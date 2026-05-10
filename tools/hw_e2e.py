@@ -259,11 +259,21 @@ def discover_lan_ip() -> str:
             # 8.8.8.8 is just a routable address; no packet is actually sent
             # by connect() on a UDP socket — it just sets the default peer.
             s.connect(("8.8.8.8", 53))
-            return s.getsockname()[0]
+            ip = s.getsockname()[0]
         finally:
             s.close()
+        if ip.startswith("127."):
+            # No default route → loopback. Fall through to the gethostbyname path.
+            raise OSError("UDP-getsockname returned loopback; no default route?")
+        return ip
     except OSError:
-        return socket.gethostbyname(socket.gethostname())
+        ip = socket.gethostbyname(socket.gethostname())
+        if ip.startswith("127."):
+            raise RuntimeError(
+                f"discover_lan_ip found no non-loopback interface (got {ip!r}). "
+                f"Is this host connected to a LAN?"
+            )
+        return ip
 
 
 def main(argv: list[str]) -> int:
