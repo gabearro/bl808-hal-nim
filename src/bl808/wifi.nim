@@ -17,6 +17,13 @@
 
 import mmio, memmap
 
+# Iter 2.A.0 step 3: vendor lwIP source compilation. Required because
+# wifi_vendor_support.c's lwIP-side bridges (netifapi_netif_add -> netif_add,
+# tcpip_input -> ethernet_input, wifi_netif_dhcp_start -> dhcp_start) call
+# vendor lwIP functions that otherwise wouldn't be in the link.
+when defined(bl808m0) and defined(bl808WifiVendor):
+  import bl808/kernel/lwipcore
+
 when defined(bl808m0) and defined(bl808WifiVendor) and defined(bl808WifiNimFw):
   import wifi_fw
   when not defined(bl808WifiVendorCmdMgr):
