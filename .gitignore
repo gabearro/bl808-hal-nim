@@ -1,0 +1,10 @@
+.DS_Store
+.venv/
+__pycache__/
+build/ftdi_reset
+build/hw-validation/
+
+# WiFi+BLE e2e harness
+build/hw-e2e/
+.pytest_cache/
+tools/__pycache__/
