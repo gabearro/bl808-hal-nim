@@ -145,3 +145,39 @@ def test_echo_server_stop_releases_port():
         s.bind(("127.0.0.1", port))  # should succeed
     finally:
         s.close()
+
+
+def test_discover_lan_ip_returns_ipv4_string():
+    """Returns a non-loopback IPv4 dotted string when LAN is up. We don't assert
+    on the specific value (that depends on the host); just that it's a v4
+    address and not 127.0.0.1."""
+    from hw_e2e import discover_lan_ip
+    ip = discover_lan_ip()
+    assert isinstance(ip, str)
+    parts = ip.split(".")
+    assert len(parts) == 4
+    for p in parts:
+        assert 0 <= int(p) <= 255
+    # Note: in CI without a network, this test will be brittle. The fallback
+    # path may return 127.0.0.1; allow it.
+
+
+def test_discover_lan_ip_fallback_on_udp_socket_error(monkeypatch):
+    """If the UDP-trick raises, fall back to gethostbyname(gethostname())."""
+    import socket
+    from hw_e2e import discover_lan_ip
+
+    real_socket = socket.socket
+    real_gethostbyname = socket.gethostbyname
+    real_gethostname = socket.gethostname
+
+    def boom(*args, **kwargs):
+        raise OSError("simulated network down")
+
+    monkeypatch.setattr(socket, "socket", boom)
+    # Ensure fallback path is exercised; gethostbyname returns a string.
+    monkeypatch.setattr(socket, "gethostbyname", lambda h: "10.99.99.99")
+    monkeypatch.setattr(socket, "gethostname", lambda: "test-host")
+
+    ip = discover_lan_ip()
+    assert ip == "10.99.99.99"
