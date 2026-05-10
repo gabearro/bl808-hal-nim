@@ -1,0 +1,1105 @@
+{
+  "defaults": {
+    "uart_baud": 230400,
+    "openocd_interface": "pine64jtag.cfg",
+    "openocd_target": "tgt_e907_v2.cfg",
+    "forbidden": ["[FAIL]", "panic", "Unhandled", "trap_entry", "fatal:"],
+    "jtag_snapshot": [
+      "poll",
+      "reg pc",
+      "reg sp",
+      "reg ra",
+      "reg mepc",
+      "reg mcause",
+      "reg mtval",
+      "mdw 0x40000000 16",
+      "mdw 0x2000e010 1"
+    ]
+  },
+  "tests": [
+    {
+      "name": "m0_hello_nim_test",
+      "tiers": ["full"],
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_hello_nim_test.nim", "flash": "m0"}],
+      "required": ["Hello from Nim!"],
+      "timeout": 10
+    },
+    {
+      "name": "m0_cps_test",
+      "tiers": ["smoke", "full"],
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_cps_test.nim", "flash": "m0"}],
+      "required": ["[PASS] CPS await returned correct value", "[PASS] Multiple awaits correct", "[PASS] Pre-completed future", "=== Phase 1 Complete ==="],
+      "timeout": 20
+    },
+    {
+      "name": "m0_uart_async_test",
+      "tiers": ["smoke", "full"],
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_uart_async_test.nim", "flash": "m0"}],
+      "input": "abcq",
+      "input_after": "Type characters",
+      "required": ["[ECHO] Done", "[HEARTBEAT] Done"],
+      "timeout": 30
+    },
+    {
+      "name": "m0_sched_test",
+      "tiers": ["smoke", "full"],
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_sched_test.nim", "flash": "m0"}],
+      "required": ["[Y] done", "[A] 500ms", "[B] 250ms", "[C] 1000ms"],
+      "timeout": 50
+    },
+    {
+      "name": "m0_sync_test",
+      "tiers": ["smoke", "full"],
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_sync_test.nim", "flash": "m0"}],
+      "required": ["[PASS] Zero-initialized semaphore retains released permit", "[PASS] waitAll propagates child errors", "[PASS] TaskGroup propagates child errors", "[PASS] Cancelled ISR future releases bridge slot", "[PASS] withTimeout preserves completed typed result", "[PASS] withTimeout fails stalled void future", "[CONSUMER] total=100 [PASS]", "[EVT] event received! [PASS]"],
+      "timeout": 80
+    },
+    {
+      "name": "m0_fault_test",
+      "tiers": ["full"],
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_fault_test.nim", "flash": "m0"}],
+      "required": ["[PASS] Stack guard initialized", "[PASS] Boot health record valid", "[PASS] Fault record persisted", "[PASS] Fault record includes stack bounds", "[PASS] Boot health captured fault record", "[PASS] Heap check initial", "[PASS] Heap allocation failure tracked", "[PASS] Heap tail canary detects overrun", "=== Test Complete ==="],
+      "timeout": 25
+    },
+    {
+      "name": "m0_wdt_test",
+      "tiers": ["full"],
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_wdt_test.nim", "flash": "m0"}],
+      "required": ["[PASS] WDT feeds incrementing", "=== Test Complete ==="],
+      "timeout": 15
+    },
+    {
+      "name": "m0_hal_register_smoke_test",
+      "tiers": ["full"],
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_hal_register_smoke_test.nim", "flash": "m0"}],
+      "required": [
+        "[PASS] CLIC init clears UART0 attr",
+        "[PASS] EMI enable",
+        "[PASS] TZC pack window",
+        "[PASS] PWM stop",
+        "[PASS] ADC scan stop",
+        "[PASS] CAN IRQ disable",
+        "[PASS] I2S TX FIFO addr",
+        "[PASS] PDM enable",
+        "[PASS] DMA2D width",
+        "[PASS] SEC TRNG API",
+        "[PASS] EFUSE safe status read",
+        "[PASS] Cache flush API",
+        "[PASS] PSRAM enable",
+        "[PASS] LZ4 enable cleared",
+        "[PASS] DBI FIFO register",
+        "[PASS] NPU BLAI clock register",
+        "[PASS] PKA DSA init",
+        "Result: 0x00000072 passed, 0x00000000 failed",
+        "=== Test Complete ==="
+      ],
+      "timeout": 25
+    },
+    {
+      "name": "m0_hal_system_test",
+      "tiers": ["full"],
+      "build": [{
+        "id": "kernel",
+        "core": "bl808m0",
+        "source": "examples/m0_hal_system_test.nim",
+        "flash": "m0",
+        "defines": {"bl808hwharness": "1"}
+      }],
+      "required": [
+        "=== BL808 HAL System Test ===",
+        "[PASS] core interrupt guard",
+        "[PASS] glb spi divider",
+        "[PASS] hbn retention roundtrip",
+        "[PASS] cci flush",
+        "=== Test Complete ==="
+      ],
+      "timeout": 25
+    },
+    {
+      "name": "m0_hal_comms_test",
+      "tiers": ["full"],
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_hal_comms_test.nim", "flash": "m0"}],
+      "required": [
+        "=== BL808 HAL Comms Test ===",
+        "[PASS] uart deinit",
+        "[PASS] spi deinit",
+        "[PASS] i2c bounded register helpers",
+        "[PASS] can bounded transfer APIs",
+        "[PASS] ir tx/rx bounded APIs",
+        "=== Test Complete ==="
+      ],
+      "timeout": 30
+    },
+    {
+      "name": "m0_hal_signal_test",
+      "tiers": ["full"],
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_hal_signal_test.nim", "flash": "m0"}],
+      "required": [
+        "=== BL808 HAL Signal Test ===",
+        "[PASS] dma memory copy",
+        "[PASS] adc scan stop",
+        "[PASS] i2s disable",
+        "[PASS] pwm control APIs",
+        "=== Test Complete ==="
+      ],
+      "timeout": 30
+    },
+    {
+      "name": "m0_hal_security_storage_test",
+      "tiers": ["full"],
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_hal_security_storage_test.nim", "flash": "m0"}],
+      "required": [
+        "=== BL808 HAL Security Storage Test ===",
+        "[PASS] efuse safe read APIs",
+        "[PASS] flash read-only APIs",
+        "[PASS] pka low-level command APIs",
+        "[PASS] psram read/write APIs",
+        "[PASS] lz4 bounded decompress",
+        "=== Test Complete ==="
+      ],
+      "timeout": 35
+    },
+    {
+      "name": "m0_pka_highlevel_test",
+      "tiers": ["full"],
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_pka_highlevel_test.nim", "flash": "m0"}],
+      "required": [
+        "=== BL808 PKA High-Level Test ===",
+        "[PASS] pka low-level ladd",
+        "[PASS] ecdsa private",
+        "[PASS] ecdsa public",
+        "[PASS] ecdsa public matches generator",
+        "[PASS] ecdh public",
+        "[PASS] ecdh scalar 384 wrapper",
+        "[PASS] ecdsa sign nonzero",
+        "[PASS] ecdsa verify 384 wrapper",
+        "[PASS] dsa sign",
+        "[PASS] dsa verify",
+        "=== Test Complete ==="
+      ],
+      "timeout": 60
+    },
+    {
+      "name": "m0_ble_hal_test",
+      "tiers": ["full"],
+      "build": [{
+        "id": "kernel",
+        "core": "bl808m0",
+        "source": "examples/m0_ble_hal_test.nim",
+        "flash": "m0",
+        "defines": {
+          "bl808BleVendor": "1",
+          "bl808BleVendorBtble": "1",
+          "bl808BleVendorBl808PhyRf": "1",
+          "bl808BleVendorTrace": "1"
+        }
+      }],
+      "jtag_flash_reset_capture": true,
+      "required": [
+        "=== BL808 BLE HAL Test ===",
+        "[BLE] advertising bl808-hal",
+        "[PASS] BLE device discovered",
+        "[PASS] BLE connected",
+        "[PASS] ble advertising stop",
+        "=== Test Complete ==="
+      ],
+      "host_actions": [{
+        "after_marker": "[BLE] advertising bl808-hal",
+        "cmd": ["{python}", "tools/ble_connect_validate.py", "--name", "bl808-hal", "--timeout", "20", "--link-only"],
+        "required": ["[PASS] BLE device discovered", "[PASS] BLE connected"],
+        "timeout": 30
+      }],
+      "jtag_snapshot": [
+        "poll",
+        "reg pc",
+        "reg sp",
+        "reg ra",
+        "reg a0",
+        "reg a1",
+        "reg a2",
+        "reg s1",
+        "reg s2",
+        "reg mepc",
+        "reg mcause",
+        "reg mtval",
+        "mdw 0x2204fec0 24",
+        "mdw 0x2203cfac 8",
+        "mdw 0x2203f904 8",
+        "mdw 0x22041f1c 16",
+        "mdw 0x200010b0 4",
+        "mdw 0x200010b8 4",
+        "mdw 0x20000250 1",
+        "mdw 0x20000540 3",
+        "mdw 0x20000580 3",
+        "mdw 0x2000060c 1",
+        "mdw 0x20000810 9",
+        "mdw 0x2000f880 1",
+        "mdw 0x28000018 3",
+        "mdw 0x28000100 2",
+        "mdw 0x280009c0 3"
+      ],
+      "timeout": 90
+    },
+    {
+      "name": "m0_ble_nim_controller_hal_test",
+      "tiers": ["experimental"],
+      "build": [{
+        "id": "kernel",
+        "core": "bl808m0",
+        "source": "examples/m0_ble_hal_test.nim",
+        "flash": "m0",
+        "defines": {
+          "bl808BleNimBl606pPhyRf": "1",
+          "bl808BleVendorLldConProbe": "1",
+          "bl808BleVendorManualConnTx": "1",
+          "bl808BleVendorLlcStartProbe": "1",
+          "bl808BleVendorConTimingPath": "1",
+          "bl808BleNimSchProg": "1",
+          "bl808BleConnStageDiag": "1",
+          "bl808BleFinalAdvLoopDiag": "1",
+          "BleExpectPeripheralLink": "1"
+        }
+      }],
+      "jtag_flash_reset_capture": true,
+      "required": [
+        "=== BL808 BLE HAL Test ===",
+        "[BLE] advertising bl808-hal",
+        "[PASS] BLE device discovered",
+        "[PASS] BLE connected",
+        "[PASS] ble peripheral connected callback",
+        "[PASS] ble peripheral disconnected callback",
+        "[PASS] ble advertising stop",
+        "=== Test Complete ==="
+      ],
+      "host_actions": [{
+        "after_marker": "[BLE] advertising bl808-hal",
+        "cmd": ["{python}", "tools/ble_connect_validate.py", "--name", "bl808-hal", "--timeout", "20", "--link-only"],
+        "required": ["[PASS] BLE device discovered", "[PASS] BLE connected"],
+        "timeout": 30
+      }],
+      "jtag_snapshot": [
+        "poll",
+        "reg pc",
+        "reg sp",
+        "reg ra",
+        "reg a0",
+        "reg a1",
+        "reg a2",
+        "reg s1",
+        "reg s2",
+        "reg mepc",
+        "reg mcause",
+        "reg mtval",
+        "mdw 0x20000250 1",
+        "mdw 0x20000540 3",
+        "mdw 0x20000580 3",
+        "mdw 0x2000060c 1",
+        "mdw 0x20000810 9",
+        "mdw 0x2000f880 1",
+        "mdw 0x28000018 3",
+        "mdw 0x28000100 2",
+        "mdw 0x280009c0 3"
+      ],
+      "timeout": 90
+    },
+    {
+      "name": "m0_bleblob_direct_test",
+      "tiers": ["full"],
+      "build": [{
+        "id": "kernel",
+        "core": "bl808m0",
+        "source": "examples/m0_bleblob_direct_test.nim",
+        "flash": "m0",
+        "defines": {
+          "bl808BleVendor": "1",
+          "bl808BleVendorBtble": "1",
+          "bl808BleVendorBl808PhyRf": "1",
+          "bl808BleVendorTrace": "1"
+        }
+      }],
+      "jtag_flash_reset_capture": true,
+      "required": [
+        "=== BL808 BLE Blob Direct Test ===",
+        "[PASS] ble blob wireless prep",
+        "[PASS] ble blob controller init",
+        "[PASS] ble blob hci command direct",
+        "[PASS] ble blob controller deinit",
+        "=== Test Complete ==="
+      ],
+      "timeout": 45
+    },
+    {
+      "name": "m0_ble_bl606p_hal_test",
+      "tiers": ["full"],
+      "build": [{
+        "id": "kernel",
+        "core": "bl808m0",
+        "source": "examples/m0_ble_hal_test.nim",
+        "flash": "m0",
+        "defines": {
+          "bl808BleVendor": "1",
+          "bl808BleVendorBtble": "1",
+          "bl808BleVendorBl606pPhyRf": "1"
+        }
+      }],
+      "jtag_flash_reset_capture": true,
+      "required": [
+        "=== BL808 BLE HAL Test ===",
+        "[BLE] advertising bl808-hal",
+        "[PASS] BLE device discovered",
+        "[PASS] BLE connected",
+        "[PASS] ble advertising stop",
+        "=== Test Complete ==="
+      ],
+      "host_actions": [{
+        "after_marker": "[BLE] advertising bl808-hal",
+        "cmd": ["{python}", "tools/ble_connect_validate.py", "--name", "bl808-hal", "--timeout", "20", "--link-only"],
+        "required": ["[PASS] BLE device discovered", "[PASS] BLE connected"],
+        "timeout": 30
+      }],
+      "jtag_snapshot": [
+        "poll",
+        "reg pc",
+        "reg sp",
+        "reg ra",
+        "reg a0",
+        "reg a1",
+        "reg a2",
+        "reg s1",
+        "reg s2",
+        "reg mepc",
+        "reg mcause",
+        "reg mtval",
+        "mdw 0x2204fec0 24",
+        "mdw 0x2203cfac 8",
+        "mdw 0x2203f904 8",
+        "mdw 0x22041f1c 16",
+        "mdw 0x200010b0 4",
+        "mdw 0x200010b8 4",
+        "mdw 0x20000250 1",
+        "mdw 0x20000540 3",
+        "mdw 0x20000580 3",
+        "mdw 0x2000060c 1",
+        "mdw 0x20000810 9",
+        "mdw 0x2000f880 1",
+        "mdw 0x28000018 3",
+        "mdw 0x28000100 2",
+        "mdw 0x280009c0 3"
+      ],
+      "timeout": 90
+    },
+    {
+      "name": "m0_ble_central_hal_test",
+      "tiers": ["full"],
+      "build": [{
+        "id": "kernel",
+        "core": "bl808m0",
+        "source": "examples/m0_ble_central_hal_test.nim",
+        "flash": "m0",
+        "defines": {
+          "bl808BleVendor": "1",
+          "bl808BleVendorBtble": "1",
+          "bl808BleVendorBl616Controller": "1",
+          "bl808BleVendorBl616ControllerM10": "1",
+          "bl808BleUseRandomAddr": "1"
+        }
+      }],
+      "jtag_flash_reset_capture": true,
+      "required": [
+        "=== BL808 BLE Central HAL Test ===",
+        "[BLE] central scan bl808-host",
+        "[PASS] BLE advertising started",
+        "[PASS] ble central connect",
+        "=== Test Complete ==="
+      ],
+      "host_actions": [{
+        "after_marker": "[BLE] central scan bl808-host",
+        "cmd": ["{python}", "tools/ble_advertise_macos.py", "--name", "bl808-host", "--service-uuid", "", "--duration", "25"],
+        "required": ["[PASS] BLE advertising started"],
+        "timeout": 35
+      }],
+      "jtag_snapshot": [
+        "poll",
+        "reg pc",
+        "reg sp",
+        "reg ra",
+        "reg mepc",
+        "reg mcause",
+        "reg mtval",
+        "mdw 0x62024748 4",
+        "mdw 0x40002E00 16",
+        "mdw 0x40002F00 20",
+        "mdw 0x6202014c 1",
+        "mdw 0x62023b20 64",
+        "mdw 0x62023c70 16",
+        "mdw 0x62053D00 80",
+        "mdw 0x6202292c 32",
+        "mdw 0x620239e8 32"
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "m0_ble_nim_controller_central_hal_test",
+      "tiers": ["experimental"],
+      "build": [{
+        "id": "kernel",
+        "core": "bl808m0",
+        "source": "examples/m0_ble_central_hal_test.nim",
+        "flash": "m0",
+        "defines": {
+          "bl808BleVendorLldScanProbe": "1",
+          "bl808BleVendorScanFlags": "5",
+          "bl808BleNimSyntheticCentral": "0",
+          "bl808BleNimSyntheticCentralComplete": "1",
+          "bl808BleNimBl606pPhyRf": "1",
+          "bl808BleVendorInitPeerComplete": "1",
+          "BleCentralTimeoutMs": "40000"
+        }
+      }],
+      "jtag_flash_reset_capture": true,
+      "required": [
+        "=== BL808 BLE Central HAL Test ===",
+        "[BLE] central scan bl808-host",
+        "[PASS] BLE advertising started",
+        "[PASS] ble central connect",
+        "=== Test Complete ==="
+      ],
+      "pre_host_actions": [{
+        "cmd": ["{python}", "tools/ble_advertise_macos.py", "--name", "bl808-host", "--service-uuid", "", "--duration", "100", "--restart-interval", "1", "--restart-count", "1"],
+        "required": ["[PASS] BLE advertising started"],
+        "timeout": 12
+      }],
+      "jtag_snapshot": [
+        "poll",
+        "reg pc",
+        "reg sp",
+        "reg ra",
+        "reg mepc",
+        "reg mcause",
+        "reg mtval",
+        "mdw 0x40002E00 16",
+        "mdw 0x40002F00 20",
+        "mdw 0x6202014c 1",
+        "mdw 0x62023b20 64",
+        "mdw 0x62023c70 16",
+        "mdw 0x62053D00 80",
+        "mdw 0x6202292c 32",
+        "mdw 0x620239e8 32"
+      ],
+      "timeout": 100
+    },
+    {
+      "name": "m0_wifi_scan_hal_test",
+      "tiers": ["smoke"],
+      "build": [{
+        "id": "kernel",
+        "core": "bl808m0",
+        "source": "examples/m0_wifi_hal_test.nim",
+        "flash": "m0",
+        "defines": {
+          "bl808WifiVendor": "1",
+          "WifiScanOnly": "1"
+        }
+      }],
+      "required": [
+        "=== BL808 WiFi HAL Test ===",
+        "[PASS] wifi init",
+        "[PASS] wifi sta enable",
+        "[PASS] wifi scan",
+        "[PASS] wifi scan results",
+        "[PASS] wifi ap start",
+        "[PASS] wifi ap stop",
+        "=== Test Complete ==="
+      ],
+      "timeout": 80
+    },
+    {
+      "name": "m0_wifi_nimfw_scan_hal_test",
+      "tiers": ["smoke"],
+      "build": [{
+        "id": "kernel",
+        "core": "bl808m0",
+        "source": "examples/m0_wifi_hal_test.nim",
+        "flash": "m0",
+        "defines": {
+          "bl808WifiVendor": "1",
+          "bl808WifiNimFw": "1",
+          "WifiScanOnly": "1"
+        }
+      }],
+      "required": [
+        "=== BL808 WiFi HAL Test ===",
+        "[PASS] wifi init",
+        "[PASS] wifi sta enable",
+        "[PASS] wifi scan",
+        "[PASS] wifi scan results",
+        "[PASS] wifi ap start",
+        "[PASS] wifi ap stop",
+        "=== Test Complete ==="
+      ],
+      "timeout": 80
+    },
+    {
+      "name": "m0_wifi_hal_test",
+      "tiers": ["full"],
+      "build": [{
+        "id": "kernel",
+        "core": "bl808m0",
+        "source": "examples/m0_wifi_hal_test.nim",
+        "flash": "m0",
+        "defines": {
+          "bl808WifiVendor": "1",
+          "WifiSsid": {"env": "BL808_WIFI_SSID"},
+          "WifiPassword": {"secret_env": "BL808_WIFI_PASSWORD"},
+          "WifiChannel": {"env": "BL808_WIFI_CHANNEL", "default": 0}
+        }
+      }],
+      "required": [
+        "=== BL808 WiFi HAL Test ===",
+        "[PASS] wifi init",
+        "[PASS] wifi sta enable",
+        "[PASS] wifi scan",
+        "[PASS] wifi scan results",
+        "[PASS] wifi connect",
+        "[PASS] wifi connect status",
+        "[PASS] wifi connect reason",
+        "[PASS] wifi netif",
+        "[PASS] wifi disconnect",
+        "[PASS] wifi ap start",
+        "[PASS] wifi ap stop",
+        "=== Test Complete ==="
+      ],
+      "timeout": 80
+    },
+    {
+      "name": "m0_wifi_nimfw_hal_test",
+      "tiers": ["full"],
+      "build": [{
+        "id": "kernel",
+        "core": "bl808m0",
+        "source": "examples/m0_wifi_hal_test.nim",
+        "flash": "m0",
+        "defines": {
+          "bl808WifiVendor": "1",
+          "bl808WifiNimFw": "1",
+          "WifiSsid": {"env": "BL808_WIFI_SSID"},
+          "WifiPassword": {"secret_env": "BL808_WIFI_PASSWORD"},
+          "WifiChannel": {"env": "BL808_WIFI_CHANNEL", "default": 0}
+        }
+      }],
+      "required": [
+        "=== BL808 WiFi HAL Test ===",
+        "[WIFI-NIMFW] bl_init done",
+        "[PASS] wifi init",
+        "[PASS] wifi sta enable",
+        "[PASS] wifi scan",
+        "[PASS] wifi scan results",
+        "[PASS] wifi connect",
+        "[PASS] wifi connect status",
+        "[PASS] wifi connect reason",
+        "[PASS] wifi netif",
+        "[PASS] wifi disconnect",
+        "[PASS] wifi ap start",
+        "[PASS] wifi ap stop",
+        "=== Test Complete ==="
+      ],
+      "timeout": 80
+    },
+    {
+      "name": "m0_wifi_bad_password_hal_test",
+      "tiers": ["full"],
+      "build": [{
+        "id": "kernel",
+        "core": "bl808m0",
+        "source": "examples/m0_wifi_hal_test.nim",
+        "flash": "m0",
+        "defines": {
+          "bl808WifiVendor": "1",
+          "WifiSsid": {"env": "BL808_WIFI_SSID"},
+          "WifiPassword": {"env": "BL808_WIFI_BAD_PASSWORD", "default": "dummy-password"},
+          "WifiChannel": {"env": "BL808_WIFI_CHANNEL", "default": 0},
+          "WifiExpectConnectFailure": "1",
+          "WifiExpectedConnectStatus": "8",
+          "WifiExpectedConnectReason": "15"
+        }
+      }],
+      "required": [
+        "=== BL808 WiFi HAL Test ===",
+        "[PASS] wifi init",
+        "[PASS] wifi sta enable",
+        "[PASS] wifi scan",
+        "[PASS] wifi scan results",
+        "[WIFI] connect failure status=0x00000008 reason=0x0000000F",
+        "[PASS] wifi connect expected failure",
+        "[PASS] wifi connect failure status",
+        "[PASS] wifi connect failure reason",
+        "[PASS] wifi ap start",
+        "[PASS] wifi ap stop",
+        "=== Test Complete ==="
+      ],
+      "timeout": 100
+    },
+    {
+      "name": "m0_wifi_nimfw_bad_password_hal_test",
+      "tiers": ["full"],
+      "build": [{
+        "id": "kernel",
+        "core": "bl808m0",
+        "source": "examples/m0_wifi_hal_test.nim",
+        "flash": "m0",
+        "defines": {
+          "bl808WifiVendor": "1",
+          "bl808WifiNimFw": "1",
+          "WifiSsid": {"env": "BL808_WIFI_SSID"},
+          "WifiPassword": {"env": "BL808_WIFI_BAD_PASSWORD", "default": "dummy-password"},
+          "WifiChannel": {"env": "BL808_WIFI_CHANNEL", "default": 0},
+          "WifiExpectConnectFailure": "1",
+          "WifiExpectedConnectStatus": "8",
+          "WifiExpectedConnectReason": "15"
+        }
+      }],
+      "required": [
+        "=== BL808 WiFi HAL Test ===",
+        "[WIFI-NIMFW] bl_init done",
+        "[PASS] wifi init",
+        "[PASS] wifi sta enable",
+        "[PASS] wifi scan",
+        "[PASS] wifi scan results",
+        "[WIFI] connect failure status=0x00000008 reason=0x0000000F",
+        "[PASS] wifi connect expected failure",
+        "[PASS] wifi connect failure status",
+        "[PASS] wifi connect failure reason",
+        "[PASS] wifi ap start",
+        "[PASS] wifi ap stop",
+        "=== Test Complete ==="
+      ],
+      "timeout": 100
+    },
+    {
+      "name": "m0_ble_legacy_hal_test",
+      "tiers": ["full"],
+      "build": [{
+        "id": "kernel",
+        "core": "bl808m0",
+        "source": "examples/m0_ble_hal_test.nim",
+        "flash": "m0",
+        "defines": {
+          "bl808BleVendor": "1",
+          "bl808BleVendorRf": "1"
+        }
+      }],
+      "jtag_flash_reset_capture": true,
+      "required": [
+        "=== BL808 BLE HAL Test ===",
+        "[BLE] advertising bl808-hal",
+        "[PASS] BLE device discovered",
+        "[PASS] BLE connected",
+        "[PASS] ble advertising stop",
+        "=== Test Complete ==="
+      ],
+      "host_actions": [{
+        "after_marker": "[BLE] advertising bl808-hal",
+        "cmd": ["{python}", "tools/ble_connect_validate.py", "--name", "bl808-hal", "--timeout", "20", "--link-only"],
+        "required": ["[PASS] BLE device discovered", "[PASS] BLE connected"],
+        "timeout": 30
+      }],
+      "jtag_snapshot": [
+        "poll",
+        "reg pc",
+        "reg sp",
+        "reg ra",
+        "reg a0",
+        "reg a1",
+        "reg a2",
+        "reg s1",
+        "reg s2",
+        "reg mepc",
+        "reg mcause",
+        "reg mtval",
+        "mdw 0x20000250 1",
+        "mdw 0x20000540 3",
+        "mdw 0x20000580 3",
+        "mdw 0x2000060c 1",
+        "mdw 0x20000810 9",
+        "mdw 0x2000f880 1",
+        "mdw 0x28000018 3",
+        "mdw 0x28000100 2",
+        "mdw 0x280009c0 3"
+      ],
+      "timeout": 90
+    },
+    {
+      "name": "m0_ble_bl616_controller_hal_test",
+      "tiers": ["full"],
+      "build": [{
+        "id": "kernel",
+        "core": "bl808m0",
+        "source": "examples/m0_ble_hal_test.nim",
+        "flash": "m0",
+        "defines": {
+          "bl808BleVendor": "1",
+          "bl808BleVendorBtble": "1",
+          "bl808BleVendorBl616Controller": "1",
+          "bl808BleUseRandomAddr": "1"
+        }
+      }],
+      "jtag_flash_reset_capture": true,
+      "required": [
+        "=== BL808 BLE HAL Test ===",
+        "[BLE] advertising bl808-hal",
+        "[PASS] BLE device discovered",
+        "[PASS] BLE connected",
+        "[PASS] ble advertising stop",
+        "=== Test Complete ==="
+      ],
+      "host_actions": [{
+        "after_marker": "[BLE] advertising bl808-hal",
+        "cmd": ["{python}", "tools/ble_connect_validate.py", "--name", "bl808-hal", "--timeout", "20", "--link-only"],
+        "required": ["[PASS] BLE device discovered", "[PASS] BLE connected"],
+        "timeout": 30
+      }],
+      "jtag_snapshot": [
+        "poll",
+        "reg pc",
+        "reg sp",
+        "reg ra",
+        "reg a0",
+        "reg a1",
+        "reg a2",
+        "reg s1",
+        "reg s2",
+        "reg mepc",
+        "reg mcause",
+        "reg mtval",
+        "mdw 0x20000250 1",
+        "mdw 0x20000540 3",
+        "mdw 0x20000580 3",
+        "mdw 0x2000060c 1",
+        "mdw 0x20000810 9",
+        "mdw 0x2000f880 1",
+        "mdw 0x28000018 3",
+        "mdw 0x28000100 2",
+        "mdw 0x280009c0 3"
+      ],
+      "timeout": 90
+    },
+    {
+      "name": "m0_ble_wifi_scan_hal_test",
+      "tiers": ["smoke"],
+      "build": [{
+        "id": "kernel",
+        "core": "bl808m0",
+        "source": "examples/m0_ble_wifi_hal_test.nim",
+        "flash": "m0",
+        "defines": {
+          "bl808WifiVendor": "1",
+          "bl808BleVendor": "1",
+          "bl808BleVendorBtble": "1",
+          "bl808BleVendorBl606pPhyRf": "1",
+          "bl808BleVendorTrace": "1",
+          "WifiScanOnly": "1"
+        }
+      }],
+      "jtag_flash_reset_capture": true,
+      "required": [
+        "=== BL808 BLE/WiFi HAL Test ===",
+        "[PASS] wifi scan results",
+        "[PASS] wifi ap start",
+        "[PASS] wifi ap stop",
+        "[BLE] advertising bl808-hal",
+        "[PASS] BLE device discovered",
+        "[PASS] BLE connected",
+        "[PASS] ble advertising stop",
+        "=== Test Complete ==="
+      ],
+      "host_actions": [{
+        "after_marker": "[BLE] advertising bl808-hal",
+        "cmd": ["{python}", "tools/ble_connect_validate.py", "--name", "bl808-hal", "--timeout", "20", "--link-only"],
+        "required": ["[PASS] BLE device discovered", "[PASS] BLE connected"],
+        "timeout": 30
+      }],
+      "timeout": 90
+    },
+    {
+      "name": "m0_ble_wifi_hal_test",
+      "tiers": ["full"],
+      "build": [{
+        "id": "kernel",
+        "core": "bl808m0",
+        "source": "examples/m0_ble_wifi_hal_test.nim",
+        "flash": "m0",
+        "defines": {
+          "bl808WifiVendor": "1",
+          "bl808BleVendor": "1",
+          "bl808BleVendorBtble": "1",
+          "bl808BleVendorBl606pPhyRf": "1",
+          "bl808BleVendorTrace": "1",
+          "WifiSsid": {"env": "BL808_WIFI_SSID"},
+          "WifiPassword": {"secret_env": "BL808_WIFI_PASSWORD"},
+          "WifiChannel": {"env": "BL808_WIFI_CHANNEL", "default": 0}
+        }
+      }],
+      "jtag_flash_reset_capture": true,
+      "required": [
+        "=== BL808 BLE/WiFi HAL Test ===",
+        "[PASS] wifi connect",
+        "[BLE] advertising bl808-hal",
+        "[PASS] BLE device discovered",
+        "[PASS] BLE connected",
+        "[PASS] ble advertising stop",
+        "=== Test Complete ==="
+      ],
+      "host_actions": [{
+        "after_marker": "[BLE] advertising bl808-hal",
+        "cmd": ["{python}", "tools/ble_connect_validate.py", "--name", "bl808-hal", "--timeout", "20", "--link-only"],
+        "required": ["[PASS] BLE device discovered", "[PASS] BLE connected"],
+        "timeout": 30
+      }],
+      "jtag_snapshot": [
+        "poll",
+        "reg pc",
+        "reg sp",
+        "reg ra",
+        "reg a0",
+        "reg a1",
+        "reg a2",
+        "reg s1",
+        "reg s2",
+        "reg mepc",
+        "reg mcause",
+        "reg mtval",
+        "mdw 0x2204fec0 24",
+        "mdw 0x2203cfac 8",
+        "mdw 0x2203f904 8",
+        "mdw 0x22041f1c 16",
+        "mdw 0x200010b0 4",
+        "mdw 0x200010b8 4",
+        "mdw 0x20000250 1",
+        "mdw 0x20000540 3",
+        "mdw 0x20000580 3",
+        "mdw 0x20000810 9",
+        "mdw 0x2000f880 1",
+        "mdw 0x28000018 3",
+        "mdw 0x28000100 2",
+        "mdw 0x280009c0 3"
+      ],
+      "timeout": 55
+    },
+    {
+      "name": "m0_ble_wifi_nim_hal_test",
+      "tiers": ["experimental"],
+      "build": [{
+        "id": "kernel",
+        "core": "bl808m0",
+        "source": "examples/m0_ble_wifi_hal_test.nim",
+        "flash": "m0",
+        "defines": {
+          "bl808WifiVendor": "1",
+          "bl808WifiNimFw": "1",
+          "bl808BleNimBl606pPhyRf": "1",
+          "bl808BleVendorLldConProbe": "1",
+          "bl808BleVendorManualConnTx": "1",
+          "bl808BleVendorLlcStartProbe": "1",
+          "bl808BleVendorConTimingPath": "1",
+          "bl808BleNimSchProg": "1",
+          "WifiSsid": {"env": "BL808_WIFI_SSID"},
+          "WifiPassword": {"secret_env": "BL808_WIFI_PASSWORD"},
+          "WifiChannel": {"env": "BL808_WIFI_CHANNEL", "default": 0}
+        }
+      }],
+      "jtag_flash_reset_capture": true,
+      "required": [
+        "=== BL808 BLE/WiFi HAL Test ===",
+        "[PASS] wifi init",
+        "[PASS] wifi connect",
+        "[BLE] advertising bl808-hal",
+        "[PASS] BLE device discovered",
+        "[PASS] BLE connected",
+        "[PASS] ble peripheral connected callback",
+        "[PASS] ble peripheral disconnected callback",
+        "[PASS] ble advertising stop",
+        "=== Test Complete ==="
+      ],
+      "host_actions": [{
+        "after_marker": "[BLE] advertising bl808-hal",
+        "cmd": ["{python}", "tools/ble_connect_validate.py", "--name", "bl808-hal", "--timeout", "20", "--link-only"],
+        "required": ["[PASS] BLE device discovered", "[PASS] BLE connected"],
+        "timeout": 30
+      }],
+      "timeout": 110
+    },
+    {
+      "name": "m0_hal_net_usb_test",
+      "tiers": ["full"],
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_hal_net_usb_test.nim", "flash": "m0"}],
+      "required": [
+        "=== BL808 HAL Net USB Test ===",
+        "[PASS] emac rx/tx disable",
+        "[PASS] emac bounded mdio APIs",
+        "[PASS] usb endpoint controls",
+        "[PASS] usb host stop",
+        "=== Test Complete ==="
+      ],
+      "timeout": 35
+    },
+    {
+      "name": "d0_mm_hal_register_smoke_test",
+      "tiers": ["full"],
+      "build": [
+        {"id": "kernel", "core": "bl808m0", "source": "examples/m0_d0_mm_hal_boot_helper.nim", "flash": "m0"},
+        {"id": "d0", "core": "bl808d0", "source": "examples/d0_mm_hal_register_smoke_test.nim", "flash": "d0"}
+      ],
+      "required": [
+        "[PASS] D0 started",
+        "[PASS] DBI register API",
+        "[PASS] DVP register API",
+        "[PASS] OSD register API",
+        "[PASS] H264 register API",
+        "[PASS] MJPEG register API",
+        "[PASS] NPU register API",
+        "[PASS] D0 MM HAL register smoke complete",
+        "=== Test Complete ==="
+      ],
+      "timeout": 40
+    },
+    {
+      "name": "m0_rtc_test",
+      "tiers": ["full"],
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_rtc_test.nim", "flash": "m0"}],
+      "required": ["[PASS] Set/get round-trip", "[PASS] Leap year 2000-02-29 round-trip", "[PASS] FatFs timestamp non-zero", "=== Test Complete ==="],
+      "timeout": 35
+    },
+    {
+      "name": "m0_sd_test",
+      "tiers": ["full"],
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_sd_test.nim", "flash": "m0"}],
+      "required": ["[PASS] Data verified: Hello!", "[PASS] Directory empty after delete", "[PASS] disk I/O callbacks", "=== Test Complete ==="],
+      "timeout": 60
+    },
+    {
+      "name": "m0_asyncsd_test",
+      "tiers": ["full"],
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_asyncsd_test.nim", "flash": "m0"}],
+      "required": ["[PASS] asyncSdWrite", "[PASS] asyncSdRead data verified", "[PASS] asyncSdRemove", "=== Test Complete ==="],
+      "timeout": 60
+    },
+    {
+      "name": "m0_ipc_timeout_test",
+      "tiers": ["full"],
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_ipc_timeout_test.nim", "flash": "m0"}],
+      "required": ["[M0] timeout 1 [OK]", "[M0] timeout 2 [OK]", "[M0] IPC timeout cleanup [PASS]"],
+      "timeout": 20
+    },
+    {
+      "name": "m0_ipc_test",
+      "tiers": ["full"],
+      "build": [
+        {"id": "kernel", "core": "bl808m0", "source": "examples/m0_ipc_test.nim", "flash": "m0"},
+        {"id": "d0", "core": "bl808d0", "source": "examples/d0_ipc_test.nim", "flash": "d0"}
+      ],
+      "required": ["[M0] All IPC calls correct! [PASS]"],
+      "timeout": 90
+    },
+    {
+      "name": "m0_allcore_test",
+      "tiers": ["full"],
+      "build": [
+        {"id": "kernel", "core": "bl808m0", "source": "examples/m0_allcore_test.nim", "flash": "m0"},
+        {"id": "d0", "core": "bl808d0", "source": "examples/d0_allcore_test.nim", "flash": "d0"},
+        {"id": "lp", "core": "bl808lp", "source": "examples/lp_allcore_test.nim", "flash": "lp"}
+      ],
+      "required": ["Result: 5 passed, 0 failed", "=== ALL TESTS PASSED ==="],
+      "timeout": 120,
+      "jtag_snapshot": [
+        "poll",
+        "reg pc",
+        "reg sp",
+        "mdw 0x40002000 16",
+        "mdw 0x40002800 16",
+        "mdw 0x40002f00 4",
+        "mdw 0x40003800 16",
+        "mdw 0x40003a00 16",
+        "mdw 0x2000a840 16",
+        "mdw 0x2000a860 16",
+        "mdw 0x62054d10 20",
+        "mdw 0x62054a60 16"
+      ]
+    },
+    {
+      "name": "lp_jtag_enable_test",
+      "tiers": ["manual"],
+      "build": [
+        {"id": "kernel", "core": "bl808m0", "source": "examples/m0_lp_jtag_enable_helper.nim", "flash": "m0"},
+        {"id": "lp", "core": "bl808lp", "source": "examples/lp_jtag_enable.nim", "flash": "lp"}
+      ],
+      "required": [
+        "[OK] LP JTAG helper ran",
+        "[M0] LP pads are now configured for LP JTAG"
+      ],
+      "timeout": 20,
+      "jtag_poll_after_success": false,
+      "jtag_snapshot": [
+        "poll",
+        "reg pc",
+        "reg sp",
+        "mdw 0x40002f80 12",
+        "mdw 0x20000510 1",
+        "mdw 0x200008dc 1",
+        "mdw 0x200008e0 1",
+        "mdw 0x200008f4 1",
+        "mdw 0x20000900 1"
+      ]
+    },
+    {
+      "name": "lp_ipc_reg_probe_test",
+      "tiers": ["manual"],
+      "build": [
+        {"id": "kernel", "core": "bl808m0", "source": "examples/m0_lp_ipc_reg_probe.nim", "flash": "m0"},
+        {"id": "lp", "core": "bl808lp", "source": "examples/lp_ipc_reg_probe.nim", "flash": "lp"}
+      ],
+      "required": [
+        "[OK] LP IPC register server alive",
+        "=== LP IPC REG PROBE PASSED ==="
+      ],
+      "timeout": 30,
+      "jtag_snapshot": [
+        "poll",
+        "reg pc",
+        "reg sp",
+        "mdw 0x40002ec0 8",
+        "mdw 0x40003800 16",
+        "mdw 0x40003a00 16",
+        "mdw 0x20000510 1",
+        "mdw 0x20003018 1"
+      ]
+    },
+    {
+      "name": "d0_kernel_test",
+      "tiers": ["full"],
+      "build": [
+        {"id": "kernel", "core": "bl808m0", "source": "examples/m0_d0_boot_helper.nim", "flash": "m0"},
+        {"id": "d0", "core": "bl808d0", "source": "examples/d0_kernel_test.nim", "flash": "d0"}
+      ],
+      "required": ["[M0] Releasing D0", "[D0] Scheduler initialized", "[D0-A] done", "[D0-B] done"],
+      "timeout": 100
+    },
+    {
+      "name": "m0_wifi_e2e_test",
+      "tiers": ["e2e"],
+      "build": [{
+        "id": "kernel",
+        "core": "bl808m0",
+        "source": "examples/m0_wifi_e2e_test.nim",
+        "flash": "m0",
+        "defines": {
+          "bl808WifiVendor": "1",
+          "WifiSsid": {"env": "BL808_WIFI_SSID"},
+          "WifiPassword": {"secret_env": "BL808_WIFI_PASSWORD"},
+          "AttemptsTotal": {"env": "BL808_WIFI_E2E_ATTEMPTS", "default": 3}
+        }
+      }],
+      "required": ["=== BL808 E2E Test Complete ==="],
+      "timeout": 240
+    }
+  ]
+}
