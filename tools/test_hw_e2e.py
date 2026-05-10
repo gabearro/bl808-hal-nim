@@ -181,3 +181,21 @@ def test_discover_lan_ip_fallback_on_udp_socket_error(monkeypatch):
 
     ip = discover_lan_ip()
     assert ip == "10.99.99.99"
+
+
+def test_discover_lan_ip_raises_when_only_loopback_available(monkeypatch):
+    """If both the UDP-trick and gethostbyname only return loopback, raise.
+    Silent return of 127.0.0.1 would propagate to firmware and cause
+    hard-to-diagnose TCP timeouts in Pass 2."""
+    import socket
+    from hw_e2e import discover_lan_ip
+
+    def boom(*args, **kwargs):
+        raise OSError("simulated network down")
+
+    monkeypatch.setattr(socket, "socket", boom)
+    monkeypatch.setattr(socket, "gethostbyname", lambda h: "127.0.0.1")
+    monkeypatch.setattr(socket, "gethostname", lambda: "test-host")
+
+    with pytest.raises(RuntimeError, match="loopback"):
+        discover_lan_ip()
