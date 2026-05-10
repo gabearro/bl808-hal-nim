@@ -40,8 +40,8 @@ const
 # via lwipcore. We declare only the symbols this binary needs.
 type
   Netif {.importc: "struct netif", header: "lwip/netif.h", incompleteStruct.} = object
-  ErrT* = int8
-const ErrOk*: ErrT = 0
+  ErrT = int8
+const ErrOk: ErrT = 0
 
 proc dhcpStart(netif: ptr Netif): ErrT
   {.importc: "dhcp_start", header: "lwip/dhcp.h".}
