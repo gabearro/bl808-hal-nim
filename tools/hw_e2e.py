@@ -1,4 +1,4 @@
-"""WiFi+BLE e2e soak orchestrator (single-cell mode for Iteration 1).
+"""WiFi+BLE e2e soak orchestrator.
 
 Per cell:
   1. Build firmware via existing `make m0 FILE=...`.
@@ -7,7 +7,7 @@ Per cell:
      attempts (or on overall timeout).
   4. Aggregate to a CellReport, write JSON, print summary table.
 
-Iteration 1 supports a single cell: WiFi blob backend.
+Cells: WiFi blob backend; WiFi lwIP smoke (DHCP+ICMP).
 """
 from __future__ import annotations
 
