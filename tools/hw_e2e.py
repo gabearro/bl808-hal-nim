@@ -189,6 +189,35 @@ def run_wifi_blob_cell(
     return report
 
 
+def run_wifi_lwip_smoke_cell(
+    *, uart_port: str, uart_baud: int, ssid: str, password: str,
+    attempts: int, build_dir: Path,
+) -> CellReport:
+    """WiFi lwIP smoke cell: scan -> assoc -> DHCP -> ICMP echo to gateway.
+
+    Builds + flashes + runs `m0_wifi_lwip_smoke` via hw_validate.py's catalog
+    mode (same plumbing as the wifi-blob cell). No host-side echo server is
+    needed (the firmware pings the DHCP-supplied gateway directly).
+    """
+    work_dir = build_dir / "hw-validate-work"
+    log_path = run_via_hw_validate(
+        test_name="m0_wifi_lwip_smoke",
+        ssid=ssid, password=password, attempts=attempts,
+        uart_port=uart_port, uart_baud=uart_baud, work_dir=work_dir,
+    )
+    print(f"uart log: {log_path}")
+    attempts_records = parse_log_file(log_path)
+
+    report = summarize_cell(attempts_records)
+    print_cell_summary("wifi-lwip-smoke", report)
+    out_dir = build_dir / time.strftime("%Y%m%d-%H%M%S")
+    write_cell_report_json(
+        out_dir / "wifi-lwip-smoke.json", "wifi-lwip-smoke", report,
+        extra={"uart_log": str(log_path)},
+    )
+    return report
+
+
 class EchoServer:
     """Tiny TCP echo server: bind to 0.0.0.0:0, accept loop on a daemon thread,
     each connection gets its bytes echoed back. Used by the WiFi e2e harness so
@@ -278,7 +307,8 @@ def discover_lan_ip() -> str:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cell", choices=["wifi-blob"], default="wifi-blob")
+    parser.add_argument("--cell", choices=["wifi-blob", "wifi-lwip-smoke"],
+                        default="wifi-blob")
     parser.add_argument("--uart", default="/dev/tty.usbserial-XXXX")
     parser.add_argument("--uart-baud", type=int, default=230400)
     parser.add_argument("--ssid", required=True,
@@ -293,15 +323,22 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--success-floor", type=float, default=2/3,
                         help="Minimum success rate to exit 0 (default 2/3)")
     args = parser.parse_args(argv)
-    if args.cell != "wifi-blob":
-        print(f"cell {args.cell!r} not supported in Iteration 1", file=sys.stderr)
+    if args.cell == "wifi-blob":
+        report = run_wifi_blob_cell(
+            uart_port=args.uart, uart_baud=args.uart_baud,
+            ssid=args.ssid, password=args.password,
+            attempts=args.attempts, ap_check_target=args.ap_check_target,
+            overall_timeout_s=args.overall_timeout_s, build_dir=args.build_dir,
+        )
+    elif args.cell == "wifi-lwip-smoke":
+        report = run_wifi_lwip_smoke_cell(
+            uart_port=args.uart, uart_baud=args.uart_baud,
+            ssid=args.ssid, password=args.password,
+            attempts=args.attempts, build_dir=args.build_dir,
+        )
+    else:
+        print(f"cell {args.cell!r} not supported", file=sys.stderr)
         return 2
-    report = run_wifi_blob_cell(
-        uart_port=args.uart, uart_baud=args.uart_baud,
-        ssid=args.ssid, password=args.password,
-        attempts=args.attempts, ap_check_target=args.ap_check_target,
-        overall_timeout_s=args.overall_timeout_s, build_dir=args.build_dir,
-    )
     if report.success_rate >= args.success_floor:
         print(f"\nPASS: success rate {report.success_rate * 100:.1f}% "
               f">= floor {args.success_floor * 100:.1f}%")
