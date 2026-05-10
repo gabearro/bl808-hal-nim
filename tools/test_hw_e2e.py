@@ -75,3 +75,73 @@ def test_print_cell_summary_emits_per_phase_table(capsys):
     assert "wifi-blob" in out
     assert "1/2" in out  # ok count
     assert "auth" in out  # phase that failed
+
+
+def test_echo_server_starts_on_kernel_assigned_port():
+    """EchoServer binds to 0.0.0.0:0; .port returns the kernel-assigned port."""
+    from hw_e2e import EchoServer
+    server = EchoServer()
+    server.start()
+    try:
+        assert server.port > 0
+        assert server.port < 65536
+    finally:
+        server.stop()
+
+
+def test_echo_server_echoes_received_bytes():
+    """A client connecting to EchoServer.port and sending bytes gets them back."""
+    import socket
+    from hw_e2e import EchoServer
+    server = EchoServer()
+    server.start()
+    try:
+        with socket.create_connection(("127.0.0.1", server.port), timeout=2.0) as s:
+            s.sendall(b"BL808-E2E-PROBE\n")
+            received = b""
+            while len(received) < 16:
+                chunk = s.recv(64)
+                if not chunk:
+                    break
+                received += chunk
+        assert received == b"BL808-E2E-PROBE\n"
+    finally:
+        server.stop()
+
+
+def test_echo_server_handles_multiple_sequential_connections():
+    """Each TCP connection is independent; server keeps accepting after one closes."""
+    import socket
+    from hw_e2e import EchoServer
+    server = EchoServer()
+    server.start()
+    try:
+        for i in range(3):
+            with socket.create_connection(("127.0.0.1", server.port), timeout=2.0) as s:
+                s.sendall(f"hello-{i}".encode())
+                received = b""
+                while len(received) < len(f"hello-{i}"):
+                    chunk = s.recv(64)
+                    if not chunk:
+                        break
+                    received += chunk
+            assert received == f"hello-{i}".encode()
+    finally:
+        server.stop()
+
+
+def test_echo_server_stop_releases_port():
+    """After .stop(), the port is free for another bind."""
+    import socket
+    from hw_e2e import EchoServer
+    server = EchoServer()
+    server.start()
+    port = server.port
+    server.stop()
+    # If the port is still held, this connect will fail or the next bind will EADDRINUSE.
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("127.0.0.1", port))  # should succeed
+    finally:
+        s.close()

@@ -15,8 +15,10 @@ import argparse
 import dataclasses
 import io
 import json
+import socket as _socket
 import subprocess
 import sys
+import threading as _threading
 import time
 from pathlib import Path
 from typing import IO
@@ -185,6 +187,61 @@ def run_wifi_blob_cell(
         extra={"uart_log": str(log_path)},
     )
     return report
+
+
+class EchoServer:
+    """Tiny TCP echo server: bind to 0.0.0.0:0, accept loop on a daemon thread,
+    each connection gets its bytes echoed back. Used by the WiFi e2e harness so
+    the board has a known TCP target on the harness host's LAN.
+    """
+
+    def __init__(self) -> None:
+        self._sock: _socket.socket | None = None
+        self._thread: _threading.Thread | None = None
+        self._stop_evt = _threading.Event()
+        self.port: int = 0
+
+    def start(self) -> None:
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", 0))
+        s.listen(4)
+        s.settimeout(0.2)  # allow accept loop to check stop flag
+        self._sock = s
+        self.port = s.getsockname()[1]
+        self._stop_evt.clear()
+        self._thread = _threading.Thread(target=self._accept_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
+    def _accept_loop(self) -> None:
+        while not self._stop_evt.is_set():
+            try:
+                conn, _addr = self._sock.accept()  # type: ignore[union-attr]
+            except _socket.timeout:
+                continue
+            except OSError:
+                # socket closed by stop()
+                return
+            try:
+                data = conn.recv(64)
+                if data:
+                    conn.sendall(data)
+            except OSError:
+                pass
+            finally:
+                conn.close()
 
 
 def main(argv: list[str]) -> int:
