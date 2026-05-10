@@ -91,7 +91,8 @@ elif defined(bl808d0):
     regSet(txAddr, (1'u32 shl 6) or (1'u32 shl 1) or (1'u32 shl 4))
     let rxAddr = GpioConfigBase + 17 * 4
     regSet(rxAddr, (1'u32 shl 0) or (1'u32 shl 1) or (1'u32 shl 4))
-    enableMmPeriphClock(4)
+    resetMmUart3()
+    enableMmUart3Clock()
 
     let console = initUart(uart3, DefaultUartConfig, DefaultClkHz)
 

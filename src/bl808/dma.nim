@@ -49,14 +49,14 @@ proc channelBase(dmaBase: uint, ch: uint32): uint {.inline.} =
 # =============================================================================
 const
   CtrlTransferSizeMask* = 0xFFF'u32    # Transfer size [11:0]
-  CtrlSBSizeShift*      = 12           # Source burst size [14:12]
-  CtrlSBSizeMask*       = 0x07'u32 shl 12
-  CtrlDBSizeShift*      = 15           # Dest burst size [17:15]
-  CtrlDBSizeMask*       = 0x07'u32 shl 15
-  CtrlSWidthShift*      = 18           # Source transfer width [20:18]
-  CtrlSWidthMask*       = 0x07'u32 shl 18
-  CtrlDWidthShift*      = 21           # Dest transfer width [23:21]
-  CtrlDWidthMask*       = 0x07'u32 shl 21
+  CtrlSBSizeShift*      = 12           # Source burst size [13:12]
+  CtrlSBSizeMask*       = 0x03'u32 shl 12
+  CtrlDBSizeShift*      = 15           # Dest burst size [16:15]
+  CtrlDBSizeMask*       = 0x03'u32 shl 15
+  CtrlSWidthShift*      = 18           # Source transfer width [19:18]
+  CtrlSWidthMask*       = 0x03'u32 shl 18
+  CtrlDWidthShift*      = 21           # Dest transfer width [22:21]
+  CtrlDWidthMask*       = 0x03'u32 shl 21
   CtrlSrcIncr*          = 26           # Source address increment
   CtrlDstIncr*          = 27           # Dest address increment
   CtrlTcIntEnable*      = 31           # TC interrupt enable

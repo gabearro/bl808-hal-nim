@@ -20,6 +20,12 @@ MEMORY
     PSRAM (rwx) : ORIGIN = 0x50000000, LENGTH = 64M
 }
 
+PHDRS
+{
+    text PT_LOAD FLAGS(5); /* R + X */
+    data PT_LOAD FLAGS(6); /* R + W */
+}
+
 _stack_size = 8K;
 
 SECTIONS
@@ -27,7 +33,7 @@ SECTIONS
     .init : ALIGN(4)
     {
         KEEP(*(.init))
-    } > DRAM
+    } > DRAM :text
 
     .text : ALIGN(4)
     {
@@ -35,7 +41,7 @@ SECTIONS
         *(.rodata .rodata.*)
         *(.srodata .srodata.*)
         . = ALIGN(4);
-    } > DRAM
+    } > DRAM :text
 
     _sidata = LOADADDR(.data);
 
@@ -46,7 +52,7 @@ SECTIONS
         *(.sdata .sdata.*)
         . = ALIGN(8);
         _edata = .;
-    } > DRAM
+    } > DRAM :data
 
     .bss (NOLOAD) : ALIGN(8)
     {
@@ -56,21 +62,24 @@ SECTIONS
         *(COMMON)
         . = ALIGN(8);
         _ebss = .;
-    } > DRAM
-
-    .stack (NOLOAD) : ALIGN(16)
-    {
-        . = . + _stack_size;
-        . = ALIGN(16);
-        _sp = .;
-    } > DRAM
+    } > DRAM :data
 
     .heap (NOLOAD) : ALIGN(8)
     {
         _sheap = .;
         . = ORIGIN(DRAM) + LENGTH(DRAM) - _stack_size;
+        . = ALIGN(16);
         _eheap = .;
-    } > DRAM
+    } > DRAM :data
+
+    .stack (NOLOAD) : ALIGN(16)
+    {
+        _sstack = .;
+        . = ORIGIN(DRAM) + LENGTH(DRAM);
+        . = ALIGN(16);
+        _estack = .;
+        _sp = .;
+    } > DRAM :data
 
     /DISCARD/ :
     {
@@ -78,4 +87,9 @@ SECTIONS
         *(.note.*)
         *(.eh_frame*)
     }
+
 }
+
+ASSERT(_eheap >= _sheap, "D0 DRAM overflow: no space left for heap")
+ASSERT(_sstack == ORIGIN(DRAM) + LENGTH(DRAM) - _stack_size,
+       "D0 stack is not placed at top of DRAM")

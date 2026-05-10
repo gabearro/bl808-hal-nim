@@ -1,23 +1,23 @@
 ## BL808 Audio Codec driver.
 ##
-## AUADC at 0x2000AC00 — Audio ADC (microphone input, PDM)
-## AUDAC at 0x20055000 — Audio DAC (speaker/headphone output)
+## AUDAC at 0x20055000 (AudioBase) — Audio DAC (speaker/headphone output).
+## AUADC/PDM at 0x2000AC00 (AuadcBase) — audio ADC / PDM microphone input.
 ##
-## Register layouts from bouffalo_sdk auadc_reg.h and audac_reg.h.
+## The AUDAC register layout is from bouffalo_sdk audac_reg.h.
 
 import mmio, memmap
 
 # =============================================================================
-# AUADC (Audio ADC) register offsets — base 0x2000AC00
+# AUADC / PDM register offsets — base 0x2000AC00
 # =============================================================================
 const
-  AuadcPdmTop*      = AuadcBase + 0x00'u  # Clock gate, ADC rate
-  AuadcPdmItf*      = AuadcBase + 0x04'u  # ADC ch0 enable, ITF enable
-  AuadcPdmAdc0*     = AuadcBase + 0x08'u  # FIR mode
-  AuadcPdmAdc1*     = AuadcBase + 0x0C'u  # K1/K2 gain coefficients
-  AuadcPdmDac0*     = AuadcBase + 0x10'u  # PDM H/L, ADC source select
-  AuadcPdmPdm0*     = AuadcBase + 0x1C'u  # PDM enable, channel select
-  AuadcAdcS0*       = AuadcBase + 0x38'u  # Volume control (9 bits)
+  AuadcPdmTop*      = AuadcBase + 0x00'u  # PDM top config
+  AuadcPdmItf*      = AuadcBase + 0x04'u  # PDM/audio interface mux
+  AuadcPdmAdc0*     = AuadcBase + 0x08'u  # PDM ADC config 0
+  AuadcPdmAdc1*     = AuadcBase + 0x0C'u  # PDM ADC config 1
+  AuadcPdmDac0*     = AuadcBase + 0x10'u  # PDM DAC/source config
+  AuadcPdmPdm0*     = AuadcBase + 0x1C'u  # PDM config
+  AuadcAdcS0*       = AuadcBase + 0x38'u  # ADC volume
   AuadcAnaCfg1*     = AuadcBase + 0x60'u  # PGA chop, noise, current ctrl
   AuadcAnaCfg2*     = AuadcBase + 0x64'u  # Dither, quantization, DEM, SDM
   AuadcCmd*         = AuadcBase + 0x68'u  # ODR, PGA gain/mode, ch select, enable

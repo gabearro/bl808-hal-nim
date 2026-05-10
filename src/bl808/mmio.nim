@@ -3,6 +3,8 @@
 ## All peripheral register access goes through these routines,
 ## which guarantee volatile semantics.
 
+from std/volatile import volatileStore, volatileLoad
+
 proc regRead*(address: uint): uint32 {.inline.} =
   ## Read a 32-bit memory-mapped register.
   volatileLoad(cast[ptr uint32](address))

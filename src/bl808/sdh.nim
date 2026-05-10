@@ -204,6 +204,7 @@ proc sdhCardStable*(): bool =
 # =============================================================================
 proc sdhSendCommand*(cmdIndex: uint32, argument: uint32,
                      respType: SdhRespType, dataPresent: bool = false,
+                     transferMode: uint16 = 0, crcCheck: bool = true,
                      timeout: uint32 = 1_000_000): SdhError =
   ## Send an SD command and wait for completion.
 
@@ -217,13 +218,14 @@ proc sdhSendCommand*(cmdIndex: uint32, argument: uint32,
   regWrite(SdhArgument, argument)
 
   # Build command register value
-  var cmd = (cmdIndex shl CmdIdxShift) or
+  var cmd = transferMode.uint32 or
+            (cmdIndex shl CmdIdxShift) or
             (respType.uint32 shl CmdRespTypeShift)
-  if respType == resp48bit or respType == resp48busy:
+  if crcCheck and (respType == resp48bit or respType == resp48busy):
     # Enable CRC and index check for R1/R6/R7 responses.
-    # R3 (OCR) has no CRC — caller should use resp48bit only for R1/R6/R7.
+    # R3 (OCR) has no CRC or index check, so callers pass crcCheck = false.
     cmd = cmd or (1'u32 shl CmdCrcEn) or (1'u32 shl CmdIdxEn)
-  elif respType == resp136bit:
+  elif crcCheck and respType == resp136bit:
     cmd = cmd or (1'u32 shl CmdCrcEn)  # R2 has CRC but no index
   if dataPresent:
     cmd = cmd or (1'u32 shl CmdDataPresent)
@@ -275,10 +277,10 @@ proc sdhSetHighSpeed*(enable: bool) =
   else:
     regClear(SdhHostCtrl, 1'u32 shl HcHighSpeed)
 
-proc sdhSetClockDiv*(div: uint32) =
+proc sdhSetClockDiv*(divider: uint32) =
   ## Set SD clock divider (0=base clock, 1=/2, 2=/4, etc.).
   regClear(SdhClockCtrl, 1'u32 shl ClkSdClkEn)
-  regModify(SdhClockCtrl, ClkFreqSelMask, (div and 0xFF) shl ClkFreqSelShift)
+  regModify(SdhClockCtrl, ClkFreqSelMask, (divider and 0xFF) shl ClkFreqSelShift)
   regSet(SdhClockCtrl, 1'u32 shl ClkSdClkEn)
 
 # =============================================================================

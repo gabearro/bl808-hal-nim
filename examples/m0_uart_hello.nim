@@ -2,15 +2,15 @@
 ##
 ## Build: nim c -d:bl808m0 examples/m0_uart_hello.nim
 ##
-## Ox64 M0 console: UART0, GPIO14 (TX), GPIO15 (RX), 2 Mbps.
-## Connect a USB-serial adapter at 2000000 baud.
+## Ox64 M0 console: UART0, GPIO14 (TX), GPIO15 (RX), 230400 baud by default.
+## Override with `-d:ConsoleBaud=<baud>` when needed.
 
 import bl808
 
 const
   ConsoleUartTxPin = 14'u32
   ConsoleUartRxPin = 15'u32
-  ConsoleBaud = 2_000_000'u32
+  ConsoleBaud {.intdefine.} = 230_400'u32
   DefaultClkHz = 32_000_000'u32  # RC32M boot clock
 
 proc main() {.exportc, cdecl.} =

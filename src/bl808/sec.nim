@@ -14,45 +14,46 @@ import mmio, memmap
 const
   SecBase*          = SecEngBase  # 0x20004000
 
-  # AES registers
-  AesCfg*           = SecBase + 0x000'u  # AES configuration
-  AesMsk*           = SecBase + 0x004'u  # AES mask
-  AesStatus*        = SecBase + 0x008'u  # AES status
-  AesIntSts*        = SecBase + 0x00C'u  # AES interrupt status
-  AesKey0*          = SecBase + 0x010'u  # AES key word 0 (8 words, 0x010-0x02C)
-  AesIv0*           = SecBase + 0x030'u  # AES IV word 0 (4 words, 0x030-0x03C)
-  AesSrcAddr*       = SecBase + 0x040'u  # Source data address
-  AesDstAddr*       = SecBase + 0x044'u  # Destination data address
-  AesMsgLen*        = SecBase + 0x048'u  # Message length
-  AesEndian*        = SecBase + 0x04C'u  # Endian config
-  AesLinkCfg*       = SecBase + 0x050'u  # Link mode config
-
   # SHA registers
-  ShaCfg*           = SecBase + 0x100'u  # SHA configuration
-  ShaStatus*        = SecBase + 0x104'u  # SHA status
-  ShaIntSts*        = SecBase + 0x108'u  # SHA interrupt status
-  ShaSrcAddr*       = SecBase + 0x10C'u  # Source data address
-  ShaMsgLen*        = SecBase + 0x110'u  # Message length
-  ShaHash0*         = SecBase + 0x114'u  # Hash output word 0 (8 words)
-  ShaLink*          = SecBase + 0x134'u  # SHA link mode config
-  ShaEndian*        = SecBase + 0x13C'u  # SHA endian
+  ShaCfg*           = SecBase + 0x000'u  # SHA configuration/control
+  ShaSrcAddr*       = SecBase + 0x004'u  # Source data address
+  ShaStatus*        = SecBase + 0x008'u  # SHA status
+  ShaEndian*        = SecBase + 0x00C'u  # SHA endian config
+  ShaHash0*         = SecBase + 0x010'u  # Hash output low word 0 (8 words)
+  ShaHashHigh0*     = SecBase + 0x030'u  # Hash output high word 0 (SHA-384/512)
+  ShaLink*          = SecBase + 0x050'u  # SHA link mode config
+  ShaCtrlProt*      = SecBase + 0x0FC'u  # SHA access protection
+
+  # AES registers
+  AesCfg*           = SecBase + 0x100'u  # AES configuration/control
+  AesSrcAddr*       = SecBase + 0x104'u  # Source data address
+  AesDstAddr*       = SecBase + 0x108'u  # Destination data address
+  AesStatus*        = SecBase + 0x10C'u  # AES status
+  AesIv0*           = SecBase + 0x110'u  # AES IV word 0 (4 words, 0x110-0x11C)
+  AesKey0*          = SecBase + 0x120'u  # AES key word 0 (8 words, 0x120-0x13C)
+  AesKeySel0*       = SecBase + 0x140'u  # Hardware key select 0
+  AesKeySel1*       = SecBase + 0x144'u  # Hardware key select 1
+  AesEndian*        = SecBase + 0x148'u  # Endian config
+  AesSboot*         = SecBase + 0x14C'u  # Secure boot / XTS config
+  AesLinkCfg*       = SecBase + 0x150'u  # Link mode config
+  AesCtrlProt*      = SecBase + 0x1FC'u  # AES access protection
 
   # TRNG registers
   TrngCtrl0*        = SecBase + 0x200'u  # TRNG control 0
-  TrngCtrl1*        = SecBase + 0x204'u  # TRNG control 1
-  TrngCtrl2*        = SecBase + 0x208'u  # TRNG control 2
-  TrngCtrl3*        = SecBase + 0x20C'u  # TRNG control 3
-  TrngStatus*       = SecBase + 0x210'u  # TRNG status
-  TrngData0*        = SecBase + 0x214'u  # TRNG output word 0
-  TrngData1*        = SecBase + 0x218'u  # TRNG output word 1
-  TrngData2*        = SecBase + 0x21C'u  # TRNG output word 2
-  TrngData3*        = SecBase + 0x220'u  # TRNG output word 3
-  TrngData4*        = SecBase + 0x224'u  # TRNG output word 4
-  TrngData5*        = SecBase + 0x228'u  # TRNG output word 5
-  TrngData6*        = SecBase + 0x22C'u  # TRNG output word 6
-  TrngData7*        = SecBase + 0x230'u  # TRNG output word 7
-  TrngIntSts*       = SecBase + 0x234'u  # TRNG interrupt status
-  TrngIntMask*      = SecBase + 0x238'u  # TRNG interrupt mask
+  TrngStatus*       = SecBase + 0x204'u  # TRNG status
+  TrngData0*        = SecBase + 0x208'u  # TRNG output word 0
+  TrngData1*        = SecBase + 0x20C'u  # TRNG output word 1
+  TrngData2*        = SecBase + 0x210'u  # TRNG output word 2
+  TrngData3*        = SecBase + 0x214'u  # TRNG output word 3
+  TrngData4*        = SecBase + 0x218'u  # TRNG output word 4
+  TrngData5*        = SecBase + 0x21C'u  # TRNG output word 5
+  TrngData6*        = SecBase + 0x220'u  # TRNG output word 6
+  TrngData7*        = SecBase + 0x224'u  # TRNG output word 7
+  TrngTest*         = SecBase + 0x228'u  # TRNG test control
+  TrngCtrl1*        = SecBase + 0x22C'u  # TRNG reseed low
+  TrngCtrl2*        = SecBase + 0x230'u  # TRNG reseed high
+  TrngCtrl3*        = SecBase + 0x234'u  # TRNG health-test control
+  TrngCtrlProt*     = SecBase + 0x2FC'u  # TRNG access protection
 
   # PKA registers
   PkaCtrl0*         = SecBase + 0x300'u  # PKA control 0
@@ -64,34 +65,54 @@ const
 # AES configuration fields
 # =============================================================================
 const
-  AesCfgEn*        = 0        # AES enable
-  AesCfgModeShift* = 1        # AES mode [2:1]: 0=ECB, 1=CTR, 2=CBC
-  AesCfgModeMask*  = 0x03'u32 shl 1
-  AesCfgDecEn*     = 3        # Decrypt mode (0=encrypt, 1=decrypt)
-  AesCfgKeySizeShift* = 4     # Key size [5:4]: 0=128, 1=192, 2=256
-  AesCfgKeySizeMask*  = 0x03'u32 shl 4
-  AesCfgDmaEn*     = 6        # DMA mode enable
-  AesCfgMsgLenEn*  = 7        # Message length enable
-  AesCfgIntDone*   = 8        # Interrupt on done
+  AesCfgTrigger*   = 1        # Start operation (write 1 pulse)
+  AesCfgEn*        = 2        # AES enable
+  AesCfgKeySizeShift* = 3     # Key size/mode [4:3]
+  AesCfgKeySizeMask*  = 0x03'u32 shl 3
+  AesCfgModeShift* = 12       # Block mode [13:12]: 0=ECB, 1=CTR, 2=CBC, 3=XTS
+  AesCfgModeMask*  = 0x03'u32 shl 12
+  AesCfgDecEn*     = 5        # Decrypt mode (0=encrypt, 1=decrypt)
+  AesCfgHwKeyEn*   = 7        # Use eFuse-backed hardware key
+  AesCfgIntDone*   = 8        # Done interrupt flag
+  AesCfgIntClear*  = 9        # Clear done interrupt (write 1 pulse)
+  AesCfgIntMask*   = 11       # Done interrupt mask
+  AesCfgIvSel*     = 14       # IV source select
+  AesCfgLinkMode*  = 15       # Descriptor link mode
+  AesCfgMsgLenShift* = 16     # Message length in 16-byte blocks
+  AesCfgMsgLenMask*  = 0xFFFF'u32 shl 16
   AesCfgBusy*      = 0        # Busy (in status register)
 
 # =============================================================================
 # SHA configuration fields
 # =============================================================================
 const
-  ShaCfgEn*        = 0        # SHA enable
-  ShaCfgModeShift* = 1        # SHA mode [3:1]: 0=SHA256, 1=SHA224, 2=SHA1, 3=SHA1
-  ShaCfgModeMask*  = 0x07'u32 shl 1
-  ShaCfgHashSel*   = 4        # Hash select
-  ShaCfgIntDone*   = 8        # Interrupt on done
+  ShaCfgTrigger*   = 1        # Start operation (write 1 pulse)
+  ShaCfgModeShift* = 2        # SHA/CRC mode [4:2]
+  ShaCfgModeMask*  = 0x07'u32 shl 2
+  ShaCfgEn*        = 5        # SHA enable
+  ShaCfgHashSel*   = 6        # Accumulate from existing hash
+  ShaCfgIntDone*   = 8        # Done interrupt flag
+  ShaCfgIntClear*  = 9        # Clear done interrupt (write 1 pulse)
+  ShaCfgIntMask*   = 11       # Done interrupt mask
+  ShaCfgModeExtShift* = 12    # Extended mode [13:12]
+  ShaCfgModeExtMask*  = 0x03'u32 shl 12
+  ShaCfgLinkMode*  = 15       # Descriptor link mode
+  ShaCfgMsgLenShift* = 16     # Message length in blocks
+  ShaCfgMsgLenMask*  = 0xFFFF'u32 shl 16
   ShaCfgBusy*      = 0        # Busy (in status register)
 
 # =============================================================================
 # TRNG control fields
 # =============================================================================
 const
-  TrngEn*          = 0        # TRNG enable
-  TrngIntEn*       = 1        # Interrupt enable
+  TrngBusy*        = 0        # Busy
+  TrngTrigger*     = 1        # Start operation (write 1 pulse)
+  TrngEn*          = 2        # TRNG enable
+  TrngDoutClear*   = 3        # Clear output data (write 1 pulse)
+  TrngHealthError* = 4        # Health-test error
+  TrngIntDone*     = 8        # Done interrupt flag
+  TrngIntClear*    = 9        # Clear done interrupt (write 1 pulse)
+  TrngIntMask*     = 11       # Done interrupt mask
   TrngReady*       = 0        # Data ready (in status register)
 
 # =============================================================================
@@ -131,6 +152,16 @@ proc aesSetIv*(iv: array[4, uint32]) =
   for i in 0 ..< 4:
     regWrite(AesIv0 + i.uint * 4, iv[i])
 
+proc aesKeyMode(keySize: AesKeySize): uint32 {.inline.} =
+  ## BL808 SEC_ENG encodes AES-256 as mode 1 and AES-192 as mode 2.
+  case keySize
+  of aes128: 0'u32
+  of aes192: 2'u32
+  of aes256: 1'u32
+
+proc aesBlocks(length: uint32): uint32 {.inline.} =
+  if length == 0: 0'u32 else: (length + 15'u32) div 16'u32
+
 proc aesEncryptBlock*(src, dst: uint32, length: uint32,
                       mode: AesMode, keySize: AesKeySize): SecError =
   ## Encrypt data using AES. `src` and `dst` are memory addresses.
@@ -138,28 +169,24 @@ proc aesEncryptBlock*(src, dst: uint32, length: uint32,
 
   # Wait for any previous operation
   var timeout = 100_000'u32
-  while (regRead(AesStatus) and 1) != 0:
+  while (regRead(AesCfg) and (1'u32 shl AesCfgBusy)) != 0:
     timeout.dec
     if timeout == 0: return secBusy
 
-  # Configure
-  var cfg = (1'u32 shl AesCfgEn)
-  cfg = cfg or (mode.uint32 shl AesCfgModeShift)
-  cfg = cfg or (keySize.uint32 shl AesCfgKeySizeShift)
-  cfg = cfg or (1'u32 shl AesCfgMsgLenEn)
-  regWrite(AesCfg, cfg)
-
-  # Set addresses and length
+  # Set addresses before triggering the engine.
   regWrite(AesSrcAddr, src)
   regWrite(AesDstAddr, dst)
-  regWrite(AesMsgLen, length)
 
-  # Start
-  regSet(AesCfg, 1'u32 shl AesCfgDmaEn)
+  var cfg = (1'u32 shl AesCfgEn)
+  cfg = cfg or (mode.uint32 shl AesCfgModeShift)
+  cfg = cfg or (aesKeyMode(keySize) shl AesCfgKeySizeShift)
+  cfg = cfg or ((aesBlocks(length) shl AesCfgMsgLenShift) and AesCfgMsgLenMask)
+  cfg = cfg or (1'u32 shl AesCfgTrigger)
+  regWrite(AesCfg, cfg)
 
   # Wait for completion
   timeout = 1_000_000
-  while (regRead(AesStatus) and 1) != 0:
+  while (regRead(AesCfg) and (1'u32 shl AesCfgBusy)) != 0:
     timeout.dec
     if timeout == 0: return secTimeout
 
@@ -169,24 +196,22 @@ proc aesDecryptBlock*(src, dst: uint32, length: uint32,
                       mode: AesMode, keySize: AesKeySize): SecError =
   ## Decrypt data using AES.
   var timeout = 100_000'u32
-  while (regRead(AesStatus) and 1) != 0:
+  while (regRead(AesCfg) and (1'u32 shl AesCfgBusy)) != 0:
     timeout.dec
     if timeout == 0: return secBusy
 
-  var cfg = (1'u32 shl AesCfgEn) or (1'u32 shl AesCfgDecEn)
-  cfg = cfg or (mode.uint32 shl AesCfgModeShift)
-  cfg = cfg or (keySize.uint32 shl AesCfgKeySizeShift)
-  cfg = cfg or (1'u32 shl AesCfgMsgLenEn)
-  regWrite(AesCfg, cfg)
-
   regWrite(AesSrcAddr, src)
   regWrite(AesDstAddr, dst)
-  regWrite(AesMsgLen, length)
 
-  regSet(AesCfg, 1'u32 shl AesCfgDmaEn)
+  var cfg = (1'u32 shl AesCfgEn) or (1'u32 shl AesCfgDecEn)
+  cfg = cfg or (mode.uint32 shl AesCfgModeShift)
+  cfg = cfg or (aesKeyMode(keySize) shl AesCfgKeySizeShift)
+  cfg = cfg or ((aesBlocks(length) shl AesCfgMsgLenShift) and AesCfgMsgLenMask)
+  cfg = cfg or (1'u32 shl AesCfgTrigger)
+  regWrite(AesCfg, cfg)
 
   timeout = 1_000_000
-  while (regRead(AesStatus) and 1) != 0:
+  while (regRead(AesCfg) and (1'u32 shl AesCfgBusy)) != 0:
     timeout.dec
     if timeout == 0: return secTimeout
 
@@ -204,13 +229,17 @@ proc shaStart*(mode: ShaMode) =
 proc shaUpdate*(src: uint32, length: uint32): SecError =
   ## Feed data block into the SHA engine.
   regWrite(ShaSrcAddr, src)
-  regWrite(ShaMsgLen, length)
 
-  # Trigger processing
-  regSet(ShaCfg, 1'u32 shl ShaCfgHashSel)
+  let blocks = if length == 0: 0'u32 else: (length + 63'u32) div 64'u32
+  var cfg = regRead(ShaCfg)
+  cfg = cfg and (ShaCfgModeMask or ShaCfgModeExtMask or (1'u32 shl ShaCfgHashSel))
+  cfg = cfg or (1'u32 shl ShaCfgEn)
+  cfg = cfg or ((blocks shl ShaCfgMsgLenShift) and ShaCfgMsgLenMask)
+  cfg = cfg or (1'u32 shl ShaCfgTrigger)
+  regWrite(ShaCfg, cfg)
 
   var timeout = 1_000_000'u32
-  while (regRead(ShaStatus) and 1) != 0:
+  while (regRead(ShaCfg) and (1'u32 shl ShaCfgBusy)) != 0:
     timeout.dec
     if timeout == 0: return secTimeout
 
@@ -231,7 +260,7 @@ proc shaFinish*() =
 # =============================================================================
 proc trngEnable*() =
   ## Enable the hardware TRNG.
-  regSet(TrngCtrl0, 1'u32 shl TrngEn)
+  regWrite(TrngCtrl0, (1'u32 shl TrngEn) or (1'u32 shl TrngTrigger))
 
 proc trngDisable*() =
   regClear(TrngCtrl0, 1'u32 shl TrngEn)
@@ -241,18 +270,21 @@ proc trngReady*(): bool =
 
 proc trngRead*(timeout: uint32 = 100_000): (uint32, SecError) =
   ## Read a 32-bit random number from the TRNG.
+  if not trngReady():
+    trngEnable()
   var countdown = timeout
   while not trngReady():
     countdown.dec
     if countdown == 0: return (0'u32, secTimeout)
 
   let value = regRead(TrngData0)
-  # Acknowledge (some implementations need a status clear)
-  regSet(TrngIntSts, 1'u32)
+  regWrite(TrngCtrl0, (1'u32 shl TrngEn) or (1'u32 shl TrngIntClear))
   (value, secOk)
 
 proc trngReadAll*(output: var array[8, uint32], timeout: uint32 = 100_000): SecError =
   ## Read all 8 TRNG output words (256 bits of randomness).
+  if not trngReady():
+    trngEnable()
   var countdown = timeout
   while not trngReady():
     countdown.dec
@@ -260,7 +292,7 @@ proc trngReadAll*(output: var array[8, uint32], timeout: uint32 = 100_000): SecE
 
   for i in 0 ..< 8:
     output[i] = regRead(TrngData0 + i.uint * 4)
-  regSet(TrngIntSts, 1'u32)
+  regWrite(TrngCtrl0, (1'u32 shl TrngEn) or (1'u32 shl TrngIntClear))
   secOk
 
 proc trngFillBuffer*(buf: var openArray[uint8]): SecError =

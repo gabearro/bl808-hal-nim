@@ -90,7 +90,7 @@ const
 # Types
 # =============================================================================
 type
-  AdcChannel* = range[0..11]
+  AdcChannel* = range[0..15]
     ## ADC channels 0-11 map to GPIO pins via analog mux.
     ## Channel 12 = DAC output A, 13 = DAC output B
     ## Channel 14 = TSEN (temperature sensor)

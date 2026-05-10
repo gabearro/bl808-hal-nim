@@ -6,35 +6,60 @@
 import mmio, memmap
 
 # =============================================================================
-# DBI register offsets
+# DBI register offsets (verified against the BL808 RM and hardware)
 # =============================================================================
 const
   DbiConfig*        = DbiBase + 0x00'u   # DBI configuration
   DbiIntSts*        = DbiBase + 0x04'u   # Interrupt status
-  DbiIntMask*       = DbiBase + 0x08'u   # Interrupt mask
-  DbiPixCfg*        = DbiBase + 0x0C'u   # Pixel configuration
-  DbiCmd*           = DbiBase + 0x10'u   # Command register
-  DbiData*          = DbiBase + 0x14'u   # Data register
-  DbiPeriod*        = DbiBase + 0x18'u   # Clock period
-  DbiAddrCfg*       = DbiBase + 0x1C'u   # Address config (column/page)
+  DbiBusBusyReg*    = DbiBase + 0x08'u   # Bus busy status
+  DbiPixCnt*        = DbiBase + 0x0C'u   # Pixel count and output format
+  DbiPixCfg*        = DbiPixCnt          # Backward-compatible alias
+  DbiPrd*           = DbiBase + 0x10'u   # Clock period
+  DbiCmd*           = DbiConfig          # Command lives in DBI_CONFIG[15:8]
+  DbiWdata*         = DbiBase + 0x18'u   # Write data
+  DbiRdata*         = DbiBase + 0x1C'u   # Read data
   DbiFifoCfg0*      = DbiBase + 0x80'u   # FIFO config 0
   DbiFifoCfg1*      = DbiBase + 0x84'u   # FIFO config 1
   DbiFifoWdata*     = DbiBase + 0x88'u   # FIFO write data
-  DbiFifoRdata*     = DbiBase + 0x8C'u   # FIFO read data
 
 # =============================================================================
 # DBI_CONFIG fields
 # =============================================================================
 const
   DbiEn*            = 0       # DBI enable
-  DbiModeShift*     = 1       # DBI mode [2:1]: 0=TypeB_8080, 1=TypeB_6800, 2=TypeC_SPI3, 3=TypeC_SPI4
-  DbiModeMask*      = 0x03'u32 shl 1
-  DbiPixFmtShift*   = 4       # Pixel format [5:4]
-  DbiPixFmtMask*    = 0x03'u32 shl 4
-  DbiContinuousEn*  = 8       # Continuous mode enable
-  DbiDmaEn*         = 9       # DMA enable
-  DbiSclkPol*       = 12      # SPI clock polarity (Type C)
-  DbiSclkPhase*     = 13      # SPI clock phase (Type C)
+  DbiSel*           = 1       # 0=Type B, 1=Type C
+  DbiCmdEn*         = 2       # Command phase enable
+  DbiDatEn*         = 3       # Data phase enable
+  DbiDatWr*         = 4       # Data write (1=write, 0=read)
+  DbiDatTp*         = 5       # Data type (0=parameter, 1=pixel)
+  DbiDatBcShift*    = 6       # Data byte count [7:6]
+  DbiDatBcMask*     = 0x03'u32 shl DbiDatBcShift
+  DbiCmdShift*      = 8       # Command byte [15:8]
+  DbiCmdMask*       = 0xFF'u32 shl DbiCmdShift
+  DbiSclkPol*       = 16      # SPI clock polarity (Type C)
+  DbiSclkPhase*     = 17      # SPI clock phase (Type C)
+  DbiContinuousEn*  = 18      # Continuous mode enable
+  DbiDmyEn*         = 19      # Dummy cycle enable
+  DbiDmyCntShift*   = 20      # Dummy cycle count [23:20]
+  DbiDmyCntMask*    = 0x0F'u32 shl DbiDmyCntShift
+  DbiTc3WireMode*   = 27      # Type C 3-wire mode enable
+  DbiTcDegEn*       = 28      # Type C input deglitch enable
+  DbiTcDegCntShift* = 29      # Type C deglitch cycle count [31:29]
+  DbiTcDegCntMask*  = 0x07'u32 shl DbiTcDegCntShift
+  DbiBusBusy*       = 0       # DBI_BUS_BUSY bit
+  DbiTypeSelectMask* = 1'u32 shl DbiSel
+  DbiTc3WireModeMask* = 1'u32 shl DbiTc3WireMode
+  DbiModeShift*     = DbiSel  # Compatibility alias; mode bits are not contiguous
+  DbiModeMask*      = DbiTypeSelectMask or DbiTc3WireModeMask
+
+# =============================================================================
+# DBI_PIX_CNT fields
+# =============================================================================
+const
+  DbiPixCountShift*  = 0
+  DbiPixCountMask*   = 0x00FF_FFFF'u32
+  DbiPixFormat*      = 31      # 0=RGB565, 1=RGB666/RGB888
+  DbiPixFormatMask*  = 1'u32 shl DbiPixFormat
 
 # =============================================================================
 # Types
@@ -57,33 +82,47 @@ type
 # =============================================================================
 # DBI operations
 # =============================================================================
+proc modeBits(mode: DbiMode): uint32 {.inline.} =
+  case mode
+  of dbi8080, dbi6800:
+    0'u32
+  of dbiSpi3Wire:
+    DbiTypeSelectMask or DbiTc3WireModeMask
+  of dbiSpi4Wire:
+    DbiTypeSelectMask
+
 proc initDbi*(mode: DbiMode = dbiSpi4Wire, pixFmt: DbiPixelFmt = dbiRgb565,
               clockDiv: uint32 = 4): Dbi =
   ## Initialize the DBI display interface.
   result.base = DbiBase
 
-  var cfg = 0'u32
-  cfg = cfg or (mode.uint32 shl DbiModeShift)
-  cfg = cfg or (pixFmt.uint32 shl DbiPixFmtShift)
+  var cfg = mode.modeBits()
+  cfg = cfg or (1'u32 shl DbiCmdEn) or (1'u32 shl DbiDatEn) or (1'u32 shl DbiDatWr)
   regWrite(DbiConfig, cfg)
 
+  var pix = regRead(DbiPixCnt)
+  pix = pix and not DbiPixFormatMask
+  if pixFmt != dbiRgb565:
+    pix = pix or DbiPixFormatMask
+  regWrite(DbiPixCnt, pix)
+
   # Set clock period
-  regWrite(DbiPeriod, clockDiv)
+  regWrite(DbiPrd, clockDiv)
 
   # Clear FIFO
-  regSet(DbiFifoCfg0, 0x0C'u32)
+  regSet(DbiFifoCfg0, 1'u32 shl 2)
 
 proc dbiWriteCmd*(dbi: Dbi, cmd: uint8) =
   ## Write a command byte to the display.
-  regWrite(DbiCmd, cmd.uint32)
+  regModify(DbiConfig, DbiCmdMask, cmd.uint32 shl DbiCmdShift)
 
 proc dbiWriteData*(dbi: Dbi, data: uint8) =
-  ## Write a data byte to the display.
-  regWrite(DbiData, data.uint32)
+  ## Write a data byte to the display command data register.
+  regWrite(DbiWdata, data.uint32)
 
 proc dbiWriteData16*(dbi: Dbi, data: uint16) =
-  ## Write a 16-bit data value.
-  regWrite(DbiData, data.uint32)
+  ## Write a 16-bit data value to the display command data register.
+  regWrite(DbiWdata, data.uint32)
 
 proc dbiWritePixels*(dbi: Dbi, pixels: openArray[uint16]) =
   ## Write pixel data (RGB565) to the display via FIFO.
@@ -103,9 +142,6 @@ proc dbiSetWindow*(dbi: Dbi, x0, y0, x1, y1: uint16) =
   dbi.dbiWriteData16(y0)
   dbi.dbiWriteData16(y1)
   dbi.dbiWriteCmd(0x2C)  # Memory write
-
-proc dbiEnableDma*(dbi: Dbi) =
-  regSet(DbiConfig, 1'u32 shl DbiDmaEn)
 
 proc dbiFifoAddr*(dbi: Dbi): uint {.inline.} =
   DbiFifoWdata

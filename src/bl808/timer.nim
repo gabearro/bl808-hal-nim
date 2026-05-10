@@ -46,15 +46,32 @@ const
   TimerTcvwr2*      = 0xA8'u  # Timer2 counter value read
   TimerTcvwr3*      = 0xAC'u  # Timer3 counter value read
   TimerTcdr*        = 0xBC'u  # Timer clock divider
+  TimerTcdrForce*   = 0xCC'u  # Force live divider update
 
 # =============================================================================
 # Timer clock control (TCCR) fields
 # =============================================================================
 const
-  TccrClk2SrcShift* = 2    # Timer2 clock source [3:2]
-  TccrClk2SrcMask*  = 0x03'u32 shl 2
-  TccrClk3SrcShift* = 5    # Timer3 clock source [6:5]
-  TccrClk3SrcMask*  = 0x03'u32 shl 5
+  TccrClk2SrcShift* = 0    # Timer2 clock source [3:0]
+  TccrClk2SrcMask*  = 0x0F'u32 shl TccrClk2SrcShift
+  TccrClk3SrcShift* = 4    # Timer3 clock source [7:4]
+  TccrClk3SrcMask*  = 0x0F'u32 shl TccrClk3SrcShift
+  TccrWdtSrcShift*  = 8    # Watchdog clock source [11:8]
+  TccrWdtSrcMask*   = 0x0F'u32 shl TccrWdtSrcShift
+
+# =============================================================================
+# Timer clock divider (TCDR) fields
+# =============================================================================
+const
+  TcdrTimer2Shift*  = 8
+  TcdrTimer2Mask*   = 0xFF'u32 shl TcdrTimer2Shift
+  TcdrTimer3Shift*  = 16
+  TcdrTimer3Mask*   = 0xFF'u32 shl TcdrTimer3Shift
+  TcdrWdtShift*     = 24
+  TcdrWdtMask*      = 0xFF'u32 shl TcdrWdtShift
+  TcdrForceTimer2*  = 1
+  TcdrForceTimer3*  = 2
+  TcdrForceWdt*     = 4
 
 # =============================================================================
 # Timer counter enable (TCER) fields
@@ -81,6 +98,8 @@ type
     timerClk1k     = 2   # 1 KHz (from 32K divider)
     timerClkXtal   = 3   # Crystal clock
 
+  WdtClkSrc* = TimerClkSrc
+
   TimerCountMode* = enum
     timerPreload   = 0   # Preload mode (auto-reload)
     timerFreeRun   = 1   # Free-running mode
@@ -88,6 +107,12 @@ type
   Timer* = object
     base: uint
     id: TimerId
+
+const
+  wdtClkFclk* = timerClkFclk
+  wdtClk32k*  = timerClk32k
+  wdtClk1k*   = timerClk1k
+  wdtClkXtal* = timerClkXtal
 
 # =============================================================================
 # Timer base address
@@ -116,12 +141,20 @@ proc setClockSource*(timer: Timer, ch: TimerChannel, src: TimerClkSrc) =
 
 proc setClockDiv*(timer: Timer, ch: TimerChannel, divider: uint32) =
   ## Set clock divider for a channel (0-255, actual divider = value + 1).
-  ## Timer2 divider is at bits [7:0], Timer3 at bits [15:8].
   case ch
   of timerCh2:
-    regModify(timer.base + TimerTcdr, 0xFF'u32, divider and 0xFF)
+    regModify(timer.base + TimerTcdr, TcdrTimer2Mask,
+              (divider and 0xFF) shl TcdrTimer2Shift)
   of timerCh3:
-    regModify(timer.base + TimerTcdr, 0xFF'u32 shl 8, (divider and 0xFF) shl 8)
+    regModify(timer.base + TimerTcdr, TcdrTimer3Mask,
+              (divider and 0xFF) shl TcdrTimer3Shift)
+
+proc forceClockDiv*(timer: Timer, ch: TimerChannel) =
+  ## Force a divider update while a timer channel is already running.
+  let bit = case ch
+    of timerCh2: TcdrForceTimer2
+    of timerCh3: TcdrForceTimer3
+  regWrite(timer.base + TimerTcdrForce, 1'u32 shl bit)
 
 proc setCountMode*(timer: Timer, ch: TimerChannel, mode: TimerCountMode) =
   let bit = case ch
@@ -214,26 +247,54 @@ proc setupPeriodic*(timer: Timer, ch: TimerChannel, periodTicks: uint32,
 const
   WmerWdtEn*   = 0    # Watchdog enable bit in WMER
   WmerWdtRst*  = 1    # Watchdog reset enable (1 = reset on timeout)
+  WmrWdtMatchMask* = 0xFFFF'u32
+  WdtWfarMagic* = 0x0000_BABA'u32
+  WdtWsarMagic* = 0x0000_EB10'u32
+
+proc setWdtClockSource*(timer: Timer, src: WdtClkSrc) =
+  regModify(timer.base + TimerTccr, TccrWdtSrcMask,
+            src.uint32 shl TccrWdtSrcShift)
+
+proc setWdtClockDiv*(timer: Timer, divider: uint32) =
+  ## Set watchdog clock divider (0-255, actual divider = value + 1).
+  regModify(timer.base + TimerTcdr, TcdrWdtMask,
+            (divider and 0xFF) shl TcdrWdtShift)
+
+proc forceWdtClockDiv*(timer: Timer) =
+  ## Force a watchdog divider update while the watchdog is already running.
+  regWrite(timer.base + TimerTcdrForce, 1'u32 shl TcdrForceWdt)
+
+proc wdtUnlock*(timer: Timer) =
+  ## Unlock the next write to protected watchdog registers.
+  regWrite(timer.base + TimerWfar, WdtWfarMagic)
+  regWrite(timer.base + TimerWsar, WdtWsarMagic)
 
 proc wdtEnable*(timer: Timer, matchValue: uint32, resetOnTimeout: bool = true) =
   ## Enable the watchdog timer with the given timeout value.
-  regWrite(timer.base + TimerWmr, matchValue)
+  timer.wdtUnlock()
+  regWrite(timer.base + TimerWmr, matchValue and WmrWdtMatchMask)
+  timer.wdtUnlock()
+  regWrite(timer.base + TimerWicr, 1'u32)
+  timer.wdtUnlock()
+  regWrite(timer.base + TimerWcr, 1'u32)
   var wmer = 1'u32 shl WmerWdtEn
   if resetOnTimeout:
     wmer = wmer or (1'u32 shl WmerWdtRst)
+  timer.wdtUnlock()
   regWrite(timer.base + TimerWmer, wmer)
 
 proc wdtDisable*(timer: Timer) =
+  timer.wdtUnlock()
   regClear(timer.base + TimerWmer, 1'u32 shl WmerWdtEn)
 
 proc wdtFeed*(timer: Timer) =
   ## Feed (kick) the watchdog to prevent timeout.
-  ## Must write magic sequences to WFAR then WSAR.
-  regWrite(timer.base + TimerWfar, 0xBABA_0000'u32)
-  regWrite(timer.base + TimerWsar, 0x5A5A_0000'u32)
+  timer.wdtUnlock()
+  regWrite(timer.base + TimerWcr, 1'u32)
 
 proc wdtReadCounter*(timer: Timer): uint32 =
   regRead(timer.base + TimerWvr)
 
 proc wdtClearInterrupt*(timer: Timer) =
+  timer.wdtUnlock()
   regWrite(timer.base + TimerWicr, 1'u32)

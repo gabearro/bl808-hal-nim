@@ -12,7 +12,7 @@ import mmio, memmap
 const
   I2sCfg*           = I2sBase + 0x00'u   # I2S configuration
   I2sIntSts*        = I2sBase + 0x04'u   # Interrupt status
-  I2sBclkCfg*       = I2sBase + 0x08'u   # BCLK configuration
+  I2sBclkCfg*       = I2sBase + 0x10'u   # BCLK configuration
   I2sFifoCfg0*      = I2sBase + 0x80'u   # FIFO configuration 0
   I2sFifoCfg1*      = I2sBase + 0x84'u   # FIFO configuration 1
   I2sFifoWdata*     = I2sBase + 0x88'u   # FIFO write data
@@ -24,15 +24,21 @@ const
 # =============================================================================
 const
   I2sMasterEn*      = 0       # Master mode enable
-  I2sRxEn*          = 1       # RX enable
-  I2sTxEn*          = 2       # TX enable
-  I2sFrameSelShift* = 3       # Frame format [4:3]: 0=LJ, 1=RJ, 2=I2S, 3=DSP
-  I2sFrameSelMask*  = 0x03'u32 shl 3
-  I2sDataSizeShift* = 5       # Data size [7:5]: 0=8bit, 1=16bit, 2=24bit, 3=32bit
-  I2sDataSizeMask*  = 0x07'u32 shl 5
-  I2sMonoMode*      = 8       # Mono mode (left channel only)
-  I2sEndian*        = 9       # Endian swap
-  I2sMute*          = 10      # Mute output
+  I2sSlaveEn*       = 1       # Slave mode enable
+  I2sTxEn*          = 2       # TX data enable
+  I2sRxEn*          = 3       # RX data enable
+  I2sMonoMode*      = 4       # Mono mode
+  I2sMute*          = 5       # Mute output
+  I2sFs1tMode*      = 6       # FS 1T mode
+  I2sFsChCntShift*  = 7       # Frame slot channel count [8:7]
+  I2sFsChCntMask*   = 0x03'u32 shl 7
+  I2sFrameSizeShift* = 12     # Frame/slot size [13:12]
+  I2sFrameSizeMask* = 0x03'u32 shl 12
+  I2sDataSizeShift* = 14      # Data size [15:14]
+  I2sDataSizeMask*  = 0x03'u32 shl 14
+  I2sFrameSelShift* = 16      # I2S mode/format [17:16]
+  I2sFrameSelMask*  = 0x03'u32 shl 16
+  I2sEndian*        = 18      # Endian swap
 
 # =============================================================================
 # I2S BCLK configuration fields
@@ -91,8 +97,10 @@ proc initI2s*(format: I2sFrameFormat = i2sStandard,
   var cfg = 0'u32
   if role == i2sMaster:
     cfg = cfg or (1'u32 shl I2sMasterEn)
-  cfg = cfg or (format.uint32 shl I2sFrameSelShift)
-  cfg = cfg or (dataSize.uint32 shl I2sDataSizeShift)
+  else:
+    cfg = cfg or (1'u32 shl I2sSlaveEn)
+  cfg = cfg or (format.uint32 shl I2sFrameSelShift)   # Format at bits [17:16]
+  cfg = cfg or (dataSize.uint32 shl I2sDataSizeShift)  # Data size at bits [15:14]
   regWrite(I2sCfg, cfg)
 
   # Set BCLK divider

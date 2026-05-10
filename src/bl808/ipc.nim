@@ -5,12 +5,12 @@
 ##   IPC1 (0x2000A840) — LP mailbox
 ##   IPC2 (0x30005000) — D0 mailbox
 ##
-## Each IPC instance has 16 interrupt bits per direction.
+## Each IPC instance exposes 32 interrupt channels.
 ## Shared data passes through XRAM (16 KB at 0x40000000).
 ##
 ## Communication model:
-##   - Core A writes to Core B's IPC_ISWR to trigger an interrupt on Core B
-##   - Core B reads its IPC_IRSRR, processes the message, then writes IPC_ICR
+##   - Core A writes to Core B's CPU1_ISWR to trigger an interrupt on Core B
+##   - Core B reads CPU0_IRSRR, processes the message, then writes CPU0_ICR
 ##   - Payloads are placed in XRAM before triggering the interrupt
 
 import mmio, memmap, core
@@ -18,41 +18,24 @@ import mmio, memmap, core
 # =============================================================================
 # IPC register offsets (relative to IPC base)
 # =============================================================================
-# Each IPC instance has two CPU interfaces:
-#   CPU1 at offset 0x00 (incoming from the paired core)
-#   CPU0 at offset 0x20 (outgoing to the paired core)
 const
-  IpcIswr*          = 0x00'u  # Interrupt Set Write (trigger interrupt)
-  IpcIrsrr*         = 0x04'u  # Interrupt Raw Status Read
-  IpcIcr*           = 0x08'u  # Interrupt Clear
-  IpcIusr*          = 0x0C'u  # Interrupt Unmask Status Read
-  IpcIucr*          = 0x10'u  # Interrupt Unmask Clear
-  IpcIlslr*         = 0x14'u  # Interrupt Line Select Low
-  IpcIlshr*         = 0x18'u  # Interrupt Line Select High
-  IpcIsr*           = 0x1C'u  # Interrupt Status (masked)
+  IpcCpu1Iswr*      = 0x00'u  # Send/trigger interrupt toward this IPC core
+  IpcCpu1Irsrr*     = 0x04'u  # CPU1-side raw pending status
+  IpcCpu1Icr*       = 0x08'u  # CPU1-side clear pending bits
+  IpcCpu1Iusr*      = 0x0C'u  # CPU1-side interrupt unmask
+  IpcCpu1Iucr*      = 0x10'u  # CPU1-side interrupt mask
+  IpcCpu1Ilslr*     = 0x14'u  # CPU1-side low security mask
+  IpcCpu1Ilshr*     = 0x18'u  # CPU1-side high security mask
+  IpcCpu1Isr*       = 0x1C'u  # CPU1-side masked pending status
 
-  # CPU0 (outgoing) register set at +0x20
-  IpcCpu0Offset*    = 0x20'u
-
-# =============================================================================
-# IPC addressing by core pairs
-# =============================================================================
-# The IPC register addresses for sending between cores:
-#
-# M0 -> D0: Write to IPC2 + 0x00 (CPU1 set of D0's mailbox)
-# M0 -> LP: Write to IPC1 + 0x00 (CPU1 set of LP's mailbox)
-# D0 -> M0: Write to IPC0 + 0x00 (CPU1 set of M0's mailbox)
-# D0 -> LP: Write to IPC1 + 0x20 (CPU0 set of LP's mailbox — from D0 side)
-# LP -> M0: Write to IPC0 + 0x20 (CPU0 set of M0's mailbox — from LP side)
-# LP -> D0: Write to IPC2 + 0x20 (CPU0 set of D0's mailbox — from LP side)
-#
-# And for receiving (reading status, clearing):
-# M0 receives from D0: Read IPC0 + 0x00
-# M0 receives from LP: Read IPC0 + 0x20
-# D0 receives from M0: Read IPC2 + 0x00
-# D0 receives from LP: Read IPC2 + 0x20
-# LP receives from M0: Read IPC1 + 0x00
-# LP receives from D0: Read IPC1 + 0x20
+  IpcCpu0Iswr*      = 0x20'u  # CPU0-side send/trigger
+  IpcCpu0Irsrr*     = 0x24'u  # CPU0-side raw pending status
+  IpcCpu0Icr*       = 0x28'u  # CPU0-side clear pending bits
+  IpcCpu0Iusr*      = 0x2C'u  # CPU0-side interrupt unmask
+  IpcCpu0Iucr*      = 0x30'u  # CPU0-side interrupt mask
+  IpcCpu0Ilslr*     = 0x34'u  # CPU0-side low security mask
+  IpcCpu0Ilshr*     = 0x38'u  # CPU0-side high security mask
+  IpcCpu0Isr*       = 0x3C'u  # CPU0-side masked pending status
 
 type
   IpcTarget* = enum
@@ -60,8 +43,8 @@ type
     ipcD0
     ipcLP
 
-  IpcSignal* = range[0..15]
-    ## 16 interrupt signal bits per direction
+  IpcSignal* = range[0..31]
+    ## 32 interrupt signal bits per mailbox
 
 # =============================================================================
 # XRAM shared memory layout
@@ -119,62 +102,26 @@ const IpcMsgHeaderSize* = 4
 # =============================================================================
 # Send address resolution
 # =============================================================================
+proc ipcBase(core: IpcTarget): uint =
+  case core
+  of ipcM0: Ipc0Base
+  of ipcLP: Ipc1Base
+  of ipcD0: Ipc2Base
+
 proc sendAddr(fromCore, toCore: IpcTarget): uint =
-  ## Get the IPC register address to write ISWR for triggering an interrupt.
-  case fromCore
-  of ipcM0:
-    case toCore
-    of ipcD0: Ipc2Base + IpcIswr               # M0 -> D0
-    of ipcLP: Ipc1Base + IpcIswr               # M0 -> LP
-    of ipcM0: 0  # invalid
-  of ipcD0:
-    case toCore
-    of ipcM0: Ipc0Base + IpcIswr               # D0 -> M0
-    of ipcLP: Ipc1Base + IpcCpu0Offset + IpcIswr  # D0 -> LP
-    of ipcD0: 0
-  of ipcLP:
-    case toCore
-    of ipcM0: Ipc0Base + IpcCpu0Offset + IpcIswr  # LP -> M0
-    of ipcD0: Ipc2Base + IpcCpu0Offset + IpcIswr  # LP -> D0
-    of ipcLP: 0
+  ## Sender identity is not encoded by the hardware mailbox.
+  ## Protocols that need per-sender distinction must reserve distinct channels.
+  if fromCore == toCore:
+    return 0
+  ipcBase(toCore) + IpcCpu1Iswr
 
-proc recvStatusAddr(selfCore, fromCore: IpcTarget): uint =
-  ## Get the IPC register address to read raw interrupt status.
-  case selfCore
-  of ipcM0:
-    case fromCore
-    of ipcD0: Ipc0Base + IpcIrsrr
-    of ipcLP: Ipc0Base + IpcCpu0Offset + IpcIrsrr
-    of ipcM0: 0
-  of ipcD0:
-    case fromCore
-    of ipcM0: Ipc2Base + IpcIrsrr
-    of ipcLP: Ipc2Base + IpcCpu0Offset + IpcIrsrr
-    of ipcD0: 0
-  of ipcLP:
-    case fromCore
-    of ipcM0: Ipc1Base + IpcIrsrr
-    of ipcD0: Ipc1Base + IpcCpu0Offset + IpcIrsrr
-    of ipcLP: 0
+proc recvClearAddr(selfCore: IpcTarget): uint =
+  ## Get the IPC clear register address for this core's receive bank.
+  ipcBase(selfCore) + IpcCpu0Icr
 
-proc recvClearAddr(selfCore, fromCore: IpcTarget): uint =
-  ## Get the IPC register address to clear an interrupt.
-  case selfCore
-  of ipcM0:
-    case fromCore
-    of ipcD0: Ipc0Base + IpcIcr
-    of ipcLP: Ipc0Base + IpcCpu0Offset + IpcIcr
-    of ipcM0: 0
-  of ipcD0:
-    case fromCore
-    of ipcM0: Ipc2Base + IpcIcr
-    of ipcLP: Ipc2Base + IpcCpu0Offset + IpcIcr
-    of ipcD0: 0
-  of ipcLP:
-    case fromCore
-    of ipcM0: Ipc1Base + IpcIcr
-    of ipcD0: Ipc1Base + IpcCpu0Offset + IpcIcr
-    of ipcLP: 0
+proc recvRawStatusAddr(selfCore: IpcTarget): uint =
+  ## Get the raw pending status register for this core's receive bank.
+  ipcBase(selfCore) + IpcCpu0Irsrr
 
 proc bufferAddr(fromCore, toCore: IpcTarget): (uint, uint32) =
   ## Get the XRAM buffer base address and size for a given direction.
@@ -195,6 +142,17 @@ proc bufferAddr(fromCore, toCore: IpcTarget): (uint, uint32) =
     of ipcD0: (XramBufLPtoD0, XramBufLPtoD0Size.uint32)
     of ipcLP: (0'u, 0'u32)
 
+proc sharedWriteBarrier() {.inline.} =
+  ## Publish cached XRAM writes before signaling another core.
+  core.dcacheFlushAll()
+  core.fence()
+
+proc sharedReadBarrier() {.inline.} =
+  ## Refresh cached XRAM lines before consuming data from another core.
+  core.dcacheFlushAll()
+  core.dcacheInvalidateAll()
+  core.fence()
+
 # =============================================================================
 # Compile-time self-core identification
 # =============================================================================
@@ -212,28 +170,26 @@ else:
 # =============================================================================
 proc ipcSendSignal*(target: IpcTarget, signal: IpcSignal) =
   ## Send an interrupt signal to another core.
-  let addr = sendAddr(selfCore, target)
-  if addr != 0:
-    regWrite(addr, 1'u32 shl signal.uint32)
+  let regAddr = sendAddr(selfCore, target)
+  if regAddr != 0:
+    regWrite(regAddr, 1'u32 shl signal.uint32)
 
 proc ipcReadSignals*(fromCore: IpcTarget): uint32 =
-  ## Read pending IPC signals from a specific core.
-  let addr = recvStatusAddr(selfCore, fromCore)
-  if addr != 0:
-    regRead(addr)
-  else:
-    0
+  ## Read pending IPC signals for this core.
+  ## The hardware mailbox does not preserve sender identity in the status word.
+  discard fromCore
+  regRead(recvRawStatusAddr(selfCore))
 
 proc ipcClearSignal*(fromCore: IpcTarget, signal: IpcSignal) =
   ## Clear a received IPC signal.
-  let addr = recvClearAddr(selfCore, fromCore)
-  if addr != 0:
-    regWrite(addr, 1'u32 shl signal.uint32)
+  discard fromCore
+  let regAddr = recvClearAddr(selfCore)
+  regWrite(regAddr, 1'u32 shl signal.uint32)
 
 proc ipcClearAllSignals*(fromCore: IpcTarget) =
-  let addr = recvClearAddr(selfCore, fromCore)
-  if addr != 0:
-    regWrite(addr, 0xFFFF'u32)
+  discard fromCore
+  let regAddr = recvClearAddr(selfCore)
+  regWrite(regAddr, 0xFFFF_FFFF'u32)
 
 # =============================================================================
 # Message-based IPC (using XRAM)
@@ -273,8 +229,8 @@ proc ipcSendMessage*(target: IpcTarget, tag: uint16, data: openArray[uint8]): bo
       word = word or (data[i+j].uint32 shl (j * 8))
     regWrite(bufBase + offset, word)
 
-  # Memory fence before signaling
-  fence()
+  # Publish shared-memory writes before signaling.
+  sharedWriteBarrier()
 
   # Signal the target core
   ipcSendSignal(target, IpcSignalMsg)
@@ -290,6 +246,8 @@ proc ipcRecvMessage*(fromCore: IpcTarget, tag: var uint16,
 
   let (bufBase, _) = bufferAddr(fromCore, selfCore)
   if bufBase == 0: return -1
+
+  sharedReadBarrier()
 
   # Read message header
   let header = regRead(bufBase)
@@ -332,7 +290,7 @@ proc ipcSetReady*() =
     of ipcD0: XramSyncD0
     of ipcLP: XramSyncLP
   regWrite(syncAddr, IpcSyncFlag)
-  fence()
+  sharedWriteBarrier()
 
 proc ipcIsReady*(target: IpcTarget): bool =
   ## Check if another core has signaled ready.
@@ -340,6 +298,7 @@ proc ipcIsReady*(target: IpcTarget): bool =
     of ipcM0: XramSyncM0
     of ipcD0: XramSyncD0
     of ipcLP: XramSyncLP
+  sharedReadBarrier()
   regRead(syncAddr) == IpcSyncFlag
 
 proc ipcWaitReady*(target: IpcTarget, timeout: uint32 = 10_000_000): bool =
@@ -357,10 +316,12 @@ proc ipcSharedWrite32*(offset: uint, value: uint32) =
   ## Write a 32-bit value to the user shared memory region.
   if offset < XramUserSize:
     regWrite(XramUserBase + offset, value)
+    sharedWriteBarrier()
 
 proc ipcSharedRead32*(offset: uint): uint32 =
   ## Read a 32-bit value from the user shared memory region.
   if offset < XramUserSize:
+    sharedReadBarrier()
     regRead(XramUserBase + offset)
   else:
     0
@@ -382,10 +343,11 @@ proc ipcSharedWriteBuffer*(offset: uint, data: openArray[uint8]) =
     for j in 0 ..< min(data.len - i, (XramUserSize - off.int)):
       word = word or (data[i+j].uint32 shl (j * 8))
     regWrite(XramUserBase + off, word)
-  fence()
+  sharedWriteBarrier()
 
 proc ipcSharedReadBuffer*(offset: uint, buf: var openArray[uint8]) =
   ## Read a buffer from user shared memory.
+  sharedReadBarrier()
   var i = 0
   var off = offset
   while i + 3 < buf.len and off + 3 < XramUserSize:
@@ -406,16 +368,13 @@ proc ipcSharedReadBuffer*(offset: uint, buf: var openArray[uint8]) =
 # =============================================================================
 proc ipcInit*() =
   ## Initialize IPC for the current core.
-  ## Clears all pending signals and marks this core as ready.
-  when defined(bl808m0):
-    # Clear incoming signals from D0 and LP
-    ipcClearAllSignals(ipcD0)
-    ipcClearAllSignals(ipcLP)
-  elif defined(bl808d0):
-    ipcClearAllSignals(ipcM0)
-    ipcClearAllSignals(ipcLP)
-  elif defined(bl808lp):
-    ipcClearAllSignals(ipcM0)
-    ipcClearAllSignals(ipcD0)
+  ## Enables all interrupt bits, clears pending signals, and marks this core as ready.
+
+  # Unmask all interrupt bits on our receive bank.
+  regWrite(ipcBase(selfCore) + IpcCpu0Iusr, 0xFFFF_FFFF'u32)
+
+  # Clear all pending signals
+  let clearAddr = recvClearAddr(selfCore)
+  regWrite(clearAddr, 0xFFFF_FFFF'u32)
 
   ipcSetReady()

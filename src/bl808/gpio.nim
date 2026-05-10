@@ -10,6 +10,12 @@ import mmio, memmap
 # GPIO configuration register fields (per-pin, 32-bit)
 # =============================================================================
 const
+  GlbUartCfg1 = GlbBase + 0x154'u
+  GlbUartCfg2 = GlbBase + 0x158'u
+  UartSigDisabled = 0x0F'u32
+  Uart0TxSignal = 2'u32
+  Uart0RxSignal = 3'u32
+
   GpioIe*           = 0          # Input enable
   GpioSmt*          = 1          # Schmitt trigger
   GpioDrvShift*     = 2          # Drive strength [3:2]
@@ -53,9 +59,10 @@ type
     funcI2c2        = 19  # I2C2 (D0)
     funcI2c3        = 20  # I2C3 (D0)
     funcMmUart      = 21  # UART3 (D0)
-    funcDpi          = 22  # DPI display
-    funcJtag0       = 26  # JTAG D0
-    funcJtag1       = 27  # JTAG M0
+    funcDpi         = 22  # DPI display
+    funcJtagLp      = 25  # JTAG LP (E902)
+    funcJtagM0      = 26  # JTAG M0 (E907)
+    funcJtagD0      = 27  # JTAG D0 (C906)
 
   GpioDrive* = enum
     drive0 = 0
@@ -69,12 +76,11 @@ type
     pullDown
 
   GpioIntMode* = enum
-    intNone          = 0
-    intFallingEdge   = 1
-    intRisingEdge    = 2
-    intLowLevel      = 3
-    intHighLevel     = 4
-    intBothEdges     = 5
+    intFallingEdge   = 0
+    intRisingEdge    = 1
+    intLowLevel      = 2
+    intHighLevel     = 3
+    intBothEdges     = 4
 
 # =============================================================================
 # Pin configuration address
@@ -93,16 +99,16 @@ proc gpioSetDrive*(pin: uint32, drive: GpioDrive) =
   regModify(pinCfgAddr(pin), GpioDrvMask, drive.uint32 shl GpioDrvShift)
 
 proc gpioSetPull*(pin: uint32, pull: GpioPull) =
-  let addr = pinCfgAddr(pin)
+  let regAddr = pinCfgAddr(pin)
   case pull
   of pullNone:
-    regClear(addr, (1'u32 shl GpioPu) or (1'u32 shl GpioPd))
+    regClear(regAddr, (1'u32 shl GpioPu) or (1'u32 shl GpioPd))
   of pullUp:
-    regSet(addr, 1'u32 shl GpioPu)
-    regClear(addr, 1'u32 shl GpioPd)
+    regSet(regAddr, 1'u32 shl GpioPu)
+    regClear(regAddr, 1'u32 shl GpioPd)
   of pullDown:
-    regClear(addr, 1'u32 shl GpioPu)
-    regSet(addr, 1'u32 shl GpioPd)
+    regClear(regAddr, 1'u32 shl GpioPu)
+    regSet(regAddr, 1'u32 shl GpioPd)
 
 proc gpioSetSchmitt*(pin: uint32, enable: bool) =
   if enable:
@@ -115,8 +121,8 @@ proc gpioSetSchmitt*(pin: uint32, enable: bool) =
 # =============================================================================
 proc gpioInitOutput*(pin: uint32, drive: GpioDrive = drive1, pull: GpioPull = pullNone) =
   ## Configure a pin as GPIO output.
-  let addr = pinCfgAddr(pin)
-  var cfg = regRead(addr)
+  let regAddr = pinCfgAddr(pin)
+  var cfg = regRead(regAddr)
   # Set function to GPIO, enable output, disable input
   cfg = cfg and not (GpioFuncSelMask or GpioDrvMask or (1'u32 shl GpioIe))
   cfg = cfg or (funcGpio.uint32 shl GpioFuncSelShift)
@@ -129,15 +135,15 @@ proc gpioInitOutput*(pin: uint32, drive: GpioDrive = drive1, pull: GpioPull = pu
   of pullUp:   cfg = cfg or (1'u32 shl GpioPu)
   of pullDown: cfg = cfg or (1'u32 shl GpioPd)
   of pullNone: discard
-  regWrite(addr, cfg)
+  regWrite(regAddr, cfg)
 
 proc gpioWrite*(pin: uint32, high: bool) {.inline.} =
   ## Set a GPIO output pin high or low.
-  let addr = pinCfgAddr(pin)
+  let regAddr = pinCfgAddr(pin)
   if high:
-    regSet(addr, 1'u32 shl GpioSet)
+    regSet(regAddr, 1'u32 shl GpioSet)
   else:
-    regSet(addr, 1'u32 shl GpioClr)
+    regSet(regAddr, 1'u32 shl GpioClr)
 
 proc gpioSet*(pin: uint32) {.inline.} =
   ## Set a GPIO output pin high (atomic).
@@ -149,20 +155,20 @@ proc gpioClear*(pin: uint32) {.inline.} =
 
 proc gpioToggle*(pin: uint32) {.inline.} =
   ## Toggle a GPIO output pin.
-  let addr = pinCfgAddr(pin)
-  let current = (regRead(addr) shr GpioO) and 1
+  let regAddr = pinCfgAddr(pin)
+  let current = (regRead(regAddr) shr GpioO) and 1
   if current == 1:
-    regSet(addr, 1'u32 shl GpioClr)
+    regSet(regAddr, 1'u32 shl GpioClr)
   else:
-    regSet(addr, 1'u32 shl GpioSet)
+    regSet(regAddr, 1'u32 shl GpioSet)
 
 # =============================================================================
 # GPIO input
 # =============================================================================
 proc gpioInitInput*(pin: uint32, pull: GpioPull = pullNone) =
   ## Configure a pin as GPIO input.
-  let addr = pinCfgAddr(pin)
-  var cfg = regRead(addr)
+  let regAddr = pinCfgAddr(pin)
+  var cfg = regRead(regAddr)
   cfg = cfg and not (GpioFuncSelMask or (1'u32 shl GpioOe))
   cfg = cfg or (funcGpio.uint32 shl GpioFuncSelShift)
   cfg = cfg or (1'u32 shl GpioIe)
@@ -172,7 +178,7 @@ proc gpioInitInput*(pin: uint32, pull: GpioPull = pullNone) =
   of pullUp:   cfg = cfg or (1'u32 shl GpioPu)
   of pullDown: cfg = cfg or (1'u32 shl GpioPd)
   of pullNone: discard
-  regWrite(addr, cfg)
+  regWrite(regAddr, cfg)
 
 proc gpioRead*(pin: uint32): bool {.inline.} =
   ## Read the current input level of a GPIO pin.
@@ -182,14 +188,16 @@ proc gpioRead*(pin: uint32): bool {.inline.} =
 # GPIO interrupts
 # =============================================================================
 proc gpioSetInterrupt*(pin: uint32, mode: GpioIntMode) =
-  ## Configure GPIO interrupt mode.
-  let addr = pinCfgAddr(pin)
-  regModify(addr, GpioIntModeMask, mode.uint32 shl GpioIntModeShift)
+  ## Configure GPIO interrupt mode and unmask the interrupt.
+  ## To disable, use gpioDisableInterrupt instead.
+  let regAddr = pinCfgAddr(pin)
+  regModify(regAddr, GpioIntModeMask, mode.uint32 shl GpioIntModeShift)
   # Unmask interrupt
-  if mode != intNone:
-    regClear(addr, 1'u32 shl GpioIntMask)
-  else:
-    regSet(addr, 1'u32 shl GpioIntMask)
+  regClear(regAddr, 1'u32 shl GpioIntMask)
+
+proc gpioDisableInterrupt*(pin: uint32) =
+  ## Disable GPIO interrupt for this pin.
+  regSet(pinCfgAddr(pin), 1'u32 shl GpioIntMask)
 
 proc gpioClearInterrupt*(pin: uint32) =
   ## Clear the interrupt flag for a pin.
@@ -201,35 +209,93 @@ proc gpioInterruptActive*(pin: uint32): bool =
 # =============================================================================
 # Alternate function setup helpers
 # =============================================================================
+proc setUartSignal(pin, uartSignal: uint32) =
+  ## Route a GPIO UART pad to a concrete UART signal.
+  ##
+  ## BL808 uses GPIO function 7 plus GLB_UART_CFG1/2 signal nibbles. The vendor
+  ## bflb_gpio_uart_init helper updates both, and clears duplicate signal routes.
+  let sig = int(pin mod 12'u32)
+  let signal = uartSignal and 0x0F'u32
+  var cfg1 = regRead(GlbUartCfg1)
+  var cfg2 = regRead(GlbUartCfg2)
+
+  if sig < 8:
+    let shift = sig * 4
+    cfg1 = (cfg1 and not (0x0F'u32 shl shift)) or (signal shl shift)
+  else:
+    let shift = (sig - 8) * 4
+    cfg2 = (cfg2 and not (0x0F'u32 shl shift)) or (signal shl shift)
+
+  if signal != UartSigDisabled:
+    for i in 0 ..< 8:
+      if i != sig:
+        let shift = i * 4
+        if ((cfg1 shr shift) and 0x0F'u32) == signal:
+          cfg1 = (cfg1 and not (0x0F'u32 shl shift)) or
+                 (UartSigDisabled shl shift)
+    for i in 8 ..< 12:
+      if i != sig:
+        let shift = (i - 8) * 4
+        if ((cfg2 shr shift) and 0x0F'u32) == signal:
+          cfg2 = (cfg2 and not (0x0F'u32 shl shift)) or
+                 (UartSigDisabled shl shift)
+
+  regWrite(GlbUartCfg1, cfg1)
+  regWrite(GlbUartCfg2, cfg2)
+
 proc gpioSetupUart*(txPin, rxPin: uint32) =
   ## Configure a pair of pins for UART (function 7).
+  setUartSignal(txPin, Uart0TxSignal)
+  setUartSignal(rxPin, Uart0RxSignal)
+
   let txAddr = pinCfgAddr(txPin)
-  var txCfg = regRead(txAddr)
-  txCfg = txCfg and not GpioFuncSelMask
-  txCfg = txCfg or (funcUart.uint32 shl GpioFuncSelShift)
-  txCfg = txCfg or (1'u32 shl GpioOe) or (1'u32 shl GpioSmt)
+  var txCfg = 0'u32
+  txCfg = txCfg or (1'u32 shl GpioIntMask)
+  txCfg = txCfg or (1'u32 shl GpioIe) or (1'u32 shl GpioSmt)
   txCfg = txCfg or (1'u32 shl GpioPu)
+  txCfg = txCfg or (drive1.uint32 shl GpioDrvShift)
+  txCfg = txCfg or (funcUart.uint32 shl GpioFuncSelShift)
+  txCfg = txCfg or (1'u32 shl GpioMode)
   regWrite(txAddr, txCfg)
 
   let rxAddr = pinCfgAddr(rxPin)
-  var rxCfg = regRead(rxAddr)
-  rxCfg = rxCfg and not GpioFuncSelMask
-  rxCfg = rxCfg or (funcUart.uint32 shl GpioFuncSelShift)
+  var rxCfg = 0'u32
+  rxCfg = rxCfg or (1'u32 shl GpioIntMask)
   rxCfg = rxCfg or (1'u32 shl GpioIe) or (1'u32 shl GpioSmt)
   rxCfg = rxCfg or (1'u32 shl GpioPu)
+  rxCfg = rxCfg or (drive1.uint32 shl GpioDrvShift)
+  rxCfg = rxCfg or (funcUart.uint32 shl GpioFuncSelShift)
+  rxCfg = rxCfg or (1'u32 shl GpioMode)
   regWrite(rxAddr, rxCfg)
+
+proc gpioSetupSdh*(clkPin, cmdPin, dat0Pin, dat1Pin, dat2Pin, dat3Pin: uint32) =
+  ## Configure six pins for the SD Host controller.
+  for pin in [clkPin, cmdPin, dat0Pin, dat1Pin, dat2Pin, dat3Pin]:
+    let regAddr = pinCfgAddr(pin)
+    var cfg = regRead(regAddr)
+    cfg = cfg and not (GpioFuncSelMask or GpioDrvMask)
+    cfg = cfg or (funcSdh.uint32 shl GpioFuncSelShift)
+    cfg = cfg or (drive2.uint32 shl GpioDrvShift)
+    cfg = cfg or (1'u32 shl GpioIe) or (1'u32 shl GpioSmt)
+    if pin == clkPin:
+      cfg = cfg or (1'u32 shl GpioOe)
+      cfg = cfg and not ((1'u32 shl GpioPu) or (1'u32 shl GpioPd))
+    else:
+      cfg = cfg or (1'u32 shl GpioPu)
+      cfg = cfg and not (1'u32 shl GpioPd)
+    regWrite(regAddr, cfg)
 
 proc gpioSetupSpi*(sclkPin, mosiPin, misoPin, csPin: uint32, isMm: bool = false) =
   ## Configure pins for SPI.
   let function = if isMm: funcSpi1 else: funcSpi0
 
   for pin in [sclkPin, mosiPin, csPin]:
-    let addr = pinCfgAddr(pin)
-    var cfg = regRead(addr)
+    let regAddr = pinCfgAddr(pin)
+    var cfg = regRead(regAddr)
     cfg = cfg and not GpioFuncSelMask
     cfg = cfg or (function.uint32 shl GpioFuncSelShift)
     cfg = cfg or (1'u32 shl GpioOe) or (1'u32 shl GpioSmt)
-    regWrite(addr, cfg)
+    regWrite(regAddr, cfg)
 
   let misoAddr = pinCfgAddr(misoPin)
   var misoCfg = regRead(misoAddr)
@@ -247,10 +313,10 @@ proc gpioSetupI2c*(sdaPin, sclPin: uint32, which: range[0..3] = 0) =
     of 3: funcI2c3
 
   for pin in [sdaPin, sclPin]:
-    let addr = pinCfgAddr(pin)
-    var cfg = regRead(addr)
+    let regAddr = pinCfgAddr(pin)
+    var cfg = regRead(regAddr)
     cfg = cfg and not GpioFuncSelMask
     cfg = cfg or (function.uint32 shl GpioFuncSelShift)
     cfg = cfg or (1'u32 shl GpioIe) or (1'u32 shl GpioOe)
     cfg = cfg or (1'u32 shl GpioSmt) or (1'u32 shl GpioPu)
-    regWrite(addr, cfg)
+    regWrite(regAddr, cfg)
