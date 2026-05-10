@@ -20,6 +20,7 @@
 #include <lwip/netifapi.h>
 #include <lwip/pbuf.h>
 #include <lwip/tcpip.h>
+#include <lwip/dhcp.h>
 
 /* Iter 2.A.0 step 2: vendor lwIP's lwipopts.h leaves LWIP_NETIF_API
  * undefined, so vendor netifapi.h does not declare these typedefs. SDK lwIP
@@ -1992,12 +1993,11 @@ err_t netifapi_netif_add(struct netif *netif, const ip4_addr_t *ipaddr,
                          void *state, netif_init_fn init,
                          netif_input_fn input)
 {
-    (void)ipaddr;
-    (void)netmask;
-    (void)gw;
-    netif->state = state;
-    netif->input = input;
-    return init ? init(netif) : 0;
+    /* Iter 2.A.0 step 4: real bridge to vendor lwIP. Joins the netif chain
+     * so dhcp_start, etharp_output, etc. find the netif. The previous stub
+     * set state/input but never registered with lwIP. */
+    return netif_add(netif, ipaddr, netmask, gw, state, init, input)
+        ? ERR_OK : ERR_IF;
 }
 
 err_t netifapi_netif_common(struct netif *netif, netifapi_void_fn voidfunc,
@@ -2986,5 +2986,11 @@ int wifi_mgmr_scan_complete_notify(void)
     vendor_puts_raw("[WIFI] scan complete notify\r\n");
     return 0;
 }
-int wifi_netif_dhcp_start(struct netif *netif) { (void)netif; return 0; }
+int wifi_netif_dhcp_start(struct netif *netif)
+{
+    /* Iter 2.A.0 step 4: real bridge. Previous stub returned 0 without
+     * doing anything, leaving the netif without DHCP. */
+    if (netif == NULL) return -1;
+    return (int)dhcp_start(netif);
+}
 int wifi_netif_dhcp_stop(struct netif *netif) { (void)netif; return 0; }
