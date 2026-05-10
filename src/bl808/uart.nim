@@ -5,7 +5,8 @@
 ##
 ## Register layout is identical across all instances.
 
-import mmio, memmap
+import glb, mmio, memmap
+import kernel/jtaglog
 
 # =============================================================================
 # UART register offsets
@@ -37,8 +38,9 @@ const
   UtxPrtSel*         = 5       # Parity select (0=even, 1=odd)
   UtxBitCntDShift*   = 8       # Data bits count [10:8]
   UtxBitCntDMask*    = 0x07'u32 shl 8
-  UtxBitCntPShift*   = 11      # Parity bits [12:11]
-  UtxBitCntBShift*   = 13      # Stop bits [15:13]
+  UtxBitCntPShift*   = 11      # Stop bits [12:11]
+  UtxBitCntPMask*    = 0x03'u32 shl 11
+  UtxBitCntBShift*   = 13      # Break bits [15:13]
   UtxBitCntBMask*    = 0x07'u32 shl 13
   UtxLenShift*       = 16      # TX transfer length [31:16]
 
@@ -71,8 +73,8 @@ const
 # FIFO_CONFIG_1 fields
 # =============================================================================
 const
-  FifoTxCountShift*  = 0       # TX FIFO count [5:0]
-  FifoTxCountMask*   = 0x3F'u32
+  FifoTxFreeShift*   = 0       # TX FIFO free slots [5:0]
+  FifoTxFreeMask*    = 0x3F'u32
   FifoRxCountShift*  = 8       # RX FIFO count [13:8]
   FifoRxCountMask*   = 0x3F'u32 shl 8
   FifoTxThreshShift* = 16      # TX FIFO threshold [20:16]
@@ -177,6 +179,12 @@ proc initUart*(id: UartId, config: UartConfig, uartClkHz: uint32): Uart =
   result.id = id
   let base = result.base
 
+  case id
+  of uart0, uart1, uart2:
+    enableUartClock()
+  of uart3:
+    enableMmUart3Clock()
+
   # Disable TX and RX during configuration
   regClear(base + UartUtxConfig, 1'u32 shl UtxEn)
   regClear(base + UartUrxConfig, 1'u32 shl UrxEn)
@@ -189,7 +197,7 @@ proc initUart*(id: UartId, config: UartConfig, uartClkHz: uint32): Uart =
   # Configure TX
   var txCfg = 0'u32
   txCfg = txCfg or (config.dataBits.uint32 shl UtxBitCntDShift)
-  txCfg = txCfg or (config.stopBits.uint32 shl UtxBitCntBShift)
+  txCfg = txCfg or (config.stopBits.uint32 shl UtxBitCntPShift)
   txCfg = txCfg or (1'u32 shl UtxFreerunEn)  # Free-run mode for byte-at-a-time
   if config.parity != parityNone:
     txCfg = txCfg or (1'u32 shl UtxPrtEn)
@@ -205,6 +213,8 @@ proc initUart*(id: UartId, config: UartConfig, uartClkHz: uint32): Uart =
     if config.parity == parityOdd:
       rxCfg = rxCfg or (1'u32 shl UrxPrtSel)
   regWrite(base + UartUrxConfig, rxCfg)
+
+  regClear(base + UartDataConfig, 1'u32)
 
   # Clear and reset FIFOs
   regSet(base + UartFifoConfig0,
@@ -228,17 +238,22 @@ proc initUart*(id: UartId, config: UartConfig, uartClkHz: uint32): Uart =
 # =============================================================================
 proc txFifoCount*(uart: Uart): uint32 {.inline.} =
   ## Number of bytes currently in the TX FIFO.
-  regRead(uart.base + UartFifoConfig1) and FifoTxCountMask
+  let free = regRead(uart.base + UartFifoConfig1) and FifoTxFreeMask
+  if free >= 32: 0'u32 else: 32'u32 - free
+
+proc txFifoFree*(uart: Uart): uint32 {.inline.} =
+  ## Number of free byte slots in the TX FIFO.
+  regRead(uart.base + UartFifoConfig1) and FifoTxFreeMask
 
 proc rxFifoCount*(uart: Uart): uint32 {.inline.} =
   ## Number of bytes available in the RX FIFO.
   (regRead(uart.base + UartFifoConfig1) and FifoRxCountMask) shr FifoRxCountShift
 
 proc txFifoFull*(uart: Uart): bool {.inline.} =
-  uart.txFifoCount() >= 32
+  uart.txFifoFree() == 0
 
 proc txFifoEmpty*(uart: Uart): bool {.inline.} =
-  uart.txFifoCount() == 0
+  uart.txFifoFree() >= 32
 
 proc rxAvailable*(uart: Uart): bool {.inline.} =
   uart.rxFifoCount() > 0
@@ -252,6 +267,7 @@ proc txBusy*(uart: Uart): bool {.inline.} =
 proc sendByte*(uart: Uart, b: uint8): UartError =
   ## Send a single byte, blocking until FIFO has space.
   ## Returns uartOk on success, uartTimeout if stuck.
+  hwValidationLogByte(b)
   var timeout = 100_000'u32
   while uart.txFifoFull():
     timeout.dec
@@ -310,6 +326,7 @@ proc recv*(uart: Uart, buf: var openArray[uint8], timeout: uint32 = 1_000_000): 
 proc trySendByte*(uart: Uart, b: uint8): bool {.inline.} =
   ## Try to send a byte. Returns false if FIFO is full.
   if uart.txFifoFull(): return false
+  hwValidationLogByte(b)
   regWrite(uart.base + UartFifoWdata, b.uint32)
   true
 
@@ -353,6 +370,25 @@ proc clearInterrupt*(uart: Uart, intBit: uint32) =
 
 proc readInterruptStatus*(uart: Uart): uint32 =
   regRead(uart.base + UartIntSts)
+
+proc setInterruptEnable*(uart: Uart, mask: uint32) =
+  ## Set the UART interrupt-enable register.
+  ##
+  ## Interrupt sources are still gated by UartIntMask. Drivers normally enable
+  ## the source here once, then mask/unmask individual bits with
+  ## enableInterrupt/disableInterrupt.
+  regWrite(uart.base + UartIntEn, mask)
+
+proc setRxFifoThreshold*(uart: Uart, threshold: uint32) =
+  ## Set the RX FIFO ready threshold.
+  let value = min(threshold, 31'u32)
+  regModify(uart.base + UartFifoConfig1,
+            FifoRxThreshMask,
+            value shl FifoRxThreshShift)
+
+proc baseAddr*(uart: Uart): uint {.inline.} =
+  ## Return the UART MMIO base address.
+  uart.base
 
 # =============================================================================
 # DMA support

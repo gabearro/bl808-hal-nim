@@ -73,8 +73,9 @@ const
   PkaRegSize384*  = 9'u8
   PkaRegSize512*  = 10'u8
 
-# Size in 32-bit words for each register size code
-const pkaSizeWords: array[11, uint16] = [0, 1, 1, 1, 2, 3, 4, 6, 8, 12, 16]
+# Size in 32-bit words for each PKA register size code. The SDK names these
+# by byte capacity: REG_SIZE_32 is a 32-byte register, not a 32-bit register.
+const pkaSizeWords: array[11, uint16] = [0, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128]
 
 # =============================================================================
 # PKA register offsets from device base
@@ -126,10 +127,10 @@ proc pkaWriteFirstConfig(base: uint, opcode: uint32, s0Idx: uint8,
   ## Build and write the first operand config to PKA_RW.
   var cmd = (opcode shl 24) or
             (lastop.uint32 shl 31) or
-            (dIdx.uint32 shl 20) or
+            (dSize.uint32 shl 20) or
             s0Idx.uint32 or
-            (s0Size.uint32 shl 12) or
-            (dSize.uint32 shl 8)
+            (dIdx.uint32 shl 12) or
+            (s0Size.uint32 shl 8)
   regWrite(base + PkaRwOffset, cmd)
 
 # =============================================================================
@@ -476,65 +477,88 @@ const
 # secp256r1 curve constants (NIST P-256)
 # =============================================================================
 const secp256r1P* {.exportc.}: array[8, uint32] = [
-  0xFFFFFFFF'u32, 0xFFFFFFFF'u32, 0xFFFFFFFF'u32, 0x00000000'u32,
-  0x00000000'u32, 0x00000000'u32, 0x00000001'u32, 0xFFFFFFFF'u32
+  0xFFFFFFFF'u32, 0x01000000'u32, 0x00000000'u32, 0x00000000'u32,
+  0x00000000'u32, 0xFFFFFFFF'u32, 0xFFFFFFFF'u32, 0xFFFFFFFF'u32
 ]
 const secp256r1N* {.exportc.}: array[8, uint32] = [
-  0xFC632551'u32, 0xF3B9CAC2'u32, 0xA7179E84'u32, 0xBCE6FAAD'u32,
-  0xFFFFFFFF'u32, 0xFFFFFFFF'u32, 0x00000000'u32, 0xFFFFFFFF'u32
+  0xFFFFFFFF'u32, 0x00000000'u32, 0xFFFFFFFF'u32, 0xFFFFFFFF'u32,
+  0xADFAE6BC'u32, 0x849E17A7'u32, 0xC2CAB9F3'u32, 0x512563FC'u32
 ]
 const secp256r1Gx* {.exportc.}: array[8, uint32] = [
-  0xD898C296'u32, 0xF4A13945'u32, 0x2DEB33A0'u32, 0x77037D81'u32,
-  0x63A440F2'u32, 0xF8BCE6E5'u32, 0xE12C4247'u32, 0x6B17D1F2'u32
+  0xF2D1176B'u32, 0x47422CE1'u32, 0xE5E6BCF8'u32, 0xF240A463'u32,
+  0x817D0377'u32, 0xA033EB2D'u32, 0x4539A1F4'u32, 0x96C298D8'u32
 ]
 const secp256r1Gy* {.exportc.}: array[8, uint32] = [
-  0x37BF51F5'u32, 0xCBB64068'u32, 0x6B315ECE'u32, 0x2BCE3357'u32,
-  0x7C0F9E16'u32, 0x8EE7EB4A'u32, 0xFE1A7F9B'u32, 0x4FE342E2'u32
+  0xE242E34F'u32, 0x9B7F1AFE'u32, 0x4AEBE78E'u32, 0x169E0F7C'u32,
+  0x5733CE2B'u32, 0xCE5E316B'u32, 0x6840B6CB'u32, 0xF551BF37'u32
 ]
 const secp256r1B* {.exportc.}: array[8, uint32] = [
-  0x27D2604B'u32, 0x3BCE3C3E'u32, 0xCC53B0F6'u32, 0x651D06B0'u32,
-  0x769886BC'u32, 0xB3EBBD55'u32, 0xAA3A93E7'u32, 0x5AC635D8'u32
+  0xD835C65A'u32, 0xE7933AAA'u32, 0x55BDEBB3'u32, 0xBC869876'u32,
+  0xB0061D65'u32, 0xF6B053CC'u32, 0x3E3CCE3B'u32, 0x4B60D227'u32
 ]
 
 # Montgomery inverse R for P and N (precomputed)
 const secp256r1InvR_P* {.exportc.}: array[8, uint32] = [
-  0x00000001'u32, 0x00000000'u32, 0x00000000'u32, 0xFFFFFFFF'u32,
-  0xFFFFFFFF'u32, 0xFFFFFFFF'u32, 0xFFFFFFFE'u32, 0x00000000'u32
+  0xFEFFFFFF'u32, 0x03000000'u32, 0xFDFFFFFF'u32, 0x02000000'u32,
+  0x01000000'u32, 0xFEFFFFFF'u32, 0x03000000'u32, 0x00000000'u32
 ]
 const secp256r1InvR_N* {.exportc.}: array[8, uint32] = [
-  0xEEDF9BFE'u32, 0x012FFD85'u32, 0xDF1A6C21'u32, 0x43190553'u32,
-  0x00000000'u32, 0x00000000'u32, 0xFFFFFFFF'u32, 0x00000000'u32
+  0x3366D060'u32, 0xE9C10549'u32, 0x04B6F807'u32, 0x2577601E'u32,
+  0xE2F3DEBA'u32, 0xAF6F5643'u32, 0xF7C81BCE'u32, 0x797C199C'u32
 ]
 const secp256r1PrimeN_P* {.exportc.}: array[8, uint32] = [
-  0x00000001'u32, 0x00000000'u32, 0x00000000'u32, 0x00000001'u32,
-  0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32
+  0xFFFFFFFF'u32, 0x02000000'u32, 0x00000000'u32, 0x00000000'u32,
+  0x01000000'u32, 0x00000000'u32, 0x00000000'u32, 0x01000000'u32
 ]
 const secp256r1PrimeN_N* {.exportc.}: array[8, uint32] = [
-  0x039CDAAF'u32, 0x0C46353D'u32, 0x58E8617B'u32, 0x43190553'u32,
-  0x00000000'u32, 0x00000000'u32, 0x00000001'u32, 0x00000000'u32
+  0x3366D060'u32, 0x1C28D6A9'u32, 0xEC77FE50'u32, 0xF6C688C5'u32,
+  0x0844C948'u32, 0xE4D2747D'u32, 0xAAC8D1CC'u32, 0x4FBC00EE'u32
 ]
+
+const
+  secp256r1One: array[8, uint32] = [
+    0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32,
+    0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x01000000'u32
+  ]
+  secp256r1Bar2: array[8, uint32] = [
+    0x01000000'u32, 0xFDFFFFFF'u32, 0xFFFFFFFF'u32, 0xFFFFFFFF'u32,
+    0xFEFFFFFF'u32, 0x00000000'u32, 0x00000000'u32, 0x02000000'u32
+  ]
+  secp256r1Bar3: array[8, uint32] = [
+    0x02000000'u32, 0xFCFFFFFF'u32, 0xFFFFFFFF'u32, 0xFFFFFFFF'u32,
+    0xFDFFFFFF'u32, 0x00000000'u32, 0x00000000'u32, 0x03000000'u32
+  ]
+  secp256r1Bar4: array[8, uint32] = [
+    0x03000000'u32, 0xFBFFFFFF'u32, 0xFFFFFFFF'u32, 0xFFFFFFFF'u32,
+    0xFCFFFFFF'u32, 0x00000000'u32, 0x00000000'u32, 0x04000000'u32
+  ]
+  secp256r1Bar8: array[8, uint32] = [
+    0x07000000'u32, 0xF7FFFFFF'u32, 0xFFFFFFFF'u32, 0xFFFFFFFF'u32,
+    0xF8FFFFFF'u32, 0x00000000'u32, 0x00000000'u32, 0x08000000'u32
+  ]
+  secp256r1OneP1: array[8, uint32] = [
+    0x00000000'u32, 0xFEFFFFFF'u32, 0xFFFFFFFF'u32, 0xFFFFFFFF'u32,
+    0xFFFFFFFF'u32, 0x00000000'u32, 0x00000000'u32, 0x02000000'u32
+  ]
+  secp256r1OneM1: array[8, uint32] = [
+    0x00000000'u32, 0xFEFFFFFF'u32, 0xFFFFFFFF'u32, 0xFFFFFFFF'u32,
+    0xFFFFFFFF'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32
+  ]
+  secp256r1ZeroX: array[8, uint32] = [
+    0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32,
+    0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32
+  ]
+  secp256r1ZeroY: array[8, uint32] = [
+    0x00000000'u32, 0xFEFFFFFF'u32, 0xFFFFFFFF'u32, 0xFFFFFFFF'u32,
+    0xFFFFFFFF'u32, 0x00000000'u32, 0x00000000'u32, 0x01000000'u32
+  ]
 
 # =============================================================================
 # ECDSA / ECDH / DSA stub exports
 # (These compose the low-level PKA operations above for ECC math)
 # =============================================================================
 
-proc bflb_sec_ecc_get_random_value*(data: ptr uint32, maxRef: ptr uint32,
-                                    size: uint32): cint {.exportc, cdecl.} =
-  ## Get a random value less than maxRef using TRNG.
-  # Use hardware TRNG to fill data, then reduce mod maxRef
-  let trngBase = SecEngBase + 0x200
-  regSet(trngBase, 1'u32)  # Enable TRNG
-  for i in 0'u32 ..< size:
-    var timeout = 100_000'u32
-    while (regRead(trngBase + 0x04) and 1) == 0:
-      timeout.dec
-      if timeout == 0: return -1
-    cast[ptr UncheckedArray[uint32]](data)[i] = regRead(trngBase + 0x14 + (i mod 8) * 4)
-  regSet(trngBase + 0x34, 1)  # Clear
-  0
-
-proc bflb_sec_ecc_cmp*(a, b: ptr uint32, size: uint32): cint {.exportc, cdecl.} =
+proc eccCmpWords(a, b: ptr uint32, size: uint32): cint =
   let arrA = cast[ptr UncheckedArray[uint32]](a)
   let arrB = cast[ptr UncheckedArray[uint32]](b)
   for i in countdown(size.int - 1, 0):
@@ -542,11 +566,151 @@ proc bflb_sec_ecc_cmp*(a, b: ptr uint32, size: uint32): cint {.exportc, cdecl.} 
     if arrA[i] < arrB[i]: return -1
   0
 
+proc bflb_sec_ecc_get_random_value*(data: ptr uint32, maxRef: ptr uint32,
+                                    size: uint32): cint {.exportc, cdecl.} =
+  ## Get a random value less than maxRef using TRNG.
+  const
+    TrngCtrl = SecEngBase + 0x200'u
+    TrngStatus = SecEngBase + 0x204'u
+    TrngData = SecEngBase + 0x208'u
+    TrngTrigger = 1'u32 shl 1
+    TrngEnable = 1'u32 shl 2
+    TrngDataClear = 1'u32 shl 3
+    TrngIntClear = 1'u32 shl 9
+  let dataWords = cast[ptr UncheckedArray[uint32]](data)
+
+  var word = 0'u32
+  while word < size:
+    regWrite(TrngCtrl, TrngEnable or TrngTrigger)
+    var timeout = 100_000'u32
+    while (regRead(TrngStatus) and 1) == 0:
+      timeout.dec
+      if timeout == 0: return -1
+
+    let remaining = size - word
+    let batch = if remaining < 8'u32: remaining else: 8'u32
+    for i in 0'u32 ..< batch:
+      dataWords[word + i] = regRead(TrngData + i.uint * 4)
+    word += batch
+    regWrite(TrngCtrl, TrngEnable or TrngDataClear or TrngIntClear)
+
+  while eccCmpWords(data, maxRef, size) >= 0:
+    var borrow = 0'u64
+    let refWords = cast[ptr UncheckedArray[uint32]](maxRef)
+    for i in 0 ..< size.int:
+      let lhs = dataWords[i].uint64
+      let rhs = refWords[i].uint64 + borrow
+      if lhs >= rhs:
+        dataWords[i] = (lhs - rhs).uint32
+        borrow = 0
+      else:
+        dataWords[i] = ((1'u64 shl 32) + lhs - rhs).uint32
+        borrow = 1
+  0
+
+proc bflb_sec_ecc_cmp*(a, b: ptr uint32, size: uint32): cint {.exportc, cdecl.} =
+  eccCmpWords(a, b, size)
+
 proc bflb_sec_ecc_is_zero*(a: ptr uint32, size: uint32): cint {.exportc, cdecl.} =
   let arr = cast[ptr UncheckedArray[uint32]](a)
   for i in 0 ..< size.int:
     if arr[i] != 0: return 0
   1
+
+proc pkaRegSizeForBits(bits: uint32): uint8 =
+  if bits <= 64: PkaRegSize8
+  elif bits <= 128: PkaRegSize16
+  elif bits <= 256: PkaRegSize32
+  elif bits <= 512: PkaRegSize64
+  elif bits <= 768: PkaRegSize96
+  elif bits <= 1024: PkaRegSize128
+  elif bits <= 1536: PkaRegSize192
+  elif bits <= 2048: PkaRegSize256
+  elif bits <= 3072: PkaRegSize384
+  else: PkaRegSize512
+
+proc wordLenForBits(bits: uint32): uint16 =
+  ((bits + 31'u32) shr 5).uint16
+
+const DsaMaxWords = 32
+type DsaWordArray = array[DsaMaxWords, uint32]
+
+proc dsaLoad(dst: var DsaWordArray, src: ptr uint32, words: uint16) =
+  let srcWords = cast[ptr UncheckedArray[uint32]](src)
+  for i in 0 ..< words.int:
+    dst[i] = srcWords[i]
+
+proc dsaLoadPadded(dst: var DsaWordArray, src: ptr uint32,
+                   srcWordsLen: uint32, words: uint16) =
+  let srcWords = cast[ptr UncheckedArray[uint32]](src)
+  let count = min(srcWordsLen, words.uint32)
+  for i in 0 ..< count.int:
+    dst[i] = srcWords[i]
+
+proc dsaStore(dst: ptr uint32, src: DsaWordArray, words: uint16) =
+  let dstWords = cast[ptr UncheckedArray[uint32]](dst)
+  for i in 0 ..< words.int:
+    dstWords[i] = src[i]
+
+proc dsaCmp(a, b: DsaWordArray, words: uint16): cint =
+  for i in countdown(words.int - 1, 0):
+    if a[i] > b[i]: return 1
+    if a[i] < b[i]: return -1
+  0
+
+proc dsaIsZero(a: DsaWordArray, words: uint16): bool =
+  for i in 0 ..< words.int:
+    if a[i] != 0:
+      return false
+  true
+
+proc dsaSubInPlace(a: var DsaWordArray, b: DsaWordArray, words: uint16) =
+  var borrow = 0'u64
+  for i in 0 ..< words.int:
+    let lhs = a[i].uint64
+    let rhs = b[i].uint64 + borrow
+    if lhs >= rhs:
+      a[i] = (lhs - rhs).uint32
+      borrow = 0
+    else:
+      a[i] = ((1'u64 shl 32) + lhs - rhs).uint32
+      borrow = 1
+
+proc dsaReduce(a: var DsaWordArray, modulus: DsaWordArray, words: uint16) =
+  while dsaCmp(a, modulus, words) >= 0:
+    dsaSubInPlace(a, modulus, words)
+
+proc dsaAddMod(dst: var DsaWordArray, a, b, modulus: DsaWordArray, words: uint16) =
+  var carry = 0'u64
+  for i in 0 ..< words.int:
+    let sum = a[i].uint64 + b[i].uint64 + carry
+    dst[i] = sum.uint32
+    carry = sum shr 32
+  if carry != 0 or dsaCmp(dst, modulus, words) >= 0:
+    dsaSubInPlace(dst, modulus, words)
+
+proc dsaMulMod(dst: var DsaWordArray, a, b, modulus: DsaWordArray, words: uint16) =
+  var accum: DsaWordArray
+  var term = a
+  dsaReduce(term, modulus, words)
+  for bit in 0 ..< (words.int * 32):
+    if ((b[bit shr 5] shr (bit and 31)) and 1'u32) != 0:
+      dsaAddMod(accum, accum, term, modulus, words)
+    dsaAddMod(term, term, term, modulus, words)
+  dst = accum
+
+proc dsaExpMod(dst: var DsaWordArray, base, exponent, modulus: DsaWordArray,
+               words: uint16) =
+  var resultWords: DsaWordArray
+  var power = base
+  resultWords[0] = 1
+  dsaReduce(resultWords, modulus, words)
+  dsaReduce(power, modulus, words)
+  for bit in 0 ..< (words.int * 32):
+    if ((exponent[bit shr 5] shr (bit and 31)) and 1'u32) != 0:
+      dsaMulMod(resultWords, resultWords, power, modulus, words)
+    dsaMulMod(power, power, power, modulus, words)
+  dst = resultWords
 
 proc bflb_sec_ecdsa_init*(handle: ptr BflbEcdsa, id: uint8): cint {.exportc, cdecl.} =
   handle.ecpId = id
@@ -602,15 +766,25 @@ const
   R_TMP7  = 7'u8
   R_PX    = 8'u8   # input point X
   R_PY    = 9'u8   # input point Y
-  R_P     = 10'u8  # curve prime
-  R_N     = 11'u8  # curve order
-  R_INVR  = 12'u8  # invR mod P
-  R_PRIMN = 13'u8  # primeN for P
+  R_P     = 20'u8  # curve prime; PKA expects primeN at modulus + 1
+  R_PRIMN = 21'u8  # primeN for P
+  R_INVR  = 22'u8  # invR mod P
+  R_N     = 23'u8  # curve order; PKA expects primeN_N at modulus + 1
+  R_PRIMN_N = 24'u8
+  R_INVR_N = 25'u8
   R_TMP19 = 19'u8
-  SZ      = 8'u8   # SEC_ENG_PKA_REG_SIZE_256
+  SZ      = PkaRegSize32
 
-# Global PKA device (matches blob's `pka` global variable)
-var pka* {.exportc.}: ptr BflbDevice
+# Global PKA device (matches blob's `pka` global variable).
+#
+# Firmware jumps straight to main(), so Nim module init procs are not run.
+# Define the compatible global in C so the pointer is valid in .data before
+# high-level wrappers or external C code read it.
+{.emit: """
+__attribute__((used)) bflb_device_s bl808_hal_default_pka_device = {0, 0x20004000U};
+__attribute__((used)) bflb_device_s *pka = &bl808_hal_default_pka_device;
+""".}
+var pka* {.importc.}: ptr BflbDevice
 
 proc getCurveParams(ecpId: uint8): (ptr uint32, ptr uint32, ptr uint32,
                                      ptr uint32, ptr uint32,
@@ -635,11 +809,13 @@ proc eccLoadCurveParams(dev: ptr BflbDevice, ecpId: uint8) =
   let (cp, cn, cgx, cgy, cb, cinvr, cprimn, cinvrn, cprimnn, ws) =
     getCurveParams(ecpId)
   bflb_pka_write(dev, R_P, SZ, cp, ws.uint16, 0)
+  bflb_pka_write(dev, R_PRIMN, SZ, cprimn, ws.uint16, 0)
+  bflb_pka_write(dev, R_INVR, SZ, cinvr, ws.uint16, 0)
   bflb_pka_write(dev, R_N, SZ, cn, ws.uint16, 0)
+  bflb_pka_write(dev, R_PRIMN_N, SZ, cprimnn, ws.uint16, 0)
+  bflb_pka_write(dev, R_INVR_N, SZ, cinvrn, ws.uint16, 0)
   bflb_pka_write(dev, R_PX, SZ, cgx, ws.uint16, 0)
   bflb_pka_write(dev, R_PY, SZ, cgy, ws.uint16, 0)
-  bflb_pka_write(dev, R_INVR, SZ, cinvr, ws.uint16, 0)
-  bflb_pka_write(dev, R_PRIMN, SZ, cprimn, ws.uint16, 1)
 
 proc eccPointDouble(dev: ptr BflbDevice) =
   ## Point doubling in Jacobian coords: (RX,RY,RZ) = 2*(RX,RY,RZ) mod P.
@@ -764,11 +940,472 @@ proc eccJacobianToAffine(dev: ptr BflbDevice, wordSize: uint32) =
   # RY = Y * Z^(-3) mod P
   bflb_pka_mmul(dev, R_RY, SZ, R_RY, SZ, R_TMP5, SZ, R_P, SZ, 1)
 
+const
+  SdkP256S32 = PkaRegSize32
+  SdkP256S64 = PkaRegSize64
+  SdkP256Words = 8'u16
+  SdkP256Mod = 0'u8
+  SdkP256PrimeN = 1'u8
+  SdkP256X1 = 2'u8
+  SdkP256Y1 = 3'u8
+  SdkP256Z1 = 4'u8
+  SdkP256X2 = 5'u8
+  SdkP256Y2 = 6'u8
+  SdkP256Z2 = 7'u8
+  SdkP256One = 8'u8
+  SdkP256Bar2 = 9'u8
+  SdkP256Bar3 = 10'u8
+  SdkP256Bar4 = 11'u8
+  SdkP256Bar8 = 12'u8
+  SdkP256T13 = 13'u8
+  SdkP256T14 = 14'u8
+  SdkP256T15 = 15'u8
+  SdkP256T16 = 16'u8
+  SdkP256T17 = 17'u8
+  SdkP256T18 = 18'u8
+  SdkP256OneP1 = 19'u8
+  SdkP256OneM1 = 20'u8
+
+proc sdkP256PointMulInit(dev: ptr BflbDevice) =
+  bflb_pka_write(dev, SdkP256Mod, SdkP256S32, addr secp256r1P[0], SdkP256Words, 0)
+  bflb_pka_write(dev, SdkP256PrimeN, SdkP256S32, addr secp256r1PrimeN_P[0], SdkP256Words, 0)
+  bflb_pka_write(dev, SdkP256One, SdkP256S32, addr secp256r1One[0], SdkP256Words, 0)
+  bflb_pka_write(dev, SdkP256Bar2, SdkP256S32, addr secp256r1Bar2[0], SdkP256Words, 0)
+  bflb_pka_write(dev, SdkP256Bar3, SdkP256S32, addr secp256r1Bar3[0], SdkP256Words, 0)
+  bflb_pka_write(dev, SdkP256Bar4, SdkP256S32, addr secp256r1Bar4[0], SdkP256Words, 0)
+  bflb_pka_write(dev, SdkP256Bar8, SdkP256S32, addr secp256r1Bar8[0], SdkP256Words, 0)
+  bflb_pka_write(dev, SdkP256OneP1, SdkP256S32, addr secp256r1OneP1[0], SdkP256Words, 0)
+  bflb_pka_write(dev, SdkP256OneM1, SdkP256S32, addr secp256r1OneM1[0], SdkP256Words, 0)
+
+proc sdkP256PointAddInfCheck(dev: ptr BflbDevice,
+                             p1Inf, p2Inf: var uint8) =
+  let p1a = bflb_pka_lcmp(dev, SdkP256X1, SdkP256S32, SdkP256One, SdkP256S32)
+  let p1b = bflb_pka_lcmp(dev, SdkP256Y1, SdkP256S32, SdkP256OneP1, SdkP256S32)
+  let p1c = bflb_pka_lcmp(dev, SdkP256OneM1, SdkP256S32, SdkP256Y1, SdkP256S32)
+  let p1d = bflb_pka_lcmp(dev, SdkP256Z1, SdkP256S32, SdkP256One, SdkP256S32)
+  p1Inf = p1a and p1b and p1c and p1d
+
+  let p2a = bflb_pka_lcmp(dev, SdkP256X2, SdkP256S32, SdkP256One, SdkP256S32)
+  let p2b = bflb_pka_lcmp(dev, SdkP256Y2, SdkP256S32, SdkP256OneP1, SdkP256S32)
+  let p2c = bflb_pka_lcmp(dev, SdkP256OneM1, SdkP256S32, SdkP256Y2, SdkP256S32)
+  let p2d = bflb_pka_lcmp(dev, SdkP256Z2, SdkP256S32, SdkP256One, SdkP256S32)
+  p2Inf = p2a and p2b and p2c and p2d
+
+proc sdkP256CopyX2ToX1(dev: ptr BflbDevice) =
+  bflb_pka_movdat(dev, SdkP256X2, SdkP256S32, SdkP256X1, SdkP256S32, 0)
+  bflb_pka_movdat(dev, SdkP256Y2, SdkP256S32, SdkP256Y1, SdkP256S32, 0)
+  bflb_pka_movdat(dev, SdkP256Z2, SdkP256S32, SdkP256Z1, SdkP256S32, 1)
+
+proc sdkP256PointAdd(dev: ptr BflbDevice) =
+  bflb_pka_mmul(dev, SdkP256Y2, SdkP256S32, SdkP256T13, SdkP256S32, SdkP256Z1, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256Y1, SdkP256S32, SdkP256T14, SdkP256S32, SdkP256Z2, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256X2, SdkP256S32, SdkP256T15, SdkP256S32, SdkP256Z1, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256X1, SdkP256S32, SdkP256T16, SdkP256S32, SdkP256Z2, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_msub(dev, SdkP256T13, SdkP256S32, SdkP256T13, SdkP256S32, SdkP256T14, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_msub(dev, SdkP256T15, SdkP256S32, SdkP256T15, SdkP256S32, SdkP256T16, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256Z1, SdkP256S32, SdkP256X1, SdkP256S32, SdkP256Z2, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256T15, SdkP256S32, SdkP256Y1, SdkP256S32, SdkP256T15, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256Y1, SdkP256S32, SdkP256Z1, SdkP256S32, SdkP256T15, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256T13, SdkP256S32, SdkP256T17, SdkP256S32, SdkP256T13, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256T17, SdkP256S32, SdkP256T17, SdkP256S32, SdkP256X1, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_msub(dev, SdkP256T17, SdkP256S32, SdkP256T17, SdkP256S32, SdkP256Z1, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256Bar2, SdkP256S32, SdkP256T18, SdkP256S32, SdkP256Y1, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256T18, SdkP256S32, SdkP256T18, SdkP256S32, SdkP256T16, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_msub(dev, SdkP256T17, SdkP256S32, SdkP256T18, SdkP256S32, SdkP256T18, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256Y1, SdkP256S32, SdkP256Y1, SdkP256S32, SdkP256T16, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256Z1, SdkP256S32, SdkP256T14, SdkP256S32, SdkP256T14, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256Z1, SdkP256S32, SdkP256Z1, SdkP256S32, SdkP256X1, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256T15, SdkP256S32, SdkP256X1, SdkP256S32, SdkP256T18, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_msub(dev, SdkP256Y1, SdkP256S32, SdkP256Y1, SdkP256S32, SdkP256T18, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256T13, SdkP256S32, SdkP256Y1, SdkP256S32, SdkP256Y1, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_msub(dev, SdkP256Y1, SdkP256S32, SdkP256Y1, SdkP256S32, SdkP256T14, SdkP256S32, SdkP256Mod, SdkP256S32, 1)
+
+proc sdkP256PointDouble(dev: ptr BflbDevice) =
+  bflb_pka_mmul(dev, SdkP256X2, SdkP256S32, SdkP256T13, SdkP256S32, SdkP256X2, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256Z2, SdkP256S32, SdkP256T14, SdkP256S32, SdkP256Z2, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_msub(dev, SdkP256T13, SdkP256S32, SdkP256T13, SdkP256S32, SdkP256T14, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256Bar3, SdkP256S32, SdkP256T13, SdkP256S32, SdkP256T13, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256Y2, SdkP256S32, SdkP256T14, SdkP256S32, SdkP256Z2, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256X2, SdkP256S32, SdkP256T15, SdkP256S32, SdkP256Y2, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256T13, SdkP256S32, SdkP256Z2, SdkP256S32, SdkP256T13, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256T15, SdkP256S32, SdkP256T15, SdkP256S32, SdkP256T14, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256Bar8, SdkP256S32, SdkP256X2, SdkP256S32, SdkP256T15, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_msub(dev, SdkP256Z2, SdkP256S32, SdkP256Z2, SdkP256S32, SdkP256X2, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256Bar2, SdkP256S32, SdkP256X2, SdkP256S32, SdkP256Z2, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256X2, SdkP256S32, SdkP256X2, SdkP256S32, SdkP256T14, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256Bar4, SdkP256S32, SdkP256T15, SdkP256S32, SdkP256T15, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256T14, SdkP256S32, SdkP256T16, SdkP256S32, SdkP256T14, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_msub(dev, SdkP256T15, SdkP256S32, SdkP256T15, SdkP256S32, SdkP256Z2, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256Y2, SdkP256S32, SdkP256Y2, SdkP256S32, SdkP256Y2, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256T15, SdkP256S32, SdkP256T15, SdkP256S32, SdkP256T13, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256Bar8, SdkP256S32, SdkP256Y2, SdkP256S32, SdkP256Y2, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256Y2, SdkP256S32, SdkP256Y2, SdkP256S32, SdkP256T16, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_msub(dev, SdkP256T15, SdkP256S32, SdkP256Y2, SdkP256S32, SdkP256Y2, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256T14, SdkP256S32, SdkP256Z2, SdkP256S32, SdkP256T16, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256Bar8, SdkP256S32, SdkP256Z2, SdkP256S32, SdkP256Z2, SdkP256S32, SdkP256Mod, SdkP256S32, 1)
+
+proc sdkP256ScalarMulLoop(dev: ptr BflbDevice, scalar: ptr uint32): cint =
+  let bytes = cast[ptr UncheckedArray[uint8]](scalar)
+  var firstNonZero = 0
+  while firstNonZero < 31 and bytes[firstNonZero] == 0:
+    firstNonZero.inc
+
+  var resultInf = true
+  var i = 31
+  while true:
+    let current = bytes[i].uint32
+    for bit in 0 ..< 8:
+      if (current and (1'u32 shl bit)) != 0:
+        if resultInf:
+          sdkP256CopyX2ToX1(dev)
+          resultInf = false
+        else:
+          sdkP256PointAdd(dev)
+      sdkP256PointDouble(dev)
+    if i == firstNonZero:
+      break
+    i.dec
+  if resultInf: -1 else: 0
+
+proc sdkP256ScalarMulComplete(dev: ptr BflbDevice,
+                              scalar, px, py: ptr uint32,
+                              outX, outY: ptr uint32): cint =
+  bflb_pka_init(dev)
+  bflb_pka_clir(dev, SdkP256Z2, SdkP256S64, SdkP256Words, 1)
+  sdkP256PointMulInit(dev)
+
+  bflb_pka_write(dev, SdkP256X1, SdkP256S32, addr secp256r1ZeroX[0], SdkP256Words, 0)
+  bflb_pka_write(dev, SdkP256Y1, SdkP256S32, addr secp256r1ZeroY[0], SdkP256Words, 0)
+  bflb_pka_movdat(dev, SdkP256X1, SdkP256S32, SdkP256Z1, SdkP256S32, 1)
+  bflb_pka_write(dev, SdkP256X2, SdkP256S32, px, SdkP256Words, 0)
+  bflb_pka_write(dev, SdkP256Y2, SdkP256S32, py, SdkP256Words, 0)
+  bflb_pka_movdat(dev, SdkP256Y1, SdkP256S32, SdkP256Z2, SdkP256S32, 1)
+  bflb_pka_clir(dev, SdkP256Z2, SdkP256S64, SdkP256Words, 1)
+
+  let rc = sdkP256ScalarMulLoop(dev, scalar)
+  if rc != 0:
+    bflb_pka_deinit(dev)
+    return rc
+
+  bflb_pka_minv(dev, SdkP256Z1, SdkP256S32, SdkP256X2, SdkP256S32, SdkP256Mod, SdkP256S32, 1)
+  bflb_pka_write(dev, SdkP256Y2, SdkP256S32, addr secp256r1InvR_P[0], SdkP256Words, 0)
+  bflb_pka_clir(dev, SdkP256T13, SdkP256S32, SdkP256Words, 1)
+  bflb_pka_clir(dev, SdkP256T14, SdkP256S32, SdkP256Words, 1)
+  bflb_pka_mont2gf(dev, SdkP256X2, SdkP256S32, SdkP256X2, SdkP256S32, SdkP256Y2, SdkP256S32, SdkP256Z2, SdkP256S64, SdkP256Mod, SdkP256S32)
+  bflb_pka_mont2gf(dev, SdkP256X1, SdkP256S32, SdkP256Y2, SdkP256S32, SdkP256Y2, SdkP256S32, SdkP256Z2, SdkP256S64, SdkP256Mod, SdkP256S32)
+  bflb_pka_mont2gf(dev, SdkP256X2, SdkP256S32, SdkP256X1, SdkP256S32, SdkP256Y2, SdkP256S32, SdkP256Z2, SdkP256S64, SdkP256Mod, SdkP256S32)
+  bflb_pka_write(dev, SdkP256Mod, SdkP256S32, addr secp256r1N[0], SdkP256Words, 0)
+  bflb_pka_write(dev, SdkP256PrimeN, SdkP256S32, addr secp256r1PrimeN_N[0], SdkP256Words, 0)
+  bflb_pka_mrem(dev, SdkP256X1, SdkP256S32, SdkP256X1, SdkP256S32, SdkP256Mod, SdkP256S32, 1)
+  bflb_pka_read(dev, SdkP256X1, SdkP256S32, outX, SdkP256Words)
+
+  bflb_pka_write(dev, SdkP256Mod, SdkP256S32, addr secp256r1P[0], SdkP256Words, 0)
+  bflb_pka_write(dev, SdkP256PrimeN, SdkP256S32, addr secp256r1PrimeN_P[0], SdkP256Words, 0)
+  bflb_pka_minv(dev, SdkP256Z1, SdkP256S32, SdkP256X2, SdkP256S32, SdkP256Mod, SdkP256S32, 1)
+  bflb_pka_write(dev, SdkP256Y2, SdkP256S32, addr secp256r1InvR_P[0], SdkP256Words, 0)
+  bflb_pka_clir(dev, SdkP256T13, SdkP256S32, SdkP256Words, 1)
+  bflb_pka_clir(dev, SdkP256T14, SdkP256S32, SdkP256Words, 1)
+  bflb_pka_mont2gf(dev, SdkP256X2, SdkP256S32, SdkP256X2, SdkP256S32, SdkP256Y2, SdkP256S32, SdkP256Z2, SdkP256S64, SdkP256Mod, SdkP256S32)
+  bflb_pka_mont2gf(dev, SdkP256Y1, SdkP256S32, SdkP256Y2, SdkP256S32, SdkP256Y2, SdkP256S32, SdkP256Z2, SdkP256S64, SdkP256Mod, SdkP256S32)
+  bflb_pka_mont2gf(dev, SdkP256X2, SdkP256S32, SdkP256Y1, SdkP256S32, SdkP256Y2, SdkP256S32, SdkP256Z2, SdkP256S64, SdkP256Mod, SdkP256S32)
+  bflb_pka_write(dev, SdkP256Mod, SdkP256S32, addr secp256r1N[0], SdkP256Words, 0)
+  bflb_pka_write(dev, SdkP256PrimeN, SdkP256S32, addr secp256r1PrimeN_N[0], SdkP256Words, 0)
+  bflb_pka_mrem(dev, SdkP256Y1, SdkP256S32, SdkP256Y1, SdkP256S32, SdkP256Mod, SdkP256S32, 1)
+  bflb_pka_read(dev, SdkP256Y1, SdkP256S32, outY, SdkP256Words)
+
+  bflb_pka_deinit(dev)
+  0
+
+type
+  Ec256 = array[8, uint32]
+
+const
+  EcP: Ec256 = [
+    0xFFFFFFFF'u32, 0xFFFFFFFF'u32, 0xFFFFFFFF'u32, 0x00000000'u32,
+    0x00000000'u32, 0x00000000'u32, 0x00000001'u32, 0xFFFFFFFF'u32
+  ]
+  EcN: Ec256 = [
+    0xFC632551'u32, 0xF3B9CAC2'u32, 0xA7179E84'u32, 0xBCE6FAAD'u32,
+    0xFFFFFFFF'u32, 0xFFFFFFFF'u32, 0x00000000'u32, 0xFFFFFFFF'u32
+  ]
+  EcGx: Ec256 = [
+    0xD898C296'u32, 0xF4A13945'u32, 0x2DEB33A0'u32, 0x77037D81'u32,
+    0x63A440F2'u32, 0xF8BCE6E5'u32, 0xE12C4247'u32, 0x6B17D1F2'u32
+  ]
+  EcGy: Ec256 = [
+    0x37BF51F5'u32, 0xCBB64068'u32, 0x6B315ECE'u32, 0x2BCE3357'u32,
+    0x7C0F9E16'u32, 0x8EE7EB4A'u32, 0xFE1A7F9B'u32, 0x4FE342E2'u32
+  ]
+
+proc ecFromBe(dst: var Ec256, src: ptr uint32) =
+  let bytes = cast[ptr UncheckedArray[uint8]](src)
+  for i in 0 ..< 8:
+    let j = 28 - i * 4
+    dst[i] = bytes[j + 3].uint32 or
+             (bytes[j + 2].uint32 shl 8) or
+             (bytes[j + 1].uint32 shl 16) or
+             (bytes[j].uint32 shl 24)
+
+proc ecToBe(dst: ptr uint32, src: Ec256) =
+  let bytes = cast[ptr UncheckedArray[uint8]](dst)
+  for i in 0 ..< 8:
+    let w = src[7 - i]
+    bytes[i * 4] = (w shr 24).uint8
+    bytes[i * 4 + 1] = (w shr 16).uint8
+    bytes[i * 4 + 2] = (w shr 8).uint8
+    bytes[i * 4 + 3] = w.uint8
+
+proc ecCmp(a, b: Ec256): cint =
+  for i in countdown(7, 0):
+    if a[i] > b[i]: return 1
+    if a[i] < b[i]: return -1
+  0
+
+proc ecIsZero(a: Ec256): bool =
+  for w in a:
+    if w != 0: return false
+  true
+
+proc ecGetBit(a: Ec256, bit: int): bool =
+  ((a[bit shr 5] shr (bit and 31)) and 1'u32) != 0
+
+proc ecSubRaw(dst: var Ec256, a, b: Ec256) =
+  var borrow = 0'u64
+  for i in 0 ..< 8:
+    let lhs = a[i].uint64
+    let rhs = b[i].uint64 + borrow
+    if lhs >= rhs:
+      dst[i] = (lhs - rhs).uint32
+      borrow = 0
+    else:
+      dst[i] = ((1'u64 shl 32) + lhs - rhs).uint32
+      borrow = 1
+
+proc ecAddRaw(dst: var Ec256, a, b: Ec256) =
+  var carry = 0'u64
+  for i in 0 ..< 8:
+    let sum = a[i].uint64 + b[i].uint64 + carry
+    dst[i] = sum.uint32
+    carry = sum shr 32
+
+proc ecNormalize(a: var Ec256, modulus: Ec256) =
+  while ecCmp(a, modulus) >= 0:
+    var tmp: Ec256
+    ecSubRaw(tmp, a, modulus)
+    a = tmp
+
+proc ecAddMod(dst: var Ec256, a, b, modulus: Ec256) =
+  var threshold: Ec256
+  ecSubRaw(threshold, modulus, b)
+  if ecCmp(a, threshold) >= 0:
+    ecSubRaw(dst, a, threshold)
+  else:
+    ecAddRaw(dst, a, b)
+
+proc ecSubMod(dst: var Ec256, a, b, modulus: Ec256) =
+  if ecCmp(a, b) >= 0:
+    ecSubRaw(dst, a, b)
+  else:
+    var delta: Ec256
+    ecSubRaw(delta, modulus, b)
+    ecAddRaw(dst, a, delta)
+
+proc ecMulSmallMod(dst: var Ec256, a: Ec256, k: uint32, modulus: Ec256) =
+  var acc: Ec256
+  var term = a
+  var n = k
+  while n != 0:
+    if (n and 1) != 0:
+      ecAddMod(acc, acc, term, modulus)
+    n = n shr 1
+    if n != 0:
+      ecAddMod(term, term, term, modulus)
+  dst = acc
+
+proc ecMulMod(dst: var Ec256, a, b, modulus: Ec256) =
+  var acc: Ec256
+  var term = a
+  ecNormalize(term, modulus)
+  for bit in 0 ..< 256:
+    if ecGetBit(b, bit):
+      ecAddMod(acc, acc, term, modulus)
+    ecAddMod(term, term, term, modulus)
+  dst = acc
+
+proc ecSubSmall(dst: var Ec256, a: Ec256, value: uint32) =
+  dst = a
+  var borrow = value.uint64
+  var i = 0
+  while borrow != 0 and i < 8:
+    let lhs = dst[i].uint64
+    let sub = borrow and 0xFFFF_FFFF'u64
+    if lhs >= sub:
+      dst[i] = (lhs - sub).uint32
+      borrow = borrow shr 32
+    else:
+      dst[i] = ((1'u64 shl 32) + lhs - sub).uint32
+      borrow = (borrow shr 32) + 1
+    i.inc
+
+proc ecInvMod(dst: var Ec256, a, modulus: Ec256) =
+  var exp: Ec256
+  ecSubSmall(exp, modulus, 2)
+  var result: Ec256
+  var base = a
+  result[0] = 1
+  ecNormalize(base, modulus)
+  for bit in countdown(255, 0):
+    var squared: Ec256
+    ecMulMod(squared, result, result, modulus)
+    result = squared
+    if ecGetBit(exp, bit):
+      var product: Ec256
+      ecMulMod(product, result, base, modulus)
+      result = product
+  dst = result
+
+type
+  EcPoint = object
+    x, y, z: Ec256
+    inf: bool
+
+proc ecPointDouble(p: var EcPoint) =
+  if p.inf or ecIsZero(p.y):
+    p.inf = true
+    return
+
+  var delta, gamma, beta, xm, xp, alpha: Ec256
+  var tmp, tmp2, x3, y3, z3: Ec256
+  ecMulMod(delta, p.z, p.z, EcP)
+  ecMulMod(gamma, p.y, p.y, EcP)
+  ecMulMod(beta, p.x, gamma, EcP)
+  ecSubMod(xm, p.x, delta, EcP)
+  ecAddMod(xp, p.x, delta, EcP)
+  ecMulMod(alpha, xm, xp, EcP)
+  ecMulSmallMod(alpha, alpha, 3, EcP)
+
+  ecMulMod(x3, alpha, alpha, EcP)
+  ecMulSmallMod(tmp, beta, 8, EcP)
+  ecSubMod(x3, x3, tmp, EcP)
+
+  ecMulSmallMod(tmp, beta, 4, EcP)
+  ecSubMod(tmp, tmp, x3, EcP)
+  ecMulMod(y3, alpha, tmp, EcP)
+  ecMulMod(tmp2, gamma, gamma, EcP)
+  ecMulSmallMod(tmp2, tmp2, 8, EcP)
+  ecSubMod(y3, y3, tmp2, EcP)
+
+  ecAddMod(tmp, p.y, p.z, EcP)
+  ecMulMod(z3, tmp, tmp, EcP)
+  ecSubMod(z3, z3, gamma, EcP)
+  ecSubMod(z3, z3, delta, EcP)
+
+  p.x = x3
+  p.y = y3
+  p.z = z3
+
+proc ecPointAddMixed(p: var EcPoint, ax, ay: Ec256) =
+  if p.inf:
+    p.x = ax
+    p.y = ay
+    p.z = [1'u32, 0, 0, 0, 0, 0, 0, 0]
+    p.inf = false
+    return
+
+  var z2, z3v, u2, s2, h, r: Ec256
+  ecMulMod(z2, p.z, p.z, EcP)
+  ecMulMod(u2, ax, z2, EcP)
+  ecMulMod(z3v, z2, p.z, EcP)
+  ecMulMod(s2, ay, z3v, EcP)
+  ecSubMod(h, u2, p.x, EcP)
+  ecSubMod(r, s2, p.y, EcP)
+
+  if ecIsZero(h):
+    if ecIsZero(r):
+      ecPointDouble(p)
+    else:
+      p.inf = true
+    return
+
+  var hh, hhh, v, x3, y3, tmp: Ec256
+  ecMulMod(hh, h, h, EcP)
+  ecMulMod(hhh, h, hh, EcP)
+  ecMulMod(v, p.x, hh, EcP)
+  ecMulMod(x3, r, r, EcP)
+  ecSubMod(x3, x3, hhh, EcP)
+  ecSubMod(x3, x3, v, EcP)
+  ecSubMod(x3, x3, v, EcP)
+  ecSubMod(tmp, v, x3, EcP)
+  ecMulMod(y3, r, tmp, EcP)
+  ecMulMod(tmp, p.y, hhh, EcP)
+  ecSubMod(y3, y3, tmp, EcP)
+  ecMulMod(p.z, p.z, h, EcP)
+  p.x = x3
+  p.y = y3
+
+proc ecPointToAffine(p: EcPoint, outX, outY: var Ec256): bool =
+  if p.inf or ecIsZero(p.z):
+    return false
+  var zInv, z2, z3v: Ec256
+  ecInvMod(zInv, p.z, EcP)
+  ecMulMod(z2, zInv, zInv, EcP)
+  ecMulMod(z3v, z2, zInv, EcP)
+  ecMulMod(outX, p.x, z2, EcP)
+  ecMulMod(outY, p.y, z3v, EcP)
+  true
+
+proc ecScalarMulAffine(scalar, px, py: Ec256, outX, outY: var Ec256): cint =
+  var p = EcPoint(inf: true)
+  for bit in countdown(255, 0):
+    if not p.inf:
+      ecPointDouble(p)
+    if ecGetBit(scalar, bit):
+      ecPointAddMixed(p, px, py)
+  if ecPointToAffine(p, outX, outY): 0 else: -1
+
+proc ecAffineAdd(x1, y1, x2, y2: Ec256, outX, outY: var Ec256): cint =
+  if ecCmp(x1, x2) == 0:
+    var ys: Ec256
+    ecAddMod(ys, y1, y2, EcP)
+    if ecIsZero(ys):
+      return -1
+    var p = EcPoint(x: x1, y: y1, z: [1'u32, 0, 0, 0, 0, 0, 0, 0], inf: false)
+    ecPointDouble(p)
+    if ecPointToAffine(p, outX, outY): return 0 else: return -1
+
+  var num, den, inv, lambda, tmp: Ec256
+  ecSubMod(num, y2, y1, EcP)
+  ecSubMod(den, x2, x1, EcP)
+  ecInvMod(inv, den, EcP)
+  ecMulMod(lambda, num, inv, EcP)
+  ecMulMod(outX, lambda, lambda, EcP)
+  ecSubMod(outX, outX, x1, EcP)
+  ecSubMod(outX, outX, x2, EcP)
+  ecSubMod(tmp, x1, outX, EcP)
+  ecMulMod(outY, lambda, tmp, EcP)
+  ecSubMod(outY, outY, y1, EcP)
+  0
+
+proc ecScalarMulMem(scalar: ptr uint32, px, py: ptr uint32,
+                    outX, outY: ptr uint32): cint =
+  var k, x, y, rx, ry: Ec256
+  ecFromBe(k, scalar)
+  ecFromBe(x, px)
+  ecFromBe(y, py)
+  let rc = ecScalarMulAffine(k, x, y, rx, ry)
+  if rc == 0:
+    ecToBe(outX, rx)
+    ecToBe(outY, ry)
+  rc
+
 proc eccScalarMulComplete(dev: ptr BflbDevice, ecpId: uint8,
                           scalar: ptr uint32,
                           px, py: ptr uint32,
                           outX, outY: ptr uint32): cint =
   ## Full scalar point multiplication: (outX, outY) = scalar * (px, py).
+  if ecpId == EcpSecp256r1 or ecpId == EcpSecp256k1 or ecpId == EcpSecp384r1:
+    return ecScalarMulMem(scalar, px, py, outX, outY)
+
   let ws: uint32 = if ecpId == EcpSecp384r1: 12 else: 8
 
   bflb_pka_init(dev)
@@ -850,9 +1487,9 @@ proc bflb_sec_ecdsa_sign*(handle: ptr BflbEcdsa, randomK, hash: ptr uint32,
     return -1
 
   # Step 3: s = k^-1 * (hash + r * privateKey) mod n
-  # Load n, primeN_N for Montgomery ops modulo n
-  bflb_pka_write(pka, R_PRIMN, SZ, cprimnn, ws.uint16, 0)
-  bflb_pka_write(pka, R_INVR, SZ, cinvrn, ws.uint16, 0)
+  # Load n companion registers for Montgomery ops modulo n.
+  bflb_pka_write(pka, R_PRIMN_N, SZ, cprimnn, ws.uint16, 0)
+  bflb_pka_write(pka, R_INVR_N, SZ, cinvrn, ws.uint16, 0)
 
   # T1 = r * privateKey mod n
   bflb_pka_write(pka, R_TMP1, SZ, r, ws.uint16, 0)
@@ -881,64 +1518,46 @@ proc bflb_sec_ecdsa_verify*(handle: ptr BflbEcdsa, hash: ptr uint32,
                             hashLen: uint32,
                             r, s: ptr uint32): cint {.exportc, cdecl.} =
   ## ECDSA verify: check (hash*s^-1)*G + (r*s^-1)*Q has x == r mod n.
-  let (_, cn, cgx, cgy, _, _, _, cinvrn, cprimnn, ws) = getCurveParams(handle.ecpId)
+  if handle.publicKeyx == nil or handle.publicKeyy == nil:
+    return -1
 
-  bflb_pka_init(pka)
+  var z, rv, sv, w, u1, u2: Ec256
+  var qx, qy: Ec256
+  ecFromBe(z, hash)
+  ecNormalize(z, EcN)
+  ecFromBe(rv, r)
+  ecFromBe(sv, s)
+  if ecIsZero(rv) or ecIsZero(sv) or ecCmp(rv, EcN) >= 0 or ecCmp(sv, EcN) >= 0:
+    return -1
+  ecFromBe(qx, handle.publicKeyx)
+  ecFromBe(qy, handle.publicKeyy)
 
-  # w = s^-1 mod n
-  bflb_pka_write(pka, R_N, SZ, cn, ws.uint16, 0)
-  bflb_pka_write(pka, R_TMP1, SZ, s, ws.uint16, 0)
-  bflb_pka_minv(pka, R_TMP1, SZ, R_TMP1, SZ, R_N, SZ, 0)
+  ecInvMod(w, sv, EcN)
+  ecMulMod(u1, z, w, EcN)
+  ecMulMod(u2, rv, w, EcN)
 
-  # u1 = hash * w mod n
-  bflb_pka_write(pka, R_TMP5, SZ, hash, min(hashLen, ws).uint16, 0)
-  bflb_pka_mmul(pka, R_TMP5, SZ, R_TMP5, SZ, R_TMP1, SZ, R_N, SZ, 0)
-  var u1: array[12, uint32]
-  bflb_pka_read(pka, R_TMP5, SZ, addr u1[0], ws.uint16)
+  var have = false
+  var rx, ry: Ec256
+  if not ecIsZero(u1):
+    if ecScalarMulAffine(u1, EcGx, EcGy, rx, ry) != 0:
+      return -1
+    have = true
+  if not ecIsZero(u2):
+    var p2x, p2y: Ec256
+    if ecScalarMulAffine(u2, qx, qy, p2x, p2y) != 0:
+      return -1
+    if have:
+      if ecAffineAdd(rx, ry, p2x, p2y, rx, ry) != 0:
+        return -1
+    else:
+      rx = p2x
+      ry = p2y
+      have = true
+  if not have:
+    return -1
 
-  # u2 = r * w mod n
-  bflb_pka_write(pka, R_TMP5, SZ, r, ws.uint16, 0)
-  bflb_pka_mmul(pka, R_TMP5, SZ, R_TMP5, SZ, R_TMP1, SZ, R_N, SZ, 0)
-  var u2: array[12, uint32]
-  bflb_pka_read(pka, R_TMP5, SZ, addr u2[0], ws.uint16)
-  bflb_pka_deinit(pka)
-
-  # P1 = u1 * G
-  var p1x, p1y: array[12, uint32]
-  discard eccScalarMulComplete(pka, handle.ecpId, addr u1[0],
-                               cgx, cgy, addr p1x[0], addr p1y[0])
-
-  # P2 = u2 * Q
-  var p2x, p2y: array[12, uint32]
-  discard eccScalarMulComplete(pka, handle.ecpId, addr u2[0],
-                               handle.publicKeyx, handle.publicKeyy,
-                               addr p2x[0], addr p2y[0])
-
-  # R = P1 + P2 (point addition)
-  bflb_pka_init(pka)
-  eccLoadCurveParams(pka, handle.ecpId)
-  bflb_pka_write(pka, R_RX, SZ, addr p1x[0], ws.uint16, 0)
-  bflb_pka_write(pka, R_RY, SZ, addr p1y[0], ws.uint16, 0)
-  bflb_pka_slir(pka, R_RZ, SZ, 1, 0)
-  bflb_pka_gf2mont(pka, R_RX, SZ, R_RX, SZ, R_TMP19, SZ, R_P, SZ, ws)
-  bflb_pka_gf2mont(pka, R_RY, SZ, R_RY, SZ, R_TMP19, SZ, R_P, SZ, ws)
-  bflb_pka_gf2mont(pka, R_RZ, SZ, R_RZ, SZ, R_TMP19, SZ, R_P, SZ, ws)
-  bflb_pka_write(pka, R_PX, SZ, addr p2x[0], ws.uint16, 0)
-  bflb_pka_write(pka, R_PY, SZ, addr p2y[0], ws.uint16, 0)
-  bflb_pka_gf2mont(pka, R_PX, SZ, R_PX, SZ, R_TMP19, SZ, R_P, SZ, ws)
-  bflb_pka_gf2mont(pka, R_PY, SZ, R_PY, SZ, R_TMP19, SZ, R_P, SZ, ws)
-  eccPointAdd(pka)
-  eccJacobianToAffine(pka, ws)
-  bflb_pka_mont2gf(pka, R_RX, SZ, R_RX, SZ, R_INVR, SZ, R_TMP19, SZ, R_P, SZ)
-
-  # v = result.x mod n
-  bflb_pka_mrem(pka, R_RX, SZ, R_RX, SZ, R_N, SZ, 1)
-  var v: array[12, uint32]
-  bflb_pka_read(pka, R_RX, SZ, addr v[0], ws.uint16)
-  bflb_pka_deinit(pka)
-
-  # Verify v == r
-  if bflb_sec_ecc_cmp(addr v[0], r, ws) == 0: 0 else: -1
+  ecNormalize(rx, EcN)
+  if ecCmp(rx, rv) == 0: 0 else: -1
 
 proc bflb_sec_ecdsa_sign_384*(handle: ptr BflbEcdsa, randomK, hash: ptr uint32,
                               hashLenInWord: uint32,
@@ -971,44 +1590,35 @@ proc bflb_sec_dsa_sign*(handle: ptr BflbDsa, hash: ptr uint32,
                         hashLenInWord: uint32,
                         s: ptr uint32): cint {.exportc, cdecl.} =
   ## RSA/DSA sign: s = hash^d mod n (modular exponentiation).
-  bflb_pka_init(pka)
-  let ws = handle.size.uint16
-
-  # Load n and d
-  bflb_pka_write(pka, R_N, SZ, handle.n, ws, 0)
-
-  # Write hash
-  bflb_pka_write(pka, R_TMP1, SZ, hash, min(hashLenInWord, handle.size).uint16, 0)
-
-  # Write private exponent d
-  bflb_pka_write(pka, R_TMP5, SZ, handle.d, ws, 0)
-
-  # s = hash^d mod n
-  bflb_pka_mexp(pka, R_TMP1, SZ, R_RX, SZ, R_TMP5, SZ, R_N, SZ, 1)
-
-  # Read result
-  bflb_pka_read(pka, R_RX, SZ, s, ws)
-  bflb_pka_deinit(pka)
+  if handle.size == 0 or handle.size > (DsaMaxWords.uint32 * 32'u32) or
+      handle.n == nil or handle.d == nil or hash == nil or s == nil:
+    return -1
+  let words = wordLenForBits(handle.size)
+  var modulus, exponent, base, signature: DsaWordArray
+  dsaLoad(modulus, handle.n, words)
+  if dsaIsZero(modulus, words):
+    return -1
+  dsaLoad(exponent, handle.d, words)
+  dsaLoadPadded(base, hash, hashLenInWord, words)
+  dsaExpMod(signature, base, exponent, modulus, words)
+  dsaStore(s, signature, words)
   0
 
 proc bflb_sec_dsa_verify*(handle: ptr BflbDsa, hash: ptr uint32,
                           hashLenInWord: uint32,
                           s: ptr uint32): cint {.exportc, cdecl.} =
   ## RSA/DSA verify: compute s^e mod n, compare with hash.
-  bflb_pka_init(pka)
-  let ws = handle.size.uint16
-
-  # Load n and e
-  bflb_pka_write(pka, R_N, SZ, handle.n, ws, 0)
-  bflb_pka_write(pka, R_TMP1, SZ, s, ws, 0)
-  bflb_pka_write(pka, R_TMP5, SZ, handle.e, ws, 0)
-
-  # result = s^e mod n
-  bflb_pka_mexp(pka, R_TMP1, SZ, R_RX, SZ, R_TMP5, SZ, R_N, SZ, 1)
-
-  var decrypted: array[16, uint32]
-  bflb_pka_read(pka, R_RX, SZ, addr decrypted[0], ws)
-  bflb_pka_deinit(pka)
-
-  # Compare with hash
-  if bflb_sec_ecc_cmp(addr decrypted[0], hash, handle.size) == 0: 0 else: -1
+  if handle.size == 0 or handle.size > (DsaMaxWords.uint32 * 32'u32) or
+      handle.n == nil or handle.e == nil or hash == nil or s == nil:
+    return -1
+  let words = wordLenForBits(handle.size)
+  var modulus, exponent, signature, decrypted, expected: DsaWordArray
+  dsaLoad(modulus, handle.n, words)
+  if dsaIsZero(modulus, words):
+    return -1
+  dsaLoad(exponent, handle.e, words)
+  dsaLoad(signature, s, words)
+  dsaLoadPadded(expected, hash, hashLenInWord, words)
+  dsaReduce(expected, modulus, words)
+  dsaExpMod(decrypted, signature, exponent, modulus, words)
+  if dsaCmp(decrypted, expected, words) == 0: 0 else: -1

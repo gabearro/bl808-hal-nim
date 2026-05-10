@@ -1,80 +1,80 @@
-## BL808 BLAI (Bouffalo Lab AI) NPU driver.
+## BL808 BLAI/CNN NPU integration helpers.
 ##
-## BLAI/CNN at 0x30024000 — neural network inference accelerator.
-## Supports basic CNN operations: convolution, pooling, activation.
-## Model weights and layer configs are loaded into memory and the
-## NPU processes them layer by layer.
+## The public BL808 SDK exposes BLAI through MM clock/reset control, SRAM
+## ownership, and codec bus/QoS registers. The neural-network layer programming
+## path is instruction-stream based, so this module avoids pretending that the
+## BLAI aperture contains simple convolution layer dimension registers.
 
 import mmio, memmap
 
 # =============================================================================
-# NPU register offsets
+# SDK-documented BLAI integration registers
 # =============================================================================
 const
-  NpuCtrl*          = BlaiBase + 0x00'u   # NPU control
-  NpuStatus*        = BlaiBase + 0x04'u   # NPU status
-  NpuIntSts*        = BlaiBase + 0x08'u   # Interrupt status
-  NpuIntMask*       = BlaiBase + 0x0C'u   # Interrupt mask
-  NpuIntClr*        = BlaiBase + 0x10'u   # Interrupt clear
-  NpuLayerCfg0*     = BlaiBase + 0x20'u   # Layer config 0
-  NpuLayerCfg1*     = BlaiBase + 0x24'u   # Layer config 1
-  NpuInputAddr*     = BlaiBase + 0x30'u   # Input data address
-  NpuInputSize*     = BlaiBase + 0x34'u   # Input dimensions
-  NpuOutputAddr*    = BlaiBase + 0x38'u   # Output data address
-  NpuOutputSize*    = BlaiBase + 0x3C'u   # Output dimensions
-  NpuWeightAddr*    = BlaiBase + 0x40'u   # Weight data address
-  NpuBiasAddr*      = BlaiBase + 0x44'u   # Bias data address
-  NpuKernelSize*    = BlaiBase + 0x48'u   # Kernel dimensions
-  NpuStridepad*     = BlaiBase + 0x4C'u   # Stride and padding
-  NpuActCfg*        = BlaiBase + 0x50'u   # Activation config
-  NpuPoolCfg*       = BlaiBase + 0x54'u   # Pooling config
-  NpuQuantCfg*      = BlaiBase + 0x58'u   # Quantization config
+  MmCnnClock*       = MmGlbBase + 0x04'u  # MM_GLB_MM_CLK_CPU
+  MmCnnReset*       = MmGlbBase + 0x4C'u  # MM_GLB_SW_RESET_CODEC_SUB
+  MmVramCtrl*       = MmMiscBase + 0x50'u # MM_MISC_VRAM_CTRL
+
+  CodecBusCtrl*     = CodecMiscBase + 0x00'u
+  CodecQosCtrl*     = CodecMiscBase + 0x04'u
+  CodecBusThreshold* = CodecMiscBase + 0x08'u
+  BlaiLimiterRead*  = CodecMiscBase + 0x20'u
+  BlaiLimiterWrite* = CodecMiscBase + 0x24'u
 
 # =============================================================================
-# NPU control fields
+# BLAI aperture registers observed on hardware
 # =============================================================================
 const
-  NpuEn*            = 0       # NPU enable
-  NpuLayerStart*    = 1       # Start processing current layer
-  NpuSoftReset*     = 4       # Soft reset
+  BlaiCoreCfg0*     = BlaiBase + 0x00'u
+  BlaiCoreCfg1*     = BlaiBase + 0x04'u
+  BlaiCoreCfg2*     = BlaiBase + 0x08'u
+  BlaiIntClear*     = BlaiBase + 0x10'u
+
+  # Legacy aliases retained for code that only needs raw register access.
+  NpuCtrl*          = BlaiCoreCfg0
+  NpuStatus*        = BlaiCoreCfg1
+  NpuIntSts*        = BlaiCoreCfg2
+  NpuIntClr*        = BlaiIntClear
 
 # =============================================================================
-# NPU status fields
+# MM_GLB/MM_MISC/Codec bit fields
 # =============================================================================
 const
-  NpuBusy*          = 0       # NPU busy
-  NpuLayerDone*     = 1       # Layer processing done
+  CnnClkDivEn*      = 8
+  CnnClkSelShift*   = 9
+  CnnClkDivShift*   = 12
+  CnnClkDivEnMask*  = 1'u32 shl CnnClkDivEn
+  CnnClkSelMask*    = 0x03'u32 shl CnnClkSelShift
+  CnnClkDivMask*    = 0x07'u32 shl CnnClkDivShift
+
+  CnnReset*         = 4
+  CnnResetMask*     = 1'u32 shl CnnReset
+
+  SysramSet*        = 0
+  BlaiSramRel*      = 7
+  BlaiSramSel*      = 15
+  SysramSetMask*    = 1'u32 shl SysramSet
+  BlaiSramRelMask*  = 1'u32 shl BlaiSramRel
+  BlaiSramSelMask*  = 1'u32 shl BlaiSramSel
+
+  CnnAwqos*         = 10
+  CnnArqos*         = 11
+  CnnAwqosMask*     = 1'u32 shl CnnAwqos
+  CnnArqosMask*     = 1'u32 shl CnnArqos
+
+  BlaiLimiterCountMask* = 0x0000_FFFF'u32
+  BlaiLimiterMode*      = 31
+  BlaiLimiterModeMask*  = 1'u32 shl BlaiLimiterMode
 
 # =============================================================================
-# Layer configuration
-# =============================================================================
-const
-  # Layer type in LayerCfg0
-  NpuLayerTypeShift* = 0      # Layer type [3:0]
-  NpuLayerTypeMask*  = 0x0F'u32
-  NpuLayerConv*     = 0       # Convolution
-  NpuLayerPool*     = 1       # Pooling
-  NpuLayerFC*       = 2       # Fully connected
-  NpuLayerEltwise*  = 3       # Element-wise
-
-  # Activation type in ActCfg
-  NpuActTypeShift*  = 0       # Activation type [3:0]
-  NpuActTypeMask*   = 0x0F'u32
-  NpuActNone*       = 0
-  NpuActRelu*       = 1
-  NpuActRelu6*      = 2
-  NpuActSigmoid*    = 3
-
-  # Pooling type in PoolCfg
-  NpuPoolTypeShift* = 0       # Pool type [1:0]
-  NpuPoolTypeMask*  = 0x03'u32
-  NpuPoolMax*       = 0
-  NpuPoolAvg*       = 1
-
-# =============================================================================
-# Types
+# Compatibility types
 # =============================================================================
 type
+  NpuClockSource* = enum
+    npuClk160M = 0
+    npuClk240M = 1
+    npuClk320M = 2
+
   NpuLayerType* = enum
     npuConv     = 0
     npuPool     = 1
@@ -95,22 +95,72 @@ type
     npuOk
     npuTimeout
     npuBusy
+    npuUnsupported
 
 # =============================================================================
-# NPU operations
+# NPU integration operations
 # =============================================================================
+proc npuSetClock*(enable: bool = true,
+                  source: NpuClockSource = npuClk160M,
+                  divider: uint32 = 0) =
+  ## Configure the SDK-documented CNN clock selector/divider.
+  var value = ((source.uint32 and 0x03'u32) shl CnnClkSelShift) or
+              ((divider and 0x07'u32) shl CnnClkDivShift)
+  if enable:
+    value = value or CnnClkDivEnMask
+  regModify(MmCnnClock, CnnClkDivEnMask or CnnClkSelMask or CnnClkDivMask, value)
+
+proc npuClockEnabled*(): bool =
+  (regRead(MmCnnClock) and CnnClkDivEnMask) != 0
+
+proc npuHoldReset*() =
+  ## Assert the CNN reset bit in MM_GLB_SW_RESET_CODEC_SUB.
+  regSet(MmCnnReset, CnnResetMask)
+
+proc npuReleaseReset*() =
+  ## Deassert the CNN reset bit in MM_GLB_SW_RESET_CODEC_SUB.
+  regClear(MmCnnReset, CnnResetMask)
+
+proc npuReset*() =
+  npuHoldReset()
+  for _ in 0 ..< 64:
+    discard regRead(MmCnnReset)
+  npuReleaseReset()
+
+proc npuReleaseSram*() =
+  ## Make the BLAI SRAM banks available and latch the SYSRAM_SET update.
+  var value = regRead(MmVramCtrl) or BlaiSramRelMask
+  regWrite(MmVramCtrl, value)
+  regWrite(MmVramCtrl, value or SysramSetMask)
+
+proc npuSramReleased*(): bool =
+  (regRead(MmVramCtrl) and BlaiSramRelMask) != 0
+
+proc npuSetCodecQos*(aw: bool = true, ar: bool = true) =
+  var value = 0'u32
+  if aw:
+    value = value or CnnAwqosMask
+  if ar:
+    value = value or CnnArqosMask
+  regModify(CodecQosCtrl, CnnAwqosMask or CnnArqosMask, value)
+
+proc npuSetBusLimiters*(readCount, writeCount: uint32,
+                        readMode: bool = true,
+                        writeMode: bool = true) =
+  var rd = readCount and BlaiLimiterCountMask
+  var wr = writeCount and BlaiLimiterCountMask
+  if readMode:
+    rd = rd or BlaiLimiterModeMask
+  if writeMode:
+    wr = wr or BlaiLimiterModeMask
+  regWrite(BlaiLimiterRead, rd)
+  regWrite(BlaiLimiterWrite, wr)
+
 proc npuInit*() =
-  ## Initialize the NPU.
-  # Soft reset
-  regSet(NpuCtrl, 1'u32 shl NpuSoftReset)
-  for i in 0 ..< 100: discard regRead(NpuCtrl)
-  regClear(NpuCtrl, 1'u32 shl NpuSoftReset)
-
-  # Clear interrupts
-  regWrite(NpuIntClr, 0xFF)
-
-  # Enable
-  regSet(NpuCtrl, 1'u32 shl NpuEn)
+  ## Bring the BLAI/CNN integration block into a usable reset/clock state.
+  npuSetClock(enable = true, source = npuClk160M, divider = 0)
+  npuReset()
+  npuReleaseSram()
 
 proc npuConfigureConvLayer*(inputAddr, outputAddr, weightAddr, biasAddr: uint32,
                             inputW, inputH, inputC: uint32,
@@ -119,46 +169,31 @@ proc npuConfigureConvLayer*(inputAddr, outputAddr, weightAddr, biasAddr: uint32,
                             strideW, strideH: uint32,
                             padW, padH: uint32,
                             activation: NpuActivation = npuActRelu) =
-  ## Configure a convolution layer.
-  regWrite(NpuInputAddr, inputAddr)
-  regWrite(NpuOutputAddr, outputAddr)
-  regWrite(NpuWeightAddr, weightAddr)
-  regWrite(NpuBiasAddr, biasAddr)
-
-  # Input dimensions: W | H<<16 | C in a separate config word
-  regWrite(NpuInputSize, (inputW and 0xFFF) or ((inputH and 0xFFF) shl 12) or
-                         ((inputC and 0xFF) shl 24))
-
-  # Output channels
-  regWrite(NpuOutputSize, outputC and 0xFFFF)
-
-  # Kernel size
-  regWrite(NpuKernelSize, (kernelW and 0x0F) or ((kernelH and 0x0F) shl 4))
-
-  # Stride and padding
-  regWrite(NpuStridepad, (strideW and 0x0F) or ((strideH and 0x0F) shl 4) or
-                         ((padW and 0x0F) shl 8) or ((padH and 0x0F) shl 12))
-
-  # Layer type = convolution
-  regModify(NpuLayerCfg0, NpuLayerTypeMask, NpuLayerConv.uint32)
-
-  # Activation
-  regModify(NpuActCfg, NpuActTypeMask, activation.uint32)
+  ## Compatibility stub.
+  ##
+  ## BL808 BLAI layer execution is driven by encoded instruction streams. The
+  ## simple layer-dimension registers previously used here do not retain writes
+  ## on hardware, so this proc intentionally performs no MMIO.
+  discard inputAddr
+  discard outputAddr
+  discard weightAddr
+  discard biasAddr
+  discard inputW
+  discard inputH
+  discard inputC
+  discard outputC
+  discard kernelW
+  discard kernelH
+  discard strideW
+  discard strideH
+  discard padW
+  discard padH
+  discard activation
 
 proc npuRunLayer*(timeout: uint32 = 5_000_000): NpuError =
-  ## Start processing the configured layer and wait for completion.
-  regWrite(NpuIntClr, 0xFF)
-  regSet(NpuCtrl, 1'u32 shl NpuLayerStart)
-
-  var countdown = timeout
-  while countdown > 0:
-    let sts = regRead(NpuStatus)
-    if (sts and (1'u32 shl NpuLayerDone)) != 0:
-      regWrite(NpuIntClr, 0xFF)
-      return npuOk
-    countdown.dec
-
-  npuTimeout
+  ## Direct layer launch is not exposed by the hardware register map we have.
+  discard timeout
+  npuUnsupported
 
 proc npuIsBusy*(): bool =
-  (regRead(NpuStatus) and (1'u32 shl NpuBusy)) != 0
+  false

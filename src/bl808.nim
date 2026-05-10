@@ -30,6 +30,7 @@ import bl808/i2c;     export i2c
 import bl808/pwm;     export pwm
 import bl808/timer;   export timer
 import bl808/ir;      export ir
+import bl808/can;     export can
 import bl808/cks;     export cks
 
 # Analog
@@ -38,6 +39,7 @@ import bl808/adc;     export adc
 # Audio
 import bl808/i2s;     export i2s
 import bl808/audio;   export audio
+import bl808/pdm;     export pdm
 
 # DMA
 import bl808/dma;     export dma
@@ -72,6 +74,10 @@ import bl808/mjpeg;   export mjpeg
 import bl808/h264;    export h264
 import bl808/npu;     export npu
 import bl808/lz4;     export lz4
+
+# Radio blobs (reimplemented from objdump disassembly)
+import bl808/blecontroller; export blecontroller
+import bl808/wifi_fw;       export wifi_fw
 
 # Startup (must be last — references irq)
 import bl808/startup; export startup

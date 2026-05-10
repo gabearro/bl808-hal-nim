@@ -15,7 +15,8 @@ const
   EmacIpgt*         = EmacBase + 0x0C'u   # Inter-packet gap (TX)
   EmacPktLen*       = EmacBase + 0x18'u   # Max/Min packet length
   EmacCollConfig*   = EmacBase + 0x1C'u   # Collision configuration
-  EmacTxBdBase*     = EmacBase + 0x20'u   # TX buffer descriptor base
+  EmacTxBdNum*      = EmacBase + 0x20'u   # TXBDNUM/TXBDPTR/RXBDPTR
+  EmacTxBdBase*     = EmacTxBdNum         # Backwards-compatible alias
   EmacFlowCtrl*     = EmacBase + 0x24'u   # Flow control
   EmacMiiMode*      = EmacBase + 0x28'u   # MII mode (RMII/MII select)
   EmacMiiCmd*       = EmacBase + 0x2C'u   # MII command
@@ -30,10 +31,15 @@ const
   EmacTxCtrl*       = EmacBase + 0x50'u   # TX control
   EmacRxCtrl*       = EmacBase + 0x54'u   # RX control
 
-  # TX buffer descriptors start at offset 0x400
-  EmacTxBdStart*    = EmacBase + 0x400'u
-  # RX buffer descriptors start at offset 0x600
-  EmacRxBdStart*    = EmacBase + 0x600'u
+  # TX and RX share a single 128-descriptor pool starting at offset 0x400.
+  EmacBdPoolStart*  = EmacBase + 0x400'u
+  EmacBdCount*      = 128'u32
+
+proc emacTxBdAddr*(index: uint32): uint {.inline.} =
+  EmacBdPoolStart + (index.uint * 8'u)
+
+proc emacRxBdAddr*(txBdCount: uint32, index: uint32): uint {.inline.} =
+  EmacBdPoolStart + ((txBdCount + index).uint * 8'u)
 
 # =============================================================================
 # Mode register fields
@@ -107,13 +113,13 @@ type
 proc emacInit*(macAddr: array[6, uint8], fullDuplex: bool = true) =
   ## Initialize the Ethernet MAC.
 
-  # Set MAC address
-  let mac0 = macAddr[0].uint32 or
-             (macAddr[1].uint32 shl 8) or
-             (macAddr[2].uint32 shl 16) or
-             (macAddr[3].uint32 shl 24)
-  let mac1 = macAddr[4].uint32 or
-             (macAddr[5].uint32 shl 8)
+  # Set MAC address (SDK: ADDR0[7:0]=byte5, ADDR0[15:8]=byte4, etc.)
+  let mac0 = macAddr[5].uint32 or
+             (macAddr[4].uint32 shl 8) or
+             (macAddr[3].uint32 shl 16) or
+             (macAddr[2].uint32 shl 24)
+  let mac1 = macAddr[1].uint32 or
+             (macAddr[0].uint32 shl 8)
   regWrite(EmacMacAddr0, mac0)
   regWrite(EmacMacAddr1, mac1)
 
@@ -130,7 +136,7 @@ proc emacInit*(macAddr: array[6, uint8], fullDuplex: bool = true) =
     regWrite(EmacIpgt, 0x12)
 
   # Set max packet length
-  regWrite(EmacPktLen, (1518'u32 shl 16) or 64)  # Max 1518, min 64
+  regWrite(EmacPktLen, 1518'u32 or (64'u32 shl 16))  # Max in low, min in high
 
   # Clear all interrupts
   regWrite(EmacIntSrc, 0xFF)
@@ -157,11 +163,11 @@ proc emacMdioRead*(phyAddr: uint8, regAddr: uint8,
   regWrite(EmacMiiAddr, (phyAddr.uint32 shl 8) or regAddr.uint32)
 
   # Issue read command
-  regWrite(EmacMiiCmd, 1'u32)  # Read
+  regWrite(EmacMiiCmd, 0x01'u32 shl 1)  # Read command = bit 1
 
   # Wait for completion
   var countdown = timeout
-  while (regRead(EmacMiiStatus) and 1) != 0:  # Busy
+  while (regRead(EmacMiiStatus) and (1'u32 shl 1)) != 0:  # Busy is bit 1
     countdown.dec
     if countdown == 0: return (0'u16, emacTimeout)
 
@@ -175,10 +181,10 @@ proc emacMdioWrite*(phyAddr: uint8, regAddr: uint8, data: uint16,
   regWrite(EmacMiiTxData, data.uint32)
 
   # Issue write command
-  regWrite(EmacMiiCmd, 2'u32)  # Write
+  regWrite(EmacMiiCmd, 0x01'u32 shl 2)  # Write command = bit 2
 
   var countdown = timeout
-  while (regRead(EmacMiiStatus) and 1) != 0:
+  while (regRead(EmacMiiStatus) and (1'u32 shl 1)) != 0:  # Busy is bit 1
     countdown.dec
     if countdown == 0: return emacTimeout
   emacOk
@@ -187,10 +193,10 @@ proc emacMdioWrite*(phyAddr: uint8, regAddr: uint8, data: uint16,
 # Interrupt control
 # =============================================================================
 proc emacEnableInterrupt*(intBit: uint32) =
-  regSet(EmacIntMask, 1'u32 shl intBit)
+  regClear(EmacIntMask, 1'u32 shl intBit)
 
 proc emacDisableInterrupt*(intBit: uint32) =
-  regClear(EmacIntMask, 1'u32 shl intBit)
+  regSet(EmacIntMask, 1'u32 shl intBit)
 
 proc emacClearInterrupt*(intBit: uint32) =
   regWrite(EmacIntSrc, 1'u32 shl intBit)

@@ -56,7 +56,10 @@ const
 const
   GlbBase*          = 0x2000_0000'u  # Global control
   MixBase*          = 0x2000_1000'u  # RF / Mixed signal
+  RfBase*           = 0x2000_1000'u  # RF (alias of MixBase)
   GpipBase*         = 0x2000_2000'u  # General Purpose I/P
+  PhyBase*          = 0x2000_2800'u  # WiFi/BLE PHY registers
+  AgcBase*          = 0x2000_2C00'u  # AGC (Automatic Gain Control)
   SecDbgBase*       = 0x2000_3000'u  # Secure debug
   SecEngBase*       = 0x2000_4000'u  # Security engine (AES/SHA/TRNG)
   TzcSecBase*       = 0x2000_5000'u  # TrustZone secure
@@ -77,6 +80,7 @@ const
   I2c1Base*         = 0x2000_A900'u
   Uart2Base*        = 0x2000_AA00'u
   I2sBase*          = 0x2000_AB00'u
+  AuadcBase*        = 0x2000_AC00'u  # Audio ADC / PDM
   Lz4dBase*         = 0x2000_AD00'u
 
   SfCtrlBase*       = 0x2000_B000'u  # Serial flash controller
@@ -88,9 +92,8 @@ const
 
   EmiMiscBase*      = 0x2005_0000'u  # XRAM/EMI control
   PsramCtrlBase*    = 0x2005_2000'u  # PSRAM controller
-  AuadcBase*        = 0x2000_AC00'u  # Audio ADC (AUADC)
-  AudacBase*        = 0x2005_5000'u  # Audio DAC (AUDAC)
-  AudioBase*        = AudacBase      # Alias for backwards compat
+  AudioBase*        = 0x2005_5000'u  # Audio codec (AUDAC)
+  AudacBase*        = AudioBase      # Audio DAC alias
   EfCtrlBase*       = 0x2005_6000'u  # eFuse control
   SdhBase*          = 0x2006_0000'u  # SD Host
   EmacBase*         = 0x2007_0000'u  # Ethernet MAC
@@ -113,44 +116,95 @@ const
   Timer1Base*       = 0x3000_9000'u  # Timer1 (D0)
   PsramUhsBase*     = 0x3000_F000'u  # PSRAM UHS controller
 
-  SubMiscBase*      = 0x3001_0000'u  # Sub-system misc
-  Dvp0Base*         = 0x3001_2000'u  # DVP camera (8 instances, stride 0x100)
+  CamFrontBase*     = 0x3001_0000'u  # Camera front-end / sub-misc mux
+  SubMiscBase*      = 0x3001_0000'u  # Alias for CamFrontBase
+  MmSubsysBase*     = 0x3001_1000'u  # MM subsystem control
+  Dvp0Base*         = 0x3001_2000'u  # DVP camera 0
+  Dvp1Base*         = 0x3001_2100'u  # DVP camera 1
+  Dvp2Base*         = 0x3001_2200'u  # DVP camera 2
+  Dvp3Base*         = 0x3001_2300'u  # DVP camera 3
+  Dvp4Base*         = 0x3001_2400'u  # DVP camera 4
+  Dvp5Base*         = 0x3001_2500'u  # DVP camera 5
+  Dvp6Base*         = 0x3001_2600'u  # DVP camera 6
+  Dvp7Base*         = 0x3001_2700'u  # DVP camera 7
+  DvpTsrc0Base*     = 0x3001_2800'u  # DVP timing source 0
+  DvpTsrc1Base*     = 0x3001_2900'u  # DVP timing source 1
+  AxiCtrlNr3dBase*  = 0x3001_2A00'u  # AXI NR3D control
+  OsdProbeBase*     = 0x3001_2B00'u  # OSD probe
   OsdABase*         = 0x3001_3000'u  # OSD layer A
   OsdBBase*         = 0x3001_4000'u  # OSD layer B
   OsdDpBase*        = 0x3001_5000'u  # OSD display pipeline
+  MipiBase*         = 0x3001_A000'u  # MIPI base (CSI)
   MipiCsiBase*      = 0x3001_A000'u  # MIPI CSI
   MipiDsiBase*      = 0x3001_A100'u  # MIPI DSI
   DbiBase*          = 0x3001_B000'u  # DBI display
   CodecMiscBase*    = 0x3002_0000'u  # Codec misc
   MjpegBase*        = 0x3002_1000'u  # MJPEG encoder
-  H264Base*         = 0x3002_2000'u  # H.264 encoder
+  VideoBase*        = 0x3002_2000'u  # H.264/video encoder
+  H264Base*         = 0x3002_2000'u  # Alias for VideoBase
   MjpegDecBase*     = 0x3002_3000'u  # MJPEG decoder
-  BlaiBase*         = 0x3002_4000'u  # NPU (BLAI)
+  BlCnnBase*        = 0x3002_4000'u  # NPU (BLAI/CNN)
+  BlaiBase*         = 0x3002_4000'u  # Alias for BlCnnBase
 
 # =============================================================================
 # Interrupt controllers
 # =============================================================================
-const
-  # D0 PLIC (T-Head modified)
-  PlicBase*         = 0xE000_0000'u
-  PlicPriorityBase* = 0xE000_0004'u  # IRQ 1 priority (4 bytes each)
-  PlicPendingBase*  = 0xE000_1000'u
-  PlicEnableBase*   = 0xE000_2000'u  # M-mode enable base
-  PlicSEnableBase*  = 0xE000_2080'u  # S-mode enable base
-  PlicThresholdM*   = 0xE020_0000'u  # M-mode threshold
-  PlicClaimM*       = 0xE020_0004'u  # M-mode claim/complete
-  PlicThresholdS*   = 0xE020_1000'u  # S-mode threshold
-  PlicClaimS*       = 0xE020_1004'u  # S-mode claim/complete
+#
+# Real hardware per-CPU address space (private bus at 0xE0000000):
+#
+#   M0 (hart 0): CLINT at 0xE0000000, CLIC at 0xE0800000
+#     MSIP=0xE0000000, mtimecmp=0xE0004000, mtime=0xE000BFF8
+#     CLIC cfg at 0xE0800000, per-IRQ regs at 0xE0801000+4*i
+#       +0: intip  +1: intie  +2: intattr  +3: intctl
+#
+#   LP (hart 2): Separate CLINT+CLIC at 0xE0000000/0xE0800000 (same layout)
+#     mtimecmp=0xE0004000, mtime=0xE000BFF8 (shared clock with M0)
+#
+#   D0 (hart 1): PLIC at 0xE0000000, D0 CLINT at 0xE4000000
+#     PLIC: priority=+0x4, pending=+0x1000, enable=+0x2000, ctx=+0x200000
+#     D0 CLINT: mtimecmp=0xE4004000, mtime=0xE400BFF8
+#
+# QEMU now uses per-CPU address spaces, so all cores see the same
+# addresses as real hardware. No address overrides needed.
 
-  # M0 CLIC
-  ClicBase*         = 0xE000_0000'u  # E907 CLIC base
+const
+  # D0 PLIC at 0xE0000000 (D0 private bus view)
+  PlicBase*         = 0xE000_0000'u
+  PlicPriorityBase* = 0xE000_0004'u
+  PlicPendingBase*  = 0xE000_1000'u
+  PlicEnableBase*   = 0xE000_2000'u
+  PlicSEnableBase*  = 0xE000_2080'u
+  PlicThresholdM*   = 0xE020_0000'u
+  PlicClaimM*       = 0xE020_0004'u
+  PlicThresholdS*   = 0xE020_1000'u
+  PlicClaimS*       = 0xE020_1004'u
+
+const
+  # D0 CLINT at 0xE4000000 (D0 private bus view)
+  D0ClintMtimecmpBase* = 0xE400_4000'u  # mtimecmp at +0x4000
+  D0ClintMtimeBase*    = 0xE400_BFF8'u  # mtime at +0xBFF8
+
+const
+  # LP CLINT at 0xE0000000 (LP private bus view, own instance)
+  LpClintMtimecmpBase* = 0xE000_4000'u  # mtimecmp at +0x4000
+  LpClintMtimeBase*    = 0xE000_BFF8'u  # mtime (shared clock with M0)
+
+const
+  # M0 CLIC/CLINT at 0xE0000000 (M0 private bus view)
+  ClicBase*         = 0xE000_0000'u  # E907 CLINT base
   ClicMsipBase*     = 0xE000_0000'u
   ClicMtimeBase*    = 0xE000_BFF8'u
   ClicMtimecmpBase* = 0xE000_4000'u
-  ClicIntipBase*    = 0xE800_0000'u
-  ClicIntieBase*    = 0xE800_0400'u
-  ClicIntcfgBase*   = 0xE800_0800'u
-  ClicCfgBase*      = 0xE800_0C00'u
+
+  # T-Head CLIC interrupt controller at 0xE0800000
+  # Per-IRQ registers at base+0x1000, packed as 4-byte structs:
+  #   byte +0: intip (pending), +1: intie (enable),
+  #   byte +2: intattr (attribute), +3: intctl (priority/level)
+  ClicCtrlBase*     = 0xE080_0000'u  # CLIC config register (cliccfg)
+  ClicInfoBase*     = 0xE080_0004'u  # CLIC info register (clicinfo)
+  ClicMintThresh*   = 0xE080_0008'u  # Machine interrupt threshold
+  ClicIntBase*      = 0xE080_1000'u  # Per-IRQ register array
+  ClicIntStride*    = 4'u            # Bytes per IRQ entry
 
 # =============================================================================
 # GPIO configuration base (inside GLB)
@@ -165,6 +219,7 @@ const
 const
   Ox64FlashSize*        = 16 * 1024 * 1024  # 16 MB
   Ox64M0FwOffset*       = 0x00_0000'u       # M0 firmware
+  Ox64LPBootOffset*     = 0x08_0000'u       # LP firmware XIP image
   Ox64D0BootOffset*     = 0x10_0000'u       # D0 low-load bootloader
   Ox64MainImageOffset*  = 0x80_0000'u       # Main image
 

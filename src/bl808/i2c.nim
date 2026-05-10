@@ -36,11 +36,10 @@ const
   I2cSubAddrEn*     = 4       # Sub-address enable
   I2cSubAddrBcShift* = 5      # Sub-address byte count [6:5]
   I2cSubAddrBcMask*  = 0x03'u32 shl 5
-  I2cAddr10bEn*     = 7       # 10-bit address enable
-  I2cSlvAddrShift*  = 8       # Slave address [17:8]
-  I2cSlvAddrMask*   = 0x3FF'u32 shl 8
-  I2cPktLenShift*   = 20      # Packet length [27:20] (n-1)
-  I2cPktLenMask*    = 0xFF'u32 shl 20
+  I2cSlvAddrShift*  = 8       # Slave address [14:8]
+  I2cSlvAddrMask*   = 0x7F'u32 shl 8
+  I2cPktLenShift*   = 16      # Packet length [23:16] (n-1)
+  I2cPktLenMask*    = 0xFF'u32 shl 16
   I2cDeglitchCycShift* = 28   # Deglitch cycle count [31:28]
   I2cDeglitchCycMask*  = 0x0F'u32 shl 28
 
@@ -56,17 +55,20 @@ const
   I2cIntFifoErr*    = 5       # FIFO error
   # Mask bits at +8
   I2cIntMaskOffset* = 8
+  # Clear bits at +16
+  I2cIntClrOffset* = 16
 
 # =============================================================================
 # FIFO fields
 # =============================================================================
 const
+  I2cFifoDepth*     = 2'u32
   I2cFifoDmaRxEn*   = 0
   I2cFifoDmaTxEn*   = 1
   I2cFifoTxClr*     = 2
   I2cFifoRxClr*     = 3
 
-  I2cFifoTxCountMask* = 0x03'u32
+  I2cFifoTxCountMask* = 0x03'u32  # TX free count
   I2cFifoRxCountShift* = 8
   I2cFifoRxCountMask*  = 0x03'u32 shl 8
 
@@ -93,8 +95,8 @@ type
     i2cFifoError
 
   I2c* = object
-    base: uint
-    id: I2cId
+    base*: uint
+    id*: I2cId
 
 # =============================================================================
 # Base address lookup
@@ -128,10 +130,11 @@ proc initI2c*(id: I2cId, speed: I2cSpeed, i2cClkHz: uint32): I2c =
   let period = i2cClkHz div targetFreq
   let halfPeriod = period div 2
 
-  # Phase periods: each is a 16-bit pair (phase0 | phase1<<16)
-  let startPrd = (halfPeriod shl 16) or halfPeriod
-  let stopPrd = (halfPeriod shl 16) or halfPeriod
-  let dataPrd = (halfPeriod shl 16) or halfPeriod
+  # Phase periods: each is 4x8-bit phase values
+  let phase = min(halfPeriod, 255'u32)  # 8-bit fields
+  let startPrd = phase or (phase shl 8) or (phase shl 16) or (phase shl 24)
+  let stopPrd = phase or (phase shl 8) or (phase shl 16) or (phase shl 24)
+  let dataPrd = phase or (phase shl 8) or (phase shl 16) or (phase shl 24)
 
   regWrite(base + I2cPrdStart, startPrd)
   regWrite(base + I2cPrdStop, stopPrd)
@@ -161,14 +164,14 @@ proc waitComplete(i2c: I2c, timeout: uint32 = 500_000): I2cError =
     let sts = regRead(i2c.base + I2cIntSts)
     if (sts and (1'u32 shl I2cIntEnd)) != 0:
       # Clear end interrupt
-      regSet(i2c.base + I2cIntSts, 1'u32 shl I2cIntEnd)
+      regSet(i2c.base + I2cIntSts, 1'u32 shl (I2cIntEnd + 16))
       # Check for NAK
       if (sts and (1'u32 shl I2cIntNak)) != 0:
-        regSet(i2c.base + I2cIntSts, 1'u32 shl I2cIntNak)
+        regSet(i2c.base + I2cIntSts, 1'u32 shl (I2cIntNak + 16))
         return i2cNak
       # Check for arbitration lost
       if (sts and (1'u32 shl I2cIntArb)) != 0:
-        regSet(i2c.base + I2cIntSts, 1'u32 shl I2cIntArb)
+        regSet(i2c.base + I2cIntSts, 1'u32 shl (I2cIntArb + 16))
         return i2cArbLost
       return i2cOk
     countdown.dec
@@ -183,10 +186,10 @@ proc startTransfer(i2c: I2c, address: uint8, isRead: bool, length: uint32,
   regSet(base + I2cFifoConfig0,
          (1'u32 shl I2cFifoTxClr) or (1'u32 shl I2cFifoRxClr))
 
-  # Clear all interrupt flags
+  # Clear all interrupt flags (clear bits are at +16 offset)
   regWrite(base + I2cIntSts,
-           (1'u32 shl I2cIntEnd) or (1'u32 shl I2cIntNak) or
-           (1'u32 shl I2cIntArb) or (1'u32 shl I2cIntFifoErr))
+           (1'u32 shl (I2cIntEnd + 16)) or (1'u32 shl (I2cIntNak + 16)) or
+           (1'u32 shl (I2cIntArb + 16)) or (1'u32 shl (I2cIntFifoErr + 16)))
 
   var cfg = regRead(base + I2cConfig)
 
@@ -225,16 +228,16 @@ proc write*(i2c: I2c, address: uint8, data: openArray[uint8]): I2cError =
   let base = i2c.base
 
   # Load TX FIFO before starting
-  for i in 0 ..< min(data.len, 4):
+  for i in 0 ..< min(data.len, I2cFifoDepth.int):
     regWrite(base + I2cFifoWdata, data[i].uint32)
 
   startTransfer(i2c, address, isRead = false, length = data.len.uint32)
 
   # Feed remaining data
-  var idx = 4
+  var idx = I2cFifoDepth.int
   while idx < data.len:
-    let txCount = regRead(base + I2cFifoConfig1) and I2cFifoTxCountMask
-    if txCount < 2:
+    let txFree = regRead(base + I2cFifoConfig1) and I2cFifoTxCountMask
+    if txFree > 0:
       regWrite(base + I2cFifoWdata, data[idx].uint32)
       idx.inc
 
@@ -274,16 +277,16 @@ proc writeReg*(i2c: I2c, address: uint8, regAddr: uint8, data: openArray[uint8])
   let base = i2c.base
 
   # Load TX data
-  for i in 0 ..< min(data.len, 4):
+  for i in 0 ..< min(data.len, I2cFifoDepth.int):
     regWrite(base + I2cFifoWdata, data[i].uint32)
 
   startTransfer(i2c, address, isRead = false, length = data.len.uint32,
                 subAddr = regAddr.uint32, subAddrLen = 1)
 
-  var idx = 4
+  var idx = I2cFifoDepth.int
   while idx < data.len:
-    let txCount = regRead(base + I2cFifoConfig1) and I2cFifoTxCountMask
-    if txCount < 2:
+    let txFree = regRead(base + I2cFifoConfig1) and I2cFifoTxCountMask
+    if txFree > 0:
       regWrite(base + I2cFifoWdata, data[idx].uint32)
       idx.inc
 

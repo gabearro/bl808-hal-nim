@@ -2,7 +2,7 @@
 ##
 ## Build: nim c -d:bl808d0 examples/d0_uart_hello.nim
 ##
-## Ox64 D0 console: UART3, GPIO16 (TX), GPIO17 (RX), 2 Mbps.
+## Ox64 D0 console: UART3, GPIO16 (TX), GPIO17 (RX), 230400 baud by default.
 ## Note: The D0 firmware must be loaded by M0 (via bootloader or IPC).
 
 import bl808
@@ -10,7 +10,7 @@ import bl808
 const
   ConsoleUartTxPin = 16'u32
   ConsoleUartRxPin = 17'u32
-  ConsoleBaud = 2_000_000'u32
+  ConsoleBaud {.intdefine.} = 230_400'u32
   DefaultClkHz = 32_000_000'u32  # Boot clock
 
 proc main() {.exportc, cdecl.} =
@@ -27,8 +27,9 @@ proc main() {.exportc, cdecl.} =
   let rxAddr = GpioConfigBase + ConsoleUartRxPin * 4
   regSet(rxAddr, (1'u32 shl 0) or (1'u32 shl 1) or (1'u32 shl 4))  # IE, SMT, PU
 
-  # Enable MM UART clock (bit 4 of MM_CLK_CTRL_PERI)
-  enableMmPeriphClock(4)
+  # MM UART3 is controlled through MM_GLB UART0 clock/reset fields.
+  resetMmUart3()
+  enableMmUart3Clock()
 
   # Initialize UART3
   let console = initUart(uart3, UartConfig(

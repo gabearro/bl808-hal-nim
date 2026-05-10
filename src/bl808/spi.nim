@@ -53,7 +53,10 @@ const
   SpiIntTxUnder*    = 4       # TX FIFO underrun
   SpiIntFifoErr*    = 5       # FIFO error
   # Mask bits are at offset +8
+  SpiIntBitsMask*   = 0x3F'u32
   SpiIntMaskOffset* = 8
+  SpiIntClearOffset* = 16
+  SpiIntEnableOffset* = 24
 
 # =============================================================================
 # FIFO fields
@@ -68,14 +71,17 @@ const
   SpiFifoRxOverflow*  = 6
   SpiFifoRxUnderflow* = 7
 
-  SpiFifoTxCountShift* = 0
-  SpiFifoTxCountMask*  = 0x1F'u32
+  # FIFO_CONFIG1 [5:0] reports TX free entries, not TX used entries.
+  SpiFifoTxFreeShift* = 0
+  SpiFifoTxFreeMask*  = 0x3F'u32
+  SpiFifoTxCountShift* = SpiFifoTxFreeShift
+  SpiFifoTxCountMask*  = SpiFifoTxFreeMask
   SpiFifoRxCountShift* = 8
-  SpiFifoRxCountMask*  = 0x1F'u32 shl 8
+  SpiFifoRxCountMask*  = 0x3F'u32 shl 8
   SpiFifoTxThreshShift* = 16
-  SpiFifoTxThreshMask*  = 0x03'u32 shl 16
+  SpiFifoTxThreshMask*  = 0x1F'u32 shl 16
   SpiFifoRxThreshShift* = 24
-  SpiFifoRxThreshMask*  = 0x03'u32 shl 24
+  SpiFifoRxThreshMask*  = 0x1F'u32 shl 24
 
 # =============================================================================
 # SPI types
@@ -183,8 +189,11 @@ proc initSpi*(id: SpiId, config: SpiConfig): Spi =
   regSet(base + SpiFifoConfig0,
          (1'u32 shl SpiFifoTxClr) or (1'u32 shl SpiFifoRxClr))
 
-  # Mask all interrupts
-  regSet(base + SpiIntSts, 0x3F'u32 shl SpiIntMaskOffset)
+  # Enable interrupt sources in the peripheral but keep them masked.
+  regWrite(base + SpiIntSts,
+           (SpiIntBitsMask shl SpiIntEnableOffset) or
+           (SpiIntBitsMask shl SpiIntMaskOffset) or
+           (SpiIntBitsMask shl SpiIntClearOffset))
 
 proc deinitSpi*(spi: Spi) =
   ## Disable SPI and clear FIFOs.
@@ -192,11 +201,26 @@ proc deinitSpi*(spi: Spi) =
   regSet(spi.base + SpiFifoConfig0,
          (1'u32 shl SpiFifoTxClr) or (1'u32 shl SpiFifoRxClr))
 
+proc baseAddr*(spi: Spi): uint {.inline.} =
+  ## Return the SPI MMIO base address.
+  spi.base
+
 # =============================================================================
 # FIFO status
 # =============================================================================
+proc fifoDepth*(spi: Spi): uint32 {.inline.} =
+  case spi.frameSize
+  of frame8bit: 32'u32
+  of frame16bit: 16'u32
+  of frame24bit, frame32bit: 8'u32
+
+proc txFifoFree*(spi: Spi): uint32 {.inline.} =
+  regRead(spi.base + SpiFifoConfig1) and SpiFifoTxFreeMask
+
 proc txFifoCount*(spi: Spi): uint32 {.inline.} =
-  regRead(spi.base + SpiFifoConfig1) and SpiFifoTxCountMask
+  let depth = spi.fifoDepth()
+  let free = spi.txFifoFree()
+  if free >= depth: 0'u32 else: depth - free
 
 proc rxFifoCount*(spi: Spi): uint32 {.inline.} =
   (regRead(spi.base + SpiFifoConfig1) and SpiFifoRxCountMask) shr SpiFifoRxCountShift
@@ -212,7 +236,7 @@ proc transferByte*(spi: Spi, txByte: uint8): (uint8, SpiError) =
   var timeout = 100_000'u32
 
   # Wait for TX FIFO space
-  while spi.txFifoCount() >= 4:
+  while spi.txFifoFree() == 0:
     timeout.dec
     if timeout == 0: return (0'u8, spiTimeout)
 
@@ -274,10 +298,26 @@ proc rxFifoAddr*(spi: Spi): uint {.inline.} =
 # Interrupt support
 # =============================================================================
 proc enableInterrupt*(spi: Spi, intBit: uint32) =
-  regClear(spi.base + SpiIntSts, 1'u32 shl (intBit + SpiIntMaskOffset.uint32))
+  let bit = 1'u32 shl intBit
+  let cur = regRead(spi.base + SpiIntSts)
+  let enableBits = ((cur shr SpiIntEnableOffset) and SpiIntBitsMask) or bit
+  let maskBits = ((cur shr SpiIntMaskOffset) and SpiIntBitsMask) and not bit
+  regWrite(spi.base + SpiIntSts,
+           (enableBits shl SpiIntEnableOffset) or
+           (maskBits shl SpiIntMaskOffset))
 
 proc disableInterrupt*(spi: Spi, intBit: uint32) =
-  regSet(spi.base + SpiIntSts, 1'u32 shl (intBit + SpiIntMaskOffset.uint32))
+  let bit = 1'u32 shl intBit
+  let cur = regRead(spi.base + SpiIntSts)
+  let enableBits = (cur shr SpiIntEnableOffset) and SpiIntBitsMask
+  let maskBits = ((cur shr SpiIntMaskOffset) and SpiIntBitsMask) or bit
+  regWrite(spi.base + SpiIntSts,
+           (enableBits shl SpiIntEnableOffset) or
+           (maskBits shl SpiIntMaskOffset))
 
 proc clearInterrupt*(spi: Spi, intBit: uint32) =
-  regSet(spi.base + SpiIntSts, 1'u32 shl (intBit + 16))
+  let cur = regRead(spi.base + SpiIntSts)
+  regWrite(spi.base + SpiIntSts,
+           (cur and ((SpiIntBitsMask shl SpiIntEnableOffset) or
+                     (SpiIntBitsMask shl SpiIntMaskOffset))) or
+           (1'u32 shl (intBit + SpiIntClearOffset.uint32)))

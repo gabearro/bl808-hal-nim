@@ -14,14 +14,12 @@
 
 #include <bl60x_fw_api.h>
 #include <bl_os_adapter/bl_os_adapter.h>
-#include <lwip/dhcp.h>
 #include <lwip/etharp.h>
 #include <lwip/ip4_addr.h>
 #include <lwip/netif.h>
 #include <lwip/netifapi.h>
 #include <lwip/pbuf.h>
 #include <lwip/tcpip.h>
-#include <netif/ethernet.h>
 
 #include "../../build/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/bl_main.h"
 #include "../../build/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/bl_msg_tx.h"
@@ -1981,17 +1979,12 @@ err_t netifapi_netif_add(struct netif *netif, const ip4_addr_t *ipaddr,
                          void *state, netif_init_fn init,
                          netif_input_fn input)
 {
-    /* Iter 2.A.0: real bridge to vendor lwIP. Joins the netif chain so
-       dhcp_start, etharp_output, etc. find the netif. The previous stub
-       set state/input but never registered with lwIP, leaving the netif
-       orphaned outside lwIP's netif_list. */
-    if (netif_add(netif, ipaddr, netmask, gw, state, init, input) == NULL) {
-        return ERR_IF;
-    }
-    /* linkoutput is wired by bl606a0_wifi_netif_init (in wifi_driver.nim)
-       to wifiTx, which in turn calls bl_output. No additional wiring
-       needed here. (See spec Section 6 finding #3.) */
-    return ERR_OK;
+    (void)ipaddr;
+    (void)netmask;
+    (void)gw;
+    netif->state = state;
+    netif->input = input;
+    return init ? init(netif) : 0;
 }
 
 err_t netifapi_netif_common(struct netif *netif, netifapi_void_fn voidfunc,
@@ -2031,10 +2024,18 @@ void netifapi_netif_set_up(struct netif *netif)
     netif_set_up(netif);
 }
 
-/* Iter 2.A.0: netif_set_default, netif_set_up, netif_set_status_callback
-   stubs removed -- vendor lwIP (vendor/lwip/src/core/netif.c) provides
-   them. netif_set_link_up / netif_set_link_down kept because vendor lwIP
-   may not export them depending on LWIP_NETIF_LINK_CALLBACK config. */
+void netif_set_default(struct netif *netif)
+{
+    (void)netif;
+}
+
+void netif_set_up(struct netif *netif)
+{
+    if (netif) {
+        netif->flags |= NETIF_FLAG_UP;
+    }
+}
+
 void netif_set_link_up(struct netif *netif)
 {
     if (netif) {
@@ -2049,16 +2050,27 @@ void netif_set_link_down(struct netif *netif)
     }
 }
 
-err_t tcpip_input(struct pbuf *p, struct netif *inp)
+void netif_set_status_callback(struct netif *netif, netif_status_callback_fn status_callback)
 {
-    /* Iter 2.A.0: NO_SYS=1, no tcpip thread. Deliver directly to lwIP's
-       Ethernet input. Calling inp->input(p, inp) here would loop because
-       the blob passes tcpip_input itself as the input arg to netif_add. */
-    return ethernet_input(p, inp);
+    if (netif) {
+        netif->status_callback = status_callback;
+    }
 }
 
-/* Iter 2.A.0: etharp_output stub removed -- vendor lwIP
-   (vendor/lwip/src/core/ipv4/etharp.c) provides it. */
+err_t tcpip_input(struct pbuf *p, struct netif *inp)
+{
+    (void)inp;
+    pbuf_free(p);
+    return 0;
+}
+
+err_t etharp_output(struct netif *netif, struct pbuf *q, const ip4_addr_t *ipaddr)
+{
+    (void)netif;
+    (void)q;
+    (void)ipaddr;
+    return 0;
+}
 
 uint32_t ipaddr_addr(const char *cp)
 {
@@ -2077,14 +2089,95 @@ uint32_t inet_addr(const char *cp)
     return ipaddr_addr(cp);
 }
 
-/* Iter 2.A.0: pbuf_alloc / pbuf_alloced_custom / pbuf_free / pbuf_ref /
-   pbuf_take / pbuf_cat / pbuf_header stubs removed -- vendor lwIP
-   (vendor/lwip/src/core/pbuf.c) provides them.
+struct pbuf *pbuf_alloc(pbuf_layer layer, u16_t length, pbuf_type type)
+{
+    struct pbuf *p;
+    (void)layer;
+    (void)type;
+    p = calloc(1, sizeof(struct pbuf) + length);
+    if (!p) {
+        return NULL;
+    }
+    p->payload = (uint8_t *)p + sizeof(struct pbuf);
+    p->len = length;
+    p->tot_len = length;
+    p->ref = 1;
+    return p;
+}
 
-   Coupling note: these MUST move together. Vendor pbuf_alloc(PBUF_POOL,...)
-   returns a pbuf whose memory came from memp_malloc(MEMP_PBUF_POOL).
-   Mixing the old libc-malloc/free pbuf_alloc with vendor pbuf_free (or
-   vice versa) corrupts the heap. */
+struct pbuf *pbuf_alloced_custom(pbuf_layer layer, u16_t length,
+                                 pbuf_type type, struct pbuf_custom *p,
+                                 void *payload_mem, u16_t payload_mem_len)
+{
+    (void)layer;
+    (void)type;
+    (void)payload_mem_len;
+    memset(&p->pbuf, 0, sizeof(p->pbuf));
+    p->pbuf.payload = payload_mem;
+    p->pbuf.len = length;
+    p->pbuf.tot_len = length;
+    p->pbuf.ref = 1;
+    return &p->pbuf;
+}
+
+u8_t pbuf_free(struct pbuf *p)
+{
+    while (p) {
+        struct pbuf *next = p->next;
+        if (p->flags & PBUF_FLAG_IS_CUSTOM) {
+            struct pbuf_custom *custom = (struct pbuf_custom *)p;
+            if (custom->custom_free_function) {
+                custom->custom_free_function(p);
+            }
+        } else {
+            free(p);
+        }
+        p = next;
+    }
+    return 1;
+}
+
+void pbuf_ref(struct pbuf *p)
+{
+    if (p) {
+        p->ref++;
+    }
+}
+
+err_t pbuf_take(struct pbuf *buf, const void *dataptr, u16_t len)
+{
+    if (!buf || !buf->payload || len > buf->len) {
+        return -1;
+    }
+    memcpy(buf->payload, dataptr, len);
+    return 0;
+}
+
+void pbuf_cat(struct pbuf *head, struct pbuf *tail)
+{
+    struct pbuf *p = head;
+    if (!p) {
+        return;
+    }
+    while (p->next) {
+        p = p->next;
+    }
+    p->next = tail;
+    if (tail) {
+        head->tot_len += tail->tot_len;
+    }
+}
+
+u8_t pbuf_header(struct pbuf *p, s16_t header_size_increment)
+{
+    if (!p) {
+        return 1;
+    }
+    p->payload = (uint8_t *)p->payload - header_size_increment;
+    p->len = (u16_t)(p->len + header_size_increment);
+    p->tot_len = (u16_t)(p->tot_len + header_size_increment);
+    return 0;
+}
 
 int aos_post_event(uint16_t type, uint16_t code, unsigned long value)
 {
@@ -3008,11 +3101,5 @@ int wifi_mgmr_scan_complete_notify(void)
     vendor_puts_raw("[WIFI] scan complete notify\r\n");
     return 0;
 }
-int wifi_netif_dhcp_start(struct netif *netif)
-{
-    /* Iter 2.A.0: real bridge. Previous stub returned 0 without doing
-       anything, leaving the netif without DHCP. */
-    if (netif == NULL) return -1;
-    return (int)dhcp_start(netif);
-}
+int wifi_netif_dhcp_start(struct netif *netif) { (void)netif; return 0; }
 int wifi_netif_dhcp_stop(struct netif *netif) { (void)netif; return 0; }

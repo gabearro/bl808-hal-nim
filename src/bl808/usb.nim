@@ -225,8 +225,8 @@ proc usbDeviceInit*(highSpeed: bool = true) =
   discard regRead(UsbDevIsg1)
   discard regRead(UsbDevIsg2)
 
-proc usbDeviceSetAddress*(addr: uint8) =
-  regWrite(UsbDevAdr, addr.uint32 and 0x7F)
+proc usbDeviceSetAddress*(address: uint8) =
+  regWrite(UsbDevAdr, address.uint32 and 0x7F)
 
 proc usbDeviceGetFrameNumber*(): uint32 =
   regRead(UsbDevSfn) and 0x7FF
@@ -254,13 +254,13 @@ proc usbCxFifoFull*(): bool =
 proc usbSetInEpMaxPacket*(ep: uint32, maxPkt: uint32) =
   ## Set max packet size for an IN endpoint (1-8).
   if ep >= 1 and ep <= 8:
-    let addr = UsbDevInmps1 + (ep - 1) * 4
-    regModify(addr, 0x7FF'u32, maxPkt and 0x7FF)
+    let regAddr = UsbDevInmps1 + (ep - 1) * 4
+    regModify(regAddr, 0x7FF'u32, maxPkt and 0x7FF)
 
 proc usbSetOutEpMaxPacket*(ep: uint32, maxPkt: uint32) =
   if ep >= 1 and ep <= 8:
-    let addr = UsbDevOutmps1 + (ep - 1) * 4
-    regModify(addr, 0x7FF'u32, maxPkt and 0x7FF)
+    let regAddr = UsbDevOutmps1 + (ep - 1) * 4
+    regModify(regAddr, 0x7FF'u32, maxPkt and 0x7FF)
 
 proc usbStallInEp*(ep: uint32) =
   if ep >= 1 and ep <= 8:

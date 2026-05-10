@@ -60,6 +60,10 @@ const
   IrRxDeglitchEn*   = 4       # Deglitch enable
   IrRxDeglitchCntShift* = 8   # Deglitch count [11:8]
   IrRxDeglitchCntMask*  = 0x0F'u32 shl 8
+  IrRxEndInt*       = 0       # RX end interrupt status
+  IrRxEndMask*      = 8       # RX end interrupt mask
+  IrRxEndClr*       = 16      # RX end interrupt clear
+  IrRxEndEn*        = 24      # RX end interrupt enable
 
 # =============================================================================
 # Types
@@ -103,7 +107,7 @@ proc irTxSend*(data: uint32, bits: uint32 = 32) =
     timeout.dec
     if timeout == 0: break
   regClear(IrTxCfg, 1'u32 shl IrTxEn)
-  regWrite(IrTxIntSts, 1'u32 shl 16)  # Clear end interrupt
+  regSet(IrTxIntSts, 1'u32 shl 16)  # Clear end interrupt
 
 proc irTxSendNec*(address: uint8, command: uint8) =
   ## Send a standard NEC IR command (address + command with complements).
@@ -136,7 +140,7 @@ proc irRxRead*(timeout: uint32 = 1_000_000): (uint32, IrError) =
     countdown.dec
     if countdown == 0: return (0'u32, irTimeout)
   let data = regRead(IrRxDataWord0)
-  regWrite(IrRxIntSts, 1'u32 shl 16)  # Clear end interrupt
+  regSet(IrRxIntSts, 1'u32 shl IrRxEndClr)  # Clear end interrupt
   (data, irOk)
 
 proc irRxGetBitCount*(): uint32 =

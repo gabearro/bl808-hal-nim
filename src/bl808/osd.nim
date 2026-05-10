@@ -1,7 +1,7 @@
 ## BL808 OSD (On-Screen Display) driver.
 ##
-## OSD_A at 0x30013000 — OSD layer A (overlay input)
-## OSD_B at 0x30014000 — OSD layer B (overlay input)
+## OSD_A at 0x30013000 — OSD blend layer A (overlay input)
+## OSD_B at 0x30014000 — OSD blend layer B (overlay input)
 ## OSD_DP at 0x30015000 — OSD Display Pipeline (blending, output)
 ##
 ## The OSD subsystem composites multiple layers with alpha blending,
@@ -10,30 +10,69 @@
 import mmio, memmap
 
 # =============================================================================
-# OSD layer registers (OSD_A / OSD_B share the same layout)
+# OSD blend layer registers (OSD_A / OSD_B share the same layout)
 # =============================================================================
 const
   # Per-layer register offsets
-  OsdConfig*        = 0x00'u  # Layer configuration
-  OsdHsize*         = 0x04'u  # Horizontal size
-  OsdVsize*         = 0x08'u  # Vertical size
-  OsdHpos*          = 0x0C'u  # Horizontal position
-  OsdVpos*          = 0x10'u  # Vertical position
-  OsdMemAddr*       = 0x14'u  # Frame buffer address
-  OsdMemStride*     = 0x18'u  # Memory stride (bytes per line)
-  OsdAlpha*         = 0x1C'u  # Alpha value
-  OsdColorKey*      = 0x20'u  # Color key value
-  OsdPalette*       = 0x100'u # Palette table (256 entries, if indexed mode)
+  OsdLayerXConfig*  = 0x00'u  # X min/max
+  OsdLayerYConfig*  = 0x04'u  # Y min/max
+  OsdMemConfig0*    = 0x08'u  # Force shadow / layer enable
+  OsdLayerConfig0*  = 0x14'u  # Pixel format, channel order, global alpha
+  OsdLayerConfig1*  = 0x18'u  # Global color
+  OsdLayerConfig2*  = 0x1C'u  # Palette color-key range
+  OsdLayerConfig3*  = 0x20'u  # Color-key min/max A/R
+  OsdLayerConfig4*  = 0x24'u  # Color-key min/max G/B
+  OsdLayerConfig5*  = 0x28'u  # Color-key replacement A/R/G/B
+  OsdLayerConfig6*  = 0x2C'u  # Color-key enable / palette update
+  OsdLayerConfig7*  = 0x30'u  # Palette update color
+  OsdLayerConfig8*  = 0x34'u  # 1-bit alpha values
+  OsdError*         = 0x40'u  # FIFO drain status/mask
+  OsdShadow*        = 0x44'u  # Shadow/preload counter
+  OsdMemAddr*       = 0x60'u  # Frame buffer address
+  OsdMemConfig2*    = 0x64'u  # Frame width/stride in 8-byte units
+  OsdMemConfig3*    = 0x68'u  # Frame height and line fix bits
+  OsdDrawOffset*    = 0x400'u # Draw block offset within each OSD block
+  OsdDrawBlendEn*   = OsdDrawOffset + 0xF0'u
+
+  # Backward-compatible names for the old simplified layer model.
+  OsdConfig*        = OsdMemConfig0
+  OsdHsize*         = OsdLayerXConfig
+  OsdVsize*         = OsdLayerYConfig
+  OsdHpos*          = OsdLayerXConfig
+  OsdVpos*          = OsdLayerYConfig
+  OsdMemStride*     = OsdMemConfig2
+  OsdAlpha*         = OsdLayerConfig0
+  OsdColorKey*      = OsdLayerConfig7
+  OsdPalette*       = OsdLayerConfig7
 
 # =============================================================================
-# OSD_CONFIG fields
+# OSD blend fields
 # =============================================================================
 const
-  OsdLayerEn*       = 0       # Layer enable
-  OsdFmtShift*      = 4       # Pixel format [6:4]
-  OsdFmtMask*       = 0x07'u32 shl 4
-  OsdCkeyEn*        = 8       # Color key enable
-  OsdAlphaMode*     = 12      # Alpha mode (0=global, 1=per-pixel)
+  OsdForceShadow*   = 0
+  OsdLayerEn*       = 15
+  OsdLayerEnMask*   = 1'u32 shl OsdLayerEn
+  OsdFmtShift*      = 0
+  OsdFmtMask*       = 0x1F'u32 shl OsdFmtShift
+  OsdOrderAShift*   = 8
+  OsdOrderAMask*    = 0x03'u32 shl OsdOrderAShift
+  OsdOrderRvShift*  = 10
+  OsdOrderRvMask*   = 0x03'u32 shl OsdOrderRvShift
+  OsdOrderGyShift*  = 12
+  OsdOrderGyMask*   = 0x03'u32 shl OsdOrderGyShift
+  OsdOrderBuShift*  = 14
+  OsdOrderBuMask*   = 0x03'u32 shl OsdOrderBuShift
+  OsdGlobalAlphaEn* = 16
+  OsdGlobalAlphaShift* = 24
+  OsdGlobalAlphaMask* = 0xFF'u32 shl OsdGlobalAlphaShift
+  OsdCkeyEn*        = 0       # Compatibility alias for OsdKeyColorEn
+  OsdKeyColorEn*    = 0
+  OsdFrameWidthByteX8Shift* = 0
+  OsdFrameWidthByteX8Mask* = 0x3FFF'u32 shl OsdFrameWidthByteX8Shift
+  OsdStrideByteX8Shift* = 16
+  OsdStrideByteX8Mask* = 0x3FFF'u32 shl OsdStrideByteX8Shift
+  OsdFrameHeightShift* = 0
+  OsdFrameHeightMask* = 0x3FFF'u32 shl OsdFrameHeightShift
 
 # =============================================================================
 # Display pipeline (OSD_DP) registers
@@ -69,6 +108,27 @@ proc layerBase(layer: OsdLayer): uint =
   of osdLayerA: OsdABase
   of osdLayerB: OsdBBase
 
+proc blendFormat(fmt: OsdPixelFmt): uint32 {.inline.} =
+  case fmt
+  of osdArgb8888: 0'u32
+  of osdRgb888: 0'u32
+  of osdRgb565: 6'u32
+  of osdArgb4444: 2'u32
+  of osdArgb1555: 4'u32
+  of osdIndex8: 10'u32
+
+proc bytesPerPixel(fmt: OsdPixelFmt): uint32 {.inline.} =
+  case fmt
+  of osdArgb8888: 4'u32
+  of osdRgb888: 3'u32
+  of osdRgb565, osdArgb4444, osdArgb1555: 2'u32
+  of osdIndex8: 1'u32
+
+proc enableLayerRegs(base: uint) =
+  regSet(base + OsdMemConfig0, 1'u32 shl OsdForceShadow)
+  regSet(base + OsdMemConfig0, OsdLayerEnMask)
+  regSet(base + OsdDrawBlendEn, 1'u32)
+
 # =============================================================================
 # OSD layer operations
 # =============================================================================
@@ -79,46 +139,65 @@ proc osdConfigureLayer*(layer: OsdLayer, width, height: uint32,
   ## Configure an OSD overlay layer.
   let base = layerBase(layer)
 
-  regWrite(base + OsdHsize, width)
-  regWrite(base + OsdVsize, height)
-  regWrite(base + OsdHpos, posX)
-  regWrite(base + OsdVpos, posY)
+  regClear(base + OsdMemConfig0, OsdLayerEnMask)
+
+  regWrite(base + OsdLayerXConfig, ((posX + width - 1'u32) shl 16) or posX)
+  regWrite(base + OsdLayerYConfig, ((posY + height - 1'u32) shl 16) or posY)
   regWrite(base + OsdMemAddr, fbAddr)
 
-  # Calculate stride based on format
-  let bytesPerPix = case fmt
-    of osdArgb8888: 4'u32
-    of osdRgb888: 3'u32
-    of osdRgb565, osdArgb4444, osdArgb1555: 2'u32
-    of osdIndex8: 1'u32
-  regWrite(base + OsdMemStride, width * bytesPerPix)
+  let strideBytes = width * fmt.bytesPerPixel()
+  let strideX8 = strideBytes div 8'u32
+  regModify(base + OsdMemConfig2,
+            OsdFrameWidthByteX8Mask or OsdStrideByteX8Mask,
+            (strideX8 shl OsdFrameWidthByteX8Shift) or
+            (strideX8 shl OsdStrideByteX8Shift))
+  regModify(base + OsdMemConfig3, OsdFrameHeightMask,
+            height shl OsdFrameHeightShift)
 
-  regWrite(base + OsdAlpha, alpha.uint32)
+  var cfg0 = regRead(base + OsdLayerConfig0)
+  cfg0 = cfg0 and not (OsdFmtMask or OsdOrderAMask or OsdOrderRvMask or
+                       OsdOrderGyMask or OsdOrderBuMask or
+                       (1'u32 shl OsdGlobalAlphaEn) or OsdGlobalAlphaMask)
+  cfg0 = cfg0 or (fmt.blendFormat() shl OsdFmtShift)
+  cfg0 = cfg0 or (3'u32 shl OsdOrderAShift) or (2'u32 shl OsdOrderRvShift) or
+                (1'u32 shl OsdOrderGyShift) or (0'u32 shl OsdOrderBuShift)
+  cfg0 = cfg0 or (1'u32 shl OsdGlobalAlphaEn) or
+                (alpha.uint32 shl OsdGlobalAlphaShift)
+  regWrite(base + OsdLayerConfig0, cfg0)
 
-  var cfg = (1'u32 shl OsdLayerEn) or (fmt.uint32 shl OsdFmtShift)
-  regWrite(base + OsdConfig, cfg)
+  regWrite(base + OsdShadow, 200)
+  regWrite(base + OsdError, 1'u32 shl 1)
+  enableLayerRegs(base)
 
 proc osdEnableLayer*(layer: OsdLayer) =
-  regSet(layerBase(layer) + OsdConfig, 1'u32 shl OsdLayerEn)
+  enableLayerRegs(layerBase(layer))
 
 proc osdDisableLayer*(layer: OsdLayer) =
-  regClear(layerBase(layer) + OsdConfig, 1'u32 shl OsdLayerEn)
+  regClear(layerBase(layer) + OsdMemConfig0, OsdLayerEnMask)
 
 proc osdSetAlpha*(layer: OsdLayer, alpha: uint8) =
-  regWrite(layerBase(layer) + OsdAlpha, alpha.uint32)
+  let base = layerBase(layer)
+  regModify(base + OsdLayerConfig0,
+            (1'u32 shl OsdGlobalAlphaEn) or OsdGlobalAlphaMask,
+            (1'u32 shl OsdGlobalAlphaEn) or
+            (alpha.uint32 shl OsdGlobalAlphaShift))
 
 proc osdSetColorKey*(layer: OsdLayer, color: uint32, enable: bool = true) =
   let base = layerBase(layer)
-  regWrite(base + OsdColorKey, color)
+  regWrite(base + OsdLayerConfig7, color)
   if enable:
-    regSet(base + OsdConfig, 1'u32 shl OsdCkeyEn)
+    regSet(base + OsdLayerConfig6, 1'u32 shl OsdKeyColorEn)
   else:
-    regClear(base + OsdConfig, 1'u32 shl OsdCkeyEn)
+    regClear(base + OsdLayerConfig6, 1'u32 shl OsdKeyColorEn)
 
 proc osdSetPosition*(layer: OsdLayer, x, y: uint32) =
   let base = layerBase(layer)
-  regWrite(base + OsdHpos, x)
-  regWrite(base + OsdVpos, y)
+  let oldX = regRead(base + OsdLayerXConfig)
+  let oldY = regRead(base + OsdLayerYConfig)
+  let width = ((oldX shr 16) and 0xFFF'u32) - (oldX and 0xFFF'u32) + 1'u32
+  let height = ((oldY shr 16) and 0xFFF'u32) - (oldY and 0xFFF'u32) + 1'u32
+  regWrite(base + OsdLayerXConfig, ((x + width - 1'u32) shl 16) or x)
+  regWrite(base + OsdLayerYConfig, ((y + height - 1'u32) shl 16) or y)
 
 # =============================================================================
 # Display pipeline

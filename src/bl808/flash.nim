@@ -14,9 +14,10 @@ import mmio, memmap
 # =============================================================================
 const
   SfCtrlCfg*        = SfCtrlBase + 0x00'u   # SF control config
-  SfCtrlIfSahb0*    = SfCtrlBase + 0x04'u   # SF AHB interface 0
-  SfCtrlIfSahb1*    = SfCtrlBase + 0x08'u   # SF AHB interface 1
-  SfCtrlIfSahb2*    = SfCtrlBase + 0x0C'u   # SF AHB interface 2
+  SfCtrlCfg1*       = SfCtrlBase + 0x04'u   # SF control config 1
+  SfCtrlIfSahb0*    = SfCtrlBase + 0x08'u   # SF AHB interface 0
+  SfCtrlIfSahb1*    = SfCtrlBase + 0x0C'u   # SF AHB interface 1
+  SfCtrlIfSahb2*    = SfCtrlBase + 0x10'u   # SF AHB interface 2
   SfCtrlProtEnRd*   = SfCtrlBase + 0x10'u   # Read protect enable
   SfCtrlProtEn*     = SfCtrlBase + 0x14'u   # Protect enable
   SfCtrlSfPad*      = SfCtrlBase + 0x20'u   # Pad configuration
@@ -58,6 +59,20 @@ const
 const
   FlashSrBusy*       = 0       # Write in progress
   FlashSrWel*        = 1       # Write enable latch
+
+# =============================================================================
+# SF IF_SAHB command bits
+# =============================================================================
+const
+  Sahb0Busy*          = 1'u32 shl 0
+  Sahb0Trigger*       = 1'u32 shl 1
+  Sahb0DataBytesShift* = 2
+  Sahb0AddrBytesShift* = 17
+  Sahb0CmdBytesShift*  = 20
+  Sahb0DataRw*        = 1'u32 shl 23
+  Sahb0DataEn*        = 1'u32 shl 24
+  Sahb0AddrEn*        = 1'u32 shl 26
+  Sahb0CmdEn*         = 1'u32 shl 27
 
 # =============================================================================
 # Flash size constants
@@ -108,33 +123,48 @@ proc flashReadXipBuffer*(offset: uint32, buf: var openArray[uint8]) =
 # The SF controller uses a buffer at SfCtrlBufBase to stage commands and data.
 # Commands are issued by configuring the IF_SAHB registers.
 
-proc sfCtrlSendCmd(cmd: uint8, addr: uint32 = 0, hasAddr: bool = false,
-                   addrLen: uint32 = 3, dummyClocks: uint32 = 0) =
+proc sfCtrlSendCmd(cmd: uint8, flashAddr: uint32 = 0, hasAddr: bool = false,
+                   addrLen: uint32 = 3, dataLen: uint32 = 0,
+                   dataWrite: bool = false, dummyClocks: uint32 = 0) =
   ## Send a command via the SF controller.
-  # Write command to buffer
-  regWrite(SfCtrlBufBase, cmd.uint32 shl 24)
+  var cmd0 = cmd.uint32 shl 24
+  var cmd1 = 0'u32
 
-  # Configure command phase
-  var sahb0 = 0'u32
-  sahb0 = sahb0 or (1'u32 shl 2)    # Command phase enable
-  sahb0 = sahb0 or (7'u32 shl 17)   # 8-bit command (cmd_bit_cnt = 7)
   if hasAddr:
-    sahb0 = sahb0 or (1'u32 shl 5)  # Address phase enable
-    sahb0 = sahb0 or (((addrLen * 8 - 1) and 0x1F) shl 20)  # Address bit count
+    let alen = min(addrLen, 4'u32)
+    for i in 0 ..< alen.int:
+      let shift = ((alen.int - 1 - i) * 8).uint32
+      let byteVal = (flashAddr shr shift) and 0xFF'u32
+      let streamIndex = 1 + i
+      if streamIndex < 4:
+        cmd0 = cmd0 or (byteVal shl ((3 - streamIndex) * 8).uint32)
+      else:
+        cmd1 = cmd1 or (byteVal shl ((7 - streamIndex) * 8).uint32)
+
+  regWrite(SfCtrlIfSahb1, cmd0)
+  regWrite(SfCtrlIfSahb2, cmd1)
+
+  var sahb0 = Sahb0CmdEn
+  sahb0 = sahb0 or (0'u32 shl Sahb0CmdBytesShift)  # 1 command byte
+  if hasAddr:
+    let alen = min(addrLen, 4'u32)
+    sahb0 = sahb0 or Sahb0AddrEn
+    sahb0 = sahb0 or ((alen - 1'u32) shl Sahb0AddrBytesShift)
+  if dataLen > 0:
+    sahb0 = sahb0 or Sahb0DataEn
+    sahb0 = sahb0 or ((dataLen - 1'u32) shl Sahb0DataBytesShift)
+    if dataWrite:
+      sahb0 = sahb0 or Sahb0DataRw
+
   regWrite(SfCtrlIfSahb0, sahb0)
-
-  if hasAddr:
-    regWrite(SfCtrlIfSahb1, addr)
-
-  # Trigger the command
-  regSet(SfCtrlCfg, 1'u32 shl 2)
-  regWaitClear(SfCtrlCfg, 1'u32 shl 2)
+  regWrite(SfCtrlIfSahb0, sahb0 or Sahb0Trigger)
+  discard regWaitClear(SfCtrlIfSahb0, Sahb0Busy or Sahb0Trigger)
 
 proc sfCtrlWaitBusy(timeout: uint32 = 1_000_000): FlashError =
   var countdown = timeout
   while countdown > 0:
     sfCtrlSendCmd(FlashCmdReadSr1)
-    let sr = regRead(SfCtrlBufBase + 4) and 0xFF
+    let sr = regRead(SfCtrlBufBase) and 0xFF
     if (sr and (1'u32 shl FlashSrBusy)) == 0:
       return flashOk
     countdown.dec
@@ -155,7 +185,7 @@ proc flashWaitReady*(timeout: uint32 = 5_000_000): FlashError =
 proc flashReadId*(): FlashId =
   ## Read the JEDEC flash ID (manufacturer, memory type, capacity).
   sfCtrlSendCmd(FlashCmdReadId)
-  let id0 = regRead(SfCtrlBufBase + 4)
+  let id0 = regRead(SfCtrlBufBase)
   result.manufacturerId = ((id0 shr 0) and 0xFF).uint8
   result.memoryType = ((id0 shr 8) and 0xFF).uint8
   result.capacity = ((id0 shr 16) and 0xFF).uint8
@@ -192,7 +222,7 @@ proc flashProgramRaw(address: uint32, data: openArray[uint8]): FlashError =
   if result != flashOk: return
 
   # Load data into SF buffer
-  var bufOffset = 4'u  # Skip command/address bytes in buffer
+  var bufOffset = 0'u
   var i = 0
   while i + 3 < data.len:
     let word = data[i].uint32 or
@@ -209,7 +239,8 @@ proc flashProgramRaw(address: uint32, data: openArray[uint8]): FlashError =
       word = word or (data[i+j].uint32 shl (j * 8))
     regWrite(SfCtrlBufBase + bufOffset, word)
 
-  sfCtrlSendCmd(FlashCmdPageProg, address, hasAddr = true)
+  sfCtrlSendCmd(FlashCmdPageProg, address, hasAddr = true,
+                dataLen = data.len.uint32, dataWrite = true)
   result = flashWaitReady()
 
 proc flashProgramPage*(address: uint32, data: openArray[uint8]): FlashError =
@@ -220,19 +251,19 @@ proc flashProgramPage*(address: uint32, data: openArray[uint8]): FlashError =
 proc flashWrite*(address: uint32, data: openArray[uint8]): FlashError =
   ## Write arbitrary data to flash at any address. Handles page boundary crossing.
   var offset = 0
-  var addr = address
+  var writeAddr = address
 
   while offset < data.len:
     # Calculate bytes remaining in current page
-    let pageOffset = addr and (FlashPageSize - 1)
+    let pageOffset = writeAddr and (FlashPageSize - 1)
     let pageRemain = (FlashPageSize - pageOffset).int
     let chunkLen = min(pageRemain, data.len - offset)
 
-    result = flashProgramRaw(addr, data.toOpenArray(offset, offset + chunkLen - 1))
+    result = flashProgramRaw(writeAddr, data.toOpenArray(offset, offset + chunkLen - 1))
     if result != flashOk: return
 
     offset += chunkLen
-    addr += chunkLen.uint32
+    writeAddr += chunkLen.uint32
 
 proc flashReset*() =
   ## Issue a software reset to the flash chip.
