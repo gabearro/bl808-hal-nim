@@ -244,6 +244,28 @@ class EchoServer:
                 conn.close()
 
 
+def discover_lan_ip() -> str:
+    """Return the local interface IP that would be used to reach the public
+    internet. Uses the standard UDP-getsockname trick (no packet sent). Falls
+    back to gethostbyname(gethostname()) if the UDP path errors.
+
+    The returned IP is what gets passed to firmware as WifiEchoHost so the
+    board can TCP-connect back to the harness host across the WiFi LAN.
+    """
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # 8.8.8.8 is just a routable address; no packet is actually sent
+            # by connect() on a UDP socket — it just sets the default peer.
+            s.connect(("8.8.8.8", 53))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except OSError:
+        return socket.gethostbyname(socket.gethostname())
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cell", choices=["wifi-blob"], default="wifi-blob")
