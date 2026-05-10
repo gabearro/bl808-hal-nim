@@ -2054,9 +2054,10 @@ err_t netifapi_netif_set_link_down(struct netif *netif)
 
 err_t tcpip_input(struct pbuf *p, struct netif *inp)
 {
-    (void)inp;
-    pbuf_free(p);
-    return 0;
+    /* Iter 2.A.0 step 4: NO_SYS=1, no tcpip thread. Deliver directly to
+     * lwIP's Ethernet input. The blob passes tcpip_input as the input arg
+     * to netif_add, so calling inp->input(p, inp) here would loop. */
+    return ethernet_input(p, inp);
 }
 
 uint32_t inet_addr(const char *cp)
