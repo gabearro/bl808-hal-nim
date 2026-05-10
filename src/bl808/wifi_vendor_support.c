@@ -2037,37 +2037,19 @@ void netifapi_netif_set_up(struct netif *netif)
     netif_set_up(netif);
 }
 
-void netif_set_default(struct netif *netif)
+/* Iter 2.A.0 step 3: vendor netifapi.c is gated behind LWIP_NETIF_API=1
+ * which we don't enable. SDK files (bl_rx.c) call these. Provide thin
+ * stubs that delegate to vendor lwIP's netif_set_link_up/down. */
+err_t netifapi_netif_set_link_up(struct netif *netif)
 {
-    (void)netif;
+    netif_set_link_up(netif);
+    return ERR_OK;
 }
 
-void netif_set_up(struct netif *netif)
+err_t netifapi_netif_set_link_down(struct netif *netif)
 {
-    if (netif) {
-        netif->flags |= NETIF_FLAG_UP;
-    }
-}
-
-void netif_set_link_up(struct netif *netif)
-{
-    if (netif) {
-        netif->flags |= NETIF_FLAG_LINK_UP;
-    }
-}
-
-void netif_set_link_down(struct netif *netif)
-{
-    if (netif) {
-        netif->flags &= (uint8_t)~NETIF_FLAG_LINK_UP;
-    }
-}
-
-void netif_set_status_callback(struct netif *netif, netif_status_callback_fn status_callback)
-{
-    if (netif) {
-        netif->status_callback = status_callback;
-    }
+    netif_set_link_down(netif);
+    return ERR_OK;
 }
 
 err_t tcpip_input(struct pbuf *p, struct netif *inp)
@@ -2077,119 +2059,9 @@ err_t tcpip_input(struct pbuf *p, struct netif *inp)
     return 0;
 }
 
-err_t etharp_output(struct netif *netif, struct pbuf *q, const ip4_addr_t *ipaddr)
-{
-    (void)netif;
-    (void)q;
-    (void)ipaddr;
-    return 0;
-}
-
-uint32_t ipaddr_addr(const char *cp)
-{
-    (void)cp;
-    return 0;
-}
-
-char *ip4addr_ntoa(const ip4_addr_t *addr)
-{
-    (void)addr;
-    return "0.0.0.0";
-}
-
 uint32_t inet_addr(const char *cp)
 {
     return ipaddr_addr(cp);
-}
-
-struct pbuf *pbuf_alloc(pbuf_layer layer, u16_t length, pbuf_type type)
-{
-    struct pbuf *p;
-    (void)layer;
-    (void)type;
-    p = calloc(1, sizeof(struct pbuf) + length);
-    if (!p) {
-        return NULL;
-    }
-    p->payload = (uint8_t *)p + sizeof(struct pbuf);
-    p->len = length;
-    p->tot_len = length;
-    p->ref = 1;
-    return p;
-}
-
-struct pbuf *pbuf_alloced_custom(pbuf_layer layer, u16_t length,
-                                 pbuf_type type, struct pbuf_custom *p,
-                                 void *payload_mem, u16_t payload_mem_len)
-{
-    (void)layer;
-    (void)type;
-    (void)payload_mem_len;
-    memset(&p->pbuf, 0, sizeof(p->pbuf));
-    p->pbuf.payload = payload_mem;
-    p->pbuf.len = length;
-    p->pbuf.tot_len = length;
-    p->pbuf.ref = 1;
-    return &p->pbuf;
-}
-
-u8_t pbuf_free(struct pbuf *p)
-{
-    while (p) {
-        struct pbuf *next = p->next;
-        if (p->flags & PBUF_FLAG_IS_CUSTOM) {
-            struct pbuf_custom *custom = (struct pbuf_custom *)p;
-            if (custom->custom_free_function) {
-                custom->custom_free_function(p);
-            }
-        } else {
-            free(p);
-        }
-        p = next;
-    }
-    return 1;
-}
-
-void pbuf_ref(struct pbuf *p)
-{
-    if (p) {
-        p->ref++;
-    }
-}
-
-err_t pbuf_take(struct pbuf *buf, const void *dataptr, u16_t len)
-{
-    if (!buf || !buf->payload || len > buf->len) {
-        return -1;
-    }
-    memcpy(buf->payload, dataptr, len);
-    return 0;
-}
-
-void pbuf_cat(struct pbuf *head, struct pbuf *tail)
-{
-    struct pbuf *p = head;
-    if (!p) {
-        return;
-    }
-    while (p->next) {
-        p = p->next;
-    }
-    p->next = tail;
-    if (tail) {
-        head->tot_len += tail->tot_len;
-    }
-}
-
-u8_t pbuf_header(struct pbuf *p, s16_t header_size_increment)
-{
-    if (!p) {
-        return 1;
-    }
-    p->payload = (uint8_t *)p->payload - header_size_increment;
-    p->len = (u16_t)(p->len + header_size_increment);
-    p->tot_len = (u16_t)(p->tot_len + header_size_increment);
-    return 0;
 }
 
 int aos_post_event(uint16_t type, uint16_t code, unsigned long value)
