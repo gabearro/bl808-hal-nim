@@ -19,6 +19,7 @@ type
     assoc = "assoc"
     dhcp = "dhcp"
     tcp = "tcp"
+    icmp = "icmp"
     adv_start = "adv_start"
     connect_req = "connect_req"
     mtu = "mtu"

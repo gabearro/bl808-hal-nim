@@ -26,6 +26,7 @@ class Phase(Enum):
     ASSOC = "assoc"
     DHCP = "dhcp"
     TCP = "tcp"
+    ICMP = "icmp"
     # BLE milestone (added now so the Nim enum is stable; firmware tests in later iters use them)
     ADV_START = "adv_start"
     CONNECT_REQ = "connect_req"
@@ -65,6 +66,7 @@ _DEADLINES: dict[Phase, float] = {
     Phase.ASSOC: 3.0,
     Phase.DHCP: 8.0,
     Phase.TCP: 5.0,
+    Phase.ICMP: 3.0,
     Phase.ADV_START: 3.0,
     Phase.CONNECT_REQ: 5.0,
     Phase.MTU: 2.0,
