@@ -1095,7 +1095,9 @@
           "bl808WifiVendor": "1",
           "WifiSsid": {"env": "BL808_WIFI_SSID"},
           "WifiPassword": {"secret_env": "BL808_WIFI_PASSWORD"},
-          "AttemptsTotal": {"env": "BL808_WIFI_E2E_ATTEMPTS", "default": 3}
+          "AttemptsTotal": {"env": "BL808_WIFI_E2E_ATTEMPTS", "default": 3},
+          "WifiEchoHost": {"env": "BL808_WIFI_E2E_HOST", "default": "0.0.0.0"},
+          "WifiEchoPort": {"env": "BL808_WIFI_E2E_PORT", "default": 0}
         }
       }],
       "required": ["=== BL808 E2E Test Complete ==="],
