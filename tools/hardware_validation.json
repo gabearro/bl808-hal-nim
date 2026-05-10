@@ -1115,6 +1115,7 @@
           "bl808WifiVendor": "1",
           "WifiSsid": {"env": "BL808_WIFI_SSID"},
           "WifiPassword": {"secret_env": "BL808_WIFI_PASSWORD"},
+          "WifiChannel": {"env": "BL808_WIFI_CHANNEL", "default": 0},
           "AttemptsTotal": {"env": "BL808_WIFI_E2E_ATTEMPTS", "default": 3}
         }
       }],
