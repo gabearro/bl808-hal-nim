@@ -34,7 +34,7 @@ RV32_SIZE := $(shell command -v $(SIZE_RV32) 2>/dev/null || command -v $(SIZE_RV
 RV64_OBJCOPY := $(shell command -v $(OBJCOPY_RV64) 2>/dev/null || echo "")
 RV64_SIZE := $(shell command -v $(SIZE_RV64) 2>/dev/null || echo "")
 
-.PHONY: m0 d0 lp ipc examples-check flash-m0 flash-d0 flash-lp venv hw-list hw-preflight hw-smoke hw-smoke-uart hw-smoke-anchor hw-smoke-jtag hw-allcore-jtag hw-e2e-quick hw-full hw-full-uart hw-full-anchor clean help
+.PHONY: m0 d0 lp ipc examples-check flash-m0 flash-d0 flash-lp venv hw-list hw-preflight hw-smoke hw-smoke-uart hw-smoke-anchor hw-smoke-jtag hw-allcore-jtag hw-e2e-quick hw-e2e-lwip-smoke hw-full hw-full-uart hw-full-anchor clean help
 
 help:
 	@echo "BL808 HAL build system"
@@ -61,6 +61,7 @@ help:
 	@echo "  make hw-full-uart UART_PORT=<p> Build, UART-flash, and run full tests"
 	@echo "  make hw-full-anchor UART_PORT=<p> Build, UART-anchor-flash, and run full tests"
 	@echo "  make hw-e2e-quick UART_PORT=<p> WIFI_SSID=<s> WIFI_PASSWORD=<p>  WiFi blob N=3 e2e soak (Iteration 1)"
+	@echo "  make hw-e2e-lwip-smoke UART_PORT=<p> WIFI_SSID=<s> WIFI_PASSWORD=<p>  WiFi lwIP DHCP+ICMP smoke N=3"
 	@echo ""
 	@echo "Options:"
 	@echo "  UART_PORT=/dev/ttyUSB0      Runtime UART; also used for flashing by default"
@@ -193,6 +194,11 @@ hw-e2e-quick: venv
 	@test -n "$(WIFI_SSID)" || (echo "Error: WIFI_SSID is required (e.g. WIFI_SSID=Frog)"; exit 1)
 	@test -n "$(WIFI_PASSWORD)" || (echo "Error: WIFI_PASSWORD is required"; exit 1)
 	$(PYTHON) tools/hw_e2e.py --cell wifi-blob --uart $(UART_PORT) --uart-baud $(UART_BAUD) --ssid $(WIFI_SSID) --password $(WIFI_PASSWORD) --attempts 3
+
+hw-e2e-lwip-smoke: venv
+	@test -n "$(WIFI_SSID)" || (echo "Error: WIFI_SSID is required (e.g. WIFI_SSID=Frog)"; exit 1)
+	@test -n "$(WIFI_PASSWORD)" || (echo "Error: WIFI_PASSWORD is required"; exit 1)
+	$(PYTHON) tools/hw_e2e.py --cell wifi-lwip-smoke --uart $(UART_PORT) --uart-baud $(UART_BAUD) --ssid $(WIFI_SSID) --password $(WIFI_PASSWORD) --attempts 3
 
 # Clean build artifacts
 clean:

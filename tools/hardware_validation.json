@@ -1102,6 +1102,24 @@
       }],
       "required": ["=== BL808 E2E Test Complete ==="],
       "timeout": 240
+    },
+    {
+      "name": "m0_wifi_lwip_smoke",
+      "tiers": ["e2e"],
+      "build": [{
+        "id": "kernel",
+        "core": "bl808m0",
+        "source": "examples/m0_wifi_lwip_smoke.nim",
+        "flash": "m0",
+        "defines": {
+          "bl808WifiVendor": "1",
+          "WifiSsid": {"env": "BL808_WIFI_SSID"},
+          "WifiPassword": {"secret_env": "BL808_WIFI_PASSWORD"},
+          "AttemptsTotal": {"env": "BL808_WIFI_E2E_ATTEMPTS", "default": 3}
+        }
+      }],
+      "required": ["=== BL808 LwIP Smoke Complete ==="],
+      "timeout": 240
     }
   ]
 }
