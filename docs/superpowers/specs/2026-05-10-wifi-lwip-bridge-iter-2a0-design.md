@@ -374,12 +374,53 @@ Total Iter 2.A.0 effort: probably 2-3 sessions, depending on how much TX-API arc
 
 ## 6. Investigation findings
 
-(To be filled in by Pass 1's investigation task before any code change.)
+### Blob TX API entry point
 
-Required findings:
-- Blob TX API entry point symbol + signature
-- Blob `wifi_pkt` alloc/free convention (does our `tcpip_stack_input` need to release the pkt back? via what API?)
-- `bl606a0_wifi_netif_init` body — what does it set, does it wire a `linkoutput`?
+- **Symbol:** `bl_output`
+- **Signature:** `err_t bl_output(struct bl_hw *bl_hw, int is_sta, struct pbuf *p, struct bl_tx_cfm *custom_cfm)` (BL808 build — no `from_local` flag; that field only appears under `CFG_NETBUS_WIFI_ENABLE`).
+- **Source of evidence:**
+  - SDK reference: `build/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/bl_tx.c:549` (declaration), `bl_tx.h:111`.
+  - Already implemented in our HAL as a Nim `exportc` proc: `src/bl808/wifi_tx.nim:442` (full body that pushes onto `sta->waiting_list` and calls `bl_irq_handler` via `txCntrlCheckFc`).
+  - The blob itself does NOT export a TX entry point — `nm libwifi_fw.a` shows zero `bl_main_tx*` / `bl_send_data` / `bl_main_send_data` symbols. The blob's only undefined lwIP-side symbol is `tcpip_stack_input`. The TX entry is host-side code we already own.
+- **Implication:** Linkoutput is NOT a flat-byte-buffer API; it takes a `struct pbuf *` directly (same pbuf type the lwIP stack hands us — vendor pbuf == SDK pbuf, header layouts verified identical). `bl_output` reads the ethernet header from `p->payload`, expands the pbuf header by `PBUF_LINK_ENCAPSULATION_HLEN` (48), writes a `bl_txhdr` in front, calls `pbuf_ref(p)`, and queues the pbuf on the per-STA `waiting_list`. **No flatten/copy step is needed in `bl808_wifi_linkoutput` — we hand `bl_output` the pbuf as-is.** Section 3.4 of this spec ("TX path detail — pbuf flattening") was based on a wrong assumption; Task 3 should drop the `pbuf_copy_partial` step.
+
+### wifi_pkt free convention after tcpip_stack_input
+
+- **Caller-owned (blob owns and frees the wifi_pkt).** Our `tcpip_stack_input` MUST **return a non-zero value (use -1)** to signal "blob, please free". Returning 0 means "callee retained ownership" (used by zerocopy/custom-pbuf path that we are NOT taking on BL808).
+- **Evidence:**
+  - SDK reference impl: `build/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/bl_utils.c:391-521`. The function uses a local `bool free_by_lowlayer = true` (line 398), only sets it to `false` in the zerocopy branch (line 513), and the final `if (free_by_lowlayer) return -1; else return 0;` (lines 515-520) encodes the contract.
+  - For BL808 specifically: `bl_utils.c:438-440` — `#if defined(CFG_CHIP_BL808)` selects `_handle_frame_from_stack_with_mempool` (which `pbuf_alloc`+`pbuf_take` the payload) and sets `zerocopy = false`. So BL808 **always** returns -1.
+  - Our existing Nim impl in `src/bl808/wifi_utils.nim:216-251` already encodes this convention: it returns `-1` unconditionally at the end and uses the mempool path under `bl808WifiRxPbufInput`.
+  - Caller side: `src/bl808/wifi_fw.nim:19995-20007` (`rxu_swdesc_upload_evt`) — if `tcpip_stack_input` returns non-zero, it calls `rxl_mpdu_free(entry)`. So returning -1 triggers the blob's own free path; we do nothing extra.
+- **Implication for `wifi_vendor_support.c` bridge:** Use the mempool wrap (alloc a vendor pbuf, `pbuf_take` the payload, push to `netif->input`, `pbuf_free` on input failure). No call to a `bl_pkt_free` / `bl_msdu_free` API is needed — those don't exist. Just return -1 and the blob's `rxl_mpdu_free` runs in the caller.
+
+### bl606a0_wifi_netif_init body summary
+
+- **Already implemented in our HAL** (Nim, exportc) at `src/bl808/wifi_driver.nim:155-166`. Currently wired into the netif by `wifi_vendor_support.c:2810-2811`'s `netifapi_netif_add(... , bl606a0_wifi_netif_init, tcpip_input)` call. The C `extern err_t bl606a0_wifi_netif_init(struct netif *netif);` at line 52 imports it.
+- **Sets `netif->mtu`:** yes, `1500`.
+- **Sets `netif->flags`:** yes, `NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP | NETIF_FLAG_IGMP`.
+- **Sets `netif->hostname`:** yes, points to `wifiMgmr.hostname`.
+- **Sets `netif->hwaddr_len`:** yes, `ETHARP_HWADDR_LEN` (6).
+- **Sets `netif->output`:** yes, to vendor lwIP `etharp_output`.
+- **Sets `netif->linkoutput`:** **YES, to a private `wifiTx` (Nim proc, file-scope, `cdecl` but NOT exported).** The proc body (`wifi_driver.nim:122-135`) calls `bl_output(bl606a0StaHw, isSta, p, addr customCfm)` — i.e., it already does the right thing.
+- **Sets `netif->status_callback`:** yes, via `netif_set_status_callback`.
+- **Implication for Task 3:**
+  - We do **NOT** need to add a separate `bl808_wifi_linkoutput` C function — `wifiTx` in `wifi_driver.nim` is already the linkoutput, already wired by init, and already calls `bl_output`. Section 2.2 of this spec is largely obsolete; the linkoutput exists.
+  - The bug today is NOT a missing linkoutput. The bugs are: (a) `netifapi_netif_add` does not call vendor `netif_add` so the netif never joins `netif_list` (lines 1977-1988 ignore ipaddr/netmask/gw and never link the netif), (b) `tcpip_input` is a stub that just frees the pbuf (lines 2060-2065), (c) `wifi_netif_dhcp_start` is a no-op (line 3104), (d) `tcpip_stack_input` C entry has no body in this file (only the gated Nim version in `wifi_utils.nim`).
+  - Critical caveat: `bl606a0StaHw` is initialized inside `bl606a0_wifi_init` (`wifi_driver.nim:191-211`) and consumed by `wifiTx` via `bl_output(bl606a0StaHw, ...)`. Verify this is non-nil before any `dhcp_start` runs in the smoke test, otherwise the linkoutput will return `ErrConn` immediately.
+
+### RX context (tcpip_stack_input)
+
+- **Task context.** `tcpip_stack_input` is reached only from `rxu_swdesc_upload_evt`, which is dispatched as KE event handler index 8 (`wifi_fw.nim:1506`). Handlers are invoked synchronously by `ke_evt_schedule` (`wifi_fw.nim:2032-2046`) via an indirect call. `ke_evt_schedule` is called from `vendor_poll_once` in `src/bl808/wifi_vendor_support.c:1272`, which itself runs from a polled main-loop call (`vendor_poll_for` at line 1280-1286, called from `bl808_wifi_vendor_poll`).
+- **No real ISR path:** The MAC IRQ is consumed by polling (`bl808_wifi_vendor_poll_mac_irq`, line 1260) and the IPC IRQ is also polled (`bl808_wifi_vendor_host_ipc_status() != 0` → call `bl_irq_handler`, lines 1263-1266). `wifi_irqs.nim` exposes `bl_irq_bottomhalf` for IPC processing — also called from polled context.
+- **Implication for bridge:** Safe to `pbuf_alloc` directly inside `tcpip_stack_input`. No deferred ring buffer required for Pass 1. (Future caveat: if any RX path is ever switched to a true ISR — e.g., an actual MAC RX IRQ wired to the CLIC — this assumption breaks. None of the existing code does that today.)
+
+### Additional notes for Task 3 implementer
+
+- The spec's Section 2.2 ("New TX adapter `bl808_wifi_linkoutput`") and Section 3 "TX path detail — pbuf flattening" should be considered superseded — there is no new TX adapter to write and no flatten step. Task 3 just needs to make sure `netifapi_netif_add` actually calls vendor `netif_add` (so the chain init runs `bl606a0_wifi_netif_init`, which already wires `wifiTx`).
+- Because `wifi_driver.nim` already provides `wifiTx`, `bl_output`, `bl606a0_wifi_netif_init`, `netifStatusCallback`, the C `extern` declarations and the C-side stubs in `wifi_vendor_support.c` are duplicates that sometimes mask the Nim definitions. The "delete shadowing stubs" plan in Section 2.4 still applies, and extra care is needed: `wifi_vendor_support.c` defines `netif_set_status_callback` (line 2053-2058) — if vendor lwIP also defines it, deleting the stub may be a no-op; if not, keep the stub since `bl606a0_wifi_netif_init` calls it.
+- The spec's Section 3 RX-path code uses `pkt->pkt[0]` and `pkt->len[0]`, matching the SDK's `struct wifi_pkt` (defined in `bl_utils.c:215-219`: `uint32_t pkt[4]; void *pbuf[4]; uint16_t len[4];`). That layout is correct.
+- `extra_status` carries the AMSDU bit (`BL_RX_STATUS_AMSDU`); set `p->flags |= PBUF_FLAG_AMSDU` when present. The existing Nim impl in `wifi_utils.nim:240-241` already does this; the C bridge should mirror it.
 
 ---
 
