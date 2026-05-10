@@ -21,6 +21,19 @@
 #include <lwip/pbuf.h>
 #include <lwip/tcpip.h>
 
+/* Iter 2.A.0 step 2: vendor lwIP's lwipopts.h leaves LWIP_NETIF_API
+ * undefined, so vendor netifapi.h does not declare these typedefs. SDK lwIP
+ * defines them. When vendor headers win the include race (Task 3 onward),
+ * declare them locally so this file's netifapi_netif_common signature
+ * compiles. Today (SDK headers active) this block is dead code. */
+#ifndef LWIP_NETIF_API
+#define LWIP_NETIF_API 0
+#endif
+#if !LWIP_NETIF_API
+typedef void  (*netifapi_void_fn)(struct netif *netif);
+typedef err_t (*netifapi_errt_fn)(struct netif *netif);
+#endif
+
 #include "../../build/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/bl_main.h"
 #include "../../build/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/bl_msg_tx.h"
 #include "../../build/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/bl_rx.h"
