@@ -163,7 +163,6 @@ when defined(bl808m0):
       {.passC: "-DBL808_WIFI_FORCE_RESP_TX_POWER=0x70 -DBL808_WIFI_FORCE_RESP_TX_POWER_ALL".}
     {.passC: "-fcommon -fshort-enums -Wno-incompatible-pointer-types -Wno-int-conversion -Wno-implicit-function-declaration".}
     {.passC: "-Isrc/bl808".}
-    {.passL: "-Wl,--wrap=wpa_set_bss".}
     {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/include".}
     {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver".}
     {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi/include".}
@@ -284,6 +283,7 @@ when defined(bl808m0):
     {.passL: "-Lsrc/bl808".}
     when defined(bl808WifiWrapWaitUs):
       {.passL: "-Wl,--wrap=wait_us".}
+      {.passL: "-Wl,--wrap=wpa_set_bss".}
     when defined(bl808WifiNimFw):
       when defined(bl808WifiConnectTrace):
         {.passL: "-Wl,--wrap=mm_active -Wl,--wrap=mm_hw_info_set -Wl,--wrap=mm_sec_machwaddr_wr -Wl,--wrap=sm_handle_eapol_input -Wl,--wrap=wpa_sm_rx_eapol -Wl,--wrap=txu_cntrl_push -Wl,--wrap=txl_cntrl_push -Wl,--wrap=txl_frame_push -Wl,--wrap=txl_frame_push_force -Wl,--wrap=txl_frame_cfm -Wl,--wrap=txl_cfm_push -Wl,--wrap=rxu_cntrl_frame_handle".}
