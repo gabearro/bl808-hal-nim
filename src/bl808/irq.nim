@@ -364,16 +364,17 @@ proc getTrapHandler*(irq: uint32): TrapHandler =
   else:
     nil
 
-proc dispatchTrapInterrupt(irq: uint32): bool =
+proc dispatchTrapInterrupt(irq: uint32): bool {.raises: [].} =
   let handler = getTrapHandler(irq)
   if handler != nil:
-    handler()
+    {.cast(raises: []).}:
+      handler()
     return true
   else:
     lastUnhandledIrq = irq
     return false
 
-proc defaultTrapEntry*() {.exportc: "trap_entry", cdecl.} =
+proc defaultTrapEntry*() {.exportc: "trap_entry", cdecl, raises: [].} =
   ## Default trap entry point — dispatches to registered handlers.
   let cause = csrReadMcause()
   let isInterrupt = (cause and (1'u shl (sizeof(uint) * 8 - 1))) != 0
@@ -413,5 +414,9 @@ proc defaultTrapEntry*() {.exportc: "trap_entry", cdecl.} =
     lastTrapCause = cause
     lastTrapEpc = csrReadMepc()
     lastTrapValue = csrReadMtval()
-    faultHandleTrap(cause, lastTrapEpc, lastTrapValue)
-    haltTrap()
+    # iter 258: faultHalt is properly {.noreturn.} so Nim doesn't inject
+    # the nimInErrorMode-skip path that previously caused trap_entry to
+    # `ret` after a non-noreturn faultHandleTrap → mret to bad mepc →
+    # infinite trap loop → hardware reset (~200-iteration boot loop).
+    {.cast(raises: []).}:
+      faultHalt(FaultReasonTrap, cause, lastTrapEpc, lastTrapValue)
