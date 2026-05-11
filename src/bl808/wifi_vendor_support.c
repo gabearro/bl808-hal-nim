@@ -3093,3 +3093,52 @@ int __wrap_wpa_set_bss(u8 vif_idx, u8 sta_idx, char *macddr, char *bssid,
     bl_os_printf("\r\n");
     return 0;
 }
+
+/* =========================================================================
+ * Iter 2.A.2: SAE callback trip-wires.
+ *
+ * The vendor supplicant exposes wpa3_build_sae_msg and wpa3_parse_sae_msg
+ * via the wpa_funcs callback table registered with the MAC firmware blob
+ * (libwifi_fw.a). When key_mgmt=SAE is selected, the blob's auth state
+ * machine is supposed to invoke these callbacks via the cb table to drive
+ * the SAE Commit / SAE Confirm exchange. The unknown is whether the blob
+ * actually does this, or whether it defaults to Open Auth + PSK 4WHS
+ * regardless of key_mgmt.
+ *
+ * Linker --wrap=wpa3_build_sae_msg / --wrap=wpa3_parse_sae_msg redirects
+ * the cb table entries through these trip-wires. If they fire, the blob
+ * IS driving SAE. If they never fire, the blob isn't, and we fall back
+ * to AP reconfig.
+ *
+ * Signatures match supplicant_api.h:197-198 / bl_wpa3.c:130,209 (NOT the
+ * stale 3-arg variant in bl_wifi_driver.h:84).
+ * ========================================================================= */
+
+extern uint8_t *__real_wpa3_build_sae_msg(uint8_t *bssid, uint8_t *mac,
+                                          uint8_t *passphrase,
+                                          uint32_t sae_msg_type,
+                                          size_t *sae_msg_len);
+extern int __real_wpa3_parse_sae_msg(uint8_t *buf, size_t len,
+                                     uint32_t sae_msg_type, uint16_t status);
+
+uint8_t *__wrap_wpa3_build_sae_msg(uint8_t *bssid, uint8_t *mac,
+                                   uint8_t *passphrase,
+                                   uint32_t sae_msg_type, size_t *len_out)
+{
+    bl_os_printf("[SAE] build type=%u\r\n", (unsigned)sae_msg_type);
+    uint8_t *buf = __real_wpa3_build_sae_msg(bssid, mac, passphrase,
+                                             sae_msg_type, len_out);
+    bl_os_printf("[SAE] build out len=%u buf=%p\r\n",
+                 (unsigned)(len_out ? *len_out : 0), (void *)buf);
+    return buf;
+}
+
+int __wrap_wpa3_parse_sae_msg(uint8_t *buf, size_t len,
+                              uint32_t sae_msg_type, uint16_t status)
+{
+    bl_os_printf("[SAE] parse type=%u len=%u status=%u\r\n",
+                 (unsigned)sae_msg_type, (unsigned)len, (unsigned)status);
+    int rc = __real_wpa3_parse_sae_msg(buf, len, sae_msg_type, status);
+    bl_os_printf("[SAE] parse rc=%d\r\n", rc);
+    return rc;
+}
