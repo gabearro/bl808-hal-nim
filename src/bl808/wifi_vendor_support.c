@@ -3079,7 +3079,7 @@ int __wrap_wpa_set_bss(u8 vif_idx, u8 sta_idx, char *macddr, char *bssid,
         bl_os_printf("[PMF] wrapper: wpa_gen_wpa_ie failed rc=%d\r\n", new_len);
         return -1;
     }
-    gWpaSm.assoc_wpa_ie_len = (uint16_t)new_len;
+    gWpaSm.assoc_wpa_ie_len = new_len;
     wpa_config_assoc_ie(gWpaSm.vif_idx, gWpaSm.proto,
                         gWpaSm.assoc_wpa_ie, gWpaSm.assoc_wpa_ie_len);
 
