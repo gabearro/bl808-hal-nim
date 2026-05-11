@@ -3083,8 +3083,12 @@ int __wrap_wpa_set_bss(u8 vif_idx, u8 sta_idx, char *macddr, char *bssid,
     wpa_config_assoc_ie(gWpaSm.vif_idx, gWpaSm.proto,
                         gWpaSm.assoc_wpa_ie, gWpaSm.assoc_wpa_ie_len);
 
-    bl_os_printf("[PMF] wrapper: assoc_wpa_ie_len=%u byte0=0x%02x\r\n",
-                 (unsigned)gWpaSm.assoc_wpa_ie_len,
-                 gWpaSm.assoc_wpa_ie_len > 0 ? gWpaSm.assoc_wpa_ie[0] : 0);
+    bl_os_printf("[PMF] wrapper: assoc_wpa_ie_len=%u\r\n",
+                 (unsigned)gWpaSm.assoc_wpa_ie_len);
+    bl_os_printf("[PMF] ie:");
+    for (unsigned i = 0; i < gWpaSm.assoc_wpa_ie_len; i++) {
+        bl_os_printf(" %02x", gWpaSm.assoc_wpa_ie[i]);
+    }
+    bl_os_printf("\r\n");
     return 0;
 }
