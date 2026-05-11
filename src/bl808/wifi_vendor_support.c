@@ -2995,3 +2995,96 @@ int wifi_netif_dhcp_start(struct netif *netif)
     return (int)dhcp_start(netif);
 }
 int wifi_netif_dhcp_stop(struct netif *netif) { (void)netif; return 0; }
+
+/* =========================================================================
+ * Iter 2.A.1: PMF-Capable wrapper.
+ *
+ * The bl808 vendor supplicant defaults to advertising NO PMF in its RSN IE.
+ * WPA3-Transition-mode APs reject WPA2 clients that omit the MFPC bit with
+ * status_code 19 (CIPHER_REJECTED_PER_POLICY). This wrapper interposes on
+ * wpa_set_bss via -Wl,--wrap=wpa_set_bss: when the caller does NOT request
+ * full PMF (the typical path), we let the real function run, then reach into
+ * gWpaSm to set pmf_cfg.capable=true and mgmt_group_cipher=BIP-CMAC-128, and
+ * regenerate + republish the assoc RSN IE so the next association request
+ * carries the MFPC bit + group mgmt cipher selector.
+ *
+ * If a caller ever requests pmf_required=true, we pass through unchanged.
+ * Receive-side BIP MIC validation is delegated to libwifi_fw.a once
+ * bl_wifi_set_igtk_internal() installs the IGTK from 4WHS M3.
+ * ========================================================================= */
+
+/* Pull in the supplicant internal struct wpa_sm.  The include chain is:
+ *   rsn_supp/wpa_i.h
+ *     -> bl_supplicant/bl_wifi_driver.h -> supplicant_api.h  (enum wpa_alg, wifi_pmf_config_t)
+ *     -> common/wpa_common.h -> os.h (SUPPRESSED) -> supplicant_api.h (already guarded)
+ *        provides: PMK_LEN, WPA_NONCE_LEN, struct wpa_ptk, struct wpa_gtk_data, struct rsn_sppamsdu_sup
+ *     -> common/defs.h  (enum wpa_states) — no sub-includes
+ *
+ * os.h and utils/common.h conflict with the OS-shim implementations earlier
+ * in this file, so suppress them via their own include guards. */
+#define OS_H      /* suppress os.h  — shims already defined above */
+#define COMMON_H  /* suppress utils/common.h — not needed here */
+/* Minimal typedefs normally provided by utils/common.h. */
+#ifndef __bitwise
+#define __bitwise
+#endif
+#ifndef __force
+#define __force
+#endif
+typedef u16 __bitwise be16;
+typedef u32 __bitwise be32;
+#ifndef STRUCT_PACKED
+#define STRUCT_PACKED __attribute__((packed))
+#endif
+#include "common/defs.h"      /* enum wpa_states (no sub-includes) */
+#include "common/wpa_common.h"/* PMK_LEN, struct wpa_ptk, struct rsn_sppamsdu_sup */
+#include "rsn_supp/wpa_i.h"  /* struct wpa_sm */
+
+#define BL808_WPA_CIPHER_AES_128_CMAC ((u16)(1u << 5))  /* matches defs.h:25 */
+
+extern struct wpa_sm gWpaSm;
+extern int wpa_gen_wpa_ie(struct wpa_sm *sm, u8 *wpa_ie, size_t wpa_ie_len);
+extern void wpa_config_assoc_ie(uint8_t vif_idx, u8 proto, u8 *assoc_buf,
+                                u32 assoc_wpa_ie_len);
+extern int __real_wpa_set_bss(u8 vif_idx, u8 sta_idx, char *macddr, char *bssid,
+                              u8 pairwise_cipher, u8 group_cipher,
+                              bool pmf_required, u8 mgmt_group_cipher);
+
+int __wrap_wpa_set_bss(u8 vif_idx, u8 sta_idx, char *macddr, char *bssid,
+                       u8 pairwise_cipher, u8 group_cipher,
+                       bool pmf_required, u8 mgmt_group_cipher)
+{
+    if (pmf_required) {
+        /* Caller already wants PMF; nothing to override. */
+        return __real_wpa_set_bss(vif_idx, sta_idx, macddr, bssid,
+                                  pairwise_cipher, group_cipher,
+                                  pmf_required, mgmt_group_cipher);
+    }
+
+    int rc = __real_wpa_set_bss(vif_idx, sta_idx, macddr, bssid,
+                                pairwise_cipher, group_cipher,
+                                false, 0);
+    if (rc < 0) {
+        return rc;
+    }
+
+    gWpaSm.pmf_cfg.capable = true;
+    gWpaSm.pmf_cfg.required = false;
+    gWpaSm.mgmt_group_cipher = BL808_WPA_CIPHER_AES_128_CMAC;
+    gWpaSm.assoc_wpa_ie_len = sizeof(gWpaSm.assoc_wpa_ie);
+
+    int new_len = wpa_gen_wpa_ie(&gWpaSm, gWpaSm.assoc_wpa_ie,
+                                 gWpaSm.assoc_wpa_ie_len);
+    if (new_len < 0) {
+        bl_os_printf("[PMF] wrapper: wpa_gen_wpa_ie failed rc=%d\r\n", new_len);
+        return -1;
+    }
+    gWpaSm.assoc_wpa_ie_len = (uint16_t)new_len;
+    wpa_config_assoc_ie(gWpaSm.vif_idx, gWpaSm.proto,
+                        gWpaSm.assoc_wpa_ie, gWpaSm.assoc_wpa_ie_len);
+
+    bl_os_printf("[PMF] wrapper: assoc_wpa_ie_len=%u byte0=0x%02x\r\n",
+                 (unsigned)gWpaSm.assoc_wpa_ie_len,
+                 gWpaSm.assoc_wpa_ie_len > 0 ? gWpaSm.assoc_wpa_ie[0] : 0);
+    return 0;
+}
