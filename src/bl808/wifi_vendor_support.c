@@ -3071,6 +3071,7 @@ int __wrap_wpa_set_bss(u8 vif_idx, u8 sta_idx, char *macddr, char *bssid,
     gWpaSm.pmf_cfg.capable = true;
     gWpaSm.pmf_cfg.required = true;
     gWpaSm.mgmt_group_cipher = BL808_WPA_CIPHER_AES_128_CMAC;
+    gWpaSm.key_mgmt = (1u << 10);  /* WPA_KEY_MGMT_SAE per defs.h:39 */
     gWpaSm.assoc_wpa_ie_len = sizeof(gWpaSm.assoc_wpa_ie);
 
     int new_len = wpa_gen_wpa_ie(&gWpaSm, gWpaSm.assoc_wpa_ie,
