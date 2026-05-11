@@ -143,6 +143,11 @@ when defined(bl808m0) and defined(bl808WifiVendor) and defined(bl808WifiNimFw):
   var wifi_hw {.importc, header: "bl_defs.h".}: BlHw
   var bl_mod_params {.importc, header: "bl_mod_params.h".}: BlModParams
 
+  ## Direct-UART trace helpers — `cfg_trace(char*)` and `cfg_trace_rc(char*,int)`
+  ## are kept available as extern C symbols so any wifi_* module can drop in
+  ## prints without going through the wifi-blob log routing (which is
+  ## char-write-blind and gets clobbered by PHY printf chatter). Poll
+  ## FIFO-free status before each byte so traces survive concurrent emits.
   {.emit: """
 static void cfg_putc(char c) {
   volatile unsigned int *fifo = (volatile unsigned int *)0x2000a088;
@@ -164,8 +169,6 @@ void cfg_trace_rc(char *s, int v) {
   cfg_putc('\r'); cfg_putc('\n');
 }
 """.}
-  proc cfgTrace(s: cstring) {.importc: "cfg_trace", cdecl.}
-  proc cfgTraceRc(s: cstring; v: cint) {.importc: "cfg_trace_rc", cdecl.}
 
   proc c_memset(s: pointer; c: cint; n: csize_t): pointer
     {.importc: "memset", header: "<string.h>", cdecl.}
@@ -370,10 +373,7 @@ void cfg_trace_rc(char *s, int v) {
     0
 
   proc bl_main_phy_up*(): cint {.exportc, cdecl.} =
-    cfgTrace("[NIMFW] phy_up entry\r\n")
-    let r = bl_send_start(hwPtr())
-    cfgTraceRc("[NIMFW] phy_up rc=", r)
-    if r != 0: -1 else: 0
+    if bl_send_start(hwPtr()) != 0: -1 else: 0
 
   proc bl_main_channel_set*(channel: cint): cint {.exportc, cdecl.} =
     discard bl_send_channel_set_req(hwPtr(), channel)
@@ -536,24 +536,19 @@ void cfg_trace_rc(char *s, int v) {
     0
 
   proc cfg80211_init(blHw: ptr BlHw): cint =
-    cfgTrace("[NIMFW] cfg80211_init entry\r\n")
     if blHw == nil:
-      cfgTrace("[NIMFW] cfg80211_init blHw=nil\r\n")
       return -1
     let raw = cast[pointer](blHw)
     initListHead(raw, BlHwVifsOff)
     storePtr(raw, BlHwModParamsOff, cast[pointer](addr bl_mod_params))
 
     result = bl_platform_on(blHw)
-    cfgTraceRc("[NIMFW] bl_platform_on rc=", result)
     if result != 0:
       return result
     ipc_host_enable_irq(loadPtr(raw, BlHwIpcEnvOff), IpcIrqE2aAll)
     discard bl_wifi_enable_irq()
 
-    cfgTrace("[NIMFW] before bl_send_reset\r\n")
     result = bl_send_reset(blHw)
-    cfgTraceRc("[NIMFW] bl_send_reset rc=", result)
     if result != 0:
       return result
     bl_os_msleep(5'u32)
@@ -561,17 +556,13 @@ void cfg_trace_rc(char *s, int v) {
     var versionCfm: array[SizeMmVersionCfm, uint8]
     zero(addr versionCfm[0], versionCfm.len)
     result = bl_send_version_req(blHw, cast[ptr MmVersionCfm](addr versionCfm[0]))
-    cfgTraceRc("[NIMFW] bl_send_version_req rc=", result)
     if result != 0:
       return result
     result = bl_handle_dynparams(blHw)
-    cfgTraceRc("[NIMFW] bl_handle_dynparams rc=", result)
     if result != 0:
       return result
     discard bl_send_me_config_req(blHw)
-    cfgTrace("[NIMFW] bl_send_me_config_req done\r\n")
     discard bl_send_me_chan_config_req(blHw)
-    cfgTrace("[NIMFW] cfg80211_init complete\r\n")
 
   proc bl_cfg80211_connect*(blHw: ptr BlHw; sme: ptr Cfg80211ConnectParams): cint =
     var cfm: array[SizeSmConnectCfm, uint8]
@@ -604,14 +595,11 @@ void cfg_trace_rc(char *s, int v) {
     ipc_host_txdesc_left(loadPtr(hwRaw(), BlHwIpcEnvOff), 0, 0)
 
   proc bl_main_rtthread_start*(blHwOut: ptr ptr BlHw): cint {.exportc, cdecl.} =
-    cfgTrace("[NIMFW] bl_main_rtthread_start entry\r\n")
     if blHwOut == nil:
-      cfgTrace("[NIMFW] bl_main_rtthread_start blHwOut=nil\r\n")
       return -1
     bl_main_lowlevel_init()
     blHwOut[] = hwPtr()
     result = cfg80211_init(hwPtr())
-    cfgTraceRc("[NIMFW] cfg80211_init rc=", result)
     if result != 0:
       return result
     result = bl_open(blHwOut[])
