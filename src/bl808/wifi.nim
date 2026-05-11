@@ -282,6 +282,8 @@ when defined(bl808m0):
     {.compile: "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/library/platform_util.c".}
     {.passL: "-Lsrc/bl808".}
     {.passL: "-Wl,--wrap=wpa_set_bss".}
+    {.passL: "-Wl,--wrap=wpa3_build_sae_msg".}
+    {.passL: "-Wl,--wrap=wpa3_parse_sae_msg".}
     when defined(bl808WifiWrapWaitUs):
       {.passL: "-Wl,--wrap=wait_us".}
     when defined(bl808WifiNimFw):
