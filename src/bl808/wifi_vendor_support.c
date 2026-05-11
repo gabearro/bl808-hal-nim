@@ -3069,7 +3069,7 @@ int __wrap_wpa_set_bss(u8 vif_idx, u8 sta_idx, char *macddr, char *bssid,
     }
 
     gWpaSm.pmf_cfg.capable = true;
-    gWpaSm.pmf_cfg.required = false;
+    gWpaSm.pmf_cfg.required = true;
     gWpaSm.mgmt_group_cipher = BL808_WPA_CIPHER_AES_128_CMAC;
     gWpaSm.assoc_wpa_ie_len = sizeof(gWpaSm.assoc_wpa_ie);
 
