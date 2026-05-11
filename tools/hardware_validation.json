@@ -1121,6 +1121,27 @@
       }],
       "required": ["=== BL808 LwIP Smoke Complete ==="],
       "timeout": 240
+    },
+    {
+      "name": "m0_wifi_nimfw_boot_test",
+      "tiers": ["smoke"],
+      "build": [{
+        "id": "kernel",
+        "core": "bl808m0",
+        "source": "examples/m0_wifi_nimfw_boot_test.nim",
+        "flash": "m0",
+        "defines": {
+          "bl808WifiVendor": "1",
+          "bl808WifiNimFw": "1"
+        }
+      }],
+      "required": [
+        "=== BL808 WiFi NimFw Boot Probe ===",
+        "[WIFI-NIMFW] bl_init done",
+        "[PASS] wifi nimfw init",
+        "=== BL808 NimFw Boot Probe Complete ==="
+      ],
+      "timeout": 30
     }
   ]
 }
