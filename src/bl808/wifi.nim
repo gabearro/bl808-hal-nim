@@ -163,6 +163,7 @@ when defined(bl808m0):
       {.passC: "-DBL808_WIFI_FORCE_RESP_TX_POWER=0x70 -DBL808_WIFI_FORCE_RESP_TX_POWER_ALL".}
     {.passC: "-fcommon -fshort-enums -Wno-incompatible-pointer-types -Wno-int-conversion -Wno-implicit-function-declaration".}
     {.passC: "-Isrc/bl808".}
+    {.passL: "-Wl,--wrap=wpa_set_bss".}
     {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/include".}
     {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver".}
     {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi/include".}
