@@ -1132,7 +1132,8 @@
         "flash": "m0",
         "defines": {
           "bl808WifiVendor": "1",
-          "bl808WifiNimFw": "1"
+          "bl808WifiNimFw": "1",
+          "bl808WifiNimFwTrace": "1"
         }
       }],
       "required": [
