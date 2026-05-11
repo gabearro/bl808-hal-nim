@@ -21,7 +21,7 @@ import mmio, memmap
 # wifi_vendor_support.c's lwIP-side bridges (netifapi_netif_add -> netif_add,
 # tcpip_input -> ethernet_input, wifi_netif_dhcp_start -> dhcp_start) call
 # vendor lwIP functions that otherwise wouldn't be in the link.
-when defined(bl808m0) and defined(bl808WifiVendor):
+when defined(bl808m0) and defined(bl808WifiVendor) and not defined(bl808WifiNimFw):
   import bl808/kernel/lwipcore
 
 when defined(bl808m0) and defined(bl808WifiVendor) and defined(bl808WifiNimFw):
@@ -281,9 +281,10 @@ when defined(bl808m0):
     {.compile: "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/library/platform.c".}
     {.compile: "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/library/platform_util.c".}
     {.passL: "-Lsrc/bl808".}
-    {.passL: "-Wl,--wrap=wpa_set_bss".}
-    {.passL: "-Wl,--wrap=wpa3_build_sae_msg".}
-    {.passL: "-Wl,--wrap=wpa3_parse_sae_msg".}
+    when not defined(bl808WifiNimFw):
+      {.passL: "-Wl,--wrap=wpa_set_bss".}
+      {.passL: "-Wl,--wrap=wpa3_build_sae_msg".}
+      {.passL: "-Wl,--wrap=wpa3_parse_sae_msg".}
     when defined(bl808WifiWrapWaitUs):
       {.passL: "-Wl,--wrap=wait_us".}
     when defined(bl808WifiNimFw):
