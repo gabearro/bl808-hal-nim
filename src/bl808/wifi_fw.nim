@@ -1526,14 +1526,18 @@ proc wifi_fw_runtime_init*() {.exportc, cdecl.} =
   ## Initialize wifi_fw runtime state once.
   ##
   ## CRITICAL: do NOT call NimMain() here. `_start` jumps directly to
-  ## user `main()`, so NimMain has never been called. Calling NimMain
-  ## inside this function would re-invoke `main()` recursively (NimMain
-  ## ends with `jal main`), leading to stack overflow / boot loop.
-  ## Nim global initialization happens elsewhere (e.g. PreMain at boot
-  ## or per-module init). All this proc needs to do is install the
-  ## kernel-event handler table.
+  ## user `main()`, so NimMain has never been called. NimMain itself
+  ## ends with `jal main`, so calling it here would recursively re-enter
+  ## main → infinite recursion. Instead, call PreMain — it runs all the
+  ## Nim global var initializers (which is what populates dispatch
+  ## tables like mm_default_handler) and returns. ke_evt_handlers_init
+  ## then wires up the per-event handler table.
   if wifiFwRuntimeInited != 0:
     return
+  {.emit: """
+  extern void PreMain(void);
+  PreMain();
+  """.}
   ke_evt_handlers_init()
   wifiFwRuntimeInited = 1
 
@@ -23049,12 +23053,30 @@ proc phyif_utils_decode*(rxvec: pointer, rssi: ptr int8): uint32 {.exportc, cdec
 # ###########################################################################
 
 proc ipc_emb_msg_push*(msgDescPtr: pointer) {.exportc, cdecl.} =
-  ## Push a message descriptor to the IPC shared-memory ring for host pickup.
-  ## Called from ke_msg_send for API/external task messages.
-  ## From blob: the argument is &hdr.id (= param - 8), pointing to the
-  ## {id, destId, srcId, paramLen} portion of the message header.
-  ## TODO: implement IPC shared-ring push (relocation target unknown in archive)
-  discard
+  if msgDescPtr == nil:
+    return
+  let sharedBase = cast[uint](addr ipcSharedEnv[0])
+  let msgId = cast[ptr uint16](msgDescPtr)[]
+  let dstId = cast[ptr uint8](cast[uint](msgDescPtr) + 2)[]
+  let srcId = cast[ptr uint8](cast[uint](msgDescPtr) + 3)[]
+  let paramLen = cast[ptr uint32](cast[uint](msgDescPtr) + 4)[]
+  # Mirror layout used by ipc_emb_msg_evt on the receive (host→emb) side:
+  #   ipc_shared_env[4..5] = id, [6] = dst, [7] = src, [8..11] = paramLen,
+  #   [12..] = payload words.
+  cast[ptr uint16](sharedBase + 4)[] = msgId
+  cast[ptr uint8](sharedBase + 6)[] = dstId
+  cast[ptr uint8](sharedBase + 7)[] = srcId
+  cast[ptr uint32](sharedBase + 8)[] = paramLen
+  # Copy payload words from after the 8-byte header.
+  let paySrc = cast[uint](msgDescPtr) + 8
+  var cursor: uint32 = 0
+  while cursor < paramLen:
+    let v = cast[ptr uint32](paySrc + cursor.uint)[]
+    cast[ptr uint32](sharedBase + 12'u + cursor.uint)[] = v
+    cursor += 4
+  # Raise host-side IpcIrqE2aMsgAck (= 1<<2). The chip's emb→app trigger
+  # register is at 0x24800100.
+  regWrite(0x24800100'u, 1'u32 shl 2)
 
 proc ipc_emb_init*() {.exportc, cdecl.} =
   ## Initialize IPC embedded interface.
