@@ -18,7 +18,7 @@ MEMORY
     WIFI_RAM (rw)  : ORIGIN = 0x22030000, LENGTH = 144K
 }
 
-_stack_size = 38K;
+_stack_size = 16K;
 
 SECTIONS
 {
