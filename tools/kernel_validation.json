@@ -1,0 +1,547 @@
+{
+  "defaults": {
+    "qemu": "/Users/gabriel/Documents/nimlang/qemu-bl808/build/qemu-system-riscv64",
+    "forbidden": ["[FAIL]", "panic", "Unhandled", "trap_entry", "fatal:"]
+  },
+  "tests": [
+    {
+      "name": "m0_cps_test",
+      "tiers": ["smoke", "full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_cps_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-kernel", "{build:kernel}"],
+      "required": ["[PASS] CPS await returned correct value", "[PASS] Multiple awaits correct", "[PASS] Pre-completed future", "=== Phase 1 Complete ==="],
+      "timeout": 12
+    },
+    {
+      "name": "m0_sched_test",
+      "tiers": ["smoke", "full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_sched_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-kernel", "{build:kernel}"],
+      "required": ["[Y] done", "[A] 500ms", "[B] 250ms", "[C] 1000ms"],
+      "timeout": 45
+    },
+    {
+      "name": "m0_sync_test",
+      "tiers": ["smoke", "full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_sync_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-kernel", "{build:kernel}"],
+      "required": ["[PASS] Zero-initialized semaphore retains released permit", "[PASS] waitAll propagates child errors", "[PASS] TaskGroup propagates child errors", "[PASS] Cancelled ISR future releases bridge slot", "[PASS] withTimeout preserves completed typed result", "[PASS] withTimeout fails stalled void future", "[CONSUMER] total=100 [PASS]", "[EVT] event received! [PASS]", "[GROUP] worker 2 done", "[SEM] worker 3 released permit"],
+      "timeout": 70
+    },
+    {
+      "name": "m0_uart_async_test",
+      "tiers": ["smoke", "full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_uart_async_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-kernel", "{build:kernel}"],
+      "input": "abcq",
+      "required": ["[ECHO] Done", "[HEARTBEAT] Done"],
+      "timeout": 25
+    },
+    {
+      "name": "m0_shell_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_shell_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-kernel", "{build:kernel}"],
+      "input": "help\nmem\nsched\nisr\nboot\ntick\nuptime\nwdt\ntime\nunknown\n",
+      "required": ["BL808 Shell", "help    ", "used:", "ticks:", "active slots:", "valid:", " ticks", " ms", "feeds:", "unix=", "unknown: unknown"],
+      "timeout": 25
+    },
+    {
+      "name": "m0_log_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_log_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-kernel", "{build:kernel}"],
+      "required": ["=== BL808 Log Framework Test ===", "This is an info message", "This is a warning message", "This is an error message", "=== Test Complete ==="],
+      "timeout": 12
+    },
+    {
+      "name": "m0_spi_test",
+      "tiers": ["smoke", "full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_spi_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-kernel", "{build:kernel}"],
+      "required": ["[PASS] Full-duplex no-peer readback: 0x00", "[PASS] Recv no-peer bus: 0x00 0x00 0x00", "=== Test Complete ==="],
+      "timeout": 18
+    },
+    {
+      "name": "m0_i2c_async_test",
+      "tiers": ["smoke", "full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_i2c_async_test.nim"}],
+      "qemu_args": ["-M", "bl808,attach-default-eeproms=on", "-display", "none", "-serial", "stdio", "-monitor", "none", "-kernel", "{build:kernel}"],
+      "required": ["[PASS] Data verified: Hello", "[PASS] NAK test: non-existent address correctly rejected", "=== Test Complete ==="],
+      "timeout": 20
+    },
+    {
+      "name": "m0_dma_test",
+      "tiers": ["smoke", "full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_dma_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-kernel", "{build:kernel}"],
+      "required": ["[PASS] M2M data verified", "[PASS] SPI DMA no-peer readback: 0x00", "=== Test Complete ==="],
+      "timeout": 18
+    },
+    {
+      "name": "m0_wdt_test",
+      "tiers": ["smoke", "full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_wdt_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-kernel", "{build:kernel}"],
+      "required": ["[PASS] WDT feeds incrementing", "=== Test Complete ==="],
+      "timeout": 15
+    },
+    {
+      "name": "m0_fault_test",
+      "tiers": ["smoke", "full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_fault_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-kernel", "{build:kernel}"],
+      "required": ["[PASS] Stack guard initialized", "[PASS] Boot health record valid", "[PASS] Fault record persisted", "[PASS] Fault record includes stack bounds", "[PASS] Boot health captured fault record", "[PASS] Heap check initial", "[PASS] Heap allocation failure tracked", "[PASS] Heap tail canary detects overrun", "=== Test Complete ==="],
+      "timeout": 15
+    },
+    {
+      "name": "m0_hal_register_smoke_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_hal_register_smoke_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-kernel", "{build:kernel}"],
+      "required": [
+        "=== BL808 HAL Register Smoke Test ===",
+        "[PASS] CLIC init clears UART0 attr",
+        "[PASS] EMI enable",
+        "[PASS] TZC pack window",
+        "[PASS] PWM stop",
+        "[PASS] ADC scan stop",
+        "[PASS] CAN IRQ disable",
+        "[PASS] I2S TX FIFO addr",
+        "[PASS] PDM enable",
+        "[PASS] DMA2D width",
+        "[PASS] SEC TRNG API",
+        "[PASS] EFUSE safe status read",
+        "[PASS] Cache flush API",
+        "[PASS] PSRAM enable",
+        "[PASS] LZ4 enable cleared",
+        "[PASS] DBI FIFO register",
+        "[PASS] NPU BLAI clock register",
+        "[PASS] PKA DSA init",
+        "Result: 0x00000072 passed, 0x00000000 failed",
+        "=== Test Complete ==="
+      ],
+      "timeout": 15
+    },
+    {
+      "name": "m0_hal_system_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_hal_system_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-kernel", "{build:kernel}"],
+      "required": [
+        "=== BL808 HAL System Test ===",
+        "[PASS] core interrupt guard",
+        "[PASS] glb spi divider",
+        "[PASS] hbn retention roundtrip",
+        "[PASS] cci flush",
+        "=== Test Complete ==="
+      ],
+      "timeout": 20
+    },
+    {
+      "name": "m0_hal_comms_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_hal_comms_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-kernel", "{build:kernel}"],
+      "required": [
+        "=== BL808 HAL Comms Test ===",
+        "[PASS] uart deinit",
+        "[PASS] spi deinit",
+        "[PASS] i2c bounded register helpers",
+        "[PASS] can bounded transfer APIs",
+        "[PASS] ir tx/rx bounded APIs",
+        "=== Test Complete ==="
+      ],
+      "timeout": 25
+    },
+    {
+      "name": "m0_hal_signal_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_hal_signal_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-kernel", "{build:kernel}"],
+      "required": [
+        "=== BL808 HAL Signal Test ===",
+        "[PASS] dma memory copy",
+        "[PASS] adc scan stop",
+        "[PASS] i2s disable",
+        "[PASS] pwm control APIs",
+        "=== Test Complete ==="
+      ],
+      "timeout": 25
+    },
+    {
+      "name": "m0_hal_security_storage_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_hal_security_storage_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-kernel", "{build:kernel}"],
+      "required": [
+        "=== BL808 HAL Security Storage Test ===",
+        "[PASS] efuse safe read APIs",
+        "[PASS] flash read-only APIs",
+        "[PASS] pka low-level command APIs",
+        "[PASS] psram read/write APIs",
+        "[PASS] lz4 bounded decompress",
+        "=== Test Complete ==="
+      ],
+      "timeout": 30
+    },
+    {
+      "name": "m0_hal_net_usb_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_hal_net_usb_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-kernel", "{build:kernel}"],
+      "required": [
+        "=== BL808 HAL Net USB Test ===",
+        "[PASS] emac rx/tx disable",
+        "[PASS] emac bounded mdio APIs",
+        "[PASS] usb endpoint controls",
+        "[PASS] usb host stop",
+        "=== Test Complete ==="
+      ],
+      "timeout": 30
+    },
+    {
+      "name": "m0_pds_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_pds_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-icount", "shift=0,align=off,sleep=on", "-kernel", "{build:kernel}"],
+      "required": ["[PASS] Timed PDS wake resumed execution with IRQ delivery", "=== Test Complete ==="],
+      "timeout": 20
+    },
+    {
+      "name": "m0_pds_gpio_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_pds_gpio_test.nim"}],
+      "qemu_args": ["-M", "bl808,aon-gpio10-driven=on", "-display", "none", "-serial", "stdio", "-monitor", "none", "-qmp", "unix:{qmp:main},server=on,wait=off", "-icount", "shift=0,align=off,sleep=on", "-kernel", "{build:kernel}"],
+      "qmp_actions": [{"after_marker": "Entering PDS sleep forever, waiting for host-driven GPIO10 rise", "delay_ms": 350, "commands": [{"execute": "qom-set", "arguments": {"path": "/machine", "property": "aon-gpio10-level", "value": true}}]}],
+      "required": ["[PASS] GLB GPIO wake resumed PDS sleep", "=== Test Complete ==="],
+      "timeout": 25
+    },
+    {
+      "name": "m0_pds_hbn_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_pds_hbn_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-qmp", "unix:{qmp:main},server=on,wait=off", "-icount", "shift=0,align=off,sleep=on", "-kernel", "{build:kernel}"],
+      "qmp_actions": [{"after_marker": "Entering PDS sleep forever, waiting for host-triggered HBN wake", "delay_ms": 350, "commands": [{"execute": "qom-set", "arguments": {"path": "/machine", "property": "hbn-bod-level", "value": true}}]}],
+      "required": ["[PASS] HBN BOD wake resumed PDS sleep", "=== Test Complete ==="],
+      "timeout": 25
+    },
+    {
+      "name": "m0_hbn_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_hbn_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-icount", "shift=0,align=off,sleep=on", "-kernel", "{build:kernel}"],
+      "required": ["[PASS] HBN RTC wake survived reset and raised HBN_OUT0", "[PASS] Boot health survived HBN reset", "=== Test Complete ==="],
+      "timeout": 30
+    },
+    {
+      "name": "m0_pds_pds_gpio_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_pds_pds_gpio_test.nim"}],
+      "qemu_args": ["-M", "bl808,gpio16-driven=on", "-display", "none", "-serial", "stdio", "-monitor", "none", "-qmp", "unix:{qmp:main},server=on,wait=off", "-icount", "shift=0,align=off,sleep=on", "-kernel", "{build:kernel}"],
+      "qmp_actions": [{"after_marker": "Entering PDS sleep forever, waiting for host-driven GPIO16 rise", "delay_ms": 350, "commands": [{"execute": "qom-set", "arguments": {"path": "/machine", "property": "gpio16-level", "value": true}}]}],
+      "required": ["[PASS] Native PDS GPIO wake resumed PDS sleep", "=== Test Complete ==="],
+      "timeout": 25
+    },
+    {
+      "name": "m0_pds_irrx_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_pds_irrx_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-qmp", "unix:{qmp:main},server=on,wait=off", "-icount", "shift=0,align=off,sleep=on", "-kernel", "{build:kernel}"],
+      "qmp_actions": [{"after_marker": "Entering PDS sleep forever, waiting for host-injected IR frame", "delay_ms": 50, "commands": [{"execute": "qom-set", "arguments": {"path": "/machine", "property": "irrx-data", "value": 2774139135}}, {"execute": "qom-set", "arguments": {"path": "/machine", "property": "irrx-bitcount", "value": 32}}, {"execute": "qom-set", "arguments": {"path": "/machine", "property": "irrx-inject", "value": true}}]}],
+      "required": ["[PASS] IR RX wake resumed PDS sleep", "=== Test Complete ==="],
+      "timeout": 25
+    },
+    {
+      "name": "m0_pds_wifi_tbtt_wakeup_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_pds_wifi_tbtt_wakeup_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-qmp", "unix:{qmp:main},server=on,wait=off", "-icount", "shift=0,align=off,sleep=on", "-kernel", "{build:kernel}"],
+      "qmp_actions": [{"after_marker": "Entering PDS sleep forever, waiting for host-triggered TBTT wake", "delay_ms": 150, "commands": [{"execute": "qom-set", "arguments": {"path": "/machine", "property": "wifi-tbtt-wakeup", "value": true}}]}],
+      "required": ["[PASS] WiFi TBTT wake resumed PDS sleep", "=== Test Complete ==="],
+      "timeout": 25
+    },
+    {
+      "name": "m0_wifi_irq_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_wifi_irq_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-qmp", "unix:{qmp:main},server=on,wait=off", "-kernel", "{build:kernel}"],
+      "qmp_actions": [{"after_marker": "Waiting for host-injected wifi-mac-gen-rx-complete event", "commands": [{"execute": "qom-set", "arguments": {"path": "/machine", "property": "wifi-mac-gen-rx-complete", "value": true}}]}],
+      "required": ["[PASS] Native Wi-Fi MAC interrupt path reached the CLIC"],
+      "timeout": 20
+    },
+    {
+      "name": "m0_wifi_ipc_pub_irq_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_wifi_ipc_pub_irq_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-qmp", "unix:{qmp:main},server=on,wait=off", "-kernel", "{build:kernel}"],
+      "qmp_actions": [{"after_marker": "Waiting for host-injected wifi-ipc-status2-pending=2", "commands": [{"execute": "qom-set", "arguments": {"path": "/machine", "property": "wifi-ipc-status2-pending", "value": 2}}]}],
+      "required": ["[PASS] Native Wi-Fi embedded IPC path reached the CLIC"],
+      "timeout": 20
+    },
+    {
+      "name": "m0_ble_irq_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_ble_irq_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-qmp", "unix:{qmp:main},server=on,wait=off", "-kernel", "{build:kernel}"],
+      "qmp_actions": [{"after_marker": "Waiting for host-injected ble-intrawstat-pending=1", "commands": [{"execute": "qom-set", "arguments": {"path": "/machine", "property": "ble-intrawstat-pending", "value": 1}}]}],
+      "required": ["[PASS] Native BLE controller path reached the CLIC"],
+      "timeout": 20
+    },
+    {
+      "name": "d0_pds_irq_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [
+        {"id": "kernel", "core": "bl808m0", "source": "examples/m0_d0_pds_irq_test.nim"},
+        {"id": "d0", "core": "bl808d0", "source": "examples/d0_pds_irq_test.nim"}
+      ],
+      "qemu_args": ["-M", "bl808,d0-firmware={build:d0}", "-display", "none", "-serial", "stdio", "-serial", "file:{log:d0}", "-monitor", "none", "-qmp", "unix:{qmp:main},server=on,wait=off", "-kernel", "{build:kernel}"],
+      "qmp_actions": [{"after_marker": "Waiting for host-triggered wifi-wakeup-event", "delay_ms": 50, "commands": [{"execute": "qom-set", "arguments": {"path": "/machine", "property": "wifi-wakeup-event", "value": true}}]}],
+      "required": ["[PASS] D0 PDS IRQ followed the native PDS wake fabric"],
+      "timeout": 45
+    },
+    {
+      "name": "d0_wl_all_irq_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [
+        {"id": "kernel", "core": "bl808m0", "source": "examples/m0_d0_pds_irq_test.nim"},
+        {"id": "d0", "core": "bl808d0", "source": "examples/d0_wl_all_irq_test.nim"}
+      ],
+      "qemu_args": ["-M", "bl808,d0-firmware={build:d0}", "-display", "none", "-serial", "stdio", "-serial", "file:{log:d0}", "-monitor", "none", "-qmp", "unix:{qmp:main},server=on,wait=off", "-kernel", "{build:kernel}"],
+      "qmp_actions": [{"after_marker": "Waiting for host-injected BLE wireless event", "delay_ms": 50, "commands": [{"execute": "qom-set", "arguments": {"path": "/machine", "property": "ble-intrawstat-pending", "value": 1}}]}],
+      "required": ["[PASS] D0 WL_ALL IRQ reached the PLIC"],
+      "timeout": 45
+    },
+    {
+      "name": "m0_mm_power_cycle_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [
+        {"id": "kernel", "core": "bl808m0", "source": "examples/m0_mm_power_cycle_test.nim"},
+        {"id": "d0", "core": "bl808d0", "source": "examples/d0_mm_power_cycle_test.nim"}
+      ],
+      "qemu_args": ["-M", "bl808,d0-firmware={build:d0}", "-display", "none", "-serial", "stdio", "-serial", "file:{log:d0}", "-monitor", "none", "-kernel", "{build:kernel}"],
+      "required": ["[PASS] MM power cycle stopped and restarted D0"],
+      "timeout": 35
+    },
+    {
+      "name": "m0_asyncfs_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_asyncfs_test.nim"}],
+      "assets": [{"id": "flash", "type": "empty_file", "size": 16777216, "fill_byte": 255}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-drive", "if=mtd,format=raw,file={asset:flash}", "-kernel", "{build:kernel}"],
+      "required": ["[PASS] Data verified: Hello World!", "=== Test Complete ==="],
+      "timeout": 35
+    },
+    {
+      "name": "m0_flash_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_flash_test.nim"}],
+      "assets": [{"id": "flash", "type": "empty_file", "size": 16777216, "fill_byte": 255}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-drive", "if=mtd,format=raw,file={asset:flash}", "-kernel", "{build:kernel}"],
+      "required": ["[PASS] Raw flash program verified", "[PASS] Flash reset command", "[PASS] Data verified: Hello!", "=== Test Complete ==="],
+      "timeout": 35
+    },
+    {
+      "name": "m0_sd_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_sd_test.nim"}],
+      "assets": [{"id": "sd", "type": "empty_file", "size": 67108864}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-drive", "if=sd,format=raw,file={asset:sd}", "-kernel", "{build:kernel}"],
+      "required": ["[PASS] Data verified: Hello!", "[PASS] Directory empty after delete", "=== Test Complete ==="],
+      "timeout": 45
+    },
+    {
+      "name": "m0_asyncsd_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_asyncsd_test.nim"}],
+      "assets": [{"id": "sd", "type": "empty_file", "size": 67108864}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-drive", "if=sd,format=raw,file={asset:sd}", "-kernel", "{build:kernel}"],
+      "required": ["[PASS] asyncSdWrite", "[PASS] asyncSdRead data verified", "[PASS] asyncSdRemove", "=== Test Complete ==="],
+      "timeout": 45
+    },
+    {
+      "name": "m0_usb_cdc_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_usb_cdc_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-kernel", "{build:kernel}"],
+      "required": ["[OK] USB device enumerated and configured", "[PASS] USB CDC loopback verified: Hello USB!", "=== Test Complete ==="],
+      "timeout": 35
+    },
+    {
+      "name": "m0_rtc_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_rtc_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-kernel", "{build:kernel}"],
+      "required": ["[PASS] Set/get round-trip", "[PASS] Leap year 2000-02-29 round-trip", "[PASS] FatFs timestamp non-zero", "=== Test Complete ==="],
+      "timeout": 35
+    },
+    {
+      "name": "m0_net_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_net_test.nim"}],
+      "qemu_args": ["-M", "bl808,net-phy=ip101g", "-display", "none", "-serial", "stdio", "-monitor", "none", "-nic", "user,model=bl808-emac,hostfwd=tcp::12345-:7", "-kernel", "{build:kernel}"],
+      "required": ["[OK] EMAC driver initialized", "[NET] TCP echo server listening on port 7"],
+      "host_checks": [{"type": "tcp_echo", "after_marker": "[NET] TCP echo server listening on port 7", "host": "127.0.0.1", "port": 12345, "send": "hello ox64\n", "expect": "hello ox64\n"}],
+      "timeout": 45
+    },
+    {
+      "name": "m0_ipc_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [
+        {"id": "kernel", "core": "bl808m0", "source": "examples/m0_ipc_test.nim"},
+        {"id": "d0", "core": "bl808d0", "source": "examples/d0_ipc_test.nim"}
+      ],
+      "qemu_args": ["-M", "bl808,d0-firmware={build:d0}", "-display", "none", "-serial", "stdio", "-serial", "file:{log:d0}", "-monitor", "none", "-kernel", "{build:kernel}"],
+      "required": ["[M0] D0 ready [OK] debug=0x0000002F", "[M0] All IPC calls correct! [PASS]"],
+      "timeout": 80
+    },
+    {
+      "name": "m0_ipc_timeout_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_ipc_timeout_test.nim"}],
+      "qemu_args": ["-M", "bl808", "-display", "none", "-serial", "stdio", "-monitor", "none", "-kernel", "{build:kernel}"],
+      "required": ["[M0] timeout 1 [OK]", "[M0] timeout 2 [OK]", "[M0] IPC timeout cleanup [PASS]"],
+      "timeout": 10
+    },
+    {
+      "name": "m0_allcore_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [
+        {"id": "kernel", "core": "bl808m0", "source": "examples/m0_allcore_test.nim"},
+        {"id": "d0", "core": "bl808d0", "source": "examples/d0_allcore_test.nim"},
+        {"id": "lp", "core": "bl808lp", "source": "examples/lp_allcore_test.nim"}
+      ],
+      "qemu_args": ["-M", "bl808,d0-firmware={build:d0},lp-firmware={build:lp}", "-display", "none", "-serial", "stdio", "-serial", "file:{log:d0}", "-serial", "null", "-serial", "null", "-monitor", "none", "-kernel", "{build:kernel}"],
+      "required": ["Result: 5 passed, 0 failed", "=== ALL TESTS PASSED ==="],
+      "timeout": 100
+    },
+    {
+      "name": "d0_kernel_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [
+        {"id": "kernel", "core": "bl808m0", "source": "examples/m0_d0_boot_helper.nim"},
+        {"id": "d0", "core": "bl808d0", "source": "examples/d0_kernel_test.nim"}
+      ],
+      "qemu_args": ["-M", "bl808,d0-firmware={build:d0}", "-display", "none", "-serial", "stdio", "-serial", "file:{log:d0}", "-monitor", "none", "-kernel", "{build:kernel}"],
+      "required": ["[D0] Scheduler initialized", "[D0-A] done", "[D0-B] done"],
+      "timeout": 90
+    },
+    {
+      "name": "d0_mm_hal_register_smoke_test",
+      "tiers": ["full"],
+      "kind": "qemu",
+      "build": [
+        {"id": "kernel", "core": "bl808m0", "source": "examples/m0_d0_mm_hal_boot_helper.nim"},
+        {"id": "d0", "core": "bl808d0", "source": "examples/d0_mm_hal_register_smoke_test.nim"}
+      ],
+      "qemu_args": ["-M", "bl808,d0-firmware={build:d0}", "-display", "none", "-serial", "stdio", "-serial", "null", "-monitor", "none", "-kernel", "{build:kernel}"],
+      "required": ["[PASS] DBI register API", "[PASS] DVP register API", "[PASS] OSD register API", "[PASS] H264 register API", "[PASS] MJPEG register API", "[PASS] NPU register API", "[PASS] D0 MM HAL register smoke complete", "=== Test Complete ==="],
+      "timeout": 20
+    },
+    {
+      "name": "examples_compile_check",
+      "tiers": ["full"],
+      "kind": "command",
+      "cmd": ["python3", "tools/compile_examples.py", "--keep-going"],
+      "required": ["Summary: checked=", "failed=0"],
+      "timeout": 90
+    },
+    {
+      "name": "hal_binding_declared_m0",
+      "tiers": ["full"],
+      "kind": "command",
+      "cmd": ["python3", "tools/audit_hal_bindings.py", "--declared-check", "--kind", "all", "--include-category", "ordinary", "--include-category", "external-c", "--include-category", "firmware-reimpl", "--core", "bl808m0", "--nim-define", "bl808WifiVendor=1"],
+      "required": ["PASS declared-check"],
+      "timeout": 30
+    },
+    {
+      "name": "hal_binding_declared_d0",
+      "tiers": ["full"],
+      "kind": "command",
+      "cmd": ["python3", "tools/audit_hal_bindings.py", "--declared-check", "--kind", "all", "--include-category", "ordinary", "--include-category", "external-c", "--include-category", "firmware-reimpl", "--core", "bl808d0"],
+      "required": ["PASS declared-check"],
+      "timeout": 30
+    },
+    {
+      "name": "hal_binding_declared_lp",
+      "tiers": ["full"],
+      "kind": "command",
+      "cmd": ["python3", "tools/audit_hal_bindings.py", "--declared-check", "--kind", "all", "--include-category", "ordinary", "--include-category", "external-c", "--include-category", "firmware-reimpl", "--core", "bl808lp"],
+      "required": ["PASS declared-check"],
+      "timeout": 30
+    },
+    {
+      "name": "hal_binding_efuse_programming_declared_only",
+      "tiers": ["full"],
+      "kind": "command",
+      "cmd": ["python3", "tools/audit_hal_bindings.py", "--declared-check", "--kind", "all", "--include-category", "efuse-programming", "--core", "bl808m0"],
+      "required": ["PASS declared-check"],
+      "timeout": 15
+    },
+    {
+      "name": "hal_source_coverage_audit",
+      "tiers": ["full"],
+      "kind": "command",
+      "cmd": ["python3", "tools/audit_hal_coverage.py", "--scope", "src", "--forbid-efuse-programming", "--fail-on-uncovered"],
+      "required": ["uncovered by validation examples: 0", "efuse programming sites in validation entries: 0"],
+      "timeout": 15
+    },
+    {
+      "name": "qemu_model_qtest",
+      "tiers": ["full"],
+      "kind": "command",
+      "cmd": ["python3", "qemu-machine/tests/validate_bl808_qtest.py", "--qemu", "{qemu}"],
+      "required": ["BL808 qtest validation passed"],
+      "timeout": 60
+    },
+    {
+      "name": "qemu_model_tcg",
+      "tiers": ["full"],
+      "kind": "command",
+      "cmd": ["python3", "qemu-machine/tests/validate_bl808_tcg.py", "--qemu", "{qemu}"],
+      "required": ["BL808 TCG D0 XIP validation passed"],
+      "timeout": 30
+    }
+  ]
+}

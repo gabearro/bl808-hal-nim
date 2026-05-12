@@ -43,7 +43,7 @@ Single iteration, two commits, two file edits, then a hardware run. No decomposi
 **Build verification command (used after every Task 1 / Task 2 step):**
 ```bash
 make m0 FILE=examples/m0_wifi_lwip_smoke.nim \
-  NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=6509171272'
+  NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=<wifi-password>'
 ```
 Expected last line: `Output: build/m0_firmware.bin`
 
@@ -138,7 +138,7 @@ int __wrap_wpa_set_bss(u8 vif_idx, u8 sta_idx, char *macddr, char *bssid,
 Run:
 ```bash
 make m0 FILE=examples/m0_wifi_lwip_smoke.nim \
-  NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=6509171272'
+  NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=<wifi-password>'
 ```
 
 Expected: command succeeds (exit 0); the last line of output is `Output: build/m0_firmware.bin`.
@@ -205,7 +205,7 @@ Indentation must match the surrounding pragmas (4 spaces inside the `when define
 Run:
 ```bash
 make m0 FILE=examples/m0_wifi_lwip_smoke.nim \
-  NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=6509171272'
+  NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=<wifi-password>'
 ```
 
 Expected: command succeeds (exit 0); the last line of output is `Output: build/m0_firmware.bin`.
@@ -252,7 +252,7 @@ After Tasks 1-2 are committed, run on hardware:
 make hw-e2e-lwip-smoke \
   UART_PORT=/dev/tty.usbserial-TGKWL2RS \
   WIFI_SSID=Frog \
-  WIFI_PASSWORD=6509171272
+  WIFI_PASSWORD=<wifi-password>
 ```
 
 Expected outcomes (these are the only acceptable end-states):

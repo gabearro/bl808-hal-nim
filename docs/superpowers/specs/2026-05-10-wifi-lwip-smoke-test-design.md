@@ -72,7 +72,7 @@ Two `{.emit:}` accessors for `netif->ip_addr.addr` and `netif->gw.addr`.
 
 `main` does `systemInit`/`heapInit`/`setupConsole`/`hwValidationLogReset` (under WiFi vendor) then `e2eRun(AttemptsTotal, runOneAttempt, deinitForRetry)` then emits `=== BL808 LwIP Smoke Complete ===` sentinel for the catalog `required` matcher.
 
-**Build verification**: `make m0 FILE=examples/m0_wifi_lwip_smoke.nim NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=6509171272'` ends with `Output: build/m0_firmware.bin`.
+**Build verification**: `make m0 FILE=examples/m0_wifi_lwip_smoke.nim NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=<wifi-password>'` ends with `Output: build/m0_firmware.bin`.
 
 **Commit message**: `Add m0_wifi_lwip_smoke.nim — DHCP phase only (Iter 2.A.0 follow-up step 1/3)`
 
@@ -252,7 +252,7 @@ START at HEAD = 079bcce (Iter 2.A.0 substrate complete; build verified)
    → If pass: commit. If fail: identify which file broke, discard with checkout HEAD --.
 
 4. Hardware run (no commit unless fixes needed)
-   → make hw-e2e-lwip-smoke UART_PORT=/dev/tty.usbserial-TGKWL2RS WIFI_SSID=Frog WIFI_PASSWORD=6509171272
+   → make hw-e2e-lwip-smoke UART_PORT=/dev/tty.usbserial-TGKWL2RS WIFI_SSID=Frog WIFI_PASSWORD=<wifi-password>
    → Bucket the 3 attempts by phase
    → If at least 1/3 reaches icmp:ok: substrate validated, iteration done
    → If all 3 fail at the same phase: real bug; surface with marker stream for triage

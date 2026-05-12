@@ -42,7 +42,7 @@ Single iteration, three commits, two file edits, then a hardware run with four w
 **Build verification command** (used after every Task 1 / 2 / 3 step):
 ```bash
 make m0 FILE=examples/m0_wifi_lwip_smoke.nim \
-  NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=6509171272'
+  NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=<wifi-password>'
 ```
 Expected last line: `Output: build/m0_firmware.bin`
 
@@ -85,7 +85,7 @@ Insert one line **immediately after** the `mgmt_group_cipher` assignment (so the
 Run:
 ```bash
 make m0 FILE=examples/m0_wifi_lwip_smoke.nim \
-  NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=6509171272'
+  NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=<wifi-password>'
 ```
 
 Expected: command succeeds (exit 0); the last line of output is `Output: build/m0_firmware.bin`.
@@ -193,7 +193,7 @@ int __wrap_wpa3_parse_sae_msg(uint8_t *buf, size_t len,
 Run:
 ```bash
 make m0 FILE=examples/m0_wifi_lwip_smoke.nim \
-  NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=6509171272'
+  NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=<wifi-password>'
 ```
 
 Expected: command succeeds (exit 0); the last line of output is `Output: build/m0_firmware.bin`. Binary text size should grow only marginally (the wrappers are present in the object file but not referenced; gcc may eliminate them if `-fdata-sections -ffunction-sections` + `--gc-sections` are in play, leaving size unchanged. Either is fine for this commit.)
@@ -269,7 +269,7 @@ Indentation must match the existing `--wrap=wpa_set_bss` line exactly (4 spaces)
 Run:
 ```bash
 make m0 FILE=examples/m0_wifi_lwip_smoke.nim \
-  NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=6509171272'
+  NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=<wifi-password>'
 ```
 
 Expected: command succeeds (exit 0); the last line of output is `Output: build/m0_firmware.bin`. Binary text size should grow ~200 bytes from the previous commit (the two wrappers + their printf calls are now referenced).
@@ -316,7 +316,7 @@ After Tasks 1-3 are committed, run on hardware:
 make hw-e2e-lwip-smoke \
   UART_PORT=/dev/tty.usbserial-TGKWL2RS \
   WIFI_SSID=Frog \
-  WIFI_PASSWORD=6509171272
+  WIFI_PASSWORD=<wifi-password>
 ```
 
 Read the marker stream + `[SAE]` and `[PMF]` log lines from:

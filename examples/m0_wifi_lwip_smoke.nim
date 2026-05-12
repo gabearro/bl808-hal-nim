@@ -3,7 +3,7 @@
 ## Build with:
 ##   make m0 FILE=examples/m0_wifi_lwip_smoke.nim \
 ##     NIM="nim -d:bl808kernel -d:bl808WifiVendor \
-##              -d:WifiSsid=Frog -d:WifiPassword=6509171272"
+##              -d:WifiSsid=Frog -d:WifiPassword=<wifi-password>"
 ##
 ## Per attempt: scan -> auth -> 4whs -> assoc (synthetic) -> DHCP.
 ## ICMP echo phase is added in the next commit.

@@ -1,0 +1,227 @@
+[
+  {
+    "symbol": "bl_tpc_update_power_table_channel_offset",
+    "ref_instr": 14,
+    "nim_instr": 3,
+    "missing_instr": 11,
+    "pct_of_ref": 21.43,
+    "ref_member": "",
+    "line": 20785
+  },
+  {
+    "symbol": "ipc_emb_notify",
+    "ref_instr": 14,
+    "nim_instr": 6,
+    "missing_instr": 8,
+    "pct_of_ref": 42.86,
+    "ref_member": "",
+    "line": 22673
+  },
+  {
+    "symbol": "co_list_push_front",
+    "ref_instr": 10,
+    "nim_instr": 4,
+    "missing_instr": 6,
+    "pct_of_ref": 40.0,
+    "ref_member": "",
+    "line": 1634
+  },
+  {
+    "symbol": "co_list_extract",
+    "ref_instr": 10,
+    "nim_instr": 4,
+    "missing_instr": 6,
+    "pct_of_ref": 40.0,
+    "ref_member": "",
+    "line": 1651
+  },
+  {
+    "symbol": "chan_ctxt_get_remaining_time_ms",
+    "ref_instr": 11,
+    "nim_instr": 6,
+    "missing_instr": 5,
+    "pct_of_ref": 54.55,
+    "ref_member": "",
+    "line": 6012
+  },
+  {
+    "symbol": "co_list_push_back",
+    "ref_instr": 10,
+    "nim_instr": 5,
+    "missing_instr": 5,
+    "pct_of_ref": 50.0,
+    "ref_member": "",
+    "line": 1621
+  },
+  {
+    "symbol": "mfp_add_mgmt_mic",
+    "ref_instr": 15,
+    "nim_instr": 11,
+    "missing_instr": 4,
+    "pct_of_ref": 73.33,
+    "ref_member": "",
+    "line": 1395
+  },
+  {
+    "symbol": "co_pool_alloc",
+    "ref_instr": 10,
+    "nim_instr": 6,
+    "missing_instr": 4,
+    "pct_of_ref": 60.0,
+    "ref_member": "",
+    "line": 1882
+  },
+  {
+    "symbol": "rxl_pd_append",
+    "ref_instr": 10,
+    "nim_instr": 7,
+    "missing_instr": 3,
+    "pct_of_ref": 70.0,
+    "ref_member": "",
+    "line": 18110
+  },
+  {
+    "symbol": "rxl_hd_append",
+    "ref_instr": 10,
+    "nim_instr": 7,
+    "missing_instr": 3,
+    "pct_of_ref": 70.0,
+    "ref_member": "",
+    "line": 18081
+  },
+  {
+    "symbol": "scanu_rm_exist_ssid",
+    "ref_instr": 17,
+    "nim_instr": 15,
+    "missing_instr": 2,
+    "pct_of_ref": 88.24,
+    "ref_member": "",
+    "line": 8232
+  },
+  {
+    "symbol": "coex_dump_wifi",
+    "ref_instr": 16,
+    "nim_instr": 14,
+    "missing_instr": 2,
+    "pct_of_ref": 87.5,
+    "ref_member": "",
+    "line": 1276
+  },
+  {
+    "symbol": "cfg_api_element_dump",
+    "ref_instr": 15,
+    "nim_instr": 13,
+    "missing_instr": 2,
+    "pct_of_ref": 86.67,
+    "ref_member": "",
+    "line": 24815
+  },
+  {
+    "symbol": "me_freq_to_chan_ptr",
+    "ref_instr": 8,
+    "nim_instr": 6,
+    "missing_instr": 2,
+    "pct_of_ref": 75.0,
+    "ref_member": "",
+    "line": 1380
+  },
+  {
+    "symbol": "me_bw_check",
+    "ref_instr": 6,
+    "nim_instr": 4,
+    "missing_instr": 2,
+    "pct_of_ref": 66.67,
+    "ref_member": "",
+    "line": 1385
+  },
+  {
+    "symbol": "coex_dump_pta",
+    "ref_instr": 15,
+    "nim_instr": 14,
+    "missing_instr": 1,
+    "pct_of_ref": 93.33,
+    "ref_member": "",
+    "line": 1277
+  },
+  {
+    "symbol": "co_pool_init",
+    "ref_instr": 15,
+    "nim_instr": 14,
+    "missing_instr": 1,
+    "pct_of_ref": 93.33,
+    "ref_member": "",
+    "line": 1856
+  },
+  {
+    "symbol": "rx_swdesc_init",
+    "ref_instr": 6,
+    "nim_instr": 5,
+    "missing_instr": 1,
+    "pct_of_ref": 83.33,
+    "ref_member": "",
+    "line": 17817
+  },
+  {
+    "symbol": "scanu_find_result",
+    "ref_instr": 5,
+    "nim_instr": 4,
+    "missing_instr": 1,
+    "pct_of_ref": 80.0,
+    "ref_member": "",
+    "line": 1376
+  },
+  {
+    "symbol": "bl_wifi_unset_appie_internal",
+    "ref_instr": 5,
+    "nim_instr": 4,
+    "missing_instr": 1,
+    "pct_of_ref": 80.0,
+    "ref_member": "",
+    "line": 23339
+  },
+  {
+    "symbol": "me_legacy_ridx_max",
+    "ref_instr": 4,
+    "nim_instr": 3,
+    "missing_instr": 1,
+    "pct_of_ref": 75.0,
+    "ref_member": "",
+    "line": 1384
+  },
+  {
+    "symbol": "bl_wifi_unregister_wpa_cb_internal",
+    "ref_instr": 4,
+    "nim_instr": 3,
+    "missing_instr": 1,
+    "pct_of_ref": 75.0,
+    "ref_member": "",
+    "line": 23311
+  },
+  {
+    "symbol": "notifier_chain_unregsiter",
+    "ref_instr": 2,
+    "nim_instr": 1,
+    "missing_instr": 1,
+    "pct_of_ref": 50.0,
+    "ref_member": "",
+    "line": 23101
+  },
+  {
+    "symbol": "notifier_chain_regsiter",
+    "ref_instr": 2,
+    "nim_instr": 1,
+    "missing_instr": 1,
+    "pct_of_ref": 50.0,
+    "ref_member": "",
+    "line": 23099
+  },
+  {
+    "symbol": "bl_wifi_sta_update_ap_info_internal",
+    "ref_instr": 2,
+    "nim_instr": 1,
+    "missing_instr": 1,
+    "pct_of_ref": 50.0,
+    "ref_member": "",
+    "line": 23624
+  }
+]

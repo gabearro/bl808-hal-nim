@@ -1,0 +1,6 @@
+[submodule "vendor/littlefs"]
+	path = vendor/littlefs
+	url = https://github.com/littlefs-project/littlefs.git
+[submodule "vendor/lwip"]
+	path = vendor/lwip
+	url = https://github.com/lwip-tcpip/lwip.git
