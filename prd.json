@@ -1,0 +1,121 @@
+{
+  "iteration": 195,
+  "items": [
+    {
+      "id": "PRD-195-001",
+      "category": "critical-stub",
+      "description": "rxu_cntrl_desc_prepare is a pure `ret` stub. Blob sets swdesc[20]=3, disables IRQ (csrrci mstatus,8), co_list_push_back(rxu_cntrl_env+0x40, swdesc), restores IRQ.",
+      "steps_to_verify": [
+        "Nim objdump of rxu_cntrl_desc_prepare contains sb/store 3, csrrci, R_RISCV_CALL co_list_push_back, conditional csrsi",
+        "Callers observe RX indications pushed to upload list at rxu_cntrl_env+0x40"
+      ],
+      "passes": false
+    },
+    {
+      "id": "PRD-195-002",
+      "category": "critical-stub",
+      "description": "txl_buffer_alloc missing txu_cntrl_frame_build call. Blob constructs 802.11 header at desc+556+hdrLen via txu_cntrl_frame_build(desc,bufPtr). Nim incorrectly c_memcpy(dst,hostid+22,4).",
+      "steps_to_verify": [
+        "Nim objdump of txl_buffer_alloc contains R_RISCV_CALL txu_cntrl_frame_build",
+        "c_memcpy call on hostid+22 removed",
+        "15-iteration loop uses T-Head-compatible logic or at minimum writes descriptor fields matching blob's DMA/THD pattern"
+      ],
+      "passes": false
+    },
+    {
+      "id": "PRD-195-003",
+      "category": "critical-inversion",
+      "description": "txl_frame_release has inverted logic: on valid==0 logs error instead of pushing desc to free list (co_list_push_back txl_frame_env). Causes TX descriptor leak.",
+      "steps_to_verify": [
+        "Nim objdump of txl_frame_release contains R_RISCV_CALL co_list_push_back when valid==0",
+        "No getLogFunc(4) call on valid==0 path"
+      ],
+      "passes": false
+    },
+    {
+      "id": "PRD-195-004",
+      "category": "critical-statemachine",
+      "description": "ps_enable_cfm wrong timer offset (+12 vs blob +0x24=+36), missing ps_env[52]&2 guard, missing status&0x800000 branch, missing ps_env[8] counter decrement and tail-call to ps_enable_cfm_handle.",
+      "steps_to_verify": [
+        "Timer address in mm_timer_clear call is ps_env+0x24 not ps_env+12",
+        "Early-return when (ps_env[52] & 2) != 0",
+        "Branch on status bit 23 (0x800000)",
+        "Decrement ps_env[8] and tail-call ps_enable_cfm_handle(vif) when counter hits 0"
+      ],
+      "passes": false
+    },
+    {
+      "id": "PRD-195-005",
+      "category": "critical-stub",
+      "description": "ps_check_tx_status.part.0 stub missing null-frame TX path, half-threshold PM event, and ps_env[8]==0 guard. completionFn arg is discarded. Blob calls txl_frame_send_null_frame, wifi_hosal_pm_post_event.",
+      "steps_to_verify": [
+        "Nim objdump contains R_RISCV_CALL txl_frame_send_null_frame",
+        "R_RISCV_CALL wifi_hosal_pm_post_event for half-threshold path",
+        "ps_env[12] read as uint32 not uint8",
+        "completionFn forwarded as a1 to null-frame send"
+      ],
+      "passes": false
+    },
+    {
+      "id": "PRD-195-006",
+      "category": "critical-stub",
+      "description": "sm_assoc_req_send_pre is a one-line stub (ke_state_set 7). Blob: li a0=7;li a1=0;li a2=0; tail-call sm_auth_assoc_send_according_chan.",
+      "steps_to_verify": [
+        "Nim objdump of sm_assoc_req_send_pre contains R_RISCV_CALL sm_auth_assoc_send_according_chan",
+        "Args: a0=7, a1=0, a2=0"
+      ],
+      "passes": false
+    },
+    {
+      "id": "PRD-195-007",
+      "category": "high-reentrancy",
+      "description": "mm_timer_clear calls mm_timer_schedule (full-loop callback processor) when head changes. Blob calls mm_timer_hw_set(newHead) — HW register program only. Fix to use mm_timer_hw_set.",
+      "steps_to_verify": [
+        "Nim objdump of mm_timer_clear calls mm_timer_hw_set (not mm_timer_schedule)",
+        "No callback invocation side effects during clear"
+      ],
+      "passes": false
+    },
+    {
+      "id": "PRD-195-008",
+      "category": "security-replay",
+      "description": "rxu_cntrl_check_pn group-key path doesn't call replay_counter_validate — inline compare only, replay window bits never updated. Security bug.",
+      "steps_to_verify": [
+        "Group-key path (keyType != 0 || tid==8) calls R_RISCV_CALL replay_counter_validate",
+        "Pairwise path preserves per-tid PN slot update"
+      ],
+      "passes": false
+    },
+    {
+      "id": "PRD-195-009",
+      "category": "correctness-state",
+      "description": "sm_connect_ind: (a) ke_msg_free(connInfoOld) should subtract 12 (msg header); (b) unconditional ke_state_set(TASK_SM, 0) at end overrides failure state — blob only sets 0 on success.",
+      "steps_to_verify": [
+        "ke_msg_free receives connInfoOld - 12",
+        "ke_state_set(TASK_SM, 0) guarded by status==0"
+      ],
+      "passes": false
+    },
+    {
+      "id": "PRD-195-010",
+      "category": "correctness-abi",
+      "description": "txu_cntrl_push: txu_cntrl_sechdr_len_compute Nim signature takes 2 args but blob takes 1 arg and returns via a0. me_update_buffer_control should receive VIF tag pointer not STA idx.",
+      "steps_to_verify": [
+        "txu_cntrl_sechdr_len_compute call uses blob's 1-arg form",
+        "me_update_buffer_control receives vifTag pointer"
+      ],
+      "passes": false
+    },
+    {
+      "id": "PRD-195-011",
+      "category": "correctness-signature",
+      "description": "mfp_protect_mgmt_frame: signature corrected to (frameDesc, fc, action) and call sites updated to pass fc+action.",
+      "steps_to_verify": [
+        "Signature declared as (frameDesc: pointer, fc: uint32, action: uint32 = 0)",
+        "vifIdx read from frameDesc[47] internally, not passed arg",
+        "All 3 call sites pass proper fc"
+      ],
+      "passes": true
+    }
+  ]
+}

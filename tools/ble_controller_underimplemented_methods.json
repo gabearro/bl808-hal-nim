@@ -1,0 +1,5264 @@
+{
+  "reference": "build/vendor_bl808_fw/libbtblecontroller_bl808_ble1m0s1bredr0.a",
+  "nim_binary": "build/hw-validation-wireless-build-after-hci-pack/nimcache/m0_ble_nim_controller_hal_test/kernel/@pbl808@sblecontroller.nim.c.o",
+  "source": "src/bl808/blecontroller.nim",
+  "reference_functions": 452,
+  "nim_functions": 980,
+  "common_functions": 452,
+  "missing_in_nim": [],
+  "extra_in_nim": [
+    "BLE_ROM_hook_init",
+    "BLE_ROM_patch",
+    "_patch_ble_cmp_abs_time",
+    "_patch_ble_cmp_dest_id",
+    "_patch_ble_cmp_timer_id",
+    "_patch_ble_co_list_check_size_available",
+    "_patch_ble_co_list_extract",
+    "_patch_ble_co_list_extract_after",
+    "_patch_ble_co_list_find",
+    "_patch_ble_co_list_init",
+    "_patch_ble_co_list_insert_after",
+    "_patch_ble_co_list_insert_before",
+    "_patch_ble_co_list_merge",
+    "_patch_ble_co_list_pop_front",
+    "_patch_ble_co_list_push_back",
+    "_patch_ble_co_list_push_front",
+    "_patch_ble_co_list_size",
+    "_patch_ble_ke_event_callback_set",
+    "_patch_ble_ke_event_clear",
+    "_patch_ble_ke_event_flush",
+    "_patch_ble_ke_event_get_all",
+    "_patch_ble_ke_event_init",
+    "_patch_ble_ke_event_schedule",
+    "_patch_ble_ke_event_set",
+    "_patch_ble_ke_flush",
+    "_patch_ble_ke_free",
+    "_patch_ble_ke_handler_search",
+    "_patch_ble_ke_init",
+    "_patch_ble_ke_is_free",
+    "_patch_ble_ke_malloc",
+    "_patch_ble_ke_mem_init",
+    "_patch_ble_ke_mem_is_in_heap",
+    "_patch_ble_ke_msg_alloc",
+    "_patch_ble_ke_msg_free",
+    "_patch_ble_ke_msg_get_sent_num",
+    "_patch_ble_ke_msg_send",
+    "_patch_ble_ke_msg_send_basic",
+    "_patch_ble_ke_queue_extract",
+    "_patch_ble_ke_queue_insert",
+    "_patch_ble_ke_sleep_check",
+    "_patch_ble_ke_state_get",
+    "_patch_ble_ke_state_set",
+    "_patch_ble_ke_task_create",
+    "_patch_ble_ke_task_handler_get",
+    "_patch_ble_ke_task_init",
+    "_patch_ble_ke_task_saved_update",
+    "_patch_ble_ke_task_schedule",
+    "_patch_ble_ke_time_cmp",
+    "_patch_ble_ke_time_past",
+    "_patch_ble_ke_timer_active",
+    "_patch_ble_ke_timer_clear",
+    "_patch_ble_ke_timer_hw_set",
+    "_patch_ble_ke_timer_init",
+    "_patch_ble_ke_timer_schedule",
+    "_patch_ble_ke_timer_set",
+    "_patch_ble_ke_timer_target_get",
+    "_patch_ke_time",
+    "bflb_main_check_task_valid",
+    "bflb_main_get_task_priority",
+    "bflb_main_task_post",
+    "bflb_main_task_post_from_fw",
+    "bflb_main_task_post_from_isr",
+    "bflbble_activity_ongoing_check",
+    "bflbble_init",
+    "bflbble_isr",
+    "bflbble_isr_clear",
+    "bflbble_reset",
+    "bflbble_sleep_check",
+    "bflbble_version",
+    "bflbip_check_wakeup_boundary",
+    "bflbip_eif_get",
+    "bflbip_ext_wakeup_enable",
+    "bflbip_get_prevent_sleep",
+    "bflbip_get_sleep_dur_cnt",
+    "bflbip_get_sleep_stat_cnt",
+    "bflbip_get_sw_wakup_cnt",
+    "bflbip_init",
+    "bflbip_prevent_sleep_clear",
+    "bflbip_prevent_sleep_set",
+    "bflbip_reset",
+    "bflbip_schedule",
+    "bflbip_sleep",
+    "bflbip_sleep_enable",
+    "bflbip_sleep_lpcycles_2_us",
+    "bflbip_us_2_lpcycles",
+    "bflbip_version",
+    "bflbip_wakeup",
+    "bflbip_wakeup_delay_set",
+    "bflbip_wakeup_end",
+    "bflbip_wlcoex_set",
+    "bl_channel_calc_threshold",
+    "bl_read_mac_addr",
+    "bleAesAddRoundKey__OOZsrcZbl808Zblecontroller_u5605",
+    "bleAesCmac__OOZsrcZbl808Zblecontroller_u5722",
+    "bleAesEncryptBlock__OOZsrcZbl808Zblecontroller_u5651",
+    "bleAesExpandKey__OOZsrcZbl808Zblecontroller_u5548",
+    "bleAesMixColumns__OOZsrcZbl808Zblecontroller_u5639",
+    "bleAesSubShift__OOZsrcZbl808Zblecontroller_u5615",
+    "bleCcmComputeMic__OOZsrcZbl808Zblecontroller_u6108",
+    "bleCcmCounterBlock__OOZsrcZbl808Zblecontroller_u6062",
+    "bleCcmCryptInPlace__OOZsrcZbl808Zblecontroller_u6070",
+    "bleCmacShiftSubkey__OOZsrcZbl808Zblecontroller_u5702",
+    "bleControllerInitInternal__OOZsrcZbl808Zblecontroller_u4836",
+    "bleCopyAddrParam__OOZsrcZbl808Zblecontroller_u5859",
+    "bleCopyBytes__OOZsrcZbl808Zblecontroller_u5820",
+    "bleCopyReversed__OOZsrcZbl808Zblecontroller_u5796",
+    "bleNimDbgIsrCount",
+    "bleNimDbgIsrStatOr",
+    "bleNimDbgLldRxCheckCount",
+    "bleNimDbgLldRxCheckHitCount",
+    "bleNimDbgLldRxCheckMissCount",
+    "bleNimDbgLldRxDescActive",
+    "bleNimDbgLldRxFreeCount",
+    "bleNimDbgLldRxLastEnvIdx",
+    "bleNimDbgLldRxLastIdx",
+    "bleNimDbgPushCount",
+    "bleNimDbgRxConnectIndCount",
+    "bleNimDbgRxLastBuf",
+    "bleNimDbgRxLastDesc",
+    "bleNimDbgRxLastHeader",
+    "bleNimDbgRxLastStatus",
+    "bleNimDbgRxReadyCount",
+    "bleNimDbgRxScanReqCount",
+    "bleNimDbgStat20Count",
+    "bleNimDbgStat8000Count",
+    "bleNimDbgVendorAclEmptyLastStatus",
+    "bleNimDbgVendorAclEmptyTxCount",
+    "bleNimDbgVendorAclEmptyTxPending",
+    "bleNimDbgVendorConStarted",
+    "bleNimDbgVendorLlcpLastOpcode",
+    "bleNimDbgVendorLlcpLastStatus",
+    "bleNimDbgVendorLlcpRxCount",
+    "bleNimDbgVendorLlcpTxCount",
+    "bleNimDbgVendorLlcpTxDropped",
+    "bleNimDbgVendorLlcpTxQueued",
+    "bleReverseBytes__OOZsrcZbl808Zblecontroller_u5844",
+    "ble_assert_err",
+    "ble_assert_param",
+    "ble_assert_warn",
+    "ble_cmp_abs_time",
+    "ble_cmp_dest_id",
+    "ble_cmp_timer_id",
+    "ble_co_list_check_size_available",
+    "ble_co_list_extract",
+    "ble_co_list_extract_after",
+    "ble_co_list_find",
+    "ble_co_list_init",
+    "ble_co_list_insert_after",
+    "ble_co_list_insert_before",
+    "ble_co_list_merge",
+    "ble_co_list_pool_init",
+    "ble_co_list_pop_front",
+    "ble_co_list_push_back",
+    "ble_co_list_push_front",
+    "ble_co_list_size",
+    "ble_controller_deinit",
+    "ble_controller_disable_adv_random_delay",
+    "ble_controller_fix_scan_chan",
+    "ble_controller_get_debug_level",
+    "ble_controller_get_lib_ver",
+    "ble_controller_get_tx_pwr",
+    "ble_controller_init",
+    "ble_controller_notify_adv_discarded",
+    "ble_controller_program_ongoing",
+    "ble_controller_set_debug_level",
+    "ble_controller_set_scan_filter_table_size",
+    "ble_controller_set_tx_pwr",
+    "ble_controller_sleep",
+    "ble_controller_sleep_is_ongoing",
+    "ble_controller_sleep_restore",
+    "ble_controller_task_init",
+    "ble_controller_trace_malloc_init",
+    "ble_controller_update_adv_scan_aa",
+    "ble_controller_wakeup",
+    "ble_dbg_platform_reset_complete",
+    "ble_fur_debug_info",
+    "ble_get_deep_sleep_stat",
+    "ble_ke_check_malloc",
+    "ble_ke_debug_mem_info",
+    "ble_ke_event_callback_set",
+    "ble_ke_event_clear",
+    "ble_ke_event_flush",
+    "ble_ke_event_get",
+    "ble_ke_event_get_all",
+    "ble_ke_event_init",
+    "ble_ke_event_schedule",
+    "ble_ke_event_set",
+    "ble_ke_flush",
+    "ble_ke_free",
+    "ble_ke_get_event_field",
+    "ble_ke_handler_search",
+    "ble_ke_init",
+    "ble_ke_is_free",
+    "ble_ke_malloc",
+    "ble_ke_mem_init",
+    "ble_ke_mem_is_empty",
+    "ble_ke_mem_is_in_heap",
+    "ble_ke_msg_alloc",
+    "ble_ke_msg_dest_id_get",
+    "ble_ke_msg_discard",
+    "ble_ke_msg_fobflbard",
+    "ble_ke_msg_fobflbard_new_id",
+    "ble_ke_msg_free",
+    "ble_ke_msg_get_sent_num",
+    "ble_ke_msg_in_queue",
+    "ble_ke_msg_save",
+    "ble_ke_msg_send",
+    "ble_ke_msg_send_basic",
+    "ble_ke_msg_src_id_get",
+    "ble_ke_queue_extract",
+    "ble_ke_queue_insert",
+    "ble_ke_sleep_check",
+    "ble_ke_state_get",
+    "ble_ke_state_set",
+    "ble_ke_task_check",
+    "ble_ke_task_create",
+    "ble_ke_task_delete",
+    "ble_ke_task_handler_get",
+    "ble_ke_task_init",
+    "ble_ke_task_msg_flush",
+    "ble_ke_task_saved_update",
+    "ble_ke_task_schedule",
+    "ble_ke_time",
+    "ble_ke_time_cmp",
+    "ble_ke_time_past",
+    "ble_ke_timer_active",
+    "ble_ke_timer_adjust_all",
+    "ble_ke_timer_clear",
+    "ble_ke_timer_hw_set",
+    "ble_ke_timer_init",
+    "ble_ke_timer_schedule",
+    "ble_ke_timer_set",
+    "ble_ke_timer_target_get",
+    "ble_ke_tx_queue_num",
+    "ble_portYIELD_FROM_ISR",
+    "ble_rf_get_pwr_offset",
+    "ble_rf_init",
+    "ble_rf_set_pwr_offset_table",
+    "ble_rf_set_tx_channel",
+    "ble_uxTaskPriorityGet",
+    "ble_vTaskDelete",
+    "ble_xQueueCreate",
+    "ble_xQueueReceive",
+    "ble_xQueueSend",
+    "ble_xQueueSendFromISR",
+    "blecontroller_main",
+    "bt_onchiphci_handle_rx_acl",
+    "bt_onchiphci_send_raw__OOZsrcZbl808Zblecontroller_u5046",
+    "btbleTargetExpired__OOZsrcZbl808Zblecontroller_u1235",
+    "co_bdaddr_set",
+    "coex_dump_ble",
+    "configureBleEm__OOZsrcZbl808Zblecontroller_u117",
+    "configureBleRf1M__OOZsrcZbl808Zblecontroller_u401",
+    "configureDigClock__OOZsrcZbl808Zblecontroller_u118",
+    "connParamStatus__OOZsrcZbl808Zblecontroller_u1027",
+    "copyBytes__OOZsrcZbl808Zblecontroller_u896",
+    "currentBtbleHalfUs__OOZsrcZbl808Zblecontroller_u1153",
+    "currentBtbleTime__OOZsrcZbl808Zblecontroller_u1145",
+    "defaultLocalAddrBytes__OOZsrcZbl808Zblecontroller_u1577",
+    "dump_data",
+    "ea_elt_cancel",
+    "ea_elt_create",
+    "ea_elt_insert",
+    "ea_elt_remove",
+    "ea_finetimer_isr",
+    "ea_init",
+    "ea_interval_create",
+    "ea_interval_delete",
+    "ea_interval_duration_req",
+    "ea_interval_insert",
+    "ea_interval_remove",
+    "ea_offset_req",
+    "ea_sw_isr",
+    "ea_time_get_halfslot_rounded",
+    "ea_time_get_slot_rounded",
+    "ea_timer_target_get",
+    "ecc_get_private_key",
+    "ecc_is_valid_point",
+    "em_buf_init",
+    "em_buf_rx_buff_addr_get",
+    "em_buf_rx_free",
+    "em_buf_tx_buff_addr_get",
+    "em_buf_tx_free",
+    "enableWirelessClocks__OOZsrcZbl808Zblecontroller_u88",
+    "get_stack_usage",
+    "handleNimHciCommand__OOZsrcZbl808Zblecontroller_u1669",
+    "handleOnchipHciCommandBuffer__OOZsrcZbl808Zblecontroller_u5033",
+    "hciFormatFieldSize__OOZsrcZbl808Zblecontroller_u3759",
+    "hciUtilCopyByFormat__OOZsrcZbl808Zblecontroller_u3762",
+    "hci_acl_tx_data_alloc",
+    "hci_acl_tx_data_received",
+    "hci_build_acl_rx_data",
+    "hci_cmd_get_max_param_size",
+    "hci_cmd_received",
+    "hci_command_handler",
+    "hci_get_tx_queue_num",
+    "hci_init",
+    "hci_look_for_cmd_desc",
+    "hci_look_for_evt_desc",
+    "hci_look_for_le_evt_desc",
+    "hci_reset",
+    "hci_util_pack",
+    "hci_util_unpack",
+    "initBleCoreRegisters__OOZsrcZbl808Zblecontroller_u1423",
+    "initBtbleLinkLayerRegisters__OOZsrcZbl808Zblecontroller_u1334",
+    "initBtbleTimeRegisters__OOZsrcZbl808Zblecontroller_u1138",
+    "llc_ch_assess_get_current_ch_map",
+    "llc_ch_assess_get_local_ch_map",
+    "llc_ch_assess_local",
+    "llc_ch_assess_reass_ch",
+    "llc_common_cmd_complete_send",
+    "llc_common_cmd_status_send",
+    "llc_common_enc_change_evt_send",
+    "llc_common_enc_key_ref_comp_evt_send",
+    "llc_common_flush_occurred_send",
+    "llc_common_nb_of_pkt_comp_evt_send",
+    "llc_con_update_complete_send",
+    "llc_con_update_finished",
+    "llc_con_update_ind",
+    "llc_discon_event_complete_send",
+    "llc_end_evt_defer",
+    "llc_feats_rd_event_send",
+    "llc_hci_acl_data_tx_handler",
+    "llc_hci_command_handler",
+    "llc_le_ch_sel_algo_evt_send",
+    "llc_le_con_cmp_evt_send",
+    "llc_llcp_ch_map_update_pdu_send",
+    "llc_llcp_con_param_req_pdu_send",
+    "llc_llcp_con_param_rsp_pdu_send",
+    "llc_llcp_con_update_pdu_send",
+    "llc_llcp_enc_req_pdu_send",
+    "llc_llcp_enc_rsp_pdu_send",
+    "llc_llcp_feats_req_pdu_send",
+    "llc_llcp_feats_rsp_pdu_send",
+    "llc_llcp_get_autorize",
+    "llc_llcp_length_req_pdu_send",
+    "llc_llcp_length_rsp_pdu_send",
+    "llc_llcp_pause_enc_req_pdu_send",
+    "llc_llcp_pause_enc_rsp_pdu_send",
+    "llc_llcp_ping_req_pdu_send",
+    "llc_llcp_ping_rsp_pdu_send",
+    "llc_llcp_recv_handler",
+    "llc_llcp_reject_ind_pdu_send",
+    "llc_llcp_start_enc_req_pdu_send",
+    "llc_llcp_start_enc_rsp_pdu_send",
+    "llc_llcp_terminate_ind_pdu_send",
+    "llc_llcp_unknown_rsp_send_pdu",
+    "llc_llcp_version_ind_pdu_send",
+    "llc_lsto_con_update",
+    "llc_ltk_req_send",
+    "llc_map_update_finished",
+    "llc_map_update_ind",
+    "llc_pdu_acl_tx_ack_defer",
+    "llc_pdu_defer",
+    "llc_pdu_llcp_tx_ack_defer",
+    "llc_reset",
+    "llc_util_bw_mgt",
+    "llc_util_clear_operation_ptr",
+    "llc_util_dicon_procedure",
+    "llc_util_get_free_conhdl",
+    "llc_util_get_nb_active_link",
+    "llc_util_set_auth_payl_to_margin",
+    "llc_util_set_llcp_discard_enable",
+    "llc_util_update_channel_map",
+    "llc_version_rd_event_send",
+    "lldAccessAddressValid__OOZsrcZbl808Zblecontroller_u7079",
+    "lld_ch_map_ind",
+    "lld_con_param_req",
+    "lld_con_param_rsp",
+    "lld_con_update_after_param_req",
+    "lld_con_update_ind",
+    "lld_con_update_req",
+    "lld_core_reset",
+    "lld_crypt_isr",
+    "lld_evt_adv_create",
+    "lld_evt_canceled",
+    "lld_evt_channel_next",
+    "lld_evt_deffered_elt_handler",
+    "lld_evt_deffered_elt_simple_handler",
+    "lld_evt_delete_elt_push",
+    "lld_evt_delete_evt_mode_get",
+    "lld_evt_drift_compute",
+    "lld_evt_elt_defferred_get",
+    "lld_evt_elt_delete",
+    "lld_evt_elt_insert",
+    "lld_evt_end",
+    "lld_evt_end_isr",
+    "lld_evt_init",
+    "lld_evt_init_evt",
+    "lld_evt_move_to_master",
+    "lld_evt_move_to_slave",
+    "lld_evt_prevent_stop",
+    "lld_evt_restart",
+    "lld_evt_rx",
+    "lld_evt_rx_afs",
+    "lld_evt_rx_isr",
+    "lld_evt_scan_create",
+    "lld_evt_schedule",
+    "lld_evt_schedule_next",
+    "lld_evt_slave_update",
+    "lld_evt_slot_isr",
+    "lld_evt_timer_isr",
+    "lld_evt_update_create",
+    "lld_get_evt_mode",
+    "lld_get_mode",
+    "lld_master_check_increase_instant",
+    "lld_move_to_master",
+    "lld_move_to_slave",
+    "lld_pdu_adv_pack",
+    "lld_pdu_check",
+    "lld_pdu_data_send",
+    "lld_pdu_data_tx_push",
+    "lld_pdu_rx_handler",
+    "lld_pdu_tx_flush",
+    "lld_pdu_tx_loop",
+    "lld_pdu_tx_prog",
+    "lld_pdu_tx_push",
+    "lld_scan_start",
+    "lld_scan_stop",
+    "lld_set_evt_end_time",
+    "lld_sleep_enter",
+    "lld_sleep_init",
+    "lld_sleep_wakeup",
+    "lld_sleep_wakeup_end",
+    "lld_update_adv_scan_aa",
+    "lld_util_anchor_point_move",
+    "lld_util_compute_ce_max",
+    "lld_util_connection_param_set",
+    "lld_util_dle_set_cs_fields",
+    "lld_util_eff_tx_time_set",
+    "lld_util_elt_programmed",
+    "lld_util_flush_list",
+    "lld_util_freq2chnl",
+    "lld_util_get_bd_address",
+    "lld_util_get_local_offset",
+    "lld_util_get_peer_offset",
+    "lld_util_get_tx_pkt_cnt",
+    "lld_util_instant_get",
+    "lld_util_instant_ongoing",
+    "lld_util_priority_set",
+    "lld_util_priority_update",
+    "lld_util_set_bd_address",
+    "lld_wlcoex_set",
+    "llm_bad_channel_sort",
+    "llm_ble_ready",
+    "llm_common_cmd_complete_send",
+    "llm_common_cmd_status_send",
+    "llm_con_req_ind",
+    "llm_con_req_tx_cfm",
+    "llm_create_con",
+    "llm_encryption_done",
+    "llm_encryption_start",
+    "llm_end_evt_defer",
+    "llm_le_adv_report_ind",
+    "llm_ll_adv_type_get",
+    "llm_notify_adv_discarded",
+    "llm_pdu_defer",
+    "llm_set_adv_data",
+    "llm_set_adv_en",
+    "llm_set_adv_param",
+    "llm_set_scan_en",
+    "llm_set_scan_param",
+    "llm_set_scan_rsp_data",
+    "llm_util_adv_data_update",
+    "llm_util_apply_bd_addr",
+    "llm_util_bd_addr_in_wl",
+    "llm_util_bd_addr_wl_position",
+    "llm_util_bl_add",
+    "llm_util_bl_check",
+    "llm_util_bl_rem",
+    "llm_util_check_address_validity",
+    "llm_util_check_evt_mask",
+    "llm_util_check_map_validity",
+    "llm_util_get_channel_map",
+    "llm_util_get_supp_features",
+    "llm_util_set_public_addr",
+    "llm_wl_clr",
+    "llm_wl_dev_add",
+    "llm_wl_dev_add_hdl",
+    "llm_wl_dev_rem",
+    "llm_wl_dev_rem_hdl",
+    "localAddrBytes__OOZsrcZbl808Zblecontroller_u1538",
+    "paramLe16__OOZsrcZbl808Zblecontroller_u1014",
+    "pka0_write_op__OOZsrcZbl808Zblecontroller_u7574",
+    "powerOnXtalWifiPll__OOZsrcZbl808Zblecontroller_u158",
+    "prepareWirelessDomain__OOZsrcZbl808Zblecontroller_u400",
+    "programBtbleLegacyAdv__OOZsrcZbl808Zblecontroller_u1586",
+    "programNimAdvertising__OOZsrcZbl808Zblecontroller_u1618",
+    "pushBtbleAdvProgram__OOZsrcZbl808Zblecontroller_u1197",
+    "requestBtbleSwInterrupt__OOZsrcZbl808Zblecontroller_u1168",
+    "resetBtbleLinkLayerCore__OOZsrcZbl808Zblecontroller_u1268",
+    "resetNimControllerState__OOZsrcZbl808Zblecontroller_u1490",
+    "scheduleBtbleEvent__OOZsrcZbl808Zblecontroller_u1228",
+    "sec_eng_pka0_clear_int",
+    "sec_eng_pka0_clir",
+    "sec_eng_pka0_ladd",
+    "sec_eng_pka0_lcmp",
+    "sec_eng_pka0_ldiv2n",
+    "sec_eng_pka0_lmul",
+    "sec_eng_pka0_lmul2n",
+    "sec_eng_pka0_lsub",
+    "sec_eng_pka0_mexp",
+    "sec_eng_pka0_mmul",
+    "sec_eng_pka0_movdat",
+    "sec_eng_pka0_mrem",
+    "sec_eng_pka0_msub",
+    "sec_eng_pka0_pld",
+    "sec_eng_pka0_read_data",
+    "sec_eng_pka0_reset",
+    "sec_eng_pka0_wait_4_isr",
+    "sendCmdComplete2__OOZsrcZbl808Zblecontroller_u950",
+    "sendCmdCompletePayload__OOZsrcZbl808Zblecontroller_u983",
+    "sendCmdComplete__OOZsrcZbl808Zblecontroller_u910",
+    "sendCmdStatus__OOZsrcZbl808Zblecontroller_u991",
+    "sendDisconnectComplete__OOZsrcZbl808Zblecontroller_u1102",
+    "sendEncryptionChange__OOZsrcZbl808Zblecontroller_u6647",
+    "sendHandleCmdComplete__OOZsrcZbl808Zblecontroller_u6631",
+    "sendHostEvent__OOZsrcZbl808Zblecontroller_u999",
+    "sendLeConnectionComplete__OOZsrcZbl808Zblecontroller_u1035",
+    "sendLeConnectionUpdateComplete__OOZsrcZbl808Zblecontroller_u6678",
+    "sendLeMetaPayload__OOZsrcZbl808Zblecontroller_u1007",
+    "sendLePhyUpdateComplete__OOZsrcZbl808Zblecontroller_u6714",
+    "sendLeRemoteFeaturesComplete__OOZsrcZbl808Zblecontroller_u6699",
+    "sendRemoteVersionInfoComplete__OOZsrcZbl808Zblecontroller_u6663",
+    "serviceBtbleAdvRxDescriptors__OOZsrcZbl808Zblecontroller_u1239",
+    "swResetCfg0__OOZsrcZbl808Zblecontroller_u80",
+    "trace_free",
+    "trace_malloc"
+  ],
+  "functions_with_disassembly": 452,
+  "byte_identical_functions": 8,
+  "mnemonic_identical_functions": 9,
+  "nim_smaller_count": 399,
+  "severity_buckets": {
+    ">=200": 0,
+    "100-199": 1,
+    "50-99": 10,
+    "25-49": 64,
+    "10-24": 187,
+    "1-9": 137
+  },
+  "smaller_methods": [
+    {
+      "symbol": "GF_Jacobian_Point_Addition256",
+      "ref_instr": 132,
+      "nim_instr": 2,
+      "missing_instr": 130,
+      "pct_of_ref": 1.52,
+      "line": 6750,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "bigHexInversion256",
+      "ref_instr": 75,
+      "nim_instr": 6,
+      "missing_instr": 69,
+      "pct_of_ref": 8.0,
+      "line": 5083,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "ll_length_req_handler",
+      "ref_instr": 66,
+      "nim_instr": 2,
+      "missing_instr": 64,
+      "pct_of_ref": 3.03,
+      "line": 6790,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_con_move_cbk",
+      "ref_instr": 64,
+      "nim_instr": 2,
+      "missing_instr": 62,
+      "pct_of_ref": 3.12,
+      "line": 6809,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "sch_prog_push",
+      "ref_instr": 63,
+      "nim_instr": 2,
+      "missing_instr": 61,
+      "pct_of_ref": 3.17,
+      "line": 6919,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "rwip_reset",
+      "ref_instr": 84,
+      "nim_instr": 29,
+      "missing_instr": 55,
+      "pct_of_ref": 34.52,
+      "line": 5522,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "lld_per_adv_list_add",
+      "ref_instr": 56,
+      "nim_instr": 2,
+      "missing_instr": 54,
+      "pct_of_ref": 3.57,
+      "line": 6871,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_con_data_flow_set",
+      "ref_instr": 56,
+      "nim_instr": 2,
+      "missing_instr": 54,
+      "pct_of_ref": 3.57,
+      "line": 6848,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "ll_connection_update_ind_handler",
+      "ref_instr": 55,
+      "nim_instr": 2,
+      "missing_instr": 53,
+      "pct_of_ref": 3.64,
+      "line": 6785,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "ll_connection_param_req_handler",
+      "ref_instr": 55,
+      "nim_instr": 2,
+      "missing_instr": 53,
+      "pct_of_ref": 3.64,
+      "line": 6783,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "rwip_init",
+      "ref_instr": 94,
+      "nim_instr": 43,
+      "missing_instr": 51,
+      "pct_of_ref": 45.74,
+      "line": 5509,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_controller_init",
+      "ref_instr": 59,
+      "nim_instr": 12,
+      "missing_instr": 47,
+      "pct_of_ref": 20.34,
+      "line": 5338,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "ble_util_buf_init",
+      "ref_instr": 49,
+      "nim_instr": 2,
+      "missing_instr": 47,
+      "pct_of_ref": 4.08,
+      "line": 5381,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "lld_rx_timing_compute",
+      "ref_instr": 48,
+      "nim_instr": 2,
+      "missing_instr": 46,
+      "pct_of_ref": 4.17,
+      "line": 6876,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_clk_acc_modify",
+      "ref_instr": 48,
+      "nim_instr": 2,
+      "missing_instr": 46,
+      "pct_of_ref": 4.17,
+      "line": 6808,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_le_en_enc_cmd_handler",
+      "ref_instr": 73,
+      "nim_instr": 29,
+      "missing_instr": 44,
+      "pct_of_ref": 39.73,
+      "line": 6417,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "aes_k2",
+      "ref_instr": 45,
+      "nim_instr": 2,
+      "missing_instr": 43,
+      "pct_of_ref": 4.44,
+      "line": 6195,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "aes_cmac",
+      "ref_instr": 45,
+      "nim_instr": 2,
+      "missing_instr": 43,
+      "pct_of_ref": 4.44,
+      "line": 6074,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "lld_calc_aux_rx",
+      "ref_instr": 43,
+      "nim_instr": 2,
+      "missing_instr": 41,
+      "pct_of_ref": 4.65,
+      "line": 6844,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_disconnect_cmd_handler",
+      "ref_instr": 57,
+      "nim_instr": 16,
+      "missing_instr": 41,
+      "pct_of_ref": 28.07,
+      "line": 6402,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "phy_upd_proc_start",
+      "ref_instr": 40,
+      "nim_instr": 1,
+      "missing_instr": 39,
+      "pct_of_ref": 2.5,
+      "line": 5864,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "llm_ch_map_update_ind_handler",
+      "ref_instr": 41,
+      "nim_instr": 2,
+      "missing_instr": 39,
+      "pct_of_ref": 4.88,
+      "line": 6886,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_le_rem_con_param_req_reply_cmd_handler",
+      "ref_instr": 69,
+      "nim_instr": 31,
+      "missing_instr": 38,
+      "pct_of_ref": 44.93,
+      "line": 6453,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "llm_ch_map_update",
+      "ref_instr": 38,
+      "nim_instr": 2,
+      "missing_instr": 36,
+      "pct_of_ref": 5.26,
+      "line": 6885,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_vs_set_max_rx_size_and_time_cmd_handler",
+      "ref_instr": 46,
+      "nim_instr": 10,
+      "missing_instr": 36,
+      "pct_of_ref": 21.74,
+      "line": 6594,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_rf_init",
+      "ref_instr": 38,
+      "nim_instr": 2,
+      "missing_instr": 36,
+      "pct_of_ref": 5.26,
+      "line": 5479,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "llc_auth_payl_nearly_to_handler",
+      "ref_instr": 37,
+      "nim_instr": 2,
+      "missing_instr": 35,
+      "pct_of_ref": 5.41,
+      "line": 6805,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "ll_feature_rsp_handler",
+      "ref_instr": 37,
+      "nim_instr": 2,
+      "missing_instr": 35,
+      "pct_of_ref": 5.41,
+      "line": 6789,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "co_time_timer_periodic_set",
+      "ref_instr": 35,
+      "nim_instr": 1,
+      "missing_instr": 34,
+      "pct_of_ref": 2.86,
+      "line": 6249,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "llc_init_term_proc",
+      "ref_instr": 35,
+      "nim_instr": 2,
+      "missing_instr": 33,
+      "pct_of_ref": 5.71,
+      "line": 6812,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "ble_util_buf_rx_free",
+      "ref_instr": 35,
+      "nim_instr": 2,
+      "missing_instr": 33,
+      "pct_of_ref": 5.71,
+      "line": 5421,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "SubtractBigHexUint32_256",
+      "ref_instr": 35,
+      "nim_instr": 2,
+      "missing_instr": 33,
+      "pct_of_ref": 5.71,
+      "line": 6757,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "nvds_init",
+      "ref_instr": 34,
+      "nim_instr": 2,
+      "missing_instr": 32,
+      "pct_of_ref": 5.88,
+      "line": 6646,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "llc_stopped_ind_handler",
+      "ref_instr": 34,
+      "nim_instr": 2,
+      "missing_instr": 32,
+      "pct_of_ref": 5.88,
+      "line": 6834,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "ll_min_used_channels_ind_handler",
+      "ref_instr": 34,
+      "nim_instr": 2,
+      "missing_instr": 32,
+      "pct_of_ref": 5.88,
+      "line": 6792,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "co_time_timer_long_set",
+      "ref_instr": 33,
+      "nim_instr": 1,
+      "missing_instr": 32,
+      "pct_of_ref": 3.03,
+      "line": 6246,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_msg_send_basic",
+      "ref_instr": 34,
+      "nim_instr": 2,
+      "missing_instr": 32,
+      "pct_of_ref": 5.88,
+      "line": 5246,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "bt_onchiphci_hanlde_rx_acl",
+      "ref_instr": 34,
+      "nim_instr": 2,
+      "missing_instr": 32,
+      "pct_of_ref": 5.88,
+      "line": 5367,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "sch_slice_bg_remove",
+      "ref_instr": 33,
+      "nim_instr": 2,
+      "missing_instr": 31,
+      "pct_of_ref": 6.06,
+      "line": 6924,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_adv_end_ind_handler",
+      "ref_instr": 33,
+      "nim_instr": 2,
+      "missing_instr": 31,
+      "pct_of_ref": 6.06,
+      "line": 6839,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "sch_slice_fg_remove",
+      "ref_instr": 32,
+      "nim_instr": 2,
+      "missing_instr": 30,
+      "pct_of_ref": 6.25,
+      "line": 6927,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "sch_slice_bg_add",
+      "ref_instr": 32,
+      "nim_instr": 2,
+      "missing_instr": 30,
+      "pct_of_ref": 6.25,
+      "line": 6923,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_auth_payl_real_to_handler",
+      "ref_instr": 32,
+      "nim_instr": 2,
+      "missing_instr": 30,
+      "pct_of_ref": 6.25,
+      "line": 6806,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "co_time_init",
+      "ref_instr": 31,
+      "nim_instr": 1,
+      "missing_instr": 30,
+      "pct_of_ref": 3.23,
+      "line": 6234,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "SubtractFromSelfBigHexSign256",
+      "ref_instr": 32,
+      "nim_instr": 2,
+      "missing_instr": 30,
+      "pct_of_ref": 6.25,
+      "line": 6759,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "SubtractBigHexMod256",
+      "ref_instr": 32,
+      "nim_instr": 2,
+      "missing_instr": 30,
+      "pct_of_ref": 6.25,
+      "line": 6756,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "sch_arb_insert",
+      "ref_instr": 31,
+      "nim_instr": 2,
+      "missing_instr": 29,
+      "pct_of_ref": 6.45,
+      "line": 2710,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "nvds_put",
+      "ref_instr": 31,
+      "nim_instr": 2,
+      "missing_instr": 29,
+      "pct_of_ref": 6.45,
+      "line": 6659,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "llc_proc_reg",
+      "ref_instr": 31,
+      "nim_instr": 2,
+      "missing_instr": 29,
+      "pct_of_ref": 6.45,
+      "line": 6833,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "ll_terminate_ind_handler",
+      "ref_instr": 31,
+      "nim_instr": 2,
+      "missing_instr": 29,
+      "pct_of_ref": 6.45,
+      "line": 6803,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_tl_send",
+      "ref_instr": 31,
+      "nim_instr": 2,
+      "missing_instr": 29,
+      "pct_of_ref": 6.45,
+      "line": 3531,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "co_time_timer_set",
+      "ref_instr": 30,
+      "nim_instr": 1,
+      "missing_instr": 29,
+      "pct_of_ref": 3.33,
+      "line": 6243,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "aes_h9",
+      "ref_instr": 31,
+      "nim_instr": 2,
+      "missing_instr": 29,
+      "pct_of_ref": 6.45,
+      "line": 6182,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "sch_arb_event_start_isr",
+      "ref_instr": 30,
+      "nim_instr": 2,
+      "missing_instr": 28,
+      "pct_of_ref": 6.67,
+      "line": 6907,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "ll_phy_req_handler",
+      "ref_instr": 30,
+      "nim_instr": 2,
+      "missing_instr": 28,
+      "pct_of_ref": 6.67,
+      "line": 6795,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "sch_slice_fg_add",
+      "ref_instr": 29,
+      "nim_instr": 2,
+      "missing_instr": 27,
+      "pct_of_ref": 6.9,
+      "line": 6926,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "rwip_wlcoex_set",
+      "ref_instr": 29,
+      "nim_instr": 2,
+      "missing_instr": 27,
+      "pct_of_ref": 6.9,
+      "line": 5547,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "lld_rxdesc_buf_ready",
+      "ref_instr": 29,
+      "nim_instr": 2,
+      "missing_instr": 27,
+      "pct_of_ref": 6.9,
+      "line": 6877,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "flash_erase",
+      "ref_instr": 29,
+      "nim_instr": 2,
+      "missing_instr": 27,
+      "pct_of_ref": 6.9,
+      "line": 6291,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_aes_encrypt",
+      "ref_instr": 31,
+      "nim_instr": 4,
+      "missing_instr": 27,
+      "pct_of_ref": 12.9,
+      "line": 5958,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "GF_Point_Jacobian_To_Affine256",
+      "ref_instr": 28,
+      "nim_instr": 1,
+      "missing_instr": 27,
+      "pct_of_ref": 3.57,
+      "line": 5087,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "lld_con_data_tx",
+      "ref_instr": 28,
+      "nim_instr": 2,
+      "missing_instr": 26,
+      "pct_of_ref": 7.14,
+      "line": 6850,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "co_util_unpack",
+      "ref_instr": 28,
+      "nim_instr": 2,
+      "missing_instr": 26,
+      "pct_of_ref": 7.14,
+      "line": 6262,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_msg_alloc",
+      "ref_instr": 28,
+      "nim_instr": 2,
+      "missing_instr": 26,
+      "pct_of_ref": 7.14,
+      "line": 5238,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_init",
+      "ref_instr": 28,
+      "nim_instr": 2,
+      "missing_instr": 26,
+      "pct_of_ref": 7.14,
+      "line": 5209,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "aes_cmac_start",
+      "ref_instr": 28,
+      "nim_instr": 2,
+      "missing_instr": 26,
+      "pct_of_ref": 7.14,
+      "line": 6078,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "aes_cmac_continue",
+      "ref_instr": 29,
+      "nim_instr": 3,
+      "missing_instr": 26,
+      "pct_of_ref": 10.34,
+      "line": 6082,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "sch_slice_compute",
+      "ref_instr": 27,
+      "nim_instr": 2,
+      "missing_instr": 25,
+      "pct_of_ref": 7.41,
+      "line": 6925,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_per_adv_list_rem",
+      "ref_instr": 27,
+      "nim_instr": 2,
+      "missing_instr": 25,
+      "pct_of_ref": 7.41,
+      "line": 6872,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_con_enc_key_load",
+      "ref_instr": 27,
+      "nim_instr": 2,
+      "missing_instr": 25,
+      "pct_of_ref": 7.41,
+      "line": 6851,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_aa_gen",
+      "ref_instr": 61,
+      "nim_instr": 36,
+      "missing_instr": 25,
+      "pct_of_ref": 59.02,
+      "line": 6710,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "llc_op_disconnect_ind_handler",
+      "ref_instr": 27,
+      "nim_instr": 2,
+      "missing_instr": 25,
+      "pct_of_ref": 7.41,
+      "line": 6820,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "ll_version_ind_handler",
+      "ref_instr": 27,
+      "nim_instr": 2,
+      "missing_instr": 25,
+      "pct_of_ref": 7.41,
+      "line": 6804,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "co_util_pack",
+      "ref_instr": 27,
+      "nim_instr": 2,
+      "missing_instr": 25,
+      "pct_of_ref": 7.41,
+      "line": 6258,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "aes_start",
+      "ref_instr": 26,
+      "nim_instr": 1,
+      "missing_instr": 25,
+      "pct_of_ref": 3.85,
+      "line": 5952,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "specialModP256",
+      "ref_instr": 26,
+      "nim_instr": 2,
+      "missing_instr": 24,
+      "pct_of_ref": 7.69,
+      "line": 6929,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_con_tx_enc",
+      "ref_instr": 26,
+      "nim_instr": 2,
+      "missing_instr": 24,
+      "pct_of_ref": 7.69,
+      "line": 6865,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_con_rx_enc",
+      "ref_instr": 26,
+      "nim_instr": 2,
+      "missing_instr": 24,
+      "pct_of_ref": 7.69,
+      "line": 6863,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_proc_unreg",
+      "ref_instr": 25,
+      "nim_instr": 1,
+      "missing_instr": 24,
+      "pct_of_ref": 4.0,
+      "line": 5908,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_controller_deinit",
+      "ref_instr": 26,
+      "nim_instr": 2,
+      "missing_instr": 24,
+      "pct_of_ref": 7.69,
+      "line": 5342,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "nvds_get",
+      "ref_instr": 25,
+      "nim_instr": 2,
+      "missing_instr": 23,
+      "pct_of_ref": 8.0,
+      "line": 6651,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "lld_con_llcp_tx",
+      "ref_instr": 25,
+      "nim_instr": 2,
+      "missing_instr": 23,
+      "pct_of_ref": 8.0,
+      "line": 6854,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_llcp_tx_check",
+      "ref_instr": 24,
+      "nim_instr": 1,
+      "missing_instr": 23,
+      "pct_of_ref": 4.17,
+      "line": 5870,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_rd_rem_ver_info_cmd_handler",
+      "ref_instr": 51,
+      "nim_instr": 28,
+      "missing_instr": 23,
+      "pct_of_ref": 54.9,
+      "line": 6584,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_le_set_data_len_cmd_handler",
+      "ref_instr": 46,
+      "nim_instr": 23,
+      "missing_instr": 23,
+      "pct_of_ref": 50.0,
+      "line": 6562,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_acl_data_handler",
+      "ref_instr": 25,
+      "nim_instr": 2,
+      "missing_instr": 23,
+      "pct_of_ref": 8.0,
+      "line": 6766,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "MultiplyBigHexModP256",
+      "ref_instr": 25,
+      "nim_instr": 2,
+      "missing_instr": 23,
+      "pct_of_ref": 8.0,
+      "line": 6753,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "sch_arb_remove",
+      "ref_instr": 24,
+      "nim_instr": 2,
+      "missing_instr": 22,
+      "pct_of_ref": 8.33,
+      "line": 2722,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "llm_link_disc",
+      "ref_instr": 24,
+      "nim_instr": 2,
+      "missing_instr": 22,
+      "pct_of_ref": 8.33,
+      "line": 6896,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_con_param_update",
+      "ref_instr": 24,
+      "nim_instr": 2,
+      "missing_instr": 22,
+      "pct_of_ref": 8.33,
+      "line": 6858,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_adv_rand_addr_update",
+      "ref_instr": 24,
+      "nim_instr": 2,
+      "missing_instr": 22,
+      "pct_of_ref": 8.33,
+      "line": 6841,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_tl_acl_tx_data_received",
+      "ref_instr": 23,
+      "nim_instr": 1,
+      "missing_instr": 22,
+      "pct_of_ref": 4.35,
+      "line": 6634,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_msg_cmd_reject_send",
+      "ref_instr": 24,
+      "nim_instr": 2,
+      "missing_instr": 22,
+      "pct_of_ref": 8.33,
+      "line": 6311,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_le_rd_adv_ch_tx_pw_cmd_handler",
+      "ref_instr": 34,
+      "nim_instr": 12,
+      "missing_instr": 22,
+      "pct_of_ref": 35.29,
+      "line": 6491,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "dbg_platform_reset_complete",
+      "ref_instr": 23,
+      "nim_instr": 1,
+      "missing_instr": 22,
+      "pct_of_ref": 4.35,
+      "line": 5364,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "sch_slice_per_remove",
+      "ref_instr": 23,
+      "nim_instr": 2,
+      "missing_instr": 21,
+      "pct_of_ref": 8.7,
+      "line": 2736,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "sch_slice_per_add",
+      "ref_instr": 23,
+      "nim_instr": 2,
+      "missing_instr": 21,
+      "pct_of_ref": 8.7,
+      "line": 2726,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "rwip_driver_init",
+      "ref_instr": 23,
+      "nim_instr": 2,
+      "missing_instr": 21,
+      "pct_of_ref": 8.7,
+      "line": 5505,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "lld_con_data_len_update",
+      "ref_instr": 23,
+      "nim_instr": 2,
+      "missing_instr": 21,
+      "pct_of_ref": 8.7,
+      "line": 6849,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_con_current_tx_power_get",
+      "ref_instr": 24,
+      "nim_instr": 3,
+      "missing_instr": 21,
+      "pct_of_ref": 12.5,
+      "line": 6315,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "lld_adv_stop",
+      "ref_instr": 22,
+      "nim_instr": 1,
+      "missing_instr": 21,
+      "pct_of_ref": 4.55,
+      "line": 4048,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "llc_encrypt_ind_handler",
+      "ref_instr": 23,
+      "nim_instr": 2,
+      "missing_instr": 21,
+      "pct_of_ref": 8.7,
+      "line": 6811,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "ble_util_buf_adv_tx_free",
+      "ref_instr": 23,
+      "nim_instr": 2,
+      "missing_instr": 21,
+      "pct_of_ref": 8.7,
+      "line": 5397,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "GF_Jacobian_Point_Double256",
+      "ref_instr": 23,
+      "nim_instr": 2,
+      "missing_instr": 21,
+      "pct_of_ref": 8.7,
+      "line": 6751,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "sch_plan_set",
+      "ref_instr": 22,
+      "nim_instr": 2,
+      "missing_instr": 20,
+      "pct_of_ref": 9.09,
+      "line": 6914,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "rwip_timer_co_set",
+      "ref_instr": 21,
+      "nim_instr": 1,
+      "missing_instr": 20,
+      "pct_of_ref": 4.76,
+      "line": 5562,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "rwip_bts_to_bt_time",
+      "ref_instr": 22,
+      "nim_instr": 2,
+      "missing_instr": 20,
+      "pct_of_ref": 9.09,
+      "line": 5569,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "lld_phy_upd_cfm_handler",
+      "ref_instr": 22,
+      "nim_instr": 2,
+      "missing_instr": 20,
+      "pct_of_ref": 9.09,
+      "line": 6873,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_ch_map_upd_cfm_handler",
+      "ref_instr": 22,
+      "nim_instr": 2,
+      "missing_instr": 20,
+      "pct_of_ref": 9.09,
+      "line": 6846,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_acl_tx_cfm_handler",
+      "ref_instr": 22,
+      "nim_instr": 2,
+      "missing_instr": 20,
+      "pct_of_ref": 9.09,
+      "line": 6836,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "ll_connection_param_rsp_handler",
+      "ref_instr": 22,
+      "nim_instr": 2,
+      "missing_instr": 20,
+      "pct_of_ref": 9.09,
+      "line": 6784,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "sch_prog_end_isr",
+      "ref_instr": 21,
+      "nim_instr": 2,
+      "missing_instr": 19,
+      "pct_of_ref": 9.52,
+      "line": 6916,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "platform_reset",
+      "ref_instr": 21,
+      "nim_instr": 2,
+      "missing_instr": 19,
+      "pct_of_ref": 9.52,
+      "line": 4868,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "nvds_lock",
+      "ref_instr": 21,
+      "nim_instr": 2,
+      "missing_instr": 19,
+      "pct_of_ref": 9.52,
+      "line": 6670,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "nvds_del",
+      "ref_instr": 21,
+      "nim_instr": 2,
+      "missing_instr": 19,
+      "pct_of_ref": 9.52,
+      "line": 6666,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "lld_white_list_rem",
+      "ref_instr": 21,
+      "nim_instr": 2,
+      "missing_instr": 19,
+      "pct_of_ref": 9.52,
+      "line": 6880,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_con_time_get",
+      "ref_instr": 21,
+      "nim_instr": 2,
+      "missing_instr": 19,
+      "pct_of_ref": 9.52,
+      "line": 6864,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_con_pref_slave_evt_dur_set",
+      "ref_instr": 21,
+      "nim_instr": 2,
+      "missing_instr": 19,
+      "pct_of_ref": 9.52,
+      "line": 6861,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_con_phys_update",
+      "ref_instr": 21,
+      "nim_instr": 2,
+      "missing_instr": 19,
+      "pct_of_ref": 9.52,
+      "line": 6860,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "co_djob_unreg",
+      "ref_instr": 21,
+      "nim_instr": 2,
+      "missing_instr": 19,
+      "pct_of_ref": 9.52,
+      "line": 6764,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "btble_ke_malloc",
+      "ref_instr": 21,
+      "nim_instr": 2,
+      "missing_instr": 19,
+      "pct_of_ref": 9.52,
+      "line": 5215,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "ble_util_buf_llcp_tx_free",
+      "ref_instr": 21,
+      "nim_instr": 2,
+      "missing_instr": 19,
+      "pct_of_ref": 9.52,
+      "line": 5408,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "ble_util_buf_acl_tx_free",
+      "ref_instr": 21,
+      "nim_instr": 2,
+      "missing_instr": 19,
+      "pct_of_ref": 9.52,
+      "line": 5390,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "sch_alarm_set",
+      "ref_instr": 20,
+      "nim_instr": 2,
+      "missing_instr": 18,
+      "pct_of_ref": 10.0,
+      "line": 6905,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "rwip_timer_arb_set",
+      "ref_instr": 19,
+      "nim_instr": 1,
+      "missing_instr": 18,
+      "pct_of_ref": 5.26,
+      "line": 1032,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "rwip_timer_alarm_set",
+      "ref_instr": 19,
+      "nim_instr": 1,
+      "missing_instr": 18,
+      "pct_of_ref": 5.26,
+      "line": 5553,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "lld_llcp_tx_cfm_handler",
+      "ref_instr": 20,
+      "nim_instr": 2,
+      "missing_instr": 18,
+      "pct_of_ref": 10.0,
+      "line": 6870,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_proc_timer_pause_set",
+      "ref_instr": 19,
+      "nim_instr": 1,
+      "missing_instr": 18,
+      "pct_of_ref": 5.26,
+      "line": 5897,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "ll_length_rsp_handler",
+      "ref_instr": 20,
+      "nim_instr": 2,
+      "missing_instr": 18,
+      "pct_of_ref": 10.0,
+      "line": 6791,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_send_2_host",
+      "ref_instr": 20,
+      "nim_instr": 2,
+      "missing_instr": 18,
+      "pct_of_ref": 10.0,
+      "line": 3587,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "flash_read",
+      "ref_instr": 29,
+      "nim_instr": 11,
+      "missing_instr": 18,
+      "pct_of_ref": 37.93,
+      "line": 6277,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "ecc_generate_key256",
+      "ref_instr": 22,
+      "nim_instr": 4,
+      "missing_instr": 18,
+      "pct_of_ref": 18.18,
+      "line": 5058,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_msg_forward_new_id",
+      "ref_instr": 20,
+      "nim_instr": 2,
+      "missing_instr": 18,
+      "pct_of_ref": 10.0,
+      "line": 5276,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "bt_onchiphci_send",
+      "ref_instr": 24,
+      "nim_instr": 6,
+      "missing_instr": 18,
+      "pct_of_ref": 25.0,
+      "line": 5018,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "rwip_channel_assess_ble",
+      "ref_instr": 18,
+      "nim_instr": 1,
+      "missing_instr": 17,
+      "pct_of_ref": 5.56,
+      "line": 937,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "lld_adv_start",
+      "ref_instr": 18,
+      "nim_instr": 1,
+      "missing_instr": 17,
+      "pct_of_ref": 5.56,
+      "line": 4045,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "lld_acl_rx_ind_handler",
+      "ref_instr": 19,
+      "nim_instr": 2,
+      "missing_instr": 17,
+      "pct_of_ref": 10.53,
+      "line": 6835,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_op_feats_exch_ind_handler",
+      "ref_instr": 19,
+      "nim_instr": 2,
+      "missing_instr": 17,
+      "pct_of_ref": 10.53,
+      "line": 6823,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_ll_reject_ind_pdu_send",
+      "ref_instr": 19,
+      "nim_instr": 2,
+      "missing_instr": 17,
+      "pct_of_ref": 10.53,
+      "line": 6814,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_cmd_cmp_send",
+      "ref_instr": 21,
+      "nim_instr": 4,
+      "missing_instr": 17,
+      "pct_of_ref": 19.05,
+      "line": 5873,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "ll_phy_update_ind_handler",
+      "ref_instr": 19,
+      "nim_instr": 2,
+      "missing_instr": 17,
+      "pct_of_ref": 10.53,
+      "line": 6797,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "ll_clk_acc_rsp_handler",
+      "ref_instr": 19,
+      "nim_instr": 2,
+      "missing_instr": 17,
+      "pct_of_ref": 10.53,
+      "line": 6782,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_build_le_evt",
+      "ref_instr": 20,
+      "nim_instr": 3,
+      "missing_instr": 17,
+      "pct_of_ref": 15.0,
+      "line": 3605,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "flash_init",
+      "ref_instr": 18,
+      "nim_instr": 1,
+      "missing_instr": 17,
+      "pct_of_ref": 5.56,
+      "line": 6266,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "co_time_get",
+      "ref_instr": 19,
+      "nim_instr": 2,
+      "missing_instr": 17,
+      "pct_of_ref": 10.53,
+      "line": 6231,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_msg_forward",
+      "ref_instr": 19,
+      "nim_instr": 2,
+      "missing_instr": 17,
+      "pct_of_ref": 10.53,
+      "line": 5272,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "rwip_aes_encrypt",
+      "ref_instr": 79,
+      "nim_instr": 63,
+      "missing_instr": 16,
+      "pct_of_ref": 79.75,
+      "line": 5796,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "lld_scan_req_ind_handler",
+      "ref_instr": 18,
+      "nim_instr": 2,
+      "missing_instr": 16,
+      "pct_of_ref": 11.11,
+      "line": 6878,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_llcp_rx_ind_handler",
+      "ref_instr": 18,
+      "nim_instr": 2,
+      "missing_instr": 16,
+      "pct_of_ref": 11.11,
+      "line": 6869,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_con_init",
+      "ref_instr": 18,
+      "nim_instr": 2,
+      "missing_instr": 16,
+      "pct_of_ref": 11.11,
+      "line": 6853,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_adv_restart",
+      "ref_instr": 18,
+      "nim_instr": 2,
+      "missing_instr": 16,
+      "pct_of_ref": 11.11,
+      "line": 6842,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_op_phy_upd_ind_handler",
+      "ref_instr": 18,
+      "nim_instr": 2,
+      "missing_instr": 16,
+      "pct_of_ref": 11.11,
+      "line": 6825,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_op_con_upd_ind_handler",
+      "ref_instr": 18,
+      "nim_instr": 2,
+      "missing_instr": 16,
+      "pct_of_ref": 11.11,
+      "line": 6819,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_le_ping_set",
+      "ref_instr": 17,
+      "nim_instr": 1,
+      "missing_instr": 16,
+      "pct_of_ref": 5.88,
+      "line": 5860,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "ll_enc_req_handler",
+      "ref_instr": 18,
+      "nim_instr": 2,
+      "missing_instr": 16,
+      "pct_of_ref": 11.11,
+      "line": 6786,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_tl_cmd_received",
+      "ref_instr": 18,
+      "nim_instr": 2,
+      "missing_instr": 16,
+      "pct_of_ref": 11.11,
+      "line": 6643,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "flash_identify",
+      "ref_instr": 20,
+      "nim_instr": 4,
+      "missing_instr": 16,
+      "pct_of_ref": 20.0,
+      "line": 6269,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_check_malloc",
+      "ref_instr": 18,
+      "nim_instr": 2,
+      "missing_instr": 16,
+      "pct_of_ref": 11.11,
+      "line": 5222,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "aes_alloc",
+      "ref_instr": 20,
+      "nim_instr": 4,
+      "missing_instr": 16,
+      "pct_of_ref": 20.0,
+      "line": 5912,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "BTBLE_ROM_hook_init",
+      "ref_instr": 17,
+      "nim_instr": 1,
+      "missing_instr": 16,
+      "pct_of_ref": 5.88,
+      "line": 5361,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "rwip_isr",
+      "ref_instr": 17,
+      "nim_instr": 2,
+      "missing_instr": 15,
+      "pct_of_ref": 11.76,
+      "line": 5532,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "llm_cmd_stat_send",
+      "ref_instr": 17,
+      "nim_instr": 2,
+      "missing_instr": 15,
+      "pct_of_ref": 11.76,
+      "line": 6889,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llm_cmd_cmp_send",
+      "ref_instr": 17,
+      "nim_instr": 2,
+      "missing_instr": 15,
+      "pct_of_ref": 11.76,
+      "line": 6888,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_con_tx_len_update_for_rate",
+      "ref_instr": 17,
+      "nim_instr": 2,
+      "missing_instr": 15,
+      "pct_of_ref": 11.76,
+      "line": 6867,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_role_get",
+      "ref_instr": 17,
+      "nim_instr": 2,
+      "missing_instr": 15,
+      "pct_of_ref": 11.76,
+      "line": 5881,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "llc_op_ver_exch_ind_handler",
+      "ref_instr": 17,
+      "nim_instr": 2,
+      "missing_instr": 15,
+      "pct_of_ref": 11.76,
+      "line": 6826,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_op_dl_upd_ind_handler",
+      "ref_instr": 17,
+      "nim_instr": 2,
+      "missing_instr": 15,
+      "pct_of_ref": 11.76,
+      "line": 6821,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_op_ch_map_upd_ind_handler",
+      "ref_instr": 17,
+      "nim_instr": 2,
+      "missing_instr": 15,
+      "pct_of_ref": 11.76,
+      "line": 6817,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "ll_enc_rsp_handler",
+      "ref_instr": 17,
+      "nim_instr": 2,
+      "missing_instr": 15,
+      "pct_of_ref": 11.76,
+      "line": 6787,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_wr_auth_payl_to_cmd_handler",
+      "ref_instr": 39,
+      "nim_instr": 24,
+      "missing_instr": 15,
+      "pct_of_ref": 61.54,
+      "line": 6615,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_tl_acl_tx_data_alloc",
+      "ref_instr": 19,
+      "nim_instr": 4,
+      "missing_instr": 15,
+      "pct_of_ref": 21.05,
+      "line": 6629,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_le_rem_con_param_req_neg_reply_cmd_handler",
+      "ref_instr": 17,
+      "nim_instr": 2,
+      "missing_instr": 15,
+      "pct_of_ref": 11.76,
+      "line": 6463,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_msg_send",
+      "ref_instr": 17,
+      "nim_instr": 2,
+      "missing_instr": 15,
+      "pct_of_ref": 11.76,
+      "line": 5243,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_dma_isr_handler",
+      "ref_instr": 16,
+      "nim_instr": 1,
+      "missing_instr": 15,
+      "pct_of_ref": 6.25,
+      "line": 6225,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "aes_h8",
+      "ref_instr": 50,
+      "nim_instr": 35,
+      "missing_instr": 15,
+      "pct_of_ref": 70.0,
+      "line": 6175,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "MultiplyByU32ModP256",
+      "ref_instr": 17,
+      "nim_instr": 2,
+      "missing_instr": 15,
+      "pct_of_ref": 11.76,
+      "line": 6754,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "AddPdiv2_256",
+      "ref_instr": 17,
+      "nim_instr": 2,
+      "missing_instr": 15,
+      "pct_of_ref": 11.76,
+      "line": 6749,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "rw_main_task_post_from_fw",
+      "ref_instr": 16,
+      "nim_instr": 2,
+      "missing_instr": 14,
+      "pct_of_ref": 12.5,
+      "line": 6683,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "lld_rxdesc_free",
+      "ref_instr": 15,
+      "nim_instr": 1,
+      "missing_instr": 14,
+      "pct_of_ref": 6.67,
+      "line": 2689,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "lld_rxdesc_check",
+      "ref_instr": 16,
+      "nim_instr": 2,
+      "missing_instr": 14,
+      "pct_of_ref": 12.5,
+      "line": 2651,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "lld_con_stop",
+      "ref_instr": 15,
+      "nim_instr": 1,
+      "missing_instr": 14,
+      "pct_of_ref": 6.67,
+      "line": 4060,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "lld_con_start",
+      "ref_instr": 15,
+      "nim_instr": 1,
+      "missing_instr": 14,
+      "pct_of_ref": 6.67,
+      "line": 4057,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "lld_con_param_upd_cfm_handler",
+      "ref_instr": 16,
+      "nim_instr": 2,
+      "missing_instr": 14,
+      "pct_of_ref": 12.5,
+      "line": 6857,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_adv_init",
+      "ref_instr": 16,
+      "nim_instr": 2,
+      "missing_instr": 14,
+      "pct_of_ref": 12.5,
+      "line": 6840,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_adv_duration_update",
+      "ref_instr": 16,
+      "nim_instr": 2,
+      "missing_instr": 14,
+      "pct_of_ref": 12.5,
+      "line": 6838,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_llcp_send",
+      "ref_instr": 16,
+      "nim_instr": 2,
+      "missing_instr": 14,
+      "pct_of_ref": 12.5,
+      "line": 6815,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_cleanup",
+      "ref_instr": 16,
+      "nim_instr": 2,
+      "missing_instr": 14,
+      "pct_of_ref": 12.5,
+      "line": 6807,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "ll_slave_feature_req_handler",
+      "ref_instr": 16,
+      "nim_instr": 2,
+      "missing_instr": 14,
+      "pct_of_ref": 12.5,
+      "line": 6800,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "ll_phy_rsp_handler",
+      "ref_instr": 16,
+      "nim_instr": 2,
+      "missing_instr": 14,
+      "pct_of_ref": 12.5,
+      "line": 6796,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "ll_feature_req_handler",
+      "ref_instr": 16,
+      "nim_instr": 2,
+      "missing_instr": 14,
+      "pct_of_ref": 12.5,
+      "line": 6788,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_tl_init",
+      "ref_instr": 15,
+      "nim_instr": 1,
+      "missing_instr": 14,
+      "pct_of_ref": 6.67,
+      "line": 3527,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "co_time_compensate",
+      "ref_instr": 15,
+      "nim_instr": 1,
+      "missing_instr": 14,
+      "pct_of_ref": 6.67,
+      "line": 6237,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_mem_is_empty",
+      "ref_instr": 16,
+      "nim_instr": 2,
+      "missing_instr": 14,
+      "pct_of_ref": 12.5,
+      "line": 5235,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_mem_init",
+      "ref_instr": 21,
+      "nim_instr": 7,
+      "missing_instr": 14,
+      "pct_of_ref": 33.33,
+      "line": 5228,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "sch_plan_req",
+      "ref_instr": 15,
+      "nim_instr": 2,
+      "missing_instr": 13,
+      "pct_of_ref": 13.33,
+      "line": 6913,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "sch_alarm_timer_isr",
+      "ref_instr": 15,
+      "nim_instr": 2,
+      "missing_instr": 13,
+      "pct_of_ref": 13.33,
+      "line": 6906,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "sch_alarm_clear",
+      "ref_instr": 15,
+      "nim_instr": 2,
+      "missing_instr": 13,
+      "pct_of_ref": 13.33,
+      "line": 6903,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llm_is_dev_connected",
+      "ref_instr": 15,
+      "nim_instr": 2,
+      "missing_instr": 13,
+      "pct_of_ref": 13.33,
+      "line": 6894,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_proc_timer_set",
+      "ref_instr": 14,
+      "nim_instr": 1,
+      "missing_instr": 13,
+      "pct_of_ref": 7.14,
+      "line": 5902,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "llc_op_encrypt_ind_handler",
+      "ref_instr": 15,
+      "nim_instr": 2,
+      "missing_instr": 13,
+      "pct_of_ref": 13.33,
+      "line": 6822,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_llcp_state_set",
+      "ref_instr": 15,
+      "nim_instr": 2,
+      "missing_instr": 13,
+      "pct_of_ref": 13.33,
+      "line": 6816,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_le_ping_restart",
+      "ref_instr": 15,
+      "nim_instr": 2,
+      "missing_instr": 13,
+      "pct_of_ref": 13.33,
+      "line": 6813,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_cmd_stat_send",
+      "ref_instr": 17,
+      "nim_instr": 4,
+      "missing_instr": 13,
+      "pct_of_ref": 23.53,
+      "line": 5877,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "ll_start_enc_rsp_handler",
+      "ref_instr": 15,
+      "nim_instr": 2,
+      "missing_instr": 13,
+      "pct_of_ref": 13.33,
+      "line": 6802,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "ll_start_enc_req_handler",
+      "ref_instr": 15,
+      "nim_instr": 2,
+      "missing_instr": 13,
+      "pct_of_ref": 13.33,
+      "line": 6801,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_send_2_controller",
+      "ref_instr": 15,
+      "nim_instr": 2,
+      "missing_instr": 13,
+      "pct_of_ref": 13.33,
+      "line": 3584,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_le_set_phy_cmd_handler",
+      "ref_instr": 43,
+      "nim_instr": 30,
+      "missing_instr": 13,
+      "pct_of_ref": 69.77,
+      "line": 6482,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "dl_upd_proc_start",
+      "ref_instr": 14,
+      "nim_instr": 1,
+      "missing_instr": 13,
+      "pct_of_ref": 7.14,
+      "line": 5867,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_task_init",
+      "ref_instr": 15,
+      "nim_instr": 2,
+      "missing_instr": 13,
+      "pct_of_ref": 13.33,
+      "line": 5307,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_free",
+      "ref_instr": 15,
+      "nim_instr": 2,
+      "missing_instr": 13,
+      "pct_of_ref": 13.33,
+      "line": 5219,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "sch_prog_skip_isr",
+      "ref_instr": 14,
+      "nim_instr": 2,
+      "missing_instr": 12,
+      "pct_of_ref": 14.29,
+      "line": 6921,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "sch_plan_shift",
+      "ref_instr": 14,
+      "nim_instr": 2,
+      "missing_instr": 12,
+      "pct_of_ref": 14.29,
+      "line": 6915,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "rwip_sw_int_req",
+      "ref_instr": 14,
+      "nim_instr": 2,
+      "missing_instr": 12,
+      "pct_of_ref": 14.29,
+      "line": 1053,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "rwip_bt_time_to_bts",
+      "ref_instr": 20,
+      "nim_instr": 8,
+      "missing_instr": 12,
+      "pct_of_ref": 40.0,
+      "line": 5565,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "rw_main_task_post",
+      "ref_instr": 14,
+      "nim_instr": 2,
+      "missing_instr": 12,
+      "pct_of_ref": 14.29,
+      "line": 6680,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "lld_con_offset_upd_ind_handler",
+      "ref_instr": 14,
+      "nim_instr": 2,
+      "missing_instr": 12,
+      "pct_of_ref": 14.29,
+      "line": 6856,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_proc_collision_check",
+      "ref_instr": 14,
+      "nim_instr": 2,
+      "missing_instr": 12,
+      "pct_of_ref": 14.29,
+      "line": 6827,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_disconnect",
+      "ref_instr": 14,
+      "nim_instr": 2,
+      "missing_instr": 12,
+      "pct_of_ref": 14.29,
+      "line": 6810,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "ll_ping_rsp_handler",
+      "ref_instr": 14,
+      "nim_instr": 2,
+      "missing_instr": 12,
+      "pct_of_ref": 14.29,
+      "line": 6799,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "ll_clk_acc_req_handler",
+      "ref_instr": 14,
+      "nim_instr": 2,
+      "missing_instr": 12,
+      "pct_of_ref": 14.29,
+      "line": 6781,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_build_acl_data",
+      "ref_instr": 14,
+      "nim_instr": 2,
+      "missing_instr": 12,
+      "pct_of_ref": 14.29,
+      "line": 5377,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btblecontroller_main",
+      "ref_instr": 14,
+      "nim_instr": 2,
+      "missing_instr": 12,
+      "pct_of_ref": 14.29,
+      "line": 5345,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_timer_set",
+      "ref_instr": 14,
+      "nim_instr": 2,
+      "missing_instr": 12,
+      "pct_of_ref": 14.29,
+      "line": 5334,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_queue_insert",
+      "ref_instr": 14,
+      "nim_instr": 2,
+      "missing_instr": 12,
+      "pct_of_ref": 14.29,
+      "line": 5284,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_queue_extract",
+      "ref_instr": 14,
+      "nim_instr": 2,
+      "missing_instr": 12,
+      "pct_of_ref": 14.29,
+      "line": 5280,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_aes_init",
+      "ref_instr": 13,
+      "nim_instr": 1,
+      "missing_instr": 12,
+      "pct_of_ref": 7.69,
+      "line": 5955,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "ble_util_buf_llcp_tx_alloc",
+      "ref_instr": 14,
+      "nim_instr": 2,
+      "missing_instr": 12,
+      "pct_of_ref": 14.29,
+      "line": 5405,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "rwip_rand_init",
+      "ref_instr": 12,
+      "nim_instr": 1,
+      "missing_instr": 11,
+      "pct_of_ref": 8.33,
+      "line": 5541,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "rw_main_task_post_from_isr",
+      "ref_instr": 13,
+      "nim_instr": 2,
+      "missing_instr": 11,
+      "pct_of_ref": 15.38,
+      "line": 6686,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "llm_dev_list_search",
+      "ref_instr": 13,
+      "nim_instr": 2,
+      "missing_instr": 11,
+      "pct_of_ref": 15.38,
+      "line": 6891,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_con_tx_len_update_for_intv",
+      "ref_instr": 13,
+      "nim_instr": 2,
+      "missing_instr": 11,
+      "pct_of_ref": 15.38,
+      "line": 6866,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_adv_scan_rsp_data_update",
+      "ref_instr": 13,
+      "nim_instr": 2,
+      "missing_instr": 11,
+      "pct_of_ref": 15.38,
+      "line": 6843,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_adv_adv_data_update",
+      "ref_instr": 13,
+      "nim_instr": 2,
+      "missing_instr": 11,
+      "pct_of_ref": 15.38,
+      "line": 6837,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_start",
+      "ref_instr": 12,
+      "nim_instr": 1,
+      "missing_instr": 11,
+      "pct_of_ref": 8.33,
+      "line": 3697,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "ll_channel_map_ind_handler",
+      "ref_instr": 13,
+      "nim_instr": 2,
+      "missing_instr": 11,
+      "pct_of_ref": 15.38,
+      "line": 6780,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_rd_tx_pwr_lvl_cmd_handler",
+      "ref_instr": 34,
+      "nim_instr": 23,
+      "missing_instr": 11,
+      "pct_of_ref": 67.65,
+      "line": 6390,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_msg_evt_pkupk",
+      "ref_instr": 13,
+      "nim_instr": 2,
+      "missing_instr": 11,
+      "pct_of_ref": 15.38,
+      "line": 6776,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_msg_cmd_pkupk",
+      "ref_instr": 13,
+      "nim_instr": 2,
+      "missing_instr": 11,
+      "pct_of_ref": 15.38,
+      "line": 6771,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_msg_cmd_cmp_pkupk",
+      "ref_instr": 13,
+      "nim_instr": 2,
+      "missing_instr": 11,
+      "pct_of_ref": 15.38,
+      "line": 6769,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "ecc_gen_new_secret_key",
+      "ref_instr": 12,
+      "nim_instr": 1,
+      "missing_instr": 11,
+      "pct_of_ref": 8.33,
+      "line": 5068,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_task_msg_flush",
+      "ref_instr": 13,
+      "nim_instr": 2,
+      "missing_instr": 11,
+      "pct_of_ref": 15.38,
+      "line": 5310,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_task_check",
+      "ref_instr": 13,
+      "nim_instr": 2,
+      "missing_instr": 11,
+      "pct_of_ref": 15.38,
+      "line": 5297,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_state_get",
+      "ref_instr": 13,
+      "nim_instr": 2,
+      "missing_instr": 11,
+      "pct_of_ref": 15.38,
+      "line": 5294,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "ble_util_buf_adv_tx_alloc",
+      "ref_instr": 13,
+      "nim_instr": 2,
+      "missing_instr": 11,
+      "pct_of_ref": 15.38,
+      "line": 5394,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "aes_ccm",
+      "ref_instr": 42,
+      "nim_instr": 31,
+      "missing_instr": 11,
+      "pct_of_ref": 73.81,
+      "line": 6061,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "sch_prog_fifo_isr",
+      "ref_instr": 12,
+      "nim_instr": 2,
+      "missing_instr": 10,
+      "pct_of_ref": 16.67,
+      "line": 6917,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_disc_ind_handler",
+      "ref_instr": 12,
+      "nim_instr": 2,
+      "missing_instr": 10,
+      "pct_of_ref": 16.67,
+      "line": 6868,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_con_pref_slave_latency_set",
+      "ref_instr": 12,
+      "nim_instr": 2,
+      "missing_instr": 10,
+      "pct_of_ref": 16.67,
+      "line": 6862,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_con_ch_map_update",
+      "ref_instr": 12,
+      "nim_instr": 2,
+      "missing_instr": 10,
+      "pct_of_ref": 16.67,
+      "line": 6847,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_proc_err_ind",
+      "ref_instr": 12,
+      "nim_instr": 2,
+      "missing_instr": 10,
+      "pct_of_ref": 16.67,
+      "line": 6828,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_op_le_ping_ind_handler",
+      "ref_instr": 12,
+      "nim_instr": 2,
+      "missing_instr": 10,
+      "pct_of_ref": 16.67,
+      "line": 6824,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_op_clk_acc_ind_handler",
+      "ref_instr": 12,
+      "nim_instr": 2,
+      "missing_instr": 10,
+      "pct_of_ref": 16.67,
+      "line": 6818,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "ll_ping_req_handler",
+      "ref_instr": 12,
+      "nim_instr": 2,
+      "missing_instr": 10,
+      "pct_of_ref": 16.67,
+      "line": 6798,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_msg_cmd_desc_get",
+      "ref_instr": 12,
+      "nim_instr": 2,
+      "missing_instr": 10,
+      "pct_of_ref": 16.67,
+      "line": 6770,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_build_cc_evt",
+      "ref_instr": 13,
+      "nim_instr": 3,
+      "missing_instr": 10,
+      "pct_of_ref": 23.08,
+      "line": 3608,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "flash_write",
+      "ref_instr": 12,
+      "nim_instr": 2,
+      "missing_instr": 10,
+      "pct_of_ref": 16.67,
+      "line": 6284,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "ecc_gen_new_public_key",
+      "ref_instr": 11,
+      "nim_instr": 1,
+      "missing_instr": 10,
+      "pct_of_ref": 9.09,
+      "line": 5065,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_state_set",
+      "ref_instr": 12,
+      "nim_instr": 2,
+      "missing_instr": 10,
+      "pct_of_ref": 16.67,
+      "line": 5291,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_event_schedule",
+      "ref_instr": 12,
+      "nim_instr": 2,
+      "missing_instr": 10,
+      "pct_of_ref": 16.67,
+      "line": 5203,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_event_clear",
+      "ref_instr": 12,
+      "nim_instr": 2,
+      "missing_instr": 10,
+      "pct_of_ref": 16.67,
+      "line": 5188,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "ble_util_buf_acl_tx_alloc",
+      "ref_instr": 13,
+      "nim_instr": 3,
+      "missing_instr": 10,
+      "pct_of_ref": 23.08,
+      "line": 5384,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "aes_result_handler",
+      "ref_instr": 22,
+      "nim_instr": 12,
+      "missing_instr": 10,
+      "pct_of_ref": 54.55,
+      "line": 5924,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "rwble_init",
+      "ref_instr": 11,
+      "nim_instr": 2,
+      "missing_instr": 9,
+      "pct_of_ref": 18.18,
+      "line": 5816,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "llm_clk_acc_set",
+      "ref_instr": 11,
+      "nim_instr": 2,
+      "missing_instr": 9,
+      "pct_of_ref": 18.18,
+      "line": 6887,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_con_peer_sca_set",
+      "ref_instr": 11,
+      "nim_instr": 2,
+      "missing_instr": 9,
+      "pct_of_ref": 18.18,
+      "line": 6859,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_con_offset_get",
+      "ref_instr": 11,
+      "nim_instr": 2,
+      "missing_instr": 9,
+      "pct_of_ref": 18.18,
+      "line": 6855,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "ll_pause_enc_rsp_handler",
+      "ref_instr": 11,
+      "nim_instr": 2,
+      "missing_instr": 9,
+      "pct_of_ref": 18.18,
+      "line": 6794,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "ll_pause_enc_req_handler",
+      "ref_instr": 11,
+      "nim_instr": 2,
+      "missing_instr": 9,
+      "pct_of_ref": 18.18,
+      "line": 6793,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_tl_cmd_get_max_param_size",
+      "ref_instr": 11,
+      "nim_instr": 2,
+      "missing_instr": 9,
+      "pct_of_ref": 18.18,
+      "line": 6640,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "co_djob_initialize",
+      "ref_instr": 11,
+      "nim_instr": 2,
+      "missing_instr": 9,
+      "pct_of_ref": 18.18,
+      "line": 6761,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "btble_ke_task_create",
+      "ref_instr": 11,
+      "nim_instr": 2,
+      "missing_instr": 9,
+      "pct_of_ref": 18.18,
+      "line": 5300,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "ble_util_buf_elt_rx_get",
+      "ref_instr": 11,
+      "nim_instr": 2,
+      "missing_instr": 9,
+      "pct_of_ref": 18.18,
+      "line": 5401,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "sch_prog_tx_isr",
+      "ref_instr": 10,
+      "nim_instr": 2,
+      "missing_instr": 8,
+      "pct_of_ref": 20.0,
+      "line": 6922,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "sch_prog_rx_isr",
+      "ref_instr": 10,
+      "nim_instr": 2,
+      "missing_instr": 8,
+      "pct_of_ref": 20.0,
+      "line": 6920,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llm_per_adv_chain_dur",
+      "ref_instr": 10,
+      "nim_instr": 2,
+      "missing_instr": 8,
+      "pct_of_ref": 20.0,
+      "line": 6898,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_vs_set_pref_slave_evt_dur_cmd_handler",
+      "ref_instr": 18,
+      "nim_instr": 10,
+      "missing_instr": 8,
+      "pct_of_ref": 55.56,
+      "line": 6601,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_evt_mask_set",
+      "ref_instr": 14,
+      "nim_instr": 6,
+      "missing_instr": 8,
+      "pct_of_ref": 42.86,
+      "line": 3558,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "ecc_abort_key256_generation",
+      "ref_instr": 11,
+      "nim_instr": 3,
+      "missing_instr": 8,
+      "pct_of_ref": 27.27,
+      "line": 5062,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_task_delete",
+      "ref_instr": 10,
+      "nim_instr": 2,
+      "missing_instr": 8,
+      "pct_of_ref": 20.0,
+      "line": 5304,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_event_get",
+      "ref_instr": 10,
+      "nim_instr": 2,
+      "missing_instr": 8,
+      "pct_of_ref": 20.0,
+      "line": 5194,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "ble_util_buf_acl_tx_elt_get",
+      "ref_instr": 9,
+      "nim_instr": 1,
+      "missing_instr": 8,
+      "pct_of_ref": 11.11,
+      "line": 5387,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "AddP256",
+      "ref_instr": 10,
+      "nim_instr": 2,
+      "missing_instr": 8,
+      "pct_of_ref": 20.0,
+      "line": 6748,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llm_le_evt_mask_check",
+      "ref_instr": 9,
+      "nim_instr": 2,
+      "missing_instr": 7,
+      "pct_of_ref": 22.22,
+      "line": 6895,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llm_activity_free_set",
+      "ref_instr": 9,
+      "nim_instr": 2,
+      "missing_instr": 7,
+      "pct_of_ref": 22.22,
+      "line": 6882,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llm_activity_free_get",
+      "ref_instr": 9,
+      "nim_instr": 2,
+      "missing_instr": 7,
+      "pct_of_ref": 22.22,
+      "line": 6881,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_read_clock",
+      "ref_instr": 9,
+      "nim_instr": 2,
+      "missing_instr": 7,
+      "pct_of_ref": 22.22,
+      "line": 927,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_command_llm_handler",
+      "ref_instr": 9,
+      "nim_instr": 2,
+      "missing_instr": 7,
+      "pct_of_ref": 22.22,
+      "line": 6768,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "btble_ke_event_set",
+      "ref_instr": 9,
+      "nim_instr": 2,
+      "missing_instr": 7,
+      "pct_of_ref": 22.22,
+      "line": 5206,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_co_list_merge",
+      "ref_instr": 9,
+      "nim_instr": 2,
+      "missing_instr": 7,
+      "pct_of_ref": 22.22,
+      "line": 5132,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "ble_util_buf_rx_alloc",
+      "ref_instr": 9,
+      "nim_instr": 2,
+      "missing_instr": 7,
+      "pct_of_ref": 22.22,
+      "line": 5418,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "AddBigHexModP256",
+      "ref_instr": 9,
+      "nim_instr": 2,
+      "missing_instr": 7,
+      "pct_of_ref": 22.22,
+      "line": 6747,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "sch_arb_sw_isr",
+      "ref_instr": 8,
+      "nim_instr": 2,
+      "missing_instr": 6,
+      "pct_of_ref": 25.0,
+      "line": 6909,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "rwip_current_drift_get",
+      "ref_instr": 8,
+      "nim_instr": 2,
+      "missing_instr": 6,
+      "pct_of_ref": 25.0,
+      "line": 930,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "lld_rpa_renew",
+      "ref_instr": 8,
+      "nim_instr": 2,
+      "missing_instr": 6,
+      "pct_of_ref": 25.0,
+      "line": 6875,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_init",
+      "ref_instr": 18,
+      "nim_instr": 12,
+      "missing_instr": 6,
+      "pct_of_ref": 66.67,
+      "line": 3947,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "lld_con_rssi_get",
+      "ref_instr": 8,
+      "nim_instr": 2,
+      "missing_instr": 6,
+      "pct_of_ref": 25.0,
+      "line": 6316,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "lld_con_event_counter_get",
+      "ref_instr": 8,
+      "nim_instr": 2,
+      "missing_instr": 6,
+      "pct_of_ref": 25.0,
+      "line": 6852,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_ch_map_set",
+      "ref_instr": 8,
+      "nim_instr": 2,
+      "missing_instr": 6,
+      "pct_of_ref": 25.0,
+      "line": 6845,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_vs_set_pref_slave_latency_cmd_handler",
+      "ref_instr": 16,
+      "nim_instr": 10,
+      "missing_instr": 6,
+      "pct_of_ref": 62.5,
+      "line": 6608,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_msg_task_dest_compute",
+      "ref_instr": 8,
+      "nim_instr": 2,
+      "missing_instr": 6,
+      "pct_of_ref": 25.0,
+      "line": 6625,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_initialize",
+      "ref_instr": 9,
+      "nim_instr": 3,
+      "missing_instr": 6,
+      "pct_of_ref": 33.33,
+      "line": 5371,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_sleep_check",
+      "ref_instr": 8,
+      "nim_instr": 2,
+      "missing_instr": 6,
+      "pct_of_ref": 25.0,
+      "line": 5288,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_event_callback_set",
+      "ref_instr": 8,
+      "nim_instr": 2,
+      "missing_instr": 6,
+      "pct_of_ref": 25.0,
+      "line": 5184,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_dma_init",
+      "ref_instr": 7,
+      "nim_instr": 1,
+      "missing_instr": 6,
+      "pct_of_ref": 14.29,
+      "line": 6217,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "lld_white_list_add",
+      "ref_instr": 7,
+      "nim_instr": 2,
+      "missing_instr": 5,
+      "pct_of_ref": 28.57,
+      "line": 6879,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "lld_ch_idx_get",
+      "ref_instr": 14,
+      "nim_instr": 9,
+      "missing_instr": 5,
+      "pct_of_ref": 64.29,
+      "line": 6730,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "llc_proc_id_get",
+      "ref_instr": 7,
+      "nim_instr": 2,
+      "missing_instr": 5,
+      "pct_of_ref": 28.57,
+      "line": 6830,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_le_rd_phy_cmd_handler",
+      "ref_instr": 28,
+      "nim_instr": 23,
+      "missing_instr": 5,
+      "pct_of_ref": 82.14,
+      "line": 6510,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_fc_check_host_available_nb_acl_packets",
+      "ref_instr": 12,
+      "nim_instr": 7,
+      "missing_instr": 5,
+      "pct_of_ref": 58.33,
+      "line": 3550,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_command_llc_handler",
+      "ref_instr": 7,
+      "nim_instr": 2,
+      "missing_instr": 5,
+      "pct_of_ref": 28.57,
+      "line": 6767,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_ble_conhdl_register",
+      "ref_instr": 6,
+      "nim_instr": 1,
+      "missing_instr": 5,
+      "pct_of_ref": 16.67,
+      "line": 6296,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "ecc_init",
+      "ref_instr": 18,
+      "nim_instr": 13,
+      "missing_instr": 5,
+      "pct_of_ref": 72.22,
+      "line": 4736,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_timer_clear",
+      "ref_instr": 7,
+      "nim_instr": 2,
+      "missing_instr": 5,
+      "pct_of_ref": 28.57,
+      "line": 5317,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_dma_copy",
+      "ref_instr": 10,
+      "nim_instr": 5,
+      "missing_instr": 5,
+      "pct_of_ref": 50.0,
+      "line": 6220,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_controller_remaining_mem",
+      "ref_instr": 7,
+      "nim_instr": 2,
+      "missing_instr": 5,
+      "pct_of_ref": 28.57,
+      "line": 5355,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_co_list_push_back",
+      "ref_instr": 7,
+      "nim_instr": 2,
+      "missing_instr": 5,
+      "pct_of_ref": 28.57,
+      "line": 5095,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "rwip_prevent_sleep_set",
+      "ref_instr": 9,
+      "nim_instr": 5,
+      "missing_instr": 4,
+      "pct_of_ref": 55.56,
+      "line": 1025,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "rwip_prevent_sleep_clear",
+      "ref_instr": 10,
+      "nim_instr": 6,
+      "missing_instr": 4,
+      "pct_of_ref": 60.0,
+      "line": 1028,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "rwip_eif_get",
+      "ref_instr": 6,
+      "nim_instr": 2,
+      "missing_instr": 4,
+      "pct_of_ref": 33.33,
+      "line": 5550,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "llm_plan_elt_get",
+      "ref_instr": 6,
+      "nim_instr": 2,
+      "missing_instr": 4,
+      "pct_of_ref": 33.33,
+      "line": 6899,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llm_le_features_get",
+      "ref_instr": 18,
+      "nim_instr": 14,
+      "missing_instr": 4,
+      "pct_of_ref": 77.78,
+      "line": 5855,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "llm_adv_itf_extended_set",
+      "ref_instr": 6,
+      "nim_instr": 2,
+      "missing_instr": 4,
+      "pct_of_ref": 33.33,
+      "line": 6884,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_proc_id_set",
+      "ref_instr": 6,
+      "nim_instr": 2,
+      "missing_instr": 4,
+      "pct_of_ref": 33.33,
+      "line": 6831,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_le_set_scan_rsp_data_cmd_handler",
+      "ref_instr": 21,
+      "nim_instr": 17,
+      "missing_instr": 4,
+      "pct_of_ref": 80.95,
+      "line": 6555,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_le_set_adv_en_cmd_handler",
+      "ref_instr": 21,
+      "nim_instr": 17,
+      "missing_instr": 4,
+      "pct_of_ref": 80.95,
+      "line": 6528,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_le_set_adv_data_cmd_handler",
+      "ref_instr": 21,
+      "nim_instr": 17,
+      "missing_instr": 4,
+      "pct_of_ref": 80.95,
+      "line": 6521,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_le_rd_chnl_map_cmd_handler",
+      "ref_instr": 27,
+      "nim_instr": 23,
+      "missing_instr": 4,
+      "pct_of_ref": 85.19,
+      "line": 6498,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_fc_host_nb_acl_pkts_complete",
+      "ref_instr": 10,
+      "nim_instr": 6,
+      "missing_instr": 4,
+      "pct_of_ref": 60.0,
+      "line": 3555,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_ble_conhdl_unregister",
+      "ref_instr": 5,
+      "nim_instr": 1,
+      "missing_instr": 4,
+      "pct_of_ref": 20.0,
+      "line": 6299,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "co_time_timer_init",
+      "ref_instr": 5,
+      "nim_instr": 1,
+      "missing_instr": 4,
+      "pct_of_ref": 20.0,
+      "line": 6240,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "co_nb_good_channels",
+      "ref_instr": 6,
+      "nim_instr": 2,
+      "missing_instr": 4,
+      "pct_of_ref": 33.33,
+      "line": 6228,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_is_free",
+      "ref_instr": 6,
+      "nim_instr": 2,
+      "missing_instr": 4,
+      "pct_of_ref": 33.33,
+      "line": 5225,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_event_init",
+      "ref_instr": 6,
+      "nim_instr": 2,
+      "missing_instr": 4,
+      "pct_of_ref": 33.33,
+      "line": 5200,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_co_list_pool_init",
+      "ref_instr": 6,
+      "nim_instr": 2,
+      "missing_instr": 4,
+      "pct_of_ref": 33.33,
+      "line": 5136,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_co_list_insert_after",
+      "ref_instr": 6,
+      "nim_instr": 2,
+      "missing_instr": 4,
+      "pct_of_ref": 33.33,
+      "line": 5122,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "sch_slice_init",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "missing_instr": 3,
+      "pct_of_ref": 40.0,
+      "line": 6928,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "sch_plan_rem",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "missing_instr": 3,
+      "pct_of_ref": 40.0,
+      "line": 6912,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "sch_plan_init",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "missing_instr": 3,
+      "pct_of_ref": 40.0,
+      "line": 6911,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "sch_arb_init",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "missing_instr": 3,
+      "pct_of_ref": 40.0,
+      "line": 6908,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "rwip_schedule",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "missing_instr": 3,
+      "pct_of_ref": 40.0,
+      "line": 5535,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "llm_is_adv_itf_legacy",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "missing_instr": 3,
+      "pct_of_ref": 40.0,
+      "line": 6893,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llm_dev_list_empty_entry",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "missing_instr": 3,
+      "pct_of_ref": 40.0,
+      "line": 6890,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llm_adv_hdl_to_id",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "missing_instr": 3,
+      "pct_of_ref": 40.0,
+      "line": 6883,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_stop",
+      "ref_instr": 20,
+      "nim_instr": 17,
+      "missing_instr": 3,
+      "pct_of_ref": 85.0,
+      "line": 3700,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "llc_proc_init",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "missing_instr": 3,
+      "pct_of_ref": 40.0,
+      "line": 6832,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_proc_get",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "missing_instr": 3,
+      "pct_of_ref": 40.0,
+      "line": 6829,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_msg_le_evt_desc_get",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "missing_instr": 3,
+      "pct_of_ref": 40.0,
+      "line": 6777,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_msg_evt_desc_get",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "missing_instr": 3,
+      "pct_of_ref": 40.0,
+      "line": 6773,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_le_rd_rem_feats_cmd_handler",
+      "ref_instr": 31,
+      "nim_instr": 28,
+      "missing_instr": 3,
+      "pct_of_ref": 90.32,
+      "line": 6443,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_fc_acl_buf_size_set",
+      "ref_instr": 6,
+      "nim_instr": 3,
+      "missing_instr": 3,
+      "pct_of_ref": 50.0,
+      "line": 3540,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_flush",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "missing_instr": 3,
+      "pct_of_ref": 40.0,
+      "line": 5212,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_co_list_push_front",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "missing_instr": 3,
+      "pct_of_ref": 40.0,
+      "line": 5099,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_co_list_pop_front",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "missing_instr": 3,
+      "pct_of_ref": 40.0,
+      "line": 5103,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_co_list_insert_before",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "missing_instr": 3,
+      "pct_of_ref": 40.0,
+      "line": 5127,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_co_list_extract",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "missing_instr": 3,
+      "pct_of_ref": 40.0,
+      "line": 5110,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "sch_prog_init",
+      "ref_instr": 4,
+      "nim_instr": 2,
+      "missing_instr": 2,
+      "pct_of_ref": 50.0,
+      "line": 6918,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "sch_alarm_init",
+      "ref_instr": 4,
+      "nim_instr": 2,
+      "missing_instr": 2,
+      "pct_of_ref": 50.0,
+      "line": 6904,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "rwip_ch_ass_en_set",
+      "ref_instr": 3,
+      "nim_instr": 1,
+      "missing_instr": 2,
+      "pct_of_ref": 33.33,
+      "line": 5576,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "rwble_isr",
+      "ref_instr": 4,
+      "nim_instr": 2,
+      "missing_instr": 2,
+      "pct_of_ref": 50.0,
+      "line": 5820,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "llc_init",
+      "ref_instr": 7,
+      "nim_instr": 5,
+      "missing_instr": 2,
+      "pct_of_ref": 71.43,
+      "line": 3690,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_rd_rssi_cmd_handler",
+      "ref_instr": 25,
+      "nim_instr": 23,
+      "missing_instr": 2,
+      "pct_of_ref": 92.0,
+      "line": 6379,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "co_time_timer_stop",
+      "ref_instr": 3,
+      "nim_instr": 1,
+      "missing_instr": 2,
+      "pct_of_ref": 33.33,
+      "line": 6252,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_timer_get",
+      "ref_instr": 4,
+      "nim_instr": 2,
+      "missing_instr": 2,
+      "pct_of_ref": 50.0,
+      "line": 5325,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_timer_active",
+      "ref_instr": 4,
+      "nim_instr": 2,
+      "missing_instr": 2,
+      "pct_of_ref": 50.0,
+      "line": 5313,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_co_list_size",
+      "ref_instr": 4,
+      "nim_instr": 2,
+      "missing_instr": 2,
+      "pct_of_ref": 50.0,
+      "line": 5142,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "aes_rand",
+      "ref_instr": 11,
+      "nim_instr": 9,
+      "missing_instr": 2,
+      "pct_of_ref": 81.82,
+      "line": 5919,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "SubtractFromSelfBigHex256",
+      "ref_instr": 4,
+      "nim_instr": 2,
+      "missing_instr": 2,
+      "pct_of_ref": 50.0,
+      "line": 6758,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "SubtractBigHex256",
+      "ref_instr": 4,
+      "nim_instr": 2,
+      "missing_instr": 2,
+      "pct_of_ref": 50.0,
+      "line": 6755,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "MultiplyBigHexByUint32_256",
+      "ref_instr": 4,
+      "nim_instr": 2,
+      "missing_instr": 2,
+      "pct_of_ref": 50.0,
+      "line": 6752,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "AddBigHex256",
+      "ref_instr": 4,
+      "nim_instr": 2,
+      "missing_instr": 2,
+      "pct_of_ref": 50.0,
+      "line": 6746,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "Add2SelfBigHex256",
+      "ref_instr": 4,
+      "nim_instr": 2,
+      "missing_instr": 2,
+      "pct_of_ref": 50.0,
+      "line": 6745,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "sch_plan_chk",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "missing_instr": 1,
+      "pct_of_ref": 66.67,
+      "line": 6910,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "rwip_sca_get",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "missing_instr": 1,
+      "pct_of_ref": 66.67,
+      "line": 5544,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "rwip_max_drift_get",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "missing_instr": 1,
+      "pct_of_ref": 66.67,
+      "line": 933,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "rwip_ch_assess_data_ble_get",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "missing_instr": 1,
+      "pct_of_ref": 66.67,
+      "line": 5579,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "rwip_ch_ass_en_get",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "missing_instr": 1,
+      "pct_of_ref": 66.67,
+      "line": 5573,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "llm_tx_path_comp_get",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "missing_instr": 1,
+      "pct_of_ref": 66.67,
+      "line": 6902,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llm_set_connection_accept_timeout",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "missing_instr": 1,
+      "pct_of_ref": 66.67,
+      "line": 6901,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llm_rx_path_comp_get",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "missing_instr": 1,
+      "pct_of_ref": 66.67,
+      "line": 6900,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llm_master_ch_map_get",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "missing_instr": 1,
+      "pct_of_ref": 66.67,
+      "line": 6897,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llm_get_connection_accept_timeout",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "missing_instr": 1,
+      "pct_of_ref": 66.67,
+      "line": 6892,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "llc_proc_state_set",
+      "ref_instr": 2,
+      "nim_instr": 1,
+      "missing_instr": 1,
+      "pct_of_ref": 50.0,
+      "line": 5891,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_msg_evt_get_hl_tl_dest",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "missing_instr": 1,
+      "pct_of_ref": 66.67,
+      "line": 6774,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_msg_cmd_status_exp",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "missing_instr": 1,
+      "pct_of_ref": 66.67,
+      "line": 6772,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "hci_msg_cmd_ll_dest_get",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "missing_instr": 1,
+      "pct_of_ref": 66.67,
+      "line": 6307,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_le_set_adv_set_rand_addr_cmd_handler",
+      "ref_instr": 10,
+      "nim_instr": 9,
+      "missing_instr": 1,
+      "pct_of_ref": 90.0,
+      "line": 6542,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_is_ext_host",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "missing_instr": 1,
+      "pct_of_ref": 66.67,
+      "line": 5374,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_fc_init",
+      "ref_instr": 6,
+      "nim_instr": 5,
+      "missing_instr": 1,
+      "pct_of_ref": 83.33,
+      "line": 3514,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_fc_acl_packet_sent",
+      "ref_instr": 7,
+      "nim_instr": 6,
+      "missing_instr": 1,
+      "pct_of_ref": 85.71,
+      "line": 3546,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "hci_fc_acl_en",
+      "ref_instr": 4,
+      "nim_instr": 3,
+      "missing_instr": 1,
+      "pct_of_ref": 75.0,
+      "line": 3543,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "co_slot_to_duration",
+      "ref_instr": 4,
+      "nim_instr": 3,
+      "missing_instr": 1,
+      "pct_of_ref": 75.0,
+      "line": 6255,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "co_djob_reg",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "missing_instr": 1,
+      "pct_of_ref": 66.67,
+      "line": 6763,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "co_djob_isr_reg",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "missing_instr": 1,
+      "pct_of_ref": 66.67,
+      "line": 6762,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "co_djob_init",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "missing_instr": 1,
+      "pct_of_ref": 66.67,
+      "line": 6760,
+      "placeholder_stub": true
+    },
+    {
+      "symbol": "btble_ke_event_get_all",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "missing_instr": 1,
+      "pct_of_ref": 66.67,
+      "line": 5197,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_ke_event_flush",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "missing_instr": 1,
+      "pct_of_ref": 66.67,
+      "line": 5191,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_co_list_init",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "missing_instr": 1,
+      "pct_of_ref": 66.67,
+      "line": 5107,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_co_list_find",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "missing_instr": 1,
+      "pct_of_ref": 66.67,
+      "line": 5118,
+      "placeholder_stub": false
+    },
+    {
+      "symbol": "btble_co_list_extract_after",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "missing_instr": 1,
+      "pct_of_ref": 66.67,
+      "line": 5114,
+      "placeholder_stub": false
+    }
+  ],
+  "placeholder_stub_count": 186,
+  "placeholder_stubs_in_reference_count": 186,
+  "placeholder_stubs_in_reference": [
+    {
+      "symbol": "GF_Jacobian_Point_Addition256",
+      "ref_instr": 132,
+      "nim_instr": 2,
+      "line": 6750
+    },
+    {
+      "symbol": "ll_length_req_handler",
+      "ref_instr": 66,
+      "nim_instr": 2,
+      "line": 6790
+    },
+    {
+      "symbol": "llc_con_move_cbk",
+      "ref_instr": 64,
+      "nim_instr": 2,
+      "line": 6809
+    },
+    {
+      "symbol": "sch_prog_push",
+      "ref_instr": 63,
+      "nim_instr": 2,
+      "line": 6919
+    },
+    {
+      "symbol": "lld_per_adv_list_add",
+      "ref_instr": 56,
+      "nim_instr": 2,
+      "line": 6871
+    },
+    {
+      "symbol": "lld_con_data_flow_set",
+      "ref_instr": 56,
+      "nim_instr": 2,
+      "line": 6848
+    },
+    {
+      "symbol": "ll_connection_update_ind_handler",
+      "ref_instr": 55,
+      "nim_instr": 2,
+      "line": 6785
+    },
+    {
+      "symbol": "ll_connection_param_req_handler",
+      "ref_instr": 55,
+      "nim_instr": 2,
+      "line": 6783
+    },
+    {
+      "symbol": "lld_rx_timing_compute",
+      "ref_instr": 48,
+      "nim_instr": 2,
+      "line": 6876
+    },
+    {
+      "symbol": "llc_clk_acc_modify",
+      "ref_instr": 48,
+      "nim_instr": 2,
+      "line": 6808
+    },
+    {
+      "symbol": "lld_calc_aux_rx",
+      "ref_instr": 43,
+      "nim_instr": 2,
+      "line": 6844
+    },
+    {
+      "symbol": "llm_ch_map_update_ind_handler",
+      "ref_instr": 41,
+      "nim_instr": 2,
+      "line": 6886
+    },
+    {
+      "symbol": "llm_ch_map_update",
+      "ref_instr": 38,
+      "nim_instr": 2,
+      "line": 6885
+    },
+    {
+      "symbol": "llc_auth_payl_nearly_to_handler",
+      "ref_instr": 37,
+      "nim_instr": 2,
+      "line": 6805
+    },
+    {
+      "symbol": "ll_feature_rsp_handler",
+      "ref_instr": 37,
+      "nim_instr": 2,
+      "line": 6789
+    },
+    {
+      "symbol": "llc_init_term_proc",
+      "ref_instr": 35,
+      "nim_instr": 2,
+      "line": 6812
+    },
+    {
+      "symbol": "SubtractBigHexUint32_256",
+      "ref_instr": 35,
+      "nim_instr": 2,
+      "line": 6757
+    },
+    {
+      "symbol": "llc_stopped_ind_handler",
+      "ref_instr": 34,
+      "nim_instr": 2,
+      "line": 6834
+    },
+    {
+      "symbol": "ll_min_used_channels_ind_handler",
+      "ref_instr": 34,
+      "nim_instr": 2,
+      "line": 6792
+    },
+    {
+      "symbol": "sch_slice_bg_remove",
+      "ref_instr": 33,
+      "nim_instr": 2,
+      "line": 6924
+    },
+    {
+      "symbol": "lld_adv_end_ind_handler",
+      "ref_instr": 33,
+      "nim_instr": 2,
+      "line": 6839
+    },
+    {
+      "symbol": "sch_slice_fg_remove",
+      "ref_instr": 32,
+      "nim_instr": 2,
+      "line": 6927
+    },
+    {
+      "symbol": "sch_slice_bg_add",
+      "ref_instr": 32,
+      "nim_instr": 2,
+      "line": 6923
+    },
+    {
+      "symbol": "llc_auth_payl_real_to_handler",
+      "ref_instr": 32,
+      "nim_instr": 2,
+      "line": 6806
+    },
+    {
+      "symbol": "SubtractFromSelfBigHexSign256",
+      "ref_instr": 32,
+      "nim_instr": 2,
+      "line": 6759
+    },
+    {
+      "symbol": "SubtractBigHexMod256",
+      "ref_instr": 32,
+      "nim_instr": 2,
+      "line": 6756
+    },
+    {
+      "symbol": "llc_proc_reg",
+      "ref_instr": 31,
+      "nim_instr": 2,
+      "line": 6833
+    },
+    {
+      "symbol": "ll_terminate_ind_handler",
+      "ref_instr": 31,
+      "nim_instr": 2,
+      "line": 6803
+    },
+    {
+      "symbol": "sch_arb_event_start_isr",
+      "ref_instr": 30,
+      "nim_instr": 2,
+      "line": 6907
+    },
+    {
+      "symbol": "ll_phy_req_handler",
+      "ref_instr": 30,
+      "nim_instr": 2,
+      "line": 6795
+    },
+    {
+      "symbol": "sch_slice_fg_add",
+      "ref_instr": 29,
+      "nim_instr": 2,
+      "line": 6926
+    },
+    {
+      "symbol": "lld_rxdesc_buf_ready",
+      "ref_instr": 29,
+      "nim_instr": 2,
+      "line": 6877
+    },
+    {
+      "symbol": "lld_con_data_tx",
+      "ref_instr": 28,
+      "nim_instr": 2,
+      "line": 6850
+    },
+    {
+      "symbol": "sch_slice_compute",
+      "ref_instr": 27,
+      "nim_instr": 2,
+      "line": 6925
+    },
+    {
+      "symbol": "lld_per_adv_list_rem",
+      "ref_instr": 27,
+      "nim_instr": 2,
+      "line": 6872
+    },
+    {
+      "symbol": "lld_con_enc_key_load",
+      "ref_instr": 27,
+      "nim_instr": 2,
+      "line": 6851
+    },
+    {
+      "symbol": "llc_op_disconnect_ind_handler",
+      "ref_instr": 27,
+      "nim_instr": 2,
+      "line": 6820
+    },
+    {
+      "symbol": "ll_version_ind_handler",
+      "ref_instr": 27,
+      "nim_instr": 2,
+      "line": 6804
+    },
+    {
+      "symbol": "specialModP256",
+      "ref_instr": 26,
+      "nim_instr": 2,
+      "line": 6929
+    },
+    {
+      "symbol": "lld_con_tx_enc",
+      "ref_instr": 26,
+      "nim_instr": 2,
+      "line": 6865
+    },
+    {
+      "symbol": "lld_con_rx_enc",
+      "ref_instr": 26,
+      "nim_instr": 2,
+      "line": 6863
+    },
+    {
+      "symbol": "lld_con_llcp_tx",
+      "ref_instr": 25,
+      "nim_instr": 2,
+      "line": 6854
+    },
+    {
+      "symbol": "hci_acl_data_handler",
+      "ref_instr": 25,
+      "nim_instr": 2,
+      "line": 6766
+    },
+    {
+      "symbol": "MultiplyBigHexModP256",
+      "ref_instr": 25,
+      "nim_instr": 2,
+      "line": 6753
+    },
+    {
+      "symbol": "llm_link_disc",
+      "ref_instr": 24,
+      "nim_instr": 2,
+      "line": 6896
+    },
+    {
+      "symbol": "lld_con_param_update",
+      "ref_instr": 24,
+      "nim_instr": 2,
+      "line": 6858
+    },
+    {
+      "symbol": "lld_adv_rand_addr_update",
+      "ref_instr": 24,
+      "nim_instr": 2,
+      "line": 6841
+    },
+    {
+      "symbol": "lld_con_data_len_update",
+      "ref_instr": 23,
+      "nim_instr": 2,
+      "line": 6849
+    },
+    {
+      "symbol": "llc_encrypt_ind_handler",
+      "ref_instr": 23,
+      "nim_instr": 2,
+      "line": 6811
+    },
+    {
+      "symbol": "GF_Jacobian_Point_Double256",
+      "ref_instr": 23,
+      "nim_instr": 2,
+      "line": 6751
+    },
+    {
+      "symbol": "sch_plan_set",
+      "ref_instr": 22,
+      "nim_instr": 2,
+      "line": 6914
+    },
+    {
+      "symbol": "lld_phy_upd_cfm_handler",
+      "ref_instr": 22,
+      "nim_instr": 2,
+      "line": 6873
+    },
+    {
+      "symbol": "lld_ch_map_upd_cfm_handler",
+      "ref_instr": 22,
+      "nim_instr": 2,
+      "line": 6846
+    },
+    {
+      "symbol": "lld_acl_tx_cfm_handler",
+      "ref_instr": 22,
+      "nim_instr": 2,
+      "line": 6836
+    },
+    {
+      "symbol": "ll_connection_param_rsp_handler",
+      "ref_instr": 22,
+      "nim_instr": 2,
+      "line": 6784
+    },
+    {
+      "symbol": "sch_prog_end_isr",
+      "ref_instr": 21,
+      "nim_instr": 2,
+      "line": 6916
+    },
+    {
+      "symbol": "lld_white_list_rem",
+      "ref_instr": 21,
+      "nim_instr": 2,
+      "line": 6880
+    },
+    {
+      "symbol": "lld_con_time_get",
+      "ref_instr": 21,
+      "nim_instr": 2,
+      "line": 6864
+    },
+    {
+      "symbol": "lld_con_pref_slave_evt_dur_set",
+      "ref_instr": 21,
+      "nim_instr": 2,
+      "line": 6861
+    },
+    {
+      "symbol": "lld_con_phys_update",
+      "ref_instr": 21,
+      "nim_instr": 2,
+      "line": 6860
+    },
+    {
+      "symbol": "co_djob_unreg",
+      "ref_instr": 21,
+      "nim_instr": 2,
+      "line": 6764
+    },
+    {
+      "symbol": "sch_alarm_set",
+      "ref_instr": 20,
+      "nim_instr": 2,
+      "line": 6905
+    },
+    {
+      "symbol": "lld_llcp_tx_cfm_handler",
+      "ref_instr": 20,
+      "nim_instr": 2,
+      "line": 6870
+    },
+    {
+      "symbol": "ll_length_rsp_handler",
+      "ref_instr": 20,
+      "nim_instr": 2,
+      "line": 6791
+    },
+    {
+      "symbol": "lld_acl_rx_ind_handler",
+      "ref_instr": 19,
+      "nim_instr": 2,
+      "line": 6835
+    },
+    {
+      "symbol": "llc_op_feats_exch_ind_handler",
+      "ref_instr": 19,
+      "nim_instr": 2,
+      "line": 6823
+    },
+    {
+      "symbol": "llc_ll_reject_ind_pdu_send",
+      "ref_instr": 19,
+      "nim_instr": 2,
+      "line": 6814
+    },
+    {
+      "symbol": "ll_phy_update_ind_handler",
+      "ref_instr": 19,
+      "nim_instr": 2,
+      "line": 6797
+    },
+    {
+      "symbol": "ll_clk_acc_rsp_handler",
+      "ref_instr": 19,
+      "nim_instr": 2,
+      "line": 6782
+    },
+    {
+      "symbol": "lld_scan_req_ind_handler",
+      "ref_instr": 18,
+      "nim_instr": 2,
+      "line": 6878
+    },
+    {
+      "symbol": "lld_llcp_rx_ind_handler",
+      "ref_instr": 18,
+      "nim_instr": 2,
+      "line": 6869
+    },
+    {
+      "symbol": "lld_con_init",
+      "ref_instr": 18,
+      "nim_instr": 2,
+      "line": 6853
+    },
+    {
+      "symbol": "lld_adv_restart",
+      "ref_instr": 18,
+      "nim_instr": 2,
+      "line": 6842
+    },
+    {
+      "symbol": "llc_op_phy_upd_ind_handler",
+      "ref_instr": 18,
+      "nim_instr": 2,
+      "line": 6825
+    },
+    {
+      "symbol": "llc_op_con_upd_ind_handler",
+      "ref_instr": 18,
+      "nim_instr": 2,
+      "line": 6819
+    },
+    {
+      "symbol": "ll_enc_req_handler",
+      "ref_instr": 18,
+      "nim_instr": 2,
+      "line": 6786
+    },
+    {
+      "symbol": "llm_cmd_stat_send",
+      "ref_instr": 17,
+      "nim_instr": 2,
+      "line": 6889
+    },
+    {
+      "symbol": "llm_cmd_cmp_send",
+      "ref_instr": 17,
+      "nim_instr": 2,
+      "line": 6888
+    },
+    {
+      "symbol": "lld_con_tx_len_update_for_rate",
+      "ref_instr": 17,
+      "nim_instr": 2,
+      "line": 6867
+    },
+    {
+      "symbol": "llc_op_ver_exch_ind_handler",
+      "ref_instr": 17,
+      "nim_instr": 2,
+      "line": 6826
+    },
+    {
+      "symbol": "llc_op_dl_upd_ind_handler",
+      "ref_instr": 17,
+      "nim_instr": 2,
+      "line": 6821
+    },
+    {
+      "symbol": "llc_op_ch_map_upd_ind_handler",
+      "ref_instr": 17,
+      "nim_instr": 2,
+      "line": 6817
+    },
+    {
+      "symbol": "ll_enc_rsp_handler",
+      "ref_instr": 17,
+      "nim_instr": 2,
+      "line": 6787
+    },
+    {
+      "symbol": "MultiplyByU32ModP256",
+      "ref_instr": 17,
+      "nim_instr": 2,
+      "line": 6754
+    },
+    {
+      "symbol": "AddPdiv2_256",
+      "ref_instr": 17,
+      "nim_instr": 2,
+      "line": 6749
+    },
+    {
+      "symbol": "lld_con_param_upd_cfm_handler",
+      "ref_instr": 16,
+      "nim_instr": 2,
+      "line": 6857
+    },
+    {
+      "symbol": "lld_adv_init",
+      "ref_instr": 16,
+      "nim_instr": 2,
+      "line": 6840
+    },
+    {
+      "symbol": "lld_adv_duration_update",
+      "ref_instr": 16,
+      "nim_instr": 2,
+      "line": 6838
+    },
+    {
+      "symbol": "llc_llcp_send",
+      "ref_instr": 16,
+      "nim_instr": 2,
+      "line": 6815
+    },
+    {
+      "symbol": "llc_cleanup",
+      "ref_instr": 16,
+      "nim_instr": 2,
+      "line": 6807
+    },
+    {
+      "symbol": "ll_slave_feature_req_handler",
+      "ref_instr": 16,
+      "nim_instr": 2,
+      "line": 6800
+    },
+    {
+      "symbol": "ll_phy_rsp_handler",
+      "ref_instr": 16,
+      "nim_instr": 2,
+      "line": 6796
+    },
+    {
+      "symbol": "ll_feature_req_handler",
+      "ref_instr": 16,
+      "nim_instr": 2,
+      "line": 6788
+    },
+    {
+      "symbol": "sch_plan_req",
+      "ref_instr": 15,
+      "nim_instr": 2,
+      "line": 6913
+    },
+    {
+      "symbol": "sch_alarm_timer_isr",
+      "ref_instr": 15,
+      "nim_instr": 2,
+      "line": 6906
+    },
+    {
+      "symbol": "sch_alarm_clear",
+      "ref_instr": 15,
+      "nim_instr": 2,
+      "line": 6903
+    },
+    {
+      "symbol": "llm_is_dev_connected",
+      "ref_instr": 15,
+      "nim_instr": 2,
+      "line": 6894
+    },
+    {
+      "symbol": "llc_op_encrypt_ind_handler",
+      "ref_instr": 15,
+      "nim_instr": 2,
+      "line": 6822
+    },
+    {
+      "symbol": "llc_llcp_state_set",
+      "ref_instr": 15,
+      "nim_instr": 2,
+      "line": 6816
+    },
+    {
+      "symbol": "llc_le_ping_restart",
+      "ref_instr": 15,
+      "nim_instr": 2,
+      "line": 6813
+    },
+    {
+      "symbol": "ll_start_enc_rsp_handler",
+      "ref_instr": 15,
+      "nim_instr": 2,
+      "line": 6802
+    },
+    {
+      "symbol": "ll_start_enc_req_handler",
+      "ref_instr": 15,
+      "nim_instr": 2,
+      "line": 6801
+    },
+    {
+      "symbol": "sch_prog_skip_isr",
+      "ref_instr": 14,
+      "nim_instr": 2,
+      "line": 6921
+    },
+    {
+      "symbol": "sch_plan_shift",
+      "ref_instr": 14,
+      "nim_instr": 2,
+      "line": 6915
+    },
+    {
+      "symbol": "lld_con_offset_upd_ind_handler",
+      "ref_instr": 14,
+      "nim_instr": 2,
+      "line": 6856
+    },
+    {
+      "symbol": "llc_proc_collision_check",
+      "ref_instr": 14,
+      "nim_instr": 2,
+      "line": 6827
+    },
+    {
+      "symbol": "llc_disconnect",
+      "ref_instr": 14,
+      "nim_instr": 2,
+      "line": 6810
+    },
+    {
+      "symbol": "ll_ping_rsp_handler",
+      "ref_instr": 14,
+      "nim_instr": 2,
+      "line": 6799
+    },
+    {
+      "symbol": "ll_clk_acc_req_handler",
+      "ref_instr": 14,
+      "nim_instr": 2,
+      "line": 6781
+    },
+    {
+      "symbol": "llm_dev_list_search",
+      "ref_instr": 13,
+      "nim_instr": 2,
+      "line": 6891
+    },
+    {
+      "symbol": "lld_con_tx_len_update_for_intv",
+      "ref_instr": 13,
+      "nim_instr": 2,
+      "line": 6866
+    },
+    {
+      "symbol": "lld_adv_scan_rsp_data_update",
+      "ref_instr": 13,
+      "nim_instr": 2,
+      "line": 6843
+    },
+    {
+      "symbol": "lld_adv_adv_data_update",
+      "ref_instr": 13,
+      "nim_instr": 2,
+      "line": 6837
+    },
+    {
+      "symbol": "ll_channel_map_ind_handler",
+      "ref_instr": 13,
+      "nim_instr": 2,
+      "line": 6780
+    },
+    {
+      "symbol": "hci_msg_evt_pkupk",
+      "ref_instr": 13,
+      "nim_instr": 2,
+      "line": 6776
+    },
+    {
+      "symbol": "hci_msg_cmd_pkupk",
+      "ref_instr": 13,
+      "nim_instr": 2,
+      "line": 6771
+    },
+    {
+      "symbol": "hci_msg_cmd_cmp_pkupk",
+      "ref_instr": 13,
+      "nim_instr": 2,
+      "line": 6769
+    },
+    {
+      "symbol": "sch_prog_fifo_isr",
+      "ref_instr": 12,
+      "nim_instr": 2,
+      "line": 6917
+    },
+    {
+      "symbol": "lld_disc_ind_handler",
+      "ref_instr": 12,
+      "nim_instr": 2,
+      "line": 6868
+    },
+    {
+      "symbol": "lld_con_pref_slave_latency_set",
+      "ref_instr": 12,
+      "nim_instr": 2,
+      "line": 6862
+    },
+    {
+      "symbol": "lld_con_ch_map_update",
+      "ref_instr": 12,
+      "nim_instr": 2,
+      "line": 6847
+    },
+    {
+      "symbol": "llc_proc_err_ind",
+      "ref_instr": 12,
+      "nim_instr": 2,
+      "line": 6828
+    },
+    {
+      "symbol": "llc_op_le_ping_ind_handler",
+      "ref_instr": 12,
+      "nim_instr": 2,
+      "line": 6824
+    },
+    {
+      "symbol": "llc_op_clk_acc_ind_handler",
+      "ref_instr": 12,
+      "nim_instr": 2,
+      "line": 6818
+    },
+    {
+      "symbol": "ll_ping_req_handler",
+      "ref_instr": 12,
+      "nim_instr": 2,
+      "line": 6798
+    },
+    {
+      "symbol": "hci_msg_cmd_desc_get",
+      "ref_instr": 12,
+      "nim_instr": 2,
+      "line": 6770
+    },
+    {
+      "symbol": "llm_clk_acc_set",
+      "ref_instr": 11,
+      "nim_instr": 2,
+      "line": 6887
+    },
+    {
+      "symbol": "lld_con_peer_sca_set",
+      "ref_instr": 11,
+      "nim_instr": 2,
+      "line": 6859
+    },
+    {
+      "symbol": "lld_con_offset_get",
+      "ref_instr": 11,
+      "nim_instr": 2,
+      "line": 6855
+    },
+    {
+      "symbol": "ll_pause_enc_rsp_handler",
+      "ref_instr": 11,
+      "nim_instr": 2,
+      "line": 6794
+    },
+    {
+      "symbol": "ll_pause_enc_req_handler",
+      "ref_instr": 11,
+      "nim_instr": 2,
+      "line": 6793
+    },
+    {
+      "symbol": "co_djob_initialize",
+      "ref_instr": 11,
+      "nim_instr": 2,
+      "line": 6761
+    },
+    {
+      "symbol": "sch_prog_tx_isr",
+      "ref_instr": 10,
+      "nim_instr": 2,
+      "line": 6922
+    },
+    {
+      "symbol": "sch_prog_rx_isr",
+      "ref_instr": 10,
+      "nim_instr": 2,
+      "line": 6920
+    },
+    {
+      "symbol": "llm_per_adv_chain_dur",
+      "ref_instr": 10,
+      "nim_instr": 2,
+      "line": 6898
+    },
+    {
+      "symbol": "AddP256",
+      "ref_instr": 10,
+      "nim_instr": 2,
+      "line": 6748
+    },
+    {
+      "symbol": "llm_le_evt_mask_check",
+      "ref_instr": 9,
+      "nim_instr": 2,
+      "line": 6895
+    },
+    {
+      "symbol": "llm_activity_free_set",
+      "ref_instr": 9,
+      "nim_instr": 2,
+      "line": 6882
+    },
+    {
+      "symbol": "llm_activity_free_get",
+      "ref_instr": 9,
+      "nim_instr": 2,
+      "line": 6881
+    },
+    {
+      "symbol": "hci_command_llm_handler",
+      "ref_instr": 9,
+      "nim_instr": 2,
+      "line": 6768
+    },
+    {
+      "symbol": "AddBigHexModP256",
+      "ref_instr": 9,
+      "nim_instr": 2,
+      "line": 6747
+    },
+    {
+      "symbol": "sch_arb_sw_isr",
+      "ref_instr": 8,
+      "nim_instr": 2,
+      "line": 6909
+    },
+    {
+      "symbol": "lld_rpa_renew",
+      "ref_instr": 8,
+      "nim_instr": 2,
+      "line": 6875
+    },
+    {
+      "symbol": "lld_con_event_counter_get",
+      "ref_instr": 8,
+      "nim_instr": 2,
+      "line": 6852
+    },
+    {
+      "symbol": "lld_ch_map_set",
+      "ref_instr": 8,
+      "nim_instr": 2,
+      "line": 6845
+    },
+    {
+      "symbol": "lld_white_list_add",
+      "ref_instr": 7,
+      "nim_instr": 2,
+      "line": 6879
+    },
+    {
+      "symbol": "llc_proc_id_get",
+      "ref_instr": 7,
+      "nim_instr": 2,
+      "line": 6830
+    },
+    {
+      "symbol": "hci_command_llc_handler",
+      "ref_instr": 7,
+      "nim_instr": 2,
+      "line": 6767
+    },
+    {
+      "symbol": "llm_plan_elt_get",
+      "ref_instr": 6,
+      "nim_instr": 2,
+      "line": 6899
+    },
+    {
+      "symbol": "llm_adv_itf_extended_set",
+      "ref_instr": 6,
+      "nim_instr": 2,
+      "line": 6884
+    },
+    {
+      "symbol": "llc_proc_id_set",
+      "ref_instr": 6,
+      "nim_instr": 2,
+      "line": 6831
+    },
+    {
+      "symbol": "sch_slice_init",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "line": 6928
+    },
+    {
+      "symbol": "sch_plan_rem",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "line": 6912
+    },
+    {
+      "symbol": "sch_plan_init",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "line": 6911
+    },
+    {
+      "symbol": "sch_arb_init",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "line": 6908
+    },
+    {
+      "symbol": "llm_is_adv_itf_legacy",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "line": 6893
+    },
+    {
+      "symbol": "llm_dev_list_empty_entry",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "line": 6890
+    },
+    {
+      "symbol": "llm_adv_hdl_to_id",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "line": 6883
+    },
+    {
+      "symbol": "llc_proc_init",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "line": 6832
+    },
+    {
+      "symbol": "llc_proc_get",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "line": 6829
+    },
+    {
+      "symbol": "hci_msg_le_evt_desc_get",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "line": 6777
+    },
+    {
+      "symbol": "hci_msg_evt_desc_get",
+      "ref_instr": 5,
+      "nim_instr": 2,
+      "line": 6773
+    },
+    {
+      "symbol": "sch_prog_init",
+      "ref_instr": 4,
+      "nim_instr": 2,
+      "line": 6918
+    },
+    {
+      "symbol": "sch_alarm_init",
+      "ref_instr": 4,
+      "nim_instr": 2,
+      "line": 6904
+    },
+    {
+      "symbol": "SubtractFromSelfBigHex256",
+      "ref_instr": 4,
+      "nim_instr": 2,
+      "line": 6758
+    },
+    {
+      "symbol": "SubtractBigHex256",
+      "ref_instr": 4,
+      "nim_instr": 2,
+      "line": 6755
+    },
+    {
+      "symbol": "MultiplyBigHexByUint32_256",
+      "ref_instr": 4,
+      "nim_instr": 2,
+      "line": 6752
+    },
+    {
+      "symbol": "AddBigHex256",
+      "ref_instr": 4,
+      "nim_instr": 2,
+      "line": 6746
+    },
+    {
+      "symbol": "Add2SelfBigHex256",
+      "ref_instr": 4,
+      "nim_instr": 2,
+      "line": 6745
+    },
+    {
+      "symbol": "sch_plan_chk",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "line": 6910
+    },
+    {
+      "symbol": "llm_tx_path_comp_get",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "line": 6902
+    },
+    {
+      "symbol": "llm_set_connection_accept_timeout",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "line": 6901
+    },
+    {
+      "symbol": "llm_rx_path_comp_get",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "line": 6900
+    },
+    {
+      "symbol": "llm_master_ch_map_get",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "line": 6897
+    },
+    {
+      "symbol": "llm_get_connection_accept_timeout",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "line": 6892
+    },
+    {
+      "symbol": "hci_msg_evt_get_hl_tl_dest",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "line": 6774
+    },
+    {
+      "symbol": "hci_msg_cmd_status_exp",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "line": 6772
+    },
+    {
+      "symbol": "co_djob_reg",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "line": 6763
+    },
+    {
+      "symbol": "co_djob_isr_reg",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "line": 6762
+    },
+    {
+      "symbol": "co_djob_init",
+      "ref_instr": 3,
+      "nim_instr": 2,
+      "line": 6760
+    },
+    {
+      "symbol": "lld_ral_search",
+      "ref_instr": 2,
+      "nim_instr": 2,
+      "line": 6874
+    },
+    {
+      "symbol": "hci_msg_evt_host_lid_get",
+      "ref_instr": 2,
+      "nim_instr": 2,
+      "line": 6775
+    },
+    {
+      "symbol": "syscntl_init",
+      "ref_instr": 1,
+      "nim_instr": 2,
+      "line": 6930
+    },
+    {
+      "symbol": "led_set_all",
+      "ref_instr": 1,
+      "nim_instr": 2,
+      "line": 6779
+    },
+    {
+      "symbol": "led_init",
+      "ref_instr": 1,
+      "nim_instr": 2,
+      "line": 6778
+    },
+    {
+      "symbol": "emi_init",
+      "ref_instr": 1,
+      "nim_instr": 2,
+      "line": 6765
+    }
+  ]
+}

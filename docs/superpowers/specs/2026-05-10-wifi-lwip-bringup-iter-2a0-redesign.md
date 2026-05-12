@@ -16,7 +16,7 @@
 
 Replace the `wifi_vendor_support.c` lwIP stubs with real bridges to vendor lwIP, integrated **incrementally** so the build is verifiable after each commit. After this iteration:
 
-- `make m0 FILE=examples/m0_wifi_hal_test.nim NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=6509171272 -d:WifiScanOnly=true'` builds cleanly with vendor lwIP linked into the binary
+- `make m0 FILE=examples/m0_wifi_hal_test.nim NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=<wifi-password> -d:WifiScanOnly=true'` builds cleanly with vendor lwIP linked into the binary
 - `wifi_vendor_support.c`'s `netifapi_netif_add` / `tcpip_input` / `wifi_netif_dhcp_start` bridges actually call vendor lwIP (no longer no-ops)
 - The blob's WiFi netif is registered in vendor lwIP's netif chain
 - Future `dhcp_start(netif)` calls would actually trigger DHCP packets (untested in this iteration; smoke test is a follow-up)
@@ -29,7 +29,7 @@ Replace the `wifi_vendor_support.c` lwIP stubs with real bridges to vendor lwIP,
 - Anything BLE — separate iteration
 
 **Success criterion per commit** (mandatory, no exceptions):
-- Each commit must leave `make m0 FILE=examples/m0_wifi_hal_test.nim NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=6509171272 -d:WifiScanOnly=true' 2>&1 | tail -5` ending in `Output: build/m0_firmware.bin`. If a commit breaks the build, the commit is wrong and gets reverted before continuing.
+- Each commit must leave `make m0 FILE=examples/m0_wifi_hal_test.nim NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=<wifi-password> -d:WifiScanOnly=true' 2>&1 | tail -5` ending in `Output: build/m0_firmware.bin`. If a commit breaks the build, the commit is wrong and gets reverted before continuing.
 
 **Predicted state after iteration**: same observable behavior (scan/auth/4whs/assoc work; DHCP doesn't reach the AP because the test binary doesn't call `dhcp_start`). The DIFFERENCE is that the substrate is now correct — a follow-up iteration writing the smoke test will actually exercise DHCP.
 
@@ -53,7 +53,7 @@ Append a 257-byte newlib-format `_ctype_` table at end of file. Indexed by `c+1`
 
 Take the `_ctype_` definition verbatim from a known newlib source (or the Bouffalo SDK's copy if simpler) rather than inventing one — wrong bit flags would silently fail later.
 
-**Build verification**: `make m0 FILE=examples/m0_wifi_hal_test.nim NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=6509171272 -d:WifiScanOnly=true' 2>&1 | tail -5` must end in `Output: build/m0_firmware.bin`. The new symbol is currently unreferenced (no vendor lwIP in the link yet), so this is a pure-addition commit with zero behavior change.
+**Build verification**: `make m0 FILE=examples/m0_wifi_hal_test.nim NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=<wifi-password> -d:WifiScanOnly=true' 2>&1 | tail -5` must end in `Output: build/m0_firmware.bin`. The new symbol is currently unreferenced (no vendor lwIP in the link yet), so this is a pure-addition commit with zero behavior change.
 
 **Commit message**: `baremetal_libc: add _ctype_ table for vendor lwIP ip4_addr.c (Iter 2.A.0 step 1/4)`
 
@@ -199,7 +199,7 @@ src/bl808/wifi.nim
 ### Conventions
 
 - Each commit's diff scope is **only** the files listed for that commit. No incidental changes.
-- Build verification command is fixed: `make m0 FILE=examples/m0_wifi_hal_test.nim NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=6509171272 -d:WifiScanOnly=true' 2>&1 | tail -5`. Output must end with `Output: build/m0_firmware.bin`.
+- Build verification command is fixed: `make m0 FILE=examples/m0_wifi_hal_test.nim NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=<wifi-password> -d:WifiScanOnly=true' 2>&1 | tail -5`. Output must end with `Output: build/m0_firmware.bin`.
 - If any commit's verification fails, STOP and surface to the user. Do not paper over with more stubs.
 - Commit messages exact: the strings in Section 2.
 

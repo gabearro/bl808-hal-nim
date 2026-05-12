@@ -129,7 +129,7 @@ board                                      harness                    Mac/AP
 deinitForRetry()  →  next attempt
 ```
 
-Harness runs a tiny TCP echo server on its host (one socket, accept loop) so the test target IP is always the harness — no LAN-side fixture required. Credentials (`Frog` / `6509171272`) are passed via existing `-d:WifiSsid=… -d:WifiPassword=…` strdefines.
+Harness runs a tiny TCP echo server on its host (one socket, accept loop) so the test target IP is always the harness — no LAN-side fixture required. Credentials (`Frog` / `<wifi-password>`) are passed via existing `-d:WifiSsid=… -d:WifiPassword=…` strdefines.
 
 ### 3.2 BLE peripheral attempt
 

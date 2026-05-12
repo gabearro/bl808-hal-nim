@@ -3,7 +3,7 @@
 ## Build with:
 ##   make m0 FILE=examples/m0_wifi_e2e_test.nim \
 ##     NIM="nim -d:bl808kernel -d:bl808WifiVendor \
-##              -d:WifiSsid=Frog -d:WifiPassword=6509171272"
+##              -d:WifiSsid=Frog -d:WifiPassword=<wifi-password>"
 ##
 ## (`-d:bl808kernel` matches the validation harness path that brings in the
 ## kernel allocator the WiFi vendor blob requires.)

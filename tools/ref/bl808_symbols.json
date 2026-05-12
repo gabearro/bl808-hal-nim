@@ -1,0 +1,3187 @@
+[
+  {
+    "symbol": "scanu_frame_handler",
+    "instrs": 859,
+    "member": "scanu.o"
+  },
+  {
+    "symbol": "rxu_cntrl_frame_handle",
+    "instrs": 666,
+    "member": "rxu_cntrl.o"
+  },
+  {
+    "symbol": "apm_assoc_req_handler",
+    "instrs": 470,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "rc_init",
+    "instrs": 463,
+    "member": "rc.o"
+  },
+  {
+    "symbol": "rxu_mgt_frame_check",
+    "instrs": 411,
+    "member": "rxu_cntrl.o"
+  },
+  {
+    "symbol": "mm_hw_config_handler",
+    "instrs": 399,
+    "member": "mm_task.o"
+  },
+  {
+    "symbol": "hal_machw_init",
+    "instrs": 372,
+    "member": "hal_machw.o"
+  },
+  {
+    "symbol": "coex_dump_wifi",
+    "instrs": 363,
+    "member": "arch_main.o"
+  },
+  {
+    "symbol": "rxl_cntrl_evt",
+    "instrs": 352,
+    "member": "rxl_cntrl.o"
+  },
+  {
+    "symbol": "mm_sec_keydump",
+    "instrs": 325,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "rc_update_stats",
+    "instrs": 320,
+    "member": "rc.o"
+  },
+  {
+    "symbol": "apm_start_req_handler",
+    "instrs": 313,
+    "member": "apm_task.o"
+  },
+  {
+    "symbol": "mm_check_beacon",
+    "instrs": 290,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "me_build_beacon",
+    "instrs": 276,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "txl_cntrl_env_dump",
+    "instrs": 265,
+    "member": "txl_cntrl.o"
+  },
+  {
+    "symbol": "scanu_scan_next",
+    "instrs": 265,
+    "member": "scanu.o"
+  },
+  {
+    "symbol": "aes_encrypt_block",
+    "instrs": 261,
+    "member": "mfp_bip.o"
+  },
+  {
+    "symbol": "hal_machw_gen_handler",
+    "instrs": 243,
+    "member": "hal_machw.o"
+  },
+  {
+    "symbol": "rc_check",
+    "instrs": 242,
+    "member": "rc.o"
+  },
+  {
+    "symbol": "mm_sta_add",
+    "instrs": 223,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "txl_payload_handle_backup",
+    "instrs": 220,
+    "member": "txl_cntrl.o"
+  },
+  {
+    "symbol": "rxu_mgt_ind_handler",
+    "instrs": 219,
+    "member": "bam_task.o"
+  },
+  {
+    "symbol": "hal_machw_timing_info",
+    "instrs": 210,
+    "member": "hal_machw.o"
+  },
+  {
+    "symbol": "me_build_probe_rsp",
+    "instrs": 202,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "sm_auth_handler",
+    "instrs": 201,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "chan_distribute_slots",
+    "instrs": 196,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "bl_pm_ops_register",
+    "instrs": 196,
+    "member": "bl.o"
+  },
+  {
+    "symbol": "mfp_compute_bip",
+    "instrs": 191,
+    "member": "mfp_bip.o"
+  },
+  {
+    "symbol": "txl_frame_dump",
+    "instrs": 190,
+    "member": "txl_frame.o"
+  },
+  {
+    "symbol": "vif_mgmt_add_key",
+    "instrs": 185,
+    "member": "vif_mgmt.o"
+  },
+  {
+    "symbol": "bam_send_air_action_frame",
+    "instrs": 177,
+    "member": "bam.o"
+  },
+  {
+    "symbol": "chan_pre_switch_channel",
+    "instrs": 176,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "sm_connect_req_handler",
+    "instrs": 173,
+    "member": "sm_task.o"
+  },
+  {
+    "symbol": "me_update_buffer_control",
+    "instrs": 172,
+    "member": "me_utils.o"
+  },
+  {
+    "symbol": "mfp_ignore_mgmt_frame",
+    "instrs": 172,
+    "member": "mfp.o"
+  },
+  {
+    "symbol": "coex_dump_pta",
+    "instrs": 171,
+    "member": "arch_main.o"
+  },
+  {
+    "symbol": "mm_tim_update_proceed",
+    "instrs": 169,
+    "member": "mm_bcn.o"
+  },
+  {
+    "symbol": "me_build_associate_rsp",
+    "instrs": 166,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "sm_set_bss_param",
+    "instrs": 166,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "sm_auth_send",
+    "instrs": 166,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "txu_cntrl_frame_build",
+    "instrs": 163,
+    "member": "txu_cntrl.o"
+  },
+  {
+    "symbol": "chan_goto_idle_cb",
+    "instrs": 162,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "apm_send_mlme",
+    "instrs": 160,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "rxl_hwdesc_init",
+    "instrs": 159,
+    "member": "rxl_hwdesc.o"
+  },
+  {
+    "symbol": "me_build_associate_req",
+    "instrs": 159,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "wifi_main",
+    "instrs": 157,
+    "member": "arch_main.o"
+  },
+  {
+    "symbol": "txu_cntrl_push",
+    "instrs": 154,
+    "member": "txu_cntrl.o"
+  },
+  {
+    "symbol": "me_sta_add_req_handler",
+    "instrs": 153,
+    "member": "me_task.o"
+  },
+  {
+    "symbol": "sm_handle_connection",
+    "instrs": 151,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "mm_bcn_transmit",
+    "instrs": 149,
+    "member": "mm_bcn.o"
+  },
+  {
+    "symbol": "chan_ctxt_op_evt",
+    "instrs": 147,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "mm_sec_machwkey_wr",
+    "instrs": 143,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "vif_mgmt_register",
+    "instrs": 143,
+    "member": "vif_mgmt.o"
+  },
+  {
+    "symbol": "rxu_swdesc_upload_evt",
+    "instrs": 143,
+    "member": "rxu_cntrl.o"
+  },
+  {
+    "symbol": "sm_disconnect",
+    "instrs": 143,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "sm_assoc_req_send",
+    "instrs": 143,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "sm_assoc_rsp_handler",
+    "instrs": 141,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "scanu_join_cfm_handler",
+    "instrs": 141,
+    "member": "sm_task.o"
+  },
+  {
+    "symbol": "sm_deauth_handler",
+    "instrs": 140,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "_fw_queue_dumpp.isra.0",
+    "instrs": 140,
+    "member": "bugkiller_fw_queue.o"
+  },
+  {
+    "symbol": "rc_update_retry_chain",
+    "instrs": 137,
+    "member": "rc.o"
+  },
+  {
+    "symbol": "apm_start_cfm",
+    "instrs": 135,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "cfg_api_element_dump",
+    "instrs": 135,
+    "member": "cfg_api.o"
+  },
+  {
+    "symbol": "sm_connect_ind",
+    "instrs": 133,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "sm_handle_supplicant_result",
+    "instrs": 133,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "chan_tbtt_insert",
+    "instrs": 131,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "sta_mgmt_register",
+    "instrs": 127,
+    "member": "sta_mgmt.o"
+  },
+  {
+    "symbol": "txl_frame_init",
+    "instrs": 124,
+    "member": "txl_frame.o"
+  },
+  {
+    "symbol": "me_beacon_check",
+    "instrs": 124,
+    "member": "me_utils.o"
+  },
+  {
+    "symbol": "rc_update_bw_nss_max",
+    "instrs": 124,
+    "member": "rc.o"
+  },
+  {
+    "symbol": "apm_set_bss_param",
+    "instrs": 123,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "txl_transmit_trigger",
+    "instrs": 122,
+    "member": "txl_cntrl.o"
+  },
+  {
+    "symbol": "apm_tx_int_ps_get_postpone",
+    "instrs": 122,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "rc_new_random_rate",
+    "instrs": 119,
+    "member": "rc.o"
+  },
+  {
+    "symbol": "me_extract_csa",
+    "instrs": 117,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "me_mic_calc",
+    "instrs": 117,
+    "member": "me_mic.o"
+  },
+  {
+    "symbol": "ps_dpsm_update",
+    "instrs": 116,
+    "member": "ps.o"
+  },
+  {
+    "symbol": "ke_task_schedule",
+    "instrs": 116,
+    "member": "ke_task.o"
+  },
+  {
+    "symbol": "ps_set_mode",
+    "instrs": 115,
+    "member": "ps.o"
+  },
+  {
+    "symbol": "scan_probe_req_tx",
+    "instrs": 114,
+    "member": "scan.o"
+  },
+  {
+    "symbol": "txl_cfm_dump",
+    "instrs": 113,
+    "member": "txl_cfm.o"
+  },
+  {
+    "symbol": "chan_ctxt_unlink",
+    "instrs": 112,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "rc_update_counters",
+    "instrs": 112,
+    "member": "rc.o"
+  },
+  {
+    "symbol": "rxl_hwdesc_dump",
+    "instrs": 111,
+    "member": "rxl_hwdesc.o"
+  },
+  {
+    "symbol": "vif_mgmt_unregister",
+    "instrs": 111,
+    "member": "vif_mgmt.o"
+  },
+  {
+    "symbol": "mm_sta_del",
+    "instrs": 109,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "txu_cntrl_tkip_mic_append",
+    "instrs": 109,
+    "member": "txu_cntrl.o"
+  },
+  {
+    "symbol": "bugkiller_fw_queue_timer_dump",
+    "instrs": 109,
+    "member": "bugkiller_fw_queue.o"
+  },
+  {
+    "symbol": "mm_tbtt_evt",
+    "instrs": 108,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "txl_buffer_init",
+    "instrs": 107,
+    "member": "txl_buffer.o"
+  },
+  {
+    "symbol": "sm_get_bss_params",
+    "instrs": 107,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "mm_bcn_update",
+    "instrs": 105,
+    "member": "mm_bcn.o"
+  },
+  {
+    "symbol": "ps_check_frame",
+    "instrs": 105,
+    "member": "ps.o"
+  },
+  {
+    "symbol": "coex_pta_force_autocontrol_set",
+    "instrs": 104,
+    "member": "bl.o"
+  },
+  {
+    "symbol": "sm_send_sa_query",
+    "instrs": 104,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "ke_timer_set",
+    "instrs": 104,
+    "member": "ke_timer.o"
+  },
+  {
+    "symbol": "scanu_search_by_ssid",
+    "instrs": 103,
+    "member": "scanu.o"
+  },
+  {
+    "symbol": "apm_probe_req_handler",
+    "instrs": 103,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "coex_wifi_pta_forece_enable",
+    "instrs": 103,
+    "member": "arch_main.o"
+  },
+  {
+    "symbol": "ipc_emb_init",
+    "instrs": 103,
+    "member": "ipc_emb.o"
+  },
+  {
+    "symbol": "txl_frame_send_qosnull_frame",
+    "instrs": 101,
+    "member": "txl_frame.o"
+  },
+  {
+    "symbol": "_aid_list_delete.isra.0",
+    "instrs": 101,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "ipc_emb_msg_evt",
+    "instrs": 101,
+    "member": "ipc_emb.o"
+  },
+  {
+    "symbol": "td_timer_end",
+    "instrs": 100,
+    "member": "td.o"
+  },
+  {
+    "symbol": "chan_tbtt_schedule",
+    "instrs": 98,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "ipc_emb_tx_evt",
+    "instrs": 97,
+    "member": "ipc_emb.o"
+  },
+  {
+    "symbol": "chan_get_next_chan",
+    "instrs": 95,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "ps_check_beacon",
+    "instrs": 94,
+    "member": "ps.o"
+  },
+  {
+    "symbol": "rc_update_preamble_type",
+    "instrs": 94,
+    "member": "rc.o"
+  },
+  {
+    "symbol": "rxu_cntrl_protected_handle",
+    "instrs": 94,
+    "member": "rxu_cntrl.o"
+  },
+  {
+    "symbol": "rxu_mpdu_upload_and_indicate.constprop.0",
+    "instrs": 94,
+    "member": "rxu_cntrl.o"
+  },
+  {
+    "symbol": "txl_cntrl_push_int",
+    "instrs": 92,
+    "member": "txl_cntrl.o"
+  },
+  {
+    "symbol": "vif_mgmt_statistic_dump",
+    "instrs": 92,
+    "member": "vif_mgmt.o"
+  },
+  {
+    "symbol": "dump_cfg_entries",
+    "instrs": 92,
+    "member": "cfg_task.o"
+  },
+  {
+    "symbol": "ke_state_set",
+    "instrs": 92,
+    "member": "ke_task.o"
+  },
+  {
+    "symbol": "ps_uapsd_timer_handle",
+    "instrs": 91,
+    "member": "ps.o"
+  },
+  {
+    "symbol": "sm_deauth_send",
+    "instrs": 91,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "me_add_ie_rsn",
+    "instrs": 90,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "sm_scan_bss",
+    "instrs": 90,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "mm_sta_add_cfm_handler",
+    "instrs": 90,
+    "member": "sm_task.o"
+  },
+  {
+    "symbol": "mm_sta_tbtt",
+    "instrs": 89,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "txl_frame_send_null_frame",
+    "instrs": 88,
+    "member": "txl_frame.o"
+  },
+  {
+    "symbol": "sta_mgmt_send_postponed_frame",
+    "instrs": 87,
+    "member": "sta_mgmt.o"
+  },
+  {
+    "symbol": "txl_reset",
+    "instrs": 87,
+    "member": "txl_cntrl.o"
+  },
+  {
+    "symbol": "txl_frame_get",
+    "instrs": 87,
+    "member": "txl_frame.o"
+  },
+  {
+    "symbol": "sta_mgmt_init",
+    "instrs": 86,
+    "member": "sta_mgmt.o"
+  },
+  {
+    "symbol": "scan_set_channel_request",
+    "instrs": 85,
+    "member": "scan.o"
+  },
+  {
+    "symbol": "tpc_update_tx_power",
+    "instrs": 85,
+    "member": "tpc.o"
+  },
+  {
+    "symbol": "chan_ctxt_link",
+    "instrs": 83,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "bl_wifi_set_sta_key_internal",
+    "instrs": 83,
+    "member": "supplicant_api.o"
+  },
+  {
+    "symbol": "sta_mgmt_add_key",
+    "instrs": 81,
+    "member": "sta_mgmt.o"
+  },
+  {
+    "symbol": "me_set_active_cfm_handler",
+    "instrs": 81,
+    "member": "sm_task.o"
+  },
+  {
+    "symbol": "apm_sta_delete",
+    "instrs": 81,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "mm_bcn_init_vif",
+    "instrs": 80,
+    "member": "mm_bcn.o"
+  },
+  {
+    "symbol": "sm_auth_assoc_send_according_chan",
+    "instrs": 80,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "mm_set_vif_state_cfm_handler",
+    "instrs": 80,
+    "member": "sm_task.o"
+  },
+  {
+    "symbol": "mfp_add_mgmt_mic",
+    "instrs": 80,
+    "member": "mfp.o"
+  },
+  {
+    "symbol": "apm_sta_connect_timeout_ind_handler",
+    "instrs": 80,
+    "member": "apm_task.o"
+  },
+  {
+    "symbol": "set_key.constprop.0",
+    "instrs": 80,
+    "member": "supplicant_api.o"
+  },
+  {
+    "symbol": "assert_rec",
+    "instrs": 79,
+    "member": "arch_main.o"
+  },
+  {
+    "symbol": "assert_err",
+    "instrs": 79,
+    "member": "arch_main.o"
+  },
+  {
+    "symbol": "_dump_ke_task",
+    "instrs": 78,
+    "member": "bugkiller_fw_task.o"
+  },
+  {
+    "symbol": "mm_check_rssi",
+    "instrs": 77,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "txu_cntrl_sec_hdr_append",
+    "instrs": 77,
+    "member": "txu_cntrl.o"
+  },
+  {
+    "symbol": "mm_sec_machwkey_del",
+    "instrs": 76,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "ps_enable_cfm_handle",
+    "instrs": 76,
+    "member": "ps.o"
+  },
+  {
+    "symbol": "me_set_ps_disable_req_handler",
+    "instrs": 76,
+    "member": "me_task.o"
+  },
+  {
+    "symbol": "scanu_rm_exist_ssid",
+    "instrs": 76,
+    "member": "scanu.o"
+  },
+  {
+    "symbol": "sm_delete_resources",
+    "instrs": 76,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "txu_cntrl_sechdr_len_compute",
+    "instrs": 76,
+    "member": "txu_cntrl.o"
+  },
+  {
+    "symbol": "mm_timer_set",
+    "instrs": 74,
+    "member": "mm_timer.o"
+  },
+  {
+    "symbol": "rxl_timer_int_handler",
+    "instrs": 74,
+    "member": "rxl_cntrl.o"
+  },
+  {
+    "symbol": "chan_cde_evt",
+    "instrs": 73,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "txl_cfm_flush",
+    "instrs": 73,
+    "member": "txl_cfm.o"
+  },
+  {
+    "symbol": "txl_cntrl_push",
+    "instrs": 73,
+    "member": "txl_cntrl.o"
+  },
+  {
+    "symbol": "me_config_req_handler",
+    "instrs": 73,
+    "member": "me_task.o"
+  },
+  {
+    "symbol": "sm_join_bss",
+    "instrs": 73,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "chan_init",
+    "instrs": 72,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "ps_disable_cfm_handle",
+    "instrs": 72,
+    "member": "ps.o"
+  },
+  {
+    "symbol": "me_set_active_req_handler",
+    "instrs": 72,
+    "member": "me_task.o"
+  },
+  {
+    "symbol": "apm_stop",
+    "instrs": 72,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "scanu_raw_send_req_handler",
+    "instrs": 71,
+    "member": "scanu_task.o"
+  },
+  {
+    "symbol": "scanu_join_req_handler",
+    "instrs": 70,
+    "member": "scanu_task.o"
+  },
+  {
+    "symbol": "chan_tbtt_switch_evt",
+    "instrs": 69,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "txl_cfm_evt",
+    "instrs": 69,
+    "member": "txl_cfm.o"
+  },
+  {
+    "symbol": "me_rc_set_rate_req_handler",
+    "instrs": 69,
+    "member": "me_task.o"
+  },
+  {
+    "symbol": "bl_wifi_set_igtk_internal",
+    "instrs": 69,
+    "member": "supplicant_api.o"
+  },
+  {
+    "symbol": "chan_ctxt_add",
+    "instrs": 68,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "ps_send_pspoll",
+    "instrs": 68,
+    "member": "ps.o"
+  },
+  {
+    "symbol": "bl_sleep_schedule",
+    "instrs": 68,
+    "member": "bl.o"
+  },
+  {
+    "symbol": "mm_scan_channel_end_ind_handler",
+    "instrs": 68,
+    "member": "scan_task.o"
+  },
+  {
+    "symbol": "mm_scan_channel_start_ind_handler",
+    "instrs": 68,
+    "member": "scan_task.o"
+  },
+  {
+    "symbol": "me_extract_rate_set",
+    "instrs": 68,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "sm_connect_abort_req_handler",
+    "instrs": 68,
+    "member": "sm_task.o"
+  },
+  {
+    "symbol": "chan_conn_less_delay_prog",
+    "instrs": 67,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "chan_scan_req",
+    "instrs": 67,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "chan_bcn_detect_start",
+    "instrs": 67,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "mm_monitor_enable_req_handler",
+    "instrs": 67,
+    "member": "mm_task.o"
+  },
+  {
+    "symbol": "ps_traffic_status_update",
+    "instrs": 67,
+    "member": "ps.o"
+  },
+  {
+    "symbol": "rxl_cntrl_dump",
+    "instrs": 67,
+    "member": "rxl_cntrl.o"
+  },
+  {
+    "symbol": "vif_mgmt_init",
+    "instrs": 67,
+    "member": "vif_mgmt.o"
+  },
+  {
+    "symbol": "me_traffic_ind_req_handler",
+    "instrs": 67,
+    "member": "me_task.o"
+  },
+  {
+    "symbol": "apm_stop_req_handler",
+    "instrs": 67,
+    "member": "apm_task.o"
+  },
+  {
+    "symbol": "txl_frame_send_selfcts_frame",
+    "instrs": 66,
+    "member": "txl_frame.o"
+  },
+  {
+    "symbol": "me_mic_init",
+    "instrs": 66,
+    "member": "me_mic.o"
+  },
+  {
+    "symbol": "mm_set_idle_req_handler",
+    "instrs": 64,
+    "member": "mm_task.o"
+  },
+  {
+    "symbol": "mm_timer_schedule",
+    "instrs": 63,
+    "member": "mm_timer.o"
+  },
+  {
+    "symbol": "me_set_ps_disable_cfm_handler",
+    "instrs": 63,
+    "member": "sm_task.o"
+  },
+  {
+    "symbol": "apm_sta_add_cfm_handler",
+    "instrs": 63,
+    "member": "apm_task.o"
+  },
+  {
+    "symbol": "mm_start_req_handler",
+    "instrs": 62,
+    "member": "mm_task.o"
+  },
+  {
+    "symbol": "apm_sta_remove",
+    "instrs": 62,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "ke_timer_schedule",
+    "instrs": 62,
+    "member": "ke_timer.o"
+  },
+  {
+    "symbol": "txl_cntrl_halt_ac",
+    "instrs": 61,
+    "member": "txl_cntrl.o"
+  },
+  {
+    "symbol": "rc_sort_samples_tp",
+    "instrs": 61,
+    "member": "rc.o"
+  },
+  {
+    "symbol": "intc_init",
+    "instrs": 61,
+    "member": "intc.o"
+  },
+  {
+    "symbol": "rc_set_next_mcs_index",
+    "instrs": 59,
+    "member": "rc.o"
+  },
+  {
+    "symbol": "apm_auth_handler",
+    "instrs": 59,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "cfg_api_element_set",
+    "instrs": 59,
+    "member": "cfg_api.o"
+  },
+  {
+    "symbol": "bl_wifi_set_ap_key_internal",
+    "instrs": 59,
+    "member": "supplicant_api.o"
+  },
+  {
+    "symbol": "scan_start_req_handler",
+    "instrs": 58,
+    "member": "scan_task.o"
+  },
+  {
+    "symbol": "sta_mgmt_postponed_desc_release",
+    "instrs": 58,
+    "member": "sta_mgmt.o"
+  },
+  {
+    "symbol": "tpc_update_vif_tx_power",
+    "instrs": 58,
+    "member": "tpc.o"
+  },
+  {
+    "symbol": "scanu_confirm",
+    "instrs": 58,
+    "member": "scanu.o"
+  },
+  {
+    "symbol": "apm_disassoc_handler",
+    "instrs": 58,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "chan_ctxt_update",
+    "instrs": 57,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "hal_machw_rx_duration",
+    "instrs": 57,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "ps_check_tx_status.part.0",
+    "instrs": 57,
+    "member": "ps.o"
+  },
+  {
+    "symbol": "ps_check_tx_frame",
+    "instrs": 57,
+    "member": "ps.o"
+  },
+  {
+    "symbol": "scanu_start_cfm_handler",
+    "instrs": 57,
+    "member": "sm_task.o"
+  },
+  {
+    "symbol": "apm_bcn_set",
+    "instrs": 57,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "chan_ctxt_del",
+    "instrs": 56,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "ke_timer_clear",
+    "instrs": 56,
+    "member": "ke_timer.o"
+  },
+  {
+    "symbol": "mm_monitor_channel_req_handler",
+    "instrs": 55,
+    "member": "mm_task.o"
+  },
+  {
+    "symbol": "me_add_ie_ht_capa",
+    "instrs": 55,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "me_legacy_rate_bitfield_build",
+    "instrs": 55,
+    "member": "me_utils.o"
+  },
+  {
+    "symbol": "rc_get_duration",
+    "instrs": 55,
+    "member": "rc.o"
+  },
+  {
+    "symbol": "chan_upd_ctxt_status",
+    "instrs": 54,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "chan_roc_req",
+    "instrs": 54,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "wakeup_from_doze_pre",
+    "instrs": 54,
+    "member": "bl.o"
+  },
+  {
+    "symbol": "rc_check_fixed_rate_config",
+    "instrs": 54,
+    "member": "rc.o"
+  },
+  {
+    "symbol": "mm_sec_machwaddr_wr",
+    "instrs": 53,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "rxl_mpdu_free",
+    "instrs": 53,
+    "member": "rxl_cntrl.o"
+  },
+  {
+    "symbol": "txl_buffer_update_thd",
+    "instrs": 53,
+    "member": "txl_buffer.o"
+  },
+  {
+    "symbol": "txl_frame_evt",
+    "instrs": 53,
+    "member": "txl_frame.o"
+  },
+  {
+    "symbol": "me_add_ie_wpa",
+    "instrs": 53,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "scan_done_ind_handler",
+    "instrs": 53,
+    "member": "scanu_task.o"
+  },
+  {
+    "symbol": "cfg_start_req_handler",
+    "instrs": 53,
+    "member": "cfg_task.o"
+  },
+  {
+    "symbol": "chan_conn_less_delay_evt",
+    "instrs": 52,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "sm_sa_query_handler",
+    "instrs": 52,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "apm_tx_int_ps_check",
+    "instrs": 52,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "cfg_api_element_general_set",
+    "instrs": 52,
+    "member": "cfg_api.o"
+  },
+  {
+    "symbol": "txl_buffer_alloc",
+    "instrs": 51,
+    "member": "txl_buffer.o"
+  },
+  {
+    "symbol": "phy_channel_to_freq",
+    "instrs": 51,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "sm_handle_eapol_input",
+    "instrs": 51,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "co_list_remove",
+    "instrs": 51,
+    "member": "co_list.o"
+  },
+  {
+    "symbol": "co_pool_init",
+    "instrs": 51,
+    "member": "co_pool.o"
+  },
+  {
+    "symbol": "me_build_sae_authenticate",
+    "instrs": 50,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "sm_sa_query_timeout_ind_handler",
+    "instrs": 50,
+    "member": "sm_task.o"
+  },
+  {
+    "symbol": "bl_fw_statistic_dump",
+    "instrs": 50,
+    "member": "ke_event.o"
+  },
+  {
+    "symbol": "hal_machw_reset",
+    "instrs": 49,
+    "member": "hal_machw.o"
+  },
+  {
+    "symbol": "set_mac_to_doze",
+    "instrs": 49,
+    "member": "bl.o"
+  },
+  {
+    "symbol": "me_rate_translate",
+    "instrs": 49,
+    "member": "me_utils.o"
+  },
+  {
+    "symbol": "mm_env_max_ampdu_duration_set",
+    "instrs": 48,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "aes_cmac_shift_sub_key",
+    "instrs": 48,
+    "member": "mfp_bip.o"
+  },
+  {
+    "symbol": "txl_frame_push",
+    "instrs": 47,
+    "member": "txl_frame.o"
+  },
+  {
+    "symbol": "apm_tx_int_ps_postpone",
+    "instrs": 47,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "mm_sec_machwkey_get",
+    "instrs": 46,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "wait_mac_goto_idle",
+    "instrs": 46,
+    "member": "bl.o"
+  },
+  {
+    "symbol": "rxl_pd_append",
+    "instrs": 46,
+    "member": "rxl_hwdesc.o"
+  },
+  {
+    "symbol": "txl_cntrl_clear_all_ac",
+    "instrs": 46,
+    "member": "txl_cntrl.o"
+  },
+  {
+    "symbol": "me_add_ie_ht_oper",
+    "instrs": 46,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "me_extract_country_reg",
+    "instrs": 46,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "rc_get_initial_rate_config",
+    "instrs": 46,
+    "member": "rc.o"
+  },
+  {
+    "symbol": "ke_state_get",
+    "instrs": 46,
+    "member": "ke_task.o"
+  },
+  {
+    "symbol": "chan_switch_start",
+    "instrs": 45,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "rc_calc_tp",
+    "instrs": 45,
+    "member": "rc.o"
+  },
+  {
+    "symbol": "sm_rsp_timeout_ind_handler",
+    "instrs": 45,
+    "member": "sm_task.o"
+  },
+  {
+    "symbol": "hal_machw_sleep_check",
+    "instrs": 44,
+    "member": "hal_machw.o"
+  },
+  {
+    "symbol": "mm_set_ps_options_req_handler",
+    "instrs": 44,
+    "member": "mm_task.o"
+  },
+  {
+    "symbol": "txl_cfm_flush_desc",
+    "instrs": 44,
+    "member": "txl_cfm.o"
+  },
+  {
+    "symbol": "txl_cntrl_flush_ac",
+    "instrs": 44,
+    "member": "txl_cntrl.o"
+  },
+  {
+    "symbol": "replay_counter_validate",
+    "instrs": 44,
+    "member": "replay_counter.o"
+  },
+  {
+    "symbol": "ke_msg_alloc",
+    "instrs": 44,
+    "member": "ke_msg.o"
+  },
+  {
+    "symbol": "assert_warn",
+    "instrs": 44,
+    "member": "arch_main.o"
+  },
+  {
+    "symbol": "mm_force_idle_req_handler",
+    "instrs": 43,
+    "member": "mm_task.o"
+  },
+  {
+    "symbol": "sm_disconnect_process",
+    "instrs": 43,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "mm_hw_info_set",
+    "instrs": 42,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "rxl_mpdu_transfer",
+    "instrs": 42,
+    "member": "rxl_cntrl.o"
+  },
+  {
+    "symbol": "txl_cntrl_init",
+    "instrs": 42,
+    "member": "txl_cntrl.o"
+  },
+  {
+    "symbol": "vif_mgmt_set_ap_bcn_int",
+    "instrs": 42,
+    "member": "vif_mgmt.o"
+  },
+  {
+    "symbol": "rc_set_previous_mcs_index",
+    "instrs": 42,
+    "member": "rc.o"
+  },
+  {
+    "symbol": "mm_connection_loss_ind_handler",
+    "instrs": 42,
+    "member": "sm_task.o"
+  },
+  {
+    "symbol": "co_pool_free",
+    "instrs": 42,
+    "member": "co_pool.o"
+  },
+  {
+    "symbol": "td_reset",
+    "instrs": 41,
+    "member": "td.o"
+  },
+  {
+    "symbol": "txl_frame_push_force",
+    "instrs": 41,
+    "member": "txl_frame.o"
+  },
+  {
+    "symbol": "phyif_utils_decode",
+    "instrs": 41,
+    "member": "rxu_cntrl.o"
+  },
+  {
+    "symbol": "apm_tx_int_ps_clear",
+    "instrs": 41,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "co_dlist_extract",
+    "instrs": 41,
+    "member": "co_dlist.o"
+  },
+  {
+    "symbol": "ke_msg_send",
+    "instrs": 41,
+    "member": "ke_msg.o"
+  },
+  {
+    "symbol": "mm_bcn_transmitted",
+    "instrs": 40,
+    "member": "mm_bcn.o"
+  },
+  {
+    "symbol": "ps_disable_cfm",
+    "instrs": 40,
+    "member": "ps.o"
+  },
+  {
+    "symbol": "ps_enable_cfm",
+    "instrs": 40,
+    "member": "ps.o"
+  },
+  {
+    "symbol": "mm_bss_param_setting_handler",
+    "instrs": 40,
+    "member": "sm_task.o"
+  },
+  {
+    "symbol": "txu_cntrl_protect_mgmt_frame",
+    "instrs": 40,
+    "member": "txu_cntrl.o"
+  },
+  {
+    "symbol": "apm_sta_del_req_handler",
+    "instrs": 40,
+    "member": "apm_task.o"
+  },
+  {
+    "symbol": "ke_flush",
+    "instrs": 40,
+    "member": "ke_event.o"
+  },
+  {
+    "symbol": "hal_machw_idle_req",
+    "instrs": 39,
+    "member": "hal_machw.o"
+  },
+  {
+    "symbol": "bl60x_edca_get",
+    "instrs": 39,
+    "member": "mm_task.o"
+  },
+  {
+    "symbol": "bl_tpc_update_power_table_channel_offset",
+    "instrs": 39,
+    "member": "tpc.o"
+  },
+  {
+    "symbol": "txl_cntrl_push_int_force",
+    "instrs": 39,
+    "member": "txl_cntrl.o"
+  },
+  {
+    "symbol": "co_list_pool_init",
+    "instrs": 39,
+    "member": "co_list.o"
+  },
+  {
+    "symbol": "chan_tbtt_switch_update",
+    "instrs": 38,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "rc_check_valid_rate",
+    "instrs": 38,
+    "member": "rc.o"
+  },
+  {
+    "symbol": "apm_sta_add",
+    "instrs": 38,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "ke_queue_extract",
+    "instrs": 38,
+    "member": "ke_queue.o"
+  },
+  {
+    "symbol": "chan_tbtt_detect_conflict.isra.0",
+    "instrs": 37,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "rxl_hd_append",
+    "instrs": 37,
+    "member": "rxl_hwdesc.o"
+  },
+  {
+    "symbol": "txl_frame_init_desc",
+    "instrs": 37,
+    "member": "txl_frame.o"
+  },
+  {
+    "symbol": "scanu_start",
+    "instrs": 37,
+    "member": "scanu.o"
+  },
+  {
+    "symbol": "sm_connection_sta_add_ind",
+    "instrs": 37,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "sm_assoc_done",
+    "instrs": 37,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "mfp_protect_mgmt_frame",
+    "instrs": 37,
+    "member": "mfp.o"
+  },
+  {
+    "symbol": "ke_handler_search",
+    "instrs": 37,
+    "member": "ke_task.o"
+  },
+  {
+    "symbol": "ps_uapsd_set",
+    "instrs": 36,
+    "member": "ps.o"
+  },
+  {
+    "symbol": "td_start",
+    "instrs": 36,
+    "member": "td.o"
+  },
+  {
+    "symbol": "apm_deauth_handler",
+    "instrs": 36,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "apm_conf_max_sta_req_handler",
+    "instrs": 36,
+    "member": "apm_task.o"
+  },
+  {
+    "symbol": "co_pool_alloc",
+    "instrs": 36,
+    "member": "co_pool.o"
+  },
+  {
+    "symbol": "vif_mgmt_del_key",
+    "instrs": 35,
+    "member": "vif_mgmt.o"
+  },
+  {
+    "symbol": "me_init_bcmc_rate",
+    "instrs": 35,
+    "member": "me_utils.o"
+  },
+  {
+    "symbol": "notifier_chain_call",
+    "instrs": 35,
+    "member": "notifier.o"
+  },
+  {
+    "symbol": "bl_wifi_set_appie_internal",
+    "instrs": 35,
+    "member": "supplicant_api.o"
+  },
+  {
+    "symbol": "bugkiller_fw_task_dump",
+    "instrs": 35,
+    "member": "bugkiller_fw_task.o"
+  },
+  {
+    "symbol": "hal_machw_monitor_mode",
+    "instrs": 34,
+    "member": "hal_machw.o"
+  },
+  {
+    "symbol": "me_add_ie_supp_rates",
+    "instrs": 34,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "mm_set_ps_mode_cfm_handler",
+    "instrs": 34,
+    "member": "me_task.o"
+  },
+  {
+    "symbol": "mm_set_idle_cfm_handler",
+    "instrs": 34,
+    "member": "me_task.o"
+  },
+  {
+    "symbol": "co_list_extract",
+    "instrs": 34,
+    "member": "co_list.o"
+  },
+  {
+    "symbol": "bl_event_handle",
+    "instrs": 34,
+    "member": "ke_event.o"
+  },
+  {
+    "symbol": "ke_evt_schedule",
+    "instrs": 34,
+    "member": "ke_event.o"
+  },
+  {
+    "symbol": "bl_wifi_ap_deauth_internal",
+    "instrs": 34,
+    "member": "supplicant_api.o"
+  },
+  {
+    "symbol": "mm_set_ps_mode_req_handler",
+    "instrs": 33,
+    "member": "mm_task.o"
+  },
+  {
+    "symbol": "co_list_insert",
+    "instrs": 33,
+    "member": "co_list.o"
+  },
+  {
+    "symbol": "hal_machw_search_addr",
+    "instrs": 32,
+    "member": "hal_machw.o"
+  },
+  {
+    "symbol": "mm_remain_on_channel_req_handler",
+    "instrs": 32,
+    "member": "mm_task.o"
+  },
+  {
+    "symbol": "mm_reset_req_handler",
+    "instrs": 32,
+    "member": "mm_task.o"
+  },
+  {
+    "symbol": "scan_init",
+    "instrs": 32,
+    "member": "scan.o"
+  },
+  {
+    "symbol": "me_mic_end",
+    "instrs": 32,
+    "member": "me_mic.o"
+  },
+  {
+    "symbol": "scanu_find_result",
+    "instrs": 32,
+    "member": "scanu.o"
+  },
+  {
+    "symbol": "sm_connect_auth_assoc_req",
+    "instrs": 32,
+    "member": "sm_task.o"
+  },
+  {
+    "symbol": "mac_vsie_find",
+    "instrs": 32,
+    "member": "mac_ie.o"
+  },
+  {
+    "symbol": "mm_env_init",
+    "instrs": 31,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "mm_version_req_handler",
+    "instrs": 31,
+    "member": "mm_task.o"
+  },
+  {
+    "symbol": "wait_mac_goto_prestate",
+    "instrs": 31,
+    "member": "bl.o"
+  },
+  {
+    "symbol": "me_sta_del_req_handler",
+    "instrs": 31,
+    "member": "me_task.o"
+  },
+  {
+    "symbol": "me_tx_cfm_singleton",
+    "instrs": 31,
+    "member": "me_utils.o"
+  },
+  {
+    "symbol": "sm_disconnect_req_handler",
+    "instrs": 31,
+    "member": "sm_task.o"
+  },
+  {
+    "symbol": "apm_tx_cfm_handler",
+    "instrs": 31,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "chan_update_tx_power",
+    "instrs": 30,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "chan_ctxt_get_remaining_time_ms",
+    "instrs": 30,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "scan_ie_download",
+    "instrs": 30,
+    "member": "scan.o"
+  },
+  {
+    "symbol": "txl_cfm_init",
+    "instrs": 30,
+    "member": "txl_cfm.o"
+  },
+  {
+    "symbol": "rxu_cntrl_check_pn.constprop.0",
+    "instrs": 30,
+    "member": "rxu_cntrl.o"
+  },
+  {
+    "symbol": "sm_get_set_machwkey_index",
+    "instrs": 30,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "coex_wifi_pti_forece_enable",
+    "instrs": 30,
+    "member": "arch_main.o"
+  },
+  {
+    "symbol": "phy_freq_to_channel",
+    "instrs": 29,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "ipc_emb_cfmback_irq",
+    "instrs": 29,
+    "member": "ipc_emb.o"
+  },
+  {
+    "symbol": "mm_init",
+    "instrs": 28,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "txl_frame_release",
+    "instrs": 28,
+    "member": "txl_frame.o"
+  },
+  {
+    "symbol": "me_freq_to_chan_ptr",
+    "instrs": 28,
+    "member": "me.o"
+  },
+  {
+    "symbol": "find_wpa_rsn_ie",
+    "instrs": 28,
+    "member": "scanu.o"
+  },
+  {
+    "symbol": "sm_issue_sa_query_request",
+    "instrs": 28,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "notifier_chain_regsiter",
+    "instrs": 28,
+    "member": "notifier.o"
+  },
+  {
+    "symbol": "mac_irq",
+    "instrs": 28,
+    "member": "intc.o"
+  },
+  {
+    "symbol": "bl_wifi_auth_done_internal",
+    "instrs": 28,
+    "member": "supplicant_api.o"
+  },
+  {
+    "symbol": "mm_hw_ap_info_set",
+    "instrs": 27,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "mm_back_to_host_idle",
+    "instrs": 27,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "bl_reset_evt",
+    "instrs": 27,
+    "member": "bl.o"
+  },
+  {
+    "symbol": "me_add_ie_ssid",
+    "instrs": 27,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "me_build_add_ba_req",
+    "instrs": 27,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "rc_calc_prob_ewma",
+    "instrs": 27,
+    "member": "rc.o"
+  },
+  {
+    "symbol": "sm_add_chan_ctx",
+    "instrs": 27,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "co_list_push_back",
+    "instrs": 27,
+    "member": "co_list.o"
+  },
+  {
+    "symbol": "notifier_chain_unregsiter",
+    "instrs": 27,
+    "member": "notifier.o"
+  },
+  {
+    "symbol": "mm_sta_add_req_handler",
+    "instrs": 26,
+    "member": "mm_task.o"
+  },
+  {
+    "symbol": "ps_tx_null_timer_handle",
+    "instrs": 26,
+    "member": "ps.o"
+  },
+  {
+    "symbol": "sta_mgmt_unregister",
+    "instrs": 26,
+    "member": "sta_mgmt.o"
+  },
+  {
+    "symbol": "blmac_abs_timer_set",
+    "instrs": 26,
+    "member": "txl_cntrl.o"
+  },
+  {
+    "symbol": "me_add_ie_ext_supp_rates",
+    "instrs": 26,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "michael_block",
+    "instrs": 26,
+    "member": "me_mic.o"
+  },
+  {
+    "symbol": "scanu_cached_scanresult_clear",
+    "instrs": 26,
+    "member": "scanu.o"
+  },
+  {
+    "symbol": "mm_sta_timer_bcn_timeout",
+    "instrs": 25,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "mm_ps_change_ind",
+    "instrs": 25,
+    "member": "rxl_cntrl.o"
+  },
+  {
+    "symbol": "td_cfm_set_timer",
+    "instrs": 25,
+    "member": "td.o"
+  },
+  {
+    "symbol": "me_build_authenticate",
+    "instrs": 25,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "mfp_is_robust_frame",
+    "instrs": 25,
+    "member": "mfp.o"
+  },
+  {
+    "symbol": "bl_wifi_get_sta_gtk",
+    "instrs": 25,
+    "member": "supplicant_api.o"
+  },
+  {
+    "symbol": "mm_hw_ap_info_reset",
+    "instrs": 24,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "ps_check_tbtt",
+    "instrs": 24,
+    "member": "ps.o"
+  },
+  {
+    "symbol": "bl60x_firmwre_mpdu_free",
+    "instrs": 24,
+    "member": "rxl_cntrl.o"
+  },
+  {
+    "symbol": "scan_abort_req_handler",
+    "instrs": 24,
+    "member": "scan_task.o"
+  },
+  {
+    "symbol": "sta_mgmt_aging_postponed_desc",
+    "instrs": 24,
+    "member": "sta_mgmt.o"
+  },
+  {
+    "symbol": "td_pack_tim_ind",
+    "instrs": 24,
+    "member": "td.o"
+  },
+  {
+    "symbol": "rxu_cntrl_init",
+    "instrs": 24,
+    "member": "rxu_cntrl.o"
+  },
+  {
+    "symbol": "co_list_push_front",
+    "instrs": 24,
+    "member": "co_list.o"
+  },
+  {
+    "symbol": "blmac_pwr_mgt_setf",
+    "instrs": 23,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "mm_force_idle_req",
+    "instrs": 23,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "mm_timer_clear",
+    "instrs": 23,
+    "member": "mm_timer.o"
+  },
+  {
+    "symbol": "bl_nap_calculate",
+    "instrs": 23,
+    "member": "bl.o"
+  },
+  {
+    "symbol": "vif_mgmt_bcn_recv",
+    "instrs": 23,
+    "member": "vif_mgmt.o"
+  },
+  {
+    "symbol": "me_build_del_ba",
+    "instrs": 23,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "me_rate_bitfield_vht_build",
+    "instrs": 23,
+    "member": "me_utils.o"
+  },
+  {
+    "symbol": "sm_supplicant_deauth_cfm",
+    "instrs": 23,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "bl_wifi_wpa_ptk_init_done_internal",
+    "instrs": 23,
+    "member": "supplicant_api.o"
+  },
+  {
+    "symbol": "me_init",
+    "instrs": 22,
+    "member": "me.o"
+  },
+  {
+    "symbol": "me_chan_config_req_handler",
+    "instrs": 22,
+    "member": "me_task.o"
+  },
+  {
+    "symbol": "sm_send_next_bss_param",
+    "instrs": 22,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "apm_send_next_bss_param",
+    "instrs": 22,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "_puts_space",
+    "instrs": 22,
+    "member": "bugkiller_fw_queue.o"
+  },
+  {
+    "symbol": "chan_ctxt_trigger",
+    "instrs": 21,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "mm_send_connection_loss_ind",
+    "instrs": 21,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "mm_ap_traffic_probe_cfm",
+    "instrs": 21,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "mm_timer_hw_set",
+    "instrs": 21,
+    "member": "mm_timer.o"
+  },
+  {
+    "symbol": "rxl_dma_evt",
+    "instrs": 21,
+    "member": "rxl_cntrl.o"
+  },
+  {
+    "symbol": "bl_tpc_update_power_table",
+    "instrs": 21,
+    "member": "tpc.o"
+  },
+  {
+    "symbol": "scanu_start_req_handler",
+    "instrs": 21,
+    "member": "scanu_task.o"
+  },
+  {
+    "symbol": "mm_bcn_change_cfm_handler",
+    "instrs": 21,
+    "member": "apm_task.o"
+  },
+  {
+    "symbol": "ke_timer_hw_set",
+    "instrs": 21,
+    "member": "ke_timer.o"
+  },
+  {
+    "symbol": "ipc_emb_notify",
+    "instrs": 21,
+    "member": "ipc_emb.o"
+  },
+  {
+    "symbol": "mm_sec_machwaddr_del",
+    "instrs": 20,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "scan_cancel_req_handler",
+    "instrs": 20,
+    "member": "scan_task.o"
+  },
+  {
+    "symbol": "txl_cfm_push",
+    "instrs": 20,
+    "member": "txl_cfm.o"
+  },
+  {
+    "symbol": "rc_get_lowest_rate_config",
+    "instrs": 20,
+    "member": "rc.o"
+  },
+  {
+    "symbol": "apm_init",
+    "instrs": 20,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "ipc_emb_tx_irq",
+    "instrs": 20,
+    "member": "ipc_emb.o"
+  },
+  {
+    "symbol": "blmac_soft_reset_getf",
+    "instrs": 19,
+    "member": "hal_machw.o"
+  },
+  {
+    "symbol": "ps_init",
+    "instrs": 19,
+    "member": "ps.o"
+  },
+  {
+    "symbol": "mm_scan_channel_end_early_handler",
+    "instrs": 19,
+    "member": "scan_task.o"
+  },
+  {
+    "symbol": "scan_probe_req_handler",
+    "instrs": 19,
+    "member": "scan_task.o"
+  },
+  {
+    "symbol": "txl_int_fake_transfer",
+    "instrs": 19,
+    "member": "txl_cntrl.o"
+  },
+  {
+    "symbol": "vif_mgmt_send_postponed_frame",
+    "instrs": 19,
+    "member": "vif_mgmt.o"
+  },
+  {
+    "symbol": "scanu_init",
+    "instrs": 19,
+    "member": "scanu.o"
+  },
+  {
+    "symbol": "add_round_key",
+    "instrs": 19,
+    "member": "mfp_bip.o"
+  },
+  {
+    "symbol": "notifier_chain_call_fromeCritical",
+    "instrs": 19,
+    "member": "notifier.o"
+  },
+  {
+    "symbol": "bl_wifi_get_assoc_bssid_internal",
+    "instrs": 19,
+    "member": "supplicant_api.o"
+  },
+  {
+    "symbol": "element_notify",
+    "instrs": 18,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "ascii_to_hex",
+    "instrs": 18,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "bl_init",
+    "instrs": 18,
+    "member": "bl.o"
+  },
+  {
+    "symbol": "sta_mgmt_entry_init",
+    "instrs": 18,
+    "member": "sta_mgmt.o"
+  },
+  {
+    "symbol": "txl_cntrl_clear_ac",
+    "instrs": 18,
+    "member": "txl_cntrl.o"
+  },
+  {
+    "symbol": "txl_cntrl_clear_bcn_ac",
+    "instrs": 18,
+    "member": "txl_cntrl.o"
+  },
+  {
+    "symbol": "me_legacy_ridx_max",
+    "instrs": 18,
+    "member": "me_utils.o"
+  },
+  {
+    "symbol": "me_add_chan_ctx",
+    "instrs": 18,
+    "member": "me_utils.o"
+  },
+  {
+    "symbol": "rxu_cntrl_desc_prepare.constprop.0.isra.0",
+    "instrs": 18,
+    "member": "rxu_cntrl.o"
+  },
+  {
+    "symbol": "ke_task_local",
+    "instrs": 18,
+    "member": "ke_task.o"
+  },
+  {
+    "symbol": "chan_ap_tx_cfm",
+    "instrs": 17,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "chan_sta_tx_cfm",
+    "instrs": 17,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "mm_reset",
+    "instrs": 17,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "mm_sta_del_req_handler",
+    "instrs": 17,
+    "member": "mm_task.o"
+  },
+  {
+    "symbol": "bl_pwr_find",
+    "instrs": 17,
+    "member": "tpc.o"
+  },
+  {
+    "symbol": "me_build_capability",
+    "instrs": 17,
+    "member": "me_utils.o"
+  },
+  {
+    "symbol": "co_list_insert_after",
+    "instrs": 17,
+    "member": "co_list.o"
+  },
+  {
+    "symbol": "co_list_insert_before",
+    "instrs": 17,
+    "member": "co_list.o"
+  },
+  {
+    "symbol": "chan_is_on_channel",
+    "instrs": 16,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "chan_is_tx_allowed",
+    "instrs": 16,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "rxl_frame_release",
+    "instrs": 16,
+    "member": "rxl_cntrl.o"
+  },
+  {
+    "symbol": "txl_machdr_format",
+    "instrs": 16,
+    "member": "txl_cntrl.o"
+  },
+  {
+    "symbol": "me_get_basic_rates",
+    "instrs": 16,
+    "member": "me_utils.o"
+  },
+  {
+    "symbol": "me_tx_cfm_amsdu",
+    "instrs": 16,
+    "member": "me_utils.o"
+  },
+  {
+    "symbol": "rxu_cntrl_machdr_len_get",
+    "instrs": 16,
+    "member": "rxu_cntrl.o"
+  },
+  {
+    "symbol": "rxu_cntrl_evt",
+    "instrs": 16,
+    "member": "rxu_cntrl.o"
+  },
+  {
+    "symbol": "scanu_raw_send_cfm",
+    "instrs": 16,
+    "member": "scanu.o"
+  },
+  {
+    "symbol": "apm_handle_eapol_input",
+    "instrs": 16,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "ipc_emb_wait",
+    "instrs": 16,
+    "member": "ipc_emb.o"
+  },
+  {
+    "symbol": "ipc_emb_msg_irq",
+    "instrs": 16,
+    "member": "ipc_emb.o"
+  },
+  {
+    "symbol": "rxl_init",
+    "instrs": 15,
+    "member": "rxl_cntrl.o"
+  },
+  {
+    "symbol": "rxl_reset",
+    "instrs": 15,
+    "member": "rxl_cntrl.o"
+  },
+  {
+    "symbol": "scan_terminate_channel_request",
+    "instrs": 15,
+    "member": "scan.o"
+  },
+  {
+    "symbol": "scan_send_cancel_cfm",
+    "instrs": 15,
+    "member": "scan.o"
+  },
+  {
+    "symbol": "td_init",
+    "instrs": 15,
+    "member": "td.o"
+  },
+  {
+    "symbol": "bl_tpc_power_table_get",
+    "instrs": 15,
+    "member": "tpc.o"
+  },
+  {
+    "symbol": "vif_mgmt_reset",
+    "instrs": 15,
+    "member": "vif_mgmt.o"
+  },
+  {
+    "symbol": "me_build_add_ba_rsp",
+    "instrs": 15,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "me_extract_power_constraint",
+    "instrs": 15,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "rc_get_mcs_index",
+    "instrs": 15,
+    "member": "rc.o"
+  },
+  {
+    "symbol": "mm_cfg_element_keepalive_timestamp_update",
+    "instrs": 14,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "mm_bcn_init",
+    "instrs": 14,
+    "member": "mm_bcn.o"
+  },
+  {
+    "symbol": "co_pack8p",
+    "instrs": 14,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "rc_check_rate_duplicated",
+    "instrs": 14,
+    "member": "rc.o"
+  },
+  {
+    "symbol": "rc_init_bcmc_rate",
+    "instrs": 14,
+    "member": "rc.o"
+  },
+  {
+    "symbol": "co_dlist_push_back",
+    "instrs": 14,
+    "member": "co_dlist.o"
+  },
+  {
+    "symbol": "chan_is_on_operational_channel",
+    "instrs": 13,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "cmp_abs_time",
+    "instrs": 13,
+    "member": "mm_timer.o"
+  },
+  {
+    "symbol": "ble_rf_ops",
+    "instrs": 13,
+    "member": "bl.o"
+  },
+  {
+    "symbol": "mac_recovery",
+    "instrs": 13,
+    "member": "bl.o"
+  },
+  {
+    "symbol": "td_pck_ind",
+    "instrs": 13,
+    "member": "td.o"
+  },
+  {
+    "symbol": "td_pck_ps_ind",
+    "instrs": 13,
+    "member": "td.o"
+  },
+  {
+    "symbol": "tpc_get_vif_tx_power_vs_rate",
+    "instrs": 13,
+    "member": "tpc.o"
+  },
+  {
+    "symbol": "tpc_update_frame_tx_power",
+    "instrs": 13,
+    "member": "tpc.o"
+  },
+  {
+    "symbol": "vif_mgmt_get_first_ap_inf",
+    "instrs": 13,
+    "member": "vif_mgmt.o"
+  },
+  {
+    "symbol": "me_add_ie_ds",
+    "instrs": 13,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "me_add_ie_erp",
+    "instrs": 13,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "me_add_ie_tim",
+    "instrs": 13,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "is_cck_group",
+    "instrs": 13,
+    "member": "rc.o"
+  },
+  {
+    "symbol": "co_dlist_push_front",
+    "instrs": 13,
+    "member": "co_dlist.o"
+  },
+  {
+    "symbol": "co_dlist_pop_front",
+    "instrs": 13,
+    "member": "co_dlist.o"
+  },
+  {
+    "symbol": "ke_timer_active",
+    "instrs": 13,
+    "member": "ke_timer.o"
+  },
+  {
+    "symbol": "mac_paid_gid_ap_compute",
+    "instrs": 13,
+    "member": "mac.o"
+  },
+  {
+    "symbol": "bugkiller_fw_queue_sent_dump",
+    "instrs": 13,
+    "member": "bugkiller_fw_queue.o"
+  },
+  {
+    "symbol": "bugkiller_fw_queue_saved_dump",
+    "instrs": 13,
+    "member": "bugkiller_fw_queue.o"
+  },
+  {
+    "symbol": "rfc_channel_ops",
+    "instrs": 12,
+    "member": "bl.o"
+  },
+  {
+    "symbol": "bl_nap_hook_call",
+    "instrs": 12,
+    "member": "bl.o"
+  },
+  {
+    "symbol": "bl_nap_hook_call_fromCritical",
+    "instrs": 12,
+    "member": "bl.o"
+  },
+  {
+    "symbol": "txl_frame_cfm",
+    "instrs": 12,
+    "member": "txl_frame.o"
+  },
+  {
+    "symbol": "me_11ac_nss_max",
+    "instrs": 12,
+    "member": "me_utils.o"
+  },
+  {
+    "symbol": "me_11n_nss_max",
+    "instrs": 12,
+    "member": "me_utils.o"
+  },
+  {
+    "symbol": "scan_start_cfm_handler",
+    "instrs": 12,
+    "member": "scanu_task.o"
+  },
+  {
+    "symbol": "txu_cntrl_cfm",
+    "instrs": 12,
+    "member": "txu_cntrl.o"
+  },
+  {
+    "symbol": "apm_embedded_enabled",
+    "instrs": 12,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "co_list_concat",
+    "instrs": 12,
+    "member": "co_list.o"
+  },
+  {
+    "symbol": "hal_machw_stop",
+    "instrs": 11,
+    "member": "hal_machw.o"
+  },
+  {
+    "symbol": "hal_machw_disable_int",
+    "instrs": 11,
+    "member": "hal_machw.o"
+  },
+  {
+    "symbol": "mm_sta_timer_data_timeout",
+    "instrs": 11,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "mm_hw_idle_evt",
+    "instrs": 11,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "bl_nap_hook_register",
+    "instrs": 11,
+    "member": "bl.o"
+  },
+  {
+    "symbol": "bl_nap_hook_register_fromCritical",
+    "instrs": 11,
+    "member": "bl.o"
+  },
+  {
+    "symbol": "bl_nap_hook_unregister",
+    "instrs": 11,
+    "member": "bl.o"
+  },
+  {
+    "symbol": "bl_nap_hook_unregister_fromCritical",
+    "instrs": 11,
+    "member": "bl.o"
+  },
+  {
+    "symbol": "rx_swdesc_init",
+    "instrs": 11,
+    "member": "rx_swdesc.o"
+  },
+  {
+    "symbol": "me_add_ie_customer",
+    "instrs": 11,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "me_legacy_ridx_min",
+    "instrs": 11,
+    "member": "me_utils.o"
+  },
+  {
+    "symbol": "sm_init",
+    "instrs": 11,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "notifier_chain_regsiter_fromCritical",
+    "instrs": 11,
+    "member": "notifier.o"
+  },
+  {
+    "symbol": "ke_evt_clear",
+    "instrs": 11,
+    "member": "ke_event.o"
+  },
+  {
+    "symbol": "ke_init",
+    "instrs": 11,
+    "member": "ke_event.o"
+  },
+  {
+    "symbol": "bl_irq_handler",
+    "instrs": 11,
+    "member": "intc.o"
+  },
+  {
+    "symbol": "mm_tim_update",
+    "instrs": 10,
+    "member": "mm_bcn.o"
+  },
+  {
+    "symbol": "mm_bcn_change",
+    "instrs": 10,
+    "member": "mm_bcn.o"
+  },
+  {
+    "symbol": "txl_current_desc_get",
+    "instrs": 10,
+    "member": "txl_cntrl.o"
+  },
+  {
+    "symbol": "vif_mgmt_get_vif",
+    "instrs": 10,
+    "member": "vif_mgmt.o"
+  },
+  {
+    "symbol": "me_11ac_mcs_max",
+    "instrs": 10,
+    "member": "me_utils.o"
+  },
+  {
+    "symbol": "me_init_rate",
+    "instrs": 10,
+    "member": "me_utils.o"
+  },
+  {
+    "symbol": "sm_set_channel_coex_connected",
+    "instrs": 10,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "ke_evt_set",
+    "instrs": 10,
+    "member": "ke_event.o"
+  },
+  {
+    "symbol": "ke_task_sm_activating",
+    "instrs": 10,
+    "member": "ke_task.o"
+  },
+  {
+    "symbol": "cmp_timer_id",
+    "instrs": 10,
+    "member": "ke_timer.o"
+  },
+  {
+    "symbol": "mac_ie_find",
+    "instrs": 10,
+    "member": "mac_ie.o"
+  },
+  {
+    "symbol": "sysctrl_init",
+    "instrs": 10,
+    "member": "sysctrl.o"
+  },
+  {
+    "symbol": "mm_tim_update_req_handler",
+    "instrs": 9,
+    "member": "mm_task.o"
+  },
+  {
+    "symbol": "mm_bcn_change_req_handler",
+    "instrs": 9,
+    "member": "mm_task.o"
+  },
+  {
+    "symbol": "txl_get_seq_ctrl",
+    "instrs": 9,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "xor",
+    "instrs": 9,
+    "member": "mfp_bip.o"
+  },
+  {
+    "symbol": "notifier_chain_unregsiter_fromCritical",
+    "instrs": 9,
+    "member": "notifier.o"
+  },
+  {
+    "symbol": "ke_msg_send_basic",
+    "instrs": 9,
+    "member": "ke_msg.o"
+  },
+  {
+    "symbol": "force_trigger",
+    "instrs": 9,
+    "member": "arch_main.o"
+  },
+  {
+    "symbol": "intc_enable_irq",
+    "instrs": 9,
+    "member": "intc.o"
+  },
+  {
+    "symbol": "chan_ctxt_use_dominant_chan",
+    "instrs": 8,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "mm_rx_filter_set",
+    "instrs": 8,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "mm_ap_probe_cfm",
+    "instrs": 8,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "mm_set_wpa_rsn_ie",
+    "instrs": 8,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "wakeup_from_doze_done",
+    "instrs": 8,
+    "member": "bl.o"
+  },
+  {
+    "symbol": "vif_mgmt_bcn_to_prog",
+    "instrs": 8,
+    "member": "vif_mgmt.o"
+  },
+  {
+    "symbol": "rc_get_nss",
+    "instrs": 8,
+    "member": "rc.o"
+  },
+  {
+    "symbol": "apm_sta_fw_delete",
+    "instrs": 8,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "ipc_emb_tx_flow_off",
+    "instrs": 8,
+    "member": "ipc_emb.o"
+  },
+  {
+    "symbol": "chan_get_dominant_chan",
+    "instrs": 7,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "mm_active",
+    "instrs": 7,
+    "member": "mm.o"
+  },
+  {
+    "symbol": "rxl_current_desc_get",
+    "instrs": 7,
+    "member": "rxl_cntrl.o"
+  },
+  {
+    "symbol": "scan_get_scan_duration",
+    "instrs": 7,
+    "member": "scan.o"
+  },
+  {
+    "symbol": "scan_get_chan",
+    "instrs": 7,
+    "member": "scan.o"
+  },
+  {
+    "symbol": "txl_cntrl_tx_check",
+    "instrs": 7,
+    "member": "txl_cntrl.o"
+  },
+  {
+    "symbol": "bam_init",
+    "instrs": 7,
+    "member": "bam.o"
+  },
+  {
+    "symbol": "sm_auth_start",
+    "instrs": 7,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "apm_handle_auth_done",
+    "instrs": 7,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "co_list_cnt",
+    "instrs": 7,
+    "member": "co_list.o"
+  },
+  {
+    "symbol": "bl60x_fw_dump_statistic",
+    "instrs": 7,
+    "member": "ke_event.o"
+  },
+  {
+    "symbol": "mac_paid_gid_sta_compute",
+    "instrs": 7,
+    "member": "mac.o"
+  },
+  {
+    "symbol": "intc_spurious",
+    "instrs": 7,
+    "member": "intc.o"
+  },
+  {
+    "symbol": "bl_wifi_timer_arm",
+    "instrs": 7,
+    "member": "supplicant_api.o"
+  },
+  {
+    "symbol": "td_set_tim_time",
+    "instrs": 6,
+    "member": "td.o"
+  },
+  {
+    "symbol": "txl_cfm_dma_int_handler_backup",
+    "instrs": 6,
+    "member": "txl_cfm.o"
+  },
+  {
+    "symbol": "txl_cntrl_inc_pck_cnt",
+    "instrs": 6,
+    "member": "txl_cntrl.o"
+  },
+  {
+    "symbol": "me_set_sta_ht_vht_param",
+    "instrs": 6,
+    "member": "me_utils.o"
+  },
+  {
+    "symbol": "me_bw_check",
+    "instrs": 6,
+    "member": "me_utils.o"
+  },
+  {
+    "symbol": "co_list_pop_front",
+    "instrs": 6,
+    "member": "co_list.o"
+  },
+  {
+    "symbol": "co_list_find",
+    "instrs": 6,
+    "member": "co_list.o"
+  },
+  {
+    "symbol": "rxl_timeout_int_handler",
+    "instrs": 5,
+    "member": "rxl_cntrl.o"
+  },
+  {
+    "symbol": "sta_mgmt_del_key",
+    "instrs": 5,
+    "member": "sta_mgmt.o"
+  },
+  {
+    "symbol": "txl_buffer_reinit",
+    "instrs": 5,
+    "member": "txl_buffer.o"
+  },
+  {
+    "symbol": "txl_buffer_reset",
+    "instrs": 5,
+    "member": "txl_buffer.o"
+  },
+  {
+    "symbol": "vif_mgmt_bcn_to_evt",
+    "instrs": 5,
+    "member": "vif_mgmt.o"
+  },
+  {
+    "symbol": "me_build_deauthenticate",
+    "instrs": 5,
+    "member": "me_mgmtframe.o"
+  },
+  {
+    "symbol": "me_tx_cfm_ampdu",
+    "instrs": 5,
+    "member": "me_utils.o"
+  },
+  {
+    "symbol": "cfm_raw_send",
+    "instrs": 5,
+    "member": "scanu_task.o"
+  },
+  {
+    "symbol": "sm_auth_send_pre",
+    "instrs": 5,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "sm_assoc_req_send_pre",
+    "instrs": 5,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "ke_msg_forward_and_change_id",
+    "instrs": 5,
+    "member": "ke_msg.o"
+  },
+  {
+    "symbol": "ipc_emb_tx_flow_on",
+    "instrs": 5,
+    "member": "ipc_emb.o"
+  },
+  {
+    "symbol": "ipc_emb_txcfm",
+    "instrs": 5,
+    "member": "ipc_emb.o"
+  },
+  {
+    "symbol": "bl_wifi_unset_appie_internal",
+    "instrs": 5,
+    "member": "supplicant_api.o"
+  },
+  {
+    "symbol": "mm_timer_init",
+    "instrs": 4,
+    "member": "mm_timer.o"
+  },
+  {
+    "symbol": "element_notify_status_enabled",
+    "instrs": 4,
+    "member": "scan.o"
+  },
+  {
+    "symbol": "tpc_get_vif_tx_power",
+    "instrs": 4,
+    "member": "tpc.o"
+  },
+  {
+    "symbol": "sm_disconnect_deauth_cfm",
+    "instrs": 4,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "sm_connect_abort_process",
+    "instrs": 4,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "sm_connect_abort_deauth_cfm",
+    "instrs": 4,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "co_dlist_init",
+    "instrs": 4,
+    "member": "co_dlist.o"
+  },
+  {
+    "symbol": "ke_msg_forward",
+    "instrs": 4,
+    "member": "ke_msg.o"
+  },
+  {
+    "symbol": "cmp_dest_id",
+    "instrs": 4,
+    "member": "ke_task.o"
+  },
+  {
+    "symbol": "ipc_emb_radar_event_ind",
+    "instrs": 4,
+    "member": "ipc_emb.o"
+  },
+  {
+    "symbol": "ipc_emb_txcfm_ind",
+    "instrs": 4,
+    "member": "ipc_emb.o"
+  },
+  {
+    "symbol": "ipc_emb_prim_tbtt_ind",
+    "instrs": 4,
+    "member": "ipc_emb.o"
+  },
+  {
+    "symbol": "ipc_emb_sec_tbtt_ind",
+    "instrs": 4,
+    "member": "ipc_emb.o"
+  },
+  {
+    "symbol": "bl_wifi_register_wpa_cb_internal",
+    "instrs": 4,
+    "member": "supplicant_api.o"
+  },
+  {
+    "symbol": "bl_wifi_unregister_wpa_cb_internal",
+    "instrs": 4,
+    "member": "supplicant_api.o"
+  },
+  {
+    "symbol": "bl_wifi_set_wps_cb_internal",
+    "instrs": 4,
+    "member": "supplicant_api.o"
+  },
+  {
+    "symbol": "chan_ctxt_cnt",
+    "instrs": 3,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "chan_ctxt_set_auth_assoc_req",
+    "instrs": 3,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "scanu_search_by_bssid",
+    "instrs": 3,
+    "member": "scanu.o"
+  },
+  {
+    "symbol": "apm_get_hostapd_ctx",
+    "instrs": 3,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "co_list_init",
+    "instrs": 3,
+    "member": "co_list.o"
+  },
+  {
+    "symbol": "ke_msg_free",
+    "instrs": 3,
+    "member": "ke_msg.o"
+  },
+  {
+    "symbol": "bl_wifi_timer_setfn",
+    "instrs": 3,
+    "member": "supplicant_api.o"
+  },
+  {
+    "symbol": "bl_wifi_get_wps_status_internal",
+    "instrs": 3,
+    "member": "supplicant_api.o"
+  },
+  {
+    "symbol": "bl_wifi_set_wps_status_internal",
+    "instrs": 3,
+    "member": "supplicant_api.o"
+  },
+  {
+    "symbol": "ps_polling_frame",
+    "instrs": 2,
+    "member": "ps.o"
+  },
+  {
+    "symbol": "pm_force_sleep_check",
+    "instrs": 2,
+    "member": "bl.o"
+  },
+  {
+    "symbol": "bl_nap_call",
+    "instrs": 2,
+    "member": "bl.o"
+  },
+  {
+    "symbol": "bl_tpc_update_power_table_rate",
+    "instrs": 2,
+    "member": "tpc.o"
+  },
+  {
+    "symbol": "bl_tpc_update_power_rate_11b",
+    "instrs": 2,
+    "member": "tpc.o"
+  },
+  {
+    "symbol": "bl_tpc_update_power_rate_11g",
+    "instrs": 2,
+    "member": "tpc.o"
+  },
+  {
+    "symbol": "bl_tpc_update_power_rate_11n",
+    "instrs": 2,
+    "member": "tpc.o"
+  },
+  {
+    "symbol": "me_check_rc",
+    "instrs": 2,
+    "member": "me_utils.o"
+  },
+  {
+    "symbol": "sm_connection_tlv_pack",
+    "instrs": 2,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "cfg_api_element_general_get",
+    "instrs": 2,
+    "member": "cfg_api.o"
+  },
+  {
+    "symbol": "ke_msg_discard",
+    "instrs": 2,
+    "member": "ke_task.o"
+  },
+  {
+    "symbol": "ke_msg_save",
+    "instrs": 2,
+    "member": "ke_task.o"
+  },
+  {
+    "symbol": "ipc_emb_hostrxdesc_check",
+    "instrs": 2,
+    "member": "ipc_emb.o"
+  },
+  {
+    "symbol": "bl_wifi_get_hostap_private_internal",
+    "instrs": 2,
+    "member": "supplicant_api.o"
+  },
+  {
+    "symbol": "bl_wifi_timer_disarm",
+    "instrs": 2,
+    "member": "supplicant_api.o"
+  },
+  {
+    "symbol": "bl_wifi_skip_supp_pmkcaching",
+    "instrs": 2,
+    "member": "supplicant_api.o"
+  },
+  {
+    "symbol": "bl_wifi_sta_update_ap_info_internal",
+    "instrs": 2,
+    "member": "supplicant_api.o"
+  },
+  {
+    "symbol": "bl_wifi_sta_set_reset_param_internal",
+    "instrs": 2,
+    "member": "supplicant_api.o"
+  },
+  {
+    "symbol": "bl_wifi_sta_is_ap_notify_completed_rsne_internal",
+    "instrs": 2,
+    "member": "supplicant_api.o"
+  },
+  {
+    "symbol": "bl_wifi_sta_is_running_internal",
+    "instrs": 2,
+    "member": "supplicant_api.o"
+  },
+  {
+    "symbol": "chan_bcn_to_evt",
+    "instrs": 1,
+    "member": "chan.o"
+  },
+  {
+    "symbol": "txl_hwdesc_init",
+    "instrs": 1,
+    "member": "txl_hwdesc.o"
+  },
+  {
+    "symbol": "txl_hwdesc_reset",
+    "instrs": 1,
+    "member": "txl_hwdesc.o"
+  },
+  {
+    "symbol": "sm_connection_tlv_set",
+    "instrs": 1,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "sm_connection_tlv_reset",
+    "instrs": 1,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "sm_connection_tlv_desc_get",
+    "instrs": 1,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "sm_connect_wap_tlv_pack_cb",
+    "instrs": 1,
+    "member": "sm.o"
+  },
+  {
+    "symbol": "txu_cntrl_init",
+    "instrs": 1,
+    "member": "txu_cntrl.o"
+  },
+  {
+    "symbol": "apm_beacon_handler",
+    "instrs": 1,
+    "member": "apm.o"
+  },
+  {
+    "symbol": "coex_wifi_rf_forece_enable",
+    "instrs": 1,
+    "member": "arch_main.o"
+  },
+  {
+    "symbol": "ipc_emb_dump",
+    "instrs": 1,
+    "member": "ipc_emb.o"
+  },
+  {
+    "symbol": "bl_wifi_timer_done",
+    "instrs": 1,
+    "member": "supplicant_api.o"
+  }
+]

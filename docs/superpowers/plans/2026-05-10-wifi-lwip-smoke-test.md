@@ -47,7 +47,7 @@ Single iteration, three commits, one new firmware binary, three small file edits
 **Build verification command (used after every Task 1 / Task 2 step):**
 ```bash
 make m0 FILE=examples/m0_wifi_lwip_smoke.nim \
-  NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=6509171272'
+  NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=<wifi-password>'
 ```
 Expected last line: `Output: build/m0_firmware.bin`
 
@@ -72,7 +72,7 @@ Create `examples/m0_wifi_lwip_smoke.nim` with the following contents:
 ## Build with:
 ##   make m0 FILE=examples/m0_wifi_lwip_smoke.nim \
 ##     NIM="nim -d:bl808kernel -d:bl808WifiVendor \
-##              -d:WifiSsid=Frog -d:WifiPassword=6509171272"
+##              -d:WifiSsid=Frog -d:WifiPassword=<wifi-password>"
 ##
 ## Per attempt: scan -> auth -> 4whs -> assoc (synthetic) -> DHCP.
 ## ICMP echo phase is added in the next commit.
@@ -219,7 +219,7 @@ main()
 Run:
 ```bash
 make m0 FILE=examples/m0_wifi_lwip_smoke.nim \
-  NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=6509171272'
+  NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=<wifi-password>'
 ```
 
 Expected: command succeeds (exit 0); the last line of output is `Output: build/m0_firmware.bin`.
@@ -474,7 +474,7 @@ Replace the `return true` at the end with the ICMP phase block, so the tail of `
 Run:
 ```bash
 make m0 FILE=examples/m0_wifi_lwip_smoke.nim \
-  NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=6509171272'
+  NIM='nim -d:bl808kernel -d:bl808WifiVendor -d:WifiSsid=Frog -d:WifiPassword=<wifi-password>'
 ```
 
 Expected: command succeeds (exit 0); the last line of output is `Output: build/m0_firmware.bin`.
@@ -761,7 +761,7 @@ To run on hardware (operator action):
 make hw-e2e-lwip-smoke \
   UART_PORT=/dev/tty.usbserial-TGKWL2RS \
   WIFI_SSID=Frog \
-  WIFI_PASSWORD=6509171272
+  WIFI_PASSWORD=<wifi-password>
 ```
 
 Expected outcomes (any of these is a valid completion of this iteration):
