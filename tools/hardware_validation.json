@@ -582,6 +582,7 @@
         "defines": {
           "bl808WifiVendor": "1",
           "bl808WifiNimFw": "1",
+          "bl808WifiWpa3Sae": "1",
           "WifiSsid": {"env": "BL808_WIFI_SSID"},
           "WifiPassword": {"secret_env": "BL808_WIFI_PASSWORD"},
           "WifiChannel": {"env": "BL808_WIFI_CHANNEL", "default": 0}

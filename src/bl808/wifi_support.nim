@@ -1053,8 +1053,15 @@ void bl808_nim_os_log_write(uint32_t level, char *tag, char *file,
         inc ipcPollIrqCount
         bl_irq_handler()
       bl_sleep_schedule()
-      if ke_env[0] == 0:
-        ipc_emb_wait()
+      # NOTE: do NOT call ipc_emb_wait() here. In the vendor blob, that path
+      # parks the embedded core on a WAITING_FOREVER notify when there are
+      # no events; the host core then drives IRQ traffic to wake it. In this
+      # nimfw, host and embedded run on the same M0, so a blocking wait
+      # starves the very poll loop that delivers the wakeup. Triggered most
+      # visibly by disconnect: after the SM_DISCONNECT_REQ quiesces IPC,
+      # ke_env[0] hits 0 and the M0 deadlocks until the test harness
+      # timeout. Stay busy-polling — the 100us delay in vendorPollFor is
+      # the only pacing we need.
       ke_evt_schedule()
     if hostPollEnabled and loadPtr(wifiHwRaw(), 48) != nil:
       bl_main_event_handle(0, nil)

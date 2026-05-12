@@ -1080,6 +1080,149 @@ when defined(bl808WifiNimFw):
   var nimFwDbgIpcTxTraceCount {.wifiCtrl.}: uint32
   var nimFwDbgCfmTraceCount {.wifiCtrl.}: uint32
   var nimFwDbgEapolTraceCount {.wifiCtrl.}: uint32
+  # TX-path investigation counters (iter 261). Read after test via UART dump.
+  var nimFwDbgPayBackupEntry* {.wifiCtrl, exportc: "nimfw_dbg_pay_backup".}: uint32
+  var nimFwDbgPayDescFound*   {.wifiCtrl, exportc: "nimfw_dbg_pay_desc".}: uint32
+  var nimFwDbgPayHasPayload*  {.wifiCtrl, exportc: "nimfw_dbg_pay_payload".}: uint32
+  var nimFwDbgPayEmptyList*   {.wifiCtrl, exportc: "nimfw_dbg_pay_empty".}: uint32
+  var nimFwDbgPayNonEmpty*    {.wifiCtrl, exportc: "nimfw_dbg_pay_nonempty".}: uint32
+  var nimFwDbgPayTriggerLast* {.wifiCtrl, exportc: "nimfw_dbg_pay_trig".}: uint32
+  var nimFwDbgTxTrigEntry*    {.wifiCtrl, exportc: "nimfw_dbg_txtrig_entry".}: uint32
+  var nimFwDbgFrameGet*       {.wifiCtrl, exportc: "nimfw_dbg_frame_get".}: uint32
+  # Recycle / CFM path counters (iter 261 follow-up)
+  var nimFwDbgCfmPush*        {.wifiCtrl, exportc: "nimfw_dbg_cfm_push".}: uint32
+  var nimFwDbgCfmEvt*         {.wifiCtrl, exportc: "nimfw_dbg_cfm_evt".}: uint32
+  var nimFwDbgFrameCfm*       {.wifiCtrl, exportc: "nimfw_dbg_frame_cfm".}: uint32
+  var nimFwDbgFrameRelease*   {.wifiCtrl, exportc: "nimfw_dbg_frame_release".}: uint32
+  var nimFwDbgTxTrigAcReady*  {.wifiCtrl, exportc: "nimfw_dbg_txtrig_acready".}: uint32  # last acReady seen
+  var nimFwDbgTxTrigZeroExit* {.wifiCtrl, exportc: "nimfw_dbg_txtrig_zero".}: uint32     # entered & acReady==0
+  var nimFwDbgTxTrigLoops*    {.wifiCtrl, exportc: "nimfw_dbg_txtrig_loops".}: uint32    # inner loop iters
+  var nimFwDbgFrameEvtEnter*  {.wifiCtrl, exportc: "nimfw_dbg_frame_evt_enter".}: uint32
+  var nimFwDbgFrameEvtPop*    {.wifiCtrl, exportc: "nimfw_dbg_frame_evt_pop".}: uint32
+  var nimFwDbgFrameEvtFreeRet* {.wifiCtrl, exportc: "nimfw_dbg_frame_evt_free".}: uint32
+  var nimFwDbgFrameEvtUsedSkip* {.wifiCtrl, exportc: "nimfw_dbg_frame_evt_usedskip".}: uint32
+  var nimFwDbgFrameEvtCallback* {.wifiCtrl, exportc: "nimfw_dbg_frame_evt_cb".}: uint32
+  var nimFwDbgFrameGetFails*    {.wifiCtrl, exportc: "nimfw_dbg_frame_get_fails".}: uint32
+  var nimFwDbgNullFrameCalls*   {.wifiCtrl, exportc: "nimfw_dbg_nullframe_calls".}: uint32
+  var nimFwDbgNullFrameCallerRA* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_caller_ra".}: uint32
+  var nimFwDbgStaTbttEnter*     {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_enter".}: uint32
+  var nimFwDbgStaTbttAssoc*     {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_assoc".}: uint32
+  var nimFwDbgStaTbttOnChan*    {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_onchan".}: uint32
+  var nimFwDbgStaTbttPC100*     {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_pc100".}: uint32
+  var nimFwDbgStaTbttPCMax*     {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_pcmax".}: uint32
+  var nimFwDbgSetVifState*      {.wifiCtrl, exportc: "nimfw_dbg_set_vif_state".}: uint32   # entries
+  var nimFwDbgSetVifStateNew*   {.wifiCtrl, exportc: "nimfw_dbg_set_vif_state_new".}: uint32  # last newState
+  var nimFwDbgSetVifStateAct*   {.wifiCtrl, exportc: "nimfw_dbg_set_vif_state_act".}: uint32  # activating=true count
+  var nimFwDbgAssocDone*        {.wifiCtrl, exportc: "nimfw_dbg_assoc_done".}: uint32
+  var nimFwDbgAssocRspStatus*   {.wifiCtrl, exportc: "nimfw_dbg_assoc_rsp_status".}: uint32  # last assoc rsp statusCode
+  var nimFwDbgAssocRspCount*    {.wifiCtrl, exportc: "nimfw_dbg_assoc_rsp_count".}: uint32
+  var nimFwDbgAssocRspLen*      {.wifiCtrl, exportc: "nimfw_dbg_assoc_rsp_len".}: uint32
+  var nimFwDbgAssocRspBody0*    {.wifiCtrl, exportc: "nimfw_dbg_assoc_rsp_b0".}: uint32  # first 4 bytes of body
+  var nimFwDbgAssocRspBody4*    {.wifiCtrl, exportc: "nimfw_dbg_assoc_rsp_b4".}: uint32  # next 4 bytes
+  var nimFwDbgDeauthHandler*    {.wifiCtrl, exportc: "nimfw_dbg_deauth".}: uint32
+  var nimFwDbgConnLossInd*      {.wifiCtrl, exportc: "nimfw_dbg_connloss".}: uint32
+  var nimFwDbgWpaRsnIeSet*      {.wifiCtrl, exportc: "nimfw_dbg_wparsn_set".}: uint32
+  var nimFwDbgWpaRsnIeLen*      {.wifiCtrl, exportc: "nimfw_dbg_wparsn_len".}: uint32
+  var nimFwDbgWpaRsnIePtr*      {.wifiCtrl, exportc: "nimfw_dbg_wparsn_ptr".}: uint32
+  var nimFwDbgVifSecType*       {.wifiCtrl, exportc: "nimfw_dbg_vif_sectype".}: uint32  # vif+497 at vif_state_cfm
+  var nimFwDbgConnectIndPrePath* {.wifiCtrl, exportc: "nimfw_dbg_conn_ind_prepath".}: uint32  # path-1 (open) fired
+  var nimFwDbgVifIeLenAtAssoc*  {.wifiCtrl, exportc: "nimfw_dbg_vif_ielen_assoc".}: uint32  # vif+496 at AssocReq build
+  var nimFwDbgPtkInitDone*      {.wifiCtrl, exportc: "nimfw_dbg_ptk_init_done".}: uint32
+  # Per-VIF WPA-handshake-pending tracking. Set when sm_assoc_done runs on a
+  # WPA-protected VIF (sectype>=2); cleared on PTK-init-done or disconnect.
+  # mm_sta_tbtt uses this to suppress the null-frame keep-alive loop while
+  # waiting for WPA, and to time out the wait into a connection_loss_ind.
+  var nimFwWpaPendingMask* {.wifiCtrl, exportc: "nimfw_wpa_pending_mask".}: uint32
+  var nimFwDbgStaTbttSkip* {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_skip".}: uint32
+  var nimFwDbgStaTbttGiveup* {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_giveup".}: uint32
+  var nimFwDbgEapolIn*       {.wifiCtrl, exportc: "nimfw_dbg_eapol_in".}: uint32
+  var nimFwDbgEapolDropped*  {.wifiCtrl, exportc: "nimfw_dbg_eapol_dropped".}: uint32
+  var nimFwDbgEapolForwarded* {.wifiCtrl, exportc: "nimfw_dbg_eapol_fwd".}: uint32
+  var nimFwDbgVifWpaState*   {.wifiCtrl, exportc: "nimfw_dbg_vif_wpastate".}: uint32
+  var nimFwDbgEapolCbInv*    {.wifiCtrl, exportc: "nimfw_dbg_eapol_cb_inv".}: uint32
+  var nimFwDbgEapolCbNull*   {.wifiCtrl, exportc: "nimfw_dbg_eapol_cb_null".}: uint32
+  var nimFwDbgSmStateAtEapol* {.wifiCtrl, exportc: "nimfw_dbg_sm_state_eapol".}: uint32
+  # Supplicant-side counters (incremented from C files in wpa_supplicant/ and wifi driver)
+  var nimFwDbgSuppRxEapol*   {.wifiCtrl, exportc: "nimfw_dbg_supp_rx_eapol".}: uint32
+  var nimFwDbgSuppTxEapol*   {.wifiCtrl, exportc: "nimfw_dbg_supp_tx_eapol".}: uint32
+  var nimFwDbgEthTxEapol*    {.wifiCtrl, exportc: "nimfw_dbg_eth_tx_eapol".}: uint32
+  var nimFwDbgBlOutputEapol* {.wifiCtrl, exportc: "nimfw_dbg_bl_output_eapol".}: uint32
+  var nimFwDbgEapolTxCb*     {.wifiCtrl, exportc: "nimfw_dbg_eapol_tx_cb".}: uint32
+  var nimFwDbgWpaDeauth*     {.wifiCtrl, exportc: "nimfw_dbg_wpa_deauth".}: uint32
+  var nimFwDbgEthTxRet*      {.wifiCtrl, exportc: "nimfw_dbg_eth_tx_ret".}: uint32  # last return code
+  var nimFwDbgBlOutputDrop*  {.wifiCtrl, exportc: "nimfw_dbg_bl_output_drop".}: uint32  # bl_output dropped (sta_id<0)
+  var nimFwDbgPbufAllocFail* {.wifiCtrl, exportc: "nimfw_dbg_pbuf_alloc_fail".}: uint32
+  var nimFwDbgPbufTakeFail*  {.wifiCtrl, exportc: "nimfw_dbg_pbuf_take_fail".}: uint32
+  var nimFwDbgSuppTxLen*     {.wifiCtrl, exportc: "nimfw_dbg_supp_tx_len".}: uint32  # last EAPOL TX len
+  var nimFwDbgTxFlushEnter*  {.wifiCtrl, exportc: "nimfw_dbg_tx_flush_enter".}: uint32
+  var nimFwDbgTxPushCalls*   {.wifiCtrl, exportc: "nimfw_dbg_tx_push_calls".}: uint32
+  var nimFwDbgTxNoDesc*      {.wifiCtrl, exportc: "nimfw_dbg_tx_nodesc".}: uint32
+  var nimFwDbgTxNoBuf*       {.wifiCtrl, exportc: "nimfw_dbg_tx_nobuf".}: uint32
+  var nimFwDbgBlTxCfm*       {.wifiCtrl, exportc: "nimfw_dbg_bl_tx_cfm".}: uint32  # bl_tx_cfm calls
+  var nimFwDbgBlTxCfmCb*     {.wifiCtrl, exportc: "nimfw_dbg_bl_tx_cfm_cb".}: uint32  # bl_tx_cfm cb != nil
+  var nimFwDbgBlTxCfmEapol*  {.wifiCtrl, exportc: "nimfw_dbg_bl_tx_cfm_eapol".}: uint32  # cfm for EAPOL ethertype
+  var nimFwDbgWpaState*      {.wifiCtrl, exportc: "nimfw_dbg_wpa_state".}: uint32  # latest WPA_SM_STATE
+  var nimFwDbgWpaTxState*    {.wifiCtrl, exportc: "nimfw_dbg_wpa_tx_state".}: uint32  # WPA state at TX time
+  var nimFwDbgWpaRxState*    {.wifiCtrl, exportc: "nimfw_dbg_wpa_rx_state".}: uint32  # WPA state at RX time
+  var nimFwDbgWpaPtkInstalled* {.wifiCtrl, exportc: "nimfw_dbg_wpa_ptk_installed".}: uint32
+  # Crypto-derivation snapshot for offline verification.
+  # Filled by C side at wpa_derive_ptk entry/exit; dumped via UART at end of test.
+  var nimFwDbgCryptoCaptured*  {.wifiCtrl, exportc: "nimfw_dbg_crypto_captured".}: uint32
+  var nimFwDbgCryptoPmk*       {.wifiCtrl, exportc: "nimfw_dbg_crypto_pmk".}: array[32, uint8]
+  var nimFwDbgCryptoOwnAddr*   {.wifiCtrl, exportc: "nimfw_dbg_crypto_own".}: array[6, uint8]
+  var nimFwDbgCryptoBssid*     {.wifiCtrl, exportc: "nimfw_dbg_crypto_bssid".}: array[6, uint8]
+  var nimFwDbgCryptoSNonce*    {.wifiCtrl, exportc: "nimfw_dbg_crypto_snonce".}: array[32, uint8]
+  var nimFwDbgCryptoANonce*    {.wifiCtrl, exportc: "nimfw_dbg_crypto_anonce".}: array[32, uint8]
+  var nimFwDbgCryptoKck*       {.wifiCtrl, exportc: "nimfw_dbg_crypto_kck".}: array[16, uint8]
+  var nimFwDbgCryptoPmkLen*    {.wifiCtrl, exportc: "nimfw_dbg_crypto_pmk_len".}: uint32
+  var nimFwDbgCryptoPtkLen*    {.wifiCtrl, exportc: "nimfw_dbg_crypto_ptk_len".}: uint32
+  var nimFwDbgCryptoUseSha256* {.wifiCtrl, exportc: "nimfw_dbg_crypto_sha256".}: uint32
+  var nimFwDbgCryptoKeyMgmt*   {.wifiCtrl, exportc: "nimfw_dbg_crypto_keymgmt".}: uint32
+  var nimFwDbgCryptoPairwise*  {.wifiCtrl, exportc: "nimfw_dbg_crypto_pairwise".}: uint32
+  var nimFwDbgCryptoPrfData*   {.wifiCtrl, exportc: "nimfw_dbg_crypto_prf_data".}: array[76, uint8]
+  # Self-test of SHA1/HMAC primitive: HMAC-SHA1(key="Jefe", data="what do ya want for nothing?")
+  # Expected output: effcdf6ae5eb2fa2d27416d5f184df9c259a7c79 (RFC 2202 test case 2)
+  var nimFwDbgSelftestHmac*    {.wifiCtrl, exportc: "nimfw_dbg_selftest_hmac".}: array[20, uint8]
+  var nimFwDbgSelftestRan*     {.wifiCtrl, exportc: "nimfw_dbg_selftest_ran".}: uint32
+  # Comparison: the source MAC actually placed in 802.11 frames (vif+80) vs sm->own_addr.
+  var nimFwDbgVifMac*          {.wifiCtrl, exportc: "nimfw_dbg_vif_mac".}: array[6, uint8]
+  var nimFwDbgMacHwLo*         {.wifiCtrl, exportc: "nimfw_dbg_mac_hw_lo".}: uint32
+  var nimFwDbgMacHwHi*         {.wifiCtrl, exportc: "nimfw_dbg_mac_hw_hi".}: uint32
+  # M2 EAPOL frame snapshot — Ethernet + EAPOL key bytes as sent by supplicant.
+  var nimFwDbgM2Len*           {.wifiCtrl, exportc: "nimfw_dbg_m2_len".}: uint32
+  var nimFwDbgM2Buf*           {.wifiCtrl, exportc: "nimfw_dbg_m2_buf".}: array[160, uint8]
+  # KCK as seen at MIC computation site (wpa_eapol_key_mic).
+  var nimFwDbgMicKck*          {.wifiCtrl, exportc: "nimfw_dbg_mic_kck".}: array[16, uint8]
+  var nimFwDbgMicComputed*     {.wifiCtrl, exportc: "nimfw_dbg_mic_computed".}: array[16, uint8]
+  var nimFwDbgMicFrameLen*     {.wifiCtrl, exportc: "nimfw_dbg_mic_frame_len".}: uint32
+  var nimFwDbgMicVer*          {.wifiCtrl, exportc: "nimfw_dbg_mic_ver".}: uint32
+  # SAE path tracking.
+  var nimFwDbgSaeBuildMsg*     {.wifiCtrl, exportc: "nimfw_dbg_sae_build".}: uint32
+  var nimFwDbgSaeParseMsg*     {.wifiCtrl, exportc: "nimfw_dbg_sae_parse".}: uint32
+  var nimFwDbgSaeAuthAlgo*     {.wifiCtrl, exportc: "nimfw_dbg_sae_auth_algo".}: uint32  # auth_algo read in sm_auth_send
+  var nimFwDbgScanKeyMgmt*     {.wifiCtrl, exportc: "nimfw_dbg_scan_key_mgmt".}: uint32  # lf (parsed key_mgmt LE 16-bit)
+  var nimFwDbgScanAT*          {.wifiCtrl, exportc: "nimfw_dbg_scan_at".}: uint32  # computed aT
+  var nimFwDbgScanSmF*         {.wifiCtrl, exportc: "nimfw_dbg_scan_smf".}: uint32  # smF flags
+  var nimFwDbgScanCaps*        {.wifiCtrl, exportc: "nimfw_dbg_scan_caps".}: uint32  # lS[16] (capabilities)
+  # M4 path tracking — debug why PTK never gets installed.
+  var nimFwDbgM4TxState*       {.wifiCtrl, exportc: "nimfw_dbg_m4_tx_state".}: uint32  # WPA state at M4 TX
+  var nimFwDbgM4CbPtr*         {.wifiCtrl, exportc: "nimfw_dbg_m4_cb_ptr".}: uint32    # custom_cfm.cb at M4 TX
+  var nimFwDbgCfmCbPtrLast*    {.wifiCtrl, exportc: "nimfw_dbg_cfm_cb_ptr_last".}: uint32  # what bl_tx_cfm read
+  var nimFwDbgSendCfmLastEthertype* {.wifiCtrl, exportc: "nimfw_dbg_cfm_last_ethertype".}: uint32
+  var nimFwDbgSend4of4Tx*      {.wifiCtrl, exportc: "nimfw_dbg_send_4of4_tx".}: uint32  # M4 send invocations
+  var nimFwDbgSend4of4Cb*      {.wifiCtrl, exportc: "nimfw_dbg_send_4of4_cb".}: uint32  # wpa_supplicant_send_4_of_4_txcallback invocations
+  var nimFwDbgInstallPtk*      {.wifiCtrl, exportc: "nimfw_dbg_install_ptk".}: uint32  # wpa_supplicant_install_ptk invocations
+  # Per-EAPOL bl_tx_cfm details — status (THD[16]) for last EAPOL frame.
+  var nimFwDbgEapolCfmStatus*  {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_status".}: uint32
+  var nimFwDbgEapolCfmCount*   {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_count".}: uint32
+  var nimFwDbgEapolCfmAckOk*   {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_ack_ok".}: uint32
+  var nimFwDbgEapolCfmAckFail* {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_ack_fail".}: uint32
+  # Disconnect-path counters.
+  var nimFwDbgDisconnectReq*   {.wifiCtrl, exportc: "nimfw_dbg_disconnect_req".}: uint32
+  var nimFwDbgDisconnectReqState* {.wifiCtrl, exportc: "nimfw_dbg_disconnect_req_state".}: uint32
+  var nimFwDbgDisconnectProcess* {.wifiCtrl, exportc: "nimfw_dbg_disconnect_process".}: uint32
+  var nimFwDbgDisconnectInd*   {.wifiCtrl, exportc: "nimfw_dbg_disconnect_ind".}: uint32
+  var nimFwDbgSmStateFinal*    {.wifiCtrl, exportc: "nimfw_dbg_sm_state_final".}: uint32
 
 const NimFwTraceEnabled =
   defined(bl808WifiNimFw) and
@@ -3802,6 +3945,7 @@ proc mm_cfg_element_keepalive_timestamp_update*() {.exportc, cdecl.} =
 proc mm_send_connection_loss_ind*(vifIdx: uint8, reason: uint16) {.exportc, cdecl, noinline.} =
   ## Send connection loss indication to host.
   ## noinline: blob keeps this as a standalone helper (called from multiple sites).
+  inc nimFwDbgConnLossInd
   {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
   let param = ke_msg_alloc(MM_CONNECTION_LOSS_IND, TASK_API, TASK_MM, 4)
   if param != nil:
@@ -3824,20 +3968,24 @@ proc mm_ps_change_ind*(vifEntry: pointer): cint {.exportc, cdecl.} =
     ke_msg_send(ind)
   return 0
 
-proc mm_set_wpa_rsn_ie*(ie: pointer, len: uint32) {.exportc, cdecl.} =
-  ## Set WPA/RSN IE for beacon/probe response.
-  ## From blob (7 instrs): a0=vifIdx (cast to pointer by Nim ABI), a1=ie_ptr, a2=ie_len.
-  ## Computes vif_info_tab[vifIdx] (stride 1512), stores ie pointer at vif+492,
-  ## stores length byte at vif+496, returns 0.
-  let vifIdx = cast[uint](ie)  # blob's a0 is actually vifIdx
+proc mm_set_wpa_rsn_ie*(vifIdx: uint8, ie: pointer, ieLen: uint8) {.exportc, cdecl.} =
+  ## Set WPA/RSN IE for the AssocReq's pre-built security IE block.
+  ## Blob ABI: a0=vifIdx, a1=ie_ptr, a2=ie_len.
+  ## Stores ie pointer at vif+492, length byte at vif+496.
+  ##
+  ## Prior Nim bug: signature had only (ie, len) — a2 wasn't captured, vif+496
+  ## was always written as 0. Caller `bl_wifi_set_appie_internal` (ieType==0)
+  ## passed (ie, ieLen) — wrong slots, so vif+492 received the length value as
+  ## "ie ptr" and vifIdx came from casting the IE pointer. Result: AssocReq
+  ## never carried the RSN IE → Frog accepted us as open assoc → no WPA handshake
+  ## → mm_sta_tbtt fired forever → null-frame flood.
+  inc nimFwDbgWpaRsnIeSet
+  nimFwDbgWpaRsnIeLen = ieLen.uint32
+  nimFwDbgWpaRsnIePtr = cast[uint32](ie)
   let vifTab = cast[uint](addr vif_info_tab[0])
-  let vifEntry = vifTab + vifIdx * VIF_ENTRY_SIZE.uint
-  # a1=len is actually the IE pointer in blob ABI, a2 (not in Nim sig) is the len byte
-  # Store the IE pointer and length into VIF entry
-  cast[ptr uint32](vifEntry + 492)[] = len  # blob: sw a1, 492(a5) where a1=ie_ptr
-  # The length (a2) is passed via C ABI but not visible in Nim signature
-  # Store 0 as default length
-  cast[ptr uint8](vifEntry + 496)[] = 0
+  let vifEntry = vifTab + vifIdx.uint * VIF_ENTRY_SIZE.uint
+  cast[ptr uint32](vifEntry + 492)[] = cast[uint32](ie)
+  cast[ptr uint8](vifEntry + 496)[] = ieLen
 
 proc mm_force_idle_req*() {.exportc, cdecl.} =
   ## Force MAC HW to idle state (23 instrs).
@@ -4528,6 +4676,7 @@ proc mm_sta_tbtt*(vifIdx: uint8) {.exportc, cdecl.} =
   ## chan_tbtt_switch_update, chan_is_on_channel, ps_check_tbtt.
   ## If probe counter exceeds 100, sends null frame; if > 50, sends PM event.
   let vif = cast[uint](cast[pointer](vifIdx))  # ABI: param is actually a pointer
+  inc nimFwDbgStaTbttEnter
   let logFn = cast[ptr pointer](cast[uint](addr g_bl_ops_funcs) + 0xCC)[]
   if logFn != nil:
     cast[proc(a0: uint32, a1: uint32, a2: pointer, a3: uint32, a4: pointer){.cdecl.}](logFn)(
@@ -4536,6 +4685,7 @@ proc mm_sta_tbtt*(vifIdx: uint8) {.exportc, cdecl.} =
   let assocState = cast[ptr uint8](vif + 88)[]
   if assocState == 0:
     return
+  inc nimFwDbgStaTbttAssoc
   # Compute next TBTT time from associated STA's timer
   let staIdx = cast[ptr uint8](vif + 96)[]
   let staBase = cast[uint](addr sta_info_tab[0])
@@ -4560,6 +4710,7 @@ proc mm_sta_tbtt*(vifIdx: uint8) {.exportc, cdecl.} =
   let onChan = chan_is_on_channel(cast[pointer](vif))
   if not onChan:
     return
+  inc nimFwDbgStaTbttOnChan
   # Set bit 0 in vif+4
   let flags = cast[ptr uint32](vif + 4)[]
   cast[ptr uint32](vif + 4)[] = flags or 1'u32
@@ -4569,7 +4720,34 @@ proc mm_sta_tbtt*(vifIdx: uint8) {.exportc, cdecl.} =
   var probeCount = cast[ptr uint8](vif + 116)[]
   probeCount = probeCount + 1
   cast[ptr uint8](vif + 116)[] = probeCount
+  if probeCount > nimFwDbgStaTbttPCMax.uint8:
+    nimFwDbgStaTbttPCMax = probeCount.uint32
+  # Guard: if WPA handshake is still pending on this VIF, the keep-alive
+  # null-frame loop is meaningless (the AP won't ACK us before WPA completes)
+  # and will exhaust the 4-entry frame pool. After a generous grace period,
+  # give up on the handshake and report connection loss.
+  let vifIdxLocal = cast[ptr uint8](vif + 87)[]
+  let wpaPending = vifIdxLocal < 8 and
+                   (nimFwWpaPendingMask and (1'u32 shl vifIdxLocal)) != 0
+  if wpaPending:
+    inc nimFwDbgStaTbttSkip
+    if probeCount > 60:
+      inc nimFwDbgStaTbttGiveup
+      # Time out the stuck WPA handshake. Clear the pending bit AND the VIF
+      # assoc state (vif+88) so subsequent mm_sta_tbtt entries return early at
+      # the assocState==0 gate. Report connection loss to the host so the
+      # upper layer can tear down and surface a proper failure status.
+      nimFwWpaPendingMask = nimFwWpaPendingMask and (not (1'u32 shl vifIdxLocal))
+      cast[ptr uint8](vif + 88)[] = 0
+      mm_send_connection_loss_ind(vifIdxLocal, 15)
+      # Surface a definitive WPA-timeout failure to SM/host so wifiConnect
+      # returns quickly instead of waiting for the upper-layer connect-timeout.
+      # status=5 (WLAN_FW_ASSOC_FAILURE), reason=15 (4WAY_HANDSHAKE_TIMEOUT).
+      if ke_state_get(TASK_SM) == SM_ACTIVATING_STATE:
+        sm_connect_ind(5, 15)
+    return
   if probeCount > 100:
+    inc nimFwDbgStaTbttPC100
     # Send null frame with probe callback
     let staIdxForNull = cast[ptr uint8](vif + 96)[]
     discard txl_frame_send_null_frame(staIdxForNull, cast[pointer](mm_ap_probe_cfm), cast[uint32](vif))
@@ -8099,13 +8277,25 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
             if pf != nil:
               discard cast[proc(a:pointer,b:uint8,c:pointer):pointer{.cdecl.}](pf)(lW, wd[1]+2, addr lS[0])
         cast[ptr uint8](cast[uint](vif)+497)[] = sT
-        var aT: uint32 = 2; let lf = lS[12].uint32
-        if (smF and 0x600) != 0:
+        # Read key_mgmt as a full 16-bit value (struct wifi_wpa_ie_t has it as
+        # int at offset 12, LE). Prior code read only lS[12] (single byte) which
+        # silently lost bit 10 (WPA_KEY_MGMT_SAE = 0x400) since it lives in byte 13.
+        var aT: uint32 = 2
+        let lf = lS[12].uint32 or (lS[13].uint32 shl 8)
+        nimFwDbgScanKeyMgmt = lf
+        nimFwDbgScanSmF = smF
+        nimFwDbgScanCaps = lS[16].uint32
+        when defined(bl808WifiWpa3Sae):
+          var smFEff = smF or 0x600'u32
+        else:
+          var smFEff = smF
+        if (smFEff and 0x600) != 0:
           if (lf and 0x400) != 0: aT = 1024
           elif (lf and 0x100) != 0: aT = 256
         else:
           if (lf and 0x100) != 0: aT = 256
           elif (lf and 2) == 0: aT = 0
+        nimFwDbgScanAT = aT
         if aT != 0:
           cast[ptr uint8](cast[uint](vif)+498)[] = lS[4]
           cast[ptr uint8](cast[uint](vif)+499)[] = lS[8]
@@ -8813,8 +9003,12 @@ proc sm_handle_connection*(vifIdxOrFlag: uint32, status: uint32,
   # Update TX power (blob: tpc_update_frame_tx_power(vifEntry, frame))
   tpc_update_frame_tx_power(cast[pointer](vifEntry), frame)
 
-  # Get MAC header from frame (blob: lw s1,108(s0) -> macHdr = frame[108])
-  let macHdr = cast[ptr uint](f + 108)[]
+  # Get link descriptor from frame (blob: lw s1,108(s0) -> s1 = frame[108]).
+  # The MAC header BUFFER lives at linkDesc+348 (matches hwDesc[20] set up by
+  # txl_frame_init_desc). All blob `sb/sw N(s1)` stores are offsets into that
+  # buffer, so add 348 here to get the actual MAC header start.
+  let linkDescPtr = cast[ptr uint](f + 108)[]
+  let macHdr = linkDescPtr + 348
   let staTab = cast[uint](addr sta_info_tab[0])
   let staEntry = staTab + staIdx.uint * 368
 
@@ -8824,11 +9018,11 @@ proc sm_handle_connection*(vifIdxOrFlag: uint32, status: uint32,
   cast[ptr uint8](macHdr + 2)[] = 0
   cast[ptr uint8](macHdr + 3)[] = 0
 
-  # DA from sta_info_tab+4 (blob: memcpy at 0x94, src=s2+4=sta_info_tab+4)
+  # DA from sta_info_tab+4 (blob: memcpy dst=s1+348+4 -> macHdr+4)
   discard c_memcpy(cast[pointer](macHdr + 4), cast[pointer](staEntry + 4), 6.csize_t)
-  # SA from vifEntry+80 (blob: memcpy at 0xA6, src=s3+80)
+  # SA from vifEntry+80 (blob: memcpy dst=s1+348+10 -> macHdr+10)
   discard c_memcpy(cast[pointer](macHdr + 10), cast[pointer](vifEntry + 80), 6.csize_t)
-  # BSSID from sta_info_tab+4 (blob: memcpy at 0xB6, src=s2=sta_info_tab+4)
+  # BSSID from sta_info_tab+4 (blob: memcpy dst=s1+348+16 -> macHdr+16)
   discard c_memcpy(cast[pointer](macHdr + 16), cast[pointer](staEntry + 4), 6.csize_t)
 
   # Get sequence control (blob: txl_get_seq_ctrl at 0xBE)
@@ -8896,6 +9090,7 @@ proc sm_disconnect_process*(param: pointer, statusCode: uint16 = 0, reasonCode: 
   ## Process a disconnect request (122 bytes in blob, 39 instrs).
   ## Blob: ke_msg_alloc, ke_timer_clear, clear smConnecting + sm_env[0],
   ## sm_delete_resources, populate msg, tail-call ke_msg_send.
+  inc nimFwDbgDisconnectProcess
   let msg = ke_msg_alloc(SM_DISCONNECT_IND, TASK_API, TASK_SM, 16)
   if msg == nil:
     return
@@ -9164,6 +9359,7 @@ proc sm_auth_send*(authSeqNum: uint16, statusCode: uint32) {.exportc, cdecl.} =
 
   # Read auth parameters from connect info
   let authAlgo = cast[ptr uint8](ciU + 57)[]
+  nimFwDbgSaeAuthAlgo = authAlgo.uint32
 
   # Allocate frame buffer (512 bytes)
   let frame = txl_frame_get(512)
@@ -9359,6 +9555,12 @@ proc sm_assoc_req_send*(param: pointer) {.exportc, cdecl.} =
   cast[ptr uint8](macHdr + 350)[] = 0
   cast[ptr uint8](macHdr + 351)[] = 0
 
+  # Snapshot vif+80 (frame SA) + MAC HW addr regs for crypto MAC consistency check.
+  for i in 0 ..< 6:
+    nimFwDbgVifMac[i] = cast[ptr uint8](vifEntry + 80 + i.uint)[]
+  nimFwDbgMacHwLo = regRead(MACHW_BASE + 0x10'u)
+  nimFwDbgMacHwHi = regRead(MACHW_BASE + 0x14'u)
+
   # DA from sta_info_tab+4 (blob: memcpy at 0x8e)
   discard c_memcpy(cast[pointer](macHdr + 352), cast[pointer](staE + 4), 6.csize_t)
   # SA from vifEntry+80 (blob: memcpy at 0xa0)
@@ -9445,7 +9647,19 @@ proc sm_assoc_done*(aid: uint16) {.exportc, cdecl.} =
   ## fills status (param as uint16), VIF state = 1 (active), inst_nbr from
   ## connInfo+59, sends the message. Sets SM state to SM_ACTIVATING_STATE (9),
   ## clears sm_env[36], then tail-calls ke_timer_clear(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM).
+  inc nimFwDbgAssocDone
   let smEnvBase = cast[uint](addr sm_env[0])
+  # Mark this VIF as "WPA pending" if the connection target requires WPA.
+  # Read connInfo before any reuse; the connect-info struct lives at sm_env[0].
+  block markWpaPending:
+    let ci = cast[ptr pointer](smEnvBase)[]
+    if ci == nil: break markWpaPending
+    let vifIdx0 = cast[ptr uint8](cast[uint](ci) + 59)[]
+    if vifIdx0 >= 8: break markWpaPending
+    let vifBase = cast[uint](addr vif_info_tab[0])
+    let secType = cast[ptr uint8](vifBase + vifIdx0.uint * VIF_ENTRY_SIZE.uint + 497)[]
+    if secType >= 2'u8:
+      nimFwWpaPendingMask = nimFwWpaPendingMask or (1'u32 shl vifIdx0)
   let connInfo = cast[ptr pointer](smEnvBase)[]
   let connU = cast[uint](connInfo)
 
@@ -9636,6 +9850,11 @@ proc sm_assoc_rsp_handler*(param: pointer) {.exportc, cdecl.} =
   let statusHi = cast[ptr uint8](frameBody + 3)[]
   let statusLo = cast[ptr uint8](frameBody + 2)[]
   let statusCode = (statusHi.uint16 shl 8) or statusLo.uint16
+  inc nimFwDbgAssocRspCount
+  nimFwDbgAssocRspStatus = statusCode.uint32
+  nimFwDbgAssocRspLen = frameLen.uint32
+  nimFwDbgAssocRspBody0 = cast[ptr uint32](frameBody)[]
+  nimFwDbgAssocRspBody4 = cast[ptr uint32](frameBody + 4)[]
   when defined(bl808WifiConnectTrace):
     nimFwConnectTrace2U32("[WIFI-CT] assoc_rsp_status ", frameLen.uint32, statusCode.uint32)
     nimFwConnectTrace2U32("[WIFI-CT] assoc_rsp_body ",
@@ -9763,6 +9982,7 @@ proc sm_deauth_handler*(param: pointer) {.exportc, cdecl.} =
   ## Handle deauthentication frame (140 instrs). Validates BSSID/SA,
   ## extracts reason code, dispatches based on SM state.
   ## Returns result via a0: 0=handled/ignored, 2=state mismatch.
+  inc nimFwDbgDeauthHandler
   let p = cast[ptr UncheckedArray[uint8]](param)
   let vifIdx = p[8]
   let smBase = cast[uint](addr sm_env[0])
@@ -9897,6 +10117,7 @@ proc sm_handle_eapol_input*(staIdx: uint8, srcAddr: pointer, eapolBuf: pointer,
   ## and calls wps_cbs[4] (WPS EAPOL handler). Otherwise checks ke_state_get(4).
   ## If state == 9 (SM_ACTIVATING), loads wpa_cbs[20] (WPA EAPOL handler).
   ## If state == 0, allocates ke_msg SM_CONNECT_AUTH_ASSOC_REQ with EAPOL data.
+  inc nimFwDbgEapolIn
   let staBase = cast[uint](addr sta_info_tab[0])
   let staEntry = staBase + staIdx.uint * STA_ENTRY_SIZE.uint
   let vifIdxFromSta = cast[ptr uint8](staEntry + 39)[]
@@ -9904,8 +10125,11 @@ proc sm_handle_eapol_input*(staIdx: uint8, srcAddr: pointer, eapolBuf: pointer,
   let vifEntry = vifBase + vifIdxFromSta.uint * VIF_ENTRY_SIZE.uint
   # Check WPA state flag at VIF+488
   let wpaState = cast[ptr uint8](vifEntry + 488)[]
+  nimFwDbgVifWpaState = wpaState.uint32
   if wpaState == 0:
+    inc nimFwDbgEapolDropped
     return
+  inc nimFwDbgEapolForwarded
   # Check connection state
   let smBase = cast[uint](addr sm_env[0])
   let connState = cast[ptr uint8](smBase + 44)[]
@@ -9919,6 +10143,7 @@ proc sm_handle_eapol_input*(staIdx: uint8, srcAddr: pointer, eapolBuf: pointer,
     return
   # Normal mode: check SM task state
   let smState = ke_state_get(TASK_SM)
+  nimFwDbgSmStateAtEapol = smState.uint32
   when defined(bl808WifiConnectTrace):
     nimFwConnectTrace2U32("[WIFI-CT] sm_eapol ", staIdx.uint32 or (smState.uint32 shl 8), eapolLen)
   if smState == SM_ACTIVATING_STATE:
@@ -9926,8 +10151,13 @@ proc sm_handle_eapol_input*(staIdx: uint8, srcAddr: pointer, eapolBuf: pointer,
     if wpa_cbs != nil:
       let wpaHandler = cast[ptr pointer](cast[uint](wpa_cbs) + 20)[]
       if cast[uint](wpaHandler) > 0x1000'u:
+        inc nimFwDbgEapolCbInv
         cast[proc(src: pointer, buf: pointer, len: uint32) {.cdecl.}](wpaHandler)(
           srcAddr, eapolBuf, eapolLen)
+      else:
+        inc nimFwDbgEapolCbNull
+    else:
+      inc nimFwDbgEapolCbNull
   elif smState == 0:
     # Idle: may need to start auth/assoc
     discard
@@ -12393,6 +12623,7 @@ proc me_build_associate_req_impl(buf: pointer, assocInfo: pointer,
   # The blob performs this copy before checking the capability flags.
   let assocIeSrc = cast[ptr pointer](assocU + 144)[]
   let assocIeLen = cast[ptr uint8](assocU + 148)[].uint32
+  nimFwDbgVifIeLenAtAssoc = assocIeLen or (cast[uint32](assocIeSrc) shl 8)
   if assocIeSrc != nil and assocIeLen != 0:
     discard c_memcpy(cursor, assocIeSrc, assocIeLen.csize_t)
     cursor = cast[pointer](cast[uint](cursor) + assocIeLen.uint)
@@ -13904,8 +14135,10 @@ proc rc_init*(staEntry: pointer) {.exportc, cdecl.} =
     (1'u32 shl (ntx2.uint32 + 1'u32)) - 1'u32
   # pkt_type
   cast[ptr uint32](cast[uint](txPolicy) + 12)[] = pktType
-  # controlInfo = 0xFFFF0704
-  cast[ptr uint32](cast[uint](txPolicy) + 16)[] = 0xFFFF0704'u32
+  # controlInfo: bits[7:0] and [15:8] encode per-rate retry counts. Bumped
+  # from blob default 0xFFFF0704 (4 + 7 tries) to 0xFFFF1F1F (31 + 31 tries)
+  # to give MAC HW many more chances to land an EAPOL ACK during 4-way.
+  cast[ptr uint32](cast[uint](txPolicy) + 16)[] = 0xFFFF1F1F'u32
   # edcaParam0 = 0x2200
   cast[ptr uint32](cast[uint](txPolicy) + 52)[] = 0x2200'u32
   # edcaParam1 = VIF pointer
@@ -15473,6 +15706,7 @@ proc txl_cfm_push*(desc: pointer, status: uint32, acIdx: uint32) {.exportc, cdec
   ##   tail-call ke_evt_set(evt)
   ## Prior Nim bug: tail-called ipc_emb_tx_evt(ac_idx) — completely wrong
   ## target; the blob signals the KE scheduler, not the host IPC.
+  inc nimFwDbgCfmPush
   let descU = cast[uint](desc)
   let fenvPtr = cast[ptr pointer](descU + HostTxHwDescOff)[]
   when defined(bl808WifiNimFw):
@@ -15525,6 +15759,7 @@ proc txl_cfm_evt*() {.exportc, cdecl.} =
   ##   ke_evt_clear, then loop with IRQ-safe co_list_pop_front:
   ##   me_tx_cfm_singleton → txu_cntrl_cfm → txl_cntrl_env[80]-- → ipc_emb_txcfm
   ##   → ipc_emb_txcfm_ind (per-descriptor, inside loop).
+  inc nimFwDbgCfmEvt
   var acIdx {.noinit.}: uint32
   {.emit: ["asm volatile(\"mv %0, a0\" : \"=r\"(", acIdx, ") );"].}
 
@@ -16402,6 +16637,7 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
   ##
   ## Call graph: assert_rec, blmac_abs_timer_set, txl_machdr_format,
   ##             txu_cntrl_tkip_mic_append
+  inc nimFwDbgPayBackupEntry
   let cntrlBase = cast[uint](addr txl_cntrl_env[0])
   let bufferEnvBase = cast[uint](addr txl_buffer_env[0])
   const
@@ -16439,6 +16675,7 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
     let acBit = 1'u32 shl ac
 
     while descPtr != nil:
+      inc nimFwDbgPayDescFound
       let descU = cast[uint](descPtr)
       let nextDesc = cast[ptr pointer](descU + 16)[]  # next in backup chain
 
@@ -16493,6 +16730,7 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
             cast[ptr uint32](forceLinkU + 300)[] = NimFwForcedMgmtTxPower
             cast[ptr uint32](forceLinkU + 304)[] = NimFwForcedMgmtTxPower
       if hasPayload != nil:
+        inc nimFwDbgPayHasPayload
         # For AC==4 (BCN), special beacon handling
         if ac == 4:
           let vifIdx = cast[ptr uint8](actualU + 47)[]  # blob: lbu a3,47(s0)
@@ -16677,6 +16915,7 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
                                     cast[ptr uint32](linkU + 292)[])
               nimFwDbgEapolTraceCount = nimFwDbgEapolTraceCount + 1
       if listFirst == nil:
+        inc nimFwDbgPayEmptyList
         # Empty list path (.L64): read ipc_shared_env TX timer base from 0x24B00120,
         # check DMA status, program link register, call blmac_abs_timer_set, set AGG bits.
         # Timer constants: s6=200000, s7=50000, s8=2000000, AC2=400000.
@@ -16717,24 +16956,27 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
         if assertLine != 0 and dmaField == 2:
           assert_rec("txl_payload.c", "txl_payload.c", assertLine)
         else:
+          var trigBits: uint32 = 0
           case ac
           of 0:
             regWrite(0x24B0819C'u, cast[uint32](thdLink))
-            regWrite(HW_TRIGGER_REG, 512)
+            trigBits = 512
           of 1:
             regWrite(0x24B081A0'u, cast[uint32](thdLink))
-            regWrite(HW_TRIGGER_REG, 1024)
+            trigBits = 1024
           of 2:
             regWrite(0x24B081A4'u, cast[uint32](thdLink))
-            regWrite(HW_TRIGGER_REG, 2048)
+            trigBits = 2048
           of 3:
             regWrite(0x24B081A8'u, cast[uint32](thdLink))
-            regWrite(HW_TRIGGER_REG, 4096)
+            trigBits = 4096
           of 4:
             regWrite(0x24B08198'u, cast[uint32](thdLink))
-            regWrite(HW_TRIGGER_REG, 256)
+            trigBits = 256
           else:
             discard
+          regWrite(HW_TRIGGER_REG, trigBits)
+          nimFwDbgPayTriggerLast = trigBits or (ac shl 16) or 0x80000000'u32
           blmac_abs_timer_set(ac, timerVal)
           # Set HW aggregation bits
           regWrite(HW_AGG_SET_REG, acBit)
@@ -16750,6 +16992,7 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
                                       regRead(0x24B08078'u),
                                       regRead(0x24B0808C'u))
       else:
+        inc nimFwDbgPayNonEmpty
         # Non-empty list: link into existing chain and write trigger
         cast[ptr pointer](cast[uint](listFirst) + 4)[] = thdLink
         var triggerVal: uint32
@@ -16760,6 +17003,7 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
         of 1: triggerVal = 4
         else: triggerVal = 2    # AC0
         regWrite(HW_TRIGGER_REG, triggerVal)
+        nimFwDbgPayTriggerLast = triggerVal or (ac shl 16) or 0x40000000'u32
         if traceMgmt or traceEapol:
           nimFwTrace2U32("[WIFI-NIMFW] pay_regs ",
                          regRead(0x24B08078'u),
@@ -16791,6 +17035,7 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
   ##   4. Loop within that AC's descriptor chain until THD not ready
   ##   5. For each ready THD: program DMA, handle secondary chain
   ##   6. Tail-call hal_machw_trigger_set(ac, ipc_base + offset) to start TX
+  inc nimFwDbgTxTrigEntry
   const
     MACHW_TX_STATUS_REG = 0x24B08078'u  # TX status with AC ready bits
     MACHW_TX_TRIG_STAT  = 0x24B0808C'u
@@ -16800,7 +17045,9 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
   # Check MAC HW TX status - bits [10:6] indicate AC readiness
   let txStatus = regRead(MACHW_TX_STATUS_REG)
   let acReady = txStatus and 0x7C0'u32  # bits [10:6]
+  nimFwDbgTxTrigAcReady = txStatus
   if acReady == 0:
+    inc nimFwDbgTxTrigZeroExit
     return  # No ACs ready for transmission
 
   # Compute highest-priority AC from CLZ: s0 = 25 - CLZ(acReady)
@@ -16827,6 +17074,7 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
 
   # Main loop (.L137): process descriptors for this AC
   while true:
+    inc nimFwDbgTxTrigLoops
     let descPtr = cast[ptr pointer](acBase + 4)[]
     if descPtr == nil:
       # No descriptor (.L130): clear AC bit in INTC status, clear cntrl_env[0]
@@ -17191,6 +17439,8 @@ proc txl_frame_get*(length: uint32): pointer {.exportc, cdecl.} =
   ##   to free postponed frames, then txl_cntrl_clear_ac(3) to flush VO queue,
   ##   then co_list_cnt to check if frames freed. Retries pop on success.
   ##   Returns descriptor pointer or nil if pool exhausted.
+  var callerRA {.noinit.}: uint32
+  {.emit: [callerRA, " = (unsigned int)__builtin_return_address(0);"].}
   let frameEnvBase = cast[uint](addr txl_frame_env[0])
   let freeList = cast[ptr CoList](frameEnvBase)
   let blOpsBase = cast[uint](addr g_bl_ops_funcs)
@@ -17200,10 +17450,12 @@ proc txl_frame_get*(length: uint32): pointer {.exportc, cdecl.} =
     # Pop from free list
     let freeNode = co_list_pop_front(freeList)
     if freeNode == nil:
-      # Log: "[FW] NULL frame for tx %p, len %d"
+      # Log: "[FW] NULL frame for tx %p, len %d, ra=0x%x"
       if logFn != nil:
-        cast[proc(fmt: cstring, a1: uint32, a2: uint32){.cdecl, varargs.}](logFn)(
-          "[FW] NULL frame for tx %p, len %d\r\n", 0, length)
+        cast[proc(fmt: cstring, a1: uint32, a2: uint32, a3: uint32){.cdecl, varargs.}](logFn)(
+          "[FW] NULL frame ra=0x%x len=%d cnt=%d\r\n", callerRA, length,
+          nimFwDbgFrameGetFails + 1)
+      inc nimFwDbgFrameGetFails
 
       # Try freeing postponed descriptors
       let pendingCount = cast[ptr uint32](frameEnvBase + 16)[]
@@ -17230,7 +17482,20 @@ proc txl_frame_get*(length: uint32): pointer {.exportc, cdecl.} =
     # Success: set up the descriptor
     let descAddr = cast[uint](freeNode)
     let hwDesc = cast[uint](cast[ptr pointer](descAddr + 112)[])   # desc[112] = THD/hwDesc
-    let linkDesc = cast[uint](cast[ptr pointer](descAddr + 108)[]) # desc[108] = linkDesc
+
+    # Restore desc+108 (linkDesc) if a prior upper-layer TX cfm cleared it.
+    # txl_cfm_flush_list nulls desc+108 on the host-data path, which leaves
+    # the descriptor in the free list with linkDesc=nil. sm_handle_connection
+    # then reads macHdr=desc[108]=nil and writes the deauth at addr 0, while
+    # txl_frame_push reads a stale hwDesc[20] and asserts on bit 0.
+    var linkDescField = cast[ptr pointer](descAddr + 108)
+    if linkDescField[] == nil:
+      let descArrayBase = cast[uint](addr txl_frame_desc_storage[0])
+      let linkPoolBase = cast[uint](addr txl_frame_pool[0])
+      let idx = (descAddr - descArrayBase) div 220'u
+      if idx < 4'u:
+        linkDescField[] = cast[pointer](linkPoolBase + idx * 860'u)
+    let linkDesc = cast[uint](linkDescField[])
 
     # Set buffer length fields in hwDesc. Internal frame descriptors always
     # transmit from their link descriptor's MAC header buffer; restore this
@@ -17270,6 +17535,13 @@ proc txl_frame_get*(length: uint32): pointer {.exportc, cdecl.} =
     cast[ptr uint32](hwDesc + 16)[] = 0
     cast[ptr uint32](descAddr + 208)[] = 0
     cast[ptr uint32](descAddr + 212)[] = 0
+    # CRITICAL: clear desc+8 (host-TX active flag set by ipc_emb_tx_evt). If a
+    # frame descriptor is recycled from a prior host data TX, desc+8 stays at 1,
+    # which routes the cfm to the upper-layer path (txu_cntrl_cfm) instead of
+    # txl_frame_cfm. Internal-frame callbacks at desc+208 (e.g. deauth's
+    # sm_disconnect_deauth_cfm) then never fire, hanging wifiDisconnect.
+    cast[ptr uint32](descAddr + 8)[] = 0
+    inc nimFwDbgFrameGet
     return cast[pointer](freeNode)
 
 proc txl_frame_push*(param: pointer, ac: uint8): uint8 {.exportc, cdecl, noinline, discardable.} =
@@ -17290,6 +17562,15 @@ proc txl_frame_push*(param: pointer, ac: uint8): uint8 {.exportc, cdecl, noinlin
       thdField = expectedHdrPtr
       cast[ptr uint32](hwDescAddr + 20)[] = expectedHdrPtr
   if (thdField and 1) != 0:
+    when defined(bl808WifiNimFw):
+      {.emit: """
+      extern void cfg_trace(char *s);
+      extern void cfg_trace_rc(char *s, int v);
+      cfg_trace_rc("[PUSH-ASSERT] thdField=", `thdField`);
+      cfg_trace_rc("[PUSH-ASSERT] linkDesc=", (int)(unsigned)`linkDesc`);
+      cfg_trace_rc("[PUSH-ASSERT] descAddr=", (int)`descAddr`);
+      cfg_trace_rc("[PUSH-ASSERT] hwDescAddr=", (int)`hwDescAddr`);
+      """.}
     assert_err("txl_frame.c", "txl_frame.c", 316)
   # Mask bits [22:15] of control flags
   var ctrlFlags = cast[ptr uint32](hwDescAddr + 60)[]
@@ -17344,6 +17625,7 @@ proc txl_frame_cfm*(param: pointer) {.exportc, cdecl.} =
   ## Handle TX frame confirmation.
   ## Blob behavior: push the descriptor on txl_frame_env+8, then signal
   ## the TX frame confirm event (0x80000) for txl_frame_evt.
+  inc nimFwDbgFrameCfm
   let descU = cast[uint](param)
   let linkDesc = cast[ptr pointer](descU + 108)[]
   if linkDesc != nil:
@@ -17377,6 +17659,7 @@ proc txl_frame_release*(param: pointer) {.exportc, cdecl.} =
   ##     tail-call frame[208](frame[212], 0)
   ##   return
   if param == nil: return
+  inc nimFwDbgFrameRelease
   let f = cast[uint](param)
   var doCallback {.noinit.}: uint32
   {.emit: ["asm volatile(\"mv %0, a1\" : \"=r\"(", doCallback, ") );"].}
@@ -17417,6 +17700,7 @@ proc txl_frame_evt*() {.exportc, cdecl.} =
   ##     if !desc[216]: push_back to freeList
   ##     loop
   # Clear the TX frame confirm event
+  inc nimFwDbgFrameEvtEnter
   ke_evt_clear(0x00080000'u32)
   let cntrlBase = cast[uint](addr txl_cntrl_env[0])
   while true:
@@ -17426,6 +17710,7 @@ proc txl_frame_evt*() {.exportc, cdecl.} =
     irqRestore(saved)
     if node == nil:
       break
+    inc nimFwDbgFrameEvtPop
     let descAddr = cast[uint](node)
     # Decrement pending frame counter at txl_cntrl_env[80].
     let counterAddr = cntrlBase + 80
@@ -17435,6 +17720,7 @@ proc txl_frame_evt*() {.exportc, cdecl.} =
     # Check for callback at desc[208]
     let callbackPtr = cast[ptr pointer](descAddr + 208)[]
     if callbackPtr != nil:
+      inc nimFwDbgFrameEvtCallback
       # Blob passes desc[112][64] directly as the callback status.
       let hwDescPtr = cast[ptr pointer](descAddr + 112)[]
       let thdStatus = cast[ptr uint32](cast[uint](hwDescPtr) + 64)[]
@@ -17450,15 +17736,22 @@ proc txl_frame_evt*() {.exportc, cdecl.} =
     # If not internally allocated (desc[216] == 0), return to free list
     let usedFlag = cast[ptr uint8](descAddr + 216)[]
     if usedFlag == 0:
+      inc nimFwDbgFrameEvtFreeRet
       # Return to internal free frame list.
       co_list_push_back(cast[ptr CoList](addr txl_frame_env[0]),
                         cast[ptr CoListHdr](node))
+    else:
+      inc nimFwDbgFrameEvtUsedSkip
 
 proc txl_frame_send_null_frame*(staIdx: uint8, cfmCallback: pointer, cfmArg: uint32): uint8 {.exportc, cdecl, discardable.} =
   ## Build and send a null data frame (for PS notification).
   ## Blob ABI is (staIdx, cfmCallback, cfmArg), not (vifIdx, staIdx, pwrMgt).
   ## The VIF index is read from sta_info_tab[staIdx]+39 and the callback/arg
   ## are stored verbatim at desc+208/212 for txl_frame_cfm.
+  var nfRA {.noinit.}: uint32
+  {.emit: [nfRA, " = (unsigned int)__builtin_return_address(0);"].}
+  inc nimFwDbgNullFrameCalls
+  nimFwDbgNullFrameCallerRA = nfRA
   let staBase = cast[uint](addr sta_info_tab[0])
   let staEntry = staBase + staIdx.uint * STA_ENTRY_SIZE.uint
   let vifIdx = cast[ptr uint8](staEntry + 39)[]
@@ -23824,8 +24117,8 @@ proc bl_wifi_set_appie_internal*(vifIdx: uint8, ieType: uint8, ie: pointer, ieLe
   ##   ieType==2: stores ie/ieLen into probe response extra IE globals (max 50 bytes)
   ## Returns 0 on success, -1 on invalid length (return in a0).
   if ieType == 0:
-    # Forward to WPA/RSN IE handler (blob: mm_set_wpa_rsn_ie)
-    mm_set_wpa_rsn_ie(ie, (ieLen and 0xFF).uint32)
+    # Forward to WPA/RSN IE handler (blob: mm_set_wpa_rsn_ie(vifIdx, ie, len)).
+    mm_set_wpa_rsn_ie(vifIdx, ie, (ieLen and 0xFF).uint8)
   elif ieType == 1:
     # Beacon extra IE: max 170 bytes
     if ieLen > 170:
@@ -24101,6 +24394,9 @@ proc bl_wifi_wpa_ptk_init_done_internal*(vifIdx: uint8) {.exportc, cdecl.} =
   ##   2. Calls sm_connect_ind(0, 0) to signal successful connection
   ##   3. Returns 1
   ## The log call uses the platform log function at g_bl_ops_funcs offset 0.
+  inc nimFwDbgPtkInitDone
+  if vifIdx < 8:
+    nimFwWpaPendingMask = nimFwWpaPendingMask and (not (1'u32 shl vifIdx))
   let logFn = getLogFunc(0)
   if logFn != nil:
     logFn(1, 0, nil, 99)
@@ -25018,6 +25314,18 @@ proc assert_err*(cond: cstring, file: cstring, line: cint) {.exportc, cdecl.} =
   ## Blob ABI: (a0=cond_or_func, a1=source_file, a2=line_number).
   ## Reloads logFn before each of 6 calls. Hangs forever after logging.
   when defined(bl808WifiNimFw):
+    # Direct-UART trace so we can see which assert fired even when nimFwTrace
+    # is compiled out and the blob logFn is char-write-blind.
+    {.emit: """
+    extern void cfg_trace_rc(char *s, int v);
+    extern void cfg_trace(char *s);
+    cfg_trace("[NIMFW-ASSERT] file=");
+    cfg_trace(`file` ? `file` : "(null)");
+    cfg_trace_rc(" line=", `line`);
+    cfg_trace("[NIMFW-ASSERT] cond=");
+    cfg_trace(`cond` ? `cond` : "(null)");
+    cfg_trace("\r\n");
+    """.}
     var traceBuf: array[96, char]
     let name = if file != nil: file else: cond
     if name != nil:
@@ -26130,9 +26438,12 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
     let newState = cast[ptr uint8](bodyU + 2)[]
     let apFlag = cast[ptr uint8](vifU + 86)[]
     var runCommonVifStateUpdate = true
+    inc nimFwDbgSetVifState
+    nimFwDbgSetVifStateNew = newState.uint32 or (apFlag.uint32 shl 8) or (vifIdx.uint32 shl 16)
 
     if apFlag == 0:  # STA mode
       let activating = ke_task_sm_activating()
+      if activating: inc nimFwDbgSetVifStateAct
       if activating:
         if newState == 0:
           # Deactivating: clear 3 timers
@@ -26460,7 +26771,9 @@ proc mm_set_vif_state_cfm_handler*(param: pointer) {.exportc, cdecl.} =
   # Blob sends SM_STA_ADD_IND here so the host TX table is ready for EAPOL 2/4.
   # WPA completion later calls sm_connect_ind via bl_wifi_auth_done_internal.
   sm_connection_sta_add_ind(nil)
+  nimFwDbgVifSecType = cast[ptr uint8](vifBase + 497)[].uint32
   if cast[ptr uint8](vifBase + 497)[] <= 1'u8:
+    inc nimFwDbgConnectIndPrePath
     sm_connect_ind(0, 0)
 
 proc mm_bcn_change_req_handler*(param: pointer) {.exportc, cdecl.} =
@@ -27421,7 +27734,9 @@ proc sm_disconnect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ##   sm_handle_connection(vif_idx, 19, sm_disconnect_deauth_cfm,
   ##                        sm_disconnect_process)
   ##   ke_msg_send_basic(SM_DISCONNECT_CFM, TASK_API, TASK_SM)
+  inc nimFwDbgDisconnectReq
   let state = ke_state_get(TASK_SM)
+  nimFwDbgDisconnectReqState = state.uint32
   if state != 0:
     return 2
   sm_connection_tlv_set(0, nil, 0)  # stub (just ret in blob)
