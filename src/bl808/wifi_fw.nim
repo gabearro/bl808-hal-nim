@@ -8285,7 +8285,7 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
         nimFwDbgScanKeyMgmt = lf
         nimFwDbgScanSmF = smF
         nimFwDbgScanCaps = lS[16].uint32
-        when defined(bl808WifiWpa3Sae):
+        when defined(bl808WifiForcePmfCapable):
           var smFEff = smF or 0x600'u32
         else:
           var smFEff = smF
@@ -17562,15 +17562,6 @@ proc txl_frame_push*(param: pointer, ac: uint8): uint8 {.exportc, cdecl, noinlin
       thdField = expectedHdrPtr
       cast[ptr uint32](hwDescAddr + 20)[] = expectedHdrPtr
   if (thdField and 1) != 0:
-    when defined(bl808WifiNimFw):
-      {.emit: """
-      extern void cfg_trace(char *s);
-      extern void cfg_trace_rc(char *s, int v);
-      cfg_trace_rc("[PUSH-ASSERT] thdField=", `thdField`);
-      cfg_trace_rc("[PUSH-ASSERT] linkDesc=", (int)(unsigned)`linkDesc`);
-      cfg_trace_rc("[PUSH-ASSERT] descAddr=", (int)`descAddr`);
-      cfg_trace_rc("[PUSH-ASSERT] hwDescAddr=", (int)`hwDescAddr`);
-      """.}
     assert_err("txl_frame.c", "txl_frame.c", 316)
   # Mask bits [22:15] of control flags
   var ctrlFlags = cast[ptr uint32](hwDescAddr + 60)[]
