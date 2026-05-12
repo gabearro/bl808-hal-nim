@@ -129,7 +129,14 @@ when defined(bl808m0):
       {.passC: "-DBL808_WIFI_CONNECT_CACHE_HINT".}
     when defined(bl808WifiVerboseConnect):
       {.passC: "-DBL808_WIFI_VERBOSE_CONNECT".}
-    when defined(bl808WifiWpa3Sae):
+    when defined(bl808WifiForcePmfCapable):
+      # Forces smF |= 0x600 (PMF-cap bits) on every scanned BSS in
+      # wifi_fw.nim's scanu path so APs that advertise PMF-required are
+      # reachable. Also enables the SAE supplicant compilation flags
+      # (CONFIG_WPA3_SAE / IEEE80211W / SHA256) so the wpa_supplicant code
+      # exists in the binary — but the vendor blob doesn't drive SAE auth,
+      # so real WPA3-SAE association still doesn't work end-to-end. The
+      # name reflects the actual runtime effect, not the aspirational one.
       {.passC: "-DCONFIG_WPA3_SAE -DCONFIG_IEEE80211W -DCONFIG_SHA256".}
     when defined(bl808WifiForceAckMode):
       {.passC: "-DBL808_WIFI_FORCE_ACK_MODE".}
@@ -499,23 +506,27 @@ when defined(bl808m0):
     else:
       if rc == 0: wifiOk else: wifiFail
 
-  when defined(bl808WifiVendor) and defined(bl808WifiNimFw):
+  when defined(bl808WifiVendor) and defined(bl808WifiNimFwDiag):
     proc dcTrace(s: cstring) {.importc: "cfg_trace", cdecl.}
     proc dcTraceRc(s: cstring; v: cint) {.importc: "cfg_trace_rc", cdecl.}
 
   proc wifiDisconnect*(): WifiError =
     when defined(bl808WifiVendor) and defined(bl808WifiNimFw):
-      dcTrace("[DC] enter\n")
+      when defined(bl808WifiNimFwDiag):
+        dcTrace("[DC] enter\n")
       bl808_wifi_vendor_poll(64)
-      dcTrace("[DC] poll64 done\n")
+      when defined(bl808WifiNimFwDiag):
+        dcTrace("[DC] poll64 done\n")
       for _ in 0 ..< 2000:
         if sm_state == 0'u16:
           break
         bl808_wifi_vendor_poll(8)
-      dcTrace("[DC] pre-loop done\n")
+      when defined(bl808WifiNimFwDiag):
+        dcTrace("[DC] pre-loop done\n")
     let rc = wifi_mgmr_sta_disconnect()
     when defined(bl808WifiVendor) and defined(bl808WifiNimFw):
-      dcTraceRc("[DC] sta_disconnect rc=", rc.cint)
+      when defined(bl808WifiNimFwDiag):
+        dcTraceRc("[DC] sta_disconnect rc=", rc.cint)
       if rc != 0:
         return wifiFail
       var loopIter: int = 0
@@ -524,10 +535,11 @@ when defined(bl808m0):
         if bl808_wifi_vendor_disconnect_done() != 0 or sm_state == 0'u16:
           return wifiOk
         inc loopIter
-        if (loopIter mod 500) == 0:
-          dcTraceRc("[DC-poll] iter=", loopIter.cint)
-          dcTraceRc("[DC-poll] sm_state=", sm_state.cint)
-          dcTraceRc("[DC-poll] disc_done=", bl808_wifi_vendor_disconnect_done())
+        when defined(bl808WifiNimFwDiag):
+          if (loopIter mod 500) == 0:
+            dcTraceRc("[DC-poll] iter=", loopIter.cint)
+            dcTraceRc("[DC-poll] sm_state=", sm_state.cint)
+            dcTraceRc("[DC-poll] disc_done=", bl808_wifi_vendor_disconnect_done())
       return wifiFail
     else:
       if rc == 0: wifiOk else: wifiFail
