@@ -220,6 +220,10 @@ static uint32_t bleblob_dbg_time_words[3];
 uint32_t bleblob_llc_start_seen;
 uint32_t bleblob_llc_start_header[4];
 uint8_t bleblob_llc_start_msg[64] __attribute__((aligned(4)));
+uint32_t bleblob_llc_start_em[64];
+uint32_t bleblob_llc_start_rx[64];
+uint32_t bleblob_llc_start_tx[16];
+uint32_t bleblob_llc_start_regs[8];
 
 extern uint8_t __real_llc_start(uint16_t conhdl, void *param);
 
@@ -241,6 +245,29 @@ uint8_t __wrap_llc_start(uint16_t conhdl, void *param)
 
     uint8_t status = __real_llc_start(conhdl, param);
     bleblob_llc_start_header[2] = status;
+    if (status == 0) {
+        uint32_t activity = 0x28010000u + 0x0120u + 0x0094u * (conhdl & 0x0fu);
+        uint32_t tx = 0x28010000u + 0x0558u + 0x0070u * (conhdl & 0x0fu);
+        volatile uint32_t *em = (volatile uint32_t *)activity;
+        volatile uint32_t *rx = (volatile uint32_t *)0x28010458u;
+        volatile uint32_t *txdesc = (volatile uint32_t *)tx;
+
+        for (uint32_t i = 0; i < 64u; i++) {
+            bleblob_llc_start_em[i] = em[i];
+            bleblob_llc_start_rx[i] = rx[i];
+        }
+        for (uint32_t i = 0; i < 16u; i++) {
+            bleblob_llc_start_tx[i] = txdesc[i];
+        }
+        bleblob_llc_start_regs[0] = *(volatile uint32_t *)0x28000018u;
+        bleblob_llc_start_regs[1] = *(volatile uint32_t *)0x2800001Cu;
+        bleblob_llc_start_regs[2] = *(volatile uint32_t *)0x28000024u;
+        bleblob_llc_start_regs[3] = *(volatile uint32_t *)0x28000100u;
+        bleblob_llc_start_regs[4] = *(volatile uint32_t *)0x28000104u;
+        bleblob_llc_start_regs[5] = *(volatile uint32_t *)0x28000828u;
+        bleblob_llc_start_regs[6] = *(volatile uint32_t *)0x28000800u;
+        bleblob_llc_start_regs[7] = *(volatile uint32_t *)0x280009C0u;
+    }
     return status;
 }
 #endif

@@ -22,6 +22,10 @@
 #include <lwip/tcpip.h>
 #include <lwip/dhcp.h>
 
+#if PBUF_LINK_ENCAPSULATION_HLEN < 48
+#error "BL808 WiFi TX requires at least 48 bytes of lwIP link encapsulation headroom"
+#endif
+
 /* Iter 2.A.0 step 2: vendor lwIP's lwipopts.h leaves LWIP_NETIF_API
  * undefined, so vendor netifapi.h does not declare these typedefs. SDK lwIP
  * defines them. When vendor headers win the include race (Task 3 onward),
@@ -3068,10 +3072,12 @@ int __wrap_wpa_set_bss(u8 vif_idx, u8 sta_idx, char *macddr, char *bssid,
         return rc;
     }
 
+    /* Preserve the selected AKM (typically WPA2-PSK on transition APs).  The
+     * wrapper only advertises MFPC; forcing MFPR or SAE makes WPA2 clients
+     * send an association request the AP can legitimately reject. */
     gWpaSm.pmf_cfg.capable = true;
-    gWpaSm.pmf_cfg.required = true;
+    gWpaSm.pmf_cfg.required = false;
     gWpaSm.mgmt_group_cipher = BL808_WPA_CIPHER_AES_128_CMAC;
-    gWpaSm.key_mgmt = (1u << 10);  /* WPA_KEY_MGMT_SAE per defs.h:39 */
     gWpaSm.assoc_wpa_ie_len = sizeof(gWpaSm.assoc_wpa_ie);
 
     int new_len = wpa_gen_wpa_ie(&gWpaSm, gWpaSm.assoc_wpa_ie,

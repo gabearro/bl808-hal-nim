@@ -3,11 +3,12 @@
  *
  * M0 boots from flash XIP at 0x58000000, with RAM at 0x62020000 (cached).
  * Flash: 16 MB SPI NOR (Ox64)
- * RAM:   OCRAM 64 KB + WRAM 160 KB = 224 KB total.
- *        The upper 16 KB of WRAM is reserved for LP firmware when the E902
- *        core is used, so M0 owns 0x62020000 - 0x62054000.
+ * RAM:   the cached flash-XIP image uses the 64 KB OCRAM window starting at
+ *        0x62020000.  Do not model WRAM aliases as contiguous with this
+ *        window: hardware traces show addresses such as 0x62053xxx can alias
+ *        back over OCRAM state at 0x62023xxx and corrupt the live stack.
  *
- * Stack is placed at the top of WRAM.
+ * Stack is placed near the top of this OCRAM window.
  */
 
 ENTRY(_start)
@@ -15,10 +16,11 @@ ENTRY(_start)
 MEMORY
 {
     FLASH (rx)  : ORIGIN = 0x58000000, LENGTH = 1M
-    RAM   (rwx) : ORIGIN = 0x62020000, LENGTH = 208K
+    RAM   (rwx) : ORIGIN = 0x62020000, LENGTH = 64K
 }
 
 _stack_size = 8K;
+_stack_top_reserve = 512;
 
 SECTIONS
 {
@@ -63,16 +65,16 @@ SECTIONS
     .heap (NOLOAD) : ALIGN(4)
     {
         _sheap = .;
-        . = ORIGIN(RAM) + LENGTH(RAM) - _stack_size;
+        . = ORIGIN(RAM) + LENGTH(RAM) - _stack_top_reserve - _stack_size;
         . = ALIGN(16);
         _eheap = .;
     } > RAM
 
-    /* Stack at top of RAM, growing down into its reserved window */
+    /* Stack near top of RAM, growing down below a small hardware/ROM scratch margin. */
     .stack (NOLOAD) : ALIGN(16)
     {
         _sstack = .;
-        . = ORIGIN(RAM) + LENGTH(RAM);
+        . = ORIGIN(RAM) + LENGTH(RAM) - _stack_top_reserve;
         . = ALIGN(16);
         _estack = .;
         _sp = .;
@@ -88,5 +90,5 @@ SECTIONS
 }
 
 ASSERT(_eheap >= _sheap, "M0 RAM overflow: no space left for heap")
-ASSERT(_sstack == ORIGIN(RAM) + LENGTH(RAM) - _stack_size,
+ASSERT(_sstack == ORIGIN(RAM) + LENGTH(RAM) - _stack_top_reserve - _stack_size,
        "M0 stack is not placed at top of RAM")

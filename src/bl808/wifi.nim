@@ -23,6 +23,60 @@ import mmio, memmap
 # vendor lwIP functions that otherwise wouldn't be in the link.
 when defined(bl808m0) and defined(bl808WifiVendor) and not defined(bl808WifiNimFw):
   import bl808/kernel/lwipcore
+  when not defined(bl808WifiVendorMsgTx):
+    import wifi_msg_tx
+
+  # The SDK C sources carry Nim-firmware debug probes used during WiFi bring-up.
+  # Vendor-firmware builds still compile those sources, so provide inert
+  # definitions here when wifi_fw.nim is not linked.
+  var
+    nimFwVendorDbgBlOutputEapol* {.exportc: "nimfw_dbg_bl_output_eapol".}: uint32
+    nimFwVendorDbgBlOutputDrop* {.exportc: "nimfw_dbg_bl_output_drop".}: uint32
+    nimFwVendorDbgBlTxCfmEapol* {.exportc: "nimfw_dbg_bl_tx_cfm_eapol".}: uint32
+    nimFwVendorDbgBlTxCfmRet* {.exportc: "nimfw_dbg_bl_tx_cfm_ret".}: uint32
+    nimFwVendorDbgBlTxCfmStatus* {.exportc: "nimfw_dbg_bl_tx_cfm_status".}: uint32
+    nimFwVendorDbgCryptoCaptured* {.exportc: "nimfw_dbg_crypto_captured".}: uint32
+    nimFwVendorDbgCryptoKeyMgmt* {.exportc: "nimfw_dbg_crypto_keymgmt".}: uint32
+    nimFwVendorDbgCryptoPairwise* {.exportc: "nimfw_dbg_crypto_pairwise".}: uint32
+    nimFwVendorDbgCryptoPmkLen* {.exportc: "nimfw_dbg_crypto_pmk_len".}: uint32
+    nimFwVendorDbgCryptoPtkLen* {.exportc: "nimfw_dbg_crypto_ptk_len".}: uint32
+    nimFwVendorDbgCryptoSha256* {.exportc: "nimfw_dbg_crypto_sha256".}: uint32
+    nimFwVendorDbgEapolTxCb* {.exportc: "nimfw_dbg_eapol_tx_cb".}: uint32
+    nimFwVendorDbgEthTxEapol* {.exportc: "nimfw_dbg_eth_tx_eapol".}: uint32
+    nimFwVendorDbgEthTxRet* {.exportc: "nimfw_dbg_eth_tx_ret".}: uint32
+    nimFwVendorDbgInstallPtk* {.exportc: "nimfw_dbg_install_ptk".}: uint32
+    nimFwVendorDbgM2Len* {.exportc: "nimfw_dbg_m2_len".}: uint32
+    nimFwVendorDbgM4CbPtr* {.exportc: "nimfw_dbg_m4_cb_ptr".}: uint32
+    nimFwVendorDbgM4TxState* {.exportc: "nimfw_dbg_m4_tx_state".}: uint32
+    nimFwVendorDbgMicFrameLen* {.exportc: "nimfw_dbg_mic_frame_len".}: uint32
+    nimFwVendorDbgMicVer* {.exportc: "nimfw_dbg_mic_ver".}: uint32
+    nimFwVendorDbgPbufAllocFail* {.exportc: "nimfw_dbg_pbuf_alloc_fail".}: uint32
+    nimFwVendorDbgPbufTakeFail* {.exportc: "nimfw_dbg_pbuf_take_fail".}: uint32
+    nimFwVendorDbgSaeBuild* {.exportc: "nimfw_dbg_sae_build".}: uint32
+    nimFwVendorDbgSaeParse* {.exportc: "nimfw_dbg_sae_parse".}: uint32
+    nimFwVendorDbgSelftestRan* {.exportc: "nimfw_dbg_selftest_ran".}: uint32
+    nimFwVendorDbgSend4of4Cb* {.exportc: "nimfw_dbg_send_4of4_cb".}: uint32
+    nimFwVendorDbgSend4of4Tx* {.exportc: "nimfw_dbg_send_4of4_tx".}: uint32
+    nimFwVendorDbgSuppRxEapol* {.exportc: "nimfw_dbg_supp_rx_eapol".}: uint32
+    nimFwVendorDbgSuppTxEapol* {.exportc: "nimfw_dbg_supp_tx_eapol".}: uint32
+    nimFwVendorDbgSuppTxLen* {.exportc: "nimfw_dbg_supp_tx_len".}: uint32
+    nimFwVendorDbgWpaDeauth* {.exportc: "nimfw_dbg_wpa_deauth".}: uint32
+    nimFwVendorDbgWpaPtkInstalled* {.exportc: "nimfw_dbg_wpa_ptk_installed".}: uint32
+    nimFwVendorDbgWpaRxState* {.exportc: "nimfw_dbg_wpa_rx_state".}: uint32
+    nimFwVendorDbgWpaState* {.exportc: "nimfw_dbg_wpa_state".}: uint32
+    nimFwVendorDbgWpaTxState* {.exportc: "nimfw_dbg_wpa_tx_state".}: uint32
+
+    nimFwVendorDbgCryptoAnonce* {.exportc: "nimfw_dbg_crypto_anonce".}: array[32, uint8]
+    nimFwVendorDbgCryptoBssid* {.exportc: "nimfw_dbg_crypto_bssid".}: array[6, uint8]
+    nimFwVendorDbgCryptoKck* {.exportc: "nimfw_dbg_crypto_kck".}: array[16, uint8]
+    nimFwVendorDbgCryptoOwn* {.exportc: "nimfw_dbg_crypto_own".}: array[6, uint8]
+    nimFwVendorDbgCryptoPmk* {.exportc: "nimfw_dbg_crypto_pmk".}: array[32, uint8]
+    nimFwVendorDbgCryptoPrfData* {.exportc: "nimfw_dbg_crypto_prf_data".}: array[76, uint8]
+    nimFwVendorDbgCryptoSnonce* {.exportc: "nimfw_dbg_crypto_snonce".}: array[32, uint8]
+    nimFwVendorDbgM2Buf* {.exportc: "nimfw_dbg_m2_buf".}: array[160, uint8]
+    nimFwVendorDbgMicComputed* {.exportc: "nimfw_dbg_mic_computed".}: array[16, uint8]
+    nimFwVendorDbgMicKck* {.exportc: "nimfw_dbg_mic_kck".}: array[16, uint8]
+    nimFwVendorDbgSelftestHmac* {.exportc: "nimfw_dbg_selftest_hmac".}: array[20, uint8]
 
 when defined(bl808m0) and defined(bl808WifiVendor) and defined(bl808WifiNimFw):
   import wifi_fw
@@ -116,7 +170,8 @@ when defined(bl808m0):
   when defined(bl808WifiVendor):
     {.passC: "-DBL808 -DCPU_M0 -DCFG_CHIP_BL808 -DCFG_TXDESC=4 -DCFG_STA_MAX=1 -DCFG_VIRT_DEV_MAX=2".}
     {.passC: "-DBL_CHIP_NAME=\"BL808\" -D__FILENAME__=__FILE__ -DBL808_WIFI_VENDOR_FULL_SUPPLICANT -DUSE_MBEDTLS_CRYPTO -include sys/types.h".}
-    {.passC: "-DBL808_WIFI_CONNECT_CRYPTO_PARAMS -DBL808_WIFI_CONNECT_CFG80211_FLAGS".}
+    when defined(bl808WifiConnectCfg80211Flags):
+      {.passC: "-DBL808_WIFI_CONNECT_CRYPTO_PARAMS -DBL808_WIFI_CONNECT_CFG80211_FLAGS".}
     when defined(bl808WifiNimFw):
       {.passC: "-DBL808_WIFI_NIM_FW".}
     when defined(bl808WifiTrace):
@@ -129,15 +184,20 @@ when defined(bl808m0):
       {.passC: "-DBL808_WIFI_CONNECT_CACHE_HINT".}
     when defined(bl808WifiVerboseConnect):
       {.passC: "-DBL808_WIFI_VERBOSE_CONNECT".}
+    when defined(bl808WifiVerboseScan):
+      {.passC: "-DBL808_WIFI_VERBOSE_SCAN".}
+    # The connection wrapper asks for PMF-capable association by default.
+    # Keep the supplicant's 802.11w code compiled for both firmware backends so
+    # WPA3-transition APs can see MFPC and the group management cipher in the
+    # generated RSN IE. This does not force PMF-required or SAE.
+    {.passC: "-DCONFIG_IEEE80211W".}
     when defined(bl808WifiForcePmfCapable):
       # Forces smF |= 0x600 (PMF-cap bits) on every scanned BSS in
       # wifi_fw.nim's scanu path so APs that advertise PMF-required are
-      # reachable. Also enables the SAE supplicant compilation flags
-      # (CONFIG_WPA3_SAE / IEEE80211W / SHA256) so the wpa_supplicant code
-      # exists in the binary — but the vendor blob doesn't drive SAE auth,
-      # so real WPA3-SAE association still doesn't work end-to-end. The
-      # name reflects the actual runtime effect, not the aspirational one.
-      {.passC: "-DCONFIG_WPA3_SAE -DCONFIG_IEEE80211W -DCONFIG_SHA256".}
+      # reachable. Also enables the SAE/SHA256 supplicant code for explicit
+      # WPA3 probe builds. The vendor blob still does not drive SAE auth
+      # end-to-end, so real WPA3-SAE association remains outside this default.
+      {.passC: "-DCONFIG_WPA3_SAE -DCONFIG_SHA256".}
     when defined(bl808WifiForceAckMode):
       {.passC: "-DBL808_WIFI_FORCE_ACK_MODE".}
     when defined(bl808WifiForceMacTiming80MHz):
@@ -221,7 +281,7 @@ when defined(bl808m0):
       {.compile: "build/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/bl_mod_params.c".}
     when not defined(bl808WifiNimFw):
       {.compile: "build/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/bl_msg_rx.c".}
-    when not defined(bl808WifiNimFw) or defined(bl808WifiVendorMsgTx):
+    when defined(bl808WifiVendorMsgTx):
       {.compile: "build/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/bl_msg_tx.c".}
     when not defined(bl808WifiNimFw):
       {.compile: "build/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/bl_platform.c".}
@@ -264,7 +324,7 @@ when defined(bl808m0):
     {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/sha256-prf.c".}
     {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/sha256.c".}
     {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/eap_peer/eap_common.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/rsn_supp/wpa.c".}
+    {.compile: "wifi_supplicant_wpa_overlay.c".}
     {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/rsn_supp/wpa_ie.c".}
     {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/utils/common.c".}
     {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/utils/wpa_debug.c".}
@@ -291,9 +351,10 @@ when defined(bl808m0):
     {.compile: "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/library/platform_util.c".}
     {.passL: "-Lsrc/bl808".}
     when not defined(bl808WifiNimFw):
-      {.passL: "-Wl,--wrap=wpa_set_bss".}
-      {.passL: "-Wl,--wrap=wpa3_build_sae_msg".}
-      {.passL: "-Wl,--wrap=wpa3_parse_sae_msg".}
+      when defined(bl808WifiPmfCapableWrapper):
+        {.passL: "-Wl,--wrap=wpa_set_bss".}
+        {.passL: "-Wl,--wrap=wpa3_build_sae_msg".}
+        {.passL: "-Wl,--wrap=wpa3_parse_sae_msg".}
     when defined(bl808WifiWrapWaitUs):
       {.passL: "-Wl,--wrap=wait_us".}
     when defined(bl808WifiNimFw):
@@ -511,6 +572,10 @@ when defined(bl808m0):
     proc dcTraceRc(s: cstring; v: cint) {.importc: "cfg_trace_rc", cdecl.}
 
   proc wifiDisconnect*(): WifiError =
+    when defined(bl808WifiVendor):
+      bl808_wifi_vendor_poll(8)
+      if bl808_wifi_vendor_connected() == 0:
+        return wifiOk
     when defined(bl808WifiVendor) and defined(bl808WifiNimFw):
       when defined(bl808WifiNimFwDiag):
         dcTrace("[DC] enter\n")

@@ -264,11 +264,17 @@ proc txBusy*(uart: Uart): bool {.inline.} =
 # =============================================================================
 # Blocking send
 # =============================================================================
+const
+  # At the hardware-validation default of 230400 baud, a full 32-byte FIFO takes
+  # about 1.4 ms to drain. Keep this comfortably above that so dense diagnostic
+  # output does not report a transient timeout while the UART is still shifting.
+  UartTxFifoWaitBudget* = 5_000_000'u32
+
 proc sendByte*(uart: Uart, b: uint8): UartError =
   ## Send a single byte, blocking until FIFO has space.
   ## Returns uartOk on success, uartTimeout if stuck.
   hwValidationLogByte(b)
-  var timeout = 100_000'u32
+  var timeout = UartTxFifoWaitBudget
   while uart.txFifoFull():
     timeout.dec
     if timeout == 0: return uartTimeout
@@ -289,6 +295,18 @@ proc sendString*(uart: Uart, s: string): UartError =
     if err != uartOk: return err
   uartOk
 
+proc sendCString*(uart: Uart, s: cstring): UartError =
+  ## Send a NUL-terminated string without allocating.
+  if s == nil:
+    return uartOk
+  let raw = cast[ptr UncheckedArray[char]](s)
+  var i = 0
+  while raw[i] != '\0':
+    let err = uart.sendByte(raw[i].uint8)
+    if err != uartOk: return err
+    inc i
+  uartOk
+
 proc sendLine*(uart: Uart, s: string): UartError =
   ## Send a string followed by CR+LF.
   result = uart.sendString(s)
@@ -296,6 +314,20 @@ proc sendLine*(uart: Uart, s: string): UartError =
   result = uart.sendByte(0x0D)
   if result != uartOk: return
   result = uart.sendByte(0x0A)
+  when defined(bl808m0) or defined(bl808lp) or defined(bl808d0):
+    # Keep a real return frame after the final byte on bare-metal targets.
+    {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
+
+proc sendLine*(uart: Uart, s: cstring): UartError =
+  ## Send a NUL-terminated string followed by CR+LF without allocating.
+  result = uart.sendCString(s)
+  if result != uartOk: return
+  result = uart.sendByte(0x0D)
+  if result != uartOk: return
+  result = uart.sendByte(0x0A)
+  when defined(bl808m0) or defined(bl808lp) or defined(bl808d0):
+    # Keep a real return frame after the final byte on bare-metal targets.
+    {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
 
 # =============================================================================
 # Blocking receive

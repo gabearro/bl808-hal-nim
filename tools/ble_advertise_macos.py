@@ -15,6 +15,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--service-uuid",
                         default="12345678-1234-5678-1234-56789abcdef0",
                         help="Service UUID to include in advertising data; empty omits it.")
+    parser.add_argument("--gatt-service-uuid",
+                        default="12345678-1234-5678-1234-56789abcdef0",
+                        help="Service UUID to register for incoming connections.")
+    parser.add_argument("--characteristic-uuid",
+                        default="12345678-1234-5678-1234-56789abcdef1",
+                        help="Readable characteristic UUID to expose under the advertised service.")
+    parser.add_argument("--no-gatt-service", action="store_true",
+                        help="Do not register a matching CBMutableService before advertising.")
     parser.add_argument("--duration", type=float, default=20.0,
                         help="Seconds to keep advertising before exiting.")
     parser.add_argument("--startup-timeout", type=float, default=8.0,
@@ -23,6 +31,8 @@ def parse_args() -> argparse.Namespace:
                         help="Seconds between stop/start advertising cycles. Disabled by default.")
     parser.add_argument("--restart-count", type=int, default=-1,
                         help="Maximum restart cycles when --restart-interval is set; negative means unlimited.")
+    parser.add_argument("--debug", action="store_true",
+                        help="Print CoreBluetooth startup state transitions.")
     return parser.parse_args()
 
 
@@ -33,11 +43,15 @@ def main() -> int:
         from CoreBluetooth import (  # type: ignore
             CBAdvertisementDataLocalNameKey,
             CBAdvertisementDataServiceUUIDsKey,
+            CBAttributePermissionsReadable,
+            CBCharacteristicPropertyRead,
+            CBMutableCharacteristic,
+            CBMutableService,
             CBPeripheralManager,
             CBPeripheralManagerStatePoweredOn,
             CBUUID,
         )
-        from Foundation import NSDate, NSObject, NSRunLoop  # type: ignore
+        from Foundation import NSData, NSDate, NSObject, NSRunLoop  # type: ignore
     except ImportError as exc:
         print(f"[FAIL] BLE advertising unavailable: {exc}", flush=True)
         return 1
@@ -48,29 +62,107 @@ def main() -> int:
             if self is None:
                 return None
             self.name = args.name
-            self.service_uuid = args.service_uuid
+            self.advertised_service_cb_uuid = (
+                CBUUID.UUIDWithString_(args.service_uuid)
+                if args.service_uuid else None
+            )
+            self.gatt_service_cb_uuid = (
+                CBUUID.UUIDWithString_(args.gatt_service_uuid)
+                if args.gatt_service_uuid else None
+            )
+            self.characteristic_cb_uuid = (
+                CBUUID.UUIDWithString_(args.characteristic_uuid)
+                if args.characteristic_uuid else None
+            )
+            self.service_add_requested = False
+            self.service_added = (
+                self.gatt_service_cb_uuid is None or args.no_gatt_service
+            )
+            self.powered_on = False
+            self.advertising_requested = False
             self.started = False
             self.failed = False
             return self
 
-        def start_advertising(self, peripheral):
-            advertisement = {
-                CBAdvertisementDataLocalNameKey: self.name,
-            }
-            if self.service_uuid:
+        def advertisement_data(self):
+            advertisement = {}
+            if self.name:
+                advertisement[CBAdvertisementDataLocalNameKey] = self.name
+            if self.advertised_service_cb_uuid is not None:
                 advertisement[CBAdvertisementDataServiceUUIDsKey] = [
-                    CBUUID.UUIDWithString_(self.service_uuid)
+                    self.advertised_service_cb_uuid
                 ]
-            peripheral.startAdvertising_(advertisement)
+            return advertisement
 
-        def peripheralManagerDidUpdateState_(self, peripheral):
-            if peripheral.state() != CBPeripheralManagerStatePoweredOn:
+        def start_advertising(self, peripheral):
+            self.advertising_requested = True
+            if args.debug:
+                print(f"[INFO] BLE advertising request={self.advertisement_data()}", flush=True)
+            peripheral.startAdvertising_(self.advertisement_data())
+
+        def maybe_start_advertising(self, peripheral):
+            if (
+                self.started
+                or self.advertising_requested
+                or not self.powered_on
+                or not self.service_added
+            ):
+                if args.debug:
+                    print(
+                        "[INFO] BLE advertising wait "
+                        f"started={self.started} requested={self.advertising_requested} "
+                        f"powered={self.powered_on} service_added={self.service_added}",
+                        flush=True,
+                    )
                 return
             self.start_advertising(peripheral)
+
+        def peripheralManagerDidUpdateState_(self, peripheral):
+            if args.debug:
+                print(f"[INFO] BLE peripheral state={peripheral.state()}", flush=True)
+            if peripheral.state() != CBPeripheralManagerStatePoweredOn:
+                return
+            self.powered_on = True
+            if (
+                self.gatt_service_cb_uuid is not None
+                and not args.no_gatt_service
+                and not self.service_add_requested
+            ):
+                service = CBMutableService.alloc().initWithType_primary_(
+                    self.gatt_service_cb_uuid, True
+                )
+                if self.characteristic_cb_uuid is not None:
+                    value = b"bl808-hal"
+                    ns_value = NSData.dataWithBytes_length_(value, len(value))
+                    characteristic = (
+                        CBMutableCharacteristic.alloc()
+                        .initWithType_properties_value_permissions_(
+                            self.characteristic_cb_uuid,
+                            CBCharacteristicPropertyRead,
+                            ns_value,
+                            CBAttributePermissionsReadable,
+                        )
+                    )
+                    service.setCharacteristics_([characteristic])
+                peripheral.addService_(service)
+                self.service_add_requested = True
+                if args.debug:
+                    print("[INFO] BLE advertising service add requested", flush=True)
+                return
+            self.maybe_start_advertising(peripheral)
+
+        def peripheralManager_didAddService_error_(self, peripheral, service, error):
+            if error is not None:
+                self.failed = True
+                print(f"[FAIL] BLE advertising service add: {error}", flush=True)
+                return
+            self.service_added = True
+            self.maybe_start_advertising(peripheral)
 
         def peripheralManagerDidStartAdvertising_error_(self, peripheral, error):
             if error is not None:
                 self.failed = True
+                self.advertising_requested = False
                 print(f"[FAIL] BLE advertising start: {error}", flush=True)
                 return
             self.started = True
@@ -85,6 +177,14 @@ def main() -> int:
         )
 
     if delegate.failed or not delegate.started:
+        if args.debug:
+            print(
+                "[INFO] BLE advertising final "
+                f"powered={delegate.powered_on} service_requested={delegate.service_add_requested} "
+                f"service_added={delegate.service_added} requested={delegate.advertising_requested} "
+                f"started={delegate.started}",
+                flush=True,
+            )
         print("[FAIL] BLE advertising did not start", flush=True)
         return 1
 
@@ -101,7 +201,8 @@ def main() -> int:
         if next_restart is not None and time.monotonic() >= next_restart:
             manager.stopAdvertising()
             delegate.started = False
-            delegate.start_advertising(manager)
+            delegate.advertising_requested = False
+            delegate.maybe_start_advertising(manager)
             restarts += 1
             if args.restart_count >= 0 and restarts >= args.restart_count:
                 next_restart = None

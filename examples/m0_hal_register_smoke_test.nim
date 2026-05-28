@@ -399,7 +399,7 @@ proc smokeNpuPka() =
   var ecdh: pka.BflbEcdh
   var dsa: pka.BflbDsa
   checkEq("PKA ECDSA init", pka.bflb_sec_ecdsa_init(addr ecdsa, pka.EcpSecp256r1).uint32, 0)
-  checkEq("PKA ECDH init", pka.bflb_sec_ecdh_init(addr ecdh, pka.EcpSecp256k1).uint32, 0)
+  checkEq("PKA ECDH init", pka.bflb_sec_ecdh_init(addr ecdh, pka.EcpSecp256r1).uint32, 0)
   checkEq("PKA DSA init", pka.bflb_sec_dsa_init(addr dsa, 2048).uint32, 0)
   npu.npuSetClock(true, npu.npuClk160M, 1)
   check("NPU clock helper", npu.npuClockEnabled())

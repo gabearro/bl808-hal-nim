@@ -360,6 +360,7 @@ GLB_GPIO_CFG_INT_STAT = 1 << 21
 GLB_GPIO_CFG_I = 1 << 28
 GLB_GPIO_CFG_ASYNC_RISING = 6
 GLB_SWRST_CFG2_PICO_RESET = 1 << 3
+GLB_SWRST_CFG2_CHIP_RESET = 1 << 5
 
 MM_GLB_BASE = 0x30007000
 MM_GLB_MM_CLK_CTRL_CPU = MM_GLB_BASE + 0x00
@@ -927,6 +928,16 @@ def main() -> int:
                     TIMER_TCCR_RESET)
         check_equal("Timer0 match0 reset", qtest.readl(TIMER0_BASE + TIMER_TMR2_0),
                     TIMER_TMR_RESET)
+
+        qtest.writel(GLB_DIG_CLK_CFG1, 0x12345678)
+        check_equal("GLB sticky write before chip reset",
+                    qtest.readl(GLB_DIG_CLK_CFG1), 0x12345678)
+        qtest.writel(GLB_SWRST_CFG2, GLB_SWRST_CFG2_CHIP_RESET)
+        qtest.clock_step(1)
+        check_equal("GLB chip reset restores DIG_CLK_CFG1",
+                    qtest.readl(GLB_DIG_CLK_CFG1), 0)
+        check_equal("GLB chip reset clears SWRST_CFG2",
+                    qtest.readl(GLB_SWRST_CFG2), 0)
 
         # RM Table 1.6 exposes the shared EMAC and PWM blocks as D0 PLIC
         # sources EMAC2 (IRQ 52) and PWM1 (IRQ 64). The D0 PLIC sits on the

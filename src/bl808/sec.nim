@@ -54,12 +54,15 @@ const
   TrngCtrl2*        = SecBase + 0x230'u  # TRNG reseed high
   TrngCtrl3*        = SecBase + 0x234'u  # TRNG health-test control
   TrngCtrlProt*     = SecBase + 0x2FC'u  # TRNG access protection
+  SecCtrlProtRead*  = SecBase + 0xF00'u  # Security engine group ownership
 
-  # PKA registers
-  PkaCtrl0*         = SecBase + 0x300'u  # PKA control 0
-  PkaStatus*        = SecBase + 0x360'u  # PKA status
-  PkaIntSts*        = SecBase + 0x364'u  # PKA interrupt status
-  PkaIntMask*       = SecBase + 0x368'u  # PKA interrupt mask
+  # PKA registers. Status, interrupt, and mask bits are fields in CTRL_0.
+  PkaCtrl0*         = SecBase + 0x300'u  # PKA control/status
+  PkaRw*            = SecBase + 0x340'u  # PKA command/data FIFO
+  PkaRwBurst*       = SecBase + 0x360'u  # PKA burst data FIFO
+  PkaStatus*        = PkaCtrl0           # Compatibility alias
+  PkaIntSts*        = PkaCtrl0           # Compatibility alias
+  PkaIntMask*       = PkaCtrl0           # Compatibility alias
 
 # =============================================================================
 # AES configuration fields
@@ -114,6 +117,13 @@ const
   TrngIntClear*    = 9        # Clear done interrupt (write 1 pulse)
   TrngIntMask*     = 11       # Done interrupt mask
   TrngReady*       = 0        # Data ready (in status register)
+  TrngRoscEn*      = 31       # Ring oscillator entropy source enable
+  TrngOwnerShift*  = 4
+  TrngOwnerMask*   = 0x03'u32
+  TrngOwnerGroup0* = 0x01'u32
+  TrngOwnerFree*   = 0x03'u32
+  TrngRequestGroup0* = 0x02'u32
+  TrngReleaseAccess* = 0x06'u32
 
 # =============================================================================
 # Types
@@ -258,42 +268,117 @@ proc shaFinish*() =
 # =============================================================================
 # TRNG (True Random Number Generator)
 # =============================================================================
+proc trngClearInt() =
+  let mask = 1'u32 shl TrngIntMask
+  let clear = 1'u32 shl TrngIntClear
+  var v = regRead(TrngCtrl0) or mask
+  regWrite(TrngCtrl0, v or clear)
+  v = regRead(TrngCtrl0) or mask
+  regWrite(TrngCtrl0, v and not clear)
+
 proc trngEnable*() =
   ## Enable the hardware TRNG.
-  regWrite(TrngCtrl0, (1'u32 shl TrngEn) or (1'u32 shl TrngTrigger))
+  regSet(TrngCtrl3, 1'u32 shl TrngRoscEn)
+  regSet(TrngCtrl0, (1'u32 shl TrngEn) or (1'u32 shl TrngIntMask))
+  trngClearInt()
 
 proc trngDisable*() =
-  regClear(TrngCtrl0, 1'u32 shl TrngEn)
+  regWrite(TrngCtrl0, (regRead(TrngCtrl0) and not (1'u32 shl TrngEn)) or
+                      (1'u32 shl TrngIntMask))
 
 proc trngReady*(): bool =
-  (regRead(TrngStatus) and 1) != 0
+  (regRead(TrngCtrl0) and (1'u32 shl TrngBusy)) == 0
+
+proc trngOwner(): uint32 {.inline.} =
+  (regRead(SecCtrlProtRead) shr TrngOwnerShift) and TrngOwnerMask
+
+proc trngRequestGroup0(releaseWhenDone: var bool): bool =
+  releaseWhenDone = false
+  case trngOwner()
+  of TrngOwnerGroup0:
+    true
+  of TrngOwnerFree:
+    regWrite(TrngCtrlProt, TrngRequestGroup0)
+    if trngOwner() == TrngOwnerGroup0:
+      releaseWhenDone = true
+      true
+    else:
+      false
+  else:
+    false
+
+proc trngReleaseGroup0(releaseWhenDone: bool) =
+  if releaseWhenDone:
+    regWrite(TrngCtrlProt, TrngReleaseAccess)
+
+proc trngWaitIdle(timeout: uint32): SecError =
+  var countdown = timeout
+  while (regRead(TrngCtrl0) and (1'u32 shl TrngBusy)) != 0:
+    if countdown == 0:
+      return secTimeout
+    countdown.dec
+  secOk
+
+proc trngNopDelay() {.inline.} =
+  {.emit: """
+    __asm__ volatile("nop");
+    __asm__ volatile("nop");
+    __asm__ volatile("nop");
+    __asm__ volatile("nop");
+  """.}
+
+proc trngFinish() =
+  regWrite(TrngCtrl0, (regRead(TrngCtrl0) and not (1'u32 shl TrngTrigger)) or
+                      (1'u32 shl TrngIntMask))
+  regSet(TrngCtrl0, (1'u32 shl TrngDoutClear) or (1'u32 shl TrngIntMask))
+  regWrite(TrngCtrl0, (regRead(TrngCtrl0) and not (1'u32 shl TrngDoutClear)) or
+                      (1'u32 shl TrngIntMask))
+  trngDisable()
+  trngClearInt()
+
+proc trngReadAll*(output: var array[8, uint32],
+                  timeout: uint32 = 100_000): SecError
 
 proc trngRead*(timeout: uint32 = 100_000): (uint32, SecError) =
   ## Read a 32-bit random number from the TRNG.
-  if not trngReady():
-    trngEnable()
-  var countdown = timeout
-  while not trngReady():
-    countdown.dec
-    if countdown == 0: return (0'u32, secTimeout)
-
-  let value = regRead(TrngData0)
-  regWrite(TrngCtrl0, (1'u32 shl TrngEn) or (1'u32 shl TrngIntClear))
-  (value, secOk)
+  var words: array[8, uint32]
+  let err = trngReadAll(words, timeout)
+  if err != secOk:
+    return (0'u32, err)
+  (words[0], secOk)
 
 proc trngReadAll*(output: var array[8, uint32], timeout: uint32 = 100_000): SecError =
   ## Read all 8 TRNG output words (256 bits of randomness).
-  if not trngReady():
-    trngEnable()
-  var countdown = timeout
-  while not trngReady():
-    countdown.dec
-    if countdown == 0: return secTimeout
+  var releaseTrng = false
+  if not trngRequestGroup0(releaseTrng):
+    return secBusy
 
+  trngEnable()
+  trngClearInt()
+  trngNopDelay()
+  result = trngWaitIdle(timeout)
+  if result != secOk:
+    trngFinish()
+    trngReleaseGroup0(releaseTrng)
+    return
+
+  trngClearInt()
+  regSet(TrngCtrl0, (1'u32 shl TrngTrigger) or (1'u32 shl TrngIntMask))
+  trngNopDelay()
+  result = trngWaitIdle(timeout)
+  if result != secOk:
+    trngFinish()
+    trngReleaseGroup0(releaseTrng)
+    return
+
+  var nonZero = false
   for i in 0 ..< 8:
     output[i] = regRead(TrngData0 + i.uint * 4)
-  regWrite(TrngCtrl0, (1'u32 shl TrngEn) or (1'u32 shl TrngIntClear))
-  secOk
+    if output[i] != 0'u32:
+      nonZero = true
+  trngFinish()
+  trngReleaseGroup0(releaseTrng)
+  result = if nonZero: secOk else: secTimeout
 
 proc trngFillBuffer*(buf: var openArray[uint8]): SecError =
   ## Fill a buffer with random bytes.

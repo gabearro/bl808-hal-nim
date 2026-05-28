@@ -22,7 +22,13 @@
 
 /* ---------- Packet buffers ---------- */
 #define PBUF_POOL_SIZE              12
-#define PBUF_POOL_BUFSIZE           1536  /* MTU + headers */
+/*
+ * The BL808 WiFi TX path reserves this encapsulation space for struct bl_txhdr
+ * and alignment before handing a pbuf to the MAC. Keep this in sync with the
+ * Bouffalo WiFi driver contract; PBUF_RAW_TX allocations depend on it.
+ */
+#define PBUF_LINK_ENCAPSULATION_HLEN 48
+#define PBUF_POOL_BUFSIZE           1600  /* Ethernet MTU plus WiFi headroom */
 
 /* ---------- Protocol control blocks ---------- */
 #define MEMP_NUM_TCP_PCB            4

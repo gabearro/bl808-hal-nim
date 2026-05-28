@@ -5,6 +5,7 @@
 
 import bl808/startup
 import bl808/core
+import bl808/irq
 import bl808/glb, bl808/gpio, bl808/uart
 import bl808/ble, bl808/wifi
 import bl808/panicoverride
@@ -12,7 +13,7 @@ import bl808/kernel/alloc
 when defined(bl808BleVendor):
   from bl808/bleblob import bleBlobPoll
 else:
-  from bl808/blecontroller import bflbip_schedule
+  from bl808/blecontroller import bflbip_schedule, bleNimReclaimRfForBle
   when defined(BleDebugCounters):
     from bl808/blecontroller import
       bleNimDbgIsrCount, bleNimDbgStat8000Count, bleNimDbgPushCount,
@@ -25,7 +26,13 @@ else:
       bleNimDbgVendorConLastTimeout, bleNimDbgVendorAclEmptyTxCount,
       bleNimDbgVendorLldConStartCount,
       bleNimDbgVendorLldConStartStatus,
-      bleNimDbgVendorLldConStartParamWord
+      bleNimDbgVendorLldConStartParamWord,
+      bleNimDbgLldRxFreeCount, bleNimDbgLldRxLastStatus,
+      bleNimDbgLldRxLastHeader, bleNimDbgLldRxLastMeta,
+      bleNimDbgConnDeferredScheduleCount,
+      bleNimDbgConnRxStatusRejectCount,
+      bleNimDbgConnRxLastRejectedStatus,
+      bleNimDbgConnRxLastRejectedHeader
   when defined(bl808WifiNimFw):
     from bl808/wifi_fw import coex_pta_force_autocontrol_set
 
@@ -43,6 +50,7 @@ const
   BleHostMinWindowIterations {.intdefine.} = 5_000
   BlePollIterations {.intdefine.} = 8
   BlePollDelayUs {.intdefine.} = 1_000
+  BlePostAdvertiseQuietMs {.intdefine.} = 0
 
 var
   console: Uart
@@ -98,6 +106,18 @@ proc pollBleController(iterations: uint32) =
       bflbble_isr()
       bflbip_schedule()
       blePollHostEvents()
+
+proc hostWindowDurationUs(iterationsValue: int): uint64 =
+  let iterations =
+    if iterationsValue <= 0: 0'u64
+    else: iterationsValue.uint64
+  let delay =
+    if BlePollDelayUs <= 0: 1'u64
+    else: BlePollDelayUs.uint64
+  iterations * delay
+
+proc hostWindowDeadlineUs(): uint64 =
+  clicReadMtime() + hostWindowDurationUs(BleHostWindowIterations)
 
 proc printHciStatus(label: string) =
   discard console.sendString("[BLE] ")
@@ -156,6 +176,22 @@ proc printBleDebugCounters(label: string) =
     console.sendHex32(bleNimDbgVendorLldConStartCount())
     discard console.sendString(" lldRc=")
     console.sendHex32(bleNimDbgVendorLldConStartStatus())
+    discard console.sendString(" defer=")
+    console.sendHex32(bleNimDbgConnDeferredScheduleCount())
+    discard console.sendString(" rxReject=")
+    console.sendHex32(bleNimDbgConnRxStatusRejectCount())
+    discard console.sendString(" rejSt=")
+    console.sendHex32(bleNimDbgConnRxLastRejectedStatus())
+    discard console.sendString(" rejHdr=")
+    console.sendHex32(bleNimDbgConnRxLastRejectedHeader())
+    discard console.sendString(" rxFree=")
+    console.sendHex32(bleNimDbgLldRxFreeCount())
+    discard console.sendString(" rxSt=")
+    console.sendHex32(bleNimDbgLldRxLastStatus())
+    discard console.sendString(" rxHdr=")
+    console.sendHex32(bleNimDbgLldRxLastHeader())
+    discard console.sendString(" rxMeta=")
+    console.sendHex32(bleNimDbgLldRxLastMeta())
     for i in 0'u32 ..< 12'u32:
       discard console.sendString(" p")
       console.sendHex32(i)
@@ -166,6 +202,7 @@ proc printBleDebugCounters(label: string) =
 proc smokeBle() =
   when not defined(bl808BleVendor) and defined(bl808WifiNimFw):
     coex_pta_force_autocontrol_set(2)
+    bleNimReclaimRfForBle()
     discard console.sendLine("[WIFI] PTA BT-priority for BLE")
 
   let mainRef = cast[pointer](blecontroller_main)
@@ -213,6 +250,8 @@ proc smokeBle() =
       delayUs(BlePollDelayUs.uint32)
   discard console.sendString("[BLE] advertising ")
   discard console.sendLine(BleDeviceName)
+  when BlePostAdvertiseQuietMs > 0:
+    delayUs(BlePostAdvertiseQuietMs.uint32 * 1_000'u32)
   printBleDebugCounters("adv")
 
   when defined(bl808BleVendor):
@@ -220,10 +259,18 @@ proc smokeBle() =
       pollBleController(8)
       delayUs(1000)
   else:
-    for i in 0 ..< BleHostWindowIterations:
+    let hostDeadline = hostWindowDeadlineUs()
+    let minDeadline = clicReadMtime() +
+      hostWindowDurationUs(BleHostMinWindowIterations)
+    var hostLoop = 0'u32
+    while clicReadMtime() < hostDeadline:
       pollBleController(BlePollIterations.uint32)
       delayUs(BlePollDelayUs.uint32)
-      if i >= BleHostMinWindowIterations and
+      when defined(BleHostLoopDiag):
+        inc hostLoop
+        if (hostLoop mod 5000'u32) == 0'u32:
+          printBleDebugCounters("host-loop")
+      if clicReadMtime() >= minDeadline and
           bleConnectedCalled and bleDisconnectedCalled:
         break
 

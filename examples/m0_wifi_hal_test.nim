@@ -25,6 +25,12 @@ const
   WifiExpectConnectFailure {.booldefine.} = false
   WifiExpectedConnectStatus {.intdefine.} = 8
   WifiExpectedConnectReason {.intdefine.} = 15
+  WifiStatusAssociateFailure = 5
+  WifiStatusDeauthByApWhenConnecting = 6
+  WifiStatusPskHandshakeTimeout = 8
+  WifiReasonPreviousAuthenticationInvalid = 2
+  WifiReasonAssociationDenied = 12
+  WifiReasonFourWayHandshakeTimeout = 15
 
 var
   console: Uart
@@ -32,18 +38,37 @@ var
   failed = 0
 
 proc check(label: string, ok: bool) =
-  discard console.sendString(if ok: "[PASS] " else: "[FAIL] ")
-  discard console.sendLine(label)
+  withInterruptsDisabled:
+    console.flushTx()
+    discard console.sendString(if ok: "[PASS] " else: "[FAIL] ")
+    discard console.sendLine(label)
+    console.flushTx()
   if ok: inc passed else: inc failed
 
+proc wifiCredentialFailureMatches(status, reason: cint): bool =
+  if status == WifiExpectedConnectStatus and reason == WifiExpectedConnectReason:
+    return true
+  # Different APs surface bad credentials at different phases. Treat only the
+  # known wrong-key outcomes as credential failures; do not accept arbitrary
+  # nonzero connect errors.
+  (status == WifiStatusAssociateFailure and
+    reason == WifiReasonAssociationDenied) or
+  (status == WifiStatusDeauthByApWhenConnecting and
+    reason == WifiReasonPreviousAuthenticationInvalid) or
+  (status == WifiStatusPskHandshakeTimeout and
+    reason == WifiReasonFourWayHandshakeTimeout)
+
 proc printResult() =
-  discard console.sendString("Result: ")
-  console.sendHex32(passed.uint32)
-  discard console.sendString(" passed, ")
-  console.sendHex32(failed.uint32)
-  discard console.sendLine(" failed")
-  if failed == 0:
-    discard console.sendLine("=== Test Complete ===")
+  withInterruptsDisabled:
+    console.flushTx()
+    discard console.sendString("Result: ")
+    console.sendHex32(passed.uint32)
+    discard console.sendString(" passed, ")
+    console.sendHex32(failed.uint32)
+    discard console.sendLine(" failed")
+    if failed == 0:
+      discard console.sendLine("=== Test Complete ===")
+    console.flushTx()
 
 proc dumpReg(label: string, address: uint) =
   discard console.sendString(label)
@@ -670,7 +695,10 @@ proc main() {.exportc, cdecl.} =
   discard console.sendLine(WifiSsid)
   let connectResult = wifiConnect(WifiSsid, WifiPassword, WifiChannel.uint8)
   when defined(bl808WifiVendor):
-    discard console.sendString("[WIFI] connect status=")
+    when WifiExpectConnectFailure:
+      discard console.sendString("[WIFI] connect failure status=")
+    else:
+      discard console.sendString("[WIFI] connect status=")
     console.sendHex32(bl808_wifi_vendor_last_status().uint32)
     discard console.sendString(" reason=")
     console.sendHex32(bl808_wifi_vendor_last_reason().uint32)
@@ -680,10 +708,10 @@ proc main() {.exportc, cdecl.} =
   when WifiExpectConnectFailure:
     check("wifi connect expected failure", connectResult != wifiOk)
     when defined(bl808WifiVendor):
-      check("wifi connect failure status",
-            bl808_wifi_vendor_last_status() == WifiExpectedConnectStatus)
-      check("wifi connect failure reason",
-            bl808_wifi_vendor_last_reason() == WifiExpectedConnectReason)
+      let failureStatus = bl808_wifi_vendor_last_status()
+      let failureReason = bl808_wifi_vendor_last_reason()
+      check("wifi credential failure classified",
+            wifiCredentialFailureMatches(failureStatus, failureReason))
     discard wifiDisconnect()
   else:
     check("wifi connect", connectResult == wifiOk)
