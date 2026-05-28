@@ -22,6 +22,8 @@ const
   IrqM0Lz4d*       = IrqBase + 7
   IrqM0SecEng1*    = IrqBase + 9
   IrqM0SecEng0*    = IrqBase + 10
+  IrqM0SecEngCdet1* = IrqBase + 11
+  IrqM0SecEngCdet0* = IrqBase + 12
   IrqM0SfCtrl1*    = IrqBase + 13
   IrqM0SfCtrl0*    = IrqBase + 14
   IrqM0Dma0All*    = IrqBase + 15
@@ -192,6 +194,14 @@ when defined(bl808m0) or defined(bl808lp):
 
   when defined(bl808m0):
     const ClicMaxIrq* = 80
+    const
+      GlbMcuIntStatus0* = GlbBase + 0x50'u
+      GlbMcuIntStatus1* = GlbBase + 0x54'u
+      GlbMcuIntMask0* = GlbBase + 0x58'u
+      GlbMcuIntMask1* = GlbBase + 0x5C'u
+      GlbMcuIntClear0* = GlbBase + 0x60'u
+      GlbMcuIntClear1* = GlbBase + 0x64'u
+      GlbMcuIntCount = 64'u32
   else:
     const ClicMaxIrq* = 48
 
@@ -201,30 +211,108 @@ when defined(bl808m0) or defined(bl808lp):
     ClicIntIe  = 1'u  # intie: interrupt enable
     ClicIntAttr = 2'u # intattr: trigger/mode
     ClicIntCtl = 3'u  # intctl: priority/level
+    ClicInfoIntCtlBitsPos = 21'u32
+    ClicInfoIntCtlBitsMask = 0x0F'u32 shl ClicInfoIntCtlBitsPos
+    ClicCfgNlBitsPos = 1'u32
+    ClicCfgNlBitsMask = 0x0F'u32 shl ClicCfgNlBitsPos
     ClicIntCtlBits = 3  # BL808 implements the top 3 bits of clicintctl.
+    ClicAttrNonVector* = 0x00'u8
+    ClicAttrVector* = 0x01'u8
+    ClicAttrVectorPositive* = 0x03'u8
+    ClicMsoftIrq = 3'u32
+    ClicMtimerIrq = 7'u32
 
   template clicIrqAddr(irq: uint32, field: uint): uint =
     ClicIntBase + irq * ClicIntStride + field
 
+  proc clicImplementedCtlBits(): uint8 {.inline.} =
+    let bits = ((regRead(ClicInfoBase) and ClicInfoIntCtlBitsMask) shr
+      ClicInfoIntCtlBitsPos).uint8
+    if bits == 0'u8:
+      ClicIntCtlBits.uint8
+    else:
+      bits
+
+  proc clicConfigureLevels() =
+    ## Match Bouffalo SystemInit: route all implemented intctl bits to CLIC
+    ## levels before programming per-source levels.
+    let bits = clicImplementedCtlBits().uint32
+    let cfg = regRead(ClicCtrlBase)
+    regWrite(ClicCtrlBase, (cfg and not ClicCfgNlBitsMask) or
+      ((bits shl ClicCfgNlBitsPos) and ClicCfgNlBitsMask))
+    regWrite(ClicMintThresh, 0)
+
+  proc clicDefaultAttr*(): uint8 {.inline.} =
+    ## Reference SystemInit uses hardware-vector CLIC IRQs unless a direct-trap
+    ## debug build explicitly asks for the simpler non-vector path.
+    when defined(bl808directtrap):
+      ClicAttrNonVector
+    else:
+      ClicAttrVector
+
+  when defined(bl808m0):
+    proc m0McuIntSourceIndex(irq: uint32): uint32 {.inline.} =
+      irq - IrqBase.uint32
+
+    proc m0McuIntHasSource*(irq: uint32): bool {.inline.} =
+      irq >= IrqBase.uint32 and m0McuIntSourceIndex(irq) < GlbMcuIntCount
+
+    proc m0McuIntRegister(base: uint, source: uint32): uint {.inline.} =
+      base + uint((source div 32'u32) * 4'u32)
+
+    proc m0McuIntBit(source: uint32): uint32 {.inline.} =
+      1'u32 shl (source and 31'u32)
+
+    proc m0McuIntMaskSource*(irq: uint32) =
+      ## Mask the GLB MCU interrupt mux source feeding this M0 CLIC IRQ.
+      if not m0McuIntHasSource(irq):
+        return
+      let source = m0McuIntSourceIndex(irq)
+      regSet(m0McuIntRegister(GlbMcuIntMask0, source), m0McuIntBit(source))
+
+    proc m0McuIntUnmaskSource*(irq: uint32) =
+      ## Unmask the GLB MCU interrupt mux source feeding this M0 CLIC IRQ.
+      if not m0McuIntHasSource(irq):
+        return
+      let source = m0McuIntSourceIndex(irq)
+      regClear(m0McuIntRegister(GlbMcuIntMask0, source), m0McuIntBit(source))
+
+    proc m0McuIntClearSource*(irq: uint32) =
+      ## Clear the GLB MCU interrupt mux latch for this M0 CLIC IRQ.
+      if not m0McuIntHasSource(irq):
+        return
+      let source = m0McuIntSourceIndex(irq)
+      regSet(m0McuIntRegister(GlbMcuIntClear0, source), m0McuIntBit(source))
+
+    proc m0McuIntMaskAndClearSource*(irq: uint32) =
+      ## Quiesce a GLB-routed interrupt source before clearing its CLIC bit.
+      m0McuIntMaskSource(irq)
+      m0McuIntClearSource(irq)
+
   proc clicEnableIrq*(irq: uint32) =
     ## Enable a CLIC interrupt source.
+    when defined(bl808m0):
+      m0McuIntUnmaskSource(irq)
     volatileStore(cast[ptr uint8](clicIrqAddr(irq, ClicIntIe)), 1'u8)
 
   proc clicDisableIrq*(irq: uint32) =
+    when defined(bl808m0):
+      m0McuIntMaskSource(irq)
     volatileStore(cast[ptr uint8](clicIrqAddr(irq, ClicIntIe)), 0'u8)
 
   proc clicSetPending*(irq: uint32) =
     volatileStore(cast[ptr uint8](clicIrqAddr(irq, ClicIntIp)), 1'u8)
 
   proc clicClearPending*(irq: uint32) =
+    when defined(bl808m0):
+      m0McuIntClearSource(irq)
     volatileStore(cast[ptr uint8](clicIrqAddr(irq, ClicIntIp)), 0'u8)
 
   proc clicSetAttr*(irq: uint32, attr: uint8) =
     ## Set CLIC interrupt attributes.
     ##
-    ## BL808 boot code may leave selective hardware vectoring enabled for some
-    ## sources. The HAL uses a single software trap dispatcher, so init clears
-    ## this field for every IRQ.
+    ## Bit 0 is SHV.  The normal BL808 SDK path sets it for hardware-vector
+    ## interrupt entry through mtvt; only direct-trap debug builds clear it.
     volatileStore(cast[ptr uint8](clicIrqAddr(irq, ClicIntAttr)), attr)
 
   proc clicEncodeLevel(level: uint8): uint8 {.inline.} =
@@ -232,12 +320,13 @@ when defined(bl808m0) or defined(bl808lp):
     if level == 0'u8:
       return 0'u8
 
-    let maxLevel = (1'u32 shl ClicIntCtlBits) - 1'u32
+    let ctlBits = clicImplementedCtlBits().uint32
+    let maxLevel = (1'u32 shl ctlBits) - 1'u32
     var clamped = level.uint32
     if clamped > maxLevel:
       clamped = maxLevel
 
-    ((clamped shl (8 - ClicIntCtlBits)) and 0xFF'u32).uint8
+    ((clamped shl (8'u32 - ctlBits)) and 0xFF'u32).uint8
 
   proc clicSetLevel*(irq: uint32, level: uint8) =
     ## Set the priority/level for a CLIC interrupt (higher = higher priority).
@@ -245,9 +334,14 @@ when defined(bl808m0) or defined(bl808lp):
 
   proc clicReadMtime*(): uint64 =
     ## Read the CLIC machine timer (64-bit mtime).
-    let lo = regRead(ClicMtimeBase)
-    let hi = regRead(ClicMtimeBase + 4)
-    (hi.uint64 shl 32) or lo.uint64
+    var hi1 = regRead(ClicMtimeBase + 4)
+    var lo = regRead(ClicMtimeBase)
+    var hi2 = regRead(ClicMtimeBase + 4)
+    while hi1 != hi2:
+      hi1 = hi2
+      lo = regRead(ClicMtimeBase)
+      hi2 = regRead(ClicMtimeBase + 4)
+    (hi2.uint64 shl 32) or lo.uint64
 
   proc clicSetMtimecmp*(value: uint64) =
     ## Set the machine timer compare value.
@@ -257,12 +351,13 @@ when defined(bl808m0) or defined(bl808lp):
 
   proc clicInit*() =
     ## Initialize CLIC: disable all interrupts.
-    regWrite(ClicMintThresh, 0'u32)
+    clicConfigureLevels()
     for i in 0'u32 ..< ClicMaxIrq:
       clicDisableIrq(i)
       clicClearPending(i)
-      clicSetAttr(i, 0)
+      clicSetAttr(i, clicDefaultAttr())
       clicSetLevel(i, 0)
+    clicSetAttr(ClicMsoftIrq, ClicAttrVectorPositive)
 
   const IrqMExt* = 11'u32
     ## Machine external interrupt cause code.
@@ -281,6 +376,8 @@ when defined(bl808m0) or defined(bl808lp):
 
   proc clicCompletePeripheral*(irq: uint32) =
     ## Clear the pending bit for a peripheral IRQ after handling.
+    when defined(bl808m0):
+      m0McuIntClearSource(irq)
     clicClearPending(irq)
 
 # =============================================================================
@@ -374,8 +471,34 @@ proc dispatchTrapInterrupt(irq: uint32): bool {.raises: [].} =
     lastUnhandledIrq = irq
     return false
 
+when defined(bl808m0) or defined(bl808lp):
+  proc dispatchClicVectorInterrupt(irq: uint32) {.raises: [].} =
+    ## Dispatch a hardware-vector CLIC interrupt.  In vector mode mcause holds
+    ## the concrete vector number; do not infer interrupt identity by scanning
+    ## pending state, because ordinary exceptions can carry CLIC high bits too.
+    if irq >= ClicMaxIrq.uint32:
+      lastUnhandledIrq = irq
+      return
+
+    if irq >= IrqBase.uint32:
+      if not dispatchTrapInterrupt(irq):
+        clicDisableIrq(irq)
+      clicCompletePeripheral(irq)
+    elif irq == ClicMsoftIrq or irq == ClicMtimerIrq:
+      discard dispatchTrapInterrupt(irq)
+    else:
+      lastUnhandledIrq = irq
+
+proc vectorTrapEntry*() {.exportc: "trap_vector_entry", cdecl, raises: [].} =
+  ## Hardware-vector IRQ entry point used by the CLIC vector wrapper.
+  let cause = csrReadMcause()
+  when defined(bl808m0) or defined(bl808lp):
+    dispatchClicVectorInterrupt((cause and 0x3FF'u).uint32)
+  else:
+    discard dispatchTrapInterrupt((cause and 0xFFF'u).uint32)
+
 proc defaultTrapEntry*() {.exportc: "trap_entry", cdecl, raises: [].} =
-  ## Default trap entry point — dispatches to registered handlers.
+  ## Default exception/direct-trap entry point.
   let cause = csrReadMcause()
   let isInterrupt = (cause and (1'u shl (sizeof(uint) * 8 - 1))) != 0
   let code = cause and 0xFFF
@@ -393,18 +516,15 @@ proc defaultTrapEntry*() {.exportc: "trap_entry", cdecl, raises: [].} =
     else:
       when defined(bl808m0) or defined(bl808lp):
         let irqCode = code.uint32
-        if irqCode >= IrqBase:
-          # CLIC mode reports the concrete interrupt vector in mcause.exccode.
-          if not dispatchTrapInterrupt(irqCode):
-            clicDisableIrq(irqCode)
-          clicCompletePeripheral(irqCode)
-        elif irqCode == IrqMExt:
+        if irqCode == IrqMExt:
           # Compatibility path for systems that aggregate peripheral IRQs.
           let irq = clicClaimPeripheral()
           if irq != 0:
             if not dispatchTrapInterrupt(irq):
               clicDisableIrq(irq)
             clicCompletePeripheral(irq)
+        elif irqCode >= IrqBase.uint32:
+          dispatchClicVectorInterrupt(irqCode)
         else:
           # Standard local interrupt (timer=7, software=3)
           discard dispatchTrapInterrupt(irqCode)

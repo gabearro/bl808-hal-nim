@@ -11,6 +11,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/irq.h"
 #include "hw/misc/bl808_glb.h"
+#include "system/runstate.h"
 
 #define GLB_REG_COUNT          2048
 #define GLB_GPIO_CFG_BASE      0x8C4
@@ -52,6 +53,7 @@
 #define GLB_WIFI_PLL_CFG6      0x828
 #define GLB_WIFI_PLL_CFG8      0x830
 #define GLB_SWRST_CFG1         0x544
+#define GLB_SWRST_CFG2         0x548
 #define GLB_CGEN_CFG1          0x584
 #define GLB_CGEN_CFG2          0x588
 
@@ -68,6 +70,8 @@
 
 #define MM_GLB_REG_BCLK2X_DIV_ACT_PULSE BIT(18)
 #define MM_GLB_STS_BCLK2X_PROT_DONE BIT(20)
+
+#define GLB_SWRST_CFG2_CHIP_RESET BIT(5)
 
 typedef struct BL808GLBHook BL808GLBHook;
 
@@ -615,6 +619,7 @@ static void bl808_glb_write(void *opaque, hwaddr offset, uint64_t value,
     uint32_t idx = offset / 4;
     uint32_t old_value;
     uint32_t next_value;
+    bool chip_reset_requested;
 
     if (bl808_glb_is_gpio_cfg(offset, &pin)) {
         bl808_glb_gpio_write(s, pin, (uint32_t)value);
@@ -629,6 +634,9 @@ static void bl808_glb_write(void *opaque, hwaddr offset, uint64_t value,
 
     old_value = s->regs[idx];
     next_value = (uint32_t)value;
+    chip_reset_requested = !s->mm_domain && offset == GLB_SWRST_CFG2 &&
+        !(old_value & GLB_SWRST_CFG2_CHIP_RESET) &&
+        (next_value & GLB_SWRST_CFG2_CHIP_RESET);
     if (!s->mm_domain && offset == GLB_SYS_CFG1) {
         next_value &= ~(GLB_STS_BCLK_PROT_DONE | GLB_STS_PICO_CLK_PROT_DONE);
         if (next_value & GLB_REG_BCLK_DIV_ACT_PULSE) {
@@ -645,6 +653,9 @@ static void bl808_glb_write(void *opaque, hwaddr offset, uint64_t value,
     }
     s->regs[idx] = next_value;
     bl808_glb_update_clients(s, offset, old_value, next_value);
+    if (chip_reset_requested) {
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    }
 }
 
 static const MemoryRegionOps bl808_glb_ops = {

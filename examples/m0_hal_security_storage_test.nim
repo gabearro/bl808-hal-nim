@@ -117,7 +117,7 @@ proc smokePka() =
   var dsa: BflbDsa
   checkEq("pka ecdsa init", bflb_sec_ecdsa_init(addr ecdsa, EcpSecp256r1).uint32, 0)
   discard bflb_sec_ecdsa_deinit(addr ecdsa)
-  checkEq("pka ecdh init", bflb_sec_ecdh_init(addr ecdh, EcpSecp256k1).uint32, 0)
+  checkEq("pka ecdh init", bflb_sec_ecdh_init(addr ecdh, EcpSecp256r1).uint32, 0)
   discard bflb_sec_ecdh_deinit(addr ecdh)
   checkEq("pka dsa init", bflb_sec_dsa_init(addr dsa, 2048).uint32, 0)
   bflb_pka_deinit(addr dev)

@@ -1,6 +1,6 @@
 ## Nim replacement for the BL808 WiFi host message request builders.
 
-when defined(bl808m0) and defined(bl808WifiVendor) and defined(bl808WifiNimFw):
+when defined(bl808m0) and defined(bl808WifiVendor) and not defined(bl808WifiVendorMsgTx):
   {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver".}
   {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/include".}
 
@@ -290,6 +290,7 @@ when defined(bl808m0) and defined(bl808WifiVendor) and defined(bl808WifiNimFw):
     WLAN_CIPHER_SUITE_WEP40 = 0x000f_ac01'u32
     WLAN_CIPHER_SUITE_TKIP = 0x000f_ac02'u32
     WLAN_CIPHER_SUITE_WEP104 = 0x000f_ac05'u32
+    ETH_P_PAE = 0x888e'u16
 
     IEEE80211_CHAN_DISABLED = 1'u32 shl 0
     IEEE80211_CHAN_NO_IR = 1'u32 shl 1
@@ -385,6 +386,18 @@ when defined(bl808m0) and defined(bl808WifiVendor) and defined(bl808WifiNimFw):
 
   proc storeI32(base: pointer; off: uint; value: int32) {.inline.} =
     cast[ptr int32](ptrAt(base, off))[] = value
+
+  proc swap16(value: uint16): uint16 {.inline.} =
+    ((value and 0x00ff'u16) shl 8) or (value shr 8)
+
+  proc smControlPortEthertype(crypto: pointer): uint16 {.inline.} =
+    ## The SDK connect parameters use numeric ETH_P_* values, while the LMAC
+    ## station gate stores the byte-swapped request halfword before comparing it
+    ## to the on-wire EtherType from TX descriptors.
+    let configured =
+      if crypto == nil: 0'u16
+      else: loadU16(crypto, CryptoControlEthertypeOff)
+    if configured == 0'u16: swap16(ETH_P_PAE) else: swap16(configured)
 
   var channelNumDefault: int32
   var countryCode0: uint8
@@ -717,20 +730,21 @@ when defined(bl808m0) and defined(bl808WifiVendor) and defined(bl808WifiNimFw):
     let smeRaw = cast[pointer](sme)
     let crypto = ptrAt(smeRaw, ConnCryptoOff)
     var flags = loadU32(smeRaw, ConnFlagsOff)
-    if loadU32(crypto, CryptoNCiphersOff) != 0'u32:
-      let cipher = loadU32(crypto, CryptoCiphers0Off)
-      if cipher == WLAN_CIPHER_SUITE_WEP40 or cipher == WLAN_CIPHER_SUITE_TKIP or
-          cipher == WLAN_CIPHER_SUITE_WEP104:
-        flags = flags or DISABLE_HT
-    if loadU8(crypto, CryptoControlPortOff) != 0'u8:
-      flags = flags or CONTROL_PORT_HOST
-    if loadU8(crypto, CryptoControlNoEncOff) != 0'u8:
-      flags = flags or CONTROL_PORT_NO_ENC
-    if usePairwiseKey(crypto):
-      flags = flags or WPA_WPA2_IN_USE
-    if loadU32(smeRaw, ConnMfpOff) == NL80211_MFP_REQUIRED:
-      flags = flags or MFP_IN_USE
-    storeU16(req, SmCtrlPortEthertypeOff, 0x8e88'u16)
+    when defined(bl808WifiConnectCfg80211Flags):
+      if loadU32(crypto, CryptoNCiphersOff) != 0'u32:
+        let cipher = loadU32(crypto, CryptoCiphers0Off)
+        if cipher == WLAN_CIPHER_SUITE_WEP40 or cipher == WLAN_CIPHER_SUITE_TKIP or
+            cipher == WLAN_CIPHER_SUITE_WEP104:
+          flags = flags or DISABLE_HT
+      if loadU8(crypto, CryptoControlPortOff) != 0'u8:
+        flags = flags or CONTROL_PORT_HOST
+      if loadU8(crypto, CryptoControlNoEncOff) != 0'u8:
+        flags = flags or CONTROL_PORT_NO_ENC
+      if usePairwiseKey(crypto):
+        flags = flags or WPA_WPA2_IN_USE
+      if loadU32(smeRaw, ConnMfpOff) == NL80211_MFP_REQUIRED:
+        flags = flags or MFP_IN_USE
+    storeU16(req, SmCtrlPortEthertypeOff, smControlPortEthertype(crypto))
 
     let bssid = loadPtr(smeRaw, ConnBssidOff)
     if bssid != nil and not macIsSpecial(bssid, 0xff) and not macIsSpecial(bssid, 0):
@@ -833,7 +847,7 @@ when defined(bl808m0) and defined(bl808WifiVendor) and defined(bl808WifiNimFw):
     storeU16(req, ApmTimOftOff, 0)
     storeU16(req, ApmBcnIntOff, bcnInt)
     storeU32(req, ApmFlagsOff, 0x08)
-    storeU16(req, ApmCtrlPortEthertypeOff, 0x8e88'u16)
+    storeU16(req, ApmCtrlPortEthertypeOff, swap16(ETH_P_PAE))
     storeU8(req, ApmTimLenOff, 6)
     storeU8(req, ApmVifIdxOff, vifIndex)
     let passLen = if password == nil: 0'u else: c_strlen(password).uint

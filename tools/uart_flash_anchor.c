@@ -19,6 +19,7 @@
 #define GLB_UART_CFG0       (GLB_BASE + 0x150u)
 #define GLB_UART_CFG1       (GLB_BASE + 0x154u)
 #define GLB_UART_CFG2       (GLB_BASE + 0x158u)
+#define GLB_SWRST_CFG2      (GLB_BASE + 0x548u)
 #define GLB_CGEN_CFG1       (GLB_BASE + 0x584u)
 #define HBN_GLB             (HBN_BASE + 0x030u)
 #define GPIO_CFG_BASE       (GLB_BASE + 0x8C4u)
@@ -91,6 +92,7 @@
 #define CMD_READ_ID         1u
 #define CMD_ERASE           2u
 #define CMD_WRITE_VERIFY    3u
+#define CMD_REBOOT          4u
 
 #define ERR_OK              0u
 #define ERR_BAD_COMMAND     1u
@@ -317,6 +319,29 @@ static void uart_send_response(uint32_t status, uint32_t result, uint32_t counte
     uart_send_u32(counter);
 }
 
+static void delay_cycles(uint32_t count)
+{
+    while (count--) {
+        __asm__ volatile("nop");
+    }
+}
+
+static void reboot_chip(void)
+{
+    uint32_t value = read32(GLB_SWRST_CFG2);
+    value &= ~(1u << 5);
+    write32(GLB_SWRST_CFG2, value);
+    delay_cycles(1000u);
+    value |= (1u << 5);
+    write32(GLB_SWRST_CFG2, value);
+    delay_cycles(1000u);
+    value &= ~(1u << 5);
+    write32(GLB_SWRST_CFG2, value);
+    for (;;) {
+        __asm__ volatile("wfi");
+    }
+}
+
 static int sf_wait_idle(uint32_t timeout)
 {
     while (timeout--) {
@@ -537,6 +562,7 @@ void main(void)
         uint32_t result = ERR_OK;
         uint32_t counter = req.address + req.length;
         uint32_t sequence = read32(DEBUG_INFO_BASE + 0x20u) + 1u;
+        uint32_t reboot_after_response = 0;
 
         write32(DEBUG_INFO_BASE + 0x00u, req.command);
         write32(DEBUG_INFO_BASE + 0x04u, req.address);
@@ -573,6 +599,8 @@ void main(void)
                     status = (uint32_t)flash_program_verify(req.address, req.length);
                 }
             }
+        } else if (req.command == CMD_REBOOT) {
+            reboot_after_response = 1u;
         } else {
             status = ERR_BAD_COMMAND;
         }
@@ -582,6 +610,10 @@ void main(void)
         write32(DEBUG_INFO_BASE + 0x1Cu, counter);
         dcache_flush_all();
         uart_send_response(status, result, counter);
+        if (reboot_after_response != 0u) {
+            delay_cycles(100000000u);
+            reboot_chip();
+        }
     }
 }
 

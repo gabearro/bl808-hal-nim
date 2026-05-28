@@ -16,12 +16,18 @@
 # BLE Controller C API (from ble_lib_api.h, libblecontroller.a)
 # =============================================================================
 when defined(bl808m0):
-  import core, mmio
+  import core, irq, kernel/clock, mmio, sec
 
   when defined(bl808BleVendor):
     import bleblob as blecontroller
   else:
     import blecontroller
+    import blep256
+
+  const bl808BleNimPureConnection* {.booldefine.}: bool = false
+  const bl808BleNimPureCentral* {.booldefine.}: bool = false
+  const bl808BleNimConnectionEnabled =
+    defined(bl808BleVendorLldConProbe) or bl808BleNimPureConnection
 
   type
     BleInitStageCb* = proc(stage: cstring) {.cdecl.}
@@ -118,25 +124,17 @@ when defined(bl808m0):
       blecontroller.ble_controller_init(taskPriority)
       reportBleInitStage(stageCb, "after controller init")
     else:
-      discard taskPriority
       reportBleInitStage(stageCb, "before controller init")
       when defined(bl808BleDebugSplitControllerInit):
-        blecontroller.bflbble_init()
-        reportBleInitStage(stageCb, "after bflbble_init")
+        discard taskPriority
         blecontroller.bflbip_init()
         reportBleInitStage(stageCb, "after bflbip_init")
         blecontroller.ble_ke_init()
         reportBleInitStage(stageCb, "after ble_ke_init")
-        blecontroller.em_buf_init()
-        reportBleInitStage(stageCb, "after em_buf_init")
         blecontroller.hci_init(false)
         reportBleInitStage(stageCb, "after hci_init")
-        blecontroller.llc_init()
-        reportBleInitStage(stageCb, "after llc_init")
-        blecontroller.lld_init(false)
-        reportBleInitStage(stageCb, "after lld_init")
-        blecontroller.llm_init()
-        reportBleInitStage(stageCb, "after llm_init")
+        blecontroller.bflbble_init()
+        reportBleInitStage(stageCb, "after bflbble_init")
         blecontroller.ecc_init()
         reportBleInitStage(stageCb, "after ecc_init")
         blecontroller.lld_sleep_init()
@@ -146,6 +144,7 @@ when defined(bl808m0):
         blecontroller.bdaddr_init()
         reportBleInitStage(stageCb, "after bdaddr_init")
         blecontroller.ble_controller_task_init(nil)
+        blecontroller.bflbble_enable_runtime_irqs()
       else:
         blecontroller.ble_controller_init(taskPriority)
       reportBleInitStage(stageCb, "after controller init")
@@ -184,8 +183,17 @@ when defined(bl808m0):
     blecontroller.ble_controller_get_tx_pwr()
 
   # --- HCI on-chip interface (host<->controller) ---
+  const
+    HciPktAclData = 1'u8
+
   type
     HciRecvCb* = proc(data: ptr uint8, len: uint16): uint8 {.cdecl.}
+    HciQueuedEvent = object
+      pktType: uint8
+      len: uint16
+      data: array[260, uint8]
+
+  const HciQueuedEventCount = 8
 
   var hciRecvCb: HciRecvCb
   var hciLastPktType: uint8
@@ -194,78 +202,182 @@ when defined(bl808m0):
   var hciLastWord1: uint32
   var hciLastOpcode: uint16
   var hciLastStatus: int16 = -1
-  var hciEventBuf: array[260, uint8]
+  var hciLastPayload: array[260, uint8]
+  var hciRawSendBuf: array[258, uint8]
+  when not defined(bl808BleVendor):
+    var hciCommandSlot: blecontroller.OnChipHciCmd
+  var hciCommandInFlight: bool
+  var hciEventQueue: array[HciQueuedEventCount, HciQueuedEvent]
+  var hciEventHead: uint8
+  var hciEventTail: uint8
+  var hciEventQueued: uint8
+  var hciEventDropped: uint32
+  var hciDispatchPktType: uint8
+  var hciDispatchBuf: array[260, uint8]
+  var hciDispatching: bool
+  var ble_host_debug_stage* {.exportc.}: uint32
+  var ble_host_debug_opcode* {.exportc.}: uint32
+  var ble_host_debug_status* {.exportc.}: uint32
+  var ble_host_debug_len* {.exportc.}: uint32
+  var ble_host_debug_ptr* {.exportc.}: uint32
+  var ble_central_debug_stage* {.exportc.}: uint32
+  var ble_central_debug_timeout* {.exportc.}: uint32
+  var ble_central_debug_waited* {.exportc.}: uint32
+  var ble_central_debug_flags* {.exportc.}: uint32
+  var ble_central_debug_create_count* {.exportc.}: uint32
+  var ble_central_debug_create_result* {.exportc.}: uint32
+  var ble_host_acl_rx_count* {.exportc.}: uint32
+  var ble_host_acl_tx_count* {.exportc.}: uint32
+  var ble_host_acl_tx_reject_count* {.exportc.}: uint32
+  var ble_host_att_rx_count* {.exportc.}: uint32
+  var ble_host_att_tx_count* {.exportc.}: uint32
+  var ble_host_att_last_opcode* {.exportc.}: uint32
+  var ble_host_att_last_status* {.exportc.}: uint32
+  var ble_adv_host_debug_stage* {.exportc.}: uint32
+  var ble_adv_host_debug_result* {.exportc.}: uint32
+  var ble_adv_host_debug_detail* {.exportc.}: uint32
+  var ble_hci_return_debug_sp* {.exportc.}: uint32
+  var ble_hci_return_debug_result* {.exportc.}: uint32
+  var ble_hci_return_debug_stack* {.exportc.}: array[12, uint32]
+
+  template bleHostReadSp(): uint32 =
+    block:
+      var v: uint32
+      {.emit: ["asm volatile(\"mv %0, sp\" : \"=r\"(", v, ") : : \"memory\");"].}
+      v
+
+  proc resetHciEventQueue() =
+    hciEventHead = 0
+    hciEventTail = 0
+    hciEventQueued = 0
+    hciEventDropped = 0
+    hciDispatchPktType = 0
+    hciDispatching = false
+
+  proc enqueueHciHostEvent(pktType: uint8, srcId: uint16, param: ptr uint8,
+                           paramLen: uint8): bool =
+    if param == nil and paramLen != 0'u8:
+      inc hciEventDropped
+      return false
+    if hciEventQueued >= HciQueuedEventCount.uint8:
+      inc hciEventDropped
+      return false
+
+    let slotIdx = hciEventTail.int
+    hciEventQueue[slotIdx].pktType = pktType
+    var outLen = paramLen.uint16
+    if param != nil:
+      let raw = cast[ptr UncheckedArray[uint8]](param)
+      case pktType
+      of 4'u8:
+        hciEventQueue[slotIdx].data[0] = 0x3E'u8
+        hciEventQueue[slotIdx].data[1] = paramLen
+        for i in 0 ..< paramLen.int:
+          hciEventQueue[slotIdx].data[i + 2] = raw[i]
+        outLen = paramLen.uint16 + 2'u16
+      of 5'u8, 7'u8:
+        hciEventQueue[slotIdx].data[0] = uint8(srcId and 0xFF)
+        hciEventQueue[slotIdx].data[1] = paramLen
+        for i in 0 ..< paramLen.int:
+          hciEventQueue[slotIdx].data[i + 2] = raw[i]
+        outLen = paramLen.uint16 + 2'u16
+      else:
+        for i in 0 ..< paramLen.int:
+          hciEventQueue[slotIdx].data[i] = raw[i]
+    hciEventQueue[slotIdx].len = outLen
+    hciEventTail = uint8((hciEventTail.int + 1) mod HciQueuedEventCount)
+    inc hciEventQueued
+    true
+
+  proc drainHciHostEvents() =
+    if hciDispatching:
+      return
+    hciDispatching = true
+    while hciEventQueued != 0'u8 and hciRecvCb != nil:
+      let slotIdx = hciEventHead.int
+      let pktType = hciEventQueue[slotIdx].pktType
+      let cbLen = hciEventQueue[slotIdx].len
+      for i in 0 ..< cbLen.int:
+        hciDispatchBuf[i] = hciEventQueue[slotIdx].data[i]
+      hciEventHead = uint8((hciEventHead.int + 1) mod HciQueuedEventCount)
+      dec hciEventQueued
+      hciDispatchPktType = pktType
+      ble_host_debug_stage = 0x5010'u32
+      let cbStatus = hciRecvCb(addr hciDispatchBuf[0], cbLen)
+      ble_host_debug_status = cbStatus.uint32
+      ble_host_debug_stage = 0x5011'u32
+      hciDispatchPktType = 0
+    hciDispatching = false
+
+  proc bleHostBridge(pktType: uint8, srcId: uint16, param: ptr uint8,
+                     paramLen: uint8) {.cdecl.} =
+    hciLastPktType = pktType
+    hciLastLen = paramLen
+    hciLastWord0 = 0
+    hciLastWord1 = 0
+    hciLastOpcode = 0
+    hciLastStatus = -1
+    if param != nil:
+      let raw = cast[ptr UncheckedArray[uint8]](param)
+      for i in 0 ..< min(paramLen.int, hciLastPayload.len):
+        hciLastPayload[i] = raw[i]
+      for i in 0 ..< min(paramLen.int, 4):
+        hciLastWord0 = hciLastWord0 or (raw[i].uint32 shl (i * 8))
+      for i in 0 ..< min(max(paramLen.int - 4, 0), 4):
+        hciLastWord1 = hciLastWord1 or (raw[i + 4].uint32 shl (i * 8))
+      case pktType
+      of 2'u8, 3'u8:
+        hciLastOpcode = srcId
+        if paramLen > 0:
+          hciLastStatus = raw[0].int16
+      of 4'u8:
+        if paramLen >= 2:
+          case raw[0]
+          of 0x07'u8:
+            hciLastOpcode = 0x2022'u16
+            hciLastStatus = 0
+          of 0x08'u8:
+            hciLastOpcode = 0x2025'u16
+            hciLastStatus = raw[1].int16
+          of 0x09'u8:
+            hciLastOpcode = 0x2026'u16
+            hciLastStatus = raw[1].int16
+          else:
+            discard
+      else:
+        discard
+      if paramLen >= 6 and raw[0] == 0x0E'u8:
+        hciLastOpcode = raw[3].uint16 or (raw[4].uint16 shl 8)
+        hciLastStatus = raw[5].int16
+      elif paramLen >= 6 and raw[0] == 0x0F'u8:
+        hciLastStatus = raw[3].int16
+        hciLastOpcode = raw[4].uint16 or (raw[5].uint16 shl 8)
+    if hciRecvCb != nil and pktType != 2'u8 and pktType != 3'u8:
+      when defined(bl808BleVendorLldScanProbe):
+        blecontroller.bleCentralDebugMark(
+          0x930'u32, (uint32(pktType) shl 16) or uint32(srcId))
+      discard enqueueHciHostEvent(pktType, srcId, param, paramLen)
+      when defined(bl808BleVendorLldScanProbe):
+        blecontroller.bleCentralDebugMark(
+          0x931'u32, (uint32(pktType) shl 16) or uint32(srcId))
 
   proc bt_onchiphci_interface_init*(cb: HciRecvCb): uint8 {.cdecl.} =
     ## Initialize the on-chip HCI interface.
     ## `cb` is called when the controller sends data to the host.
+    resetHciEventQueue()
     hciRecvCb = cb
-    proc bridge(pktType: uint8, srcId: uint16, param: ptr uint8,
-                paramLen: uint8) {.cdecl.} =
-      hciLastPktType = pktType
-      hciLastLen = paramLen
-      hciLastWord0 = 0
-      hciLastWord1 = 0
-      hciLastOpcode = 0
-      hciLastStatus = -1
-      if param != nil:
-        let raw = cast[ptr UncheckedArray[uint8]](param)
-        for i in 0 ..< min(paramLen.int, 4):
-          hciLastWord0 = hciLastWord0 or (raw[i].uint32 shl (i * 8))
-        for i in 0 ..< min(max(paramLen.int - 4, 0), 4):
-          hciLastWord1 = hciLastWord1 or (raw[i + 4].uint32 shl (i * 8))
-        case pktType
-        of 2'u8, 3'u8:
-          hciLastOpcode = srcId
-          if paramLen > 0:
-            hciLastStatus = raw[0].int16
-        else:
-          discard
-        if paramLen >= 6 and raw[0] == 0x0E'u8:
-          hciLastOpcode = raw[3].uint16 or (raw[4].uint16 shl 8)
-          hciLastStatus = raw[5].int16
-        elif paramLen >= 6 and raw[0] == 0x0F'u8:
-          hciLastStatus = raw[3].int16
-          hciLastOpcode = raw[4].uint16 or (raw[5].uint16 shl 8)
-      if hciRecvCb != nil:
-        var cbParam = param
-        var cbLen = paramLen.uint16
-        if param != nil:
-          case pktType
-          of 4'u8:
-            hciEventBuf[0] = 0x3E'u8
-            hciEventBuf[1] = paramLen
-            let raw = cast[ptr UncheckedArray[uint8]](param)
-            for i in 0 ..< paramLen.int:
-              hciEventBuf[i + 2] = raw[i]
-            cbParam = addr hciEventBuf[0]
-            cbLen = paramLen.uint16 + 2
-          of 5'u8, 7'u8:
-            hciEventBuf[0] = uint8(srcId and 0xFF)
-            hciEventBuf[1] = paramLen
-            let raw = cast[ptr UncheckedArray[uint8]](param)
-            for i in 0 ..< paramLen.int:
-              hciEventBuf[i + 2] = raw[i]
-            cbParam = addr hciEventBuf[0]
-            cbLen = paramLen.uint16 + 2
-          else:
-            discard
-        when defined(bl808BleVendorLldScanProbe):
-          blecontroller.bleCentralDebugMark(
-            0x930'u32, (uint32(pktType) shl 16) or uint32(srcId))
-        discard hciRecvCb(cbParam, cbLen)
-        when defined(bl808BleVendorLldScanProbe):
-          blecontroller.bleCentralDebugMark(
-            0x931'u32, (uint32(pktType) shl 16) or uint32(srcId))
     when defined(bl808BleVendor):
-      discard blecontroller.bt_onchiphci_interface_init(bridge)
+      discard blecontroller.bt_onchiphci_interface_init(bleHostBridge)
     else:
-      discard blecontroller.bt_onchiphci_interface_init(bridge)
+      discard blecontroller.bt_onchiphci_interface_init(bleHostBridge)
     0
 
   proc bt_onchiphci_send*(pktType: uint8, destId: uint16,
                           pkt: pointer): int8 {.cdecl.} =
     ## Send an HCI packet from host to controller.
+    ble_host_debug_stage = 0x5100'u32
+    ble_host_debug_len = destId.uint32
+    ble_host_debug_ptr = cast[uint32](cast[uint](pkt))
     when defined(bl808BleVendor):
       discard pktType
       if pkt == nil or destId < 3:
@@ -280,18 +392,37 @@ when defined(bl808m0):
         else: cast[ptr uint8](cast[uint](pkt) + 3'u)
       blecontroller.bleBlobHciCommand(opcode, params, paramLen)
     else:
-      discard pktType
       when defined(bl808BleVendorLldScanProbe):
         let entrySp = bleHciSendReadSp()
         let sendReturnShadow = regRead((entrySp + BleHciSendRaOffset).uint)
         bleHciSendReturnShadow = sendReturnShadow
         bleProbeTraceWord(60'u32, sendReturnShadow)
         blecontroller.bleCentralDebugMark(0x940'u32, uint32(destId))
-      let ok = blecontroller.bt_onchiphci_send_raw(pkt, destId)
-      when defined(bl808BleVendorLldScanProbe):
-        blecontroller.bleCentralDebugMark(0x941'u32, if ok: 1'u32 else: 0'u32)
-        bleHciSendRestoreSendRaFromTrace()
-      if ok: 0'i8 else: -1'i8
+      if pktType == HciPktAclData:
+        let rc = blecontroller.bt_onchiphci_send(pktType, destId, pkt)
+        ble_host_debug_stage = 0x5110'u32
+        ble_host_debug_status = cast[uint32](rc)
+        when defined(bl808BleVendorLldScanProbe):
+          blecontroller.bleCentralDebugMark(
+            0x941'u32, if rc == 0'i8: 1'u32 else: 0'u32)
+          bleHciSendRestoreSendRaFromTrace()
+        ble_host_debug_stage = 0x5120'u32
+        rc
+      else:
+        var ok = false
+        if pkt != nil and destId >= 3'u16 and destId.int <= hciRawSendBuf.len:
+          let src = cast[ptr UncheckedArray[uint8]](pkt)
+          for i in 0 ..< destId.int:
+            hciRawSendBuf[i] = src[i]
+          ok = blecontroller.bt_onchiphci_send_raw(addr hciRawSendBuf[0],
+                                                   destId)
+        ble_host_debug_stage = 0x5110'u32
+        ble_host_debug_status = if ok: 0'u32 else: 1'u32
+        when defined(bl808BleVendorLldScanProbe):
+          blecontroller.bleCentralDebugMark(0x941'u32, if ok: 1'u32 else: 0'u32)
+          bleHciSendRestoreSendRaFromTrace()
+        ble_host_debug_stage = 0x5120'u32
+        if ok: 0'i8 else: -1'i8
 
   proc bleLastHciOpcode*(): uint16 {.cdecl.} =
     hciLastOpcode
@@ -326,6 +457,10 @@ when defined(bl808m0):
   proc bflbble_reset*() {.cdecl.} =
     blecontroller.bflbble_reset()
 
+  proc bflbble_enable_runtime_irqs*() {.cdecl.} =
+    when not defined(bl808BleVendor):
+      blecontroller.bflbble_enable_runtime_irqs()
+
   proc bflbble_sleep_check*(): cint {.cdecl.} =
     ## Check if BLE can sleep. Returns 1 if sleepable.
     if blecontroller.bflbble_sleep_check(): 1 else: 0
@@ -340,7 +475,7 @@ when defined(bl808m0):
 when defined(bl808m0):
 
   const
-    BlePeripheralIdleDisconnectPolls {.intdefine.}: uint32 = 1_000
+    BlePeripheralIdleDisconnectPolls {.intdefine.}: int = 0
 
   type
     BtReadyCb* = proc(err: cint) {.cdecl.}
@@ -397,6 +532,7 @@ when defined(bl808m0):
 
   var
     bleHostEnabled: bool
+    bleReadyCbPending: BtReadyCb
     bleNameStorage: array[32, char]
     bleConnCb: ptr BtConnCb
     bleScanCb: BtLeScanCb
@@ -406,8 +542,10 @@ when defined(bl808m0):
     bleConn: BtConn
     bleConnActive: bool
     bleConnPending: bool
+    bleConnConnectedNotified: bool
     bleCentralTargetName: array[32, char]
     bleCentralTargetActive: bool
+    bleCentralAcceptAnyReport: bool
     bleCentralPeerFound: bool
     bleCentralPeer: BtAddrLe
     bleCentralConnected: bool
@@ -429,10 +567,19 @@ when defined(bl808m0):
     bleScanMatchedDataLen: uint8
     bleScanMatchedAddr: array[6, uint8]
     bleScanMatchedData: array[31, uint8]
+    bleStaticRandomIdentity: array[6, uint8]
+    bleStaticRandomIdentityConfigured: bool
 
   const
+    bl808BleUseRandomAddr* {.booldefine.}: bool = false
+    bl808BleUseStaticRandomIdentity* {.booldefine.}: bool = true
+    BleUseRandomIdentity =
+      bl808BleUseStaticRandomIdentity or bl808BleUseRandomAddr
+    HciOpReadBufferSize = 0x1005'u16
     HciOpReset = 0x0C03'u16
     HciOpDisconnect = 0x0406'u16
+    HciOpLeReadBufferSize = 0x2002'u16
+    HciOpLeReadLocalSupportedFeatures = 0x2003'u16
     HciOpLeSetRandomAddress = 0x2005'u16
     HciOpLeSetAdvParams = 0x2006'u16
     HciOpLeSetAdvData = 0x2008'u16
@@ -442,17 +589,97 @@ when defined(bl808m0):
     HciOpLeSetScanEnable = 0x200C'u16
     HciOpLeCreateConnection = 0x200D'u16
     HciOpLeCreateConnectionCancel = 0x200E'u16
+    HciOpLeEncrypt = 0x2017'u16
+    HciOpLeRand = 0x2018'u16
+    HciOpLeSetDataLen = 0x2022'u16
+    HciOpLeReadSuggestedDefaultDataLen = 0x2023'u16
+    HciOpLeWriteSuggestedDefaultDataLen = 0x2024'u16
+    HciOpLeReadLocalP256PublicKey = 0x2025'u16
+    HciOpLeGenerateDhKey = 0x2026'u16
+    HciOpLeReadMaximumDataLen = 0x202F'u16
     HciEvtDisconnectComplete = 0x05'u8
     HciEvtLeMeta = 0x3E'u8
     HciLeEvtConnectionComplete = 0x01'u8
     HciLeEvtAdvertisingReport = 0x02'u8
+    HciLeEvtDataLengthChange = 0x07'u8
+    HciLeEvtReadLocalP256PublicKeyComplete = 0x08'u8
+    HciLeEvtGenerateDhKeyComplete = 0x09'u8
     HciLeEvtEnhancedConnectionComplete = 0x0A'u8
-    MacosCentralServiceUuidLe = [
-      0xF0'u8, 0xDE, 0xBC, 0x9A, 0x78, 0x56, 0x34, 0x12,
-      0x78, 0x56, 0x34, 0x12, 0x78, 0x56, 0x34, 0x12,
+    HciLeFeatureExtendedReject = 1'u8 shl 2
+    HciLeFeatureLePing = 1'u8 shl 4
+    HciLeFeatureDataPacketLengthExtension = 1'u8 shl 5
+    HciLeFeatureChannelSelectionAlgorithm2 = 1'u8 shl 6
+    HciLeDefaultDataOctets = 0x001B'u16
+    HciLeDefaultDataTime = 0x0148'u16
+    BleMaxLegacyAdvDataLen = 31
+    BleHciLegacyDataParamLen = 32
+    P256DebugPeerPublicKeyLe: array[64, uint8] = [
+      0xE6'u8, 0x9D, 0x35, 0x0E, 0x48, 0x01, 0x03, 0xCC,
+      0xDB, 0xFD, 0xF4, 0xAC, 0x11, 0x91, 0xF4, 0xEF,
+      0xB9, 0xA5, 0xF9, 0xE9, 0xA7, 0x83, 0x2C, 0x5E,
+      0x2C, 0xBE, 0x97, 0xF2, 0xD2, 0x03, 0xB0, 0x20,
+      0x8B, 0xD2, 0x89, 0x15, 0xD0, 0x8E, 0x1C, 0x74,
+      0x24, 0x30, 0xED, 0x8F, 0xC2, 0x45, 0x63, 0x76,
+      0x5C, 0x15, 0x52, 0x5A, 0xBF, 0x9A, 0x32, 0x63,
+      0x6D, 0xEB, 0x2A, 0x65, 0x49, 0x9C, 0x80, 0xDC
     ]
-    bl808BleNimSyntheticCentral* {.booldefine.}: bool = true
+    BleAdTypeFlags = 0x01'u8
+    BleAdTypeShortName = 0x08'u8
+    BleAdTypeCompleteName = 0x09'u8
+    BleAdFlagsGeneralDiscoverable = 0x02'u8
+    BleAdFlagsBrEdrNotSupported = 0x04'u8
+    BleDefaultAdvInterval = 0x00A0'u16
+    BleMinAdvInterval = 0x0020'u16
+    BleCentralDiscoveryScanInterval = 0x0060'u16
+    BleCentralDiscoveryScanWindow = 0x0030'u16
+    BleCentralConnectScanInterval = 0x0060'u16
+    BleCentralConnectScanWindow = 0x0060'u16
+    BleCentralDiscoveryActiveScan {.booldefine.}: bool = true
+    BleCentralPollIterations {.intdefine.}: int = 8
+    # Name-based central connects resolve a device from advertising reports.  A
+    # bounded per-address attempt lets peers that rotate private addresses be
+    # rediscovered instead of pinning the whole user timeout to a stale address.
+    BleCentralConnectAttemptMs {.intdefine.}: int = 5_000
+    # Name-based discovery resolves an advertising address, not a durable peer
+    # identity.  After an initiator timeout, rediscover by name instead of
+    # retrying the same address so private-address rotation and macOS advertising
+    # restarts cannot pin the central loop to a stale target.
+    BleCentralPeerConnectRetries {.intdefine.}: int = 0
+    BleCentralPostScanDrainPolls {.intdefine.}: int = 2
     bl808BleCentralScanRestartMs* {.intdefine.}: int = 500
+    bl808BleNimSyntheticCentral* {.booldefine.}: bool = false
+    HciAclPbFirstNonFlush = 0x02'u8
+    L2capCidAtt = 0x0004'u16
+    L2capCidLeSignaling = 0x0005'u16
+    AttLocalMtu = 23'u16
+    AttOpErrorRsp = 0x01'u8
+    AttOpExchangeMtuReq = 0x02'u8
+    AttOpExchangeMtuRsp = 0x03'u8
+    AttOpFindInfoReq = 0x04'u8
+    AttOpFindInfoRsp = 0x05'u8
+    AttOpReadByTypeReq = 0x08'u8
+    AttOpReadByTypeRsp = 0x09'u8
+    AttOpReadReq = 0x0A'u8
+    AttOpReadRsp = 0x0B'u8
+    AttOpReadBlobReq = 0x0C'u8
+    AttOpReadBlobRsp = 0x0D'u8
+    AttOpReadByGroupTypeReq = 0x10'u8
+    AttOpReadByGroupTypeRsp = 0x11'u8
+    AttErrInvalidHandle = 0x01'u8
+    AttErrReadNotPermitted = 0x02'u8
+    AttErrInvalidPdu = 0x04'u8
+    AttErrRequestNotSupported = 0x06'u8
+    AttErrAttributeNotFound = 0x0A'u8
+    GattUuidPrimaryService = 0x2800'u16
+    GattUuidCharacteristic = 0x2803'u16
+    GattUuidGenericAccess = 0x1800'u16
+    GattUuidGenericAttribute = 0x1801'u16
+    GattUuidDeviceName = 0x2A00'u16
+    GattHandleGapService = 0x0001'u16
+    GattHandleDeviceNameDecl = 0x0002'u16
+    GattHandleDeviceNameValue = 0x0003'u16
+    GattHandleGattService = 0x0004'u16
+    GattDeviceNameProperties = 0x02'u8
 
   proc copyBleName(name: cstring) =
     for i in 0 ..< bleNameStorage.len:
@@ -472,9 +699,15 @@ when defined(bl808m0):
     hciLastLen = 0
     hciLastWord0 = 0
     hciLastWord1 = 0
+    for i in 0 ..< hciLastPayload.len:
+      hciLastPayload[i] = 0
 
   proc hciCommandOk(opcode: uint16, params: ptr uint8,
                     paramLen: uint8, polls: int = 64): bool =
+    ble_host_debug_stage = 0x5200'u32
+    ble_host_debug_opcode = opcode.uint32
+    ble_host_debug_len = paramLen.uint32
+    ble_host_debug_ptr = cast[uint32](cast[uint](params))
     when defined(bl808BleVendor):
       resetHciLast()
       if blecontroller.bleBlobHciCommand(opcode, params, paramLen) != 0:
@@ -486,9 +719,11 @@ when defined(bl808m0):
       hciLastOpcode == opcode and hciLastStatus == 0
     else:
       discard polls
-      var pkt: array[260, uint8]
-      if paramLen.int + 3 > pkt.len:
+      if hciCommandInFlight:
         return false
+      hciCommandInFlight = true
+      defer:
+        hciCommandInFlight = false
       when defined(bl808BleVendorLldScanProbe):
         let entrySp = bleHciSendReadSp()
         let commandReturnShadow =
@@ -496,16 +731,16 @@ when defined(bl808m0):
         bleHciCommandReturnShadow = commandReturnShadow
         bleProbeTraceWord(56'u32, commandReturnShadow)
       resetHciLast()
-      pkt[0] = uint8(opcode and 0xFF)
-      pkt[1] = uint8((opcode shr 8) and 0xFF)
-      pkt[2] = paramLen
-      if params != nil:
-        let src = cast[ptr UncheckedArray[uint8]](params)
-        for i in 0 ..< paramLen.int:
-          pkt[i + 3] = src[i]
       when defined(bl808BleVendorLldScanProbe):
         bleProbeTraceWord(64'u32, uint32(opcode))
-      let sendRc = bt_onchiphci_send(0, uint16(paramLen.int + 3), addr pkt[0])
+      ble_host_debug_stage = 0x5210'u32
+      hciCommandSlot.opcode = opcode
+      hciCommandSlot.params = params
+      hciCommandSlot.paramLen = paramLen
+      let sendRc =
+        blecontroller.bt_onchiphci_send(0'u8, 0'u16, addr hciCommandSlot)
+      ble_host_debug_stage = 0x5220'u32
+      ble_host_debug_status = cast[uint32](sendRc)
       when defined(bl808BleVendorLldScanProbe):
         let expectedOpcode =
           uint16(bleHciReadExpectedOpcodeFromTrace() and 0xFFFF'u32)
@@ -526,6 +761,16 @@ when defined(bl808m0):
           bleHciSendRestoreCommandRaFromTrace()
         return false
       result = hciLastOpcode == expectedOpcode and hciLastStatus == 0
+      ble_host_debug_stage = 0x5230'u32
+      ble_host_debug_status =
+        (uint32(hciLastOpcode) shl 16) or
+        (cast[uint32](hciLastStatus) and 0xFFFF'u32)
+      ble_hci_return_debug_sp = bleHostReadSp()
+      ble_hci_return_debug_result = if result: 1'u32 else: 0'u32
+      for i in 0 ..< ble_hci_return_debug_stack.len:
+        ble_hci_return_debug_stack[i] =
+          regRead((ble_hci_return_debug_sp + uint32(i * 4)).uint)
+      ble_host_debug_stage = 0x5231'u32
       when defined(bl808BleVendorLldScanProbe):
         bleHciCommandDiag1 = bleHciCommandDiag1 or
           (if result: 1'u32 else: 0'u32)
@@ -534,12 +779,198 @@ when defined(bl808m0):
           blecontroller.bleCentralDebugMark(0x953'u32, bleHciCommandDiag1)
         bleHciSendRestoreCommandRaFromTrace()
 
+  proc bleLeEncryptSelfTest*(): bool {.cdecl.} =
+    var params: array[32, uint8]
+    const
+      key = [
+        0x00'u8, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
+      ]
+      plaintext = [
+        0x00'u8, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF
+      ]
+      ciphertext = [
+        0x69'u8, 0xC4, 0xE0, 0xD8, 0x6A, 0x7B, 0x04, 0x30,
+        0xD8, 0xCD, 0xB7, 0x80, 0x70, 0xB4, 0xC5, 0x5A
+      ]
+    for i in 0 ..< 16:
+      params[i] = key[i]
+      params[16 + i] = plaintext[i]
+    if not hciCommandOk(HciOpLeEncrypt, addr params[0], params.len.uint8):
+      return false
+    if hciLastLen != 17'u8 or hciLastStatus != 0:
+      return false
+    for i in 0 ..< 16:
+      if hciLastPayload[1 + i] != ciphertext[i]:
+        return false
+    true
+
+  proc bleLeRandSelfTest*(): bool {.cdecl.} =
+    if not hciCommandOk(HciOpLeRand, nil, 0):
+      return false
+    if hciLastLen != 9'u8 or hciLastStatus != 0:
+      return false
+    var first: array[8, uint8]
+    var firstAllZero = true
+    for i in 0 ..< first.len:
+      first[i] = hciLastPayload[1 + i]
+      if first[i] != 0'u8:
+        firstAllZero = false
+    if firstAllZero:
+      return false
+
+    if not hciCommandOk(HciOpLeRand, nil, 0):
+      return false
+    if hciLastLen != 9'u8 or hciLastStatus != 0:
+      return false
+    var secondAllZero = true
+    var same = true
+    for i in 0 ..< first.len:
+      let b = hciLastPayload[1 + i]
+      if b != 0'u8:
+        secondAllZero = false
+      if b != first[i]:
+        same = false
+    (not secondAllZero) and (not same)
+
+  proc bleLeP256SelfTest*(): bool {.cdecl.} =
+    when defined(bl808BleVendor):
+      true
+    else:
+      if not hciCommandOk(HciOpLeReadLocalP256PublicKey, nil, 0):
+        return false
+      if hciLastLen != 66'u8 or hciLastPayload[0] !=
+          HciLeEvtReadLocalP256PublicKeyComplete or hciLastStatus != 0:
+        return false
+      if not bleP256IsValidPublicKeyLe(addr hciLastPayload[2],
+                                       addr hciLastPayload[34]):
+        return false
+
+      if not hciCommandOk(HciOpLeGenerateDhKey,
+                          unsafeAddr P256DebugPeerPublicKeyLe[0],
+                          P256DebugPeerPublicKeyLe.len.uint8):
+        return false
+      if hciLastLen != 34'u8 or hciLastPayload[0] !=
+          HciLeEvtGenerateDhKeyComplete or hciLastStatus != 0:
+        return false
+      var allZero = true
+      for i in 0 ..< 32:
+        if hciLastPayload[2 + i] != 0'u8:
+          allZero = false
+      not allZero
+
+  proc hciLastPayloadLe16(off: int): uint16 =
+    hciLastPayload[off].uint16 or (hciLastPayload[off + 1].uint16 shl 8)
+
+  proc bleLeBufferSizeSelfTest*(): bool {.cdecl.} =
+    when defined(bl808BleVendor):
+      true
+    else:
+      if not hciCommandOk(HciOpReadBufferSize, nil, 0):
+        return false
+      if hciLastLen != 8'u8 or hciLastStatus != 0:
+        return false
+      if hciLastPayloadLe16(1) != HciLeDefaultDataOctets or
+          hciLastPayload[3] != 0'u8 or
+          hciLastPayloadLe16(4) != 1'u16 or
+          hciLastPayloadLe16(6) != 0'u16:
+        return false
+
+      if not hciCommandOk(HciOpLeReadBufferSize, nil, 0):
+        return false
+      hciLastLen == 4'u8 and hciLastStatus == 0 and
+        hciLastPayloadLe16(1) == HciLeDefaultDataOctets and
+        hciLastPayload[3] == 1'u8
+
+  proc bleLeLocalFeaturesSelfTest*(): bool {.cdecl.} =
+    when defined(bl808BleVendor):
+      true
+    else:
+      if not hciCommandOk(HciOpLeReadLocalSupportedFeatures, nil, 0):
+        return false
+      if hciLastLen != 9'u8 or hciLastStatus != 0:
+        return false
+      if (hciLastPayload[1] and HciLeFeatureExtendedReject) == 0'u8:
+        return false
+      if (hciLastPayload[1] and
+          (HciLeFeatureLePing or HciLeFeatureDataPacketLengthExtension)) != 0'u8:
+        return false
+      when blecontroller.bl808BleNimPeripheralChSel2:
+        if (hciLastPayload[2] and HciLeFeatureChannelSelectionAlgorithm2) == 0'u8:
+          return false
+      true
+
+  proc bleLeDataLengthSelfTest*(): bool {.cdecl.} =
+    when defined(bl808BleVendor):
+      true
+    else:
+      if not hciCommandOk(HciOpLeReadMaximumDataLen, nil, 0):
+        return false
+      if hciLastLen != 9'u8 or hciLastStatus != 0:
+        return false
+      if hciLastPayloadLe16(1) != HciLeDefaultDataOctets or
+          hciLastPayloadLe16(3) != HciLeDefaultDataTime or
+          hciLastPayloadLe16(5) != HciLeDefaultDataOctets or
+          hciLastPayloadLe16(7) != HciLeDefaultDataTime:
+        return false
+
+      if not hciCommandOk(HciOpLeReadSuggestedDefaultDataLen, nil, 0):
+        return false
+      if hciLastLen != 5'u8 or hciLastStatus != 0:
+        return false
+      if hciLastPayloadLe16(1) != HciLeDefaultDataOctets or
+          hciLastPayloadLe16(3) != HciLeDefaultDataTime:
+        return false
+
+      var params: array[4, uint8]
+      params[0] = uint8(HciLeDefaultDataOctets and 0x00FF'u16)
+      params[1] = uint8((HciLeDefaultDataOctets shr 8) and 0x00FF'u16)
+      params[2] = uint8(HciLeDefaultDataTime and 0x00FF'u16)
+      params[3] = uint8((HciLeDefaultDataTime shr 8) and 0x00FF'u16)
+      hciCommandOk(HciOpLeWriteSuggestedDefaultDataLen, addr params[0],
+                   params.len.uint8)
+
+  proc staticRandomIdentityPayloadValid(identity: array[6, uint8]): bool =
+    var allZero = true
+    var allOne = true
+    for i in 0 ..< 5:
+      if identity[i] != 0'u8:
+        allZero = false
+      if identity[i] != 0xFF'u8:
+        allOne = false
+    let randomMsbs = identity[5] and 0x3F'u8
+    if randomMsbs != 0'u8:
+      allZero = false
+    if randomMsbs != 0x3F'u8:
+      allOne = false
+    (not allZero) and (not allOne)
+
+  proc generateStaticRandomIdentity(): bool =
+    var words: array[8, uint32]
+    for attempt in 0 ..< 4:
+      discard attempt
+      if sec.trngReadAll(words) != sec.secOk:
+        return false
+      for i in 0 ..< bleStaticRandomIdentity.len:
+        let word = words[i div 4]
+        bleStaticRandomIdentity[i] =
+          uint8((word shr ((i mod 4) * 8)) and 0xFF'u32)
+      bleStaticRandomIdentity[5] =
+        (bleStaticRandomIdentity[5] and 0x3F'u8) or 0xC0'u8
+      if staticRandomIdentityPayloadValid(bleStaticRandomIdentity):
+        bleStaticRandomIdentityConfigured = true
+        return true
+    false
+
   proc configureRandomAddress(): bool =
-    when defined(bl808BleUseRandomAddr):
-      var randomAddr = [0xC0'u8, 0x80, 0x80, 0x05, 0xB9, 0x18]
+    when BleUseRandomIdentity:
+      if not bleStaticRandomIdentityConfigured:
+        if not generateStaticRandomIdentity():
+          return false
       hciCommandOk(HciOpLeSetRandomAddress,
-                   addr randomAddr[0],
-                   randomAddr.len.uint8)
+                   addr bleStaticRandomIdentity[0],
+                   bleStaticRandomIdentity.len.uint8)
     else:
       true
 
@@ -566,6 +997,8 @@ when defined(bl808m0):
                               dataLen: int): bool =
     if not bleCentralTargetActive:
       return false
+    if bleCentralAcceptAnyReport:
+      return true
     let target = cast[ptr UncheckedArray[char]](addr bleCentralTargetName[0])
     var pos = 0
     while pos < dataLen:
@@ -582,23 +1015,129 @@ when defined(bl808m0):
                                 cast[uint](data) + uint(pos + 2)),
                               valueLen):
         return true
-      if (dataType == 0x06'u8 or dataType == 0x07'u8) and valueLen >= 16:
-        let value = cast[ptr UncheckedArray[uint8]](
-          cast[uint](data) + uint(pos + 2))
-        var uuidOffset = 0
-        while uuidOffset + 16 <= valueLen:
-          var uuidMatches = true
-          for i in 0 ..< MacosCentralServiceUuidLe.len:
-            if value[uuidOffset + i] != MacosCentralServiceUuidLe[i]:
-              uuidMatches = false
-              break
-          if uuidMatches:
-            return true
-          uuidOffset += 16
       pos += 1 + fieldLen
     false
 
+  proc appendAdStructure(payload: var array[BleHciLegacyDataParamLen, uint8],
+                         pos: var int, dataType: uint8, data: pointer,
+                         dataLen: int): bool =
+    if dataLen < 0 or dataLen > BleMaxLegacyAdvDataLen - 1:
+      return false
+    if dataLen > 0 and data == nil:
+      return false
+    if pos + dataLen + 2 > payload.len:
+      return false
+    payload[pos] = uint8(dataLen + 1)
+    inc pos
+    payload[pos] = dataType
+    inc pos
+    if dataLen > 0:
+      let raw = cast[ptr UncheckedArray[uint8]](data)
+      for i in 0 ..< dataLen:
+        payload[pos] = raw[i]
+        inc pos
+    true
+
+  proc appendAdByte(payload: var array[BleHciLegacyDataParamLen, uint8],
+                    pos: var int, dataType, value: uint8): bool =
+    var data = value
+    appendAdStructure(payload, pos, dataType, addr data, 1)
+
+  proc appendAdName(payload: var array[BleHciLegacyDataParamLen, uint8],
+                    pos: var int, completeOnly: bool = false): bool =
+    let name = cast[ptr UncheckedArray[uint8]](addr bleNameStorage[0])
+    var nameLen = 0
+    while nameLen < bleNameStorage.len - 1 and name[nameLen] != 0:
+      inc nameLen
+    if nameLen == 0:
+      return true
+    let room = payload.len - pos - 2
+    if room <= 0:
+      return completeOnly == false
+    let copyLen = if nameLen > room: room else: nameLen
+    if completeOnly and copyLen != nameLen:
+      return false
+    let dataType =
+      if copyLen == nameLen: BleAdTypeCompleteName else: BleAdTypeShortName
+    appendAdStructure(payload, pos, dataType, addr name[0], copyLen)
+
+  proc encodeBtData(payload: var array[BleHciLegacyDataParamLen, uint8],
+                    data: ptr BtData, dataCount: csize_t): bool =
+    for i in 0 ..< payload.len:
+      payload[i] = 0
+    if dataCount > csize_t(BleMaxLegacyAdvDataLen):
+      return false
+    var pos = 1
+    if dataCount != 0:
+      if data == nil:
+        return false
+      let items = cast[ptr UncheckedArray[BtData]](data)
+      for i in 0 ..< dataCount.int:
+        if not appendAdStructure(payload, pos, items[i].dataType,
+                                 items[i].data, items[i].dataLen.int):
+          return false
+    payload[0] = uint8(pos - 1)
+    true
+
+  proc encodeDefaultAdvData(
+      payload: var array[BleHciLegacyDataParamLen, uint8]): bool =
+    for i in 0 ..< payload.len:
+      payload[i] = 0
+    var pos = 1
+    if not appendAdByte(payload, pos, BleAdTypeFlags,
+                        BleAdFlagsGeneralDiscoverable or
+                        BleAdFlagsBrEdrNotSupported):
+      return false
+    payload[0] = uint8(pos - 1)
+    true
+
+  proc encodeDefaultScanRspData(
+      payload: var array[BleHciLegacyDataParamLen, uint8]): bool =
+    for i in 0 ..< payload.len:
+      payload[i] = 0
+    var pos = 1
+    if not appendAdName(payload, pos, completeOnly = true):
+      return false
+    payload[0] = uint8(pos - 1)
+    true
+
+  proc encodeDefaultAdvAndScanRspData(
+      advPayload: var array[BleHciLegacyDataParamLen, uint8],
+      scanRsp: var array[BleHciLegacyDataParamLen, uint8]): bool =
+    for i in 0 ..< advPayload.len:
+      advPayload[i] = 0
+    for i in 0 ..< scanRsp.len:
+      scanRsp[i] = 0
+
+    var advPos = 1
+    if not appendAdByte(advPayload, advPos, BleAdTypeFlags,
+                        BleAdFlagsGeneralDiscoverable or
+                        BleAdFlagsBrEdrNotSupported):
+      return false
+
+    if appendAdName(advPayload, advPos, completeOnly = true):
+      scanRsp[0] = 0
+    else:
+      if not appendAdName(advPayload, advPos):
+        return false
+      var scanPos = 1
+      if not appendAdName(scanRsp, scanPos):
+        return false
+      scanRsp[0] = uint8(scanPos - 1)
+
+    advPayload[0] = uint8(advPos - 1)
+    true
+
+  proc advIntervalOrDefault(value: uint16): uint16 {.inline.} =
+    if value == 0'u16:
+      BleDefaultAdvInterval
+    elif value < BleMinAdvInterval:
+      BleMinAdvInterval
+    else:
+      value
+
   proc notifyConnected(err: uint8) =
+    bleConnConnectedNotified = true
     if bleConnCb != nil and bleConnCb.connected != nil:
       bleConnCb.connected(addr bleConn, err)
 
@@ -607,7 +1146,7 @@ when defined(bl808m0):
       bleConnCb.disconnected(addr bleConn, reason)
 
   proc notifyPeripheralConnectedFromController() =
-    when defined(bl808BleVendorLldConProbe):
+    when bl808BleNimConnectionEnabled:
       let handle = blecontroller.bleNimPeripheralConnHandle()
       let peerA0 = blecontroller.bleNimPeripheralConnPeerA0()
       let peerA1 = blecontroller.bleNimPeripheralConnPeerA1()
@@ -637,16 +1176,17 @@ when defined(bl808m0):
     ## API. Vendor firmware reports these through HCI; the Nim/vendor-LLD
     ## bridge records them in controller counters to avoid re-entering the HCI
     ## callback chain from the low-level connection-start path.
+    drainHciHostEvents()
     when defined(bl808BleVendor):
       discard
     else:
-      when defined(bl808BleVendorLldConProbe):
+      when bl808BleNimConnectionEnabled:
         let connEvents = blecontroller.bleNimPeripheralConnEventCount()
+        var newConnEvent = false
         if connEvents != blePeripheralConnEventsSeen:
           blePeripheralConnEventsSeen = connEvents
-        let controllerStarted = blecontroller.bleNimDbgVendorConStarted() != 0'u32
-        if (connEvents != 0'u32 or controllerStarted) and
-            not blePeripheralConnectedNotified:
+          newConnEvent = true
+        if newConnEvent and not blePeripheralConnectedNotified:
           notifyPeripheralConnectedFromController()
 
         let discEvents = blecontroller.bleNimPeripheralDiscEventCount()
@@ -656,22 +1196,33 @@ when defined(bl808m0):
             uint8(blecontroller.bleNimPeripheralDiscReason() and 0xFF'u32)
           bleConnActive = false
           bleConnPending = false
+          bleConnConnectedNotified = false
           bleCentralConnected = false
           blePeripheralIdlePolls = 0
           notifyDisconnected(reason)
           blePeripheralConnectedNotified = false
         elif bleConnActive and bleConn.role == 1'u8:
-          let llcpRx = blecontroller.bleNimDbgVendorLlcpRxCount()
-          if llcpRx != blePeripheralLastLlcpRx:
-            blePeripheralLastLlcpRx = llcpRx
-            blePeripheralIdlePolls = 0
-          elif blePeripheralIdlePolls < BlePeripheralIdleDisconnectPolls:
-            inc blePeripheralIdlePolls
+          when BlePeripheralIdleDisconnectPolls > 0:
+            let llcpRx = blecontroller.bleNimDbgVendorLlcpRxCount()
+            if llcpRx != blePeripheralLastLlcpRx:
+              blePeripheralLastLlcpRx = llcpRx
+              blePeripheralIdlePolls = 0
+            elif blePeripheralIdlePolls <
+                uint32(BlePeripheralIdleDisconnectPolls):
+              inc blePeripheralIdlePolls
+            else:
+              bleConnActive = false
+              bleConnPending = false
+              bleConnConnectedNotified = false
+              bleCentralConnected = false
+              blecontroller.bleNimPeripheralIdleDisconnect(0x13'u8)
+              blePeripheralDiscEventsSeen =
+                blecontroller.bleNimPeripheralDiscEventCount()
+              blePeripheralIdlePolls = 0
+              notifyDisconnected(0x13'u8)
+              blePeripheralConnectedNotified = false
           else:
-            bleConnActive = false
-            bleConnPending = false
-            bleCentralConnected = false
-            notifyDisconnected(0x13'u8)
+            discard
       else:
         discard
 
@@ -685,6 +1236,7 @@ when defined(bl808m0):
     if status == 0 and handle == bleConn.handle:
       bleConnActive = false
       bleConnPending = false
+      bleConnConnectedNotified = false
       notifyDisconnected(reason)
 
   proc handleLeConnectionComplete(raw: ptr UncheckedArray[uint8],
@@ -755,6 +1307,350 @@ when defined(bl808m0):
             if i < copyLen: payload[i] else: 0'u8
       offset += 10 + dataLen
 
+  proc le16(raw: ptr UncheckedArray[uint8], off: int): uint16 {.inline.} =
+    raw[off].uint16 or (raw[off + 1].uint16 shl 8)
+
+  proc putLe16(raw: ptr UncheckedArray[uint8], off: int,
+               value: uint16) {.inline.} =
+    raw[off] = uint8(value and 0x00FF'u16)
+    raw[off + 1] = uint8((value shr 8) and 0x00FF'u16)
+
+  proc bleNameLen(): int =
+    while result < bleNameStorage.len and bleNameStorage[result] != '\0':
+      inc result
+
+  proc sendL2capPdu(handle, cid: uint16, payload: ptr uint8,
+                    payloadLen: uint16): bool =
+    if payloadLen > uint16(HciLeDefaultDataOctets - 4):
+      inc ble_host_acl_tx_reject_count
+      return false
+    if payload == nil and payloadLen != 0'u16:
+      inc ble_host_acl_tx_reject_count
+      return false
+
+    var data: array[HciLeDefaultDataOctets.int, uint8]
+    let raw = cast[ptr UncheckedArray[uint8]](addr data[0])
+    putLe16(raw, 0, payloadLen)
+    putLe16(raw, 2, cid)
+    if payloadLen != 0'u16:
+      let src = cast[ptr UncheckedArray[uint8]](payload)
+      for i in 0 ..< payloadLen.int:
+        raw[4 + i] = src[i]
+
+    when defined(bl808BleVendor):
+      inc ble_host_acl_tx_reject_count
+      false
+    else:
+      var acl = blecontroller.OnChipHciAclDataTx(
+        conhdl: handle,
+        pbBcFlag: HciAclPbFirstNonFlush,
+        len: payloadLen + 4'u16,
+        buffer: addr data[0],
+      )
+      let ok =
+        blecontroller.bt_onchiphci_send(HciPktAclData, 0'u16,
+                                        addr acl) == 0'i8
+      if ok:
+        inc ble_host_acl_tx_count
+      else:
+        inc ble_host_acl_tx_reject_count
+      ok
+
+  proc sendAttPdu(handle: uint16, payload: ptr uint8,
+                  payloadLen: uint16): bool =
+    result = sendL2capPdu(handle, L2capCidAtt, payload, payloadLen)
+    if result:
+      inc ble_host_att_tx_count
+
+  proc sendAttError(handle: uint16, requestOpcode: uint8,
+                    attrHandle: uint16, errorCode: uint8): bool =
+    var rsp: array[5, uint8]
+    let raw = cast[ptr UncheckedArray[uint8]](addr rsp[0])
+    raw[0] = AttOpErrorRsp
+    raw[1] = requestOpcode
+    putLe16(raw, 2, attrHandle)
+    raw[4] = errorCode
+    ble_host_att_last_status =
+      (uint32(requestOpcode) shl 16) or uint32(errorCode)
+    sendAttPdu(handle, addr rsp[0], rsp.len.uint16)
+
+  proc appendGattUuid16(rsp: ptr UncheckedArray[uint8], pos: var int,
+                        handle, uuid: uint16) =
+    putLe16(rsp, pos, handle)
+    putLe16(rsp, pos + 2, uuid)
+    pos += 4
+
+  proc appendGattGroup(rsp: ptr UncheckedArray[uint8], pos: var int,
+                       startHandle, endHandle, uuid: uint16) =
+    putLe16(rsp, pos, startHandle)
+    putLe16(rsp, pos + 2, endHandle)
+    putLe16(rsp, pos + 4, uuid)
+    pos += 6
+
+  proc handleAttExchangeMtu(handle: uint16,
+                            pdu: ptr UncheckedArray[uint8],
+                            pduLen: uint16): bool =
+    if pduLen < 3'u16:
+      return sendAttError(handle, AttOpExchangeMtuReq, 0'u16,
+                          AttErrInvalidPdu)
+    var rsp: array[3, uint8]
+    let raw = cast[ptr UncheckedArray[uint8]](addr rsp[0])
+    raw[0] = AttOpExchangeMtuRsp
+    putLe16(raw, 1, AttLocalMtu)
+    sendAttPdu(handle, addr rsp[0], rsp.len.uint16)
+
+  proc handleAttFindInfo(handle: uint16,
+                         pdu: ptr UncheckedArray[uint8],
+                         pduLen: uint16): bool =
+    if pduLen < 5'u16:
+      return sendAttError(handle, AttOpFindInfoReq, 0'u16,
+                          AttErrInvalidPdu)
+    let startHandle = le16(pdu, 1)
+    let endHandle = le16(pdu, 3)
+    if startHandle == 0'u16 or startHandle > endHandle:
+      return sendAttError(handle, AttOpFindInfoReq, startHandle,
+                          AttErrInvalidHandle)
+
+    var rsp: array[AttLocalMtu.int, uint8]
+    let raw = cast[ptr UncheckedArray[uint8]](addr rsp[0])
+    raw[0] = AttOpFindInfoRsp
+    raw[1] = 0x01'u8
+    var pos = 2
+    if startHandle <= GattHandleGapService and endHandle >= GattHandleGapService:
+      appendGattUuid16(raw, pos, GattHandleGapService, GattUuidPrimaryService)
+    if startHandle <= GattHandleDeviceNameDecl and
+        endHandle >= GattHandleDeviceNameDecl:
+      appendGattUuid16(raw, pos, GattHandleDeviceNameDecl,
+                       GattUuidCharacteristic)
+    if startHandle <= GattHandleDeviceNameValue and
+        endHandle >= GattHandleDeviceNameValue:
+      appendGattUuid16(raw, pos, GattHandleDeviceNameValue,
+                       GattUuidDeviceName)
+    if startHandle <= GattHandleGattService and endHandle >= GattHandleGattService:
+      appendGattUuid16(raw, pos, GattHandleGattService, GattUuidPrimaryService)
+    if pos == 2:
+      return sendAttError(handle, AttOpFindInfoReq, startHandle,
+                          AttErrAttributeNotFound)
+    sendAttPdu(handle, addr rsp[0], pos.uint16)
+
+  proc handleAttReadByGroupType(handle: uint16,
+                                pdu: ptr UncheckedArray[uint8],
+                                pduLen: uint16): bool =
+    if pduLen < 7'u16:
+      return sendAttError(handle, AttOpReadByGroupTypeReq, 0'u16,
+                          AttErrInvalidPdu)
+    let startHandle = le16(pdu, 1)
+    let endHandle = le16(pdu, 3)
+    let groupType = le16(pdu, 5)
+    if startHandle == 0'u16 or startHandle > endHandle:
+      return sendAttError(handle, AttOpReadByGroupTypeReq, startHandle,
+                          AttErrInvalidHandle)
+    if groupType != GattUuidPrimaryService:
+      return sendAttError(handle, AttOpReadByGroupTypeReq, startHandle,
+                          AttErrAttributeNotFound)
+
+    var rsp: array[AttLocalMtu.int, uint8]
+    let raw = cast[ptr UncheckedArray[uint8]](addr rsp[0])
+    raw[0] = AttOpReadByGroupTypeRsp
+    raw[1] = 6'u8
+    var pos = 2
+    if startHandle <= GattHandleGapService and endHandle >= GattHandleGapService:
+      appendGattGroup(raw, pos, GattHandleGapService,
+                      GattHandleDeviceNameValue, GattUuidGenericAccess)
+    if startHandle <= GattHandleGattService and endHandle >= GattHandleGattService:
+      appendGattGroup(raw, pos, GattHandleGattService,
+                      GattHandleGattService, GattUuidGenericAttribute)
+    if pos == 2:
+      return sendAttError(handle, AttOpReadByGroupTypeReq, startHandle,
+                          AttErrAttributeNotFound)
+    sendAttPdu(handle, addr rsp[0], pos.uint16)
+
+  proc appendDeviceNameValue(rsp: ptr UncheckedArray[uint8],
+                             pos: var int,
+                             maxValueLen: int,
+                             offset: int = 0) =
+    let nameLen = bleNameLen()
+    if offset >= nameLen:
+      return
+    let valueLen =
+      if nameLen - offset > maxValueLen: maxValueLen else: nameLen - offset
+    let name = cast[ptr UncheckedArray[uint8]](addr bleNameStorage[0])
+    for i in 0 ..< valueLen:
+      rsp[pos + i] = name[offset + i]
+    pos += valueLen
+
+  proc handleAttReadByType(handle: uint16,
+                           pdu: ptr UncheckedArray[uint8],
+                           pduLen: uint16): bool =
+    if pduLen < 7'u16:
+      return sendAttError(handle, AttOpReadByTypeReq, 0'u16,
+                          AttErrInvalidPdu)
+    let startHandle = le16(pdu, 1)
+    let endHandle = le16(pdu, 3)
+    let attrType = le16(pdu, 5)
+    if startHandle == 0'u16 or startHandle > endHandle:
+      return sendAttError(handle, AttOpReadByTypeReq, startHandle,
+                          AttErrInvalidHandle)
+
+    var rsp: array[AttLocalMtu.int, uint8]
+    let raw = cast[ptr UncheckedArray[uint8]](addr rsp[0])
+    raw[0] = AttOpReadByTypeRsp
+    var pos = 2
+    if attrType == GattUuidCharacteristic:
+      raw[1] = 7'u8
+      if startHandle <= GattHandleDeviceNameDecl and
+          endHandle >= GattHandleDeviceNameDecl:
+        putLe16(raw, pos, GattHandleDeviceNameDecl)
+        raw[pos + 2] = GattDeviceNameProperties
+        putLe16(raw, pos + 3, GattHandleDeviceNameValue)
+        putLe16(raw, pos + 5, GattUuidDeviceName)
+        pos += 7
+    elif attrType == GattUuidDeviceName:
+      raw[1] = uint8(2 + bleNameLen())
+      if raw[1] > AttLocalMtu - 2:
+        raw[1] = uint8(AttLocalMtu - 2)
+      if startHandle <= GattHandleDeviceNameValue and
+          endHandle >= GattHandleDeviceNameValue:
+        putLe16(raw, pos, GattHandleDeviceNameValue)
+        pos += 2
+        appendDeviceNameValue(raw, pos, int(raw[1]) - 2)
+    else:
+      return sendAttError(handle, AttOpReadByTypeReq, startHandle,
+                          AttErrAttributeNotFound)
+
+    if pos == 2:
+      return sendAttError(handle, AttOpReadByTypeReq, startHandle,
+                          AttErrAttributeNotFound)
+    sendAttPdu(handle, addr rsp[0], pos.uint16)
+
+  proc handleAttRead(handle: uint16,
+                     pdu: ptr UncheckedArray[uint8],
+                     pduLen: uint16,
+                     blob: bool): bool =
+    let reqOpcode = if blob: AttOpReadBlobReq else: AttOpReadReq
+    if (not blob and pduLen < 3'u16) or (blob and pduLen < 5'u16):
+      return sendAttError(handle, reqOpcode, 0'u16, AttErrInvalidPdu)
+    let attrHandle = le16(pdu, 1)
+    let offset =
+      if blob: le16(pdu, 3).int
+      else: 0
+    var rsp: array[AttLocalMtu.int, uint8]
+    let raw = cast[ptr UncheckedArray[uint8]](addr rsp[0])
+    raw[0] = if blob: AttOpReadBlobRsp else: AttOpReadRsp
+    var pos = 1
+    case attrHandle
+    of GattHandleGapService:
+      if offset != 0:
+        return sendAttError(handle, reqOpcode, attrHandle,
+                            AttErrAttributeNotFound)
+      putLe16(raw, pos, GattUuidGenericAccess)
+      pos += 2
+    of GattHandleDeviceNameDecl:
+      if offset != 0:
+        return sendAttError(handle, reqOpcode, attrHandle,
+                            AttErrAttributeNotFound)
+      raw[pos] = GattDeviceNameProperties
+      putLe16(raw, pos + 1, GattHandleDeviceNameValue)
+      putLe16(raw, pos + 3, GattUuidDeviceName)
+      pos += 5
+    of GattHandleDeviceNameValue:
+      appendDeviceNameValue(raw, pos, int(AttLocalMtu) - 1, offset)
+    of GattHandleGattService:
+      if offset != 0:
+        return sendAttError(handle, reqOpcode, attrHandle,
+                            AttErrAttributeNotFound)
+      putLe16(raw, pos, GattUuidGenericAttribute)
+      pos += 2
+    else:
+      return sendAttError(handle, reqOpcode, attrHandle,
+                          AttErrAttributeNotFound)
+    sendAttPdu(handle, addr rsp[0], pos.uint16)
+
+  proc handleAttPdu(handle: uint16,
+                    pdu: ptr UncheckedArray[uint8],
+                    pduLen: uint16) =
+    if pdu == nil or pduLen == 0'u16:
+      return
+    inc ble_host_att_rx_count
+    let opcode = pdu[0]
+    ble_host_att_last_opcode = opcode.uint32
+    let ok =
+      case opcode
+      of AttOpExchangeMtuReq:
+        handleAttExchangeMtu(handle, pdu, pduLen)
+      of AttOpFindInfoReq:
+        handleAttFindInfo(handle, pdu, pduLen)
+      of AttOpReadByTypeReq:
+        handleAttReadByType(handle, pdu, pduLen)
+      of AttOpReadReq:
+        handleAttRead(handle, pdu, pduLen, blob = false)
+      of AttOpReadBlobReq:
+        handleAttRead(handle, pdu, pduLen, blob = true)
+      of AttOpReadByGroupTypeReq:
+        handleAttReadByGroupType(handle, pdu, pduLen)
+      else:
+        sendAttError(handle, opcode, 0'u16, AttErrRequestNotSupported)
+    if ok:
+      ble_host_att_last_status = opcode.uint32 shl 16
+
+  proc sendL2capCommandReject(handle: uint16, identifier: uint8): bool =
+    var rsp: array[6, uint8]
+    let raw = cast[ptr UncheckedArray[uint8]](addr rsp[0])
+    raw[0] = 0x01'u8
+    raw[1] = identifier
+    putLe16(raw, 2, 2'u16)
+    putLe16(raw, 4, 0x0000'u16)
+    sendL2capPdu(handle, L2capCidLeSignaling, addr rsp[0], rsp.len.uint16)
+
+  proc handleL2capSignaling(handle: uint16,
+                            pdu: ptr UncheckedArray[uint8],
+                            pduLen: uint16) =
+    var off = 0
+    while off + 4 <= pduLen.int:
+      let code = pdu[off]
+      let identifier = pdu[off + 1]
+      let cmdLen = le16(pdu, off + 2).int
+      if off + 4 + cmdLen > pduLen.int:
+        return
+      if code == 0x12'u8 and cmdLen >= 8:
+        var rsp: array[6, uint8]
+        let raw = cast[ptr UncheckedArray[uint8]](addr rsp[0])
+        raw[0] = 0x13'u8
+        raw[1] = identifier
+        putLe16(raw, 2, 2'u16)
+        putLe16(raw, 4, 0x0000'u16)
+        discard sendL2capPdu(handle, L2capCidLeSignaling,
+                             addr rsp[0], rsp.len.uint16)
+      else:
+        discard sendL2capCommandReject(handle, identifier)
+      off += 4 + cmdLen
+
+  proc handleAclData(raw: ptr UncheckedArray[uint8], len: int) =
+    if raw == nil or len < 8:
+      return
+    inc ble_host_acl_rx_count
+    let handleFlags = le16(raw, 0)
+    let pbFlag = uint8((handleFlags shr 12) and 0x03'u16)
+    if pbFlag == 0x01'u8:
+      return
+    let handle = handleFlags and 0x0FFF'u16
+    let aclLen = le16(raw, 2).int
+    if aclLen < 4 or len < 4 + aclLen:
+      return
+    let l2capLen = le16(raw, 4).int
+    let cid = le16(raw, 6)
+    if l2capLen > aclLen - 4:
+      return
+    let payload =
+      cast[ptr UncheckedArray[uint8]](cast[uint](raw) + 8'u)
+    case cid
+    of L2capCidAtt:
+      handleAttPdu(handle, payload, l2capLen.uint16)
+    of L2capCidLeSignaling:
+      handleL2capSignaling(handle, payload, l2capLen.uint16)
+    else:
+      discard
+
   proc handleLeMetaEvent(raw: ptr UncheckedArray[uint8], len: int) =
     if len < 3:
       return
@@ -773,23 +1669,29 @@ when defined(bl808m0):
         not bleCentralTargetActive and not bleAdvActive:
       return 0
     let raw = cast[ptr UncheckedArray[uint8]](param)
-    case raw[0]
-    of HciEvtLeMeta:
-      handleLeMetaEvent(raw, paramLen.int)
-    of HciEvtDisconnectComplete:
-      handleDisconnectionComplete(raw, paramLen.int)
+    if hciDispatchPktType == HciPktAclData:
+      handleAclData(raw, paramLen.int)
     else:
-      discard
+      case raw[0]
+      of HciEvtLeMeta:
+        handleLeMetaEvent(raw, paramLen.int)
+      of HciEvtDisconnectComplete:
+        handleDisconnectionComplete(raw, paramLen.int)
+      else:
+        discard
     0
 
   proc bt_enable*(cb: BtReadyCb): cint {.cdecl.} =
     ## Enable Bluetooth. Calls `cb` when ready.
+    bleReadyCbPending = cb
     if not bleHostEnabled:
       bleHostEnabled = true
       discard bt_onchiphci_interface_init(bleHostHciEvent)
       discard hciCommandOk(HciOpReset, nil, 0)
-    if cb != nil:
-      cb(0)
+    let readyCb = bleReadyCbPending
+    bleReadyCbPending = nil
+    if readyCb != nil:
+      readyCb(0)
     0
 
   proc bt_set_name*(name: cstring): cint {.cdecl.} =
@@ -806,27 +1708,31 @@ when defined(bl808m0):
                         ad: ptr BtData, adLen: csize_t,
                         sd: ptr BtData, sdLen: csize_t): cint {.cdecl.} =
     ## Start BLE advertising.
-    discard param
-    discard ad
-    discard adLen
-    discard sd
-    discard sdLen
+    ble_adv_host_debug_stage = 0xA000'u32
     if not bleHostEnabled:
+      ble_adv_host_debug_result = 0xFFFF0001'u32
       return -1
     bleAdvActive = false
     blePeripheralConnectedNotified = false
-    when defined(bl808BleVendorLldConProbe):
+    blePeripheralIdlePolls = 0
+    when bl808BleNimConnectionEnabled:
       blePeripheralConnEventsSeen =
         blecontroller.bleNimPeripheralConnEventCount()
       blePeripheralDiscEventsSeen =
         blecontroller.bleNimPeripheralDiscEventCount()
     var advParams: array[15, uint8]
-    advParams[0] = 0xA0'u8
-    advParams[1] = 0x00'u8
-    advParams[2] = 0xA0'u8
-    advParams[3] = 0x00'u8
+    let intervalMin =
+      if param == nil: BleDefaultAdvInterval
+      else: advIntervalOrDefault(param.intervalMin)
+    let intervalMax =
+      if param == nil or param.intervalMax == 0'u16: intervalMin
+      else: advIntervalOrDefault(param.intervalMax)
+    advParams[0] = uint8(intervalMin and 0xFF'u16)
+    advParams[1] = uint8(intervalMin shr 8)
+    advParams[2] = uint8(intervalMax and 0xFF'u16)
+    advParams[3] = uint8(intervalMax shr 8)
     advParams[4] = 0x00'u8
-    when defined(bl808BleUseRandomAddr):
+    when BleUseRandomIdentity:
       if not configureRandomAddress():
         return -1
       advParams[5] = 0x01'u8
@@ -834,70 +1740,58 @@ when defined(bl808m0):
       advParams[5] = 0x00'u8
     advParams[13] = 0x07'u8
     advParams[14] = 0x00'u8
+    ble_adv_host_debug_stage = 0xA100'u32
+    ble_adv_host_debug_detail =
+      (uint32(intervalMax) shl 16) or uint32(intervalMin)
     if not hciCommandOk(HciOpLeSetAdvParams,
                         addr advParams[0],
                         advParams.len.uint8):
+      ble_adv_host_debug_result = 0xFFFF0002'u32
       return -1
 
-    var advPayload: array[32, uint8]
-    var p = 1
-    advPayload[p] = 2
-    inc p
-    advPayload[p] = 0x01
-    inc p
-    advPayload[p] = 0x06
-    inc p
-    let name = cast[ptr UncheckedArray[uint8]](addr bleNameStorage[0])
-    var nameLen = 0
-    while nameLen < 26 and name[nameLen] != 0:
-      inc nameLen
-    if nameLen > 0:
-      advPayload[p] = uint8(nameLen + 1)
-      inc p
-      advPayload[p] = 0x09
-      inc p
-      for i in 0 ..< nameLen:
-        advPayload[p] = name[i]
-        inc p
-    if adLen == 0 and p + 9 <= advPayload.len:
-      advPayload[p] = 8
-      inc p
-      advPayload[p] = 0xFF
-      inc p
-      advPayload[p] = 0xFF
-      inc p
-      advPayload[p] = 0xFF
-      inc p
-      let marker = [0x42'u8, 0x4C, 0x38, 0x30, 0x38]
-      for b in marker:
-        advPayload[p] = b
-        inc p
-    advPayload[0] = uint8(p - 1)
+    var advPayload: array[BleHciLegacyDataParamLen, uint8]
+    var scanRsp: array[BleHciLegacyDataParamLen, uint8]
+    let useDefaultSplit = adLen == 0 and sdLen == 0
+    let advOk =
+      if useDefaultSplit: encodeDefaultAdvAndScanRspData(advPayload, scanRsp)
+      elif adLen == 0: encodeDefaultAdvData(advPayload)
+      else: encodeBtData(advPayload, ad, adLen)
+    if not advOk:
+      ble_adv_host_debug_result = 0xFFFF0003'u32
+      return -1
+    ble_adv_host_debug_stage = 0xA200'u32
+    ble_adv_host_debug_detail = advPayload[0].uint32
     if not hciCommandOk(HciOpLeSetAdvData,
                         addr advPayload[0],
                         advPayload.len.uint8):
+      ble_adv_host_debug_result = 0xFFFF0004'u32
       return -1
 
-    var scanRsp: array[32, uint8]
-    p = 1
-    if nameLen > 0:
-      scanRsp[p] = uint8(nameLen + 1)
-      inc p
-      scanRsp[p] = 0x09
-      inc p
-      for i in 0 ..< nameLen:
-        scanRsp[p] = name[i]
-        inc p
-    scanRsp[0] = uint8(p - 1)
+    let scanRspOk =
+      if useDefaultSplit: true
+      elif sdLen == 0: encodeDefaultScanRspData(scanRsp)
+      else: encodeBtData(scanRsp, sd, sdLen)
+    if not scanRspOk:
+      ble_adv_host_debug_result = 0xFFFF0005'u32
+      return -1
+    ble_adv_host_debug_stage = 0xA300'u32
+    ble_adv_host_debug_detail = scanRsp[0].uint32
     if not hciCommandOk(HciOpLeSetScanRspData,
                         addr scanRsp[0],
                         scanRsp.len.uint8):
+      ble_adv_host_debug_result = 0xFFFF0006'u32
       return -1
 
     var enable = 1'u8
-    if not hciCommandOk(HciOpLeSetAdvEnable, addr enable, 1):
+    ble_adv_host_debug_stage = 0xA700'u32
+    ble_adv_host_debug_detail = cast[uint32](cast[uint](addr enable))
+    let enableOk = hciCommandOk(HciOpLeSetAdvEnable, addr enable, 1)
+    ble_adv_host_debug_stage = 0xA710'u32
+    ble_adv_host_debug_result = if enableOk: 1'u32 else: 0'u32
+    if not enableOk:
       return -1
     bleAdvActive = true
+    ble_adv_host_debug_stage = 0xA720'u32
     0
 
   proc bt_le_adv_stop*(): cint {.cdecl.} =
@@ -914,6 +1808,7 @@ when defined(bl808m0):
 
   proc bt_le_scan_start*(param: ptr BtLeScanParam,
                          cb: BtLeScanCb): cint {.cdecl.} =
+    ble_host_debug_stage = 0x5300'u32
     if not bleHostEnabled:
       return -1
     let optionalProbe = cb == nil and not bleCentralTargetActive
@@ -929,7 +1824,7 @@ when defined(bl808m0):
       if param == nil or param.interval == 0: 0x0060'u16 else: param.interval
     let window =
       if param == nil or param.window == 0: 0x0030'u16 else: param.window
-    when defined(bl808BleUseRandomAddr):
+    when BleUseRandomIdentity:
       if not configureRandomAddress():
         return -1
     scanParams[0] = scanType
@@ -937,13 +1832,14 @@ when defined(bl808m0):
     scanParams[2] = uint8(interval shr 8)
     scanParams[3] = uint8(window and 0xFF)
     scanParams[4] = uint8(window shr 8)
-    when defined(bl808BleUseRandomAddr):
+    when BleUseRandomIdentity:
       scanParams[5] = 0x01'u8
     else:
       scanParams[5] = 0x00'u8
     scanParams[6] = 0x00'u8
     when defined(bl808BleVendorLldScanProbe):
       blecontroller.bleCentralDebugMark(0x130'u32, 0)
+    ble_host_debug_stage = 0x5310'u32
     if not hciCommandOk(HciOpLeSetScanParams,
                         addr scanParams[0],
                         scanParams.len.uint8):
@@ -956,6 +1852,7 @@ when defined(bl808m0):
     when defined(bl808BleVendorLldScanProbe):
       blecontroller.bleCentralDebugMark(0x131'u32, 0)
     var enable = [0x01'u8, filterDup]
+    ble_host_debug_stage = 0x5320'u32
     when defined(bl808BleVendorLldScanProbe):
       blecontroller.bleCentralDebugMark(0x140'u32, uint32(filterDup))
     if not hciCommandOk(HciOpLeSetScanEnable, addr enable[0], enable.len.uint8):
@@ -968,6 +1865,7 @@ when defined(bl808m0):
     when defined(bl808BleVendorLldScanProbe):
       blecontroller.bleCentralDebugMark(0x141'u32, 0)
     bleScanActive = true
+    ble_host_debug_stage = 0x5330'u32
     0
 
   proc bt_le_scan_stop*(): cint {.cdecl.} =
@@ -1179,9 +2077,9 @@ when defined(bl808m0):
       case index
       of 1'u8: blecontroller.nim_vendor_init_arb_last_w1
       of 2'u8: blecontroller.nim_vendor_init_arb_last_w2
+      of 5'u8: blecontroller.nim_vendor_init_arb_last_w5
       of 7'u8: blecontroller.nim_vendor_init_arb_last_w7
-      of 24'u8: blecontroller.nim_vendor_init_arb_last_w24
-      of 28'u8: blecontroller.nim_vendor_init_arb_last_w28
+      of 11'u8: blecontroller.nim_vendor_init_arb_last_w11
       else: 0
     else:
       discard index
@@ -1301,6 +2199,76 @@ when defined(bl808m0):
     else:
       0
 
+  proc bleControllerSchProgElapsedCount*(): uint32 {.cdecl.} =
+    when not defined(bl808BleVendor):
+      when defined(bl808BleVendorLldScanProbe) and
+          blecontroller.bl808BleNimSchProg:
+        blecontroller.nim_vendor_sch_prog_elapsed_count
+      else:
+        0
+    else:
+      0
+
+  proc bleControllerSchProgLastStage*(): uint32 {.cdecl.} =
+    when not defined(bl808BleVendor):
+      when defined(bl808BleVendorLldScanProbe) and
+          blecontroller.bl808BleNimSchProg:
+        blecontroller.nim_sch_prog_last_stage
+      else:
+        0
+    else:
+      0
+
+  proc bleControllerSchProgLastTarget*(): uint32 {.cdecl.} =
+    when not defined(bl808BleVendor):
+      when defined(bl808BleVendorLldScanProbe) and
+          blecontroller.bl808BleNimSchProg:
+        blecontroller.nim_sch_prog_last_target
+      else:
+        0
+    else:
+      0
+
+  proc bleControllerSchProgLastNow*(): uint32 {.cdecl.} =
+    when not defined(bl808BleVendor):
+      when defined(bl808BleVendorLldScanProbe) and
+          blecontroller.bl808BleNimSchProg:
+        blecontroller.nim_sch_prog_last_now
+      else:
+        0
+    else:
+      0
+
+  proc bleControllerSchProgLastSlot*(): uint32 {.cdecl.} =
+    when not defined(bl808BleVendor):
+      when defined(bl808BleVendorLldScanProbe) and
+          blecontroller.bl808BleNimSchProg:
+        blecontroller.nim_sch_prog_last_slot
+      else:
+        0
+    else:
+      0
+
+  proc bleControllerSchProgLastIntMask*(): uint32 {.cdecl.} =
+    when not defined(bl808BleVendor):
+      when defined(bl808BleVendorLldScanProbe) and
+          blecontroller.bl808BleNimSchProg:
+        blecontroller.nim_sch_prog_last_intmask
+      else:
+        0
+    else:
+      0
+
+  proc bleControllerSchProgLastIntStat*(): uint32 {.cdecl.} =
+    when not defined(bl808BleVendor):
+      when defined(bl808BleVendorLldScanProbe) and
+          blecontroller.bl808BleNimSchProg:
+        blecontroller.nim_sch_prog_last_intstat
+      else:
+        0
+    else:
+      0
+
   proc bleControllerIsrCount*(): uint32 {.cdecl.} =
     when defined(bl808BleVendor):
       0
@@ -1326,31 +2294,31 @@ when defined(bl808m0):
       blecontroller.ble_dbg_stat8000_count()
 
   proc bleControllerRxCheckCount*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldConProbe) or defined(bl808BleVendorLldScanProbe):
+    when bl808BleNimConnectionEnabled or defined(bl808BleVendorLldScanProbe):
       blecontroller.nim_lld_rx_check_count
     else:
       0
 
   proc bleControllerRxCheckHitCount*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldConProbe) or defined(bl808BleVendorLldScanProbe):
+    when bl808BleNimConnectionEnabled or defined(bl808BleVendorLldScanProbe):
       blecontroller.nim_lld_rx_check_hit_count
     else:
       0
 
   proc bleControllerRxFreeCount*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldConProbe) or defined(bl808BleVendorLldScanProbe):
+    when bl808BleNimConnectionEnabled or defined(bl808BleVendorLldScanProbe):
       blecontroller.nim_lld_rx_free_count
     else:
       0
 
   proc bleControllerRxLastStatus*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldConProbe) or defined(bl808BleVendorLldScanProbe):
+    when bl808BleNimConnectionEnabled or defined(bl808BleVendorLldScanProbe):
       blecontroller.nim_lld_rx_last_status
     else:
       0
 
   proc bleControllerRxLastHeader*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldConProbe) or defined(bl808BleVendorLldScanProbe):
+    when bl808BleNimConnectionEnabled or defined(bl808BleVendorLldScanProbe):
       blecontroller.nim_lld_rx_last_header
     else:
       0
@@ -1377,7 +2345,10 @@ when defined(bl808m0):
 
   proc bt_conn_create_le*(peer: ptr BtAddrLe,
                           param: ptr BtLeConnParam): ptr BtConn {.cdecl.} =
+    ble_central_debug_stage = 0x5400'u32
+    inc ble_central_debug_create_count
     if not bleHostEnabled or peer == nil:
+      ble_central_debug_create_result = 0xFFFFFFFE'u32
       return nil
     var connParams: array[25, uint8]
     let intervalMin =
@@ -1388,17 +2359,18 @@ when defined(bl808m0):
       if param == nil: 0'u16 else: param.latency
     let timeout =
       if param == nil or param.timeout == 0: 400'u16 else: param.timeout
-    connParams[0] = 0x60'u8
-    connParams[1] = 0x00'u8
-    connParams[2] = 0x30'u8
-    connParams[3] = 0x00'u8
+    connParams[0] = uint8(BleCentralConnectScanInterval and 0xFF'u16)
+    connParams[1] = uint8(BleCentralConnectScanInterval shr 8)
+    connParams[2] = uint8(BleCentralConnectScanWindow and 0xFF'u16)
+    connParams[3] = uint8(BleCentralConnectScanWindow shr 8)
     connParams[4] = 0x00'u8
     connParams[5] = peer.addrType
     for i in 0 ..< peer.a.len:
       connParams[6 + i] = peer.a[i]
-    when defined(bl808BleUseRandomAddr):
+    when BleUseRandomIdentity:
       if not configureRandomAddress():
         bleConnPending = false
+        bleConnConnectedNotified = false
         return nil
       connParams[12] = 0x01'u8
     else:
@@ -1417,12 +2389,16 @@ when defined(bl808m0):
     connParams[24] = 0x00'u8
     bleConn = BtConn(peer: peer[], status: 0xFF'u8)
     bleConnPending = true
+    bleConnConnectedNotified = false
     bleCentralConnected = false
     if not hciCommandOk(HciOpLeCreateConnection,
                         addr connParams[0],
                         connParams.len.uint8):
       bleConnPending = false
+      bleConnConnectedNotified = false
+      ble_central_debug_create_result = 0xFFFFFFFF'u32
       return nil
+    ble_central_debug_create_result = 0
     addr bleConn
 
   proc bt_conn_disconnect*(conn: ptr BtConn, reason: uint8): cint {.cdecl.} =
@@ -1436,6 +2412,45 @@ when defined(bl808m0):
       return -1
     0
 
+  proc centralConnectAttemptBudget(timeoutMs: uint32): uint32 =
+    let configured =
+      if BleCentralConnectAttemptMs <= 0:
+        timeoutMs
+      else:
+        uint32(BleCentralConnectAttemptMs)
+    if configured == 0'u32 or configured > timeoutMs:
+      timeoutMs
+    else:
+      configured
+
+  proc shouldRetryKnownCentralPeer(addrType: uint8, retries: uint32): bool =
+    ## A resolved address is only a snapshot of the advertiser we saw.  The
+    ## default is to rediscover by name after each failed attempt; board-specific
+    ## diagnostics can still raise BleCentralPeerConnectRetries when debugging a
+    ## stable peer address.
+    discard addrType
+    retries < uint32(max(BleCentralPeerConnectRetries, 0))
+
+  proc noteKnownCentralPeerRetry(retries: var uint32) =
+    if retries != high(uint32):
+      inc retries
+
+  proc pollCentralController() =
+    when defined(bl808BleVendor):
+      blecontroller.bleBlobPoll(32)
+      drainHciHostEvents()
+    else:
+      const iterations = max(BleCentralPollIterations, 1)
+      for _ in 0 ..< iterations:
+        blecontroller.bflbble_isr()
+        blecontroller.bleControllerDrainScanReports()
+        drainHciHostEvents()
+        blecontroller.bflbip_schedule()
+        when bl808BleNimPureCentral:
+          blecontroller.bleControllerServiceScan()
+        blecontroller.bleControllerDrainScanReports()
+        drainHciHostEvents()
+
   proc copyCentralTargetName(name: cstring) =
     for i in 0 ..< bleCentralTargetName.len:
       bleCentralTargetName[i] = '\0'
@@ -1447,14 +2462,11 @@ when defined(bl808m0):
       bleCentralTargetName[i] = src[i]
       inc i
 
-  proc bleCentralConnectByName*(name: cstring,
-                                timeoutMs: uint32 = 20_000): cint {.cdecl.} =
-    if not bleHostEnabled:
-      return -1
+  proc resetCentralDiscoveryState(name: cstring, acceptAnyReport = false) =
     copyCentralTargetName(name)
     bleCentralTargetActive = true
+    bleCentralAcceptAnyReport = acceptAnyReport
     bleCentralPeerFound = false
-    bleCentralConnected = false
     bleScanReportCounter = 0
     bleScanNameMatchCounter = 0
     bleScanMatchedEventType = 0
@@ -1464,66 +2476,203 @@ when defined(bl808m0):
       bleScanMatchedAddr[i] = 0
     for i in 0 ..< bleScanMatchedData.len:
       bleScanMatchedData[i] = 0
-    bleConnPending = false
-    var scanParam = BtLeScanParam(
-      scanType: 0x01'u8,
-      filterDup: 0x00'u8,
-      interval: 0x0060'u16,
-      window: 0x0030'u16,
-    )
+
+  proc centralDiscoveryScanType(): uint8 =
+    if BleCentralDiscoveryActiveScan: 0x01'u8 else: 0x00'u8
+
+  proc monotonicMs(): uint64 {.inline.} =
+    ticksToMs(readTick())
+
+  proc elapsedMsSince(startedAtMs: uint64): uint32 =
+    let elapsed = monotonicMs() - startedAtMs
+    if elapsed > high(uint32).uint64:
+      high(uint32)
+    else:
+      elapsed.uint32
+
+  proc startCentralDiscoveryScan(scanParam: var BtLeScanParam,
+                                 timeoutMs: uint32,
+                                 mark: uint32): bool =
     when defined(bl808BleVendorLldScanProbe):
-      blecontroller.bleCentralDebugMark(0x100'u32, timeoutMs)
+      blecontroller.bleCentralDebugMark(mark, timeoutMs)
     let scanStartRc = bt_le_scan_start(addr scanParam, nil)
     if scanStartRc != 0:
       when defined(bl808BleVendorLldScanProbe):
         bleProbeTraceWord(52'u32, cast[uint32](scanStartRc))
         blecontroller.bleCentralDebugMark(0x1FF'u32, bleScanStartDiag)
+      return false
+    true
+
+  proc restartCentralDiscoveryScan(scanParam: var BtLeScanParam,
+                                   timeoutMs: uint32,
+                                   mark: uint32,
+                                   peerConnectRetries: var uint32): bool =
+    peerConnectRetries = 0
+    bleCentralPeerFound = false
+    bleCentralTargetActive = true
+    if not startCentralDiscoveryScan(scanParam, timeoutMs, mark):
+      bleCentralTargetActive = false
+      return false
+    true
+
+  proc stopDiscoveryScanBeforeConnect(): bool =
+    when bl808BleNimPureCentral:
+      # LE Create Connection takes over the scheduler and resets the pure
+      # scan/initiator rings. Keep the host's scan state in sync without an
+      # extra HCI command between the observed advert and CONNECT_IND.
+      if bleScanActive:
+        bleScanActive = false
+        bleScanCb = nil
+      true
+    else:
+      bt_le_scan_stop() == 0
+
+  proc bleCentralScanTarget(name: cstring, timeoutMs: uint32,
+                            acceptAnyReport: bool): cint =
+    if not bleHostEnabled:
       return -1
+    resetCentralDiscoveryState(name, acceptAnyReport)
+    var scanParam = BtLeScanParam(
+      scanType: centralDiscoveryScanType(),
+      filterDup: 0x00'u8,
+      interval: BleCentralDiscoveryScanInterval,
+      window: BleCentralDiscoveryScanWindow,
+    )
+    let scanStartRc = bt_le_scan_start(addr scanParam, nil)
+    if scanStartRc != 0:
+      bleCentralTargetActive = false
+      return -1
+    let startedAtMs = monotonicMs()
+
+    while elapsedMsSince(startedAtMs) < timeoutMs:
+      pollCentralController()
+      when not defined(bl808BleVendor):
+        synthesizeCentralReportIfNeeded()
+      if bleCentralPeerFound:
+        discard bt_le_scan_stop()
+        bleCentralTargetActive = false
+        bleCentralAcceptAnyReport = false
+        return 0
+      delayUs(1000)
+    discard bt_le_scan_stop()
+    bleCentralTargetActive = false
+    bleCentralAcceptAnyReport = false
+    -1
+
+  proc bleCentralScanByName*(name: cstring,
+                             timeoutMs: uint32 = 20_000): cint {.cdecl.} =
+    bleCentralScanTarget(name, timeoutMs, false)
+
+  proc bleCentralScanAnyReport*(timeoutMs: uint32 = 20_000): cint {.cdecl.} =
+    bleCentralScanTarget("".cstring, timeoutMs, true)
+
+  proc bleCentralConnectByName*(name: cstring,
+                                timeoutMs: uint32 = 20_000): cint {.cdecl.} =
+    ble_central_debug_stage = 0x5500'u32
+    ble_central_debug_timeout = timeoutMs
+    ble_central_debug_waited = 0
+    ble_central_debug_flags = 0
+    if not bleHostEnabled:
+      return -1
+    resetCentralDiscoveryState(name)
+    bleCentralConnected = false
+    bleConnPending = false
+    bleConnConnectedNotified = false
+    var scanParam = BtLeScanParam(
+      scanType: centralDiscoveryScanType(),
+      filterDup: 0x00'u8,
+      interval: BleCentralDiscoveryScanInterval,
+      window: BleCentralDiscoveryScanWindow,
+    )
+    if not startCentralDiscoveryScan(scanParam, timeoutMs, 0x100'u32):
+      return -1
+    ble_central_debug_stage = 0x5510'u32
     when defined(bl808BleVendorLldScanProbe):
       blecontroller.bleCentralDebugMark(0x110'u32, 0)
-    var waited = 0'u32
     var connectStarted = false
-    while waited < timeoutMs:
-      when defined(bl808BleVendor):
-        blecontroller.bleBlobPoll(32)
+    var connectStartedAt = 0'u32
+    var retryKnownPeerPending = false
+    var peerConnectRetries = 0'u32
+    let attemptBudget = centralConnectAttemptBudget(timeoutMs)
+    let startedAtMs = monotonicMs()
+    var nextScanRestartMs =
+      if bl808BleCentralScanRestartMs <= 0:
+        0'u32
       else:
+        uint32(bl808BleCentralScanRestartMs)
+
+    while true:
+      let waited = elapsedMsSince(startedAtMs)
+      ble_central_debug_waited = waited
+      if waited >= timeoutMs:
+        break
+      pollCentralController()
+      ble_central_debug_flags =
+        (if bleCentralPeerFound: 1'u32 else: 0'u32) or
+        (if connectStarted: 2'u32 else: 0'u32) or
+        (if bleConnPending: 4'u32 else: 0'u32) or
+        (if bleCentralConnected: 8'u32 else: 0'u32)
+      when defined(bl808BleVendorLldScanProbe):
+        if nextScanRestartMs != 0'u32 and waited >= nextScanRestartMs and
+            not bleCentralPeerFound and not connectStarted:
+          discard blecontroller.ble_scan_probe_restart()
+          nextScanRestartMs = waited + uint32(bl808BleCentralScanRestartMs)
+      when not defined(bl808BleVendor):
         when defined(bl808BleVendorLldScanProbe):
           blecontroller.bleCentralDebugMark(0x120'u32, waited)
-          blecontroller.bflbble_isr()
-          blecontroller.bleCentralDebugMark(0x121'u32, waited)
-          when defined(bl808BleVendorLldInitProbe) and
-              defined(bl808BleVendorInitPeerComplete):
-            if connectStarted:
-              blecontroller.bleCentralDebugMark(0x400'u32, waited)
-              if blecontroller.ble_init_probe_service_peer_complete() != 0'u8:
-                blecontroller.bleCentralDebugMark(0x401'u32, waited)
-                bleConn.status = 0
-                bleConn.handle = 0
-                bleConn.role = 0
-                bleConn.peer = bleCentralPeer
-                bleConnPending = false
-                bleConnActive = true
-                bleAdvActive = false
-                bleCentralConnected = true
-                notifyConnected(0)
-          when bl808BleCentralScanRestartMs > 0:
-            if waited != 0'u32 and
-                (waited mod uint32(bl808BleCentralScanRestartMs)) == 0'u32 and
-                not bleCentralPeerFound:
-              discard blecontroller.ble_scan_probe_restart()
         if waited >= 250'u32:
           synthesizeCentralReportIfNeeded()
       if bleCentralConnected:
+        if not bleConnConnectedNotified:
+          notifyConnected(bleConn.status)
         return 0
+      when defined(BleCentralReturnAfterHandoffForSnapshot):
+        when bl808BleNimPureCentral:
+          if blecontroller.nim_init_handoff_pending != 0'u32 or
+              blecontroller.nim_init_total_start_count != 0'u32:
+            ble_central_debug_stage = 0x55E0'u32
+            return -1
+      if connectStarted and not bleConnPending and not bleCentralConnected:
+        connectStarted = false
+        if shouldRetryKnownCentralPeer(bleCentralPeer.addrType,
+                                       peerConnectRetries):
+          noteKnownCentralPeerRetry(peerConnectRetries)
+          retryKnownPeerPending = true
+          bleCentralPeerFound = true
+          bleCentralTargetActive = false
+        else:
+          if waited >= timeoutMs or not restartCentralDiscoveryScan(
+              scanParam, timeoutMs, 0x510'u32, peerConnectRetries):
+            return -1
+      if connectStarted and attemptBudget != 0'u32 and
+          ((waited - connectStartedAt) >= attemptBudget):
+        when defined(bl808BleVendorLldScanProbe):
+          blecontroller.bleCentralDebugMark(0x520'u32, waited)
+        discard hciCommandOk(HciOpLeCreateConnectionCancel, nil, 0)
+        connectStarted = false
+        bleConnPending = false
+        bleConnConnectedNotified = false
+        if shouldRetryKnownCentralPeer(bleCentralPeer.addrType,
+                                       peerConnectRetries):
+          noteKnownCentralPeerRetry(peerConnectRetries)
+          retryKnownPeerPending = true
+          bleCentralPeerFound = true
+          bleCentralTargetActive = false
+        else:
+          if waited >= timeoutMs or not restartCentralDiscoveryScan(
+              scanParam, timeoutMs, 0x521'u32, peerConnectRetries):
+            return -1
       if bleCentralPeerFound and not connectStarted:
+        ble_central_debug_stage = 0x5520'u32
         when defined(bl808BleVendorLldScanProbe):
           blecontroller.bleCentralDebugMark(0x200'u32, waited)
-        discard bt_le_scan_stop()
+        discard stopDiscoveryScanBeforeConnect()
+        ble_central_debug_stage = 0x5530'u32
         when defined(bl808BleVendorLldScanProbe):
           blecontroller.bleCentralDebugMark(0x211'u32, waited)
         when not defined(bl808BleVendor):
           when defined(bl808BleVendorLldScanProbe):
-            for drainIdx in 0 ..< 20:
+            for drainIdx in 0 ..< max(BleCentralPostScanDrainPolls, 0):
               blecontroller.bleCentralDebugMark(0x220'u32, drainIdx.uint32)
               blecontroller.bflbble_isr()
               blecontroller.bleCentralDebugMark(0x221'u32, drainIdx.uint32)
@@ -1537,25 +2686,43 @@ when defined(bl808m0):
         when defined(bl808BleVendorLldScanProbe):
           blecontroller.bleCentralDebugMark(0x300'u32, waited)
         if bt_conn_create_le(addr bleCentralPeer, addr connParam) == nil:
+          ble_central_debug_stage = 0x55F0'u32
           when defined(bl808BleVendorLldScanProbe):
             blecontroller.bleCentralDebugMark(0x3FF'u32, waited)
           bleCentralTargetActive = false
+          bleCentralAcceptAnyReport = false
           bleConnPending = false
+          bleConnConnectedNotified = false
           return -1
+        bleCentralTargetActive = false
+        bleCentralAcceptAnyReport = false
+        ble_central_debug_stage = 0x5540'u32
         when defined(bl808BleVendorLldScanProbe):
           blecontroller.bleCentralDebugMark(0x301'u32, waited)
+        if not retryKnownPeerPending:
+          peerConnectRetries = 0
+        retryKnownPeerPending = false
         connectStarted = true
+        connectStartedAt = waited
+        ble_central_debug_flags =
+          (if bleCentralPeerFound: 1'u32 else: 0'u32) or
+          (if connectStarted: 2'u32 else: 0'u32) or
+          (if bleConnPending: 4'u32 else: 0'u32) or
+          (if bleCentralConnected: 8'u32 else: 0'u32)
       delayUs(1000)
-      inc waited
+    let finalWaited = elapsedMsSince(startedAtMs)
+    ble_central_debug_stage = 0x5560'u32
+    ble_central_debug_waited = finalWaited
     if connectStarted:
       when defined(bl808BleVendorLldScanProbe):
-        blecontroller.bleCentralDebugMark(0x500'u32, waited)
+        blecontroller.bleCentralDebugMark(0x500'u32, finalWaited)
       discard hciCommandOk(HciOpLeCreateConnectionCancel, nil, 0)
     else:
       when defined(bl808BleVendorLldScanProbe):
-        blecontroller.bleCentralDebugMark(0x501'u32, waited)
+        blecontroller.bleCentralDebugMark(0x501'u32, finalWaited)
       discard bt_le_scan_stop()
     bleCentralTargetActive = false
+    bleCentralAcceptAnyReport = false
     -1
 
   proc bleDisconnectCurrent*(reason: uint8 = 0x13'u8,
@@ -1564,10 +2731,15 @@ when defined(bl808m0):
       return 0
     if bt_conn_disconnect(addr bleConn, reason) != 0:
       return -1
+    drainHciHostEvents()
+    if not bleConnActive:
+      return 0
     var waited = 0'u32
     while waited < timeoutMs:
       when defined(bl808BleVendor):
-        blecontroller.bleBlobPoll(32)
+        pollCentralController()
+      else:
+        drainHciHostEvents()
       if not bleConnActive:
         return 0
       delayUs(1000)
@@ -1629,6 +2801,15 @@ when defined(bl808m0):
 
   proc bleStopAdvertising*(): BleError =
     let rc = bt_le_adv_stop()
+    if rc == 0: bleOk else: bleFail
+
+  proc bleCentralScan*(name: string,
+                       timeoutMs: uint32 = 20_000): BleError =
+    let rc = bleCentralScanByName(name.cstring, timeoutMs)
+    if rc == 0: bleOk else: bleFail
+
+  proc bleCentralScanAny*(timeoutMs: uint32 = 20_000): BleError =
+    let rc = bleCentralScanAnyReport(timeoutMs)
     if rc == 0: bleOk else: bleFail
 
   proc bleCentralConnect*(name: string,

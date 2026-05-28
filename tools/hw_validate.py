@@ -8,11 +8,13 @@ OpenOCD for reset/run control plus failure snapshots.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import glob
 import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import struct
@@ -38,6 +40,9 @@ JTAG_FLASH_STUB_SOURCE = REPO_ROOT / "tools" / "jtag_flash_stub.c"
 JTAG_FLASH_STUB_LINKER = REPO_ROOT / "tools" / "jtag_flash_stub.ld"
 UART_FLASH_ANCHOR_SOURCE = REPO_ROOT / "tools" / "uart_flash_anchor.c"
 UART_FLASH_ANCHOR_LINKER = REPO_ROOT / "tools" / "uart_flash_anchor.ld"
+BLE_VENDOR_PROBE_DIR = REPO_ROOT / "build" / "inspect" / "btble_bl808_lib"
+BLE_VENDOR_LLD_CON_PROBE_LLCP = BLE_VENDOR_PROBE_DIR / "lld_con_probe_llcp.o"
+BLE_VENDOR_LLD_CON_PROBE_NIMWRAP = BLE_VENDOR_PROBE_DIR / "lld_con_probe_llcp_nimwrap.o"
 JTAG_FLASH_STUB_ENTRY = 0x22020000
 JTAG_FLASH_STUB_END = 0x2204F000
 UART_FLASH_ANCHOR_ENTRY = 0x62020000
@@ -78,10 +83,12 @@ UART_FLASH_CMD_PING = 0
 UART_FLASH_CMD_READ_ID = 1
 UART_FLASH_CMD_ERASE = 2
 UART_FLASH_CMD_WRITE_VERIFY = 3
+UART_FLASH_CMD_REBOOT = 4
 UART_FLASH_DEBUG_BASE = 0x2204C020
 UART_FLASH_DEBUG_STATUS_BUSY = 0xFFFFFFFF
 UART_FLASH_BANNER = b"BL808-UART-FLASH-ANCHOR v1\r\n"
 JTAG_MEMORY_LOG_MAGIC = 0x474C544A
+SERIAL_CAPTURE_OPEN_SETTLE_S = 0.25
 UART_FLASH_STATUS_NAMES = {
     0: "ok",
     1: "bad command",
@@ -115,6 +122,46 @@ class TestResult:
     ok: bool
     elapsed: float
     reason: str
+
+
+class HardwareRunLock:
+    def __init__(self, path: Path):
+        self.path = path
+        self.file: Any | None = None
+
+    def __enter__(self) -> "HardwareRunLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.file = self.path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(self.file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            self.file.seek(0)
+            holder = self.file.read().strip() or "unknown holder"
+            self.file.close()
+            self.file = None
+            raise RuntimeError(
+                f"hardware validation is already running; lock={self.path}; {holder}"
+            ) from exc
+
+        self.file.seek(0)
+        self.file.truncate()
+        self.file.write(
+            f"pid={os.getpid()} cwd={Path.cwd()} cmd={shlex.join(sys.argv)}\n"
+        )
+        self.file.flush()
+        os.fsync(self.file.fileno())
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self.file is None:
+            return
+        try:
+            self.file.seek(0)
+            self.file.truncate()
+            fcntl.flock(self.file.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.file.close()
+            self.file = None
 
 
 @dataclass
@@ -379,10 +426,22 @@ def parse_args() -> argparse.Namespace:
                             "M0 UART anchor, then stream persistent SPI flash data over "
                             "the normal UART pins."
                         ))
+    parser.add_argument("--uart-anchor-existing", action="store_true",
+                        help=(
+                            "Use an already-running M0 UART flash anchor instead of "
+                            "loading the anchor over JTAG. This requires UART ack mode "
+                            "and pairs with --uart-anchor-reset-after-flash when runtime "
+                            "JTAG/nSRST is unavailable."
+                        ))
     parser.add_argument("--uart-anchor-probe", action="store_true",
                         help=(
                             "Load the M0 UART flash anchor, verify ping/read-id, and exit "
                             "without erasing or writing SPI flash."
+                        ))
+    parser.add_argument("--uart-anchor-build-only", action="store_true",
+                        help=(
+                            "Build the M0 UART flash anchor and a persistent boot2 flash "
+                            "image for recovery/install, then exit without touching hardware."
                         ))
     parser.add_argument("--uart-anchor-flash-image", type=Path, default=None,
                         help=(
@@ -412,8 +471,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--jtag-flash-reset-capture", action="store_true",
                         help=(
                             "With --jtag-flash, run the flashed image by pulsing target nSRST "
-                            "and capture UART/host actions without a post-flash OpenOCD attach. "
-                            "This keeps JTAG flashing but avoids runtime halt/poll/snapshot."
+                            "before UART/host capture. Runtime JTAG remains attached by default "
+                            "so failure snapshots are available; set jtag_flash_runtime_jtag=false "
+                            "in a manifest entry only when the run must be isolated from OpenOCD."
+                        ))
+    parser.add_argument("--jtag-flash-runtime-jtag", action="store_true",
+                        help=(
+                            "Compatibility flag for --jtag-flash reset-capture tests. Runtime JTAG "
+                            "is already kept by default; this option explicitly requests the same "
+                            "behavior for older commands or manifest opt-outs."
                         ))
     parser.add_argument("--jtag-flash-chunk-size", type=int, default=JTAG_FLASH_MAX_CHUNK,
                         help=(
@@ -437,6 +503,11 @@ def parse_args() -> argparse.Namespace:
                             "After --uart-anchor-flash, reattach runtime JTAG instead of "
                             "skipping it. Useful with --jtag-memory-log when UART TX is not "
                             "visible to the host."
+                        ))
+    parser.add_argument("--uart-anchor-reset-after-flash", action="store_true",
+                        help=(
+                            "After --uart-anchor-flash succeeds, ask the M0 UART anchor "
+                            "to reboot the chip instead of relying on nSRST or a manual reset."
                         ))
     parser.add_argument("--jtag-memory-log", action="store_true",
                         help=(
@@ -675,6 +746,47 @@ def run_logged(
     return proc
 
 
+def prepare_ble_vendor_lld_con_probe(
+    *,
+    defines: dict[str, str],
+    objcopy: str,
+    work_dir: Path,
+    dry_run: bool,
+) -> Path | None:
+    if "bl808BleVendorLldConProbe" not in defines:
+        return None
+    if defines.get("bl808BleNimPureConnection") == "1":
+        return None
+    if "bl808BleVendorManualConnTx" not in defines:
+        return None
+
+    source = BLE_VENDOR_LLD_CON_PROBE_LLCP
+    output = BLE_VENDOR_LLD_CON_PROBE_NIMWRAP
+    if not source.exists() and not dry_run:
+        raise RuntimeError(f"missing BLE vendor connection probe object: {source}")
+    if not dry_run and output.exists() and output.stat().st_mtime >= source.stat().st_mtime:
+        return output
+
+    ensure_parent(output)
+    cmd = [
+        objcopy,
+        "--redefine-sym",
+        "lld_con_data_tx=vendor_lld_con_data_tx",
+        "--redefine-sym",
+        "lld_con_llcp_tx=vendor_lld_con_llcp_tx",
+        str(source),
+        str(output),
+    ]
+    run_checked(
+        cmd,
+        cwd=REPO_ROOT,
+        log_path=work_dir / "logs" / "ble_vendor_lld_con_probe_nimwrap.objcopy.log",
+        dry_run=dry_run,
+        env=harness_env(),
+    )
+    return output
+
+
 def host_action_command(action: dict[str, Any]) -> list[str]:
     raw = action.get("cmd")
     if not isinstance(raw, list) or not raw:
@@ -684,6 +796,16 @@ def host_action_command(action: dict[str, Any]) -> list[str]:
         text = str(part)
         cmd.append(sys.executable if text == "{python}" else text)
     return cmd
+
+
+def host_action_env() -> dict[str, str]:
+    env = harness_env()
+    # CoreBluetooth privacy authorization is attached to the helper app bundle.
+    # Launch through LaunchServices by default so host actions exercise the same
+    # TCC identity as manual validation runs. Developers can still override this
+    # for local debugging with BL808_MACOS_BLE_HELPER_LAUNCH=direct.
+    env.setdefault("BL808_MACOS_BLE_HELPER_LAUNCH", "open")
+    return env
 
 
 def run_host_action(
@@ -704,6 +826,7 @@ def run_host_action(
         cwd=REPO_ROOT,
         log_path=log_path,
         timeout=timeout_s,
+        env=host_action_env(),
     )
     output = proc.stdout
     if proc.returncode != 0:
@@ -753,6 +876,7 @@ def start_host_action(
         text=True,
         stdout=log_file,
         stderr=subprocess.STDOUT,
+        env=host_action_env(),
     )
     return RunningHostAction(
         index=index,
@@ -772,8 +896,12 @@ def read_running_host_action_output(running: RunningHostAction) -> str:
 
 def stop_host_action(running: RunningHostAction) -> str:
     if running.proc.poll() is None:
-        running.proc.kill()
-        running.proc.wait()
+        running.proc.terminate()
+        try:
+            running.proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            running.proc.kill()
+            running.proc.wait()
     if not running.log_file.closed:
         running.log_file.close()
     return running.log_path.read_text(encoding="utf-8", errors="replace")
@@ -1260,7 +1388,12 @@ class SerialCapture:
             self._log.close()
 
 
-def elf_symbol_addresses(elf: Path, symbols: list[str]) -> dict[str, int]:
+def elf_symbol_addresses(
+    elf: Path,
+    symbols: list[str],
+    *,
+    required: bool = True,
+) -> dict[str, int]:
     nm = shutil.which("riscv64-unknown-elf-nm") or shutil.which("riscv32-unknown-elf-nm")
     if nm is None:
         raise RuntimeError("riscv64-unknown-elf-nm not found for JTAG memory log")
@@ -1283,7 +1416,7 @@ def elf_symbol_addresses(elf: Path, symbols: list[str]) -> dict[str, int]:
             except ValueError:
                 continue
     missing = [symbol for symbol in symbols if symbol not in found]
-    if missing:
+    if required and missing:
         raise RuntimeError(f"{elf} is missing JTAG memory log symbols {missing!r}")
     return found
 
@@ -1595,6 +1728,13 @@ def build_firmware(
             item.get("defines", {}),
             parse_cli_nim_defines(args.nim_define),
         )
+        if core == "bl808m0":
+            prepare_ble_vendor_lld_con_probe(
+                defines=defines,
+                objcopy=objcopy_rv32,
+                work_dir=work_dir,
+                dry_run=args.dry_run,
+            )
         for name, value in sorted(defines.items()):
             nim_cmd.insert(4, f"-d:{name}={value}")
         if args.jtag_load and core in ("bl808m0", "bl808d0", "bl808lp"):
@@ -1872,6 +2012,47 @@ def build_m0_jtag_flash_segments(
     ]
 
 
+def build_compact_flash_image(segments: list[JtagFlashSegment]) -> bytes:
+    if not segments:
+        raise RuntimeError("cannot build compact flash image without segments")
+    flash_size = 0
+    payloads: list[tuple[int, bytes, str]] = []
+    for segment in segments:
+        data = segment.path.read_bytes()
+        if not data:
+            raise RuntimeError(f"flash segment is empty: {segment.path}")
+        end = segment.address + len(data)
+        flash_size = max(flash_size, end)
+        payloads.append((segment.address, data, segment.label))
+
+    flash = bytearray(b"\xFF" * flash_size)
+    for address, data, label in payloads:
+        end = address + len(data)
+        if flash[address:end] != b"\xFF" * len(data):
+            raise RuntimeError(f"overlapping flash segment: {label}")
+        flash[address:end] = data
+    return bytes(flash)
+
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def find_unique_payload_offset(image: bytes, payload: bytes, *, label: str) -> int:
+    if not payload:
+        raise RuntimeError(f"{label} payload is empty")
+    offset = image.find(payload)
+    if offset < 0:
+        raise RuntimeError(f"{label} payload was not found in compact flash image")
+    duplicate = image.find(payload, offset + 1)
+    if duplicate >= 0:
+        raise RuntimeError(
+            f"{label} payload appears multiple times in compact flash image "
+            f"(0x{offset:X}, 0x{duplicate:X})"
+        )
+    return offset
+
+
 def jtag_flash_segments_for_outputs(
     test: dict[str, Any],
     *,
@@ -1967,6 +2148,36 @@ def parse_openocd_words(text: str, address: int, count: int) -> list[int]:
             f"could not parse {count} OpenOCD words for 0x{address:08X}: {text!r}"
         )
     return words[:count]
+
+
+def jtag_snapshot_symbol_names(commands: list[str]) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for command in commands:
+        for match in re.finditer(r"\{sym:([^}]+)\}", command):
+            name = match.group(1)
+            if name not in seen:
+                names.append(name)
+                seen.add(name)
+    return names
+
+
+def expand_jtag_snapshot_command(command: str, symbols: dict[str, int]) -> str:
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if name not in symbols:
+            raise RuntimeError(f"missing JTAG snapshot symbol {name!r}")
+        return f"0x{symbols[name]:08X}"
+
+    return re.sub(r"\{sym:([^}]+)\}", replace, command)
+
+
+def missing_jtag_snapshot_symbols(command: str, symbols: dict[str, int]) -> list[str]:
+    return [
+        match.group(1)
+        for match in re.finditer(r"\{sym:([^}]+)\}", command)
+        if match.group(1) not in symbols
+    ]
 
 
 def jtag_flash_read32(session: OpenOcdSession, address: int) -> int:
@@ -2664,13 +2875,15 @@ def uart_flash_anchor_ping_until_ready_jtag(
 def select_uart_flash_anchor_ack_mode(
     args: argparse.Namespace,
     ser: Any,
-    session: OpenOcdSession,
+    session: OpenOcdSession | None,
     *,
     log_path: Path,
     prefix: str,
 ) -> str:
     requested = str(getattr(args, "uart_anchor_ack_mode", "auto"))
     if requested == "jtag":
+        if session is None:
+            raise RuntimeError("UART anchor JTAG ack mode requires an OpenOCD session")
         version = uart_flash_anchor_ping_until_ready_jtag(ser, session, timeout_s=10)
         if version != 1:
             raise RuntimeError(f"unexpected UART flash anchor version via JTAG ack: {version}")
@@ -2686,6 +2899,11 @@ def select_uart_flash_anchor_ack_mode(
     except Exception as uart_exc:
         if requested == "uart":
             raise
+        if session is None:
+            raise RuntimeError(
+                f"{prefix} UART ack failed and no OpenOCD session is available "
+                f"for JTAG ack fallback: {uart_exc}"
+            ) from uart_exc
         append_log(
             log_path,
             f"\n# {prefix} UART anchor UART ack failed; trying JTAG ack: {uart_exc}\n",
@@ -2760,6 +2978,27 @@ def uart_anchor_flash_program_segment(
             print(f"  wrote 0x{written:X}/0x{len(data):X}")
 
 
+def uart_anchor_request_reboot(
+    ser: Any,
+    *,
+    args: argparse.Namespace,
+    session: OpenOcdSession | None = None,
+    ack_mode: str = "uart",
+) -> None:
+    if args.dry_run:
+        print("DRY-RUN: UART-anchor reboot target after flash")
+        return
+    uart_flash_anchor_command_checked(
+        ser,
+        UART_FLASH_CMD_REBOOT,
+        session=session,
+        ack_mode=ack_mode,
+        timeout_s=5,
+        attempts=3,
+    )
+    print("UART anchor reboot requested", flush=True)
+
+
 def flash_firmware_over_uart_anchor(
     test: dict[str, Any],
     *,
@@ -2785,17 +3024,24 @@ def flash_firmware_over_uart_anchor(
     anchor_args = argparse.Namespace(**vars(args))
     anchor_args.jtag_core = "m0"
 
-    anchor = build_uart_flash_anchor(
-        args=anchor_args,
-        work_dir=work_dir,
-        test_name=test["name"],
-        flash_baud=flash_baud,
-    )
+    anchor: Path | None = None
+    if not args.uart_anchor_existing:
+        anchor = build_uart_flash_anchor(
+            args=anchor_args,
+            work_dir=work_dir,
+            test_name=test["name"],
+            flash_baud=flash_baud,
+        )
 
     if args.dry_run:
-        print(f"DRY-RUN: open UART flash anchor port {flash_port} at {flash_baud}")
+        if args.uart_anchor_existing:
+            print(f"DRY-RUN: use existing UART flash anchor on {flash_port} at {flash_baud}")
+        else:
+            print(f"DRY-RUN: open UART flash anchor port {flash_port} at {flash_baud}")
         for segment in segments:
             uart_anchor_flash_program_segment(None, segment, args=anchor_args)
+        if args.uart_anchor_reset_after_flash:
+            uart_anchor_request_reboot(None, args=anchor_args)
         return
 
     try:
@@ -2809,6 +3055,58 @@ def flash_firmware_over_uart_anchor(
     ser: Any | None = None
     session: OpenOcdSession | None = None
     try:
+        if args.uart_anchor_existing:
+            anchor_log_path = work_dir / "logs" / f"{test['name']}.uart-anchor-existing.log"
+            append_log(
+                anchor_log_path,
+                "\n# use existing UART flash anchor; no JTAG load/reset performed\n",
+            )
+            ser = open_serial_device(
+                serial,
+                port=flash_port,
+                baud=flash_baud,
+                timeout=0.05,
+                write_timeout=10,
+                dtr=dtr,
+                rts=rts,
+            )
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+            serial_drain_until_quiet(ser, quiet_s=0.15, timeout_s=1.0)
+            ack_mode = select_uart_flash_anchor_ack_mode(
+                args,
+                ser,
+                None,
+                log_path=anchor_log_path,
+                prefix="existing UART flash anchor",
+            )
+            jedec, _ = uart_flash_anchor_command_checked(
+                ser,
+                UART_FLASH_CMD_READ_ID,
+                session=None,
+                ack_mode=ack_mode,
+                timeout_s=5,
+                attempts=3,
+            )
+            print(f"UART anchor flash JEDEC ID: 0x{jedec:06X}")
+            for segment in segments:
+                uart_anchor_flash_program_segment(
+                    ser,
+                    segment,
+                    args=anchor_args,
+                    session=None,
+                    ack_mode=ack_mode,
+                )
+            if args.uart_anchor_reset_after_flash:
+                uart_anchor_request_reboot(
+                    ser,
+                    args=anchor_args,
+                    session=None,
+                    ack_mode=ack_mode,
+                )
+            return
+
+        assert anchor is not None
         session = prepare_jtag_session_with_recovery(
             args=anchor_args,
             defaults=defaults,
@@ -2915,6 +3213,13 @@ def flash_firmware_over_uart_anchor(
                 session=session,
                 ack_mode=ack_mode,
             )
+        if args.uart_anchor_reset_after_flash:
+            uart_anchor_request_reboot(
+                ser,
+                args=anchor_args,
+                session=session,
+                ack_mode=ack_mode,
+            )
     finally:
         if ser is not None:
             ser.close()
@@ -2955,6 +3260,130 @@ def default_prebuilt_ble_snapshot_commands() -> list[str]:
     ]
 
 
+def run_uart_anchor_build_only(args: argparse.Namespace, manifest: dict[str, Any]) -> int:
+    defaults = manifest.get("defaults", {})
+    work_dir = args.work_dir
+    work_dir.mkdir(parents=True, exist_ok=True)
+    (work_dir / "logs").mkdir(parents=True, exist_ok=True)
+    flash_baud = int(args.flash_baud or args.uart_baud or defaults.get("uart_baud", 230_400))
+    anchor_args = argparse.Namespace(**vars(args))
+    anchor_args.jtag_core = "m0"
+    test_name = "uart_anchor_persistent"
+
+    print("UART-anchor build-only", flush=True)
+    print(f"work_dir={work_dir}", flush=True)
+    print(f"baud={flash_baud}", flush=True)
+
+    anchor = build_uart_flash_anchor(
+        args=anchor_args,
+        work_dir=work_dir,
+        test_name=test_name,
+        flash_baud=flash_baud,
+    )
+    if args.dry_run:
+        print("DRY-RUN: build persistent UART anchor flash image")
+        return 0
+
+    output = BuildOutput(
+        build_id="uart_anchor",
+        core="bl808m0",
+        source=str(UART_FLASH_ANCHOR_SOURCE),
+        elf=anchor.with_suffix(".elf"),
+        bin=anchor,
+        flash_core="m0",
+    )
+    segments = build_m0_jtag_flash_segments(
+        output,
+        args=anchor_args,
+        work_dir=work_dir,
+        test_name=test_name,
+    )
+    image_dir = work_dir / "uart-anchor-persistent"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    image = image_dir / "whole_flash_data.bin"
+    image_data = build_compact_flash_image(segments)
+    image.write_bytes(image_data)
+    anchor_bytes = anchor.read_bytes()
+    anchor_flash_offset = find_unique_payload_offset(
+        image_data,
+        anchor_bytes,
+        label="UART anchor",
+    )
+    expected_anchor_flash_offset = BL808_FLASH_OFFSET_FW + BL808_FW_BOOTINFO_SIZE
+    install_with_uart_boot = shlex.join([
+        str(resolve_repo_path(args.upload_script)),
+        "m0",
+        str(anchor),
+        "<uart-port>",
+        str(flash_baud),
+    ])
+    install_with_existing_anchor = shlex.join([
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--uart-anchor-flash-image",
+        str(image),
+        "--uart-anchor-flash-image-address",
+        "0",
+        "--uart-anchor-reset-after-flash",
+        "--uart-anchor-existing",
+        "--no-jtag",
+        "--uart",
+        "<uart-port>",
+    ])
+    recovery_manifest = image_dir / "recovery_manifest.json"
+    recovery_manifest.write_text(
+        json.dumps(
+            {
+                "kind": "bl808-uart-anchor-recovery",
+                "version": 1,
+                "baud": flash_baud,
+                "anchor_bin": str(anchor),
+                "anchor_size": len(anchor_bytes),
+                "anchor_sha256": file_sha256(anchor),
+                "anchor_payload": {
+                    "flash_offset": anchor_flash_offset,
+                    "flash_offset_hex": f"0x{anchor_flash_offset:06X}",
+                    "expected_boot2_wrapped_flash_offset": expected_anchor_flash_offset,
+                    "expected_boot2_wrapped_flash_offset_hex": (
+                        f"0x{expected_anchor_flash_offset:06X}"
+                    ),
+                    "matches_expected_boot2_wrapped_offset": (
+                        anchor_flash_offset == expected_anchor_flash_offset
+                    ),
+                },
+                "whole_flash_image": str(image),
+                "whole_flash_size": image.stat().st_size,
+                "whole_flash_sha256": file_sha256(image),
+                "segments": [
+                    {
+                        "label": segment.label,
+                        "address": segment.address,
+                        "path": str(segment.path),
+                        "size": segment.path.stat().st_size,
+                        "sha256": file_sha256(segment.path),
+                    }
+                    for segment in segments
+                ],
+                "commands": {
+                    "install_with_uart_boot": install_with_uart_boot,
+                    "install_with_existing_anchor": install_with_existing_anchor,
+                },
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    print(f"anchor_bin={anchor}", flush=True)
+    print(f"whole_flash_image={image}", flush=True)
+    print(f"recovery_manifest={recovery_manifest}", flush=True)
+    print(f"install_with_uart_boot={install_with_uart_boot}", flush=True)
+    print(f"install_with_existing_anchor={install_with_existing_anchor}", flush=True)
+    return 0
+
+
 def run_uart_anchor_probe(args: argparse.Namespace, manifest: dict[str, Any]) -> int:
     defaults = manifest.get("defaults", {})
     work_dir = args.work_dir
@@ -2962,7 +3391,7 @@ def run_uart_anchor_probe(args: argparse.Namespace, manifest: dict[str, Any]) ->
     (work_dir / "logs").mkdir(parents=True, exist_ok=True)
     configure_sudo_askpass(args, work_dir)
 
-    if args.no_jtag:
+    if args.no_jtag and not args.uart_anchor_existing:
         raise RuntimeError("--uart-anchor-probe requires JTAG; remove --no-jtag")
     flash_port = args.flash_port or args.uart
     if flash_port is None and not args.dry_run:
@@ -2980,15 +3409,20 @@ def run_uart_anchor_probe(args: argparse.Namespace, manifest: dict[str, Any]) ->
     if flash_port:
         print(f"uart={flash_port}", flush=True)
 
-    anchor = build_uart_flash_anchor(
-        args=anchor_args,
-        work_dir=work_dir,
-        test_name=test_name,
-        flash_baud=flash_baud,
-    )
+    anchor: Path | None = None
+    if not args.uart_anchor_existing:
+        anchor = build_uart_flash_anchor(
+            args=anchor_args,
+            work_dir=work_dir,
+            test_name=test_name,
+            flash_baud=flash_baud,
+        )
 
     if args.dry_run:
-        print(f"DRY-RUN: open UART flash anchor port {flash_port or '<uart>'} at {flash_baud}")
+        if args.uart_anchor_existing:
+            print(f"DRY-RUN: probe existing UART flash anchor on {flash_port or '<uart>'} at {flash_baud}")
+        else:
+            print(f"DRY-RUN: open UART flash anchor port {flash_port or '<uart>'} at {flash_baud}")
         return 0
 
     try:
@@ -3002,6 +3436,44 @@ def run_uart_anchor_probe(args: argparse.Namespace, manifest: dict[str, Any]) ->
     ser: Any | None = None
     session: OpenOcdSession | None = None
     try:
+        if args.uart_anchor_existing:
+            anchor_log_path = work_dir / "logs" / f"{test_name}.uart-anchor-existing.log"
+            append_log(
+                anchor_log_path,
+                "\n# probe existing UART flash anchor; no JTAG load/reset performed\n",
+            )
+            ser = open_serial_device(
+                serial,
+                port=flash_port or "",
+                baud=flash_baud,
+                timeout=0.05,
+                write_timeout=10,
+                dtr=serial_dtr,
+                rts=serial_rts,
+            )
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+            serial_drain_until_quiet(ser, quiet_s=0.15, timeout_s=1.0)
+            ack_mode = select_uart_flash_anchor_ack_mode(
+                args,
+                ser,
+                None,
+                log_path=anchor_log_path,
+                prefix="existing UART flash anchor probe",
+            )
+            jedec, _ = uart_flash_anchor_command_checked(
+                ser,
+                UART_FLASH_CMD_READ_ID,
+                session=None,
+                ack_mode=ack_mode,
+                timeout_s=5,
+                attempts=3,
+            )
+            print(f"UART anchor ack mode: {ack_mode}", flush=True)
+            print(f"UART anchor flash JEDEC ID: 0x{jedec:06X}", flush=True)
+            return 0
+
+        assert anchor is not None
         session = prepare_jtag_session_with_recovery(
             args=anchor_args,
             defaults=defaults,
@@ -3105,10 +3577,22 @@ def run_uart_anchor_prebuilt(args: argparse.Namespace, manifest: dict[str, Any])
     (work_dir / "logs").mkdir(parents=True, exist_ok=True)
     configure_sudo_askpass(args, work_dir)
 
-    if args.no_jtag:
+    if args.no_jtag and not args.uart_anchor_existing:
         raise RuntimeError("--uart-anchor-flash-image requires JTAG; remove --no-jtag")
     if args.jtag_flash or args.jtag_load:
         raise RuntimeError("--uart-anchor-flash-image is mutually exclusive with --jtag-flash and --jtag-load")
+    if args.uart_anchor_existing and args.prebuilt_snapshot_after_marker:
+        raise RuntimeError(
+            "--prebuilt-snapshot-after-marker is not supported with "
+            "--uart-anchor-existing because the existing-anchor path does not "
+            "load/reset/run the target through JTAG"
+        )
+    if args.uart_anchor_reset_after_flash and args.prebuilt_snapshot_after_marker:
+        raise RuntimeError(
+            "--prebuilt-snapshot-after-marker is not supported with "
+            "--uart-anchor-reset-after-flash because the reboot happens before "
+            "the snapshot JTAG session can be prepared"
+        )
 
     flash_port = args.flash_port or args.uart
     if flash_port is None and not args.dry_run:
@@ -3137,12 +3621,14 @@ def run_uart_anchor_prebuilt(args: argparse.Namespace, manifest: dict[str, Any])
 
     anchor_args = argparse.Namespace(**vars(args))
     anchor_args.jtag_core = "m0"
-    anchor = build_uart_flash_anchor(
-        args=anchor_args,
-        work_dir=work_dir,
-        test_name=test_name,
-        flash_baud=flash_baud,
-    )
+    anchor: Path | None = None
+    if not args.uart_anchor_existing:
+        anchor = build_uart_flash_anchor(
+            args=anchor_args,
+            work_dir=work_dir,
+            test_name=test_name,
+            flash_baud=flash_baud,
+        )
     segment = JtagFlashSegment(
         int(args.uart_anchor_flash_image_address),
         image,
@@ -3150,8 +3636,13 @@ def run_uart_anchor_prebuilt(args: argparse.Namespace, manifest: dict[str, Any])
     )
 
     if args.dry_run:
-        print(f"DRY-RUN: open UART flash anchor port {flash_port or '<uart>'} at {flash_baud}")
+        if args.uart_anchor_existing:
+            print(f"DRY-RUN: use existing UART flash anchor on {flash_port or '<uart>'} at {flash_baud}")
+        else:
+            print(f"DRY-RUN: open UART flash anchor port {flash_port or '<uart>'} at {flash_baud}")
         uart_anchor_flash_program_segment(None, segment, args=anchor_args)
+        if args.uart_anchor_reset_after_flash:
+            uart_anchor_request_reboot(None, args=anchor_args)
         return 0
 
     try:
@@ -3165,6 +3656,58 @@ def run_uart_anchor_prebuilt(args: argparse.Namespace, manifest: dict[str, Any])
     ser: Any | None = None
     session: OpenOcdSession | None = None
     try:
+        if args.uart_anchor_existing:
+            anchor_log_path = work_dir / "logs" / f"{test_name}.uart-anchor-existing.log"
+            append_log(
+                anchor_log_path,
+                "\n# use existing UART flash anchor for prebuilt image; no JTAG load/reset performed\n",
+            )
+            ser = open_serial_device(
+                serial,
+                port=flash_port or "",
+                baud=flash_baud,
+                timeout=0.05,
+                write_timeout=10,
+                dtr=serial_dtr,
+                rts=serial_rts,
+            )
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+            serial_drain_until_quiet(ser, quiet_s=0.15, timeout_s=1.0)
+            ack_mode = select_uart_flash_anchor_ack_mode(
+                args,
+                ser,
+                None,
+                log_path=anchor_log_path,
+                prefix="existing prebuilt UART flash anchor",
+            )
+            jedec, _ = uart_flash_anchor_command_checked(
+                ser,
+                UART_FLASH_CMD_READ_ID,
+                session=None,
+                ack_mode=ack_mode,
+                timeout_s=5,
+                attempts=3,
+            )
+            print(f"UART anchor flash JEDEC ID: 0x{jedec:06X}", flush=True)
+            uart_anchor_flash_program_segment(
+                ser,
+                segment,
+                args=anchor_args,
+                session=None,
+                ack_mode=ack_mode,
+            )
+            if args.uart_anchor_reset_after_flash:
+                uart_anchor_request_reboot(
+                    ser,
+                    args=anchor_args,
+                    session=None,
+                    ack_mode=ack_mode,
+                )
+            print("Prebuilt image flashed", flush=True)
+            return 0
+
+        assert anchor is not None
         session = prepare_jtag_session_with_recovery(
             args=anchor_args,
             defaults=defaults,
@@ -3270,6 +3813,13 @@ def run_uart_anchor_prebuilt(args: argparse.Namespace, manifest: dict[str, Any])
             session=session,
             ack_mode=ack_mode,
         )
+        if args.uart_anchor_reset_after_flash:
+            uart_anchor_request_reboot(
+                ser,
+                args=anchor_args,
+                session=session,
+                ack_mode=ack_mode,
+            )
     finally:
         if ser is not None:
             ser.close()
@@ -3687,12 +4237,26 @@ def capture_jtag_snapshot(
     commands: list[str],
     *,
     halt_first: bool,
+    symbols: dict[str, int] | None = None,
 ) -> str:
     output = ""
     if halt_first:
         output += session.command("halt", timeout_s=5)
     for command in commands:
-        output += session.command(command, timeout_s=5)
+        if symbols is not None:
+            missing = missing_jtag_snapshot_symbols(command, symbols)
+            if missing:
+                output += (
+                    f"\n# skipped JTAG snapshot command {command!r}; "
+                    f"missing symbols {missing!r}\n"
+                )
+                continue
+        expanded = (
+            expand_jtag_snapshot_command(command, symbols)
+            if symbols is not None
+            else command
+        )
+        output += session.command(expanded, timeout_s=5)
     return output
 
 
@@ -4602,18 +5166,38 @@ def run_hardware_test(
 
     try:
         test_reset_capture = bool(test.get("jtag_flash_reset_capture", False))
+        test_jtag_flash_runtime_jtag = test.get("jtag_flash_runtime_jtag")
         if args.jtag_flash_reset_capture and not args.jtag_flash:
             raise RuntimeError("--jtag-flash-reset-capture requires --jtag-flash")
+        if args.jtag_flash_runtime_jtag and not args.jtag_flash:
+            raise RuntimeError("--jtag-flash-runtime-jtag requires --jtag-flash")
         if args.uart_anchor_flash and (args.jtag_flash or args.jtag_load):
             raise RuntimeError(
                 "--uart-anchor-flash is mutually exclusive with --jtag-flash and --jtag-load"
             )
+        jtag_flash_reset_capture = bool(
+            args.jtag_flash
+            and (args.jtag_flash_reset_capture or test_reset_capture)
+        )
+        jtag_flash_runtime_jtag = bool(
+            args.jtag_flash_runtime_jtag
+            or (
+                jtag_flash_reset_capture
+                and test_jtag_flash_runtime_jtag is not False
+            )
+        )
+        jtag_flash_reset_via_runtime_jtag = bool(
+            jtag_flash_reset_capture
+            and jtag_flash_runtime_jtag
+            and not args.no_jtag_reset
+        )
+        jtag_flash_external_reset_capture = bool(
+            jtag_flash_reset_capture
+            and not jtag_flash_reset_via_runtime_jtag
+        )
         runtime_jtag_disabled = bool(
             (args.uart_anchor_flash and not args.uart_anchor_runtime_jtag)
-            or (
-                args.jtag_flash
-                and (args.jtag_flash_reset_capture or test_reset_capture)
-            )
+            or (jtag_flash_reset_capture and not jtag_flash_runtime_jtag)
         )
         outputs = build_firmware(test, args=args, work_dir=work_dir)
         if args.build_only:
@@ -4627,7 +5211,7 @@ def run_hardware_test(
         flash_port = args.flash_port or args.uart
         if not args.no_flash:
             if args.uart_anchor_flash:
-                if args.no_jtag:
+                if args.no_jtag and not args.uart_anchor_existing:
                     raise RuntimeError("--uart-anchor-flash requires JTAG; remove --no-jtag")
                 if flash_port is None and not args.dry_run:
                     raise RuntimeError("--flash-port or --uart is required for UART anchor flashing")
@@ -4674,6 +5258,19 @@ def run_hardware_test(
         pre_host_output = ""
 
         try:
+            if (
+                jtag_flash_reset_via_runtime_jtag
+                and not args.no_jtag
+                and not runtime_jtag_disabled
+                and session is None
+            ):
+                session = prepare_jtag_session_with_recovery(
+                    args=args,
+                    defaults=defaults,
+                    work_dir=work_dir,
+                    test_name=test["name"],
+                )
+
             if args.dry_run:
                 print(f"DRY-RUN: open primary UART {args.uart or '<uart>'} at {uart_baud}")
                 if args.secondary_uart:
@@ -4696,6 +5293,8 @@ def run_hardware_test(
                         dtr=serial_dtr,
                         rts=serial_rts,
                     )
+                if jtag_flash_reset_via_runtime_jtag:
+                    time.sleep(SERIAL_CAPTURE_OPEN_SETTLE_S)
 
             for action_index, action in enumerate(test.get("pre_host_actions", [])):
                 if args.dry_run:
@@ -4728,12 +5327,22 @@ def run_hardware_test(
             if args.manual_target_reset:
                 wait_for_manual_target_reset(args, test["name"])
 
-            if args.target_reset_before_capture or runtime_jtag_disabled:
+            anchor_reboot_requested = bool(
+                args.uart_anchor_flash and args.uart_anchor_reset_after_flash
+            )
+            if (
+                args.target_reset_before_capture
+                or (
+                    (runtime_jtag_disabled or jtag_flash_external_reset_capture)
+                    and not args.manual_target_reset
+                    and not anchor_reboot_requested
+                )
+            ):
                 reset_log = work_dir / "logs" / f"{test['name']}.target-reset.log"
                 if args.uart_anchor_flash:
                     reset_reason = "after UART anchor flash before UART capture"
-                elif runtime_jtag_disabled:
-                    reset_reason = "after JTAG flash before UART capture"
+                elif jtag_flash_reset_capture:
+                    reset_reason = "after JTAG flash before UART/JTAG capture"
                 else:
                     reset_reason = "before UART capture"
                 if primary is not None:
@@ -4774,12 +5383,13 @@ def run_hardware_test(
                         secondary=secondary,
                     )
                 else:
-                    session = prepare_jtag_session_with_recovery(
-                        args=args,
-                        defaults=defaults,
-                        work_dir=work_dir,
-                        test_name=test["name"],
-                    )
+                    if session is None:
+                        session = prepare_jtag_session_with_recovery(
+                            args=args,
+                            defaults=defaults,
+                            work_dir=work_dir,
+                            test_name=test["name"],
+                        )
                     resume_command = "resume"
                     if args.jtag_load:
                         entry = load_firmware_over_jtag(
@@ -4792,6 +5402,11 @@ def run_hardware_test(
                         if secondary is not None:
                             secondary.reset_buffers()
                         resume_command = f"resume 0x{entry:08X}"
+                    elif jtag_flash_reset_via_runtime_jtag:
+                        if primary is not None:
+                            primary.reset_buffers()
+                        if secondary is not None:
+                            secondary.reset_buffers()
                     initial_jtag_command_with_recovery(
                         session,
                         resume_command,
@@ -4808,10 +5423,21 @@ def run_hardware_test(
                     else f"{test['name']}.openocd.log"
                 )
                 if args.uart_anchor_flash:
-                    log_msg = (
-                        "Runtime JTAG skipped by UART anchor flash mode; "
-                        "image was flashed through the M0 UART anchor, then run via target nSRST.\n"
-                    )
+                    if args.manual_target_reset:
+                        log_msg = (
+                            "Runtime JTAG skipped by UART anchor flash mode; "
+                            "image was flashed through the M0 UART anchor, then run by manual target reset.\n"
+                        )
+                    elif args.uart_anchor_reset_after_flash:
+                        log_msg = (
+                            "Runtime JTAG skipped by UART anchor flash mode; "
+                            "image was flashed through the M0 UART anchor, then rebooted by anchor command.\n"
+                        )
+                    else:
+                        log_msg = (
+                            "Runtime JTAG skipped by UART anchor flash mode; "
+                            "image was flashed through the M0 UART anchor, then run via target nSRST.\n"
+                        )
                 elif runtime_jtag_disabled:
                     log_msg = (
                         "Runtime JTAG skipped by JTAG flash reset-capture mode; "
@@ -4819,11 +5445,13 @@ def run_hardware_test(
                     )
                 else:
                     log_msg = "JTAG skipped by --no-jtag; no reset or failure snapshot available.\n"
-                append_log(
-                    work_dir / "logs" / log_name,
-                    log_msg,
-                )
+                skip_log = work_dir / "logs" / log_name
+                ensure_parent(skip_log)
+                skip_log.write_text(log_msg, encoding="utf-8")
             else:
+                stale_skip_log = work_dir / "logs" / f"{test['name']}.runtime-jtag.log"
+                if stale_skip_log.exists():
+                    stale_skip_log.unlink()
                 assert session is not None
 
             if args.dry_run:
@@ -4962,7 +5590,28 @@ def run_hardware_test(
             else:
                 if session is not None:
                     snapshot = list(test.get("jtag_snapshot", defaults.get("jtag_snapshot", [])))
-                    capture_jtag_snapshot(session, snapshot, halt_first=True)
+                    snapshot_symbols: dict[str, int] | None = None
+                    symbol_names = jtag_snapshot_symbol_names(snapshot)
+                    if symbol_names:
+                        m0_outputs = [
+                            output for output in outputs.values()
+                            if output.core == "bl808m0"
+                        ]
+                        if not m0_outputs:
+                            raise RuntimeError(
+                                "symbolic JTAG snapshot requires a bl808m0 build output"
+                            )
+                        snapshot_symbols = elf_symbol_addresses(
+                            m0_outputs[0].elf,
+                            symbol_names,
+                            required=False,
+                        )
+                    capture_jtag_snapshot(
+                        session,
+                        snapshot,
+                        halt_first=True,
+                        symbols=snapshot_symbols,
+                    )
 
             return TestResult(test["name"], ok, time.monotonic() - start, reason)
         finally:
@@ -5329,21 +5978,27 @@ def run_preflight(args: argparse.Namespace, manifest: dict[str, Any]) -> int:
     return 0
 
 
-def main() -> int:
-    args = parse_args()
+def hardware_lock_required(args: argparse.Namespace) -> bool:
+    return not (
+        args.list
+        or args.build_only
+        or args.uart_anchor_build_only
+        or args.dry_run
+    )
+
+
+def main_locked(args: argparse.Namespace, manifest: dict[str, Any]) -> int:
     if args.manual_target_reset:
         args.no_jtag_reset = True
-    manifest = load_manifest(args.manifest)
-
-    if args.list:
-        print_test_list(manifest)
-        return 0
 
     if args.probe_uart_boot:
         return run_uart_boot_probe(args, manifest)
 
     if args.uart_anchor_probe:
         return run_uart_anchor_probe(args, manifest)
+
+    if args.uart_anchor_build_only:
+        return run_uart_anchor_build_only(args, manifest)
 
     if args.preflight:
         return run_preflight(args, manifest)
@@ -5383,6 +6038,26 @@ def main() -> int:
 
     failed = [result for result in results if not result.ok]
     return 1 if failed else 0
+
+
+def main() -> int:
+    args = parse_args()
+    manifest = load_manifest(args.manifest)
+
+    if args.list:
+        print_test_list(manifest)
+        return 0
+
+    if not hardware_lock_required(args):
+        return main_locked(args, manifest)
+
+    lock_path = args.work_dir / "hardware.lock"
+    try:
+        with HardwareRunLock(lock_path):
+            return main_locked(args, manifest)
+    except RuntimeError as exc:
+        print(f"FAIL {exc}", flush=True)
+        return 2
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ import kernel/boothealth
 
 when defined(bl808d0):
   import memmap, mmio
-when defined(bl808lp):
+when defined(bl808m0) or defined(bl808lp):
   import pds
 
 # =============================================================================
@@ -24,6 +24,9 @@ when defined(bl808lp):
 # =============================================================================
 {.emit: """
 extern void main(void);
+extern void __clic_interrupt_handler(void);
+extern void __trap_handler(void);
+extern void trap_vector_entry(void);
 extern unsigned long _sbss;
 extern unsigned long _ebss;
 extern unsigned long _sdata;
@@ -33,6 +36,12 @@ extern unsigned long _sp;
 extern unsigned long __wifi_bss_start __attribute__((weak));
 extern unsigned long __wifi_bss_end __attribute__((weak));
 """.}
+
+when defined(bl808m0):
+  {.emit: """
+  __attribute__((section(".bss.__irq_stack"), aligned(16), used))
+  unsigned char __irq_stack[1024];
+  """.}
 
 # =============================================================================
 # BSS initialization
@@ -119,6 +128,77 @@ when defined(bl808d0):
   }
   """.}
 elif defined(bl808lp):
+  {.emit: """
+  __attribute__((section(".rodata.__trap_vector_table"), aligned(64), used))
+  void (*const __trap_vector_table[128])(void) = {
+    [0 ... 127] = __clic_interrupt_handler,
+    [0] = __trap_handler,
+    [1] = __trap_handler,
+    [2] = __trap_handler,
+    [4] = __trap_handler,
+    [5] = __trap_handler,
+    [6] = __trap_handler,
+    [8] = __trap_handler,
+    [9] = __trap_handler,
+    [10] = __trap_handler,
+    [11] = __trap_handler,
+    [12] = __trap_handler,
+    [13] = __trap_handler,
+    [14] = __trap_handler,
+    [15] = __trap_handler
+  };
+  """.}
+
+  {.emit: """
+  __attribute__((naked, aligned(64)))
+  void __clic_interrupt_handler(void) {
+    asm volatile(
+      /* LP CLIC vector IRQs use a dedicated vector entry.  Exceptions still
+         enter __trap_handler and return with mret. */
+      "addi sp, sp, -80\n"
+      "sw ra, 0(sp)\n"
+      "sw t0, 4(sp)\n"
+      "sw t1, 8(sp)\n"
+      "sw t2, 12(sp)\n"
+      "sw s0, 16(sp)\n"
+      "sw s1, 20(sp)\n"
+      "sw a0, 24(sp)\n"
+      "sw a1, 28(sp)\n"
+      "sw a2, 32(sp)\n"
+      "sw a3, 36(sp)\n"
+      "sw a4, 40(sp)\n"
+      "sw a5, 44(sp)\n"
+      "csrr t0, mcause\n"
+      "sw t0, 48(sp)\n"
+      "csrr t0, mepc\n"
+      "sw t0, 52(sp)\n"
+      "csrr t0, mstatus\n"
+      "sw t0, 56(sp)\n"
+      "call trap_vector_entry\n"
+      "lw t0, 56(sp)\n"
+      "csrw mstatus, t0\n"
+      "lw t0, 52(sp)\n"
+      "csrw mepc, t0\n"
+      "lw t0, 48(sp)\n"
+      "csrw mcause, t0\n"
+      "lw ra, 0(sp)\n"
+      "lw t0, 4(sp)\n"
+      "lw t1, 8(sp)\n"
+      "lw t2, 12(sp)\n"
+      "lw s0, 16(sp)\n"
+      "lw s1, 20(sp)\n"
+      "lw a0, 24(sp)\n"
+      "lw a1, 28(sp)\n"
+      "lw a2, 32(sp)\n"
+      "lw a3, 36(sp)\n"
+      "lw a4, 40(sp)\n"
+      "lw a5, 44(sp)\n"
+      "addi sp, sp, 80\n"
+      "mret\n"
+    );
+  }
+  """.}
+
   # LP E902 (RV32E) trap handler: only x0-x15 exist.
   {.emit: """
   __attribute__((naked, aligned(64)))
@@ -174,16 +254,140 @@ elif defined(bl808lp):
   """.}
 else:
   # M0 (RV32I) trap handler
+  {.emit: """
+  __attribute__((section(".rodata.__trap_vector_table"), aligned(64), used))
+  void (*const __trap_vector_table[128])(void) = {
+    [0 ... 127] = __clic_interrupt_handler,
+    [0] = __trap_handler,
+    [1] = __trap_handler,
+    [2] = __trap_handler,
+    [4] = __trap_handler,
+    [5] = __trap_handler,
+    [6] = __trap_handler,
+    [8] = __trap_handler,
+    [9] = __trap_handler,
+    [10] = __trap_handler,
+    [11] = __trap_handler,
+    [12] = __trap_handler,
+    [13] = __trap_handler,
+    [14] = __trap_handler,
+    [15] = __trap_handler
+  };
+  """.}
+
+  {.emit: """
+  __attribute__((naked, aligned(64)))
+  void __clic_interrupt_handler(void) {
+    asm volatile(
+      /* Match the Bouffalo M0 startup: keep hardware SPUSH/SPSWAP disabled
+         and save the vector IRQ frame explicitly before calling Nim. Save the
+         full integer context because the BLE path enters a substantial Nim
+         call graph from an asynchronous CLIC interrupt. */
+      "addi sp, sp, -160\n"
+      "sw ra, 0(sp)\n"
+      "sw gp, 4(sp)\n"
+      "sw tp, 8(sp)\n"
+      "sw t0, 12(sp)\n"
+      "sw t1, 16(sp)\n"
+      "sw t2, 20(sp)\n"
+      "sw s0, 24(sp)\n"
+      "sw s1, 28(sp)\n"
+      "sw a0, 32(sp)\n"
+      "sw a1, 36(sp)\n"
+      "sw a2, 40(sp)\n"
+      "sw a3, 44(sp)\n"
+      "sw a4, 48(sp)\n"
+      "sw a5, 52(sp)\n"
+      "sw a6, 56(sp)\n"
+      "sw a7, 60(sp)\n"
+      "sw s2, 64(sp)\n"
+      "sw s3, 68(sp)\n"
+      "sw s4, 72(sp)\n"
+      "sw s5, 76(sp)\n"
+      "sw s6, 80(sp)\n"
+      "sw s7, 84(sp)\n"
+      "sw s8, 88(sp)\n"
+      "sw s9, 92(sp)\n"
+      "sw s10, 96(sp)\n"
+      "sw s11, 100(sp)\n"
+      "sw t3, 104(sp)\n"
+      "sw t4, 108(sp)\n"
+      "sw t5, 112(sp)\n"
+      "sw t6, 116(sp)\n"
+      "csrr t0, mcause\n"
+      "sw t0, 120(sp)\n"
+      "csrr t0, mepc\n"
+      "sw t0, 124(sp)\n"
+      "csrr t0, mstatus\n"
+      "sw t0, 128(sp)\n"
+      "csrr t0, mscratch\n"
+      "sw t0, 132(sp)\n"
+      "call trap_vector_entry\n"
+      "lw t0, 128(sp)\n"
+      "csrw mstatus, t0\n"
+      "lw t0, 124(sp)\n"
+      "csrw mepc, t0\n"
+      "lw t0, 120(sp)\n"
+      "csrw mcause, t0\n"
+      "lw t0, 132(sp)\n"
+      "csrw mscratch, t0\n"
+      "lw ra, 0(sp)\n"
+      "lw gp, 4(sp)\n"
+      "lw tp, 8(sp)\n"
+      "lw t0, 12(sp)\n"
+      "lw t1, 16(sp)\n"
+      "lw t2, 20(sp)\n"
+      "lw s0, 24(sp)\n"
+      "lw s1, 28(sp)\n"
+      "lw a0, 32(sp)\n"
+      "lw a1, 36(sp)\n"
+      "lw a2, 40(sp)\n"
+      "lw a3, 44(sp)\n"
+      "lw a4, 48(sp)\n"
+      "lw a5, 52(sp)\n"
+      "lw a6, 56(sp)\n"
+      "lw a7, 60(sp)\n"
+      "lw s2, 64(sp)\n"
+      "lw s3, 68(sp)\n"
+      "lw s4, 72(sp)\n"
+      "lw s5, 76(sp)\n"
+      "lw s6, 80(sp)\n"
+      "lw s7, 84(sp)\n"
+      "lw s8, 88(sp)\n"
+      "lw s9, 92(sp)\n"
+      "lw s10, 96(sp)\n"
+      "lw s11, 100(sp)\n"
+      "lw t3, 104(sp)\n"
+      "lw t4, 108(sp)\n"
+      "lw t5, 112(sp)\n"
+      "lw t6, 116(sp)\n"
+      "addi sp, sp, 160\n"
+      "mret\n"
+    );
+  }
+  """.}
+
   when defined(bl808TrapFrameDiag):
     {.emit: """
     #include <stdint.h>
     volatile uint32_t bl808_trap_frame[40];
 
     __attribute__((naked, aligned(64)))
-    void __trap_handler(void) {
-      asm volatile(
-        /* Save registers */
-        "addi sp, sp, -128\n"
+	    void __trap_handler(void) {
+	      asm volatile(
+	        /* Capture the raw exception entry before this handler changes SP. */
+	        "la t0, bl808_trap_frame\n"
+	        "lw t1, 0(t0)\n"
+	        "bnez t1, 0f\n"
+	        "sw sp, 144(t0)\n"
+	        "sw ra, 148(t0)\n"
+	        "csrr t1, mcause\n"
+	        "sw t1, 152(t0)\n"
+	        "csrr t1, mepc\n"
+	        "sw t1, 156(t0)\n"
+	        "0:\n"
+	        /* Save registers */
+	        "addi sp, sp, -128\n"
         "sw ra, 0(sp)\n"
         "sw t0, 4(sp)\n"
         "sw t1, 8(sp)\n"
@@ -415,6 +619,7 @@ elif defined(bl808m0):
         "csrw 0x7c0, t0\n"
         /* Set stack pointer */
         "la sp, _sp\n"
+        "csrw mscratch, sp\n"
         /* Direct trap mode for RAM-resident debug stubs. */
         "la t0, __trap_handler\n"
         "csrw mtvec, t0\n"
@@ -446,7 +651,15 @@ elif defined(bl808m0):
         "csrw 0x7c0, t0\n"
         /* Set stack pointer */
         "la sp, _sp\n"
-        /* Set trap vector (CLIC-compatible mode) */
+        "csrw mscratch, sp\n"
+        /* Match the SDK SystemInit: disable SPUSH/SPSWAP for ipush/ipop. */
+        "csrr t0, 0x7e1\n"
+        "li t1, ~(0x3 << 16)\n"
+        "and t0, t0, t1\n"
+        "csrw 0x7e1, t0\n"
+        /* Set CLIC vector bases: mtvt handles vector IRQs, mtvec handles exceptions. */
+        "la t0, __trap_vector_table\n"
+        "csrw 0x307, t0\n"    /* mtvt: T-Head CLIC hardware vector table */
         "la t0, __trap_handler\n"
         "ori t0, t0, 0x3\n"  /* CLIC mode: mtvec[1:0] = 0b11 */
         "csrw mtvec, t0\n"
@@ -476,7 +689,10 @@ else:
       "csrw 0x7c0, t0\n"
       /* Set stack pointer */
       "la sp, _sp\n"
-      /* Set trap vector (direct mode for CLIC) */
+      "csrw mscratch, sp\n"
+      /* Set CLIC vector bases: mtvt handles vector IRQs, mtvec handles exceptions. */
+      "la t0, __trap_vector_table\n"
+      "csrw 0x307, t0\n"    /* mtvt: T-Head CLIC hardware vector table */
       "la t0, __trap_handler\n"
       "ori t0, t0, 0x3\n"  /* CLIC mode: mtvec[1:0] = 0b11 */
       "csrw mtvec, t0\n"
@@ -501,6 +717,8 @@ proc systemInit*() =
   faultInit()
   bootHealthInit()
   when defined(bl808m0):
+    pdsConfigureLpMtimerClock()
+    pdsClearIrq()
     clicInit()
   elif defined(bl808d0):
     const

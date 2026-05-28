@@ -24,6 +24,12 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [ -d "$REPO_ROOT/.venv/bin" ]; then
+    PATH="$REPO_ROOT/.venv/bin:$PATH"
+fi
+
 CORE="${1:-}"
 FIRMWARE="${2:-}"
 PORT="${3:-/dev/ttyUSB0}"

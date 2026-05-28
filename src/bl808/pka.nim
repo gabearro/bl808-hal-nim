@@ -1,15 +1,16 @@
-## BL808 PKA (Public Key Accelerator) — Nim reimplementation of libpka_bl808.a
+## BL808 PKA (Public Key Accelerator) HAL.
 ##
-## This module is a COMPLETE Nim reimplementation of the PKA binary blob,
-## reverse-engineered from the disassembly using `riscv64-unknown-elf-objdump`.
-## It exports the same C symbols as the blob for link-level compatibility.
+## This module provides Nim implementations of the exported PKA low-level
+## command bindings and the supported high-level SEC wrappers. Target P-256
+## paths drive the BL808 PKA hardware; non-target builds keep pure Nim fallbacks
+## for vector tests.
 ##
 ## The PKA hardware accelerator sits at SEC_ENG_BASE + 0x300 and provides:
 ##   - Large number arithmetic (add, sub, mul, div, compare)
 ##   - Modular arithmetic (mod add/sub/mul/sqr/exp/inv/rem)
 ##   - Montgomery domain conversions (GF↔Montgomery)
-##   - ECDSA sign/verify (secp256r1, secp256k1, secp384r1)
-##   - ECDH key exchange
+##   - ECDSA sign/verify (secp256r1)
+##   - ECDH key exchange (secp256r1)
 ##   - DSA sign/verify (RSA)
 ##
 ## PKA register offsets from device base:
@@ -25,6 +26,9 @@
 ##   [7:0]   = additional params (data count, etc.)
 
 import mmio, memmap
+from std/volatile import volatileStore
+when defined(bl808m0):
+  import irq
 
 # =============================================================================
 # PKA opcodes (from bflb_sec_pka.h)
@@ -83,6 +87,34 @@ const pkaSizeWords: array[11, uint16] = [0, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128
 const
   PkaCtrl0Offset  = 0x300'u  # PKA_CTRL_0
   PkaRwOffset     = 0x340'u  # PKA_RW (command/data)
+  PkaCtrlDoneStatus = 1'u32 shl 0
+  PkaCtrlDoneClear = 1'u32 shl 1
+  PkaCtrlEnable   = 1'u32 shl 3
+  PkaCtrlIntStatus = 1'u32 shl 8
+  PkaCtrlIntClear = 1'u32 shl 9
+  PkaCtrlIntMask  = 1'u32 shl 11
+  PkaCtrlEndianBig = 1'u32 shl 12
+
+const
+  EccTrngCtrl = SecEngBase + 0x200'u
+  EccTrngData = SecEngBase + 0x208'u
+  EccTrngCtrl3 = SecEngBase + 0x234'u
+  EccTrngCtrlProt = SecEngBase + 0x2FC'u
+  EccSecCtrlProtRead = SecEngBase + 0xF00'u
+  EccTrngBusy = 1'u32 shl 0
+  EccTrngTrigger = 1'u32 shl 1
+  EccTrngEnable = 1'u32 shl 2
+  EccTrngDataClear = 1'u32 shl 3
+  EccTrngIntClear = 1'u32 shl 9
+  EccTrngIntMask = 1'u32 shl 11
+  EccTrngRoscEnable = 1'u32 shl 31
+  EccTrngGroupOwnerShift = 4
+  EccTrngGroupOwnerMask = 0x03'u32
+  EccTrngGroup0Owner = 0x01'u32
+  EccTrngReleasedOwner = 0x03'u32
+  EccTrngRequestGroup0 = 0x02'u32
+  EccTrngReleaseAccess = 0x06'u32
+  EccTrngTimeout = 100_000'u32
 
 # =============================================================================
 # Device struct (matches bflb_device_s layout)
@@ -92,9 +124,41 @@ type
     name*: cstring
     regBase*: uint32  # At offset 4 from struct start
 
+when defined(BleDebugCounters) or defined(bl808PkaDebug):
+  var nim_pka_debug_stage* {.exportc.}: uint32
+  var nim_pka_debug_ctrl* {.exportc.}: uint32
+
+  proc pkaDebugMark(base: uint, stage: uint32) {.inline.} =
+    volatileStore(addr nim_pka_debug_stage, stage)
+    volatileStore(addr nim_pka_debug_ctrl, regRead(base + PkaCtrl0Offset))
+else:
+  proc pkaDebugMark(base: uint, stage: uint32) {.inline.} =
+    discard base
+    discard stage
+
+when defined(bl808PkaDebug):
+  var nim_pka_verify_stage* {.exportc.}: uint32
+  var nim_pka_verify_xmod* {.exportc.}: array[8, uint32]
+  var nim_pka_verify_u1* {.exportc.}: array[8, uint32]
+  var nim_pka_verify_u2* {.exportc.}: array[8, uint32]
+  var nim_pka_verify_w* {.exportc.}: array[8, uint32]
+
 # =============================================================================
 # Internal helpers
 # =============================================================================
+proc quiesceSecEngPollingIrqs() =
+  ## PKA/TRNG operations are polled in this HAL, so their SEC interrupt
+  ## sources and shared CLIC lines must be left masked and non-pending.
+  when defined(bl808m0):
+    irqDisable(IrqM0SecEng1)
+    irqDisable(IrqM0SecEng0)
+    irqDisable(IrqM0SecEngCdet1)
+    irqDisable(IrqM0SecEngCdet0)
+    irqClearPending(IrqM0SecEng1)
+    irqClearPending(IrqM0SecEng0)
+    irqClearPending(IrqM0SecEngCdet1)
+    irqClearPending(IrqM0SecEngCdet0)
+
 proc pkaBase(dev: ptr BflbDevice): uint {.inline.} =
   dev.regBase
 
@@ -105,21 +169,43 @@ proc pkaRw(dev: ptr BflbDevice): uint {.inline.} =
   dev.regBase + PkaRwOffset
 
 proc pkaClearInt(base: uint) =
+  pkaDebugMark(base, 0x00000010'u32)
+  quiesceSecEngPollingIrqs()
   let ctrl = base + PkaCtrl0Offset
   var v = regRead(ctrl)
-  v = v or (1'u32 shl 9)  # Set int_clear bit
+  v = v or PkaCtrlIntClear
   regWrite(ctrl, v)
   v = regRead(ctrl)
-  v = v and not (1'u32 shl 9)
+  v = v and not PkaCtrlIntClear
   regWrite(ctrl, v)
+  quiesceSecEngPollingIrqs()
+
+proc pkaReadMtimeUs(): uint64 =
+  when defined(bl808d0):
+    const base = D0ClintMtimeBase
+  else:
+    const base = ClicMtimeBase
+  var hi1 = regRead(base + 4)
+  var lo = regRead(base)
+  var hi2 = regRead(base + 4)
+  while hi1 != hi2:
+    hi1 = hi2
+    lo = regRead(base)
+    hi2 = regRead(base + 4)
+  (hi2.uint64 shl 32) or lo.uint64
 
 proc pkaWaitIsr(base: uint) =
-  var timeout = 100'u32
-  while timeout > 0:
+  let start = pkaReadMtimeUs()
+  while pkaReadMtimeUs() - start <= 100_000'u64:
     let v = regRead(base + PkaCtrl0Offset)
-    if (v and (1'u32 shl 8)) != 0:  # Check int_status bit
+    if (v and PkaCtrlIntStatus) != 0:
       return
-    timeout.dec
+
+proc pkaWaitAndClear(base: uint) =
+  pkaDebugMark(base, 0x00000020'u32)
+  pkaWaitIsr(base)
+  pkaDebugMark(base, 0x00000021'u32)
+  pkaClearInt(base)
 
 proc pkaWriteFirstConfig(base: uint, opcode: uint32, s0Idx: uint8,
                          s0Size: uint8, dIdx: uint8, dSize: uint8,
@@ -140,14 +226,20 @@ proc pkaWriteFirstConfig(base: uint, opcode: uint32, s0Idx: uint8,
 proc bflb_pka_init*(dev: ptr BflbDevice) {.exportc, cdecl.} =
   ## Initialize PKA hardware.
   let base = dev.regBase
-  regWrite(base + PkaCtrl0Offset, 0)          # Clear control
-  regWrite(base + PkaCtrl0Offset, 8)          # Set enable bit [3]
+  pkaDebugMark(base, 0x00000100'u32)
+  regWrite(base + PkaCtrl0Offset, 0)
+  regWrite(base + PkaCtrl0Offset, PkaCtrlEnable or PkaCtrlIntMask)
+  pkaClearInt(base)
   var v = regRead(base + PkaCtrl0Offset)
-  v = v or 0x1000'u32                         # Set bit [12] (clock enable)
+  v = v or PkaCtrlEndianBig or PkaCtrlIntMask
   regWrite(base + PkaCtrl0Offset, v)
+  pkaDebugMark(base, 0x00000101'u32)
 
 proc bflb_pka_deinit*(dev: ptr BflbDevice) {.exportc, cdecl.} =
-  regWrite(dev.regBase + PkaCtrl0Offset, 0)
+  let base = dev.regBase
+  pkaClearInt(base)
+  regWrite(base + PkaCtrl0Offset, PkaCtrlIntMask)
+  pkaClearInt(base)
 
 proc bflb_pka_write*(dev: ptr BflbDevice, regindex: uint8, regsize: uint8,
                      data: ptr uint32, size: uint16, lastop: uint8) {.exportc, cdecl.} =
@@ -187,8 +279,7 @@ proc bflb_pka_read*(dev: ptr BflbDevice, regindex: uint8, regsize: uint8,
   regWrite(base + PkaRwOffset, cmd)
   regWrite(base + PkaRwOffset, 0)  # Trigger read
 
-  pkaClearInt(base)
-  pkaWaitIsr(base)
+  pkaWaitAndClear(base)
 
   # Read data words
   let rw = base + PkaRwOffset
@@ -204,8 +295,7 @@ proc bflb_pka_lmod2n*(dev: ptr BflbDevice, s0Idx, s0Size, dIdx, dSize: uint8,
   pkaWriteFirstConfig(base, PkaOpLmod2n, s0Idx, s0Size, dIdx, dSize, 0)
   regWrite(base + PkaRwOffset, bitShift.uint32)
   if lastop != 0:
-    pkaClearInt(base)
-    pkaWaitIsr(base)
+    pkaWaitAndClear(base)
 
 proc bflb_pka_ldiv2n*(dev: ptr BflbDevice, s0Idx, s0Size, dIdx, dSize: uint8,
                       bitShift: uint16, lastop: uint8) {.exportc, cdecl.} =
@@ -213,8 +303,7 @@ proc bflb_pka_ldiv2n*(dev: ptr BflbDevice, s0Idx, s0Size, dIdx, dSize: uint8,
   pkaWriteFirstConfig(base, PkaOpLdiv2n, s0Idx, s0Size, dIdx, dSize, 0)
   regWrite(base + PkaRwOffset, bitShift.uint32)
   if lastop != 0:
-    pkaClearInt(base)
-    pkaWaitIsr(base)
+    pkaWaitAndClear(base)
 
 proc bflb_pka_lmul2n*(dev: ptr BflbDevice, s0Idx, s0Size, dIdx, dSize: uint8,
                       bitShift: uint16, lastop: uint8) {.exportc, cdecl.} =
@@ -222,71 +311,64 @@ proc bflb_pka_lmul2n*(dev: ptr BflbDevice, s0Idx, s0Size, dIdx, dSize: uint8,
   pkaWriteFirstConfig(base, PkaOpLmul2n, s0Idx, s0Size, dIdx, dSize, 0)
   regWrite(base + PkaRwOffset, bitShift.uint32)
   if lastop != 0:
-    pkaClearInt(base)
-    pkaWaitIsr(base)
+    pkaWaitAndClear(base)
 
 # --- Two-operand large arithmetic ---
 
 proc bflb_pka_ladd*(dev: ptr BflbDevice, s0Idx, s0Size, dIdx, dSize: uint8,
                     s1Idx, s1Size: uint8, lastop: uint8) {.exportc, cdecl.} =
   let base = dev.regBase
-  pkaWriteFirstConfig(base, PkaOpLadd, s0Idx, s0Size, dIdx, dSize, 0)
+  pkaWriteFirstConfig(base, PkaOpLadd, s0Idx, s0Size, dIdx, dSize, lastop)
   let s1Cmd = (s1Idx.uint32 shl 12) or (s1Size.uint32 shl 20)
   regWrite(base + PkaRwOffset, s1Cmd)
   if lastop != 0:
-    pkaClearInt(base)
-    pkaWaitIsr(base)
+    pkaWaitAndClear(base)
 
 proc bflb_pka_lsub*(dev: ptr BflbDevice, s0Idx, s0Size, dIdx, dSize: uint8,
                     s1Idx, s1Size: uint8, lastop: uint8) {.exportc, cdecl.} =
   let base = dev.regBase
-  pkaWriteFirstConfig(base, PkaOpLsub, s0Idx, s0Size, dIdx, dSize, 0)
+  pkaWriteFirstConfig(base, PkaOpLsub, s0Idx, s0Size, dIdx, dSize, lastop)
   let s1Cmd = (s1Idx.uint32 shl 12) or (s1Size.uint32 shl 20)
   regWrite(base + PkaRwOffset, s1Cmd)
   if lastop != 0:
-    pkaClearInt(base)
-    pkaWaitIsr(base)
+    pkaWaitAndClear(base)
 
 proc bflb_pka_lmul*(dev: ptr BflbDevice, s0Idx, s0Size, dIdx, dSize: uint8,
                     s1Idx, s1Size: uint8, lastop: uint8) {.exportc, cdecl.} =
   let base = dev.regBase
-  pkaWriteFirstConfig(base, PkaOpLmul, s0Idx, s0Size, dIdx, dSize, 0)
+  pkaWriteFirstConfig(base, PkaOpLmul, s0Idx, s0Size, dIdx, dSize, lastop)
   let s1Cmd = (s1Idx.uint32 shl 12) or (s1Size.uint32 shl 20)
   regWrite(base + PkaRwOffset, s1Cmd)
   if lastop != 0:
-    pkaClearInt(base)
-    pkaWaitIsr(base)
+    pkaWaitAndClear(base)
 
 proc bflb_pka_lsqr*(dev: ptr BflbDevice, s0Idx, s0Size, dIdx, dSize: uint8,
                     lastop: uint8) {.exportc, cdecl.} =
   let base = dev.regBase
-  pkaWriteFirstConfig(base, PkaOpLsqr, s0Idx, s0Size, dIdx, dSize, 0)
+  pkaWriteFirstConfig(base, PkaOpLsqr, s0Idx, s0Size, dIdx, dSize, lastop)
   regWrite(base + PkaRwOffset, 0)
   if lastop != 0:
-    pkaClearInt(base)
-    pkaWaitIsr(base)
+    pkaWaitAndClear(base)
 
 proc bflb_pka_ldiv*(dev: ptr BflbDevice, s0Idx, s0Size, dIdx, dSize: uint8,
                     s2Idx, s2Size: uint8, lastop: uint8) {.exportc, cdecl.} =
   let base = dev.regBase
-  pkaWriteFirstConfig(base, PkaOpLdiv, s0Idx, s0Size, dIdx, dSize, 0)
+  pkaWriteFirstConfig(base, PkaOpLdiv, s0Idx, s0Size, dIdx, dSize, lastop)
   let s2Cmd = (s2Idx.uint32 shl 12) or (s2Size.uint32 shl 20)
   regWrite(base + PkaRwOffset, s2Cmd)
   if lastop != 0:
-    pkaClearInt(base)
-    pkaWaitIsr(base)
+    pkaWaitAndClear(base)
 
 proc bflb_pka_lcmp*(dev: ptr BflbDevice, s0Idx, s0Size: uint8,
                     s1Idx, s1Size: uint8): uint8 {.exportc, cdecl.} =
   let base = dev.regBase
-  pkaWriteFirstConfig(base, PkaOpLcmp, s0Idx, s0Size, 0, 0, 0)
+  pkaWriteFirstConfig(base, PkaOpLcmp, s0Idx, s0Size, 0, 0, 1)
   let s1Cmd = (s1Idx.uint32 shl 12) or (s1Size.uint32 shl 20)
   regWrite(base + PkaRwOffset, s1Cmd)
-  pkaClearInt(base)
-  pkaWaitIsr(base)
+  pkaWaitAndClear(base)
   # Read comparison result from status register
   let status = regRead(base + PkaCtrl0Offset)
-  ((status shr 17) and 0x03).uint8  # Result in bits [18:17]
+  ((status shr 24) and 0x01).uint8
 
 # --- Modular arithmetic ---
 
@@ -294,121 +376,111 @@ proc bflb_pka_madd*(dev: ptr BflbDevice, s0Idx, s0Size, dIdx, dSize: uint8,
                     s1Idx, s1Size, s2Idx, s2Size: uint8,
                     lastop: uint8) {.exportc, cdecl.} =
   let base = dev.regBase
-  pkaWriteFirstConfig(base, PkaOpMadd, s0Idx, s0Size, dIdx, dSize, 0)
+  pkaWriteFirstConfig(base, PkaOpMadd, s0Idx, s0Size, dIdx, dSize, lastop)
   let s1s2 = (s1Idx.uint32 shl 12) or (s1Size.uint32 shl 20) or
              (s2Idx.uint32) or (s2Size.uint32 shl 8)
   regWrite(base + PkaRwOffset, s1s2)
   if lastop != 0:
-    pkaClearInt(base)
-    pkaWaitIsr(base)
+    pkaWaitAndClear(base)
 
 proc bflb_pka_msub*(dev: ptr BflbDevice, s0Idx, s0Size, dIdx, dSize: uint8,
                     s1Idx, s1Size, s2Idx, s2Size: uint8,
                     lastop: uint8) {.exportc, cdecl.} =
   let base = dev.regBase
-  pkaWriteFirstConfig(base, PkaOpMsub, s0Idx, s0Size, dIdx, dSize, 0)
+  pkaWriteFirstConfig(base, PkaOpMsub, s0Idx, s0Size, dIdx, dSize, lastop)
   let s1s2 = (s1Idx.uint32 shl 12) or (s1Size.uint32 shl 20) or
              (s2Idx.uint32) or (s2Size.uint32 shl 8)
   regWrite(base + PkaRwOffset, s1s2)
   if lastop != 0:
-    pkaClearInt(base)
-    pkaWaitIsr(base)
+    pkaWaitAndClear(base)
 
 proc bflb_pka_mmul*(dev: ptr BflbDevice, s0Idx, s0Size, dIdx, dSize: uint8,
                     s1Idx, s1Size, s2Idx, s2Size: uint8,
                     lastop: uint8) {.exportc, cdecl.} =
   let base = dev.regBase
-  pkaWriteFirstConfig(base, PkaOpMmul, s0Idx, s0Size, dIdx, dSize, 0)
+  pkaWriteFirstConfig(base, PkaOpMmul, s0Idx, s0Size, dIdx, dSize, lastop)
   let s1s2 = (s1Idx.uint32 shl 12) or (s1Size.uint32 shl 20) or
              (s2Idx.uint32) or (s2Size.uint32 shl 8)
   regWrite(base + PkaRwOffset, s1s2)
   if lastop != 0:
-    pkaClearInt(base)
-    pkaWaitIsr(base)
+    pkaWaitAndClear(base)
 
 proc bflb_pka_msqr*(dev: ptr BflbDevice, s0Idx, s0Size, dIdx, dSize: uint8,
                     s2Idx, s2Size: uint8, lastop: uint8) {.exportc, cdecl.} =
   let base = dev.regBase
-  pkaWriteFirstConfig(base, PkaOpMsqr, s0Idx, s0Size, dIdx, dSize, 0)
+  pkaWriteFirstConfig(base, PkaOpMsqr, s0Idx, s0Size, dIdx, dSize, lastop)
   let s2Cmd = (s2Idx.uint32) or (s2Size.uint32 shl 8)
   regWrite(base + PkaRwOffset, s2Cmd)
   if lastop != 0:
-    pkaClearInt(base)
-    pkaWaitIsr(base)
+    pkaWaitAndClear(base)
 
 proc bflb_pka_mrem*(dev: ptr BflbDevice, s0Idx, s0Size, dIdx, dSize: uint8,
                     s2Idx, s2Size: uint8, lastop: uint8) {.exportc, cdecl.} =
   let base = dev.regBase
-  pkaWriteFirstConfig(base, PkaOpMrem, s0Idx, s0Size, dIdx, dSize, 0)
+  pkaWriteFirstConfig(base, PkaOpMrem, s0Idx, s0Size, dIdx, dSize, lastop)
   let s2Cmd = (s2Idx.uint32) or (s2Size.uint32 shl 8)
   regWrite(base + PkaRwOffset, s2Cmd)
   if lastop != 0:
-    pkaClearInt(base)
-    pkaWaitIsr(base)
+    pkaWaitAndClear(base)
 
 proc bflb_pka_minv*(dev: ptr BflbDevice, s0Idx, s0Size, dIdx, dSize: uint8,
                     s2Idx, s2Size: uint8, lastop: uint8) {.exportc, cdecl.} =
   let base = dev.regBase
-  pkaWriteFirstConfig(base, PkaOpMinv, s0Idx, s0Size, dIdx, dSize, 0)
+  pkaWriteFirstConfig(base, PkaOpMinv, s0Idx, s0Size, dIdx, dSize, lastop)
   let s2Cmd = (s2Idx.uint32) or (s2Size.uint32 shl 8)
   regWrite(base + PkaRwOffset, s2Cmd)
   if lastop != 0:
-    pkaClearInt(base)
-    pkaWaitIsr(base)
+    pkaWaitAndClear(base)
 
 proc bflb_pka_mexp*(dev: ptr BflbDevice, s0Idx, s0Size, dIdx, dSize: uint8,
                     s1Idx, s1Size, s2Idx, s2Size: uint8,
                     lastop: uint8) {.exportc, cdecl.} =
   let base = dev.regBase
-  pkaWriteFirstConfig(base, PkaOpMexp, s0Idx, s0Size, dIdx, dSize, 0)
+  pkaWriteFirstConfig(base, PkaOpMexp, s0Idx, s0Size, dIdx, dSize, lastop)
   let s1s2 = (s1Idx.uint32 shl 12) or (s1Size.uint32 shl 20) or
              (s2Idx.uint32) or (s2Size.uint32 shl 8)
   regWrite(base + PkaRwOffset, s1s2)
   if lastop != 0:
-    pkaClearInt(base)
-    pkaWaitIsr(base)
+    pkaWaitAndClear(base)
 
 # --- Register management ---
 
 proc bflb_pka_regsize*(dev: ptr BflbDevice, s0Idx, s0Size, dIdx, dSize: uint8,
                        lastop: uint8) {.exportc, cdecl.} =
   let base = dev.regBase
-  pkaWriteFirstConfig(base, PkaOpResize, s0Idx, s0Size, dIdx, dSize, 0)
+  pkaWriteFirstConfig(base, PkaOpResize, s0Idx, s0Size, dIdx, dSize, lastop)
   regWrite(base + PkaRwOffset, 0)
   if lastop != 0:
-    pkaClearInt(base)
-    pkaWaitIsr(base)
+    pkaWaitAndClear(base)
 
 proc bflb_pka_movdat*(dev: ptr BflbDevice, s0Idx, s0Size, dIdx, dSize: uint8,
                       lastop: uint8) {.exportc, cdecl.} =
   let base = dev.regBase
-  pkaWriteFirstConfig(base, PkaOpMovdat, s0Idx, s0Size, dIdx, dSize, 0)
+  pkaWriteFirstConfig(base, PkaOpMovdat, s0Idx, s0Size, dIdx, dSize, lastop)
   regWrite(base + PkaRwOffset, 0)
   if lastop != 0:
-    pkaClearInt(base)
-    pkaWaitIsr(base)
+    pkaWaitAndClear(base)
 
 proc bflb_pka_nlir*(dev: ptr BflbDevice, s0Idx, s0Size, dIdx, dSize: uint8,
                     lastop: uint8) {.exportc, cdecl.} =
   let base = dev.regBase
-  pkaWriteFirstConfig(base, PkaOpNlir, s0Idx, s0Size, dIdx, dSize, 0)
+  pkaWriteFirstConfig(base, PkaOpNlir, s0Idx, s0Size, dIdx, dSize, lastop)
   regWrite(base + PkaRwOffset, 0)
   if lastop != 0:
-    pkaClearInt(base)
-    pkaWaitIsr(base)
+    pkaWaitAndClear(base)
 
 proc bflb_pka_slir*(dev: ptr BflbDevice, regindex, regsize: uint8,
                     data: uint32, lastop: uint8) {.exportc, cdecl.} =
   ## Write a single immediate value to a PKA register.
   let base = dev.regBase
   let cmd = (PkaOpSlir shl 24) or
+            ((if lastop != 0: 1'u32 else: 0'u32) shl 31) or
             (regsize.uint32 shl 20) or
-            (regindex.uint32 shl 12) or
-            (data and 0xFFF)
+            (regindex.uint32 shl 12)
   regWrite(base + PkaRwOffset, cmd)
+  regWrite(base + PkaRwOffset, data)
   if lastop != 0:
-    pkaClearInt(base)
-    pkaWaitIsr(base)
+    pkaWaitAndClear(base)
 
 proc bflb_pka_clir*(dev: ptr BflbDevice, regindex, regsize: uint8,
                     size: uint16, lastop: uint8) {.exportc, cdecl.} =
@@ -419,19 +491,18 @@ proc bflb_pka_clir*(dev: ptr BflbDevice, regindex, regsize: uint8,
   regWrite(base + PkaRwOffset, cmd)
   regWrite(base + PkaRwOffset, 0)  # Trigger
   if lastop != 0:
-    pkaClearInt(base)
-    pkaWaitIsr(base)
+    pkaWaitAndClear(base)
 
 # --- Montgomery domain conversions ---
 
 proc bflb_pka_gf2mont*(dev: ptr BflbDevice,
                        sIdx, sSize, dIdx, dSize: uint8,
                        tIdx, tSize, pIdx, pSize: uint8,
-                       size: uint32) {.exportc, cdecl.} =
+                       bitShift: uint32) {.exportc, cdecl.} =
   ## Convert from GF (normal) to Montgomery domain.
-  ## Steps: t = s * 2^(size*32) mod p, then d = t
+  ## Steps: t = s * 2^bitShift mod p, then d = t.
   bflb_pka_lmul2n(dev, sIdx, sSize, tIdx, tSize,
-                  (size * 32).uint16, 0)
+                  bitShift.uint16, 0)
   bflb_pka_mrem(dev, tIdx, tSize, dIdx, dSize,
                 pIdx, pSize, 1)
 
@@ -440,9 +511,9 @@ proc bflb_pka_mont2gf*(dev: ptr BflbDevice,
                        invrIdx, invrSize: uint8,
                        tIdx, tSize, pIdx, pSize: uint8) {.exportc, cdecl.} =
   ## Convert from Montgomery domain to GF (normal).
-  ## d = s * invR mod p
-  bflb_pka_mmul(dev, sIdx, sSize, dIdx, dSize,
-                invrIdx, invrSize, pIdx, pSize, 1)
+  ## The SDK performs a full-width multiply by R^-1 followed by reduction.
+  bflb_pka_lmul(dev, sIdx, sSize, tIdx, tSize, invrIdx, invrSize, 0)
+  bflb_pka_mrem(dev, tIdx, tSize, dIdx, dSize, pIdx, pSize, 1)
 
 # =============================================================================
 # ECC helper types and constants (for ECDSA/ECDH)
@@ -554,7 +625,7 @@ const
   ]
 
 # =============================================================================
-# ECDSA / ECDH / DSA stub exports
+# ECDSA / ECDH / DSA high-level exports
 # (These compose the low-level PKA operations above for ECC math)
 # =============================================================================
 
@@ -566,52 +637,177 @@ proc eccCmpWords(a, b: ptr uint32, size: uint32): cint =
     if arrA[i] < arrB[i]: return -1
   0
 
+proc eccCmpBeBytes(a, b: ptr uint8, len: uint32): cint =
+  if a == nil or b == nil:
+    return 0
+  let aa = cast[ptr UncheckedArray[uint8]](a)
+  let bb = cast[ptr UncheckedArray[uint8]](b)
+  var i = 0'u32
+  while i < len and aa[i] == 0:
+    i.inc
+  var j = 0'u32
+  while j < len and bb[j] == 0:
+    j.inc
+  if i == len and j == len:
+    return 0
+  if i > j:
+    return -1
+  if j > i:
+    return 1
+  while i < len:
+    if aa[i] > bb[i]:
+      return 1
+    if aa[i] < bb[i]:
+      return -1
+    i.inc
+  0
+
+proc eccIsZeroBytes(a: ptr uint8, len: uint32): bool =
+  if a == nil:
+    return true
+  let bytes = cast[ptr UncheckedArray[uint8]](a)
+  for i in 0 ..< len.int:
+    if bytes[i] != 0:
+      return false
+  true
+
+proc copyWords(dst, src: ptr uint32, words: uint32) =
+  let dd = cast[ptr UncheckedArray[uint32]](dst)
+  let ss = cast[ptr UncheckedArray[uint32]](src)
+  for i in 0 ..< words.int:
+    dd[i] = ss[i]
+
+proc eccTrngNopDelay() {.inline.} =
+  {.emit: """
+    __asm__ volatile("nop");
+    __asm__ volatile("nop");
+    __asm__ volatile("nop");
+    __asm__ volatile("nop");
+  """.}
+
+proc eccTrngOwner(): uint32 {.inline.} =
+  (regRead(EccSecCtrlProtRead) shr EccTrngGroupOwnerShift) and
+    EccTrngGroupOwnerMask
+
+proc eccRequestTrngGroup0(releaseWhenDone: var bool): bool =
+  releaseWhenDone = false
+  case eccTrngOwner()
+  of EccTrngGroup0Owner:
+    true
+  of EccTrngReleasedOwner:
+    regWrite(EccTrngCtrlProt, EccTrngRequestGroup0)
+    if eccTrngOwner() == EccTrngGroup0Owner:
+      releaseWhenDone = true
+      true
+    else:
+      false
+  else:
+    false
+
+proc eccReleaseTrngGroup0(releaseWhenDone: bool) =
+  if releaseWhenDone:
+    regWrite(EccTrngCtrlProt, EccTrngReleaseAccess)
+
+proc eccTrngClearInterrupt() =
+  quiesceSecEngPollingIrqs()
+  var v = regRead(EccTrngCtrl) or EccTrngIntMask
+  regWrite(EccTrngCtrl, v or EccTrngIntClear)
+  v = regRead(EccTrngCtrl) or EccTrngIntMask
+  regWrite(EccTrngCtrl, v and not EccTrngIntClear)
+  quiesceSecEngPollingIrqs()
+
+proc eccTrngWaitIdle(): bool =
+  var timeout = EccTrngTimeout
+  while (regRead(EccTrngCtrl) and EccTrngBusy) != 0'u32:
+    if timeout == 0'u32:
+      return false
+    dec timeout
+  true
+
+proc eccTrngDisable() =
+  regWrite(EccTrngCtrl, (regRead(EccTrngCtrl) and not EccTrngEnable) or
+                        EccTrngIntMask)
+  eccTrngClearInterrupt()
+
+proc eccTrngReadBlock(dst: ptr uint8): bool =
+  if dst == nil:
+    return false
+
+  regWrite(EccTrngCtrl3, regRead(EccTrngCtrl3) or EccTrngRoscEnable)
+  regWrite(EccTrngCtrl, regRead(EccTrngCtrl) or EccTrngEnable or
+                         EccTrngIntMask)
+  eccTrngClearInterrupt()
+  eccTrngNopDelay()
+  if not eccTrngWaitIdle():
+    eccTrngDisable()
+    return false
+
+  eccTrngClearInterrupt()
+  regWrite(EccTrngCtrl, regRead(EccTrngCtrl) or EccTrngTrigger or
+                         EccTrngIntMask)
+  eccTrngNopDelay()
+  if not eccTrngWaitIdle():
+    eccTrngDisable()
+    return false
+
+  let outp = cast[ptr UncheckedArray[uint8]](dst)
+  var nonZero = false
+  for wordIndex in 0 ..< 8:
+    let word = regRead(EccTrngData + wordIndex.uint * 4)
+    if word != 0'u32:
+      nonZero = true
+    for byteIndex in 0 ..< 4:
+      outp[wordIndex * 4 + byteIndex] =
+        uint8((word shr (byteIndex * 8)) and 0xFF'u32)
+
+  regWrite(EccTrngCtrl, (regRead(EccTrngCtrl) and not EccTrngTrigger) or
+                        EccTrngIntMask)
+  regWrite(EccTrngCtrl, regRead(EccTrngCtrl) or EccTrngDataClear or
+                         EccTrngIntMask)
+  regWrite(EccTrngCtrl, (regRead(EccTrngCtrl) and not EccTrngDataClear) or
+                        EccTrngIntMask)
+  eccTrngDisable()
+  nonZero
+
 proc bflb_sec_ecc_get_random_value*(data: ptr uint32, maxRef: ptr uint32,
                                     size: uint32): cint {.exportc, cdecl.} =
-  ## Get a random value less than maxRef using TRNG.
-  const
-    TrngCtrl = SecEngBase + 0x200'u
-    TrngStatus = SecEngBase + 0x204'u
-    TrngData = SecEngBase + 0x208'u
-    TrngTrigger = 1'u32 shl 1
-    TrngEnable = 1'u32 shl 2
-    TrngDataClear = 1'u32 shl 3
-    TrngIntClear = 1'u32 shl 9
-  let dataWords = cast[ptr UncheckedArray[uint32]](data)
+  ## Get a big-endian byte string less than maxRef using TRNG.
+  if data == nil or size == 0:
+    return -1
 
-  var word = 0'u32
-  while word < size:
-    regWrite(TrngCtrl, TrngEnable or TrngTrigger)
-    var timeout = 100_000'u32
-    while (regRead(TrngStatus) and 1) == 0:
-      timeout.dec
-      if timeout == 0: return -1
+  var releaseTrng = false
+  if not eccRequestTrngGroup0(releaseTrng):
+    return -1
 
-    let remaining = size - word
-    let batch = if remaining < 8'u32: remaining else: 8'u32
-    for i in 0'u32 ..< batch:
-      dataWords[word + i] = regRead(TrngData + i.uint * 4)
-    word += batch
-    regWrite(TrngCtrl, TrngEnable or TrngDataClear or TrngIntClear)
+  let dataBytes = cast[ptr UncheckedArray[uint8]](data)
+  var trngBlock: array[32, uint8]
+  var tries = 100
+  while tries > 0:
+    var offset = 0'u32
+    while offset < size:
+      if not eccTrngReadBlock(addr trngBlock[0]):
+        eccReleaseTrngGroup0(releaseTrng)
+        return -1
+      var blockIndex = 0'u32
+      while blockIndex < trngBlock.len.uint32 and offset < size:
+        dataBytes[offset] = trngBlock[blockIndex.int]
+        offset.inc
+        blockIndex.inc
 
-  while eccCmpWords(data, maxRef, size) >= 0:
-    var borrow = 0'u64
-    let refWords = cast[ptr UncheckedArray[uint32]](maxRef)
-    for i in 0 ..< size.int:
-      let lhs = dataWords[i].uint64
-      let rhs = refWords[i].uint64 + borrow
-      if lhs >= rhs:
-        dataWords[i] = (lhs - rhs).uint32
-        borrow = 0
-      else:
-        dataWords[i] = ((1'u64 shl 32) + lhs - rhs).uint32
-        borrow = 1
-  0
+    if maxRef == nil or
+        eccCmpBeBytes(cast[ptr uint8](maxRef), cast[ptr uint8](data), size) > 0:
+      eccReleaseTrngGroup0(releaseTrng)
+      return 0
+    tries.dec
+  eccReleaseTrngGroup0(releaseTrng)
+  -1
 
 proc bflb_sec_ecc_cmp*(a, b: ptr uint32, size: uint32): cint {.exportc, cdecl.} =
   eccCmpWords(a, b, size)
 
 proc bflb_sec_ecc_is_zero*(a: ptr uint32, size: uint32): cint {.exportc, cdecl.} =
+  if a == nil:
+    return 1
   let arr = cast[ptr UncheckedArray[uint32]](a)
   for i in 0 ..< size.int:
     if arr[i] != 0: return 0
@@ -632,7 +828,10 @@ proc pkaRegSizeForBits(bits: uint32): uint8 =
 proc wordLenForBits(bits: uint32): uint16 =
   ((bits + 31'u32) shr 5).uint16
 
-const DsaMaxWords = 32
+proc isSupportedEcpId(ecpId: uint8): bool {.inline.} =
+  ecpId == EcpSecp256r1
+
+const DsaMaxWords = 64
 type DsaWordArray = array[DsaMaxWords, uint32]
 
 proc dsaLoad(dst: var DsaWordArray, src: ptr uint32, words: uint16) =
@@ -713,21 +912,42 @@ proc dsaExpMod(dst: var DsaWordArray, base, exponent, modulus: DsaWordArray,
   dst = resultWords
 
 proc bflb_sec_ecdsa_init*(handle: ptr BflbEcdsa, id: uint8): cint {.exportc, cdecl.} =
+  if handle == nil or not isSupportedEcpId(id):
+    return -1
   handle.ecpId = id
+  handle.privateKey = nil
+  handle.publicKeyx = nil
+  handle.publicKeyy = nil
   0
 
 proc bflb_sec_ecdsa_deinit*(handle: ptr BflbEcdsa): cint {.exportc, cdecl.} =
+  if handle == nil:
+    return -1
+  handle.privateKey = nil
+  handle.publicKeyx = nil
+  handle.publicKeyy = nil
   0
 
 proc bflb_sec_ecdh_init*(handle: ptr BflbEcdh, id: uint8): cint {.exportc, cdecl.} =
+  if handle == nil or not isSupportedEcpId(id):
+    return -1
   handle.ecpId = id
   0
 
 proc bflb_sec_ecdh_deinit*(handle: ptr BflbEcdh): cint {.exportc, cdecl.} =
+  if handle == nil:
+    return -1
   0
 
 proc bflb_sec_dsa_init*(handle: ptr BflbDsa, size: uint32): cint {.exportc, cdecl.} =
+  if handle == nil or size == 0 or size > DsaMaxWords.uint32 * 32'u32:
+    return -1
   handle.size = size
+  handle.crtSize = 0
+  handle.n = nil
+  handle.e = nil
+  handle.d = nil
+  handle.crtCfg = default(BflbDsaCrt)
   0
 
 # =============================================================================
@@ -786,28 +1006,22 @@ __attribute__((used)) bflb_device_s *pka = &bl808_hal_default_pka_device;
 """.}
 var pka* {.importc.}: ptr BflbDevice
 
-proc getCurveParams(ecpId: uint8): (ptr uint32, ptr uint32, ptr uint32,
-                                     ptr uint32, ptr uint32,
-                                     ptr uint32, ptr uint32,
-                                     ptr uint32, ptr uint32, uint32) =
+proc getP256CurveParams(): (ptr uint32, ptr uint32, ptr uint32,
+                            ptr uint32, ptr uint32,
+                            ptr uint32, ptr uint32,
+                            ptr uint32, ptr uint32, uint32) =
   ## Returns (P, N, Gx, Gy, B, invR_P, primeN_P, invR_N, primeN_N, wordSize)
-  case ecpId
-  of EcpSecp256r1:
-    (addr secp256r1P[0], addr secp256r1N[0],
-     addr secp256r1Gx[0], addr secp256r1Gy[0], addr secp256r1B[0],
-     addr secp256r1InvR_P[0], addr secp256r1PrimeN_P[0],
-     addr secp256r1InvR_N[0], addr secp256r1PrimeN_N[0], 8'u32)
-  else:
-    # secp256k1 and secp384r1 would go here
-    (addr secp256r1P[0], addr secp256r1N[0],
-     addr secp256r1Gx[0], addr secp256r1Gy[0], addr secp256r1B[0],
-     addr secp256r1InvR_P[0], addr secp256r1PrimeN_P[0],
-     addr secp256r1InvR_N[0], addr secp256r1PrimeN_N[0], 8'u32)
+  (addr secp256r1P[0], addr secp256r1N[0],
+   addr secp256r1Gx[0], addr secp256r1Gy[0], addr secp256r1B[0],
+   addr secp256r1InvR_P[0], addr secp256r1PrimeN_P[0],
+   addr secp256r1InvR_N[0], addr secp256r1PrimeN_N[0], 8'u32)
 
 proc eccLoadCurveParams(dev: ptr BflbDevice, ecpId: uint8) =
   ## Load curve constants into PKA registers.
+  if not isSupportedEcpId(ecpId):
+    return
   let (cp, cn, cgx, cgy, cb, cinvr, cprimn, cinvrn, cprimnn, ws) =
-    getCurveParams(ecpId)
+    getP256CurveParams()
   bflb_pka_write(dev, R_P, SZ, cp, ws.uint16, 0)
   bflb_pka_write(dev, R_PRIMN, SZ, cprimn, ws.uint16, 0)
   bflb_pka_write(dev, R_INVR, SZ, cinvr, ws.uint16, 0)
@@ -921,7 +1135,8 @@ proc eccPointMul(dev: ptr BflbDevice, scalar: ptr uint32, wordSize: uint32) =
           bflb_pka_write(dev, R_RZ, SZ, addr secp256r1InvR_P[0], wordSize.uint16, 0)
           # Actually we need "1" in Montgomery domain. For simplicity, write 1 and convert.
           bflb_pka_slir(dev, R_RZ, SZ, 1, 0)
-          bflb_pka_gf2mont(dev, R_RZ, SZ, R_RZ, SZ, R_TMP19, SZ, R_P, SZ, wordSize)
+          bflb_pka_gf2mont(dev, R_RZ, SZ, R_RZ, SZ, R_TMP19, SZ, R_P, SZ,
+                            wordSize * 32)
           firstBit = false
         else:
           # R = R + P (mixed addition)
@@ -976,6 +1191,17 @@ proc sdkP256PointMulInit(dev: ptr BflbDevice) =
   bflb_pka_write(dev, SdkP256Bar8, SdkP256S32, addr secp256r1Bar8[0], SdkP256Words, 0)
   bflb_pka_write(dev, SdkP256OneP1, SdkP256S32, addr secp256r1OneP1[0], SdkP256Words, 0)
   bflb_pka_write(dev, SdkP256OneM1, SdkP256S32, addr secp256r1OneM1[0], SdkP256Words, 0)
+
+proc sdkP256ClearWorkingRegs(dev: ptr BflbDevice) =
+  const regs = [
+    SdkP256X1, SdkP256Y1, SdkP256Z1,
+    SdkP256X2, SdkP256Y2, SdkP256Z2,
+    SdkP256T13, SdkP256T14, SdkP256T15,
+    SdkP256T16, SdkP256T17, SdkP256T18
+  ]
+  for reg in regs:
+    bflb_pka_clir(dev, reg, SdkP256S32, SdkP256Words, 1)
+    bflb_pka_clir(dev, reg, SdkP256S64, SdkP256Words, 1)
 
 proc sdkP256PointAddInfCheck(dev: ptr BflbDevice,
                              p1Inf, p2Inf: var uint8) =
@@ -1070,24 +1296,42 @@ proc sdkP256ScalarMulLoop(dev: ptr BflbDevice, scalar: ptr uint32): cint =
 proc sdkP256ScalarMulComplete(dev: ptr BflbDevice,
                               scalar, px, py: ptr uint32,
                               outX, outY: ptr uint32): cint =
+  pkaDebugMark(dev.regBase, 0x00000200'u32)
   bflb_pka_init(dev)
-  bflb_pka_clir(dev, SdkP256Z2, SdkP256S64, SdkP256Words, 1)
+  pkaDebugMark(dev.regBase, 0x00000201'u32)
+  sdkP256ClearWorkingRegs(dev)
+  pkaDebugMark(dev.regBase, 0x00000202'u32)
   sdkP256PointMulInit(dev)
+  pkaDebugMark(dev.regBase, 0x00000203'u32)
 
   bflb_pka_write(dev, SdkP256X1, SdkP256S32, addr secp256r1ZeroX[0], SdkP256Words, 0)
   bflb_pka_write(dev, SdkP256Y1, SdkP256S32, addr secp256r1ZeroY[0], SdkP256Words, 0)
   bflb_pka_movdat(dev, SdkP256X1, SdkP256S32, SdkP256Z1, SdkP256S32, 1)
   bflb_pka_write(dev, SdkP256X2, SdkP256S32, px, SdkP256Words, 0)
+  bflb_pka_clir(dev, SdkP256T13, SdkP256S32, SdkP256Words, 1)
+  bflb_pka_clir(dev, SdkP256T14, SdkP256S32, SdkP256Words, 1)
+  bflb_pka_gf2mont(dev, SdkP256X2, SdkP256S32, SdkP256X2, SdkP256S32,
+                   SdkP256Z2, SdkP256S64, SdkP256Mod, SdkP256S32,
+                   SdkP256Words.uint32 * 32)
   bflb_pka_write(dev, SdkP256Y2, SdkP256S32, py, SdkP256Words, 0)
+  bflb_pka_clir(dev, SdkP256T13, SdkP256S32, SdkP256Words, 1)
+  bflb_pka_clir(dev, SdkP256T14, SdkP256S32, SdkP256Words, 1)
+  bflb_pka_gf2mont(dev, SdkP256Y2, SdkP256S32, SdkP256Y2, SdkP256S32,
+                   SdkP256Z2, SdkP256S64, SdkP256Mod, SdkP256S32,
+                   SdkP256Words.uint32 * 32)
   bflb_pka_movdat(dev, SdkP256Y1, SdkP256S32, SdkP256Z2, SdkP256S32, 1)
   bflb_pka_clir(dev, SdkP256Z2, SdkP256S64, SdkP256Words, 1)
 
+  pkaDebugMark(dev.regBase, 0x00000210'u32)
   let rc = sdkP256ScalarMulLoop(dev, scalar)
   if rc != 0:
     bflb_pka_deinit(dev)
+    pkaDebugMark(dev.regBase, 0x00000211'u32)
     return rc
+  pkaDebugMark(dev.regBase, 0x00000220'u32)
 
   bflb_pka_minv(dev, SdkP256Z1, SdkP256S32, SdkP256X2, SdkP256S32, SdkP256Mod, SdkP256S32, 1)
+  pkaDebugMark(dev.regBase, 0x00000230'u32)
   bflb_pka_write(dev, SdkP256Y2, SdkP256S32, addr secp256r1InvR_P[0], SdkP256Words, 0)
   bflb_pka_clir(dev, SdkP256T13, SdkP256S32, SdkP256Words, 1)
   bflb_pka_clir(dev, SdkP256T14, SdkP256S32, SdkP256Words, 1)
@@ -1098,6 +1342,7 @@ proc sdkP256ScalarMulComplete(dev: ptr BflbDevice,
   bflb_pka_write(dev, SdkP256PrimeN, SdkP256S32, addr secp256r1PrimeN_N[0], SdkP256Words, 0)
   bflb_pka_mrem(dev, SdkP256X1, SdkP256S32, SdkP256X1, SdkP256S32, SdkP256Mod, SdkP256S32, 1)
   bflb_pka_read(dev, SdkP256X1, SdkP256S32, outX, SdkP256Words)
+  pkaDebugMark(dev.regBase, 0x00000240'u32)
 
   bflb_pka_write(dev, SdkP256Mod, SdkP256S32, addr secp256r1P[0], SdkP256Words, 0)
   bflb_pka_write(dev, SdkP256PrimeN, SdkP256S32, addr secp256r1PrimeN_P[0], SdkP256Words, 0)
@@ -1112,9 +1357,247 @@ proc sdkP256ScalarMulComplete(dev: ptr BflbDevice,
   bflb_pka_write(dev, SdkP256PrimeN, SdkP256S32, addr secp256r1PrimeN_N[0], SdkP256Words, 0)
   bflb_pka_mrem(dev, SdkP256Y1, SdkP256S32, SdkP256Y1, SdkP256S32, SdkP256Mod, SdkP256S32, 1)
   bflb_pka_read(dev, SdkP256Y1, SdkP256S32, outY, SdkP256Words)
+  pkaDebugMark(dev.regBase, 0x00000250'u32)
 
   bflb_pka_deinit(dev)
+  pkaDebugMark(dev.regBase, 0x00000260'u32)
   0
+
+proc pkaReduceModN(dev: ptr BflbDevice, value, outValue: ptr uint32): cint =
+  if dev == nil or value == nil or outValue == nil:
+    return -1
+  let (_, cn, _, _, _, _, _, _, cprimnn, ws) = getP256CurveParams()
+  bflb_pka_init(dev)
+  bflb_pka_write(dev, SdkP256Mod, SdkP256S32, cn, ws.uint16, 0)
+  bflb_pka_write(dev, SdkP256PrimeN, SdkP256S32, cprimnn, ws.uint16, 0)
+  bflb_pka_write(dev, SdkP256X1, SdkP256S32, value, ws.uint16, 0)
+  bflb_pka_mrem(dev, SdkP256X1, SdkP256S32, SdkP256X1, SdkP256S32,
+                SdkP256Mod, SdkP256S32, 1)
+  bflb_pka_read(dev, SdkP256X1, SdkP256S32, outValue, ws.uint16)
+  bflb_pka_deinit(dev)
+  0
+
+proc pkaMulModN(dev: ptr BflbDevice, a, b, outValue: ptr uint32): cint =
+  if dev == nil or a == nil or b == nil or outValue == nil:
+    return -1
+  let (_, cn, _, _, _, _, _, _, cprimnn, ws) = getP256CurveParams()
+  bflb_pka_init(dev)
+  bflb_pka_write(dev, SdkP256Mod, SdkP256S32, cn, ws.uint16, 0)
+  bflb_pka_write(dev, SdkP256PrimeN, SdkP256S32, cprimnn, ws.uint16, 0)
+  bflb_pka_write(dev, SdkP256X1, SdkP256S32, a, ws.uint16, 0)
+  bflb_pka_write(dev, SdkP256Y1, SdkP256S32, b, ws.uint16, 0)
+  bflb_pka_lmul(dev, SdkP256X1, SdkP256S32, SdkP256T13,
+                PkaRegSize128, SdkP256Y1, SdkP256S32, 1)
+  bflb_pka_mrem(dev, SdkP256T13, PkaRegSize128, SdkP256X1,
+                SdkP256S32, SdkP256Mod, SdkP256S32, 1)
+  bflb_pka_read(dev, SdkP256X1, SdkP256S32, outValue, ws.uint16)
+  bflb_pka_deinit(dev)
+  0
+
+proc pkaInvModN(dev: ptr BflbDevice, value, outValue: ptr uint32): cint =
+  if dev == nil or value == nil or outValue == nil:
+    return -1
+  let (_, cn, _, _, _, _, _, cinvrn, cprimnn, ws) = getP256CurveParams()
+  bflb_pka_init(dev)
+  bflb_pka_write(dev, SdkP256Mod, SdkP256S32, cn, ws.uint16, 0)
+  bflb_pka_write(dev, SdkP256PrimeN, SdkP256S32, cprimnn, ws.uint16, 0)
+  bflb_pka_write(dev, SdkP256Y1, SdkP256S32, cinvrn, ws.uint16, 0)
+  bflb_pka_write(dev, SdkP256X2, SdkP256S32, value, ws.uint16, 0)
+  bflb_pka_clir(dev, SdkP256T13, SdkP256S32, ws.uint16, 1)
+  bflb_pka_clir(dev, SdkP256T14, SdkP256S32, ws.uint16, 1)
+  bflb_pka_gf2mont(dev, SdkP256X2, SdkP256S32, SdkP256X2,
+                   SdkP256S32, SdkP256Z2, SdkP256S64,
+                   SdkP256Mod, SdkP256S32, ws * 32)
+  bflb_pka_minv(dev, SdkP256X2, SdkP256S32, SdkP256Y2,
+                SdkP256S32, SdkP256Mod, SdkP256S32, 1)
+  bflb_pka_mont2gf(dev, SdkP256Y2, SdkP256S32, SdkP256X2,
+                   SdkP256S32, SdkP256Y1, SdkP256S32,
+                   SdkP256Z2, SdkP256S64, SdkP256Mod, SdkP256S32)
+  bflb_pka_read(dev, SdkP256X2, SdkP256S32, outValue, ws.uint16)
+  bflb_pka_deinit(dev)
+  0
+
+proc pkaAddModP(dev: ptr BflbDevice, a, b, outValue: ptr uint32): cint =
+  if dev == nil or a == nil or b == nil or outValue == nil:
+    return -1
+  let (cp, _, _, _, _, _, cprimn, _, _, ws) = getP256CurveParams()
+  bflb_pka_init(dev)
+  bflb_pka_write(dev, SdkP256Mod, SdkP256S32, cp, ws.uint16, 0)
+  bflb_pka_write(dev, SdkP256PrimeN, SdkP256S32, cprimn, ws.uint16, 0)
+  bflb_pka_write(dev, SdkP256X1, SdkP256S32, a, ws.uint16, 0)
+  bflb_pka_write(dev, SdkP256Y1, SdkP256S32, b, ws.uint16, 0)
+  bflb_pka_madd(dev, SdkP256X1, SdkP256S32, SdkP256X2,
+                SdkP256S32, SdkP256Y1, SdkP256S32,
+                SdkP256Mod, SdkP256S32, 1)
+  bflb_pka_read(dev, SdkP256X2, SdkP256S32, outValue, ws.uint16)
+  bflb_pka_deinit(dev)
+  0
+
+proc pkaSubModP(dev: ptr BflbDevice, a, b, outValue: ptr uint32): cint =
+  if dev == nil or a == nil or b == nil or outValue == nil:
+    return -1
+  let (cp, _, _, _, _, _, cprimn, _, _, ws) = getP256CurveParams()
+  bflb_pka_init(dev)
+  bflb_pka_write(dev, SdkP256Mod, SdkP256S32, cp, ws.uint16, 0)
+  bflb_pka_write(dev, SdkP256PrimeN, SdkP256S32, cprimn, ws.uint16, 0)
+  bflb_pka_write(dev, SdkP256X1, SdkP256S32, a, ws.uint16, 0)
+  bflb_pka_write(dev, SdkP256Y1, SdkP256S32, b, ws.uint16, 0)
+  bflb_pka_msub(dev, SdkP256X1, SdkP256S32, SdkP256X2,
+                SdkP256S32, SdkP256Y1, SdkP256S32,
+                SdkP256Mod, SdkP256S32, 1)
+  bflb_pka_read(dev, SdkP256X2, SdkP256S32, outValue, ws.uint16)
+  bflb_pka_deinit(dev)
+  0
+
+proc pkaMulModP(dev: ptr BflbDevice, a, b, outValue: ptr uint32): cint =
+  if dev == nil or a == nil or b == nil or outValue == nil:
+    return -1
+  let (cp, _, _, _, _, _, cprimn, _, _, ws) = getP256CurveParams()
+  bflb_pka_init(dev)
+  bflb_pka_write(dev, SdkP256Mod, SdkP256S32, cp, ws.uint16, 0)
+  bflb_pka_write(dev, SdkP256PrimeN, SdkP256S32, cprimn, ws.uint16, 0)
+  bflb_pka_write(dev, SdkP256X1, SdkP256S32, a, ws.uint16, 0)
+  bflb_pka_write(dev, SdkP256Y1, SdkP256S32, b, ws.uint16, 0)
+  bflb_pka_lmul(dev, SdkP256X1, SdkP256S32, SdkP256T13,
+                PkaRegSize128, SdkP256Y1, SdkP256S32, 1)
+  bflb_pka_mrem(dev, SdkP256T13, PkaRegSize128, SdkP256X2,
+                SdkP256S32, SdkP256Mod, SdkP256S32, 1)
+  bflb_pka_read(dev, SdkP256X2, SdkP256S32, outValue, ws.uint16)
+  bflb_pka_deinit(dev)
+  0
+
+proc pkaInvModP(dev: ptr BflbDevice, value, outValue: ptr uint32): cint =
+  if dev == nil or value == nil or outValue == nil:
+    return -1
+  let (cp, _, _, _, _, cinvr, cprimn, _, _, ws) = getP256CurveParams()
+  bflb_pka_init(dev)
+  bflb_pka_write(dev, SdkP256Mod, SdkP256S32, cp, ws.uint16, 0)
+  bflb_pka_write(dev, SdkP256PrimeN, SdkP256S32, cprimn, ws.uint16, 0)
+  bflb_pka_write(dev, SdkP256Y1, SdkP256S32, cinvr, ws.uint16, 0)
+  bflb_pka_write(dev, SdkP256X2, SdkP256S32, value, ws.uint16, 0)
+  bflb_pka_clir(dev, SdkP256T13, SdkP256S32, ws.uint16, 1)
+  bflb_pka_clir(dev, SdkP256T14, SdkP256S32, ws.uint16, 1)
+  bflb_pka_gf2mont(dev, SdkP256X2, SdkP256S32, SdkP256X2,
+                   SdkP256S32, SdkP256Z2, SdkP256S64,
+                   SdkP256Mod, SdkP256S32, ws * 32)
+  bflb_pka_minv(dev, SdkP256X2, SdkP256S32, SdkP256Y2,
+                SdkP256S32, SdkP256Mod, SdkP256S32, 1)
+  bflb_pka_mont2gf(dev, SdkP256Y2, SdkP256S32, SdkP256X2,
+                   SdkP256S32, SdkP256Y1, SdkP256S32,
+                   SdkP256Z2, SdkP256S64, SdkP256Mod, SdkP256S32)
+  bflb_pka_read(dev, SdkP256X2, SdkP256S32, outValue, ws.uint16)
+  bflb_pka_deinit(dev)
+  0
+
+proc sdkP256MontLoadAffineCoord(dev: ptr BflbDevice, regIdx: uint8,
+                                value: ptr uint32) =
+  bflb_pka_write(dev, regIdx, SdkP256S32, value, SdkP256Words, 0)
+  bflb_pka_clir(dev, SdkP256T13, SdkP256S32, SdkP256Words, 1)
+  bflb_pka_clir(dev, SdkP256T14, SdkP256S32, SdkP256Words, 1)
+  bflb_pka_gf2mont(dev, regIdx, SdkP256S32, regIdx, SdkP256S32,
+                   SdkP256Z2, SdkP256S64, SdkP256Mod, SdkP256S32,
+                   SdkP256Words.uint32 * 32)
+
+proc pkaP256AddAffineXModN(dev: ptr BflbDevice, x1, y1, x2, y2,
+                           outXModN: ptr uint32): cint =
+  if dev == nil or x1 == nil or y1 == nil or x2 == nil or y2 == nil or
+      outXModN == nil:
+    return -1
+
+  var slopeNum, slopeDen, slopeDenInv: array[8, uint32]
+  var lambda, lambda2, x3: array[8, uint32]
+
+  if eccCmpBeBytes(cast[ptr uint8](x1), cast[ptr uint8](x2), 32) == 0:
+    if eccCmpBeBytes(cast[ptr uint8](y1), cast[ptr uint8](y2), 32) != 0:
+      return -1
+    if eccIsZeroBytes(cast[ptr uint8](y1), 32):
+      return -1
+
+    var xSquared, twiceXSquared, threeXSquared: array[8, uint32]
+    var three = [0'u32, 0, 0, 0, 0, 0, 0, 0x03000000'u32]
+    var twiceX: array[8, uint32]
+    if pkaMulModP(dev, x1, x1, addr xSquared[0]) != 0:
+      return -1
+    if pkaAddModP(dev, addr xSquared[0], addr xSquared[0],
+                  addr twiceXSquared[0]) != 0:
+      return -1
+    if pkaAddModP(dev, addr twiceXSquared[0], addr xSquared[0],
+                  addr threeXSquared[0]) != 0:
+      return -1
+    if pkaSubModP(dev, addr threeXSquared[0], addr three[0],
+                  addr slopeNum[0]) != 0:
+      return -1
+    if pkaAddModP(dev, y1, y1, addr slopeDen[0]) != 0:
+      return -1
+    if pkaInvModP(dev, addr slopeDen[0], addr slopeDenInv[0]) != 0:
+      return -1
+    if pkaMulModP(dev, addr slopeNum[0], addr slopeDenInv[0],
+                  addr lambda[0]) != 0:
+      return -1
+    if pkaMulModP(dev, addr lambda[0], addr lambda[0], addr lambda2[0]) != 0:
+      return -1
+    if pkaAddModP(dev, x1, x1, addr twiceX[0]) != 0:
+      return -1
+    if pkaSubModP(dev, addr lambda2[0], addr twiceX[0], addr x3[0]) != 0:
+      return -1
+    return pkaReduceModN(dev, addr x3[0], outXModN)
+
+  var tmp: array[8, uint32]
+  if pkaSubModP(dev, y2, y1, addr slopeNum[0]) != 0:
+    return -1
+  if pkaSubModP(dev, x2, x1, addr slopeDen[0]) != 0:
+    return -1
+  if pkaInvModP(dev, addr slopeDen[0], addr slopeDenInv[0]) != 0:
+    return -1
+  if pkaMulModP(dev, addr slopeNum[0], addr slopeDenInv[0],
+                addr lambda[0]) != 0:
+    return -1
+  if pkaMulModP(dev, addr lambda[0], addr lambda[0], addr lambda2[0]) != 0:
+    return -1
+  if pkaSubModP(dev, addr lambda2[0], x1, addr tmp[0]) != 0:
+    return -1
+  if pkaSubModP(dev, addr tmp[0], x2, addr x3[0]) != 0:
+    return -1
+  pkaReduceModN(dev, addr x3[0], outXModN)
+
+proc isP256FieldElementBe(value: ptr uint32): bool =
+  value != nil and
+    eccCmpBeBytes(cast[ptr uint8](value),
+                  cast[ptr uint8](unsafeAddr secp256r1P[0]), 32) < 0
+
+proc isP256PublicKeyRangeBe(x, y: ptr uint32): bool =
+  x != nil and y != nil and
+    not (eccIsZeroBytes(cast[ptr uint8](x), 32) and
+         eccIsZeroBytes(cast[ptr uint8](y), 32)) and
+    isP256FieldElementBe(x) and isP256FieldElementBe(y)
+
+proc pkaIsValidP256PublicKey(dev: ptr BflbDevice, x, y: ptr uint32): bool =
+  if dev == nil or not isP256PublicKeyRangeBe(x, y):
+    return false
+
+  bflb_pka_init(dev)
+  sdkP256PointMulInit(dev)
+  sdkP256MontLoadAffineCoord(dev, SdkP256X1, x)
+  sdkP256MontLoadAffineCoord(dev, SdkP256Y1, y)
+  sdkP256MontLoadAffineCoord(dev, SdkP256X2, unsafeAddr secp256r1B[0])
+
+  bflb_pka_mmul(dev, SdkP256Y1, SdkP256S32, SdkP256Y2, SdkP256S32,
+                SdkP256Y1, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256X1, SdkP256S32, SdkP256T13, SdkP256S32,
+                SdkP256X1, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256T13, SdkP256S32, SdkP256T13, SdkP256S32,
+                SdkP256X1, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_mmul(dev, SdkP256Bar3, SdkP256S32, SdkP256T14, SdkP256S32,
+                SdkP256X1, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_msub(dev, SdkP256T13, SdkP256S32, SdkP256T13, SdkP256S32,
+                SdkP256T14, SdkP256S32, SdkP256Mod, SdkP256S32, 0)
+  bflb_pka_madd(dev, SdkP256T13, SdkP256S32, SdkP256T13, SdkP256S32,
+                SdkP256X2, SdkP256S32, SdkP256Mod, SdkP256S32, 1)
+
+  let valid = bflb_pka_lcmp(dev, SdkP256Y2, SdkP256S32,
+                            SdkP256T13, SdkP256S32) == 0
+  bflb_pka_deinit(dev)
+  valid
 
 type
   Ec256 = array[8, uint32]
@@ -1135,6 +1618,10 @@ const
   EcGy: Ec256 = [
     0x37BF51F5'u32, 0xCBB64068'u32, 0x6B315ECE'u32, 0x2BCE3357'u32,
     0x7C0F9E16'u32, 0x8EE7EB4A'u32, 0xFE1A7F9B'u32, 0x4FE342E2'u32
+  ]
+  EcB: Ec256 = [
+    0x27D2604B'u32, 0x3BCE3C3E'u32, 0xCC53B0F6'u32, 0x651D06B0'u32,
+    0x769886BC'u32, 0xB3EBBD55'u32, 0xAA3A93E7'u32, 0x5AC635D8'u32
   ]
 
 proc ecFromBe(dst: var Ec256, src: ptr uint32) =
@@ -1373,18 +1860,66 @@ proc ecAffineAdd(x1, y1, x2, y2: Ec256, outX, outY: var Ec256): cint =
     ecPointDouble(p)
     if ecPointToAffine(p, outX, outY): return 0 else: return -1
 
-  var num, den, inv, lambda, tmp: Ec256
+  var num, den, inv, lambda, tmp, x3, y3: Ec256
   ecSubMod(num, y2, y1, EcP)
   ecSubMod(den, x2, x1, EcP)
   ecInvMod(inv, den, EcP)
   ecMulMod(lambda, num, inv, EcP)
-  ecMulMod(outX, lambda, lambda, EcP)
-  ecSubMod(outX, outX, x1, EcP)
-  ecSubMod(outX, outX, x2, EcP)
-  ecSubMod(tmp, x1, outX, EcP)
-  ecMulMod(outY, lambda, tmp, EcP)
-  ecSubMod(outY, outY, y1, EcP)
+  ecMulMod(x3, lambda, lambda, EcP)
+  ecSubMod(x3, x3, x1, EcP)
+  ecSubMod(x3, x3, x2, EcP)
+  ecSubMod(tmp, x1, x3, EcP)
+  ecMulMod(y3, lambda, tmp, EcP)
+  ecSubMod(y3, y3, y1, EcP)
+  outX = x3
+  outY = y3
   0
+
+proc ecIsValidPublicKey(x, y: Ec256): bool =
+  if (ecIsZero(x) and ecIsZero(y)) or ecCmp(x, EcP) >= 0 or ecCmp(y, EcP) >= 0:
+    return false
+
+  var y2, x2, rhs, threeX: Ec256
+  ecMulMod(y2, y, y, EcP)
+  ecMulMod(x2, x, x, EcP)
+  ecMulMod(rhs, x2, x, EcP)
+  ecMulSmallMod(threeX, x, 3, EcP)
+  ecSubMod(rhs, rhs, threeX, EcP)
+  ecAddMod(rhs, rhs, EcB, EcP)
+  ecCmp(y2, rhs) == 0
+
+proc isValidP256ScalarBe(scalar: ptr uint32): bool =
+  if scalar == nil:
+    return false
+  const byteLen = 32'u32
+  not eccIsZeroBytes(cast[ptr uint8](scalar), byteLen) and
+    eccCmpBeBytes(cast[ptr uint8](scalar),
+                  cast[ptr uint8](unsafeAddr secp256r1N[0]), byteLen) < 0
+
+proc isValidP256PublicKeyBe(x, y: ptr uint32): bool =
+  if x == nil or y == nil:
+    return false
+  var qx, qy: Ec256
+  ecFromBe(qx, x)
+  ecFromBe(qy, y)
+  ecIsValidPublicKey(qx, qy)
+
+proc bflb_sec_p256_is_valid_public_key_be*(x, y: ptr uint32): bool =
+  isValidP256PublicKeyBe(x, y)
+
+proc bflb_sec_p256_inverse_field_be*(value, outValue: ptr uint32): cint =
+  if value == nil or outValue == nil or
+      eccIsZeroBytes(cast[ptr uint8](value), 32) or
+      not isP256FieldElementBe(value):
+    return -1
+  when defined(bl808m0):
+    pkaInvModP(pka, value, outValue)
+  else:
+    var v, inv: Ec256
+    ecFromBe(v, value)
+    ecInvMod(inv, v, EcP)
+    ecToBe(outValue, inv)
+    0
 
 proc ecScalarMulMem(scalar: ptr uint32, px, py: ptr uint32,
                     outX, outY: ptr uint32): cint =
@@ -1403,36 +1938,16 @@ proc eccScalarMulComplete(dev: ptr BflbDevice, ecpId: uint8,
                           px, py: ptr uint32,
                           outX, outY: ptr uint32): cint =
   ## Full scalar point multiplication: (outX, outY) = scalar * (px, py).
-  if ecpId == EcpSecp256r1 or ecpId == EcpSecp256k1 or ecpId == EcpSecp384r1:
-    return ecScalarMulMem(scalar, px, py, outX, outY)
-
-  let ws: uint32 = if ecpId == EcpSecp384r1: 12 else: 8
-
-  bflb_pka_init(dev)
-  eccLoadCurveParams(dev, ecpId)
-
-  # Load input point into PX, PY registers
-  bflb_pka_write(dev, R_PX, SZ, px, ws.uint16, 0)
-  bflb_pka_write(dev, R_PY, SZ, py, ws.uint16, 0)
-
-  # Convert point to Montgomery domain
-  bflb_pka_gf2mont(dev, R_PX, SZ, R_PX, SZ, R_TMP19, SZ, R_P, SZ, ws)
-  bflb_pka_gf2mont(dev, R_PY, SZ, R_PY, SZ, R_TMP19, SZ, R_P, SZ, ws)
-
-  # Perform scalar multiplication
-  eccPointMul(dev, scalar, ws)
-
-  # Convert result from Jacobian+Montgomery to affine+GF
-  eccJacobianToAffine(dev, ws)
-  bflb_pka_mont2gf(dev, R_RX, SZ, R_RX, SZ, R_INVR, SZ, R_TMP19, SZ, R_P, SZ)
-  bflb_pka_mont2gf(dev, R_RY, SZ, R_RY, SZ, R_INVR, SZ, R_TMP19, SZ, R_P, SZ)
-
-  # Read results
-  bflb_pka_read(dev, R_RX, SZ, outX, ws.uint16)
-  bflb_pka_read(dev, R_RY, SZ, outY, ws.uint16)
-
-  bflb_pka_deinit(dev)
-  0
+  if dev == nil or scalar == nil or px == nil or py == nil or outX == nil or
+      outY == nil:
+    return -1
+  case ecpId
+  of EcpSecp256r1:
+    return sdkP256ScalarMulComplete(dev, scalar, px, py, outX, outY)
+  of EcpSecp256k1, EcpSecp384r1:
+    return -1
+  else:
+    return -1
 
 # =============================================================================
 # ECDSA / ECDH / DSA — full implementations
@@ -1441,123 +1956,241 @@ proc eccScalarMulComplete(dev: ptr BflbDevice, ecpId: uint8,
 proc bflb_sec_ecdsa_get_private_key*(handle: ptr BflbEcdsa,
                                      privateKey: ptr uint32): cint {.exportc, cdecl.} =
   ## Generate a random private key < n.
-  let (_, cn, _, _, _, _, _, _, _, ws) = getCurveParams(handle.ecpId)
+  if handle == nil or privateKey == nil or not isSupportedEcpId(handle.ecpId):
+    return -1
+  let (_, cn, _, _, _, _, _, _, _, ws) = getP256CurveParams()
+  let byteLen = ws * 4
   var tries = 100
   while tries > 0:
-    let rc = bflb_sec_ecc_get_random_value(privateKey, cn, ws)
+    let rc = bflb_sec_ecc_get_random_value(privateKey, cn, byteLen)
     if rc != 0: return rc
-    # Ensure key is not zero and < n
-    if bflb_sec_ecc_is_zero(privateKey, ws) == 0:
-      if bflb_sec_ecc_cmp(privateKey, cn, ws) < 0:
-        return 0
+    if not eccIsZeroBytes(cast[ptr uint8](privateKey), byteLen):
+      return 0
     tries.dec
   -1
 
 proc bflb_sec_ecdsa_get_public_key*(handle: ptr BflbEcdsa,
                                     privateKey, pRx, pRy: ptr uint32): cint {.exportc, cdecl.} =
   ## Compute public key Q = privateKey * G.
+  if handle == nil or privateKey == nil or pRx == nil or pRy == nil or
+      not isSupportedEcpId(handle.ecpId) or not isValidP256ScalarBe(privateKey):
+    return -1
   handle.privateKey = cast[ptr uint32](privateKey)
   handle.publicKeyx = pRx
   handle.publicKeyy = pRy
-  let (_, _, cgx, cgy, _, _, _, _, _, _) = getCurveParams(handle.ecpId)
+  let (_, _, cgx, cgy, _, _, _, _, _, _) = getP256CurveParams()
   eccScalarMulComplete(pka, handle.ecpId, privateKey, cgx, cgy, pRx, pRy)
 
 proc bflb_sec_ecdsa_sign*(handle: ptr BflbEcdsa, randomK, hash: ptr uint32,
                           hashLenInWord: uint32,
                           r, s: ptr uint32): cint {.exportc, cdecl.} =
   ## ECDSA signature: (r, s) where r = (k*G).x mod n, s = k^-1*(hash + r*d) mod n.
-  let (_, cn, cgx, cgy, _, _, _, cinvrn, cprimnn, ws) = getCurveParams(handle.ecpId)
-
-  # Step 1: (x1, y1) = k * G
-  var kx, ky: array[12, uint32]
-  let rc = eccScalarMulComplete(pka, handle.ecpId, randomK, cgx, cgy,
-                                addr kx[0], addr ky[0])
-  if rc != 0: return rc
-
-  # Step 2: r = x1 mod n
-  bflb_pka_init(pka)
-  bflb_pka_write(pka, R_N, SZ, cn, ws.uint16, 0)
-  bflb_pka_write(pka, R_RX, SZ, addr kx[0], ws.uint16, 0)
-  bflb_pka_mrem(pka, R_RX, SZ, R_RX, SZ, R_N, SZ, 1)
-  bflb_pka_read(pka, R_RX, SZ, r, ws.uint16)
-
-  # Check r != 0
-  if bflb_sec_ecc_is_zero(r, ws) != 0:
-    bflb_pka_deinit(pka)
+  if handle == nil or handle.privateKey == nil or hash == nil or r == nil or
+      s == nil or not isSupportedEcpId(handle.ecpId) or
+      not isValidP256ScalarBe(handle.privateKey):
     return -1
+  let (_, cn, cgx, cgy, _, _, _, cinvrn, cprimnn, ws) = getP256CurveParams()
+  let byteLen = ws * 4
 
-  # Step 3: s = k^-1 * (hash + r * privateKey) mod n
-  # Load n companion registers for Montgomery ops modulo n.
-  bflb_pka_write(pka, R_PRIMN_N, SZ, cprimnn, ws.uint16, 0)
-  bflb_pka_write(pka, R_INVR_N, SZ, cinvrn, ws.uint16, 0)
+  var tries = 100
+  while tries > 0:
+    var k: array[8, uint32]
+    if randomK == nil:
+      if bflb_sec_ecc_get_random_value(addr k[0], cn, byteLen) != 0:
+        return -1
+    else:
+      copyWords(addr k[0], randomK, ws)
+      tries = 1
+    if eccIsZeroBytes(cast[ptr uint8](addr k[0]), byteLen) or
+        eccCmpBeBytes(cast[ptr uint8](addr k[0]),
+                      cast[ptr uint8](cn), byteLen) >= 0:
+      tries.dec
+      continue
 
-  # T1 = r * privateKey mod n
-  bflb_pka_write(pka, R_TMP1, SZ, r, ws.uint16, 0)
-  bflb_pka_write(pka, R_TMP5, SZ, handle.privateKey, ws.uint16, 0)
-  bflb_pka_mmul(pka, R_TMP1, SZ, R_TMP1, SZ, R_TMP5, SZ, R_N, SZ, 0)
+    var rx, ry: array[8, uint32]
+    if eccScalarMulComplete(pka, handle.ecpId, addr k[0], cgx, cgy,
+                            addr rx[0], addr ry[0]) != 0:
+      tries.dec
+      continue
+    copyWords(r, addr rx[0], ws)
+    if eccIsZeroBytes(cast[ptr uint8](r), byteLen):
+      tries.dec
+      continue
 
-  # T1 = hash + r*d mod n
-  bflb_pka_write(pka, R_TMP5, SZ, hash, min(hashLenInWord, ws).uint16, 0)
-  bflb_pka_madd(pka, R_TMP1, SZ, R_TMP1, SZ, R_TMP5, SZ, R_N, SZ, 0)
+    bflb_pka_init(pka)
+    bflb_pka_write(pka, 0, SZ, cn, ws.uint16, 0)
+    bflb_pka_write(pka, 1, SZ, cprimnn, ws.uint16, 0)
+    bflb_pka_write(pka, 2, SZ, cinvrn, ws.uint16, 0)
 
-  # T5 = k^-1 mod n
-  bflb_pka_write(pka, R_TMP5, SZ, randomK, ws.uint16, 0)
-  bflb_pka_minv(pka, R_TMP5, SZ, R_TMP5, SZ, R_N, SZ, 0)
+    bflb_pka_write(pka, 5, SZ, addr k[0], ws.uint16, 0)
+    bflb_pka_clir(pka, 13, SZ, ws.uint16, 1)
+    bflb_pka_clir(pka, 14, SZ, ws.uint16, 1)
+    bflb_pka_gf2mont(pka, 5, SZ, 5, SZ, 7, PkaRegSize64, 0, SZ,
+                     byteLen * 8)
+    bflb_pka_minv(pka, 5, SZ, 6, SZ, 0, SZ, 1)
+    bflb_pka_mont2gf(pka, 6, SZ, 5, SZ, 2, SZ, 7, PkaRegSize64, 0, SZ)
+    var kInv: array[8, uint32]
+    bflb_pka_read(pka, 5, SZ, addr kInv[0], ws.uint16)
 
-  # s = k^-1 * (hash + r*d) mod n
-  bflb_pka_mmul(pka, R_TMP5, SZ, R_TMP5, SZ, R_TMP1, SZ, R_N, SZ, 1)
-  bflb_pka_read(pka, R_TMP5, SZ, s, ws.uint16)
+    bflb_pka_write(pka, 4, SZ, handle.privateKey, ws.uint16, 0)
+    bflb_pka_write(pka, 5, SZ, r, ws.uint16, 0)
+    bflb_pka_lmul(pka, 4, SZ, 3, PkaRegSize128, 5, SZ, 1)
 
-  bflb_pka_deinit(pka)
+    var hashBuf: array[8, uint32]
+    copyWords(addr hashBuf[0], hash, min(hashLenInWord, ws))
+    bflb_pka_write(pka, 5, SZ, addr hashBuf[0], ws.uint16, 0)
+    bflb_pka_ladd(pka, 3, PkaRegSize128, 3, PkaRegSize128, 5, SZ, 1)
 
-  # Check s != 0
-  if bflb_sec_ecc_is_zero(s, ws) != 0: return -1
-  0
+    bflb_pka_write(pka, 5, SZ, addr kInv[0], ws.uint16, 0)
+    bflb_pka_lmul(pka, 3, PkaRegSize128, 3, PkaRegSize128, 5, SZ, 1)
+
+    bflb_pka_write(pka, 0, SZ, cn, ws.uint16, 0)
+    bflb_pka_mrem(pka, 3, PkaRegSize128, 4, SZ, 0, SZ, 1)
+    bflb_pka_read(pka, 4, SZ, s, ws.uint16)
+    bflb_pka_deinit(pka)
+
+    if not eccIsZeroBytes(cast[ptr uint8](s), byteLen):
+      return 0
+    tries.dec
+  -1
 
 proc bflb_sec_ecdsa_verify*(handle: ptr BflbEcdsa, hash: ptr uint32,
                             hashLen: uint32,
                             r, s: ptr uint32): cint {.exportc, cdecl.} =
   ## ECDSA verify: check (hash*s^-1)*G + (r*s^-1)*Q has x == r mod n.
-  if handle.publicKeyx == nil or handle.publicKeyy == nil:
+  if handle == nil or hash == nil or r == nil or s == nil or
+      not isSupportedEcpId(handle.ecpId) or
+      handle.publicKeyx == nil or handle.publicKeyy == nil:
     return -1
 
-  var z, rv, sv, w, u1, u2: Ec256
-  var qx, qy: Ec256
-  ecFromBe(z, hash)
-  ecNormalize(z, EcN)
-  ecFromBe(rv, r)
-  ecFromBe(sv, s)
-  if ecIsZero(rv) or ecIsZero(sv) or ecCmp(rv, EcN) >= 0 or ecCmp(sv, EcN) >= 0:
-    return -1
-  ecFromBe(qx, handle.publicKeyx)
-  ecFromBe(qy, handle.publicKeyy)
-
-  ecInvMod(w, sv, EcN)
-  ecMulMod(u1, z, w, EcN)
-  ecMulMod(u2, rv, w, EcN)
-
-  var have = false
-  var rx, ry: Ec256
-  if not ecIsZero(u1):
-    if ecScalarMulAffine(u1, EcGx, EcGy, rx, ry) != 0:
+  when defined(bl808m0):
+    let (_, _, cgx, cgy, _, _, _, _, _, ws) = getP256CurveParams()
+    let byteLen = ws * 4
+    if not isValidP256ScalarBe(r) or not isValidP256ScalarBe(s) or
+        not isValidP256PublicKeyBe(handle.publicKeyx, handle.publicKeyy):
+      when defined(bl808PkaDebug):
+        nim_pka_verify_stage = 0x10'u32
       return -1
-    have = true
-  if not ecIsZero(u2):
-    var p2x, p2y: Ec256
-    if ecScalarMulAffine(u2, qx, qy, p2x, p2y) != 0:
+
+    var hashBuf, z, w, u1, u2: array[8, uint32]
+    copyWords(addr hashBuf[0], hash, min(hashLen, ws))
+    if pkaReduceModN(pka, addr hashBuf[0], addr z[0]) != 0:
+      when defined(bl808PkaDebug):
+        nim_pka_verify_stage = 0x20'u32
       return -1
-    if have:
-      if ecAffineAdd(rx, ry, p2x, p2y, rx, ry) != 0:
+    if pkaInvModN(pka, s, addr w[0]) != 0:
+      when defined(bl808PkaDebug):
+        nim_pka_verify_stage = 0x21'u32
+      return -1
+    if pkaMulModN(pka, addr z[0], addr w[0], addr u1[0]) != 0:
+      when defined(bl808PkaDebug):
+        nim_pka_verify_stage = 0x22'u32
+      return -1
+    if pkaMulModN(pka, r, addr w[0], addr u2[0]) != 0:
+      when defined(bl808PkaDebug):
+        nim_pka_verify_stage = 0x23'u32
+      return -1
+    when defined(bl808PkaDebug):
+      for i in 0 ..< 8:
+        nim_pka_verify_w[i] = w[i]
+        nim_pka_verify_u1[i] = u1[i]
+        nim_pka_verify_u2[i] = u2[i]
+      nim_pka_verify_stage = 0x30'u32
+
+    var have = false
+    var p1x, p1y, p2x, p2y, xMod: array[8, uint32]
+    if not eccIsZeroBytes(cast[ptr uint8](addr u1[0]), byteLen):
+      if eccScalarMulComplete(pka, handle.ecpId, addr u1[0], cgx, cgy,
+                              addr p1x[0], addr p1y[0]) != 0:
+        when defined(bl808PkaDebug):
+          nim_pka_verify_stage = 0x40'u32
         return -1
-    else:
-      rx = p2x
-      ry = p2y
       have = true
-  if not have:
-    return -1
 
-  ecNormalize(rx, EcN)
-  if ecCmp(rx, rv) == 0: 0 else: -1
+    if not eccIsZeroBytes(cast[ptr uint8](addr u2[0]), byteLen):
+      if eccScalarMulComplete(pka, handle.ecpId, addr u2[0],
+                              handle.publicKeyx, handle.publicKeyy,
+                              addr p2x[0], addr p2y[0]) != 0:
+        when defined(bl808PkaDebug):
+          nim_pka_verify_stage = 0x50'u32
+        return -1
+      if have:
+        if pkaP256AddAffineXModN(pka, addr p1x[0], addr p1y[0],
+                                 addr p2x[0], addr p2y[0],
+                                 addr xMod[0]) != 0:
+          when defined(bl808PkaDebug):
+            nim_pka_verify_stage = 0x60'u32
+          return -1
+      else:
+        if pkaReduceModN(pka, addr p2x[0], addr xMod[0]) != 0:
+          when defined(bl808PkaDebug):
+            nim_pka_verify_stage = 0x61'u32
+          return -1
+        have = true
+    elif have:
+      if pkaReduceModN(pka, addr p1x[0], addr xMod[0]) != 0:
+        when defined(bl808PkaDebug):
+          nim_pka_verify_stage = 0x62'u32
+        return -1
+
+    if not have:
+      when defined(bl808PkaDebug):
+        nim_pka_verify_stage = 0x63'u32
+      return -1
+    when defined(bl808PkaDebug):
+      for i in 0 ..< 8:
+        nim_pka_verify_xmod[i] = xMod[i]
+      nim_pka_verify_stage = 0x70'u32
+    if eccCmpBeBytes(cast[ptr uint8](addr xMod[0]),
+                     cast[ptr uint8](r), byteLen) == 0:
+      when defined(bl808PkaDebug):
+        nim_pka_verify_stage = 0x71'u32
+      return 0
+    when defined(bl808PkaDebug):
+      nim_pka_verify_stage = 0x72'u32
+    return -1
+  else:
+    var z, rv, sv, w, u1, u2: Ec256
+    var qx, qy: Ec256
+    var hashBuf: array[8, uint32]
+    copyWords(addr hashBuf[0], hash, min(hashLen, 8'u32))
+    ecFromBe(z, addr hashBuf[0])
+    ecNormalize(z, EcN)
+    ecFromBe(rv, r)
+    ecFromBe(sv, s)
+    if ecIsZero(rv) or ecIsZero(sv) or ecCmp(rv, EcN) >= 0 or ecCmp(sv, EcN) >= 0:
+      return -1
+    ecFromBe(qx, handle.publicKeyx)
+    ecFromBe(qy, handle.publicKeyy)
+    if not ecIsValidPublicKey(qx, qy):
+      return -1
+
+    ecInvMod(w, sv, EcN)
+    ecMulMod(u1, z, w, EcN)
+    ecMulMod(u2, rv, w, EcN)
+
+    var have = false
+    var rx, ry: Ec256
+    if not ecIsZero(u1):
+      if ecScalarMulAffine(u1, EcGx, EcGy, rx, ry) != 0:
+        return -1
+      have = true
+    if not ecIsZero(u2):
+      var p2x, p2y: Ec256
+      if ecScalarMulAffine(u2, qx, qy, p2x, p2y) != 0:
+        return -1
+      if have:
+        if ecAffineAdd(rx, ry, p2x, p2y, rx, ry) != 0:
+          return -1
+      else:
+        rx = p2x
+        ry = p2y
+        have = true
+    if not have:
+      return -1
+
+    ecNormalize(rx, EcN)
+    if ecCmp(rx, rv) == 0: 0 else: -1
 
 proc bflb_sec_ecdsa_sign_384*(handle: ptr BflbEcdsa, randomK, hash: ptr uint32,
                               hashLenInWord: uint32,
@@ -1572,13 +2205,20 @@ proc bflb_sec_ecdsa_verify_384*(handle: ptr BflbEcdsa, hash: ptr uint32,
 proc bflb_sec_ecdh_get_public_key*(handle: ptr BflbEcdh,
                                    privateKey, pRx, pRy: ptr uint32): cint {.exportc, cdecl.} =
   ## ECDH: publicKey = privateKey * G.
-  let (_, _, cgx, cgy, _, _, _, _, _, _) = getCurveParams(handle.ecpId)
+  if handle == nil or privateKey == nil or pRx == nil or pRy == nil or
+      not isSupportedEcpId(handle.ecpId) or not isValidP256ScalarBe(privateKey):
+    return -1
+  let (_, _, cgx, cgy, _, _, _, _, _, _) = getP256CurveParams()
   eccScalarMulComplete(pka, handle.ecpId, privateKey, cgx, cgy, pRx, pRy)
 
 proc bflb_sec_ecdh_get_encrypt_key*(handle: ptr BflbEcdh,
                                     pkX, pkY, privateKey: ptr uint32,
                                     pRx, pRy: ptr uint32): cint {.exportc, cdecl.} =
   ## ECDH: sharedSecret = privateKey * peerPublicKey.
+  if handle == nil or pkX == nil or pkY == nil or privateKey == nil or
+      pRx == nil or pRy == nil or not isSupportedEcpId(handle.ecpId) or
+      not isValidP256ScalarBe(privateKey) or not isValidP256PublicKeyBe(pkX, pkY):
+    return -1
   eccScalarMulComplete(pka, handle.ecpId, privateKey, pkX, pkY, pRx, pRy)
 
 proc bflb_sec_ecdh_get_scalar_point_384*(handle: ptr BflbEcdh,
@@ -1590,7 +2230,8 @@ proc bflb_sec_dsa_sign*(handle: ptr BflbDsa, hash: ptr uint32,
                         hashLenInWord: uint32,
                         s: ptr uint32): cint {.exportc, cdecl.} =
   ## RSA/DSA sign: s = hash^d mod n (modular exponentiation).
-  if handle.size == 0 or handle.size > (DsaMaxWords.uint32 * 32'u32) or
+  if handle == nil or handle.size == 0 or
+      handle.size > (DsaMaxWords.uint32 * 32'u32) or
       handle.n == nil or handle.d == nil or hash == nil or s == nil:
     return -1
   let words = wordLenForBits(handle.size)
@@ -1608,7 +2249,8 @@ proc bflb_sec_dsa_verify*(handle: ptr BflbDsa, hash: ptr uint32,
                           hashLenInWord: uint32,
                           s: ptr uint32): cint {.exportc, cdecl.} =
   ## RSA/DSA verify: compute s^e mod n, compare with hash.
-  if handle.size == 0 or handle.size > (DsaMaxWords.uint32 * 32'u32) or
+  if handle == nil or handle.size == 0 or
+      handle.size > (DsaMaxWords.uint32 * 32'u32) or
       handle.n == nil or handle.e == nil or hash == nil or s == nil:
     return -1
   let words = wordLenForBits(handle.size)

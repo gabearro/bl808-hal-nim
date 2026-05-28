@@ -244,6 +244,10 @@ when defined(bl808m0):
     var bleblob_llc_start_seen {.importc.}: uint32
     var bleblob_llc_start_header {.importc.}: array[4, uint32]
     var bleblob_llc_start_msg {.importc.}: array[64, uint8]
+    var bleblob_llc_start_em {.importc.}: array[64, uint32]
+    var bleblob_llc_start_rx {.importc.}: array[64, uint32]
+    var bleblob_llc_start_tx {.importc.}: array[16, uint32]
+    var bleblob_llc_start_regs {.importc.}: array[8, uint32]
 
   proc bleBlobDbgLlcStartSeen*(): uint32 =
     when defined(bl808BleVendorCaptureLlcStart):
@@ -269,6 +273,46 @@ when defined(bl808m0):
           (uint32(bleblob_llc_start_msg[(off + 1'u32).int]) shl 8) or
           (uint32(bleblob_llc_start_msg[(off + 2'u32).int]) shl 16) or
           (uint32(bleblob_llc_start_msg[(off + 3'u32).int]) shl 24)
+      else:
+        0'u32
+    else:
+      discard index
+      0'u32
+
+  proc bleBlobDbgLlcStartEmWord*(index: uint32): uint32 =
+    when defined(bl808BleVendorCaptureLlcStart):
+      if index < bleblob_llc_start_em.len.uint32:
+        bleblob_llc_start_em[index.int]
+      else:
+        0'u32
+    else:
+      discard index
+      0'u32
+
+  proc bleBlobDbgLlcStartRxWord*(index: uint32): uint32 =
+    when defined(bl808BleVendorCaptureLlcStart):
+      if index < bleblob_llc_start_rx.len.uint32:
+        bleblob_llc_start_rx[index.int]
+      else:
+        0'u32
+    else:
+      discard index
+      0'u32
+
+  proc bleBlobDbgLlcStartTxWord*(index: uint32): uint32 =
+    when defined(bl808BleVendorCaptureLlcStart):
+      if index < bleblob_llc_start_tx.len.uint32:
+        bleblob_llc_start_tx[index.int]
+      else:
+        0'u32
+    else:
+      discard index
+      0'u32
+
+  proc bleBlobDbgLlcStartRegWord*(index: uint32): uint32 =
+    when defined(bl808BleVendorCaptureLlcStart):
+      if index < bleblob_llc_start_regs.len.uint32:
+        bleblob_llc_start_regs[index.int]
       else:
         0'u32
     else:

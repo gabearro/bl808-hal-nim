@@ -257,6 +257,8 @@ when defined(bl808m0) and defined(bl808WifiVendor) and defined(bl808WifiNimFw):
   var fwStarted: bool
   var staEnabled: bool
   var apEnabled: bool
+  var osMutexDepth: uint32
+  var osMutexSavedIrq: uint32
   var connectDone = -1'i32
   var disconnectDone: int32
   var scanDoneCount: uint32
@@ -603,8 +605,12 @@ void bl808_nim_os_log_write(uint32_t level, char *tag, char *file,
     while true:
       rawDelay(1000)
 
-  proc osEnterCritical(): uint32 {.cdecl.} = 0
-  proc osExitCritical(level: uint32) {.cdecl.} = discard level
+  proc osEnterCritical(): uint32 {.cdecl.} =
+    {.emit: ["asm volatile(\"csrrci %0, mstatus, 8\" : \"=r\"(", result, ") :: \"memory\");"].}
+
+  proc osExitCritical(level: uint32) {.cdecl.} =
+    if (level and 8'u32) != 0:
+      {.emit: "asm volatile(\"csrsi mstatus, 8\" ::: \"memory\");".}
 
   proc osMsleep(ms: clong): cint {.cdecl.} =
     let deadline = readMtimeUs() + uint64(ms) * 1000'u64
@@ -676,8 +682,20 @@ void bl808_nim_os_log_write(uint32_t level, char *tag, char *file,
   proc osSemGive(sem: pointer): int32 {.cdecl.} = discard osEventGroupSend(sem, 1); 0
   proc osMutexCreate(): pointer {.cdecl.} = cast[pointer](1)
   proc osMutexDelete(mutex: pointer) {.cdecl.} = discard mutex
-  proc osMutexLock(mutex: pointer): int32 {.cdecl.} = discard mutex; 0
-  proc osMutexUnlock(mutex: pointer): int32 {.cdecl.} = discard mutex; 0
+  proc osMutexLock(mutex: pointer): int32 {.cdecl.} =
+    discard mutex
+    # Bare-metal M0 has no competing tasks; the shared state risk is IRQ re-entry.
+    if osMutexDepth == 0:
+      osMutexSavedIrq = osEnterCritical()
+    inc osMutexDepth
+    0
+  proc osMutexUnlock(mutex: pointer): int32 {.cdecl.} =
+    discard mutex
+    if osMutexDepth != 0:
+      dec osMutexDepth
+      if osMutexDepth == 0:
+        osExitCritical(osMutexSavedIrq)
+    0
 
   proc osQueueCreate(queueLen, itemSize: uint32): pointer {.cdecl.} =
     let total = sizeof(SimpleQueue).uint + queueLen.uint * itemSize.uint
@@ -1044,14 +1062,33 @@ void bl808_nim_os_log_write(uint32_t level, char *tag, char *file,
     regWrite32(CoexCtrl, 0x5010_001f'u32)
     fwStarted = true
 
+  proc vendorDrainScheduledWork() =
+    # The SDK has independent host/firmware tasks.  This port runs both sides on
+    # M0, so each poll drains bounded queued work instead of relying on UART or
+    # unrelated delays to pace command ACK/CFM delivery.
+    var budget = 16
+    while budget > 0:
+      dec budget
+      var didWork = false
+      if bl808WifiVendorHostIpcStatus() != 0:
+        inc ipcPollIrqCount
+        bl_irq_handler()
+        didWork = true
+      if keEvtField != 0:
+        ke_evt_schedule()
+        didWork = true
+      if hostPollEnabled and loadPtr(wifiHwRaw(), 48) != nil:
+        if bl808WifiVendorHostIpcStatus() != 0:
+          didWork = true
+        bl_main_event_handle(0, nil)
+      if not didWork and bl808WifiVendorHostIpcStatus() == 0 and keEvtField == 0:
+        break
+
   proc vendorPollOnce() =
     if fwStarted:
       bl808WifiVendorPollEmbEvents()
       bl808WifiVendorPollMacIrq()
       bl808WifiVendorDriveRfStatus()
-      if bl808WifiVendorHostIpcStatus() != 0:
-        inc ipcPollIrqCount
-        bl_irq_handler()
       bl_sleep_schedule()
       # NOTE: do NOT call ipc_emb_wait() here. In the vendor blob, that path
       # parks the embedded core on a WAITING_FOREVER notify when there are
@@ -1062,8 +1099,8 @@ void bl808_nim_os_log_write(uint32_t level, char *tag, char *file,
       # ke_env[0] hits 0 and the M0 deadlocks until the test harness
       # timeout. Stay busy-polling — the 100us delay in vendorPollFor is
       # the only pacing we need.
-      ke_evt_schedule()
-    if hostPollEnabled and loadPtr(wifiHwRaw(), 48) != nil:
+      vendorDrainScheduledWork()
+    elif hostPollEnabled and loadPtr(wifiHwRaw(), 48) != nil:
       bl_main_event_handle(0, nil)
 
   proc vendorPollFor(iterations: uint32) =
@@ -1545,10 +1582,11 @@ err_t pbuf_take(struct pbuf *buf, const void *dataptr, u16_t len) {
     connectDone = -1
     lastStatusCode = -1
     disconnectDone = 0
+    const flags = WifiConnectDefault or WifiConnectPmfCapable
     result = bl_main_connect(cast[ptr uint8](ssid), ssidLen.cint,
                              cast[ptr uint8](psk), pskLen.cint,
                              cast[ptr uint8](pmk), pmkLen.cint,
-                             nil, 0, freq, WifiConnectDefault or WifiConnectPmfCapable)
+                             nil, 0, freq, flags)
     discard mac
     discard band
 

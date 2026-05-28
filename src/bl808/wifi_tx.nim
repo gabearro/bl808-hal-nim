@@ -295,8 +295,8 @@ when defined(bl808m0) and defined(bl808WifiVendor) and defined(bl808WifiNimFw):
         bl_os_printf("[TX] Have remaining packets when checking!\n\r")
       else:
         bl_os_enter_critical()
-        bl_irq_handler()
         txCntrlStaTrigger = txCntrlStaTrigger or bitSta(loadU8(sta, BlStaStaIdxOff))
+        bl_irq_handler()
         bl_os_exit_critical()
 
   proc txPush(sta, txdescHost, ptxbuf, txhdr: pointer) =
@@ -504,9 +504,9 @@ when defined(bl808m0) and defined(bl808WifiVendor) and defined(bl808WifiNimFw):
     pbuf_ref(p)
     bl_os_enter_critical()
     listPushBack(ptrAt(sta, BlStaWaitingListOff), txhdr)
+    txCntrlStaTrigger = txCntrlStaTrigger or bitSta(staId)
     if txCntrlCheckFc(sta):
       bl_irq_handler()
-    txCntrlStaTrigger = txCntrlStaTrigger or bitSta(staId)
     bl_os_exit_critical()
     ErrOk
 

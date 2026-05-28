@@ -43,7 +43,9 @@ when defined(bl808m0):
   switch("riscv32.any.gcc.exe", riscvGcc)
   switch("riscv32.any.gcc.linkerexe", riscvGcc)
   switch("passC", "-march=rv32imafc -mabi=ilp32f -mcmodel=medlow")
-  switch("passC", "-ffunction-sections -fdata-sections -fno-builtin")
+  # The M0 BLE HCI path relies on normal call/return frames while crossing
+  # Nim/C callbacks; GCC sibling-call optimization can corrupt that path.
+  switch("passC", "-ffunction-sections -fdata-sections -fno-builtin -fno-optimize-sibling-calls")
   # Disable GCC -Os crossjumping so assert_err / ke_msg_send tail-call
   # sites match the blob's per-line distinct call sites (T-Head GCC did
   # not aggressively crossjump these). Lifts wifi_fw.nim match rate

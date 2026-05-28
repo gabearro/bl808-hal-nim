@@ -5,9 +5,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+MACOS_HELPER = REPO_ROOT / "tools" / "run_macos_ble_helper.py"
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,6 +36,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dump-on-fail", action="store_true", default=True,
                         help="Print a compact list of nearby advertisements if not found.")
     return parser.parse_args()
+
+
+def should_use_macos_helper() -> bool:
+    backend = os.environ.get("BL808_BLE_CONNECT_VALIDATE_BACKEND", "").lower()
+    if backend in {"bleak", "direct"}:
+        return False
+    return sys.platform == "darwin"
+
+
+def run_macos_helper(args: argparse.Namespace) -> int:
+    cmd = [
+        sys.executable,
+        str(MACOS_HELPER),
+        "connect",
+        "--name",
+        args.name,
+        "--timeout",
+        str(args.timeout),
+        "--hold-seconds",
+        str(args.hold_seconds),
+        "--dump-limit",
+        str(args.dump_limit),
+    ]
+    if args.address:
+        cmd.extend(["--address", args.address])
+    if args.payload_hex:
+        cmd.extend(["--payload-hex", args.payload_hex])
+    if args.link_only:
+        cmd.append("--link-only")
+
+    proc = subprocess.run(cmd, cwd=REPO_ROOT)
+    return proc.returncode
 
 
 @dataclass
@@ -181,6 +220,8 @@ async def run(args: argparse.Namespace) -> int:
 
 def main() -> int:
     args = parse_args()
+    if should_use_macos_helper():
+        return run_macos_helper(args)
     try:
         return asyncio.run(run(args))
     except Exception as exc:

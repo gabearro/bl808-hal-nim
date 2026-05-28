@@ -16,6 +16,8 @@ extern uint8_t rxu_cntrl_env[];
 extern uint8_t rxl_cntrl_env[];
 #endif
 extern uint8_t sta_info_tab[];
+extern uint8_t vif_info_tab[];
+extern uint8_t chan_env[];
 extern void *wpa_cbs;
 
 #ifdef BL808_WIFI_CONNECT_TRACE_RAW_RX
@@ -24,6 +26,7 @@ void __real_rxl_cntrl_evt(void);
 void __real_mm_active(void);
 void __real_mm_hw_info_set(void *mac_addr);
 uint8_t __real_mm_sec_machwaddr_wr(uint8_t sta_idx, uintptr_t key_slot);
+uint8_t txl_cntrl_tx_check(void *vif_entry);
 void __real_txl_frame_push(void *frame, uint8_t ac);
 void __real_txl_frame_push_force(void *frame, uint8_t ac);
 void __real_txl_frame_cfm(void *frame);
@@ -233,6 +236,56 @@ static void trace_tx_eapol_desc(const char *tag, void *frame, uint8_t ac,
                      (unsigned long)trace_load32(link + 292u),
                      (unsigned long)trace_load32(link + 296u),
                      (unsigned long)trace_load32(link + 300u));
+    }
+
+    if (trace_is_eapol_proto(proto)) {
+        uint8_t sta_idx = trace_load8(desc + 49u);
+        uint8_t vif_idx = trace_load8(desc + 47u);
+        uintptr_t sta = 0u;
+        uintptr_t vif = 0u;
+        uintptr_t cur = trace_load32((uintptr_t)chan_env + 32u);
+        uintptr_t sched = trace_load32((uintptr_t)chan_env + 36u);
+        uint8_t tx_ok = 0u;
+
+        if (sta_idx < 7u) {
+            sta = (uintptr_t)sta_info_tab + (uintptr_t)sta_idx * 368u;
+        }
+        if (vif_idx < 4u) {
+            vif = (uintptr_t)vif_info_tab + (uintptr_t)vif_idx * 1512u;
+            tx_ok = txl_cntrl_tx_check((void *)vif);
+        }
+
+        bl_os_printf("[WIFI-EAPOLSTA] %s n=%lu sm=%u sta=%u valid=%u inst=%u info=%u ps=%u aid=%u type=%u rate=0x%04X cap=0x%08lX rc=0x%08lX vif=%u vtype=%u vstate=%u vsta=%u keyps=0x%08lX sec=%u flags=0x%08lX txok=%u vctxt=0x%08lX cur=0x%08lX cst=%u cidx=%u calt=%u sched=0x%08lX sst=%u sidx=%u salt=%u chflags=0x%02X chcnt=%u\r\n",
+                     tag, (unsigned long)eapol_count, ke_state_get(4),
+                     sta_idx,
+                     sta ? trace_load8(sta + 42u) : 0u,
+                     sta ? trace_load8(sta + 39u) : 0u,
+                     sta ? trace_load8(sta + 40u) : 0u,
+                     sta ? trace_load8(sta + 41u) : 0u,
+                     sta ? trace_load16(sta + 36u) : 0u,
+                     sta ? trace_load8(sta + 72u) : 0u,
+                     sta ? trace_load16(sta + 70u) : 0u,
+                     (unsigned long)(sta ? trace_load32(sta + 308u) : 0u),
+                     (unsigned long)(sta ? trace_load32(sta + 324u) : 0u),
+                     vif_idx,
+                     vif ? trace_load8(vif + 86u) : 0u,
+                     vif ? trace_load8(vif + 88u) : 0u,
+                     vif ? trace_load8(vif + 96u) : 0u,
+                     (unsigned long)(vif ? trace_load32(vif + 196u) : 0u),
+                     vif ? trace_load8(vif + 497u) : 0u,
+                     (unsigned long)(vif ? trace_load32(vif + 1496u) : 0u),
+                     tx_ok,
+                     (unsigned long)(vif ? trace_load32(vif + 64u) : 0u),
+                     (unsigned long)cur,
+                     cur ? trace_load8(cur + 22u) : 0u,
+                     cur ? trace_load8(cur + 23u) : 0u,
+                     cur ? trace_load8(cur + 25u) : 0u,
+                     (unsigned long)sched,
+                     sched ? trace_load8(sched + 22u) : 0u,
+                     sched ? trace_load8(sched + 23u) : 0u,
+                     sched ? trace_load8(sched + 25u) : 0u,
+                     trace_load8((uintptr_t)chan_env + 120u),
+                     trace_load8((uintptr_t)chan_env + 124u));
     }
 
     eapol_count++;
@@ -628,10 +681,30 @@ void __wrap_txu_cntrl_push(void *desc, uint8_t ac)
 uint8_t __wrap_txl_cntrl_push(void *desc, uint8_t ac)
 {
     uint8_t ret;
+    uint16_t proto = trace_load16((uintptr_t)desc + 32u);
+    uint8_t is_eapol = trace_is_eapol_proto(proto);
 
+    if (is_eapol) {
+        bl_os_printf("[WIFI-TXLWRAP] enter desc=0x%08lX ac=%u proto=0x%04X q=0x%08lX pol=0x%08lX link=0x%08lX hw=0x%08lX\r\n",
+                     (unsigned long)(uintptr_t)desc, ac, proto,
+                     (unsigned long)trace_load32((uintptr_t)desc + 8u),
+                     (unsigned long)trace_load32((uintptr_t)desc + 88u),
+                     (unsigned long)trace_load32((uintptr_t)desc + 108u),
+                     (unsigned long)trace_load32((uintptr_t)desc + 112u));
+    }
     trace_tx_eapol_desc("txl-pre", desc, ac, 0, 0);
     ret = __real_txl_cntrl_push(desc, ac);
     trace_tx_eapol_desc("txl-post", desc, ac, 0, 0);
+    if (is_eapol || trace_is_eapol_proto(trace_load16((uintptr_t)desc + 32u))) {
+        bl_os_printf("[WIFI-TXLWRAP] exit desc=0x%08lX ret=%u proto=0x%04X q=0x%08lX pol=0x%08lX link=0x%08lX hw=0x%08lX status=0x%08lX\r\n",
+                     (unsigned long)(uintptr_t)desc, ret,
+                     trace_load16((uintptr_t)desc + 32u),
+                     (unsigned long)trace_load32((uintptr_t)desc + 8u),
+                     (unsigned long)trace_load32((uintptr_t)desc + 88u),
+                     (unsigned long)trace_load32((uintptr_t)desc + 108u),
+                     (unsigned long)trace_load32((uintptr_t)desc + 112u),
+                     (unsigned long)trace_load32(trace_load32((uintptr_t)desc + 112u) + 64u));
+    }
     return ret;
 }
 

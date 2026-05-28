@@ -170,6 +170,31 @@ proc emergencyHexUint*(v: uint) {.raises: [].} =
     emergencyPutc(ord('_').uint8)
   emergencyHex32(low32(v))
 
+when defined(bl808TrapFrameDiag):
+  var bl808_trap_frame {.importc.}: array[40, uint32]
+
+  proc faultDumpTrapFrame() {.raises: [].} =
+    if bl808_trap_frame[0] == 0'u32:
+      return
+    emergencyWrite(" frame_magic=")
+    emergencyHex32(bl808_trap_frame[0])
+    emergencyWrite(" frame_sp=")
+    emergencyHex32(bl808_trap_frame[36])
+    emergencyWrite(" frame_ra=")
+    emergencyHex32(bl808_trap_frame[37])
+    emergencyWrite(" frame_cause=")
+    emergencyHex32(bl808_trap_frame[38])
+    emergencyWrite(" frame_epc=")
+    emergencyHex32(bl808_trap_frame[39])
+    emergencyWrite(" saved_ra=")
+    emergencyHex32(bl808_trap_frame[2])
+    emergencyWrite(" saved_a0=")
+    emergencyHex32(bl808_trap_frame[6])
+    emergencyWrite(" saved_a1=")
+    emergencyHex32(bl808_trap_frame[7])
+    emergencyWrite(" saved_a2=")
+    emergencyHex32(bl808_trap_frame[8])
+
 proc faultDump*(reason: uint32, cause, epc, tval: uint) {.raises: [].} =
   emergencyWrite("\r\n[FAULT] reason=")
   emergencyHex32(reason)
@@ -181,6 +206,8 @@ proc faultDump*(reason: uint32, cause, epc, tval: uint) {.raises: [].} =
   emergencyHexUint(tval)
   emergencyWrite(" sp=")
   emergencyHexUint(readStackPointer())
+  when defined(bl808TrapFrameDiag):
+    faultDumpTrapFrame()
   emergencyWrite("\r\n")
 
 proc faultHandleTrap*(cause, epc, tval: uint) =

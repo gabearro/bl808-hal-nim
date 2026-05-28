@@ -24,7 +24,11 @@ when defined(bl808BleVendor):
     bleBlobDbgReg32,
     bleBlobDbgLlcStartSeen,
     bleBlobDbgLlcStartHeader,
-    bleBlobDbgLlcStartWord
+    bleBlobDbgLlcStartWord,
+    bleBlobDbgLlcStartEmWord,
+    bleBlobDbgLlcStartRxWord,
+    bleBlobDbgLlcStartTxWord,
+    bleBlobDbgLlcStartRegWord
 else:
   from bl808/blecontroller import
     bleNimDbgIsrCount,
@@ -78,6 +82,8 @@ else:
     bleNimDbgVendorConnStageMepc,
     bleNimDbgVendorConnStageMcause,
     bleNimDbgVendorConnStageMark,
+    bleNimDbgVendorLldConStartCount,
+    bleNimDbgVendorLldConStartStatus,
     bleNimPeripheralConnEventCount,
     bleNimPeripheralDiscEventCount,
     bleNimPeripheralDiscReason,
@@ -126,6 +132,13 @@ const
   BleHostWindowIterations {.intdefine.} = 35_000
   BlePollIterations {.intdefine.} = 8
   BlePollDelayUs {.intdefine.} = 1_000
+  bl808BleVerboseDiag {.booldefine.}: bool = false
+  bl808BlePreHostAdvDiag {.booldefine.}: bool = false
+  bl808BleMidAdvLoopDiag {.booldefine.}: bool = false
+  bl808BleFinalAdvLoopDiag {.booldefine.}: bool = false
+  bl808BlePrintLlcCaptureOnce {.booldefine.}: bool = false
+  bl808BleFullBtbleMapDiag {.booldefine.}: bool = false
+  bl808BleDiagSampleTime {.booldefine.}: bool = false
 
 var
   console: Uart
@@ -138,6 +151,19 @@ var
   bleConnectedErr: uint8 = 0xFF'u8
   bleDisconnectedCalled = false
   bleConnCbStorage: BtConnCb
+  ble_test_debug_stage* {.exportc.}: uint32
+  ble_test_debug_sp* {.exportc.}: uint32
+  ble_test_debug_ra* {.exportc.}: uint32
+
+template bleTestMark(stage: uint32) =
+  block:
+    var spv: uint32
+    var rav: uint32
+    {.emit: ["asm volatile(\"mv %0, sp\" : \"=r\"(", spv, ") : : \"memory\");"].}
+    {.emit: ["asm volatile(\"mv %0, ra\" : \"=r\"(", rav, ") : : \"memory\");"].}
+    ble_test_debug_stage = stage
+    ble_test_debug_sp = spv
+    ble_test_debug_ra = rav
 
 when not defined(bl808BleVendor):
   const
@@ -170,13 +196,6 @@ proc pollBleController(iterations: uint32) =
     for _ in 0'u32 ..< iterations:
       if bleConnectedCalled and bleDisconnectedCalled:
         return
-      if bleConnectedCalled:
-        bflbip_schedule()
-        blePollHostEvents()
-        bleNimDbgVendorConnStageMark(0x213'u32)
-        if bleDisconnectedCalled:
-          return
-        continue
       bleNimDbgVendorConnStageMark(0x210'u32)
       bflbble_isr()
       bleNimDbgVendorConnStageMark(0x211'u32)
@@ -187,10 +206,33 @@ proc pollBleController(iterations: uint32) =
       if bleConnectedCalled and bleDisconnectedCalled:
         return
 
+proc hostWindowDeadlineUs(): uint64 =
+  let iterations =
+    if BleHostWindowIterations <= 0: 0'u64
+    else: BleHostWindowIterations.uint64
+  let delay =
+    if BlePollDelayUs <= 0: 1'u64
+    else: BlePollDelayUs.uint64
+  clicReadMtime() + iterations * delay
+
 proc check(label: string, ok: bool) =
-  discard console.sendString(if ok: "[PASS] " else: "[FAIL] ")
-  discard console.sendLine(label)
+  withInterruptsDisabled:
+    console.flushTx()
+    discard console.sendString(if ok: "[PASS] " else: "[FAIL] ")
+    discard console.sendLine(label)
+    console.flushTx()
   if ok: inc passed else: inc failed
+
+proc finishTestAndIdle() =
+  discard console.sendString("Result: ")
+  console.sendHex32(passed.uint32)
+  discard console.sendString(" passed, ")
+  console.sendHex32(failed.uint32)
+  discard console.sendLine(" failed")
+  if failed == 0:
+    discard console.sendLine("=== Test Complete ===")
+  while true:
+    wfi()
 
 proc cstringEquals(a: cstring, b: cstring): bool =
   if a == nil or b == nil:
@@ -272,14 +314,17 @@ proc printHciStatus(label: string) =
   console.sendHex32(bleLastHciWord0())
   discard console.sendString(" w1=")
   console.sendHex32(bleLastHciWord1())
+  bleTestMark(0xA1E0'u32)
   discard console.sendLine("")
+  bleTestMark(0xA1F0'u32)
 
 proc sampleBleTime() =
-  regWrite(0x28000100'u32.uint,
-           regRead(0x28000100'u32.uint) or 0x80000000'u32)
-  var guard = 4096
-  while (regRead(0x28000100'u32.uint) and 0x80000000'u32) != 0 and guard > 0:
-    dec guard
+  when bl808BleDiagSampleTime:
+    regWrite(0x28000100'u32.uint,
+             regRead(0x28000100'u32.uint) or 0x80000000'u32)
+    var guard = 4096
+    while (regRead(0x28000100'u32.uint) and 0x80000000'u32) != 0 and guard > 0:
+      dec guard
 
 proc bleDbgReg32(regAddr: uint32): uint32 =
   when defined(bl808BleVendor):
@@ -292,6 +337,18 @@ proc printReg(label: string, regAddr: uint32) =
   discard console.sendString(label)
   discard console.sendString("=")
   console.sendHex32(bleDbgReg32(regAddr))
+
+proc printBtbleEmScanDiag(label: string) {.noinline.} =
+  discard console.sendString("[BLEDBG] emscan ")
+  discard console.sendString(label)
+  printReg("a4c", 0x28010A4C'u32)
+  printReg("a50", 0x28010A50'u32)
+  printReg("a54", 0x28010A54'u32)
+  printReg("a58", 0x28010A58'u32)
+  bleTestMark(0xD1E0'u32)
+  discard console.sendByte(13'u8)
+  discard console.sendByte(10'u8)
+  bleTestMark(0xD1F0'u32)
 
 proc printBtbleMapDiag(label: string) =
   discard console.sendString("[BLEDBG] btble0 ")
@@ -472,6 +529,24 @@ proc printBtbleMapDiag(label: string) =
     console.sendHex32(bleNimDbgVendorAclEmptyLastStatus())
     discard console.sendLine("")
 
+    discard console.sendString("[BLEDBG] hostacl ")
+    discard console.sendString(label)
+    discard console.sendString(" arx=")
+    console.sendHex32(ble_host_acl_rx_count)
+    discard console.sendString(" atx=")
+    console.sendHex32(ble_host_acl_tx_count)
+    discard console.sendString(" arej=")
+    console.sendHex32(ble_host_acl_tx_reject_count)
+    discard console.sendString(" attrx=")
+    console.sendHex32(ble_host_att_rx_count)
+    discard console.sendString(" atttx=")
+    console.sendHex32(ble_host_att_tx_count)
+    discard console.sendString(" attop=")
+    console.sendHex32(ble_host_att_last_opcode)
+    discard console.sendString(" attst=")
+    console.sendHex32(ble_host_att_last_status)
+    discard console.sendLine("")
+
     discard console.sendString("[BLEDBG] nimcon ")
     discard console.sendString(label)
     discard console.sendString(" st=")
@@ -592,13 +667,101 @@ proc printBtbleMapDiag(label: string) =
   printReg("a40", 0x28010A40'u32)
   discard console.sendLine("")
 
-  discard console.sendString("[BLEDBG] emscan ")
-  discard console.sendString(label)
-  printReg("a4c", 0x28010A4C'u32)
-  printReg("a50", 0x28010A50'u32)
-  printReg("a54", 0x28010A54'u32)
-  printReg("a58", 0x28010A58'u32)
-  discard console.sendLine("")
+  printBtbleEmScanDiag(label)
+
+proc printBleNimConnSummary(label: string) =
+  when not defined(bl808BleVendor):
+    discard console.sendString("[BLEDBG] connsum ")
+    discard console.sendString(label)
+    discard console.sendString(" isr=")
+    console.sendHex32(bleNimDbgIsrCount())
+    discard console.sendString(" rxready=")
+    console.sendHex32(bleNimDbgRxReadyCount())
+    discard console.sendString(" scanreq=")
+    console.sendHex32(bleNimDbgRxScanReqCount())
+    discard console.sendString(" scanmatch=")
+    console.sendHex32(bleNimDbgRxScanReqMatchCount())
+    discard console.sendString(" conind=")
+    console.sendHex32(bleNimDbgRxConnectIndCount())
+    discard console.sendString(" rxhdr=")
+    console.sendHex32(bleNimDbgRxLastHeader())
+    discard console.sendString(" rxstat=")
+    console.sendHex32(bleNimDbgRxLastStatus())
+    discard console.sendLine("")
+
+    discard console.sendString("[BLEDBG] connstart ")
+    discard console.sendString(label)
+    discard console.sendString(" started=")
+    console.sendHex32(bleNimDbgVendorConStarted())
+    discard console.sendString(" lldcnt=")
+    console.sendHex32(bleNimDbgVendorLldConStartCount())
+    discard console.sendString(" lldst=")
+    console.sendHex32(bleNimDbgVendorLldConStartStatus())
+    discard console.sendString(" st=")
+    console.sendHex32(bleNimDbgVendorConLastStatus())
+    discard console.sendString(" rxclk=")
+    console.sendHex32(bleNimDbgVendorConLastRxClock())
+    discard console.sendString(" rxfine=")
+    console.sendHex32(bleNimDbgVendorConLastRxFine())
+    discard console.sendString(" anchor=")
+    console.sendHex32(bleNimDbgVendorConLastAnchor())
+    discard console.sendString(" win=")
+    console.sendHex32(bleNimDbgVendorConLastWinOffset())
+    discard console.sendString(" int=")
+    console.sendHex32(bleNimDbgVendorConLastInterval())
+    discard console.sendString(" to=")
+    console.sendHex32(bleNimDbgVendorConLastTimeout())
+    discard console.sendString(" aa=")
+    console.sendHex32(bleNimDbgVendorConLastAccessAddr())
+    discard console.sendString(" crc=")
+    console.sendHex32(bleNimDbgVendorConLastCrcInit())
+    discard console.sendString(" cevt=")
+    console.sendHex32(bleNimPeripheralConnEventCount())
+    discard console.sendString(" devt=")
+    console.sendHex32(bleNimPeripheralDiscEventCount())
+    discard console.sendString(" drsn=")
+    console.sendHex32(bleNimPeripheralDiscReason())
+    discard console.sendLine("")
+
+    discard console.sendString("[BLEDBG] connll ")
+    discard console.sendString(label)
+    discard console.sendString(" llrx=")
+    console.sendHex32(bleNimDbgVendorLlcpRxCount())
+    discard console.sendString(" lltx=")
+    console.sendHex32(bleNimDbgVendorLlcpTxCount())
+    discard console.sendString(" llq=")
+    console.sendHex32(bleNimDbgVendorLlcpTxQueued())
+    discard console.sendString(" lldrop=")
+    console.sendHex32(bleNimDbgVendorLlcpTxDropped())
+    discard console.sendString(" llop=")
+    console.sendHex32(bleNimDbgVendorLlcpLastOpcode())
+    discard console.sendString(" llst=")
+    console.sendHex32(bleNimDbgVendorLlcpLastStatus())
+    discard console.sendString(" emptytx=")
+    console.sendHex32(bleNimDbgVendorAclEmptyTxCount())
+    discard console.sendString(" emptypend=")
+    console.sendHex32(bleNimDbgVendorAclEmptyTxPending())
+    discard console.sendString(" emptyst=")
+    console.sendHex32(bleNimDbgVendorAclEmptyLastStatus())
+    discard console.sendLine("")
+
+    discard console.sendString("[BLEDBG] hostacl ")
+    discard console.sendString(label)
+    discard console.sendString(" arx=")
+    console.sendHex32(ble_host_acl_rx_count)
+    discard console.sendString(" atx=")
+    console.sendHex32(ble_host_acl_tx_count)
+    discard console.sendString(" arej=")
+    console.sendHex32(ble_host_acl_tx_reject_count)
+    discard console.sendString(" attrx=")
+    console.sendHex32(ble_host_att_rx_count)
+    discard console.sendString(" atttx=")
+    console.sendHex32(ble_host_att_tx_count)
+    discard console.sendString(" attop=")
+    console.sendHex32(ble_host_att_last_opcode)
+    discard console.sendString(" attst=")
+    console.sendHex32(ble_host_att_last_status)
+    discard console.sendLine("")
 
 proc printBleBlobDiag(label: string) =
   when defined(bl808BleVendor):
@@ -641,7 +804,7 @@ proc printBleBlobDiag(label: string) =
         if i != 0'u32:
           discard console.sendString(",")
         console.sendHex32(bleBlobDbgLlcStartWord(i))
-    discard console.sendLine("")
+      discard console.sendLine("")
     discard console.sendString("[BLEDBG] regs glb3b0=")
     console.sendHex32(bleBlobDbgReg32(0x200003B0'u32))
     discard console.sendString(" dig250=")
@@ -680,7 +843,9 @@ proc printBleBlobDiag(label: string) =
     discard console.sendString(" sched2=")
     console.sendHex32(bleBlobDbgReg32(0x280009C8'u32))
     discard console.sendLine("")
-    printBtbleMapDiag(label)
+    when bl808BleFullBtbleMapDiag:
+      printBtbleMapDiag(label)
+    bleTestMark(0xE1F0'u32)
   else:
     sampleBleTime()
     discard console.sendString("[BLEDBG] ")
@@ -721,7 +886,9 @@ proc printBleBlobDiag(label: string) =
     discard console.sendString(" sched2=")
     console.sendHex32(regRead(0x280009C8'u32.uint))
     discard console.sendLine("")
-    printBtbleMapDiag(label)
+    when bl808BleFullBtbleMapDiag:
+      printBtbleMapDiag(label)
+    bleTestMark(0xE1F0'u32)
 
 proc printBleBlobLlcStartCapture(label: string) =
   when defined(bl808BleVendor) and defined(bl808BleVendorCaptureLlcStart):
@@ -740,6 +907,38 @@ proc printBleBlobLlcStartCapture(label: string) =
       if i != 0'u32:
         discard console.sendString(",")
       console.sendHex32(bleBlobDbgLlcStartWord(i))
+    discard console.sendLine("")
+    discard console.sendString("[BLELLCEM] ")
+    discard console.sendString(label)
+    discard console.sendString(" words=")
+    for i in 0'u32 ..< 16'u32:
+      if i != 0'u32:
+        discard console.sendString(",")
+      console.sendHex32(bleBlobDbgLlcStartEmWord(i))
+    discard console.sendLine("")
+    discard console.sendString("[BLELLCRX] ")
+    discard console.sendString(label)
+    discard console.sendString(" words=")
+    for i in 0'u32 ..< 16'u32:
+      if i != 0'u32:
+        discard console.sendString(",")
+      console.sendHex32(bleBlobDbgLlcStartRxWord(i))
+    discard console.sendLine("")
+    discard console.sendString("[BLELLCTX] ")
+    discard console.sendString(label)
+    discard console.sendString(" words=")
+    for i in 0'u32 ..< 8'u32:
+      if i != 0'u32:
+        discard console.sendString(",")
+      console.sendHex32(bleBlobDbgLlcStartTxWord(i))
+    discard console.sendLine("")
+    discard console.sendString("[BLELLCREG] ")
+    discard console.sendString(label)
+    discard console.sendString(" words=")
+    for i in 0'u32 ..< 8'u32:
+      if i != 0'u32:
+        discard console.sendString(",")
+      console.sendHex32(bleBlobDbgLlcStartRegWord(i))
     discard console.sendLine("")
 
 proc checkControllerSleepRestore() =
@@ -766,10 +965,38 @@ proc smokeBle() =
   check("ble hci interface init", bt_onchiphci_interface_init(hciRecv) == 0)
   check("ble hci send", bt_onchiphci_send(0, hciPacket.len.uint16, addr hciPacket[0]) == 0)
   printHciStatus("reset")
+  when not defined(bl808BleVendor):
+    bleTestMark(0xA240'u32)
+    when defined(bl808BleHciSelfTestTrace):
+      discard console.sendLine("[BLEDBG] selftest before le-encrypt")
+    let leEncryptOk = bleLeEncryptSelfTest()
+    bleTestMark(if leEncryptOk: 0xA250'u32 else: 0xA251'u32)
+    when defined(bl808BleHciSelfTestTrace):
+      discard console.sendLine("[BLEDBG] selftest after le-encrypt")
+    check("ble le encrypt command", leEncryptOk)
+    printHciStatus("le-encrypt")
+    check("ble le rand command", bleLeRandSelfTest())
+    printHciStatus("le-rand")
+    bleTestMark(0xA300'u32)
+    let p256SelfTestOk = bleLeP256SelfTest()
+    bleTestMark(0xA310'u32)
+    check("ble le p256 command", p256SelfTestOk)
+    bleTestMark(0xA320'u32)
+    printHciStatus("le-p256")
+    bleTestMark(0xA330'u32)
+    check("ble le buffer size command", bleLeBufferSizeSelfTest())
+    printHciStatus("le-buffer-size")
+    check("ble le local features command", bleLeLocalFeaturesSelfTest())
+    printHciStatus("le-local-features")
+    check("ble le data length command", bleLeDataLengthSelfTest())
+    printHciStatus("le-data-length")
+    bleTestMark(0xA210'u32)
   when defined(bl808BleDebugFlowRegs):
     printBleBlobDiag("after-hci-reset")
 
+  bleTestMark(0xA220'u32)
   bflbble_init()
+  bleTestMark(0xA230'u32)
   when defined(bl808BleDebugFlowRegs):
     printBleBlobDiag("after-bflbble-init")
   pollBleController(1)
@@ -803,8 +1030,11 @@ proc smokeBle() =
 
   bleConnCbStorage.connected = bleConnected
   bleConnCbStorage.disconnected = bleDisconnected
+  bleTestMark(0xA240'u32)
   bt_conn_cb_register(addr bleConnCbStorage)
+  bleTestMark(0xA250'u32)
   check("ble conn callback register", true)
+  bleTestMark(0xA260'u32)
 
   when BleCentralConnect != 0:
     bleConnectedCalled = false
@@ -819,44 +1049,57 @@ proc smokeBle() =
       discard bleDisconnect()
 
   when BlePeripheralAdvertise != 0:
+    bleTestMark(0xB000'u32)
     enableBleControllerIrq()
+    bleTestMark(0xB010'u32)
     var advParam: BtLeAdvParam
+    advParam.intervalMin = 0x0020'u16
+    advParam.intervalMax = 0x0020'u16
     var advData: BtData
+    bleTestMark(0xB020'u32)
     check("ble advertising start", bt_le_adv_start(addr advParam, addr advData, 0, nil, 0) == 0)
+    bleTestMark(0xB030'u32)
     printHciStatus("adv-start")
-    when defined(bl808BleVerboseDiag):
+    when bl808BleVerboseDiag:
       printBleBlobDiag("adv-start")
     for _ in 0 ..< 2000:
       pollBleController(BlePollIterations.uint32)
       delayUs(BlePollDelayUs.uint32)
-    when defined(bl808BleVerboseDiag):
+    when bl808BleVerboseDiag:
       printBleBlobDiag("adv-pre-host")
-    when defined(bl808BlePreHostAdvDiag):
-      printBleBlobDiag("adv-pre-host")
+    when bl808BlePreHostAdvDiag:
+      bleTestMark(0xB100'u32)
+      bleTestMark(0xB110'u32)
+    bleTestMark(0xB120'u32)
     discard console.sendString("[BLE] advertising ")
+    bleTestMark(0xB130'u32)
     discard console.sendLine(BleDeviceName)
+    bleTestMark(0xB140'u32)
 
     var midDiagConnectedPrinted = false
-    for i in 0 ..< BleHostWindowIterations:
+    var i = 0
+    let hostDeadline = hostWindowDeadlineUs()
+    while clicReadMtime() < hostDeadline:
       if bleConnectedCalled and bleDisconnectedCalled:
         break
       pollBleController(BlePollIterations.uint32)
       delayUs(BlePollDelayUs.uint32)
       if bleConnectedCalled and bleDisconnectedCalled:
         break
-      when defined(bl808BleMidAdvLoopDiag):
-        if i == 999 or i == 4999 or i == 9999:
-          printBleBlobDiag("adv-mid")
+      when bl808BleMidAdvLoopDiag:
         if bleConnectedCalled and not midDiagConnectedPrinted:
-          printBleBlobDiag("adv-connected")
+          printBleNimConnSummary("adv-connected")
           midDiagConnectedPrinted = true
-      when defined(bl808BleVerboseDiag):
+      when bl808BleVerboseDiag:
         if i == 999 or i == 4999 or i == 9999:
           printBleBlobDiag("adv-loop")
-    when defined(bl808BleVerboseDiag) or defined(bl808BleFinalAdvLoopDiag):
+      inc i
+    when bl808BleVerboseDiag:
       if not (bleConnectedCalled and bleDisconnectedCalled):
         printBleBlobDiag("adv-loop")
-    when defined(bl808BlePrintLlcCaptureOnce):
+    when bl808BleFinalAdvLoopDiag:
+      printBleNimConnSummary("adv-loop")
+    when bl808BlePrintLlcCaptureOnce:
       printBleBlobLlcStartCapture("adv-loop")
 
     discard console.sendString("[BLEDBG] flags connected=")
@@ -868,9 +1111,7 @@ proc smokeBle() =
       check("ble peripheral connected callback",
             bleConnectedCalled and bleConnectedErr == 0)
       check("ble peripheral disconnected callback", bleDisconnectedCalled)
-    discard console.sendLine("[BLEDBG] before adv stop")
     check("ble advertising stop", bt_le_adv_stop() == 0)
-    discard console.sendLine("[BLEDBG] after adv stop")
   when BlePeripheralAdvertise != 0:
     if bleConnectedCalled:
       check("ble controller sleep skipped after host link", true)
@@ -883,6 +1124,7 @@ proc smokeBle() =
     checkControllerSleepRestore()
     bleControllerDeinit()
     check("ble controller deinit", true)
+  finishTestAndIdle()
 
 proc main() {.exportc, cdecl.} =
   systemInit()
@@ -902,11 +1144,3 @@ proc main() {.exportc, cdecl.} =
   discard console.sendLine("=== BL808 BLE HAL Test ===")
 
   smokeBle()
-
-  discard console.sendString("Result: ")
-  console.sendHex32(passed.uint32)
-  discard console.sendString(" passed, ")
-  console.sendHex32(failed.uint32)
-  discard console.sendLine(" failed")
-  if failed == 0:
-    discard console.sendLine("=== Test Complete ===")

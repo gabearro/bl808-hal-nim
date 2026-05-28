@@ -6,6 +6,14 @@ import bl808/glb, bl808/gpio, bl808/uart
 import bl808/ble
 import bl808/panicoverride
 import bl808/kernel/alloc
+
+const BleCentralVerboseDiag {.booldefine.}: bool = false
+
+when defined(bl808BleVendorLldInitProbe):
+  import bl808/mmio
+when (BleCentralVerboseDiag or defined(bl808BleVendorLldInitProbe)) and
+    not defined(bl808BleVendor):
+  from bl808/blecontroller import nil
 when defined(bl808BleNimUseClicIrq) and not defined(bl808BleVendor):
   import bl808/irq
 when defined(bl808BleVendor):
@@ -25,6 +33,8 @@ const
   BleCentralName {.strdefine.} = "bl808-host"
   BleCentralTimeoutMs {.intdefine.} = 20_000
   BleCentralHostStartDelayMs {.intdefine.} = 3_000
+  BleCentralScanOnly {.booldefine.}: bool = false
+  BleCentralScanAny {.booldefine.}: bool = false
 
 var
   console: Uart
@@ -65,7 +75,7 @@ proc bleDisconnected(conn: ptr BtConn, reason: uint8) {.cdecl.} =
 
 proc bleInitStage(stage: cstring) {.cdecl.} =
   discard console.sendString("[BLEDBG] init ")
-  discard console.sendLine($stage)
+  discard console.sendLine(stage)
 
 proc printHciStatus(label: string) =
   discard console.sendString("[BLE] ")
@@ -172,12 +182,27 @@ proc printScanProbeDiag() =
     console.sendHex32(bleControllerInitProbeArbLastWord(1))
     discard console.sendString(" w2=")
     console.sendHex32(bleControllerInitProbeArbLastWord(2))
+    discard console.sendString(" w5=")
+    console.sendHex32(bleControllerInitProbeArbLastWord(5))
     discard console.sendString(" w7=")
     console.sendHex32(bleControllerInitProbeArbLastWord(7))
-    discard console.sendString(" w24=")
-    console.sendHex32(bleControllerInitProbeArbLastWord(24))
-    discard console.sendString(" w28=")
-    console.sendHex32(bleControllerInitProbeArbLastWord(28))
+    discard console.sendString(" w11=")
+    console.sendHex32(bleControllerInitProbeArbLastWord(11))
+    discard console.sendLine("")
+    discard console.sendString("[BLEDBG] sch_prog stage=")
+    console.sendHex32(bleControllerSchProgLastStage())
+    discard console.sendString(" target=")
+    console.sendHex32(bleControllerSchProgLastTarget())
+    discard console.sendString(" now=")
+    console.sendHex32(bleControllerSchProgLastNow())
+    discard console.sendString(" slot=")
+    console.sendHex32(bleControllerSchProgLastSlot())
+    discard console.sendString(" mask=")
+    console.sendHex32(bleControllerSchProgLastIntMask())
+    discard console.sendString(" stat=")
+    console.sendHex32(bleControllerSchProgLastIntStat())
+    discard console.sendString(" elapsed=")
+    console.sendHex32(bleControllerSchProgElapsedCount())
     discard console.sendLine("")
     discard console.sendString("[BLEDBG] init_peer_rx count=")
     console.sendHex32(bleControllerInitProbePeerRxCount())
@@ -224,51 +249,217 @@ proc waitForHostAdvertiser() =
       delayUs(1000)
 
 proc printLastAdvReportDiag() =
-  when defined(bl808BleVendorLldScanProbe):
-    discard console.sendString("[BLEDBG] last_adv ev=")
-    console.sendHex32(bleScanLastReportEventType().uint32)
-    discard console.sendString(" addr_type=")
-    console.sendHex32(bleScanLastReportAddrType().uint32)
-    discard console.sendString(" rssi=")
-    console.sendHex32(bleScanLastReportRssiRaw().uint32)
-    discard console.sendString(" addr=")
-    for i in 0'u8 ..< 6'u8:
-      console.sendHex32(bleScanLastReportAddrByte(i).uint32)
-    discard console.sendString(" data_len=")
-    let dataLen = bleScanLastReportDataLen()
-    console.sendHex32(dataLen.uint32)
-    discard console.sendString(" data=")
-    var i = 0'u8
-    while i < dataLen and i < 31'u8:
-      console.sendHex32(bleScanLastReportDataByte(i).uint32)
-      inc i
-    discard console.sendLine("")
+  discard console.sendString("[BLEDBG] last_adv ev=")
+  console.sendHex32(bleScanLastReportEventType().uint32)
+  discard console.sendString(" addr_type=")
+  console.sendHex32(bleScanLastReportAddrType().uint32)
+  discard console.sendString(" rssi=")
+  console.sendHex32(bleScanLastReportRssiRaw().uint32)
+  discard console.sendString(" addr=")
+  for i in 0'u8 ..< 6'u8:
+    console.sendHex32(bleScanLastReportAddrByte(i).uint32)
+  discard console.sendString(" data_len=")
+  let dataLen = bleScanLastReportDataLen()
+  console.sendHex32(dataLen.uint32)
+  discard console.sendString(" data=")
+  var i = 0'u8
+  while i < dataLen and i < 31'u8:
+    console.sendHex32(bleScanLastReportDataByte(i).uint32)
+    inc i
+  discard console.sendLine("")
 
 proc printMatchedAdvReportDiag() =
-  when defined(bl808BleVendorLldScanProbe):
-    discard console.sendString("[BLEDBG] matched_adv ev=")
-    console.sendHex32(bleScanMatchedReportEventType().uint32)
-    discard console.sendString(" addr_type=")
-    console.sendHex32(bleScanMatchedReportAddrType().uint32)
-    discard console.sendString(" addr=")
-    for i in 0'u8 ..< 6'u8:
-      console.sendHex32(bleScanMatchedReportAddrByte(i).uint32)
-    discard console.sendString(" data_len=")
-    let dataLen = bleScanMatchedReportDataLen()
-    console.sendHex32(dataLen.uint32)
-    discard console.sendString(" data=")
-    var i = 0'u8
-    while i < dataLen and i < 31'u8:
-      console.sendHex32(bleScanMatchedReportDataByte(i).uint32)
-      inc i
-    discard console.sendLine("")
+  discard console.sendString("[BLEDBG] matched_adv ev=")
+  console.sendHex32(bleScanMatchedReportEventType().uint32)
+  discard console.sendString(" addr_type=")
+  console.sendHex32(bleScanMatchedReportAddrType().uint32)
+  discard console.sendString(" addr=")
+  for i in 0'u8 ..< 6'u8:
+    console.sendHex32(bleScanMatchedReportAddrByte(i).uint32)
+  discard console.sendString(" data_len=")
+  let dataLen = bleScanMatchedReportDataLen()
+  console.sendHex32(dataLen.uint32)
+  discard console.sendString(" data=")
+  var i = 0'u8
+  while i < dataLen and i < 31'u8:
+    console.sendHex32(bleScanMatchedReportDataByte(i).uint32)
+    inc i
+  discard console.sendLine("")
 
 proc printInitParamDiag() =
   when defined(bl808BleVendorLldInitProbe):
     discard console.sendString("[BLEDBG] init_params data=")
-    for i in 0'u8 ..< 36'u8:
+    for i in 0'u8 ..< 68'u8:
       console.sendHex32(bleControllerInitProbeParamByte(i).uint32)
     discard console.sendLine("")
+
+    discard console.sendString("[BLEDBG] init_em txptr=")
+    console.sendHex32(regRead(0x28010140'u).uint32)
+    discard console.sendString(" desc0=")
+    console.sendHex32(regRead(0x28010C10'u).uint32)
+    discard console.sendString(" desc1=")
+    console.sendHex32(regRead(0x28010C14'u).uint32)
+    discard console.sendString(" desc2=")
+    console.sendHex32(regRead(0x28010C18'u).uint32)
+    discard console.sendString(" data=")
+    console.sendHex32(regRead(0x28011794'u).uint32)
+    discard console.sendLine("")
+
+    discard console.sendString("[BLEDBG] init_start_snapshot em20=")
+    console.sendHex32(blecontroller.nim_vendor_init_em_snapshot[8])
+    discard console.sendString(" em24=")
+    console.sendHex32(blecontroller.nim_vendor_init_em_snapshot[9])
+    discard console.sendString(" em28=")
+    console.sendHex32(blecontroller.nim_vendor_init_em_snapshot[10])
+    discard console.sendString(" em2c=")
+    console.sendHex32(blecontroller.nim_vendor_init_em_snapshot[11])
+    discard console.sendString(" em30=")
+    console.sendHex32(blecontroller.nim_vendor_init_em_snapshot[12])
+    discard console.sendString(" desc0=")
+    console.sendHex32(blecontroller.nim_vendor_init_desc_snapshot[0])
+    discard console.sendString(" desc1=")
+    console.sendHex32(blecontroller.nim_vendor_init_desc_snapshot[1])
+    discard console.sendString(" desc2=")
+    console.sendHex32(blecontroller.nim_vendor_init_desc_snapshot[2])
+    discard console.sendString(" data0=")
+    console.sendHex32(blecontroller.nim_vendor_init_data_snapshot[0])
+    discard console.sendString(" data1=")
+    console.sendHex32(blecontroller.nim_vendor_init_data_snapshot[1])
+    discard console.sendLine("")
+
+    discard console.sendString("[BLEDBG] init_start_em_words=")
+    for i in 0 ..< 18:
+      console.sendHex32(blecontroller.nim_vendor_init_em_snapshot[i])
+    discard console.sendLine("")
+
+    discard console.sendString("[BLEDBG] init_start_data_words=")
+    for i in 0 ..< 8:
+      console.sendHex32(blecontroller.nim_vendor_init_data_snapshot[i])
+    discard console.sendLine("")
+
+proc printCentralHostDiag() =
+  when not defined(bl808BleVendor):
+    discard console.sendString("[BLEDBG] central_host stage=")
+    console.sendHex32(ble_central_debug_stage)
+    discard console.sendString(" timeout=")
+    console.sendHex32(ble_central_debug_timeout)
+    discard console.sendString(" waited=")
+    console.sendHex32(ble_central_debug_waited)
+    discard console.sendString(" flags=")
+    console.sendHex32(ble_central_debug_flags)
+    discard console.sendString(" create_count=")
+    console.sendHex32(ble_central_debug_create_count)
+    discard console.sendString(" create_result=")
+    console.sendHex32(ble_central_debug_create_result)
+    discard console.sendString(" host_stage=")
+    console.sendHex32(ble_host_debug_stage)
+    discard console.sendString(" host_op=")
+    console.sendHex32(ble_host_debug_opcode)
+    discard console.sendString(" host_status=")
+    console.sendHex32(ble_host_debug_status)
+    discard console.sendLine("")
+
+proc printNimInitiatorDiag() =
+  when BleCentralVerboseDiag and defined(bl808BleNimPureCentral):
+    discard console.sendString("[BLEDBG] init_counts active=")
+    console.sendHex32(blecontroller.nim_init_active)
+    discard console.sendString(" prog=")
+    console.sendHex32(blecontroller.nim_init_program_count)
+    discard console.sendString(" evt=")
+    console.sendHex32(blecontroller.nim_init_event_count)
+    discard console.sendString(" last_evt=")
+    console.sendHex32(blecontroller.nim_init_last_event)
+    discard console.sendString(" txevt=")
+    console.sendHex32(blecontroller.nim_init_tx_event_count)
+    discard console.sendString(" match=")
+    console.sendHex32(blecontroller.nim_init_match_count)
+    discard console.sendString(" rx=")
+    console.sendHex32(blecontroller.nim_init_rx_count)
+    discard console.sendString(" total_rx=")
+    console.sendHex32(blecontroller.nim_init_total_rx_count)
+    discard console.sendString(" peer_type=")
+    console.sendHex32(blecontroller.nim_init_hci_params[5].uint32)
+    discard console.sendString(" peer=")
+    for i in 0 ..< 6:
+      console.sendHex32(blecontroller.nim_init_hci_params[6 + i].uint32)
+    discard console.sendString(" chidx=")
+    console.sendHex32(blecontroller.nim_init_last_channel_index)
+    discard console.sendString(" advch=")
+    console.sendHex32(blecontroller.nim_init_last_adv_channel)
+    discard console.sendString(" seed=")
+    console.sendHex32(blecontroller.nim_init_channel_seed)
+    discard console.sendString(" win=")
+    console.sendHex32(blecontroller.nim_init_channel_window_valid)
+    discard console.sendLine("")
+
+    discard console.sendString("[BLEDBG] init_rx reason=")
+    console.sendHex32(blecontroller.nim_init_rx_match_reason)
+    discard console.sendString(" header=")
+    console.sendHex32(blecontroller.nim_init_rx_last_header)
+    discard console.sendString(" status=")
+    console.sendHex32(blecontroller.nim_init_rx_last_status)
+    discard console.sendString(" peer0=")
+    console.sendHex32(blecontroller.nim_init_rx_last_peer0)
+    discard console.sendString(" peer1=")
+    console.sendHex32(blecontroller.nim_init_rx_last_peer1)
+    discard console.sendString(" addr_mis=")
+    console.sendHex32(blecontroller.nim_init_rx_addr_mismatch_count)
+    discard console.sendString(" type_mis=")
+    console.sendHex32(blecontroller.nim_init_rx_type_mismatch_count)
+    discard console.sendLine("")
+
+    discard console.sendString("[BLEDBG] init_handoff pending=")
+    console.sendHex32(blecontroller.nim_init_handoff_pending)
+    discard console.sendString(" start=")
+    console.sendHex32(blecontroller.nim_init_handoff_start_count)
+    discard console.sendString(" timeout=")
+    console.sendHex32(blecontroller.nim_init_handoff_timeout_count)
+    discard console.sendString(" complete_pending=")
+    console.sendHex32(blecontroller.nim_init_complete_pending)
+    discard console.sendString(" hci_complete=")
+    console.sendHex32(blecontroller.nim_init_hci_complete_count)
+    discard console.sendString(" last_status=")
+    console.sendHex32(blecontroller.nim_init_last_status)
+    discard console.sendString(" con_status=")
+    console.sendHex32(blecontroller.nim_vendor_con_last_status)
+    discard console.sendString(" con_evt=")
+    console.sendHex32(blecontroller.nim_vendor_conn_evt_count)
+    discard console.sendLine("")
+
+    when defined(BleDebugCounters):
+      discard console.sendString("[BLEDBG] init_snapshot count=")
+      console.sendHex32(blecontroller.nim_init_handoff_snapshot_count)
+      discard console.sendString(" reason=")
+      console.sendHex32(blecontroller.nim_init_handoff_snapshot_reason)
+      discard console.sendString(" t0=")
+      console.sendHex32(blecontroller.nim_init_handoff_snapshot_timing[0])
+      discard console.sendString(" hdrfine=")
+      console.sendHex32(blecontroller.nim_init_handoff_snapshot_timing[1])
+      discard console.sendString(" rxclk=")
+      console.sendHex32(blecontroller.nim_init_handoff_snapshot_timing[2])
+      discard console.sendString(" eventclk=")
+      console.sendHex32(blecontroller.nim_init_handoff_snapshot_timing[3])
+      discard console.sendString(" ready=")
+      console.sendHex32(blecontroller.nim_init_handoff_snapshot_timing[5])
+      discard console.sendString(" deadline=")
+      console.sendHex32(blecontroller.nim_init_handoff_snapshot_timing[6])
+      discard console.sendLine("")
+
+      discard console.sendString("[BLEDBG] conn_sched idx=")
+      console.sendHex32(blecontroller.nim_conn_sched_log_index)
+      discard console.sendString(" last_now=")
+      console.sendHex32(blecontroller.nim_conn_last_schedule_now)
+      discard console.sendString(" last_target=")
+      console.sendHex32(blecontroller.nim_conn_last_schedule_target)
+      discard console.sendString(" last_delta=")
+      console.sendHex32(blecontroller.nim_conn_last_schedule_delta)
+      discard console.sendString(" last_evt=")
+      console.sendHex32(blecontroller.nim_conn_last_event_counter)
+      discard console.sendString(" rx_seq_idx=")
+      console.sendHex32(blecontroller.nim_conn_rx_seq_log_index)
+      discard console.sendString(" missed=")
+      console.sendHex32(blecontroller.nim_conn_missed_event_fallback_count)
+      discard console.sendLine("")
 
 proc main() {.exportc, cdecl.} =
   systemInit()
@@ -312,14 +503,36 @@ proc main() {.exportc, cdecl.} =
 
   bleConnectedCalled = false
   bleConnectedErr = 0xFF'u8
-  discard console.sendString("[BLE] central scan ")
-  discard console.sendLine(BleCentralName)
-  waitForHostAdvertiser()
-  when BleCentralHostStartDelayMs > 0:
+  when BleCentralScanAny:
+    discard console.sendLine("[BLE] central scan any")
+    console.flushTx()
+  else:
     discard console.sendString("[BLE] central scan ")
     discard console.sendLine(BleCentralName)
-  let centralOk =
-    bleCentralConnect(BleCentralName, BleCentralTimeoutMs.uint32) == bleOk
+    console.flushTx()
+  waitForHostAdvertiser()
+  when BleCentralHostStartDelayMs > 0:
+    when BleCentralScanAny:
+      discard console.sendLine("[BLE] central scan any")
+      console.flushTx()
+    else:
+      discard console.sendString("[BLE] central scan ")
+      discard console.sendLine(BleCentralName)
+      console.flushTx()
+  when BleCentralScanOnly:
+    when BleCentralScanAny:
+      let centralOk = bleCentralScanAny(BleCentralTimeoutMs.uint32) == bleOk
+    else:
+      let centralOk =
+        bleCentralScan(BleCentralName, BleCentralTimeoutMs.uint32) == bleOk
+  else:
+    let centralOk =
+      bleCentralConnect(BleCentralName, BleCentralTimeoutMs.uint32) == bleOk
+    let connectedOk =
+      centralOk and bleConnectedCalled and bleConnectedErr == 0
+    var disconnectOk = true
+    if centralOk:
+      disconnectOk = bleDisconnect() == bleOk
   printHciStatus("central")
   discard console.sendString("[BLE] central reports=")
   console.sendHex32(bleScanReportCount())
@@ -328,12 +541,23 @@ proc main() {.exportc, cdecl.} =
   discard console.sendLine("")
   printLastAdvReportDiag()
   printMatchedAdvReportDiag()
-  printInitParamDiag()
-  printScanProbeDiag()
-  check("ble central connect",
-        centralOk and bleConnectedCalled and bleConnectedErr == 0)
-  if centralOk:
-    discard bleDisconnect()
+  printCentralHostDiag()
+  when BleCentralScanOnly:
+    if not centralOk:
+      printNimInitiatorDiag()
+      printInitParamDiag()
+      printScanProbeDiag()
+    when BleCentralScanAny:
+      check("ble central scan report", centralOk)
+    else:
+      check("ble central scan match", centralOk)
+  else:
+    let centralResultOk = connectedOk and disconnectOk
+    if not centralResultOk:
+      printNimInitiatorDiag()
+      printInitParamDiag()
+      printScanProbeDiag()
+    check("ble central connect", centralResultOk)
 
   discard console.sendString("Result: ")
   console.sendHex32(passed.uint32)
@@ -342,3 +566,5 @@ proc main() {.exportc, cdecl.} =
   discard console.sendLine(" failed")
   if failed == 0:
     discard console.sendLine("=== Test Complete ===")
+  while true:
+    wfi()
