@@ -52,11 +52,12 @@ def parse_objdump(path: Path) -> dict[str, dict[str, list[str]]]:
     return out
 
 
-def source_lines(source: Path) -> tuple[dict[str, int], set[str]]:
+def source_lines(source: Path) -> tuple[dict[str, int], set[str], dict[str, int]]:
     lines: dict[str, int] = {}
     stubs: set[str] = set()
+    stub_lines: dict[str, int] = {}
     if not source.exists():
-        return lines, stubs
+        return lines, stubs, stub_lines
     for line_no, line in enumerate(source.read_text(errors="ignore").splitlines(), start=1):
         proc_match = re.match(r"\s*proc\s+([A-Za-z_][A-Za-z0-9_]*)\*?", line)
         if proc_match:
@@ -65,8 +66,22 @@ def source_lines(source: Path) -> tuple[dict[str, int], set[str]]:
         if stub_match:
             symbol = stub_match.group(1).strip()
             stubs.add(symbol)
+            stub_lines.setdefault(symbol, line_no)
             lines.setdefault(symbol, line_no)
-    return lines, stubs
+    return lines, stubs, stub_lines
+
+
+def likely_active_placeholder_stub(
+    symbol: str,
+    nim_instr: int,
+    line_map: dict[str, int],
+    stub_lines: dict[str, int],
+) -> bool:
+    return (
+        nim_instr <= 2
+        and symbol in stub_lines
+        and line_map.get(symbol) == stub_lines.get(symbol)
+    )
 
 
 def severity_buckets(items: list[dict[str, object]]) -> dict[str, int]:
@@ -88,13 +103,32 @@ def severity_buckets(items: list[dict[str, object]]) -> dict[str, int]:
     return buckets
 
 
+def function_instruction_count(
+    disassembly: dict[str, dict[str, list[str]]],
+    symbol: str,
+) -> int:
+    """Count a symbol plus GCC local body fragments such as foo.part.0."""
+    total = len(disassembly.get(symbol, {}).get("bytes", []))
+    prefix = f"{symbol}."
+    for name, body in disassembly.items():
+        if name.startswith(prefix):
+            suffix = name[len(prefix):]
+            if (
+                suffix.startswith("part.")
+                or suffix.startswith("isra.")
+                or suffix.startswith("constprop.")
+            ):
+                total += len(body["bytes"])
+    return total
+
+
 def build_report(ref: Path, nim: Path, source: Path) -> dict[str, object]:
     ref_funcs = nm_functions(ref)
     nim_funcs = nm_functions(nim)
     common = sorted(ref_funcs & nim_funcs)
     ref_dis = parse_objdump(ref)
     nim_dis = parse_objdump(nim)
-    line_map, stub_symbols = source_lines(source)
+    line_map, stub_symbols, stub_lines = source_lines(source)
 
     checked: list[str] = []
     byte_identical: list[str] = []
@@ -105,13 +139,20 @@ def build_report(ref: Path, nim: Path, source: Path) -> dict[str, object]:
         if symbol not in ref_dis or symbol not in nim_dis:
             continue
         checked.append(symbol)
-        ref_instr = len(ref_dis[symbol]["bytes"])
-        nim_instr = len(nim_dis[symbol]["bytes"])
+        ref_instr = function_instruction_count(ref_dis, symbol)
+        nim_instr = function_instruction_count(nim_dis, symbol)
         if ref_dis[symbol]["bytes"] == nim_dis[symbol]["bytes"]:
             byte_identical.append(symbol)
         if ref_dis[symbol]["mnem"] == nim_dis[symbol]["mnem"]:
             mnemonic_identical.append(symbol)
         if nim_instr < ref_instr:
+            source_stub = symbol in stub_symbols
+            likely_active_stub = likely_active_placeholder_stub(
+                symbol,
+                nim_instr,
+                line_map,
+                stub_lines,
+            )
             smaller.append(
                 {
                     "symbol": symbol,
@@ -120,19 +161,31 @@ def build_report(ref: Path, nim: Path, source: Path) -> dict[str, object]:
                     "missing_instr": ref_instr - nim_instr,
                     "pct_of_ref": round((nim_instr / ref_instr) * 100, 2) if ref_instr else 0,
                     "line": line_map.get(symbol),
-                    "placeholder_stub": symbol in stub_symbols,
+                    "placeholder_stub": source_stub,
+                    "likely_active_placeholder_stub": likely_active_stub,
                 }
             )
 
     smaller.sort(key=lambda item: (int(item["missing_instr"]), str(item["symbol"])), reverse=True)
     stub_rows: list[dict[str, object]] = []
+    active_stub_count = 0
     for symbol in sorted(stub_symbols & ref_funcs):
+        nim_instr = function_instruction_count(nim_dis, symbol)
+        likely_active = likely_active_placeholder_stub(
+            symbol,
+            nim_instr,
+            line_map,
+            stub_lines,
+        )
+        if likely_active:
+            active_stub_count += 1
         stub_rows.append(
             {
                 "symbol": symbol,
-                "ref_instr": len(ref_dis.get(symbol, {}).get("bytes", [])),
-                "nim_instr": len(nim_dis.get(symbol, {}).get("bytes", [])),
+                "ref_instr": function_instruction_count(ref_dis, symbol),
+                "nim_instr": nim_instr,
                 "line": line_map.get(symbol),
+                "likely_active": likely_active,
             }
         )
     stub_rows.sort(key=lambda item: (int(item["ref_instr"]), str(item["symbol"])), reverse=True)
@@ -154,6 +207,7 @@ def build_report(ref: Path, nim: Path, source: Path) -> dict[str, object]:
         "smaller_methods": smaller,
         "placeholder_stub_count": len(stub_symbols),
         "placeholder_stubs_in_reference_count": len(stub_rows),
+        "likely_active_placeholder_stubs_in_reference_count": active_stub_count,
         "placeholder_stubs_in_reference": stub_rows,
     }
 
@@ -181,6 +235,7 @@ def write_markdown(report: dict[str, object], path: Path) -> None:
         f"- Method count where Nim is smaller than blob: **{report['nim_smaller_count']}**",
         f"- Placeholder stubs in source: **{report['placeholder_stub_count']}**",
         f"- Placeholder stubs matching reference symbols: **{report['placeholder_stubs_in_reference_count']}**",
+        f"- Likely active placeholder stubs in this build: **{report['likely_active_placeholder_stubs_in_reference_count']}**",
         "- Severity buckets: "
         + ", ".join(f"{key}: {buckets[key]}" for key in [">=200", "100-199", "50-99", "25-49", "10-24", "1-9"]),
         "- Note: instruction deltas are local to each symbol body; wrappers that delegate to helper functions can still appear short.",
@@ -195,8 +250,8 @@ def write_markdown(report: dict[str, object], path: Path) -> None:
     lines += [
         "## Largest Shorter Methods",
         "",
-        "| # | Symbol | src line | ref | nim | missing | nim/ref % | stub |",
-        "|---:|---|---:|---:|---:|---:|---:|---|",
+        "| # | Symbol | src line | ref | nim | missing | nim/ref % | source stub | active stub |",
+        "|---:|---|---:|---:|---:|---:|---:|---|---|",
     ]
     for idx, item in enumerate(smaller[:80], start=1):
         assert isinstance(item, dict)
@@ -204,22 +259,24 @@ def write_markdown(report: dict[str, object], path: Path) -> None:
         lines.append(
             f"| {idx} | `{item['symbol']}` | {line if line is not None else ''} | "
             f"{item['ref_instr']} | {item['nim_instr']} | {item['missing_instr']} | "
-            f"{item['pct_of_ref']} | {'yes' if item['placeholder_stub'] else 'no'} |"
+            f"{item['pct_of_ref']} | {'yes' if item['placeholder_stub'] else 'no'} | "
+            f"{'yes' if item['likely_active_placeholder_stub'] else 'no'} |"
         )
 
     lines += [
         "",
         "## Largest Placeholder Stubs",
         "",
-        "| # | Symbol | src line | ref instr | nim instr |",
-        "|---:|---|---:|---:|---:|",
+        "| # | Symbol | src line | ref instr | nim instr | active |",
+        "|---:|---|---:|---:|---:|---|",
     ]
     for idx, item in enumerate(stubs[:80], start=1):
         assert isinstance(item, dict)
         line = item.get("line")
         lines.append(
             f"| {idx} | `{item['symbol']}` | {line if line is not None else ''} | "
-            f"{item['ref_instr']} | {item['nim_instr']} |"
+            f"{item['ref_instr']} | {item['nim_instr']} | "
+            f"{'yes' if item['likely_active'] else 'no'} |"
         )
 
     path.write_text("\n".join(lines) + "\n")
@@ -262,6 +319,10 @@ def main() -> int:
     print(f"Nim-smaller funcs:         {report['nim_smaller_count']}")
     print(f"Placeholder stubs:         {report['placeholder_stub_count']}")
     print(f"Reference placeholder stubs: {report['placeholder_stubs_in_reference_count']}")
+    print(
+        "Likely active reference placeholder stubs: "
+        f"{report['likely_active_placeholder_stubs_in_reference_count']}"
+    )
 
     top = report["smaller_methods"]
     assert isinstance(top, list)
