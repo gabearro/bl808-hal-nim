@@ -16,7 +16,7 @@
 # BLE Controller C API (from ble_lib_api.h, libblecontroller.a)
 # =============================================================================
 when defined(bl808m0):
-  import core, irq, kernel/clock, mmio, sec
+  import core, irq, kernel/clock, kernel/cps, mmio, sec
 
   when defined(bl808BleVendor):
     import bleblob as blecontroller
@@ -108,46 +108,52 @@ when defined(bl808m0):
     if stageCb != nil:
       stageCb(stage)
 
-  proc bleControllerInitRawWithStage*(taskPriority: uint8,
-                                      stageCb: BleInitStageCb) {.cdecl.} =
-    ## Initialize BLE controller. `taskPriority` is the RTOS task priority.
-    if bleControllerStarted:
-      reportBleInitStage(stageCb, "already started")
-      return
+  proc bleBackendPrepareControllerInit(stageCb: BleInitStageCb) =
     when defined(bl808BleVendor):
       reportBleInitStage(stageCb, "before wireless domain")
       blecontroller.bleBlobPrepareWirelessDomain()
       reportBleInitStage(stageCb, "after wireless domain")
       blecontroller.bleBlobAllowAssertReturn()
       reportBleInitStage(stageCb, "after assert return")
-      reportBleInitStage(stageCb, "before controller init")
-      blecontroller.ble_controller_init(taskPriority)
-      reportBleInitStage(stageCb, "after controller init")
     else:
-      reportBleInitStage(stageCb, "before controller init")
-      when defined(bl808BleDebugSplitControllerInit):
-        discard taskPriority
-        blecontroller.bflbip_init()
-        reportBleInitStage(stageCb, "after bflbip_init")
-        blecontroller.ble_ke_init()
-        reportBleInitStage(stageCb, "after ble_ke_init")
-        blecontroller.hci_init(false)
-        reportBleInitStage(stageCb, "after hci_init")
-        blecontroller.bflbble_init()
-        reportBleInitStage(stageCb, "after bflbble_init")
-        blecontroller.ecc_init()
-        reportBleInitStage(stageCb, "after ecc_init")
-        blecontroller.lld_sleep_init()
-        reportBleInitStage(stageCb, "after lld_sleep_init")
-        blecontroller.lld_evt_init()
-        reportBleInitStage(stageCb, "after lld_evt_init")
-        blecontroller.bdaddr_init()
-        reportBleInitStage(stageCb, "after bdaddr_init")
-        blecontroller.ble_controller_task_init(nil)
-        blecontroller.bflbble_enable_runtime_irqs()
-      else:
-        blecontroller.ble_controller_init(taskPriority)
-      reportBleInitStage(stageCb, "after controller init")
+      discard stageCb
+
+  proc bleBackendControllerInit(taskPriority: uint8,
+                                stageCb: BleInitStageCb) =
+    reportBleInitStage(stageCb, "before controller init")
+    when defined(bl808BleDebugSplitControllerInit) and
+        not defined(bl808BleVendor):
+      discard taskPriority
+      blecontroller.bflbip_init()
+      reportBleInitStage(stageCb, "after bflbip_init")
+      blecontroller.ble_ke_init()
+      reportBleInitStage(stageCb, "after ble_ke_init")
+      blecontroller.hci_init(false)
+      reportBleInitStage(stageCb, "after hci_init")
+      blecontroller.bflbble_init()
+      reportBleInitStage(stageCb, "after bflbble_init")
+      blecontroller.ecc_init()
+      reportBleInitStage(stageCb, "after ecc_init")
+      blecontroller.lld_sleep_init()
+      reportBleInitStage(stageCb, "after lld_sleep_init")
+      blecontroller.lld_evt_init()
+      reportBleInitStage(stageCb, "after lld_evt_init")
+      blecontroller.bdaddr_init()
+      reportBleInitStage(stageCb, "after bdaddr_init")
+      blecontroller.ble_controller_task_init(nil)
+      blecontroller.bflbble_enable_runtime_irqs()
+    else:
+      blecontroller.ble_controller_init(taskPriority)
+    reportBleInitStage(stageCb, "after controller init")
+
+  proc bleControllerInitRawWithStage*(taskPriority: uint8,
+                                      stageCb: BleInitStageCb) {.cdecl.} =
+    ## Initialize BLE controller. `taskPriority` is the RTOS task priority.
+    if bleControllerStarted:
+      reportBleInitStage(stageCb, "already started")
+      return
+    bleBackendPrepareControllerInit(stageCb)
+    bleBackendControllerInit(taskPriority, stageCb)
     bleControllerStarted = true
 
   proc bleControllerInitRaw*(taskPriority: uint8) {.cdecl.} =
@@ -163,17 +169,11 @@ when defined(bl808m0):
 
   proc ble_controller_sleep*(maxSleepCycles: int32): int32 {.cdecl.} =
     ## Enter BLE sleep. Returns actual sleep cycles.
-    when defined(bl808BleVendor):
-      blecontroller.ble_controller_sleep(maxSleepCycles)
-    else:
-      blecontroller.ble_controller_sleep(maxSleepCycles)
+    blecontroller.ble_controller_sleep(maxSleepCycles)
 
   proc ble_controller_sleep_restore*() {.cdecl.} =
     ## Restore after BLE sleep.
-    when defined(bl808BleVendor):
-      blecontroller.ble_controller_sleep_restore()
-    else:
-      blecontroller.ble_controller_sleep_restore()
+    blecontroller.ble_controller_sleep_restore()
 
   proc ble_controller_set_tx_pwr*(bleTxPower: cint) {.cdecl.} =
     ## Set BLE TX power level.
@@ -228,6 +228,7 @@ when defined(bl808m0):
   var ble_central_debug_create_result* {.exportc.}: uint32
   var ble_host_acl_rx_count* {.exportc.}: uint32
   var ble_host_acl_tx_count* {.exportc.}: uint32
+
   var ble_host_acl_tx_reject_count* {.exportc.}: uint32
   var ble_host_att_rx_count* {.exportc.}: uint32
   var ble_host_att_tx_count* {.exportc.}: uint32
@@ -552,8 +553,13 @@ when defined(bl808m0):
     blePeripheralConnEventsSeen: uint32
     blePeripheralDiscEventsSeen: uint32
     blePeripheralConnectedNotified: bool
-    blePeripheralLastLlcpRx: uint32
+    blePeripheralDisconnectedNotified: bool
+    blePeripheralLastRxEventCounter: uint32
     blePeripheralIdlePolls: uint32
+    blePeripheralConnectFuture: CpsFuture[ptr BtConn]
+    blePeripheralConnectTimer: TimerId
+    blePeripheralDisconnectFuture: CpsFuture[uint8]
+    blePeripheralDisconnectTimer: TimerId
     bleScanReportCounter: uint32
     bleScanNameMatchCounter: uint32
     bleScanLastEventType: uint8
@@ -1136,12 +1142,56 @@ when defined(bl808m0):
     else:
       value
 
+  proc cancelBleTimer(timerId: var TimerId) =
+    if timerId != 0'u32:
+      cancelTimer(timerId)
+      timerId = 0'u32
+
+  proc completeBlePeripheralConnected(conn: ptr BtConn) =
+    if blePeripheralConnectFuture != nil and
+        not blePeripheralConnectFuture.finished:
+      complete(blePeripheralConnectFuture, conn)
+    cancelBleTimer(blePeripheralConnectTimer)
+    blePeripheralConnectFuture = nil
+
+  proc failBlePeripheralConnected(message: string) =
+    if blePeripheralConnectFuture != nil and
+        not blePeripheralConnectFuture.finished:
+      fail(blePeripheralConnectFuture, newException(TimeoutError, message))
+    cancelBleTimer(blePeripheralConnectTimer)
+    blePeripheralConnectFuture = nil
+
+  proc completeBlePeripheralDisconnected(reason: uint8) =
+    if blePeripheralDisconnectFuture != nil and
+        not blePeripheralDisconnectFuture.finished:
+      complete(blePeripheralDisconnectFuture, reason)
+    cancelBleTimer(blePeripheralDisconnectTimer)
+    blePeripheralDisconnectFuture = nil
+
+  proc failBlePeripheralDisconnected(message: string) =
+    if blePeripheralDisconnectFuture != nil and
+        not blePeripheralDisconnectFuture.finished:
+      fail(blePeripheralDisconnectFuture, newException(TimeoutError, message))
+    cancelBleTimer(blePeripheralDisconnectTimer)
+    blePeripheralDisconnectFuture = nil
+
   proc notifyConnected(err: uint8) =
     bleConnConnectedNotified = true
+    if err == 0:
+      blePeripheralDisconnectedNotified = false
+    if err == 0:
+      completeBlePeripheralConnected(addr bleConn)
+    else:
+      failBlePeripheralConnected("BLE peripheral connect failed")
     if bleConnCb != nil and bleConnCb.connected != nil:
       bleConnCb.connected(addr bleConn, err)
 
   proc notifyDisconnected(reason: uint8) =
+    completeBlePeripheralDisconnected(reason)
+    if blePeripheralDisconnectedNotified:
+      return
+    blePeripheralDisconnectedNotified = true
+    blePeripheralConnectedNotified = false
     if bleConnCb != nil and bleConnCb.disconnected != nil:
       bleConnCb.disconnected(addr bleConn, reason)
 
@@ -1166,9 +1216,11 @@ when defined(bl808m0):
       bleConnActive = true
       bleAdvActive = false
       bleCentralConnected = false
-      blePeripheralLastLlcpRx = blecontroller.bleNimDbgVendorLlcpRxCount()
+      blePeripheralLastRxEventCounter =
+        blecontroller.bleNimPeripheralLastRxEventCounter()
       blePeripheralIdlePolls = 0
       blePeripheralConnectedNotified = true
+      blePeripheralDisconnectedNotified = false
       notifyConnected(0)
 
   proc blePollHostEvents*() {.cdecl.} =
@@ -1200,12 +1252,12 @@ when defined(bl808m0):
           bleCentralConnected = false
           blePeripheralIdlePolls = 0
           notifyDisconnected(reason)
-          blePeripheralConnectedNotified = false
         elif bleConnActive and bleConn.role == 1'u8:
           when BlePeripheralIdleDisconnectPolls > 0:
-            let llcpRx = blecontroller.bleNimDbgVendorLlcpRxCount()
-            if llcpRx != blePeripheralLastLlcpRx:
-              blePeripheralLastLlcpRx = llcpRx
+            let rxEventCounter =
+              blecontroller.bleNimPeripheralLastRxEventCounter()
+            if rxEventCounter != blePeripheralLastRxEventCounter:
+              blePeripheralLastRxEventCounter = rxEventCounter
               blePeripheralIdlePolls = 0
             elif blePeripheralIdlePolls <
                 uint32(BlePeripheralIdleDisconnectPolls):
@@ -1220,11 +1272,76 @@ when defined(bl808m0):
                 blecontroller.bleNimPeripheralDiscEventCount()
               blePeripheralIdlePolls = 0
               notifyDisconnected(0x13'u8)
-              blePeripheralConnectedNotified = false
-          else:
-            discard
-      else:
-        discard
+        else:
+          discard
+
+  proc bleBackendServicePump() {.inline.} =
+    when defined(bl808BleVendor):
+      blecontroller.bleBlobPoll(32)
+      drainHciHostEvents()
+      blePollHostEvents()
+    else:
+      blecontroller.bflbble_isr()
+      when bl808BleNimPureCentral:
+        blecontroller.bleControllerDrainScanReports()
+      drainHciHostEvents()
+      blecontroller.bflbip_schedule()
+      when bl808BleNimPureCentral:
+        blecontroller.bleControllerServiceScan()
+        blecontroller.bleControllerDrainScanReports()
+      drainHciHostEvents()
+      blePollHostEvents()
+
+  proc bleHostServicePump*() {.cdecl.} =
+    ## One bounded BLE host/control-plane service step. This deliberately does
+    ## not replace BTBLE event scheduling or descriptor programming; it only
+    ## drains controller work into host-visible state.
+    if not bleControllerStarted and not bleHostEnabled:
+      return
+    bleBackendServicePump()
+
+  proc bleHostServiceTask*(periodUs: uint32 = 1000'u32,
+                           iterations: uint32 = 8'u32): CpsVoidFuture {.cps.} =
+    ## CPS-owned BLE host service. Hard radio timing remains in the
+    ## controller callbacks; this task replaces ad hoc app polling loops.
+    let delay =
+      if periodUs == 0'u32: 1'u32 else: periodUs
+    let count =
+      if iterations == 0'u32: 1'u32 else: iterations
+    while true:
+      for _ in 0'u32 ..< count:
+        bleHostServicePump()
+      await sleepUs(delay.uint64)
+
+  var
+    bleHostServiceHookInstalled: bool
+    bleHostServiceHookPeriodTicks: uint64 = usToTicks(1000'u64)
+    bleHostServiceHookIterations: uint32 = 8'u32
+
+  proc bleHostServicePollHook(now: uint64): uint64 =
+    let count =
+      if bleHostServiceHookIterations == 0'u32: 1'u32
+      else: bleHostServiceHookIterations
+    for _ in 0'u32 ..< count:
+      bleHostServicePump()
+    now + bleHostServiceHookPeriodTicks
+
+  proc bleConfigureHostServiceHook*(periodUs: uint32 = 1000'u32,
+                                    iterations: uint32 = 8'u32) =
+    bleHostServiceHookPeriodTicks =
+      if periodUs == 0'u32: 1'u64 else: usToTicks(periodUs.uint64)
+    bleHostServiceHookIterations =
+      if iterations == 0'u32: 1'u32 else: iterations
+
+  proc bleInstallHostServiceHook*(periodUs: uint32 = 1000'u32,
+                                  iterations: uint32 = 8'u32) =
+    ## Install the high-frequency BLE host pump as a scheduler poll hook.
+    ## Event waits remain CPS futures; the pump itself must not allocate per
+    ## tick when WiFi and BLE are both active.
+    bleConfigureHostServiceHook(periodUs, iterations)
+    if not bleHostServiceHookInstalled:
+      bleHostServiceHookInstalled =
+        addSchedulerTimedPollHook(bleHostServicePollHook, readTick())
 
   proc handleDisconnectionComplete(raw: ptr UncheckedArray[uint8],
                                    len: int) =
@@ -1714,6 +1831,7 @@ when defined(bl808m0):
       return -1
     bleAdvActive = false
     blePeripheralConnectedNotified = false
+    blePeripheralDisconnectedNotified = false
     blePeripheralIdlePolls = 0
     when bl808BleNimConnectionEnabled:
       blePeripheralConnEventsSeen =
@@ -1883,6 +2001,21 @@ when defined(bl808m0):
 
   proc bt_conn_cb_register*(cb: ptr BtConnCb) {.cdecl.} =
     bleConnCb = cb
+
+  proc bleHostDbgConnActive*(): uint32 {.exportc, cdecl.} =
+    if bleConnActive: 1'u32 else: 0'u32
+
+  proc bleHostDbgPeripheralConnectedNotified*(): uint32 {.exportc, cdecl.} =
+    if blePeripheralConnectedNotified: 1'u32 else: 0'u32
+
+  proc bleHostDbgPeripheralDisconnectedNotified*(): uint32 {.exportc, cdecl.} =
+    if blePeripheralDisconnectedNotified: 1'u32 else: 0'u32
+
+  proc bleHostDbgPeripheralIdlePolls*(): uint32 {.exportc, cdecl.} =
+    blePeripheralIdlePolls
+
+  proc bleHostDbgPeripheralLastRxEventCounter*(): uint32 {.exportc, cdecl.} =
+    blePeripheralLastRxEventCounter
 
   proc bleScanReportCount*(): uint32 {.cdecl.} =
     bleScanReportCounter
@@ -2398,6 +2531,8 @@ when defined(bl808m0):
       bleConnConnectedNotified = false
       ble_central_debug_create_result = 0xFFFFFFFF'u32
       return nil
+    when not defined(bl808BleVendor):
+      drainHciHostEvents()
     ble_central_debug_create_result = 0
     addr bleConn
 
@@ -2725,6 +2860,120 @@ when defined(bl808m0):
     bleCentralAcceptAnyReport = false
     -1
 
+  proc bleCentralScanByNameAsync*(name: cstring,
+                                  timeoutMs: uint32 = 20_000): CpsFuture[BtAddrLe] {.cps.} =
+    if not bleHostEnabled:
+      raise newException(CatchableError, "BLE host is not enabled")
+    resetCentralDiscoveryState(name, false)
+    var scanParam = BtLeScanParam(
+      scanType: centralDiscoveryScanType(),
+      filterDup: 0x00'u8,
+      interval: BleCentralDiscoveryScanInterval,
+      window: BleCentralDiscoveryScanWindow,
+    )
+    if not startCentralDiscoveryScan(scanParam, timeoutMs, 0x100'u32):
+      raise newException(CatchableError, "BLE scan start failed")
+    let startedAtMs = monotonicMs()
+    while elapsedMsSince(startedAtMs) < timeoutMs:
+      bleHostServicePump()
+      when not defined(bl808BleVendor):
+        synthesizeCentralReportIfNeeded()
+      if bleCentralPeerFound:
+        discard bt_le_scan_stop()
+        bleCentralTargetActive = false
+        bleCentralAcceptAnyReport = false
+        return bleCentralPeer
+      await sleepMs(1)
+    discard bt_le_scan_stop()
+    bleCentralTargetActive = false
+    bleCentralAcceptAnyReport = false
+    raise newException(TimeoutError, "BLE scan timed out")
+
+  proc bleCentralConnectByNameAsync*(name: cstring,
+                                     timeoutMs: uint32 = 20_000): CpsFuture[ptr BtConn] {.cps.} =
+    ble_central_debug_stage = 0x5500'u32
+    ble_central_debug_timeout = timeoutMs
+    ble_central_debug_waited = 0
+    ble_central_debug_flags = 0
+    if not bleHostEnabled:
+      raise newException(CatchableError, "BLE host is not enabled")
+    resetCentralDiscoveryState(name)
+    bleCentralConnected = false
+    bleConnPending = false
+    bleConnConnectedNotified = false
+    var scanParam = BtLeScanParam(
+      scanType: centralDiscoveryScanType(),
+      filterDup: 0x00'u8,
+      interval: BleCentralDiscoveryScanInterval,
+      window: BleCentralDiscoveryScanWindow,
+    )
+    if not startCentralDiscoveryScan(scanParam, timeoutMs, 0x100'u32):
+      raise newException(CatchableError, "BLE scan start failed")
+    var connectStarted = false
+    var connectStartedAt = 0'u32
+    var peerConnectRetries = 0'u32
+    let attemptBudget = centralConnectAttemptBudget(timeoutMs)
+    let startedAtMs = monotonicMs()
+    while true:
+      let waited = elapsedMsSince(startedAtMs)
+      ble_central_debug_waited = waited
+      if waited >= timeoutMs:
+        break
+      bleHostServicePump()
+      ble_central_debug_flags =
+        (if bleCentralPeerFound: 1'u32 else: 0'u32) or
+        (if connectStarted: 2'u32 else: 0'u32) or
+        (if bleConnPending: 4'u32 else: 0'u32) or
+        (if bleCentralConnected: 8'u32 else: 0'u32)
+      when not defined(bl808BleVendor):
+        if waited >= 250'u32:
+          synthesizeCentralReportIfNeeded()
+      if bleCentralConnected:
+        if not bleConnConnectedNotified:
+          notifyConnected(bleConn.status)
+        return addr bleConn
+      if connectStarted and not bleConnPending and not bleCentralConnected:
+        connectStarted = false
+        if not restartCentralDiscoveryScan(scanParam, timeoutMs, 0x510'u32,
+                                           peerConnectRetries):
+          break
+      if connectStarted and attemptBudget != 0'u32 and
+          ((waited - connectStartedAt) >= attemptBudget):
+        discard hciCommandOk(HciOpLeCreateConnectionCancel, nil, 0)
+        connectStarted = false
+        bleConnPending = false
+        bleConnConnectedNotified = false
+        if not restartCentralDiscoveryScan(scanParam, timeoutMs, 0x521'u32,
+                                           peerConnectRetries):
+          break
+      if bleCentralPeerFound and not connectStarted:
+        discard stopDiscoveryScanBeforeConnect()
+        var connParam = BtLeConnParam(
+          intervalMin: 0x0018'u16,
+          intervalMax: 0x0028'u16,
+          latency: 0'u16,
+          timeout: 400'u16,
+        )
+        if bt_conn_create_le(addr bleCentralPeer, addr connParam) == nil:
+          bleCentralTargetActive = false
+          bleCentralAcceptAnyReport = false
+          bleConnPending = false
+          bleConnConnectedNotified = false
+          raise newException(CatchableError, "BLE create connection failed")
+        bleCentralTargetActive = false
+        bleCentralAcceptAnyReport = false
+        peerConnectRetries = 0
+        connectStarted = true
+        connectStartedAt = waited
+      await sleepMs(1)
+    if connectStarted:
+      discard hciCommandOk(HciOpLeCreateConnectionCancel, nil, 0)
+    else:
+      discard bt_le_scan_stop()
+    bleCentralTargetActive = false
+    bleCentralAcceptAnyReport = false
+    raise newException(TimeoutError, "BLE connect timed out")
+
   proc bleDisconnectCurrent*(reason: uint8 = 0x13'u8,
                              timeoutMs: uint32 = 2_000): cint {.cdecl.} =
     if not bleConnActive:
@@ -2740,10 +2989,10 @@ when defined(bl808m0):
         pollCentralController()
       else:
         drainHciHostEvents()
-      if not bleConnActive:
-        return 0
-      delayUs(1000)
-      inc waited
+        if not bleConnActive:
+          return 0
+        delayUs(1000)
+        inc waited
     -1
 
 # =============================================================================
@@ -2789,6 +3038,9 @@ when defined(bl808m0):
     let rc = bt_enable(readyCb)
     if rc == 0: bleOk else: bleFail
 
+  proc bleEnableAsync*(readyCb: BtReadyCb): CpsFuture[BleError] {.cps.} =
+    return bleEnable(readyCb)
+
   proc bleSetName*(name: string): BleError =
     let rc = bt_set_name(name.cstring)
     if rc == 0: bleOk else: bleFail
@@ -2799,9 +3051,64 @@ when defined(bl808m0):
     let rc = bt_le_adv_start(param, ad, adLen.csize_t, sd, sdLen.csize_t)
     if rc == 0: bleOk else: bleFail
 
+  proc bleStartAdvertisingAsync*(param: ptr BtLeAdvParam,
+                                 ad: ptr BtData, adLen: int,
+                                 sd: ptr BtData = nil,
+                                 sdLen: int = 0): CpsFuture[BleError] {.cps.} =
+    return bleStartAdvertising(param, ad, adLen, sd, sdLen)
+
   proc bleStopAdvertising*(): BleError =
     let rc = bt_le_adv_stop()
     if rc == 0: bleOk else: bleFail
+
+  proc bleStopAdvertisingAsync*(): CpsFuture[BleError] {.cps.} =
+    return bleStopAdvertising()
+
+  proc bleWaitPeripheralDisconnected*(timeoutMs: uint32 = 20_000): CpsFuture[uint8]
+
+  proc bleDisconnectAsync*(reason: uint8 = 0x13'u8,
+                           timeoutMs: uint32 = 2_000): CpsFuture[BleError] {.cps.} =
+    if not bleConnActive:
+      return bleOk
+    if bt_conn_disconnect(addr bleConn, reason) != 0:
+      if bleConn.role == 1'u8 and blePeripheralConnectedNotified:
+        bleConnActive = false
+        bleConnPending = false
+        bleConnConnectedNotified = false
+        bleCentralConnected = false
+        notifyDisconnected(reason)
+        return bleOk
+      return bleFail
+    discard await bleWaitPeripheralDisconnected(timeoutMs)
+    return bleOk
+
+  proc bleWaitPeripheralConnected*(timeoutMs: uint32 = 20_000): CpsFuture[ptr BtConn] =
+    if blePeripheralConnectedNotified and bleConnActive:
+      return completedLocalFuture(addr bleConn)
+    if blePeripheralConnectFuture != nil and not blePeripheralConnectFuture.finished:
+      return blePeripheralConnectFuture
+    blePeripheralConnectFuture = newLocalCpsFuture[ptr BtConn]()
+    if timeoutMs != 0'u32:
+      blePeripheralConnectTimer = addTimerMs(timeoutMs.uint64, proc() =
+        failBlePeripheralConnected("BLE peripheral connect timed out")
+      )
+    return blePeripheralConnectFuture
+
+  proc bleWaitPeripheralDisconnected*(timeoutMs: uint32 = 20_000): CpsFuture[uint8] =
+    if not bleConnActive:
+      if blePeripheralConnectedNotified and
+          not blePeripheralDisconnectedNotified:
+        notifyDisconnected(0x13'u8)
+      return completedLocalFuture(0x13'u8)
+    if blePeripheralDisconnectFuture != nil and
+        not blePeripheralDisconnectFuture.finished:
+      return blePeripheralDisconnectFuture
+    blePeripheralDisconnectFuture = newLocalCpsFuture[uint8]()
+    if timeoutMs != 0'u32:
+      blePeripheralDisconnectTimer = addTimerMs(timeoutMs.uint64, proc() =
+        failBlePeripheralDisconnected("BLE peripheral disconnect timed out")
+      )
+    return blePeripheralDisconnectFuture
 
   proc bleCentralScan*(name: string,
                        timeoutMs: uint32 = 20_000): BleError =
@@ -2816,6 +3123,37 @@ when defined(bl808m0):
                           timeoutMs: uint32 = 20_000): BleError =
     let rc = bleCentralConnectByName(name.cstring, timeoutMs)
     if rc == 0: bleOk else: bleFail
+
+  proc bleWaitPeripheralDisconnectedServicedAsync*(
+      timeoutMs: uint32 = 20_000'u32,
+      periodUs: uint32 = 1000'u32,
+      iterations: uint32 = 8'u32): CpsFuture[bool] {.cps.} =
+    ## Wait for a peripheral disconnect while keeping the Nim BLE host serviced.
+    ## The controller/host pump is bounded and synchronous; this CPS helper owns
+    ## the wait cadence so applications do not open-code BLE polling loops.
+    if not bleConnActive:
+      if blePeripheralConnectedNotified and
+          not blePeripheralDisconnectedNotified:
+        notifyDisconnected(0x13'u8)
+      return blePeripheralDisconnectedNotified
+
+    let delay = if periodUs == 0'u32: 1'u64 else: periodUs.uint64
+    let count = if iterations == 0'u32: 1'u32 else: iterations
+    let deadline =
+      if timeoutMs == 0'u32:
+        uint64.high
+      else:
+        readTick() + usToTicks(timeoutMs.uint64 * 1000'u64)
+
+    while not blePeripheralDisconnectedNotified and readTick() < deadline:
+      for _ in 0'u32 ..< count:
+        bleHostServicePump()
+      await sleepUs(delay)
+
+    if not bleConnActive and blePeripheralConnectedNotified and
+        not blePeripheralDisconnectedNotified:
+      notifyDisconnected(0x13'u8)
+    return blePeripheralDisconnectedNotified
 
   proc bleDisconnect*(reason: uint8 = 0x13'u8,
                       timeoutMs: uint32 = 2_000): BleError =

@@ -23,6 +23,8 @@ const
   WifiChannel {.intdefine.} = 0
   WifiScanOnly {.booldefine.} = false
   WifiExpectConnectFailure {.booldefine.} = false
+  WifiKeepaliveFrames {.intdefine.} = 0
+  WifiKeepaliveQosNull {.booldefine.} = false
   WifiExpectedConnectStatus {.intdefine.} = 8
   WifiExpectedConnectReason {.intdefine.} = 15
   WifiStatusAssociateFailure = 5
@@ -184,6 +186,9 @@ when defined(bl808WifiNimFw):
   var nimfw_dbg_cfm_evt        {.importc.}: uint32
   var nimfw_dbg_frame_cfm      {.importc.}: uint32
   var nimfw_dbg_frame_release  {.importc.}: uint32
+  var nimfw_dbg_txint_enter    {.importc.}: uint32
+  var nimfw_dbg_txint_last_cb  {.importc.}: uint32
+  var nimfw_dbg_txint_last_fc  {.importc.}: uint32
   var nimfw_dbg_txtrig_acready {.importc.}: uint32
   var nimfw_dbg_txtrig_zero    {.importc.}: uint32
   var nimfw_dbg_txtrig_loops   {.importc.}: uint32
@@ -193,8 +198,46 @@ when defined(bl808WifiNimFw):
   var nimfw_dbg_frame_evt_usedskip {.importc.}: uint32
   var nimfw_dbg_frame_evt_cb       {.importc.}: uint32
   var nimfw_dbg_frame_get_fails    {.importc.}: uint32
+  var nimfw_dbg_frame_get_invalid  {.importc.}: uint32
+  var nimfw_dbg_frame_get_invalid_ptr {.importc.}: uint32
+  var nimfw_dbg_frame_get_invalid_next {.importc.}: uint32
+  var nimfw_dbg_frame_free_rebuild {.importc.}: uint32
+  var nimfw_dbg_frame_free_reclaimed {.importc.}: uint32
+  var nimfw_dbg_frame_free_push_invalid {.importc.}: uint32
+  var nimfw_dbg_tx_pending_invalid {.importc.}: uint32
+  var nimfw_dbg_tx_pending_invalid_ptr {.importc.}: uint32
   var nimfw_dbg_nullframe_calls    {.importc.}: uint32
   var nimfw_dbg_nullframe_caller_ra {.importc.}: uint32
+  var nimfw_dbg_nullframe_desc      {.importc.}: uint32
+  var nimfw_dbg_nullframe_buf       {.importc.}: uint32
+  var nimfw_dbg_nullframe_fc        {.importc.}: uint32
+  var nimfw_dbg_nullframe_push_rc   {.importc.}: uint32
+  var nimfw_dbg_nullframe_return    {.importc.}: uint32
+  var nimfw_dbg_nullframe_vif_sta   {.importc.}: uint32
+  var nimfw_dbg_nullframe_fake_seen {.importc.}: uint32
+  var nimfw_dbg_nullframe_fake_qidx {.importc.}: uint32
+  var nimfw_dbg_nullframe_fake_head_before {.importc.}: uint32
+  var nimfw_dbg_nullframe_fake_tail_before {.importc.}: uint32
+  var nimfw_dbg_nullframe_fake_head_after {.importc.}: uint32
+  var nimfw_dbg_nullframe_fake_tail_after {.importc.}: uint32
+  var nimfw_dbg_nullframe_fake_link {.importc.}: uint32
+  var nimfw_dbg_nullframe_busy_txcheck {.importc.}: uint32
+  var nimfw_dbg_nullframe_busy_pscheck {.importc.}: uint32
+  var nimfw_dbg_nullframe_postponed {.importc.}: uint32
+  var nimfw_dbg_nullframe_queued {.importc.}: uint32
+  var nimfw_keepalive_inflight {.importc.}: uint32
+  var nimfw_keepalive_target_cfm {.importc.}: uint32
+  var nimfw_dbg_keepalive_rc {.importc.}: uint32
+  var nimfw_dbg_keepalive_post_before {.importc.}: uint32
+  var nimfw_dbg_keepalive_post_after {.importc.}: uint32
+  var nimfw_dbg_keepalive_txint_before {.importc.}: uint32
+  var nimfw_dbg_keepalive_txint_after {.importc.}: uint32
+  var nimfw_dbg_keepalive_fake_before {.importc.}: uint32
+  var nimfw_dbg_keepalive_fake_after {.importc.}: uint32
+  var nimfw_dbg_keepalive_pay_before {.importc.}: uint32
+  var nimfw_dbg_keepalive_pay_after {.importc.}: uint32
+  var nimfw_dbg_keepalive_cb_before {.importc.}: uint32
+  var nimfw_dbg_keepalive_cb_after {.importc.}: uint32
   var nimfw_dbg_sta_tbtt_enter     {.importc.}: uint32
   var nimfw_dbg_sta_tbtt_assoc     {.importc.}: uint32
   var nimfw_dbg_sta_tbtt_onchan    {.importc.}: uint32
@@ -218,6 +261,27 @@ when defined(bl808WifiNimFw):
   var nimfw_dbg_conn_ind_prepath   {.importc.}: uint32
   var nimfw_dbg_vif_ielen_assoc    {.importc.}: uint32
   var nimfw_dbg_ptk_init_done      {.importc.}: uint32
+  var nimfw_dbg_keydata_decrypt_calls {.importc.}: uint32
+  var nimfw_dbg_keydata_decrypt_len {.importc.}: uint32
+  var nimfw_dbg_keydata_decrypt_out_len {.importc.}: uint32
+  var nimfw_dbg_keydata_decrypt_ok {.importc.}: uint32
+  var nimfw_dbg_keydata_decrypt_fail {.importc.}: uint32
+  var nimfw_dbg_postponed_service_calls {.importc.}: uint32
+  var nimfw_dbg_postponed_service_sent {.importc.}: uint32
+  var nimfw_dbg_postponed_reconcile {.importc.}: uint32
+  var nimfw_dbg_postponed_reconcile_old {.importc.}: uint32
+  var nimfw_dbg_postponed_reconcile_new {.importc.}: uint32
+  var nimfw_dbg_auto_null_skipped {.importc.}: uint32
+  var nimfw_dbg_tx_stalled_internal_recover {.importc.}: uint32
+  var nimfw_dbg_tx_recover_ac {.importc.}: uint32
+  var nimfw_dbg_tx_recover_pending {.importc.}: uint32
+  var nimfw_dbg_tx_recover_current_before {.importc.}: uint32
+  var nimfw_dbg_tx_recover_current_after {.importc.}: uint32
+  var nimfw_dbg_tx_recover_backup_before {.importc.}: uint32
+  var nimfw_dbg_tx_recover_backup_after_fake {.importc.}: uint32
+  var nimfw_dbg_tx_recover_backup_after_pay {.importc.}: uint32
+  var nimfw_dbg_tx_recover_desc_buf {.importc.}: uint32
+  var nimfw_dbg_tx_recover_desc_cb {.importc.}: uint32
   var nimfw_wpa_pending_mask       {.importc.}: uint32
   var nimfw_dbg_sta_tbtt_skip      {.importc.}: uint32
   var nimfw_dbg_sta_tbtt_giveup    {.importc.}: uint32
@@ -371,12 +435,104 @@ when defined(bl808WifiNimFw):
     discard console.sendString(" frame_release=")
     console.sendHex32(nimfw_dbg_frame_release)
     discard console.sendLine("")
+    discard console.sendString("[WIFI-NIMFW] tx_counters txint_enter=")
+    console.sendHex32(nimfw_dbg_txint_enter)
+    discard console.sendString(" last_cb=")
+    console.sendHex32(nimfw_dbg_txint_last_cb)
+    discard console.sendString(" last_fc=")
+    console.sendHex32(nimfw_dbg_txint_last_fc)
+    discard console.sendLine("")
+    discard console.sendString("[WIFI-NIMFW] tx_counters nullframe_fake_seen=")
+    console.sendHex32(nimfw_dbg_nullframe_fake_seen)
+    discard console.sendString(" qidx=")
+    console.sendHex32(nimfw_dbg_nullframe_fake_qidx)
+    discard console.sendString(" link=")
+    console.sendHex32(nimfw_dbg_nullframe_fake_link)
+    discard console.sendLine("")
+    discard console.sendString("[WIFI-NIMFW] tx_counters nullframe_fake_head_before=")
+    console.sendHex32(nimfw_dbg_nullframe_fake_head_before)
+    discard console.sendString(" tail_before=")
+    console.sendHex32(nimfw_dbg_nullframe_fake_tail_before)
+    discard console.sendString(" head_after=")
+    console.sendHex32(nimfw_dbg_nullframe_fake_head_after)
+    discard console.sendString(" tail_after=")
+    console.sendHex32(nimfw_dbg_nullframe_fake_tail_after)
+    discard console.sendLine("")
     discard console.sendString("[WIFI-NIMFW] tx_counters nullframe_calls=")
     console.sendHex32(nimfw_dbg_nullframe_calls)
     discard console.sendString(" nullframe_ra=")
     console.sendHex32(nimfw_dbg_nullframe_caller_ra)
     discard console.sendString(" framegetfails=")
     console.sendHex32(nimfw_dbg_frame_get_fails)
+    discard console.sendLine("")
+    discard console.sendString("[WIFI-NIMFW] tx_counters frame_invalid=")
+    console.sendHex32(nimfw_dbg_frame_get_invalid)
+    discard console.sendString(" ptr=")
+    console.sendHex32(nimfw_dbg_frame_get_invalid_ptr)
+    discard console.sendString(" next=")
+    console.sendHex32(nimfw_dbg_frame_get_invalid_next)
+    discard console.sendLine("")
+    discard console.sendString("[WIFI-NIMFW] tx_counters frame_rebuild=")
+    console.sendHex32(nimfw_dbg_frame_free_rebuild)
+    discard console.sendString(" reclaimed=")
+    console.sendHex32(nimfw_dbg_frame_free_reclaimed)
+    discard console.sendString(" push_invalid=")
+    console.sendHex32(nimfw_dbg_frame_free_push_invalid)
+    discard console.sendString(" pending_invalid=")
+    console.sendHex32(nimfw_dbg_tx_pending_invalid)
+    discard console.sendString(" pending_ptr=")
+    console.sendHex32(nimfw_dbg_tx_pending_invalid_ptr)
+    discard console.sendLine("")
+    discard console.sendString("[WIFI-NIMFW] tx_counters nullframe_desc=")
+    console.sendHex32(nimfw_dbg_nullframe_desc)
+    discard console.sendString(" buf=")
+    console.sendHex32(nimfw_dbg_nullframe_buf)
+    discard console.sendString(" fc=")
+    console.sendHex32(nimfw_dbg_nullframe_fc)
+    discard console.sendLine("")
+    discard console.sendString("[WIFI-NIMFW] tx_counters nullframe_push_rc=")
+    console.sendHex32(nimfw_dbg_nullframe_push_rc)
+    discard console.sendString(" return=")
+    console.sendHex32(nimfw_dbg_nullframe_return)
+    discard console.sendString(" vif_sta=")
+    console.sendHex32(nimfw_dbg_nullframe_vif_sta)
+    discard console.sendLine("")
+    discard console.sendString("[WIFI-NIMFW] tx_counters keepalive_busy_txcheck=")
+    console.sendHex32(nimfw_dbg_nullframe_busy_txcheck)
+    discard console.sendString(" busy_inflight=")
+    console.sendHex32(nimfw_dbg_nullframe_busy_pscheck)
+    discard console.sendString(" postponed=")
+    console.sendHex32(nimfw_dbg_nullframe_postponed)
+    discard console.sendString(" queued=")
+    console.sendHex32(nimfw_dbg_nullframe_queued)
+    discard console.sendString(" inflight=")
+    console.sendHex32(nimfw_keepalive_inflight)
+    discard console.sendString(" target=")
+    console.sendHex32(nimfw_keepalive_target_cfm)
+    discard console.sendLine("")
+    discard console.sendString("[WIFI-NIMFW] tx_counters keepalive_call rc=")
+    console.sendHex32(nimfw_dbg_keepalive_rc)
+    discard console.sendString(" post=")
+    console.sendHex32(nimfw_dbg_keepalive_post_before)
+    discard console.sendString("->")
+    console.sendHex32(nimfw_dbg_keepalive_post_after)
+    discard console.sendString(" txint=")
+    console.sendHex32(nimfw_dbg_keepalive_txint_before)
+    discard console.sendString("->")
+    console.sendHex32(nimfw_dbg_keepalive_txint_after)
+    discard console.sendLine("")
+    discard console.sendString("[WIFI-NIMFW] tx_counters keepalive_call fake=")
+    console.sendHex32(nimfw_dbg_keepalive_fake_before)
+    discard console.sendString("->")
+    console.sendHex32(nimfw_dbg_keepalive_fake_after)
+    discard console.sendString(" pay=")
+    console.sendHex32(nimfw_dbg_keepalive_pay_before)
+    discard console.sendString("->")
+    console.sendHex32(nimfw_dbg_keepalive_pay_after)
+    discard console.sendString(" cb=")
+    console.sendHex32(nimfw_dbg_keepalive_cb_before)
+    discard console.sendString("->")
+    console.sendHex32(nimfw_dbg_keepalive_cb_after)
     discard console.sendLine("")
     discard console.sendString("[WIFI-NIMFW] tx_counters set_vif_state=")
     console.sendHex32(nimfw_dbg_set_vif_state)
@@ -415,6 +571,12 @@ when defined(bl808WifiNimFw):
     console.sendHex32(nimfw_dbg_vif_ielen_assoc)
     discard console.sendString(" ptk_done=")
     console.sendHex32(nimfw_dbg_ptk_init_done)
+    discard console.sendString(" kde_calls=")
+    console.sendHex32(nimfw_dbg_keydata_decrypt_calls)
+    discard console.sendString(" kde_ok=")
+    console.sendHex32(nimfw_dbg_keydata_decrypt_ok)
+    discard console.sendString(" kde_fail=")
+    console.sendHex32(nimfw_dbg_keydata_decrypt_fail)
     discard console.sendString(" wpa_mask=")
     console.sendHex32(nimfw_wpa_pending_mask)
     discard console.sendString(" tbtt_skip=")
@@ -483,12 +645,51 @@ when defined(bl808WifiNimFw):
     console.sendHex32(nimfw_dbg_wpa_rx_state)
     discard console.sendString(" ptk_inst=")
     console.sendHex32(nimfw_dbg_wpa_ptk_installed)
+    discard console.sendString(" kde_len=")
+    console.sendHex32(nimfw_dbg_keydata_decrypt_len)
+    discard console.sendString(" kde_out=")
+    console.sendHex32(nimfw_dbg_keydata_decrypt_out_len)
     discard console.sendString(" crypto_cap=")
     console.sendHex32(nimfw_dbg_crypto_captured)
     discard console.sendString(" pmk_len=")
     console.sendHex32(nimfw_dbg_crypto_pmk_len)
     discard console.sendString(" ptk_len=")
     console.sendHex32(nimfw_dbg_crypto_ptk_len)
+    discard console.sendLine("")
+    discard console.sendString("[WIFI-NIMFW] tx_counters postponed_reconcile=")
+    console.sendHex32(nimfw_dbg_postponed_reconcile)
+    discard console.sendString(" old=")
+    console.sendHex32(nimfw_dbg_postponed_reconcile_old)
+    discard console.sendString(" new=")
+    console.sendHex32(nimfw_dbg_postponed_reconcile_new)
+    discard console.sendString(" service_calls=")
+    console.sendHex32(nimfw_dbg_postponed_service_calls)
+    discard console.sendString(" service_sent=")
+    console.sendHex32(nimfw_dbg_postponed_service_sent)
+    discard console.sendString(" auto_null_skip=")
+    console.sendHex32(nimfw_dbg_auto_null_skipped)
+    discard console.sendString(" tx_recover=")
+    console.sendHex32(nimfw_dbg_tx_stalled_internal_recover)
+    discard console.sendLine("")
+    discard console.sendString("[WIFI-NIMFW] tx_counters recover ac=")
+    console.sendHex32(nimfw_dbg_tx_recover_ac)
+    discard console.sendString(" pending=")
+    console.sendHex32(nimfw_dbg_tx_recover_pending)
+    discard console.sendString(" current=")
+    console.sendHex32(nimfw_dbg_tx_recover_current_before)
+    discard console.sendString("->")
+    console.sendHex32(nimfw_dbg_tx_recover_current_after)
+    discard console.sendLine("")
+    discard console.sendString("[WIFI-NIMFW] tx_counters recover backup=")
+    console.sendHex32(nimfw_dbg_tx_recover_backup_before)
+    discard console.sendString("->")
+    console.sendHex32(nimfw_dbg_tx_recover_backup_after_fake)
+    discard console.sendString("->")
+    console.sendHex32(nimfw_dbg_tx_recover_backup_after_pay)
+    discard console.sendString(" desc_buf=")
+    console.sendHex32(nimfw_dbg_tx_recover_desc_buf)
+    discard console.sendString(" cb=")
+    console.sendHex32(nimfw_dbg_tx_recover_desc_cb)
     discard console.sendLine("")
     if nimfw_dbg_crypto_captured != 0:
       discard console.sendString("[CRYPTO] sha256=")
@@ -714,11 +915,62 @@ proc main() {.exportc, cdecl.} =
             wifiCredentialFailureMatches(failureStatus, failureReason))
     discard wifiDisconnect()
   else:
-    check("wifi connect", connectResult == wifiOk)
+    let connectOk = connectResult == wifiOk
+    when defined(bl808WifiNimFw):
+      if not connectOk:
+        dumpNimFwTxCounters()
+    check("wifi connect", connectOk)
     when defined(bl808WifiVendor):
       check("wifi connect status", bl808_wifi_vendor_last_status() == 0)
       check("wifi connect reason", bl808_wifi_vendor_last_reason() == 0)
     check("wifi netif", wifiGetNetif() != nil)
+    when defined(bl808WifiNimFw):
+      when WifiKeepaliveFrames > 0:
+        wifiSetStaKeepaliveQosNull(WifiKeepaliveQosNull)
+        var txFrames = 0
+        var txFailures = 0
+        var txAttempts = 0
+        while txFrames < WifiKeepaliveFrames and txAttempts < 5000:
+          inc txAttempts
+          var busy = false
+          case wifiSendStaKeepaliveFrame()
+          of wifiOk:
+            inc txFrames
+          of wifiBusy:
+            busy = true
+          else:
+            inc txFailures
+          let serviceRounds = if busy: 10 else: 250
+          for _ in 0 ..< serviceRounds:
+            wifiServicePump(8)
+            delayUs(1000)
+        var confirmPolls = 0
+        while wifiStaKeepaliveConfirmCount() < txFrames.uint32 and
+            confirmPolls < 5000:
+          wifiServicePump(8)
+          delayUs(1000)
+          inc confirmPolls
+        discard console.sendString("[WIFI] keepalive tx=")
+        console.sendHex32(txFrames.uint32)
+        discard console.sendString(" attempts=")
+        console.sendHex32(txAttempts.uint32)
+        discard console.sendString(" failures=")
+        console.sendHex32(txFailures.uint32)
+        discard console.sendString(" cfm=")
+        console.sendHex32(wifiStaKeepaliveConfirmCount())
+        discard console.sendString(" ack=")
+        console.sendHex32(wifiStaKeepaliveAckOkCount())
+        discard console.sendString(" nack=")
+        console.sendHex32(wifiStaKeepaliveFailCount())
+        discard console.sendLine("")
+        let keepaliveOk =
+          txFrames >= WifiKeepaliveFrames and
+          txFailures == 0 and
+          wifiStaKeepaliveAckOkCount() >= WifiKeepaliveFrames.uint32 and
+          wifiStaKeepaliveFailCount() == 0
+        if not keepaliveOk:
+          dumpNimFwTxCounters()
+        check("wifi keepalive tx ack", keepaliveOk)
     when defined(bl808WifiNimFwDiag):
       discard console.sendString("[DISCONNECT] pre sm_state=")
       console.sendHex32(ke_state_get(4'u16).uint32)

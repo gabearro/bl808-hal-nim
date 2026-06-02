@@ -10,6 +10,9 @@ with both connected debug paths:
   captures register/memory snapshots on failures. With `--jtag-flash`, it also
   programs external SPI flash through a RAM-resident M0 flash stub, so the BL808
   BOOT strap does not need to be asserted.
+- M0 UART anchor path: loads a RAM-resident M0 flash anchor over JTAG, then
+  streams persistent SPI flash writes over the normal UART pins. If that anchor
+  is already running, `--uart-anchor-existing` can reuse it without JTAG.
 
 The default JTAG target is M0/E907 through `pine64jtag.cfg` and
 `tgt_e907_v2.cfg`. Cross-core tests still run D0/LP firmware; M0 JTAG is used
@@ -73,6 +76,64 @@ disturbed.
 The default make targets use `--jtag-flash`, so the board can stay in normal
 boot mode. The harness resets the FTDI adapter, controls the JTAG mux, and
 programs persistent flash through the M0 JTAG path.
+
+Some BLE/WiFi tests set `jtag_flash_reset_capture` so the flashed image starts
+from a fresh target reset before UART and host capture. Runtime JTAG stays
+enabled by default in that mode, so a failing run still gets the post-run
+register and symbol snapshot. If a specific test truly needs to isolate the
+UART/host run from OpenOCD, set `jtag_flash_runtime_jtag: false` in that manifest
+entry; `--jtag-flash-runtime-jtag` is still accepted as an explicit compatibility
+flag.
+
+## macOS BLE Host Actions
+
+BLE connect/advertise validations that involve the Mac use the native
+CoreBluetooth helper built by `tools/run_macos_ble_helper.py`. The helper app
+is generated at:
+
+```sh
+~/Library/Application Support/bl808-hal/MacOSBLEHelper.app
+```
+
+The hardware harness launches this app through LaunchServices so macOS
+Bluetooth privacy authorization is attached to the app bundle, not to Python or
+the shell. Before running BLE host-action tests, verify permission with:
+
+```sh
+.venv/bin/python tools/run_macos_ble_helper.py permission --debug
+```
+
+If this reports `authorization=notDetermined`, `denied`, or no central state,
+open System Settings > Privacy & Security > Bluetooth and enable
+MacOSBLEHelper. Until CoreBluetooth reports the helper as powered on, BLE tests
+can still prove board-side advertising/scanning over UART/JTAG, but Mac-to-board
+connect validation is blocked on macOS rather than firmware.
+
+The preferred anchor path loads a temporary M0 flash anchor over JTAG, programs
+the new image through UART, then pulses target nSRST before runtime capture:
+
+```sh
+.venv/bin/python tools/hw_validate.py --test m0_wifi_hal_test \
+  --uart-anchor-flash \
+  --uart /dev/cu.usbserial-XXXX
+```
+
+If an M0 UART flash anchor is already running on the board, the harness can
+program a new image through UART and ask the anchor to reboot into it, without
+entering UART boot mode or using runtime JTAG:
+
+```sh
+.venv/bin/python tools/hw_validate.py --test m0_wifi_hal_test \
+  --uart-anchor-flash \
+  --uart-anchor-existing \
+  --uart-anchor-reset-after-flash \
+  --no-jtag \
+  --uart /dev/cu.usbserial-XXXX
+```
+
+This path still requires a live anchor. If neither JTAG nor an existing anchor
+is reachable, the board must be put into UART boot once to restore a runnable
+image or anchor.
 
 For the explicit UART-flash fallback path, put the board into UART boot mode
 before the flash step. The harness does not drive the BL808 BOOT strap.
@@ -229,6 +290,50 @@ program, and verify flash. Multi-core tests additionally program LP at
 `0x091000` and D0 at `0x100000`. UART is still used for runtime logs after the
 JTAG flash step completes. The stub only drives the SPI flash controller; it
 does not access eFuse.
+
+Program persistent flash through the M0 UART flash anchor:
+
+```sh
+.venv/bin/python tools/hw_validate.py --test m0_cps_test --uart-anchor-flash \
+  --uart /dev/cu.usbserial-XXXX
+```
+
+Without `--uart-anchor-existing`, the harness first uses JTAG to reset-halt M0,
+load `tools/uart_flash_anchor.c` into WRAM, and start it. The anchor receives
+flash commands on UART0 and erases/programs/verifies SPI flash. By default the
+harness opens the runtime UART and pulses target nSRST before capture, which is
+the most reliable path when the FTDI reset line is available. Use
+`--uart-anchor-reset-after-flash` only when you intentionally want the anchor to
+request a chip reboot instead of relying on nSRST.
+
+When a previously flashed anchor is already running, skip the JTAG load step:
+
+```sh
+.venv/bin/python tools/hw_validate.py --test m0_cps_test --uart-anchor-flash \
+  --uart-anchor-existing \
+  --uart-anchor-reset-after-flash \
+  --no-jtag \
+  --uart /dev/cu.usbserial-XXXX
+```
+
+`--uart-anchor-existing` uses UART acknowledgements only. It cannot recover if
+the current image is not the anchor; in that case use JTAG or the manual UART
+boot fallback to restore the anchor.
+
+Build a persistent anchor recovery image without touching hardware:
+
+```sh
+.venv/bin/python tools/hw_validate.py --uart-anchor-build-only \
+  --work-dir build/uart-anchor-recovery
+```
+
+The command writes the raw anchor firmware and a compact `whole_flash_data.bin`
+containing boot2, partition tables, and the anchor firmware. The raw anchor can
+be installed once with `tools/upload.sh m0 ...` from UART boot mode; the compact
+image can be replayed later with `--uart-anchor-flash-image` if an anchor is
+already live. The adjacent `recovery_manifest.json` records the anchor SHA256,
+the compact image SHA256, each flash segment, and the exact flash offset where
+the wrapped anchor payload appears.
 
 Avoid the UART bootloader and BOOT button by loading validation images into RAM
 over JTAG:

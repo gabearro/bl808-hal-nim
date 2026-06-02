@@ -52,8 +52,17 @@ proc newVarDecl(name: NimNode, typ = newEmptyNode(),
   ## Shorthand for `var name: typ = defVal` as a statement.
   nnkVarSection.newTree(newIdentDefs(name, typ, defVal))
 
+proc nodeName(n: NimNode): string =
+  case n.kind
+  of nnkIdent, nnkSym:
+    $n
+  of nnkOpenSymChoice, nnkClosedSymChoice:
+    if n.len > 0: $n[0] else: ""
+  else:
+    ""
+
 proc isAwaitCall(n: NimNode): bool =
-  n.kind in {nnkCall, nnkCommand} and n[0].kind == nnkIdent and $n[0] == "await"
+  n.kind in {nnkCall, nnkCommand} and n.len > 0 and nodeName(n[0]) == "await"
 
 proc isDirectAwaitStmt(s: NimNode): bool =
   ## Check if a statement is a top-level await pattern (not nested).
@@ -372,6 +381,19 @@ proc liftAwaitInBody(body: NimNode): NimNode =
         else:
           newIf.add branch.copyNimTree()
       result.add newIf
+    of nnkWhenStmt:
+      var newWhen = nnkWhenStmt.newTree()
+      for branch in s:
+        if branch.kind == nnkElifBranch:
+          newWhen.add nnkElifBranch.newTree(
+            branch[0].copyNimTree(),
+            liftAwaitInBody(branch[1])
+          )
+        elif branch.kind == nnkElse:
+          newWhen.add nnkElse.newTree(liftAwaitInBody(branch[0]))
+        else:
+          newWhen.add branch.copyNimTree()
+      result.add newWhen
     of nnkWhileStmt:
       result.add nnkWhileStmt.newTree(
         s[0].copyNimTree(),
@@ -648,6 +670,7 @@ type
   SegmentKind = enum
     skNormal        # Existing linear segment
     skIfDispatch    # If/elif/else condition evaluation + dispatch
+    skWhenDispatch  # Compile-time when/else dispatch
     skWhileEntry    # While condition check + body first chunk
 
   IfBranchInfo = object
@@ -722,6 +745,13 @@ proc splitStmtForAwait(s: NimNode, segments: var seq[Segment],
                        exceptBranches: seq[ExceptBranch] = @[],
                        trySegIndices: var seq[int]): bool =
   ## Try to split a statement at an await point. Returns true if handled.
+  proc awaitTargetName(n: NimNode): string =
+    ## Nim uses `_` as an explicit discard binding. Treat it like a bare
+    ## `await`, otherwise typed CPS procs try to infer `typeof(read(voidFuture))`.
+    result = $n
+    if result == "_":
+      result = ""
+
   template emitAwait(futExpr, target: untyped) =
     addAwaitSegment(segments, currentPre, futExpr, target, exceptBranches)
     if exceptBranches.len > 0:
@@ -731,13 +761,13 @@ proc splitStmtForAwait(s: NimNode, segments: var seq[Segment],
   if s.kind in {nnkLetSection, nnkVarSection}:
     let def = s[0]
     if def.kind == nnkIdentDefs and def[^1].isAwaitCall:
-      emitAwait(def[^1][1], $def[0])
+      emitAwait(def[^1][1], awaitTargetName(def[0]))
   if s.isAwaitCall:
     emitAwait(s[1], "")
   if s.kind == nnkDiscardStmt and s[0].isAwaitCall:
     emitAwait(s[0][1], "")
   if s.kind == nnkAsgn and s[1].isAwaitCall:
-    emitAwait(s[1][1], $s[0])
+    emitAwait(s[1][1], awaitTargetName(s[0]))
   return false
 
 macro cps*(prc: untyped): untyped =
@@ -1243,6 +1273,58 @@ macro cps*(prc: untyped): untyped =
           if br.hasAwait and br.contCount > 0:
             let mergeIdx = br.contStartIdx + br.contCount - 1
             segments[mergeIdx].overrideNextIdx = afterIfIdx
+
+        handled = true
+
+      # Handle when/else containing await. This mirrors if-dispatch, but emits
+      # a compile-time `when` in the generated step so inactive branches are not
+      # semantically checked.
+      if not handled and s.kind == nnkWhenStmt and hasNestedAwait(s):
+        if exceptCtx.len > 0 and currentPre.len > 0:
+          currentPre = @[rebuildTryExcept(currentPre, exceptCtx)]
+        let dispatchIdx = segments.len
+        segments.add Segment(
+          kind: skWhenDispatch,
+          preStmts: currentPre,
+          afterTryIdx: -1,
+          overrideNextIdx: -1,
+          breakTargetIdx: loopBreakTarget,
+          continueTargetIdx: loopContinueTarget,
+          afterIfIdx: -1,
+          afterWhileIdx: -1
+        )
+        currentPre = @[]
+
+        var branches: seq[IfBranchInfo]
+        for branch in s:
+          var cond: NimNode
+          var branchBodyNode: NimNode
+          if branch.kind == nnkElifBranch:
+            cond = branch[0]
+            branchBodyNode = branch[1]
+          elif branch.kind == nnkElse:
+            cond = newEmptyNode()
+            branchBodyNode = branch[0]
+          else:
+            continue
+
+          var info = splitBranchBody(branchBodyNode, segments,
+                                      loopBreakTarget, loopContinueTarget, exceptCtx)
+          info.condition = cond
+          if info.hasAwait and info.contCount > 0:
+            segments.add newNormalSegment(@[],
+                                          breakTargetIdx = loopBreakTarget,
+                                          continueTargetIdx = loopContinueTarget)
+            info.contCount += 1
+          branches.add info
+
+        segments[dispatchIdx].ifBranches = branches
+        let afterWhenIdx = segments.len
+        segments[dispatchIdx].afterIfIdx = afterWhenIdx
+        for br in branches:
+          if br.hasAwait and br.contCount > 0:
+            let mergeIdx = br.contStartIdx + br.contCount - 1
+            segments[mergeIdx].overrideNextIdx = afterWhenIdx
 
         handled = true
 
@@ -2368,6 +2450,36 @@ macro cps*(prc: untyped): untyped =
       # Fallthrough (no else branch matched)
       if seg.ifBranches.len > 0 and seg.ifBranches[^1].condition.kind != nnkEmpty:
         stepBody.add genStepTransition(envId, afterIfStep)
+
+    of skWhenDispatch:
+      for s in seg.preStmts:
+        stepBody.add rewrite(s, knownNames, brTarget, ctTarget)
+
+      let afterWhenStep = if seg.afterIfIdx < numSteps:
+        stepNames[seg.afterIfIdx]
+      else: nil
+
+      var whenStmt = nnkWhenStmt.newTree()
+
+      for br in seg.ifBranches:
+        var branchBody = newStmtList()
+        for s in br.preStmts:
+          branchBody.add rewrite(s, knownNames, brTarget, ctTarget)
+
+        if br.hasAwait and br.contCount > 0:
+          genBranchAwaitOrTransition(br, branchBody, envId)
+        else:
+          branchBody.add genStepTransition(envId, afterWhenStep)
+
+        if br.condition.kind == nnkEmpty:
+          whenStmt.add nnkElse.newTree(branchBody)
+        else:
+          whenStmt.add nnkElifBranch.newTree(br.condition.copyNimTree(), branchBody)
+
+      stepBody.add whenStmt
+
+      if seg.ifBranches.len > 0 and seg.ifBranches[^1].condition.kind != nnkEmpty:
+        stepBody.add genStepTransition(envId, afterWhenStep)
 
     of skWhileEntry:
       let afterWhileStep = if seg.afterWhileIdx < numSteps:

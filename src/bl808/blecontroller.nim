@@ -119,6 +119,19 @@ var nim_ble_platform_init_stage* {.exportc.}: uint32
 var nim_ble_core_init_return_count* {.exportc.}: uint32
 var nim_ble_lld_init_return_count* {.exportc.}: uint32
 var nim_ble_bflbble_init_return_count* {.exportc.}: uint32
+var nim_ble_wireless_prepare_count* {.exportc.}: uint32
+var nim_ble_wireless_preserve_wifi_count* {.exportc.}: uint32
+var nim_ble_wireless_reset_count* {.exportc.}: uint32
+var nim_ble_wireless_last_wifi_state* {.exportc.}: uint32
+var nim_ble_wlcoex_enabled* {.exportc.}: uint32
+var nim_ble_wifi_tx_window_active* {.exportc.}: uint32
+var nim_ble_wifi_tx_window_enter_count* {.exportc.}: uint32
+var nim_ble_wifi_tx_window_leave_count* {.exportc.}: uint32
+var nim_ble_wifi_tx_window_skip_count* {.exportc.}: uint32
+var nim_ble_wifi_tx_window_defer_count* {.exportc.}: uint32
+var nim_ble_wifi_tx_window_resume_count* {.exportc.}: uint32
+var nim_ble_wifi_tx_window_last_intmask* {.exportc.}: uint32
+var nim_ble_wifi_tx_window_last_intstat* {.exportc.}: uint32
 
 when defined(BleDebugCounters):
   var nim_ble_p256_stage* {.exportc.}: uint32
@@ -841,17 +854,45 @@ proc invalidateBleRf1MConfig() {.inline.} =
   ## the controller state still believes BLE 1M was configured.
   bleRf1MConfigured = false
 
+proc wifiMacLooksActive(): bool {.inline.} =
+  ## The BL808 WiFi MAC and BLE controller share the wireless reset/RF domain.
+  ## If WiFi already enabled MACHW/PTA, BLE must not pulse the shared reset
+  ## lines or WiFi software state can remain associated while the MAC no longer
+  ## completes queued transmissions.
+  when defined(bl808m0):
+    const
+      MachwBcnStatus = 0x24B00400'u32
+      MachwIntcUnmask = 0x24B08074'u32
+      PtaCtrl = 0x24920004'u32
+    let bcn = regRead(MachwBcnStatus.uint)
+    let intc = regRead(MachwIntcUnmask.uint)
+    let pta = regRead(PtaCtrl.uint)
+    nim_ble_wireless_last_wifi_state =
+      (bcn and 0xFF'u32) or ((intc shr 16) and 0xFF00'u32) or
+      ((pta shl 16) and 0x00FF0000'u32)
+    ((bcn and 0x1'u32) != 0'u32) or
+      ((intc and 0x80000000'u32) != 0'u32) or
+      ((pta and 0x1'u32) != 0'u32)
+  else:
+    false
+
 proc prepareWirelessDomain() =
+  inc nim_ble_wireless_prepare_count
+  let preserveWifi = wifiMacLooksActive()
   configureBleEm()
   powerOnXtalWifiPll()
   configureDigClock()
   enableWirelessClocks()
-  swResetCfg0(4)
-  swResetCfg0(8)
-  swResetCfg0(10)
-  configureDigClock()
-  enableWirelessClocks()
-  invalidateBleRf1MConfig()
+  if preserveWifi:
+    inc nim_ble_wireless_preserve_wifi_count
+  else:
+    swResetCfg0(4)
+    swResetCfg0(8)
+    swResetCfg0(10)
+    configureDigClock()
+    enableWirelessClocks()
+    invalidateBleRf1MConfig()
+    inc nim_ble_wireless_reset_count
 
 proc configureBtPriorityPta() =
   ## Match the WiFi firmware's BT-priority PTA mode without linking WiFi FW.
@@ -1366,6 +1407,8 @@ var nim_ble_rf_last_notch_word* {.exportc.}: uint32
 var nim_ble_rf_optimize_count* {.exportc.}: uint32
 var nim_ble_rf_last_optimize_word* {.exportc.}: uint32
 var nim_ble_rf_init_count* {.exportc.}: uint32
+var nim_ble_wifi_rf_dirty_epoch* {.exportc.}: uint32
+var nim_ble_wifi_rf_reclaimed_epoch* {.exportc.}: uint32
 var nim_ble_rf_pri_static_count* {.exportc.}: uint32
 var nim_ble_rf_pri_gain_count* {.exportc.}: uint32
 var nim_ble_rf_pri_tx_power_table_count* {.exportc.}: uint32
@@ -1382,6 +1425,15 @@ var nim_ble_rf_last_init_b0* {.exportc.}: uint32
 var nim_ble_rf_last_init_b4* {.exportc.}: uint32
 var nim_ble_rf_last_init_c8* {.exportc.}: uint32
 var nim_ble_rf_last_lo_fcal* {.exportc.}: uint32
+
+proc markBleRfDirtyForWifi() {.inline.} =
+  inc nim_ble_wifi_rf_dirty_epoch
+
+proc nim_ble_coex_wifi_rf_reclaim_needed*(): uint32 {.exportc, cdecl.} =
+  if nim_ble_wifi_rf_dirty_epoch == nim_ble_wifi_rf_reclaimed_epoch:
+    return 0'u32
+  nim_ble_wifi_rf_reclaimed_epoch = nim_ble_wifi_rf_dirty_epoch
+  1'u32
 var nim_ble_rf_last_lo_acal* {.exportc.}: uint32
 var nim_ble_rf_last_roscal_i* {.exportc.}: uint32
 var nim_ble_rf_last_roscal_q* {.exportc.}: uint32
@@ -2535,6 +2587,11 @@ proc configureBleRfChannelMhz(channelMhz: uint16) =
   ## BL808 rf_pri_update_param and rf_pri_get_notch_param are no-ops in the RF
   ## archive used here, but rf_pri_optimize has one relevant default-path
   ## channel-range write. Keep that translated in pure Nim below.
+  when defined(bl808m0) and defined(bl808WifiNimFw):
+    if nim_ble_wlcoex_enabled != 0'u32 and
+        nim_ble_wifi_tx_window_active != 0'u32:
+      inc nim_ble_wifi_tx_window_defer_count
+      return
   regOr(BleRfRetuneReg, BleRfRetuneHoldMask)
   regOr(BleRfSynthCtrlReg, BleRfSynthChannelPrepareMask)
   regOr(BleRfSynthCtrlReg, BleRfSynthChannelLatchMask)
@@ -2568,6 +2625,7 @@ proc configureBleRfChannelMhz(channelMhz: uint16) =
   inc nim_ble_rf_tune_count
   nim_ble_rf_last_channel_mhz = channelMhz.uint32
   nim_ble_rf_last_notch_word = notchWord
+  markBleRfDirtyForWifi()
   settleBleRfCalibrationLatches()
   when defined(bl808m0):
     nimDisableM0RfClicIrq()
@@ -2606,6 +2664,7 @@ proc configureBleRf1M() =
   nim_ble_rf_last_init_b0 = regRead(0x200010B0'u32.uint)
   nim_ble_rf_last_init_b4 = regRead(0x200010B4'u32.uint)
   nim_ble_rf_last_init_c8 = regRead(0x200010C8'u32.uint)
+  markBleRfDirtyForWifi()
   bleRf1MConfigured = true
   when defined(bl808m0):
     nimDisableM0RfClicIrq()
@@ -4697,6 +4756,11 @@ when defined(bl808m0) and
       else:
         max(1'u32, durationUs and 0x7FFF'u32)
 
+    const NimBleWifiTxGuardSlots = 8'u32
+
+    proc schProgFutureDistance(now, target: uint32): uint32 {.inline.} =
+      (target - now) and 0x0FFFFFFF'u32
+
     proc schProgCall(idx: uint8, event: uint8) =
       let slot = idx and 0x0F'u8
       if schProgActive[slot.int] == 0:
@@ -4837,6 +4901,65 @@ when defined(bl808m0) and
         inc nim_vendor_sch_prog_elapsed_count
         schProgFinishSlot(slot, 0'u8)
         rwip_mac_done_set()
+
+    proc nim_ble_coex_wifi_tx_window_enter*(): uint32 {.exportc, cdecl.} =
+      ## Called by the WiFi firmware while it owns the shared RF/PTA fabric.
+      ## Return 1 only when WiFi acquires an idle BLE scheduler gap. If a BLE
+      ## slot is already active, skip/reschedule it and make WiFi retry later
+      ## instead of transmitting while the shared RF may still be busy.
+      inc nim_ble_wifi_tx_window_enter_count
+      nim_ble_wifi_tx_window_last_intmask =
+        regRead(BLE_BASE + BTBLE_INTMASK_OFFSET)
+      nim_ble_wifi_tx_window_last_intstat =
+        regRead(BLE_BASE + BTBLE_INTSTAT_OFFSET)
+      if nim_ble_wlcoex_enabled == 0'u32:
+        return 1'u32
+      if nim_ble_wifi_tx_window_active != 0'u32:
+        return 1'u32
+      writeBtbleInterruptMask(0)
+      regWrite((BLE_BASE + BTBLE_INTACK_OFFSET).uint,
+               regRead(BLE_BASE + BTBLE_INTSTAT_OFFSET))
+      let now = currentBtbleTime()
+      var skipped = 0'u32
+      var nearFuture = 0'u32
+      for rawSlot in 0'u8 ..< 16'u8:
+        let slot = rawSlot and 0x0F'u8
+        if schProgActive[slot.int] != 0:
+          let target = schProgSlotTarget(slot)
+          let untilTarget = schProgFutureDistance(now, target)
+          if untilTarget < 0x08000000'u32 and
+              untilTarget > NimBleWifiTxGuardSlots:
+            continue
+          if untilTarget < 0x08000000'u32:
+            inc nearFuture
+            continue
+          let slotAddr = BTBLE_EM_BASE + uint32(slot) * 0x10'u32
+          let disabled =
+            (read16(slotAddr) and not 0x0038'u16) or 0x0018'u16
+          write16(slotAddr, disabled)
+          schProgElapsedEndArmed[slot.int] = 0
+          inc nim_ble_wifi_tx_window_skip_count
+          inc skipped
+          sch_prog_skip_isr(slot)
+      if skipped != 0'u32 or nearFuture != 0'u32:
+        writeBtbleInterruptMask(BtbleIntConnection)
+        if skipped != 0'u32:
+          inc nim_ble_wifi_tx_window_resume_count
+          rwip_sw_int_req()
+        return 0'u32
+      nim_ble_wifi_tx_window_active = 1'u32
+      1'u32
+
+    proc nim_ble_coex_wifi_tx_window_leave*() {.exportc, cdecl.} =
+      ## Re-enable BLE scheduling after the WiFi MAC reports TX confirmation.
+      inc nim_ble_wifi_tx_window_leave_count
+      if nim_ble_wifi_tx_window_active == 0'u32:
+        return
+      nim_ble_wifi_tx_window_active = 0'u32
+      writeBtbleInterruptMask(BtbleIntConnection)
+      if nim_ble_wlcoex_enabled != 0'u32:
+        inc nim_ble_wifi_tx_window_resume_count
+        rwip_sw_int_req()
 
     proc sch_prog_init*(initType: uint8) {.exportc, cdecl.} =
       if initType < 2'u8 or initType > 3'u8:
@@ -6464,7 +6587,7 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
         uint32(getLe16(p, 8)) * NimConnHalfSlotsPerConnIntervalUnit
       var phyLeadHalfSlots =
         if rateIdx <= 1'u8: 8'u32 else: 12'u32
-      if p[39] == 0'u8:
+      if (uint16(p[39]) and NimConnAdvTypeTimingBit) == 0'u16:
         phyLeadHalfSlots = 4'u32
       (clock + (windowSizeHalfSlots shr 1) + windowOffsetHalfSlots +
        phyLeadHalfSlots) and 0x0FFFFFFF'u32
@@ -6916,9 +7039,6 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
       if llcpPending and nim_conn_state.txProgrammed and
           nim_conn_state.txProgrammedEvent == nim_conn_state.eventCounter:
         return
-      if not llcpPending and not aclPayloadPending and not aclEmptyPending:
-        return
-
       var llid = NimVendorDataLlIdContinuation
       var emOff = NimConnEmptyDataEmOffset
       var pduLen = 0'u8
@@ -7047,7 +7167,9 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
     proc nimConnProgramChannel(conhdl: uint16): uint8 =
       let channel = nimConnSelectChannel()
       # Connection-event retuning is owned by the BTBLE scheduler from the EM
-      # channel control word.  Software retuning here races the scheduled event.
+      # channel control word.  CSA#2 is selected by the hardware bit in the
+      # control word, matching vendor lld_con_start; CSA#1 keeps the current
+      # unmapped channel in the low bits.
       let emChannel =
         if nim_conn_state.channelSelection2:
           0'u8
@@ -7377,6 +7499,10 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
 
     proc nimConnServiceDeferredSchedule() =
       if not nim_conn_state.active or not nim_conn_state.reschedulePending:
+        return
+      if nim_ble_wlcoex_enabled != 0'u32 and
+          nim_ble_wifi_tx_window_active != 0'u32:
+        inc nim_ble_wifi_tx_window_defer_count
         return
       nim_conn_state.reschedulePending = false
       nimConnSchedule()
@@ -8509,6 +8635,14 @@ proc resetNimControllerState() =
     nim_conn_missed_event_fallback_count = 0
     nim_conn_rx_acquire_events = 0
     nim_conn_rx_acquire_reset_count = 0
+    nim_ble_wifi_tx_window_active = 0
+    nim_ble_wifi_tx_window_enter_count = 0
+    nim_ble_wifi_tx_window_leave_count = 0
+    nim_ble_wifi_tx_window_skip_count = 0
+    nim_ble_wifi_tx_window_defer_count = 0
+    nim_ble_wifi_tx_window_resume_count = 0
+    nim_ble_wifi_tx_window_last_intmask = 0
+    nim_ble_wifi_tx_window_last_intstat = 0
     when defined(BleDebugCounters):
       nim_conn_tx_header_log_index = 0
       nim_conn_rx_seq_log_index = 0
@@ -13748,7 +13882,9 @@ proc lld_update_adv_scan_aa*() {.exportc, cdecl.} =
   discard
 
 proc lld_wlcoex_set*(en: bool) {.exportc, cdecl.} =
-  discard
+  nim_ble_wlcoex_enabled = if en: 1'u32 else: 0'u32
+  if not en:
+    nim_ble_wifi_tx_window_active = 0'u32
 
 # LLD PDU functions
 proc lld_pdu_adv_pack*(params: pointer) {.exportc, cdecl.} =
@@ -14621,6 +14757,16 @@ proc bleNimPeripheralDiscSource*(): uint32 {.exportc, cdecl.} =
 proc bleNimDbgVendorLlcpRxCount*(): uint32 {.exportc, cdecl.} =
   when defined(bl808m0) and bl808BleNimConnectionEnabled:
     nim_vendor_llcp_rx_count
+  else:
+    0'u32
+
+proc bleNimPeripheralLastRxEventCounter*(): uint32 {.exportc, cdecl.} =
+  when defined(bl808m0) and bl808BleNimConnectionEnabled and
+      bl808BleNimPureConnection:
+    if nim_conn_state.active:
+      nim_conn_state.lastRxEventCounter.uint32
+    else:
+      0'u32
   else:
     0'u32
 

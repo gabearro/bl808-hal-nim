@@ -187,7 +187,8 @@ def test_ble_central_timeouts_use_kernel_clock_abstraction():
     source = REPO_ROOT / "src" / "bl808" / "ble.nim"
     text = source.read_text(encoding="utf-8")
 
-    assert "import core, irq, kernel/clock, mmio, sec" in text
+    assert "kernel/clock" in text
+    assert "kernel/cps" in text
     timing_body = text.split("proc monotonicMs", 1)[1].split(
         "proc startCentralDiscoveryScan", 1
     )[0]
@@ -1356,7 +1357,7 @@ def test_pure_ble_connection_tx_descriptor_header_leaves_sequence_to_hardware():
     assert "nim_conn_state.txSeq" not in header_body
 
 
-def test_pure_ble_connection_tx_descriptors_only_arm_real_payloads():
+def test_pure_ble_connection_tx_descriptors_keep_valid_empty_pdu_armed():
     source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
     text = source.read_text(encoding="utf-8")
 
@@ -1375,10 +1376,9 @@ def test_pure_ble_connection_tx_descriptors_only_arm_real_payloads():
         "proc nimConnArmPendingHostAclTx", 1
     )[0]
     assert "let aclEmptyPending = nim_vendor_acl_empty_tx_pending != 0'u32" in tx_body
-    assert (
-        "if not llcpPending and not aclPayloadPending and not aclEmptyPending:\n"
-        "        return"
-    ) in tx_body
+    assert "if not llcpPending and not aclPayloadPending and not aclEmptyPending:" not in tx_body
+    assert "var llid = NimVendorDataLlIdContinuation" in tx_body
+    assert "var pduLen = 0'u8" in tx_body
     assert "elif aclPayloadPending or aclEmptyPending:" in tx_body
     assert "nimConnArmTxDesc(descOff, nextOff, NimConnEmptyDataEmOffset, header)" in (
         tx_body
@@ -1902,6 +1902,14 @@ def test_central_poll_loop_drains_queued_hci_events():
 def test_central_connect_waits_after_successful_create_connection():
     source = REPO_ROOT / "src" / "bl808" / "ble.nim"
     text = source.read_text(encoding="utf-8")
+
+    create_le_body = text.split("proc bt_conn_create_le*", 1)[1].split(
+        "proc bt_conn_disconnect*", 1
+    )[0]
+    assert "when not defined(bl808BleVendor):\n      drainHciHostEvents()" in create_le_body
+    assert create_le_body.index("hciCommandOk(HciOpLeCreateConnection") < create_le_body.index(
+        "drainHciHostEvents()"
+    )
 
     connect_body = text.split("proc bleCentralConnectByName*", 1)[1].split(
         "proc bleDisconnectCurrent*", 1

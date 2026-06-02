@@ -20,6 +20,11 @@ const
     ## Fixed ISR callback queue depth. postFromIsr drops callbacks after this
     ## limit and records an overflow count instead of allocating in interrupt
     ## context.
+  MaxSchedulerTimers* = 32
+    ## Bounded timer heap backing store. Timer entries carry closures, so the
+    ## heap stores stable pointers to these slots instead of copying entries.
+  MaxSchedulerTimedPollHooks* = 8
+    ## Bounded count of scheduler-owned timed poll hooks.
 
 # =============================================================================
 # Timer heap entry
@@ -28,11 +33,13 @@ const
 type
   TimerId* = uint32
 
-  TimerEntry = object
+  TimerEntryObj = object
     deadline: uint64
     id: TimerId
     callback: proc() {.closure.}
     cancelled: bool
+
+  TimerEntry = ptr TimerEntryObj
 
 # =============================================================================
 # Scheduler state
@@ -60,15 +67,29 @@ type
 var scheduler*: Scheduler
   ## The global scheduler for this core.
 
+var
+  timerPool: array[MaxSchedulerTimers, TimerEntryObj]
+  timerPoolUsed: array[MaxSchedulerTimers, bool]
+
 type
   SchedulerPollHook* = proc() {.closure.}
     ## Optional per-iteration polling hook signature.
+  SchedulerTimedPollHook* = proc(now: uint64): uint64 {.closure.}
+    ## Timed poll hook. Called when its deadline expires. Return the next
+    ## absolute tick deadline, or 0 to disable future timed polling.
+  TimedPollHookEntry = object
+    hook: SchedulerTimedPollHook
+    deadline: uint64
 
 var schedulerPollHook*: SchedulerPollHook = nil
   ## Legacy single poll hook. Prefer addSchedulerPollHook for subsystems.
 
 var schedulerPollHooks: seq[SchedulerPollHook]
   ## Additional hooks called each scheduler iteration for polling-based I/O.
+
+var
+  schedulerTimedPollHooks: array[MaxSchedulerTimedPollHooks, TimedPollHookEntry]
+  schedulerTimedPollHookCount: int
 
 proc setSchedulerPollHook*(hook: SchedulerPollHook) =
   ## Register/replace the legacy scheduler polling hook.
@@ -79,11 +100,50 @@ proc addSchedulerPollHook*(hook: SchedulerPollHook) =
   if hook != nil:
     schedulerPollHooks.add(hook)
 
+proc addSchedulerTimedPollHook*(hook: SchedulerTimedPollHook;
+                                firstDeadline: uint64 = 0'u64): bool =
+  ## Add a timed scheduler polling hook. Timed hooks let subsystems do bounded
+  ## high-frequency service without keeping the scheduler permanently awake.
+  if hook == nil or schedulerTimedPollHookCount >= MaxSchedulerTimedPollHooks:
+    return false
+  schedulerTimedPollHooks[schedulerTimedPollHookCount] = TimedPollHookEntry(
+    hook: hook,
+    deadline: firstDeadline,
+  )
+  schedulerTimedPollHookCount.inc
+  true
+
 # =============================================================================
 # Min-heap operations on scheduler.timers
 # =============================================================================
 
 proc heapLen(s: Scheduler): int {.inline.} = s.timers.len
+
+proc allocTimerEntry(deadline: uint64, id: TimerId,
+                     callback: proc() {.closure.}): TimerEntry =
+  for i in 0 ..< MaxSchedulerTimers:
+    if not timerPoolUsed[i]:
+      timerPoolUsed[i] = true
+      timerPool[i] = TimerEntryObj(
+        deadline: deadline,
+        id: id,
+        callback: callback,
+        cancelled: false,
+      )
+      return addr timerPool[i]
+  nil
+
+proc releaseTimerEntry(entry: TimerEntry) =
+  if entry == nil:
+    return
+  for i in 0 ..< MaxSchedulerTimers:
+    if entry == addr timerPool[i]:
+      entry.callback = nil
+      entry.deadline = 0
+      entry.id = 0
+      entry.cancelled = false
+      timerPoolUsed[i] = false
+      return
 
 proc heapPush(s: var Scheduler, entry: TimerEntry) =
   s.timers.add(entry)
@@ -150,6 +210,10 @@ proc schedulerInit*() =
   scheduler.timers = @[]
   schedulerPollHook = nil
   schedulerPollHooks = @[]
+  schedulerTimedPollHookCount = 0
+  for i in 0 ..< MaxSchedulerTimedPollHooks:
+    schedulerTimedPollHooks[i].hook = nil
+    schedulerTimedPollHooks[i].deadline = 0
   for i in 0 ..< MaxIsrPendingCallbacks:
     scheduler.isrPending[i] = nil
   scheduler.isrHead = 0
@@ -161,6 +225,12 @@ proc schedulerInit*() =
   scheduler.totalTicks = 0
   scheduler.totalCallbacks = 0
   scheduler.totalTimersFired = 0
+  for i in 0 ..< MaxSchedulerTimers:
+    timerPoolUsed[i] = false
+    timerPool[i].callback = nil
+    timerPool[i].deadline = 0
+    timerPool[i].id = 0
+    timerPool[i].cancelled = false
 
   # Initialize the ISR bridge
   isrBridgeInit()
@@ -198,12 +268,10 @@ proc addTimer*(deadline: uint64, callback: proc() {.closure.}): TimerId =
   ## Returns a timer ID that can be used to cancel it.
   let id = scheduler.nextTimerId
   scheduler.nextTimerId += 1
-  scheduler.heapPush(TimerEntry(
-    deadline: deadline,
-    id: id,
-    callback: callback,
-    cancelled: false,
-  ))
+  let entry = allocTimerEntry(deadline, id, callback)
+  if entry == nil:
+    faultHalt(FaultReasonManual, 0x54494D52'u, scheduler.timers.len.uint, 0'u)
+  scheduler.heapPush(entry)
   # If this timer is now the soonest, reprogram the hardware
   if scheduler.timers[0].id == id:
     programmedTimerDeadline = deadline
@@ -258,6 +326,7 @@ proc fireExpiredTimers(s: var Scheduler) =
     if not entry.cancelled:
       entry.callback()
       s.totalTimersFired += 1
+    releaseTimerEntry(entry)
     now = readTick()
     if interruptDeadline > now:
       now = interruptDeadline
@@ -280,8 +349,16 @@ proc runReadyCallbacks(s: var Scheduler) =
 proc reprogramNextDeadline(s: Scheduler) {.inline.} =
   ## Set the hardware timer to fire at the next timer heap entry,
   ## or clear it if no timers are pending.
+  var nextDeadline = 0'u64
   if s.heapLen > 0:
-    programmedTimerDeadline = s.heapPeekDeadline
+    nextDeadline = s.heapPeekDeadline
+  for i in 0 ..< schedulerTimedPollHookCount:
+    let deadline = schedulerTimedPollHooks[i].deadline
+    if schedulerTimedPollHooks[i].hook != nil and deadline != 0'u64:
+      if nextDeadline == 0'u64 or deadline < nextDeadline:
+        nextDeadline = deadline
+  if nextDeadline != 0'u64:
+    programmedTimerDeadline = nextDeadline
     setDeadline(programmedTimerDeadline)
   else:
     programmedTimerDeadline = 0
@@ -293,6 +370,30 @@ proc runPollHooks() =
   for hook in schedulerPollHooks:
     if hook != nil:
       hook()
+
+proc runTimedPollHooks(now: uint64) =
+  for i in 0 ..< schedulerTimedPollHookCount:
+    if schedulerTimedPollHooks[i].hook != nil and
+        schedulerTimedPollHooks[i].deadline != 0'u64 and
+        schedulerTimedPollHooks[i].deadline <= now:
+      schedulerTimedPollHooks[i].deadline =
+        schedulerTimedPollHooks[i].hook(now)
+
+proc hasUntimedPollHooks(): bool {.inline.} =
+  if schedulerPollHook != nil:
+    return true
+  for hook in schedulerPollHooks:
+    if hook != nil:
+      return true
+  false
+
+proc hasDueTimedPollHooks(now: uint64): bool {.inline.} =
+  for i in 0 ..< schedulerTimedPollHookCount:
+    if schedulerTimedPollHooks[i].hook != nil and
+        schedulerTimedPollHooks[i].deadline != 0'u64 and
+        schedulerTimedPollHooks[i].deadline <= now:
+      return true
+  false
 
 proc runScheduler*() {.noreturn.} =
   ## Enter the scheduler main loop. Does not return.
@@ -317,6 +418,7 @@ proc runScheduler*() {.noreturn.} =
 
     # 4. Run poll hooks (IPC, watchdog, networking, etc.)
     runPollHooks()
+    runTimedPollHooks(readTick())
     if not faultCheckStackGuard():
       faultHalt(FaultReasonStackGuard, 0'u, 0'u, 0'u)
 
@@ -331,11 +433,15 @@ proc runScheduler*() {.noreturn.} =
     var shouldSleep = false
     withInterruptsDisabled:
       shouldSleep = scheduler.ready.len == 0 and scheduler.isrCount == 0 and
-                    isrBridgePendingCompletions() == 0 and not timerIsrFired
+                    isrBridgePendingCompletions() == 0 and not timerIsrFired and
+                    not hasUntimedPollHooks() and
+                    not hasDueTimedPollHooks(readTick())
     if shouldSleep:
       withInterruptsDisabled:
         shouldSleep = scheduler.ready.len == 0 and scheduler.isrCount == 0 and
-                      isrBridgePendingCompletions() == 0 and not timerIsrFired
+                      isrBridgePendingCompletions() == 0 and not timerIsrFired and
+                      not hasUntimedPollHooks() and
+                      not hasDueTimedPollHooks(readTick())
       if shouldSleep:
         wfi()
 
