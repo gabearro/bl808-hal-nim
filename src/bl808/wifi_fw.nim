@@ -39,10 +39,6 @@
 import mmio, memmap
 from std/volatile import volatileStore, volatileLoad
 
-when defined(bl808m0):
-  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/os/bl_os_adapter/bl_os_adapter/include".}
-  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/os/bl_os_adapter/bl_os_adapter/include/bl_os_adapter".}
-
 # =============================================================================
 # MAC HW register base addresses (from BL808 vendor WiFi firmware)
 # =============================================================================
@@ -103,10 +99,16 @@ const
   SCAN_ACTIVE_RX_FILTER_BITS = 0x2200'u32
   SCAN_PASSIVE_RX_FILTER_BITS = 0x2000'u32
   SCAN_EDCA_RX_FILTER_CLEAR_MASK = 0xFFFFDDFF'u32
-  SCAN_STATE_CHANNEL_RUNNING = 3'u8
   SCAN_DEFAULT_DURATION_US = 0x35B60'u32
   SCAN_STATUS_OK = 0'u8
   SCAN_STATUS_BUSY = 8'u8
+  WifiTimerDrainLimit = 8'u32
+  WifiIpcMsgDrainLimit = 8'u32
+  WifiSavedMsgDrainLimit = 8'u32
+  WifiTxCfmDrainLimit = 16'u32
+  WifiTxTriggerDrainLimit = 16'u32
+  WifiTxFrameDrainLimit = 16'u32
+  WifiRxTimerDrainLimit = 16'u32
 
 when defined(bl808WifiForceTxPwr70):
   const NimFwForcedMgmtTxPower = 0x70'u32
@@ -420,8 +422,36 @@ const
   KE_EVT_RXUREADY*     = 0x00200000'u32
   KE_EVT_RXREADY*      = 0x00100000'u32
   KE_EVT_RX*           = KE_EVT_RXREADY   # compatibility alias
-  # SM state constant from blob (ke_task_sm_activating checks state == 9)
+  # WiFi firmware task states. These values match the blob task tables and
+  # state-specific handlers used by ke_task_init.
+  TaskIdleState* = 0'u16
+  TaskActiveState* = 1'u16
+  TaskGoingIdleState* = 2'u16
+  ScanIdleState* = 0'u16
+  ScanActiveState* = 1'u16
+  ScanChannelPendingState* = 2'u16
+  ScanChannelRunningState* = 3'u16
+  ScanuIdleState* = 0'u16
+  ScanuScanningState* = 1'u16
+  ScanuJoiningState* = 2'u16
+  MeIdleState* = 0'u16
+  MeBusyState* = 1'u16
+  MeGoingIdleState* = 2'u16
+  SmIdleState* = 0'u16
+  SmScanningState* = 1'u16
+  SmWaitingState* = 2'u16
+  SmAddingChanState* = 3'u16
+  SmSettingBssState* = 4'u16
+  SmAuthStartingState* = 5'u16
+  SmAuthenticatingState* = 6'u16
+  SmAssociatingState* = 7'u16
+  SmAssocRspState* = 8'u16
   SM_ACTIVATING_STATE* = 9'u16
+  SmDisconnectingState* = 10'u16
+  ApmIdleState* = 0'u16
+  ApmActiveState* = 1'u16
+  ApmStartingState* = 2'u16
+  BamIdleState* = 0'u16
 
   VIF_TYPE_STA* = 0'u8
   VIF_TYPE_IBSS* = 1'u8
@@ -4008,6 +4038,7 @@ var
   keMsgQueueSent* {.wifiCtrl.}: CoList
   keMsgQueueSaved* {.wifiCtrl.}: CoList
   keTimerQueue* {.wifiCtrl.}: CoList
+  keSavedReschedTask* {.wifiCtrl.}: uint8 = TASK_NONE
 
   # Task state array (per task)
   keTaskStates* {.wifiCtrl.}: array[TASK_MAX.int, uint16]
@@ -4399,385 +4430,298 @@ proc c_strlen(s: pointer): csize_t {.importc: "strlen", header: "<string.h>".}
 proc c_snprintf(buf: pointer, size: csize_t, fmt: cstring): cint {.importc: "snprintf", header: "<stdio.h>", varargs.}
 proc c_sprintf(buf: pointer, fmt: cstring): cint {.importc: "sprintf", header: "<stdio.h>", varargs, discardable.}
 
-when defined(bl808WifiNimFw):
-  when not isMainModule:
-    {.emit: "void NimMain(void);".}
+when not isMainModule:
+  {.emit: "void NimMain(void);".}
 
-  var nimFwDbgFrameTraceCount {.wifiCtrl.}: uint32
-  var nimFwDbgIpcTxTraceCount {.wifiCtrl.}: uint32
-  var nimFwDbgCfmTraceCount {.wifiCtrl.}: uint32
-  var nimFwDbgEapolTraceCount {.wifiCtrl.}: uint32
-  # TX-path investigation counters (iter 261). Read after test via UART dump.
-  var nimFwDbgPayBackupEntry* {.wifiCtrl, exportc: "nimfw_dbg_pay_backup".}: uint32
-  var nimFwDbgPayDescFound*   {.wifiCtrl, exportc: "nimfw_dbg_pay_desc".}: uint32
-  var nimFwDbgPayHasPayload*  {.wifiCtrl, exportc: "nimfw_dbg_pay_payload".}: uint32
-  var nimFwDbgPayEmptyList*   {.wifiCtrl, exportc: "nimfw_dbg_pay_empty".}: uint32
-  var nimFwDbgPayNonEmpty*    {.wifiCtrl, exportc: "nimfw_dbg_pay_nonempty".}: uint32
-  var nimFwDbgPayTriggerLast* {.wifiCtrl, exportc: "nimfw_dbg_pay_trig".}: uint32
-  var nimFwDbgTxTrigEntry*    {.wifiCtrl, exportc: "nimfw_dbg_txtrig_entry".}: uint32
-  var nimFwDbgFrameGet*       {.wifiCtrl, exportc: "nimfw_dbg_frame_get".}: uint32
-  var nimFwDbgFrameGetInvalid* {.wifiCtrl, exportc: "nimfw_dbg_frame_get_invalid".}: uint32
-  var nimFwDbgFrameGetInvalidPtr* {.wifiCtrl, exportc: "nimfw_dbg_frame_get_invalid_ptr".}: uint32
-  var nimFwDbgFrameGetInvalidNext* {.wifiCtrl, exportc: "nimfw_dbg_frame_get_invalid_next".}: uint32
-  var nimFwDbgFrameFreeRebuild* {.wifiCtrl, exportc: "nimfw_dbg_frame_free_rebuild".}: uint32
-  var nimFwDbgFrameFreeReclaimed* {.wifiCtrl, exportc: "nimfw_dbg_frame_free_reclaimed".}: uint32
-  var nimFwDbgFrameFreePushInvalid* {.wifiCtrl, exportc: "nimfw_dbg_frame_free_push_invalid".}: uint32
-  var nimFwDbgTxPendingInvalid* {.wifiCtrl, exportc: "nimfw_dbg_tx_pending_invalid".}: uint32
-  var nimFwDbgTxPendingInvalidPtr* {.wifiCtrl, exportc: "nimfw_dbg_tx_pending_invalid_ptr".}: uint32
-  # Recycle / CFM path counters (iter 261 follow-up)
-  var nimFwDbgCfmPush*        {.wifiCtrl, exportc: "nimfw_dbg_cfm_push".}: uint32
-  var nimFwDbgCfmEvt*         {.wifiCtrl, exportc: "nimfw_dbg_cfm_evt".}: uint32
-  var nimFwDbgFrameCfm*       {.wifiCtrl, exportc: "nimfw_dbg_frame_cfm".}: uint32
-  var nimFwDbgFrameRelease*   {.wifiCtrl, exportc: "nimfw_dbg_frame_release".}: uint32
-  var nimFwDbgTxTrigAcReady*  {.wifiCtrl, exportc: "nimfw_dbg_txtrig_acready".}: uint32  # last acReady seen
-  var nimFwDbgTxTrigZeroExit* {.wifiCtrl, exportc: "nimfw_dbg_txtrig_zero".}: uint32     # entered & acReady==0
-  var nimFwDbgTxTrigLoops*    {.wifiCtrl, exportc: "nimfw_dbg_txtrig_loops".}: uint32    # inner loop iters
-  var nimFwDbgFrameEvtEnter*  {.wifiCtrl, exportc: "nimfw_dbg_frame_evt_enter".}: uint32
-  var nimFwDbgFrameEvtPop*    {.wifiCtrl, exportc: "nimfw_dbg_frame_evt_pop".}: uint32
-  var nimFwDbgFrameEvtFreeRet* {.wifiCtrl, exportc: "nimfw_dbg_frame_evt_free".}: uint32
-  var nimFwDbgFrameEvtUsedSkip* {.wifiCtrl, exportc: "nimfw_dbg_frame_evt_usedskip".}: uint32
-  var nimFwDbgFrameEvtCallback* {.wifiCtrl, exportc: "nimfw_dbg_frame_evt_cb".}: uint32
-  var nimFwDbgFrameGetFails*    {.wifiCtrl, exportc: "nimfw_dbg_frame_get_fails".}: uint32
-  var nimFwDbgNullFrameCalls*   {.wifiCtrl, exportc: "nimfw_dbg_nullframe_calls".}: uint32
-  var nimFwDbgNullFrameCallerRA* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_caller_ra".}: uint32
-  var nimFwDbgTxRouteInternal*  {.wifiCtrl, exportc: "nimfw_dbg_tx_route_internal".}: uint32
-  var nimFwDbgTxRouteHost*      {.wifiCtrl, exportc: "nimfw_dbg_tx_route_host".}: uint32
-  var nimFwDbgTxRouteUsedFlag*  {.wifiCtrl, exportc: "nimfw_dbg_tx_route_usedflag".}: uint32
-  var nimFwDbgFrameGetUsedBefore* {.wifiCtrl, exportc: "nimfw_dbg_frame_get_used_before".}: uint32
-  var nimFwDbgNullFrameCfm*     {.wifiCtrl, exportc: "nimfw_dbg_nullframe_cfm".}: uint32
-  var nimFwDbgNullFrameAckOk*   {.wifiCtrl, exportc: "nimfw_dbg_nullframe_ack_ok".}: uint32
-  var nimFwDbgNullFrameAckFail* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_ack_fail".}: uint32
-  var nimFwDbgNullFrameLastStatus* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_status".}: uint32
-  var nimFwDbgNullFrameDescLast* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_desc".}: uint32
-  var nimFwDbgNullFrameBufLast* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_buf".}: uint32
-  var nimFwDbgNullFrameFcLast* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_fc".}: uint32
-  var nimFwDbgNullFramePushRc* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_push_rc".}: uint32
-  var nimFwDbgNullFrameReturn* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_return".}: uint32
-  var nimFwDbgNullFrameVifSta* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_vif_sta".}: uint32
-  var nimFwDbgNullFrameCbSet*   {.wifiCtrl, exportc: "nimfw_dbg_nullframe_cb_set".}: uint32
-  var nimFwDbgNullFrameCbSetPtr* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_cb_set_ptr".}: uint32
-  var nimFwDbgNullFrameEvtSeen* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_evt_seen".}: uint32
-  var nimFwDbgNullFrameEvtCbNil* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_evt_cb_nil".}: uint32
-  var nimFwDbgNullFrameEvtCbPtr* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_evt_cb_ptr".}: uint32
-  var nimFwDbgNullFrameEvtDesc* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_evt_desc".}: uint32
-  var nimFwDbgNullFrameTxTrigSeen* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_txtrig_seen".}: uint32
-  var nimFwDbgNullFrameTxTrigHost* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_txtrig_host".}: uint32
-  var nimFwDbgNullFrameTxTrigInternal* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_txtrig_internal".}: uint32
-  var nimFwDbgNullFrameTxTrigUsedFlag* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_txtrig_usedflag".}: uint32
-  var nimFwDbgNullFrameBusyTxCheck* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_busy_txcheck".}: uint32
-  var nimFwDbgNullFrameBusyPsCheck* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_busy_pscheck".}: uint32
-  var nimFwDbgNullFramePaySeen* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_seen".}: uint32
-  var nimFwDbgNullFramePayHasPayload* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_payload".}: uint32
-  var nimFwDbgNullFramePayEmpty* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_empty".}: uint32
-  var nimFwDbgNullFramePayNonEmpty* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_nonempty".}: uint32
-  var nimFwDbgNullFramePayAc* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_ac".}: uint32
-  var nimFwDbgNullFramePayTrigger* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_trig".}: uint32
-  var nimFwDbgNullFramePayCurrent* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_current".}: uint32
-  var nimFwDbgNullFramePayPending* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_pending".}: uint32
-  var nimFwDbgNullFramePayThdStatus* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_thd_status".}: uint32
-  var nimFwDbgNullFramePostponed* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_postponed".}: uint32
-  var nimFwDbgNullFrameQueued* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_queued".}: uint32
-  var nimFwDbgPostponedServiceCalls* {.wifiCtrl, exportc: "nimfw_dbg_postponed_service_calls".}: uint32
-  var nimFwDbgPostponedServiceSent* {.wifiCtrl, exportc: "nimfw_dbg_postponed_service_sent".}: uint32
-  var nimFwDbgNullFrameTxIntSeen* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_txint_seen".}: uint32
-  var nimFwDbgNullFrameTxIntFc* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_txint_fc".}: uint32
-  var nimFwDbgNullFrameTxIntBuf* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_txint_buf".}: uint32
-  var nimFwDbgNullFrameFakeSeen* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_fake_seen".}: uint32
-  var nimFwDbgNullFrameFakeQidx* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_fake_qidx".}: uint32
-  var nimFwDbgNullFrameFakeHeadBefore* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_fake_head_before".}: uint32
-  var nimFwDbgNullFrameFakeTailBefore* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_fake_tail_before".}: uint32
-  var nimFwDbgNullFrameFakeHeadAfter* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_fake_head_after".}: uint32
-  var nimFwDbgNullFrameFakeTailAfter* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_fake_tail_after".}: uint32
-  var nimFwDbgNullFrameFakeLink* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_fake_link".}: uint32
-  var nimFwDbgPostponedRelease* {.wifiCtrl, exportc: "nimfw_dbg_postponed_release".}: uint32
-  var nimFwDbgPostponedReleaseCb* {.wifiCtrl, exportc: "nimfw_dbg_postponed_release_cb".}: uint32
-  var nimFwDbgPostponedReleaseDesc* {.wifiCtrl, exportc: "nimfw_dbg_postponed_release_desc".}: uint32
-  var nimFwDbgPostponedReleaseFc* {.wifiCtrl, exportc: "nimfw_dbg_postponed_release_fc".}: uint32
-  var nimFwDbgPostponedReleaseFlags* {.wifiCtrl, exportc: "nimfw_dbg_postponed_release_flags".}: uint32
-  var nimFwDbgPostponedReconcile* {.wifiCtrl, exportc: "nimfw_dbg_postponed_reconcile".}: uint32
-  var nimFwDbgPostponedReconcileOld* {.wifiCtrl, exportc: "nimfw_dbg_postponed_reconcile_old".}: uint32
-  var nimFwDbgPostponedReconcileNew* {.wifiCtrl, exportc: "nimfw_dbg_postponed_reconcile_new".}: uint32
-  var nimFwDbgAutoNullSkipped* {.wifiCtrl, exportc: "nimfw_dbg_auto_null_skipped".}: uint32
-  var nimFwDbgTxStalledInternalRecover* {.wifiCtrl, exportc: "nimfw_dbg_tx_stalled_internal_recover".}: uint32
-  var nimFwDbgTxRecoverAc* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_ac".}: uint32
-  var nimFwDbgTxRecoverPending* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_pending".}: uint32
-  var nimFwDbgTxRecoverCurrentBefore* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_current_before".}: uint32
-  var nimFwDbgTxRecoverCurrentAfter* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_current_after".}: uint32
-  var nimFwDbgTxRecoverBackupBefore* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_backup_before".}: uint32
-  var nimFwDbgTxRecoverBackupAfterFake* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_backup_after_fake".}: uint32
-  var nimFwDbgTxRecoverBackupAfterPay* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_backup_after_pay".}: uint32
-  var nimFwDbgTxRecoverDescBuf* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_desc_buf".}: uint32
-  var nimFwDbgTxRecoverDescCb* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_desc_cb".}: uint32
-  var nimFwStaTxChannelPrepareEnabled* {.wifiCtrl, exportc: "nimfw_sta_tx_channel_prepare_enabled".}: uint32
-  var nimFwBleWifiRoleWindowEnabled* {.wifiCtrl, exportc: "nimfw_ble_wifi_role_window_enabled".}: uint32
-  var nimFwBleWifiRoleWindowActive* {.wifiCtrl, exportc: "nimfw_ble_wifi_role_window_active".}: uint32
-  var nimFwDbgBleWifiRoleEnter* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_role_enter".}: uint32
-  var nimFwDbgBleWifiRoleLeave* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_role_leave".}: uint32
-  var nimFwDbgBleWifiRoleLastCtrl* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_role_last_ctrl".}: uint32
-  var nimFwDbgBleWifiRoleLastCtrl2* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_role_last_ctrl2".}: uint32
-  var nimFwDbgBleWifiRoleLastMirror* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_role_last_mirror".}: uint32
-  var nimFwDbgBleWifiTxPreBcn* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_tx_pre_bcn".}: uint32
-  var nimFwDbgBleWifiTxPrePti* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_tx_pre_pti".}: uint32
-  var nimFwDbgBleWifiTxPreStat* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_tx_pre_stat".}: uint32
-  var nimFwDbgBleWifiTxTrigStat* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_tx_trig_stat".}: uint32
-  var nimFwDbgBleWifiTxTrigAgg* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_tx_trig_agg".}: uint32
-  var nimFwDbgBleWifiTxCfmBcn* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_tx_cfm_bcn".}: uint32
-  var nimFwDbgBleWifiTxCfmPti* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_tx_cfm_pti".}: uint32
-  var nimFwDbgStaTxRfRestore* {.wifiCtrl, exportc: "nimfw_dbg_sta_tx_rf_restore".}: uint32
-  var nimFwDbgStaTxRfFullRestore* {.wifiCtrl, exportc: "nimfw_dbg_sta_tx_rf_full_restore".}: uint32
-  var nimFwKeepaliveInFlight* {.wifiCtrl, exportc: "nimfw_keepalive_inflight".}: uint32
-  var nimFwKeepaliveTargetCfm* {.wifiCtrl, exportc: "nimfw_keepalive_target_cfm".}: uint32
-  var nimFwKeepaliveStartedAt* {.wifiCtrl, exportc: "nimfw_keepalive_started_at".}: uint32
-  var nimFwDbgKeepaliveRc* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_rc".}: uint32
-  var nimFwDbgKeepalivePostBefore* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_post_before".}: uint32
-  var nimFwDbgKeepalivePostAfter* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_post_after".}: uint32
-  var nimFwDbgKeepaliveTxintBefore* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_txint_before".}: uint32
-  var nimFwDbgKeepaliveTxintAfter* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_txint_after".}: uint32
-  var nimFwDbgKeepaliveFakeBefore* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_fake_before".}: uint32
-  var nimFwDbgKeepaliveFakeAfter* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_fake_after".}: uint32
-  var nimFwDbgKeepalivePayBefore* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_pay_before".}: uint32
-  var nimFwDbgKeepalivePayAfter* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_pay_after".}: uint32
-  var nimFwDbgKeepaliveCbBefore* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_cb_before".}: uint32
-  var nimFwDbgKeepaliveCbAfter* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_cb_after".}: uint32
-  var nimFwKeepaliveQosNullEnabled* {.wifiCtrl, exportc: "nimfw_keepalive_qosnull_enabled".}: uint32
-  var nimFwDbgTxIntEnter* {.wifiCtrl, exportc: "nimfw_dbg_txint_enter".}: uint32
-  var nimFwDbgTxIntLastCb* {.wifiCtrl, exportc: "nimfw_dbg_txint_last_cb".}: uint32
-  var nimFwDbgTxIntLastFc* {.wifiCtrl, exportc: "nimfw_dbg_txint_last_fc".}: uint32
-  var nimFwDbgStaTbttEnter*     {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_enter".}: uint32
-  var nimFwDbgStaTbttAssoc*     {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_assoc".}: uint32
-  var nimFwDbgStaTbttOnChan*    {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_onchan".}: uint32
-  var nimFwDbgStaTbttPC100*     {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_pc100".}: uint32
-  var nimFwDbgStaTbttPCMax*     {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_pcmax".}: uint32
-  var nimFwDbgSetVifState*      {.wifiCtrl, exportc: "nimfw_dbg_set_vif_state".}: uint32   # entries
-  var nimFwDbgSetVifStateNew*   {.wifiCtrl, exportc: "nimfw_dbg_set_vif_state_new".}: uint32  # last newState
-  var nimFwDbgSetVifStateAct*   {.wifiCtrl, exportc: "nimfw_dbg_set_vif_state_act".}: uint32  # activating=true count
-  var nimFwDbgAssocDone*        {.wifiCtrl, exportc: "nimfw_dbg_assoc_done".}: uint32
-  var nimFwDbgAssocRspStatus*   {.wifiCtrl, exportc: "nimfw_dbg_assoc_rsp_status".}: uint32  # last assoc rsp statusCode
-  var nimFwDbgAssocRspCount*    {.wifiCtrl, exportc: "nimfw_dbg_assoc_rsp_count".}: uint32
-  var nimFwDbgAssocRspLen*      {.wifiCtrl, exportc: "nimfw_dbg_assoc_rsp_len".}: uint32
-  var nimFwDbgAssocRspBody0*    {.wifiCtrl, exportc: "nimfw_dbg_assoc_rsp_b0".}: uint32  # first 4 bytes of body
-  var nimFwDbgAssocRspBody4*    {.wifiCtrl, exportc: "nimfw_dbg_assoc_rsp_b4".}: uint32  # next 4 bytes
-  var nimFwDbgDeauthHandler*    {.wifiCtrl, exportc: "nimfw_dbg_deauth".}: uint32
-  var nimFwDbgConnLossInd*      {.wifiCtrl, exportc: "nimfw_dbg_connloss".}: uint32
-  var nimFwDbgWpaRsnIeSet*      {.wifiCtrl, exportc: "nimfw_dbg_wparsn_set".}: uint32
-  var nimFwDbgWpaRsnIeLen*      {.wifiCtrl, exportc: "nimfw_dbg_wparsn_len".}: uint32
-  var nimFwDbgWpaRsnIePtr*      {.wifiCtrl, exportc: "nimfw_dbg_wparsn_ptr".}: uint32
-  var nimFwDbgVifSecType*       {.wifiCtrl, exportc: "nimfw_dbg_vif_sectype".}: uint32  # vif+497 at vif_state_cfm
-  var nimFwDbgConnectIndPrePath* {.wifiCtrl, exportc: "nimfw_dbg_conn_ind_prepath".}: uint32  # path-1 (open) fired
-  var nimFwDbgVifIeLenAtAssoc*  {.wifiCtrl, exportc: "nimfw_dbg_vif_ielen_assoc".}: uint32  # vif+496 at AssocReq build
-  var nimFwDbgPtkInitDone*      {.wifiCtrl, exportc: "nimfw_dbg_ptk_init_done".}: uint32
-  var nimFwDbgKeyDataDecryptCalls* {.wifiCtrl, exportc: "nimfw_dbg_keydata_decrypt_calls".}: uint32
-  var nimFwDbgKeyDataDecryptLen* {.wifiCtrl, exportc: "nimfw_dbg_keydata_decrypt_len".}: uint32
-  var nimFwDbgKeyDataDecryptOutLen* {.wifiCtrl, exportc: "nimfw_dbg_keydata_decrypt_out_len".}: uint32
-  var nimFwDbgKeyDataDecryptOk* {.wifiCtrl, exportc: "nimfw_dbg_keydata_decrypt_ok".}: uint32
-  var nimFwDbgKeyDataDecryptFail* {.wifiCtrl, exportc: "nimfw_dbg_keydata_decrypt_fail".}: uint32
-  # Per-VIF WPA-handshake-pending tracking. Set when sm_assoc_done runs on a
-  # WPA-protected VIF (sectype>=2); cleared on PTK-init-done or disconnect.
-  # mm_sta_tbtt uses this to suppress the null-frame keep-alive loop while
-  # waiting for WPA, and to time out the wait into a connection_loss_ind.
-  var nimFwWpaPendingMask* {.wifiCtrl, exportc: "nimfw_wpa_pending_mask".}: uint32
-  var nimFwDbgStaTbttSkip* {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_skip".}: uint32
-  var nimFwDbgStaTbttGiveup* {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_giveup".}: uint32
-  var nimFwDbgEapolIn*       {.wifiCtrl, exportc: "nimfw_dbg_eapol_in".}: uint32
-  var nimFwDbgEapolDropped*  {.wifiCtrl, exportc: "nimfw_dbg_eapol_dropped".}: uint32
-  var nimFwDbgEapolForwarded* {.wifiCtrl, exportc: "nimfw_dbg_eapol_fwd".}: uint32
-  var nimFwDbgVifWpaState*   {.wifiCtrl, exportc: "nimfw_dbg_vif_wpastate".}: uint32
-  var nimFwDbgEapolCbInv*    {.wifiCtrl, exportc: "nimfw_dbg_eapol_cb_inv".}: uint32
-  var nimFwDbgEapolCbNull*   {.wifiCtrl, exportc: "nimfw_dbg_eapol_cb_null".}: uint32
-  var nimFwDbgSmStateAtEapol* {.wifiCtrl, exportc: "nimfw_dbg_sm_state_eapol".}: uint32
-  # Supplicant-side counters (incremented from C files in wpa_supplicant/ and wifi driver)
-  var nimFwDbgSuppRxEapol*   {.wifiCtrl, exportc: "nimfw_dbg_supp_rx_eapol".}: uint32
-  var nimFwDbgSuppTxEapol*   {.wifiCtrl, exportc: "nimfw_dbg_supp_tx_eapol".}: uint32
-  var nimFwDbgEthTxEapol*    {.wifiCtrl, exportc: "nimfw_dbg_eth_tx_eapol".}: uint32
-  var nimFwDbgBlOutputEapol* {.wifiCtrl, exportc: "nimfw_dbg_bl_output_eapol".}: uint32
-  var nimFwDbgEapolTxCb*     {.wifiCtrl, exportc: "nimfw_dbg_eapol_tx_cb".}: uint32
-  var nimFwDbgWpaDeauth*     {.wifiCtrl, exportc: "nimfw_dbg_wpa_deauth".}: uint32
-  var nimFwDbgEthTxRet*      {.wifiCtrl, exportc: "nimfw_dbg_eth_tx_ret".}: uint32  # last return code
-  var nimFwDbgBlOutputDrop*  {.wifiCtrl, exportc: "nimfw_dbg_bl_output_drop".}: uint32  # bl_output dropped (sta_id<0)
-  var nimFwDbgPbufAllocFail* {.wifiCtrl, exportc: "nimfw_dbg_pbuf_alloc_fail".}: uint32
-  var nimFwDbgPbufTakeFail*  {.wifiCtrl, exportc: "nimfw_dbg_pbuf_take_fail".}: uint32
-  var nimFwDbgSuppTxLen*     {.wifiCtrl, exportc: "nimfw_dbg_supp_tx_len".}: uint32  # last EAPOL TX len
-  var nimFwDbgTxFlushEnter*  {.wifiCtrl, exportc: "nimfw_dbg_tx_flush_enter".}: uint32
-  var nimFwDbgTxPushCalls*   {.wifiCtrl, exportc: "nimfw_dbg_tx_push_calls".}: uint32
-  var nimFwDbgTxNoDesc*      {.wifiCtrl, exportc: "nimfw_dbg_tx_nodesc".}: uint32
-  var nimFwDbgTxNoBuf*       {.wifiCtrl, exportc: "nimfw_dbg_tx_nobuf".}: uint32
-  var nimFwDbgBlTxCfm*       {.wifiCtrl, exportc: "nimfw_dbg_bl_tx_cfm".}: uint32  # bl_tx_cfm calls
-  var nimFwDbgBlTxCfmCb*     {.wifiCtrl, exportc: "nimfw_dbg_bl_tx_cfm_cb".}: uint32  # bl_tx_cfm cb != nil
-  var nimFwDbgBlTxCfmEapol*  {.wifiCtrl, exportc: "nimfw_dbg_bl_tx_cfm_eapol".}: uint32  # cfm for EAPOL ethertype
-  var nimFwDbgWpaState*      {.wifiCtrl, exportc: "nimfw_dbg_wpa_state".}: uint32  # latest WPA_SM_STATE
-  var nimFwDbgWpaTxState*    {.wifiCtrl, exportc: "nimfw_dbg_wpa_tx_state".}: uint32  # WPA state at TX time
-  var nimFwDbgWpaRxState*    {.wifiCtrl, exportc: "nimfw_dbg_wpa_rx_state".}: uint32  # WPA state at RX time
-  var nimFwDbgWpaPtkInstalled* {.wifiCtrl, exportc: "nimfw_dbg_wpa_ptk_installed".}: uint32
-  # Crypto-derivation snapshot for offline verification.
-  # Filled by C side at wpa_derive_ptk entry/exit; dumped via UART at end of test.
-  var nimFwDbgCryptoCaptured*  {.wifiCtrl, exportc: "nimfw_dbg_crypto_captured".}: uint32
-  var nimFwDbgCryptoPmk*       {.wifiCtrl, exportc: "nimfw_dbg_crypto_pmk".}: array[32, uint8]
-  var nimFwDbgCryptoOwnAddr*   {.wifiCtrl, exportc: "nimfw_dbg_crypto_own".}: array[6, uint8]
-  var nimFwDbgCryptoBssid*     {.wifiCtrl, exportc: "nimfw_dbg_crypto_bssid".}: array[6, uint8]
-  var nimFwDbgCryptoSNonce*    {.wifiCtrl, exportc: "nimfw_dbg_crypto_snonce".}: array[32, uint8]
-  var nimFwDbgCryptoANonce*    {.wifiCtrl, exportc: "nimfw_dbg_crypto_anonce".}: array[32, uint8]
-  var nimFwDbgCryptoKck*       {.wifiCtrl, exportc: "nimfw_dbg_crypto_kck".}: array[16, uint8]
-  var nimFwDbgCryptoPmkLen*    {.wifiCtrl, exportc: "nimfw_dbg_crypto_pmk_len".}: uint32
-  var nimFwDbgCryptoPtkLen*    {.wifiCtrl, exportc: "nimfw_dbg_crypto_ptk_len".}: uint32
-  var nimFwDbgCryptoUseSha256* {.wifiCtrl, exportc: "nimfw_dbg_crypto_sha256".}: uint32
-  var nimFwDbgCryptoKeyMgmt*   {.wifiCtrl, exportc: "nimfw_dbg_crypto_keymgmt".}: uint32
-  var nimFwDbgCryptoPairwise*  {.wifiCtrl, exportc: "nimfw_dbg_crypto_pairwise".}: uint32
-  var nimFwDbgCryptoPrfData*   {.wifiCtrl, exportc: "nimfw_dbg_crypto_prf_data".}: array[76, uint8]
-  # Self-test of SHA1/HMAC primitive: HMAC-SHA1(key="Jefe", data="what do ya want for nothing?")
-  # Expected output: effcdf6ae5eb2fa2d27416d5f184df9c259a7c79 (RFC 2202 test case 2)
-  var nimFwDbgSelftestHmac*    {.wifiCtrl, exportc: "nimfw_dbg_selftest_hmac".}: array[20, uint8]
-  var nimFwDbgSelftestRan*     {.wifiCtrl, exportc: "nimfw_dbg_selftest_ran".}: uint32
-  # Comparison: the source MAC actually placed in 802.11 frames (vif+80) vs sm->own_addr.
-  var nimFwDbgVifMac*          {.wifiCtrl, exportc: "nimfw_dbg_vif_mac".}: array[6, uint8]
-  var nimFwDbgMacHwLo*         {.wifiCtrl, exportc: "nimfw_dbg_mac_hw_lo".}: uint32
-  var nimFwDbgMacHwHi*         {.wifiCtrl, exportc: "nimfw_dbg_mac_hw_hi".}: uint32
-  # M2 EAPOL frame snapshot — Ethernet + EAPOL key bytes as sent by supplicant.
-  var nimFwDbgM2Len*           {.wifiCtrl, exportc: "nimfw_dbg_m2_len".}: uint32
-  var nimFwDbgM2Buf*           {.wifiCtrl, exportc: "nimfw_dbg_m2_buf".}: array[160, uint8]
-  # KCK as seen at MIC computation site (wpa_eapol_key_mic).
-  var nimFwDbgMicKck*          {.wifiCtrl, exportc: "nimfw_dbg_mic_kck".}: array[16, uint8]
-  var nimFwDbgMicComputed*     {.wifiCtrl, exportc: "nimfw_dbg_mic_computed".}: array[16, uint8]
-  var nimFwDbgMicFrameLen*     {.wifiCtrl, exportc: "nimfw_dbg_mic_frame_len".}: uint32
-  var nimFwDbgMicVer*          {.wifiCtrl, exportc: "nimfw_dbg_mic_ver".}: uint32
-  # SAE path tracking.
-  var nimFwDbgSaeBuildMsg*     {.wifiCtrl, exportc: "nimfw_dbg_sae_build".}: uint32
-  var nimFwDbgSaeParseMsg*     {.wifiCtrl, exportc: "nimfw_dbg_sae_parse".}: uint32
-  var nimFwDbgSaeAuthAlgo*     {.wifiCtrl, exportc: "nimfw_dbg_sae_auth_algo".}: uint32  # auth_algo read in sm_auth_send
-  var nimFwDbgScanKeyMgmt*     {.wifiCtrl, exportc: "nimfw_dbg_scan_key_mgmt".}: uint32  # lf (parsed key_mgmt LE 16-bit)
-  var nimFwDbgScanAT*          {.wifiCtrl, exportc: "nimfw_dbg_scan_at".}: uint32  # computed aT
-  var nimFwDbgScanSmF*         {.wifiCtrl, exportc: "nimfw_dbg_scan_smf".}: uint32  # smF flags
-  var nimFwDbgScanCaps*        {.wifiCtrl, exportc: "nimfw_dbg_scan_caps".}: uint32  # lS[16] (capabilities)
-  # M4 path tracking — debug why PTK never gets installed.
-  var nimFwDbgM4TxState*       {.wifiCtrl, exportc: "nimfw_dbg_m4_tx_state".}: uint32  # WPA state at M4 TX
-  var nimFwDbgM4CbPtr*         {.wifiCtrl, exportc: "nimfw_dbg_m4_cb_ptr".}: uint32    # custom_cfm.cb at M4 TX
-  var nimFwDbgCfmCbPtrLast*    {.wifiCtrl, exportc: "nimfw_dbg_cfm_cb_ptr_last".}: uint32  # what bl_tx_cfm read
-  var nimFwDbgSendCfmLastEthertype* {.wifiCtrl, exportc: "nimfw_dbg_cfm_last_ethertype".}: uint32
-  var nimFwDbgSend4of4Tx*      {.wifiCtrl, exportc: "nimfw_dbg_send_4of4_tx".}: uint32  # M4 send invocations
-  var nimFwDbgSend4of4Cb*      {.wifiCtrl, exportc: "nimfw_dbg_send_4of4_cb".}: uint32  # wpa_supplicant_send_4_of_4_txcallback invocations
-  var nimFwDbgInstallPtk*      {.wifiCtrl, exportc: "nimfw_dbg_install_ptk".}: uint32  # wpa_supplicant_install_ptk invocations
-  # Per-EAPOL bl_tx_cfm details — status (THD[16]) for last EAPOL frame.
-  var nimFwDbgEapolCfmStatus*  {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_status".}: uint32
-  var nimFwDbgEapolCfmCount*   {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_count".}: uint32
-  var nimFwDbgEapolCfmAckOk*   {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_ack_ok".}: uint32
-  var nimFwDbgEapolCfmAckFail* {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_ack_fail".}: uint32
-  # Disconnect-path counters.
-  var nimFwDbgDisconnectReq*   {.wifiCtrl, exportc: "nimfw_dbg_disconnect_req".}: uint32
-  var nimFwDbgDisconnectReqState* {.wifiCtrl, exportc: "nimfw_dbg_disconnect_req_state".}: uint32
-  var nimFwDbgDisconnectProcess* {.wifiCtrl, exportc: "nimfw_dbg_disconnect_process".}: uint32
-  var nimFwDbgDisconnectInd*   {.wifiCtrl, exportc: "nimfw_dbg_disconnect_ind".}: uint32
-  var nimFwDbgSmStateFinal*    {.wifiCtrl, exportc: "nimfw_dbg_sm_state_final".}: uint32
-else:
-  var
-    nimFwDbgFrameTraceCount, nimFwDbgIpcTxTraceCount,
-      nimFwDbgCfmTraceCount, nimFwDbgEapolTraceCount: uint32
-    nimFwDbgPayBackupEntry, nimFwDbgPayDescFound,
-      nimFwDbgPayHasPayload, nimFwDbgPayEmptyList, nimFwDbgPayNonEmpty,
-      nimFwDbgPayTriggerLast: uint32
-    nimFwDbgTxTrigEntry, nimFwDbgTxTrigAcReady,
-      nimFwDbgTxTrigZeroExit, nimFwDbgTxTrigLoops: uint32
-    nimFwDbgFrameGet, nimFwDbgFrameCfm, nimFwDbgFrameRelease,
-      nimFwDbgFrameGetFails, nimFwDbgCfmPush, nimFwDbgCfmEvt,
-      nimFwDbgFrameGetInvalid, nimFwDbgFrameGetInvalidPtr,
-      nimFwDbgFrameGetInvalidNext, nimFwDbgFrameFreeRebuild,
-      nimFwDbgFrameFreeReclaimed, nimFwDbgFrameFreePushInvalid,
-      nimFwDbgTxPendingInvalid, nimFwDbgTxPendingInvalidPtr: uint32
-    nimFwDbgFrameEvtEnter, nimFwDbgFrameEvtPop,
-      nimFwDbgFrameEvtFreeRet, nimFwDbgFrameEvtUsedSkip,
-      nimFwDbgFrameEvtCallback: uint32
-    nimFwDbgNullFrameCalls, nimFwDbgNullFrameCallerRA: uint32
-    nimFwDbgTxRouteInternal, nimFwDbgTxRouteHost,
-      nimFwDbgTxRouteUsedFlag, nimFwDbgFrameGetUsedBefore: uint32
-    nimFwDbgNullFrameCfm, nimFwDbgNullFrameAckOk,
-      nimFwDbgNullFrameAckFail, nimFwDbgNullFrameLastStatus: uint32
-    nimFwDbgNullFrameDescLast, nimFwDbgNullFrameBufLast,
-      nimFwDbgNullFrameFcLast, nimFwDbgNullFramePushRc,
-      nimFwDbgNullFrameReturn, nimFwDbgNullFrameVifSta,
-      nimFwDbgNullFrameCbSet, nimFwDbgNullFrameCbSetPtr, nimFwDbgNullFrameEvtSeen,
-      nimFwDbgNullFrameEvtCbNil, nimFwDbgNullFrameEvtCbPtr,
-      nimFwDbgNullFrameEvtDesc, nimFwDbgNullFrameTxTrigSeen,
-      nimFwDbgNullFrameTxTrigHost, nimFwDbgNullFrameTxTrigInternal,
-      nimFwDbgNullFrameTxTrigUsedFlag, nimFwDbgNullFrameBusyTxCheck,
-      nimFwDbgNullFrameBusyPsCheck, nimFwDbgNullFramePaySeen,
-      nimFwDbgNullFramePayHasPayload, nimFwDbgNullFramePayEmpty,
-      nimFwDbgNullFramePayNonEmpty, nimFwDbgNullFramePayAc,
-      nimFwDbgNullFramePayTrigger, nimFwDbgNullFramePayCurrent,
-      nimFwDbgNullFramePayPending, nimFwDbgNullFramePayThdStatus,
-      nimFwDbgNullFramePostponed, nimFwDbgNullFrameQueued,
-      nimFwDbgPostponedServiceCalls, nimFwDbgPostponedServiceSent,
-      nimFwDbgNullFrameTxIntSeen, nimFwDbgNullFrameTxIntFc,
-      nimFwDbgNullFrameTxIntBuf, nimFwDbgNullFrameFakeSeen,
-      nimFwDbgNullFrameFakeQidx, nimFwDbgNullFrameFakeHeadBefore,
-      nimFwDbgNullFrameFakeTailBefore, nimFwDbgNullFrameFakeHeadAfter,
-      nimFwDbgNullFrameFakeTailAfter, nimFwDbgNullFrameFakeLink,
-      nimFwDbgPostponedRelease, nimFwDbgPostponedReleaseCb,
-      nimFwDbgPostponedReleaseDesc, nimFwDbgPostponedReleaseFc,
-      nimFwDbgPostponedReleaseFlags,
-      nimFwDbgPostponedReconcile, nimFwDbgPostponedReconcileOld,
-      nimFwDbgPostponedReconcileNew,
-      nimFwDbgAutoNullSkipped, nimFwDbgTxStalledInternalRecover,
-      nimFwDbgTxRecoverAc, nimFwDbgTxRecoverPending,
-      nimFwDbgTxRecoverCurrentBefore, nimFwDbgTxRecoverCurrentAfter,
-      nimFwDbgTxRecoverBackupBefore, nimFwDbgTxRecoverBackupAfterFake,
-      nimFwDbgTxRecoverBackupAfterPay, nimFwDbgTxRecoverDescBuf,
-      nimFwDbgTxRecoverDescCb,
-      nimFwStaTxChannelPrepareEnabled,
-      nimFwBleWifiRoleWindowEnabled, nimFwBleWifiRoleWindowActive,
-      nimFwDbgBleWifiRoleEnter, nimFwDbgBleWifiRoleLeave,
-      nimFwDbgBleWifiRoleLastCtrl, nimFwDbgBleWifiRoleLastCtrl2,
-      nimFwDbgBleWifiRoleLastMirror,
-      nimFwDbgBleWifiTxPreBcn, nimFwDbgBleWifiTxPrePti,
-      nimFwDbgBleWifiTxPreStat, nimFwDbgBleWifiTxTrigStat,
-      nimFwDbgBleWifiTxTrigAgg, nimFwDbgBleWifiTxCfmBcn,
-      nimFwDbgBleWifiTxCfmPti, nimFwDbgStaTxRfFullRestore,
-      nimFwKeepaliveInFlight, nimFwKeepaliveTargetCfm,
-      nimFwDbgKeepaliveRc,
-      nimFwDbgKeepalivePostBefore, nimFwDbgKeepalivePostAfter,
-      nimFwDbgKeepaliveTxintBefore, nimFwDbgKeepaliveTxintAfter,
-      nimFwDbgKeepaliveFakeBefore, nimFwDbgKeepaliveFakeAfter,
-      nimFwDbgKeepalivePayBefore, nimFwDbgKeepalivePayAfter,
-      nimFwDbgKeepaliveCbBefore, nimFwDbgKeepaliveCbAfter,
-      nimFwDbgTxIntEnter,
-      nimFwDbgTxIntLastCb, nimFwDbgTxIntLastFc: uint32
-    nimFwDbgStaTbttEnter, nimFwDbgStaTbttAssoc,
-      nimFwDbgStaTbttOnChan, nimFwDbgStaTbttPC100,
-      nimFwDbgStaTbttPCMax, nimFwDbgStaTbttSkip,
-      nimFwDbgStaTbttGiveup: uint32
-    nimFwDbgSetVifState, nimFwDbgSetVifStateNew,
-      nimFwDbgSetVifStateAct: uint32
-    nimFwDbgAssocDone, nimFwDbgAssocRspStatus,
-      nimFwDbgAssocRspCount, nimFwDbgAssocRspLen,
-      nimFwDbgAssocRspBody0, nimFwDbgAssocRspBody4: uint32
-    nimFwDbgDeauthHandler, nimFwDbgConnLossInd: uint32
-    nimFwDbgWpaRsnIeSet, nimFwDbgWpaRsnIeLen,
-      nimFwDbgWpaRsnIePtr: uint32
-    nimFwDbgVifSecType, nimFwDbgConnectIndPrePath,
-      nimFwDbgVifIeLenAtAssoc, nimFwDbgPtkInitDone,
-      nimFwDbgKeyDataDecryptCalls, nimFwDbgKeyDataDecryptLen,
-      nimFwDbgKeyDataDecryptOutLen, nimFwDbgKeyDataDecryptOk,
-      nimFwDbgKeyDataDecryptFail: uint32
-    nimFwWpaPendingMask: uint32
-    nimFwDbgEapolIn, nimFwDbgEapolDropped,
-      nimFwDbgEapolForwarded, nimFwDbgVifWpaState,
-      nimFwDbgEapolCbInv, nimFwDbgEapolCbNull,
-      nimFwDbgSmStateAtEapol, nimFwDbgEapolTxCb: uint32
-    nimFwDbgWpaState, nimFwDbgWpaTxState,
-      nimFwDbgWpaRxState, nimFwDbgWpaPtkInstalled: uint32
-    nimFwDbgSaeBuildMsg, nimFwDbgSaeParseMsg,
-      nimFwDbgSaeAuthAlgo, nimFwDbgScanKeyMgmt,
-      nimFwDbgScanAT, nimFwDbgScanSmF, nimFwDbgScanCaps: uint32
-    nimFwDbgEapolCfmStatus, nimFwDbgEapolCfmCount,
-      nimFwDbgEapolCfmAckOk, nimFwDbgEapolCfmAckFail: uint32
-    nimFwDbgDisconnectReq, nimFwDbgDisconnectReqState,
-      nimFwDbgDisconnectProcess, nimFwDbgDisconnectInd,
-      nimFwDbgSmStateFinal: uint32
-    nimFwDbgMacHwLo, nimFwDbgMacHwHi: uint32
-    nimFwDbgVifMac: array[6, uint8]
+var nimFwDbgFrameTraceCount {.wifiCtrl.}: uint32
+var nimFwDbgIpcTxTraceCount {.wifiCtrl.}: uint32
+var nimFwDbgCfmTraceCount {.wifiCtrl.}: uint32
+var nimFwDbgEapolTraceCount {.wifiCtrl.}: uint32
+# TX-path investigation counters (iter 261). Read after test via UART dump.
+var nimFwDbgPayBackupEntry* {.wifiCtrl, exportc: "nimfw_dbg_pay_backup".}: uint32
+var nimFwDbgPayDescFound*   {.wifiCtrl, exportc: "nimfw_dbg_pay_desc".}: uint32
+var nimFwDbgPayHasPayload*  {.wifiCtrl, exportc: "nimfw_dbg_pay_payload".}: uint32
+var nimFwDbgPayEmptyList*   {.wifiCtrl, exportc: "nimfw_dbg_pay_empty".}: uint32
+var nimFwDbgPayNonEmpty*    {.wifiCtrl, exportc: "nimfw_dbg_pay_nonempty".}: uint32
+var nimFwDbgPayTriggerLast* {.wifiCtrl, exportc: "nimfw_dbg_pay_trig".}: uint32
+var nimFwDbgTxTrigEntry*    {.wifiCtrl, exportc: "nimfw_dbg_txtrig_entry".}: uint32
+var nimFwDbgFrameGet*       {.wifiCtrl, exportc: "nimfw_dbg_frame_get".}: uint32
+var nimFwDbgFrameGetInvalid* {.wifiCtrl, exportc: "nimfw_dbg_frame_get_invalid".}: uint32
+var nimFwDbgFrameGetInvalidPtr* {.wifiCtrl, exportc: "nimfw_dbg_frame_get_invalid_ptr".}: uint32
+var nimFwDbgFrameGetInvalidNext* {.wifiCtrl, exportc: "nimfw_dbg_frame_get_invalid_next".}: uint32
+var nimFwDbgFrameFreeRebuild* {.wifiCtrl, exportc: "nimfw_dbg_frame_free_rebuild".}: uint32
+var nimFwDbgFrameFreeReclaimed* {.wifiCtrl, exportc: "nimfw_dbg_frame_free_reclaimed".}: uint32
+var nimFwDbgFrameFreePushInvalid* {.wifiCtrl, exportc: "nimfw_dbg_frame_free_push_invalid".}: uint32
+var nimFwDbgTxPendingInvalid* {.wifiCtrl, exportc: "nimfw_dbg_tx_pending_invalid".}: uint32
+var nimFwDbgTxPendingInvalidPtr* {.wifiCtrl, exportc: "nimfw_dbg_tx_pending_invalid_ptr".}: uint32
+var nimFwDbgTxThdNoBuffer* {.wifiCtrl, exportc: "nimfw_dbg_tx_thd_nobuf".}: uint32
+var nimFwDbgTxThdNoBufferDesc* {.wifiCtrl, exportc: "nimfw_dbg_tx_thd_nobuf_desc".}: uint32
+var nimFwDbgApmStaAddNoSlot* {.wifiCtrl, exportc: "nimfw_dbg_apm_sta_add_noslot".}: uint32
+var nimFwDbgApmStaAddNoSlotSta* {.wifiCtrl, exportc: "nimfw_dbg_apm_sta_add_noslot_sta".}: uint32
+var nimFwDbgKeTimerYield* {.wifiCtrl, exportc: "nimfw_dbg_ke_timer_yield".}: uint32
+var nimFwDbgKeTimerYieldHead* {.wifiCtrl, exportc: "nimfw_dbg_ke_timer_yield_head".}: uint32
+var nimFwDbgMmTimerYield* {.wifiCtrl, exportc: "nimfw_dbg_mm_timer_yield".}: uint32
+var nimFwDbgMmTimerYieldHead* {.wifiCtrl, exportc: "nimfw_dbg_mm_timer_yield_head".}: uint32
+var nimFwDbgIpcMsgYield* {.wifiCtrl, exportc: "nimfw_dbg_ipc_msg_yield".}: uint32
+var nimFwDbgIpcMsgYieldStatus* {.wifiCtrl, exportc: "nimfw_dbg_ipc_msg_yield_status".}: uint32
+var nimFwDbgSavedMsgYield* {.wifiCtrl, exportc: "nimfw_dbg_saved_msg_yield".}: uint32
+var nimFwDbgSavedMsgYieldTask* {.wifiCtrl, exportc: "nimfw_dbg_saved_msg_yield_task".}: uint32
+var nimFwDbgCfmEvtYield* {.wifiCtrl, exportc: "nimfw_dbg_cfm_evt_yield".}: uint32
+var nimFwDbgCfmEvtYieldAc* {.wifiCtrl, exportc: "nimfw_dbg_cfm_evt_yield_ac".}: uint32
+var nimFwDbgTxTrigYield* {.wifiCtrl, exportc: "nimfw_dbg_txtrig_yield".}: uint32
+var nimFwDbgTxTrigYieldAc* {.wifiCtrl, exportc: "nimfw_dbg_txtrig_yield_ac".}: uint32
+var nimFwDbgTxTrigYieldHead* {.wifiCtrl, exportc: "nimfw_dbg_txtrig_yield_head".}: uint32
+var nimFwDbgFrameEvtYield* {.wifiCtrl, exportc: "nimfw_dbg_frame_evt_yield".}: uint32
+var nimFwDbgFrameEvtYieldHead* {.wifiCtrl, exportc: "nimfw_dbg_frame_evt_yield_head".}: uint32
+var nimFwDbgRxTimerYield* {.wifiCtrl, exportc: "nimfw_dbg_rx_timer_yield".}: uint32
+var nimFwDbgRxTimerYieldHead* {.wifiCtrl, exportc: "nimfw_dbg_rx_timer_yield_head".}: uint32
+# Recycle / CFM path counters (iter 261 follow-up)
+var nimFwDbgCfmPush*        {.wifiCtrl, exportc: "nimfw_dbg_cfm_push".}: uint32
+var nimFwDbgCfmEvt*         {.wifiCtrl, exportc: "nimfw_dbg_cfm_evt".}: uint32
+var nimFwDbgFrameCfm*       {.wifiCtrl, exportc: "nimfw_dbg_frame_cfm".}: uint32
+var nimFwDbgFrameRelease*   {.wifiCtrl, exportc: "nimfw_dbg_frame_release".}: uint32
+var nimFwDbgTxTrigAcReady*  {.wifiCtrl, exportc: "nimfw_dbg_txtrig_acready".}: uint32  # last acReady seen
+var nimFwDbgTxTrigZeroExit* {.wifiCtrl, exportc: "nimfw_dbg_txtrig_zero".}: uint32     # entered & acReady==0
+var nimFwDbgTxTrigLoops*    {.wifiCtrl, exportc: "nimfw_dbg_txtrig_loops".}: uint32    # inner loop iters
+var nimFwDbgFrameEvtEnter*  {.wifiCtrl, exportc: "nimfw_dbg_frame_evt_enter".}: uint32
+var nimFwDbgFrameEvtPop*    {.wifiCtrl, exportc: "nimfw_dbg_frame_evt_pop".}: uint32
+var nimFwDbgFrameEvtFreeRet* {.wifiCtrl, exportc: "nimfw_dbg_frame_evt_free".}: uint32
+var nimFwDbgFrameEvtUsedSkip* {.wifiCtrl, exportc: "nimfw_dbg_frame_evt_usedskip".}: uint32
+var nimFwDbgFrameEvtCallback* {.wifiCtrl, exportc: "nimfw_dbg_frame_evt_cb".}: uint32
+var nimFwDbgFrameGetFails*    {.wifiCtrl, exportc: "nimfw_dbg_frame_get_fails".}: uint32
+var nimFwDbgNullFrameCalls*   {.wifiCtrl, exportc: "nimfw_dbg_nullframe_calls".}: uint32
+var nimFwDbgNullFrameCallerRA* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_caller_ra".}: uint32
+var nimFwDbgTxRouteInternal*  {.wifiCtrl, exportc: "nimfw_dbg_tx_route_internal".}: uint32
+var nimFwDbgTxRouteHost*      {.wifiCtrl, exportc: "nimfw_dbg_tx_route_host".}: uint32
+var nimFwDbgTxRouteUsedFlag*  {.wifiCtrl, exportc: "nimfw_dbg_tx_route_usedflag".}: uint32
+var nimFwDbgFrameGetUsedBefore* {.wifiCtrl, exportc: "nimfw_dbg_frame_get_used_before".}: uint32
+var nimFwDbgNullFrameCfm*     {.wifiCtrl, exportc: "nimfw_dbg_nullframe_cfm".}: uint32
+var nimFwDbgNullFrameAckOk*   {.wifiCtrl, exportc: "nimfw_dbg_nullframe_ack_ok".}: uint32
+var nimFwDbgNullFrameAckFail* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_ack_fail".}: uint32
+var nimFwDbgNullFrameLastStatus* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_status".}: uint32
+var nimFwDbgNullFrameDescLast* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_desc".}: uint32
+var nimFwDbgNullFrameBufLast* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_buf".}: uint32
+var nimFwDbgNullFrameFcLast* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_fc".}: uint32
+var nimFwDbgNullFramePushRc* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_push_rc".}: uint32
+var nimFwDbgNullFrameReturn* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_return".}: uint32
+var nimFwDbgNullFrameVifSta* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_vif_sta".}: uint32
+var nimFwDbgNullFrameCbSet*   {.wifiCtrl, exportc: "nimfw_dbg_nullframe_cb_set".}: uint32
+var nimFwDbgNullFrameCbSetPtr* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_cb_set_ptr".}: uint32
+var nimFwDbgNullFrameEvtSeen* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_evt_seen".}: uint32
+var nimFwDbgNullFrameEvtCbNil* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_evt_cb_nil".}: uint32
+var nimFwDbgNullFrameEvtCbPtr* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_evt_cb_ptr".}: uint32
+var nimFwDbgNullFrameEvtDesc* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_evt_desc".}: uint32
+var nimFwDbgNullFrameTxTrigSeen* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_txtrig_seen".}: uint32
+var nimFwDbgNullFrameTxTrigHost* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_txtrig_host".}: uint32
+var nimFwDbgNullFrameTxTrigInternal* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_txtrig_internal".}: uint32
+var nimFwDbgNullFrameTxTrigUsedFlag* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_txtrig_usedflag".}: uint32
+var nimFwDbgNullFrameBusyTxCheck* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_busy_txcheck".}: uint32
+var nimFwDbgNullFrameBusyPsCheck* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_busy_pscheck".}: uint32
+var nimFwDbgNullFramePaySeen* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_seen".}: uint32
+var nimFwDbgNullFramePayHasPayload* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_payload".}: uint32
+var nimFwDbgNullFramePayEmpty* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_empty".}: uint32
+var nimFwDbgNullFramePayNonEmpty* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_nonempty".}: uint32
+var nimFwDbgNullFramePayAc* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_ac".}: uint32
+var nimFwDbgNullFramePayTrigger* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_trig".}: uint32
+var nimFwDbgNullFramePayCurrent* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_current".}: uint32
+var nimFwDbgNullFramePayPending* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_pending".}: uint32
+var nimFwDbgNullFramePayThdStatus* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_thd_status".}: uint32
+var nimFwDbgNullFramePostponed* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_postponed".}: uint32
+var nimFwDbgNullFrameQueued* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_queued".}: uint32
+var nimFwDbgPostponedServiceCalls* {.wifiCtrl, exportc: "nimfw_dbg_postponed_service_calls".}: uint32
+var nimFwDbgPostponedServiceSent* {.wifiCtrl, exportc: "nimfw_dbg_postponed_service_sent".}: uint32
+var nimFwDbgNullFrameTxIntSeen* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_txint_seen".}: uint32
+var nimFwDbgNullFrameTxIntFc* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_txint_fc".}: uint32
+var nimFwDbgNullFrameTxIntBuf* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_txint_buf".}: uint32
+var nimFwDbgNullFrameFakeSeen* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_fake_seen".}: uint32
+var nimFwDbgNullFrameFakeQidx* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_fake_qidx".}: uint32
+var nimFwDbgNullFrameFakeHeadBefore* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_fake_head_before".}: uint32
+var nimFwDbgNullFrameFakeTailBefore* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_fake_tail_before".}: uint32
+var nimFwDbgNullFrameFakeHeadAfter* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_fake_head_after".}: uint32
+var nimFwDbgNullFrameFakeTailAfter* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_fake_tail_after".}: uint32
+var nimFwDbgNullFrameFakeLink* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_fake_link".}: uint32
+var nimFwDbgPostponedRelease* {.wifiCtrl, exportc: "nimfw_dbg_postponed_release".}: uint32
+var nimFwDbgPostponedReleaseCb* {.wifiCtrl, exportc: "nimfw_dbg_postponed_release_cb".}: uint32
+var nimFwDbgPostponedReleaseDesc* {.wifiCtrl, exportc: "nimfw_dbg_postponed_release_desc".}: uint32
+var nimFwDbgPostponedReleaseFc* {.wifiCtrl, exportc: "nimfw_dbg_postponed_release_fc".}: uint32
+var nimFwDbgPostponedReleaseFlags* {.wifiCtrl, exportc: "nimfw_dbg_postponed_release_flags".}: uint32
+var nimFwDbgPostponedReconcile* {.wifiCtrl, exportc: "nimfw_dbg_postponed_reconcile".}: uint32
+var nimFwDbgPostponedReconcileOld* {.wifiCtrl, exportc: "nimfw_dbg_postponed_reconcile_old".}: uint32
+var nimFwDbgPostponedReconcileNew* {.wifiCtrl, exportc: "nimfw_dbg_postponed_reconcile_new".}: uint32
+var nimFwDbgAutoNullSkipped* {.wifiCtrl, exportc: "nimfw_dbg_auto_null_skipped".}: uint32
+var nimFwDbgTxStalledInternalRecover* {.wifiCtrl, exportc: "nimfw_dbg_tx_stalled_internal_recover".}: uint32
+var nimFwDbgTxRecoverAc* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_ac".}: uint32
+var nimFwDbgTxRecoverPending* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_pending".}: uint32
+var nimFwDbgTxRecoverCurrentBefore* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_current_before".}: uint32
+var nimFwDbgTxRecoverCurrentAfter* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_current_after".}: uint32
+var nimFwDbgTxRecoverBackupBefore* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_backup_before".}: uint32
+var nimFwDbgTxRecoverBackupAfterFake* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_backup_after_fake".}: uint32
+var nimFwDbgTxRecoverBackupAfterPay* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_backup_after_pay".}: uint32
+var nimFwDbgTxRecoverDescBuf* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_desc_buf".}: uint32
+var nimFwDbgTxRecoverDescCb* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_desc_cb".}: uint32
+var nimFwStaTxChannelPrepareEnabled* {.wifiCtrl, exportc: "nimfw_sta_tx_channel_prepare_enabled".}: uint32
+var nimFwBleWifiRoleWindowEnabled* {.wifiCtrl, exportc: "nimfw_ble_wifi_role_window_enabled".}: uint32
+var nimFwBleWifiRoleWindowActive* {.wifiCtrl, exportc: "nimfw_ble_wifi_role_window_active".}: uint32
+var nimFwDbgBleWifiRoleEnter* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_role_enter".}: uint32
+var nimFwDbgBleWifiRoleLeave* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_role_leave".}: uint32
+var nimFwDbgBleWifiRoleLastCtrl* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_role_last_ctrl".}: uint32
+var nimFwDbgBleWifiRoleLastCtrl2* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_role_last_ctrl2".}: uint32
+var nimFwDbgBleWifiRoleLastMirror* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_role_last_mirror".}: uint32
+var nimFwDbgBleWifiTxPreBcn* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_tx_pre_bcn".}: uint32
+var nimFwDbgBleWifiTxPrePti* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_tx_pre_pti".}: uint32
+var nimFwDbgBleWifiTxPreStat* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_tx_pre_stat".}: uint32
+var nimFwDbgBleWifiTxTrigStat* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_tx_trig_stat".}: uint32
+var nimFwDbgBleWifiTxTrigAgg* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_tx_trig_agg".}: uint32
+var nimFwDbgBleWifiTxCfmBcn* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_tx_cfm_bcn".}: uint32
+var nimFwDbgBleWifiTxCfmPti* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_tx_cfm_pti".}: uint32
+var nimFwDbgStaTxRfRestore* {.wifiCtrl, exportc: "nimfw_dbg_sta_tx_rf_restore".}: uint32
+var nimFwDbgStaTxRfFullRestore* {.wifiCtrl, exportc: "nimfw_dbg_sta_tx_rf_full_restore".}: uint32
+var nimFwKeepaliveInFlight* {.wifiCtrl, exportc: "nimfw_keepalive_inflight".}: uint32
+var nimFwKeepaliveTargetCfm* {.wifiCtrl, exportc: "nimfw_keepalive_target_cfm".}: uint32
+var nimFwKeepaliveStartedAt* {.wifiCtrl, exportc: "nimfw_keepalive_started_at".}: uint32
+var nimFwDbgKeepaliveRc* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_rc".}: uint32
+var nimFwDbgKeepalivePostBefore* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_post_before".}: uint32
+var nimFwDbgKeepalivePostAfter* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_post_after".}: uint32
+var nimFwDbgKeepaliveTxintBefore* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_txint_before".}: uint32
+var nimFwDbgKeepaliveTxintAfter* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_txint_after".}: uint32
+var nimFwDbgKeepaliveFakeBefore* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_fake_before".}: uint32
+var nimFwDbgKeepaliveFakeAfter* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_fake_after".}: uint32
+var nimFwDbgKeepalivePayBefore* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_pay_before".}: uint32
+var nimFwDbgKeepalivePayAfter* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_pay_after".}: uint32
+var nimFwDbgKeepaliveCbBefore* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_cb_before".}: uint32
+var nimFwDbgKeepaliveCbAfter* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_cb_after".}: uint32
+var nimFwKeepaliveQosNullEnabled* {.wifiCtrl, exportc: "nimfw_keepalive_qosnull_enabled".}: uint32
+var nimFwDbgTxIntEnter* {.wifiCtrl, exportc: "nimfw_dbg_txint_enter".}: uint32
+var nimFwDbgTxIntLastCb* {.wifiCtrl, exportc: "nimfw_dbg_txint_last_cb".}: uint32
+var nimFwDbgTxIntLastFc* {.wifiCtrl, exportc: "nimfw_dbg_txint_last_fc".}: uint32
+var nimFwDbgStaTbttEnter*     {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_enter".}: uint32
+var nimFwDbgStaTbttAssoc*     {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_assoc".}: uint32
+var nimFwDbgStaTbttOnChan*    {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_onchan".}: uint32
+var nimFwDbgStaTbttPC100*     {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_pc100".}: uint32
+var nimFwDbgStaTbttPCMax*     {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_pcmax".}: uint32
+var nimFwDbgSetVifState*      {.wifiCtrl, exportc: "nimfw_dbg_set_vif_state".}: uint32   # entries
+var nimFwDbgSetVifStateNew*   {.wifiCtrl, exportc: "nimfw_dbg_set_vif_state_new".}: uint32  # last newState
+var nimFwDbgSetVifStateAct*   {.wifiCtrl, exportc: "nimfw_dbg_set_vif_state_act".}: uint32  # activating=true count
+var nimFwDbgAssocDone*        {.wifiCtrl, exportc: "nimfw_dbg_assoc_done".}: uint32
+var nimFwDbgAssocRspStatus*   {.wifiCtrl, exportc: "nimfw_dbg_assoc_rsp_status".}: uint32  # last assoc rsp statusCode
+var nimFwDbgAssocRspCount*    {.wifiCtrl, exportc: "nimfw_dbg_assoc_rsp_count".}: uint32
+var nimFwDbgAssocRspLen*      {.wifiCtrl, exportc: "nimfw_dbg_assoc_rsp_len".}: uint32
+var nimFwDbgAssocRspBody0*    {.wifiCtrl, exportc: "nimfw_dbg_assoc_rsp_b0".}: uint32  # first 4 bytes of body
+var nimFwDbgAssocRspBody4*    {.wifiCtrl, exportc: "nimfw_dbg_assoc_rsp_b4".}: uint32  # next 4 bytes
+var nimFwDbgDeauthHandler*    {.wifiCtrl, exportc: "nimfw_dbg_deauth".}: uint32
+var nimFwDbgConnLossInd*      {.wifiCtrl, exportc: "nimfw_dbg_connloss".}: uint32
+var nimFwDbgWpaRsnIeSet*      {.wifiCtrl, exportc: "nimfw_dbg_wparsn_set".}: uint32
+var nimFwDbgWpaRsnIeLen*      {.wifiCtrl, exportc: "nimfw_dbg_wparsn_len".}: uint32
+var nimFwDbgWpaRsnIePtr*      {.wifiCtrl, exportc: "nimfw_dbg_wparsn_ptr".}: uint32
+var nimFwDbgVifSecType*       {.wifiCtrl, exportc: "nimfw_dbg_vif_sectype".}: uint32  # vif+497 at vif_state_cfm
+var nimFwDbgConnectIndPrePath* {.wifiCtrl, exportc: "nimfw_dbg_conn_ind_prepath".}: uint32  # path-1 (open) fired
+var nimFwDbgVifIeLenAtAssoc*  {.wifiCtrl, exportc: "nimfw_dbg_vif_ielen_assoc".}: uint32  # vif+496 at AssocReq build
+var nimFwDbgPtkInitDone*      {.wifiCtrl, exportc: "nimfw_dbg_ptk_init_done".}: uint32
+var nimFwDbgKeyDataDecryptCalls* {.wifiCtrl, exportc: "nimfw_dbg_keydata_decrypt_calls".}: uint32
+var nimFwDbgKeyDataDecryptLen* {.wifiCtrl, exportc: "nimfw_dbg_keydata_decrypt_len".}: uint32
+var nimFwDbgKeyDataDecryptOutLen* {.wifiCtrl, exportc: "nimfw_dbg_keydata_decrypt_out_len".}: uint32
+var nimFwDbgKeyDataDecryptOk* {.wifiCtrl, exportc: "nimfw_dbg_keydata_decrypt_ok".}: uint32
+var nimFwDbgKeyDataDecryptFail* {.wifiCtrl, exportc: "nimfw_dbg_keydata_decrypt_fail".}: uint32
+# Per-VIF WPA-handshake-pending tracking. Set when sm_assoc_done runs on a
+# WPA-protected VIF (sectype>=2); cleared on PTK-init-done or disconnect.
+# mm_sta_tbtt uses this to suppress the null-frame keep-alive loop while
+# waiting for WPA, and to time out the wait into a connection_loss_ind.
+var nimFwWpaPendingMask* {.wifiCtrl, exportc: "nimfw_wpa_pending_mask".}: uint32
+var nimFwDbgStaTbttSkip* {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_skip".}: uint32
+var nimFwDbgStaTbttGiveup* {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_giveup".}: uint32
+var nimFwDbgEapolIn*       {.wifiCtrl, exportc: "nimfw_dbg_eapol_in".}: uint32
+var nimFwDbgEapolDropped*  {.wifiCtrl, exportc: "nimfw_dbg_eapol_dropped".}: uint32
+var nimFwDbgEapolForwarded* {.wifiCtrl, exportc: "nimfw_dbg_eapol_fwd".}: uint32
+var nimFwDbgVifWpaState*   {.wifiCtrl, exportc: "nimfw_dbg_vif_wpastate".}: uint32
+var nimFwDbgEapolCbInv*    {.wifiCtrl, exportc: "nimfw_dbg_eapol_cb_inv".}: uint32
+var nimFwDbgEapolCbNull*   {.wifiCtrl, exportc: "nimfw_dbg_eapol_cb_null".}: uint32
+var nimFwDbgSmStateAtEapol* {.wifiCtrl, exportc: "nimfw_dbg_sm_state_eapol".}: uint32
+# Supplicant-side counters (incremented from C files in wpa_supplicant/ and wifi driver)
+var nimFwDbgSuppRxEapol*   {.wifiCtrl, exportc: "nimfw_dbg_supp_rx_eapol".}: uint32
+var nimFwDbgSuppTxEapol*   {.wifiCtrl, exportc: "nimfw_dbg_supp_tx_eapol".}: uint32
+var nimFwDbgEthTxEapol*    {.wifiCtrl, exportc: "nimfw_dbg_eth_tx_eapol".}: uint32
+var nimFwDbgBlOutputEapol* {.wifiCtrl, exportc: "nimfw_dbg_bl_output_eapol".}: uint32
+var nimFwDbgEapolTxCb*     {.wifiCtrl, exportc: "nimfw_dbg_eapol_tx_cb".}: uint32
+var nimFwDbgWpaDeauth*     {.wifiCtrl, exportc: "nimfw_dbg_wpa_deauth".}: uint32
+var nimFwDbgEthTxRet*      {.wifiCtrl, exportc: "nimfw_dbg_eth_tx_ret".}: uint32  # last return code
+var nimFwDbgBlOutputDrop*  {.wifiCtrl, exportc: "nimfw_dbg_bl_output_drop".}: uint32  # bl_output dropped (sta_id<0)
+var nimFwDbgPbufAllocFail* {.wifiCtrl, exportc: "nimfw_dbg_pbuf_alloc_fail".}: uint32
+var nimFwDbgPbufTakeFail*  {.wifiCtrl, exportc: "nimfw_dbg_pbuf_take_fail".}: uint32
+var nimFwDbgSuppTxLen*     {.wifiCtrl, exportc: "nimfw_dbg_supp_tx_len".}: uint32  # last EAPOL TX len
+var nimFwDbgTxFlushEnter*  {.wifiCtrl, exportc: "nimfw_dbg_tx_flush_enter".}: uint32
+var nimFwDbgTxPushCalls*   {.wifiCtrl, exportc: "nimfw_dbg_tx_push_calls".}: uint32
+var nimFwDbgTxNoDesc*      {.wifiCtrl, exportc: "nimfw_dbg_tx_nodesc".}: uint32
+var nimFwDbgTxNoBuf*       {.wifiCtrl, exportc: "nimfw_dbg_tx_nobuf".}: uint32
+var nimFwDbgBlTxCfm*       {.wifiCtrl, exportc: "nimfw_dbg_bl_tx_cfm".}: uint32  # bl_tx_cfm calls
+var nimFwDbgBlTxCfmCb*     {.wifiCtrl, exportc: "nimfw_dbg_bl_tx_cfm_cb".}: uint32  # bl_tx_cfm cb != nil
+var nimFwDbgBlTxCfmEapol*  {.wifiCtrl, exportc: "nimfw_dbg_bl_tx_cfm_eapol".}: uint32  # cfm for EAPOL ethertype
+var nimFwDbgWpaState*      {.wifiCtrl, exportc: "nimfw_dbg_wpa_state".}: uint32  # latest WPA_SM_STATE
+var nimFwDbgWpaTxState*    {.wifiCtrl, exportc: "nimfw_dbg_wpa_tx_state".}: uint32  # WPA state at TX time
+var nimFwDbgWpaRxState*    {.wifiCtrl, exportc: "nimfw_dbg_wpa_rx_state".}: uint32  # WPA state at RX time
+var nimFwDbgWpaPtkInstalled* {.wifiCtrl, exportc: "nimfw_dbg_wpa_ptk_installed".}: uint32
+# Crypto-derivation snapshot for offline verification.
+# Filled by C side at wpa_derive_ptk entry/exit; dumped via UART at end of test.
+var nimFwDbgCryptoCaptured*  {.wifiCtrl, exportc: "nimfw_dbg_crypto_captured".}: uint32
+var nimFwDbgCryptoPmk*       {.wifiCtrl, exportc: "nimfw_dbg_crypto_pmk".}: array[32, uint8]
+var nimFwDbgCryptoOwnAddr*   {.wifiCtrl, exportc: "nimfw_dbg_crypto_own".}: array[6, uint8]
+var nimFwDbgCryptoBssid*     {.wifiCtrl, exportc: "nimfw_dbg_crypto_bssid".}: array[6, uint8]
+var nimFwDbgCryptoSNonce*    {.wifiCtrl, exportc: "nimfw_dbg_crypto_snonce".}: array[32, uint8]
+var nimFwDbgCryptoANonce*    {.wifiCtrl, exportc: "nimfw_dbg_crypto_anonce".}: array[32, uint8]
+var nimFwDbgCryptoKck*       {.wifiCtrl, exportc: "nimfw_dbg_crypto_kck".}: array[16, uint8]
+var nimFwDbgCryptoPmkLen*    {.wifiCtrl, exportc: "nimfw_dbg_crypto_pmk_len".}: uint32
+var nimFwDbgCryptoPtkLen*    {.wifiCtrl, exportc: "nimfw_dbg_crypto_ptk_len".}: uint32
+var nimFwDbgCryptoUseSha256* {.wifiCtrl, exportc: "nimfw_dbg_crypto_sha256".}: uint32
+var nimFwDbgCryptoKeyMgmt*   {.wifiCtrl, exportc: "nimfw_dbg_crypto_keymgmt".}: uint32
+var nimFwDbgCryptoPairwise*  {.wifiCtrl, exportc: "nimfw_dbg_crypto_pairwise".}: uint32
+var nimFwDbgCryptoPrfData*   {.wifiCtrl, exportc: "nimfw_dbg_crypto_prf_data".}: array[76, uint8]
+# Self-test of SHA1/HMAC primitive: HMAC-SHA1(key="Jefe", data="what do ya want for nothing?")
+# Expected output: effcdf6ae5eb2fa2d27416d5f184df9c259a7c79 (RFC 2202 test case 2)
+var nimFwDbgSelftestHmac*    {.wifiCtrl, exportc: "nimfw_dbg_selftest_hmac".}: array[20, uint8]
+var nimFwDbgSelftestRan*     {.wifiCtrl, exportc: "nimfw_dbg_selftest_ran".}: uint32
+# Comparison: the source MAC actually placed in 802.11 frames (vif+80) vs sm->own_addr.
+var nimFwDbgVifMac*          {.wifiCtrl, exportc: "nimfw_dbg_vif_mac".}: array[6, uint8]
+var nimFwDbgMacHwLo*         {.wifiCtrl, exportc: "nimfw_dbg_mac_hw_lo".}: uint32
+var nimFwDbgMacHwHi*         {.wifiCtrl, exportc: "nimfw_dbg_mac_hw_hi".}: uint32
+# M2 EAPOL frame snapshot — Ethernet + EAPOL key bytes as sent by supplicant.
+var nimFwDbgM2Len*           {.wifiCtrl, exportc: "nimfw_dbg_m2_len".}: uint32
+var nimFwDbgM2Buf*           {.wifiCtrl, exportc: "nimfw_dbg_m2_buf".}: array[160, uint8]
+# KCK as seen at MIC computation site (wpa_eapol_key_mic).
+var nimFwDbgMicKck*          {.wifiCtrl, exportc: "nimfw_dbg_mic_kck".}: array[16, uint8]
+var nimFwDbgMicComputed*     {.wifiCtrl, exportc: "nimfw_dbg_mic_computed".}: array[16, uint8]
+var nimFwDbgMicFrameLen*     {.wifiCtrl, exportc: "nimfw_dbg_mic_frame_len".}: uint32
+var nimFwDbgMicVer*          {.wifiCtrl, exportc: "nimfw_dbg_mic_ver".}: uint32
+# SAE path tracking.
+var nimFwDbgSaeBuildMsg*     {.wifiCtrl, exportc: "nimfw_dbg_sae_build".}: uint32
+var nimFwDbgSaeParseMsg*     {.wifiCtrl, exportc: "nimfw_dbg_sae_parse".}: uint32
+var nimFwDbgSaeAuthAlgo*     {.wifiCtrl, exportc: "nimfw_dbg_sae_auth_algo".}: uint32  # auth_algo read in sm_auth_send
+var nimFwDbgScanKeyMgmt*     {.wifiCtrl, exportc: "nimfw_dbg_scan_key_mgmt".}: uint32  # lf (parsed key_mgmt LE 16-bit)
+var nimFwDbgScanAT*          {.wifiCtrl, exportc: "nimfw_dbg_scan_at".}: uint32  # computed aT
+var nimFwDbgScanSmF*         {.wifiCtrl, exportc: "nimfw_dbg_scan_smf".}: uint32  # smF flags
+var nimFwDbgScanCaps*        {.wifiCtrl, exportc: "nimfw_dbg_scan_caps".}: uint32  # lS[16] (capabilities)
+# M4 path tracking — debug why PTK never gets installed.
+var nimFwDbgM4TxState*       {.wifiCtrl, exportc: "nimfw_dbg_m4_tx_state".}: uint32  # WPA state at M4 TX
+var nimFwDbgM4CbPtr*         {.wifiCtrl, exportc: "nimfw_dbg_m4_cb_ptr".}: uint32    # custom_cfm.cb at M4 TX
+var nimFwDbgCfmCbPtrLast*    {.wifiCtrl, exportc: "nimfw_dbg_cfm_cb_ptr_last".}: uint32  # what bl_tx_cfm read
+var nimFwDbgSendCfmLastEthertype* {.wifiCtrl, exportc: "nimfw_dbg_cfm_last_ethertype".}: uint32
+var nimFwDbgSend4of4Tx*      {.wifiCtrl, exportc: "nimfw_dbg_send_4of4_tx".}: uint32  # M4 send invocations
+var nimFwDbgSend4of4Cb*      {.wifiCtrl, exportc: "nimfw_dbg_send_4of4_cb".}: uint32  # wpa_supplicant_send_4_of_4_txcallback invocations
+var nimFwDbgInstallPtk*      {.wifiCtrl, exportc: "nimfw_dbg_install_ptk".}: uint32  # wpa_supplicant_install_ptk invocations
+# Per-EAPOL bl_tx_cfm details — status (THD[16]) for last EAPOL frame.
+var nimFwDbgEapolCfmStatus*  {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_status".}: uint32
+var nimFwDbgEapolCfmCount*   {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_count".}: uint32
+var nimFwDbgEapolCfmAckOk*   {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_ack_ok".}: uint32
+var nimFwDbgEapolCfmAckFail* {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_ack_fail".}: uint32
+# Disconnect-path counters.
+var nimFwDbgDisconnectReq*   {.wifiCtrl, exportc: "nimfw_dbg_disconnect_req".}: uint32
+var nimFwDbgDisconnectReqState* {.wifiCtrl, exportc: "nimfw_dbg_disconnect_req_state".}: uint32
+var nimFwDbgDisconnectProcess* {.wifiCtrl, exportc: "nimfw_dbg_disconnect_process".}: uint32
+var nimFwDbgDisconnectInd*   {.wifiCtrl, exportc: "nimfw_dbg_disconnect_ind".}: uint32
+var nimFwDbgSmStateFinal*    {.wifiCtrl, exportc: "nimfw_dbg_sm_state_final".}: uint32
 
 const NimFwTraceEnabled =
-  defined(bl808WifiNimFw) and
-  (defined(bl808WifiNimFwTrace) or
-   defined(bl808WifiScanTrace) or
-   defined(bl808WifiVerboseConnect))
+  defined(bl808WifiNimFwTrace) or
+  defined(bl808WifiScanTrace) or
+  defined(bl808WifiVerboseConnect)
 
 when NimFwTraceEnabled:
   proc c_puts(s: cstring): cint {.importc: "puts", header: "<stdio.h>", cdecl, discardable.}
@@ -4802,7 +4746,7 @@ else:
     discard a
     discard b
 
-when defined(bl808WifiConnectTrace) and defined(bl808WifiNimFw):
+when defined(bl808WifiConnectTrace):
   proc hwValidationLogByte(b: uint8) {.importc: "hw_validation_log_byte", cdecl.}
 
   proc nimFwConnectTraceText(s: cstring) {.inline.} =
@@ -5148,6 +5092,78 @@ proc me_legacy_rate_bitfield_build*(rates: pointer, count: uint8): uint32 {.expo
 proc me_legacy_ridx_min*(bitfield: uint32): uint8 {.exportc, cdecl.}
 proc me_legacy_ridx_max*(bitfield: uint32): uint8 {.exportc, cdecl.}
 
+const
+  WifiHwPollLimit = 100_000'u32
+  WifiMachwSoftResetReg = 0x24B08050'u32
+
+var
+  nimFwDbgHwWaitTimeoutCount* {.wifiCtrl, exportc: "nimfw_dbg_hw_wait_timeout_count".}: uint32
+  nimFwDbgHwWaitLastReg* {.wifiCtrl, exportc: "nimfw_dbg_hw_wait_last_reg".}: uint32
+  nimFwDbgHwWaitLastMask* {.wifiCtrl, exportc: "nimfw_dbg_hw_wait_last_mask".}: uint32
+  nimFwDbgAssertErrCount* {.wifiCtrl, exportc: "nimfw_dbg_assert_err_count".}: uint32
+  nimFwDbgAssertErrLastLine* {.wifiCtrl, exportc: "nimfw_dbg_assert_err_last_line".}: uint32
+  nimFwDbgAssertErrLastFile* {.wifiCtrl, exportc: "nimfw_dbg_assert_err_last_file".}: uint32
+
+proc noteHwWaitTimeout(reg, mask: uint32) {.inline.} =
+  inc nimFwDbgHwWaitTimeoutCount
+  nimFwDbgHwWaitLastReg = reg
+  nimFwDbgHwWaitLastMask = mask
+
+proc noteAssertErr(file: cstring, line: cint) {.inline.} =
+  inc nimFwDbgAssertErrCount
+  nimFwDbgAssertErrLastLine = cast[uint32](line)
+  nimFwDbgAssertErrLastFile = cast[uint32](cast[uint](file))
+
+proc waitRegMaskClear(reg: uint, mask: uint32,
+                      limit: uint32 = WifiHwPollLimit): bool =
+  var remaining = limit
+  while (volatileLoad(cast[ptr uint32](reg)) and mask) != 0:
+    if remaining == 0:
+      noteHwWaitTimeout(reg.uint32, mask)
+      return false
+    dec remaining
+  true
+
+proc waitRegMaskSet(reg: uint, mask: uint32,
+                    limit: uint32 = WifiHwPollLimit): bool =
+  var remaining = limit
+  while (volatileLoad(cast[ptr uint32](reg)) and mask) == 0:
+    if remaining == 0:
+      noteHwWaitTimeout(reg.uint32, mask)
+      return false
+    dec remaining
+  true
+
+proc waitRegLowNibbleClear(reg: uint,
+                           limit: uint32 = WifiHwPollLimit): bool =
+  var remaining = limit
+  while (regRead(reg) and 0x0F'u32) != 0:
+    if remaining == 0:
+      noteHwWaitTimeout(reg.uint32, 0x0F'u32)
+      return false
+    dec remaining
+  true
+
+proc waitRegLowNibbleEquals(reg: uint, value: uint32,
+                            limit: uint32 = WifiHwPollLimit): bool =
+  let expected = value and 0x0F'u32
+  var remaining = limit
+  while (regRead(reg) and 0x0F'u32) != expected:
+    if remaining == 0:
+      noteHwWaitTimeout(reg.uint32, 0x0F'u32 or (expected shl 8))
+      return false
+    dec remaining
+  true
+
+proc waitMacSoftResetClear(limit: uint32 = WifiHwPollLimit): bool =
+  var remaining = limit
+  while blmac_soft_reset_getf() != 0:
+    if remaining == 0:
+      noteHwWaitTimeout(WifiMachwSoftResetReg, 0xFF'u32)
+      return false
+    dec remaining
+  true
+
 proc dsParamFreq(band: uint8, ds: ptr DsParamSetIeView): uint16 {.inline.} =
   phy_channel_to_freq(band, ds.currentChannel)
 proc me_bw_check*(param: pointer) {.exportc, cdecl.}
@@ -5307,6 +5323,61 @@ proc rcSetRateConfig(stats: pointer, idx: int, val: uint16) {.inline.} =
   ## Write rate_config to entry i.
   rcU16(stats, idx * RC_RATE_ENTRY_SIZE + 10) = val
 
+const RcRandomRateAttemptLimit = 64
+
+proc rc_pick_non_duplicate_rate(stats: pointer): uint16 =
+  ## Pick a non-duplicate sample rate with a deterministic fallback.
+  ## rc_new_random_rate can keep returning existing entries, so production
+  ## firmware must not rely on RNG convergence for scheduler progress.
+  var randomRate: uint16 = 0xFFFF'u16
+  var tries = 0
+  while tries < RcRandomRateAttemptLimit:
+    randomRate = rc_new_random_rate(stats)
+    if rc_check_rate_duplicated(stats, randomRate) == 0:
+      return randomRate
+    inc tries
+
+  let fmtForFill = rcU8(stats, RCS_FORMAT_MOD)
+  if fmtForFill <= 1:
+    let rateMap = rcU16(stats, RCS_RATE_MAP)
+    let lo = rcU8(stats, RCS_LOWEST_IDX)
+    let hi = rcU8(stats, RCS_HIGHEST_IDX)
+    let bw = rcU8(stats, RCS_BW_MAX).uint16 shl 10
+    var idx = lo
+    while idx <= hi:
+      if ((rateMap shr idx) and 1'u16) != 0:
+        var candidate = (fmtForFill.uint16 shl 11) or idx.uint16
+        if idx == 0:
+          candidate = candidate or 0x400'u16
+        elif idx - 1 <= 2:
+          candidate = candidate or bw
+        if rc_check_rate_duplicated(stats, candidate) == 0:
+          return candidate
+      if idx == 0xFF'u8:
+        break
+      inc idx
+  else:
+    let groupCnt = rcU8(stats, RCS_GROUP_CNT)
+    let maxMcs = rcU8(stats, RCS_MAX_NSS_MCS)
+    let sgi = rcU8(stats, RCS_SHORT_GI)
+    var group: uint8 = 0
+    while group <= groupCnt:
+      let bitmap = rcU8(stats, RCS_RATE_BITMAP + group.int)
+      var mcs: uint8 = 0
+      while mcs <= maxMcs and mcs < 8:
+        if ((bitmap shr mcs) and 1'u8) != 0:
+          var candidate = (fmtForFill.uint16 shl 11) or
+                          (group.uint16 shl 3) or mcs.uint16
+          if sgi != 0:
+            candidate = candidate or 0x200'u16
+          if rc_check_rate_duplicated(stats, candidate) == 0:
+            return candidate
+        inc mcs
+      if group == 0xFF'u8:
+        break
+      inc group
+  0xFFFF'u16
+
 proc rcRateEntryTp(stats: pointer, idx: int): uint16 {.inline.} =
   ## Read throughput estimate from entry i (at entry base + 8).
   rcU16(stats, idx * RC_RATE_ENTRY_SIZE + 8)
@@ -5416,9 +5487,8 @@ proc co_list_extract*(list: ptr CoList, elem: ptr CoListHdr) {.exportc, cdecl.} 
   if cur == elem:
     list.first = elem.next
     return
-  while true:
+  while cur.next != nil:
     var nxt = cur.next
-    if nxt == nil: return
     if nxt == elem:
       if list.last == elem:
         list.last = cur
@@ -5693,9 +5763,8 @@ proc ke_evt_set*(evtBit: uint32) {.exportc, cdecl.} =
   let next = keEvtField or evtBit
   keEvtField = next
   keEnvEventField()[] = next
-  when defined(bl808WifiNimFw):
-    if (evtBit and 0x98000000'u32) != 0:
-      nimFwTrace2U32("[WIFI-NIMFW] evt_set ", evtBit, next)
+  if (evtBit and 0x98000000'u32) != 0:
+    nimFwTrace2U32("[WIFI-NIMFW] evt_set ", evtBit, next)
   irqRestore(saved)
 
 proc ke_evt_clear*(evtBit: uint32) {.exportc, cdecl, noinline.} =
@@ -5706,9 +5775,8 @@ proc ke_evt_clear*(evtBit: uint32) {.exportc, cdecl, noinline.} =
   let next = keEvtField and (not evtBit)
   keEvtField = next
   keEnvEventField()[] = next
-  when defined(bl808WifiNimFw):
-    if (evtBit and 0x98000000'u32) != 0:
-      nimFwTrace2U32("[WIFI-NIMFW] evt_clear ", evtBit, next)
+  if (evtBit and 0x98000000'u32) != 0:
+    nimFwTrace2U32("[WIFI-NIMFW] evt_clear ", evtBit, next)
   irqRestore(saved)
 
 proc eventIndex32(x: uint32): uint32 {.inline.} =
@@ -5891,6 +5959,7 @@ proc ke_init*() {.exportc, cdecl.} =
   co_list_init(addr keMsgQueueSent)
   co_list_init(addr keMsgQueueSaved)
   co_list_init(addr keTimerQueue)
+  keSavedReschedTask = TASK_NONE
   ke_evt_clear(0xFFFFFFFF'u32)
 
 proc ke_flush*() {.exportc, cdecl.} =
@@ -5899,18 +5968,21 @@ proc ke_flush*() {.exportc, cdecl.} =
   ##   while (msg = co_list_pop_front(&ke_env.q_saved)) ke_msg_free(msg)
   ##   while (tmr = co_list_pop_front(&ke_env.tmr_free)) g_bl_ops_funcs.free(tmr)
   ##   ke_evt_clear(0xFFFFFFFF)  # tail call
-  while true:
+  while keMsgQueueSent.first != nil:
     let msg = co_list_pop_front(addr keMsgQueueSent)
-    if msg == nil: break
+    if msg == nil:
+      break
     ke_msg_free(msg)
-  while true:
+  while keMsgQueueSaved.first != nil:
     let msg = co_list_pop_front(addr keMsgQueueSaved)
-    if msg == nil: break
+    if msg == nil:
+      break
     ke_msg_free(msg)
   let freeFnPtr = blOpsFunc(188)
-  while true:
+  while keTimerQueue.first != nil:
     let tmr = co_list_pop_front(addr keTimerQueue)
-    if tmr == nil: break
+    if tmr == nil:
+      break
     if freeFnPtr != nil:
       cast[proc(p: pointer) {.cdecl.}](freeFnPtr)(tmr)
   ke_evt_clear(0xFFFFFFFF'u32)
@@ -5923,6 +5995,42 @@ proc cmp_dest_id(elem: ptr CoListHdr, param: pointer): bool {.exportc, cdecl.} =
   ## Compare callback for ke_queue_extract: match by destId.
   let hdr = cast[ptr KeMsgHdr](elem)
   return hdr.destId == encodedArgU8(param)
+
+proc ke_saved_queue_has_dest(taskId: uint8): bool =
+  var cur = keMsgQueueSaved.first
+  while cur != nil:
+    if cast[ptr KeMsgHdr](cur).destId == taskId:
+      return true
+    cur = cur.next
+  false
+
+proc ke_reschedule_saved_messages(taskId: uint8,
+                                  limit: uint32 = WifiSavedMsgDrainLimit): bool =
+  ## Move a bounded batch of saved messages back to the sent queue.
+  ## Returns true when more saved messages for the task remain.
+  var moved = 0'u32
+  while moved < limit:
+    let node = ke_queue_extract(addr keMsgQueueSaved, cmp_dest_id,
+                                cast[pointer](cast[uint](taskId)))
+    if node == nil:
+      if keSavedReschedTask == taskId:
+        keSavedReschedTask = TASK_NONE
+      return false
+    let saved = irqSave()
+    co_list_push_back(addr keMsgQueueSent, node)
+    irqRestore(saved)
+    ke_evt_set(KE_EVT_KE_MESSAGE)
+    inc moved
+
+  let more = ke_saved_queue_has_dest(taskId)
+  if more:
+    keSavedReschedTask = taskId
+    inc nimFwDbgSavedMsgYield
+    nimFwDbgSavedMsgYieldTask = taskId.uint32
+    ke_evt_set(KE_EVT_KE_MESSAGE)
+  elif keSavedReschedTask == taskId:
+    keSavedReschedTask = TASK_NONE
+  more
 
 proc ke_task_local*(taskId: uint8): bool {.exportc, cdecl, noinline.} =
   ## Return true if taskId is a local embedded task (< TASK_API).
@@ -5956,17 +6064,7 @@ proc ke_state_set*(taskId: uint8, state: uint16) {.exportc, cdecl.} =
   # Early-out if state unchanged
   if sp[] == state: return
   sp[] = state
-  # Re-schedule saved messages for this task.
-  # Uses ke_queue_extract with cmp_dest_id to find matching messages one at a time.
-  while true:
-    let node = ke_queue_extract(addr keMsgQueueSaved, cmp_dest_id,
-                                cast[pointer](cast[uint](taskId)))
-    if node == nil: break
-    # Push to sent queue (interrupt-protected) and set message event
-    let saved = irqSave()
-    co_list_push_back(addr keMsgQueueSent, node)
-    irqRestore(saved)
-    ke_evt_set(KE_EVT_KE_MESSAGE)
+  discard ke_reschedule_saved_messages(taskId)
 
 proc ke_state_get*(taskId: uint8): uint16 {.exportc, cdecl.} =
   ## Get the current state of a task.
@@ -6009,6 +6107,9 @@ proc ke_task_schedule*() {.exportc, cdecl.} =
   ##   2. If not found, try default handler table → ke_handler_search
   ##   3. Call handler with (msgId, param, srcId, destId)
   ##   4. Handle return: 0=consumed(free), 1=no_free(cleanup), 2=saved
+  if keMsgQueueSent.first == nil and keSavedReschedTask != TASK_NONE:
+    discard ke_reschedule_saved_messages(keSavedReschedTask)
+
   let saved = irqSave()
   let node = co_list_pop_front(addr keMsgQueueSent)
   irqRestore(saved)
@@ -6073,12 +6174,11 @@ proc ke_task_schedule*() {.exportc, cdecl.} =
     nimFwTrace("[WIFI-NIMFW] task_sched call")
     let rawRes = handler(param)
     let res = if rawRes >= 0 and rawRes <= 2: rawRes else: 0
-    when defined(bl808WifiNimFw):
-      if rawRes != res:
-        nimFwTrace2U32("[WIFI-NIMFW] task_sched res norm ",
-                       rawRes.uint32, res.uint32)
-      else:
-        nimFwTraceU32("[WIFI-NIMFW] task_sched res=", res.uint32)
+    if rawRes != res:
+      nimFwTrace2U32("[WIFI-NIMFW] task_sched res norm ",
+                     rawRes.uint32, res.uint32)
+    else:
+      nimFwTraceU32("[WIFI-NIMFW] task_sched res=", res.uint32)
     case res
     of 0:
       ke_msg_free(node)           # KE_MSG_CONSUMED; blob frees the header
@@ -6092,7 +6192,10 @@ proc ke_task_schedule*() {.exportc, cdecl.} =
   # Common tail: one IRQ-safe queue-empty check + ke_evt_clear
   let sTail = irqSave()
   if keMsgQueueSent.first == nil:
-    ke_evt_clear(KE_EVT_KE_MESSAGE)
+    if keSavedReschedTask != TASK_NONE:
+      ke_evt_set(KE_EVT_KE_MESSAGE)
+    else:
+      ke_evt_clear(KE_EVT_KE_MESSAGE)
   irqRestore(sTail)
 
 proc ke_task_sm_activating*(): bool {.exportc, cdecl.} =
@@ -6227,12 +6330,17 @@ proc ke_timer_clear*(taskId: uint16, instId: uint8) {.exportc, cdecl.} =
     if node != nil:
       platformFree(cast[pointer](node))
 
+proc keTimerExpired(entry: ptr KeTimerEntry): bool {.inline.} =
+  entry != nil and cast[int32](entry.time - macTimeNow() - 50) < 0
+
 proc ke_timer_schedule*() {.exportc, cdecl.} =
   ## Process expired timers.
   ## From blob: loops clearing event, checking first timer. If expired,
   ## pops and sends ke_msg_send_basic. If not expired, programs HW timer
   ## and re-checks (races with HW). If queue empty, disables HW timer.
-  while true:
+  var drained = 0'u32
+
+  while drained < WifiTimerDrainLimit:
     ke_evt_clear(KE_EVT_KE_TIMER)
     let node = cast[ptr KeTimerEntry](keTimerQueue.first)
     if node == nil:
@@ -6250,12 +6358,24 @@ proc ke_timer_schedule*() {.exportc, cdecl.} =
       if diff2 >= 0:
         return  # Still not expired, done
       # Fell through: expired during HW setup, continue loop to process it
+
+    # Timer expired: pop, send message, free
+    let popped = co_list_pop_front(addr keTimerQueue)
+    let entry = cast[ptr KeTimerEntry](popped)
+    ke_msg_send_basic(entry.id, entry.taskId, 0xFF)
+    platformFree(cast[pointer](entry))
+    inc drained
+
+  let next = cast[ptr KeTimerEntry](keTimerQueue.first)
+  if next != nil:
+    nimFwDbgKeTimerYieldHead = next.time
+    if keTimerExpired(next):
+      inc nimFwDbgKeTimerYield
+      ke_evt_set(KE_EVT_KE_TIMER)
     else:
-      # Timer expired: pop, send message, free
-      let popped = co_list_pop_front(addr keTimerQueue)
-      let entry = cast[ptr KeTimerEntry](popped)
-      ke_msg_send_basic(entry.id, entry.taskId, 0xFF)
-      platformFree(cast[pointer](entry))
+      ke_timer_hw_set(next)
+  else:
+    ke_timer_hw_set(nil)
 
 proc ke_timer_active*(taskId: uint16, instId: uint8): bool {.exportc, cdecl.} =
   ## Check if a timer is active.
@@ -6385,8 +6505,7 @@ proc hal_machw_init*() {.exportc, cdecl.} =
   # -----------------------------------------------------------------------
   regWrite(MACHW_INTC_SOFT_RESET, 1'u32)
   # Poll blmac_soft_reset_getf() until low byte reads 0
-  while blmac_soft_reset_getf() != 0:
-    discard
+  discard waitMacSoftResetClear()
 
   # -----------------------------------------------------------------------
   # Block 2: Configure BCN status / MAC core mode (0x1c - 0x5c)
@@ -6688,8 +6807,7 @@ proc hal_machw_reset*() {.exportc, cdecl.} =
   regWrite(MACHW_DOZE_CNTRL2_REG, 0x7C'u32)
 
   # Poll STATE_CNTRL until lower 4 bits == 0 (state machine fully idle)
-  while (regRead(MACHW_STATE_CNTRL_REG) and 0xF'u32) != 0:
-    discard
+  discard waitRegLowNibbleClear(MACHW_STATE_CNTRL_REG)
 
   # Clear "idle request pending" flag (bit 2) in halMachwStatusFlags
   halMachwStatusFlags = halMachwStatusFlags and not 0x04'u32
@@ -6738,8 +6856,7 @@ proc hal_machw_stop*() {.exportc, cdecl.} =
   regWrite(MACHW_INTC_SOFT_RESET, 1)
 
   # Poll until soft reset completes via blmac_soft_reset_getf (blob: call in loop)
-  while blmac_soft_reset_getf() != 0:
-    discard
+  discard waitMacSoftResetClear()
 
 proc hal_machw_idle_req*() {.exportc, cdecl.} =
   ## Request MAC HW transition to IDLE state.
@@ -6816,16 +6933,14 @@ proc hal_machw_search_addr*(addr_ptr: pointer, idx: uint32): uint32 {.exportc, c
   regWrite(MACHW_BASE + 0x0C0'u, addrView.highLe)
   # Trigger search
   regWrite(MACHW_BASE + 0x0C4'u, 0x20000000'u32)
-  # Poll until search complete (bit 29 clears)
-  while true:
-    let status = regRead(MACHW_BASE + 0x0C4'u)
-    if (status and 0x20000000'u32) == 0:
-      # Vendor treats bit 28 as "not found"; the found entry is encoded as
-      # the HW address slot in bits [23:16], biased by +8 for STA slots.
-      if (status and 0x10000000'u32) != 0:
-        return 0xFF'u32  # Not found
-      else:
-        return ((status shr 16) - 8'u32) and 0xFF'u32
+  if not waitRegMaskClear(MACHW_BASE + 0x0C4'u, 0x20000000'u32):
+    return 0xFF'u32
+  let status = regRead(MACHW_BASE + 0x0C4'u)
+  # Vendor treats bit 28 as "not found"; the found entry is encoded as
+  # the HW address slot in bits [23:16], biased by +8 for STA slots.
+  if (status and 0x10000000'u32) != 0:
+    return 0xFF'u32
+  ((status shr 16) - 8'u32) and 0xFF'u32
 
 proc hal_machw_monitor_mode*(enable: bool) {.exportc, cdecl.} =
   ## Enable monitor mode in MAC HW.
@@ -6926,12 +7041,11 @@ proc hal_machw_gen_handler*() {.exportc, cdecl.} =
   let unmask = regRead(MACHW_INTC_UNMASK_REG)
   let status = unmask and rawStatus
   regWrite(MACHW_INTC_STATUS_ACK, status)
-  when defined(bl808WifiNimFw):
-    if status != 0'u32 and (status and 0x0F3FFB8C'u32) != 0'u32:
-      nimFwTrace2U32("[WIFI-NIMFW] machw_status ", rawStatus, unmask)
-      nimFwTrace2U32("[WIFI-NIMFW] machw_status2 ",
-                     status,
-                     regRead(MACHW_INTC_GEN_RAW))
+  if status != 0'u32 and (status and 0x0F3FFB8C'u32) != 0'u32:
+    nimFwTrace2U32("[WIFI-NIMFW] machw_status ", rawStatus, unmask)
+    nimFwTrace2U32("[WIFI-NIMFW] machw_status2 ",
+                   status,
+                   regRead(MACHW_INTC_GEN_RAW))
 
   # Step 2: Primary TBTT (bits 0 + 18 = 0x40001)
   if (status and 0x00040001'u32) != 0:
@@ -7208,8 +7322,8 @@ proc hal_machw_rx_duration*(rxvec: pointer, band: uint32): uint32 {.exportc, cde
   # Trigger computation: write 0x80000000 to MACHW_INTC offset 0x168
   regWrite(MACHW_INTC_BASE + 0x168'u, 0x80000000'u32)
   # Poll until bit 18 (0x40000) is set in offset 0x168
-  while (regRead(MACHW_INTC_BASE + 0x168'u) and 0x40000'u32) == 0:
-    discard
+  if not waitRegMaskSet(MACHW_INTC_BASE + 0x168'u, 0x40000'u32):
+    return 500
   # Check result: if lower 26 bits of offset 0x168 are 0, return 500
   let result_reg = regRead(MACHW_INTC_BASE + 0x168'u)
   let durBits = result_reg and 0x03FFFFFF'u32
@@ -7488,8 +7602,7 @@ proc mm_cfg_element_keepalive_timestamp_update*() {.exportc, cdecl.} =
 proc mm_send_connection_loss_ind*(vifIdx: uint8, reason: uint16) {.exportc, cdecl, noinline.} =
   ## Send connection loss indication to host.
   ## noinline: blob keeps this as a standalone helper (called from multiple sites).
-  when defined(bl808WifiNimFw):
-    inc nimFwDbgConnLossInd
+  inc nimFwDbgConnLossInd
   {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
   let ind = cast[ptr MmConnectionLossIndPayload](
     ke_msg_alloc(MM_CONNECTION_LOSS_IND, TASK_API, TASK_MM,
@@ -7525,10 +7638,9 @@ proc mm_set_wpa_rsn_ie*(vifIdx: uint8, ie: pointer, ieLen: uint8) {.exportc, cde
   ## "ie ptr" and vifIdx came from casting the IE pointer. Result: AssocReq
   ## never carried the RSN IE → Frog accepted us as open assoc → no WPA handshake
   ## → mm_sta_tbtt fired forever → null-frame flood.
-  when defined(bl808WifiNimFw):
-    inc nimFwDbgWpaRsnIeSet
-    nimFwDbgWpaRsnIeLen = ieLen.uint32
-    nimFwDbgWpaRsnIePtr = cast[uint32](ie)
+  inc nimFwDbgWpaRsnIeSet
+  nimFwDbgWpaRsnIeLen = ieLen.uint32
+  nimFwDbgWpaRsnIePtr = cast[uint32](ie)
   let vifTab = cast[uint](addr vif_info_tab[0])
   let vifEntry = vifTab + vifIdx.uint * VIF_ENTRY_SIZE.uint
   let sec = vifSecurityAt(vifEntry)
@@ -7570,7 +7682,7 @@ proc mm_hw_idle_evt*() {.exportc, cdecl.} =
   ##   ke_evt_clear(0x04000000)
   ##   ke_state_set(TASK_MM=0, 0)    # tail call
   ke_evt_clear(KE_EVT_IDLE)
-  ke_state_set(0'u8, 0'u16)
+  ke_state_set(TASK_MM, MM_IDLE.uint16)
 
 proc mm_hw_info_set*(macAddr: pointer) {.exportc, cdecl.} =
   ## Set HW info for a VIF (42 instrs).
@@ -8433,8 +8545,7 @@ proc mm_sec_machwaddr_wr*(vifIdx: uint8, addr_ptr: pointer, idx: uint8): uint8 {
   volatileStore(cast[ptr uint32](KEY_CTRL), ctrlWord)
 
   # Poll until bit 30 (0x40000000) clears
-  while (volatileLoad(cast[ptr uint32](KEY_CTRL)) and 0x40000000'u32) != 0:
-    discard
+  discard waitRegMaskClear(KEY_CTRL, 0x40000000'u32)
   return hwStaIdx.uint8
 
 proc mm_sec_machwaddr_del*(idx: uint8) {.exportc, cdecl.} =
@@ -8469,8 +8580,7 @@ proc mm_sec_machwaddr_del*(idx: uint8) {.exportc, cdecl.} =
   volatileStore(cast[ptr uint32](KEY_CTRL), ctrlWord)
 
   # Poll until bit 30 (0x40000000) clears
-  while (volatileLoad(cast[ptr uint32](KEY_CTRL)) and 0x40000000'u32) != 0:
-    discard
+  discard waitRegMaskClear(KEY_CTRL, 0x40000000'u32)
 
 proc mm_sec_macrx_ind*(staIdx: uint8, payload: pointer, length: uint16) {.exportc, cdecl.} =
   ## Forward EAPOL/security frame to host via IPC. Uses platform alloc/free
@@ -8588,8 +8698,7 @@ proc mm_sec_machwkey_wr*(param: pointer) {.exportc, cdecl.} =
     volatileStore(cast[ptr uint32](KEY_CTRL), ctrlWord)
 
     # Poll until bit 30 (trigger) clears
-    while (volatileLoad(cast[ptr uint32](KEY_CTRL)) and 0x40000000'u32) != 0:
-      discard
+    discard waitRegMaskClear(KEY_CTRL, 0x40000000'u32)
 
     # Register key in upper-MAC STA table (blob pairwise path: sta_mgmt_add_key
     # only; vif_mgmt_add_key is reserved for the default-key branches above).
@@ -8657,16 +8766,14 @@ proc mm_sec_machwkey_del*(keyIdx: uint8) {.exportc, cdecl.} =
   volatileStore(cast[ptr uint32](MACHW + 0x0B0'u), 0)
   volatileStore(cast[ptr uint32](MACHW + 0x0B4'u), 0)
   volatileStore(cast[ptr uint32](MACHW + 0x0B8'u), 0)
-  while (volatileLoad(cast[ptr uint32](KEY_CTRL)) and 0x40000000'u32) != 0:
-    discard
+  discard waitRegMaskClear(KEY_CTRL, 0x40000000'u32)
 
   # Write control word with key index and trigger delete (bit 30)
   let ctrlWord = (keyIdx.uint32 shl 16) or 0x40000000'u32
   volatileStore(cast[ptr uint32](KEY_CTRL), ctrlWord)
 
   # Poll until trigger bit clears
-  while (volatileLoad(cast[ptr uint32](KEY_CTRL)) and 0x40000000'u32) != 0:
-    discard
+  discard waitRegMaskClear(KEY_CTRL, 0x40000000'u32)
 
 proc mm_sec_machwkey_get*(keyIdx: uint8, outBuf: pointer, keySizeOut: pointer): pointer {.exportc, cdecl, discardable.} =
   ## Get key material from MAC HW key table (48 instructions in blob).
@@ -8691,8 +8798,7 @@ proc mm_sec_machwkey_get*(keyIdx: uint8, outBuf: pointer, keySizeOut: pointer): 
   volatileStore(cast[ptr uint32](KEY_CTRL), readCmd)
 
   # Poll until bit 31 clears
-  while (volatileLoad(cast[ptr uint32](KEY_CTRL)) and 0x80000000'u32) != 0:
-    discard
+  discard waitRegMaskClear(KEY_CTRL, 0x80000000'u32)
 
   # Check bit 0 of control to determine key size (16 or 8 bytes)
   let ctrlVal = volatileLoad(cast[ptr uint32](KEY_CTRL))
@@ -8757,8 +8863,7 @@ proc mm_sec_keydump*() {.exportc, cdecl.} =
   while idx <= keyCount:
     volatileStore(cast[ptr uint32](SEC_KEY_CTRL),
                   (idx.uint32 shl 16) or READ_TRIGGER)
-    while (volatileLoad(cast[ptr uint32](SEC_KEY_CTRL)) and READ_TRIGGER) != 0:
-      discard
+    discard waitRegMaskClear(SEC_KEY_CTRL.uint, READ_TRIGGER)
 
     let kdLo = volatileLoad(cast[ptr uint32](SEC_KEY_DATA_LO))
     let kdHi = volatileLoad(cast[ptr uint32](SEC_KEY_DATA_HI))
@@ -8982,10 +9087,7 @@ proc mm_bcn_transmitted*(vifEntry: pointer) {.exportc, cdecl.} =
     discard mm_bcn_update(env.templatePtr)
   # Process TIM update queue at bcnEnvBase+12 (CoList)
   let timQueue = addr env.timQueue
-  while true:
-    let node = timQueue.first
-    if node == nil:
-      break
+  while timQueue.first != nil:
     let popped = co_list_pop_front(timQueue)
     if popped == nil:
       break
@@ -9383,13 +9485,19 @@ proc mm_timer_clear*(timer: pointer) {.exportc, cdecl.} =
     # Timer is not head: just extract
     co_list_extract(addr mm_timer_list, timerHdr)
 
+proc mmTimerExpired(node: ptr CoListHdr): bool {.inline.} =
+  node != nil and
+    cast[int32](mmTimerAt(node).expiry - regRead(MACHW_TIMLO_REG)) - 50 < 0
+
 proc mm_timer_schedule*() {.exportc, cdecl.} =
   ## Schedule MM timers -- process all expired timers.
   ## From blob (64 instrs): loop: clear pending timer event. Load list head.
   ## If null, disable abs timer and return. Check head.time vs MAC HW time;
   ## if not expired (diff >= -50), program abs timer and return.
   ## If expired, pop head, call callback(env), repeat.
-  while true:
+  var drained = 0'u32
+
+  while drained < WifiTimerDrainLimit:
     # Clear pending MM timer event at start of each iteration
     # (blob: lui a0, 0x40000 -> call function; this acknowledges/clears the
     #  timer interrupt so we can re-arm it)
@@ -9430,6 +9538,19 @@ proc mm_timer_schedule*() {.exportc, cdecl.} =
     # Call callback(env) -- blob reloads and calls unconditionally after assert
     let cbFn = cast[proc(env: pointer) {.cdecl.}](cb)
     cbFn(env)
+    inc drained
+
+  let next = mm_timer_list.first
+  if next != nil:
+    let nextTimer = mmTimerAt(next)
+    nimFwDbgMmTimerYieldHead = nextTimer.expiry
+    if mmTimerExpired(next):
+      inc nimFwDbgMmTimerYield
+      ke_evt_set(KE_EVT_MM_TIMER)
+    else:
+      mm_timer_hw_set(cast[pointer](next))
+  else:
+    mm_timer_hw_set(nil)
 
 # ###########################################################################
 #                     CHANNEL MANAGEMENT (chan_*)
@@ -10849,7 +10970,7 @@ proc scan_init*() {.exportc, cdecl.} =
   scan_env.passiveDuration = 0x35B60'u32
   scan_env.joinActiveDuration = 0x35B60'u32
   nimFwTrace("[WIFI-NIMFW] scan_init durations set")
-  ke_state_set(TASK_SCAN, 0)
+  ke_state_set(TASK_SCAN, ScanIdleState)
   nimFwTrace("[WIFI-NIMFW] scan_init state set")
   scan_probe_req_ie.magic = 0xCAFEFADE'u32
   scan_probe_req_ie.reserved0 = 0
@@ -10912,8 +11033,8 @@ proc scan_set_channel_request*(param: pointer) {.exportc, cdecl.} =
     dsParamSetIeAt(chanInfoPtr).currentChannel = txPowerIdx
   # Blob: call chan_scan_req to submit channel change to HW
   chan_scan_req(addr chanCfg)
-  # Transition scan task to state 2 (scanning)
-  ke_state_set(TASK_SCAN, 2)
+  # Transition scan task to the channel-request pending state.
+  ke_state_set(TASK_SCAN, ScanChannelPendingState)
 
 proc scan_terminate_channel_request*() {.exportc, cdecl.} =
   ## Terminate the current channel scan request (15 instrs in blob).
@@ -11073,7 +11194,7 @@ proc scan_get_chan*(idx: uint32): pointer {.exportc, cdecl.} =
 
 proc scanu_init*() {.exportc, cdecl.} =
   ## Initialize upper MAC scan module.
-  ke_state_set(TASK_SCANU, 0)
+  ke_state_set(TASK_SCANU, ScanuIdleState)
   discard c_memset(cast[pointer](addr scanu_env), 0, sizeof(ScanuEnvObj).csize_t)
   scanu_env.probeIeCopyDst = addr scanuAddIeView().ieData[0]
   scanuJoinHandler = cast[pointer](scanu_frame_handler)
@@ -11109,7 +11230,7 @@ proc scanu_confirm*(status: uint8) {.exportc, cdecl.} =
   if apiJoinCfm != nil:
     statusCfmView(apiJoinCfm).status = status
     ke_msg_send(apiJoinCfm)
-  ke_state_set(TASK_SCANU, 0)
+  ke_state_set(TASK_SCANU, ScanuIdleState)
 
 type ProbeIeWriter = object
   len*: uint16
@@ -11271,7 +11392,7 @@ proc scanu_start*(param: pointer) {.exportc, cdecl.} =
   let joinFlag = scanu_env.bssidFilterEnabled
   if joinFlag == 0:
     resetUndirectedScanuStart()
-  ke_state_set(TASK_SCANU, 1)
+  ke_state_set(TASK_SCANU, ScanuScanningState)
   # Blob 0x4c..0x74: if scanParam[300] != 0 (probe data ptr) AND
   # scanParam[304]..[305] (halfword probe length) <= 200, copy the probe
   # data into scanu_env[224] via memcpy, then tail-call scanu_scan_next.
@@ -11737,10 +11858,9 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
               discard c_memcpy(addr assocSecIeStore[slot][0], srcSecIe, copyLen.csize_t)
               sec.rsnIePtr = cast[uint32](addr assocSecIeStore[slot][0])
               sec.rsnIeLen = copyLen.uint8
-              when defined(bl808WifiNimFw):
-                nimFwTrace2U32("[WIFI-NIMFW] scan_sec_ie ",
-                               stF.uint32 or (copyLen.uint32 shl 8),
-                               cast[ptr uint32](srcSecIe)[])
+              nimFwTrace2U32("[WIFI-NIMFW] scan_sec_ie ",
+                             stF.uint32 or (copyLen.uint32 shl 8),
+                             cast[ptr uint32](srcSecIe)[])
             var notify {.noinit.}: WpaScanSecurityNotifyView
             discard c_memset(addr notify, 0, sizeof(WpaScanSecurityNotifyView).csize_t)
             notify.vifIdx = vifView.vifIdx
@@ -11838,12 +11958,11 @@ proc scanu_search_by_ssid*(ssid: pointer, entryIndexOut: pointer): pointer {.exp
   let ssidSlot = lengthPrefixedSsidView(ssid)
   # Read the SSID: first byte is length
   let searchLen = ssidSlot.length
-  when defined(bl808WifiNimFw):
-    let searchWord = ssidSlot.data[0].uint32 or
-      (ssidSlot.data[1].uint32 shl 8) or
-      (ssidSlot.data[2].uint32 shl 16) or
-      (ssidSlot.data[3].uint32 shl 24)
-    nimFwTrace2U32("[WIFI-NIMFW] ssid_s ", searchLen.uint32, searchWord)
+  let searchWord = ssidSlot.data[0].uint32 or
+    (ssidSlot.data[1].uint32 shl 8) or
+    (ssidSlot.data[2].uint32 shl 16) or
+    (ssidSlot.data[3].uint32 shl 24)
+  nimFwTrace2U32("[WIFI-NIMFW] ssid_s ", searchLen.uint32, searchWord)
   if searchLen == 0:
     return nil
   # Build search key (ssid+1 is the actual SSID data, length = searchLen)
@@ -11856,10 +11975,9 @@ proc scanu_search_by_ssid*(ssid: pointer, entryIndexOut: pointer): pointer {.exp
   var bestRssi: int8 = -128
   for i in 0'u8 ..< SCANU_MAX_RESULT_ENTRIES.uint8:
     let entry = addr scanu_env.entries[i]
-    when defined(bl808WifiNimFw):
-      nimFwTrace2U32("[WIFI-NIMFW] ssid_i ",
-                     i.uint32 or (entry.valid.uint32 shl 8),
-                     cast[uint32](entry.rawMsgPtr))
+    nimFwTrace2U32("[WIFI-NIMFW] ssid_i ",
+                   i.uint32 or (entry.valid.uint32 shl 8),
+                   cast[uint32](entry.rawMsgPtr))
     if entry.valid == 0:
       continue
     # If filter active, check channel info pattern
@@ -11876,8 +11994,7 @@ proc scanu_search_by_ssid*(ssid: pointer, entryIndexOut: pointer): pointer {.exp
     # Blob: reads entry.rawMsgPtr, finds SSID IE (id=0), compares length+data.
     let rawMsgPtr = entry.rawMsgPtr
     if rawMsgPtr == nil:
-      when defined(bl808WifiNimFw):
-        nimFwTrace2U32("[WIFI-NIMFW] ssid_raw0 ", i.uint32, cast[uint32](entry))
+      nimFwTrace2U32("[WIFI-NIMFW] ssid_raw0 ", i.uint32, cast[uint32](entry))
       continue
     # Find SSID IE in the cached RXU_MGT_IND payload. The RXU header is 32
     # bytes, followed by the MAC header (24) and beacon fixed fields (12).
@@ -11890,14 +12007,13 @@ proc scanu_search_by_ssid*(ssid: pointer, entryIndexOut: pointer): pointer {.exp
       continue
     let entrySsid = ssidIeAt(ssidIe)
     let entrySsidLen = entrySsid.ie.len
-    when defined(bl808WifiNimFw):
-      let entryWord = entrySsid.data[0].uint32 or
-        (entrySsid.data[1].uint32 shl 8) or
-        (entrySsid.data[2].uint32 shl 16) or
-        (entrySsid.data[3].uint32 shl 24)
-      let entryMeta = i.uint32 or (entry.valid.uint32 shl 8) or
-        (entrySsidLen.uint32 shl 16) or (rssi.uint8.uint32 shl 24)
-      nimFwTrace2U32("[WIFI-NIMFW] ssid_e ", entryMeta, entryWord)
+    let entryWord = entrySsid.data[0].uint32 or
+      (entrySsid.data[1].uint32 shl 8) or
+      (entrySsid.data[2].uint32 shl 16) or
+      (entrySsid.data[3].uint32 shl 24)
+    let entryMeta = i.uint32 or (entry.valid.uint32 shl 8) or
+      (entrySsidLen.uint32 shl 16) or (rssi.uint8.uint32 shl 24)
+    nimFwTrace2U32("[WIFI-NIMFW] ssid_e ", entryMeta, entryWord)
     if entrySsidLen != searchLen:
       continue
     if searchLen > 0:
@@ -11905,11 +12021,9 @@ proc scanu_search_by_ssid*(ssid: pointer, entryIndexOut: pointer): pointer {.exp
                                addr entrySsid.data[0],
                                searchLen.csize_t)
       if cmpResult != 0:
-        when defined(bl808WifiNimFw):
-          nimFwTrace2U32("[WIFI-NIMFW] ssid_cmp ", i.uint32, cast[uint32](cmpResult))
+        nimFwTrace2U32("[WIFI-NIMFW] ssid_cmp ", i.uint32, cast[uint32](cmpResult))
         continue
-    when defined(bl808WifiNimFw):
-      nimFwTrace2U32("[WIFI-NIMFW] ssid_hit ", i.uint32, rssi.uint8.uint32)
+    nimFwTrace2U32("[WIFI-NIMFW] ssid_hit ", i.uint32, rssi.uint8.uint32)
     # Match found: log via g_bl_ops_funcs[204]
     let logFnMatch = getLogFunc(204)
     if logFnMatch != nil:
@@ -12085,7 +12199,7 @@ proc sm_init*() {.exportc, cdecl.} =
   sm.connectInfo = nil
   sm.deauthPending = 1
   sm.authRetryLimit = 4
-  ke_state_set(TASK_SM, 0)
+  ke_state_set(TASK_SM, SmIdleState)
 
 proc sm_get_bss_params*(resultOut: ptr pointer, chanPtrOut: ptr pointer): bool {.exportc, cdecl.} =
   ## Get BSS parameters from scan results.
@@ -12248,7 +12362,7 @@ proc sm_scan_bss*(bssid: pointer, ssid: pointer, chanInfo: pointer) {.exportc, c
 
   # Send the scan request and advance SM state
   ke_msg_send(msg)
-  ke_state_set(TASK_SM, 1)
+  ke_state_set(TASK_SM, SmScanningState)
 
 proc sm_join_bss*(bssid: pointer, ssid: pointer, joinInfo: pointer, flag: uint32) {.exportc, cdecl.} =
   ## Join a BSS (send join request to scan module).
@@ -12305,8 +12419,8 @@ proc sm_join_bss*(bssid: pointer, ssid: pointer, joinInfo: pointer, flag: uint32
   # Send message
   ke_msg_send(msg)
 
-  # Advance SM state: ke_state_set(TASK_SM, 2)
-  ke_state_set(TASK_SM, 2)
+  # Advance SM state to waiting-for-join.
+  ke_state_set(TASK_SM, SmWaitingState)
 
 proc sm_add_chan_ctx*(param: pointer): uint8 {.exportc, cdecl, discardable.} =
   ## Add channel context for the target BSS (27 instrs). Returns chan_ctxt_add's
@@ -12443,7 +12557,7 @@ proc sm_set_bss_param*(param: pointer) {.exportc, cdecl.} =
 
   # 8. Advance state, then dispatch the queue. The confirmation handlers
   # require state 4 before the first queued request can complete.
-  ke_state_set(TASK_SM, 4)
+  ke_state_set(TASK_SM, SmSettingBssState)
   sm_send_next_bss_param(param)
 
 proc sm_handle_connection*(vifIdxOrFlag: uint32, status: uint32,
@@ -12468,7 +12582,7 @@ proc sm_handle_connection*(vifIdxOrFlag: uint32, status: uint32,
   let staIdx = vif.staIdx
 
   # Set SM state to disconnecting (blob: ke_state_set(4, 10))
-  ke_state_set(TASK_SM, 10)
+  ke_state_set(TASK_SM, SmDisconnectingState)
 
   # Allocate TX frame (blob: txl_frame_get(0x200) = li a0,512)
   let frame = txl_frame_get(512)
@@ -12693,7 +12807,7 @@ proc sm_connect_ind*(statusCode: uint16, reasonCode: uint16) {.exportc, cdecl, n
   # Then both paths fall through to ke_msg_free + ke_msg_send + sm_delete_resources.
   # There is NO second ke_state_set at the end.
   if statusCode == 0:
-    ke_state_set(TASK_SM, 0)
+    ke_state_set(TASK_SM, SmIdleState)
   else:
     # Failure path (blob .L97 at 0x14a-0x1a0):
     #   ke_state_set(TASK_SM, 10)
@@ -12702,7 +12816,7 @@ proc sm_connect_ind*(statusCode: uint16, reasonCode: uint16) {.exportc, cdecl, n
     #       scanu_rm_exist_ssid(connInfo /*s5*/, sm_env[28] /*s6*/)
     #       sm_env[28] = -1
     # Then falls through to L98 via unconditional jump.
-    ke_state_set(TASK_SM, 10)
+    ke_state_set(TASK_SM, SmDisconnectingState)
     let bssIdx = cast[int32](sm.scanResultIndex)
     if bssIdx >= 0:
       scanu_rm_exist_ssid(connInfo, cast[uint8](bssIdx and 0xFF))
@@ -12965,8 +13079,8 @@ proc sm_auth_send*(authSeqNum: uint16, statusCode: uint32) {.exportc, cdecl.} =
   # Set auth response timeout timer (blob: ke_timer_set)
   ke_timer_set(SM_RSP_TIMEOUT_IND, TASK_SM, listenInterval)
 
-  # Set auth state (blob: ke_state_set(TASK_SM, 6))
-  ke_state_set(TASK_SM, 6)
+  # Set auth state.
+  ke_state_set(TASK_SM, SmAuthenticatingState)
 
   smConnecting = true
 
@@ -12976,7 +13090,7 @@ proc sm_auth_send_pre*(authSeqNum: uint16, statusCode: uint32 = 0) {.exportc, cd
   ## Tail-calls sm_auth_assoc_send_according_chan(nextState=5, param1=<a0 in>,
   ## param2=<a1 in>). The Nim declaration only has `param` (a0); the callee's
   ## second arg comes from a1 at the call site. Recover a1 via inline asm.
-  sm_auth_assoc_send_according_chan(5, authSeqNum, statusCode)
+  sm_auth_assoc_send_according_chan(SmAuthStartingState, authSeqNum, statusCode)
 
 proc sm_auth_start*(param: pointer) {.exportc, cdecl.} =
   ## Start authentication (24 bytes in blob, 8 instrs).
@@ -13077,23 +13191,22 @@ proc sm_assoc_req_send*(param: pointer) {.exportc, cdecl.} =
   let smEnvSecond = sm.connectIndMsg
   if smEnvSecond != nil:
     cast[ptr uint16](cast[uint](smEnvSecond) + 16)[] = assocBodyLen
-  when defined(bl808WifiNimFw):
-    nimFwTrace2U32("[WIFI-NIMFW] assoc_tx_len ", builtLen, assocBodyLen.uint32)
-    nimFwTrace2U32("[WIFI-NIMFW] assoc_tx_body ",
-                   cast[ptr uint32](assocBodyPtr)[],
-                   cast[ptr uint32](cast[uint](assocBodyPtr) + 4)[])
-    nimFwTrace2U32("[WIFI-NIMFW] assoc_tx_rates ",
-                   cast[ptr uint32](addr vif.basicRates[0])[],
-                   cast[ptr uint32](addr vif.basicRates[4])[])
-    when defined(bl808WifiConnectTrace):
-      nimFwConnectTrace2U32("[WIFI-CT] assoc_tx_len ", builtLen, assocBodyLen.uint32)
-      nimFwConnectTrace2U32("[WIFI-CT] assoc_tx_body ",
-                            cast[ptr uint32](assocBodyPtr)[],
-                            cast[ptr uint32](cast[uint](assocBodyPtr) + 4)[])
-      nimFwConnectTrace2U32("[WIFI-CT] assoc_tx_rates ",
-                            cast[ptr uint32](addr vif.basicRates[0])[],
-                            cast[ptr uint32](addr vif.basicRates[4])[])
-      nimFwConnectTraceHw("[WIFI-CT] assoc_hw ")
+  nimFwTrace2U32("[WIFI-NIMFW] assoc_tx_len ", builtLen, assocBodyLen.uint32)
+  nimFwTrace2U32("[WIFI-NIMFW] assoc_tx_body ",
+                 cast[ptr uint32](assocBodyPtr)[],
+                 cast[ptr uint32](cast[uint](assocBodyPtr) + 4)[])
+  nimFwTrace2U32("[WIFI-NIMFW] assoc_tx_rates ",
+                 cast[ptr uint32](addr vif.basicRates[0])[],
+                 cast[ptr uint32](addr vif.basicRates[4])[])
+  when defined(bl808WifiConnectTrace):
+    nimFwConnectTrace2U32("[WIFI-CT] assoc_tx_len ", builtLen, assocBodyLen.uint32)
+    nimFwConnectTrace2U32("[WIFI-CT] assoc_tx_body ",
+                          cast[ptr uint32](assocBodyPtr)[],
+                          cast[ptr uint32](cast[uint](assocBodyPtr) + 4)[])
+    nimFwConnectTrace2U32("[WIFI-CT] assoc_tx_rates ",
+                          cast[ptr uint32](addr vif.basicRates[0])[],
+                          cast[ptr uint32](addr vif.basicRates[4])[])
+    nimFwConnectTraceHw("[WIFI-CT] assoc_hw ")
 
   # Push frame to TX (blob: txl_frame_push(frame, 3))
   txl_frame_push(frame, 3)
@@ -13101,7 +13214,7 @@ proc sm_assoc_req_send*(param: pointer) {.exportc, cdecl.} =
   # Set timeout timer
   let tmo = if sm.connectFlags != 0: 0x1E000'u32 else: 0x7D000'u32
   ke_timer_set(SM_RSP_TIMEOUT_IND, TASK_SM, tmo)
-  ke_state_set(TASK_SM, 8)
+  ke_state_set(TASK_SM, SmAssocRspState)
 
 proc sm_assoc_req_send_pre*(param: pointer) {.exportc, cdecl.} =
   ## Pre-send association request.
@@ -13110,7 +13223,7 @@ proc sm_assoc_req_send_pre*(param: pointer) {.exportc, cdecl.} =
   ##   li a1, 0         ; param1 = 0
   ##   li a2, 0         ; param2 = 0
   ##   tail-call sm_auth_assoc_send_according_chan
-  sm_auth_assoc_send_according_chan(7'u16, 0'u16, 0'u32)
+  sm_auth_assoc_send_according_chan(SmAssociatingState, 0'u16, 0'u32)
 
 proc sm_assoc_done*(aid: uint16) {.exportc, cdecl.} =
   ## Handle association completion.
@@ -13470,15 +13583,15 @@ proc sm_deauth_handler*(param: pointer) {.exportc, cdecl.} =
 
   # Check SM state - first call
   let st = ke_state_get(TASK_SM)
-  if st == 10:
-    # SM in state 10 (authenticating) - return 2
+  if st == SmDisconnectingState:
+    # SM already disconnecting - return 2
     smConnecting = false  # blob: s3=2 -> return
     return
 
   # Check SM state - second call
   let st2 = ke_state_get(TASK_SM)
-  if st2 != 0:
-    # SM in active state (!= 0, != 10):
+  if st2 != SmIdleState:
+    # SM in an active state other than disconnecting:
     # Check if connect-info vifIdx matches param vifIdx
     if connInfoPtr != nil:
       let connVifIdx = connectInfoView(connInfoPtr).vifIdx
@@ -13512,8 +13625,8 @@ proc sm_deauth_handler*(param: pointer) {.exportc, cdecl.} =
     sm_issue_sa_query_request()
   else:
     # Unprotected deauth (.L217):
-    # 1. Set SM state to 10 (disconnecting)
-    ke_state_set(TASK_SM, 10)
+    # 1. Set SM state to disconnecting.
+    ke_state_set(TASK_SM, SmDisconnectingState)
     # 2. Log via g_bl_ops_funcs[1] (blob at 0x1A4-0x1B6)
     let logFn = blOpsFunc(4)
     if logFn != nil:
@@ -13611,7 +13724,7 @@ proc sm_handle_eapol_input*(staIdx: uint8, srcAddr: pointer, eapolBuf: pointer,
         inc nimFwDbgEapolCbNull
     else:
       inc nimFwDbgEapolCbNull
-  elif smState == 0:
+  elif smState == SmIdleState:
     # Idle: may need to start auth/assoc
     discard
 
@@ -13623,20 +13736,20 @@ proc sm_handle_supplicant_result*(result_code: uint8, reason: uint8) {.exportc, 
   ## If state==10 (SM_ACTIVATING), returns immediately.
   ## If reason==0: sets sta[72]=2 (failed) and tail-calls sm_connect_ind(0,0).
   ## If reason==15: calls g_bl_ops_funcs log, then falls through.
-  ## Otherwise: transitions SM state to 10, allocates TX frame via txl_frame_get(512),
+  ## Otherwise: transitions SM state to disconnecting, allocates TX frame via txl_frame_get(512),
   ## builds deauth frame with VIF info, calls me_build_deauthenticate, then
   ## txl_frame_push to transmit. On failure, calls sm_connect_ind(9/10, reason).
   let vifTab = cast[uint](addr vif_info_tab[0])
   let sta = staInfoForIdx(result_code)
 
   # Check SM task state
-  let smState = ke_state_get(4)
+  let smState = ke_state_get(TASK_SM)
   when defined(bl808WifiConnectTrace):
     nimFwConnectTrace2U32("[WIFI-CT] supp_result ",
                           result_code.uint32 or (reason.uint32 shl 8),
                           smState.uint32)
-  if smState == 10:
-    return  # Already in activating state
+  if smState == SmDisconnectingState:
+    return  # Already disconnecting
 
   if reason == 0:
     # Supplicant failed with reason=0: check if already failed
@@ -13654,8 +13767,8 @@ proc sm_handle_supplicant_result*(result_code: uint8, reason: uint8) {.exportc, 
       cast[proc(a: uint32, b: uint32, c: cstring, d: uint32) {.cdecl.}](logFn)(
         3, 0, "sm.c", 1717)
 
-  # Transition SM state to 10 (activating)
-  ke_state_set(4, 10)
+  # Transition SM state to disconnecting.
+  ke_state_set(TASK_SM, SmDisconnectingState)
 
   # Allocate TX frame for deauth (512 bytes)
   let frame = txl_frame_get(512)
@@ -13951,14 +14064,14 @@ proc sm_connect_auth_assoc_req() {.exportc, cdecl.} =
   let msgId = msg.nextState
   if msgId == 5:
     let smState = ke_state_get(TASK_SM)
-    if smState != 5:
+    if smState != SmAuthStartingState:
       return
     # Blob: lhu a0,2(s0); lw a1,4(s0); call sm_auth_send
     # a0 = payload[2] (authSeqNum), a1 = payload[4] (statusCode via hidden arg)
     sm_auth_send(msg.param1, msg.param2)
   elif msgId == 7:
     let smState = ke_state_get(TASK_SM)
-    if smState != 7:
+    if smState != SmAssociatingState:
       return
     sm_assoc_req_send(payload)
 
@@ -13977,7 +14090,7 @@ proc apm_init*() {.exportc, cdecl.} =
   discard c_memset(apm, 0, sizeof(ApmEnvView).csize_t)  # clear full 176-byte env
   apm.maxSta = 4
   apm.staCount = 0
-  ke_state_set(TASK_APM, 0)
+  ke_state_set(TASK_APM, ApmIdleState)
 
 proc apm_start_cfm*(param: pointer) {.exportc, cdecl.} =
   ## Process AP start confirmation.
@@ -14079,7 +14192,7 @@ proc apm_start_cfm*(param: pointer) {.exportc, cdecl.} =
   apm.connectInfo = nil
 
   # Reset APM state to idle
-  ke_state_set(TASK_APM, 0)
+  ke_state_set(TASK_APM, ApmIdleState)
 
 proc apm_stop*(vifEntry: pointer) {.exportc, cdecl.} =
   ## Stop AP mode for the given VIF entry.
@@ -14212,7 +14325,7 @@ proc apm_set_bss_param*(param: pointer) {.exportc, cdecl.} =
 
   # 6. Advance state, then dispatch the queue. AP confirmation handlers
   # require state 1 before the first queued request can complete.
-  ke_state_set(TASK_APM, 1)
+  ke_state_set(TASK_APM, ApmActiveState)
   apm_send_next_bss_param(param)
 
 proc apm_send_next_bss_param*(param: pointer) {.exportc, cdecl.} =
@@ -14275,7 +14388,7 @@ proc apm_bcn_set*(param: pointer) {.exportc, cdecl.} =
   ke_msg_send(cast[pointer](msg))
 
   # Advance APM state to 2
-  ke_state_set(TASK_APM, 2)
+  ke_state_set(TASK_APM, ApmStartingState)
 
 proc apm_sta_add*(param: pointer): uint8 {.exportc, cdecl.} =
   ## Add a station to AP (association) (38 instrs).
@@ -15155,10 +15268,7 @@ proc apm_tx_int_ps_get_postpone*(vifEntry: pointer, staEntry: pointer, postponeF
   var cur = cast[pointer](sta.postponedList.first)
   var prev: pointer = nil
   let psCheckSeqz = cast[uint32](if (psStatus - 2) == 0: 1 else: 0)
-  while true:
-    if cur == nil:
-      assert_warn("apm.c", "apm.c", 377)
-      postponeFlag[] = 1; return nil
+  while cur != nil:
     let curU = cast[uint](cur)
     let frameTid = cast[ptr uint8](curU + 46)[]
     let tidMatch = frameTid and delivMask
@@ -15194,6 +15304,9 @@ proc apm_tx_int_ps_get_postpone*(vifEntry: pointer, staEntry: pointer, postponeF
       return cur
     prev = cur
     cur = cast[ptr pointer](curU)[]
+  assert_warn("apm.c", "apm.c", 377)
+  postponeFlag[] = 1
+  return nil
 
 proc apm_tx_int_ps_clear*(vifEntry: pointer, staIdx: uint8) {.exportc, cdecl.} =
   ## Clear PS postpone buffer for station (41 instrs).
@@ -15237,7 +15350,7 @@ proc me_init*() {.exportc, cdecl.} =
   ##   ke_state_set(TASK_ME=3, 0)
   ##   scanu_init(); apm_init(); sm_init(); bam_init()
   discard c_memset(addr me_env[0], 0, 136.csize_t)
-  ke_state_set(TASK_ME, 0)
+  ke_state_set(TASK_ME, MeIdleState)
   nimFwTrace("[WIFI-NIMFW] scanu_init begin")
   scanu_init()
   nimFwTrace("[WIFI-NIMFW] scanu_init done")
@@ -16035,10 +16148,9 @@ proc me_build_associate_req_impl(buf: pointer, assocInfo: pointer,
     discard c_memcpy(cursor, assocIeSrc, assocIeLen.csize_t)
     cursor = cast[pointer](cast[uint](cursor) + assocIeLen.uint)
     totalLen += assocIeLen
-  when defined(bl808WifiNimFw):
-    nimFwTrace2U32("[WIFI-NIMFW] assoc_tx_sec ",
-                   secFlags,
-                   assocIeLen)
+  nimFwTrace2U32("[WIFI-NIMFW] assoc_tx_sec ",
+                 secFlags,
+                 assocIeLen)
 
   # Emit WMM Information Element only (blob does NOT emit a separate QoS
   # Capability IE — just the 9-byte WMM IE which carries QoS Info at byte 8).
@@ -17432,60 +17544,9 @@ proc rc_init*(staEntry: pointer) {.exportc, cdecl.} =
 
   var fillIdx = 1
   while fillIdx < nRates.int - 1:
-    var randomRate: uint16 = 0xFFFF'u16
-    var tries = 0
-    while tries < 64:
-      randomRate = rc_new_random_rate(stats)
-      if rc_check_rate_duplicated(stats, randomRate) == 0:
-        break
-      inc tries
-    if tries >= 64:
-      let fmtForFill = rcU8(stats, RCS_FORMAT_MOD)
-      var foundFallback = false
-      if fmtForFill <= 1:
-        let rateMap = rcU16(stats, RCS_RATE_MAP)
-        let lo = rcU8(stats, RCS_LOWEST_IDX)
-        let hi = rcU8(stats, RCS_HIGHEST_IDX)
-        let bw = rcU8(stats, RCS_BW_MAX).uint16 shl 10
-        var idx = lo
-        while idx <= hi:
-          if ((rateMap shr idx) and 1'u16) != 0:
-            var candidate = (fmtForFill.uint16 shl 11) or idx.uint16
-            if idx == 0:
-              candidate = candidate or 0x400'u16
-            elif idx - 1 <= 2:
-              candidate = candidate or bw
-            if rc_check_rate_duplicated(stats, candidate) == 0:
-              randomRate = candidate
-              foundFallback = true
-              break
-          if idx == 0xFF'u8:
-            break
-          inc idx
-      else:
-        let groupCnt = rcU8(stats, RCS_GROUP_CNT)
-        let maxMcs = rcU8(stats, RCS_MAX_NSS_MCS)
-        let sgi = rcU8(stats, RCS_SHORT_GI)
-        var group: uint8 = 0
-        while group <= groupCnt:
-          let bitmap = rcU8(stats, RCS_RATE_BITMAP + group.int)
-          var mcs: uint8 = 0
-          while mcs <= maxMcs and mcs < 8:
-            if ((bitmap shr mcs) and 1'u8) != 0:
-              var candidate = (fmtForFill.uint16 shl 11) or
-                              (group.uint16 shl 3) or mcs.uint16
-              if sgi != 0:
-                candidate = candidate or 0x200'u16
-              if rc_check_rate_duplicated(stats, candidate) == 0:
-                randomRate = candidate
-                foundFallback = true
-                break
-            inc mcs
-          if foundFallback or group == 0xFF'u8:
-            break
-          inc group
-      if not foundFallback:
-        break
+    let randomRate = rc_pick_non_duplicate_rate(stats)
+    if randomRate == 0xFFFF'u16:
+      break
     rcSetRateConfig(stats, fillIdx, randomRate)
     inc fillIdx
 
@@ -18045,14 +18106,13 @@ proc rc_update_bw_nss_max*(staIdx: uint8, nss: uint8, groupCnt: uint8) {.exportc
   rcU16(rcStats, lastEntryOff) = initialRate
 
   # Fill entries[1..nRates-2] with random non-duplicate sample rates.
-  # Blob keeps a single rc_new_random_rate call site inside a do-while.
+  # Blob keeps a single rc_new_random_rate call site inside a do-while; use a
+  # bounded helper so bad RNG state cannot trap the cooperative scheduler here.
   var idx: int = 1
   while idx < nRates.int - 1:
-    var randomRate: uint16 = 0
-    while true:
-      randomRate = rc_new_random_rate(rcStats)
-      if rc_check_rate_duplicated(rcStats, randomRate) == 0:
-        break
+    let randomRate = rc_pick_non_duplicate_rate(rcStats)
+    if randomRate == 0xFFFF'u16:
+      break
     rcSetRateConfig(rcStats, idx, randomRate)
     idx += 1
 
@@ -18966,29 +19026,28 @@ proc txl_buffer_alloc*(param: pointer, queueIdx: uint32, flags: uint32): pointer
   # Link into txl_buffer_env[queueIdx + 22], matching txl_int_fake_transfer.
   # dmaEntry = desc + 208 is both the return value and the node pushed.
   let dmaEntry = cast[uint](bufLink)
-  when defined(bl808WifiNimFw):
-    if isEapol:
-      nimFwTrace2U32("[WIFI-NIMFW] txbuf_eapol ",
-                     queueIdx or (hdrLen.uint32 shl 8),
-                     cast[uint32](dmaEntry))
-      nimFwTrace2U32("[WIFI-NIMFW] txbuf_ctrl ",
-                     cast[uint32](bufferControl),
-                     cast[ptr uint32](dmaBase)[])
-      when defined(bl808WifiConnectTrace):
-        if nimFwDbgEapolTraceCount < 64'u32:
-          nimFwConnectTrace2U32("[WIFI-CT] txbuf_eapol ",
-                                queueIdx or (hdrLen.uint32 shl 8) or
-                                  (padLen.uint32 shl 16),
-                                cast[uint32](dmaEntry))
-          nimFwConnectTrace2U32("[WIFI-CT] txbuf_ctrl ",
-                                cast[uint32](bufferControl),
-                                cast[ptr uint32](dmaBase)[])
-          nimFwConnectTrace2U32("[WIFI-CT] txbuf_pol0 ",
-                                cast[ptr uint32](dmaBase + 4)[],
-                                cast[ptr uint32](dmaBase + 20)[])
-          nimFwConnectTrace2U32("[WIFI-CT] txbuf_pol1 ",
-                                cast[ptr uint32](dmaBase + 36)[],
-                                cast[ptr uint32](dmaBase + 52)[])
+  if isEapol:
+    nimFwTrace2U32("[WIFI-NIMFW] txbuf_eapol ",
+                   queueIdx or (hdrLen.uint32 shl 8),
+                   cast[uint32](dmaEntry))
+    nimFwTrace2U32("[WIFI-NIMFW] txbuf_ctrl ",
+                   cast[uint32](bufferControl),
+                   cast[ptr uint32](dmaBase)[])
+    when defined(bl808WifiConnectTrace):
+      if nimFwDbgEapolTraceCount < 64'u32:
+        nimFwConnectTrace2U32("[WIFI-CT] txbuf_eapol ",
+                              queueIdx or (hdrLen.uint32 shl 8) or
+                                (padLen.uint32 shl 16),
+                              cast[uint32](dmaEntry))
+        nimFwConnectTrace2U32("[WIFI-CT] txbuf_ctrl ",
+                              cast[uint32](bufferControl),
+                              cast[ptr uint32](dmaBase)[])
+        nimFwConnectTrace2U32("[WIFI-CT] txbuf_pol0 ",
+                              cast[ptr uint32](dmaBase + 4)[],
+                              cast[ptr uint32](dmaBase + 20)[])
+        nimFwConnectTrace2U32("[WIFI-CT] txbuf_pol1 ",
+                              cast[ptr uint32](dmaBase + 36)[],
+                              cast[ptr uint32](dmaBase + 52)[])
   let head = txBackupQueueHeadPtr(queueIdx)
   let tailPtr = txBackupQueueTailPtr(queueIdx)
   let listTail = head[]
@@ -19019,11 +19078,12 @@ proc txl_buffer_update_thd*(param: pointer) {.exportc, cdecl.} =
   for i in 0 ..< desc.bufferPtrs.len:
     let bufPtr = desc.bufferPtrs[i]
     if bufPtr == 0:
-      # Blob spins at .L19 when count==0 (no valid buffer seen) but does NOT
-      # call assert_err there — it just falls through into the infinite loop
-      # as a hard-trap. Mirror that without the extra call.
       if count == 0:
-        while true: discard
+        inc nimFwDbgTxThdNoBuffer
+        nimFwDbgTxThdNoBufferDesc = pointerAddrU32(param)
+        hwDesc.status = 0
+        hwDesc.controlFlags = 0
+        return
       break
     # Fill THD entry
     let entry = addr linkDesc.payloadThd[i]
@@ -19082,40 +19142,39 @@ proc txl_cfm_push*(desc: pointer, status: uint32, acIdx: uint32) {.exportc, cdec
   inc nimFwDbgCfmPush
   let txDesc = hostTxDescAt(desc)
   let fenvPtr = txDesc.hwDesc
-  when defined(bl808WifiNimFw):
-    var cfmHeadTrace = 0'u32
+  var cfmHeadTrace = 0'u32
+  if fenvPtr != nil:
+    cfmHeadTrace = hostTxHwDescAt(fenvPtr).word0
+  let traceBadCfm = cfmHeadTrace == 0xBADCAB1E'u32
+  if nimFwDbgCfmTraceCount < 32'u32 or traceBadCfm:
+    var thdStatusTrace = status
     if fenvPtr != nil:
-      cfmHeadTrace = hostTxHwDescAt(fenvPtr).word0
-    let traceBadCfm = cfmHeadTrace == 0xBADCAB1E'u32
-    if nimFwDbgCfmTraceCount < 32'u32 or traceBadCfm:
-      var thdStatusTrace = status
-      if fenvPtr != nil:
-        let thdBaseTrace = hostTxHeadThd(hostTxHwDescAt(fenvPtr))
-        if thdBaseTrace != nil:
-          thdStatusTrace = thdBaseTrace.flags
-      nimFwTrace2U32("[WIFI-NIMFW] cfm_push ",
-                     acIdx or (nimFwDbgCfmTraceCount shl 8),
-                     pointerAddrU32(desc))
-      nimFwTrace2U32("[WIFI-NIMFW] cfm_ptrs ",
-                     cast[uint32](cast[uint](fenvPtr)),
-                     cfmHeadTrace)
-      nimFwTrace2U32("[WIFI-NIMFW] cfm_links ",
-                     cast[uint32](cast[uint](txDesc.queueFirst)),
-                     cast[uint32](cast[uint](txDesc.bufDesc)))
-      when defined(bl808WifiConnectTrace):
-        nimFwConnectTrace2U32("[WIFI-CT] cfm_push ",
-                              acIdx or (nimFwDbgCfmTraceCount shl 8),
-                              pointerAddrU32(desc))
-        nimFwConnectTrace2U32("[WIFI-CT] cfm_ptrs ",
-                              cast[uint32](cast[uint](fenvPtr)),
-                              cfmHeadTrace)
-        nimFwConnectTrace2U32("[WIFI-CT] cfm_status ",
-                              thdStatusTrace,
-                              status)
-        nimFwConnectTrace2U32("[WIFI-CT] cfm_links ",
-                              cast[uint32](cast[uint](txDesc.queueFirst)),
-                              cast[uint32](cast[uint](txDesc.bufDesc)))
-      inc nimFwDbgCfmTraceCount
+      let thdBaseTrace = hostTxHeadThd(hostTxHwDescAt(fenvPtr))
+      if thdBaseTrace != nil:
+        thdStatusTrace = thdBaseTrace.flags
+    nimFwTrace2U32("[WIFI-NIMFW] cfm_push ",
+                   acIdx or (nimFwDbgCfmTraceCount shl 8),
+                   pointerAddrU32(desc))
+    nimFwTrace2U32("[WIFI-NIMFW] cfm_ptrs ",
+                   cast[uint32](cast[uint](fenvPtr)),
+                   cfmHeadTrace)
+    nimFwTrace2U32("[WIFI-NIMFW] cfm_links ",
+                   cast[uint32](cast[uint](txDesc.queueFirst)),
+                   cast[uint32](cast[uint](txDesc.bufDesc)))
+    when defined(bl808WifiConnectTrace):
+      nimFwConnectTrace2U32("[WIFI-CT] cfm_push ",
+                            acIdx or (nimFwDbgCfmTraceCount shl 8),
+                            pointerAddrU32(desc))
+      nimFwConnectTrace2U32("[WIFI-CT] cfm_ptrs ",
+                            cast[uint32](cast[uint](fenvPtr)),
+                            cfmHeadTrace)
+      nimFwConnectTrace2U32("[WIFI-CT] cfm_status ",
+                            thdStatusTrace,
+                            status)
+      nimFwConnectTrace2U32("[WIFI-CT] cfm_links ",
+                            cast[uint32](cast[uint](txDesc.queueFirst)),
+                            cast[uint32](cast[uint](txDesc.bufDesc)))
+    inc nimFwDbgCfmTraceCount
   if fenvPtr != nil:
     let hwdesc = hostTxHeadThd(hostTxHwDescAt(fenvPtr))
     if hwdesc != nil:
@@ -19124,6 +19183,9 @@ proc txl_cfm_push*(desc: pointer, status: uint32, acIdx: uint32) {.exportc, cdec
   co_list_push_back(txCfmList(acIdx), cast[ptr CoListHdr](desc))
   if acIdx < 5'u32:
     ke_evt_set(txl_cfm_evt_bit[acIdx])
+
+proc txlCfmPending(acList: ptr CoList): bool {.inline.} =
+  acList.first != nil
 
 proc txl_cfm_evt*() {.exportc, cdecl.} =
   ## Process TX confirmation events (212 bytes in blob).
@@ -19151,58 +19213,54 @@ proc txl_cfm_evt*() {.exportc, cdecl.} =
 
   # Get per-AC confirmation list
   let acList = txCfmList(acIdx)
+  var drained = 0'u32
 
-  # Main loop: process all pending TX confirms for this AC
-  while true:
-    # Re-read list head each iteration (blob reloads via th.lrw)
-    if acList.first == nil:
-      break
-
+  # Main loop: process a bounded batch of pending TX confirms for this AC.
+  while drained < WifiTxCfmDrainLimit and txlCfmPending(acList):
     # IRQ-safe pop (blob: csrrci mstatus,8 / csrsi mstatus,8)
     let irqState = irqSave()
     let node = co_list_pop_front(acList)
     irqRestore(irqState)
 
     if node == nil:
-      break
+      return
 
-    when defined(bl808WifiNimFw):
-      let descTrace = hostTxDescAt(cast[pointer](node))
-      let nodeU = cast[uint](descTrace)
-      let fenvPtrTrace = descTrace.hwDesc
-      var cfmHeadTrace = 0'u32
+    let descTrace = hostTxDescAt(cast[pointer](node))
+    let nodeU = cast[uint](descTrace)
+    let fenvPtrTrace = descTrace.hwDesc
+    var cfmHeadTrace = 0'u32
+    if fenvPtrTrace != nil:
+      cfmHeadTrace = hostTxHwDescAt(fenvPtrTrace).word0
+    let traceBadCfm = cfmHeadTrace == 0xBADCAB1E'u32
+    if nimFwDbgCfmTraceCount < 64'u32 or traceBadCfm:
+      var thdStatusTrace = 0'u32
       if fenvPtrTrace != nil:
-        cfmHeadTrace = hostTxHwDescAt(fenvPtrTrace).word0
-      let traceBadCfm = cfmHeadTrace == 0xBADCAB1E'u32
-      if nimFwDbgCfmTraceCount < 64'u32 or traceBadCfm:
-        var thdStatusTrace = 0'u32
-        if fenvPtrTrace != nil:
-          let thdBaseTrace = hostTxHeadThd(hostTxHwDescAt(fenvPtrTrace))
-          if thdBaseTrace != nil:
-            thdStatusTrace = thdBaseTrace.flags
-        nimFwTrace2U32("[WIFI-NIMFW] cfm_evt ",
-                       acIdx or (nimFwDbgCfmTraceCount shl 8),
-                       cast[uint32](nodeU))
-        nimFwTrace2U32("[WIFI-NIMFW] cfm_evt_ptr ",
-                       cast[uint32](cast[uint](fenvPtrTrace)),
-                       cfmHeadTrace)
-        nimFwTrace2U32("[WIFI-NIMFW] cfm_evt_lnk ",
-                       cast[uint32](cast[uint](descTrace.queueFirst)),
-                       cast[uint32](cast[uint](descTrace.bufDesc)))
-        when defined(bl808WifiConnectTrace):
-          nimFwConnectTrace2U32("[WIFI-CT] cfm_evt ",
-                                acIdx or (nimFwDbgCfmTraceCount shl 8),
-                                cast[uint32](nodeU))
-          nimFwConnectTrace2U32("[WIFI-CT] cfm_evt_ptr ",
-                                cast[uint32](cast[uint](fenvPtrTrace)),
-                                cfmHeadTrace)
-          nimFwConnectTrace2U32("[WIFI-CT] cfm_evt_status ",
-                                thdStatusTrace,
-                                cast[uint32](cast[uint](descTrace.cfmDst)))
-          nimFwConnectTrace2U32("[WIFI-CT] cfm_evt_lnk ",
-                                cast[uint32](cast[uint](descTrace.queueFirst)),
-                                cast[uint32](cast[uint](descTrace.bufDesc)))
-        inc nimFwDbgCfmTraceCount
+        let thdBaseTrace = hostTxHeadThd(hostTxHwDescAt(fenvPtrTrace))
+        if thdBaseTrace != nil:
+          thdStatusTrace = thdBaseTrace.flags
+      nimFwTrace2U32("[WIFI-NIMFW] cfm_evt ",
+                     acIdx or (nimFwDbgCfmTraceCount shl 8),
+                     cast[uint32](nodeU))
+      nimFwTrace2U32("[WIFI-NIMFW] cfm_evt_ptr ",
+                     cast[uint32](cast[uint](fenvPtrTrace)),
+                     cfmHeadTrace)
+      nimFwTrace2U32("[WIFI-NIMFW] cfm_evt_lnk ",
+                     cast[uint32](cast[uint](descTrace.queueFirst)),
+                     cast[uint32](cast[uint](descTrace.bufDesc)))
+      when defined(bl808WifiConnectTrace):
+        nimFwConnectTrace2U32("[WIFI-CT] cfm_evt ",
+                              acIdx or (nimFwDbgCfmTraceCount shl 8),
+                              cast[uint32](nodeU))
+        nimFwConnectTrace2U32("[WIFI-CT] cfm_evt_ptr ",
+                              cast[uint32](cast[uint](fenvPtrTrace)),
+                              cfmHeadTrace)
+        nimFwConnectTrace2U32("[WIFI-CT] cfm_evt_status ",
+                              thdStatusTrace,
+                              cast[uint32](cast[uint](descTrace.cfmDst)))
+        nimFwConnectTrace2U32("[WIFI-CT] cfm_evt_lnk ",
+                              cast[uint32](cast[uint](descTrace.queueFirst)),
+                              cast[uint32](cast[uint](descTrace.bufDesc)))
+      inc nimFwDbgCfmTraceCount
 
     # Rate control update
     me_tx_cfm_singleton(cast[pointer](node))
@@ -19214,6 +19272,12 @@ proc txl_cfm_evt*() {.exportc, cdecl.} =
     ipc_emb_txcfm(cast[pointer](node))
     # IPC confirm indication - called per descriptor inside loop (blob: 0xb4-0xbe)
     ipc_emb_txcfm_ind(acMask)
+    inc drained
+
+  if txlCfmPending(acList):
+    inc nimFwDbgCfmEvtYield
+    nimFwDbgCfmEvtYieldAc = acIdx
+    ke_evt_set(evtField)
 
 proc txl_cfm_flush*() {.exportc, cdecl, noinline.} =
   ## Flush all pending TX confirmations (190 bytes in blob).
@@ -19240,7 +19304,7 @@ proc txl_cfm_flush*() {.exportc, cdecl, noinline.} =
   let forcedStatus = 0x3C000000'u32 or acMask
   var count: uint32 = 0
 
-  while true:
+  while cfmList.first != nil:
     let node = co_list_pop_front(cfmList)
     if node == nil:
       break
@@ -19454,14 +19518,13 @@ proc txl_cntrl_push*(param: pointer, ac: uint8): uint8 {.exportc, cdecl.} =
   let saved = irqSave()
   # Check desc[8] for existing queue chain (blob at 0x56)
   let queueFirst = desc.queueFirst
-  when defined(bl808WifiNimFw):
-    let protoTrace = desc.frameLen
-    if protoTrace == 0x8E88'u16 or protoTrace == 0x888E'u16:
-      nimFwTrace2U32("[WIFI-NIMFW] txl_push_eapol ",
-                     ac.uint32 or (desc.staIdx.uint32 shl 8) or
-                       (desc.vifIdx.uint32 shl 16) or
-                       (desc.staInfoIdx.uint32 shl 24),
-                     cast[uint32](cast[uint](queueFirst)))
+  let protoTrace = desc.frameLen
+  if protoTrace == 0x8E88'u16 or protoTrace == 0x888E'u16:
+    nimFwTrace2U32("[WIFI-NIMFW] txl_push_eapol ",
+                   ac.uint32 or (desc.staIdx.uint32 shl 8) or
+                     (desc.vifIdx.uint32 shl 16) or
+                     (desc.staInfoIdx.uint32 shl 24),
+                   cast[uint32](cast[uint](queueFirst)))
   if queueFirst == nil:
     # Empty queue: fake transfer (blob: txl_int_fake_transfer at 0x5e)
     txl_int_fake_transfer(param, ac.uint32)
@@ -19697,37 +19760,27 @@ proc txl_cntrl_halt_ac*(ac: uint8) {.exportc, cdecl.} =
   of 0:  # BK
     setBit = 0x10000'u32     # bit 16
     regWrite(MACHW_TX_TRIG_SET, setBit)
-    while true:
-      let stat = regRead(MACHW_TX_TRIG_STAT)
-      if (stat and 0x10000) == 0: break  # extract bit 16
+    discard waitRegMaskClear(MACHW_TX_TRIG_STAT, 0x10000'u32)
     clearMask = 0x10000'u32
   of 1:  # BE
     setBit = 0x20000'u32     # bit 17
     regWrite(MACHW_TX_TRIG_SET, setBit)
-    while true:
-      let stat = regRead(MACHW_TX_TRIG_STAT)
-      if (stat and 0x20000) == 0: break
+    discard waitRegMaskClear(MACHW_TX_TRIG_STAT, 0x20000'u32)
     clearMask = 0x20000'u32
   of 2:  # VI
     setBit = 0x40000'u32     # bit 18
     regWrite(MACHW_TX_TRIG_SET, setBit)
-    while true:
-      let stat = regRead(MACHW_TX_TRIG_STAT)
-      if (stat and 0x40000) == 0: break
+    discard waitRegMaskClear(MACHW_TX_TRIG_STAT, 0x40000'u32)
     clearMask = 0x40000'u32
   of 3:  # VO
     setBit = 0x80000'u32     # bit 19
     regWrite(MACHW_TX_TRIG_SET, setBit)
-    while true:
-      let stat = regRead(MACHW_TX_TRIG_STAT)
-      if (stat and 0x80000) == 0: break
+    discard waitRegMaskClear(MACHW_TX_TRIG_STAT, 0x80000'u32)
     clearMask = 0x80000'u32
   of 4:  # BCN
     setBit = 0x8000'u32      # bit 15
     regWrite(MACHW_TX_TRIG_SET, setBit)
-    while true:
-      let stat = regRead(MACHW_TX_TRIG_STAT)
-      if (stat and 3) == 0: break  # bits [1:0]
+    discard waitRegMaskClear(MACHW_TX_TRIG_STAT, 0x03'u32)
     clearMask = 0x8000'u32
   else:
     assert_err("txl_cntrl.c", "txl_cntrl.c", 0x700)
@@ -20403,6 +20456,9 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
       # Advance to next descriptor in backup chain (.L70 re-reads backup head)
       descPtr = backupHead[]
 
+proc txlTriggerPending(acCtrl: ptr TxControlAcView): bool {.inline.} =
+  acCtrl.pending.first != nil
+
 proc txl_transmit_trigger*() {.exportc, cdecl.} =
   ## Trigger TX DMA transmission for the highest-priority ready AC.
   ## Reads MACHW INTC status to find the highest-priority AC with a pending
@@ -20465,9 +20521,10 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
   regWrite(0x24B0807C'u, readyBit)
 
   let acCtrl = txControlAc(ac)
+  var drained = 0'u32
 
-  # Main loop (.L137): process descriptors for this AC
-  while true:
+  # Main loop (.L137): process a bounded batch of descriptors for this AC.
+  while drained < WifiTxTriggerDrainLimit:
     inc nimFwDbgTxTrigLoops
     let descPtr = cast[pointer](acCtrl.pending.first)
     if descPtr == nil:
@@ -20553,51 +20610,50 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
     discard co_list_pop_front(addr acCtrl.pending)
 
     let hostCfm = if desc.usedFlag != 0: desc.queueFirst else: nil
-    when defined(bl808WifiNimFw):
-      let isNullDataFrame = fcTrace == 0x48'u8 and fcTrace1 == 0x01'u8
-      let isTrackedByCallback =
-        desc.callback != nil and
-        cast[uint32](cast[uint](desc.callback)) == nimFwDbgNullFrameCbSetPtr
-      let isTrackedNullFrame =
-        isNullDataFrame or isTrackedByCallback
-      if isTrackedNullFrame:
-        inc nimFwDbgNullFrameTxTrigSeen
-        nimFwDbgNullFrameTxTrigUsedFlag = desc.usedFlag.uint32
-        if hostCfm == nil:
-          inc nimFwDbgNullFrameTxTrigInternal
-        else:
-          inc nimFwDbgNullFrameTxTrigHost
-      nimFwDbgTxRouteUsedFlag = desc.usedFlag.uint32
+    let isNullDataFrame = fcTrace == 0x48'u8 and fcTrace1 == 0x01'u8
+    let isTrackedByCallback =
+      desc.callback != nil and
+      cast[uint32](cast[uint](desc.callback)) == nimFwDbgNullFrameCbSetPtr
+    let isTrackedNullFrame =
+      isNullDataFrame or isTrackedByCallback
+    if isTrackedNullFrame:
+      inc nimFwDbgNullFrameTxTrigSeen
+      nimFwDbgNullFrameTxTrigUsedFlag = desc.usedFlag.uint32
       if hostCfm == nil:
-        inc nimFwDbgTxRouteInternal
+        inc nimFwDbgNullFrameTxTrigInternal
       else:
-        inc nimFwDbgTxRouteHost
-      let fenvPtrTrace = desc.hwDesc
-      var cfmHeadTrace = 0'u32
-      if fenvPtrTrace != nil:
-        cfmHeadTrace = hostTxHwDescAt(fenvPtrTrace).word0
-      let traceBadCfm = cfmHeadTrace == 0xBADCAB1E'u32
-      let traceRoutedHost = hostCfm != nil
-      if traceBadCfm or traceRoutedHost or traceMgmt or traceEapol:
-        nimFwTrace2U32("[WIFI-NIMFW] txtrig_route ",
-                       ac.uint32 or ((if traceRoutedHost: 1'u32 else: 0'u32) shl 8),
-                       cast[uint32](descAddr))
-        nimFwTrace2U32("[WIFI-NIMFW] txtrig_cfm ",
-                       cast[uint32](cast[uint](fenvPtrTrace)),
-                       cfmHeadTrace)
-        nimFwTrace2U32("[WIFI-NIMFW] txtrig_link ",
-                       cast[uint32](cast[uint](desc.queueFirst)),
-                       cast[uint32](cast[uint](desc.bufDesc)))
-        when defined(bl808WifiConnectTrace):
-          nimFwConnectTrace2U32("[WIFI-CT] txtrig_route ",
-                                ac.uint32 or ((if traceRoutedHost: 1'u32 else: 0'u32) shl 8),
-                                cast[uint32](descAddr))
-          nimFwConnectTrace2U32("[WIFI-CT] txtrig_cfm ",
-                                cast[uint32](cast[uint](fenvPtrTrace)),
-                                cfmHeadTrace)
-          nimFwConnectTrace2U32("[WIFI-CT] txtrig_link ",
-                                cast[uint32](cast[uint](desc.queueFirst)),
-                                cast[uint32](cast[uint](desc.bufDesc)))
+        inc nimFwDbgNullFrameTxTrigHost
+    nimFwDbgTxRouteUsedFlag = desc.usedFlag.uint32
+    if hostCfm == nil:
+      inc nimFwDbgTxRouteInternal
+    else:
+      inc nimFwDbgTxRouteHost
+    let fenvPtrTrace = desc.hwDesc
+    var cfmHeadTrace = 0'u32
+    if fenvPtrTrace != nil:
+      cfmHeadTrace = hostTxHwDescAt(fenvPtrTrace).word0
+    let traceBadCfm = cfmHeadTrace == 0xBADCAB1E'u32
+    let traceRoutedHost = hostCfm != nil
+    if traceBadCfm or traceRoutedHost or traceMgmt or traceEapol:
+      nimFwTrace2U32("[WIFI-NIMFW] txtrig_route ",
+                     ac.uint32 or ((if traceRoutedHost: 1'u32 else: 0'u32) shl 8),
+                     cast[uint32](descAddr))
+      nimFwTrace2U32("[WIFI-NIMFW] txtrig_cfm ",
+                     cast[uint32](cast[uint](fenvPtrTrace)),
+                     cfmHeadTrace)
+      nimFwTrace2U32("[WIFI-NIMFW] txtrig_link ",
+                     cast[uint32](cast[uint](desc.queueFirst)),
+                     cast[uint32](cast[uint](desc.bufDesc)))
+      when defined(bl808WifiConnectTrace):
+        nimFwConnectTrace2U32("[WIFI-CT] txtrig_route ",
+                              ac.uint32 or ((if traceRoutedHost: 1'u32 else: 0'u32) shl 8),
+                              cast[uint32](descAddr))
+        nimFwConnectTrace2U32("[WIFI-CT] txtrig_cfm ",
+                              cast[uint32](cast[uint](fenvPtrTrace)),
+                              cfmHeadTrace)
+        nimFwConnectTrace2U32("[WIFI-CT] txtrig_link ",
+                              cast[uint32](cast[uint](desc.queueFirst)),
+                              cast[uint32](cast[uint](desc.bufDesc)))
     if hostCfm == nil:
       # Internal management frame: frame-confirm event only.
       txl_frame_cfm(descPtr)
@@ -20608,7 +20664,12 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
     # Set absolute timer for next TX opportunity and loop to check for more descriptors.
     let ipcBase = regRead(IPC_SHARED_TX_BASE)
     blmac_abs_timer_set(ac, ipcBase + TX_TIMEOUT_LOCAL[ac])
-    continue
+    inc drained
+
+  if txlTriggerPending(acCtrl):
+    inc nimFwDbgTxTrigYield
+    nimFwDbgTxTrigYieldAc = ac
+    nimFwDbgTxTrigYieldHead = pointerAddrU32(cast[pointer](acCtrl.pending.first))
 
 proc txl_current_desc_get*(ac: uint8): pointer {.exportc, cdecl.} =
   ## Get the current TX descriptor for an AC.
@@ -20999,7 +21060,9 @@ proc txl_frame_get*(length: uint32): pointer {.exportc, cdecl.} =
   let freeList = addr frameEnv.freeList
   let logFn = blOpsFunc(4)
 
-  while true:
+  var retryAllocation = true
+  while retryAllocation:
+    retryAllocation = false
     # Pop from free list
     let freeNode = txl_frame_free_list_pop(freeList)
     if freeNode == nil:
@@ -21019,6 +21082,7 @@ proc txl_frame_get*(length: uint32): pointer {.exportc, cdecl.} =
           if logFn != nil:
             cast[proc(fmt: cstring, cnt: uint32){.cdecl, varargs.}](logFn)(
               "[FW] Get (%d) frames from desc_postponed\r\n", freed)
+          retryAllocation = true
           continue  # retry pop
 
       # Try flushing AC 3 (VO) queue
@@ -21030,6 +21094,7 @@ proc txl_frame_get*(length: uint32): pointer {.exportc, cdecl.} =
       if logFn != nil:
         cast[proc(fmt: cstring, cnt: uint32){.cdecl, varargs.}](logFn)(
           "[FW] Get (%d) frames from AC flushing\r\n", freeCount)
+      retryAllocation = true
       continue  # retry pop
 
     # Success: set up the descriptor
@@ -21055,13 +21120,12 @@ proc txl_frame_get*(length: uint32): pointer {.exportc, cdecl.} =
     # txl_frame_push.
     let expectedHdrPtr = cast[uint32](cast[uint](addr linkDesc.macHeader[0]))
     let oldBufPtr = hwDesc.payloadStart
-    when defined(bl808WifiNimFw):
-      if nimFwDbgFrameTraceCount < 16'u32 or oldBufPtr != expectedHdrPtr:
-        nimFwTrace2U32("[WIFI-NIMFW] frame_get ",
-                       length or (nimFwDbgFrameTraceCount shl 16),
-                       cast[uint32](descAddr))
-        nimFwTrace2U32("[WIFI-NIMFW] frame_hdr ", oldBufPtr, expectedHdrPtr)
-        inc nimFwDbgFrameTraceCount
+    if nimFwDbgFrameTraceCount < 16'u32 or oldBufPtr != expectedHdrPtr:
+      nimFwTrace2U32("[WIFI-NIMFW] frame_get ",
+                     length or (nimFwDbgFrameTraceCount shl 16),
+                     cast[uint32](descAddr))
+      nimFwTrace2U32("[WIFI-NIMFW] frame_hdr ", oldBufPtr, expectedHdrPtr)
+      inc nimFwDbgFrameTraceCount
     hwDesc.payloadStart = expectedHdrPtr
     let curBufPtr = expectedHdrPtr  # hwDesc[20]
     hwDesc.frameLen = length + 4     # data length + FCS
@@ -21096,6 +21160,7 @@ proc txl_frame_get*(length: uint32): pointer {.exportc, cdecl.} =
     desc.queueFirst = nil
     inc nimFwDbgFrameGet
     return cast[pointer](freeNode)
+  nil
 
 proc txl_frame_push*(param: pointer, ac: uint8): uint8 {.exportc, cdecl, noinline, discardable.} =
   ## Push a frame for transmission.
@@ -21111,8 +21176,7 @@ proc txl_frame_push*(param: pointer, ac: uint8): uint8 {.exportc, cdecl, noinlin
     let linkDesc = hostTxLinkDescAt(desc.bufDesc)
     let expectedHdrPtr = cast[uint32](cast[uint](addr linkDesc.macHeader[0]))
     if thdField != expectedHdrPtr:
-      when defined(bl808WifiNimFw):
-        nimFwTrace2U32("[WIFI-NIMFW] frame_push_fix ", thdField, expectedHdrPtr)
+      nimFwTrace2U32("[WIFI-NIMFW] frame_push_fix ", thdField, expectedHdrPtr)
       thdField = expectedHdrPtr
       hwDesc.payloadStart = expectedHdrPtr
   if (thdField and 1) != 0:
@@ -21146,8 +21210,7 @@ proc txl_frame_push_force*(param: pointer, ac: uint8) {.exportc, cdecl.} =
     let linkDesc = hostTxLinkDescAt(desc.bufDesc)
     let expectedHdrPtr = cast[uint32](cast[uint](addr linkDesc.macHeader[0]))
     if thdField != expectedHdrPtr:
-      when defined(bl808WifiNimFw):
-        nimFwTrace2U32("[WIFI-NIMFW] frame_force_fix ", thdField, expectedHdrPtr)
+      nimFwTrace2U32("[WIFI-NIMFW] frame_force_fix ", thdField, expectedHdrPtr)
       thdField = expectedHdrPtr
       hwDesc.payloadStart = expectedHdrPtr
   if (thdField and 1) != 0:
@@ -21219,6 +21282,9 @@ proc txl_frame_release*(param: pointer) {.exportc, cdecl.} =
       let buf = desc.callbackArg
       cast[proc(buf: pointer, flag: uint32) {.cdecl.}](cbPtr)(buf, 0)
 
+proc txlFrameConfirmPending(frameEnv: ptr TxFrameEnvView): bool {.inline.} =
+  frameEnv.usedList.first != nil
+
 proc txl_frame_evt*() {.exportc, cdecl.} =
   ## TX frame event handler.
   ## From disassembly (53 instrs): Processes all pending TX frame confirmations.
@@ -21249,26 +21315,26 @@ proc txl_frame_evt*() {.exportc, cdecl.} =
   ke_evt_clear(0x00080000'u32)
   let txCtrl = txControlEnv()
   let frameEnv = txFrameEnv()
-  while true:
+  var drained = 0'u32
+  while drained < WifiTxFrameDrainLimit and txlFrameConfirmPending(frameEnv):
     # Pop from pending list under interrupt protection
     let saved = irqSave()
     let node = co_list_pop_front(addr frameEnv.usedList)
     irqRestore(saved)
     if node == nil:
-      break
+      return
     inc nimFwDbgFrameEvtPop
     let desc = hostTxDescAt(node)
-    when defined(bl808WifiNimFw):
-      let evtLinkDesc = desc.bufDesc
-      if evtLinkDesc != nil:
-        let evtLink = hostTxLinkDescAt(evtLinkDesc)
-        if evtLink.macHeader[0] == 0x48'u8 and evtLink.macHeader[1] == 0x01'u8:
-          inc nimFwDbgNullFrameEvtSeen
-          nimFwDbgNullFrameEvtDesc = pointerAddrU32(cast[pointer](node))
-          nimFwDbgNullFrameEvtCbPtr =
-            cast[uint32](cast[uint](desc.callback))
-          if desc.callback == nil:
-            inc nimFwDbgNullFrameEvtCbNil
+    let evtLinkDesc = desc.bufDesc
+    if evtLinkDesc != nil:
+      let evtLink = hostTxLinkDescAt(evtLinkDesc)
+      if evtLink.macHeader[0] == 0x48'u8 and evtLink.macHeader[1] == 0x01'u8:
+        inc nimFwDbgNullFrameEvtSeen
+        nimFwDbgNullFrameEvtDesc = pointerAddrU32(cast[pointer](node))
+        nimFwDbgNullFrameEvtCbPtr =
+          cast[uint32](cast[uint](desc.callback))
+        if desc.callback == nil:
+          inc nimFwDbgNullFrameEvtCbNil
     # Decrement pending frame counter at txl_cntrl_env[80].
     if txCtrl.packetCounter > 0:
       txCtrl.packetCounter = txCtrl.packetCounter - 1
@@ -21285,6 +21351,7 @@ proc txl_frame_evt*() {.exportc, cdecl.} =
       # Check retry flag at desc[218]
       if desc.retryFlag != 0:
         desc.retryFlag = 0
+        inc drained
         continue  # re-process (loop back)
     # If not internally allocated (desc[216] == 0), return to free list
     if desc.usedFlag == 0:
@@ -21293,6 +21360,13 @@ proc txl_frame_evt*() {.exportc, cdecl.} =
       txl_frame_free_list_push(cast[pointer](node))
     else:
       inc nimFwDbgFrameEvtUsedSkip
+    inc drained
+
+  if txlFrameConfirmPending(frameEnv):
+    inc nimFwDbgFrameEvtYield
+    nimFwDbgFrameEvtYieldHead =
+      pointerAddrU32(cast[pointer](frameEnv.usedList.first))
+    ke_evt_set(0x00080000'u32)
 
 proc txl_frame_send_null_frame*(staIdx: uint8, cfmCallback: pointer, cfmArg: uint32): uint8 {.exportc, cdecl, discardable.} =
   ## Build and send a null data frame (for PS notification).
@@ -22759,7 +22833,7 @@ proc rxl_mpdu_free*(desc: pointer) {.exportc, cdecl.} =
     savedStatus = cast[proc(): pointer {.cdecl.}](getStatusFn)()
   sw.uploadDone = 0
   var prevHw: uint32 = 0
-  while true:
+  while curHw != 0:
     let hwStatus = cast[ptr uint16](curHw + 16)[]
     cast[ptr uint32](curHw + 20)[] = 0
     if (hwStatus and 1) != 0:
@@ -22773,8 +22847,6 @@ proc rxl_mpdu_free*(desc: pointer) {.exportc, cdecl.} =
       return
     let nextHw = cast[ptr uint32](curHw + 4)[]
     prevHw = cast[uint32](curHw)
-    if nextHw == 0:
-      break
     curHw = cast[uint](nextHw)
   assert_rec("rxl_hwdesc.c", "rxl_hwdesc.c", 872)
   let cleanFn = blOpsFunc(24)
@@ -22865,7 +22937,7 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
   # L70: main processing loop (up to 5 frames per call). Blob does NOT disable
   # MAC HW interrupts around the loop — only masks via csrrci mstatus in the
   # co_list_pop critical section below.
-  while true:
+  while loopCount > 0:
     let curHwDesc = cast[pointer](cntrlEnv.queue.first)
     if cntrlEnv.processingFlag != 0 or curHwDesc == nil:
       # L43 in blob: no tail-call to ke_evt_set here — blob simply returns.
@@ -22898,15 +22970,14 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
        break frameWork
 
      # Validate frame: both valid and associated bits must be set
-     when defined(bl808WifiNimFw):
-       let dbgBuf = cast[uint](bufChain)
-       let dbgPayload =
-         if dbgBuf != 0: cast[ptr uint32](dbgBuf + 8)[]
-         else: 0'u32
-       let dbgFc =
-         if dbgPayload != 0: cast[ptr uint16](dbgPayload.uint)[].uint32
-         else: 0'u32
-       nimFwTrace2U32("[WIFI-NIMFW] rxl_frame ", hwFlags, dbgFc)
+     let dbgBuf = cast[uint](bufChain)
+     let dbgPayload =
+       if dbgBuf != 0: cast[ptr uint32](dbgBuf + 8)[]
+       else: 0'u32
+     let dbgFc =
+       if dbgPayload != 0: cast[ptr uint16](dbgPayload.uint)[].uint32
+       else: 0'u32
+     nimFwTrace2U32("[WIFI-NIMFW] rxl_frame ", hwFlags, dbgFc)
      if (hwFlags and 0x20020000'u32) != 0x20020000'u32:
        releaseFrame = rxu_cntrl_frame_handle(curHwDesc) == 0
        break frameWork
@@ -23153,6 +23224,10 @@ proc rxl_dma_evt*() {.exportc, cdecl.} =
   ke_evt_clear(0x00400000'u32)
   regWrite(0x24A00020'u, 0x20'u32)
 
+proc submittedRxReady(desc: pointer): bool {.inline.} =
+  desc != nil and
+    (cast[ptr uint32](cast[uint](desc) + 64)[] and 0x4000'u32) != 0
+
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void rxl_timer_int_handler(void);".}
 proc rxl_timer_int_handler*() {.exportc, cdecl.} =
   ## RX timer interrupt handler.
@@ -23168,14 +23243,14 @@ proc rxl_timer_int_handler*() {.exportc, cdecl.} =
   ## Call graph: co_list_push_back, assert_rec, rxl_hd_append, ke_evt_set
   regWrite(0x24B0807C'u, 0x000A0000'u32)
   let env = rxlCntrlEnvView()
-  while true:
+  var drained = 0'u32
+  template scheduleQueuedRx() =
+    if env.queue.first != nil:
+      ke_evt_set(0x00100000'u32)
+
+  while drained < WifiRxTimerDrainLimit and submittedRxReady(env.submittedHead):
     let descPtr = env.submittedHead
-    if descPtr == nil:
-      break
     let descAddr = cast[uint](descPtr)
-    let statusWord = cast[ptr uint32](descAddr + 64)[]
-    if (statusWord and 0x4000) == 0:
-      break
     # Dequeue: advance first to next
     let nextDesc = cast[ptr uint32](descAddr + 4)[]
     let swDescLink = cast[uint](cast[ptr uint32](descAddr + 12)[])
@@ -23201,8 +23276,15 @@ proc rxl_timer_int_handler*() {.exportc, cdecl.} =
         cast[ptr uint32](swDescLink + 16)[] = 0
         cast[ptr uint32](swDescLink + 12)[] = 0
         rxl_hd_append(cast[pointer](innerDesc))
-  if env.queue.first != nil:
-    ke_evt_set(0x00100000'u32)
+    inc drained
+
+  if submittedRxReady(env.submittedHead):
+    inc nimFwDbgRxTimerYield
+    nimFwDbgRxTimerYieldHead = pointerAddrU32(env.submittedHead)
+    scheduleQueuedRx()
+    regWrite(0x24B0807C'u, 0x000A0000'u32)
+    return
+  scheduleQueuedRx()
 
 proc rxl_timeout_int_handler*() {.exportc, cdecl.} =
   ## RX timeout interrupt handler.
@@ -23575,8 +23657,7 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
     let bufChain = cast[uint](swdesc.bufferChain)
     let payload = cast[uint](cast[ptr uint32](bufChain + 8)[])
     let rawFC = cast[ptr uint16](payload)[]
-    when defined(bl808WifiNimFw):
-      nimFwTrace2U32("[WIFI-NIMFW] rxu_fc ", hwFlags, rawFC.uint32)
+    nimFwTrace2U32("[WIFI-NIMFW] rxu_fc ", hwFlags, rawFC.uint32)
 
     # NOTE: The blob does NOT call tcpip_stack_input from rxu_cntrl_frame_handle.
     # The fast-path delivery happens only in rxu_swdesc_upload_evt.
@@ -23960,8 +24041,7 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
         # Blob's associated mgmt path (.L158 -> .L163 -> .L234) routes through
         # rxu_mgt_frame_check(param, sta_idx), not the data upload path.
         returnValue = rxu_mgt_frame_check(param, env.staIdx)
-        when defined(bl808WifiNimFw):
-          nimFwTrace2U32("[WIFI-NIMFW] rxu_mgt_assoc ", rawFC.uint32, returnValue)
+        nimFwTrace2U32("[WIFI-NIMFW] rxu_mgt_assoc ", rawFC.uint32, returnValue)
         doReturn()
 
     # ================================================================
@@ -23991,8 +24071,7 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
 
       # Management frame filter check (blob: rxu_mgt_frame_check at reloc 0x324)
       let mgtAccepted = rxu_mgt_frame_check(param, 0xFF'u8)
-      when defined(bl808WifiNimFw):
-        nimFwTrace2U32("[WIFI-NIMFW] rxu_mgt ", rawFC.uint32, mgtAccepted)
+      nimFwTrace2U32("[WIFI-NIMFW] rxu_mgt ", rawFC.uint32, mgtAccepted)
       returnValue = mgtAccepted
       doReturn()
 
@@ -25004,10 +25083,8 @@ proc sta_mgmt_send_postponed_frame*(vifEntry: pointer, staEntry: pointer, maxCou
   # Walk postponed descriptor list
   var count: uint32 = 0
   let frameEnv = txFrameEnv()
-  while true:
+  while sta.postponedList.first != nil and (maxCount == 0 or count < maxCount):
     let head = sta.postponedList.first
-    if head == nil:
-      break
     # Check TX allowed
     let txOk = txl_cntrl_tx_check(vifEntry)
     if not txOk:
@@ -25037,9 +25114,6 @@ proc sta_mgmt_send_postponed_frame*(vifEntry: pointer, staEntry: pointer, maxCou
     # Decrement global postponed count in txl_frame_env+16
     if frameEnv.postponedCount > 0:
       frameEnv.postponedCount = frameEnv.postponedCount - 1
-    # Check limit
-    if maxCount != 0 and count >= maxCount:
-      break
   # Release remaining postponed descriptors
   discard sta_mgmt_postponed_desc_release(staEntry, 0)
   return count
@@ -25405,7 +25479,7 @@ proc bam_init*() {.exportc, cdecl.} =
   ## From disassembly: stores 0xFF to bamStaIdx (no active BA session),
   ## then tail-calls ke_state_set(TASK_BAM, 0).
   bamStaIdx = 0xFF'u8
-  ke_state_set(TASK_BAM, 0)
+  ke_state_set(TASK_BAM, BamIdleState)
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void bam_send_air_action_frame(unsigned char,unsigned char,unsigned char,unsigned char,unsigned short,unsigned char,void*);".}
 proc bam_send_air_action_frame*(staIdx: uint8, tid: uint8, isAddba: uint8,
@@ -26437,13 +26511,9 @@ proc wait_mac_goto_idle*(): uint32 {.exportc, cdecl.} =
   # Poll for completion: read timestamp for timeout
   let startTime = macTimeNow()
   let timeout = 0x4C4B3F'u32
-  while true:
-    let status = regRead(MACHW_INTC_BASE + 0x06C'u)
-    if (status and 0x04'u32) != 0:
-      break
-    let elapsed = macTimeNow() - startTime
-    if elapsed >= timeout:
-      break
+  var status = regRead(MACHW_INTC_BASE + 0x06C'u)
+  while (status and 0x04'u32) == 0 and macTimeNow() - startTime < timeout:
+    status = regRead(MACHW_INTC_BASE + 0x06C'u)
   # Read final state
   let finalState = regRead(MACHW_STATE_CNTRL_REG) and 0x0F'u32
   # Ack: write 4 to ack register, clear bit 2
@@ -26470,10 +26540,7 @@ proc wait_mac_goto_prestate*(): uint32 {.exportc, cdecl.} =
     assert_err("ps.c", "ps.c", 1465)
   regWrite(MACHW_STATE_CNTRL_REG, targetBits)
   # Poll until state matches pre-state
-  while true:
-    let cur = regRead(MACHW_STATE_CNTRL_REG) and 0x0F'u32
-    if cur == preState.uint32:
-      break
+  discard waitRegLowNibbleEquals(MACHW_STATE_CNTRL_REG, preState.uint32)
   return 0
 
 proc wakeup_from_doze_done*(): uint32 {.exportc, cdecl.} =
@@ -26519,16 +26586,11 @@ proc wakeup_from_doze_pre*(): uint32 {.exportc, cdecl.} =
   # Timestamp-based timeout poll
   let startTime = macTimeNow()
   let timeout = 0x4C4B3F'u32
-  while true:
-    let status = regRead(MACHW_INTC_BASE + 0x06C'u)
-    if (status and 0x04'u32) != 0:
-      break
-    let elapsed = macTimeNow() - startTime
-    if elapsed >= timeout:
-      break
+  var status = regRead(MACHW_INTC_BASE + 0x06C'u)
+  while (status and 0x04'u32) == 0 and macTimeNow() - startTime < timeout:
+    status = regRead(MACHW_INTC_BASE + 0x06C'u)
   # Wait for state to go idle
-  while (regRead(MACHW_STATE_CNTRL_REG) and 0x0F'u32) != 0:
-    discard
+  discard waitRegLowNibbleClear(MACHW_STATE_CNTRL_REG)
   # Final: ack, clear, set
   regWrite(MACHW_INTC_BASE + 0x070'u, 0x04'u32)
   unmask = regRead(intcCtrl)
@@ -27219,27 +27281,25 @@ proc ipc_emb_tx_evt*(ac: uint32) {.exportc, cdecl.} =
   # Deref list head -> first descriptor
   let listHeadPtr = cast[ptr pointer](ipcEnvBase + 12)[]
   var descPtr = cast[ptr pointer](cast[uint](listHeadPtr))[]
-  when defined(bl808WifiNimFw):
-    nimFwTrace2U32("[WIFI-NIMFW] ipc_tx_evt ", ac, cast[uint32](cast[uint](descPtr)))
+  nimFwTrace2U32("[WIFI-NIMFW] ipc_tx_evt ", ac, cast[uint32](cast[uint](descPtr)))
   while descPtr != nil:
     let descAddr = cast[uint](descPtr)
-    when defined(bl808WifiNimFw):
-      let txDesc = hostTxDescAt(cast[pointer](descAddr + 12))
-      let ethTypeTrace = txDesc.frameLen
-      let pktLenTrace = txDesc.seqPassthrough
-      let traceIpc = nimFwDbgIpcTxTraceCount < 16'u32 or
-        ethTypeTrace == 0x8E88'u16 or ethTypeTrace == 0x888E'u16
-      if traceIpc:
-        let tidTrace = txDesc.staIdx.uint32
-        let vifTrace = txDesc.vifIdx.uint32
-        let staTrace = txDesc.staInfoIdx.uint32
-        nimFwTrace2U32("[WIFI-NIMFW] ipc_txd ",
-                       ethTypeTrace.uint32 or (pktLenTrace.uint32 shl 16),
-                       tidTrace or (vifTrace shl 8) or (staTrace shl 16))
-        nimFwTrace2U32("[WIFI-NIMFW] ipc_txd_buf ",
-                       txDesc.bufferPtrs[0],
-                       txDesc.bufferLens[0])
-        inc nimFwDbgIpcTxTraceCount
+    let txDesc = hostTxDescAt(cast[pointer](descAddr + 12))
+    let ethTypeTrace = txDesc.frameLen
+    let pktLenTrace = txDesc.seqPassthrough
+    let traceIpc = nimFwDbgIpcTxTraceCount < 16'u32 or
+      ethTypeTrace == 0x8E88'u16 or ethTypeTrace == 0x888E'u16
+    if traceIpc:
+      let tidTrace = txDesc.staIdx.uint32
+      let vifTrace = txDesc.vifIdx.uint32
+      let staTrace = txDesc.staInfoIdx.uint32
+      nimFwTrace2U32("[WIFI-NIMFW] ipc_txd ",
+                     ethTypeTrace.uint32 or (pktLenTrace.uint32 shl 16),
+                     tidTrace or (vifTrace shl 8) or (staTrace shl 16))
+      nimFwTrace2U32("[WIFI-NIMFW] ipc_txd_buf ",
+                     txDesc.bufferPtrs[0],
+                     txDesc.bufferLens[0])
+      inc nimFwDbgIpcTxTraceCount
     # Flow control check for non-BCN queues (blob: .L21 at 0xa2)
     if not isBcn:
       let keEvtFld = cast[ptr uint32](cast[uint](addr keEvtField))[]
@@ -27307,6 +27367,9 @@ proc ipc_emb_msg_irq*() {.exportc, cdecl.} =
     ke_evt_set(0x10000000'u32)
     regWrite(IPC_EMB_UNMASK_CLR, 2)  # blob: sw 2, 0x110(base)
 
+proc ipcMessagePending(status: uint32, msgBit: uint32): bool {.inline.} =
+  (status and msgBit) != 0
+
 proc ipc_emb_msg_evt*() {.exportc, cdecl.} =
   ## Process IPC message event. Blob semantics (from ipc_emb_msg_evt disassembly,
   ## 101 instrs). Host writes the message into `ipc_shared_env` (offsets
@@ -27321,13 +27384,8 @@ proc ipc_emb_msg_evt*() {.exportc, cdecl.} =
   let sharedBase = cast[uint](addr ipcSharedEnv[0])
   let envBase = cast[uint](addr ipcEmbEnvStruct[0])
   var ipcStatus = regRead(0x24800104'u)
-  while true:
-    # No more messages: clear the kernel event, re-enable MSG IRQ, return.
-    # Blob calls ke_evt_clear only when exiting, not at entry.
-    if (ipcStatus and IPC_MSG_BIT) == 0:
-      ke_evt_clear(0x10000000'u32)
-      regWrite(IPC_EMB_UNMASK_SET, IPC_MSG_BIT)
-      return
+  var drained = 0'u32
+  while drained < WifiIpcMsgDrainLimit and ipcMessagePending(ipcStatus, IPC_MSG_BIT):
     nimFwTrace("[WIFI-NIMFW] ipc_emb_msg_evt msg")
     # Ack the msg bit (0x24800108) before processing.
     regWrite(0x24800108'u, IPC_MSG_BIT)
@@ -27376,7 +27434,18 @@ proc ipc_emb_msg_evt*() {.exportc, cdecl.} =
     ke_msg_send(keMsgPayload(hdr))
     nimFwTrace("[WIFI-NIMFW] ipc_emb_msg_evt dispatched")
     # Re-read IPC status for next iteration (blob: `lw a5, 260(s2); j .L49`).
+    inc drained
     ipcStatus = regRead(0x24800104'u)
+
+  if ipcMessagePending(ipcStatus, IPC_MSG_BIT):
+    inc nimFwDbgIpcMsgYield
+    nimFwDbgIpcMsgYieldStatus = ipcStatus
+    return
+
+  # No more messages: clear the kernel event, re-enable MSG IRQ, return.
+  # Blob calls ke_evt_clear only when exiting, not at entry.
+  ke_evt_clear(0x10000000'u32)
+  regWrite(IPC_EMB_UNMASK_SET, IPC_MSG_BIT)
 
 proc ipc_emb_radar_event_ind*() {.exportc, cdecl.} =
   ## Handle radar event indication.
@@ -28707,16 +28776,15 @@ proc mac_irq*() {.exportc, cdecl.} =
       return  # spurious -- both status regs zero
   # Read IRQ handler index
   let irqIdx = regRead(MAC_PL_IRQ_HANDLER)
-  when defined(bl808WifiNimFw):
-    let irqSlot = irqIdx and 0x3F'u32
-    if irqSlot == 53'u32 or irqSlot == 54'u32:
-      nimFwTrace2U32("[WIFI-NIMFW] macirq_tx ",
-                     irqSlot or (status0 shl 8),
-                     regRead(MAC_PL_IRQ_STATUS1))
-      when defined(bl808WifiConnectTrace):
-        nimFwConnectTrace2U32("[WIFI-CT] macirq_tx ",
-                              irqSlot or (status0 shl 8),
-                              regRead(MAC_PL_IRQ_STATUS1))
+  let irqSlot = irqIdx and 0x3F'u32
+  if irqSlot == 53'u32 or irqSlot == 54'u32:
+    nimFwTrace2U32("[WIFI-NIMFW] macirq_tx ",
+                   irqSlot or (status0 shl 8),
+                   regRead(MAC_PL_IRQ_STATUS1))
+    when defined(bl808WifiConnectTrace):
+      nimFwConnectTrace2U32("[WIFI-CT] macirq_tx ",
+                            irqSlot or (status0 shl 8),
+                            regRead(MAC_PL_IRQ_STATUS1))
   let handler = cast[proc() {.cdecl.}](intc_handler_tab[irqIdx and 0x3F])
   if handler == nil:
     assert_err("intc.c", "intc.c", 154)
@@ -28808,104 +28876,60 @@ proc notifier_chain_insert_ordered(headPtr: ptr pointer, notifier: ptr CoListHdr
   ##   offset 8: priority (int32, higher = inserted earlier)
   ## From blob: walks list via offset 4, compares int32 at offset 8.
   ## Inserts before the first node whose priority < new node's priority.
+  let newPrio = cast[ptr int32](cast[uint](notifier) + 8)[]
   var pos = headPtr
-  while true:
-    let cur = cast[ptr CoListHdr](pos[])
-    if cur == nil:
-      # End of list or empty: insert here
-      cast[ptr pointer](cast[uint](notifier) + 4)[] = nil
-      pos[] = cast[pointer](notifier)
-      break
+  var cur = cast[ptr CoListHdr](pos[])
+  while cur != nil:
     let curPrio = cast[ptr int32](cast[uint](cur) + 8)[]
-    let newPrio = cast[ptr int32](cast[uint](notifier) + 8)[]
     if curPrio < newPrio:
       # Insert notifier before cur
       cast[ptr pointer](cast[uint](notifier) + 4)[] = cast[pointer](cur)
       pos[] = cast[pointer](notifier)
-      break
+      return
     # Advance: pos = &cur->next (offset 4)
     pos = cast[ptr pointer](cast[uint](cur) + 4)
+    cur = cast[ptr CoListHdr](pos[])
+  # End of list or empty: insert here
+  cast[ptr pointer](cast[uint](notifier) + 4)[] = nil
+  pos[] = cast[pointer](notifier)
 
 proc notifier_chain_remove(headPtr: ptr pointer, notifier: ptr CoListHdr) =
   ## Remove a notifier from a singly-linked list by pointer match.
   ## From blob: walks list via offset 4 (next), compares pointer,
   ## unlinks by setting prev->next = node->next.
   var pos = headPtr
-  while true:
-    let cur = cast[ptr CoListHdr](pos[])
-    if cur == nil:
-      break  # not found
+  var cur = cast[ptr CoListHdr](pos[])
+  while cur != nil:
     if cur == notifier:
       # Unlink: *pos = notifier->next
       pos[] = cast[ptr pointer](cast[uint](notifier) + 4)[]
-      break
+      return
     pos = cast[ptr pointer](cast[uint](cur) + 4)
+    cur = cast[ptr CoListHdr](pos[])
 
 proc notifier_chain_regsiter*(chain: ptr CoList, notifier: ptr CoListHdr) {.exportc, cdecl.} =
   ## Register notifier with irqSave (64 bytes in blob, 30 instrs).
   ## From blob: irqSave, inline priority-ordered insert, irqRestore, return 0.
   let saved = irqSave()
-  var pos = cast[ptr pointer](addr chain.first)
-  while true:
-    let cur = cast[ptr CoListHdr](pos[])
-    if cur == nil:
-      cast[ptr pointer](cast[uint](notifier) + 4)[] = nil
-      pos[] = cast[pointer](notifier)
-      break
-    let curPrio = cast[ptr int32](cast[uint](cur) + 8)[]
-    let newPrio = cast[ptr int32](cast[uint](notifier) + 8)[]
-    if curPrio < newPrio:
-      cast[ptr pointer](cast[uint](notifier) + 4)[] = cast[pointer](cur)
-      pos[] = cast[pointer](notifier)
-      break
-    pos = cast[ptr pointer](cast[uint](cur) + 4)
+  notifier_chain_insert_ordered(cast[ptr pointer](addr chain.first), notifier)
   irqRestore(saved)
 
 proc notifier_chain_regsiter_fromCritical*(chain: ptr CoList, notifier: ptr CoListHdr) {.exportc, cdecl.} =
   ## Register notifier from critical section (26 bytes in blob).
   ## From blob: inline priority-ordered insert into singly-linked list.
-  var pos = cast[ptr pointer](addr chain.first)
-  while true:
-    let cur = cast[ptr CoListHdr](pos[])
-    if cur == nil:
-      cast[ptr pointer](cast[uint](notifier) + 4)[] = nil
-      pos[] = cast[pointer](notifier)
-      break
-    let curPrio = cast[ptr int32](cast[uint](cur) + 8)[]
-    let newPrio = cast[ptr int32](cast[uint](notifier) + 8)[]
-    if curPrio < newPrio:
-      cast[ptr pointer](cast[uint](notifier) + 4)[] = cast[pointer](cur)
-      pos[] = cast[pointer](notifier)
-      break
-    pos = cast[ptr pointer](cast[uint](cur) + 4)
+  notifier_chain_insert_ordered(cast[ptr pointer](addr chain.first), notifier)
 
 proc notifier_chain_unregsiter*(chain: ptr CoList, notifier: ptr CoListHdr) {.exportc, cdecl.} =
   ## Unregister notifier with irqSave (62 bytes in blob, 29 instrs).
   ## From blob: irqSave, inline walk singly-linked list, unlink, irqRestore, return 0.
   let saved = irqSave()
-  var pos = cast[ptr pointer](addr chain.first)
-  while true:
-    let cur = cast[ptr CoListHdr](pos[])
-    if cur == nil:
-      break
-    if cur == notifier:
-      pos[] = cast[ptr pointer](cast[uint](notifier) + 4)[]
-      break
-    pos = cast[ptr pointer](cast[uint](cur) + 4)
+  notifier_chain_remove(cast[ptr pointer](addr chain.first), notifier)
   irqRestore(saved)
 
 proc notifier_chain_unregsiter_fromCritical*(chain: ptr CoList, notifier: ptr CoListHdr) {.exportc, cdecl.} =
   ## Unregister notifier from critical section (22 bytes in blob).
   ## From blob: inline walk singly-linked list, find and unlink matching node.
-  var pos = cast[ptr pointer](addr chain.first)
-  while true:
-    let cur = cast[ptr CoListHdr](pos[])
-    if cur == nil:
-      break
-    if cur == notifier:
-      pos[] = cast[ptr pointer](cast[uint](notifier) + 4)[]
-      break
-    pos = cast[ptr pointer](cast[uint](cur) + 4)
+  notifier_chain_remove(cast[ptr pointer](addr chain.first), notifier)
 
 proc notifier_chain_call*(chain: ptr CoList, event: uint32, data: pointer) {.exportc, cdecl.} =
   ## Call all notifiers in the chain.
@@ -28990,30 +29014,32 @@ proc replay_counter_validate*(param: pointer): bool {.exportc, cdecl.} =
 proc assert_err*(cond: cstring, file: cstring, line: cint) {.exportc, cdecl.} =
   ## Fatal assertion handler (244 bytes in blob, 75 instrs).
   ## Blob ABI: (a0=cond_or_func, a1=source_file, a2=line_number).
-  ## Reloads logFn before each of 6 calls. Hangs forever after logging.
-  when defined(bl808WifiNimFw):
-    # Direct-UART trace so we can see which assert fired even when nimFwTrace
-    # is compiled out and the blob logFn is char-write-blind.
-    {.emit: """
-    extern void cfg_trace_rc(char *s, int v);
-    extern void cfg_trace(char *s);
-    cfg_trace("[NIMFW-ASSERT] file=");
-    cfg_trace(`file` ? `file` : "(null)");
-    cfg_trace_rc(" line=", `line`);
-    cfg_trace("[NIMFW-ASSERT] cond=");
-    cfg_trace(`cond` ? `cond` : "(null)");
-    cfg_trace("\r\n");
-    """.}
-    var traceBuf: array[96, char]
-    let name = if file != nil: file else: cond
-    if name != nil:
-      discard c_snprintf(addr traceBuf[0], traceBuf.len.csize_t,
-                         "[WIFI-NIMFW] assert %s:%d", name, line)
-    else:
-      discard c_snprintf(addr traceBuf[0], traceBuf.len.csize_t,
-                         "[WIFI-NIMFW] assert line %d", line)
-    nimFwTrace(cast[cstring](addr traceBuf[0]))
-    nimFwTraceU32("[WIFI-NIMFW] assert line ", cast[uint32](line))
+  ## Reloads logFn before each of 6 calls. The blob hangs forever after
+  ## logging; the pure Nim path records diagnostics and raises the firmware
+  ## reset event so CPS/coexistence service loops remain able to run.
+  noteAssertErr(file, line)
+  # Direct-UART trace so we can see which assert fired even when nimFwTrace
+  # is compiled out and the blob logFn is char-write-blind.
+  {.emit: """
+  extern void cfg_trace_rc(char *s, int v);
+  extern void cfg_trace(char *s);
+  cfg_trace("[NIMFW-ASSERT] file=");
+  cfg_trace(`file` ? `file` : "(null)");
+  cfg_trace_rc(" line=", `line`);
+  cfg_trace("[NIMFW-ASSERT] cond=");
+  cfg_trace(`cond` ? `cond` : "(null)");
+  cfg_trace("\r\n");
+  """.}
+  var traceBuf: array[96, char]
+  let name = if file != nil: file else: cond
+  if name != nil:
+    discard c_snprintf(addr traceBuf[0], traceBuf.len.csize_t,
+                       "[WIFI-NIMFW] assert %s:%d", name, line)
+  else:
+    discard c_snprintf(addr traceBuf[0], traceBuf.len.csize_t,
+                       "[WIFI-NIMFW] assert line %d", line)
+  nimFwTrace(cast[cstring](addr traceBuf[0]))
+  nimFwTraceU32("[WIFI-NIMFW] assert line ", cast[uint32](line))
   # Call 1: condition/function name
   let logFn1 = getLogFunc(76)
   if logFn1 != nil:
@@ -29042,8 +29068,10 @@ proc assert_err*(cond: cstring, file: cstring, line: cint) {.exportc, cdecl.} =
     logFn6(2, 0, nil, 158,
           dbg_assert_block[6], dbg_assert_block[7],
           dbg_assert_block[8], dbg_assert_block[9])
-  while true:
-    discard  # Hang on fatal error
+  let saved = irqSave()
+  hal_machw_disable_int()
+  ke_evt_set(0x80000000'u32)
+  irqRestore(saved)
 
 proc assert_rec*(cond: cstring, file: cstring, line: cint) {.exportc, cdecl.} =
   ## Recoverable assertion handler (248 bytes in blob, 79 instrs).
@@ -29061,10 +29089,9 @@ proc assert_rec*(cond: cstring, file: cstring, line: cint) {.exportc, cdecl.} =
     logFn(2, 0, nil, 94,
           dbg_assert_block[6], dbg_assert_block[7],
           dbg_assert_block[8], dbg_assert_block[9])
-  when defined(bl808WifiNimFw):
-    nimFwTrace2U32("[WIFI-NIMFW] assert_rec ",
-                   cast[uint32](line),
-                   cast[uint32](cast[uint](file)))
+  nimFwTrace2U32("[WIFI-NIMFW] assert_rec ",
+                 cast[uint32](line),
+                 cast[uint32](cast[uint](file)))
   # Call notification function from g_bl_ops_funcs[1] (byte offset 4, NOT 80)
   let notifyFn = blOpsFunc(4)
   if notifyFn != nil:
@@ -29919,7 +29946,7 @@ proc mm_start_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ##  10. Call ipc_emb_init(), mm_active()
   ##  11. Send MM_START_CFM with status 0 (success)
   let state = ke_state_get(TASK_MM)
-  if state != 0:
+  if state != MM_IDLE.uint16:
     assert_err("mm_task.c", "mm_task.c", 308)
   # Initialize PHY (blob: phy_init at 0x3a)
   {.emit: ["extern void phy_init(void*); phy_init(0);"].}
@@ -29936,7 +29963,7 @@ proc mm_start_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   # Request idle (blob: hal_machw_idle_req at 0x98)
   hal_machw_idle_req()
   # Set state (blob: ke_state_set at 0xa4)
-  ke_state_set(TASK_MM, 1)
+  ke_state_set(TASK_MM, MM_ACTIVE_STATE.uint16)
   return 0
 
 proc mm_version_req_handler*(param: pointer): cint {.exportc, cdecl.} =
@@ -29974,13 +30001,13 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
 
   # Preamble: check state, save pre-state if non-idle
   let curState = ke_state_get(srcId)
-  if curState != 0:
+  if curState != TaskIdleState:
     # Non-idle: save HW mode and task state, force idle
     let hwMode = regRead(MACHW_STATE_CNTRL_REG) and 0x0F'u32
     mm.hardwareMode = hwMode.uint8
     mm.previousState = ke_state_get(srcId).uint8
     hal_machw_idle_req()
-    ke_state_set(srcId, 2)  # MM_GOING_TO_IDLE
+    ke_state_set(srcId, TaskGoingIdleState)
     # Fast path: if SET_VIF_STATE with state=0, enable monitor RX
     if msgId == MM_SET_VIF_STATE_REQ and
         cast[ptr MmSetVifStateReqPayload](msgBody).state == 0:
@@ -30207,7 +30234,7 @@ proc mm_set_idle_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## If going active: calls mm_active.
   ## Sends MM_SET_IDLE_CFM (id=27) via basic send.
   let state = ke_state_get(TASK_ME)
-  if state == 3:
+  if state == HW_ACTIVE.uint16:
     return 2  # CONNECTED state, return SAVED
   let idle = mmSetIdleReqView(param).idle
   let mm = mmEnvView()
@@ -30215,7 +30242,7 @@ proc mm_set_idle_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   if idle != 0:
     # Going idle
     let curState = ke_state_get(TASK_ME)
-    if curState == 0:
+    if curState == MeIdleState:
       # Already idle - verify HW idle, then send cfm
       let hwState = regRead(MACHW_STATE_CNTRL_REG) and 0x0F'u32
       if hwState != 0:
@@ -30224,14 +30251,14 @@ proc mm_set_idle_req_handler*(param: pointer): cint {.exportc, cdecl.} =
       mm.hardwareMode = 0
       ke_msg_send_basic(MM_SET_IDLE_CFM, TASK_API, TASK_ME)
       return 0
-    if curState == 2:
+    if curState == MeGoingIdleState:
       return 0  # Already in idle transition
     hal_machw_idle_req()
-    ke_state_set(TASK_ME, 2)
+    ke_state_set(TASK_ME, MeGoingIdleState)
   else:
     # Going active
     let curState = ke_state_get(TASK_ME)
-    if curState == 2:
+    if curState == MeGoingIdleState:
       return 0
     mm_active()
     ke_msg_send_basic(MM_SET_IDLE_CFM, TASK_API, TASK_ME)
@@ -30243,14 +30270,14 @@ proc mm_set_idle_cfm_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## If me_env[0x7e] != 0xFF, sends ME_SET_ACTIVE_REQ via ke_msg_send_basic.
   ## Then ke_state_set(dest_id, 0) to transition to IDLE.
   let state = ke_state_get(TASK_ME)
-  if state != 1:
+  if state != MeBusyState:
     assert_err("me_task.c", "me_task.c", 504)
   # Check if ME has a connection (me_env byte at offset 0x7e)
   let meBase = cast[uint](addr me_env[0])
   let connIdx = cast[ptr uint8](meBase + 0x7E)[]
   if connIdx != 0xFF:
     ke_msg_send_basic(ME_SET_ACTIVE_REQ, TASK_ME, TASK_ME)
-  ke_state_set(TASK_ME, 0)
+  ke_state_set(TASK_ME, MeIdleState)
   return 0
 
 proc mm_sta_add_req_handler*(param: pointer) {.exportc, cdecl.} =
@@ -30360,12 +30387,12 @@ proc mm_set_ps_mode_cfm_handler*(param: pointer) {.exportc, cdecl.} =
   ## with wrong msg IDs and wrong next-state values. Blob is single-symbol,
   ## parameterised by caller task via a2.
   let srcTask = keMsgHdrFromPayload(param).destId
-  if ke_state_get(srcTask) != 1:
+  if ke_state_get(srcTask) != TaskActiveState:
     assert_err("mm_task.c", "mm_task.c", 609)
   let marker = cast[ptr uint8](cast[uint](addr me_env[0]) + 0x7E)[]
   if marker != 0xFF'u8:
     ke_msg_send_basic(ME_SET_PS_DISABLE_CFM, srcTask, 0'u8)
-  ke_state_set(srcTask, 0)
+  ke_state_set(srcTask, TaskIdleState)
 
 proc mm_set_ps_options_req_handler*(param: pointer) {.exportc, cdecl.} =
   ## Handle MM_SET_PS_OPTIONS_REQ (132 bytes in blob, 44 instrs).
@@ -30452,9 +30479,9 @@ proc mm_bcn_change_req_handler*(param: pointer) {.exportc, cdecl.} =
 
 proc mm_bcn_change_cfm_handler*(param: pointer) {.exportc, cdecl.} =
   ## Handle MM_BCN_CHANGE_CFM: beacon change confirmed.
-  ## Blob (mm_bcn.o, 66b): ke_state_get(APM)→assert state==2→apm_start_cfm(0)→return 0
+  ## Blob (mm_bcn.o, 66b): assert APM starting, then apm_start_cfm(0).
   let state = ke_state_get(TASK_APM)
-  if state != 2:
+  if state != ApmStartingState:
     assert_err("mm_bcn.c", "mm_bcn.c", 353)
   apm_start_cfm(nil)
 
@@ -30588,7 +30615,7 @@ proc mm_connection_loss_ind_handler*(param: pointer) {.exportc, cdecl.} =
 
   # Check SM state (blob: ke_state_get(TASK_SM))
   let smState = ke_state_get(TASK_SM)
-  if smState != 0:
+  if smState != SmIdleState:
     return  # SM not idle, can't process disconnect
 
   let vif = vifChannelForIdx(ind.vifIdx)
@@ -30597,8 +30624,8 @@ proc mm_connection_loss_ind_handler*(param: pointer) {.exportc, cdecl.} =
   if vif.state == 0:
     return  # not active
 
-  # Set SM state to disconnecting (blob: ke_state_set(SM, 10))
-  ke_state_set(TASK_SM, 10)
+  # Set SM state to disconnecting.
+  ke_state_set(TASK_SM, SmDisconnectingState)
 
   # Set connection TLV (blob: sm_connection_tlv_set at 0x4a)
   sm_connection_tlv_set(0, nil, 0)  # stub in blob (just ret)
@@ -30610,19 +30637,18 @@ proc mm_bss_param_setting_handler*(param: pointer) {.exportc, cdecl.} =
   ## Handle STA BSS parameter-setting confirmations.
   let smListPtr = addr smEnvView().pendingBssParams
   let smState = ke_state_get(TASK_SM)
-  when defined(bl808WifiNimFw):
-    let hdr = keMsgHdrFromPayload(param)
-    nimFwTrace2U32("[WIFI-NIMFW] bss_cfm_sm ",
-                   smState.uint32 or (hdr.id.uint32 shl 16),
-                   cast[uint32](cast[uint](smListPtr.first)))
-  if smState == 4:
+  let hdr = keMsgHdrFromPayload(param)
+  nimFwTrace2U32("[WIFI-NIMFW] bss_cfm_sm ",
+                 smState.uint32 or (hdr.id.uint32 shl 16),
+                 cast[uint32](cast[uint](smListPtr.first)))
+  if smState == SmSettingBssState:
     sm_send_next_bss_param(param)
     return
-  if smState == 0 and smListPtr.first != nil:
-    ke_state_set(TASK_SM, 4)
+  if smState == SmIdleState and smListPtr.first != nil:
+    ke_state_set(TASK_SM, SmSettingBssState)
     sm_send_next_bss_param(param)
     return
-  if smState != 0 and smState != 10:
+  if smState != SmIdleState and smState != SmDisconnectingState:
     # SM-copy invariant guard (blob sm_task.o line 265 assert_err).
     assert_err("sm_task.c", "sm_task.c", 265)
   return
@@ -30656,16 +30682,16 @@ proc mm_force_idle_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## at the state==0 path that the blob never issues. The blob's "status"
   ## is returned only via the callback (s0 return value is 0 on success).
   let state = ke_state_get(TASK_MM)
-  if state == 0:
+  if state == MM_IDLE.uint16:
     let hwState = regRead(MACHW_STATE_CNTRL_REG) and 0xF'u32
     if hwState != 0:
       assert_err("mm_task.c", "mm_task.c", 1013)
-    ke_state_set(TASK_MM, 3)
+    ke_state_set(TASK_MM, HW_ACTIVE.uint16)
     let callbackPtr = cast[ptr pointer](param)[]
     if callbackPtr != nil:
       cast[proc() {.cdecl.}](callbackPtr)()
     return 0
-  elif state == 2:
+  elif state == MM_GOING_TO_IDLE.uint16:
     return 2
   else:
     hal_machw_idle_req()
@@ -30782,10 +30808,10 @@ proc scheduleActiveScanProbeTimer*(scanParam: pointer) {.inline.} =
   ke_timer_set(SCAN_PROBE_TIMER, TASK_SCAN, duration shr 1)
 
 proc scanTaskInChannelRunningState*(): bool {.inline.} =
-  ke_state_get(TASK_SCAN) == SCAN_STATE_CHANNEL_RUNNING
+  ke_state_get(TASK_SCAN) == ScanChannelRunningState
 
 proc enterScanChannelRunningState*() {.inline.} =
-  ke_state_set(TASK_SCAN, SCAN_STATE_CHANNEL_RUNNING)
+  ke_state_set(TASK_SCAN, ScanChannelRunningState)
 
 proc sendPeriodicScanProbeRequest*() {.inline.} =
   discard scan_probe_req_tx(nil)
@@ -30797,7 +30823,7 @@ proc mm_scan_channel_start_ind_handler*(param: pointer): cint {.exportc, cdecl.}
   ## register (0x24B00060), calls scan_set_channel_request, sends SCAN_DONE_IND
   ## with ke_msg_alloc(0x407, 1, 3, ...), sets ke_state(SCAN, 3).
   let state = ke_state_get(TASK_SCAN)
-  if state != 2:
+  if state != ScanChannelPendingState:
     assert_err("scan_task.c", "scan_task.c", 159)
   # Read scan env parameters
   let scanParam = scan_env.paramPtr
@@ -30834,7 +30860,7 @@ proc sendScanDoneIndication*() {.inline.} =
   ke_msg_send_basic(SCAN_DONE_IND, scan_env.requester, TASK_SCAN)
 
 proc finishCompletedScanTask*() {.inline.} =
-  ke_state_set(TASK_SCAN, 0)
+  ke_state_set(TASK_SCAN, ScanIdleState)
 
 proc mm_scan_channel_end_ind_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle scan channel end indication (68 instrs in blob).
@@ -30844,7 +30870,7 @@ proc mm_scan_channel_end_ind_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## OR abort flag set, sends scan done msg and resets. Otherwise calls
   ## scan_set_channel_request for next channel.
   let state = ke_state_get(TASK_SCAN)
-  if state != 3:
+  if state != ScanChannelRunningState:
     assert_err("scan_task.c", "scan_task.c", 234)
   # Clear scan timer (blob: ke_timer_clear at 0x3a)
   let scanTimerId = KE_FIRST_MSG(TASK_SCAN.uint16) + 2  # SCAN_CHANNEL_TO_IND
@@ -30875,7 +30901,7 @@ proc mm_scan_channel_end_early_handler*(param: pointer): cint {.exportc, cdecl.}
   ## From blob (scan_task.o): checks ke_state_get(SCAN)!=0 (asserts at line 186).
   ## Then calls scan_terminate_channel_request to abort current channel.
   let state = ke_state_get(TASK_SCAN)
-  if state == 0:
+  if state == ScanIdleState:
     assert_err("scan_task.c", "scan_task.c", 186)
   scan_terminate_channel_request()
   return 0
@@ -30937,7 +30963,7 @@ proc scan_start_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   let scanState = ke_state_get(TASK_SCAN)
   var cfmStatus = SCAN_STATUS_OK
   var doDownload = true
-  if scanState != 0:
+  if scanState != ScanIdleState:
     cfmStatus = SCAN_STATUS_BUSY
     doDownload = false
   else:
@@ -30993,7 +31019,7 @@ proc scan_done_ind_handler*(param: pointer): cint {.exportc, cdecl.} =
   scanu_cached_scanresult_clear()
   if msg != nil:
     ke_msg_send(msg)
-  ke_state_set(TASK_SCANU, 0)
+  ke_state_set(TASK_SCANU, ScanuIdleState)
   return 0
 
 proc scan_cancel_req_handler*(param: pointer): cint {.exportc, cdecl.} =
@@ -31003,7 +31029,7 @@ proc scan_cancel_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## and returns. If scan is idle, calls scan_send_cancel_cfm(status=1, src_id)
   ## so the requester still gets a confirmation.
   let state = ke_state_get(TASK_SCAN)
-  if state != 0:
+  if state != ScanIdleState:
     scan_env.abortFlag = 1
   else:
     scan_send_cancel_cfm(1)
@@ -31021,9 +31047,9 @@ proc scan_abort_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Nim invented both, which meant an extra IPC message + premature
   ## scan-state reset on every abort.
   let state = ke_state_get(TASK_SCAN)
-  if state != 0:
+  if state != ScanIdleState:
     scan_env.abortFlag = 1
-    if state == 3:
+    if state == ScanChannelRunningState:
       scan_terminate_channel_request()
   let logPtr = blOpsFunc(4)
   if logPtr != nil:
@@ -31086,7 +31112,7 @@ proc scanu_start_cfm_handler*(param: pointer) {.exportc, cdecl.} =
 
   # Assert SM state is 1 (scanning)
   let smState = ke_state_get(TASK_SM)
-  if smState != 1:
+  if smState != SmScanningState:
     # Blob uses assert_err here.
     assert_err(cast[cstring](0), cast[cstring](0), 402)
 
@@ -31126,7 +31152,7 @@ proc scanu_join_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ##   7. Clear scanu_env.found (offset specific), set scan duration (0xA00=2560)
   ##   8. Check param[286] bit0 (scan type), if set: ASSERT (line 191)
   ##   9. Call scan_start() to begin the targeted scan
-  ##  10. If scan_start succeeds: ke_state_set(TASK_SCANU, 2), store scan result,
+  ##  10. If scan_start succeeds: ke_state_set(TASK_SCANU, ScanuJoiningState), store scan result,
   ##      call scanu_confirm, clear link, send SCANU_JOIN_CFM
   ##  11. If fails: call scanu_confirm(fail)
   let req = scanuStartReqView(param)
@@ -31167,7 +31193,7 @@ proc scanu_join_req_handler*(param: pointer): cint {.exportc, cdecl.} =
     let existingEntry = scanuResultAt(existing)
     let rawMsg = existingEntry.rawMsgPtr
     if rawMsg != nil:
-      ke_state_set(TASK_SCANU, 1)
+      ke_state_set(TASK_SCANU, ScanuScanningState)
       scanu_env.pendingRawMsg = rawMsg
       ke_msg_send(rawMsg)
       existingEntry.rawMsgPtr = nil
@@ -31179,7 +31205,7 @@ proc scanu_join_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   scanu_start(param)
 
   # Scan started, set state
-  ke_state_set(TASK_SCANU, 2)
+  ke_state_set(TASK_SCANU, ScanuJoiningState)
   return 1
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void scanu_join_cfm_handler(void*);".}
@@ -31193,7 +31219,7 @@ proc scanu_join_cfm_handler*(param: pointer) {.exportc, cdecl.} =
   ## If bit31 not set: check sm_env[16] flag for sm_join_bss path, else
   ## sm_connect_ind with various error codes (13,14,17,18).
   let state = ke_state_get(TASK_SM)
-  if state != 2:
+  if state != SmWaitingState:
     assert_err("sm_task.c", "sm_task.c", 445)
   let sm = smEnvView()
   # Check cancelled flag
@@ -31242,7 +31268,7 @@ proc scanu_join_cfm_handler*(param: pointer) {.exportc, cdecl.} =
         # sm_env+19 holds connection flags, not the quick-connect setting.
         msg.quickConn = 0
         ke_msg_send(msg)
-      ke_state_set(TASK_SM, 3)
+      ke_state_set(TASK_SM, SmAddingChanState)
     # Copy connection flags to vif[1496]
     let connFlags = ci.channelDuration
     vifKeyPointersAt(vifBase).flags = connFlags
@@ -31447,7 +31473,7 @@ proc sm_disconnect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   inc nimFwDbgDisconnectReq
   let state = ke_state_get(TASK_SM)
   nimFwDbgDisconnectReqState = state.uint32
-  if state != 0:
+  if state != SmIdleState:
     return 2
   sm_connection_tlv_set(0, nil, 0)  # stub (just ret in blob)
   let vifIdx = smReqVifIdxOrZero(param)
@@ -31460,9 +31486,9 @@ proc sm_disconnect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
 proc sm_connect_abort_req_handler*(param: pointer) {.exportc, cdecl.} =
   ## Handle SM_CONNECT_ABORT_REQ: abort ongoing connection (198 bytes in blob).
   ## Blob dispatches on SM state:
-  ##   0:       send cfm with status=0
-  ##   1 (scan): set sm_env abort flag, send SCAN_ABORT_REQ, clear scan cache, send cfm
-  ##   2:       set sm_env abort flag, send cfm
+  ##   idle:    send cfm with status=0
+  ##   scan:    set sm_env abort flag, send SCAN_ABORT_REQ, clear scan cache, send cfm
+  ##   waiting: set sm_env abort flag, send cfm
   ##   3,4:     return 2 (msg requeued)
   ##   6,8,9:   call sm_handle_connection(abort), clear cfm status, send cfm
   ##   other:   send cfm with status=state
@@ -31471,20 +31497,21 @@ proc sm_connect_abort_req_handler*(param: pointer) {.exportc, cdecl.} =
     ke_msg_alloc(SM_CONNECT_ABORT_CFM, TASK_API, TASK_SM,
                  StatusCfmPayloadSize))
   let sm = smEnvView()
-  if state > 2 and state <= 4:
+  if state > SmWaitingState and state <= SmSettingBssState:
     # States 3,4: message will be requeued (return 2)
     return
-  elif state == 1:
+  elif state == SmScanningState:
     # Scanning: mark abort, cancel scan, clear cache
     sm.cancelRequested = state.uint8
     ke_msg_send_basic(SCAN_ABORT_REQ, TASK_SCAN, TASK_SM)
     scanu_cached_scanresult_clear()
     if cfm != nil:
       cfm.status = state.uint8
-  elif state == 2:
+  elif state == SmWaitingState:
     # Waiting: mark abort flag
     sm.cancelRequested = 1
-  elif state == 6 or state == 8 or state == 9:
+  elif state == SmAuthenticatingState or state == SmAssocRspState or
+      state == SM_ACTIVATING_STATE:
     # Connected/active: call sm_handle_connection with abort
     let vifIdx = smReqVifIdxOrZero(param)
     sm_handle_connection(vifIdx.uint32, 24,
@@ -31500,7 +31527,7 @@ proc sm_rsp_timeout_ind_handler*(param: pointer) {.exportc, cdecl.} =
   ## Handle SM_RSP_TIMEOUT_IND: auth/assoc response timeout (126 bytes in blob).
   ## Blob: loads sm_env[0] (connection env), ke_state_get(SM), then:
   ##   - If no connection env: return 0
-  ##   - State must be 6 or 7 (auth/assoc in progress after channel grant)
+  ##   - State must be in the auth/assoc response window after channel grant
   ##   - Check retry count (conn_env[60]) vs max retries (sm_env word at byte 24)
   ##   - If retries available: increment, state 6 -> wpa_cbs[64]() + sm_auth_send_pre(1,0);
   ##     state 7 -> sm_assoc_req_send_pre()
@@ -31515,9 +31542,7 @@ proc sm_rsp_timeout_ind_handler*(param: pointer) {.exportc, cdecl.} =
                           state.uint32, cast[uint32](cast[uint](connEnv)))
   if connEnv == nil:
     return
-  # Check state is 6 or 7: (state-6) & ~3 must be 0
-  let stateCheck = (state.uint32 - 6) and (not 3'u32)
-  if stateCheck != 0:
+  if state < SmAuthenticatingState or state > SM_ACTIVATING_STATE:
     return
   let retryCount = connectInfoAuthRetry(connEnv)[]
   let maxRetries = sm.authRetryLimit
@@ -31532,7 +31557,7 @@ proc sm_rsp_timeout_ind_handler*(param: pointer) {.exportc, cdecl.} =
     return
   # Increment retry count
   connectInfoAuthRetry(connEnv)[] = retryCount + 1
-  if state == 6:
+  if state == SmAuthenticatingState:
     # Auth timeout: call wpa_cbs[64] callback, then retry auth
     if wpa_cbs != nil:
       let wpaCbFn = cast[ptr pointer](cast[uint](wpa_cbs) + 64)[]
@@ -31540,7 +31565,7 @@ proc sm_rsp_timeout_ind_handler*(param: pointer) {.exportc, cdecl.} =
         cast[proc() {.cdecl.}](wpaCbFn)()
     sm_auth_send_pre(1'u16, 0)
   else:
-    # Assoc timeout (state 7): retry association
+    # Assoc/activation timeout: retry association
     sm_assoc_req_send_pre(nil)
 
 proc sm_sa_query_timeout_ind_handler*(param: pointer) {.exportc, cdecl.} =
@@ -31568,8 +31593,7 @@ proc sm_sa_query_timeout_ind_handler*(param: pointer) {.exportc, cdecl.} =
   let vifBase = cast[uint](addr vif_info_tab[0]) + vifIdx.uint * VIF_ENTRY_SIZE.uint
   # Clear SA query flag
   sm.saQueryActive = 0
-  # Set SM state to 10 (disconnecting)
-  ke_state_set(TASK_SM, 10)
+  ke_state_set(TASK_SM, SmDisconnectingState)
   # Log via g_bl_ops_funcs
   let logFn = blOpsFunc(204)
   if logFn != nil:
@@ -31597,8 +31621,7 @@ proc sm_disconnect*(param: pointer) {.exportc, cdecl.} =
     return  # not a STA VIF
   if vif.state == 0:
     return  # VIF not active
-  # Set SM state to disconnecting (state 10)
-  ke_state_set(TASK_SM, 10)
+  ke_state_set(TASK_SM, SmDisconnectingState)
   let staIdx = vif.staIdx
   let reason = smDisconnectReasonOrDefault(param)
   # Allocate TX frame for deauth (blob: txl_frame_get with 512 byte payload)
@@ -31700,7 +31723,7 @@ proc sm_delete_resources*() {.exportc, cdecl.} =
   # Clear sm_env[484] (status word)
   vifApConfig(vif).securityFlags = 0
   sm.connectInfo = nil
-  ke_state_set(TASK_SM, 0)
+  ke_state_set(TASK_SM, SmIdleState)
 
 proc sm_auth_assoc_send_according_chan*(nextState: uint16 = 0, param1: uint16 = 0, param2: uint32 = 0) {.exportc, cdecl.} =
   ## Send auth/assoc on appropriate channel (226 bytes in blob, 57 instrs).
@@ -31733,9 +31756,9 @@ proc sm_auth_assoc_send_according_chan*(nextState: uint16 = 0, param1: uint16 = 
                      nextState.uint32, chanCnt.uint32)
       nimFwConnectTrace2U32("[WIFI-CT] auth_direct ",
                             nextState.uint32, chanCnt.uint32)
-    if nextState == 5:
+    if nextState == SmAuthStartingState:
       sm_auth_send(param1, param2)
-    elif nextState == 7:
+    elif nextState == SmAssociatingState:
       sm_assoc_req_send(nil)
     return
   # Check remaining channel time
@@ -31753,9 +31776,9 @@ proc sm_auth_assoc_send_according_chan*(nextState: uint16 = 0, param1: uint16 = 
                      nextState.uint32, remaining)
       nimFwConnectTrace2U32("[WIFI-CT] auth_short ",
                             nextState.uint32, remaining)
-    if nextState == 5:
+    if nextState == SmAuthStartingState:
       sm_auth_send(param1, param2)
-    elif nextState == 7:
+    elif nextState == SmAssociatingState:
       sm_assoc_req_send(nil)
     return
   # Multi-channel path: allocate channel-switch message
@@ -31828,7 +31851,7 @@ proc apm_start_req_handler*(param: pointer) {.exportc, cdecl.} =
 
   if not earlyExit:
     let state = ke_state_get(TASK_APM)
-    if state != 0:
+    if state != ApmIdleState:
       errorCode = 8  # BUSY
       earlyExit = true
 
@@ -32041,7 +32064,7 @@ proc apm_stop_req_handler*(param: pointer) {.exportc, cdecl.} =
 
   if vif.vifType == VIF_TYPE_AP and vif.state != 0:
     let state = ke_state_get(TASK_APM)
-    if state != 0:
+    if state != ApmIdleState:
       # Check and clear hostapd_enabled flag at apm_env+0x55
       if apm.beaconIntervalIndex != 0:
         apm.beaconIntervalIndex = 0
@@ -32078,9 +32101,9 @@ proc apm_sta_add_cfm_handler*(param: pointer) {.exportc, cdecl.} =
   ##           cb = wpa_cbs[36]
   ##           cb(param, sta_info_tab[staIdx + 1 ...]) via T-Head custom insn
   ##         return
-  ##   # fall-through: no slot matched — blob emits `sb zero, 13(zero); ebreak`
-  ##   # which is a hard panic marker the RTOS traps. We reproduce the intent
-  ##   # with assert_err so the same miscompile is reported at runtime.
+  ##   # fall-through: no slot matched. The blob emits a hard fault marker here;
+  ##   # the pure Nim path records the mismatch and returns so the scheduler
+  ##   # remains serviceable.
   let cfm = apmStaAddCfmParamView(param)
   let staIdx = cfm.staIdx
   let sta = staInfoForIdx(staIdx)
@@ -32101,10 +32124,8 @@ proc apm_sta_add_cfm_handler*(param: pointer) {.exportc, cdecl.} =
               let stored = cast[uint32](slot.staHandle)
               cast[proc(p: pointer, v: uint32) {.cdecl.}](cbFn)(param, stored)
         return
-  # No matching slot — blob traps via `sb zero, 13(zero)` (store to NULL+13,
-  # causes an access fault on E907) followed by `ebreak`. Emit the equivalent
-  # directly so we don't add a spurious assert_err call to the graph.
-  {.emit: "__asm__ volatile(\"sb zero, 13(zero)\\n\\tebreak\");".}
+  inc nimFwDbgApmStaAddNoSlot
+  nimFwDbgApmStaAddNoSlotSta = staIdx.uint32
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void apm_sta_del_req_handler(void*);".}
 proc apm_sta_del_req_handler*(param: pointer) {.exportc, cdecl.} =
@@ -32283,7 +32304,7 @@ proc me_config_req_handler*(param: pointer) {.exportc, cdecl.} =
     if cfm != nil:
       cfm.status = 2
       ke_msg_send(cfm)
-    ke_state_set(TASK_ME, 1)
+    ke_state_set(TASK_ME, MeBusyState)
 
 proc me_chan_config_req_handler*(param: pointer) {.exportc, cdecl.} =
   ## Handle ME_CHAN_CONFIG_REQ: configure channel parameters.
@@ -32401,12 +32422,12 @@ proc me_sta_del_req_handler*(param: pointer) {.exportc, cdecl.} =
 proc me_set_active_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle ME_SET_ACTIVE_REQ (196 bytes in blob, 52 instrs).
   ## From blob (me_task.o): manages per-VIF bitmask me_env.active_mask(offset 0).
-  ## If state==BUSY(1): returns 2. Reads req[0]=active(bool), req[1]=vif_idx.
+  ## If ME is busy: returns 2. Reads req[0]=active(bool), req[1]=vif_idx.
   ## If active: set bit; else clear bit. Allocates ME_SET_ACTIVE_CFM (id=26),
   ## sets status=seqz(mask), sends cfm, transitions to BUSY.
   ## Fast path: if mask already 0 and deactivating, just send basic cfm.
   let state = ke_state_get(TASK_ME)
-  if state == 1:
+  if state == MeBusyState:
     return 2  # ME_BUSY, message saved
   let me = meEnvView()
   let hdr = keMsgHdrFromPayload(param)
@@ -32439,26 +32460,26 @@ proc me_set_active_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   if cfm != nil:
     cfm.status = if newMask == 0: 1'u8 else: 0'u8
     ke_msg_send(cfm)
-  ke_state_set(TASK_ME, 1)  # Transition to ME_BUSY
+  ke_state_set(TASK_ME, MeBusyState)
   return 0
 
 proc me_set_active_cfm_handler_sm*(param: pointer) {.exportc: "me_set_active_cfm_handler_sm", cdecl.} =
   ## Blob sm_task.o::me_set_active_cfm_handler (136 bytes).
   ## Only touches TASK_SM state. Blob flow (three ke_state_get reads):
-  ##   1. if state == 4 → .L31
-  ##   2. else if state == 10 → .L31
+  ##   1. if state == setting-BSS → .L31
+  ##   2. else if state == disconnecting → .L31
   ##   3. else → assert_err(690), falls through to .L31
-  ##   .L31: if ke_state_get(SM) == 10 → ke_state_set(SM, 0); return
+  ##   .L31: if ke_state_get(SM) == disconnecting → set idle; return
   ##   .L33: if sm_env[17] != 0 → sm_deauth_send; sm_env[17] = 0
   ##         sm_auth_start(NULL)
-  if ke_state_get(TASK_SM) == 4:
+  if ke_state_get(TASK_SM) == SmSettingBssState:
     discard
-  elif ke_state_get(TASK_SM) == 10:
+  elif ke_state_get(TASK_SM) == SmDisconnectingState:
     discard
   else:
     assert_err("me_task.c", "me_task.c", 690)
-  if ke_state_get(TASK_SM) == 10:
-    ke_state_set(TASK_SM, 0)
+  if ke_state_get(TASK_SM) == SmDisconnectingState:
+    ke_state_set(TASK_SM, SmIdleState)
     return
   let sm = smEnvView()
   let deauthFlag = sm.deauthPending
@@ -32489,19 +32510,19 @@ proc me_set_active_cfm_handler_apm*(param: pointer) {.exportc: "me_set_active_cf
   ## caching, so we mirror that explicitly to preserve assert-then-retry
   ## semantics (the state could in theory change between calls if another
   ## task pre-empts — the blob's redundancy protects against that).
-  ##   1. if ke_state_get(APM) == 1 → jump to .L69 (skip assert)
-  ##   2. else if ke_state_get(APM) == 0 → jump to .L69
+  ##   1. if ke_state_get(APM) == active → jump to .L69 (skip assert)
+  ##   2. else if ke_state_get(APM) == idle → jump to .L69
   ##   3. else → assert_err(313)
-  ##   .L69: if ke_state_get(APM) == 1:
+  ##   .L69: if ke_state_get(APM) == active:
   ##     if apm_env[4] != NULL → assert_err(320)
   ##     apm_bcn_set(NULL)
-  if ke_state_get(TASK_APM) == 1:
+  if ke_state_get(TASK_APM) == ApmActiveState:
     discard
-  elif ke_state_get(TASK_APM) == 0:
+  elif ke_state_get(TASK_APM) == ApmIdleState:
     discard
   else:
     assert_err("apm_task.c", "apm_task.c", 313)
-  if ke_state_get(TASK_APM) == 1:
+  if ke_state_get(TASK_APM) == ApmActiveState:
     if apmEnvView().pendingBssParams.first != nil:
       assert_err("apm_task.c", "apm_task.c", 320)
     apm_bcn_set(nil)
@@ -32521,7 +32542,7 @@ proc me_set_ps_disable_req_handler*(param: pointer): cint {.exportc, cdecl.} =
     ke_msg_send_basic(ME_SET_PS_DISABLE_CFM, reqSrc, reqDst)
     return 0
   let state = ke_state_get(TASK_ME)
-  if state == 1:
+  if state == MeBusyState:
     return 2  # ME_BUSY
   let oldMask = me.psDisableMask
   let req = cast[ptr MeSetPsDisableReqPayload](param)
@@ -32548,29 +32569,29 @@ proc me_set_ps_disable_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   if cfm != nil:
     cfm.status = if newMask == 0: 2'u8 else: 0'u8
     ke_msg_send(cfm)
-  ke_state_set(TASK_ME, 1)
+  ke_state_set(TASK_ME, MeBusyState)
   return 0
 
 proc me_set_ps_disable_cfm_handler_sm*(param: pointer) {.exportc: "me_set_ps_disable_cfm_handler_sm", cdecl.} =
   ## Blob sm_task.o (108 bytes). Linear structure: 4 ke_state_get calls
-  ## matching 4, 0, 10; assert_err on miss; then shared tail that
-  ## re-reads state and tail-calls sm_send_next_bss_param if state==4.
+  ## matching setting-BSS, idle, disconnecting; assert_err on miss; then shared
+  ## tail that re-reads state and tail-calls sm_send_next_bss_param if setting-BSS.
   block sendTail:
-    if ke_state_get(TASK_SM) == 4: break sendTail
-    if ke_state_get(TASK_SM) == 0: break sendTail
-    if ke_state_get(TASK_SM) == 10: break sendTail
+    if ke_state_get(TASK_SM) == SmSettingBssState: break sendTail
+    if ke_state_get(TASK_SM) == SmIdleState: break sendTail
+    if ke_state_get(TASK_SM) == SmDisconnectingState: break sendTail
     assert_err("me_task.c", "me_task.c", 630)
-  if ke_state_get(TASK_SM) == 4:
+  if ke_state_get(TASK_SM) == SmSettingBssState:
     sm_send_next_bss_param(param)
 
 proc me_set_ps_disable_cfm_handler_apm*(param: pointer) {.exportc: "me_set_ps_disable_cfm_handler_apm", cdecl.} =
   ## Blob apm_task.o (92 bytes). Same linear structure as _sm but with
-  ## TASK_APM and states {1, 0}; assert at line 248; shared tail call.
+  ## TASK_APM and states {active, idle}; assert at line 248; shared tail call.
   block sendTail:
-    if ke_state_get(TASK_APM) == 1: break sendTail
-    if ke_state_get(TASK_APM) == 0: break sendTail
+    if ke_state_get(TASK_APM) == ApmActiveState: break sendTail
+    if ke_state_get(TASK_APM) == ApmIdleState: break sendTail
     assert_err("apm_task.c", "apm_task.c", 248)
-  if ke_state_get(TASK_APM) == 1:
+  if ke_state_get(TASK_APM) == ApmActiveState:
     apm_send_next_bss_param(param)
 
 
@@ -32838,9 +32859,7 @@ proc chan_tbtt_schedule*(tbttEntry: pointer) {.exportc, cdecl.} =
     chan_tbtt_insert(tbttEntry)
     # Process all entries in the TBTT list
     let tbttList = chanTbttReschedList()
-    while true:
-      if tbttList.first == nil:
-        break
+    while tbttList.first != nil:
       let entry = co_list_pop_front(tbttList)
       if entry == nil:
         break
@@ -33402,7 +33421,7 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
     case subtypeBits.int
     of 0x80:  # Beacon (blob .L70 at 0x3be)
       let state = ke_state_get(TASK_SCAN)
-      if state == 2 or state == 3:
+      if state == ScanChannelPendingState or state == ScanChannelRunningState:
         skipSecHdr = true
         msgSubtype = 2
       else:
@@ -33542,16 +33561,15 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
         accepted = 0
 
   # --- Message allocation and population (blob 0x2c8-0x518) ---
-  when defined(bl808WifiNimFw):
-    let dbgState = ke_state_get(TASK_SCAN).uint32
-    let dbgMgt0 = (accepted.uint32 shl 24) or
-      (msgSubtype.uint32 shl 16) or (vifIdx.uint32 shl 8) or rxuEnvVifIdx.uint32
-    let dbgMgt1 = (dbgState shl 24) or
-      (bodyLen.uint32 shl 8) or machdrLen.uint32
-    nimFwTrace2U32("[WIFI-NIMFW] mgt_pre ", dbgMgt0, dbgMgt1)
-    when defined(bl808WifiConnectTrace):
-      if subtypeBits == 0xB0'u16 or subtypeBits == 0x10'u16 or subtypeBits == 0x30'u16:
-        nimFwConnectTrace2U32("[WIFI-CT] mgt_pre ", dbgMgt0, dbgMgt1)
+  let dbgState = ke_state_get(TASK_SCAN).uint32
+  let dbgMgt0 = (accepted.uint32 shl 24) or
+    (msgSubtype.uint32 shl 16) or (vifIdx.uint32 shl 8) or rxuEnvVifIdx.uint32
+  let dbgMgt1 = (dbgState shl 24) or
+    (bodyLen.uint32 shl 8) or machdrLen.uint32
+  nimFwTrace2U32("[WIFI-NIMFW] mgt_pre ", dbgMgt0, dbgMgt1)
+  when defined(bl808WifiConnectTrace):
+    if subtypeBits == 0xB0'u16 or subtypeBits == 0x10'u16 or subtypeBits == 0x30'u16:
+      nimFwConnectTrace2U32("[WIFI-CT] mgt_pre ", dbgMgt0, dbgMgt1)
   if accepted == 0 or msgSubtype == 0xFF:
     # Set accepted to result byte for return
     accepted = acceptedByte
@@ -33607,14 +33625,13 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
       # msg[27] = secondaryByte (from mfp_ignore_mgmt_frame)
       cast[ptr uint8](msgAddr + 27)[] = secondaryByte
 
-      when defined(bl808WifiNimFw):
-        if subtypeBits == 0x10'u16 or subtypeBits == 0x30'u16:
-          nimFwTrace2U32("[WIFI-NIMFW] assoc_copy ",
-                         copyLen.uint32,
-                         cast[ptr uint32](copySrc)[])
-          nimFwTrace2U32("[WIFI-NIMFW] assoc_copy2 ",
-                         cast[ptr uint32](copySrc + 4)[],
-                         cast[ptr uint32](copySrc + 8)[])
+      if subtypeBits == 0x10'u16 or subtypeBits == 0x30'u16:
+        nimFwTrace2U32("[WIFI-NIMFW] assoc_copy ",
+                       copyLen.uint32,
+                       cast[ptr uint32](copySrc)[])
+        nimFwTrace2U32("[WIFI-NIMFW] assoc_copy2 ",
+                       cast[ptr uint32](copySrc + 4)[],
+                       cast[ptr uint32](copySrc + 8)[])
 
       # Probe Req special fields: if msgSubtype==5 and sendStaIdx==0
       if msgSubtype == 5 and sendStaIdx == 0:
@@ -33682,7 +33699,7 @@ proc rxu_mgt_ind_handler_sm(param: pointer) {.exportc: "rxu_mgt_ind_handler_sm",
       nimFwConnectTrace2U32("[WIFI-CT] sm_mgt_auth ",
                             ke_state_get(TASK_SM).uint32,
                             traceWord)
-    if ke_state_get(TASK_SM) != 6: return
+    if ke_state_get(TASK_SM) != SmAuthenticatingState: return
     sm_auth_handler(param)
   of 0x10: # Association Response
     when defined(bl808WifiConnectTrace):
@@ -33690,7 +33707,7 @@ proc rxu_mgt_ind_handler_sm(param: pointer) {.exportc: "rxu_mgt_ind_handler_sm",
       nimFwConnectTrace2U32("[WIFI-CT] sm_mgt_assoc ",
                             ke_state_get(TASK_SM).uint32,
                             traceWord)
-    if ke_state_get(TASK_SM) != 8: return
+    if ke_state_get(TASK_SM) != SmAssocRspState: return
     sm_assoc_rsp_handler(param)
   of 0x30: # Reassociation Response
     when defined(bl808WifiConnectTrace):
@@ -33698,25 +33715,25 @@ proc rxu_mgt_ind_handler_sm(param: pointer) {.exportc: "rxu_mgt_ind_handler_sm",
       nimFwConnectTrace2U32("[WIFI-CT] sm_mgt_reassoc ",
                             ke_state_get(TASK_SM).uint32,
                             traceWord)
-    if ke_state_get(TASK_SM) != 8: return
+    if ke_state_get(TASK_SM) != SmAssocRspState: return
     sm_assoc_rsp_handler(param)
   of 0xC0: # Deauthentication
     let state = ke_state_get(TASK_SM)
-    if state == 0 or state == SM_ACTIVATING_STATE:
+    if state == SmIdleState or state == SM_ACTIVATING_STATE:
       sm_deauth_handler(param)
       return
-    # For deauth in state 6 (authenticating), try sm_auth_start
+    # For deauth while authenticating, try sm_auth_start.
     let state2 = ke_state_get(TASK_SM)
-    if state2 == 6:
+    if state2 == SmAuthenticatingState:
       sm_auth_start(param)
   of 0xA0: # Disassociation
     let state = ke_state_get(TASK_SM)
-    if state == 0 or state == SM_ACTIVATING_STATE:
+    if state == SmIdleState or state == SM_ACTIVATING_STATE:
       sm_deauth_handler(param)
       return
-    # For disassoc in state 6, try sm_auth_start
+    # For disassoc while authenticating, try sm_auth_start.
     let state2 = ke_state_get(TASK_SM)
-    if state2 == 6:
+    if state2 == SmAuthenticatingState:
       sm_auth_start(param)
   of 0xD0: # Action
     # Only handle SA Query (category == 8)
@@ -33827,6 +33844,16 @@ var keTaskStateSm* {.exportc: "sm_state".}: uint16 = 0
 var keTaskStateApm* {.exportc: "apm_state".}: uint16 = 0
 var keTaskStateBam* {.exportc: "bam_state".}: uint16 = 0
 var keTaskStateCfg* {.exportc: "cfg_state".}: uint16 = 0
+
+const
+  MmStateCount = 4'u16
+  ScanStateCount = 4'u16
+  ScanuStateCount = 3'u16
+  MeStateCount = 2'u16
+  SmStateCount = 11'u16
+  ApmStateCount = 3'u16
+  BamStateCount = 5'u16
+  CfgStateCount = 1'u16
 
 # --- KE task dispatch table types ---
 # ke_msg_handler_t: {msg_id: uint32, handler: pointer} = 8 bytes per entry
@@ -34122,6 +34149,28 @@ var sm_reconn_dominant_flag* {.exportc.}: uint32 = 0
 # 4 bytes with initial value 1, but the full array is the actual runtime storage.
 # The first element should be initialized to 1 (assert block enabled).
 
+proc configureKeTaskDesc(taskId: uint8, stateTable: pointer,
+                         defaultHandler: pointer, statePtr: ptr uint16,
+                         stateCount: uint16) {.inline.} =
+  let desc = addr keTaskDescs[taskId.int]
+  desc.stateTable = stateTable
+  desc.defaultHandler = defaultHandler
+  desc.statePtr = statePtr
+  desc.reserved = 0
+  desc.stateCount = stateCount
+
+type
+  KeTaskInitSpec = object
+    taskId: uint8
+    stateTable: pointer
+    defaultHandler: pointer
+    statePtr: ptr uint16
+    stateCount: uint16
+
+proc configureKeTaskDesc(spec: KeTaskInitSpec) {.inline.} =
+  configureKeTaskDesc(spec.taskId, spec.stateTable, spec.defaultHandler,
+                      spec.statePtr, spec.stateCount)
+
 # ###########################################################################
 #  KE Task Descriptor Table Initialization
 #  Populates keTaskDescs[] with dispatch table pointers and state variable
@@ -34133,64 +34182,99 @@ proc ke_task_init*() {.exportc, cdecl.} =
   ## Initialize the kernel task descriptor table.
   ## Blob equivalent: static TASK_DESC rodata in ke_task.o (0xa0 bytes, 10 entries).
   ## Each entry: {stateTable, defaultHandler, statePtr, reserved:u16, stateCount:u16}
+  let taskSpecs = [
+    KeTaskInitSpec(taskId: TASK_MM,
+                   stateTable: cast[pointer](addr mm_state_handler),
+                   defaultHandler: cast[pointer](addr mm_default_handler),
+                   statePtr: addr keTaskStateMm,
+                   stateCount: MmStateCount),
+    KeTaskInitSpec(taskId: TASK_SCAN,
+                   stateTable: nil,
+                   defaultHandler: cast[pointer](addr scan_default_handler),
+                   statePtr: addr keTaskStateScan,
+                   stateCount: ScanStateCount),
+    KeTaskInitSpec(taskId: TASK_SCANU,
+                   stateTable: cast[pointer](addr scanu_state_handler),
+                   defaultHandler: cast[pointer](addr scanu_default_handler),
+                   statePtr: addr keTaskStateScanu,
+                   stateCount: ScanuStateCount),
+    KeTaskInitSpec(taskId: TASK_ME,
+                   stateTable: nil,
+                   defaultHandler: cast[pointer](addr me_default_handler),
+                   statePtr: addr keTaskStateMe,
+                   stateCount: MeStateCount),
+    KeTaskInitSpec(taskId: TASK_SM,
+                   stateTable: nil,
+                   defaultHandler: cast[pointer](addr sm_default_handler),
+                   statePtr: addr keTaskStateSm,
+                   stateCount: SmStateCount),
+    KeTaskInitSpec(taskId: TASK_APM,
+                   stateTable: nil,
+                   defaultHandler: cast[pointer](addr apm_default_handler),
+                   statePtr: addr keTaskStateApm,
+                   stateCount: ApmStateCount),
+    KeTaskInitSpec(taskId: TASK_BAM,
+                   stateTable: nil,
+                   defaultHandler: cast[pointer](addr bam_default_handler),
+                   statePtr: addr keTaskStateBam,
+                   stateCount: BamStateCount),
+    KeTaskInitSpec(taskId: TASK_CFG,
+                   stateTable: nil,
+                   defaultHandler: cast[pointer](addr cfg_default_handler),
+                   statePtr: addr keTaskStateCfg,
+                   stateCount: CfgStateCount),
+  ]
 
-  # TASK_MM (0): 4 states, has state_handler table
-  keTaskDescs[TASK_MM.int].stateTable = cast[pointer](addr mm_state_handler)
-  keTaskDescs[TASK_MM.int].defaultHandler = cast[pointer](addr mm_default_handler)
-  keTaskDescs[TASK_MM.int].statePtr = addr keTaskStateMm
-  keTaskDescs[TASK_MM.int].stateCount = 4
-
-  # TASK_SCAN (1): 4 states (blob reserved=0x0100), no state_handler
-  keTaskDescs[TASK_SCAN.int].stateTable = nil
-  keTaskDescs[TASK_SCAN.int].defaultHandler = cast[pointer](addr scan_default_handler)
-  keTaskDescs[TASK_SCAN.int].statePtr = addr keTaskStateScan
-  keTaskDescs[TASK_SCAN.int].stateCount = 4
-
-  # TASK_SCANU (2): 3 states, has state_handler table
-  keTaskDescs[TASK_SCANU.int].stateTable = cast[pointer](addr scanu_state_handler)
-  keTaskDescs[TASK_SCANU.int].defaultHandler = cast[pointer](addr scanu_default_handler)
-  keTaskDescs[TASK_SCANU.int].statePtr = addr keTaskStateScanu
-  keTaskDescs[TASK_SCANU.int].stateCount = 3
-
-  # TASK_ME (3): 2 states, no state_handler
-  keTaskDescs[TASK_ME.int].stateTable = nil
-  keTaskDescs[TASK_ME.int].defaultHandler = cast[pointer](addr me_default_handler)
-  keTaskDescs[TASK_ME.int].statePtr = addr keTaskStateMe
-  keTaskDescs[TASK_ME.int].stateCount = 2
-
-  # TASK_SM (4): 11 states, no state_handler
-  keTaskDescs[TASK_SM.int].stateTable = nil
-  keTaskDescs[TASK_SM.int].defaultHandler = cast[pointer](addr sm_default_handler)
-  keTaskDescs[TASK_SM.int].statePtr = addr keTaskStateSm
-  keTaskDescs[TASK_SM.int].stateCount = 11
-
-  # TASK_APM (5): 3 states, no state_handler
-  keTaskDescs[TASK_APM.int].stateTable = nil
-  keTaskDescs[TASK_APM.int].defaultHandler = cast[pointer](addr apm_default_handler)
-  keTaskDescs[TASK_APM.int].statePtr = addr keTaskStateApm
-  keTaskDescs[TASK_APM.int].stateCount = 3
-
-  # TASK_BAM (6): 5 states, no state_handler
-  keTaskDescs[TASK_BAM.int].stateTable = nil
-  keTaskDescs[TASK_BAM.int].defaultHandler = cast[pointer](addr bam_default_handler)
-  keTaskDescs[TASK_BAM.int].statePtr = addr keTaskStateBam
-  keTaskDescs[TASK_BAM.int].stateCount = 5
-
-  # TASK_RXU (7): no handlers (all zero in blob)
-  # Left as zero-initialized
-
-  # TASK_CFG (8): 1 state, no state_handler
-  keTaskDescs[TASK_CFG.int].stateTable = nil
-  keTaskDescs[TASK_CFG.int].defaultHandler = cast[pointer](addr cfg_default_handler)
-  keTaskDescs[TASK_CFG.int].statePtr = addr keTaskStateCfg
-  keTaskDescs[TASK_CFG.int].stateCount = 1
-
-  # TASK_API (9): no handlers (all zero in blob)
-  # Left as zero-initialized
+  for spec in taskSpecs:
+    configureKeTaskDesc(spec)
 
 # ###########################################################################
 #                  WiFi Main Entry Point
 # ###########################################################################
+
+type
+  WifiMainServiceMode = enum
+    wifiServiceNonblocking
+    wifiServiceBlockingIdle
+
+proc wifiMainHasPendingWork(): bool {.inline.} =
+  keEvtField != 0
+
+proc wifiMainModeFromAbi(blockWhenIdle: uint8): WifiMainServiceMode {.inline.} =
+  if blockWhenIdle == 0'u8:
+    wifiServiceNonblocking
+  else:
+    wifiServiceBlockingIdle
+
+proc wifiMainServiceStep(mode: WifiMainServiceMode): bool =
+  ## Run one WiFi firmware service iteration.
+  ##
+  ## The blob's wifi_main blocks in ipc_emb_wait() when idle because host and
+  ## embedded firmware run independently. In this pure Nim port, CPS callers can
+  ## drive WiFi and BLE from one scheduler, so they must use the nonblocking
+  ## form and let the scheduler decide when to sleep.
+  let tslo = macTimeNow()
+  var ctrl = regRead(MAC_PL_CTRL_REG)
+  if (tslo and 0x00080000'u32) != 0:
+    ctrl = ctrl or 0x01'u32
+  else:
+    ctrl = ctrl and not 0x01'u32
+  regWrite(MAC_PL_CTRL_REG, ctrl)
+
+  bl_sleep_schedule()
+
+  result = wifiMainHasPendingWork()
+  if mode == wifiServiceBlockingIdle and not result:
+    ipc_emb_wait()
+    result = wifiMainHasPendingWork()
+
+  ke_evt_schedule()
+
+proc wifi_main_service_step*(blockWhenIdle: uint8 = 0'u8) {.exportc, cdecl.} =
+  discard wifiMainServiceStep(wifiMainModeFromAbi(blockWhenIdle))
+
+proc wifi_main_poll_once*() {.exportc, cdecl.} =
+  discard wifiMainServiceStep(wifiServiceNonblocking)
 
 proc wifi_main*(param: pointer) {.exportc, cdecl.} =
   ## WiFi firmware main entry point (157 instructions in blob).
@@ -34288,17 +34372,4 @@ proc wifi_main*(param: pointer) {.exportc, cdecl.} =
   #   load keEvtField; if == 0: call ipc_emb_wait;
   #   call ke_evt_schedule; j .L23
   while true:
-    let tslo = macTimeNow()
-    var ctrl = regRead(MAC_PL_CTRL_REG)
-    if (tslo and 0x00080000'u32) != 0:
-      ctrl = ctrl or 0x01'u32   # Active: enable platform clock
-    else:
-      ctrl = ctrl and not 0x01'u32  # Idle: disable platform clock
-    regWrite(MAC_PL_CTRL_REG, ctrl)
-
-    bl_sleep_schedule()
-
-    if keEvtField == 0:
-      ipc_emb_wait()  # Block until IPC event when idle
-
-    ke_evt_schedule()
+    discard wifiMainServiceStep(wifiServiceBlockingIdle)

@@ -10,7 +10,7 @@ import bl808/mmio
 import bl808/wifi
 import bl808/panicoverride
 import bl808/kernel/alloc
-when defined(bl808WifiVendor):
+when defined(bl808WifiNimFw):
   import bl808/kernel/jtaglog
 
 const
@@ -78,7 +78,7 @@ proc dumpReg(label: string, address: uint) =
   console.sendHex32(regRead(address))
   discard console.sendString(" ")
 
-when defined(bl808WifiVendor):
+when defined(bl808WifiNimFw):
   proc sendHex8(value: uint8) =
     const hexDigits = "0123456789ABCDEF"
     discard console.sendByte(hexDigits[((value shr 4) and 0xF).int].uint8)
@@ -91,7 +91,7 @@ when defined(bl808WifiVendor):
       discard console.sendByte('.'.uint8)
 
   proc dumpScanDiag() =
-    var count = bl808_wifi_vendor_scan_diag_count()
+    var count = bl808_wifi_backend_scan_diag_count()
     discard console.sendString("[WIFI] scan diag count=")
     console.sendHex32(count)
     discard console.sendLine("")
@@ -106,7 +106,7 @@ when defined(bl808WifiVendor):
       var auth: uint8
       var cipher: uint8
       var bssid: array[6, uint8]
-      let rc = bl808_wifi_vendor_scan_diag_get(i, addr ssidLen, addr ssid[0],
+      let rc = bl808_wifi_backend_scan_diag_get(i, addr ssidLen, addr ssid[0],
                                                addr channel, addr rssi,
                                                addr auth, addr cipher,
                                                addr bssid[0])
@@ -835,7 +835,7 @@ proc main() {.exportc, cdecl.} =
     stopBits: stop1, parity: parityNone,
   ), ConsoleClkHz)
 
-  when defined(bl808WifiVendor):
+  when defined(bl808WifiNimFw):
     hwValidationLogReset()
 
   discard console.sendLine("")
@@ -852,37 +852,37 @@ proc main() {.exportc, cdecl.} =
   var iface = wifi_mgmr_sta_enable()
   check("wifi sta enable", iface != nil)
   check("wifi scan", wifi_mgmr_scan(addr iface, nil) == 0)
-  when defined(bl808WifiVendor):
+  when defined(bl808WifiNimFw):
     for _ in 0 ..< 30000:
-      bl808_wifi_vendor_poll(8)
-      if bl808_wifi_vendor_scan_done_count() > 0'u32:
+      bl808_wifi_backend_poll(8)
+      if bl808_wifi_backend_scan_done_count() > 0'u32:
         break
       delayUs(1000)
     for _ in 0 ..< 500:
-      bl808_wifi_vendor_poll(8)
+      bl808_wifi_backend_poll(8)
       delayUs(1000)
     discard console.sendString("[WIFI] scan items=")
-    console.sendHex32(bl808_wifi_vendor_scan_count())
+    console.sendHex32(bl808_wifi_backend_scan_count())
     discard console.sendString(" done=")
-    console.sendHex32(bl808_wifi_vendor_scan_done_count())
+    console.sendHex32(bl808_wifi_backend_scan_done_count())
     discard console.sendString(" macirq=")
-    console.sendHex32(bl808_wifi_vendor_mac_irq_count())
+    console.sendHex32(bl808_wifi_backend_mac_irq_count())
     discard console.sendString(" poll=")
-    console.sendHex32(bl808_wifi_vendor_mac_poll_irq_count())
+    console.sendHex32(bl808_wifi_backend_mac_poll_irq_count())
     discard console.sendString(" trap=")
-    console.sendHex32(bl808_wifi_vendor_mac_trap_irq_count())
+    console.sendHex32(bl808_wifi_backend_mac_trap_irq_count())
     discard console.sendString(" ipc=")
-    console.sendHex32(bl808_wifi_vendor_ipc_trap_irq_count())
+    console.sendHex32(bl808_wifi_backend_ipc_trap_irq_count())
     discard console.sendString(" ipcpoll=")
-    console.sendHex32(bl808_wifi_vendor_ipc_poll_irq_count())
+    console.sendHex32(bl808_wifi_backend_ipc_poll_irq_count())
     discard console.sendLine("")
     when defined(bl808WifiNimFwDiag):
       dumpScanDiag()
       dumpWifiRxDebug()
     elif not defined(bl808WifiNimFw):
       dumpWifiMacRegs()
-    check("wifi scan complete", bl808_wifi_vendor_scan_done_count() > 0'u32)
-    check("wifi scan results", bl808_wifi_vendor_scan_count() > 0'u32)
+    check("wifi scan complete", bl808_wifi_backend_scan_done_count() > 0'u32)
+    check("wifi scan results", bl808_wifi_backend_scan_count() > 0'u32)
 
   when WifiScanOnly:
     check("wifi ap start", wifiStartAp("bl808-hal-ap", "12345678", 1) == wifiOk)
@@ -895,22 +895,22 @@ proc main() {.exportc, cdecl.} =
   discard console.sendString("[WIFI] connecting ssid=")
   discard console.sendLine(WifiSsid)
   let connectResult = wifiConnect(WifiSsid, WifiPassword, WifiChannel.uint8)
-  when defined(bl808WifiVendor):
+  when defined(bl808WifiNimFw):
     when WifiExpectConnectFailure:
       discard console.sendString("[WIFI] connect failure status=")
     else:
       discard console.sendString("[WIFI] connect status=")
-    console.sendHex32(bl808_wifi_vendor_last_status().uint32)
+    console.sendHex32(bl808_wifi_backend_last_status().uint32)
     discard console.sendString(" reason=")
-    console.sendHex32(bl808_wifi_vendor_last_reason().uint32)
+    console.sendHex32(bl808_wifi_backend_last_reason().uint32)
     discard console.sendLine("")
   when defined(bl808WifiNimFwDiag):
     dumpNimFwTxCounters()
   when WifiExpectConnectFailure:
     check("wifi connect expected failure", connectResult != wifiOk)
-    when defined(bl808WifiVendor):
-      let failureStatus = bl808_wifi_vendor_last_status()
-      let failureReason = bl808_wifi_vendor_last_reason()
+    when defined(bl808WifiNimFw):
+      let failureStatus = bl808_wifi_backend_last_status()
+      let failureReason = bl808_wifi_backend_last_reason()
       check("wifi credential failure classified",
             wifiCredentialFailureMatches(failureStatus, failureReason))
     discard wifiDisconnect()
@@ -920,9 +920,9 @@ proc main() {.exportc, cdecl.} =
       if not connectOk:
         dumpNimFwTxCounters()
     check("wifi connect", connectOk)
-    when defined(bl808WifiVendor):
-      check("wifi connect status", bl808_wifi_vendor_last_status() == 0)
-      check("wifi connect reason", bl808_wifi_vendor_last_reason() == 0)
+    when defined(bl808WifiNimFw):
+      check("wifi connect status", bl808_wifi_backend_last_status() == 0)
+      check("wifi connect reason", bl808_wifi_backend_last_reason() == 0)
     check("wifi netif", wifiGetNetif() != nil)
     when defined(bl808WifiNimFw):
       when WifiKeepaliveFrames > 0:

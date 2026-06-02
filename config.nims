@@ -61,7 +61,7 @@ when defined(bl808m0):
       switch("passL", "-T src/linker/bl808_m0_ram.ld")
   elif defined(bl808WifiCachedBss):
     switch("passL", "-T src/linker/bl808_m0_wifi_cached.ld")
-  elif defined(bl808WifiVendor):
+  elif defined(bl808WifiNimFw):
     switch("passL", "-T src/linker/bl808_m0_wifi.ld")
   else:
     switch("passL", "-T src/linker/bl808_m0.ld")

@@ -1,14 +1,11 @@
 ## BL808 BLE 5.0 controller interface.
 ##
 ## The BL808 M0 core uses the BLE controller shared with BL602.
-## Precompiled blob: libblecontroller_bl602_m1s1.a (1 master, 1 slave)
-##                or libblecontroller_bl602_m8s1.a (8 masters, 1 slave)
-##
-## Link flags: --passL:"-lblecontroller_bl602_m1s1"
+## Pure Nim controller implementation: src/bl808/blecontroller.nim.
 ##
 ## The BLE host stack uses a Zephyr BLE port with standard bt_* APIs.
 ## This module provides:
-##   1. Controller-level init (blob API from ble_lib_api.h)
+##   1. Controller-level init
 ##   2. HCI on-chip interface for host<->controller communication
 ##   3. Zephyr BLE host stack declarations (bt_enable, bt_le_adv_*, etc.)
 
@@ -18,111 +15,30 @@
 when defined(bl808m0):
   import core, irq, kernel/clock, kernel/cps, mmio, sec
 
-  when defined(bl808BleVendor):
-    import bleblob as blecontroller
-  else:
-    import blecontroller
-    import blep256
+  import blecontroller
+  import blep256
 
   const bl808BleNimPureConnection* {.booldefine.}: bool = false
   const bl808BleNimPureCentral* {.booldefine.}: bool = false
-  const bl808BleNimConnectionEnabled =
-    defined(bl808BleVendorLldConProbe) or bl808BleNimPureConnection
+  const bl808BleNimConnectionEnabled = bl808BleNimPureConnection
 
   type
     BleInitStageCb* = proc(stage: cstring) {.cdecl.}
 
   var bleControllerStarted: bool
 
-  when defined(bl808BleVendorLldScanProbe):
-    const BleCentralTraceBaseLocal = 0x40002F00'u32
-
-    var bleHciSendReturnShadow: uint32
-    var bleHciCommandReturnShadow: uint32
-    var bleHciCommandDiag0: uint32
-    var bleHciCommandDiag1: uint32
-    var bleScanStartDiag: uint32
-
-    const
-      BleHciSendRaOffset = 12'u32
-      BleHciCommandRaOffset = 284'u32
-
-    template bleProbeTraceWord(offset: uint32, value: uint32) =
-      regWrite((BleCentralTraceBaseLocal + offset).uint, value)
-
-    template bleProbeTraceReadWord(offset: uint32): uint32 =
-      regRead((BleCentralTraceBaseLocal + offset).uint)
-
-    template bleHciSendReadSp(): uint32 =
-      block:
-        var v: uint32
-        {.emit: ["asm volatile(\"mv %0, sp\" : \"=r\"(", v, "));"].}
-        v
-
-    template bleHciSendRestoreRa(expected: uint32, offset: uint32) =
-      block:
-        let expectedRa = expected
-        if expectedRa != 0'u32:
-          let slot = bleHciSendReadSp() + offset
-          if regRead(slot.uint) != expectedRa:
-            regWrite(slot.uint, expectedRa)
-
-    template bleHciSendRestoreSendRaFromTrace() =
-      {.emit: """
-      asm volatile(
-          "li t0, 0x40002F3C\n"
-          "lw t1, 0(t0)\n"
-          "beqz t1, 1f\n"
-          "addi t0, sp, 12\n"
-          "lw t2, 0(t0)\n"
-          "beq t1, t2, 1f\n"
-          "sw t1, 0(t0)\n"
-          "1:\n"
-          ::: "t0", "t1", "t2", "memory");
-      """.}
-
-    template bleHciSendRestoreCommandRaFromTrace() =
-      {.emit: """
-      asm volatile(
-          "li t0, 0x40002F38\n"
-          "lw t1, 0(t0)\n"
-          "beqz t1, 1f\n"
-          "addi t0, sp, 284\n"
-          "lw t2, 0(t0)\n"
-          "beq t1, t2, 1f\n"
-          "sw t1, 0(t0)\n"
-          "1:\n"
-          ::: "t0", "t1", "t2", "memory");
-      """.}
-
-    template bleHciReadExpectedOpcodeFromTrace(): uint32 =
-      block:
-        var v: uint32
-        {.emit: [
-          "asm volatile(\"li t0, 0x40002F40\\n\\tlw %0, 0(t0)\" : \"=r\"(",
-          v, ") : : \"t0\", \"memory\");"
-        ].}
-        v
-
   proc reportBleInitStage(stageCb: BleInitStageCb, stage: cstring) {.inline.} =
     if stageCb != nil:
       stageCb(stage)
 
   proc bleBackendPrepareControllerInit(stageCb: BleInitStageCb) =
-    when defined(bl808BleVendor):
-      reportBleInitStage(stageCb, "before wireless domain")
-      blecontroller.bleBlobPrepareWirelessDomain()
-      reportBleInitStage(stageCb, "after wireless domain")
-      blecontroller.bleBlobAllowAssertReturn()
-      reportBleInitStage(stageCb, "after assert return")
-    else:
-      discard stageCb
+    if stageCb != nil:
+      discard
 
   proc bleBackendControllerInit(taskPriority: uint8,
                                 stageCb: BleInitStageCb) =
     reportBleInitStage(stageCb, "before controller init")
-    when defined(bl808BleDebugSplitControllerInit) and
-        not defined(bl808BleVendor):
+    when defined(bl808BleDebugSplitControllerInit):
       discard taskPriority
       blecontroller.bflbip_init()
       reportBleInitStage(stageCb, "after bflbip_init")
@@ -204,8 +120,7 @@ when defined(bl808m0):
   var hciLastStatus: int16 = -1
   var hciLastPayload: array[260, uint8]
   var hciRawSendBuf: array[258, uint8]
-  when not defined(bl808BleVendor):
-    var hciCommandSlot: blecontroller.OnChipHciCmd
+  var hciCommandSlot: blecontroller.OnChipHciCmd
   var hciCommandInFlight: bool
   var hciEventQueue: array[HciQueuedEventCount, HciQueuedEvent]
   var hciEventHead: uint8
@@ -354,23 +269,13 @@ when defined(bl808m0):
         hciLastStatus = raw[3].int16
         hciLastOpcode = raw[4].uint16 or (raw[5].uint16 shl 8)
     if hciRecvCb != nil and pktType != 2'u8 and pktType != 3'u8:
-      when defined(bl808BleVendorLldScanProbe):
-        blecontroller.bleCentralDebugMark(
-          0x930'u32, (uint32(pktType) shl 16) or uint32(srcId))
       discard enqueueHciHostEvent(pktType, srcId, param, paramLen)
-      when defined(bl808BleVendorLldScanProbe):
-        blecontroller.bleCentralDebugMark(
-          0x931'u32, (uint32(pktType) shl 16) or uint32(srcId))
-
   proc bt_onchiphci_interface_init*(cb: HciRecvCb): uint8 {.cdecl.} =
     ## Initialize the on-chip HCI interface.
     ## `cb` is called when the controller sends data to the host.
     resetHciEventQueue()
     hciRecvCb = cb
-    when defined(bl808BleVendor):
-      discard blecontroller.bt_onchiphci_interface_init(bleHostBridge)
-    else:
-      discard blecontroller.bt_onchiphci_interface_init(bleHostBridge)
+    discard blecontroller.bt_onchiphci_interface_init(bleHostBridge)
     0
 
   proc bt_onchiphci_send*(pktType: uint8, destId: uint16,
@@ -379,51 +284,24 @@ when defined(bl808m0):
     ble_host_debug_stage = 0x5100'u32
     ble_host_debug_len = destId.uint32
     ble_host_debug_ptr = cast[uint32](cast[uint](pkt))
-    when defined(bl808BleVendor):
-      discard pktType
-      if pkt == nil or destId < 3:
-        return -1'i8
-      let raw = cast[ptr UncheckedArray[uint8]](pkt)
-      let opcode = raw[0].uint16 or (raw[1].uint16 shl 8)
-      let paramLen = raw[2]
-      if destId < uint16(3 + paramLen.int):
-        return -1'i8
-      let params =
-        if paramLen == 0: nil
-        else: cast[ptr uint8](cast[uint](pkt) + 3'u)
-      blecontroller.bleBlobHciCommand(opcode, params, paramLen)
+    if pktType == HciPktAclData:
+      let rc = blecontroller.bt_onchiphci_send(pktType, destId, pkt)
+      ble_host_debug_stage = 0x5110'u32
+      ble_host_debug_status = cast[uint32](rc)
+      ble_host_debug_stage = 0x5120'u32
+      rc
     else:
-      when defined(bl808BleVendorLldScanProbe):
-        let entrySp = bleHciSendReadSp()
-        let sendReturnShadow = regRead((entrySp + BleHciSendRaOffset).uint)
-        bleHciSendReturnShadow = sendReturnShadow
-        bleProbeTraceWord(60'u32, sendReturnShadow)
-        blecontroller.bleCentralDebugMark(0x940'u32, uint32(destId))
-      if pktType == HciPktAclData:
-        let rc = blecontroller.bt_onchiphci_send(pktType, destId, pkt)
-        ble_host_debug_stage = 0x5110'u32
-        ble_host_debug_status = cast[uint32](rc)
-        when defined(bl808BleVendorLldScanProbe):
-          blecontroller.bleCentralDebugMark(
-            0x941'u32, if rc == 0'i8: 1'u32 else: 0'u32)
-          bleHciSendRestoreSendRaFromTrace()
-        ble_host_debug_stage = 0x5120'u32
-        rc
-      else:
-        var ok = false
-        if pkt != nil and destId >= 3'u16 and destId.int <= hciRawSendBuf.len:
-          let src = cast[ptr UncheckedArray[uint8]](pkt)
-          for i in 0 ..< destId.int:
-            hciRawSendBuf[i] = src[i]
-          ok = blecontroller.bt_onchiphci_send_raw(addr hciRawSendBuf[0],
-                                                   destId)
-        ble_host_debug_stage = 0x5110'u32
-        ble_host_debug_status = if ok: 0'u32 else: 1'u32
-        when defined(bl808BleVendorLldScanProbe):
-          blecontroller.bleCentralDebugMark(0x941'u32, if ok: 1'u32 else: 0'u32)
-          bleHciSendRestoreSendRaFromTrace()
-        ble_host_debug_stage = 0x5120'u32
-        if ok: 0'i8 else: -1'i8
+      var ok = false
+      if pkt != nil and destId >= 3'u16 and destId.int <= hciRawSendBuf.len:
+        let src = cast[ptr UncheckedArray[uint8]](pkt)
+        for i in 0 ..< destId.int:
+          hciRawSendBuf[i] = src[i]
+        ok = blecontroller.bt_onchiphci_send_raw(addr hciRawSendBuf[0],
+                                                 destId)
+      ble_host_debug_stage = 0x5110'u32
+      ble_host_debug_status = if ok: 0'u32 else: 1'u32
+      ble_host_debug_stage = 0x5120'u32
+      if ok: 0'i8 else: -1'i8
 
   proc bleLastHciOpcode*(): uint16 {.cdecl.} =
     hciLastOpcode
@@ -459,8 +337,7 @@ when defined(bl808m0):
     blecontroller.bflbble_reset()
 
   proc bflbble_enable_runtime_irqs*() {.cdecl.} =
-    when not defined(bl808BleVendor):
-      blecontroller.bflbble_enable_runtime_irqs()
+    blecontroller.bflbble_enable_runtime_irqs()
 
   proc bflbble_sleep_check*(): cint {.cdecl.} =
     ## Check if BLE can sleep. Returns 1 if sleepable.
@@ -714,77 +591,35 @@ when defined(bl808m0):
     ble_host_debug_opcode = opcode.uint32
     ble_host_debug_len = paramLen.uint32
     ble_host_debug_ptr = cast[uint32](cast[uint](params))
-    when defined(bl808BleVendor):
-      resetHciLast()
-      if blecontroller.bleBlobHciCommand(opcode, params, paramLen) != 0:
-        return false
-      for _ in 0 ..< polls:
-        if hciLastOpcode == opcode:
-          break
-        blecontroller.bleBlobPoll(16)
-      hciLastOpcode == opcode and hciLastStatus == 0
-    else:
-      discard polls
-      if hciCommandInFlight:
-        return false
-      hciCommandInFlight = true
-      defer:
-        hciCommandInFlight = false
-      when defined(bl808BleVendorLldScanProbe):
-        let entrySp = bleHciSendReadSp()
-        let commandReturnShadow =
-          regRead((entrySp + BleHciCommandRaOffset).uint)
-        bleHciCommandReturnShadow = commandReturnShadow
-        bleProbeTraceWord(56'u32, commandReturnShadow)
-      resetHciLast()
-      when defined(bl808BleVendorLldScanProbe):
-        bleProbeTraceWord(64'u32, uint32(opcode))
-      ble_host_debug_stage = 0x5210'u32
-      hciCommandSlot.opcode = opcode
-      hciCommandSlot.params = params
-      hciCommandSlot.paramLen = paramLen
-      let sendRc =
-        blecontroller.bt_onchiphci_send(0'u8, 0'u16, addr hciCommandSlot)
-      ble_host_debug_stage = 0x5220'u32
-      ble_host_debug_status = cast[uint32](sendRc)
-      when defined(bl808BleVendorLldScanProbe):
-        let expectedOpcode =
-          uint16(bleHciReadExpectedOpcodeFromTrace() and 0xFFFF'u32)
-      else:
-        let expectedOpcode = opcode
-      when defined(bl808BleVendorLldScanProbe):
-        bleHciCommandDiag0 =
-          (uint32(expectedOpcode) shl 16) or
-          (cast[uint32](hciLastStatus) and 0xFFFF'u32)
-        bleHciCommandDiag1 =
-          (uint32(hciLastOpcode) shl 16) or
-          ((cast[uint32](sendRc) and 0xFF'u32) shl 8)
-        bleProbeTraceWord(40'u32, bleHciCommandDiag0)
-        bleProbeTraceWord(44'u32, bleHciCommandDiag1)
-      if sendRc != 0:
-        when defined(bl808BleVendorLldScanProbe):
-          blecontroller.bleCentralDebugMark(0x951'u32, bleHciCommandDiag1)
-          bleHciSendRestoreCommandRaFromTrace()
-        return false
-      result = hciLastOpcode == expectedOpcode and hciLastStatus == 0
-      ble_host_debug_stage = 0x5230'u32
-      ble_host_debug_status =
-        (uint32(hciLastOpcode) shl 16) or
-        (cast[uint32](hciLastStatus) and 0xFFFF'u32)
-      ble_hci_return_debug_sp = bleHostReadSp()
-      ble_hci_return_debug_result = if result: 1'u32 else: 0'u32
-      for i in 0 ..< ble_hci_return_debug_stack.len:
-        ble_hci_return_debug_stack[i] =
-          regRead((ble_hci_return_debug_sp + uint32(i * 4)).uint)
-      ble_host_debug_stage = 0x5231'u32
-      when defined(bl808BleVendorLldScanProbe):
-        bleHciCommandDiag1 = bleHciCommandDiag1 or
-          (if result: 1'u32 else: 0'u32)
-        bleProbeTraceWord(44'u32, bleHciCommandDiag1)
-        if not result:
-          blecontroller.bleCentralDebugMark(0x953'u32, bleHciCommandDiag1)
-        bleHciSendRestoreCommandRaFromTrace()
-
+    discard polls
+    if hciCommandInFlight:
+      return false
+    hciCommandInFlight = true
+    defer:
+      hciCommandInFlight = false
+    resetHciLast()
+    ble_host_debug_stage = 0x5210'u32
+    hciCommandSlot.opcode = opcode
+    hciCommandSlot.params = params
+    hciCommandSlot.paramLen = paramLen
+    let sendRc =
+      blecontroller.bt_onchiphci_send(0'u8, 0'u16, addr hciCommandSlot)
+    ble_host_debug_stage = 0x5220'u32
+    ble_host_debug_status = cast[uint32](sendRc)
+    let expectedOpcode = opcode
+    if sendRc != 0:
+      return false
+    result = hciLastOpcode == expectedOpcode and hciLastStatus == 0
+    ble_host_debug_stage = 0x5230'u32
+    ble_host_debug_status =
+      (uint32(hciLastOpcode) shl 16) or
+      (cast[uint32](hciLastStatus) and 0xFFFF'u32)
+    ble_hci_return_debug_sp = bleHostReadSp()
+    ble_hci_return_debug_result = if result: 1'u32 else: 0'u32
+    for i in 0 ..< ble_hci_return_debug_stack.len:
+      ble_hci_return_debug_stack[i] =
+        regRead((ble_hci_return_debug_sp + uint32(i * 4)).uint)
+    ble_host_debug_stage = 0x5231'u32
   proc bleLeEncryptSelfTest*(): bool {.cdecl.} =
     var params: array[32, uint8]
     const
@@ -841,101 +676,89 @@ when defined(bl808m0):
     (not secondAllZero) and (not same)
 
   proc bleLeP256SelfTest*(): bool {.cdecl.} =
-    when defined(bl808BleVendor):
-      true
-    else:
-      if not hciCommandOk(HciOpLeReadLocalP256PublicKey, nil, 0):
-        return false
-      if hciLastLen != 66'u8 or hciLastPayload[0] !=
-          HciLeEvtReadLocalP256PublicKeyComplete or hciLastStatus != 0:
-        return false
-      if not bleP256IsValidPublicKeyLe(addr hciLastPayload[2],
-                                       addr hciLastPayload[34]):
-        return false
+    if not hciCommandOk(HciOpLeReadLocalP256PublicKey, nil, 0):
+      return false
+    if hciLastLen != 66'u8 or hciLastPayload[0] !=
+        HciLeEvtReadLocalP256PublicKeyComplete or hciLastStatus != 0:
+      return false
+    if not bleP256IsValidPublicKeyLe(addr hciLastPayload[2],
+                                     addr hciLastPayload[34]):
+      return false
 
-      if not hciCommandOk(HciOpLeGenerateDhKey,
-                          unsafeAddr P256DebugPeerPublicKeyLe[0],
-                          P256DebugPeerPublicKeyLe.len.uint8):
-        return false
-      if hciLastLen != 34'u8 or hciLastPayload[0] !=
-          HciLeEvtGenerateDhKeyComplete or hciLastStatus != 0:
-        return false
-      var allZero = true
-      for i in 0 ..< 32:
-        if hciLastPayload[2 + i] != 0'u8:
-          allZero = false
-      not allZero
+    if not hciCommandOk(HciOpLeGenerateDhKey,
+                        unsafeAddr P256DebugPeerPublicKeyLe[0],
+                        P256DebugPeerPublicKeyLe.len.uint8):
+      return false
+    if hciLastLen != 34'u8 or hciLastPayload[0] !=
+        HciLeEvtGenerateDhKeyComplete or hciLastStatus != 0:
+      return false
+    var allZero = true
+    for i in 0 ..< 32:
+      if hciLastPayload[2 + i] != 0'u8:
+        allZero = false
+    not allZero
 
   proc hciLastPayloadLe16(off: int): uint16 =
     hciLastPayload[off].uint16 or (hciLastPayload[off + 1].uint16 shl 8)
 
   proc bleLeBufferSizeSelfTest*(): bool {.cdecl.} =
-    when defined(bl808BleVendor):
-      true
-    else:
-      if not hciCommandOk(HciOpReadBufferSize, nil, 0):
-        return false
-      if hciLastLen != 8'u8 or hciLastStatus != 0:
-        return false
-      if hciLastPayloadLe16(1) != HciLeDefaultDataOctets or
-          hciLastPayload[3] != 0'u8 or
-          hciLastPayloadLe16(4) != 1'u16 or
-          hciLastPayloadLe16(6) != 0'u16:
-        return false
+    if not hciCommandOk(HciOpReadBufferSize, nil, 0):
+      return false
+    if hciLastLen != 8'u8 or hciLastStatus != 0:
+      return false
+    if hciLastPayloadLe16(1) != HciLeDefaultDataOctets or
+        hciLastPayload[3] != 0'u8 or
+        hciLastPayloadLe16(4) != 1'u16 or
+        hciLastPayloadLe16(6) != 0'u16:
+      return false
 
-      if not hciCommandOk(HciOpLeReadBufferSize, nil, 0):
-        return false
-      hciLastLen == 4'u8 and hciLastStatus == 0 and
-        hciLastPayloadLe16(1) == HciLeDefaultDataOctets and
-        hciLastPayload[3] == 1'u8
+    if not hciCommandOk(HciOpLeReadBufferSize, nil, 0):
+      return false
+    hciLastLen == 4'u8 and hciLastStatus == 0 and
+      hciLastPayloadLe16(1) == HciLeDefaultDataOctets and
+      hciLastPayload[3] == 1'u8
 
   proc bleLeLocalFeaturesSelfTest*(): bool {.cdecl.} =
-    when defined(bl808BleVendor):
-      true
-    else:
-      if not hciCommandOk(HciOpLeReadLocalSupportedFeatures, nil, 0):
+    if not hciCommandOk(HciOpLeReadLocalSupportedFeatures, nil, 0):
+      return false
+    if hciLastLen != 9'u8 or hciLastStatus != 0:
+      return false
+    if (hciLastPayload[1] and HciLeFeatureExtendedReject) == 0'u8:
+      return false
+    if (hciLastPayload[1] and
+        (HciLeFeatureLePing or HciLeFeatureDataPacketLengthExtension)) != 0'u8:
+      return false
+    when blecontroller.bl808BleNimPeripheralChSel2:
+      if (hciLastPayload[2] and HciLeFeatureChannelSelectionAlgorithm2) == 0'u8:
         return false
-      if hciLastLen != 9'u8 or hciLastStatus != 0:
-        return false
-      if (hciLastPayload[1] and HciLeFeatureExtendedReject) == 0'u8:
-        return false
-      if (hciLastPayload[1] and
-          (HciLeFeatureLePing or HciLeFeatureDataPacketLengthExtension)) != 0'u8:
-        return false
-      when blecontroller.bl808BleNimPeripheralChSel2:
-        if (hciLastPayload[2] and HciLeFeatureChannelSelectionAlgorithm2) == 0'u8:
-          return false
-      true
+    true
 
   proc bleLeDataLengthSelfTest*(): bool {.cdecl.} =
-    when defined(bl808BleVendor):
-      true
-    else:
-      if not hciCommandOk(HciOpLeReadMaximumDataLen, nil, 0):
-        return false
-      if hciLastLen != 9'u8 or hciLastStatus != 0:
-        return false
-      if hciLastPayloadLe16(1) != HciLeDefaultDataOctets or
-          hciLastPayloadLe16(3) != HciLeDefaultDataTime or
-          hciLastPayloadLe16(5) != HciLeDefaultDataOctets or
-          hciLastPayloadLe16(7) != HciLeDefaultDataTime:
-        return false
+    if not hciCommandOk(HciOpLeReadMaximumDataLen, nil, 0):
+      return false
+    if hciLastLen != 9'u8 or hciLastStatus != 0:
+      return false
+    if hciLastPayloadLe16(1) != HciLeDefaultDataOctets or
+        hciLastPayloadLe16(3) != HciLeDefaultDataTime or
+        hciLastPayloadLe16(5) != HciLeDefaultDataOctets or
+        hciLastPayloadLe16(7) != HciLeDefaultDataTime:
+      return false
 
-      if not hciCommandOk(HciOpLeReadSuggestedDefaultDataLen, nil, 0):
-        return false
-      if hciLastLen != 5'u8 or hciLastStatus != 0:
-        return false
-      if hciLastPayloadLe16(1) != HciLeDefaultDataOctets or
-          hciLastPayloadLe16(3) != HciLeDefaultDataTime:
-        return false
+    if not hciCommandOk(HciOpLeReadSuggestedDefaultDataLen, nil, 0):
+      return false
+    if hciLastLen != 5'u8 or hciLastStatus != 0:
+      return false
+    if hciLastPayloadLe16(1) != HciLeDefaultDataOctets or
+        hciLastPayloadLe16(3) != HciLeDefaultDataTime:
+      return false
 
-      var params: array[4, uint8]
-      params[0] = uint8(HciLeDefaultDataOctets and 0x00FF'u16)
-      params[1] = uint8((HciLeDefaultDataOctets shr 8) and 0x00FF'u16)
-      params[2] = uint8(HciLeDefaultDataTime and 0x00FF'u16)
-      params[3] = uint8((HciLeDefaultDataTime shr 8) and 0x00FF'u16)
-      hciCommandOk(HciOpLeWriteSuggestedDefaultDataLen, addr params[0],
-                   params.len.uint8)
+    var params: array[4, uint8]
+    params[0] = uint8(HciLeDefaultDataOctets and 0x00FF'u16)
+    params[1] = uint8((HciLeDefaultDataOctets shr 8) and 0x00FF'u16)
+    params[2] = uint8(HciLeDefaultDataTime and 0x00FF'u16)
+    params[3] = uint8((HciLeDefaultDataTime shr 8) and 0x00FF'u16)
+    hciCommandOk(HciOpLeWriteSuggestedDefaultDataLen, addr params[0],
+                 params.len.uint8)
 
   proc staticRandomIdentityPayloadValid(identity: array[6, uint8]): bool =
     var allZero = true
@@ -1223,74 +1046,69 @@ when defined(bl808m0):
       blePeripheralDisconnectedNotified = false
       notifyConnected(0)
 
+  proc bleBackendPollPeripheralEvents() =
+    when bl808BleNimConnectionEnabled:
+      let connEvents = blecontroller.bleNimPeripheralConnEventCount()
+      var newConnEvent = false
+      if connEvents != blePeripheralConnEventsSeen:
+        blePeripheralConnEventsSeen = connEvents
+        newConnEvent = true
+      if newConnEvent and not blePeripheralConnectedNotified:
+        notifyPeripheralConnectedFromController()
+
+      let discEvents = blecontroller.bleNimPeripheralDiscEventCount()
+      if discEvents != blePeripheralDiscEventsSeen:
+        blePeripheralDiscEventsSeen = discEvents
+        let reason =
+          uint8(blecontroller.bleNimPeripheralDiscReason() and 0xFF'u32)
+        bleConnActive = false
+        bleConnPending = false
+        bleConnConnectedNotified = false
+        bleCentralConnected = false
+        blePeripheralIdlePolls = 0
+        notifyDisconnected(reason)
+      elif bleConnActive and bleConn.role == 1'u8:
+        when BlePeripheralIdleDisconnectPolls > 0:
+          let rxEventCounter =
+            blecontroller.bleNimPeripheralLastRxEventCounter()
+          if rxEventCounter != blePeripheralLastRxEventCounter:
+            blePeripheralLastRxEventCounter = rxEventCounter
+            blePeripheralIdlePolls = 0
+          elif blePeripheralIdlePolls <
+              uint32(BlePeripheralIdleDisconnectPolls):
+            inc blePeripheralIdlePolls
+          else:
+            bleConnActive = false
+            bleConnPending = false
+            bleConnConnectedNotified = false
+            bleCentralConnected = false
+            blecontroller.bleNimPeripheralIdleDisconnect(0x13'u8)
+            blePeripheralDiscEventsSeen =
+              blecontroller.bleNimPeripheralDiscEventCount()
+            blePeripheralIdlePolls = 0
+            notifyDisconnected(0x13'u8)
+      else:
+        discard
+
   proc blePollHostEvents*() {.cdecl.} =
     ## Drain controller-side Nim peripheral link events into the host callback
     ## API. Vendor firmware reports these through HCI; the Nim/vendor-LLD
     ## bridge records them in controller counters to avoid re-entering the HCI
     ## callback chain from the low-level connection-start path.
     drainHciHostEvents()
-    when defined(bl808BleVendor):
-      discard
-    else:
-      when bl808BleNimConnectionEnabled:
-        let connEvents = blecontroller.bleNimPeripheralConnEventCount()
-        var newConnEvent = false
-        if connEvents != blePeripheralConnEventsSeen:
-          blePeripheralConnEventsSeen = connEvents
-          newConnEvent = true
-        if newConnEvent and not blePeripheralConnectedNotified:
-          notifyPeripheralConnectedFromController()
-
-        let discEvents = blecontroller.bleNimPeripheralDiscEventCount()
-        if discEvents != blePeripheralDiscEventsSeen:
-          blePeripheralDiscEventsSeen = discEvents
-          let reason =
-            uint8(blecontroller.bleNimPeripheralDiscReason() and 0xFF'u32)
-          bleConnActive = false
-          bleConnPending = false
-          bleConnConnectedNotified = false
-          bleCentralConnected = false
-          blePeripheralIdlePolls = 0
-          notifyDisconnected(reason)
-        elif bleConnActive and bleConn.role == 1'u8:
-          when BlePeripheralIdleDisconnectPolls > 0:
-            let rxEventCounter =
-              blecontroller.bleNimPeripheralLastRxEventCounter()
-            if rxEventCounter != blePeripheralLastRxEventCounter:
-              blePeripheralLastRxEventCounter = rxEventCounter
-              blePeripheralIdlePolls = 0
-            elif blePeripheralIdlePolls <
-                uint32(BlePeripheralIdleDisconnectPolls):
-              inc blePeripheralIdlePolls
-            else:
-              bleConnActive = false
-              bleConnPending = false
-              bleConnConnectedNotified = false
-              bleCentralConnected = false
-              blecontroller.bleNimPeripheralIdleDisconnect(0x13'u8)
-              blePeripheralDiscEventsSeen =
-                blecontroller.bleNimPeripheralDiscEventCount()
-              blePeripheralIdlePolls = 0
-              notifyDisconnected(0x13'u8)
-        else:
-          discard
+    bleBackendPollPeripheralEvents()
 
   proc bleBackendServicePump() {.inline.} =
-    when defined(bl808BleVendor):
-      blecontroller.bleBlobPoll(32)
-      drainHciHostEvents()
-      blePollHostEvents()
-    else:
-      blecontroller.bflbble_isr()
-      when bl808BleNimPureCentral:
-        blecontroller.bleControllerDrainScanReports()
-      drainHciHostEvents()
-      blecontroller.bflbip_schedule()
-      when bl808BleNimPureCentral:
-        blecontroller.bleControllerServiceScan()
-        blecontroller.bleControllerDrainScanReports()
-      drainHciHostEvents()
-      blePollHostEvents()
+    blecontroller.bflbble_isr()
+    when bl808BleNimPureCentral:
+      blecontroller.bleControllerDrainScanReports()
+    drainHciHostEvents()
+    blecontroller.bflbip_schedule()
+    when bl808BleNimPureCentral:
+      blecontroller.bleControllerServiceScan()
+      blecontroller.bleControllerDrainScanReports()
+    drainHciHostEvents()
+    blePollHostEvents()
 
   proc bleHostServicePump*() {.cdecl.} =
     ## One bounded BLE host/control-plane service step. This deliberately does
@@ -1436,6 +1254,17 @@ when defined(bl808m0):
     while result < bleNameStorage.len and bleNameStorage[result] != '\0':
       inc result
 
+  proc sendAclDataToController(handle: uint16,
+                               payloadLen: uint16,
+                               data: ptr uint8): bool =
+    var acl = blecontroller.OnChipHciAclDataTx(
+      conhdl: handle,
+      pbBcFlag: HciAclPbFirstNonFlush,
+      len: payloadLen + 4'u16,
+      buffer: data,
+    )
+    blecontroller.bt_onchiphci_send(HciPktAclData, 0'u16, addr acl) == 0'i8
+
   proc sendL2capPdu(handle, cid: uint16, payload: ptr uint8,
                     payloadLen: uint16): bool =
     if payloadLen > uint16(HciLeDefaultDataOctets - 4):
@@ -1454,24 +1283,12 @@ when defined(bl808m0):
       for i in 0 ..< payloadLen.int:
         raw[4 + i] = src[i]
 
-    when defined(bl808BleVendor):
-      inc ble_host_acl_tx_reject_count
-      false
+    let ok = sendAclDataToController(handle, payloadLen, addr data[0])
+    if ok:
+      inc ble_host_acl_tx_count
     else:
-      var acl = blecontroller.OnChipHciAclDataTx(
-        conhdl: handle,
-        pbBcFlag: HciAclPbFirstNonFlush,
-        len: payloadLen + 4'u16,
-        buffer: addr data[0],
-      )
-      let ok =
-        blecontroller.bt_onchiphci_send(HciPktAclData, 0'u16,
-                                        addr acl) == 0'i8
-      if ok:
-        inc ble_host_acl_tx_count
-      else:
-        inc ble_host_acl_tx_reject_count
-      ok
+      inc ble_host_acl_tx_reject_count
+    ok
 
   proc sendAttPdu(handle: uint16, payload: ptr uint8,
                   payloadLen: uint16): bool =
@@ -1955,33 +1772,15 @@ when defined(bl808m0):
     else:
       scanParams[5] = 0x00'u8
     scanParams[6] = 0x00'u8
-    when defined(bl808BleVendorLldScanProbe):
-      blecontroller.bleCentralDebugMark(0x130'u32, 0)
     ble_host_debug_stage = 0x5310'u32
     if not hciCommandOk(HciOpLeSetScanParams,
                         addr scanParams[0],
                         scanParams.len.uint8):
-      when defined(bl808BleVendorLldScanProbe):
-        bleScanStartDiag = 0x13F00000'u32 or
-          (bleHciCommandDiag1 and 0x00FFFFFF'u32)
-        bleProbeTraceWord(48'u32, bleScanStartDiag)
-        blecontroller.bleCentralDebugMark(0x13F'u32, bleScanStartDiag)
       return -1
-    when defined(bl808BleVendorLldScanProbe):
-      blecontroller.bleCentralDebugMark(0x131'u32, 0)
     var enable = [0x01'u8, filterDup]
     ble_host_debug_stage = 0x5320'u32
-    when defined(bl808BleVendorLldScanProbe):
-      blecontroller.bleCentralDebugMark(0x140'u32, uint32(filterDup))
     if not hciCommandOk(HciOpLeSetScanEnable, addr enable[0], enable.len.uint8):
-      when defined(bl808BleVendorLldScanProbe):
-        bleScanStartDiag = 0x14F00000'u32 or
-          (bleHciCommandDiag1 and 0x00FFFFFF'u32)
-        bleProbeTraceWord(48'u32, bleScanStartDiag)
-        blecontroller.bleCentralDebugMark(0x14F'u32, bleScanStartDiag)
       return -1
-    when defined(bl808BleVendorLldScanProbe):
-      blecontroller.bleCentralDebugMark(0x141'u32, 0)
     bleScanActive = true
     ble_host_debug_stage = 0x5330'u32
     0
@@ -2069,412 +1868,221 @@ when defined(bl808m0):
       0
 
   proc bleControllerScanProbeReportCount*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldScanProbe):
-      blecontroller.nim_vendor_scan_report_count
-    else:
-      0
+    0
 
   proc bleControllerScanProbeStartStatus*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldScanProbe):
-      blecontroller.nim_vendor_scan_start_status
-    else:
-      0
+    0
 
   proc bleControllerScanProbeArbInsertCount*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldScanProbe):
-      blecontroller.nim_vendor_scan_arb_insert_count
-    else:
-      0
+    0
 
   proc bleControllerScanProbeArbCallbackCount*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldScanProbe):
-      blecontroller.nim_vendor_scan_arb_cb_count
-    else:
-      0
+    0
 
   proc bleControllerScanProbeSwIntCount*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldScanProbe):
-      blecontroller.nim_vendor_scan_sw_int_count
-    else:
-      0
+    0
 
   proc bleControllerScanProbeRestartCount*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldScanProbe):
-      blecontroller.nim_vendor_scan_restart_count
-    else:
-      0
+    0
 
   proc bleControllerScanProbeUnsupportedCount*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldScanProbe):
-      blecontroller.nim_vendor_scan_unsupported_count
-    else:
-      0
+    0
 
   proc bleControllerScanProbeUnsupportedHeader*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldScanProbe):
-      blecontroller.nim_vendor_scan_unsupported_header
-    else:
-      0
+    0
 
   proc bleControllerScanProbeUnsupportedLen*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldScanProbe):
-      blecontroller.nim_vendor_scan_unsupported_len
-    else:
-      0
+    0
 
   proc bleControllerScanProbeUnsupportedByte*(index: uint8): uint8 {.cdecl.} =
-    when defined(bl808BleVendorLldScanProbe):
-      if index.int < blecontroller.nim_vendor_scan_unsupported_data.len:
-        blecontroller.nim_vendor_scan_unsupported_data[index.int]
-      else:
-        0
-    else:
-      discard index
-      0
+    discard index
+    0
 
   proc bleControllerInitProbeStartStatus*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_vendor_init_start_status
-    else:
-      0
+    0
 
   proc bleControllerInitProbeMessageCount*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_vendor_init_msg_count
-    else:
-      0
+    0
 
   proc bleControllerInitProbeSuccessCount*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_vendor_init_success_count
-    else:
-      0
+    0
 
   proc bleControllerInitProbeFailureCount*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_vendor_init_failure_count
-    else:
-      0
+    0
 
   proc bleControllerInitProbeLastActivity*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_vendor_init_last_activity
-    else:
-      0
+    0
 
   proc bleControllerInitProbeLastMessageStatus*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_vendor_init_last_msg_status
-    else:
-      0
+    0
 
   proc bleControllerInitProbeCancelStatus*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_vendor_init_cancel_status
-    else:
-      0
+    0
 
   proc bleControllerInitProbeCancelCount*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_vendor_init_cancel_count
-    else:
-      0
+    0
 
   proc bleControllerInitProbeHeaderFixCount*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_vendor_init_header_fix_count
-    else:
-      0
+    0
 
   proc bleControllerInitProbeParamByte*(index: uint8): uint8 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.ble_init_probe_param_byte(index)
-    else:
-      discard index
-      0
+    discard index
+    0
 
   proc bleControllerInitProbeArbInsertCount*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_vendor_init_arb_insert_count
-    else:
-      0
+    0
 
   proc bleControllerInitProbeArbCallbackCount*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_vendor_init_arb_cb_count
-    else:
-      0
+    0
 
   proc bleControllerInitProbeArbLastWord*(index: uint8): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      case index
-      of 1'u8: blecontroller.nim_vendor_init_arb_last_w1
-      of 2'u8: blecontroller.nim_vendor_init_arb_last_w2
-      of 5'u8: blecontroller.nim_vendor_init_arb_last_w5
-      of 7'u8: blecontroller.nim_vendor_init_arb_last_w7
-      of 11'u8: blecontroller.nim_vendor_init_arb_last_w11
-      else: 0
-    else:
-      discard index
-      0
+    discard index
+    0
 
   proc bleControllerInitProbePeerRxCount*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_vendor_init_peer_rx_count
-    else:
-      0
+    0
 
   proc bleControllerInitProbePeerHitCount*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_vendor_init_peer_hit_count
-    else:
-      0
+    0
 
   proc bleControllerInitProbePeerRxLastHeader*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_vendor_init_peer_rx_last_header
-    else:
-      0
+    0
 
   proc bleControllerInitProbePeerRxLastStatus*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_vendor_init_peer_rx_last_status
-    else:
-      0
+    0
 
   proc bleControllerInitProbePeerRxLastMeta*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_vendor_init_peer_rx_last_meta
-    else:
-      0
+    0
 
   proc bleControllerInitProbeStatusFixCount*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_vendor_init_status_fix_count
-    else:
-      0
+    0
 
   proc bleControllerInitProbeStatusFixLast*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_vendor_init_status_fix_last
-    else:
-      0
+    0
 
   proc bleControllerInitProbeMessageAllocCount*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_vendor_init_msg_alloc_count
-    else:
-      0
+    0
 
   proc bleControllerInitProbeMessageAllocLen*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_vendor_init_msg_alloc_last_len
-    else:
-      0
+    0
 
   proc bleControllerInitProbeMessageAllocDest*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_vendor_init_msg_alloc_last_dest
-    else:
-      0
+    0
 
   proc bleControllerInitProbeMessageAllocSrc*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_vendor_init_msg_alloc_last_src
-    else:
-      0
+    0
 
   proc bleControllerInitProbeAccessAddressCount*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_lld_aa_gen_count
-    else:
-      0
+    0
 
   proc bleControllerInitProbeAccessAddress*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_lld_aa_last
-    else:
-      0
+    0
 
   proc bleControllerInitProbeAccessAddressSeed*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_lld_aa_last_seed
-    else:
-      0
+    0
 
   proc bleControllerInitProbePacketDurationCount*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_vendor_init_pkt_dur_count
-    else:
-      0
+    0
 
   proc bleControllerInitProbePacketDurationLen*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_vendor_init_pkt_dur_last_len
-    else:
-      0
+    0
 
   proc bleControllerInitProbePacketDurationRate*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldInitProbe):
-      blecontroller.nim_vendor_init_pkt_dur_last_rate
-    else:
-      0
+    0
 
   proc bleControllerSchProgFifoCount*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldScanProbe):
-      blecontroller.bleNimDbgVendorSchProgFifoCount()
-    else:
-      0
+    0
 
   proc bleControllerSchProgSkipCount*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendorLldScanProbe):
-      blecontroller.bleNimDbgVendorSchProgSkipCount()
-    else:
-      0
+    0
 
   proc bleControllerSchProgElapsedCount*(): uint32 {.cdecl.} =
-    when not defined(bl808BleVendor):
-      when defined(bl808BleVendorLldScanProbe) and
-          blecontroller.bl808BleNimSchProg:
-        blecontroller.nim_vendor_sch_prog_elapsed_count
-      else:
-        0
-    else:
-      0
+    0
 
   proc bleControllerSchProgLastStage*(): uint32 {.cdecl.} =
-    when not defined(bl808BleVendor):
-      when defined(bl808BleVendorLldScanProbe) and
-          blecontroller.bl808BleNimSchProg:
-        blecontroller.nim_sch_prog_last_stage
-      else:
-        0
-    else:
-      0
+    0
 
   proc bleControllerSchProgLastTarget*(): uint32 {.cdecl.} =
-    when not defined(bl808BleVendor):
-      when defined(bl808BleVendorLldScanProbe) and
-          blecontroller.bl808BleNimSchProg:
-        blecontroller.nim_sch_prog_last_target
-      else:
-        0
-    else:
-      0
+    0
 
   proc bleControllerSchProgLastNow*(): uint32 {.cdecl.} =
-    when not defined(bl808BleVendor):
-      when defined(bl808BleVendorLldScanProbe) and
-          blecontroller.bl808BleNimSchProg:
-        blecontroller.nim_sch_prog_last_now
-      else:
-        0
-    else:
-      0
+    0
 
   proc bleControllerSchProgLastSlot*(): uint32 {.cdecl.} =
-    when not defined(bl808BleVendor):
-      when defined(bl808BleVendorLldScanProbe) and
-          blecontroller.bl808BleNimSchProg:
-        blecontroller.nim_sch_prog_last_slot
-      else:
-        0
-    else:
-      0
+    0
 
   proc bleControllerSchProgLastIntMask*(): uint32 {.cdecl.} =
-    when not defined(bl808BleVendor):
-      when defined(bl808BleVendorLldScanProbe) and
-          blecontroller.bl808BleNimSchProg:
-        blecontroller.nim_sch_prog_last_intmask
-      else:
-        0
-    else:
-      0
+    0
 
   proc bleControllerSchProgLastIntStat*(): uint32 {.cdecl.} =
-    when not defined(bl808BleVendor):
-      when defined(bl808BleVendorLldScanProbe) and
-          blecontroller.bl808BleNimSchProg:
-        blecontroller.nim_sch_prog_last_intstat
-      else:
-        0
-    else:
-      0
+    0
 
   proc bleControllerIsrCount*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendor):
-      0
-    else:
-      blecontroller.ble_dbg_isr_count()
+    blecontroller.ble_dbg_isr_count()
 
   proc bleControllerIsrStatOr*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendor):
-      0
-    else:
-      blecontroller.ble_dbg_isr_stat_or()
+    blecontroller.ble_dbg_isr_stat_or()
 
   proc bleControllerStat20Count*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendor):
-      0
-    else:
-      blecontroller.ble_dbg_stat20_count()
+    blecontroller.ble_dbg_stat20_count()
 
   proc bleControllerStat8000Count*(): uint32 {.cdecl.} =
-    when defined(bl808BleVendor):
-      0
-    else:
-      blecontroller.ble_dbg_stat8000_count()
+    blecontroller.ble_dbg_stat8000_count()
 
   proc bleControllerRxCheckCount*(): uint32 {.cdecl.} =
-    when bl808BleNimConnectionEnabled or defined(bl808BleVendorLldScanProbe):
+    when bl808BleNimConnectionEnabled:
       blecontroller.nim_lld_rx_check_count
     else:
       0
 
   proc bleControllerRxCheckHitCount*(): uint32 {.cdecl.} =
-    when bl808BleNimConnectionEnabled or defined(bl808BleVendorLldScanProbe):
+    when bl808BleNimConnectionEnabled:
       blecontroller.nim_lld_rx_check_hit_count
     else:
       0
 
   proc bleControllerRxFreeCount*(): uint32 {.cdecl.} =
-    when bl808BleNimConnectionEnabled or defined(bl808BleVendorLldScanProbe):
+    when bl808BleNimConnectionEnabled:
       blecontroller.nim_lld_rx_free_count
     else:
       0
 
   proc bleControllerRxLastStatus*(): uint32 {.cdecl.} =
-    when bl808BleNimConnectionEnabled or defined(bl808BleVendorLldScanProbe):
+    when bl808BleNimConnectionEnabled:
       blecontroller.nim_lld_rx_last_status
     else:
       0
 
   proc bleControllerRxLastHeader*(): uint32 {.cdecl.} =
-    when bl808BleNimConnectionEnabled or defined(bl808BleVendorLldScanProbe):
+    when bl808BleNimConnectionEnabled:
       blecontroller.nim_lld_rx_last_header
     else:
       0
 
   proc synthesizeCentralReportIfNeeded() =
-    when not defined(bl808BleVendor):
-      when bl808BleNimSyntheticCentral:
-        if not bleScanActive or not bleCentralTargetActive or bleCentralPeerFound:
-          return
-        var peer: BtAddrLe
-        peer.addrType = 0x01'u8
-        peer.a[0] = 0xC0'u8
-        peer.a[1] = 0xDE'u8
-        peer.a[2] = 0xAC'u8
-        peer.a[3] = 0xCE'u8
-        peer.a[4] = 0x55'u8
-        peer.a[5] = 0x01'u8
-        bleScanData.len = 0
-        bleCentralPeer = peer
-        bleCentralPeerFound = true
-        bleCentralTargetActive = false
-        inc bleScanReportCounter
-        inc bleScanNameMatchCounter
+    when bl808BleNimSyntheticCentral:
+      if not bleScanActive or not bleCentralTargetActive or bleCentralPeerFound:
+        return
+      var peer: BtAddrLe
+      peer.addrType = 0x01'u8
+      peer.a[0] = 0xC0'u8
+      peer.a[1] = 0xDE'u8
+      peer.a[2] = 0xAC'u8
+      peer.a[3] = 0xCE'u8
+      peer.a[4] = 0x55'u8
+      peer.a[5] = 0x01'u8
+      bleScanData.len = 0
+      bleCentralPeer = peer
+      bleCentralPeerFound = true
+      bleCentralTargetActive = false
+      inc bleScanReportCounter
+      inc bleScanNameMatchCounter
+
+  proc bleBackendSynthesizeCentralReportIfNeeded() {.inline.} =
+    synthesizeCentralReportIfNeeded()
+
+  proc bleBackendVersionString(): string =
+    "bl808-blecontroller-nim-1.0"
 
   proc bt_conn_create_le*(peer: ptr BtAddrLe,
                           param: ptr BtLeConnParam): ptr BtConn {.cdecl.} =
@@ -2531,8 +2139,7 @@ when defined(bl808m0):
       bleConnConnectedNotified = false
       ble_central_debug_create_result = 0xFFFFFFFF'u32
       return nil
-    when not defined(bl808BleVendor):
-      drainHciHostEvents()
+    drainHciHostEvents()
     ble_central_debug_create_result = 0
     addr bleConn
 
@@ -2570,21 +2177,24 @@ when defined(bl808m0):
     if retries != high(uint32):
       inc retries
 
-  proc pollCentralController() =
-    when defined(bl808BleVendor):
-      blecontroller.bleBlobPoll(32)
+  proc bleBackendPollCentralController() =
+    const iterations = max(BleCentralPollIterations, 1)
+    for _ in 0 ..< iterations:
+      blecontroller.bflbble_isr()
+      blecontroller.bleControllerDrainScanReports()
       drainHciHostEvents()
-    else:
-      const iterations = max(BleCentralPollIterations, 1)
-      for _ in 0 ..< iterations:
-        blecontroller.bflbble_isr()
-        blecontroller.bleControllerDrainScanReports()
-        drainHciHostEvents()
-        blecontroller.bflbip_schedule()
-        when bl808BleNimPureCentral:
-          blecontroller.bleControllerServiceScan()
-        blecontroller.bleControllerDrainScanReports()
-        drainHciHostEvents()
+      blecontroller.bflbip_schedule()
+      when bl808BleNimPureCentral:
+        blecontroller.bleControllerServiceScan()
+      blecontroller.bleControllerDrainScanReports()
+      drainHciHostEvents()
+
+  proc pollCentralController() =
+    bleBackendPollCentralController()
+
+  proc bleBackendServiceDisconnectWait(): bool =
+    drainHciHostEvents()
+    not bleConnActive
 
   proc copyCentralTargetName(name: cstring) =
     for i in 0 ..< bleCentralTargetName.len:
@@ -2628,13 +2238,8 @@ when defined(bl808m0):
   proc startCentralDiscoveryScan(scanParam: var BtLeScanParam,
                                  timeoutMs: uint32,
                                  mark: uint32): bool =
-    when defined(bl808BleVendorLldScanProbe):
-      blecontroller.bleCentralDebugMark(mark, timeoutMs)
     let scanStartRc = bt_le_scan_start(addr scanParam, nil)
     if scanStartRc != 0:
-      when defined(bl808BleVendorLldScanProbe):
-        bleProbeTraceWord(52'u32, cast[uint32](scanStartRc))
-        blecontroller.bleCentralDebugMark(0x1FF'u32, bleScanStartDiag)
       return false
     true
 
@@ -2681,8 +2286,7 @@ when defined(bl808m0):
 
     while elapsedMsSince(startedAtMs) < timeoutMs:
       pollCentralController()
-      when not defined(bl808BleVendor):
-        synthesizeCentralReportIfNeeded()
+      bleBackendSynthesizeCentralReportIfNeeded()
       if bleCentralPeerFound:
         discard bt_le_scan_stop()
         bleCentralTargetActive = false
@@ -2722,8 +2326,6 @@ when defined(bl808m0):
     if not startCentralDiscoveryScan(scanParam, timeoutMs, 0x100'u32):
       return -1
     ble_central_debug_stage = 0x5510'u32
-    when defined(bl808BleVendorLldScanProbe):
-      blecontroller.bleCentralDebugMark(0x110'u32, 0)
     var connectStarted = false
     var connectStartedAt = 0'u32
     var retryKnownPeerPending = false
@@ -2747,16 +2349,8 @@ when defined(bl808m0):
         (if connectStarted: 2'u32 else: 0'u32) or
         (if bleConnPending: 4'u32 else: 0'u32) or
         (if bleCentralConnected: 8'u32 else: 0'u32)
-      when defined(bl808BleVendorLldScanProbe):
-        if nextScanRestartMs != 0'u32 and waited >= nextScanRestartMs and
-            not bleCentralPeerFound and not connectStarted:
-          discard blecontroller.ble_scan_probe_restart()
-          nextScanRestartMs = waited + uint32(bl808BleCentralScanRestartMs)
-      when not defined(bl808BleVendor):
-        when defined(bl808BleVendorLldScanProbe):
-          blecontroller.bleCentralDebugMark(0x120'u32, waited)
-        if waited >= 250'u32:
-          synthesizeCentralReportIfNeeded()
+      if waited >= 250'u32:
+        bleBackendSynthesizeCentralReportIfNeeded()
       if bleCentralConnected:
         if not bleConnConnectedNotified:
           notifyConnected(bleConn.status)
@@ -2781,8 +2375,6 @@ when defined(bl808m0):
             return -1
       if connectStarted and attemptBudget != 0'u32 and
           ((waited - connectStartedAt) >= attemptBudget):
-        when defined(bl808BleVendorLldScanProbe):
-          blecontroller.bleCentralDebugMark(0x520'u32, waited)
         discard hciCommandOk(HciOpLeCreateConnectionCancel, nil, 0)
         connectStarted = false
         bleConnPending = false
@@ -2799,31 +2391,16 @@ when defined(bl808m0):
             return -1
       if bleCentralPeerFound and not connectStarted:
         ble_central_debug_stage = 0x5520'u32
-        when defined(bl808BleVendorLldScanProbe):
-          blecontroller.bleCentralDebugMark(0x200'u32, waited)
         discard stopDiscoveryScanBeforeConnect()
         ble_central_debug_stage = 0x5530'u32
-        when defined(bl808BleVendorLldScanProbe):
-          blecontroller.bleCentralDebugMark(0x211'u32, waited)
-        when not defined(bl808BleVendor):
-          when defined(bl808BleVendorLldScanProbe):
-            for drainIdx in 0 ..< max(BleCentralPostScanDrainPolls, 0):
-              blecontroller.bleCentralDebugMark(0x220'u32, drainIdx.uint32)
-              blecontroller.bflbble_isr()
-              blecontroller.bleCentralDebugMark(0x221'u32, drainIdx.uint32)
-              delayUs(1000)
         var connParam = BtLeConnParam(
           intervalMin: 0x0018'u16,
           intervalMax: 0x0028'u16,
           latency: 0'u16,
           timeout: 400'u16,
         )
-        when defined(bl808BleVendorLldScanProbe):
-          blecontroller.bleCentralDebugMark(0x300'u32, waited)
         if bt_conn_create_le(addr bleCentralPeer, addr connParam) == nil:
           ble_central_debug_stage = 0x55F0'u32
-          when defined(bl808BleVendorLldScanProbe):
-            blecontroller.bleCentralDebugMark(0x3FF'u32, waited)
           bleCentralTargetActive = false
           bleCentralAcceptAnyReport = false
           bleConnPending = false
@@ -2832,8 +2409,6 @@ when defined(bl808m0):
         bleCentralTargetActive = false
         bleCentralAcceptAnyReport = false
         ble_central_debug_stage = 0x5540'u32
-        when defined(bl808BleVendorLldScanProbe):
-          blecontroller.bleCentralDebugMark(0x301'u32, waited)
         if not retryKnownPeerPending:
           peerConnectRetries = 0
         retryKnownPeerPending = false
@@ -2849,12 +2424,8 @@ when defined(bl808m0):
     ble_central_debug_stage = 0x5560'u32
     ble_central_debug_waited = finalWaited
     if connectStarted:
-      when defined(bl808BleVendorLldScanProbe):
-        blecontroller.bleCentralDebugMark(0x500'u32, finalWaited)
       discard hciCommandOk(HciOpLeCreateConnectionCancel, nil, 0)
     else:
-      when defined(bl808BleVendorLldScanProbe):
-        blecontroller.bleCentralDebugMark(0x501'u32, finalWaited)
       discard bt_le_scan_stop()
     bleCentralTargetActive = false
     bleCentralAcceptAnyReport = false
@@ -2876,8 +2447,7 @@ when defined(bl808m0):
     let startedAtMs = monotonicMs()
     while elapsedMsSince(startedAtMs) < timeoutMs:
       bleHostServicePump()
-      when not defined(bl808BleVendor):
-        synthesizeCentralReportIfNeeded()
+      bleBackendSynthesizeCentralReportIfNeeded()
       if bleCentralPeerFound:
         discard bt_le_scan_stop()
         bleCentralTargetActive = false
@@ -2925,9 +2495,8 @@ when defined(bl808m0):
         (if connectStarted: 2'u32 else: 0'u32) or
         (if bleConnPending: 4'u32 else: 0'u32) or
         (if bleCentralConnected: 8'u32 else: 0'u32)
-      when not defined(bl808BleVendor):
-        if waited >= 250'u32:
-          synthesizeCentralReportIfNeeded()
+      if waited >= 250'u32:
+        bleBackendSynthesizeCentralReportIfNeeded()
       if bleCentralConnected:
         if not bleConnConnectedNotified:
           notifyConnected(bleConn.status)
@@ -2985,14 +2554,10 @@ when defined(bl808m0):
       return 0
     var waited = 0'u32
     while waited < timeoutMs:
-      when defined(bl808BleVendor):
-        pollCentralController()
-      else:
-        drainHciHostEvents()
-        if not bleConnActive:
-          return 0
-        delayUs(1000)
-        inc waited
+      if bleBackendServiceDisconnectWait():
+        return 0
+      delayUs(1000)
+      inc waited
     -1
 
 # =============================================================================
@@ -3024,14 +2589,7 @@ when defined(bl808m0):
 
   proc bleGetVersion*(): string =
     ## Get BLE controller library version.
-    when defined(bl808BleVendor):
-      let ver = ble_controller_get_lib_ver()
-      if ver == nil:
-        ""
-      else:
-        $ver
-    else:
-      "bl808-blecontroller-nim-1.0"
+    bleBackendVersionString()
 
   proc bleEnable*(readyCb: BtReadyCb): BleError =
     ## Enable the Zephyr BLE host stack.

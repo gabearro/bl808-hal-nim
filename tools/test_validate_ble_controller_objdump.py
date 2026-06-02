@@ -29,7 +29,7 @@ def test_likely_active_placeholder_ignores_compiled_wrapper_fallback(tmp_path):
             [
                 "proc lld_con_data_tx*() {.exportc, cdecl.} =",
                 "  vendor_lld_con_data_tx()",
-                "when not defined(bl808BleVendorManualConnTx):",
+                "when not defined(bl808BleNimManualConnTx):",
                 "  vendorZeroStub(lld_con_data_tx)",
                 "vendorZeroStub(ll_length_req_handler)",
             ]
@@ -69,11 +69,11 @@ def test_llcp_data_length_response_is_feature_gated():
         "nimBleLocalFeatureSupported(NimBleFeatureDataPacketLengthExtension)"
         in length_branch
     )
-    assert "vendorBuildLengthRsp()" in length_branch
-    assert "vendorBuildUnsupportedFeatureRsp(opcode)" in length_branch
+    assert "nimLlcpBuildLengthRsp()" in length_branch
+    assert "nimLlcpBuildUnsupportedFeatureRsp(opcode)" in length_branch
 
-    record_peer_length = text.split("proc vendorRecordPeerDataLength", 1)[1].split(
-        "proc vendorConfigCount", 1
+    record_peer_length = text.split("proc nimLlcpRecordPeerDataLength", 1)[1].split(
+        "proc nimLlcpConfigCount", 1
     )[0]
     assert (
         "nimBleLocalFeatureSupported(NimBleFeatureDataPacketLengthExtension)"
@@ -116,30 +116,30 @@ def test_remote_feature_exchange_tracks_feature_req_and_hci_pending_event():
 
     assert "HciOpLeReadRemoteFeatures = 0x2016'u16" in text
 
-    record_peer_features = text.split("proc vendorRecordPeerFeatures", 1)[1].split(
-        "proc vendorMaybeCompleteRemoteFeatures", 1
+    record_peer_features = text.split("proc nimLlcpRecordPeerFeatures", 1)[1].split(
+        "proc nimLlcpMaybeCompleteRemoteFeatures", 1
     )[0]
     assert "opcode != LlcpFeatureReq" in record_peer_features
     assert "opcode != LlcpFeatureRsp" in record_peer_features
     assert "opcode != LlcpSlaveFeatureReq" in record_peer_features
-    assert "nim_vendor_llcp_state.peerFeaturesKnown = true" in record_peer_features
+    assert "nim_llcp_state.peerFeaturesKnown = true" in record_peer_features
 
-    used_features = text.split("proc vendorLlcpUsedFeaturesForPeer", 1)[1].split(
-        "proc vendorRecordUsedFeatures", 1
+    used_features = text.split("proc nimLlcpUsedFeaturesForPeer", 1)[1].split(
+        "proc nimLlcpRecordUsedFeatures", 1
     )[0]
     assert "NimBleConservativeLeFeatures and" in used_features
-    assert "nim_vendor_llcp_state.peerFeatures" in used_features
+    assert "nim_llcp_state.peerFeatures" in used_features
 
-    feature_response = text.split("proc vendorBuildFeatureRsp", 1)[1].split(
-        "proc vendorBuildPhyRsp", 1
+    feature_response = text.split("proc nimLlcpBuildFeatureRsp", 1)[1].split(
+        "proc nimLlcpBuildPhyRsp", 1
     )[0]
-    assert "vendorLlcpUsedFeaturesForPeer()" in feature_response
-    assert "vendorBuildFeaturePdu(LlcpFeatureRsp, features)" in feature_response
+    assert "nimLlcpUsedFeaturesForPeer()" in feature_response
+    assert "nimLlcpBuildFeaturePdu(LlcpFeatureRsp, features)" in feature_response
 
-    observe_block = text.split("proc vendorObserveLlcpPdu", 1)[1].split(
-        "proc vendorObserveLlcpEm", 1
+    observe_block = text.split("proc nimLlcpObservePdu", 1)[1].split(
+        "proc nimLlcpObserveEm", 1
     )[0]
-    assert "vendorMaybeCompleteRemoteFeatures(conhdl)" in observe_block
+    assert "nimLlcpMaybeCompleteRemoteFeatures(conhdl)" in observe_block
 
     remote_features_command = text.split(
         "proc sendLeReadRemoteFeaturesCommand", 1
@@ -191,15 +191,15 @@ def test_connection_update_command_queues_llcp_and_completes_at_instant():
         "proc nimBleRequestedPhySupported", 1
     )[0]
     assert "nimBleConnectionUpdateParamStatus(params, paramLen, handle)" in command
-    assert "vendorStartConnectionUpdate(handle, hciLeConnUpdateReq(params))" in command
+    assert "nimLlcpStartConnectionUpdate(handle, hciLeConnUpdateReq(params))" in command
     assert "sendCmdStatus(opcode, result)" in command
     assert "sendLeConnectionUpdateComplete(handle" not in command
 
-    llcp_start = text.split("proc vendorStartConnectionUpdate", 1)[1].split(
-        "proc vendorBuildChannelMapInd", 1
+    llcp_start = text.split("proc nimLlcpStartConnectionUpdate", 1)[1].split(
+        "proc nimLlcpBuildChannelMapInd", 1
     )[0]
-    assert "vendorBuildConnectionUpdateInd(req)" in llcp_start
-    assert "vendorQueueLlcpPdu(conhdl, pdu)" in llcp_start
+    assert "nimLlcpBuildConnectionUpdateInd(req)" in llcp_start
+    assert "nimLlcpQueuePdu(conhdl, pdu)" in llcp_start
     assert "nimConnStorePendingConnectionUpdate" in llcp_start
 
     apply_update = text.split("proc nimConnApplyPendingConnectionUpdate", 1)[1].split(
@@ -235,6 +235,15 @@ def test_remote_connection_parameter_reply_is_not_fake_success():
 def test_ble_controller_trng_polling_masks_done_interrupt():
     source = Path(__file__).resolve().parents[1] / "src/bl808/blecontroller.nim"
     text = source.read_text(encoding="utf-8")
+
+    wait_idle = text.split("proc bleTrngWaitIdle", 1)[1].split(
+        "proc bleTrngClearInterrupt", 1
+    )[0]
+    assert "TrngTimeout = 100_000'u32" in text
+    assert "nim_trng_wait_timeout_count" in text
+    assert "nim_trng_wait_last_reg" in text
+    assert "nim_trng_wait_last_mask" in text
+    assert "noteTrngWaitTimeout(TrngCtrl.uint32, TrngBusy)" in wait_idle
 
     read_block = text.split("proc bleTrngReadBlock", 1)[1].split(
         "proc bleFillRandomBytesUnlocked", 1

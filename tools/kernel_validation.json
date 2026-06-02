@@ -491,7 +491,7 @@
       "name": "hal_binding_declared_m0",
       "tiers": ["full"],
       "kind": "command",
-      "cmd": ["python3", "tools/audit_hal_bindings.py", "--declared-check", "--kind", "all", "--include-category", "ordinary", "--include-category", "external-c", "--include-category", "firmware-reimpl", "--core", "bl808m0", "--nim-define", "bl808WifiVendor=1"],
+      "cmd": ["python3", "tools/audit_hal_bindings.py", "--declared-check", "--kind", "all", "--include-category", "ordinary", "--include-category", "external-c", "--include-category", "firmware-reimpl", "--core", "bl808m0", "--nim-define", "bl808WifiNimFw=1"],
       "required": ["PASS declared-check"],
       "timeout": 30
     },

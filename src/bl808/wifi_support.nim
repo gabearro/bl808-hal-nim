@@ -4,7 +4,7 @@
 ## OS-adapter function table, minimal lwIP/pbuf shims, WiFi manager facade, and
 ## host/firmware polling loop used by the hardware validation tests.
 
-when defined(bl808m0) and defined(bl808WifiVendor) and defined(bl808WifiNimFw):
+when defined(bl808m0) and defined(bl808WifiNimFw):
   import wifi_fw
 
   {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver".}
@@ -311,9 +311,9 @@ when defined(bl808m0) and defined(bl808WifiVendor) and defined(bl808WifiNimFw):
   proc ipc_emb_init() {.importc, cdecl.}
   proc bl_init() {.importc, cdecl.}
   proc bl_pm_ops_register() {.importc, cdecl.}
-  proc ipc_emb_wait() {.importc, cdecl.}
   proc ke_evt_set(events: uint32) {.importc, cdecl.}
   proc ke_evt_schedule() {.importc, cdecl.}
+  proc wifi_main_poll_once() {.importc, cdecl.}
   proc bl_irq_handler() {.importc, cdecl.}
   proc bl_main_event_handle(param: cint; txFcField: pointer) {.importc, cdecl.}
   proc mac_irq() {.importc, cdecl.}
@@ -416,13 +416,13 @@ when defined(bl808m0) and defined(bl808WifiVendor) and defined(bl808WifiNimFw):
     let data = cast[ptr uint32](UartWdata.uint)
     var timeout: uint32
     if c == '\n':
-      when defined(bl808WifiVendorValidationLog):
+      when defined(bl808WifiValidationLog):
         hw_validation_log_byte('\r'.uint8)
       timeout = 1_000_000
       while (fifo[] and 0x3f'u32) == 0 and timeout != 0:
         dec timeout
       data[] = '\r'.uint32
-    when defined(bl808WifiVendorValidationLog):
+    when defined(bl808WifiValidationLog):
       hw_validation_log_byte(c.uint8)
     timeout = 1_000_000
     while (fifo[] and 0x3f'u32) == 0 and timeout != 0:
@@ -444,7 +444,7 @@ when defined(bl808m0) and defined(bl808WifiVendor) and defined(bl808WifiNimFw):
     vendorPutsRaw(s)
 
   proc validationPutsRaw(s: cstring) =
-    when not defined(bl808WifiVendorValidationLog):
+    when not defined(bl808WifiValidationLog):
       if s == nil:
         return
       var i = 0
@@ -858,12 +858,12 @@ void bl808_nim_os_log_write(uint32_t level, char *tag, char *file,
     scanDiag[slot].auth = loadU8(ind, WifiBeaconAuthOff)
     scanDiag[slot].cipher = loadU8(ind, WifiBeaconCipherOff)
 
-  proc bl808_wifi_vendor_scan_diag_count*(): uint32 {.exportc, cdecl.} =
+  proc bl808_wifi_backend_scan_diag_count*(): uint32 {.exportc, cdecl.} =
     if scanItemCount < VendorScanDiagMax.uint32: scanItemCount else: VendorScanDiagMax.uint32
 
-  proc bl808_wifi_vendor_scan_diag_get*(index: uint32; ssidLen, ssid, channel: pointer;
+  proc bl808_wifi_backend_scan_diag_get*(index: uint32; ssidLen, ssid, channel: pointer;
                                         rssi, auth, cipher, bssid: pointer): cint {.exportc, cdecl.} =
-    if index >= bl808_wifi_vendor_scan_diag_count(): return -1
+    if index >= bl808_wifi_backend_scan_diag_count(): return -1
     let start = if scanItemCount > VendorScanDiagMax.uint32: scanItemCount mod VendorScanDiagMax.uint32 else: 0'u32
     let slot = ((start + index) mod VendorScanDiagMax.uint32).int
     if scanDiag[slot].used == 0: return -1
@@ -881,7 +881,7 @@ void bl808_nim_os_log_write(uint32_t level, char *tag, char *file,
     elif channel == 14: 2484'u16
     else: 0'u16
 
-  proc bl808WifiVendorSwResetCfg0(bit: uint32) =
+  proc bl808WifiBackendSwResetCfg0(bit: uint32) =
     let reg = GlbBase + 0x540'u32
     let mask = 1'u32 shl bit
     regWrite32(reg, regRead32(reg) and not mask)
@@ -891,13 +891,13 @@ void bl808_nim_os_log_write(uint32_t level, char *tag, char *file,
     regWrite32(reg, regRead32(reg) and not mask)
     discard regRead32(reg)
 
-  proc bl808WifiVendorEnableWirelessClocks() =
+  proc bl808WifiBackendEnableWirelessClocks() =
     regWrite32(GlbBase + 0x580'u32, regRead32(GlbBase + 0x580'u32) or ((1'u32 shl 5) or (1'u32 shl 6) or (1'u32 shl 7)))
     regWrite32(GlbBase + 0x584'u32, regRead32(GlbBase + 0x584'u32) or (1'u32 shl 1))
     regWrite32(GlbBase + 0x588'u32, regRead32(GlbBase + 0x588'u32) or ((1'u32 shl 4) or (1'u32 shl 8) or (1'u32 shl 10)))
     regUpdate32(GlbBase + 0x3B0'u32, 0x0f, 1)
 
-  proc bl808WifiVendorConfigureDigClock() =
+  proc bl808WifiBackendConfigureDigClock() =
     let reg = GlbBase + 0x250'u32
     var v = regRead32(reg)
     let dig32 = v and (1'u32 shl 12)
@@ -910,7 +910,7 @@ void bl808_nim_os_log_write(uint32_t level, char *tag, char *file,
     v = (v and not (0x7f'u32 shl 16)) or (0x4e'u32 shl 16) or (1'u32 shl 25) or (1'u32 shl 24) or dig32
     regWrite32(reg, v)
 
-  proc bl808WifiVendorPowerOnXtalWifiPll() =
+  proc bl808WifiBackendPowerOnXtalWifiPll() =
     let aon = 0x2000_F000'u32
     let hbn = 0x2000_F000'u32
     let mmGlb = 0x3000_7000'u32
@@ -946,28 +946,28 @@ void bl808_nim_os_log_write(uint32_t level, char *tag, char *file,
     regWrite32(GlbBase + 0x090'u32, regRead32(GlbBase + 0x090'u32) or 1)
     regWrite32(mmGlb, regRead32(mmGlb) or 1)
 
-  proc bl808WifiVendorPrepareWirelessDomain() =
+  proc bl808WifiBackendPrepareWirelessDomain() =
     var prepared {.global.}: bool
     if prepared:
-      bl808WifiVendorEnableWirelessClocks()
+      bl808WifiBackendEnableWirelessClocks()
       return
     regUpdate32(GlbBase + 0x60c'u32, 0xff, 0)
-    bl808WifiVendorPowerOnXtalWifiPll()
-    bl808WifiVendorConfigureDigClock()
-    bl808WifiVendorEnableWirelessClocks()
-    bl808WifiVendorSwResetCfg0(4)
-    bl808WifiVendorConfigureDigClock()
-    bl808WifiVendorEnableWirelessClocks()
+    bl808WifiBackendPowerOnXtalWifiPll()
+    bl808WifiBackendConfigureDigClock()
+    bl808WifiBackendEnableWirelessClocks()
+    bl808WifiBackendSwResetCfg0(4)
+    bl808WifiBackendConfigureDigClock()
+    bl808WifiBackendEnableWirelessClocks()
     prepared = true
 
-  proc bl808WifiVendorPollEmbEvents() =
+  proc bl808WifiBackendPollEmbEvents() =
     if (regRead32(IpcEmb2AppStatus) and IpcA2eMsgBit) != 0:
       ke_evt_set(KeEvtIpcEmbMsg)
-  proc bl808WifiVendorClearEmbIpc() = regWrite32(IpcApp2EmbAck, 0xffff_ffff'u32)
-  proc bl808WifiVendorClearHostIpc() = regWrite32(IpcEmb2AppAck, 0xffff_ffff'u32)
-  proc bl808WifiVendorHostIpcStatus(): uint32 = regRead32(IpcEmb2AppRawStatus)
+  proc bl808WifiBackendClearEmbIpc() = regWrite32(IpcApp2EmbAck, 0xffff_ffff'u32)
+  proc bl808WifiBackendClearHostIpc() = regWrite32(IpcEmb2AppAck, 0xffff_ffff'u32)
+  proc bl808WifiBackendHostIpcStatus(): uint32 = regRead32(IpcEmb2AppRawStatus)
 
-  proc bl808WifiVendorDriveRfStatus() =
+  proc bl808WifiBackendDriveRfStatus() =
     var rfCtrl = regRead32(RfStatusCtrl)
     if (regRead32(MacRfStatus) and MacRfActiveBit) != 0:
       rfCtrl = rfCtrl or 0x01'u32
@@ -975,7 +975,7 @@ void bl808_nim_os_log_write(uint32_t level, char *tag, char *file,
       rfCtrl = rfCtrl and not 0x01'u32
     regWrite32(RfStatusCtrl, rfCtrl)
 
-  proc bl808WifiVendorPollMacIrq() =
+  proc bl808WifiBackendPollMacIrq() =
     var guard = 32
     while guard > 0:
       dec guard
@@ -987,15 +987,15 @@ void bl808_nim_os_log_write(uint32_t level, char *tag, char *file,
       inc macPollIrqCount
       if platformPending != 0: mac_irq() else: hal_machw_gen_handler()
 
-  proc bl808WifiVendorMacIrqTrampoline() {.cdecl.} =
+  proc bl808WifiBackendMacIrqTrampoline() {.cdecl.} =
     inc macIrqCount
     inc macTrapIrqCount
     mac_irq()
-  proc bl808WifiVendorIpcIrqTrampoline() {.cdecl.} =
+  proc bl808WifiBackendIpcIrqTrampoline() {.cdecl.} =
     inc ipcTrapIrqCount
     bl_irq_handler()
 
-  proc bl808WifiVendorApplyHighPowerProfile() =
+  proc bl808WifiBackendApplyHighPowerProfile() =
     var ch: array[14, int8]
     var pwr11b = [0x1c'i8, 0x1c'i8, 0x1c'i8, 0x1c'i8]
     var pwr11g = [0x1c'i8, 0x1c'i8, 0x1c'i8, 0x1c'i8, 0x1c'i8, 0x1c'i8, 0x1c'i8, 0x1c'i8]
@@ -1005,7 +1005,7 @@ void bl808_nim_os_log_write(uint32_t level, char *tag, char *file,
     bl_tpc_update_power_rate_11g(addr pwr11g[0])
     bl_tpc_update_power_rate_11n(addr pwr11n[0])
 
-  proc bl808WifiVendorTrace(step: cstring) =
+  proc bl808WifiBackendTrace(step: cstring) =
     validationPutsRaw("[WIFI-NIMFW] ")
     validationPutsRaw(step)
     validationPutsRaw("\r\n")
@@ -1013,7 +1013,7 @@ void bl808_nim_os_log_write(uint32_t level, char *tag, char *file,
     vendorPutsRaw(step)
     vendorPutsRaw("\r\n")
 
-  proc bl808WifiVendorFwStart() =
+  proc bl808WifiBackendFwStart() =
     if fwStarted: return
     setupBlOps()
     setupHosal()
@@ -1024,35 +1024,35 @@ void bl808_nim_os_log_write(uint32_t level, char *tag, char *file,
     regWrite32(IntcPend, regRead32(IntcPend) and not 0x10'u32)
     arch_delay_us(100)
     osExitCritical(irqState)
-    bl808WifiVendorTrace("wifi_hosal_rf_turn_on begin")
+    bl808WifiBackendTrace("wifi_hosal_rf_turn_on begin")
     discard wifi_hosal_rf_turn_on(nil)
-    bl808WifiVendorTrace("wifi_hosal_rf_turn_on done")
-    bl808WifiVendorTrace("rf_init begin")
+    bl808WifiBackendTrace("wifi_hosal_rf_turn_on done")
+    bl808WifiBackendTrace("rf_init begin")
     rf_init(40_000_000)
-    bl808WifiVendorTrace("rf_init done")
-    bl808WifiVendorTrace("high_power_profile begin")
-    bl808WifiVendorApplyHighPowerProfile()
-    bl808WifiVendorTrace("high_power_profile done")
-    bl808WifiVendorTrace("mpif_clk_init begin")
+    bl808WifiBackendTrace("rf_init done")
+    bl808WifiBackendTrace("high_power_profile begin")
+    bl808WifiBackendApplyHighPowerProfile()
+    bl808WifiBackendTrace("high_power_profile done")
+    bl808WifiBackendTrace("mpif_clk_init begin")
     mpif_clk_init()
-    bl808WifiVendorTrace("mpif_clk_init done")
-    bl808WifiVendorTrace("sysctrl_init begin")
+    bl808WifiBackendTrace("mpif_clk_init done")
+    bl808WifiBackendTrace("sysctrl_init begin")
     sysctrl_init()
-    bl808WifiVendorTrace("sysctrl_init done")
-    bl808WifiVendorTrace("intc_init begin")
+    bl808WifiBackendTrace("sysctrl_init done")
+    bl808WifiBackendTrace("intc_init begin")
     intc_init()
-    bl808WifiVendorTrace("intc_init done")
-    bl808WifiVendorTrace("ipc_emb_init begin")
+    bl808WifiBackendTrace("intc_init done")
+    bl808WifiBackendTrace("ipc_emb_init begin")
     ipc_emb_init()
-    bl808WifiVendorTrace("ipc_emb_init done")
-    bl808WifiVendorClearEmbIpc()
-    bl808WifiVendorClearHostIpc()
-    bl808WifiVendorTrace("bl_init begin")
+    bl808WifiBackendTrace("ipc_emb_init done")
+    bl808WifiBackendClearEmbIpc()
+    bl808WifiBackendClearHostIpc()
+    bl808WifiBackendTrace("bl_init begin")
     bl_init()
-    bl808WifiVendorTrace("bl_init done")
-    bl808WifiVendorTrace("bl_pm_ops_register begin")
+    bl808WifiBackendTrace("bl_init done")
+    bl808WifiBackendTrace("bl_pm_ops_register begin")
     bl_pm_ops_register()
-    bl808WifiVendorTrace("bl_pm_ops_register done")
+    bl808WifiBackendTrace("bl_pm_ops_register done")
     regWrite32(BcnStatus + 4, 0x0024_f037'u32)
     regWrite32(BcnStatus, regRead32(BcnStatus) or 0x01)
     regWrite32(BcnStatus, regRead32(BcnStatus) and not 0x01'u32)
@@ -1070,7 +1070,7 @@ void bl808_nim_os_log_write(uint32_t level, char *tag, char *file,
     while budget > 0:
       dec budget
       var didWork = false
-      if bl808WifiVendorHostIpcStatus() != 0:
+      if bl808WifiBackendHostIpcStatus() != 0:
         inc ipcPollIrqCount
         bl_irq_handler()
         didWork = true
@@ -1078,27 +1078,18 @@ void bl808_nim_os_log_write(uint32_t level, char *tag, char *file,
         ke_evt_schedule()
         didWork = true
       if hostPollEnabled and loadPtr(wifiHwRaw(), 48) != nil:
-        if bl808WifiVendorHostIpcStatus() != 0:
+        if bl808WifiBackendHostIpcStatus() != 0:
           didWork = true
         bl_main_event_handle(0, nil)
-      if not didWork and bl808WifiVendorHostIpcStatus() == 0 and keEvtField == 0:
+      if not didWork and bl808WifiBackendHostIpcStatus() == 0 and keEvtField == 0:
         break
 
   proc vendorPollOnce() =
     if fwStarted:
-      bl808WifiVendorPollEmbEvents()
-      bl808WifiVendorPollMacIrq()
-      bl808WifiVendorDriveRfStatus()
-      bl_sleep_schedule()
-      # NOTE: do NOT call ipc_emb_wait() here. In the vendor blob, that path
-      # parks the embedded core on a WAITING_FOREVER notify when there are
-      # no events; the host core then drives IRQ traffic to wake it. In this
-      # nimfw, host and embedded run on the same M0, so a blocking wait
-      # starves the very poll loop that delivers the wakeup. Triggered most
-      # visibly by disconnect: after the SM_DISCONNECT_REQ quiesces IPC,
-      # ke_env[0] hits 0 and the M0 deadlocks until the test harness
-      # timeout. Stay busy-polling — the 100us delay in vendorPollFor is
-      # the only pacing we need.
+      bl808WifiBackendPollEmbEvents()
+      bl808WifiBackendPollMacIrq()
+      bl808WifiBackendDriveRfStatus()
+      wifi_main_poll_once()
       vendorDrainScheduledWork()
     elif hostPollEnabled and loadPtr(wifiHwRaw(), 48) != nil:
       bl_main_event_handle(0, nil)
@@ -1110,33 +1101,33 @@ void bl808_nim_os_log_write(uint32_t level, char *tag, char *file,
       vendorPollOnce()
       delayMtimeUs(100)
 
-  proc bl808_wifi_vendor_poll*(iterations: cuint) {.exportc, cdecl.} =
+  proc bl808_wifi_backend_poll*(iterations: cuint) {.exportc, cdecl.} =
     vendorPollFor(if iterations == 0: 1'u32 else: iterations.uint32)
-  proc bl808_wifi_vendor_connected*(): cint {.exportc, cdecl.} =
+  proc bl808_wifi_backend_connected*(): cint {.exportc, cdecl.} =
     if connectDone == 0: 1 else: 0
-  proc bl808_wifi_vendor_connect_done*(): cint {.exportc, cdecl.} =
+  proc bl808_wifi_backend_connect_done*(): cint {.exportc, cdecl.} =
     if connectDone >= 0: 1 else: 0
-  proc bl808_wifi_vendor_disconnect_done*(): cint {.exportc, cdecl.} =
+  proc bl808_wifi_backend_disconnect_done*(): cint {.exportc, cdecl.} =
     if disconnectDone != 0: 1 else: 0
-  proc bl808_wifi_vendor_last_status*(): cint {.exportc, cdecl.} = lastStatusCode.cint
-  proc bl808_wifi_vendor_last_reason*(): cint {.exportc, cdecl.} = lastReasonCode.cint
-  proc bl808_wifi_vendor_scan_count*(): uint32 {.exportc, cdecl.} = scanItemCount
-  proc bl808_wifi_vendor_scan_done_count*(): uint32 {.exportc, cdecl.} = scanDoneCount
-  proc bl808_wifi_vendor_mac_irq_count*(): uint32 {.exportc, cdecl.} = macIrqCount
-  proc bl808_wifi_vendor_mac_poll_irq_count*(): uint32 {.exportc, cdecl.} = macPollIrqCount
-  proc bl808_wifi_vendor_mac_trap_irq_count*(): uint32 {.exportc, cdecl.} = macTrapIrqCount
-  proc bl808_wifi_vendor_ipc_trap_irq_count*(): uint32 {.exportc, cdecl.} = ipcTrapIrqCount
-  proc bl808_wifi_vendor_ipc_poll_irq_count*(): uint32 {.exportc, cdecl.} = ipcPollIrqCount
+  proc bl808_wifi_backend_last_status*(): cint {.exportc, cdecl.} = lastStatusCode.cint
+  proc bl808_wifi_backend_last_reason*(): cint {.exportc, cdecl.} = lastReasonCode.cint
+  proc bl808_wifi_backend_scan_count*(): uint32 {.exportc, cdecl.} = scanItemCount
+  proc bl808_wifi_backend_scan_done_count*(): uint32 {.exportc, cdecl.} = scanDoneCount
+  proc bl808_wifi_backend_mac_irq_count*(): uint32 {.exportc, cdecl.} = macIrqCount
+  proc bl808_wifi_backend_mac_poll_irq_count*(): uint32 {.exportc, cdecl.} = macPollIrqCount
+  proc bl808_wifi_backend_mac_trap_irq_count*(): uint32 {.exportc, cdecl.} = macTrapIrqCount
+  proc bl808_wifi_backend_ipc_trap_irq_count*(): uint32 {.exportc, cdecl.} = ipcTrapIrqCount
+  proc bl808_wifi_backend_ipc_poll_irq_count*(): uint32 {.exportc, cdecl.} = ipcPollIrqCount
 
   proc bl_wifi_clock_enable*(): cint {.exportc, cdecl.} =
-    bl808WifiVendorPrepareWirelessDomain()
+    bl808WifiBackendPrepareWirelessDomain()
     let reg = GlbBase + 0x3b0'u32
     regWrite32(reg, (regRead32(reg) and not 0x0f'u32) or 1)
     0
 
   proc bl_wifi_enable_irq*(): cint {.exportc, cdecl.} =
-    bl808_register_trap_handler(Bl808IrqWifi, bl808WifiVendorMacIrqTrampoline)
-    bl808_register_trap_handler(Bl808IrqWifiIpcPublic, bl808WifiVendorIpcIrqTrampoline)
+    bl808_register_trap_handler(Bl808IrqWifi, bl808WifiBackendMacIrqTrampoline)
+    bl808_register_trap_handler(Bl808IrqWifiIpcPublic, bl808WifiBackendIpcIrqTrampoline)
     bl808_enable_peripheral_irq(Bl808IrqWifi, 1)
     bl808_enable_peripheral_irq(Bl808IrqWifiIpcPublic, 1)
     0
@@ -1481,7 +1472,7 @@ err_t pbuf_take(struct pbuf *buf, const void *dataptr, u16_t len) {
       inc scanDoneCount
       vendorPutsRaw("[WIFI] scan done\r\n")
 
-  proc bl808_wifi_vendor_init*(conf: ptr WifiConf): cint {.exportc, cdecl.} =
+  proc bl808_wifi_backend_init*(conf: ptr WifiConf): cint {.exportc, cdecl.} =
     var local: array[8, uint8]
     if wifiStarted: return 0
     setupBlOps()
@@ -1493,7 +1484,7 @@ err_t pbuf_take(struct pbuf *buf, const void *dataptr, u16_t len) {
     if conf != nil and loadU8(conf, WifiConfCountryOff) != 0:
       local[0] = loadU8(conf, WifiConfCountryOff)
       local[1] = if loadU8(conf, WifiConfCountryOff + 1) != 0: loadU8(conf, WifiConfCountryOff + 1) else: 'S'.uint8
-    bl808WifiVendorFwStart()
+    bl808WifiBackendFwStart()
     hostPollEnabled = true
     result = bl606a0_wifi_init(cast[ptr WifiConf](addr local[0]))
     if result == 0:

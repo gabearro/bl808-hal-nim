@@ -3,7 +3,14 @@
     "uart_baud": 230400,
     "openocd_interface": "pine64jtag.cfg",
     "openocd_target": "tgt_e907_v2.cfg",
-    "forbidden": ["[FAIL]", "[FAULT]", "panic", "Unhandled", "trap_entry", "fatal:"],
+    "forbidden": [
+      "[FAIL]",
+      "[FAULT]",
+      "panic",
+      "Unhandled",
+      "trap_entry",
+      "fatal:"
+    ],
     "jtag_snapshot": [
       "poll",
       "reg pc",
@@ -19,59 +26,172 @@
   "tests": [
     {
       "name": "m0_hello_nim_test",
-      "tiers": ["full"],
-      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_hello_nim_test.nim", "flash": "m0"}],
-      "required": ["Hello from Nim!"],
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_hello_nim_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "Hello from Nim!"
+      ],
       "timeout": 10
     },
     {
       "name": "m0_cps_test",
-      "tiers": ["smoke", "full"],
-      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_cps_test.nim", "flash": "m0"}],
-      "required": ["[PASS] CPS await returned correct value", "[PASS] Multiple awaits correct", "[PASS] Pre-completed future", "=== Phase 1 Complete ==="],
+      "tiers": [
+        "smoke",
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_cps_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "[PASS] CPS await returned correct value",
+        "[PASS] Multiple awaits correct",
+        "[PASS] Pre-completed future",
+        "=== Phase 1 Complete ==="
+      ],
       "timeout": 20
     },
     {
       "name": "m0_uart_async_test",
-      "tiers": ["smoke", "full"],
-      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_uart_async_test.nim", "flash": "m0"}],
+      "tiers": [
+        "smoke",
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_uart_async_test.nim",
+          "flash": "m0"
+        }
+      ],
       "input": "abcq",
       "input_after": "Type characters",
-      "required": ["[ECHO] Done", "[HEARTBEAT] Done"],
+      "required": [
+        "[ECHO] Done",
+        "[HEARTBEAT] Done"
+      ],
       "timeout": 30
     },
     {
       "name": "m0_sched_test",
-      "tiers": ["smoke", "full"],
-      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_sched_test.nim", "flash": "m0"}],
-      "required": ["[Y] done", "[A] 500ms", "[B] 250ms", "[C] 1000ms"],
+      "tiers": [
+        "smoke",
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_sched_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "[Y] done",
+        "[A] 500ms",
+        "[B] 250ms",
+        "[C] 1000ms"
+      ],
       "timeout": 50
     },
     {
       "name": "m0_sync_test",
-      "tiers": ["smoke", "full"],
-      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_sync_test.nim", "flash": "m0"}],
-      "required": ["[PASS] Zero-initialized semaphore retains released permit", "[PASS] waitAll propagates child errors", "[PASS] TaskGroup propagates child errors", "[PASS] Cancelled ISR future releases bridge slot", "[PASS] withTimeout preserves completed typed result", "[PASS] withTimeout fails stalled void future", "[CONSUMER] total=100 [PASS]", "[EVT] event received! [PASS]"],
+      "tiers": [
+        "smoke",
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_sync_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "[PASS] Zero-initialized semaphore retains released permit",
+        "[PASS] waitAll propagates child errors",
+        "[PASS] TaskGroup propagates child errors",
+        "[PASS] Cancelled ISR future releases bridge slot",
+        "[PASS] withTimeout preserves completed typed result",
+        "[PASS] withTimeout fails stalled void future",
+        "[CONSUMER] total=100 [PASS]",
+        "[EVT] event received! [PASS]"
+      ],
       "timeout": 80
     },
     {
       "name": "m0_fault_test",
-      "tiers": ["full"],
-      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_fault_test.nim", "flash": "m0"}],
-      "required": ["[PASS] Stack guard initialized", "[PASS] Boot health record valid", "[PASS] Fault record persisted", "[PASS] Fault record includes stack bounds", "[PASS] Boot health captured fault record", "[PASS] Heap check initial", "[PASS] Heap allocation failure tracked", "[PASS] Heap tail canary detects overrun", "=== Test Complete ==="],
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_fault_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "[PASS] Stack guard initialized",
+        "[PASS] Boot health record valid",
+        "[PASS] Fault record persisted",
+        "[PASS] Fault record includes stack bounds",
+        "[PASS] Boot health captured fault record",
+        "[PASS] Heap check initial",
+        "[PASS] Heap allocation failure tracked",
+        "[PASS] Heap tail canary detects overrun",
+        "=== Test Complete ==="
+      ],
       "timeout": 25
     },
     {
       "name": "m0_wdt_test",
-      "tiers": ["full"],
-      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_wdt_test.nim", "flash": "m0"}],
-      "required": ["[PASS] WDT feeds incrementing", "=== Test Complete ==="],
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wdt_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "[PASS] WDT feeds incrementing",
+        "=== Test Complete ==="
+      ],
       "timeout": 15
     },
     {
       "name": "m0_hal_register_smoke_test",
-      "tiers": ["full"],
-      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_hal_register_smoke_test.nim", "flash": "m0"}],
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_hal_register_smoke_test.nim",
+          "flash": "m0"
+        }
+      ],
       "required": [
         "[PASS] CLIC init clears UART0 attr",
         "[PASS] EMI enable",
@@ -97,14 +217,20 @@
     },
     {
       "name": "m0_hal_system_test",
-      "tiers": ["full"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_hal_system_test.nim",
-        "flash": "m0",
-        "defines": {"bl808hwharness": "1"}
-      }],
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_hal_system_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808hwharness": "1"
+          }
+        }
+      ],
       "required": [
         "=== BL808 HAL System Test ===",
         "[PASS] core interrupt guard",
@@ -117,8 +243,17 @@
     },
     {
       "name": "m0_hal_comms_test",
-      "tiers": ["full"],
-      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_hal_comms_test.nim", "flash": "m0"}],
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_hal_comms_test.nim",
+          "flash": "m0"
+        }
+      ],
       "required": [
         "=== BL808 HAL Comms Test ===",
         "[PASS] uart deinit",
@@ -132,8 +267,17 @@
     },
     {
       "name": "m0_hal_signal_test",
-      "tiers": ["full"],
-      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_hal_signal_test.nim", "flash": "m0"}],
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_hal_signal_test.nim",
+          "flash": "m0"
+        }
+      ],
       "required": [
         "=== BL808 HAL Signal Test ===",
         "[PASS] dma memory copy",
@@ -146,8 +290,17 @@
     },
     {
       "name": "m0_hal_security_storage_test",
-      "tiers": ["full"],
-      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_hal_security_storage_test.nim", "flash": "m0"}],
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_hal_security_storage_test.nim",
+          "flash": "m0"
+        }
+      ],
       "required": [
         "=== BL808 HAL Security Storage Test ===",
         "[PASS] efuse safe read APIs",
@@ -161,8 +314,17 @@
     },
     {
       "name": "m0_pka_highlevel_test",
-      "tiers": ["full"],
-      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_pka_highlevel_test.nim", "flash": "m0"}],
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_pka_highlevel_test.nim",
+          "flash": "m0"
+        }
+      ],
       "required": [
         "=== BL808 PKA High-Level Test ===",
         "[PASS] pka low-level ladd",
@@ -185,19 +347,18 @@
     },
     {
       "name": "m0_ble_hal_test",
-      "tiers": ["full"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_ble_hal_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808BleVendor": "1",
-          "bl808BleVendorBtble": "1",
-          "bl808BleVendorBl606pPhyRf": "1",
-          "bl808BleVendorTrace": "1"
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_ble_hal_test.nim",
+          "flash": "m0",
+          "defines": {}
         }
-      }],
+      ],
       "jtag_flash_reset_capture": true,
       "required": [
         "=== BL808 BLE HAL Test ===",
@@ -207,12 +368,28 @@
         "[PASS] ble advertising stop",
         "=== Test Complete ==="
       ],
-      "host_actions": [{
-        "after_marker": "[BLE] advertising bl808-hal",
-        "cmd": ["{python}", "tools/run_macos_ble_helper.py", "connect", "--name", "bl808-hal", "--timeout", "20", "--link-only", "--hold-seconds", "1.0"],
-        "required": ["[PASS] BLE device discovered", "[PASS] BLE connected"],
-        "timeout": 30
-      }],
+      "host_actions": [
+        {
+          "after_marker": "[BLE] advertising bl808-hal",
+          "cmd": [
+            "{python}",
+            "tools/run_macos_ble_helper.py",
+            "connect",
+            "--name",
+            "bl808-hal",
+            "--timeout",
+            "20",
+            "--link-only",
+            "--hold-seconds",
+            "1.0"
+          ],
+          "required": [
+            "[PASS] BLE device discovered",
+            "[PASS] BLE connected"
+          ],
+          "timeout": 30
+        }
+      ],
       "jtag_snapshot": [
         "poll",
         "reg pc",
@@ -257,27 +434,31 @@
     },
     {
       "name": "m0_ble_nim_controller_hal_test",
-      "tiers": ["full"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_ble_hal_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808BleNimPureConnection": "1",
-          "bl808BleNimManualConnTx": "1",
-          "bl808BleNimConTimingPath": "1",
-          "bl808BleNimSchProg": "1",
-          "BleDebugCounters": "1",
-	          "bl808BlePreHostAdvDiag": "1",
-	          "bl808BleFinalAdvLoopDiag": "0",
-	          "bl808BleMidAdvLoopDiag": "0",
-	          "bl808TrapFrameDiag": "1",
-	          "BleHostWindowIterations": "80000",
-          "BlePollIterations": "1",
-          "BleExpectPeripheralLink": "1"
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_ble_hal_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808BleNimPureConnection": "1",
+            "bl808BleNimManualConnTx": "1",
+            "bl808BleNimConTimingPath": "1",
+            "bl808BleNimSchProg": "1",
+            "BleDebugCounters": "1",
+            "bl808BlePreHostAdvDiag": "1",
+            "bl808BleFinalAdvLoopDiag": "0",
+            "bl808BleMidAdvLoopDiag": "0",
+            "bl808TrapFrameDiag": "1",
+            "BleHostWindowIterations": "80000",
+            "BlePollIterations": "1",
+            "BleExpectPeripheralLink": "1"
+          }
         }
-      }],
+      ],
       "jtag_flash_reset_capture": true,
       "jtag_flash_runtime_jtag": true,
       "required": [
@@ -295,12 +476,28 @@
         "[PASS] ble advertising stop",
         "=== Test Complete ==="
       ],
-      "host_actions": [{
-        "after_marker": "[BLE] advertising bl808-hal",
-        "cmd": ["{python}", "tools/run_macos_ble_helper.py", "connect", "--name", "bl808-hal", "--timeout", "20", "--hold-seconds", "1.0", "--debug"],
-        "required": ["[PASS] BLE device discovered", "[PASS] BLE connected"],
-        "timeout": 30
-      }],
+      "host_actions": [
+        {
+          "after_marker": "[BLE] advertising bl808-hal",
+          "cmd": [
+            "{python}",
+            "tools/run_macos_ble_helper.py",
+            "connect",
+            "--name",
+            "bl808-hal",
+            "--timeout",
+            "20",
+            "--hold-seconds",
+            "1.0",
+            "--debug"
+          ],
+          "required": [
+            "[PASS] BLE device discovered",
+            "[PASS] BLE connected"
+          ],
+          "timeout": 30
+        }
+      ],
       "jtag_snapshot": [
         "poll",
         "reg pc",
@@ -340,11 +537,15 @@
         "mdw 0x20001700 80",
         "mdw 0x28000018 3",
         "mdw 0x28000100 2",
+        "mdw 0x28000110 1",
+        "mdw 0x28000800 80",
+        "mdw 0x28000970 16",
+        "mdw 0x28010000 32",
         "mdw 0x28010120 32",
         "mdw 0x28010558 16",
         "mdb 0x28010a2c 64",
-        "mdb 0x28010a52 64",
-        "mdw 0x280009c0 3",
+        "mdb 0x28010a4c 64",
+        "mdw 0x280009c0 8",
         "mdw 0xE0800000 4",
         "mdb 0xE0801000 128",
         "mdb 0xE08010E0 16",
@@ -431,14 +632,14 @@
         "mdw {sym:nim_ble_platform_init_stage} 1",
         "mdw {sym:nim_adv_debug_stage} 2",
         "mdw {sym:ble_adv_host_debug_stage} 3",
-      "mdw {sym:ble_hci_return_debug_result} 2",
-      "mdw {sym:ble_hci_return_debug_stack} 12",
-      "mdw {sym:nim_hci_debug_stage} 8",
-      "mdw {sym:ble_host_debug_stage} 8",
-      "mdw {sym:hciCommandSlot} 4",
-      "mdw {sym:hciCommandInFlight} 4",
-      "mdw {sym:hciLastPayload} 12",
-      "mdw {sym:ble_test_debug_ra} 3",
+        "mdw {sym:ble_hci_return_debug_result} 2",
+        "mdw {sym:ble_hci_return_debug_stack} 12",
+        "mdw {sym:nim_hci_debug_stage} 8",
+        "mdw {sym:ble_host_debug_stage} 8",
+        "mdw {sym:hciCommandSlot} 4",
+        "mdw {sym:hciCommandInFlight} 4",
+        "mdw {sym:hciLastPayload} 12",
+        "mdw {sym:ble_test_debug_ra} 3",
         "mdw 0x62053C80 96",
         "mdw 0x62053F00 64",
         "mdw {sym:nim_vendor_lld_con_start_count} 2",
@@ -472,6 +673,27 @@
         "mdw {sym:nim_conn_rx_seq_log} 16",
         "mdw {sym:nim_conn_tx_state_log} 16",
         "mdw {sym:nim_conn_tx_header_log} 16",
+        "mdw {sym:nim_llcp_tx_log} 8",
+        "mdw {sym:nim_llcp_rx_log} 8",
+        "mdw {sym:nim_llcp_peer_features} 2",
+        "mdw {sym:nim_llcp_used_features} 2",
+        "mdw {sym:nim_llcp_tx_log_index} 1",
+        "mdw {sym:nim_llcp_rx_log_index} 1",
+        "mdw {sym:nim_llcp_last_status} 1",
+        "mdw {sym:nim_llcp_last_opcode} 1",
+        "mdw {sym:nim_llcp_startup_deferred_count} 1",
+        "mdw {sym:nim_llcp_startup_tx_count} 1",
+        "mdw {sym:nim_llcp_tx_pending} 1",
+        "mdw {sym:nim_llcp_tx_count} 1",
+        "mdw {sym:nim_llcp_rx_count} 1",
+        "mdw {sym:nim_llcp_rx_malformed_count} 1",
+        "mdw {sym:nim_llcp_rx_malformed_last} 1",
+        "mdw {sym:nim_acl_rx_count} 1",
+        "mdw {sym:nim_acl_rx_drop_count} 1",
+        "mdw {sym:nim_acl_host_tx_count} 1",
+        "mdw {sym:nim_acl_host_tx_pending} 1",
+        "mdw {sym:nim_acl_empty_tx_count} 1",
+        "mdw {sym:nim_acl_empty_tx_pending} 1",
         "mdw {sym:nim_vendor_llcp_tx_log} 8",
         "mdw {sym:nim_vendor_llcp_rx_log} 8",
         "mdw {sym:nim_vendor_llcp_peer_features} 2",
@@ -490,19 +712,18 @@
     },
     {
       "name": "m0_bleblob_direct_test",
-      "tiers": ["full"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_bleblob_direct_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808BleVendor": "1",
-          "bl808BleVendorBtble": "1",
-          "bl808BleVendorBl808PhyRf": "1",
-          "bl808BleVendorTrace": "1"
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_bleblob_direct_test.nim",
+          "flash": "m0",
+          "defines": {}
         }
-      }],
+      ],
       "jtag_flash_reset_capture": true,
       "required": [
         "=== BL808 BLE Blob Direct Test ===",
@@ -516,18 +737,18 @@
     },
     {
       "name": "m0_ble_bl606p_hal_test",
-      "tiers": ["experimental"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_ble_hal_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808BleVendor": "1",
-          "bl808BleVendorBtble": "1",
-          "bl808BleVendorBl606pPhyRf": "1"
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_ble_hal_test.nim",
+          "flash": "m0",
+          "defines": {}
         }
-      }],
+      ],
       "jtag_flash_reset_capture": true,
       "required": [
         "=== BL808 BLE HAL Test ===",
@@ -537,12 +758,28 @@
         "[PASS] ble advertising stop",
         "=== Test Complete ==="
       ],
-      "host_actions": [{
-        "after_marker": "[BLE] advertising bl808-hal",
-        "cmd": ["{python}", "tools/run_macos_ble_helper.py", "connect", "--name", "bl808-hal", "--timeout", "20", "--link-only", "--hold-seconds", "1.0"],
-        "required": ["[PASS] BLE device discovered", "[PASS] BLE connected"],
-        "timeout": 30
-      }],
+      "host_actions": [
+        {
+          "after_marker": "[BLE] advertising bl808-hal",
+          "cmd": [
+            "{python}",
+            "tools/run_macos_ble_helper.py",
+            "connect",
+            "--name",
+            "bl808-hal",
+            "--timeout",
+            "20",
+            "--link-only",
+            "--hold-seconds",
+            "1.0"
+          ],
+          "required": [
+            "[PASS] BLE device discovered",
+            "[PASS] BLE connected"
+          ],
+          "timeout": 30
+        }
+      ],
       "jtag_snapshot": [
         "poll",
         "reg pc",
@@ -583,20 +820,20 @@
     },
     {
       "name": "m0_ble_central_hal_test",
-      "tiers": ["experimental"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_ble_central_hal_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808BleVendor": "1",
-          "bl808BleVendorBtble": "1",
-          "bl808BleVendorBl616Controller": "1",
-          "bl808BleVendorBl616ControllerM10": "1",
-          "bl808BleUseRandomAddr": "1"
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_ble_central_hal_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808BleUseRandomAddr": "1"
+          }
         }
-      }],
+      ],
       "jtag_flash_reset_capture": true,
       "required": [
         "=== BL808 BLE Central HAL Test ===",
@@ -605,11 +842,30 @@
         "[PASS] ble central connect",
         "=== Test Complete ==="
       ],
-      "pre_host_actions": [{
-        "cmd": ["{python}", "tools/run_macos_ble_helper.py", "advertise", "--name", "bl808-host", "--service-uuid", "", "--duration", "160", "--startup-timeout", "20", "--debug", "--restart-interval", "20"],
-        "required": ["[PASS] BLE advertising started"],
-        "timeout": 170
-      }],
+      "pre_host_actions": [
+        {
+          "cmd": [
+            "{python}",
+            "tools/run_macos_ble_helper.py",
+            "advertise",
+            "--name",
+            "bl808-host",
+            "--service-uuid",
+            "",
+            "--duration",
+            "160",
+            "--startup-timeout",
+            "20",
+            "--debug",
+            "--restart-interval",
+            "20"
+          ],
+          "required": [
+            "[PASS] BLE advertising started"
+          ],
+          "timeout": 170
+        }
+      ],
       "jtag_snapshot": [
         "poll",
         "reg pc",
@@ -636,22 +892,23 @@
     },
     {
       "name": "m0_ble_nim_controller_central_hal_test",
-      "tiers": ["experimental"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_ble_central_hal_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808BleVendorLldScanProbe": "1",
-          "bl808BleVendorLldInitProbe": "1",
-          "bl808BleVendorInitPeerComplete": "1",
-          "bl808BleNimSyntheticCentral": "0",
-          "bl808BleNimSyntheticCentralComplete": "0",
-          "bl808BleNimSchProg": "1",
-          "BleCentralTimeoutMs": "120000"
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_ble_central_hal_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808BleNimSyntheticCentral": "0",
+            "bl808BleNimSyntheticCentralComplete": "0",
+            "bl808BleNimSchProg": "1",
+            "BleCentralTimeoutMs": "120000"
+          }
         }
-      }],
+      ],
       "jtag_flash_reset_capture": true,
       "required": [
         "=== BL808 BLE Central HAL Test ===",
@@ -660,11 +917,30 @@
         "[PASS] ble central connect",
         "=== Test Complete ==="
       ],
-      "pre_host_actions": [{
-        "cmd": ["{python}", "tools/run_macos_ble_helper.py", "advertise", "--name", "bl808-host", "--service-uuid", "", "--duration", "160", "--startup-timeout", "20", "--debug", "--restart-interval", "20"],
-        "required": ["[PASS] BLE advertising started"],
-        "timeout": 170
-      }],
+      "pre_host_actions": [
+        {
+          "cmd": [
+            "{python}",
+            "tools/run_macos_ble_helper.py",
+            "advertise",
+            "--name",
+            "bl808-host",
+            "--service-uuid",
+            "",
+            "--duration",
+            "160",
+            "--startup-timeout",
+            "20",
+            "--debug",
+            "--restart-interval",
+            "20"
+          ],
+          "required": [
+            "[PASS] BLE advertising started"
+          ],
+          "timeout": 170
+        }
+      ],
       "jtag_snapshot": [
         "poll",
         "reg pc",
@@ -695,23 +971,27 @@
     },
     {
       "name": "m0_ble_nim_controller_pure_scan_any_hal_test",
-      "tiers": ["experimental"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_ble_central_hal_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808BleNimPureCentral": "1",
-          "bl808BleNimSchProg": "1",
-          "BleCentralScanOnly": "1",
-          "BleCentralScanAny": "1",
-          "BleCentralDiscoveryActiveScan": "0",
-          "BleCentralHostStartDelayMs": "0",
-          "BleCentralTimeoutMs": "30000",
-          "BleDebugCounters": "1"
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_ble_central_hal_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808BleNimPureCentral": "1",
+            "bl808BleNimSchProg": "1",
+            "BleCentralScanOnly": "1",
+            "BleCentralScanAny": "1",
+            "BleCentralDiscoveryActiveScan": "0",
+            "BleCentralHostStartDelayMs": "0",
+            "BleCentralTimeoutMs": "30000",
+            "BleDebugCounters": "1"
+          }
         }
-      }],
+      ],
       "jtag_flash_reset_capture": true,
       "required": [
         "=== BL808 BLE Central HAL Test ===",
@@ -780,19 +1060,23 @@
     },
     {
       "name": "m0_ble_nim_controller_pure_scan_hal_test",
-      "tiers": ["full"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_ble_central_hal_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808BleNimPureCentral": "1",
-          "bl808BleNimSchProg": "1",
-          "BleCentralScanOnly": "1",
-          "BleCentralTimeoutMs": "60000"
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_ble_central_hal_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808BleNimPureCentral": "1",
+            "bl808BleNimSchProg": "1",
+            "BleCentralScanOnly": "1",
+            "BleCentralTimeoutMs": "60000"
+          }
         }
-      }],
+      ],
       "jtag_flash_reset_capture": true,
       "required": [
         "=== BL808 BLE Central HAL Test ===",
@@ -801,11 +1085,28 @@
         "[PASS] ble central scan match",
         "=== Test Complete ==="
       ],
-      "pre_host_actions": [{
-        "cmd": ["{python}", "tools/run_macos_ble_helper.py", "advertise", "--name", "bl808-host", "--service-uuid", "", "--duration", "90", "--startup-timeout", "20", "--debug"],
-        "required": ["[PASS] BLE advertising started"],
-        "timeout": 100
-      }],
+      "pre_host_actions": [
+        {
+          "cmd": [
+            "{python}",
+            "tools/run_macos_ble_helper.py",
+            "advertise",
+            "--name",
+            "bl808-host",
+            "--service-uuid",
+            "",
+            "--duration",
+            "90",
+            "--startup-timeout",
+            "20",
+            "--debug"
+          ],
+          "required": [
+            "[PASS] BLE advertising started"
+          ],
+          "timeout": 100
+        }
+      ],
       "jtag_snapshot": [
         "poll",
         "reg pc",
@@ -872,22 +1173,26 @@
     },
     {
       "name": "m0_ble_nim_controller_pure_central_hal_test",
-      "tiers": ["full"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_ble_central_hal_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808BleNimPureCentral": "1",
-          "bl808BleNimPureConnection": "1",
-          "bl808BleNimManualConnTx": "1",
-          "bl808BleNimSchProg": "1",
-          "BleCentralTimeoutMs": "120000",
-          "BleCentralVerboseDiag": "1",
-          "BleDebugCounters": "1"
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_ble_central_hal_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808BleNimPureCentral": "1",
+            "bl808BleNimPureConnection": "1",
+            "bl808BleNimManualConnTx": "1",
+            "bl808BleNimSchProg": "1",
+            "BleCentralTimeoutMs": "120000",
+            "BleCentralVerboseDiag": "1",
+            "BleDebugCounters": "1"
+          }
         }
-      }],
+      ],
       "jtag_flash_reset_capture": true,
       "required": [
         "=== BL808 BLE Central HAL Test ===",
@@ -896,11 +1201,28 @@
         "[PASS] ble central connect",
         "=== Test Complete ==="
       ],
-      "pre_host_actions": [{
-        "cmd": ["{python}", "tools/run_macos_ble_helper.py", "advertise", "--name", "bl808-host", "--service-uuid", "", "--duration", "160", "--startup-timeout", "20", "--debug"],
-        "required": ["[PASS] BLE advertising started"],
-        "timeout": 170
-      }],
+      "pre_host_actions": [
+        {
+          "cmd": [
+            "{python}",
+            "tools/run_macos_ble_helper.py",
+            "advertise",
+            "--name",
+            "bl808-host",
+            "--service-uuid",
+            "",
+            "--duration",
+            "160",
+            "--startup-timeout",
+            "20",
+            "--debug"
+          ],
+          "required": [
+            "[PASS] BLE advertising started"
+          ],
+          "timeout": 170
+        }
+      ],
       "jtag_snapshot": [
         "poll",
         "reg pc",
@@ -1053,23 +1375,27 @@
     },
     {
       "name": "m0_ble_nim_controller_pure_central_boot_hal_test",
-      "tiers": ["experimental"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_ble_central_hal_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808BleNimPureCentral": "1",
-          "bl808BleNimPureConnection": "1",
-          "bl808BleNimManualConnTx": "1",
-          "bl808BleNimSchProg": "1",
-          "BleCentralTimeoutMs": "5000",
-          "BleCentralHostStartDelayMs": "0",
-          "BleCentralVerboseDiag": "1",
-          "BleDebugCounters": "1"
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_ble_central_hal_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808BleNimPureCentral": "1",
+            "bl808BleNimPureConnection": "1",
+            "bl808BleNimManualConnTx": "1",
+            "bl808BleNimSchProg": "1",
+            "BleCentralTimeoutMs": "5000",
+            "BleCentralHostStartDelayMs": "0",
+            "BleCentralVerboseDiag": "1",
+            "BleDebugCounters": "1"
+          }
         }
-      }],
+      ],
       "jtag_flash_reset_capture": true,
       "required": [
         "=== BL808 BLE Central HAL Test ===",
@@ -1100,17 +1426,20 @@
     },
     {
       "name": "m0_wifi_scan_hal_test",
-      "tiers": ["smoke"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_wifi_hal_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808WifiVendor": "1",
-          "WifiScanOnly": "1"
+      "tiers": [
+        "smoke"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wifi_hal_test.nim",
+          "flash": "m0",
+          "defines": {
+            "WifiScanOnly": "1"
+          }
         }
-      }],
+      ],
       "required": [
         "=== BL808 WiFi HAL Test ===",
         "[PASS] wifi init",
@@ -1125,18 +1454,21 @@
     },
     {
       "name": "m0_wifi_nimfw_scan_hal_test",
-      "tiers": ["smoke"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_wifi_hal_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808WifiVendor": "1",
-          "bl808WifiNimFw": "1",
-          "WifiScanOnly": "1"
+      "tiers": [
+        "smoke"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wifi_hal_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "WifiScanOnly": "1"
+          }
         }
-      }],
+      ],
       "required": [
         "=== BL808 WiFi HAL Test ===",
         "[PASS] wifi init",
@@ -1151,19 +1483,29 @@
     },
     {
       "name": "m0_wifi_hal_test",
-      "tiers": ["full"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_wifi_hal_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808WifiVendor": "1",
-          "WifiSsid": {"env": "BL808_WIFI_SSID"},
-          "WifiPassword": {"secret_env": "BL808_WIFI_PASSWORD"},
-          "WifiChannel": {"env": "BL808_WIFI_CHANNEL", "default": 0}
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wifi_hal_test.nim",
+          "flash": "m0",
+          "defines": {
+            "WifiSsid": {
+              "env": "BL808_WIFI_SSID"
+            },
+            "WifiPassword": {
+              "secret_env": "BL808_WIFI_PASSWORD"
+            },
+            "WifiChannel": {
+              "env": "BL808_WIFI_CHANNEL",
+              "default": 0
+            }
+          }
         }
-      }],
+      ],
       "required": [
         "=== BL808 WiFi HAL Test ===",
         "[PASS] wifi init",
@@ -1221,21 +1563,31 @@
     },
     {
       "name": "m0_wifi_nimfw_hal_test",
-      "tiers": ["full"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_wifi_hal_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808WifiVendor": "1",
-          "bl808WifiNimFw": "1",
-          "bl808WifiForcePmfCapable": "1",
-          "WifiSsid": {"env": "BL808_WIFI_SSID"},
-          "WifiPassword": {"secret_env": "BL808_WIFI_PASSWORD"},
-          "WifiChannel": {"env": "BL808_WIFI_CHANNEL", "default": 0}
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wifi_hal_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808WifiForcePmfCapable": "1",
+            "WifiSsid": {
+              "env": "BL808_WIFI_SSID"
+            },
+            "WifiPassword": {
+              "secret_env": "BL808_WIFI_PASSWORD"
+            },
+            "WifiChannel": {
+              "env": "BL808_WIFI_CHANNEL",
+              "default": 0
+            }
+          }
         }
-      }],
+      ],
       "required": [
         "=== BL808 WiFi HAL Test ===",
         "[WIFI-NIMFW] bl_init done",
@@ -1256,22 +1608,32 @@
     },
     {
       "name": "m0_wifi_nimfw_keepalive_hal_test",
-      "tiers": ["full"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_wifi_hal_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808WifiVendor": "1",
-          "bl808WifiNimFw": "1",
-          "bl808WifiForcePmfCapable": "1",
-          "WifiKeepaliveFrames": "3",
-          "WifiSsid": {"env": "BL808_WIFI_SSID"},
-          "WifiPassword": {"secret_env": "BL808_WIFI_PASSWORD"},
-          "WifiChannel": {"env": "BL808_WIFI_CHANNEL", "default": 0}
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wifi_hal_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808WifiForcePmfCapable": "1",
+            "WifiKeepaliveFrames": "3",
+            "WifiSsid": {
+              "env": "BL808_WIFI_SSID"
+            },
+            "WifiPassword": {
+              "secret_env": "BL808_WIFI_PASSWORD"
+            },
+            "WifiChannel": {
+              "env": "BL808_WIFI_CHANNEL",
+              "default": 0
+            }
+          }
         }
-      }],
+      ],
       "required": [
         "[WIFI-NIMFW] bl_init done",
         "[PASS] wifi init",
@@ -1446,23 +1808,33 @@
     },
     {
       "name": "m0_wifi_nimfw_qosnull_keepalive_hal_test",
-      "tiers": ["full"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_wifi_hal_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808WifiVendor": "1",
-          "bl808WifiNimFw": "1",
-          "bl808WifiForcePmfCapable": "1",
-          "WifiKeepaliveFrames": "3",
-          "WifiKeepaliveQosNull": "1",
-          "WifiSsid": {"env": "BL808_WIFI_SSID"},
-          "WifiPassword": {"secret_env": "BL808_WIFI_PASSWORD"},
-          "WifiChannel": {"env": "BL808_WIFI_CHANNEL", "default": 0}
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wifi_hal_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808WifiForcePmfCapable": "1",
+            "WifiKeepaliveFrames": "3",
+            "WifiKeepaliveQosNull": "1",
+            "WifiSsid": {
+              "env": "BL808_WIFI_SSID"
+            },
+            "WifiPassword": {
+              "secret_env": "BL808_WIFI_PASSWORD"
+            },
+            "WifiChannel": {
+              "env": "BL808_WIFI_CHANNEL",
+              "default": 0
+            }
+          }
         }
-      }],
+      ],
       "required": [
         "[WIFI-NIMFW] bl_init done",
         "[PASS] wifi init",
@@ -1509,22 +1881,33 @@
     },
     {
       "name": "m0_wifi_bad_password_hal_test",
-      "tiers": ["full"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_wifi_hal_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808WifiVendor": "1",
-          "WifiSsid": {"env": "BL808_WIFI_SSID"},
-          "WifiPassword": {"env": "BL808_WIFI_BAD_PASSWORD", "default": "dummy-password"},
-          "WifiChannel": {"env": "BL808_WIFI_CHANNEL", "default": 0},
-          "WifiExpectConnectFailure": "1",
-          "WifiExpectedConnectStatus": "8",
-          "WifiExpectedConnectReason": "15"
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wifi_hal_test.nim",
+          "flash": "m0",
+          "defines": {
+            "WifiSsid": {
+              "env": "BL808_WIFI_SSID"
+            },
+            "WifiPassword": {
+              "env": "BL808_WIFI_BAD_PASSWORD",
+              "default": "dummy-password"
+            },
+            "WifiChannel": {
+              "env": "BL808_WIFI_CHANNEL",
+              "default": 0
+            },
+            "WifiExpectConnectFailure": "1",
+            "WifiExpectedConnectStatus": "8",
+            "WifiExpectedConnectReason": "15"
+          }
         }
-      }],
+      ],
       "required": [
         "=== BL808 WiFi HAL Test ===",
         "[PASS] wifi init",
@@ -1542,23 +1925,34 @@
     },
     {
       "name": "m0_wifi_nimfw_bad_password_hal_test",
-      "tiers": ["full"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_wifi_hal_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808WifiVendor": "1",
-          "bl808WifiNimFw": "1",
-          "WifiSsid": {"env": "BL808_WIFI_SSID"},
-          "WifiPassword": {"env": "BL808_WIFI_BAD_PASSWORD", "default": "dummy-password"},
-          "WifiChannel": {"env": "BL808_WIFI_CHANNEL", "default": 0},
-          "WifiExpectConnectFailure": "1",
-          "WifiExpectedConnectStatus": "8",
-          "WifiExpectedConnectReason": "15"
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wifi_hal_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "WifiSsid": {
+              "env": "BL808_WIFI_SSID"
+            },
+            "WifiPassword": {
+              "env": "BL808_WIFI_BAD_PASSWORD",
+              "default": "dummy-password"
+            },
+            "WifiChannel": {
+              "env": "BL808_WIFI_CHANNEL",
+              "default": 0
+            },
+            "WifiExpectConnectFailure": "1",
+            "WifiExpectedConnectStatus": "8",
+            "WifiExpectedConnectReason": "15"
+          }
         }
-      }],
+      ],
       "required": [
         "=== BL808 WiFi HAL Test ===",
         "[WIFI-NIMFW] bl_init done",
@@ -1577,17 +1971,18 @@
     },
     {
       "name": "m0_ble_legacy_hal_test",
-      "tiers": ["full"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_ble_hal_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808BleVendor": "1",
-          "bl808BleVendorRf": "1"
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_ble_hal_test.nim",
+          "flash": "m0",
+          "defines": {}
         }
-      }],
+      ],
       "jtag_flash_reset_capture": true,
       "required": [
         "=== BL808 BLE HAL Test ===",
@@ -1597,12 +1992,26 @@
         "[PASS] ble advertising stop",
         "=== Test Complete ==="
       ],
-      "host_actions": [{
-        "after_marker": "[BLE] advertising bl808-hal",
-        "cmd": ["{python}", "tools/run_macos_ble_helper.py", "connect", "--name", "bl808-hal", "--timeout", "20", "--link-only"],
-        "required": ["[PASS] BLE device discovered", "[PASS] BLE connected"],
-        "timeout": 30
-      }],
+      "host_actions": [
+        {
+          "after_marker": "[BLE] advertising bl808-hal",
+          "cmd": [
+            "{python}",
+            "tools/run_macos_ble_helper.py",
+            "connect",
+            "--name",
+            "bl808-hal",
+            "--timeout",
+            "20",
+            "--link-only"
+          ],
+          "required": [
+            "[PASS] BLE device discovered",
+            "[PASS] BLE connected"
+          ],
+          "timeout": 30
+        }
+      ],
       "jtag_snapshot": [
         "poll",
         "reg pc",
@@ -1630,19 +2039,20 @@
     },
     {
       "name": "m0_ble_bl616_controller_hal_test",
-      "tiers": ["experimental"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_ble_hal_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808BleVendor": "1",
-          "bl808BleVendorBtble": "1",
-          "bl808BleVendorBl616Controller": "1",
-          "bl808BleUseRandomAddr": "1"
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_ble_hal_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808BleUseRandomAddr": "1"
+          }
         }
-      }],
+      ],
       "jtag_flash_reset_capture": true,
       "required": [
         "=== BL808 BLE HAL Test ===",
@@ -1652,12 +2062,26 @@
         "[PASS] ble advertising stop",
         "=== Test Complete ==="
       ],
-      "host_actions": [{
-        "after_marker": "[BLE] advertising bl808-hal",
-        "cmd": ["{python}", "tools/run_macos_ble_helper.py", "connect", "--name", "bl808-hal", "--timeout", "20", "--link-only"],
-        "required": ["[PASS] BLE device discovered", "[PASS] BLE connected"],
-        "timeout": 30
-      }],
+      "host_actions": [
+        {
+          "after_marker": "[BLE] advertising bl808-hal",
+          "cmd": [
+            "{python}",
+            "tools/run_macos_ble_helper.py",
+            "connect",
+            "--name",
+            "bl808-hal",
+            "--timeout",
+            "20",
+            "--link-only"
+          ],
+          "required": [
+            "[PASS] BLE device discovered",
+            "[PASS] BLE connected"
+          ],
+          "timeout": 30
+        }
+      ],
       "jtag_snapshot": [
         "poll",
         "reg pc",
@@ -1685,21 +2109,20 @@
     },
     {
       "name": "m0_ble_wifi_scan_hal_test",
-      "tiers": ["smoke"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_ble_wifi_hal_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808WifiVendor": "1",
-          "bl808BleVendor": "1",
-          "bl808BleVendorBtble": "1",
-          "bl808BleVendorBl606pPhyRf": "1",
-          "bl808BleVendorTrace": "1",
-          "WifiScanOnly": "1"
+      "tiers": [
+        "smoke"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_ble_wifi_hal_test.nim",
+          "flash": "m0",
+          "defines": {
+            "WifiScanOnly": "1"
+          }
         }
-      }],
+      ],
       "jtag_flash_reset_capture": true,
       "required": [
         "=== BL808 BLE/WiFi HAL Test ===",
@@ -1712,33 +2135,53 @@
         "[PASS] ble advertising stop",
         "=== Test Complete ==="
       ],
-      "host_actions": [{
-        "after_marker": "[BLE] advertising bl808-hal",
-        "cmd": ["{python}", "tools/run_macos_ble_helper.py", "connect", "--name", "bl808-hal", "--timeout", "20", "--link-only"],
-        "required": ["[PASS] BLE device discovered", "[PASS] BLE connected"],
-        "timeout": 30
-      }],
+      "host_actions": [
+        {
+          "after_marker": "[BLE] advertising bl808-hal",
+          "cmd": [
+            "{python}",
+            "tools/run_macos_ble_helper.py",
+            "connect",
+            "--name",
+            "bl808-hal",
+            "--timeout",
+            "20",
+            "--link-only"
+          ],
+          "required": [
+            "[PASS] BLE device discovered",
+            "[PASS] BLE connected"
+          ],
+          "timeout": 30
+        }
+      ],
       "timeout": 90
     },
     {
       "name": "m0_ble_wifi_hal_test",
-      "tiers": ["full"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_ble_wifi_hal_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808WifiVendor": "1",
-          "bl808BleVendor": "1",
-          "bl808BleVendorBtble": "1",
-          "bl808BleVendorBl606pPhyRf": "1",
-          "bl808BleVendorTrace": "1",
-          "WifiSsid": {"env": "BL808_WIFI_SSID"},
-          "WifiPassword": {"secret_env": "BL808_WIFI_PASSWORD"},
-          "WifiChannel": {"env": "BL808_WIFI_CHANNEL", "default": 0}
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_ble_wifi_hal_test.nim",
+          "flash": "m0",
+          "defines": {
+            "WifiSsid": {
+              "env": "BL808_WIFI_SSID"
+            },
+            "WifiPassword": {
+              "secret_env": "BL808_WIFI_PASSWORD"
+            },
+            "WifiChannel": {
+              "env": "BL808_WIFI_CHANNEL",
+              "default": 0
+            }
+          }
         }
-      }],
+      ],
       "jtag_flash_reset_capture": true,
       "required": [
         "=== BL808 BLE/WiFi HAL Test ===",
@@ -1749,12 +2192,26 @@
         "[PASS] ble advertising stop",
         "=== Test Complete ==="
       ],
-      "host_actions": [{
-        "after_marker": "[BLE] advertising bl808-hal",
-        "cmd": ["{python}", "tools/run_macos_ble_helper.py", "connect", "--name", "bl808-hal", "--timeout", "20", "--link-only"],
-        "required": ["[PASS] BLE device discovered", "[PASS] BLE connected"],
-        "timeout": 30
-      }],
+      "host_actions": [
+        {
+          "after_marker": "[BLE] advertising bl808-hal",
+          "cmd": [
+            "{python}",
+            "tools/run_macos_ble_helper.py",
+            "connect",
+            "--name",
+            "bl808-hal",
+            "--timeout",
+            "20",
+            "--link-only"
+          ],
+          "required": [
+            "[PASS] BLE device discovered",
+            "[PASS] BLE connected"
+          ],
+          "timeout": 30
+        }
+      ],
       "jtag_snapshot": [
         "poll",
         "reg pc",
@@ -1787,28 +2244,38 @@
     },
     {
       "name": "m0_ble_wifi_nim_hal_test",
-      "tiers": ["full"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_ble_wifi_hal_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808WifiVendor": "1",
-          "bl808WifiNimFw": "1",
-          "bl808BleNimPureConnection": "1",
-          "bl808BleNimManualConnTx": "1",
-          "bl808BleNimConTimingPath": "1",
-          "bl808BleNimSchProg": "1",
-          "BleHostWindowIterations": "80000",
-          "BlePollIterations": "1",
-          "BlePostAdvertiseQuietMs": "500",
-          "BlePeripheralIdleDisconnectPolls": "3000",
-          "WifiSsid": {"env": "BL808_WIFI_SSID"},
-          "WifiPassword": {"secret_env": "BL808_WIFI_PASSWORD"},
-          "WifiChannel": {"env": "BL808_WIFI_CHANNEL", "default": 0}
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_ble_wifi_hal_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808BleNimPureConnection": "1",
+            "bl808BleNimManualConnTx": "1",
+            "bl808BleNimConTimingPath": "1",
+            "bl808BleNimSchProg": "1",
+            "BleHostWindowIterations": "80000",
+            "BlePollIterations": "1",
+            "BlePostAdvertiseQuietMs": "500",
+            "BlePeripheralIdleDisconnectPolls": "3000",
+            "WifiSsid": {
+              "env": "BL808_WIFI_SSID"
+            },
+            "WifiPassword": {
+              "secret_env": "BL808_WIFI_PASSWORD"
+            },
+            "WifiChannel": {
+              "env": "BL808_WIFI_CHANNEL",
+              "default": 0
+            }
+          }
         }
-      }],
+      ],
       "jtag_flash_reset_capture": true,
       "jtag_flash_runtime_jtag": true,
       "required": [
@@ -1822,12 +2289,26 @@
         "[PASS] ble advertising stop",
         "=== Test Complete ==="
       ],
-      "host_actions": [{
-        "after_marker": "[BLE] advertising bl808-hal",
-        "cmd": ["{python}", "tools/run_macos_ble_helper.py", "connect", "--name", "bl808-hal", "--timeout", "30", "--link-only"],
-        "required": ["[PASS] BLE device discovered", "[PASS] BLE connected"],
-        "timeout": 45
-      }],
+      "host_actions": [
+        {
+          "after_marker": "[BLE] advertising bl808-hal",
+          "cmd": [
+            "{python}",
+            "tools/run_macos_ble_helper.py",
+            "connect",
+            "--name",
+            "bl808-hal",
+            "--timeout",
+            "30",
+            "--link-only"
+          ],
+          "required": [
+            "[PASS] BLE device discovered",
+            "[PASS] BLE connected"
+          ],
+          "timeout": 45
+        }
+      ],
       "jtag_snapshot": [
         "poll",
         "reg pc",
@@ -1844,6 +2325,22 @@
         "mdw {sym:nim_ble_dbg_isr_count} 1",
         "mdw {sym:nim_ble_dbg_rx_ready_count} 1",
         "mdw {sym:nim_ble_dbg_rx_connect_ind_count} 1",
+        "mdw {sym:nim_connect_ind_pending} 1",
+        "mdw {sym:nim_connect_ind_queued_count} 1",
+        "mdw {sym:nim_connect_ind_service_count} 1",
+        "mdw {sym:nim_connect_ind_return_count} 1",
+        "mdw {sym:nim_adv_sch_event_active} 1",
+        "mdw {sym:nim_conn_start_return_count} 1",
+        "mdb {sym:nim_adv_enabled} 1",
+        "mdb {sym:nim_adv_data_len} 1",
+        "mdb {sym:nim_scan_rsp_data_len} 1",
+        "mdb {sym:nim_adv_params} 15",
+        "mdb {sym:nim_adv_data} 31",
+        "mdb {sym:nim_scan_rsp_data} 31",
+        "mdw {sym:nim_adv_sch_program_count} 1",
+        "mdw {sym:nim_adv_sch_event_count} 1",
+        "mdw {sym:nim_adv_sch_end_count} 1",
+        "mdw {sym:nim_adv_sch_last_event} 1",
         "mdw {sym:nim_ble_dbg_rx_last_header} 1",
         "mdw {sym:nim_ble_dbg_rx_last_status} 1",
         "mdw {sym:nim_ble_dbg_rx_last_desc} 1",
@@ -1879,6 +2376,11 @@
         "mdw {sym:nim_conn_rx_last_rejected_status} 1",
         "mdw {sym:nim_conn_rx_last_rejected_header} 1",
         "mdw {sym:nim_conn_deferred_schedule_count} 1",
+        "mdw {sym:nim_llcp_tx_count} 1",
+        "mdw {sym:nim_llcp_rx_count} 1",
+        "mdw {sym:nim_llcp_rx_malformed_count} 1",
+        "mdw {sym:nim_acl_rx_count} 1",
+        "mdw {sym:nim_acl_rx_drop_count} 1",
         "mdw {sym:nim_vendor_llcp_tx_count} 1",
         "mdw {sym:nim_vendor_llcp_rx_count} 1",
         "mdw {sym:nim_vendor_disc_evt_count} 1",
@@ -1897,32 +2399,42 @@
     },
     {
       "name": "m0_ble_wifi_nim_coex_hal_test",
-      "tiers": ["full"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_ble_wifi_hal_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808WifiVendor": "1",
-          "bl808WifiNimFw": "1",
-          "bl808BleNimPureConnection": "1",
-          "bl808BleNimManualConnTx": "1",
-          "bl808BleNimConTimingPath": "1",
-          "bl808BleNimSchProg": "1",
-          "WifiBleSimultaneous": "1",
-          "WifiBleConnectPtaMode": "2",
-          "WifiBleCoexPtaMode": "1",
-          "WifiBleCoexServicePeriodUs": "1000",
-          "WifiBleCoexServiceIterations": "1",
-          "BleHostWindowIterations": "80000",
-          "BlePollIterations": "1",
-          "BlePostAdvertiseQuietMs": "500",
-          "WifiSsid": {"env": "BL808_WIFI_SSID"},
-          "WifiPassword": {"secret_env": "BL808_WIFI_PASSWORD"},
-          "WifiChannel": {"env": "BL808_WIFI_CHANNEL", "default": 0}
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_ble_wifi_hal_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808BleNimPureConnection": "1",
+            "bl808BleNimManualConnTx": "1",
+            "bl808BleNimConTimingPath": "1",
+            "bl808BleNimSchProg": "1",
+            "WifiBleSimultaneous": "1",
+            "WifiBleConnectPtaMode": "2",
+            "WifiBleCoexPtaMode": "1",
+            "WifiBleCoexServicePeriodUs": "1000",
+            "WifiBleCoexServiceIterations": "1",
+            "BleHostWindowIterations": "80000",
+            "BlePollIterations": "1",
+            "BlePostAdvertiseQuietMs": "500",
+            "WifiSsid": {
+              "env": "BL808_WIFI_SSID"
+            },
+            "WifiPassword": {
+              "secret_env": "BL808_WIFI_PASSWORD"
+            },
+            "WifiChannel": {
+              "env": "BL808_WIFI_CHANNEL",
+              "default": 0
+            }
+          }
         }
-      }],
+      ],
       "jtag_flash_reset_capture": true,
       "jtag_flash_runtime_jtag": true,
       "required": [
@@ -1940,12 +2452,29 @@
         "[PASS] wifi disconnect after ble",
         "=== Test Complete ==="
       ],
-      "host_actions": [{
-        "after_marker": "[BLE] advertising bl808-hal",
-        "cmd": ["{python}", "tools/run_macos_ble_helper.py", "connect", "--name", "bl808-hal", "--timeout", "30", "--link-only", "--hold-seconds", "1.0", "--debug"],
-        "required": ["[PASS] BLE device discovered", "[PASS] BLE connected"],
-        "timeout": 45
-      }],
+      "host_actions": [
+        {
+          "after_marker": "[BLE] advertising bl808-hal",
+          "cmd": [
+            "{python}",
+            "tools/run_macos_ble_helper.py",
+            "connect",
+            "--name",
+            "bl808-hal",
+            "--timeout",
+            "30",
+            "--link-only",
+            "--hold-seconds",
+            "1.0",
+            "--debug"
+          ],
+          "required": [
+            "[PASS] BLE device discovered",
+            "[PASS] BLE connected"
+          ],
+          "timeout": 45
+        }
+      ],
       "jtag_snapshot": [
         "poll",
         "reg pc",
@@ -1981,40 +2510,50 @@
     },
     {
       "name": "m0_ble_wifi_nim_coex_long_hal_test",
-      "tiers": ["full"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_ble_wifi_hal_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808WifiVendor": "1",
-          "bl808WifiNimFw": "1",
-          "bl808BleNimPureConnection": "1",
-          "bl808BleNimManualConnTx": "1",
-          "bl808BleNimConTimingPath": "1",
-          "bl808BleNimSchProg": "1",
-          "WifiBleSimultaneous": "1",
-          "WifiBleConnectPtaMode": "2",
-          "WifiBleCoexPtaMode": "1",
-          "WifiBleCoexServicePeriodUs": "1000",
-          "WifiBleCoexServiceIterations": "1",
-          "WifiBleTrafficFrames": "20",
-          "WifiBleTrafficAttemptBudget": "120",
-          "WifiBleTrafficPeriodMs": "50",
-          "WifiBleTrafficBusyRetryMs": "10",
-          "WifiBlePostTrafficFrames": "3",
-          "BleTrafficStartDelayMs": "5000",
-          "BleHostWindowIterations": "80000",
-          "BleHostMinWindowIterations": "8000",
-          "BlePollIterations": "1",
-          "BlePostAdvertiseQuietMs": "500",
-          "BlePeripheralIdleDisconnectPolls": "3000",
-          "WifiSsid": {"env": "BL808_WIFI_SSID"},
-          "WifiPassword": {"secret_env": "BL808_WIFI_PASSWORD"},
-          "WifiChannel": {"env": "BL808_WIFI_CHANNEL", "default": 0}
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_ble_wifi_hal_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808BleNimPureConnection": "1",
+            "bl808BleNimManualConnTx": "1",
+            "bl808BleNimConTimingPath": "1",
+            "bl808BleNimSchProg": "1",
+            "WifiBleSimultaneous": "1",
+            "WifiBleConnectPtaMode": "2",
+            "WifiBleCoexPtaMode": "1",
+            "WifiBleCoexServicePeriodUs": "1000",
+            "WifiBleCoexServiceIterations": "1",
+            "WifiBleTrafficFrames": "20",
+            "WifiBleTrafficAttemptBudget": "120",
+            "WifiBleTrafficPeriodMs": "50",
+            "WifiBleTrafficBusyRetryMs": "10",
+            "WifiBlePostTrafficFrames": "3",
+            "BleTrafficStartDelayMs": "5000",
+            "BleHostWindowIterations": "80000",
+            "BleHostMinWindowIterations": "8000",
+            "BlePollIterations": "1",
+            "BlePostAdvertiseQuietMs": "500",
+            "BlePeripheralIdleDisconnectPolls": "3000",
+            "WifiSsid": {
+              "env": "BL808_WIFI_SSID"
+            },
+            "WifiPassword": {
+              "secret_env": "BL808_WIFI_PASSWORD"
+            },
+            "WifiChannel": {
+              "env": "BL808_WIFI_CHANNEL",
+              "default": 0
+            }
+          }
         }
-      }],
+      ],
       "jtag_flash_reset_capture": true,
       "jtag_flash_runtime_jtag": true,
       "required": [
@@ -2033,12 +2572,30 @@
         "[PASS] wifi disconnect after ble",
         "=== Test Complete ==="
       ],
-      "host_actions": [{
-        "after_marker": "[BLE] advertising bl808-hal",
-        "cmd": ["{python}", "tools/run_macos_ble_helper.py", "connect", "--name", "bl808-hal", "--timeout", "30", "--link-only", "--hold-seconds", "45.0", "--debug"],
-        "required": ["[PASS] BLE device discovered", "[PASS] BLE connected", "[PASS] BLE disconnected"],
-        "timeout": 90
-      }],
+      "host_actions": [
+        {
+          "after_marker": "[BLE] advertising bl808-hal",
+          "cmd": [
+            "{python}",
+            "tools/run_macos_ble_helper.py",
+            "connect",
+            "--name",
+            "bl808-hal",
+            "--timeout",
+            "30",
+            "--link-only",
+            "--hold-seconds",
+            "45.0",
+            "--debug"
+          ],
+          "required": [
+            "[PASS] BLE device discovered",
+            "[PASS] BLE connected",
+            "[PASS] BLE disconnected"
+          ],
+          "timeout": 90
+        }
+      ],
       "jtag_snapshot": [
         "poll",
         "reg pc",
@@ -2051,6 +2608,22 @@
         "mdw {sym:nim_ble_dbg_isr_count} 1",
         "mdw {sym:nim_ble_dbg_rx_ready_count} 1",
         "mdw {sym:nim_ble_dbg_rx_connect_ind_count} 1",
+        "mdw {sym:nim_connect_ind_pending} 1",
+        "mdw {sym:nim_connect_ind_queued_count} 1",
+        "mdw {sym:nim_connect_ind_service_count} 1",
+        "mdw {sym:nim_connect_ind_return_count} 1",
+        "mdw {sym:nim_adv_sch_event_active} 1",
+        "mdw {sym:nim_conn_start_return_count} 1",
+        "mdb {sym:nim_adv_enabled} 1",
+        "mdb {sym:nim_adv_data_len} 1",
+        "mdb {sym:nim_scan_rsp_data_len} 1",
+        "mdb {sym:nim_adv_params} 15",
+        "mdb {sym:nim_adv_data} 31",
+        "mdb {sym:nim_scan_rsp_data} 31",
+        "mdw {sym:nim_adv_sch_program_count} 1",
+        "mdw {sym:nim_adv_sch_event_count} 1",
+        "mdw {sym:nim_adv_sch_end_count} 1",
+        "mdw {sym:nim_adv_sch_last_event} 1",
         "mdw {sym:nim_ble_wireless_prepare_count} 1",
         "mdw {sym:nim_ble_wireless_preserve_wifi_count} 1",
         "mdw {sym:nim_ble_wireless_reset_count} 1",
@@ -2163,25 +2736,28 @@
     },
     {
       "name": "m0_ble_wifi_nim_scan_hal_test",
-      "tiers": ["full"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_ble_wifi_hal_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808WifiVendor": "1",
-          "bl808WifiNimFw": "1",
-          "bl808BleNimPureConnection": "1",
-          "bl808BleNimManualConnTx": "1",
-          "bl808BleNimConTimingPath": "1",
-          "bl808BleNimSchProg": "1",
-          "BleHostWindowIterations": "80000",
-          "BlePollIterations": "1",
-          "BlePostAdvertiseQuietMs": "500",
-          "WifiScanOnly": "1"
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_ble_wifi_hal_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808BleNimPureConnection": "1",
+            "bl808BleNimManualConnTx": "1",
+            "bl808BleNimConTimingPath": "1",
+            "bl808BleNimSchProg": "1",
+            "BleHostWindowIterations": "80000",
+            "BlePollIterations": "1",
+            "BlePostAdvertiseQuietMs": "500",
+            "WifiScanOnly": "1"
+          }
         }
-      }],
+      ],
       "jtag_flash_reset_capture": true,
       "jtag_flash_runtime_jtag": true,
       "required": [
@@ -2198,12 +2774,26 @@
         "[PASS] ble advertising stop",
         "=== Test Complete ==="
       ],
-      "host_actions": [{
-        "after_marker": "[BLE] advertising bl808-hal",
-        "cmd": ["{python}", "tools/run_macos_ble_helper.py", "connect", "--name", "bl808-hal", "--timeout", "30", "--link-only"],
-        "required": ["[PASS] BLE device discovered", "[PASS] BLE connected"],
-        "timeout": 45
-      }],
+      "host_actions": [
+        {
+          "after_marker": "[BLE] advertising bl808-hal",
+          "cmd": [
+            "{python}",
+            "tools/run_macos_ble_helper.py",
+            "connect",
+            "--name",
+            "bl808-hal",
+            "--timeout",
+            "30",
+            "--link-only"
+          ],
+          "required": [
+            "[PASS] BLE device discovered",
+            "[PASS] BLE connected"
+          ],
+          "timeout": 45
+        }
+      ],
       "jtag_snapshot": [
         "poll",
         "reg pc",
@@ -2220,6 +2810,22 @@
         "mdw {sym:nim_ble_dbg_isr_count} 1",
         "mdw {sym:nim_ble_dbg_rx_ready_count} 1",
         "mdw {sym:nim_ble_dbg_rx_connect_ind_count} 1",
+        "mdw {sym:nim_connect_ind_pending} 1",
+        "mdw {sym:nim_connect_ind_queued_count} 1",
+        "mdw {sym:nim_connect_ind_service_count} 1",
+        "mdw {sym:nim_connect_ind_return_count} 1",
+        "mdw {sym:nim_adv_sch_event_active} 1",
+        "mdw {sym:nim_conn_start_return_count} 1",
+        "mdb {sym:nim_adv_enabled} 1",
+        "mdb {sym:nim_adv_data_len} 1",
+        "mdb {sym:nim_scan_rsp_data_len} 1",
+        "mdb {sym:nim_adv_params} 15",
+        "mdb {sym:nim_adv_data} 31",
+        "mdb {sym:nim_scan_rsp_data} 31",
+        "mdw {sym:nim_adv_sch_program_count} 1",
+        "mdw {sym:nim_adv_sch_event_count} 1",
+        "mdw {sym:nim_adv_sch_end_count} 1",
+        "mdw {sym:nim_adv_sch_last_event} 1",
         "mdw {sym:nim_ble_dbg_rx_last_header} 1",
         "mdw {sym:nim_ble_dbg_rx_last_status} 1",
         "mdw {sym:nim_ble_dbg_rx_last_desc} 1",
@@ -2255,6 +2861,11 @@
         "mdw {sym:nim_conn_rx_last_rejected_status} 1",
         "mdw {sym:nim_conn_rx_last_rejected_header} 1",
         "mdw {sym:nim_conn_deferred_schedule_count} 1",
+        "mdw {sym:nim_llcp_tx_count} 1",
+        "mdw {sym:nim_llcp_rx_count} 1",
+        "mdw {sym:nim_llcp_rx_malformed_count} 1",
+        "mdw {sym:nim_acl_rx_count} 1",
+        "mdw {sym:nim_acl_rx_drop_count} 1",
         "mdw {sym:nim_vendor_llcp_tx_count} 1",
         "mdw {sym:nim_vendor_llcp_rx_count} 1",
         "mdw {sym:nim_vendor_disc_evt_count} 1",
@@ -2273,8 +2884,17 @@
     },
     {
       "name": "m0_hal_net_usb_test",
-      "tiers": ["full"],
-      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_hal_net_usb_test.nim", "flash": "m0"}],
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_hal_net_usb_test.nim",
+          "flash": "m0"
+        }
+      ],
       "required": [
         "=== BL808 HAL Net USB Test ===",
         "[PASS] emac rx/tx disable",
@@ -2287,10 +2907,22 @@
     },
     {
       "name": "d0_mm_hal_register_smoke_test",
-      "tiers": ["full"],
+      "tiers": [
+        "full"
+      ],
       "build": [
-        {"id": "kernel", "core": "bl808m0", "source": "examples/m0_d0_mm_hal_boot_helper.nim", "flash": "m0"},
-        {"id": "d0", "core": "bl808d0", "source": "examples/d0_mm_hal_register_smoke_test.nim", "flash": "d0"}
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_d0_mm_hal_boot_helper.nim",
+          "flash": "m0"
+        },
+        {
+          "id": "d0",
+          "core": "bl808d0",
+          "source": "examples/d0_mm_hal_register_smoke_test.nim",
+          "flash": "d0"
+        }
       ],
       "required": [
         "[PASS] D0 started",
@@ -2307,51 +2939,140 @@
     },
     {
       "name": "m0_rtc_test",
-      "tiers": ["full"],
-      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_rtc_test.nim", "flash": "m0"}],
-      "required": ["[PASS] Set/get round-trip", "[PASS] Leap year 2000-02-29 round-trip", "[PASS] FatFs timestamp non-zero", "=== Test Complete ==="],
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_rtc_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "[PASS] Set/get round-trip",
+        "[PASS] Leap year 2000-02-29 round-trip",
+        "[PASS] FatFs timestamp non-zero",
+        "=== Test Complete ==="
+      ],
       "timeout": 35
     },
     {
       "name": "m0_sd_test",
-      "tiers": ["full"],
-      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_sd_test.nim", "flash": "m0"}],
-      "required": ["[PASS] Data verified: Hello!", "[PASS] Directory empty after delete", "[PASS] disk I/O callbacks", "=== Test Complete ==="],
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_sd_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "[PASS] Data verified: Hello!",
+        "[PASS] Directory empty after delete",
+        "[PASS] disk I/O callbacks",
+        "=== Test Complete ==="
+      ],
       "timeout": 60
     },
     {
       "name": "m0_asyncsd_test",
-      "tiers": ["full"],
-      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_asyncsd_test.nim", "flash": "m0"}],
-      "required": ["[PASS] asyncSdWrite", "[PASS] asyncSdRead data verified", "[PASS] asyncSdRemove", "=== Test Complete ==="],
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_asyncsd_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "[PASS] asyncSdWrite",
+        "[PASS] asyncSdRead data verified",
+        "[PASS] asyncSdRemove",
+        "=== Test Complete ==="
+      ],
       "timeout": 60
     },
     {
       "name": "m0_ipc_timeout_test",
-      "tiers": ["full"],
-      "build": [{"id": "kernel", "core": "bl808m0", "source": "examples/m0_ipc_timeout_test.nim", "flash": "m0"}],
-      "required": ["[M0] timeout 1 [OK]", "[M0] timeout 2 [OK]", "[M0] IPC timeout cleanup [PASS]"],
+      "tiers": [
+        "full"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_ipc_timeout_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "[M0] timeout 1 [OK]",
+        "[M0] timeout 2 [OK]",
+        "[M0] IPC timeout cleanup [PASS]"
+      ],
       "timeout": 20
     },
     {
       "name": "m0_ipc_test",
-      "tiers": ["full"],
-      "build": [
-        {"id": "kernel", "core": "bl808m0", "source": "examples/m0_ipc_test.nim", "flash": "m0"},
-        {"id": "d0", "core": "bl808d0", "source": "examples/d0_ipc_test.nim", "flash": "d0"}
+      "tiers": [
+        "full"
       ],
-      "required": ["[M0] All IPC calls correct! [PASS]"],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_ipc_test.nim",
+          "flash": "m0"
+        },
+        {
+          "id": "d0",
+          "core": "bl808d0",
+          "source": "examples/d0_ipc_test.nim",
+          "flash": "d0"
+        }
+      ],
+      "required": [
+        "[M0] All IPC calls correct! [PASS]"
+      ],
       "timeout": 90
     },
     {
       "name": "m0_allcore_test",
-      "tiers": ["full"],
-      "build": [
-        {"id": "kernel", "core": "bl808m0", "source": "examples/m0_allcore_test.nim", "flash": "m0"},
-        {"id": "d0", "core": "bl808d0", "source": "examples/d0_allcore_test.nim", "flash": "d0"},
-        {"id": "lp", "core": "bl808lp", "source": "examples/lp_allcore_test.nim", "flash": "lp"}
+      "tiers": [
+        "full"
       ],
-      "required": ["Result: 5 passed, 0 failed", "=== ALL TESTS PASSED ==="],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_allcore_test.nim",
+          "flash": "m0"
+        },
+        {
+          "id": "d0",
+          "core": "bl808d0",
+          "source": "examples/d0_allcore_test.nim",
+          "flash": "d0"
+        },
+        {
+          "id": "lp",
+          "core": "bl808lp",
+          "source": "examples/lp_allcore_test.nim",
+          "flash": "lp"
+        }
+      ],
+      "required": [
+        "Result: 5 passed, 0 failed",
+        "=== ALL TESTS PASSED ==="
+      ],
       "timeout": 120,
       "jtag_snapshot": [
         "poll",
@@ -2370,10 +3091,22 @@
     },
     {
       "name": "lp_jtag_enable_test",
-      "tiers": ["manual"],
+      "tiers": [
+        "manual"
+      ],
       "build": [
-        {"id": "kernel", "core": "bl808m0", "source": "examples/m0_lp_jtag_enable_helper.nim", "flash": "m0"},
-        {"id": "lp", "core": "bl808lp", "source": "examples/lp_jtag_enable.nim", "flash": "lp"}
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_lp_jtag_enable_helper.nim",
+          "flash": "m0"
+        },
+        {
+          "id": "lp",
+          "core": "bl808lp",
+          "source": "examples/lp_jtag_enable.nim",
+          "flash": "lp"
+        }
       ],
       "required": [
         "[OK] LP JTAG helper ran",
@@ -2395,10 +3128,22 @@
     },
     {
       "name": "lp_ipc_reg_probe_test",
-      "tiers": ["manual"],
+      "tiers": [
+        "manual"
+      ],
       "build": [
-        {"id": "kernel", "core": "bl808m0", "source": "examples/m0_lp_ipc_reg_probe.nim", "flash": "m0"},
-        {"id": "lp", "core": "bl808lp", "source": "examples/lp_ipc_reg_probe.nim", "flash": "lp"}
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_lp_ipc_reg_probe.nim",
+          "flash": "m0"
+        },
+        {
+          "id": "lp",
+          "core": "bl808lp",
+          "source": "examples/lp_ipc_reg_probe.nim",
+          "flash": "lp"
+        }
       ],
       "required": [
         "[OK] LP IPC register server alive",
@@ -2418,67 +3163,120 @@
     },
     {
       "name": "d0_kernel_test",
-      "tiers": ["full"],
-      "build": [
-        {"id": "kernel", "core": "bl808m0", "source": "examples/m0_d0_boot_helper.nim", "flash": "m0"},
-        {"id": "d0", "core": "bl808d0", "source": "examples/d0_kernel_test.nim", "flash": "d0"}
+      "tiers": [
+        "full"
       ],
-      "required": ["[M0] Releasing D0", "[D0] Scheduler initialized", "[D0-A] done", "[D0-B] done"],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_d0_boot_helper.nim",
+          "flash": "m0"
+        },
+        {
+          "id": "d0",
+          "core": "bl808d0",
+          "source": "examples/d0_kernel_test.nim",
+          "flash": "d0"
+        }
+      ],
+      "required": [
+        "[M0] Releasing D0",
+        "[D0] Scheduler initialized",
+        "[D0-A] done",
+        "[D0-B] done"
+      ],
       "timeout": 100
     },
     {
       "name": "m0_wifi_e2e_test",
-      "tiers": ["e2e"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_wifi_e2e_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808WifiVendor": "1",
-          "WifiSsid": {"env": "BL808_WIFI_SSID"},
-          "WifiPassword": {"secret_env": "BL808_WIFI_PASSWORD"},
-          "AttemptsTotal": {"env": "BL808_WIFI_E2E_ATTEMPTS", "default": 3},
-          "WifiEchoHost": {"env": "BL808_WIFI_E2E_HOST", "default": "0.0.0.0"},
-          "WifiEchoPort": {"env": "BL808_WIFI_E2E_PORT", "default": 0}
+      "tiers": [
+        "e2e"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wifi_e2e_test.nim",
+          "flash": "m0",
+          "defines": {
+            "WifiSsid": {
+              "env": "BL808_WIFI_SSID"
+            },
+            "WifiPassword": {
+              "secret_env": "BL808_WIFI_PASSWORD"
+            },
+            "AttemptsTotal": {
+              "env": "BL808_WIFI_E2E_ATTEMPTS",
+              "default": 3
+            },
+            "WifiEchoHost": {
+              "env": "BL808_WIFI_E2E_HOST",
+              "default": "0.0.0.0"
+            },
+            "WifiEchoPort": {
+              "env": "BL808_WIFI_E2E_PORT",
+              "default": 0
+            }
+          }
         }
-      }],
-      "required": ["=== BL808 E2E Test Complete ==="],
+      ],
+      "required": [
+        "=== BL808 E2E Test Complete ==="
+      ],
       "timeout": 240
     },
     {
       "name": "m0_wifi_lwip_smoke",
-      "tiers": ["e2e"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_wifi_lwip_smoke.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808WifiVendor": "1",
-          "WifiSsid": {"env": "BL808_WIFI_SSID"},
-          "WifiPassword": {"secret_env": "BL808_WIFI_PASSWORD"},
-          "WifiChannel": {"env": "BL808_WIFI_CHANNEL", "default": 0},
-          "AttemptsTotal": {"env": "BL808_WIFI_E2E_ATTEMPTS", "default": 3}
+      "tiers": [
+        "e2e"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wifi_lwip_smoke.nim",
+          "flash": "m0",
+          "defines": {
+            "WifiSsid": {
+              "env": "BL808_WIFI_SSID"
+            },
+            "WifiPassword": {
+              "secret_env": "BL808_WIFI_PASSWORD"
+            },
+            "WifiChannel": {
+              "env": "BL808_WIFI_CHANNEL",
+              "default": 0
+            },
+            "AttemptsTotal": {
+              "env": "BL808_WIFI_E2E_ATTEMPTS",
+              "default": 3
+            }
+          }
         }
-      }],
-      "required": ["=== BL808 LwIP Smoke Complete ==="],
+      ],
+      "required": [
+        "=== BL808 LwIP Smoke Complete ==="
+      ],
       "timeout": 240
     },
     {
       "name": "m0_wifi_nimfw_boot_test",
-      "tiers": ["smoke"],
-      "build": [{
-        "id": "kernel",
-        "core": "bl808m0",
-        "source": "examples/m0_wifi_nimfw_boot_test.nim",
-        "flash": "m0",
-        "defines": {
-          "bl808WifiVendor": "1",
-          "bl808WifiNimFw": "1",
-          "bl808WifiNimFwTrace": "1"
+      "tiers": [
+        "smoke"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wifi_nimfw_boot_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808WifiNimFwTrace": "1"
+          }
         }
-      }],
+      ],
       "required": [
         "=== BL808 WiFi NimFw Boot Probe ===",
         "[WIFI-NIMFW] bl_init done",
