@@ -4416,6 +4416,14 @@ when defined(bl808WifiNimFw):
   var nimFwDbgPayTriggerLast* {.wifiCtrl, exportc: "nimfw_dbg_pay_trig".}: uint32
   var nimFwDbgTxTrigEntry*    {.wifiCtrl, exportc: "nimfw_dbg_txtrig_entry".}: uint32
   var nimFwDbgFrameGet*       {.wifiCtrl, exportc: "nimfw_dbg_frame_get".}: uint32
+  var nimFwDbgFrameGetInvalid* {.wifiCtrl, exportc: "nimfw_dbg_frame_get_invalid".}: uint32
+  var nimFwDbgFrameGetInvalidPtr* {.wifiCtrl, exportc: "nimfw_dbg_frame_get_invalid_ptr".}: uint32
+  var nimFwDbgFrameGetInvalidNext* {.wifiCtrl, exportc: "nimfw_dbg_frame_get_invalid_next".}: uint32
+  var nimFwDbgFrameFreeRebuild* {.wifiCtrl, exportc: "nimfw_dbg_frame_free_rebuild".}: uint32
+  var nimFwDbgFrameFreeReclaimed* {.wifiCtrl, exportc: "nimfw_dbg_frame_free_reclaimed".}: uint32
+  var nimFwDbgFrameFreePushInvalid* {.wifiCtrl, exportc: "nimfw_dbg_frame_free_push_invalid".}: uint32
+  var nimFwDbgTxPendingInvalid* {.wifiCtrl, exportc: "nimfw_dbg_tx_pending_invalid".}: uint32
+  var nimFwDbgTxPendingInvalidPtr* {.wifiCtrl, exportc: "nimfw_dbg_tx_pending_invalid_ptr".}: uint32
   # Recycle / CFM path counters (iter 261 follow-up)
   var nimFwDbgCfmPush*        {.wifiCtrl, exportc: "nimfw_dbg_cfm_push".}: uint32
   var nimFwDbgCfmEvt*         {.wifiCtrl, exportc: "nimfw_dbg_cfm_evt".}: uint32
@@ -4432,6 +4440,109 @@ when defined(bl808WifiNimFw):
   var nimFwDbgFrameGetFails*    {.wifiCtrl, exportc: "nimfw_dbg_frame_get_fails".}: uint32
   var nimFwDbgNullFrameCalls*   {.wifiCtrl, exportc: "nimfw_dbg_nullframe_calls".}: uint32
   var nimFwDbgNullFrameCallerRA* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_caller_ra".}: uint32
+  var nimFwDbgTxRouteInternal*  {.wifiCtrl, exportc: "nimfw_dbg_tx_route_internal".}: uint32
+  var nimFwDbgTxRouteHost*      {.wifiCtrl, exportc: "nimfw_dbg_tx_route_host".}: uint32
+  var nimFwDbgTxRouteUsedFlag*  {.wifiCtrl, exportc: "nimfw_dbg_tx_route_usedflag".}: uint32
+  var nimFwDbgFrameGetUsedBefore* {.wifiCtrl, exportc: "nimfw_dbg_frame_get_used_before".}: uint32
+  var nimFwDbgNullFrameCfm*     {.wifiCtrl, exportc: "nimfw_dbg_nullframe_cfm".}: uint32
+  var nimFwDbgNullFrameAckOk*   {.wifiCtrl, exportc: "nimfw_dbg_nullframe_ack_ok".}: uint32
+  var nimFwDbgNullFrameAckFail* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_ack_fail".}: uint32
+  var nimFwDbgNullFrameLastStatus* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_status".}: uint32
+  var nimFwDbgNullFrameDescLast* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_desc".}: uint32
+  var nimFwDbgNullFrameBufLast* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_buf".}: uint32
+  var nimFwDbgNullFrameFcLast* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_fc".}: uint32
+  var nimFwDbgNullFramePushRc* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_push_rc".}: uint32
+  var nimFwDbgNullFrameReturn* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_return".}: uint32
+  var nimFwDbgNullFrameVifSta* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_vif_sta".}: uint32
+  var nimFwDbgNullFrameCbSet*   {.wifiCtrl, exportc: "nimfw_dbg_nullframe_cb_set".}: uint32
+  var nimFwDbgNullFrameCbSetPtr* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_cb_set_ptr".}: uint32
+  var nimFwDbgNullFrameEvtSeen* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_evt_seen".}: uint32
+  var nimFwDbgNullFrameEvtCbNil* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_evt_cb_nil".}: uint32
+  var nimFwDbgNullFrameEvtCbPtr* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_evt_cb_ptr".}: uint32
+  var nimFwDbgNullFrameEvtDesc* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_evt_desc".}: uint32
+  var nimFwDbgNullFrameTxTrigSeen* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_txtrig_seen".}: uint32
+  var nimFwDbgNullFrameTxTrigHost* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_txtrig_host".}: uint32
+  var nimFwDbgNullFrameTxTrigInternal* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_txtrig_internal".}: uint32
+  var nimFwDbgNullFrameTxTrigUsedFlag* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_txtrig_usedflag".}: uint32
+  var nimFwDbgNullFrameBusyTxCheck* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_busy_txcheck".}: uint32
+  var nimFwDbgNullFrameBusyPsCheck* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_busy_pscheck".}: uint32
+  var nimFwDbgNullFramePaySeen* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_seen".}: uint32
+  var nimFwDbgNullFramePayHasPayload* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_payload".}: uint32
+  var nimFwDbgNullFramePayEmpty* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_empty".}: uint32
+  var nimFwDbgNullFramePayNonEmpty* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_nonempty".}: uint32
+  var nimFwDbgNullFramePayAc* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_ac".}: uint32
+  var nimFwDbgNullFramePayTrigger* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_trig".}: uint32
+  var nimFwDbgNullFramePayCurrent* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_current".}: uint32
+  var nimFwDbgNullFramePayPending* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_pending".}: uint32
+  var nimFwDbgNullFramePayThdStatus* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_pay_thd_status".}: uint32
+  var nimFwDbgNullFramePostponed* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_postponed".}: uint32
+  var nimFwDbgNullFrameQueued* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_queued".}: uint32
+  var nimFwDbgPostponedServiceCalls* {.wifiCtrl, exportc: "nimfw_dbg_postponed_service_calls".}: uint32
+  var nimFwDbgPostponedServiceSent* {.wifiCtrl, exportc: "nimfw_dbg_postponed_service_sent".}: uint32
+  var nimFwDbgNullFrameTxIntSeen* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_txint_seen".}: uint32
+  var nimFwDbgNullFrameTxIntFc* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_txint_fc".}: uint32
+  var nimFwDbgNullFrameTxIntBuf* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_txint_buf".}: uint32
+  var nimFwDbgNullFrameFakeSeen* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_fake_seen".}: uint32
+  var nimFwDbgNullFrameFakeQidx* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_fake_qidx".}: uint32
+  var nimFwDbgNullFrameFakeHeadBefore* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_fake_head_before".}: uint32
+  var nimFwDbgNullFrameFakeTailBefore* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_fake_tail_before".}: uint32
+  var nimFwDbgNullFrameFakeHeadAfter* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_fake_head_after".}: uint32
+  var nimFwDbgNullFrameFakeTailAfter* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_fake_tail_after".}: uint32
+  var nimFwDbgNullFrameFakeLink* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_fake_link".}: uint32
+  var nimFwDbgPostponedRelease* {.wifiCtrl, exportc: "nimfw_dbg_postponed_release".}: uint32
+  var nimFwDbgPostponedReleaseCb* {.wifiCtrl, exportc: "nimfw_dbg_postponed_release_cb".}: uint32
+  var nimFwDbgPostponedReleaseDesc* {.wifiCtrl, exportc: "nimfw_dbg_postponed_release_desc".}: uint32
+  var nimFwDbgPostponedReleaseFc* {.wifiCtrl, exportc: "nimfw_dbg_postponed_release_fc".}: uint32
+  var nimFwDbgPostponedReleaseFlags* {.wifiCtrl, exportc: "nimfw_dbg_postponed_release_flags".}: uint32
+  var nimFwDbgPostponedReconcile* {.wifiCtrl, exportc: "nimfw_dbg_postponed_reconcile".}: uint32
+  var nimFwDbgPostponedReconcileOld* {.wifiCtrl, exportc: "nimfw_dbg_postponed_reconcile_old".}: uint32
+  var nimFwDbgPostponedReconcileNew* {.wifiCtrl, exportc: "nimfw_dbg_postponed_reconcile_new".}: uint32
+  var nimFwDbgAutoNullSkipped* {.wifiCtrl, exportc: "nimfw_dbg_auto_null_skipped".}: uint32
+  var nimFwDbgTxStalledInternalRecover* {.wifiCtrl, exportc: "nimfw_dbg_tx_stalled_internal_recover".}: uint32
+  var nimFwDbgTxRecoverAc* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_ac".}: uint32
+  var nimFwDbgTxRecoverPending* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_pending".}: uint32
+  var nimFwDbgTxRecoverCurrentBefore* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_current_before".}: uint32
+  var nimFwDbgTxRecoverCurrentAfter* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_current_after".}: uint32
+  var nimFwDbgTxRecoverBackupBefore* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_backup_before".}: uint32
+  var nimFwDbgTxRecoverBackupAfterFake* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_backup_after_fake".}: uint32
+  var nimFwDbgTxRecoverBackupAfterPay* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_backup_after_pay".}: uint32
+  var nimFwDbgTxRecoverDescBuf* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_desc_buf".}: uint32
+  var nimFwDbgTxRecoverDescCb* {.wifiCtrl, exportc: "nimfw_dbg_tx_recover_desc_cb".}: uint32
+  var nimFwStaTxChannelPrepareEnabled* {.wifiCtrl, exportc: "nimfw_sta_tx_channel_prepare_enabled".}: uint32
+  var nimFwBleWifiRoleWindowEnabled* {.wifiCtrl, exportc: "nimfw_ble_wifi_role_window_enabled".}: uint32
+  var nimFwBleWifiRoleWindowActive* {.wifiCtrl, exportc: "nimfw_ble_wifi_role_window_active".}: uint32
+  var nimFwDbgBleWifiRoleEnter* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_role_enter".}: uint32
+  var nimFwDbgBleWifiRoleLeave* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_role_leave".}: uint32
+  var nimFwDbgBleWifiRoleLastCtrl* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_role_last_ctrl".}: uint32
+  var nimFwDbgBleWifiRoleLastCtrl2* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_role_last_ctrl2".}: uint32
+  var nimFwDbgBleWifiRoleLastMirror* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_role_last_mirror".}: uint32
+  var nimFwDbgBleWifiTxPreBcn* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_tx_pre_bcn".}: uint32
+  var nimFwDbgBleWifiTxPrePti* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_tx_pre_pti".}: uint32
+  var nimFwDbgBleWifiTxPreStat* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_tx_pre_stat".}: uint32
+  var nimFwDbgBleWifiTxTrigStat* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_tx_trig_stat".}: uint32
+  var nimFwDbgBleWifiTxTrigAgg* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_tx_trig_agg".}: uint32
+  var nimFwDbgBleWifiTxCfmBcn* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_tx_cfm_bcn".}: uint32
+  var nimFwDbgBleWifiTxCfmPti* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_tx_cfm_pti".}: uint32
+  var nimFwDbgStaTxRfRestore* {.wifiCtrl, exportc: "nimfw_dbg_sta_tx_rf_restore".}: uint32
+  var nimFwDbgStaTxRfFullRestore* {.wifiCtrl, exportc: "nimfw_dbg_sta_tx_rf_full_restore".}: uint32
+  var nimFwKeepaliveInFlight* {.wifiCtrl, exportc: "nimfw_keepalive_inflight".}: uint32
+  var nimFwKeepaliveTargetCfm* {.wifiCtrl, exportc: "nimfw_keepalive_target_cfm".}: uint32
+  var nimFwKeepaliveStartedAt* {.wifiCtrl, exportc: "nimfw_keepalive_started_at".}: uint32
+  var nimFwDbgKeepaliveRc* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_rc".}: uint32
+  var nimFwDbgKeepalivePostBefore* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_post_before".}: uint32
+  var nimFwDbgKeepalivePostAfter* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_post_after".}: uint32
+  var nimFwDbgKeepaliveTxintBefore* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_txint_before".}: uint32
+  var nimFwDbgKeepaliveTxintAfter* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_txint_after".}: uint32
+  var nimFwDbgKeepaliveFakeBefore* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_fake_before".}: uint32
+  var nimFwDbgKeepaliveFakeAfter* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_fake_after".}: uint32
+  var nimFwDbgKeepalivePayBefore* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_pay_before".}: uint32
+  var nimFwDbgKeepalivePayAfter* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_pay_after".}: uint32
+  var nimFwDbgKeepaliveCbBefore* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_cb_before".}: uint32
+  var nimFwDbgKeepaliveCbAfter* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_cb_after".}: uint32
+  var nimFwKeepaliveQosNullEnabled* {.wifiCtrl, exportc: "nimfw_keepalive_qosnull_enabled".}: uint32
+  var nimFwDbgTxIntEnter* {.wifiCtrl, exportc: "nimfw_dbg_txint_enter".}: uint32
+  var nimFwDbgTxIntLastCb* {.wifiCtrl, exportc: "nimfw_dbg_txint_last_cb".}: uint32
+  var nimFwDbgTxIntLastFc* {.wifiCtrl, exportc: "nimfw_dbg_txint_last_fc".}: uint32
   var nimFwDbgStaTbttEnter*     {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_enter".}: uint32
   var nimFwDbgStaTbttAssoc*     {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_assoc".}: uint32
   var nimFwDbgStaTbttOnChan*    {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_onchan".}: uint32
@@ -4455,6 +4566,11 @@ when defined(bl808WifiNimFw):
   var nimFwDbgConnectIndPrePath* {.wifiCtrl, exportc: "nimfw_dbg_conn_ind_prepath".}: uint32  # path-1 (open) fired
   var nimFwDbgVifIeLenAtAssoc*  {.wifiCtrl, exportc: "nimfw_dbg_vif_ielen_assoc".}: uint32  # vif+496 at AssocReq build
   var nimFwDbgPtkInitDone*      {.wifiCtrl, exportc: "nimfw_dbg_ptk_init_done".}: uint32
+  var nimFwDbgKeyDataDecryptCalls* {.wifiCtrl, exportc: "nimfw_dbg_keydata_decrypt_calls".}: uint32
+  var nimFwDbgKeyDataDecryptLen* {.wifiCtrl, exportc: "nimfw_dbg_keydata_decrypt_len".}: uint32
+  var nimFwDbgKeyDataDecryptOutLen* {.wifiCtrl, exportc: "nimfw_dbg_keydata_decrypt_out_len".}: uint32
+  var nimFwDbgKeyDataDecryptOk* {.wifiCtrl, exportc: "nimfw_dbg_keydata_decrypt_ok".}: uint32
+  var nimFwDbgKeyDataDecryptFail* {.wifiCtrl, exportc: "nimfw_dbg_keydata_decrypt_fail".}: uint32
   # Per-VIF WPA-handshake-pending tracking. Set when sm_assoc_done runs on a
   # WPA-protected VIF (sectype>=2); cleared on PTK-init-done or disconnect.
   # mm_sta_tbtt uses this to suppress the null-frame keep-alive loop while
@@ -4560,11 +4676,68 @@ else:
     nimFwDbgTxTrigEntry, nimFwDbgTxTrigAcReady,
       nimFwDbgTxTrigZeroExit, nimFwDbgTxTrigLoops: uint32
     nimFwDbgFrameGet, nimFwDbgFrameCfm, nimFwDbgFrameRelease,
-      nimFwDbgFrameGetFails, nimFwDbgCfmPush, nimFwDbgCfmEvt: uint32
+      nimFwDbgFrameGetFails, nimFwDbgCfmPush, nimFwDbgCfmEvt,
+      nimFwDbgFrameGetInvalid, nimFwDbgFrameGetInvalidPtr,
+      nimFwDbgFrameGetInvalidNext, nimFwDbgFrameFreeRebuild,
+      nimFwDbgFrameFreeReclaimed, nimFwDbgFrameFreePushInvalid,
+      nimFwDbgTxPendingInvalid, nimFwDbgTxPendingInvalidPtr: uint32
     nimFwDbgFrameEvtEnter, nimFwDbgFrameEvtPop,
       nimFwDbgFrameEvtFreeRet, nimFwDbgFrameEvtUsedSkip,
       nimFwDbgFrameEvtCallback: uint32
     nimFwDbgNullFrameCalls, nimFwDbgNullFrameCallerRA: uint32
+    nimFwDbgTxRouteInternal, nimFwDbgTxRouteHost,
+      nimFwDbgTxRouteUsedFlag, nimFwDbgFrameGetUsedBefore: uint32
+    nimFwDbgNullFrameCfm, nimFwDbgNullFrameAckOk,
+      nimFwDbgNullFrameAckFail, nimFwDbgNullFrameLastStatus: uint32
+    nimFwDbgNullFrameDescLast, nimFwDbgNullFrameBufLast,
+      nimFwDbgNullFrameFcLast, nimFwDbgNullFramePushRc,
+      nimFwDbgNullFrameReturn, nimFwDbgNullFrameVifSta,
+      nimFwDbgNullFrameCbSet, nimFwDbgNullFrameCbSetPtr, nimFwDbgNullFrameEvtSeen,
+      nimFwDbgNullFrameEvtCbNil, nimFwDbgNullFrameEvtCbPtr,
+      nimFwDbgNullFrameEvtDesc, nimFwDbgNullFrameTxTrigSeen,
+      nimFwDbgNullFrameTxTrigHost, nimFwDbgNullFrameTxTrigInternal,
+      nimFwDbgNullFrameTxTrigUsedFlag, nimFwDbgNullFrameBusyTxCheck,
+      nimFwDbgNullFrameBusyPsCheck, nimFwDbgNullFramePaySeen,
+      nimFwDbgNullFramePayHasPayload, nimFwDbgNullFramePayEmpty,
+      nimFwDbgNullFramePayNonEmpty, nimFwDbgNullFramePayAc,
+      nimFwDbgNullFramePayTrigger, nimFwDbgNullFramePayCurrent,
+      nimFwDbgNullFramePayPending, nimFwDbgNullFramePayThdStatus,
+      nimFwDbgNullFramePostponed, nimFwDbgNullFrameQueued,
+      nimFwDbgPostponedServiceCalls, nimFwDbgPostponedServiceSent,
+      nimFwDbgNullFrameTxIntSeen, nimFwDbgNullFrameTxIntFc,
+      nimFwDbgNullFrameTxIntBuf, nimFwDbgNullFrameFakeSeen,
+      nimFwDbgNullFrameFakeQidx, nimFwDbgNullFrameFakeHeadBefore,
+      nimFwDbgNullFrameFakeTailBefore, nimFwDbgNullFrameFakeHeadAfter,
+      nimFwDbgNullFrameFakeTailAfter, nimFwDbgNullFrameFakeLink,
+      nimFwDbgPostponedRelease, nimFwDbgPostponedReleaseCb,
+      nimFwDbgPostponedReleaseDesc, nimFwDbgPostponedReleaseFc,
+      nimFwDbgPostponedReleaseFlags,
+      nimFwDbgPostponedReconcile, nimFwDbgPostponedReconcileOld,
+      nimFwDbgPostponedReconcileNew,
+      nimFwDbgAutoNullSkipped, nimFwDbgTxStalledInternalRecover,
+      nimFwDbgTxRecoverAc, nimFwDbgTxRecoverPending,
+      nimFwDbgTxRecoverCurrentBefore, nimFwDbgTxRecoverCurrentAfter,
+      nimFwDbgTxRecoverBackupBefore, nimFwDbgTxRecoverBackupAfterFake,
+      nimFwDbgTxRecoverBackupAfterPay, nimFwDbgTxRecoverDescBuf,
+      nimFwDbgTxRecoverDescCb,
+      nimFwStaTxChannelPrepareEnabled,
+      nimFwBleWifiRoleWindowEnabled, nimFwBleWifiRoleWindowActive,
+      nimFwDbgBleWifiRoleEnter, nimFwDbgBleWifiRoleLeave,
+      nimFwDbgBleWifiRoleLastCtrl, nimFwDbgBleWifiRoleLastCtrl2,
+      nimFwDbgBleWifiRoleLastMirror,
+      nimFwDbgBleWifiTxPreBcn, nimFwDbgBleWifiTxPrePti,
+      nimFwDbgBleWifiTxPreStat, nimFwDbgBleWifiTxTrigStat,
+      nimFwDbgBleWifiTxTrigAgg, nimFwDbgBleWifiTxCfmBcn,
+      nimFwDbgBleWifiTxCfmPti, nimFwDbgStaTxRfFullRestore,
+      nimFwKeepaliveInFlight, nimFwKeepaliveTargetCfm,
+      nimFwDbgKeepaliveRc,
+      nimFwDbgKeepalivePostBefore, nimFwDbgKeepalivePostAfter,
+      nimFwDbgKeepaliveTxintBefore, nimFwDbgKeepaliveTxintAfter,
+      nimFwDbgKeepaliveFakeBefore, nimFwDbgKeepaliveFakeAfter,
+      nimFwDbgKeepalivePayBefore, nimFwDbgKeepalivePayAfter,
+      nimFwDbgKeepaliveCbBefore, nimFwDbgKeepaliveCbAfter,
+      nimFwDbgTxIntEnter,
+      nimFwDbgTxIntLastCb, nimFwDbgTxIntLastFc: uint32
     nimFwDbgStaTbttEnter, nimFwDbgStaTbttAssoc,
       nimFwDbgStaTbttOnChan, nimFwDbgStaTbttPC100,
       nimFwDbgStaTbttPCMax, nimFwDbgStaTbttSkip,
@@ -4578,7 +4751,10 @@ else:
     nimFwDbgWpaRsnIeSet, nimFwDbgWpaRsnIeLen,
       nimFwDbgWpaRsnIePtr: uint32
     nimFwDbgVifSecType, nimFwDbgConnectIndPrePath,
-      nimFwDbgVifIeLenAtAssoc, nimFwDbgPtkInitDone: uint32
+      nimFwDbgVifIeLenAtAssoc, nimFwDbgPtkInitDone,
+      nimFwDbgKeyDataDecryptCalls, nimFwDbgKeyDataDecryptLen,
+      nimFwDbgKeyDataDecryptOutLen, nimFwDbgKeyDataDecryptOk,
+      nimFwDbgKeyDataDecryptFail: uint32
     nimFwWpaPendingMask: uint32
     nimFwDbgEapolIn, nimFwDbgEapolDropped,
       nimFwDbgEapolForwarded, nimFwDbgVifWpaState,
@@ -4704,6 +4880,8 @@ template me_build_associate_req*(frame: pointer): uint32 =
 proc me_build_add_ba_req*(buf: pointer, param: pointer): uint32 {.exportc, cdecl.}
 proc txl_frame_push*(param: pointer, ac: uint8): uint8 {.exportc, cdecl, noinline, discardable.}
 proc txl_frame_get*(length: uint32): pointer {.exportc, cdecl.}
+proc txl_tx_desc_pointer_plausible(p: pointer): bool
+proc txl_frame_rebuild_free_list(): uint32
 proc txl_get_seq_ctrl*(): uint16 {.exportc, cdecl.}
 proc tpc_update_frame_tx_power*(env: pointer, frameDesc: pointer) {.exportc, cdecl.}
 proc txu_cntrl_protect_mgmt_frame*(param: pointer, hdrPtr: pointer, extraLen: uint32) {.exportc, cdecl.}
@@ -4821,6 +4999,8 @@ proc mm_rx_filter_set*() {.exportc, cdecl.}
 proc apm_tx_int_ps_check*(txDesc: pointer): bool {.exportc, cdecl.}
 proc apm_tx_int_ps_get_postpone*(vifEntry: pointer, staEntry: pointer, postponeFlag: ptr uint32): pointer {.exportc, cdecl.}
 proc txl_frame_send_null_frame*(staIdx: uint8, cfmCallback: pointer, cfmArg: uint32): uint8 {.exportc, cdecl, discardable.}
+proc txl_frame_send_qosnull_frame*(staIdx: uint8, qosCtrl: uint16,
+  cfmCallback: pointer, cfmArg: uint32): uint8 {.exportc, cdecl, discardable.}
 proc txl_frame_release*(param: pointer) {.exportc, cdecl.}
 proc txl_int_fake_transfer*(txDesc: pointer, queueIdx: uint32) {.exportc, cdecl.}
 proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.}
@@ -4928,6 +5108,7 @@ proc phy_get_version*(versionOut: pointer, buf: pointer) {.importc, cdecl.}
   ## at versionOut, reads scratch buf. Called by mm_version_req_handler.
 proc wifi_hosal_rf_turn_on*() {.importc, cdecl.}
 proc rf_init*(xtalfreqHz: uint32) {.importc, cdecl.}
+proc rfc_init*(xtalfreqHz: uint32, fullInit: uint32) {.importc, cdecl.}
 proc mpif_clk_init*() {.importc, cdecl.}
 proc tpc_update_tx_power*(vifIdx: uint8) {.exportc, cdecl.}
 proc bl_tpc_power_table_get*(powerTable: ptr array[38, int8]) {.exportc, cdecl.}
@@ -5581,6 +5762,25 @@ proc ke_msg_alloc*(id: uint16, destId: uint8, srcId: uint8, paramLen: uint32): p
   discard c_memset(payload, 0, paramLen.csize_t)
   return payload
 
+proc ke_msg_try_alloc(id: uint16, destId: uint8, srcId: uint8,
+                      paramLen: uint32): pointer =
+  ## Allocate a kernel message for optional caches. Unlike ke_msg_alloc this
+  ## returns nil on heap pressure instead of asserting.
+  let allocFn = cast[proc(sz: uint32): pointer {.cdecl.}](
+    blOpsFunc(0xB8))
+  let totalSize = paramLen + KeMsgHdrSize.uint32
+  let hdr = cast[ptr KeMsgHdr](allocFn(totalSize))
+  if hdr == nil:
+    return nil
+  hdr.id = id
+  hdr.destId = destId
+  hdr.srcId = srcId
+  hdr.paramLen = paramLen
+  hdr.next = nil
+  let payload = keMsgPayload(hdr)
+  discard c_memset(payload, 0, paramLen.csize_t)
+  return payload
+
 proc ke_msg_send*(param: pointer) {.exportc, cdecl, noinline.} =
   ## Send a kernel message (param points to payload, header is immediately before it).
   ## From blob: asserts destId <= TASK_MAX, routes local tasks to sent queue
@@ -5642,6 +5842,10 @@ proc ke_msg_free*(param: pointer) {.exportc, cdecl.} =
   ## — param is already the HEADER pointer (callers subtract 12 before
   ## calling).
   platformFree(param)
+
+proc ke_msg_free_payload(param: pointer) {.inline.} =
+  if param != nil:
+    ke_msg_free(cast[pointer](keMsgHdrFromPayload(param)))
 
 proc ke_msg_discard*(param: pointer): cint {.exportc, cdecl.} =
   ## Message handler: discard (consume and free). Returns 0 = consumed.
@@ -8066,7 +8270,15 @@ proc mm_sta_tbtt*(vifIdx: uint8) {.exportc, cdecl.} =
     inc nimFwDbgStaTbttPC100
     # Send null frame with probe callback
     let staIdxForNull = vifView.staIdx
-    discard txl_frame_send_null_frame(staIdxForNull, cast[pointer](mm_ap_probe_cfm), cast[uint32](vif))
+    let probeRc = txl_frame_send_null_frame(
+      staIdxForNull, cast[pointer](mm_ap_probe_cfm), cast[uint32](vif))
+    if probeRc == 0'u8:
+      # The TX confirmation callback owns the next liveness decision.
+      vifView.probeCount = 0
+    else:
+      # Descriptor pressure is transient; back off instead of retrying on
+      # every TBTT and starving foreground WiFi/BLE coexistence traffic.
+      vifView.probeCount = 50
   elif probeCount > 49:
     # Send PM post event (blob: wifi_hosal_pm_post_event tail-call)
     wifi_hosal_pm_post_event(3, 0, nil)
@@ -9971,7 +10183,10 @@ proc chan_pre_switch_channel*(ctxt: pointer) {.exportc, cdecl.} =
           if vif.vifType == 0:
             let vifAssoc = vif.state
             if vifAssoc != 0:
-              discard txl_frame_send_null_frame(vif.staIdx, nil, 0)
+              if co_list_cnt(addr txFrameEnv().freeList) > 1'u32:
+                discard txl_frame_send_null_frame(vif.staIdx, nil, 0)
+              else:
+                inc nimFwDbgAutoNullSkipped
         vif2 = vif.next
 
     # Blob .L222/.L227: walk active VIFs again, mark TD state, release any
@@ -11585,11 +11800,11 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
       return
   else:
     if entry.rawMsgPtr != nil:
-      ke_msg_free(entry.rawMsgPtr)
+      ke_msg_free_payload(entry.rawMsgPtr)
       entry.rawMsgPtr = nil
 
   let rawLen = totalLen.uint32 + 32
-  let msg = ke_msg_alloc(0x1C00'u16, 2, 2, rawLen)
+  let msg = ke_msg_try_alloc(0x1C00'u16, 2, 2, rawLen)
   entry.rawMsgPtr = msg
   if bfOn != 0:
     scanu_env.pendingRawMsg = msg
@@ -11778,8 +11993,68 @@ proc scanu_cached_scanresult_clear*() {.exportc, cdecl.} =
     e.valid = 0
     e.rssi = -128'i8
     if e.rawMsgPtr != nil:
-      ke_msg_free(e.rawMsgPtr)
+      ke_msg_free_payload(e.rawMsgPtr)
       e.rawMsgPtr = nil
+
+proc scanu_prune_scanresult_raw_frames() =
+  ## Release raw scan frames that are no longer needed after target selection.
+  ## The fixed ScanuResultEntry records are retained so the join path can still
+  ## use the selected BSS/channel result; dropping raw frame copies lowers peak
+  ## heap use before the large SM_CONNECT_IND allocation.
+  for i in 0 ..< SCANU_MAX_RESULT_ENTRIES:
+    let e = addr scanu_env.entries[i]
+    if e.rawMsgPtr != nil:
+      ke_msg_free_payload(e.rawMsgPtr)
+      e.rawMsgPtr = nil
+
+proc wifi_nimfw_release_scan_raw_cache*() {.exportc, cdecl.} =
+  ## Release bulky cached raw scan frames while retaining structured scan
+  ## result entries. Call before connect request allocation when a previous
+  ## foreground scan may have filled the cache.
+  scanu_prune_scanresult_raw_frames()
+
+proc wifi_nimfw_prune_scan_raw_cache_for_ssid*(ssid: cstring,
+                                               ssidLen: uint32)
+    {.exportc, cdecl.} =
+  ## Keep only the strongest cached raw scan frame for the target SSID.
+  ## The connect selector still needs one raw frame to parse SSID/security IEs,
+  ## but retaining every beacon/probe-response copy can exhaust the small WiFi
+  ## message heap before the connect request is allocated.
+  if ssid == nil or ssidLen == 0'u32 or ssidLen > 32'u32:
+    return
+
+  var bestEntry: ptr ScanuResultEntry = nil
+  var bestRssi: int8 = -128
+  for i in 0 ..< SCANU_MAX_RESULT_ENTRIES:
+    let entry = addr scanu_env.entries[i]
+    if entry.valid == 0 or entry.rawMsgPtr == nil:
+      continue
+    let rawRx = rxuMgtIndAt(entry.rawMsgPtr)
+    let totalLen = rawRx.frameLen
+    let ieLen = if totalLen > 36'u16: totalLen.uint32 - 36'u32 else: 0'u32
+    let ieStart = rxuMgtIndIeStart(entry.rawMsgPtr)
+    let ssidIe = mac_ie_find(ieStart, ieLen, IE_ID_SSID)
+    if ssidIe == nil:
+      continue
+    let entrySsid = ssidIeAt(ssidIe)
+    if entrySsid.ie.len.uint32 != ssidLen:
+      continue
+    if c_memcmp(cast[pointer](ssid), addr entrySsid.data[0],
+                ssidLen.csize_t) != 0:
+      continue
+    if bestEntry == nil or entry.rssi > bestRssi:
+      bestEntry = entry
+      bestRssi = entry.rssi
+
+  if bestEntry == nil:
+    scanu_prune_scanresult_raw_frames()
+    return
+
+  for i in 0 ..< SCANU_MAX_RESULT_ENTRIES:
+    let entry = addr scanu_env.entries[i]
+    if entry != bestEntry and entry.rawMsgPtr != nil:
+      ke_msg_free_payload(entry.rawMsgPtr)
+      entry.rawMsgPtr = nil
 
 proc scanu_dump_scanresult*() {.exportc, cdecl.} =
   ## Dump scan results for debugging.
@@ -19221,6 +19496,7 @@ proc txl_cntrl_push_int*(param: pointer, ac: uint8): uint8 {.exportc, cdecl.} =
   ##   txl_int_fake_transfer, co_list_push_back(x2), txl_payload_handle_backup,
   ##   txl_frame_release, apm_tx_int_ps_postpone.
   let desc = hostTxDescAt(param)
+  inc nimFwDbgTxIntEnter
   let rcStatsPtr = desc.hwDesc
   let txCtrl = txControlEnv()
   let staTabBase = cast[uint](addr sta_info_tab[0])
@@ -19228,6 +19504,25 @@ proc txl_cntrl_push_int*(param: pointer, ac: uint8): uint8 {.exportc, cdecl.} =
   let fcTrace =
     if linkPtrTrace != nil: hostTxLinkDescAt(linkPtrTrace).macHeader[0]
     else: 0'u8
+  nimFwDbgTxIntLastCb = cast[uint32](cast[uint](desc.callback))
+  if linkPtrTrace != nil:
+    let linkTrace = hostTxLinkDescAt(linkPtrTrace)
+    nimFwDbgTxIntLastFc =
+      linkTrace.macHeader[0].uint32 or (linkTrace.macHeader[1].uint32 shl 8)
+  let isNullDataFrame =
+    linkPtrTrace != nil and hostTxLinkDescAt(linkPtrTrace).macHeader[0] == 0x48'u8 and
+      hostTxLinkDescAt(linkPtrTrace).macHeader[1] == 0x01'u8
+  let isTrackedByCallback =
+    desc.callback != nil and
+    cast[uint32](cast[uint](desc.callback)) == nimFwDbgNullFrameCbSetPtr
+  let isTrackedNullFrame = isNullDataFrame or isTrackedByCallback
+  if isTrackedNullFrame:
+    inc nimFwDbgNullFrameTxIntSeen
+    nimFwDbgNullFrameTxIntBuf = pointerAddrU32(linkPtrTrace)
+    if linkPtrTrace != nil:
+      let link = hostTxLinkDescAt(linkPtrTrace)
+      nimFwDbgNullFrameTxIntFc =
+        link.macHeader[0].uint32 or (link.macHeader[1].uint32 shl 8)
   let traceMgmt = linkPtrTrace != nil and nimFwMgmtFcTrace(fcTrace)
 
   # Step 1: Check TX readiness (blob computes VIF from desc[47], then calls txl_cntrl_tx_check)
@@ -19318,6 +19613,8 @@ proc txl_cntrl_push_int*(param: pointer, ac: uint8): uint8 {.exportc, cdecl.} =
           nimFwConnectTrace2U32("[WIFI-CT] txint_push ",
                                 txCtrl.packetCounter,
                                 cast[uint32](cast[uint](desc.hwDesc)))
+      if isTrackedNullFrame:
+        inc nimFwDbgNullFrameQueued
       return 1'u8
 
   # Not-ready path (L103): check STA for off-channel deferral
@@ -19337,6 +19634,8 @@ proc txl_cntrl_push_int*(param: pointer, ac: uint8): uint8 {.exportc, cdecl.} =
 
   # STA exists: defer TX to off-channel path
   desc.postponeFlag = 1
+  if isTrackedNullFrame:
+    inc nimFwDbgNullFramePostponed
   desc.staIdx = ac
   let staEntry = staTabBase + staInstNbr.uint * STA_ENTRY_SIZE.uint
   let sta = staInfoAt(staEntry)
@@ -19748,6 +20047,13 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
       let actualU = cast[uint](actualDesc)
       let actual = hostTxDescAt(actualDesc)
       let fcTrace = backupDesc.macHeader[0]
+      let isNullDataFrame =
+        backupDesc.macHeader[0] == 0x48'u8 and backupDesc.macHeader[1] == 0x01'u8
+      let isTrackedByCallback =
+        actualDesc != nil and actual.callback != nil and
+        cast[uint32](cast[uint](actual.callback)) == nimFwDbgNullFrameCbSetPtr
+      let isTrackedNullFrame =
+        isNullDataFrame or isTrackedByCallback
       let traceMgmt = nimFwMgmtFcTrace(fcTrace)
       let protoTrace =
         if actualDesc != nil: actual.frameLen
@@ -19756,6 +20062,15 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
 
       # Gate: only do beacon/machdr/tkip/thd patching if actualDesc[8] != nil
       let hasPayload = actual.queueFirst
+      if isTrackedNullFrame:
+        inc nimFwDbgNullFramePaySeen
+        nimFwDbgNullFramePayAc = ac
+        nimFwDbgNullFramePayCurrent = pointerAddrU32(acCtrl.current)
+        nimFwDbgNullFramePayPending = pointerAddrU32(cast[pointer](acCtrl.pending.first))
+        nimFwDbgNullFramePayThdStatus =
+          hostTxHwDescAt(actual.hwDesc).confirmStatus
+        if hasPayload != nil:
+          inc nimFwDbgNullFramePayHasPayload
       if traceMgmt:
         nimFwTrace2U32("[WIFI-NIMFW] pay_enter ",
                        ac or ((if hasPayload != nil: 1'u32 else: 0'u32) shl 8),
@@ -19976,6 +20291,8 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
               nimFwDbgEapolTraceCount = nimFwDbgEapolTraceCount + 1
       if listFirst == nil:
         inc nimFwDbgPayEmptyList
+        if isTrackedNullFrame:
+          inc nimFwDbgNullFramePayEmpty
         # Empty list path (.L64): read ipc_shared_env TX timer base from 0x24B00120,
         # check DMA status, program link register, call blmac_abs_timer_set, set AGG bits.
         # Timer constants: s6=200000, s7=50000, s8=2000000, AC2=400000.
@@ -20037,6 +20354,8 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
             discard
           regWrite(HW_TRIGGER_REG, trigBits)
           nimFwDbgPayTriggerLast = trigBits or (ac shl 16) or 0x80000000'u32
+          if isTrackedNullFrame:
+            nimFwDbgNullFramePayTrigger = nimFwDbgPayTriggerLast
           blmac_abs_timer_set(ac, timerVal)
           # Set HW aggregation bits
           regWrite(HW_AGG_SET_REG, acBit)
@@ -20053,6 +20372,8 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
                                       regRead(0x24B0808C'u))
       else:
         inc nimFwDbgPayNonEmpty
+        if isTrackedNullFrame:
+          inc nimFwDbgNullFramePayNonEmpty
         # Non-empty list: link into existing chain and write trigger
         cast[ptr pointer](cast[uint](listFirst) + 4)[] = thdLink
         var triggerVal: uint32
@@ -20064,6 +20385,8 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
         else: triggerVal = 2    # AC0
         regWrite(HW_TRIGGER_REG, triggerVal)
         nimFwDbgPayTriggerLast = triggerVal or (ac shl 16) or 0x40000000'u32
+        if isTrackedNullFrame:
+          nimFwDbgNullFramePayTrigger = nimFwDbgPayTriggerLast
         if traceMgmt or traceEapol:
           nimFwTrace2U32("[WIFI-NIMFW] pay_regs ",
                          regRead(0x24B08078'u),
@@ -20079,8 +20402,6 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
 
       # Advance to next descriptor in backup chain (.L70 re-reads backup head)
       descPtr = backupHead[]
-      if descPtr != nil:
-        backupHead[] = hostTxBufferedLinkAt(descPtr).next
 
 proc txl_transmit_trigger*() {.exportc, cdecl.} =
   ## Trigger TX DMA transmission for the highest-priority ready AC.
@@ -20102,22 +20423,37 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
     IPC_SHARED_TX_BASE  = 0x24B00120'u
     TX_TIMEOUT_LOCAL    = [200000'u32, 2000000'u32, 400000'u32, 200000'u32, 50000'u32]
 
-  # Check MAC HW TX status - bits [10:6] indicate AC readiness
+  # Check MAC HW TX status. The reference path uses bits [10:6], but BL808
+  # also reports active TX queues in the halt/status field used by
+  # txl_cntrl_halt_ac: AC0..AC3 at bits [16..19], beacon at bit 15.
   let txStatus = regRead(MACHW_TX_STATUS_REG)
   let acReady = txStatus and 0x7C0'u32  # bits [10:6]
+  let acReadyHigh = txStatus and 0x000F8000'u32
   nimFwDbgTxTrigAcReady = txStatus
-  if acReady == 0:
+  if acReady == 0 and acReadyHigh == 0:
     inc nimFwDbgTxTrigZeroExit
     return  # No ACs ready for transmission
 
-  # Compute highest-priority AC from CLZ: s0 = 25 - CLZ(acReady)
-  var clzResult: cint
-  {.emit: [clzResult, " = __builtin_clz((unsigned int)", acReady, ");"].}
-  # Blob keeps an assert_err for `ac > 4`. Under upstream GCC -Os the
-  # compiler knows `acReady` has bits only in [10:6] so `ac` is always
-  # ≤4 and elides the check. Use a volatile to defeat the range analysis.
-  var acV {.volatile.}: uint32 = 25'u32 - clzResult.uint32
-  let ac = acV
+  var ac: uint32
+  if acReady != 0:
+    # Compute highest-priority AC from CLZ: s0 = 25 - CLZ(acReady)
+    var clzResult: cint
+    {.emit: [clzResult, " = __builtin_clz((unsigned int)", acReady, ");"].}
+    # Blob keeps an assert_err for `ac > 4`. Under upstream GCC -Os the
+    # compiler knows `acReady` has bits only in [10:6] so `ac` is always
+    # ≤4 and elides the check. Use a volatile to defeat the range analysis.
+    var acV {.volatile.}: uint32 = 25'u32 - clzResult.uint32
+    ac = acV
+  elif (acReadyHigh and 0x00008000'u32) != 0:
+    ac = 4'u32
+  elif (acReadyHigh and 0x00080000'u32) != 0:
+    ac = 3'u32
+  elif (acReadyHigh and 0x00040000'u32) != 0:
+    ac = 2'u32
+  elif (acReadyHigh and 0x00020000'u32) != 0:
+    ac = 1'u32
+  else:
+    ac = 0'u32
   if ac > 4:
     assert_err("txl_cntrl.c", "txl_cntrl.c", 0x86C)
 
@@ -20140,6 +20476,16 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
       acCtrl.current = nil
       regWrite(MACHW_TX_TRIG_STAT, intcStat and clearMask)
       return
+    if not txl_tx_desc_pointer_plausible(descPtr):
+      inc nimFwDbgTxPendingInvalid
+      nimFwDbgTxPendingInvalidPtr = pointerAddrU32(descPtr)
+      acCtrl.pending.first = nil
+      acCtrl.pending.last = nil
+      acCtrl.current = nil
+      let intcStat = regRead(MACHW_TX_TRIG_STAT)
+      regWrite(MACHW_TX_TRIG_STAT, intcStat and clearMask)
+      discard txl_frame_rebuild_free_list()
+      return
 
     # Read THD from descriptor at offset 112
     let desc = hostTxDescAt(descPtr)
@@ -20147,6 +20493,7 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
     let linkPtrTrace = desc.bufDesc
     let linkUTrace = cast[uint](linkPtrTrace)
     let fcTrace = if linkPtrTrace != nil: cast[ptr uint8](linkUTrace + 348)[] else: 0'u8
+    let fcTrace1 = if linkPtrTrace != nil: cast[ptr uint8](linkUTrace + 349)[] else: 0'u8
     let traceMgmt = linkPtrTrace != nil and nimFwMgmtFcTrace(fcTrace)
     let protoTrace = desc.frameLen
     let traceEapol = protoTrace == 0x8E88'u16 or protoTrace == 0x888E'u16
@@ -20205,8 +20552,26 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
     # .L134: Pop descriptor from list and process confirmation
     discard co_list_pop_front(addr acCtrl.pending)
 
-    let hostCfm = desc.queueFirst
+    let hostCfm = if desc.usedFlag != 0: desc.queueFirst else: nil
     when defined(bl808WifiNimFw):
+      let isNullDataFrame = fcTrace == 0x48'u8 and fcTrace1 == 0x01'u8
+      let isTrackedByCallback =
+        desc.callback != nil and
+        cast[uint32](cast[uint](desc.callback)) == nimFwDbgNullFrameCbSetPtr
+      let isTrackedNullFrame =
+        isNullDataFrame or isTrackedByCallback
+      if isTrackedNullFrame:
+        inc nimFwDbgNullFrameTxTrigSeen
+        nimFwDbgNullFrameTxTrigUsedFlag = desc.usedFlag.uint32
+        if hostCfm == nil:
+          inc nimFwDbgNullFrameTxTrigInternal
+        else:
+          inc nimFwDbgNullFrameTxTrigHost
+      nimFwDbgTxRouteUsedFlag = desc.usedFlag.uint32
+      if hostCfm == nil:
+        inc nimFwDbgTxRouteInternal
+      else:
+        inc nimFwDbgTxRouteHost
       let fenvPtrTrace = desc.hwDesc
       var cfmHeadTrace = 0'u32
       if fenvPtrTrace != nil:
@@ -20380,11 +20745,143 @@ proc txl_hwdesc_reset*() {.exportc, cdecl, noinline.} =
   ## txl_reset; without the barrier GCC elides empty-body calls.
   {.emit: ["asm volatile(\"\" ::: \"memory\");"].}
 
+const
+  TxlFrameDescCount = 4'u32
+  TxlFrameDescSize = 220'u
+  TxlFrameLinkCount = 4'u32
+  TxlFrameLinkSize = 860'u
+  InvalidFrameDescIndex = 0xFFFF_FFFF'u32
+
+proc txl_frame_desc_index(p: pointer): uint32 {.inline.} =
+  if p == nil:
+    return InvalidFrameDescIndex
+  let base = cast[uint](addr txl_frame_desc_storage[0])
+  let raw = cast[uint](p)
+  let total = TxlFrameDescCount.uint * TxlFrameDescSize
+  if raw < base or raw >= base + total:
+    return InvalidFrameDescIndex
+  let delta = raw - base
+  if (delta mod TxlFrameDescSize) != 0'u:
+    return InvalidFrameDescIndex
+  uint32(delta div TxlFrameDescSize)
+
+proc txl_frame_desc_valid(p: pointer): bool {.inline.} =
+  txl_frame_desc_index(p) != InvalidFrameDescIndex
+
+proc txl_tx_desc_pointer_plausible(p: pointer): bool =
+  if p == nil:
+    return false
+  let raw = cast[uint32](cast[uint](p))
+  raw >= 0x2200_0000'u32 and raw < 0x2210_0000'u32
+
+proc txl_frame_link_valid(p: pointer): bool {.inline.} =
+  if p == nil:
+    return false
+  let base = cast[uint](addr txl_frame_pool[0])
+  let raw = cast[uint](p)
+  let total = TxlFrameLinkCount.uint * TxlFrameLinkSize
+  if raw < base or raw >= base + total:
+    return false
+  ((raw - base) mod TxlFrameLinkSize) == 0'u
+
+proc txl_frame_list_contains(list: ptr CoList, needle: pointer): bool =
+  var node = cast[pointer](list.first)
+  var guard = 0'u32
+  while node != nil and guard < 16'u32:
+    if not txl_tx_desc_pointer_plausible(node):
+      inc nimFwDbgFrameGetInvalid
+      nimFwDbgFrameGetInvalidNext = pointerAddrU32(node)
+      return false
+    if node == needle:
+      return true
+    node = cast[pointer](cast[ptr CoListHdr](node).next)
+    inc guard
+  false
+
+proc txl_frame_link_list_contains_desc(head: pointer, needle: pointer): bool =
+  var linkPtr = head
+  var guard = 0'u32
+  while linkPtr != nil and guard < TxlFrameLinkCount:
+    if not txl_frame_link_valid(linkPtr):
+      return false
+    let link = hostTxBufferedLinkAt(linkPtr)
+    if link.txDesc == needle:
+      return true
+    linkPtr = link.next
+    inc guard
+  false
+
+proc txl_frame_desc_active(p: pointer): bool =
+  let frameEnv = txFrameEnv()
+  if txl_frame_list_contains(addr frameEnv.usedList, p):
+    return true
+  for ac in 0'u32 ..< 4'u32:
+    let acCtrl = txControlAc(ac)
+    if acCtrl.current == p:
+      return true
+    if txl_frame_list_contains(addr acCtrl.pending, p):
+      return true
+    if txl_frame_link_list_contains_desc(txBackupQueueHeadPtr(ac)[], p):
+      return true
+  let staBase = cast[uint](addr sta_info_tab[0])
+  for i in 0 ..< STA_INFO_TAB_ENTRIES:
+    let sta = staInfoAt(staBase + i.uint * STA_ENTRY_SIZE.uint)
+    if txl_frame_list_contains(addr sta.postponedList, p):
+      return true
+  false
+
+proc txl_frame_rebuild_free_list(): uint32 =
+  let frameEnv = txFrameEnv()
+  let saved = irqSave()
+  frameEnv.freeList.first = nil
+  frameEnv.freeList.last = nil
+  let base = cast[uint](addr txl_frame_desc_storage[0])
+  for i in 0'u32 ..< TxlFrameDescCount:
+    let descPtr = cast[pointer](base + i.uint * TxlFrameDescSize)
+    if not txl_frame_desc_active(descPtr):
+      co_list_push_back(addr frameEnv.freeList, cast[ptr CoListHdr](descPtr))
+      inc result
+  irqRestore(saved)
+  inc nimFwDbgFrameFreeRebuild
+  nimFwDbgFrameFreeReclaimed = result
+
+proc txl_frame_free_list_pop(freeList: ptr CoList): ptr CoListHdr =
+  let firstPtr = cast[pointer](freeList.first)
+  if firstPtr == nil:
+    return nil
+  if not txl_frame_desc_valid(firstPtr):
+    inc nimFwDbgFrameGetInvalid
+    nimFwDbgFrameGetInvalidPtr = pointerAddrU32(firstPtr)
+    freeList.first = nil
+    freeList.last = nil
+    if txl_frame_rebuild_free_list() == 0:
+      return nil
+  let node = freeList.first
+  let next = cast[pointer](node.next)
+  if next != nil and not txl_frame_desc_valid(next):
+    inc nimFwDbgFrameGetInvalid
+    nimFwDbgFrameGetInvalidNext = pointerAddrU32(next)
+    freeList.first = nil
+    freeList.last = nil
+  else:
+    freeList.first = node.next
+    if freeList.first == nil:
+      freeList.last = nil
+  node.next = nil
+  node
+
+proc txl_frame_free_list_push(param: pointer) =
+  if not txl_frame_desc_valid(param):
+    inc nimFwDbgFrameFreePushInvalid
+    nimFwDbgFrameGetInvalidPtr = pointerAddrU32(param)
+    return
+  co_list_push_back(addr txFrameEnv().freeList, cast[ptr CoListHdr](param))
+
 # TX Frame management
 proc txl_frame_init*() {.exportc, cdecl.} =
   ## Initialize TX frame pool (111 instrs in blob).
   ## Blob calls: co_list_init (x2), memset, co_list_push_back, phy_get_ntx (x2).
-  ## Inits free/used lists, loops 5 descs pushing each onto free list,
+  ## Inits free/used lists, loops over the private descriptors pushing each onto free list,
   ## then inits ACK descriptor with PHY params and clears buffer control globals.
   let frameEnv = txFrameEnv()
   # 1. co_list_init on free list (txl_frame_env+0) and used list (txl_frame_env+8)
@@ -20401,9 +20898,9 @@ proc txl_frame_init*() {.exportc, cdecl.} =
   let hwPoolBase = cast[uint](addr txl_frame_hwdesc_pool[0])
   let hwCfmBase = cast[uint](addr txl_frame_hwdesc_cfms[0])
   let payloadPoolBase = cast[uint](addr txl_frame_buf_ctrl[0])
-  for i in 0 ..< 4:
+  for i in 0'u32 ..< TxlFrameDescCount:
     let descSize = 220'u32  # 0xDC
-    let descBase = descArrayBase + i.uint * descSize
+    let descBase = descArrayBase + i.uint * descSize.uint
     let frameDesc = hostTxDescAt(cast[pointer](descBase))
     let linkDesc = linkPoolBase + i.uint * 860'u
     let hwDesc = hwPoolBase + i.uint * 72'u
@@ -20430,7 +20927,7 @@ proc txl_frame_init*() {.exportc, cdecl.} =
       hw.word52 = 0
       payload.magic = 0xBADCAB1E'u32
       # CRITICAL: push descriptor onto free list (blob: co_list_push_back at 0xD8)
-      co_list_push_back(addr frameEnv.freeList, cast[ptr CoListHdr](descBase))
+      txl_frame_free_list_push(cast[pointer](descBase))
 
   # 3. Post-loop: init txl_buffer_control_24G globals
   let bufCtrl = txBufferControl24G()
@@ -20504,7 +21001,7 @@ proc txl_frame_get*(length: uint32): pointer {.exportc, cdecl.} =
 
   while true:
     # Pop from free list
-    let freeNode = co_list_pop_front(freeList)
+    let freeNode = txl_frame_free_list_pop(freeList)
     if freeNode == nil:
       # Log: "[FW] NULL frame for tx %p, len %d, ra=0x%x"
       if logFn != nil:
@@ -20546,10 +21043,9 @@ proc txl_frame_get*(length: uint32): pointer {.exportc, cdecl.} =
     # then reads macHdr=desc[108]=nil and writes the deauth at addr 0, while
     # txl_frame_push reads a stale hwDesc[20] and asserts on bit 0.
     if desc.bufDesc == nil:
-      let descArrayBase = cast[uint](addr txl_frame_desc_storage[0])
       let linkPoolBase = cast[uint](addr txl_frame_pool[0])
-      let idx = (descAddr - descArrayBase) div 220'u
-      if idx < 4'u:
+      let idx = txl_frame_desc_index(cast[pointer](freeNode))
+      if idx < TxlFrameDescCount:
         desc.bufDesc = cast[pointer](linkPoolBase + idx * 860'u)
     let linkDesc = hostTxLinkDescAt(desc.bufDesc)
 
@@ -20591,11 +21087,12 @@ proc txl_frame_get*(length: uint32): pointer {.exportc, cdecl.} =
     hwDesc.status = 0
     desc.callback = nil
     desc.callbackArg = nil
-    # CRITICAL: clear desc+8 (host-TX active flag set by ipc_emb_tx_evt). If a
-    # frame descriptor is recycled from a prior host data TX, desc+8 stays at 1,
-    # which routes the cfm to the upper-layer path (txu_cntrl_cfm) instead of
-    # txl_frame_cfm. Internal-frame callbacks at desc+208 (e.g. deauth's
-    # sm_disconnect_deauth_cfm) then never fire, hanging wifiDisconnect.
+    # CRITICAL: clear desc+216 (host-TX active flag set by ipc_emb_tx_evt). If a
+    # frame descriptor is recycled with desc+216 still at 1, confirmation routes
+    # to the upper-layer path instead of txl_frame_cfm. Internal-frame callbacks
+    # at desc+208 then never fire.
+    nimFwDbgFrameGetUsedBefore = desc.usedFlag.uint32
+    desc.usedFlag = 0
     desc.queueFirst = nil
     inc nimFwDbgFrameGet
     return cast[pointer](freeNode)
@@ -20607,6 +21104,7 @@ proc txl_frame_push*(param: pointer, ac: uint8): uint8 {.exportc, cdecl, noinlin
   ## clears hwDesc[8,12,64], conditionally sets hwDesc[56] based on THD type,
   ## then tail-calls txl_cntrl_push.
   let desc = hostTxDescAt(param)
+  inc nimFwDbgTxPushCalls
   let hwDesc = hostTxHwDescAt(desc.hwDesc)
   var thdField = hwDesc.payloadStart
   if desc.bufDesc != nil:
@@ -20693,8 +21191,12 @@ proc txl_frame_cfm*(param: pointer) {.exportc, cdecl.} =
                        hwDesc.confirmStatus,
                        hwDesc.status)
   let frameEnv = txFrameEnv()
-  co_list_push_back(addr frameEnv.usedList, cast[ptr CoListHdr](param))
-  ke_evt_set(0x00080000'u32)
+  if txl_frame_desc_valid(param):
+    co_list_push_back(addr frameEnv.usedList, cast[ptr CoListHdr](param))
+    ke_evt_set(0x00080000'u32)
+  else:
+    inc nimFwDbgFrameFreePushInvalid
+    nimFwDbgFrameGetInvalidPtr = pointerAddrU32(param)
 
 proc txl_frame_release*(param: pointer) {.exportc, cdecl.} =
   ## Release a TX frame descriptor. Blob (txl_frame_release, 0x44 bytes):
@@ -20710,7 +21212,7 @@ proc txl_frame_release*(param: pointer) {.exportc, cdecl.} =
   {.emit: ["asm volatile(\"mv %0, a1\" : \"=r\"(", doCallback, ") );"].}
   if desc.usedFlag == 0:
     # Internally allocated frame: return to the frame free list at txl_frame_env.
-    co_list_push_back(addr txFrameEnv().freeList, cast[ptr CoListHdr](param))
+    txl_frame_free_list_push(param)
   if doCallback != 0:
     let cbPtr = desc.callback
     if cbPtr != nil:
@@ -20756,6 +21258,17 @@ proc txl_frame_evt*() {.exportc, cdecl.} =
       break
     inc nimFwDbgFrameEvtPop
     let desc = hostTxDescAt(node)
+    when defined(bl808WifiNimFw):
+      let evtLinkDesc = desc.bufDesc
+      if evtLinkDesc != nil:
+        let evtLink = hostTxLinkDescAt(evtLinkDesc)
+        if evtLink.macHeader[0] == 0x48'u8 and evtLink.macHeader[1] == 0x01'u8:
+          inc nimFwDbgNullFrameEvtSeen
+          nimFwDbgNullFrameEvtDesc = pointerAddrU32(cast[pointer](node))
+          nimFwDbgNullFrameEvtCbPtr =
+            cast[uint32](cast[uint](desc.callback))
+          if desc.callback == nil:
+            inc nimFwDbgNullFrameEvtCbNil
     # Decrement pending frame counter at txl_cntrl_env[80].
     if txCtrl.packetCounter > 0:
       txCtrl.packetCounter = txCtrl.packetCounter - 1
@@ -20777,7 +21290,7 @@ proc txl_frame_evt*() {.exportc, cdecl.} =
     if desc.usedFlag == 0:
       inc nimFwDbgFrameEvtFreeRet
       # Return to internal free frame list.
-      co_list_push_back(addr frameEnv.freeList, cast[ptr CoListHdr](node))
+      txl_frame_free_list_push(cast[pointer](node))
     else:
       inc nimFwDbgFrameEvtUsedSkip
 
@@ -20819,31 +21332,395 @@ proc txl_frame_send_null_frame*(staIdx: uint8, cfmCallback: pointer, cfmArg: uin
   # Store callback info for confirmation
   desc.callback = cfmCallback
   desc.callbackArg = cast[pointer](cfmArg.uint)
+  nimFwDbgNullFrameDescLast = pointerAddrU32(frame)
+  nimFwDbgNullFrameBufLast = pointerAddrU32(desc.bufDesc)
+  nimFwDbgNullFrameFcLast =
+    hdr.frameControl.uint32 or (hdr.seqCtrl.uint32 shl 16)
+  nimFwDbgNullFrameVifSta =
+    staIdx.uint32 or (vifIdx.uint32 shl 8) or (vif.state.uint32 shl 16)
+  if cfmCallback != nil:
+    inc nimFwDbgNullFrameCbSet
+    nimFwDbgNullFrameCbSetPtr = cast[uint32](cast[uint](cfmCallback))
   # Store VIF and STA info in descriptor
   desc.staInfoIdx = staIdx
   desc.vifIdx = vifIdx
   # Push frame for transmission on AC 3 (VO)
-  return (txl_frame_push(frame, 3) xor 1'u8) and 0xFF'u8
+  let pushRc = txl_frame_push(frame, 3)
+  let publicRc = (pushRc xor 1'u8) and 0xFF'u8
+  nimFwDbgNullFramePushRc = pushRc.uint32
+  nimFwDbgNullFrameReturn = publicRc.uint32
+  nimFwDbgNullFrameBufLast = pointerAddrU32(desc.bufDesc)
+  if desc.bufDesc != nil:
+    let pushedHdr = hostTxDataHeader(desc)
+    nimFwDbgNullFrameFcLast =
+      pushedHdr.frameControl.uint32 or (pushedHdr.seqCtrl.uint32 shl 16)
+  return publicRc
 
-{.emit: "__attribute__((optimize(\"crossjumping\"))) void txl_frame_send_qosnull_frame(unsigned char,unsigned char,unsigned char);".}
-proc txl_frame_send_qosnull_frame*(vifIdx: uint8, staIdx: uint8, ac: uint8) {.exportc, cdecl.} =
+const WifiTxFrameSuccessfulBit = 1'u32 shl 23
+
+proc wifi_nimfw_coex_force_ble_role*() {.exportc, cdecl.}
+{.emit: """
+__attribute__((weak)) unsigned long nim_ble_coex_wifi_tx_window_enter(void) { return 1; }
+__attribute__((weak)) void nim_ble_coex_wifi_tx_window_leave(void) {}
+__attribute__((weak)) unsigned long nim_ble_coex_wifi_rf_reclaim_needed(void) { return 0; }
+""".}
+proc nim_ble_coex_wifi_tx_window_enter*(): uint32 {.importc, cdecl.}
+proc nim_ble_coex_wifi_tx_window_leave*() {.importc, cdecl.}
+proc nim_ble_coex_wifi_rf_reclaim_needed*(): uint32 {.importc, cdecl.}
+
+proc wifi_nimfw_null_frame_cfm(arg: pointer, status: uint32) {.cdecl.} =
+  discard arg
+  inc nimFwDbgNullFrameCfm
+  nimFwDbgNullFrameLastStatus = status
+  nimFwDbgBleWifiTxCfmBcn = regRead(0x24B00400'u)
+  nimFwDbgBleWifiTxCfmPti = regRead(0x24B00404'u)
+  if (status and WifiTxFrameSuccessfulBit) != 0'u32:
+    inc nimFwDbgNullFrameAckOk
+  else:
+    inc nimFwDbgNullFrameAckFail
+  if nimFwBleWifiRoleWindowActive != 0'u32:
+    wifi_nimfw_coex_force_ble_role()
+
+proc wifi_nimfw_send_checked_null_frame(staIdx: uint8): uint8 =
+  ## Send one STA null-data frame using the same descriptor construction path
+  ## as the firmware-facing txl_frame_send_null_frame entry point.  Keeping the
+  ## public keepalive API on that path avoids a second frame builder drifting
+  ## from the reference layout.
+  let beforePostponed = txFrameEnv().postponedCount
+  nimFwDbgKeepalivePostBefore = beforePostponed
+  nimFwDbgKeepaliveTxintBefore = nimFwDbgNullFrameTxIntSeen
+  nimFwDbgKeepaliveFakeBefore = nimFwDbgNullFrameFakeSeen
+  nimFwDbgKeepalivePayBefore = nimFwDbgNullFramePaySeen
+  nimFwDbgKeepaliveCbBefore = nimFwDbgNullFrameCbSet
+  let rc = txl_frame_send_null_frame(
+    staIdx, cast[pointer](wifi_nimfw_null_frame_cfm), 0)
+  let afterPostponed = txFrameEnv().postponedCount
+  nimFwDbgKeepaliveRc = rc.uint32
+  nimFwDbgKeepalivePostAfter = afterPostponed
+  nimFwDbgKeepaliveTxintAfter = nimFwDbgNullFrameTxIntSeen
+  nimFwDbgKeepaliveFakeAfter = nimFwDbgNullFrameFakeSeen
+  nimFwDbgKeepalivePayAfter = nimFwDbgNullFramePaySeen
+  nimFwDbgKeepaliveCbAfter = nimFwDbgNullFrameCbSet
+  if rc == 0'u8 and afterPostponed > beforePostponed:
+    return 2'u8
+  rc
+
+proc wifi_nimfw_send_checked_qosnull_frame(staIdx: uint8): uint8 =
+  ## Send one STA QoS-null frame through the reference firmware QoS-null
+  ## builder. This exercises the normal QoS management-frame descriptor layout
+  ## while preserving the same confirmation counters used by keepalive tests.
+  let beforePostponed = txFrameEnv().postponedCount
+  nimFwDbgKeepalivePostBefore = beforePostponed
+  nimFwDbgKeepaliveTxintBefore = nimFwDbgNullFrameTxIntSeen
+  nimFwDbgKeepaliveFakeBefore = nimFwDbgNullFrameFakeSeen
+  nimFwDbgKeepalivePayBefore = nimFwDbgNullFramePaySeen
+  nimFwDbgKeepaliveCbBefore = nimFwDbgNullFrameCbSet
+  let rc = txl_frame_send_qosnull_frame(
+    staIdx, 0'u16, cast[pointer](wifi_nimfw_null_frame_cfm), 0)
+  let afterPostponed = txFrameEnv().postponedCount
+  nimFwDbgKeepaliveRc = rc.uint32
+  nimFwDbgKeepalivePostAfter = afterPostponed
+  nimFwDbgKeepaliveTxintAfter = nimFwDbgNullFrameTxIntSeen
+  nimFwDbgKeepaliveFakeAfter = nimFwDbgNullFrameFakeSeen
+  nimFwDbgKeepalivePayAfter = nimFwDbgNullFramePaySeen
+  nimFwDbgKeepaliveCbAfter = nimFwDbgNullFrameCbSet
+  if rc == 0'u8 and afterPostponed > beforePostponed:
+    return 2'u8
+  rc
+
+proc wifi_nimfw_actual_postponed_count(): uint32 =
+  var total = 0'u32
+  let staBase = cast[uint](addr sta_info_tab[0])
+  for i in 0 ..< STA_INFO_TAB_ENTRIES:
+    let sta = staInfoAt(staBase + i.uint * STA_ENTRY_SIZE.uint)
+    total += co_list_cnt(addr sta.postponedList)
+  total
+
+proc wifi_nimfw_reconcile_postponed_count() =
+  let frameEnv = txFrameEnv()
+  let actual = wifi_nimfw_actual_postponed_count()
+  if frameEnv.postponedCount != actual:
+    inc nimFwDbgPostponedReconcile
+    nimFwDbgPostponedReconcileOld = frameEnv.postponedCount
+    nimFwDbgPostponedReconcileNew = actual
+    frameEnv.postponedCount = actual
+
+proc wifi_nimfw_service_sta_postponed*(limit: uint32): uint32 {.exportc, cdecl.} =
+  ## Bounded service hook for STA-mode frames deferred by txl_cntrl_push_int
+  ## while the channel scheduler was temporarily not admitting TX.
+  inc nimFwDbgPostponedServiceCalls
+  let maxFrames = if limit == 0'u32: 1'u32 else: limit
+  var sent = 0'u32
+  for i in 0'u8 ..< MAX_VIFS.uint8:
+    let vifEntry = cast[pointer](cast[uint](addr vif_info_tab[0]) +
+      i.uint * VIF_ENTRY_SIZE.uint)
+    let vif = vifChannelAt(vifEntry)
+    if vif.vifType == VIF_TYPE_STA and vif.state != 0'u8:
+      let staEntry = cast[pointer](cast[uint](addr sta_info_tab[0]) +
+        vif.staIdx.uint * STA_ENTRY_SIZE.uint)
+      if txl_cntrl_tx_check(vifEntry):
+        let remaining = maxFrames - sent
+        let n = sta_mgmt_send_postponed_frame(vifEntry, staEntry, remaining)
+        sent += n
+        nimFwDbgPostponedServiceSent += n
+        if sent >= maxFrames:
+          break
+  if sent == 0'u32:
+    wifi_nimfw_reconcile_postponed_count()
+  sent
+
+proc rfc_channel_ops*(channel: uint32) {.exportc, cdecl.}
+
+var
+  nimFwStaTxPreparedBand: uint8
+  nimFwStaTxPreparedChanType: uint8
+  nimFwStaTxPreparedPrimaryFreq: uint16
+  nimFwStaTxPreparedCenterFreq1: uint16
+  nimFwStaTxPreparedCenterFreq2: uint16
+
+proc wifi_nimfw_prepare_sta_tx_channel*() {.exportc, cdecl.} =
+  ## Restore the WiFi RF channel before STA TX when another radio user, such as
+  ## BLE, may have borrowed the shared RF programming path.
+  ## rf_init() only passes fullInit=true into rfc_init() on the first process
+  ## call. BLE coexistence needs a real RF reclaim because BLE writes the shared
+  ## 0x2000xxxx RF plane between WiFi transmissions.
+  let sm = smEnvView()
+  var band = 0'u8
+  var chanType = 0'u8
+  var primaryFreq = sm.primaryFreq
+  var centerFreq1 = sm.centerFreq
+  var centerFreq2 = 0'u16
+  var txPower = 0'u8
+  if primaryFreq == 0'u16 or centerFreq1 == 0'u16:
+    for i in 0'u8 ..< MAX_VIFS.uint8:
+      let vif = vifChannelForIdx(i)
+      if vif.vifType == VIF_TYPE_STA and vif.state != 0'u8:
+        if vif.chanCtxt != nil:
+          let ctxt = cast[ptr ChanCtxtView](vif.chanCtxt)
+          band = ctxt.channel.band
+          chanType = ctxt.channel.chanType
+          primaryFreq = ctxt.channel.primFreq
+          centerFreq1 = ctxt.channel.centerFreq1
+          centerFreq2 = ctxt.channel.centerFreq2
+          txPower = ctxt.channel.txPower
+          break
+        if vif.channelFreqPair != 0'u32:
+          primaryFreq = uint16(vif.channelFreqPair and 0xFFFF'u32)
+          centerFreq1 = uint16((vif.channelFreqPair shr 16) and 0xFFFF'u32)
+          break
+  if primaryFreq != 0'u16 and centerFreq1 != 0'u16:
+    if nimFwBleWifiRoleWindowEnabled == 0'u32:
+      inc nimFwDbgStaTxRfRestore
+      wifi_hosal_rf_turn_on()
+      rf_init(40000000'u32)
+      phy_init(nil)
+      phy_set_channel(band, chanType, primaryFreq, centerFreq1, centerFreq2, txPower)
+      return
+    let reclaimNeeded = nim_ble_coex_wifi_rf_reclaim_needed() != 0'u32
+    let channelChanged =
+      nimFwStaTxPreparedBand != band or
+      nimFwStaTxPreparedChanType != chanType or
+      nimFwStaTxPreparedPrimaryFreq != primaryFreq or
+      nimFwStaTxPreparedCenterFreq1 != centerFreq1 or
+      nimFwStaTxPreparedCenterFreq2 != centerFreq2
+    if reclaimNeeded or channelChanged:
+      inc nimFwDbgStaTxRfRestore
+      wifi_hosal_rf_turn_on()
+      if reclaimNeeded:
+        inc nimFwDbgStaTxRfFullRestore
+        rfc_init(40000000'u32, 1'u32)
+        phy_init(nil)
+      phy_set_channel(band, chanType, primaryFreq, centerFreq1, centerFreq2, txPower)
+      nimFwStaTxPreparedBand = band
+      nimFwStaTxPreparedChanType = chanType
+      nimFwStaTxPreparedPrimaryFreq = primaryFreq
+      nimFwStaTxPreparedCenterFreq1 = centerFreq1
+      nimFwStaTxPreparedCenterFreq2 = centerFreq2
+
+proc wifi_nimfw_coex_force_wifi_role*(): uint32 {.exportc, cdecl.} =
+  ## Grant the shared RF/PTA fabric to WiFi for one active STA TX window.
+  ## These role constants match the BL808 SDK wifi_bt_coex_force_wlan_impl
+  ## PTI-priority force mode. Use the transient window only while a WiFi frame is
+  ## outstanding; BLE scheduling is paused through the callback below.
+  const
+    PtaCtrl = 0x24920004'u
+    PtaCtrl2 = 0x24920028'u
+    PtaMirror = 0x24920404'u
+    PtaClear = 0x24920428'u
+    WlanCoexControl = 0x24B00400'u
+    WlanCoexPti = 0x24B00404'u
+    WifiRoleCtrl = 0x50000013'u32
+    WifiRoleCtrl2 = 0'u32
+  if nimFwBleWifiRoleWindowActive != 0'u32:
+    nimFwDbgBleWifiRoleLastCtrl = regRead(PtaCtrl)
+    nimFwDbgBleWifiRoleLastCtrl2 = regRead(PtaCtrl2)
+    nimFwDbgBleWifiRoleLastMirror = regRead(PtaMirror)
+    return 1'u32
+  if nim_ble_coex_wifi_tx_window_enter() == 0'u32:
+    nimFwDbgBleWifiRoleLastCtrl = regRead(PtaCtrl)
+    nimFwDbgBleWifiRoleLastCtrl2 = regRead(PtaCtrl2)
+    nimFwDbgBleWifiRoleLastMirror = regRead(PtaMirror)
+    return 0'u32
+  nimFwBleWifiRoleWindowActive = 1'u32
+  regWrite(PtaClear, 0'u32)
+  regWrite(WlanCoexControl, 0x00000F48'u32)
+  regWrite(WlanCoexPti, 0xFFFFFFFF'u32)
+  regWrite(WlanCoexControl, 0x00000F49'u32)
+  regWrite(PtaCtrl, WifiRoleCtrl)
+  regWrite(PtaCtrl2, WifiRoleCtrl2)
+  regWrite(PtaMirror, WifiRoleCtrl)
+  nimFwDbgBleWifiTxPreBcn = regRead(0x24B00400'u)
+  nimFwDbgBleWifiTxPrePti = regRead(0x24B00404'u)
+  nimFwDbgBleWifiTxPreStat = regRead(0x24B00408'u)
+  nimFwDbgBleWifiRoleLastCtrl = regRead(PtaCtrl)
+  nimFwDbgBleWifiRoleLastCtrl2 = regRead(PtaCtrl2)
+  nimFwDbgBleWifiRoleLastMirror = regRead(PtaMirror)
+  inc nimFwDbgBleWifiRoleEnter
+  1'u32
+
+proc wifi_nimfw_coex_force_ble_role*() {.exportc, cdecl.} =
+  ## Return the shared RF/PTA fabric to BLE/BT after the WiFi TX confirmation.
+  ## Mirrors the BL808 SDK wifi_bt_coex_force_bt_impl PTI-priority force mode.
+  const
+    PtaCtrl = 0x24920004'u
+    PtaCtrl2 = 0x24920028'u
+    PtaMirror = 0x24920404'u
+    PtaClear = 0x24920428'u
+    WlanCoexControl = 0x24B00400'u
+    WlanCoexPti = 0x24B00404'u
+    BtRoleCtrl = 0x50000013'u32
+    BtRoleCtrl2 = 0'u32
+  regWrite(PtaClear, 0'u32)
+  regWrite(WlanCoexControl, 0x00000048'u32)
+  regWrite(WlanCoexPti, 0'u32)
+  regWrite(WlanCoexControl, 0x00000049'u32)
+  regWrite(PtaCtrl, BtRoleCtrl)
+  regWrite(PtaCtrl2, BtRoleCtrl2)
+  regWrite(PtaMirror, BtRoleCtrl)
+  nimFwBleWifiRoleWindowActive = 0'u32
+  nim_ble_coex_wifi_tx_window_leave()
+  nimFwDbgBleWifiRoleLastCtrl = regRead(PtaCtrl)
+  nimFwDbgBleWifiRoleLastCtrl2 = regRead(PtaCtrl2)
+  nimFwDbgBleWifiRoleLastMirror = regRead(PtaMirror)
+  inc nimFwDbgBleWifiRoleLeave
+
+proc wifi_nimfw_set_sta_tx_channel_prepare_enabled*(enabled: uint32)
+    {.exportc, cdecl.} =
+  nimFwStaTxChannelPrepareEnabled = if enabled == 0'u32: 0'u32 else: 1'u32
+
+proc wifi_nimfw_set_ble_wifi_role_window_enabled*(enabled: uint32)
+    {.exportc, cdecl.} =
+  nimFwBleWifiRoleWindowEnabled = if enabled == 0'u32: 0'u32 else: 1'u32
+  if nimFwBleWifiRoleWindowEnabled == 0'u32 and
+      nimFwBleWifiRoleWindowActive != 0'u32:
+    wifi_nimfw_coex_force_ble_role()
+
+proc wifi_nimfw_set_keepalive_qosnull_enabled*(enabled: uint32)
+    {.exportc, cdecl.} =
+  nimFwKeepaliveQosNullEnabled = if enabled == 0'u32: 0'u32 else: 1'u32
+
+proc wifi_nimfw_send_sta_null_frame*(): uint8 {.exportc, cdecl.} =
+  ## Send one STA-mode null-data keepalive frame through the real WiFi TX path.
+  ## This is used by coexistence validation to prove WiFi is transmitting while
+  ## BLE is connected, without depending on a TCP/IP stack in Nim firmware mode.
+  if nimFwKeepaliveInFlight != 0'u32:
+    if nimFwDbgNullFrameCfm >= nimFwKeepaliveTargetCfm:
+      nimFwKeepaliveInFlight = 0
+      if nimFwBleWifiRoleWindowActive != 0'u32:
+        wifi_nimfw_coex_force_ble_role()
+    else:
+      const KeepaliveStaleMacTicks = 250_000'u32
+      let age = regRead(MACHW_TIMLO_REG) - nimFwKeepaliveStartedAt
+      if age >= KeepaliveStaleMacTicks:
+        inc nimFwDbgTxStalledInternalRecover
+        nimFwDbgTxRecoverAc = 3
+        nimFwDbgTxRecoverPending = txFrameEnv().postponedCount
+        txl_cntrl_clear_ac(3)
+        nimFwKeepaliveInFlight = 0
+        nimFwKeepaliveTargetCfm = nimFwDbgNullFrameCfm
+        if nimFwBleWifiRoleWindowActive != 0'u32:
+          wifi_nimfw_coex_force_ble_role()
+      else:
+        if nimFwBleWifiRoleWindowEnabled != 0'u32:
+          if wifi_nimfw_coex_force_wifi_role() == 0'u32:
+            return 2'u8
+        discard wifi_nimfw_service_sta_postponed(1)
+        nimFwDbgBleWifiTxTrigStat = regRead(0x24B08078'u)
+        nimFwDbgBleWifiTxTrigAgg = regRead(0x24B0808C'u)
+        txl_transmit_trigger()
+        inc nimFwDbgNullFrameBusyPsCheck
+        return 2'u8
+
+  if txFrameEnv().postponedCount != 0:
+    discard wifi_nimfw_service_sta_postponed(1)
+    if txFrameEnv().postponedCount != 0:
+      inc nimFwDbgNullFramePostponed
+      return 2'u8
+
+  for i in 0'u8 ..< MAX_VIFS.uint8:
+    let vif = vifChannelForIdx(i)
+    if vif.vifType == 0'u8 and vif.state != 0'u8:
+      if not txl_cntrl_tx_check(cast[pointer](vif)):
+        inc nimFwDbgNullFrameBusyTxCheck
+        return 2'u8
+      if nimFwBleWifiRoleWindowEnabled != 0'u32:
+        if wifi_nimfw_coex_force_wifi_role() == 0'u32:
+          return 2'u8
+      if nimFwStaTxChannelPrepareEnabled != 0'u32:
+        wifi_nimfw_prepare_sta_tx_channel()
+      let beforeCfm = nimFwDbgNullFrameCfm
+      let rc =
+        if nimFwBleWifiRoleWindowEnabled != 0'u32 or
+            nimFwKeepaliveQosNullEnabled != 0'u32:
+          wifi_nimfw_send_checked_qosnull_frame(vif.staIdx)
+        else:
+          wifi_nimfw_send_checked_null_frame(vif.staIdx)
+      if rc != 0'u8:
+        if nimFwBleWifiRoleWindowActive != 0'u32:
+          wifi_nimfw_coex_force_ble_role()
+        return rc
+      if nimFwDbgNullFrameCfm > beforeCfm:
+        return 0'u8
+      nimFwKeepaliveInFlight = 1
+      nimFwKeepaliveStartedAt = regRead(MACHW_TIMLO_REG)
+      nimFwKeepaliveTargetCfm = beforeCfm + 1
+      inc nimFwDbgNullFrameQueued
+      discard wifi_nimfw_service_sta_postponed(1)
+      nimFwDbgBleWifiTxTrigStat = regRead(0x24B08078'u)
+      nimFwDbgBleWifiTxTrigAgg = regRead(0x24B0808C'u)
+      txl_transmit_trigger()
+      return 0'u8
+  1'u8
+
+proc wifi_nimfw_null_frame_ack_ok_count*(): uint32 {.exportc, cdecl.} =
+  nimFwDbgNullFrameAckOk
+
+proc wifi_nimfw_null_frame_cfm_count*(): uint32 {.exportc, cdecl.} =
+  nimFwDbgNullFrameCfm
+
+proc wifi_nimfw_null_frame_fail_count*(): uint32 {.exportc, cdecl.} =
+  nimFwDbgNullFrameAckFail
+
+{.emit: "__attribute__((optimize(\"crossjumping\"))) unsigned char txl_frame_send_qosnull_frame(unsigned char,unsigned short,void *,unsigned long);".}
+proc txl_frame_send_qosnull_frame*(staIdx: uint8, qosCtrl: uint16,
+    cfmCallback: pointer, cfmArg: uint32): uint8 {.exportc, cdecl,
+    discardable.} =
   ## Build and send a QoS null frame (101 instrs).
   ## Similar to txl_frame_send_null_frame but with QoS header (26 bytes).
   ## Frame Control = 0xC8 (QoS null, subtype 12), with To-DS/From-DS flags
   ## depending on VIF type (STA vs AP).
-  ## QoS field encodes the AC and TID.
   ## Assembly trace:
   ##   s4 = sta_info_tab base
   ##   s2 = sta entry = s4 + staIdx * 368
-  ##   s0 = sta[39] (format mod)
-  ##   s3 = vif_info_tab base, s5 = vif entry = s3 + vifIdx * 1512
-  ##   s6 = vifIdx, s5 = staIdx, s7 = ac, s8 = ac (dup)
+  ##   s0 = sta[39] (VIF index)
+  ##   s3 = vif_info_tab base, s5 = vif entry = s3 + sta[39] * 1512
   ##   Allocates txl_frame_get(26, staIdx)
   ##   Builds QoS null frame: FC=0xC8+flags, addresses, seq num, QoS field
-  ##   desc[208] = staIdx, desc[212] = ac, desc[49] = vifIdx, desc[47] = formatMod
+  ##   desc[208] = cfmCallback, desc[212] = cfmArg,
+  ##   desc[49] = staIdx, desc[47] = sta[39]
   ##   Calls txl_frame_push(desc, 3), returns (result^1)&0xFF
   let sta = staInfoForIdx(staIdx)
-  let staFormatMod = sta.instNbr
+  let vifIdx = sta.instNbr
   let vifBase = cast[uint](addr vif_info_tab[0])
   let vifEntry = vifBase + vifIdx.uint * VIF_ENTRY_SIZE.uint
   let vif = vifChannelAt(vifEntry)
@@ -20852,8 +21729,9 @@ proc txl_frame_send_qosnull_frame*(vifIdx: uint8, staIdx: uint8, ac: uint8) {.ex
   # Allocate frame (26 bytes for QoS null header)
   let frame = txl_frame_get(26)
   if frame == nil:
-    return  # returns 1 in blob
+    return 1'u8
   let desc = hostTxDescAt(frame)
+  tpc_update_frame_tx_power(cast[pointer](vifEntry), frame)
   let hdr = hostTxQosDataHeader(desc)
   # Check VIF type (STA or AP) to determine To-DS/From-DS
   let vifType = vif.vifType
@@ -20875,19 +21753,33 @@ proc txl_frame_send_qosnull_frame*(vifIdx: uint8, staIdx: uint8, ac: uint8) {.ex
   # Vendor leaves QoS null sequence control zero here.
   hdr.data.seqCtrl = 0
   # QoS field at offset 372-373 (bytes 24-25 of MAC header)
-  # QoS TID = AC mapping, EOSP=0
-  hdr.qosCtrl = (ac and 0x0F).uint16
-  # Store confirmation context words.
-  let aux = hostTxAuxWords(desc)
-  aux.word0 = staIdx.uint32
-  aux.word1 = ac.uint32
-  # Store VIF/STA metadata
-  desc.staInfoIdx = vifIdx
-  desc.vifIdx = staFormatMod
-  # Apply TX power control (blob: tpc_update_frame_tx_power)
-  tpc_update_frame_tx_power(cast[pointer](vifEntry), frame)
+  hdr.qosCtrl = qosCtrl
+  # Store confirmation context and descriptor metadata exactly like the blob.
+  desc.callback = cfmCallback
+  desc.callbackArg = cast[pointer](cfmArg.uint)
+  desc.staInfoIdx = staIdx
+  desc.vifIdx = vifIdx
+  nimFwDbgNullFrameDescLast = pointerAddrU32(frame)
+  nimFwDbgNullFrameBufLast = pointerAddrU32(desc.bufDesc)
+  nimFwDbgNullFrameFcLast =
+    hdr.data.frameControl.uint32 or (hdr.qosCtrl.uint32 shl 16)
+  nimFwDbgNullFrameVifSta =
+    staIdx.uint32 or (vifIdx.uint32 shl 8) or (vif.state.uint32 shl 16)
+  if cfmCallback != nil:
+    inc nimFwDbgNullFrameCbSet
+    nimFwDbgNullFrameCbSetPtr = cast[uint32](cast[uint](cfmCallback))
   # Push frame for TX on AC 3 (VO)
-  txl_frame_push(frame, 3)
+  let pushRc = txl_frame_push(frame, 3)
+  let publicRc = (pushRc xor 1'u8) and 0xFF'u8
+  nimFwDbgNullFramePushRc = pushRc.uint32
+  nimFwDbgNullFrameReturn = publicRc.uint32
+  nimFwDbgNullFrameBufLast = pointerAddrU32(desc.bufDesc)
+  if desc.bufDesc != nil:
+    let pushedHdr = hostTxQosDataHeader(desc)
+    nimFwDbgNullFrameFcLast =
+      pushedHdr.data.frameControl.uint32 or
+      (pushedHdr.qosCtrl.uint32 shl 16)
+  return publicRc
 
 proc txl_frame_send_selfcts_frame*(vifInfo: pointer, duration: uint16, rateConfig: uint32, navValue: uint32) {.exportc, cdecl.} =
   ## Build and send a self-CTS frame (for NAV protection).
@@ -22085,7 +22977,8 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
              if baCount != 0 and (baCount.int - 1) <= 0:
                sta.psStatus = 0
                let staVifIdx = sta.infoIdx
-               txl_frame_send_qosnull_frame(staVifIdx, (frameCtrl or 0x10).uint8, 0)
+               discard txl_frame_send_qosnull_frame(
+                 staVifIdx, frameCtrl or 0x10'u16, nil, 0)
                sta.psStatus = 0
                # BAM notify (byte[2]=0). Shares alloc/send site with the
                # PS-Poll no-BA path via bamSendByte2==0 below.
@@ -24178,6 +25071,7 @@ proc sta_mgmt_postponed_desc_release*(staEntry: pointer, flag: uint32): uint32 {
   var prev: pointer = nil
   let macTime = regRead(MACHW_TIMLO_REG)
   let maxAge = 0x1D4C0'u32  # ~120ms in MAC ticks
+  let frameEnv = txFrameEnv()
   var cur = cast[pointer](sta.postponedList.first)
   while cur != nil:
     let curU = cast[uint](cur)
@@ -24194,8 +25088,29 @@ proc sta_mgmt_postponed_desc_release*(staEntry: pointer, flag: uint32): uint32 {
     if doRelease:
       # Remove from postponed list (blob: co_list_remove)
       co_list_remove(addr sta.postponedList, cast[ptr CoListHdr](prev), cast[ptr CoListHdr](cur))
-      # Release frame descriptor (blob: txl_frame_release)
+      let txDesc = hostTxDescAt(cur)
+      inc nimFwDbgPostponedRelease
+      nimFwDbgPostponedReleaseDesc = pointerAddrU32(cur)
+      nimFwDbgPostponedReleaseCb = pointerAddrU32(txDesc.callback)
+      nimFwDbgPostponedReleaseFlags =
+        flag or (txDesc.usedFlag.uint32 shl 8) or
+        (txDesc.postponeFlag.uint32 shl 16) or (txDesc.retryFlag.uint32 shl 24)
+      if txDesc.bufDesc != nil:
+        let link = hostTxLinkDescAt(txDesc.bufDesc)
+        nimFwDbgPostponedReleaseFc =
+          link.macHeader[0].uint32 or (link.macHeader[1].uint32 shl 8)
+      else:
+        nimFwDbgPostponedReleaseFc = 0xFFFFFFFF'u32
+      # Release expired/off-channel descriptors without invoking upper-layer
+      # completion. The SDK passes doCallback=1 here, but our pure-Nim path can
+      # age descriptors whose callback storage was already invalidated by prior
+      # host/firmware recycling. Keeping callback dispatch out of the scavenger
+      # preserves the descriptor-pool invariant while normal TX confirmations
+      # still use txl_frame_evt for valid callbacks.
+      {.emit: ["asm volatile(\"mv a1, zero\" ::: \"a1\");"].}
       txl_frame_release(cur)
+      if frameEnv.postponedCount > 0:
+        frameEnv.postponedCount = frameEnv.postponedCount - 1
       released += 1
     else:
       prev = cur
@@ -25433,7 +26348,7 @@ proc ps_uapsd_timer_handle*() {.exportc, cdecl.} =
       # Set UAPSD trigger flag
       vif.flags = vif.flags or 0x08
       # Send QoS null frame (blob: txl_frame_send_qosnull_frame)
-      txl_frame_send_qosnull_frame(vif.vifIdx, vif.staIdx, 3)
+      discard txl_frame_send_qosnull_frame(vif.staIdx, 3'u16, nil, 0)
       # Update timestamp
       vif.psLastTime = macTime
     vifPtr = vif.next
@@ -27112,6 +28027,14 @@ proc bl_wifi_auth_done_internal*(param: pointer): uint32 {.exportc, cdecl.} =
               fileStr: pointer, p0: pointer, p1: pointer) {.cdecl.}](logFn)(
       1, 0, nil, 29, nil, param, status)
   # Blob calls sm_handle_supplicant_result(a0=staAddr, a1=status)
+  let staIdx = encodedArgU8(param)
+  let statusCode = encodedArgU8(status)
+  if statusCode == 0'u8:
+    let vifIdx = staInfoForIdx(staIdx).instNbr
+    if vifIdx < 8'u8:
+      nimFwWpaPendingMask = nimFwWpaPendingMask and
+        (not (1'u32 shl vifIdx.uint32))
+      vifChannelForIdx(vifIdx).probeCount = 0
   sm_handle_supplicant_result(encodedArgU8(param), encodedArgU8(status))
   return 1
 
@@ -30433,12 +31356,6 @@ proc sm_connect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   if state1 == 10:
     return 2  # SM busy, message will be re-queued
 
-  # Allocate SM_CONNECT_CFM once. Control flow is structured so every CFM
-  # send converges on a single `ke_msg_send(cfm)` call at the tail, matching
-  # blob's tail-merged single call site. Previously Nim branched out to
-  # three separate ke_msg_send calls which GCC couldn't collapse.
-  let cfm = cast[ptr StatusCfmPayload](
-    ke_msg_alloc(SM_CONNECT_CFM, TASK_API, TASK_SM, StatusCfmPayloadSize))
   var cfmStatus: uint8 = 0
   var earlyExit = false
 
@@ -30475,22 +31392,17 @@ proc sm_connect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
     sm.connectFlags = (req.channelDuration and 0xFF).uint8
     if sm.connectIndMsg != nil:
       assert_err("sm_task.c", "sm_task.c", 99)
-    let connectMsg = ke_msg_alloc(SM_CONNECT_IND_MSG, TASK_API, TASK_SM, 860)
-    sm.connectIndMsg = connectMsg
     sm.scanResultIndex = 0xFFFFFFFF'u32
     sm.vendorIeLen = sm.vendorIeLen and 0x00FF'u16
 
     sm_connection_tlv_set(vifIdx, param, 0)
 
-    if connectMsg != nil:
-      discard c_memset(connectMsg, 0, 64.csize_t)
-
-  # Single ke_msg_send tail — blob tail-merges all CFM sends here.
-  if cfm != nil:
-    cfm.status = cfmStatus
-    ke_msg_send(cfm)
-
   if earlyExit:
+    let cfm = cast[ptr StatusCfmPayload](
+      ke_msg_alloc(SM_CONNECT_CFM, TASK_API, TASK_SM, StatusCfmPayloadSize))
+    if cfm != nil:
+      cfm.status = cfmStatus
+      ke_msg_send(cfm)
     return 0
 
   # Post-CFM success steps (blob: direct join when a target BSSID/channel is
@@ -30503,6 +31415,19 @@ proc sm_connect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
     chanPtr = connectInfoChannelHint(param)
   else:
     discard sm_get_bss_params(addr resultPtr, addr chanPtr)
+
+  scanu_prune_scanresult_raw_frames()
+  let cfm = cast[ptr StatusCfmPayload](
+    ke_msg_alloc(SM_CONNECT_CFM, TASK_API, TASK_SM, StatusCfmPayloadSize))
+  if cfm != nil:
+    cfm.status = cfmStatus
+    ke_msg_send(cfm)
+
+  let sm = smEnvView()
+  let connectMsg = ke_msg_alloc(SM_CONNECT_IND_MSG, TASK_API, TASK_SM, 860)
+  sm.connectIndMsg = connectMsg
+  if connectMsg != nil:
+    discard c_memset(connectMsg, 0, 64.csize_t)
 
   let vifMac = cast[pointer](addr vif.macAddr[0])
   if resultPtr != nil and chanPtr != nil and
@@ -32157,6 +33082,12 @@ proc txl_int_fake_transfer*(txDesc: pointer, queueIdx: uint32) {.exportc, cdecl.
       nimFwConnectTrace2U32("[WIFI-CT] fake_tx ",
                             queueIdx,
                             cast[uint32](cast[uint](link)))
+  let isNullDataFrame =
+    link != nil and link.macHeader[0] == 0x48'u8 and link.macHeader[1] == 0x01'u8
+  let isTrackedByCallback =
+    desc.callback != nil and
+    cast[uint32](cast[uint](desc.callback)) == nimFwDbgNullFrameCbSetPtr
+  let isTrackedNullFrame = isNullDataFrame or isTrackedByCallback
   # Write fake transfer status marker at THD+72
   link.headerThd.magic = 0xCAFEFADE'u32
   # Store back-pointer to TX descriptor at THD+20
@@ -32166,12 +33097,21 @@ proc txl_int_fake_transfer*(txDesc: pointer, queueIdx: uint32) {.exportc, cdecl.
   # entry+8 after the T-Head indexed-address instruction.
   let head = txBackupQueueHeadPtr(queueIdx)
   let tailPtr = txBackupQueueTailPtr(queueIdx)
+  if isTrackedNullFrame:
+    inc nimFwDbgNullFrameFakeSeen
+    nimFwDbgNullFrameFakeQidx = queueIdx
+    nimFwDbgNullFrameFakeLink = pointerAddrU32(cast[pointer](link))
+    nimFwDbgNullFrameFakeHeadBefore = pointerAddrU32(head[])
+    nimFwDbgNullFrameFakeTailBefore = pointerAddrU32(tailPtr[])
   if head[] == nil:
     head[] = cast[pointer](link)
   else:
     hostTxBufferedLinkAt(tailPtr[]).next = cast[pointer](link)
   tailPtr[] = cast[pointer](link)
   link.next = nil
+  if isTrackedNullFrame:
+    nimFwDbgNullFrameFakeHeadAfter = pointerAddrU32(head[])
+    nimFwDbgNullFrameFakeTailAfter = pointerAddrU32(tailPtr[])
 
 proc cfm_raw_send*(param: pointer) {.exportc, cdecl.} =
   ## Send raw TX confirmation (5 instrs in blob).

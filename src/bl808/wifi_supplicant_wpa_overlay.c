@@ -7,8 +7,41 @@
  * transition APs also need WPA2 clients to advertise MFPC.
  */
 #define wpa_set_bss bl808_vendor_wpa_set_bss
+#define aes_unwrap bl808_wpa_aes_unwrap_nonoverlap
 #include "../../build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/rsn_supp/wpa.c"
+#undef aes_unwrap
 #undef wpa_set_bss
+
+extern volatile uint32_t nimfw_dbg_keydata_decrypt_calls;
+extern volatile uint32_t nimfw_dbg_keydata_decrypt_len;
+extern volatile uint32_t nimfw_dbg_keydata_decrypt_out_len;
+extern volatile uint32_t nimfw_dbg_keydata_decrypt_ok;
+extern volatile uint32_t nimfw_dbg_keydata_decrypt_fail;
+
+int bl808_wpa_aes_unwrap_nonoverlap(const u8 *kek, int n,
+                                    const u8 *cipher, u8 *plain)
+{
+    u8 unwrapped[256];
+    size_t out_len;
+    int rc;
+
+    nimfw_dbg_keydata_decrypt_calls++;
+    if (n <= 0 || (size_t)n > (sizeof(unwrapped) / 8)) {
+        nimfw_dbg_keydata_decrypt_fail++;
+        return -1;
+    }
+    out_len = (size_t)n * 8;
+    nimfw_dbg_keydata_decrypt_len = (uint32_t)((n + 1) * 8);
+    nimfw_dbg_keydata_decrypt_out_len = (uint32_t)out_len;
+    rc = aes_unwrap(kek, n, cipher, unwrapped);
+    if (rc != 0) {
+        nimfw_dbg_keydata_decrypt_fail++;
+        return rc;
+    }
+    memcpy(plain, unwrapped, out_len);
+    nimfw_dbg_keydata_decrypt_ok++;
+    return 0;
+}
 
 static u16 bl808_mgmt_group_cipher_to_supp(u8 mgmt_group_cipher)
 {

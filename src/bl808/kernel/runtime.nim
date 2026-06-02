@@ -190,6 +190,11 @@ proc read*[T](fut: CpsFuture[T]): T =
     raise fut.error
   fut.value
 
+proc read*(fut: CpsVoidFuture) =
+  ## Read a completed void future. Raises if the future has an error.
+  if fut.error != nil:
+    raise fut.error
+
 proc isCancelled*[T](fut: CpsFuture[T]): bool {.inline.} =
   fut.state == FutureStateCancelled
 

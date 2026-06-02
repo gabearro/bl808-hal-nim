@@ -17,6 +17,9 @@
 
 import mmio, memmap
 
+when defined(bl808m0):
+  import kernel/cps
+
 # Iter 2.A.0 step 3: vendor lwIP source compilation. Required because
 # wifi_vendor_support.c's lwIP-side bridges (netifapi_netif_add -> netif_add,
 # tcpip_input -> ethernet_input, wifi_netif_dhcp_start -> dhcp_start) call
@@ -137,6 +140,7 @@ type
     wifiFail          = -1
     wifiTimeout       = -2
     wifiNotInit       = -3
+    wifiBusy          = -4
 
   WifiScanResult* = object
     ssid*: array[33, char]
@@ -144,6 +148,11 @@ type
     channel*: uint8
     rssi*: int8
     authMode*: WifiAuthMode
+
+const
+  wifiBleCoexWifiAlwaysOn* = 0'u32
+  wifiBleCoexWifiPriority* = 1'u32
+  wifiBleCoexBtPriority* = 2'u32
 
 # =============================================================================
 # WiFi C opaque types
@@ -429,6 +438,19 @@ when defined(bl808m0):
       {.importc, cdecl.}
     when defined(bl808WifiNimFw):
       var sm_state {.importc.}: uint16
+      proc txl_transmit_trigger*() {.importc, cdecl.}
+      proc txl_frame_evt*() {.importc, cdecl.}
+      proc wifi_nimfw_prune_scan_raw_cache_for_ssid*(ssid: cstring,
+                                                     ssidLen: uint32)
+        {.importc, cdecl.}
+      proc wifi_nimfw_set_sta_tx_channel_prepare_enabled*(enabled: uint32)
+        {.importc, cdecl.}
+      proc wifi_nimfw_prepare_sta_tx_channel*() {.importc, cdecl.}
+      proc wifi_nimfw_set_ble_wifi_role_window_enabled*(enabled: uint32)
+        {.importc, cdecl.}
+      proc wifi_nimfw_set_keepalive_qosnull_enabled*(enabled: uint32)
+        {.importc, cdecl.}
+      proc rwip_wlcoex_set*(enabled: bool) {.importc, cdecl.}
 
     proc wifi_mgmr_init*(conf: ptr WifiConf): cint {.cdecl.} =
       let rc = bl808_wifi_vendor_init(conf)
@@ -459,6 +481,8 @@ when defined(bl808m0):
       {.importc, cdecl.}
 
     proc wifi_mgmr_sta_disconnect*(): cint {.importc, cdecl.}
+    when defined(bl808WifiNimFw):
+      proc bl_main_disconnect*(): cint {.importc, cdecl.}
   else:
     proc wifi_mgmr_sta_connect*(iface: ptr WifiInterface,
                                 ssid: cstring, psk: cstring, pmk: cstring,
@@ -541,6 +565,322 @@ when defined(bl808m0):
 when defined(bl808m0):
 
   var staIface: WifiInterface
+  var
+    wifiScanFuture: CpsFuture[uint32]
+    wifiScanTimer: TimerId
+    wifiConnectFuture: CpsFuture[WifiError]
+    wifiConnectTimer: TimerId
+    wifiStaIdleFuture: CpsFuture[WifiError]
+    wifiStaIdleTimer: TimerId
+    wifiDisconnectFuture: CpsFuture[WifiError]
+    wifiDisconnectTimer: TimerId
+    wifiDisconnectIssuePending: bool
+    wifiDisconnectIssueTimeoutMs: uint32
+
+  proc wifiBackendPoll(count: uint32) {.inline.} =
+    when defined(bl808WifiVendor):
+      bl808_wifi_vendor_poll(count)
+    else:
+      discard count
+
+  proc wifiBackendConnected(): bool {.inline.} =
+    when defined(bl808WifiVendor):
+      bl808_wifi_vendor_connected() != 0
+    else:
+      wifiGetNetif() != nil
+
+  proc wifiBackendScanDone(): bool {.inline.} =
+    when defined(bl808WifiVendor):
+      bl808_wifi_vendor_scan_done_count() > 0'u32
+    else:
+      true
+
+  proc wifiBackendScanCount(): uint32 {.inline.} =
+    when defined(bl808WifiVendor):
+      bl808_wifi_vendor_scan_count()
+    else:
+      0'u32
+
+  proc wifiBackendConnectDone(): bool {.inline.} =
+    when defined(bl808WifiVendor):
+      bl808_wifi_vendor_connect_done() != 0
+    else:
+      true
+
+  proc wifiBackendDisconnectDone(): bool {.inline.} =
+    when defined(bl808WifiVendor):
+      bl808_wifi_vendor_disconnect_done() != 0
+    else:
+      true
+
+  proc wifiNimFirmwareStaIdle(): bool {.inline.} =
+    when defined(bl808WifiNimFw):
+      sm_state == 0'u16
+    else:
+      true
+
+  proc wifiNimFirmwareIssueDisconnect(): cint {.inline.} =
+    when defined(bl808WifiNimFw):
+      bl_main_disconnect()
+    else:
+      wifi_mgmr_sta_disconnect()
+
+  proc wifiNimFirmwarePruneScanCache(ssid: string) {.inline.} =
+    when defined(bl808WifiNimFw):
+      wifi_nimfw_prune_scan_raw_cache_for_ssid(ssid.cstring, ssid.len.uint32)
+    else:
+      discard ssid
+
+  proc wifiNimFirmwareServiceTx(count: uint32) {.inline.} =
+    when defined(bl808WifiNimFw):
+      discard wifi_nimfw_service_sta_postponed(count)
+      for _ in 0'u32 ..< count:
+        txl_transmit_trigger()
+        txl_frame_evt()
+    else:
+      discard count
+
+  proc wifiNimFirmwareSetBleCoexMode(mode: uint32) {.inline.} =
+    when defined(bl808WifiNimFw):
+      coex_pta_force_autocontrol_set(mode)
+      rwip_wlcoex_set(mode != wifiBleCoexWifiAlwaysOn)
+      wifi_nimfw_set_sta_tx_channel_prepare_enabled(
+        if mode == wifiBleCoexWifiPriority: 1'u32 else: 0'u32)
+      wifi_nimfw_set_ble_wifi_role_window_enabled(
+        if mode == wifiBleCoexWifiPriority: 1'u32 else: 0'u32)
+    else:
+      discard mode
+
+  proc wifiNimFirmwareReclaimStaTxChannel() {.inline.} =
+    when defined(bl808WifiNimFw):
+      wifi_nimfw_prepare_sta_tx_channel()
+
+  proc wifiNimFirmwareSendStaKeepaliveFrame(): WifiError {.inline.} =
+    when defined(bl808WifiNimFw):
+      case wifi_nimfw_send_sta_null_frame()
+      of 0'u8: wifiOk
+      of 2'u8: wifiBusy
+      else: wifiFail
+    else:
+      wifiFail
+
+  proc wifiNimFirmwareSetKeepaliveQosNull(enabled: bool) {.inline.} =
+    when defined(bl808WifiNimFw):
+      wifi_nimfw_set_keepalive_qosnull_enabled(
+        if enabled: 1'u32 else: 0'u32)
+    else:
+      discard enabled
+
+  proc wifiNimFirmwareKeepaliveAckOkCount(): uint32 {.inline.} =
+    when defined(bl808WifiNimFw):
+      wifi_nimfw_null_frame_ack_ok_count()
+    else:
+      0'u32
+
+  proc wifiNimFirmwareKeepaliveConfirmCount(): uint32 {.inline.} =
+    when defined(bl808WifiNimFw):
+      wifi_nimfw_null_frame_cfm_count()
+    else:
+      0'u32
+
+  proc wifiNimFirmwareKeepaliveFailCount(): uint32 {.inline.} =
+    when defined(bl808WifiNimFw):
+      wifi_nimfw_null_frame_fail_count()
+    else:
+      0'u32
+
+  proc cancelWifiTimer(timerId: var TimerId) =
+    if timerId != 0'u32:
+      cancelTimer(timerId)
+      timerId = 0'u32
+
+  proc completeWifiScan(value: uint32) =
+    if wifiScanFuture != nil and not wifiScanFuture.finished:
+      complete(wifiScanFuture, value)
+    cancelWifiTimer(wifiScanTimer)
+    wifiScanFuture = nil
+
+  proc completeWifiConnect(value: WifiError) =
+    if wifiConnectFuture != nil and not wifiConnectFuture.finished:
+      complete(wifiConnectFuture, value)
+    cancelWifiTimer(wifiConnectTimer)
+    wifiConnectFuture = nil
+
+  proc completeWifiStaIdle(value: WifiError) =
+    if wifiStaIdleFuture != nil and not wifiStaIdleFuture.finished:
+      complete(wifiStaIdleFuture, value)
+    cancelWifiTimer(wifiStaIdleTimer)
+    wifiStaIdleFuture = nil
+
+  proc completeWifiDisconnect(value: WifiError) =
+    if wifiDisconnectFuture != nil and not wifiDisconnectFuture.finished:
+      complete(wifiDisconnectFuture, value)
+    cancelWifiTimer(wifiDisconnectTimer)
+    wifiDisconnectFuture = nil
+    wifiDisconnectIssuePending = false
+    wifiDisconnectIssueTimeoutMs = 0'u32
+
+  proc wifiCompletePendingEvents() =
+    if wifiScanFuture != nil and not wifiScanFuture.finished and
+        wifiBackendScanDone():
+      completeWifiScan(wifiBackendScanCount())
+    if wifiConnectFuture != nil and not wifiConnectFuture.finished and
+        wifiBackendConnectDone():
+      completeWifiConnect(if wifiBackendConnected(): wifiOk else: wifiFail)
+    if wifiStaIdleFuture != nil and not wifiStaIdleFuture.finished and
+        wifiNimFirmwareStaIdle():
+      completeWifiStaIdle(wifiOk)
+    if wifiDisconnectIssuePending and wifiDisconnectFuture != nil and
+        not wifiDisconnectFuture.finished:
+      wifiDisconnectIssuePending = false
+      let rc = wifiNimFirmwareIssueDisconnect()
+      if rc != 0:
+        completeWifiDisconnect(wifiFail)
+      elif wifiDisconnectIssueTimeoutMs != 0'u32:
+        wifiDisconnectTimer = addTimerMs(
+          wifiDisconnectIssueTimeoutMs.uint64,
+          proc() = completeWifiDisconnect(wifiFail))
+    if wifiDisconnectFuture != nil and not wifiDisconnectFuture.finished:
+      if wifiBackendDisconnectDone() or wifiNimFirmwareStaIdle():
+        completeWifiDisconnect(wifiOk)
+
+  proc wifiServicePump*(iterations: uint32 = 8'u32) {.cdecl.} =
+    ## One bounded WiFi control-plane service step. The MAC/firmware timing
+    ## remains below this layer; CPS callers use this instead of ad hoc polls.
+    let hasPending =
+      (wifiScanFuture != nil and not wifiScanFuture.finished) or
+      (wifiConnectFuture != nil and not wifiConnectFuture.finished) or
+      (wifiStaIdleFuture != nil and not wifiStaIdleFuture.finished) or
+      (wifiDisconnectFuture != nil and not wifiDisconnectFuture.finished) or
+      wifiDisconnectIssuePending
+    if not hasPending and not wifiApEnabled and not wifiBackendConnected():
+      return
+    let count = if iterations == 0'u32: 1'u32 else: iterations
+    wifiBackendPoll(count)
+    wifiNimFirmwareServiceTx(count)
+    wifiCompletePendingEvents()
+
+  proc wifiServiceTask*(periodUs: uint32 = 1000'u32,
+                        iterations: uint32 = 8'u32): CpsVoidFuture {.cps.} =
+    let delay = if periodUs == 0'u32: 1'u32 else: periodUs
+    while true:
+      wifiServicePump(iterations)
+      await sleepUs(delay.uint64)
+
+  var
+    wifiServiceHookInstalled: bool
+    wifiServiceHookPeriodTicks: uint64 = usToTicks(1000'u64)
+    wifiServiceHookIterations: uint32 = 8'u32
+
+  proc wifiServicePollHook(now: uint64): uint64 =
+    wifiServicePump(wifiServiceHookIterations)
+    now + wifiServiceHookPeriodTicks
+
+  proc wifiConfigureServiceHook*(periodUs: uint32 = 1000'u32,
+                                 iterations: uint32 = 8'u32) =
+    ## Configure the scheduler-owned WiFi pump cadence without allocating a CPS
+    ## sleep future on every service tick.
+    wifiServiceHookPeriodTicks =
+      if periodUs == 0'u32: 1'u64 else: usToTicks(periodUs.uint64)
+    wifiServiceHookIterations =
+      if iterations == 0'u32: 1'u32 else: iterations
+
+  proc wifiInstallServiceHook*(periodUs: uint32 = 1000'u32,
+                               iterations: uint32 = 8'u32) =
+    ## Install the high-frequency WiFi control-plane pump as a scheduler poll
+    ## hook. Timed scheduler hooks wake from WFI only when service is due.
+    wifiConfigureServiceHook(periodUs, iterations)
+    if not wifiServiceHookInstalled:
+      wifiServiceHookInstalled =
+        addSchedulerTimedPollHook(wifiServicePollHook, readTick())
+
+  proc wifiSetBleCoexistenceMode*(mode: uint32) =
+    ## Configure WiFi/BLE PTA priority while STA WiFi remains active.
+    ## Use wifiBleCoexWifiPriority when WiFi must actively transmit during BLE
+    ## activity; use wifiBleCoexBtPriority for BLE-preferred windows.
+    wifiNimFirmwareSetBleCoexMode(mode)
+
+  proc wifiReclaimStaTxChannel*() =
+    ## Restore the STA TX RF/channel programming after another radio user, such
+    ## as BLE, has borrowed the shared RF path.
+    wifiNimFirmwareReclaimStaTxChannel()
+
+  proc wifiSendStaKeepaliveFrame*(): WifiError =
+    ## Transmit one STA null-data keepalive frame when the Nim WiFi firmware is
+    ## associated. This is a WiFi MAC TX primitive for coexistence validation,
+    ## not a replacement for the lwIP data path.
+    wifiNimFirmwareSendStaKeepaliveFrame()
+
+  proc wifiSetStaKeepaliveQosNull*(enabled: bool) =
+    ## Select QoS-null framing for the STA keepalive TX primitive. Normal WiFi
+    ## keepalive validation uses legacy null-data by default; coexistence tests
+    ## enable QoS-null because it follows the SDK U-APSD/control path.
+    wifiNimFirmwareSetKeepaliveQosNull(enabled)
+
+  proc wifiStaKeepaliveAckOkCount*(): uint32 =
+    wifiNimFirmwareKeepaliveAckOkCount()
+
+  proc wifiStaKeepaliveConfirmCount*(): uint32 =
+    wifiNimFirmwareKeepaliveConfirmCount()
+
+  proc wifiStaKeepaliveFailCount*(): uint32 =
+    wifiNimFirmwareKeepaliveFailCount()
+
+  type
+    WifiKeepaliveStats* = object
+      frames*: uint32
+      failures*: uint32
+      attempts*: uint32
+      busy*: uint32
+      ackDelta*: uint32
+      failDelta*: uint32
+      cfmDelta*: uint32
+
+  proc wifiSendStaKeepaliveUntilAckAsync*(
+      targetAck, attemptBudget: uint32,
+      periodMs: uint32 = 50'u32,
+      busyRetryMs: uint32 = 10'u32,
+      confirmDrainMs: uint32 = 500'u32,
+      serviceIterations: uint32 = 1'u32): CpsFuture[WifiKeepaliveStats] {.cps.} =
+    ## Send STA keepalive frames until the requested ACK count is observed or
+    ## the attempt budget is exhausted. This is the CPS orchestration layer for
+    ## coexistence tests; the TX primitive and bounded service pump stay sync.
+    let ackBefore = wifiStaKeepaliveAckOkCount()
+    let failBefore = wifiStaKeepaliveFailCount()
+    let cfmBefore = wifiStaKeepaliveConfirmCount()
+    let txPeriodUs =
+      if periodMs == 0'u32: 1'u64 else: periodMs.uint64 * 1000'u64
+    let busyPeriodUs =
+      if busyRetryMs == 0'u32: 1'u64 else: busyRetryMs.uint64 * 1000'u64
+    let count =
+      if serviceIterations == 0'u32: 1'u32 else: serviceIterations
+    var stats: WifiKeepaliveStats
+    while wifiStaKeepaliveAckOkCount() - ackBefore < targetAck and
+        stats.attempts < attemptBudget:
+      inc stats.attempts
+      wifiServicePump(count)
+      var nextDelayUs = txPeriodUs
+      case wifiSendStaKeepaliveFrame()
+      of wifiOk:
+        inc stats.frames
+      of wifiBusy:
+        inc stats.busy
+        nextDelayUs = busyPeriodUs
+      else:
+        inc stats.failures
+      wifiServicePump(count)
+      await sleepUs(nextDelayUs)
+
+    let confirmDeadline = readTick() + usToTicks(confirmDrainMs.uint64 * 1000'u64)
+    while wifiStaKeepaliveConfirmCount() - cfmBefore < stats.frames and
+        readTick() < confirmDeadline:
+      wifiServicePump(count)
+      await sleepUs(1000'u64)
+
+    stats.ackDelta = wifiStaKeepaliveAckOkCount() - ackBefore
+    stats.failDelta = wifiStaKeepaliveFailCount() - failBefore
+    stats.cfmDelta = wifiStaKeepaliveConfirmCount() - cfmBefore
+    return stats
 
   proc wifiInit*(): WifiError =
     ## Initialize WiFi subsystem. Call once at startup.
@@ -551,8 +891,33 @@ when defined(bl808m0):
     if staIface == nil: return wifiFail
     wifiOk
 
+  proc wifiInitAsync*(): CpsFuture[WifiError] {.cps.} =
+    return wifiInit()
+
+  proc wifiScanAsync*(timeoutMs: uint32 = 30_000): CpsFuture[uint32] =
+    if staIface == nil:
+      return completedLocalFuture(0'u32)
+    if wifiScanFuture != nil and not wifiScanFuture.finished:
+      return failedLocalFuture[uint32](
+        newException(CatchableError, "WiFi scan already pending"))
+    let rc = wifi_mgmr_scan(addr staIface, nil)
+    if rc != 0:
+      return completedLocalFuture(0'u32)
+    when defined(bl808WifiVendor):
+      wifiScanFuture = newLocalCpsFuture[uint32]()
+      if timeoutMs != 0'u32:
+        wifiScanTimer = addTimerMs(timeoutMs.uint64, proc() =
+          completeWifiScan(0'u32)
+        )
+      wifiCompletePendingEvents()
+      return wifiScanFuture
+    else:
+      return completedLocalFuture(0'u32)
+
   proc wifiConnect*(ssid, password: string, channel: uint8 = 0): WifiError =
     ## Connect to a WiFi AP.
+    when defined(bl808WifiNimFw):
+      wifi_nimfw_prune_scan_raw_cache_for_ssid(ssid.cstring, ssid.len.uint32)
     let rc = wifi_mgmr_sta_connect(
       addr staIface, ssid.cstring, password.cstring,
       nil, nil, 0, channel)
@@ -563,13 +928,63 @@ when defined(bl808m0):
         bl808_wifi_vendor_poll(8)
         if bl808_wifi_vendor_connect_done() != 0:
           break
-      if bl808_wifi_vendor_connected() != 0: wifiOk else: wifiFail
+      return if bl808_wifi_vendor_connected() != 0: wifiOk else: wifiFail
     else:
-      if rc == 0: wifiOk else: wifiFail
+      return if rc == 0: wifiOk else: wifiFail
+
+  proc wifiConnectAsync*(ssid, password: string,
+                         channel: uint8 = 0,
+                         timeoutMs: uint32 = 30_000): CpsFuture[WifiError] =
+    if wifiConnectFuture != nil and not wifiConnectFuture.finished:
+      return failedLocalFuture[WifiError](
+        newException(CatchableError, "WiFi connect already pending"))
+    when defined(bl808WifiNimFw):
+      wifi_nimfw_prune_scan_raw_cache_for_ssid(ssid.cstring, ssid.len.uint32)
+    let rc = wifi_mgmr_sta_connect(
+      addr staIface, ssid.cstring, password.cstring,
+      nil, nil, 0, channel)
+    when defined(bl808WifiVendor):
+      if rc != 0:
+        return completedLocalFuture(wifiFail)
+      wifiConnectFuture = newLocalCpsFuture[WifiError]()
+      if timeoutMs != 0'u32:
+        wifiConnectTimer = addTimerMs(timeoutMs.uint64, proc() =
+          completeWifiConnect(wifiFail)
+        )
+      wifiCompletePendingEvents()
+      return wifiConnectFuture
+    else:
+      return completedLocalFuture(if rc == 0: wifiOk else: wifiFail)
 
   when defined(bl808WifiVendor) and defined(bl808WifiNimFwDiag):
     proc dcTrace(s: cstring) {.importc: "cfg_trace", cdecl.}
     proc dcTraceRc(s: cstring; v: cint) {.importc: "cfg_trace_rc", cdecl.}
+
+  proc wifiWaitStaIdleAsync(timeoutMs: uint32 = 2_000): CpsFuture[WifiError] =
+    when defined(bl808WifiVendor) and defined(bl808WifiNimFw):
+      if sm_state == 0'u16:
+        return completedLocalFuture(wifiOk)
+      if wifiStaIdleFuture != nil and not wifiStaIdleFuture.finished:
+        return wifiStaIdleFuture
+      wifiStaIdleFuture = newLocalCpsFuture[WifiError]()
+      if timeoutMs != 0'u32:
+        wifiStaIdleTimer = addTimerMs(timeoutMs.uint64, proc() =
+          completeWifiStaIdle(wifiFail)
+        )
+      wifiCompletePendingEvents()
+      return wifiStaIdleFuture
+    else:
+      return completedLocalFuture(wifiOk)
+
+  proc wifiIssueDisconnectAsync(timeoutMs: uint32 = 10_000): CpsFuture[WifiError] =
+    when defined(bl808WifiVendor) and defined(bl808WifiNimFw):
+      wifiDisconnectFuture = newLocalCpsFuture[WifiError]()
+      wifiDisconnectIssuePending = true
+      wifiDisconnectIssueTimeoutMs = timeoutMs
+      return wifiDisconnectFuture
+    else:
+      let rc = wifi_mgmr_sta_disconnect()
+      return completedLocalFuture(if rc == 0: wifiOk else: wifiFail)
 
   proc wifiDisconnect*(): WifiError =
     when defined(bl808WifiVendor):
@@ -609,14 +1024,46 @@ when defined(bl808m0):
     else:
       if rc == 0: wifiOk else: wifiFail
 
+  proc wifiDisconnectAsync*(timeoutMs: uint32 = 10_000): CpsFuture[WifiError] =
+    if wifiDisconnectFuture != nil and not wifiDisconnectFuture.finished:
+      return failedLocalFuture[WifiError](
+        newException(CatchableError, "WiFi disconnect already pending"))
+    when defined(bl808WifiVendor):
+      wifiServicePump()
+      if bl808_wifi_vendor_connected() == 0:
+        return completedLocalFuture(wifiOk)
+    when defined(bl808WifiVendor) and defined(bl808WifiNimFw):
+      if wifiStaIdleFuture != nil and not wifiStaIdleFuture.finished:
+        return failedLocalFuture[WifiError](
+          newException(CatchableError, "WiFi disconnect already pending"))
+      wifiServicePump(64)
+      return wifiIssueDisconnectAsync(timeoutMs)
+    else:
+      return wifiIssueDisconnectAsync(timeoutMs)
+
   proc wifiStartAp*(ssid, password: string, channel: int = 1): WifiError =
     let rc = wifi_mgmr_ap_start(addr staIface, ssid.cstring,
                                  0, password.cstring, channel.cint)
-    if rc == 0: wifiOk else: wifiFail
+    if rc == 0:
+      wifiApEnabled = true
+      wifiOk
+    else:
+      wifiFail
+
+  proc wifiStartApAsync*(ssid, password: string,
+                         channel: int = 1): CpsFuture[WifiError] {.cps.} =
+    return wifiStartAp(ssid, password, channel)
 
   proc wifiStopAp*(): WifiError =
     let rc = wifi_mgmr_ap_stop(addr staIface)
-    if rc == 0: wifiOk else: wifiFail
+    if rc == 0:
+      wifiApEnabled = false
+      wifiOk
+    else:
+      wifiFail
+
+  proc wifiStopApAsync*(): CpsFuture[WifiError] {.cps.} =
+    return wifiStopAp()
 
   proc wifiGetNetif*(): pointer =
     ## Get the lwIP netif for the STA interface.
