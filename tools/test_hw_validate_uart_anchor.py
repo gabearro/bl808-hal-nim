@@ -102,39 +102,6 @@ def test_compact_flash_image_places_segments(tmp_path):
     assert image[0x20:0x22] == b"xy"
 
 
-def test_prepare_ble_vendor_lld_con_probe_renames_tx_symbols(monkeypatch, tmp_path):
-    source = tmp_path / "lld_con_probe_llcp.o"
-    output = tmp_path / "lld_con_probe_llcp_nimwrap.o"
-    source.write_bytes(b"obj")
-    calls = []
-
-    def fake_run_checked(cmd, **kwargs):
-        calls.append((cmd, kwargs))
-        output.write_bytes(b"wrapped")
-        return ""
-
-    monkeypatch.setattr(hw_validate, "BLE_VENDOR_LLD_CON_PROBE_LLCP", source)
-    monkeypatch.setattr(hw_validate, "BLE_VENDOR_LLD_CON_PROBE_NIMWRAP", output)
-    monkeypatch.setattr(hw_validate, "run_checked", fake_run_checked)
-
-    result = hw_validate.prepare_ble_vendor_lld_con_probe(
-        defines={
-            "bl808BleVendorLldConProbe": "1",
-            "bl808BleVendorManualConnTx": "1",
-        },
-        objcopy="objcopy",
-        work_dir=tmp_path / "work",
-        dry_run=False,
-    )
-
-    assert result == output
-    assert output.read_bytes() == b"wrapped"
-    cmd = calls[0][0]
-    assert "--redefine-sym" in cmd
-    assert "lld_con_data_tx=vendor_lld_con_data_tx" in cmd
-    assert "lld_con_llcp_tx=vendor_lld_con_llcp_tx" in cmd
-
-
 def test_uart_anchor_build_only_dry_run(monkeypatch, tmp_path, capsys):
     argv = [
         "hw_validate.py",

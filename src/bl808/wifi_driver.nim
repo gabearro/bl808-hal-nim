@@ -3,7 +3,7 @@
 ## This module owns the netif init and TX forwarding ABI used by the remaining
 ## SDK WiFi manager/supplicant scaffolding.
 
-when defined(bl808m0) and defined(bl808WifiVendor) and defined(bl808WifiNimFw):
+when defined(bl808m0) and defined(bl808WifiNimFw):
   {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver".}
   {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/include".}
   {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/lwip/src/include".}

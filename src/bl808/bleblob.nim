@@ -24,7 +24,7 @@ when defined(bl808m0):
       {.passC: "-DBL808_BLEBLOB_USE_BL808_PHYRF=1".}
       {.passC: "-DBL808_BLEBLOB_REPLACE_RWIP_DRIVER=1".}
       {.passL: "-Wl,--wrap=rwip_init -Wl,--wrap=rwip_reset".}
-      when defined(bl808WifiVendor):
+      when defined(bl808WifiNimFw):
         {.passC: "-DBL808_BLEBLOB_WIFI_COEX=1".}
         # The combined WiFi/BLE validation image links the BL808 BLE RF archive
         # beside the WiFi PHY/RF archive. They overlap on common PHY entry

@@ -1,13 +1,10 @@
 ## BL808 WiFi driver interface.
 ##
-## The BL808 M0 WiFi path has two bring-up modes:
-##   - default vendor firmware: src/bl808/libwifi_fw.a
-##   - -d:bl808WifiNimFw: src/bl808/wifi_fw.nim replaces that firmware archive
+## The BL808 M0 WiFi path uses src/bl808/wifi_fw.nim as its firmware.
 ##
 ## Native firmware mode is the replacement path: src/bl808/wifi_fw.nim owns the
-## firmware ABI that would otherwise come from libwifi_fw.a. The remaining SDK C
-## pieces in this file are host driver/supplicant scaffolding used while the Nim
-## stack catches up; the vendor blob is only a reference/oracle.
+## firmware ABI. The remaining SDK C pieces in this file are host
+## driver/supplicant scaffolding used while the Nim stack catches up.
 ##
 ## WiFi runs on the M0 (E907) core. The D0/LP cores communicate
 ## with WiFi through IPC if needed.
@@ -20,90 +17,24 @@ import mmio, memmap
 when defined(bl808m0):
   import kernel/cps
 
-# Iter 2.A.0 step 3: vendor lwIP source compilation. Required because
-# wifi_vendor_support.c's lwIP-side bridges (netifapi_netif_add -> netif_add,
-# tcpip_input -> ethernet_input, wifi_netif_dhcp_start -> dhcp_start) call
-# vendor lwIP functions that otherwise wouldn't be in the link.
-when defined(bl808m0) and defined(bl808WifiVendor) and not defined(bl808WifiNimFw):
-  import bl808/kernel/lwipcore
-  when not defined(bl808WifiVendorMsgTx):
-    import wifi_msg_tx
+when defined(bl808m0) and not defined(bl808WifiNimFw):
+  {.error: "BL808 M0 WiFi now requires -d:bl808WifiNimFw; vendor firmware is no longer supported.".}
 
-  # The SDK C sources carry Nim-firmware debug probes used during WiFi bring-up.
-  # Vendor-firmware builds still compile those sources, so provide inert
-  # definitions here when wifi_fw.nim is not linked.
-  var
-    nimFwVendorDbgBlOutputEapol* {.exportc: "nimfw_dbg_bl_output_eapol".}: uint32
-    nimFwVendorDbgBlOutputDrop* {.exportc: "nimfw_dbg_bl_output_drop".}: uint32
-    nimFwVendorDbgBlTxCfmEapol* {.exportc: "nimfw_dbg_bl_tx_cfm_eapol".}: uint32
-    nimFwVendorDbgBlTxCfmRet* {.exportc: "nimfw_dbg_bl_tx_cfm_ret".}: uint32
-    nimFwVendorDbgBlTxCfmStatus* {.exportc: "nimfw_dbg_bl_tx_cfm_status".}: uint32
-    nimFwVendorDbgCryptoCaptured* {.exportc: "nimfw_dbg_crypto_captured".}: uint32
-    nimFwVendorDbgCryptoKeyMgmt* {.exportc: "nimfw_dbg_crypto_keymgmt".}: uint32
-    nimFwVendorDbgCryptoPairwise* {.exportc: "nimfw_dbg_crypto_pairwise".}: uint32
-    nimFwVendorDbgCryptoPmkLen* {.exportc: "nimfw_dbg_crypto_pmk_len".}: uint32
-    nimFwVendorDbgCryptoPtkLen* {.exportc: "nimfw_dbg_crypto_ptk_len".}: uint32
-    nimFwVendorDbgCryptoSha256* {.exportc: "nimfw_dbg_crypto_sha256".}: uint32
-    nimFwVendorDbgEapolTxCb* {.exportc: "nimfw_dbg_eapol_tx_cb".}: uint32
-    nimFwVendorDbgEthTxEapol* {.exportc: "nimfw_dbg_eth_tx_eapol".}: uint32
-    nimFwVendorDbgEthTxRet* {.exportc: "nimfw_dbg_eth_tx_ret".}: uint32
-    nimFwVendorDbgInstallPtk* {.exportc: "nimfw_dbg_install_ptk".}: uint32
-    nimFwVendorDbgM2Len* {.exportc: "nimfw_dbg_m2_len".}: uint32
-    nimFwVendorDbgM4CbPtr* {.exportc: "nimfw_dbg_m4_cb_ptr".}: uint32
-    nimFwVendorDbgM4TxState* {.exportc: "nimfw_dbg_m4_tx_state".}: uint32
-    nimFwVendorDbgMicFrameLen* {.exportc: "nimfw_dbg_mic_frame_len".}: uint32
-    nimFwVendorDbgMicVer* {.exportc: "nimfw_dbg_mic_ver".}: uint32
-    nimFwVendorDbgPbufAllocFail* {.exportc: "nimfw_dbg_pbuf_alloc_fail".}: uint32
-    nimFwVendorDbgPbufTakeFail* {.exportc: "nimfw_dbg_pbuf_take_fail".}: uint32
-    nimFwVendorDbgSaeBuild* {.exportc: "nimfw_dbg_sae_build".}: uint32
-    nimFwVendorDbgSaeParse* {.exportc: "nimfw_dbg_sae_parse".}: uint32
-    nimFwVendorDbgSelftestRan* {.exportc: "nimfw_dbg_selftest_ran".}: uint32
-    nimFwVendorDbgSend4of4Cb* {.exportc: "nimfw_dbg_send_4of4_cb".}: uint32
-    nimFwVendorDbgSend4of4Tx* {.exportc: "nimfw_dbg_send_4of4_tx".}: uint32
-    nimFwVendorDbgSuppRxEapol* {.exportc: "nimfw_dbg_supp_rx_eapol".}: uint32
-    nimFwVendorDbgSuppTxEapol* {.exportc: "nimfw_dbg_supp_tx_eapol".}: uint32
-    nimFwVendorDbgSuppTxLen* {.exportc: "nimfw_dbg_supp_tx_len".}: uint32
-    nimFwVendorDbgWpaDeauth* {.exportc: "nimfw_dbg_wpa_deauth".}: uint32
-    nimFwVendorDbgWpaPtkInstalled* {.exportc: "nimfw_dbg_wpa_ptk_installed".}: uint32
-    nimFwVendorDbgWpaRxState* {.exportc: "nimfw_dbg_wpa_rx_state".}: uint32
-    nimFwVendorDbgWpaState* {.exportc: "nimfw_dbg_wpa_state".}: uint32
-    nimFwVendorDbgWpaTxState* {.exportc: "nimfw_dbg_wpa_tx_state".}: uint32
-
-    nimFwVendorDbgCryptoAnonce* {.exportc: "nimfw_dbg_crypto_anonce".}: array[32, uint8]
-    nimFwVendorDbgCryptoBssid* {.exportc: "nimfw_dbg_crypto_bssid".}: array[6, uint8]
-    nimFwVendorDbgCryptoKck* {.exportc: "nimfw_dbg_crypto_kck".}: array[16, uint8]
-    nimFwVendorDbgCryptoOwn* {.exportc: "nimfw_dbg_crypto_own".}: array[6, uint8]
-    nimFwVendorDbgCryptoPmk* {.exportc: "nimfw_dbg_crypto_pmk".}: array[32, uint8]
-    nimFwVendorDbgCryptoPrfData* {.exportc: "nimfw_dbg_crypto_prf_data".}: array[76, uint8]
-    nimFwVendorDbgCryptoSnonce* {.exportc: "nimfw_dbg_crypto_snonce".}: array[32, uint8]
-    nimFwVendorDbgM2Buf* {.exportc: "nimfw_dbg_m2_buf".}: array[160, uint8]
-    nimFwVendorDbgMicComputed* {.exportc: "nimfw_dbg_mic_computed".}: array[16, uint8]
-    nimFwVendorDbgMicKck* {.exportc: "nimfw_dbg_mic_kck".}: array[16, uint8]
-    nimFwVendorDbgSelftestHmac* {.exportc: "nimfw_dbg_selftest_hmac".}: array[20, uint8]
-
-when defined(bl808m0) and defined(bl808WifiVendor) and defined(bl808WifiNimFw):
+when defined(bl808m0):
   import wifi_fw
-  when not defined(bl808WifiVendorCmdMgr):
-    import wifi_cmds
-  when not defined(bl808WifiVendorDriver):
-    import wifi_driver
+  import wifi_cmds
+  import wifi_driver
   import wifi_hosal
   import wifi_ipc_host
   import wifi_irqs
-  when not defined(bl808WifiVendorSupport):
-    import wifi_support
-  when not defined(bl808WifiVendorMain):
-    import wifi_main
-  when not defined(bl808WifiVendorMsgTx):
-    import wifi_msg_tx
+  import wifi_support
+  import wifi_main
+  import wifi_msg_tx
   import wifi_mod_params
   import wifi_platform
-  when not defined(bl808WifiVendorRx):
-    import wifi_rx
-  when not defined(bl808WifiVendorTx):
-    import wifi_tx
-  when not defined(bl808WifiVendorUtils):
-    import wifi_utils
+  import wifi_rx
+  import wifi_tx
+  import wifi_utils
 
 # =============================================================================
 # RF configuration registers (documented subset at MIX_BASE 0x20001000)
@@ -169,383 +100,265 @@ type
     channel*: uint8
 
 # =============================================================================
-# WiFi manager host API (SDK scaffolding plus Nim/vendor firmware backend)
+# WiFi manager host API (SDK scaffolding plus Nim firmware backend)
 #
-# With -d:bl808WifiNimFw, firmware symbols resolve to src/bl808/wifi_fw.nim and
-# libwifi_fw.a is not linked. Without it, those symbols resolve to the vendor
-# firmware archive plus its PHY/RF companion.
+# Firmware symbols resolve to src/bl808/wifi_fw.nim. BL808 M0 builds reject the
+# old firmware archive path.
 # =============================================================================
 when defined(bl808m0):
-  when defined(bl808WifiVendor):
-    {.passC: "-DBL808 -DCPU_M0 -DCFG_CHIP_BL808 -DCFG_TXDESC=4 -DCFG_STA_MAX=1 -DCFG_VIRT_DEV_MAX=2".}
-    {.passC: "-DBL_CHIP_NAME=\"BL808\" -D__FILENAME__=__FILE__ -DBL808_WIFI_VENDOR_FULL_SUPPLICANT -DUSE_MBEDTLS_CRYPTO -include sys/types.h".}
-    when defined(bl808WifiConnectCfg80211Flags):
-      {.passC: "-DBL808_WIFI_CONNECT_CRYPTO_PARAMS -DBL808_WIFI_CONNECT_CFG80211_FLAGS".}
-    when defined(bl808WifiNimFw):
-      {.passC: "-DBL808_WIFI_NIM_FW".}
-    when defined(bl808WifiTrace):
-      {.passC: "-DBL808_WIFI_TRACE".}
-    when defined(bl808WifiConnectTrace):
-      {.passC: "-DBL808_WIFI_CONNECT_TRACE".}
-    when defined(bl808WifiConnectTraceRawRx):
-      {.passC: "-DBL808_WIFI_CONNECT_TRACE_RAW_RX".}
-    when defined(bl808WifiConnectCacheHint):
-      {.passC: "-DBL808_WIFI_CONNECT_CACHE_HINT".}
-    when defined(bl808WifiVerboseConnect):
-      {.passC: "-DBL808_WIFI_VERBOSE_CONNECT".}
-    when defined(bl808WifiVerboseScan):
-      {.passC: "-DBL808_WIFI_VERBOSE_SCAN".}
-    # The connection wrapper asks for PMF-capable association by default.
-    # Keep the supplicant's 802.11w code compiled for both firmware backends so
-    # WPA3-transition APs can see MFPC and the group management cipher in the
-    # generated RSN IE. This does not force PMF-required or SAE.
-    {.passC: "-DCONFIG_IEEE80211W".}
-    when defined(bl808WifiForcePmfCapable):
-      # Forces smF |= 0x600 (PMF-cap bits) on every scanned BSS in
-      # wifi_fw.nim's scanu path so APs that advertise PMF-required are
-      # reachable. Also enables the SAE/SHA256 supplicant code for explicit
-      # WPA3 probe builds. The vendor blob still does not drive SAE auth
-      # end-to-end, so real WPA3-SAE association remains outside this default.
-      {.passC: "-DCONFIG_WPA3_SAE -DCONFIG_SHA256".}
-    when defined(bl808WifiForceAckMode):
-      {.passC: "-DBL808_WIFI_FORCE_ACK_MODE".}
-    when defined(bl808WifiForceMacTiming80MHz):
-      {.passC: "-DBL808_WIFI_FORCE_MAC_TIMING_80MHZ".}
-    when defined(bl808WifiForceVifOwnMac):
-      {.passC: "-DBL808_WIFI_FORCE_VIF_OWN_MAC".}
-    when defined(bl808WifiKeepBcnBit5):
-      {.passC: "-DBL808_WIFI_KEEP_BCN_BIT5".}
-    when defined(bl808WifiForcePtaWlan):
-      {.passC: "-DBL808_WIFI_FORCE_PTA_WLAN".}
-    when defined(bl808WifiVendorValidationLog):
-      {.passC: "-DBL808_WIFI_VENDOR_LOG_TO_VALIDATION_BUFFER".}
-    when defined(bl808WifiOfficialPowerProfile):
-      {.passC: "-DBL808_WIFI_VENDOR_OFFICIAL_POWER_PROFILE".}
-    when defined(bl808WifiVendorUseBl808Rf):
-      {.passC: "-DBL808_WIFI_VENDOR_USE_BL808_RF".}
-    when defined(bl808WifiConnectPassphraseOnly):
-      {.passC: "-DBL808_WIFI_CONNECT_PASSPHRASE_ONLY".}
-    when defined(bl808WifiConnectHexPmkAsPassphrase):
-      {.passC: "-DBL808_WIFI_CONNECT_HEX_PMK_AS_PASSPHRASE".}
-    when defined(bl808WifiConnectDerivePmk):
-      {.passC: "-DBL808_WIFI_CONNECT_DERIVE_PMK".}
-    when defined(bl808WifiForceTxPwr20):
-      {.passC: "-DBL808_WIFI_FORCE_TX_POWER=0x20".}
-    when defined(bl808WifiForceTxPwr30):
-      {.passC: "-DBL808_WIFI_FORCE_TX_POWER=0x30".}
-    when defined(bl808WifiForceTxPwr70):
-      {.passC: "-DBL808_WIFI_FORCE_TX_POWER=0x70".}
-    when defined(bl808WifiForceRespTxPwr70):
-      {.passC: "-DBL808_WIFI_FORCE_RESP_TX_POWER=0x70".}
-    when defined(bl808WifiForceRespTxPwr70All):
-      {.passC: "-DBL808_WIFI_FORCE_RESP_TX_POWER=0x70 -DBL808_WIFI_FORCE_RESP_TX_POWER_ALL".}
-    {.passC: "-fcommon -fshort-enums -Wno-incompatible-pointer-types -Wno-int-conversion -Wno-implicit-function-declaration".}
-    {.passC: "-Isrc/bl808".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/include".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi/include".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi_hosal/include".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/lwip/src/include".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/lwip/lwip-port".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/lwip/lwip-port/arch".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/lwip/lwip-port/config".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/lwip/lwip-port/FreeRTOS".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/os/freertos_e907/include".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/os/freertos_e907/portable/GCC/RISC-V".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/platform/hosal/include".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/platform/hosal/bl808_e907_hal".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/platform/soc/bl808/bl808_e907_std/bl808_bsp_driver/std_drv/inc".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/platform/soc/bl808/bl808_e907_std/bl808_bsp_driver/regs".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/platform/soc/bl808/bl808_e907_std/bl808_bsp_driver/risc-v/Core/Include".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/os/bl_os_adapter/bl_os_adapter/include".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/os/bl_os_adapter/bl_os_adapter/include/bl_os_adapter".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/stage/yloop/include".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/include".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/include/bl_supplicant".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/include/utils".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/port/include".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/inc".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/priv_inc".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/include".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/utils/include".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/dns_server/include".}
-    {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/netutils/include".}
-    when not defined(bl808WifiNimFw) or defined(bl808WifiVendorSupport):
-      {.compile: "wifi_vendor_support.c".}
-    when defined(bl808WifiConnectTrace):
-      {.compile: "wifi_connect_trace.c".}
-    when defined(bl808WifiTrace) and not defined(bl808WifiNimFw):
-      {.compile: "wifi_eapol_trace.c".}
-    when not defined(bl808WifiNimFw):
-      {.compile: "wifi_ipc_host.c".}
-    when not defined(bl808WifiNimFw) or defined(bl808WifiVendorCmdMgr):
-      {.compile: "build/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/bl_cmds.c".}
-    when not defined(bl808WifiNimFw):
-      {.compile: "build/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/bl_irqs.c".}
-    when not defined(bl808WifiNimFw) or defined(bl808WifiVendorMain):
-      {.compile: "build/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/bl_main.c".}
-    when not defined(bl808WifiNimFw):
-      {.compile: "build/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/bl_mod_params.c".}
-    when not defined(bl808WifiNimFw):
-      {.compile: "build/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/bl_msg_rx.c".}
-    when defined(bl808WifiVendorMsgTx):
-      {.compile: "build/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/bl_msg_tx.c".}
-    when not defined(bl808WifiNimFw):
-      {.compile: "build/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/bl_platform.c".}
-    when not defined(bl808WifiNimFw) or defined(bl808WifiVendorRx):
-      {.compile: "build/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/bl_rx.c".}
-    when not defined(bl808WifiNimFw) or defined(bl808WifiVendorTx):
-      {.compile: "build/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/bl_tx.c".}
-    when not defined(bl808WifiNimFw) or defined(bl808WifiVendorUtils):
-      {.compile: "build/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/bl_utils.c".}
-    when not defined(bl808WifiNimFw) or defined(bl808WifiVendorDriver):
-      {.compile: "build/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/wifi.c".}
-    when not defined(bl808WifiNimFw):
-      {.compile: "build/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/wifi_pkt_hooks.c".}
-    when not defined(bl808WifiNimFw):
-      {.compile: "build/bl_iot_sdk_b773b3f/components/network/wifi_hosal/wifi_hosal.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/ap/ap_config.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/ap/wpa_auth_ie.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/ap/wpa_auth_rsn_ccmp_only.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/bl_supplicant/bl_hostap.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/bl_supplicant/bl_wpa3.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/bl_supplicant/bl_wpa_main.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/bl_supplicant/bl_wpas_glue.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/common/sae.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/common/wpa_common.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/aes-cbc.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/aes-internal-bl.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/aes-omac1.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/aes-unwrap.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/aes-wrap.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/crypto_internal-modexp.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/dh_group5.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/dh_groups.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/md5-internal.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/md5.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/rc4.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/sha1-internal.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/sha1-pbkdf2-bl.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/sha1.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/sha256-internal.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/sha256-prf.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/sha256.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/eap_peer/eap_common.c".}
-    {.compile: "wifi_supplicant_wpa_overlay.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/rsn_supp/wpa_ie.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/utils/common.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/utils/wpa_debug.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/utils/wpabuf.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/src/blcrypto_suite_aes.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/src/blcrypto_suite_bignum.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/src/blcrypto_suite_ecp.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/src/blcrypto_suite_ecp_curves.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/src/blcrypto_suite_hacc.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/src/blcrypto_suite_hacc_glue.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/src/blcrypto_suite_hacc_secp256r1_mul.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/src/blcrypto_suite_platform_util.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/src/blcrypto_suite_porting.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/src/blcrypto_suite_supplicant_api.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/library/aes.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/library/md.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/library/md5.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/library/pkcs5.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/library/ripemd160.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/library/sha1.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/library/sha256.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/library/sha512.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/library/platform.c".}
-    {.compile: "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/library/platform_util.c".}
-    {.passL: "-Lsrc/bl808".}
-    when not defined(bl808WifiNimFw):
-      when defined(bl808WifiPmfCapableWrapper):
-        {.passL: "-Wl,--wrap=wpa_set_bss".}
-        {.passL: "-Wl,--wrap=wpa3_build_sae_msg".}
-        {.passL: "-Wl,--wrap=wpa3_parse_sae_msg".}
-    when defined(bl808WifiWrapWaitUs):
-      {.passL: "-Wl,--wrap=wait_us".}
-    when defined(bl808WifiNimFw):
-      when defined(bl808WifiConnectTrace):
-        {.passL: "-Wl,--wrap=mm_active -Wl,--wrap=mm_hw_info_set -Wl,--wrap=mm_sec_machwaddr_wr -Wl,--wrap=sm_handle_eapol_input -Wl,--wrap=wpa_sm_rx_eapol -Wl,--wrap=txu_cntrl_push -Wl,--wrap=txl_cntrl_push -Wl,--wrap=txl_frame_push -Wl,--wrap=txl_frame_push_force -Wl,--wrap=txl_frame_cfm -Wl,--wrap=txl_cfm_push -Wl,--wrap=rxu_cntrl_frame_handle".}
-      when defined(bl808WifiConnectTraceRawRx):
-        {.passL: "-Wl,--wrap=rxl_cntrl_evt".}
-      when defined(bl808WifiVendorUseBl808Rf):
-        {.passL: "-Wl,--start-group src/bl808/librf_bl808.a -Wl,--end-group".}
-      else:
-        {.passL: "-Wl,--start-group build/bl_iot_sdk_b773b3f/components/platform/soc/bl606p/bl606p_phyrf/lib/libbl606p_phyrf.a -Wl,--end-group".}
-    else:
-      when defined(bl808WifiTrace):
-        {.passL: "-Wl,--wrap=mm_active -Wl,--wrap=mm_hw_info_set -Wl,--wrap=mm_sec_machwaddr_wr -Wl,--wrap=sm_handle_eapol_input -Wl,--wrap=tcpip_stack_input -Wl,--wrap=rxu_cntrl_frame_handle -Wl,--wrap=rxu_swdesc_upload_evt -Wl,--wrap=txl_frame_push -Wl,--wrap=txl_frame_push_force -Wl,--wrap=txl_frame_cfm -Wl,--wrap=txl_frame_evt -Wl,--wrap=txl_transmit_trigger -Wl,--wrap=txl_cfm_push".}
-      when defined(bl808WifiConnectTrace):
-        {.passL: "-Wl,--wrap=mm_active -Wl,--wrap=mm_hw_info_set -Wl,--wrap=mm_sec_machwaddr_wr -Wl,--wrap=sm_handle_eapol_input -Wl,--wrap=wpa_sm_rx_eapol -Wl,--wrap=txu_cntrl_push -Wl,--wrap=txl_cntrl_push -Wl,--wrap=txl_frame_push -Wl,--wrap=txl_frame_push_force -Wl,--wrap=txl_frame_cfm -Wl,--wrap=txl_cfm_push -Wl,--wrap=rxu_cntrl_frame_handle".}
-      when defined(bl808WifiConnectTraceRawRx):
-        {.passL: "-Wl,--wrap=rxl_cntrl_evt".}
-      when defined(bl808WifiVendorUseBl808Rf):
-        {.passL: "-Wl,--start-group src/bl808/libwifi_fw.a src/bl808/librf_bl808.a -Wl,--end-group".}
-      else:
-        {.passL: "-Wl,--start-group src/bl808/libwifi_fw.a build/bl_iot_sdk_b773b3f/components/platform/soc/bl606p/bl606p_phyrf/lib/libbl606p_phyrf.a -Wl,--end-group".}
+  {.passC: "-DBL808 -DCPU_M0 -DCFG_CHIP_BL808 -DCFG_TXDESC=4 -DCFG_STA_MAX=1 -DCFG_VIRT_DEV_MAX=2".}
+  {.passC: "-DBL_CHIP_NAME=\"BL808\" -D__FILENAME__=__FILE__ -DBL808_WIFI_VENDOR_FULL_SUPPLICANT -DUSE_MBEDTLS_CRYPTO -include sys/types.h".}
+  when defined(bl808WifiConnectCfg80211Flags):
+    {.passC: "-DBL808_WIFI_CONNECT_CRYPTO_PARAMS -DBL808_WIFI_CONNECT_CFG80211_FLAGS".}
+  {.passC: "-DBL808_WIFI_NIM_FW".}
+  when defined(bl808WifiTrace):
+    {.passC: "-DBL808_WIFI_TRACE".}
+  when defined(bl808WifiConnectTrace):
+    {.passC: "-DBL808_WIFI_CONNECT_TRACE".}
+  when defined(bl808WifiConnectTraceRawRx):
+    {.passC: "-DBL808_WIFI_CONNECT_TRACE_RAW_RX".}
+  when defined(bl808WifiConnectCacheHint):
+    {.passC: "-DBL808_WIFI_CONNECT_CACHE_HINT".}
+  when defined(bl808WifiVerboseConnect):
+    {.passC: "-DBL808_WIFI_VERBOSE_CONNECT".}
+  when defined(bl808WifiVerboseScan):
+    {.passC: "-DBL808_WIFI_VERBOSE_SCAN".}
+  # The connection wrapper asks for PMF-capable association by default.
+  # Keep the supplicant's 802.11w code compiled so WPA3-transition APs can see
+  # MFPC and the group management cipher in the generated RSN IE. This does not
+  # force PMF-required or SAE.
+  {.passC: "-DCONFIG_IEEE80211W".}
+  when defined(bl808WifiForcePmfCapable):
+    # Forces smF |= 0x600 (PMF-cap bits) on every scanned BSS in
+    # wifi_fw.nim's scanu path so APs that advertise PMF-required are
+    # reachable. Also enables the SAE/SHA256 supplicant code for explicit
+    # WPA3 probe builds. Real WPA3-SAE association remains outside this default.
+    {.passC: "-DCONFIG_WPA3_SAE -DCONFIG_SHA256".}
+  when defined(bl808WifiForceAckMode):
+    {.passC: "-DBL808_WIFI_FORCE_ACK_MODE".}
+  when defined(bl808WifiForceMacTiming80MHz):
+    {.passC: "-DBL808_WIFI_FORCE_MAC_TIMING_80MHZ".}
+  when defined(bl808WifiForceVifOwnMac):
+    {.passC: "-DBL808_WIFI_FORCE_VIF_OWN_MAC".}
+  when defined(bl808WifiKeepBcnBit5):
+    {.passC: "-DBL808_WIFI_KEEP_BCN_BIT5".}
+  when defined(bl808WifiForcePtaWlan):
+    {.passC: "-DBL808_WIFI_FORCE_PTA_WLAN".}
+  when defined(bl808WifiValidationLog):
+    {.passC: "-DBL808_WIFI_VENDOR_LOG_TO_VALIDATION_BUFFER".}
+  when defined(bl808WifiOfficialPowerProfile):
+    {.passC: "-DBL808_WIFI_VENDOR_OFFICIAL_POWER_PROFILE".}
+  when defined(bl808WifiUseBl808Rf):
+    {.passC: "-DBL808_WIFI_VENDOR_USE_BL808_RF".}
+  when defined(bl808WifiConnectPassphraseOnly):
+    {.passC: "-DBL808_WIFI_CONNECT_PASSPHRASE_ONLY".}
+  when defined(bl808WifiConnectHexPmkAsPassphrase):
+    {.passC: "-DBL808_WIFI_CONNECT_HEX_PMK_AS_PASSPHRASE".}
+  when defined(bl808WifiConnectDerivePmk):
+    {.passC: "-DBL808_WIFI_CONNECT_DERIVE_PMK".}
+  when defined(bl808WifiForceTxPwr20):
+    {.passC: "-DBL808_WIFI_FORCE_TX_POWER=0x20".}
+  when defined(bl808WifiForceTxPwr30):
+    {.passC: "-DBL808_WIFI_FORCE_TX_POWER=0x30".}
+  when defined(bl808WifiForceTxPwr70):
+    {.passC: "-DBL808_WIFI_FORCE_TX_POWER=0x70".}
+  when defined(bl808WifiForceRespTxPwr70):
+    {.passC: "-DBL808_WIFI_FORCE_RESP_TX_POWER=0x70".}
+  when defined(bl808WifiForceRespTxPwr70All):
+    {.passC: "-DBL808_WIFI_FORCE_RESP_TX_POWER=0x70 -DBL808_WIFI_FORCE_RESP_TX_POWER_ALL".}
+  {.passC: "-fcommon -fshort-enums -Wno-incompatible-pointer-types -Wno-int-conversion -Wno-implicit-function-declaration".}
+  {.passC: "-Isrc/bl808".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/include".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi/include".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi_hosal/include".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/lwip/src/include".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/lwip/lwip-port".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/lwip/lwip-port/arch".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/lwip/lwip-port/config".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/lwip/lwip-port/FreeRTOS".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/os/freertos_e907/include".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/os/freertos_e907/portable/GCC/RISC-V".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/platform/hosal/include".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/platform/hosal/bl808_e907_hal".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/platform/soc/bl808/bl808_e907_std/bl808_bsp_driver/std_drv/inc".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/platform/soc/bl808/bl808_e907_std/bl808_bsp_driver/regs".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/platform/soc/bl808/bl808_e907_std/bl808_bsp_driver/risc-v/Core/Include".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/os/bl_os_adapter/bl_os_adapter/include".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/os/bl_os_adapter/bl_os_adapter/include/bl_os_adapter".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/stage/yloop/include".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/include".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/include/bl_supplicant".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/include/utils".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/port/include".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/inc".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/priv_inc".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/include".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/utils/include".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/dns_server/include".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/netutils/include".}
+  when defined(bl808WifiConnectTrace):
+    {.compile: "wifi_connect_trace.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/ap/ap_config.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/ap/wpa_auth_ie.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/ap/wpa_auth_rsn_ccmp_only.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/bl_supplicant/bl_hostap.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/bl_supplicant/bl_wpa3.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/bl_supplicant/bl_wpa_main.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/bl_supplicant/bl_wpas_glue.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/common/sae.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/common/wpa_common.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/aes-cbc.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/aes-internal-bl.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/aes-omac1.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/aes-unwrap.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/aes-wrap.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/crypto_internal-modexp.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/dh_group5.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/dh_groups.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/md5-internal.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/md5.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/rc4.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/sha1-internal.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/sha1-pbkdf2-bl.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/sha1.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/sha256-internal.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/sha256-prf.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/crypto/sha256.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/eap_peer/eap_common.c".}
+  {.compile: "wifi_supplicant_wpa_overlay.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/rsn_supp/wpa_ie.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/utils/common.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/utils/wpa_debug.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/utils/wpabuf.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/src/blcrypto_suite_aes.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/src/blcrypto_suite_bignum.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/src/blcrypto_suite_ecp.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/src/blcrypto_suite_ecp_curves.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/src/blcrypto_suite_hacc.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/src/blcrypto_suite_hacc_glue.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/src/blcrypto_suite_hacc_secp256r1_mul.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/src/blcrypto_suite_platform_util.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/src/blcrypto_suite_porting.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/blcrypto_suite/src/blcrypto_suite_supplicant_api.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/library/aes.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/library/md.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/library/md5.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/library/pkcs5.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/library/ripemd160.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/library/sha1.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/library/sha256.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/library/sha512.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/library/platform.c".}
+  {.compile: "build/bl_iot_sdk_b773b3f/components/security/mbedtls_lts/mbedtls/library/platform_util.c".}
+  {.passL: "-Lsrc/bl808".}
+  when defined(bl808WifiWrapWaitUs):
+    {.passL: "-Wl,--wrap=wait_us".}
+  when defined(bl808WifiConnectTrace):
+    {.passL: "-Wl,--wrap=mm_active -Wl,--wrap=mm_hw_info_set -Wl,--wrap=mm_sec_machwaddr_wr -Wl,--wrap=sm_handle_eapol_input -Wl,--wrap=wpa_sm_rx_eapol -Wl,--wrap=txu_cntrl_push -Wl,--wrap=txl_cntrl_push -Wl,--wrap=txl_frame_push -Wl,--wrap=txl_frame_push_force -Wl,--wrap=txl_frame_cfm -Wl,--wrap=txl_cfm_push -Wl,--wrap=rxu_cntrl_frame_handle".}
+  when defined(bl808WifiConnectTraceRawRx):
+    {.passL: "-Wl,--wrap=rxl_cntrl_evt".}
+  when defined(bl808WifiUseBl808Rf):
+    {.passL: "-Wl,--start-group src/bl808/librf_bl808.a -Wl,--end-group".}
+  else:
+    {.passL: "-Wl,--start-group build/bl_iot_sdk_b773b3f/components/platform/soc/bl606p/bl606p_phyrf/lib/libbl606p_phyrf.a -Wl,--end-group".}
 
   var
     wifiInitialized: bool
-    wifiStaEnabled: bool
-    wifiStaConnected: bool
     wifiApEnabled: bool
-    wifiStaToken: uint32 = 0x57544153'u32
-    wifiNetifToken: uint32 = 0x4E455449'u32
 
   # --- Initialization ---
-  when defined(bl808WifiVendor):
-    proc bl808_wifi_vendor_init(conf: ptr WifiConf): cint
-      {.importc, cdecl.}
-    proc bl808_wifi_vendor_poll*(iterations: uint32)
-      {.importc, cdecl.}
-    proc bl808_wifi_vendor_connected*(): cint
-      {.importc, cdecl.}
-    proc bl808_wifi_vendor_connect_done*(): cint
-      {.importc, cdecl.}
-    proc bl808_wifi_vendor_disconnect_done*(): cint
-      {.importc, cdecl.}
-    proc bl808_wifi_vendor_last_status*(): cint
-      {.importc, cdecl.}
-    proc bl808_wifi_vendor_last_reason*(): cint
-      {.importc, cdecl.}
-    proc bl808_wifi_vendor_scan_count*(): uint32
-      {.importc, cdecl.}
-    proc bl808_wifi_vendor_scan_done_count*(): uint32
-      {.importc, cdecl.}
-    proc bl808_wifi_vendor_scan_diag_count*(): uint32
-      {.importc, cdecl.}
-    proc bl808_wifi_vendor_scan_diag_get*(index: uint32,
-                                          ssidLen: ptr uint8,
-                                          ssid: ptr uint8,
-                                          channel: ptr uint8,
-                                          rssi: ptr int8,
-                                          auth: ptr uint8,
-                                          cipher: ptr uint8,
-                                          bssid: ptr uint8): cint
-      {.importc, cdecl.}
-    proc bl808_wifi_vendor_mac_irq_count*(): uint32
-      {.importc, cdecl.}
-    proc bl808_wifi_vendor_mac_poll_irq_count*(): uint32
-      {.importc, cdecl.}
-    proc bl808_wifi_vendor_mac_trap_irq_count*(): uint32
-      {.importc, cdecl.}
-    proc bl808_wifi_vendor_ipc_trap_irq_count*(): uint32
-      {.importc, cdecl.}
-    proc bl808_wifi_vendor_ipc_poll_irq_count*(): uint32
-      {.importc, cdecl.}
-    when defined(bl808WifiNimFw):
-      var sm_state {.importc.}: uint16
-      proc txl_transmit_trigger*() {.importc, cdecl.}
-      proc txl_frame_evt*() {.importc, cdecl.}
-      proc wifi_nimfw_prune_scan_raw_cache_for_ssid*(ssid: cstring,
-                                                     ssidLen: uint32)
-        {.importc, cdecl.}
-      proc wifi_nimfw_set_sta_tx_channel_prepare_enabled*(enabled: uint32)
-        {.importc, cdecl.}
-      proc wifi_nimfw_prepare_sta_tx_channel*() {.importc, cdecl.}
-      proc wifi_nimfw_set_ble_wifi_role_window_enabled*(enabled: uint32)
-        {.importc, cdecl.}
-      proc wifi_nimfw_set_keepalive_qosnull_enabled*(enabled: uint32)
-        {.importc, cdecl.}
-      proc rwip_wlcoex_set*(enabled: bool) {.importc, cdecl.}
+  proc bl808_wifi_backend_init(conf: ptr WifiConf): cint
+    {.importc: "bl808_wifi_backend_init", cdecl.}
+  proc bl808_wifi_backend_poll*(iterations: uint32)
+    {.importc: "bl808_wifi_backend_poll", cdecl.}
+  proc bl808_wifi_backend_connected*(): cint
+    {.importc: "bl808_wifi_backend_connected", cdecl.}
+  proc bl808_wifi_backend_connect_done*(): cint
+    {.importc: "bl808_wifi_backend_connect_done", cdecl.}
+  proc bl808_wifi_backend_disconnect_done*(): cint
+    {.importc: "bl808_wifi_backend_disconnect_done", cdecl.}
+  proc bl808_wifi_backend_last_status*(): cint
+    {.importc: "bl808_wifi_backend_last_status", cdecl.}
+  proc bl808_wifi_backend_last_reason*(): cint
+    {.importc: "bl808_wifi_backend_last_reason", cdecl.}
+  proc bl808_wifi_backend_scan_count*(): uint32
+    {.importc: "bl808_wifi_backend_scan_count", cdecl.}
+  proc bl808_wifi_backend_scan_done_count*(): uint32
+    {.importc: "bl808_wifi_backend_scan_done_count", cdecl.}
+  proc bl808_wifi_backend_scan_diag_count*(): uint32
+    {.importc: "bl808_wifi_backend_scan_diag_count", cdecl.}
+  proc bl808_wifi_backend_scan_diag_get*(index: uint32,
+                                         ssidLen: ptr uint8,
+                                         ssid: ptr uint8,
+                                         channel: ptr uint8,
+                                         rssi: ptr int8,
+                                         auth: ptr uint8,
+                                         cipher: ptr uint8,
+                                         bssid: ptr uint8): cint
+    {.importc: "bl808_wifi_backend_scan_diag_get", cdecl.}
+  proc bl808_wifi_backend_mac_irq_count*(): uint32
+    {.importc: "bl808_wifi_backend_mac_irq_count", cdecl.}
+  proc bl808_wifi_backend_mac_poll_irq_count*(): uint32
+    {.importc: "bl808_wifi_backend_mac_poll_irq_count", cdecl.}
+  proc bl808_wifi_backend_mac_trap_irq_count*(): uint32
+    {.importc: "bl808_wifi_backend_mac_trap_irq_count", cdecl.}
+  proc bl808_wifi_backend_ipc_trap_irq_count*(): uint32
+    {.importc: "bl808_wifi_backend_ipc_trap_irq_count", cdecl.}
+  proc bl808_wifi_backend_ipc_poll_irq_count*(): uint32
+    {.importc: "bl808_wifi_backend_ipc_poll_irq_count", cdecl.}
+  var sm_state {.importc.}: uint16
+  proc txl_transmit_trigger*() {.importc, cdecl.}
+  proc txl_frame_evt*() {.importc, cdecl.}
+  proc wifi_nimfw_prune_scan_raw_cache_for_ssid*(ssid: cstring,
+                                                 ssidLen: uint32)
+    {.importc, cdecl.}
+  proc wifi_nimfw_set_sta_tx_channel_prepare_enabled*(enabled: uint32)
+    {.importc, cdecl.}
+  proc wifi_nimfw_prepare_sta_tx_channel*() {.importc, cdecl.}
+  proc wifi_nimfw_set_ble_wifi_role_window_enabled*(enabled: uint32)
+    {.importc, cdecl.}
+  proc wifi_nimfw_set_keepalive_qosnull_enabled*(enabled: uint32)
+    {.importc, cdecl.}
+  proc rwip_wlcoex_set*(enabled: bool) {.importc, cdecl.}
 
-    proc wifi_mgmr_init*(conf: ptr WifiConf): cint {.cdecl.} =
-      let rc = bl808_wifi_vendor_init(conf)
-      wifiInitialized = rc == 0
-      rc
-  else:
-    proc wifi_mgmr_init*(conf: ptr WifiConf): cint {.cdecl.} =
-      discard conf
-      wifiInitialized = true
-      0
+  proc wifi_mgmr_init*(conf: ptr WifiConf): cint {.cdecl.} =
+    let rc = bl808_wifi_backend_init(conf)
+    wifiInitialized = rc == 0
+    rc
 
-  when defined(bl808WifiVendor):
-    proc wifi_mgmr_sta_enable*(): WifiInterface {.importc, cdecl.}
-      ## Enable STA mode. Returns interface handle.
-  else:
-    proc wifi_mgmr_sta_enable*(): WifiInterface {.cdecl.} =
-      ## Enable STA mode. Returns interface handle.
-      if not wifiInitialized:
-        return nil
-      wifiStaEnabled = true
-      cast[WifiInterface](addr wifiStaToken)
+  proc wifi_mgmr_sta_enable*(): WifiInterface {.importc, cdecl.}
+    ## Enable STA mode. Returns interface handle.
 
   # --- Station connect/disconnect ---
-  when defined(bl808WifiVendor):
-    proc wifi_mgmr_sta_connect*(iface: ptr WifiInterface,
-                                ssid: cstring, psk: cstring, pmk: cstring,
-                                mac: ptr uint8, band: uint8, chan_id: uint8): cint
-      {.importc, cdecl.}
+  proc wifi_mgmr_sta_connect*(iface: ptr WifiInterface,
+                              ssid: cstring, psk: cstring, pmk: cstring,
+                              mac: ptr uint8, band: uint8, chan_id: uint8): cint
+    {.importc, cdecl.}
 
-    proc wifi_mgmr_sta_disconnect*(): cint {.importc, cdecl.}
-    when defined(bl808WifiNimFw):
-      proc bl_main_disconnect*(): cint {.importc, cdecl.}
-  else:
-    proc wifi_mgmr_sta_connect*(iface: ptr WifiInterface,
-                                ssid: cstring, psk: cstring, pmk: cstring,
-                                mac: ptr uint8, band: uint8, chan_id: uint8): cint {.cdecl.} =
-      discard psk
-      discard pmk
-      discard mac
-      discard band
-      discard chan_id
-      if iface == nil or iface[] == nil or ssid == nil or not wifiStaEnabled:
-        return -1
-      wifiStaConnected = true
-      0
-
-    proc wifi_mgmr_sta_disconnect*(): cint {.cdecl.} =
-      wifiStaConnected = false
-      if wifiStaEnabled: 0 else: -1
+  proc wifi_mgmr_sta_disconnect*(): cint {.importc, cdecl.}
+  proc bl_main_disconnect*(): cint {.importc, cdecl.}
 
   # --- Scanning ---
-  when defined(bl808WifiVendor):
-    proc wifi_mgmr_scan*(iface: ptr WifiInterface, cb: pointer): cint
-      {.importc, cdecl.}
-  else:
-    proc wifi_mgmr_scan*(iface: ptr WifiInterface, cb: pointer): cint {.cdecl.} =
-      discard cb
-      if iface != nil and iface[] != nil and wifiStaEnabled: 0 else: -1
+  proc wifi_mgmr_scan*(iface: ptr WifiInterface, cb: pointer): cint
+    {.importc, cdecl.}
 
   # --- AP mode ---
-  when defined(bl808WifiVendor):
-    proc wifi_mgmr_ap_start*(iface: ptr WifiInterface,
-                             ssid: cstring, hiddenSsid: cint,
-                             passwd: cstring, channel: cint): cint
-      {.importc, cdecl.}
+  proc wifi_mgmr_ap_start*(iface: ptr WifiInterface,
+                           ssid: cstring, hiddenSsid: cint,
+                           passwd: cstring, channel: cint): cint
+    {.importc, cdecl.}
 
-    proc wifi_mgmr_ap_stop*(iface: ptr WifiInterface): cint
-      {.importc, cdecl.}
-  else:
-    proc wifi_mgmr_ap_start*(iface: ptr WifiInterface,
-                             ssid: cstring, hiddenSsid: cint,
-                             passwd: cstring, channel: cint): cint {.cdecl.} =
-      discard hiddenSsid
-      discard passwd
-      if iface == nil or iface[] == nil or ssid == nil or channel <= 0:
-        return -1
-      wifiApEnabled = true
-      0
-
-    proc wifi_mgmr_ap_stop*(iface: ptr WifiInterface): cint {.cdecl.} =
-      if iface == nil or iface[] == nil:
-        return -1
-      wifiApEnabled = false
-      0
+  proc wifi_mgmr_ap_stop*(iface: ptr WifiInterface): cint
+    {.importc, cdecl.}
 
   # --- Status ---
-  when defined(bl808WifiVendor):
-    proc wifi_mgmr_sta_netif_get*(): pointer {.importc, cdecl.}
-      ## Returns struct netif* (lwIP network interface for STA).
-  else:
-    proc wifi_mgmr_sta_netif_get*(): pointer {.cdecl.} =
-      ## Returns struct netif* (lwIP network interface for STA).
-      if wifiStaEnabled: cast[pointer](addr wifiNetifToken) else: nil
+  proc wifi_mgmr_sta_netif_get*(): pointer {.importc, cdecl.}
+    ## Returns struct netif* (lwIP network interface for STA).
 
-  # --- PHY/RF companion archive used by both firmware backends ---
+  # --- PHY/RF companion archive used by the Nim firmware backend ---
   proc phy_init*(cfg: pointer): cint
     {.importc, cdecl.}
     ## Initialize PHY. Called internally by wifi_mgmr_init.
@@ -554,7 +367,7 @@ when defined(bl808m0):
     {.importc, cdecl.}
     ## Initialize RF. Called internally by wifi_mgmr_init.
 
-  # --- WiFi firmware internals (Nim backend or src/bl808/libwifi_fw.a) ---
+  # --- WiFi firmware internals (Nim backend) ---
   proc bl_init*(): cint
     {.importc, cdecl.}
     ## Low-level WiFi firmware init.
@@ -578,116 +391,93 @@ when defined(bl808m0):
     wifiDisconnectIssueTimeoutMs: uint32
 
   proc wifiBackendPoll(count: uint32) {.inline.} =
-    when defined(bl808WifiVendor):
-      bl808_wifi_vendor_poll(count)
-    else:
-      discard count
+    bl808_wifi_backend_poll(count)
 
   proc wifiBackendConnected(): bool {.inline.} =
-    when defined(bl808WifiVendor):
-      bl808_wifi_vendor_connected() != 0
-    else:
-      wifiGetNetif() != nil
+    bl808_wifi_backend_connected() != 0
 
   proc wifiBackendScanDone(): bool {.inline.} =
-    when defined(bl808WifiVendor):
-      bl808_wifi_vendor_scan_done_count() > 0'u32
-    else:
-      true
+    bl808_wifi_backend_scan_done_count() > 0'u32
 
   proc wifiBackendScanCount(): uint32 {.inline.} =
-    when defined(bl808WifiVendor):
-      bl808_wifi_vendor_scan_count()
-    else:
-      0'u32
+    bl808_wifi_backend_scan_count()
 
   proc wifiBackendConnectDone(): bool {.inline.} =
-    when defined(bl808WifiVendor):
-      bl808_wifi_vendor_connect_done() != 0
-    else:
-      true
+    bl808_wifi_backend_connect_done() != 0
 
   proc wifiBackendDisconnectDone(): bool {.inline.} =
-    when defined(bl808WifiVendor):
-      bl808_wifi_vendor_disconnect_done() != 0
-    else:
-      true
+    bl808_wifi_backend_disconnect_done() != 0
+
+  proc wifiBackendUsesEventFutures(): bool {.inline.} =
+    true
 
   proc wifiNimFirmwareStaIdle(): bool {.inline.} =
-    when defined(bl808WifiNimFw):
-      sm_state == 0'u16
-    else:
-      true
+    sm_state == 0'u16
 
   proc wifiNimFirmwareIssueDisconnect(): cint {.inline.} =
-    when defined(bl808WifiNimFw):
-      bl_main_disconnect()
-    else:
-      wifi_mgmr_sta_disconnect()
+    bl_main_disconnect()
+
+  proc wifiBackendStaDisconnect(): cint {.inline.} =
+    wifi_mgmr_sta_disconnect()
+
+  proc wifiNimFirmwareDisconnectNeedsDrain(): bool {.inline.} =
+    true
 
   proc wifiNimFirmwarePruneScanCache(ssid: string) {.inline.} =
-    when defined(bl808WifiNimFw):
-      wifi_nimfw_prune_scan_raw_cache_for_ssid(ssid.cstring, ssid.len.uint32)
-    else:
-      discard ssid
+    wifi_nimfw_prune_scan_raw_cache_for_ssid(ssid.cstring, ssid.len.uint32)
 
   proc wifiNimFirmwareServiceTx(count: uint32) {.inline.} =
-    when defined(bl808WifiNimFw):
-      discard wifi_nimfw_service_sta_postponed(count)
-      for _ in 0'u32 ..< count:
-        txl_transmit_trigger()
-        txl_frame_evt()
-    else:
-      discard count
+    discard wifi_nimfw_service_sta_postponed(count)
+    for _ in 0'u32 ..< count:
+      txl_transmit_trigger()
+      txl_frame_evt()
 
   proc wifiNimFirmwareSetBleCoexMode(mode: uint32) {.inline.} =
-    when defined(bl808WifiNimFw):
-      coex_pta_force_autocontrol_set(mode)
-      rwip_wlcoex_set(mode != wifiBleCoexWifiAlwaysOn)
-      wifi_nimfw_set_sta_tx_channel_prepare_enabled(
-        if mode == wifiBleCoexWifiPriority: 1'u32 else: 0'u32)
-      wifi_nimfw_set_ble_wifi_role_window_enabled(
-        if mode == wifiBleCoexWifiPriority: 1'u32 else: 0'u32)
-    else:
-      discard mode
+    coex_pta_force_autocontrol_set(mode)
+    rwip_wlcoex_set(mode != wifiBleCoexWifiAlwaysOn)
+    wifi_nimfw_set_sta_tx_channel_prepare_enabled(
+      if mode == wifiBleCoexWifiPriority: 1'u32 else: 0'u32)
+    wifi_nimfw_set_ble_wifi_role_window_enabled(
+      if mode == wifiBleCoexWifiPriority: 1'u32 else: 0'u32)
 
   proc wifiNimFirmwareReclaimStaTxChannel() {.inline.} =
-    when defined(bl808WifiNimFw):
-      wifi_nimfw_prepare_sta_tx_channel()
+    wifi_nimfw_prepare_sta_tx_channel()
 
   proc wifiNimFirmwareSendStaKeepaliveFrame(): WifiError {.inline.} =
-    when defined(bl808WifiNimFw):
-      case wifi_nimfw_send_sta_null_frame()
-      of 0'u8: wifiOk
-      of 2'u8: wifiBusy
-      else: wifiFail
-    else:
-      wifiFail
+    case wifi_nimfw_send_sta_null_frame()
+    of 0'u8: wifiOk
+    of 2'u8: wifiBusy
+    else: wifiFail
 
   proc wifiNimFirmwareSetKeepaliveQosNull(enabled: bool) {.inline.} =
-    when defined(bl808WifiNimFw):
-      wifi_nimfw_set_keepalive_qosnull_enabled(
-        if enabled: 1'u32 else: 0'u32)
-    else:
-      discard enabled
+    wifi_nimfw_set_keepalive_qosnull_enabled(
+      if enabled: 1'u32 else: 0'u32)
 
   proc wifiNimFirmwareKeepaliveAckOkCount(): uint32 {.inline.} =
-    when defined(bl808WifiNimFw):
-      wifi_nimfw_null_frame_ack_ok_count()
-    else:
-      0'u32
+    wifi_nimfw_null_frame_ack_ok_count()
 
   proc wifiNimFirmwareKeepaliveConfirmCount(): uint32 {.inline.} =
-    when defined(bl808WifiNimFw):
-      wifi_nimfw_null_frame_cfm_count()
-    else:
-      0'u32
+    wifi_nimfw_null_frame_cfm_count()
 
   proc wifiNimFirmwareKeepaliveFailCount(): uint32 {.inline.} =
-    when defined(bl808WifiNimFw):
-      wifi_nimfw_null_frame_fail_count()
+    wifi_nimfw_null_frame_fail_count()
+
+  when defined(bl808WifiNimFwDiag):
+    proc dcTrace(s: cstring) {.importc: "cfg_trace", cdecl.}
+    proc dcTraceRc(s: cstring; v: cint) {.importc: "cfg_trace_rc", cdecl.}
+
+  proc wifiDisconnectTrace(message: cstring) {.inline.} =
+    when defined(bl808WifiNimFwDiag):
+      dcTrace(message)
     else:
-      0'u32
+      discard message
+
+  proc wifiDisconnectTraceRc(message: cstring; value: cint) {.inline.} =
+    when defined(bl808WifiNimFwDiag):
+      dcTraceRc(message, value)
+    else:
+      discard message
+      discard value
 
   proc cancelWifiTimer(timerId: var TimerId) =
     if timerId != 0'u32:
@@ -743,6 +533,28 @@ when defined(bl808m0):
     if wifiDisconnectFuture != nil and not wifiDisconnectFuture.finished:
       if wifiBackendDisconnectDone() or wifiNimFirmwareStaIdle():
         completeWifiDisconnect(wifiOk)
+
+  proc wifiBeginScanWait(timeoutMs: uint32): CpsFuture[uint32] =
+    if not wifiBackendUsesEventFutures():
+      return completedLocalFuture(0'u32)
+    wifiScanFuture = newLocalCpsFuture[uint32]()
+    if timeoutMs != 0'u32:
+      wifiScanTimer = addTimerMs(timeoutMs.uint64, proc() =
+        completeWifiScan(0'u32)
+      )
+    wifiCompletePendingEvents()
+    return wifiScanFuture
+
+  proc wifiBeginConnectWait(timeoutMs: uint32): CpsFuture[WifiError] =
+    if not wifiBackendUsesEventFutures():
+      return completedLocalFuture(if wifiBackendConnected(): wifiOk else: wifiFail)
+    wifiConnectFuture = newLocalCpsFuture[WifiError]()
+    if timeoutMs != 0'u32:
+      wifiConnectTimer = addTimerMs(timeoutMs.uint64, proc() =
+        completeWifiConnect(wifiFail)
+      )
+    wifiCompletePendingEvents()
+    return wifiConnectFuture
 
   proc wifiServicePump*(iterations: uint32 = 8'u32) {.cdecl.} =
     ## One bounded WiFi control-plane service step. The MAC/firmware timing
@@ -903,34 +715,22 @@ when defined(bl808m0):
     let rc = wifi_mgmr_scan(addr staIface, nil)
     if rc != 0:
       return completedLocalFuture(0'u32)
-    when defined(bl808WifiVendor):
-      wifiScanFuture = newLocalCpsFuture[uint32]()
-      if timeoutMs != 0'u32:
-        wifiScanTimer = addTimerMs(timeoutMs.uint64, proc() =
-          completeWifiScan(0'u32)
-        )
-      wifiCompletePendingEvents()
-      return wifiScanFuture
-    else:
-      return completedLocalFuture(0'u32)
+    return wifiBeginScanWait(timeoutMs)
 
   proc wifiConnect*(ssid, password: string, channel: uint8 = 0): WifiError =
     ## Connect to a WiFi AP.
-    when defined(bl808WifiNimFw):
-      wifi_nimfw_prune_scan_raw_cache_for_ssid(ssid.cstring, ssid.len.uint32)
+    wifiNimFirmwarePruneScanCache(ssid)
     let rc = wifi_mgmr_sta_connect(
       addr staIface, ssid.cstring, password.cstring,
       nil, nil, 0, channel)
-    when defined(bl808WifiVendor):
-      if rc != 0:
-        return wifiFail
+    if rc != 0:
+      return wifiFail
+    if wifiBackendUsesEventFutures():
       for _ in 0 ..< 30_000:
-        bl808_wifi_vendor_poll(8)
-        if bl808_wifi_vendor_connect_done() != 0:
+        wifiBackendPoll(8)
+        if wifiBackendConnectDone():
           break
-      return if bl808_wifi_vendor_connected() != 0: wifiOk else: wifiFail
-    else:
-      return if rc == 0: wifiOk else: wifiFail
+    return if wifiBackendConnected(): wifiOk else: wifiFail
 
   proc wifiConnectAsync*(ssid, password: string,
                          channel: uint8 = 0,
@@ -938,88 +738,66 @@ when defined(bl808m0):
     if wifiConnectFuture != nil and not wifiConnectFuture.finished:
       return failedLocalFuture[WifiError](
         newException(CatchableError, "WiFi connect already pending"))
-    when defined(bl808WifiNimFw):
-      wifi_nimfw_prune_scan_raw_cache_for_ssid(ssid.cstring, ssid.len.uint32)
+    wifiNimFirmwarePruneScanCache(ssid)
     let rc = wifi_mgmr_sta_connect(
       addr staIface, ssid.cstring, password.cstring,
       nil, nil, 0, channel)
-    when defined(bl808WifiVendor):
-      if rc != 0:
-        return completedLocalFuture(wifiFail)
-      wifiConnectFuture = newLocalCpsFuture[WifiError]()
-      if timeoutMs != 0'u32:
-        wifiConnectTimer = addTimerMs(timeoutMs.uint64, proc() =
-          completeWifiConnect(wifiFail)
-        )
-      wifiCompletePendingEvents()
-      return wifiConnectFuture
-    else:
-      return completedLocalFuture(if rc == 0: wifiOk else: wifiFail)
-
-  when defined(bl808WifiVendor) and defined(bl808WifiNimFwDiag):
-    proc dcTrace(s: cstring) {.importc: "cfg_trace", cdecl.}
-    proc dcTraceRc(s: cstring; v: cint) {.importc: "cfg_trace_rc", cdecl.}
+    if rc != 0:
+      return completedLocalFuture(wifiFail)
+    return wifiBeginConnectWait(timeoutMs)
 
   proc wifiWaitStaIdleAsync(timeoutMs: uint32 = 2_000): CpsFuture[WifiError] =
-    when defined(bl808WifiVendor) and defined(bl808WifiNimFw):
-      if sm_state == 0'u16:
-        return completedLocalFuture(wifiOk)
-      if wifiStaIdleFuture != nil and not wifiStaIdleFuture.finished:
-        return wifiStaIdleFuture
-      wifiStaIdleFuture = newLocalCpsFuture[WifiError]()
-      if timeoutMs != 0'u32:
-        wifiStaIdleTimer = addTimerMs(timeoutMs.uint64, proc() =
-          completeWifiStaIdle(wifiFail)
-        )
-      wifiCompletePendingEvents()
-      return wifiStaIdleFuture
-    else:
+    if wifiNimFirmwareStaIdle():
       return completedLocalFuture(wifiOk)
+    if wifiStaIdleFuture != nil and not wifiStaIdleFuture.finished:
+      return wifiStaIdleFuture
+    wifiStaIdleFuture = newLocalCpsFuture[WifiError]()
+    if timeoutMs != 0'u32:
+      wifiStaIdleTimer = addTimerMs(timeoutMs.uint64, proc() =
+        completeWifiStaIdle(wifiFail)
+      )
+    wifiCompletePendingEvents()
+    return wifiStaIdleFuture
 
   proc wifiIssueDisconnectAsync(timeoutMs: uint32 = 10_000): CpsFuture[WifiError] =
-    when defined(bl808WifiVendor) and defined(bl808WifiNimFw):
-      wifiDisconnectFuture = newLocalCpsFuture[WifiError]()
-      wifiDisconnectIssuePending = true
-      wifiDisconnectIssueTimeoutMs = timeoutMs
-      return wifiDisconnectFuture
-    else:
-      let rc = wifi_mgmr_sta_disconnect()
+    if not wifiBackendUsesEventFutures():
+      let rc = wifiNimFirmwareIssueDisconnect()
       return completedLocalFuture(if rc == 0: wifiOk else: wifiFail)
+    wifiDisconnectFuture = newLocalCpsFuture[WifiError]()
+    wifiDisconnectIssuePending = true
+    wifiDisconnectIssueTimeoutMs = timeoutMs
+    return wifiDisconnectFuture
 
   proc wifiDisconnect*(): WifiError =
-    when defined(bl808WifiVendor):
-      bl808_wifi_vendor_poll(8)
-      if bl808_wifi_vendor_connected() == 0:
-        return wifiOk
-    when defined(bl808WifiVendor) and defined(bl808WifiNimFw):
-      when defined(bl808WifiNimFwDiag):
-        dcTrace("[DC] enter\n")
-      bl808_wifi_vendor_poll(64)
-      when defined(bl808WifiNimFwDiag):
-        dcTrace("[DC] poll64 done\n")
+    wifiBackendPoll(8)
+    if not wifiBackendConnected():
+      return wifiOk
+    if wifiNimFirmwareDisconnectNeedsDrain():
+      wifiDisconnectTrace("[DC] enter\n")
+      wifiBackendPoll(64)
+      wifiDisconnectTrace("[DC] poll64 done\n")
       for _ in 0 ..< 2000:
-        if sm_state == 0'u16:
+        if wifiNimFirmwareStaIdle():
           break
-        bl808_wifi_vendor_poll(8)
-      when defined(bl808WifiNimFwDiag):
-        dcTrace("[DC] pre-loop done\n")
-    let rc = wifi_mgmr_sta_disconnect()
-    when defined(bl808WifiVendor) and defined(bl808WifiNimFw):
-      when defined(bl808WifiNimFwDiag):
-        dcTraceRc("[DC] sta_disconnect rc=", rc.cint)
+        wifiBackendPoll(8)
+      wifiDisconnectTrace("[DC] pre-loop done\n")
+    let rc = wifiBackendStaDisconnect()
+    if wifiNimFirmwareDisconnectNeedsDrain():
+      wifiDisconnectTraceRc("[DC] sta_disconnect rc=", rc.cint)
       if rc != 0:
         return wifiFail
       var loopIter: int = 0
       for _ in 0 ..< 10_000:
-        bl808_wifi_vendor_poll(8)
-        if bl808_wifi_vendor_disconnect_done() != 0 or sm_state == 0'u16:
+        wifiBackendPoll(8)
+        if wifiBackendDisconnectDone() or wifiNimFirmwareStaIdle():
           return wifiOk
         inc loopIter
-        when defined(bl808WifiNimFwDiag):
-          if (loopIter mod 500) == 0:
-            dcTraceRc("[DC-poll] iter=", loopIter.cint)
-            dcTraceRc("[DC-poll] sm_state=", sm_state.cint)
-            dcTraceRc("[DC-poll] disc_done=", bl808_wifi_vendor_disconnect_done())
+        if (loopIter mod 500) == 0:
+          wifiDisconnectTraceRc("[DC-poll] iter=", loopIter.cint)
+          wifiDisconnectTraceRc("[DC-poll] sm_state=",
+                                if wifiNimFirmwareStaIdle(): 0.cint else: 1.cint)
+          wifiDisconnectTraceRc("[DC-poll] disc_done=",
+                                if wifiBackendDisconnectDone(): 1.cint else: 0.cint)
       return wifiFail
     else:
       if rc == 0: wifiOk else: wifiFail
@@ -1028,18 +806,15 @@ when defined(bl808m0):
     if wifiDisconnectFuture != nil and not wifiDisconnectFuture.finished:
       return failedLocalFuture[WifiError](
         newException(CatchableError, "WiFi disconnect already pending"))
-    when defined(bl808WifiVendor):
-      wifiServicePump()
-      if bl808_wifi_vendor_connected() == 0:
-        return completedLocalFuture(wifiOk)
-    when defined(bl808WifiVendor) and defined(bl808WifiNimFw):
+    wifiServicePump()
+    if not wifiBackendConnected():
+      return completedLocalFuture(wifiOk)
+    if wifiBackendUsesEventFutures():
       if wifiStaIdleFuture != nil and not wifiStaIdleFuture.finished:
         return failedLocalFuture[WifiError](
           newException(CatchableError, "WiFi disconnect already pending"))
       wifiServicePump(64)
-      return wifiIssueDisconnectAsync(timeoutMs)
-    else:
-      return wifiIssueDisconnectAsync(timeoutMs)
+    return wifiIssueDisconnectAsync(timeoutMs)
 
   proc wifiStartAp*(ssid, password: string, channel: int = 1): WifiError =
     let rc = wifi_mgmr_ap_start(addr staIface, ssid.cstring,

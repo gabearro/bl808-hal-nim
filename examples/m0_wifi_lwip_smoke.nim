@@ -2,7 +2,7 @@
 ##
 ## Build with:
 ##   make m0 FILE=examples/m0_wifi_lwip_smoke.nim \
-##     NIM="nim -d:bl808kernel -d:bl808WifiVendor \
+##     NIM="nim -d:bl808kernel -d:bl808WifiNimFw \
 ##              -d:WifiSsid=Frog -d:WifiPassword=<wifi-password>"
 ##
 ## Per attempt: scan -> auth -> 4whs -> assoc (synthetic) -> DHCP.
@@ -19,7 +19,7 @@ import bl808/kernel/alloc
 import bl808/kernel/clock
 import bl808/kernel/e2e_marker
 import bl808/kernel/e2e_runner
-when defined(bl808WifiVendor):
+when defined(bl808WifiNimFw):
   import bl808/kernel/jtaglog
 
 const
@@ -35,7 +35,7 @@ const
 
 # --- Inline lwIP bindings ---
 # The `lwip/*.h` include path comes from kernel/lwipcore.nim's passC, which
-# is pulled in transitively by `import bl808/wifi` under `-d:bl808WifiVendor`.
+# is pulled in transitively by `import bl808/wifi` under `-d:bl808WifiNimFw`.
 # Vendor lwIP C objects (raw.c, dhcp.c, timeouts.c, ...) are also compiled
 # via lwipcore. We declare only the symbols this binary needs.
 type
@@ -298,7 +298,7 @@ proc main() {.exportc, cdecl.} =
   systemInit()
   heapInit()
   setupConsole()
-  when defined(bl808WifiVendor):
+  when defined(bl808WifiNimFw):
     hwValidationLogReset()
   e2eMarkerInit(addr console)
   discard console.sendLine("")

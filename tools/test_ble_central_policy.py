@@ -204,21 +204,21 @@ def test_ble_central_timeouts_use_kernel_clock_abstraction():
     assert "clicReadMtime()" not in connect_body
 
 
-def test_ble_rf_delay_service_matches_reference_calibration_latch_clear():
+def test_ble_rf_delay_service_clears_txcal_latch_without_faking_fcal_ready():
     source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
     text = source.read_text(encoding="utf-8")
 
     service_body = text.split("proc serviceBleRfCalibrationLatch() =", 1)[1].split(
         "proc bleRfDelayUs", 1
     )[0]
+    assert "var txcal = regRead(BleRfTxPowerReg.uint)" in service_body
     assert "txcal = txcal and not BleRfTxcalLatchMask" in service_body
     assert "regWrite(BleRfTxPowerReg.uint, txcal)" in service_body
     assert "fcal = fcal or BleRfFcalReadyMask" not in service_body
     assert "regWrite(BleRfFcalReg.uint, fcal)" not in service_body
     assert "if (fcal and BleRfFcalReadyMask) != 0'u32:" in service_body
     assert "inc nim_ble_rf_fcal_ready_count" in service_body
-    assert "touched = true" in service_body
-    assert "nimDisableM0RfClicIrq()" in service_body
+    assert "inc nim_ble_rf_txcal_latch_count" in service_body
 
 
 def test_ble_rf_init_and_channel_retune_settle_calibration_latches():
@@ -261,6 +261,9 @@ def test_ble_rf_init_and_channel_retune_settle_calibration_latches():
     assert "BleRegInit(address: 0x24C00824'u32, value: 0x0000010D'u32)" in text
     assert "BleRegInit(address: 0x24C0083C'u32, value: 0x04920492'u32)" in text
     assert "BleRegInit(address: 0x24C00860'u32, value: 0x00007F03'u32)" in text
+    assert "BleRfPower4DbmTxCal = 0x0010C222'u32" in text
+    assert "BleRegInit(address: 0x200010B4'u32, value: BleRfPower4DbmTxCal)" in text
+    assert "0x0002A222'u32" not in text
     assert "0x0010331F'u32" not in text
     assert "0x0210031F'u32" not in text
     assert "word = word and not BleRfOptimizeMidBandMask" in optimize_body
@@ -426,17 +429,14 @@ def test_ble_role_starts_do_not_rerun_full_rf_calibration():
             "proc programNimAdvertising", 1
         )[0],
         text.split("proc programNimAdvertising", 1)[1].split(
-            "when defined(bl808m0) and defined(bl808BleVendorLldScanProbe):", 1
-        )[0],
-        text.split("proc programVendorLldInitiator", 1)[1].split(
-            "proc programVendorLldScan", 1
-        )[0],
-        text.split("proc programVendorLldScan", 1)[1].split(
             "proc hciCommandStatusEvent", 1
         )[0],
     ]:
         assert "ensureBleRf1MConfigured()" in body
         assert "configureBleRf1M()" not in body
+
+    assert "proc programVendorLldInitiator" not in text
+    assert "proc programVendorLldScan" not in text
 
 
 def test_wireless_domain_reset_invalidates_ble_rf_ready_cache():
@@ -473,8 +473,8 @@ def test_ble_connection_handoff_preserves_rx_descriptor_ring():
     assert "syncBtbleRxDescHeadToLldEnv" not in text
 
     peripheral_handoff = text.split(
-        "proc startVendorLldConnectionFromConnectInd", 1
-    )[1].split("proc handleVendorConnectInd", 1)[0]
+        "proc startNimConnectionFromConnectInd", 1
+    )[1].split("proc handleNimConnectInd", 1)[0]
     assert "prepareBtbleConnectionRxRingForHandoff()" in peripheral_handoff
     assert "0x0000013E'u32" not in peripheral_handoff
 
@@ -498,7 +498,7 @@ def test_lld_rxdesc_free_matches_sdk_head_advance_semantics():
     text = source.read_text(encoding="utf-8")
 
     body = text.split("proc lld_rxdesc_free*", 1)[1].split(
-        "when bl808BleConnManualTx:", 1
+        "when bl808BleNimManualConnTx:", 1
     )[0]
     assert "discard desc" in body
     assert "if nim_lld_rx_desc_active != 0" not in body
@@ -620,7 +620,7 @@ def test_pure_ble_rf_table_preserves_connection_em_config_byte():
     assert "doAssert offsetof(BtbleRfTableView, calibrationWord) == 0x3E" in text
 
     init_body = text.split("proc btble_rf_init", 1)[1].split(
-        "when defined(bl808m0) and defined(bl808BleVendorLldScanProbe)", 1
+        "# ---------------------------------------------------------------------------", 1
     )[0]
     assert "proc nimRfTxpwrDbmGet(cs: uint8, high: uint8): int8 {.cdecl.}" in text
     assert "table.reserved08 = nil" in init_body
@@ -642,19 +642,23 @@ def test_pure_ble_legacy_advertiser_uses_known_good_em_words():
     source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
     text = source.read_text(encoding="utf-8")
 
-    assert "BtbleLegacyAdvEventHeader = 0x0021'u16" in text
-    assert "BtbleLegacyAdvEventWord124 = 0x69F5'u16" in text
-    assert "BtbleLegacyAdvWord138 = 0xF104'u16" in text
-    assert "BtbleLegacyAdvWord13C = 0x7D16'u16" in text
-    assert "BtbleLegacyAdvControl = 0x11942542'u32" in text
-    assert "BtbleLegacyAdvTimingHigh = 0x013C'u16" in text
-    assert "BtbleLegacyAdvTimingLow = 0x3D91'u16" in text
-    assert "BtbleLegacyAdvTail = 0xA765'u16" in text
-    assert "BtbleLegacyAdvTxDescFlags = 0xF2CF'u16" in text
-    assert "BtbleLegacyAdvTxTailLow = 0xE496'u16" in text
-    assert "BtbleLegacyAdvTxTailHigh = 0x7B1F'u16" in text
-    assert "BtbleLegacyAdvRxTailLow = 0xBEE8'u16" in text
-    assert "BtbleLegacyAdvRxTailHigh = 0x55FB'u16" in text
+    assert "BtbleLegacyAdvEventHeaderBase = 0x0020'u16" in text
+    assert "BtbleLegacyAdvEventWord124 = 0xE3F5'u16" in text
+    assert "BtbleLegacyAdvWord138 = 0xF102'u16" in text
+    assert "BtbleLegacyAdvWord13C = 0xBD86'u16" in text
+    assert "BtbleLegacyAdvControl = 0x11842182'u32" in text
+    assert "BtbleLegacyAdvTimingHigh = 0x1338'u16" in text
+    assert "BtbleLegacyAdvTimingLow = 0x3FD1'u16" in text
+    assert "BtbleLegacyAdvTail = 0xE745'u16" in text
+    assert "BtbleLegacyAdvTxDescFlags = 0xF84F'u16" in text
+    assert "BtbleLegacyAdvTxTailLow = 0x4592'u16" in text
+    assert "BtbleLegacyAdvTxTailHigh = 0x7B9F'u16" in text
+    assert "BtbleLegacyAdvRxTailLow = 0x8EEC'u16" in text
+    assert "BtbleLegacyAdvRxTailHigh = 0x51FB'u16" in text
+    assert "BtbleScanRspDataOffset = 0x0A4C'u32" in text
+    assert "BtbleLegacyScanRspEmptyPtr = 0x0000'u16" in text
+    assert "BtbleLegacyScanRspEmptyTail = 0x2601'u16" in text
+    assert "BtbleLegacyScanRspDataTail = 0x2601'u16" in text
 
 
 def test_legacy_advertising_uses_spec_random_adv_delay():
@@ -700,14 +704,30 @@ def test_legacy_advertising_chsel_matches_supported_features():
     assert "0'u16" in chsel_body
 
     adv_body = text.split("proc programBtbleLegacyAdv", 1)[1].split(
-        "when defined(bl808m0) and defined(bl808BleVendorLldAdvProbe)", 1
+        "proc btbleDelayTicksToSlots", 1
     )[0]
     assert "let advHeaderFlags = NimBleLegacyAdvChSelBit or txAdd" in adv_body
+    assert "let eventAddrType = uint16(nim_adv_params[5] and 0x01'u8)" in adv_body
+    assert "let advEventHeader = BtbleLegacyAdvEventHeaderBase or eventAddrType" in adv_body
     assert "let scanRspHeaderFlags = 0x0004'u16 or txAdd" in adv_body
+    assert "write16(BTBLE_EM_BASE + 0x13A'u32, 0'u16)" not in adv_body
     assert "((pduLen and 0x00FF'u16) shl 8) or advHeaderFlags" in adv_body
     assert (
         "((scanRspPduLen and 0x00FF'u16) shl 8) or scanRspHeaderFlags"
         in adv_body
+    )
+    assert "if scanRspLen == 0:" in adv_body
+    assert "write16(BTBLE_EM_BASE + 0x56C'u32, BtbleLegacyScanRspEmptyPtr)" in (
+        adv_body
+    )
+    assert "write16(BTBLE_EM_BASE + 0x56E'u32, BtbleLegacyScanRspEmptyTail)" in (
+        adv_body
+    )
+    assert "write16(BTBLE_EM_BASE + 0x56C'u32, BtbleScanRspDataOffset.uint16)" in (
+        adv_body
+    )
+    assert "write16(BTBLE_EM_BASE + 0x56E'u32, BtbleLegacyScanRspDataTail)" in (
+        adv_body
     )
     assert "((pduLen and 0x00FF'u16) shl 8) or 0x0020'u16" not in adv_body
 
@@ -835,10 +855,10 @@ def test_pure_ble_peripheral_uses_reference_transmit_window_timing():
     assert "intervalHalfUs" not in text
 
     start_body = text.split(
-        "proc vendorLldConStart(conhdl: uint16, params: pointer): uint8 {.cdecl.} =",
+        "proc nimLldConStart(conhdl: uint16, params: pointer): uint8 {.cdecl.} =",
         1,
     )[1].split(
-        "proc vendorLldConLlcpTx", 1
+        "proc nimLldConLlcpTx", 1
     )[0]
     direct_branch = start_body.split(
         "if p[36] != 0'u8:", 1
@@ -928,7 +948,7 @@ def test_rwip_priority_tables_match_sdk_reference_bytes():
         text,
         re.S,
     )
-    assert len(tables) == 3
+    assert len(tables) == 2
     for table in tables:
         collapsed = " ".join(table.split())
         assert (
@@ -950,7 +970,7 @@ def test_rwip_timing_defaults_match_sdk_reference_fallbacks():
             "var rwip_prog_delay* {.exportc.}: uint16 = "
             "RwipDefaultProgramDelaySlots"
         )
-        == 3
+        == 2
     )
     assert text.count(
         "proc rwip_current_drift_get*(): uint32 {.exportc, cdecl.} =\n"
@@ -1101,7 +1121,7 @@ def test_pure_ble_connection_programs_rf_channel_indexes():
     )
     assert "nimConnMappedChannel(nim_conn_state.lastUnmappedChannel)" in select_channel
     assert "let emUnmappedChannel =" not in program_channel
-    start_body = text.split("proc vendorLldConStart", 1)[1].split(
+    start_body = text.split("proc nimLldConStart", 1)[1].split(
         "let scaIdx = p[22]", 1
     )[0]
     assert "nim_conn_state.hopIncrement = p[21] and 0x1F'u8" in start_body
@@ -1150,8 +1170,8 @@ def test_pure_ble_connection_programs_rf_channel_indexes():
     )
 
     connect_handoff = text.split(
-        "proc startVendorLldConnectionFromConnectInd", 1
-    )[1].split("proc serviceQueuedVendorConnectInd", 1)[0]
+        "proc startNimConnectionFromConnectInd", 1
+    )[1].split("proc serviceQueuedNimConnectInd", 1)[0]
     assert "NimConnConnectIndTransmitWindowDelayHalfSlots = 4'u32" in text
     assert "NimConnAdvTypeTimingBit = 0x10'u16" in text
     assert (
@@ -1182,16 +1202,14 @@ def test_pure_ble_connection_programs_rf_channel_indexes():
     timing_path = connect_handoff.split("when bl808BleNimConTimingPath:", 1)[
         1
     ].split("else:", 1)[0]
-    assert "vendorConnectTiming(baseClock, rxFine, rateIdx, timingClock, timingFine)" in (
+    assert "nimConnectTiming(baseClock, rxFine, rateIdx, timingClock, timingFine)" in (
         timing_path
     )
     assert "putLe32(outp, 28, timingClock)" in timing_path
     assert "NimConnConnectIndTransmitWindowDelayHalfSlots" not in timing_path
     assert "outp[39] = nimConnLegacyAdvLeadSelector()" in connect_handoff
-    assert (
-        "putLe16(llc, 38, uint16(outp[38]) or (uint16(outp[39]) shl 8))"
-        in connect_handoff
-    )
+    assert "outp[38] = uint8((header shr 5) and 0x01'u16)" in connect_handoff
+    assert "outp[39] = nimConnLegacyAdvLeadSelector()" in connect_handoff
     assert "let rxFine = btbleAdvRxFine(desc)" in text
     assert "let rxClock = btbleAdvRxClock(desc)" in text
 
@@ -1375,9 +1393,9 @@ def test_pure_ble_connection_tx_descriptors_keep_valid_empty_pdu_armed():
     tx_body = text.split("proc nimConnProgramTxDescriptors", 1)[1].split(
         "proc nimConnArmPendingHostAclTx", 1
     )[0]
-    assert "let aclEmptyPending = nim_vendor_acl_empty_tx_pending != 0'u32" in tx_body
+    assert "let aclEmptyPending = nim_acl_empty_tx_pending != 0'u32" in tx_body
     assert "if not llcpPending and not aclPayloadPending and not aclEmptyPending:" not in tx_body
-    assert "var llid = NimVendorDataLlIdContinuation" in tx_body
+    assert "var llid = NimDataLlIdContinuation" in tx_body
     assert "var pduLen = 0'u8" in tx_body
     assert "elif aclPayloadPending or aclEmptyPending:" in tx_body
     assert "nimConnArmTxDesc(descOff, nextOff, NimConnEmptyDataEmOffset, header)" in (
@@ -1443,13 +1461,13 @@ def test_pure_ble_llcp_filters_malformed_control_pdus():
     source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
     text = source.read_text(encoding="utf-8")
 
-    assert "proc vendorLlcpRxPduValid(opcode: uint8, pduLen: uint16): bool" in text
-    assert "let expected = vendorLlcpWireLength(opcode)" in text
+    assert "proc nimLlcpRxPduValid(opcode: uint8, pduLen: uint16): bool" in text
+    assert "let expected = nimLlcpWireLength(opcode)" in text
     assert "return pduLen == expected.uint16" in text
     assert "LlcpPlausibleFutureOpcodeMax = 0x3F'u8" in text
-    assert "nim_vendor_llcp_rx_malformed_count" in text
-    assert text.count("vendorLlcpRxPduValid(opcode,") >= 5
-    assert text.count("vendorRecordMalformedLlcp(") >= 5
+    assert "nim_llcp_rx_malformed_count" in text
+    assert text.count("nimLlcpRxPduValid(opcode,") >= 5
+    assert text.count("nimLlcpRecordMalformed(") >= 5
 
 
 def test_pure_ble_llcp_rejects_unadvertised_optional_procedures():
@@ -1468,13 +1486,13 @@ def test_pure_ble_llcp_rejects_unadvertised_optional_procedures():
         "of LlcpPingReq:", 1
     )[0]
     assert "if nimBlePhyUpdateSupported():" in phy_req_branch
-    assert "vendorBuildUnsupportedFeatureRsp(opcode)" in phy_req_branch
+    assert "nimLlcpBuildUnsupportedFeatureRsp(opcode)" in phy_req_branch
 
     ping_req_branch = text.split("of LlcpPingReq:", 1)[1].split(
         "of LlcpEncReq", 1
     )[0]
     assert "nimBleLocalFeatureSupported(NimBleFeatureLePing)" in ping_req_branch
-    assert "vendorBuildUnsupportedFeatureRsp(opcode)" in ping_req_branch
+    assert "nimLlcpBuildUnsupportedFeatureRsp(opcode)" in ping_req_branch
 
 
 def test_llc_procedure_state_helpers_match_vendor_proc_env_abi():
@@ -1500,8 +1518,8 @@ def test_authenticated_payload_timeout_path_is_real_nim_not_zero_stub():
     source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
     text = source.read_text(encoding="utf-8")
 
-    assert "vendorZeroStub(llc_auth_payl_nearly_to_handler)" not in text
-    assert "vendorZeroStub(llc_auth_payl_real_to_handler)" not in text
+    assert "abiNoopHandler(llc_auth_payl_nearly_to_handler)" not in text
+    assert "abiNoopHandler(llc_auth_payl_real_to_handler)" not in text
     assert "LlcAuthPayloadNearlyTimerId = 0x0102'u16" in text
     assert "LlcAuthPayloadRealTimerId = 0x0103'u16" in text
     assert "HciEvtAuthenticatedPayloadTimeoutExpired = 0x57'u16" in text
@@ -1531,30 +1549,30 @@ def test_pure_ble_feature_response_uses_peer_intersection():
     source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
     text = source.read_text(encoding="utf-8")
 
-    build_pdu = text.split("proc vendorBuildFeaturePdu", 1)[1].split(
-        "proc vendorBuildLengthPdu", 1
+    build_pdu = text.split("proc nimLlcpBuildFeaturePdu", 1)[1].split(
+        "proc nimLlcpBuildLengthPdu", 1
     )[0]
     assert "features: uint64" in build_pdu
     assert "nimBleFeatureByte(features, i)" in build_pdu
 
-    used_features = text.split("proc vendorLlcpUsedFeaturesForPeer", 1)[1].split(
-        "proc vendorRecordUsedFeatures", 1
+    used_features = text.split("proc nimLlcpUsedFeaturesForPeer", 1)[1].split(
+        "proc nimLlcpRecordUsedFeatures", 1
     )[0]
-    assert "nim_vendor_llcp_state.peerFeaturesKnown" in used_features
+    assert "nim_llcp_state.peerFeaturesKnown" in used_features
     assert "NimBleConservativeLeFeatures and" in used_features
-    assert "nim_vendor_llcp_state.peerFeatures" in used_features
+    assert "nim_llcp_state.peerFeatures" in used_features
 
     request_send = text.split("proc llc_llcp_feats_req_pdu_send", 1)[1].split(
         "proc llc_llcp_feats_rsp_pdu_send", 1
     )[0]
-    assert "vendorBuildFeaturePdu(LlcpFeatureReq)" in request_send
+    assert "nimLlcpBuildFeaturePdu(LlcpFeatureReq)" in request_send
 
-    response_builder = text.split("proc vendorBuildFeatureRsp", 1)[1].split(
-        "proc vendorBuildPhyRsp", 1
+    response_builder = text.split("proc nimLlcpBuildFeatureRsp", 1)[1].split(
+        "proc nimLlcpBuildPhyRsp", 1
     )[0]
-    assert "let features = vendorLlcpUsedFeaturesForPeer()" in response_builder
-    assert "vendorRecordUsedFeatures(features)" in response_builder
-    assert "vendorBuildFeaturePdu(LlcpFeatureRsp, features)" in response_builder
+    assert "let features = nimLlcpUsedFeaturesForPeer()" in response_builder
+    assert "nimLlcpRecordUsedFeatures(features)" in response_builder
+    assert "nimLlcpBuildFeaturePdu(LlcpFeatureRsp, features)" in response_builder
 
 
 def test_pure_ble_connection_does_not_reprocess_duplicate_data_pdus():
@@ -1572,11 +1590,11 @@ def test_pure_ble_connection_does_not_reprocess_duplicate_data_pdus():
     assert "if payloadFresh:" in observe_body
 
     service_body = text.split(
-        "proc serviceVendorConnectionLlcpRxDescriptors", 1
-    )[1].split("when not defined(bl808BleVendorArbProbe)", 1)[0]
+        "proc serviceNimConnectionLlcpRxDescriptors", 1
+    )[1].split("when not defined(bl808m0):", 1)[0]
     assert "var payloadFresh = true" in service_body
     assert "payloadFresh = nim_conn_state.rxPayloadFresh" in service_body
-    assert "if payloadFresh:\n            vendorRecordLlcpRx" in service_body
+    assert "if payloadFresh:\n            nimLlcpRecordRx" in service_body
     assert "if payloadFresh:\n            if sendHostAclData" in service_body
 
 
@@ -1584,22 +1602,22 @@ def test_pure_ble_connection_accepts_done_rx_link_status_before_payload():
     source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
     text = source.read_text(encoding="utf-8")
 
-    assert "NimVendorRxDescLinkMask = 0x7FFF'u16" in text
-    assert "NimVendorRxDescConnErrorMask" not in text
-    assert "NimVendorRxDescConnSyncMiss" not in text
+    assert "NimRxDescLinkMask = 0x7FFF'u16" in text
+    assert "NimRxDescConnErrorMask" not in text
+    assert "NimRxDescConnSyncMiss" not in text
     helper = text.split("proc connRxStatusAcceptsPayload", 1)[1].split(
         "proc rejectConnRxDescriptor", 1
     )[0]
-    assert "(status and NimVendorRxDescDone) != 0'u16" in helper
+    assert "(status and NimRxDescDone) != 0'u16" in helper
     assert "0x8116/0x811e are not" in helper
-    assert "NimVendorRxDescLinkMask" in text
+    assert "NimRxDescLinkMask" in text
     assert "nim_conn_rx_status_reject_count" in text
     assert text.count("not connRxStatusAcceptsPayload(status)") >= 3
-    assert text.count("status and NimVendorRxDescLinkMask") >= 8
+    assert text.count("status and NimRxDescLinkMask") >= 8
 
     service_body = text.split(
-        "proc serviceVendorConnectionLlcpRxDescriptors", 1
-    )[1].split("when not defined(bl808BleVendorArbProbe)", 1)[0]
+        "proc serviceNimConnectionLlcpRxDescriptors", 1
+    )[1].split("when not defined(bl808m0):", 1)[0]
     assert service_body.index("if not connRxStatusAcceptsPayload(status):") < (
         service_body.index("if not validConnDataHeader(header):")
     )
@@ -1611,18 +1629,18 @@ def test_pure_ble_connection_drains_rx_inside_rx_callback():
     text = source.read_text(encoding="utf-8")
 
     callback_body = text.split("proc nimConnSchProgCb", 1)[1].split(
-        "proc vendorLldConStart", 1
+        "proc nimLldConStart", 1
     )[0]
     rx_branch = callback_body.split("of 2'u8:", 1)[1].split(
         "of 0'u8, 1'u8, 4'u8, 7'u8, 0xFF'u8:", 1
     )[0]
-    assert "serviceVendorConnectionLlcpRxDescriptors()" in rx_branch
-    assert "Vendor lld_con_frm_cbk drains RX descriptors" in rx_branch
+    assert "serviceNimConnectionLlcpRxDescriptors()" in rx_branch
+    assert "LLD connection frame callback drains RX descriptors" in rx_branch
 
     event_done_body = text.split("proc nimConnEventDone", 1)[1].split(
         "proc nimConnServiceSupervisionTimeout", 1
     )[0]
-    assert "serviceVendorConnectionLlcpRxDescriptors()" in event_done_body
+    assert "serviceNimConnectionLlcpRxDescriptors()" in event_done_body
     assert "nimConnAdvanceCsa1ChannelState(1'u16)" in event_done_body
 
 
@@ -1630,15 +1648,15 @@ def test_pure_ble_peripheral_primes_startup_version_procedure():
     source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
     text = source.read_text(encoding="utf-8")
 
-    prime_body = text.split("proc vendorPrimeStartupLlcp", 1)[1].split(
-        "proc vendorTrySendStartupLlcp", 1
+    prime_body = text.split("proc nimLlcpPrimeStartup", 1)[1].split(
+        "proc nimLlcpTrySendStartup", 1
     )[0]
     assert "when bl808BleNimPureConnection:" in prime_body
-    assert "vendorConfigCount(bl808BleVendorStartupLlcpRetries)" in prime_body
-    assert "nim_vendor_llcp_state.versionProcedureStarted = false" in prime_body
+    assert "nimLlcpConfigCount(bl808BleNimStartupLlcpRetries)" in prime_body
+    assert "nim_llcp_state.versionProcedureStarted = false" in prime_body
 
-    try_send_body = text.split("proc vendorTrySendStartupLlcp", 1)[1].split(
-        "proc vendorObserveLlcpPdu", 1
+    try_send_body = text.split("proc nimLlcpTrySendStartup", 1)[1].split(
+        "proc nimLlcpObservePdu", 1
     )[0]
     assert "nim_conn_state.active and nim_conn_state.centralRole and" in try_send_body
     assert "not nim_conn_state.rxObserved" in try_send_body
@@ -1646,9 +1664,9 @@ def test_pure_ble_peripheral_primes_startup_version_procedure():
     version_branch = text.split("of LlcpVersionInd:", 1)[1].split(
         "of LlcpLengthReq:", 1
     )[0]
-    assert "if not nim_vendor_llcp_state.versionProcedureStarted:" in version_branch
-    assert "vendorBuildVersionInd()" in version_branch
-    assert "vendorQueueLlcpPdu(conhdl, rsp)" in version_branch
+    assert "if not nim_llcp_state.versionProcedureStarted:" in version_branch
+    assert "nimLlcpBuildVersionInd()" in version_branch
+    assert "nimLlcpQueuePdu(conhdl, rsp)" in version_branch
 
 
 def test_polled_m0_ble_roles_use_interrupt_mask_helper():
@@ -1658,7 +1676,7 @@ def test_polled_m0_ble_roles_use_interrupt_mask_helper():
     assert "const bl808BleNimUseClicIrq* {.booldefine.}: bool = false" in text
     assert "const bl808BleNimRuntimeClicIrq =" in text
     assert "bl808BleNimUseClicIrq or bl808BleNimPureCentral" in text
-    assert "const bl808BleVendorDeferConnectInd* {.booldefine.}: bool = true" in text
+    assert "const bl808BleNimDeferConnectInd* {.booldefine.}: bool = true" in text
     assert "writeBtbleInterruptMask(BtbleIntAdvertising)" in text
     assert "writeBtbleInterruptMask(BtbleIntConnection)" in text
     assert "enableBtbleInterruptMaskBits(BtbleIntEventTarget)" in text
@@ -1680,7 +1698,7 @@ def test_polled_m0_ble_roles_use_interrupt_mask_helper():
     )[0]
     assert "serviceBtbleAdvRxDescriptors()" in interrupt_body
     assert "not bl808BleNimRuntimeClicIrq" in interrupt_body
-    assert "serviceQueuedVendorConnectInd()" in interrupt_body
+    assert "serviceQueuedNimConnectInd()" in interrupt_body
 
     irq_restore = text.split("proc btbleIrqRestore", 1)[1].split(
         "proc swResetCfg0", 1
@@ -1694,8 +1712,8 @@ def test_connect_ind_handoff_waits_for_advertising_scheduler_end():
     source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
     text = source.read_text(encoding="utf-8")
 
-    adv_cb_body = text.split("proc nimVendorSchProgCb", 1)[1].split(
-        "when defined(bl808m0) and defined(bl808BleVendorLldAdvProbe)", 1
+    adv_cb_body = text.split("proc nimSchProgCb", 1)[1].split(
+        "proc pushBtbleAdvProgram", 1
     )[0]
     assert "nim_adv_sch_event_active = 0" in adv_cb_body
     assert "of 0'u8, 1'u8, 4'u8, 7'u8, 0xFF'u8:" in adv_cb_body
@@ -1704,13 +1722,15 @@ def test_connect_ind_handoff_waits_for_advertising_scheduler_end():
         "proc scheduleBtbleEvent", 1
     )[0]
     assert "nim_adv_sch_event_active = 1" in adv_push_body
-    assert "sch_prog_push(addr nim_vendor_sch_prog[0])" in adv_push_body
+    assert "sch_prog_push(addr nim_sch_prog[0])" in adv_push_body
 
-    queued_body = text.split("proc serviceQueuedVendorConnectInd", 1)[1].split(
-        "proc handleVendorConnectInd", 1
+    queued_body = text.split("proc serviceQueuedNimConnectInd", 1)[1].split(
+        "proc handleNimConnectInd", 1
     )[0]
     assert "if nim_adv_sch_event_active != 0'u32:" in queued_body
-    assert "startVendorLldConnectionFromConnectInd(" in queued_body
+    assert "if nim_adv_enabled:" in queued_body
+    assert "nim_adv_sch_event_active = 0" in queued_body
+    assert "startNimConnectionFromConnectInd(" in queued_body
 
     handoff_quiesce = text.split(
         "proc quiesceNimAdvertisingForConnectionHandoff", 1
@@ -1731,8 +1751,8 @@ def test_connect_ind_handoff_waits_for_advertising_scheduler_end():
     )
 
     peripheral_handoff = text.split(
-        "proc startVendorLldConnectionFromConnectInd", 1
-    )[1].split("proc serviceQueuedVendorConnectInd", 1)[0]
+        "proc startNimConnectionFromConnectInd", 1
+    )[1].split("proc serviceQueuedNimConnectInd", 1)[0]
     assert "quiesceNimAdvertisingForConnectionHandoff()" in peripheral_handoff
     assert peripheral_handoff.index(
         "quiesceNimAdvertisingForConnectionHandoff()"
@@ -1780,65 +1800,109 @@ def test_connect_ind_handoff_waits_for_advertising_scheduler_end():
     assert "legacySchedulerPending" in interrupt_body
     assert "((detail and 0x0000001E'u32) != 0)" in interrupt_body
     assert "if legacySchedulerPending:" in interrupt_body
-    assert "defined(bl808BleVendorLldScanProbe):\n    # The vendor scan arbiter" in (
-        interrupt_body
-    )
+    assert "defined(bl808BleVendorLldScanProbe)" not in interrupt_body
     assert "if nim_scan_enabled:\n      serviceAdvRx = true" in interrupt_body
-    assert "if nim_vendor_init_active:\n        serviceAdvRx = true" in (
-        interrupt_body
-    )
-    assert "vendorSchProgElapsedIsr()" in interrupt_body
+    assert "bleControllerServiceScan()" in interrupt_body
+    assert "nimSchProgElapsedIsr()" in interrupt_body
     assert "not legacySchedulerPending" in interrupt_body
 
 
-def test_vendor_init_arb_normalization_uses_init_element_layout():
+def test_pure_advertising_scheduler_uses_committed_fifo_slot_metadata():
     source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
     text = source.read_text(encoding="utf-8")
 
-    init_body = text.split("proc normalizeVendorLldInitArbElement", 1)[1].split(
-        "when bl808BleNimConnectionEnabled", 1
-    )[0]
-    assert "words[1] = target" in init_body
-    assert "words[11] = target" in init_body
-    assert "setVendorLldArbDuration" not in init_body
-    assert "words[24]" not in init_body
-    assert "words[28]" not in init_body
+    assert "proc btbleAdvSlotTail" in text
 
-    scan_body = text.split("proc normalizeVendorLldScanArbElement", 1)[1].split(
-        "proc normalizeVendorLldInitArbElement", 1
+    clear_body = text.split("proc clearBtbleProgramSlots", 1)[1].split(
+        "const\n  BtbleRxDescRingBaseOffset", 1
     )[0]
-    assert "setVendorLldArbDuration(words)" in scan_body
-    assert "words[28] = target" in scan_body
+    assert "for slot in 0'u32 ..< 18'u32:" in clear_body
+    assert "btbleAdvSlotTail(slot)" in clear_body
+    assert "if slot < 10'u32:" not in clear_body
+
+    adv_push_body = text.split("proc pushBtbleAdvProgram", 1)[1].split(
+        "proc scheduleBtbleEvent", 1
+    )[0]
+    schprog_body = adv_push_body.split("bl808BleNimSchProgEnabled:", 1)[1].split(
+        "return", 1
+    )[0]
+    assert "let slot = uint32(schProgWriteIdx and 0x0F'u8)" in schprog_body
+    assert "let slotTail = btbleAdvSlotTail(slot)" in schprog_body
+    assert "BTBLE_EM_BASE + slot * 0x10'u32" in schprog_body
+    assert "sch_prog_push(addr nim_sch_prog[0])" in schprog_body
+    assert "mod 16'u32" in schprog_body
+    assert "uint32(nim_adv_schedule_slot) mod 10'u32" not in schprog_body
+
+
+def test_pure_scheduler_initializes_reference_slice_defaults():
+    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
+    text = source.read_text(encoding="utf-8")
+
+    body = text.split("proc initBtbleLinkLayerRegisters", 1)[1].split(
+        "proc initBleCoreRegisters", 1
+    )[0]
+    assert "sch_slice_params[0] = 0xFFFF'u16" in body
+    assert "sch_slice_params[1] = 0xFFFF'u16" in body
+    assert "sch_slice_params[2] = 0x57E4'u16" in body
+    assert "sch_slice_params[3] = 0'u16" in body
+
+
+def test_wireless_domain_preserves_wifi_only_when_coex_enabled():
+    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
+    text = source.read_text(encoding="utf-8")
+
+    body = text.split("proc wifiMacLooksActive", 1)[1].split(
+        "proc prepareWirelessDomain", 1
+    )[0]
+    assert "if nim_ble_wlcoex_enabled == 0'u32:" in body
+    assert "return false" in body
+    assert "MachwBcnStatus" in body
+
+
+def test_pure_ble_controller_has_no_vendor_scan_or_init_scheduler_branches():
+    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
+    text = source.read_text(encoding="utf-8")
+
+    for forbidden in [
+        "normalizeVendorLldInitArbElement",
+        "normalizeVendorLldScanArbElement",
+        "programVendorLldInitiator",
+        "programVendorLldScan",
+        "vendorLldInitStart",
+        "vendorLldScanStart",
+        "nim_vendor_init_",
+        "bl808BleVendorLldScanProbe",
+        "bl808BleVendorLldInitProbe",
+        "vendorZeroStub",
+        "vendorLlcpHandler",
+    ]:
+        assert forbidden not in text
 
     arb_body = text.split("proc sch_arb_insert*", 1)[1].split(
         "proc sch_arb_remove*", 1
     )[0]
-    assert "nim_vendor_init_arb_last_w5 = words[5]" in arb_body
-    assert "nim_vendor_init_arb_last_w11 = words[11]" in arb_body
-    assert "nim_vendor_init_arb_last_w24" not in arb_body
-    assert "nim_vendor_init_arb_last_w28" not in arb_body
-    assert "normalizeVendorLldInitArbElement(words, arbTarget)" in arb_body
-    assert "normalizeVendorLldScanArbElement(words, arbTarget)" in arb_body
+    assert "discard elt" in arb_body
+    assert arb_body.rstrip().endswith("0")
 
 
-def test_vendor_init_params_use_lld_init_plan_layout():
+def test_pure_ble_initiator_uses_hci_create_connection_params():
     source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
     text = source.read_text(encoding="utf-8")
 
-    view_body = text.split("VendorLldInitParamsView", 1)[1].split(
-        "EmBufNode*", 1
+    assert "proc programNimInitiator" in text
+    init_body = text.split("proc programNimInitiator", 1)[1].split(
+        "proc nimInitReleasePendingRxDesc", 1
     )[0]
-    assert "connInterval*: uint16" in view_body
-    assert "connOffset*: uint16" in view_body
-    assert "connIntervalMax*" not in view_body
-    assert "offsetof(VendorLldInitParamsView, connOffset) == 30" in text
-
-    init_body = text.split("proc programVendorLldInitiator", 1)[1].split(
-        "proc programVendorLldScan", 1
-    )[0]
-    assert "initParams.connInterval = req.connIntervalMin" in init_body
-    assert "initParams.connOffset = 0'u16" in init_body
-    assert "initParams.connOffset = req.connIntervalMax" not in init_body
+    assert "nimInitValidCreateConnectionParams(params, paramLen)" in init_body
+    assert "ensureBleRf1MConfigured()" in init_body
+    assert "for i in 0 ..< nim_init_hci_params.len:" in init_body
+    assert "nim_init_hci_params[i] = cast[ptr UncheckedArray[uint8]](params)[i]" in (
+        init_body
+    )
+    assert "nim_scan_enabled = false" in init_body
+    assert "nim_init_active = 1" in init_body
+    assert "nimInitBuildConnReqData()" in init_body
+    assert "pushNimInitiatorProgram()" in init_body
 
 
 def test_polled_scheduler_services_elapsed_frame_ends():
@@ -1856,11 +1920,60 @@ def test_polled_scheduler_services_elapsed_frame_ends():
     assert "rwip_mac_done_set()" in elapsed_body
 
     push_body = text.split("proc sch_prog_push*", 1)[1].split(
-        "proc vendorSchProgInit", 1
+        "proc nimSchProgInit", 1
     )[0]
     assert "schProgElapsedEndTarget[slot.int]" in push_body
     assert "schProgDurationSlots(dur)" in push_body
     assert "schProgElapsedEndArmed[slot.int] = 1" in push_body
+
+
+def test_btble_command_waits_are_bounded_and_diagnostic():
+    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
+    text = source.read_text(encoding="utf-8")
+
+    assert "BtbleCommandPollLimit = 100_000'u32" in text
+    assert "nim_btble_cmd_wait_timeout_count" in text
+    assert "nim_btble_cmd_wait_last_reg" in text
+    assert "proc waitBtbleCommandDone" in text
+
+    helper_body = text.split("proc waitBtbleCommandDone", 1)[1].split(
+        "proc bflbble_isr", 1
+    )[0]
+    assert "while (regRead(reg) and BtbleBusyBit) != 0'u32:" in helper_body
+    assert "inc nim_btble_cmd_wait_timeout_count" in helper_body
+
+    for forbidden in [
+        "while (regRead((BLE_BASE + 0x000'u32).uint) and 0x80000000'u32)",
+        "while (regRead((BLE_BASE + 0x100'u32).uint) and 0x80000000'u32)",
+        "while (regRead((BLE_BASE + 0x800'u32).uint) and 0x80000000'u32)",
+        "while (regRead(BLE_BASE + BLE_BASETIMECNT_OFFSET) and 0x80000000'u32)",
+        "while true:\n    let v = regRead(BLE_BASE + BLE_BASETIMECNT_OFFSET)",
+    ]:
+        assert forbidden not in text
+
+    for start, end in [
+        ("proc initBtbleTimeRegisters() =", "proc currentBtbleTime"),
+        ("proc currentBtbleTime(): uint32 =", "proc currentBtbleHalfUs"),
+        ("proc currentBtbleHalfUs(): uint32 =", "proc requestBtbleSwInterrupt"),
+        ("proc resetBtbleLinkLayerCore() =", "proc writeBtbleAdvRxDescHeadIndex"),
+        (
+            "proc ea_time_get_halfslot_rounded*(): uint32 {.exportc, cdecl.} =",
+            "proc ea_time_get_slot_rounded",
+        ),
+        (
+            'proc patch_ke_time*(): uint32 {.exportc: "_patch_ke_time", cdecl.} =',
+            "proc ble_ke_time*",
+        ),
+    ]:
+        body = text.split(start, 1)[1].split(end, 1)[0]
+        assert "waitBtbleCommandDone" in body
+
+    patch_ke_time_body = text.split(
+        'proc patch_ke_time*(): uint32 {.exportc: "_patch_ke_time", cdecl.} =',
+        1,
+    )[1].split("proc ble_ke_time*", 1)[0]
+    assert "waitBtbleCommandDone((BLE_BASE + BLE_BASETIMECNT_OFFSET).uint" in patch_ke_time_body
+    assert "while true:" not in patch_ke_time_body
 
 
 def test_host_hci_events_are_drained_outside_controller_callback():
@@ -1887,15 +2000,13 @@ def test_central_poll_loop_drains_queued_hci_events():
     source = REPO_ROOT / "src" / "bl808" / "ble.nim"
     text = source.read_text(encoding="utf-8")
 
-    poll_body = text.split("proc pollCentralController", 1)[1].split(
-        "proc copyCentralTargetName", 1
+    poll_body = text.split("proc bleBackendPollCentralController", 1)[1].split(
+        "proc pollCentralController", 1
     )[0]
     assert "blecontroller.bleControllerDrainScanReports()" in poll_body
     assert poll_body.count("drainHciHostEvents()") >= 2
-    assert (
-        "blecontroller.bleControllerDrainScanReports()\n"
-        "        drainHciHostEvents()"
-        in poll_body
+    assert poll_body.index("blecontroller.bleControllerDrainScanReports()") < poll_body.index(
+        "drainHciHostEvents()"
     )
 
 
@@ -1906,7 +2017,8 @@ def test_central_connect_waits_after_successful_create_connection():
     create_le_body = text.split("proc bt_conn_create_le*", 1)[1].split(
         "proc bt_conn_disconnect*", 1
     )[0]
-    assert "when not defined(bl808BleVendor):\n      drainHciHostEvents()" in create_le_body
+    assert "drainHciHostEvents()" in create_le_body
+    assert "defined(bl808BleVendor)" not in create_le_body
     assert create_le_body.index("hciCommandOk(HciOpLeCreateConnection") < create_le_body.index(
         "drainHciHostEvents()"
     )
@@ -1966,8 +2078,8 @@ def test_central_disconnect_wait_drains_queued_hci_events():
         "    drainHciHostEvents()"
         in disconnect_body
     )
-    assert "when defined(bl808BleVendor):\n        pollCentralController()" in disconnect_body
-    assert "else:\n        drainHciHostEvents()" in disconnect_body
+    assert "bleBackendServiceDisconnectWait()" in disconnect_body
+    assert "defined(bl808BleVendor)" not in disconnect_body
 
 
 def test_hci_disconnect_stops_pure_connection_scheduler_state():
@@ -1982,13 +2094,13 @@ def test_hci_disconnect_stops_pure_connection_scheduler_state():
     assert "nim_conn_handle = 0" in disconnect_complete
 
     cleanup = text.split("proc clearNimConnectionStateForDisconnect", 1)[1].split(
-        "proc noteVendorPeripheralDisconnectedFrom", 1
+        "proc noteNimPeripheralDisconnectedFrom", 1
     )[0]
-    assert "nim_vendor_con_started = false" in cleanup
+    assert "nim_conn_started = false" in cleanup
     assert "nim_init_active = 0" in cleanup
     assert "nim_conn_state.active = false" in cleanup
     assert "nim_conn_state.reschedulePending = false" in cleanup
-    assert "nim_vendor_llcp_tx_pending = 0" in cleanup
+    assert "nim_llcp_tx_pending = 0" in cleanup
     assert "writeBtbleInterruptMask(0)" in cleanup
 
     hci_disconnect = text.split("of HciOpDisconnect:", 1)[1].split(
@@ -2149,3 +2261,146 @@ def test_m0_ble_p256_uses_pka_for_secret_scalar_work_not_public_validation():
     assert "proc bleP256IsValidPublicKeyLe*(x, y: ptr uint8): bool" in blep256
     assert "p256IsValidPublicKeyLe(x, y)" in blep256
     assert "not p256IsValidPublicKeyLe(pointX, pointY)" not in blep256
+
+
+def test_ble_scheduler_program_path_uses_pure_nim_names():
+    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
+    text = source.read_text(encoding="utf-8")
+
+    for forbidden in [
+        "bl808BleWrapLldConStartDiag",
+        "__real_vendor_lld_con_start",
+        "__wrap_vendor_lld_con_start",
+        "vendorSchProgInit",
+        "vendorSchProgFifoIsr",
+        "vendorSchProgSkipIsr",
+        "vendorSchProgPush",
+        "vendorSchProgElapsedIsr",
+        "vendorSchProgSkipIndex",
+        "vendorProgWrite16",
+        "vendorProgWrite32",
+        "vendorLldConStart",
+        "vendorLldConDataTx",
+        "vendorLldConLlcpTx",
+        "startVendorLldConnectionFromConnectInd",
+        "handleVendorConnectInd",
+        "serviceQueuedVendorConnectInd",
+        "serviceVendorArbTimer",
+        "activeVendorConnectionHandle",
+        "noteVendorRxDescConsumed",
+        "refreshVendorSyncPositions",
+        "vendorConnectTiming",
+        "runVendorArbCallback",
+        "queueVendorArbCallback",
+        "serviceVendorArbCallbacks",
+        "drainVendorInitPeerComplete",
+        "initVendorRwipRfTable",
+        "recordVendorPeripheralPeer",
+        "noteVendorPeripheralConnected",
+        "noteVendorAdvertiserConnected",
+        "noteVendorPeripheralDisconnectedFrom",
+        "noteVendorPeripheralDisconnected",
+        "handleVendorLldMessage",
+        "serviceVendorConnectionLlcpRxDescriptors",
+        "proc vendorLlcStart(",
+        "VendorLlcpState",
+        "VendorLlcpPdu",
+        "NimVendorLlcpTxEmOffset",
+        "NimVendorAclTxEmOffset",
+        "NimVendorRxDescDone",
+        "NimVendorDataLlIdControl",
+        "vendorRecordLlcpRx",
+        "vendorLlcpRxPduValid",
+        "vendorBuildFeaturePdu",
+        "vendorQueueLlcpPdu",
+        "vendorPrimeStartupLlcp",
+        "vendorTrySendStartupLlcp",
+        "vendorHandleConsumedLlcp",
+        "NimVendorLlcStartEnvView",
+        "VendorLldConStartParamsView",
+        "VendorLlcControllerDefaultsView",
+        "VendorLlcStartParamsView",
+        "VendorLldAdvParamsView",
+        "VendorLldScanParamsView",
+        "VendorLldInitParamsView",
+        "vendorOverlay",
+        "nimVendorSchProgCb",
+        "var nim_vendor_sch_prog",
+        "addr nim_vendor_sch_prog",
+        "nim_vendor_lld_adv_params",
+        "nim_vendor_lld_adv_rand_state",
+        "nimVendorLlcMsgWord",
+        "printNimVendorLlcMsg",
+        "nimVendorReadRa",
+        "nimVendorReadSp",
+        "nimVendorConnMark",
+    ]:
+        assert forbidden not in text
+
+    for expected in [
+        "proc nimSchProgCb(arg0: uint32, ctx: pointer,",
+        "proc nimSchProgInit(initType: uint8)",
+        "proc nimSchProgFifoIsr()",
+        "proc nimSchProgSkipIsr(idx: uint8)",
+        "proc nimSchProgPush(prog: pointer)",
+        "proc nimSchProgElapsedIsr()",
+        'var nimSchProgSkipIndex {.exportc: "m_sw_skip_et_idx".}: uint32',
+        "proc schProgWrite16(off: int, value: uint16)",
+        "proc schProgWrite32(off: int, value: uint32)",
+        "proc nimLldConStart(conhdl: uint16, params: pointer): uint8",
+        "proc nimLldConDataTx(conhdl: uint16, buf: pointer): uint8",
+        "proc nimLldConLlcpTx(conhdl: uint16, buf: pointer): uint8",
+        "proc lld_con_data_tx*(conhdl: uint16, buf: pointer): uint8",
+        "proc lld_con_llcp_tx*(conhdl: uint16, buf: pointer): uint8",
+        "proc startNimConnectionFromConnectInd(descIdx: uint8,",
+        "proc handleNimConnectInd(descIdx: uint8,",
+        "proc serviceQueuedNimConnectInd()",
+        "proc serviceNimArbTimer()",
+        "proc activeNimConnectionHandle(): uint16",
+        "proc noteNimRxDescConsumed(idx: uint32)",
+        "proc refreshNimSyncPositions()",
+        "proc nimConnectTiming(baseClock: uint32",
+        "proc runNimArbCallback(cb: SchArbStartCb",
+        "proc queueNimArbCallback(cb: SchArbStartCb",
+        "proc serviceNimArbCallbacks()",
+        "proc drainNimInitPeerComplete(): bool",
+        "proc initNimRwipRfTable()",
+        "proc recordNimPeripheralPeer(conhdl: uint16,",
+        "proc noteNimPeripheralConnected(conhdl: uint16)",
+        "proc noteNimAdvertiserConnected(raw: ptr UncheckedArray[uint8],",
+        "proc noteNimPeripheralDisconnectedFrom(source: uint32, reason: uint8)",
+        "proc noteNimPeripheralDisconnected(reason: uint8)",
+        "proc handleNimLldMessage(param: pointer): bool",
+        "proc serviceNimConnectionLlcpRxDescriptors()",
+        "proc nimLlcStart(conhdl: uint16, params: pointer): uint8",
+        '{.exportc: "vendor_llc_start", cdecl.}',
+        "NimLlcpState = object",
+        "NimLlcpPdu = object",
+        "NimLlcpTxEmOffset = 0x0788'u16",
+        "NimAclTxEmOffset = 0x0A20'u16",
+        "NimRxDescDone = 0x8000'u16",
+        "NimDataLlIdControl = 0x03'u8",
+        "proc nimLlcpRecordRx(header: uint16, dataOff: uint16, pduLen: uint16)",
+        "proc nimLlcpRxPduValid(opcode: uint8, pduLen: uint16): bool",
+        "proc nimLlcpBuildFeaturePdu(",
+        "proc nimLlcpQueuePdu(conhdl: uint16, pdu: ptr UncheckedArray[uint8],",
+        "proc nimLlcpPrimeStartup()",
+        "proc nimLlcpTrySendStartup(conhdl: uint16)",
+        "proc nimLlcpHandleConsumed(conhdl: uint16,",
+        "NimLlcStartEnvView {.packed.} = object",
+        "NimLldConStartParamsView {.packed.} = object",
+        "NimLlcControllerDefaultsView {.packed.} = object",
+        "NimLlcStartParamsView {.packed.} = object",
+        "NimLldAdvParamsView {.packed.} = object",
+        "NimLldScanParamsView {.packed.} = object",
+        "NimLldInitParamsView {.packed.} = object",
+        "controllerOverlay*: array[28, uint8]",
+        "var nim_sch_prog_fifo_count* {.exportc: \"nim_vendor_sch_prog_fifo_count\".}: uint32",
+        "var nim_llc_msg* {.exportc: \"nim_vendor_llc_msg\".}: array[64, uint8]",
+        "proc nimConnMark(stage: uint32) {.inline.}",
+    ]:
+        assert expected in text
+
+    for line in text.splitlines():
+        if "nim_vendor_" in line:
+            assert "exportc:" in line

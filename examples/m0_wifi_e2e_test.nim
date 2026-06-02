@@ -2,7 +2,7 @@
 ##
 ## Build with:
 ##   make m0 FILE=examples/m0_wifi_e2e_test.nim \
-##     NIM="nim -d:bl808kernel -d:bl808WifiVendor \
+##     NIM="nim -d:bl808kernel -d:bl808WifiNimFw \
 ##              -d:WifiSsid=Frog -d:WifiPassword=<wifi-password>"
 ##
 ## (`-d:bl808kernel` matches the validation harness path that brings in the
@@ -21,7 +21,7 @@ import bl808/panicoverride
 import bl808/kernel/alloc
 import bl808/kernel/e2e_marker
 import bl808/kernel/e2e_runner
-when defined(bl808WifiVendor):
+when defined(bl808WifiNimFw):
   import bl808/kernel/jtaglog
 
 const
@@ -79,7 +79,7 @@ proc main() {.exportc, cdecl.} =
   systemInit()
   heapInit()
   setupConsole()
-  when defined(bl808WifiVendor):
+  when defined(bl808WifiNimFw):
     hwValidationLogReset()
   e2eMarkerInit(addr console)
   discard console.sendLine("")

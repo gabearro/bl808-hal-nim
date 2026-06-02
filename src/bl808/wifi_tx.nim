@@ -1,6 +1,6 @@
 ## Nim replacement for the BL808 WiFi host TX path in bl_tx.c.
 
-when defined(bl808m0) and defined(bl808WifiVendor) and defined(bl808WifiNimFw):
+when defined(bl808m0) and defined(bl808WifiNimFw):
   {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver".}
   {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/include".}
 

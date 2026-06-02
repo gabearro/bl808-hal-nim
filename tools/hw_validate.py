@@ -40,9 +40,6 @@ JTAG_FLASH_STUB_SOURCE = REPO_ROOT / "tools" / "jtag_flash_stub.c"
 JTAG_FLASH_STUB_LINKER = REPO_ROOT / "tools" / "jtag_flash_stub.ld"
 UART_FLASH_ANCHOR_SOURCE = REPO_ROOT / "tools" / "uart_flash_anchor.c"
 UART_FLASH_ANCHOR_LINKER = REPO_ROOT / "tools" / "uart_flash_anchor.ld"
-BLE_VENDOR_PROBE_DIR = REPO_ROOT / "build" / "inspect" / "btble_bl808_lib"
-BLE_VENDOR_LLD_CON_PROBE_LLCP = BLE_VENDOR_PROBE_DIR / "lld_con_probe_llcp.o"
-BLE_VENDOR_LLD_CON_PROBE_NIMWRAP = BLE_VENDOR_PROBE_DIR / "lld_con_probe_llcp_nimwrap.o"
 JTAG_FLASH_STUB_ENTRY = 0x22020000
 JTAG_FLASH_STUB_END = 0x2204F000
 UART_FLASH_ANCHOR_ENTRY = 0x62020000
@@ -744,47 +741,6 @@ def run_logged(
         return subprocess.CompletedProcess(cmd, 124, output + message, "")
     append_log(log_path, proc.stdout)
     return proc
-
-
-def prepare_ble_vendor_lld_con_probe(
-    *,
-    defines: dict[str, str],
-    objcopy: str,
-    work_dir: Path,
-    dry_run: bool,
-) -> Path | None:
-    if "bl808BleVendorLldConProbe" not in defines:
-        return None
-    if defines.get("bl808BleNimPureConnection") == "1":
-        return None
-    if "bl808BleVendorManualConnTx" not in defines:
-        return None
-
-    source = BLE_VENDOR_LLD_CON_PROBE_LLCP
-    output = BLE_VENDOR_LLD_CON_PROBE_NIMWRAP
-    if not source.exists() and not dry_run:
-        raise RuntimeError(f"missing BLE vendor connection probe object: {source}")
-    if not dry_run and output.exists() and output.stat().st_mtime >= source.stat().st_mtime:
-        return output
-
-    ensure_parent(output)
-    cmd = [
-        objcopy,
-        "--redefine-sym",
-        "lld_con_data_tx=vendor_lld_con_data_tx",
-        "--redefine-sym",
-        "lld_con_llcp_tx=vendor_lld_con_llcp_tx",
-        str(source),
-        str(output),
-    ]
-    run_checked(
-        cmd,
-        cwd=REPO_ROOT,
-        log_path=work_dir / "logs" / "ble_vendor_lld_con_probe_nimwrap.objcopy.log",
-        dry_run=dry_run,
-        env=harness_env(),
-    )
-    return output
 
 
 def host_action_command(action: dict[str, Any]) -> list[str]:
@@ -1728,13 +1684,6 @@ def build_firmware(
             item.get("defines", {}),
             parse_cli_nim_defines(args.nim_define),
         )
-        if core == "bl808m0":
-            prepare_ble_vendor_lld_con_probe(
-                defines=defines,
-                objcopy=objcopy_rv32,
-                work_dir=work_dir,
-                dry_run=args.dry_run,
-            )
         for name, value in sorted(defines.items()):
             nim_cmd.insert(4, f"-d:{name}={value}")
         if args.jtag_load and core in ("bl808m0", "bl808d0", "bl808lp"):

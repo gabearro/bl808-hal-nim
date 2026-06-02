@@ -11,32 +11,31 @@ import bl808/ble, bl808/wifi
 import bl808/panicoverride
 import bl808/kernel/alloc
 import bl808/kernel/cps
-when not defined(bl808BleVendor):
+from bl808/blecontroller import
+  bleNimPeripheralDiscEventCount,
+  bleNimPeripheralDiscReason,
+  bleNimPeripheralDiscSource,
+  bleNimDbgVendorLlcpRxCount,
+  bleNimDbgVendorLlcpLastOpcode
+when defined(BleDebugCounters):
   from bl808/blecontroller import
-    bleNimPeripheralDiscEventCount,
-    bleNimPeripheralDiscReason,
-    bleNimPeripheralDiscSource,
-    bleNimDbgVendorLlcpRxCount,
-    bleNimDbgVendorLlcpLastOpcode
-  when defined(BleDebugCounters):
-    from bl808/blecontroller import
-      bleNimDbgIsrCount, bleNimDbgStat8000Count, bleNimDbgPushCount,
-      bleNimDbgRxReadyCount, bleNimDbgRxConnectIndCount,
-      bleNimDbgVendorSchProgFifoCount, bleNimDbgVendorSchProgSkipCount,
-      bleNimDbgVendorLlcpRxCount, bleNimDbgVendorLlcpTxCount,
-      bleNimDbgVendorLlcpLastOpcode, bleNimDbgVendorLlcpLastStatus,
-      bleNimDbgVendorConLastStatus,
-      bleNimDbgVendorConLastAnchor, bleNimDbgVendorConLastInterval,
-      bleNimDbgVendorConLastTimeout, bleNimDbgVendorAclEmptyTxCount,
-      bleNimDbgVendorLldConStartCount,
-      bleNimDbgVendorLldConStartStatus,
-      bleNimDbgVendorLldConStartParamWord,
-      bleNimDbgLldRxFreeCount, bleNimDbgLldRxLastStatus,
-      bleNimDbgLldRxLastHeader, bleNimDbgLldRxLastMeta,
-      bleNimDbgConnDeferredScheduleCount,
-      bleNimDbgConnRxStatusRejectCount,
-      bleNimDbgConnRxLastRejectedStatus,
-      bleNimDbgConnRxLastRejectedHeader
+    bleNimDbgIsrCount, bleNimDbgStat8000Count, bleNimDbgPushCount,
+    bleNimDbgRxReadyCount, bleNimDbgRxConnectIndCount,
+    bleNimDbgVendorSchProgFifoCount, bleNimDbgVendorSchProgSkipCount,
+    bleNimDbgVendorLlcpRxCount, bleNimDbgVendorLlcpTxCount,
+    bleNimDbgVendorLlcpLastOpcode, bleNimDbgVendorLlcpLastStatus,
+    bleNimDbgVendorConLastStatus,
+    bleNimDbgVendorConLastAnchor, bleNimDbgVendorConLastInterval,
+    bleNimDbgVendorConLastTimeout, bleNimDbgVendorAclEmptyTxCount,
+    bleNimDbgVendorLldConStartCount,
+    bleNimDbgVendorLldConStartStatus,
+    bleNimDbgVendorLldConStartParamWord,
+    bleNimDbgLldRxFreeCount, bleNimDbgLldRxLastStatus,
+    bleNimDbgLldRxLastHeader, bleNimDbgLldRxLastMeta,
+    bleNimDbgConnDeferredScheduleCount,
+    bleNimDbgConnRxStatusRejectCount,
+    bleNimDbgConnRxLastRejectedStatus,
+    bleNimDbgConnRxLastRejectedHeader
 
 const
   ConsoleUartTxPin = 14'u32
@@ -81,32 +80,31 @@ var
   bleDisconnectedCalled = false
   bleConnCbStorage: BtConnCb
 
-when defined(bl808WifiNimFw):
-  var nimfw_dbg_nullframe_calls {.importc.}: uint32
-  var nimfw_dbg_nullframe_return {.importc.}: uint32
-  var nimfw_dbg_nullframe_txint_seen {.importc.}: uint32
-  var nimfw_dbg_nullframe_fake_seen {.importc.}: uint32
-  var nimfw_dbg_nullframe_fake_qidx {.importc.}: uint32
-  var nimfw_dbg_nullframe_fake_link {.importc.}: uint32
-  var nimfw_dbg_nullframe_busy_txcheck {.importc.}: uint32
-  var nimfw_dbg_nullframe_busy_pscheck {.importc.}: uint32
-  var nimfw_dbg_nullframe_txtrig_seen {.importc.}: uint32
-  var nimfw_dbg_nullframe_txtrig_internal {.importc.}: uint32
-  var nimfw_dbg_nullframe_pay_seen {.importc.}: uint32
-  var nimfw_dbg_nullframe_pay_payload {.importc.}: uint32
-  var nimfw_dbg_nullframe_pay_empty {.importc.}: uint32
-  var nimfw_dbg_nullframe_pay_nonempty {.importc.}: uint32
-  var nimfw_dbg_nullframe_pay_trig {.importc.}: uint32
-  var nimfw_dbg_nullframe_pay_current {.importc.}: uint32
-  var nimfw_dbg_nullframe_pay_pending {.importc.}: uint32
-  var nimfw_dbg_nullframe_pay_thd_status {.importc.}: uint32
-  var nimfw_dbg_nullframe_postponed {.importc.}: uint32
-  var nimfw_dbg_nullframe_queued {.importc.}: uint32
-  var nimfw_keepalive_inflight {.importc.}: uint32
-  var nimfw_keepalive_target_cfm {.importc.}: uint32
-  var nimfw_dbg_keepalive_rc {.importc.}: uint32
-  var nimfw_dbg_keepalive_post_before {.importc.}: uint32
-  var nimfw_dbg_keepalive_post_after {.importc.}: uint32
+var nimfw_dbg_nullframe_calls {.importc.}: uint32
+var nimfw_dbg_nullframe_return {.importc.}: uint32
+var nimfw_dbg_nullframe_txint_seen {.importc.}: uint32
+var nimfw_dbg_nullframe_fake_seen {.importc.}: uint32
+var nimfw_dbg_nullframe_fake_qidx {.importc.}: uint32
+var nimfw_dbg_nullframe_fake_link {.importc.}: uint32
+var nimfw_dbg_nullframe_busy_txcheck {.importc.}: uint32
+var nimfw_dbg_nullframe_busy_pscheck {.importc.}: uint32
+var nimfw_dbg_nullframe_txtrig_seen {.importc.}: uint32
+var nimfw_dbg_nullframe_txtrig_internal {.importc.}: uint32
+var nimfw_dbg_nullframe_pay_seen {.importc.}: uint32
+var nimfw_dbg_nullframe_pay_payload {.importc.}: uint32
+var nimfw_dbg_nullframe_pay_empty {.importc.}: uint32
+var nimfw_dbg_nullframe_pay_nonempty {.importc.}: uint32
+var nimfw_dbg_nullframe_pay_trig {.importc.}: uint32
+var nimfw_dbg_nullframe_pay_current {.importc.}: uint32
+var nimfw_dbg_nullframe_pay_pending {.importc.}: uint32
+var nimfw_dbg_nullframe_pay_thd_status {.importc.}: uint32
+var nimfw_dbg_nullframe_postponed {.importc.}: uint32
+var nimfw_dbg_nullframe_queued {.importc.}: uint32
+var nimfw_keepalive_inflight {.importc.}: uint32
+var nimfw_keepalive_target_cfm {.importc.}: uint32
+var nimfw_dbg_keepalive_rc {.importc.}: uint32
+var nimfw_dbg_keepalive_post_before {.importc.}: uint32
+var nimfw_dbg_keepalive_post_after {.importc.}: uint32
 
 proc check(label: string, ok: bool) =
   discard console.sendString(if ok: "[PASS] " else: "[FAIL] ")
@@ -123,10 +121,7 @@ proc printResult() =
     discard console.sendLine("=== Test Complete ===")
 
 proc wifiStaAssociated(): bool =
-  when defined(bl808WifiVendor):
-    bl808_wifi_vendor_connected() != 0
-  else:
-    wifiGetNetif() != nil
+  bl808_wifi_backend_connected() != 0
 
 proc bleReady(err: cint) {.cdecl.} =
   bleReadyCalled = true
@@ -191,7 +186,7 @@ proc printHciStatus(label: string) =
   discard console.sendLine("")
 
 proc printBleDebugCounters(label: string) =
-  when not defined(bl808BleVendor) and defined(BleDebugCounters):
+  when defined(BleDebugCounters):
     discard console.sendString("[BLEDBG] ")
     discard console.sendString(label)
     discard console.sendString(" isr=")
@@ -254,15 +249,14 @@ proc printBleDebugCounters(label: string) =
     discard console.sendLine("")
 
 proc smokeBle(): CpsVoidFuture {.cps.} =
-  when not defined(bl808BleVendor) and defined(bl808WifiNimFw):
-    when WifiBleSimultaneous:
-      wifiSetBleCoexistenceMode(WifiBleConnectPtaMode.uint32)
-      discard console.sendString("[WIFI] PTA connect mode=")
-      console.sendHex32(WifiBleConnectPtaMode.uint32)
-      discard console.sendLine("")
-    else:
-      wifiSetBleCoexistenceMode(wifiBleCoexBtPriority)
-      discard console.sendLine("[WIFI] PTA BT-priority for BLE")
+  when WifiBleSimultaneous:
+    wifiSetBleCoexistenceMode(WifiBleConnectPtaMode.uint32)
+    discard console.sendString("[WIFI] PTA connect mode=")
+    console.sendHex32(WifiBleConnectPtaMode.uint32)
+    discard console.sendLine("")
+  else:
+    wifiSetBleCoexistenceMode(wifiBleCoexBtPriority)
+    discard console.sendLine("[WIFI] PTA BT-priority for BLE")
 
   let mainRef = cast[pointer](blecontroller_main)
   check("ble controller main symbol", mainRef != nil)
@@ -306,9 +300,8 @@ proc smokeBle(): CpsVoidFuture {.cps.} =
   check("ble advertising start",
         (await bleStartAdvertisingAsync(addr advParam, addr advData, 0)) == bleOk)
   printHciStatus("adv-start")
-  when not defined(bl808BleVendor):
-    for _ in 0 ..< 2000:
-      await sleepUs(BlePollDelayUs.uint64)
+  for _ in 0 ..< 2000:
+    await sleepUs(BlePollDelayUs.uint64)
   discard console.sendString("[BLE] advertising ")
   discard console.sendLine(BleDeviceName)
   when WifiBleSimultaneous:
@@ -317,161 +310,156 @@ proc smokeBle(): CpsVoidFuture {.cps.} =
     await sleepMs(BlePostAdvertiseQuietMs.uint64)
   printBleDebugCounters("adv")
 
-  when defined(bl808BleVendor):
-    for _ in 0 ..< 15000:
-      await sleepUs(1000)
-  else:
-    let hostDeadline = hostWindowDeadlineUs()
-    let minDeadline = clicReadMtime() +
-      hostWindowDurationUs(BleHostMinWindowIterations)
-    var hostLoop = 0'u32
-    var wifiTxStats: WifiKeepaliveStats
-    var wifiTxStarted = false
-    while clicReadMtime() < hostDeadline:
-      await sleepUs(BlePollDelayUs.uint64)
-      when WifiBleSimultaneous and WifiBleTrafficFrames > 0:
-        let trafficDelayUs = BleTrafficStartDelayMs.uint64 * 1000'u64
-        let trafficWindowOpen =
-          bleConnectedCalled and not bleDisconnectedCalled and
-          clicReadMtime() - bleConnectedAtUs >= trafficDelayUs
-        if trafficWindowOpen and not wifiTxStarted:
-          wifiTxStarted = true
-          wifiSetBleCoexistenceMode(WifiBleCoexPtaMode.uint32)
-          discard console.sendString("[WIFI] PTA traffic mode=")
-          console.sendHex32(WifiBleCoexPtaMode.uint32)
-          discard console.sendLine("")
-          wifiTxStats = await wifiSendStaKeepaliveUntilAckAsync(
-            WifiBleTrafficFrames.uint32,
-            WifiBleTrafficAttemptBudget.uint32,
-            WifiBleTrafficPeriodMs.uint32,
-            WifiBleTrafficBusyRetryMs.uint32,
-            500'u32,
-            WifiBleCoexServiceIterations.uint32)
-          wifiSetBleCoexistenceMode(WifiBleConnectPtaMode.uint32)
-          discard console.sendString("[WIFI] PTA post-traffic mode=")
-          console.sendHex32(WifiBleConnectPtaMode.uint32)
-          discard console.sendLine("")
-      when defined(BleHostLoopDiag):
-        inc hostLoop
-        if (hostLoop mod 5000'u32) == 0'u32:
-          printBleDebugCounters("host-loop")
-      if clicReadMtime() >= minDeadline and
-          bleConnectedCalled and bleDisconnectedCalled:
-        break
-
-    printBleDebugCounters("host-window")
+  let hostDeadline = hostWindowDeadlineUs()
+  let minDeadline = clicReadMtime() +
+    hostWindowDurationUs(BleHostMinWindowIterations)
+  var hostLoop = 0'u32
+  var wifiTxStats: WifiKeepaliveStats
+  var wifiTxStarted = false
+  while clicReadMtime() < hostDeadline:
+    await sleepUs(BlePollDelayUs.uint64)
     when WifiBleSimultaneous and WifiBleTrafficFrames > 0:
-      discard console.sendString("[WIFI] coex tx frames=")
-      console.sendHex32(wifiTxStats.frames)
-      discard console.sendString(" attempts=")
-      console.sendHex32(wifiTxStats.attempts)
-      discard console.sendString(" busy=")
-      console.sendHex32(wifiTxStats.busy)
-      discard console.sendString(" failures=")
-      console.sendHex32(wifiTxStats.failures)
-      discard console.sendString(" cfm=")
-      console.sendHex32(wifiTxStats.cfmDelta)
-      discard console.sendString(" ack=")
-      console.sendHex32(wifiTxStats.ackDelta)
-      discard console.sendString(" nack=")
-      console.sendHex32(wifiTxStats.failDelta)
-      discard console.sendLine("")
-      let wifiTxDuringBleOk =
-        wifiTxStats.frames >= WifiBleTrafficFrames.uint32 and
-        wifiTxStats.failures == 0'u32 and
-        wifiTxStats.ackDelta >= WifiBleTrafficFrames.uint32 and
-        wifiTxStats.cfmDelta >= wifiTxStats.frames
-      when WifiBleTrafficRequireAck:
-        check("wifi tx during ble connection", wifiTxDuringBleOk)
-      else:
-        check("wifi tx during ble connection attempted",
-              wifiTxStats.frames > 0'u32 and wifiTxStats.failures == 0'u32)
-      when defined(bl808WifiNimFw):
-        if wifiTxStats.failures != 0'u32 or
-            wifiTxStats.ackDelta < WifiBleTrafficFrames.uint32:
-          discard console.sendString("[WIFI-NIMFW] null calls=")
-          console.sendHex32(nimfw_dbg_nullframe_calls)
-          discard console.sendString(" return=")
-          console.sendHex32(nimfw_dbg_nullframe_return)
-          discard console.sendString(" txint=")
-          console.sendHex32(nimfw_dbg_nullframe_txint_seen)
-          discard console.sendString(" fake=")
-          console.sendHex32(nimfw_dbg_nullframe_fake_seen)
-          discard console.sendString(" qidx=")
-          console.sendHex32(nimfw_dbg_nullframe_fake_qidx)
-          discard console.sendString(" link=")
-          console.sendHex32(nimfw_dbg_nullframe_fake_link)
-          discard console.sendString(" busy_tx=")
-          console.sendHex32(nimfw_dbg_nullframe_busy_txcheck)
-          discard console.sendString(" busy_ps=")
-          console.sendHex32(nimfw_dbg_nullframe_busy_pscheck)
-          discard console.sendString(" postponed=")
-          console.sendHex32(nimfw_dbg_nullframe_postponed)
-          discard console.sendString(" queued=")
-          console.sendHex32(nimfw_dbg_nullframe_queued)
-          discard console.sendLine("")
-          discard console.sendString("[WIFI-NIMFW] payload seen=")
-          console.sendHex32(nimfw_dbg_nullframe_pay_seen)
-          discard console.sendString(" payload=")
-          console.sendHex32(nimfw_dbg_nullframe_pay_payload)
-          discard console.sendString(" empty=")
-          console.sendHex32(nimfw_dbg_nullframe_pay_empty)
-          discard console.sendString(" nonempty=")
-          console.sendHex32(nimfw_dbg_nullframe_pay_nonempty)
-          discard console.sendString(" trig=")
-          console.sendHex32(nimfw_dbg_nullframe_pay_trig)
-          discard console.sendString(" current=")
-          console.sendHex32(nimfw_dbg_nullframe_pay_current)
-          discard console.sendString(" pending=")
-          console.sendHex32(nimfw_dbg_nullframe_pay_pending)
-          discard console.sendString(" thd=")
-          console.sendHex32(nimfw_dbg_nullframe_pay_thd_status)
-          discard console.sendString(" txtrig=")
-          console.sendHex32(nimfw_dbg_nullframe_txtrig_seen)
-          discard console.sendString(" txtrig_int=")
-          console.sendHex32(nimfw_dbg_nullframe_txtrig_internal)
-          discard console.sendLine("")
-          discard console.sendString("[WIFI-NIMFW] keepalive inflight=")
-          console.sendHex32(nimfw_keepalive_inflight)
-          discard console.sendString(" target=")
-          console.sendHex32(nimfw_keepalive_target_cfm)
-          discard console.sendString(" rc=")
-          console.sendHex32(nimfw_dbg_keepalive_rc)
-          discard console.sendString(" post_before=")
-          console.sendHex32(nimfw_dbg_keepalive_post_before)
-          discard console.sendString(" post_after=")
-          console.sendHex32(nimfw_dbg_keepalive_post_after)
-          discard console.sendLine("")
-    check("ble peripheral connected callback",
-          bleConnectedCalled and bleConnectedErr == 0)
-    when BleRequireDisconnectedCallback:
-      await waitBleDisconnectedCallback(BleDisconnectDrainMs.uint32)
-      discard console.sendString("[BLEDBG] host active=")
-      console.sendHex32(bleHostDbgConnActive())
-      discard console.sendString(" connected_notified=")
-      console.sendHex32(bleHostDbgPeripheralConnectedNotified())
-      discard console.sendString(" disconnected_notified=")
-      console.sendHex32(bleHostDbgPeripheralDisconnectedNotified())
-      discard console.sendString(" idle_polls=")
-      console.sendHex32(bleHostDbgPeripheralIdlePolls())
-      discard console.sendString(" last_rx_event=")
-      console.sendHex32(bleHostDbgPeripheralLastRxEventCounter())
-      discard console.sendString(" disc_events=")
-      console.sendHex32(bleNimPeripheralDiscEventCount())
-      discard console.sendString(" disc_source=")
-      console.sendHex32(bleNimPeripheralDiscSource())
-      discard console.sendString(" disc_reason=")
-      console.sendHex32(bleNimPeripheralDiscReason())
-      discard console.sendString(" llcp_rx=")
-      console.sendHex32(bleNimDbgVendorLlcpRxCount())
-      discard console.sendString(" llcp_last=")
-      console.sendHex32(bleNimDbgVendorLlcpLastOpcode())
-      discard console.sendLine("")
-      check("ble peripheral disconnected callback", bleDisconnectedCalled)
+      let trafficDelayUs = BleTrafficStartDelayMs.uint64 * 1000'u64
+      let trafficWindowOpen =
+        bleConnectedCalled and not bleDisconnectedCalled and
+        clicReadMtime() - bleConnectedAtUs >= trafficDelayUs
+      if trafficWindowOpen and not wifiTxStarted:
+        wifiTxStarted = true
+        wifiSetBleCoexistenceMode(WifiBleCoexPtaMode.uint32)
+        discard console.sendString("[WIFI] PTA traffic mode=")
+        console.sendHex32(WifiBleCoexPtaMode.uint32)
+        discard console.sendLine("")
+        wifiTxStats = await wifiSendStaKeepaliveUntilAckAsync(
+          WifiBleTrafficFrames.uint32,
+          WifiBleTrafficAttemptBudget.uint32,
+          WifiBleTrafficPeriodMs.uint32,
+          WifiBleTrafficBusyRetryMs.uint32,
+          500'u32,
+          WifiBleCoexServiceIterations.uint32)
+        wifiSetBleCoexistenceMode(WifiBleConnectPtaMode.uint32)
+        discard console.sendString("[WIFI] PTA post-traffic mode=")
+        console.sendHex32(WifiBleConnectPtaMode.uint32)
+        discard console.sendLine("")
+    when defined(BleHostLoopDiag):
+      inc hostLoop
+      if (hostLoop mod 5000'u32) == 0'u32:
+        printBleDebugCounters("host-loop")
+    if clicReadMtime() >= minDeadline and
+        bleConnectedCalled and bleDisconnectedCalled:
+      break
+
+  printBleDebugCounters("host-window")
+  when WifiBleSimultaneous and WifiBleTrafficFrames > 0:
+    discard console.sendString("[WIFI] coex tx frames=")
+    console.sendHex32(wifiTxStats.frames)
+    discard console.sendString(" attempts=")
+    console.sendHex32(wifiTxStats.attempts)
+    discard console.sendString(" busy=")
+    console.sendHex32(wifiTxStats.busy)
+    discard console.sendString(" failures=")
+    console.sendHex32(wifiTxStats.failures)
+    discard console.sendString(" cfm=")
+    console.sendHex32(wifiTxStats.cfmDelta)
+    discard console.sendString(" ack=")
+    console.sendHex32(wifiTxStats.ackDelta)
+    discard console.sendString(" nack=")
+    console.sendHex32(wifiTxStats.failDelta)
+    discard console.sendLine("")
+    let wifiTxDuringBleOk =
+      wifiTxStats.frames >= WifiBleTrafficFrames.uint32 and
+      wifiTxStats.failures == 0'u32 and
+      wifiTxStats.ackDelta >= WifiBleTrafficFrames.uint32 and
+      wifiTxStats.cfmDelta >= wifiTxStats.frames
+    when WifiBleTrafficRequireAck:
+      check("wifi tx during ble connection", wifiTxDuringBleOk)
     else:
-      check("ble peripheral connected callback retained", bleConnectedCalled)
-    when WifiBleSimultaneous:
-      check("wifi still connected after ble", wifiStaAssociated())
+      check("wifi tx during ble connection attempted",
+            wifiTxStats.frames > 0'u32 and wifiTxStats.failures == 0'u32)
+    if wifiTxStats.failures != 0'u32 or
+        wifiTxStats.ackDelta < WifiBleTrafficFrames.uint32:
+      discard console.sendString("[WIFI-NIMFW] null calls=")
+      console.sendHex32(nimfw_dbg_nullframe_calls)
+      discard console.sendString(" return=")
+      console.sendHex32(nimfw_dbg_nullframe_return)
+      discard console.sendString(" txint=")
+      console.sendHex32(nimfw_dbg_nullframe_txint_seen)
+      discard console.sendString(" fake=")
+      console.sendHex32(nimfw_dbg_nullframe_fake_seen)
+      discard console.sendString(" qidx=")
+      console.sendHex32(nimfw_dbg_nullframe_fake_qidx)
+      discard console.sendString(" link=")
+      console.sendHex32(nimfw_dbg_nullframe_fake_link)
+      discard console.sendString(" busy_tx=")
+      console.sendHex32(nimfw_dbg_nullframe_busy_txcheck)
+      discard console.sendString(" busy_ps=")
+      console.sendHex32(nimfw_dbg_nullframe_busy_pscheck)
+      discard console.sendString(" postponed=")
+      console.sendHex32(nimfw_dbg_nullframe_postponed)
+      discard console.sendString(" queued=")
+      console.sendHex32(nimfw_dbg_nullframe_queued)
+      discard console.sendLine("")
+      discard console.sendString("[WIFI-NIMFW] payload seen=")
+      console.sendHex32(nimfw_dbg_nullframe_pay_seen)
+      discard console.sendString(" payload=")
+      console.sendHex32(nimfw_dbg_nullframe_pay_payload)
+      discard console.sendString(" empty=")
+      console.sendHex32(nimfw_dbg_nullframe_pay_empty)
+      discard console.sendString(" nonempty=")
+      console.sendHex32(nimfw_dbg_nullframe_pay_nonempty)
+      discard console.sendString(" trig=")
+      console.sendHex32(nimfw_dbg_nullframe_pay_trig)
+      discard console.sendString(" current=")
+      console.sendHex32(nimfw_dbg_nullframe_pay_current)
+      discard console.sendString(" pending=")
+      console.sendHex32(nimfw_dbg_nullframe_pay_pending)
+      discard console.sendString(" thd=")
+      console.sendHex32(nimfw_dbg_nullframe_pay_thd_status)
+      discard console.sendString(" txtrig=")
+      console.sendHex32(nimfw_dbg_nullframe_txtrig_seen)
+      discard console.sendString(" txtrig_int=")
+      console.sendHex32(nimfw_dbg_nullframe_txtrig_internal)
+      discard console.sendLine("")
+      discard console.sendString("[WIFI-NIMFW] keepalive inflight=")
+      console.sendHex32(nimfw_keepalive_inflight)
+      discard console.sendString(" target=")
+      console.sendHex32(nimfw_keepalive_target_cfm)
+      discard console.sendString(" rc=")
+      console.sendHex32(nimfw_dbg_keepalive_rc)
+      discard console.sendString(" post_before=")
+      console.sendHex32(nimfw_dbg_keepalive_post_before)
+      discard console.sendString(" post_after=")
+      console.sendHex32(nimfw_dbg_keepalive_post_after)
+      discard console.sendLine("")
+  check("ble peripheral connected callback",
+        bleConnectedCalled and bleConnectedErr == 0)
+  when BleRequireDisconnectedCallback:
+    await waitBleDisconnectedCallback(BleDisconnectDrainMs.uint32)
+    discard console.sendString("[BLEDBG] host active=")
+    console.sendHex32(bleHostDbgConnActive())
+    discard console.sendString(" connected_notified=")
+    console.sendHex32(bleHostDbgPeripheralConnectedNotified())
+    discard console.sendString(" disconnected_notified=")
+    console.sendHex32(bleHostDbgPeripheralDisconnectedNotified())
+    discard console.sendString(" idle_polls=")
+    console.sendHex32(bleHostDbgPeripheralIdlePolls())
+    discard console.sendString(" last_rx_event=")
+    console.sendHex32(bleHostDbgPeripheralLastRxEventCounter())
+    discard console.sendString(" disc_events=")
+    console.sendHex32(bleNimPeripheralDiscEventCount())
+    discard console.sendString(" disc_source=")
+    console.sendHex32(bleNimPeripheralDiscSource())
+    discard console.sendString(" disc_reason=")
+    console.sendHex32(bleNimPeripheralDiscReason())
+    discard console.sendString(" llcp_rx=")
+    console.sendHex32(bleNimDbgVendorLlcpRxCount())
+    discard console.sendString(" llcp_last=")
+    console.sendHex32(bleNimDbgVendorLlcpLastOpcode())
+    discard console.sendLine("")
+    check("ble peripheral disconnected callback", bleDisconnectedCalled)
+  else:
+    check("ble peripheral connected callback retained", bleConnectedCalled)
+  when WifiBleSimultaneous:
+    check("wifi still connected after ble", wifiStaAssociated())
 
   check("ble advertising stop", (await bleStopAdvertisingAsync()) == bleOk)
   let sleepRc = ble_controller_sleep(7)
@@ -493,14 +481,13 @@ proc smokeWifi(): CpsVoidFuture {.cps.} =
   check("wifi sta enable", iface != nil)
   let scanItems = await wifiScanAsync(30_000)
   check("wifi scan", true)
-  when defined(bl808WifiVendor):
-    discard console.sendString("[WIFI] scan items=")
-    console.sendHex32(scanItems)
-    discard console.sendString(" done=")
-    console.sendHex32(bl808_wifi_vendor_scan_done_count())
-    discard console.sendLine("")
-    check("wifi scan complete", bl808_wifi_vendor_scan_done_count() > 0'u32)
-    check("wifi scan results", scanItems > 0'u32)
+  discard console.sendString("[WIFI] scan items=")
+  console.sendHex32(scanItems)
+  discard console.sendString(" done=")
+  console.sendHex32(bl808_wifi_backend_scan_done_count())
+  discard console.sendLine("")
+  check("wifi scan complete", bl808_wifi_backend_scan_done_count() > 0'u32)
+  check("wifi scan results", scanItems > 0'u32)
 
   when WifiScanOnly:
     check("wifi ap start",
@@ -540,37 +527,36 @@ proc smokeWifi(): CpsVoidFuture {.cps.} =
 
 proc finishWifiAfterBle(): CpsVoidFuture {.cps.} =
   when WifiBleSimultaneous:
-    when defined(bl808WifiNimFw):
-      when WifiBlePostTrafficFrames > 0:
-        wifiSetBleCoexistenceMode(wifiBleCoexWifiPriority)
-        wifiSetStaKeepaliveQosNull(true)
-        wifiReclaimStaTxChannel()
-        let txStats = await wifiSendStaKeepaliveUntilAckAsync(
-          WifiBlePostTrafficFrames.uint32,
-          5000'u32,
-          1'u32,
-          1'u32,
-          500'u32,
-          WifiBleCoexServiceIterations.uint32)
-        discard console.sendString("[WIFI] post-ble tx frames=")
-        console.sendHex32(txStats.frames)
-        discard console.sendString(" attempts=")
-        console.sendHex32(txStats.attempts)
-        discard console.sendString(" busy=")
-        console.sendHex32(txStats.busy)
-        discard console.sendString(" failures=")
-        console.sendHex32(txStats.failures)
-        discard console.sendString(" cfm_delta=")
-        console.sendHex32(txStats.cfmDelta)
-        discard console.sendString(" ack_delta=")
-        console.sendHex32(txStats.ackDelta)
-        discard console.sendString(" nack_delta=")
-        console.sendHex32(txStats.failDelta)
-        discard console.sendLine("")
-        check("wifi tx after ble", txStats.frames > 0'u32 and
-              txStats.failures == 0'u32 and
-              txStats.cfmDelta >= txStats.frames and
-              txStats.ackDelta >= WifiBlePostTrafficFrames.uint32)
+    when WifiBlePostTrafficFrames > 0:
+      wifiSetBleCoexistenceMode(wifiBleCoexWifiPriority)
+      wifiSetStaKeepaliveQosNull(true)
+      wifiReclaimStaTxChannel()
+      let txStats = await wifiSendStaKeepaliveUntilAckAsync(
+        WifiBlePostTrafficFrames.uint32,
+        5000'u32,
+        1'u32,
+        1'u32,
+        500'u32,
+        WifiBleCoexServiceIterations.uint32)
+      discard console.sendString("[WIFI] post-ble tx frames=")
+      console.sendHex32(txStats.frames)
+      discard console.sendString(" attempts=")
+      console.sendHex32(txStats.attempts)
+      discard console.sendString(" busy=")
+      console.sendHex32(txStats.busy)
+      discard console.sendString(" failures=")
+      console.sendHex32(txStats.failures)
+      discard console.sendString(" cfm_delta=")
+      console.sendHex32(txStats.cfmDelta)
+      discard console.sendString(" ack_delta=")
+      console.sendHex32(txStats.ackDelta)
+      discard console.sendString(" nack_delta=")
+      console.sendHex32(txStats.failDelta)
+      discard console.sendLine("")
+      check("wifi tx after ble", txStats.frames > 0'u32 and
+            txStats.failures == 0'u32 and
+            txStats.cfmDelta >= txStats.frames and
+            txStats.ackDelta >= WifiBlePostTrafficFrames.uint32)
     when defined(WifiTransitionDiag):
       discard console.sendLine("[WIFI] post-ble disconnect begin")
     check("wifi disconnect after ble", (await wifiDisconnectAsync()) == wifiOk)

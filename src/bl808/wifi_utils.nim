@@ -5,7 +5,7 @@
 ## layer keeps ownership of WiFi descriptors and buffers. The experimental lwIP
 ## pbuf delivery path can be enabled with -d:bl808WifiRxPbufInput.
 
-when defined(bl808m0) and defined(bl808WifiVendor) and defined(bl808WifiNimFw):
+when defined(bl808m0) and defined(bl808WifiNimFw):
   {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver".}
   {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/include".}
 

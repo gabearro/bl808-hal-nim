@@ -1,6 +1,6 @@
 ## Nim replacement for the BL808 WiFi host message request builders.
 
-when defined(bl808m0) and defined(bl808WifiVendor) and not defined(bl808WifiVendorMsgTx):
+when defined(bl808m0) and defined(bl808WifiNimFw):
   {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver".}
   {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/include".}
 
@@ -333,7 +333,7 @@ when defined(bl808m0) and defined(bl808WifiVendor) and not defined(bl808WifiVend
   proc utils_tlv_bl_pack_auto(buf: ptr uint32; bufSz: cint; typ: uint16;
                               arg1: pointer): uint32
     {.importc, header: "utils_tlv_bl.h", cdecl.}
-  proc bl808_wifi_vendor_poll(iterations: cuint) {.importc, cdecl.}
+  proc bl808_wifi_backend_poll(iterations: cuint) {.importc, cdecl.}
 
   template ptrAt(base: pointer; off: uint): pointer =
     cast[pointer](cast[uint](base) + off)
@@ -791,7 +791,7 @@ when defined(bl808m0) and defined(bl808WifiVendor) and not defined(bl808WifiVend
     blSendMsg(blHw, req, 1, SM_CONNECT_CFM, cfm)
 
   proc bl_send_sm_disconnect_req*(blHw: ptr BlHw): cint {.exportc, cdecl.} =
-    bl808_wifi_vendor_poll(64)
+    bl808_wifi_backend_poll(64)
     let req = blMsgZalloc(SM_DISCONNECT_REQ, TASK_SM, DRV_TASK_ID, SizeSmDisconnectReq)
     if req == nil: return -Enomem
     storeU8(req, 0, staVifIdx(blHw))

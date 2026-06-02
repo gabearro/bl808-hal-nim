@@ -3,7 +3,7 @@
 ## This module owns the global `wifi_hw` object and exports the bl_main_*
 ## entry points while lower message/TX/RX units are still being ported.
 
-when defined(bl808m0) and defined(bl808WifiVendor) and defined(bl808WifiNimFw):
+when defined(bl808m0) and defined(bl808WifiNimFw):
   {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver".}
   {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/include".}
 
