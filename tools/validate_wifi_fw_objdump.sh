@@ -12,6 +12,8 @@ Examples:
 
 Optional RF/PHY provenance checks:
   VALIDATE_RF_ELF=/tmp/kernel.elf tools/validate_wifi_fw_objdump.sh <ref> <nim_obj>
+  VALIDATE_RF_HW_TEST=m0_wifi_nimfw_hal_test tools/validate_wifi_fw_objdump.sh <ref> <nim_obj>
+  VALIDATE_RF_HW_TESTS=m0_wifi_nimfw_boot_test,m0_wifi_nimfw_hal_test tools/validate_wifi_fw_objdump.sh <ref> <nim_obj>
   VALIDATE_RF_BUILD_LOG=build.log tools/validate_wifi_fw_objdump.sh <ref> <nim_obj>
   VALIDATE_RF_LINK_MAP=kernel.map tools/validate_wifi_fw_objdump.sh <ref> <nim_obj>
   VALIDATE_RF_REQUIRE_HW_NIMCACHE=1 VALIDATE_RF_ELF=build/hw-validation/bin/<test>/kernel.elf tools/validate_wifi_fw_objdump.sh <ref> <nim_obj>
@@ -19,6 +21,8 @@ Optional RF/PHY provenance checks:
   that WiFi phy_init copies agcmem to 0x24C0A000 and has no LDPC RAM path.
   When a hw-validation kernel.map exists beside VALIDATE_RF_ELF, the RF
   provenance step also rejects extracted RF archive members in the link map.
+  When a hw-validation kernel build log exists for VALIDATE_RF_ELF, the RF
+  provenance step also rejects RF archive references in the compiler/link log.
 USAGE
   exit 2
 fi
@@ -163,11 +167,30 @@ if [[ -f tools/validate_rf_symbol_provenance.py ]]; then
   if [[ -f src/bl808/librf_bl808.a ]]; then
     RF_ARGS+=(--rf-archive src/bl808/librf_bl808.a --check-wifi-phy-memory-init)
   fi
+  if [[ -n "${VALIDATE_RF_HW_TEST:-}" ]]; then
+    RF_ARGS+=(--hw-validation-test "$VALIDATE_RF_HW_TEST")
+  fi
+  if [[ -n "${VALIDATE_RF_HW_TESTS:-}" ]]; then
+    IFS=',' read -r -a rf_hw_tests <<< "$VALIDATE_RF_HW_TESTS"
+    for rf_hw_test in "${rf_hw_tests[@]}"; do
+      if [[ -n "$rf_hw_test" ]]; then
+        RF_ARGS+=(--hw-validation-test "$rf_hw_test")
+      fi
+    done
+  fi
   if [[ -n "${VALIDATE_RF_ELF:-}" ]]; then
     RF_ARGS+=(--elf "$VALIDATE_RF_ELF" --check-hw-validation-nimcache-objects)
     inferred_map="${VALIDATE_RF_ELF%.elf}.map"
     if [[ -f "$inferred_map" ]]; then
       RF_ARGS+=(--link-map "$inferred_map")
+    fi
+    if [[ "$VALIDATE_RF_ELF" == */build/hw-validation/bin/*/kernel.elf ]]; then
+      RF_ARGS+=(--infer-hw-validation-nimcache-objects)
+      test_name="$(basename "$(dirname "$VALIDATE_RF_ELF")")"
+      inferred_build_log="$(dirname "$(dirname "$(dirname "$VALIDATE_RF_ELF")")")/logs/${test_name}.kernel.build.log"
+      if [[ -f "$inferred_build_log" ]]; then
+        RF_ARGS+=(--build-log "$inferred_build_log")
+      fi
     fi
     if [[ -n "${VALIDATE_RF_REQUIRE_HW_NIMCACHE:-}" ]]; then
       RF_ARGS+=(--require-hw-validation-wifi-nimcache-object)

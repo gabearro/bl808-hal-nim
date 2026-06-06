@@ -1,5 +1,6 @@
 import subprocess
 import shutil
+import re
 from pathlib import Path
 
 
@@ -2696,6 +2697,7 @@ def test_wifi_sae_and_assoc_rsp_builders_use_typed_vif_overlays():
         "acVo*: uint32",
         "doAssert offsetof(MmWmmParameterSourceView, acBk) == 8",
         "doAssert offsetof(MmWmmParameterSourceView, idleOptions) == 26",
+        "doAssert offsetof(VifChannelView, wmmQosInfo) == 452",
         "template mmWmmParameterSource(): ptr MmWmmParameterSourceView",
         "proc setLe32*(rec: var WmmAcParamRecord; value: uint32) {.inline.}",
     ]:
@@ -2718,7 +2720,7 @@ def test_wifi_sae_and_assoc_rsp_builders_use_typed_vif_overlays():
         "let bufPtrPtr = cast[ptr pointer](buf)",
         "let wmm = wmmParameterIeAt(bufPtrPtr[])",
         "let wmmSrc = mmWmmParameterSource()",
-        "wmm.qosInfo = vif.modeByte452",
+        "wmm.qosInfo = vif.wmmQosInfo",
         "wmm.ac[0].setLe32(wmmSrc.acBe)",
         "wmm.ac[1].setLe32(wmmSrc.acBk)",
         "wmm.ac[2].setLe32(wmmSrc.acVi)",
@@ -2736,6 +2738,7 @@ def test_wifi_sae_and_assoc_rsp_builders_use_typed_vif_overlays():
         "let vifEntry = vifTabBase + vifIdx * VIF_ENTRY_SIZE.uint",
         "let saeCtx = cast[pointer](vifEntry + 80)",
         "cast[pointer](cast[uint](buf) + 6)",
+        "modeByte452",
         "p[0] = (authAlgo and 0xFF).uint8",
         "p[1] = ((authAlgo shr 8) and 0xFF).uint8",
         "p[2] = (authSeq and 0xFF).uint8",
@@ -5891,6 +5894,12 @@ def test_ble_hci_format_parser_uses_explicit_terminator_loop():
 def test_ble_rf_and_connection_convergence_loops_are_explicit():
     ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
 
+    btble_rf_table = ble.split("BtbleRfTableView {.packed.} = object", 1)[1].split(
+        "BleMacPhyRegs {.packed.} = object", 1
+    )[0]
+    btble_rf_init = ble.split("proc btble_rf_init*(rf: pointer) {.exportc, cdecl.} =", 1)[1].split(
+        "when defined(bl808m0) and bl808BleNimConnectionEnabled:", 1
+    )[0]
     txcal_body = ble.split("proc tuneBleRfTxcalSingenPower", 1)[1].split(
         "proc writeBleRfTxcalMixerCs", 1
     )[0]
@@ -5898,6 +5907,35 @@ def test_ble_rf_and_connection_convergence_loops_are_explicit():
         "nimConnProgramRxTiming", 1
     )[0]
 
+    for expected in [
+        "unusedCallback08*: pointer",
+        "unusedCallback0c*: pointer",
+        "unusedCallback18*: pointer",
+        "unusedCallback28*: pointer",
+        "emConfigPadding3a*: array[3, uint8]",
+        "doAssert offsetof(BtbleRfTableView, unusedCallback08) == 0x08",
+        "doAssert offsetof(BtbleRfTableView, unusedCallback0c) == 0x0C",
+        "doAssert offsetof(BtbleRfTableView, unusedCallback18) == 0x18",
+        "doAssert offsetof(BtbleRfTableView, unusedCallback28) == 0x28",
+        "doAssert offsetof(BtbleRfTableView, emConfigPadding3a) == 0x3A",
+    ]:
+        assert expected in ble
+    for expected in [
+        "table.unusedCallback08 = nil",
+        "table.unusedCallback0c = nil",
+        "table.unusedCallback18 = nil",
+        "table.unusedCallback28 = nil",
+        "table.emConfigPadding3a = [0'u8, 0, 0]",
+    ]:
+        assert expected in btble_rf_init
+    for forbidden in [
+        "reserved08*",
+        "reserved0C*",
+        "reserved18*",
+        "reserved28*",
+        "reserved3A*",
+    ]:
+        assert forbidden not in btble_rf_table
     assert "var tuning = true" in txcal_body
     assert "while tuning:" in txcal_body
     assert "while true:" not in txcal_body
@@ -5994,65 +6032,225 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "wifiRfCoreInit(40000000'u32)"
     )
     assert "WlRfConfig {.packed.} = object" in wifi_fw
-    assert "doAssert offsetof(WlRfConfig, paramLoad) == 200" in wifi_fw
+    assert "doAssert offsetof(WlRfConfig, paramLoadCallback) == 200" in wifi_fw
+    wl_rf_config = wifi_fw.split("WlRfConfig {.packed.} = object", 1)[1].split(
+        "WlRfMemoryOverlay {.packed.} = object", 1
+    )[0]
+    for expected in (
+        "enableParamLoadCallback: uint8",
+        "requestFullCalibration: uint8",
+        "enableCapcodeSetCallback: uint8",
+        "paramLoadCallback: pointer",
+        "capcodeSetCallback: pointer",
+        "capcodeGetCallback: pointer",
+        "channelFreqSeedPair0: uint32",
+        "channelFreqSeedPair1: uint32",
+        "channelFreqSeedPair2: uint32",
+        "channelFreqSeedPadding: array[5, uint32]",
+        "ratePowerTablePreamble: uint16",
+        "ratePowerTable: array[106, uint8]",
+        "ratePowerLimitDbm: uint8",
+        "ratePowerTablePostamble: array[4, uint8]",
+        "temperaturePowerCompPadding: uint16",
+        "efuseTrimControl: uint32",
+        "xtalCountWindowMin: uint32",
+        "xtalCountWindowMax: uint32",
+        "xtalDividerConfig: uint32",
+        "xtalControlCode: uint32",
+        "ceLoopScratch0: uint32",
+        "pdLoopReserved12: uint8",
+    ):
+        assert expected in wifi_fw
+    for forbidden in (
+        "channelFreqPair0",
+        "channelFreqPair1",
+        "channelFreqPair2",
+        "channelFreqPairPadding",
+        "channelPowerTablePadding",
+        "powerTableLimit",
+        "powerTablePostamble",
+        "enParamLoad",
+        "enFullCal",
+        "enCapcodeSet",
+        "paramLoad:",
+        "capcodeSet:",
+        "capcodeGet:",
+    ):
+        assert forbidden not in wl_rf_config
+    for vague_name in (
+        "priByte9C",
+        "priWordC0",
+        "word04: uint32",
+        "word08: uint32",
+        "word0c: uint32",
+        "word10: uint32",
+        "rfReg1c8Value: uint32",
+        "rfReg1ccValue: uint32",
+        "rfReg1c4Value: uint32",
+        "rfReg1c0Value: uint32",
+        "loopWord0",
+        "pdReserved12",
+        "agcCtrl88",
+        "agcCtrl8c",
+        "dfeCtrl3bc",
+        "dfeCtrl414",
+        "phyCtrlC40",
+        "phyCtrlC44",
+    ):
+        assert vague_name not in wifi_fw
     assert "WlRfMemoryOverlay {.packed.} = object" in wifi_fw
     assert "doAssert offsetof(WlRfMemoryOverlay, calib) == 212" in wifi_fw
     assert "doAssert offsetof(WlRfMemoryOverlay, env) == 532" in wifi_fw
     for expected in [
+        "PhyEnvView {.packed.} = object",
+        "initCfgWords: array[9, uint32]",
+        "channelBandType: uint16",
+        "primaryFreq: uint16",
+        "centerFreq1: uint16",
+        "centerFreq2OrTxPower: uint16",
+        "txPowerAndReserved: uint16",
+        "BbaRxVectorView {.packed.} = object",
+        "rxFormatWord0: uint32",
+        "rxFormatWord1Rate: uint8",
+        "rssiDbm: uint8",
+        "rxFormatWord1Mcs: uint8",
+        "rxFormatWord1Flags: uint8",
+        "carrierFreqOffset: uint16",
+        "doAssert sizeof(PhyEnvView) == 48",
+        "doAssert offsetof(PhyEnvView, initCfgWords) == 0",
+        "doAssert offsetof(PhyEnvView, channelBandType) == 36",
+        "doAssert offsetof(PhyEnvView, primaryFreq) == 38",
+        "doAssert offsetof(PhyEnvView, centerFreq1) == 40",
+        "doAssert offsetof(PhyEnvView, centerFreq2OrTxPower) == 42",
+        "doAssert offsetof(PhyEnvView, txPowerAndReserved) == 44",
+        "doAssert sizeof(BbaRxVectorView) == 24",
+        "doAssert offsetof(BbaRxVectorView, rxFormatWord0) == 0",
+        "doAssert offsetof(BbaRxVectorView, rxFormatWord1Rate) == 4",
+        "doAssert offsetof(BbaRxVectorView, rssiDbm) == 5",
+        "doAssert offsetof(BbaRxVectorView, carrierFreqOffset) == 0x16",
         "doAssert offsetof(WifiModemBlock, versionWord) == 0x0",
+        "doAssert offsetof(WifiModemBlock, versionDfeCaps1c) == 0x1C",
+        "doAssert offsetof(WifiModemBlock, versionDfeCaps24) == 0x24",
+        "doAssert offsetof(WifiModemBlock, versionDfeCaps28) == 0x28",
         "doAssert offsetof(WifiModemBlock, versionScratch3c) == 0x3C",
-        "doAssert offsetof(WifiModemBlock, phyCtrl800) == 0x800",
-        "doAssert offsetof(WifiModemBlock, phyCtrl814) == 0x814",
-        "doAssert offsetof(WifiModemBlock, phyCtrl820) == 0x820",
-        "doAssert offsetof(WifiModemBlock, phyCtrl824) == 0x824",
-        "doAssert offsetof(WifiModemBlock, phyCtrl830) == 0x830",
-        "doAssert offsetof(WifiModemBlock, phyCtrl834) == 0x834",
-        "doAssert offsetof(WifiModemBlock, phyCtrl83c) == 0x83C",
-        "doAssert offsetof(WifiModemBlock, phyCtrl840) == 0x840",
-        "doAssert offsetof(WifiModemBlock, phyCtrl84c) == 0x84C",
-        "doAssert offsetof(WifiModemBlock, phyCtrl860) == 0x860",
-        "doAssert offsetof(WifiModemBlock, phyCtrl874) == 0x874",
+        "doAssert offsetof(WifiModemBlock, preAgcCtrl324) == 0x324",
+        "doAssert offsetof(WifiModemBlock, basebandDfeTimeout3bc) == 0x3BC",
+        "doAssert offsetof(WifiModemBlock, basebandDfeEnable414) == 0x414",
+        "doAssert offsetof(WifiModemBlock, versionFeatureCtrl800) == 0x800",
+        "doAssert offsetof(WifiModemBlock, bandwidth20MGuard814) == 0x814",
+        "doAssert offsetof(WifiModemBlock, bandwidth20MProfile820) == 0x820",
+        "doAssert offsetof(WifiModemBlock, channelTypeCtrl824) == 0x824",
+        "doAssert offsetof(WifiModemBlock, bandwidth20MProfile830) == 0x830",
+        "doAssert offsetof(WifiModemBlock, bandwidth20MEnable834) == 0x834",
+        "doAssert offsetof(WifiModemBlock, bandwidth20MSignal83c) == 0x83C",
+        "doAssert offsetof(WifiModemBlock, bandwidth20MSignal840) == 0x840",
+        "doAssert offsetof(WifiModemBlock, preAgcSignal844) == 0x844",
+        "doAssert offsetof(WifiModemBlock, preAgcSignal848) == 0x848",
+        "doAssert offsetof(WifiModemBlock, channelCenterRatio84c) == 0x84C",
+        "doAssert offsetof(WifiModemBlock, bandwidth20MFilter860) == 0x860",
+        "doAssert offsetof(WifiModemBlock, bandwidth20MGate874) == 0x874",
         "doAssert offsetof(WifiModemBlock, phyChannelPulse888) == 0x888",
+        "doAssert offsetof(WifiModemBlock, preAgcDetect894) == 0x894",
         "doAssert offsetof(WifiModemBlock, groupMembership0) == 0x8A8",
         "doAssert offsetof(WifiModemBlock, groupMembership1) == 0x8AC",
         "doAssert offsetof(WifiModemBlock, userPosition) == 0x8B0",
         "doAssert offsetof(WifiModemBlock, aid) == 0x8C0",
         "doAssert offsetof(WifiModemBlock, aidMaskLo) == 0x8C4",
         "doAssert offsetof(WifiModemBlock, aidMaskHi) == 0x8C8",
-        "doAssert offsetof(WifiModemBlock, phyCtrl930) == 0x930",
-        "doAssert offsetof(WifiModemBlock, phyCtrlC40) == 0xC40",
-        "doAssert offsetof(WifiModemBlock, phyCtrlC44) == 0xC44",
+        "doAssert offsetof(WifiModemBlock, preAgcTiming8d4) == 0x8D4",
+        "doAssert offsetof(WifiModemBlock, preAgcTiming8d8) == 0x8D8",
+        "doAssert offsetof(WifiModemBlock, preAgcTiming8e0) == 0x8E0",
+        "doAssert offsetof(WifiModemBlock, preAgcTiming8e4) == 0x8E4",
+        "doAssert offsetof(WifiModemBlock, channelModeCtrl930) == 0x930",
+        "doAssert offsetof(WifiModemBlock, basebandRxPathCtrlC40) == 0xC40",
+        "doAssert offsetof(WifiModemBlock, basebandRxPathCtrlC44) == 0xC44",
         "doAssert offsetof(WifiModemBlock, intStatusB41c) == 0xB41C",
         "doAssert offsetof(WifiModemBlock, intAckB420) == 0xB420",
-        "doAssert offsetof(WifiModemBlock, rxTailC018) == 0xC018",
+        "doAssert offsetof(WifiModemBlock, rxGainTailCtrlC018) == 0xC018",
         "doAssert offsetof(WifiModemBlock, rxGainTimingC044) == 0xC044",
         "doAssert offsetof(WifiModemBlock, rxGainTable0C080) == 0xC080",
         "doAssert offsetof(WifiModemBlock, rxGainTable1C084) == 0xC084",
         "doAssert offsetof(WifiModemBlock, rxGainTable2C088) == 0xC088",
+        "doAssert offsetof(RfRegBlock, txcalBias58) == 0x58",
+        "doAssert offsetof(RfRegBlock, txcalGain64) == 0x64",
+        "doAssert offsetof(RfRegBlock, txcalGain68) == 0x68",
+        "doAssert offsetof(RfRegBlock, txcalDc6c) == 0x6C",
+        "doAssert offsetof(PhyAgcBlock, sharedCopyWindow88) == 0x88",
+        "doAssert offsetof(PhyAgcBlock, sharedCopyWindow8c) == 0x8C",
+        "doAssert offsetof(MacPhyCtrlBlock, channelBandwidthCtrl310) == 0x310",
+        "doAssert offsetof(CrmPhyClockBlock, phyClockSelect8) == 0x08",
+        "doAssert offsetof(CrmPhyClockBlock, rfClockMux10) == 0x10",
+        "doAssert offsetof(CrmPhyClockBlock, modemReset18) == 0x18",
+        "doAssert offsetof(RfPllBlock, pllReset10) == 0x10",
+        "doAssert offsetof(RfPllBlock, refdivCtrl14) == 0x14",
+        "doAssert offsetof(RfPllBlock, loopFilter18) == 0x18",
+        "doAssert offsetof(RfPllBlock, fractionalCtrl1c) == 0x1C",
+        "doAssert offsetof(RfPllBlock, fractionalWord28) == 0x28",
+        "doAssert offsetof(RfPllBlock, modeCtrl2c) == 0x2C",
+        "doAssert offsetof(RfPllBlock, enableCtrl30) == 0x30",
+        "doAssert offsetof(RfDfeInitBlock, dfeRfFixedCtrl814) == 0x814",
+        "doAssert offsetof(RfDfeInitBlock, dfeTrim824) == 0x824",
+        "doAssert offsetof(RfRegBlock, synthDfePathControl63c) == 0x63C",
+        "doAssert offsetof(BbaAgcBlock, agcCoreEnable004) == 0x004",
+        "doAssert offsetof(BbaAgcBlock, agcCoreCtrl100) == 0x100",
+        "doAssert offsetof(BbaAgcBlock, agcCoreProfile364) == 0x364",
         "doAssert offsetof(BbaAgcBlock, pdComp36c) == 0x36C",
+        "doAssert offsetof(BbaAgcBlock, agcCoreProfile370) == 0x370",
+        "doAssert offsetof(BbaAgcBlock, agcCoreStage0B380) == 0x380",
         "doAssert offsetof(BbaAgcBlock, macActiveB384) == 0x384",
+        "doAssert offsetof(BbaAgcBlock, agcCoreStage2B388) == 0x388",
         "doAssert offsetof(BbaAgcBlock, macActiveB38c) == 0x38C",
         "doAssert offsetof(BbaAgcBlock, pdGain390) == 0x390",
+        "doAssert offsetof(BbaAgcBlock, agcCoreDetect394) == 0x394",
+        "doAssert offsetof(BbaAgcBlock, agcCoreDetect398) == 0x398",
         "doAssert offsetof(BbaAgcBlock, macActiveB3a0) == 0x3A0",
+        "doAssert offsetof(BbaAgcBlock, agcCoreWindow3a4) == 0x3A4",
         "doAssert offsetof(BbaAgcBlock, pdTiming3ac) == 0x3AC",
         "doAssert offsetof(BbaAgcBlock, macActiveB3bc) == 0x3BC",
         "doAssert offsetof(BbaAgcBlock, pdSlope3c0) == 0x3C0",
         "doAssert offsetof(BbaAgcBlock, macActiveB3c4) == 0x3C4",
+        "doAssert offsetof(BbaAgcBlock, agcCoreTimeout414) == 0x414",
         "doAssert offsetof(BbaAgcBlock, macActiveC01c) == 0x101C",
         "doAssert offsetof(BbaAgcBlock, macActiveC020) == 0x1020",
         "doAssert offsetof(BbaAgcBlock, macActiveC02c) == 0x102C",
+        "doAssert offsetof(BbaAgcBlock, agcCoreTableC80c) == 0x180C",
         "doAssert offsetof(BbaAgcBlock, pdCompC830) == 0x1830",
+        "doAssert offsetof(BbaAgcBlock, pdCompRampC838) == 0x1838",
+        "doAssert offsetof(BbaAgcBlock, pdCompRampC83c) == 0x183C",
+        "doAssert offsetof(BbaAgcBlock, pdCompRampC840) == 0x1840",
     ]:
         assert expected in wifi_fw
+    for expected in [
+        "RfAuxCtrlBase = 0x20000500'u",
+        "BbaAgcBase = 0x24C0B000'u",
+        "cast[ptr RfAuxCtrlBlock](RfAuxCtrlBase)",
+        "cast[ptr BbaAgcBlock](BbaAgcBase)",
+    ]:
+        assert expected in wifi_fw
+    for forbidden in [
+        "cast[ptr RfAuxCtrlBlock](0x20000500'u)",
+        "cast[ptr BbaAgcBlock](0x24C0B000'u)",
+    ]:
+        assert forbidden not in wifi_fw
     assert 'var wlCfgGlobal* {.exportc: "wl_cfg".}: pointer' in wifi_fw
     assert "proc wl_rf_cfg_init*() {.exportc, cdecl.} =" in wifi_fw
     assert "proc wl_cfg_get(rmem: ptr WlRfMemoryOverlay): ptr WlRfConfig {.exportc, cdecl.} =" in wifi_fw
     assert "proc wl_cfg_get(rmem: ptr uint8): ptr WlRfConfig {.importc, cdecl.}" not in wifi_fw
     assert "proc modem_init_core*(xtalfreqHz, restore: uint32)" in wifi_fw
     assert "proc wifiRfCoreInit*(xtalfreqHz: uint32) {.exportc, cdecl, noinline.}" in wifi_fw
-    assert "proc wifiRfCoreInitMode(xtalfreqHz: uint32, apiMode: uint8) {.noinline.}" in wifi_fw
+    for expected in [
+        "RadioPhyMode* = enum",
+        "wifiOnly = 1'u8",
+        "bleOnly = 2'u8",
+        "wifiBleCoex = 3'u8",
+        "proc radioPhyModeFromApi(apiMode: uint8): RadioPhyMode {.inline.} =",
+        "proc apiFromRadioPhyMode(mode: RadioPhyMode): uint8 {.inline.} =",
+    ]:
+        assert expected in wifi_fw
+    assert "proc wlModeFromApi" not in wifi_fw
+    assert "proc wifiRfCoreInitMode(xtalfreqHz: uint32, mode: RadioPhyMode) {.noinline.}" in wifi_fw
     rf_core_init = wifi_fw.split(
-        "proc wifiRfCoreInitMode(xtalfreqHz: uint32, apiMode: uint8) {.noinline.} =",
+        "proc wifiRfCoreInitMode(xtalfreqHz: uint32, mode: RadioPhyMode) {.noinline.} =",
         1,
     )[1].split("proc wifiRfCoreInit*(xtalfreqHz: uint32) {.exportc, cdecl, noinline.} =", 1)[0]
     wifi_rf_core_export = wifi_fw.split(
@@ -6063,24 +6261,144 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "proc rfc_init*(xtalfreqHz: uint32, fullInit: uint32 = 1'u32) {.exportc, cdecl.} =",
         1,
     )[1].split("template rf_calib_data", 1)[0]
+    vco_table_body = wifi_fw.split(
+        "proc programRfcVcoTable() =",
+        1,
+    )[1].split("proc rf_dump_status*", 1)[0]
+    rfc_bandwidth_body = wifi_fw.split(
+        "proc rfc_config_bandwidth*(bandwidth: uint32) {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc rfc_config_channel*", 1)[0]
+    rfc_channel_body = wifi_fw.split(
+        "proc rfc_config_channel*(channelMhz: uint32) {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc modemInitCoreMode", 1)[0]
+    rfc_modem_late_body = wifi_fw.split(
+        "proc programRfcModemLateInit() =",
+        1,
+    )[1].split("proc modemInitCoreMode", 1)[0]
+    rf_restore_body = wifi_fw.split(
+        "proc rfPriRestoreCalReg() =",
+        1,
+    )[1].split("proc rfPriWriteTotalPowerComp", 1)[0]
+    restore_cal_state_body = wifi_fw.split(
+        "proc restoreRfPriCalState(state: RfPriCalState) =",
+        1,
+    )[1].split("proc rfPriConfigChannelForCal", 1)[0]
+    save_cal_state_body = wifi_fw.split(
+        "proc saveRfPriCalState(): RfPriCalState =",
+        1,
+    )[1].split("proc restoreRfPriCalState", 1)[0]
+    total_power_comp_body = wifi_fw.split(
+        "proc rfPriWriteTotalPowerComp(channelIndex: uint32) =",
+        1,
+    )[1].split("proc rf_pri_input_xtalfreq", 1)[0]
+    xtal_input_body = wifi_fw.split(
+        "proc rf_pri_input_xtalfreq(xtalfreqHz: uint32) {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc rfPriXtalRefdivRatio", 1)[0]
+    xtal_refdiv_body = wifi_fw.split(
+        "proc rfPriXtalRefdivRatio(): uint32 {.inline.} =",
+        1,
+    )[1].split("proc rfPriXtalTenthsMhz", 1)[0]
+    xtal_tenths_body = wifi_fw.split(
+        "proc rfPriXtalTenthsMhz(): uint32 {.inline.} =",
+        1,
+    )[1].split("proc rfPriWifiPllConfig", 1)[0]
+    efuse_init_body = wifi_fw.split(
+        "proc rfPriEfuseInit() =",
+        1,
+    )[1].split("proc runRfPriFullCalRestoreBaseline", 1)[0]
+    efuse_xtal_cap_body = wifi_fw.split(
+        "proc rfPriApplyEfuseXtalCapTrim(cfg: ptr WlRfConfig;",
+        1,
+    )[1].split("proc rfPriApplyEfuseTxGainTrim", 1)[0]
+    efuse_tx_gain_body = wifi_fw.split(
+        "proc rfPriApplyEfuseTxGainTrim(cfg: ptr WlRfConfig) =",
+        1,
+    )[1].split("proc rfPriApplyEfuseDfeTrim", 1)[0]
+    efuse_dfe_trim_body = wifi_fw.split(
+        "proc rfPriApplyEfuseDfeTrim(cfg: ptr WlRfConfig) =",
+        1,
+    )[1].split("proc rfPriEfuseInit", 1)[0]
+    notch_param_body = wifi_fw.split(
+        "proc rfPriApplyNotchParam(channelMhz: uint32) =",
+        1,
+    )[1].split("proc rfPriApplyWb03Non40OptimizePll", 1)[0]
+    wifi_pll_config_body = wifi_fw.split(
+        "proc rfPriWifiPllConfig() =",
+        1,
+    )[1].split("proc rfPriEfuseInit", 1)[0]
+    rf_optimize_body = wifi_fw.split(
+        "proc rf_pri_optimize(channelMhz: uint32) {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc rfc_config_channel*", 1)[0]
+    rf_stage_snapshot_body = wifi_fw.split(
+        "proc rfPriSnapshotStage(tag: uint32) =",
+        1,
+    )[1].split("proc writeRfPriFixedValueRegs", 1)[0]
+    bz_txcal_snapshot_body = wifi_fw.split(
+        "proc rfPriSnapshotBzTxcalState(tag: uint32) =",
+        1,
+    )[1].split("proc sampleRfTxcalAverage", 1)[0]
+    rxcal_replay_body = wifi_fw.split(
+        "proc rfPriReplayRxcalRegs() =",
+        1,
+    )[1].split("proc rfPriSeedRxcalRestoreLowHalves", 1)[0]
     phy_init_body = wifi_fw.split(
         "proc phy_init*(cfg: pointer) {.exportc, cdecl.} =",
         1,
     )[1].split("var wlCalGlobal*", 1)[0]
+    agc_core_body = wifi_fw.split(
+        "proc bl808PhyProgramAgcCoreRegs() =",
+        1,
+    )[1].split("var phyRxGainOffsetVsTemperature", 1)[0]
+    pre_agc_body = wifi_fw.split(
+        "proc bl808PhyProgramPreAgcRegs() =",
+        1,
+    )[1].split("proc bl808PhyProgramAgcCopyTailRegs", 1)[0]
+    agc_copy_tail_body = wifi_fw.split(
+        "proc bl808PhyProgramAgcCopyTailRegs() =",
+        1,
+    )[1].split("proc bl808PhyProgramAgcCoreRegs", 1)[0]
     wl_init_body = wifi_fw.split(
         "proc wl_init*(): int8 {.exportc, cdecl.} =",
         1,
     )[1].split("proc channelPowerIndex", 1)[0]
+    wl_cfg_init_body = wifi_fw.split(
+        "proc wl_rf_cfg_init*() {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc wl_cfg_get", 1)[0]
     modem_init_mode_body = wifi_fw.split(
-        "proc modemInitCoreMode(xtalfreqHz, restore: uint32; apiMode: uint8) =",
+        "proc modemInitCoreMode(xtalfreqHz, restoreExistingCalibration: uint32;",
         1,
     )[1].split("proc modem_init_core*", 1)[0]
     assert "proc configureWlRfConfig(cfg: ptr WlRfConfig; xtalfreqHz: uint32;" in wifi_fw
-    assert "cfg.paramLoad = nil" in wifi_fw
+    assert "mode: RadioPhyMode; requestFullCalibration: uint8" in wifi_fw
+    assert "cfg.paramLoadCallback = nil" in wifi_fw
+    for expected in [
+        "cfg.channelFreqSeedPair0 = 0x096C0100'u32",
+        "cfg.channelFreqSeedPair1 = 0x098A097B'u32",
+        "cfg.channelFreqSeedPair2 = 0x09A80999'u32",
+        "cfg.channelFreqSeedPadding.mitems",
+        "cfg.ratePowerTablePreamble = 0'u16",
+        "cfg.ratePowerLimitDbm = 20'u8",
+    ]:
+        assert expected in wl_cfg_init_body
     assert "var wifiBl808RfInited: uint32" in wifi_fw
-    assert "when defined(bl808WifiRfColdInit):" in wifi_fw
-    assert "let restore = if wifiBl808RfInited == 0'u32: 0'u32 else: 1'u32" in wifi_fw
-    assert "let restore = 1'u32" in wifi_fw
+    assert "bl808WifiRfColdInit" not in wifi_fw
+    assert (
+        "let requestFullCalibration =\n"
+        "        if wifiBl808RfInited == 0'u32: 1'u8 else: 0'u8"
+    ) in rf_core_init
+    assert (
+        "let restoreExistingCalibration =\n"
+        "      if wifiBl808RfInited == 0'u32: 0'u32 else: 1'u32"
+    ) in rf_core_init
+    assert "let restoreExistingCalibration = 1'u32" not in wifi_fw
+    assert "let requestFullCalibration = 0'u8" not in wifi_fw
+    assert "let restore = if wifiBl808RfInited" not in wifi_fw
+    assert "let restore = 1'u32" not in wifi_fw
     assert "discard wl_init()" in wifi_fw
     assert "wifiBl808RfInited = 1'u32" in wifi_fw
     assert "when defined(bl808WifiUseBl808Rf):" in wifi_fw
@@ -6097,30 +6415,668 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     assert "proc phy_set_channel*(band: uint8, chanType: uint8" not in wifi_fw
     assert "extern void phy_init" not in wifi_fw
     assert "phy_init(0)" not in wifi_fw
+    assert "template phyEnvByte(" not in wifi_fw
+    assert "template phyEnvHalf(" not in wifi_fw
+    assert "template phyEnvWord(" not in wifi_fw
+    assert "template phyEnvViewPtr(): ptr PhyEnvView" in wifi_fw
     assert rf_core_init.index("wl_cfg_get(addr wifiBl808WlRmem)") < rf_core_init.index(
         "discard wl_init()"
     )
     assert "let cfg = wl_cfg_get(addr wifiBl808WlRmem)" in rfc_init_body
-    assert "configureWlRfConfig(" in rfc_init_body
-    assert "WlApiModeWlan" in rfc_init_body
-    assert "configureWlRfConfig(cfg, xtalfreqHz, apiMode, enFullCal)" in rf_core_init
-    assert "nimFwDbgRfApiMode = apiMode.uint32" in rf_core_init
-    assert "wifiRfCoreInitMode(xtalfreqHz, WlApiModeWlan)" in wifi_rf_core_export
-    assert "modemInitCoreMode(cfg.xtalfreqHz, restore, cfg.apiMode)" in wl_init_body
-    assert "rf_pri_init(if restore == 0'u32: 1'u32 else: 0'u32, apiMode.uint32)" in modem_init_mode_body
-    assert "nimFwDbgRfApiMode = apiMode.uint32" in modem_init_mode_body
-    assert "modemInitCoreMode(xtalfreqHz, restore, WlApiModeWlan)" in wifi_fw
-    assert "rf_pri_init(if restore == 0'u32: 1'u32 else: 0'u32, 1'u32)" not in modem_init_mode_body
+    assert "let wlFullCalibrationFlag =" in rfc_init_body
     assert "if fullInit != 0'u32: 1'u8 else: 0'u8" in rfc_init_body
+    assert "configureWlRfConfig(" in rfc_init_body
+    assert "wifiOnly" in rfc_init_body
+    assert "wlFullCalibrationFlag)" in rfc_init_body
+    assert "configureWlRfConfig(cfg, xtalfreqHz, mode, requestFullCalibration)" in rf_core_init
+    assert "let apiMode = apiFromRadioPhyMode(mode)" in rf_core_init
+    assert "nimFwDbgRfApiMode = apiMode.uint32" in rf_core_init
+    assert "nimFwDbgRfRestore = restoreExistingCalibration" in rf_core_init
+    assert '"[WIFI-CT] bl808_rf_modem ", xtalfreqHz, restoreExistingCalibration' in rf_core_init
+    assert '"[WIFI-CT] bl808_rf_done ", xtalfreqHz, restoreExistingCalibration' in rf_core_init
+    assert "wifiRfCoreInitMode(xtalfreqHz, wifiOnly)" in wifi_rf_core_export
+    assert "let restoreExistingCalibration =" in wl_init_body
+    assert "if cfg.requestFullCalibration != 0'u8: 0'u32 else: 1'u32" in wl_init_body
+    assert (
+        "modemInitCoreMode(\n      cfg.xtalfreqHz,\n      restoreExistingCalibration,"
+    ) in wl_init_body
+    assert "let apiMode = apiFromRadioPhyMode(mode)" in modem_init_mode_body
+    assert "let xtalCfg = RfcXtalConfigTable[xtalIndex(xtalfreqHz)]" in modem_init_mode_body
+    assert (
+        "updateReg32(addr rf.rxMode220, 0xFBFFFFFF'u32, 0'u32)"
+        in modem_init_mode_body
+    )
+    assert (
+        "updateReg32(addr rf.rxMode220, 0xF7FFFFFF'u32, 0x08000000'u32)"
+        in modem_init_mode_body
+    )
+    assert modem_init_mode_body.index(
+        "updateReg32(addr rf.rxMode220, 0xFBFFFFFF'u32, 0'u32)"
+    ) < modem_init_mode_body.index("rf_pri_input_xtalfreq(xtalfreqHz)")
+    assert modem_init_mode_body.index(
+        "updateReg32(addr rf.rxMode220, 0xF7FFFFFF'u32, 0x08000000'u32)"
+    ) < modem_init_mode_body.index("rf_pri_input_xtalfreq(xtalfreqHz)")
+    assert "restoreExistingCalibration == 0'u32" in modem_init_mode_body
+    assert "proc modemInitCoreMode(xtalfreqHz, restore: uint32" not in wifi_fw
+    assert "nimFwDbgRfApiMode = apiMode.uint32" in modem_init_mode_body
+    assert "modemInitCoreMode(xtalfreqHz, restore, wifiOnly)" in wifi_fw
+    assert "rf_pri_init(if restore == 0'u32: 1'u32 else: 0'u32, 1'u32)" not in modem_init_mode_body
+    assert "if fullInit != 0'u32: 1'u8 else: 0'u8)" not in rfc_init_body
     assert rfc_init_body.index("discard wl_init()") < rfc_init_body.index("phy_init(nil)")
     assert "rf_init(xtalfreqHz)" not in rfc_init_body
     assert "modem_init_core(" not in rfc_init_body
+    assert "RfPriCalState = object" in wifi_fw
+    assert "RfPriCalSavedRegAddrs:" not in wifi_fw
+    assert "RfPriCalSavedRegs:" not in wifi_fw
+    assert "RfPriGainInit:" not in wifi_fw
+    assert "writeRadioRegMaskInit(RfPriGainInit)" not in wifi_fw
+    assert "proc rfRegRead(" not in wifi_fw
+    assert "proc rfRegWrite(" not in wifi_fw
+    assert "proc rfRegUpdate(" not in wifi_fw
+    assert "proc readReg32(" not in wifi_fw
+    assert "RfCtrlReg = 0x20001004'u32" not in wifi_fw
+    assert not re.search(r"^\s*Rf[A-Za-z0-9]+Reg[A-Za-z0-9_]*\s*=\s*0x2000", wifi_fw, re.M)
+    assert "RadioRegMaskInit = object" not in wifi_fw
+    assert "proc writeRadioRegMaskInit(" not in wifi_fw
+    assert "proc writeRadioMemoryWords(" not in wifi_fw
+    assert "writeRadioMemoryWords(0x20001700'u32, words)" not in wifi_fw
+    for expected in [
+        "doAssert offsetof(RfRegBlock, calMixerStateF0) == 0xF0",
+        "doAssert offsetof(RfRegBlock, calDfeState240) == 0x240",
+        "doAssert offsetof(RfRegBlock, calDfeState244) == 0x244",
+        "doAssert offsetof(RfDfeInitBlock, hbnCtrl30) == 0x30",
+        "doAssert offsetof(RfTxPowerCompTableBlock, txPowerCompWords700) == 0x700",
+        "RfTxPowerCompTableBlock {.packed.} = object",
+        "txPowerCompWords700: array[43, uint32]",
+        "template rfTxPowerCompTableRegs(): ptr RfTxPowerCompTableBlock",
+        "proc writeRfTxPowerCompTable(words: openArray[uint32]) =",
+        "volatileStore(addr table.txPowerCompWords700[i], word)",
+        "writeRfTxPowerCompTable(txPowerTableWords)",
+        "hbnCtrl30: uint32",
+        "calDfeState240: uint32",
+        "calDfeState244: uint32",
+        "calMixerStateF0: uint32",
+    ]:
+        assert expected in wifi_fw
+    for expected in [
+        "let rf = rfRegs()",
+        "let dfe = rfDfeInitRegs()",
+        "result.synthCtrl2c = volatileLoad(addr rf.synthCtrl2c)",
+        "result.hbnCtrl30 = volatileLoad(addr dfe.hbnCtrl30)",
+        "result.calDfeState240 = volatileLoad(addr rf.calDfeState240)",
+        "result.calDfeState244 = volatileLoad(addr rf.calDfeState244)",
+        "result.calMixerStateF0 = volatileLoad(addr rf.calMixerStateF0)",
+        "nimFwDbgRfCalSaveRf2c = result.synthCtrl2c",
+        "nimFwDbgRfCalSaveRf88 = result.txcalDfe88",
+    ]:
+        assert expected in save_cal_state_body
+    for expected in [
+        "volatileStore(addr rf.synthCtrl2c, state.synthCtrl2c)",
+        "volatileStore(addr dfe.hbnCtrl30, state.hbnCtrl30)",
+        "volatileStore(addr rf.calDfeState240, state.calDfeState240)",
+        "volatileStore(addr rf.calDfeState244, state.calDfeState244)",
+        "volatileStore(addr rf.calMixerStateF0, state.calMixerStateF0)",
+        "nimFwDbgRfCalRestoreRf2c = state.synthCtrl2c",
+        "nimFwDbgRfCalRestoreRf88 = state.txcalDfe88",
+    ]:
+        assert expected in restore_cal_state_body
+    for forbidden in [
+        "for i, regAddr in RfPriCalSavedRegAddrs:",
+        "result.words[i]",
+        "state.words[i]",
+        "rfRegRead(regAddr)",
+        "rfRegWrite(regAddr",
+    ]:
+        assert forbidden not in save_cal_state_body
+        assert forbidden not in restore_cal_state_body
+    ble_controller = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    save_ble_cal_state_body = ble_controller.split(
+        "proc saveBleRfPriCalState(): BleRfPriCalState =",
+        1,
+    )[1].split("proc restoreBleRfPriCalState", 1)[0]
+    restore_ble_cal_state_body = ble_controller.split(
+        "proc restoreBleRfPriCalState(state: BleRfPriCalState) =",
+        1,
+    )[1].split("proc waitBleRfFcalReady", 1)[0]
+    assert "BleRfPriCalState = object" in ble_controller
+    assert "BleRfPriCalSavedRegAddrs:" not in ble_controller
+    assert "BleRfPriCalSavedRegs:" not in ble_controller
+    for expected in [
+        "BleRfRegBlock {.packed.} = object",
+        "BleRfDfeInitBlock {.packed.} = object",
+        "doAssert offsetof(BleRfRegBlock, synthCtrl2c) == 0x2C",
+        "doAssert offsetof(BleRfRegBlock, rbbRccalCtrl80) == 0x80",
+        "doAssert offsetof(BleRfRegBlock, rccalReplay84) == 0x84",
+        "doAssert offsetof(BleRfRegBlock, calPathConfig8c) == 0x8C",
+        "doAssert offsetof(BleRfRegBlock, channelCalStrobeB0) == 0xB0",
+        "doAssert offsetof(BleRfRegBlock, channelCalStatusB4) == 0xB4",
+        "doAssert offsetof(BleRfRegBlock, channelFcalConfigBc) == 0xBC",
+        "doAssert offsetof(BleRfRegBlock, calMixerStateF0) == 0xF0",
+        "doAssert offsetof(BleRfRegBlock, calDfeState240) == 0x240",
+        "doAssert offsetof(BleRfRegBlock, calDfeState244) == 0x244",
+        "doAssert offsetof(BleRfDfeInitBlock, hbnCtrl30) == 0x30",
+        "template bleRfRegs(): ptr BleRfRegBlock",
+        "template bleRfDfeInitRegs(): ptr BleRfDfeInitBlock",
+        "rbbRccalCtrl80: uint32",
+        "rccalReplay84: uint32",
+        "calPathConfig8c: uint32",
+        "channelCalStrobeB0: uint32",
+        "channelCalStatusB4: uint32",
+        "channelFcalConfigBc: uint32",
+        "txcalParam70: uint32",
+        "txcalGain68: uint32",
+        "txcalDfe88: uint32",
+    ]:
+        assert expected in ble_controller
+    for old_name in [
+        "reserved084",
+        "config8c",
+        "configB0",
+        "txPowerB4",
+        "configBc",
+    ]:
+        assert old_name not in ble_controller
+    for expected in [
+        "let rf = bleRfRegs()",
+        "let dfe = bleRfDfeInitRegs()",
+        "result.synthCtrl2c = volatileLoad(addr rf.synthCtrl2c)",
+        "result.hbnCtrl30 = volatileLoad(addr dfe.hbnCtrl30)",
+        "result.rbbRccalCtrl80 = volatileLoad(addr rf.rbbRccalCtrl80)",
+        "result.calPathConfig8c = volatileLoad(addr rf.calPathConfig8c)",
+        "result.calDfeState240 = volatileLoad(addr rf.calDfeState240)",
+        "result.calDfeState244 = volatileLoad(addr rf.calDfeState244)",
+        "result.txcalDfe88 = volatileLoad(addr rf.txcalDfe88)",
+    ]:
+        assert expected in save_ble_cal_state_body
+    for expected in [
+        "volatileStore(addr rf.synthCtrl2c, state.synthCtrl2c)",
+        "volatileStore(addr dfe.hbnCtrl30, state.hbnCtrl30)",
+        "volatileStore(addr rf.rbbRccalCtrl80, state.rbbRccalCtrl80)",
+        "volatileStore(addr rf.calPathConfig8c, state.calPathConfig8c)",
+        "volatileStore(addr rf.calDfeState240, state.calDfeState240)",
+        "volatileStore(addr rf.calDfeState244, state.calDfeState244)",
+        "volatileStore(addr rf.txcalDfe88, state.txcalDfe88)",
+    ]:
+        assert expected in restore_ble_cal_state_body
+    for forbidden in [
+        "for i, regAddr in BleRfPriCalSavedRegAddrs:",
+        "result.words[i]",
+        "state.words[i]",
+    ]:
+        assert forbidden not in save_ble_cal_state_body
+        assert forbidden not in restore_ble_cal_state_body
+    for expected in [
+        "doAssert offsetof(RfRegBlock, synthCtrl2c) == 0x2C",
+        "doAssert offsetof(RfRegBlock, priModeCtrl30) == 0x30",
+        "doAssert offsetof(RfRegBlock, baseCtrl1) == 0x04",
+        "doAssert offsetof(RfRegBlock, calMode14) == 0x14",
+        "doAssert offsetof(RfRegBlock, calCtrl1c) == 0x1C",
+        "doAssert offsetof(RfRegBlock, capability20) == 0x20",
+        "doAssert offsetof(RfRegBlock, scanSynthLatch34) == 0x34",
+        "doAssert offsetof(RfRegBlock, scanSynthLatch40) == 0x40",
+        "doAssert offsetof(RfRegBlock, rccalTone48) == 0x48",
+        "doAssert offsetof(RfRegBlock, scanRxLatch4c) == 0x4C",
+        "doAssert offsetof(RfRegBlock, xtalCapTrim5c) == 0x5C",
+        "doAssert offsetof(RfRegBlock, rxcalPrep60) == 0x60",
+        "doAssert offsetof(RfRegBlock, txcalParam70) == 0x70",
+        "doAssert offsetof(RfRegBlock, txcalParam74) == 0x74",
+        "doAssert offsetof(RfRegBlock, rxModeCalibrationGate78) == 0x78",
+        "doAssert offsetof(RfRegBlock, roscalCtrl7c) == 0x7C",
+        "doAssert offsetof(RfRegBlock, rbbRccalCtrl80) == 0x80",
+        "doAssert offsetof(RfRegBlock, rccalReplay84) == 0x84",
+        "doAssert offsetof(RfRegBlock, txcalDfe88) == 0x88",
+        "doAssert offsetof(RfRegBlock, calPathCtrl90) == 0x90",
+        "doAssert offsetof(RfRegBlock, bandwidthCtrl94) == 0x94",
+        "doAssert offsetof(RfRegBlock, fcalCtrlA0) == 0xA0",
+        "doAssert offsetof(RfRegBlock, acalCtrlA4) == 0xA4",
+        "doAssert offsetof(RfRegBlock, calResultA8) == 0xA8",
+        "doAssert offsetof(RfRegBlock, fcalAc) == 0xAC",
+        "doAssert offsetof(RfRegBlock, channelCalStrobeB0) == 0xB0",
+        "doAssert offsetof(RfRegBlock, channelCalStatusB4) == 0xB4",
+        "doAssert offsetof(RfRegBlock, txcalCtrlB8) == 0xB8",
+        "doAssert offsetof(RfRegBlock, channelFcalConfigBc) == 0xBC",
+        "doAssert offsetof(RfRegBlock, sdmCtrlC0) == 0xC0",
+        "doAssert offsetof(RfRegBlock, sdmDivC4) == 0xC4",
+        "doAssert offsetof(RfRegBlock, rfPriBiasTrimCc) == 0xCC",
+        "doAssert offsetof(RfRegBlock, optimizeCtrlD0) == 0xD0",
+        "doAssert offsetof(RfRegBlock, rfBiasTrimD4) == 0xD4",
+        "doAssert offsetof(RfRegBlock, rfCodeConfig110c) == 0x10C",
+        "doAssert offsetof(RfRegBlock, vcoPairTable13c) == 0x13C",
+        "doAssert offsetof(RfRegBlock, txcalDefaultProfile128) == 0x128",
+        "doAssert offsetof(RfRegBlock, txcalDefaultProfile12c) == 0x12C",
+        "doAssert offsetof(RfRegBlock, txcalDefaultProfile130) == 0x130",
+        "doAssert offsetof(RfRegBlock, calModeDefault138) == 0x138",
+        "doAssert offsetof(RfRegBlock, vcoPair2484Mhz164) == 0x164",
+        "doAssert offsetof(RfRegBlock, roscalCal0) == 0x168",
+        "doAssert offsetof(RfRegBlock, roscalCal1) == 0x16C",
+        "doAssert offsetof(RfRegBlock, rxcalReplay) == 0x170",
+        "doAssert offsetof(RfRegBlock, channelTuneGate228) == 0x228",
+        "doAssert offsetof(RfRegBlock, channelFreqMhz264) == 0x264",
+        "doAssert offsetof(RfRegBlock, channelTuneStrobe268) == 0x268",
+        "doAssert offsetof(RfRegBlock, channelTuneCtrl26c) == 0x26C",
+        "doAssert offsetof(RfRegBlock, xtalControlCode1c0) == 0x1C0",
+        "doAssert offsetof(RfRegBlock, xtalDividerConfig1c4) == 0x1C4",
+        "doAssert offsetof(RfRegBlock, xtalCountWindowMin1c8) == 0x1C8",
+        "doAssert offsetof(RfRegBlock, xtalCountWindowMax1cc) == 0x1CC",
+        "doAssert offsetof(RfRegBlock, calSingenCtrl20c) == 0x20C",
+        "doAssert offsetof(RfRegBlock, calSingenAmpLo214) == 0x214",
+        "doAssert offsetof(RfRegBlock, calSingenAmpHi218) == 0x218",
+        "doAssert offsetof(RfRegBlock, calSingenMeasurePrep21c) == 0x21C",
+        "doAssert offsetof(RfRegBlock, rxMode220) == 0x220",
+        "doAssert offsetof(RfRegBlock, calDfeGate23c) == 0x23C",
+        "doAssert offsetof(RfRegBlock, channelSequencer260) == 0x260",
+        "doAssert offsetof(RfRegBlock, modemPathEnable504) == 0x504",
+        "doAssert offsetof(RfRegBlock, pdCompLatchCtrl50c) == 0x50C",
+        "doAssert offsetof(RfRegBlock, channelSequencer2c4) == 0x2C4",
+        "doAssert offsetof(RfRegBlock, rfcSequencerBias400) == 0x400",
+        "doAssert offsetof(RfRegBlock, modemPathEnable514) == 0x514",
+        "doAssert offsetof(RfRegBlock, txcalTosdac600) == 0x600",
+        "doAssert offsetof(RfRegBlock, scanSynthControl608) == 0x608",
+        "doAssert offsetof(RfRegBlock, calMeasurePrep60c) == 0x60C",
+        "doAssert offsetof(RfRegBlock, rxcalSearch614) == 0x614",
+        "doAssert offsetof(RfRegBlock, measureCtrl618) == 0x618",
+        "doAssert offsetof(RfRegBlock, measureMode61c) == 0x61C",
+        "doAssert offsetof(RfRegBlock, measureI620) == 0x620",
+        "doAssert offsetof(RfRegBlock, measureQ624) == 0x624",
+        "doAssert offsetof(RfRegBlock, scanTxMeasureControl62c) == 0x62C",
+        "doAssert offsetof(RfRegBlock, notchCtrl680) == 0x680",
+        "doAssert offsetof(RfRegBlock, txPowerComp704) == 0x704",
+        "doAssert offsetof(RfRegBlock, rfGainTable75c) == 0x75C",
+        "doAssert offsetof(RfRegBlock, rfGainTable760) == 0x760",
+        "doAssert offsetof(RfRegBlock, rfGainTable764) == 0x764",
+        "doAssert offsetof(RfRegBlock, rfGainTable76c) == 0x76C",
+        "doAssert offsetof(RfRegBlock, rfGainTable774) == 0x774",
+        "doAssert offsetof(RfRegBlock, rfGainTable77c) == 0x77C",
+        "doAssert offsetof(RfRegBlock, rfGainTable784) == 0x784",
+        "doAssert offsetof(RfRegBlock, rfGainTable78c) == 0x78C",
+        "doAssert offsetof(RfRegBlock, rfGainTable794) == 0x794",
+        "doAssert offsetof(RfRegBlock, rfGainTable79c) == 0x79C",
+        "doAssert offsetof(RfRegBlock, txPowerComp7ac) == 0x7AC",
+        "doAssert offsetof(RfRegBlock, txPowerCompTail7bc) == 0x7BC",
+        "doAssert offsetof(RfRegBlock, txPowerCompTail7c0) == 0x7C0",
+        "doAssert offsetof(RfRegBlock, txPowerCompTail7c4) == 0x7C4",
+        "doAssert offsetof(RfRegBlock, txPowerCompTail7c8) == 0x7C8",
+        "doAssert offsetof(RfRegBlock, txPowerCompTail7cc) == 0x7CC",
+        "doAssert offsetof(RfRegBlock, txPowerCompTail7d0) == 0x7D0",
+        "doAssert offsetof(RfRegBlock, txPowerCompTail7d4) == 0x7D4",
+        "doAssert offsetof(RfRegBlock, txPowerCompTail7d8) == 0x7D8",
+        "doAssert offsetof(RfPllBlock, pllReset10) == 0x10",
+        "doAssert offsetof(RfPllBlock, refdivCtrl14) == 0x14",
+        "doAssert offsetof(RfPllBlock, loopFilter18) == 0x18",
+        "doAssert offsetof(RfPllBlock, fractionalCtrl1c) == 0x1C",
+        "doAssert offsetof(RfPllBlock, fractionalWord28) == 0x28",
+        "doAssert offsetof(RfPllBlock, modeCtrl2c) == 0x2C",
+        "doAssert offsetof(RfPllBlock, enableCtrl30) == 0x30",
+        "doAssert offsetof(RfPllBlock, pllFixedDefault84) == 0x84",
+        "doAssert offsetof(RfDfeInitBlock, dfeStaticCtrl820) == 0x820",
+        "doAssert offsetof(RfDfeInitBlock, dfeRfFixedDefault884) == 0x884",
+        "doAssert offsetof(PhyAgcBlock, rfcSettlingTimerA8) == 0xA8",
+        "doAssert offsetof(RfAuxCtrlBlock, rfcAuxPathSelect540) == 0x40",
+        "doAssert offsetof(RfAuxCtrlBlock, rfcAuxPathGate544) == 0x44",
+    ]:
+        assert expected in wifi_fw
+    assert "modeCtrl: uint32" not in wifi_fw
+    assert "synthCtrl: uint32" not in wifi_fw
+    for old_name in [
+        "init78",
+        "init90",
+        "init163c",
+        "modemLateGate504",
+        "modemLateGate514",
+        "rfcLateCtrl260",
+        "rfcLateCtrl2c4",
+        "config8c",
+        "configB0",
+        "configB4",
+        "configBc",
+        "staticCtrlD4",
+        "staticCtrl128",
+        "staticCtrl12c",
+        "staticCtrl130",
+        "staticCtrl138",
+        "fixedValCtrl110c",
+        "fixedValLatch78",
+        "fixedStaticConfigCc",
+        "staticInitLatchD4",
+        "fixedValByteLatch110c",
+        "staticInitProfile128",
+        "staticInitProfile12c",
+        "staticInitProfile130",
+        "staticInitLatch138",
+        "fixedRxModeGate78",
+        "rfPriStaticBiasCc",
+        "staticRfBiasD4",
+        "fixedRfCode110c",
+        "staticTxcalProfile128",
+        "staticTxcalProfile12c",
+        "staticTxcalProfile130",
+        "staticCalMode138",
+        "modemBringupLatch504",
+        "modemBringupLatch514",
+        "synthLatch608",
+        "synthDfeLatch63c",
+        "scanTxLatch162c",
+        "synthScanLatch608",
+        "synthDfePathLatch63c",
+        "scanTxMeasureLatch62c",
+        "fixedPowerTail7bc",
+        "txPowerFixedTail7bc",
+        "pllFixedVal884",
+        "dfeInit814",
+        "dfeInit820",
+        "dfeFixedVal884",
+        "trace84",
+        "trace4c",
+        "trace162c",
+        "configCc",
+    ]:
+        assert old_name not in wifi_fw
+    assert "volatileStore(addr rf.vcoPairTable13c[i]" in vco_table_body
+    assert "volatileStore(addr rf.vcoPair2484Mhz164" in vco_table_body
+    for expected in [
+        "addr rf.rbbRccalCtrl80",
+        "addr rf.bandwidthCtrl94",
+        "addr rf.scanSynthControl608",
+        "addr rf.txcalDfe88",
+        "addr rf.channelTuneGate228",
+        "addr rf.roscalCtrl7c",
+    ]:
+        assert expected in rfc_bandwidth_body
+    for expected in [
+        "addr rf.channelTuneGate228",
+        "addr rf.synthCtrl2c",
+        "addr rf.channelFreqMhz264",
+        "addr rf.channelTuneStrobe268",
+        "addr rf.baseCtrl1",
+        "addr rf.channelTuneCtrl26c",
+    ]:
+        assert expected in rfc_channel_body
+    for forbidden in [
+        "tuneGate228",
+        "channelFreq264",
+        "channelStrobe268",
+        "channelTune26c",
+        "rfcChannelSequencer260",
+        "rfcChannelSequencer2c4",
+        "RfBase + 0x13C'u",
+        "RfBase + 0x164'u",
+        "RfBase + 0x7C'u",
+        "RfBase + 0x88'u",
+        "RfBase + 0x94'u",
+        "RfBase + 0x228'u",
+        "RfBase + 0x264'u",
+        "RfBase + 0x268'u",
+        "RfBase + 0x26C'u",
+        "RfBase + 0x608'u",
+    ]:
+        assert forbidden not in vco_table_body
+        assert forbidden not in rfc_bandwidth_body
+        assert forbidden not in rfc_channel_body
+    assert "let rf = rfRegs()" in modem_init_mode_body
+    assert "RfcModemLateUnknownInit:" not in wifi_fw
+    assert "RfcModemLateInit:" not in wifi_fw
+    assert "writeRadioRegMaskInit(RfcModemLateUnknownInit)" not in wifi_fw
+    assert "writeRadioRegMaskInit(RfcModemLateInit)" not in wifi_fw
+    assert "programRfcModemLateInit()" in modem_init_mode_body
+    for expected in [
+        "let rf = rfRegs()",
+        "let bba = bbaAgcRegs()",
+        "let phy = phyRegs()",
+        "let aux = rfAuxCtrlRegs()",
+        "addr rf.baseCtrl1",
+        "addr rf.channelTuneCtrl26c",
+        "addr rf.channelTuneStrobe268",
+        "addr rf.synthCtrl2c",
+        "addr rf.synthDfePathControl63c",
+        "addr rf.rfcSequencerBias400",
+        "addr aux.rfcAuxPathSelect540",
+        "addr aux.rfcAuxPathGate544",
+        "addr phy.rfcSettlingTimerA8",
+        "addr rf.rxMode220",
+        "addr rf.bandwidthCtrl94",
+        "addr rf.rbbRccalCtrl80",
+        "addr rf.channelSequencer260",
+        "addr rf.channelSequencer2c4",
+        "addr bba.macActiveC01c",
+        "addr bba.macActiveC020",
+        "addr bba.macActiveC02c",
+    ]:
+        assert expected in rfc_modem_late_body
+    for forbidden in [
+        "0x20001400'u32",
+        "0x20000540'u32",
+        "0x20000544'u32",
+        "0x200028A8'u32",
+        "rfcLateUnknown400",
+        "rfcLateAuxCtrl540",
+        "rfcLateAuxCtrl544",
+        "rfcLatePhyCtrlA8",
+    ]:
+        assert forbidden not in wifi_fw
+    for expected in [
+        "addr rf.xtalControlCode1c0",
+        "addr rf.xtalDividerConfig1c4",
+        "addr rf.xtalCountWindowMin1c8",
+        "addr rf.xtalCountWindowMax1cc",
+        "addr rf.modemPathEnable504",
+        "addr rf.modemPathEnable514",
+    ]:
+        assert expected in modem_init_mode_body
+    for forbidden in [
+        "RfBase + 0x1C0'u",
+        "RfBase + 0x1C4'u",
+        "RfBase + 0x1C8'u",
+        "RfBase + 0x1CC'u",
+        "RfBase + 0x504'u",
+        "RfBase + 0x514'u",
+    ]:
+        assert forbidden not in modem_init_mode_body
+    for expected in [
+        "let rf = rfRegs()",
+        "addr rf.roscalCal0",
+        "addr rf.roscalCal1",
+        "addr rf.rccalReplay84",
+        "addr rf.txcalParam70",
+    ]:
+        assert expected in rf_restore_body
+    for forbidden in [
+        "RfBase + 0x168'u",
+        "RfBase + 0x16C'u",
+        "RfBase + 0x084'u",
+        "RfBase + 0x070'u",
+    ]:
+        assert forbidden not in rf_restore_body
+    assert "let rf = rfRegs()" in restore_cal_state_body
+    assert "addr rf.synthCtrl2c" in restore_cal_state_body
+    assert "addr rf.txcalDfe88" in restore_cal_state_body
+    assert "addr rf.calPathConfig8c" in restore_cal_state_body
+    assert "RfSynthCtrlReg" not in restore_cal_state_body
+    assert "rfRegRead(RfPriInit8cReg" not in restore_cal_state_body
+    gain_init_body = wifi_fw.split("proc writeRfPriGainInit() =", 1)[1].split(
+        "proc rfCalibSeedDefaultVcoIfEmpty", 1
+    )[0]
+    for expected in [
+        "let rf = rfRegs()",
+        "addr rf.rfGainTable760",
+        "addr rf.rfGainTable75c",
+        "addr rf.rfGainTable79c",
+        "addr rf.rfGainTable794",
+        "addr rf.rfGainTable78c",
+        "addr rf.rfGainTable784",
+        "addr rf.rfGainTable77c",
+        "addr rf.rfGainTable774",
+        "addr rf.rfGainTable76c",
+        "addr rf.rfGainTable764",
+        "addr rf.synthCtrl2c",
+        "addr rf.synthDfePathControl63c",
+    ]:
+        assert expected in gain_init_body
+    for forbidden in [
+        "0x20001760'u32",
+        "0x2000175C'u32",
+        "0x2000179C'u32",
+        "0x20001794'u32",
+        "0x2000178C'u32",
+        "0x20001784'u32",
+        "0x2000177C'u32",
+        "0x20001774'u32",
+        "0x2000176C'u32",
+        "0x20001764'u32",
+        "RfSynthCtrlReg",
+        "RfPriInit163cReg",
+    ]:
+        assert forbidden not in gain_init_body
+    for expected in [
+        "let rf = rfRegs()",
+        "addr rf.txPowerComp704",
+        "addr rf.txPowerComp7ac",
+    ]:
+        assert expected in total_power_comp_body
+    for forbidden in [
+        "RfBase + 0x704'u",
+        "RfBase + 0x7AC'u",
+    ]:
+        assert forbidden not in total_power_comp_body
+    for expected in [
+        "bl808RfPriXtal24mFlag: uint8",
+        "bl808RfPriXtal26mFlag: uint8",
+        "bl808RfPriXtal32mFlag: uint8",
+        "bl808RfPriXtal38p4mFlag: uint8",
+        "bl808RfPriXtal40mFlag: uint8 = 1",
+        "bl808RfPriXtal52mFlag: uint8",
+    ]:
+        assert expected in wifi_fw
+    xtal_index_body = wifi_fw.split(
+        "proc xtalIndex(xtalfreqHz: uint32): uint32 {.inline.} =",
+        1,
+    )[1].split("proc crm_init", 1)[0]
+    for expected in [
+        "of WlXtal24M: 0'u32",
+        "of WlXtal26M: 1'u32",
+        "of WlXtal32M: 2'u32",
+        "of WlXtal38P4M: 3'u32",
+        "of WlXtal40M: 4'u32",
+        "of WlXtal52M: 5'u32",
+        "else: 5'u32",
+    ]:
+        assert expected in xtal_index_body
+    for expected in [
+        "private vendor flag",
+        "bl808RfPriXtal24mFlag = 0",
+        "bl808RfPriXtal26mFlag = 0",
+        "bl808RfPriXtal32mFlag = 0",
+        "bl808RfPriXtal38p4mFlag = 0",
+        "bl808RfPriXtal40mFlag = 0",
+        "bl808RfPriXtal52mFlag = 0",
+        "of WlXtal24M:",
+        "bl808RfPriXtal24mFlag = 1",
+        "of WlXtal26M:",
+        "bl808RfPriXtal26mFlag = 1",
+        "of WlXtal32M:",
+        "bl808RfPriXtal32mFlag = 1",
+        "of WlXtal38P4M:",
+        "bl808RfPriXtal38p4mFlag = 1",
+        "of WlXtal40M:",
+        "bl808RfPriXtal40mFlag = 1",
+        "of WlXtal52M:",
+        "bl808RfPriXtal52mFlag = 1",
+    ]:
+        assert expected in xtal_input_body
+    assert "Remaining unknown" not in xtal_input_body
+    assert "case bl808RfXtalIndex" not in xtal_refdiv_body
+    assert "case bl808RfXtalIndex" not in xtal_tenths_body
+    for expected in [
+        "bl808RfPriXtal24mFlag != 0 or bl808RfPriXtal26mFlag != 0",
+        "bl808RfPriXtal32mFlag != 0 or bl808RfPriXtal38p4mFlag != 0 or",
+        "bl808RfPriXtal40mFlag != 0",
+    ]:
+        assert expected in xtal_refdiv_body
+    for expected in [
+        "if bl808RfPriXtal24mFlag != 0:",
+        "elif bl808RfPriXtal26mFlag != 0:",
+        "elif bl808RfPriXtal32mFlag != 0:",
+        "elif bl808RfPriXtal38p4mFlag != 0:",
+        "elif bl808RfPriXtal52mFlag != 0:",
+    ]:
+        assert expected in xtal_tenths_body
+    for expected in [
+        "let rf = rfRegs()",
+        "addr rf.txPowerComp704",
+        "addr rf.txPowerComp7ac",
+    ]:
+        assert expected in efuse_init_body
+    assert "addr rf.xtalCapTrim5c" in efuse_xtal_cap_body
+    for forbidden in [
+        "RfBase + 0x05C'u",
+        "RfBase + 0x704'u",
+        "RfBase + 0x7AC'u",
+    ]:
+        assert forbidden not in efuse_init_body
+    assert "let rf = rfRegs()" in notch_param_body
+    assert "addr rf.notchCtrl680" in notch_param_body
+    assert "RfBase + 0x680'u" not in notch_param_body
+    for expected in [
+        "let rf = rfRegs()",
+        "addr rf.scanRxLatch4c",
+        "addr rf.txcalParam70",
+        "addr rf.roscalCtrl7c",
+        "addr rf.rbbRccalCtrl80",
+        "addr rf.txcalDfe88",
+        "addr rf.fcalCtrlA0",
+        "addr rf.optimizeCtrlD0",
+        "addr rf.txcalTosdac600",
+        "addr rf.scanTxMeasureControl62c",
+        "addr rf.channelCalStrobeB0",
+        "addr rf.channelCalStatusB4",
+        "addr rf.channelFcalConfigBc",
+    ]:
+        assert expected in rf_stage_snapshot_body
+    for forbidden in [
+        "0x2000104C'u",
+        "0x2000107C'u",
+        "0x20001080'u",
+        "RfPriTxcalDfeReg.uint",
+        "0x200010A0'u",
+        "RfOptimizeReg.uint",
+        "0x20001600'u",
+        "0x2000162C'u",
+    ]:
+        assert forbidden not in rf_stage_snapshot_body
+    for body in [wifi_pll_config_body, rf_optimize_body]:
+        assert "let rf = rfRegs()" in body
+        assert "addr rf.optimizeCtrlD0" in body
+        assert "rfRegRead(RfOptimizeReg" not in body
+        assert "rfRegWrite(RfOptimizeReg" not in body
+        assert "regRead(RfOptimizeReg.uint)" not in body
+        assert "regWrite(RfOptimizeReg.uint" not in body
+    assert "addr rf.txcalParam70" in rf_optimize_body
+    assert "RfTxcalParamReg.uint" not in rf_optimize_body
+    for expected in [
+        "let rf = rfRegs()",
+        "addr rf.rccalTone48",
+        "addr rf.scanRxLatch4c",
+        "addr rf.txcalDfe88",
+        "addr rf.txcalTosdac600",
+        "addr rf.scanTxMeasureControl62c",
+    ]:
+        assert expected in bz_txcal_snapshot_body
+    for forbidden in [
+        "rfRegRead(0x20001048'u32)",
+        "rfRegRead(0x2000104C'u32)",
+        "rfRegRead(RfPriTxcalDfeReg)",
+        "rfRegRead(0x20001600'u32)",
+        "rfRegRead(0x2000162C'u32)",
+    ]:
+        assert forbidden not in bz_txcal_snapshot_body
+    assert "let rf = rfRegs()" in rxcal_replay_body
+    assert "addr rf.rxcalReplay[i]" in rxcal_replay_body
+    assert "RfBase + 0x170'u" not in rxcal_replay_body
     sta_tx_prepare = wifi_fw.split(
         "proc wifi_nimfw_prepare_sta_tx_channel*() {.exportc, cdecl.} =",
         1,
     )[1].split("proc wifi_nimfw_coex_force_wifi_role*", 1)[0]
     assert "let reclaimNeeded = nim_ble_coex_wifi_rf_reclaim_needed() != 0'u32" in sta_tx_prepare
-    assert "wifiRfCoreInitMode(40000000'u32, WlApiModeAll)" in sta_tx_prepare
+    assert "wifiRfCoreInitMode(40000000'u32, wifiBleCoex)" in sta_tx_prepare
     tx_payload_body = wifi_fw.split(
         "proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =",
         1,
@@ -6141,30 +7097,126 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     assert "phy_init+0x16..0x52" in wifi_fw
     assert "phy_init+0x5a..0x938" in wifi_fw
     assert "phy_init+0x93c..0x964" in wifi_fw
-    assert "AgcMemoryBase = 0x24C0A000'u" in wifi_fw
+    initial_channel_body = wifi_fw.split(
+        "proc phyInitProgramInitialChannel() =",
+        1,
+    )[1].split("proc phy_init*(cfg: pointer)", 1)[0]
+    for expected in [
+        "phy_init+0x976..0x9a2",
+        "crm_clk_set(0)",
+        "mdm_set_channel.constprop.0(2412, 2412, 0)",
+        "rfc_config_bandwidth(0)",
+        "rfc_config_channel(2412)",
+        "phy_init+0x9a6..0x9fc",
+        "crm_clk_set(0'u32)",
+        "bl808MdmSetChannel(initial.primFreq.uint32, initial.centerFreq1.uint32,",
+        "rfc_config_bandwidth(0'u32)",
+        "rfc_config_channel(initial.centerFreq1.uint32)",
+        "volatileStore(addr env.channelBandType",
+    ]:
+        assert expected in initial_channel_body
+    crm_init_body = wifi_fw.split(
+        "proc crm_init() {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc crm_mdm_reset() {.exportc, cdecl.} =", 1)[0]
+    crm_reset_body = wifi_fw.split(
+        "proc crm_mdm_reset() {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc crm_clk_set(bandwidth: uint32) {.exportc, cdecl.} =", 1)[0]
+    crm_clk_body = wifi_fw.split(
+        "proc crm_clk_set(bandwidth: uint32) {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc signExtend", 1)[0]
+    assert "addr crmPhyClockRegs().rfClockMux10" in crm_init_body
+    assert "addr crmPhyClockRegs().modemReset18" in crm_reset_body
+    assert "addr crmPhyClockRegs().phyClockSelect8" in crm_clk_body
+    for body in [crm_init_body, crm_reset_body, crm_clk_body]:
+        for forbidden in [
+            "cast[ptr uint32](0x24940008'u)",
+            "cast[ptr uint32](0x24940010'u)",
+            "cast[ptr uint32](0x24940018'u)",
+        ]:
+            assert forbidden not in body
+    assert "WifiAgcMemoryRam {.packed.} = object" in wifi_fw
+    assert "words: array[512, uint32]" in wifi_fw
+    assert "doAssert sizeof(WifiAgcMemoryRam) == 2048" in wifi_fw
+    assert "doAssert offsetof(WifiAgcMemoryRam, words) == 0" in wifi_fw
+    assert "WifiAgcMemoryBase = 0x24C0A000'u" in wifi_fw
+    assert "WifiAgcMemoryWords = 512" in wifi_fw
+    assert "template wifiAgcMemoryRegs(): ptr WifiAgcMemoryRam" in wifi_fw
     assert 'var agcmem* {.exportc: "agcmem".}: array[512, uint32]' in wifi_fw
+    assert (
+        'proc phy_ldpc_tx_supported(): bool {.importc: "phy_ldpc_tx_supported", cdecl.}'
+        in wifi_fw
+    )
+    assert "External non-BL808 PHY fallback: reports whether TX LDPC is supported." in wifi_fw
+    assert wifi_fw.index("when not defined(bl808WifiUseBl808Rf):") < wifi_fw.index(
+        'proc phy_ldpc_tx_supported(): bool {.importc: "phy_ldpc_tx_supported", cdecl.}'
+    )
     assert "proc copyAgcMemory() =" in wifi_fw
     assert "phy_init+0x452..0x470" in wifi_fw
     assert "0x24C09000 LDPC-memory load path" in wifi_fw
     assert "table load is BLE-only" in wifi_fw
     assert "no WiFi" in wifi_fw
     assert "LDPC memory image is present in the BL808 RF archive" in wifi_fw
-    assert "volatileStore(addr dst[i], src[i])" in wifi_fw
+    assert "static: doAssert agcmem.len == WifiAgcMemoryWords" in wifi_fw
+    for expected in [
+        'exportc: "nimfw_dbg_phy_init_count"',
+        'exportc: "nimfw_dbg_phy_init_phase"',
+        'exportc: "nimfw_dbg_phy_modem_version"',
+        'exportc: "nimfw_dbg_phy_clock_count"',
+        'exportc: "nimfw_dbg_phy_agc_copy_count"',
+        'exportc: "nimfw_dbg_phy_agc_source_first"',
+        'exportc: "nimfw_dbg_phy_agc_source_last"',
+        'exportc: "nimfw_dbg_phy_agc_dest_first"',
+        'exportc: "nimfw_dbg_phy_agc_dest_last"',
+        'exportc: "nimfw_dbg_phy_wifi_ldpc_absent"',
+        "nimFwDbgPhyInitPhase = 3'u32",
+        "inc nimFwDbgPhyAgcCopyCount",
+        "nimFwDbgPhyWifiLdpcAbsent = 1'u32",
+        "nimFwDbgPhyAgcSourceFirst = agcmem[0]",
+        "nimFwDbgPhyAgcSourceLast = agcmem[WifiAgcMemoryWords - 1]",
+        "nimFwDbgPhyAgcDestFirst = volatileLoad(addr dst.words[0])",
+        "nimFwDbgPhyAgcDestLast =",
+    ]:
+        assert expected in wifi_fw
+    assert "let dst = wifiAgcMemoryRegs()" in wifi_fw
+    assert "volatileStore(addr dst.words[i], src[i])" in wifi_fw
+    assert "cast[ptr UncheckedArray[uint32]](AgcMemoryBase)" not in wifi_fw
     assert "copyAgcMemory()" in wifi_fw
     recovered_phy_body = wifi_fw.split(
         "proc bl808PhyProgramRecoveredRegs() =",
         1,
     )[1].split("proc bl808PhyProgramAgcCopyTailRegs()", 1)[0]
     assert "let mdm = wifiModemRegs()" in recovered_phy_body
+    assert "let macPhy = macPhyCtrlRegs()" in recovered_phy_body
     for expected in [
-        "addr mdm.phyCtrl820",
-        "addr mdm.phyCtrl800",
-        "addr mdm.phyCtrl824",
-        "addr mdm.phyCtrl930",
-        "addr mdm.dfeCtrl3bc",
-        "addr mdm.dfeCtrl414",
-        "addr mdm.phyCtrlC40",
-        "addr mdm.phyCtrlC44",
+        "let spatialStreamCountMinus1 =",
+        "let txChainCountMinus1 =",
+        "let heOrBandwidthProfile =",
+        "let modemCapability21 =",
+        "let modemCapability30 =",
+    ]:
+        assert expected in recovered_phy_body
+    for forbidden in [
+        "let modemBits11to8",
+        "let modemBits15to12",
+        "let modemBits7to4",
+        "let modemBit22OrAc",
+        "let modemBit21",
+        "let modemBit30",
+    ]:
+        assert forbidden not in recovered_phy_body
+    for expected in [
+        "addr mdm.bandwidth20MProfile820",
+        "addr mdm.versionFeatureCtrl800",
+        "addr mdm.channelTypeCtrl824",
+        "addr macPhy.channelBandwidthCtrl310",
+        "addr mdm.channelModeCtrl930",
+        "addr mdm.basebandDfeTimeout3bc",
+        "addr mdm.basebandDfeEnable414",
+        "addr mdm.basebandRxPathCtrlC40",
+        "addr mdm.basebandRxPathCtrlC44",
     ]:
         assert expected in recovered_phy_body
     for forbidden in [
@@ -6176,6 +7228,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "WifiModemBase + 0x414'u",
         "WifiModemBase + 0xC40'u",
         "WifiModemBase + 0xC44'u",
+        "cast[ptr uint32](0x24B00310'u)",
     ]:
         assert forbidden not in recovered_phy_body
     mdm_channel_body = wifi_fw.split(
@@ -6183,17 +7236,19 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         1,
     )[1].split("proc pulsePhyChannelRfWindow()", 1)[0]
     assert "let mdm = wifiModemRegs()" in mdm_channel_body
+    assert "let macPhy = macPhyCtrlRegs()" in mdm_channel_body
     for expected in [
-        "addr mdm.phyCtrl84c",
-        "addr mdm.phyCtrl824",
-        "addr mdm.phyCtrl820",
-        "addr mdm.phyCtrl830",
-        "addr mdm.phyCtrl83c",
-        "addr mdm.phyCtrl840",
-        "addr mdm.phyCtrl860",
-        "addr mdm.phyCtrl874",
-        "addr mdm.phyCtrl834",
-        "addr mdm.phyCtrl814",
+        "addr mdm.channelCenterRatio84c",
+        "addr mdm.channelTypeCtrl824",
+        "addr macPhy.channelBandwidthCtrl310",
+        "addr mdm.bandwidth20MProfile820",
+        "addr mdm.bandwidth20MProfile830",
+        "addr mdm.bandwidth20MSignal83c",
+        "addr mdm.bandwidth20MSignal840",
+        "addr mdm.bandwidth20MFilter860",
+        "addr mdm.bandwidth20MGate874",
+        "addr mdm.bandwidth20MEnable834",
+        "addr mdm.bandwidth20MGuard814",
     ]:
         assert expected in mdm_channel_body
     for forbidden in [
@@ -6207,6 +7262,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "WifiModemBase + 0x874'u",
         "WifiModemBase + 0x834'u",
         "WifiModemBase + 0x814'u",
+        "cast[ptr uint32](0x24B00310'u)",
     ]:
         assert forbidden not in mdm_channel_body
     channel_pulse_body = wifi_fw.split(
@@ -6215,6 +7271,29 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     )[1].split("proc phy_mdm_isr*", 1)[0]
     assert "addr wifiModemRegs().phyChannelPulse888" in channel_pulse_body
     assert "cast[ptr uint32](0x24C00888'u)" not in channel_pulse_body
+    bba_rx_body = wifi_fw.split(
+        "proc bba_loop(rxVector: pointer, frameType: uint32) {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc modemVersionReg()", 1)[0]
+    for expected in [
+        "let rxv = bbaRxVecPtr(rxVector)",
+        "addr rxv.rssiDbm",
+        "proc bbaRxFormatWord1(rxv: ptr BbaRxVectorView): uint32",
+        "addr rxv.rxFormatWord0",
+        "addr rxv.rxFormatWord1Rate",
+        "addr rxv.rxFormatWord1Mcs",
+        "addr rxv.rxFormatWord1Flags",
+        "addr rxv.carrierFreqOffset",
+    ]:
+        assert expected in bba_rx_body
+    for forbidden in [
+        "cast[ptr uint8](cast[uint](rxVector) + 5'u)",
+        "cast[ptr uint16](cast[uint](rxVector) + 0x16'u)",
+        "cast[ptr UncheckedArray[uint32]](rxVector)",
+        "let byte5",
+        "let half16",
+    ]:
+        assert forbidden not in bba_rx_body
     phy_mdm_isr_body = wifi_fw.split(
         "proc phy_mdm_isr*() {.exportc, cdecl.} =",
         1,
@@ -6235,6 +7314,30 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     )[1].split("proc phy_get_channel_raw*", 1)[0]
     assert "addr wifiModemRegs().versionScratch3c" in phy_get_version_body
     assert "WifiModemBase + 0x3C'u" not in phy_get_version_body
+    phy_get_channel_body = wifi_fw.split(
+        'proc phy_get_channel_raw*(info: pointer, index: uint8)\n'
+        '      {.exportc: "phy_get_channel", cdecl.} =',
+        1,
+    )[1].split("proc phy_get_ntx*", 1)[0]
+    assert "let env = phyEnvViewPtr()" in phy_get_channel_body
+    for expected in [
+        "addr env.channelBandType",
+        "addr env.primaryFreq",
+        "addr env.centerFreq1",
+        "addr env.centerFreq2OrTxPower",
+    ]:
+        assert expected in phy_get_channel_body
+    for forbidden in [
+        "phyEnvWord(36'u)",
+        "phyEnvWord(40'u)",
+    ]:
+        assert forbidden not in phy_get_channel_body
+    phy_stop_body = wifi_fw.split(
+        "proc phy_stop*() {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc phy_mdm_reset*", 1)[0]
+    assert "discard regRead(MACHW_STATE_CNTRL_REG)" in phy_stop_body
+    assert "cast[ptr uint32](0x24B00038'u)" not in phy_stop_body
     phy_aid_body = wifi_fw.split(
         "proc phy_set_aid*(aid: uint16)",
         1,
@@ -6289,6 +7392,10 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "proc bba_reset() {.exportc, cdecl.} =",
         1,
     )[1].split("proc bbaSetPdLatch", 1)[0]
+    bba_pd_latch_body = wifi_fw.split(
+        "proc bbaSetPdLatch(enable: bool) =",
+        1,
+    )[1].split("proc bbaUpdatePdComp", 1)[0]
     bba_update_pd_comp_body = wifi_fw.split(
         "proc bbaUpdatePdComp(target: uint8) =",
         1,
@@ -6299,6 +7406,10 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         assert "addr bba.pdCompC830" in body
         assert "cast[ptr uint32](0x24C0B390'u)" not in body
         assert "cast[ptr uint32](0x24C0C830'u)" not in body
+    for body in [bba_init_body, bba_reset_body, bba_pd_latch_body]:
+        assert "let rf = rfRegs()" in body
+        assert "addr rf.pdCompLatchCtrl50c" in body
+        assert "cast[ptr uint32](0x2000150C'u)" not in body
     rxgain_body = wifi_fw.split(
         "proc rc2_config_rxgain*(offset: int8) {.exportc, cdecl.} =",
         1,
@@ -6320,10 +7431,60 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "proc bl808PhyProgramRxTailRegs() =",
         1,
     )[1].split("proc bl808MdmSetChannel", 1)[0]
+    assert "let rf = rfRegs()" in rx_tail_body
     assert "let mdm = wifiModemRegs()" in rx_tail_body
-    assert "addr mdm.rxTailC018" in rx_tail_body
+    assert "addr rf.channelTuneCtrl26c" in rx_tail_body
+    assert "addr mdm.rxGainTailCtrlC018" in rx_tail_body
+    assert "RfBase + 0x26C'u" not in rx_tail_body
     assert "cast[ptr uint32](0x24C0C018'u)" not in rx_tail_body
     assert "let clkCount = phyClockCountFromVersion(version)" in wifi_fw
+    copy_phy_cfg_body = wifi_fw.split(
+        "proc copyPhyInitCfg(cfg: pointer) =",
+        1,
+    )[1].split("proc copyAgcMemory()", 1)[0]
+    for expected in [
+        "let env = phyEnvViewPtr()",
+        "addr env.initCfgWords[i]",
+        "addr env.channelBandType",
+        "addr env.primaryFreq",
+        "addr env.centerFreq1",
+        "addr env.centerFreq2OrTxPower",
+    ]:
+        assert expected in copy_phy_cfg_body
+    for forbidden in [
+        "phyEnvWord((i * 4).uint)",
+        "phyEnvWord(36'u)",
+        "phyEnvWord(40'u)",
+    ]:
+        assert forbidden not in copy_phy_cfg_body
+    phy_update_power_body = wifi_fw.split(
+        "proc phy_update_power_table*() {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc phyEnvCenter2Word", 1)[0]
+    assert "addr phyEnvViewPtr().channelBandType" in phy_update_power_body
+    assert "phyEnvByte(37'u)" not in phy_update_power_body
+    phy_set_channel_body = wifi_fw.split(
+        "proc phy_set_channel*(channel: ptr ChanCtxtDefView, force: uint32)",
+        1,
+    )[1].split("proc phyInitValidateClock", 1)[0]
+    for expected in [
+        "let env = phyEnvViewPtr()",
+        "addr env.channelBandType",
+        "addr env.primaryFreq",
+        "addr env.centerFreq1",
+        "addr env.centerFreq2OrTxPower",
+        "addr env.txPowerAndReserved",
+    ]:
+        assert expected in phy_set_channel_body
+    for forbidden in [
+        "phyEnvByte(37'u)",
+        "phyEnvHalf(36'u)",
+        "phyEnvHalf(38'u)",
+        "phyEnvHalf(40'u)",
+        "phyEnvHalf(42'u)",
+        "phyEnvHalf(44'u)",
+    ]:
+        assert forbidden not in phy_set_channel_body
     assert phy_init_body.index("phyInitValidateClock()") < phy_init_body.index(
         "phyInitProgramBasebandAndAgc()"
     )
@@ -6336,10 +7497,101 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     assert phy_init_body.index("phyInitProgramInitialChannel()") < phy_init_body.index(
         "copyPhyInitCfg(cfg)"
     )
+    phy_baseband_body = wifi_fw.split(
+        "proc phyInitProgramBasebandAndAgc() =",
+        1,
+    )[1].split("proc phyInitProgramReceiveTail", 1)[0]
+    assert phy_baseband_body.index("bl808PhyProgramRecoveredRegs()") < phy_baseband_body.index(
+        "bl808PhyProgramPreAgcRegs()"
+    )
+    assert phy_baseband_body.index("bl808PhyProgramPreAgcRegs()") < phy_baseband_body.index(
+        "copyAgcMemory()"
+    )
+    assert phy_baseband_body.index("copyAgcMemory()") < phy_baseband_body.index(
+        "bl808PhyProgramAgcCopyTailRegs()"
+    )
+    for expected in [
+        "let mdm = wifiModemRegs()",
+        "let bba = bbaAgcRegs()",
+        "let crm = crmPhyClockRegs()",
+        "addr mdm.preAgcCtrl324",
+        "addr mdm.preAgcSignal848",
+        "addr mdm.preAgcSignal844",
+        "addr mdm.preAgcTiming8d4",
+        "addr mdm.preAgcTiming8d8",
+        "addr mdm.preAgcTiming8e0",
+        "addr mdm.preAgcTiming8e4",
+        "addr mdm.bandwidth20MGuard814",
+        "addr mdm.preAgcDetect894",
+        "addr mdm.bandwidth20MEnable834",
+        "addr crm.rfClockMux10",
+        "addr bba.macActiveC01c",
+        "addr bba.agcCoreCtrl100",
+        "addr bba.agcCoreTableC80c",
+        "addr bba.pdGain390",
+    ]:
+        assert expected in pre_agc_body
+    for expected in [
+        "let bba = bbaAgcRegs()",
+        "let crm = crmPhyClockRegs()",
+        "addr bba.pdGain390",
+        "addr crm.rfClockMux10",
+    ]:
+        assert expected in agc_copy_tail_body
+    for forbidden in [
+        "PhyInitBasebandPreAgcInit",
+        "writeRadioRegMaskInitRange",
+        "0x24C00324'u32",
+        "0x24C00848'u32",
+        "0x24C00844'u32",
+        "0x24C008D4'u32",
+        "0x24C008D8'u32",
+        "0x24C008E0'u32",
+        "0x24C008E4'u32",
+        "0x24C00814'u32",
+        "0x24C00894'u32",
+        "0x24C0B100'u32",
+        "0x24C0C80C'u32",
+    ]:
+        assert forbidden not in wifi_fw
+    for expected in [
+        "let bba = bbaAgcRegs()",
+        "addr bba.agcCoreWindow3a4",
+        "addr bba.agcCoreDetect394",
+        "addr bba.agcCoreDetect398",
+        "addr bba.agcCoreProfile364",
+        "addr bba.agcCoreProfile370",
+        "addr bba.agcCoreStage0B380",
+        "addr bba.agcCoreStage2B388",
+        "addr bba.pdCompRampC838",
+        "addr bba.pdCompRampC83c",
+        "addr bba.pdCompRampC840",
+        "addr bba.agcCoreEnable004",
+        "addr bba.agcCoreTimeout414",
+    ]:
+        assert expected in agc_core_body
+    for forbidden in [
+        "PhyInitAgcCoreInit",
+        "0x24C0B3A4'u32",
+        "0x24C0B394'u32",
+        "0x24C0B398'u32",
+        "0x24C0B364'u32",
+        "0x24C0C838'u32",
+        "0x24C0C83C'u32",
+        "0x24C0C840'u32",
+        "0x24C0B414'u32",
+    ]:
+        assert forbidden not in wifi_fw
     assert "proc wrapPhyAssertErr*(fileOrCond, condOrFile: cstring," in wifi_fw
     assert '{.exportc: "__wrap_phy_assert_err", cdecl, noinline.}' in wifi_fw
     assert 'nimFwConnectTrace2U32("[WIFI-CT] phy_assert "' in wifi_fw
-    assert "regRead(0x24C0003C'u32)" in wifi_fw
+    wrap_phy_assert_body = wifi_fw.split(
+        "proc wrapPhyAssertErr*(fileOrCond, condOrFile: cstring",
+        1,
+    )[1].split("proc tpc_update_tx_power*", 1)[0]
+    assert "let mdm = wifiModemRegs()" in wrap_phy_assert_body
+    assert "volatileLoad(addr mdm.versionScratch3c)" in wrap_phy_assert_body
+    assert "regRead(0x24C0003C'u32)" not in wrap_phy_assert_body
     assert "line == 586.cint or line == 0x20FA.cint or line == 0x2A60.cint" in wifi_fw
     blecontroller = (ROOT / "src/bl808/blecontroller.nim").read_text()
     blerfdata = (ROOT / "src/bl808/blerfdata.nim").read_text()
@@ -6436,9 +7688,18 @@ def test_rf_symbol_provenance_checker_rejects_archive_fallbacks():
         "no RF archive members extracted in link map",
         '".a(" not in stripped',
         "def check_wifi_phy_memory_init(archive: Path) -> list[str]:",
+        "def check_wifi_object_phy_memory_init(obj: Path) -> list[str]:",
         "--check-wifi-phy-memory-init",
         "--rf-archive",
         "agcmem-0x24c0a000",
+        "missing Nim AGC copy evidence to 0x24C0A000",
+        "Nim WiFi PHY memory init copies agcmem and has no LDPC RAM path",
+        "unexpected Nim WiFi LDPC RAM reference 0x24C09000",
+        "failures.extend(check_wifi_object_phy_memory_init(args.wifi_object))",
+        'missing = check_defined(args.wifi_object, WIFI_RF_SYMBOLS, "wifi-object")',
+        'failures.extend(f"wifi-object:{symbol}" for symbol in missing)',
+        'missing = check_defined(args.ble_object, BLE_RF_SYMBOLS, "ble-object")',
+        'failures.extend(f"ble-object:{symbol}" for symbol in missing)',
         "24c09000",
         "unexpected WiFi ldpcmem symbol",
         "def check_elf_defined(\n    path: Path, symbols: list[str], label: str, required: bool",
@@ -6455,6 +7716,19 @@ def test_rf_symbol_provenance_checker_rejects_archive_fallbacks():
         "def hw_validation_nimcache_object(elf: Path, object_name: str) -> Path | None:",
         "def check_hw_validation_nimcache_objects(",
         "check_hw_validation_nimcache_objects(",
+        "check_wifi_phy_memory: bool",
+        'missing = check_defined(obj, symbols, f"{elf} {label}-nimcache-object")',
+        'failures.extend(f"{obj}:missing:{symbol}" for symbol in missing)',
+        'if label == "wifi" and check_wifi_phy_memory:',
+        "failures.extend(check_wifi_object_phy_memory_init(obj))",
+        "args.check_wifi_phy_memory_init",
+        "def add_hw_validation_test_inputs(",
+        "--hw-validation-test",
+        "--hw-validation-work-dir",
+        "args.check_hw_validation_nimcache_objects = True",
+        "args.infer_hw_validation_nimcache_objects = True",
+        'work_dir / "bin" / test_name / "kernel.elf"',
+        'work_dir / "logs" / f"{test_name}.kernel.build.log"',
         "check-hw-validation-nimcache-objects",
         "require-hw-validation-nimcache-objects",
         "require-hw-validation-wifi-nimcache-object",
@@ -6463,10 +7737,45 @@ def test_rf_symbol_provenance_checker_rejects_archive_fallbacks():
         "fail if any converted BLE/coex RF symbol is not defined in each ELF",
         "required_symbols.extend(WIFI_RF_SYMBOLS)",
         "required_symbols.extend(BLE_RF_SYMBOLS)",
+        '"wl_rf_cfg_init"',
+        '"wl_rmem_size_get"',
+        '"wl_env_get"',
+        '"rfc_config_bandwidth"',
+        '"rfc_config_channel"',
+        '"modem_init"',
+        '"modem_restore"',
+        '"rf_dump_status"',
+        '"phy_get_mac_freq"',
+        '"phy_get_version"',
+        '"phy_get_channel"',
+        '"phy_mdm_isr"',
+        '"phy_rc_isr"',
+        '"phy_ldpc_tx_supported"',
+        '"phy_ldpc_rx_supported"',
+        '"phy_set_channel"',
+        '"phy_powroffset_set"',
+        '"trpc_update_power"',
+        '"trpc_get_default_power_idx"',
         '"rf_pri_init"',
+        '"rf_pri_input_xtalfreq"',
+        '"rf_pri_config_mode"',
         '"rf_pri_input_device_info"',
+        '"rf_pri_update_param"',
+        '"rf_pri_get_notch_param"',
         '"rf_pri_optimize"',
         '"rf_pri_set_channel_pwr_comp"',
+        '"rf_pri_set_bandwidth"',
+        '"rf_pri_get_vco_freq_cw"',
+        '"rf_pri_get_vco_idac_cw"',
+        '"ble_rf_init"',
+        '"ble_rf_set_pwr_offset_table"',
+        '"ble_rf_get_pwr_offset"',
+        '"ble_rf_set_tx_channel"',
+        '"rf_txpwr_dbm2cs"',
+        '"rf_txpwr_cs2dbm"',
+        '"nim_ble_coex_wifi_tx_window_enter"',
+        '"nim_ble_coex_wifi_tx_window_leave"',
+        '"nim_ble_coex_wifi_rf_reclaim_needed"',
         "defines retained RF/PHY symbols",
         "RF/PHY symbols not retained in ELF",
         "f\"{label} required\"",
@@ -6475,15 +7784,24 @@ def test_rf_symbol_provenance_checker_rejects_archive_fallbacks():
 
     for expected in [
         "VALIDATE_RF_ELF",
+        "VALIDATE_RF_HW_TEST",
+        "VALIDATE_RF_HW_TESTS",
         "VALIDATE_RF_BUILD_LOG",
         "VALIDATE_RF_LINK_MAP",
         "VALIDATE_RF_REQUIRE_HW_NIMCACHE",
         "WiFi phy_init copies agcmem to 0x24C0A000 and has no LDPC RAM path",
         "rejects extracted RF archive members in the link map",
         "--check-hw-validation-nimcache-objects",
+        "--hw-validation-test \"$VALIDATE_RF_HW_TEST\"",
+        "IFS=',' read -r -a rf_hw_tests",
+        "for rf_hw_test in \"${rf_hw_tests[@]}\"",
         "--require-hw-validation-wifi-nimcache-object",
         "inferred_map=\"${VALIDATE_RF_ELF%.elf}.map\"",
         "RF_ARGS+=(--link-map \"$inferred_map\")",
+        'if [[ "$VALIDATE_RF_ELF" == */build/hw-validation/bin/*/kernel.elf ]]; then',
+        "RF_ARGS+=(--infer-hw-validation-nimcache-objects)",
+        'inferred_build_log="$(dirname "$(dirname "$(dirname "$VALIDATE_RF_ELF")")")/logs/${test_name}.kernel.build.log"',
+        'RF_ARGS+=(--build-log "$inferred_build_log")',
         "--rf-archive src/bl808/librf_bl808.a --check-wifi-phy-memory-init",
         "RF/PHY symbol provenance:",
         "python3 tools/validate_rf_symbol_provenance.py",
@@ -6502,27 +7820,782 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
     wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
     manifest = (ROOT / "tools/hardware_validation.json").read_text()
 
-    fixed_body = wifi_fw.split("proc writeRfPriFixedValInit() =", 1)[1].split(
+    fixed_body = wifi_fw.split("proc writeRfPriFixedValueRegs() =", 1)[1].split(
         "proc rfPriApplyWb03RuntimeLatches()",
         1,
     )[0]
+    wb03_runtime_latches_body = wifi_fw.split(
+        "proc rfPriApplyWb03RuntimeLatches() =",
+        1,
+    )[1].split("var nim_wifi_rf_pri_txcal_count", 1)[0]
+    wb03_rxcal_tosdac_latch_body = wifi_fw.split(
+        "proc rfPriApplyWb03RxcalTosdacLatch() =",
+        1,
+    )[1].split("proc rfSignedByte", 1)[0]
+    wb03_scan_latches_body = wifi_fw.split(
+        "proc rfPriApplyWb03ScanRxLatches() =",
+        1,
+    )[1].split("proc rfPriPrepareWb03MacActiveScanState()", 1)[0]
+    wb03_mac_active_body = wifi_fw.split(
+        "proc rfPriPrepareWb03MacActiveScanState() =",
+        1,
+    )[1].split("proc rfPriApplyWb03AuthTxLatches()", 1)[0]
+    wb03_auth_tx_latches_body = wifi_fw.split(
+        "proc rfPriApplyWb03AuthTxLatches() =",
+        1,
+    )[1].split("proc rfPriCaptureWb03AuthTxPrePush()", 1)[0]
+    wb03_auth_tx_capture_body = wifi_fw.split(
+        "proc rfPriCaptureWb03AuthTxPrePush() =",
+        1,
+    )[1].split("proc captureAuthTxHwPrePush", 1)[0]
+    wb03_rfc_entry_body = wifi_fw.split(
+        "proc rfPriApplyWb03RfcEntryBaseline() =",
+        1,
+    )[1].split("proc rfPriApplyWb03ScanBaseline()", 1)[0]
+    wb03_rfc_wait_body = wifi_fw.split(
+        "proc rfPriWaitConfigIdleForWb03RfcEntry() =",
+        1,
+    )[1].split("proc rfPriApplyWb03RfcEntryBaseline()", 1)[0]
+    wb03_scan_baseline_body = wifi_fw.split(
+        "proc rfPriApplyWb03ScanBaseline() =",
+        1,
+    )[1].split("proc wlCfgU32", 1)[0]
+    rf70_search_body = wifi_fw.split(
+        "proc rfPriSearchRf70ReplayWindow(window: int): tuple[ok: bool, nibble: uint32] =",
+        1,
+    )[1].split("proc rfPriPopulateWb03TxcalRf70ReplayFieldsFromSearch", 1)[0]
+    rf70_search_commit_body = wifi_fw.split(
+        "proc rfPriPopulateWb03TxcalRf70ReplayFieldsFromSearch(): bool =",
+        1,
+    )[1].split("proc rfPriReplayWb03Rf70FromTxcalCalWords()", 1)[0]
+    rf70_populate_body = wifi_fw.split(
+        "proc rfPriPopulateWb03TxcalRf70ReplayFields() =",
+        1,
+    )[1].split("proc rfPriApplyWb03RccalSeed()", 1)[0]
+    rf70_replay_body = wifi_fw.split(
+        "proc rfPriReplayWb03Rf70FromTxcalCalWords() =",
+        1,
+    )[1].split("proc rfPriPopulateWb03TxcalRf70ReplayFields()", 1)[0]
+    for expected in [
+        'exportc: "nim_wifi_rf_rf70_txcal_search_best_nibble"',
+        'exportc: "nim_wifi_rf_rf70_txcal_search_runner_nibble"',
+        'exportc: "nim_wifi_rf_rf70_txcal_search_best_sample"',
+        'exportc: "nim_wifi_rf_rf70_txcal_search_runner_sample"',
+        "var bestNibble = 5'u32",
+        "var runnerUpNibble = 5'u32",
+        "var bestSample = low(int32)",
+        "var runnerUpSample = low(int32)",
+        "if sample.value > bestSample:",
+        "runnerUpSample = bestSample",
+        "runnerUpNibble = bestNibble",
+        "elif sample.value > runnerUpSample:",
+        "let adjacent =",
+        "min(bestNibble, runnerUpNibble)",
+        "bestNibble",
+        "rfPriRecordRf70SearchWindow(\n      window, ok, bestNibble, runnerUpNibble, bestSample, runnerUpSample,",
+    ]:
+        assert expected in wifi_fw if expected.startswith("exportc") else expected in rf70_search_body
+    assert "bl808WifiRfWb03ApplyMeasuredRf70Replay* {.booldefine.}: bool = false" in wifi_fw
+    for expected in [
+        "if bl808WifiRfWb03ApplyMeasuredRf70Replay:",
+        "rfPriStoreRf70ReplayWindowNibbles(\n          window0.nibble, window1.nibble, window2.nibble)",
+        "return true",
+        "return false",
+    ]:
+        assert expected in rf70_search_commit_body
+    for expected in [
+        "Run the recovered strongest-candidate search for UART/JTAG visibility.",
+        "Applying those measured replay windows is default-off",
+        "RfPriRf70ReplayFieldsMeasuredFallback",
+    ]:
+        assert expected in rf70_populate_body
+    for expected in [
+        "RfCalibRf70ReplayLowBandWordIndex",
+        "RfCalibRf70ReplayHighBandWordIndex",
+        "RfCalibLoVcoHalfwordBase",
+        "RfCalibTxcalRecordBaseWord",
+        "proc rfCalibRf70ReplayLowBandWord()",
+        "proc rfCalibRf70ReplayHighBandWord()",
+        "let lowBandReplayWord = rfCalibRf70ReplayLowBandWord()",
+        "let highBandReplayWord = rfCalibRf70ReplayHighBandWord()",
+        "let lowBandReplayWordBefore = rfCalibRf70ReplayLowBandWord()",
+        "let highBandReplayWordBefore = rfCalibRf70ReplayHighBandWord()",
+    ]:
+        assert expected in wifi_fw
+    for vague_calib_access in [
+        "rfCalibWord(3)",
+        "rfCalibWord(4)",
+        "rfCalibSetWord(3",
+        "rfCalibSetWord(4",
+        "RfPriTxcalRecordBaseWord",
+        "rfCalibHalf(14 +",
+        "let word3",
+        "let word4",
+        "let w8",
+    ]:
+        assert vague_calib_access not in wifi_fw
+    for forbidden in [
+        "BelowThreshold",
+        "AboveThreshold",
+        "rf70ReplaySearchBelow",
+        "rf70ReplaySearchAbove",
+        "sample.value <= -2048'i32",
+        "not adjacent",
+        "strongest sample below",
+        "threshold/bracket",
+    ]:
+        assert forbidden not in rf70_search_body
+    wait_fcal_ready_body = wifi_fw.split(
+        "proc waitRfFcalReady(): bool =",
+        1,
+    )[1].split("proc sampleRfFcalCount()", 1)[0]
+    sample_fcal_body = wifi_fw.split(
+        "proc sampleRfFcalCount(): uint16 =",
+        1,
+    )[1].split("proc writeRfFcalCode", 1)[0]
+    write_fcal_body = wifi_fw.split(
+        "proc writeRfFcalCode(code: uint16) =",
+        1,
+    )[1].split("proc writeRfAcalCode", 1)[0]
+    write_acal_body = wifi_fw.split(
+        "proc writeRfAcalCode(code: uint16) =",
+        1,
+    )[1].split("proc vendorLikeRfAcalForFcal", 1)[0]
+    prepare_lo_fcal_body = wifi_fw.split(
+        "proc prepareRfPriLoFcal() =",
+        1,
+    )[1].split("proc chooseRfBaseFcalCode()", 1)[0]
+    choose_lo_fcal_body = wifi_fw.split(
+        "proc chooseRfBaseFcalCode(): uint16 =",
+        1,
+    )[1].split("proc runRfPriLoFcal()", 1)[0]
+    run_lo_fcal_body = wifi_fw.split(
+        "proc runRfPriLoFcal() =",
+        1,
+    )[1].split("proc prepareRfPriLoAcal()", 1)[0]
+    prepare_lo_acal_body = wifi_fw.split(
+        "proc prepareRfPriLoAcal() =",
+        1,
+    )[1].split("proc runRfPriLoAcal()", 1)[0]
+    run_lo_acal_body = wifi_fw.split(
+        "proc runRfPriLoAcal() =",
+        1,
+    )[1].split("proc saveRfPriCalState()", 1)[0]
+    config_channel_cal_body = wifi_fw.split(
+        "proc rfPriConfigChannelForCal(index: int) =",
+        1,
+    )[1].split("proc startRfPriTxDfeForCal()", 1)[0]
+    start_tx_dfe_body = wifi_fw.split(
+        "proc startRfPriTxDfeForCal() =",
+        1,
+    )[1].split("proc startRfPriRxDfeForCal()", 1)[0]
+    start_rx_dfe_body = wifi_fw.split(
+        "proc startRfPriRxDfeForCal() =",
+        1,
+    )[1].split("proc signedRfPowerMeasurement", 1)[0]
+    prepare_txcal_body = wifi_fw.split(
+        "proc prepareRfPriTxcal() =",
+        1,
+    )[1].split("proc prepareRfPriBzTxcal()", 1)[0]
+    prepare_bz_txcal_body = wifi_fw.split(
+        "proc prepareRfPriBzTxcal() =",
+        1,
+    )[1].split("proc runRfPriTxcal()", 1)[0]
+    run_txcal_body = wifi_fw.split(
+        "proc runRfPriTxcal() =",
+        1,
+    )[1].split("proc runRfPriBzTxcal()", 1)[0]
+    run_bz_txcal_body = wifi_fw.split(
+        "proc runRfPriBzTxcal() =",
+        1,
+    )[1].split("proc waitRfRxcalMeasurementReady()", 1)[0]
+    bz_txcal_snapshot_body = wifi_fw.split(
+        "proc rfPriSnapshotBzTxcalState(tag: uint32) =",
+        1,
+    )[1].split("proc rfCalibRf70ReplayLowBandWord()", 1)[0]
+    store_txcal_record_body = wifi_fw.split(
+        "proc storeRfTxcalRecord(index: int;",
+        1,
+    )[1].split("proc storeRfPriBzTxcalRecord", 1)[0]
+    store_bz_txcal_record_body = wifi_fw.split(
+        "proc storeRfPriBzTxcalRecord(index: int;",
+        1,
+    )[1].split("proc configureRfPriTxcalGain", 1)[0]
+    apply_txcal_record_body = wifi_fw.split(
+        "proc rfPriApplyTxcalRecordToTable(txPowerTableWords: var array[43, uint32],",
+        1,
+    )[1].split("proc rfPriApplyBzTxcalRecordToTable", 1)[0]
+    apply_bz_txcal_record_body = wifi_fw.split(
+        "proc rfPriApplyBzTxcalRecordToTable(txPowerTableWords: var array[43, uint32],",
+        1,
+    )[1].split("proc rfPriSeedBzTxcalFallbackRecords", 1)[0]
+    seed_bz_txcal_body = wifi_fw.split(
+        "proc rfPriSeedBzTxcalFallbackRecords() =",
+        1,
+    )[1].split("proc rfPriWriteTxPowerTable()", 1)[0]
+    write_tx_power_table_body = wifi_fw.split(
+        "proc rfPriWriteTxPowerTable() =",
+        1,
+    )[1].split("proc writeRfPriGainInit()", 1)[0]
+    prepare_roscal_body = wifi_fw.split(
+        "proc prepareRfPriRoscal() =",
+        1,
+    )[1].split("proc runRfPriRoscal()", 1)[0]
+    apply_roscal_body = wifi_fw.split(
+        "proc applyRfRoscalCodes(iCode, qCode: uint32) =",
+        1,
+    )[1].split("proc prepareRfPriRoscal()", 1)[0]
+    run_roscal_body = wifi_fw.split(
+        "proc runRfPriRoscal() =",
+        1,
+    )[1].split("proc waitRfRccalMeasurementReady()", 1)[0]
+    wait_roscal_measure_body = wifi_fw.split(
+        "proc waitRfRoscalMeasurementReady(): bool =",
+        1,
+    )[1].split("proc writeRfRoscalCandidate", 1)[0]
+    write_roscal_candidate_body = wifi_fw.split(
+        "proc writeRfRoscalCandidate(iBranch: bool, code: uint32) =",
+        1,
+    )[1].split("type\n    RfRoscalSample", 1)[0]
+    sample_roscal_measure_body = wifi_fw.split(
+        "proc sampleRfRoscalMeasurement(iBranch: bool): RfRoscalSample =",
+        1,
+    )[1].split("proc logRfRoscalSearch", 1)[0]
+    prepare_rccal_body = wifi_fw.split(
+        "proc prepareRfPriRccal() =",
+        1,
+    )[1].split("proc prepareRfPriRccalTone()", 1)[0]
+    wait_rccal_measure_body = wifi_fw.split(
+        "proc waitRfRccalMeasurementReady(): bool =",
+        1,
+    )[1].split("proc sampleRfRccalPower", 1)[0]
+    prepare_rccal_tone_body = wifi_fw.split(
+        "proc prepareRfPriRccalTone() =",
+        1,
+    )[1].split("proc logRfRccalSearch", 1)[0]
+    sample_rccal_power_body = wifi_fw.split(
+        "proc sampleRfRccalPower(): uint32 =",
+        1,
+    )[1].split("proc primeRfRccalPowerMeasurement()", 1)[0]
+    prime_rccal_measure_body = wifi_fw.split(
+        "proc primeRfRccalPowerMeasurement() =",
+        1,
+    )[1].split("proc writeRfRccalCode", 1)[0]
+    write_rccal_body = wifi_fw.split(
+        "proc writeRfRccalCode(code: uint32) =",
+        1,
+    )[1].split("proc writeRfRccalSearchCode", 1)[0]
+    write_rccal_search_body = wifi_fw.split(
+        "proc writeRfRccalSearchCode(code: uint32) =",
+        1,
+    )[1].split("proc prepareRfPriRccal()", 1)[0]
+    run_rccal_body = wifi_fw.split(
+        "proc runRfPriRccal() =",
+        1,
+    )[1].split("proc clampRfTxcalParam", 1)[0]
+    txcal_singen_amp_body = wifi_fw.split(
+        "proc writeRfTxcalSingenAmplitude(amp: uint32) =",
+        1,
+    )[1].split("proc sampleRfTxcalAverage", 1)[0]
+    txcal_param_body = wifi_fw.split(
+        "proc writeRfTxcalParam(paramInd: uint32, value: int32) =",
+        1,
+    )[1].split("proc waitRfTxcalMeasurementReady", 1)[0]
+    txcal_average_body = wifi_fw.split(
+        "proc sampleRfTxcalAverage(): tuple[ok: bool, value: int32] =",
+        1,
+    )[1].split("proc sampleRfTxcalAdcMean", 1)[0]
+    txcal_adc_mean_body = wifi_fw.split(
+        "proc sampleRfTxcalAdcMean(): tuple[ok: bool, value: int32] =",
+        1,
+    )[1].split("proc tuneRfTxcalSingenPower", 1)[0]
+    txcal_search_stage_body = wifi_fw.split(
+        "proc prepareRfTxcalSearchStage() =",
+        1,
+    )[1].split("proc sampleRfTxcalPower", 1)[0]
+    txcal_gain_body = wifi_fw.split(
+        "proc configureRfPriTxcalGain(setup: array[9, uint16],",
+        1,
+    )[1].split("proc configureRfPriTxcalGain(index: int", 1)[0]
+    txcal_power_body = wifi_fw.split(
+        "proc sampleRfTxcalPower(measFreq: uint32):",
+        1,
+    )[1].split("proc measureRfTxcalCandidate", 1)[0]
+    wait_txcal_measure_body = wifi_fw.split(
+        "proc waitRfTxcalMeasurementReady(): bool =",
+        1,
+    )[1].split("proc clampRfTxcalAmp", 1)[0]
+    wait_rxcal_measure_body = wifi_fw.split(
+        "proc waitRfRxcalMeasurementReady(): bool =",
+        1,
+    )[1].split("proc clampRfRxcalParam", 1)[0]
+    rxcal_param_body = wifi_fw.split(
+        "proc writeRfRxcalParam(paramInd: uint32, value: int32) =",
+        1,
+    )[1].split("proc sampleRfRxcalPower", 1)[0]
+    rxcal_power_body = wifi_fw.split(
+        "proc sampleRfRxcalPower(): tuple[ok: bool, power: uint32] =",
+        1,
+    )[1].split("proc measureRfRxcalCandidate", 1)[0]
+    store_rxcal_record_body = wifi_fw.split(
+        "proc storeRfRxcalRecord(index: int, p2, p3: int32, power: uint32) =",
+        1,
+    )[1].split("proc rfPriReplayRxcalRegs()", 1)[0]
+    prepare_rxcal_body = wifi_fw.split(
+        "proc prepareRfPriRxcal() =",
+        1,
+    )[1].split("proc runRfPriRxcal()", 1)[0]
+    run_rxcal_body = wifi_fw.split(
+        "proc runRfPriRxcal() =",
+        1,
+    )[1].split("proc rfPriApplyTxcalRecordToTable", 1)[0]
+    efuse_init_body = wifi_fw.split(
+        "proc rfPriEfuseInit() =",
+        1,
+    )[1].split("proc runRfPriFullCalRestoreBaseline", 1)[0]
+    efuse_xtal_cap_body = wifi_fw.split(
+        "proc rfPriApplyEfuseXtalCapTrim(cfg: ptr WlRfConfig;",
+        1,
+    )[1].split("proc rfPriApplyEfuseTxGainTrim", 1)[0]
+    efuse_tx_gain_body = wifi_fw.split(
+        "proc rfPriApplyEfuseTxGainTrim(cfg: ptr WlRfConfig) =",
+        1,
+    )[1].split("proc rfPriApplyEfuseDfeTrim", 1)[0]
+    efuse_dfe_trim_body = wifi_fw.split(
+        "proc rfPriApplyEfuseDfeTrim(cfg: ptr WlRfConfig) =",
+        1,
+    )[1].split("proc rfPriEfuseInit", 1)[0]
+    rf_pri_init_body = wifi_fw.split(
+        "proc rf_pri_init(coldInit, mode: uint32) {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc rf_pri_txcal", 1)[0]
+    wifi_pll_config_body = wifi_fw.split(
+        "proc rfPriWifiPllConfig() =",
+        1,
+    )[1].split("proc rfPriEfuseInit", 1)[0]
+    wb03_optimize_pll_body = wifi_fw.split(
+        "proc rfPriApplyWb03Non40OptimizePll(channelMhz: uint32) =",
+        1,
+    )[1].split("proc rf_pri_optimize", 1)[0]
+
+    for expected in [
+        "RfCalibBzTxcalRecordBaseByte",
+        "RfCalibBzTxcalRecordStrideBytes",
+        "proc rfCalibBzTxcalRecordByteOffset(record: int)",
+        "proc rfCalibBzTxcalRecordWord0(record: int)",
+        "proc rfCalibBzTxcalRecordWord1(record: int)",
+        "proc rfCalibStoreBzTxcalRecordWords(record: int; word0, word1: uint32)",
+        "rfCalibBzTxcalRecordWord0(record)",
+        "rfCalibBzTxcalRecordWord1(record)",
+    ]:
+        assert expected in wifi_fw
+    for expected in [
+        "param0, param1, param2, param3: int32",
+        "packRfTxcalCalWord0(param0, param1, param2)",
+        "packRfTxcalCalWord1(param3)",
+        "txcalRecordWord0",
+        "txcalRecordWord1",
+        "bzTxcalRecordWord0",
+        "bzTxcalRecordWord1",
+    ]:
+        assert expected in store_txcal_record_body + store_bz_txcal_record_body
+    for expected in [
+        "Vendor rf_pri_txcal_w2reg always writes these fields",
+        "preserves base-table words for empty records until TXCAL is bit-for-bit",
+        "let txcalParam0 = txcalRecordWord0 and 0x3F'u32",
+        "let txcalParam1 = (txcalRecordWord0 shr 8) and 0x3F'u32",
+        "let txcalParam2 = (txcalRecordWord0 shr 16) and 0x7FF'u32",
+        "let txcalParam3 = txcalRecordWord1 and 0x3FF'u32",
+        "if txcalRecordWord0 == 0'u32 and txcalRecordWord1 == 0'u32:",
+        "txPowerTableWords[tableIndex]",
+    ]:
+        assert expected in apply_txcal_record_body
+    for expected in [
+        "Vendor rf_pri_bz_txcal_w2reg always writes these fields",
+        "preserves base-table words for empty records until BZ TXCAL is validated",
+        "let bzTxcalRecordWord0 = rfCalibBzTxcalRecordWord0(record)",
+        "let bzTxcalRecordWord1 = rfCalibBzTxcalRecordWord1(record)",
+        "let txcalParam0 = bzTxcalRecordWord0 and 0x3F'u32",
+        "let txcalParam1 = (bzTxcalRecordWord0 shr 8) and 0x3F'u32",
+        "let txcalParam2 = (bzTxcalRecordWord0 shr 16) and 0x07FF'u32",
+        "let txcalParam3 = bzTxcalRecordWord1 and 0x03FF'u32",
+        "if (txcalParam0 or txcalParam1 or txcalParam2 or txcalParam3) == 0'u32:",
+        "txPowerTableWords[start]",
+    ]:
+        assert expected in apply_bz_txcal_record_body
+    for expected in [
+        "let bzTxcalRecordWord0 = rfCalibBzTxcalRecordWord0(record)",
+        "let bzTxcalRecordWord1 = rfCalibBzTxcalRecordWord1(record)",
+        "rfCalibStoreBzTxcalRecordWords(",
+        "packRfTxcalCalWord0(0x20'i32, 0x20'i32, 0x400'i32)",
+    ]:
+        assert expected in seed_bz_txcal_body
+    for expected in [
+        "let wb03Xtal40 = rfPriIsWb03() and",
+        "bl808RfXtalIndex == xtalIndex(WlXtal40M)",
+        "if wb03Xtal40:",
+        "RfPriWb03TxPowerRegisterBaseline",
+        "RfPriTxPowerRegisterBase",
+        "if rfCalibDataGlobal != nil and not wb03Xtal40:",
+        "var txPowerTableWords =",
+        "rfPriApplyTxcalRecordToTable(\n          txPowerTableWords, 3 + slot * 2, record)",
+        "rfPriApplyBzTxcalRecordToTable(txPowerTableWords,",
+        "writeRfTxPowerCompTable(txPowerTableWords)",
+    ]:
+        assert expected in write_tx_power_table_body
+    for body in [
+        bz_txcal_snapshot_body,
+        store_bz_txcal_record_body,
+        apply_bz_txcal_record_body,
+        seed_bz_txcal_body,
+    ]:
+        for vague_bz_access in [
+            "0xF8 +",
+            "record * 8",
+            "let offset =",
+            "let p0",
+            "let p1",
+            "let p2",
+            "let p3",
+            "p0=0x20",
+        ]:
+            assert vague_bz_access not in body
+    for expected in [
+        "let txcalParam0Coarse =",
+        "let txcalParam1Coarse =",
+        "let txcalParam0Refined =",
+        "let txcalParam1Refined =",
+        "let txcalParam2Coarse =",
+        "let txcalParam3Coarse =",
+        "let txcalParam2Refined =",
+        "let txcalParam3Refined =",
+    ]:
+        assert expected in run_txcal_body
+        assert expected in run_bz_txcal_body
+    for expected in [
+        "RfPriTxcalRf70InitialSearchSeedNibble = 0xB'u32",
+        "rf_pri_txcal+0x148..0x158 seeds RF70",
+        "addr rf.txcalParam70",
+        "RfPriTxcalRf70InitialSearchSeedNibble",
+    ]:
+        assert expected in wifi_fw if expected.startswith("RfPri") else expected in prepare_txcal_body
+    assert prepare_txcal_body.index(
+        "RfPriTxcalRf70InitialSearchSeedNibble"
+    ) < prepare_txcal_body.index("preRf70TxcalParamReg = volatileLoad(addr rf.txcalParam70)")
+    for expected in [
+        "Vendor rf_pri_txcal+0x54c..0x6a0 prepares the post-RF70 TXCAL search",
+        "one-shot RF64/RF58/RF21c/RF220 staging sequence",
+        "updateReg32(addr rf.calSingenCtrl20c, 0xFC00_FFFF'u32, 0x0049_0000'u32)",
+        "updateReg32(addr rf.calSingenAmpLo214, 0x003F_FFFF'u32, 0'u32)",
+        "updateReg32(addr rf.calSingenAmpHi218, 0x003F_FFFF'u32, 0xC000_0000'u32)",
+        "updateReg32(addr rf.rxcalPrep60, not 0x0000_0003'u32, 0x0000_0003'u32)",
+        "updateReg32(addr rf.txcalGain64, 0x0FC3_FFFF'u32, 0x9030_0000'u32)",
+        "updateReg32(addr rf.txcalBias58, 0xFFF8_FFFF'u32, 0x0004_0000'u32)",
+        "updateReg32(addr rf.rccalTone48, 0xCE0F_FFFF'u32, 0x0077_0000'u32)",
+        "updateReg32(addr rf.calPathConfig8c, not 0x0000_0030'u32, 0x0000_0010'u32)",
+        "updateReg32(addr rf.txcalGain64, 0xF8FF_FFFF'u32, 0x0400_0000'u32)",
+        "updateReg32(addr rf.txcalGain64, 0xFF83_FFFF'u32, 0xF040_0000'u32)",
+        "updateReg32(addr rf.priModeCtrl30, 0xFFFE_FFFF'u32, 0'u32)",
+        "updateReg32(addr rf.txcalBias58, 0xFFF8_FFFF'u32, 0x0001_0000'u32)",
+        "updateReg32(addr rf.calSingenMeasurePrep21c, 0xEFFF_EFFF'u32, 0'u32)",
+        "updateReg32(addr rf.calSingenAmpLo214, not 0x0000_07FF'u32, 0x0000_0010'u32)",
+        "updateReg32(addr rf.calSingenAmpHi218, not 0x0000_07FF'u32, 0x0000_0010'u32)",
+        "updateReg32(addr rf.calDfeGate23c, not 0x0004_0000'u32, 0x0004_0000'u32)",
+        "updateReg32(addr rf.rxMode220, not 0x0000_0180'u32, 0'u32)",
+        "updateReg32(addr rf.rxMode220, 0xFFFF_E7FF'u32, 0x0000_1082'u32)",
+        "updateReg32(addr rf.rxMode220, not 0x0000_0010'u32, 0x0000_0100'u32)",
+        "updateReg32(addr rf.calSingenCtrl20c, not 0x8000_0000'u32, 0'u32)",
+        "updateReg32(addr rf.calSingenCtrl20c, not 0x8000_0000'u32, 0x8000_0000'u32)",
+        "waitRfUs(10'u32)",
+    ]:
+        assert expected in txcal_search_stage_body
+    assert "0x003D_0000'u32" not in txcal_search_stage_body
+    for expected in [
+        "let rxcalParam2Coarse =",
+        "let rxcalParam3Coarse =",
+        "let rxcalParam2Refined =",
+        "let rxcalParam3Refined =",
+    ]:
+        assert expected in run_rxcal_body
+    for body in [run_txcal_body, run_bz_txcal_body, run_rxcal_body]:
+        for vague_search_result in [
+            "let p0a",
+            "let p1a",
+            "let p2a",
+            "let p3a",
+            "let p0b",
+            "let p1b",
+            "let p2b",
+            "let p3b",
+            "p0b.value",
+            "p1b.value",
+            "p2b.value",
+            "p3b.value",
+        ]:
+            assert vague_search_result not in body
 
     assert "Port of librf_bl808.a:rf_pri.c.o rf_pri_fixed_val_regs" in fixed_body
-    assert "writeRadioRegMaskInit(RfPriFixedValPrefixInit)" in fixed_body
-    assert "writeRadioRegMaskInit(RfPriFixedValSuffixInit)" in fixed_body
+    assert "writeRfPriFixedCommonPreBranch()" in fixed_body
+    assert "writeRfPriFixedCommonPostBranch()" in fixed_body
+    assert "writeRfPriFixedPowerCompTailDefaults()" in fixed_body
+    assert "RfPriFixedValPrefixInit:" not in wifi_fw
+    assert "RfPriFixedValSuffixInit:" not in wifi_fw
+    assert "writeRadioRegMaskInit(RfPriFixedValSuffixInit)" not in wifi_fw
+    assert "RfPriStaticInit:" not in wifi_fw
+    assert "writeRadioRegMaskInit(RfPriStaticInit)" not in wifi_fw
     assert "if rfPriIsWb03():" in fixed_body
     assert "0xFFFFFFE0'u32, 0x00000015'u32" in fixed_body
     assert "0xDFFFFFFF'u32, 0x00000000'u32" in fixed_body
     assert "0xFFFFFFE0'u32, 0x0000001B'u32" in fixed_body
     assert "0xFFFFFFFF'u32, 0x20000000'u32" in fixed_body
     assert fixed_body.index("0x00000015'u32") < fixed_body.index("0x0000001B'u32")
+    assert "let rf = rfRegs()" in fixed_body
+    assert "let dfe = rfDfeInitRegs()" in fixed_body
+    assert "addr dfe.dfeRfFixedCtrl814" in fixed_body
+    assert "addr rf.acalCtrlA4" in fixed_body
+    assert "volatileLoad(addr dfe.dfeRfFixedCtrl814)" in fixed_body
+    assert "volatileLoad(addr rf.acalCtrlA4)" in fixed_body
+    assert "cast[ptr uint32](RfAcalCtrlReg.uint)" not in fixed_body
+    assert "readReg32(RfAcalCtrlReg)" not in fixed_body
+    assert "cast[ptr uint32](RfPriInitF814Reg.uint)" not in fixed_body
+    assert "readReg32(RfPriInitF814Reg)" not in fixed_body
+    fixed_prefix_body = wifi_fw.split(
+        "proc writeRfPriFixedCommonPreBranch() =", 1
+    )[1].split(
+        "proc writeRfPriFixedCommonPostBranch() =", 1
+    )[0]
+    for expected in [
+        "let rf = rfRegs()",
+        "let pll = rfPllRegs()",
+        "let dfe = rfDfeInitRegs()",
+        "addr rf.calSingenMeasurePrep21c",
+        "addr rf.bandwidthCtrl94",
+        "addr rf.rxMode220",
+        "addr rf.scanSynthControl608",
+        "addr rf.synthDfePathControl63c",
+        "addr rf.calPathCtrl90",
+        "addr rf.measureCtrl618",
+        "addr rf.modemPathEnable504",
+        "addr dfe.dfeRfFixedDefault884",
+        "addr dfe.dfeRfFixedCtrl814",
+        "addr pll.pllFixedDefault84",
+        "addr rf.rxModeCalibrationGate78",
+        "addr pll.refdivCtrl14",
+    ]:
+        assert expected in fixed_prefix_body
+    for forbidden in [
+        "0x2000121C'u32",
+        "0x20001094'u32",
+        "0x20001608'u32",
+        "RfRxModeReg",
+        "RfPriInit163cReg",
+        "RfPriInit90Reg",
+        "RfPriInit1618Reg",
+        "RfPriInit1504Reg",
+        "RfPriInitF884Reg",
+        "RfPriInitF814Reg",
+        "RfPriInit884Reg",
+        "RfPriInit78Reg",
+        "RfPriInit814Reg",
+    ]:
+        assert forbidden not in fixed_prefix_body
+    fixed_suffix_body = wifi_fw.split(
+        "proc writeRfPriFixedCommonPostBranch() =", 1
+    )[1].split(
+        "proc writeRfPriFixedPowerCompTailDefaults() =", 1
+    )[0]
+    for expected in [
+        "let rf = rfRegs()",
+        "let dfe = rfDfeInitRegs()",
+        "addr dfe.hbnCtrl30",
+        "addr rf.priModeCtrl30",
+        "addr dfe.dfeRfFixedDefault884",
+        "addr rf.channelCalStrobeB0",
+        "addr rf.rfPriBiasTrimCc",
+        "addr rf.acalCtrlA4",
+        "addr rf.txcalCtrlB8",
+        "addr rf.calModeDefault138",
+        "addr rf.channelCalStatusB4",
+        "addr rf.calCtrl1c",
+        "addr rf.baseCtrl1",
+        "addr rf.rfCodeConfig110c",
+        "addr rf.roscalCtrl7c",
+        "addr rf.txcalDfe88",
+        "addr rf.txcalParam70",
+        "addr rf.txcalGain68",
+        "addr rf.rfBiasTrimD4",
+    ]:
+        assert expected in fixed_suffix_body
+    for forbidden in [
+        "RfPriInitHbnReg",
+        "RfPriModeCtrlReg",
+        "RfPriInitF884Reg",
+        "RfPriConfigB0Reg",
+        "0x200010CC'u32",
+        "RfAcalCtrlReg",
+        "RfTxcalCtrlReg",
+        "RfPriInit138Reg",
+        "RfPriConfigB4Reg",
+        "RfCalCtrlReg",
+        "RfCtrlReg",
+        "RfPriInit110cReg",
+        "RfRoscalCtrlReg",
+        "RfPriTxcalDfeReg",
+        "RfTxcalParamReg",
+        "RfPriInit68Reg",
+        "RfPriInitD4Reg",
+    ]:
+        assert forbidden not in fixed_suffix_body
+    fixed_tail_body = wifi_fw.split(
+        "proc writeRfPriFixedPowerCompTailDefaults() =", 1
+    )[1].split(
+        "proc writeRfPriStaticInit() =", 1
+    )[0]
+    for expected in [
+        "let rf = rfRegs()",
+        "addr rf.txPowerCompTail7bc",
+        "addr rf.txPowerCompTail7c0",
+        "addr rf.txPowerCompTail7c4",
+        "addr rf.txPowerCompTail7c8",
+        "addr rf.txPowerCompTail7cc",
+        "addr rf.txPowerCompTail7d0",
+        "addr rf.txPowerCompTail7d4",
+        "addr rf.txPowerCompTail7d8",
+    ]:
+        assert expected in fixed_tail_body
+    for forbidden in [
+        "0x200017BC'u32",
+        "0x200017C0'u32",
+        "0x200017C4'u32",
+        "0x200017C8'u32",
+        "0x200017CC'u32",
+        "0x200017D0'u32",
+        "0x200017D4'u32",
+        "0x200017D8'u32",
+    ]:
+        assert forbidden not in wifi_fw
+    static_init_body = wifi_fw.split("proc writeRfPriStaticInit() =", 1)[1].split(
+        "proc writeRfPriFixedValueRegs() =", 1
+    )[0]
+    for expected in [
+        "let rf = rfRegs()",
+        "let pll = rfPllRegs()",
+        "let dfe = rfDfeInitRegs()",
+        "addr pll.enableCtrl30",
+        "addr rf.rxMode220",
+        "addr dfe.dfeStaticCtrl820",
+        "addr dfe.hbnCtrl30",
+        "addr rf.priModeCtrl30",
+        "addr dfe.dfeRfFixedDefault884",
+        "addr rf.rfPriBiasTrimCc",
+        "addr rf.synthDfePathControl63c",
+        "addr rf.txcalGain64",
+        "addr rf.txcalDefaultProfile128",
+        "addr rf.txcalDefaultProfile12c",
+        "addr rf.txcalDefaultProfile130",
+        "addr rf.rfBiasTrimD4",
+        "addr rf.calPathCtrl90",
+        "addr rf.txcalCtrlB8",
+        "addr rf.calModeDefault138",
+        "addr rf.calPathConfig8c",
+        "addr rf.measureCtrl618",
+    ]:
+        assert expected in static_init_body
+    for forbidden in [
+        "RfPriInitPllReg",
+        "RfRxModeReg",
+        "RfPriInitDfeReg",
+        "RfPriInitHbnReg",
+        "RfPriModeCtrlReg",
+        "RfPriInitF884Reg",
+        "0x200010CC'u32",
+        "RfPriInit163cReg",
+        "RfPriInit64Reg",
+        "RfPriInit128Reg",
+        "RfPriInit12cReg",
+        "RfPriInit130Reg",
+        "RfPriInitD4Reg",
+        "RfPriInit90Reg",
+        "RfTxcalCtrlReg",
+        "RfPriInit138Reg",
+        "RfPriInit8cReg",
+        "RfPriInit1618Reg",
+    ]:
+        assert forbidden not in static_init_body
+
+    assert "cast[ptr uint32](RfPriInitDfeReg824.uint)" not in efuse_init_body
+    for expected in [
+        "proc rfPriEfuseXtalCapPairValid(cfg: ptr WlRfConfig): bool",
+        "proc rfPriApplyEfuseXtalCapTrim(cfg: ptr WlRfConfig;",
+        "let efuseXtalCapCode0 = cfg.efuseXtalCapCode0",
+        "let efuseXtalCapCode1 = cfg.efuseXtalCapCode1",
+        "rfPriEfuseXtalCapPairValid(cfg)",
+        "addr rf.xtalCapTrim5c",
+    ]:
+        assert expected in wifi_fw if expected.startswith("proc ") else expected in efuse_xtal_cap_body
+    for expected in [
+        "let efuseTxGainByte = cfg.efuseTxGainComp",
+        "bl808RfTxGainComp",
+        "bl808RfTempPowerComp = rfSignedByte(cfg.temperaturePowerComp)",
+    ]:
+        assert expected in efuse_tx_gain_body
+    for expected in [
+        "let efuseDfeTrimNibble = cfg.efuseDfeTrim",
+        "let dfe = rfDfeInitRegs()",
+        "addr dfe.dfeTrim824",
+    ]:
+        assert expected in efuse_dfe_trim_body
+    for expected in [
+        "rfPriApplyEfuseXtalCapTrim(cfg, txCorrRegHigh, txCorrRegLow)",
+        "rfPriApplyEfuseTxGainTrim(cfg)",
+        "rfPriApplyEfuseDfeTrim(cfg)",
+        "addr rf.txPowerComp704",
+        "addr rf.txPowerComp7ac",
+    ]:
+        assert expected in efuse_init_body
+    for vague_name in [
+        "let cap0",
+        "let cap1",
+        "let pwrByte",
+        "let dfeTrim",
+        "Remaining unknown:",
+    ]:
+        assert vague_name not in efuse_init_body
+    for expected in [
+        "addr rfDfeInitRegs().dfeTrim824",
+        "addr rf.calPathCtrl90",
+        "addr rf.rxMode220",
+        "addr rf.synthCtrl2c",
+        "addr rf.synthDfePathControl63c",
+        "writeRfPriStaticInit()",
+        "writeRfPriGainInit()",
+    ]:
+        assert expected in rf_pri_init_body
+    for expected in [
+        "librf_bl808.a:rf_pri.c.o rf_pri_full_cal+0x36..0x5e",
+        "librf_bl808.a:rf_pri.c.o rf_pri_txcal+0x316..0x52a",
+        "librf_bl808.a:rf_pri.c.o rf_pri_restore_cal_reg+0x10c..0x1a8",
+        "runRfPriRoscal",
+        "runRfPriRccal",
+        "preserve those RF[0x20] gates",
+        "Callback-driven",
+        "applying measured windows is default-off",
+        "RF70/RFA0/RFB4 remain",
+        "rf_pri_fixed_val_regs' WB03 branch",
+        "JTAG/UART traces show RF88/RFD0",
+    ]:
+        assert expected in rf_pri_init_body
+    for forbidden in [
+        "cast[ptr uint32](RfPriInitDfeReg824.uint)",
+        "cast[ptr uint32](RfPriInit90Reg.uint)",
+        "cast[ptr uint32](RfRxModeReg.uint)",
+        "cast[ptr uint32](RfSynthCtrlReg.uint)",
+        "cast[ptr uint32](RfPriInit163cReg.uint)",
+    ]:
+        assert forbidden not in rf_pri_init_body
 
     for expected in [
-        "RadioRegMaskInit(address: RfTxcalParamReg",
-        "keepMask: 0xFFFFF8FF'u32, setMask: 0x00000270'u32",
-        "RadioRegMaskInit(address: RfPriTxcalDfeReg",
-        "keepMask: 0xFFFF8FFF'u32, setMask: 0x00004000'u32",
-        "RfOptimizeReg = 0x200010D0'u32",
+            "doAssert offsetof(RfRegBlock, optimizeCtrlD0) == 0xD0",
         "proc nim_wifi_rf_stage_breakpoint*(tag: uint32)",
         "{.exportc, cdecl, noinline.}",
         "proc nim_wifi_rf_fixed_val_breakpoint*()",
@@ -6544,21 +8617,619 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
         "rf_pri_optimize+0x82..0x14e",
         "RfOptimizeWb03PllEdge0Mhz = 2452'u32",
         "RfOptimizeWb03PllEdge1Mhz = 2472'u32",
-        "rfRegUpdate(RfPriInitPll18Reg, 0x000001F0'u32, 0x00000020'u32)",
-        "rfRegUpdate(RfPriInitPll1cReg, 0x0007F001'u32, 0x00036100'u32)",
-        "rfRegUpdate(RfPriInitPll18Reg, 0x000000F0'u32, 0x00000140'u32)",
-        "rfRegUpdate(RfPriInitPll1cReg, 0x0007F100'u32, 0x0005A001'u32)",
         "bl808WifiRfWb03ForceAuthTxLatches* {.booldefine.}: bool = true",
         "bl808WifiRfWb03AuthTxPulseLatch* {.booldefine.}: bool = true",
         "rfPriApplyWb03AuthTxLatches()",
-        "rfRegWrite(RfPriTxcalDfeReg, RfPriWb03ScanRf88Seed)",
       ]:
         assert expected in wifi_fw
 
-    wb03_mac_active_body = wifi_fw.split(
-        "proc rfPriPrepareWb03MacActiveScanState() =",
-        1,
-    )[1].split("proc rfPriApplyWb03AuthTxLatches()", 1)[0]
+    for body in [wifi_pll_config_body, wb03_optimize_pll_body]:
+        assert "let pll = rfPllRegs()" in body
+        assert "RfPriInitPll18Reg" not in body
+        assert "RfPriInitPll1cReg" not in body
+        assert "RfPriInitPll28Reg" not in body
+        assert "RfPriInitPll2cReg" not in body
+    for expected in [
+        "addr pll.refdivCtrl14",
+        "addr pll.fractionalWord28",
+        "addr pll.modeCtrl2c",
+        "addr pll.loopFilter18",
+        "addr pll.fractionalCtrl1c",
+        "addr pll.pllReset10",
+        "addr pll.enableCtrl30",
+    ]:
+        assert expected in wifi_pll_config_body
+    for expected in [
+        "addr pll.loopFilter18",
+        "addr pll.fractionalCtrl1c",
+        "0x00000040'u32",
+        "0x0005A000'u32",
+    ]:
+        assert expected in wb03_optimize_pll_body
+
+    for expected in [
+        "let rf = rfRegs()",
+        "addr rf.txcalDfe88",
+        "addr rf.acalCtrlA4",
+    ]:
+        assert expected in wb03_runtime_latches_body
+    assert "cast[ptr uint32](RfPriTxcalDfeReg.uint)" not in wb03_runtime_latches_body
+    assert "cast[ptr uint32](RfAcalCtrlReg.uint)" not in wb03_runtime_latches_body
+
+    for expected in [
+        "let rf = rfRegs()",
+        "addr rf.txcalTosdac600",
+        "RfPriWb03RxcalTosdacReplayMask",
+    ]:
+        assert expected in wb03_rxcal_tosdac_latch_body
+    for forbidden in [
+        "rfRegWrite(RfTxcalTosdacReg",
+        "rfRegRead(RfTxcalTosdacReg",
+    ]:
+        assert forbidden not in wb03_rxcal_tosdac_latch_body
+
+    for body in [
+        wb03_scan_latches_body,
+        wb03_rfc_entry_body,
+        wb03_scan_baseline_body,
+    ]:
+        assert "addr rf.scanSynthControl608" in body
+        assert "addr rf.txcalTosdac600" in body
+        assert "addr rf.measureCtrl618" in body
+        assert "addr rf.calPathConfig8c" in body
+        assert "0x20001608'u32" not in body
+        assert "rfRegWrite(RfTxcalTosdacReg" not in body
+        assert "rfRegWrite(RfMeasureCtrlReg" not in body
+        assert "rfRegWrite(RfPriInit8cReg" not in body
+        assert "addr rf.channelFcalConfigBc" in body
+        assert "rfRegWrite(RfPriConfigBcReg" not in body
+    for body in [wb03_scan_latches_body, wb03_scan_baseline_body]:
+        assert "addr rf.txcalDfe88" in body
+        assert "addr rf.channelCalStatusB4" in body
+        assert "rfRegWrite(RfPriTxcalDfeReg" not in body
+        assert "rfRegWrite(RfPriConfigB4Reg" not in body
+    assert "addr rf.fcalCtrlA0" in wb03_scan_latches_body
+    assert "addr rf.calMode14" in wb03_scan_latches_body
+    assert "addr rf.calCtrl1c" in wb03_scan_latches_body
+    assert "rfRegWrite(RfFcalCtrlReg" not in wb03_scan_latches_body
+    assert "RfCalModeReg" not in wb03_scan_latches_body
+    assert "RfCalCtrlReg" not in wb03_scan_latches_body
+    for body in [
+        rf70_search_body,
+        rf70_replay_body,
+        wb03_scan_latches_body,
+        wb03_mac_active_body,
+        wb03_auth_tx_latches_body,
+        prepare_txcal_body,
+        prepare_rxcal_body,
+    ]:
+        assert "addr rf.txcalParam70" in body
+        assert "rfRegRead(RfTxcalParamReg" not in body
+        assert "rfRegWrite(RfTxcalParamReg" not in body
+        assert "rfRegRead(RfPriInit70Reg" not in body
+        assert "rfRegWrite(RfPriInit70Reg" not in body
+
+    for body in [
+        wait_fcal_ready_body,
+        sample_fcal_body,
+        write_fcal_body,
+        write_acal_body,
+        prepare_lo_fcal_body,
+        choose_lo_fcal_body,
+        run_lo_fcal_body,
+        prepare_lo_acal_body,
+        run_lo_acal_body,
+        config_channel_cal_body,
+    ]:
+        assert "RfFcalReg" not in body
+        assert "RfFcalCtrlReg" not in body
+        assert "RfAcalCtrlReg" not in body
+        assert "RfCalResultReg" not in body
+        assert "RfSdm1Reg" not in body
+        assert "RfSdm2Reg" not in body
+    for body in [prepare_lo_fcal_body, run_lo_fcal_body,
+                 prepare_lo_acal_body, run_lo_acal_body]:
+        assert "addr rf.calMode14" in body
+    for body in [prepare_lo_fcal_body, choose_lo_fcal_body,
+                 config_channel_cal_body]:
+        assert "addr rf.sdmCtrlC0" in body
+    for body in [prepare_lo_fcal_body, run_lo_acal_body,
+                 config_channel_cal_body]:
+        assert "addr rf.sdmDivC4" in body
+    for body in [prepare_lo_fcal_body, prepare_lo_acal_body]:
+        for expected in [
+            "let rf = rfRegs()",
+            "addr rf.baseCtrl1",
+            "addr rf.synthCtrl2c",
+            "addr rf.priModeCtrl30",
+            "addr rf.calCtrl1c",
+        ]:
+            assert expected in body
+        for forbidden in [
+            "RfCtrlReg",
+            "RfSynthCtrlReg",
+            "RfPriModeCtrlReg",
+            "RfCalCtrlReg",
+        ]:
+            assert forbidden not in body
+    for expected in [
+        "addr rf.fcalAc",
+        "addr rf.calResultA8",
+    ]:
+        assert expected in sample_fcal_body
+    assert "addr rf.fcalAc" in wait_fcal_ready_body
+    assert "addr rf.fcalCtrlA0" in write_fcal_body
+    assert "addr rf.fcalCtrlA0" in write_acal_body
+    for expected in [
+        "addr rf.fcalCtrlA0",
+        "addr rf.channelFcalConfigBc",
+        "addr rf.txcalCtrlB8",
+        "addr rf.channelCalStrobeB0",
+        "addr rf.channelCalStatusB4",
+    ]:
+        assert expected in config_channel_cal_body
+    for forbidden in [
+        "RfTxcalCtrlReg",
+        "RfPriConfigB0Reg",
+        "RfPriConfigB4Reg",
+        "RfPriConfigBcReg",
+    ]:
+        assert forbidden not in config_channel_cal_body
+    for expected in [
+        "addr rf.scanRxLatch4c",
+        "addr rf.scanTxMeasureControl62c",
+    ]:
+        assert expected in wb03_scan_latches_body
+
+    for body in [wb03_mac_active_body, wb03_auth_tx_latches_body]:
+        assert "let rf = rfRegs()" in body
+        assert "addr rf.txcalTosdac600" in body
+        assert "addr rf.scanTxMeasureControl62c" in body
+        assert "addr rf.fcalCtrlA0" in body
+        assert "addr rf.roscalCtrl7c" in body
+        assert "rfRegWrite(RfTxcalTosdacReg" not in body
+        assert "rfRegWrite(RfFcalCtrlReg" not in body
+        assert "rfRegWrite(RfRoscalCtrlReg" not in body
+    assert "addr rf.txcalDfe88" in wb03_auth_tx_latches_body
+    assert "rfRegWrite(RfPriTxcalDfeReg" not in wb03_auth_tx_latches_body
+    assert "addr rf.calPathConfig8c" in wb03_auth_tx_capture_body
+    assert "rfRegRead(RfPriInit8cReg" not in wb03_auth_tx_capture_body
+    assert "addr rf.txcalDc6c" in wb03_mac_active_body
+    assert "rfRegWrite(RfPriInit6cReg" not in wb03_mac_active_body
+    assert "addr rf.calMode14" in wb03_mac_active_body
+    assert "addr rf.calCtrl1c" in wb03_mac_active_body
+    assert "RfCalModeReg" not in wb03_mac_active_body
+    assert "RfCalCtrlReg" not in wb03_mac_active_body
+    for expected in [
+        "let rf = rfRegs()",
+        "addr rf.channelCalStrobeB0",
+        "addr rf.channelCalStatusB4",
+        "addr rf.txcalCtrlB8",
+    ]:
+        assert expected in wb03_rfc_wait_body
+    for forbidden in [
+        "rfRegRead(RfPriConfigB4Reg",
+        "rfRegOr(RfPriConfigB0Reg",
+        "rfRegClear(RfPriConfigB0Reg",
+        "RfTxcalCtrlReg",
+    ]:
+        assert forbidden not in wb03_rfc_wait_body
+
+    for body in [prepare_txcal_body, prepare_bz_txcal_body, prepare_rxcal_body]:
+        assert "let rf = rfRegs()" in body
+        assert "addr rf.calDfeGate23c" in body
+        assert "0x2000123C'u32" not in body
+        for expected in [
+            "addr rf.baseCtrl1",
+            "addr rf.synthCtrl2c",
+            "addr rf.priModeCtrl30",
+        ]:
+            assert expected in body
+        for forbidden in [
+            "RfCtrlReg",
+            "RfSynthCtrlReg",
+            "RfPriModeCtrlReg",
+        ]:
+            assert forbidden not in body
+    for body in [start_tx_dfe_body, start_rx_dfe_body]:
+        assert "addr rf" in body
+        assert "addr rf.rxMode220" in body
+        assert "RfRxModeReg" not in body
+        assert "rfRegClear(RfRxModeReg" not in body
+        assert "rfRegWrite(RfRxModeReg" not in body
+        assert "rfRegRead(RfRxModeReg" not in body
+    for body in [prepare_txcal_body, prepare_bz_txcal_body]:
+        for expected in [
+            "addr rf.txcalDfe88",
+            "addr rf.calCtrl1c",
+            "addr rf.calSingenCtrl20c",
+            "addr rf.calSingenAmpLo214",
+            "addr rf.calSingenAmpHi218",
+            "addr rf.rccalTone48",
+            "addr rf.txcalGain64",
+            "addr rf.txcalBias58",
+        ]:
+            assert expected in body
+        for forbidden in [
+            "rfRegOr(RfPriTxcalDfeReg, 0x80000000'u32)",
+            "rfRegWrite(RfPriRccalSingenReg0",
+            "rfRegWrite(RfPriRccalSingenReg1",
+            "rfRegWrite(RfPriRccalSingenReg2",
+            "rfRegClear(RfPriRccalSingenReg0",
+            "rfRegOr(RfPriRccalSingenReg0",
+            "rfRegWrite(RfPriRccalToneReg",
+            "rfRegOr(RfPriInit64Reg",
+            "rfRegWrite(RfPriInit64Reg",
+            "rfRegRead(RfPriInit64Reg",
+            "rfRegWrite(RfPriInit58Reg",
+            "rfRegRead(RfPriInit58Reg",
+            "RfCalCtrlReg",
+        ]:
+            assert forbidden not in body
+    assert "addr rf.txcalDc6c" in prepare_txcal_body
+    assert "addr rf.txcalGain68" in prepare_txcal_body
+    assert "rfRegWrite(RfPriTxcalDcReg" not in prepare_txcal_body
+    assert "rfRegRead(RfPriTxcalDcReg" not in prepare_txcal_body
+    assert "rfRegWrite(RfPriInit68Reg" not in prepare_txcal_body
+    assert "rfRegRead(RfPriInit68Reg" not in prepare_txcal_body
+    assert "addr rf.calPathConfig8c" in prepare_bz_txcal_body
+    assert "rfRegWrite(RfPriInit8cReg" not in prepare_bz_txcal_body
+    assert "rfRegRead(RfPriInit8cReg" not in prepare_bz_txcal_body
+    assert "addr rf.txcalGain64" in run_bz_txcal_body
+    assert "rfRegWrite(RfPriInit64Reg" not in run_bz_txcal_body
+    assert "rfRegRead(RfPriInit64Reg" not in run_bz_txcal_body
+    assert "addr rf.measureMode61c" in prepare_txcal_body
+    assert "rfRegWrite(RfMeasureModeReg" not in prepare_txcal_body
+    for body in [run_txcal_body, run_bz_txcal_body, run_rxcal_body]:
+        assert "let rf = rfRegs()" in body
+        assert "addr rf.calMode14" in body
+        assert "RfCalModeReg" not in body
+    assert "addr rf.calCtrl1c" in run_bz_txcal_body
+    assert "RfCalCtrlReg" not in run_bz_txcal_body
+
+    for expected in [
+        "let rf = rfRegs()",
+        "addr rf.baseCtrl1",
+        "addr rf.synthCtrl2c",
+        "addr rf.priModeCtrl30",
+        "addr rf.calCtrl1c",
+        "addr rf.rxMode220",
+        "addr rf.rccalTone48",
+        "addr rf.roscalCtrl7c",
+    ]:
+        assert expected in prepare_roscal_body
+    for forbidden in [
+        "rfRegClear(RfRxModeReg",
+        "rfRegWrite(RfRxModeReg",
+        "RfCtrlReg",
+        "RfSynthCtrlReg",
+        "RfPriModeCtrlReg",
+        "RfCalCtrlReg",
+        "rfRegWrite(RfPriRccalToneReg",
+        "rfRegClear(RfRoscalCtrlReg",
+    ]:
+        assert forbidden not in prepare_roscal_body
+    for expected in [
+        "let rf = rfRegs()",
+        "addr rf.roscalCal0",
+        "addr rf.roscalCal1",
+    ]:
+        assert expected in apply_roscal_body
+    for forbidden in ["RfRoscalReg0", "RfRoscalReg1"]:
+        assert forbidden not in apply_roscal_body
+    assert "let rf = rfRegs()" in write_roscal_candidate_body
+    assert "addr rf.roscalCtrl7c" in write_roscal_candidate_body
+    assert "RfRoscalCtrlReg" not in write_roscal_candidate_body
+    assert "rfRegUpdate(RfRoscalCtrlReg" not in write_roscal_candidate_body
+    for expected in [
+        "let rf = rfRegs()",
+        "addr rf.capability20",
+        "addr rf.calMode14",
+        "RfRoscalCapabilityMask",
+        "RfRoscalModeMask",
+    ]:
+        assert expected in run_roscal_body
+    for forbidden in ["RfCapabilityReg", "RfCalModeReg"]:
+        assert forbidden not in run_roscal_body
+    for body in [
+        wait_roscal_measure_body,
+        wait_rccal_measure_body,
+        wait_txcal_measure_body,
+    ]:
+        assert "let rf = rfRegs()" in body
+        assert "addr rf.measureCtrl618" in body
+        assert "rfRegRead(RfMeasureCtrlReg" not in body
+    for expected in [
+        "let rf = rfRegs()",
+        "addr rf.measureCtrl618",
+        "addr rf.measureMode61c",
+        "addr rf.measureI620",
+        "addr rf.measureQ624",
+    ]:
+        assert expected in sample_roscal_measure_body
+    for forbidden in [
+        "rfRegClear(RfMeasureCtrlReg",
+        "rfRegOr(RfMeasureCtrlReg",
+        "rfRegWrite(RfMeasureModeReg",
+        "rfRegRead(RfMeasureModeReg",
+        "RfMeasureIReg",
+        "RfMeasureQReg",
+    ]:
+        assert forbidden not in sample_roscal_measure_body
+
+    for body in [prepare_rccal_body, prepare_rccal_tone_body]:
+        assert "let rf = rfRegs()" in body
+        for expected in [
+            "addr rf.rccalTone48",
+            "addr rf.calSingenCtrl20c",
+            "addr rf.calSingenAmpLo214",
+            "addr rf.calSingenAmpHi218",
+            "addr rf.measureCtrl618",
+        ]:
+            assert expected in body
+        for forbidden in [
+            "rfRegWrite(RfPriRccalToneReg",
+            "rfRegWrite(RfPriRccalSingenReg0",
+            "rfRegWrite(RfPriRccalSingenReg1",
+            "rfRegWrite(RfPriRccalSingenReg2",
+            "rfRegClear(RfPriRccalSingenReg0",
+            "rfRegOr(RfPriRccalSingenReg0",
+        ]:
+            assert forbidden not in body
+    for expected in [
+        "addr rf.baseCtrl1",
+        "addr rf.synthCtrl2c",
+        "addr rf.priModeCtrl30",
+        "addr rf.calCtrl1c",
+    ]:
+        assert expected in prepare_rccal_body
+    for forbidden in [
+        "RfCtrlReg",
+        "RfSynthCtrlReg",
+        "RfPriModeCtrlReg",
+        "RfCalCtrlReg",
+    ]:
+        assert forbidden not in prepare_rccal_body
+    for body in [write_rccal_body, write_rccal_search_body]:
+        assert "let rf = rfRegs()" in body
+        assert "addr rf.rbbRccalCtrl80" in body
+        assert "RfRbbRccalReg" not in body
+    for expected in [
+        "let rf = rfRegs()",
+        "addr rf.capability20",
+        "addr rf.calMode14",
+        "RfRccalCapabilityMask",
+        "RfRccalModeMask",
+        "RfRccalFailMode",
+    ]:
+        assert expected in run_rccal_body
+    for forbidden in ["RfCapabilityReg", "RfCalModeReg"]:
+        assert forbidden not in run_rccal_body
+    for expected in [
+        "addr rf.calMeasurePrep60c",
+        "addr rf.measureMode61c",
+    ]:
+        assert expected in prepare_rccal_body
+    for forbidden in [
+        "rfRegClear(RfPriRccalMeasurePrepReg",
+        "rfRegOr(RfPriRccalMeasurePrepReg",
+        "rfRegWrite(RfMeasureCtrlReg",
+        "rfRegClear(RfMeasureCtrlReg",
+        "rfRegWrite(RfMeasureModeReg",
+    ]:
+        assert forbidden not in prepare_rccal_body
+
+    for body in [
+        sample_rccal_power_body,
+        prime_rccal_measure_body,
+        txcal_average_body,
+        txcal_adc_mean_body,
+        txcal_power_body,
+    ]:
+        assert "let rf = rfRegs()" in body
+        assert "addr rf.measureCtrl618" in body
+        for forbidden in [
+            "rfRegClear(RfMeasureCtrlReg",
+            "rfRegOr(RfMeasureCtrlReg",
+            "rfRegWrite(RfMeasureCtrlReg",
+            "rfRegRead(RfMeasureCtrlReg",
+        ]:
+            assert forbidden not in body
+    for body in [sample_rccal_power_body, txcal_power_body]:
+        assert "addr rf.measureI620" in body
+        assert "addr rf.measureQ624" in body
+        assert "rfRegRead(RfMeasureIReg" not in body
+        assert "rfRegRead(RfMeasureQReg" not in body
+    for body in [prime_rccal_measure_body, txcal_average_body, txcal_adc_mean_body]:
+        assert "addr rf.measureMode61c" in body
+        assert "rfRegWrite(RfMeasureModeReg" not in body
+    for body in [txcal_average_body, txcal_adc_mean_body]:
+        assert "addr rf.measureI620" in body
+    for expected in [
+        "addr rf.calSingenAmpLo214",
+        "addr rf.calSingenAmpHi218",
+        "addr rf.calSingenCtrl20c",
+    ]:
+        assert expected in txcal_singen_amp_body
+    for forbidden in [
+        "rfRegUpdate(RfPriRccalSingenReg",
+        "rfRegClear(RfPriRccalSingenReg0",
+        "rfRegOr(RfPriRccalSingenReg0",
+    ]:
+        assert forbidden not in txcal_singen_amp_body
+    for expected in [
+        "let rf = rfRegs()",
+        "addr rf.txcalParam74",
+        "addr rf.txcalTosdac600",
+    ]:
+        assert expected in txcal_param_body
+    for forbidden in [
+        "rfRegUpdate(RfTxcalParam01Reg",
+        "rfRegWrite(RfTxcalTosdacReg",
+        "rfRegRead(RfTxcalTosdacReg",
+    ]:
+        assert forbidden not in txcal_param_body
+    for expected in [
+        "addr rf.calSingenCtrl20c",
+        "addr rf.calSingenAmpLo214",
+        "addr rf.calSingenAmpHi218",
+        "addr rf.rccalTone48",
+        "addr rf.calPathConfig8c",
+        "addr rf.txcalGain64",
+        "addr rf.txcalBias58",
+    ]:
+        assert expected in txcal_search_stage_body
+    for forbidden in [
+        "rfRegWrite(RfPriRccalSingenReg0",
+        "rfRegWrite(RfPriRccalSingenReg1",
+        "rfRegWrite(RfPriRccalSingenReg2",
+        "rfRegWrite(RfPriRccalToneReg",
+        "rfRegWrite(RfPriInit8cReg",
+        "rfRegRead(RfPriInit8cReg",
+        "rfRegWrite(RfPriInit64Reg",
+        "rfRegRead(RfPriInit64Reg",
+        "rfRegWrite(RfPriInit58Reg",
+        "rfRegRead(RfPriInit58Reg",
+    ]:
+        assert forbidden not in txcal_search_stage_body
+    for expected in [
+        "let rf = rfRegs()",
+        "addr rf.rccalTone48",
+        "addr rf.txcalDc6c",
+        "addr rf.txcalGain64",
+        "addr rf.txcalBias58",
+        "addr rf.txcalGain68",
+    ]:
+        assert expected in txcal_gain_body
+    for forbidden in [
+        "rfRegWrite(RfPriRccalToneReg",
+        "rfRegRead(RfPriRccalToneReg",
+        "rfRegWrite(RfPriTxcalDcReg",
+        "rfRegRead(RfPriTxcalDcReg",
+        "rfRegWrite(RfPriInit64Reg",
+        "rfRegRead(RfPriInit64Reg",
+        "rfRegWrite(RfPriInit58Reg",
+        "rfRegRead(RfPriInit58Reg",
+        "rfRegWrite(RfPriInit68Reg",
+        "rfRegRead(RfPriInit68Reg",
+    ]:
+        assert forbidden not in txcal_gain_body
+
+    assert "let rf = rfRegs()" in wait_rxcal_measure_body
+    assert "addr rf.measureCtrl618" in wait_rxcal_measure_body
+    assert "rfRegRead(RfMeasureCtrlReg" not in wait_rxcal_measure_body
+    assert "let rf = rfRegs()" in rxcal_param_body
+    assert "addr rf.rxcalSearch614" in rxcal_param_body
+    assert "rfRegRead(RfPriRxcalSearchReg" not in rxcal_param_body
+    assert "rfRegWrite(RfPriRxcalSearchReg" not in rxcal_param_body
+    for expected in [
+        "let rf = rfRegs()",
+        "addr rf.measureCtrl618",
+        "addr rf.measureI620",
+        "addr rf.measureQ624",
+    ]:
+        assert expected in rxcal_power_body
+    for forbidden in [
+        "rfRegWrite(RfMeasureCtrlReg",
+        "rfRegClear(RfMeasureCtrlReg",
+        "rfRegOr(RfMeasureCtrlReg",
+        "rfRegRead(RfMeasureIReg",
+        "rfRegRead(RfMeasureQReg",
+    ]:
+        assert forbidden not in rxcal_power_body
+    assert "let rf = rfRegs()" in store_rxcal_record_body
+    assert "addr rf.rxcalReplay[index]" in store_rxcal_record_body
+    for expected in [
+        "let rxcalParam2ReplayWord = packRfRxcalWord0(p2)",
+        "let rxcalParam3ReplayWord = packRfRxcalWord1(p3)",
+        "let rxcalRecordBaseWord = 18 + index * 2",
+        "rxcalParam2ReplayWord or rxcalParam3ReplayWord",
+    ]:
+        assert expected in store_rxcal_record_body
+    for vague_name in [
+        "let rxcalRecordWord0",
+        "let rxcalRecordWord1",
+        "let rxcalRecordBase =",
+    ]:
+        assert vague_name not in store_rxcal_record_body
+    assert "RfPriRxcalReg0" not in store_rxcal_record_body
+    assert "rfRegWrite(RfPriRxcalReg0" not in store_rxcal_record_body
+    assert "rfRegRead(RfPriRxcalReg0" not in store_rxcal_record_body
+
+    for expected in [
+        "addr rf.baseCtrl1",
+        "addr rf.synthCtrl2c",
+        "addr rf.priModeCtrl30",
+        "addr rf.channelFcalConfigBc",
+        "addr rf.txcalCtrlB8",
+        "addr rf.rxMode220",
+        "addr rf.calPathCtrl90",
+        "addr rf.txcalDfe88",
+        "addr rf.rxcalPrep60",
+        "addr rf.txcalGain64",
+        "addr rf.txcalBias58",
+        "addr rf.txcalGain68",
+        "addr rf.rccalTone48",
+        "addr rf.txcalTosdac600",
+        "addr rf.txcalParam74",
+        "addr rf.measureCtrl618",
+        "addr rf.measureMode61c",
+        "addr rf.rxcalSearch614",
+        "addr rf.calSingenCtrl20c",
+        "addr rf.calSingenAmpLo214",
+        "addr rf.calSingenAmpHi218",
+        "addr rf.calSingenMeasurePrep21c",
+        "proc wlCfgWb03RxcalReplayA8Word()",
+        "proc wlCfgWb03RxcalReplayAcWord()",
+        "let rxcalReplayA8Word = wlCfgWb03RxcalReplayA8Word()",
+        "let rxcalReplayAcWord = wlCfgWb03RxcalReplayAcWord()",
+    ]:
+        assert expected in wifi_fw if expected.startswith("proc ") else expected in prepare_rxcal_body
+    for forbidden in [
+        "0x200010BC'u32",
+        "0x20001088'u32",
+        "0x20001060'u32",
+        "0x2000120C'u32",
+        "0x20001214'u32",
+        "0x20001218'u32",
+        "0x2000121C'u32",
+        "rfRegWrite(RfPriRccalToneReg",
+        "RfCtrlReg",
+        "RfSynthCtrlReg",
+        "RfPriModeCtrlReg",
+        "RfTxcalCtrlReg",
+        "rfRegWrite(RfTxcalTosdacReg",
+        "rfRegWrite(RfTxcalParam01Reg",
+        "rfRegWrite(RfPriInit90Reg",
+        "rfRegRead(RfPriInit90Reg",
+        "rfRegOr(RfPriInit64Reg",
+        "rfRegWrite(RfPriInit64Reg",
+        "rfRegRead(RfPriInit64Reg",
+        "rfRegWrite(RfPriInit58Reg",
+        "rfRegRead(RfPriInit58Reg",
+        "rfRegWrite(RfPriInit68Reg",
+        "rfRegRead(RfPriInit68Reg",
+        "rfRegWrite(RfMeasureModeReg",
+        "rfRegWrite(RfMeasureCtrlReg",
+        "rfRegWrite(RfPriRxcalSearchReg",
+        "let cfgA8",
+        "let cfgAc",
+        "wlCfgU32(0xA8)",
+        "wlCfgU32(0xAC)",
+    ]:
+        assert forbidden not in prepare_rxcal_body
+    for expected in [
+        "let rf = rfRegs()",
+        "volatileStore(addr rf.rxcalSearch614, 0x00400000'u32)",
+        "volatileStore(addr rf.measureCtrl618, 0x80000000'u32)",
+    ]:
+        assert expected in run_rxcal_body
+    for forbidden in [
+        "rfRegWrite(RfPriRxcalSearchReg, 0x00400000'u32)",
+        "rfRegWrite(RfMeasureCtrlReg, 0x80000000'u32)",
+    ]:
+        assert forbidden not in run_rxcal_body
+
     for expected in [
         "let bba = bbaAgcRegs()",
         "addr bba.macActiveB340",
@@ -6597,23 +9268,47 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
         1,
     )[1].split("proc rfPriTracePhase", 1)[0]
     for expected in [
+        "let rf = rfRegs()",
+        "let env = phyEnvViewPtr()",
         "let mdm = wifiModemRegs()",
-        "readReg32(RfCtrlReg)",
-        "readReg32(RfPriTrace34Reg)",
-        "readReg32(RfPriTrace40Reg)",
-        "readReg32(RfPriTrace4cReg)",
-        "readReg32(RfOptimizeReg)",
-        "readReg32(RfRbbRccalReg)",
-        "readReg32(RfPriTrace84Reg)",
-        "readReg32(RfPriTrace162cReg)",
-        "readReg32(RfPriTrace1680Reg)",
-        "readReg32(RfPriTrace113cReg)",
-        "addr mdm.phyCtrl820",
-        "addr mdm.phyCtrl824",
-        "addr mdm.phyCtrl830",
-        "addr mdm.phyCtrl874",
+        "addr env.channelBandType",
+        "addr env.primaryFreq",
+        "addr env.centerFreq1",
+        "volatileLoad(addr rf.baseCtrl1)",
+        "addr rf.synthCtrl2c",
+        "addr rf.scanSynthLatch34",
+        "addr rf.scanSynthLatch40",
+        "addr rf.scanRxLatch4c",
+        "addr rf.txcalParam70",
+        "addr rf.txcalParam74",
+        "addr rf.txcalDfe88",
+        "addr rf.fcalCtrlA0",
+        "addr rf.acalCtrlA4",
+        "addr rf.channelFcalConfigBc",
+        "addr rf.optimizeCtrlD0",
+        "addr rf.rbbRccalCtrl80",
+        "addr rf.rccalReplay84",
+        "addr rf.calPathConfig8c",
+        "addr rf.calPathCtrl90",
+        "addr rf.channelCalStatusB4",
+        "addr rf.txcalTosdac600",
+        "addr rf.rxcalSearch614",
+        "addr rf.measureCtrl618",
+        "addr rf.scanTxMeasureControl62c",
+        "addr rf.notchCtrl680",
+        "addr rf.vcoPairTable13c[0]",
+        "addr mdm.bandwidth20MProfile820",
+        "addr mdm.channelTypeCtrl824",
+        "addr mdm.bandwidth20MProfile830",
+        "addr mdm.bandwidth20MGate874",
     ]:
         assert expected in rf_trace_body
+    for forbidden in [
+        "phyEnvWord(36'u)",
+        "phyEnvHalf(38'u)",
+        "phyEnvHalf(40'u)",
+    ]:
+        assert forbidden not in rf_trace_body
     for forbidden in [
         "WifiModemBase + 0x820'u",
         "WifiModemBase + 0x824'u",
@@ -6622,6 +9317,8 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
         "cast[ptr uint32](0x20001004'u)",
         "cast[ptr uint32](0x20001034'u)",
         "cast[ptr uint32](0x20001040'u)",
+        "addr rf.trace34",
+        "addr rf.trace40",
         "cast[ptr uint32](0x2000104C'u)",
         "cast[ptr uint32](0x200010D0'u)",
         "cast[ptr uint32](0x20001080'u)",
@@ -6629,6 +9326,22 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
         "cast[ptr uint32](0x2000162C'u)",
         "cast[ptr uint32](0x20001680'u)",
         "cast[ptr uint32](0x2000113C'u)",
+        "readReg32(RfCtrlReg)",
+        "readReg32(RfPriTrace34Reg)",
+        "readReg32(RfPriTrace40Reg)",
+        "readReg32(RfPriTrace4cReg)",
+        "readReg32(RfTxcalParam01Reg)",
+        "readReg32(RfPriTxcalDfeReg)",
+        "readReg32(RfOptimizeReg)",
+        "readReg32(RfPriTrace84Reg)",
+        "readReg32(RfPriInit8cReg)",
+        "readReg32(RfPriInit90Reg)",
+        "readReg32(RfTxcalTosdacReg)",
+        "readReg32(RfPriRxcalSearchReg)",
+        "readReg32(RfMeasureCtrlReg)",
+        "readReg32(RfPriTrace162cReg)",
+        "readReg32(RfPriTrace1680Reg)",
+        "readReg32(RfPriTrace113cReg)",
     ]:
         assert forbidden not in rf_trace_body
 
@@ -6645,6 +9358,12 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
         "mdw {sym:nimfw_dbg_rf_phy_trace_rf88} 64",
         "mdw {sym:nimfw_dbg_rf_phy_trace_rfd0} 64",
         "mdw {sym:nimfw_dbg_rf_phy_trace_device} 64",
+        "mdw {sym:nimfw_dbg_phy_init_count} 1",
+        "mdw {sym:nimfw_dbg_phy_init_phase} 1",
+        "mdw {sym:nimfw_dbg_phy_agc_copy_count} 1",
+        "mdw {sym:nimfw_dbg_phy_agc_dest_first} 1",
+        "mdw {sym:nimfw_dbg_phy_agc_dest_last} 1",
+        "mdw {sym:nimfw_dbg_phy_wifi_ldpc_absent} 1",
         "mdw {sym:nim_wifi_rf_stage_rf70_log} 8",
         "mdw {sym:nim_wifi_rf_stage_rf88_log} 8",
         "mdw {sym:nim_wifi_rf_stage_rfd0_log} 8",
@@ -6663,6 +9382,24 @@ def test_wifi_rx_tx_dhcp_path_uses_typed_overlays():
     wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
     wifi_tx = (ROOT / "src/bl808/wifi_tx.nim").read_text()
     lwip_smoke = (ROOT / "examples/m0_wifi_lwip_smoke.nim").read_text()
+    e2e_runner = (ROOT / "src/bl808/kernel/e2e_runner.nim").read_text()
+    assert "stopAfterSuccess = false" in e2e_runner
+    assert "if stopAfterSuccess:\n        break" in e2e_runner
+    assert (
+        "e2eRun(AttemptsTotal, runOneAttempt, deinitForRetry, "
+        "stopAfterSuccess = true)"
+    ) in lwip_smoke
+    assert "proc runIcmpEcho(targetAddress: uint32; requiredReply: bool)" in lwip_smoke
+    assert "GatewayIcmpAttempts {.intdefine.} = 3" in lwip_smoke
+    assert "var gatewayIcmpOk = false" in lwip_smoke
+    assert "for _ in 0 ..< GatewayIcmpAttempts:" in lwip_smoke
+    assert "gatewayIcmpOk = true" in lwip_smoke
+    assert "let targetIcmpOk = runIcmpEcho(IcmpTargetAddress, false)" in lwip_smoke
+    assert "return gatewayIcmpOk or targetIcmpOk" in lwip_smoke
+    assert 'kvWrite("type", nimfw_dbg_icmp_cb_type_code)' in lwip_smoke
+    assert "if not gatewayIcmpOk:\n    return false" not in lwip_smoke
+    assert "discard runIcmpEcho(IcmpTargetAddress, false)" not in lwip_smoke
+    assert 'kvWrite("required", uint32(requiredReply))' in lwip_smoke
 
     rx_body = wifi_fw.rsplit("proc rxu_cntrl_frame_handle*", 1)[1].split(
         "proc rxu_swdesc_upload_evt*", 1
@@ -6866,7 +9603,7 @@ def test_wifi_tcpip_input_converts_80211_mpdu_for_lwip():
         "(flags and RxFlagIs80211Mpdu) != 0'u32 and msduOffset == 0'u32",
         "let usedMpduInput = (flags and RxFlagIs80211Mpdu) != 0'u32 and msduOffset == 0'u32",
         "if msduOffset >= 14'u32: msduOffset - 14'u32",
-        "allocFramePbuf(ethOffset, pkt)",
+        "allocFramePbuf(resolvedOffset, pkt)",
         'exportc: "nimfw_dbg_tcpip_input_mpdu_conv"',
         'exportc: "nimfw_dbg_tcpip_input_mpdu_fail"',
         'exportc: "nimfw_dbg_tcpip_input_mpdu_fail_detail_lo"',
@@ -6880,7 +9617,7 @@ def test_wifi_tcpip_input_converts_80211_mpdu_for_lwip():
         'exportc: "nimfw_dbg_tcpip_input_frame_src0"',
         'exportc: "nimfw_dbg_tcpip_input_frame_pbuf0"',
         'exportc: "nimfw_dbg_tcpip_input_frame_ethertype"',
-        "nimFwDbgTcpipInputFrameLast0 = ethOffset or (msduOffset shl 16)",
+        "nimFwDbgTcpipInputFrameLast0 = resolvedOffset or (msduOffset shl 16)",
         "nimFwDbgTcpipInputFrameSrc0 = loadLe32Bytes(firstPayload, 0)",
         "nimFwDbgTcpipInputFramePbuf0 = loadLe32Bytes(eth, 0)",
         "nimFwDbgTcpipInputFrameEthType = etherType.uint32 or (p.len.uint32 shl 16)",
@@ -6901,6 +9638,12 @@ def test_wifi_tcpip_input_converts_80211_mpdu_for_lwip():
 
     smoke = (ROOT / "examples/m0_wifi_lwip_smoke.nim").read_text()
     lwipopts = (ROOT / "src/bl808/kernel/lwip_wifi_smoke/lwipopts.h").read_text()
+    for expected in [
+        "#define LWIP_HOOK_DHCP_APPEND_OPTIONS",
+        "(msg)->flags = PP_HTONS(0x8000U)",
+        "(msg_type) == DHCP_DISCOVER || (msg_type) == DHCP_REQUEST",
+    ]:
+        assert expected in lwipopts
     for expected in [
         "var nimfw_dbg_tcpip_input_frame_last0 {.importc.}: uint32",
         "var nimfw_dbg_tcpip_input_frame_src0 {.importc.}: uint32",
@@ -8133,7 +10876,7 @@ def test_wifi_mm_state_handlers_use_vif_overlays():
     for expected in [
         "let vif = vifChannelForIdx(vifIdx)",
         "let staIdx = vif.staIdx",
-        "let flags1496 = vifKeyPointers(vif).flags",
+        "let keyPointerFlags = vifKeyPointers(vif).flags",
         "let sec = vifSecurity(vif)",
     ]:
         assert expected in vif_state_body
@@ -10561,6 +13304,42 @@ def test_wifi_rx_mgt_copy_uses_typed_cursor_and_word_overlay():
         "cast[ptr uint32](copySrc + 8)[]",
     ]:
         assert forbidden not in body
+
+
+def test_wifi_mm_rx_upload_flags_are_named_by_effect():
+    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    hw_info_body = wifi_fw.rsplit("proc mm_hw_info_set*", 1)[1].split(
+        "proc mm_hw_ap_info_set*", 1
+    )[0]
+    hw_ap_body = wifi_fw.rsplit("proc mm_hw_ap_info_set*", 1)[1].split(
+        "proc mm_hw_ap_info_reset*", 1
+    )[0]
+    mgt_body = wifi_fw.rsplit("proc rxu_mgt_frame_check*", 1)[1].split(
+        "# ###########################################################################\n#                  SCAN TASK",
+        1,
+    )[0]
+
+    for expected in [
+        "rxPromiscUploadFlag*: uint32",
+        "apPromiscUploadFlag*: uint32",
+        "doAssert offsetof(MmEnvView, rxPromiscUploadFlag) == 44",
+        "doAssert offsetof(MmEnvView, apPromiscUploadFlag) == 48",
+        "if mm.rxPromiscUploadFlag != 0:",
+        "if mm.apPromiscUploadFlag != 0:",
+    ]:
+        assert expected in wifi_fw
+
+    assert "if mm.rxPromiscUploadFlag != 0:" in hw_info_body
+    assert "if mm.apPromiscUploadFlag != 0:" in hw_ap_body
+    assert "(mm.rxPromiscUploadFlag or mm.apPromiscUploadFlag) != 0" in mgt_body
+
+    for forbidden in [
+        "uploadWord44",
+        "mm.word48",
+        "offsetof(MmEnvView, word48)",
+        "staPromiscUploadFlag",
+    ]:
+        assert forbidden not in wifi_fw
 
 
 def test_wifi_set_active_confirm_handlers_use_state_predicates():

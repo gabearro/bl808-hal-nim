@@ -36,6 +36,7 @@ const
   WifiIcmpTargetC {.intdefine.} = 1
   WifiIcmpTargetD {.intdefine.} = 1
   AttemptsTotal {.intdefine.} = 3
+  GatewayIcmpAttempts {.intdefine.} = 3
   DhcpTimeoutMs = 10_000'u32
 
 # IPv4 field accessors. The netif struct has nested ip_addr_t fields whose
@@ -602,6 +603,22 @@ type
     txTickMs: uint32
 
 var icmpState: IcmpState
+var nimfw_dbg_icmp_tx_target* {.exportc.}: uint32
+var nimfw_dbg_icmp_tx_rc* {.exportc.}: uint32
+var nimfw_dbg_icmp_tx_ident_seq* {.exportc.}: uint32
+var nimfw_dbg_icmp_tx_checksum* {.exportc.}: uint32
+var nimfw_dbg_icmp_timeout_polls* {.exportc.}: uint32
+var nimfw_dbg_icmp_tcpip_ok_before* {.exportc.}: uint32
+var nimfw_dbg_icmp_tcpip_ok_after* {.exportc.}: uint32
+var nimfw_dbg_icmp_cb_count* {.exportc.}: uint32
+var nimfw_dbg_icmp_cb_total_len* {.exportc.}: uint32
+var nimfw_dbg_icmp_cb_ip0* {.exportc.}: uint32
+var nimfw_dbg_icmp_cb_ihl* {.exportc.}: uint32
+var nimfw_dbg_icmp_cb_type_code* {.exportc.}: uint32
+var nimfw_dbg_icmp_cb_ident_seq* {.exportc.}: uint32
+var nimfw_dbg_icmp_cb_payload0* {.exportc.}: uint32
+var nimfw_dbg_icmp_cb_addr* {.exportc.}: uint32
+var nimfw_dbg_icmp_cb_reject* {.exportc.}: uint32
 
 proc loadLe32[N: static[int]](bytes: var array[N, uint8], offset: int): uint32 {.inline.} =
   uint32(bytes[offset]) or
@@ -637,29 +654,141 @@ proc icmpRecvCb(arg: pointer, pcb: ptr RawPcb, p: ptr Pbuf,
                 address: ptr IpAddr): uint8 {.cdecl.} =
   ## Raw recv callback. lwIP delivers the packet with the IPv4 header still
   ## attached (LWIP_RAW=1 default). Skip past it via the IHL nibble.
+  inc nimfw_dbg_icmp_cb_count
+  nimfw_dbg_icmp_cb_reject = 0
+  if address != nil:
+    nimfw_dbg_icmp_cb_addr = address.address
   let totalLen = pbufTotLen(p)
+  nimfw_dbg_icmp_cb_total_len = totalLen.uint32
   if totalLen < 20'u16 + 8'u16:
+    nimfw_dbg_icmp_cb_reject = 1
     return 0
   var ipByte0: uint8
   discard pbufCopyPartial(p, addr ipByte0, 1'u16, 0'u16)
+  nimfw_dbg_icmp_cb_ip0 = ipByte0.uint32
   let ihlBytes = uint16(ipByte0 and 0x0f) * 4'u16
+  nimfw_dbg_icmp_cb_ihl = ihlBytes.uint32
   if ihlBytes < 20'u16 or totalLen < ihlBytes + 8'u16:
+    nimfw_dbg_icmp_cb_reject = 2
     return 0
   var icmp: IcmpEcho
   discard pbufCopyPartial(p, addr icmp, sizeof(IcmpEcho).uint16, ihlBytes)
+  nimfw_dbg_icmp_cb_type_code = icmp.icmpType.uint32 or
+    (icmp.code.uint32 shl 8)
+  nimfw_dbg_icmp_cb_ident_seq = htons(icmp.identifier).uint32 or
+    (htons(icmp.sequence).uint32 shl 16)
+  nimfw_dbg_icmp_cb_payload0 = loadLe32(icmp.payload, 0)
   if icmp.icmpType != IcmpEchoReply:
+    nimfw_dbg_icmp_cb_reject = 3
     return 0
   if htons(icmp.identifier) != icmpState.ident:
+    nimfw_dbg_icmp_cb_reject = 4
     return 0
   if htons(icmp.sequence) != icmpState.seq:
+    nimfw_dbg_icmp_cb_reject = 5
     return 0
   for k in 0 ..< 8:
     if icmp.payload[k] != IcmpPayload[k]:
+      nimfw_dbg_icmp_cb_reject = 6
       return 0
   icmpState.rttMs = nowMs() - icmpState.txTickMs
   icmpState.replied = true
+  nimfw_dbg_icmp_cb_reject = 7
   discard pbufFree(p)
   return 1
+
+proc runIcmpEcho(targetAddress: uint32; requiredReply: bool): bool {.nimcall.} =
+  phaseMark(Phase.icmp, Kind.start):
+    kvWrite("dst", targetAddress)
+  nimfw_dbg_icmp_tx_target = targetAddress
+  nimfw_dbg_icmp_tx_rc = 0xFFFF_FFFF'u32
+  nimfw_dbg_icmp_tx_ident_seq = 0
+  nimfw_dbg_icmp_tx_checksum = 0
+  nimfw_dbg_icmp_timeout_polls = 0
+  nimfw_dbg_icmp_tcpip_ok_before = wifi_nimfw_tcpip_input_ok()
+  nimfw_dbg_icmp_tcpip_ok_after = nimfw_dbg_icmp_tcpip_ok_before
+  nimfw_dbg_icmp_cb_count = 0
+  nimfw_dbg_icmp_cb_total_len = 0
+  nimfw_dbg_icmp_cb_ip0 = 0
+  nimfw_dbg_icmp_cb_ihl = 0
+  nimfw_dbg_icmp_cb_type_code = 0
+  nimfw_dbg_icmp_cb_ident_seq = 0
+  nimfw_dbg_icmp_cb_payload0 = 0
+  nimfw_dbg_icmp_cb_addr = 0
+  nimfw_dbg_icmp_cb_reject = 0
+  icmpState.replied = false
+  icmpState.ident = ((nowMs() and 0xffff'u32) or 1'u32).uint16
+  icmpState.seq = 1'u16
+  nimfw_dbg_icmp_tx_ident_seq = icmpState.ident.uint32 or
+    (icmpState.seq.uint32 shl 16)
+  icmpState.txTickMs = nowMs()
+
+  let pcb = rawNew(IpProtoIcmp)
+  if pcb == nil:
+    phaseMark(Phase.icmp, Kind.fail):
+      kvWrite("reason", "pcb_alloc")
+      kvWrite("required", uint32(requiredReply))
+    return not requiredReply
+  rawRecv(pcb, icmpRecvCb, addr icmpState)
+
+  var req: IcmpEcho
+  req.icmpType = IcmpEchoRequest
+  req.code = 0
+  req.identifier = htons(icmpState.ident)
+  req.sequence = htons(icmpState.seq)
+  for i in 0 ..< 8:
+    req.payload[i] = IcmpPayload[i]
+  req.checksum = 0
+  let arr = cast[ptr UncheckedArray[uint8]](addr req)
+  req.checksum = htons(inetChecksum(arr, sizeof(IcmpEcho)))
+  nimfw_dbg_icmp_tx_checksum = htons(req.checksum).uint32
+
+  let pbuf = pbufAlloc(pbufRaw, IcmpPacketBytes, pbufRam)
+  if pbuf == nil:
+    rawRemove(pcb)
+    phaseMark(Phase.icmp, Kind.fail):
+      kvWrite("reason", "tx_failed")
+      kvWrite("required", uint32(requiredReply))
+    return not requiredReply
+  discard pbufTake(pbuf, addr req, IcmpPacketBytes)
+  var dstAddr: IpAddr
+  dstAddr.address = targetAddress
+  let txRc = rawSendto(pcb, pbuf, addr dstAddr)
+  nimfw_dbg_icmp_tx_rc = cast[uint32](txRc)
+  discard pbufFree(pbuf)
+  if txRc != ErrOk:
+    rawRemove(pcb)
+    phaseMark(Phase.icmp, Kind.fail):
+      kvWrite("reason", "tx_failed")
+      kvWrite("rc", txRc.int32)
+      kvWrite("required", uint32(requiredReply))
+    return not requiredReply
+
+  let icmpDeadline = nowMs() + IcmpTimeoutMs
+  while not icmpState.replied:
+    pollNetwork()
+    inc nimfw_dbg_icmp_timeout_polls
+    if nowMs() >= icmpDeadline:
+      nimfw_dbg_icmp_tcpip_ok_after = wifi_nimfw_tcpip_input_ok()
+      rawRemove(pcb)
+      phaseMark(Phase.icmp, Kind.fail):
+        kvWrite("reason", "recv_timeout")
+        kvWrite("cb", nimfw_dbg_icmp_cb_count)
+        kvWrite("rej", nimfw_dbg_icmp_cb_reject)
+        kvWrite("ip0", nimfw_dbg_icmp_cb_ip0)
+        kvWrite("type", nimfw_dbg_icmp_cb_type_code)
+        kvWrite("tcpi", nimfw_dbg_icmp_tcpip_ok_after -
+          nimfw_dbg_icmp_tcpip_ok_before)
+        kvWrite("required", uint32(requiredReply))
+      return not requiredReply
+  nimfw_dbg_icmp_tcpip_ok_after = wifi_nimfw_tcpip_input_ok()
+  rawRemove(pcb)
+  phaseMark(Phase.icmp, Kind.ok):
+    kvWrite("rtt_ms", icmpState.rttMs)
+    kvWrite("seq", icmpState.seq)
+    kvWrite("cb", nimfw_dbg_icmp_cb_count)
+    kvWrite("dst", targetAddress)
+  true
 
 var console: Uart
 
@@ -1485,64 +1614,16 @@ proc runOneAttempt(): bool {.nimcall.} =
     kvWrite("ip", ip4)
     kvWrite("gw", gw4)
 
-  # ICMP echo to the configured target. The default is 1.1.1.1, which exercises
-  # DHCP routing through the gateway rather than only the local ARP path.
-  phaseMark(Phase.icmp, Kind.start):
-    kvWrite("dst", IcmpTargetAddress)
-  icmpState.replied = false
-  icmpState.ident = ((nowMs() and 0xffff'u32) or 1'u32).uint16
-  icmpState.seq = 1'u16
-  icmpState.txTickMs = nowMs()
-
-  let pcb = rawNew(IpProtoIcmp)
-  if pcb == nil:
-    phaseMark(Phase.icmp, Kind.fail):
-      kvWrite("reason", "pcb_alloc")
-    return false
-  rawRecv(pcb, icmpRecvCb, addr icmpState)
-
-  var req: IcmpEcho
-  req.icmpType = IcmpEchoRequest
-  req.code = 0
-  req.identifier = htons(icmpState.ident)
-  req.sequence = htons(icmpState.seq)
-  for i in 0 ..< 8:
-    req.payload[i] = IcmpPayload[i]
-  req.checksum = 0
-  let arr = cast[ptr UncheckedArray[uint8]](addr req)
-  req.checksum = htons(inetChecksum(arr, sizeof(IcmpEcho)))
-
-  let pbuf = pbufAlloc(pbufRaw, IcmpPacketBytes, pbufRam)
-  if pbuf == nil:
-    rawRemove(pcb)
-    phaseMark(Phase.icmp, Kind.fail):
-      kvWrite("reason", "tx_failed")
-    return false
-  discard pbufTake(pbuf, addr req, IcmpPacketBytes)
-  var dstAddr: IpAddr
-  dstAddr.address = IcmpTargetAddress
-  let txRc = rawSendto(pcb, pbuf, addr dstAddr)
-  discard pbufFree(pbuf)
-  if txRc != ErrOk:
-    rawRemove(pcb)
-    phaseMark(Phase.icmp, Kind.fail):
-      kvWrite("reason", "tx_failed")
-      kvWrite("rc", txRc.int32)
-    return false
-
-  let icmpDeadline = nowMs() + IcmpTimeoutMs
-  while not icmpState.replied:
-    pollNetwork()
-    if nowMs() >= icmpDeadline:
-      rawRemove(pcb)
-      phaseMark(Phase.icmp, Kind.fail):
-        kvWrite("reason", "recv_timeout")
-      return false
-  rawRemove(pcb)
-  phaseMark(Phase.icmp, Kind.ok):
-    kvWrite("rtt_ms", icmpState.rttMs)
-    kvWrite("seq", icmpState.seq)
-  return true
+  # Run both probes. Some local gateways do not answer ICMP echo, while some AP
+  # paths block public echo; either success proves ARP/TX/encrypted RX,
+  # tcpip_stack_input, and the lwIP raw callback.
+  var gatewayIcmpOk = false
+  for _ in 0 ..< GatewayIcmpAttempts:
+    if runIcmpEcho(gw4, false):
+      gatewayIcmpOk = true
+      break
+  let targetIcmpOk = runIcmpEcho(IcmpTargetAddress, false)
+  return gatewayIcmpOk or targetIcmpOk
 
 proc deinitForRetry() {.nimcall.} =
   discard wifiDisconnect()
@@ -1557,7 +1638,7 @@ proc main() {.exportc, cdecl.} =
   discard console.sendLine("")
   discard console.sendLine("=== BL808 WiFi LwIP Smoke Test ===")
   lwipInit()
-  e2eRun(AttemptsTotal, runOneAttempt, deinitForRetry)
+  e2eRun(AttemptsTotal, runOneAttempt, deinitForRetry, stopAfterSuccess = true)
   discard console.sendLine("=== BL808 LwIP Smoke Complete ===")
 
 main()

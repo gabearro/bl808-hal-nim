@@ -22,6 +22,66 @@ def test_function_instruction_count_handles_missing_symbol():
     assert audit.function_instruction_count({}, "missing") == 0
 
 
+def test_ble_rf_symbol_gate_lists_converted_rf_and_coex_exports():
+    for symbol in [
+        "btble_rf_init",
+        "ble_rf_init",
+        "ble_rf_set_pwr_offset_table",
+        "ble_rf_get_pwr_offset",
+        "ble_rf_set_tx_channel",
+        "rf_txpwr_dbm2cs",
+        "rf_txpwr_cs2dbm",
+        "rwip_wlcoex_set",
+        "nim_ble_coex_wifi_tx_window_enter",
+        "nim_ble_coex_wifi_tx_window_leave",
+        "nim_ble_coex_wifi_rf_reclaim_needed",
+    ]:
+        assert symbol in audit.BLE_RF_SYMBOLS
+
+
+def test_ble_rf_symbols_are_rendered_in_markdown(tmp_path):
+    path = tmp_path / "report.md"
+    report = {
+        "reference": "ref.a",
+        "nim_binary": "nim.o",
+        "source": "src/bl808/blecontroller.nim",
+        "reference_functions": 1,
+        "nim_functions": 1,
+        "common_functions": 1,
+        "missing_in_nim": [],
+        "nim_smaller_count": 0,
+        "placeholder_stub_count": 0,
+        "placeholder_stubs_in_reference_count": 0,
+        "likely_active_placeholder_stubs_in_reference_count": 0,
+        "severity_buckets": {
+            ">=200": 0,
+            "100-199": 0,
+            "50-99": 0,
+            "25-49": 0,
+            "10-24": 0,
+            "1-9": 0,
+        },
+        "ble_rf_symbols": [
+            {
+                "symbol": "ble_rf_init",
+                "present": True,
+                "nim_instr": 3,
+                "line": 15457,
+                "placeholder_stub": False,
+                "likely_active_placeholder_stub": False,
+            }
+        ],
+        "smaller_methods": [],
+        "placeholder_stubs_in_reference": [],
+    }
+
+    audit.write_markdown(report, path)
+
+    text = path.read_text()
+    assert "## BLE RF / Coexistence Symbols" in text
+    assert "`ble_rf_init`" in text
+
+
 def test_likely_active_placeholder_ignores_compiled_wrapper_fallback(tmp_path):
     source = tmp_path / "blecontroller.nim"
     source.write_text(

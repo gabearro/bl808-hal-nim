@@ -741,8 +741,8 @@ type
     keepAliveLimit*: uint32
     keepAliveCounter*: uint32
     keepAliveTimestamp*: uint32
-    uploadWord44*: uint32
-    word48*: uint32
+    rxPromiscUploadFlag*: uint32
+    apPromiscUploadFlag*: uint32
     maxAmpduDuration*: uint32
     reserved56*: array[12, uint8]
 
@@ -1161,7 +1161,7 @@ type
     capabilityInfo*: uint16
     basicRates*: array[13, uint8]
     reserved449*: array[3, uint8]
-    modeByte452*: uint8
+    wmmQosInfo*: uint8
     wmmAcFlags*: uint8
     reserved454*: array[2, uint8]
     edcaParams*: array[128, uint8]
@@ -3132,8 +3132,8 @@ static:
   doAssert offsetof(MmEnvView, keepAliveLimit) == 32
   doAssert offsetof(MmEnvView, keepAliveCounter) == 36
   doAssert offsetof(MmEnvView, keepAliveTimestamp) == 40
-  doAssert offsetof(MmEnvView, uploadWord44) == 44
-  doAssert offsetof(MmEnvView, word48) == 48
+  doAssert offsetof(MmEnvView, rxPromiscUploadFlag) == 44
+  doAssert offsetof(MmEnvView, apPromiscUploadFlag) == 48
   doAssert offsetof(MmEnvView, maxAmpduDuration) == 52
   doAssert offsetof(MmWmmParameterSourceView, acBk) == 8
   doAssert offsetof(MmWmmParameterSourceView, acBe) == 12
@@ -3401,7 +3401,7 @@ static:
   doAssert offsetof(VifChannelView, beaconIntervalTu) == 432
   doAssert offsetof(VifChannelView, capabilityInfo) == 434
   doAssert offsetof(VifChannelView, basicRates) == 436
-  doAssert offsetof(VifChannelView, modeByte452) == 452
+  doAssert offsetof(VifChannelView, wmmQosInfo) == 452
   doAssert offsetof(VifChannelView, wmmAcFlags) == 453
   doAssert offsetof(VifChannelView, edcaParams) == 456
   doAssert offsetof(VifSecurityOverlay, connected) == 0
@@ -4561,10 +4561,10 @@ template vifPostponedStaList(vif: ptr VifChannelView): ptr CoList =
   cast[ptr CoList](addr vif.postponedStaHead)
 
 template vifEdcaPsGate(vif: ptr VifChannelView): int8 =
-  cast[int8](vif.modeByte452)
+  cast[int8](vif.wmmQosInfo)
 
 template vifWpaCipher(vif: ptr VifChannelView): uint8 =
-  vif.modeByte452
+  vif.wmmQosInfo
 
 template vifSecurity(vif: ptr VifChannelView): ptr VifSecurityOverlay =
   cast[ptr VifSecurityOverlay](addr vif.edcaParams[32])
@@ -6635,6 +6635,16 @@ var nimFwDbgRfCalRestoreReadbackRf2c* {.wifiCtrl, exportc: "nimfw_dbg_rf_cal_res
 var nimFwDbgRfPhase* {.wifiCtrl, exportc: "nimfw_dbg_rf_phase".}: uint32
 var nimFwDbgRfRestore* {.wifiCtrl, exportc: "nimfw_dbg_rf_restore".}: uint32
 var nimFwDbgRfApiMode* {.wifiCtrl, exportc: "nimfw_dbg_rf_api_mode".}: uint32
+var nimFwDbgPhyInitCount* {.wifiCtrl, exportc: "nimfw_dbg_phy_init_count".}: uint32
+var nimFwDbgPhyInitPhase* {.wifiCtrl, exportc: "nimfw_dbg_phy_init_phase".}: uint32
+var nimFwDbgPhyModemVersion* {.wifiCtrl, exportc: "nimfw_dbg_phy_modem_version".}: uint32
+var nimFwDbgPhyClockCount* {.wifiCtrl, exportc: "nimfw_dbg_phy_clock_count".}: uint32
+var nimFwDbgPhyAgcCopyCount* {.wifiCtrl, exportc: "nimfw_dbg_phy_agc_copy_count".}: uint32
+var nimFwDbgPhyAgcSourceFirst* {.wifiCtrl, exportc: "nimfw_dbg_phy_agc_source_first".}: uint32
+var nimFwDbgPhyAgcSourceLast* {.wifiCtrl, exportc: "nimfw_dbg_phy_agc_source_last".}: uint32
+var nimFwDbgPhyAgcDestFirst* {.wifiCtrl, exportc: "nimfw_dbg_phy_agc_dest_first".}: uint32
+var nimFwDbgPhyAgcDestLast* {.wifiCtrl, exportc: "nimfw_dbg_phy_agc_dest_last".}: uint32
+var nimFwDbgPhyWifiLdpcAbsent* {.wifiCtrl, exportc: "nimfw_dbg_phy_wifi_ldpc_absent".}: uint32
 var nimFwDbgRfAssertCount* {.wifiCtrl, exportc: "nimfw_dbg_rf_assert_count".}: uint32
 var nimFwDbgRfAssertLine* {.wifiCtrl, exportc: "nimfw_dbg_rf_assert_line".}: uint32
 var nimFwDbgRfAssertReg3c* {.wifiCtrl, exportc: "nimfw_dbg_rf_assert_reg3c".}: uint32
@@ -7885,72 +7895,222 @@ else:
   ## at versionOut, reads scratch buf. Called by mm_version_req_handler.
   proc phy_get_version*(versionOut: pointer, buf: pointer) {.importc, cdecl.}
 proc wifi_hosal_rf_turn_on*() {.importc, cdecl.}
+type
+  RadioPhyMode* = enum
+    wifiOnly = 1'u8
+    bleOnly = 2'u8
+    wifiBleCoex = 3'u8
+
 when defined(bl808WifiUseBl808Rf):
   type
-    RadioPhyMode* = enum
-      wifiOnly = 1'u8
-      bleOnly = 2'u8
-      wifiBleCoex = 3'u8
-
     RfRegBlock {.packed.} = object
       baseCtrl0: uint32
       baseCtrl1: uint32
-      reserved008: array[9, uint32]
-      modeCtrl: uint32
-      reserved030: array[20, uint32]
-      synthCtrl: uint32
+      reserved008: array[3, uint32]
+      calMode14: uint32
+      reserved018: uint32
+      calCtrl1c: uint32
+      capability20: uint32
+      reserved024: array[2, uint32]
+      synthCtrl2c: uint32
+      priModeCtrl30: uint32
+      scanSynthLatch34: uint32
+      reserved038: array[2, uint32]
+      scanSynthLatch40: uint32
+      reserved044: uint32
+      rccalTone48: uint32
+      scanRxLatch4c: uint32
+      reserved050: array[2, uint32]
+      txcalBias58: uint32
+      xtalCapTrim5c: uint32
+      rxcalPrep60: uint32
+      txcalGain64: uint32
+      txcalGain68: uint32
+      txcalDc6c: uint32
+      txcalParam70: uint32
+      txcalParam74: uint32
+      rxModeCalibrationGate78: uint32
+      roscalCtrl7c: uint32
+      rbbRccalCtrl80: uint32
+      rccalReplay84: uint32
+      txcalDfe88: uint32
+      calPathConfig8c: uint32
+      calPathCtrl90: uint32
+      bandwidthCtrl94: uint32
+      reserved098: array[2, uint32]
+      fcalCtrlA0: uint32
+      acalCtrlA4: uint32
+      calResultA8: uint32
+      fcalAc: uint32
+      channelCalStrobeB0: uint32
+      channelCalStatusB4: uint32
+      txcalCtrlB8: uint32
+      channelFcalConfigBc: uint32
+      sdmCtrlC0: uint32
+      sdmDivC4: uint32
+      reserved0c8: uint32
+      rfPriBiasTrimCc: uint32
+      optimizeCtrlD0: uint32
+      rfBiasTrimD4: uint32
+      reserved0d8: array[6, uint32]
+      calMixerStateF0: uint32
+      reserved0f4: array[6, uint32]
+      rfCodeConfig110c: uint32
+      reserved110: array[6, uint32]
+      txcalDefaultProfile128: uint32
+      txcalDefaultProfile12c: uint32
+      txcalDefaultProfile130: uint32
+      reserved134: uint32
+      calModeDefault138: uint32
+      vcoPairTable13c: array[10, uint32]
+      vcoPair2484Mhz164: uint32
+      roscalCal0: uint32
+      roscalCal1: uint32
+      rxcalReplay: array[4, uint32]
+      reserved180: array[16, uint32]
+      xtalControlCode1c0: uint32
+      xtalDividerConfig1c4: uint32
+      xtalCountWindowMin1c8: uint32
+      xtalCountWindowMax1cc: uint32
+      reserved1d0: array[15, uint32]
+      calSingenCtrl20c: uint32
+      reserved210: uint32
+      calSingenAmpLo214: uint32
+      calSingenAmpHi218: uint32
+      calSingenMeasurePrep21c: uint32
+      rxMode220: uint32
+      reserved224: uint32
+      channelTuneGate228: uint32
+      reserved22c: array[4, uint32]
+      calDfeGate23c: uint32
+      calDfeState240: uint32
+      calDfeState244: uint32
+      reserved248: array[6, uint32]
+      channelSequencer260: uint32
+      channelFreqMhz264: uint32
+      channelTuneStrobe268: uint32
+      channelTuneCtrl26c: uint32
+      reserved270: array[21, uint32]
+      channelSequencer2c4: uint32
+      reserved2c8: array[78, uint32]
+      rfcSequencerBias400: uint32
+      reserved404: array[64, uint32]
+      modemPathEnable504: uint32
+      reserved508: uint32
+      pdCompLatchCtrl50c: uint32
+      reserved510: uint32
+      modemPathEnable514: uint32
+      reserved518: array[58, uint32]
+      txcalTosdac600: uint32
+      reserved604: uint32
+      scanSynthControl608: uint32
+      calMeasurePrep60c: uint32
+      reserved610: uint32
+      rxcalSearch614: uint32
+      measureCtrl618: uint32
+      measureMode61c: uint32
+      measureI620: uint32
+      measureQ624: uint32
+      reserved628: uint32
+      scanTxMeasureControl62c: uint32
+      reserved630: array[3, uint32]
+      synthDfePathControl63c: uint32
+      reserved640: array[16, uint32]
+      notchCtrl680: uint32
+      reserved684: array[32, uint32]
+      txPowerComp704: uint32
+      reserved708: array[21, uint32]
+      rfGainTable75c: uint32
+      rfGainTable760: uint32
+      rfGainTable764: uint32
+      reserved768: uint32
+      rfGainTable76c: uint32
+      reserved770: uint32
+      rfGainTable774: uint32
+      reserved778: uint32
+      rfGainTable77c: uint32
+      reserved780: uint32
+      rfGainTable784: uint32
+      reserved788: uint32
+      rfGainTable78c: uint32
+      reserved790: uint32
+      rfGainTable794: uint32
+      reserved798: uint32
+      rfGainTable79c: uint32
+      reserved7a0: array[3, uint32]
+      txPowerComp7ac: uint32
+      reserved7b0: array[3, uint32]
+      txPowerCompTail7bc: uint32
+      txPowerCompTail7c0: uint32
+      txPowerCompTail7c4: uint32
+      txPowerCompTail7c8: uint32
+      txPowerCompTail7cc: uint32
+      txPowerCompTail7d0: uint32
+      txPowerCompTail7d4: uint32
+      txPowerCompTail7d8: uint32
 
     WifiModemBlock {.packed.} = object
       versionWord: uint32
       reserved004: array[6, uint32]
-      dfeCtrl7: uint32
+      versionDfeCaps1c: uint32
       reserved020: uint32
-      dfeCtrl9: uint32
-      dfeCtrl10: uint32
+      versionDfeCaps24: uint32
+      versionDfeCaps28: uint32
       reserved02c: array[4, uint32]
       versionScratch3c: uint32
-      reserved040: array[223, uint32]
-      dfeCtrl3bc: uint32
+      reserved040: array[185, uint32]
+      preAgcCtrl324: uint32
+      reserved328: array[37, uint32]
+      basebandDfeTimeout3bc: uint32
       reserved3c0: array[21, uint32]
-      dfeCtrl414: uint32
+      basebandDfeEnable414: uint32
       reserved418: array[250, uint32]
-      phyCtrl800: uint32
+      versionFeatureCtrl800: uint32
       reserved804: array[4, uint32]
-      phyCtrl814: uint32
+      bandwidth20MGuard814: uint32
       reserved818: array[2, uint32]
-      phyCtrl820: uint32
-      phyCtrl824: uint32
+      bandwidth20MProfile820: uint32
+      channelTypeCtrl824: uint32
       reserved828: array[2, uint32]
-      phyCtrl830: uint32
-      phyCtrl834: uint32
+      bandwidth20MProfile830: uint32
+      bandwidth20MEnable834: uint32
       reserved838: uint32
-      phyCtrl83c: uint32
-      phyCtrl840: uint32
-      reserved844: array[2, uint32]
-      phyCtrl84c: uint32
+      bandwidth20MSignal83c: uint32
+      bandwidth20MSignal840: uint32
+      preAgcSignal844: uint32
+      preAgcSignal848: uint32
+      channelCenterRatio84c: uint32
       reserved850: array[4, uint32]
-      phyCtrl860: uint32
+      bandwidth20MFilter860: uint32
       reserved864: array[4, uint32]
-      phyCtrl874: uint32
+      bandwidth20MGate874: uint32
       reserved878: array[4, uint32]
       phyChannelPulse888: uint32
-      reserved88c: array[7, uint32]
+      reserved88c: array[2, uint32]
+      preAgcDetect894: uint32
+      reserved898: array[4, uint32]
       groupMembership0: uint32
       groupMembership1: uint32
       userPosition: array[4, uint32]
       aid: uint32
       aidMaskLo: uint32
       aidMaskHi: uint32
-      reserved8cc: array[25, uint32]
-      phyCtrl930: uint32
+      reserved8cc: array[2, uint32]
+      preAgcTiming8d4: uint32
+      preAgcTiming8d8: uint32
+      reserved8dc: uint32
+      preAgcTiming8e0: uint32
+      preAgcTiming8e4: uint32
+      reserved8e8: array[18, uint32]
+      channelModeCtrl930: uint32
       reserved934: array[195, uint32]
-      phyCtrlC40: uint32
-      phyCtrlC44: uint32
+      basebandRxPathCtrlC40: uint32
+      basebandRxPathCtrlC44: uint32
       reservedC48: array[10741, uint32]
       intStatusB41c: uint32
       intAckB420: uint32
       reservedB424: array[765, uint32]
-      rxTailC018: uint32
+      rxGainTailCtrlC018: uint32
       reservedC01c: array[10, uint32]
       rxGainTimingC044: uint32
       reservedC048: array[14, uint32]
@@ -7960,157 +8120,427 @@ when defined(bl808WifiUseBl808Rf):
 
     PhyAgcBlock {.packed.} = object
       reserved000: array[34, uint32]
-      agcCtrl88: uint32
-      agcCtrl8c: uint32
+      sharedCopyWindow88: uint32
+      sharedCopyWindow8c: uint32
+      reserved090: array[6, uint32]
+      rfcSettlingTimerA8: uint32
+
+    RfAuxCtrlBlock {.packed.} = object
+      reserved000: array[16, uint32]
+      rfcAuxPathSelect540: uint32
+      rfcAuxPathGate544: uint32
+
+    MacPhyCtrlBlock {.packed.} = object
+      reserved000: array[196, uint32]
+      channelBandwidthCtrl310: uint32
+
+    CrmPhyClockBlock {.packed.} = object
+      reserved000: array[2, uint32]
+      phyClockSelect8: uint32
+      reserved00c: uint32
+      rfClockMux10: uint32
+      reserved014: uint32
+      modemReset18: uint32
+
+    RfPllBlock {.packed.} = object
+      reserved000: array[4, uint32]
+      pllReset10: uint32
+      refdivCtrl14: uint32
+      loopFilter18: uint32
+      fractionalCtrl1c: uint32
+      reserved020: array[2, uint32]
+      fractionalWord28: uint32
+      modeCtrl2c: uint32
+      enableCtrl30: uint32
+      reserved034: array[20, uint32]
+      pllFixedDefault84: uint32
+
+    RfDfeInitBlock {.packed.} = object
+      reserved000: array[12, uint32]
+      hbnCtrl30: uint32
+      reserved034: array[504, uint32]
+      dfeRfFixedCtrl814: uint32
+      reserved818: array[2, uint32]
+      dfeStaticCtrl820: uint32
+      dfeTrim824: uint32
+      reserved828: array[23, uint32]
+      dfeRfFixedDefault884: uint32
 
     BbaAgcBlock {.packed.} = object
-      reserved000: array[208, uint32]
+      reserved000: uint32
+      agcCoreEnable004: uint32
+      reserved008: array[62, uint32]
+      agcCoreCtrl100: uint32
+      reserved104: array[143, uint32]
       macActiveB340: uint32
       macActiveB344: uint32
-      reserved348: array[8, uint32]
+      reserved348: array[7, uint32]
+      agcCoreProfile364: uint32
       macActiveB368: uint32
       pdComp36c: uint32
-      reserved370: array[5, uint32]
+      agcCoreProfile370: uint32
+      reserved374: array[3, uint32]
+      agcCoreStage0B380: uint32
       macActiveB384: uint32
-      reserved388: uint32
+      agcCoreStage2B388: uint32
       macActiveB38c: uint32
       pdGain390: uint32
-      reserved394: array[3, uint32]
+      agcCoreDetect394: uint32
+      agcCoreDetect398: uint32
+      reserved39c: uint32
       macActiveB3a0: uint32
-      reserved3a4: array[2, uint32]
+      agcCoreWindow3a4: uint32
+      reserved3a8: uint32
       pdTiming3ac: uint32
       reserved3b0: array[3, uint32]
       macActiveB3bc: uint32
       pdSlope3c0: uint32
       macActiveB3c4: uint32
-      reserved3c8: array[789, uint32]
+      reserved3c8: array[19, uint32]
+      agcCoreTimeout414: uint32
+      reserved418: array[769, uint32]
       macActiveC01c: uint32
       macActiveC020: uint32
       reservedC024: array[2, uint32]
       macActiveC02c: uint32
-      reservedC030: array[512, uint32]
+      reservedC030: array[503, uint32]
+      agcCoreTableC80c: uint32
+      reservedC810: array[8, uint32]
       pdCompC830: uint32
+      reservedC834: uint32
+      pdCompRampC838: uint32
+      pdCompRampC83c: uint32
+      pdCompRampC840: uint32
 
-    RadioRegMaskInit = object
-      address: uint32
-      keepMask: uint32
-      setMask: uint32
+    BbaRuntimeState {.packed.} = object
+      ceLoopScratch0: uint32
+      ceLoopScratch4: uint32
+      pdRssiState: uint8
+      pdGainCode: uint8
+      pdCompCurrent: uint8
+      pdCompLatch: uint8
+      pdLoopReserved12: uint8
+      pdLoopReserved13: uint8
+      cePpmAccumulator: uint16
+      ceUpdateInterval: uint8
+      ceUpdateCount: uint8
+      ceCapcodeHoldoff: uint8
+      ceLoopReserved19: uint8
+
+    BbaRxVectorView {.packed.} = object
+      rxFormatWord0: uint32
+      rxFormatWord1Rate: uint8
+      rssiDbm: uint8
+      rxFormatWord1Mcs: uint8
+      rxFormatWord1Flags: uint8
+      reserved008: array[14, uint8]
+      carrierFreqOffset: uint16
+
+    RfTxPowerCompTableBlock {.packed.} = object
+      reserved000: array[0x700 div 4, uint32]
+      txPowerCompWords700: array[43, uint32]
 
     RfcXtalConfig = object
       xtalHz: uint32
-      word04: uint32
-      word08: uint32
-      word0c: uint32
-      word10: uint32
+      xtalCountWindowMin: uint32
+      xtalCountWindowMax: uint32
+      xtalDividerConfig: uint32
+      xtalControlCode: uint32
 
     WlRfConfig {.packed.} = object
       status: uint32
       apiMode: uint8
-      enParamLoad: uint8
-      enFullCal: uint8
-      reserved07: uint8
+      enableParamLoadCallback: uint8
+      requestFullCalibration: uint8
+      enableCapcodeSetCallback: uint8
       xtalfreqHz: uint32
-      xtalCap: uint16
-      reserved0E: array[2, uint8]
-      priWord10: uint32
-      priWord14: uint32
-      priWord18: uint32
-      priZeroWords: array[5, uint32]
-      priHalf30: uint16
-      reserved32: array[106, uint8]
-      priByte9C: uint8
-      reserved9D: array[4, uint8]
-      priZeroA1: array[14, uint8]
-      priZeroA2: array[14, uint8]
-      priByteBD: uint8
-      priHalfBE: uint16
-      priWordC0: uint32
-      priWordC4: uint32
-      paramLoad: pointer
-      capcodeSet: pointer
-      capcodeGet: pointer
+      xtalCapCodes: uint16
+      xtalCapPadding: array[2, uint8]
+      channelFreqSeedPair0: uint32
+      channelFreqSeedPair1: uint32
+      channelFreqSeedPair2: uint32
+      channelFreqSeedPadding: array[5, uint32]
+      ratePowerTablePreamble: uint16
+      ratePowerTable: array[106, uint8]
+      ratePowerLimitDbm: uint8
+      ratePowerTablePostamble: array[4, uint8]
+      channelPowerComp: array[14, uint8]
+      channelLowPowerComp: array[14, uint8]
+      temperaturePowerComp: uint8
+      temperaturePowerCompPadding: uint16
+      efuseTrimControl: uint32
+      efuseTxGainComp: uint8
+      efuseXtalCapCode0: uint8
+      efuseXtalCapCode1: uint8
+      efuseDfeTrim: uint8
+      paramLoadCallback: pointer
+      capcodeSetCallback: pointer
+      capcodeGetCallback: pointer
 
     WlRfMemoryOverlay {.packed.} = object
       config: WlRfConfig
       calib: array[320, uint8]
       env: array[12, uint8]
 
+    PhyEnvView {.packed.} = object
+      initCfgWords: array[9, uint32]
+      channelBandType: uint16
+      primaryFreq: uint16
+      centerFreq1: uint16
+      centerFreq2OrTxPower: uint16
+      txPowerAndReserved: uint16
+      reserved046: array[2, uint8]
+
+    WifiAgcMemoryRam {.packed.} = object
+      words: array[512, uint32]
+
   static:
     doAssert sizeof(RfRegBlock) >= 0x84
-    doAssert offsetof(RfRegBlock, modeCtrl) == 0x2C
-    doAssert offsetof(RfRegBlock, synthCtrl) == 0x80
+    doAssert offsetof(RfRegBlock, baseCtrl1) == 0x04
+    doAssert offsetof(RfRegBlock, calMode14) == 0x14
+    doAssert offsetof(RfRegBlock, calCtrl1c) == 0x1C
+    doAssert offsetof(RfRegBlock, capability20) == 0x20
+    doAssert offsetof(RfRegBlock, synthCtrl2c) == 0x2C
+    doAssert offsetof(RfRegBlock, priModeCtrl30) == 0x30
+    doAssert offsetof(RfRegBlock, scanSynthLatch34) == 0x34
+    doAssert offsetof(RfRegBlock, scanSynthLatch40) == 0x40
+    doAssert offsetof(RfRegBlock, rccalTone48) == 0x48
+    doAssert offsetof(RfRegBlock, scanRxLatch4c) == 0x4C
+    doAssert offsetof(RfRegBlock, txcalBias58) == 0x58
+    doAssert offsetof(RfRegBlock, xtalCapTrim5c) == 0x5C
+    doAssert offsetof(RfRegBlock, rxcalPrep60) == 0x60
+    doAssert offsetof(RfRegBlock, txcalGain64) == 0x64
+    doAssert offsetof(RfRegBlock, txcalGain68) == 0x68
+    doAssert offsetof(RfRegBlock, txcalDc6c) == 0x6C
+    doAssert offsetof(RfRegBlock, txcalParam70) == 0x70
+    doAssert offsetof(RfRegBlock, txcalParam74) == 0x74
+    doAssert offsetof(RfRegBlock, rxModeCalibrationGate78) == 0x78
+    doAssert offsetof(RfRegBlock, roscalCtrl7c) == 0x7C
+    doAssert offsetof(RfRegBlock, rbbRccalCtrl80) == 0x80
+    doAssert offsetof(RfRegBlock, rccalReplay84) == 0x84
+    doAssert offsetof(RfRegBlock, txcalDfe88) == 0x88
+    doAssert offsetof(RfRegBlock, calPathConfig8c) == 0x8C
+    doAssert offsetof(RfRegBlock, calPathCtrl90) == 0x90
+    doAssert offsetof(RfRegBlock, bandwidthCtrl94) == 0x94
+    doAssert offsetof(RfRegBlock, fcalCtrlA0) == 0xA0
+    doAssert offsetof(RfRegBlock, acalCtrlA4) == 0xA4
+    doAssert offsetof(RfRegBlock, calResultA8) == 0xA8
+    doAssert offsetof(RfRegBlock, fcalAc) == 0xAC
+    doAssert offsetof(RfRegBlock, channelCalStrobeB0) == 0xB0
+    doAssert offsetof(RfRegBlock, channelCalStatusB4) == 0xB4
+    doAssert offsetof(RfRegBlock, txcalCtrlB8) == 0xB8
+    doAssert offsetof(RfRegBlock, channelFcalConfigBc) == 0xBC
+    doAssert offsetof(RfRegBlock, sdmCtrlC0) == 0xC0
+    doAssert offsetof(RfRegBlock, sdmDivC4) == 0xC4
+    doAssert offsetof(RfRegBlock, rfPriBiasTrimCc) == 0xCC
+    doAssert offsetof(RfRegBlock, optimizeCtrlD0) == 0xD0
+    doAssert offsetof(RfRegBlock, rfBiasTrimD4) == 0xD4
+    doAssert offsetof(RfRegBlock, calMixerStateF0) == 0xF0
+    doAssert offsetof(RfRegBlock, rfCodeConfig110c) == 0x10C
+    doAssert offsetof(RfRegBlock, txcalDefaultProfile128) == 0x128
+    doAssert offsetof(RfRegBlock, txcalDefaultProfile12c) == 0x12C
+    doAssert offsetof(RfRegBlock, txcalDefaultProfile130) == 0x130
+    doAssert offsetof(RfRegBlock, calModeDefault138) == 0x138
+    doAssert offsetof(RfRegBlock, vcoPairTable13c) == 0x13C
+    doAssert offsetof(RfRegBlock, vcoPair2484Mhz164) == 0x164
+    doAssert offsetof(RfRegBlock, roscalCal0) == 0x168
+    doAssert offsetof(RfRegBlock, roscalCal1) == 0x16C
+    doAssert offsetof(RfRegBlock, rxcalReplay) == 0x170
+    doAssert offsetof(RfRegBlock, channelTuneGate228) == 0x228
+    doAssert offsetof(RfRegBlock, channelFreqMhz264) == 0x264
+    doAssert offsetof(RfRegBlock, channelTuneStrobe268) == 0x268
+    doAssert offsetof(RfRegBlock, channelTuneCtrl26c) == 0x26C
+    doAssert offsetof(RfRegBlock, xtalControlCode1c0) == 0x1C0
+    doAssert offsetof(RfRegBlock, xtalDividerConfig1c4) == 0x1C4
+    doAssert offsetof(RfRegBlock, xtalCountWindowMin1c8) == 0x1C8
+    doAssert offsetof(RfRegBlock, xtalCountWindowMax1cc) == 0x1CC
+    doAssert offsetof(RfRegBlock, calSingenCtrl20c) == 0x20C
+    doAssert offsetof(RfRegBlock, calSingenAmpLo214) == 0x214
+    doAssert offsetof(RfRegBlock, calSingenAmpHi218) == 0x218
+    doAssert offsetof(RfRegBlock, calSingenMeasurePrep21c) == 0x21C
+    doAssert offsetof(RfRegBlock, rxMode220) == 0x220
+    doAssert offsetof(RfRegBlock, modemPathEnable504) == 0x504
+    doAssert offsetof(RfRegBlock, calDfeGate23c) == 0x23C
+    doAssert offsetof(RfRegBlock, calDfeState240) == 0x240
+    doAssert offsetof(RfRegBlock, calDfeState244) == 0x244
+    doAssert offsetof(RfRegBlock, channelSequencer260) == 0x260
+    doAssert offsetof(RfRegBlock, pdCompLatchCtrl50c) == 0x50C
+    doAssert offsetof(RfRegBlock, channelSequencer2c4) == 0x2C4
+    doAssert offsetof(RfRegBlock, rfcSequencerBias400) == 0x400
+    doAssert offsetof(RfRegBlock, modemPathEnable514) == 0x514
+    doAssert offsetof(RfRegBlock, txcalTosdac600) == 0x600
+    doAssert offsetof(RfRegBlock, scanSynthControl608) == 0x608
+    doAssert offsetof(RfRegBlock, calMeasurePrep60c) == 0x60C
+    doAssert offsetof(RfRegBlock, rxcalSearch614) == 0x614
+    doAssert offsetof(RfRegBlock, measureCtrl618) == 0x618
+    doAssert offsetof(RfRegBlock, measureMode61c) == 0x61C
+    doAssert offsetof(RfRegBlock, measureI620) == 0x620
+    doAssert offsetof(RfRegBlock, measureQ624) == 0x624
+    doAssert offsetof(RfRegBlock, scanTxMeasureControl62c) == 0x62C
+    doAssert offsetof(RfRegBlock, synthDfePathControl63c) == 0x63C
+    doAssert offsetof(RfRegBlock, notchCtrl680) == 0x680
+    doAssert offsetof(RfRegBlock, txPowerComp704) == 0x704
+    doAssert offsetof(RfRegBlock, rfGainTable75c) == 0x75C
+    doAssert offsetof(RfRegBlock, rfGainTable760) == 0x760
+    doAssert offsetof(RfRegBlock, rfGainTable764) == 0x764
+    doAssert offsetof(RfRegBlock, rfGainTable76c) == 0x76C
+    doAssert offsetof(RfRegBlock, rfGainTable774) == 0x774
+    doAssert offsetof(RfRegBlock, rfGainTable77c) == 0x77C
+    doAssert offsetof(RfRegBlock, rfGainTable784) == 0x784
+    doAssert offsetof(RfRegBlock, rfGainTable78c) == 0x78C
+    doAssert offsetof(RfRegBlock, rfGainTable794) == 0x794
+    doAssert offsetof(RfRegBlock, rfGainTable79c) == 0x79C
+    doAssert offsetof(RfRegBlock, txPowerComp7ac) == 0x7AC
+    doAssert offsetof(RfRegBlock, txPowerCompTail7bc) == 0x7BC
+    doAssert offsetof(RfRegBlock, txPowerCompTail7c0) == 0x7C0
+    doAssert offsetof(RfRegBlock, txPowerCompTail7c4) == 0x7C4
+    doAssert offsetof(RfRegBlock, txPowerCompTail7c8) == 0x7C8
+    doAssert offsetof(RfRegBlock, txPowerCompTail7cc) == 0x7CC
+    doAssert offsetof(RfRegBlock, txPowerCompTail7d0) == 0x7D0
+    doAssert offsetof(RfRegBlock, txPowerCompTail7d4) == 0x7D4
+    doAssert offsetof(RfRegBlock, txPowerCompTail7d8) == 0x7D8
     doAssert offsetof(WifiModemBlock, versionWord) == 0x0
-    doAssert offsetof(WifiModemBlock, dfeCtrl7) == 0x1C
-    doAssert offsetof(WifiModemBlock, dfeCtrl9) == 0x24
-    doAssert offsetof(WifiModemBlock, dfeCtrl10) == 0x28
+    doAssert offsetof(WifiModemBlock, versionDfeCaps1c) == 0x1C
+    doAssert offsetof(WifiModemBlock, versionDfeCaps24) == 0x24
+    doAssert offsetof(WifiModemBlock, versionDfeCaps28) == 0x28
     doAssert offsetof(WifiModemBlock, versionScratch3c) == 0x3C
-    doAssert offsetof(WifiModemBlock, dfeCtrl3bc) == 0x3BC
-    doAssert offsetof(WifiModemBlock, dfeCtrl414) == 0x414
-    doAssert offsetof(WifiModemBlock, phyCtrl800) == 0x800
-    doAssert offsetof(WifiModemBlock, phyCtrl814) == 0x814
-    doAssert offsetof(WifiModemBlock, phyCtrl820) == 0x820
-    doAssert offsetof(WifiModemBlock, phyCtrl824) == 0x824
-    doAssert offsetof(WifiModemBlock, phyCtrl830) == 0x830
-    doAssert offsetof(WifiModemBlock, phyCtrl834) == 0x834
-    doAssert offsetof(WifiModemBlock, phyCtrl83c) == 0x83C
-    doAssert offsetof(WifiModemBlock, phyCtrl840) == 0x840
-    doAssert offsetof(WifiModemBlock, phyCtrl84c) == 0x84C
-    doAssert offsetof(WifiModemBlock, phyCtrl860) == 0x860
-    doAssert offsetof(WifiModemBlock, phyCtrl874) == 0x874
+    doAssert offsetof(WifiModemBlock, preAgcCtrl324) == 0x324
+    doAssert offsetof(WifiModemBlock, basebandDfeTimeout3bc) == 0x3BC
+    doAssert offsetof(WifiModemBlock, basebandDfeEnable414) == 0x414
+    doAssert offsetof(WifiModemBlock, versionFeatureCtrl800) == 0x800
+    doAssert offsetof(WifiModemBlock, bandwidth20MGuard814) == 0x814
+    doAssert offsetof(WifiModemBlock, bandwidth20MProfile820) == 0x820
+    doAssert offsetof(WifiModemBlock, channelTypeCtrl824) == 0x824
+    doAssert offsetof(WifiModemBlock, bandwidth20MProfile830) == 0x830
+    doAssert offsetof(WifiModemBlock, bandwidth20MEnable834) == 0x834
+    doAssert offsetof(WifiModemBlock, bandwidth20MSignal83c) == 0x83C
+    doAssert offsetof(WifiModemBlock, bandwidth20MSignal840) == 0x840
+    doAssert offsetof(WifiModemBlock, preAgcSignal844) == 0x844
+    doAssert offsetof(WifiModemBlock, preAgcSignal848) == 0x848
+    doAssert offsetof(WifiModemBlock, channelCenterRatio84c) == 0x84C
+    doAssert offsetof(WifiModemBlock, bandwidth20MFilter860) == 0x860
+    doAssert offsetof(WifiModemBlock, bandwidth20MGate874) == 0x874
     doAssert offsetof(WifiModemBlock, phyChannelPulse888) == 0x888
+    doAssert offsetof(WifiModemBlock, preAgcDetect894) == 0x894
     doAssert offsetof(WifiModemBlock, groupMembership0) == 0x8A8
     doAssert offsetof(WifiModemBlock, groupMembership1) == 0x8AC
     doAssert offsetof(WifiModemBlock, userPosition) == 0x8B0
     doAssert offsetof(WifiModemBlock, aid) == 0x8C0
     doAssert offsetof(WifiModemBlock, aidMaskLo) == 0x8C4
     doAssert offsetof(WifiModemBlock, aidMaskHi) == 0x8C8
-    doAssert offsetof(WifiModemBlock, phyCtrl930) == 0x930
-    doAssert offsetof(WifiModemBlock, phyCtrlC40) == 0xC40
-    doAssert offsetof(WifiModemBlock, phyCtrlC44) == 0xC44
+    doAssert offsetof(WifiModemBlock, preAgcTiming8d4) == 0x8D4
+    doAssert offsetof(WifiModemBlock, preAgcTiming8d8) == 0x8D8
+    doAssert offsetof(WifiModemBlock, preAgcTiming8e0) == 0x8E0
+    doAssert offsetof(WifiModemBlock, preAgcTiming8e4) == 0x8E4
+    doAssert offsetof(WifiModemBlock, channelModeCtrl930) == 0x930
+    doAssert offsetof(WifiModemBlock, basebandRxPathCtrlC40) == 0xC40
+    doAssert offsetof(WifiModemBlock, basebandRxPathCtrlC44) == 0xC44
     doAssert offsetof(WifiModemBlock, intStatusB41c) == 0xB41C
     doAssert offsetof(WifiModemBlock, intAckB420) == 0xB420
-    doAssert offsetof(WifiModemBlock, rxTailC018) == 0xC018
+    doAssert offsetof(WifiModemBlock, rxGainTailCtrlC018) == 0xC018
     doAssert offsetof(WifiModemBlock, rxGainTimingC044) == 0xC044
     doAssert offsetof(WifiModemBlock, rxGainTable0C080) == 0xC080
     doAssert offsetof(WifiModemBlock, rxGainTable1C084) == 0xC084
     doAssert offsetof(WifiModemBlock, rxGainTable2C088) == 0xC088
-    doAssert offsetof(PhyAgcBlock, agcCtrl88) == 0x88
-    doAssert offsetof(PhyAgcBlock, agcCtrl8c) == 0x8C
+    doAssert offsetof(PhyAgcBlock, sharedCopyWindow88) == 0x88
+    doAssert offsetof(PhyAgcBlock, sharedCopyWindow8c) == 0x8C
+    doAssert offsetof(PhyAgcBlock, rfcSettlingTimerA8) == 0xA8
+    doAssert offsetof(RfAuxCtrlBlock, rfcAuxPathSelect540) == 0x40
+    doAssert offsetof(RfAuxCtrlBlock, rfcAuxPathGate544) == 0x44
+    doAssert offsetof(MacPhyCtrlBlock, channelBandwidthCtrl310) == 0x310
+    doAssert offsetof(CrmPhyClockBlock, phyClockSelect8) == 0x08
+    doAssert offsetof(CrmPhyClockBlock, rfClockMux10) == 0x10
+    doAssert offsetof(CrmPhyClockBlock, modemReset18) == 0x18
+    doAssert offsetof(RfPllBlock, pllReset10) == 0x10
+    doAssert offsetof(RfPllBlock, refdivCtrl14) == 0x14
+    doAssert offsetof(RfPllBlock, loopFilter18) == 0x18
+    doAssert offsetof(RfPllBlock, fractionalCtrl1c) == 0x1C
+    doAssert offsetof(RfPllBlock, fractionalWord28) == 0x28
+    doAssert offsetof(RfPllBlock, modeCtrl2c) == 0x2C
+    doAssert offsetof(RfPllBlock, enableCtrl30) == 0x30
+    doAssert offsetof(RfPllBlock, pllFixedDefault84) == 0x84
+    doAssert offsetof(RfDfeInitBlock, hbnCtrl30) == 0x30
+    doAssert offsetof(RfDfeInitBlock, dfeRfFixedCtrl814) == 0x814
+    doAssert offsetof(RfDfeInitBlock, dfeStaticCtrl820) == 0x820
+    doAssert offsetof(RfDfeInitBlock, dfeTrim824) == 0x824
+    doAssert offsetof(RfDfeInitBlock, dfeRfFixedDefault884) == 0x884
+    doAssert offsetof(BbaAgcBlock, agcCoreEnable004) == 0x004
+    doAssert offsetof(BbaAgcBlock, agcCoreCtrl100) == 0x100
     doAssert offsetof(BbaAgcBlock, macActiveB340) == 0x340
     doAssert offsetof(BbaAgcBlock, macActiveB344) == 0x344
+    doAssert offsetof(BbaAgcBlock, agcCoreProfile364) == 0x364
     doAssert offsetof(BbaAgcBlock, macActiveB368) == 0x368
     doAssert offsetof(BbaAgcBlock, pdComp36c) == 0x36C
+    doAssert offsetof(BbaAgcBlock, agcCoreProfile370) == 0x370
+    doAssert offsetof(BbaAgcBlock, agcCoreStage0B380) == 0x380
     doAssert offsetof(BbaAgcBlock, macActiveB384) == 0x384
+    doAssert offsetof(BbaAgcBlock, agcCoreStage2B388) == 0x388
     doAssert offsetof(BbaAgcBlock, macActiveB38c) == 0x38C
     doAssert offsetof(BbaAgcBlock, pdGain390) == 0x390
+    doAssert offsetof(BbaAgcBlock, agcCoreDetect394) == 0x394
+    doAssert offsetof(BbaAgcBlock, agcCoreDetect398) == 0x398
     doAssert offsetof(BbaAgcBlock, macActiveB3a0) == 0x3A0
+    doAssert offsetof(BbaAgcBlock, agcCoreWindow3a4) == 0x3A4
     doAssert offsetof(BbaAgcBlock, pdTiming3ac) == 0x3AC
     doAssert offsetof(BbaAgcBlock, macActiveB3bc) == 0x3BC
     doAssert offsetof(BbaAgcBlock, pdSlope3c0) == 0x3C0
     doAssert offsetof(BbaAgcBlock, macActiveB3c4) == 0x3C4
+    doAssert offsetof(BbaAgcBlock, agcCoreTimeout414) == 0x414
     doAssert offsetof(BbaAgcBlock, macActiveC01c) == 0x101C
     doAssert offsetof(BbaAgcBlock, macActiveC020) == 0x1020
     doAssert offsetof(BbaAgcBlock, macActiveC02c) == 0x102C
+    doAssert offsetof(BbaAgcBlock, agcCoreTableC80c) == 0x180C
     doAssert offsetof(BbaAgcBlock, pdCompC830) == 0x1830
+    doAssert offsetof(BbaAgcBlock, pdCompRampC838) == 0x1838
+    doAssert offsetof(BbaAgcBlock, pdCompRampC83c) == 0x183C
+    doAssert offsetof(BbaAgcBlock, pdCompRampC840) == 0x1840
+    doAssert offsetof(RfTxPowerCompTableBlock, txPowerCompWords700) == 0x700
+    doAssert sizeof(BbaRuntimeState) == 20
+    doAssert offsetof(BbaRuntimeState, pdRssiState) == 8
+    doAssert offsetof(BbaRuntimeState, pdGainCode) == 9
+    doAssert offsetof(BbaRuntimeState, pdCompCurrent) == 10
+    doAssert offsetof(BbaRuntimeState, pdCompLatch) == 11
+    doAssert offsetof(BbaRuntimeState, cePpmAccumulator) == 14
+    doAssert offsetof(BbaRuntimeState, ceUpdateInterval) == 16
+    doAssert offsetof(BbaRuntimeState, ceUpdateCount) == 17
+    doAssert offsetof(BbaRuntimeState, ceCapcodeHoldoff) == 18
+    doAssert sizeof(BbaRxVectorView) == 24
+    doAssert offsetof(BbaRxVectorView, rxFormatWord0) == 0
+    doAssert offsetof(BbaRxVectorView, rxFormatWord1Rate) == 4
+    doAssert offsetof(BbaRxVectorView, rssiDbm) == 5
+    doAssert offsetof(BbaRxVectorView, carrierFreqOffset) == 0x16
     doAssert sizeof(WlRfConfig) == 212
     doAssert offsetof(WlRfConfig, apiMode) == 4
     doAssert offsetof(WlRfConfig, xtalfreqHz) == 8
-    doAssert offsetof(WlRfConfig, xtalCap) == 12
-    doAssert offsetof(WlRfConfig, priWord10) == 16
-    doAssert offsetof(WlRfConfig, priByte9C) == 156
-    doAssert offsetof(WlRfConfig, priZeroA1) == 161
-    doAssert offsetof(WlRfConfig, priZeroA2) == 175
-    doAssert offsetof(WlRfConfig, priByteBD) == 189
-    doAssert offsetof(WlRfConfig, priHalfBE) == 190
-    doAssert offsetof(WlRfConfig, priWordC0) == 192
-    doAssert offsetof(WlRfConfig, priWordC4) == 196
-    doAssert offsetof(WlRfConfig, paramLoad) == 200
-    doAssert offsetof(WlRfConfig, capcodeSet) == 204
-    doAssert offsetof(WlRfConfig, capcodeGet) == 208
+    doAssert offsetof(WlRfConfig, xtalCapCodes) == 12
+    doAssert offsetof(WlRfConfig, channelFreqSeedPair0) == 16
+    doAssert offsetof(WlRfConfig, ratePowerTable) == 50
+    doAssert offsetof(WlRfConfig, ratePowerLimitDbm) == 156
+    doAssert offsetof(WlRfConfig, channelPowerComp) == 161
+    doAssert offsetof(WlRfConfig, channelLowPowerComp) == 175
+    doAssert offsetof(WlRfConfig, temperaturePowerComp) == 189
+    doAssert offsetof(WlRfConfig, temperaturePowerCompPadding) == 190
+    doAssert offsetof(WlRfConfig, efuseTrimControl) == 192
+    doAssert offsetof(WlRfConfig, efuseTxGainComp) == 196
+    doAssert offsetof(WlRfConfig, efuseXtalCapCode0) == 197
+    doAssert offsetof(WlRfConfig, efuseXtalCapCode1) == 198
+    doAssert offsetof(WlRfConfig, efuseDfeTrim) == 199
+    doAssert offsetof(WlRfConfig, paramLoadCallback) == 200
+    doAssert offsetof(WlRfConfig, capcodeSetCallback) == 204
+    doAssert offsetof(WlRfConfig, capcodeGetCallback) == 208
     doAssert sizeof(WlRfMemoryOverlay) == 544
     doAssert offsetof(WlRfMemoryOverlay, config) == 0
     doAssert offsetof(WlRfMemoryOverlay, calib) == 212
     doAssert offsetof(WlRfMemoryOverlay, env) == 532
+    doAssert sizeof(PhyEnvView) == 48
+    doAssert offsetof(PhyEnvView, initCfgWords) == 0
+    doAssert offsetof(PhyEnvView, channelBandType) == 36
+    doAssert offsetof(PhyEnvView, primaryFreq) == 38
+    doAssert offsetof(PhyEnvView, centerFreq1) == 40
+    doAssert offsetof(PhyEnvView, centerFreq2OrTxPower) == 42
+    doAssert offsetof(PhyEnvView, txPowerAndReserved) == 44
+    doAssert sizeof(WifiAgcMemoryRam) == 2048
+    doAssert offsetof(WifiAgcMemoryRam, words) == 0
     doAssert sizeof(RfcXtalConfig) == 20
 
   const
@@ -8129,6 +8559,13 @@ when defined(bl808WifiUseBl808Rf):
     RfPriWb03Rf70ColdSeed = 0x25181222'u32
     RfPriWb03Rf70ScanSeed = 0x24181222'u32
     RfPriWb03MacActiveRf70Seed = 0x23171222'u32
+    RfPriTxcalRf70InitialSearchSeedNibble = 0xB'u32
+    RfPriRf70ReplayNotApplicable = 0xFFFF_FFFF'u32
+    RfPriRf70ReplayFieldsSeededAtReplay = 0x00000001'u32
+    RfPriRf70ReplayFieldsUnexpected = 0x00000002'u32
+    RfPriRf70ReplayFieldsPopulatedByTxcal = 0x00000003'u32
+    RfPriRf70ReplayFieldsMeasuredByTxcal = 0x00000004'u32
+    RfPriRf70ReplayFieldsMeasuredFallback = 0x00000005'u32
     RfPriWb03MacActiveRf7cSeed = 0x24222422'u32
     RfPriWb03RccalRf80Seed = 0x1B1B1B1B'u32
     RfPriWb03RccalRf84Seed = 0x02324020'u32
@@ -8153,7 +8590,8 @@ when defined(bl808WifiUseBl808Rf):
     RfPriWb03ScanRf1608Seed = 0x10000000'u32
     RfPriWb03ScanRf1618Seed = 0x80000000'u32
     RfPriWb03ScanRf162cSeed = 0x000F0002'u32
-    AgcMemoryBase = 0x24C0A000'u
+    WifiAgcMemoryBase = 0x24C0A000'u
+    WifiAgcMemoryWords = 512
     Bl808RfDeviceInfoBl616 = 0'u32
     Bl808RfDeviceInfoWb03 = 1'u32
     Bl808RfDeviceInfoBl618m = 2'u32
@@ -8164,6 +8602,11 @@ when defined(bl808WifiUseBl808Rf):
     bl808WifiRfWb03ForceAuthTxLatches* {.booldefine.}: bool = true
     bl808WifiRfWb03AuthTxSettleUs* {.intdefine.}: int = 0
     bl808WifiRfWb03AuthTxPulseLatch* {.booldefine.}: bool = true
+    ## Keep the recovered RF70 strongest-candidate search as diagnostics by
+    ## default. A 2026-06-06 hardware run showed measured replay windows
+    ## w0=A,w1=E,w2=9 regressed auth/connect, so applying them remains opt-in
+    ## until the full vendor TXCAL measurement setup is recovered.
+    bl808WifiRfWb03ApplyMeasuredRf70Replay* {.booldefine.}: bool = false
     WlXtal24M = 24_000_000'u32
     WlXtal26M = 26_000_000'u32
     WlXtal32M = 32_000_000'u32
@@ -8171,87 +8614,15 @@ when defined(bl808WifiUseBl808Rf):
     WlXtal40M = 40_000_000'u32
     WlXtal52M = 52_000_000'u32
     RfBase = 0x20001000'u
+    RfPllBase = 0x20000800'u
+    RfAuxCtrlBase = 0x20000500'u
     PhyBase = 0x20002800'u
     AgcBase = 0x20002C00'u
     WifiModemBase = 0x24C00000'u
-    RfPriInitPllReg = 0x20000830'u32
-    RfPriInitPllResetReg = 0x20000810'u32
-    RfPriInitPll18Reg = 0x20000818'u32
-    RfPriInitPll1cReg = 0x2000081C'u32
-    RfPriInitPll28Reg = 0x20000828'u32
-    RfPriInitPll2cReg = 0x2000082C'u32
-    RfPriInitHbnReg = 0x2000F030'u32
-    RfPriInitDfeReg = 0x2000F820'u32
-    RfPriInitDfeReg824 = 0x2000F824'u32
-    RfRxModeReg = 0x20001220'u32
-    RfPriModeCtrlReg = 0x20001030'u32
-    RfPriInitF884Reg = 0x2000F884'u32
-    RfPriInitF814Reg = 0x2000F814'u32
-    RfPriInit884Reg = 0x20000884'u32
-    RfPriInit814Reg = 0x20000814'u32
-    RfPriInit163cReg = 0x2000163C'u32
-    RfPriInit64Reg = 0x20001064'u32
-    RfPriInit6cReg = 0x2000106C'u32
-    RfPriInit70Reg = 0x20001070'u32
-    RfPriInit128Reg = 0x20001128'u32
-    RfPriInit12cReg = 0x2000112C'u32
-    RfPriInit130Reg = 0x20001130'u32
-    RfPriInitD4Reg = 0x200010D4'u32
-    RfPriInit90Reg = 0x20001090'u32
-    RfTxcalCtrlReg = 0x200010B8'u32
-    RfPriInit138Reg = 0x20001138'u32
-    RfPriInit8cReg = 0x2000108C'u32
-    RfPriInit1618Reg = 0x20001618'u32
-    RfCtrlReg = 0x20001004'u32
-    RfPriTrace34Reg = 0x20001034'u32
-    RfPriTrace40Reg = 0x20001040'u32
-    RfPriTrace4cReg = 0x2000104C'u32
-    RfCalModeReg = 0x20001014'u32
-    RfCalCtrlReg = 0x2000101C'u32
-    RfCapabilityReg = 0x20001020'u32
-    RfFcalCtrlReg = 0x200010A0'u32
-    RfAcalCtrlReg = 0x200010A4'u32
-    RfCalResultReg = 0x200010A8'u32
-    RfFcalReg = 0x200010AC'u32
-    RfPriConfigB0Reg = 0x200010B0'u32
-    RfPriConfigB4Reg = 0x200010B4'u32
-    RfPriConfigBcReg = 0x200010BC'u32
-    RfMeasureCtrlReg = 0x20001618'u32
-    RfMeasureModeReg = 0x2000161C'u32
-    RfMeasureIReg = 0x20001620'u32
-    RfMeasureQReg = 0x20001624'u32
-    RfRoscalCtrlReg = 0x2000107C'u32
-    RfPriInit78Reg = 0x20001078'u32
-    RfRbbRccalReg = 0x20001080'u32
-    RfPriTrace84Reg = 0x20001084'u32
-    RfRoscalReg0 = 0x20001168'u32
-    RfRoscalReg1 = 0x2000116C'u32
-    RfTxcalParamReg = 0x20001070'u32
-    RfTxcalParam01Reg = 0x20001074'u32
-    RfTxcalTosdacReg = 0x20001600'u32
-    RfPriRxcalSearchReg = 0x20001614'u32
-    RfPriTrace162cReg = 0x2000162C'u32
-    RfPriTrace1680Reg = 0x20001680'u32
-    RfPriTrace113cReg = 0x2000113C'u32
-    RfPriRxcalReg0 = 0x20001170'u32
-    RfPriRxcalReg1 = 0x20001174'u32
-    RfPriRxcalReg2 = 0x20001178'u32
-    RfPriRxcalReg3 = 0x2000117C'u32
-    RfPriInit110cReg = 0x2000110C'u32
-    RfPriRccalSingenReg0 = 0x2000120C'u32
-    RfPriRccalSingenReg1 = 0x20001214'u32
-    RfPriRccalSingenReg2 = 0x20001218'u32
-    RfPriRccalMeasurePrepReg = 0x2000160C'u32
-    RfPriRccalToneReg = 0x20001048'u32
-    RfPriInit58Reg = 0x20001058'u32
-    RfPriInit68Reg = 0x20001068'u32
-    RfPriTxcalDfeReg = 0x20001088'u32
-    RfPriTxcalDcReg = 0x2000106C'u32
-    RfSdm1Reg = 0x200010C0'u32
-    RfSdm2Reg = 0x200010C4'u32
-    RfSynthCtrlReg = 0x2000102C'u32
-    RfPriInit1504Reg = 0x20001504'u32
-    RfOptimizeReg = 0x200010D0'u32
+    MacPhyCtrlBase = 0x24B00000'u
+    CrmPhyClockBase = 0x24940000'u
+    RfDfeInitBase = 0x2000F000'u
+    BbaAgcBase = 0x24C0B000'u
     RfOptimizeMidBandMask = 0x00000001'u32
     RfOptimizeMidBandFirstMhz = 2452'u32
     RfOptimizeMidBandLastMhz = 2472'u32
@@ -8321,7 +8692,7 @@ when defined(bl808WifiUseBl808Rf):
     RfTxcalAverageMeasureMode = 0x04000000'u32
     RfTxcalInitialAmp = 128'u32
     RfTxcalInitialAdcMax = 128'i32
-    RfTxcalInitialAdcMin = 64'i32
+    RfTxcalInitialAdcMin = 96'i32
     RfTxcalGainAmp = 192'u32
     RfTxcalGainAdcMax = 256'i32
     RfTxcalGainAdcMin = 128'i32
@@ -8342,7 +8713,13 @@ when defined(bl808WifiUseBl808Rf):
     RfLoFcalHighCount = 0xA6E0'u16
     RfLoFcalStopCount = 0xACE0'u16
     RfLoFcalDiv = 0x0855'u16
-    RfPriTxcalRecordBaseWord = 26
+    RfCalibRccalReplayWordIndex = 2
+    RfCalibRf70ReplayLowBandWordIndex = 3
+    RfCalibRf70ReplayHighBandWordIndex = 4
+    RfCalibLoVcoHalfwordBase = 14
+    RfCalibTxcalRecordBaseWord = 26
+    RfCalibBzTxcalRecordBaseByte = 0xF8
+    RfCalibBzTxcalRecordStrideBytes = 8
 
     RfPriDefaultVcoCal40M: array[21, uint16] = [
       ## Fallback for zeroed wl_cal VCO halfwords, recovered from passing
@@ -8384,266 +8761,35 @@ when defined(bl808WifiUseBl808Rf):
     RfcXtalConfigTable: array[6, RfcXtalConfig] = [
       ## librf_bl808.a:rfc.c.o .rodata.rfc_xtal_cfg, indexed by xtalIndex().
       RfcXtalConfig(xtalHz: WlXtal24M,
-                    word04: 0x00038E39'u32, word08: 0x000471C7'u32,
-                    word0c: 0x22000000'u32, word10: 0x00000990'u32),
+                    xtalCountWindowMin: 0x00038E39'u32,
+                    xtalCountWindowMax: 0x000471C7'u32,
+                    xtalDividerConfig: 0x22000000'u32,
+                    xtalControlCode: 0x00000990'u32),
       RfcXtalConfig(xtalHz: WlXtal26M,
-                    word04: 0x00034835'u32, word08: 0x00041A42'u32,
-                    word0c: 0x1F627627'u32, word10: 0x00000990'u32),
+                    xtalCountWindowMin: 0x00034835'u32,
+                    xtalCountWindowMax: 0x00041A42'u32,
+                    xtalDividerConfig: 0x1F627627'u32,
+                    xtalControlCode: 0x00000990'u32),
       RfcXtalConfig(xtalHz: WlXtal32M,
-                    word04: 0x0002AAAB'u32, word08: 0x00035555'u32,
-                    word0c: 0x19800000'u32, word10: 0x00000990'u32),
+                    xtalCountWindowMin: 0x0002AAAB'u32,
+                    xtalCountWindowMax: 0x00035555'u32,
+                    xtalDividerConfig: 0x19800000'u32,
+                    xtalControlCode: 0x00000990'u32),
       RfcXtalConfig(xtalHz: WlXtal38P4M,
-                    word04: 0x000238E4'u32, word08: 0x0002C71C'u32,
-                    word0c: 0x15400000'u32, word10: 0x00000990'u32),
+                    xtalCountWindowMin: 0x000238E4'u32,
+                    xtalCountWindowMax: 0x0002C71C'u32,
+                    xtalDividerConfig: 0x15400000'u32,
+                    xtalControlCode: 0x00000990'u32),
       RfcXtalConfig(xtalHz: WlXtal40M,
-                    word04: 0x00022222'u32, word08: 0x0002AAAB'u32,
-                    word0c: 0x14400000'u32, word10: 0x0000097E'u32),
+                    xtalCountWindowMin: 0x00022222'u32,
+                    xtalCountWindowMax: 0x0002AAAB'u32,
+                    xtalDividerConfig: 0x14400000'u32,
+                    xtalControlCode: 0x0000097E'u32),
       RfcXtalConfig(xtalHz: WlXtal52M,
-                    word04: 0x0001A41A'u32, word08: 0x00020D21'u32,
-                    word0c: 0x0FB13B14'u32, word10: 0x00000990'u32)
-    ]
-
-    RfcModemLateInit: array[36, RadioRegMaskInit] = [
-      ## Ordered port of librf_bl808.a:rfc.c.o modem_init_core+0x1a2..0x3b6;
-      ## the final 0x20001504/0x20001514 strobes remain explicit.
-      RadioRegMaskInit(address: 0x20001004'u32,
-                       keepMask: 0xFFFFF7FF'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: 0x2000126C'u32,
-                       keepMask: 0xFFFFFFF7'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: 0x20001268'u32,
-                       keepMask: 0xFFFF0000'u32, setMask: 0x00001040'u32),
-      RadioRegMaskInit(address: 0x20001004'u32,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000002'u32),
-      RadioRegMaskInit(address: RfSynthCtrlReg,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000004'u32),
-      RadioRegMaskInit(address: RfPriInit163cReg,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000080'u32),
-      RadioRegMaskInit(address: RfPriInit163cReg,
-                       keepMask: 0xFFFF7FFF'u32, setMask: 0x00008000'u32),
-      RadioRegMaskInit(address: RfPriInit163cReg,
-                       keepMask: 0xFFFFFF80'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: RfPriInit163cReg,
-                       keepMask: 0xFFFF80FF'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: RfSynthCtrlReg,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000002'u32),
-      RadioRegMaskInit(address: RfSynthCtrlReg,
-                       keepMask: 0xFFFFBFFF'u32, setMask: 0x00004000'u32),
-      RadioRegMaskInit(address: RfSynthCtrlReg,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000020'u32),
-      RadioRegMaskInit(address: 0x20001400'u32,
-                       keepMask: 0xFF7FFFFF'u32, setMask: 0x00800000'u32),
-      RadioRegMaskInit(address: 0x20001400'u32,
-                       keepMask: 0xFFFF7FFF'u32, setMask: 0x00008000'u32),
-      RadioRegMaskInit(address: 0x20001400'u32,
-                       keepMask: 0xFFFFBFFF'u32, setMask: 0x00004000'u32),
-      RadioRegMaskInit(address: 0x20001400'u32,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000200'u32),
-      RadioRegMaskInit(address: 0x20001400'u32,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000100'u32),
-      RadioRegMaskInit(address: 0x20000540'u32,
-                       keepMask: 0xFFFFFCFF'u32, setMask: 0x00000C00'u32),
-      RadioRegMaskInit(address: 0x20000544'u32,
-                       keepMask: 0xFFFFFFFB'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: 0x20001220'u32,
-                       keepMask: 0xF7FFFFFF'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: 0x20001004'u32,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000002'u32),
-      RadioRegMaskInit(address: RfSynthCtrlReg,
-                       keepMask: 0xFFFFFFDF'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: 0x20001094'u32,
-                       keepMask: 0xFFFEFFFF'u32, setMask: 0x00010000'u32),
-      RadioRegMaskInit(address: 0x20001080'u32,
-                       keepMask: 0xBFFFFFFF'u32, setMask: 0x40000000'u32),
-      RadioRegMaskInit(address: 0x20001260'u32,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: 0x20001260'u32,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: 0x200028A8'u32,
-                       keepMask: 0x00000000'u32, setMask: 0x000000C8'u32),
-      RadioRegMaskInit(address: 0x200012C4'u32,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000002'u32),
-      RadioRegMaskInit(address: 0x200012C4'u32,
-                       keepMask: 0xFFFFFFFE'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: 0x24C0C01C'u32,
-                       keepMask: 0xFFFFFC00'u32, setMask: 0x00000050'u32),
-      RadioRegMaskInit(address: 0x24C0C020'u32,
-                       keepMask: 0xFFFFFC00'u32, setMask: 0x00000050'u32),
-      RadioRegMaskInit(address: 0x2000126C'u32,
-                       keepMask: 0xFFF003FF'u32, setMask: 0x00028000'u32),
-      RadioRegMaskInit(address: 0x20001268'u32,
-                       keepMask: 0xC00FFFFF'u32, setMask: 0x05000000'u32),
-      RadioRegMaskInit(address: 0x24C0C01C'u32,
-                       keepMask: 0xFC00FFFF'u32, setMask: 0x00010000'u32),
-      RadioRegMaskInit(address: 0x24C0C020'u32,
-                       keepMask: 0xFC00FFFF'u32, setMask: 0x00010000'u32),
-      RadioRegMaskInit(address: 0x24C0C02C'u32,
-                       keepMask: 0xFFFFFF00'u32, setMask: 0x00000001'u32)
-    ]
-
-    RfPriFixedValPrefixInit: array[14, RadioRegMaskInit] = [
-      RadioRegMaskInit(address: 0x2000121C'u32,
-                       keepMask: 0xEFFFEFFF'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: 0x20001094'u32,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x30010000'u32),
-      RadioRegMaskInit(address: RfRxModeReg,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000600'u32),
-      RadioRegMaskInit(address: 0x20001608'u32,
-                       keepMask: 0xDFFFFFFF'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: RfPriInit163cReg,
-                       keepMask: 0x00000000'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: RfPriInit90Reg,
-                       keepMask: 0xFFFFFFF8'u32, setMask: 0x00000004'u32),
-      RadioRegMaskInit(address: RfPriInit1618Reg,
-                       keepMask: 0x3FFFFFFF'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: RfPriInit1504Reg,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00100000'u32),
-      RadioRegMaskInit(address: RfPriInitF884Reg,
-                       keepMask: 0xCFFF1FFF'u32, setMask: 0x20008000'u32),
-      RadioRegMaskInit(address: RfPriInitF814Reg,
-                       keepMask: 0xFFFFF0FF'u32, setMask: 0x00000300'u32),
-      RadioRegMaskInit(address: RfPriInit884Reg,
-                       keepMask: 0xFFFF7FFF'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: RfRxModeReg,
-                       keepMask: 0xFFFFFFEF'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: RfPriInit78Reg,
-                       keepMask: 0xCFFFFFFF'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: RfPriInit814Reg,
-                       keepMask: 0xFCCFFFFF'u32, setMask: 0x00100000'u32)
-    ]
-
-    RfPriFixedValSuffixInit: array[28, RadioRegMaskInit] = [
-      RadioRegMaskInit(address: RfPriInitHbnReg,
-                       keepMask: 0xF0FFFFFF'u32, setMask: 0x08000000'u32),
-      RadioRegMaskInit(address: RfPriModeCtrlReg,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00001003'u32),
-      RadioRegMaskInit(address: RfPriInitF884Reg,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000004'u32),
-      RadioRegMaskInit(address: RfPriConfigB0Reg,
-                       keepMask: 0xFFFFFF3F'u32, setMask: 0x00000040'u32),
-      RadioRegMaskInit(address: 0x200010CC'u32,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00200000'u32),
-      RadioRegMaskInit(address: RfAcalCtrlReg,
-                       keepMask: 0xFFFFFFF8'u32, setMask: 0x00000005'u32),
-      RadioRegMaskInit(address: RfAcalCtrlReg,
-                       keepMask: 0xFFFFF0FF'u32, setMask: 0x00000A00'u32),
-      RadioRegMaskInit(address: RfTxcalCtrlReg,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000010'u32),
-      RadioRegMaskInit(address: RfPriInit138Reg,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000003'u32),
-      RadioRegMaskInit(address: RfPriConfigB0Reg,
-                       keepMask: 0xFFFFFFFE'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: RfPriConfigB4Reg,
-                       keepMask: 0xFFFCC7FF'u32, setMask: 0x0000C000'u32),
-      RadioRegMaskInit(address: RfCalCtrlReg,
-                       keepMask: 0xFFFFFF7F'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: RfCtrlReg,
-                       keepMask: 0xFFFFFFF3'u32, setMask: 0x00000004'u32),
-      RadioRegMaskInit(address: RfPriInit110cReg,
-                       keepMask: 0xFFFFFF00'u32, setMask: 0x00000066'u32),
-      RadioRegMaskInit(address: RfRoscalCtrlReg,
-                       keepMask: 0xFFFFFF8F'u32, setMask: 0x00000030'u32),
-      RadioRegMaskInit(address: RfPriTxcalDfeReg,
-                       keepMask: 0xFFFF8FFF'u32, setMask: 0x00004000'u32),
-      RadioRegMaskInit(address: RfPriConfigB0Reg,
-                       keepMask: 0xFFFFFFFB'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: RfTxcalParamReg,
-                       keepMask: 0xFFFFF8FF'u32, setMask: 0x00000270'u32),
-      RadioRegMaskInit(address: RfPriInit68Reg,
-                       keepMask: 0xC00C0088'u32, setMask: 0xE17E0244'u32),
-      RadioRegMaskInit(address: RfPriInitD4Reg,
-                       keepMask: 0xFFF0F00F'u32, setMask: 0x00F013C1'u32),
-      RadioRegMaskInit(address: 0x200017BC'u32,
-                       keepMask: 0xFFC00000'u32, setMask: 0x00177124'u32),
-      RadioRegMaskInit(address: 0x200017C0'u32,
-                       keepMask: 0xFFC00000'u32, setMask: 0x0019E0A4'u32),
-      RadioRegMaskInit(address: 0x200017C4'u32,
-                       keepMask: 0xFFC00000'u32, setMask: 0x0019E0A4'u32),
-      RadioRegMaskInit(address: 0x200017C8'u32,
-                       keepMask: 0xFFC00000'u32, setMask: 0x0017C0A4'u32),
-      RadioRegMaskInit(address: 0x200017CC'u32,
-                       keepMask: 0xFFC00000'u32, setMask: 0x0017C0A4'u32),
-      RadioRegMaskInit(address: 0x200017D0'u32,
-                       keepMask: 0xFFC00000'u32, setMask: 0x0017C0A4'u32),
-      RadioRegMaskInit(address: 0x200017D4'u32,
-                       keepMask: 0xFFC00000'u32, setMask: 0x00191064'u32),
-      RadioRegMaskInit(address: 0x200017D8'u32,
-                       keepMask: 0xFFC00000'u32, setMask: 0x00177064'u32)
-    ]
-
-    RfPriStaticInit: array[23, RadioRegMaskInit] = [
-      RadioRegMaskInit(address: RfPriInitPllReg,
-                       keepMask: 0xFFFFF9FF'u32, setMask: 0x000001FC'u32),
-      RadioRegMaskInit(address: RfPriInitPllReg,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000002'u32),
-      RadioRegMaskInit(address: RfPriInitPllReg,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000001'u32),
-      RadioRegMaskInit(address: RfRxModeReg,
-                       keepMask: 0xFFFFE67D'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: RfRxModeReg,
-                       keepMask: 0xFFFFFF9E'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: RfPriInitDfeReg,
-                       keepMask: 0xFF0FFFFF'u32, setMask: 0x00300000'u32),
-      RadioRegMaskInit(address: RfPriInitHbnReg,
-                       keepMask: 0xF0FFFFFF'u32, setMask: 0x08000000'u32),
-      RadioRegMaskInit(address: RfPriModeCtrlReg,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00001003'u32),
-      RadioRegMaskInit(address: RfPriInitF884Reg,
-                       keepMask: 0xF000FFFF'u32, setMask: 0x082000F4'u32),
-      RadioRegMaskInit(address: 0x200010CC'u32,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x10000000'u32),
-      RadioRegMaskInit(address: RfPriInit163cReg,
-                       keepMask: 0x00000000'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: RfPriInit64Reg,
-                       keepMask: 0xFFFE0008'u32, setMask: 0x00004C2C'u32),
-      RadioRegMaskInit(address: RfPriInit128Reg,
-                       keepMask: 0xFF800800'u32, setMask: 0x004C2491'u32),
-      RadioRegMaskInit(address: RfPriInit12cReg,
-                       keepMask: 0xFF800800'u32, setMask: 0x004C24C2'u32),
-      RadioRegMaskInit(address: RfPriInit130Reg,
-                       keepMask: 0xFF800FFF'u32, setMask: 0x00491000'u32),
-      RadioRegMaskInit(address: RfPriInitD4Reg,
-                       keepMask: 0xFFF0F00F'u32, setMask: 0x00F013C1'u32),
-      RadioRegMaskInit(address: RfPriInit90Reg,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00010000'u32),
-      RadioRegMaskInit(address: RfTxcalCtrlReg,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000010'u32),
-      RadioRegMaskInit(address: RfPriInit138Reg,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000003'u32),
-      RadioRegMaskInit(address: RfPriInit130Reg,
-                       keepMask: 0xFFFFFE92'u32, setMask: 0x00000092'u32),
-      RadioRegMaskInit(address: RfPriInit8cReg,
-                       keepMask: 0xFFFFFFF8'u32, setMask: 0x00000002'u32),
-      RadioRegMaskInit(address: RfPriInit1618Reg,
-                       keepMask: 0x3FFFFFFF'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: RfRxModeReg,
-                       keepMask: 0xFFFFFFEF'u32, setMask: 0x00000000'u32)
-    ]
-
-    RfPriGainInit: array[12, RadioRegMaskInit] = [
-      RadioRegMaskInit(address: 0x20001760'u32,
-                       keepMask: 0xFF000000'u32, setMask: 0x00003189'u32),
-      RadioRegMaskInit(address: 0x2000175C'u32,
-                       keepMask: 0xFF000000'u32, setMask: 0x0030F495'u32),
-      RadioRegMaskInit(address: 0x2000179C'u32,
-                       keepMask: 0xC00007FF'u32, setMask: 0xD037D000'u32),
-      RadioRegMaskInit(address: 0x20001794'u32,
-                       keepMask: 0xC00007FF'u32, setMask: 0xD06FF000'u32),
-      RadioRegMaskInit(address: 0x2000178C'u32,
-                       keepMask: 0xC00007FF'u32, setMask: 0xD077E000'u32),
-      RadioRegMaskInit(address: 0x20001784'u32,
-                       keepMask: 0xC00007FF'u32, setMask: 0x10940000'u32),
-      RadioRegMaskInit(address: 0x2000177C'u32,
-                       keepMask: 0xC00007FF'u32, setMask: 0x109C0000'u32),
-      RadioRegMaskInit(address: 0x20001774'u32,
-                       keepMask: 0xC00007FF'u32, setMask: 0x11180000'u32),
-      RadioRegMaskInit(address: 0x2000176C'u32,
-                       keepMask: 0xC00007FF'u32, setMask: 0x115C0000'u32),
-      RadioRegMaskInit(address: 0x20001764'u32,
-                       keepMask: 0xC00007FF'u32, setMask: 0x11FC0000'u32),
-      RadioRegMaskInit(address: RfSynthCtrlReg,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00004007'u32),
-      RadioRegMaskInit(address: RfPriInit163cReg,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00008080'u32)
+                    xtalCountWindowMin: 0x0001A41A'u32,
+                    xtalCountWindowMax: 0x00020D21'u32,
+                    xtalDividerConfig: 0x0FB13B14'u32,
+                    xtalControlCode: 0x00000990'u32)
     ]
 
     RfPriTxPowerRegisterBase: array[43, uint32] = [
@@ -8746,180 +8892,14 @@ when defined(bl808WifiUseBl808Rf):
       [0x0000'u16, 0x0001'u16, 0x0003'u16, 0x0008'u16, 0x0000'u16, 0x0005'u16, 0x0001'u16, 0x0000'u16, 0xFFE2'u16]
     ]
 
-    RfPriCalSavedRegs: array[27, uint32] = [
-      0x20001004'u32, 0x2000102C'u32, 0x2000101C'u32, 0x20001030'u32,
-      0x200010B8'u32, 0x200010C0'u32, 0x200010C4'u32, 0x2000F030'u32,
-      0x20001088'u32, 0x2000108C'u32, 0x20001600'u32, 0x2000160C'u32,
-      0x20001618'u32, 0x2000161C'u32, 0x20001048'u32, 0x2000120C'u32,
-      0x20001214'u32, 0x20001218'u32, 0x2000123C'u32, 0x20001240'u32,
-      0x20001244'u32, 0x200010F0'u32, 0x20001064'u32, 0x20001058'u32,
-      0x20001220'u32, 0x20001074'u32, 0x200010A4'u32
-    ]
-
-    PhyInitBasebandPreAgcInit: array[23, RadioRegMaskInit] = [
-      ## Deterministic part of librf_bl808.a:phy.c.o phy_init+0x318..0x450.
-      RadioRegMaskInit(address: 0x24C00324'u32,
-                       keepMask: 0xFFC0FFFF'u32, setMask: 0x002D0000'u32),
-      RadioRegMaskInit(address: 0x24C00848'u32,
-                       keepMask: 0x00000000'u32, setMask: 0x10000000'u32),
-      RadioRegMaskInit(address: 0x24C00844'u32,
-                       keepMask: 0x00000000'u32, setMask: 0x10000000'u32),
-      RadioRegMaskInit(address: 0x24C008D4'u32,
-                       keepMask: 0xFC00FFFF'u32, setMask: 0x008C0000'u32),
-      RadioRegMaskInit(address: 0x24C008D8'u32,
-                       keepMask: 0xFFFFFC00'u32, setMask: 0x0000006B'u32),
-      RadioRegMaskInit(address: 0x24C008D8'u32,
-                       keepMask: 0xFC00FFFF'u32, setMask: 0x00890000'u32),
-      RadioRegMaskInit(address: 0x24C008E0'u32,
-                       keepMask: 0xFFFFFC00'u32, setMask: 0x00000032'u32),
-      RadioRegMaskInit(address: 0x24C008E4'u32,
-                       keepMask: 0x00000000'u32, setMask: 0x00740000'u32),
-      RadioRegMaskInit(address: 0x24C008E0'u32,
-                       keepMask: 0xFC00FFFF'u32, setMask: 0x00860000'u32),
-      RadioRegMaskInit(address: 0x24C00814'u32,
-                       keepMask: 0xFFF00FFF'u32, setMask: 0x0000A000'u32),
-      RadioRegMaskInit(address: 0x24C00894'u32,
-                       keepMask: 0xFFEFFFFF'u32, setMask: 0x00100000'u32),
-      RadioRegMaskInit(address: 0x24C00834'u32,
-                       keepMask: 0xFFFFFFEF'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: 0x24940010'u32,
-                       keepMask: 0xF7FFFFFF'u32, setMask: 0x08000000'u32),
-      RadioRegMaskInit(address: 0x24C0C01C'u32,
-                       keepMask: 0x00000000'u32, setMask: 0x000000A0'u32),
-      RadioRegMaskInit(address: 0x24C0B100'u32,
-                       keepMask: 0xFFFF80FF'u32, setMask: 0x00005000'u32),
-      RadioRegMaskInit(address: 0x24C0B100'u32,
-                       keepMask: 0xFFFFFF80'u32, setMask: 0x00000050'u32),
-      RadioRegMaskInit(address: 0x24C0C80C'u32,
-                       keepMask: 0x00FFFFFF'u32, setMask: 0xA8000000'u32),
-      RadioRegMaskInit(address: 0x24C0B390'u32,
-                       keepMask: 0xFFFFEFFF'u32, setMask: 0x00001000'u32),
-      RadioRegMaskInit(address: 0x24940010'u32,
-                       keepMask: 0xDFFFFFFF'u32, setMask: 0x20000000'u32),
-      RadioRegMaskInit(address: 0x24C0B390'u32,
-                       keepMask: 0xFFFFEFFF'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: 0x24C0B390'u32,
-                       keepMask: 0xFFFEFFFF'u32, setMask: 0x00010000'u32),
-      RadioRegMaskInit(address: 0x24C0B390'u32,
-                       keepMask: 0xFFFFFBFF'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: 0x24940010'u32,
-                       keepMask: 0xDFFFFFFF'u32, setMask: 0x00000000'u32)
-    ]
-
-    PhyInitAgcCoreInit: array[54, RadioRegMaskInit] = [
-      ## Deterministic part of phy_init+0x4ba..0x938.
-      RadioRegMaskInit(address: 0x24C0B3A4'u32,
-                       keepMask: 0xFFFFFF00'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: 0x24C0B3A4'u32,
-                       keepMask: 0xFFFF00FF'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: 0x24C0B394'u32,
-                       keepMask: 0xFF00FFFF'u32, setMask: 0x00F80000'u32),
-      RadioRegMaskInit(address: 0x24C0B398'u32,
-                       keepMask: 0xFFFF00FF'u32, setMask: 0x00009E00'u32),
-      RadioRegMaskInit(address: 0x24C0B3C4'u32,
-                       keepMask: 0xFFFFFF00'u32, setMask: 0x000000CE'u32),
-      RadioRegMaskInit(address: 0x24C0B364'u32,
-                       keepMask: 0xE0FFFFFF'u32, setMask: 0x08000000'u32),
-      RadioRegMaskInit(address: 0x24C0B364'u32,
-                       keepMask: 0xFFC0FFFF'u32, setMask: 0x003C0000'u32),
-      RadioRegMaskInit(address: 0x24C0B364'u32,
-                       keepMask: 0xFFFFC0FF'u32, setMask: 0x00003A00'u32),
-      RadioRegMaskInit(address: 0x24C0B364'u32,
-                       keepMask: 0xFFFFFFC0'u32, setMask: 0x0000003B'u32),
-      RadioRegMaskInit(address: 0x24C0B368'u32,
-                       keepMask: 0xFFC00FFF'u32, setMask: 0x00270000'u32),
-      RadioRegMaskInit(address: 0x24C0B368'u32,
-                       keepMask: 0xFFFFFC00'u32, setMask: 0x00000270'u32),
-      RadioRegMaskInit(address: 0x24C0B36C'u32,
-                       keepMask: 0xFFFFFF00'u32, setMask: 0x00000010'u32),
-      RadioRegMaskInit(address: 0x24C0B36C'u32,
-                       keepMask: 0xFFFFF8FF'u32, setMask: 0x00000500'u32),
-      RadioRegMaskInit(address: 0x24C0B36C'u32,
-                       keepMask: 0xFF00FFFF'u32, setMask: 0x00200000'u32),
-      RadioRegMaskInit(address: 0x24C0B36C'u32,
-                       keepMask: 0xF8FFFFFF'u32, setMask: 0x05000000'u32),
-      RadioRegMaskInit(address: 0x24C0B370'u32,
-                       keepMask: 0xFF80FFFF'u32, setMask: 0x00580000'u32),
-      RadioRegMaskInit(address: 0x24C0B3C0'u32,
-                       keepMask: 0x00FFFFFF'u32, setMask: 0x18000000'u32),
-      RadioRegMaskInit(address: 0x24C0B3C4'u32,
-                       keepMask: 0xFF00FFFF'u32, setMask: 0x00E00000'u32),
-      RadioRegMaskInit(address: 0x24C0B3C4'u32,
-                       keepMask: 0x00FFFFFF'u32, setMask: 0xDC000000'u32),
-      RadioRegMaskInit(address: 0x24C0B3A0'u32,
-                       keepMask: 0xFFFFFF00'u32, setMask: 0x0000009D'u32),
-      RadioRegMaskInit(address: 0x24C0B3C0'u32,
-                       keepMask: 0xFFFFFF00'u32, setMask: 0x000000B0'u32),
-      RadioRegMaskInit(address: 0x24C0B380'u32,
-                       keepMask: 0xFFF03FFF'u32, setMask: 0x000F8000'u32),
-      RadioRegMaskInit(address: 0x24C0B380'u32,
-                       keepMask: 0xFC0FFFFF'u32, setMask: 0x03700000'u32),
-      RadioRegMaskInit(address: 0x24C0B380'u32,
-                       keepMask: 0x03FFFFFF'u32, setMask: 0x04000000'u32),
-      RadioRegMaskInit(address: 0x24C0B380'u32,
-                       keepMask: 0xFFFFDFFF'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: 0x24C0B380'u32,
-                       keepMask: 0xFFFFE3FF'u32, setMask: 0x00000400'u32),
-      RadioRegMaskInit(address: 0x24C0B384'u32,
-                       keepMask: 0x03FFFFFF'u32, setMask: 0xE4000000'u32),
-      RadioRegMaskInit(address: 0x24C0B384'u32,
-                       keepMask: 0xFC0FFFFF'u32, setMask: 0x03700000'u32),
-      RadioRegMaskInit(address: 0x24C0B384'u32,
-                       keepMask: 0xFFF03FFF'u32, setMask: 0x00050000'u32),
-      RadioRegMaskInit(address: 0x24C0B384'u32,
-                       keepMask: 0xFFFFDFFF'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: 0x24C0B384'u32,
-                       keepMask: 0xFFFFE3FF'u32, setMask: 0x00001800'u32),
-      RadioRegMaskInit(address: 0x24C0B388'u32,
-                       keepMask: 0x03FFFFFF'u32, setMask: 0x3C000000'u32),
-      RadioRegMaskInit(address: 0x24C0B388'u32,
-                       keepMask: 0xFC0FFFFF'u32, setMask: 0x01700000'u32),
-      RadioRegMaskInit(address: 0x24C0B388'u32,
-                       keepMask: 0xFFF03FFF'u32, setMask: 0x000A8000'u32),
-      RadioRegMaskInit(address: 0x24C0B388'u32,
-                       keepMask: 0xFFFFDFFF'u32, setMask: 0x00000000'u32),
-      RadioRegMaskInit(address: 0x24C0B388'u32,
-                       keepMask: 0xFFFFE3FF'u32, setMask: 0x00001400'u32),
-      RadioRegMaskInit(address: 0x24C0B38C'u32,
-                       keepMask: 0x03FFFFFF'u32, setMask: 0x64000000'u32),
-      RadioRegMaskInit(address: 0x24C0B38C'u32,
-                       keepMask: 0xFC0FFFFF'u32, setMask: 0x03600000'u32),
-      RadioRegMaskInit(address: 0x24C0B38C'u32,
-                       keepMask: 0xFFF03FFF'u32, setMask: 0x000E0000'u32),
-      RadioRegMaskInit(address: 0x24C0B38C'u32,
-                       keepMask: 0xFFFFE3FF'u32, setMask: 0x00001400'u32),
-      RadioRegMaskInit(address: 0x24C0C830'u32,
-                       keepMask: 0x03FFFFFF'u32, setMask: 0xFC000000'u32),
-      RadioRegMaskInit(address: 0x24C0C830'u32,
-                       keepMask: 0xFC0FFFFF'u32, setMask: 0x00100000'u32),
-      RadioRegMaskInit(address: 0x24C0C830'u32,
-                       keepMask: 0xFFF03FFF'u32, setMask: 0x000D8000'u32),
-      RadioRegMaskInit(address: 0x24C0C830'u32,
-                       keepMask: 0xFFFFE3FF'u32, setMask: 0x00001400'u32),
-      RadioRegMaskInit(address: 0x24C0C838'u32,
-                       keepMask: 0x7FFFFFFF'u32, setMask: 0x80000000'u32),
-      RadioRegMaskInit(address: 0x24C0C838'u32,
-                       keepMask: 0xFFF80000'u32, setMask: 0x00000040'u32),
-      RadioRegMaskInit(address: 0x24C0C83C'u32,
-                       keepMask: 0x7FFFFFFF'u32, setMask: 0x80000000'u32),
-      RadioRegMaskInit(address: 0x24C0C83C'u32,
-                       keepMask: 0xFFF00000'u32, setMask: 0x00000040'u32),
-      RadioRegMaskInit(address: 0x24C0C840'u32,
-                       keepMask: 0x7FFFFFFF'u32, setMask: 0x80000000'u32),
-      RadioRegMaskInit(address: 0x24C0C840'u32,
-                       keepMask: 0xFFC00000'u32, setMask: 0x00000036'u32),
-      RadioRegMaskInit(address: 0x24C0B004'u32,
-                       keepMask: 0x00000000'u32, setMask: 0x00000001'u32),
-      RadioRegMaskInit(address: 0x24C0B390'u32,
-                       keepMask: 0xFFFFFFFC'u32, setMask: 0x00000001'u32),
-      RadioRegMaskInit(address: 0x24C0B3BC'u32,
-                       keepMask: 0x00000000'u32, setMask: 0x001E8480'u32),
-      RadioRegMaskInit(address: 0x24C0B414'u32,
-                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000100'u32)
-    ]
-
   template rfRegs(): ptr RfRegBlock =
     cast[ptr RfRegBlock](RfBase)
+
+  template rfPllRegs(): ptr RfPllBlock =
+    cast[ptr RfPllBlock](RfPllBase)
+
+  template rfAuxCtrlRegs(): ptr RfAuxCtrlBlock =
+    cast[ptr RfAuxCtrlBlock](RfAuxCtrlBase)
 
   template phyRegs(): ptr PhyAgcBlock =
     cast[ptr PhyAgcBlock](PhyBase)
@@ -8930,33 +8910,36 @@ when defined(bl808WifiUseBl808Rf):
   template wifiModemRegs(): ptr WifiModemBlock =
     cast[ptr WifiModemBlock](WifiModemBase)
 
+  template macPhyCtrlRegs(): ptr MacPhyCtrlBlock =
+    cast[ptr MacPhyCtrlBlock](MacPhyCtrlBase)
+
+  template crmPhyClockRegs(): ptr CrmPhyClockBlock =
+    cast[ptr CrmPhyClockBlock](CrmPhyClockBase)
+
+  template rfDfeInitRegs(): ptr RfDfeInitBlock =
+    cast[ptr RfDfeInitBlock](RfDfeInitBase)
+
   template bbaAgcRegs(): ptr BbaAgcBlock =
-    cast[ptr BbaAgcBlock](0x24C0B000'u)
+    cast[ptr BbaAgcBlock](BbaAgcBase)
+
+  template rfTxPowerCompTableRegs(): ptr RfTxPowerCompTableBlock =
+    cast[ptr RfTxPowerCompTableBlock](RfBase)
+
+  template wifiAgcMemoryRegs(): ptr WifiAgcMemoryRam =
+    cast[ptr WifiAgcMemoryRam](WifiAgcMemoryBase)
 
   proc updateReg32(reg: ptr uint32, clearMask, setMask: uint32) {.inline.} =
     volatileStore(reg, (volatileLoad(reg) and clearMask) or setMask)
 
-  proc readReg32(regAddr: uint32): uint32 {.inline.} =
-    volatileLoad(cast[ptr uint32](regAddr.uint))
-
-  proc writeRadioRegMaskInit(table: openArray[RadioRegMaskInit]) =
-    for item in table:
-      updateReg32(cast[ptr uint32](item.address.uint), item.keepMask, item.setMask)
-
-  proc writeRadioRegMaskInitRange(
-      table: openArray[RadioRegMaskInit], first, lastExcl: int) =
-    for i in first ..< lastExcl:
-      let item = table[i]
-      updateReg32(cast[ptr uint32](item.address.uint), item.keepMask, item.setMask)
-
-  proc writeRadioMemoryWords(base: uint32, words: openArray[uint32]) =
+  proc writeRfTxPowerCompTable(words: openArray[uint32]) =
+    let table = rfTxPowerCompTableRegs()
     for i, word in words:
-      volatileStore(cast[ptr uint32]((base + uint32(i) * 4'u32).uint), word)
+      volatileStore(addr table.txPowerCompWords700[i], word)
 
   proc waitRfUs(us: uint32) {.inline.} =
     arch_delay_us(us)
 
-  proc wlModeFromApi(apiMode: uint8): RadioPhyMode {.inline.} =
+  proc radioPhyModeFromApi(apiMode: uint8): RadioPhyMode {.inline.} =
     case apiMode
     of WlApiModeBle:
       bleOnly
@@ -8964,6 +8947,15 @@ when defined(bl808WifiUseBl808Rf):
       wifiBleCoex
     else:
       wifiOnly
+
+  proc apiFromRadioPhyMode(mode: RadioPhyMode): uint8 {.inline.} =
+    case mode
+    of bleOnly:
+      WlApiModeBle
+    of wifiBleCoex:
+      WlApiModeAll
+    else:
+      WlApiModeWlan
 
   proc xtalIndex(xtalfreqHz: uint32): uint32 {.inline.} =
     case xtalfreqHz
@@ -9055,7 +9047,7 @@ when defined(bl808WifiUseBl808Rf):
     0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32,
     0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0xC0088D03'u32]
 
-  var bbaEnv {.align: 4.}: array[20, uint8]
+  var bbaEnv {.align: 4.}: BbaRuntimeState
   const
     BbaPdThresholdAttack: array[4, int8] = [-100'i8, -70'i8, -48'i8, -36'i8]
     BbaPdThresholdRelease: array[4, int8] = [-100'i8, -75'i8, -53'i8, -41'i8]
@@ -9063,23 +9055,14 @@ when defined(bl808WifiUseBl808Rf):
   var wlCfgGlobal* {.exportc: "wl_cfg".}: pointer
   var phy_env* {.exportc.}: array[48, uint8]
 
-  template bbaEnvByte(offset: uint): ptr uint8 =
-    cast[ptr uint8](cast[uint](addr bbaEnv[0]) + offset)
+  template bbaState(): ptr BbaRuntimeState =
+    addr bbaEnv
 
-  template bbaEnvHalf(offset: uint): ptr uint16 =
-    cast[ptr uint16](cast[uint](addr bbaEnv[0]) + offset)
+  template bbaRxVecPtr(rxVector: pointer): ptr BbaRxVectorView =
+    cast[ptr BbaRxVectorView](rxVector)
 
-  template bbaEnvWord(offset: uint): ptr uint32 =
-    cast[ptr uint32](cast[uint](addr bbaEnv[0]) + offset)
-
-  template phyEnvByte(offset: uint): ptr uint8 =
-    cast[ptr uint8](cast[uint](addr phy_env[0]) + offset)
-
-  template phyEnvHalf(offset: uint): ptr uint16 =
-    cast[ptr uint16](cast[uint](addr phy_env[0]) + offset)
-
-  template phyEnvWord(offset: uint): ptr uint32 =
-    cast[ptr uint32](cast[uint](addr phy_env[0]) + offset)
+  template phyEnvViewPtr(): ptr PhyEnvView =
+    cast[ptr PhyEnvView](addr phy_env[0])
 
   proc crm_get_mac_freq(): uint32 {.exportc, cdecl.} =
     ## crm_bl616.c.o crm_get_mac_freq returns 60 MHz.
@@ -9087,24 +9070,27 @@ when defined(bl808WifiUseBl808Rf):
 
   proc crm_init() {.exportc, cdecl.} =
     ## Port of crm_bl616.c.o crm_init: set RF clock mux bits at 0x24940010.
-    updateReg32(cast[ptr uint32](0x24940010'u), 0xF8000000'u32, 0x08000000'u32)
+    updateReg32(addr crmPhyClockRegs().rfClockMux10,
+                0xF8000000'u32, 0x08000000'u32)
 
   proc crm_mdm_reset() {.exportc, cdecl.} =
     ## Port of crm_bl616.c.o crm_mdm_reset.
-    volatileStore(cast[ptr uint32](0x24940018'u), 0x11'u32)
+    volatileStore(addr crmPhyClockRegs().modemReset18, 0x11'u32)
     arch_delay_us(1'u32)
-    volatileStore(cast[ptr uint32](0x24940018'u), 0'u32)
+    volatileStore(addr crmPhyClockRegs().modemReset18, 0'u32)
     arch_delay_us(1'u32)
 
   proc crm_clk_set(bandwidth: uint32) {.exportc, cdecl.} =
     ## Port of crm_bl616.c.o crm_clk_set. bandwidth 0 selects the default PHY
     ## clock bits; bandwidth 1 selects the alternate 40 MHz bit pattern.
     if bandwidth == 0'u32:
-      updateReg32(cast[ptr uint32](0x24940008'u), 0xFFFFFFCF'u32, 0'u32)
-      updateReg32(cast[ptr uint32](0x24940008'u), 0xFFFFFF3F'u32, 0'u32)
+      updateReg32(addr crmPhyClockRegs().phyClockSelect8, 0xFFFFFFCF'u32, 0'u32)
+      updateReg32(addr crmPhyClockRegs().phyClockSelect8, 0xFFFFFF3F'u32, 0'u32)
     elif bandwidth == 1'u32:
-      updateReg32(cast[ptr uint32](0x24940008'u), 0xFFFFFFCF'u32, 0x10'u32)
-      updateReg32(cast[ptr uint32](0x24940008'u), 0xFFFFFF3F'u32, 0x40'u32)
+      updateReg32(addr crmPhyClockRegs().phyClockSelect8,
+                  0xFFFFFFCF'u32, 0x10'u32)
+      updateReg32(addr crmPhyClockRegs().phyClockSelect8,
+                  0xFFFFFF3F'u32, 0x40'u32)
 
   proc signExtend(value: uint32, bits: uint32): int32 {.inline.} =
     let shift = 32'u32 - bits
@@ -9127,7 +9113,7 @@ when defined(bl808WifiUseBl808Rf):
       updateReg32(addr bba.pdComp36c, 0xFFFFFF00'u32, 0x00000014'u32)
       updateReg32(addr bba.pdTiming3ac, 0xFFFFFF00'u32, 0x000000C8'u32)
       updateReg32(addr bba.pdTiming3ac, 0xFFF00FFF'u32, 0x000C5000'u32)
-      volatileStore(bbaEnvByte(9'u), 2'u8)
+      volatileStore(addr bbaState().pdGainCode, 2'u8)
     of 1'u32:
       updateReg32(addr bba.pdGain390, 0xFFFFFEFF'u32, 0'u32)
       updateReg32(addr bba.pdGain390, 0xFFFFFFFF'u32, 0x00000200'u32)
@@ -9137,7 +9123,7 @@ when defined(bl808WifiUseBl808Rf):
       updateReg32(addr bba.pdTiming3ac, 0xFFF00FFF'u32, 0x000BF000'u32)
       updateReg32(addr mdm.rxGainTimingC044, 0xFFFF00FF'u32, 0x00000600'u32)
       updateReg32(addr bba.pdComp36c, 0xFFFFFF00'u32, 0x00000014'u32)
-      volatileStore(bbaEnvByte(9'u), 1'u8)
+      volatileStore(addr bbaState().pdGainCode, 1'u8)
     of 3'u32:
       updateReg32(addr bba.pdGain390, 0xFFFFFFFF'u32, 0x00000100'u32)
       updateReg32(addr bba.pdGain390, 0xFFFFFFFF'u32, 0x00000200'u32)
@@ -9147,7 +9133,7 @@ when defined(bl808WifiUseBl808Rf):
       updateReg32(addr bba.pdComp36c, 0xFFFFFF00'u32, 0x00000014'u32)
       updateReg32(addr bba.pdTiming3ac, 0xFFFFFF00'u32, 0x000000CC'u32)
       updateReg32(addr bba.pdTiming3ac, 0xFFF00FFF'u32, 0x000C9000'u32)
-      volatileStore(bbaEnvByte(9'u), 3'u8)
+      volatileStore(addr bbaState().pdGainCode, 3'u8)
     else:
       updateReg32(addr bba.pdGain390, 0xFFFFFEFF'u32, 0'u32)
       updateReg32(addr bba.pdGain390, 0xFFFFFDFF'u32, 0'u32)
@@ -9157,74 +9143,83 @@ when defined(bl808WifiUseBl808Rf):
       updateReg32(addr bba.pdTiming3ac, 0xFFF00FFF'u32, 0x000BF000'u32)
       updateReg32(addr mdm.rxGainTimingC044, 0xFFFF00FF'u32, 0x00000800'u32)
       updateReg32(addr bba.pdComp36c, 0xFFFFFF00'u32, 0x00000010'u32)
-      volatileStore(bbaEnvByte(9'u), 0'u8)
+      volatileStore(addr bbaState().pdGainCode, 0'u8)
 
   proc bba_init() {.exportc, cdecl.} =
     ## Port of librf_bl808.a:bba.c.o bba_init+0x0..0x106.
     let bba = bbaAgcRegs()
-    volatileStore(bbaEnvByte(10'u), 1'u8)
-    volatileStore(bbaEnvHalf(16'u), 10'u16)
-    volatileStore(bbaEnvWord(0'u), 0'u32)
-    volatileStore(bbaEnvWord(4'u), 0'u32)
-    volatileStore(bbaEnvByte(8'u), 0'u8)
-    volatileStore(bbaEnvByte(12'u), 0'u8)
-    volatileStore(bbaEnvByte(18'u), 0'u8)
-    volatileStore(bbaEnvHalf(14'u), 0'u16)
+    let rf = rfRegs()
+    volatileStore(addr bbaState().pdCompCurrent, 1'u8)
+    volatileStore(addr bbaState().ceUpdateInterval, 10'u8)
+    volatileStore(addr bbaState().ceUpdateCount, 0'u8)
+    volatileStore(addr bbaState().ceLoopScratch0, 0'u32)
+    volatileStore(addr bbaState().ceLoopScratch4, 0'u32)
+    volatileStore(addr bbaState().pdRssiState, 0'u8)
+    volatileStore(addr bbaState().pdLoopReserved12, 0'u8)
+    volatileStore(addr bbaState().ceCapcodeHoldoff, 0'u8)
+    volatileStore(addr bbaState().cePpmAccumulator, 0'u16)
     bbaSetPdGain(0'u32)
     updateReg32(addr bba.pdGain390, 0xFFFFFF0F'u32, 0'u32)
     updateReg32(addr bba.pdCompC830, 0xFC0FFFFF'u32, 0x00100000'u32)
-    volatileStore(bbaEnvByte(11'u), 0'u8)
-    updateReg32(cast[ptr uint32](0x2000150C'u), 0xFFFFFEFF'u32, 0'u32)
-    updateReg32(cast[ptr uint32](0x2000150C'u), 0xFFFFFDFF'u32, 0'u32)
+    volatileStore(addr bbaState().pdCompLatch, 0'u8)
+    updateReg32(addr rf.pdCompLatchCtrl50c, 0xFFFFFEFF'u32, 0'u32)
+    updateReg32(addr rf.pdCompLatchCtrl50c, 0xFFFFFDFF'u32, 0'u32)
 
   proc bba_reset() {.exportc, cdecl.} =
     ## Port of librf_bl808.a:bba.c.o bba_reset+0x0..0x8a.
     let bba = bbaAgcRegs()
-    volatileStore(bbaEnvWord(8'u), 0x00010000'u32)
-    volatileStore(bbaEnvHalf(16'u), 10'u16)
-    volatileStore(bbaEnvWord(0'u), 0'u32)
-    volatileStore(bbaEnvWord(4'u), 0'u32)
-    volatileStore(bbaEnvByte(12'u), 0'u8)
-    volatileStore(bbaEnvHalf(14'u), 0'u16)
-    volatileStore(bbaEnvByte(18'u), 0'u8)
+    let rf = rfRegs()
+    volatileStore(addr bbaState().pdRssiState, 0'u8)
+    volatileStore(addr bbaState().pdGainCode, 0'u8)
+    volatileStore(addr bbaState().pdCompCurrent, 1'u8)
+    volatileStore(addr bbaState().pdCompLatch, 0'u8)
+    volatileStore(addr bbaState().ceUpdateInterval, 10'u8)
+    volatileStore(addr bbaState().ceUpdateCount, 0'u8)
+    volatileStore(addr bbaState().ceLoopScratch0, 0'u32)
+    volatileStore(addr bbaState().ceLoopScratch4, 0'u32)
+    volatileStore(addr bbaState().pdLoopReserved12, 0'u8)
+    volatileStore(addr bbaState().cePpmAccumulator, 0'u16)
+    volatileStore(addr bbaState().ceCapcodeHoldoff, 0'u8)
     bbaSetPdGain(0'u32)
     updateReg32(addr bba.pdGain390, 0xFFFFFF0F'u32, 0'u32)
     updateReg32(addr bba.pdCompC830, 0xFC0FFFFF'u32, 0x00100000'u32)
-    volatileStore(bbaEnvByte(11'u), 0'u8)
-    updateReg32(cast[ptr uint32](0x2000150C'u), 0xFFFFFEFF'u32, 0'u32)
-    updateReg32(cast[ptr uint32](0x2000150C'u), 0xFFFFFDFF'u32, 0'u32)
+    volatileStore(addr bbaState().pdCompLatch, 0'u8)
+    updateReg32(addr rf.pdCompLatchCtrl50c, 0xFFFFFEFF'u32, 0'u32)
+    updateReg32(addr rf.pdCompLatchCtrl50c, 0xFFFFFDFF'u32, 0'u32)
 
   proc bbaSetPdLatch(enable: bool) =
+    let rf = rfRegs()
     if enable:
-      updateReg32(cast[ptr uint32](0x2000150C'u), 0xFFFFFFFF'u32, 0x00000100'u32)
-      updateReg32(cast[ptr uint32](0x2000150C'u), 0xFFFFFDFF'u32, 0'u32)
-      volatileStore(bbaEnvByte(11'u), 1'u8)
+      updateReg32(addr rf.pdCompLatchCtrl50c, 0xFFFFFFFF'u32, 0x00000100'u32)
+      updateReg32(addr rf.pdCompLatchCtrl50c, 0xFFFFFDFF'u32, 0'u32)
+      volatileStore(addr bbaState().pdCompLatch, 1'u8)
     else:
-      updateReg32(cast[ptr uint32](0x2000150C'u), 0xFFFFFEFF'u32, 0'u32)
-      updateReg32(cast[ptr uint32](0x2000150C'u), 0xFFFFFDFF'u32, 0'u32)
-      volatileStore(bbaEnvByte(11'u), 0'u8)
+      updateReg32(addr rf.pdCompLatchCtrl50c, 0xFFFFFEFF'u32, 0'u32)
+      updateReg32(addr rf.pdCompLatchCtrl50c, 0xFFFFFDFF'u32, 0'u32)
+      volatileStore(addr bbaState().pdCompLatch, 0'u8)
 
   proc bbaUpdatePdComp(target: uint8) =
-    if volatileLoad(bbaEnvByte(10'u)) == target:
+    if volatileLoad(addr bbaState().pdCompCurrent) == target:
       return
     let bba = bbaAgcRegs()
     updateReg32(addr bba.pdGain390, 0xFFFFFF0F'u32, 0'u32)
     updateReg32(addr bba.pdCompC830, 0xFC0FFFFF'u32, target.uint32 shl 20)
-    volatileStore(bbaEnvByte(10'u), target)
+    volatileStore(addr bbaState().pdCompCurrent, target)
 
   proc bbaCeUpdateCapcode() =
     ## Port of bba_ce_update_capcode+0x0..0x9e, using wl_cfg capcode callbacks.
     if wlCfgGlobal == nil:
       return
-    let offset = signExtend(volatileLoad(bbaEnvHalf(14'u)).uint32, 16'u32)
+    let offset = signExtend(
+      volatileLoad(addr bbaState().cePpmAccumulator).uint32, 16'u32)
     if offset == 0'i32:
       return
     let cfg = cast[ptr WlRfConfig](wlCfgGlobal)
-    if cfg.capcodeGet == nil or cfg.capcodeSet == nil:
+    if cfg.capcodeGetCallback == nil or cfg.capcodeSetCallback == nil:
       return
     var capcode: uint8
     var capcodeAux: uint8
-    cast[proc(a: ptr uint8, b: ptr uint8) {.cdecl.}](cfg.capcodeGet)(
+    cast[proc(a: ptr uint8, b: ptr uint8) {.cdecl.}](cfg.capcodeGetCallback)(
       addr capcode, addr capcodeAux)
     var next = capcode
     if offset > 0'i32:
@@ -9239,39 +9234,43 @@ when defined(bl808WifiUseBl808Rf):
       next = capcode + 1'u8
       if next == capcode:
         return
-    cast[proc(a: uint8) {.cdecl.}](cfg.capcodeSet)(next)
-    volatileStore(bbaEnvHalf(14'u), 0'u16)
-    volatileStore(bbaEnvByte(18'u), 1'u8)
+    cast[proc(a: uint8) {.cdecl.}](cfg.capcodeSetCallback)(next)
+    volatileStore(addr bbaState().cePpmAccumulator, 0'u16)
+    volatileStore(addr bbaState().ceCapcodeHoldoff, 1'u8)
 
   proc bbaCeLoop(rssi: int32, ppm: int32) =
     ## Port of librf_bl808.a:bba.c.o bba_ce_loop+0x0..0xae.
     let ppm6 = signExtend(uint32((ppm shl 6) and 0xFFFF'i32), 16'u32)
-    if volatileLoad(bbaEnvByte(18'u)) == 1'u8:
-      let count = volatileLoad(bbaEnvByte(17'u))
-      if count < volatileLoad(bbaEnvByte(16'u)):
-        volatileStore(bbaEnvByte(17'u), count + 1'u8)
+    if volatileLoad(addr bbaState().ceCapcodeHoldoff) == 1'u8:
+      let count = volatileLoad(addr bbaState().ceUpdateCount)
+      if count < volatileLoad(addr bbaState().ceUpdateInterval):
+        volatileStore(addr bbaState().ceUpdateCount, count + 1'u8)
         return
-      volatileStore(bbaEnvByte(17'u), 0'u8)
-      volatileStore(bbaEnvByte(18'u), 0'u8)
+      volatileStore(addr bbaState().ceUpdateCount, 0'u8)
+      volatileStore(addr bbaState().ceCapcodeHoldoff, 0'u8)
 
     if abs(ppm6) > 0xC0'i32:
-      var accum = signExtend(volatileLoad(bbaEnvHalf(14'u)).uint32, 16'u32)
+      var accum = signExtend(
+        volatileLoad(addr bbaState().cePpmAccumulator).uint32, 16'u32)
       if rssi < -85'i32:
         accum += ppm6
       elif rssi < -65'i32:
         accum += ppm shl 7
       else:
         accum += ppm shl 8
-      volatileStore(bbaEnvHalf(14'u), uint16(accum and 0xFFFF'i32))
+      volatileStore(
+        addr bbaState().cePpmAccumulator, uint16(accum and 0xFFFF'i32))
 
-    if abs(signExtend(volatileLoad(bbaEnvHalf(14'u)).uint32, 16'u32)) > 0x180'i32:
+    if abs(signExtend(
+        volatileLoad(addr bbaState().cePpmAccumulator).uint32,
+        16'u32)) > 0x180'i32:
       bbaCeUpdateCapcode()
 
   proc bbaPdLoop(rssi: int32) =
     ## Port of librf_bl808.a:bba.c.o bba_pd_loop+0x0..0x21a.
-    let state = volatileLoad(bbaEnvByte(8'u))
+    let state = volatileLoad(addr bbaState().pdRssiState)
     var nextState = state
-    var targetComp = volatileLoad(bbaEnvByte(11'u))
+    var targetComp = volatileLoad(addr bbaState().pdCompLatch)
     var changeGain = false
 
     case state
@@ -9312,9 +9311,9 @@ when defined(bl808WifiUseBl808Rf):
         elif rssi < BbaPdThresholdRelease[3].int32:
           targetComp = 0'u8
         else:
-          targetComp = volatileLoad(bbaEnvByte(11'u))
+          targetComp = volatileLoad(addr bbaState().pdCompLatch)
       else:
-        if volatileLoad(bbaEnvByte(11'u)) != 1'u8:
+        if volatileLoad(addr bbaState().pdCompLatch) != 1'u8:
           bbaSetPdLatch(true)
         targetComp = 0'u8
     else:
@@ -9322,9 +9321,9 @@ when defined(bl808WifiUseBl808Rf):
 
     if changeGain:
       bbaSetPdGain(nextState.uint32)
-      volatileStore(bbaEnvByte(8'u), nextState)
+      volatileStore(addr bbaState().pdRssiState, nextState)
 
-    if volatileLoad(bbaEnvByte(11'u)) != 0'u8 and targetComp == 0'u8:
+    if volatileLoad(addr bbaState().pdCompLatch) != 0'u8 and targetComp == 0'u8:
       bbaSetPdLatch(false)
 
     bbaUpdatePdComp(targetComp)
@@ -9334,7 +9333,8 @@ when defined(bl808WifiUseBl808Rf):
     ## subphases.
     if frameType != 0x80'u32 or rxVector == nil:
       return
-    let rssi = signExtend(volatileLoad(cast[ptr uint8](cast[uint](rxVector) + 5'u)).uint32, 8'u32)
+    let rxv = bbaRxVecPtr(rxVector)
+    let rssi = signExtend(volatileLoad(addr rxv.rssiDbm).uint32, 8'u32)
     let ppm = calc_ppm(rxVector).int32
     bbaCeLoop(rssi, ppm)
     bbaPdLoop(rssi)
@@ -9343,22 +9343,28 @@ when defined(bl808WifiUseBl808Rf):
     ## Port of librf_bl808.a:bba.c.o bba_rssi_correction+0x0..0x18.
     if rxVector == nil:
       return
-    if volatileLoad(bbaEnvByte(11'u)) != 0'u8:
-      let byte5 = cast[ptr uint8](cast[uint](rxVector) + 5'u)
-      volatileStore(byte5, volatileLoad(byte5) + 0x14'u8)
+    if volatileLoad(addr bbaState().pdCompLatch) != 0'u8:
+      let rxv = bbaRxVecPtr(rxVector)
+      volatileStore(addr rxv.rssiDbm, volatileLoad(addr rxv.rssiDbm) + 0x14'u8)
+
+  proc bbaRxFormatWord1(rxv: ptr BbaRxVectorView): uint32 {.inline.} =
+    volatileLoad(addr rxv.rxFormatWord1Rate).uint32 or
+      (volatileLoad(addr rxv.rssiDbm).uint32 shl 8) or
+      (volatileLoad(addr rxv.rxFormatWord1Mcs).uint32 shl 16) or
+      (volatileLoad(addr rxv.rxFormatWord1Flags).uint32 shl 24)
 
   proc calc_ppm(rxVector: pointer): int8 {.exportc, cdecl.} =
     ## Port of librf_bl808.a:bba.c.o calc_ppm+0x0..0x44.
     if rxVector == nil:
       return 0'i8
-    let words = cast[ptr UncheckedArray[uint32]](rxVector)
-    let half16 = volatileLoad(cast[ptr uint16](cast[uint](rxVector) + 0x16'u)).uint32
-    if (volatileLoad(addr words[0]) and 0xF'u32) == 0'u32 and
-        bbaExtractBits(volatileLoad(addr words[1]), 7'u32, 4'u32) <= 3'u32:
-      let ppm = signExtend(half16, 8'u32)
+    let rxv = bbaRxVecPtr(rxVector)
+    let carrierOffset = volatileLoad(addr rxv.carrierFreqOffset).uint32
+    if (volatileLoad(addr rxv.rxFormatWord0) and 0xF'u32) == 0'u32 and
+        bbaExtractBits(bbaRxFormatWord1(rxv), 7'u32, 4'u32) <= 3'u32:
+      let ppm = signExtend(carrierOffset, 8'u32)
       return cast[int8](signExtend(uint32((ppm * 3'i32) shr 6), 8'u32))
     else:
-      let ppm = signExtend(half16, 16'u32)
+      let ppm = signExtend(carrierOffset, 16'u32)
       let rounded = (ppm and not 0xF'i32) + (ppm shr 4)
       return cast[int8](signExtend(uint32((-rounded) shr 7), 8'u32))
 
@@ -9376,15 +9382,18 @@ when defined(bl808WifiUseBl808Rf):
       (((extractBits(version, 31'u32, 24'u32) + 2'u32) * 5'u32) shl 1)
 
   proc copyPhyInitCfg(cfg: pointer) =
+    let env = phyEnvViewPtr()
     if cfg != nil:
       let words = cast[ptr UncheckedArray[uint32]](cfg)
       for i in 0 ..< 9:
-        volatileStore(phyEnvWord((i * 4).uint), words[i])
+        volatileStore(addr env.initCfgWords[i], words[i])
     else:
       for i in 0 ..< 9:
-        volatileStore(phyEnvWord((i * 4).uint), 0'u32)
-    volatileStore(phyEnvWord(36'u), 0x00FF0501'u32)
-    volatileStore(phyEnvWord(40'u), 0x00FF0FFF'u32)
+        volatileStore(addr env.initCfgWords[i], 0'u32)
+    volatileStore(addr env.channelBandType, 0x0501'u16)
+    volatileStore(addr env.primaryFreq, 0x00FF'u16)
+    volatileStore(addr env.centerFreq1, 0x0FFF'u16)
+    volatileStore(addr env.centerFreq2OrTxPower, 0x00FF'u16)
 
   proc copyAgcMemory() =
     ## LLVM objdump provenance: librf_bl808.a:phy.c.o phy_init+0x452..0x470
@@ -9392,68 +9401,179 @@ when defined(bl808WifiUseBl808Rf):
     ## WiFi RF archive has no ldpcmem symbol and the decoded WiFi phy/lp_phy
     ## objects do not contain a 0x24C09000 LDPC-memory load path; the 0x24C09000
     ## table load is BLE-only in blecontroller.loadBlePhyMemories().
+    static: doAssert agcmem.len == WifiAgcMemoryWords
+    nimFwDbgPhyInitPhase = 3'u32
+    inc nimFwDbgPhyAgcCopyCount
+    nimFwDbgPhyWifiLdpcAbsent = 1'u32
+    nimFwDbgPhyAgcSourceFirst = agcmem[0]
+    nimFwDbgPhyAgcSourceLast = agcmem[WifiAgcMemoryWords - 1]
     let src = cast[ptr UncheckedArray[uint32]](addr agcmem[0])
-    let dst = cast[ptr UncheckedArray[uint32]](AgcMemoryBase)
-    for i in 0 ..< (sizeof(agcmem) div sizeof(uint32)):
-      volatileStore(addr dst[i], src[i])
+    let dst = wifiAgcMemoryRegs()
+    for i in 0 ..< WifiAgcMemoryWords:
+      volatileStore(addr dst.words[i], src[i])
+    nimFwDbgPhyAgcDestFirst = volatileLoad(addr dst.words[0])
+    nimFwDbgPhyAgcDestLast =
+      volatileLoad(addr dst.words[WifiAgcMemoryWords - 1])
     nimFwAgcAfterCopyProbe()
 
   proc bl808PhyProgramRecoveredRegs() =
-    ## Partial translation of librf_bl808.a:phy.c.o phy_init+0x5a..0x450.
-    ## Fixed writes and the post-copy AGC/core phase are represented in
-    ## tables; dynamic fields use the LLVM-decoded T-Head th.extu operations.
+    ## Partial translation of librf_bl808.a:phy.c.o phy_init+0x5a..0x310.
+    ## Dynamic fields use the LLVM-decoded T-Head th.extu operations.
     let version = modemVersionReg()
     let mdm = wifiModemRegs()
-    let modemBits11to8 = (extractBits(version, 11'u32, 8'u32) - 1'u32) and 0xFF'u32
-    let modemBits15to12 = (extractBits(version, 15'u32, 12'u32) - 1'u32) and 0xFF'u32
-    let modemBits7to4 = (extractBits(version, 7'u32, 4'u32) - 1'u32) and 0xFF'u32
-    let modemBit22OrAc = if extractBits(version, 22'u32, 22'u32) != 0'u32 or
-        extractBits(version, 25'u32, 24'u32) != 0'u32: 0x2'u32 else: 0'u32
-    let modemBit21 = extractBits(version, 21'u32, 21'u32)
-    let modemBit30 = extractBits(version, 30'u32, 30'u32)
-    volatileStore(addr mdm.phyCtrl820, 0x00000005'u32)
-    updateReg32(addr mdm.phyCtrl820, 0xFFFFFF8F'u32, modemBits11to8 shl 4)
-    updateReg32(addr mdm.phyCtrl820, 0xFFFF8FFF'u32, modemBits15to12 shl 12)
-    updateReg32(addr mdm.phyCtrl820, 0xFFFFFEFF'u32,
+    let macPhy = macPhyCtrlRegs()
+    let spatialStreamCountMinus1 =
+      (extractBits(version, 11'u32, 8'u32) - 1'u32) and 0xFF'u32
+    let modemProfile15to12Minus1 =
+      (extractBits(version, 15'u32, 12'u32) - 1'u32) and 0xFF'u32
+    let txChainCountMinus1 =
+      (extractBits(version, 7'u32, 4'u32) - 1'u32) and 0xFF'u32
+    let heOrBandwidthProfile =
+      if extractBits(version, 22'u32, 22'u32) != 0'u32 or
+          extractBits(version, 25'u32, 24'u32) != 0'u32:
+        0x2'u32
+      else:
+        0'u32
+    let modemCapability21 = extractBits(version, 21'u32, 21'u32)
+    let modemCapability30 = extractBits(version, 30'u32, 30'u32)
+    volatileStore(addr mdm.bandwidth20MProfile820, 0x00000005'u32)
+    updateReg32(addr mdm.bandwidth20MProfile820, 0xFFFFFF8F'u32,
+                spatialStreamCountMinus1 shl 4)
+    updateReg32(addr mdm.bandwidth20MProfile820, 0xFFFF8FFF'u32,
+                modemProfile15to12Minus1 shl 12)
+    updateReg32(addr mdm.bandwidth20MProfile820, 0xFFFFFEFF'u32,
                 extractBits(version, 27'u32, 27'u32) shl 8)
-    updateReg32(addr mdm.phyCtrl820, 0xFFFFFFFC'u32, modemBit22OrAc)
-    updateReg32(addr mdm.phyCtrl820, not 0x200'u32, 0x200'u32)
-    updateReg32(addr mdm.phyCtrl800, 0xFFFFF0FF'u32, modemBits11to8 shl 8)
-    updateReg32(addr mdm.phyCtrl820, 0xFFDFFFFF'u32, modemBit21 shl 21)
-    updateReg32(addr mdm.phyCtrl820, 0xFFEFFFFF'u32, modemBit21 shl 20)
-    updateReg32(addr mdm.phyCtrl800, 0xFFFFF0FF'u32, modemBits11to8 shl 8)
-    updateReg32(addr mdm.phyCtrl820, 0xFFFEFFFF'u32,
-                (modemBit21 and modemBit30) shl 16)
-    updateReg32(addr mdm.phyCtrl820, 0xEFFFFFFF'u32,
-                (modemBit21 and modemBit30) shl 28)
-    volatileStore(addr mdm.phyCtrl824, 0x00000005'u32)
-    updateReg32(addr mdm.phyCtrl824, 0xFFFFFF8F'u32, modemBits11to8 shl 4)
-    updateReg32(addr mdm.phyCtrl824, 0xFF8FFFFF'u32, modemBits7to4 shl 20)
-    updateReg32(addr mdm.phyCtrl824, 0xFCFFFFFF'u32,
+    updateReg32(addr mdm.bandwidth20MProfile820, 0xFFFFFFFC'u32,
+                heOrBandwidthProfile)
+    updateReg32(addr mdm.bandwidth20MProfile820, not 0x200'u32, 0x200'u32)
+    updateReg32(addr mdm.versionFeatureCtrl800, 0xFFFFF0FF'u32,
+                spatialStreamCountMinus1 shl 8)
+    updateReg32(addr mdm.bandwidth20MProfile820, 0xFFDFFFFF'u32,
+                modemCapability21 shl 21)
+    updateReg32(addr mdm.bandwidth20MProfile820, 0xFFEFFFFF'u32,
+                modemCapability21 shl 20)
+    updateReg32(addr mdm.versionFeatureCtrl800, 0xFFFFF0FF'u32,
+                spatialStreamCountMinus1 shl 8)
+    updateReg32(addr mdm.bandwidth20MProfile820, 0xFFFEFFFF'u32,
+                (modemCapability21 and modemCapability30) shl 16)
+    updateReg32(addr mdm.bandwidth20MProfile820, 0xEFFFFFFF'u32,
+                (modemCapability21 and modemCapability30) shl 28)
+    volatileStore(addr mdm.channelTypeCtrl824, 0x00000005'u32)
+    updateReg32(addr mdm.channelTypeCtrl824, 0xFFFFFF8F'u32,
+                spatialStreamCountMinus1 shl 4)
+    updateReg32(addr mdm.channelTypeCtrl824, 0xFF8FFFFF'u32,
+                txChainCountMinus1 shl 20)
+    updateReg32(addr mdm.channelTypeCtrl824, 0xFCFFFFFF'u32,
                 extractBits(version, 25'u32, 24'u32) shl 24)
-    updateReg32(addr mdm.phyCtrl824, 0xFFFFFEFF'u32,
+    updateReg32(addr mdm.channelTypeCtrl824, 0xFFFFFEFF'u32,
                 extractBits(version, 26'u32, 26'u32) shl 8)
-    updateReg32(addr mdm.phyCtrl824, 0xFFFFFFFC'u32, modemBit22OrAc)
-    updateReg32(cast[ptr uint32](0x24B00310'u),
-                0xFF8FFFFF'u32, modemBits11to8 shl 20)
-    updateReg32(addr mdm.phyCtrl824, 0xFFFDFFFF'u32,
+    updateReg32(addr mdm.channelTypeCtrl824, 0xFFFFFFFC'u32,
+                heOrBandwidthProfile)
+    updateReg32(addr macPhy.channelBandwidthCtrl310,
+                0xFF8FFFFF'u32, spatialStreamCountMinus1 shl 20)
+    updateReg32(addr mdm.channelTypeCtrl824, 0xFFFDFFFF'u32,
                 ((version shr 4) and 0x20000'u32))
-    updateReg32(addr mdm.phyCtrl800, 0xFFFFFF0F'u32, modemBits11to8 shl 4)
-    updateReg32(addr mdm.phyCtrl824, 0xFFFDFFFF'u32,
+    updateReg32(addr mdm.versionFeatureCtrl800, 0xFFFFFF0F'u32,
+                spatialStreamCountMinus1 shl 4)
+    updateReg32(addr mdm.channelTypeCtrl824, 0xFFFDFFFF'u32,
                 extractBits(version, 31'u32, 31'u32) shl 16)
-    updateReg32(addr mdm.phyCtrl930, not 0x00000F00'u32, 0x00000100'u32)
-    updateReg32(addr mdm.dfeCtrl3bc, not 0'u32, 0x001E8480'u32)
-    updateReg32(addr mdm.dfeCtrl414, not 0'u32, 0x00000100'u32)
-    updateReg32(addr mdm.phyCtrlC40, 0xFE0FFFFF'u32, 0x00E00000'u32)
-    updateReg32(addr mdm.phyCtrlC44, 0xFFF0FFFF'u32, 0x00001000'u32)
-    writeRadioRegMaskInitRange(PhyInitBasebandPreAgcInit, 0, 19)
+    updateReg32(addr mdm.channelModeCtrl930, not 0x00000F00'u32, 0x00000100'u32)
+    updateReg32(addr mdm.basebandDfeTimeout3bc, not 0'u32, 0x001E8480'u32)
+    updateReg32(addr mdm.basebandDfeEnable414, not 0'u32, 0x00000100'u32)
+    updateReg32(addr mdm.basebandRxPathCtrlC40, 0xFE0FFFFF'u32, 0x00E00000'u32)
+    updateReg32(addr mdm.basebandRxPathCtrlC44, 0xFFF0FFFF'u32, 0x00001000'u32)
+
+  proc bl808PhyProgramPreAgcRegs() =
+    ## Deterministic typed port of librf_bl808.a:phy.c.o phy_init+0x318..0x43c.
+    let mdm = wifiModemRegs()
+    let bba = bbaAgcRegs()
+    let crm = crmPhyClockRegs()
+    updateReg32(addr mdm.preAgcCtrl324, 0xFFC0FFFF'u32, 0x002D0000'u32)
+    updateReg32(addr mdm.preAgcSignal848, 0x00000000'u32, 0x10000000'u32)
+    updateReg32(addr mdm.preAgcSignal844, 0x00000000'u32, 0x10000000'u32)
+    updateReg32(addr mdm.preAgcTiming8d4, 0xFC00FFFF'u32, 0x008C0000'u32)
+    updateReg32(addr mdm.preAgcTiming8d8, 0xFFFFFC00'u32, 0x0000006B'u32)
+    updateReg32(addr mdm.preAgcTiming8d8, 0xFC00FFFF'u32, 0x00890000'u32)
+    updateReg32(addr mdm.preAgcTiming8e0, 0xFFFFFC00'u32, 0x00000032'u32)
+    updateReg32(addr mdm.preAgcTiming8e4, 0x00000000'u32, 0x00740000'u32)
+    updateReg32(addr mdm.preAgcTiming8e0, 0xFC00FFFF'u32, 0x00860000'u32)
+    updateReg32(addr mdm.bandwidth20MGuard814, 0xFFF00FFF'u32, 0x0000A000'u32)
+    updateReg32(addr mdm.preAgcDetect894, 0xFFEFFFFF'u32, 0x00100000'u32)
+    updateReg32(addr mdm.bandwidth20MEnable834, 0xFFFFFFEF'u32, 0x00000000'u32)
+    updateReg32(addr crm.rfClockMux10, 0xF7FFFFFF'u32, 0x08000000'u32)
+    updateReg32(addr bba.macActiveC01c, 0x00000000'u32, 0x000000A0'u32)
+    updateReg32(addr bba.agcCoreCtrl100, 0xFFFF80FF'u32, 0x00005000'u32)
+    updateReg32(addr bba.agcCoreCtrl100, 0xFFFFFF80'u32, 0x00000050'u32)
+    updateReg32(addr bba.agcCoreTableC80c, 0x00FFFFFF'u32, 0xA8000000'u32)
+    updateReg32(addr bba.pdGain390, 0xFFFFEFFF'u32, 0x00001000'u32)
+    updateReg32(addr crm.rfClockMux10, 0xDFFFFFFF'u32, 0x20000000'u32)
 
   proc bl808PhyProgramAgcCopyTailRegs() =
-    writeRadioRegMaskInitRange(
-      PhyInitBasebandPreAgcInit, 19, PhyInitBasebandPreAgcInit.len)
+    ## phy_init+0x470..0x49c: release AGC copy window and restore clock mux.
+    let bba = bbaAgcRegs()
+    let crm = crmPhyClockRegs()
+    updateReg32(addr bba.pdGain390, 0xFFFFEFFF'u32, 0x00000000'u32)
+    updateReg32(addr bba.pdGain390, 0xFFFEFFFF'u32, 0x00010000'u32)
+    updateReg32(addr bba.pdGain390, 0xFFFFFBFF'u32, 0x00000000'u32)
+    updateReg32(addr crm.rfClockMux10, 0xDFFFFFFF'u32, 0x00000000'u32)
 
   proc bl808PhyProgramAgcCoreRegs() =
-    writeRadioRegMaskInit(PhyInitAgcCoreInit)
+    ## Deterministic typed port of librf_bl808.a:phy.c.o phy_init+0x4ba..0x938.
+    let bba = bbaAgcRegs()
+    updateReg32(addr bba.agcCoreWindow3a4, 0xFFFFFF00'u32, 0x00000000'u32)
+    updateReg32(addr bba.agcCoreWindow3a4, 0xFFFF00FF'u32, 0x00000000'u32)
+    updateReg32(addr bba.agcCoreDetect394, 0xFF00FFFF'u32, 0x00F80000'u32)
+    updateReg32(addr bba.agcCoreDetect398, 0xFFFF00FF'u32, 0x00009E00'u32)
+    updateReg32(addr bba.macActiveB3c4, 0xFFFFFF00'u32, 0x000000CE'u32)
+    updateReg32(addr bba.agcCoreProfile364, 0xE0FFFFFF'u32, 0x08000000'u32)
+    updateReg32(addr bba.agcCoreProfile364, 0xFFC0FFFF'u32, 0x003C0000'u32)
+    updateReg32(addr bba.agcCoreProfile364, 0xFFFFC0FF'u32, 0x00003A00'u32)
+    updateReg32(addr bba.agcCoreProfile364, 0xFFFFFFC0'u32, 0x0000003B'u32)
+    updateReg32(addr bba.macActiveB368, 0xFFC00FFF'u32, 0x00270000'u32)
+    updateReg32(addr bba.macActiveB368, 0xFFFFFC00'u32, 0x00000270'u32)
+    updateReg32(addr bba.pdComp36c, 0xFFFFFF00'u32, 0x00000010'u32)
+    updateReg32(addr bba.pdComp36c, 0xFFFFF8FF'u32, 0x00000500'u32)
+    updateReg32(addr bba.pdComp36c, 0xFF00FFFF'u32, 0x00200000'u32)
+    updateReg32(addr bba.pdComp36c, 0xF8FFFFFF'u32, 0x05000000'u32)
+    updateReg32(addr bba.agcCoreProfile370, 0xFF80FFFF'u32, 0x00580000'u32)
+    updateReg32(addr bba.pdSlope3c0, 0x00FFFFFF'u32, 0x18000000'u32)
+    updateReg32(addr bba.macActiveB3c4, 0xFF00FFFF'u32, 0x00E00000'u32)
+    updateReg32(addr bba.macActiveB3c4, 0x00FFFFFF'u32, 0xDC000000'u32)
+    updateReg32(addr bba.macActiveB3a0, 0xFFFFFF00'u32, 0x0000009D'u32)
+    updateReg32(addr bba.pdSlope3c0, 0xFFFFFF00'u32, 0x000000B0'u32)
+    updateReg32(addr bba.agcCoreStage0B380, 0xFFF03FFF'u32, 0x000F8000'u32)
+    updateReg32(addr bba.agcCoreStage0B380, 0xFC0FFFFF'u32, 0x03700000'u32)
+    updateReg32(addr bba.agcCoreStage0B380, 0x03FFFFFF'u32, 0x04000000'u32)
+    updateReg32(addr bba.agcCoreStage0B380, 0xFFFFDFFF'u32, 0x00000000'u32)
+    updateReg32(addr bba.agcCoreStage0B380, 0xFFFFE3FF'u32, 0x00000400'u32)
+    updateReg32(addr bba.macActiveB384, 0x03FFFFFF'u32, 0xE4000000'u32)
+    updateReg32(addr bba.macActiveB384, 0xFC0FFFFF'u32, 0x03700000'u32)
+    updateReg32(addr bba.macActiveB384, 0xFFF03FFF'u32, 0x00050000'u32)
+    updateReg32(addr bba.macActiveB384, 0xFFFFDFFF'u32, 0x00000000'u32)
+    updateReg32(addr bba.macActiveB384, 0xFFFFE3FF'u32, 0x00001800'u32)
+    updateReg32(addr bba.agcCoreStage2B388, 0x03FFFFFF'u32, 0x3C000000'u32)
+    updateReg32(addr bba.agcCoreStage2B388, 0xFC0FFFFF'u32, 0x01700000'u32)
+    updateReg32(addr bba.agcCoreStage2B388, 0xFFF03FFF'u32, 0x000A8000'u32)
+    updateReg32(addr bba.agcCoreStage2B388, 0xFFFFDFFF'u32, 0x00000000'u32)
+    updateReg32(addr bba.agcCoreStage2B388, 0xFFFFE3FF'u32, 0x00001400'u32)
+    updateReg32(addr bba.macActiveB38c, 0x03FFFFFF'u32, 0x64000000'u32)
+    updateReg32(addr bba.macActiveB38c, 0xFC0FFFFF'u32, 0x03600000'u32)
+    updateReg32(addr bba.macActiveB38c, 0xFFF03FFF'u32, 0x000E0000'u32)
+    updateReg32(addr bba.macActiveB38c, 0xFFFFE3FF'u32, 0x00001400'u32)
+    updateReg32(addr bba.pdCompC830, 0x03FFFFFF'u32, 0xFC000000'u32)
+    updateReg32(addr bba.pdCompC830, 0xFC0FFFFF'u32, 0x00100000'u32)
+    updateReg32(addr bba.pdCompC830, 0xFFF03FFF'u32, 0x000D8000'u32)
+    updateReg32(addr bba.pdCompC830, 0xFFFFE3FF'u32, 0x00001400'u32)
+    updateReg32(addr bba.pdCompRampC838, 0x7FFFFFFF'u32, 0x80000000'u32)
+    updateReg32(addr bba.pdCompRampC838, 0xFFF80000'u32, 0x00000040'u32)
+    updateReg32(addr bba.pdCompRampC83c, 0x7FFFFFFF'u32, 0x80000000'u32)
+    updateReg32(addr bba.pdCompRampC83c, 0xFFF00000'u32, 0x00000040'u32)
+    updateReg32(addr bba.pdCompRampC840, 0x7FFFFFFF'u32, 0x80000000'u32)
+    updateReg32(addr bba.pdCompRampC840, 0xFFC00000'u32, 0x00000036'u32)
+    updateReg32(addr bba.agcCoreEnable004, 0x00000000'u32, 0x00000001'u32)
+    updateReg32(addr bba.pdGain390, 0xFFFFFFFC'u32, 0x00000001'u32)
+    updateReg32(addr bba.macActiveB3bc, 0x00000000'u32, 0x001E8480'u32)
+    updateReg32(addr bba.agcCoreTimeout414, 0xFFFFFFFF'u32, 0x00000100'u32)
 
   var phyRxGainOffsetVsTemperature = -128'i8
 
@@ -9485,30 +9605,31 @@ when defined(bl808WifiUseBl808Rf):
   proc bl808PhyProgramRxTailRegs() =
     ## phy_init+0x942..0x964: final receive-path RF/AGC writes after
     ## rc2_config_rxgain and before bba_init.
+    let rf = rfRegs()
     let mdm = wifiModemRegs()
-    updateReg32(cast[ptr uint32](RfBase + 0x26C'u),
-                0xC00FFFFF'u32, 0x05000000'u32)
-    updateReg32(addr mdm.rxTailC018, 0xFFFFFC00'u32, 0x00000050'u32)
+    updateReg32(addr rf.channelTuneCtrl26c, 0xC00FFFFF'u32, 0x05000000'u32)
+    updateReg32(addr mdm.rxGainTailCtrlC018, 0xFFFFFC00'u32, 0x00000050'u32)
 
   proc bl808MdmSetChannel(primFreq, centerFreq1, chanType: uint32) =
     let mdm = wifiModemRegs()
+    let macPhy = macPhyCtrlRegs()
     crm_mdm_reset()
     if primFreq != 0'u32 and centerFreq1 != 0'u32:
       let ratio = ((centerFreq1 shl 15) div primFreq) and 0x7FFF'u32
-      updateReg32(addr mdm.phyCtrl84c, 0xFFFF8000'u32, ratio)
-    updateReg32(addr mdm.phyCtrl824, 0xFCFFFFFF'u32, chanType shl 24)
-    updateReg32(cast[ptr uint32](0x24B00310'u),
+      updateReg32(addr mdm.channelCenterRatio84c, 0xFFFF8000'u32, ratio)
+    updateReg32(addr mdm.channelTypeCtrl824, 0xFCFFFFFF'u32, chanType shl 24)
+    updateReg32(addr macPhy.channelBandwidthCtrl310,
                 0xFFFCFFFF'u32, chanType shl 16)
     if chanType == 0'u32:
-      volatileStore(addr mdm.phyCtrl820, 0x0000130D'u32)
-      volatileStore(addr mdm.phyCtrl824, 0x0000010D'u32)
-      volatileStore(addr mdm.phyCtrl830, 0x00001B0F'u32)
-      volatileStore(addr mdm.phyCtrl83c, 0x04920492'u32)
-      volatileStore(addr mdm.phyCtrl840, 0x03310000'u32)
-      volatileStore(addr mdm.phyCtrl860, 0x00007F03'u32)
-      volatileStore(addr mdm.phyCtrl874, 0x08000000'u32)
-      updateReg32(addr mdm.phyCtrl834, 0xFFFFFFFE'u32, 0x00000001'u32)
-      updateReg32(addr mdm.phyCtrl814, not 0x0000A000'u32, 0'u32)
+      volatileStore(addr mdm.bandwidth20MProfile820, 0x0000130D'u32)
+      volatileStore(addr mdm.channelTypeCtrl824, 0x0000010D'u32)
+      volatileStore(addr mdm.bandwidth20MProfile830, 0x00001B0F'u32)
+      volatileStore(addr mdm.bandwidth20MSignal83c, 0x04920492'u32)
+      volatileStore(addr mdm.bandwidth20MSignal840, 0x03310000'u32)
+      volatileStore(addr mdm.bandwidth20MFilter860, 0x00007F03'u32)
+      volatileStore(addr mdm.bandwidth20MGate874, 0x08000000'u32)
+      updateReg32(addr mdm.bandwidth20MEnable834, 0xFFFFFFFE'u32, 0x00000001'u32)
+      updateReg32(addr mdm.bandwidth20MGuard814, not 0x0000A000'u32, 0'u32)
 
   proc pulsePhyChannelRfWindow() =
     ## Vendor phy_set_channel pulses this modem register immediately before
@@ -9543,8 +9664,11 @@ when defined(bl808WifiUseBl808Rf):
     if info == nil:
       return
     let dst = cast[ptr UncheckedArray[uint32]](info)
-    dst[0] = volatileLoad(phyEnvWord(36'u))
-    dst[1] = volatileLoad(phyEnvWord(40'u))
+    let env = phyEnvViewPtr()
+    dst[0] = volatileLoad(addr env.channelBandType).uint32 or
+      (volatileLoad(addr env.primaryFreq).uint32 shl 16)
+    dst[1] = volatileLoad(addr env.centerFreq1).uint32 or
+      (volatileLoad(addr env.centerFreq2OrTxPower).uint32 shl 16)
 
   proc phy_get_ntx*(): uint8 {.exportc, cdecl.} =
     (((modemVersionReg() shr 4) and 0xF'u32) - 1'u32).uint8
@@ -9619,7 +9743,7 @@ when defined(bl808WifiUseBl808Rf):
     1000'u32
 
   proc phy_stop*() {.exportc, cdecl.} =
-    discard volatileLoad(cast[ptr uint32](0x24B00038'u))
+    discard regRead(MACHW_STATE_CNTRL_REG)
 
   proc phy_mdm_reset*() {.exportc, cdecl.} =
     crm_mdm_reset()
@@ -9643,7 +9767,8 @@ when defined(bl808WifiUseBl808Rf):
         volatileStore(addr mdm.userPosition[i], src[i])
 
   proc phy_update_power_table*() {.exportc, cdecl.} =
-    trpc_update_power(cast[pointer](volatileLoad(phyEnvByte(37'u)).uint))
+    let channelType = (volatileLoad(addr phyEnvViewPtr().channelBandType) shr 8).uint8
+    trpc_update_power(cast[pointer](channelType.uint))
 
   proc phyEnvCenter2Word(channel: ptr ChanCtxtDefView): uint16 {.inline.} =
     if channel != nil and channel.centerFreq2 == 0'u16:
@@ -9659,11 +9784,12 @@ when defined(bl808WifiUseBl808Rf):
       {.exportc, cdecl.} =
     if channel == nil or force != 0'u32:
       return
-    let bandAndType = volatileLoad(phyEnvHalf(36'u))
-    let currentType = volatileLoad(phyEnvByte(37'u))
-    let currentPrim = volatileLoad(phyEnvHalf(38'u))
-    let currentCenter = volatileLoad(phyEnvHalf(40'u))
-    let currentCenter2 = volatileLoad(phyEnvHalf(42'u))
+    let env = phyEnvViewPtr()
+    let bandAndType = volatileLoad(addr env.channelBandType)
+    let currentType = (bandAndType shr 8).uint8
+    let currentPrim = volatileLoad(addr env.primaryFreq)
+    let currentCenter = volatileLoad(addr env.centerFreq1)
+    let currentCenter2 = volatileLoad(addr env.centerFreq2OrTxPower)
     let nextCenter2 = phyEnvCenter2Word(channel)
     if bandAndType == cast[ptr uint16](channel)[] and
         currentType == channel.chanType and
@@ -9681,11 +9807,11 @@ when defined(bl808WifiUseBl808Rf):
     rfc_config_channel(channel.centerFreq1.uint32)
     when defined(bl808WifiUseBl808Rf):
       rfPhyTraceCheckpoint(0x41'u32)
-    volatileStore(phyEnvHalf(36'u), cast[ptr uint16](channel)[])
-    volatileStore(phyEnvHalf(38'u), channel.primFreq)
-    volatileStore(phyEnvHalf(40'u), channel.centerFreq1)
-    volatileStore(phyEnvHalf(42'u), nextCenter2)
-    volatileStore(phyEnvHalf(44'u),
+    volatileStore(addr env.channelBandType, cast[ptr uint16](channel)[])
+    volatileStore(addr env.primaryFreq, channel.primFreq)
+    volatileStore(addr env.centerFreq1, channel.centerFreq1)
+    volatileStore(addr env.centerFreq2OrTxPower, nextCenter2)
+    volatileStore(addr env.txPowerAndReserved,
                   channel.txPower.uint16 or (channel.reserved.uint16 shl 8))
     when defined(bl808WifiUseBl808Rf):
       rfPhyTraceCheckpoint(0x42'u32)
@@ -9698,31 +9824,41 @@ when defined(bl808WifiUseBl808Rf):
 
   proc phyInitValidateClock() =
     ## phy_init+0x16..0x52: CRM setup and clock-count assert.
+    inc nimFwDbgPhyInitCount
+    nimFwDbgPhyInitPhase = 1'u32
     crm_init()
     let version = modemVersionReg()
     let clkCount = phyClockCountFromVersion(version)
+    nimFwDbgPhyModemVersion = version
+    nimFwDbgPhyClockCount = clkCount
     if clkCount != 32'u32:
       wrapPhyAssertErr("clk_cnt", "phy.c", 586)
 
   proc phyInitProgramBasebandAndAgc() =
     ## phy_init+0x5a..0x938: modem-derived baseband fields, AGC memory copy,
     ## and the recovered AGC core table.
+    nimFwDbgPhyInitPhase = 2'u32
     crm_mdm_reset()
     bl808PhyProgramRecoveredRegs()
+    bl808PhyProgramPreAgcRegs()
     copyAgcMemory()
     bl808PhyProgramAgcCopyTailRegs()
     bl808PhyProgramAgcCoreRegs()
 
   proc phyInitProgramReceiveTail() =
     ## phy_init+0x93c..0x964 plus BBA/TRPC setup.
+    nimFwDbgPhyInitPhase = 4'u32
     rc2_config_rxgain(0'i8)
     bl808PhyProgramRxTailRegs()
     bba_init()
     trpc_init()
 
   proc phyInitProgramInitialChannel() =
-    ## phy_init channel tail: initialize 20 MHz channel-1 modem/RF state and
-    ## mirror it into phy_env.
+    ## phy_init+0x976..0x9a2 initializes 20 MHz channel-1 modem/RF state:
+    ## crm_clk_set(0), mdm_set_channel.constprop.0(2412, 2412, 0),
+    ## rfc_config_bandwidth(0), rfc_config_channel(2412). The following
+    ## phy_init+0x9a6..0x9fc block mirrors cfg/env words into phy_env.
+    nimFwDbgPhyInitPhase = 5'u32
     crm_clk_set(0'u32)
     var initial = ChanCtxtDefView(
       band: 1'u8,
@@ -9740,11 +9876,12 @@ when defined(bl808WifiUseBl808Rf):
       pulsePhyChannelRfWindow()
     rfc_config_channel(initial.centerFreq1.uint32)
     trpc_update_power(nil)
-    volatileStore(phyEnvHalf(36'u), cast[ptr uint16](addr initial)[])
-    volatileStore(phyEnvHalf(38'u), initial.primFreq)
-    volatileStore(phyEnvHalf(40'u), initial.centerFreq1)
-    volatileStore(phyEnvHalf(42'u), phyEnvCenter2Word(addr initial))
-    volatileStore(phyEnvHalf(44'u),
+    let env = phyEnvViewPtr()
+    volatileStore(addr env.channelBandType, cast[ptr uint16](addr initial)[])
+    volatileStore(addr env.primaryFreq, initial.primFreq)
+    volatileStore(addr env.centerFreq1, initial.centerFreq1)
+    volatileStore(addr env.centerFreq2OrTxPower, phyEnvCenter2Word(addr initial))
+    volatileStore(addr env.txPowerAndReserved,
                   initial.txPower.uint16 or (initial.reserved.uint16 shl 8))
 
   proc phy_init*(cfg: pointer) {.exportc, cdecl.} =
@@ -9753,6 +9890,7 @@ when defined(bl808WifiUseBl808Rf):
     phyInitProgramReceiveTail()
     phyInitProgramInitialChannel()
     copyPhyInitCfg(cfg)
+    nimFwDbgPhyInitPhase = 6'u32
 
   var wlCalGlobal* {.exportc: "wl_cal".}: pointer
   var wlEnvGlobal* {.exportc: "wl_env".}: pointer
@@ -9877,26 +10015,29 @@ when defined(bl808WifiUseBl808Rf):
     if cfg == nil:
       return
     seedWlCfgTxPowerDefaults()
-    cfg.priWordC0 = 0x02000000'u32
-    cfg.priWordC4 = 0x80808001'u32
-    cfg.priHalfBE = 0'u16
-    for item in cfg.priZeroA1.mitems:
+    cfg.efuseTrimControl = 0x02000000'u32
+    cfg.efuseTxGainComp = 0x01'u8
+    cfg.efuseXtalCapCode0 = 0x80'u8
+    cfg.efuseXtalCapCode1 = 0x80'u8
+    cfg.efuseDfeTrim = 0x80'u8
+    cfg.temperaturePowerCompPadding = 0'u16
+    for item in cfg.channelPowerComp.mitems:
       item = 0'u8
-    for item in cfg.priZeroA2.mitems:
+    for item in cfg.channelLowPowerComp.mitems:
       item = 0'u8
     if Bl808WifiRfDeviceInfo == int(Bl808RfDeviceInfoWb03):
       # Vendor RF RXCAL reads raw wl_cfg+0xA8/+0xAC and uses them to program
       # RF70/RF1600. These bytes overlap the channel-comp table at wl_cfg+0xA1.
       wlCfgSetU32(WlRfCfgRxcalA8Offset, WlRfCfgWb03RxcalA8Default)
       wlCfgSetU32(WlRfCfgRxcalAcOffset, WlRfCfgWb03RxcalAcDefault)
-    cfg.priWord10 = 0x096C0100'u32
-    cfg.priWord14 = 0x098A097B'u32
-    cfg.priWord18 = 0x09A80999'u32
-    cfg.priByteBD = 35'u8
-    for item in cfg.priZeroWords.mitems:
+    cfg.channelFreqSeedPair0 = 0x096C0100'u32
+    cfg.channelFreqSeedPair1 = 0x098A097B'u32
+    cfg.channelFreqSeedPair2 = 0x09A80999'u32
+    cfg.temperaturePowerComp = 35'u8
+    for item in cfg.channelFreqSeedPadding.mitems:
       item = 0'u32
-    cfg.priHalf30 = 0'u16
-    cfg.priByte9C = 20'u8
+    cfg.ratePowerTablePreamble = 0'u16
+    cfg.ratePowerLimitDbm = 20'u8
 
   proc wl_cfg_get(rmem: ptr WlRfMemoryOverlay): ptr WlRfConfig {.exportc, cdecl.} =
     if rmem == nil:
@@ -9911,9 +10052,9 @@ when defined(bl808WifiUseBl808Rf):
     rfCalibDataGlobal = wlCalGlobal
     if rmem.config.status != WlRfConfigMagic:
       rmem.config.xtalfreqHz = 40_000_000'u32
-      rmem.config.xtalCap = 0x2020'u16
-      rmem.config.capcodeGet = nil
-      rmem.config.capcodeSet = nil
+      rmem.config.xtalCapCodes = 0x2020'u16
+      rmem.config.capcodeGetCallback = nil
+      rmem.config.capcodeSetCallback = nil
     wl_rf_cfg_init()
     addr rmem.config
 
@@ -9935,10 +10076,42 @@ when defined(bl808WifiUseBl808Rf):
 
   type
     RfPriCalState = object
-      words: array[RfPriCalSavedRegs.len, uint32]
+      baseCtrl1: uint32
+      synthCtrl2c: uint32
+      calCtrl1c: uint32
+      priModeCtrl30: uint32
+      txcalCtrlB8: uint32
+      sdmCtrlC0: uint32
+      sdmDivC4: uint32
+      hbnCtrl30: uint32
+      txcalDfe88: uint32
+      calPathConfig8c: uint32
+      txcalTosdac600: uint32
+      calMeasurePrep60c: uint32
+      measureCtrl618: uint32
+      measureMode61c: uint32
+      rccalTone48: uint32
+      calSingenCtrl20c: uint32
+      calSingenAmpLo214: uint32
+      calSingenAmpHi218: uint32
+      calDfeGate23c: uint32
+      calDfeState240: uint32
+      calDfeState244: uint32
+      calMixerStateF0: uint32
+      txcalGain64: uint32
+      txcalBias58: uint32
+      rxMode220: uint32
+      txcalParam74: uint32
+      acalCtrlA4: uint32
 
   var
     bl808RfXtalIndex: uint32
+    bl808RfPriXtal24mFlag: uint8
+    bl808RfPriXtal26mFlag: uint8
+    bl808RfPriXtal32mFlag: uint8
+    bl808RfPriXtal38p4mFlag: uint8
+    bl808RfPriXtal40mFlag: uint8 = 1
+    bl808RfPriXtal52mFlag: uint8
     bl808RfMode: RadioPhyMode
     bl808RfColdInit: uint32
     bl808RfChannelMhz: uint32
@@ -9990,48 +10163,53 @@ when defined(bl808WifiUseBl808Rf):
     else:
       Bl808WifiRfDeviceInfo == int(Bl808RfDeviceInfoWb03)
 
-  proc rfPhyTraceCheckpoint(phase: uint32) =
-    let idx = int(nimFwDbgRfPhyTraceCount and uint32(NimFwDbgRfPhyTraceLen - 1))
-    inc nimFwDbgRfPhyTraceCount
-    nimFwDbgRfPhyTracePhase[idx] = phase
-    nimFwDbgRfPhyTraceDevice[idx] =
-      uint32(rfPriIsWb03()) or
+  proc rfPriDeviceTraceWord(): uint32 {.inline.} =
+    uint32(rfPriIsWb03()) or
       (bl808RfDeviceBl616.uint32 shl 4) or
       (bl808RfDeviceBl618m.uint32 shl 8) or
       ((bl808RfXtalIndex and 0xFF'u32) shl 16)
+
+  proc rfPhyTraceCheckpoint(phase: uint32) =
+    let rf = rfRegs()
+    let idx = int(nimFwDbgRfPhyTraceCount and uint32(NimFwDbgRfPhyTraceLen - 1))
+    inc nimFwDbgRfPhyTraceCount
+    nimFwDbgRfPhyTracePhase[idx] = phase
+    nimFwDbgRfPhyTraceDevice[idx] = rfPriDeviceTraceWord()
+    let env = phyEnvViewPtr()
     nimFwDbgRfPhyTraceChanMeta[idx] =
-      volatileLoad(phyEnvWord(36'u))
+      volatileLoad(addr env.channelBandType).uint32 or
+      (volatileLoad(addr env.primaryFreq).uint32 shl 16)
     nimFwDbgRfPhyTraceChanFreq[idx] =
-      volatileLoad(phyEnvHalf(38'u)).uint32 or
-      (volatileLoad(phyEnvHalf(40'u)).uint32 shl 16)
-    nimFwDbgRfPhyTraceRf2c[idx] = readReg32(RfSynthCtrlReg)
-    nimFwDbgRfPhyTraceRf04[idx] = readReg32(RfCtrlReg)
-    nimFwDbgRfPhyTraceRf34[idx] = readReg32(RfPriTrace34Reg)
-    nimFwDbgRfPhyTraceRf40[idx] = readReg32(RfPriTrace40Reg)
-    nimFwDbgRfPhyTraceRf4c[idx] = readReg32(RfPriTrace4cReg)
-    nimFwDbgRfPhyTraceRf70[idx] = readReg32(RfTxcalParamReg)
-    nimFwDbgRfPhyTraceRf74[idx] = readReg32(RfTxcalParam01Reg)
-    nimFwDbgRfPhyTraceRf88[idx] = readReg32(RfPriTxcalDfeReg)
-    nimFwDbgRfPhyTraceRf90[idx] = readReg32(RfPriInit90Reg)
-    nimFwDbgRfPhyTraceRfa0[idx] = readReg32(RfFcalCtrlReg)
-    nimFwDbgRfPhyTraceRfa4[idx] = readReg32(RfAcalCtrlReg)
-    nimFwDbgRfPhyTraceRfbc[idx] = readReg32(RfPriConfigBcReg)
-    nimFwDbgRfPhyTraceRfd0[idx] = readReg32(RfOptimizeReg)
-    nimFwDbgRfPhyTraceRf80[idx] = readReg32(RfRbbRccalReg)
-    nimFwDbgRfPhyTraceRf84[idx] = readReg32(RfPriTrace84Reg)
-    nimFwDbgRfPhyTraceRf8c[idx] = readReg32(RfPriInit8cReg)
-    nimFwDbgRfPhyTraceRfb4[idx] = readReg32(RfPriConfigB4Reg)
-    nimFwDbgRfPhyTraceRf1600[idx] = readReg32(RfTxcalTosdacReg)
-    nimFwDbgRfPhyTraceRf1614[idx] = readReg32(RfPriRxcalSearchReg)
-    nimFwDbgRfPhyTraceRf1618[idx] = readReg32(RfMeasureCtrlReg)
-    nimFwDbgRfPhyTraceRf162c[idx] = readReg32(RfPriTrace162cReg)
-    nimFwDbgRfPhyTraceRf1680[idx] = readReg32(RfPriTrace1680Reg)
-    nimFwDbgRfPhyTraceRf113c[idx] = readReg32(RfPriTrace113cReg)
+      volatileLoad(addr env.primaryFreq).uint32 or
+      (volatileLoad(addr env.centerFreq1).uint32 shl 16)
+    nimFwDbgRfPhyTraceRf2c[idx] = volatileLoad(addr rf.synthCtrl2c)
+    nimFwDbgRfPhyTraceRf04[idx] = volatileLoad(addr rf.baseCtrl1)
+    nimFwDbgRfPhyTraceRf34[idx] = volatileLoad(addr rf.scanSynthLatch34)
+    nimFwDbgRfPhyTraceRf40[idx] = volatileLoad(addr rf.scanSynthLatch40)
+    nimFwDbgRfPhyTraceRf4c[idx] = volatileLoad(addr rf.scanRxLatch4c)
+    nimFwDbgRfPhyTraceRf70[idx] = volatileLoad(addr rf.txcalParam70)
+    nimFwDbgRfPhyTraceRf74[idx] = volatileLoad(addr rf.txcalParam74)
+    nimFwDbgRfPhyTraceRf88[idx] = volatileLoad(addr rf.txcalDfe88)
+    nimFwDbgRfPhyTraceRf90[idx] = volatileLoad(addr rf.calPathCtrl90)
+    nimFwDbgRfPhyTraceRfa0[idx] = volatileLoad(addr rf.fcalCtrlA0)
+    nimFwDbgRfPhyTraceRfa4[idx] = volatileLoad(addr rf.acalCtrlA4)
+    nimFwDbgRfPhyTraceRfbc[idx] = volatileLoad(addr rf.channelFcalConfigBc)
+    nimFwDbgRfPhyTraceRfd0[idx] = volatileLoad(addr rf.optimizeCtrlD0)
+    nimFwDbgRfPhyTraceRf80[idx] = volatileLoad(addr rf.rbbRccalCtrl80)
+    nimFwDbgRfPhyTraceRf84[idx] = volatileLoad(addr rf.rccalReplay84)
+    nimFwDbgRfPhyTraceRf8c[idx] = volatileLoad(addr rf.calPathConfig8c)
+    nimFwDbgRfPhyTraceRfb4[idx] = volatileLoad(addr rf.channelCalStatusB4)
+    nimFwDbgRfPhyTraceRf1600[idx] = volatileLoad(addr rf.txcalTosdac600)
+    nimFwDbgRfPhyTraceRf1614[idx] = volatileLoad(addr rf.rxcalSearch614)
+    nimFwDbgRfPhyTraceRf1618[idx] = volatileLoad(addr rf.measureCtrl618)
+    nimFwDbgRfPhyTraceRf162c[idx] = volatileLoad(addr rf.scanTxMeasureControl62c)
+    nimFwDbgRfPhyTraceRf1680[idx] = volatileLoad(addr rf.notchCtrl680)
+    nimFwDbgRfPhyTraceRf113c[idx] = volatileLoad(addr rf.vcoPairTable13c[0])
     let mdm = wifiModemRegs()
-    nimFwDbgRfPhyTracePhy820[idx] = volatileLoad(addr mdm.phyCtrl820)
-    nimFwDbgRfPhyTracePhy824[idx] = volatileLoad(addr mdm.phyCtrl824)
-    nimFwDbgRfPhyTracePhy830[idx] = volatileLoad(addr mdm.phyCtrl830)
-    nimFwDbgRfPhyTracePhy874[idx] = volatileLoad(addr mdm.phyCtrl874)
+    nimFwDbgRfPhyTracePhy820[idx] = volatileLoad(addr mdm.bandwidth20MProfile820)
+    nimFwDbgRfPhyTracePhy824[idx] = volatileLoad(addr mdm.channelTypeCtrl824)
+    nimFwDbgRfPhyTracePhy830[idx] = volatileLoad(addr mdm.bandwidth20MProfile830)
+    nimFwDbgRfPhyTracePhy874[idx] = volatileLoad(addr mdm.bandwidth20MGate874)
     nimFwDbgRfPhyTraceRxCtrl[idx] = regRead(MACHW_RX_CNTRL_REG)
     nimFwDbgRfPhyTraceIrqRaw[idx] = regRead(0x24B0806C'u)
     nimFwDbgRfPhyTraceGenRaw[idx] = regRead(0x24B08084'u)
@@ -10069,6 +10247,37 @@ when defined(bl808WifiUseBl808Rf):
   var nim_wifi_rf_optimize_rfd0_log* {.exportc.}: array[RfPriStageSnapshotEntries, uint32]
   var nim_wifi_rf_optimize_rf70_log* {.exportc.}: array[RfPriStageSnapshotEntries, uint32]
   var nim_wifi_rf_optimize_nibble_log* {.exportc.}: array[RfPriStageSnapshotEntries, uint32]
+  var nim_wifi_rf_fixed_val_count* {.exportc.}: uint32
+  var nim_wifi_rf_fixed_val_device* {.exportc.}: uint32
+  var nim_wifi_rf_fixed_val_branch* {.exportc.}: uint32
+  var nim_wifi_rf_fixed_val_rf70* {.exportc.}: uint32
+  var nim_wifi_rf_fixed_val_rf88* {.exportc.}: uint32
+  var nim_wifi_rf_fixed_val_rfd0* {.exportc.}: uint32
+  var nim_wifi_rf_fixed_val_rf814* {.exportc.}: uint32
+  var nim_wifi_rf_fixed_val_rfa0* {.exportc.}: uint32
+  var nim_wifi_rf_rf70_replay_apply_count* {.exportc.}: uint32
+  var nim_wifi_rf_rf70_replay_reason* {.exportc.}: uint32
+  var nim_wifi_rf_rf70_replay_reg_before* {.exportc.}: uint32
+  var nim_wifi_rf_rf70_replay_reg_after* {.exportc.}: uint32
+  var nim_wifi_rf_rf70_replay_cal_word3_before* {.exportc.}: uint32
+  var nim_wifi_rf_rf70_replay_cal_word4_before* {.exportc.}: uint32
+  var nim_wifi_rf_rf70_replay_cal_word3_after* {.exportc.}: uint32
+  var nim_wifi_rf_rf70_replay_cal_word4_after* {.exportc.}: uint32
+  var rf70ReplayWindow0SourceNibble* {.exportc: "nim_wifi_rf_rf70_txcal_window0_nibble".}: uint32
+  var rf70ReplayWindow1SourceNibble* {.exportc: "nim_wifi_rf_rf70_txcal_window1_nibble".}: uint32
+  var rf70ReplayWindow2SourceNibble* {.exportc: "nim_wifi_rf_rf70_txcal_window2_nibble".}: uint32
+  var rf70ReplayWindowValidMask* {.exportc: "nim_wifi_rf_rf70_txcal_window_mask".}: uint32
+  var nim_wifi_rf_rf70_txcal_search_count* {.exportc.}: uint32
+  var nim_wifi_rf_rf70_txcal_search_ok_mask* {.exportc.}: uint32
+  var rf70ReplaySearchBestNibble* {.exportc: "nim_wifi_rf_rf70_txcal_search_best_nibble".}: array[3, uint32]
+  var rf70ReplaySearchRunnerUpNibble* {.exportc: "nim_wifi_rf_rf70_txcal_search_runner_nibble".}: array[3, uint32]
+  var rf70ReplaySearchBestSample* {.exportc: "nim_wifi_rf_rf70_txcal_search_best_sample".}: array[3, uint32]
+  var rf70ReplaySearchRunnerUpSample* {.exportc: "nim_wifi_rf_rf70_txcal_search_runner_sample".}: array[3, uint32]
+  var rf70ReplaySearchMeasureCtrl* {.exportc: "nim_wifi_rf_rf70_txcal_search_ctrl".}: array[3, uint32]
+  var rf70ReplaySearchMeasureMode* {.exportc: "nim_wifi_rf_rf70_txcal_search_mode".}: array[3, uint32]
+  var rf70ReplaySearchMeasureIRaw* {.exportc: "nim_wifi_rf_rf70_txcal_search_i_raw".}: array[3, uint32]
+  var rf70ReplayCandidateValidMask* {.exportc: "nim_wifi_rf_rf70_txcal_candidate_ok_mask".}: array[3, uint32]
+  var rf70ReplayCandidateAverageSample* {.exportc: "nim_wifi_rf_rf70_txcal_candidate_sample".}: array[48, uint32]
 
   var nim_wifi_rf_breakpoint_tag* {.exportc.}: uint32
   var nim_wifi_rf_breakpoint_count* {.exportc.}: uint32
@@ -10090,67 +10299,151 @@ when defined(bl808WifiUseBl808Rf):
 
   proc rfPriSnapshotStage(tag: uint32) =
     nim_wifi_rf_stage_breakpoint(tag)
+    let rf = rfRegs()
     let idx = int(nim_wifi_rf_stage_snapshot_count mod
       uint32(RfPriStageSnapshotEntries))
     inc nim_wifi_rf_stage_snapshot_count
     nim_wifi_rf_stage_tag_log[idx] = tag
-    nim_wifi_rf_stage_rf4c_log[idx] =
-      volatileLoad(cast[ptr uint32](0x2000104C'u.uint))
-    nim_wifi_rf_stage_rf70_log[idx] =
-      volatileLoad(cast[ptr uint32](RfPriInit70Reg.uint))
-    nim_wifi_rf_stage_rf7c_log[idx] =
-      volatileLoad(cast[ptr uint32](0x2000107C'u.uint))
-    nim_wifi_rf_stage_rf80_log[idx] =
-      volatileLoad(cast[ptr uint32](0x20001080'u.uint))
-    nim_wifi_rf_stage_rf88_log[idx] =
-      volatileLoad(cast[ptr uint32](RfPriTxcalDfeReg.uint))
-    nim_wifi_rf_stage_rfa0_log[idx] =
-      volatileLoad(cast[ptr uint32](0x200010A0'u.uint))
-    nim_wifi_rf_stage_rfd0_log[idx] =
-      volatileLoad(cast[ptr uint32](RfOptimizeReg.uint))
-    nim_wifi_rf_stage_rf1600_log[idx] =
-      volatileLoad(cast[ptr uint32](0x20001600'u.uint))
-    nim_wifi_rf_stage_rf162c_log[idx] =
-      volatileLoad(cast[ptr uint32](0x2000162C'u.uint))
-    nim_wifi_rf_stage_rfb0_log[idx] =
-      volatileLoad(cast[ptr uint32](RfPriConfigB0Reg.uint))
-    nim_wifi_rf_stage_rfb4_log[idx] =
-      volatileLoad(cast[ptr uint32](RfPriConfigB4Reg.uint))
-    nim_wifi_rf_stage_rfbc_log[idx] =
-      volatileLoad(cast[ptr uint32](RfPriConfigBcReg.uint))
+    nim_wifi_rf_stage_rf4c_log[idx] = volatileLoad(addr rf.scanRxLatch4c)
+    nim_wifi_rf_stage_rf70_log[idx] = volatileLoad(addr rf.txcalParam70)
+    nim_wifi_rf_stage_rf7c_log[idx] = volatileLoad(addr rf.roscalCtrl7c)
+    nim_wifi_rf_stage_rf80_log[idx] = volatileLoad(addr rf.rbbRccalCtrl80)
+    nim_wifi_rf_stage_rf88_log[idx] = volatileLoad(addr rf.txcalDfe88)
+    nim_wifi_rf_stage_rfa0_log[idx] = volatileLoad(addr rf.fcalCtrlA0)
+    nim_wifi_rf_stage_rfd0_log[idx] = volatileLoad(addr rf.optimizeCtrlD0)
+    nim_wifi_rf_stage_rf1600_log[idx] = volatileLoad(addr rf.txcalTosdac600)
+    nim_wifi_rf_stage_rf162c_log[idx] = volatileLoad(addr rf.scanTxMeasureControl62c)
+    nim_wifi_rf_stage_rfb0_log[idx] = volatileLoad(addr rf.channelCalStrobeB0)
+    nim_wifi_rf_stage_rfb4_log[idx] = volatileLoad(addr rf.channelCalStatusB4)
+    nim_wifi_rf_stage_rfbc_log[idx] = volatileLoad(addr rf.channelFcalConfigBc)
 
-  proc writeRfPriFixedValInit() =
+  proc writeRfPriFixedCommonPreBranch() =
+    ## Common pre-branch writes from librf_bl808.a:rf_pri.c.o
+    ## rf_pri_fixed_val_regs.
+    let rf = rfRegs()
+    let pll = rfPllRegs()
+    let dfe = rfDfeInitRegs()
+    updateReg32(addr rf.calSingenMeasurePrep21c, 0xEFFFEFFF'u32, 0'u32)
+    updateReg32(addr rf.bandwidthCtrl94, 0xFFFFFFFF'u32, 0x30010000'u32)
+    updateReg32(addr rf.rxMode220, 0xFFFFFFFF'u32, 0x00000600'u32)
+    updateReg32(addr rf.scanSynthControl608, 0xDFFFFFFF'u32, 0'u32)
+    updateReg32(addr rf.synthDfePathControl63c, 0x00000000'u32, 0'u32)
+    updateReg32(addr rf.calPathCtrl90, 0xFFFFFFF8'u32, 0x00000004'u32)
+    updateReg32(addr rf.measureCtrl618, 0x3FFFFFFF'u32, 0'u32)
+    updateReg32(addr rf.modemPathEnable504, 0xFFFFFFFF'u32, 0x00100000'u32)
+    updateReg32(addr dfe.dfeRfFixedDefault884, 0xCFFF1FFF'u32, 0x20008000'u32)
+    updateReg32(addr dfe.dfeRfFixedCtrl814, 0xFFFFF0FF'u32, 0x00000300'u32)
+    updateReg32(addr pll.pllFixedDefault84, 0xFFFF7FFF'u32, 0'u32)
+    updateReg32(addr rf.rxMode220, 0xFFFFFFEF'u32, 0'u32)
+    updateReg32(addr rf.rxModeCalibrationGate78, 0xCFFFFFFF'u32, 0'u32)
+    updateReg32(addr pll.refdivCtrl14, 0xFCCFFFFF'u32, 0x00100000'u32)
+
+  proc writeRfPriFixedCommonPostBranch() =
+    ## Common post-branch writes from librf_bl808.a:rf_pri.c.o
+    ## rf_pri_fixed_val_regs.
+    let rf = rfRegs()
+    let dfe = rfDfeInitRegs()
+    updateReg32(addr dfe.hbnCtrl30, 0xF0FFFFFF'u32, 0x08000000'u32)
+    updateReg32(addr rf.priModeCtrl30, 0xFFFFFFFF'u32, 0x00001003'u32)
+    updateReg32(addr dfe.dfeRfFixedDefault884, 0xFFFFFFFF'u32, 0x00000004'u32)
+    updateReg32(addr rf.channelCalStrobeB0, 0xFFFFFF3F'u32, 0x00000040'u32)
+    updateReg32(addr rf.rfPriBiasTrimCc, 0xFFFFFFFF'u32, 0x00200000'u32)
+    updateReg32(addr rf.acalCtrlA4, 0xFFFFFFF8'u32, 0x00000005'u32)
+    updateReg32(addr rf.acalCtrlA4, 0xFFFFF0FF'u32, 0x00000A00'u32)
+    updateReg32(addr rf.txcalCtrlB8, 0xFFFFFFFF'u32, 0x00000010'u32)
+    updateReg32(addr rf.calModeDefault138, 0xFFFFFFFF'u32, 0x00000003'u32)
+    updateReg32(addr rf.channelCalStrobeB0, 0xFFFFFFFE'u32, 0'u32)
+    updateReg32(addr rf.channelCalStatusB4, 0xFFFCC7FF'u32, 0x0000C000'u32)
+    updateReg32(addr rf.calCtrl1c, 0xFFFFFF7F'u32, 0'u32)
+    updateReg32(addr rf.baseCtrl1, 0xFFFFFFF3'u32, 0x00000004'u32)
+    updateReg32(addr rf.rfCodeConfig110c, 0xFFFFFF00'u32, 0x00000066'u32)
+    updateReg32(addr rf.roscalCtrl7c, 0xFFFFFF8F'u32, 0x00000030'u32)
+    updateReg32(addr rf.txcalDfe88, 0xFFFF8FFF'u32, 0x00004000'u32)
+    updateReg32(addr rf.channelCalStrobeB0, 0xFFFFFFFB'u32, 0'u32)
+    updateReg32(addr rf.txcalParam70, 0xFFFFF8FF'u32, 0x00000270'u32)
+    updateReg32(addr rf.txcalGain68, 0xC00C0088'u32, 0xE17E0244'u32)
+    updateReg32(addr rf.rfBiasTrimD4, 0xFFF0F00F'u32, 0x00F013C1'u32)
+
+  proc writeRfPriFixedPowerCompTailDefaults() =
+    ## TX power-compensation tail writes from librf_bl808.a:rf_pri.c.o
+    ## rf_pri_fixed_val_regs.
+    ## These eight writes program the trailing TX power-compensation defaults.
+    let rf = rfRegs()
+    updateReg32(addr rf.txPowerCompTail7bc, 0xFFC00000'u32, 0x00177124'u32)
+    updateReg32(addr rf.txPowerCompTail7c0, 0xFFC00000'u32, 0x0019E0A4'u32)
+    updateReg32(addr rf.txPowerCompTail7c4, 0xFFC00000'u32, 0x0019E0A4'u32)
+    updateReg32(addr rf.txPowerCompTail7c8, 0xFFC00000'u32, 0x0017C0A4'u32)
+    updateReg32(addr rf.txPowerCompTail7cc, 0xFFC00000'u32, 0x0017C0A4'u32)
+    updateReg32(addr rf.txPowerCompTail7d0, 0xFFC00000'u32, 0x0017C0A4'u32)
+    updateReg32(addr rf.txPowerCompTail7d4, 0xFFC00000'u32, 0x00191064'u32)
+    updateReg32(addr rf.txPowerCompTail7d8, 0xFFC00000'u32, 0x00177064'u32)
+
+  proc writeRfPriStaticInit() =
+    ## Typed port of librf_bl808.a:rf_pri.c.o rf_pri_init static register phase.
+    let rf = rfRegs()
+    let pll = rfPllRegs()
+    let dfe = rfDfeInitRegs()
+    updateReg32(addr pll.enableCtrl30, 0xFFFFF9FF'u32, 0x000001FC'u32)
+    updateReg32(addr pll.enableCtrl30, 0xFFFFFFFF'u32, 0x00000002'u32)
+    updateReg32(addr pll.enableCtrl30, 0xFFFFFFFF'u32, 0x00000001'u32)
+    updateReg32(addr rf.rxMode220, 0xFFFFE67D'u32, 0'u32)
+    updateReg32(addr rf.rxMode220, 0xFFFFFF9E'u32, 0'u32)
+    updateReg32(addr dfe.dfeStaticCtrl820, 0xFF0FFFFF'u32, 0x00300000'u32)
+    updateReg32(addr dfe.hbnCtrl30, 0xF0FFFFFF'u32, 0x08000000'u32)
+    updateReg32(addr rf.priModeCtrl30, 0xFFFFFFFF'u32, 0x00001003'u32)
+    updateReg32(addr dfe.dfeRfFixedDefault884, 0xF000FFFF'u32, 0x082000F4'u32)
+    updateReg32(addr rf.rfPriBiasTrimCc, 0xFFFFFFFF'u32, 0x10000000'u32)
+    updateReg32(addr rf.synthDfePathControl63c, 0x00000000'u32, 0'u32)
+    updateReg32(addr rf.txcalGain64, 0xFFFE0008'u32, 0x00004C2C'u32)
+    updateReg32(addr rf.txcalDefaultProfile128, 0xFF800800'u32, 0x004C2491'u32)
+    updateReg32(addr rf.txcalDefaultProfile12c, 0xFF800800'u32, 0x004C24C2'u32)
+    updateReg32(addr rf.txcalDefaultProfile130, 0xFF800FFF'u32, 0x00491000'u32)
+    updateReg32(addr rf.rfBiasTrimD4, 0xFFF0F00F'u32, 0x00F013C1'u32)
+    updateReg32(addr rf.calPathCtrl90, 0xFFFFFFFF'u32, 0x00010000'u32)
+    updateReg32(addr rf.txcalCtrlB8, 0xFFFFFFFF'u32, 0x00000010'u32)
+    updateReg32(addr rf.calModeDefault138, 0xFFFFFFFF'u32, 0x00000003'u32)
+    updateReg32(addr rf.txcalDefaultProfile130, 0xFFFFFE92'u32, 0x00000092'u32)
+    updateReg32(addr rf.calPathConfig8c, 0xFFFFFFF8'u32, 0x00000002'u32)
+    updateReg32(addr rf.measureCtrl618, 0x3FFFFFFF'u32, 0'u32)
+    updateReg32(addr rf.rxMode220, 0xFFFFFFEF'u32, 0'u32)
+
+  proc writeRfPriFixedValueRegs() =
     ## Port of librf_bl808.a:rf_pri.c.o rf_pri_fixed_val_regs.
     nim_wifi_rf_fixed_val_breakpoint()
     rfPriSnapshotStage(0xF100'u32)
     rfPhyTraceCheckpoint(rfPriTracePhase(0x1C00'u32))
     rfPhyTraceCheckpoint(rfPriTracePhase(0x1D00'u32))
-    writeRadioRegMaskInit(RfPriFixedValPrefixInit)
+    writeRfPriFixedCommonPreBranch()
     rfPriSnapshotStage(0xF101'u32)
+    let rf = rfRegs()
+    let dfe = rfDfeInitRegs()
     if rfPriIsWb03():
-      updateReg32(cast[ptr uint32](RfPriInitF814Reg.uint),
-                  0xFFFFFFE0'u32, 0x00000015'u32)
-      updateReg32(cast[ptr uint32](RfAcalCtrlReg.uint),
-                  0xDFFFFFFF'u32, 0x00000000'u32)
+      updateReg32(addr dfe.dfeRfFixedCtrl814, 0xFFFFFFE0'u32, 0x00000015'u32)
+      updateReg32(addr rf.acalCtrlA4, 0xDFFFFFFF'u32, 0x00000000'u32)
     else:
-      updateReg32(cast[ptr uint32](RfPriInitF814Reg.uint),
-                  0xFFFFFFE0'u32, 0x0000001B'u32)
-      updateReg32(cast[ptr uint32](RfAcalCtrlReg.uint),
-                  0xFFFFFFFF'u32, 0x20000000'u32)
+      updateReg32(addr dfe.dfeRfFixedCtrl814, 0xFFFFFFE0'u32, 0x0000001B'u32)
+      updateReg32(addr rf.acalCtrlA4, 0xFFFFFFFF'u32, 0x20000000'u32)
     rfPhyTraceCheckpoint(0x1E'u32)
-    writeRadioRegMaskInit(RfPriFixedValSuffixInit)
+    writeRfPriFixedCommonPostBranch()
+    writeRfPriFixedPowerCompTailDefaults()
     rfPriSnapshotStage(0xF102'u32)
+    inc nim_wifi_rf_fixed_val_count
+    nim_wifi_rf_fixed_val_device = rfPriDeviceTraceWord()
+    nim_wifi_rf_fixed_val_branch = uint32(rfPriIsWb03())
+    nim_wifi_rf_fixed_val_rf70 = volatileLoad(addr rf.txcalParam70)
+    nim_wifi_rf_fixed_val_rf88 = volatileLoad(addr rf.txcalDfe88)
+    nim_wifi_rf_fixed_val_rfd0 = volatileLoad(addr rf.optimizeCtrlD0)
+    nim_wifi_rf_fixed_val_rf814 = volatileLoad(addr dfe.dfeRfFixedCtrl814)
+    nim_wifi_rf_fixed_val_rfa0 = volatileLoad(addr rf.acalCtrlA4)
     rfPhyTraceCheckpoint(0x1F'u32)
     rfPhyTraceCheckpoint(0x20'u32)
 
   proc rfPriApplyWb03RuntimeLatches() =
     if rfPriIsWb03():
-      updateReg32(cast[ptr uint32](RfPriInit90Reg.uint),
-                  0xFFFFFFFF'u32, 0x00010000'u32)
-      updateReg32(cast[ptr uint32](RfPriTxcalDfeReg.uint),
-                  0xFFFFFFFF'u32, 0x00010000'u32)
-      updateReg32(cast[ptr uint32](RfAcalCtrlReg.uint),
-                  0xFFFFFFFF'u32, 0x00000100'u32)
+      let rf = rfRegs()
+      updateReg32(addr rf.calPathCtrl90, 0xFFFFFFFF'u32, 0x00010000'u32)
+      updateReg32(addr rf.txcalDfe88, 0xFFFFFFFF'u32, 0x00010000'u32)
+      updateReg32(addr rf.acalCtrlA4, 0xFFFFFFFF'u32, 0x00000100'u32)
 
   var nim_wifi_rf_pri_txcal_count* {.exportc.}: uint32
   var nim_wifi_rf_pri_lo_fcal_count* {.exportc.}: uint32
@@ -10181,6 +10474,15 @@ when defined(bl808WifiUseBl808Rf):
   var nim_wifi_rf_last_txcal_amp_mean* {.exportc.}: uint32
   var nim_wifi_rf_last_txcal_tmxcs* {.exportc.}: uint32
   var nim_wifi_rf_last_txcal_tmxcs_power* {.exportc.}: uint32
+  var preRf70TxcalSingenAmplitude* {.exportc: "nim_wifi_rf_pre_rf70_txcal_amp".}: uint32
+  var preRf70TxcalAdcMean* {.exportc: "nim_wifi_rf_pre_rf70_txcal_amp_mean".}: uint32
+  var preRf70TxcalParamReg* {.exportc: "nim_wifi_rf_pre_rf70_rf70".}: uint32
+  var preRf70TxcalMixerDcReg* {.exportc: "nim_wifi_rf_pre_rf70_rf6c".}: uint32
+  var preRf70SingenControlReg* {.exportc: "nim_wifi_rf_pre_rf70_rf120c".}: uint32
+  var preRf70SingenAmplitudeLoReg* {.exportc: "nim_wifi_rf_pre_rf70_rf1214".}: uint32
+  var preRf70SingenAmplitudeHiReg* {.exportc: "nim_wifi_rf_pre_rf70_rf1218".}: uint32
+  var preRf70AverageMeasureCtrlReg* {.exportc: "nim_wifi_rf_pre_rf70_rf1618".}: uint32
+  var preRf70AverageMeasureModeReg* {.exportc: "nim_wifi_rf_pre_rf70_rf161c".}: uint32
   var nim_wifi_rf_last_rxcal_word0* {.exportc.}: uint32
   var nim_wifi_rf_last_rxcal_word1* {.exportc.}: uint32
   var nim_wifi_rf_last_rxcal_power* {.exportc.}: uint32
@@ -10219,35 +10521,22 @@ when defined(bl808WifiUseBl808Rf):
   var nim_wifi_rf_bz_txcal_rf1600_log* {.exportc.}: array[8, uint32]
   var nim_wifi_rf_bz_txcal_rf162c_log* {.exportc.}: array[8, uint32]
   var nim_wifi_rf_bz_txcal_tag_log* {.exportc.}: array[8, uint32]
+
+  proc sampleRfTxcalAverage(): tuple[ok: bool, value: int32]
+  proc rfPriConfigChannelForCal(index: int)
   var nim_wifi_rf_roscal_search_log* {.exportc.}: array[16, uint32]
   var nim_wifi_rf_fcal_search_log* {.exportc.}: array[16, uint32]
   var nim_wifi_rf_rccal_search_log* {.exportc.}: array[32, uint32]
   var nim_wifi_rf_rccal_power_log* {.exportc.}: array[32, uint32]
 
-  proc rfRegRead(regAddr: uint32): uint32 {.inline.} =
-    volatileLoad(cast[ptr uint32](regAddr.uint))
-
-  proc rfRegWrite(regAddr, value: uint32) {.inline.} =
-    volatileStore(cast[ptr uint32](regAddr.uint), value)
-
-  proc rfRegOr(regAddr, mask: uint32) {.inline.} =
-    rfRegWrite(regAddr, rfRegRead(regAddr) or mask)
-
-  proc rfRegClear(regAddr, mask: uint32) {.inline.} =
-    rfRegWrite(regAddr, rfRegRead(regAddr) and not mask)
-
-  proc rfRegUpdate(regAddr, mask, value: uint32) {.inline.} =
-    rfRegWrite(regAddr, (rfRegRead(regAddr) and not mask) or (value and mask))
-
   proc rfPriApplyWb03RxcalTosdacLatch() =
     if not rfPriIsWb03() or
         bl808RfXtalIndex != xtalIndex(WlXtal40M):
       return
-    rfRegWrite(RfTxcalTosdacReg,
-               (rfRegRead(RfTxcalTosdacReg) and
-                not RfPriWb03RxcalTosdacReplayMask) or
-               (RfPriWb03RxcalTosdacSeed and
-                RfPriWb03RxcalTosdacReplayMask))
+    let rf = rfRegs()
+    updateReg32(addr rf.txcalTosdac600, not RfPriWb03RxcalTosdacReplayMask,
+                RfPriWb03RxcalTosdacSeed and
+                RfPriWb03RxcalTosdacReplayMask)
 
   proc rfSignedByte(value: uint8): int16 {.inline.} =
     cast[int8](value).int16
@@ -10273,53 +10562,294 @@ when defined(bl808WifiUseBl808Rf):
   proc rfCalibSetByte(offset: int, value: uint8) {.inline.} =
     cast[ptr UncheckedArray[uint8]](rfCalibDataGlobal)[offset] = value
 
+  proc rfCalibBzTxcalRecordByteOffset(record: int): int {.inline.} =
+    RfCalibBzTxcalRecordBaseByte +
+      record * RfCalibBzTxcalRecordStrideBytes
+
+  proc rfCalibBzTxcalRecordWord0(record: int): uint32 {.inline.} =
+    let offset = rfCalibBzTxcalRecordByteOffset(record)
+    rfCalibByte(offset).uint32 or
+      (rfCalibByte(offset + 1).uint32 shl 8) or
+      (rfCalibHalf((offset + 2) div 2).uint32 shl 16)
+
+  proc rfCalibBzTxcalRecordWord1(record: int): uint32 {.inline.} =
+    let offset = rfCalibBzTxcalRecordByteOffset(record)
+    rfCalibHalf((offset + 4) div 2).uint32
+
+  proc rfCalibStoreBzTxcalRecordWords(record: int; word0, word1: uint32) =
+    let offset = rfCalibBzTxcalRecordByteOffset(record)
+    rfCalibSetByte(offset, (word0 and 0xFF'u32).uint8)
+    rfCalibSetByte(offset + 1, ((word0 shr 8) and 0xFF'u32).uint8)
+    rfCalibSetHalf((offset + 2) div 2, ((word0 shr 16) and 0xFFFF'u32).uint16)
+    rfCalibSetHalf((offset + 4) div 2, (word1 and 0xFFFF'u32).uint16)
+
   proc rfPriSnapshotBzTxcalState(tag: uint32) =
     nim_wifi_rf_bz_txcal_snapshot_tag = tag
+    let rf = rfRegs()
     let idx = int(nim_wifi_rf_bz_txcal_snapshot_count and 0x7'u32)
     inc nim_wifi_rf_bz_txcal_snapshot_count
     nim_wifi_rf_bz_txcal_tag_log[idx] = tag
-    nim_wifi_rf_bz_txcal_rf48_log[idx] = rfRegRead(0x20001048'u32)
-    nim_wifi_rf_bz_txcal_rf4c_log[idx] = rfRegRead(0x2000104C'u32)
-    nim_wifi_rf_bz_txcal_rf88_log[idx] = rfRegRead(RfPriTxcalDfeReg)
-    nim_wifi_rf_bz_txcal_rf1600_log[idx] = rfRegRead(RfTxcalTosdacReg)
-    nim_wifi_rf_bz_txcal_rf162c_log[idx] = rfRegRead(0x2000162C'u32)
+    nim_wifi_rf_bz_txcal_rf48_log[idx] = volatileLoad(addr rf.rccalTone48)
+    nim_wifi_rf_bz_txcal_rf4c_log[idx] = volatileLoad(addr rf.scanRxLatch4c)
+    nim_wifi_rf_bz_txcal_rf88_log[idx] = volatileLoad(addr rf.txcalDfe88)
+    nim_wifi_rf_bz_txcal_rf1600_log[idx] = volatileLoad(addr rf.txcalTosdac600)
+    nim_wifi_rf_bz_txcal_rf162c_log[idx] = volatileLoad(addr rf.scanTxMeasureControl62c)
     if rfCalibDataGlobal == nil:
       return
     for record in 0 ..< 9:
-      let offset = 0xF8 + record * 8
       nim_wifi_rf_bz_txcal_word0_log[record] =
-        rfCalibByte(offset).uint32 or
-        (rfCalibByte(offset + 1).uint32 shl 8) or
-        (rfCalibHalf((offset + 2) div 2).uint32 shl 16)
+        rfCalibBzTxcalRecordWord0(record)
       nim_wifi_rf_bz_txcal_word1_log[record] =
-        rfCalibHalf((offset + 4) div 2).uint32
+        rfCalibBzTxcalRecordWord1(record)
 
-  proc rfPriApplyWb03Rf70ColdSeed() =
+  proc rfCalibRf70ReplayLowBandWord(): uint32 {.inline.} =
+    rfCalibWord(RfCalibRf70ReplayLowBandWordIndex)
+
+  proc rfCalibRf70ReplayHighBandWord(): uint32 {.inline.} =
+    rfCalibWord(RfCalibRf70ReplayHighBandWordIndex)
+
+  proc rfCalibSetRf70ReplayLowBandWord(value: uint32) {.inline.} =
+    rfCalibSetWord(RfCalibRf70ReplayLowBandWordIndex, value)
+
+  proc rfCalibSetRf70ReplayHighBandWord(value: uint32) {.inline.} =
+    rfCalibSetWord(RfCalibRf70ReplayHighBandWordIndex, value)
+
+  proc rfPriRf70ReplayWindow0Nibble(): uint32 {.inline.} =
+    (rfCalibRf70ReplayLowBandWord() shr 24) and 0xF'u32
+
+  proc rfPriRf70ReplayWindow1Nibble(): uint32 {.inline.} =
+    (rfCalibRf70ReplayHighBandWord() shr 8) and 0xF'u32
+
+  proc rfPriRf70ReplayWindow2Nibble(): uint32 {.inline.} =
+    (rfCalibRf70ReplayHighBandWord() shr 4) and 0xF'u32
+
+  proc rfPriRefreshRf70ReplayWindowDiagnostics() =
+    if rfCalibDataGlobal == nil:
+      rf70ReplayWindowValidMask = 0'u32
+      rf70ReplayWindow0SourceNibble = 0'u32
+      rf70ReplayWindow1SourceNibble = 0'u32
+      rf70ReplayWindow2SourceNibble = 0'u32
+      return
+    let lowBandReplayWord = rfCalibRf70ReplayLowBandWord()
+    let highBandReplayWord = rfCalibRf70ReplayHighBandWord()
+    rf70ReplayWindow0SourceNibble = (lowBandReplayWord shr 24) and 0xF'u32
+    rf70ReplayWindow1SourceNibble = (highBandReplayWord shr 8) and 0xF'u32
+    rf70ReplayWindow2SourceNibble = (highBandReplayWord shr 4) and 0xF'u32
+    rf70ReplayWindowValidMask =
+      (if lowBandReplayWord != 0'u32: 0x1'u32 else: 0'u32) or
+      (if (highBandReplayWord and 0x00000F00'u32) != 0'u32: 0x2'u32 else: 0'u32) or
+      (if (highBandReplayWord and 0x000000F0'u32) != 0'u32: 0x4'u32 else: 0'u32)
+
+  proc rfPriStoreRf70ReplayWindowNibbles(window0, window1, window2: uint32) =
+    rfCalibSetRf70ReplayLowBandWord(
+      (rfCalibRf70ReplayLowBandWord() and 0x00FF_FFFF'u32) or
+      ((window0 and 0xF'u32) shl 24))
+    rfCalibSetRf70ReplayHighBandWord(
+      (rfCalibRf70ReplayHighBandWord() and 0xFFFF_F00F'u32) or
+      ((window1 and 0xF'u32) shl 8) or
+      ((window2 and 0xF'u32) shl 4))
+    rfPriRefreshRf70ReplayWindowDiagnostics()
+
+  proc rfPriRecordRf70SearchWindow(window: int; ok: bool;
+                                   bestNibble, runnerUpNibble: uint32;
+                                   bestSample, runnerUpSample: int32;
+                                   measureCtrl, measureMode, measureIRaw: uint32) =
+    if window < 0 or window >= 3:
+      return
+    rf70ReplaySearchBestNibble[window] = bestNibble and 0xF'u32
+    rf70ReplaySearchRunnerUpNibble[window] = runnerUpNibble and 0xF'u32
+    rf70ReplaySearchBestSample[window] = cast[uint32](bestSample)
+    rf70ReplaySearchRunnerUpSample[window] = cast[uint32](runnerUpSample)
+    rf70ReplaySearchMeasureCtrl[window] = measureCtrl
+    rf70ReplaySearchMeasureMode[window] = measureMode
+    rf70ReplaySearchMeasureIRaw[window] = measureIRaw
+    if ok:
+      nim_wifi_rf_rf70_txcal_search_ok_mask =
+        nim_wifi_rf_rf70_txcal_search_ok_mask or (1'u32 shl uint32(window))
+
+  proc rfPriSearchRf70ReplayWindow(window: int): tuple[ok: bool, nibble: uint32] =
+    ## Port boundary for librf_bl808.a:rf_pri.c.o rf_pri_txcal RF70
+    ## replay-source scans:
+    ##   +0x316..0x3a2 -> rf_calib_data+0x0c bits 27:24
+    ##   +0x3da..0x466 -> rf_calib_data+0x10 bits 11:8
+    ##   +0x49e..0x52a -> rf_calib_data+0x10 bits 7:4
+    ##
+    ## Each window writes candidate RF70 low nibbles 0..15 and tracks the two
+    ## strongest signed measurements. LLVM objdump shows the vendor path stores
+    ## the strongest nibble, except when the top two candidates are adjacent; in
+    ## that case it stores the lower adjacent nibble.
+    inc nim_wifi_rf_rf70_txcal_search_count
+    var bestNibble = 5'u32
+    var runnerUpNibble = 5'u32
+    var bestSample = low(int32)
+    var runnerUpSample = low(int32)
+    var lastMeasureCtrl = 0'u32
+    var lastMeasureMode = 0'u32
+    var lastMeasureIRaw = 0'u32
+    let rf = rfRegs()
+    let originalRf70 = volatileLoad(addr rf.txcalParam70)
+    for candidate in 0'u32 .. 15'u32:
+      updateReg32(addr rf.txcalParam70, 0xFFFF_FFF0'u32, candidate)
+      let sample = sampleRfTxcalAverage()
+      let candidateTraceIndex = window * 16 + int(candidate)
+      if candidateTraceIndex >= 0 and candidateTraceIndex < 48:
+        rf70ReplayCandidateAverageSample[candidateTraceIndex] =
+          if sample.ok: cast[uint32](sample.value) else: 0x8000_0000'u32
+      if sample.ok:
+        rf70ReplayCandidateValidMask[window] =
+          rf70ReplayCandidateValidMask[window] or
+          (1'u32 shl candidate)
+      lastMeasureCtrl = volatileLoad(addr rf.measureCtrl618)
+      lastMeasureMode = volatileLoad(addr rf.measureMode61c)
+      lastMeasureIRaw = volatileLoad(addr rf.measureI620)
+      if sample.ok:
+        if sample.value > bestSample:
+          runnerUpSample = bestSample
+          runnerUpNibble = bestNibble
+          bestSample = sample.value
+          bestNibble = candidate
+        elif sample.value > runnerUpSample:
+          runnerUpSample = sample.value
+          runnerUpNibble = candidate
+    volatileStore(addr rf.txcalParam70, originalRf70)
+
+    let adjacent =
+      (int32(bestNibble) - int32(runnerUpNibble) == 1'i32) or
+      (int32(runnerUpNibble) - int32(bestNibble) == 1'i32)
+    let ok = bestSample != low(int32)
+    let selected =
+      if ok and adjacent and runnerUpSample != low(int32):
+        min(bestNibble, runnerUpNibble)
+      elif ok:
+        bestNibble
+      else:
+        RfPriWb03Rf70ColdSeed and 0xF'u32
+    rfPriRecordRf70SearchWindow(
+      window, ok, bestNibble, runnerUpNibble, bestSample, runnerUpSample,
+      lastMeasureCtrl, lastMeasureMode, lastMeasureIRaw)
+    (ok, selected)
+
+  proc rfPriPopulateWb03TxcalRf70ReplayFieldsFromSearch(): bool =
+    if not rfPriIsWb03() or
+        bl808RfXtalIndex != xtalIndex(WlXtal40M) or
+        rfCalibDataGlobal == nil:
+      return false
+    nim_wifi_rf_rf70_txcal_search_ok_mask = 0'u32
+    for i in 0 ..< 3:
+      rf70ReplaySearchBestNibble[i] = 0'u32
+      rf70ReplaySearchRunnerUpNibble[i] = 0'u32
+      rf70ReplaySearchBestSample[i] = 0'u32
+      rf70ReplaySearchRunnerUpSample[i] = 0'u32
+      rf70ReplaySearchMeasureCtrl[i] = 0'u32
+      rf70ReplaySearchMeasureMode[i] = 0'u32
+      rf70ReplaySearchMeasureIRaw[i] = 0'u32
+      rf70ReplayCandidateValidMask[i] = 0'u32
+      for candidate in 0 ..< 16:
+        rf70ReplayCandidateAverageSample[i * 16 + candidate] = 0'u32
+    let window0 = rfPriSearchRf70ReplayWindow(0)
+    rfPriConfigChannelForCal(2)
+    let window1 = rfPriSearchRf70ReplayWindow(1)
+    rfPriConfigChannelForCal(0x11)
+    let window2 = rfPriSearchRf70ReplayWindow(2)
+    rfPriConfigChannelForCal(9)
+    if window0.ok and window1.ok and window2.ok:
+      if bl808WifiRfWb03ApplyMeasuredRf70Replay:
+        rfPriStoreRf70ReplayWindowNibbles(
+          window0.nibble, window1.nibble, window2.nibble)
+        return true
+      return false
+    false
+
+  proc rfPriReplayWb03Rf70FromTxcalCalWords() =
     ## WB03/40M vendor cold init enters the MAC-active scan transition with
-    ## this RF70 calibration seed.
-    ## The local cold TX/RX calibration still leaves the RF70 source words
-    ## zero, so seed the vendor-derived value until that calibration path is
-    ## bit-for-bit recovered.
+    ## RF70=0x25181222. Vendor rf_pri_restore_cal_reg rebuilds RF70 from
+    ## rf_calib_data word 3 bits 27:24; the matching word-4 nibble is consumed
+    ## later by rf_pri_optimize. Keep this replay explicit so logs distinguish
+    ## a true TXCAL-produced source field from a late fallback.
+    if not rfPriIsWb03() or
+        bl808RfXtalIndex != xtalIndex(WlXtal40M) or
+        rfCalibDataGlobal == nil:
+      nim_wifi_rf_rf70_replay_reason = RfPriRf70ReplayNotApplicable
+      rfPriRefreshRf70ReplayWindowDiagnostics()
+      return
+    let lowBandReplayWordBefore = rfCalibRf70ReplayLowBandWord()
+    let highBandReplayWordBefore = rfCalibRf70ReplayHighBandWord()
+    let rf = rfRegs()
+    if lowBandReplayWordBefore != 0'u32 or highBandReplayWordBefore != 0'u32:
+      rfPriRefreshRf70ReplayWindowDiagnostics()
+      let hasVendorSource = rf70ReplayWindowValidMask == 0x7'u32
+      if nim_wifi_rf_rf70_replay_reason != RfPriRf70ReplayFieldsMeasuredByTxcal and
+          nim_wifi_rf_rf70_replay_reason != RfPriRf70ReplayFieldsMeasuredFallback:
+        nim_wifi_rf_rf70_replay_reason =
+          if hasVendorSource:
+            RfPriRf70ReplayFieldsPopulatedByTxcal
+          else:
+            RfPriRf70ReplayFieldsUnexpected
+      nim_wifi_rf_rf70_replay_cal_word3_before = lowBandReplayWordBefore
+      nim_wifi_rf_rf70_replay_cal_word4_before = highBandReplayWordBefore
+      nim_wifi_rf_rf70_replay_reg_before = volatileLoad(addr rf.txcalParam70)
+      if hasVendorSource:
+        inc nim_wifi_rf_rf70_replay_apply_count
+        volatileStore(addr rf.txcalParam70,
+                      (RfPriWb03Rf70ColdSeed and 0xFFFF_FFF0'u32) or
+                      rfPriRf70ReplayWindow0Nibble())
+        nim_wifi_rf_rf70_replay_cal_word3_after =
+          rfCalibRf70ReplayLowBandWord()
+        nim_wifi_rf_rf70_replay_cal_word4_after =
+          rfCalibRf70ReplayHighBandWord()
+        nim_wifi_rf_rf70_replay_reg_after = volatileLoad(addr rf.txcalParam70)
+      rfPriRefreshRf70ReplayWindowDiagnostics()
+      return
+    inc nim_wifi_rf_rf70_replay_apply_count
+    nim_wifi_rf_rf70_replay_reason = RfPriRf70ReplayFieldsSeededAtReplay
+    nim_wifi_rf_rf70_replay_reg_before = volatileLoad(addr rf.txcalParam70)
+    nim_wifi_rf_rf70_replay_cal_word3_before = lowBandReplayWordBefore
+    nim_wifi_rf_rf70_replay_cal_word4_before = highBandReplayWordBefore
+    let nibble = RfPriWb03Rf70ColdSeed and 0xF'u32
+    rfPriStoreRf70ReplayWindowNibbles(nibble, nibble, nibble)
+    volatileStore(addr rf.txcalParam70, RfPriWb03Rf70ColdSeed)
+    nim_wifi_rf_rf70_replay_cal_word3_after =
+      rfCalibRf70ReplayLowBandWord()
+    nim_wifi_rf_rf70_replay_cal_word4_after =
+      rfCalibRf70ReplayHighBandWord()
+    nim_wifi_rf_rf70_replay_reg_after = volatileLoad(addr rf.txcalParam70)
+
+  proc rfPriPopulateWb03TxcalRf70ReplayFields() =
+    ## LLVM objdump provenance: librf_bl808.a:rf_pri.c.o rf_pri_txcal writes
+    ## RF70's replay source words before the per-record rf_pri_txcal_w2reg
+    ## table path:
+    ##   rf_pri_txcal+0x388..0x3a2 -> rf_calib_data+0x0c bits 27:24
+    ##   rf_pri_txcal+0x450..0x466 -> rf_calib_data+0x10 bits 11:8
+    ##   rf_pri_txcal+0x512..0x52a -> rf_calib_data+0x10 bits 7:4
+    ## Run the recovered strongest-candidate search for UART/JTAG visibility.
+    ## Applying those measured replay windows is default-off because the
+    ## remaining vendor TXCAL setup is not fully recovered yet; the known
+    ## WB03/40M fallback keeps scan/auth behavior stable.
     if not rfPriIsWb03() or
         bl808RfXtalIndex != xtalIndex(WlXtal40M) or
         rfCalibDataGlobal == nil:
       return
-    if rfCalibWord(3) != 0'u32 or rfCalibWord(4) != 0'u32:
+    if rfCalibRf70ReplayLowBandWord() != 0'u32 or
+        rfCalibRf70ReplayHighBandWord() != 0'u32:
       return
+    if rfPriPopulateWb03TxcalRf70ReplayFieldsFromSearch():
+      nim_wifi_rf_rf70_replay_reason = RfPriRf70ReplayFieldsMeasuredByTxcal
+      return
+    nim_wifi_rf_rf70_replay_reason = RfPriRf70ReplayFieldsMeasuredFallback
     let nibble = RfPriWb03Rf70ColdSeed and 0xF'u32
-    rfCalibSetWord(3, (rfCalibWord(3) and 0x00FFFFFF'u32) or (nibble shl 24))
-    rfCalibSetWord(4, (rfCalibWord(4) and 0xFFFFFF0F'u32) or (nibble shl 4))
-    rfRegWrite(RfTxcalParamReg, RfPriWb03Rf70ColdSeed)
+    rfPriStoreRf70ReplayWindowNibbles(nibble, nibble, nibble)
 
   proc rfPriApplyWb03RccalSeed() =
     if not rfPriIsWb03() or
         bl808RfXtalIndex != xtalIndex(WlXtal40M):
       return
-    rfRegWrite(RfRbbRccalReg, RfPriWb03RccalRf80Seed)
-    rfRegWrite(0x20001084'u32, RfPriWb03RccalRf84Seed)
+    let rf = rfRegs()
+    volatileStore(addr rf.rbbRccalCtrl80, RfPriWb03RccalRf80Seed)
+    volatileStore(addr rf.rccalReplay84, RfPriWb03RccalRf84Seed)
     if rfCalibDataGlobal != nil:
       let value = RfPriWb03RccalRf80Seed and RfRccalCodeMask
-      rfCalibSetWord(2, (rfCalibWord(2) and not 0x00FF_FFFF'u32) or
+      rfCalibSetWord(RfCalibRccalReplayWordIndex,
+        (rfCalibWord(RfCalibRccalReplayWordIndex) and not 0x00FF_FFFF'u32) or
         value or (value shl 6) or (value shl 12) or (value shl 18))
 
   proc rfPriApplyWb03ScanRxLatches() =
@@ -10331,20 +10861,21 @@ when defined(bl808WifiUseBl808Rf):
     ## explicit until the preceding calibration/latch source is fully recovered.
     rfPriSnapshotBzTxcalState(0x4A'u32)
     rfPhyTraceCheckpoint(0x4A'u32)
-    rfRegOr(RfCalModeReg, 0x00040000'u32)
-    rfRegOr(RfCalCtrlReg, 0x00000080'u32)
-    rfRegWrite(RfTxcalParamReg, RfPriWb03Rf70ScanSeed)
-    rfRegWrite(RfTxcalTosdacReg, RfPriWb03ScanRf1600ActiveSeed)
-    rfRegWrite(0x20001608'u32, RfPriWb03ScanRf1608Seed)
-    rfRegWrite(RfMeasureCtrlReg, RfPriWb03ScanRf1618Seed)
-    rfRegWrite(0x2000162C'u32, RfPriWb03ScanRf162cSeed)
-    rfRegWrite(RfRbbRccalReg, RfPriWb03ScanRf80ActiveSeed)
-    rfRegWrite(RfFcalCtrlReg, 0x0C0C9F96'u32)
-    rfRegWrite(RfPriConfigB4Reg, RfPriWb03ScanRfb4Seed)
-    rfRegWrite(RfPriConfigBcReg, RfPriWb03ScanRfbcSeed)
-    rfRegWrite(0x2000104C'u32, RfPriWb03ScanRf4cSeed)
-    rfRegWrite(RfPriTxcalDfeReg, RfPriWb03ScanRf88Seed)
-    rfRegWrite(RfPriInit8cReg, RfPriWb03ScanRf8cSeed)
+    let rf = rfRegs()
+    updateReg32(addr rf.calMode14, not 0'u32, 0x00040000'u32)
+    updateReg32(addr rf.calCtrl1c, not 0'u32, 0x00000080'u32)
+    volatileStore(addr rf.txcalParam70, RfPriWb03Rf70ScanSeed)
+    volatileStore(addr rf.txcalTosdac600, RfPriWb03ScanRf1600ActiveSeed)
+    volatileStore(addr rf.scanSynthControl608, RfPriWb03ScanRf1608Seed)
+    volatileStore(addr rf.measureCtrl618, RfPriWb03ScanRf1618Seed)
+    volatileStore(addr rf.scanTxMeasureControl62c, RfPriWb03ScanRf162cSeed)
+    volatileStore(addr rf.rbbRccalCtrl80, RfPriWb03ScanRf80ActiveSeed)
+    volatileStore(addr rf.fcalCtrlA0, 0x0C0C9F96'u32)
+    volatileStore(addr rf.channelCalStatusB4, RfPriWb03ScanRfb4Seed)
+    volatileStore(addr rf.channelFcalConfigBc, RfPriWb03ScanRfbcSeed)
+    volatileStore(addr rf.scanRxLatch4c, RfPriWb03ScanRf4cSeed)
+    volatileStore(addr rf.txcalDfe88, RfPriWb03ScanRf88Seed)
+    volatileStore(addr rf.calPathConfig8c, RfPriWb03ScanRf8cSeed)
     rfPhyTraceCheckpoint(0x4B'u32)
     nim_wifi_rf_latch_service_enable(1'u32)
     waitRfUs(1'u32)
@@ -10360,6 +10891,7 @@ when defined(bl808WifiUseBl808Rf):
         bl808RfXtalIndex != xtalIndex(WlXtal40M):
       return
     rfPriSnapshotBzTxcalState(0x45'u32)
+    let rf = rfRegs()
     let bba = bbaAgcRegs()
     volatileStore(addr bba.macActiveB340, 0x00000000'u32)
     volatileStore(addr bba.macActiveB344, 0x00000000'u32)
@@ -10374,15 +10906,15 @@ when defined(bl808WifiUseBl808Rf):
     volatileStore(addr bba.macActiveC01c, 0x00050050'u32)
     volatileStore(addr bba.macActiveC020, 0x00050050'u32)
     volatileStore(addr bba.macActiveC02c, 0x00000008'u32)
-    rfRegWrite(RfPriInit6cReg, 0x00000644'u32)
-    rfRegWrite(RfPriInit70Reg, RfPriWb03MacActiveRf70Seed)
-    rfRegWrite(RfRoscalCtrlReg, RfPriWb03MacActiveRf7cSeed)
-    rfRegWrite(RfFcalCtrlReg, RfPriWb03MacActiveRfa0Seed)
-    rfRegWrite(RfTxcalTosdacReg, RfPriWb03MacActiveRf1600Seed)
-    rfRegWrite(0x2000162C'u32, 0x00070007'u32)
-    rfRegWrite(RfRbbRccalReg, RfPriWb03MacActiveRf80Seed)
-    rfRegOr(RfCalModeReg, 0x00040000'u32)
-    rfRegOr(RfCalCtrlReg, 0x00000080'u32)
+    volatileStore(addr rf.txcalDc6c, 0x00000644'u32)
+    volatileStore(addr rf.txcalParam70, RfPriWb03MacActiveRf70Seed)
+    volatileStore(addr rf.roscalCtrl7c, RfPriWb03MacActiveRf7cSeed)
+    volatileStore(addr rf.fcalCtrlA0, RfPriWb03MacActiveRfa0Seed)
+    volatileStore(addr rf.txcalTosdac600, RfPriWb03MacActiveRf1600Seed)
+    volatileStore(addr rf.scanTxMeasureControl62c, 0x00070007'u32)
+    volatileStore(addr rf.rbbRccalCtrl80, RfPriWb03MacActiveRf80Seed)
+    updateReg32(addr rf.calMode14, not 0'u32, 0x00040000'u32)
+    updateReg32(addr rf.calCtrl1c, not 0'u32, 0x00000080'u32)
     rfPriSnapshotBzTxcalState(0x46'u32)
 
   proc rfPriApplyWb03AuthTxLatches() =
@@ -10391,14 +10923,15 @@ when defined(bl808WifiUseBl808Rf):
     if not rfPriIsWb03() or
         bl808RfXtalIndex != xtalIndex(WlXtal40M):
       return
-    rfRegWrite(RfPriInit70Reg, RfPriWb03MacActiveRf70Seed)
-    rfRegWrite(RfRoscalCtrlReg, RfPriWb03MacActiveRf7cSeed)
-    rfRegWrite(RfFcalCtrlReg, RfPriWb03MacActiveRfa0Seed)
+    let rf = rfRegs()
+    volatileStore(addr rf.txcalParam70, RfPriWb03MacActiveRf70Seed)
+    volatileStore(addr rf.roscalCtrl7c, RfPriWb03MacActiveRf7cSeed)
+    volatileStore(addr rf.fcalCtrlA0, RfPriWb03MacActiveRfa0Seed)
     when bl808WifiRfWb03AuthTxPulseLatch:
-      rfRegWrite(RfPriTxcalDfeReg, RfPriWb03ScanRf88Seed)
-    rfRegWrite(RfTxcalTosdacReg, RfPriWb03MacActiveRf1600Seed)
-    rfRegWrite(0x2000162C'u32, 0x00070007'u32)
-    rfRegWrite(RfRbbRccalReg, RfPriWb03MacActiveRf80Seed)
+      volatileStore(addr rf.txcalDfe88, RfPriWb03ScanRf88Seed)
+    volatileStore(addr rf.txcalTosdac600, RfPriWb03MacActiveRf1600Seed)
+    volatileStore(addr rf.scanTxMeasureControl62c, 0x00070007'u32)
+    volatileStore(addr rf.rbbRccalCtrl80, RfPriWb03MacActiveRf80Seed)
     when bl808WifiRfWb03AuthTxPulseLatch:
       nim_wifi_rf_latch_service_enable(1'u32)
       waitRfUs(1'u32)
@@ -10408,14 +10941,15 @@ when defined(bl808WifiUseBl808Rf):
       waitRfUs(uint32(bl808WifiRfWb03AuthTxSettleUs))
 
   proc rfPriCaptureWb03AuthTxPrePush() =
-    nimFwDbgAuthRfPrePush[0] = rfRegRead(RfPriInit70Reg)
-    nimFwDbgAuthRfPrePush[1] = rfRegRead(RfPriTxcalDfeReg)
-    nimFwDbgAuthRfPrePush[2] = rfRegRead(RfPriInit8cReg)
-    nimFwDbgAuthRfPrePush[3] = rfRegRead(RfFcalCtrlReg)
-    nimFwDbgAuthRfPrePush[4] = rfRegRead(RfPriConfigB4Reg)
-    nimFwDbgAuthRfPrePush[5] = rfRegRead(RfPriConfigBcReg)
-    nimFwDbgAuthRfPrePush[6] = rfRegRead(RfOptimizeReg)
-    nimFwDbgAuthRfPrePush[7] = rfRegRead(RfTxcalTosdacReg)
+    let rf = rfRegs()
+    nimFwDbgAuthRfPrePush[0] = volatileLoad(addr rf.txcalParam70)
+    nimFwDbgAuthRfPrePush[1] = volatileLoad(addr rf.txcalDfe88)
+    nimFwDbgAuthRfPrePush[2] = volatileLoad(addr rf.calPathConfig8c)
+    nimFwDbgAuthRfPrePush[3] = volatileLoad(addr rf.fcalCtrlA0)
+    nimFwDbgAuthRfPrePush[4] = volatileLoad(addr rf.channelCalStatusB4)
+    nimFwDbgAuthRfPrePush[5] = volatileLoad(addr rf.channelFcalConfigBc)
+    nimFwDbgAuthRfPrePush[6] = volatileLoad(addr rf.optimizeCtrlD0)
+    nimFwDbgAuthRfPrePush[7] = volatileLoad(addr rf.txcalTosdac600)
 
   proc captureAuthTxHwPrePush(desc: ptr HostTxDescView, thd: ptr HostTxHwDescView) =
     nimFwDbgAuthHwPrePush[0] = desc.descWord4
@@ -10475,19 +11009,20 @@ when defined(bl808WifiUseBl808Rf):
     if not rfPriIsWb03() or
         bl808RfXtalIndex != xtalIndex(WlXtal40M):
       return
-    var status = rfRegRead(RfPriConfigB4Reg)
+    let rf = rfRegs()
+    var status = volatileLoad(addr rf.channelCalStatusB4)
     if (status and 0x00100000'u32) == 0'u32:
       return
     for _ in 0 ..< RfConfigChannelWaitLimit:
-      rfRegOr(RfTxcalCtrlReg, 0x00010000'u32)
+      updateReg32(addr rf.txcalCtrlB8, not 0'u32, 0x00010000'u32)
       waitRfUs(10'u32)
-      rfRegClear(RfTxcalCtrlReg, 0x00010000'u32)
+      updateReg32(addr rf.txcalCtrlB8, not 0x00010000'u32, 0'u32)
       waitRfUs(50'u32)
-      rfRegOr(RfPriConfigB0Reg, 0x10000000'u32)
+      updateReg32(addr rf.channelCalStrobeB0, 0xFFFFFFFF'u32, 0x10000000'u32)
       waitRfUs(10'u32)
-      rfRegClear(RfPriConfigB0Reg, 0x10000000'u32)
+      updateReg32(addr rf.channelCalStrobeB0, not 0x10000000'u32, 0'u32)
       waitRfUs(50'u32)
-      status = rfRegRead(RfPriConfigB4Reg)
+      status = volatileLoad(addr rf.channelCalStatusB4)
       if (status and 0x00100000'u32) == 0'u32:
         return
     inc nim_wifi_rf_config_channel_wait_timeout_count
@@ -10500,26 +11035,28 @@ when defined(bl808WifiUseBl808Rf):
     if not rfPriIsWb03() or
         bl808RfXtalIndex != xtalIndex(WlXtal40M):
       return
-    rfRegWrite(RfTxcalTosdacReg, RfPriWb03RfcEntryRf1600Seed)
-    rfRegWrite(RfRbbRccalReg, RfPriWb03ScanRf80ListenSeed)
-    rfRegWrite(RfPriConfigBcReg, RfPriWb03ScanRfbcSeed)
-    rfRegWrite(0x20001608'u32, RfPriWb03ScanRf1608Seed)
-    rfRegWrite(RfMeasureCtrlReg, RfPriWb03ScanRf1618Seed)
-    rfRegWrite(RfPriInit8cReg, RfPriWb03ScanRf8cSeed)
+    let rf = rfRegs()
+    volatileStore(addr rf.txcalTosdac600, RfPriWb03RfcEntryRf1600Seed)
+    volatileStore(addr rf.rbbRccalCtrl80, RfPriWb03ScanRf80ListenSeed)
+    volatileStore(addr rf.channelFcalConfigBc, RfPriWb03ScanRfbcSeed)
+    volatileStore(addr rf.scanSynthControl608, RfPriWb03ScanRf1608Seed)
+    volatileStore(addr rf.measureCtrl618, RfPriWb03ScanRf1618Seed)
+    volatileStore(addr rf.calPathConfig8c, RfPriWb03ScanRf8cSeed)
     rfPriWaitConfigIdleForWb03RfcEntry()
 
   proc rfPriApplyWb03ScanBaseline() =
     if not rfPriIsWb03() or
         bl808RfXtalIndex != xtalIndex(WlXtal40M):
       return
-    rfRegWrite(RfTxcalTosdacReg, RfPriWb03ScanRf1600BaselineSeed)
-    rfRegWrite(0x20001608'u32, RfPriWb03ScanRf1608Seed)
-    rfRegWrite(RfMeasureCtrlReg, RfPriWb03ScanRf1618Seed)
-    rfRegWrite(RfRbbRccalReg, RfPriWb03RccalRf80Seed)
-    rfRegWrite(RfPriConfigB4Reg, RfPriWb03ScanRfb4Seed)
-    rfRegWrite(RfPriConfigBcReg, RfPriWb03ScanRfbcSeed)
-    rfRegWrite(RfPriTxcalDfeReg, RfPriWb03ScanRf88Seed)
-    rfRegWrite(RfPriInit8cReg, RfPriWb03ScanRf8cSeed)
+    let rf = rfRegs()
+    volatileStore(addr rf.txcalTosdac600, RfPriWb03ScanRf1600BaselineSeed)
+    volatileStore(addr rf.scanSynthControl608, RfPriWb03ScanRf1608Seed)
+    volatileStore(addr rf.measureCtrl618, RfPriWb03ScanRf1618Seed)
+    volatileStore(addr rf.rbbRccalCtrl80, RfPriWb03RccalRf80Seed)
+    volatileStore(addr rf.channelCalStatusB4, RfPriWb03ScanRfb4Seed)
+    volatileStore(addr rf.channelFcalConfigBc, RfPriWb03ScanRfbcSeed)
+    volatileStore(addr rf.txcalDfe88, RfPriWb03ScanRf88Seed)
+    volatileStore(addr rf.calPathConfig8c, RfPriWb03ScanRf8cSeed)
 
   proc wlCfgU32(offset: int): uint32 =
     if wlCfgGlobal == nil:
@@ -10530,20 +11067,26 @@ when defined(bl808WifiUseBl808Rf):
       (bytes[offset + 2].uint32 shl 16) or
       (bytes[offset + 3].uint32 shl 24)
 
+  proc wlCfgWb03RxcalReplayA8Word(): uint32 {.inline.} =
+    wlCfgU32(WlRfCfgRxcalA8Offset)
+
+  proc wlCfgWb03RxcalReplayAcWord(): uint32 {.inline.} =
+    wlCfgU32(WlRfCfgRxcalAcOffset)
+
   proc rfLoFcal(index: int): uint16 {.inline.} =
-    (rfCalibHalf(14 + index) shr 8) and 0x00FF'u16
+    (rfCalibHalf(RfCalibLoVcoHalfwordBase + index) shr 8) and 0x00FF'u16
 
   proc rfLoAcal(index: int): uint16 {.inline.} =
-    rfCalibHalf(14 + index) and 0x003F'u16
+    rfCalibHalf(RfCalibLoVcoHalfwordBase + index) and 0x003F'u16
 
   proc setRfLoFcal(index: int, fcal: uint16) =
-    let halfIndex = 14 + index
+    let halfIndex = RfCalibLoVcoHalfwordBase + index
     let value = (rfCalibHalf(halfIndex) and 0x00FF'u16) or
       ((fcal and 0x00FF'u16) shl 8)
     rfCalibSetHalf(halfIndex, value)
 
   proc setRfLoAcal(index: int, acal: uint16) =
-    let halfIndex = 14 + index
+    let halfIndex = RfCalibLoVcoHalfwordBase + index
     let value = (rfCalibHalf(halfIndex) and 0xFF00'u16) or
       (acal and 0x003F'u16)
     rfCalibSetHalf(halfIndex, value)
@@ -10560,7 +11103,7 @@ when defined(bl808WifiUseBl808Rf):
     if rfCalibDataGlobal == nil:
       return false
     for i in 0 ..< RfPriTxcalSearchRecords * 2:
-      if rfCalibWord(RfPriTxcalRecordBaseWord + i) != 0'u32:
+      if rfCalibWord(RfCalibTxcalRecordBaseWord + i) != 0'u32:
         return true
     false
 
@@ -10568,25 +11111,30 @@ when defined(bl808WifiUseBl808Rf):
   proc restoreRfPriCalState(state: RfPriCalState)
 
   proc waitRfFcalReady(): bool =
+    let rf = rfRegs()
     for _ in 0 ..< RfFcalWaitLimit:
-      if (rfRegRead(RfFcalReg) and RfFcalReadyMask) != 0'u32:
+      if (volatileLoad(addr rf.fcalAc) and RfFcalReadyMask) != 0'u32:
         return true
       waitRfUs(1'u32)
     inc nim_wifi_rf_fcal_wait_timeout_count
     false
 
   proc sampleRfFcalCount(): uint16 =
-    rfRegClear(RfFcalReg, RfFcalReadyMask)
-    rfRegOr(RfFcalReg, RfFcalStartMask)
+    let rf = rfRegs()
+    updateReg32(addr rf.fcalAc, not RfFcalReadyMask, 0'u32)
+    updateReg32(addr rf.fcalAc, not 0'u32, RfFcalStartMask)
     discard waitRfFcalReady()
-    result = uint16((rfRegRead(RfCalResultReg) shr 16) and 0xFFFF'u32)
-    rfRegClear(RfFcalReg, RfFcalStartMask)
+    result = uint16((volatileLoad(addr rf.calResultA8) shr 16) and 0xFFFF'u32)
+    updateReg32(addr rf.fcalAc, not RfFcalStartMask, 0'u32)
 
   proc writeRfFcalCode(code: uint16) =
-    rfRegUpdate(RfFcalCtrlReg, RfFcalCodeMask, uint32(code and 0x00FF'u16))
+    let rf = rfRegs()
+    updateReg32(addr rf.fcalCtrlA0, not RfFcalCodeMask,
+                uint32(code and 0x00FF'u16))
 
   proc writeRfAcalCode(code: uint16) =
-    rfRegUpdate(RfFcalCtrlReg, RfAcalCodeMask,
+    let rf = rfRegs()
+    updateReg32(addr rf.fcalCtrlA0, not RfAcalCodeMask,
                 uint32(code and 0x003F'u16) shl 16)
 
   proc vendorLikeRfAcalForFcal(fcal: uint16): uint16 {.inline.} =
@@ -10598,28 +11146,25 @@ when defined(bl808WifiUseBl808Rf):
       0x000A'u16
 
   proc prepareRfPriLoFcal() =
-    rfRegWrite(RfCalModeReg,
-               (rfRegRead(RfCalModeReg) and not 0x00000030'u32) or
-               0x00000010'u32)
-    rfRegClear(RfCtrlReg, RfCtrlTuneEnableMask)
-    rfRegWrite(RfSynthCtrlReg, 0'u32)
-    rfRegOr(RfPriModeCtrlReg, 0x00000002'u32)
-    rfRegWrite(RfPriModeCtrlReg,
-               (rfRegRead(RfPriModeCtrlReg) and 0x0CF090FF'u32) or
-               0x0CF00000'u32)
-    rfRegOr(RfCalCtrlReg, 0x00000008'u32)
+    let rf = rfRegs()
+    updateReg32(addr rf.calMode14, not 0x00000030'u32, 0x00000010'u32)
+    updateReg32(addr rf.baseCtrl1, not RfCtrlTuneEnableMask, 0'u32)
+    volatileStore(addr rf.synthCtrl2c, 0'u32)
+    updateReg32(addr rf.priModeCtrl30, not 0'u32, 0x00000002'u32)
+    updateReg32(addr rf.priModeCtrl30, 0x0CF090FF'u32, 0x0CF00000'u32)
+    updateReg32(addr rf.calCtrl1c, not 0'u32, 0x00000008'u32)
     writeRfFcalCode(0x80'u16)
-    rfRegClear(RfTxcalCtrlReg, 0x00003000'u32)
-    rfRegUpdate(RfCalResultReg, 0x0000FFFF'u32, uint32(RfLoFcalDiv))
-    rfRegWrite(RfSdm2Reg, 0x01000000'u32)
-    rfRegOr(RfSdm1Reg, 0x00001000'u32)
-    rfRegClear(RfSdm1Reg, 0x00010000'u32)
-    rfRegOr(RfTxcalCtrlReg, 0x00010000'u32)
+    updateReg32(addr rf.txcalCtrlB8, not 0x00003000'u32, 0'u32)
+    updateReg32(addr rf.calResultA8, 0xFFFF0000'u32, uint32(RfLoFcalDiv))
+    volatileStore(addr rf.sdmDivC4, 0x01000000'u32)
+    updateReg32(addr rf.sdmCtrlC0, not 0'u32, 0x00001000'u32)
+    updateReg32(addr rf.sdmCtrlC0, not 0x00010000'u32, 0'u32)
+    updateReg32(addr rf.txcalCtrlB8, not 0'u32, 0x00010000'u32)
     waitRfUs(10'u32)
-    rfRegOr(RfSdm1Reg, 0x00010000'u32)
-    rfRegClear(RfTxcalCtrlReg, 0x00010000'u32)
+    updateReg32(addr rf.sdmCtrlC0, not 0'u32, 0x00010000'u32)
+    updateReg32(addr rf.txcalCtrlB8, not 0x00010000'u32, 0'u32)
     waitRfUs(50'u32)
-    rfRegUpdate(RfAcalCtrlReg, 0x00000003'u32, 0x00000002'u32)
+    updateReg32(addr rf.acalCtrlA4, 0xFFFFFFFC'u32, 0x00000002'u32)
     waitRfUs(50'u32)
 
   proc chooseRfBaseFcalCode(): uint16 =
@@ -10645,11 +11190,12 @@ when defined(bl808WifiUseBl808Rf):
         bit = bit shr 1
       if code >= 15'u16 and code <= 240'u16:
         return code
-      rfRegClear(RfSdm1Reg, 0x00010000'u32)
-      rfRegOr(RfTxcalCtrlReg, 0x00010000'u32)
+      let rf = rfRegs()
+      updateReg32(addr rf.sdmCtrlC0, not 0x00010000'u32, 0'u32)
+      updateReg32(addr rf.txcalCtrlB8, not 0'u32, 0x00010000'u32)
       waitRfUs(50'u32)
-      rfRegOr(RfSdm1Reg, 0x00010000'u32)
-      rfRegClear(RfTxcalCtrlReg, 0x00010000'u32)
+      updateReg32(addr rf.sdmCtrlC0, not 0'u32, 0x00010000'u32)
+      updateReg32(addr rf.txcalCtrlB8, not 0x00010000'u32, 0'u32)
       waitRfUs(50'u32)
       code = 0x80'u16
     if logIndex < nim_wifi_rf_fcal_search_log.len:
@@ -10659,10 +11205,9 @@ when defined(bl808WifiUseBl808Rf):
   proc runRfPriLoFcal() =
     if rfCalibDataGlobal == nil:
       return
+    let rf = rfRegs()
     inc nim_wifi_rf_pri_lo_fcal_count
-    rfRegWrite(RfCalModeReg,
-               (rfRegRead(RfCalModeReg) and not 0x00000030'u32) or
-               0x00000010'u32)
+    updateReg32(addr rf.calMode14, not 0x00000030'u32, 0x00000010'u32)
     let saved = saveRfPriCalState()
     prepareRfPriLoFcal()
 
@@ -10709,37 +11254,32 @@ when defined(bl808WifiUseBl808Rf):
       setRfLoFcal(i, uint16(fcal))
 
     restoreRfPriCalState(saved)
-    rfRegOr(RfCalModeReg, 0x00000030'u32)
+    updateReg32(addr rf.calMode14, not 0'u32, 0x00000030'u32)
     nim_wifi_rf_last_lo_fcal = uint32(rfLoFcal(RfLoChannelCount - 1))
 
   proc prepareRfPriLoAcal() =
-    rfRegWrite(RfCalModeReg,
-               (rfRegRead(RfCalModeReg) and not 0x000000C0'u32) or
-               0x00000040'u32)
-    rfRegClear(RfCtrlReg, RfCtrlTuneEnableMask)
-    rfRegWrite(RfSynthCtrlReg, 0'u32)
-    rfRegOr(RfPriModeCtrlReg, 0x00000002'u32)
-    rfRegWrite(RfPriModeCtrlReg,
-               (rfRegRead(RfPriModeCtrlReg) and 0x0CF090FF'u32) or
-               0x0CF00000'u32)
-    rfRegOr(RfCalCtrlReg, 0x00000010'u32)
+    let rf = rfRegs()
+    updateReg32(addr rf.calMode14, not 0x000000C0'u32, 0x00000040'u32)
+    updateReg32(addr rf.baseCtrl1, not RfCtrlTuneEnableMask, 0'u32)
+    volatileStore(addr rf.synthCtrl2c, 0'u32)
+    updateReg32(addr rf.priModeCtrl30, not 0'u32, 0x00000002'u32)
+    updateReg32(addr rf.priModeCtrl30, 0x0CF090FF'u32, 0x0CF00000'u32)
+    updateReg32(addr rf.calCtrl1c, not 0'u32, 0x00000010'u32)
 
   proc runRfPriLoAcal() =
     if rfCalibDataGlobal == nil:
       return
+    let rf = rfRegs()
     inc nim_wifi_rf_pri_lo_acal_count
-    rfRegWrite(RfCalModeReg,
-               (rfRegRead(RfCalModeReg) and not 0x000000C0'u32) or
-               0x00000040'u32)
+    updateReg32(addr rf.calMode14, not 0x000000C0'u32, 0x00000040'u32)
     let saved = saveRfPriCalState()
     prepareRfPriLoAcal()
 
     for i in 0 ..< RfLoChannelCount:
-      rfRegUpdate(RfAcalCtrlReg, 0x00000700'u32, 0x00000400'u32)
-      rfRegUpdate(RfFcalCtrlReg, RfAcalCodeMask, 0x00100000'u32)
-      rfRegUpdate(RfFcalCtrlReg, RfFcalCodeMask,
-                  uint32(rfLoFcal(i)))
-      rfRegWrite(RfSdm2Reg, RfChannelDivTable40M[i])
+      updateReg32(addr rf.acalCtrlA4, 0xFFFFF8FF'u32, 0x00000400'u32)
+      updateReg32(addr rf.fcalCtrlA0, not RfAcalCodeMask, 0x00100000'u32)
+      updateReg32(addr rf.fcalCtrlA0, not RfFcalCodeMask, uint32(rfLoFcal(i)))
+      volatileStore(addr rf.sdmDivC4, RfChannelDivTable40M[i])
       waitRfUs(1'u32)
 
       var acal = 0x10'u16
@@ -10747,7 +11287,7 @@ when defined(bl808WifiUseBl808Rf):
       while bit != 0'u16:
         writeRfAcalCode(acal)
         waitRfUs(1'u32)
-        if (rfRegRead(RfAcalCtrlReg) and RfAcalComparatorMask) == 0'u32:
+        if (volatileLoad(addr rf.acalCtrlA4) and RfAcalComparatorMask) == 0'u32:
           acal = uint16((uint32(acal) + uint32(bit)) and 0xFFFF'u32)
         else:
           acal = uint16((uint32(acal) - uint32(bit)) and 0xFFFF'u32)
@@ -10755,89 +11295,141 @@ when defined(bl808WifiUseBl808Rf):
 
       writeRfAcalCode(acal)
       waitRfUs(1'u32)
-      if (rfRegRead(RfAcalCtrlReg) and RfAcalComparatorMask) == 0'u32 and
+      if (volatileLoad(addr rf.acalCtrlA4) and RfAcalComparatorMask) == 0'u32 and
           acal <= 30'u16:
         inc acal
       acal = vendorLikeRfAcalForFcal(rfLoFcal(i))
       setRfLoAcal(i, acal and 0x001F'u16)
 
     restoreRfPriCalState(saved)
-    rfRegOr(RfCalModeReg, 0x000000C0'u32)
+    updateReg32(addr rf.calMode14, not 0'u32, 0x000000C0'u32)
     nim_wifi_rf_last_lo_acal = uint32(rfLoAcal(RfLoChannelCount - 1))
 
   proc saveRfPriCalState(): RfPriCalState =
     inc nimFwDbgRfCalSaveCount
-    for i, regAddr in RfPriCalSavedRegs:
-      result.words[i] = rfRegRead(regAddr)
-    nimFwDbgRfCalSaveRf2c = result.words[1]
-    nimFwDbgRfCalSaveRf88 = result.words[8]
+    let rf = rfRegs()
+    let dfe = rfDfeInitRegs()
+    result.baseCtrl1 = volatileLoad(addr rf.baseCtrl1)
+    result.synthCtrl2c = volatileLoad(addr rf.synthCtrl2c)
+    result.calCtrl1c = volatileLoad(addr rf.calCtrl1c)
+    result.priModeCtrl30 = volatileLoad(addr rf.priModeCtrl30)
+    result.txcalCtrlB8 = volatileLoad(addr rf.txcalCtrlB8)
+    result.sdmCtrlC0 = volatileLoad(addr rf.sdmCtrlC0)
+    result.sdmDivC4 = volatileLoad(addr rf.sdmDivC4)
+    result.hbnCtrl30 = volatileLoad(addr dfe.hbnCtrl30)
+    result.txcalDfe88 = volatileLoad(addr rf.txcalDfe88)
+    result.calPathConfig8c = volatileLoad(addr rf.calPathConfig8c)
+    result.txcalTosdac600 = volatileLoad(addr rf.txcalTosdac600)
+    result.calMeasurePrep60c = volatileLoad(addr rf.calMeasurePrep60c)
+    result.measureCtrl618 = volatileLoad(addr rf.measureCtrl618)
+    result.measureMode61c = volatileLoad(addr rf.measureMode61c)
+    result.rccalTone48 = volatileLoad(addr rf.rccalTone48)
+    result.calSingenCtrl20c = volatileLoad(addr rf.calSingenCtrl20c)
+    result.calSingenAmpLo214 = volatileLoad(addr rf.calSingenAmpLo214)
+    result.calSingenAmpHi218 = volatileLoad(addr rf.calSingenAmpHi218)
+    result.calDfeGate23c = volatileLoad(addr rf.calDfeGate23c)
+    result.calDfeState240 = volatileLoad(addr rf.calDfeState240)
+    result.calDfeState244 = volatileLoad(addr rf.calDfeState244)
+    result.calMixerStateF0 = volatileLoad(addr rf.calMixerStateF0)
+    result.txcalGain64 = volatileLoad(addr rf.txcalGain64)
+    result.txcalBias58 = volatileLoad(addr rf.txcalBias58)
+    result.rxMode220 = volatileLoad(addr rf.rxMode220)
+    result.txcalParam74 = volatileLoad(addr rf.txcalParam74)
+    result.acalCtrlA4 = volatileLoad(addr rf.acalCtrlA4)
+    nimFwDbgRfCalSaveRf2c = result.synthCtrl2c
+    nimFwDbgRfCalSaveRf88 = result.txcalDfe88
 
   proc restoreRfPriCalState(state: RfPriCalState) =
     inc nimFwDbgRfCalRestoreCount
-    nimFwDbgRfCalRestoreRf2c = state.words[1]
-    nimFwDbgRfCalRestoreRf88 = state.words[8]
-    for i, regAddr in RfPriCalSavedRegs:
-      rfRegWrite(regAddr, state.words[i])
-    nimFwDbgRfCalRestoreReadbackRf2c = rfRegRead(RfSynthCtrlReg)
-    nimFwDbgRfCalRestoreReadbackRf88 = rfRegRead(RfPriTxcalDfeReg)
-    nimFwDbgRfCalRestoreRf8c = rfRegRead(RfPriInit8cReg)
+    let rf = rfRegs()
+    let dfe = rfDfeInitRegs()
+    nimFwDbgRfCalRestoreRf2c = state.synthCtrl2c
+    nimFwDbgRfCalRestoreRf88 = state.txcalDfe88
+    volatileStore(addr rf.baseCtrl1, state.baseCtrl1)
+    volatileStore(addr rf.synthCtrl2c, state.synthCtrl2c)
+    volatileStore(addr rf.calCtrl1c, state.calCtrl1c)
+    volatileStore(addr rf.priModeCtrl30, state.priModeCtrl30)
+    volatileStore(addr rf.txcalCtrlB8, state.txcalCtrlB8)
+    volatileStore(addr rf.sdmCtrlC0, state.sdmCtrlC0)
+    volatileStore(addr rf.sdmDivC4, state.sdmDivC4)
+    volatileStore(addr dfe.hbnCtrl30, state.hbnCtrl30)
+    volatileStore(addr rf.txcalDfe88, state.txcalDfe88)
+    volatileStore(addr rf.calPathConfig8c, state.calPathConfig8c)
+    volatileStore(addr rf.txcalTosdac600, state.txcalTosdac600)
+    volatileStore(addr rf.calMeasurePrep60c, state.calMeasurePrep60c)
+    volatileStore(addr rf.measureCtrl618, state.measureCtrl618)
+    volatileStore(addr rf.measureMode61c, state.measureMode61c)
+    volatileStore(addr rf.rccalTone48, state.rccalTone48)
+    volatileStore(addr rf.calSingenCtrl20c, state.calSingenCtrl20c)
+    volatileStore(addr rf.calSingenAmpLo214, state.calSingenAmpLo214)
+    volatileStore(addr rf.calSingenAmpHi218, state.calSingenAmpHi218)
+    volatileStore(addr rf.calDfeGate23c, state.calDfeGate23c)
+    volatileStore(addr rf.calDfeState240, state.calDfeState240)
+    volatileStore(addr rf.calDfeState244, state.calDfeState244)
+    volatileStore(addr rf.calMixerStateF0, state.calMixerStateF0)
+    volatileStore(addr rf.txcalGain64, state.txcalGain64)
+    volatileStore(addr rf.txcalBias58, state.txcalBias58)
+    volatileStore(addr rf.rxMode220, state.rxMode220)
+    volatileStore(addr rf.txcalParam74, state.txcalParam74)
+    volatileStore(addr rf.acalCtrlA4, state.acalCtrlA4)
+    nimFwDbgRfCalRestoreReadbackRf2c = volatileLoad(addr rf.synthCtrl2c)
+    nimFwDbgRfCalRestoreReadbackRf88 = volatileLoad(addr rf.txcalDfe88)
+    nimFwDbgRfCalRestoreRf8c = volatileLoad(addr rf.calPathConfig8c)
 
   proc rfPriConfigChannelForCal(index: int) =
     if rfCalibDataGlobal == nil or index < 0 or index >= RfLoChannelCount:
       return
+    let rf = rfRegs()
     nim_wifi_rf_last_config_channel_index = uint32(index)
-    rfRegOr(RfPriModeCtrlReg, 0x00F00000'u32)
+    updateReg32(addr rf.priModeCtrl30, not 0'u32, 0x00F00000'u32)
 
     let fcalByte = uint32(rfLoFcal(index))
     let acalByte = uint32(rfLoAcal(index))
     nim_wifi_rf_last_config_channel_fcal = fcalByte
     nim_wifi_rf_last_config_channel_acal = acalByte
     nim_wifi_rf_last_config_channel_sdm2 = RfChannelDivTable40M[index]
-    rfRegWrite(RfFcalCtrlReg,
-               (rfRegRead(RfFcalCtrlReg) and 0xFFC0FF00'u32) or
-               fcalByte or ((acalByte shl 16) and 0x003F0000'u32))
-    rfRegWrite(RfPriConfigBcReg,
-               (rfRegRead(RfPriConfigBcReg) and 0xFF100FFF'u32) or
-               (((fcalByte shr 4) shl 20) and 0x00F00000'u32))
-    rfRegWrite(RfSdm2Reg,
-               (rfRegRead(RfSdm2Reg) and 0xC0000000'u32) or
-               (RfChannelDivTable40M[index] and 0x3FFFFFFF'u32))
-    rfRegClear(RfSdm1Reg, 0x00001000'u32)
+    volatileStore(addr rf.fcalCtrlA0,
+                  (volatileLoad(addr rf.fcalCtrlA0) and 0xFFC0FF00'u32) or
+                  fcalByte or ((acalByte shl 16) and 0x003F0000'u32))
+    volatileStore(addr rf.channelFcalConfigBc,
+                  (volatileLoad(addr rf.channelFcalConfigBc) and 0xFF100FFF'u32) or
+                  (((fcalByte shr 4) shl 20) and 0x00F00000'u32))
+    volatileStore(addr rf.sdmDivC4,
+                  (volatileLoad(addr rf.sdmDivC4) and 0xC0000000'u32) or
+                  (RfChannelDivTable40M[index] and 0x3FFFFFFF'u32))
+    updateReg32(addr rf.sdmCtrlC0, not 0x00001000'u32, 0'u32)
 
     var status = 0'u32
     for _ in 0 ..< RfConfigChannelWaitLimit:
-      rfRegOr(RfTxcalCtrlReg, 0x00010000'u32)
+      updateReg32(addr rf.txcalCtrlB8, not 0'u32, 0x00010000'u32)
       waitRfUs(10'u32)
-      rfRegClear(RfTxcalCtrlReg, 0x00010000'u32)
+      updateReg32(addr rf.txcalCtrlB8, not 0x00010000'u32, 0'u32)
       waitRfUs(50'u32)
-      rfRegOr(RfPriConfigB0Reg, 0x10000000'u32)
+      updateReg32(addr rf.channelCalStrobeB0, not 0'u32, 0x10000000'u32)
       waitRfUs(10'u32)
-      rfRegClear(RfPriConfigB0Reg, 0x10000000'u32)
+      updateReg32(addr rf.channelCalStrobeB0, not 0x10000000'u32, 0'u32)
       waitRfUs(50'u32)
-      status = rfRegRead(RfPriConfigB4Reg)
+      status = volatileLoad(addr rf.channelCalStatusB4)
       if (status and 0x01100000'u32) == 0'u32:
-        nim_wifi_rf_last_config_channel_b8 = rfRegRead(RfTxcalCtrlReg)
-        nim_wifi_rf_last_config_channel_b0 = rfRegRead(RfPriConfigB0Reg)
+        nim_wifi_rf_last_config_channel_b8 = volatileLoad(addr rf.txcalCtrlB8)
+        nim_wifi_rf_last_config_channel_b0 = volatileLoad(addr rf.channelCalStrobeB0)
         nim_wifi_rf_last_config_channel_status = status
         return
 
     inc nim_wifi_rf_config_channel_wait_timeout_count
-    nim_wifi_rf_last_config_channel_b8 = rfRegRead(RfTxcalCtrlReg)
-    nim_wifi_rf_last_config_channel_b0 = rfRegRead(RfPriConfigB0Reg)
+    nim_wifi_rf_last_config_channel_b8 = volatileLoad(addr rf.txcalCtrlB8)
+    nim_wifi_rf_last_config_channel_b0 = volatileLoad(addr rf.channelCalStrobeB0)
     nim_wifi_rf_last_config_channel_status = status
 
   proc startRfPriTxDfeForCal() =
-    rfRegClear(RfRxModeReg, 0x00000180'u32)
-    rfRegWrite(RfRxModeReg,
-               (rfRegRead(RfRxModeReg) and 0xFFFFE7FF'u32) or 0x00001082'u32)
-    rfRegWrite(RfRxModeReg,
-               (rfRegRead(RfRxModeReg) and not 0x00000010'u32) or
-               0x00000100'u32)
+    let rf = rfRegs()
+    updateReg32(addr rf.rxMode220, not 0x00000180'u32, 0'u32)
+    updateReg32(addr rf.rxMode220, 0xFFFFE7FF'u32, 0x00001082'u32)
+    updateReg32(addr rf.rxMode220, not 0x00000010'u32, 0x00000100'u32)
 
   proc startRfPriRxDfeForCal() =
-    rfRegWrite(RfRxModeReg,
-               (rfRegRead(RfRxModeReg) and not 0x00000060'u32) or
-               0x00000061'u32)
+    let rf = rfRegs()
+    updateReg32(addr rf.rxMode220, not 0x00000060'u32, 0x00000061'u32)
 
   proc signedRfPowerMeasurement(word: uint32): int32 {.inline.} =
     let sample = (word shr 9) and 0x0000FFFF'u32
@@ -10851,6 +11443,15 @@ when defined(bl808WifiUseBl808Rf):
     if (sample and 0x0100_0000'u32) != 0'u32:
       result = result - 0x0200_0000'i32
 
+  proc signedRfAverageAdcMean(word: uint32): int32 {.inline.} =
+    ## Vendor TXCAL amplitude tuning uses `sample << 7 >> 17`, i.e. signed
+    ## RF1620 bits 24:10. RF70 replay-window search still uses the full
+    ## signed 25-bit average sample.
+    let sample = (word shr 10) and 0x0000_7FFF'u32
+    result = int32(sample)
+    if (sample and 0x0000_4000'u32) != 0'u32:
+      result = result - 0x0000_8000'i32
+
   proc squareRfSample(sample: int32): uint64 {.inline.} =
     let value = int64(sample)
     uint64(value * value)
@@ -10862,8 +11463,9 @@ when defined(bl808WifiUseBl808Rf):
       uint32(value)
 
   proc waitRfRoscalMeasurementReady(): bool =
+    let rf = rfRegs()
     for _ in 0 ..< RfRoscalWaitLimit:
-      if (rfRegRead(RfMeasureCtrlReg) and RfMeasureReadyMask) != 0'u32:
+      if (volatileLoad(addr rf.measureCtrl618) and RfMeasureReadyMask) != 0'u32:
         return true
       waitRfUs(1'u32)
     inc nim_wifi_rf_roscal_wait_timeout_count
@@ -10871,10 +11473,11 @@ when defined(bl808WifiUseBl808Rf):
 
   proc writeRfRoscalCandidate(iBranch: bool, code: uint32) =
     let value = code and RfRoscalCodeMask
+    let rf = rfRegs()
     if iBranch:
-      rfRegUpdate(RfRoscalCtrlReg, RfRoscalIRegMask, value shl 8)
+      updateReg32(addr rf.roscalCtrl7c, not RfRoscalIRegMask, value shl 8)
     else:
-      rfRegUpdate(RfRoscalCtrlReg, RfRoscalQRegMask, value)
+      updateReg32(addr rf.roscalCtrl7c, not RfRoscalQRegMask, value)
 
   type
     RfRoscalSample = object
@@ -10882,17 +11485,19 @@ when defined(bl808WifiUseBl808Rf):
       signed: int32
 
   proc sampleRfRoscalMeasurement(iBranch: bool): RfRoscalSample =
-    rfRegClear(RfMeasureCtrlReg, RfMeasureTriggerClearMask)
-    rfRegWrite(RfMeasureModeReg,
-               (rfRegRead(RfMeasureModeReg) and RfMeasureModeKeepMask) or
-               RfMeasureRoscalMode)
-    rfRegOr(RfMeasureCtrlReg, RfMeasureStartMask)
+    let rf = rfRegs()
+    updateReg32(addr rf.measureCtrl618, not RfMeasureTriggerClearMask, 0'u32)
+    updateReg32(addr rf.measureMode61c, RfMeasureModeKeepMask,
+                RfMeasureRoscalMode)
+    updateReg32(addr rf.measureCtrl618, 0xFFFFFFFF'u32, RfMeasureStartMask)
     discard waitRfRoscalMeasurementReady()
-    let sampleReg =
-      if iBranch: RfMeasureIReg else: RfMeasureQReg
-    result.raw = rfRegRead(sampleReg)
+    result.raw =
+      if iBranch:
+        volatileLoad(addr rf.measureI620)
+      else:
+        volatileLoad(addr rf.measureQ624)
     result.signed = signedRfAverageMeasurement(result.raw)
-    rfRegClear(RfMeasureCtrlReg, RfMeasureTriggerClearMask)
+    updateReg32(addr rf.measureCtrl618, not RfMeasureTriggerClearMask, 0'u32)
 
   proc logRfRoscalSearch(index: var int, iBranch: bool, code: uint32,
                          sample: RfRoscalSample) =
@@ -10942,176 +11547,156 @@ when defined(bl808WifiUseBl808Rf):
     let iBits = iCode and RfRoscalCodeMask
     let qBits = qCode and RfRoscalCodeMask
     if rfCalibDataGlobal != nil:
-      var word = rfCalibWord(2)
-      word = (word and not 0x00FF_FFFF'u32) or
+      var rccalReplayWord = rfCalibWord(RfCalibRccalReplayWordIndex)
+      rccalReplayWord = (rccalReplayWord and not 0x00FF_FFFF'u32) or
         iBits or (qBits shl 6) or (iBits shl 12) or (qBits shl 18)
-      rfCalibSetWord(2, word)
+      rfCalibSetWord(RfCalibRccalReplayWordIndex, rccalReplayWord)
 
     let packed = iBits or (qBits shl 8) or (iBits shl 16) or (qBits shl 24)
-    rfRegWrite(RfRoscalReg0,
-               (rfRegRead(RfRoscalReg0) and RfRoscalRegisterKeepMask) or packed)
-    rfRegWrite(RfRoscalReg1,
-               (rfRegRead(RfRoscalReg1) and RfRoscalRegisterKeepMask) or packed)
+    let rf = rfRegs()
+    volatileStore(addr rf.roscalCal0,
+                  (volatileLoad(addr rf.roscalCal0) and
+                   RfRoscalRegisterKeepMask) or packed)
+    volatileStore(addr rf.roscalCal1,
+                  (volatileLoad(addr rf.roscalCal1) and
+                   RfRoscalRegisterKeepMask) or packed)
     nim_wifi_rf_last_roscal_i = iBits
     nim_wifi_rf_last_roscal_q = qBits
 
   proc prepareRfPriRoscal() =
-    rfRegClear(RfCtrlReg, RfCtrlTuneEnableMask)
-    rfRegWrite(RfSynthCtrlReg, 0'u32)
-    rfRegOr(RfPriModeCtrlReg, 0x00000002'u32)
-    rfRegWrite(RfPriModeCtrlReg,
-               (rfRegRead(RfPriModeCtrlReg) and 0x21F0FEFF'u32) or
-               0x21F06E00'u32)
+    let rf = rfRegs()
+    updateReg32(addr rf.baseCtrl1, not RfCtrlTuneEnableMask, 0'u32)
+    volatileStore(addr rf.synthCtrl2c, 0'u32)
+    updateReg32(addr rf.priModeCtrl30, not 0'u32, 0x00000002'u32)
+    updateReg32(addr rf.priModeCtrl30, 0x21F0FEFF'u32, 0x21F06E00'u32)
     waitRfUs(1'u32)
 
-    rfRegClear(RfRxModeReg, 0x00000180'u32)
-    rfRegWrite(RfRxModeReg,
-               (rfRegRead(RfRxModeReg) and 0xFFFFE7FF'u32) or 0x00001082'u32)
-    rfRegWrite(RfRxModeReg,
-               (rfRegRead(RfRxModeReg) and not 0x00000010'u32) or
-               0x00000100'u32)
-    rfRegWrite(RfRxModeReg,
-               (rfRegRead(RfRxModeReg) and not 0x00000060'u32) or
-               0x00000061'u32)
-    rfRegOr(RfCalCtrlReg, 0x00000200'u32)
-    rfRegWrite(RfPriRccalToneReg,
-               (rfRegRead(RfPriRccalToneReg) and 0xFFFF8CFF'u32) or
-               0x00003137'u32)
-    rfRegClear(RfRoscalCtrlReg, 0x80000000'u32)
+    updateReg32(addr rf.rxMode220, not 0x00000180'u32, 0'u32)
+    updateReg32(addr rf.rxMode220, 0xFFFFE7FF'u32, 0x00001082'u32)
+    updateReg32(addr rf.rxMode220, not 0x00000010'u32, 0x00000100'u32)
+    updateReg32(addr rf.rxMode220, not 0x00000060'u32, 0x00000061'u32)
+    updateReg32(addr rf.calCtrl1c, not 0'u32, 0x00000200'u32)
+    updateReg32(addr rf.rccalTone48, 0xFFFF8CFF'u32, 0x00003137'u32)
+    updateReg32(addr rf.roscalCtrl7c, not 0x80000000'u32, 0'u32)
 
   proc runRfPriRoscal() =
-    if (rfRegRead(RfCapabilityReg) and RfRoscalCapabilityMask) == 0'u32:
-      rfRegClear(RfCalModeReg, RfRoscalModeMask)
+    let rf = rfRegs()
+    if (volatileLoad(addr rf.capability20) and RfRoscalCapabilityMask) == 0'u32:
+      updateReg32(addr rf.calMode14, not RfRoscalModeMask, 0'u32)
       return
 
     inc nim_wifi_rf_pri_roscal_count
-    rfRegWrite(RfCalModeReg,
-               (rfRegRead(RfCalModeReg) and not RfRoscalModeMask) or
-               RfRoscalStartMode)
+    updateReg32(addr rf.calMode14, not RfRoscalModeMask, RfRoscalStartMode)
     let saved = saveRfPriCalState()
     prepareRfPriRoscal()
     let iCode = uint32(chooseRfRoscalCode(true))
     let qCode = uint32(chooseRfRoscalCode(false))
     applyRfRoscalCodes(iCode, qCode)
     restoreRfPriCalState(saved)
-    rfRegOr(RfCalModeReg, RfRoscalDoneMode)
+    updateReg32(addr rf.calMode14, not 0'u32, RfRoscalDoneMode)
 
   proc waitRfRccalMeasurementReady(): bool =
+    let rf = rfRegs()
     for _ in 0 ..< RfRccalWaitLimit:
-      if (rfRegRead(RfMeasureCtrlReg) and RfMeasureReadyMask) != 0'u32:
+      if (volatileLoad(addr rf.measureCtrl618) and RfMeasureReadyMask) != 0'u32:
         return true
       waitRfUs(1'u32)
     inc nim_wifi_rf_rccal_wait_timeout_count
     false
 
   proc sampleRfRccalPower(): uint32 =
-    rfRegClear(RfMeasureCtrlReg, RfMeasureRccalTriggerMask)
-    rfRegOr(RfMeasureCtrlReg, RfMeasureRccalTriggerMask)
+    let rf = rfRegs()
+    updateReg32(addr rf.measureCtrl618, not RfMeasureRccalTriggerMask, 0'u32)
+    updateReg32(addr rf.measureCtrl618, not RfMeasureRccalTriggerMask,
+                RfMeasureRccalTriggerMask)
     waitRfUs(1'u32)
     if not waitRfRccalMeasurementReady():
-      rfRegClear(RfMeasureCtrlReg, RfMeasureRccalTriggerMask)
+      updateReg32(addr rf.measureCtrl618, not RfMeasureRccalTriggerMask, 0'u32)
       return 0'u32
 
-    let iSample = signedRfPowerMeasurement(rfRegRead(RfMeasureIReg))
-    let qSample = signedRfPowerMeasurement(rfRegRead(RfMeasureQReg))
-    rfRegClear(RfMeasureCtrlReg, RfMeasureRccalTriggerMask)
+    let iSample = signedRfPowerMeasurement(volatileLoad(addr rf.measureI620))
+    let qSample = signedRfPowerMeasurement(volatileLoad(addr rf.measureQ624))
+    updateReg32(addr rf.measureCtrl618, not RfMeasureRccalTriggerMask, 0'u32)
     saturatingRfUint32(squareRfSample(iSample) + squareRfSample(qSample))
 
   proc primeRfRccalPowerMeasurement() =
-    rfRegWrite(RfMeasureCtrlReg,
-               (rfRegRead(RfMeasureCtrlReg) and 0xFFF00000'u32) or
-               RfRccalReferenceMeasureCtrl)
-    rfRegWrite(RfMeasureModeReg,
-               (rfRegRead(RfMeasureModeReg) and RfMeasureModeKeepMask) or
-               RfMeasureRoscalMode)
-    rfRegClear(RfMeasureCtrlReg, RfMeasureRccalTriggerMask)
-    rfRegOr(RfMeasureCtrlReg, RfMeasureStartMask)
+    let rf = rfRegs()
+    updateReg32(addr rf.measureCtrl618, 0xFFF00000'u32,
+                RfRccalReferenceMeasureCtrl)
+    updateReg32(addr rf.measureMode61c, RfMeasureModeKeepMask,
+                RfMeasureRoscalMode)
+    updateReg32(addr rf.measureCtrl618, not RfMeasureRccalTriggerMask, 0'u32)
+    updateReg32(addr rf.measureCtrl618, not RfMeasureStartMask,
+                RfMeasureStartMask)
     waitRfUs(1'u32)
     discard waitRfRccalMeasurementReady()
-    discard rfRegRead(RfMeasureIReg)
-    rfRegClear(RfMeasureCtrlReg, RfMeasureRccalTriggerMask)
+    discard volatileLoad(addr rf.measureI620)
+    updateReg32(addr rf.measureCtrl618, not RfMeasureRccalTriggerMask, 0'u32)
 
   proc writeRfRccalCode(code: uint32) =
     let value = code and RfRccalCodeMask
     let packed = value or (value shl 8) or (value shl 16) or (value shl 24)
-    rfRegWrite(RfRbbRccalReg,
-               (rfRegRead(RfRbbRccalReg) and RfRccalRegisterKeepMask) or packed)
+    let rf = rfRegs()
+    volatileStore(addr rf.rbbRccalCtrl80,
+                  (volatileLoad(addr rf.rbbRccalCtrl80) and
+                   RfRccalRegisterKeepMask) or packed)
     if rfCalibDataGlobal != nil:
-      rfCalibSetWord(2, (rfCalibWord(2) and not 0x00FF_FFFF'u32) or
-        value or (value shl 6) or (value shl 12) or (value shl 18))
+      rfCalibSetWord(RfCalibRccalReplayWordIndex,
+        (rfCalibWord(RfCalibRccalReplayWordIndex) and
+          not 0x00FF_FFFF'u32) or
+          value or (value shl 6) or (value shl 12) or (value shl 18))
 
   proc writeRfRccalSearchCode(code: uint32) =
     let value = code and RfRccalCodeMask
-    var word = rfRegRead(RfRbbRccalReg)
+    let rf = rfRegs()
+    var word = volatileLoad(addr rf.rbbRccalCtrl80)
     word = (word and 0xC0FF_FFFF'u32) or (value shl 24)
     word = (word and 0xFFFF_C0FF'u32) or (value shl 8)
-    rfRegWrite(RfRbbRccalReg, word)
+    volatileStore(addr rf.rbbRccalCtrl80, word)
 
   proc prepareRfPriRccal() =
-    rfRegClear(RfCtrlReg, RfCtrlTuneEnableMask)
-    rfRegWrite(RfSynthCtrlReg, 0'u32)
-    rfRegOr(RfPriModeCtrlReg, 0x00000002'u32)
-    rfRegWrite(RfPriModeCtrlReg,
-               (rfRegRead(RfPriModeCtrlReg) and 0x2DF8F8FF'u32) or
-               0x2DF87800'u32)
+    let rf = rfRegs()
+    updateReg32(addr rf.baseCtrl1, not RfCtrlTuneEnableMask, 0'u32)
+    volatileStore(addr rf.synthCtrl2c, 0'u32)
+    updateReg32(addr rf.priModeCtrl30, not 0'u32, 0x00000002'u32)
+    updateReg32(addr rf.priModeCtrl30, 0x2DF8F8FF'u32, 0x2DF87800'u32)
     waitRfUs(1'u32)
 
     startRfPriTxDfeForCal()
     startRfPriRxDfeForCal()
-    rfRegClear(0x20001084'u32, 0x00030000'u32)
-    rfRegWrite(0x20001084'u32,
-               (rfRegRead(0x20001084'u32) and 0xFCFF_FFFF'u32) or
-               0x0200_0000'u32)
-    rfRegOr(RfPriInit8cReg, 0x00001000'u32)
-    rfRegOr(RfCalCtrlReg, 0x00000800'u32)
-    rfRegClear(RfPriRccalMeasurePrepReg, 0x00000400'u32)
-    rfRegOr(RfPriRccalMeasurePrepReg, 0x04000000'u32)
-    rfRegWrite(RfPriRccalToneReg,
-               (rfRegRead(RfPriRccalToneReg) and 0xFFFF8CFF'u32) or
-               0x00003100'u32)
-    rfRegWrite(RfPriRccalSingenReg0,
-               (rfRegRead(RfPriRccalSingenReg0) and 0xFC00FFFF'u32) or
-               0x00300000'u32)
-    rfRegWrite(RfPriRccalSingenReg1,
-               rfRegRead(RfPriRccalSingenReg1) and 0x003FFFFF'u32)
-    rfRegWrite(RfPriRccalSingenReg2,
-               (rfRegRead(RfPriRccalSingenReg2) and 0x003FFFFF'u32) or
-               0xC0000000'u32)
-    rfRegWrite(RfPriRccalSingenReg1,
-               (rfRegRead(RfPriRccalSingenReg1) and 0xFFFFF800'u32) or
-               0x000000FF'u32)
-    rfRegWrite(RfPriRccalSingenReg2,
-               (rfRegRead(RfPriRccalSingenReg2) and 0xFFFFF800'u32) or
-               0x000000FF'u32)
-    rfRegClear(RfPriRccalSingenReg0, 0x80000000'u32)
-    rfRegOr(RfPriRccalSingenReg0, 0x80000000'u32)
+    updateReg32(addr rf.rccalReplay84, not 0x00030000'u32, 0'u32)
+    volatileStore(addr rf.rccalReplay84,
+                  (volatileLoad(addr rf.rccalReplay84) and 0xFCFF_FFFF'u32) or
+                  0x0200_0000'u32)
+    updateReg32(addr rf.calPathConfig8c, not 0x00001000'u32, 0x00001000'u32)
+    updateReg32(addr rf.calCtrl1c, not 0'u32, 0x00000800'u32)
+    updateReg32(addr rf.calMeasurePrep60c, not 0x00000400'u32, 0'u32)
+    updateReg32(addr rf.calMeasurePrep60c, not 0x04000000'u32, 0x04000000'u32)
+    updateReg32(addr rf.rccalTone48, 0xFFFF8CFF'u32, 0x00003100'u32)
+    updateReg32(addr rf.calSingenCtrl20c, 0xFC00FFFF'u32, 0x00300000'u32)
+    updateReg32(addr rf.calSingenAmpLo214, 0x003FFFFF'u32, 0'u32)
+    updateReg32(addr rf.calSingenAmpHi218, 0x003FFFFF'u32, 0xC0000000'u32)
+    updateReg32(addr rf.calSingenAmpLo214, 0xFFFFF800'u32, 0x000000FF'u32)
+    updateReg32(addr rf.calSingenAmpHi218, 0xFFFFF800'u32, 0x000000FF'u32)
+    updateReg32(addr rf.calSingenCtrl20c, not 0x80000000'u32, 0'u32)
+    updateReg32(addr rf.calSingenCtrl20c, not 0x80000000'u32, 0x80000000'u32)
     startRfPriTxDfeForCal()
-    rfRegWrite(RfMeasureCtrlReg,
-               (rfRegRead(RfMeasureCtrlReg) and 0xFFF00000'u32) or
-               RfRccalReferenceMeasureCtrl)
-    rfRegClear(RfMeasureCtrlReg, RfMeasureRccalTriggerMask)
-    rfRegWrite(RfMeasureModeReg,
-               (rfRegRead(RfMeasureModeReg) and RfMeasureModeKeepMask) or
-               RfMeasureRoscalMode)
+    updateReg32(addr rf.measureCtrl618, 0xFFF00000'u32,
+                RfRccalReferenceMeasureCtrl)
+    updateReg32(addr rf.measureCtrl618, not RfMeasureRccalTriggerMask, 0'u32)
+    updateReg32(addr rf.measureMode61c, RfMeasureModeKeepMask,
+                RfMeasureRoscalMode)
 
   proc prepareRfPriRccalTone() =
-    rfRegWrite(RfPriRccalToneReg,
-               (rfRegRead(RfPriRccalToneReg) and 0xFFFF8CFF'u32) or
-               0x00006200'u32)
-    rfRegWrite(RfPriRccalSingenReg0,
-               (rfRegRead(RfPriRccalSingenReg0) and 0xFC00FFFF'u32) or
-               0x00B50000'u32)
-    rfRegWrite(RfPriRccalSingenReg1,
-               rfRegRead(RfPriRccalSingenReg1) and 0x003FFFFF'u32)
-    rfRegWrite(RfPriRccalSingenReg2,
-               (rfRegRead(RfPriRccalSingenReg2) and 0x003FFFFF'u32) or
-               0xC0000000'u32)
-    rfRegClear(RfPriRccalSingenReg0, 0x80000000'u32)
-    rfRegOr(RfPriRccalSingenReg0, 0x80000000'u32)
+    let rf = rfRegs()
+    updateReg32(addr rf.rccalTone48, 0xFFFF8CFF'u32, 0x00006200'u32)
+    updateReg32(addr rf.calSingenCtrl20c, 0xFC00FFFF'u32, 0x00B50000'u32)
+    updateReg32(addr rf.calSingenAmpLo214, 0x003FFFFF'u32, 0'u32)
+    updateReg32(addr rf.calSingenAmpHi218, 0x003FFFFF'u32, 0xC0000000'u32)
+    updateReg32(addr rf.calSingenCtrl20c, not 0x80000000'u32, 0'u32)
+    updateReg32(addr rf.calSingenCtrl20c, not 0x80000000'u32, 0x80000000'u32)
     startRfPriTxDfeForCal()
-    rfRegWrite(RfMeasureCtrlReg,
-               (rfRegRead(RfMeasureCtrlReg) and 0xFFF00000'u32) or
-               RfRccalToneMeasureCtrl)
+    updateReg32(addr rf.measureCtrl618, 0xFFF00000'u32, RfRccalToneMeasureCtrl)
 
   proc logRfRccalSearch(index: var int, code, power: uint32) =
     if index < nim_wifi_rf_rccal_search_log.len:
@@ -11196,14 +11781,13 @@ when defined(bl808WifiUseBl808Rf):
     (ok, lastMeasuredCode)
 
   proc runRfPriRccal() =
-    if (rfRegRead(RfCapabilityReg) and RfRccalCapabilityMask) == 0'u32:
-      rfRegClear(RfCalModeReg, RfRccalModeMask)
+    let rf = rfRegs()
+    if (volatileLoad(addr rf.capability20) and RfRccalCapabilityMask) == 0'u32:
+      updateReg32(addr rf.calMode14, not RfRccalModeMask, 0'u32)
       return
 
     inc nim_wifi_rf_pri_rccal_count
-    rfRegWrite(RfCalModeReg,
-               (rfRegRead(RfCalModeReg) and not RfRccalModeMask) or
-               RfRccalStartMode)
+    updateReg32(addr rf.calMode14, not RfRccalModeMask, RfRccalStartMode)
     let saved = saveRfPriCalState()
     prepareRfPriRccal()
     let result = chooseRfRccalCode()
@@ -11211,11 +11795,9 @@ when defined(bl808WifiUseBl808Rf):
     writeRfRccalCode(result.code)
     rfPriApplyWb03RccalSeed()
     if result.ok:
-      rfRegOr(RfCalModeReg, RfRccalDoneMode)
+      updateReg32(addr rf.calMode14, not 0'u32, RfRccalDoneMode)
     else:
-      rfRegWrite(RfCalModeReg,
-                 (rfRegRead(RfCalModeReg) and not RfRccalModeMask) or
-                 RfRccalFailMode)
+      updateReg32(addr rf.calMode14, not RfRccalModeMask, RfRccalFailMode)
 
   proc clampRfTxcalParam(paramInd: uint32, value: int32): int32 {.inline.} =
     case paramInd
@@ -11242,29 +11824,29 @@ when defined(bl808WifiUseBl808Rf):
       uint32(clamped) and RfTxcalParam3Mask
 
   proc writeRfTxcalParam(paramInd: uint32, value: int32) =
+    let rf = rfRegs()
     let clamped = clampRfTxcalParam(paramInd, value)
     case paramInd
     of 0'u32:
-      rfRegUpdate(RfTxcalParam01Reg, RfTxcalParam0Mask,
+      updateReg32(addr rf.txcalParam74, not RfTxcalParam0Mask,
                   (uint32(clamped) and 0x3F'u32) shl 24)
     of 1'u32:
-      rfRegUpdate(RfTxcalParam01Reg, RfTxcalParam1Mask,
+      updateReg32(addr rf.txcalParam74, not RfTxcalParam1Mask,
                   (uint32(clamped) and 0x3F'u32) shl 16)
     of 2'u32:
-      rfRegWrite(RfTxcalTosdacReg,
-                 (rfRegRead(RfTxcalTosdacReg) and not RfTxcalParam2Mask) or
-                 ((uint32(clamped) and 0x7FF'u32) shl 12) or
-                 RfTxcalParam2EnableBit)
+      updateReg32(addr rf.txcalTosdac600, not RfTxcalParam2Mask,
+                  ((uint32(clamped) and 0x7FF'u32) shl 12) or
+                  RfTxcalParam2EnableBit)
     of 3'u32:
-      rfRegWrite(RfTxcalTosdacReg,
-                 (rfRegRead(RfTxcalTosdacReg) and not RfTxcalParam3Mask) or
-                 encodeRfTxcalParam3(clamped) or RfTxcalParam3SignBit)
+      updateReg32(addr rf.txcalTosdac600, not RfTxcalParam3Mask,
+                  encodeRfTxcalParam3(clamped) or RfTxcalParam3SignBit)
     else:
       discard
 
   proc waitRfTxcalMeasurementReady(): bool =
+    let rf = rfRegs()
     for _ in 0 ..< RfTxcalWaitLimit:
-      if (rfRegRead(RfMeasureCtrlReg) and RfMeasureReadyMask) != 0'u32:
+      if (volatileLoad(addr rf.measureCtrl618) and RfMeasureReadyMask) != 0'u32:
         return true
       waitRfUs(1'u32)
     inc nim_wifi_rf_txcal_wait_timeout_count
@@ -11279,25 +11861,44 @@ when defined(bl808WifiUseBl808Rf):
       uint32(value)
 
   proc writeRfTxcalSingenAmplitude(amp: uint32) =
+    let rf = rfRegs()
     let value = amp and RfTxcalSingenAmplitudeMask
-    rfRegUpdate(RfPriRccalSingenReg1, RfTxcalSingenAmplitudeMask, value)
-    rfRegUpdate(RfPriRccalSingenReg2, RfTxcalSingenAmplitudeMask, value)
-    rfRegClear(RfPriRccalSingenReg0, 0x80000000'u32)
-    rfRegOr(RfPriRccalSingenReg0, 0x80000000'u32)
+    updateReg32(addr rf.calSingenAmpLo214, not RfTxcalSingenAmplitudeMask,
+                value)
+    updateReg32(addr rf.calSingenAmpHi218, not RfTxcalSingenAmplitudeMask,
+                value)
+    updateReg32(addr rf.calSingenCtrl20c, not 0x80000000'u32, 0'u32)
+    updateReg32(addr rf.calSingenCtrl20c, not 0x80000000'u32, 0x80000000'u32)
     startRfPriTxDfeForCal()
 
   proc sampleRfTxcalAverage(): tuple[ok: bool, value: int32] =
-    rfRegClear(RfMeasureCtrlReg, RfMeasureTriggerClearMask)
-    rfRegWrite(RfMeasureModeReg,
-               (rfRegRead(RfMeasureModeReg) and RfMeasureModeKeepMask) or
-               RfTxcalAverageMeasureMode)
-    rfRegOr(RfMeasureCtrlReg, RfMeasureStartMask)
+    let rf = rfRegs()
+    updateReg32(addr rf.measureCtrl618, not RfMeasureTriggerClearMask, 0'u32)
+    updateReg32(addr rf.measureMode61c, RfMeasureModeKeepMask,
+                RfTxcalAverageMeasureMode)
+    updateReg32(addr rf.measureCtrl618, not RfMeasureStartMask,
+                RfMeasureStartMask)
     if not waitRfTxcalMeasurementReady():
-      rfRegClear(RfMeasureCtrlReg, RfMeasureTriggerClearMask)
+      updateReg32(addr rf.measureCtrl618, not RfMeasureTriggerClearMask, 0'u32)
       return (false, 0'i32)
 
-    let sample = signedRfAverageMeasurement(rfRegRead(RfMeasureIReg))
-    rfRegClear(RfMeasureCtrlReg, RfMeasureTriggerClearMask)
+    let sample = signedRfAverageMeasurement(volatileLoad(addr rf.measureI620))
+    updateReg32(addr rf.measureCtrl618, not RfMeasureTriggerClearMask, 0'u32)
+    (true, sample)
+
+  proc sampleRfTxcalAdcMean(): tuple[ok: bool, value: int32] =
+    let rf = rfRegs()
+    updateReg32(addr rf.measureCtrl618, not RfMeasureTriggerClearMask, 0'u32)
+    updateReg32(addr rf.measureMode61c, RfMeasureModeKeepMask,
+                RfTxcalAverageMeasureMode)
+    updateReg32(addr rf.measureCtrl618, not RfMeasureStartMask,
+                RfMeasureStartMask)
+    if not waitRfTxcalMeasurementReady():
+      updateReg32(addr rf.measureCtrl618, not RfMeasureTriggerClearMask, 0'u32)
+      return (false, 0'i32)
+
+    let sample = signedRfAverageAdcMean(volatileLoad(addr rf.measureI620))
+    updateReg32(addr rf.measureCtrl618, not RfMeasureTriggerClearMask, 0'u32)
     (true, sample)
 
   proc tuneRfTxcalSingenPower(initialAmp: uint32,
@@ -11311,7 +11912,7 @@ when defined(bl808WifiUseBl808Rf):
       let clamped = clampRfTxcalAmp(amp)
       writeRfTxcalSingenAmplitude(clamped)
       waitRfUs(10'u32)
-      let sample = sampleRfTxcalAverage()
+      let sample = sampleRfTxcalAdcMean()
       if sample.ok:
         lastMean = sample.value
       nim_wifi_rf_last_txcal_amp = clamped
@@ -11329,7 +11930,7 @@ when defined(bl808WifiUseBl808Rf):
       step = step div 2'i32
 
   proc writeRfTxcalMixerCs(value: uint32) =
-    rfRegUpdate(RfPriTxcalDcReg, RfTxcalMixerCsMask,
+    updateReg32(addr rfRegs().txcalDc6c, not RfTxcalMixerCsMask,
                 value and RfTxcalMixerCsMask)
 
   proc chooseRfTxcalMixerCs(): uint32 =
@@ -11346,50 +11947,60 @@ when defined(bl808WifiUseBl808Rf):
 
     writeRfTxcalMixerCs(best)
     if rfCalibDataGlobal != nil:
-      rfCalibSetWord(2, (rfCalibWord(2) and 0xF8FF_FFFF'u32) or
-                         ((best and RfTxcalMixerCsMask) shl 24))
+      rfCalibSetWord(RfCalibRccalReplayWordIndex,
+        (rfCalibWord(RfCalibRccalReplayWordIndex) and 0xF8FF_FFFF'u32) or
+          ((best and RfTxcalMixerCsMask) shl 24))
     nim_wifi_rf_last_txcal_tmxcs = best
     nim_wifi_rf_last_txcal_tmxcs_power = cast[uint32](bestPower)
     best
 
   proc prepareRfTxcalSearchStage() =
-    rfRegWrite(RfPriRccalSingenReg0,
-               (rfRegRead(RfPriRccalSingenReg0) and 0xFC00_FFFF'u32) or
-               0x003D_0000'u32)
-    rfRegWrite(RfPriRccalSingenReg1,
-               rfRegRead(RfPriRccalSingenReg1) and 0x003F_FFFF'u32)
-    rfRegWrite(RfPriRccalSingenReg2,
-               (rfRegRead(RfPriRccalSingenReg2) and 0x003F_FFFF'u32) or
-               0xC000_0000'u32)
-    rfRegWrite(RfPriInit64Reg,
-               (rfRegRead(RfPriInit64Reg) and 0x0FC3_FFFF'u32) or
-               0x9030_0000'u32)
-    rfRegWrite(RfPriInit58Reg,
-               (rfRegRead(RfPriInit58Reg) and 0xFFF8_FFFF'u32) or
-               0x0004_0000'u32)
-    rfRegWrite(RfPriRccalToneReg,
-               (rfRegRead(RfPriRccalToneReg) and 0xCE0F_FFFF'u32) or
-               0x0077_0000'u32)
-    rfRegWrite(RfPriInit8cReg,
-               (rfRegRead(RfPriInit8cReg) and not 0x0000_0030'u32) or
-               0x0000_0010'u32)
+    ## Vendor rf_pri_txcal+0x54c..0x6a0 prepares the post-RF70 TXCAL search
+    ## with the same signal-generator profile used by the BZ branch, then
+    ## applies a one-shot RF64/RF58/RF21c/RF220 staging sequence before the
+    ## per-record TXCAL gain table loop.
+    let rf = rfRegs()
+    updateReg32(addr rf.calSingenCtrl20c, 0xFC00_FFFF'u32, 0x0049_0000'u32)
+    updateReg32(addr rf.calSingenAmpLo214, 0x003F_FFFF'u32, 0'u32)
+    updateReg32(addr rf.calSingenAmpHi218, 0x003F_FFFF'u32, 0xC000_0000'u32)
+    updateReg32(addr rf.rxcalPrep60, not 0x0000_0003'u32, 0x0000_0003'u32)
+    updateReg32(addr rf.txcalGain64, 0x0FC3_FFFF'u32, 0x9030_0000'u32)
+    updateReg32(addr rf.txcalBias58, 0xFFF8_FFFF'u32, 0x0004_0000'u32)
+    updateReg32(addr rf.rccalTone48, 0xCE0F_FFFF'u32, 0x0077_0000'u32)
+    updateReg32(addr rf.calPathConfig8c, not 0x0000_0030'u32, 0x0000_0010'u32)
+    updateReg32(addr rf.txcalGain64, 0xF8FF_FFFF'u32, 0x0400_0000'u32)
+    updateReg32(addr rf.txcalGain64, 0xFF83_FFFF'u32, 0xF040_0000'u32)
+    updateReg32(addr rf.rxcalPrep60, not 0x0000_0003'u32, 0x0000_0003'u32)
+    updateReg32(addr rf.priModeCtrl30, 0xFFFE_FFFF'u32, 0'u32)
+    updateReg32(addr rf.txcalBias58, 0xFFF8_FFFF'u32, 0x0001_0000'u32)
+    updateReg32(addr rf.calSingenMeasurePrep21c, 0xEFFF_EFFF'u32, 0'u32)
+    updateReg32(addr rf.calSingenAmpLo214, not 0x0000_07FF'u32, 0x0000_0010'u32)
+    updateReg32(addr rf.calSingenAmpHi218, not 0x0000_07FF'u32, 0x0000_0010'u32)
+    updateReg32(addr rf.calDfeGate23c, not 0x0004_0000'u32, 0x0004_0000'u32)
+    updateReg32(addr rf.rxMode220, not 0x0000_0180'u32, 0'u32)
+    updateReg32(addr rf.rxMode220, 0xFFFF_E7FF'u32, 0x0000_1082'u32)
+    updateReg32(addr rf.rxMode220, not 0x0000_0010'u32, 0x0000_0100'u32)
+    updateReg32(addr rf.calSingenCtrl20c, not 0x8000_0000'u32, 0'u32)
+    updateReg32(addr rf.calSingenCtrl20c, not 0x8000_0000'u32, 0x8000_0000'u32)
+    waitRfUs(10'u32)
 
   proc sampleRfTxcalPower(measFreq: uint32): tuple[ok: bool, power, iRaw, qRaw, ctrl: uint32] =
-    rfRegWrite(RfMeasureCtrlReg,
-               (rfRegRead(RfMeasureCtrlReg) and 0xFFF00000'u32) or
-               ((measFreq and 0x07FF'u32) shl RfMeasureFrequencyShift))
-    rfRegClear(RfMeasureCtrlReg, RfMeasureRccalTriggerMask)
-    rfRegOr(RfMeasureCtrlReg, RfMeasureRccalTriggerMask)
+    let rf = rfRegs()
+    updateReg32(addr rf.measureCtrl618, 0xFFF00000'u32,
+                (measFreq and 0x07FF'u32) shl RfMeasureFrequencyShift)
+    updateReg32(addr rf.measureCtrl618, not RfMeasureRccalTriggerMask, 0'u32)
+    updateReg32(addr rf.measureCtrl618, not RfMeasureRccalTriggerMask,
+                RfMeasureRccalTriggerMask)
     if not waitRfTxcalMeasurementReady():
-      rfRegClear(RfMeasureCtrlReg, RfMeasureRccalTriggerMask)
-      return (false, 0'u32, 0'u32, 0'u32, rfRegRead(RfMeasureCtrlReg))
+      updateReg32(addr rf.measureCtrl618, not RfMeasureRccalTriggerMask, 0'u32)
+      return (false, 0'u32, 0'u32, 0'u32, volatileLoad(addr rf.measureCtrl618))
 
-    let iRaw = rfRegRead(RfMeasureIReg)
-    let qRaw = rfRegRead(RfMeasureQReg)
-    let ctrl = rfRegRead(RfMeasureCtrlReg)
+    let iRaw = volatileLoad(addr rf.measureI620)
+    let qRaw = volatileLoad(addr rf.measureQ624)
+    let ctrl = volatileLoad(addr rf.measureCtrl618)
     let iSample = signedRfPowerMeasurement(iRaw)
     let qSample = signedRfPowerMeasurement(qRaw)
-    rfRegClear(RfMeasureCtrlReg, RfMeasureRccalTriggerMask)
+    updateReg32(addr rf.measureCtrl618, not RfMeasureRccalTriggerMask, 0'u32)
     (true, saturatingRfUint32(squareRfSample(iSample) + squareRfSample(qSample)),
      iRaw, qRaw, ctrl)
 
@@ -11454,181 +12065,152 @@ when defined(bl808WifiUseBl808Rf):
     else:
       (false, bestValue, 0'u32)
 
-  proc packRfTxcalCalWord0(p0, p1, p2: int32): uint32 {.inline.} =
+  proc packRfTxcalCalWord0(param0, param1, param2: int32): uint32 {.inline.} =
     ## Vendor wl_cal TXCAL layout at rf_calib_data+0x68:
-    ## p0 byte, p1 byte, p2 halfword, p3 halfword.
-    (uint32(clampRfTxcalParam(0'u32, p0)) and 0x3F'u32) or
-      ((uint32(clampRfTxcalParam(1'u32, p1)) and 0x3F'u32) shl 8) or
-      ((uint32(clampRfTxcalParam(2'u32, p2)) and 0x7FF'u32) shl 16)
+    ## param0 byte, param1 byte, param2 halfword, param3 halfword.
+    (uint32(clampRfTxcalParam(0'u32, param0)) and 0x3F'u32) or
+      ((uint32(clampRfTxcalParam(1'u32, param1)) and 0x3F'u32) shl 8) or
+      ((uint32(clampRfTxcalParam(2'u32, param2)) and 0x7FF'u32) shl 16)
 
-  proc packRfTxcalCalWord1(p3: int32): uint32 {.inline.} =
-    encodeRfTxcalParam3(p3)
+  proc packRfTxcalCalWord1(param3: int32): uint32 {.inline.} =
+    encodeRfTxcalParam3(param3)
 
-  proc storeRfTxcalRecord(index: int, p0, p1, p2, p3: int32, power: uint32) =
+  proc storeRfTxcalRecord(index: int;
+                          param0, param1, param2, param3: int32;
+                          power: uint32) =
     if rfCalibDataGlobal == nil:
       return
-    let word0 = packRfTxcalCalWord0(p0, p1, p2)
-    let word1 = packRfTxcalCalWord1(p3)
-    let base = index * 2
-    rfCalibSetWord(RfPriTxcalRecordBaseWord + base, word0)
-    rfCalibSetWord(RfPriTxcalRecordBaseWord + base + 1, word1)
-    nim_wifi_rf_last_txcal_word0 = word0
-    nim_wifi_rf_last_txcal_word1 = word1
+    let txcalRecordWord0 = packRfTxcalCalWord0(param0, param1, param2)
+    let txcalRecordWord1 = packRfTxcalCalWord1(param3)
+    let txcalRecordBase = index * 2
+    rfCalibSetWord(RfCalibTxcalRecordBaseWord + txcalRecordBase,
+                   txcalRecordWord0)
+    rfCalibSetWord(RfCalibTxcalRecordBaseWord + txcalRecordBase + 1,
+                   txcalRecordWord1)
+    nim_wifi_rf_last_txcal_word0 = txcalRecordWord0
+    nim_wifi_rf_last_txcal_word1 = txcalRecordWord1
     if index >= 0 and index < RfPriTxcalSearchRecords:
-      nim_wifi_rf_txcal_word0_log[index] = word0
-      nim_wifi_rf_txcal_word1_log[index] = word1
+      nim_wifi_rf_txcal_word0_log[index] = txcalRecordWord0
+      nim_wifi_rf_txcal_word1_log[index] = txcalRecordWord1
       nim_wifi_rf_txcal_power_log[index] = power
 
-  proc storeRfPriBzTxcalRecord(index: int, p0, p1, p2, p3: int32) =
+  proc storeRfPriBzTxcalRecord(index: int;
+                               param0, param1, param2, param3: int32) =
     if rfCalibDataGlobal == nil:
       return
-    let offset = 0xF8 + index * 8
-    let word0 = packRfTxcalCalWord0(p0, p1, p2)
-    let word1 = packRfTxcalCalWord1(p3)
-    rfCalibSetByte(offset, (word0 and 0xFF'u32).uint8)
-    rfCalibSetByte(offset + 1, ((word0 shr 8) and 0xFF'u32).uint8)
-    rfCalibSetHalf((offset + 2) div 2, ((word0 shr 16) and 0xFFFF'u32).uint16)
-    rfCalibSetHalf((offset + 4) div 2, (word1 and 0xFFFF'u32).uint16)
+    let bzTxcalRecordWord0 = packRfTxcalCalWord0(param0, param1, param2)
+    let bzTxcalRecordWord1 = packRfTxcalCalWord1(param3)
+    rfCalibStoreBzTxcalRecordWords(
+      index, bzTxcalRecordWord0, bzTxcalRecordWord1)
     if index >= 0 and index < RfPriBzTxcalSearchRecords:
-      nim_wifi_rf_bz_txcal_word0_log[index] = word0
-      nim_wifi_rf_bz_txcal_word1_log[index] = word1
+      nim_wifi_rf_bz_txcal_word0_log[index] = bzTxcalRecordWord0
+      nim_wifi_rf_bz_txcal_word1_log[index] = bzTxcalRecordWord1
 
   proc configureRfPriTxcalGain(setup: array[9, uint16],
                                param: array[7, uint32]) =
-    rfRegWrite(RfPriTxcalDcReg,
-               (rfRegRead(RfPriTxcalDcReg) and not 0x00000003'u32) or
-               (param[3] and 0x03'u32))
-    rfRegWrite(RfPriInit64Reg,
-               (rfRegRead(RfPriInit64Reg) and 0x0FC3FFFF'u32) or
-               ((param[0] and 0x3F'u32) shl 28) or
-               ((param[2] and 0x3F'u32) shl 18))
-    rfRegWrite(RfPriInit58Reg,
-               (rfRegRead(RfPriInit58Reg) and 0xFFF8FFFF'u32) or
-               ((param[1] and 0x07'u32) shl 16))
-    rfRegWrite(RfPriRccalToneReg,
-               (rfRegRead(RfPriRccalToneReg) and 0xCE08FFFF'u32) or
-               ((uint32(setup[0]) and 0x03'u32) shl 28) or
-               ((uint32(setup[3]) and 0x1F'u32) shl 20) or
-               ((param[5] and 0x07'u32) shl 16))
-    rfRegWrite(RfPriInit68Reg,
-               (rfRegRead(RfPriInit68Reg) and 0x1FFFFFFF'u32) or
-               ((param[6] and 0x07'u32) shl 29))
+    let rf = rfRegs()
+    updateReg32(addr rf.txcalDc6c, not 0x00000003'u32, param[3] and 0x03'u32)
+    updateReg32(addr rf.txcalGain64, 0x0FC3FFFF'u32,
+                ((param[0] and 0x3F'u32) shl 28) or
+                ((param[2] and 0x3F'u32) shl 18))
+    updateReg32(addr rf.txcalBias58, 0xFFF8FFFF'u32,
+                (param[1] and 0x07'u32) shl 16)
+    updateReg32(addr rf.rccalTone48, 0xCE08FFFF'u32,
+                ((uint32(setup[0]) and 0x03'u32) shl 28) or
+                ((uint32(setup[3]) and 0x1F'u32) shl 20) or
+                ((param[5] and 0x07'u32) shl 16))
+    updateReg32(addr rf.txcalGain68, 0x1FFFFFFF'u32,
+                (param[6] and 0x07'u32) shl 29)
 
   proc configureRfPriTxcalGain(index: int, param: array[7, uint32]) =
     configureRfPriTxcalGain(RfPriTxcalPowerSetup[index], param)
 
   proc prepareRfPriTxcal() =
-    rfRegClear(RfCtrlReg, RfCtrlTuneEnableMask)
-    rfRegWrite(RfSynthCtrlReg, 0'u32)
-    rfRegOr(RfPriModeCtrlReg, 0x00000002'u32)
-    rfRegWrite(RfPriModeCtrlReg,
-               (rfRegRead(RfPriModeCtrlReg) and 0xCEFFF8FF'u32) or
-               0xCEFF7800'u32)
+    let rf = rfRegs()
+    updateReg32(addr rf.baseCtrl1, not RfCtrlTuneEnableMask, 0'u32)
+    volatileStore(addr rf.synthCtrl2c, 0'u32)
+    updateReg32(addr rf.priModeCtrl30, not 0'u32, 0x00000002'u32)
+    updateReg32(addr rf.priModeCtrl30, 0xCEFFF8FF'u32, 0xCEFF7800'u32)
     waitRfUs(1'u32)
 
-    rfRegOr(0x2000123C'u32, 0x00040000'u32)
+    updateReg32(addr rf.calDfeGate23c, not 0x00040000'u32, 0x00040000'u32)
     startRfPriTxDfeForCal()
     startRfPriRxDfeForCal()
-    rfRegOr(0x2000123C'u32, 0x00040000'u32)
-    rfRegOr(RfCalCtrlReg, 0x00003000'u32)
-    rfRegOr(RfPriTxcalDfeReg, 0x80000000'u32)
-    rfRegOr(RfPriInit64Reg, 0x00400000'u32)
-    rfRegWrite(RfPriTxcalDcReg,
-               (rfRegRead(RfPriTxcalDcReg) and not 0x00000007'u32) or
-               0x00000004'u32)
+    rfPriConfigChannelForCal(9)
+    updateReg32(addr rf.calDfeGate23c, not 0x00040000'u32, 0x00040000'u32)
+    updateReg32(addr rf.calCtrl1c, not 0'u32, 0x00003000'u32)
+    updateReg32(addr rf.txcalDfe88, not 0x80000000'u32, 0x80000000'u32)
+    updateReg32(addr rf.txcalGain64, not 0x00800000'u32, 0x00800000'u32)
+    updateReg32(addr rf.txcalDc6c, not 0x00000007'u32, 0x00000004'u32)
+    updateReg32(addr rf.calSingenCtrl20c, 0xFC00FFFF'u32, 0x00B00000'u32)
+    updateReg32(addr rf.calSingenAmpLo214, 0x003FFFFF'u32, 0'u32)
+    updateReg32(addr rf.calSingenAmpHi218, 0x003FFFFF'u32, 0xC0000000'u32)
+    updateReg32(addr rf.calSingenCtrl20c, not 0x80000000'u32, 0'u32)
+    updateReg32(addr rf.calSingenCtrl20c, not 0x80000000'u32, 0x80000000'u32)
 
-    rfRegWrite(RfPriRccalSingenReg0,
-               (rfRegRead(RfPriRccalSingenReg0) and 0xFC00FFFF'u32) or
-               0x00B00000'u32)
-    rfRegWrite(RfPriRccalSingenReg1,
-               rfRegRead(RfPriRccalSingenReg1) and 0x003FFFFF'u32)
-    rfRegWrite(RfPriRccalSingenReg2,
-               (rfRegRead(RfPriRccalSingenReg2) and 0x003FFFFF'u32) or
-               0xC0000000'u32)
-    rfRegClear(RfPriRccalSingenReg0, 0x80000000'u32)
-    rfRegOr(RfPriRccalSingenReg0, 0x80000000'u32)
-
-    rfRegOr(RfPriModeCtrlReg, 0x00000003'u32)
-    rfRegWrite(RfPriInit64Reg,
-               (rfRegRead(RfPriInit64Reg) and 0x0FC3FFFF'u32) or
-               0x50000000'u32)
-    rfRegWrite(RfPriInit58Reg,
-               (rfRegRead(RfPriInit58Reg) and 0xFFF8FFFF'u32) or
-               0x00040000'u32)
-    rfRegWrite(RfPriRccalToneReg,
-               (rfRegRead(RfPriRccalToneReg) and 0xCE08FFFF'u32) or
-               0x00870000'u32)
-    rfRegWrite(RfPriInit68Reg,
-               (rfRegRead(RfPriInit68Reg) and 0x1DFFFFFF'u32) or
-               0xE0000000'u32)
-    rfRegWrite(RfMeasureModeReg,
-               (rfRegRead(RfMeasureModeReg) and RfMeasureModeKeepMask) or
-               RfMeasureRoscalMode)
-    discard tuneRfTxcalSingenPower(RfTxcalInitialAmp,
-                                   RfTxcalInitialAdcMax,
-                                   RfTxcalInitialAdcMin)
-    discard chooseRfTxcalMixerCs()
-    prepareRfTxcalSearchStage()
+    updateReg32(addr rf.priModeCtrl30, not 0'u32, 0x00000003'u32)
+    updateReg32(addr rf.txcalGain64, 0x0FC3FFFF'u32, 0x50000000'u32)
+    updateReg32(addr rf.txcalBias58, 0xFFF8FFFF'u32, 0x00040000'u32)
+    updateReg32(addr rf.rccalTone48, 0xCE08FFFF'u32, 0x00870000'u32)
+    updateReg32(addr rf.txcalGain68, 0x1DFFFFFF'u32, 0xE0000000'u32)
+    # rf_pri_txcal+0x148..0x158 seeds RF70 before the initial TXCAL
+    # signal-generator amplitude search and later RF70 replay-window scans.
+    updateReg32(addr rf.txcalParam70, not 0x0000000F'u32,
+                RfPriTxcalRf70InitialSearchSeedNibble)
+    updateReg32(addr rf.measureMode61c, RfMeasureModeKeepMask,
+                RfMeasureRoscalMode)
+    preRf70TxcalSingenAmplitude =
+      tuneRfTxcalSingenPower(RfTxcalInitialAmp,
+                             RfTxcalInitialAdcMax,
+                             RfTxcalInitialAdcMin)
+    preRf70TxcalAdcMean = nim_wifi_rf_last_txcal_amp_mean
+    preRf70TxcalParamReg = volatileLoad(addr rf.txcalParam70)
+    preRf70TxcalMixerDcReg = volatileLoad(addr rf.txcalDc6c)
+    preRf70SingenControlReg = volatileLoad(addr rf.calSingenCtrl20c)
+    preRf70SingenAmplitudeLoReg = volatileLoad(addr rf.calSingenAmpLo214)
+    preRf70SingenAmplitudeHiReg = volatileLoad(addr rf.calSingenAmpHi218)
+    preRf70AverageMeasureCtrlReg = volatileLoad(addr rf.measureCtrl618)
+    preRf70AverageMeasureModeReg = volatileLoad(addr rf.measureMode61c)
 
   proc prepareRfPriBzTxcal() =
-    rfRegClear(RfCtrlReg, RfCtrlTuneEnableMask)
-    rfRegWrite(RfSynthCtrlReg, 0'u32)
-    rfRegOr(RfPriModeCtrlReg, 0x00000002'u32)
-    rfRegWrite(RfPriModeCtrlReg,
-               (rfRegRead(RfPriModeCtrlReg) and 0xCEFFF8FF'u32) or
-               0xCEFF7800'u32)
+    let rf = rfRegs()
+    updateReg32(addr rf.baseCtrl1, not RfCtrlTuneEnableMask, 0'u32)
+    volatileStore(addr rf.synthCtrl2c, 0'u32)
+    updateReg32(addr rf.priModeCtrl30, not 0'u32, 0x00000002'u32)
+    updateReg32(addr rf.priModeCtrl30, 0xCEFFF8FF'u32, 0xCEFF7800'u32)
     waitRfUs(1'u32)
 
-    rfRegOr(0x2000123C'u32, 0x00040000'u32)
-    rfRegWrite(RfRxModeReg,
-               (rfRegRead(RfRxModeReg) and not 0x00000180'u32) or
-               0x00000100'u32)
-    rfRegWrite(RfRxModeReg,
-               (rfRegRead(RfRxModeReg) and not 0x00007800'u32) or
-               0x00001080'u32)
-    rfRegOr(RfRxModeReg, 0x00000001'u32)
-    rfRegOr(0x2000123C'u32, 0x00040000'u32)
-    rfRegWrite(RfRxModeReg,
-               (rfRegRead(RfRxModeReg) and not 0x00000060'u32) or
-               0x00000020'u32)
-    rfRegOr(RfRxModeReg, 0x00000040'u32)
-    rfRegOr(RfCalCtrlReg, 0x00003000'u32)
-    rfRegOr(RfPriTxcalDfeReg, 0x80000000'u32)
-    rfRegOr(RfPriInit64Reg, 0x00800000'u32)
-    rfRegWrite(RfPriRccalSingenReg0,
-               (rfRegRead(RfPriRccalSingenReg0) and 0xFC00FFFF'u32) or
-               0x00490000'u32)
-    rfRegWrite(RfPriRccalSingenReg1,
-               rfRegRead(RfPriRccalSingenReg1) and 0x003FFFFF'u32)
-    rfRegWrite(RfPriRccalSingenReg2,
-               (rfRegRead(RfPriRccalSingenReg2) and 0x003FFFFF'u32) or
-               0xC0000000'u32)
-    rfRegOr(RfPriModeCtrlReg, 0x00000003'u32)
-    rfRegWrite(RfPriInit64Reg,
-               (rfRegRead(RfPriInit64Reg) and 0x0FC3FFFF'u32) or
-               0x90300000'u32)
-    rfRegWrite(RfPriInit58Reg,
-               (rfRegRead(RfPriInit58Reg) and 0xFFF8FFFF'u32) or
-               0x00040000'u32)
-    rfRegWrite(RfPriRccalToneReg,
-               (rfRegRead(RfPriRccalToneReg) and 0xCE0FFFFF'u32) or
-               0x00770000'u32)
-    rfRegWrite(RfPriInit8cReg,
-               (rfRegRead(RfPriInit8cReg) and not 0x00000030'u32) or
-               0x00000010'u32)
-    rfRegWrite(RfPriInit64Reg,
-               (rfRegRead(RfPriInit64Reg) and 0xF8FFFFFF'u32) or
-               0x04000000'u32)
+    updateReg32(addr rf.calDfeGate23c, not 0x00040000'u32, 0x00040000'u32)
+    updateReg32(addr rf.rxMode220, not 0x00000180'u32, 0x00000100'u32)
+    updateReg32(addr rf.rxMode220, not 0x00007800'u32, 0x00001080'u32)
+    updateReg32(addr rf.rxMode220, not 0x00000001'u32, 0x00000001'u32)
+    updateReg32(addr rf.calDfeGate23c, not 0x00040000'u32, 0x00040000'u32)
+    updateReg32(addr rf.rxMode220, not 0x00000060'u32, 0x00000020'u32)
+    updateReg32(addr rf.rxMode220, not 0x00000040'u32, 0x00000040'u32)
+    updateReg32(addr rf.calCtrl1c, not 0'u32, 0x00003000'u32)
+    updateReg32(addr rf.txcalDfe88, not 0x80000000'u32, 0x80000000'u32)
+    updateReg32(addr rf.txcalGain64, not 0x00800000'u32, 0x00800000'u32)
+    updateReg32(addr rf.calSingenCtrl20c, 0xFC00FFFF'u32, 0x00490000'u32)
+    updateReg32(addr rf.calSingenAmpLo214, 0x003FFFFF'u32, 0'u32)
+    updateReg32(addr rf.calSingenAmpHi218, 0x003FFFFF'u32, 0xC0000000'u32)
+    updateReg32(addr rf.priModeCtrl30, not 0'u32, 0x00000003'u32)
+    updateReg32(addr rf.txcalGain64, 0x0FC3FFFF'u32, 0x90300000'u32)
+    updateReg32(addr rf.txcalBias58, 0xFFF8FFFF'u32, 0x00040000'u32)
+    updateReg32(addr rf.rccalTone48, 0xCE0FFFFF'u32, 0x00770000'u32)
+    updateReg32(addr rf.calPathConfig8c, not 0x00000030'u32, 0x00000010'u32)
+    updateReg32(addr rf.txcalGain64, 0xF8FFFFFF'u32, 0x04000000'u32)
 
   proc runRfPriTxcal() =
     if rfCalibDataGlobal == nil:
       return
+    let rf = rfRegs()
     inc nim_wifi_rf_pri_txcal_count
-    rfRegWrite(RfCalModeReg,
-               (rfRegRead(RfCalModeReg) and not RfTxcalModeMask) or
-               RfTxcalStartMode)
+    updateReg32(addr rf.calMode14, not RfTxcalModeMask, RfTxcalStartMode)
     let saved = saveRfPriCalState()
     prepareRfPriTxcal()
+    rfPriPopulateWb03TxcalRf70ReplayFields()
+    discard chooseRfTxcalMixerCs()
+    prepareRfTxcalSearchStage()
 
     var allOk = true
     for i in 0 ..< RfPriTxcalSearchRecords:
@@ -11638,40 +12220,50 @@ when defined(bl808WifiUseBl808Rf):
                                        RfTxcalGainAdcMin)
       nim_wifi_rf_txcal_amp_log[i] = amp
 
-      let p0a = searchRfTxcalParam(0'u32, 0x20'i32, 0x10'i32,
-                                   RfTxcalSearchFreqIq)
-      let p1a = searchRfTxcalParam(1'u32, 0x20'i32, 0x10'i32,
-                                   RfTxcalSearchFreqIq)
-      let p0b = searchRfTxcalParam(0'u32, p0a.value, 0x08'i32,
-                                   RfTxcalSearchFreqIq)
-      let p1b = searchRfTxcalParam(1'u32, p1a.value, 0x08'i32,
-                                   RfTxcalSearchFreqIq)
-      let p2a = searchRfTxcalParam(2'u32, 0x400'i32, 0x80'i32,
-                                   RfTxcalSearchFreqOsdac)
-      let p3a = searchRfTxcalParam(3'u32, 0'i32, 0x40'i32,
-                                   RfTxcalSearchFreqOsdac)
-      let p2b = searchRfTxcalParam(2'u32, p2a.value, 0x40'i32,
-                                   RfTxcalSearchFreqOsdac)
-      let p3b = searchRfTxcalParam(3'u32, p3a.value, 0x20'i32,
-                                   RfTxcalSearchFreqOsdac)
+      let txcalParam0Coarse =
+        searchRfTxcalParam(0'u32, 0x20'i32, 0x10'i32, RfTxcalSearchFreqIq)
+      let txcalParam1Coarse =
+        searchRfTxcalParam(1'u32, 0x20'i32, 0x10'i32, RfTxcalSearchFreqIq)
+      let txcalParam0Refined =
+        searchRfTxcalParam(0'u32, txcalParam0Coarse.value, 0x08'i32,
+                           RfTxcalSearchFreqIq)
+      let txcalParam1Refined =
+        searchRfTxcalParam(1'u32, txcalParam1Coarse.value, 0x08'i32,
+                           RfTxcalSearchFreqIq)
+      let txcalParam2Coarse =
+        searchRfTxcalParam(2'u32, 0x400'i32, 0x80'i32,
+                           RfTxcalSearchFreqOsdac)
+      let txcalParam3Coarse =
+        searchRfTxcalParam(3'u32, 0'i32, 0x40'i32, RfTxcalSearchFreqOsdac)
+      let txcalParam2Refined =
+        searchRfTxcalParam(2'u32, txcalParam2Coarse.value, 0x40'i32,
+                           RfTxcalSearchFreqOsdac)
+      let txcalParam3Refined =
+        searchRfTxcalParam(3'u32, txcalParam3Coarse.value, 0x20'i32,
+                           RfTxcalSearchFreqOsdac)
 
-      allOk = allOk and p0a.ok and p1a.ok and p0b.ok and p1b.ok and
-        p2a.ok and p3a.ok and p2b.ok and p3b.ok
-      storeRfTxcalRecord(i, p0b.value, p1b.value, p2b.value, p3b.value,
-                         p0b.power or p1b.power or p2b.power or p3b.power)
+      allOk = allOk and txcalParam0Coarse.ok and txcalParam1Coarse.ok and
+        txcalParam0Refined.ok and txcalParam1Refined.ok and
+        txcalParam2Coarse.ok and txcalParam3Coarse.ok and
+        txcalParam2Refined.ok and txcalParam3Refined.ok
+      storeRfTxcalRecord(
+        i,
+        txcalParam0Refined.value,
+        txcalParam1Refined.value,
+        txcalParam2Refined.value,
+        txcalParam3Refined.value,
+        txcalParam0Refined.power or txcalParam1Refined.power or
+          txcalParam2Refined.power or txcalParam3Refined.power)
 
     restoreRfPriCalState(saved)
     if allOk:
-      rfRegWrite(RfCalModeReg,
-                 (rfRegRead(RfCalModeReg) and not RfTxcalModeMask) or
-                 RfTxcalDoneMode)
+      updateReg32(addr rf.calMode14, not RfTxcalModeMask, RfTxcalDoneMode)
 
   proc runRfPriBzTxcal() =
     if rfCalibDataGlobal == nil:
       return
-    rfRegWrite(RfCalModeReg,
-               (rfRegRead(RfCalModeReg) and not RfTxcalModeMask) or
-               RfTxcalStartMode)
+    let rf = rfRegs()
+    updateReg32(addr rf.calMode14, not RfTxcalModeMask, RfTxcalStartMode)
     let saved = saveRfPriCalState()
     prepareRfPriBzTxcal()
     rfPriSnapshotBzTxcalState(0xB3'u32)
@@ -11684,59 +12276,69 @@ when defined(bl808WifiUseBl808Rf):
                                      RfTxcalGainAdcMax,
                                      RfTxcalGainAdcMin)
 
-      let p0a = searchRfTxcalParam(0'u32, 0x20'i32, 0x10'i32,
-                                   RfBzTxcalSearchFreqIq)
-      let p1a = searchRfTxcalParam(1'u32, 0x20'i32, 0x10'i32,
-                                   RfBzTxcalSearchFreqIq)
-      let p0b = searchRfTxcalParam(0'u32, p0a.value, 0x08'i32,
-                                   RfBzTxcalSearchFreqIq)
-      let p1b = searchRfTxcalParam(1'u32, p1a.value, 0x08'i32,
-                                   RfBzTxcalSearchFreqIq)
-      let p2a = searchRfTxcalParam(2'u32, 0x400'i32, 0x80'i32,
-                                   RfBzTxcalSearchFreqOsdac)
-      let p3a = searchRfTxcalParam(3'u32, 0'i32, 0x40'i32,
-                                   RfBzTxcalSearchFreqOsdac)
-      let p2b = searchRfTxcalParam(2'u32, p2a.value, 0x40'i32,
-                                   RfBzTxcalSearchFreqOsdac)
-      let p3b = searchRfTxcalParam(3'u32, p3a.value, 0x20'i32,
-                                   RfBzTxcalSearchFreqOsdac)
+      let txcalParam0Coarse =
+        searchRfTxcalParam(0'u32, 0x20'i32, 0x10'i32, RfBzTxcalSearchFreqIq)
+      let txcalParam1Coarse =
+        searchRfTxcalParam(1'u32, 0x20'i32, 0x10'i32, RfBzTxcalSearchFreqIq)
+      let txcalParam0Refined =
+        searchRfTxcalParam(0'u32, txcalParam0Coarse.value, 0x08'i32,
+                           RfBzTxcalSearchFreqIq)
+      let txcalParam1Refined =
+        searchRfTxcalParam(1'u32, txcalParam1Coarse.value, 0x08'i32,
+                           RfBzTxcalSearchFreqIq)
+      let txcalParam2Coarse =
+        searchRfTxcalParam(2'u32, 0x400'i32, 0x80'i32,
+                           RfBzTxcalSearchFreqOsdac)
+      let txcalParam3Coarse =
+        searchRfTxcalParam(3'u32, 0'i32, 0x40'i32,
+                           RfBzTxcalSearchFreqOsdac)
+      let txcalParam2Refined =
+        searchRfTxcalParam(2'u32, txcalParam2Coarse.value, 0x40'i32,
+                           RfBzTxcalSearchFreqOsdac)
+      let txcalParam3Refined =
+        searchRfTxcalParam(3'u32, txcalParam3Coarse.value, 0x20'i32,
+                           RfBzTxcalSearchFreqOsdac)
 
       let okMask =
-        (if p0a.ok: 0x01'u32 else: 0'u32) or
-        (if p1a.ok: 0x02'u32 else: 0'u32) or
-        (if p0b.ok: 0x04'u32 else: 0'u32) or
-        (if p1b.ok: 0x08'u32 else: 0'u32) or
-        (if p2a.ok: 0x10'u32 else: 0'u32) or
-        (if p3a.ok: 0x20'u32 else: 0'u32) or
-        (if p2b.ok: 0x40'u32 else: 0'u32) or
-        (if p3b.ok: 0x80'u32 else: 0'u32)
+        (if txcalParam0Coarse.ok: 0x01'u32 else: 0'u32) or
+        (if txcalParam1Coarse.ok: 0x02'u32 else: 0'u32) or
+        (if txcalParam0Refined.ok: 0x04'u32 else: 0'u32) or
+        (if txcalParam1Refined.ok: 0x08'u32 else: 0'u32) or
+        (if txcalParam2Coarse.ok: 0x10'u32 else: 0'u32) or
+        (if txcalParam3Coarse.ok: 0x20'u32 else: 0'u32) or
+        (if txcalParam2Refined.ok: 0x40'u32 else: 0'u32) or
+        (if txcalParam3Refined.ok: 0x80'u32 else: 0'u32)
       nim_wifi_rf_bz_txcal_ok_mask_log[i] = okMask
       nim_wifi_rf_bz_txcal_power_log[i] =
-        (p0b.power and 0xFFFF'u32) or ((p1b.power and 0xFFFF'u32) shl 16)
+        (txcalParam0Refined.power and 0xFFFF'u32) or
+        ((txcalParam1Refined.power and 0xFFFF'u32) shl 16)
 
-      let rowOk = p0a.ok and p1a.ok and p0b.ok and p1b.ok and
-        p2a.ok and p3a.ok and p2b.ok and p3b.ok
+      let rowOk = txcalParam0Coarse.ok and txcalParam1Coarse.ok and
+        txcalParam0Refined.ok and txcalParam1Refined.ok and
+        txcalParam2Coarse.ok and txcalParam3Coarse.ok and
+        txcalParam2Refined.ok and txcalParam3Refined.ok
       allOk = allOk and rowOk
       if rowOk:
-        storeRfPriBzTxcalRecord(i, p0b.value, p1b.value,
-                                p2b.value, p3b.value)
+        storeRfPriBzTxcalRecord(
+          i,
+          txcalParam0Refined.value,
+          txcalParam1Refined.value,
+          txcalParam2Refined.value,
+          txcalParam3Refined.value)
       else:
         storeRfPriBzTxcalRecord(i, 0x20'i32, 0x20'i32, 0x400'i32, 0'i32)
 
     rfPriSnapshotBzTxcalState(0xB4'u32)
-    rfRegClear(RfCalCtrlReg, 0x00003000'u32)
-    rfRegWrite(RfPriInit64Reg,
-               (rfRegRead(RfPriInit64Reg) and 0xF8FFFFFF'u32) or
-               0x03000000'u32)
+    updateReg32(addr rf.calCtrl1c, not 0x00003000'u32, 0'u32)
+    updateReg32(addr rf.txcalGain64, 0xF8FFFFFF'u32, 0x03000000'u32)
     restoreRfPriCalState(saved)
     if allOk:
-      rfRegWrite(RfCalModeReg,
-                 (rfRegRead(RfCalModeReg) and not RfTxcalModeMask) or
-                 RfTxcalDoneMode)
+      updateReg32(addr rf.calMode14, not RfTxcalModeMask, RfTxcalDoneMode)
 
   proc waitRfRxcalMeasurementReady(): bool =
+    let rf = rfRegs()
     for _ in 0 ..< RfRxcalWaitLimit:
-      if (rfRegRead(RfMeasureCtrlReg) and RfMeasureReadyMask) != 0'u32:
+      if (volatileLoad(addr rf.measureCtrl618) and RfMeasureReadyMask) != 0'u32:
         return true
       waitRfUs(1'u32)
     inc nim_wifi_rf_rxcal_wait_timeout_count
@@ -11759,8 +12361,9 @@ when defined(bl808WifiUseBl808Rf):
         value
 
   proc writeRfRxcalParam(paramInd: uint32, value: int32) =
+    let rf = rfRegs()
     let clamped = clampRfRxcalParam(paramInd, value)
-    var word = rfRegRead(RfPriRxcalSearchReg)
+    var word = volatileLoad(addr rf.rxcalSearch614)
     if paramInd == 2'u32:
       word = (word and not RfRxcalSearchHighMask) or
         ((uint32(clamped) shl 12) and RfRxcalSearchHighMask) or
@@ -11768,21 +12371,22 @@ when defined(bl808WifiUseBl808Rf):
     else:
       word = (word and not RfRxcalSearchLowMask) or
         (uint32(clamped) and RfRxcalSearchLowMask) or 0x00000400'u32
-    rfRegWrite(RfPriRxcalSearchReg, word)
+    volatileStore(addr rf.rxcalSearch614, word)
 
   proc sampleRfRxcalPower(): tuple[ok: bool, power: uint32] =
-    rfRegWrite(RfMeasureCtrlReg,
-               (rfRegRead(RfMeasureCtrlReg) and 0xFFF00000'u32) or
-               RfRxcalMeasureSetupMask)
-    rfRegClear(RfMeasureCtrlReg, RfRxcalMeasureClearMask)
-    rfRegOr(RfMeasureCtrlReg, RfRxcalMeasureClearMask)
+    let rf = rfRegs()
+    updateReg32(addr rf.measureCtrl618, 0xFFF00000'u32,
+                RfRxcalMeasureSetupMask)
+    updateReg32(addr rf.measureCtrl618, not RfRxcalMeasureClearMask, 0'u32)
+    updateReg32(addr rf.measureCtrl618, not RfRxcalMeasureClearMask,
+                RfRxcalMeasureClearMask)
     if not waitRfRxcalMeasurementReady():
-      rfRegClear(RfMeasureCtrlReg, RfRxcalMeasureClearMask)
+      updateReg32(addr rf.measureCtrl618, not RfRxcalMeasureClearMask, 0'u32)
       return (false, 0'u32)
 
-    let iSample = signedRfPowerMeasurement(rfRegRead(RfMeasureIReg))
-    let qSample = signedRfPowerMeasurement(rfRegRead(RfMeasureQReg))
-    rfRegClear(RfMeasureCtrlReg, RfRxcalMeasureClearMask)
+    let iSample = signedRfPowerMeasurement(volatileLoad(addr rf.measureI620))
+    let qSample = signedRfPowerMeasurement(volatileLoad(addr rf.measureQ624))
+    updateReg32(addr rf.measureCtrl618, not RfRxcalMeasureClearMask, 0'u32)
     (true, saturatingRfUint32(squareRfSample(iSample) + squareRfSample(qSample)))
 
   proc measureRfRxcalCandidate(paramInd: uint32, candidate: int32):
@@ -11839,16 +12443,22 @@ when defined(bl808WifiUseBl808Rf):
   proc storeRfRxcalRecord(index: int, p2, p3: int32, power: uint32) =
     if rfCalibDataGlobal == nil or index < 0 or index >= 4:
       return
-    let word0 = packRfRxcalWord0(p2)
-    let word1 = packRfRxcalWord1(p3)
-    let base = 18 + index * 2
-    rfCalibSetWord(base, (rfCalibWord(base) and 0x0000FFFF'u32) or word0)
-    rfCalibSetWord(base + 1, (rfCalibWord(base + 1) and 0xFFFF0000'u32) or word1)
-    rfRegWrite(RfPriRxcalReg0 + uint32(index * 4),
-               (rfRegRead(RfPriRxcalReg0 + uint32(index * 4)) and
-                0xF800FC00'u32) or word0 or word1)
-    nim_wifi_rf_last_rxcal_word0 = rfCalibWord(base)
-    nim_wifi_rf_last_rxcal_word1 = rfCalibWord(base + 1)
+    let rxcalParam2ReplayWord = packRfRxcalWord0(p2)
+    let rxcalParam3ReplayWord = packRfRxcalWord1(p3)
+    let rxcalRecordBaseWord = 18 + index * 2
+    rfCalibSetWord(
+      rxcalRecordBaseWord,
+      (rfCalibWord(rxcalRecordBaseWord) and 0x0000FFFF'u32) or
+        rxcalParam2ReplayWord)
+    rfCalibSetWord(
+      rxcalRecordBaseWord + 1,
+      (rfCalibWord(rxcalRecordBaseWord + 1) and 0xFFFF0000'u32) or
+        rxcalParam3ReplayWord)
+    let rf = rfRegs()
+    updateReg32(addr rf.rxcalReplay[index], 0xF800FC00'u32,
+                rxcalParam2ReplayWord or rxcalParam3ReplayWord)
+    nim_wifi_rf_last_rxcal_word0 = rfCalibWord(rxcalRecordBaseWord)
+    nim_wifi_rf_last_rxcal_word1 = rfCalibWord(rxcalRecordBaseWord + 1)
     nim_wifi_rf_last_rxcal_power = power
     nim_wifi_rf_rxcal_word0_log[index] = nim_wifi_rf_last_rxcal_word0
     nim_wifi_rf_rxcal_word1_log[index] = nim_wifi_rf_last_rxcal_word1
@@ -11857,12 +12467,12 @@ when defined(bl808WifiUseBl808Rf):
   proc rfPriReplayRxcalRegs() =
     if rfCalibDataGlobal == nil:
       return
+    let rf = rfRegs()
     for i in 0 ..< 4:
-      let base = 18 + i * 2
-      updateReg32(cast[ptr uint32](RfBase + 0x170'u + uint(i * 4)),
-                  0xF800FC00'u32,
-                  (rfCalibWord(base + 1) and 0x3FF'u32) or
-                  (rfCalibWord(base) and 0x07FF0000'u32))
+      let rxcalRecordBaseWord = 18 + i * 2
+      updateReg32(addr rf.rxcalReplay[i], 0xF800FC00'u32,
+                  (rfCalibWord(rxcalRecordBaseWord + 1) and 0x3FF'u32) or
+                  (rfCalibWord(rxcalRecordBaseWord) and 0x07FF0000'u32))
 
   proc rfPriSeedRxcalRestoreLowHalves() =
     ## rf_pri_rxcal preserves the low halfword of wl_cal words 18/20/22/24;
@@ -11874,130 +12484,92 @@ when defined(bl808WifiUseBl808Rf):
     if rfCalibDataGlobal == nil:
       return
     for i in 0 ..< 4:
-      let base = 18 + i * 2
-      let word0 = rfCalibWord(base)
-      if (word0 and 0x07FF_FFFF'u32) == 0'u32 or
-          (word0 and 0x0000FFFF'u32) == 0x2023'u32:
-        rfCalibSetWord(base, 0x04002123'u32)
+      let rxcalRecordBaseWord = 18 + i * 2
+      let rxcalParam2ReplayWord = rfCalibWord(rxcalRecordBaseWord)
+      if (rxcalParam2ReplayWord and 0x07FF_FFFF'u32) == 0'u32 or
+          (rxcalParam2ReplayWord and 0x0000FFFF'u32) == 0x2023'u32:
+        rfCalibSetWord(rxcalRecordBaseWord, 0x04002123'u32)
 
   proc prepareRfPriRxcal() =
     rfPhyTraceCheckpoint(0x30'u32)
-    rfRegClear(RfCtrlReg, RfCtrlTuneEnableMask)
-    rfRegWrite(RfSynthCtrlReg, 0'u32)
-    rfRegOr(RfPriModeCtrlReg, 0x00000002'u32)
-    rfRegWrite(RfPriModeCtrlReg,
-               (rfRegRead(RfPriModeCtrlReg) and 0x8FFFFEFF'u32) or
-               0x8FFF7E00'u32)
+    let rf = rfRegs()
+    updateReg32(addr rf.baseCtrl1, not RfCtrlTuneEnableMask, 0'u32)
+    volatileStore(addr rf.synthCtrl2c, 0'u32)
+    updateReg32(addr rf.priModeCtrl30, not 0'u32, 0x00000002'u32)
+    updateReg32(addr rf.priModeCtrl30, 0x8FFFFEFF'u32, 0x8FFF7E00'u32)
     rfPriConfigChannelForCal(9)
 
-    rfRegOr(0x200010BC'u32, 0x20000000'u32)
-    rfRegOr(RfTxcalCtrlReg, 0x01000000'u32)
+    updateReg32(addr rf.channelFcalConfigBc, not 0x20000000'u32, 0x20000000'u32)
+    updateReg32(addr rf.txcalCtrlB8, not 0'u32, 0x01000000'u32)
     waitRfUs(1'u32)
-    rfRegOr(0x2000123C'u32, 0x00040000'u32)
-    rfRegClear(RfRxModeReg, 0x00000180'u32)
-    rfRegWrite(RfRxModeReg,
-               (rfRegRead(RfRxModeReg) and 0xFFFFE7FF'u32) or 0x00001082'u32)
-    rfRegWrite(RfRxModeReg,
-               (rfRegRead(RfRxModeReg) and not 0x00000010'u32) or
-               0x00000100'u32)
-    rfRegOr(0x2000123C'u32, 0x00040000'u32)
-    rfRegWrite(RfRxModeReg,
-               (rfRegRead(RfRxModeReg) and not 0x00000060'u32) or
-               0x00000021'u32)
-    rfRegOr(RfRxModeReg, 0x00000040'u32)
-    rfRegOr(RfPriTxcalDfeReg, 0x10000000'u32)
-    rfRegOr(RfPriInit64Reg, 0x00800000'u32)
-    rfRegWrite(RfTxcalParamReg,
-               (rfRegRead(RfTxcalParamReg) and not 0x0000000F'u32) or
-               ((rfCalibWord(3) shr 24) and 0x0000000F'u32))
-    rfRegWrite(RfPriInit90Reg,
-               (rfRegRead(RfPriInit90Reg) and not 0x00000030'u32) or
-               0x00000010'u32)
+    updateReg32(addr rf.calDfeGate23c, not 0x00040000'u32, 0x00040000'u32)
+    updateReg32(addr rf.rxMode220, not 0x00000180'u32, 0'u32)
+    updateReg32(addr rf.rxMode220, 0xFFFFE7FF'u32, 0x00001082'u32)
+    updateReg32(addr rf.rxMode220, not 0x00000010'u32, 0x00000100'u32)
+    updateReg32(addr rf.calDfeGate23c, not 0x00040000'u32, 0x00040000'u32)
+    updateReg32(addr rf.rxMode220, not 0x00000060'u32, 0x00000021'u32)
+    updateReg32(addr rf.rxMode220, not 0x00000040'u32, 0x00000040'u32)
+    updateReg32(addr rf.txcalDfe88, not 0x10000000'u32, 0x10000000'u32)
+    updateReg32(addr rf.txcalGain64, not 0x00800000'u32, 0x00800000'u32)
+    updateReg32(addr rf.txcalParam70, not 0x0000000F'u32,
+                rfPriRf70ReplayWindow0Nibble())
+    updateReg32(addr rf.calPathCtrl90, not 0x00000030'u32, 0x00000010'u32)
     rfPriApplyWb03RuntimeLatches()
-    rfRegWrite(0x20001088'u32,
-               (rfRegRead(0x20001088'u32) and 0xFCFFFFFF'u32) or
-               0x02000000'u32)
-    rfRegOr(0x20001060'u32, 0x00000003'u32)
-    rfRegWrite(RfPriInit64Reg,
-               (rfRegRead(RfPriInit64Reg) and 0x0F83FFFF'u32) or
-               0x201C0000'u32)
-    rfRegWrite(RfPriInit58Reg,
-               (rfRegRead(RfPriInit58Reg) and 0xFFF8FFFF'u32) or
-               0x00040000'u32)
-    rfRegWrite(RfPriRccalToneReg,
-               (rfRegRead(RfPriRccalToneReg) and 0xCE08FFFF'u32) or
-               0x00700000'u32)
-    rfRegWrite(RfPriInit68Reg,
-               (rfRegRead(RfPriInit68Reg) and 0x1DFFFFFF'u32) or
-               0xA0000000'u32)
-    rfRegWrite(RfPriRccalToneReg,
-               (rfRegRead(RfPriRccalToneReg) and 0xFFFF8CFF'u32) or
-               0x0000311F'u32)
+    updateReg32(addr rf.txcalDfe88, 0xFCFFFFFF'u32, 0x02000000'u32)
+    updateReg32(addr rf.rxcalPrep60, not 0x00000003'u32, 0x00000003'u32)
+    updateReg32(addr rf.txcalGain64, 0x0F83FFFF'u32, 0x201C0000'u32)
+    updateReg32(addr rf.txcalBias58, 0xFFF8FFFF'u32, 0x00040000'u32)
+    updateReg32(addr rf.rccalTone48, 0xCE08FFFF'u32, 0x00700000'u32)
+    updateReg32(addr rf.txcalGain68, 0x1DFFFFFF'u32, 0xA0000000'u32)
+    updateReg32(addr rf.rccalTone48, 0xFFFF8CFF'u32, 0x0000311F'u32)
     waitRfUs(10'u32)
-    let cfgA8 = wlCfgU32(0xA8)
-    let cfgAc = wlCfgU32(0xAC)
-    rfRegWrite(RfTxcalTosdacReg,
-               (rfRegRead(RfTxcalTosdacReg) and not 0x000003FF'u32) or
-               (cfgAc and 0x000003FF'u32) or 0x00000400'u32)
-    rfRegWrite(RfTxcalTosdacReg,
-               (rfRegRead(RfTxcalTosdacReg) and 0xFF800FFF'u32) or
-               (((cfgA8 shr 4) shl 12) and 0x007FF000'u32) or
-               0x00800000'u32)
-    rfRegWrite(RfTxcalParam01Reg,
-               (rfRegRead(RfTxcalParam01Reg) and 0xC100FFFF'u32) or
-               ((cfgA8 shl 24) and 0x3F000000'u32))
-    rfRegWrite(RfTxcalParam01Reg,
-               (rfRegRead(RfTxcalParam01Reg) and 0xFFC10FFF'u32) or
-               ((cfgA8 shl 8) and 0x003F0000'u32))
-    rfRegWrite(RfMeasureModeReg,
-               (rfRegRead(RfMeasureModeReg) and 0x0000FFFF'u32) or
-               0x50000000'u32)
-    rfRegWrite(RfMeasureCtrlReg,
-               (rfRegRead(RfMeasureCtrlReg) and not 0x40000000'u32) or
-               0x40000000'u32)
-    rfRegWrite(RfPriRxcalSearchReg,
-               (rfRegRead(RfPriRxcalSearchReg) and 0xFF800FFF'u32) or
-               0x00C00000'u32)
-    rfRegWrite(RfPriRxcalSearchReg,
-               (rfRegRead(RfPriRxcalSearchReg) and not 0x000003FF'u32) or
-               0x00000400'u32)
-    rfRegWrite(0x2000120C'u32,
-               (rfRegRead(0x2000120C'u32) and 0xFC010FFF'u32) or
-               0x00400000'u32)
-    rfRegWrite(0x20001214'u32,
-               (rfRegRead(0x20001214'u32) and 0x003FFFFF'u32) or
-               0x40000000'u32)
-    rfRegWrite(0x20001218'u32, rfRegRead(0x20001218'u32) and 0x003FFFFF'u32)
-    rfRegWrite(0x2000121C'u32, rfRegRead(0x2000121C'u32) and 0xEFFFFFFF'u32)
-    rfRegWrite(0x20001214'u32,
-               (rfRegRead(0x20001214'u32) and not 0x000007FF'u32) or
-               0x00000110'u32)
-    rfRegWrite(0x20001218'u32,
-               (rfRegRead(0x20001218'u32) and not 0x000007FF'u32) or
-               0x00000110'u32)
-    rfRegClear(0x2000120C'u32, 0x80000000'u32)
-    rfRegOr(0x2000120C'u32, 0x80000000'u32)
+    let rxcalReplayA8Word = wlCfgWb03RxcalReplayA8Word()
+    let rxcalReplayAcWord = wlCfgWb03RxcalReplayAcWord()
+    updateReg32(addr rf.txcalTosdac600, not 0x000003FF'u32,
+                (rxcalReplayAcWord and 0x000003FF'u32) or 0x00000400'u32)
+    updateReg32(addr rf.txcalTosdac600, 0xFF800FFF'u32,
+                (((rxcalReplayA8Word shr 4) shl 12) and 0x007FF000'u32) or
+                0x00800000'u32)
+    updateReg32(addr rf.txcalParam74, 0xC100FFFF'u32,
+                (rxcalReplayA8Word shl 24) and 0x3F000000'u32)
+    updateReg32(addr rf.txcalParam74, 0xFFC10FFF'u32,
+                (rxcalReplayA8Word shl 8) and 0x003F0000'u32)
+    updateReg32(addr rf.measureMode61c, 0x0000FFFF'u32, 0x50000000'u32)
+    updateReg32(addr rf.measureCtrl618, not 0x40000000'u32, 0x40000000'u32)
+    updateReg32(addr rf.rxcalSearch614, 0xFF800FFF'u32, 0x00C00000'u32)
+    updateReg32(addr rf.rxcalSearch614, not 0x000003FF'u32, 0x00000400'u32)
+    updateReg32(addr rf.calSingenCtrl20c, 0xFC010FFF'u32, 0x00400000'u32)
+    updateReg32(addr rf.calSingenAmpLo214, 0x003FFFFF'u32, 0x40000000'u32)
+    updateReg32(addr rf.calSingenAmpHi218, 0x003FFFFF'u32, 0'u32)
+    updateReg32(addr rf.calSingenMeasurePrep21c, 0xEFFFFFFF'u32, 0'u32)
+    updateReg32(addr rf.calSingenAmpLo214, not 0x000007FF'u32, 0x00000110'u32)
+    updateReg32(addr rf.calSingenAmpHi218, not 0x000007FF'u32, 0x00000110'u32)
+    updateReg32(addr rf.calSingenCtrl20c, not 0x80000000'u32, 0'u32)
+    updateReg32(addr rf.calSingenCtrl20c, not 0x80000000'u32, 0x80000000'u32)
     rfPhyTraceCheckpoint(0x31'u32)
 
   proc runRfPriRxcal() =
     if rfCalibDataGlobal == nil:
       return
+    let rf = rfRegs()
     inc nim_wifi_rf_pri_rxcal_count
-    rfRegWrite(RfCalModeReg,
-               (rfRegRead(RfCalModeReg) and not RfRxcalModeMask) or
-               RfRxcalStartMode)
+    updateReg32(addr rf.calMode14, not RfRxcalModeMask, RfRxcalStartMode)
     let saved = saveRfPriCalState()
     prepareRfPriRxcal()
 
-    let p2a = searchRfRxcalParam(2'u32, 0x400'i32, 0x40'i32)
-    let p3a = searchRfRxcalParam(3'u32, 0'i32, 0x20'i32)
-    let p2b = searchRfRxcalParam(2'u32, p2a.value, 0x20'i32)
-    let p3b = searchRfRxcalParam(3'u32, p3a.value, 0x10'i32)
-    let power = p2a.power or p3a.power or p2b.power or p3b.power
+    let rxcalParam2Coarse = searchRfRxcalParam(2'u32, 0x400'i32, 0x40'i32)
+    let rxcalParam3Coarse = searchRfRxcalParam(3'u32, 0'i32, 0x20'i32)
+    let rxcalParam2Refined =
+      searchRfRxcalParam(2'u32, rxcalParam2Coarse.value, 0x20'i32)
+    let rxcalParam3Refined =
+      searchRfRxcalParam(3'u32, rxcalParam3Coarse.value, 0x10'i32)
+    let power = rxcalParam2Coarse.power or rxcalParam3Coarse.power or
+      rxcalParam2Refined.power or rxcalParam3Refined.power
 
     rfPriSeedRxcalRestoreLowHalves()
     for i in 0 ..< 4:
-      storeRfRxcalRecord(i, p2b.value, p3b.value, power)
+      storeRfRxcalRecord(
+        i, rxcalParam2Refined.value, rxcalParam3Refined.value, power)
 
     restoreRfPriCalState(saved)
     rfPriReplayRxcalRegs()
@@ -12007,59 +12579,66 @@ when defined(bl808WifiUseBl808Rf):
     # search register armed and measure control ready.  The search loop above
     # otherwise leaves the last candidate in 0x1614 and clears 0x1618, which
     # correlates with a silent RX DMA path during active scan.
-    rfRegWrite(RfPriRxcalSearchReg, 0x00400000'u32)
-    rfRegWrite(RfMeasureCtrlReg, 0x80000000'u32)
-    if p2a.ok and p3a.ok and p2b.ok and p3b.ok:
-      rfRegWrite(RfCalModeReg,
-                 (rfRegRead(RfCalModeReg) and not RfRxcalModeMask) or
-                 RfRxcalDoneMode)
+    volatileStore(addr rf.rxcalSearch614, 0x00400000'u32)
+    volatileStore(addr rf.measureCtrl618, 0x80000000'u32)
+    if rxcalParam2Coarse.ok and rxcalParam3Coarse.ok and
+        rxcalParam2Refined.ok and rxcalParam3Refined.ok:
+      updateReg32(addr rf.calMode14, not RfRxcalModeMask, RfRxcalDoneMode)
     rfPhyTraceCheckpoint(0x32'u32)
 
-  proc rfPriApplyTxcalRecordToTable(words: var array[43, uint32],
+  proc rfPriApplyTxcalRecordToTable(txPowerTableWords: var array[43, uint32],
                                     tableIndex, record: int) =
-    let word0 = rfCalibWord(RfPriTxcalRecordBaseWord + record * 2)
-    let word1 = rfCalibWord(RfPriTxcalRecordBaseWord + record * 2 + 1)
-    if word0 == 0'u32 and word1 == 0'u32:
+    ## Vendor rf_pri_txcal_w2reg always writes these fields. The pure path
+    ## preserves base-table words for empty records until TXCAL is bit-for-bit.
+    let txcalRecordWord0 = rfCalibWord(RfCalibTxcalRecordBaseWord + record * 2)
+    let txcalRecordWord1 =
+      rfCalibWord(RfCalibTxcalRecordBaseWord + record * 2 + 1)
+    if txcalRecordWord0 == 0'u32 and txcalRecordWord1 == 0'u32:
       return
-    let p0 = word0 and 0x3F'u32
-    let p1 = (word0 shr 8) and 0x3F'u32
-    let p2 = (word0 shr 16) and 0x7FF'u32
-    let p3 = word1 and 0x3FF'u32
-    words[tableIndex] = (words[tableIndex] and 0xFFFFF800'u32) or p2
-    words[tableIndex + 1] = (words[tableIndex + 1] and 0xFF000003'u32) or
-      (p3 shl 14) or (p0 shl 8) or (p1 shl 2)
+    let txcalParam0 = txcalRecordWord0 and 0x3F'u32
+    let txcalParam1 = (txcalRecordWord0 shr 8) and 0x3F'u32
+    let txcalParam2 = (txcalRecordWord0 shr 16) and 0x7FF'u32
+    let txcalParam3 = txcalRecordWord1 and 0x3FF'u32
+    txPowerTableWords[tableIndex] =
+      (txPowerTableWords[tableIndex] and 0xFFFFF800'u32) or txcalParam2
+    txPowerTableWords[tableIndex + 1] =
+      (txPowerTableWords[tableIndex + 1] and 0xFF000003'u32) or
+        (txcalParam3 shl 14) or (txcalParam0 shl 8) or (txcalParam1 shl 2)
 
-  proc rfPriApplyBzTxcalRecordToTable(words: var array[43, uint32],
+  proc rfPriApplyBzTxcalRecordToTable(txPowerTableWords: var array[43, uint32],
                                       start, record: int) =
-    let offset = 0xF8 + record * 8
-    let p0 = rfCalibByte(offset).uint32 and 0x3F'u32
-    let p1 = rfCalibByte(offset + 1).uint32 and 0x3F'u32
-    let p2 = rfCalibHalf((offset + 2) div 2).uint32 and 0x07FF'u32
-    let p3 = rfCalibHalf((offset + 4) div 2).uint32 and 0x03FF'u32
-    if (p0 or p1 or p2 or p3) == 0'u32:
+    ## Vendor rf_pri_bz_txcal_w2reg always writes these fields. The pure path
+    ## preserves base-table words for empty records until BZ TXCAL is validated.
+    let bzTxcalRecordWord0 = rfCalibBzTxcalRecordWord0(record)
+    let bzTxcalRecordWord1 = rfCalibBzTxcalRecordWord1(record)
+    let txcalParam0 = bzTxcalRecordWord0 and 0x3F'u32
+    let txcalParam1 = (bzTxcalRecordWord0 shr 8) and 0x3F'u32
+    let txcalParam2 = (bzTxcalRecordWord0 shr 16) and 0x07FF'u32
+    let txcalParam3 = bzTxcalRecordWord1 and 0x03FF'u32
+    if (txcalParam0 or txcalParam1 or txcalParam2 or txcalParam3) == 0'u32:
       return
-    words[start] = (words[start] and 0xFFFFF800'u32) or p2
-    words[start + 1] = (words[start + 1] and 0xFF000003'u32) or
-      (p3 shl 14) or (p0 shl 8) or (p1 shl 2)
+    txPowerTableWords[start] =
+      (txPowerTableWords[start] and 0xFFFFF800'u32) or txcalParam2
+    txPowerTableWords[start + 1] =
+      (txPowerTableWords[start + 1] and 0xFF000003'u32) or
+        (txcalParam3 shl 14) or (txcalParam0 shl 8) or (txcalParam1 shl 2)
 
   proc rfPriSeedBzTxcalFallbackRecords() =
     ## rf_pri_bz_txcal writes these defaults when the BZ search path fails:
-    ## p0=0x20, p1=0x20, p2=0x400, p3=0 at rf_calib_data+0xF8+n*8.
+    ## param0=0x20, param1=0x20, param2=0x400, param3=0 at the BZ TXCAL
+    ## calibration-record block.
     ## A fresh pure-Nim cold init skips BZ TXCAL, but restore still replays the
     ## BZ power-table records. Seed only empty records to match vendor fallback.
     if rfCalibDataGlobal == nil:
       return
     for record in 0 ..< 9:
-      let offset = 0xF8 + record * 8
-      let p0 = rfCalibByte(offset).uint32
-      let p1 = rfCalibByte(offset + 1).uint32
-      let p2 = rfCalibHalf((offset + 2) div 2).uint32
-      let p3 = rfCalibHalf((offset + 4) div 2).uint32
-      if (p0 or p1 or p2 or p3) == 0'u32:
-        rfCalibSetByte(offset, 0x20'u8)
-        rfCalibSetByte(offset + 1, 0x20'u8)
-        rfCalibSetHalf((offset + 2) div 2, 0x0400'u16)
-        rfCalibSetHalf((offset + 4) div 2, 0x0000'u16)
+      let bzTxcalRecordWord0 = rfCalibBzTxcalRecordWord0(record)
+      let bzTxcalRecordWord1 = rfCalibBzTxcalRecordWord1(record)
+      if (bzTxcalRecordWord0 or bzTxcalRecordWord1) == 0'u32:
+        rfCalibStoreBzTxcalRecordWords(
+          record,
+          packRfTxcalCalWord0(0x20'i32, 0x20'i32, 0x400'i32),
+          packRfTxcalCalWord1(0'i32))
     rfPriSnapshotBzTxcalState(0xB0'u32)
 
   proc rfPriWriteTxPowerTable() =
@@ -12068,19 +12647,38 @@ when defined(bl808WifiUseBl808Rf):
     ## the base table, matching a fresh zeroed wl_cal restore.
     let wb03Xtal40 = rfPriIsWb03() and
       bl808RfXtalIndex == xtalIndex(WlXtal40M)
-    var words =
+    var txPowerTableWords =
       if wb03Xtal40:
         RfPriWb03TxPowerRegisterBaseline
       else:
         RfPriTxPowerRegisterBase
     if rfCalibDataGlobal != nil and not wb03Xtal40:
       for slot, record in RfPriTxcalReplayRecordIds:
-        rfPriApplyTxcalRecordToTable(words, 3 + slot * 2, record)
+        rfPriApplyTxcalRecordToTable(
+          txPowerTableWords, 3 + slot * 2, record)
       for i in 0 ..< RfPriBzTxcalRecordIds.len:
-        rfPriApplyBzTxcalRecordToTable(words,
+        rfPriApplyBzTxcalRecordToTable(txPowerTableWords,
           RfPriBzTxcalTableStarts[i], RfPriBzTxcalRecordIds[i])
     rfPriSnapshotBzTxcalState(0xB1'u32)
-    writeRadioMemoryWords(0x20001700'u32, words)
+    writeRfTxPowerCompTable(txPowerTableWords)
+
+  proc writeRfPriGainInit() =
+    ## Typed port of librf_bl808.a:rf_pri.c.o rf_pri_gain_table_WR2REG.
+    ## Programs the recovered RF gain-table words and then applies the same
+    ## synthesizer/init latches formerly held in RfPriGainInit.
+    let rf = rfRegs()
+    updateReg32(addr rf.rfGainTable760, 0xFF000000'u32, 0x00003189'u32)
+    updateReg32(addr rf.rfGainTable75c, 0xFF000000'u32, 0x0030F495'u32)
+    updateReg32(addr rf.rfGainTable79c, 0xC00007FF'u32, 0xD037D000'u32)
+    updateReg32(addr rf.rfGainTable794, 0xC00007FF'u32, 0xD06FF000'u32)
+    updateReg32(addr rf.rfGainTable78c, 0xC00007FF'u32, 0xD077E000'u32)
+    updateReg32(addr rf.rfGainTable784, 0xC00007FF'u32, 0x10940000'u32)
+    updateReg32(addr rf.rfGainTable77c, 0xC00007FF'u32, 0x109C0000'u32)
+    updateReg32(addr rf.rfGainTable774, 0xC00007FF'u32, 0x11180000'u32)
+    updateReg32(addr rf.rfGainTable76c, 0xC00007FF'u32, 0x115C0000'u32)
+    updateReg32(addr rf.rfGainTable764, 0xC00007FF'u32, 0x11FC0000'u32)
+    updateReg32(addr rf.synthCtrl2c, 0xFFFFFFFF'u32, 0x00004007'u32)
+    updateReg32(addr rf.synthDfePathControl63c, 0xFFFFFFFF'u32, 0x00008080'u32)
 
   proc rfCalibSeedDefaultVcoIfEmpty() =
     ## The vendor restore path expects wl_cal halfwords 14..34 to contain
@@ -12090,10 +12688,10 @@ when defined(bl808WifiUseBl808Rf):
       return
     let halfwords = cast[ptr UncheckedArray[uint16]](rfCalibDataGlobal)
     for i in 0 ..< RfPriDefaultVcoCal40M.len:
-      if halfwords[i + 14] != 0'u16:
+      if halfwords[i + RfCalibLoVcoHalfwordBase] != 0'u16:
         return
     for i, value in RfPriDefaultVcoCal40M:
-      halfwords[i + 14] = value
+      halfwords[i + RfCalibLoVcoHalfwordBase] = value
 
   proc rfCalibWriteDefaultVco40M() =
     ## Cold LO calibration is not bit-for-bit with the vendor firmware yet.
@@ -12102,7 +12700,7 @@ when defined(bl808WifiUseBl808Rf):
       return
     let halfwords = cast[ptr UncheckedArray[uint16]](rfCalibDataGlobal)
     for i, value in RfPriDefaultVcoCal40M:
-      halfwords[i + 14] = value
+      halfwords[i + RfCalibLoVcoHalfwordBase] = value
 
   proc rfPriRestoreCalReg() =
     ## Port of librf_bl808.a:rf_pri.c.o rf_pri_restore_cal_reg register replay.
@@ -12110,24 +12708,25 @@ when defined(bl808WifiUseBl808Rf):
     ## 0x1070 and 0x1170..0x117c, plus WLAN/BZ TX-cal power table replay.
     if not rfCalibHasRestoreData():
       return
-    let w8 = rfCalibWord(2)
-    updateReg32(cast[ptr uint32](RfBase + 0x168'u), 0xC0C0C0C0'u32,
+    let rf = rfRegs()
+    let rccalReplayWord = rfCalibWord(RfCalibRccalReplayWordIndex)
+    updateReg32(addr rf.roscalCal0, 0xC0C0C0C0'u32,
                 (rfCalibWord(18) and 0x3F'u32) or
                 (((rfCalibWord(18) shr 8) and 0x3F'u32) shl 8) or
                 ((rfCalibWord(20) and 0x3F'u32) shl 16) or
                 (((rfCalibWord(20) shr 8) and 0x3F'u32) shl 24))
-    updateReg32(cast[ptr uint32](RfBase + 0x16C'u), 0xC0C0C0C0'u32,
+    updateReg32(addr rf.roscalCal1, 0xC0C0C0C0'u32,
                 (rfCalibWord(22) and 0x3F'u32) or
                 (((rfCalibWord(22) shr 8) and 0x3F'u32) shl 8) or
                 ((rfCalibWord(24) and 0x3F'u32) shl 16) or
                 (((rfCalibWord(24) shr 8) and 0x3F'u32) shl 24))
-    updateReg32(cast[ptr uint32](RfBase + 0x084'u), 0xC0C0C0C0'u32,
-                ((w8 and 0x3F'u32) shl 24) or
-                (((w8 shr 6) and 0x3F'u32) shl 16) or
-                (((w8 shr 12) and 0x3F'u32) shl 8) or
-                ((w8 shr 18) and 0x3F'u32))
-    updateReg32(cast[ptr uint32](RfBase + 0x070'u), 0xFFFFFFF0'u32,
-                (rfCalibWord(3) shr 24) and 0xF'u32)
+    updateReg32(addr rf.rccalReplay84, 0xC0C0C0C0'u32,
+                ((rccalReplayWord and 0x3F'u32) shl 24) or
+                (((rccalReplayWord shr 6) and 0x3F'u32) shl 16) or
+                (((rccalReplayWord shr 12) and 0x3F'u32) shl 8) or
+                ((rccalReplayWord shr 18) and 0x3F'u32))
+    updateReg32(addr rf.txcalParam70, 0xFFFFFFF0'u32,
+                rfPriRf70ReplayWindow0Nibble())
     rfPriSnapshotStage(0xF200'u32)
     rfPriWriteTxPowerTable()
     rfPriSnapshotStage(0xF201'u32)
@@ -12153,45 +12752,72 @@ when defined(bl808WifiUseBl808Rf):
     elif clipped < -16'i16:
       clipped = -16'i16
     let tx = rfSignExtend16(bl808RfTxGainComp.int32 + clipped.int32)
-    updateReg32(cast[ptr uint32](RfBase + 0x704'u), 0x00FFFFFF'u32,
+    let rf = rfRegs()
+    updateReg32(addr rf.txPowerComp704, 0x00FFFFFF'u32,
                 (uint32(uint16(tx)) and 0xFF'u32) shl 24)
-    updateReg32(cast[ptr uint32](RfBase + 0x7AC'u), 0xFFFFFF00'u32,
+    updateReg32(addr rf.txPowerComp7ac, 0xFFFFFF00'u32,
                 uint32(uint16(rfSignExtend16(tx.int32 - 4'i32))) and 0xFF'u32)
 
   proc rf_pri_input_xtalfreq(xtalfreqHz: uint32) {.exportc, cdecl.} =
     ## Local replacement for rf_pri.c.o rf_pri_input_xtalfreq.
-    ## Recovered: exact xtal constants and classification. Remaining unknown:
-    ## private rf_pri.c.o xtal flag globals are not yet represented because the
-    ## next layer uses the typed `bl808RfXtalIndex` state instead.
+    ## Recovered: exact xtal constants plus the six private vendor flag
+    ## globals xtal24m/26m/32m/38p4m/40m/52m.
+    bl808RfPriXtal24mFlag = 0
+    bl808RfPriXtal26mFlag = 0
+    bl808RfPriXtal32mFlag = 0
+    bl808RfPriXtal38p4mFlag = 0
+    bl808RfPriXtal40mFlag = 0
+    bl808RfPriXtal52mFlag = 0
     bl808RfXtalIndex = xtalIndex(xtalfreqHz)
+    case xtalfreqHz
+    of WlXtal24M:
+      bl808RfPriXtal24mFlag = 1
+    of WlXtal26M:
+      bl808RfPriXtal26mFlag = 1
+    of WlXtal32M:
+      bl808RfPriXtal32mFlag = 1
+    of WlXtal38P4M:
+      bl808RfPriXtal38p4mFlag = 1
+    of WlXtal40M:
+      bl808RfPriXtal40mFlag = 1
+    of WlXtal52M:
+      bl808RfPriXtal52mFlag = 1
+    else:
+      discard
 
   proc rfPriXtalRefdivRatio(): uint32 {.inline.} =
-    case bl808RfXtalIndex
-    of 0'u32, 1'u32:
+    if bl808RfPriXtal24mFlag != 0 or bl808RfPriXtal26mFlag != 0:
       1'u32
-    of 2'u32, 3'u32, 4'u32:
+    elif bl808RfPriXtal32mFlag != 0 or bl808RfPriXtal38p4mFlag != 0 or
+        bl808RfPriXtal40mFlag != 0:
       2'u32
     else:
       0'u32
 
   proc rfPriXtalTenthsMhz(): uint32 {.inline.} =
-    case bl808RfXtalIndex
-    of 0'u32: 240'u32
-    of 1'u32: 260'u32
-    of 2'u32: 320'u32
-    of 3'u32: 384'u32
-    of 5'u32: 800'u32
-    else: 400'u32
+    if bl808RfPriXtal24mFlag != 0:
+      240'u32
+    elif bl808RfPriXtal26mFlag != 0:
+      260'u32
+    elif bl808RfPriXtal32mFlag != 0:
+      320'u32
+    elif bl808RfPriXtal38p4mFlag != 0:
+      384'u32
+    elif bl808RfPriXtal52mFlag != 0:
+      800'u32
+    else:
+      400'u32
 
   proc rfPriWifiPllConfig() =
     ## Port of librf_bl808.a:rf_pri.c.o rf_pri_wifipll_config for BL808's
     ## default device path. The vendor source uses float arithmetic for the
     ## fractional PLL word; the integer form below is equivalent for all known
     ## xtal inputs and keeps this path soft-float free.
+    let rf = rfRegs()
+    let pll = rfPllRegs()
     let refdiv = rfPriXtalRefdivRatio()
-    rfRegWrite(RfPriInit814Reg,
-               (rfRegRead(RfPriInit814Reg) and 0xFFFFF0FF'u32) or
-               ((refdiv shl 8) and 0x00000F00'u32))
+    updateReg32(addr pll.refdivCtrl14, 0xFFFFF0FF'u32,
+                (refdiv shl 8) and 0x00000F00'u32)
 
     let xtalTenths = rfPriXtalTenthsMhz()
     let fracBase = (uint64(refdiv) * 15'u64) shl 25
@@ -12202,97 +12828,88 @@ when defined(bl808WifiUseBl808Rf):
         uint32(fracBase div uint64(xtalTenths div 10'u32))
       else:
         uint32((fracBase * 10'u64) div uint64(xtalTenths))
-    rfRegWrite(RfPriInitPll28Reg,
-               (rfRegRead(RfPriInitPll28Reg) and 0xFC000000'u32) or
-               (frac and 0x03FFFFFF'u32))
+    updateReg32(addr pll.fractionalWord28, 0xFC000000'u32,
+                frac and 0x03FFFFFF'u32)
 
     let wb03Xtal40 = rfPriIsWb03() and
       bl808RfXtalIndex == xtalIndex(WlXtal40M)
     let wb03Xtal26 = rfPriIsWb03() and
       bl808RfXtalIndex == xtalIndex(WlXtal26M)
     if wb03Xtal26:
-      rfRegWrite(RfPriInitPll28Reg,
-                 rfRegRead(RfPriInitPll28Reg) and 0x7BFFFFFF'u32)
-      rfRegWrite(RfPriInitPll2cReg,
-                 rfRegRead(RfPriInitPll2cReg) and 0xFFFFFECF'u32)
-      rfRegWrite(RfOptimizeReg,
-                 rfRegRead(RfOptimizeReg) and 0xFFFFFFF0'u32)
-      rfRegWrite(RfPriInitPll18Reg,
-                 (rfRegRead(RfPriInitPll18Reg) and 0xFFFFFE0F'u32) or
-                 0x00000020'u32)
-      rfRegWrite(RfPriInitPll1cReg,
-                 (rfRegRead(RfPriInitPll1cReg) and 0xFFF80FFE'u32) or
-                 0x00036100'u32)
+      updateReg32(addr pll.fractionalWord28, 0x7BFFFFFF'u32, 0'u32)
+      updateReg32(addr pll.modeCtrl2c, 0xFFFFFECF'u32, 0'u32)
+      updateReg32(addr rf.optimizeCtrlD0, 0xFFFFFFF0'u32, 0'u32)
+      updateReg32(addr pll.loopFilter18, 0xFFFFFE0F'u32, 0x00000020'u32)
+      updateReg32(addr pll.fractionalCtrl1c, 0xFFF80FFE'u32, 0x00036100'u32)
     elif not wb03Xtal40:
-      rfRegOr(RfPriInitPll28Reg, 0x84000000'u32)
-      rfRegOr(RfPriInitPll2cReg, 0x00000130'u32)
-      rfRegWrite(RfOptimizeReg,
-                 (rfRegRead(RfOptimizeReg) and 0xFFFFFFFE'u32) or
-                 0x0000000E'u32)
-      rfRegWrite(RfPriInitPll18Reg,
-                 (rfRegRead(RfPriInitPll18Reg) and 0xFFFFFE0F'u32) or
-                 0x00000020'u32)
-      rfRegWrite(RfPriInitPll1cReg,
-                 (rfRegRead(RfPriInitPll1cReg) and 0xFFF80FFE'u32) or
-                 0x00036100'u32)
-      rfRegWrite(RfPriInitPll2cReg,
-                 (rfRegRead(RfPriInitPll2cReg) and 0xFFFCFFFF'u32) or
-                 0x00010000'u32)
+      updateReg32(addr pll.fractionalWord28, not 0'u32, 0x84000000'u32)
+      updateReg32(addr pll.modeCtrl2c, not 0'u32, 0x00000130'u32)
+      updateReg32(addr rf.optimizeCtrlD0, 0xFFFFFFFE'u32, 0x0000000E'u32)
+      updateReg32(addr pll.loopFilter18, 0xFFFFFE0F'u32, 0x00000020'u32)
+      updateReg32(addr pll.fractionalCtrl1c, 0xFFF80FFE'u32, 0x00036100'u32)
+      updateReg32(addr pll.modeCtrl2c, 0xFFFCFFFF'u32, 0x00010000'u32)
 
-    rfRegWrite(RfPriInitPllResetReg,
-               rfRegRead(RfPriInitPllResetReg) and 0xFFFFFFFA'u32)
-    rfRegOr(RfPriInitPllResetReg, 0x00000001'u32)
-    rfRegOr(RfPriInitPllResetReg, 0x00000004'u32)
-    rfRegWrite(RfPriInitPllReg,
-               (rfRegRead(RfPriInitPllReg) and 0xFFFFFFF3'u32) or
-               0x00001FF3'u32)
+    updateReg32(addr pll.pllReset10, 0xFFFFFFFA'u32, 0'u32)
+    updateReg32(addr pll.pllReset10, not 0'u32, 0x00000001'u32)
+    updateReg32(addr pll.pllReset10, not 0'u32, 0x00000004'u32)
+    updateReg32(addr pll.enableCtrl30, 0xFFFFFFF3'u32, 0x00001FF3'u32)
     for _ in 0 ..< 11:
-      discard rfRegRead(RfPriInitPllReg)
+      discard volatileLoad(addr pll.enableCtrl30)
 
-  proc rfPriEfuseInit() =
-    ## Port of librf_bl808.a:rf_pri.c.o rf_pri_efuse_init.part.0 for the
-    ## BL808 WLAN config bytes at wl_cfg+0xc4..0xc7. Remaining unknown:
-    ## callback-driven temperature compensation tables referenced after
-    ## rf_pri_efuse_init.part.0+0xce.
-    let cfg = cast[ptr WlRfConfig](wlCfgGlobal)
-    if cfg == nil:
-      return
-    let bytes = cast[ptr UncheckedArray[uint8]](cfg)
-    let cap0 = bytes[0xC5]
-    let cap1 = bytes[0xC6]
-    var txCorrRegHigh: uint32
-    var txCorrRegLow: uint32
-    if cap0 != 0x80'u8 and cap1 != 0x80'u8:
-      updateReg32(cast[ptr uint32](RfBase + 0x05C'u), 0xFFE0FC0F'u32,
-                  ((cap0.uint32 shl 16) and 0x001F0000'u32) or
-                  ((cap1.uint32 shl 4) and 0x000003F0'u32))
+  proc rfPriEfuseXtalCapPairValid(cfg: ptr WlRfConfig): bool {.inline.} =
+    cfg.efuseXtalCapCode0 != 0x80'u8 and cfg.efuseXtalCapCode1 != 0x80'u8
+
+  proc rfPriApplyEfuseXtalCapTrim(cfg: ptr WlRfConfig;
+                                  txCorrRegHigh, txCorrRegLow: var uint32) =
+    let efuseXtalCapCode0 = cfg.efuseXtalCapCode0
+    let efuseXtalCapCode1 = cfg.efuseXtalCapCode1
+    let rf = rfRegs()
+    if rfPriEfuseXtalCapPairValid(cfg):
+      updateReg32(addr rf.xtalCapTrim5c, 0xFFE0FC0F'u32,
+                  ((efuseXtalCapCode0.uint32 shl 16) and 0x001F0000'u32) or
+                  ((efuseXtalCapCode1.uint32 shl 4) and 0x000003F0'u32))
       bl808RfEfuseCapComp = -7'i16
       bl808RfEfusePowerComp = -4'i16
       txCorrRegHigh = 0xFC000000'u32
       txCorrRegLow = 0x000000F8'u32
     else:
-      updateReg32(cast[ptr uint32](RfBase + 0x05C'u), 0xFFE0FC0F'u32,
+      updateReg32(addr rf.xtalCapTrim5c, 0xFFE0FC0F'u32,
                   0x00100200'u32)
       bl808RfEfuseCapComp = -3'i16
       bl808RfEfusePowerComp = 0'i16
       txCorrRegHigh = 0'u32
       txCorrRegLow = 0x000000FC'u32
-    let pwrByte = bytes[0xC4]
+
+  proc rfPriApplyEfuseTxGainTrim(cfg: ptr WlRfConfig) =
+    let efuseTxGainByte = cfg.efuseTxGainComp
     bl808RfTxGainComp =
-      if pwrByte == 0'u8: 1'i16
-      else: cast[int8](pwrByte).int16
-    bl808RfTempPowerComp = rfSignedByte(bytes[0xBD])
-    let dfeTrim = bytes[0xC7]
-    if dfeTrim != 0x80'u8:
-      updateReg32(cast[ptr uint32](RfPriInitDfeReg824.uint),
-                  0xFFFFFFF0'u32, dfeTrim.uint32 and 0xF'u32)
+      if efuseTxGainByte == 0'u8: 1'i16
+      else: cast[int8](efuseTxGainByte).int16
+    bl808RfTempPowerComp = rfSignedByte(cfg.temperaturePowerComp)
+
+  proc rfPriApplyEfuseDfeTrim(cfg: ptr WlRfConfig) =
+    let efuseDfeTrimNibble = cfg.efuseDfeTrim
+    let dfe = rfDfeInitRegs()
+    if efuseDfeTrimNibble != 0x80'u8:
+      updateReg32(addr dfe.dfeTrim824, 0xFFFFFFF0'u32,
+                  efuseDfeTrimNibble.uint32 and 0xF'u32)
     else:
-      updateReg32(cast[ptr uint32](RfPriInitDfeReg824.uint),
-                  0xFFFFFFF0'u32, 0x4'u32)
-    updateReg32(cast[ptr uint32](RfBase + 0x704'u), 0x00FFFFFF'u32,
-                txCorrRegHigh)
-    updateReg32(cast[ptr uint32](RfBase + 0x7AC'u), 0xFFFFFF00'u32,
-                txCorrRegLow)
+      updateReg32(addr dfe.dfeTrim824, 0xFFFFFFF0'u32, 0x4'u32)
+
+  proc rfPriEfuseInit() =
+    ## Port of librf_bl808.a:rf_pri.c.o rf_pri_efuse_init.part.0 for the
+    ## BL808 WLAN RF trim fields at wl_cfg+0xc4..0xc7.
+    let cfg = cast[ptr WlRfConfig](wlCfgGlobal)
+    if cfg == nil:
+      return
+    var txCorrRegHigh: uint32
+    var txCorrRegLow: uint32
+    let rf = rfRegs()
+    rfPriApplyEfuseXtalCapTrim(cfg, txCorrRegHigh, txCorrRegLow)
+    rfPriApplyEfuseTxGainTrim(cfg)
+    rfPriApplyEfuseDfeTrim(cfg)
+    updateReg32(addr rf.txPowerComp704, 0x00FFFFFF'u32, txCorrRegHigh)
+    updateReg32(addr rf.txPowerComp7ac, 0xFFFFFF00'u32, txCorrRegLow)
 
   proc runRfPriFullCalRestoreBaseline() =
     ## Porting boundary for librf_bl808.a:rf_pri.c.o rf_pri_full_cal.
@@ -12317,7 +12934,7 @@ when defined(bl808WifiUseBl808Rf):
     rfPriSeedRxcalRestoreLowHalves()
     rfPriRestoreCalReg()
     rfPriSnapshotStage(0xF301'u32)
-    rfPriApplyWb03Rf70ColdSeed()
+    rfPriReplayWb03Rf70FromTxcalCalWords()
     rfPriApplyWb03RccalSeed()
     rfPriApplyWb03RxcalTosdacLatch()
     rfPriSnapshotStage(0xF302'u32)
@@ -12327,72 +12944,74 @@ when defined(bl808WifiUseBl808Rf):
     ## Recovered: fixed RF defaults, wifipll/static register phase, full-cal
     ## order, and the rf_pri_gain_table_WR2REG follow-up.
     ##
-    ## Remaining calibration deltas:
-    ## - callback-driven temperature compensation and low-power variants.
-    ## - RF70/RFA0/RFB4 are calibration/channel-state derived. LLVM disassembly
-    ##   ruled out rf_pri_fixed_val_regs' WB03 branch as the source of their
-    ##   late values, and JTAG/UART traces show RF88/RFD0 now match the scan and
-    ##   auth paths. Keep these registers observable through rfPriSnapshotStage
-    ##   and avoid masking calibration gaps with unconditional RFC-entry seeds.
+    ## Remaining calibration deltas, tied to LLVM objdump offsets:
+    ## - librf_bl808.a:rf_pri.c.o rf_pri_full_cal+0x36..0x5e gates the
+    ##   optional ROSCAL/RCCAL branches from RF capability bits; runRfPriRoscal
+    ##   and runRfPriRccal preserve those RF[0x20] gates. Callback-driven
+    ##   temperature compensation and low-power variants remain unrecovered.
+    ## - librf_bl808.a:rf_pri.c.o rf_pri_txcal+0x316..0x52a measures RF70
+    ##   replay-source windows. We run that strongest-candidate search for
+    ##   diagnostics, but applying measured windows is default-off until the
+    ##   earlier TXCAL measurement setup is bit-for-bit recovered.
+    ## - librf_bl808.a:rf_pri.c.o rf_pri_restore_cal_reg+0x10c..0x1a8 replays
+    ##   RF70 and RXCAL words from calibration memory. RF70/RFA0/RFB4 remain
+    ##   calibration/channel-state derived; rf_pri_fixed_val_regs' WB03 branch
+    ##   is not their late-value source, and JTAG/UART traces show RF88/RFD0
+    ##   now match the scan and auth paths. Keep these registers observable
+    ##   through rfPriSnapshotStage and avoid masking calibration gaps with
+    ##   unconditional RFC-entry seeds.
     nim_wifi_rf_pri_init_entry_breakpoint()
     bl808RfColdInit = coldInit
-    bl808RfMode =
-      case mode
-      of 2'u32: bleOnly
-      of 3'u32: wifiBleCoex
-      else: wifiOnly
+    bl808RfMode = radioPhyModeFromApi(uint8(mode and 0xFF'u32))
     rfPriEnsureDeviceInfo()
     rfCalibDataGlobal = wlCalGlobal
     let needsFullCal = coldInit != 0'u32 or not rfCalibHasTxcalData()
     if not needsFullCal:
       rfCalibSeedDefaultVcoIfEmpty()
-    updateReg32(cast[ptr uint32](RfPriInitDfeReg824.uint), 0x9FFFFFFF'u32,
+    updateReg32(addr rfDfeInitRegs().dfeTrim824, 0x9FFFFFFF'u32,
                 0x40000000'u32)
     rfPriEfuseInit()
     rfPriSnapshotStage(0xF400'u32)
-    writeRfPriFixedValInit()
-    writeRadioRegMaskInit(RfPriStaticInit)
+    writeRfPriFixedValueRegs()
+    writeRfPriStaticInit()
     rfPriSnapshotStage(0xF401'u32)
     rfPriWifiPllConfig()
     rfPriSnapshotStage(0xF402'u32)
     rfPhyTraceCheckpoint(0x21'u32)
     rfPriApplyWb03RuntimeLatches()
     rfPriSnapshotStage(0xF403'u32)
-    updateReg32(cast[ptr uint32](RfPriInit90Reg.uint), not 0'u32, 0x1'u32)
-    updateReg32(cast[ptr uint32](RfRxModeReg.uint), 0xFFFFE67D'u32, 0'u32)
-    updateReg32(cast[ptr uint32](RfRxModeReg.uint), 0xFFFFFF9E'u32, 0'u32)
+    let rf = rfRegs()
+    updateReg32(addr rf.calPathCtrl90, not 0'u32, 0x1'u32)
+    updateReg32(addr rf.rxMode220, 0xFFFFE67D'u32, 0'u32)
+    updateReg32(addr rf.rxMode220, 0xFFFFFF9E'u32, 0'u32)
     if needsFullCal:
       runRfPriFullCalRestoreBaseline()
       rfPriSnapshotStage(0xF404'u32)
     elif coldInit == 0'u32:
       rfPriRestoreCalReg()
       rfPriSnapshotStage(0xF405'u32)
-      rfPriApplyWb03Rf70ColdSeed()
+      rfPriReplayWb03Rf70FromTxcalCalWords()
       rfPriApplyWb03RccalSeed()
       rfPriApplyWb03RxcalTosdacLatch()
       rfPriSnapshotStage(0xF406'u32)
-    writeRadioRegMaskInit(RfPriGainInit)
+    writeRfPriGainInit()
     rfPriSnapshotStage(0xF407'u32)
     rfPriWriteTxPowerTable()
     rfPriSnapshotStage(0xF408'u32)
     rfPriApplyWb03RccalSeed()
     rfPriApplyWb03RxcalTosdacLatch()
     rfPriSnapshotStage(0xF409'u32)
-    updateReg32(cast[ptr uint32](RfSynthCtrlReg.uint), not 0'u32, 0x6'u32)
-    updateReg32(cast[ptr uint32](RfSynthCtrlReg.uint), not 0'u32, 0x4001'u32)
-    updateReg32(cast[ptr uint32](RfPriInit163cReg.uint), not 0'u32, 0x8080'u32)
-    updateReg32(cast[ptr uint32](RfRxModeReg.uint), not 0x600'u32, 0'u32)
+    updateReg32(addr rf.synthCtrl2c, not 0'u32, 0x6'u32)
+    updateReg32(addr rf.synthCtrl2c, not 0'u32, 0x4001'u32)
+    updateReg32(addr rf.synthDfePathControl63c, not 0'u32, 0x8080'u32)
+    updateReg32(addr rf.rxMode220, not 0x600'u32, 0'u32)
     rfPriSnapshotStage(0xF40A'u32)
     rfPriApplyWb03RfcEntryBaseline()
     rfPriSnapshotStage(0xF40B'u32)
     rfPhyTraceCheckpoint(0x22'u32)
 
   proc rf_pri_config_mode(mode: uint32) {.exportc, cdecl.} =
-    bl808RfMode =
-      case mode
-      of 2'u32: bleOnly
-      of 3'u32: wifiBleCoex
-      else: wifiOnly
+    bl808RfMode = radioPhyModeFromApi(uint8(mode and 0xFF'u32))
 
   proc rf_pri_update_param(channelMhz: uint32) {.exportc, cdecl.} =
     bl808RfChannelMhz = channelMhz
@@ -12414,12 +13033,16 @@ when defined(bl808WifiUseBl808Rf):
     let notchWord =
       uint32(((uint64(notchParam) * 2048'u64 + 20_000_000'u64) div
         40_000_000'u64) and 0x07FF'u64)
-    let regAddr = uint32(RfBase + 0x680'u)
-    var word = rfRegRead(regAddr)
-    word = (word and 0x87FFFFFF'u32) or 0x08000000'u32
-    word = (word and 0xF800FFFF'u32) or ((notchWord shl 16) and 0x07FF0000'u32)
-    word = (word and 0x7FFFFFFF'u32) or (uint32(notchEnable and 1'u8) shl 31)
-    rfRegWrite(regAddr, word)
+    let rf = rfRegs()
+    var notchCtrlWord = volatileLoad(addr rf.notchCtrl680)
+    notchCtrlWord = (notchCtrlWord and 0x87FFFFFF'u32) or 0x08000000'u32
+    notchCtrlWord =
+      (notchCtrlWord and 0xF800FFFF'u32) or
+      ((notchWord shl 16) and 0x07FF0000'u32)
+    notchCtrlWord =
+      (notchCtrlWord and 0x7FFFFFFF'u32) or
+      (uint32(notchEnable and 1'u8) shl 31)
+    volatileStore(addr rf.notchCtrl680, notchCtrlWord)
 
   proc rfPriApplyWb03Non40OptimizePll(channelMhz: uint32) =
     ## LLVM objdump provenance: librf_bl808.a:rf_pri.c.o
@@ -12427,13 +13050,14 @@ when defined(bl808WifiUseBl808Rf):
     ## xtal-40 flag is clear; WB03/40M stays on the default RFD0/RF70 path.
     if not rfPriIsWb03() or bl808RfXtalIndex == xtalIndex(WlXtal40M):
       return
+    let pll = rfPllRegs()
     if channelMhz == RfOptimizeWb03PllEdge0Mhz or
         channelMhz == RfOptimizeWb03PllEdge1Mhz:
-      rfRegUpdate(RfPriInitPll18Reg, 0x000001F0'u32, 0x00000020'u32)
-      rfRegUpdate(RfPriInitPll1cReg, 0x0007F001'u32, 0x00036100'u32)
+      updateReg32(addr pll.loopFilter18, not 0x000001F0'u32, 0x00000020'u32)
+      updateReg32(addr pll.fractionalCtrl1c, not 0x0007F001'u32, 0x00036100'u32)
     else:
-      rfRegUpdate(RfPriInitPll18Reg, 0x000000F0'u32, 0x00000140'u32)
-      rfRegUpdate(RfPriInitPll1cReg, 0x0007F100'u32, 0x0005A001'u32)
+      updateReg32(addr pll.loopFilter18, not 0x000000F0'u32, 0x00000040'u32)
+      updateReg32(addr pll.fractionalCtrl1c, not 0x0007F100'u32, 0x0005A000'u32)
 
   proc rf_pri_optimize(channelMhz: uint32) {.exportc, cdecl.} =
     ## Port of the default rf_pri_optimize path in librf_bl808.a:rf_pri.c.o.
@@ -12447,34 +13071,30 @@ when defined(bl808WifiUseBl808Rf):
       uint32(RfPriStageSnapshotEntries))
     inc nim_wifi_rf_optimize_count
     nim_wifi_rf_optimize_channel_log[traceIdx] = channelMhz
-    nim_wifi_rf_optimize_device_log[traceIdx] =
-      uint32(rfPriIsWb03()) or
-      (bl808RfDeviceBl616.uint32 shl 4) or
-      (bl808RfDeviceBl618m.uint32 shl 8) or
-      ((bl808RfXtalIndex and 0xFF'u32) shl 16)
-    var word = regRead(RfOptimizeReg.uint)
+    nim_wifi_rf_optimize_device_log[traceIdx] = rfPriDeviceTraceWord()
+    let rf = rfRegs()
+    var word = volatileLoad(addr rf.optimizeCtrlD0)
     if channelMhz >= RfOptimizeMidBandFirstMhz and
         channelMhz <= RfOptimizeMidBandLastMhz:
       word = word and not RfOptimizeMidBandMask
     else:
       word = word or RfOptimizeMidBandMask
-    regWrite(RfOptimizeReg.uint, word)
+    volatileStore(addr rf.optimizeCtrlD0, word)
     nim_wifi_rf_optimize_rfd0_log[traceIdx] = word
     if rfCalibDataGlobal != nil:
       let useWord4 = channelMhz >= RfOptimizeTxcalFirstMhz and
         channelMhz <= RfOptimizeTxcalLastMhz
       let txcalNibble =
         if useWord4:
-          (rfCalibWord(4) shr 4) and 0xF'u32
+          rfPriRf70ReplayWindow2Nibble()
         else:
-          (rfCalibWord(3) shr 24) and 0xF'u32
+          rfPriRf70ReplayWindow0Nibble()
       nim_wifi_rf_optimize_nibble_log[traceIdx] =
         txcalNibble or (uint32(useWord4) shl 8)
-      updateReg32(cast[ptr uint32](RfTxcalParamReg.uint), 0xFFFFFFF0'u32,
-                  txcalNibble)
+      updateReg32(addr rf.txcalParam70, 0xFFFFFFF0'u32, txcalNibble)
     else:
       nim_wifi_rf_optimize_nibble_log[traceIdx] = 0xFFFF_FFFF'u32
-    nim_wifi_rf_optimize_rf70_log[traceIdx] = regRead(RfTxcalParamReg.uint)
+    nim_wifi_rf_optimize_rf70_log[traceIdx] = volatileLoad(addr rf.txcalParam70)
     rfPriApplyWb03Non40OptimizePll(channelMhz)
 
   proc rf_pri_set_channel_pwr_comp(channelIndex: uint32) {.exportc, cdecl.} =
@@ -12485,8 +13105,9 @@ when defined(bl808WifiUseBl808Rf):
     if cfg == nil:
       return
     for i in 0 ..< 14:
-      bl808RfChannelPowerComp[i] = rfSignedByte(cfg.priZeroA1[i])
-      bl808RfChannelLpPowerComp[i] = rfSignedByte(cfg.priZeroA2[i])
+      bl808RfChannelPowerComp[i] = rfSignedByte(cfg.channelPowerComp[i])
+      bl808RfChannelLpPowerComp[i] =
+        rfSignedByte(cfg.channelLowPowerComp[i])
     bl808RfTotalPowerComp = 0'i16
     bl808RfAppliedPowerComp = bl808RfTotalPowerComp
     rfPriWriteTotalPowerComp(channelIndex)
@@ -12500,7 +13121,7 @@ when defined(bl808WifiUseBl808Rf):
 
   proc rfPriVcoCalWord(channelMhz: uint32): uint32 =
     ## Port of rf_pri.c.o rf_pri_get_vco_{freq,idac}_cw.
-    ## The vendor body reads rf_calib_data halfword[index + 14], where
+    ## The vendor body reads the VCO table at rf_calib_data halfword[14 + index], where
     ## index = min(((channelMhz - 2402) >> 2), 20).
     if rfCalibDataGlobal == nil:
       return 0'u32
@@ -12510,7 +13131,7 @@ when defined(bl808WifiUseBl808Rf):
     if index > 20'u32:
       index = 20'u32
     let halfwords = cast[ptr UncheckedArray[uint16]](rfCalibDataGlobal)
-    halfwords[index + 14'u32].uint32
+    halfwords[index + RfCalibLoVcoHalfwordBase.uint32].uint32
 
   proc rf_pri_get_vco_freq_cw(channelMhz: uint32): uint32 {.exportc, cdecl.} =
     (rfPriVcoCalWord(channelMhz) shr 8) and 0xFF'u32
@@ -12526,14 +13147,14 @@ when defined(bl808WifiUseBl808Rf):
     ## Port of librf_bl808.a:rfc.c.o modem_init_core+0x128..0x19e.
     ## Packs two channel control words per RF register at
     ## 0x2000113C..0x20001160, then writes the 2484 MHz slot at 0x20001164.
+    let rf = rfRegs()
     var channelMhz = 2404'u32
     for i in 0'u ..< 10'u:
       let low = rfcVcoPair(channelMhz)
       let high = rfcVcoPair(channelMhz + 4'u32)
-      volatileStore(cast[ptr uint32](RfBase + 0x13C'u + i * 4'u),
-                    (high shl 16) or low)
+      volatileStore(addr rf.vcoPairTable13c[i], (high shl 16) or low)
       channelMhz += 8'u32
-    volatileStore(cast[ptr uint32](RfBase + 0x164'u), rfcVcoPair(2484'u32))
+    volatileStore(addr rf.vcoPair2484Mhz164, rfcVcoPair(2484'u32))
 
   proc rf_dump_status*() {.exportc, cdecl.} =
     ## The vendor rf.c.o rf_dump_status body is ret-only.
@@ -12545,21 +13166,22 @@ when defined(bl808WifiUseBl808Rf):
     WlCapcodeGetCb = proc(cap: ptr uint8) {.cdecl.}
 
   proc modem_init_core*(xtalfreqHz, restore: uint32) {.exportc, cdecl.}
-  proc modemInitCoreMode(xtalfreqHz, restore: uint32; apiMode: uint8)
+  proc modemInitCoreMode(xtalfreqHz, restoreExistingCalibration: uint32;
+                         mode: RadioPhyMode)
 
   proc configureWlRfConfig(cfg: ptr WlRfConfig; xtalfreqHz: uint32;
-                           apiMode, enFullCal: uint8) =
+                           mode: RadioPhyMode; requestFullCalibration: uint8) =
     if cfg == nil:
       return
     cfg.status = 0
-    cfg.apiMode = apiMode
-    cfg.enParamLoad = 0'u8
-    cfg.enFullCal = enFullCal
-    cfg.reserved07 = 0'u8
+    cfg.apiMode = apiFromRadioPhyMode(mode)
+    cfg.enableParamLoadCallback = 0'u8
+    cfg.requestFullCalibration = requestFullCalibration
+    cfg.enableCapcodeSetCallback = 0'u8
     cfg.xtalfreqHz = xtalfreqHz
-    cfg.paramLoad = nil
-    cfg.capcodeSet = nil
-    cfg.capcodeGet = nil
+    cfg.paramLoadCallback = nil
+    cfg.capcodeSetCallback = nil
+    cfg.capcodeGetCallback = nil
 
   proc wl_init*(): int8 {.exportc, cdecl.} =
     ## Port of librf_bl808.a:wl_api.c.o wl_init.
@@ -12570,18 +13192,22 @@ when defined(bl808WifiUseBl808Rf):
     if cfg == nil:
       return -1'i8
     var cbStatus = 0'i8
-    if cfg.enParamLoad != 0'u8 and cfg.paramLoad != nil:
-      cbStatus = cast[WlParamLoadCb](cfg.paramLoad)(addr cfg.xtalfreqHz)
-    if cfg.capcodeSet != nil:
-      let cap0 = uint8(cfg.xtalCap and 0x00FF'u16)
-      let cap1 = uint8((cfg.xtalCap shr 8) and 0x00FF'u16)
+    if cfg.enableParamLoadCallback != 0'u8 and cfg.paramLoadCallback != nil:
+      cbStatus = cast[WlParamLoadCb](cfg.paramLoadCallback)(addr cfg.xtalfreqHz)
+    if cfg.capcodeSetCallback != nil:
+      let cap0 = uint8(cfg.xtalCapCodes and 0x00FF'u16)
+      let cap1 = uint8((cfg.xtalCapCodes shr 8) and 0x00FF'u16)
       if cap0 <= 63'u8 and cap1 <= 63'u8:
-        cast[WlCapcodeSetCb](cfg.capcodeSet)(cap0, cap1)
-    if cfg.capcodeGet != nil:
+        cast[WlCapcodeSetCb](cfg.capcodeSetCallback)(cap0, cap1)
+    if cfg.capcodeGetCallback != nil:
       var cap: uint8
-      cast[WlCapcodeGetCb](cfg.capcodeGet)(addr cap)
-    let restore = if cfg.enFullCal != 0'u8: 0'u32 else: 1'u32
-    modemInitCoreMode(cfg.xtalfreqHz, restore, cfg.apiMode)
+      cast[WlCapcodeGetCb](cfg.capcodeGetCallback)(addr cap)
+    let restoreExistingCalibration =
+      if cfg.requestFullCalibration != 0'u8: 0'u32 else: 1'u32
+    modemInitCoreMode(
+      cfg.xtalfreqHz,
+      restoreExistingCalibration,
+      radioPhyModeFromApi(cfg.apiMode))
     cfg.status = WlRfConfigMagic
     if wlEnvGlobal != nil:
       cast[ptr UncheckedArray[uint8]](wlEnvGlobal)[9] = 0'u8
@@ -12600,22 +13226,22 @@ when defined(bl808WifiUseBl808Rf):
     ## preserving these register phases keeps vendor phy_init from pulling
     ## rfc.c.o and gives the modem path typed RF-plane ownership.
     let rf = rfRegs()
-    updateReg32(addr rf.synthCtrl, 0xFEFFFFFF'u32,
+    updateReg32(addr rf.rbbRccalCtrl80, 0xFEFFFFFF'u32,
                 if bandwidth != 0'u32: 0x01000000'u32 else: 0'u32)
     if bandwidth == 1'u32:
-      updateReg32(cast[ptr uint32](RfBase + 0x94'u), 0xEFFFFFFF'u32, 0x10000000'u32)
-      updateReg32(cast[ptr uint32](RfBase + 0x94'u), 0xDFFFFFFF'u32, 0x20000000'u32)
-      updateReg32(cast[ptr uint32](RfBase + 0x608'u), 0xDFFFFFFF'u32, 0'u32)
-      updateReg32(cast[ptr uint32](RfBase + 0x88'u), 0xFCFFFFFF'u32, 0x03000000'u32)
+      updateReg32(addr rf.bandwidthCtrl94, 0xEFFFFFFF'u32, 0x10000000'u32)
+      updateReg32(addr rf.bandwidthCtrl94, 0xDFFFFFFF'u32, 0x20000000'u32)
+      updateReg32(addr rf.scanSynthControl608, 0xDFFFFFFF'u32, 0'u32)
+      updateReg32(addr rf.txcalDfe88, 0xFCFFFFFF'u32, 0x03000000'u32)
       rf_pri_set_bandwidth(20'u32)
     else:
-      updateReg32(cast[ptr uint32](RfBase + 0x94'u), 0xEFFFFFFF'u32, 0x10000000'u32)
-      updateReg32(cast[ptr uint32](RfBase + 0x94'u), 0xDFFFFFFF'u32, 0'u32)
-      updateReg32(cast[ptr uint32](RfBase + 0x608'u), 0xDFFFFFFF'u32, 0x20000000'u32)
-      updateReg32(cast[ptr uint32](RfBase + 0x88'u), 0xFCFFFFFF'u32, 0x02000000'u32)
+      updateReg32(addr rf.bandwidthCtrl94, 0xEFFFFFFF'u32, 0x10000000'u32)
+      updateReg32(addr rf.bandwidthCtrl94, 0xDFFFFFFF'u32, 0'u32)
+      updateReg32(addr rf.scanSynthControl608, 0xDFFFFFFF'u32, 0x20000000'u32)
+      updateReg32(addr rf.txcalDfe88, 0xFCFFFFFF'u32, 0x02000000'u32)
       rf_pri_set_bandwidth(10'u32)
-    updateReg32(cast[ptr uint32](RfBase + 0x228'u), not 0x4'u32, 0'u32)
-    updateReg32(cast[ptr uint32](RfBase + 0x7C'u), not 0x100'u32, 0'u32)
+    updateReg32(addr rf.channelTuneGate228, not 0x4'u32, 0'u32)
+    updateReg32(addr rf.roscalCtrl7c, not 0x100'u32, 0'u32)
 
   proc rfc_config_channel*(channelMhz: uint32) {.exportc, cdecl.} =
     ## Port of librf_bl808.a:rfc.c.o rfc_config_channel.
@@ -12623,34 +13249,81 @@ when defined(bl808WifiUseBl808Rf):
     ## calculation from LLVM-decoded th.extu at rfc.c.o+0xee..0x118, and
     ## final RF optimize call.
     let rf = rfRegs()
-    updateReg32(cast[ptr uint32](RfBase + 0x228'u), not 0'u32, 0x8'u32)
-    updateReg32(addr rf.modeCtrl, not 0'u32, 0x40'u32)
-    updateReg32(addr rf.modeCtrl, not 0'u32, 0x200'u32)
-    updateReg32(addr rf.modeCtrl, not 0'u32, 0x1'u32)
-    updateReg32(cast[ptr uint32](RfBase + 0x264'u), 0xFFFFF000'u32,
+    updateReg32(addr rf.channelTuneGate228, not 0'u32, 0x8'u32)
+    updateReg32(addr rf.synthCtrl2c, not 0'u32, 0x40'u32)
+    updateReg32(addr rf.synthCtrl2c, not 0'u32, 0x200'u32)
+    updateReg32(addr rf.synthCtrl2c, not 0'u32, 0x1'u32)
+    updateReg32(addr rf.channelFreqMhz264, 0xFFFFF000'u32,
                 channelMhz and 0xFFF'u32)
-    updateReg32(cast[ptr uint32](RfBase + 0x268'u), 0xFFFDFFFF'u32, 0x00020000'u32)
+    updateReg32(addr rf.channelTuneStrobe268, 0xFFFDFFFF'u32, 0x00020000'u32)
     waitRfUs(1)
-    updateReg32(cast[ptr uint32](RfBase + 0x268'u), 0xFFFDFFFF'u32, 0'u32)
+    updateReg32(addr rf.channelTuneStrobe268, 0xFFFDFFFF'u32, 0'u32)
     waitRfUs(1)
     updateReg32(addr rf.baseCtrl1, not 0'u32, 0x2'u32)
     waitRfUs(1)
-    updateReg32(cast[ptr uint32](RfBase + 0x26C'u), not 0x7'u32, 0x1'u32)
+    updateReg32(addr rf.channelTuneCtrl26c, not 0x7'u32, 0x1'u32)
     waitRfUs(1)
-    updateReg32(cast[ptr uint32](RfBase + 0x26C'u), not 0'u32, 0x8'u32)
+    updateReg32(addr rf.channelTuneCtrl26c, not 0'u32, 0x8'u32)
     waitRfUs(1)
-    updateReg32(cast[ptr uint32](RfBase + 0x26C'u), not 0x7'u32, 0x2'u32)
+    updateReg32(addr rf.channelTuneCtrl26c, not 0x7'u32, 0x2'u32)
     waitRfUs(100)
-    updateReg32(cast[ptr uint32](RfBase + 0x26C'u), not 0x8'u32, 0'u32)
+    updateReg32(addr rf.channelTuneCtrl26c, not 0x8'u32, 0'u32)
     waitRfUs(1)
-    updateReg32(cast[ptr uint32](RfBase + 0x228'u), not 0x8'u32, 0'u32)
+    updateReg32(addr rf.channelTuneGate228, not 0x8'u32, 0'u32)
     rf_pri_update_param(channelMhz)
     rfPriApplyNotchParam(channelMhz)
     rf_pri_set_channel_pwr_comp(channelPowerIndex(channelMhz))
     rf_pri_optimize(channelMhz)
     rfPhyTraceCheckpoint(0x40'u32)
 
-  proc modemInitCoreMode(xtalfreqHz, restore: uint32; apiMode: uint8) =
+  proc programRfcModemLateInit() =
+    ## Typed portion of librf_bl808.a:rfc.c.o modem_init_core+0x1a2..0x3b6.
+    ## The 0x400/0x540/0x544/0x28a8 fields are still recovered from sequence
+    ## context rather than a public register manual; names describe the modem
+    ## bring-up roles implied by the vendor write order.
+    let rf = rfRegs()
+    let bba = bbaAgcRegs()
+    let phy = phyRegs()
+    let aux = rfAuxCtrlRegs()
+    updateReg32(addr rf.baseCtrl1, 0xFFFFF7FF'u32, 0x00000000'u32)
+    updateReg32(addr rf.channelTuneCtrl26c, 0xFFFFFFF7'u32, 0x00000000'u32)
+    updateReg32(addr rf.channelTuneStrobe268, 0xFFFF0000'u32, 0x00001040'u32)
+    updateReg32(addr rf.baseCtrl1, 0xFFFFFFFF'u32, 0x00000002'u32)
+    updateReg32(addr rf.synthCtrl2c, 0xFFFFFFFF'u32, 0x00000004'u32)
+    updateReg32(addr rf.synthDfePathControl63c, 0xFFFFFFFF'u32, 0x00000080'u32)
+    updateReg32(addr rf.synthDfePathControl63c, 0xFFFF7FFF'u32, 0x00008000'u32)
+    updateReg32(addr rf.synthDfePathControl63c, 0xFFFFFF80'u32, 0x00000000'u32)
+    updateReg32(addr rf.synthDfePathControl63c, 0xFFFF80FF'u32, 0x00000000'u32)
+    updateReg32(addr rf.synthCtrl2c, 0xFFFFFFFF'u32, 0x00000002'u32)
+    updateReg32(addr rf.synthCtrl2c, 0xFFFFBFFF'u32, 0x00004000'u32)
+    updateReg32(addr rf.synthCtrl2c, 0xFFFFFFFF'u32, 0x00000020'u32)
+    updateReg32(addr rf.rfcSequencerBias400, 0xFF7FFFFF'u32, 0x00800000'u32)
+    updateReg32(addr rf.rfcSequencerBias400, 0xFFFF7FFF'u32, 0x00008000'u32)
+    updateReg32(addr rf.rfcSequencerBias400, 0xFFFFBFFF'u32, 0x00004000'u32)
+    updateReg32(addr rf.rfcSequencerBias400, 0xFFFFFFFF'u32, 0x00000200'u32)
+    updateReg32(addr rf.rfcSequencerBias400, 0xFFFFFFFF'u32, 0x00000100'u32)
+    updateReg32(addr aux.rfcAuxPathSelect540, 0xFFFFFCFF'u32, 0x00000C00'u32)
+    updateReg32(addr aux.rfcAuxPathGate544, 0xFFFFFFFB'u32, 0x00000000'u32)
+    updateReg32(addr phy.rfcSettlingTimerA8, 0x00000000'u32, 0x000000C8'u32)
+    updateReg32(addr rf.rxMode220, 0xF7FFFFFF'u32, 0x00000000'u32)
+    updateReg32(addr rf.baseCtrl1, 0xFFFFFFFF'u32, 0x00000002'u32)
+    updateReg32(addr rf.synthCtrl2c, 0xFFFFFFDF'u32, 0x00000000'u32)
+    updateReg32(addr rf.bandwidthCtrl94, 0xFFFEFFFF'u32, 0x00010000'u32)
+    updateReg32(addr rf.rbbRccalCtrl80, 0xBFFFFFFF'u32, 0x40000000'u32)
+    updateReg32(addr rf.channelSequencer260, 0xFFFFFFFF'u32, 0x00000000'u32)
+    updateReg32(addr rf.channelSequencer260, 0xFFFFFFFF'u32, 0x00000000'u32)
+    updateReg32(addr rf.channelSequencer2c4, 0xFFFFFFFF'u32, 0x00000002'u32)
+    updateReg32(addr rf.channelSequencer2c4, 0xFFFFFFFE'u32, 0x00000000'u32)
+    updateReg32(addr bba.macActiveC01c, 0xFFFFFC00'u32, 0x00000050'u32)
+    updateReg32(addr bba.macActiveC020, 0xFFFFFC00'u32, 0x00000050'u32)
+    updateReg32(addr rf.channelTuneCtrl26c, 0xFFF003FF'u32, 0x00028000'u32)
+    updateReg32(addr rf.channelTuneStrobe268, 0xC00FFFFF'u32, 0x05000000'u32)
+    updateReg32(addr bba.macActiveC01c, 0xFC00FFFF'u32, 0x00010000'u32)
+    updateReg32(addr bba.macActiveC020, 0xFC00FFFF'u32, 0x00010000'u32)
+    updateReg32(addr bba.macActiveC02c, 0xFFFFFF00'u32, 0x00000001'u32)
+
+  proc modemInitCoreMode(xtalfreqHz, restoreExistingCalibration: uint32;
+                         mode: RadioPhyMode) =
     ## Porting boundary for librf_bl808.a:rfc.c.o modem_init_core.
     ## Recovered: xtal classification constants, rfc_xtal_cfg table load from
     ## LLVM-decoded th.addsl/th.lrw at rfc.c.o+0x9c..0xc8, RF init
@@ -12658,28 +13331,32 @@ when defined(bl808WifiUseBl808Rf):
     ## register sequence. wl_init supplies the recovered WL API mode so
     ## coexistence reclaim can reach rf_pri_init(..., WL_API_MODE_ALL) without
     ## changing the exported modem_init_core ABI.
+    let rf = rfRegs()
     let xtalCfg = RfcXtalConfigTable[xtalIndex(xtalfreqHz)]
-    updateReg32(cast[ptr uint32](RfRxModeReg.uint), 0xFBFFFFFF'u32, 0'u32)
-    updateReg32(cast[ptr uint32](RfRxModeReg.uint), 0xF7FFFFFF'u32, 0x08000000'u32)
+    updateReg32(addr rf.rxMode220, 0xFBFFFFFF'u32, 0'u32)
+    updateReg32(addr rf.rxMode220, 0xF7FFFFFF'u32, 0x08000000'u32)
     rf_pri_input_xtalfreq(xtalfreqHz)
     rfPriLoadConfiguredDeviceInfo()
+    let apiMode = apiFromRadioPhyMode(mode)
     nimFwDbgRfApiMode = apiMode.uint32
-    rf_pri_init(if restore == 0'u32: 1'u32 else: 0'u32, apiMode.uint32)
-    updateReg32(cast[ptr uint32](RfBase + 0x1C0'u), 0xFFFFF000'u32,
-                xtalCfg.word10 and 0x00000FFF'u32)
-    updateReg32(cast[ptr uint32](RfBase + 0x1C4'u), 0xE0000000'u32,
-                xtalCfg.word0c and 0x1FFFFFFF'u32)
-    updateReg32(cast[ptr uint32](RfBase + 0x1C8'u), 0xFFF00000'u32,
-                xtalCfg.word04 and 0x000FFFFF'u32)
-    updateReg32(cast[ptr uint32](RfBase + 0x1CC'u), 0xFFF00000'u32,
-                xtalCfg.word08 and 0x000FFFFF'u32)
+    rf_pri_init(
+      if restoreExistingCalibration == 0'u32: 1'u32 else: 0'u32,
+      apiMode.uint32)
+    updateReg32(addr rf.xtalControlCode1c0, 0xFFFFF000'u32,
+                xtalCfg.xtalControlCode and 0x00000FFF'u32)
+    updateReg32(addr rf.xtalDividerConfig1c4, 0xE0000000'u32,
+                xtalCfg.xtalDividerConfig and 0x1FFFFFFF'u32)
+    updateReg32(addr rf.xtalCountWindowMin1c8, 0xFFF00000'u32,
+                xtalCfg.xtalCountWindowMin and 0x000FFFFF'u32)
+    updateReg32(addr rf.xtalCountWindowMax1cc, 0xFFF00000'u32,
+                xtalCfg.xtalCountWindowMax and 0x000FFFFF'u32)
     programRfcVcoTable()
-    writeRadioRegMaskInit(RfcModemLateInit)
-    updateReg32(cast[ptr uint32](RfBase + 0x504'u), 0xFFFFFFFF'u32, 0x10'u32)
-    updateReg32(cast[ptr uint32](RfBase + 0x514'u), 0xFFFFFFFF'u32, 0x10'u32)
+    programRfcModemLateInit()
+    updateReg32(addr rf.modemPathEnable504, 0xFFFFFFFF'u32, 0x10'u32)
+    updateReg32(addr rf.modemPathEnable514, 0xFFFFFFFF'u32, 0x10'u32)
 
   proc modem_init_core*(xtalfreqHz, restore: uint32) {.exportc, cdecl.} =
-    modemInitCoreMode(xtalfreqHz, restore, WlApiModeWlan)
+    modemInitCoreMode(xtalfreqHz, restore, wifiOnly)
 
   proc modem_init*(xtalfreqHz: uint32) {.exportc, cdecl.} =
     modem_init_core(xtalfreqHz, 0'u32)
@@ -12696,11 +13373,13 @@ when defined(bl808WifiUseBl808Rf):
 
   proc rfc_init*(xtalfreqHz: uint32, fullInit: uint32 = 1'u32) {.exportc, cdecl.} =
     let cfg = wl_cfg_get(addr wifiBl808WlRmem)
+    let wlFullCalibrationFlag =
+      if fullInit != 0'u32: 1'u8 else: 0'u8
     configureWlRfConfig(
       cfg,
       xtalfreqHz,
-      WlApiModeWlan,
-      if fullInit != 0'u32: 1'u8 else: 0'u8)
+      wifiOnly,
+      wlFullCalibrationFlag)
     discard wl_init()
     phy_init(nil)
     wifiBl808RfInited = 1'u32
@@ -12727,8 +13406,9 @@ else:
   proc rf_init*(xtalfreqHz: uint32) {.importc, cdecl.}
   proc rfc_init*(xtalfreqHz: uint32, fullInit: uint32) {.importc, cdecl.}
 
-proc wifiRfCoreInitMode(xtalfreqHz: uint32, apiMode: uint8) {.noinline.} =
+proc wifiRfCoreInitMode(xtalfreqHz: uint32, mode: RadioPhyMode) {.noinline.} =
   when defined(bl808WifiUseBl808Rf):
+    let apiMode = apiFromRadioPhyMode(mode)
     nimFwDbgRfPhase = 1
     nimFwDbgRfApiMode = apiMode.uint32
     nimFwConnectTrace2U32("[WIFI-CT] bl808_rf_core ", xtalfreqHz, apiMode.uint32)
@@ -12737,23 +13417,17 @@ proc wifiRfCoreInitMode(xtalfreqHz: uint32, apiMode: uint8) {.noinline.} =
     nimFwDbgRfPhase = 2
     nimFwConnectTrace2U32("[WIFI-CT] bl808_rf_cfg ", cast[uint32](cast[uint](cfg)), sizeof(WlRfConfig).uint32)
     if cfg != nil:
-      when defined(bl808WifiRfColdInit):
-        let enFullCal = if wifiBl808RfInited == 0'u32: 1'u8 else: 0'u8
-      else:
-        # The recovered cold path matches rf_init(), but currently stalls in the
-        # RF delay/calibration sequence on this board. Keep the prior restore
-        # path as the default until the cold path is fully ported.
-        let enFullCal = 0'u8
-      configureWlRfConfig(cfg, xtalfreqHz, apiMode, enFullCal)
+      let requestFullCalibration =
+        if wifiBl808RfInited == 0'u32: 1'u8 else: 0'u8
+      configureWlRfConfig(cfg, xtalfreqHz, mode, requestFullCalibration)
       nimFwConnectTrace2U32("[WIFI-CT] bl808_rf_cfg2 ", cfg.status, cfg.xtalfreqHz)
     nimFwDbgRfPhase = 3
     snapshotWifiRfCalibData()
-    when defined(bl808WifiRfColdInit):
-      let restore = if wifiBl808RfInited == 0'u32: 0'u32 else: 1'u32
-    else:
-      let restore = 1'u32
-    nimFwDbgRfRestore = restore
-    nimFwConnectTrace2U32("[WIFI-CT] bl808_rf_modem ", xtalfreqHz, restore)
+    let restoreExistingCalibration =
+      if wifiBl808RfInited == 0'u32: 0'u32 else: 1'u32
+    nimFwDbgRfRestore = restoreExistingCalibration
+    nimFwConnectTrace2U32(
+      "[WIFI-CT] bl808_rf_modem ", xtalfreqHz, restoreExistingCalibration)
     nimFwDbgRfPhase = 4
     nim_wifi_rf_latch_service_enable(1'u32)
     discard wl_init()
@@ -12761,12 +13435,13 @@ proc wifiRfCoreInitMode(xtalfreqHz: uint32, apiMode: uint8) {.noinline.} =
     snapshotWifiRfCalibData()
     nimFwDbgRfPhase = 5
     wifiBl808RfInited = 1'u32
-    nimFwConnectTrace2U32("[WIFI-CT] bl808_rf_done ", xtalfreqHz, restore)
+    nimFwConnectTrace2U32(
+      "[WIFI-CT] bl808_rf_done ", xtalfreqHz, restoreExistingCalibration)
   else:
     rf_init(xtalfreqHz)
 
 proc wifiRfCoreInit*(xtalfreqHz: uint32) {.exportc, cdecl, noinline.} =
-  wifiRfCoreInitMode(xtalfreqHz, WlApiModeWlan)
+  wifiRfCoreInitMode(xtalfreqHz, wifiOnly)
 
 when defined(bl808WifiUseBl808Rf):
   proc wrapPhyAssertErr*(fileOrCond, condOrFile: cstring,
@@ -12775,11 +13450,12 @@ when defined(bl808WifiUseBl808Rf):
     ## The BL808 RF archive's phy_assert_err is a hard spin. The first
     ## phy_init assert is a clock-count diagnostic on this target; log it and
     ## continue so the smoke test can bisect the next WiFi bring-up stage.
-    let reg3c = regRead(0x24C0003C'u32)
+    let mdm = wifiModemRegs()
+    let versionScratch3c = volatileLoad(addr mdm.versionScratch3c)
     inc nimFwDbgRfAssertCount
     nimFwDbgRfAssertLine = line.uint32
-    nimFwDbgRfAssertReg3c = reg3c
-    nimFwConnectTrace2U32("[WIFI-CT] phy_assert ", line.uint32, reg3c)
+    nimFwDbgRfAssertReg3c = versionScratch3c
+    nimFwConnectTrace2U32("[WIFI-CT] phy_assert ", line.uint32, versionScratch3c)
     if line == 586.cint or line == 0x20FA.cint or line == 0x2A60.cint:
       return
     while true:
@@ -14246,7 +14922,7 @@ when not defined(bl808WifiUseBl808Rf):
   proc phy_get_ntx(): uint8 {.importc: "phy_get_ntx", cdecl.}
   proc phy_get_nss(): uint8 {.importc: "phy_get_nss", cdecl.}
   proc phy_ldpc_tx_supported(): bool {.importc: "phy_ldpc_tx_supported", cdecl.}
-    ## External: returns number of extra TX chains (0 = single antenna).
+    ## External non-BL808 PHY fallback: reports whether TX LDPC is supported.
   proc phy_get_rf_gain_idx(txPowerElem: pointer, rateParam: pointer) {.importc: "phy_get_rf_gain_idx", cdecl.}
     ## External: converts TX power element to RF gain index based on rate params.
 proc tcpip_stack_input(entry: pointer, descFlag: uint32, payload: pointer, bufOff: uint32, dmaArray: pointer, fcFlag: uint32): cint {.importc: "tcpip_stack_input", cdecl.}
@@ -15524,7 +16200,7 @@ proc mm_hw_info_set*(macAddr: pointer) {.exportc, cdecl.} =
   # Apply STA RX filter. Blob chooses the promiscuous STA variant when
   # mm_env+44 is nonzero.
   let mm = mmEnvView()
-  if mm.uploadWord44 != 0:
+  if mm.rxPromiscUploadFlag != 0:
     mm.rxFilterBase = 0x3503A58C'u32
   else:
     mm.rxFilterBase = 0x3503858C'u32
@@ -15541,7 +16217,7 @@ proc mm_hw_ap_info_set*(vifIdx: uint8) {.exportc, cdecl.} =
   regWrite(MACHW_STATUS_REG, status)
   # Set AP RX filter in mm_env[0]; value depends on mm_env word at offset 48.
   let mm = mmEnvView()
-  if mm.word48 != 0:
+  if mm.apPromiscUploadFlag != 0:
     mm.rxFilterBase = 0x3507A58C'u32
   else:
     mm.rxFilterBase = 0x3507858C'u32
@@ -19597,7 +20273,7 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
       let wmmIe = mac_vsie_find(ieStart, ieLen, cast[pointer](wmmO), 5)
       if wmmIe != nil:
         let wmm = wmmParameterIeAt(wmmIe)
-        vifView.modeByte452 = wmm.qosInfo
+        vifView.wmmQosInfo = wmm.qosInfo
         vifView.capabilityInfo = vifView.capabilityInfo or 0x200'u16
         for si in 0..3:
           let rv = wmm.ac[si].le32
@@ -24101,7 +24777,7 @@ proc me_build_associate_rsp_impl(buf: pointer, staEntry: pointer,
     wmm.ouiType = 0x02'u8
     wmm.ouiSubtype = 0x01'u8
     wmm.version = 0x01'u8
-    wmm.qosInfo = vif.modeByte452
+    wmm.qosInfo = vif.wmmQosInfo
     wmm.reserved9 = 0
     wmm.ac[0].setLe32(wmmSrc.acBe)
     wmm.ac[1].setLe32(wmmSrc.acBk)
@@ -29525,7 +30201,7 @@ proc wifi_nimfw_prepare_sta_tx_channel*() {.exportc, cdecl.} =
       if reclaimNeeded:
         inc nimFwDbgStaTxRfFullRestore
         when defined(bl808WifiUseBl808Rf):
-          wifiRfCoreInitMode(40000000'u32, WlApiModeAll)
+          wifiRfCoreInitMode(40000000'u32, wifiBleCoex)
         else:
           rfc_init(40000000'u32, 1'u32)
         phy_init(nil)
@@ -38357,8 +39033,8 @@ proc mm_set_vif_state_cfm_handler*(param: pointer) {.exportc, cdecl.} =
   # Compute PS mode and store to STA entry
   let staIdx = vif.staIdx
   let sta = staInfoForIdx(staIdx)
-  let flags1496 = vifKeyPointers(vif).flags
-  let psMode = 2'u8 - (flags1496 and 1).uint8
+  let keyPointerFlags = vifKeyPointers(vif).flags
+  let psMode = 2'u8 - (keyPointerFlags and 1).uint8
   sta.rxNss = psMode
   sta.rateWord = lmacGateHalfword(ci.ctrlPortEthertype)
   when defined(bl808WifiConnectTrace):
@@ -39844,7 +40520,7 @@ proc apm_start_req_handler*(param: pointer) {.exportc, cdecl.} =
      vif.edcaRegs[2] = volatileLoad(cast[ptr uint32](ampduBase + 8))
      vif.edcaRegs[3] = volatileLoad(cast[ptr uint32](ampduBase + 12))
      # Clear probe response length
-     vif.modeByte452 = 0
+     vif.wmmQosInfo = 0
      # Set AID bitmap and feature flag
      apCfg.aidBitmapFeatureLow = 0
      apCfg.maxAssocRate = 0xFFFF'u16
@@ -41584,14 +42260,14 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
         if postVifType == 2:
           # AP VIF: check mm_env[0x2c] (word at offset 44) for upload condition
           let mm = mmEnvView()
-          if mm.uploadWord44 != 0:
+          if mm.rxPromiscUploadFlag != 0:
             # Need to upload frame: call rxu_mpdu_upload_and_indicate (blob 0x53c)
             rxu_mpdu_upload_and_indicate(param)
             return 0  # Frame handled by upload path
       else:
         # No VIF found: check mm_env combined flags (blob .L94 at 0x52a)
         let mm = mmEnvView()
-        if (mm.uploadWord44 or mm.word48) != 0:
+        if (mm.rxPromiscUploadFlag or mm.apPromiscUploadFlag) != 0:
           rxu_mpdu_upload_and_indicate(param)
           return 0
     # Set accepted byte to return value
