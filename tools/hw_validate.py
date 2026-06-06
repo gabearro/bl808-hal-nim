@@ -511,6 +511,43 @@ def parse_args() -> argparse.Namespace:
                             "Poll the firmware's exported hw_validation_log_* ring buffer "
                             "over JTAG and include it in marker matching."
                         ))
+    parser.add_argument("--jtag-breakpoint-symbol", action="append", default=[],
+                        help=(
+                            "Set a temporary hardware breakpoint at this M0 ELF symbol after "
+                            "the runtime image is resumed. When it hits, capture a JTAG "
+                            "snapshot, remove the breakpoint, and resume."
+                        ))
+    parser.add_argument("--jtag-breakpoint-address", action="append", default=[],
+                        help=(
+                            "Set a temporary hardware breakpoint at this raw M0 address "
+                            "(decimal or 0x-prefixed hex). Uses the same snapshot commands "
+                            "as --jtag-breakpoint-symbol."
+                        ))
+    parser.add_argument("--jtag-breakpoint-timeout", type=float, default=20.0,
+                        help="Seconds to wait for each --jtag-breakpoint-symbol hit.")
+    parser.add_argument("--jtag-breakpoint-skip-count", type=int, default=0,
+                        help=(
+                            "Resume through this many matching JTAG breakpoint/watchpoint "
+                            "hits before capturing the snapshot. Useful for comparing later "
+                            "scan-channel iterations."
+                        ))
+    parser.add_argument("--jtag-breakpoint-snapshot-command", action="append", default=[],
+                        help=(
+                            "OpenOCD command to capture when a JTAG breakpoint hits. May use "
+                            "{sym:name}. If omitted, the test's jtag_snapshot commands are used."
+                        ))
+    parser.add_argument("--jtag-watchpoint-address", action="append", default=[],
+                        help=(
+                            "Set a temporary write watchpoint at this raw address after the "
+                            "runtime image is resumed. Uses the same snapshot commands as "
+                            "--jtag-breakpoint-symbol."
+                        ))
+    parser.add_argument("--jtag-watchpoint-symbol", action="append", default=[],
+                        help=(
+                            "Set a temporary write watchpoint at this M0 ELF symbol after the "
+                            "runtime image is resumed. Uses the same snapshot commands as "
+                            "--jtag-breakpoint-symbol."
+                        ))
     parser.add_argument("--no-flash", action="store_true",
                         help="Skip UART bootloader flashing and run the current image.")
     parser.add_argument("--no-jtag", action="store_true",
@@ -743,14 +780,46 @@ def run_logged(
     return proc
 
 
-def host_action_command(action: dict[str, Any]) -> list[str]:
+def parse_e2e_marker_fields(output: str, phase: str, kind: str) -> dict[str, str]:
+    prefix = f"@e2e {phase}:{kind}"
+    fields: dict[str, str] = {}
+    for line in output.splitlines():
+        marker_at = line.find(prefix)
+        if marker_at < 0:
+            continue
+        marker = line[marker_at:]
+        for part in marker[len(prefix):].strip().split():
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            fields[key] = value
+    return fields
+
+
+def expand_host_action_arg(text: str, marker_output: str | None) -> str:
+    if not text.startswith("{e2e:") or not text.endswith("}"):
+        return text
+    if marker_output is None:
+        raise RuntimeError(f"host action placeholder {text!r} requires marker output")
+    parts = text[1:-1].split(":")
+    if len(parts) != 4:
+        raise RuntimeError(f"bad host action placeholder {text!r}")
+    _, phase, kind, key = parts
+    fields = parse_e2e_marker_fields(marker_output, phase, kind)
+    if key not in fields:
+        raise RuntimeError(f"host action placeholder {text!r} not found in markers")
+    return fields[key]
+
+
+def host_action_command(action: dict[str, Any], marker_output: str | None = None) -> list[str]:
     raw = action.get("cmd")
     if not isinstance(raw, list) or not raw:
         raise RuntimeError("host action requires non-empty cmd list")
     cmd: list[str] = []
     for part in raw:
         text = str(part)
-        cmd.append(sys.executable if text == "{python}" else text)
+        text = sys.executable if text == "{python}" else text
+        cmd.append(expand_host_action_arg(text, marker_output))
     return cmd
 
 
@@ -817,9 +886,10 @@ def start_host_action(
     action: dict[str, Any],
     *,
     work_dir: Path,
+    marker_output: str | None = None,
     log_label: str | None = None,
 ) -> RunningHostAction:
-    cmd = host_action_command(action)
+    cmd = host_action_command(action, marker_output)
     timeout_s = float(action.get("timeout", 30))
     log_path = work_dir / "logs" / f"{test_name}.{log_label or f'host{index}'}.log"
     if log_path.exists():
@@ -1354,7 +1424,7 @@ def elf_symbol_addresses(
     if nm is None:
         raise RuntimeError("riscv64-unknown-elf-nm not found for JTAG memory log")
     proc = subprocess.run(
-        [nm, "-g", str(elf)],
+        [nm, str(elf)],
         cwd=REPO_ROOT,
         text=True,
         stdout=subprocess.PIPE,
@@ -1667,6 +1737,7 @@ def build_firmware(
         source = item["source"]
         elf_path = bin_dir / f"{build_id}.elf"
         bin_path = bin_dir / f"{build_id}.bin"
+        map_path = bin_dir / f"{build_id}.map"
         nimcache = work_dir / "nimcache" / test["name"] / build_id
 
         nim_cmd = [
@@ -1677,6 +1748,7 @@ def build_firmware(
             f"-d:ConsoleBaud={console_baud}",
             f"--nimcache:{nimcache}",
             f"--out:{elf_path}",
+            f"--passL:-Wl,-Map,{map_path}",
             source,
         ]
         defines = manifest_nim_defines(
@@ -4209,6 +4281,137 @@ def capture_jtag_snapshot(
     return output
 
 
+def m0_output_for_jtag_symbols(outputs: dict[str, BuildOutput]) -> BuildOutput:
+    m0_outputs = [
+        output for output in outputs.values()
+        if output.core == "bl808m0"
+    ]
+    if not m0_outputs:
+        raise RuntimeError("symbolic JTAG operation requires a bl808m0 build output")
+    return m0_outputs[0]
+
+
+def run_jtag_breakpoint_snapshots(
+    session: OpenOcdSession,
+    *,
+    args: argparse.Namespace,
+    test: dict[str, Any],
+    defaults: dict[str, Any],
+    outputs: dict[str, BuildOutput],
+    log_path: Path,
+    resume_command: str,
+) -> None:
+    m0_output = m0_output_for_jtag_symbols(outputs)
+    snapshot = (
+        list(args.jtag_breakpoint_snapshot_command)
+        if args.jtag_breakpoint_snapshot_command
+        else list(test.get("jtag_snapshot", defaults.get("jtag_snapshot", [])))
+    )
+    symbol_names = list(args.jtag_breakpoint_symbol)
+    for name in args.jtag_watchpoint_symbol:
+        if name not in symbol_names:
+            symbol_names.append(name)
+    for name in jtag_snapshot_symbol_names(snapshot):
+        if name not in symbol_names:
+            symbol_names.append(name)
+    symbols = elf_symbol_addresses(m0_output.elf, symbol_names, required=False)
+    timeout_ms = max(1, int(float(args.jtag_breakpoint_timeout) * 1000.0))
+    skip_count = max(0, int(args.jtag_breakpoint_skip_count))
+    next_resume_command = resume_command
+    breakpoints: list[tuple[str, int]] = []
+    for symbol in args.jtag_breakpoint_symbol:
+        address = symbols.get(symbol)
+        if address is None:
+            breakpoints.append((symbol, -1))
+        else:
+            breakpoints.append((symbol, address))
+    for raw_address in args.jtag_breakpoint_address:
+        try:
+            address = int(raw_address, 0)
+        except ValueError as exc:
+            raise RuntimeError(f"invalid JTAG breakpoint address {raw_address!r}") from exc
+        breakpoints.append((raw_address, address))
+    for raw_address in args.jtag_watchpoint_address:
+        try:
+            address = int(raw_address, 0)
+        except ValueError as exc:
+            raise RuntimeError(f"invalid JTAG watchpoint address {raw_address!r}") from exc
+        breakpoints.append((f"watch:{raw_address}", address))
+    for symbol in args.jtag_watchpoint_symbol:
+        address = symbols.get(symbol)
+        if address is None:
+            breakpoints.append((f"watch:{symbol}", -1))
+        else:
+            breakpoints.append((f"watch:{symbol}", address))
+
+    with log_path.open("a", encoding="utf-8") as log:
+        for index, (name, address) in enumerate(breakpoints):
+            if address < 0:
+                log.write(f"\n# skipped JTAG breakpoint {name!r}; missing symbol\n")
+                log.flush()
+                continue
+            is_watchpoint = name.startswith("watch:")
+            kind = "watchpoint" if is_watchpoint else "breakpoint"
+            log.write(f"\n# JTAG {kind} {name} at 0x{address:08X}\n")
+            log.flush()
+            if is_watchpoint:
+                session.command(f"wp 0x{address:08X} 4 w", timeout_s=5)
+            else:
+                bp_size = 2 if (address & 0x3) != 0 else 4
+                session.command(f"bp 0x{address:08X} {bp_size} hw", timeout_s=5)
+            did_halt = False
+            try:
+                initial_jtag_command_with_recovery(
+                    session,
+                    next_resume_command,
+                    args=args,
+                    log_path=log_path,
+                    timeout_s=10,
+                    reason=f"{args.jtag_core} resume to JTAG {kind} {name}",
+                )
+                next_resume_command = "resume"
+                for hit_index in range(skip_count + 1):
+                    try:
+                        hit = session.command(
+                            f"wait_halt {timeout_ms}",
+                            timeout_s=float(args.jtag_breakpoint_timeout) + 5.0,
+                        )
+                        hit_lower = hit.lower()
+                        log.write(hit)
+                        if "timed out" in hit_lower or "target not halted" in hit_lower:
+                            log.write(f"\n# JTAG {kind} {name} did not halt\n")
+                            return
+                        did_halt = True
+                        if hit_index < skip_count:
+                            log.write(
+                                f"\n# skipped JTAG {kind} {name} hit "
+                                f"{hit_index + 1}/{skip_count}\n"
+                            )
+                            log.flush()
+                            session.command("resume", timeout_s=5)
+                            did_halt = False
+                            continue
+                        log.write(capture_jtag_snapshot(
+                            session,
+                            snapshot,
+                            halt_first=False,
+                            symbols=symbols,
+                        ))
+                    except Exception as exc:
+                        log.write(f"\n# JTAG {kind} {name} did not halt: {exc}\n")
+                        return
+            finally:
+                try:
+                    if is_watchpoint:
+                        session.command(f"rwp 0x{address:08X}", timeout_s=5)
+                    else:
+                        session.command(f"rbp 0x{address:08X}", timeout_s=5)
+                finally:
+                    if did_halt and index == len(breakpoints) - 1:
+                        session.command("resume", timeout_s=5)
+                log.flush()
+
+
 def jtag_target_for_core(args: argparse.Namespace, defaults: dict[str, Any], core: str) -> Path:
     if args.target is not None and core == args.jtag_core:
         return resolve_repo_path(args.target)
@@ -5356,14 +5559,26 @@ def run_hardware_test(
                             primary.reset_buffers()
                         if secondary is not None:
                             secondary.reset_buffers()
-                    initial_jtag_command_with_recovery(
-                        session,
-                        resume_command,
-                        args=args,
-                        log_path=session.log_path,
-                        timeout_s=10,
-                        reason=f"{args.jtag_core} resume",
-                    )
+                    if (args.jtag_breakpoint_symbol or args.jtag_breakpoint_address or
+                            args.jtag_watchpoint_address or args.jtag_watchpoint_symbol):
+                        run_jtag_breakpoint_snapshots(
+                            session,
+                            args=args,
+                            test=test,
+                            defaults=defaults,
+                            outputs=outputs,
+                            log_path=session.log_path,
+                            resume_command=resume_command,
+                        )
+                    else:
+                        initial_jtag_command_with_recovery(
+                            session,
+                            resume_command,
+                            args=args,
+                            log_path=session.log_path,
+                            timeout_s=10,
+                            reason=f"{args.jtag_core} resume",
+                        )
 
             if args.no_jtag or runtime_jtag_disabled:
                 log_name = (
@@ -5489,6 +5704,7 @@ def run_hardware_test(
                             action_index,
                             action,
                             work_dir=work_dir,
+                            marker_output=combined,
                         )
                         started_action = True
                     pending_host_actions = still_pending_actions

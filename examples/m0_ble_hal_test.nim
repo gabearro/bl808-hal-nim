@@ -1102,6 +1102,14 @@ proc smokeBle() =
     when bl808BlePrintLlcCaptureOnce:
       printBleBlobLlcStartCapture("adv-loop")
 
+    if bleConnectedCalled and not bleDisconnectedCalled:
+      discard bleDisconnect(0x13'u8, 2_000)
+      for _ in 0 ..< 100:
+        if bleDisconnectedCalled:
+          break
+        pollBleController(BlePollIterations.uint32)
+        delayUs(BlePollDelayUs.uint32)
+
     discard console.sendString("[BLEDBG] flags connected=")
     console.sendHex32(if bleConnectedCalled: 1'u32 else: 0'u32)
     discard console.sendString(" disconnected=")

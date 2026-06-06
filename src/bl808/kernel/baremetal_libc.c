@@ -169,6 +169,41 @@ unsigned int ntohl(unsigned int x) {
     return htonl(x);
 }
 
+__attribute__((weak)) int abs(int value) {
+    return value < 0 ? -value : value;
+}
+
+__attribute__((weak)) double log(double x) {
+    union {
+        double d;
+        uint64_t u;
+    } v;
+    const double ln2 = 0.69314718055994530942;
+    double y;
+    double y2;
+    double term;
+    double sum;
+    int exp;
+
+    if (x <= 0.0) {
+        return -1.0e308;
+    }
+
+    v.d = x;
+    exp = (int)((v.u >> 52) & 0x7ffu) - 1023;
+    v.u = (v.u & 0x000fffffffffffffull) | (uint64_t)0x3ff0000000000000ull;
+
+    y = (v.d - 1.0) / (v.d + 1.0);
+    y2 = y * y;
+    term = y;
+    sum = term;
+    for (int n = 3; n <= 21; n += 2) {
+        term *= y2;
+        sum += term / (double)n;
+    }
+    return 2.0 * sum + (double)exp * ln2;
+}
+
 /* Nim's ARC runtime calls exit() on fatal errors */
 void exit(int status) {
     (void)status;

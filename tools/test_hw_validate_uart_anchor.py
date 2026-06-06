@@ -11,6 +11,39 @@ import pytest
 import hw_validate
 
 
+def test_host_action_command_expands_e2e_marker_fields():
+    output = "\n".join([
+        "noise",
+        "MASK: 255.255 P@e2e dhcp:ok ip=0x7A01A8C0 gw=0x0101A8C0",
+    ])
+    cmd = hw_validate.host_action_command(
+        {
+            "cmd": [
+                "{python}",
+                "tools/probe_wifi_lwip_tcp_udp.py",
+                "--ip",
+                "{e2e:dhcp:ok:ip}",
+            ]
+        },
+        output,
+    )
+
+    assert cmd == [
+        sys.executable,
+        "tools/probe_wifi_lwip_tcp_udp.py",
+        "--ip",
+        "0x7A01A8C0",
+    ]
+
+
+def test_host_action_command_rejects_missing_e2e_marker_field():
+    with pytest.raises(RuntimeError, match="not found"):
+        hw_validate.host_action_command(
+            {"cmd": ["probe", "{e2e:dhcp:ok:ip}"]},
+            "@e2e scan:ok items=1",
+        )
+
+
 def test_existing_anchor_ack_select_uses_uart_without_jtag(monkeypatch, tmp_path):
     def fake_uart_ping(_ser, *, timeout_s):
         assert timeout_s == 10
@@ -278,6 +311,91 @@ def test_uart_anchor_flash_defaults_to_target_reset_before_capture(
     assert reset_reasons == ["after UART anchor flash before UART capture"]
     out = capsys.readouterr().out
     assert "DRY-RUN: skip OpenOCD/JTAG" in out
+
+
+def test_uart_anchor_runtime_jtag_runs_breakpoint_snapshots(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    flashed = []
+
+    def fake_build_firmware(test, *, args, work_dir):
+        return {
+            "kernel": hw_validate.BuildOutput(
+                build_id="kernel",
+                core="bl808m0",
+                source=test["build"][0]["source"],
+                elf=Path("build/fake.elf"),
+                bin=Path("build/fake.bin"),
+                flash_core="m0",
+            )
+        }
+
+    def fake_flash_firmware_over_uart_anchor(test, **kwargs):
+        flashed.append(test["name"])
+
+    def fake_elf_symbol_addresses(elf, names, *, required):
+        assert elf == Path("build/fake.elf")
+        assert not required
+        return {
+            "nimfw_dbg_dhcp_tx_final_breakpoint": 0x58019BA6,
+            "nimfw_dbg_dhcp_tx_desc_bytes": 0x62021170,
+        }
+
+    def fail_ftdi_reset(*_args, **_kwargs):
+        raise AssertionError("anchor reboot path must not pulse FTDI nSRST")
+
+    monkeypatch.setattr(hw_validate, "build_firmware", fake_build_firmware)
+    monkeypatch.setattr(
+        hw_validate,
+        "flash_firmware_over_uart_anchor",
+        fake_flash_firmware_over_uart_anchor,
+    )
+    monkeypatch.setattr(hw_validate, "elf_symbol_addresses", fake_elf_symbol_addresses)
+    monkeypatch.setattr(hw_validate, "pulse_target_reset_via_ftdi", fail_ftdi_reset)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hw_validate.py",
+            "--test",
+            "m0_wifi_lwip_smoke",
+            "--uart-anchor-flash",
+            "--uart-anchor-runtime-jtag",
+            "--uart-anchor-reset-after-flash",
+            "--jtag-breakpoint-symbol",
+            "nimfw_dbg_dhcp_tx_final_breakpoint",
+            "--jtag-breakpoint-timeout",
+            "1",
+            "--jtag-breakpoint-snapshot-command",
+            "mdw {sym:nimfw_dbg_dhcp_tx_desc_bytes} 1",
+            "--uart",
+            "/dev/cu.test",
+            "--dry-run",
+            "--work-dir",
+            str(tmp_path / "work"),
+        ],
+    )
+
+    assert hw_validate.main() == 0
+    assert flashed == ["m0_wifi_lwip_smoke"]
+    out = capsys.readouterr().out
+    assert "DRY-RUN: skip OpenOCD/JTAG" not in out
+
+    openocd_log = (
+        tmp_path
+        / "work"
+        / "logs"
+        / "m0_wifi_lwip_smoke.m0.openocd.dry-run.log"
+    )
+    openocd_text = openocd_log.read_text()
+    assert "# JTAG breakpoint nimfw_dbg_dhcp_tx_final_breakpoint at 0x58019BA6" in openocd_text
+    assert "DRY-RUN openocd> bp 0x58019BA6 2 hw" in openocd_text
+    assert "DRY-RUN openocd> resume" in openocd_text
+    assert "DRY-RUN openocd> wait_halt 1000" in openocd_text
+    assert "DRY-RUN openocd> mdw 0x62021170 1" in openocd_text
+    assert "DRY-RUN openocd> rbp 0x58019BA6" in openocd_text
 
 
 def test_jtag_flash_reset_capture_keeps_runtime_jtag_by_default(

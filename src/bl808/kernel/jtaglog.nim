@@ -6,7 +6,7 @@
 
 const
   HwValidationLogMagic* = 0x474C544A'u32 # "JTLG" little-endian
-  HwValidationLogCapacity* = 8192'u32
+  HwValidationLogCapacity* {.intdefine.} = 8192
 
 var
   hwValidationLogMagic* {.exportc: "hw_validation_log_magic".}: uint32 =
@@ -16,7 +16,7 @@ var
   hwValidationLogWrite* {.exportc: "hw_validation_log_write".}: uint32 = 0
   hwValidationLogWrapped* {.exportc: "hw_validation_log_wrapped".}: uint32 = 0
   hwValidationLogBuffer* {.exportc: "hw_validation_log_buffer".}:
-    array[HwValidationLogCapacity.int, uint8]
+    array[HwValidationLogCapacity, uint8]
 
 proc hwValidationLogReset*() {.exportc: "hw_validation_log_reset", cdecl.} =
   hwValidationLogMagic = HwValidationLogMagic
@@ -30,7 +30,7 @@ proc hwValidationLogByte*(b: uint8) {.exportc: "hw_validation_log_byte", cdecl.}
   let pos = hwValidationLogWrite mod HwValidationLogCapacity
   hwValidationLogBuffer[pos.int] = b
   var next = pos + 1
-  if next >= HwValidationLogCapacity:
+  if next >= HwValidationLogCapacity.uint32:
     next = 0
     hwValidationLogWrapped = 1
   hwValidationLogWrite = next

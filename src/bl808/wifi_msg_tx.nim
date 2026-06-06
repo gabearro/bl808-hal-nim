@@ -589,8 +589,13 @@ when defined(bl808m0) and defined(bl808WifiNimFw):
     let hw = cast[pointer](blHw)
     let htCap = ptrAt(hw, BlHwHtCapOff)
     let modp = loadPtr(hw, BlHwModParamsOff)
-    bl_os_printf("[ME] HT supp %d, VHT supp %d\r\n", 1, 0)
-    storeU8(req, MeConfigHtSuppOff, 1)
+    let htSupp =
+      when defined(bl808WifiForceLegacyRates):
+        0'u8
+      else:
+        1'u8
+    bl_os_printf("[ME] HT supp %d, VHT supp %d\r\n", htSupp.cint, 0)
+    storeU8(req, MeConfigHtSuppOff, htSupp)
     storeU8(req, MeConfigVhtSuppOff, 0)
     storeU16(req, MeConfigHtCapOff + MacHtCapInfoOff, loadU16(htCap, HtCapCapOff))
     storeU8(req, MeConfigHtCapOff + MacHtAmpduOff, 3)
@@ -730,6 +735,8 @@ when defined(bl808m0) and defined(bl808WifiNimFw):
     let smeRaw = cast[pointer](sme)
     let crypto = ptrAt(smeRaw, ConnCryptoOff)
     var flags = loadU32(smeRaw, ConnFlagsOff)
+    when defined(bl808WifiForceLegacyRates):
+      flags = flags or DISABLE_HT
     when defined(bl808WifiConnectCfg80211Flags):
       if loadU32(crypto, CryptoNCiphersOff) != 0'u32:
         let cipher = loadU32(crypto, CryptoCiphers0Off)

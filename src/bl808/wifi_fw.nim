@@ -39,11 +39,15 @@
 import mmio, memmap
 from std/volatile import volatileStore, volatileLoad
 
+proc c_memcpy(dst, src: pointer, n: csize_t): pointer
+  {.importc: "memcpy", header: "<string.h>".}
+
 # =============================================================================
 # MAC HW register base addresses (from BL808 vendor WiFi firmware)
 # =============================================================================
 const
   MACHW_BASE*          = 0x24B00000'u
+  MACHW_INTC_BASE      = 0x24B08000'u
   MACHW_CTRL_REG       = MACHW_BASE + 0x000'u
   MACHW_STATE_CNTRL_REG = MACHW_BASE + 0x038'u # State machine control (current/next state)
   MACHW_STATUS_REG     = MACHW_BASE + 0x04C'u  # MAC status / gen_int control
@@ -104,11 +108,18 @@ const
   SCAN_STATUS_BUSY = 8'u8
   WifiTimerDrainLimit = 8'u32
   WifiIpcMsgDrainLimit = 8'u32
+  WifiIpcTxDrainLimit = 16'u32
   WifiSavedMsgDrainLimit = 8'u32
   WifiTxCfmDrainLimit = 16'u32
   WifiTxTriggerDrainLimit = 16'u32
   WifiTxFrameDrainLimit = 16'u32
   WifiRxTimerDrainLimit = 16'u32
+  WlApiModeWlan = 1'u8
+  WlApiModeBle = 2'u8
+  WlApiModeAll = 3'u8
+  KeMsgConsumed = 0.cint
+  KeMsgNoFree = 1.cint
+  KeMsgSaved = 2.cint
 
 when defined(bl808WifiForceTxPwr70):
   const NimFwForcedMgmtTxPower = 0x70'u32
@@ -408,6 +419,8 @@ const
   MAX_SCAN_RESULTS* = 32
   TX_BUFFER_POOL_SIZE* = 5
   RX_BUFFER_POOL_SIZE* = 12
+  IPC_TX_AC_DESC_BASE* = 0x24A00080'u32
+  IPC_TX_AC_DESC_STRIDE* = 16'u32
   KE_EVT_MAX* = 26
   KE_TIMER_MAX_DELAY* = 0x11E1A2FF'u32  # ~300s in MAC ticks
   # Event bit constants from blob (lui encoding: value << 12)
@@ -461,7 +474,7 @@ const
 
   STA_ENTRY_SIZE*   = 368    # struct sta_info_tag size from disasm (0x170)
   CHAN_CTXT_SIZE*    = 28     # channel context entry size (from blob stride)
-  VIF_ENTRY_SIZE*    = 1512  # struct vif_info_tag size from disasm (0x5E8)
+  VIF_ENTRY_SIZE*    = 1512  # struct vif_info_tag size from WiFi blob (0x5E8)
 
   # Rate control constants (Minstrel-like algorithm)
   RC_STATS_SIZE*       = 200    # sizeof(rc_sta_stats) = 0xC8
@@ -553,6 +566,22 @@ type
     first*: ptr CoListHdr
     last*: ptr CoListHdr
 
+  NotifierNodeView {.packed.} = object
+    callback*: pointer
+    next*: pointer
+    priority*: int32
+
+  ElementNotifyContextView {.packed.} = object
+    reserved00*: array[8, uint8]
+    state*: pointer
+
+  KeEnvPsFlagsView {.packed.} = object
+    flags*: uint8
+    apPending*: uint8
+    reserved30*: uint8
+    otherPending*: uint8
+    staPending*: uint8
+
   TxControlAcView {.packed.} = object
     current*: pointer
     pending*: CoList
@@ -569,6 +598,98 @@ type
 
   TxCfmEnvView {.packed.} = object
     lists*: array[5, CoList]
+
+  MachwTxQueueRegsView {.packed.} = object
+    reserved000*: array[0x78, uint8]
+    txStatus*: uint32
+    readyAck*: uint32
+    genMasked*: uint32
+    genRaw*: uint32
+    txAggSet*: uint32
+    txAggActive*: uint32
+    reserved090*: array[0xF0, uint8]
+    txTrigger*: uint32
+    reserved184*: uint32
+    dmaStatus*: uint32
+    reserved18c*: array[12, uint8]
+    beaconHead*: uint32
+    ac0Head*: uint32
+    ac1Head*: uint32
+    ac2Head*: uint32
+    ac3Head*: uint32
+
+  MachwRxDmaRegsView {.packed.} = object
+    reserved000*: array[0x180, uint8]
+    trigger*: uint32
+    reserved184*: array[0x34, uint8]
+    hdSubmittedHead*: uint32
+    pdSubmittedHead*: uint32
+    reserved1c0*: array[0x388, uint8]
+    hdHwHead*: uint32
+    pdHwHead*: uint32
+
+  MachwSecurityRegsView {.packed.} = object
+    reserved000*: array[0xAC, uint8]
+    keyMaterial*: array[4, uint32]
+    dataLow*: uint32
+    dataHigh*: uint32
+    control*: uint32
+    reserved0c8*: array[0x10, uint8]
+    keyCount*: uint32
+
+  WlanCoexRegsView {.packed.} = object
+    control*: uint32
+    pti*: uint32
+    status*: uint32
+
+  PtaCoexRegsView {.packed.} = object
+    reserved000*: array[4, uint8]
+    control*: uint32
+    reserved008*: array[0x20, uint8]
+    control2*: uint32
+    reserved02c*: array[0x3D8, uint8]
+    mirror*: uint32
+    reserved408*: array[0x20, uint8]
+    clear*: uint32
+
+  RcRateEntryView {.packed.} = object
+    reserved00*: array[4, uint8]
+    attempts*: uint16
+    failures*: uint16
+    probEwma*: uint16
+    rateConfig*: uint16
+
+  RcRateResetFieldsView {.packed.} = object
+    attempts0*: uint16
+    reserved02*: array[3, uint8]
+    oldProb*: uint8
+    sampleSkipped*: uint8
+    initialized*: uint8
+
+  RcRetrySlotView {.packed.} = object
+    rateIdx*: uint16
+    reserved02*: array[6, uint8]
+
+  RcStatsCounterView {.packed.} = object
+    reserved00*: array[128, uint8]
+    retrySlots*: array[4, RcRetrySlotView]
+    sampleCandidate*: uint16
+    reserved162*: uint16
+    totalAttempts*: uint16
+    totalSuccess*: uint16
+    reserved168*: array[2, uint8]
+    avgAmpduLen*: uint16
+    retryLimit*: uint8
+    slowRateCount*: uint8
+    updateStage*: uint8
+    flags*: uint8
+    reserved176*: array[11, uint8]
+    nssMax*: uint8
+    bwMax*: uint8
+    reserved189*: array[5, uint8]
+    legacyRateMap*: uint16
+    reserved196*: array[2, uint8]
+    fixedRate*: uint16
 
   TxFrameEnvView {.packed.} = object
     freeList*: CoList
@@ -598,6 +719,10 @@ type
     count*: uint8
     reserved85*: uint8
 
+  MeBeaconSequenceOverlay {.packed.} = object
+    reserved00*: array[84, uint8]
+    seqCounter*: uint16
+
   MmEnvView {.packed.} = object
     rxFilterBase*: uint32
     rxFilterExtra*: uint32
@@ -620,6 +745,15 @@ type
     word48*: uint32
     maxAmpduDuration*: uint32
     reserved56*: array[12, uint8]
+
+  MmWmmParameterSourceView {.packed.} = object
+    reserved00*: array[8, uint8]
+    acBk*: uint32
+    acBe*: uint32
+    acVi*: uint32
+    acVo*: uint32
+    idlePeriod*: uint16
+    idleOptions*: uint8
 
   MmBcnEnvView {.packed.} = object
     templatePtr*: pointer
@@ -665,6 +799,24 @@ type
     primaryApIdx*: uint8
     reserved19*: uint8
 
+  VifMgmtHostapdOpsEnvView {.packed.} = object
+    reserved00*: array[12, uint8]
+    hostapdOps*: pointer
+
+  VifHostapdPrivView {.packed.} = object
+    reserved00*: array[364, uint8]
+    hostapdPriv*: pointer
+
+  VifApProbeSsidOverlay {.packed.} = object
+    reserved00*: array[385, uint8]
+    hiddenSsidMode*: uint8
+    ssidLen*: uint8
+    ssidData*: UncheckedArray[uint8]
+
+  HostapdOpsView {.packed.} = object
+    reserved00*: array[44, uint8]
+    eapolRx*: pointer
+
   PsEnvView {.packed.} = object
     enabled*: uint8
     mode*: uint8
@@ -687,6 +839,12 @@ type
     flags*: uint8
     deferredMode*: uint8
     reserved54*: array[2, uint8]
+
+  PsDozeEnvView {.packed.} = object
+    base*: PsEnvView
+    dozeInProgress*: uint32
+    preState*: uint8
+    reserved61*: array[3, uint8]
 
   SmEnvView {.packed.} = object
     connectInfo*: pointer
@@ -904,7 +1062,7 @@ type
     active*: uint8
     slot*: uint8
     reserved108*: uint8
-    band*: uint8
+    requestVifIdx*: uint8
 
   ChanRocOverlay {.packed.} = object
     vifIdx*: uint8
@@ -990,7 +1148,9 @@ type
     reserved335*: uint8
     apStartBeaconInterval*: uint16
     apChanSwitchPending*: uint8
-    reserved339*: array[41, uint8]
+    reserved339*: uint8
+    postponedStaHead*: pointer
+    reserved344*: array[36, uint8]
     bssid*: array[6, uint8]
     supportedRatesLong*: array[34, uint8]
     scanBand*: uint16
@@ -1021,6 +1181,12 @@ type
     pmfRequired*: uint8
     staKeySlots*: array[4, uint8]
 
+  VifMachwKeyIndexOverlay {.packed.} = object
+    reserved00*: array[172, uint8]
+    primaryPairwise*: uint8
+    secondaryPairwise*: uint8
+    group*: uint8
+
   VifHtCapabilitiesOverlay {.packed.} = object
     capInfo*: uint16
     ampduParams*: uint8
@@ -1049,8 +1215,10 @@ type
     securityFlags*: uint32
     reserved32*: array[26, uint8]
     beaconInterval*: uint16
-    aidBitmapFeature*: uint32
+    aidBitmapFeatureLow*: uint16
+    maxAssocRate*: uint16
     privacyFlag*: uint8
+    ssidData*: UncheckedArray[uint8]
 
   KeyReplayCounterView {.packed.} = object
     pnLow*: uint32
@@ -1078,10 +1246,50 @@ type
     hasRxPn*: uint8
     reserved157*: array[3, uint8]
 
+  TkipMicKeyAreaView {.packed.} = object
+    reserved0*: uint32
+    scratch*: pointer
+    reserved8*: array[16, uint8]
+    keyMaterial*: array[8, uint8]
+
+  RxMicWordsView {.packed.} = object
+    lo*: uint32
+    hi*: uint32
+
   VifKeyPointersView {.packed.} = object
     defaultKeyPtr*: uint32
     groupKeyPtr*: uint32
     flags*: uint32
+
+  VifRxProtectedKeyTableOverlay {.packed.} = object
+    reserved00*: array[528, uint8]
+    slots*: UncheckedArray[VifKeySlotView]
+
+  VifKeySlotTableOverlay {.packed.} = object
+    reserved00*: array[528, uint8]
+    slots*: UncheckedArray[VifKeySlotView]
+
+  TxSecurityKeyListView {.packed.} = object
+    pairwiseKey*: pointer
+
+  VifAssocInfoOverlay {.packed.} = object
+    reserved00*: array[38, uint8]
+    ssidLen*: uint8
+    ssidData*: array[49, uint8]
+    basicRates*: array[13, uint8]
+    reserved101*: array[3, uint8]
+    modeByte104*: uint8
+    reserved105*: array[31, uint8]
+    securityFlags*: uint32
+    reserved140*: array[4, uint8]
+    rsnIePtr*: uint32
+    rsnIeLen*: uint8
+
+  SecMacRxIndView {.packed.} = object
+    staIdx*: uint8
+    reserved01*: uint8
+    length*: uint16
+    payload*: UncheckedArray[uint8]
 
   ApmTxDescPsView {.packed.} = object
     reserved0*: array[4, uint8]
@@ -1100,7 +1308,8 @@ type
     staDesc*: pointer
 
   HostTxDescView {.packed.} = object
-    reserved0*: array[8, uint8]
+    link*: CoListHdr
+    descWord4*: uint32
     queueFirst*: pointer
     seqPassthrough*: uint16
     reserved14*: array[2, uint8]
@@ -1114,7 +1323,7 @@ type
     reserved44*: array[2, uint8]
     staIdx*: uint8
     vifIdx*: uint8
-    reserved48*: uint8
+    hostVifType*: uint8
     staInfoIdx*: uint8
     reserved50*: array[2, uint8]
     bufferPtrs*: array[4, uint32]
@@ -1130,7 +1339,14 @@ type
     dmaLink*: pointer
     bufDesc*: pointer
     hwDesc*: pointer
-    reserved116*: array[92, uint8]
+    aggDescPtr*: uint32
+    reserved120*: array[52, uint8]
+    retryCount*: uint32
+    lifetime*: uint32
+    txFlags*: uint32
+    reserved184*: array[4, uint8]
+    aggDescStorage*: array[16, uint8]
+    cfmStatus*: uint32
     callback*: pointer
     callbackArg*: pointer
     usedFlag*: uint8
@@ -1163,6 +1379,28 @@ type
     payloadEnd*: uint32
     flags*: uint32
 
+  HostTxThdConfirmView {.packed.} = object
+    magic*: uint32
+    next*: pointer
+    payloadStart*: uint32
+    confirmType*: uint16
+    reserved14*: uint16
+    flags*: uint32
+
+  TxDumpRateDescView {.packed.} = object
+    word0*: uint32
+    word4*: uint32
+    word8*: uint32
+    word12*: uint32
+    next*: pointer
+    policy0*: array[4, uint32]
+    policy1*: array[4, uint32]
+
+  TxDumpBufferDescView {.packed.} = object
+    word0*: uint32
+    next*: pointer
+    word8*: uint32
+
   HostTxMicScratchView {.packed.} = object
     magic*: uint32
     word320*: uint32
@@ -1171,10 +1409,35 @@ type
     pending*: uint32
     data*: array[12, uint8]
 
+  CfgApiElementEntryView {.packed.} = object
+    id*: uint32
+    subId*: uint16
+    typeId*: uint16
+    name*: pointer
+    data*: pointer
+    setHandler*: pointer
+    reserved20*: array[8, uint8]
+
   HostTxLinkDescView {.packed.} = object
     reserved0*: uint32
     headerLen*: uint32
     reserved8*: array[64, uint8]
+    headerThd*: HostTxThdEntryView
+    payloadThd*: array[4, HostTxThdEntryView]
+    reserved172*: array[84, uint8]
+    rateTemplate*: array[52, uint8]
+    word308*: uint32
+    word312*: uint32
+    micScratch*: HostTxMicScratchView
+    macHeader*: UncheckedArray[uint8]
+
+  HostTxInternalLinkNodeView {.packed.} = object
+    reserved0*: uint32
+    headerLen*: uint32
+    reserved8*: array[8, uint8]
+    next*: pointer
+    txDesc*: pointer
+    reserved24*: array[48, uint8]
     headerThd*: HostTxThdEntryView
     payloadThd*: array[4, HostTxThdEntryView]
     reserved172*: array[84, uint8]
@@ -1239,6 +1502,31 @@ type
     word52*: uint32
     word56*: uint32
 
+  TxlFrameDescSlotView {.packed.} = object
+    desc*: HostTxDescView
+    reserved219*: uint8
+
+  TxlFrameLinkSlotView {.packed.} = object
+    storage*: array[860, uint8]
+
+  TxlFrameHwDescSlotView {.packed.} = object
+    desc*: HostTxHwDescView
+    reserved68*: array[4, uint8]
+
+  TxlFrameHwCfmSlotView {.packed.} = object
+    words*: array[5, uint32]
+
+  TxlFramePayloadSlotView {.packed.} = object
+    desc*: TxBufferControlView
+
+  TxlBackupQueueView {.packed.} = object
+    first*: pointer
+    last*: pointer
+
+  TxlBufferEnvView {.packed.} = object
+    reserved00*: array[180, uint8]
+    backupQueues*: array[5, TxlBackupQueueView]
+
   MacDataFrameHeaderView {.packed.} = object
     frameControl*: uint16
     duration*: uint16
@@ -1261,11 +1549,67 @@ type
     duration*: uint16
     receiverAddr*: array[6, uint8]
 
+  PsPollFrameHeaderView {.packed.} = object
+    frameControl*: uint16
+    aid*: uint16
+    bssid*: array[6, uint8]
+    transmitterAddr*: array[6, uint8]
+
+  SaQueryActionBodyView {.packed.} = object
+    category*: uint8
+    action*: uint8
+    transId*: uint16
+
   TxSecurityHeaderView {.packed.} = object
     w0*: uint16
     w1*: uint16
     w2*: uint16
     w3*: uint16
+
+  TxPnScratchView {.packed.} = object
+    lo*: uint16
+    mid*: uint16
+    hi*: uint16
+
+  LlcSnapHeaderView {.packed.} = object
+    dsap*: uint8
+    ssap*: uint8
+    control*: uint8
+    oui*: array[3, uint8]
+    ethertype*: uint16
+
+  MacFrameControlView {.packed.} = object
+    frameControl*: uint16
+
+  RxMsduSnapView {.packed.} = object
+    snap*: LlcSnapHeaderView
+    payload*: UncheckedArray[uint8]
+
+  TxFrameBuildLayout = object
+    mac*: ptr MacQosDataFrameHeaderView
+    sec*: ptr TxSecurityHeaderView
+    snap*: ptr LlcSnapHeaderView
+    macLen*: uint8
+    secLen*: uint8
+    snapLen*: uint8
+
+  TxPolicyView {.packed.} = object
+    status*: uint32
+    bufferAddr*: uint32
+    bufferMask*: uint32
+    packetType*: uint32
+    controlInfo*: uint32
+    retryRate*: array[4, uint32]
+    txPower*: array[4, uint32]
+    edcaParam0*: uint32
+    edcaParam1*: uint32
+
+  MichaelMicContextView {.packed.} = object
+    left*: uint32
+    right*: uint32
+    pending*: uint32
+    nBytes*: uint8
+    reserved13*: array[3, uint8]
 
   StaInfoView {.packed.} = object
     link*: CoListHdr
@@ -1311,7 +1655,7 @@ type
     vhtCaps*: array[32, uint8]
     reserved296*: array[12, uint8]
     capabilityFlags*: uint32
-    reserved312*: uint8
+    bwConfigState*: uint8
     nssBwMax*: uint8
     psState*: uint8
     uapsdBitmap*: uint8
@@ -1332,6 +1676,18 @@ type
     bwField*: uint16
     reserved84*: array[46, uint8]
     secondaryBw*: uint16
+
+  StaTxSequenceOverlay {.packed.} = object
+    reserved00*: array[28, uint8]
+    seqCounter*: uint16
+
+  RxuQosSeqCacheEntryView {.packed.} = object
+    seqCtrl*: uint16
+    reserved02*: array[182, uint8]
+
+  RxuQosSeqCacheTableOverlay {.packed.} = object
+    reservedBefore*: array[169 * 184, uint8]
+    entries*: UncheckedArray[RxuQosSeqCacheEntryView]
 
   ApSelfStaStartOverlay {.packed.} = object
     reserved00*: array[4, uint8]
@@ -1425,6 +1781,26 @@ type
     reserved88*: array[6, uint8]
     bssidSeq*: uint16
 
+  CcmpSecurityHeaderView {.packed.} = object
+    pn0*: uint8
+    pn1*: uint8
+    reserved2*: uint8
+    keyId*: uint8
+    pn2*: uint8
+    pn3*: uint8
+    pn4*: uint8
+    pn5*: uint8
+
+  TkipSecurityHeaderView {.packed.} = object
+    tsc1*: uint8
+    wepSeed*: uint8
+    tsc0*: uint8
+    keyId*: uint8
+    tsc2*: uint8
+    tsc3*: uint8
+    tsc4*: uint8
+    tsc5*: uint8
+
   RxlCntrlEnvView {.packed.} = object
     queue*: CoList
     submittedHead*: pointer
@@ -1438,8 +1814,36 @@ type
     pdTail*: pointer
     pdCurrent*: pointer
 
+  RxHeaderHwDescView {.packed.} = object
+    magic*: uint32
+    next*: pointer
+    bufferAddr*: uint32
+    swDesc*: uint32
+    nextThd*: uint32
+    status*: uint32
+    reserved24*: uint32
+    statusHalf*: uint16
+    statusHalf2*: uint16
+    word32*: uint32
+    word36*: uint32
+    reserved40*: uint32
+    word44*: uint32
+    word48*: uint32
+    word52*: uint32
+    word56*: uint32
+    word60*: uint32
+    flags*: uint32
+    reserved68*: array[28, uint8]
+    usedFlag*: uint32
+
+  RxSwTableDescView {.packed.} = object
+    reserved00*: uint32
+    firstHeaderDesc*: pointer
+    reserved08*: array[16, uint8]
+
   RxSwDescView {.packed.} = object
-    reserved00*: array[8, uint8]
+    reserved00*: uint32
+    firstDmaDesc*: pointer
     bufferChain*: pointer
     reserved12*: array[16, uint8]
     payloadLenHalf*: uint16
@@ -1461,8 +1865,96 @@ type
     reserved08*: uint32
     prevDesc*: pointer
     curDesc*: pointer
-    reserved20*: uint8
+    descFlag*: uint8
     descCount*: uint8
+
+  RxPayloadHwDescView {.packed.} = object
+    magic*: uint32
+    next*: pointer
+    bufferAddr*: uint32
+    bufferEnd*: uint32
+    status*: uint32
+    usedFlag*: uint32
+    bufferStart*: uint32
+    frameLen*: uint16
+    reserved30*: array[22, uint8]
+
+  RxPayloadBufferView {.packed.} = object
+    bytes*: array[1736, uint8]
+
+  RxFrameBufferRefView {.packed.} = object
+    reserved00*: array[24, uint8]
+    frameData*: pointer
+
+  RxFrameBufferChainView {.packed.} = object
+    reserved00*: uint32
+    next*: pointer
+    frameData*: pointer
+
+  RxDmaProgressDescView {.packed.} = object
+    reserved00*: uint32
+    next*: pointer
+    reserved08*: array[8, uint8]
+    status*: uint16
+    reserved18*: uint16
+    usedFlag*: uint32
+
+  RxMicFailureIndView {.packed.} = object
+    bssid*: array[6, uint8]
+    reserved06*: array[2, uint8]
+    pnLow*: uint32
+    pnHigh*: uint32
+    tid*: uint8
+    keyType*: uint8
+    vifIdx*: uint8
+    hwRxhdrHigh*: uint8
+    reserved20*: uint32
+
+  RxEthernetRewriteHeaderView {.packed.} = object
+    da*: array[6, uint8]
+    sa*: array[6, uint8]
+    ethertype*: uint16
+
+  RxuMgtIndMsgView {.packed.} = object
+    frameLen*: uint16
+    frameCtrl*: uint16
+    freq*: uint16
+    band*: uint8
+    vifIdx*: uint8
+    rxuVifIdx*: uint8
+    reserved09*: array[7, uint8]
+    timestampLow*: uint32
+    timestampHigh*: uint32
+    phyVector11*: uint8
+    rssi*: int8
+    noiseFloor*: int8
+    secondary*: uint8
+    phyVector0*: uint8
+    reserved29*: array[3, uint8]
+    body*: UncheckedArray[uint8]
+
+  RxUploadDmaArrayView {.packed.} = object
+    bufferAddrs*: array[4, uint32]
+    reserved16*: array[16, uint8]
+    lengths*: array[4, uint16]
+
+  RxuUploadEnvView {.packed.} = object
+    reserved00*: array[20, uint8]
+    uploadCount*: uint32
+    reserved24*: uint32
+
+  RxlHwdescCallbackEnvView {.packed.} = object
+    reserved00*: array[20, uint8]
+    getStatus*: pointer
+    clean*: pointer
+
+  RxlSubmittedDescView {.packed.} = object
+    reserved00*: uint32
+    next*: pointer
+    bufferChain*: pointer
+    swDesc*: pointer
+    reserved16*: array[48, uint8]
+    status*: uint32
 
   BeaconRxDescView {.packed.} = object
     reserved00*: array[8, uint8]
@@ -1487,6 +1979,14 @@ type
     tsfHigh*: uint32
     beaconInterval*: uint16
     capabilityInfo*: uint16
+    body*: UncheckedArray[uint8]
+
+  ProbeRspFixedBodyView {.packed.} = object
+    tsfLow*: uint32
+    tsfHigh*: uint32
+    beaconInterval*: uint16
+    capabilityInfo*: uint16
+    body*: UncheckedArray[uint8]
 
   HtMcsNssPrefixView {.packed.} = object
     nss0*: uint8
@@ -1520,6 +2020,10 @@ type
     srcId*: uint8           # source task (offset 7)
     paramLen*: uint32       # parameter length (offset 8)
     # payload follows at offset 12
+
+  KeMsgEnvelope* {.packed.} = object
+    header*: KeMsgHdr
+    payload*: UncheckedArray[uint8]
 
   MmVersionCfmPayload {.packed.} = object
     fwVersion*: uint32
@@ -1618,6 +2122,34 @@ type
     tid*: uint8
     dialogToken*: uint8
 
+  AddBaReqActionBodyView {.packed.} = object
+    category*: uint8
+    action*: uint8
+    dialogToken*: uint8
+    baParams*: uint16
+    timeout*: uint16
+    startSeq*: uint16
+
+  AddBaRspActionBodyView {.packed.} = object
+    category*: uint8
+    action*: uint8
+    dialogToken*: uint8
+    statusCode*: uint16
+    baParams*: uint16
+    timeout*: uint16
+
+  DelBaActionBodyView {.packed.} = object
+    category*: uint8
+    action*: uint8
+    delbaParams*: uint16
+    reasonCode*: uint16
+
+  DelBaInfoView {.packed.} = object
+    reserved00*: array[13, uint8]
+    initiator*: uint8
+    reserved14*: array[2, uint8]
+    tid*: uint8
+
   SmAuthFrameView {.packed.} = object
     frameLen*: uint16
     reserved02*: array[30, uint8]
@@ -1635,6 +2167,39 @@ type
     statusCode*: uint16
     aid*: uint16
     iesFirst*: uint8
+
+  AuthFixedBodyView {.packed.} = object
+    authAlgo*: uint16
+    authSeq*: uint16
+    statusCode*: uint16
+
+  AuthBodyTraceView {.packed.} = object
+    fixed*: AuthFixedBodyView
+    challengeTag*: uint8
+    challengeLen*: uint8
+
+  AuthChallengeBodyView {.packed.} = object
+    fixed*: AuthFixedBodyView
+    challengeTag*: uint8
+    challengeLen*: uint8
+    challengeText*: array[128, uint8]
+
+  AuthBodyDataView {.packed.} = object
+    fixed*: AuthFixedBodyView
+    data*: UncheckedArray[uint8]
+
+  ManagementReasonBodyView {.packed.} = object
+    reason*: uint16
+
+  AssocReqFixedBodyView {.packed.} = object
+    capabilityInfo*: uint16
+    listenInterval*: uint16
+    reassocBssid*: array[6, uint8]
+
+  AssocRspFixedBodyView {.packed.} = object
+    capabilityInfo*: uint16
+    statusCode*: uint16
+    aid*: uint16
 
   SmDeauthFrameView {.packed.} = object
     reserved00*: array[7, uint8]
@@ -1856,25 +2421,57 @@ type
     keyLen*: uint8
     reserved05*: array[3, uint8]
     keyWords*: array[4, uint32]
-    reserved24*: array[28, uint8]
+    reserved24*: array[16, uint8]
+    macLen*: uint8
+    reserved41*: array[3, uint8]
+    macAddr*: array[6, uint8]
+    reserved50*: array[2, uint8]
     cipherType*: uint8
     keyIdx*: uint8
     spp*: uint8
     keyFlags*: uint8
 
+  IgtkKeyWriteStackView {.packed.} = object
+    reserved00*: array[39, uint8]
+    resultByte*: uint8
+    req*: MachwKeyWriteParamView
+
+  SupplicantKeyParamView {.packed.} = object
+    addrIdx*: uint8
+    keyType*: uint8
+    reserved02*: array[2, uint8]
+    keyLen*: uint8
+    reserved05*: array[3, uint8]
+    keyData*: array[32, uint8]
+    macLen*: uint8
+    reserved41*: array[3, uint8]
+    macAddr*: array[8, uint8]
+    translatedCipher*: uint8
+    keyIdx*: uint8
+    spp*: uint8
+    rawCipher*: uint8
+
+  SupplicantTkipKeyDataView {.packed.} = object
+    temporalKey*: array[16, uint8]
+    micTx*: array[2, uint32]
+    micRx*: array[2, uint32]
+
   VifMgmtAddKeyParamView {.packed.} = object
     staIdx*: uint8
-    reserved01*: array[7, uint8]
+    keyType*: uint8
+    reserved02*: array[2, uint8]
+    keyLen*: uint8
+    reserved05*: array[3, uint8]
     ccmpKeyMaterial*: array[16, uint8]
-    tkipKeyMaterialPrefix*: array[10, uint8]
+    tkipKeyMaterial*: array[16, uint8]
+    macLen*: uint8
+    reserved41*: array[3, uint8]
+    pnLowBytes*: array[4, uint8]
+    pnHighBytes*: array[4, uint8]
     cipherType*: uint8
     keySlot*: uint8
     spp*: uint8
     hasRxPn*: uint8
-    tkipKeyMaterialTail*: array[2, uint8]
-    reserved40*: array[4, uint8]
-    pnLow*: uint32
-    pnHigh*: uint32
     reserved52*: array[4, uint8]
 
   ScanuRawSendCfmPayload {.packed.} = object
@@ -1888,6 +2485,28 @@ type
     nextState*: uint16
     param1*: uint16
     param2*: uint32
+
+  SmConnectIndPayload {.packed.} = object
+    statusCode*: uint16
+    reasonCode*: uint16
+    bssid*: array[6, uint8]
+    securityStatus*: uint8
+    vifIdx*: uint8
+    aid*: uint8
+    channelStatus*: uint8
+    hasWmm*: uint8
+    qosFlag*: uint8
+    assocReqIeLen*: uint16
+    assocRspIeLen*: uint16
+    assocIeBuffer*: array[800, uint8]
+    reserved820*: array[2, uint8]
+    chanBand*: uint8
+    reserved823*: uint8
+    chanPrimFreq*: uint16
+    chanType*: uint8
+    reserved827*: uint8
+    chanCenterFreq1*: uint32
+    chanCenterFreq2*: uint32
 
   SmVifIdxReqPayload {.packed.} = object
     vifIdx*: uint8
@@ -1915,8 +2534,12 @@ type
     reserved*: array[3, uint8]
 
   SmDisconnectIndPayload {.packed.} = object
-    status*: uint8
+    status*: uint16
+    reason*: uint16
     vifIdx*: uint8
+    ftOverDs*: uint8
+    reserved*: array[2, uint8]
+    diagnoseFirst*: pointer
 
   SmDisconnectProcessIndPayload {.packed.} = object
     status*: uint16
@@ -1955,6 +2578,54 @@ type
     dstId*: uint8
     srcId*: uint8
     paramLen*: uint32
+
+  IpcEmbMsgEnvelopeView {.packed.} = object
+    desc*: IpcEmbMsgDescView
+    payload*: UncheckedArray[uint8]
+
+  IpcSharedMsgView {.packed.} = object
+    reserved0*: array[4, uint8]
+    id*: uint16
+    dstId*: uint8
+    srcId*: uint8
+    paramLen*: uint32
+    payload*: UncheckedArray[uint8]
+
+  IpcPayloadWordStreamView {.packed.} = object
+    words*: UncheckedArray[uint32]
+
+  IpcSharedEnvView {.packed.} = object
+    reserved0*: array[4, uint8]
+    id*: uint16
+    dstId*: uint8
+    srcId*: uint8
+    paramLen*: uint32
+    payloadArea*: array[0x24CC - 12, uint8]
+    hostTxListCursor*: CoList
+    hostTxCfmCursor*: CoList
+
+  IpcEmbEnvView {.packed.} = object
+    counter*: uint8
+    reserved1*: array[11, uint8]
+    hostTxList*: ptr CoList
+    hostTxCfmList*: ptr CoList
+
+  IpcHostTxWrapperView {.packed.} = object
+    link*: CoListHdr
+    reserved4*: uint32
+    active*: uint32
+    txDesc*: HostTxDescView
+
+  IpcTxAcDescView {.packed.} = object
+    descriptor*: uint32
+    descPtr*: uint32
+    reserved8*: array[4, uint8]
+    sequence*: uint16
+    busy*: uint8
+    reserved15*: uint8
+
+  IpcTxHwDescWordTableView {.packed.} = object
+    descriptorWords*: array[NUM_TX_QUEUES, uint32]
 
   ScanChannelEntry {.packed.} = object
     prim20Freq*: uint16
@@ -2073,6 +2744,19 @@ const
 
 static:
   doAssert KeMsgHdrSize == 12'u
+  doAssert offsetof(KeMsgEnvelope, header) == 0
+  doAssert offsetof(KeMsgEnvelope, payload) == int(KeMsgHdrSize)
+  doAssert offsetof(NotifierNodeView, callback) == 0
+  doAssert offsetof(NotifierNodeView, next) == 4
+  doAssert offsetof(NotifierNodeView, priority) == 8
+  doAssert sizeof(NotifierNodeView) == 12
+  doAssert offsetof(ElementNotifyContextView, state) == 8
+  doAssert sizeof(ElementNotifyContextView) == 12
+  doAssert sizeof(KeEnvPsFlagsView) == 5
+  doAssert offsetof(KeEnvPsFlagsView, flags) == 0
+  doAssert offsetof(KeEnvPsFlagsView, apPending) == 1
+  doAssert offsetof(KeEnvPsFlagsView, otherPending) == 3
+  doAssert offsetof(KeEnvPsFlagsView, staPending) == 4
   doAssert MmVersionCfmPayloadSize == 24'u32
   doAssert MmStartReqPayloadSize == 9'u32
   doAssert offsetof(MmStartReqPayload, band) == 0
@@ -2119,6 +2803,19 @@ static:
   doAssert offsetof(MeAddBaReqParamView, bufferSize) == 15
   doAssert offsetof(MeAddBaReqParamView, tid) == 16
   doAssert offsetof(MeAddBaReqParamView, dialogToken) == 17
+  doAssert sizeof(AddBaReqActionBodyView) == 9
+  doAssert offsetof(AddBaReqActionBodyView, baParams) == 3
+  doAssert offsetof(AddBaReqActionBodyView, timeout) == 5
+  doAssert offsetof(AddBaReqActionBodyView, startSeq) == 7
+  doAssert sizeof(AddBaRspActionBodyView) == 9
+  doAssert offsetof(AddBaRspActionBodyView, statusCode) == 3
+  doAssert offsetof(AddBaRspActionBodyView, baParams) == 5
+  doAssert offsetof(AddBaRspActionBodyView, timeout) == 7
+  doAssert sizeof(DelBaActionBodyView) == 6
+  doAssert offsetof(DelBaActionBodyView, delbaParams) == 2
+  doAssert offsetof(DelBaActionBodyView, reasonCode) == 4
+  doAssert offsetof(DelBaInfoView, initiator) == 13
+  doAssert offsetof(DelBaInfoView, tid) == 16
   doAssert sizeof(SmAuthFrameView) == 41
   doAssert offsetof(SmAuthFrameView, frameLen) == 0
   doAssert offsetof(SmAuthFrameView, authAlgo) == 32
@@ -2132,6 +2829,25 @@ static:
   doAssert offsetof(SmAssocRspFrameView, statusCode) == 34
   doAssert offsetof(SmAssocRspFrameView, aid) == 36
   doAssert offsetof(SmAssocRspFrameView, iesFirst) == 38
+  doAssert sizeof(AuthFixedBodyView) == 6
+  doAssert offsetof(AuthFixedBodyView, authSeq) == 2
+  doAssert offsetof(AuthFixedBodyView, statusCode) == 4
+  doAssert sizeof(AuthBodyTraceView) == 8
+  doAssert offsetof(AuthBodyTraceView, challengeTag) == 6
+  doAssert offsetof(AuthBodyTraceView, challengeLen) == 7
+  doAssert sizeof(AuthChallengeBodyView) == 136
+  doAssert offsetof(AuthChallengeBodyView, challengeTag) == 6
+  doAssert offsetof(AuthChallengeBodyView, challengeLen) == 7
+  doAssert offsetof(AuthChallengeBodyView, challengeText) == 8
+  doAssert offsetof(AuthBodyDataView, data) == sizeof(AuthFixedBodyView)
+  doAssert sizeof(ManagementReasonBodyView) == 2
+  doAssert offsetof(ManagementReasonBodyView, reason) == 0
+  doAssert sizeof(AssocReqFixedBodyView) == 10
+  doAssert offsetof(AssocReqFixedBodyView, listenInterval) == 2
+  doAssert offsetof(AssocReqFixedBodyView, reassocBssid) == 4
+  doAssert sizeof(AssocRspFixedBodyView) == 6
+  doAssert offsetof(AssocRspFixedBodyView, statusCode) == 2
+  doAssert offsetof(AssocRspFixedBodyView, aid) == 4
   doAssert sizeof(SmDeauthFrameView) == 58
   doAssert offsetof(SmDeauthFrameView, saQueryVifIdx) == 7
   doAssert offsetof(SmDeauthFrameView, vifIdx) == 8
@@ -2217,29 +2933,65 @@ static:
   doAssert offsetof(MachwKeyWriteParamView, keyType) == 1
   doAssert offsetof(MachwKeyWriteParamView, keyLen) == 4
   doAssert offsetof(MachwKeyWriteParamView, keyWords) == 8
+  doAssert offsetof(MachwKeyWriteParamView, macLen) == 40
+  doAssert offsetof(MachwKeyWriteParamView, macAddr) == 44
   doAssert offsetof(MachwKeyWriteParamView, cipherType) == 52
   doAssert offsetof(MachwKeyWriteParamView, keyIdx) == 53
   doAssert offsetof(MachwKeyWriteParamView, spp) == 54
   doAssert offsetof(MachwKeyWriteParamView, keyFlags) == 55
-  doAssert sizeof(VifMgmtAddKeyParamView) == 56
+  doAssert sizeof(IgtkKeyWriteStackView) == 96
+  doAssert offsetof(IgtkKeyWriteStackView, resultByte) == 39
+  doAssert offsetof(IgtkKeyWriteStackView, req) == 40
+  doAssert sizeof(SupplicantKeyParamView) == 56
+  doAssert offsetof(SupplicantKeyParamView, addrIdx) == 0
+  doAssert offsetof(SupplicantKeyParamView, keyType) == 1
+  doAssert offsetof(SupplicantKeyParamView, keyLen) == 4
+  doAssert offsetof(SupplicantKeyParamView, keyData) == 8
+  doAssert offsetof(SupplicantKeyParamView, macLen) == 40
+  doAssert offsetof(SupplicantKeyParamView, macAddr) == 44
+  doAssert offsetof(SupplicantKeyParamView, translatedCipher) == 52
+  doAssert offsetof(SupplicantKeyParamView, keyIdx) == 53
+  doAssert offsetof(SupplicantKeyParamView, spp) == 54
+  doAssert offsetof(SupplicantKeyParamView, rawCipher) == 55
+  doAssert sizeof(SupplicantTkipKeyDataView) == 32
+  doAssert offsetof(SupplicantTkipKeyDataView, temporalKey) == 0
+  doAssert offsetof(SupplicantTkipKeyDataView, micTx) == 16
+  doAssert offsetof(SupplicantTkipKeyDataView, micRx) == 24
   doAssert offsetof(VifMgmtAddKeyParamView, staIdx) == 0
   doAssert offsetof(VifMgmtAddKeyParamView, ccmpKeyMaterial) == 8
-  doAssert offsetof(VifMgmtAddKeyParamView, tkipKeyMaterialPrefix) == 24
-  doAssert offsetof(VifMgmtAddKeyParamView, cipherType) == 34
-  doAssert offsetof(VifMgmtAddKeyParamView, keySlot) == 35
-  doAssert offsetof(VifMgmtAddKeyParamView, spp) == 36
-  doAssert offsetof(VifMgmtAddKeyParamView, hasRxPn) == 37
-  doAssert offsetof(VifMgmtAddKeyParamView, pnLow) == 44
-  doAssert offsetof(VifMgmtAddKeyParamView, pnHigh) == 48
+  doAssert offsetof(VifMgmtAddKeyParamView, tkipKeyMaterial) == 24
+  doAssert offsetof(VifMgmtAddKeyParamView, pnLowBytes) == 44
+  doAssert offsetof(VifMgmtAddKeyParamView, pnHighBytes) == 48
+  doAssert offsetof(VifMgmtAddKeyParamView, cipherType) == 52
+  doAssert offsetof(VifMgmtAddKeyParamView, keySlot) == 53
+  doAssert offsetof(VifMgmtAddKeyParamView, spp) == 54
+  doAssert offsetof(VifMgmtAddKeyParamView, hasRxPn) == 55
   doAssert ScanuRawSendCfmPayloadSize == 4'u32
   doAssert ScanuRawSendReqPayloadSize == 8'u32
   doAssert SmConnectAuthAssocReqPayloadSize == 8'u32
+  doAssert sizeof(SmConnectIndPayload) == 836
+  doAssert offsetof(SmConnectIndPayload, statusCode) == 0
+  doAssert offsetof(SmConnectIndPayload, bssid) == 4
+  doAssert offsetof(SmConnectIndPayload, securityStatus) == 10
+  doAssert offsetof(SmConnectIndPayload, vifIdx) == 11
+  doAssert offsetof(SmConnectIndPayload, aid) == 12
+  doAssert offsetof(SmConnectIndPayload, channelStatus) == 13
+  doAssert offsetof(SmConnectIndPayload, hasWmm) == 14
+  doAssert offsetof(SmConnectIndPayload, qosFlag) == 15
+  doAssert offsetof(SmConnectIndPayload, assocReqIeLen) == 16
+  doAssert offsetof(SmConnectIndPayload, assocRspIeLen) == 18
+  doAssert offsetof(SmConnectIndPayload, assocIeBuffer) == 20
+  doAssert offsetof(SmConnectIndPayload, chanBand) == 822
+  doAssert offsetof(SmConnectIndPayload, chanPrimFreq) == 824
+  doAssert offsetof(SmConnectIndPayload, chanType) == 826
+  doAssert offsetof(SmConnectIndPayload, chanCenterFreq1) == 828
+  doAssert offsetof(SmConnectIndPayload, chanCenterFreq2) == 832
   doAssert SmVifIdxReqPayloadSize == 1'u32
   doAssert MmMonitorReqPayloadSize == 4'u32
   doAssert MmMonitorCfmPayloadSize == 40'u32
   doAssert StatusCfmPayloadSize == 1'u32
   doAssert Status4CfmPayloadSize == 4'u32
-  doAssert SmDisconnectIndPayloadSize == 2'u32
+  doAssert SmDisconnectIndPayloadSize == 12'u32
   doAssert SmDisconnectProcessIndPayloadSize == 16'u32
   doAssert SmDisconnectReasonPayloadSize == 2'u32
   doAssert SmStaAddIndPayloadSize == 3'u32
@@ -2248,6 +3000,32 @@ static:
   doAssert MmStaDelKeyCfmPayloadSize == 2'u32
   doAssert BamTrafficStatusPayloadSize == 56'u32
   doAssert IpcEmbMsgDescViewSize == 8'u32
+  doAssert offsetof(IpcEmbMsgEnvelopeView, desc) == 0
+  doAssert offsetof(IpcEmbMsgEnvelopeView, payload) == 8
+  doAssert offsetof(IpcSharedMsgView, id) == 4
+  doAssert offsetof(IpcSharedMsgView, dstId) == 6
+  doAssert offsetof(IpcSharedMsgView, srcId) == 7
+  doAssert offsetof(IpcSharedMsgView, paramLen) == 8
+  doAssert offsetof(IpcSharedMsgView, payload) == 12
+  doAssert sizeof(IpcSharedEnvView) == 0x24DC
+  doAssert offsetof(IpcSharedEnvView, id) == 4
+  doAssert offsetof(IpcSharedEnvView, payloadArea) == 12
+  doAssert offsetof(IpcSharedEnvView, hostTxListCursor) == 0x24CC
+  doAssert offsetof(IpcSharedEnvView, hostTxCfmCursor) == 0x24D4
+  doAssert sizeof(IpcEmbEnvView) == 20
+  doAssert offsetof(IpcEmbEnvView, counter) == 0
+  doAssert offsetof(IpcEmbEnvView, hostTxList) == 12
+  doAssert offsetof(IpcEmbEnvView, hostTxCfmList) == 16
+  doAssert offsetof(IpcHostTxWrapperView, active) == 8
+  doAssert offsetof(IpcHostTxWrapperView, txDesc) == 12
+  doAssert sizeof(IpcTxAcDescView) == 16
+  doAssert IPC_TX_AC_DESC_STRIDE == sizeof(IpcTxAcDescView).uint32
+  doAssert offsetof(IpcTxAcDescView, descriptor) == 0
+  doAssert offsetof(IpcTxAcDescView, descPtr) == 4
+  doAssert offsetof(IpcTxAcDescView, sequence) == 12
+  doAssert offsetof(IpcTxAcDescView, busy) == 14
+  doAssert sizeof(IpcTxHwDescWordTableView) == NUM_TX_QUEUES * sizeof(uint32)
+  doAssert offsetof(IpcTxHwDescWordTableView, descriptorWords) == 0
   doAssert ScanChannelEntrySize == 6'u32
   doAssert ScanSsidSlotViewSize == 34'u32
   doAssert offsetof(ScanSsidSlotView, length) == 0
@@ -2271,6 +3049,55 @@ static:
   doAssert offsetof(TxControlEnvView, resetInProgress) == 88
   doAssert sizeof(TxCfmEnvView) == 40
   doAssert offsetof(TxCfmEnvView, lists) == 0
+  doAssert offsetof(MachwTxQueueRegsView, txStatus) == 0x78
+  doAssert offsetof(MachwTxQueueRegsView, readyAck) == 0x7C
+  doAssert offsetof(MachwTxQueueRegsView, txAggSet) == 0x88
+  doAssert offsetof(MachwTxQueueRegsView, txAggActive) == 0x8C
+  doAssert offsetof(MachwTxQueueRegsView, txTrigger) == 0x180
+  doAssert offsetof(MachwTxQueueRegsView, dmaStatus) == 0x188
+  doAssert offsetof(MachwTxQueueRegsView, beaconHead) == 0x198
+  doAssert offsetof(MachwTxQueueRegsView, ac0Head) == 0x19C
+  doAssert offsetof(MachwTxQueueRegsView, ac3Head) == 0x1A8
+  doAssert offsetof(MachwRxDmaRegsView, trigger) == 0x180
+  doAssert offsetof(MachwRxDmaRegsView, hdSubmittedHead) == 0x1B8
+  doAssert offsetof(MachwRxDmaRegsView, pdSubmittedHead) == 0x1BC
+  doAssert offsetof(MachwRxDmaRegsView, hdHwHead) == 0x548
+  doAssert offsetof(MachwRxDmaRegsView, pdHwHead) == 0x54C
+  doAssert offsetof(MachwSecurityRegsView, keyMaterial) == 0x0AC
+  doAssert offsetof(MachwSecurityRegsView, dataLow) == 0x0BC
+  doAssert offsetof(MachwSecurityRegsView, dataHigh) == 0x0C0
+  doAssert offsetof(MachwSecurityRegsView, control) == 0x0C4
+  doAssert offsetof(MachwSecurityRegsView, keyCount) == 0x0D8
+  doAssert offsetof(WlanCoexRegsView, control) == 0x00
+  doAssert offsetof(WlanCoexRegsView, pti) == 0x04
+  doAssert offsetof(WlanCoexRegsView, status) == 0x08
+  doAssert offsetof(PtaCoexRegsView, control) == 0x004
+  doAssert offsetof(PtaCoexRegsView, control2) == 0x028
+  doAssert offsetof(PtaCoexRegsView, mirror) == 0x404
+  doAssert offsetof(PtaCoexRegsView, clear) == 0x428
+  doAssert sizeof(RcRateEntryView) == RC_RATE_ENTRY_SIZE
+  doAssert offsetof(RcRateEntryView, attempts) == 4
+  doAssert offsetof(RcRateEntryView, failures) == 6
+  doAssert offsetof(RcRateEntryView, probEwma) == 8
+  doAssert offsetof(RcRateEntryView, rateConfig) == 10
+  doAssert offsetof(RcRateResetFieldsView, attempts0) == 0
+  doAssert offsetof(RcRateResetFieldsView, oldProb) == 5
+  doAssert offsetof(RcRateResetFieldsView, sampleSkipped) == 6
+  doAssert offsetof(RcRateResetFieldsView, initialized) == 7
+  doAssert sizeof(RcRetrySlotView) == 8
+  doAssert offsetof(RcStatsCounterView, retrySlots) == 128
+  doAssert offsetof(RcStatsCounterView, sampleCandidate) == RCS_SAMPLE_CAND
+  doAssert offsetof(RcStatsCounterView, totalAttempts) == RCS_TOTAL_ATTEMPTS
+  doAssert offsetof(RcStatsCounterView, totalSuccess) == RCS_TOTAL_SUCCESS
+  doAssert offsetof(RcStatsCounterView, avgAmpduLen) == RCS_AVG_AMPDU_LEN
+  doAssert offsetof(RcStatsCounterView, retryLimit) == RCS_RETRY_LIMIT
+  doAssert offsetof(RcStatsCounterView, updateStage) == RCS_UPDATE_STAGE
+  doAssert offsetof(RcStatsCounterView, flags) == RCS_FLAGS
+  doAssert offsetof(RcStatsCounterView, nssMax) == 187
+  doAssert offsetof(RcStatsCounterView, bwMax) == 188
+  doAssert offsetof(RcStatsCounterView, legacyRateMap) == RCS_RATE_MAP_L
+  doAssert offsetof(RcStatsCounterView, fixedRate) == 198
+  doAssert sizeof(RcStatsCounterView) == RC_STATS_SIZE
   doAssert sizeof(TxFrameEnvView) == 20
   doAssert offsetof(TxFrameEnvView, freeList) == 0
   doAssert offsetof(TxFrameEnvView, usedList) == 8
@@ -2290,6 +3117,7 @@ static:
   doAssert sizeof(MeChannelConfigView) == 86
   doAssert offsetof(MeChannelConfigView, entries) == 0
   doAssert offsetof(MeChannelConfigView, count) == 84
+  doAssert offsetof(MeBeaconSequenceOverlay, seqCounter) == 84
   doAssert sizeof(MmEnvView) == 68
   doAssert offsetof(MmEnvView, rxFilterBase) == 0
   doAssert offsetof(MmEnvView, rxFilterExtra) == 4
@@ -2307,6 +3135,12 @@ static:
   doAssert offsetof(MmEnvView, uploadWord44) == 44
   doAssert offsetof(MmEnvView, word48) == 48
   doAssert offsetof(MmEnvView, maxAmpduDuration) == 52
+  doAssert offsetof(MmWmmParameterSourceView, acBk) == 8
+  doAssert offsetof(MmWmmParameterSourceView, acBe) == 12
+  doAssert offsetof(MmWmmParameterSourceView, acVi) == 16
+  doAssert offsetof(MmWmmParameterSourceView, acVo) == 20
+  doAssert offsetof(MmWmmParameterSourceView, idlePeriod) == 24
+  doAssert offsetof(MmWmmParameterSourceView, idleOptions) == 26
   doAssert sizeof(MmBcnEnvView) == 20
   doAssert offsetof(MmBcnEnvView, templatePtr) == 0
   doAssert offsetof(MmBcnEnvView, pendingCount) == 4
@@ -2338,6 +3172,11 @@ static:
   doAssert offsetof(VifMgmtEnvView, staCount) == 16
   doAssert offsetof(VifMgmtEnvView, apCount) == 17
   doAssert offsetof(VifMgmtEnvView, primaryApIdx) == 18
+  doAssert offsetof(VifMgmtHostapdOpsEnvView, hostapdOps) == 12
+  doAssert offsetof(VifHostapdPrivView, hostapdPriv) == 364
+  doAssert offsetof(VifApProbeSsidOverlay, hiddenSsidMode) == 385
+  doAssert offsetof(VifApProbeSsidOverlay, ssidLen) == 386
+  doAssert offsetof(VifApProbeSsidOverlay, ssidData) == 387
 
   doAssert sizeof(PsEnvView) == 56
   doAssert offsetof(PsEnvView, enabled) == 0
@@ -2355,6 +3194,8 @@ static:
   doAssert offsetof(PsEnvView, uapsdTimerState) == 48
   doAssert offsetof(PsEnvView, flags) == 52
   doAssert offsetof(PsEnvView, deferredMode) == 53
+  doAssert offsetof(PsDozeEnvView, dozeInProgress) == 56
+  doAssert offsetof(PsDozeEnvView, preState) == 60
   doAssert sizeof(SmEnvView) == 56
   doAssert offsetof(SmEnvView, connectInfo) == 0
   doAssert offsetof(SmEnvView, connectIndMsg) == 4
@@ -2490,7 +3331,7 @@ static:
   doAssert offsetof(ChanScanPoolOverlay, durationTicks) == 14
   doAssert offsetof(ChanScanPoolOverlay, active) == 18
   doAssert offsetof(ChanScanPoolOverlay, slot) == 19
-  doAssert offsetof(ChanScanPoolOverlay, band) == 21
+  doAssert offsetof(ChanScanPoolOverlay, requestVifIdx) == 21
   doAssert sizeof(ChanRocOverlay) == 22
   doAssert offsetof(ChanRocOverlay, vifIdx) == 0
   doAssert offsetof(ChanRocOverlay, durationTicks) == 4
@@ -2550,6 +3391,8 @@ static:
   doAssert offsetof(VifChannelView, psBaCounter) == 334
   doAssert offsetof(VifChannelView, apStartBeaconInterval) == 336
   doAssert offsetof(VifChannelView, apChanSwitchPending) == 338
+  doAssert offsetof(VifChannelView, postponedStaHead) == 340
+  doAssert offsetof(VifChannelView, reserved344) == 344
   doAssert offsetof(VifChannelView, bssid) == 380
   doAssert offsetof(VifChannelView, supportedRatesLong) == 386
   doAssert offsetof(VifChannelView, scanBand) == 420
@@ -2573,6 +3416,9 @@ static:
   doAssert offsetof(VifSecurityOverlay, pmfRequired) == 21
   doAssert offsetof(VifSecurityOverlay, staKeySlots) == 22
   doAssert sizeof(VifSecurityOverlay) == 26
+  doAssert offsetof(VifMachwKeyIndexOverlay, primaryPairwise) == 172
+  doAssert offsetof(VifMachwKeyIndexOverlay, secondaryPairwise) == 173
+  doAssert offsetof(VifMachwKeyIndexOverlay, group) == 174
   doAssert offsetof(VifHtCapabilitiesOverlay, capInfo) == 0
   doAssert offsetof(VifHtCapabilitiesOverlay, ampduParams) == 2
   doAssert offsetof(VifHtCapabilitiesOverlay, mcsSet) == 3
@@ -2590,8 +3436,16 @@ static:
   doAssert offsetof(VifApConfigOverlay, requestedAuthType) == 23
   doAssert offsetof(VifApConfigOverlay, securityFlags) == 28
   doAssert offsetof(VifApConfigOverlay, beaconInterval) == 58
-  doAssert offsetof(VifApConfigOverlay, aidBitmapFeature) == 60
+  doAssert offsetof(VifApConfigOverlay, aidBitmapFeatureLow) == 60
+  doAssert offsetof(VifApConfigOverlay, maxAssocRate) == 62
   doAssert offsetof(VifApConfigOverlay, privacyFlag) == 64
+  doAssert offsetof(VifAssocInfoOverlay, ssidLen) == 38
+  doAssert offsetof(VifAssocInfoOverlay, ssidData) == 39
+  doAssert offsetof(VifAssocInfoOverlay, basicRates) == 88
+  doAssert offsetof(VifAssocInfoOverlay, modeByte104) == 104
+  doAssert offsetof(VifAssocInfoOverlay, securityFlags) == 136
+  doAssert offsetof(VifAssocInfoOverlay, rsnIePtr) == 144
+  doAssert offsetof(VifAssocInfoOverlay, rsnIeLen) == 148
   doAssert sizeof(KeyReplayCounterView) == 16
   doAssert sizeof(ReplayCounterWindowSlot) == 12
   doAssert offsetof(ReplayCounterWindowSlot, valid) == 8
@@ -2609,10 +3463,37 @@ static:
   doAssert offsetof(VifKeySlotView, installed) == 155
   doAssert offsetof(VifKeySlotView, hasRxPn) == 156
   doAssert sizeof(VifKeySlotView) == 160
+  doAssert sizeof(TkipMicKeyAreaView) == 32
+  doAssert offsetof(TkipMicKeyAreaView, scratch) == 4
+  doAssert offsetof(TkipMicKeyAreaView, keyMaterial) == 24
+  doAssert sizeof(RxMicWordsView) == 8
+  doAssert offsetof(RxMicWordsView, hi) == 4
   doAssert offsetof(VifKeyPointersView, defaultKeyPtr) == 0
   doAssert offsetof(VifKeyPointersView, groupKeyPtr) == 4
   doAssert offsetof(VifKeyPointersView, flags) == 8
   doAssert sizeof(VifKeyPointersView) == 12
+  doAssert offsetof(VifRxProtectedKeyTableOverlay, slots) == 528
+  doAssert offsetof(VifKeySlotTableOverlay, slots) == 528
+  doAssert offsetof(TxSecurityKeyListView, pairwiseKey) == 0
+  doAssert sizeof(TxSecurityKeyListView) == sizeof(pointer)
+  doAssert offsetof(SecMacRxIndView, staIdx) == 0
+  doAssert offsetof(SecMacRxIndView, length) == 2
+  doAssert offsetof(SecMacRxIndView, payload) == 4
+  doAssert sizeof(TxPolicyView) == 60
+  doAssert offsetof(TxPolicyView, status) == 0
+  doAssert offsetof(TxPolicyView, bufferAddr) == 4
+  doAssert offsetof(TxPolicyView, bufferMask) == 8
+  doAssert offsetof(TxPolicyView, packetType) == 12
+  doAssert offsetof(TxPolicyView, controlInfo) == 16
+  doAssert offsetof(TxPolicyView, retryRate) == 20
+  doAssert offsetof(TxPolicyView, txPower) == 36
+  doAssert offsetof(TxPolicyView, edcaParam0) == 52
+  doAssert offsetof(TxPolicyView, edcaParam1) == 56
+  doAssert sizeof(MichaelMicContextView) == 16
+  doAssert offsetof(MichaelMicContextView, left) == 0
+  doAssert offsetof(MichaelMicContextView, right) == 4
+  doAssert offsetof(MichaelMicContextView, pending) == 8
+  doAssert offsetof(MichaelMicContextView, nBytes) == 12
   doAssert offsetof(ApmTxDescPsView, staPeer) == 4
   doAssert offsetof(ApmTxDescPsView, staInstNbr) == 39
   doAssert offsetof(ApmTxDescPsView, tid) == 46
@@ -2622,6 +3503,8 @@ static:
   doAssert offsetof(ApmTxDescPsView, pendingCount) == 68
   doAssert offsetof(ApmTxDescPsView, staDesc) == 108
   doAssert offsetof(HostTxDescView, queueFirst) == 8
+  doAssert offsetof(HostTxDescView, link) == 0
+  doAssert offsetof(HostTxDescView, descWord4) == 4
   doAssert offsetof(HostTxDescView, seqPassthrough) == 12
   doAssert offsetof(HostTxDescView, cfmDst) == 16
   doAssert offsetof(HostTxDescView, da) == 20
@@ -2631,6 +3514,7 @@ static:
   doAssert offsetof(HostTxDescView, seqAssigned) == 42
   doAssert offsetof(HostTxDescView, staIdx) == 46
   doAssert offsetof(HostTxDescView, vifIdx) == 47
+  doAssert offsetof(HostTxDescView, hostVifType) == 48
   doAssert offsetof(HostTxDescView, staInfoIdx) == 49
   doAssert offsetof(HostTxDescView, bufferPtrs) == 52
   doAssert offsetof(HostTxDescView, bufferLens) == 68
@@ -2643,11 +3527,19 @@ static:
   doAssert offsetof(HostTxDescView, dmaLink) == 104
   doAssert offsetof(HostTxDescView, bufDesc) == 108
   doAssert offsetof(HostTxDescView, hwDesc) == 112
+  doAssert offsetof(HostTxDescView, aggDescPtr) == 116
+  doAssert offsetof(HostTxDescView, retryCount) == 172
+  doAssert offsetof(HostTxDescView, lifetime) == 176
+  doAssert offsetof(HostTxDescView, txFlags) == 180
+  doAssert offsetof(HostTxDescView, aggDescStorage) == 188
+  doAssert offsetof(HostTxDescView, cfmStatus) == 204
   doAssert offsetof(HostTxDescView, callback) == 208
   doAssert offsetof(HostTxDescView, callbackArg) == 212
   doAssert offsetof(HostTxDescView, usedFlag) == 216
   doAssert offsetof(HostTxDescView, postponeFlag) == 217
   doAssert offsetof(HostTxDescView, retryFlag) == 218
+  doAssert sizeof(TxlFrameDescSlotView) == 220
+  doAssert offsetof(TxlFrameDescSlotView, desc) == 0
   doAssert offsetof(HostTxHwDescView, magic) == 4
   doAssert offsetof(HostTxHwDescView, status) == 16
   doAssert offsetof(HostTxHwDescView, payloadStart) == 20
@@ -2662,7 +3554,20 @@ static:
   doAssert offsetof(HostTxHwDescView, word56) == 56
   doAssert offsetof(HostTxHwDescView, controlFlags) == 60
   doAssert offsetof(HostTxHwDescView, confirmStatus) == 64
+  doAssert sizeof(TxlFrameHwDescSlotView) == 72
+  doAssert offsetof(TxlFrameHwDescSlotView, desc) == 0
   doAssert sizeof(HostTxThdEntryView) == 20
+  doAssert offsetof(HostTxThdEntryView, flags) == 16
+  doAssert sizeof(HostTxThdConfirmView) == 20
+  doAssert offsetof(HostTxThdConfirmView, confirmType) == 12
+  doAssert offsetof(HostTxThdConfirmView, flags) == 16
+  doAssert sizeof(TxDumpRateDescView) == 52
+  doAssert offsetof(TxDumpRateDescView, next) == 16
+  doAssert offsetof(TxDumpRateDescView, policy0) == 20
+  doAssert offsetof(TxDumpRateDescView, policy1) == 36
+  doAssert sizeof(TxDumpBufferDescView) == 12
+  doAssert offsetof(TxDumpBufferDescView, next) == 4
+  doAssert offsetof(TxDumpBufferDescView, word8) == 8
   doAssert sizeof(HostTxMicScratchView) == 32
   doAssert offsetof(HostTxMicScratchView, magic) == 0
   doAssert offsetof(HostTxMicScratchView, word320) == 4
@@ -2670,6 +3575,13 @@ static:
   doAssert offsetof(HostTxMicScratchView, endPtr) == 12
   doAssert offsetof(HostTxMicScratchView, pending) == 16
   doAssert offsetof(HostTxMicScratchView, data) == 20
+  doAssert sizeof(CfgApiElementEntryView) == 28
+  doAssert offsetof(CfgApiElementEntryView, id) == 0
+  doAssert offsetof(CfgApiElementEntryView, subId) == 4
+  doAssert offsetof(CfgApiElementEntryView, typeId) == 6
+  doAssert offsetof(CfgApiElementEntryView, name) == 8
+  doAssert offsetof(CfgApiElementEntryView, data) == 12
+  doAssert offsetof(CfgApiElementEntryView, setHandler) == 16
   doAssert offsetof(HostTxLinkDescView, headerLen) == 4
   doAssert offsetof(HostTxLinkDescView, headerThd) == 72
   doAssert offsetof(HostTxLinkDescView, payloadThd) == 92
@@ -2678,6 +3590,16 @@ static:
   doAssert offsetof(HostTxLinkDescView, word312) == 312
   doAssert offsetof(HostTxLinkDescView, micScratch) == 316
   doAssert offsetof(HostTxLinkDescView, macHeader) == 348
+  doAssert sizeof(TxlFrameLinkSlotView) == 860
+  doAssert offsetof(HostTxInternalLinkNodeView, next) == 16
+  doAssert offsetof(HostTxInternalLinkNodeView, txDesc) == 20
+  doAssert offsetof(HostTxInternalLinkNodeView, headerThd) == 72
+  doAssert offsetof(HostTxInternalLinkNodeView, payloadThd) == 92
+  doAssert offsetof(HostTxInternalLinkNodeView, rateTemplate) == 256
+  doAssert offsetof(HostTxInternalLinkNodeView, word308) == 308
+  doAssert offsetof(HostTxInternalLinkNodeView, word312) == 312
+  doAssert offsetof(HostTxInternalLinkNodeView, micScratch) == 316
+  doAssert offsetof(HostTxInternalLinkNodeView, macHeader) == 348
   doAssert offsetof(HostTxBufferedLinkView, headerLen) == 4
   doAssert offsetof(HostTxBufferedLinkView, padLen) == 8
   doAssert offsetof(HostTxBufferedLinkView, next) == 16
@@ -2695,6 +3617,9 @@ static:
   doAssert offsetof(HostTxRateTemplateView, rateWord) == 20
   doAssert offsetof(HostTxRateTemplateView, txPower) == 36
   doAssert offsetof(HostTxRateTemplateView, word48) == 48
+  doAssert sizeof(PsPollFrameHeaderView) == 16
+  doAssert offsetof(PsPollFrameHeaderView, bssid) == 4
+  doAssert offsetof(PsPollFrameHeaderView, transmitterAddr) == 10
   doAssert sizeof(TxBufferControlView) == 60
   doAssert offsetof(TxBufferControlView, magic) == 0
   doAssert offsetof(TxBufferControlView, ntxConfig) == 4
@@ -2705,6 +3630,17 @@ static:
   doAssert offsetof(TxBufferControlView, txPower) == 36
   doAssert offsetof(TxBufferControlView, word52) == 52
   doAssert offsetof(TxBufferControlView, word56) == 56
+  doAssert sizeof(TxlFramePayloadSlotView) == 60
+  doAssert offsetof(TxlFramePayloadSlotView, desc) == 0
+  doAssert sizeof(TxlFrameHwCfmSlotView) == 20
+  doAssert sizeof(TxlBackupQueueView) == 8
+  doAssert offsetof(TxlBackupQueueView, first) == 0
+  doAssert offsetof(TxlBackupQueueView, last) == 4
+  doAssert offsetof(TxlBufferEnvView, backupQueues) == 180
+  doAssert offsetof(TxlBufferEnvView, backupQueues) +
+    4 * sizeof(TxlBackupQueueView) == 212
+  doAssert offsetof(TxlBufferEnvView, backupQueues) +
+    4 * sizeof(TxlBackupQueueView) + offsetof(TxlBackupQueueView, last) == 216
   doAssert sizeof(MacDataFrameHeaderView) == 24
   doAssert offsetof(MacDataFrameHeaderView, frameControl) == 0
   doAssert offsetof(MacDataFrameHeaderView, addr1) == 4
@@ -2718,7 +3654,23 @@ static:
   doAssert offsetof(MacQos4AddrFrameHeaderView, qosCtrl) == 30
   doAssert sizeof(MacCtsFrameHeaderView) == 10
   doAssert offsetof(MacCtsFrameHeaderView, receiverAddr) == 4
+  doAssert sizeof(SaQueryActionBodyView) == 4
+  doAssert offsetof(SaQueryActionBodyView, category) == 0
+  doAssert offsetof(SaQueryActionBodyView, action) == 1
+  doAssert offsetof(SaQueryActionBodyView, transId) == 2
   doAssert sizeof(TxSecurityHeaderView) == 8
+  doAssert offsetof(TxSecurityHeaderView, w0) == 0
+  doAssert offsetof(TxSecurityHeaderView, w3) == 6
+  doAssert sizeof(TxPnScratchView) == 6
+  doAssert offsetof(TxPnScratchView, lo) == 0
+  doAssert offsetof(TxPnScratchView, mid) == 2
+  doAssert offsetof(TxPnScratchView, hi) == 4
+  doAssert sizeof(LlcSnapHeaderView) == 8
+  doAssert offsetof(LlcSnapHeaderView, dsap) == 0
+  doAssert offsetof(LlcSnapHeaderView, oui) == 3
+  doAssert offsetof(LlcSnapHeaderView, ethertype) == 6
+  doAssert sizeof(MacFrameControlView) == 2
+  doAssert offsetof(MacFrameControlView, frameControl) == 0
   doAssert offsetof(StaInfoView, vif) == STA_VIF_PTR_OFF
   doAssert offsetof(StaInfoView, macAddr) == 4
   doAssert offsetof(StaInfoView, registerWord0) == 12
@@ -2740,6 +3692,7 @@ static:
   doAssert offsetof(StaInfoView, rateWord) == 70
   doAssert offsetof(StaInfoView, rxNss) == 72
   doAssert offsetof(StaInfoView, trafficFlags) == 73
+  doAssert offsetof(StaInfoView, reserved74) == 74
   doAssert offsetof(StaInfoView, keyArea) == 80
   doAssert offsetof(StaInfoView, pnLow) == 208
   doAssert offsetof(StaInfoView, pnHigh) == 212
@@ -2754,6 +3707,7 @@ static:
   doAssert offsetof(StaInfoView, supportedRates) == 248
   doAssert offsetof(StaInfoView, vhtCaps) == 264
   doAssert offsetof(StaInfoView, capabilityFlags) == STA_RATE_INFO_FLAGS_OFF
+  doAssert offsetof(StaInfoView, bwConfigState) == 312
   doAssert offsetof(StaInfoView, nssBwMax) == STA_NSS_BW_MAX_OFF
   doAssert offsetof(StaInfoView, psState) == 314
   doAssert offsetof(StaInfoView, uapsdBitmap) == 315
@@ -2763,9 +3717,14 @@ static:
   doAssert offsetof(StaInfoView, aggregationLength) == 328
   doAssert offsetof(StaInfoView, supportedRatesBitmap) == STA_SUPP_RATES_OFF
   doAssert offsetof(StaInfoView, mmFlagsBytes) == STA_RC_FLAGS_OFF
+  doAssert offsetof(StaInfoView, reserved338) == 338
   doAssert offsetof(StaInfoView, postponedList) == 356
   doAssert offsetof(StaInfoView, apmConnectTime) == 364
   doAssert sizeof(StaInfoView) == STA_ENTRY_SIZE
+  doAssert offsetof(StaTxSequenceOverlay, seqCounter) == 28
+  doAssert offsetof(RxuQosSeqCacheEntryView, seqCtrl) == 0
+  doAssert sizeof(RxuQosSeqCacheEntryView) == 184
+  doAssert offsetof(RxuQosSeqCacheTableOverlay, entries) == 169 * 184
   doAssert sizeof(ApSelfStaStartOverlay) == 335
   doAssert offsetof(ApSelfStaStartOverlay, status) == 4
   doAssert offsetof(ApSelfStaStartOverlay, infoIdx) == 40
@@ -2828,6 +3787,10 @@ static:
   doAssert offsetof(RxuCntrlEnvView, pendingList) == 72
   doAssert offsetof(RxuCntrlEnvView, freeList) == 80
   doAssert offsetof(RxuCntrlEnvView, bssidSeq) == 94
+  doAssert sizeof(CcmpSecurityHeaderView) == 8
+  doAssert offsetof(CcmpSecurityHeaderView, keyId) == 3
+  doAssert sizeof(TkipSecurityHeaderView) == 8
+  doAssert offsetof(TkipSecurityHeaderView, keyId) == 3
   doAssert sizeof(RxlCntrlEnvView) == 28
   doAssert offsetof(RxlCntrlEnvView, queue) == 0
   doAssert offsetof(RxlCntrlEnvView, submittedHead) == 8
@@ -2838,7 +3801,42 @@ static:
   doAssert sizeof(RxHwDescEnvView) == 8
   doAssert offsetof(RxHwDescEnvView, pdTail) == 0
   doAssert offsetof(RxHwDescEnvView, pdCurrent) == 4
+  doAssert sizeof(RxHeaderHwDescView) == 100
+  doAssert offsetof(RxHeaderHwDescView, next) == 4
+  doAssert offsetof(RxHeaderHwDescView, bufferAddr) == 8
+  doAssert offsetof(RxHeaderHwDescView, swDesc) == 12
+  doAssert offsetof(RxHeaderHwDescView, nextThd) == 16
+  doAssert offsetof(RxHeaderHwDescView, status) == 20
+  doAssert offsetof(RxHeaderHwDescView, statusHalf) == 28
+  doAssert offsetof(RxHeaderHwDescView, statusHalf2) == 30
+  doAssert offsetof(RxHeaderHwDescView, word32) == 32
+  doAssert offsetof(RxHeaderHwDescView, word36) == 36
+  doAssert offsetof(RxHeaderHwDescView, word44) == 44
+  doAssert offsetof(RxHeaderHwDescView, word60) == 60
+  doAssert offsetof(RxHeaderHwDescView, flags) == 64
+  doAssert offsetof(RxHeaderHwDescView, usedFlag) == 96
+  doAssert sizeof(RxSwTableDescView) == 24
+  doAssert offsetof(RxSwTableDescView, firstHeaderDesc) == 4
+  doAssert sizeof(RxFrameBufferRefView) == 28
+  doAssert offsetof(RxFrameBufferRefView, frameData) == 24
+  doAssert sizeof(RxFrameBufferChainView) == 12
+  doAssert offsetof(RxFrameBufferChainView, next) == 4
+  doAssert offsetof(RxFrameBufferChainView, frameData) == 8
+  doAssert sizeof(RxDmaProgressDescView) == 24
+  doAssert offsetof(RxDmaProgressDescView, next) == 4
+  doAssert offsetof(RxDmaProgressDescView, status) == 16
+  doAssert offsetof(RxDmaProgressDescView, usedFlag) == 20
+  doAssert sizeof(RxMicFailureIndView) == 24
+  doAssert offsetof(RxMicFailureIndView, pnLow) == 8
+  doAssert offsetof(RxMicFailureIndView, tid) == 16
+  doAssert sizeof(RxuMgtIndMsgView) == 32
+  doAssert offsetof(RxuMgtIndMsgView, frameCtrl) == 2
+  doAssert offsetof(RxuMgtIndMsgView, vifIdx) == 7
+  doAssert offsetof(RxuMgtIndMsgView, timestampLow) == 16
+  doAssert offsetof(RxuMgtIndMsgView, phyVector11) == 24
+  doAssert offsetof(RxuMgtIndMsgView, body) == 32
   doAssert offsetof(RxSwDescView, bufferChain) == 8
+  doAssert offsetof(RxSwDescView, firstDmaDesc) == 4
   doAssert offsetof(RxSwDescView, payloadLenHalf) == 28
   doAssert offsetof(RxSwDescView, timestampLow) == 32
   doAssert offsetof(RxSwDescView, timestampHigh) == 36
@@ -2852,7 +3850,36 @@ static:
   doAssert offsetof(RxMpduDescView, swDesc) == 4
   doAssert offsetof(RxMpduDescView, prevDesc) == 12
   doAssert offsetof(RxMpduDescView, curDesc) == 16
+  doAssert offsetof(RxMpduDescView, descFlag) == 20
   doAssert offsetof(RxMpduDescView, descCount) == 21
+  doAssert offsetof(RxPayloadHwDescView, next) == 4
+  doAssert offsetof(RxPayloadHwDescView, bufferAddr) == 8
+  doAssert offsetof(RxPayloadHwDescView, bufferEnd) == 12
+  doAssert offsetof(RxPayloadHwDescView, status) == 16
+  doAssert offsetof(RxPayloadHwDescView, usedFlag) == 20
+  doAssert offsetof(RxPayloadHwDescView, bufferStart) == 24
+  doAssert offsetof(RxPayloadHwDescView, frameLen) == 28
+  doAssert sizeof(RxPayloadHwDescView) == 52
+  doAssert sizeof(RxPayloadBufferView) == 1736
+  doAssert offsetof(RxFrameBufferRefView, frameData) == 24
+  doAssert sizeof(RxFrameBufferChainView) == 12
+  doAssert offsetof(RxFrameBufferChainView, next) == 4
+  doAssert offsetof(RxFrameBufferChainView, frameData) == 8
+  doAssert sizeof(RxEthernetRewriteHeaderView) == 14
+  doAssert offsetof(RxEthernetRewriteHeaderView, sa) == 6
+  doAssert offsetof(RxEthernetRewriteHeaderView, ethertype) == 12
+  doAssert sizeof(RxUploadDmaArrayView) == 40
+  doAssert offsetof(RxUploadDmaArrayView, bufferAddrs) == 0
+  doAssert offsetof(RxUploadDmaArrayView, lengths) == 32
+  doAssert sizeof(RxuUploadEnvView) == 28
+  doAssert offsetof(RxuUploadEnvView, uploadCount) == 20
+  doAssert sizeof(RxlHwdescCallbackEnvView) == 28
+  doAssert offsetof(RxlHwdescCallbackEnvView, getStatus) == 20
+  doAssert offsetof(RxlHwdescCallbackEnvView, clean) == 24
+  doAssert offsetof(RxlSubmittedDescView, next) == 4
+  doAssert offsetof(RxlSubmittedDescView, bufferChain) == 8
+  doAssert offsetof(RxlSubmittedDescView, swDesc) == 12
+  doAssert offsetof(RxlSubmittedDescView, status) == 64
   doAssert sizeof(BeaconRxDescView) == 52
   doAssert offsetof(BeaconRxDescView, payloadDesc) == 8
   doAssert offsetof(BeaconRxDescView, frameLen) == 28
@@ -2862,13 +3889,34 @@ static:
   doAssert sizeof(BeaconFrameFixedView) == 36
   doAssert offsetof(BeaconFrameFixedView, tsfLow) == 24
   doAssert offsetof(BeaconFrameFixedView, beaconInterval) == 32
+  doAssert offsetof(BeaconFrameFixedView, body) == 36
+  doAssert sizeof(ProbeRspFixedBodyView) == 12
+  doAssert offsetof(ProbeRspFixedBodyView, beaconInterval) == 8
+  doAssert offsetof(ProbeRspFixedBodyView, capabilityInfo) == 10
+  doAssert offsetof(ProbeRspFixedBodyView, body) == 12
   doAssert sizeof(HtMcsNssPrefixView) == 4
 
 template keMsgHdrFromPayload*(param: pointer): ptr KeMsgHdr =
-  cast[ptr KeMsgHdr](cast[uint](param) - KeMsgHdrSize)
+  let envelope = cast[ptr KeMsgEnvelope](
+    cast[uint](param) - offsetof(KeMsgEnvelope, payload).uint)
+  addr envelope.header
 
 template keMsgPayload*(hdr: ptr KeMsgHdr): pointer =
-  cast[pointer](cast[uint](hdr) + KeMsgHdrSize)
+  let envelope = cast[ptr KeMsgEnvelope](hdr)
+  cast[pointer](addr envelope.payload[0])
+
+template ipcPayloadWordStreamAt(payload: pointer): ptr IpcPayloadWordStreamView =
+  cast[ptr IpcPayloadWordStreamView](payload)
+
+proc copyIpcPayloadWords(dst, src: pointer; byteLen: uint32) {.inline.} =
+  if byteLen != 0:
+    discard c_memcpy(dst, src, byteLen.csize_t)
+
+template notifierNodeView(node: ptr CoListHdr): ptr NotifierNodeView =
+  cast[ptr NotifierNodeView](node)
+
+template elementNotifyContextAt(ctx: pointer): ptr ElementNotifyContextView =
+  cast[ptr ElementNotifyContextView](ctx)
 
 template keMsgExternalPayload*(param: pointer): pointer =
   cast[pointer](cast[uint](param) - 8'u)
@@ -2884,6 +3932,20 @@ template encodedArgU32*(p: pointer): uint32 =
 
 template pointerAddrU32*(p: pointer): uint32 =
   cast[uint32](cast[uint](p))
+
+proc debugLoadLe32(p: pointer): uint32 {.inline.} =
+  if p == nil:
+    return 0
+  let b = cast[ptr UncheckedArray[uint8]](p)
+  b[0].uint32 or (b[1].uint32 shl 8) or
+    (b[2].uint32 shl 16) or (b[3].uint32 shl 24)
+
+proc wifiRamPointer(p: pointer): bool {.inline.} =
+  let a = pointerAddrU32(p)
+  ((a >= OcramBase.uint32) and (a < (OcramBase + OcramSize).uint32)) or
+    ((a >= OcramCachedBase.uint32) and (a < (OcramCachedBase + OcramSize).uint32)) or
+    ((a >= WramBase.uint32) and (a < (WramBase + WramSize).uint32)) or
+    ((a >= WramCachedBase.uint32) and (a < (WramCachedBase + WramSize).uint32))
 
 template mmTimerAt(p: pointer): ptr MmTimerView =
   cast[ptr MmTimerView](p)
@@ -2906,6 +3968,156 @@ template txCfmEnv(): ptr TxCfmEnvView =
 template txCfmList(idx: uint32): ptr CoList =
   addr txCfmEnv().lists[idx]
 
+template machwTxQueueRegs(): ptr MachwTxQueueRegsView =
+  cast[ptr MachwTxQueueRegsView](MACHW_INTC_BASE)
+
+template machwRxDmaRegs(): ptr MachwRxDmaRegsView =
+  cast[ptr MachwRxDmaRegsView](MACHW_INTC_BASE)
+
+proc waitRegMaskClear(reg: uint, mask: uint32,
+                      limit: uint32 = 100_000'u32): bool
+
+const MACHW_SECURITY_CTRL_REG = MACHW_BASE + 0x0C4'u
+
+template machwSecurityRegs(): ptr MachwSecurityRegsView =
+  cast[ptr MachwSecurityRegsView](MACHW_BASE)
+
+template wlanCoexRegs(): ptr WlanCoexRegsView =
+  cast[ptr WlanCoexRegsView](MACHW_BCN_STATUS_REG)
+
+template ptaCoexRegs(): ptr PtaCoexRegsView =
+  cast[ptr PtaCoexRegsView](COEX_BASE)
+
+proc wlanCoexControl(): uint32 {.inline.} =
+  volatileLoad(addr wlanCoexRegs().control)
+
+proc wlanCoexPti(): uint32 {.inline.} =
+  volatileLoad(addr wlanCoexRegs().pti)
+
+proc wlanCoexStatus(): uint32 {.inline.} =
+  volatileLoad(addr wlanCoexRegs().status)
+
+proc wlanCoexWriteControl(value: uint32) {.inline.} =
+  volatileStore(addr wlanCoexRegs().control, value)
+
+proc wlanCoexWritePti(value: uint32) {.inline.} =
+  volatileStore(addr wlanCoexRegs().pti, value)
+
+proc ptaCoexControl(): uint32 {.inline.} =
+  volatileLoad(addr ptaCoexRegs().control)
+
+proc ptaCoexControl2(): uint32 {.inline.} =
+  volatileLoad(addr ptaCoexRegs().control2)
+
+proc ptaCoexMirror(): uint32 {.inline.} =
+  volatileLoad(addr ptaCoexRegs().mirror)
+
+proc ptaCoexWriteControl(value: uint32) {.inline.} =
+  volatileStore(addr ptaCoexRegs().control, value)
+
+proc ptaCoexWriteControl2(value: uint32) {.inline.} =
+  volatileStore(addr ptaCoexRegs().control2, value)
+
+proc ptaCoexWriteMirror(value: uint32) {.inline.} =
+  volatileStore(addr ptaCoexRegs().mirror, value)
+
+proc ptaCoexClear() {.inline.} =
+  volatileStore(addr ptaCoexRegs().clear, 0'u32)
+
+proc ptaCoexUpdateControl(keepMask, setMask: uint32) {.inline.} =
+  ptaCoexWriteControl((ptaCoexControl() and keepMask) or setMask)
+
+proc machwSecurityWriteAddress(lo, hi: uint32) {.inline.} =
+  let regs = machwSecurityRegs()
+  volatileStore(addr regs.dataLow, lo)
+  volatileStore(addr regs.dataHigh, hi)
+
+proc machwSecurityClearKeyMaterial() {.inline.} =
+  let regs = machwSecurityRegs()
+  for i in 0 ..< regs.keyMaterial.len:
+    volatileStore(addr regs.keyMaterial[i], 0'u32)
+
+proc machwSecurityWriteKeyMaterial(words: array[4, uint32]) {.inline.} =
+  let regs = machwSecurityRegs()
+  for i in 0 ..< regs.keyMaterial.len:
+    volatileStore(addr regs.keyMaterial[i], words[i])
+
+proc machwSecurityWriteControl(value: uint32) {.inline.} =
+  volatileStore(addr machwSecurityRegs().control, value)
+
+proc machwSecurityControl(): uint32 {.inline.} =
+  volatileLoad(addr machwSecurityRegs().control)
+
+proc machwSecurityKeyCount(): uint32 {.inline.} =
+  volatileLoad(addr machwSecurityRegs().keyCount)
+
+proc waitMachwSecurityControlClear(mask: uint32): bool {.inline.} =
+  waitRegMaskClear(MACHW_SECURITY_CTRL_REG, mask)
+
+proc machwTxStatus(): uint32 {.inline.} =
+  volatileLoad(addr machwTxQueueRegs().txStatus)
+
+proc machwTxReadyAck(bits: uint32) {.inline.} =
+  volatileStore(addr machwTxQueueRegs().readyAck, bits)
+
+proc machwTxTrigger(bits: uint32) {.inline.} =
+  volatileStore(addr machwTxQueueRegs().txTrigger, bits)
+
+proc machwTxDmaStatus(): uint32 {.inline.} =
+  volatileLoad(addr machwTxQueueRegs().dmaStatus)
+
+proc machwTxAggActive(): uint32 {.inline.} =
+  volatileLoad(addr machwTxQueueRegs().txAggActive)
+
+proc machwTxAggSet(bits: uint32) {.inline.} =
+  volatileStore(addr machwTxQueueRegs().txAggSet, bits)
+
+proc machwTxAggActiveSet(bits: uint32) {.inline.} =
+  volatileStore(addr machwTxQueueRegs().txAggActive, bits)
+
+proc machwTxHeadReg(ac: uint32): ptr uint32 {.inline.} =
+  let regs = machwTxQueueRegs()
+  case ac
+  of 0: addr regs.ac0Head
+  of 1: addr regs.ac1Head
+  of 2: addr regs.ac2Head
+  of 3: addr regs.ac3Head
+  of 4: addr regs.beaconHead
+  else: nil
+
+proc machwTxHeadValue(ac: uint32): uint32 {.inline.} =
+  let reg = machwTxHeadReg(ac)
+  if reg == nil:
+    0'u32
+  else:
+    volatileLoad(reg)
+
+proc machwTxSetHead(ac: uint32; thd: pointer) {.inline.} =
+  let reg = machwTxHeadReg(ac)
+  if reg != nil:
+    volatileStore(reg, pointerAddrU32(thd))
+
+proc machwRxDmaTrigger(bits: uint32) {.inline.} =
+  volatileStore(addr machwRxDmaRegs().trigger, bits)
+
+proc machwRxHdSubmittedHead(): uint32 {.inline.} =
+  volatileLoad(addr machwRxDmaRegs().hdSubmittedHead)
+
+proc machwRxPdSubmittedHead(): uint32 {.inline.} =
+  volatileLoad(addr machwRxDmaRegs().pdSubmittedHead)
+
+proc machwRxHwHdHead(): uint32 {.inline.} =
+  volatileLoad(addr machwRxDmaRegs().hdHwHead)
+
+proc machwRxHwPdHead(): uint32 {.inline.} =
+  volatileLoad(addr machwRxDmaRegs().pdHwHead)
+
+proc machwRxSetHdSubmittedHead(value: uint32) {.inline.} =
+  volatileStore(addr machwRxDmaRegs().hdSubmittedHead, value)
+
+proc machwRxSetPdSubmittedHead(value: uint32) {.inline.} =
+  volatileStore(addr machwRxDmaRegs().pdSubmittedHead, value)
+
 template txFrameEnv(): ptr TxFrameEnvView =
   cast[ptr TxFrameEnvView](addr txl_frame_env[0])
 
@@ -2918,8 +4130,14 @@ template meHtCapsPtr(me: ptr MeEnvView): pointer =
 template meChannelConfigView(): ptr MeChannelConfigView =
   cast[ptr MeChannelConfigView](addr meEnvView().chanConfig[0])
 
+template meBeaconSequence(): ptr MeBeaconSequenceOverlay =
+  cast[ptr MeBeaconSequenceOverlay](addr me_env[0])
+
 template mmEnvView(): ptr MmEnvView =
   cast[ptr MmEnvView](addr mm_env[0])
+
+template mmWmmParameterSource(): ptr MmWmmParameterSourceView =
+  cast[ptr MmWmmParameterSourceView](addr mm_env[0])
 
 template bcnEnvView(): ptr MmBcnEnvView =
   cast[ptr MmBcnEnvView](addr mm_bcn_env[0])
@@ -2936,8 +4154,26 @@ template timDescView(): ptr TimDescView =
 template vifMgmtEnvView(): ptr VifMgmtEnvView =
   cast[ptr VifMgmtEnvView](addr vif_mgmt_env[0])
 
+template vifMgmtHostapdOpsEnv(): ptr VifMgmtHostapdOpsEnvView =
+  cast[ptr VifMgmtHostapdOpsEnvView](addr vif_mgmt_env[0])
+
+template vifHostapdPrivAt(p: uint): ptr VifHostapdPrivView =
+  cast[ptr VifHostapdPrivView](p)
+
+template vifHostapdPriv(vif: ptr VifChannelView): ptr VifHostapdPrivView =
+  vifHostapdPrivAt(cast[uint](vif))
+
+template vifApProbeSsid(vif: ptr VifChannelView): ptr VifApProbeSsidOverlay =
+  cast[ptr VifApProbeSsidOverlay](vif)
+
+template hostapdOpsAt(p: pointer): ptr HostapdOpsView =
+  cast[ptr HostapdOpsView](p)
+
 template psEnvView(): ptr PsEnvView =
   cast[ptr PsEnvView](addr ps_env[0])
+
+template psDozeEnvView(): ptr PsDozeEnvView =
+  cast[ptr PsDozeEnvView](addr ps_env[0])
 
 template smEnvView(): ptr SmEnvView =
   cast[ptr SmEnvView](addr sm_env[0])
@@ -2963,8 +4199,107 @@ template connectInfoAuthRetry(connInfo: pointer): ptr uint8 =
 template connectInfoChannelHint(connInfo: pointer): pointer =
   cast[pointer](addr connectInfoView(connInfo).channelHint[0])
 
+proc connectInfoChannelFrequency(ci: ptr ConnectInfoView): uint16 {.inline.} =
+  uint16(ci.channelHint[0]) or (uint16(ci.channelHint[1]) shl 8)
+
+proc connectInfoHasChannelHint(ci: ptr ConnectInfoView): bool {.inline.} =
+  let freq = connectInfoChannelFrequency(ci)
+  freq != 0'u16 and freq != 0xFFFF'u16
+
+proc connectInfoSsidLen(ci: ptr ConnectInfoView): uint8 {.inline.} =
+  if ci.ssidLen > 0 and ci.ssidLen <= 32:
+    return ci.ssidLen
+  var length: uint8 = 0
+  while length < 32'u8 and ci.ssid[length.int] != 0'u8:
+    inc length
+  length
+
+proc connectInfoFillSsidSlot(slot: ptr ScanSsidSlotView;
+                             ci: ptr ConnectInfoView) {.inline.} =
+  slot.length = 0
+  for i in 0 ..< slot.data.len:
+    slot.data[i] = 0
+  let length = connectInfoSsidLen(ci)
+  slot.length = length
+  for i in 0 ..< length.int:
+    slot.data[i] = ci.ssid[i]
+
+proc vifChannelCenterFreq1(vif: ptr VifChannelView; fallback: uint16): uint16 {.inline.} =
+  let freq = uint16(vif.channelFreqPair and 0xFFFF'u32)
+  if freq == 0'u16: fallback else: freq
+
+proc vifChannelCenterFreq2(vif: ptr VifChannelView): uint16 {.inline.} =
+  uint16((vif.channelFreqPair shr 16) and 0xFFFF'u32)
+
 proc lmacGateHalfword(value: uint16): uint16 {.inline.} =
   ((value and 0x00ff'u16) shl 8) or (value shr 8)
+
+proc txFrameBaseMacLen(desc: ptr HostTxDescView): uint8 {.inline.} =
+  if desc.staIdx == 0xFF'u8: 24'u8
+  else: sizeof(MacQosDataFrameHeaderView).uint8
+
+proc txFrameSnapLen(frameType: uint16): uint8 {.inline.} =
+  if frameType > 1535'u16: sizeof(LlcSnapHeaderView).uint8
+  else: 0'u8
+
+proc txFrameSecLen(desc: ptr HostTxDescView; macLen, snapLen: uint8): uint8 {.inline.} =
+  if desc.hdrLen > macLen + snapLen:
+    desc.hdrLen - macLen - snapLen
+  else:
+    0'u8
+
+proc txFrameBuildLayout(desc: ptr HostTxDescView; payloadStart: pointer;
+                        frameType: uint16): TxFrameBuildLayout {.inline.} =
+  let payload = cast[uint](payloadStart)
+  result.macLen = txFrameBaseMacLen(desc)
+  result.snapLen = txFrameSnapLen(frameType)
+  result.secLen = txFrameSecLen(desc, result.macLen, result.snapLen)
+  let snapAddr = payload - result.snapLen.uint
+  let secAddr = snapAddr - result.secLen.uint
+  let macAddr = secAddr - result.macLen.uint
+  result.mac = cast[ptr MacQosDataFrameHeaderView](macAddr)
+  result.sec = cast[ptr TxSecurityHeaderView](secAddr)
+  result.snap =
+    if result.snapLen == 0'u8: nil
+    else: cast[ptr LlcSnapHeaderView](snapAddr)
+
+proc txFrameWriteSnap(layout: TxFrameBuildLayout; ethertype: uint16) {.inline.} =
+  if layout.snap != nil:
+    layout.snap.dsap = 0xAA'u8
+    layout.snap.ssap = 0xAA'u8
+    layout.snap.control = 0x03'u8
+    layout.snap.oui = [0'u8, 0'u8, 0'u8]
+    layout.snap.ethertype = ethertype
+
+proc macAddrLo32(addrBytes: ptr array[6, uint8]): uint32 {.inline.} =
+  cast[ptr uint16](unsafeAddr addrBytes[][0])[].uint32 or
+    (cast[ptr uint16](unsafeAddr addrBytes[][2])[].uint32 shl 16)
+
+proc macAddrHi16(addrBytes: ptr array[6, uint8]): uint32 {.inline.} =
+  cast[ptr uint16](unsafeAddr addrBytes[][4])[].uint32
+
+proc macAddrWord0(addrBytes: ptr array[6, uint8]): uint32 {.inline.} =
+  addrBytes[][0].uint32 or
+    (addrBytes[][1].uint32 shl 8) or
+    (addrBytes[][2].uint32 shl 16) or
+    (addrBytes[][3].uint32 shl 24)
+
+proc snapTraceLo(layout: TxFrameBuildLayout): uint32 {.inline.} =
+  if layout.snap == nil:
+    0'u32
+  else:
+    layout.snap.dsap.uint32 or
+      (layout.snap.ssap.uint32 shl 8) or
+      (layout.snap.control.uint32 shl 16) or
+      (layout.snap.oui[0].uint32 shl 24)
+
+proc snapTraceHi(layout: TxFrameBuildLayout): uint32 {.inline.} =
+  if layout.snap == nil:
+    0'u32
+  else:
+    layout.snap.oui[1].uint32 or
+      (layout.snap.oui[2].uint32 shl 8) or
+      (layout.snap.ethertype.uint32 shl 16)
 
 template apmStartInfoView(connInfo: pointer): ptr ApmStartInfoView =
   cast[ptr ApmStartInfoView](connInfo)
@@ -2981,20 +4316,29 @@ template apmConfMaxStaReqView(param: pointer): ptr ApmConfMaxStaReqPayload =
 template apmProbeReqView(param: pointer): ptr ApmProbeReqView =
   cast[ptr ApmProbeReqView](param)
 
-template staKeyReqView(param: pointer): ptr StaKeyReqPayload =
-  cast[ptr StaKeyReqPayload](param)
-
-template staKeyDataPtr(req: ptr StaKeyReqPayload): pointer =
-  cast[pointer](addr req.keyDataPrefix[0])
-
 template machwKeyWriteParamView(param: pointer): ptr MachwKeyWriteParamView =
   cast[ptr MachwKeyWriteParamView](param)
+
+template machwKeyWriteKeyTailPtr(req: ptr MachwKeyWriteParamView): pointer =
+  cast[pointer](addr req.reserved24[0])
+
+template supplicantTkipKeyData(req: ptr SupplicantKeyParamView): ptr SupplicantTkipKeyDataView =
+  cast[ptr SupplicantTkipKeyDataView](addr req.keyData[0])
+
+template cfgApiElementEntryAt(entry: pointer): ptr CfgApiElementEntryView =
+  cast[ptr CfgApiElementEntryView](entry)
 
 template vifMgmtAddKeyParamView(param: pointer): ptr VifMgmtAddKeyParamView =
   cast[ptr VifMgmtAddKeyParamView](param)
 
 template vifMgmtAddKeyTkipMaterialPtr(req: ptr VifMgmtAddKeyParamView): pointer =
-  cast[pointer](addr req.tkipKeyMaterialPrefix[0])
+  cast[pointer](addr req.tkipKeyMaterial[0])
+
+proc le32(bytes: ptr array[4, uint8]): uint32 {.inline.} =
+  bytes[][0].uint32 or
+    (bytes[][1].uint32 shl 8) or
+    (bytes[][2].uint32 shl 16) or
+    (bytes[][3].uint32 shl 24)
 
 template scanStartReqView(param: pointer): ptr ScanStartReqPayload =
   cast[ptr ScanStartReqPayload](param)
@@ -3040,8 +4384,23 @@ template mmStaDelReqView(param: pointer): ptr MmStaDelReqPayload =
 template meAddBaReqParamView(param: pointer): ptr MeAddBaReqParamView =
   cast[ptr MeAddBaReqParamView](param)
 
+template addBaReqActionBodyAt(param: pointer): ptr AddBaReqActionBodyView =
+  cast[ptr AddBaReqActionBodyView](param)
+
+template addBaRspActionBodyAt(param: pointer): ptr AddBaRspActionBodyView =
+  cast[ptr AddBaRspActionBodyView](param)
+
+template delBaActionBodyAt(param: pointer): ptr DelBaActionBodyView =
+  cast[ptr DelBaActionBodyView](param)
+
+template delBaInfoView(param: pointer): ptr DelBaInfoView =
+  cast[ptr DelBaInfoView](param)
+
 template smAuthFrameView(param: pointer): ptr SmAuthFrameView =
   cast[ptr SmAuthFrameView](param)
+
+template smConnectIndPayloadAt(param: pointer): ptr SmConnectIndPayload =
+  cast[ptr SmConnectIndPayload](param)
 
 template smAuthSaeBodyPtr(frame: ptr SmAuthFrameView): pointer =
   cast[pointer](addr frame.saeBodyFirst)
@@ -3142,8 +4501,9 @@ template psUapsdTimer(): pointer =
 template psTxNullTimer(): pointer =
   cast[pointer](addr psEnvView().txNullTimerWord)
 
-template mmEnvKeepAliveTimestampByte1(): untyped =
-  cast[ptr UncheckedArray[uint8]](addr mmEnvView().keepAliveTimestamp)[1]
+template mmEnvClearKeepAliveTimestampByte1() =
+  let mm = mmEnvView()
+  mm.keepAliveTimestamp = mm.keepAliveTimestamp and not 0x0000FF00'u32
 
 template mmBcnTemplateByte(idx: static[int]): untyped =
   cast[ptr UncheckedArray[uint8]](addr bcnEnvView().templatePtr)[idx]
@@ -3194,6 +4554,12 @@ template vifEntryAddr(idx: uint8): uint =
 template vifChannelForIdx(idx: uint8): ptr VifChannelView =
   vifChannelAt(vifEntryAddr(idx))
 
+template vifChannelTypeByte(vif: ptr VifChannelView): ptr uint8 =
+  cast[ptr uint8](addr vif.flags)
+
+template vifPostponedStaList(vif: ptr VifChannelView): ptr CoList =
+  cast[ptr CoList](addr vif.postponedStaHead)
+
 template vifEdcaPsGate(vif: ptr VifChannelView): int8 =
   cast[int8](vif.modeByte452)
 
@@ -3201,19 +4567,25 @@ template vifWpaCipher(vif: ptr VifChannelView): uint8 =
   vif.modeByte452
 
 template vifSecurity(vif: ptr VifChannelView): ptr VifSecurityOverlay =
-  cast[ptr VifSecurityOverlay](cast[uint](vif) + 488)
+  cast[ptr VifSecurityOverlay](addr vif.edcaParams[32])
 
 template vifSecurityAt(p: uint): ptr VifSecurityOverlay =
   vifSecurity(vifChannelAt(p))
 
+template vifMachwKeyIndexes(vif: ptr VifChannelView): ptr VifMachwKeyIndexOverlay =
+  cast[ptr VifMachwKeyIndexOverlay](vif)
+
+template vifAssocInfo(info: pointer): ptr VifAssocInfoOverlay =
+  cast[ptr VifAssocInfoOverlay](info)
+
 template vifHtCapabilities(vif: ptr VifChannelView): ptr VifHtCapabilitiesOverlay =
-  cast[ptr VifHtCapabilitiesOverlay](cast[uint](vif) + 348)
+  cast[ptr VifHtCapabilitiesOverlay](addr vif.reserved344[4])
 
 template vifHtCapabilitiesAt(p: uint): ptr VifHtCapabilitiesOverlay =
   vifHtCapabilities(vifChannelAt(p))
 
 template vifHtOperation(vif: ptr VifChannelView): ptr VifHtOperationOverlay =
-  cast[ptr VifHtOperationOverlay](cast[uint](vif) + 476)
+  cast[ptr VifHtOperationOverlay](addr vif.edcaParams[20])
 
 template vifApConfig(vif: ptr VifChannelView): ptr VifApConfigOverlay =
   cast[ptr VifApConfigOverlay](addr vif.edcaParams[0])
@@ -3224,8 +4596,24 @@ template vifApConfigAt(p: uint): ptr VifApConfigOverlay =
 template vifApEdcaWord(apCfg: ptr VifApConfigOverlay, idx: int): ptr uint32 =
   cast[ptr uint32](addr apCfg.edcaParams[idx * 4])
 
+template vifKeySlotTable(vif: ptr VifChannelView): ptr VifKeySlotTableOverlay =
+  cast[ptr VifKeySlotTableOverlay](vif)
+
+template vifKeySlot(vif: ptr VifChannelView, slot: uint): ptr VifKeySlotView =
+  addr vifKeySlotTable(vif).slots[slot]
+
 template vifKeySlotAt(vifEntry: uint, slot: uint): ptr VifKeySlotView =
-  cast[ptr VifKeySlotView](vifEntry + slot * 160'u + 528'u)
+  vifKeySlot(vifChannelAt(vifEntry), slot)
+
+template vifKeySlotPtr(vif: ptr VifChannelView, slot: uint): uint32 =
+  cast[uint32](cast[uint](vifKeySlot(vif, slot)))
+
+template vifRxProtectedKeySlot(vif: ptr VifChannelView, slot: uint): ptr VifKeySlotView =
+  addr cast[ptr VifRxProtectedKeyTableOverlay](vif).slots[slot]
+
+template tkipMicKeyArea(key: ptr VifKeySlotView;
+                        micKeyOff: uint): ptr TkipMicKeyAreaView =
+  cast[ptr TkipMicKeyAreaView](cast[uint](key) + micKeyOff - 24)
 
 template replayCounterStateView(param: pointer): ptr ReplayCounterStateView =
   cast[ptr ReplayCounterStateView](param)
@@ -3236,26 +4624,69 @@ template vifKeyPointersAt(vifEntry: uint): ptr VifKeyPointersView =
 template vifKeyPointers(vif: ptr VifChannelView): ptr VifKeyPointersView =
   vifKeyPointersAt(cast[uint](vif))
 
+template txSecurityKeyListAt(p: pointer): ptr TxSecurityKeyListView =
+  cast[ptr TxSecurityKeyListView](p)
+
+template secMacRxIndAt(p: pointer): ptr SecMacRxIndView =
+  cast[ptr SecMacRxIndView](p)
+
+template txPolicyAt(p: pointer): ptr TxPolicyView =
+  cast[ptr TxPolicyView](p)
+
+template michaelMicContextAt(p: pointer): ptr MichaelMicContextView =
+  cast[ptr MichaelMicContextView](p)
+
 template apmTxDescPsAt(p: pointer): ptr ApmTxDescPsView =
   cast[ptr ApmTxDescPsView](p)
 
 template hostTxDescAt(p: pointer): ptr HostTxDescView =
   cast[ptr HostTxDescView](p)
 
+template txlFrameDescSlotAt(idx: uint32): ptr TxlFrameDescSlotView =
+  addr cast[ptr UncheckedArray[TxlFrameDescSlotView]](
+    addr txl_frame_desc_storage[0])[idx]
+
+template txlFrameDescAt(idx: uint32): ptr HostTxDescView =
+  addr txlFrameDescSlotAt(idx).desc
+
+template hostTxPnScratch(desc: ptr HostTxDescView): ptr TxPnScratchView =
+  cast[ptr TxPnScratchView](addr desc.pnScratch[0])
+
 template hostTxHwDescAt(p: pointer): ptr HostTxHwDescView =
   cast[ptr HostTxHwDescView](p)
+
+template txlFrameHwDescSlotAt(idx: uint32): ptr TxlFrameHwDescSlotView =
+  addr cast[ptr UncheckedArray[TxlFrameHwDescSlotView]](
+    addr txl_frame_hwdesc_pool[0])[idx]
+
+template txlFrameHwDescAt(idx: uint32): ptr HostTxHwDescView =
+  addr txlFrameHwDescSlotAt(idx).desc
+
+template txlFrameHwCfmAt(idx: uint32): ptr TxlFrameHwCfmSlotView =
+  addr cast[ptr UncheckedArray[TxlFrameHwCfmSlotView]](
+    addr txl_frame_hwdesc_cfms[0])[idx]
 
 template hostTxLinkDescAt(p: pointer): ptr HostTxLinkDescView =
   cast[ptr HostTxLinkDescView](p)
 
+template txlFrameLinkSlotAt(idx: uint32): ptr TxlFrameLinkSlotView =
+  addr cast[ptr UncheckedArray[TxlFrameLinkSlotView]](
+    addr txl_frame_pool[0])[idx]
+
+template txlFrameLinkDescAt(idx: uint32): ptr HostTxLinkDescView =
+  cast[ptr HostTxLinkDescView](addr txlFrameLinkSlotAt(idx).storage[0])
+
 template hostTxBufferedLinkAt(p: pointer): ptr HostTxBufferedLinkView =
   cast[ptr HostTxBufferedLinkView](p)
 
+template hostTxInternalLinkNodeAt(p: pointer): ptr HostTxInternalLinkNodeView =
+  cast[ptr HostTxInternalLinkNodeView](p)
+
 template hostTxInlineBufferedLink(desc: ptr HostTxDescView): ptr HostTxBufferedLinkView =
-  cast[ptr HostTxBufferedLinkView](cast[uint](desc) + 208'u)
+  cast[ptr HostTxBufferedLinkView](addr desc.callback)
 
 template hostTxAuxWords(desc: ptr HostTxDescView): ptr HostTxAuxWordsView =
-  cast[ptr HostTxAuxWordsView](cast[uint](desc) + 208'u)
+  cast[ptr HostTxAuxWordsView](addr desc.callback)
 
 template hostTxRateTemplate(link: ptr HostTxLinkDescView): ptr HostTxRateTemplateView =
   cast[ptr HostTxRateTemplateView](addr link.rateTemplate[0])
@@ -3269,14 +4700,83 @@ template hostTxRateTemplateAt(p: pointer): ptr HostTxRateTemplateView =
 template hostTxHeadThd(hw: ptr HostTxHwDescView): ptr HostTxThdEntryView =
   cast[ptr HostTxThdEntryView](hw.word0.uint)
 
+template hostTxThdAt(p: pointer): ptr HostTxThdEntryView =
+  cast[ptr HostTxThdEntryView](p)
+
+template hostTxThdConfirmAt(p: ptr HostTxThdEntryView): ptr HostTxThdConfirmView =
+  cast[ptr HostTxThdConfirmView](p)
+
+template txDumpRateDescAt(p: pointer): ptr TxDumpRateDescView =
+  cast[ptr TxDumpRateDescView](p)
+
+template txDumpBufferDescAt(p: pointer): ptr TxDumpBufferDescView =
+  cast[ptr TxDumpBufferDescView](p)
+
 template txBufferControlAt(p: pointer): ptr TxBufferControlView =
   cast[ptr TxBufferControlView](p)
+
+template txlFramePayloadSlotAt(idx: uint32): ptr TxlFramePayloadSlotView =
+  addr cast[ptr UncheckedArray[TxlFramePayloadSlotView]](
+    addr txl_frame_buf_ctrl[0])[idx]
+
+template txlFramePayloadDescAt(idx: uint32): ptr TxBufferControlView =
+  addr txlFramePayloadSlotAt(idx).desc
 
 template txBufferControl24G(): ptr TxBufferControlView =
   cast[ptr TxBufferControlView](addr txl_buffer_control_24G[0])
 
+template txBufferControlDescAt(idx: int): ptr TxBufferControlView =
+  addr cast[ptr UncheckedArray[TxBufferControlView]](addr txl_buffer_control_desc[0])[idx]
+
+template txBufferControlBcmcDescAt(idx: int): ptr TxBufferControlView =
+  addr cast[ptr UncheckedArray[TxBufferControlView]](addr txl_buffer_control_desc_bcmc[0])[idx]
+
+template txlBufferEnvView(): ptr TxlBufferEnvView =
+  cast[ptr TxlBufferEnvView](addr txl_buffer_env[0])
+
+template ipcSharedEnvView(): ptr IpcSharedEnvView =
+  cast[ptr IpcSharedEnvView](addr ipcSharedEnv[0])
+
+template ipcEmbEnvView(): ptr IpcEmbEnvView =
+  cast[ptr IpcEmbEnvView](addr ipcEmbEnvStruct[0])
+
+template ipcHostTxWrapperAt(p: pointer): ptr IpcHostTxWrapperView =
+  cast[ptr IpcHostTxWrapperView](p)
+
+template ipcHostTxWrapperFromDesc(desc: ptr HostTxDescView): ptr IpcHostTxWrapperView =
+  cast[ptr IpcHostTxWrapperView](cast[uint](desc) - offsetof(IpcHostTxWrapperView, txDesc).uint)
+
+proc ipcHostTxHead(env: ptr IpcEmbEnvView): ptr IpcHostTxWrapperView {.inline.} =
+  if env.hostTxList == nil or env.hostTxList.first == nil:
+    return nil
+  ipcHostTxWrapperAt(cast[pointer](env.hostTxList.first))
+
+template ipcTxAcDescAt(ac: uint32): ptr IpcTxAcDescView =
+  cast[ptr IpcTxAcDescView]((IPC_TX_AC_DESC_BASE + ac * IPC_TX_AC_DESC_STRIDE).uint)
+
+proc ipcTxAcDescClear(ac: uint32) {.inline.} =
+  let desc = ipcTxAcDescAt(ac)
+  volatileStore(addr desc.descriptor, 0'u32)
+  volatileStore(addr desc.busy, 0'u8)
+  volatileStore(addr desc.sequence, 0'u16)
+
+template ipcTxHwDescWordTable(): ptr IpcTxHwDescWordTableView =
+  cast[ptr IpcTxHwDescWordTableView](IPC_TX_AC_DESC_BASE.uint)
+
+proc ipcTxHwDescWordAddrHalfword(ac: uint32): uint16 {.inline.} =
+  cast[uint](addr ipcTxHwDescWordTable().descriptorWords[ac.int]).uint16
+
+template hostTxLinkMacHdrAddr(link: ptr HostTxLinkDescView): uint =
+  cast[uint](addr link.macHeader[0])
+
+template hostTxLinkMacHdrPtr(link: ptr HostTxLinkDescView; offset: uint): pointer =
+  cast[pointer](addr link.macHeader[offset.int])
+
+template hostTxLinkMacHdrPtr(link: ptr HostTxBufferedLinkView; offset: uint): pointer =
+  cast[pointer](addr link.macHeader[offset.int])
+
 template hostTxMacHdrAddr(desc: ptr HostTxDescView): uint =
-  cast[uint](desc.bufDesc) + 348'u
+  hostTxLinkMacHdrAddr(hostTxLinkDescAt(desc.bufDesc))
 
 template hostTxDataHeader(desc: ptr HostTxDescView): ptr MacDataFrameHeaderView =
   cast[ptr MacDataFrameHeaderView](addr hostTxLinkDescAt(desc.bufDesc).macHeader[0])
@@ -3287,20 +4787,20 @@ template hostTxQosDataHeader(desc: ptr HostTxDescView): ptr MacQosDataFrameHeade
 template hostTxCtsHeader(desc: ptr HostTxDescView): ptr MacCtsFrameHeaderView =
   cast[ptr MacCtsFrameHeaderView](addr hostTxLinkDescAt(desc.bufDesc).macHeader[0])
 
+template hostTxPsPollHeader(desc: ptr HostTxDescView): ptr PsPollFrameHeaderView =
+  cast[ptr PsPollFrameHeaderView](addr hostTxLinkDescAt(desc.bufDesc).macHeader[0])
+
+template saQueryActionBodyAt(p: pointer): ptr SaQueryActionBodyView =
+  cast[ptr SaQueryActionBodyView](p)
+
 template hostTxConfirmLinkWord(desc: ptr HostTxDescView): ptr uint32 =
-  cast[ptr uint32](cast[uint](desc) - 4'u)
+  addr ipcHostTxWrapperFromDesc(desc).active
 
 template txBackupQueueHeadPtr(queueIdx: uint32): ptr pointer =
-  cast[ptr pointer](cast[uint](addr txl_buffer_env[0]) + (queueIdx + 22'u32).uint * 8'u + 4'u)
+  addr txlBufferEnvView().backupQueues[queueIdx].first
 
 template txBackupQueueTailPtr(queueIdx: uint32): ptr pointer =
-  cast[ptr pointer](cast[uint](addr txl_buffer_env[0]) + (queueIdx + 22'u32).uint * 8'u + 8'u)
-
-template hostTxLinkWord(link: ptr HostTxLinkDescView, byteOff: static[uint]): uint32 =
-  cast[ptr uint32](cast[uint](link) + byteOff)[]
-
-template hostTxLinkWordAt(link: ptr HostTxLinkDescView, byteOff: static[uint]): ptr uint32 =
-  cast[ptr uint32](cast[uint](link) + byteOff)
+  addr txlBufferEnvView().backupQueues[queueIdx].last
 
 template staInfoAt(p: pointer): ptr StaInfoView =
   cast[ptr StaInfoView](p)
@@ -3313,7 +4813,16 @@ template staInfoForIdx(idx: uint8): ptr StaInfoView =
     idx.uint * STA_ENTRY_SIZE.uint)
 
 template staBandwidthOverlay(sta: ptr StaInfoView): ptr StaBandwidthOverlay =
-  cast[ptr StaBandwidthOverlay](cast[uint](sta) + 76'u)
+  cast[ptr StaBandwidthOverlay](addr sta.reserved74[2])
+
+template staTxSequence(sta: ptr StaInfoView): ptr StaTxSequenceOverlay =
+  cast[ptr StaTxSequenceOverlay](sta)
+
+template rxuQosSeqCacheTable(): ptr RxuQosSeqCacheTableOverlay =
+  cast[ptr RxuQosSeqCacheTableOverlay](addr sta_info_tab[0])
+
+template staPowerConstraintOut(sta: ptr StaInfoView): pointer =
+  cast[pointer](addr sta.reserved338[10])
 
 template apSelfStaStart(sta: ptr StaInfoView): ptr ApSelfStaStartOverlay =
   cast[ptr ApSelfStaStartOverlay](sta)
@@ -3356,6 +4865,21 @@ template rxlCntrlEnvView(): ptr RxlCntrlEnvView =
 template rxHwDescEnvView(): ptr RxHwDescEnvView =
   cast[ptr RxHwDescEnvView](addr rx_hwdesc_env[0])
 
+template rxHeaderHwDescAt(idx: int): ptr RxHeaderHwDescView =
+  addr cast[ptr UncheckedArray[RxHeaderHwDescView]](addr rx_dma_hdrdesc[0])[idx]
+
+template rxHeaderHwDescView(param: pointer): ptr RxHeaderHwDescView =
+  cast[ptr RxHeaderHwDescView](param)
+
+template rxSwTableDescAt(idx: int): ptr RxSwTableDescView =
+  addr cast[ptr UncheckedArray[RxSwTableDescView]](addr rx_swdesc_tab[0])[idx]
+
+template rxPayloadHwDescAt(idx: int): ptr RxPayloadHwDescView =
+  addr cast[ptr UncheckedArray[RxPayloadHwDescView]](addr rx_payload_desc[0])[idx]
+
+template rxPayloadBufferAt(idx: int): ptr RxPayloadBufferView =
+  addr cast[ptr UncheckedArray[RxPayloadBufferView]](addr rx_payload_desc_buffer[0])[idx]
+
 template rxSwDescView(param: pointer): ptr RxSwDescView =
   cast[ptr RxSwDescView](param)
 
@@ -3372,7 +4896,16 @@ template beaconFrameFixedView(param: pointer): ptr BeaconFrameFixedView =
   cast[ptr BeaconFrameFixedView](param)
 
 template beaconFrameIeBody(frame: ptr BeaconFrameFixedView): pointer =
-  cast[pointer](cast[uint](frame) + sizeof(BeaconFrameFixedView).uint)
+  addr frame.body[0]
+
+template probeRspFixedBodyView(param: pointer): ptr ProbeRspFixedBodyView =
+  cast[ptr ProbeRspFixedBodyView](param)
+
+template probeRspIeBody(frame: ptr ProbeRspFixedBodyView): pointer =
+  addr frame.body[0]
+
+proc ieCursorAfter(p: pointer; n: uint): pointer {.inline.} =
+  addr cast[ptr UncheckedArray[uint8]](p)[n]
 
 template htMcsNssPrefixView(param: pointer): ptr HtMcsNssPrefixView =
   cast[ptr HtMcsNssPrefixView](param)
@@ -3419,6 +4952,10 @@ type
 # Kernel message handler descriptor (8 bytes)
 # Used by ke_handler_search: pairs a handler table pointer with its entry count.
 type
+  KeMsgHandlerEntry* {.packed.} = object
+    msgId*: uint32          # lower 16 bits are the KE message id
+    handler*: pointer
+
   KeMsgHandlerDesc* = object
     handlers*: pointer      # offset 0: ptr to MsgHandlerEntry array (8 bytes each)
     numHandlers*: uint16    # offset 4: number of entries in the table
@@ -3435,9 +4972,32 @@ type
     reserved*: uint16          # offset 12: reserved
     stateCount*: uint16        # offset 14: number of valid states (asserted > 0)
 
+static:
+  doAssert offsetof(KeMsgHandlerEntry, msgId) == 0
+  doAssert offsetof(KeMsgHandlerEntry, handler) == 4
+  doAssert sizeof(KeMsgHandlerEntry) == 8
+  doAssert offsetof(KeMsgHandlerDesc, handlers) == 0
+  doAssert offsetof(KeMsgHandlerDesc, numHandlers) == 4
+  doAssert sizeof(KeMsgHandlerDesc) == 8
+  doAssert offsetof(KeTaskDesc, stateTable) == 0
+  doAssert offsetof(KeTaskDesc, defaultHandler) == 4
+  doAssert offsetof(KeTaskDesc, statePtr) == 8
+  doAssert offsetof(KeTaskDesc, stateCount) == 14
+  doAssert sizeof(KeTaskDesc) == 16
+
+template keMsgHandlerEntryAt(table: pointer, idx: uint16): ptr KeMsgHandlerEntry =
+  addr cast[ptr UncheckedArray[KeMsgHandlerEntry]](table)[idx]
+
+template keMsgHandlerDescAt(table: pointer, state: uint16): ptr KeMsgHandlerDesc =
+  addr cast[ptr UncheckedArray[KeMsgHandlerDesc]](table)[state]
+
 {.pragma: wifiCtrl, codegenDecl: "$# $# __attribute__((section(\".ram_wifi_ctrl\")))".}
 {.pragma: wifiCtrlExport, exportc, codegenDecl: "$# $# __attribute__((section(\".ram_wifi_ctrl\")))".}
 {.pragma: weakExport, exportc, codegenDecl: "$# __attribute__((weak)) $#$#".}
+{.pragma: wifiRxDmaHd, codegenDecl: "$# $# __attribute__((section(\".wifibss.rx_dma.0_hd\"), aligned(16), used))".}
+{.pragma: wifiRxDmaPd, codegenDecl: "$# $# __attribute__((section(\".wifibss.rx_dma.1_pd\"), aligned(16), used))".}
+{.pragma: wifiRxDmaSw, codegenDecl: "$# $# __attribute__((section(\".wifibss.rx_dma.2_sw\"), aligned(16), used))".}
+{.pragma: wifiRxDmaBuf, codegenDecl: "$# $# __attribute__((section(\".wifibss.rx_dma.3_buf\"), aligned(16), used))".}
 
 # TX DMA descriptor (from disassembly analysis of txl_buffer_init)
 type
@@ -3498,6 +5058,11 @@ type
     securityAuth*: uint8
     pad23*: uint8
     rawMsgPtr*: pointer
+
+  ScanuCachedSsid* = object
+    valid*: uint8
+    length*: uint8
+    data*: array[32, uint8]
 
   ScanuEnvObj* = object
     paramPtr*: pointer
@@ -3595,6 +5160,7 @@ type
     reserved3*: array[10, uint8]
     beaconPeriod*: uint16
     capInfo*: uint16
+    ieData*: UncheckedArray[uint8]
 
   PhyRxVectorView {.packed.} = object
     word0*: uint32
@@ -3614,6 +5180,25 @@ type
     id*: uint8
     len*: uint8
 
+  MmIeView {.packed.} = object
+    ie*: MacIeView
+    keyId*: uint16
+    ipn*: array[6, uint8]
+    mic*: array[8, uint8]
+
+  RateSetView {.packed.} = object
+    count*: uint8
+    rates*: UncheckedArray[uint8]
+
+  MacIeDataView {.packed.} = object
+    ie*: MacIeView
+    data*: UncheckedArray[uint8]
+
+  TimeoutIntervalIeView {.packed.} = object
+    ie*: MacIeView
+    intervalType*: uint8
+    intervalValue*: array[4, uint8]
+
   SsidIeView {.packed.} = object
     ie*: MacIeView
     data*: UncheckedArray[uint8]
@@ -3621,9 +5206,30 @@ type
   DsParamSetIeView {.packed.} = object
     ie*: MacIeView
     currentChannel*: uint8
+    next*: UncheckedArray[uint8]
+
+  OneByteMacIeView {.packed.} = object
+    ie*: MacIeView
+    value*: uint8
+    next*: UncheckedArray[uint8]
+
+  BssMaxIdlePeriodIeView {.packed.} = object
+    ie*: MacIeView
+    idlePeriod*: uint16
+    idleOptions*: uint8
+    next*: UncheckedArray[uint8]
 
   WmmAcParamRecord {.packed.} = object
     raw*: array[4, uint8]
+
+  WmmInfoIeView {.packed.} = object
+    ie*: MacIeView
+    oui*: array[3, uint8]
+    ouiType*: uint8
+    ouiSubtype*: uint8
+    version*: uint8
+    qosInfo*: uint8
+    next*: UncheckedArray[uint8]
 
   WmmParameterIeView {.packed.} = object
     ie*: MacIeView
@@ -3634,6 +5240,7 @@ type
     qosInfo*: uint8
     reserved9*: uint8
     ac*: array[4, WmmAcParamRecord]
+    next*: UncheckedArray[uint8]
 
   HtCapIeView {.packed.} = object
     ie*: MacIeView
@@ -3644,6 +5251,64 @@ type
     txBfCapsLo*: uint16
     txBfCapsHi*: uint16
     aselCap*: uint8
+    next*: UncheckedArray[uint8]
+
+  HtOperIeView {.packed.} = object
+    ie*: MacIeView
+    primaryChannel*: uint8
+    secondaryOffset*: uint8
+    htProtection*: uint8
+    operationMode*: array[3, uint8]
+    basicMcsSet*: array[16, uint8]
+    next*: UncheckedArray[uint8]
+
+  RsnSuiteView {.packed.} = object
+    oui*: array[3, uint8]
+    suiteType*: uint8
+
+  RsnCcmpPskIeView {.packed.} = object
+    ie*: MacIeView
+    version*: uint16
+    groupCipher*: RsnSuiteView
+    pairwiseCount*: uint16
+    pairwiseCipher*: RsnSuiteView
+    akmCount*: uint16
+    akmSuite*: RsnSuiteView
+    capabilities*: uint16
+    next*: UncheckedArray[uint8]
+
+  RsnTkipCcmpIeView {.packed.} = object
+    ie*: MacIeView
+    version*: uint16
+    groupCipher*: RsnSuiteView
+    pairwiseCount*: uint16
+    pairwiseCipher*: array[2, RsnSuiteView]
+    akmCount*: uint16
+    akmSuite*: RsnSuiteView
+    capabilities*: uint16
+    next*: UncheckedArray[uint8]
+
+  WpaVendorIeView {.packed.} = object
+    ie*: MacIeView
+    vendorType*: array[4, uint8]
+    version*: uint16
+    groupCipher*: RsnSuiteView
+    pairwiseCount*: uint16
+    pairwiseCipher*: array[2, RsnSuiteView]
+    akmCount*: uint16
+    akmSuite*: RsnSuiteView
+    next*: UncheckedArray[uint8]
+
+  WpaPskVendorIeView {.packed.} = object
+    ie*: MacIeView
+    vendorType*: array[4, uint8]
+    version*: uint16
+    groupCipher*: RsnSuiteView
+    pairwiseCount*: uint16
+    pairwiseCipher*: RsnSuiteView
+    akmCount*: uint16
+    akmSuite*: RsnSuiteView
+    next*: UncheckedArray[uint8]
 
   WpsScanCallbackView {.packed.} = object
     result*: pointer
@@ -3659,6 +5324,12 @@ type
   WpsScanCallbackBuffer {.packed.} = object
     view*: WpsScanCallbackView
     tail*: array[112, uint8]
+
+  WpsCallbacksView {.packed.} = object
+    init*: pointer
+    eapolHandler*: pointer
+    staConnected*: pointer
+    staAddConfirm*: pointer
 
   WpaParsedInfoView {.packed.} = object
     reserved0*: array[4, uint8]
@@ -3680,11 +5351,54 @@ type
 
   WpaCallbacksView {.packed.} = object
     init*: pointer
-    reserved4*: pointer
+    deinit*: pointer
     scanSecurityNotify*: pointer
     keyWrite*: pointer
-    reserved16*: array[8, pointer]
+    reserved16*: pointer
+    eapolHandler*: pointer
+    beaconRegister*: pointer
+    apStopped*: pointer
+    reserved32*: pointer
+    staAdd*: pointer
+    disconnect*: pointer
+    reserved44*: pointer
     parseSecurityIe*: pointer
+    reserved52*: pointer
+    getSaeFrame*: pointer
+    reserved60*: pointer
+    authTimeout*: pointer
+
+  WpaBeaconRegisterParamView {.packed.} = object
+    vifIdx*: uint8
+    bssid*: array[6, uint8]
+    reserved07*: array[33, uint8]
+    rateCount*: uint32
+    rates*: array[32, uint8]
+    marker*: uint16
+    ssid*: array[64, uint8]
+    terminator*: uint8
+    reserved143*: uint8
+
+  WpaKeyWriteParamView {.packed.} = object
+    vifIdx*: uint8
+    staIdx*: uint8
+    reserved02*: array[14, uint8]
+    keyDataLen*: uint32
+    keyMaterial*: array[38, uint8]
+    ssid*: array[64, uint8]
+    reserved122*: array[3, uint8]
+    quickConn*: uint8
+    reserved126*: array[2, uint8]
+
+  WepKeyWriteParamView {.packed.} = object
+    selector*: uint16
+    reserved02*: array[2, uint8]
+    keyLen*: uint8
+    reserved05*: array[3, uint8]
+    keyData*: array[44, uint8]
+    cipherMode*: uint8
+    instNbr*: uint8
+    reserved54*: array[2, uint8]
 
   WpaScanSecurityNotifyView {.packed.} = object
     vifIdx*: uint8
@@ -3710,15 +5424,16 @@ type
   CsaIeView {.packed.} = object
     ie*: MacIeView
     switchMode*: uint8
-    switchCount*: uint8
     newChannel*: uint8
+    switchCount*: uint8
+    next*: UncheckedArray[uint8]
 
   ExtendedCsaIeView {.packed.} = object
     ie*: MacIeView
     switchMode*: uint8
     operatingClass*: uint8
-    switchCount*: uint8
     newChannel*: uint8
+    switchCount*: uint8
 
   SecondaryChannelOffsetIeView {.packed.} = object
     ie*: MacIeView
@@ -3736,6 +5451,25 @@ type
     freq*: uint16
     newFreq*: uint16
     bwFreq*: uint16
+
+  PowerConstraintOutputOverlay {.packed.} = object
+    reserved00*: array[132, uint8]
+    constraint*: uint8
+
+  CountryRegOutputOverlay {.packed.} = object
+    reserved00*: array[76, uint8]
+    channelReg*: pointer
+
+  CountryRegView {.packed.} = object
+    countryHalf*: uint16
+    environment*: uint8
+    reserved03*: uint8
+    maxPower*: uint8
+
+  CountryTripletView {.packed.} = object
+    firstChan*: uint8
+    numChan*: uint8
+    maxPower*: uint8
 
   TxlFrameDescView {.packed.} = object
     reserved0*: array[47, uint8]
@@ -3785,8 +5519,32 @@ type
 template macIeAt(p: uint): ptr MacIeView =
   cast[ptr MacIeView](p)
 
+template rateSetAt(p: pointer): ptr RateSetView =
+  cast[ptr RateSetView](p)
+
+template macIeDataAt(p: pointer): ptr MacIeDataView =
+  cast[ptr MacIeDataView](p)
+
+template timeoutIntervalIeAt(p: pointer): ptr TimeoutIntervalIeView =
+  cast[ptr TimeoutIntervalIeView](p)
+
 template timIeAt(p: pointer): ptr TimIeView =
   cast[ptr TimIeView](p)
+
+template csaIeAt(p: pointer): ptr CsaIeView =
+  cast[ptr CsaIeView](p)
+
+template powerConstraintOutputAt(p: pointer): ptr PowerConstraintOutputOverlay =
+  cast[ptr PowerConstraintOutputOverlay](p)
+
+template countryRegOutputAt(p: pointer): ptr CountryRegOutputOverlay =
+  cast[ptr CountryRegOutputOverlay](p)
+
+template countryRegAt(p: pointer): ptr CountryRegView =
+  cast[ptr CountryRegView](p)
+
+template countryTripletAt(p: pointer): ptr CountryTripletView =
+  cast[ptr CountryTripletView](p)
 
 template ssidIeAt(p: pointer): ptr SsidIeView =
   cast[ptr SsidIeView](p)
@@ -3794,11 +5552,35 @@ template ssidIeAt(p: pointer): ptr SsidIeView =
 template dsParamSetIeAt(p: pointer): ptr DsParamSetIeView =
   cast[ptr DsParamSetIeView](p)
 
+template oneByteMacIeAt(p: pointer): ptr OneByteMacIeView =
+  cast[ptr OneByteMacIeView](p)
+
+template bssMaxIdlePeriodIeAt(p: pointer): ptr BssMaxIdlePeriodIeView =
+  cast[ptr BssMaxIdlePeriodIeView](p)
+
+template wmmInfoIeAt(p: pointer): ptr WmmInfoIeView =
+  cast[ptr WmmInfoIeView](p)
+
 template wmmParameterIeAt(p: pointer): ptr WmmParameterIeView =
   cast[ptr WmmParameterIeView](p)
 
 template htCapIeAt(p: pointer): ptr HtCapIeView =
   cast[ptr HtCapIeView](p)
+
+template htOperIeAt(p: pointer): ptr HtOperIeView =
+  cast[ptr HtOperIeView](p)
+
+template rsnCcmpPskIeAt(p: pointer): ptr RsnCcmpPskIeView =
+  cast[ptr RsnCcmpPskIeView](p)
+
+template rsnTkipCcmpIeAt(p: pointer): ptr RsnTkipCcmpIeView =
+  cast[ptr RsnTkipCcmpIeView](p)
+
+template wpaVendorIeAt(p: pointer): ptr WpaVendorIeView =
+  cast[ptr WpaVendorIeView](p)
+
+template wpaPskVendorIeAt(p: pointer): ptr WpaPskVendorIeView =
+  cast[ptr WpaPskVendorIeView](p)
 
 template hostTxProbeReqFrame(link: ptr HostTxLinkDescView): ptr ProbeReqFrameView =
   cast[ptr ProbeReqFrameView](addr link.macHeader[0])
@@ -3809,11 +5591,20 @@ template txlThdProbeAt(p: pointer): ptr TxlThdProbeView =
 template wpaCallbacks(): ptr WpaCallbacksView =
   cast[ptr WpaCallbacksView](wpa_cbs)
 
+template wpsCallbacks(): ptr WpsCallbacksView =
+  cast[ptr WpsCallbacksView](wps_cbs)
+
 proc le32*(rec: WmmAcParamRecord): uint32 {.inline.} =
   rec.raw[0].uint32 or
     (rec.raw[1].uint32 shl 8) or
     (rec.raw[2].uint32 shl 16) or
     (rec.raw[3].uint32 shl 24)
+
+proc setLe32*(rec: var WmmAcParamRecord; value: uint32) {.inline.} =
+  rec.raw[0] = (value and 0xFF'u32).uint8
+  rec.raw[1] = ((value shr 8) and 0xFF'u32).uint8
+  rec.raw[2] = ((value shr 16) and 0xFF'u32).uint8
+  rec.raw[3] = ((value shr 24) and 0xFF'u32).uint8
 
 proc keyMgmtLe*(info: ptr WpaParsedInfoView): uint32 {.inline.} =
   info.keyMgmtByte.uint32 or (info.keyMgmtHigh.uint32 shl 8)
@@ -3828,7 +5619,7 @@ template scanuResultAt(p: pointer): ptr ScanuResultEntry =
   cast[ptr ScanuResultEntry](p)
 
 template scanuChannelConfig(): ptr ScanuChannelConfigOverlay =
-  cast[ptr ScanuChannelConfigOverlay](cast[uint](addr scanu_env) + 40'u)
+  cast[ptr ScanuChannelConfigOverlay](addr meEnvView().chanConfig[0])
 
 template scanuAddIeView(): ptr ScanuAddIeObj =
   cast[ptr ScanuAddIeObj](addr scanu_add_ie[0])
@@ -3852,7 +5643,7 @@ template rxuMgtIndAt(p: pointer): ptr RxuMgtIndView =
   cast[ptr RxuMgtIndView](p)
 
 proc rxuMgtIndIeStart(p: pointer): pointer {.inline.} =
-  cast[pointer](cast[uint](p) + sizeof(RxuMgtIndView).uint)
+  addr rxuMgtIndAt(p).ieData[0]
 
 proc rxuMgtIndSsidLogPtr(rx: ptr RxuMgtIndView): pointer {.inline.} =
   cast[pointer](unsafeAddr rx.reserved3[8])
@@ -3869,11 +5660,125 @@ template macAddrAt(p: pointer): ptr MacAddrView =
 template macDataFrameAt(p: pointer): ptr MacDataFrameHeaderView =
   cast[ptr MacDataFrameHeaderView](p)
 
+template macFrameControlAt(p: pointer): ptr MacFrameControlView =
+  cast[ptr MacFrameControlView](p)
+
+template mmieAt(p: pointer): ptr MmIeView =
+  cast[ptr MmIeView](p)
+
+template mmieMicWords(ie: ptr MmIeView): ptr UncheckedArray[uint32] =
+  cast[ptr UncheckedArray[uint32]](addr ie.mic[0])
+
 template macQosDataFrameAt(p: pointer): ptr MacQosDataFrameHeaderView =
   cast[ptr MacQosDataFrameHeaderView](p)
 
 template macQos4AddrFrameAt(p: pointer): ptr MacQos4AddrFrameHeaderView =
   cast[ptr MacQos4AddrFrameHeaderView](p)
+
+template rxFrameBufferChainAt(p: pointer): ptr RxFrameBufferChainView =
+  cast[ptr RxFrameBufferChainView](p)
+
+template rxFrameBufferRefAt(p: pointer): ptr RxFrameBufferRefView =
+  cast[ptr RxFrameBufferRefView](p)
+
+template rxDmaProgressDescAt(p: pointer): ptr RxDmaProgressDescView =
+  cast[ptr RxDmaProgressDescView](p)
+
+template rxMicFailureIndAt(p: pointer): ptr RxMicFailureIndView =
+  cast[ptr RxMicFailureIndView](p)
+
+template rxMicWordsAt(p: uint): ptr RxMicWordsView =
+  cast[ptr RxMicWordsView](p)
+
+template rxuMgtIndMsgAt(p: pointer): ptr RxuMgtIndMsgView =
+  cast[ptr RxuMgtIndMsgView](p)
+
+template authChallengeBodyAt(p: pointer): ptr AuthChallengeBodyView =
+  cast[ptr AuthChallengeBodyView](p)
+
+template managementReasonBodyAt(p: pointer): ptr ManagementReasonBodyView =
+  cast[ptr ManagementReasonBodyView](p)
+
+template rxEthernetRewriteHeaderAt(p: pointer): ptr RxEthernetRewriteHeaderView =
+  cast[ptr RxEthernetRewriteHeaderView](p)
+
+proc rxFramePayload(swdesc: ptr RxSwDescView): pointer {.inline.} =
+  rxFrameBufferChainAt(swdesc.bufferChain).frameData
+
+proc rxQosControl(frame: ptr MacDataFrameHeaderView; machdrLen: uint8): uint16 {.inline.} =
+  if machdrLen >= sizeof(MacQos4AddrFrameHeaderView).uint8:
+    macQos4AddrFrameAt(frame).qosCtrl
+  else:
+    macQosDataFrameAt(frame).qosCtrl
+
+template rxFrameBytes(frame: pointer): ptr UncheckedArray[uint8] =
+  cast[ptr UncheckedArray[uint8]](frame)
+
+template rxFrameWords(frame: pointer): ptr UncheckedArray[uint32] =
+  cast[ptr UncheckedArray[uint32]](frame)
+
+proc rxFrameCursor(frame: pointer; offset: uint): pointer {.inline.} =
+  cast[pointer](addr rxFrameBytes(frame)[offset])
+
+proc copyRoundedRxWords(dst: pointer; src: pointer; byteLen: uint16) {.inline.} =
+  let wordCount = (byteLen.uint32 + 3) shr 2
+  let dstWords = rxFrameWords(dst)
+  let srcWords = rxFrameWords(src)
+  for w in 0'u32 ..< wordCount:
+    dstWords[w] = srcWords[w]
+
+proc rxMsduView(frame: ptr MacDataFrameHeaderView; machdrLen: uint8): ptr RxMsduSnapView {.inline.} =
+  cast[ptr RxMsduSnapView](addr rxFrameBytes(frame)[machdrLen])
+
+proc rxMsdu(frame: ptr MacDataFrameHeaderView; machdrLen: uint8): ptr LlcSnapHeaderView {.inline.} =
+  addr rxMsduView(frame, machdrLen).snap
+
+proc rxMsduPayload(msdu: ptr RxMsduSnapView): pointer {.inline.} =
+  cast[pointer](addr msdu.payload[0])
+
+proc rxSnapPrefixIs(msdu: ptr LlcSnapHeaderView;
+                    oui2: uint8): bool {.inline.} =
+  msdu.dsap == 0xAA'u8 and
+    msdu.ssap == 0xAA'u8 and
+    msdu.control == 0x03'u8 and
+    msdu.oui[0] == 0'u8 and
+    msdu.oui[1] == 0'u8 and
+    msdu.oui[2] == oui2
+
+proc rxSnapIsRfc1042(msdu: ptr LlcSnapHeaderView): bool {.inline.} =
+  rxSnapPrefixIs(msdu, 0'u8)
+
+proc rxSnapIsBridgeTunnel(msdu: ptr LlcSnapHeaderView): bool {.inline.} =
+  rxSnapPrefixIs(msdu, 0xF8'u8)
+
+proc rxSnapTraceLo(msdu: ptr LlcSnapHeaderView): uint32 {.inline.} =
+  msdu.dsap.uint32 or
+    (msdu.ssap.uint32 shl 8) or
+    (msdu.control.uint32 shl 16) or
+    (msdu.oui[0].uint32 shl 24)
+
+proc rxSnapTraceHi(msdu: ptr LlcSnapHeaderView): uint32 {.inline.} =
+  msdu.oui[1].uint32 or
+    (msdu.oui[2].uint32 shl 8) or
+    (msdu.ethertype.uint32 shl 16)
+
+proc rxSecurityHeaderAt[T](frame: pointer; machdrLen: uint8): ptr T {.inline.} =
+  cast[ptr T](addr rxFrameBytes(frame)[machdrLen])
+
+proc rxEthernetRewriteHeader(frame: ptr MacDataFrameHeaderView; stripLen: uint8): ptr RxEthernetRewriteHeaderView {.inline.} =
+  cast[ptr RxEthernetRewriteHeaderView](addr rxFrameBytes(frame)[stripLen.int - 14])
+
+proc rxFrameBodyByte(frame: ptr MacDataFrameHeaderView; offset: uint8): uint8 {.inline.} =
+  cast[ptr UncheckedArray[uint8]](frame)[offset]
+
+proc rxFrameAtRef(buf: pointer): ptr MacDataFrameHeaderView {.inline.} =
+  macDataFrameAt(rxFrameBufferRefAt(buf).frameData)
+
+proc rxCopyAddr(dst: ptr array[6, uint8]; src: ptr array[6, uint8]) {.inline.} =
+  dst[] = src[]
+
+proc rxAddrPtr(src: ptr array[6, uint8]): pointer {.inline.} =
+  cast[pointer](src)
 
 template vifApBeaconFrameDesc(vif: ptr VifChannelView): ptr TxlFrameDescView =
   cast[ptr TxlFrameDescView](addr vif.staIdx)
@@ -3929,12 +5834,33 @@ static:
   doAssert offsetof(ProbeReqFrameView, ssidData) == 26
   doAssert sizeof(RxuMgtIndView) == 68
   doAssert offsetof(RxuMgtIndView, reserved3) + 8 == 62
+  doAssert offsetof(RxuMgtIndView, ieData) == 68
   doAssert sizeof(PhyRxVectorView) == 45
   doAssert sizeof(MacAddrView) == 6
   doAssert sizeof(MacIeView) == 2
+  doAssert sizeof(MmIeView) == 18
+  doAssert offsetof(MmIeView, ie) == 0
+  doAssert offsetof(MmIeView, keyId) == 2
+  doAssert offsetof(MmIeView, ipn) == 4
+  doAssert offsetof(MmIeView, mic) == 10
+  doAssert offsetof(RateSetView, rates) == 1
+  doAssert offsetof(MacIeDataView, data) == 2
+  doAssert offsetof(TimeoutIntervalIeView, intervalType) == 2
+  doAssert offsetof(TimeoutIntervalIeView, intervalValue) == 3
+  doAssert sizeof(TimeoutIntervalIeView) == 7
   doAssert offsetof(SsidIeView, data) == 2
   doAssert sizeof(DsParamSetIeView) == 3
   doAssert offsetof(DsParamSetIeView, currentChannel) == 2
+  doAssert offsetof(DsParamSetIeView, next) == 3
+  doAssert sizeof(OneByteMacIeView) == 3
+  doAssert offsetof(OneByteMacIeView, value) == 2
+  doAssert offsetof(OneByteMacIeView, next) == 3
+  doAssert sizeof(BssMaxIdlePeriodIeView) == 5
+  doAssert offsetof(BssMaxIdlePeriodIeView, idlePeriod) == 2
+  doAssert offsetof(BssMaxIdlePeriodIeView, idleOptions) == 4
+  doAssert sizeof(WmmInfoIeView) == 9
+  doAssert offsetof(WmmInfoIeView, qosInfo) == 8
+  doAssert offsetof(WmmInfoIeView, next) == 9
   doAssert sizeof(WmmAcParamRecord) == 4
   doAssert offsetof(WmmParameterIeView, qosInfo) == 8
   doAssert offsetof(WmmParameterIeView, ac) == 10
@@ -3946,6 +5872,45 @@ static:
   doAssert offsetof(HtCapIeView, txBfCapsLo) == 23
   doAssert offsetof(HtCapIeView, aselCap) == 27
   doAssert sizeof(HtCapIeView) == 28
+  doAssert offsetof(HtCapIeView, next) == 28
+  doAssert offsetof(HtOperIeView, primaryChannel) == 2
+  doAssert offsetof(HtOperIeView, secondaryOffset) == 3
+  doAssert offsetof(HtOperIeView, htProtection) == 4
+  doAssert offsetof(HtOperIeView, operationMode) == 5
+  doAssert offsetof(HtOperIeView, basicMcsSet) == 8
+  doAssert sizeof(HtOperIeView) == 24
+  doAssert offsetof(HtOperIeView, next) == 24
+  doAssert sizeof(RsnSuiteView) == 4
+  doAssert offsetof(RsnCcmpPskIeView, groupCipher) == 4
+  doAssert offsetof(RsnCcmpPskIeView, pairwiseCipher) == 10
+  doAssert offsetof(RsnCcmpPskIeView, akmSuite) == 16
+  doAssert offsetof(RsnCcmpPskIeView, capabilities) == 20
+  doAssert sizeof(RsnCcmpPskIeView) == 22
+  doAssert offsetof(RsnCcmpPskIeView, next) == 22
+  doAssert offsetof(RsnTkipCcmpIeView, pairwiseCipher) == 10
+  doAssert offsetof(RsnTkipCcmpIeView, akmCount) == 18
+  doAssert offsetof(RsnTkipCcmpIeView, akmSuite) == 20
+  doAssert offsetof(RsnTkipCcmpIeView, capabilities) == 24
+  doAssert sizeof(RsnTkipCcmpIeView) == 26
+  doAssert offsetof(RsnTkipCcmpIeView, next) == 26
+  doAssert offsetof(WpaVendorIeView, vendorType) == 2
+  doAssert offsetof(WpaVendorIeView, version) == 6
+  doAssert offsetof(WpaVendorIeView, groupCipher) == 8
+  doAssert offsetof(WpaVendorIeView, pairwiseCount) == 12
+  doAssert offsetof(WpaVendorIeView, pairwiseCipher) == 14
+  doAssert offsetof(WpaVendorIeView, akmCount) == 22
+  doAssert offsetof(WpaVendorIeView, akmSuite) == 24
+  doAssert sizeof(WpaVendorIeView) == 28
+  doAssert offsetof(WpaVendorIeView, next) == 28
+  doAssert offsetof(WpaPskVendorIeView, vendorType) == 2
+  doAssert offsetof(WpaPskVendorIeView, version) == 6
+  doAssert offsetof(WpaPskVendorIeView, groupCipher) == 8
+  doAssert offsetof(WpaPskVendorIeView, pairwiseCount) == 12
+  doAssert offsetof(WpaPskVendorIeView, pairwiseCipher) == 14
+  doAssert offsetof(WpaPskVendorIeView, akmCount) == 18
+  doAssert offsetof(WpaPskVendorIeView, akmSuite) == 20
+  doAssert sizeof(WpaPskVendorIeView) == 24
+  doAssert offsetof(WpaPskVendorIeView, next) == 24
   doAssert offsetof(WpsScanCallbackView, capInfo) == 6
   doAssert offsetof(WpsScanCallbackView, ssidPtr) == 8
   doAssert offsetof(WpsScanCallbackView, ssidLen) == 12
@@ -3954,6 +5919,10 @@ static:
   doAssert offsetof(WpsScanCallbackView, wpsIe) == 24
   doAssert sizeof(WpsScanCallbackView) == 28
   doAssert sizeof(WpsScanCallbackBuffer) == 140
+  doAssert offsetof(WpsCallbacksView, init) == 0
+  doAssert offsetof(WpsCallbacksView, eapolHandler) == 4
+  doAssert offsetof(WpsCallbacksView, staConnected) == 8
+  doAssert offsetof(WpsCallbacksView, staAddConfirm) == 12
   doAssert offsetof(WpaParsedInfoView, groupCipher) == 4
   doAssert offsetof(WpaParsedInfoView, pairwiseCipher) == 8
   doAssert offsetof(WpaParsedInfoView, keyMgmtByte) == 12
@@ -3962,9 +5931,36 @@ static:
   doAssert offsetof(WpaParsedInfoView, vendorByte28) == 28
   doAssert sizeof(WpaParsedInfoView) == 32
   doAssert sizeof(WpaParsedInfoBuffer) == 128
+  doAssert offsetof(WpaCallbacksView, init) == 0
+  doAssert offsetof(WpaCallbacksView, deinit) == 4
   doAssert offsetof(WpaCallbacksView, scanSecurityNotify) == 8
   doAssert offsetof(WpaCallbacksView, keyWrite) == 12
+  doAssert offsetof(WpaCallbacksView, eapolHandler) == 20
+  doAssert offsetof(WpaCallbacksView, beaconRegister) == 24
+  doAssert offsetof(WpaCallbacksView, apStopped) == 28
+  doAssert offsetof(WpaCallbacksView, staAdd) == 36
+  doAssert offsetof(WpaCallbacksView, disconnect) == 40
   doAssert offsetof(WpaCallbacksView, parseSecurityIe) == 48
+  doAssert offsetof(WpaCallbacksView, getSaeFrame) == 56
+  doAssert offsetof(WpaCallbacksView, authTimeout) == 64
+  doAssert sizeof(WpaBeaconRegisterParamView) == 144
+  doAssert offsetof(WpaBeaconRegisterParamView, bssid) == 1
+  doAssert offsetof(WpaBeaconRegisterParamView, rateCount) == 40
+  doAssert offsetof(WpaBeaconRegisterParamView, rates) == 44
+  doAssert offsetof(WpaBeaconRegisterParamView, marker) == 76
+  doAssert offsetof(WpaBeaconRegisterParamView, ssid) == 78
+  doAssert offsetof(WpaBeaconRegisterParamView, terminator) == 142
+  doAssert sizeof(WpaKeyWriteParamView) == 128
+  doAssert offsetof(WpaKeyWriteParamView, staIdx) == 1
+  doAssert offsetof(WpaKeyWriteParamView, keyDataLen) == 16
+  doAssert offsetof(WpaKeyWriteParamView, keyMaterial) == 20
+  doAssert offsetof(WpaKeyWriteParamView, ssid) == 58
+  doAssert offsetof(WpaKeyWriteParamView, quickConn) == 125
+  doAssert sizeof(WepKeyWriteParamView) == 56
+  doAssert offsetof(WepKeyWriteParamView, keyLen) == 4
+  doAssert offsetof(WepKeyWriteParamView, keyData) == 8
+  doAssert offsetof(WepKeyWriteParamView, cipherMode) == 52
+  doAssert offsetof(WepKeyWriteParamView, instNbr) == 53
   doAssert offsetof(WpaScanSecurityNotifyView, macAddr) == 2
   doAssert offsetof(WpaScanSecurityNotifyView, bssid) == 8
   doAssert offsetof(WpaScanSecurityNotifyView, cipher) == 52
@@ -3972,15 +5968,31 @@ static:
   doAssert offsetof(WpaScanSecurityNotifyView, cipherPair) == 56
   doAssert offsetof(WpaScanSecurityNotifyView, vendorByte124) == 124
   doAssert sizeof(WpaScanSecurityNotifyView) == 128
+  doAssert offsetof(HostapdOpsView, eapolRx) == 44
   doAssert offsetof(TimIeView, dtimCount) == 2
   doAssert offsetof(TimIeView, dtimPeriod) == 3
   doAssert offsetof(TimIeView, bitmapControl) == 4
   doAssert offsetof(TimIeView, partialBitmap) == 5
   doAssert sizeof(CsaIeView) == 5
+  doAssert offsetof(CsaIeView, switchMode) == 2
+  doAssert offsetof(CsaIeView, newChannel) == 3
+  doAssert offsetof(CsaIeView, switchCount) == 4
+  doAssert offsetof(CsaIeView, next) == 5
   doAssert sizeof(ExtendedCsaIeView) == 6
+  doAssert offsetof(ExtendedCsaIeView, switchMode) == 2
+  doAssert offsetof(ExtendedCsaIeView, operatingClass) == 3
+  doAssert offsetof(ExtendedCsaIeView, newChannel) == 4
+  doAssert offsetof(ExtendedCsaIeView, switchCount) == 5
   doAssert sizeof(SecondaryChannelOffsetIeView) == 3
   doAssert sizeof(WideBandwidthChannelSwitchIeView) == 5
   doAssert sizeof(CsaOutputView) == 8
+  doAssert offsetof(PowerConstraintOutputOverlay, constraint) == 132
+  doAssert offsetof(CountryRegOutputOverlay, channelReg) == 76
+  doAssert offsetof(CountryRegView, environment) == 2
+  doAssert offsetof(CountryRegView, maxPower) == 4
+  doAssert sizeof(CountryTripletView) == 3
+  doAssert offsetof(CountryTripletView, numChan) == 1
+  doAssert offsetof(CountryTripletView, maxPower) == 2
   doAssert sizeof(TxlFrameDescView) == 216
   doAssert offsetof(TxlFrameDescView, vifIdx) == 47
   doAssert offsetof(TxlFrameDescView, staInfoIdx) == 49
@@ -4114,10 +6126,10 @@ var
   # =0x3D8 (41 × 24), rx_payload_desc=0x854 (41 × 52), rx_payload_desc_buffer
   # =0x11608 (41 × 1736). They must be addressable at their blob names so the
   # MAC register writes in rxl_hwdesc_init land at the right physical pages.
-  rx_dma_hdrdesc* {.exportc.}: array[4100, uint8]
-  rx_swdesc_tab* {.exportc.}: array[984, uint8]
-  rx_payload_desc* {.exportc.}: array[2132, uint8]
-  rx_payload_desc_buffer* {.exportc.}: array[71176, uint8]
+  rx_dma_hdrdesc* {.exportc, wifiRxDmaHd.}: array[4100, uint8]
+  rx_payload_desc* {.exportc, wifiRxDmaPd.}: array[2132, uint8]
+  rx_swdesc_tab* {.exportc, wifiRxDmaSw.}: array[984, uint8]
+  rx_payload_desc_buffer* {.exportc, wifiRxDmaBuf.}: array[71176, uint8]
 
   # RX HW descriptor environment (from rxl_hwdesc.c)
   # Layout (28 bytes):
@@ -4158,6 +6170,7 @@ var
 
   # Scan-upper environment (exported as "scanu_env")
   scanu_env* {.exportc.}: ScanuEnvObj
+  scanuCachedSsids: array[SCANU_MAX_RESULT_ENTRIES, ScanuCachedSsid]
   scanuJoinHandler*: pointer  # Function pointer stored during scanu_init
   scanuResults*: array[MAX_SCAN_RESULTS, pointer]
   scanuResultCount*: uint32
@@ -4273,7 +6286,7 @@ var
   # free STA pool; entries 5 and 6 are the two broadcast STA slots.
   sta_info_tab* {.exportc.}: array[STA_INFO_TAB_ENTRIES * STA_ENTRY_SIZE, uint8]
 
-  # VIF info table (MAX_VIFS=2 entries, VIF_ENTRY_SIZE=1512 bytes each)
+  # VIF info table (MAX_VIFS=2 entries, VIF_ENTRY_SIZE=1504 bytes each)
   # Exported as C symbol "vif_info_tab" for blob ABI compatibility.
   vif_info_tab* {.exportc.}: array[MAX_VIFS * VIF_ENTRY_SIZE, uint8]
 
@@ -4424,11 +6437,15 @@ proc getLogFunc(offset: int): PlatformLogFunc {.inline.} =
 
 # Forward declare memset for zero-init
 proc c_memset(s: pointer, c: cint, n: csize_t): pointer {.importc: "memset", header: "<string.h>".}
-proc c_memcpy(dst, src: pointer, n: csize_t): pointer {.importc: "memcpy", header: "<string.h>".}
 proc c_memmove(dst, src: pointer, n: csize_t): pointer {.importc: "memmove", header: "<string.h>".}
 proc c_strlen(s: pointer): csize_t {.importc: "strlen", header: "<string.h>".}
 proc c_snprintf(buf: pointer, size: csize_t, fmt: cstring): cint {.importc: "snprintf", header: "<stdio.h>", varargs.}
 proc c_sprintf(buf: pointer, fmt: cstring): cint {.importc: "sprintf", header: "<stdio.h>", varargs, discardable.}
+
+proc copyIeBytes(dst: pointer; src: pointer; n: uint): pointer {.inline.} =
+  if n != 0:
+    discard c_memcpy(dst, src, n.csize_t)
+  ieCursorAfter(dst, n)
 
 when not isMainModule:
   {.emit: "void NimMain(void);".}
@@ -4444,6 +6461,35 @@ var nimFwDbgPayHasPayload*  {.wifiCtrl, exportc: "nimfw_dbg_pay_payload".}: uint
 var nimFwDbgPayEmptyList*   {.wifiCtrl, exportc: "nimfw_dbg_pay_empty".}: uint32
 var nimFwDbgPayNonEmpty*    {.wifiCtrl, exportc: "nimfw_dbg_pay_nonempty".}: uint32
 var nimFwDbgPayTriggerLast* {.wifiCtrl, exportc: "nimfw_dbg_pay_trig".}: uint32
+var nimFwDbgPayTxStatus* {.wifiCtrl, exportc: "nimfw_dbg_pay_tx_status".}: uint32
+var nimFwDbgPayTxAgg* {.wifiCtrl, exportc: "nimfw_dbg_pay_tx_agg".}: uint32
+var nimFwDbgPayTxDma* {.wifiCtrl, exportc: "nimfw_dbg_pay_tx_dma".}: uint32
+var nimFwDbgPayTxCurrent* {.wifiCtrl, exportc: "nimfw_dbg_pay_tx_current".}: uint32
+var nimFwDbgPayTxThd* {.wifiCtrl, exportc: "nimfw_dbg_pay_tx_thd".}: uint32
+var nimFwDbgPayTxHead* {.wifiCtrl, exportc: "nimfw_dbg_pay_tx_head".}: uint32
+var nimFwDbgProbePayMeta* {.wifiCtrl, exportc: "nimfw_dbg_probe_pay_meta".}: uint32
+var nimFwDbgProbePayDesc* {.wifiCtrl, exportc: "nimfw_dbg_probe_pay_desc".}: uint32
+var nimFwDbgProbePayLink* {.wifiCtrl, exportc: "nimfw_dbg_probe_pay_link".}: uint32
+var nimFwDbgProbePayHw* {.wifiCtrl, exportc: "nimfw_dbg_probe_pay_hw".}: uint32
+var nimFwDbgProbePayThd* {.wifiCtrl, exportc: "nimfw_dbg_probe_pay_thd".}: uint32
+var nimFwDbgProbePayLen* {.wifiCtrl, exportc: "nimfw_dbg_probe_pay_len".}: uint32
+var nimFwDbgProbePayHw0* {.wifiCtrl, exportc: "nimfw_dbg_probe_pay_hw0".}: uint32
+var nimFwDbgProbePayHw1* {.wifiCtrl, exportc: "nimfw_dbg_probe_pay_hw1".}: uint32
+var nimFwDbgProbePayHw2* {.wifiCtrl, exportc: "nimfw_dbg_probe_pay_hw2".}: uint32
+var nimFwDbgProbePayHw3* {.wifiCtrl, exportc: "nimfw_dbg_probe_pay_hw3".}: uint32
+var nimFwDbgProbePayLink0* {.wifiCtrl, exportc: "nimfw_dbg_probe_pay_link0".}: uint32
+var nimFwDbgProbePayLink1* {.wifiCtrl, exportc: "nimfw_dbg_probe_pay_link1".}: uint32
+var nimFwDbgProbePayHwStart* {.wifiCtrl, exportc: "nimfw_dbg_probe_pay_hw_start".}: uint32
+var nimFwDbgProbePayHwEnd* {.wifiCtrl, exportc: "nimfw_dbg_probe_pay_hw_end".}: uint32
+var nimFwDbgProbePayHwFrameLen* {.wifiCtrl, exportc: "nimfw_dbg_probe_pay_hw_frame_len".}: uint32
+var nimFwDbgProbePayHwStatus* {.wifiCtrl, exportc: "nimfw_dbg_probe_pay_hw_status".}: uint32
+var nimFwDbgProbePayHwCtrl* {.wifiCtrl, exportc: "nimfw_dbg_probe_pay_hw_ctrl".}: uint32
+var nimFwDbgProbePayHwChain* {.wifiCtrl, exportc: "nimfw_dbg_probe_pay_hw_chain".}: uint32
+var nimFwDbgProbePayHwWord36* {.wifiCtrl, exportc: "nimfw_dbg_probe_pay_hw_word36".}: uint32
+var nimFwDbgProbePayHwWord56* {.wifiCtrl, exportc: "nimfw_dbg_probe_pay_hw_word56".}: uint32
+var nimFwDbgProbePayRaw* {.wifiCtrl, exportc: "nimfw_dbg_probe_pay_raw".}: array[96, uint8]
+var nimFwDbgProbeIeLen* {.wifiCtrl, exportc: "nimfw_dbg_probe_ie_len".}: uint32
+var nimFwDbgProbeIeRaw* {.wifiCtrl, exportc: "nimfw_dbg_probe_ie_raw".}: array[64, uint8]
 var nimFwDbgTxTrigEntry*    {.wifiCtrl, exportc: "nimfw_dbg_txtrig_entry".}: uint32
 var nimFwDbgFrameGet*       {.wifiCtrl, exportc: "nimfw_dbg_frame_get".}: uint32
 var nimFwDbgFrameGetInvalid* {.wifiCtrl, exportc: "nimfw_dbg_frame_get_invalid".}: uint32
@@ -4464,6 +6510,9 @@ var nimFwDbgMmTimerYield* {.wifiCtrl, exportc: "nimfw_dbg_mm_timer_yield".}: uin
 var nimFwDbgMmTimerYieldHead* {.wifiCtrl, exportc: "nimfw_dbg_mm_timer_yield_head".}: uint32
 var nimFwDbgIpcMsgYield* {.wifiCtrl, exportc: "nimfw_dbg_ipc_msg_yield".}: uint32
 var nimFwDbgIpcMsgYieldStatus* {.wifiCtrl, exportc: "nimfw_dbg_ipc_msg_yield_status".}: uint32
+var nimFwDbgIpcTxYield* {.wifiCtrl, exportc: "nimfw_dbg_ipc_tx_yield".}: uint32
+var nimFwDbgIpcTxYieldAc* {.wifiCtrl, exportc: "nimfw_dbg_ipc_tx_yield_ac".}: uint32
+var nimFwDbgIpcTxYieldHead* {.wifiCtrl, exportc: "nimfw_dbg_ipc_tx_yield_head".}: uint32
 var nimFwDbgSavedMsgYield* {.wifiCtrl, exportc: "nimfw_dbg_saved_msg_yield".}: uint32
 var nimFwDbgSavedMsgYieldTask* {.wifiCtrl, exportc: "nimfw_dbg_saved_msg_yield_task".}: uint32
 var nimFwDbgCfmEvtYield* {.wifiCtrl, exportc: "nimfw_dbg_cfm_evt_yield".}: uint32
@@ -4471,10 +6520,260 @@ var nimFwDbgCfmEvtYieldAc* {.wifiCtrl, exportc: "nimfw_dbg_cfm_evt_yield_ac".}: 
 var nimFwDbgTxTrigYield* {.wifiCtrl, exportc: "nimfw_dbg_txtrig_yield".}: uint32
 var nimFwDbgTxTrigYieldAc* {.wifiCtrl, exportc: "nimfw_dbg_txtrig_yield_ac".}: uint32
 var nimFwDbgTxTrigYieldHead* {.wifiCtrl, exportc: "nimfw_dbg_txtrig_yield_head".}: uint32
+var nimFwDbgTxTrigLastDesc* {.wifiCtrl, exportc: "nimfw_dbg_txtrig_desc".}: uint32
+var nimFwDbgTxTrigLastStatus* {.wifiCtrl, exportc: "nimfw_dbg_txtrig_status".}: uint32
+var nimFwDbgTxTrigNotReady* {.wifiCtrl, exportc: "nimfw_dbg_txtrig_notready".}: uint32
+var nimFwDbgTxTrigNoDesc* {.wifiCtrl, exportc: "nimfw_dbg_txtrig_nodesc".}: uint32
 var nimFwDbgFrameEvtYield* {.wifiCtrl, exportc: "nimfw_dbg_frame_evt_yield".}: uint32
 var nimFwDbgFrameEvtYieldHead* {.wifiCtrl, exportc: "nimfw_dbg_frame_evt_yield_head".}: uint32
 var nimFwDbgRxTimerYield* {.wifiCtrl, exportc: "nimfw_dbg_rx_timer_yield".}: uint32
 var nimFwDbgRxTimerYieldHead* {.wifiCtrl, exportc: "nimfw_dbg_rx_timer_yield_head".}: uint32
+var nimFwDbgMacIrq* {.wifiCtrl, exportc: "nimfw_dbg_mac_irq".}: uint32
+var nimFwDbgMacIrqLast* {.wifiCtrl, exportc: "nimfw_dbg_mac_irq_last".}: uint32
+var nimFwDbgMacIrqSlot50* {.wifiCtrl, exportc: "nimfw_dbg_mac_irq_slot50".}: uint32
+var nimFwDbgMacIrqSlot52* {.wifiCtrl, exportc: "nimfw_dbg_mac_irq_slot52".}: uint32
+var nimFwDbgMacIrqSlot53* {.wifiCtrl, exportc: "nimfw_dbg_mac_irq_slot53".}: uint32
+var nimFwDbgMacIrqSlot54* {.wifiCtrl, exportc: "nimfw_dbg_mac_irq_slot54".}: uint32
+var nimFwDbgMacIrqSlotOther* {.wifiCtrl, exportc: "nimfw_dbg_mac_irq_slot_other".}: uint32
+var nimFwDbgMacIrqLastHandler* {.wifiCtrl, exportc: "nimfw_dbg_mac_irq_last_handler".}: uint32
+var nimFwDbgMacIrqLastIntRaw* {.wifiCtrl, exportc: "nimfw_dbg_mac_irq_last_int_raw".}: uint32
+var nimFwDbgMacIrqLastGenRaw* {.wifiCtrl, exportc: "nimfw_dbg_mac_irq_last_gen_raw".}: uint32
+var nimFwDbgMacIrqLastRxCtrl* {.wifiCtrl, exportc: "nimfw_dbg_mac_irq_last_rxctrl".}: uint32
+var nimFwDbgMacIrqLastHd* {.wifiCtrl, exportc: "nimfw_dbg_mac_irq_last_hd".}: uint32
+var nimFwDbgMacIrqLastPd* {.wifiCtrl, exportc: "nimfw_dbg_mac_irq_last_pd".}: uint32
+var nimFwDbgMachwGen* {.wifiCtrl, exportc: "nimfw_dbg_machw_gen".}: uint32
+var nimFwDbgMachwStatus* {.wifiCtrl, exportc: "nimfw_dbg_machw_status".}: uint32
+var nimFwDbgMachwGenStatus* {.wifiCtrl, exportc: "nimfw_dbg_machw_gen_status".}: uint32
+var nimFwDbgRxlTimerEvt* {.wifiCtrl, exportc: "nimfw_dbg_rxl_timer_evt".}: uint32
+var nimFwDbgRxlTimerReady* {.wifiCtrl, exportc: "nimfw_dbg_rxl_timer_ready".}: uint32
+var nimFwDbgRxlTimerHead* {.wifiCtrl, exportc: "nimfw_dbg_rxl_timer_head".}: uint32
+var nimFwDbgRxlCntrlEvt* {.wifiCtrl, exportc: "nimfw_dbg_rxl_cntrl_evt".}: uint32
+var nimFwDbgRxlCntrlHead* {.wifiCtrl, exportc: "nimfw_dbg_rxl_cntrl_head".}: uint32
+var nimFwDbgRxlDmaEvt* {.wifiCtrl, exportc: "nimfw_dbg_rxl_dma_evt".}: uint32
+var nimFwDbgRxlSnapHd* {.wifiCtrl, exportc: "nimfw_dbg_rxl_snap_hd".}: uint32
+var nimFwDbgRxlSnapPd* {.wifiCtrl, exportc: "nimfw_dbg_rxl_snap_pd".}: uint32
+var nimFwDbgRxlSnapHwHd* {.wifiCtrl, exportc: "nimfw_dbg_rxl_snap_hw_hd".}: uint32
+var nimFwDbgRxlSnapHwPd* {.wifiCtrl, exportc: "nimfw_dbg_rxl_snap_hw_pd".}: uint32
+var nimFwDbgRxlSnapMask* {.wifiCtrl, exportc: "nimfw_dbg_rxl_snap_mask".}: uint32
+var nimFwDbgRxlSnapRxCtrl* {.wifiCtrl, exportc: "nimfw_dbg_rxl_snap_rxctrl".}: uint32
+var nimFwDbgRxlSnapIntUnmask* {.wifiCtrl, exportc: "nimfw_dbg_rxl_snap_int_unmask".}: uint32
+var nimFwDbgRxlSnapGenUnmask* {.wifiCtrl, exportc: "nimfw_dbg_rxl_snap_gen_unmask".}: uint32
+var nimFwDbgRxlSnapRxCtrlRaw* {.wifiCtrl, exportc: "nimfw_dbg_rxl_snap_rxctrl_raw".}: uint32
+var nimFwDbgRxlSnapStatusRaw* {.wifiCtrl, exportc: "nimfw_dbg_rxl_snap_status_raw".}: uint32
+var nimFwDbgRxlSnapIrqRaw* {.wifiCtrl, exportc: "nimfw_dbg_rxl_snap_irq_raw".}: uint32
+var nimFwDbgRxlSnapGenRaw* {.wifiCtrl, exportc: "nimfw_dbg_rxl_snap_gen_raw".}: uint32
+var nimFwDbgRxlSnapHdStatus* {.wifiCtrl, exportc: "nimfw_dbg_rxl_snap_hd_status".}: uint32
+var nimFwDbgRxlSnapPdStatus* {.wifiCtrl, exportc: "nimfw_dbg_rxl_snap_pd_status".}: uint32
+var nimFwDbgScanStartRxCtrl* {.wifiCtrl, exportc: "nimfw_dbg_scan_start_rxctrl".}: uint32
+var nimFwDbgScanStartIrqRaw* {.wifiCtrl, exportc: "nimfw_dbg_scan_start_irq_raw".}: uint32
+var nimFwDbgScanStartGenRaw* {.wifiCtrl, exportc: "nimfw_dbg_scan_start_gen_raw".}: uint32
+var nimFwDbgScanEndRxCtrl* {.wifiCtrl, exportc: "nimfw_dbg_scan_end_rxctrl".}: uint32
+var nimFwDbgScanEndIrqRaw* {.wifiCtrl, exportc: "nimfw_dbg_scan_end_irq_raw".}: uint32
+var nimFwDbgScanEndGenRaw* {.wifiCtrl, exportc: "nimfw_dbg_scan_end_gen_raw".}: uint32
+var nimFwDbgScanReqChanMeta* {.wifiCtrl, exportc: "nimfw_dbg_scan_req_chan_meta".}: uint32
+var nimFwDbgScanReqChanFreq* {.wifiCtrl, exportc: "nimfw_dbg_scan_req_chan_freq".}: uint32
+var nimFwDbgChanScanChanMeta* {.wifiCtrl, exportc: "nimfw_dbg_chan_scan_chan_meta".}: uint32
+var nimFwDbgChanScanChanFreq* {.wifiCtrl, exportc: "nimfw_dbg_chan_scan_chan_freq".}: uint32
+var nimFwDbgChanPreChanMeta* {.wifiCtrl, exportc: "nimfw_dbg_chan_pre_chan_meta".}: uint32
+var nimFwDbgChanPreChanFreq* {.wifiCtrl, exportc: "nimfw_dbg_chan_pre_chan_freq".}: uint32
+var nimFwDbgMacTimingE8* {.wifiCtrl, exportc: "nimfw_dbg_mac_timing_e8".}: uint32
+var nimFwDbgMacTimingF0* {.wifiCtrl, exportc: "nimfw_dbg_mac_timing_f0".}: uint32
+var nimFwDbgMacTimingF4* {.wifiCtrl, exportc: "nimfw_dbg_mac_timing_f4".}: uint32
+var nimFwDbgMacTimingF8* {.wifiCtrl, exportc: "nimfw_dbg_mac_timing_f8".}: uint32
+var nimFwDbgMacTiming104* {.wifiCtrl, exportc: "nimfw_dbg_mac_timing_104".}: uint32
+var nimFwDbgScanStartPhyRaw* {.wifiCtrl, exportc: "nimfw_dbg_scan_start_phy_raw".}: array[4, uint32]
+var nimFwDbgScanEndPhyRaw* {.wifiCtrl, exportc: "nimfw_dbg_scan_end_phy_raw".}: array[4, uint32]
+const NimFwDbgRfPhyTraceLen {.intdefine.} = 8
+var nimFwDbgRfPhyTraceCount* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_count".}: uint32
+var nimFwDbgRfPhyTracePhase* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_phase".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceDevice* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_device".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceChanMeta* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_chan_meta".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceChanFreq* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_chan_freq".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceRf70* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_rf70".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceRf74* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_rf74".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceRf2c* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_rf2c".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceRf04* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_rf04".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceRf34* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_rf34".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceRf40* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_rf40".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceRf4c* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_rf4c".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceRf88* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_rf88".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceRf90* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_rf90".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceRfa0* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_rfa0".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceRfa4* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_rfa4".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceRfbc* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_rfbc".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceRfd0* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_rfd0".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceRf80* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_rf80".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceRf84* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_rf84".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceRf8c* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_rf8c".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceRfb4* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_rfb4".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceRf1600* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_rf1600".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceRf1614* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_rf1614".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceRf1618* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_rf1618".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceRf162c* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_rf162c".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceRf1680* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_rf1680".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceRf113c* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_rf113c".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTracePhy820* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_phy820".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTracePhy824* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_phy824".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTracePhy830* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_phy830".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTracePhy874* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_phy874".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceRxCtrl* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_rxctrl".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceIrqRaw* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_irqraw".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceGenRaw* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_genraw".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceHd* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_hd".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTracePd* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_pd".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceHwHd* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_hwhd".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfPhyTraceHwPd* {.wifiCtrl, exportc: "nimfw_dbg_rf_phy_trace_hwpd".}: array[NimFwDbgRfPhyTraceLen, uint32]
+var nimFwDbgRfCalSaveCount* {.wifiCtrl, exportc: "nimfw_dbg_rf_cal_save_count".}: uint32
+var nimFwDbgRfCalRestoreCount* {.wifiCtrl, exportc: "nimfw_dbg_rf_cal_restore_count".}: uint32
+var nimFwDbgRfCalSaveRf88* {.wifiCtrl, exportc: "nimfw_dbg_rf_cal_save_rf88".}: uint32
+var nimFwDbgRfCalRestoreRf88* {.wifiCtrl, exportc: "nimfw_dbg_rf_cal_restore_rf88".}: uint32
+var nimFwDbgRfCalRestoreReadbackRf88* {.wifiCtrl, exportc: "nimfw_dbg_rf_cal_restore_readback_rf88".}: uint32
+var nimFwDbgRfCalRestoreRf8c* {.wifiCtrl, exportc: "nimfw_dbg_rf_cal_restore_rf8c".}: uint32
+var nimFwDbgRfCalSaveRf2c* {.wifiCtrl, exportc: "nimfw_dbg_rf_cal_save_rf2c".}: uint32
+var nimFwDbgRfCalRestoreRf2c* {.wifiCtrl, exportc: "nimfw_dbg_rf_cal_restore_rf2c".}: uint32
+var nimFwDbgRfCalRestoreReadbackRf2c* {.wifiCtrl, exportc: "nimfw_dbg_rf_cal_restore_readback_rf2c".}: uint32
+var nimFwDbgRfPhase* {.wifiCtrl, exportc: "nimfw_dbg_rf_phase".}: uint32
+var nimFwDbgRfRestore* {.wifiCtrl, exportc: "nimfw_dbg_rf_restore".}: uint32
+var nimFwDbgRfApiMode* {.wifiCtrl, exportc: "nimfw_dbg_rf_api_mode".}: uint32
+var nimFwDbgRfAssertCount* {.wifiCtrl, exportc: "nimfw_dbg_rf_assert_count".}: uint32
+var nimFwDbgRfAssertLine* {.wifiCtrl, exportc: "nimfw_dbg_rf_assert_line".}: uint32
+var nimFwDbgRfAssertReg3c* {.wifiCtrl, exportc: "nimfw_dbg_rf_assert_reg3c".}: uint32
+var nimFwDbgRfCalPtr* {.wifiCtrl, exportc: "nimfw_dbg_rf_cal_ptr".}: uint32
+var nimFwDbgRfCalWords* {.wifiCtrl, exportc: "nimfw_dbg_rf_cal_words".}: array[8, uint32]
+var nimFwDbgRxuDescPrepare* {.wifiCtrl, exportc: "nimfw_dbg_rxu_desc_prepare".}: uint32
+var nimFwDbgRxuUploadEvt* {.wifiCtrl, exportc: "nimfw_dbg_rxu_upload_evt".}: uint32
+var nimFwDbgRxuUploadEntry* {.wifiCtrl, exportc: "nimfw_dbg_rxu_upload_entry".}: uint32
+var nimFwDbgRxuUploadTcpipOk* {.wifiCtrl, exportc: "nimfw_dbg_rxu_upload_tcpip_ok".}: uint32
+var nimFwDbgRxuUploadTcpipFail* {.wifiCtrl, exportc: "nimfw_dbg_rxu_upload_tcpip_fail".}: uint32
+var nimFwDbgRxuUploadFrame* {.wifiCtrl, exportc: "nimfw_dbg_rxu_upload_frame".}: uint32
+var nimFwDbgRxuFrameValid* {.wifiCtrl, exportc: "nimfw_dbg_rxu_frame_valid".}: uint32
+var nimFwDbgRxuAssocData* {.wifiCtrl, exportc: "nimfw_dbg_rxu_assoc_data".}: uint32
+var nimFwDbgRxuAssocEapol* {.wifiCtrl, exportc: "nimfw_dbg_rxu_assoc_eapol".}: uint32
+var nimFwDbgRxuAssocUploadReady* {.wifiCtrl, exportc: "nimfw_dbg_rxu_assoc_upload_ready".}: uint32
+var nimFwDbgRxuAssocMgmt* {.wifiCtrl, exportc: "nimfw_dbg_rxu_assoc_mgmt".}: uint32
+var nimFwDbgRxuNonassocData* {.wifiCtrl, exportc: "nimfw_dbg_rxu_nonassoc_data".}: uint32
+var nimFwDbgRxuDropInvalid* {.wifiCtrl, exportc: "nimfw_dbg_rxu_drop_invalid".}: uint32
+var nimFwDbgRxuDropStaInactive* {.wifiCtrl, exportc: "nimfw_dbg_rxu_drop_sta_inactive".}: uint32
+var nimFwDbgRxuDropFtype* {.wifiCtrl, exportc: "nimfw_dbg_rxu_drop_ftype".}: uint32
+var nimFwDbgRxuDropNull* {.wifiCtrl, exportc: "nimfw_dbg_rxu_drop_null".}: uint32
+var nimFwDbgRxuDropDup* {.wifiCtrl, exportc: "nimfw_dbg_rxu_drop_dup".}: uint32
+var nimFwDbgRxuDropPn* {.wifiCtrl, exportc: "nimfw_dbg_rxu_drop_pn".}: uint32
+var nimFwDbgRxuProtType* {.wifiCtrl, exportc: "nimfw_dbg_rxu_prot_type".}: uint32
+var nimFwDbgRxuProtKey* {.wifiCtrl, exportc: "nimfw_dbg_rxu_prot_key".}: uint32
+var nimFwDbgRxuProtPnLo* {.wifiCtrl, exportc: "nimfw_dbg_rxu_prot_pn_lo".}: uint32
+var nimFwDbgRxuProtPnHi* {.wifiCtrl, exportc: "nimfw_dbg_rxu_prot_pn_hi".}: uint32
+var nimFwDbgRxuPnMeta* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_meta".}: uint32
+var nimFwDbgRxuPnStoredLo* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_stored_lo".}: uint32
+var nimFwDbgRxuPnStoredHi* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_stored_hi".}: uint32
+var nimFwDbgRxuPnNextLo* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_next_lo".}: uint32
+var nimFwDbgRxuPnNextHi* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_next_hi".}: uint32
+var nimFwDbgRxuDataFc* {.wifiCtrl, exportc: "nimfw_dbg_rxu_data_fc".}: uint32
+var nimFwDbgRxuDataSeq* {.wifiCtrl, exportc: "nimfw_dbg_rxu_data_seq".}: uint32
+var nimFwDbgRxuLastHwFlags* {.wifiCtrl, exportc: "nimfw_dbg_rxu_last_hwflags".}: uint32
+var nimFwDbgRxuLastStatus* {.wifiCtrl, exportc: "nimfw_dbg_rxu_last_status".}: uint32
+var nimFwDbgRxuLastLen* {.wifiCtrl, exportc: "nimfw_dbg_rxu_last_len".}: uint32
+var nimFwDbgRxuSnapLo* {.wifiCtrl, exportc: "nimfw_dbg_rxu_snap_lo".}: uint32
+var nimFwDbgRxuSnapHi* {.wifiCtrl, exportc: "nimfw_dbg_rxu_snap_hi".}: uint32
+var nimFwDbgRxuAssocSnap* {.wifiCtrl, exportc: "nimfw_dbg_rxu_assoc_snap".}: uint32
+var nimFwDbgRxuAssocIp* {.wifiCtrl, exportc: "nimfw_dbg_rxu_assoc_ip".}: uint32
+var nimFwDbgRxuAssocArp* {.wifiCtrl, exportc: "nimfw_dbg_rxu_assoc_arp".}: uint32
+var nimFwDbgRxuAssocOther* {.wifiCtrl, exportc: "nimfw_dbg_rxu_assoc_other".}: uint32
+var nimFwDbgRxuAssocUdp* {.wifiCtrl, exportc: "nimfw_dbg_rxu_assoc_udp".}: uint32
+var nimFwDbgRxuAssocTcp* {.wifiCtrl, exportc: "nimfw_dbg_rxu_assoc_tcp".}: uint32
+var nimFwDbgRxuAssocTcp80* {.wifiCtrl, exportc: "nimfw_dbg_rxu_assoc_tcp80".}: uint32
+var nimFwDbgRxuAssocLastIpProto* {.wifiCtrl, exportc: "nimfw_dbg_rxu_assoc_last_ip_proto".}: uint32
+var nimFwDbgRxuAssocLastTcpPorts* {.wifiCtrl, exportc: "nimfw_dbg_rxu_assoc_last_tcp_ports".}: uint32
+var nimFwDbgRxuAssocLastTcpFlags* {.wifiCtrl, exportc: "nimfw_dbg_rxu_assoc_last_tcp_flags".}: uint32
+var nimFwDbgRxuAssocTcpMeta* {.wifiCtrl, exportc: "nimfw_dbg_rxu_assoc_tcp_meta".}: uint32
+var nimFwDbgRxuAssocTcpRaw* {.wifiCtrl, exportc: "nimfw_dbg_rxu_assoc_tcp_raw".}: array[64, uint8]
+var nimFwDbgRxuDropNullFc* {.wifiCtrl, exportc: "nimfw_dbg_rxu_drop_null_fc".}: uint32
+var nimFwDbgRxuDropNullSeq* {.wifiCtrl, exportc: "nimfw_dbg_rxu_drop_null_seq".}: uint32
+var nimFwDbgRxuDropDupFc* {.wifiCtrl, exportc: "nimfw_dbg_rxu_drop_dup_fc".}: uint32
+var nimFwDbgRxuDropDupSeq* {.wifiCtrl, exportc: "nimfw_dbg_rxu_drop_dup_seq".}: uint32
+const RxuDupTraceEntries = 8
+var nimFwDbgRxuDupTraceCount* {.wifiCtrl, exportc: "nimfw_dbg_rxu_dup_trace_count".}: uint32
+var nimFwDbgRxuDupTraceFc* {.wifiCtrl, exportc: "nimfw_dbg_rxu_dup_trace_fc".}: array[RxuDupTraceEntries, uint32]
+var nimFwDbgRxuDupTraceSeq* {.wifiCtrl, exportc: "nimfw_dbg_rxu_dup_trace_seq".}: array[RxuDupTraceEntries, uint32]
+var nimFwDbgRxuDupTraceCache* {.wifiCtrl, exportc: "nimfw_dbg_rxu_dup_trace_cache".}: array[RxuDupTraceEntries, uint32]
+var nimFwDbgRxuDupTraceSnapLo* {.wifiCtrl, exportc: "nimfw_dbg_rxu_dup_trace_snap_lo".}: array[RxuDupTraceEntries, uint32]
+var nimFwDbgRxuDupTraceSnapHi* {.wifiCtrl, exportc: "nimfw_dbg_rxu_dup_trace_snap_hi".}: array[RxuDupTraceEntries, uint32]
+var nimFwDbgRxuDupTraceAddr0* {.wifiCtrl, exportc: "nimfw_dbg_rxu_dup_trace_addr0".}: array[RxuDupTraceEntries, uint32]
+var nimFwDbgRxuDupTraceAddr1* {.wifiCtrl, exportc: "nimfw_dbg_rxu_dup_trace_addr1".}: array[RxuDupTraceEntries, uint32]
+var nimFwDbgRxuDupTraceIp0* {.wifiCtrl, exportc: "nimfw_dbg_rxu_dup_trace_ip0".}: array[RxuDupTraceEntries, uint32]
+var nimFwDbgRxuDupTraceUdp0* {.wifiCtrl, exportc: "nimfw_dbg_rxu_dup_trace_udp0".}: array[RxuDupTraceEntries, uint32]
+var nimFwDbgRxuDupTraceBootp0* {.wifiCtrl, exportc: "nimfw_dbg_rxu_dup_trace_bootp0".}: array[RxuDupTraceEntries, uint32]
+var nimFwDbgRxuDupTraceBootp1* {.wifiCtrl, exportc: "nimfw_dbg_rxu_dup_trace_bootp1".}: array[RxuDupTraceEntries, uint32]
+var nimFwDbgRxuDupTraceBootpYiaddr* {.wifiCtrl, exportc: "nimfw_dbg_rxu_dup_trace_bootp_yiaddr".}: array[RxuDupTraceEntries, uint32]
+var nimFwDbgRxuDupTraceDhcpMsg* {.wifiCtrl, exportc: "nimfw_dbg_rxu_dup_trace_dhcp_msg".}: array[RxuDupTraceEntries, uint32]
+var nimFwDbgRxuDupTraceDhcpServer* {.wifiCtrl, exportc: "nimfw_dbg_rxu_dup_trace_dhcp_server".}: array[RxuDupTraceEntries, uint32]
+var nimFwDbgRxuDupBreakHits* {.wifiCtrl, exportc: "nimfw_dbg_rxu_dup_break_hits".}: uint32
+const RxuPnDropTraceEntries = 8
+var nimFwDbgRxuPnDropTraceCount* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_drop_trace_count".}: uint32
+var nimFwDbgRxuPnDropTraceFc* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_drop_trace_fc".}: array[RxuPnDropTraceEntries, uint32]
+var nimFwDbgRxuPnDropTraceSeq* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_drop_trace_seq".}: array[RxuPnDropTraceEntries, uint32]
+var nimFwDbgRxuPnDropTracePnLo* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_drop_trace_pn_lo".}: array[RxuPnDropTraceEntries, uint32]
+var nimFwDbgRxuPnDropTracePnHi* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_drop_trace_pn_hi".}: array[RxuPnDropTraceEntries, uint32]
+var nimFwDbgRxuPnDropTraceStoredLo* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_drop_trace_stored_lo".}: array[RxuPnDropTraceEntries, uint32]
+var nimFwDbgRxuPnDropTraceStoredHi* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_drop_trace_stored_hi".}: array[RxuPnDropTraceEntries, uint32]
+var nimFwDbgRxuPnDropTraceSnapLo* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_drop_trace_snap_lo".}: array[RxuPnDropTraceEntries, uint32]
+var nimFwDbgRxuPnDropTraceSnapHi* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_drop_trace_snap_hi".}: array[RxuPnDropTraceEntries, uint32]
+var nimFwDbgRxuPnDropTraceUdp0* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_drop_trace_udp0".}: array[RxuPnDropTraceEntries, uint32]
+var nimFwDbgRxuPnDropTraceBootpYiaddr* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_drop_trace_bootp_yiaddr".}: array[RxuPnDropTraceEntries, uint32]
+var nimFwDbgRxuPnDropTraceDhcpMsg* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_drop_trace_dhcp_msg".}: array[RxuPnDropTraceEntries, uint32]
+var nimFwDbgRxuPnDropTraceDhcpServer* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_drop_trace_dhcp_server".}: array[RxuPnDropTraceEntries, uint32]
+const RxuPnAcceptTraceEntries = 8
+var nimFwDbgRxuPnAcceptTraceCount* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_accept_trace_count".}: uint32
+var nimFwDbgRxuPnAcceptTraceStage* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_accept_trace_stage".}: array[RxuPnAcceptTraceEntries, uint32]
+var nimFwDbgRxuPnAcceptTraceFc* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_accept_trace_fc".}: array[RxuPnAcceptTraceEntries, uint32]
+var nimFwDbgRxuPnAcceptTraceSeq* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_accept_trace_seq".}: array[RxuPnAcceptTraceEntries, uint32]
+var nimFwDbgRxuPnAcceptTracePnLo* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_accept_trace_pn_lo".}: array[RxuPnAcceptTraceEntries, uint32]
+var nimFwDbgRxuPnAcceptTracePnHi* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_accept_trace_pn_hi".}: array[RxuPnAcceptTraceEntries, uint32]
+var nimFwDbgRxuPnAcceptTraceStoredLo* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_accept_trace_stored_lo".}: array[RxuPnAcceptTraceEntries, uint32]
+var nimFwDbgRxuPnAcceptTraceStoredHi* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_accept_trace_stored_hi".}: array[RxuPnAcceptTraceEntries, uint32]
+var nimFwDbgRxuPnAcceptTraceNextLo* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_accept_trace_next_lo".}: array[RxuPnAcceptTraceEntries, uint32]
+var nimFwDbgRxuPnAcceptTraceNextHi* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_accept_trace_next_hi".}: array[RxuPnAcceptTraceEntries, uint32]
+var nimFwDbgRxuPnAcceptTraceSnapLo* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_accept_trace_snap_lo".}: array[RxuPnAcceptTraceEntries, uint32]
+var nimFwDbgRxuPnAcceptTraceSnapHi* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_accept_trace_snap_hi".}: array[RxuPnAcceptTraceEntries, uint32]
+var nimFwDbgRxuPnAcceptTraceUdp0* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_accept_trace_udp0".}: array[RxuPnAcceptTraceEntries, uint32]
+var nimFwDbgRxuPnAcceptTraceBootpYiaddr* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_accept_trace_bootp_yiaddr".}: array[RxuPnAcceptTraceEntries, uint32]
+var nimFwDbgRxuPnAcceptTraceDhcpMsg* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_accept_trace_dhcp_msg".}: array[RxuPnAcceptTraceEntries, uint32]
+var nimFwDbgRxuPnAcceptTraceDhcpServer* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_accept_trace_dhcp_server".}: array[RxuPnAcceptTraceEntries, uint32]
+var nimFwDbgSetKey0* {.wifiCtrl, exportc: "nimfw_dbg_setkey0".}: uint32
+var nimFwDbgSetKey1* {.wifiCtrl, exportc: "nimfw_dbg_setkey1".}: uint32
+var nimFwDbgSetKey2* {.wifiCtrl, exportc: "nimfw_dbg_setkey2".}: uint32
+var nimFwDbgSetKey3* {.wifiCtrl, exportc: "nimfw_dbg_setkey3".}: uint32
+var nimFwDbgMachwKeyWrCalls* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_calls".}: uint32
+var nimFwDbgMachwKeyWrGroup* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_group".}: uint32
+var nimFwDbgMachwKeyWrPair* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_pair".}: uint32
+var nimFwDbgMachwKeyWrLast0* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_last0".}: uint32
+var nimFwDbgMachwKeyWrLast1* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_last1".}: uint32
+var nimFwDbgMachwKeyWrPair0* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_pair0".}: uint32
+var nimFwDbgMachwKeyWrPair1* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_pair1".}: uint32
+var nimFwDbgMachwKeyWrPair2* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_pair2".}: uint32
+var nimFwDbgMachwKeyWrPair3* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_pair3".}: uint32
+var nimFwDbgMachwKeyWrPair4* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_pair4".}: uint32
+var nimFwDbgMachwKeyWrPair5* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_pair5".}: uint32
+var nimFwDbgMachwKeyWrPairCtrl* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_pair_ctrl".}: uint32
+var nimFwDbgMachwKeyWrRead0* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_read0".}: uint32
+var nimFwDbgMachwKeyWrRead1* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_read1".}: uint32
+var nimFwDbgMachwKeyWrRead2* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_read2".}: uint32
+var nimFwDbgMachwKeyWrRead3* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_read3".}: uint32
+var nimFwDbgMachwKeyWrReadCtrl* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_read_ctrl".}: uint32
+var nimFwDbgStaAddKeyCalls* {.wifiCtrl, exportc: "nimfw_dbg_sta_add_key_calls".}: uint32
+var nimFwDbgStaAddKeyMeta* {.wifiCtrl, exportc: "nimfw_dbg_sta_add_key_meta".}: uint32
+var nimFwDbgStaAddKeyPtrs0* {.wifiCtrl, exportc: "nimfw_dbg_sta_add_key_ptrs0".}: uint32
+var nimFwDbgStaAddKeyPtrs1* {.wifiCtrl, exportc: "nimfw_dbg_sta_add_key_ptrs1".}: uint32
+var nimFwDbgStaAddKeyPtrs2* {.wifiCtrl, exportc: "nimfw_dbg_sta_add_key_ptrs2".}: uint32
+var nimFwDbgTxSecHdrStaKey0* {.wifiCtrl, exportc: "nimfw_dbg_tx_sec_hdr_sta_key0".}: uint32
+var nimFwDbgTxSecHdrStaKey1* {.wifiCtrl, exportc: "nimfw_dbg_tx_sec_hdr_sta_key1".}: uint32
+var nimFwDbgTxSecHdrStaKey2* {.wifiCtrl, exportc: "nimfw_dbg_tx_sec_hdr_sta_key2".}: uint32
+var nimFwDbgRcUpdateCalls* {.wifiCtrl, exportc: "nimfw_dbg_rc_update_calls".}: uint32
+var nimFwDbgRcUpdateMeta* {.wifiCtrl, exportc: "nimfw_dbg_rc_update_meta".}: uint32
+var nimFwDbgRcUpdateArgs* {.wifiCtrl, exportc: "nimfw_dbg_rc_update_args".}: uint32
+var nimFwDbgRcUpdateSlot* {.wifiCtrl, exportc: "nimfw_dbg_rc_update_slot".}: uint32
+var nimFwDbgRcUpdateEntry* {.wifiCtrl, exportc: "nimfw_dbg_rc_update_entry".}: uint32
+var nimFwDbgRcUpdateCounts* {.wifiCtrl, exportc: "nimfw_dbg_rc_update_counts".}: uint32
+var nimFwDbgRcUpdateFail* {.wifiCtrl, exportc: "nimfw_dbg_rc_update_fail".}: uint32
 # Recycle / CFM path counters (iter 261 follow-up)
 var nimFwDbgCfmPush*        {.wifiCtrl, exportc: "nimfw_dbg_cfm_push".}: uint32
 var nimFwDbgCfmEvt*         {.wifiCtrl, exportc: "nimfw_dbg_cfm_evt".}: uint32
@@ -4576,6 +6875,7 @@ var nimFwDbgBleWifiTxCfmBcn* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_tx_cfm_bcn
 var nimFwDbgBleWifiTxCfmPti* {.wifiCtrl, exportc: "nimfw_dbg_ble_wifi_tx_cfm_pti".}: uint32
 var nimFwDbgStaTxRfRestore* {.wifiCtrl, exportc: "nimfw_dbg_sta_tx_rf_restore".}: uint32
 var nimFwDbgStaTxRfFullRestore* {.wifiCtrl, exportc: "nimfw_dbg_sta_tx_rf_full_restore".}: uint32
+var nimFwDbgStaTxRfLatch* {.wifiCtrl, exportc: "nimfw_dbg_sta_tx_rf_latch".}: uint32
 var nimFwKeepaliveInFlight* {.wifiCtrl, exportc: "nimfw_keepalive_inflight".}: uint32
 var nimFwKeepaliveTargetCfm* {.wifiCtrl, exportc: "nimfw_keepalive_target_cfm".}: uint32
 var nimFwKeepaliveStartedAt* {.wifiCtrl, exportc: "nimfw_keepalive_started_at".}: uint32
@@ -4594,6 +6894,15 @@ var nimFwKeepaliveQosNullEnabled* {.wifiCtrl, exportc: "nimfw_keepalive_qosnull_
 var nimFwDbgTxIntEnter* {.wifiCtrl, exportc: "nimfw_dbg_txint_enter".}: uint32
 var nimFwDbgTxIntLastCb* {.wifiCtrl, exportc: "nimfw_dbg_txint_last_cb".}: uint32
 var nimFwDbgTxIntLastFc* {.wifiCtrl, exportc: "nimfw_dbg_txint_last_fc".}: uint32
+var nimFwDbgTxIntReady* {.wifiCtrl, exportc: "nimfw_dbg_txint_ready".}: uint32
+var nimFwDbgTxIntPsOk* {.wifiCtrl, exportc: "nimfw_dbg_txint_psok".}: uint32
+var nimFwDbgTxIntPush* {.wifiCtrl, exportc: "nimfw_dbg_txint_push".}: uint32
+var nimFwDbgTxIntRelease* {.wifiCtrl, exportc: "nimfw_dbg_txint_release".}: uint32
+var nimFwDbgTxIntPostpone* {.wifiCtrl, exportc: "nimfw_dbg_txint_postpone".}: uint32
+var nimFwDbgTxIntLastMeta* {.wifiCtrl, exportc: "nimfw_dbg_txint_meta".}: uint32
+var nimFwDbgTxIntLastChan* {.wifiCtrl, exportc: "nimfw_dbg_txint_chan".}: uint32
+var nimFwDbgTxIntLastQueue* {.wifiCtrl, exportc: "nimfw_dbg_txint_queue".}: uint32
+var nimFwDbgTxIntLastHw* {.wifiCtrl, exportc: "nimfw_dbg_txint_hw".}: uint32
 var nimFwDbgStaTbttEnter*     {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_enter".}: uint32
 var nimFwDbgStaTbttAssoc*     {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_assoc".}: uint32
 var nimFwDbgStaTbttOnChan*    {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_onchan".}: uint32
@@ -4603,6 +6912,17 @@ var nimFwDbgSetVifState*      {.wifiCtrl, exportc: "nimfw_dbg_set_vif_state".}: 
 var nimFwDbgSetVifStateNew*   {.wifiCtrl, exportc: "nimfw_dbg_set_vif_state_new".}: uint32  # last newState
 var nimFwDbgSetVifStateAct*   {.wifiCtrl, exportc: "nimfw_dbg_set_vif_state_act".}: uint32  # activating=true count
 var nimFwDbgAssocDone*        {.wifiCtrl, exportc: "nimfw_dbg_assoc_done".}: uint32
+var nimFwDbgAuthOpenSuccess*  {.wifiCtrl, exportc: "nimfw_dbg_auth_open_success".}: uint32
+var nimFwDbgAssocReqSend*     {.wifiCtrl, exportc: "nimfw_dbg_assoc_req_send".}: uint32
+var nimFwDbgAssocReqMeta*     {.wifiCtrl, exportc: "nimfw_dbg_assoc_req_meta".}: uint32
+var nimFwDbgAssocCfmPush*     {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_push".}: uint32
+var nimFwDbgAssocCfmFrame*    {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_frame".}: uint32
+var nimFwDbgAssocCfmEvt*      {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_evt".}: uint32
+var nimFwDbgAssocCfmStatus*   {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_status".}: uint32
+var nimFwDbgAssocCfmHwStatus* {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_hw_status".}: uint32
+var nimFwDbgAssocCfmDesc*     {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_desc".}: uint32
+var nimFwDbgAssocCfmMeta*     {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_meta".}: uint32
+var nimFwDbgAssocCfmFc*       {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_fc".}: uint32
 var nimFwDbgAssocRspStatus*   {.wifiCtrl, exportc: "nimfw_dbg_assoc_rsp_status".}: uint32  # last assoc rsp statusCode
 var nimFwDbgAssocRspCount*    {.wifiCtrl, exportc: "nimfw_dbg_assoc_rsp_count".}: uint32
 var nimFwDbgAssocRspLen*      {.wifiCtrl, exportc: "nimfw_dbg_assoc_rsp_len".}: uint32
@@ -4655,6 +6975,73 @@ var nimFwDbgTxNoBuf*       {.wifiCtrl, exportc: "nimfw_dbg_tx_nobuf".}: uint32
 var nimFwDbgBlTxCfm*       {.wifiCtrl, exportc: "nimfw_dbg_bl_tx_cfm".}: uint32  # bl_tx_cfm calls
 var nimFwDbgBlTxCfmCb*     {.wifiCtrl, exportc: "nimfw_dbg_bl_tx_cfm_cb".}: uint32  # bl_tx_cfm cb != nil
 var nimFwDbgBlTxCfmEapol*  {.wifiCtrl, exportc: "nimfw_dbg_bl_tx_cfm_eapol".}: uint32  # cfm for EAPOL ethertype
+var nimFwDbgTxSecHdrCalls* {.wifiCtrl, exportc: "nimfw_dbg_tx_sec_hdr_calls".}: uint32
+var nimFwDbgTxSecHdrNoKeyMat* {.wifiCtrl, exportc: "nimfw_dbg_tx_sec_hdr_no_keymat".}: uint32
+var nimFwDbgTxSecHdrNoKeySlot* {.wifiCtrl, exportc: "nimfw_dbg_tx_sec_hdr_no_keyslot".}: uint32
+var nimFwDbgTxSecHdrCipher* {.wifiCtrl, exportc: "nimfw_dbg_tx_sec_hdr_cipher".}: uint32
+var nimFwDbgTxSecHdrLen* {.wifiCtrl, exportc: "nimfw_dbg_tx_sec_hdr_len".}: uint32
+var nimFwDbgTxSecHdrAppend* {.wifiCtrl, exportc: "nimfw_dbg_tx_sec_hdr_append".}: uint32
+var nimFwDbgTxSecHdrMissMeta* {.wifiCtrl, exportc: "nimfw_dbg_tx_sec_hdr_miss_meta".}: uint32
+var nimFwDbgTxSecHdrMissLen* {.wifiCtrl, exportc: "nimfw_dbg_tx_sec_hdr_miss_len".}: uint32
+var nimFwDbgTxSecHdrMissKeyMat* {.wifiCtrl, exportc: "nimfw_dbg_tx_sec_hdr_miss_keymat".}: uint32
+var nimFwDbgDhcpTxDescBytes* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_desc_bytes".}: uint32
+var nimFwDbgDhcpTxHdr0* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_hdr0".}: uint32
+var nimFwDbgDhcpTxHdr1* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_hdr1".}: uint32
+var nimFwDbgDhcpTxHdr2* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_hdr2".}: uint32
+var nimFwDbgDhcpTxSec* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_sec".}: uint32
+var nimFwDbgDhcpTxSecHdr0* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_sec_hdr0".}: uint32
+var nimFwDbgDhcpTxSecHdr1* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_sec_hdr1".}: uint32
+var nimFwDbgDhcpTxSecKey* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_sec_key".}: uint32
+var nimFwDbgDhcpTxSecCtl* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_sec_ctl".}: uint32
+var nimFwDbgDhcpTxPolicy* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_policy".}: uint32
+var nimFwDbgDhcpTxBufDesc* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_buf_desc".}: uint32
+var nimFwDbgDhcpTxHwDesc* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_hw_desc".}: uint32
+var nimFwDbgDhcpTxRate0* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_rate0".}: uint32
+var nimFwDbgDhcpTxRate1* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_rate1".}: uint32
+var nimFwDbgDhcpTxRate2* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_rate2".}: uint32
+var nimFwDbgDhcpTxRate3* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_rate3".}: uint32
+var nimFwDbgDhcpTxRateRaw* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_rate_raw".}: array[13, uint32]
+var nimFwDbgDhcpTxLink0* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_link0".}: uint32
+var nimFwDbgDhcpTxLink1* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_link1".}: uint32
+var nimFwDbgDhcpTxThd0* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_thd0".}: uint32
+var nimFwDbgDhcpTxThd1* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_thd1".}: uint32
+var nimFwDbgDhcpTxThd2* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_thd2".}: uint32
+var nimFwDbgDhcpTxLayout* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_layout".}: array[8, uint32]
+var nimFwDbgDhcpTxFinalBreakHits* {.wifiCtrl,
+  exportc: "nimfw_dbg_dhcp_tx_final_break_hits".}: uint32
+var nimFwDbgDhcpTxFinalDesc0* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_final_desc0".}: uint32
+var nimFwDbgDhcpTxFinalDesc1* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_final_desc1".}: uint32
+var nimFwDbgDhcpTxFinalBuf0* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_final_buf0".}: uint32
+var nimFwDbgDhcpTxFinalLen0* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_final_len0".}: uint32
+var nimFwDbgDhcpTxFinalHwStart* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_final_hw_start".}: uint32
+var nimFwDbgDhcpTxFinalHwEnd* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_final_hw_end".}: uint32
+var nimFwDbgDhcpTxFinalHwLen* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_final_hw_len".}: uint32
+var nimFwDbgDhcpTxFinalHwFlags* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_final_hw_flags".}: uint32
+var nimFwDbgDhcpTxFinalHthdStart* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_final_hthd_start".}: uint32
+var nimFwDbgDhcpTxFinalHthdEnd* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_final_hthd_end".}: uint32
+var nimFwDbgDhcpTxFinalHthdNext* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_final_hthd_next".}: uint32
+var nimFwDbgDhcpTxFinalHthdFlags* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_final_hthd_flags".}: uint32
+var nimFwDbgDhcpTxFinalPthdStart* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_final_pthd_start".}: uint32
+var nimFwDbgDhcpTxFinalPthdEnd* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_final_pthd_end".}: uint32
+var nimFwDbgDhcpTxFinalPthdNext* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_final_pthd_next".}: uint32
+var nimFwDbgDhcpTxFinalPthdFlags* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_tx_final_pthd_flags".}: uint32
+var nimFwDbgEapolTxDescBytes* {.wifiCtrl, exportc: "nimfw_dbg_eapol_tx_desc_bytes".}: uint32
+var nimFwDbgEapolTxHdr0* {.wifiCtrl, exportc: "nimfw_dbg_eapol_tx_hdr0".}: uint32
+var nimFwDbgEapolTxHdr1* {.wifiCtrl, exportc: "nimfw_dbg_eapol_tx_hdr1".}: uint32
+var nimFwDbgEapolTxHdr2* {.wifiCtrl, exportc: "nimfw_dbg_eapol_tx_hdr2".}: uint32
+var nimFwDbgEapolTxHdr3* {.wifiCtrl, exportc: "nimfw_dbg_eapol_tx_hdr3".}: uint32
+var nimFwDbgEapolTxAddrHi* {.wifiCtrl, exportc: "nimfw_dbg_eapol_tx_addr_hi".}: uint32
+var nimFwDbgEapolTxPolicy* {.wifiCtrl, exportc: "nimfw_dbg_eapol_tx_policy".}: uint32
+var nimFwDbgEapolTxBufDesc* {.wifiCtrl, exportc: "nimfw_dbg_eapol_tx_buf_desc".}: uint32
+var nimFwDbgEapolTxHwDesc* {.wifiCtrl, exportc: "nimfw_dbg_eapol_tx_hw_desc".}: uint32
+var nimFwDbgEapolTxRate0* {.wifiCtrl, exportc: "nimfw_dbg_eapol_tx_rate0".}: uint32
+var nimFwDbgEapolTxRate1* {.wifiCtrl, exportc: "nimfw_dbg_eapol_tx_rate1".}: uint32
+var nimFwDbgEapolTxRate2* {.wifiCtrl, exportc: "nimfw_dbg_eapol_tx_rate2".}: uint32
+var nimFwDbgEapolTxRate3* {.wifiCtrl, exportc: "nimfw_dbg_eapol_tx_rate3".}: uint32
+var nimFwDbgEapolTxLink0* {.wifiCtrl, exportc: "nimfw_dbg_eapol_tx_link0".}: uint32
+var nimFwDbgEapolTxLink1* {.wifiCtrl, exportc: "nimfw_dbg_eapol_tx_link1".}: uint32
+var nimFwDbgDhcpMacRawLen* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_mac_raw_len".}: uint32
+var nimFwDbgDhcpMacRaw* {.wifiCtrl, exportc: "nimfw_dbg_dhcp_mac_raw".}: array[96, uint8]
 var nimFwDbgWpaState*      {.wifiCtrl, exportc: "nimfw_dbg_wpa_state".}: uint32  # latest WPA_SM_STATE
 var nimFwDbgWpaTxState*    {.wifiCtrl, exportc: "nimfw_dbg_wpa_tx_state".}: uint32  # WPA state at TX time
 var nimFwDbgWpaRxState*    {.wifiCtrl, exportc: "nimfw_dbg_wpa_rx_state".}: uint32  # WPA state at RX time
@@ -4694,6 +7081,49 @@ var nimFwDbgMicVer*          {.wifiCtrl, exportc: "nimfw_dbg_mic_ver".}: uint32
 var nimFwDbgSaeBuildMsg*     {.wifiCtrl, exportc: "nimfw_dbg_sae_build".}: uint32
 var nimFwDbgSaeParseMsg*     {.wifiCtrl, exportc: "nimfw_dbg_sae_parse".}: uint32
 var nimFwDbgSaeAuthAlgo*     {.wifiCtrl, exportc: "nimfw_dbg_sae_auth_algo".}: uint32  # auth_algo read in sm_auth_send
+var nimFwDbgAuthMgtSeen*     {.wifiCtrl, exportc: "nimfw_dbg_auth_mgt_seen".}: uint32
+var nimFwDbgAuthMgtAccepted* {.wifiCtrl, exportc: "nimfw_dbg_auth_mgt_accept".}: uint32
+var nimFwDbgAuthMgtRejected* {.wifiCtrl, exportc: "nimfw_dbg_auth_mgt_reject".}: uint32
+var nimFwDbgAuthMgtMsgSent*  {.wifiCtrl, exportc: "nimfw_dbg_auth_mgt_msg".}: uint32
+var nimFwDbgAuthMgtLast0*    {.wifiCtrl, exportc: "nimfw_dbg_auth_mgt_last0".}: uint32
+var nimFwDbgAuthMgtLast1*    {.wifiCtrl, exportc: "nimfw_dbg_auth_mgt_last1".}: uint32
+var nimFwDbgMgtSeen*         {.wifiCtrl, exportc: "nimfw_dbg_mgt_seen".}: uint32
+var nimFwDbgMgtAccepted*     {.wifiCtrl, exportc: "nimfw_dbg_mgt_accept".}: uint32
+var nimFwDbgMgtRejected*     {.wifiCtrl, exportc: "nimfw_dbg_mgt_reject".}: uint32
+var nimFwDbgMgtMsgSent*      {.wifiCtrl, exportc: "nimfw_dbg_mgt_msg".}: uint32
+var nimFwDbgMgtLastFc*       {.wifiCtrl, exportc: "nimfw_dbg_mgt_last_fc".}: uint32
+var nimFwDbgMgtLast0*        {.wifiCtrl, exportc: "nimfw_dbg_mgt_last0".}: uint32
+var nimFwDbgMgtLast1*        {.wifiCtrl, exportc: "nimfw_dbg_mgt_last1".}: uint32
+var nimFwDbgMgtDropReason*   {.wifiCtrl, exportc: "nimfw_dbg_mgt_drop_reason".}: uint32
+var nimFwDbgAuthSmDispatch*  {.wifiCtrl, exportc: "nimfw_dbg_auth_sm_dispatch".}: uint32
+var nimFwDbgAuthSmState*     {.wifiCtrl, exportc: "nimfw_dbg_auth_sm_state".}: uint32
+var nimFwDbgAuthHandler*     {.wifiCtrl, exportc: "nimfw_dbg_auth_handler".}: uint32
+var nimFwDbgAuthHandlerLast* {.wifiCtrl, exportc: "nimfw_dbg_auth_handler_last".}: uint32
+var nimFwDbgAuthTxLen*       {.wifiCtrl, exportc: "nimfw_dbg_auth_tx_len".}: uint32
+var nimFwDbgAuthTxMeta*      {.wifiCtrl, exportc: "nimfw_dbg_auth_tx_meta".}: uint32
+var nimFwDbgAuthTxDesc*      {.wifiCtrl, exportc: "nimfw_dbg_auth_tx_desc".}: uint32
+var nimFwDbgAuthTxRaw*       {.wifiCtrl, exportc: "nimfw_dbg_auth_tx_raw".}: array[96, uint8]
+var nimFwDbgAuthRfPrePush*   {.wifiCtrl, exportc: "nimfw_dbg_auth_rf_pre_push".}: array[8, uint32]
+var nimFwDbgAuthHwPrePush*   {.wifiCtrl, exportc: "nimfw_dbg_auth_hw_pre_push".}: array[32, uint32]
+var nimFwDbgAuthCfmPush*     {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_push".}: uint32
+var nimFwDbgAuthCfmFrame*    {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_frame".}: uint32
+var nimFwDbgAuthCfmEvt*      {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_evt".}: uint32
+var nimFwDbgAuthCfmStatus*   {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_status".}: uint32
+var nimFwDbgAuthCfmHwStatus* {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_hw_status".}: uint32
+var nimFwDbgAuthCfmDesc*     {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_desc".}: uint32
+var nimFwDbgAuthCfmMeta*     {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_meta".}: uint32
+var nimFwDbgAuthCfmFc*       {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_fc".}: uint32
+var nimFwDbgScanFrameSeen*   {.wifiCtrl, exportc: "nimfw_dbg_scan_frame_seen".}: uint32
+var nimFwDbgScanFrameAccepted* {.wifiCtrl, exportc: "nimfw_dbg_scan_frame_accept".}: uint32
+var nimFwDbgScanFrameLast*   {.wifiCtrl, exportc: "nimfw_dbg_scan_frame_last".}: uint32
+var nimFwDbgScanSsidLast*    {.wifiCtrl, exportc: "nimfw_dbg_scan_ssid_last".}: uint32
+var nimFwDbgBssIn*           {.wifiCtrl, exportc: "nimfw_dbg_bss_in".}: uint32
+var nimFwDbgBssSsidResult*   {.wifiCtrl, exportc: "nimfw_dbg_bss_ssid_result".}: uint32
+var nimFwDbgBssDirected*     {.wifiCtrl, exportc: "nimfw_dbg_bss_directed".}: uint32
+var nimFwDbgBssOut*          {.wifiCtrl, exportc: "nimfw_dbg_bss_out".}: uint32
+var nimFwDbgSsidSearch*      {.wifiCtrl, exportc: "nimfw_dbg_ssid_search".}: uint32
+var nimFwDbgSsidEntries*     {.wifiCtrl, exportc: "nimfw_dbg_ssid_entries".}: uint32
+var nimFwDbgSsidHits*        {.wifiCtrl, exportc: "nimfw_dbg_ssid_hits".}: uint32
 var nimFwDbgScanKeyMgmt*     {.wifiCtrl, exportc: "nimfw_dbg_scan_key_mgmt".}: uint32  # lf (parsed key_mgmt LE 16-bit)
 var nimFwDbgScanAT*          {.wifiCtrl, exportc: "nimfw_dbg_scan_at".}: uint32  # computed aT
 var nimFwDbgScanSmF*         {.wifiCtrl, exportc: "nimfw_dbg_scan_smf".}: uint32  # smF flags
@@ -4711,6 +7141,12 @@ var nimFwDbgEapolCfmStatus*  {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_status".}
 var nimFwDbgEapolCfmCount*   {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_count".}: uint32
 var nimFwDbgEapolCfmAckOk*   {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_ack_ok".}: uint32
 var nimFwDbgEapolCfmAckFail* {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_ack_fail".}: uint32
+var nimFwDbgEapolCfmRingIdx* {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_ring_idx".}: uint32
+var nimFwDbgEapolCfmStatusLog* {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_status_log".}: array[4, uint32]
+var nimFwDbgEapolCfmMetaLog* {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_meta_log".}: array[4, uint32]
+var nimFwDbgEapolCfmKeyLog* {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_key_log".}: array[4, uint32]
+var nimFwDbgEapolCfmReplayLog* {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_replay_log".}: array[4, uint32]
+var nimFwDbgEapolCfmCbLog* {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_cb_log".}: array[4, uint32]
 # Disconnect-path counters.
 var nimFwDbgDisconnectReq*   {.wifiCtrl, exportc: "nimfw_dbg_disconnect_req".}: uint32
 var nimFwDbgDisconnectReqState* {.wifiCtrl, exportc: "nimfw_dbg_disconnect_req_state".}: uint32
@@ -4767,11 +7203,34 @@ when defined(bl808WifiConnectTrace):
         hwValidationLogByte(ord(hexChars[nibble.int]).uint8)
         started = true
 
+  proc nimFwConnectTraceHexByte(value: uint8) {.inline.} =
+    const hexChars = "0123456789ABCDEF"
+    hwValidationLogByte(ord(hexChars[(value shr 4).int and 0xF]).uint8)
+    hwValidationLogByte(ord(hexChars[(value and 0xF'u8).int]).uint8)
+
   proc nimFwConnectTrace2U32(prefix: cstring, a, b: uint32) {.inline.} =
     nimFwConnectTraceText(prefix)
     nimFwConnectTraceHex(a)
     hwValidationLogByte(ord(' ').uint8)
     nimFwConnectTraceHex(b)
+    hwValidationLogByte(ord('\r').uint8)
+    hwValidationLogByte(ord('\n').uint8)
+
+  proc nimFwConnectTraceBytes(prefix: cstring; data: pointer; length, limit: uint32) {.inline.} =
+    if data == nil: return
+    let bytes = cast[ptr UncheckedArray[uint8]](data)
+    var count = length
+    if count > limit:
+      count = limit
+    nimFwConnectTraceText(prefix)
+    nimFwConnectTraceHex(length)
+    hwValidationLogByte(ord(' ').uint8)
+    var i = 0'u32
+    while i < count:
+      if i != 0:
+        hwValidationLogByte(ord(' ').uint8)
+      nimFwConnectTraceHexByte(bytes[i])
+      inc i
     hwValidationLogByte(ord('\r').uint8)
     hwValidationLogByte(ord('\n').uint8)
 
@@ -4785,6 +7244,11 @@ else:
     discard prefix
     discard a
     discard b
+  proc nimFwConnectTraceBytes(prefix: cstring; data: pointer; length, limit: uint32) {.inline.} =
+    discard prefix
+    discard data
+    discard length
+    discard limit
   proc nimFwConnectTraceHw(prefix: cstring) {.inline.} =
     discard prefix
 
@@ -4796,7 +7260,12 @@ template nimFwMgmtFcTrace(fc: uint8): bool =
 proc ipc_emb_msg_push*(msgDescPtr: pointer) {.exportc, cdecl.}
 proc assert_rec*(cond: cstring, file: cstring, line: cint) {.exportc, cdecl.}
 proc blmac_soft_reset_getf*(): uint8 {.exportc, cdecl, noinline.}
-proc phy_get_mac_freq*(): uint32 {.importc, cdecl.}
+when defined(bl808WifiUseBl808Rf):
+  proc crm_get_mac_freq(): uint32 {.exportc, cdecl.}
+  proc phy_get_mac_freq*(): uint32 {.exportc, cdecl.} =
+    crm_get_mac_freq()
+else:
+  proc phy_get_mac_freq*(): uint32 {.importc, cdecl.}
 proc rxl_timeout_int_handler*() {.exportc, cdecl.}
 proc mm_sec_machwaddr_wr*(vifIdx: uint8, addr_ptr: pointer, idx: uint8): uint8 {.exportc, cdecl, discardable.}
 proc mm_sec_machwkey_wr*(param: pointer) {.exportc, cdecl.}
@@ -4809,6 +7278,11 @@ proc mm_bcn_update*(vifEntry: pointer): pointer {.exportc, cdecl, noinline.}
 proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.}
 proc rxu_cntrl_desc_prepare*(swdesc: pointer) {.exportc, cdecl, noinline.}
 proc rxu_mpdu_upload_and_indicate*(param: pointer) {.exportc, cdecl.}
+
+## rxu_cntrl_env: static context structure used by the RX upper control path.
+## Declared before RX lower reset so typed overlays can reference uploadList.
+var rxu_cntrl_env* {.exportc.}: array[96, uint8]
+
 proc txl_buffer_alloc*(param: pointer, queueIdx: uint32, flags: uint32): pointer {.exportc, cdecl.}
 proc txu_cntrl_frame_build*(desc: pointer, bufPtr: pointer) {.exportc, cdecl.}
 proc txl_cfm_flush_desc*(desc: pointer) {.exportc, cdecl.}
@@ -4840,6 +7314,283 @@ proc mm_sec_macrx_ind*(staIdx: uint8, payload: pointer, length: uint16) {.export
 proc chan_bcn_detect_start*(vifEntry: pointer) {.exportc, cdecl.}
 proc chan_ctxt_trigger*(ctxt: pointer) {.exportc, cdecl.}
 proc scanu_confirm*(status: uint8) {.exportc, cdecl.}
+
+proc nimFwDbgDhcpTxFinalBreakpoint*() {.exportc: "nimfw_dbg_dhcp_tx_final_breakpoint",
+    cdecl, noinline.} =
+  inc nimFwDbgDhcpTxFinalBreakHits
+
+proc nimFwDbgRxuDupDropBreakpoint*() {.exportc: "nimfw_dbg_rxu_dup_drop_breakpoint",
+    cdecl, noinline.} =
+  inc nimFwDbgRxuDupBreakHits
+
+proc nimFwDbgRxuIpv4Preupload(frame: ptr MacDataFrameHeaderView;
+                              machdrLen, tid: uint8;
+                              frameLen: uint16) {.noinline.} =
+  if frameLen.uint32 < machdrLen.uint32 + sizeof(LlcSnapHeaderView).uint32 + 20'u32:
+    return
+  let msduView = rxMsduView(frame, machdrLen)
+  let msdu = addr msduView.snap
+  if not rxSnapIsRfc1042(msdu) or msdu.ethertype != 0x0008'u16:
+    return
+  let msduLen = frameLen.uint32 - machdrLen.uint32
+  let ipPayload = cast[ptr UncheckedArray[uint8]](rxMsduPayload(msduView))
+  let version = ipPayload[0] shr 4
+  let ihl = (ipPayload[0].uint32 and 0x0F'u32) shl 2
+  if version != 4'u8 or ihl < 20'u32 or
+      msduLen < sizeof(LlcSnapHeaderView).uint32 + ihl:
+    return
+  let proto = ipPayload[9].uint32
+  nimFwDbgRxuAssocLastIpProto = proto or
+    (frameLen.uint32 shl 8) or (machdrLen.uint32 shl 24)
+  if proto == 17'u32:
+    inc nimFwDbgRxuAssocUdp
+  elif proto == 6'u32 and
+      msduLen >= sizeof(LlcSnapHeaderView).uint32 + ihl + 20'u32:
+    inc nimFwDbgRxuAssocTcp
+    let tcp = cast[ptr UncheckedArray[uint8]](
+      cast[pointer](cast[uint](ipPayload) + ihl.uint))
+    let srcPort = (tcp[0].uint32 shl 8) or tcp[1].uint32
+    let dstPort = (tcp[2].uint32 shl 8) or tcp[3].uint32
+    let flags = tcp[13].uint32
+    nimFwDbgRxuAssocLastTcpPorts = (srcPort shl 16) or dstPort
+    nimFwDbgRxuAssocLastTcpFlags = flags
+    if srcPort == 80'u32 or dstPort == 80'u32:
+      inc nimFwDbgRxuAssocTcp80
+      nimFwDbgRxuAssocTcpMeta = frameLen.uint32 or
+        (machdrLen.uint32 shl 16) or (tid.uint32 shl 24)
+      let copyLen =
+        if msduLen - sizeof(LlcSnapHeaderView).uint32 < 64'u32:
+          msduLen - sizeof(LlcSnapHeaderView).uint32
+        else:
+          64'u32
+      for i in 0 ..< 64:
+        nimFwDbgRxuAssocTcpRaw[i] = 0
+      for i in 0'u32 ..< copyLen:
+        nimFwDbgRxuAssocTcpRaw[i.int] = ipPayload[i]
+
+proc nimFwDbgRxuDhcpMsg(frame: ptr MacDataFrameHeaderView; machdrLen: uint8;
+                        frameLen: uint16): uint32 {.noinline.} =
+  if frameLen.uint32 < machdrLen.uint32 + sizeof(LlcSnapHeaderView).uint32:
+    return 0
+  let msduView = rxMsduView(frame, machdrLen)
+  let msdu = addr msduView.snap
+  let msduLen = frameLen.uint32 - machdrLen.uint32
+  let ipPayload = cast[ptr UncheckedArray[uint8]](rxMsduPayload(msduView))
+  if not rxSnapIsRfc1042(msdu) or msdu.ethertype != 0x0008'u16 or
+      msduLen < 28'u32:
+    return 0
+  let ihl = (ipPayload[0].uint32 and 0x0F'u32) shl 2
+  if ihl < 20'u32 or msduLen < sizeof(LlcSnapHeaderView).uint32 + ihl + 8'u32:
+    return 0
+  let udp = cast[pointer](cast[uint](ipPayload) + ihl.uint)
+  if debugLoadLe32(udp) != 0x44004300'u32:
+    return 0
+  if msduLen < sizeof(LlcSnapHeaderView).uint32 + ihl + 8'u32 + 240'u32:
+    return 0
+  let bootp = cast[pointer](cast[uint](udp) + 8'u)
+  var optOff = cast[uint](bootp) + 240'u
+  let optEnd = cast[uint](ipPayload) + msduLen.uint
+  var guard = 0
+  while optOff < optEnd and guard < 64:
+    inc guard
+    let code = cast[ptr uint8](optOff)[]
+    inc optOff
+    if code == 0'u8:
+      continue
+    if code == 255'u8 or optOff >= optEnd:
+      break
+    let optLen = cast[ptr uint8](optOff)[]
+    inc optOff
+    if optOff + optLen.uint > optEnd:
+      break
+    if code == 53'u8 and optLen >= 1'u8:
+      return cast[ptr uint8](optOff)[].uint32
+    optOff += optLen.uint
+  0
+
+proc nimFwDbgRecordRxuDupDrop(frame: ptr MacDataFrameHeaderView; hwFlags: uint32;
+                              envSeq: uint16; tid, machdrLen: uint8;
+                              cachedSeq: uint16; frameLen: uint16) {.noinline.} =
+  let idx = int(nimFwDbgRxuDupTraceCount mod RxuDupTraceEntries.uint32)
+  inc nimFwDbgRxuDupTraceCount
+  let msduView = rxMsduView(frame, machdrLen)
+  let msdu = addr msduView.snap
+  nimFwDbgRxuDupTraceFc[idx] = frame.frameControl.uint32 or
+    (hwFlags and 0xFFFF0000'u32)
+  nimFwDbgRxuDupTraceSeq[idx] = envSeq.uint32 or
+    (tid.uint32 shl 16) or (machdrLen.uint32 shl 24)
+  nimFwDbgRxuDupTraceCache[idx] = cachedSeq.uint32
+  nimFwDbgRxuDupTraceSnapLo[idx] = rxSnapTraceLo(msdu)
+  nimFwDbgRxuDupTraceSnapHi[idx] = rxSnapTraceHi(msdu)
+  nimFwDbgRxuDupTraceAddr0[idx] = debugLoadLe32(addr frame.addr1[0])
+  nimFwDbgRxuDupTraceAddr1[idx] = debugLoadLe32(addr frame.addr2[0])
+  nimFwDbgRxuDupTraceIp0[idx] = 0
+  nimFwDbgRxuDupTraceUdp0[idx] = 0
+  nimFwDbgRxuDupTraceBootp0[idx] = 0
+  nimFwDbgRxuDupTraceBootp1[idx] = 0
+  nimFwDbgRxuDupTraceBootpYiaddr[idx] = 0
+  nimFwDbgRxuDupTraceDhcpMsg[idx] = 0
+  nimFwDbgRxuDupTraceDhcpServer[idx] = 0
+  if frameLen.uint32 >= machdrLen.uint32 + sizeof(LlcSnapHeaderView).uint32:
+    let msduLen = frameLen.uint32 - machdrLen.uint32
+    let ipPayload = cast[ptr UncheckedArray[uint8]](rxMsduPayload(msduView))
+    if rxSnapIsRfc1042(msdu) and msdu.ethertype == 0x0008'u16 and msduLen >= 28'u32:
+      nimFwDbgRxuDupTraceIp0[idx] = debugLoadLe32(cast[pointer](ipPayload))
+      let ihl = (ipPayload[0].uint32 and 0x0F'u32) shl 2
+      if ihl >= 20'u32 and msduLen >= sizeof(LlcSnapHeaderView).uint32 + ihl + 8'u32:
+        let udp = cast[pointer](cast[uint](ipPayload) + ihl.uint)
+        nimFwDbgRxuDupTraceUdp0[idx] = debugLoadLe32(udp)
+        if msduLen >= sizeof(LlcSnapHeaderView).uint32 + ihl + 16'u32:
+          let bootp = cast[pointer](cast[uint](udp) + 8'u)
+          nimFwDbgRxuDupTraceBootp0[idx] = debugLoadLe32(bootp)
+          nimFwDbgRxuDupTraceBootp1[idx] =
+            debugLoadLe32(cast[pointer](cast[uint](udp) + 12'u))
+          if msduLen >= sizeof(LlcSnapHeaderView).uint32 + ihl + 32'u32:
+            nimFwDbgRxuDupTraceBootpYiaddr[idx] =
+              debugLoadLe32(cast[pointer](cast[uint](bootp) + 16'u))
+          if msduLen >= sizeof(LlcSnapHeaderView).uint32 + ihl + 8'u32 + 240'u32:
+            var optOff = cast[uint](bootp) + 240'u
+            let optEnd = cast[uint](ipPayload) + msduLen.uint
+            var guard = 0
+            while optOff < optEnd and guard < 64:
+              inc guard
+              let code = cast[ptr uint8](optOff)[]
+              inc optOff
+              if code == 0'u8:
+                continue
+              if code == 255'u8 or optOff >= optEnd:
+                break
+              let optLen = cast[ptr uint8](optOff)[]
+              inc optOff
+              if optOff + optLen.uint > optEnd:
+                break
+              if code == 53'u8 and optLen >= 1'u8:
+                nimFwDbgRxuDupTraceDhcpMsg[idx] =
+                  cast[ptr uint8](optOff)[].uint32
+              elif code == 54'u8 and optLen >= 4'u8:
+                nimFwDbgRxuDupTraceDhcpServer[idx] =
+                  debugLoadLe32(cast[pointer](optOff))
+              optOff += optLen.uint
+  nimFwDbgRxuDupDropBreakpoint()
+
+proc nimFwDbgRecordRxuPnDrop(frame: ptr MacDataFrameHeaderView; hwFlags: uint32;
+                             envSeq: uint16; tid, machdrLen: uint8;
+                             frameLen: uint16) {.noinline.} =
+  let idx = int(nimFwDbgRxuPnDropTraceCount mod RxuPnDropTraceEntries.uint32)
+  inc nimFwDbgRxuPnDropTraceCount
+  let env = rxuCntrlEnvView()
+  let msduView = rxMsduView(frame, machdrLen)
+  let msdu = addr msduView.snap
+  nimFwDbgRxuPnDropTraceFc[idx] = frame.frameControl.uint32 or
+    (hwFlags and 0xFFFF0000'u32)
+  nimFwDbgRxuPnDropTraceSeq[idx] = envSeq.uint32 or
+    (tid.uint32 shl 16) or (machdrLen.uint32 shl 24)
+  nimFwDbgRxuPnDropTracePnLo[idx] = env.secInfo0
+  nimFwDbgRxuPnDropTracePnHi[idx] = env.secInfo1
+  nimFwDbgRxuPnDropTraceStoredLo[idx] = nimFwDbgRxuPnStoredLo
+  nimFwDbgRxuPnDropTraceStoredHi[idx] = nimFwDbgRxuPnStoredHi
+  nimFwDbgRxuPnDropTraceSnapLo[idx] = rxSnapTraceLo(msdu)
+  nimFwDbgRxuPnDropTraceSnapHi[idx] = rxSnapTraceHi(msdu)
+  nimFwDbgRxuPnDropTraceUdp0[idx] = 0
+  nimFwDbgRxuPnDropTraceBootpYiaddr[idx] = 0
+  nimFwDbgRxuPnDropTraceDhcpMsg[idx] = 0
+  nimFwDbgRxuPnDropTraceDhcpServer[idx] = 0
+  if frameLen.uint32 >= machdrLen.uint32 + sizeof(LlcSnapHeaderView).uint32:
+    let msduLen = frameLen.uint32 - machdrLen.uint32
+    let ipPayload = cast[ptr UncheckedArray[uint8]](rxMsduPayload(msduView))
+    if rxSnapIsRfc1042(msdu) and msdu.ethertype == 0x0008'u16 and msduLen >= 28'u32:
+      let ihl = (ipPayload[0].uint32 and 0x0F'u32) shl 2
+      if ihl >= 20'u32 and msduLen >= sizeof(LlcSnapHeaderView).uint32 + ihl + 8'u32:
+        let udp = cast[pointer](cast[uint](ipPayload) + ihl.uint)
+        nimFwDbgRxuPnDropTraceUdp0[idx] = debugLoadLe32(udp)
+        if msduLen >= sizeof(LlcSnapHeaderView).uint32 + ihl + 32'u32:
+          let bootp = cast[pointer](cast[uint](udp) + 8'u)
+          nimFwDbgRxuPnDropTraceBootpYiaddr[idx] =
+            debugLoadLe32(cast[pointer](cast[uint](bootp) + 16'u))
+          if msduLen >= sizeof(LlcSnapHeaderView).uint32 + ihl + 8'u32 + 240'u32:
+            var optOff = cast[uint](bootp) + 240'u
+            let optEnd = cast[uint](ipPayload) + msduLen.uint
+            var guard = 0
+            while optOff < optEnd and guard < 64:
+              inc guard
+              let code = cast[ptr uint8](optOff)[]
+              inc optOff
+              if code == 0'u8:
+                continue
+              if code == 255'u8 or optOff >= optEnd:
+                break
+              let optLen = cast[ptr uint8](optOff)[]
+              inc optOff
+              if optOff + optLen.uint > optEnd:
+                break
+              if code == 53'u8 and optLen >= 1'u8:
+                nimFwDbgRxuPnDropTraceDhcpMsg[idx] =
+                  cast[ptr uint8](optOff)[].uint32
+              elif code == 54'u8 and optLen >= 4'u8:
+                nimFwDbgRxuPnDropTraceDhcpServer[idx] =
+                  debugLoadLe32(cast[pointer](optOff))
+              optOff += optLen.uint
+
+proc nimFwDbgRecordRxuPnAccept(stage: uint32; frame: ptr MacDataFrameHeaderView;
+                               hwFlags: uint32; envSeq: uint16;
+                               tid, machdrLen: uint8; frameLen: uint16) {.noinline.} =
+  let idx = int(nimFwDbgRxuPnAcceptTraceCount mod RxuPnAcceptTraceEntries.uint32)
+  inc nimFwDbgRxuPnAcceptTraceCount
+  let env = rxuCntrlEnvView()
+  let msduView = rxMsduView(frame, machdrLen)
+  let msdu = addr msduView.snap
+  nimFwDbgRxuPnAcceptTraceStage[idx] = stage
+  nimFwDbgRxuPnAcceptTraceFc[idx] = frame.frameControl.uint32 or
+    (hwFlags and 0xFFFF0000'u32)
+  nimFwDbgRxuPnAcceptTraceSeq[idx] = envSeq.uint32 or
+    (tid.uint32 shl 16) or (machdrLen.uint32 shl 24)
+  nimFwDbgRxuPnAcceptTracePnLo[idx] = env.secInfo0
+  nimFwDbgRxuPnAcceptTracePnHi[idx] = env.secInfo1
+  nimFwDbgRxuPnAcceptTraceStoredLo[idx] = nimFwDbgRxuPnStoredLo
+  nimFwDbgRxuPnAcceptTraceStoredHi[idx] = nimFwDbgRxuPnStoredHi
+  nimFwDbgRxuPnAcceptTraceNextLo[idx] = nimFwDbgRxuPnNextLo
+  nimFwDbgRxuPnAcceptTraceNextHi[idx] = nimFwDbgRxuPnNextHi
+  nimFwDbgRxuPnAcceptTraceSnapLo[idx] = rxSnapTraceLo(msdu)
+  nimFwDbgRxuPnAcceptTraceSnapHi[idx] = rxSnapTraceHi(msdu)
+  nimFwDbgRxuPnAcceptTraceUdp0[idx] = 0
+  nimFwDbgRxuPnAcceptTraceBootpYiaddr[idx] = 0
+  nimFwDbgRxuPnAcceptTraceDhcpMsg[idx] = 0
+  nimFwDbgRxuPnAcceptTraceDhcpServer[idx] = 0
+  if frameLen.uint32 >= machdrLen.uint32 + sizeof(LlcSnapHeaderView).uint32:
+    let msduLen = frameLen.uint32 - machdrLen.uint32
+    let ipPayload = cast[ptr UncheckedArray[uint8]](rxMsduPayload(msduView))
+    if rxSnapIsRfc1042(msdu) and msdu.ethertype == 0x0008'u16 and msduLen >= 28'u32:
+      let ihl = (ipPayload[0].uint32 and 0x0F'u32) shl 2
+      if ihl >= 20'u32 and msduLen >= sizeof(LlcSnapHeaderView).uint32 + ihl + 8'u32:
+        let udp = cast[pointer](cast[uint](ipPayload) + ihl.uint)
+        nimFwDbgRxuPnAcceptTraceUdp0[idx] = debugLoadLe32(udp)
+        if msduLen >= sizeof(LlcSnapHeaderView).uint32 + ihl + 32'u32:
+          let bootp = cast[pointer](cast[uint](udp) + 8'u)
+          nimFwDbgRxuPnAcceptTraceBootpYiaddr[idx] =
+            debugLoadLe32(cast[pointer](cast[uint](bootp) + 16'u))
+          if msduLen >= sizeof(LlcSnapHeaderView).uint32 + ihl + 8'u32 + 240'u32:
+            var optOff = cast[uint](bootp) + 240'u
+            let optEnd = cast[uint](ipPayload) + msduLen.uint
+            var guard = 0
+            while optOff < optEnd and guard < 64:
+              inc guard
+              let code = cast[ptr uint8](optOff)[]
+              inc optOff
+              if code == 0'u8:
+                continue
+              if code == 255'u8 or optOff >= optEnd:
+                break
+              let optLen = cast[ptr uint8](optOff)[]
+              inc optOff
+              if optOff + optLen.uint > optEnd:
+                break
+              if code == 53'u8 and optLen >= 1'u8:
+                nimFwDbgRxuPnAcceptTraceDhcpMsg[idx] =
+                  cast[ptr uint8](optOff)[].uint32
+              elif code == 54'u8 and optLen >= 4'u8:
+                nimFwDbgRxuPnAcceptTraceDhcpServer[idx] =
+                  debugLoadLe32(cast[pointer](optOff))
+              optOff += optLen.uint
 proc sm_assoc_req_send_pre*(param: pointer) {.exportc, cdecl.}
 proc sm_send_next_bss_param*(param: pointer) {.exportc, cdecl.}
 proc me_build_capability*(param: pointer): uint16 {.exportc, cdecl.}
@@ -4899,8 +7650,12 @@ proc chan_get_next_chan*(): pointer {.exportc, cdecl.}
 proc chan_conn_less_delay_prog*() {.exportc, cdecl.}
 proc mm_force_idle_req*() {.exportc, cdecl.}
 proc mm_back_to_host_idle*() {.exportc, cdecl.}
-proc phy_mdm_isr*() {.importc, cdecl.}
-proc phy_rc_isr*() {.importc, cdecl.}
+when defined(bl808WifiUseBl808Rf):
+  proc phy_mdm_isr*() {.exportc, cdecl.}
+  proc phy_rc_isr*() {.exportc, cdecl.}
+else:
+  proc phy_mdm_isr*() {.importc, cdecl.}
+  proc phy_rc_isr*() {.importc, cdecl.}
 proc intc_spurious*() {.exportc, cdecl.}
 
 # Forward declarations for security/station management helpers called before definition
@@ -4912,7 +7667,9 @@ proc sta_mgmt_del_key*(staIdx: uint8, keyIdx: uint8) {.exportc, cdecl.}
 proc apm_send_mlme*(vifEntry: pointer, frameType: uint16, destAddr: pointer, callback: pointer, callbackArg: pointer, extraParam: pointer) {.exportc, cdecl.}
 proc apm_sta_add*(param: pointer): uint8 {.exportc, cdecl.}
 proc apm_sta_fw_delete*(staIdx: uint8, vifIdx: uint8, reason: uint16) {.exportc, cdecl.}
-proc bl_wifi_set_sta_key_internal*(vifIdx: uint8, macAddr: pointer, pairwise: uint8, keyIdx: uint8, keyLen: uint8, keyData: pointer, cipher: uint8, seqData: pointer, seqLen: uint8) {.exportc, cdecl.}
+proc bl_wifi_set_sta_key_internal*(vifIdx: uint8, staIdx: uint8, alg: uint32,
+    keyIdx: int32, setTx: int32, seqData: pointer, seqLen: csize_t,
+    keyData: pointer, keyLen: csize_t, pairwise: bool): cint {.exportc, cdecl.}
 # Forward declarations for station/beacon management helpers
 proc sta_mgmt_entry_init*(staEntry: pointer) {.exportc, cdecl.}
 proc sta_mgmt_postponed_desc_release*(staEntry: pointer, flag: uint32): uint32 {.exportc, cdecl.}
@@ -4938,7 +7695,12 @@ proc chan_pre_switch_channel*(ctxt: pointer) {.exportc, cdecl.}
 proc ps_check_tbtt*(vifEntry: pointer) {.exportc, cdecl.}
 proc mm_bcn_transmit*(vifIdx: uint8) {.exportc, cdecl.}
 proc chan_is_on_operational_channel*(vifEntry: pointer): bool {.exportc, cdecl, noinline.}
-proc phy_get_channel_raw*(info: pointer, index: uint8) {.importc: "phy_get_channel", cdecl.}
+when defined(bl808WifiUseBl808Rf):
+  proc phy_get_channel_raw*(info: pointer, index: uint8)
+      {.exportc: "phy_get_channel", cdecl.}
+else:
+  proc phy_get_channel_raw*(info: pointer, index: uint8)
+      {.importc: "phy_get_channel", cdecl.}
 proc mm_rx_filter_set*() {.exportc, cdecl.}
 proc apm_tx_int_ps_check*(txDesc: pointer): bool {.exportc, cdecl.}
 proc apm_tx_int_ps_get_postpone*(vifEntry: pointer, staEntry: pointer, postponeFlag: ptr uint32): pointer {.exportc, cdecl.}
@@ -5004,6 +7766,7 @@ proc bl_rx_e2a_handler*(msgPtr: pointer) {.importc, cdecl.}
 # Platform PM functions (external, called by bl_sleep_schedule)
 proc wifi_hosal_pm_state_run*(): uint32 {.importc, cdecl.}
 proc arch_delay_us*(us: uint32) {.importc, cdecl.}
+proc nim_wifi_rf_latch_service_enable*(enable: uint32) {.importc, cdecl.}
 proc wifi_hosal_pm_post_event*(typ: uint32, sev: uint32, resultPtr: pointer) {.importc, cdecl.}
 proc utils_list_pop_front*(list: ptr CoList): ptr CoListHdr {.importc, cdecl.}
   ## External list pop (host-provided), used by ipc_emb_tx_evt instead of co_list_pop_front.
@@ -5012,11 +7775,36 @@ proc utils_list_push_back*(list: ptr CoList, elem: ptr CoListHdr) {.importc, cde
 # External IPC host function (called by bl_irq_handler to disable E2A IRQs)
 proc ipc_host_disable_irq_e2a*() {.importc, cdecl.}
 # External TRPC power control functions (called by bl_tpc_* wrappers)
-proc trpc_power_get*(powerTable: pointer) {.importc, cdecl.}
-proc trpc_update_power*(powerTable: pointer) {.importc, cdecl.}
-proc trpc_update_power_11b*(powerTable: pointer) {.importc, cdecl.}
-proc trpc_update_power_11g*(powerTable: pointer) {.importc, cdecl.}
-proc trpc_update_power_11n*(powerTable: pointer) {.importc, cdecl.}
+when defined(bl808WifiUseBl808Rf):
+  proc trpc_power_get*(powerTable: pointer) {.exportc, cdecl.}
+  proc trpc_update_power*(powerTable: pointer) {.exportc, cdecl.}
+  proc trpc_update_power_11b*(powerTable: pointer) {.exportc, cdecl.}
+  proc trpc_update_power_11g*(powerTable: pointer) {.exportc, cdecl.}
+  proc trpc_update_power_11n*(powerTable: pointer) {.exportc, cdecl.}
+else:
+  proc trpc_power_get*(powerTable: pointer) {.importc, cdecl.}
+  proc trpc_update_power*(powerTable: pointer) {.importc, cdecl.}
+  proc trpc_update_power_11b*(powerTable: pointer) {.importc, cdecl.}
+  proc trpc_update_power_11g*(powerTable: pointer) {.importc, cdecl.}
+  proc trpc_update_power_11n*(powerTable: pointer) {.importc, cdecl.}
+when defined(bl808WifiUseBl808Rf):
+  proc phy_get_ntx*(): uint8 {.exportc, cdecl.}
+  proc phy_get_nss*(): uint8 {.exportc, cdecl.}
+  proc phy_ldpc_tx_supported*(): bool {.exportc, cdecl.}
+  proc phy_get_rf_gain_idx*(txPowerElem: pointer, rateParam: pointer)
+      {.exportc, cdecl.}
+  proc rf_pri_input_xtalfreq(xtalfreqHz: uint32) {.exportc, cdecl.}
+  proc rf_pri_init(coldInit, mode: uint32) {.exportc, cdecl.}
+  proc rf_pri_config_mode(mode: uint32) {.exportc, cdecl.}
+  proc rf_pri_input_device_info(deviceInfo: uint32) {.exportc, cdecl.}
+  proc rf_pri_update_param(channelMhz: uint32) {.exportc, cdecl.}
+  proc rf_pri_optimize(channelMhz: uint32) {.exportc, cdecl.}
+  proc rf_pri_set_channel_pwr_comp(channelIndex: uint32) {.exportc, cdecl.}
+  proc rf_pri_set_bandwidth(bandwidthMhz: uint32) {.exportc, cdecl.}
+  proc rf_pri_get_vco_freq_cw(channelMhz: uint32): uint32 {.exportc, cdecl.}
+  proc rf_pri_get_vco_idac_cw(channelMhz: uint32): uint32 {.exportc, cdecl.}
+  proc rfc_config_bandwidth*(bandwidth: uint32) {.exportc, cdecl.}
+  proc rfc_config_channel*(channelMhz: uint32) {.exportc, cdecl.}
 proc td_timer_evt*(env: pointer) {.exportc, cdecl.}
 proc ps_uapsd_timer_handle*() {.exportc, cdecl.}
 proc ps_tx_null_timer_handle*() {.exportc, cdecl.}
@@ -5028,14 +7816,14 @@ proc ps_enable_cfm*(vifEntry: pointer, status: uint32) {.exportc, cdecl.}
   ## PS enable confirmation. Forward declaration — impl at PS section.
 proc ps_enable_cfm_handle*(vifEntry: pointer) {.exportc, cdecl, noinline.}
 proc ps_disable_cfm_handle*(vifEntry: pointer): uint32 {.exportc, cdecl.}
-proc sta_mgmt_add_key*(staIdx: uint8, param: pointer) {.exportc, cdecl.}
-proc vif_mgmt_add_key*(vifIdx: uint8, param: pointer) {.exportc, cdecl.}
+proc sta_mgmt_add_key*(param: pointer, hwKeyIdx: uint8) {.exportc, cdecl.}
+proc vif_mgmt_add_key*(param: pointer, hwKeyIdx: uint8) {.exportc, cdecl.}
 proc replay_counter_validate*(param: pointer): bool {.exportc, cdecl.}
 proc mm_tim_update_proceed*(param: pointer) {.exportc, cdecl, noinline.}
 proc sm_disconnect*(param: pointer) {.exportc, cdecl.}
 proc sm_issue_sa_query_request*() {.exportc, cdecl.}
 proc coex_pta_force_autocontrol_set*(mode: uint32) {.exportc, cdecl.}
-proc sm_delete_resources*() {.exportc, cdecl.}
+proc sm_delete_resources*(param: pointer = nil) {.exportc, cdecl.}
 proc sm_auth_assoc_send_according_chan*(nextState: uint16 = 0, param1: uint16 = 0, param2: uint32 = 0) {.exportc, cdecl.}
 proc apm_sta_delete*(param: pointer) {.exportc, cdecl.}
 proc apm_tx_cfm_handler*(param: pointer) {.exportc, cdecl.}
@@ -5043,17 +7831,4960 @@ proc cfm_raw_send*(param: pointer) {.exportc, cdecl.}
 proc sm_supplicant_deauth_cfm*(param: pointer) {.exportc, cdecl.}
 proc ps_check_frame*(rxHdr: pointer, frameFlags: uint32, vifEntry: pointer) {.exportc, cdecl.}
 proc ps_send_pspoll*(vifEntry: pointer): uint8 {.exportc, cdecl, noinline.}
-proc phy_set_channel*(band: uint8, chanType: uint8, primFreq: uint16,
-    centerFreq1: uint16, centerFreq2: uint16, txPower: uint8) {.importc, cdecl.}
+when defined(bl808WifiUseBl808Rf):
+  proc phy_set_channel*(channel: ptr ChanCtxtDefView, force: uint32)
+      {.exportc, cdecl.}
+    ## BL808 RF blob ABI: a0 points at the packed channel descriptor and a1 must
+    ## be zero to apply it. Non-zero a1 returns without changing the PHY channel.
+else:
+  proc phy_set_channel_scalar*(band, chanType, primFreq, centerFreq1: uint32)
+      {.importc: "phy_set_channel", cdecl.}
+    ## BL606P PHY/RF archive ABI: channel fields are passed as scalar register
+    ## arguments instead of a pointer to the packed descriptor overlay.
+
+proc phySetChannel*(channel: ptr ChanCtxtDefView) {.inline.} =
+  when defined(bl808WifiUseBl808Rf):
+    phy_set_channel(channel, 0'u32)
+  else:
+    phy_set_channel_scalar(
+      channel.band.uint32,
+      channel.chanType.uint32,
+      channel.primFreq.uint32,
+      channel.centerFreq1.uint32)
+
+proc phySetChannel*(band: uint8, chanType: uint8, primFreq: uint16,
+                    centerFreq1: uint16, centerFreq2: uint16,
+                    txPower: uint8) {.inline.} =
+  var channel = ChanCtxtDefView(
+    band: band,
+    chanType: chanType,
+    primFreq: primFreq,
+    centerFreq1: centerFreq1,
+    centerFreq2: centerFreq2,
+    txPower: txPower,
+    reserved: 0'u8)
+  phySetChannel(addr channel)
+
+proc packChannelMeta(channel: ptr ChanCtxtDefView): uint32 {.inline.} =
+  channel.band.uint32 or
+    (channel.chanType.uint32 shl 8) or
+    (channel.txPower.uint8.uint32 shl 16)
+
+proc packChannelFreq(channel: ptr ChanCtxtDefView): uint32 {.inline.} =
+  channel.primFreq.uint32 or (channel.centerFreq1.uint32 shl 16)
+
+proc snapshotPhyChannel(dst: var array[4, uint32]) {.inline.} =
+  phy_get_channel_raw(cast[pointer](addr dst[0]), 0)
 # External RF/PHY functions called from wifi_main (platform-provided)
-proc phy_init*(cfg: pointer) {.importc, cdecl.}
-proc phy_get_version*(versionOut: pointer, buf: pointer) {.importc, cdecl.}
+when defined(bl808WifiUseBl808Rf):
+  proc phy_init*(cfg: pointer) {.exportc, cdecl.}
+  proc phy_get_version*(versionOut: pointer, buf: pointer) {.exportc, cdecl.}
+else:
+  proc phy_init*(cfg: pointer) {.importc, cdecl.}
   ## External PHY version query (host-provided): writes 4-byte version string
   ## at versionOut, reads scratch buf. Called by mm_version_req_handler.
+  proc phy_get_version*(versionOut: pointer, buf: pointer) {.importc, cdecl.}
 proc wifi_hosal_rf_turn_on*() {.importc, cdecl.}
-proc rf_init*(xtalfreqHz: uint32) {.importc, cdecl.}
-proc rfc_init*(xtalfreqHz: uint32, fullInit: uint32) {.importc, cdecl.}
-proc mpif_clk_init*() {.importc, cdecl.}
+when defined(bl808WifiUseBl808Rf):
+  type
+    RadioPhyMode* = enum
+      wifiOnly = 1'u8
+      bleOnly = 2'u8
+      wifiBleCoex = 3'u8
+
+    RfRegBlock {.packed.} = object
+      baseCtrl0: uint32
+      baseCtrl1: uint32
+      reserved008: array[9, uint32]
+      modeCtrl: uint32
+      reserved030: array[20, uint32]
+      synthCtrl: uint32
+
+    WifiModemBlock {.packed.} = object
+      versionWord: uint32
+      reserved004: array[6, uint32]
+      dfeCtrl7: uint32
+      reserved020: uint32
+      dfeCtrl9: uint32
+      dfeCtrl10: uint32
+      reserved02c: array[4, uint32]
+      versionScratch3c: uint32
+      reserved040: array[223, uint32]
+      dfeCtrl3bc: uint32
+      reserved3c0: array[21, uint32]
+      dfeCtrl414: uint32
+      reserved418: array[250, uint32]
+      phyCtrl800: uint32
+      reserved804: array[4, uint32]
+      phyCtrl814: uint32
+      reserved818: array[2, uint32]
+      phyCtrl820: uint32
+      phyCtrl824: uint32
+      reserved828: array[2, uint32]
+      phyCtrl830: uint32
+      phyCtrl834: uint32
+      reserved838: uint32
+      phyCtrl83c: uint32
+      phyCtrl840: uint32
+      reserved844: array[2, uint32]
+      phyCtrl84c: uint32
+      reserved850: array[4, uint32]
+      phyCtrl860: uint32
+      reserved864: array[4, uint32]
+      phyCtrl874: uint32
+      reserved878: array[4, uint32]
+      phyChannelPulse888: uint32
+      reserved88c: array[7, uint32]
+      groupMembership0: uint32
+      groupMembership1: uint32
+      userPosition: array[4, uint32]
+      aid: uint32
+      aidMaskLo: uint32
+      aidMaskHi: uint32
+      reserved8cc: array[25, uint32]
+      phyCtrl930: uint32
+      reserved934: array[195, uint32]
+      phyCtrlC40: uint32
+      phyCtrlC44: uint32
+      reservedC48: array[10741, uint32]
+      intStatusB41c: uint32
+      intAckB420: uint32
+      reservedB424: array[765, uint32]
+      rxTailC018: uint32
+      reservedC01c: array[10, uint32]
+      rxGainTimingC044: uint32
+      reservedC048: array[14, uint32]
+      rxGainTable0C080: uint32
+      rxGainTable1C084: uint32
+      rxGainTable2C088: uint32
+
+    PhyAgcBlock {.packed.} = object
+      reserved000: array[34, uint32]
+      agcCtrl88: uint32
+      agcCtrl8c: uint32
+
+    BbaAgcBlock {.packed.} = object
+      reserved000: array[208, uint32]
+      macActiveB340: uint32
+      macActiveB344: uint32
+      reserved348: array[8, uint32]
+      macActiveB368: uint32
+      pdComp36c: uint32
+      reserved370: array[5, uint32]
+      macActiveB384: uint32
+      reserved388: uint32
+      macActiveB38c: uint32
+      pdGain390: uint32
+      reserved394: array[3, uint32]
+      macActiveB3a0: uint32
+      reserved3a4: array[2, uint32]
+      pdTiming3ac: uint32
+      reserved3b0: array[3, uint32]
+      macActiveB3bc: uint32
+      pdSlope3c0: uint32
+      macActiveB3c4: uint32
+      reserved3c8: array[789, uint32]
+      macActiveC01c: uint32
+      macActiveC020: uint32
+      reservedC024: array[2, uint32]
+      macActiveC02c: uint32
+      reservedC030: array[512, uint32]
+      pdCompC830: uint32
+
+    RadioRegMaskInit = object
+      address: uint32
+      keepMask: uint32
+      setMask: uint32
+
+    RfcXtalConfig = object
+      xtalHz: uint32
+      word04: uint32
+      word08: uint32
+      word0c: uint32
+      word10: uint32
+
+    WlRfConfig {.packed.} = object
+      status: uint32
+      apiMode: uint8
+      enParamLoad: uint8
+      enFullCal: uint8
+      reserved07: uint8
+      xtalfreqHz: uint32
+      xtalCap: uint16
+      reserved0E: array[2, uint8]
+      priWord10: uint32
+      priWord14: uint32
+      priWord18: uint32
+      priZeroWords: array[5, uint32]
+      priHalf30: uint16
+      reserved32: array[106, uint8]
+      priByte9C: uint8
+      reserved9D: array[4, uint8]
+      priZeroA1: array[14, uint8]
+      priZeroA2: array[14, uint8]
+      priByteBD: uint8
+      priHalfBE: uint16
+      priWordC0: uint32
+      priWordC4: uint32
+      paramLoad: pointer
+      capcodeSet: pointer
+      capcodeGet: pointer
+
+    WlRfMemoryOverlay {.packed.} = object
+      config: WlRfConfig
+      calib: array[320, uint8]
+      env: array[12, uint8]
+
+  static:
+    doAssert sizeof(RfRegBlock) >= 0x84
+    doAssert offsetof(RfRegBlock, modeCtrl) == 0x2C
+    doAssert offsetof(RfRegBlock, synthCtrl) == 0x80
+    doAssert offsetof(WifiModemBlock, versionWord) == 0x0
+    doAssert offsetof(WifiModemBlock, dfeCtrl7) == 0x1C
+    doAssert offsetof(WifiModemBlock, dfeCtrl9) == 0x24
+    doAssert offsetof(WifiModemBlock, dfeCtrl10) == 0x28
+    doAssert offsetof(WifiModemBlock, versionScratch3c) == 0x3C
+    doAssert offsetof(WifiModemBlock, dfeCtrl3bc) == 0x3BC
+    doAssert offsetof(WifiModemBlock, dfeCtrl414) == 0x414
+    doAssert offsetof(WifiModemBlock, phyCtrl800) == 0x800
+    doAssert offsetof(WifiModemBlock, phyCtrl814) == 0x814
+    doAssert offsetof(WifiModemBlock, phyCtrl820) == 0x820
+    doAssert offsetof(WifiModemBlock, phyCtrl824) == 0x824
+    doAssert offsetof(WifiModemBlock, phyCtrl830) == 0x830
+    doAssert offsetof(WifiModemBlock, phyCtrl834) == 0x834
+    doAssert offsetof(WifiModemBlock, phyCtrl83c) == 0x83C
+    doAssert offsetof(WifiModemBlock, phyCtrl840) == 0x840
+    doAssert offsetof(WifiModemBlock, phyCtrl84c) == 0x84C
+    doAssert offsetof(WifiModemBlock, phyCtrl860) == 0x860
+    doAssert offsetof(WifiModemBlock, phyCtrl874) == 0x874
+    doAssert offsetof(WifiModemBlock, phyChannelPulse888) == 0x888
+    doAssert offsetof(WifiModemBlock, groupMembership0) == 0x8A8
+    doAssert offsetof(WifiModemBlock, groupMembership1) == 0x8AC
+    doAssert offsetof(WifiModemBlock, userPosition) == 0x8B0
+    doAssert offsetof(WifiModemBlock, aid) == 0x8C0
+    doAssert offsetof(WifiModemBlock, aidMaskLo) == 0x8C4
+    doAssert offsetof(WifiModemBlock, aidMaskHi) == 0x8C8
+    doAssert offsetof(WifiModemBlock, phyCtrl930) == 0x930
+    doAssert offsetof(WifiModemBlock, phyCtrlC40) == 0xC40
+    doAssert offsetof(WifiModemBlock, phyCtrlC44) == 0xC44
+    doAssert offsetof(WifiModemBlock, intStatusB41c) == 0xB41C
+    doAssert offsetof(WifiModemBlock, intAckB420) == 0xB420
+    doAssert offsetof(WifiModemBlock, rxTailC018) == 0xC018
+    doAssert offsetof(WifiModemBlock, rxGainTimingC044) == 0xC044
+    doAssert offsetof(WifiModemBlock, rxGainTable0C080) == 0xC080
+    doAssert offsetof(WifiModemBlock, rxGainTable1C084) == 0xC084
+    doAssert offsetof(WifiModemBlock, rxGainTable2C088) == 0xC088
+    doAssert offsetof(PhyAgcBlock, agcCtrl88) == 0x88
+    doAssert offsetof(PhyAgcBlock, agcCtrl8c) == 0x8C
+    doAssert offsetof(BbaAgcBlock, macActiveB340) == 0x340
+    doAssert offsetof(BbaAgcBlock, macActiveB344) == 0x344
+    doAssert offsetof(BbaAgcBlock, macActiveB368) == 0x368
+    doAssert offsetof(BbaAgcBlock, pdComp36c) == 0x36C
+    doAssert offsetof(BbaAgcBlock, macActiveB384) == 0x384
+    doAssert offsetof(BbaAgcBlock, macActiveB38c) == 0x38C
+    doAssert offsetof(BbaAgcBlock, pdGain390) == 0x390
+    doAssert offsetof(BbaAgcBlock, macActiveB3a0) == 0x3A0
+    doAssert offsetof(BbaAgcBlock, pdTiming3ac) == 0x3AC
+    doAssert offsetof(BbaAgcBlock, macActiveB3bc) == 0x3BC
+    doAssert offsetof(BbaAgcBlock, pdSlope3c0) == 0x3C0
+    doAssert offsetof(BbaAgcBlock, macActiveB3c4) == 0x3C4
+    doAssert offsetof(BbaAgcBlock, macActiveC01c) == 0x101C
+    doAssert offsetof(BbaAgcBlock, macActiveC020) == 0x1020
+    doAssert offsetof(BbaAgcBlock, macActiveC02c) == 0x102C
+    doAssert offsetof(BbaAgcBlock, pdCompC830) == 0x1830
+    doAssert sizeof(WlRfConfig) == 212
+    doAssert offsetof(WlRfConfig, apiMode) == 4
+    doAssert offsetof(WlRfConfig, xtalfreqHz) == 8
+    doAssert offsetof(WlRfConfig, xtalCap) == 12
+    doAssert offsetof(WlRfConfig, priWord10) == 16
+    doAssert offsetof(WlRfConfig, priByte9C) == 156
+    doAssert offsetof(WlRfConfig, priZeroA1) == 161
+    doAssert offsetof(WlRfConfig, priZeroA2) == 175
+    doAssert offsetof(WlRfConfig, priByteBD) == 189
+    doAssert offsetof(WlRfConfig, priHalfBE) == 190
+    doAssert offsetof(WlRfConfig, priWordC0) == 192
+    doAssert offsetof(WlRfConfig, priWordC4) == 196
+    doAssert offsetof(WlRfConfig, paramLoad) == 200
+    doAssert offsetof(WlRfConfig, capcodeSet) == 204
+    doAssert offsetof(WlRfConfig, capcodeGet) == 208
+    doAssert sizeof(WlRfMemoryOverlay) == 544
+    doAssert offsetof(WlRfMemoryOverlay, config) == 0
+    doAssert offsetof(WlRfMemoryOverlay, calib) == 212
+    doAssert offsetof(WlRfMemoryOverlay, env) == 532
+    doAssert sizeof(RfcXtalConfig) == 20
+
+  const
+    WlRfConfigMagic = 0x0000ACDE'u32
+    WlRfCfgRxcalA8Offset = 0xA8
+    WlRfCfgRxcalAcOffset = 0xAC
+    WlRfCfgWb03RxcalA8Default = 0x00001825'u32
+    WlRfCfgWb03RxcalAcDefault = 0x000003F7'u32
+    WlRfCfgPower11bOffset = 0x32
+    WlRfCfgPower11gOffset = 0x36
+    WlRfCfgPower11n20Offset = 0x3E
+    WlRfCfgPower11nAltOffset = 0x46
+    WlRfCfgPower11ac20Offset = 0x6C
+    WlRfCfgPower11acAltOffset = 0x78
+    WlRfCfgDefaultRatePower = 0x1C'u8
+    RfPriWb03Rf70ColdSeed = 0x25181222'u32
+    RfPriWb03Rf70ScanSeed = 0x24181222'u32
+    RfPriWb03MacActiveRf70Seed = 0x23171222'u32
+    RfPriWb03MacActiveRf7cSeed = 0x24222422'u32
+    RfPriWb03RccalRf80Seed = 0x1B1B1B1B'u32
+    RfPriWb03RccalRf84Seed = 0x02324020'u32
+    RfPriWb03ScanRf88Seed = 0x00011005'u32
+    RfPriWb03ScanRf8cSeed = 0x12202112'u32
+    RfPriWb03ScanRfb4Seed = 0x0002A222'u32
+    RfPriWb03RfcEntryRfb4Seed = 0x0102A222'u32
+    RfPriWb03ScanRfbcSeed = 0x10911100'u32
+    RfPriWb03ScanRf80ListenSeed = 0x1C1C1C1C'u32
+    RfPriWb03ScanRf80ActiveSeed = 0x1B1B1B1B'u32
+    RfPriWb03MacActiveRf80Seed = 0x1A1A1A1A'u32
+    RfPriWb03ScanRf40Seed = 0x01F00B00'u32
+    RfPriWb03ScanRf4cSeed = 0x00763237'u32
+    RfPriWb03RfcEntryRfa0Seed = 0x0D0CA296'u32
+    RfPriWb03MacActiveRfa0Seed = 0x0C0C9F96'u32
+    RfPriWb03ScanRf1600Seed = 0x00BF27F7'u32
+    RfPriWb03ScanRf1600ListenSeed = 0x00BF37F6'u32
+    RfPriWb03ScanRf1600ActiveSeed = 0x00BEC7F6'u32
+    RfPriWb03ScanRf1600BaselineSeed = 0x00BE87F4'u32
+    RfPriWb03RfcEntryRf1600Seed = 0x00BEF7F7'u32
+    RfPriWb03MacActiveRf1600Seed = 0x00BF27F3'u32
+    RfPriWb03ScanRf1608Seed = 0x10000000'u32
+    RfPriWb03ScanRf1618Seed = 0x80000000'u32
+    RfPriWb03ScanRf162cSeed = 0x000F0002'u32
+    AgcMemoryBase = 0x24C0A000'u
+    Bl808RfDeviceInfoBl616 = 0'u32
+    Bl808RfDeviceInfoWb03 = 1'u32
+    Bl808RfDeviceInfoBl618m = 2'u32
+    Bl808WifiRfDeviceInfo {.intdefine.}: int = 1
+    ## WB03/40M needs the scan/MAC-active RF latch replay before auth/assoc TX.
+    ## Hardware evidence: without this pulse, m0_wifi_nimfw_hal_test times out
+    ## at connect with RF88 falling back to 0x00010005; with it, connect passes.
+    bl808WifiRfWb03ForceAuthTxLatches* {.booldefine.}: bool = true
+    bl808WifiRfWb03AuthTxSettleUs* {.intdefine.}: int = 0
+    bl808WifiRfWb03AuthTxPulseLatch* {.booldefine.}: bool = true
+    WlXtal24M = 24_000_000'u32
+    WlXtal26M = 26_000_000'u32
+    WlXtal32M = 32_000_000'u32
+    WlXtal38P4M = 38_400_000'u32
+    WlXtal40M = 40_000_000'u32
+    WlXtal52M = 52_000_000'u32
+    RfBase = 0x20001000'u
+    PhyBase = 0x20002800'u
+    AgcBase = 0x20002C00'u
+    WifiModemBase = 0x24C00000'u
+    RfPriInitPllReg = 0x20000830'u32
+    RfPriInitPllResetReg = 0x20000810'u32
+    RfPriInitPll18Reg = 0x20000818'u32
+    RfPriInitPll1cReg = 0x2000081C'u32
+    RfPriInitPll28Reg = 0x20000828'u32
+    RfPriInitPll2cReg = 0x2000082C'u32
+    RfPriInitHbnReg = 0x2000F030'u32
+    RfPriInitDfeReg = 0x2000F820'u32
+    RfPriInitDfeReg824 = 0x2000F824'u32
+    RfRxModeReg = 0x20001220'u32
+    RfPriModeCtrlReg = 0x20001030'u32
+    RfPriInitF884Reg = 0x2000F884'u32
+    RfPriInitF814Reg = 0x2000F814'u32
+    RfPriInit884Reg = 0x20000884'u32
+    RfPriInit814Reg = 0x20000814'u32
+    RfPriInit163cReg = 0x2000163C'u32
+    RfPriInit64Reg = 0x20001064'u32
+    RfPriInit6cReg = 0x2000106C'u32
+    RfPriInit70Reg = 0x20001070'u32
+    RfPriInit128Reg = 0x20001128'u32
+    RfPriInit12cReg = 0x2000112C'u32
+    RfPriInit130Reg = 0x20001130'u32
+    RfPriInitD4Reg = 0x200010D4'u32
+    RfPriInit90Reg = 0x20001090'u32
+    RfTxcalCtrlReg = 0x200010B8'u32
+    RfPriInit138Reg = 0x20001138'u32
+    RfPriInit8cReg = 0x2000108C'u32
+    RfPriInit1618Reg = 0x20001618'u32
+    RfCtrlReg = 0x20001004'u32
+    RfPriTrace34Reg = 0x20001034'u32
+    RfPriTrace40Reg = 0x20001040'u32
+    RfPriTrace4cReg = 0x2000104C'u32
+    RfCalModeReg = 0x20001014'u32
+    RfCalCtrlReg = 0x2000101C'u32
+    RfCapabilityReg = 0x20001020'u32
+    RfFcalCtrlReg = 0x200010A0'u32
+    RfAcalCtrlReg = 0x200010A4'u32
+    RfCalResultReg = 0x200010A8'u32
+    RfFcalReg = 0x200010AC'u32
+    RfPriConfigB0Reg = 0x200010B0'u32
+    RfPriConfigB4Reg = 0x200010B4'u32
+    RfPriConfigBcReg = 0x200010BC'u32
+    RfMeasureCtrlReg = 0x20001618'u32
+    RfMeasureModeReg = 0x2000161C'u32
+    RfMeasureIReg = 0x20001620'u32
+    RfMeasureQReg = 0x20001624'u32
+    RfRoscalCtrlReg = 0x2000107C'u32
+    RfPriInit78Reg = 0x20001078'u32
+    RfRbbRccalReg = 0x20001080'u32
+    RfPriTrace84Reg = 0x20001084'u32
+    RfRoscalReg0 = 0x20001168'u32
+    RfRoscalReg1 = 0x2000116C'u32
+    RfTxcalParamReg = 0x20001070'u32
+    RfTxcalParam01Reg = 0x20001074'u32
+    RfTxcalTosdacReg = 0x20001600'u32
+    RfPriRxcalSearchReg = 0x20001614'u32
+    RfPriTrace162cReg = 0x2000162C'u32
+    RfPriTrace1680Reg = 0x20001680'u32
+    RfPriTrace113cReg = 0x2000113C'u32
+    RfPriRxcalReg0 = 0x20001170'u32
+    RfPriRxcalReg1 = 0x20001174'u32
+    RfPriRxcalReg2 = 0x20001178'u32
+    RfPriRxcalReg3 = 0x2000117C'u32
+    RfPriInit110cReg = 0x2000110C'u32
+    RfPriRccalSingenReg0 = 0x2000120C'u32
+    RfPriRccalSingenReg1 = 0x20001214'u32
+    RfPriRccalSingenReg2 = 0x20001218'u32
+    RfPriRccalMeasurePrepReg = 0x2000160C'u32
+    RfPriRccalToneReg = 0x20001048'u32
+    RfPriInit58Reg = 0x20001058'u32
+    RfPriInit68Reg = 0x20001068'u32
+    RfPriTxcalDfeReg = 0x20001088'u32
+    RfPriTxcalDcReg = 0x2000106C'u32
+    RfSdm1Reg = 0x200010C0'u32
+    RfSdm2Reg = 0x200010C4'u32
+    RfSynthCtrlReg = 0x2000102C'u32
+    RfPriInit1504Reg = 0x20001504'u32
+    RfOptimizeReg = 0x200010D0'u32
+    RfOptimizeMidBandMask = 0x00000001'u32
+    RfOptimizeMidBandFirstMhz = 2452'u32
+    RfOptimizeMidBandLastMhz = 2472'u32
+    RfOptimizeTxcalFirstMhz = 2462'u32
+    RfOptimizeTxcalLastMhz = 2484'u32
+    RfOptimizeWb03PllEdge0Mhz = 2452'u32
+    RfOptimizeWb03PllEdge1Mhz = 2472'u32
+    RfCtrlTuneEnableMask = 0x00000002'u32
+    RfMeasureTriggerClearMask = 0x20100000'u32
+    RfMeasureModeKeepMask = 0x0000FFFF'u32
+    RfMeasureRoscalMode = 0x04000000'u32
+    RfMeasureFrequencyShift = 9
+    RfMeasureStartMask = 0x20000000'u32
+    RfMeasureReadyMask = 0x10000000'u32
+    RfMeasureRccalTriggerMask = 0x20100000'u32
+    RfFcalStartMask = 0x00000010'u32
+    RfFcalReadyMask = 0x00100000'u32
+    RfFcalCodeMask = 0x000000FF'u32
+    RfAcalCodeMask = 0x003F0000'u32
+    RfAcalComparatorMask = 0x00001000'u32
+    RfRoscalCapabilityMask = 0x00000100'u32
+    RfRoscalModeMask = 0x0000C000'u32
+    RfRoscalStartMode = 0x00004000'u32
+    RfRoscalDoneMode = 0x0000C000'u32
+    RfRoscalCodeMask = 0x0000003F'u32
+    RfRoscalIRegMask = 0x00003F00'u32
+    RfRoscalQRegMask = 0x0000003F'u32
+    RfRoscalRegisterKeepMask = 0xC0C0C0C0'u32
+    RfRccalCapabilityMask = 0x00000400'u32
+    RfRccalModeMask = 0x000C0000'u32
+    RfRccalStartMode = 0x00040000'u32
+    RfRccalDoneMode = 0x000C0000'u32
+    RfRccalFailMode = 0x00080000'u32
+    RfRccalCodeMask = 0x0000003F'u32
+    RfRccalRegisterKeepMask = 0xC0C0C0C0'u32
+    RfRccalBaselineCode = 0x20'u32
+    RfRccalTargetNumerator = 81'u64
+    RfRccalTargetDenominator = 100'u64
+    RfRccalFallbackTargetNumerator = 5'u64
+    RfRccalFallbackTargetDenominator = 3'u64
+    RfRccalMinReferencePower = 64'u32
+    RfRccalReferenceMeasureCtrl = 0x00001000'u32
+    RfRccalToneMeasureCtrl = 0x0002D400'u32
+    RfTxcalModeMask = 0x00F00000'u32
+    RfTxcalStartMode = 0x00500000'u32
+    RfTxcalDoneMode = 0x00F00000'u32
+    RfRxcalModeMask = 0x03000000'u32
+    RfRxcalStartMode = 0x01000000'u32
+    RfRxcalDoneMode = 0x03000000'u32
+    RfRxcalSearchLowMask = 0x000003FF'u32
+    RfRxcalSearchHighMask = 0x007FF000'u32
+    RfRxcalSearchHighEnable = 0x00800000'u32
+    RfRxcalMeasureClearMask = 0x20100000'u32
+    RfRxcalMeasureSetupMask = 0x000F0000'u32
+    RfTxcalParam0Mask = 0x3F000000'u32
+    RfTxcalParam1Mask = 0x003F0000'u32
+    RfTxcalParam2Mask = 0x007FF000'u32
+    RfTxcalParam2EnableBit = 0x00800000'u32
+    RfTxcalParam3Mask = 0x000003FF'u32
+    RfTxcalParam3SignBit = 0x00000400'u32
+    RfPriWb03RxcalTosdacReplayMask =
+      RfTxcalParam2Mask or RfTxcalParam2EnableBit or
+      RfTxcalParam3Mask or RfTxcalParam3SignBit
+    RfPriWb03RxcalTosdacSeed = 0x00BEC7F7'u32
+    RfTxcalSingenAmplitudeMask = 0x000007FF'u32
+    RfTxcalMixerCsMask = 0x00000007'u32
+    RfTxcalAverageMeasureMode = 0x04000000'u32
+    RfTxcalInitialAmp = 128'u32
+    RfTxcalInitialAdcMax = 128'i32
+    RfTxcalInitialAdcMin = 64'i32
+    RfTxcalGainAmp = 192'u32
+    RfTxcalGainAdcMax = 256'i32
+    RfTxcalGainAdcMin = 128'i32
+    RfTxcalSearchFreqIq = 0x3D'u32
+    RfTxcalSearchFreqOsdac = 0x7A'u32
+    RfBzTxcalSearchFreqIq = 0x49'u32
+    RfBzTxcalSearchFreqOsdac = 0x92'u32
+    RfTxcalMixerCsCount = 8
+    RfTxcalSampleTraceEntries = 48
+    RfLoChannelCount = 21
+    RfFcalWaitLimit = 5000
+    RfRoscalWaitLimit = 10000
+    RfRccalWaitLimit = 10000
+    RfTxcalWaitLimit = 10000
+    RfRxcalWaitLimit = 10000
+    RfConfigChannelWaitLimit = 5000
+    RfLoFcalLowCount = 0xA6A0'u16
+    RfLoFcalHighCount = 0xA6E0'u16
+    RfLoFcalStopCount = 0xACE0'u16
+    RfLoFcalDiv = 0x0855'u16
+    RfPriTxcalRecordBaseWord = 26
+
+    RfPriDefaultVcoCal40M: array[21, uint16] = [
+      ## Fallback for zeroed wl_cal VCO halfwords, recovered from passing
+      ## BL808 40 MHz RF logs (`lo_vco_freq_cw`, `vco_idac_cw`). Vendor
+      ## full-cal data overwrites this range when available.
+      0xA20D'u16, 0xA10D'u16, 0x9F0C'u16, 0x9E0C'u16, 0x9D0C'u16,
+      0x9B0C'u16, 0x9A0C'u16, 0x990C'u16, 0x970C'u16, 0x960C'u16,
+      0x950C'u16, 0x930C'u16, 0x920C'u16, 0x910C'u16, 0x8F0B'u16,
+      0x8E0B'u16, 0x8D0B'u16, 0x8C0C'u16, 0x8A0C'u16, 0x890C'u16,
+      0x880C'u16
+    ]
+    RfPriTxcalSearchRecords = 18
+    RfPriBzTxcalSearchRecords = 9
+    RfPriTxcalReplayRecordIds: array[13, int] = [
+      0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14
+    ]
+
+    RfChannelDivTable40M: array[RfLoChannelCount, uint32] = [
+      0x14088889'u32, 0x14111111'u32, 0x1419999A'u32, 0x14222222'u32,
+      0x142AAAAB'u32, 0x14333333'u32, 0x143BBBBC'u32, 0x14444444'u32,
+      0x144CCCCD'u32, 0x14555555'u32, 0x145DDDDE'u32, 0x14666666'u32,
+      0x146EEEEF'u32, 0x14777777'u32, 0x14800000'u32, 0x14888889'u32,
+      0x14911111'u32, 0x1499999A'u32, 0x14A22222'u32, 0x14AAAAAB'u32,
+      0x14B33333'u32
+    ]
+
+    RfChannelCntTable40M: array[RfLoChannelCount, uint16] = [
+      0xA6EB'u16, 0xA732'u16, 0xA779'u16, 0xA7C0'u16, 0xA808'u16,
+      0xA84F'u16, 0xA896'u16, 0xA8DD'u16, 0xA924'u16, 0xA96B'u16,
+      0xA9B2'u16, 0xA9F9'u16, 0xAA40'u16, 0xAA87'u16, 0xAACF'u16,
+      0xAB16'u16, 0xAB5D'u16, 0xABA4'u16, 0xABEB'u16, 0xAC32'u16,
+      0xAC79'u16
+    ]
+    PhyRxGainTable: array[9, int8] = [
+      0x08'i8, 0x0F'i8, 0x16'i8, 0x1D'i8, 0x23'i8,
+      0x2A'i8, 0x30'i8, 0x36'i8, 0x3C'i8
+    ]
+
+    RfcXtalConfigTable: array[6, RfcXtalConfig] = [
+      ## librf_bl808.a:rfc.c.o .rodata.rfc_xtal_cfg, indexed by xtalIndex().
+      RfcXtalConfig(xtalHz: WlXtal24M,
+                    word04: 0x00038E39'u32, word08: 0x000471C7'u32,
+                    word0c: 0x22000000'u32, word10: 0x00000990'u32),
+      RfcXtalConfig(xtalHz: WlXtal26M,
+                    word04: 0x00034835'u32, word08: 0x00041A42'u32,
+                    word0c: 0x1F627627'u32, word10: 0x00000990'u32),
+      RfcXtalConfig(xtalHz: WlXtal32M,
+                    word04: 0x0002AAAB'u32, word08: 0x00035555'u32,
+                    word0c: 0x19800000'u32, word10: 0x00000990'u32),
+      RfcXtalConfig(xtalHz: WlXtal38P4M,
+                    word04: 0x000238E4'u32, word08: 0x0002C71C'u32,
+                    word0c: 0x15400000'u32, word10: 0x00000990'u32),
+      RfcXtalConfig(xtalHz: WlXtal40M,
+                    word04: 0x00022222'u32, word08: 0x0002AAAB'u32,
+                    word0c: 0x14400000'u32, word10: 0x0000097E'u32),
+      RfcXtalConfig(xtalHz: WlXtal52M,
+                    word04: 0x0001A41A'u32, word08: 0x00020D21'u32,
+                    word0c: 0x0FB13B14'u32, word10: 0x00000990'u32)
+    ]
+
+    RfcModemLateInit: array[36, RadioRegMaskInit] = [
+      ## Ordered port of librf_bl808.a:rfc.c.o modem_init_core+0x1a2..0x3b6;
+      ## the final 0x20001504/0x20001514 strobes remain explicit.
+      RadioRegMaskInit(address: 0x20001004'u32,
+                       keepMask: 0xFFFFF7FF'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: 0x2000126C'u32,
+                       keepMask: 0xFFFFFFF7'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: 0x20001268'u32,
+                       keepMask: 0xFFFF0000'u32, setMask: 0x00001040'u32),
+      RadioRegMaskInit(address: 0x20001004'u32,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000002'u32),
+      RadioRegMaskInit(address: RfSynthCtrlReg,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000004'u32),
+      RadioRegMaskInit(address: RfPriInit163cReg,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000080'u32),
+      RadioRegMaskInit(address: RfPriInit163cReg,
+                       keepMask: 0xFFFF7FFF'u32, setMask: 0x00008000'u32),
+      RadioRegMaskInit(address: RfPriInit163cReg,
+                       keepMask: 0xFFFFFF80'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: RfPriInit163cReg,
+                       keepMask: 0xFFFF80FF'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: RfSynthCtrlReg,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000002'u32),
+      RadioRegMaskInit(address: RfSynthCtrlReg,
+                       keepMask: 0xFFFFBFFF'u32, setMask: 0x00004000'u32),
+      RadioRegMaskInit(address: RfSynthCtrlReg,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000020'u32),
+      RadioRegMaskInit(address: 0x20001400'u32,
+                       keepMask: 0xFF7FFFFF'u32, setMask: 0x00800000'u32),
+      RadioRegMaskInit(address: 0x20001400'u32,
+                       keepMask: 0xFFFF7FFF'u32, setMask: 0x00008000'u32),
+      RadioRegMaskInit(address: 0x20001400'u32,
+                       keepMask: 0xFFFFBFFF'u32, setMask: 0x00004000'u32),
+      RadioRegMaskInit(address: 0x20001400'u32,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000200'u32),
+      RadioRegMaskInit(address: 0x20001400'u32,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000100'u32),
+      RadioRegMaskInit(address: 0x20000540'u32,
+                       keepMask: 0xFFFFFCFF'u32, setMask: 0x00000C00'u32),
+      RadioRegMaskInit(address: 0x20000544'u32,
+                       keepMask: 0xFFFFFFFB'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: 0x20001220'u32,
+                       keepMask: 0xF7FFFFFF'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: 0x20001004'u32,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000002'u32),
+      RadioRegMaskInit(address: RfSynthCtrlReg,
+                       keepMask: 0xFFFFFFDF'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: 0x20001094'u32,
+                       keepMask: 0xFFFEFFFF'u32, setMask: 0x00010000'u32),
+      RadioRegMaskInit(address: 0x20001080'u32,
+                       keepMask: 0xBFFFFFFF'u32, setMask: 0x40000000'u32),
+      RadioRegMaskInit(address: 0x20001260'u32,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: 0x20001260'u32,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: 0x200028A8'u32,
+                       keepMask: 0x00000000'u32, setMask: 0x000000C8'u32),
+      RadioRegMaskInit(address: 0x200012C4'u32,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000002'u32),
+      RadioRegMaskInit(address: 0x200012C4'u32,
+                       keepMask: 0xFFFFFFFE'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: 0x24C0C01C'u32,
+                       keepMask: 0xFFFFFC00'u32, setMask: 0x00000050'u32),
+      RadioRegMaskInit(address: 0x24C0C020'u32,
+                       keepMask: 0xFFFFFC00'u32, setMask: 0x00000050'u32),
+      RadioRegMaskInit(address: 0x2000126C'u32,
+                       keepMask: 0xFFF003FF'u32, setMask: 0x00028000'u32),
+      RadioRegMaskInit(address: 0x20001268'u32,
+                       keepMask: 0xC00FFFFF'u32, setMask: 0x05000000'u32),
+      RadioRegMaskInit(address: 0x24C0C01C'u32,
+                       keepMask: 0xFC00FFFF'u32, setMask: 0x00010000'u32),
+      RadioRegMaskInit(address: 0x24C0C020'u32,
+                       keepMask: 0xFC00FFFF'u32, setMask: 0x00010000'u32),
+      RadioRegMaskInit(address: 0x24C0C02C'u32,
+                       keepMask: 0xFFFFFF00'u32, setMask: 0x00000001'u32)
+    ]
+
+    RfPriFixedValPrefixInit: array[14, RadioRegMaskInit] = [
+      RadioRegMaskInit(address: 0x2000121C'u32,
+                       keepMask: 0xEFFFEFFF'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: 0x20001094'u32,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x30010000'u32),
+      RadioRegMaskInit(address: RfRxModeReg,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000600'u32),
+      RadioRegMaskInit(address: 0x20001608'u32,
+                       keepMask: 0xDFFFFFFF'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: RfPriInit163cReg,
+                       keepMask: 0x00000000'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: RfPriInit90Reg,
+                       keepMask: 0xFFFFFFF8'u32, setMask: 0x00000004'u32),
+      RadioRegMaskInit(address: RfPriInit1618Reg,
+                       keepMask: 0x3FFFFFFF'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: RfPriInit1504Reg,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00100000'u32),
+      RadioRegMaskInit(address: RfPriInitF884Reg,
+                       keepMask: 0xCFFF1FFF'u32, setMask: 0x20008000'u32),
+      RadioRegMaskInit(address: RfPriInitF814Reg,
+                       keepMask: 0xFFFFF0FF'u32, setMask: 0x00000300'u32),
+      RadioRegMaskInit(address: RfPriInit884Reg,
+                       keepMask: 0xFFFF7FFF'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: RfRxModeReg,
+                       keepMask: 0xFFFFFFEF'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: RfPriInit78Reg,
+                       keepMask: 0xCFFFFFFF'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: RfPriInit814Reg,
+                       keepMask: 0xFCCFFFFF'u32, setMask: 0x00100000'u32)
+    ]
+
+    RfPriFixedValSuffixInit: array[28, RadioRegMaskInit] = [
+      RadioRegMaskInit(address: RfPriInitHbnReg,
+                       keepMask: 0xF0FFFFFF'u32, setMask: 0x08000000'u32),
+      RadioRegMaskInit(address: RfPriModeCtrlReg,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00001003'u32),
+      RadioRegMaskInit(address: RfPriInitF884Reg,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000004'u32),
+      RadioRegMaskInit(address: RfPriConfigB0Reg,
+                       keepMask: 0xFFFFFF3F'u32, setMask: 0x00000040'u32),
+      RadioRegMaskInit(address: 0x200010CC'u32,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00200000'u32),
+      RadioRegMaskInit(address: RfAcalCtrlReg,
+                       keepMask: 0xFFFFFFF8'u32, setMask: 0x00000005'u32),
+      RadioRegMaskInit(address: RfAcalCtrlReg,
+                       keepMask: 0xFFFFF0FF'u32, setMask: 0x00000A00'u32),
+      RadioRegMaskInit(address: RfTxcalCtrlReg,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000010'u32),
+      RadioRegMaskInit(address: RfPriInit138Reg,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000003'u32),
+      RadioRegMaskInit(address: RfPriConfigB0Reg,
+                       keepMask: 0xFFFFFFFE'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: RfPriConfigB4Reg,
+                       keepMask: 0xFFFCC7FF'u32, setMask: 0x0000C000'u32),
+      RadioRegMaskInit(address: RfCalCtrlReg,
+                       keepMask: 0xFFFFFF7F'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: RfCtrlReg,
+                       keepMask: 0xFFFFFFF3'u32, setMask: 0x00000004'u32),
+      RadioRegMaskInit(address: RfPriInit110cReg,
+                       keepMask: 0xFFFFFF00'u32, setMask: 0x00000066'u32),
+      RadioRegMaskInit(address: RfRoscalCtrlReg,
+                       keepMask: 0xFFFFFF8F'u32, setMask: 0x00000030'u32),
+      RadioRegMaskInit(address: RfPriTxcalDfeReg,
+                       keepMask: 0xFFFF8FFF'u32, setMask: 0x00004000'u32),
+      RadioRegMaskInit(address: RfPriConfigB0Reg,
+                       keepMask: 0xFFFFFFFB'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: RfTxcalParamReg,
+                       keepMask: 0xFFFFF8FF'u32, setMask: 0x00000270'u32),
+      RadioRegMaskInit(address: RfPriInit68Reg,
+                       keepMask: 0xC00C0088'u32, setMask: 0xE17E0244'u32),
+      RadioRegMaskInit(address: RfPriInitD4Reg,
+                       keepMask: 0xFFF0F00F'u32, setMask: 0x00F013C1'u32),
+      RadioRegMaskInit(address: 0x200017BC'u32,
+                       keepMask: 0xFFC00000'u32, setMask: 0x00177124'u32),
+      RadioRegMaskInit(address: 0x200017C0'u32,
+                       keepMask: 0xFFC00000'u32, setMask: 0x0019E0A4'u32),
+      RadioRegMaskInit(address: 0x200017C4'u32,
+                       keepMask: 0xFFC00000'u32, setMask: 0x0019E0A4'u32),
+      RadioRegMaskInit(address: 0x200017C8'u32,
+                       keepMask: 0xFFC00000'u32, setMask: 0x0017C0A4'u32),
+      RadioRegMaskInit(address: 0x200017CC'u32,
+                       keepMask: 0xFFC00000'u32, setMask: 0x0017C0A4'u32),
+      RadioRegMaskInit(address: 0x200017D0'u32,
+                       keepMask: 0xFFC00000'u32, setMask: 0x0017C0A4'u32),
+      RadioRegMaskInit(address: 0x200017D4'u32,
+                       keepMask: 0xFFC00000'u32, setMask: 0x00191064'u32),
+      RadioRegMaskInit(address: 0x200017D8'u32,
+                       keepMask: 0xFFC00000'u32, setMask: 0x00177064'u32)
+    ]
+
+    RfPriStaticInit: array[23, RadioRegMaskInit] = [
+      RadioRegMaskInit(address: RfPriInitPllReg,
+                       keepMask: 0xFFFFF9FF'u32, setMask: 0x000001FC'u32),
+      RadioRegMaskInit(address: RfPriInitPllReg,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000002'u32),
+      RadioRegMaskInit(address: RfPriInitPllReg,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000001'u32),
+      RadioRegMaskInit(address: RfRxModeReg,
+                       keepMask: 0xFFFFE67D'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: RfRxModeReg,
+                       keepMask: 0xFFFFFF9E'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: RfPriInitDfeReg,
+                       keepMask: 0xFF0FFFFF'u32, setMask: 0x00300000'u32),
+      RadioRegMaskInit(address: RfPriInitHbnReg,
+                       keepMask: 0xF0FFFFFF'u32, setMask: 0x08000000'u32),
+      RadioRegMaskInit(address: RfPriModeCtrlReg,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00001003'u32),
+      RadioRegMaskInit(address: RfPriInitF884Reg,
+                       keepMask: 0xF000FFFF'u32, setMask: 0x082000F4'u32),
+      RadioRegMaskInit(address: 0x200010CC'u32,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x10000000'u32),
+      RadioRegMaskInit(address: RfPriInit163cReg,
+                       keepMask: 0x00000000'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: RfPriInit64Reg,
+                       keepMask: 0xFFFE0008'u32, setMask: 0x00004C2C'u32),
+      RadioRegMaskInit(address: RfPriInit128Reg,
+                       keepMask: 0xFF800800'u32, setMask: 0x004C2491'u32),
+      RadioRegMaskInit(address: RfPriInit12cReg,
+                       keepMask: 0xFF800800'u32, setMask: 0x004C24C2'u32),
+      RadioRegMaskInit(address: RfPriInit130Reg,
+                       keepMask: 0xFF800FFF'u32, setMask: 0x00491000'u32),
+      RadioRegMaskInit(address: RfPriInitD4Reg,
+                       keepMask: 0xFFF0F00F'u32, setMask: 0x00F013C1'u32),
+      RadioRegMaskInit(address: RfPriInit90Reg,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00010000'u32),
+      RadioRegMaskInit(address: RfTxcalCtrlReg,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000010'u32),
+      RadioRegMaskInit(address: RfPriInit138Reg,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000003'u32),
+      RadioRegMaskInit(address: RfPriInit130Reg,
+                       keepMask: 0xFFFFFE92'u32, setMask: 0x00000092'u32),
+      RadioRegMaskInit(address: RfPriInit8cReg,
+                       keepMask: 0xFFFFFFF8'u32, setMask: 0x00000002'u32),
+      RadioRegMaskInit(address: RfPriInit1618Reg,
+                       keepMask: 0x3FFFFFFF'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: RfRxModeReg,
+                       keepMask: 0xFFFFFFEF'u32, setMask: 0x00000000'u32)
+    ]
+
+    RfPriGainInit: array[12, RadioRegMaskInit] = [
+      RadioRegMaskInit(address: 0x20001760'u32,
+                       keepMask: 0xFF000000'u32, setMask: 0x00003189'u32),
+      RadioRegMaskInit(address: 0x2000175C'u32,
+                       keepMask: 0xFF000000'u32, setMask: 0x0030F495'u32),
+      RadioRegMaskInit(address: 0x2000179C'u32,
+                       keepMask: 0xC00007FF'u32, setMask: 0xD037D000'u32),
+      RadioRegMaskInit(address: 0x20001794'u32,
+                       keepMask: 0xC00007FF'u32, setMask: 0xD06FF000'u32),
+      RadioRegMaskInit(address: 0x2000178C'u32,
+                       keepMask: 0xC00007FF'u32, setMask: 0xD077E000'u32),
+      RadioRegMaskInit(address: 0x20001784'u32,
+                       keepMask: 0xC00007FF'u32, setMask: 0x10940000'u32),
+      RadioRegMaskInit(address: 0x2000177C'u32,
+                       keepMask: 0xC00007FF'u32, setMask: 0x109C0000'u32),
+      RadioRegMaskInit(address: 0x20001774'u32,
+                       keepMask: 0xC00007FF'u32, setMask: 0x11180000'u32),
+      RadioRegMaskInit(address: 0x2000176C'u32,
+                       keepMask: 0xC00007FF'u32, setMask: 0x115C0000'u32),
+      RadioRegMaskInit(address: 0x20001764'u32,
+                       keepMask: 0xC00007FF'u32, setMask: 0x11FC0000'u32),
+      RadioRegMaskInit(address: RfSynthCtrlReg,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00004007'u32),
+      RadioRegMaskInit(address: RfPriInit163cReg,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00008080'u32)
+    ]
+
+    RfPriTxPowerRegisterBase: array[43, uint32] = [
+      0x004524D4'u32, 0x0028E3D0'u32, 0x135FC000'u32, 0x00000000'u32,
+      0x12DFC000'u32, 0x00000000'u32, 0x123FE000'u32, 0x00000000'u32,
+      0x123FC000'u32, 0x00000000'u32, 0x119FF000'u32, 0x00000000'u32,
+      0x119FD000'u32, 0x00000000'u32, 0x113FF000'u32, 0x00000000'u32,
+      0x10FBD000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32,
+      0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x0030F495'u32,
+      0x00003189'u32, 0x11FC0000'u32, 0x00000000'u32, 0x115C0000'u32,
+      0x00000000'u32, 0x11180000'u32, 0x00000000'u32, 0x109C0000'u32,
+      0x00000000'u32, 0x10940000'u32, 0x0014A3D4'u32, 0x1077E000'u32,
+      0x00000000'u32, 0x106FF000'u32, 0x00000000'u32, 0x1037D000'u32,
+      0x00000000'u32, 0x000420FC'u32, 0x04030201'u32
+    ]
+    RfPriWb03TxPowerRegisterBaseline: array[43, uint32] = [
+      ## Vendor WB03/40M restore output at nimFwScanRxFilterProbe.
+      ## librf_bl808.a:rf_pri_restore_cal_reg calls rf_pri_txcal_w2reg and
+      ## rf_pri_bz_txcal_w2reg before RXCAL replay; the current pure TXCAL
+      ## records are not yet bit-for-bit and were overwriting 0x1700..0x17a8
+      ## with low fallback values.
+      0x004524D4'u32, 0x1128E3D0'u32, 0x135FC408'u32, 0x00FB206C'u32,
+      0x12DFC3F9'u32, 0x00FEDD78'u32, 0x123FE3EC'u32, 0x00FDE360'u32,
+      0x123FC3EB'u32, 0x00FD6460'u32, 0x119FF3F8'u32, 0x00FD9E70'u32,
+      0x119FD3EE'u32, 0x00FE5E78'u32, 0x113FF3E8'u32, 0x00FE967C'u32,
+      0x10FBD3FC'u32, 0x00FC1A80'u32, 0x00000000'u32, 0x00000000'u32,
+      0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x0030F495'u32,
+      0x00003189'u32, 0x11FC0408'u32, 0x00FB206C'u32, 0x115C03F9'u32,
+      0x00FEDD78'u32, 0x111803EC'u32, 0x00FDE360'u32, 0x109C03EB'u32,
+      0x00FD6460'u32, 0x109403F8'u32, 0x00FD9E70'u32, 0x1077E3EE'u32,
+      0x00FE5E78'u32, 0x106FF3E8'u32, 0x00FE967C'u32, 0x1037D3FC'u32,
+      0x00FC1A80'u32, 0x000700D8'u32, 0x04030201'u32
+    ]
+    RfPriBzTxcalRecordIds: array[4, int] = [1, 2, 3, 6]
+    RfPriBzTxcalTableStarts: array[4, int] = [35, 37, 39, 41]
+
+    RfPriBzTxcalParams: array[RfPriBzTxcalSearchRecords, array[7, uint32]] = [
+      [2'u32, 4'u32, 7'u32, 3'u32, 0x00010000'u32, 7'u32, 3'u32],
+      [2'u32, 4'u32, 7'u32, 3'u32, 0x00015000'u32, 7'u32, 5'u32],
+      [2'u32, 4'u32, 7'u32, 3'u32, 0x00019000'u32, 7'u32, 7'u32],
+      [0'u32, 4'u32, 7'u32, 3'u32, 0x0001A000'u32, 6'u32, 7'u32],
+      [0'u32, 4'u32, 7'u32, 3'u32, 0x00020000'u32, 5'u32, 7'u32],
+      [2'u32, 4'u32, 7'u32, 3'u32, 0x00015000'u32, 7'u32, 5'u32],
+      [2'u32, 4'u32, 7'u32, 3'u32, 0x00018000'u32, 7'u32, 7'u32],
+      [0'u32, 4'u32, 7'u32, 3'u32, 0x0001A000'u32, 6'u32, 7'u32],
+      [0'u32, 4'u32, 7'u32, 3'u32, 0x0001B000'u32, 5'u32, 7'u32]
+    ]
+
+    RfPriTxcalParams: array[RfPriTxcalSearchRecords, array[7, uint32]] = [
+      [2'u32, 4'u32, 7'u32, 3'u32, 0x00010000'u32, 7'u32, 2'u32],
+      [2'u32, 4'u32, 7'u32, 3'u32, 0x00010000'u32, 7'u32, 4'u32],
+      [2'u32, 4'u32, 7'u32, 3'u32, 0x00010100'u32, 7'u32, 5'u32],
+      [2'u32, 4'u32, 7'u32, 3'u32, 0x00017000'u32, 7'u32, 6'u32],
+      [2'u32, 4'u32, 7'u32, 3'u32, 0x0001B000'u32, 7'u32, 7'u32],
+      [0'u32, 4'u32, 7'u32, 3'u32, 0x00019000'u32, 5'u32, 7'u32],
+      [0'u32, 4'u32, 7'u32, 3'u32, 0x00020000'u32, 4'u32, 7'u32],
+      [2'u32, 4'u32, 7'u32, 3'u32, 0x00010000'u32, 7'u32, 4'u32],
+      [2'u32, 4'u32, 7'u32, 3'u32, 0x00010100'u32, 7'u32, 5'u32],
+      [2'u32, 4'u32, 7'u32, 3'u32, 0x00017000'u32, 7'u32, 5'u32],
+      [2'u32, 4'u32, 7'u32, 3'u32, 0x00018000'u32, 7'u32, 7'u32],
+      [0'u32, 4'u32, 7'u32, 3'u32, 0x00016000'u32, 6'u32, 7'u32],
+      [0'u32, 4'u32, 7'u32, 3'u32, 0x0001C000'u32, 4'u32, 7'u32],
+      [0'u32, 4'u32, 7'u32, 3'u32, 0x0001D000'u32, 5'u32, 7'u32],
+      [0'u32, 4'u32, 7'u32, 3'u32, 0x0001D000'u32, 4'u32, 7'u32],
+      [0'u32, 4'u32, 7'u32, 3'u32, 0x0001D000'u32, 5'u32, 7'u32],
+      [0'u32, 4'u32, 7'u32, 3'u32, 0x0001D000'u32, 3'u32, 7'u32],
+      [0'u32, 4'u32, 7'u32, 3'u32, 0x0001D000'u32, 5'u32, 7'u32]
+    ]
+
+    RfPriTxcalPowerSetup: array[RfPriTxcalSearchRecords, array[9, uint16]] = [
+      [0x0003'u16, 0x0001'u16, 0x0007'u16, 0x0017'u16, 0x0000'u16, 0x0007'u16, 0x0000'u16, 0xFFFF'u16, 0x00F0'u16],
+      [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x0019'u16, 0x0000'u16, 0x0007'u16, 0x0000'u16, 0x0000'u16, 0x00D2'u16],
+      [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x0011'u16, 0x0000'u16, 0x0007'u16, 0x0000'u16, 0x0000'u16, 0x00B4'u16],
+      [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x000C'u16, 0x0000'u16, 0x0007'u16, 0x0000'u16, 0xFFFF'u16, 0x0096'u16],
+      [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x0008'u16, 0x0000'u16, 0x0007'u16, 0x0000'u16, 0xFFFF'u16, 0x0078'u16],
+      [0x0000'u16, 0x0001'u16, 0x0005'u16, 0x0008'u16, 0x0000'u16, 0x0007'u16, 0x0000'u16, 0xFFFE'u16, 0x005A'u16],
+      [0x0000'u16, 0x0001'u16, 0x0004'u16, 0x0006'u16, 0x0000'u16, 0x0007'u16, 0x0000'u16, 0x0000'u16, 0x003C'u16],
+      [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x001B'u16, 0x0003'u16, 0x0007'u16, 0x0001'u16, 0x0000'u16, 0x005A'u16],
+      [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x0012'u16, 0x0003'u16, 0x0007'u16, 0x0001'u16, 0x0000'u16, 0x003C'u16],
+      [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x000C'u16, 0x0003'u16, 0x0007'u16, 0x0001'u16, 0x0001'u16, 0x001E'u16],
+      [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x0009'u16, 0x0003'u16, 0x0007'u16, 0x0001'u16, 0xFFFE'u16, 0x0000'u16],
+      [0x0000'u16, 0x0001'u16, 0x0006'u16, 0x0007'u16, 0x0003'u16, 0x0007'u16, 0x0001'u16, 0xFFFF'u16, 0xFFE2'u16],
+      [0x0000'u16, 0x0001'u16, 0x0004'u16, 0x0007'u16, 0x0003'u16, 0x0007'u16, 0x0001'u16, 0xFFFF'u16, 0xFFC4'u16],
+      [0x0000'u16, 0x0001'u16, 0x0003'u16, 0x0006'u16, 0x0003'u16, 0x0007'u16, 0x0001'u16, 0xFFFF'u16, 0xFFA6'u16],
+      [0x0000'u16, 0x0001'u16, 0x0001'u16, 0x0009'u16, 0x0003'u16, 0x0007'u16, 0x0001'u16, 0xFFFF'u16, 0xFF88'u16],
+      [0x0000'u16, 0x0001'u16, 0x0001'u16, 0x0007'u16, 0x0003'u16, 0x0007'u16, 0x0001'u16, 0xFFFD'u16, 0xFF6A'u16],
+      [0x0000'u16, 0x0001'u16, 0x0000'u16, 0x0009'u16, 0x0003'u16, 0x0007'u16, 0x0001'u16, 0x0000'u16, 0xFF4C'u16],
+      [0x0000'u16, 0x0001'u16, 0x0000'u16, 0x0006'u16, 0x0003'u16, 0x0007'u16, 0x0001'u16, 0x0000'u16, 0xFF2E'u16]
+    ]
+
+    RfPriBzTxcalPowerSetup: array[RfPriBzTxcalSearchRecords, array[9, uint16]] = [
+      [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x001B'u16, 0x0000'u16, 0x0005'u16, 0x0000'u16, 0xFFFE'u16, 0x00E6'u16],
+      [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x000F'u16, 0x0000'u16, 0x0005'u16, 0x0000'u16, 0x0002'u16, 0x00C8'u16],
+      [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x0009'u16, 0x0000'u16, 0x0005'u16, 0x0000'u16, 0xFFFE'u16, 0x0096'u16],
+      [0x0000'u16, 0x0001'u16, 0x0005'u16, 0x0007'u16, 0x0000'u16, 0x0005'u16, 0x0000'u16, 0xFFFC'u16, 0x0064'u16],
+      [0x0000'u16, 0x0001'u16, 0x0002'u16, 0x0006'u16, 0x0000'u16, 0x0005'u16, 0x0000'u16, 0x0004'u16, 0x0032'u16],
+      [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x0010'u16, 0x0000'u16, 0x0005'u16, 0x0001'u16, 0x0002'u16, 0x005A'u16],
+      [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x000A'u16, 0x0000'u16, 0x0005'u16, 0x0001'u16, 0x0000'u16, 0x0032'u16],
+      [0x0000'u16, 0x0001'u16, 0x0006'u16, 0x0007'u16, 0x0000'u16, 0x0005'u16, 0x0001'u16, 0x0000'u16, 0x000A'u16],
+      [0x0000'u16, 0x0001'u16, 0x0003'u16, 0x0008'u16, 0x0000'u16, 0x0005'u16, 0x0001'u16, 0x0000'u16, 0xFFE2'u16]
+    ]
+
+    RfPriCalSavedRegs: array[27, uint32] = [
+      0x20001004'u32, 0x2000102C'u32, 0x2000101C'u32, 0x20001030'u32,
+      0x200010B8'u32, 0x200010C0'u32, 0x200010C4'u32, 0x2000F030'u32,
+      0x20001088'u32, 0x2000108C'u32, 0x20001600'u32, 0x2000160C'u32,
+      0x20001618'u32, 0x2000161C'u32, 0x20001048'u32, 0x2000120C'u32,
+      0x20001214'u32, 0x20001218'u32, 0x2000123C'u32, 0x20001240'u32,
+      0x20001244'u32, 0x200010F0'u32, 0x20001064'u32, 0x20001058'u32,
+      0x20001220'u32, 0x20001074'u32, 0x200010A4'u32
+    ]
+
+    PhyInitBasebandPreAgcInit: array[23, RadioRegMaskInit] = [
+      ## Deterministic part of librf_bl808.a:phy.c.o phy_init+0x318..0x450.
+      RadioRegMaskInit(address: 0x24C00324'u32,
+                       keepMask: 0xFFC0FFFF'u32, setMask: 0x002D0000'u32),
+      RadioRegMaskInit(address: 0x24C00848'u32,
+                       keepMask: 0x00000000'u32, setMask: 0x10000000'u32),
+      RadioRegMaskInit(address: 0x24C00844'u32,
+                       keepMask: 0x00000000'u32, setMask: 0x10000000'u32),
+      RadioRegMaskInit(address: 0x24C008D4'u32,
+                       keepMask: 0xFC00FFFF'u32, setMask: 0x008C0000'u32),
+      RadioRegMaskInit(address: 0x24C008D8'u32,
+                       keepMask: 0xFFFFFC00'u32, setMask: 0x0000006B'u32),
+      RadioRegMaskInit(address: 0x24C008D8'u32,
+                       keepMask: 0xFC00FFFF'u32, setMask: 0x00890000'u32),
+      RadioRegMaskInit(address: 0x24C008E0'u32,
+                       keepMask: 0xFFFFFC00'u32, setMask: 0x00000032'u32),
+      RadioRegMaskInit(address: 0x24C008E4'u32,
+                       keepMask: 0x00000000'u32, setMask: 0x00740000'u32),
+      RadioRegMaskInit(address: 0x24C008E0'u32,
+                       keepMask: 0xFC00FFFF'u32, setMask: 0x00860000'u32),
+      RadioRegMaskInit(address: 0x24C00814'u32,
+                       keepMask: 0xFFF00FFF'u32, setMask: 0x0000A000'u32),
+      RadioRegMaskInit(address: 0x24C00894'u32,
+                       keepMask: 0xFFEFFFFF'u32, setMask: 0x00100000'u32),
+      RadioRegMaskInit(address: 0x24C00834'u32,
+                       keepMask: 0xFFFFFFEF'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: 0x24940010'u32,
+                       keepMask: 0xF7FFFFFF'u32, setMask: 0x08000000'u32),
+      RadioRegMaskInit(address: 0x24C0C01C'u32,
+                       keepMask: 0x00000000'u32, setMask: 0x000000A0'u32),
+      RadioRegMaskInit(address: 0x24C0B100'u32,
+                       keepMask: 0xFFFF80FF'u32, setMask: 0x00005000'u32),
+      RadioRegMaskInit(address: 0x24C0B100'u32,
+                       keepMask: 0xFFFFFF80'u32, setMask: 0x00000050'u32),
+      RadioRegMaskInit(address: 0x24C0C80C'u32,
+                       keepMask: 0x00FFFFFF'u32, setMask: 0xA8000000'u32),
+      RadioRegMaskInit(address: 0x24C0B390'u32,
+                       keepMask: 0xFFFFEFFF'u32, setMask: 0x00001000'u32),
+      RadioRegMaskInit(address: 0x24940010'u32,
+                       keepMask: 0xDFFFFFFF'u32, setMask: 0x20000000'u32),
+      RadioRegMaskInit(address: 0x24C0B390'u32,
+                       keepMask: 0xFFFFEFFF'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: 0x24C0B390'u32,
+                       keepMask: 0xFFFEFFFF'u32, setMask: 0x00010000'u32),
+      RadioRegMaskInit(address: 0x24C0B390'u32,
+                       keepMask: 0xFFFFFBFF'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: 0x24940010'u32,
+                       keepMask: 0xDFFFFFFF'u32, setMask: 0x00000000'u32)
+    ]
+
+    PhyInitAgcCoreInit: array[54, RadioRegMaskInit] = [
+      ## Deterministic part of phy_init+0x4ba..0x938.
+      RadioRegMaskInit(address: 0x24C0B3A4'u32,
+                       keepMask: 0xFFFFFF00'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: 0x24C0B3A4'u32,
+                       keepMask: 0xFFFF00FF'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: 0x24C0B394'u32,
+                       keepMask: 0xFF00FFFF'u32, setMask: 0x00F80000'u32),
+      RadioRegMaskInit(address: 0x24C0B398'u32,
+                       keepMask: 0xFFFF00FF'u32, setMask: 0x00009E00'u32),
+      RadioRegMaskInit(address: 0x24C0B3C4'u32,
+                       keepMask: 0xFFFFFF00'u32, setMask: 0x000000CE'u32),
+      RadioRegMaskInit(address: 0x24C0B364'u32,
+                       keepMask: 0xE0FFFFFF'u32, setMask: 0x08000000'u32),
+      RadioRegMaskInit(address: 0x24C0B364'u32,
+                       keepMask: 0xFFC0FFFF'u32, setMask: 0x003C0000'u32),
+      RadioRegMaskInit(address: 0x24C0B364'u32,
+                       keepMask: 0xFFFFC0FF'u32, setMask: 0x00003A00'u32),
+      RadioRegMaskInit(address: 0x24C0B364'u32,
+                       keepMask: 0xFFFFFFC0'u32, setMask: 0x0000003B'u32),
+      RadioRegMaskInit(address: 0x24C0B368'u32,
+                       keepMask: 0xFFC00FFF'u32, setMask: 0x00270000'u32),
+      RadioRegMaskInit(address: 0x24C0B368'u32,
+                       keepMask: 0xFFFFFC00'u32, setMask: 0x00000270'u32),
+      RadioRegMaskInit(address: 0x24C0B36C'u32,
+                       keepMask: 0xFFFFFF00'u32, setMask: 0x00000010'u32),
+      RadioRegMaskInit(address: 0x24C0B36C'u32,
+                       keepMask: 0xFFFFF8FF'u32, setMask: 0x00000500'u32),
+      RadioRegMaskInit(address: 0x24C0B36C'u32,
+                       keepMask: 0xFF00FFFF'u32, setMask: 0x00200000'u32),
+      RadioRegMaskInit(address: 0x24C0B36C'u32,
+                       keepMask: 0xF8FFFFFF'u32, setMask: 0x05000000'u32),
+      RadioRegMaskInit(address: 0x24C0B370'u32,
+                       keepMask: 0xFF80FFFF'u32, setMask: 0x00580000'u32),
+      RadioRegMaskInit(address: 0x24C0B3C0'u32,
+                       keepMask: 0x00FFFFFF'u32, setMask: 0x18000000'u32),
+      RadioRegMaskInit(address: 0x24C0B3C4'u32,
+                       keepMask: 0xFF00FFFF'u32, setMask: 0x00E00000'u32),
+      RadioRegMaskInit(address: 0x24C0B3C4'u32,
+                       keepMask: 0x00FFFFFF'u32, setMask: 0xDC000000'u32),
+      RadioRegMaskInit(address: 0x24C0B3A0'u32,
+                       keepMask: 0xFFFFFF00'u32, setMask: 0x0000009D'u32),
+      RadioRegMaskInit(address: 0x24C0B3C0'u32,
+                       keepMask: 0xFFFFFF00'u32, setMask: 0x000000B0'u32),
+      RadioRegMaskInit(address: 0x24C0B380'u32,
+                       keepMask: 0xFFF03FFF'u32, setMask: 0x000F8000'u32),
+      RadioRegMaskInit(address: 0x24C0B380'u32,
+                       keepMask: 0xFC0FFFFF'u32, setMask: 0x03700000'u32),
+      RadioRegMaskInit(address: 0x24C0B380'u32,
+                       keepMask: 0x03FFFFFF'u32, setMask: 0x04000000'u32),
+      RadioRegMaskInit(address: 0x24C0B380'u32,
+                       keepMask: 0xFFFFDFFF'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: 0x24C0B380'u32,
+                       keepMask: 0xFFFFE3FF'u32, setMask: 0x00000400'u32),
+      RadioRegMaskInit(address: 0x24C0B384'u32,
+                       keepMask: 0x03FFFFFF'u32, setMask: 0xE4000000'u32),
+      RadioRegMaskInit(address: 0x24C0B384'u32,
+                       keepMask: 0xFC0FFFFF'u32, setMask: 0x03700000'u32),
+      RadioRegMaskInit(address: 0x24C0B384'u32,
+                       keepMask: 0xFFF03FFF'u32, setMask: 0x00050000'u32),
+      RadioRegMaskInit(address: 0x24C0B384'u32,
+                       keepMask: 0xFFFFDFFF'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: 0x24C0B384'u32,
+                       keepMask: 0xFFFFE3FF'u32, setMask: 0x00001800'u32),
+      RadioRegMaskInit(address: 0x24C0B388'u32,
+                       keepMask: 0x03FFFFFF'u32, setMask: 0x3C000000'u32),
+      RadioRegMaskInit(address: 0x24C0B388'u32,
+                       keepMask: 0xFC0FFFFF'u32, setMask: 0x01700000'u32),
+      RadioRegMaskInit(address: 0x24C0B388'u32,
+                       keepMask: 0xFFF03FFF'u32, setMask: 0x000A8000'u32),
+      RadioRegMaskInit(address: 0x24C0B388'u32,
+                       keepMask: 0xFFFFDFFF'u32, setMask: 0x00000000'u32),
+      RadioRegMaskInit(address: 0x24C0B388'u32,
+                       keepMask: 0xFFFFE3FF'u32, setMask: 0x00001400'u32),
+      RadioRegMaskInit(address: 0x24C0B38C'u32,
+                       keepMask: 0x03FFFFFF'u32, setMask: 0x64000000'u32),
+      RadioRegMaskInit(address: 0x24C0B38C'u32,
+                       keepMask: 0xFC0FFFFF'u32, setMask: 0x03600000'u32),
+      RadioRegMaskInit(address: 0x24C0B38C'u32,
+                       keepMask: 0xFFF03FFF'u32, setMask: 0x000E0000'u32),
+      RadioRegMaskInit(address: 0x24C0B38C'u32,
+                       keepMask: 0xFFFFE3FF'u32, setMask: 0x00001400'u32),
+      RadioRegMaskInit(address: 0x24C0C830'u32,
+                       keepMask: 0x03FFFFFF'u32, setMask: 0xFC000000'u32),
+      RadioRegMaskInit(address: 0x24C0C830'u32,
+                       keepMask: 0xFC0FFFFF'u32, setMask: 0x00100000'u32),
+      RadioRegMaskInit(address: 0x24C0C830'u32,
+                       keepMask: 0xFFF03FFF'u32, setMask: 0x000D8000'u32),
+      RadioRegMaskInit(address: 0x24C0C830'u32,
+                       keepMask: 0xFFFFE3FF'u32, setMask: 0x00001400'u32),
+      RadioRegMaskInit(address: 0x24C0C838'u32,
+                       keepMask: 0x7FFFFFFF'u32, setMask: 0x80000000'u32),
+      RadioRegMaskInit(address: 0x24C0C838'u32,
+                       keepMask: 0xFFF80000'u32, setMask: 0x00000040'u32),
+      RadioRegMaskInit(address: 0x24C0C83C'u32,
+                       keepMask: 0x7FFFFFFF'u32, setMask: 0x80000000'u32),
+      RadioRegMaskInit(address: 0x24C0C83C'u32,
+                       keepMask: 0xFFF00000'u32, setMask: 0x00000040'u32),
+      RadioRegMaskInit(address: 0x24C0C840'u32,
+                       keepMask: 0x7FFFFFFF'u32, setMask: 0x80000000'u32),
+      RadioRegMaskInit(address: 0x24C0C840'u32,
+                       keepMask: 0xFFC00000'u32, setMask: 0x00000036'u32),
+      RadioRegMaskInit(address: 0x24C0B004'u32,
+                       keepMask: 0x00000000'u32, setMask: 0x00000001'u32),
+      RadioRegMaskInit(address: 0x24C0B390'u32,
+                       keepMask: 0xFFFFFFFC'u32, setMask: 0x00000001'u32),
+      RadioRegMaskInit(address: 0x24C0B3BC'u32,
+                       keepMask: 0x00000000'u32, setMask: 0x001E8480'u32),
+      RadioRegMaskInit(address: 0x24C0B414'u32,
+                       keepMask: 0xFFFFFFFF'u32, setMask: 0x00000100'u32)
+    ]
+
+  template rfRegs(): ptr RfRegBlock =
+    cast[ptr RfRegBlock](RfBase)
+
+  template phyRegs(): ptr PhyAgcBlock =
+    cast[ptr PhyAgcBlock](PhyBase)
+
+  template agcRegs(): ptr PhyAgcBlock =
+    cast[ptr PhyAgcBlock](AgcBase)
+
+  template wifiModemRegs(): ptr WifiModemBlock =
+    cast[ptr WifiModemBlock](WifiModemBase)
+
+  template bbaAgcRegs(): ptr BbaAgcBlock =
+    cast[ptr BbaAgcBlock](0x24C0B000'u)
+
+  proc updateReg32(reg: ptr uint32, clearMask, setMask: uint32) {.inline.} =
+    volatileStore(reg, (volatileLoad(reg) and clearMask) or setMask)
+
+  proc readReg32(regAddr: uint32): uint32 {.inline.} =
+    volatileLoad(cast[ptr uint32](regAddr.uint))
+
+  proc writeRadioRegMaskInit(table: openArray[RadioRegMaskInit]) =
+    for item in table:
+      updateReg32(cast[ptr uint32](item.address.uint), item.keepMask, item.setMask)
+
+  proc writeRadioRegMaskInitRange(
+      table: openArray[RadioRegMaskInit], first, lastExcl: int) =
+    for i in first ..< lastExcl:
+      let item = table[i]
+      updateReg32(cast[ptr uint32](item.address.uint), item.keepMask, item.setMask)
+
+  proc writeRadioMemoryWords(base: uint32, words: openArray[uint32]) =
+    for i, word in words:
+      volatileStore(cast[ptr uint32]((base + uint32(i) * 4'u32).uint), word)
+
+  proc waitRfUs(us: uint32) {.inline.} =
+    arch_delay_us(us)
+
+  proc wlModeFromApi(apiMode: uint8): RadioPhyMode {.inline.} =
+    case apiMode
+    of WlApiModeBle:
+      bleOnly
+    of WlApiModeAll:
+      wifiBleCoex
+    else:
+      wifiOnly
+
+  proc xtalIndex(xtalfreqHz: uint32): uint32 {.inline.} =
+    case xtalfreqHz
+    of WlXtal24M: 0'u32
+    of WlXtal26M: 1'u32
+    of WlXtal32M: 2'u32
+    of WlXtal38P4M: 3'u32
+    of WlXtal40M: 4'u32
+    of WlXtal52M: 5'u32
+    else: 5'u32
+
+  proc crm_init() {.exportc, cdecl.}
+  proc crm_clk_set(bandwidth: uint32) {.exportc, cdecl.}
+  proc crm_mdm_reset() {.exportc, cdecl.}
+  proc bba_init() {.exportc, cdecl.}
+  proc bba_reset() {.exportc, cdecl.}
+  proc bba_loop(rxVector: pointer, frameType: uint32) {.exportc, cdecl.}
+  proc bba_rssi_correction(rxVector: pointer) {.exportc, cdecl.}
+  proc calc_ppm(rxVector: pointer): int8 {.exportc, cdecl.}
+  proc trpc_init() {.exportc, cdecl.}
+  proc wrapPhyAssertErr*(fileOrCond, condOrFile: cstring, line: cint)
+      {.exportc: "__wrap_phy_assert_err", cdecl, noinline.}
+  proc nimFwAgcAfterCopyProbe*() {.exportc, cdecl, noinline.} =
+    {.emit: "asm volatile(\"nop\" ::: \"memory\");".}
+
+  var agcmem* {.exportc: "agcmem".}: array[512, uint32] = [
+    0x20000000'u32, 0x0400000F'u32, 0x3000106F'u32, 0x60000000'u32, 0x04000059'u32, 0x3000000F'u32, 0x5B000000'u32, 0x0400005C'u32,
+    0x300030EF'u32, 0x32000000'u32, 0x04000085'u32, 0x20000000'u32, 0x0400000F'u32, 0x2819008F'u32, 0x08000142'u32, 0x98008000'u32,
+    0x01000000'u32, 0x0A69C430'u32, 0x0A69D41E'u32, 0x0A799427'u32, 0x0A799C15'u32, 0x38018000'u32, 0x10000821'u32, 0x00200018'u32,
+    0x38008000'u32, 0x0C004003'u32, 0x0020001B'u32, 0x30000005'u32, 0x1404053A'u32, 0x04000039'u32, 0x38018000'u32, 0x10000621'u32,
+    0x00200021'u32, 0x38008000'u32, 0x0C003803'u32, 0x00200024'u32, 0x30000005'u32, 0x1404052D'u32, 0x04000039'u32, 0x38018000'u32,
+    0x10000421'u32, 0x0020002A'u32, 0x38008000'u32, 0x0C002C03'u32, 0x0020002D'u32, 0x30000005'u32, 0x14040523'u32, 0x04000039'u32,
+    0x38018000'u32, 0x10000221'u32, 0x00200033'u32, 0x38008000'u32, 0x0C002003'u32, 0x00200036'u32, 0x30000005'u32, 0x1404051C'u32,
+    0x04000039'u32, 0x28018000'u32, 0x0800003B'u32, 0x38020005'u32, 0x40000001'u32, 0x0800003E'u32, 0x30000005'u32, 0x44002001'u32,
+    0x04000041'u32, 0x30000005'u32, 0x3D000303'u32, 0x04000044'u32, 0x30000005'u32, 0x3E000200'u32, 0x04000047'u32, 0x30000005'u32,
+    0x1F1E2331'u32, 0x0400004A'u32, 0x280D20EF'u32, 0x0800004C'u32, 0x6C193BFF'u32, 0x0414140F'u32, 0x6DC4C48F'u32, 0x08104450'u32,
+    0x380132FF'u32, 0x41000F00'u32, 0x0800004C'u32, 0x30000000'u32, 0x01000000'u32, 0x04000056'u32, 0x30000000'u32, 0x2200149C'u32,
+    0x0400001E'u32, 0x38020000'u32, 0x10000231'u32, 0x08104466'u32, 0x40002000'u32, 0xE400005F'u32, 0xDC000063'u32, 0x58012000'u32,
+    0x0D001401'u32, 0x146DC863'u32, 0x08000066'u32, 0x38008000'u32, 0x60000000'u32, 0x08000059'u32, 0x38012000'u32, 0x3E000100'u32,
+    0x08000069'u32, 0x38022007'u32, 0x3D000101'u32, 0x0800006C'u32, 0x380220EF'u32, 0x1F191910'u32, 0x0800006F'u32, 0x280200EF'u32,
+    0x08000071'u32, 0x20000CEF'u32, 0x04000073'u32, 0x80000CEF'u32, 0x30B00083'u32, 0x28400081'u32, 0x0400007F'u32, 0x0400007F'u32,
+    0x300007EF'u32, 0x1F242010'u32, 0x0400007B'u32, 0x68640FEF'u32, 0x71B6848F'u32, 0x79D6848F'u32, 0x00008C4C'u32, 0x28100CEF'u32,
+    0x6C00808F'u32, 0x28080CEF'u32, 0x6C00808F'u32, 0x28060CEF'u32, 0x6C00808F'u32, 0x3000248F'u32, 0x1F191910'u32, 0x04000088'u32,
+    0x280424EF'u32, 0x0800008A'u32, 0x20002CEF'u32, 0x0400008C'u32, 0x48078EEF'u32, 0x6DA0448F'u32, 0x0800008F'u32, 0x6000000F'u32,
+    0x71BA4493'u32, 0x71B00096'u32, 0x04104499'u32, 0x3000000F'u32, 0x29000300'u32, 0x0400009C'u32, 0x3000000F'u32, 0x29000100'u32,
+    0x0400009C'u32, 0x3000000F'u32, 0x29000000'u32, 0x0400009C'u32, 0x3801800F'u32, 0x0EF1EE07'u32, 0x0200809F'u32, 0x30000000'u32,
+    0x32000000'u32, 0x040000A2'u32, 0x38020005'u32, 0x3E000201'u32, 0x080000A5'u32, 0x30000007'u32, 0x32000001'u32, 0x040000A8'u32,
+    0x30000007'u32, 0x3D000303'u32, 0x040000AB'u32, 0x3000000F'u32, 0x3F000102'u32, 0x040000AE'u32, 0x380402EF'u32, 0x1F102021'u32,
+    0x080000B1'u32, 0x380A0A6F'u32, 0x2200209C'u32, 0x080000B4'u32, 0x28060B6F'u32, 0x080000B6'u32, 0x30000B6F'u32, 0x4100000F'u32,
+    0x040000B9'u32, 0x30000B6F'u32, 0x21000003'u32, 0x040000BC'u32, 0x80000B6F'u32, 0x71BA44C1'u32, 0x701044C4'u32, 0x6C1044C4'u32,
+    0x041044C7'u32, 0x30000F6F'u32, 0x29000301'u32, 0x040000CA'u32, 0x30000F6F'u32, 0x29000101'u32, 0x040000CA'u32, 0x30000F6F'u32,
+    0x29000001'u32, 0x040000CA'u32, 0x28320BEF'u32, 0x080000CC'u32, 0x30000BEF'u32, 0x21000303'u32, 0x040000CF'u32, 0xE0000B6F'u32,
+    0x79DA44D7'u32, 0x71BA44DA'u32, 0x741044DD'u32, 0x6C1044E0'u32, 0x781044DD'u32, 0x701044E0'u32, 0x041044E3'u32, 0x3000030F'u32,
+    0x29030002'u32, 0x04000129'u32, 0x3000030F'u32, 0x29000302'u32, 0x040000E9'u32, 0x3000030F'u32, 0x29010002'u32, 0x04000129'u32,
+    0x3000030F'u32, 0x29000102'u32, 0x040000E9'u32, 0x3000030F'u32, 0x29000002'u32, 0x040000E6'u32, 0x3000000F'u32, 0x32000000'u32,
+    0x0400000F'u32, 0x3000008F'u32, 0x2200149C'u32, 0x040000EC'u32, 0x7896018F'u32, 0x4100000F'u32, 0x8C0000F1'u32, 0x080000E6'u32,
+    0x90104523'u32, 0x88C8000F'u32, 0xC00000FF'u32, 0x90104523'u32, 0x081044F6'u32, 0x941044FC'u32, 0x3000018F'u32, 0x2200289C'u32,
+    0x040000F9'u32, 0x3000030F'u32, 0x29000000'u32, 0x9404500F'u32, 0x3000000F'u32, 0x29000000'u32, 0x0410440F'u32, 0x38008005'u32,
+    0x3D010101'u32, 0x08000105'u32, 0x30000005'u32, 0x6E000000'u32, 0x04104505'u32, 0x892C000F'u32, 0x0800010A'u32, 0x941044FC'u32,
+    0xC610450D'u32, 0xC4185511'u32, 0x4000020F'u32, 0x90104515'u32, 0x04104515'u32, 0x5802800F'u32, 0x0EF1EE07'u32, 0x80000115'u32,
+    0x0800011A'u32, 0x5802800F'u32, 0x0FF1EE07'u32, 0x80000115'u32, 0x0420451A'u32, 0x30000007'u32, 0x3D030303'u32, 0x04000118'u32,
+    0x2810000F'u32, 0x08000123'u32, 0x30000005'u32, 0x4100000F'u32, 0x0400011D'u32, 0x38030005'u32, 0x3D030303'u32, 0x08000120'u32,
+    0x3810000F'u32, 0x4100000F'u32, 0x08000123'u32, 0x3000000F'u32, 0x2200289C'u32, 0x04000126'u32, 0x3000030F'u32, 0x29000000'u32,
+    0x9404500F'u32, 0x3000030F'u32, 0x32000000'u32, 0x0400012C'u32, 0x3000130F'u32, 0x32000100'u32, 0x0400012F'u32, 0x5AEE130F'u32,
+    0x4100000F'u32, 0x7C000136'u32, 0x08000133'u32, 0x3000030F'u32, 0x32000000'u32, 0x0400000F'u32, 0x492C110F'u32, 0x8C000139'u32,
+    0x08000133'u32, 0x3000130F'u32, 0x4100000F'u32, 0x0400013C'u32, 0x3000120F'u32, 0x2200209C'u32, 0x0400013F'u32, 0x3000130F'u32,
+    0x29000000'u32, 0x9404500F'u32, 0x3000008F'u32, 0x0EF1F10B'u32, 0x06000145'u32, 0x38038000'u32, 0x34000000'u32, 0x08000148'u32,
+    0x28028005'u32, 0x0800014A'u32, 0x3000028F'u32, 0x2200209C'u32, 0x0400014D'u32, 0x2000028F'u32, 0x0400014F'u32, 0x2814028F'u32,
+    0x08000151'u32, 0x3000128F'u32, 0x32000100'u32, 0x04000154'u32, 0x5AEE138F'u32, 0x4100000F'u32, 0x7C000158'u32, 0x08000133'u32,
+    0x592C138F'u32, 0x29000000'u32, 0x8C00015C'u32, 0x08000133'u32, 0x2000128F'u32, 0x9404500F'u32, 0x00000000'u32, 0x00000000'u32,
+    0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32,
+    0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32,
+    0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32,
+    0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32,
+    0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32,
+    0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32,
+    0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32,
+    0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32,
+    0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32,
+    0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32,
+    0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32,
+    0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32,
+    0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32,
+    0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32,
+    0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32,
+    0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32,
+    0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32,
+    0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32,
+    0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32,
+    0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0xC0088D03'u32]
+
+  var bbaEnv {.align: 4.}: array[20, uint8]
+  const
+    BbaPdThresholdAttack: array[4, int8] = [-100'i8, -70'i8, -48'i8, -36'i8]
+    BbaPdThresholdRelease: array[4, int8] = [-100'i8, -75'i8, -53'i8, -41'i8]
+
+  var wlCfgGlobal* {.exportc: "wl_cfg".}: pointer
+  var phy_env* {.exportc.}: array[48, uint8]
+
+  template bbaEnvByte(offset: uint): ptr uint8 =
+    cast[ptr uint8](cast[uint](addr bbaEnv[0]) + offset)
+
+  template bbaEnvHalf(offset: uint): ptr uint16 =
+    cast[ptr uint16](cast[uint](addr bbaEnv[0]) + offset)
+
+  template bbaEnvWord(offset: uint): ptr uint32 =
+    cast[ptr uint32](cast[uint](addr bbaEnv[0]) + offset)
+
+  template phyEnvByte(offset: uint): ptr uint8 =
+    cast[ptr uint8](cast[uint](addr phy_env[0]) + offset)
+
+  template phyEnvHalf(offset: uint): ptr uint16 =
+    cast[ptr uint16](cast[uint](addr phy_env[0]) + offset)
+
+  template phyEnvWord(offset: uint): ptr uint32 =
+    cast[ptr uint32](cast[uint](addr phy_env[0]) + offset)
+
+  proc crm_get_mac_freq(): uint32 {.exportc, cdecl.} =
+    ## crm_bl616.c.o crm_get_mac_freq returns 60 MHz.
+    60'u32
+
+  proc crm_init() {.exportc, cdecl.} =
+    ## Port of crm_bl616.c.o crm_init: set RF clock mux bits at 0x24940010.
+    updateReg32(cast[ptr uint32](0x24940010'u), 0xF8000000'u32, 0x08000000'u32)
+
+  proc crm_mdm_reset() {.exportc, cdecl.} =
+    ## Port of crm_bl616.c.o crm_mdm_reset.
+    volatileStore(cast[ptr uint32](0x24940018'u), 0x11'u32)
+    arch_delay_us(1'u32)
+    volatileStore(cast[ptr uint32](0x24940018'u), 0'u32)
+    arch_delay_us(1'u32)
+
+  proc crm_clk_set(bandwidth: uint32) {.exportc, cdecl.} =
+    ## Port of crm_bl616.c.o crm_clk_set. bandwidth 0 selects the default PHY
+    ## clock bits; bandwidth 1 selects the alternate 40 MHz bit pattern.
+    if bandwidth == 0'u32:
+      updateReg32(cast[ptr uint32](0x24940008'u), 0xFFFFFFCF'u32, 0'u32)
+      updateReg32(cast[ptr uint32](0x24940008'u), 0xFFFFFF3F'u32, 0'u32)
+    elif bandwidth == 1'u32:
+      updateReg32(cast[ptr uint32](0x24940008'u), 0xFFFFFFCF'u32, 0x10'u32)
+      updateReg32(cast[ptr uint32](0x24940008'u), 0xFFFFFF3F'u32, 0x40'u32)
+
+  proc signExtend(value: uint32, bits: uint32): int32 {.inline.} =
+    let shift = 32'u32 - bits
+    cast[int32](value shl shift) shr shift
+
+  proc bbaExtractBits(value: uint32, high, low: uint32): uint32 {.inline.} =
+    (value shr low) and ((1'u32 shl (high - low + 1'u32)) - 1'u32)
+
+  proc bbaSetPdGain(gain: uint32) =
+    ## Port of librf_bl808.a:bba.c.o bba_set_pd_gain+0x0..0x25c.
+    let mdm = wifiModemRegs()
+    let bba = bbaAgcRegs()
+    case gain
+    of 2'u32:
+      updateReg32(addr bba.pdGain390, 0xFFFFFFFF'u32, 0x00000100'u32)
+      updateReg32(addr bba.pdGain390, 0xFFFFFDFF'u32, 0'u32)
+      updateReg32(addr bba.pdSlope3c0, 0xFFFF00FF'u32, 0x0000C400'u32)
+      updateReg32(addr bba.pdSlope3c0, 0xFFFFFF00'u32, 0x000000BA'u32)
+      updateReg32(addr mdm.rxGainTimingC044, 0xFFFF00FF'u32, 0x00000400'u32)
+      updateReg32(addr bba.pdComp36c, 0xFFFFFF00'u32, 0x00000014'u32)
+      updateReg32(addr bba.pdTiming3ac, 0xFFFFFF00'u32, 0x000000C8'u32)
+      updateReg32(addr bba.pdTiming3ac, 0xFFF00FFF'u32, 0x000C5000'u32)
+      volatileStore(bbaEnvByte(9'u), 2'u8)
+    of 1'u32:
+      updateReg32(addr bba.pdGain390, 0xFFFFFEFF'u32, 0'u32)
+      updateReg32(addr bba.pdGain390, 0xFFFFFFFF'u32, 0x00000200'u32)
+      updateReg32(addr bba.pdSlope3c0, 0xFFFF00FF'u32, 0x0000B900'u32)
+      updateReg32(addr bba.pdSlope3c0, 0xFFFFFF00'u32, 0x000000B5'u32)
+      updateReg32(addr bba.pdTiming3ac, 0xFFFFFF00'u32, 0x000000C2'u32)
+      updateReg32(addr bba.pdTiming3ac, 0xFFF00FFF'u32, 0x000BF000'u32)
+      updateReg32(addr mdm.rxGainTimingC044, 0xFFFF00FF'u32, 0x00000600'u32)
+      updateReg32(addr bba.pdComp36c, 0xFFFFFF00'u32, 0x00000014'u32)
+      volatileStore(bbaEnvByte(9'u), 1'u8)
+    of 3'u32:
+      updateReg32(addr bba.pdGain390, 0xFFFFFFFF'u32, 0x00000100'u32)
+      updateReg32(addr bba.pdGain390, 0xFFFFFFFF'u32, 0x00000200'u32)
+      updateReg32(addr bba.pdSlope3c0, 0xFFFF00FF'u32, 0x0000D000'u32)
+      updateReg32(addr bba.pdSlope3c0, 0xFFFFFF00'u32, 0x000000BF'u32)
+      updateReg32(addr mdm.rxGainTimingC044, 0xFFFF00FF'u32, 0x00000200'u32)
+      updateReg32(addr bba.pdComp36c, 0xFFFFFF00'u32, 0x00000014'u32)
+      updateReg32(addr bba.pdTiming3ac, 0xFFFFFF00'u32, 0x000000CC'u32)
+      updateReg32(addr bba.pdTiming3ac, 0xFFF00FFF'u32, 0x000C9000'u32)
+      volatileStore(bbaEnvByte(9'u), 3'u8)
+    else:
+      updateReg32(addr bba.pdGain390, 0xFFFFFEFF'u32, 0'u32)
+      updateReg32(addr bba.pdGain390, 0xFFFFFDFF'u32, 0'u32)
+      updateReg32(addr bba.pdSlope3c0, 0xFFFF00FF'u32, 0x0000A300'u32)
+      updateReg32(addr bba.pdSlope3c0, 0xFFFFFF00'u32, 0x000000B0'u32)
+      updateReg32(addr bba.pdTiming3ac, 0xFFFFFF00'u32, 0x000000C2'u32)
+      updateReg32(addr bba.pdTiming3ac, 0xFFF00FFF'u32, 0x000BF000'u32)
+      updateReg32(addr mdm.rxGainTimingC044, 0xFFFF00FF'u32, 0x00000800'u32)
+      updateReg32(addr bba.pdComp36c, 0xFFFFFF00'u32, 0x00000010'u32)
+      volatileStore(bbaEnvByte(9'u), 0'u8)
+
+  proc bba_init() {.exportc, cdecl.} =
+    ## Port of librf_bl808.a:bba.c.o bba_init+0x0..0x106.
+    let bba = bbaAgcRegs()
+    volatileStore(bbaEnvByte(10'u), 1'u8)
+    volatileStore(bbaEnvHalf(16'u), 10'u16)
+    volatileStore(bbaEnvWord(0'u), 0'u32)
+    volatileStore(bbaEnvWord(4'u), 0'u32)
+    volatileStore(bbaEnvByte(8'u), 0'u8)
+    volatileStore(bbaEnvByte(12'u), 0'u8)
+    volatileStore(bbaEnvByte(18'u), 0'u8)
+    volatileStore(bbaEnvHalf(14'u), 0'u16)
+    bbaSetPdGain(0'u32)
+    updateReg32(addr bba.pdGain390, 0xFFFFFF0F'u32, 0'u32)
+    updateReg32(addr bba.pdCompC830, 0xFC0FFFFF'u32, 0x00100000'u32)
+    volatileStore(bbaEnvByte(11'u), 0'u8)
+    updateReg32(cast[ptr uint32](0x2000150C'u), 0xFFFFFEFF'u32, 0'u32)
+    updateReg32(cast[ptr uint32](0x2000150C'u), 0xFFFFFDFF'u32, 0'u32)
+
+  proc bba_reset() {.exportc, cdecl.} =
+    ## Port of librf_bl808.a:bba.c.o bba_reset+0x0..0x8a.
+    let bba = bbaAgcRegs()
+    volatileStore(bbaEnvWord(8'u), 0x00010000'u32)
+    volatileStore(bbaEnvHalf(16'u), 10'u16)
+    volatileStore(bbaEnvWord(0'u), 0'u32)
+    volatileStore(bbaEnvWord(4'u), 0'u32)
+    volatileStore(bbaEnvByte(12'u), 0'u8)
+    volatileStore(bbaEnvHalf(14'u), 0'u16)
+    volatileStore(bbaEnvByte(18'u), 0'u8)
+    bbaSetPdGain(0'u32)
+    updateReg32(addr bba.pdGain390, 0xFFFFFF0F'u32, 0'u32)
+    updateReg32(addr bba.pdCompC830, 0xFC0FFFFF'u32, 0x00100000'u32)
+    volatileStore(bbaEnvByte(11'u), 0'u8)
+    updateReg32(cast[ptr uint32](0x2000150C'u), 0xFFFFFEFF'u32, 0'u32)
+    updateReg32(cast[ptr uint32](0x2000150C'u), 0xFFFFFDFF'u32, 0'u32)
+
+  proc bbaSetPdLatch(enable: bool) =
+    if enable:
+      updateReg32(cast[ptr uint32](0x2000150C'u), 0xFFFFFFFF'u32, 0x00000100'u32)
+      updateReg32(cast[ptr uint32](0x2000150C'u), 0xFFFFFDFF'u32, 0'u32)
+      volatileStore(bbaEnvByte(11'u), 1'u8)
+    else:
+      updateReg32(cast[ptr uint32](0x2000150C'u), 0xFFFFFEFF'u32, 0'u32)
+      updateReg32(cast[ptr uint32](0x2000150C'u), 0xFFFFFDFF'u32, 0'u32)
+      volatileStore(bbaEnvByte(11'u), 0'u8)
+
+  proc bbaUpdatePdComp(target: uint8) =
+    if volatileLoad(bbaEnvByte(10'u)) == target:
+      return
+    let bba = bbaAgcRegs()
+    updateReg32(addr bba.pdGain390, 0xFFFFFF0F'u32, 0'u32)
+    updateReg32(addr bba.pdCompC830, 0xFC0FFFFF'u32, target.uint32 shl 20)
+    volatileStore(bbaEnvByte(10'u), target)
+
+  proc bbaCeUpdateCapcode() =
+    ## Port of bba_ce_update_capcode+0x0..0x9e, using wl_cfg capcode callbacks.
+    if wlCfgGlobal == nil:
+      return
+    let offset = signExtend(volatileLoad(bbaEnvHalf(14'u)).uint32, 16'u32)
+    if offset == 0'i32:
+      return
+    let cfg = cast[ptr WlRfConfig](wlCfgGlobal)
+    if cfg.capcodeGet == nil or cfg.capcodeSet == nil:
+      return
+    var capcode: uint8
+    var capcodeAux: uint8
+    cast[proc(a: ptr uint8, b: ptr uint8) {.cdecl.}](cfg.capcodeGet)(
+      addr capcode, addr capcodeAux)
+    var next = capcode
+    if offset > 0'i32:
+      if capcode == 0'u8:
+        return
+      next = capcode - 1'u8
+      if next == capcode:
+        return
+    else:
+      if capcode > 0x3E'u8:
+        return
+      next = capcode + 1'u8
+      if next == capcode:
+        return
+    cast[proc(a: uint8) {.cdecl.}](cfg.capcodeSet)(next)
+    volatileStore(bbaEnvHalf(14'u), 0'u16)
+    volatileStore(bbaEnvByte(18'u), 1'u8)
+
+  proc bbaCeLoop(rssi: int32, ppm: int32) =
+    ## Port of librf_bl808.a:bba.c.o bba_ce_loop+0x0..0xae.
+    let ppm6 = signExtend(uint32((ppm shl 6) and 0xFFFF'i32), 16'u32)
+    if volatileLoad(bbaEnvByte(18'u)) == 1'u8:
+      let count = volatileLoad(bbaEnvByte(17'u))
+      if count < volatileLoad(bbaEnvByte(16'u)):
+        volatileStore(bbaEnvByte(17'u), count + 1'u8)
+        return
+      volatileStore(bbaEnvByte(17'u), 0'u8)
+      volatileStore(bbaEnvByte(18'u), 0'u8)
+
+    if abs(ppm6) > 0xC0'i32:
+      var accum = signExtend(volatileLoad(bbaEnvHalf(14'u)).uint32, 16'u32)
+      if rssi < -85'i32:
+        accum += ppm6
+      elif rssi < -65'i32:
+        accum += ppm shl 7
+      else:
+        accum += ppm shl 8
+      volatileStore(bbaEnvHalf(14'u), uint16(accum and 0xFFFF'i32))
+
+    if abs(signExtend(volatileLoad(bbaEnvHalf(14'u)).uint32, 16'u32)) > 0x180'i32:
+      bbaCeUpdateCapcode()
+
+  proc bbaPdLoop(rssi: int32) =
+    ## Port of librf_bl808.a:bba.c.o bba_pd_loop+0x0..0x21a.
+    let state = volatileLoad(bbaEnvByte(8'u))
+    var nextState = state
+    var targetComp = volatileLoad(bbaEnvByte(11'u))
+    var changeGain = false
+
+    case state
+    of 0'u8:
+      if rssi > BbaPdThresholdAttack[1].int32:
+        nextState = 1'u8
+        targetComp = 0'u8
+        changeGain = true
+      elif rssi < -90'i32:
+        targetComp = 1'u8
+    of 1'u8:
+      if rssi > BbaPdThresholdAttack[2].int32:
+        nextState = 2'u8
+        targetComp = 0'u8
+        changeGain = true
+      elif rssi < BbaPdThresholdRelease[1].int32:
+        nextState = 0'u8
+        targetComp = if rssi < -90'i32: 1'u8 else: 0'u8
+        changeGain = true
+      else:
+        targetComp = 0'u8
+    of 2'u8:
+      if rssi < -14'i32:
+        nextState = 0'u8
+        targetComp = 0'u8
+      else:
+        targetComp = 0'u8
+    of 3'u8:
+      if rssi < -14'i32:
+        if rssi < BbaPdThresholdRelease[1].int32:
+          nextState = 0'u8
+          targetComp = 1'u8
+          changeGain = true
+        elif rssi < BbaPdThresholdRelease[2].int32:
+          nextState = 1'u8
+          targetComp = 0'u8
+          changeGain = true
+        elif rssi < BbaPdThresholdRelease[3].int32:
+          targetComp = 0'u8
+        else:
+          targetComp = volatileLoad(bbaEnvByte(11'u))
+      else:
+        if volatileLoad(bbaEnvByte(11'u)) != 1'u8:
+          bbaSetPdLatch(true)
+        targetComp = 0'u8
+    else:
+      discard
+
+    if changeGain:
+      bbaSetPdGain(nextState.uint32)
+      volatileStore(bbaEnvByte(8'u), nextState)
+
+    if volatileLoad(bbaEnvByte(11'u)) != 0'u8 and targetComp == 0'u8:
+      bbaSetPdLatch(false)
+
+    bbaUpdatePdComp(targetComp)
+
+  proc bba_loop(rxVector: pointer, frameType: uint32) {.exportc, cdecl.} =
+    ## Port of librf_bl808.a:bba.c.o bba_loop+0x0..0x74 with decoded CE/PD
+    ## subphases.
+    if frameType != 0x80'u32 or rxVector == nil:
+      return
+    let rssi = signExtend(volatileLoad(cast[ptr uint8](cast[uint](rxVector) + 5'u)).uint32, 8'u32)
+    let ppm = calc_ppm(rxVector).int32
+    bbaCeLoop(rssi, ppm)
+    bbaPdLoop(rssi)
+
+  proc bba_rssi_correction(rxVector: pointer) {.exportc, cdecl.} =
+    ## Port of librf_bl808.a:bba.c.o bba_rssi_correction+0x0..0x18.
+    if rxVector == nil:
+      return
+    if volatileLoad(bbaEnvByte(11'u)) != 0'u8:
+      let byte5 = cast[ptr uint8](cast[uint](rxVector) + 5'u)
+      volatileStore(byte5, volatileLoad(byte5) + 0x14'u8)
+
+  proc calc_ppm(rxVector: pointer): int8 {.exportc, cdecl.} =
+    ## Port of librf_bl808.a:bba.c.o calc_ppm+0x0..0x44.
+    if rxVector == nil:
+      return 0'i8
+    let words = cast[ptr UncheckedArray[uint32]](rxVector)
+    let half16 = volatileLoad(cast[ptr uint16](cast[uint](rxVector) + 0x16'u)).uint32
+    if (volatileLoad(addr words[0]) and 0xF'u32) == 0'u32 and
+        bbaExtractBits(volatileLoad(addr words[1]), 7'u32, 4'u32) <= 3'u32:
+      let ppm = signExtend(half16, 8'u32)
+      return cast[int8](signExtend(uint32((ppm * 3'i32) shr 6), 8'u32))
+    else:
+      let ppm = signExtend(half16, 16'u32)
+      let rounded = (ppm and not 0xF'i32) + (ppm shr 4)
+      return cast[int8](signExtend(uint32((-rounded) shr 7), 8'u32))
+
+  proc modemVersionReg(): uint32 {.inline.} =
+    volatileLoad(addr wifiModemRegs().versionWord)
+
+  proc extractBits(value: uint32, high, low: uint32): uint32 {.inline.} =
+    (value shr low) and ((1'u32 shl (high - low + 1'u32)) - 1'u32)
+
+  proc phyClockCountFromVersion(version: uint32): uint32 {.inline.} =
+    ## librf_bl808.a:phy.c.o phy_init+0x22..0x32:
+    ##   srli top byte; addi +2; th.addsl self,self,2; th.extu [23:16];
+    ##   th.addsl mid,self,1; compare against 32.
+    extractBits(version, 23'u32, 16'u32) +
+      (((extractBits(version, 31'u32, 24'u32) + 2'u32) * 5'u32) shl 1)
+
+  proc copyPhyInitCfg(cfg: pointer) =
+    if cfg != nil:
+      let words = cast[ptr UncheckedArray[uint32]](cfg)
+      for i in 0 ..< 9:
+        volatileStore(phyEnvWord((i * 4).uint), words[i])
+    else:
+      for i in 0 ..< 9:
+        volatileStore(phyEnvWord((i * 4).uint), 0'u32)
+    volatileStore(phyEnvWord(36'u), 0x00FF0501'u32)
+    volatileStore(phyEnvWord(40'u), 0x00FF0FFF'u32)
+
+  proc copyAgcMemory() =
+    ## LLVM objdump provenance: librf_bl808.a:phy.c.o phy_init+0x452..0x470
+    ## copies only agcmem into the WiFi AGC RAM window at 0x24C0A000. The BL808
+    ## WiFi RF archive has no ldpcmem symbol and the decoded WiFi phy/lp_phy
+    ## objects do not contain a 0x24C09000 LDPC-memory load path; the 0x24C09000
+    ## table load is BLE-only in blecontroller.loadBlePhyMemories().
+    let src = cast[ptr UncheckedArray[uint32]](addr agcmem[0])
+    let dst = cast[ptr UncheckedArray[uint32]](AgcMemoryBase)
+    for i in 0 ..< (sizeof(agcmem) div sizeof(uint32)):
+      volatileStore(addr dst[i], src[i])
+    nimFwAgcAfterCopyProbe()
+
+  proc bl808PhyProgramRecoveredRegs() =
+    ## Partial translation of librf_bl808.a:phy.c.o phy_init+0x5a..0x450.
+    ## Fixed writes and the post-copy AGC/core phase are represented in
+    ## tables; dynamic fields use the LLVM-decoded T-Head th.extu operations.
+    let version = modemVersionReg()
+    let mdm = wifiModemRegs()
+    let modemBits11to8 = (extractBits(version, 11'u32, 8'u32) - 1'u32) and 0xFF'u32
+    let modemBits15to12 = (extractBits(version, 15'u32, 12'u32) - 1'u32) and 0xFF'u32
+    let modemBits7to4 = (extractBits(version, 7'u32, 4'u32) - 1'u32) and 0xFF'u32
+    let modemBit22OrAc = if extractBits(version, 22'u32, 22'u32) != 0'u32 or
+        extractBits(version, 25'u32, 24'u32) != 0'u32: 0x2'u32 else: 0'u32
+    let modemBit21 = extractBits(version, 21'u32, 21'u32)
+    let modemBit30 = extractBits(version, 30'u32, 30'u32)
+    volatileStore(addr mdm.phyCtrl820, 0x00000005'u32)
+    updateReg32(addr mdm.phyCtrl820, 0xFFFFFF8F'u32, modemBits11to8 shl 4)
+    updateReg32(addr mdm.phyCtrl820, 0xFFFF8FFF'u32, modemBits15to12 shl 12)
+    updateReg32(addr mdm.phyCtrl820, 0xFFFFFEFF'u32,
+                extractBits(version, 27'u32, 27'u32) shl 8)
+    updateReg32(addr mdm.phyCtrl820, 0xFFFFFFFC'u32, modemBit22OrAc)
+    updateReg32(addr mdm.phyCtrl820, not 0x200'u32, 0x200'u32)
+    updateReg32(addr mdm.phyCtrl800, 0xFFFFF0FF'u32, modemBits11to8 shl 8)
+    updateReg32(addr mdm.phyCtrl820, 0xFFDFFFFF'u32, modemBit21 shl 21)
+    updateReg32(addr mdm.phyCtrl820, 0xFFEFFFFF'u32, modemBit21 shl 20)
+    updateReg32(addr mdm.phyCtrl800, 0xFFFFF0FF'u32, modemBits11to8 shl 8)
+    updateReg32(addr mdm.phyCtrl820, 0xFFFEFFFF'u32,
+                (modemBit21 and modemBit30) shl 16)
+    updateReg32(addr mdm.phyCtrl820, 0xEFFFFFFF'u32,
+                (modemBit21 and modemBit30) shl 28)
+    volatileStore(addr mdm.phyCtrl824, 0x00000005'u32)
+    updateReg32(addr mdm.phyCtrl824, 0xFFFFFF8F'u32, modemBits11to8 shl 4)
+    updateReg32(addr mdm.phyCtrl824, 0xFF8FFFFF'u32, modemBits7to4 shl 20)
+    updateReg32(addr mdm.phyCtrl824, 0xFCFFFFFF'u32,
+                extractBits(version, 25'u32, 24'u32) shl 24)
+    updateReg32(addr mdm.phyCtrl824, 0xFFFFFEFF'u32,
+                extractBits(version, 26'u32, 26'u32) shl 8)
+    updateReg32(addr mdm.phyCtrl824, 0xFFFFFFFC'u32, modemBit22OrAc)
+    updateReg32(cast[ptr uint32](0x24B00310'u),
+                0xFF8FFFFF'u32, modemBits11to8 shl 20)
+    updateReg32(addr mdm.phyCtrl824, 0xFFFDFFFF'u32,
+                ((version shr 4) and 0x20000'u32))
+    updateReg32(addr mdm.phyCtrl800, 0xFFFFFF0F'u32, modemBits11to8 shl 4)
+    updateReg32(addr mdm.phyCtrl824, 0xFFFDFFFF'u32,
+                extractBits(version, 31'u32, 31'u32) shl 16)
+    updateReg32(addr mdm.phyCtrl930, not 0x00000F00'u32, 0x00000100'u32)
+    updateReg32(addr mdm.dfeCtrl3bc, not 0'u32, 0x001E8480'u32)
+    updateReg32(addr mdm.dfeCtrl414, not 0'u32, 0x00000100'u32)
+    updateReg32(addr mdm.phyCtrlC40, 0xFE0FFFFF'u32, 0x00E00000'u32)
+    updateReg32(addr mdm.phyCtrlC44, 0xFFF0FFFF'u32, 0x00001000'u32)
+    writeRadioRegMaskInitRange(PhyInitBasebandPreAgcInit, 0, 19)
+
+  proc bl808PhyProgramAgcCopyTailRegs() =
+    writeRadioRegMaskInitRange(
+      PhyInitBasebandPreAgcInit, 19, PhyInitBasebandPreAgcInit.len)
+
+  proc bl808PhyProgramAgcCoreRegs() =
+    writeRadioRegMaskInit(PhyInitAgcCoreInit)
+
+  var phyRxGainOffsetVsTemperature = -128'i8
+
+  proc phyRxGainByte(index: int, offset: int8): uint32 {.inline.} =
+    uint8(int16(PhyRxGainTable[index]) + int16(offset)).uint32
+
+  proc rc2_config_rxgain*(offset: int8) {.exportc, cdecl.} =
+    ## Port of librf_bl808.a:phy.c.o rc2_config_rxgain.
+    ## Vendor phy_init calls this with offset 0 after AGC core programming.
+    if phyRxGainOffsetVsTemperature == offset:
+      return
+    phyRxGainOffsetVsTemperature = offset
+    let mdm = wifiModemRegs()
+    updateReg32(addr mdm.rxGainTable0C080,
+                0x00000000'u32,
+                phyRxGainByte(0, offset) or
+                (phyRxGainByte(1, offset) shl 8) or
+                (phyRxGainByte(2, offset) shl 16) or
+                (phyRxGainByte(3, offset) shl 24))
+    updateReg32(addr mdm.rxGainTable1C084,
+                0x00000000'u32,
+                phyRxGainByte(4, offset) or
+                (phyRxGainByte(5, offset) shl 8) or
+                (phyRxGainByte(6, offset) shl 16) or
+                (phyRxGainByte(7, offset) shl 24))
+    updateReg32(addr mdm.rxGainTable2C088, 0xFFFFFF00'u32,
+                phyRxGainByte(8, offset))
+
+  proc bl808PhyProgramRxTailRegs() =
+    ## phy_init+0x942..0x964: final receive-path RF/AGC writes after
+    ## rc2_config_rxgain and before bba_init.
+    let mdm = wifiModemRegs()
+    updateReg32(cast[ptr uint32](RfBase + 0x26C'u),
+                0xC00FFFFF'u32, 0x05000000'u32)
+    updateReg32(addr mdm.rxTailC018, 0xFFFFFC00'u32, 0x00000050'u32)
+
+  proc bl808MdmSetChannel(primFreq, centerFreq1, chanType: uint32) =
+    let mdm = wifiModemRegs()
+    crm_mdm_reset()
+    if primFreq != 0'u32 and centerFreq1 != 0'u32:
+      let ratio = ((centerFreq1 shl 15) div primFreq) and 0x7FFF'u32
+      updateReg32(addr mdm.phyCtrl84c, 0xFFFF8000'u32, ratio)
+    updateReg32(addr mdm.phyCtrl824, 0xFCFFFFFF'u32, chanType shl 24)
+    updateReg32(cast[ptr uint32](0x24B00310'u),
+                0xFFFCFFFF'u32, chanType shl 16)
+    if chanType == 0'u32:
+      volatileStore(addr mdm.phyCtrl820, 0x0000130D'u32)
+      volatileStore(addr mdm.phyCtrl824, 0x0000010D'u32)
+      volatileStore(addr mdm.phyCtrl830, 0x00001B0F'u32)
+      volatileStore(addr mdm.phyCtrl83c, 0x04920492'u32)
+      volatileStore(addr mdm.phyCtrl840, 0x03310000'u32)
+      volatileStore(addr mdm.phyCtrl860, 0x00007F03'u32)
+      volatileStore(addr mdm.phyCtrl874, 0x08000000'u32)
+      updateReg32(addr mdm.phyCtrl834, 0xFFFFFFFE'u32, 0x00000001'u32)
+      updateReg32(addr mdm.phyCtrl814, not 0x0000A000'u32, 0'u32)
+
+  proc pulsePhyChannelRfWindow() =
+    ## Vendor phy_set_channel pulses this modem register immediately before
+    ## rf_set_channel/rfc_config_channel.
+    let reg = addr wifiModemRegs().phyChannelPulse888
+    volatileStore(reg, 0x00000111'u32)
+    for _ in 0 ..< 10:
+      discard volatileLoad(reg)
+    volatileStore(reg, 0'u32)
+
+  proc phy_mdm_isr*() {.exportc, cdecl.} =
+    let mdm = wifiModemRegs()
+    let status = volatileLoad(addr mdm.intStatusB41c)
+    volatileStore(addr mdm.intAckB420, status)
+    if (status and 0x00000100'u32) != 0'u32:
+      pulsePhyChannelRfWindow()
+
+  proc phy_rc_isr*() {.exportc, cdecl.} =
+    let mdm = wifiModemRegs()
+    let status = volatileLoad(addr mdm.intStatusB41c)
+    volatileStore(addr mdm.intAckB420, status)
+
+  proc phy_get_version*(versionOut: pointer, buf: pointer) {.exportc, cdecl.} =
+    if versionOut != nil:
+      cast[ptr uint32](versionOut)[] = modemVersionReg()
+    if buf != nil:
+      cast[ptr uint32](buf)[] = volatileLoad(addr wifiModemRegs().versionScratch3c)
+
+  proc phy_get_channel_raw*(info: pointer, index: uint8)
+      {.exportc: "phy_get_channel", cdecl.} =
+    discard index
+    if info == nil:
+      return
+    let dst = cast[ptr UncheckedArray[uint32]](info)
+    dst[0] = volatileLoad(phyEnvWord(36'u))
+    dst[1] = volatileLoad(phyEnvWord(40'u))
+
+  proc phy_get_ntx*(): uint8 {.exportc, cdecl.} =
+    (((modemVersionReg() shr 4) and 0xF'u32) - 1'u32).uint8
+
+  proc phy_get_nss*(): uint8 {.exportc, cdecl.} =
+    (((modemVersionReg() shr 8) and 0xF'u32) - 1'u32).uint8
+
+  proc phy_get_nrx*(): uint8 {.exportc, cdecl.} =
+    ((modemVersionReg() and 0xF'u32) - 1'u32).uint8
+
+  proc phy_get_bw*(): uint8 {.exportc, cdecl.} =
+    ((modemVersionReg() shr 24) and 0x3'u32).uint8
+
+  proc phy_vht_supported*(): bool {.exportc, cdecl.} =
+    (modemVersionReg() and (1'u32 shl 16)) != 0
+
+  proc phy_he_supported*(): bool {.exportc, cdecl.} =
+    (modemVersionReg() and (1'u32 shl 20)) != 0
+
+  proc phy_uf_supported*(): bool {.exportc, cdecl.} =
+    false
+
+  proc phy_uf_enable*() {.exportc, cdecl.} =
+    discard
+
+  proc phy_ldpc_tx_supported*(): bool {.exportc, cdecl.} =
+    ## librf_bl808.a:phy.c.o exports LDPC support predicates only; no WiFi
+    ## LDPC memory image is present in the BL808 RF archive.
+    (modemVersionReg() and (1'u32 shl 24)) != 0
+
+  proc phy_ldpc_rx_supported*(): bool {.exportc, cdecl.} =
+    (modemVersionReg() and (1'u32 shl 25)) != 0
+
+  proc phy_bfmee_supported*(): bool {.exportc, cdecl.} =
+    (modemVersionReg() and (1'u32 shl 26)) != 0
+
+  proc phy_bfmer_supported*(): bool {.exportc, cdecl.} =
+    (modemVersionReg() and (1'u32 shl 27)) != 0
+
+  proc phy_mu_mimo_rx_supported*(): bool {.exportc, cdecl.} =
+    (modemVersionReg() and (1'u32 shl 28)) != 0
+
+  proc phy_mu_mimo_tx_supported*(): bool {.exportc, cdecl.} =
+    (modemVersionReg() and (1'u32 shl 31)) != 0
+
+  proc phy_get_rf_gain_idx*(txPowerElem: pointer, rateParam: pointer)
+      {.exportc, cdecl.} =
+    if txPowerElem == nil or rateParam == nil:
+      return
+    var power = cast[ptr int8](txPowerElem)[]
+    if power > 22'i8:
+      power = 22'i8
+    elif power < -10'i8:
+      power = -10'i8
+    cast[ptr int8](txPowerElem)[] = power
+    cast[ptr uint8](rateParam)[] = cast[uint8](power)
+
+  proc phy_get_rf_gain_capab*(maxGain: pointer, minGain: pointer)
+      {.exportc, cdecl.} =
+    if maxGain != nil:
+      cast[ptr int8](maxGain)[] = 22'i8
+    if minGain != nil:
+      cast[ptr int8](minGain)[] = -10'i8
+
+  proc phy_get_antenna_set*(): uint8 {.exportc, cdecl.} =
+    1'u8
+
+  proc phy_switch_antenna_paths*(): uint32 {.exportc, cdecl.} =
+    0'u32
+
+  proc phy_get_channel_switch_dur*(): uint32 {.exportc, cdecl.} =
+    1000'u32
+
+  proc phy_stop*() {.exportc, cdecl.} =
+    discard volatileLoad(cast[ptr uint32](0x24B00038'u))
+
+  proc phy_mdm_reset*() {.exportc, cdecl.} =
+    crm_mdm_reset()
+
+  proc phy_set_aid*(aid: uint16) {.exportc, cdecl.} =
+    let mdm = wifiModemRegs()
+    updateReg32(addr mdm.aid, 0xFFFFF800'u32, aid.uint32 and 0x7FF'u32)
+    volatileStore(addr mdm.aidMaskLo, 0'u32)
+    volatileStore(addr mdm.aidMaskHi, 0x7FF'u32)
+
+  proc phy_set_group_id_info*(membership: pointer, userPosition: pointer)
+      {.exportc, cdecl.} =
+    let mdm = wifiModemRegs()
+    if membership != nil:
+      let src = cast[ptr UncheckedArray[uint32]](membership)
+      volatileStore(addr mdm.groupMembership0, src[0])
+      volatileStore(addr mdm.groupMembership1, src[1])
+    if userPosition != nil:
+      let src = cast[ptr UncheckedArray[uint32]](userPosition)
+      for i in 0 ..< 4:
+        volatileStore(addr mdm.userPosition[i], src[i])
+
+  proc phy_update_power_table*() {.exportc, cdecl.} =
+    trpc_update_power(cast[pointer](volatileLoad(phyEnvByte(37'u)).uint))
+
+  proc phyEnvCenter2Word(channel: ptr ChanCtxtDefView): uint16 {.inline.} =
+    if channel != nil and channel.centerFreq2 == 0'u16:
+      channel.txPower.uint16
+    else:
+      channel.centerFreq2
+
+  when defined(bl808WifiUseBl808Rf):
+    proc rfPriApplyWb03RfcEntryBaseline()
+    proc rfPhyTraceCheckpoint(phase: uint32)
+
+  proc phy_set_channel*(channel: ptr ChanCtxtDefView, force: uint32)
+      {.exportc, cdecl.} =
+    if channel == nil or force != 0'u32:
+      return
+    let bandAndType = volatileLoad(phyEnvHalf(36'u))
+    let currentType = volatileLoad(phyEnvByte(37'u))
+    let currentPrim = volatileLoad(phyEnvHalf(38'u))
+    let currentCenter = volatileLoad(phyEnvHalf(40'u))
+    let currentCenter2 = volatileLoad(phyEnvHalf(42'u))
+    let nextCenter2 = phyEnvCenter2Word(channel)
+    if bandAndType == cast[ptr uint16](channel)[] and
+        currentType == channel.chanType and
+        currentPrim == channel.primFreq and
+        currentCenter == channel.centerFreq1 and
+        currentCenter2 == nextCenter2:
+      return
+    crm_clk_set(channel.chanType.uint32)
+    bl808MdmSetChannel(channel.primFreq.uint32, channel.centerFreq1.uint32,
+                       channel.chanType.uint32)
+    rfc_config_bandwidth(channel.chanType.uint32)
+    when defined(bl808WifiUseBl808Rf):
+      rfPriApplyWb03RfcEntryBaseline()
+      pulsePhyChannelRfWindow()
+    rfc_config_channel(channel.centerFreq1.uint32)
+    when defined(bl808WifiUseBl808Rf):
+      rfPhyTraceCheckpoint(0x41'u32)
+    volatileStore(phyEnvHalf(36'u), cast[ptr uint16](channel)[])
+    volatileStore(phyEnvHalf(38'u), channel.primFreq)
+    volatileStore(phyEnvHalf(40'u), channel.centerFreq1)
+    volatileStore(phyEnvHalf(42'u), nextCenter2)
+    volatileStore(phyEnvHalf(44'u),
+                  channel.txPower.uint16 or (channel.reserved.uint16 shl 8))
+    when defined(bl808WifiUseBl808Rf):
+      rfPhyTraceCheckpoint(0x42'u32)
+    if currentType != channel.chanType:
+      when defined(bl808WifiUseBl808Rf):
+        rfPhyTraceCheckpoint(0x43'u32)
+      trpc_update_power(cast[pointer](channel.chanType.uint))
+      when defined(bl808WifiUseBl808Rf):
+        rfPhyTraceCheckpoint(0x44'u32)
+
+  proc phyInitValidateClock() =
+    ## phy_init+0x16..0x52: CRM setup and clock-count assert.
+    crm_init()
+    let version = modemVersionReg()
+    let clkCount = phyClockCountFromVersion(version)
+    if clkCount != 32'u32:
+      wrapPhyAssertErr("clk_cnt", "phy.c", 586)
+
+  proc phyInitProgramBasebandAndAgc() =
+    ## phy_init+0x5a..0x938: modem-derived baseband fields, AGC memory copy,
+    ## and the recovered AGC core table.
+    crm_mdm_reset()
+    bl808PhyProgramRecoveredRegs()
+    copyAgcMemory()
+    bl808PhyProgramAgcCopyTailRegs()
+    bl808PhyProgramAgcCoreRegs()
+
+  proc phyInitProgramReceiveTail() =
+    ## phy_init+0x93c..0x964 plus BBA/TRPC setup.
+    rc2_config_rxgain(0'i8)
+    bl808PhyProgramRxTailRegs()
+    bba_init()
+    trpc_init()
+
+  proc phyInitProgramInitialChannel() =
+    ## phy_init channel tail: initialize 20 MHz channel-1 modem/RF state and
+    ## mirror it into phy_env.
+    crm_clk_set(0'u32)
+    var initial = ChanCtxtDefView(
+      band: 1'u8,
+      chanType: 0'u8,
+      primFreq: 2412'u16,
+      centerFreq1: 2412'u16,
+      centerFreq2: 0'u16,
+      txPower: 0xFF'u8,
+      reserved: 0x0F'u8)
+    bl808MdmSetChannel(initial.primFreq.uint32, initial.centerFreq1.uint32,
+                       initial.chanType.uint32)
+    rfc_config_bandwidth(0'u32)
+    when defined(bl808WifiUseBl808Rf):
+      rfPriApplyWb03RfcEntryBaseline()
+      pulsePhyChannelRfWindow()
+    rfc_config_channel(initial.centerFreq1.uint32)
+    trpc_update_power(nil)
+    volatileStore(phyEnvHalf(36'u), cast[ptr uint16](addr initial)[])
+    volatileStore(phyEnvHalf(38'u), initial.primFreq)
+    volatileStore(phyEnvHalf(40'u), initial.centerFreq1)
+    volatileStore(phyEnvHalf(42'u), phyEnvCenter2Word(addr initial))
+    volatileStore(phyEnvHalf(44'u),
+                  initial.txPower.uint16 or (initial.reserved.uint16 shl 8))
+
+  proc phy_init*(cfg: pointer) {.exportc, cdecl.} =
+    phyInitValidateClock()
+    phyInitProgramBasebandAndAgc()
+    phyInitProgramReceiveTail()
+    phyInitProgramInitialChannel()
+    copyPhyInitCfg(cfg)
+
+  var wlCalGlobal* {.exportc: "wl_cal".}: pointer
+  var wlEnvGlobal* {.exportc: "wl_env".}: pointer
+  var rfCalibDataGlobal* {.exportc: "rf_calib_data".}: pointer
+  var wifiBl808WlRmem {.align: 4.}: WlRfMemoryOverlay
+  var wifiBl808RfInited: uint32
+
+  var trpcTxpwrVsRateTable* {.exportc: "txpwr_vs_rate_table".}: array[50, uint8] = [
+    0x15'u8, 0x15'u8, 0x15'u8, 0x15'u8, 0x00'u8, 0x00'u8, 0x00'u8, 0x00'u8, 0x00'u8, 0x00'u8,
+    0x14'u8, 0x14'u8, 0x14'u8, 0x14'u8, 0x14'u8, 0x14'u8, 0x12'u8, 0x12'u8, 0x00'u8, 0x00'u8,
+    0x14'u8, 0x14'u8, 0x14'u8, 0x14'u8, 0x13'u8, 0x13'u8, 0x11'u8, 0x11'u8, 0x00'u8, 0x00'u8,
+    0x12'u8, 0x12'u8, 0x12'u8, 0x12'u8, 0x12'u8, 0x10'u8, 0x10'u8, 0x10'u8, 0x10'u8, 0x10'u8,
+    0x14'u8, 0x14'u8, 0x14'u8, 0x14'u8, 0x13'u8, 0x13'u8, 0x11'u8, 0x11'u8, 0x0F'u8, 0x0F'u8]
+
+  proc trpcCopyTable(dstOffset: int, src: pointer, count: int) =
+    if src == nil:
+      return
+    let bytes = cast[ptr UncheckedArray[uint8]](src)
+    for i in 0 ..< count:
+      trpcTxpwrVsRateTable[dstOffset + i] = bytes[i]
+
+  proc trpcCopyFromWlCfg(dstOffset: int, cfgOffset: uint, count: int) =
+    if wlCfgGlobal == nil:
+      return
+    trpcCopyTable(dstOffset, cast[pointer](cast[uint](wlCfgGlobal) + cfgOffset), count)
+
+  proc trpcCopyTableOut(dst: pointer, srcOffset: int, count: int) =
+    if dst == nil:
+      return
+    let bytes = cast[ptr UncheckedArray[uint8]](dst)
+    for i in 0 ..< count:
+      bytes[i] = trpcTxpwrVsRateTable[srcOffset + i]
+
+  proc trpc_power_get*(powerTable: pointer) {.exportc, cdecl.} =
+    ## Local replacement for the missing archive symbol used by bl_tpc_power_table_get.
+    ## phy_trpc.c.o keeps 50 rate bytes; callers request the rate-power prefix.
+    trpcCopyTableOut(powerTable, 0, 38)
+
+  proc trpc_update_power_11b*(powerTable: pointer) {.exportc, cdecl.} =
+    ## librf_bl808.a:phy_trpc.c.o trpc_update_power_11b+0x0..0x1a.
+    trpcCopyTable(0, powerTable, 4)
+
+  proc trpc_update_power_11g*(powerTable: pointer) {.exportc, cdecl.} =
+    ## librf_bl808.a:phy_trpc.c.o trpc_update_power_11g+0x0..0x20.
+    trpcCopyTable(10, powerTable, 8)
+
+  proc trpc_update_power_11n*(powerTable: pointer) {.exportc, cdecl.} =
+    ## librf_bl808.a:phy_trpc.c.o trpc_update_power_11n+0x0..0x20.
+    trpcCopyTable(20, powerTable, 8)
+
+  proc trpc_update_power_11ac*(powerTable: pointer) {.exportc, cdecl.} =
+    ## librf_bl808.a:phy_trpc.c.o trpc_update_power_11ac+0x0..0x20.
+    trpcCopyTable(30, powerTable, 10)
+
+  proc trpc_update_power_11ax*(powerTable: pointer) {.exportc, cdecl.} =
+    ## librf_bl808.a:phy_trpc.c.o trpc_update_power_11ax+0x0..0x20.
+    trpcCopyTable(40, powerTable, 10)
+
+  proc trpc_update_power*(powerTable: pointer) {.exportc, cdecl.} =
+    ## librf_bl808.a:phy_trpc.c.o trpc_update_power+0x0..0xe4.
+    ## The argument is a channel-type selector: nil uses the 20 MHz WL config
+    ## rows; non-nil uses the alternate rows at 0x46 and 0x78.
+    trpcCopyFromWlCfg(0, 0x32'u, 4)
+    trpcCopyFromWlCfg(10, 0x36'u, 8)
+    if powerTable == nil:
+      trpcCopyFromWlCfg(20, 0x3E'u, 8)
+      trpcCopyFromWlCfg(30, 0x6C'u, 10)
+      trpcCopyFromWlCfg(40, 0x6C'u, 10)
+    else:
+      trpcCopyFromWlCfg(20, 0x46'u, 8)
+      trpcCopyFromWlCfg(30, 0x78'u, 10)
+      trpcCopyFromWlCfg(40, 0x78'u, 10)
+
+  proc trpc_init() {.exportc, cdecl.} =
+    ## librf_bl808.a:phy_trpc.c.o trpc_init is ret-only.
+    discard
+
+  proc trpc_get_default_power_idx(rateType: uint32, rateIdx: uint8): int8
+      {.exportc: "trpc_get_default_power_idx", cdecl.} =
+    ## librf_bl808.a:phy_trpc.c.o trpc_get_default_power_idx+0x0..0x1a.
+    let idx = int(rateType) * 10 + int(rateIdx)
+    if idx < 0 or idx >= trpcTxpwrVsRateTable.len:
+      return 0'i8
+    cast[int8]((trpcTxpwrVsRateTable[idx] shl 2) and 0xFC'u8)
+
+  proc trpc_get_power_idx(powerTable: pointer, rateType: uint32, powerIdx: uint8): int8
+      {.exportc: "trpc_get_power_idx", cdecl.} =
+    ## librf_bl808.a:phy_trpc.c.o trpc_get_power_idx ignores its table/rate args.
+    discard powerTable
+    discard rateType
+    cast[int8]((powerIdx shl 2) and 0xFC'u8)
+
+  proc wlCfgSetU32(offset: int, value: uint32) =
+    if wlCfgGlobal == nil:
+      return
+    let bytes = cast[ptr UncheckedArray[uint8]](wlCfgGlobal)
+    bytes[offset] = uint8(value and 0xFF'u32)
+    bytes[offset + 1] = uint8((value shr 8) and 0xFF'u32)
+    bytes[offset + 2] = uint8((value shr 16) and 0xFF'u32)
+    bytes[offset + 3] = uint8((value shr 24) and 0xFF'u32)
+
+  proc wlCfgSetBytes(offset: int, value: uint8, count: int) =
+    if wlCfgGlobal == nil:
+      return
+    let bytes = cast[ptr UncheckedArray[uint8]](wlCfgGlobal)
+    for idx in 0 ..< count:
+      bytes[offset + idx] = value
+
+  proc seedWlCfgTxPowerDefaults() =
+    ## These rows are the vendor wl_cfg backing store that trpc_update_power()
+    ## copies into txpwr_vs_rate_table. A zeroed wl_cfg makes internal auth
+    ## frames inherit TX power 0, while the vendor backend seeds 0x1c -> 0x70.
+    wlCfgSetBytes(WlRfCfgPower11bOffset, WlRfCfgDefaultRatePower, 4)
+    wlCfgSetBytes(WlRfCfgPower11gOffset, WlRfCfgDefaultRatePower, 8)
+    wlCfgSetBytes(WlRfCfgPower11n20Offset, WlRfCfgDefaultRatePower, 8)
+    wlCfgSetBytes(WlRfCfgPower11nAltOffset, WlRfCfgDefaultRatePower, 8)
+    wlCfgSetBytes(WlRfCfgPower11ac20Offset, WlRfCfgDefaultRatePower, 10)
+    wlCfgSetBytes(WlRfCfgPower11acAltOffset, WlRfCfgDefaultRatePower, 10)
+
+  proc wl_rf_cfg_init*() {.exportc, cdecl.} =
+    let cfg = cast[ptr WlRfConfig](wlCfgGlobal)
+    if cfg == nil:
+      return
+    seedWlCfgTxPowerDefaults()
+    cfg.priWordC0 = 0x02000000'u32
+    cfg.priWordC4 = 0x80808001'u32
+    cfg.priHalfBE = 0'u16
+    for item in cfg.priZeroA1.mitems:
+      item = 0'u8
+    for item in cfg.priZeroA2.mitems:
+      item = 0'u8
+    if Bl808WifiRfDeviceInfo == int(Bl808RfDeviceInfoWb03):
+      # Vendor RF RXCAL reads raw wl_cfg+0xA8/+0xAC and uses them to program
+      # RF70/RF1600. These bytes overlap the channel-comp table at wl_cfg+0xA1.
+      wlCfgSetU32(WlRfCfgRxcalA8Offset, WlRfCfgWb03RxcalA8Default)
+      wlCfgSetU32(WlRfCfgRxcalAcOffset, WlRfCfgWb03RxcalAcDefault)
+    cfg.priWord10 = 0x096C0100'u32
+    cfg.priWord14 = 0x098A097B'u32
+    cfg.priWord18 = 0x09A80999'u32
+    cfg.priByteBD = 35'u8
+    for item in cfg.priZeroWords.mitems:
+      item = 0'u32
+    cfg.priHalf30 = 0'u16
+    cfg.priByte9C = 20'u8
+
+  proc wl_cfg_get(rmem: ptr WlRfMemoryOverlay): ptr WlRfConfig {.exportc, cdecl.} =
+    if rmem == nil:
+      wlCfgGlobal = nil
+      wlCalGlobal = nil
+      wlEnvGlobal = nil
+      rfCalibDataGlobal = nil
+      return nil
+    wlCfgGlobal = cast[pointer](addr rmem.config)
+    wlCalGlobal = cast[pointer](addr rmem.calib[0])
+    wlEnvGlobal = cast[pointer](addr rmem.env[0])
+    rfCalibDataGlobal = wlCalGlobal
+    if rmem.config.status != WlRfConfigMagic:
+      rmem.config.xtalfreqHz = 40_000_000'u32
+      rmem.config.xtalCap = 0x2020'u16
+      rmem.config.capcodeGet = nil
+      rmem.config.capcodeSet = nil
+    wl_rf_cfg_init()
+    addr rmem.config
+
+  proc wl_rmem_size_get*(): uint32 {.exportc, cdecl.} =
+    sizeof(WlRfMemoryOverlay).uint32
+
+  proc wl_env_get*(rmem: ptr WlRfMemoryOverlay): pointer {.exportc, cdecl.} =
+    if rmem == nil:
+      wlCfgGlobal = nil
+      wlCalGlobal = nil
+      wlEnvGlobal = nil
+      rfCalibDataGlobal = nil
+      return nil
+    wlCfgGlobal = cast[pointer](addr rmem.config)
+    wlCalGlobal = cast[pointer](addr rmem.calib[0])
+    wlEnvGlobal = cast[pointer](addr rmem.env[0])
+    rfCalibDataGlobal = wlCalGlobal
+    wlEnvGlobal
+
+  type
+    RfPriCalState = object
+      words: array[RfPriCalSavedRegs.len, uint32]
+
+  var
+    bl808RfXtalIndex: uint32
+    bl808RfMode: RadioPhyMode
+    bl808RfColdInit: uint32
+    bl808RfChannelMhz: uint32
+    bl808RfBandwidthMhz: uint32
+    bl808RfChannelPowerIndex: uint32
+    bl808RfChannelPowerComp: array[14, int16]
+    bl808RfChannelLpPowerComp: array[14, int16]
+    bl808RfTotalPowerComp: int16
+    bl808RfAppliedPowerComp: int16
+    bl808RfTempPowerComp: int16
+    bl808RfTxGainComp: int16
+    bl808RfEfuseCapComp: int16
+    bl808RfEfusePowerComp: int16
+    bl808RfDeviceBl616: uint8
+    bl808RfDeviceWb03: uint8
+    bl808RfDeviceBl618m: uint8
+    bl808RfDeviceInfoSet: uint8
+
+  proc rf_pri_input_device_info(deviceInfo: uint32) {.exportc, cdecl.} =
+    ## Vendor rf_pri_input_device_info clears the three device flags, then
+    ## maps 0 -> bl616, 1 -> wb03, 2 -> bl618m.
+    bl808RfDeviceBl616 = 0
+    bl808RfDeviceWb03 = 0
+    bl808RfDeviceBl618m = 0
+    case deviceInfo
+    of Bl808RfDeviceInfoBl616:
+      bl808RfDeviceBl616 = 1
+    of Bl808RfDeviceInfoWb03:
+      bl808RfDeviceWb03 = 1
+    of Bl808RfDeviceInfoBl618m:
+      bl808RfDeviceBl618m = 1
+    else:
+      discard
+    bl808RfDeviceInfoSet = 1
+
+  proc rfPriLoadConfiguredDeviceInfo() =
+    rf_pri_input_device_info(uint32(Bl808WifiRfDeviceInfo))
+
+  proc rfPriDeviceInfoValid(): bool {.inline.} =
+    (bl808RfDeviceBl616 or bl808RfDeviceWb03 or bl808RfDeviceBl618m) != 0
+
+  proc rfPriEnsureDeviceInfo() =
+    if bl808RfDeviceInfoSet == 0 or not rfPriDeviceInfoValid():
+      rf_pri_input_device_info(uint32(Bl808WifiRfDeviceInfo))
+
+  proc rfPriIsWb03(): bool {.inline.} =
+    if bl808RfDeviceInfoSet != 0:
+      bl808RfDeviceWb03 != 0
+    else:
+      Bl808WifiRfDeviceInfo == int(Bl808RfDeviceInfoWb03)
+
+  proc rfPhyTraceCheckpoint(phase: uint32) =
+    let idx = int(nimFwDbgRfPhyTraceCount and uint32(NimFwDbgRfPhyTraceLen - 1))
+    inc nimFwDbgRfPhyTraceCount
+    nimFwDbgRfPhyTracePhase[idx] = phase
+    nimFwDbgRfPhyTraceDevice[idx] =
+      uint32(rfPriIsWb03()) or
+      (bl808RfDeviceBl616.uint32 shl 4) or
+      (bl808RfDeviceBl618m.uint32 shl 8) or
+      ((bl808RfXtalIndex and 0xFF'u32) shl 16)
+    nimFwDbgRfPhyTraceChanMeta[idx] =
+      volatileLoad(phyEnvWord(36'u))
+    nimFwDbgRfPhyTraceChanFreq[idx] =
+      volatileLoad(phyEnvHalf(38'u)).uint32 or
+      (volatileLoad(phyEnvHalf(40'u)).uint32 shl 16)
+    nimFwDbgRfPhyTraceRf2c[idx] = readReg32(RfSynthCtrlReg)
+    nimFwDbgRfPhyTraceRf04[idx] = readReg32(RfCtrlReg)
+    nimFwDbgRfPhyTraceRf34[idx] = readReg32(RfPriTrace34Reg)
+    nimFwDbgRfPhyTraceRf40[idx] = readReg32(RfPriTrace40Reg)
+    nimFwDbgRfPhyTraceRf4c[idx] = readReg32(RfPriTrace4cReg)
+    nimFwDbgRfPhyTraceRf70[idx] = readReg32(RfTxcalParamReg)
+    nimFwDbgRfPhyTraceRf74[idx] = readReg32(RfTxcalParam01Reg)
+    nimFwDbgRfPhyTraceRf88[idx] = readReg32(RfPriTxcalDfeReg)
+    nimFwDbgRfPhyTraceRf90[idx] = readReg32(RfPriInit90Reg)
+    nimFwDbgRfPhyTraceRfa0[idx] = readReg32(RfFcalCtrlReg)
+    nimFwDbgRfPhyTraceRfa4[idx] = readReg32(RfAcalCtrlReg)
+    nimFwDbgRfPhyTraceRfbc[idx] = readReg32(RfPriConfigBcReg)
+    nimFwDbgRfPhyTraceRfd0[idx] = readReg32(RfOptimizeReg)
+    nimFwDbgRfPhyTraceRf80[idx] = readReg32(RfRbbRccalReg)
+    nimFwDbgRfPhyTraceRf84[idx] = readReg32(RfPriTrace84Reg)
+    nimFwDbgRfPhyTraceRf8c[idx] = readReg32(RfPriInit8cReg)
+    nimFwDbgRfPhyTraceRfb4[idx] = readReg32(RfPriConfigB4Reg)
+    nimFwDbgRfPhyTraceRf1600[idx] = readReg32(RfTxcalTosdacReg)
+    nimFwDbgRfPhyTraceRf1614[idx] = readReg32(RfPriRxcalSearchReg)
+    nimFwDbgRfPhyTraceRf1618[idx] = readReg32(RfMeasureCtrlReg)
+    nimFwDbgRfPhyTraceRf162c[idx] = readReg32(RfPriTrace162cReg)
+    nimFwDbgRfPhyTraceRf1680[idx] = readReg32(RfPriTrace1680Reg)
+    nimFwDbgRfPhyTraceRf113c[idx] = readReg32(RfPriTrace113cReg)
+    let mdm = wifiModemRegs()
+    nimFwDbgRfPhyTracePhy820[idx] = volatileLoad(addr mdm.phyCtrl820)
+    nimFwDbgRfPhyTracePhy824[idx] = volatileLoad(addr mdm.phyCtrl824)
+    nimFwDbgRfPhyTracePhy830[idx] = volatileLoad(addr mdm.phyCtrl830)
+    nimFwDbgRfPhyTracePhy874[idx] = volatileLoad(addr mdm.phyCtrl874)
+    nimFwDbgRfPhyTraceRxCtrl[idx] = regRead(MACHW_RX_CNTRL_REG)
+    nimFwDbgRfPhyTraceIrqRaw[idx] = regRead(0x24B0806C'u)
+    nimFwDbgRfPhyTraceGenRaw[idx] = regRead(0x24B08084'u)
+    nimFwDbgRfPhyTraceHd[idx] = machwRxHdSubmittedHead()
+    nimFwDbgRfPhyTracePd[idx] = machwRxPdSubmittedHead()
+    nimFwDbgRfPhyTraceHwHd[idx] = machwRxHwHdHead()
+    nimFwDbgRfPhyTraceHwPd[idx] = machwRxHwPdHead()
+
+  proc rfPriTracePhase(base: uint32): uint32 {.inline.} =
+    base or (uint32(rfPriIsWb03()) shl 8) or
+      (bl808RfDeviceBl616.uint32 shl 12) or
+      (bl808RfDeviceBl618m.uint32 shl 16) or
+      (bl808RfXtalIndex and 0xFF'u32)
+
+  const
+    RfPriStageSnapshotEntries {.intdefine.} = 8
+
+  var nim_wifi_rf_stage_snapshot_count* {.exportc.}: uint32
+  var nim_wifi_rf_stage_tag_log* {.exportc.}: array[RfPriStageSnapshotEntries, uint32]
+  var nim_wifi_rf_stage_rf4c_log* {.exportc.}: array[RfPriStageSnapshotEntries, uint32]
+  var nim_wifi_rf_stage_rf70_log* {.exportc.}: array[RfPriStageSnapshotEntries, uint32]
+  var nim_wifi_rf_stage_rf7c_log* {.exportc.}: array[RfPriStageSnapshotEntries, uint32]
+  var nim_wifi_rf_stage_rf80_log* {.exportc.}: array[RfPriStageSnapshotEntries, uint32]
+  var nim_wifi_rf_stage_rf88_log* {.exportc.}: array[RfPriStageSnapshotEntries, uint32]
+  var nim_wifi_rf_stage_rfa0_log* {.exportc.}: array[RfPriStageSnapshotEntries, uint32]
+  var nim_wifi_rf_stage_rfd0_log* {.exportc.}: array[RfPriStageSnapshotEntries, uint32]
+  var nim_wifi_rf_stage_rf1600_log* {.exportc.}: array[RfPriStageSnapshotEntries, uint32]
+  var nim_wifi_rf_stage_rf162c_log* {.exportc.}: array[RfPriStageSnapshotEntries, uint32]
+  var nim_wifi_rf_stage_rfb0_log* {.exportc.}: array[RfPriStageSnapshotEntries, uint32]
+  var nim_wifi_rf_stage_rfb4_log* {.exportc.}: array[RfPriStageSnapshotEntries, uint32]
+  var nim_wifi_rf_stage_rfbc_log* {.exportc.}: array[RfPriStageSnapshotEntries, uint32]
+  var nim_wifi_rf_optimize_count* {.exportc.}: uint32
+  var nim_wifi_rf_optimize_channel_log* {.exportc.}: array[RfPriStageSnapshotEntries, uint32]
+  var nim_wifi_rf_optimize_device_log* {.exportc.}: array[RfPriStageSnapshotEntries, uint32]
+  var nim_wifi_rf_optimize_rfd0_log* {.exportc.}: array[RfPriStageSnapshotEntries, uint32]
+  var nim_wifi_rf_optimize_rf70_log* {.exportc.}: array[RfPriStageSnapshotEntries, uint32]
+  var nim_wifi_rf_optimize_nibble_log* {.exportc.}: array[RfPriStageSnapshotEntries, uint32]
+
+  var nim_wifi_rf_breakpoint_tag* {.exportc.}: uint32
+  var nim_wifi_rf_breakpoint_count* {.exportc.}: uint32
+
+  proc nim_wifi_rf_stage_breakpoint*(tag: uint32)
+      {.exportc, cdecl, noinline.} =
+    ## JTAG anchor for RF/PHY bring-up. Hardware validation can break here and
+    ## inspect RF70/RF88/RFD0 without relying on local static proc symbols.
+    nim_wifi_rf_breakpoint_tag = tag
+    inc nim_wifi_rf_breakpoint_count
+
+  proc nim_wifi_rf_fixed_val_breakpoint*()
+      {.exportc, cdecl, noinline.} =
+    nim_wifi_rf_stage_breakpoint(0xF100'u32)
+
+  proc nim_wifi_rf_pri_init_entry_breakpoint*()
+      {.exportc, cdecl, noinline.} =
+    nim_wifi_rf_stage_breakpoint(0xF400'u32)
+
+  proc rfPriSnapshotStage(tag: uint32) =
+    nim_wifi_rf_stage_breakpoint(tag)
+    let idx = int(nim_wifi_rf_stage_snapshot_count mod
+      uint32(RfPriStageSnapshotEntries))
+    inc nim_wifi_rf_stage_snapshot_count
+    nim_wifi_rf_stage_tag_log[idx] = tag
+    nim_wifi_rf_stage_rf4c_log[idx] =
+      volatileLoad(cast[ptr uint32](0x2000104C'u.uint))
+    nim_wifi_rf_stage_rf70_log[idx] =
+      volatileLoad(cast[ptr uint32](RfPriInit70Reg.uint))
+    nim_wifi_rf_stage_rf7c_log[idx] =
+      volatileLoad(cast[ptr uint32](0x2000107C'u.uint))
+    nim_wifi_rf_stage_rf80_log[idx] =
+      volatileLoad(cast[ptr uint32](0x20001080'u.uint))
+    nim_wifi_rf_stage_rf88_log[idx] =
+      volatileLoad(cast[ptr uint32](RfPriTxcalDfeReg.uint))
+    nim_wifi_rf_stage_rfa0_log[idx] =
+      volatileLoad(cast[ptr uint32](0x200010A0'u.uint))
+    nim_wifi_rf_stage_rfd0_log[idx] =
+      volatileLoad(cast[ptr uint32](RfOptimizeReg.uint))
+    nim_wifi_rf_stage_rf1600_log[idx] =
+      volatileLoad(cast[ptr uint32](0x20001600'u.uint))
+    nim_wifi_rf_stage_rf162c_log[idx] =
+      volatileLoad(cast[ptr uint32](0x2000162C'u.uint))
+    nim_wifi_rf_stage_rfb0_log[idx] =
+      volatileLoad(cast[ptr uint32](RfPriConfigB0Reg.uint))
+    nim_wifi_rf_stage_rfb4_log[idx] =
+      volatileLoad(cast[ptr uint32](RfPriConfigB4Reg.uint))
+    nim_wifi_rf_stage_rfbc_log[idx] =
+      volatileLoad(cast[ptr uint32](RfPriConfigBcReg.uint))
+
+  proc writeRfPriFixedValInit() =
+    ## Port of librf_bl808.a:rf_pri.c.o rf_pri_fixed_val_regs.
+    nim_wifi_rf_fixed_val_breakpoint()
+    rfPriSnapshotStage(0xF100'u32)
+    rfPhyTraceCheckpoint(rfPriTracePhase(0x1C00'u32))
+    rfPhyTraceCheckpoint(rfPriTracePhase(0x1D00'u32))
+    writeRadioRegMaskInit(RfPriFixedValPrefixInit)
+    rfPriSnapshotStage(0xF101'u32)
+    if rfPriIsWb03():
+      updateReg32(cast[ptr uint32](RfPriInitF814Reg.uint),
+                  0xFFFFFFE0'u32, 0x00000015'u32)
+      updateReg32(cast[ptr uint32](RfAcalCtrlReg.uint),
+                  0xDFFFFFFF'u32, 0x00000000'u32)
+    else:
+      updateReg32(cast[ptr uint32](RfPriInitF814Reg.uint),
+                  0xFFFFFFE0'u32, 0x0000001B'u32)
+      updateReg32(cast[ptr uint32](RfAcalCtrlReg.uint),
+                  0xFFFFFFFF'u32, 0x20000000'u32)
+    rfPhyTraceCheckpoint(0x1E'u32)
+    writeRadioRegMaskInit(RfPriFixedValSuffixInit)
+    rfPriSnapshotStage(0xF102'u32)
+    rfPhyTraceCheckpoint(0x1F'u32)
+    rfPhyTraceCheckpoint(0x20'u32)
+
+  proc rfPriApplyWb03RuntimeLatches() =
+    if rfPriIsWb03():
+      updateReg32(cast[ptr uint32](RfPriInit90Reg.uint),
+                  0xFFFFFFFF'u32, 0x00010000'u32)
+      updateReg32(cast[ptr uint32](RfPriTxcalDfeReg.uint),
+                  0xFFFFFFFF'u32, 0x00010000'u32)
+      updateReg32(cast[ptr uint32](RfAcalCtrlReg.uint),
+                  0xFFFFFFFF'u32, 0x00000100'u32)
+
+  var nim_wifi_rf_pri_txcal_count* {.exportc.}: uint32
+  var nim_wifi_rf_pri_lo_fcal_count* {.exportc.}: uint32
+  var nim_wifi_rf_pri_lo_acal_count* {.exportc.}: uint32
+  var nim_wifi_rf_pri_roscal_count* {.exportc.}: uint32
+  var nim_wifi_rf_pri_rccal_count* {.exportc.}: uint32
+  var nim_wifi_rf_pri_rxcal_count* {.exportc.}: uint32
+  var nim_wifi_rf_fcal_wait_timeout_count* {.exportc.}: uint32
+  var nim_wifi_rf_roscal_wait_timeout_count* {.exportc.}: uint32
+  var nim_wifi_rf_rccal_wait_timeout_count* {.exportc.}: uint32
+  var nim_wifi_rf_txcal_wait_timeout_count* {.exportc.}: uint32
+  var nim_wifi_rf_rxcal_wait_timeout_count* {.exportc.}: uint32
+  var nim_wifi_rf_config_channel_wait_timeout_count* {.exportc.}: uint32
+  var nim_wifi_rf_txcal_search_count* {.exportc.}: uint32
+  var nim_wifi_rf_txcal_amp_search_count* {.exportc.}: uint32
+  var nim_wifi_rf_rxcal_search_count* {.exportc.}: uint32
+  var nim_wifi_rf_last_roscal_i* {.exportc.}: uint32
+  var nim_wifi_rf_last_roscal_q* {.exportc.}: uint32
+  var nim_wifi_rf_last_rccal_code* {.exportc.}: uint32
+  var nim_wifi_rf_last_rccal_baseline* {.exportc.}: uint32
+  var nim_wifi_rf_last_rccal_target* {.exportc.}: uint32
+  var nim_wifi_rf_last_rccal_power* {.exportc.}: uint32
+  var nim_wifi_rf_last_lo_fcal* {.exportc.}: uint32
+  var nim_wifi_rf_last_lo_acal* {.exportc.}: uint32
+  var nim_wifi_rf_last_txcal_word0* {.exportc.}: uint32
+  var nim_wifi_rf_last_txcal_word1* {.exportc.}: uint32
+  var nim_wifi_rf_last_txcal_amp* {.exportc.}: uint32
+  var nim_wifi_rf_last_txcal_amp_mean* {.exportc.}: uint32
+  var nim_wifi_rf_last_txcal_tmxcs* {.exportc.}: uint32
+  var nim_wifi_rf_last_txcal_tmxcs_power* {.exportc.}: uint32
+  var nim_wifi_rf_last_rxcal_word0* {.exportc.}: uint32
+  var nim_wifi_rf_last_rxcal_word1* {.exportc.}: uint32
+  var nim_wifi_rf_last_rxcal_power* {.exportc.}: uint32
+  var nim_wifi_rf_last_config_channel_index* {.exportc.}: uint32
+  var nim_wifi_rf_last_config_channel_status* {.exportc.}: uint32
+  var nim_wifi_rf_last_config_channel_fcal* {.exportc.}: uint32
+  var nim_wifi_rf_last_config_channel_acal* {.exportc.}: uint32
+  var nim_wifi_rf_last_config_channel_sdm2* {.exportc.}: uint32
+  var nim_wifi_rf_last_config_channel_b8* {.exportc.}: uint32
+  var nim_wifi_rf_last_config_channel_b0* {.exportc.}: uint32
+  var nim_wifi_rf_txcal_word0_log* {.exportc.}: array[RfPriTxcalSearchRecords, uint32]
+  var nim_wifi_rf_txcal_word1_log* {.exportc.}: array[RfPriTxcalSearchRecords, uint32]
+  var nim_wifi_rf_txcal_power_log* {.exportc.}: array[RfPriTxcalSearchRecords, uint32]
+  var nim_wifi_rf_txcal_amp_log* {.exportc.}: array[RfPriTxcalSearchRecords, uint32]
+  var nim_wifi_rf_txcal_tmxcs_power_log* {.exportc.}: array[RfTxcalMixerCsCount, uint32]
+  var nim_wifi_rf_txcal_sample_count* {.exportc.}: uint32
+  var nim_wifi_rf_txcal_sample_param_log* {.exportc.}: array[RfTxcalSampleTraceEntries, uint32]
+  var nim_wifi_rf_txcal_sample_candidate_log* {.exportc.}: array[RfTxcalSampleTraceEntries, uint32]
+  var nim_wifi_rf_txcal_sample_freq_log* {.exportc.}: array[RfTxcalSampleTraceEntries, uint32]
+  var nim_wifi_rf_txcal_sample_ctrl_log* {.exportc.}: array[RfTxcalSampleTraceEntries, uint32]
+  var nim_wifi_rf_txcal_sample_i_log* {.exportc.}: array[RfTxcalSampleTraceEntries, uint32]
+  var nim_wifi_rf_txcal_sample_q_log* {.exportc.}: array[RfTxcalSampleTraceEntries, uint32]
+  var nim_wifi_rf_txcal_sample_power_log* {.exportc.}: array[RfTxcalSampleTraceEntries, uint32]
+  var nim_wifi_rf_rxcal_word0_log* {.exportc.}: array[4, uint32]
+  var nim_wifi_rf_rxcal_word1_log* {.exportc.}: array[4, uint32]
+  var nim_wifi_rf_rxcal_power_log* {.exportc.}: array[4, uint32]
+  var nim_wifi_rf_bz_txcal_snapshot_count* {.exportc.}: uint32
+  var nim_wifi_rf_bz_txcal_snapshot_tag* {.exportc.}: uint32
+  var nim_wifi_rf_bz_txcal_word0_log* {.exportc.}: array[9, uint32]
+  var nim_wifi_rf_bz_txcal_word1_log* {.exportc.}: array[9, uint32]
+  var nim_wifi_rf_bz_txcal_ok_mask_log* {.exportc.}: array[9, uint32]
+  var nim_wifi_rf_bz_txcal_power_log* {.exportc.}: array[9, uint32]
+  var nim_wifi_rf_bz_txcal_rf48_log* {.exportc.}: array[8, uint32]
+  var nim_wifi_rf_bz_txcal_rf4c_log* {.exportc.}: array[8, uint32]
+  var nim_wifi_rf_bz_txcal_rf88_log* {.exportc.}: array[8, uint32]
+  var nim_wifi_rf_bz_txcal_rf1600_log* {.exportc.}: array[8, uint32]
+  var nim_wifi_rf_bz_txcal_rf162c_log* {.exportc.}: array[8, uint32]
+  var nim_wifi_rf_bz_txcal_tag_log* {.exportc.}: array[8, uint32]
+  var nim_wifi_rf_roscal_search_log* {.exportc.}: array[16, uint32]
+  var nim_wifi_rf_fcal_search_log* {.exportc.}: array[16, uint32]
+  var nim_wifi_rf_rccal_search_log* {.exportc.}: array[32, uint32]
+  var nim_wifi_rf_rccal_power_log* {.exportc.}: array[32, uint32]
+
+  proc rfRegRead(regAddr: uint32): uint32 {.inline.} =
+    volatileLoad(cast[ptr uint32](regAddr.uint))
+
+  proc rfRegWrite(regAddr, value: uint32) {.inline.} =
+    volatileStore(cast[ptr uint32](regAddr.uint), value)
+
+  proc rfRegOr(regAddr, mask: uint32) {.inline.} =
+    rfRegWrite(regAddr, rfRegRead(regAddr) or mask)
+
+  proc rfRegClear(regAddr, mask: uint32) {.inline.} =
+    rfRegWrite(regAddr, rfRegRead(regAddr) and not mask)
+
+  proc rfRegUpdate(regAddr, mask, value: uint32) {.inline.} =
+    rfRegWrite(regAddr, (rfRegRead(regAddr) and not mask) or (value and mask))
+
+  proc rfPriApplyWb03RxcalTosdacLatch() =
+    if not rfPriIsWb03() or
+        bl808RfXtalIndex != xtalIndex(WlXtal40M):
+      return
+    rfRegWrite(RfTxcalTosdacReg,
+               (rfRegRead(RfTxcalTosdacReg) and
+                not RfPriWb03RxcalTosdacReplayMask) or
+               (RfPriWb03RxcalTosdacSeed and
+                RfPriWb03RxcalTosdacReplayMask))
+
+  proc rfSignedByte(value: uint8): int16 {.inline.} =
+    cast[int8](value).int16
+
+  proc rfSignExtend16(value: int32): int16 {.inline.} =
+    cast[int16](uint16(value and 0xFFFF'i32))
+
+  proc rfCalibWord(index: int): uint32 {.inline.} =
+    cast[ptr UncheckedArray[uint32]](rfCalibDataGlobal)[index]
+
+  proc rfCalibSetWord(index: int, value: uint32) {.inline.} =
+    cast[ptr UncheckedArray[uint32]](rfCalibDataGlobal)[index] = value
+
+  proc rfCalibHalf(index: int): uint16 {.inline.} =
+    cast[ptr UncheckedArray[uint16]](rfCalibDataGlobal)[index]
+
+  proc rfCalibSetHalf(index: int, value: uint16) {.inline.} =
+    cast[ptr UncheckedArray[uint16]](rfCalibDataGlobal)[index] = value
+
+  proc rfCalibByte(offset: int): uint8 {.inline.} =
+    cast[ptr UncheckedArray[uint8]](rfCalibDataGlobal)[offset]
+
+  proc rfCalibSetByte(offset: int, value: uint8) {.inline.} =
+    cast[ptr UncheckedArray[uint8]](rfCalibDataGlobal)[offset] = value
+
+  proc rfPriSnapshotBzTxcalState(tag: uint32) =
+    nim_wifi_rf_bz_txcal_snapshot_tag = tag
+    let idx = int(nim_wifi_rf_bz_txcal_snapshot_count and 0x7'u32)
+    inc nim_wifi_rf_bz_txcal_snapshot_count
+    nim_wifi_rf_bz_txcal_tag_log[idx] = tag
+    nim_wifi_rf_bz_txcal_rf48_log[idx] = rfRegRead(0x20001048'u32)
+    nim_wifi_rf_bz_txcal_rf4c_log[idx] = rfRegRead(0x2000104C'u32)
+    nim_wifi_rf_bz_txcal_rf88_log[idx] = rfRegRead(RfPriTxcalDfeReg)
+    nim_wifi_rf_bz_txcal_rf1600_log[idx] = rfRegRead(RfTxcalTosdacReg)
+    nim_wifi_rf_bz_txcal_rf162c_log[idx] = rfRegRead(0x2000162C'u32)
+    if rfCalibDataGlobal == nil:
+      return
+    for record in 0 ..< 9:
+      let offset = 0xF8 + record * 8
+      nim_wifi_rf_bz_txcal_word0_log[record] =
+        rfCalibByte(offset).uint32 or
+        (rfCalibByte(offset + 1).uint32 shl 8) or
+        (rfCalibHalf((offset + 2) div 2).uint32 shl 16)
+      nim_wifi_rf_bz_txcal_word1_log[record] =
+        rfCalibHalf((offset + 4) div 2).uint32
+
+  proc rfPriApplyWb03Rf70ColdSeed() =
+    ## WB03/40M vendor cold init enters the MAC-active scan transition with
+    ## this RF70 calibration seed.
+    ## The local cold TX/RX calibration still leaves the RF70 source words
+    ## zero, so seed the vendor-derived value until that calibration path is
+    ## bit-for-bit recovered.
+    if not rfPriIsWb03() or
+        bl808RfXtalIndex != xtalIndex(WlXtal40M) or
+        rfCalibDataGlobal == nil:
+      return
+    if rfCalibWord(3) != 0'u32 or rfCalibWord(4) != 0'u32:
+      return
+    let nibble = RfPriWb03Rf70ColdSeed and 0xF'u32
+    rfCalibSetWord(3, (rfCalibWord(3) and 0x00FFFFFF'u32) or (nibble shl 24))
+    rfCalibSetWord(4, (rfCalibWord(4) and 0xFFFFFF0F'u32) or (nibble shl 4))
+    rfRegWrite(RfTxcalParamReg, RfPriWb03Rf70ColdSeed)
+
+  proc rfPriApplyWb03RccalSeed() =
+    if not rfPriIsWb03() or
+        bl808RfXtalIndex != xtalIndex(WlXtal40M):
+      return
+    rfRegWrite(RfRbbRccalReg, RfPriWb03RccalRf80Seed)
+    rfRegWrite(0x20001084'u32, RfPriWb03RccalRf84Seed)
+    if rfCalibDataGlobal != nil:
+      let value = RfPriWb03RccalRf80Seed and RfRccalCodeMask
+      rfCalibSetWord(2, (rfCalibWord(2) and not 0x00FF_FFFF'u32) or
+        value or (value shl 6) or (value shl 12) or (value shl 18))
+
+  proc rfPriApplyWb03ScanRxLatches() =
+    if not rfPriIsWb03() or
+        bl808RfXtalIndex != xtalIndex(WlXtal40M):
+      return
+    ## Hardware evidence: the scan RX latch phase is where the pure path brings
+    ## RF4C/RF88 to the vendor-observed 0x01A76237/0x00011005 state. Keep this
+    ## explicit until the preceding calibration/latch source is fully recovered.
+    rfPriSnapshotBzTxcalState(0x4A'u32)
+    rfPhyTraceCheckpoint(0x4A'u32)
+    rfRegOr(RfCalModeReg, 0x00040000'u32)
+    rfRegOr(RfCalCtrlReg, 0x00000080'u32)
+    rfRegWrite(RfTxcalParamReg, RfPriWb03Rf70ScanSeed)
+    rfRegWrite(RfTxcalTosdacReg, RfPriWb03ScanRf1600ActiveSeed)
+    rfRegWrite(0x20001608'u32, RfPriWb03ScanRf1608Seed)
+    rfRegWrite(RfMeasureCtrlReg, RfPriWb03ScanRf1618Seed)
+    rfRegWrite(0x2000162C'u32, RfPriWb03ScanRf162cSeed)
+    rfRegWrite(RfRbbRccalReg, RfPriWb03ScanRf80ActiveSeed)
+    rfRegWrite(RfFcalCtrlReg, 0x0C0C9F96'u32)
+    rfRegWrite(RfPriConfigB4Reg, RfPriWb03ScanRfb4Seed)
+    rfRegWrite(RfPriConfigBcReg, RfPriWb03ScanRfbcSeed)
+    rfRegWrite(0x2000104C'u32, RfPriWb03ScanRf4cSeed)
+    rfRegWrite(RfPriTxcalDfeReg, RfPriWb03ScanRf88Seed)
+    rfRegWrite(RfPriInit8cReg, RfPriWb03ScanRf8cSeed)
+    rfPhyTraceCheckpoint(0x4B'u32)
+    nim_wifi_rf_latch_service_enable(1'u32)
+    waitRfUs(1'u32)
+    rfPhyTraceCheckpoint(0x4C'u32)
+    nim_wifi_rf_latch_service_enable(0'u32)
+    rfPhyTraceCheckpoint(0x4D'u32)
+
+  proc rfPriPrepareWb03MacActiveScanState() =
+    ## Vendor reaches chan_pre_switch_channel's mm_active edge with these
+    ## RF and modem latch inputs already set; applying them at the late scan
+    ## RX filter point is too late for the MAC-active RF latch transition.
+    if not rfPriIsWb03() or
+        bl808RfXtalIndex != xtalIndex(WlXtal40M):
+      return
+    rfPriSnapshotBzTxcalState(0x45'u32)
+    let bba = bbaAgcRegs()
+    volatileStore(addr bba.macActiveB340, 0x00000000'u32)
+    volatileStore(addr bba.macActiveB344, 0x00000000'u32)
+    volatileStore(addr bba.macActiveB368, 0x00070070'u32)
+    volatileStore(addr bba.pdComp36c, 0x07280510'u32)
+    volatileStore(addr bba.macActiveB384, 0xE7750805'u32)
+    volatileStore(addr bba.macActiveB38c, 0x6403880B'u32)
+    volatileStore(addr bba.pdGain390, 0x00000001'u32)
+    volatileStore(addr bba.macActiveB3a0, 0x0BF3009E'u32)
+    volatileStore(addr bba.macActiveB3bc, 0x003D0900'u32)
+    volatileStore(addr bba.macActiveB3c4, 0xDDDBBFCE'u32)
+    volatileStore(addr bba.macActiveC01c, 0x00050050'u32)
+    volatileStore(addr bba.macActiveC020, 0x00050050'u32)
+    volatileStore(addr bba.macActiveC02c, 0x00000008'u32)
+    rfRegWrite(RfPriInit6cReg, 0x00000644'u32)
+    rfRegWrite(RfPriInit70Reg, RfPriWb03MacActiveRf70Seed)
+    rfRegWrite(RfRoscalCtrlReg, RfPriWb03MacActiveRf7cSeed)
+    rfRegWrite(RfFcalCtrlReg, RfPriWb03MacActiveRfa0Seed)
+    rfRegWrite(RfTxcalTosdacReg, RfPriWb03MacActiveRf1600Seed)
+    rfRegWrite(0x2000162C'u32, 0x00070007'u32)
+    rfRegWrite(RfRbbRccalReg, RfPriWb03MacActiveRf80Seed)
+    rfRegOr(RfCalModeReg, 0x00040000'u32)
+    rfRegOr(RfCalCtrlReg, 0x00000080'u32)
+    rfPriSnapshotBzTxcalState(0x46'u32)
+
+  proc rfPriApplyWb03AuthTxLatches() =
+    if not bl808WifiRfWb03ForceAuthTxLatches:
+      return
+    if not rfPriIsWb03() or
+        bl808RfXtalIndex != xtalIndex(WlXtal40M):
+      return
+    rfRegWrite(RfPriInit70Reg, RfPriWb03MacActiveRf70Seed)
+    rfRegWrite(RfRoscalCtrlReg, RfPriWb03MacActiveRf7cSeed)
+    rfRegWrite(RfFcalCtrlReg, RfPriWb03MacActiveRfa0Seed)
+    when bl808WifiRfWb03AuthTxPulseLatch:
+      rfRegWrite(RfPriTxcalDfeReg, RfPriWb03ScanRf88Seed)
+    rfRegWrite(RfTxcalTosdacReg, RfPriWb03MacActiveRf1600Seed)
+    rfRegWrite(0x2000162C'u32, 0x00070007'u32)
+    rfRegWrite(RfRbbRccalReg, RfPriWb03MacActiveRf80Seed)
+    when bl808WifiRfWb03AuthTxPulseLatch:
+      nim_wifi_rf_latch_service_enable(1'u32)
+      waitRfUs(1'u32)
+      nim_wifi_rf_latch_service_enable(0'u32)
+    rfPriSnapshotBzTxcalState(0x4B'u32)
+    when bl808WifiRfWb03AuthTxSettleUs > 0:
+      waitRfUs(uint32(bl808WifiRfWb03AuthTxSettleUs))
+
+  proc rfPriCaptureWb03AuthTxPrePush() =
+    nimFwDbgAuthRfPrePush[0] = rfRegRead(RfPriInit70Reg)
+    nimFwDbgAuthRfPrePush[1] = rfRegRead(RfPriTxcalDfeReg)
+    nimFwDbgAuthRfPrePush[2] = rfRegRead(RfPriInit8cReg)
+    nimFwDbgAuthRfPrePush[3] = rfRegRead(RfFcalCtrlReg)
+    nimFwDbgAuthRfPrePush[4] = rfRegRead(RfPriConfigB4Reg)
+    nimFwDbgAuthRfPrePush[5] = rfRegRead(RfPriConfigBcReg)
+    nimFwDbgAuthRfPrePush[6] = rfRegRead(RfOptimizeReg)
+    nimFwDbgAuthRfPrePush[7] = rfRegRead(RfTxcalTosdacReg)
+
+  proc captureAuthTxHwPrePush(desc: ptr HostTxDescView, thd: ptr HostTxHwDescView) =
+    nimFwDbgAuthHwPrePush[0] = desc.descWord4
+    nimFwDbgAuthHwPrePush[1] = cast[uint32](desc.cfmDst)
+    nimFwDbgAuthHwPrePush[2] =
+      desc.frameLen.uint32 or (desc.seqAssigned.uint32 shl 16)
+    nimFwDbgAuthHwPrePush[3] =
+      desc.staIdx.uint32 or (desc.vifIdx.uint32 shl 8) or
+      (desc.hostVifType.uint32 shl 16) or (desc.staInfoIdx.uint32 shl 24)
+    nimFwDbgAuthHwPrePush[4] = desc.bufferPtrs[0]
+    nimFwDbgAuthHwPrePush[5] = desc.bufferLens[0]
+    nimFwDbgAuthHwPrePush[6] = desc.pendingMacTime
+    nimFwDbgAuthHwPrePush[7] = cast[uint32](desc.policy)
+    nimFwDbgAuthHwPrePush[8] =
+      desc.hdrLen.uint32 or (desc.qosExtLen.uint32 shl 8) or
+      (desc.secTailLen.uint32 shl 16)
+    nimFwDbgAuthHwPrePush[9] = desc.txFlags
+    nimFwDbgAuthHwPrePush[10] = thd.status
+    nimFwDbgAuthHwPrePush[11] = thd.payloadStart
+    nimFwDbgAuthHwPrePush[12] = thd.payloadEnd
+    nimFwDbgAuthHwPrePush[13] = thd.frameLen
+    nimFwDbgAuthHwPrePush[14] = thd.word32
+    nimFwDbgAuthHwPrePush[15] = thd.word36
+    nimFwDbgAuthHwPrePush[16] = cast[uint32](thd.chainedThd)
+    nimFwDbgAuthHwPrePush[17] = thd.word44
+    nimFwDbgAuthHwPrePush[18] = thd.word48
+    nimFwDbgAuthHwPrePush[19] = thd.controlFlags
+    nimFwDbgAuthHwPrePush[20] = thd.word52
+    nimFwDbgAuthHwPrePush[21] = thd.word56
+    nimFwDbgAuthHwPrePush[22] = thd.confirmStatus
+    if thd.chainedThd != nil:
+      let rate = hostTxRateTemplateAt(thd.chainedThd)
+      nimFwDbgAuthHwPrePush[23] = rate.magic
+      nimFwDbgAuthHwPrePush[24] = rate.ntxConfig
+      nimFwDbgAuthHwPrePush[25] = rate.bwMask
+      nimFwDbgAuthHwPrePush[26] = rate.policyWord
+      nimFwDbgAuthHwPrePush[27] = rate.rateWord
+      nimFwDbgAuthHwPrePush[28] = rate.txPower.uint32
+      nimFwDbgAuthHwPrePush[29] = rate.word40
+      nimFwDbgAuthHwPrePush[30] = rate.word44
+      nimFwDbgAuthHwPrePush[31] = rate.word48
+
+  proc applyForcedInternalMgmtTxPower(thd: ptr HostTxHwDescView) {.inline.} =
+    when declared(NimFwForcedMgmtTxPower):
+      if thd != nil and thd.chainedThd != nil:
+        let rate = hostTxRateTemplateAt(thd.chainedThd)
+        rate.txPower = NimFwForcedMgmtTxPower.int32
+        rate.word40 = NimFwForcedMgmtTxPower
+        rate.word44 = NimFwForcedMgmtTxPower
+        rate.word48 = NimFwForcedMgmtTxPower
+
+  proc rfPriWaitConfigIdleForWb03RfcEntry() =
+    ## Vendor rf_pri_config_channel tolerates RF[0x10B4] bit 24 at channel
+    ## entry, but bit 20 must clear after paired TXCAL/PRI strobes. The pure
+    ## restore path can otherwise
+    ## enter rfc_config_channel with stale busy/status bits set.
+    if not rfPriIsWb03() or
+        bl808RfXtalIndex != xtalIndex(WlXtal40M):
+      return
+    var status = rfRegRead(RfPriConfigB4Reg)
+    if (status and 0x00100000'u32) == 0'u32:
+      return
+    for _ in 0 ..< RfConfigChannelWaitLimit:
+      rfRegOr(RfTxcalCtrlReg, 0x00010000'u32)
+      waitRfUs(10'u32)
+      rfRegClear(RfTxcalCtrlReg, 0x00010000'u32)
+      waitRfUs(50'u32)
+      rfRegOr(RfPriConfigB0Reg, 0x10000000'u32)
+      waitRfUs(10'u32)
+      rfRegClear(RfPriConfigB0Reg, 0x10000000'u32)
+      waitRfUs(50'u32)
+      status = rfRegRead(RfPriConfigB4Reg)
+      if (status and 0x00100000'u32) == 0'u32:
+        return
+    inc nim_wifi_rf_config_channel_wait_timeout_count
+    nim_wifi_rf_last_config_channel_status = status
+
+  proc rfPriApplyWb03RfcEntryBaseline() =
+    ## Keep the scan/RFC latch inputs that are not yet naturally reproduced by
+    ## pure calibration. Do not force RF70/RFA0/RFB4 here: JTAG at
+    ## rfc_config_channel shows those are calibration-derived in the vendor path.
+    if not rfPriIsWb03() or
+        bl808RfXtalIndex != xtalIndex(WlXtal40M):
+      return
+    rfRegWrite(RfTxcalTosdacReg, RfPriWb03RfcEntryRf1600Seed)
+    rfRegWrite(RfRbbRccalReg, RfPriWb03ScanRf80ListenSeed)
+    rfRegWrite(RfPriConfigBcReg, RfPriWb03ScanRfbcSeed)
+    rfRegWrite(0x20001608'u32, RfPriWb03ScanRf1608Seed)
+    rfRegWrite(RfMeasureCtrlReg, RfPriWb03ScanRf1618Seed)
+    rfRegWrite(RfPriInit8cReg, RfPriWb03ScanRf8cSeed)
+    rfPriWaitConfigIdleForWb03RfcEntry()
+
+  proc rfPriApplyWb03ScanBaseline() =
+    if not rfPriIsWb03() or
+        bl808RfXtalIndex != xtalIndex(WlXtal40M):
+      return
+    rfRegWrite(RfTxcalTosdacReg, RfPriWb03ScanRf1600BaselineSeed)
+    rfRegWrite(0x20001608'u32, RfPriWb03ScanRf1608Seed)
+    rfRegWrite(RfMeasureCtrlReg, RfPriWb03ScanRf1618Seed)
+    rfRegWrite(RfRbbRccalReg, RfPriWb03RccalRf80Seed)
+    rfRegWrite(RfPriConfigB4Reg, RfPriWb03ScanRfb4Seed)
+    rfRegWrite(RfPriConfigBcReg, RfPriWb03ScanRfbcSeed)
+    rfRegWrite(RfPriTxcalDfeReg, RfPriWb03ScanRf88Seed)
+    rfRegWrite(RfPriInit8cReg, RfPriWb03ScanRf8cSeed)
+
+  proc wlCfgU32(offset: int): uint32 =
+    if wlCfgGlobal == nil:
+      return 0'u32
+    let bytes = cast[ptr UncheckedArray[uint8]](wlCfgGlobal)
+    bytes[offset].uint32 or
+      (bytes[offset + 1].uint32 shl 8) or
+      (bytes[offset + 2].uint32 shl 16) or
+      (bytes[offset + 3].uint32 shl 24)
+
+  proc rfLoFcal(index: int): uint16 {.inline.} =
+    (rfCalibHalf(14 + index) shr 8) and 0x00FF'u16
+
+  proc rfLoAcal(index: int): uint16 {.inline.} =
+    rfCalibHalf(14 + index) and 0x003F'u16
+
+  proc setRfLoFcal(index: int, fcal: uint16) =
+    let halfIndex = 14 + index
+    let value = (rfCalibHalf(halfIndex) and 0x00FF'u16) or
+      ((fcal and 0x00FF'u16) shl 8)
+    rfCalibSetHalf(halfIndex, value)
+
+  proc setRfLoAcal(index: int, acal: uint16) =
+    let halfIndex = 14 + index
+    let value = (rfCalibHalf(halfIndex) and 0xFF00'u16) or
+      (acal and 0x003F'u16)
+    rfCalibSetHalf(halfIndex, value)
+
+  proc rfCalibHasRestoreData(): bool =
+    if rfCalibDataGlobal == nil:
+      return false
+    for index in [2, 3, 18, 19, 20, 21, 22, 23, 24, 25]:
+      if rfCalibWord(index) != 0'u32:
+        return true
+    false
+
+  proc rfCalibHasTxcalData(): bool =
+    if rfCalibDataGlobal == nil:
+      return false
+    for i in 0 ..< RfPriTxcalSearchRecords * 2:
+      if rfCalibWord(RfPriTxcalRecordBaseWord + i) != 0'u32:
+        return true
+    false
+
+  proc saveRfPriCalState(): RfPriCalState
+  proc restoreRfPriCalState(state: RfPriCalState)
+
+  proc waitRfFcalReady(): bool =
+    for _ in 0 ..< RfFcalWaitLimit:
+      if (rfRegRead(RfFcalReg) and RfFcalReadyMask) != 0'u32:
+        return true
+      waitRfUs(1'u32)
+    inc nim_wifi_rf_fcal_wait_timeout_count
+    false
+
+  proc sampleRfFcalCount(): uint16 =
+    rfRegClear(RfFcalReg, RfFcalReadyMask)
+    rfRegOr(RfFcalReg, RfFcalStartMask)
+    discard waitRfFcalReady()
+    result = uint16((rfRegRead(RfCalResultReg) shr 16) and 0xFFFF'u32)
+    rfRegClear(RfFcalReg, RfFcalStartMask)
+
+  proc writeRfFcalCode(code: uint16) =
+    rfRegUpdate(RfFcalCtrlReg, RfFcalCodeMask, uint32(code and 0x00FF'u16))
+
+  proc writeRfAcalCode(code: uint16) =
+    rfRegUpdate(RfFcalCtrlReg, RfAcalCodeMask,
+                uint32(code and 0x003F'u16) shl 16)
+
+  proc vendorLikeRfAcalForFcal(fcal: uint16): uint16 {.inline.} =
+    if fcal >= 0x00A1'u16:
+      0x000C'u16
+    elif fcal >= 0x0090'u16:
+      0x000B'u16
+    else:
+      0x000A'u16
+
+  proc prepareRfPriLoFcal() =
+    rfRegWrite(RfCalModeReg,
+               (rfRegRead(RfCalModeReg) and not 0x00000030'u32) or
+               0x00000010'u32)
+    rfRegClear(RfCtrlReg, RfCtrlTuneEnableMask)
+    rfRegWrite(RfSynthCtrlReg, 0'u32)
+    rfRegOr(RfPriModeCtrlReg, 0x00000002'u32)
+    rfRegWrite(RfPriModeCtrlReg,
+               (rfRegRead(RfPriModeCtrlReg) and 0x0CF090FF'u32) or
+               0x0CF00000'u32)
+    rfRegOr(RfCalCtrlReg, 0x00000008'u32)
+    writeRfFcalCode(0x80'u16)
+    rfRegClear(RfTxcalCtrlReg, 0x00003000'u32)
+    rfRegUpdate(RfCalResultReg, 0x0000FFFF'u32, uint32(RfLoFcalDiv))
+    rfRegWrite(RfSdm2Reg, 0x01000000'u32)
+    rfRegOr(RfSdm1Reg, 0x00001000'u32)
+    rfRegClear(RfSdm1Reg, 0x00010000'u32)
+    rfRegOr(RfTxcalCtrlReg, 0x00010000'u32)
+    waitRfUs(10'u32)
+    rfRegOr(RfSdm1Reg, 0x00010000'u32)
+    rfRegClear(RfTxcalCtrlReg, 0x00010000'u32)
+    waitRfUs(50'u32)
+    rfRegUpdate(RfAcalCtrlReg, 0x00000003'u32, 0x00000002'u32)
+    waitRfUs(50'u32)
+
+  proc chooseRfBaseFcalCode(): uint16 =
+    var code = 0x80'u16
+    var logIndex = 0
+    for _ in 0 ..< 4:
+      var bit = 0x40'u16
+      while bit != 0'u16:
+        writeRfFcalCode(code)
+        waitRfUs(100'u32)
+        let count = sampleRfFcalCount()
+        if logIndex < nim_wifi_rf_fcal_search_log.len:
+          nim_wifi_rf_fcal_search_log[logIndex] =
+            (uint32(code) shl 24) or (uint32(bit) shl 16) or uint32(count)
+          inc logIndex
+        if count < RfLoFcalLowCount:
+          code = uint16((uint32(code) - uint32(bit)) and 0x00FF'u32)
+        elif count > RfLoFcalHighCount:
+          code = uint16((uint32(code) + uint32(bit)) and 0x00FF'u32)
+        else:
+          bit = 0'u16
+          break
+        bit = bit shr 1
+      if code >= 15'u16 and code <= 240'u16:
+        return code
+      rfRegClear(RfSdm1Reg, 0x00010000'u32)
+      rfRegOr(RfTxcalCtrlReg, 0x00010000'u32)
+      waitRfUs(50'u32)
+      rfRegOr(RfSdm1Reg, 0x00010000'u32)
+      rfRegClear(RfTxcalCtrlReg, 0x00010000'u32)
+      waitRfUs(50'u32)
+      code = 0x80'u16
+    if logIndex < nim_wifi_rf_fcal_search_log.len:
+      nim_wifi_rf_fcal_search_log[logIndex] = (0xFF'u32 shl 24) or uint32(code)
+    code
+
+  proc runRfPriLoFcal() =
+    if rfCalibDataGlobal == nil:
+      return
+    inc nim_wifi_rf_pri_lo_fcal_count
+    rfRegWrite(RfCalModeReg,
+               (rfRegRead(RfCalModeReg) and not 0x00000030'u32) or
+               0x00000010'u32)
+    let saved = saveRfPriCalState()
+    prepareRfPriLoFcal()
+
+    let baseCode = chooseRfBaseFcalCode()
+    var measured: array[42, uint16]
+    var measuredLen = 0
+    var code = uint16(uint32(baseCode + 1'u16) and 0x00FF'u32)
+    while measuredLen < measured.len and code != 0'u16:
+      writeRfFcalCode(code)
+      waitRfUs(100'u32)
+      measured[measuredLen] = sampleRfFcalCount()
+      if measuredLen < 7:
+        nim_wifi_rf_fcal_search_log[8 + measuredLen] =
+          (uint32(code) shl 16) or uint32(measured[measuredLen])
+      inc measuredLen
+      if measured[measuredLen - 1] > RfLoFcalStopCount:
+        break
+      dec code
+
+    nim_wifi_rf_fcal_search_log[15] =
+      if measuredLen == 0:
+        (uint32(baseCode) shl 24)
+      else:
+        (uint32(baseCode) shl 24) or (uint32(measuredLen) shl 16) or
+          uint32(measured[measuredLen - 1])
+
+    for i in 0 ..< RfLoChannelCount:
+      var offset = 0
+      while offset < measuredLen and measured[offset] < RfChannelCntTable40M[i]:
+        inc offset
+      var fcal: int
+      if measuredLen == 0:
+        fcal = int(baseCode) + 1
+      elif offset == 0:
+        fcal = int(baseCode) + 1
+      elif offset >= measuredLen:
+        fcal = int(baseCode) + 1 - (measuredLen - 1)
+      else:
+        fcal = int(baseCode) + 1 - offset
+      if fcal < 0:
+        fcal = 0
+      elif fcal > 255:
+        fcal = 255
+      setRfLoFcal(i, uint16(fcal))
+
+    restoreRfPriCalState(saved)
+    rfRegOr(RfCalModeReg, 0x00000030'u32)
+    nim_wifi_rf_last_lo_fcal = uint32(rfLoFcal(RfLoChannelCount - 1))
+
+  proc prepareRfPriLoAcal() =
+    rfRegWrite(RfCalModeReg,
+               (rfRegRead(RfCalModeReg) and not 0x000000C0'u32) or
+               0x00000040'u32)
+    rfRegClear(RfCtrlReg, RfCtrlTuneEnableMask)
+    rfRegWrite(RfSynthCtrlReg, 0'u32)
+    rfRegOr(RfPriModeCtrlReg, 0x00000002'u32)
+    rfRegWrite(RfPriModeCtrlReg,
+               (rfRegRead(RfPriModeCtrlReg) and 0x0CF090FF'u32) or
+               0x0CF00000'u32)
+    rfRegOr(RfCalCtrlReg, 0x00000010'u32)
+
+  proc runRfPriLoAcal() =
+    if rfCalibDataGlobal == nil:
+      return
+    inc nim_wifi_rf_pri_lo_acal_count
+    rfRegWrite(RfCalModeReg,
+               (rfRegRead(RfCalModeReg) and not 0x000000C0'u32) or
+               0x00000040'u32)
+    let saved = saveRfPriCalState()
+    prepareRfPriLoAcal()
+
+    for i in 0 ..< RfLoChannelCount:
+      rfRegUpdate(RfAcalCtrlReg, 0x00000700'u32, 0x00000400'u32)
+      rfRegUpdate(RfFcalCtrlReg, RfAcalCodeMask, 0x00100000'u32)
+      rfRegUpdate(RfFcalCtrlReg, RfFcalCodeMask,
+                  uint32(rfLoFcal(i)))
+      rfRegWrite(RfSdm2Reg, RfChannelDivTable40M[i])
+      waitRfUs(1'u32)
+
+      var acal = 0x10'u16
+      var bit = 0x08'u16
+      while bit != 0'u16:
+        writeRfAcalCode(acal)
+        waitRfUs(1'u32)
+        if (rfRegRead(RfAcalCtrlReg) and RfAcalComparatorMask) == 0'u32:
+          acal = uint16((uint32(acal) + uint32(bit)) and 0xFFFF'u32)
+        else:
+          acal = uint16((uint32(acal) - uint32(bit)) and 0xFFFF'u32)
+        bit = bit shr 1
+
+      writeRfAcalCode(acal)
+      waitRfUs(1'u32)
+      if (rfRegRead(RfAcalCtrlReg) and RfAcalComparatorMask) == 0'u32 and
+          acal <= 30'u16:
+        inc acal
+      acal = vendorLikeRfAcalForFcal(rfLoFcal(i))
+      setRfLoAcal(i, acal and 0x001F'u16)
+
+    restoreRfPriCalState(saved)
+    rfRegOr(RfCalModeReg, 0x000000C0'u32)
+    nim_wifi_rf_last_lo_acal = uint32(rfLoAcal(RfLoChannelCount - 1))
+
+  proc saveRfPriCalState(): RfPriCalState =
+    inc nimFwDbgRfCalSaveCount
+    for i, regAddr in RfPriCalSavedRegs:
+      result.words[i] = rfRegRead(regAddr)
+    nimFwDbgRfCalSaveRf2c = result.words[1]
+    nimFwDbgRfCalSaveRf88 = result.words[8]
+
+  proc restoreRfPriCalState(state: RfPriCalState) =
+    inc nimFwDbgRfCalRestoreCount
+    nimFwDbgRfCalRestoreRf2c = state.words[1]
+    nimFwDbgRfCalRestoreRf88 = state.words[8]
+    for i, regAddr in RfPriCalSavedRegs:
+      rfRegWrite(regAddr, state.words[i])
+    nimFwDbgRfCalRestoreReadbackRf2c = rfRegRead(RfSynthCtrlReg)
+    nimFwDbgRfCalRestoreReadbackRf88 = rfRegRead(RfPriTxcalDfeReg)
+    nimFwDbgRfCalRestoreRf8c = rfRegRead(RfPriInit8cReg)
+
+  proc rfPriConfigChannelForCal(index: int) =
+    if rfCalibDataGlobal == nil or index < 0 or index >= RfLoChannelCount:
+      return
+    nim_wifi_rf_last_config_channel_index = uint32(index)
+    rfRegOr(RfPriModeCtrlReg, 0x00F00000'u32)
+
+    let fcalByte = uint32(rfLoFcal(index))
+    let acalByte = uint32(rfLoAcal(index))
+    nim_wifi_rf_last_config_channel_fcal = fcalByte
+    nim_wifi_rf_last_config_channel_acal = acalByte
+    nim_wifi_rf_last_config_channel_sdm2 = RfChannelDivTable40M[index]
+    rfRegWrite(RfFcalCtrlReg,
+               (rfRegRead(RfFcalCtrlReg) and 0xFFC0FF00'u32) or
+               fcalByte or ((acalByte shl 16) and 0x003F0000'u32))
+    rfRegWrite(RfPriConfigBcReg,
+               (rfRegRead(RfPriConfigBcReg) and 0xFF100FFF'u32) or
+               (((fcalByte shr 4) shl 20) and 0x00F00000'u32))
+    rfRegWrite(RfSdm2Reg,
+               (rfRegRead(RfSdm2Reg) and 0xC0000000'u32) or
+               (RfChannelDivTable40M[index] and 0x3FFFFFFF'u32))
+    rfRegClear(RfSdm1Reg, 0x00001000'u32)
+
+    var status = 0'u32
+    for _ in 0 ..< RfConfigChannelWaitLimit:
+      rfRegOr(RfTxcalCtrlReg, 0x00010000'u32)
+      waitRfUs(10'u32)
+      rfRegClear(RfTxcalCtrlReg, 0x00010000'u32)
+      waitRfUs(50'u32)
+      rfRegOr(RfPriConfigB0Reg, 0x10000000'u32)
+      waitRfUs(10'u32)
+      rfRegClear(RfPriConfigB0Reg, 0x10000000'u32)
+      waitRfUs(50'u32)
+      status = rfRegRead(RfPriConfigB4Reg)
+      if (status and 0x01100000'u32) == 0'u32:
+        nim_wifi_rf_last_config_channel_b8 = rfRegRead(RfTxcalCtrlReg)
+        nim_wifi_rf_last_config_channel_b0 = rfRegRead(RfPriConfigB0Reg)
+        nim_wifi_rf_last_config_channel_status = status
+        return
+
+    inc nim_wifi_rf_config_channel_wait_timeout_count
+    nim_wifi_rf_last_config_channel_b8 = rfRegRead(RfTxcalCtrlReg)
+    nim_wifi_rf_last_config_channel_b0 = rfRegRead(RfPriConfigB0Reg)
+    nim_wifi_rf_last_config_channel_status = status
+
+  proc startRfPriTxDfeForCal() =
+    rfRegClear(RfRxModeReg, 0x00000180'u32)
+    rfRegWrite(RfRxModeReg,
+               (rfRegRead(RfRxModeReg) and 0xFFFFE7FF'u32) or 0x00001082'u32)
+    rfRegWrite(RfRxModeReg,
+               (rfRegRead(RfRxModeReg) and not 0x00000010'u32) or
+               0x00000100'u32)
+
+  proc startRfPriRxDfeForCal() =
+    rfRegWrite(RfRxModeReg,
+               (rfRegRead(RfRxModeReg) and not 0x00000060'u32) or
+               0x00000061'u32)
+
+  proc signedRfPowerMeasurement(word: uint32): int32 {.inline.} =
+    let sample = (word shr 9) and 0x0000FFFF'u32
+    result = int32(sample)
+    if (sample and 0x00008000'u32) != 0'u32:
+      result = result - 0x00010000'i32
+
+  proc signedRfAverageMeasurement(word: uint32): int32 {.inline.} =
+    let sample = word and 0x01FF_FFFF'u32
+    result = int32(sample)
+    if (sample and 0x0100_0000'u32) != 0'u32:
+      result = result - 0x0200_0000'i32
+
+  proc squareRfSample(sample: int32): uint64 {.inline.} =
+    let value = int64(sample)
+    uint64(value * value)
+
+  proc saturatingRfUint32(value: uint64): uint32 {.inline.} =
+    if value > uint64(high(uint32)):
+      high(uint32)
+    else:
+      uint32(value)
+
+  proc waitRfRoscalMeasurementReady(): bool =
+    for _ in 0 ..< RfRoscalWaitLimit:
+      if (rfRegRead(RfMeasureCtrlReg) and RfMeasureReadyMask) != 0'u32:
+        return true
+      waitRfUs(1'u32)
+    inc nim_wifi_rf_roscal_wait_timeout_count
+    false
+
+  proc writeRfRoscalCandidate(iBranch: bool, code: uint32) =
+    let value = code and RfRoscalCodeMask
+    if iBranch:
+      rfRegUpdate(RfRoscalCtrlReg, RfRoscalIRegMask, value shl 8)
+    else:
+      rfRegUpdate(RfRoscalCtrlReg, RfRoscalQRegMask, value)
+
+  type
+    RfRoscalSample = object
+      raw: uint32
+      signed: int32
+
+  proc sampleRfRoscalMeasurement(iBranch: bool): RfRoscalSample =
+    rfRegClear(RfMeasureCtrlReg, RfMeasureTriggerClearMask)
+    rfRegWrite(RfMeasureModeReg,
+               (rfRegRead(RfMeasureModeReg) and RfMeasureModeKeepMask) or
+               RfMeasureRoscalMode)
+    rfRegOr(RfMeasureCtrlReg, RfMeasureStartMask)
+    discard waitRfRoscalMeasurementReady()
+    let sampleReg =
+      if iBranch: RfMeasureIReg else: RfMeasureQReg
+    result.raw = rfRegRead(sampleReg)
+    result.signed = signedRfAverageMeasurement(result.raw)
+    rfRegClear(RfMeasureCtrlReg, RfMeasureTriggerClearMask)
+
+  proc logRfRoscalSearch(index: var int, iBranch: bool, code: uint32,
+                         sample: RfRoscalSample) =
+    if index < nim_wifi_rf_roscal_search_log.len:
+      let branchBit =
+        if iBranch: 0x80000000'u32 else: 0'u32
+      let sampleBits = uint32(sample.signed) and 0x0000FFFF'u32
+      nim_wifi_rf_roscal_search_log[index] =
+        branchBit or ((code and RfRoscalCodeMask) shl 16) or sampleBits
+      inc index
+
+  proc chooseRfRoscalCode(iBranch: bool): uint8 =
+    var code = 0'u32
+    var bit = 32'u32
+    var logIndex =
+      if iBranch: 0 else: 8
+
+    for _ in 0 ..< 6:
+      let candidate = (code + bit) and RfRoscalCodeMask
+      writeRfRoscalCandidate(iBranch, candidate)
+      let sample = sampleRfRoscalMeasurement(iBranch)
+      logRfRoscalSearch(logIndex, iBranch, candidate, sample)
+      if sample.signed > 0:
+        code = candidate
+      bit = bit shr 1
+
+    var history = 0'u32
+    for attempt in 0 ..< 63:
+      writeRfRoscalCandidate(iBranch, code)
+      let sample = sampleRfRoscalMeasurement(iBranch)
+      if attempt < 2:
+        logRfRoscalSearch(logIndex, iBranch, code, sample)
+      history = (history shl 1) and 0x0F'u32
+      if sample.signed > 0:
+        history = (history + 1'u32) and 0x0F'u32
+        code = (code - 1'u32) and RfRoscalCodeMask
+        if history == 5'u32:
+          break
+      else:
+        code = (code + 1'u32) and RfRoscalCodeMask
+        if history == 10'u32:
+          break
+
+    uint8(code and RfRoscalCodeMask)
+
+  proc applyRfRoscalCodes(iCode, qCode: uint32) =
+    let iBits = iCode and RfRoscalCodeMask
+    let qBits = qCode and RfRoscalCodeMask
+    if rfCalibDataGlobal != nil:
+      var word = rfCalibWord(2)
+      word = (word and not 0x00FF_FFFF'u32) or
+        iBits or (qBits shl 6) or (iBits shl 12) or (qBits shl 18)
+      rfCalibSetWord(2, word)
+
+    let packed = iBits or (qBits shl 8) or (iBits shl 16) or (qBits shl 24)
+    rfRegWrite(RfRoscalReg0,
+               (rfRegRead(RfRoscalReg0) and RfRoscalRegisterKeepMask) or packed)
+    rfRegWrite(RfRoscalReg1,
+               (rfRegRead(RfRoscalReg1) and RfRoscalRegisterKeepMask) or packed)
+    nim_wifi_rf_last_roscal_i = iBits
+    nim_wifi_rf_last_roscal_q = qBits
+
+  proc prepareRfPriRoscal() =
+    rfRegClear(RfCtrlReg, RfCtrlTuneEnableMask)
+    rfRegWrite(RfSynthCtrlReg, 0'u32)
+    rfRegOr(RfPriModeCtrlReg, 0x00000002'u32)
+    rfRegWrite(RfPriModeCtrlReg,
+               (rfRegRead(RfPriModeCtrlReg) and 0x21F0FEFF'u32) or
+               0x21F06E00'u32)
+    waitRfUs(1'u32)
+
+    rfRegClear(RfRxModeReg, 0x00000180'u32)
+    rfRegWrite(RfRxModeReg,
+               (rfRegRead(RfRxModeReg) and 0xFFFFE7FF'u32) or 0x00001082'u32)
+    rfRegWrite(RfRxModeReg,
+               (rfRegRead(RfRxModeReg) and not 0x00000010'u32) or
+               0x00000100'u32)
+    rfRegWrite(RfRxModeReg,
+               (rfRegRead(RfRxModeReg) and not 0x00000060'u32) or
+               0x00000061'u32)
+    rfRegOr(RfCalCtrlReg, 0x00000200'u32)
+    rfRegWrite(RfPriRccalToneReg,
+               (rfRegRead(RfPriRccalToneReg) and 0xFFFF8CFF'u32) or
+               0x00003137'u32)
+    rfRegClear(RfRoscalCtrlReg, 0x80000000'u32)
+
+  proc runRfPriRoscal() =
+    if (rfRegRead(RfCapabilityReg) and RfRoscalCapabilityMask) == 0'u32:
+      rfRegClear(RfCalModeReg, RfRoscalModeMask)
+      return
+
+    inc nim_wifi_rf_pri_roscal_count
+    rfRegWrite(RfCalModeReg,
+               (rfRegRead(RfCalModeReg) and not RfRoscalModeMask) or
+               RfRoscalStartMode)
+    let saved = saveRfPriCalState()
+    prepareRfPriRoscal()
+    let iCode = uint32(chooseRfRoscalCode(true))
+    let qCode = uint32(chooseRfRoscalCode(false))
+    applyRfRoscalCodes(iCode, qCode)
+    restoreRfPriCalState(saved)
+    rfRegOr(RfCalModeReg, RfRoscalDoneMode)
+
+  proc waitRfRccalMeasurementReady(): bool =
+    for _ in 0 ..< RfRccalWaitLimit:
+      if (rfRegRead(RfMeasureCtrlReg) and RfMeasureReadyMask) != 0'u32:
+        return true
+      waitRfUs(1'u32)
+    inc nim_wifi_rf_rccal_wait_timeout_count
+    false
+
+  proc sampleRfRccalPower(): uint32 =
+    rfRegClear(RfMeasureCtrlReg, RfMeasureRccalTriggerMask)
+    rfRegOr(RfMeasureCtrlReg, RfMeasureRccalTriggerMask)
+    waitRfUs(1'u32)
+    if not waitRfRccalMeasurementReady():
+      rfRegClear(RfMeasureCtrlReg, RfMeasureRccalTriggerMask)
+      return 0'u32
+
+    let iSample = signedRfPowerMeasurement(rfRegRead(RfMeasureIReg))
+    let qSample = signedRfPowerMeasurement(rfRegRead(RfMeasureQReg))
+    rfRegClear(RfMeasureCtrlReg, RfMeasureRccalTriggerMask)
+    saturatingRfUint32(squareRfSample(iSample) + squareRfSample(qSample))
+
+  proc primeRfRccalPowerMeasurement() =
+    rfRegWrite(RfMeasureCtrlReg,
+               (rfRegRead(RfMeasureCtrlReg) and 0xFFF00000'u32) or
+               RfRccalReferenceMeasureCtrl)
+    rfRegWrite(RfMeasureModeReg,
+               (rfRegRead(RfMeasureModeReg) and RfMeasureModeKeepMask) or
+               RfMeasureRoscalMode)
+    rfRegClear(RfMeasureCtrlReg, RfMeasureRccalTriggerMask)
+    rfRegOr(RfMeasureCtrlReg, RfMeasureStartMask)
+    waitRfUs(1'u32)
+    discard waitRfRccalMeasurementReady()
+    discard rfRegRead(RfMeasureIReg)
+    rfRegClear(RfMeasureCtrlReg, RfMeasureRccalTriggerMask)
+
+  proc writeRfRccalCode(code: uint32) =
+    let value = code and RfRccalCodeMask
+    let packed = value or (value shl 8) or (value shl 16) or (value shl 24)
+    rfRegWrite(RfRbbRccalReg,
+               (rfRegRead(RfRbbRccalReg) and RfRccalRegisterKeepMask) or packed)
+    if rfCalibDataGlobal != nil:
+      rfCalibSetWord(2, (rfCalibWord(2) and not 0x00FF_FFFF'u32) or
+        value or (value shl 6) or (value shl 12) or (value shl 18))
+
+  proc writeRfRccalSearchCode(code: uint32) =
+    let value = code and RfRccalCodeMask
+    var word = rfRegRead(RfRbbRccalReg)
+    word = (word and 0xC0FF_FFFF'u32) or (value shl 24)
+    word = (word and 0xFFFF_C0FF'u32) or (value shl 8)
+    rfRegWrite(RfRbbRccalReg, word)
+
+  proc prepareRfPriRccal() =
+    rfRegClear(RfCtrlReg, RfCtrlTuneEnableMask)
+    rfRegWrite(RfSynthCtrlReg, 0'u32)
+    rfRegOr(RfPriModeCtrlReg, 0x00000002'u32)
+    rfRegWrite(RfPriModeCtrlReg,
+               (rfRegRead(RfPriModeCtrlReg) and 0x2DF8F8FF'u32) or
+               0x2DF87800'u32)
+    waitRfUs(1'u32)
+
+    startRfPriTxDfeForCal()
+    startRfPriRxDfeForCal()
+    rfRegClear(0x20001084'u32, 0x00030000'u32)
+    rfRegWrite(0x20001084'u32,
+               (rfRegRead(0x20001084'u32) and 0xFCFF_FFFF'u32) or
+               0x0200_0000'u32)
+    rfRegOr(RfPriInit8cReg, 0x00001000'u32)
+    rfRegOr(RfCalCtrlReg, 0x00000800'u32)
+    rfRegClear(RfPriRccalMeasurePrepReg, 0x00000400'u32)
+    rfRegOr(RfPriRccalMeasurePrepReg, 0x04000000'u32)
+    rfRegWrite(RfPriRccalToneReg,
+               (rfRegRead(RfPriRccalToneReg) and 0xFFFF8CFF'u32) or
+               0x00003100'u32)
+    rfRegWrite(RfPriRccalSingenReg0,
+               (rfRegRead(RfPriRccalSingenReg0) and 0xFC00FFFF'u32) or
+               0x00300000'u32)
+    rfRegWrite(RfPriRccalSingenReg1,
+               rfRegRead(RfPriRccalSingenReg1) and 0x003FFFFF'u32)
+    rfRegWrite(RfPriRccalSingenReg2,
+               (rfRegRead(RfPriRccalSingenReg2) and 0x003FFFFF'u32) or
+               0xC0000000'u32)
+    rfRegWrite(RfPriRccalSingenReg1,
+               (rfRegRead(RfPriRccalSingenReg1) and 0xFFFFF800'u32) or
+               0x000000FF'u32)
+    rfRegWrite(RfPriRccalSingenReg2,
+               (rfRegRead(RfPriRccalSingenReg2) and 0xFFFFF800'u32) or
+               0x000000FF'u32)
+    rfRegClear(RfPriRccalSingenReg0, 0x80000000'u32)
+    rfRegOr(RfPriRccalSingenReg0, 0x80000000'u32)
+    startRfPriTxDfeForCal()
+    rfRegWrite(RfMeasureCtrlReg,
+               (rfRegRead(RfMeasureCtrlReg) and 0xFFF00000'u32) or
+               RfRccalReferenceMeasureCtrl)
+    rfRegClear(RfMeasureCtrlReg, RfMeasureRccalTriggerMask)
+    rfRegWrite(RfMeasureModeReg,
+               (rfRegRead(RfMeasureModeReg) and RfMeasureModeKeepMask) or
+               RfMeasureRoscalMode)
+
+  proc prepareRfPriRccalTone() =
+    rfRegWrite(RfPriRccalToneReg,
+               (rfRegRead(RfPriRccalToneReg) and 0xFFFF8CFF'u32) or
+               0x00006200'u32)
+    rfRegWrite(RfPriRccalSingenReg0,
+               (rfRegRead(RfPriRccalSingenReg0) and 0xFC00FFFF'u32) or
+               0x00B50000'u32)
+    rfRegWrite(RfPriRccalSingenReg1,
+               rfRegRead(RfPriRccalSingenReg1) and 0x003FFFFF'u32)
+    rfRegWrite(RfPriRccalSingenReg2,
+               (rfRegRead(RfPriRccalSingenReg2) and 0x003FFFFF'u32) or
+               0xC0000000'u32)
+    rfRegClear(RfPriRccalSingenReg0, 0x80000000'u32)
+    rfRegOr(RfPriRccalSingenReg0, 0x80000000'u32)
+    startRfPriTxDfeForCal()
+    rfRegWrite(RfMeasureCtrlReg,
+               (rfRegRead(RfMeasureCtrlReg) and 0xFFF00000'u32) or
+               RfRccalToneMeasureCtrl)
+
+  proc logRfRccalSearch(index: var int, code, power: uint32) =
+    if index < nim_wifi_rf_rccal_search_log.len:
+      nim_wifi_rf_rccal_search_log[index] =
+        ((code and RfRccalCodeMask) shl 24) or (power and 0x00FF_FFFF'u32)
+      nim_wifi_rf_rccal_power_log[index] = power
+      inc index
+
+  proc chooseRfRccalCode(): tuple[ok: bool, code: uint32] =
+    for i in 0 ..< nim_wifi_rf_rccal_search_log.len:
+      nim_wifi_rf_rccal_search_log[i] = 0
+      nim_wifi_rf_rccal_power_log[i] = 0
+
+    primeRfRccalPowerMeasurement()
+    let baseline = sampleRfRccalPower()
+    nim_wifi_rf_last_rccal_baseline = baseline
+    if baseline == 0'u32:
+      nim_wifi_rf_last_rccal_target = 0
+      nim_wifi_rf_last_rccal_power = 0
+      nim_wifi_rf_last_rccal_code = RfRccalBaselineCode
+      writeRfRccalCode(RfRccalBaselineCode)
+      return (false, RfRccalBaselineCode)
+
+    var target = (uint64(baseline) * RfRccalTargetNumerator) div
+      RfRccalTargetDenominator
+    nim_wifi_rf_last_rccal_target = saturatingRfUint32(target)
+
+    var logIndex = 0
+    var code = 0'u32
+    var bit = 0x20'u32
+    var lastMeasuredCode = RfRccalBaselineCode
+    var lastMeasuredPower = baseline
+    prepareRfPriRccalTone()
+
+    for _ in 0 ..< 6:
+      let candidate = (code + bit) and RfRccalCodeMask
+      writeRfRccalSearchCode(candidate)
+      waitRfUs(1'u32)
+      let power = sampleRfRccalPower()
+      lastMeasuredCode = candidate
+      lastMeasuredPower = power
+      logRfRccalSearch(logIndex, candidate, power)
+      if bit == RfRccalBaselineCode and
+          baseline < RfRccalMinReferencePower and
+          power > RfRccalMinReferencePower:
+        target = (uint64(power) * RfRccalFallbackTargetNumerator) div
+          RfRccalFallbackTargetDenominator
+        nim_wifi_rf_last_rccal_target = saturatingRfUint32(target)
+      if power != 0'u32 and uint64(power) > target:
+        code = candidate
+      bit = bit shr 1
+
+    var history = 0'u32
+    var ok = false
+    for _ in 0 ..< 63:
+      let candidate = code and RfRccalCodeMask
+      writeRfRccalSearchCode(candidate)
+      waitRfUs(1'u32)
+      let power = sampleRfRccalPower()
+      lastMeasuredCode = candidate
+      lastMeasuredPower = power
+      logRfRccalSearch(logIndex, candidate, power)
+
+      history = (history shl 1) and 0x0F'u32
+      if power != 0'u32 and uint64(power) > target:
+        history = (history + 1'u32) and 0x0F'u32
+        if history == 0x05'u32:
+          ok = true
+          break
+        if code < RfRccalCodeMask:
+          inc code
+      else:
+        if history == 0x0A'u32:
+          ok = true
+          break
+        if code > 0'u32:
+          dec code
+
+    writeRfRccalCode(lastMeasuredCode)
+    nim_wifi_rf_last_rccal_code = lastMeasuredCode
+    nim_wifi_rf_last_rccal_power = lastMeasuredPower
+    (ok, lastMeasuredCode)
+
+  proc runRfPriRccal() =
+    if (rfRegRead(RfCapabilityReg) and RfRccalCapabilityMask) == 0'u32:
+      rfRegClear(RfCalModeReg, RfRccalModeMask)
+      return
+
+    inc nim_wifi_rf_pri_rccal_count
+    rfRegWrite(RfCalModeReg,
+               (rfRegRead(RfCalModeReg) and not RfRccalModeMask) or
+               RfRccalStartMode)
+    let saved = saveRfPriCalState()
+    prepareRfPriRccal()
+    let result = chooseRfRccalCode()
+    restoreRfPriCalState(saved)
+    writeRfRccalCode(result.code)
+    rfPriApplyWb03RccalSeed()
+    if result.ok:
+      rfRegOr(RfCalModeReg, RfRccalDoneMode)
+    else:
+      rfRegWrite(RfCalModeReg,
+                 (rfRegRead(RfCalModeReg) and not RfRccalModeMask) or
+                 RfRccalFailMode)
+
+  proc clampRfTxcalParam(paramInd: uint32, value: int32): int32 {.inline.} =
+    case paramInd
+    of 0'u32, 1'u32:
+      if value < 0'i32: 0'i32
+      elif value > 63'i32: 63'i32
+      else: value
+    of 2'u32:
+      if value < 0'i32: 0'i32
+      elif value > 2047'i32: 2047'i32
+      else: value
+    of 3'u32:
+      if value < -512'i32: -512'i32
+      elif value > 511'i32: 511'i32
+      else: value
+    else:
+      0'i32
+
+  proc encodeRfTxcalParam3(value: int32): uint32 {.inline.} =
+    let clamped = clampRfTxcalParam(3'u32, value)
+    if clamped < 0'i32:
+      uint32(clamped + 1024'i32) and RfTxcalParam3Mask
+    else:
+      uint32(clamped) and RfTxcalParam3Mask
+
+  proc writeRfTxcalParam(paramInd: uint32, value: int32) =
+    let clamped = clampRfTxcalParam(paramInd, value)
+    case paramInd
+    of 0'u32:
+      rfRegUpdate(RfTxcalParam01Reg, RfTxcalParam0Mask,
+                  (uint32(clamped) and 0x3F'u32) shl 24)
+    of 1'u32:
+      rfRegUpdate(RfTxcalParam01Reg, RfTxcalParam1Mask,
+                  (uint32(clamped) and 0x3F'u32) shl 16)
+    of 2'u32:
+      rfRegWrite(RfTxcalTosdacReg,
+                 (rfRegRead(RfTxcalTosdacReg) and not RfTxcalParam2Mask) or
+                 ((uint32(clamped) and 0x7FF'u32) shl 12) or
+                 RfTxcalParam2EnableBit)
+    of 3'u32:
+      rfRegWrite(RfTxcalTosdacReg,
+                 (rfRegRead(RfTxcalTosdacReg) and not RfTxcalParam3Mask) or
+                 encodeRfTxcalParam3(clamped) or RfTxcalParam3SignBit)
+    else:
+      discard
+
+  proc waitRfTxcalMeasurementReady(): bool =
+    for _ in 0 ..< RfTxcalWaitLimit:
+      if (rfRegRead(RfMeasureCtrlReg) and RfMeasureReadyMask) != 0'u32:
+        return true
+      waitRfUs(1'u32)
+    inc nim_wifi_rf_txcal_wait_timeout_count
+    false
+
+  proc clampRfTxcalAmp(value: int32): uint32 {.inline.} =
+    if value < 0'i32:
+      0'u32
+    elif value > int32(RfTxcalSingenAmplitudeMask):
+      RfTxcalSingenAmplitudeMask
+    else:
+      uint32(value)
+
+  proc writeRfTxcalSingenAmplitude(amp: uint32) =
+    let value = amp and RfTxcalSingenAmplitudeMask
+    rfRegUpdate(RfPriRccalSingenReg1, RfTxcalSingenAmplitudeMask, value)
+    rfRegUpdate(RfPriRccalSingenReg2, RfTxcalSingenAmplitudeMask, value)
+    rfRegClear(RfPriRccalSingenReg0, 0x80000000'u32)
+    rfRegOr(RfPriRccalSingenReg0, 0x80000000'u32)
+    startRfPriTxDfeForCal()
+
+  proc sampleRfTxcalAverage(): tuple[ok: bool, value: int32] =
+    rfRegClear(RfMeasureCtrlReg, RfMeasureTriggerClearMask)
+    rfRegWrite(RfMeasureModeReg,
+               (rfRegRead(RfMeasureModeReg) and RfMeasureModeKeepMask) or
+               RfTxcalAverageMeasureMode)
+    rfRegOr(RfMeasureCtrlReg, RfMeasureStartMask)
+    if not waitRfTxcalMeasurementReady():
+      rfRegClear(RfMeasureCtrlReg, RfMeasureTriggerClearMask)
+      return (false, 0'i32)
+
+    let sample = signedRfAverageMeasurement(rfRegRead(RfMeasureIReg))
+    rfRegClear(RfMeasureCtrlReg, RfMeasureTriggerClearMask)
+    (true, sample)
+
+  proc tuneRfTxcalSingenPower(initialAmp: uint32,
+                              adcMeanMax, adcMeanMin: int32): uint32 =
+    inc nim_wifi_rf_txcal_amp_search_count
+    var amp = int32(initialAmp and RfTxcalSingenAmplitudeMask)
+    var step = amp div 2'i32
+    var lastMean = 0'i32
+
+    while true:
+      let clamped = clampRfTxcalAmp(amp)
+      writeRfTxcalSingenAmplitude(clamped)
+      waitRfUs(10'u32)
+      let sample = sampleRfTxcalAverage()
+      if sample.ok:
+        lastMean = sample.value
+      nim_wifi_rf_last_txcal_amp = clamped
+      nim_wifi_rf_last_txcal_amp_mean = cast[uint32](lastMean)
+
+      if sample.ok and lastMean >= adcMeanMin and lastMean <= adcMeanMax:
+        return clamped
+      if step == 0'i32:
+        return clamped
+
+      if not sample.ok or lastMean < adcMeanMin:
+        amp = int32(clamped) + step
+      else:
+        amp = int32(clamped) - step
+      step = step div 2'i32
+
+  proc writeRfTxcalMixerCs(value: uint32) =
+    rfRegUpdate(RfPriTxcalDcReg, RfTxcalMixerCsMask,
+                value and RfTxcalMixerCsMask)
+
+  proc chooseRfTxcalMixerCs(): uint32 =
+    var best = 0'u32
+    var bestPower = low(int32)
+    for cs in 0'u32 ..< uint32(RfTxcalMixerCsCount):
+      writeRfTxcalMixerCs(cs)
+      let sample = sampleRfTxcalAverage()
+      let power = if sample.ok: sample.value else: low(int32)
+      nim_wifi_rf_txcal_tmxcs_power_log[int(cs)] = cast[uint32](power)
+      if power > bestPower:
+        bestPower = power
+        best = cs
+
+    writeRfTxcalMixerCs(best)
+    if rfCalibDataGlobal != nil:
+      rfCalibSetWord(2, (rfCalibWord(2) and 0xF8FF_FFFF'u32) or
+                         ((best and RfTxcalMixerCsMask) shl 24))
+    nim_wifi_rf_last_txcal_tmxcs = best
+    nim_wifi_rf_last_txcal_tmxcs_power = cast[uint32](bestPower)
+    best
+
+  proc prepareRfTxcalSearchStage() =
+    rfRegWrite(RfPriRccalSingenReg0,
+               (rfRegRead(RfPriRccalSingenReg0) and 0xFC00_FFFF'u32) or
+               0x003D_0000'u32)
+    rfRegWrite(RfPriRccalSingenReg1,
+               rfRegRead(RfPriRccalSingenReg1) and 0x003F_FFFF'u32)
+    rfRegWrite(RfPriRccalSingenReg2,
+               (rfRegRead(RfPriRccalSingenReg2) and 0x003F_FFFF'u32) or
+               0xC000_0000'u32)
+    rfRegWrite(RfPriInit64Reg,
+               (rfRegRead(RfPriInit64Reg) and 0x0FC3_FFFF'u32) or
+               0x9030_0000'u32)
+    rfRegWrite(RfPriInit58Reg,
+               (rfRegRead(RfPriInit58Reg) and 0xFFF8_FFFF'u32) or
+               0x0004_0000'u32)
+    rfRegWrite(RfPriRccalToneReg,
+               (rfRegRead(RfPriRccalToneReg) and 0xCE0F_FFFF'u32) or
+               0x0077_0000'u32)
+    rfRegWrite(RfPriInit8cReg,
+               (rfRegRead(RfPriInit8cReg) and not 0x0000_0030'u32) or
+               0x0000_0010'u32)
+
+  proc sampleRfTxcalPower(measFreq: uint32): tuple[ok: bool, power, iRaw, qRaw, ctrl: uint32] =
+    rfRegWrite(RfMeasureCtrlReg,
+               (rfRegRead(RfMeasureCtrlReg) and 0xFFF00000'u32) or
+               ((measFreq and 0x07FF'u32) shl RfMeasureFrequencyShift))
+    rfRegClear(RfMeasureCtrlReg, RfMeasureRccalTriggerMask)
+    rfRegOr(RfMeasureCtrlReg, RfMeasureRccalTriggerMask)
+    if not waitRfTxcalMeasurementReady():
+      rfRegClear(RfMeasureCtrlReg, RfMeasureRccalTriggerMask)
+      return (false, 0'u32, 0'u32, 0'u32, rfRegRead(RfMeasureCtrlReg))
+
+    let iRaw = rfRegRead(RfMeasureIReg)
+    let qRaw = rfRegRead(RfMeasureQReg)
+    let ctrl = rfRegRead(RfMeasureCtrlReg)
+    let iSample = signedRfPowerMeasurement(iRaw)
+    let qSample = signedRfPowerMeasurement(qRaw)
+    rfRegClear(RfMeasureCtrlReg, RfMeasureRccalTriggerMask)
+    (true, saturatingRfUint32(squareRfSample(iSample) + squareRfSample(qSample)),
+     iRaw, qRaw, ctrl)
+
+  proc measureRfTxcalCandidate(paramInd: uint32, candidate: int32,
+                               measFreq: uint32): tuple[ok: bool, power: uint32] =
+    writeRfTxcalParam(paramInd, candidate)
+    waitRfUs(10'u32)
+    let sample = sampleRfTxcalPower(measFreq)
+    let idx = int(nim_wifi_rf_txcal_sample_count mod RfTxcalSampleTraceEntries.uint32)
+    inc nim_wifi_rf_txcal_sample_count
+    nim_wifi_rf_txcal_sample_param_log[idx] = paramInd
+    nim_wifi_rf_txcal_sample_candidate_log[idx] = cast[uint32](candidate)
+    nim_wifi_rf_txcal_sample_freq_log[idx] = measFreq
+    nim_wifi_rf_txcal_sample_ctrl_log[idx] = sample.ctrl
+    nim_wifi_rf_txcal_sample_i_log[idx] = sample.iRaw
+    nim_wifi_rf_txcal_sample_q_log[idx] = sample.qRaw
+    nim_wifi_rf_txcal_sample_power_log[idx] = sample.power
+    (sample.ok, sample.power)
+
+  proc searchRfTxcalParam(paramInd: uint32, center, delta: int32,
+                          measFreq: uint32): tuple[ok: bool, value: int32,
+                                                    power: uint32] =
+    inc nim_wifi_rf_txcal_search_count
+    var bestValue = clampRfTxcalParam(paramInd, center)
+    var bestPower = high(uint32)
+    var anyOk = false
+
+    let centerSample = measureRfTxcalCandidate(paramInd, bestValue, measFreq)
+    if centerSample.ok:
+      bestPower = centerSample.power
+      anyOk = true
+
+    var step = delta
+    while step > 0'i32:
+      let baseValue = bestValue
+      let leftValue = clampRfTxcalParam(paramInd, baseValue - step)
+      let leftSample = measureRfTxcalCandidate(paramInd, leftValue, measFreq)
+      let nextStep = step div 2'i32
+      if leftSample.ok:
+        let leftImproved = not anyOk or leftSample.power < bestPower
+        if leftImproved:
+          bestValue = leftValue
+          bestPower = leftSample.power
+        anyOk = true
+        if leftImproved:
+          step = nextStep
+          continue
+
+      let rightValue = clampRfTxcalParam(paramInd, baseValue + step)
+      let rightSample = measureRfTxcalCandidate(paramInd, rightValue, measFreq)
+      if rightSample.ok:
+        if not anyOk or rightSample.power < bestPower:
+          bestValue = rightValue
+          bestPower = rightSample.power
+        anyOk = true
+
+      step = nextStep
+
+    writeRfTxcalParam(paramInd, bestValue)
+    if anyOk:
+      (true, bestValue, bestPower)
+    else:
+      (false, bestValue, 0'u32)
+
+  proc packRfTxcalCalWord0(p0, p1, p2: int32): uint32 {.inline.} =
+    ## Vendor wl_cal TXCAL layout at rf_calib_data+0x68:
+    ## p0 byte, p1 byte, p2 halfword, p3 halfword.
+    (uint32(clampRfTxcalParam(0'u32, p0)) and 0x3F'u32) or
+      ((uint32(clampRfTxcalParam(1'u32, p1)) and 0x3F'u32) shl 8) or
+      ((uint32(clampRfTxcalParam(2'u32, p2)) and 0x7FF'u32) shl 16)
+
+  proc packRfTxcalCalWord1(p3: int32): uint32 {.inline.} =
+    encodeRfTxcalParam3(p3)
+
+  proc storeRfTxcalRecord(index: int, p0, p1, p2, p3: int32, power: uint32) =
+    if rfCalibDataGlobal == nil:
+      return
+    let word0 = packRfTxcalCalWord0(p0, p1, p2)
+    let word1 = packRfTxcalCalWord1(p3)
+    let base = index * 2
+    rfCalibSetWord(RfPriTxcalRecordBaseWord + base, word0)
+    rfCalibSetWord(RfPriTxcalRecordBaseWord + base + 1, word1)
+    nim_wifi_rf_last_txcal_word0 = word0
+    nim_wifi_rf_last_txcal_word1 = word1
+    if index >= 0 and index < RfPriTxcalSearchRecords:
+      nim_wifi_rf_txcal_word0_log[index] = word0
+      nim_wifi_rf_txcal_word1_log[index] = word1
+      nim_wifi_rf_txcal_power_log[index] = power
+
+  proc storeRfPriBzTxcalRecord(index: int, p0, p1, p2, p3: int32) =
+    if rfCalibDataGlobal == nil:
+      return
+    let offset = 0xF8 + index * 8
+    let word0 = packRfTxcalCalWord0(p0, p1, p2)
+    let word1 = packRfTxcalCalWord1(p3)
+    rfCalibSetByte(offset, (word0 and 0xFF'u32).uint8)
+    rfCalibSetByte(offset + 1, ((word0 shr 8) and 0xFF'u32).uint8)
+    rfCalibSetHalf((offset + 2) div 2, ((word0 shr 16) and 0xFFFF'u32).uint16)
+    rfCalibSetHalf((offset + 4) div 2, (word1 and 0xFFFF'u32).uint16)
+    if index >= 0 and index < RfPriBzTxcalSearchRecords:
+      nim_wifi_rf_bz_txcal_word0_log[index] = word0
+      nim_wifi_rf_bz_txcal_word1_log[index] = word1
+
+  proc configureRfPriTxcalGain(setup: array[9, uint16],
+                               param: array[7, uint32]) =
+    rfRegWrite(RfPriTxcalDcReg,
+               (rfRegRead(RfPriTxcalDcReg) and not 0x00000003'u32) or
+               (param[3] and 0x03'u32))
+    rfRegWrite(RfPriInit64Reg,
+               (rfRegRead(RfPriInit64Reg) and 0x0FC3FFFF'u32) or
+               ((param[0] and 0x3F'u32) shl 28) or
+               ((param[2] and 0x3F'u32) shl 18))
+    rfRegWrite(RfPriInit58Reg,
+               (rfRegRead(RfPriInit58Reg) and 0xFFF8FFFF'u32) or
+               ((param[1] and 0x07'u32) shl 16))
+    rfRegWrite(RfPriRccalToneReg,
+               (rfRegRead(RfPriRccalToneReg) and 0xCE08FFFF'u32) or
+               ((uint32(setup[0]) and 0x03'u32) shl 28) or
+               ((uint32(setup[3]) and 0x1F'u32) shl 20) or
+               ((param[5] and 0x07'u32) shl 16))
+    rfRegWrite(RfPriInit68Reg,
+               (rfRegRead(RfPriInit68Reg) and 0x1FFFFFFF'u32) or
+               ((param[6] and 0x07'u32) shl 29))
+
+  proc configureRfPriTxcalGain(index: int, param: array[7, uint32]) =
+    configureRfPriTxcalGain(RfPriTxcalPowerSetup[index], param)
+
+  proc prepareRfPriTxcal() =
+    rfRegClear(RfCtrlReg, RfCtrlTuneEnableMask)
+    rfRegWrite(RfSynthCtrlReg, 0'u32)
+    rfRegOr(RfPriModeCtrlReg, 0x00000002'u32)
+    rfRegWrite(RfPriModeCtrlReg,
+               (rfRegRead(RfPriModeCtrlReg) and 0xCEFFF8FF'u32) or
+               0xCEFF7800'u32)
+    waitRfUs(1'u32)
+
+    rfRegOr(0x2000123C'u32, 0x00040000'u32)
+    startRfPriTxDfeForCal()
+    startRfPriRxDfeForCal()
+    rfRegOr(0x2000123C'u32, 0x00040000'u32)
+    rfRegOr(RfCalCtrlReg, 0x00003000'u32)
+    rfRegOr(RfPriTxcalDfeReg, 0x80000000'u32)
+    rfRegOr(RfPriInit64Reg, 0x00400000'u32)
+    rfRegWrite(RfPriTxcalDcReg,
+               (rfRegRead(RfPriTxcalDcReg) and not 0x00000007'u32) or
+               0x00000004'u32)
+
+    rfRegWrite(RfPriRccalSingenReg0,
+               (rfRegRead(RfPriRccalSingenReg0) and 0xFC00FFFF'u32) or
+               0x00B00000'u32)
+    rfRegWrite(RfPriRccalSingenReg1,
+               rfRegRead(RfPriRccalSingenReg1) and 0x003FFFFF'u32)
+    rfRegWrite(RfPriRccalSingenReg2,
+               (rfRegRead(RfPriRccalSingenReg2) and 0x003FFFFF'u32) or
+               0xC0000000'u32)
+    rfRegClear(RfPriRccalSingenReg0, 0x80000000'u32)
+    rfRegOr(RfPriRccalSingenReg0, 0x80000000'u32)
+
+    rfRegOr(RfPriModeCtrlReg, 0x00000003'u32)
+    rfRegWrite(RfPriInit64Reg,
+               (rfRegRead(RfPriInit64Reg) and 0x0FC3FFFF'u32) or
+               0x50000000'u32)
+    rfRegWrite(RfPriInit58Reg,
+               (rfRegRead(RfPriInit58Reg) and 0xFFF8FFFF'u32) or
+               0x00040000'u32)
+    rfRegWrite(RfPriRccalToneReg,
+               (rfRegRead(RfPriRccalToneReg) and 0xCE08FFFF'u32) or
+               0x00870000'u32)
+    rfRegWrite(RfPriInit68Reg,
+               (rfRegRead(RfPriInit68Reg) and 0x1DFFFFFF'u32) or
+               0xE0000000'u32)
+    rfRegWrite(RfMeasureModeReg,
+               (rfRegRead(RfMeasureModeReg) and RfMeasureModeKeepMask) or
+               RfMeasureRoscalMode)
+    discard tuneRfTxcalSingenPower(RfTxcalInitialAmp,
+                                   RfTxcalInitialAdcMax,
+                                   RfTxcalInitialAdcMin)
+    discard chooseRfTxcalMixerCs()
+    prepareRfTxcalSearchStage()
+
+  proc prepareRfPriBzTxcal() =
+    rfRegClear(RfCtrlReg, RfCtrlTuneEnableMask)
+    rfRegWrite(RfSynthCtrlReg, 0'u32)
+    rfRegOr(RfPriModeCtrlReg, 0x00000002'u32)
+    rfRegWrite(RfPriModeCtrlReg,
+               (rfRegRead(RfPriModeCtrlReg) and 0xCEFFF8FF'u32) or
+               0xCEFF7800'u32)
+    waitRfUs(1'u32)
+
+    rfRegOr(0x2000123C'u32, 0x00040000'u32)
+    rfRegWrite(RfRxModeReg,
+               (rfRegRead(RfRxModeReg) and not 0x00000180'u32) or
+               0x00000100'u32)
+    rfRegWrite(RfRxModeReg,
+               (rfRegRead(RfRxModeReg) and not 0x00007800'u32) or
+               0x00001080'u32)
+    rfRegOr(RfRxModeReg, 0x00000001'u32)
+    rfRegOr(0x2000123C'u32, 0x00040000'u32)
+    rfRegWrite(RfRxModeReg,
+               (rfRegRead(RfRxModeReg) and not 0x00000060'u32) or
+               0x00000020'u32)
+    rfRegOr(RfRxModeReg, 0x00000040'u32)
+    rfRegOr(RfCalCtrlReg, 0x00003000'u32)
+    rfRegOr(RfPriTxcalDfeReg, 0x80000000'u32)
+    rfRegOr(RfPriInit64Reg, 0x00800000'u32)
+    rfRegWrite(RfPriRccalSingenReg0,
+               (rfRegRead(RfPriRccalSingenReg0) and 0xFC00FFFF'u32) or
+               0x00490000'u32)
+    rfRegWrite(RfPriRccalSingenReg1,
+               rfRegRead(RfPriRccalSingenReg1) and 0x003FFFFF'u32)
+    rfRegWrite(RfPriRccalSingenReg2,
+               (rfRegRead(RfPriRccalSingenReg2) and 0x003FFFFF'u32) or
+               0xC0000000'u32)
+    rfRegOr(RfPriModeCtrlReg, 0x00000003'u32)
+    rfRegWrite(RfPriInit64Reg,
+               (rfRegRead(RfPriInit64Reg) and 0x0FC3FFFF'u32) or
+               0x90300000'u32)
+    rfRegWrite(RfPriInit58Reg,
+               (rfRegRead(RfPriInit58Reg) and 0xFFF8FFFF'u32) or
+               0x00040000'u32)
+    rfRegWrite(RfPriRccalToneReg,
+               (rfRegRead(RfPriRccalToneReg) and 0xCE0FFFFF'u32) or
+               0x00770000'u32)
+    rfRegWrite(RfPriInit8cReg,
+               (rfRegRead(RfPriInit8cReg) and not 0x00000030'u32) or
+               0x00000010'u32)
+    rfRegWrite(RfPriInit64Reg,
+               (rfRegRead(RfPriInit64Reg) and 0xF8FFFFFF'u32) or
+               0x04000000'u32)
+
+  proc runRfPriTxcal() =
+    if rfCalibDataGlobal == nil:
+      return
+    inc nim_wifi_rf_pri_txcal_count
+    rfRegWrite(RfCalModeReg,
+               (rfRegRead(RfCalModeReg) and not RfTxcalModeMask) or
+               RfTxcalStartMode)
+    let saved = saveRfPriCalState()
+    prepareRfPriTxcal()
+
+    var allOk = true
+    for i in 0 ..< RfPriTxcalSearchRecords:
+      configureRfPriTxcalGain(i, RfPriTxcalParams[i])
+      let amp = tuneRfTxcalSingenPower(RfTxcalGainAmp,
+                                       RfTxcalGainAdcMax,
+                                       RfTxcalGainAdcMin)
+      nim_wifi_rf_txcal_amp_log[i] = amp
+
+      let p0a = searchRfTxcalParam(0'u32, 0x20'i32, 0x10'i32,
+                                   RfTxcalSearchFreqIq)
+      let p1a = searchRfTxcalParam(1'u32, 0x20'i32, 0x10'i32,
+                                   RfTxcalSearchFreqIq)
+      let p0b = searchRfTxcalParam(0'u32, p0a.value, 0x08'i32,
+                                   RfTxcalSearchFreqIq)
+      let p1b = searchRfTxcalParam(1'u32, p1a.value, 0x08'i32,
+                                   RfTxcalSearchFreqIq)
+      let p2a = searchRfTxcalParam(2'u32, 0x400'i32, 0x80'i32,
+                                   RfTxcalSearchFreqOsdac)
+      let p3a = searchRfTxcalParam(3'u32, 0'i32, 0x40'i32,
+                                   RfTxcalSearchFreqOsdac)
+      let p2b = searchRfTxcalParam(2'u32, p2a.value, 0x40'i32,
+                                   RfTxcalSearchFreqOsdac)
+      let p3b = searchRfTxcalParam(3'u32, p3a.value, 0x20'i32,
+                                   RfTxcalSearchFreqOsdac)
+
+      allOk = allOk and p0a.ok and p1a.ok and p0b.ok and p1b.ok and
+        p2a.ok and p3a.ok and p2b.ok and p3b.ok
+      storeRfTxcalRecord(i, p0b.value, p1b.value, p2b.value, p3b.value,
+                         p0b.power or p1b.power or p2b.power or p3b.power)
+
+    restoreRfPriCalState(saved)
+    if allOk:
+      rfRegWrite(RfCalModeReg,
+                 (rfRegRead(RfCalModeReg) and not RfTxcalModeMask) or
+                 RfTxcalDoneMode)
+
+  proc runRfPriBzTxcal() =
+    if rfCalibDataGlobal == nil:
+      return
+    rfRegWrite(RfCalModeReg,
+               (rfRegRead(RfCalModeReg) and not RfTxcalModeMask) or
+               RfTxcalStartMode)
+    let saved = saveRfPriCalState()
+    prepareRfPriBzTxcal()
+    rfPriSnapshotBzTxcalState(0xB3'u32)
+
+    var allOk = true
+    for i in 0 ..< RfPriBzTxcalSearchRecords:
+      configureRfPriTxcalGain(RfPriBzTxcalPowerSetup[i],
+                              RfPriBzTxcalParams[i])
+      discard tuneRfTxcalSingenPower(RfTxcalGainAmp,
+                                     RfTxcalGainAdcMax,
+                                     RfTxcalGainAdcMin)
+
+      let p0a = searchRfTxcalParam(0'u32, 0x20'i32, 0x10'i32,
+                                   RfBzTxcalSearchFreqIq)
+      let p1a = searchRfTxcalParam(1'u32, 0x20'i32, 0x10'i32,
+                                   RfBzTxcalSearchFreqIq)
+      let p0b = searchRfTxcalParam(0'u32, p0a.value, 0x08'i32,
+                                   RfBzTxcalSearchFreqIq)
+      let p1b = searchRfTxcalParam(1'u32, p1a.value, 0x08'i32,
+                                   RfBzTxcalSearchFreqIq)
+      let p2a = searchRfTxcalParam(2'u32, 0x400'i32, 0x80'i32,
+                                   RfBzTxcalSearchFreqOsdac)
+      let p3a = searchRfTxcalParam(3'u32, 0'i32, 0x40'i32,
+                                   RfBzTxcalSearchFreqOsdac)
+      let p2b = searchRfTxcalParam(2'u32, p2a.value, 0x40'i32,
+                                   RfBzTxcalSearchFreqOsdac)
+      let p3b = searchRfTxcalParam(3'u32, p3a.value, 0x20'i32,
+                                   RfBzTxcalSearchFreqOsdac)
+
+      let okMask =
+        (if p0a.ok: 0x01'u32 else: 0'u32) or
+        (if p1a.ok: 0x02'u32 else: 0'u32) or
+        (if p0b.ok: 0x04'u32 else: 0'u32) or
+        (if p1b.ok: 0x08'u32 else: 0'u32) or
+        (if p2a.ok: 0x10'u32 else: 0'u32) or
+        (if p3a.ok: 0x20'u32 else: 0'u32) or
+        (if p2b.ok: 0x40'u32 else: 0'u32) or
+        (if p3b.ok: 0x80'u32 else: 0'u32)
+      nim_wifi_rf_bz_txcal_ok_mask_log[i] = okMask
+      nim_wifi_rf_bz_txcal_power_log[i] =
+        (p0b.power and 0xFFFF'u32) or ((p1b.power and 0xFFFF'u32) shl 16)
+
+      let rowOk = p0a.ok and p1a.ok and p0b.ok and p1b.ok and
+        p2a.ok and p3a.ok and p2b.ok and p3b.ok
+      allOk = allOk and rowOk
+      if rowOk:
+        storeRfPriBzTxcalRecord(i, p0b.value, p1b.value,
+                                p2b.value, p3b.value)
+      else:
+        storeRfPriBzTxcalRecord(i, 0x20'i32, 0x20'i32, 0x400'i32, 0'i32)
+
+    rfPriSnapshotBzTxcalState(0xB4'u32)
+    rfRegClear(RfCalCtrlReg, 0x00003000'u32)
+    rfRegWrite(RfPriInit64Reg,
+               (rfRegRead(RfPriInit64Reg) and 0xF8FFFFFF'u32) or
+               0x03000000'u32)
+    restoreRfPriCalState(saved)
+    if allOk:
+      rfRegWrite(RfCalModeReg,
+                 (rfRegRead(RfCalModeReg) and not RfTxcalModeMask) or
+                 RfTxcalDoneMode)
+
+  proc waitRfRxcalMeasurementReady(): bool =
+    for _ in 0 ..< RfRxcalWaitLimit:
+      if (rfRegRead(RfMeasureCtrlReg) and RfMeasureReadyMask) != 0'u32:
+        return true
+      waitRfUs(1'u32)
+    inc nim_wifi_rf_rxcal_wait_timeout_count
+    false
+
+  proc clampRfRxcalParam(paramInd: uint32, value: int32): int32 {.inline.} =
+    if paramInd == 2'u32:
+      if value < 0'i32:
+        0'i32
+      elif value > 0x7FF'i32:
+        0x7FF'i32
+      else:
+        value
+    else:
+      if value < -0x200'i32:
+        -0x200'i32
+      elif value > 0x1FF'i32:
+        0x1FF'i32
+      else:
+        value
+
+  proc writeRfRxcalParam(paramInd: uint32, value: int32) =
+    let clamped = clampRfRxcalParam(paramInd, value)
+    var word = rfRegRead(RfPriRxcalSearchReg)
+    if paramInd == 2'u32:
+      word = (word and not RfRxcalSearchHighMask) or
+        ((uint32(clamped) shl 12) and RfRxcalSearchHighMask) or
+        RfRxcalSearchHighEnable
+    else:
+      word = (word and not RfRxcalSearchLowMask) or
+        (uint32(clamped) and RfRxcalSearchLowMask) or 0x00000400'u32
+    rfRegWrite(RfPriRxcalSearchReg, word)
+
+  proc sampleRfRxcalPower(): tuple[ok: bool, power: uint32] =
+    rfRegWrite(RfMeasureCtrlReg,
+               (rfRegRead(RfMeasureCtrlReg) and 0xFFF00000'u32) or
+               RfRxcalMeasureSetupMask)
+    rfRegClear(RfMeasureCtrlReg, RfRxcalMeasureClearMask)
+    rfRegOr(RfMeasureCtrlReg, RfRxcalMeasureClearMask)
+    if not waitRfRxcalMeasurementReady():
+      rfRegClear(RfMeasureCtrlReg, RfRxcalMeasureClearMask)
+      return (false, 0'u32)
+
+    let iSample = signedRfPowerMeasurement(rfRegRead(RfMeasureIReg))
+    let qSample = signedRfPowerMeasurement(rfRegRead(RfMeasureQReg))
+    rfRegClear(RfMeasureCtrlReg, RfRxcalMeasureClearMask)
+    (true, saturatingRfUint32(squareRfSample(iSample) + squareRfSample(qSample)))
+
+  proc measureRfRxcalCandidate(paramInd: uint32, candidate: int32):
+      tuple[ok: bool, power: uint32] =
+    writeRfRxcalParam(paramInd, candidate)
+    waitRfUs(10'u32)
+    sampleRfRxcalPower()
+
+  proc searchRfRxcalParam(paramInd: uint32, center, delta: int32):
+      tuple[ok: bool, value: int32, power: uint32] =
+    inc nim_wifi_rf_rxcal_search_count
+    var bestValue = clampRfRxcalParam(paramInd, center)
+    var bestPower = high(uint32)
+    var anyOk = false
+
+    let centerSample = measureRfRxcalCandidate(paramInd, bestValue)
+    if centerSample.ok:
+      bestPower = centerSample.power
+      anyOk = true
+
+    var step = delta
+    while step > 0'i32:
+      let centerValue = bestValue
+      let leftValue = clampRfRxcalParam(paramInd, centerValue - step)
+      let leftSample = measureRfRxcalCandidate(paramInd, leftValue)
+      if leftSample.ok:
+        if not anyOk or leftSample.power < bestPower:
+          bestValue = leftValue
+          bestPower = leftSample.power
+        anyOk = true
+
+      let rightValue = clampRfRxcalParam(paramInd, centerValue + step)
+      let rightSample = measureRfRxcalCandidate(paramInd, rightValue)
+      if rightSample.ok:
+        if not anyOk or rightSample.power < bestPower:
+          bestValue = rightValue
+          bestPower = rightSample.power
+        anyOk = true
+
+      step = step div 2'i32
+
+    writeRfRxcalParam(paramInd, bestValue)
+    if anyOk:
+      (true, bestValue, bestPower)
+    else:
+      (false, bestValue, 0'u32)
+
+  proc packRfRxcalWord0(p2: int32): uint32 {.inline.} =
+    (uint32(clampRfRxcalParam(2'u32, p2)) and 0x07FF'u32) shl 16
+
+  proc packRfRxcalWord1(p3: int32): uint32 {.inline.} =
+    uint32(clampRfRxcalParam(3'u32, p3)) and 0x03FF'u32
+
+  proc storeRfRxcalRecord(index: int, p2, p3: int32, power: uint32) =
+    if rfCalibDataGlobal == nil or index < 0 or index >= 4:
+      return
+    let word0 = packRfRxcalWord0(p2)
+    let word1 = packRfRxcalWord1(p3)
+    let base = 18 + index * 2
+    rfCalibSetWord(base, (rfCalibWord(base) and 0x0000FFFF'u32) or word0)
+    rfCalibSetWord(base + 1, (rfCalibWord(base + 1) and 0xFFFF0000'u32) or word1)
+    rfRegWrite(RfPriRxcalReg0 + uint32(index * 4),
+               (rfRegRead(RfPriRxcalReg0 + uint32(index * 4)) and
+                0xF800FC00'u32) or word0 or word1)
+    nim_wifi_rf_last_rxcal_word0 = rfCalibWord(base)
+    nim_wifi_rf_last_rxcal_word1 = rfCalibWord(base + 1)
+    nim_wifi_rf_last_rxcal_power = power
+    nim_wifi_rf_rxcal_word0_log[index] = nim_wifi_rf_last_rxcal_word0
+    nim_wifi_rf_rxcal_word1_log[index] = nim_wifi_rf_last_rxcal_word1
+    nim_wifi_rf_rxcal_power_log[index] = power
+
+  proc rfPriReplayRxcalRegs() =
+    if rfCalibDataGlobal == nil:
+      return
+    for i in 0 ..< 4:
+      let base = 18 + i * 2
+      updateReg32(cast[ptr uint32](RfBase + 0x170'u + uint(i * 4)),
+                  0xF800FC00'u32,
+                  (rfCalibWord(base + 1) and 0x3FF'u32) or
+                  (rfCalibWord(base) and 0x07FF0000'u32))
+
+  proc rfPriSeedRxcalRestoreLowHalves() =
+    ## rf_pri_rxcal preserves the low halfword of wl_cal words 18/20/22/24;
+    ## rf_pri_restore_cal_reg later packs those bytes into RF[0x1168/0x116c].
+    ## The vendor WB03/40M restore baseline also leaves the RXCAL replay words
+    ## at the centered 0x400 code, which maps to RF[0x1170..0x117c]=0x04000000.
+    ## Fresh pure-Nim calibration memory reaches RXCAL empty, while vendor-good
+    ## WB03/40M restore has 0x2123 in each of those low halfwords.
+    if rfCalibDataGlobal == nil:
+      return
+    for i in 0 ..< 4:
+      let base = 18 + i * 2
+      let word0 = rfCalibWord(base)
+      if (word0 and 0x07FF_FFFF'u32) == 0'u32 or
+          (word0 and 0x0000FFFF'u32) == 0x2023'u32:
+        rfCalibSetWord(base, 0x04002123'u32)
+
+  proc prepareRfPriRxcal() =
+    rfPhyTraceCheckpoint(0x30'u32)
+    rfRegClear(RfCtrlReg, RfCtrlTuneEnableMask)
+    rfRegWrite(RfSynthCtrlReg, 0'u32)
+    rfRegOr(RfPriModeCtrlReg, 0x00000002'u32)
+    rfRegWrite(RfPriModeCtrlReg,
+               (rfRegRead(RfPriModeCtrlReg) and 0x8FFFFEFF'u32) or
+               0x8FFF7E00'u32)
+    rfPriConfigChannelForCal(9)
+
+    rfRegOr(0x200010BC'u32, 0x20000000'u32)
+    rfRegOr(RfTxcalCtrlReg, 0x01000000'u32)
+    waitRfUs(1'u32)
+    rfRegOr(0x2000123C'u32, 0x00040000'u32)
+    rfRegClear(RfRxModeReg, 0x00000180'u32)
+    rfRegWrite(RfRxModeReg,
+               (rfRegRead(RfRxModeReg) and 0xFFFFE7FF'u32) or 0x00001082'u32)
+    rfRegWrite(RfRxModeReg,
+               (rfRegRead(RfRxModeReg) and not 0x00000010'u32) or
+               0x00000100'u32)
+    rfRegOr(0x2000123C'u32, 0x00040000'u32)
+    rfRegWrite(RfRxModeReg,
+               (rfRegRead(RfRxModeReg) and not 0x00000060'u32) or
+               0x00000021'u32)
+    rfRegOr(RfRxModeReg, 0x00000040'u32)
+    rfRegOr(RfPriTxcalDfeReg, 0x10000000'u32)
+    rfRegOr(RfPriInit64Reg, 0x00800000'u32)
+    rfRegWrite(RfTxcalParamReg,
+               (rfRegRead(RfTxcalParamReg) and not 0x0000000F'u32) or
+               ((rfCalibWord(3) shr 24) and 0x0000000F'u32))
+    rfRegWrite(RfPriInit90Reg,
+               (rfRegRead(RfPriInit90Reg) and not 0x00000030'u32) or
+               0x00000010'u32)
+    rfPriApplyWb03RuntimeLatches()
+    rfRegWrite(0x20001088'u32,
+               (rfRegRead(0x20001088'u32) and 0xFCFFFFFF'u32) or
+               0x02000000'u32)
+    rfRegOr(0x20001060'u32, 0x00000003'u32)
+    rfRegWrite(RfPriInit64Reg,
+               (rfRegRead(RfPriInit64Reg) and 0x0F83FFFF'u32) or
+               0x201C0000'u32)
+    rfRegWrite(RfPriInit58Reg,
+               (rfRegRead(RfPriInit58Reg) and 0xFFF8FFFF'u32) or
+               0x00040000'u32)
+    rfRegWrite(RfPriRccalToneReg,
+               (rfRegRead(RfPriRccalToneReg) and 0xCE08FFFF'u32) or
+               0x00700000'u32)
+    rfRegWrite(RfPriInit68Reg,
+               (rfRegRead(RfPriInit68Reg) and 0x1DFFFFFF'u32) or
+               0xA0000000'u32)
+    rfRegWrite(RfPriRccalToneReg,
+               (rfRegRead(RfPriRccalToneReg) and 0xFFFF8CFF'u32) or
+               0x0000311F'u32)
+    waitRfUs(10'u32)
+    let cfgA8 = wlCfgU32(0xA8)
+    let cfgAc = wlCfgU32(0xAC)
+    rfRegWrite(RfTxcalTosdacReg,
+               (rfRegRead(RfTxcalTosdacReg) and not 0x000003FF'u32) or
+               (cfgAc and 0x000003FF'u32) or 0x00000400'u32)
+    rfRegWrite(RfTxcalTosdacReg,
+               (rfRegRead(RfTxcalTosdacReg) and 0xFF800FFF'u32) or
+               (((cfgA8 shr 4) shl 12) and 0x007FF000'u32) or
+               0x00800000'u32)
+    rfRegWrite(RfTxcalParam01Reg,
+               (rfRegRead(RfTxcalParam01Reg) and 0xC100FFFF'u32) or
+               ((cfgA8 shl 24) and 0x3F000000'u32))
+    rfRegWrite(RfTxcalParam01Reg,
+               (rfRegRead(RfTxcalParam01Reg) and 0xFFC10FFF'u32) or
+               ((cfgA8 shl 8) and 0x003F0000'u32))
+    rfRegWrite(RfMeasureModeReg,
+               (rfRegRead(RfMeasureModeReg) and 0x0000FFFF'u32) or
+               0x50000000'u32)
+    rfRegWrite(RfMeasureCtrlReg,
+               (rfRegRead(RfMeasureCtrlReg) and not 0x40000000'u32) or
+               0x40000000'u32)
+    rfRegWrite(RfPriRxcalSearchReg,
+               (rfRegRead(RfPriRxcalSearchReg) and 0xFF800FFF'u32) or
+               0x00C00000'u32)
+    rfRegWrite(RfPriRxcalSearchReg,
+               (rfRegRead(RfPriRxcalSearchReg) and not 0x000003FF'u32) or
+               0x00000400'u32)
+    rfRegWrite(0x2000120C'u32,
+               (rfRegRead(0x2000120C'u32) and 0xFC010FFF'u32) or
+               0x00400000'u32)
+    rfRegWrite(0x20001214'u32,
+               (rfRegRead(0x20001214'u32) and 0x003FFFFF'u32) or
+               0x40000000'u32)
+    rfRegWrite(0x20001218'u32, rfRegRead(0x20001218'u32) and 0x003FFFFF'u32)
+    rfRegWrite(0x2000121C'u32, rfRegRead(0x2000121C'u32) and 0xEFFFFFFF'u32)
+    rfRegWrite(0x20001214'u32,
+               (rfRegRead(0x20001214'u32) and not 0x000007FF'u32) or
+               0x00000110'u32)
+    rfRegWrite(0x20001218'u32,
+               (rfRegRead(0x20001218'u32) and not 0x000007FF'u32) or
+               0x00000110'u32)
+    rfRegClear(0x2000120C'u32, 0x80000000'u32)
+    rfRegOr(0x2000120C'u32, 0x80000000'u32)
+    rfPhyTraceCheckpoint(0x31'u32)
+
+  proc runRfPriRxcal() =
+    if rfCalibDataGlobal == nil:
+      return
+    inc nim_wifi_rf_pri_rxcal_count
+    rfRegWrite(RfCalModeReg,
+               (rfRegRead(RfCalModeReg) and not RfRxcalModeMask) or
+               RfRxcalStartMode)
+    let saved = saveRfPriCalState()
+    prepareRfPriRxcal()
+
+    let p2a = searchRfRxcalParam(2'u32, 0x400'i32, 0x40'i32)
+    let p3a = searchRfRxcalParam(3'u32, 0'i32, 0x20'i32)
+    let p2b = searchRfRxcalParam(2'u32, p2a.value, 0x20'i32)
+    let p3b = searchRfRxcalParam(3'u32, p3a.value, 0x10'i32)
+    let power = p2a.power or p3a.power or p2b.power or p3b.power
+
+    rfPriSeedRxcalRestoreLowHalves()
+    for i in 0 ..< 4:
+      storeRfRxcalRecord(i, p2b.value, p3b.value, power)
+
+    restoreRfPriCalState(saved)
+    rfPriReplayRxcalRegs()
+    rfPriApplyWb03RxcalTosdacLatch()
+    rfPriApplyWb03RuntimeLatches()
+    # Vendor scan-done state leaves the RXIQ measurement block idle with the
+    # search register armed and measure control ready.  The search loop above
+    # otherwise leaves the last candidate in 0x1614 and clears 0x1618, which
+    # correlates with a silent RX DMA path during active scan.
+    rfRegWrite(RfPriRxcalSearchReg, 0x00400000'u32)
+    rfRegWrite(RfMeasureCtrlReg, 0x80000000'u32)
+    if p2a.ok and p3a.ok and p2b.ok and p3b.ok:
+      rfRegWrite(RfCalModeReg,
+                 (rfRegRead(RfCalModeReg) and not RfRxcalModeMask) or
+                 RfRxcalDoneMode)
+    rfPhyTraceCheckpoint(0x32'u32)
+
+  proc rfPriApplyTxcalRecordToTable(words: var array[43, uint32],
+                                    tableIndex, record: int) =
+    let word0 = rfCalibWord(RfPriTxcalRecordBaseWord + record * 2)
+    let word1 = rfCalibWord(RfPriTxcalRecordBaseWord + record * 2 + 1)
+    if word0 == 0'u32 and word1 == 0'u32:
+      return
+    let p0 = word0 and 0x3F'u32
+    let p1 = (word0 shr 8) and 0x3F'u32
+    let p2 = (word0 shr 16) and 0x7FF'u32
+    let p3 = word1 and 0x3FF'u32
+    words[tableIndex] = (words[tableIndex] and 0xFFFFF800'u32) or p2
+    words[tableIndex + 1] = (words[tableIndex + 1] and 0xFF000003'u32) or
+      (p3 shl 14) or (p0 shl 8) or (p1 shl 2)
+
+  proc rfPriApplyBzTxcalRecordToTable(words: var array[43, uint32],
+                                      start, record: int) =
+    let offset = 0xF8 + record * 8
+    let p0 = rfCalibByte(offset).uint32 and 0x3F'u32
+    let p1 = rfCalibByte(offset + 1).uint32 and 0x3F'u32
+    let p2 = rfCalibHalf((offset + 2) div 2).uint32 and 0x07FF'u32
+    let p3 = rfCalibHalf((offset + 4) div 2).uint32 and 0x03FF'u32
+    if (p0 or p1 or p2 or p3) == 0'u32:
+      return
+    words[start] = (words[start] and 0xFFFFF800'u32) or p2
+    words[start + 1] = (words[start + 1] and 0xFF000003'u32) or
+      (p3 shl 14) or (p0 shl 8) or (p1 shl 2)
+
+  proc rfPriSeedBzTxcalFallbackRecords() =
+    ## rf_pri_bz_txcal writes these defaults when the BZ search path fails:
+    ## p0=0x20, p1=0x20, p2=0x400, p3=0 at rf_calib_data+0xF8+n*8.
+    ## A fresh pure-Nim cold init skips BZ TXCAL, but restore still replays the
+    ## BZ power-table records. Seed only empty records to match vendor fallback.
+    if rfCalibDataGlobal == nil:
+      return
+    for record in 0 ..< 9:
+      let offset = 0xF8 + record * 8
+      let p0 = rfCalibByte(offset).uint32
+      let p1 = rfCalibByte(offset + 1).uint32
+      let p2 = rfCalibHalf((offset + 2) div 2).uint32
+      let p3 = rfCalibHalf((offset + 4) div 2).uint32
+      if (p0 or p1 or p2 or p3) == 0'u32:
+        rfCalibSetByte(offset, 0x20'u8)
+        rfCalibSetByte(offset + 1, 0x20'u8)
+        rfCalibSetHalf((offset + 2) div 2, 0x0400'u16)
+        rfCalibSetHalf((offset + 4) div 2, 0x0000'u16)
+    rfPriSnapshotBzTxcalState(0xB0'u32)
+
+  proc rfPriWriteTxPowerTable() =
+    ## BL808 rf_pri_txcal_w2reg/rf_pri_bz_txcal_w2reg apply live TXCAL words
+    ## into the fixed power-table layout. Empty calibration records preserve
+    ## the base table, matching a fresh zeroed wl_cal restore.
+    let wb03Xtal40 = rfPriIsWb03() and
+      bl808RfXtalIndex == xtalIndex(WlXtal40M)
+    var words =
+      if wb03Xtal40:
+        RfPriWb03TxPowerRegisterBaseline
+      else:
+        RfPriTxPowerRegisterBase
+    if rfCalibDataGlobal != nil and not wb03Xtal40:
+      for slot, record in RfPriTxcalReplayRecordIds:
+        rfPriApplyTxcalRecordToTable(words, 3 + slot * 2, record)
+      for i in 0 ..< RfPriBzTxcalRecordIds.len:
+        rfPriApplyBzTxcalRecordToTable(words,
+          RfPriBzTxcalTableStarts[i], RfPriBzTxcalRecordIds[i])
+    rfPriSnapshotBzTxcalState(0xB1'u32)
+    writeRadioMemoryWords(0x20001700'u32, words)
+
+  proc rfCalibSeedDefaultVcoIfEmpty() =
+    ## The vendor restore path expects wl_cal halfwords 14..34 to contain
+    ## VCO freq/idac words. Fresh pure-Nim RF memory is zeroed, so seed a
+    ## board-log-derived 40 MHz table until rf_pri_full_cal is fully ported.
+    if rfCalibDataGlobal == nil:
+      return
+    let halfwords = cast[ptr UncheckedArray[uint16]](rfCalibDataGlobal)
+    for i in 0 ..< RfPriDefaultVcoCal40M.len:
+      if halfwords[i + 14] != 0'u16:
+        return
+    for i, value in RfPriDefaultVcoCal40M:
+      halfwords[i + 14] = value
+
+  proc rfCalibWriteDefaultVco40M() =
+    ## Cold LO calibration is not bit-for-bit with the vendor firmware yet.
+    ## Keep the passing vendor-derived 40 MHz VCO table for RFC programming.
+    if rfCalibDataGlobal == nil:
+      return
+    let halfwords = cast[ptr UncheckedArray[uint16]](rfCalibDataGlobal)
+    for i, value in RfPriDefaultVcoCal40M:
+      halfwords[i + 14] = value
+
+  proc rfPriRestoreCalReg() =
+    ## Port of librf_bl808.a:rf_pri.c.o rf_pri_restore_cal_reg register replay.
+    ## Recovered: calibration word packing into RF 0x1168/0x116c/0x1084/
+    ## 0x1070 and 0x1170..0x117c, plus WLAN/BZ TX-cal power table replay.
+    if not rfCalibHasRestoreData():
+      return
+    let w8 = rfCalibWord(2)
+    updateReg32(cast[ptr uint32](RfBase + 0x168'u), 0xC0C0C0C0'u32,
+                (rfCalibWord(18) and 0x3F'u32) or
+                (((rfCalibWord(18) shr 8) and 0x3F'u32) shl 8) or
+                ((rfCalibWord(20) and 0x3F'u32) shl 16) or
+                (((rfCalibWord(20) shr 8) and 0x3F'u32) shl 24))
+    updateReg32(cast[ptr uint32](RfBase + 0x16C'u), 0xC0C0C0C0'u32,
+                (rfCalibWord(22) and 0x3F'u32) or
+                (((rfCalibWord(22) shr 8) and 0x3F'u32) shl 8) or
+                ((rfCalibWord(24) and 0x3F'u32) shl 16) or
+                (((rfCalibWord(24) shr 8) and 0x3F'u32) shl 24))
+    updateReg32(cast[ptr uint32](RfBase + 0x084'u), 0xC0C0C0C0'u32,
+                ((w8 and 0x3F'u32) shl 24) or
+                (((w8 shr 6) and 0x3F'u32) shl 16) or
+                (((w8 shr 12) and 0x3F'u32) shl 8) or
+                ((w8 shr 18) and 0x3F'u32))
+    updateReg32(cast[ptr uint32](RfBase + 0x070'u), 0xFFFFFFF0'u32,
+                (rfCalibWord(3) shr 24) and 0xF'u32)
+    rfPriSnapshotStage(0xF200'u32)
+    rfPriWriteTxPowerTable()
+    rfPriSnapshotStage(0xF201'u32)
+    rfPriReplayRxcalRegs()
+    rfPriSnapshotStage(0xF202'u32)
+    rfPriSnapshotBzTxcalState(0xB2'u32)
+
+  proc rfPriWriteTotalPowerComp(channelIndex: uint32) =
+    ## Direct path of rf_pri_set_channel_total_pwr_comp for normal mode.
+    if rfPriIsWb03() and bl808RfXtalIndex == xtalIndex(WlXtal40M):
+      ## The WB03 restore baseline already carries the vendor channel-power
+      ## table. The current pure compensation state overwrites RF[0x1704] high
+      ## byte with 0x11, while vendor scan-filter state keeps it zero.
+      return
+    if channelIndex < 1'u32 or channelIndex > 14'u32:
+      return
+    let idx = int(channelIndex - 1'u32)
+    let total = rfSignExtend16(bl808RfTotalPowerComp.int32 -
+      bl808RfAppliedPowerComp.int32 + bl808RfChannelPowerComp[idx].int32)
+    var clipped = total
+    if clipped > 16'i16:
+      clipped = 16'i16
+    elif clipped < -16'i16:
+      clipped = -16'i16
+    let tx = rfSignExtend16(bl808RfTxGainComp.int32 + clipped.int32)
+    updateReg32(cast[ptr uint32](RfBase + 0x704'u), 0x00FFFFFF'u32,
+                (uint32(uint16(tx)) and 0xFF'u32) shl 24)
+    updateReg32(cast[ptr uint32](RfBase + 0x7AC'u), 0xFFFFFF00'u32,
+                uint32(uint16(rfSignExtend16(tx.int32 - 4'i32))) and 0xFF'u32)
+
+  proc rf_pri_input_xtalfreq(xtalfreqHz: uint32) {.exportc, cdecl.} =
+    ## Local replacement for rf_pri.c.o rf_pri_input_xtalfreq.
+    ## Recovered: exact xtal constants and classification. Remaining unknown:
+    ## private rf_pri.c.o xtal flag globals are not yet represented because the
+    ## next layer uses the typed `bl808RfXtalIndex` state instead.
+    bl808RfXtalIndex = xtalIndex(xtalfreqHz)
+
+  proc rfPriXtalRefdivRatio(): uint32 {.inline.} =
+    case bl808RfXtalIndex
+    of 0'u32, 1'u32:
+      1'u32
+    of 2'u32, 3'u32, 4'u32:
+      2'u32
+    else:
+      0'u32
+
+  proc rfPriXtalTenthsMhz(): uint32 {.inline.} =
+    case bl808RfXtalIndex
+    of 0'u32: 240'u32
+    of 1'u32: 260'u32
+    of 2'u32: 320'u32
+    of 3'u32: 384'u32
+    of 5'u32: 800'u32
+    else: 400'u32
+
+  proc rfPriWifiPllConfig() =
+    ## Port of librf_bl808.a:rf_pri.c.o rf_pri_wifipll_config for BL808's
+    ## default device path. The vendor source uses float arithmetic for the
+    ## fractional PLL word; the integer form below is equivalent for all known
+    ## xtal inputs and keeps this path soft-float free.
+    let refdiv = rfPriXtalRefdivRatio()
+    rfRegWrite(RfPriInit814Reg,
+               (rfRegRead(RfPriInit814Reg) and 0xFFFFF0FF'u32) or
+               ((refdiv shl 8) and 0x00000F00'u32))
+
+    let xtalTenths = rfPriXtalTenthsMhz()
+    let fracBase = (uint64(refdiv) * 15'u64) shl 25
+    let frac =
+      if xtalTenths == 0'u32:
+        0'u32
+      elif (xtalTenths mod 10'u32) == 0'u32:
+        uint32(fracBase div uint64(xtalTenths div 10'u32))
+      else:
+        uint32((fracBase * 10'u64) div uint64(xtalTenths))
+    rfRegWrite(RfPriInitPll28Reg,
+               (rfRegRead(RfPriInitPll28Reg) and 0xFC000000'u32) or
+               (frac and 0x03FFFFFF'u32))
+
+    let wb03Xtal40 = rfPriIsWb03() and
+      bl808RfXtalIndex == xtalIndex(WlXtal40M)
+    let wb03Xtal26 = rfPriIsWb03() and
+      bl808RfXtalIndex == xtalIndex(WlXtal26M)
+    if wb03Xtal26:
+      rfRegWrite(RfPriInitPll28Reg,
+                 rfRegRead(RfPriInitPll28Reg) and 0x7BFFFFFF'u32)
+      rfRegWrite(RfPriInitPll2cReg,
+                 rfRegRead(RfPriInitPll2cReg) and 0xFFFFFECF'u32)
+      rfRegWrite(RfOptimizeReg,
+                 rfRegRead(RfOptimizeReg) and 0xFFFFFFF0'u32)
+      rfRegWrite(RfPriInitPll18Reg,
+                 (rfRegRead(RfPriInitPll18Reg) and 0xFFFFFE0F'u32) or
+                 0x00000020'u32)
+      rfRegWrite(RfPriInitPll1cReg,
+                 (rfRegRead(RfPriInitPll1cReg) and 0xFFF80FFE'u32) or
+                 0x00036100'u32)
+    elif not wb03Xtal40:
+      rfRegOr(RfPriInitPll28Reg, 0x84000000'u32)
+      rfRegOr(RfPriInitPll2cReg, 0x00000130'u32)
+      rfRegWrite(RfOptimizeReg,
+                 (rfRegRead(RfOptimizeReg) and 0xFFFFFFFE'u32) or
+                 0x0000000E'u32)
+      rfRegWrite(RfPriInitPll18Reg,
+                 (rfRegRead(RfPriInitPll18Reg) and 0xFFFFFE0F'u32) or
+                 0x00000020'u32)
+      rfRegWrite(RfPriInitPll1cReg,
+                 (rfRegRead(RfPriInitPll1cReg) and 0xFFF80FFE'u32) or
+                 0x00036100'u32)
+      rfRegWrite(RfPriInitPll2cReg,
+                 (rfRegRead(RfPriInitPll2cReg) and 0xFFFCFFFF'u32) or
+                 0x00010000'u32)
+
+    rfRegWrite(RfPriInitPllResetReg,
+               rfRegRead(RfPriInitPllResetReg) and 0xFFFFFFFA'u32)
+    rfRegOr(RfPriInitPllResetReg, 0x00000001'u32)
+    rfRegOr(RfPriInitPllResetReg, 0x00000004'u32)
+    rfRegWrite(RfPriInitPllReg,
+               (rfRegRead(RfPriInitPllReg) and 0xFFFFFFF3'u32) or
+               0x00001FF3'u32)
+    for _ in 0 ..< 11:
+      discard rfRegRead(RfPriInitPllReg)
+
+  proc rfPriEfuseInit() =
+    ## Port of librf_bl808.a:rf_pri.c.o rf_pri_efuse_init.part.0 for the
+    ## BL808 WLAN config bytes at wl_cfg+0xc4..0xc7. Remaining unknown:
+    ## callback-driven temperature compensation tables referenced after
+    ## rf_pri_efuse_init.part.0+0xce.
+    let cfg = cast[ptr WlRfConfig](wlCfgGlobal)
+    if cfg == nil:
+      return
+    let bytes = cast[ptr UncheckedArray[uint8]](cfg)
+    let cap0 = bytes[0xC5]
+    let cap1 = bytes[0xC6]
+    var txCorrRegHigh: uint32
+    var txCorrRegLow: uint32
+    if cap0 != 0x80'u8 and cap1 != 0x80'u8:
+      updateReg32(cast[ptr uint32](RfBase + 0x05C'u), 0xFFE0FC0F'u32,
+                  ((cap0.uint32 shl 16) and 0x001F0000'u32) or
+                  ((cap1.uint32 shl 4) and 0x000003F0'u32))
+      bl808RfEfuseCapComp = -7'i16
+      bl808RfEfusePowerComp = -4'i16
+      txCorrRegHigh = 0xFC000000'u32
+      txCorrRegLow = 0x000000F8'u32
+    else:
+      updateReg32(cast[ptr uint32](RfBase + 0x05C'u), 0xFFE0FC0F'u32,
+                  0x00100200'u32)
+      bl808RfEfuseCapComp = -3'i16
+      bl808RfEfusePowerComp = 0'i16
+      txCorrRegHigh = 0'u32
+      txCorrRegLow = 0x000000FC'u32
+    let pwrByte = bytes[0xC4]
+    bl808RfTxGainComp =
+      if pwrByte == 0'u8: 1'i16
+      else: cast[int8](pwrByte).int16
+    bl808RfTempPowerComp = rfSignedByte(bytes[0xBD])
+    let dfeTrim = bytes[0xC7]
+    if dfeTrim != 0x80'u8:
+      updateReg32(cast[ptr uint32](RfPriInitDfeReg824.uint),
+                  0xFFFFFFF0'u32, dfeTrim.uint32 and 0xF'u32)
+    else:
+      updateReg32(cast[ptr uint32](RfPriInitDfeReg824.uint),
+                  0xFFFFFFF0'u32, 0x4'u32)
+    updateReg32(cast[ptr uint32](RfBase + 0x704'u), 0x00FFFFFF'u32,
+                txCorrRegHigh)
+    updateReg32(cast[ptr uint32](RfBase + 0x7AC'u), 0xFFFFFF00'u32,
+                txCorrRegLow)
+
+  proc runRfPriFullCalRestoreBaseline() =
+    ## Porting boundary for librf_bl808.a:rf_pri.c.o rf_pri_full_cal.
+    ## Recovered from the linked BL808 scan image:
+    ##   rf_pri_lo_fcal -> rf_pri_lo_acal -> optional rf_pri_roscal.part.0
+    ##   -> optional rf_pri_rccal.part.0 -> rf_pri_txcal -> rf_pri_bz_txcal
+    ##   -> rf_pri_rxcal.
+    ## WB03/40 MHz runs the recovered rf_pri_bz_txcal path. Other board paths
+    ## retain the fallback records until their BZ branch is validated.
+    runRfPriLoFcal()
+    runRfPriLoAcal()
+    rfCalibWriteDefaultVco40M()
+    runRfPriRoscal()
+    runRfPriRccal()
+    runRfPriTxcal()
+    if rfPriIsWb03() and bl808RfXtalIndex == xtalIndex(WlXtal40M):
+      runRfPriBzTxcal()
+    else:
+      rfPriSeedBzTxcalFallbackRecords()
+    runRfPriRxcal()
+    rfPriSnapshotStage(0xF300'u32)
+    rfPriSeedRxcalRestoreLowHalves()
+    rfPriRestoreCalReg()
+    rfPriSnapshotStage(0xF301'u32)
+    rfPriApplyWb03Rf70ColdSeed()
+    rfPriApplyWb03RccalSeed()
+    rfPriApplyWb03RxcalTosdacLatch()
+    rfPriSnapshotStage(0xF302'u32)
+
+  proc rf_pri_init(coldInit, mode: uint32) {.exportc, cdecl.} =
+    ## Local replacement boundary for rf_pri.c.o rf_pri_init.
+    ## Recovered: fixed RF defaults, wifipll/static register phase, full-cal
+    ## order, and the rf_pri_gain_table_WR2REG follow-up.
+    ##
+    ## Remaining calibration deltas:
+    ## - callback-driven temperature compensation and low-power variants.
+    ## - RF70/RFA0/RFB4 are calibration/channel-state derived. LLVM disassembly
+    ##   ruled out rf_pri_fixed_val_regs' WB03 branch as the source of their
+    ##   late values, and JTAG/UART traces show RF88/RFD0 now match the scan and
+    ##   auth paths. Keep these registers observable through rfPriSnapshotStage
+    ##   and avoid masking calibration gaps with unconditional RFC-entry seeds.
+    nim_wifi_rf_pri_init_entry_breakpoint()
+    bl808RfColdInit = coldInit
+    bl808RfMode =
+      case mode
+      of 2'u32: bleOnly
+      of 3'u32: wifiBleCoex
+      else: wifiOnly
+    rfPriEnsureDeviceInfo()
+    rfCalibDataGlobal = wlCalGlobal
+    let needsFullCal = coldInit != 0'u32 or not rfCalibHasTxcalData()
+    if not needsFullCal:
+      rfCalibSeedDefaultVcoIfEmpty()
+    updateReg32(cast[ptr uint32](RfPriInitDfeReg824.uint), 0x9FFFFFFF'u32,
+                0x40000000'u32)
+    rfPriEfuseInit()
+    rfPriSnapshotStage(0xF400'u32)
+    writeRfPriFixedValInit()
+    writeRadioRegMaskInit(RfPriStaticInit)
+    rfPriSnapshotStage(0xF401'u32)
+    rfPriWifiPllConfig()
+    rfPriSnapshotStage(0xF402'u32)
+    rfPhyTraceCheckpoint(0x21'u32)
+    rfPriApplyWb03RuntimeLatches()
+    rfPriSnapshotStage(0xF403'u32)
+    updateReg32(cast[ptr uint32](RfPriInit90Reg.uint), not 0'u32, 0x1'u32)
+    updateReg32(cast[ptr uint32](RfRxModeReg.uint), 0xFFFFE67D'u32, 0'u32)
+    updateReg32(cast[ptr uint32](RfRxModeReg.uint), 0xFFFFFF9E'u32, 0'u32)
+    if needsFullCal:
+      runRfPriFullCalRestoreBaseline()
+      rfPriSnapshotStage(0xF404'u32)
+    elif coldInit == 0'u32:
+      rfPriRestoreCalReg()
+      rfPriSnapshotStage(0xF405'u32)
+      rfPriApplyWb03Rf70ColdSeed()
+      rfPriApplyWb03RccalSeed()
+      rfPriApplyWb03RxcalTosdacLatch()
+      rfPriSnapshotStage(0xF406'u32)
+    writeRadioRegMaskInit(RfPriGainInit)
+    rfPriSnapshotStage(0xF407'u32)
+    rfPriWriteTxPowerTable()
+    rfPriSnapshotStage(0xF408'u32)
+    rfPriApplyWb03RccalSeed()
+    rfPriApplyWb03RxcalTosdacLatch()
+    rfPriSnapshotStage(0xF409'u32)
+    updateReg32(cast[ptr uint32](RfSynthCtrlReg.uint), not 0'u32, 0x6'u32)
+    updateReg32(cast[ptr uint32](RfSynthCtrlReg.uint), not 0'u32, 0x4001'u32)
+    updateReg32(cast[ptr uint32](RfPriInit163cReg.uint), not 0'u32, 0x8080'u32)
+    updateReg32(cast[ptr uint32](RfRxModeReg.uint), not 0x600'u32, 0'u32)
+    rfPriSnapshotStage(0xF40A'u32)
+    rfPriApplyWb03RfcEntryBaseline()
+    rfPriSnapshotStage(0xF40B'u32)
+    rfPhyTraceCheckpoint(0x22'u32)
+
+  proc rf_pri_config_mode(mode: uint32) {.exportc, cdecl.} =
+    bl808RfMode =
+      case mode
+      of 2'u32: bleOnly
+      of 3'u32: wifiBleCoex
+      else: wifiOnly
+
+  proc rf_pri_update_param(channelMhz: uint32) {.exportc, cdecl.} =
+    bl808RfChannelMhz = channelMhz
+
+  proc rf_pri_get_notch_param*(channelMhz: uint32, enable: ptr uint8,
+                               param: ptr uint32) {.exportc, cdecl.} =
+    ## Vendor BL808 helper currently returns disabled notch parameters, but
+    ## rfc_config_channel still consumes the zero outputs to program RF[0x680].
+    discard channelMhz
+    if enable != nil:
+      enable[] = 0
+    if param != nil:
+      param[] = 0
+
+  proc rfPriApplyNotchParam(channelMhz: uint32) =
+    var notchEnable: uint8
+    var notchParam: uint32
+    rf_pri_get_notch_param(channelMhz, addr notchEnable, addr notchParam)
+    let notchWord =
+      uint32(((uint64(notchParam) * 2048'u64 + 20_000_000'u64) div
+        40_000_000'u64) and 0x07FF'u64)
+    let regAddr = uint32(RfBase + 0x680'u)
+    var word = rfRegRead(regAddr)
+    word = (word and 0x87FFFFFF'u32) or 0x08000000'u32
+    word = (word and 0xF800FFFF'u32) or ((notchWord shl 16) and 0x07FF0000'u32)
+    word = (word and 0x7FFFFFFF'u32) or (uint32(notchEnable and 1'u8) shl 31)
+    rfRegWrite(regAddr, word)
+
+  proc rfPriApplyWb03Non40OptimizePll(channelMhz: uint32) =
+    ## LLVM objdump provenance: librf_bl808.a:rf_pri.c.o
+    ## rf_pri_optimize+0x82..0x14e. This is the WB03 branch used when the
+    ## xtal-40 flag is clear; WB03/40M stays on the default RFD0/RF70 path.
+    if not rfPriIsWb03() or bl808RfXtalIndex == xtalIndex(WlXtal40M):
+      return
+    if channelMhz == RfOptimizeWb03PllEdge0Mhz or
+        channelMhz == RfOptimizeWb03PllEdge1Mhz:
+      rfRegUpdate(RfPriInitPll18Reg, 0x000001F0'u32, 0x00000020'u32)
+      rfRegUpdate(RfPriInitPll1cReg, 0x0007F001'u32, 0x00036100'u32)
+    else:
+      rfRegUpdate(RfPriInitPll18Reg, 0x000000F0'u32, 0x00000140'u32)
+      rfRegUpdate(RfPriInitPll1cReg, 0x0007F100'u32, 0x0005A001'u32)
+
+  proc rf_pri_optimize(channelMhz: uint32) {.exportc, cdecl.} =
+    ## Port of the default rf_pri_optimize path in librf_bl808.a:rf_pri.c.o.
+    ## Recovered with LLVM/XuanTie disassembly: RF[0xd0] bit 0 tracks the
+    ## 2452..2472 MHz mid-band window, then RF[0x70]'s calibration nibble is
+    ## replayed from wl_cal word 4 for 2462..2484 MHz and word 3 otherwise.
+    ## Vendor WB03/40M reaches this same branch; the RF[0x818]/RF[0x81c] writes
+    ## are on the WB03/non-40M branch at rf_pri_optimize+0x82..0x14e.
+    bl808RfChannelMhz = channelMhz
+    let traceIdx = int(nim_wifi_rf_optimize_count mod
+      uint32(RfPriStageSnapshotEntries))
+    inc nim_wifi_rf_optimize_count
+    nim_wifi_rf_optimize_channel_log[traceIdx] = channelMhz
+    nim_wifi_rf_optimize_device_log[traceIdx] =
+      uint32(rfPriIsWb03()) or
+      (bl808RfDeviceBl616.uint32 shl 4) or
+      (bl808RfDeviceBl618m.uint32 shl 8) or
+      ((bl808RfXtalIndex and 0xFF'u32) shl 16)
+    var word = regRead(RfOptimizeReg.uint)
+    if channelMhz >= RfOptimizeMidBandFirstMhz and
+        channelMhz <= RfOptimizeMidBandLastMhz:
+      word = word and not RfOptimizeMidBandMask
+    else:
+      word = word or RfOptimizeMidBandMask
+    regWrite(RfOptimizeReg.uint, word)
+    nim_wifi_rf_optimize_rfd0_log[traceIdx] = word
+    if rfCalibDataGlobal != nil:
+      let useWord4 = channelMhz >= RfOptimizeTxcalFirstMhz and
+        channelMhz <= RfOptimizeTxcalLastMhz
+      let txcalNibble =
+        if useWord4:
+          (rfCalibWord(4) shr 4) and 0xF'u32
+        else:
+          (rfCalibWord(3) shr 24) and 0xF'u32
+      nim_wifi_rf_optimize_nibble_log[traceIdx] =
+        txcalNibble or (uint32(useWord4) shl 8)
+      updateReg32(cast[ptr uint32](RfTxcalParamReg.uint), 0xFFFFFFF0'u32,
+                  txcalNibble)
+    else:
+      nim_wifi_rf_optimize_nibble_log[traceIdx] = 0xFFFF_FFFF'u32
+    nim_wifi_rf_optimize_rf70_log[traceIdx] = regRead(RfTxcalParamReg.uint)
+    rfPriApplyWb03Non40OptimizePll(channelMhz)
+
+  proc rf_pri_set_channel_pwr_comp(channelIndex: uint32) {.exportc, cdecl.} =
+    bl808RfChannelPowerIndex = channelIndex
+    if channelIndex < 1'u32 or channelIndex > 14'u32:
+      return
+    let cfg = cast[ptr WlRfConfig](wlCfgGlobal)
+    if cfg == nil:
+      return
+    for i in 0 ..< 14:
+      bl808RfChannelPowerComp[i] = rfSignedByte(cfg.priZeroA1[i])
+      bl808RfChannelLpPowerComp[i] = rfSignedByte(cfg.priZeroA2[i])
+    bl808RfTotalPowerComp = 0'i16
+    bl808RfAppliedPowerComp = bl808RfTotalPowerComp
+    rfPriWriteTotalPowerComp(channelIndex)
+    bl808RfTotalPowerComp = bl808RfTempPowerComp
+    rfPriWriteTotalPowerComp(channelIndex)
+
+  proc rf_pri_set_bandwidth(bandwidthMhz: uint32) {.exportc, cdecl.} =
+    ## The vendor rf_pri_set_bandwidth body is a ret-only function in
+    ## librf_bl808.a:rf_pri.c.o; keep the symbol local to avoid archive pulls.
+    bl808RfBandwidthMhz = bandwidthMhz
+
+  proc rfPriVcoCalWord(channelMhz: uint32): uint32 =
+    ## Port of rf_pri.c.o rf_pri_get_vco_{freq,idac}_cw.
+    ## The vendor body reads rf_calib_data halfword[index + 14], where
+    ## index = min(((channelMhz - 2402) >> 2), 20).
+    if rfCalibDataGlobal == nil:
+      return 0'u32
+    var index =
+      if channelMhz > 2402'u32: (channelMhz - 2402'u32) shr 2
+      else: 0'u32
+    if index > 20'u32:
+      index = 20'u32
+    let halfwords = cast[ptr UncheckedArray[uint16]](rfCalibDataGlobal)
+    halfwords[index + 14'u32].uint32
+
+  proc rf_pri_get_vco_freq_cw(channelMhz: uint32): uint32 {.exportc, cdecl.} =
+    (rfPriVcoCalWord(channelMhz) shr 8) and 0xFF'u32
+
+  proc rf_pri_get_vco_idac_cw(channelMhz: uint32): uint32 {.exportc, cdecl.} =
+    rfPriVcoCalWord(channelMhz) and 0xFF'u32
+
+  proc rfcVcoPair(channelMhz: uint32): uint32 =
+    ((rf_pri_get_vco_freq_cw(channelMhz) and 0xFF'u32) shl 8) or
+      (rf_pri_get_vco_idac_cw(channelMhz) and 0xFF'u32)
+
+  proc programRfcVcoTable() =
+    ## Port of librf_bl808.a:rfc.c.o modem_init_core+0x128..0x19e.
+    ## Packs two channel control words per RF register at
+    ## 0x2000113C..0x20001160, then writes the 2484 MHz slot at 0x20001164.
+    var channelMhz = 2404'u32
+    for i in 0'u ..< 10'u:
+      let low = rfcVcoPair(channelMhz)
+      let high = rfcVcoPair(channelMhz + 4'u32)
+      volatileStore(cast[ptr uint32](RfBase + 0x13C'u + i * 4'u),
+                    (high shl 16) or low)
+      channelMhz += 8'u32
+    volatileStore(cast[ptr uint32](RfBase + 0x164'u), rfcVcoPair(2484'u32))
+
+  proc rf_dump_status*() {.exportc, cdecl.} =
+    ## The vendor rf.c.o rf_dump_status body is ret-only.
+    discard
+
+  type
+    WlParamLoadCb = proc(xtalfreq: ptr uint32): int8 {.cdecl.}
+    WlCapcodeSetCb = proc(cap0, cap1: uint8) {.cdecl.}
+    WlCapcodeGetCb = proc(cap: ptr uint8) {.cdecl.}
+
+  proc modem_init_core*(xtalfreqHz, restore: uint32) {.exportc, cdecl.}
+  proc modemInitCoreMode(xtalfreqHz, restore: uint32; apiMode: uint8)
+
+  proc configureWlRfConfig(cfg: ptr WlRfConfig; xtalfreqHz: uint32;
+                           apiMode, enFullCal: uint8) =
+    if cfg == nil:
+      return
+    cfg.status = 0
+    cfg.apiMode = apiMode
+    cfg.enParamLoad = 0'u8
+    cfg.enFullCal = enFullCal
+    cfg.reserved07 = 0'u8
+    cfg.xtalfreqHz = xtalfreqHz
+    cfg.paramLoad = nil
+    cfg.capcodeSet = nil
+    cfg.capcodeGet = nil
+
+  proc wl_init*(): int8 {.exportc, cdecl.} =
+    ## Port of librf_bl808.a:wl_api.c.o wl_init.
+    ## Recovered behavior: optional parameter callback, optional capcode
+    ## callbacks, full-cal vs restore modem path, 0xACDE status, and env status
+    ## byte clear. The API mode field is preserved for higher-level RF routing.
+    let cfg = cast[ptr WlRfConfig](wlCfgGlobal)
+    if cfg == nil:
+      return -1'i8
+    var cbStatus = 0'i8
+    if cfg.enParamLoad != 0'u8 and cfg.paramLoad != nil:
+      cbStatus = cast[WlParamLoadCb](cfg.paramLoad)(addr cfg.xtalfreqHz)
+    if cfg.capcodeSet != nil:
+      let cap0 = uint8(cfg.xtalCap and 0x00FF'u16)
+      let cap1 = uint8((cfg.xtalCap shr 8) and 0x00FF'u16)
+      if cap0 <= 63'u8 and cap1 <= 63'u8:
+        cast[WlCapcodeSetCb](cfg.capcodeSet)(cap0, cap1)
+    if cfg.capcodeGet != nil:
+      var cap: uint8
+      cast[WlCapcodeGetCb](cfg.capcodeGet)(addr cap)
+    let restore = if cfg.enFullCal != 0'u8: 0'u32 else: 1'u32
+    modemInitCoreMode(cfg.xtalfreqHz, restore, cfg.apiMode)
+    cfg.status = WlRfConfigMagic
+    if wlEnvGlobal != nil:
+      cast[ptr UncheckedArray[uint8]](wlEnvGlobal)[9] = 0'u8
+    cbStatus
+
+  proc channelPowerIndex(channelMhz: uint32): uint32 {.inline.} =
+    if channelMhz >= 2412'u32 and channelMhz <= 2484'u32:
+      if channelMhz == 2484'u32:
+        return 14'u32
+      return ((channelMhz - 2412'u32) div 5'u32 + 1'u32) and 0xFF'u32
+    0'u32
+
+  proc rfc_config_bandwidth*(bandwidth: uint32) {.exportc, cdecl.} =
+    ## Port of librf_bl808.a:rfc_helper.c.o rfc_config_bandwidth.
+    ## The low-level rf_pri_set_bandwidth body is a no-op in this archive, but
+    ## preserving these register phases keeps vendor phy_init from pulling
+    ## rfc.c.o and gives the modem path typed RF-plane ownership.
+    let rf = rfRegs()
+    updateReg32(addr rf.synthCtrl, 0xFEFFFFFF'u32,
+                if bandwidth != 0'u32: 0x01000000'u32 else: 0'u32)
+    if bandwidth == 1'u32:
+      updateReg32(cast[ptr uint32](RfBase + 0x94'u), 0xEFFFFFFF'u32, 0x10000000'u32)
+      updateReg32(cast[ptr uint32](RfBase + 0x94'u), 0xDFFFFFFF'u32, 0x20000000'u32)
+      updateReg32(cast[ptr uint32](RfBase + 0x608'u), 0xDFFFFFFF'u32, 0'u32)
+      updateReg32(cast[ptr uint32](RfBase + 0x88'u), 0xFCFFFFFF'u32, 0x03000000'u32)
+      rf_pri_set_bandwidth(20'u32)
+    else:
+      updateReg32(cast[ptr uint32](RfBase + 0x94'u), 0xEFFFFFFF'u32, 0x10000000'u32)
+      updateReg32(cast[ptr uint32](RfBase + 0x94'u), 0xDFFFFFFF'u32, 0'u32)
+      updateReg32(cast[ptr uint32](RfBase + 0x608'u), 0xDFFFFFFF'u32, 0x20000000'u32)
+      updateReg32(cast[ptr uint32](RfBase + 0x88'u), 0xFCFFFFFF'u32, 0x02000000'u32)
+      rf_pri_set_bandwidth(10'u32)
+    updateReg32(cast[ptr uint32](RfBase + 0x228'u), not 0x4'u32, 0'u32)
+    updateReg32(cast[ptr uint32](RfBase + 0x7C'u), not 0x100'u32, 0'u32)
+
+  proc rfc_config_channel*(channelMhz: uint32) {.exportc, cdecl.} =
+    ## Port of librf_bl808.a:rfc.c.o rfc_config_channel.
+    ## Recovered: RF tune strobes, channel register, channel-power index
+    ## calculation from LLVM-decoded th.extu at rfc.c.o+0xee..0x118, and
+    ## final RF optimize call.
+    let rf = rfRegs()
+    updateReg32(cast[ptr uint32](RfBase + 0x228'u), not 0'u32, 0x8'u32)
+    updateReg32(addr rf.modeCtrl, not 0'u32, 0x40'u32)
+    updateReg32(addr rf.modeCtrl, not 0'u32, 0x200'u32)
+    updateReg32(addr rf.modeCtrl, not 0'u32, 0x1'u32)
+    updateReg32(cast[ptr uint32](RfBase + 0x264'u), 0xFFFFF000'u32,
+                channelMhz and 0xFFF'u32)
+    updateReg32(cast[ptr uint32](RfBase + 0x268'u), 0xFFFDFFFF'u32, 0x00020000'u32)
+    waitRfUs(1)
+    updateReg32(cast[ptr uint32](RfBase + 0x268'u), 0xFFFDFFFF'u32, 0'u32)
+    waitRfUs(1)
+    updateReg32(addr rf.baseCtrl1, not 0'u32, 0x2'u32)
+    waitRfUs(1)
+    updateReg32(cast[ptr uint32](RfBase + 0x26C'u), not 0x7'u32, 0x1'u32)
+    waitRfUs(1)
+    updateReg32(cast[ptr uint32](RfBase + 0x26C'u), not 0'u32, 0x8'u32)
+    waitRfUs(1)
+    updateReg32(cast[ptr uint32](RfBase + 0x26C'u), not 0x7'u32, 0x2'u32)
+    waitRfUs(100)
+    updateReg32(cast[ptr uint32](RfBase + 0x26C'u), not 0x8'u32, 0'u32)
+    waitRfUs(1)
+    updateReg32(cast[ptr uint32](RfBase + 0x228'u), not 0x8'u32, 0'u32)
+    rf_pri_update_param(channelMhz)
+    rfPriApplyNotchParam(channelMhz)
+    rf_pri_set_channel_pwr_comp(channelPowerIndex(channelMhz))
+    rf_pri_optimize(channelMhz)
+    rfPhyTraceCheckpoint(0x40'u32)
+
+  proc modemInitCoreMode(xtalfreqHz, restore: uint32; apiMode: uint8) =
+    ## Porting boundary for librf_bl808.a:rfc.c.o modem_init_core.
+    ## Recovered: xtal classification constants, rfc_xtal_cfg table load from
+    ## LLVM-decoded th.addsl/th.lrw at rfc.c.o+0x9c..0xc8, RF init
+    ## cold/restore flag, VCO table packing loop, and late typed modem/RF
+    ## register sequence. wl_init supplies the recovered WL API mode so
+    ## coexistence reclaim can reach rf_pri_init(..., WL_API_MODE_ALL) without
+    ## changing the exported modem_init_core ABI.
+    let xtalCfg = RfcXtalConfigTable[xtalIndex(xtalfreqHz)]
+    updateReg32(cast[ptr uint32](RfRxModeReg.uint), 0xFBFFFFFF'u32, 0'u32)
+    updateReg32(cast[ptr uint32](RfRxModeReg.uint), 0xF7FFFFFF'u32, 0x08000000'u32)
+    rf_pri_input_xtalfreq(xtalfreqHz)
+    rfPriLoadConfiguredDeviceInfo()
+    nimFwDbgRfApiMode = apiMode.uint32
+    rf_pri_init(if restore == 0'u32: 1'u32 else: 0'u32, apiMode.uint32)
+    updateReg32(cast[ptr uint32](RfBase + 0x1C0'u), 0xFFFFF000'u32,
+                xtalCfg.word10 and 0x00000FFF'u32)
+    updateReg32(cast[ptr uint32](RfBase + 0x1C4'u), 0xE0000000'u32,
+                xtalCfg.word0c and 0x1FFFFFFF'u32)
+    updateReg32(cast[ptr uint32](RfBase + 0x1C8'u), 0xFFF00000'u32,
+                xtalCfg.word04 and 0x000FFFFF'u32)
+    updateReg32(cast[ptr uint32](RfBase + 0x1CC'u), 0xFFF00000'u32,
+                xtalCfg.word08 and 0x000FFFFF'u32)
+    programRfcVcoTable()
+    writeRadioRegMaskInit(RfcModemLateInit)
+    updateReg32(cast[ptr uint32](RfBase + 0x504'u), 0xFFFFFFFF'u32, 0x10'u32)
+    updateReg32(cast[ptr uint32](RfBase + 0x514'u), 0xFFFFFFFF'u32, 0x10'u32)
+
+  proc modem_init_core*(xtalfreqHz, restore: uint32) {.exportc, cdecl.} =
+    modemInitCoreMode(xtalfreqHz, restore, WlApiModeWlan)
+
+  proc modem_init*(xtalfreqHz: uint32) {.exportc, cdecl.} =
+    modem_init_core(xtalfreqHz, 0'u32)
+
+  proc modem_restore*(xtalfreqHz: uint32) {.exportc, cdecl.} =
+    modem_init_core(xtalfreqHz, 1'u32)
+
+  proc rf_init*(xtalfreqHz: uint32) {.exportc, cdecl.} =
+    if wifiBl808RfInited == 0'u32:
+      modem_init_core(xtalfreqHz, 0'u32)
+      wifiBl808RfInited = 1'u32
+    else:
+      modem_init_core(xtalfreqHz, 1'u32)
+
+  proc rfc_init*(xtalfreqHz: uint32, fullInit: uint32 = 1'u32) {.exportc, cdecl.} =
+    let cfg = wl_cfg_get(addr wifiBl808WlRmem)
+    configureWlRfConfig(
+      cfg,
+      xtalfreqHz,
+      WlApiModeWlan,
+      if fullInit != 0'u32: 1'u8 else: 0'u8)
+    discard wl_init()
+    phy_init(nil)
+    wifiBl808RfInited = 1'u32
+
+  template rf_calib_data: pointer = rfCalibDataGlobal
+
+  proc snapshotWifiRfCalibData() =
+    nimFwDbgRfCalPtr = pointerAddrU32(rf_calib_data)
+    if rf_calib_data == nil:
+      for i in 0 ..< nimFwDbgRfCalWords.len:
+        nimFwDbgRfCalWords[i] = 0
+      return
+    let words = cast[ptr UncheckedArray[uint32]](rf_calib_data)
+    for i in 0 ..< nimFwDbgRfCalWords.len:
+      nimFwDbgRfCalWords[i] = words[i]
+
+  proc mpif_clk_init*() {.exportc, cdecl.} =
+    discard
+
+  proc phy_powroffset_set*(powerOffset: ptr int8) {.exportc, cdecl.} =
+    discard powerOffset
+else:
+  proc mpif_clk_init*() {.importc, cdecl.}
+  proc rf_init*(xtalfreqHz: uint32) {.importc, cdecl.}
+  proc rfc_init*(xtalfreqHz: uint32, fullInit: uint32) {.importc, cdecl.}
+
+proc wifiRfCoreInitMode(xtalfreqHz: uint32, apiMode: uint8) {.noinline.} =
+  when defined(bl808WifiUseBl808Rf):
+    nimFwDbgRfPhase = 1
+    nimFwDbgRfApiMode = apiMode.uint32
+    nimFwConnectTrace2U32("[WIFI-CT] bl808_rf_core ", xtalfreqHz, apiMode.uint32)
+    rfPriLoadConfiguredDeviceInfo()
+    let cfg = wl_cfg_get(addr wifiBl808WlRmem)
+    nimFwDbgRfPhase = 2
+    nimFwConnectTrace2U32("[WIFI-CT] bl808_rf_cfg ", cast[uint32](cast[uint](cfg)), sizeof(WlRfConfig).uint32)
+    if cfg != nil:
+      when defined(bl808WifiRfColdInit):
+        let enFullCal = if wifiBl808RfInited == 0'u32: 1'u8 else: 0'u8
+      else:
+        # The recovered cold path matches rf_init(), but currently stalls in the
+        # RF delay/calibration sequence on this board. Keep the prior restore
+        # path as the default until the cold path is fully ported.
+        let enFullCal = 0'u8
+      configureWlRfConfig(cfg, xtalfreqHz, apiMode, enFullCal)
+      nimFwConnectTrace2U32("[WIFI-CT] bl808_rf_cfg2 ", cfg.status, cfg.xtalfreqHz)
+    nimFwDbgRfPhase = 3
+    snapshotWifiRfCalibData()
+    when defined(bl808WifiRfColdInit):
+      let restore = if wifiBl808RfInited == 0'u32: 0'u32 else: 1'u32
+    else:
+      let restore = 1'u32
+    nimFwDbgRfRestore = restore
+    nimFwConnectTrace2U32("[WIFI-CT] bl808_rf_modem ", xtalfreqHz, restore)
+    nimFwDbgRfPhase = 4
+    nim_wifi_rf_latch_service_enable(1'u32)
+    discard wl_init()
+    nim_wifi_rf_latch_service_enable(0'u32)
+    snapshotWifiRfCalibData()
+    nimFwDbgRfPhase = 5
+    wifiBl808RfInited = 1'u32
+    nimFwConnectTrace2U32("[WIFI-CT] bl808_rf_done ", xtalfreqHz, restore)
+  else:
+    rf_init(xtalfreqHz)
+
+proc wifiRfCoreInit*(xtalfreqHz: uint32) {.exportc, cdecl, noinline.} =
+  wifiRfCoreInitMode(xtalfreqHz, WlApiModeWlan)
+
+when defined(bl808WifiUseBl808Rf):
+  proc wrapPhyAssertErr*(fileOrCond, condOrFile: cstring,
+                         line: cint)
+      {.exportc: "__wrap_phy_assert_err", cdecl, noinline.} =
+    ## The BL808 RF archive's phy_assert_err is a hard spin. The first
+    ## phy_init assert is a clock-count diagnostic on this target; log it and
+    ## continue so the smoke test can bisect the next WiFi bring-up stage.
+    let reg3c = regRead(0x24C0003C'u32)
+    inc nimFwDbgRfAssertCount
+    nimFwDbgRfAssertLine = line.uint32
+    nimFwDbgRfAssertReg3c = reg3c
+    nimFwConnectTrace2U32("[WIFI-CT] phy_assert ", line.uint32, reg3c)
+    if line == 586.cint or line == 0x20FA.cint or line == 0x2A60.cint:
+      return
+    while true:
+      discard fileOrCond
+      discard condOrFile
 proc tpc_update_tx_power*(vifIdx: uint8) {.exportc, cdecl.}
 proc bl_tpc_power_table_get*(powerTable: ptr array[38, int8]) {.exportc, cdecl.}
 proc bl_pwr_find*(levels: pointer, count: uint32): uint32 {.exportc, cdecl.}
@@ -5137,20 +12868,20 @@ proc waitRegMaskSet(reg: uint, mask: uint32,
 proc waitRegLowNibbleClear(reg: uint,
                            limit: uint32 = WifiHwPollLimit): bool =
   var remaining = limit
-  while (regRead(reg) and 0x0F'u32) != 0:
+  while (regRead(reg) and 0x3F'u32) != 0:
     if remaining == 0:
-      noteHwWaitTimeout(reg.uint32, 0x0F'u32)
+      noteHwWaitTimeout(reg.uint32, 0x3F'u32)
       return false
     dec remaining
   true
 
 proc waitRegLowNibbleEquals(reg: uint, value: uint32,
                             limit: uint32 = WifiHwPollLimit): bool =
-  let expected = value and 0x0F'u32
+  let expected = value and 0x3F'u32
   var remaining = limit
-  while (regRead(reg) and 0x0F'u32) != expected:
+  while (regRead(reg) and 0x3F'u32) != expected:
     if remaining == 0:
-      noteHwWaitTimeout(reg.uint32, 0x0F'u32 or (expected shl 8))
+      noteHwWaitTimeout(reg.uint32, 0x3F'u32 or (expected shl 8))
       return false
     dec remaining
   true
@@ -5314,6 +13045,28 @@ proc rcRateEntryPtr(stats: pointer, idx: int): pointer {.inline.} =
   ## Get pointer to rate entry i within rc_sta_stats.
   ## Rate entries start at offset 0, each 12 bytes.
   cast[pointer](cast[uint](stats) + (idx * RC_RATE_ENTRY_SIZE).uint)
+
+template rcRateEntryAt(p: pointer): ptr RcRateEntryView =
+  cast[ptr RcRateEntryView](p)
+
+template rcRateEntry(stats: pointer, idx: uint16): ptr RcRateEntryView =
+  cast[ptr RcRateEntryView](cast[uint](stats) + idx.uint * RC_RATE_ENTRY_SIZE.uint)
+
+template rcRateResetFields(stats: pointer, idx: uint16): ptr RcRateResetFieldsView =
+  cast[ptr RcRateResetFieldsView](cast[uint](stats) + idx.uint * RC_RATE_ENTRY_SIZE.uint)
+
+template rcThroughputArray(tpArray: pointer): ptr UncheckedArray[uint32] =
+  cast[ptr UncheckedArray[uint32]](tpArray)
+
+template rcStatsCounters(stats: pointer): ptr RcStatsCounterView =
+  cast[ptr RcStatsCounterView](stats)
+
+proc rcClearRateEntryTransientStats(stats: pointer; idx: uint16) {.inline.} =
+  let entry = rcRateResetFields(stats, idx)
+  entry.sampleSkipped = 0
+  entry.initialized = 1
+  entry.attempts0 = 0
+  entry.oldProb = 0
 
 proc rcRateConfig(stats: pointer, idx: int): uint16 {.inline.} =
   ## Read rate_config from entry i (at entry base + 10).
@@ -5757,6 +13510,9 @@ proc co_pack8p*(dst: pointer, src: pointer, count: uint32) {.exportc, cdecl.} =
 template keEnvEventField(): ptr uint32 =
   cast[ptr uint32](addr ke_env[0])
 
+template keEnvPsFlags(): ptr KeEnvPsFlagsView =
+  cast[ptr KeEnvPsFlagsView](addr ke_env[28])
+
 proc ke_evt_set*(evtBit: uint32) {.exportc, cdecl.} =
   ## Set event bit(s) in the kernel event field (interrupt-safe).
   let saved = irqSave()
@@ -5917,15 +13673,12 @@ proc ke_msg_free_payload(param: pointer) {.inline.} =
 
 proc ke_msg_discard*(param: pointer): cint {.exportc, cdecl.} =
   ## Message handler: discard (consume and free). Returns 0 = consumed.
-  return 0  # KE_MSG_CONSUMED
+  return KeMsgConsumed
 
 proc ke_msg_save*(param: pointer): cint {.exportc, cdecl.} =
   ## Message handler: save (do not free, move to saved queue). Returns 2 = saved.
-  ## From blob: ke_msg_save returns 2 (not 1). Return values are:
-  ##   0 = KE_MSG_CONSUMED (free the message)
-  ##   1 = KE_MSG_NO_FREE (don't free, don't save -- cleanup only)
-  ##   2 = KE_MSG_SAVED (push to saved queue)
-  return 2  # KE_MSG_SAVED
+  ## From blob: ke_msg_save returns saved (not no-free).
+  return KeMsgSaved
 
 # ###########################################################################
 #                      KERNEL: QUEUE (ke_queue_*)
@@ -6089,16 +13842,26 @@ proc ke_handler_search*(msgId: uint16, desc: ptr KeMsgHandlerDesc): pointer {.ex
   let table = desc.handlers
   var i = desc.numHandlers.int - 1
   while i >= 0:
-    let entryBase = cast[uint](table) + (i.uint * 8)
-    # Handler entry: [0..3] = msgId (lower 16 bits used), [4..7] = func ptr
-    let entryId = cast[ptr uint16](entryBase)[]
-    if entryId == msgId:
-      let fnPtr = cast[ptr pointer](entryBase + 4)[]
-      if fnPtr == nil:
+    let entry = keMsgHandlerEntryAt(table, i.uint16)
+    if uint16(entry.msgId) == msgId:
+      if entry.handler == nil:
         assert_err("ke_task.c", "ke_task.c", 233)
-      return fnPtr
+      return entry.handler
     dec i
   return nil
+
+proc keResumeSavedMessagesIfIdle() {.inline.} =
+  if keMsgQueueSent.first == nil and keSavedReschedTask != TASK_NONE:
+    discard ke_reschedule_saved_messages(keSavedReschedTask)
+
+proc keUpdateMessageEventAfterSchedule() {.inline.} =
+  let saved = irqSave()
+  if keMsgQueueSent.first == nil:
+    if keSavedReschedTask != TASK_NONE:
+      ke_evt_set(KE_EVT_KE_MESSAGE)
+    else:
+      ke_evt_clear(KE_EVT_KE_MESSAGE)
+  irqRestore(saved)
 
 proc ke_task_schedule*() {.exportc, cdecl.} =
   ## Process one pending message from the sent queue.
@@ -6107,8 +13870,7 @@ proc ke_task_schedule*() {.exportc, cdecl.} =
   ##   2. If not found, try default handler table → ke_handler_search
   ##   3. Call handler with (msgId, param, srcId, destId)
   ##   4. Handle return: 0=consumed(free), 1=no_free(cleanup), 2=saved
-  if keMsgQueueSent.first == nil and keSavedReschedTask != TASK_NONE:
-    discard ke_reschedule_saved_messages(keSavedReschedTask)
+  keResumeSavedMessagesIfIdle()
 
   let saved = irqSave()
   let node = co_list_pop_front(addr keMsgQueueSent)
@@ -6139,8 +13901,7 @@ proc ke_task_schedule*() {.exportc, cdecl.} =
       let statePtr = desc.statePtr
       let curState = statePtr[]
       nimFwTraceU32("[WIFI-NIMFW] task_sched state=", curState.uint32)
-      let stateDesc = cast[ptr KeMsgHandlerDesc](
-        cast[uint](desc.stateTable) + curState.uint * sizeof(KeMsgHandlerDesc).uint)
+      let stateDesc = keMsgHandlerDescAt(desc.stateTable, curState)
       handlerFn = ke_handler_search(msgId, stateDesc)
     # Step 2: If no state handler, try default handler
     if handlerFn == nil:
@@ -6173,30 +13934,28 @@ proc ke_task_schedule*() {.exportc, cdecl.} =
     let handler = cast[proc(param: pointer): cint {.cdecl.}](handlerFn)
     nimFwTrace("[WIFI-NIMFW] task_sched call")
     let rawRes = handler(param)
-    let res = if rawRes >= 0 and rawRes <= 2: rawRes else: 0
+    let res =
+      if rawRes >= KeMsgConsumed and rawRes <= KeMsgSaved:
+        rawRes
+      else:
+        KeMsgConsumed
     if rawRes != res:
       nimFwTrace2U32("[WIFI-NIMFW] task_sched res norm ",
                      rawRes.uint32, res.uint32)
     else:
       nimFwTraceU32("[WIFI-NIMFW] task_sched res=", res.uint32)
     case res
-    of 0:
-      ke_msg_free(node)           # KE_MSG_CONSUMED; blob frees the header
-    of 1:
-      discard                     # KE_MSG_NO_FREE
-    of 2:
-      co_list_push_back(addr keMsgQueueSaved, node)  # KE_MSG_SAVED
+    of KeMsgConsumed:
+      ke_msg_free(node)
+    of KeMsgNoFree:
+      discard
+    of KeMsgSaved:
+      co_list_push_back(addr keMsgQueueSaved, node)
     else:
       assert_err("ke_task.c", "ke_task.c", 345)
 
   # Common tail: one IRQ-safe queue-empty check + ke_evt_clear
-  let sTail = irqSave()
-  if keMsgQueueSent.first == nil:
-    if keSavedReschedTask != TASK_NONE:
-      ke_evt_set(KE_EVT_KE_MESSAGE)
-    else:
-      ke_evt_clear(KE_EVT_KE_MESSAGE)
-  irqRestore(sTail)
+  keUpdateMessageEventAfterSchedule()
 
 proc ke_task_sm_activating*(): bool {.exportc, cdecl.} =
   ## Check if the SM task is currently in an activating state.
@@ -6228,7 +13987,6 @@ proc cmp_timer_id*(elem: ptr CoListHdr, param: pointer): bool {.exportc, cdecl.}
 const
   # MAC HW timer registers (from ke_timer_hw_set disassembly)
   MACHW_TIMER_TARGET_REG = MACHW_BASE + 0x148'u   # Timer target register
-  MACHW_INTC_BASE        = 0x24B08000'u            # MAC HW interrupt controller base
   MACHW_INTC_SOFT_RESET  = MACHW_INTC_BASE + 0x050'u  # Soft reset (write 1 to reset, poll for 0)
   MACHW_INTC_STATUS_RAW  = MACHW_INTC_BASE + 0x06C'u  # IRQ status raw
   MACHW_INTC_STATUS_ACK  = MACHW_INTC_BASE + 0x070'u  # IRQ status ack (write 1 to clear)
@@ -6239,6 +13997,36 @@ const
   MACHW_INTC_IRQ_SET_REG = MACHW_INTC_BASE + 0x088'u  # Gen int ack (write 1 to clear)
   MACHW_INTC_IRQ_STAT_REG = MACHW_INTC_BASE + 0x08C'u # Gen int unmask
   MACHW_TIMER_IRQ_BIT    = 0x100'u32               # bit 8: timer interrupt
+
+proc wifi_nimfw_debug_snapshot*() {.exportc, cdecl.} =
+  ## Capture live MAC/RX registers for UART smoke diagnostics.
+  nimFwDbgRxlSnapHd = machwRxHdSubmittedHead()
+  nimFwDbgRxlSnapPd = machwRxPdSubmittedHead()
+  nimFwDbgRxlSnapHwHd = machwRxHwHdHead()
+  nimFwDbgRxlSnapHwPd = machwRxHwPdHead()
+  nimFwDbgRxlSnapIntUnmask = regRead(MACHW_INTC_UNMASK_REG)
+  nimFwDbgRxlSnapGenUnmask = regRead(MACHW_INTC_IRQ_STAT_REG)
+  nimFwDbgRxlSnapIrqRaw = regRead(MACHW_INTC_STATUS_RAW)
+  nimFwDbgRxlSnapGenRaw = regRead(MACHW_INTC_GEN_RAW)
+  nimFwDbgRxlSnapRxCtrlRaw = regRead(MACHW_RX_CNTRL_REG)
+  nimFwDbgRxlSnapStatusRaw = regRead(MACHW_STATUS_REG)
+  let rxlEnv = rxlCntrlEnvView()
+  let rxHwEnv = rxHwDescEnvView()
+  nimFwDbgRxlSnapHdStatus =
+    if rxlEnv.submittedHead != nil:
+      cast[ptr RxlSubmittedDescView](rxlEnv.submittedHead).status
+    else:
+      0'u32
+  nimFwDbgRxlSnapPdStatus =
+    if rxHwEnv.pdCurrent != nil:
+      let pd = rxDmaProgressDescAt(rxHwEnv.pdCurrent)
+      pd.status.uint32 or ((pd.usedFlag and 0xFFFF'u32) shl 16)
+    else:
+      0'u32
+  nimFwDbgRxlSnapMask = nimFwDbgRxlSnapIntUnmask xor
+    (nimFwDbgRxlSnapGenUnmask shl 16)
+  nimFwDbgRxlSnapRxCtrl = nimFwDbgRxlSnapRxCtrlRaw xor
+    (nimFwDbgRxlSnapStatusRaw shl 16)
 
 proc ke_timer_hw_set*(timerEntry: ptr KeTimerEntry) {.exportc, cdecl.} =
   ## Program the HW timer to fire at the given timer entry's expiry time.
@@ -6401,7 +14189,7 @@ proc bl_event_handle*(evtType: uint32) {.exportc, cdecl.} =
   if evtType == 0:
     bl_main_event_handle(0, nil)
   else:
-    let keEnvFlags = cast[pointer](cast[uint](addr ke_env[0]) + 28)
+    let keEnvFlags = keEnvPsFlags()
     bl_main_event_handle(evtType, keEnvFlags)
     discard c_memset(keEnvFlags, 0, 5.csize_t)
 
@@ -6454,15 +14242,33 @@ proc bl60x_fw_dump_statistic*(forced: cint) {.exportc, cdecl.} =
 #                     HAL MAC HW (hal_machw_*)
 # ###########################################################################
 
-proc phy_get_ntx(): uint8 {.importc: "phy_get_ntx", cdecl.}
-proc phy_ldpc_tx_supported(): bool {.importc: "phy_ldpc_tx_supported", cdecl.}
-  ## External: returns number of extra TX chains (0 = single antenna).
-proc phy_get_rf_gain_idx(txPowerElem: pointer, rateParam: pointer) {.importc: "phy_get_rf_gain_idx", cdecl.}
-  ## External: converts TX power element to RF gain index based on rate params.
+when not defined(bl808WifiUseBl808Rf):
+  proc phy_get_ntx(): uint8 {.importc: "phy_get_ntx", cdecl.}
+  proc phy_get_nss(): uint8 {.importc: "phy_get_nss", cdecl.}
+  proc phy_ldpc_tx_supported(): bool {.importc: "phy_ldpc_tx_supported", cdecl.}
+    ## External: returns number of extra TX chains (0 = single antenna).
+  proc phy_get_rf_gain_idx(txPowerElem: pointer, rateParam: pointer) {.importc: "phy_get_rf_gain_idx", cdecl.}
+    ## External: converts TX power element to RF gain index based on rate params.
 proc tcpip_stack_input(entry: pointer, descFlag: uint32, payload: pointer, bufOff: uint32, dmaArray: pointer, fcFlag: uint32): cint {.importc: "tcpip_stack_input", cdecl.}
   ## External: fast-path delivery of RX data frames to TCP/IP stack.
-proc trpc_get_default_power_idx(rateType: uint32, rateIdx: uint8): int8 {.importc: "trpc_get_default_power_idx", cdecl.}
-  ## External: get default TX power index for a given rate type and index.
+when not defined(bl808WifiUseBl808Rf):
+  proc trpc_get_default_power_idx(rateType: uint32, rateIdx: uint8): int8 {.importc: "trpc_get_default_power_idx", cdecl.}
+    ## External: get default TX power index for a given rate type and index.
+
+proc bl808ApplyPureRfMacTimingBaseline() {.inline.} =
+  when defined(bl808WifiUseBl808Rf):
+    ## Match the passing vendor MAC timing state observed at the scan
+    ## mm_active edge. These timing registers directly gate RX/TX PHY delays.
+    regWrite(MACHW_BASE + 0x0E8'u, 0x00016809'u32)
+    regWrite(MACHW_BASE + 0x0F0'u, 0x05414002'u32)
+    regWrite(MACHW_BASE + 0x0F4'u, 0x0001900A'u32)
+    regWrite(MACHW_BASE + 0x0F8'u, 0x00028010'u32)
+    regWrite(MACHW_BASE + 0x104'u, 0x0C814028'u32)
+    nimFwDbgMacTimingE8 = regRead(MACHW_BASE + 0x0E8'u)
+    nimFwDbgMacTimingF0 = regRead(MACHW_BASE + 0x0F0'u)
+    nimFwDbgMacTimingF4 = regRead(MACHW_BASE + 0x0F4'u)
+    nimFwDbgMacTimingF8 = regRead(MACHW_BASE + 0x0F8'u)
+    nimFwDbgMacTiming104 = regRead(MACHW_BASE + 0x104'u)
 
 proc hal_machw_init*() {.exportc, cdecl.} =
   ## Initialize MAC HW registers.
@@ -6785,6 +14591,7 @@ proc hal_machw_init*() {.exportc, cdecl.} =
   r = regRead(REG_04C)
   r = (r and 0xFDFFFFFF'u32) or 0x02000000'u32
   regWrite(REG_04C, r)
+  bl808ApplyPureRfMacTimingBaseline()
 
 proc hal_machw_reset*() {.exportc, cdecl.} =
   ## Reset MAC HW: clear state, disable gen-int enable bit, reset DMA,
@@ -7040,6 +14847,8 @@ proc hal_machw_gen_handler*() {.exportc, cdecl.} =
   let rawStatus = regRead(MACHW_INTC_STATUS_RAW)
   let unmask = regRead(MACHW_INTC_UNMASK_REG)
   let status = unmask and rawStatus
+  inc nimFwDbgMachwGen
+  nimFwDbgMachwStatus = rawStatus or (status shl 16)
   regWrite(MACHW_INTC_STATUS_ACK, status)
   if status != 0'u32 and (status and 0x0F3FFB8C'u32) != 0'u32:
     nimFwTrace2U32("[WIFI-NIMFW] machw_status ", rawStatus, unmask)
@@ -7077,6 +14886,7 @@ proc hal_machw_gen_handler*() {.exportc, cdecl.} =
   if (status and 0x08'u32) != 0:
     # Read gen int raw status and acknowledge all bits
     let genStatus = regRead(MACHW_INTC_GEN_RAW)
+    nimFwDbgMachwGenStatus = genStatus
     regWrite(MACHW_INTC_IRQ_SET_REG, genStatus)
 
     # Gen bit 8 (0x100): timer expiry
@@ -7345,7 +15155,7 @@ proc element_notify*(ctx: pointer, op: uint32, param1: pointer, param2: pointer)
   ## reads ctx+8 for state, calls logFn(1, 0, fmtStr, 1826, fileStr, ctxState, param2).
   let logFn = getLogFunc(0xCC)
   if logFn != nil:
-    let ctxState = cast[ptr pointer](cast[uint](ctx) + 8)[]
+    let ctxState = elementNotifyContextAt(ctx).state
     cast[proc(a0: uint32, a1: uint32, a2: cstring, a3: uint32, a4: cstring, a5: pointer, a6: pointer) {.cdecl.}](logFn)(
       1, 0, "element_notify", 1826, "notifier.c", ctxState, param2)
 
@@ -7641,9 +15451,8 @@ proc mm_set_wpa_rsn_ie*(vifIdx: uint8, ie: pointer, ieLen: uint8) {.exportc, cde
   inc nimFwDbgWpaRsnIeSet
   nimFwDbgWpaRsnIeLen = ieLen.uint32
   nimFwDbgWpaRsnIePtr = cast[uint32](ie)
-  let vifTab = cast[uint](addr vif_info_tab[0])
-  let vifEntry = vifTab + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let sec = vifSecurityAt(vifEntry)
+  let vif = vifChannelForIdx(vifIdx)
+  let sec = vifSecurity(vif)
   sec.rsnIePtr = cast[uint32](ie)
   sec.rsnIeLen = ieLen
 
@@ -7812,7 +15621,7 @@ proc mm_sta_add*(param: pointer, staIdxOut: ptr uint8, hwStaIdxOut: ptr uint8): 
       # WPS mode: call WPS callback if available
       let wpsCbsPtr = wps_cbs
       if wpsCbsPtr != nil:
-        let cbFuncPtr = cast[ptr pointer](cast[uint](wpsCbsPtr) + 8)[]
+        let cbFuncPtr = wpsCallbacks().staConnected
         if cbFuncPtr != nil:
           let vifHwIdx = vif.vifIdx
           let cbStaIdx = staIdxOut[]
@@ -7827,21 +15636,20 @@ proc mm_sta_add*(param: pointer, staIdxOut: ptr uint8, hwStaIdxOut: ptr uint8): 
         # WPA/WPA2/WPA3 key setup (cipher 2, 3, or 4)
         var keyBuf {.noinit.}: array[128, uint8]
         discard c_memset(addr keyBuf[0], 0, 128)
+        let keyReq = cast[ptr WpaKeyWriteParamView](addr keyBuf[0])
 
-        # keyBuf[0] = vif HW index, keyBuf[1] = sta_idx
-        keyBuf[0] = vif.vifIdx
-        keyBuf[1] = staIdxOut[]
+        keyReq.vifIdx = vif.vifIdx
+        keyReq.staIdx = staIdxOut[]
 
-        # keyBuf[16..19] = key data length (word at sp+32, i.e., keyBuf offset 16)
         let keyDataLen = vif.supportedRatesLong[0]
-        cast[ptr uint32](addr keyBuf[16])[] = keyDataLen.uint32
+        keyReq.keyDataLen = keyDataLen.uint32
 
-        keyBuf[125] = req.quickConn
+        keyReq.quickConn = req.quickConn
 
-        # Copy key material from vif_entry+387 to keyBuf[20]
-        discard c_memcpy(addr keyBuf[20], addr vif.supportedRatesLong[1], keyDataLen.csize_t)
+        discard c_memcpy(addr keyReq.keyMaterial[0],
+                         addr vif.supportedRatesLong[1],
+                         keyDataLen.csize_t)
 
-        # Copy SSID into keyBuf[58]
         let creds = connectInfoCredentials(sm.connectInfo)
         let ssidPresent = creds.altSsid[0]
 
@@ -7854,7 +15662,7 @@ proc mm_sta_add*(param: pointer, staIdxOut: ptr uint8, hwStaIdxOut: ptr uint8): 
           ssidSrc = addr creds.keyString[0]
           ssidLen = c_strlen(ssidSrc)
 
-        discard c_memcpy(addr keyBuf[58], ssidSrc, ssidLen)
+        discard c_memcpy(addr keyReq.ssid[0], ssidSrc, ssidLen)
 
         # Mark key slots as invalid (-1)
         sec.staKeySlots[0] = 0xFF
@@ -7864,7 +15672,7 @@ proc mm_sta_add*(param: pointer, staIdxOut: ptr uint8, hwStaIdxOut: ptr uint8): 
         # Call WPA key write callback: wpa_cbs -> ptr -> [12] = func
         let wpaCbsPtr = wpa_cbs
         if wpaCbsPtr != nil:
-          let keyWriteCb = cast[ptr pointer](cast[uint](wpaCbsPtr) + 12)[]
+          let keyWriteCb = wpaCallbacks().keyWrite
           if keyWriteCb != nil:
             type KeyWriteProc = proc(buf: pointer): uint8 {.cdecl.}
             let kwCb = cast[KeyWriteProc](keyWriteCb)
@@ -7891,18 +15699,16 @@ proc mm_sta_add*(param: pointer, staIdxOut: ptr uint8, hwStaIdxOut: ptr uint8): 
         # Build WEP key buffer (56 bytes)
         var wepBuf {.noinit.}: array[56, uint8]
         discard c_memset(addr wepBuf[0], 0, 56)
+        let wepReq = cast[ptr WepKeyWriteParamView](addr wepBuf[0])
 
-        # wepBuf[53] = inst_nbr
-        wepBuf[53] = instNbr
+        wepReq.instNbr = instNbr
 
-        # wepBuf[0..1] = 0xFF00 (little-endian: [0]=0x00, [1]=0xFF)
-        cast[ptr uint16](addr wepBuf[0])[] = 0xFF00'u16
+        wepReq.selector = 0xFF00'u16
 
         let wepKeyStr = keyStr
         var keyLen = c_strlen(wepKeyStr).uint8
 
-        # wepBuf[4] = key length
-        wepBuf[4] = keyLen
+        wepReq.keyLen = keyLen
 
         # Blob tail-merges all three WEP-key branches into a single
         # mm_sec_machwkey_wr call site — build the wepBuf, then fall
@@ -7910,26 +15716,23 @@ proc mm_sta_add*(param: pointer, staIdxOut: ptr uint8, hwStaIdxOut: ptr uint8): 
         var writeKey = true
         if keyLen == 5 or keyLen == 13:
           # Raw WEP40 / WEP104 share the same memcpy call site.
-          wepBuf[52] = (if keyLen == 5: 0'u8 else: 3'u8)
-          discard c_memcpy(addr wepBuf[8], wepKeyStr, keyLen.csize_t)
+          wepReq.cipherMode = (if keyLen == 5: 0'u8 else: 3'u8)
+          discard c_memcpy(addr wepReq.keyData[0], wepKeyStr, keyLen.csize_t)
         elif keyLen == 10 or keyLen == 26:
           # Hex-encoded WEP key (10 hex = 5 bytes WEP40, 26 hex = 13 bytes WEP104)
-          if keyLen == 26:
-            wepBuf[52] = 3
-          else:
-            wepBuf[52] = 0
+          wepReq.cipherMode = (if keyLen == 26: 3'u8 else: 0'u8)
           var hexLen = keyLen
           if (hexLen and 1) != 0:
             hexLen = hexLen and 0xFE'u8
           if hexLen > 0:
             var i: int = 0
-            let srcBase = cast[uint](wepKeyStr)
+            let hexChars = cast[ptr UncheckedArray[uint8]](wepKeyStr)
             while i < hexLen.int:
-              let hi = ascii_to_hex(cast[ptr uint8](srcBase + i.uint)[])
-              let lo = ascii_to_hex(cast[ptr uint8](srcBase + i.uint + 1)[])
-              wepBuf[8 + (i div 2)] = (hi shl 4) or lo
+              let hi = ascii_to_hex(hexChars[i])
+              let lo = ascii_to_hex(hexChars[i + 1])
+              wepReq.keyData[i div 2] = (hi shl 4) or lo
               i += 2
-          wepBuf[4] = keyLen shr 1
+          wepReq.keyLen = keyLen shr 1
         else:
           # Unknown WEP key length -- log error, unregister, return error
           if logFuncPtr != nil:
@@ -7971,7 +15774,6 @@ proc mm_sta_del*(staIdx: uint8) {.exportc, cdecl.} =
   # Load VIF pointer from sta+39 (vifIdx byte used for table lookup)
   let vifIdx = sta.instNbr
   let vif = vifChannelForIdx(vifIdx)
-  let vifEntry = cast[uint](vif)
 
   if vif.vifType != VIF_TYPE_STA:
     # AP mode path (.L192): check sta+41 for connection status
@@ -7992,7 +15794,7 @@ proc mm_sta_del*(staIdx: uint8) {.exportc, cdecl.} =
           ke_msg_alloc(0x37'u16, 9, TASK_MM,
                        MmStaDelKeyCfmPayloadSize))
         # Store key index in msg[0], zero in msg[1]
-        mmEnvKeepAliveTimestampByte1() = 0  # clear byte at mm_env+41
+        mmEnvClearKeepAliveTimestampByte1()  # clear byte at mm_env+41
         msg.hwKeyIdx = hwKeyIdx
         msg.status = 0
         ke_msg_send(msg)
@@ -8000,7 +15802,7 @@ proc mm_sta_del*(staIdx: uint8) {.exportc, cdecl.} =
         # Call apm_tx_int_ps_clear
         let apStaIdx = vif.vifIdx
         let psIdx = (apStaIdx + 5) and 0xFF
-        apm_tx_int_ps_clear(cast[pointer](vifEntry), cast[uint8](psIdx))
+        apm_tx_int_ps_clear(cast[pointer](vif), cast[uint8](psIdx))
     # Exit via sta_mgmt_unregister below
   else:
     # STA mode path: store 0xFF at sta[96] (disassociate)
@@ -8121,7 +15923,6 @@ proc mm_check_beacon*(param: pointer) {.exportc, cdecl.} =
   let rx = beaconRxDescView(param)
   let vif = vifChannelAt(vifEntry)
   let sta = staInfoAt(staEntry)
-  let vifU = cast[uint](vif)
 
   # Step 1: Extract frame data from rxdesc payload chain
   let payloadDesc = beaconPayloadDescView(rx.payloadDesc)
@@ -8139,7 +15940,8 @@ proc mm_check_beacon*(param: pointer) {.exportc, cdecl.} =
 
   # Send keepalive null frame after beacon processing (blob: txl_frame_send_null_frame at 0x98)
   let staIdx = vif.staIdx
-  discard txl_frame_send_null_frame(staIdx, cast[pointer](mm_ap_traffic_probe_cfm), cast[uint32](vifU))
+  discard txl_frame_send_null_frame(staIdx, cast[pointer](mm_ap_traffic_probe_cfm),
+                                    pointerAddrU32(vifEntry))
 
   # Step 2: CSA check - if vif_entry[64] (CSA ctx ptr) nonzero, parse DS Param IE (id=3)
   let csaCtxPtr = vif.chanCtxt
@@ -8147,10 +15949,9 @@ proc mm_check_beacon*(param: pointer) {.exportc, cdecl.} =
     # Blob calls mac_ie_find(ieBody, ieBodyLen, 3) for DS Parameter Set
     let dsIe = mac_ie_find(ieBody, ieBodyLen, 3)
     if dsIe != nil:
-      let csaCtxU = cast[uint](csaCtxPtr)
-      let csaCtxFreq = cast[ptr uint16](csaCtxU + 6)[]
-      let csaCtxMode = cast[ptr uint8](csaCtxU + 4)[]
-      let newFreq = dsParamFreq(csaCtxMode, dsParamSetIeAt(dsIe))
+      let csaChan = addr chanCtxtAt(csaCtxPtr).channel
+      let csaCtxFreq = csaChan.primFreq
+      let newFreq = dsParamFreq(csaChan.band, dsParamSetIeAt(dsIe))
       if csaCtxFreq != newFreq:
         return  # Channel mismatch, bail out
 
@@ -8503,15 +16304,6 @@ proc mm_sec_machwaddr_wr*(vifIdx: uint8, addr_ptr: pointer, idx: uint8): uint8 {
   ##   +0x0C0: address data high (halfword at sta_entry+8)
   ##   +0x0AC..0x0B8: key material words 0..3 (cleared to 0 for addr write)
   ##   +0x0C4: control register (write hwStaIdx<<16 | keySlot<<4 | 0x40000002)
-  const
-    MACHW     = 0x24B00000'u  # blob address space
-    ADDR_LO   = MACHW + 0x0BC'u
-    ADDR_HI   = MACHW + 0x0C0'u
-    KEY_MAT0  = MACHW + 0x0AC'u
-    KEY_MAT1  = MACHW + 0x0B0'u
-    KEY_MAT2  = MACHW + 0x0B4'u
-    KEY_MAT3  = MACHW + 0x0B8'u
-    KEY_CTRL  = MACHW + 0x0C4'u
 
   # Blob reads the station MAC from sta_info_tab[staIdx].
   let mac = staMacWords(staInfoForIdx(vifIdx))
@@ -8519,15 +16311,8 @@ proc mm_sec_machwaddr_wr*(vifIdx: uint8, addr_ptr: pointer, idx: uint8): uint8 {
   # Compute HW station index: (staIdx + 8) & 0xFF
   let hwStaIdx = ((vifIdx.uint32 + 8) and 0xFF)
 
-  # Write address data
-  volatileStore(cast[ptr uint32](ADDR_LO), mac.lo)
-  volatileStore(cast[ptr uint32](ADDR_HI), mac.hi)
-
-  # Clear key material words (blob writes zero to all 4)
-  volatileStore(cast[ptr uint32](KEY_MAT0), 0'u32)
-  volatileStore(cast[ptr uint32](KEY_MAT1), 0'u32)
-  volatileStore(cast[ptr uint32](KEY_MAT2), 0'u32)
-  volatileStore(cast[ptr uint32](KEY_MAT3), 0'u32)
+  machwSecurityWriteAddress(mac.lo, mac.hi)
+  machwSecurityClearKeyMaterial()
 
   # Validate keySlot field (shifted left 4)
   # Blob: a1 is keySlot. In Nim ABI, addr_ptr carries this value.
@@ -8542,45 +16327,29 @@ proc mm_sec_machwaddr_wr*(vifIdx: uint8, addr_ptr: pointer, idx: uint8): uint8 {
   let ctrlWord = (hwStaIdx shl 16) or idxField or 0x40000002'u32
   nimFwConnectTrace2U32("[WIFI-CT] machwaddr ", (vifIdx.uint32 or (hwStaIdx shl 8) or (keySlot shl 16)), ctrlWord)
   nimFwConnectTrace2U32("[WIFI-CT] machwmac ", mac.lo, mac.hi)
-  volatileStore(cast[ptr uint32](KEY_CTRL), ctrlWord)
+  machwSecurityWriteControl(ctrlWord)
 
   # Poll until bit 30 (0x40000000) clears
-  discard waitRegMaskClear(KEY_CTRL, 0x40000000'u32)
+  discard waitMachwSecurityControlClear(0x40000000'u32)
   return hwStaIdx.uint8
 
 proc mm_sec_machwaddr_del*(idx: uint8) {.exportc, cdecl.} =
   ## Delete MAC address from HW address table (42 instructions in blob).
   ## Writes all-ones to address data, zeros to key material, then triggers
   ## the HW with (hwStaIdx<<16 | 0x40000000) and polls until done.
-  const
-    MACHW     = 0x24B00000'u
-    ADDR_LO   = MACHW + 0x0BC'u
-    ADDR_HI   = MACHW + 0x0C0'u
-    KEY_MAT0  = MACHW + 0x0AC'u
-    KEY_MAT1  = MACHW + 0x0B0'u
-    KEY_MAT2  = MACHW + 0x0B4'u
-    KEY_MAT3  = MACHW + 0x0B8'u
-    KEY_CTRL  = MACHW + 0x0C4'u
-
-  # Write all-ones to address data (invalidate)
-  volatileStore(cast[ptr uint32](ADDR_LO), 0xFFFFFFFF'u32)
-  volatileStore(cast[ptr uint32](ADDR_HI), 0xFFFFFFFF'u32)
+  machwSecurityWriteAddress(0xFFFFFFFF'u32, 0xFFFFFFFF'u32)
 
   # Compute HW station index: (idx + 8) & 0xFF
   let hwStaIdx = ((idx.uint32 + 8) and 0xFF)
 
-  # Clear key material words
-  volatileStore(cast[ptr uint32](KEY_MAT0), 0'u32)
-  volatileStore(cast[ptr uint32](KEY_MAT1), 0'u32)
-  volatileStore(cast[ptr uint32](KEY_MAT2), 0'u32)
-  volatileStore(cast[ptr uint32](KEY_MAT3), 0'u32)
+  machwSecurityClearKeyMaterial()
 
   # Build control word: hwStaIdx<<16 | 0x40000000, then write
   let ctrlWord = (hwStaIdx shl 16) or 0x40000000'u32
-  volatileStore(cast[ptr uint32](KEY_CTRL), ctrlWord)
+  machwSecurityWriteControl(ctrlWord)
 
   # Poll until bit 30 (0x40000000) clears
-  discard waitRegMaskClear(KEY_CTRL, 0x40000000'u32)
+  discard waitMachwSecurityControlClear(0x40000000'u32)
 
 proc mm_sec_macrx_ind*(staIdx: uint8, payload: pointer, length: uint16) {.exportc, cdecl.} =
   ## Forward EAPOL/security frame to host via IPC. Uses platform alloc/free
@@ -8590,9 +16359,10 @@ proc mm_sec_macrx_ind*(staIdx: uint8, payload: pointer, length: uint16) {.export
     blOpsFunc(0xB8))
   let buf = allocFn(length.uint32 + 16)
   if buf != nil:
-    cast[ptr uint8](cast[uint](buf) + 0)[] = staIdx
-    cast[ptr uint16](cast[uint](buf) + 2)[] = length
-    discard c_memcpy(cast[pointer](cast[uint](buf) + 4), payload, length.csize_t)
+    let ind = secMacRxIndAt(buf)
+    ind.staIdx = staIdx
+    ind.length = length
+    discard c_memcpy(addr ind.payload[0], payload, length.csize_t)
     ipc_emb_msg_push(buf)
     platformFree(buf)
 
@@ -8616,41 +16386,44 @@ proc mm_sec_machwkey_wr*(param: pointer) {.exportc, cdecl.} =
   ##   +0x0C4: key control (write trigger bit 30, poll until clear)
   ##   +0x0D8: key count / config
 
-  const
-    MACHW     = MACHW_BASE
-    KEY_MAT0  = MACHW + 0x0AC'u
-    KEY_MAT1  = MACHW + 0x0B0'u
-    KEY_MAT2  = MACHW + 0x0B4'u
-    KEY_MAT3  = MACHW + 0x0B8'u
-    KEY_LO    = MACHW + 0x0BC'u
-    KEY_HI    = MACHW + 0x0C0'u
-    KEY_CTRL  = MACHW + 0x0C4'u
-    KEY_COUNT = MACHW + 0x0D8'u
-
   let req = machwKeyWriteParamView(param)
   let keyType = req.keyType     # s3
   let keyIdx = req.keyIdx       # s1 (blob: lbu s1,53(a0))
   var hwIdx = req.addrIdx       # s0
+  var keyTypeForCtrl = keyType.uint32
+  var cipherType = req.cipherType
+  inc nimFwDbgMachwKeyWrCalls
+  nimFwDbgMachwKeyWrLast0 = req.addrIdx.uint32 or (keyType.uint32 shl 8) or
+    (req.keyLen.uint32 shl 16) or (req.macLen.uint32 shl 24)
+  nimFwDbgMachwKeyWrLast1 = cipherType.uint32 or (keyIdx.uint32 shl 8) or
+    (req.spp.uint32 shl 16) or (req.keyFlags.uint32 shl 24)
 
   if keyType == 0xFF:
+    inc nimFwDbgMachwKeyWrGroup
     # Default WEP / group-key path
-    let cipherType = req.cipherType  # blob: lbu a4,52(a0)
     if cipherType == 5:
       # CCMP: derive HW index from key count register top byte
-      let keyCount = volatileLoad(cast[ptr uint32](KEY_COUNT))
+      let keyCount = machwSecurityKeyCount()
       let baseIdx = cast[uint8](keyCount shr 24)
       hwIdx = cast[uint8]((hwIdx.uint32 + baseIdx.uint32 - 3) and 0xFF)
-      # Blob 0x48: vif_mgmt_add_key(vifIdx=param[0], hwIdx)
-      vif_mgmt_add_key(req.addrIdx, param)
+      # Blob 0x48: vif_mgmt_add_key(param, hwIdx)
+      vif_mgmt_add_key(param, hwIdx)
+      return
     else:
       # WEP40/WEP104: set key data low/high to all-ones (wildcard)
-      volatileStore(cast[ptr uint32](KEY_LO), 0xFFFFFFFF'u32)
-      volatileStore(cast[ptr uint32](KEY_HI), 0xFFFFFFFF'u32)
-      # Blob 0x7c: vif_mgmt_add_key(vifIdx=param[0], hwIdx)
-      vif_mgmt_add_key(req.addrIdx, param)
-    # Blob does NOT call mm_sec_machwaddr_wr here — previously we did.
+      machwSecurityWriteAddress(0xFFFFFFFF'u32, 0xFFFFFFFF'u32)
+      # Blob 0x7c: vif_mgmt_add_key(param, hwIdx)
+      vif_mgmt_add_key(param, hwIdx)
+    # Blob falls through to the key material/control write for this path.
 
   else:
+    inc nimFwDbgMachwKeyWrPair
+    nimFwDbgMachwKeyWrPair0 = nimFwDbgMachwKeyWrLast0
+    nimFwDbgMachwKeyWrPair1 = nimFwDbgMachwKeyWrLast1
+    nimFwDbgMachwKeyWrPair2 = req.keyWords[0]
+    nimFwDbgMachwKeyWrPair3 = req.keyWords[1]
+    nimFwDbgMachwKeyWrPair4 = req.keyWords[2]
+    nimFwDbgMachwKeyWrPair5 = req.keyWords[3]
     # Pairwise/group key: keyType 0..6
     if keyType > 6:
       assert_err("mm_sec.c", "mm_sec.c", 1137)
@@ -8659,50 +16432,76 @@ proc mm_sec_machwkey_wr*(param: pointer) {.exportc, cdecl.} =
     hwIdx = cast[uint8]((keyType.uint32 + 8) and 0xFF)
     # Blob does NOT call mm_sec_machwaddr_wr here.
 
-    # Write STA MAC address to KEY_LO/KEY_HI (blob: lookup sta_info_tab by hwIdx,
+    # Register key in upper-MAC STA table before programming MAC key RAM.
+    # Vendor then remaps req.cipherType through CSWTCH tables for the hardware
+    # control word. CSWTCH.121 maps the key-type field, and CSWTCH.122 maps
+    # the hardware cipher mode.
+    sta_mgmt_add_key(param, hwIdx)
+
+    # Write STA MAC address to KEY_LO/KEY_HI (blob: lookup sta_info_tab by keyType,
     # read MAC bytes from staEntry[4..9], write 32-bit low + 16-bit high)
-    let mac = staMacWords(staInfoForIdx(hwIdx))
-    volatileStore(cast[ptr uint32](KEY_LO), mac.lo)
-    volatileStore(cast[ptr uint32](KEY_HI), mac.hi)
+    let mac = staMacWords(staInfoForIdx(keyType))
+    machwSecurityWriteAddress(mac.lo, mac.hi)
 
     # Check cipher type for dispatch (0..3 only for key RAM write)
-    let cipherType = req.cipherType  # blob: lbu a5,52(s2)
-    if cipherType > 3:
-      # Cipher types 4+ (e.g. CCMP=5): blob asserts then continues with zeroed cipher
-      assert_err("mm_sec.c", "mm_sec.c", 1212)
-    # Always proceed to key material + control write below
+  let validCipherType = cipherType <= 3
+  if not validCipherType:
+    # Vendor asserts, then continues with cipher 0 and key type 1.
+    assert_err("mm_sec.c", "mm_sec.c", 1212)
+    cipherType = 0
+    keyTypeForCtrl = 1
 
-    # Write 4 key material words from param[8..23]
-    volatileStore(cast[ptr uint32](KEY_MAT0), req.keyWords[0])
-    volatileStore(cast[ptr uint32](KEY_MAT1), req.keyWords[1])
-    volatileStore(cast[ptr uint32](KEY_MAT2), req.keyWords[2])
-    volatileStore(cast[ptr uint32](KEY_MAT3), req.keyWords[3])
+  if validCipherType:
+    keyTypeForCtrl =
+      case cipherType
+      of 0: 0'u32
+      of 1: 1'u32
+      of 2: 0'u32
+      of 3: 1'u32
+      else: keyTypeForCtrl
 
-    # Validate keyIdx field (shifted left 4, low nibble must be 0)
-    let keyIdxField = keyIdx.uint32 shl 4
-    if (keyIdxField and not 0xF0'u32) != 0:
-      assert_err("mm_sec.c", "mm_sec.c", 0x1873)
+  let hwCipherType =
+    case cipherType
+    of 0: 1'u32
+    of 1: 2'u32
+    of 2: 3'u32
+    of 3: 1'u32
+    else: 0'u32
 
-    # Validate spp field (shifted left 2, only bits [3:2] valid)
-    let sppField = req.spp.uint32 shl 2  # blob: lbu s2,54(s2)
-    if (sppField and not 0x0C'u32) != 0:
-      assert_err("mm_sec.c", "mm_sec.c", 0x1874)
+  machwSecurityWriteKeyMaterial(req.keyWords)
 
-    # Build control word and write:
-    #   keyIdx<<4 | spp<<2 | keyType<<11 | hwIdx<<16 | cipherType<<8 | 0x40000000
-    let ctrlWord = keyIdxField or sppField or
-                   (keyType.uint32 shl 11) or
-                   (hwIdx.uint32 shl 16) or
-                   (cipherType.uint32 shl 8) or
-                   0x40000000'u32
-    volatileStore(cast[ptr uint32](KEY_CTRL), ctrlWord)
+  # Validate keyIdx field (shifted left 4, low nibble must be 0)
+  let keyIdxField = keyIdx.uint32 shl 4
+  if (keyIdxField and not 0xF0'u32) != 0:
+    assert_err("mm_sec.c", "mm_sec.c", 0x1873)
 
-    # Poll until bit 30 (trigger) clears
-    discard waitRegMaskClear(KEY_CTRL, 0x40000000'u32)
+  # Validate spp field (shifted left 2, only bits [3:2] valid)
+  let sppField = req.spp.uint32 shl 2  # blob: lbu s2,54(s2)
+  if (sppField and not 0x0C'u32) != 0:
+    assert_err("mm_sec.c", "mm_sec.c", 0x1874)
 
-    # Register key in upper-MAC STA table (blob pairwise path: sta_mgmt_add_key
-    # only; vif_mgmt_add_key is reserved for the default-key branches above).
-    sta_mgmt_add_key(hwIdx, param)
+  # Build control word and write:
+  #   keyIdx<<4 | spp<<2 | keyType<<11 | hwIdx<<16 |
+  #   hwCipherType<<8 | 0x40000000
+  let ctrlWord = keyIdxField or sppField or
+                 (keyTypeForCtrl shl 11) or
+                 (hwIdx.uint32 shl 16) or
+                 (hwCipherType shl 8) or
+                 0x40000000'u32
+  if keyType != 0xFF'u8:
+    nimFwDbgMachwKeyWrPairCtrl = ctrlWord
+  machwSecurityWriteControl(ctrlWord)
+
+  # Poll until bit 30 (trigger) clears
+  discard waitMachwSecurityControlClear(0x40000000'u32)
+  if keyType != 0xFF'u8:
+    machwSecurityWriteControl((hwIdx.uint32 shl 16) or 0x80000000'u32)
+    discard waitMachwSecurityControlClear(0x80000000'u32)
+    nimFwDbgMachwKeyWrRead0 = volatileLoad(addr machwSecurityRegs().keyMaterial[0])
+    nimFwDbgMachwKeyWrRead1 = volatileLoad(addr machwSecurityRegs().keyMaterial[1])
+    nimFwDbgMachwKeyWrRead2 = volatileLoad(addr machwSecurityRegs().keyMaterial[2])
+    nimFwDbgMachwKeyWrRead3 = volatileLoad(addr machwSecurityRegs().keyMaterial[3])
+    nimFwDbgMachwKeyWrReadCtrl = machwSecurityControl()
 
 proc mm_sec_machwkey_del*(keyIdx: uint8) {.exportc, cdecl.} =
   ## Delete encryption key from MAC HW key table (76 instrs in blob).
@@ -8716,64 +16515,51 @@ proc mm_sec_machwkey_del*(keyIdx: uint8) {.exportc, cdecl.} =
   ##                                for KEY_CTRL bit 0x40000000 to clear.
   ##   keyIdx >  7  && <= topCnt → station key path: writes STA MAC to KEY_LO/HI
   ##                                then calls sta_mgmt_del_key, falls through.
-  const
-    MACHW = MACHW_BASE
-    KEY_LO    = MACHW + 0x0BC'u
-    KEY_HI    = MACHW + 0x0C0'u
-    KEY_CTRL  = MACHW + 0x0C4'u
-    KEY_COUNT = MACHW + 0x0D8'u
 
-  let keyCount = volatileLoad(cast[ptr uint32](KEY_COUNT))
+  let keyCount = machwSecurityKeyCount()
   let topCount = (keyCount shr 24).uint8
 
   if keyIdx > topCount:
     # Pairwise key path. Blob math (hwIdx/slot) from blob insns:
     #   hwIdx = (keyIdx - topCount - 1) / 2
     #   vifSlot = 4 + ((keyIdx - topCount - 1) & 1)
-    #   vifEntry = &vif_info_tab[0] + hwIdx * VIF_ENTRY_SIZE(1512)
+    #   vif = vif_info_tab[hwIdx]
     # Blob tail-calls vif_mgmt_del_key here — must RETURN WITHOUT clearing
     # the MACHW key-RAM (that is only done on the group/STA paths below).
     let offset = keyIdx.int - topCount.int - 1
     let hwIdx = offset div 2
     let vifSlot = 4 + (offset and 1)
-    let vifTabBase = cast[uint](addr vif_info_tab[0])
-    let vifEntry = vifTabBase + hwIdx.uint * VIF_ENTRY_SIZE.uint
-    vif_mgmt_del_key(cast[pointer](vifEntry), vifSlot.uint8)
+    let vif = vifChannelForIdx(hwIdx.uint8)
+    vif_mgmt_del_key(cast[pointer](vif), vifSlot.uint8)
     return
   elif keyIdx <= 7:
     # Group key path: flood MACHW key data with all-ones, then delete via
     # vif_mgmt_del_key. Blob layout: vifIdx = keyIdx >> 2, vifSlot = keyIdx & 3.
-    volatileStore(cast[ptr uint32](KEY_LO), 0xFFFFFFFF'u32)
-    volatileStore(cast[ptr uint32](KEY_HI), 0xFFFFFFFF'u32)
+    machwSecurityWriteAddress(0xFFFFFFFF'u32, 0xFFFFFFFF'u32)
     let vifSlot = keyIdx and 3
     let vifIdx = keyIdx shr 2
-    let vifTabBase = cast[uint](addr vif_info_tab[0])
-    let vifEntry = vifTabBase + vifIdx.uint * VIF_ENTRY_SIZE.uint
-    vif_mgmt_del_key(cast[pointer](vifEntry), vifSlot)
+    let vif = vifChannelForIdx(vifIdx)
+    vif_mgmt_del_key(cast[pointer](vif), vifSlot)
   else:
     # Station key: keyIdx - 8 → staIdx. Write STA MAC addr to KEY_LO/HI then
     # sta_mgmt_del_key. Blob falls through to the key-RAM clear + poll.
     let staIdx = keyIdx - 8
     let mac = staMacWords(staInfoForIdx(staIdx))
-    volatileStore(cast[ptr uint32](MACHW + 0x0BC'u), mac.lo)
-    volatileStore(cast[ptr uint32](MACHW + 0x0C0'u), mac.hi)
+    machwSecurityWriteAddress(mac.lo, mac.hi)
     sta_mgmt_del_key(staIdx, 0)
 
   # Group/Station fall-through: clear the MACHW 128-bit key RAM at 0xAC..0xB8.
   # Blob then polls KEY_CTRL (0xC4) until bit 0x40000000 clears (write-done).
   # That is an MMIO write-serialize + delete completion barrier.
-  volatileStore(cast[ptr uint32](MACHW + 0x0AC'u), 0)
-  volatileStore(cast[ptr uint32](MACHW + 0x0B0'u), 0)
-  volatileStore(cast[ptr uint32](MACHW + 0x0B4'u), 0)
-  volatileStore(cast[ptr uint32](MACHW + 0x0B8'u), 0)
-  discard waitRegMaskClear(KEY_CTRL, 0x40000000'u32)
+  machwSecurityClearKeyMaterial()
+  discard waitMachwSecurityControlClear(0x40000000'u32)
 
   # Write control word with key index and trigger delete (bit 30)
   let ctrlWord = (keyIdx.uint32 shl 16) or 0x40000000'u32
-  volatileStore(cast[ptr uint32](KEY_CTRL), ctrlWord)
+  machwSecurityWriteControl(ctrlWord)
 
   # Poll until trigger bit clears
-  discard waitRegMaskClear(KEY_CTRL, 0x40000000'u32)
+  discard waitMachwSecurityControlClear(0x40000000'u32)
 
 proc mm_sec_machwkey_get*(keyIdx: uint8, outBuf: pointer, keySizeOut: pointer): pointer {.exportc, cdecl, discardable.} =
   ## Get key material from MAC HW key table (48 instructions in blob).
@@ -8781,27 +16567,22 @@ proc mm_sec_machwkey_get*(keyIdx: uint8, outBuf: pointer, keySizeOut: pointer): 
   ## Reads key count from MACHW+0x0D8, triggers HW read via MACHW+0x0C4, polls,
   ## then copies 4 words from MACHW+0x080 region (+44..+56) into outBuf, writes
   ## keySize (8 or 16) to *keySizeOut, returns 0 (or -1 on bounds).
-  const
-    MACHW     = 0x24B00000'u
-    KEY_COUNT = MACHW + 0x0D8'u
-    KEY_CTRL  = MACHW + 0x0C4'u
-    KEY_RAM   = MACHW + 0x080'u  # key RAM window base
 
   # Read key count and check bounds
-  let keyCount = volatileLoad(cast[ptr uint32](KEY_COUNT))
+  let keyCount = machwSecurityKeyCount()
   let maxIdx = (keyCount shr 24).uint8
   if keyIdx >= maxIdx:
     return cast[pointer](-1)
 
   # Trigger HW read: keyIdx<<16 | 0x80000000
   let readCmd = (keyIdx.uint32 shl 16) or 0x80000000'u32
-  volatileStore(cast[ptr uint32](KEY_CTRL), readCmd)
+  machwSecurityWriteControl(readCmd)
 
   # Poll until bit 31 clears
-  discard waitRegMaskClear(KEY_CTRL, 0x80000000'u32)
+  discard waitMachwSecurityControlClear(0x80000000'u32)
 
   # Check bit 0 of control to determine key size (16 or 8 bytes)
-  let ctrlVal = volatileLoad(cast[ptr uint32](KEY_CTRL))
+  let ctrlVal = machwSecurityControl()
   var keySize: uint8 = 8
   if (ctrlVal and 1) != 0:
     keySize = 16
@@ -8809,7 +16590,7 @@ proc mm_sec_machwkey_get*(keyIdx: uint8, outBuf: pointer, keySizeOut: pointer): 
   # Copy key material from KEY_RAM+44..+56 into output buffer — blob calls
   # memcpy here rather than inlining the 16-byte copy as four word stores.
   if outBuf != nil:
-    discard c_memcpy(outBuf, cast[pointer](KEY_RAM + 44), 16.csize_t)
+    discard c_memcpy(outBuf, addr machwSecurityRegs().keyMaterial[0], 16.csize_t)
 
   # Write key size to keySizeOut
   if keySizeOut != nil:
@@ -8827,17 +16608,8 @@ proc mm_sec_keydump*() {.exportc, cdecl.} =
   ##   0x24B000AC..B8 = key material words (4 x 32-bit)
   ## Ends with tail call to mm_rx_filter_set().
 
-  const
-    MACHW = 0x24B00000'u32
-    SEC_KEY_CTRL    = MACHW + 0x0C4'u32
-    SEC_KEY_DATA_LO = MACHW + 0x0BC'u32
-    SEC_KEY_DATA_HI = MACHW + 0x0C0'u32
-    SEC_KEY_COUNT   = MACHW + 0x0D8'u32
-    SEC_KEY_MAT0    = MACHW + 0x0AC'u32
-    SEC_KEY_MAT1    = MACHW + 0x0B0'u32
-    SEC_KEY_MAT2    = MACHW + 0x0B4'u32
-    SEC_KEY_MAT3    = MACHW + 0x0B8'u32
-    READ_TRIGGER    = 0x80000000'u32
+  const READ_TRIGGER = 0x80000000'u32
+  let regs = machwSecurityRegs()
 
   # Clear bit 0 of crypto debug flag at 0x20005198
   let flagPtr = cast[ptr uint32](0x20005198'u32)
@@ -8848,7 +16620,7 @@ proc mm_sec_keydump*() {.exportc, cdecl.} =
   type LogV = proc(a0, a1: uint32, fmt: pointer, line: uint32, a5: uint32) {.cdecl, varargs.}
   type Log0 = proc(a0, a1: uint32, fmt: pointer, line: uint32) {.cdecl, varargs.}
 
-  let totalKeys = volatileLoad(cast[ptr uint32](SEC_KEY_COUNT))
+  let totalKeys = volatileLoad(addr regs.keyCount)
 
   if logFunc != nil: cast[LogV](logFunc)(2, 0, nil, 945, totalKeys)
   if logFunc != nil: cast[LogV](logFunc)(2, 0, nil, 946,
@@ -8856,17 +16628,16 @@ proc mm_sec_keydump*() {.exportc, cdecl.} =
     (totalKeys shr 16) and 0xFF, totalKeys shr 24)
   if logFunc != nil: cast[Log0](logFunc)(2, 0, nil, 972)
 
-  let keyCount = cast[int32](volatileLoad(cast[ptr uint32](SEC_KEY_COUNT)))
+  let keyCount = cast[int32](volatileLoad(addr regs.keyCount))
   if logFunc != nil: cast[LogV](logFunc)(2, 0, nil, 977, keyCount.uint32)
 
   var idx: int32 = 0
   while idx <= keyCount:
-    volatileStore(cast[ptr uint32](SEC_KEY_CTRL),
-                  (idx.uint32 shl 16) or READ_TRIGGER)
-    discard waitRegMaskClear(SEC_KEY_CTRL.uint, READ_TRIGGER)
+    volatileStore(addr regs.control, (idx.uint32 shl 16) or READ_TRIGGER)
+    discard waitMachwSecurityControlClear(READ_TRIGGER)
 
-    let kdLo = volatileLoad(cast[ptr uint32](SEC_KEY_DATA_LO))
-    let kdHi = volatileLoad(cast[ptr uint32](SEC_KEY_DATA_HI))
+    let kdLo = volatileLoad(addr regs.dataLow)
+    let kdHi = volatileLoad(addr regs.dataHigh)
     # Blob asserts upper 16 bits of kdHi must be zero (offset 0x116-0x12e)
     if (kdHi and 0xFFFF0000'u32) != 0:
       assert_err("mm_sec.c", "mm_sec.c", idx.cint)
@@ -8877,17 +16648,17 @@ proc mm_sec_keydump*() {.exportc, cdecl.} =
       (kdLo shr 16) and 0xFF, kdLo shr 24,
       maskedHi and 0xFF, maskedHi shr 8)
 
-    let c1 = volatileLoad(cast[ptr uint32](SEC_KEY_CTRL))
+    let c1 = volatileLoad(addr regs.control)
     if logFunc != nil: cast[LogV](logFunc)(2, 0, nil, 998, c1 and 1)
-    let c2 = volatileLoad(cast[ptr uint32](SEC_KEY_CTRL))
+    let c2 = volatileLoad(addr regs.control)
     if logFunc != nil: cast[LogV](logFunc)(2, 0, nil, 999, (c2 shr 1) and 0x7FFF)
-    let c3 = volatileLoad(cast[ptr uint32](SEC_KEY_CTRL))
+    let c3 = volatileLoad(addr regs.control)
     if logFunc != nil: cast[LogV](logFunc)(2, 0, nil, 1000, (c3 shr 16) and 0xFFFF)
 
-    let kw0 = volatileLoad(cast[ptr uint32](SEC_KEY_MAT0))
-    let kw1 = volatileLoad(cast[ptr uint32](SEC_KEY_MAT1))
-    let kw2 = volatileLoad(cast[ptr uint32](SEC_KEY_MAT2))
-    let kw3 = volatileLoad(cast[ptr uint32](SEC_KEY_MAT3))
+    let kw0 = volatileLoad(addr regs.keyMaterial[0])
+    let kw1 = volatileLoad(addr regs.keyMaterial[1])
+    let kw2 = volatileLoad(addr regs.keyMaterial[2])
+    let kw3 = volatileLoad(addr regs.keyMaterial[3])
 
     if logFunc != nil: cast[LogV](logFunc)(2, 0, nil, 1007,
       kw0 and 0xFF, (kw0 shr 8) and 0xFF,
@@ -9120,10 +16891,8 @@ proc mm_bcn_update*(vifEntry: pointer): pointer {.exportc, cdecl, noinline.} =
   let msgHdr = keMsgHdrFromPayload(cast[pointer](s1))
   ke_msg_send_basic(46, msgHdr.srcId, 0'u8)
 
-  # Recompute vifEntry from vif_info_tab (blob uses multiply: vifIdx * 1512)
-  let vifBase = cast[uint](addr vif_info_tab[0])
-  let vifE = vifBase + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let vif = vifChannelAt(vifE)
+  # Recompute VIF from vifIdx (blob uses multiply: vifIdx * 1512)
+  let vif = vifChannelForIdx(vifIdx)
 
   # Read entry metrics
   let entry = beaconChangeReqAt(s1)
@@ -9234,17 +17003,9 @@ proc mm_bcn_transmit*(vifIdx: uint8) {.exportc, cdecl.} =
   if env.pendingCount != 0:
     assert_err("mm_bcn.c", "mm_bcn.c", 701)
 
-  let vifBase = cast[uint](addr vif_info_tab[0])
-
-  # Walk VIF linked list
-  var vifPtr = cast[ptr pointer](vifBase)[]  # first entry's next ptr (linked list head)
-  # Actually the blob loads from a separate "vif_mgmt_first_used" GOT entry
-  # For our layout, iterate over active VIFs
-
-  # Simplified: iterate through VIF entries checking type == AP
-  for vifIdx in 0'u8 ..< 2'u8:
-    let vifEntry = vifBase + vifIdx.uint * VIF_ENTRY_SIZE
-    let vif = vifChannelAt(vifEntry)
+  # Iterate through VIF entries checking type == AP.
+  for entryVifIdx in 0'u8 ..< 2'u8:
+    let vif = vifChannelForIdx(entryVifIdx)
     let vifType = vif.vifType
 
     if vifType != VIF_TYPE_AP:
@@ -9267,8 +17028,7 @@ proc mm_bcn_transmit*(vifIdx: uint8) {.exportc, cdecl.} =
     # Write length to TX descriptor: vif[208] -> desc, desc[28] = totalLen
     let txDescPtr = vif.beaconTxDesc
     if txDescPtr != nil:
-      let descAddr = cast[uint](txDescPtr)
-      cast[ptr uint32](descAddr + 28)[] = totalLen
+      hostTxHwDescAt(txDescPtr).frameLen = totalLen
 
     discard nextTxSeqNumber()
 
@@ -9317,11 +17077,11 @@ proc mm_bcn_transmit*(vifIdx: uint8) {.exportc, cdecl.} =
     # Update TX power for beacon frame (blob: tpc_update_frame_tx_power at 0x128)
     let descForTpc = vif.beaconTxDesc
     if descForTpc != nil:
-      tpc_update_frame_tx_power(cast[pointer](vifEntry), descForTpc)
+      tpc_update_frame_tx_power(cast[pointer](vif), descForTpc)
 
     # Check if on operational channel (blob: chan_is_on_operational_channel at 0x132)
     # a0 is blob's s0 = current VIF entry pointer, not vif_idx.
-    let onOpChan = chan_is_on_operational_channel(cast[pointer](vifEntry))
+    let onOpChan = chan_is_on_operational_channel(cast[pointer](vif))
     if not onOpChan:
       continue  # skip this VIF if not on channel
 
@@ -9352,9 +17112,10 @@ proc mm_bcn_transmit*(vifIdx: uint8) {.exportc, cdecl.} =
       tbttMsg.staIdx = (staHwIdx + 5) and 0xFF
       ke_msg_send(tbttMsg)
 
-    # Store sta info: vif[143]=staHwIdx, vif[145]=0xFF (blob 0x170, 0x176)
-    cast[ptr uint8](vifEntry + 143)[] = staHwIdx
-    cast[ptr uint8](vifEntry + 145)[] = 0xFF'u8
+    # Store sta info in the preallocated beacon frame descriptor.
+    let bcnDesc = vifApBeaconFrameDesc(vif)
+    bcnDesc.vifIdx = staHwIdx
+    bcnDesc.staInfoIdx = 0xFF'u8
 
     # Push pre-existing beacon frame at vif+96 with AC=4 (beacon queue).
     # Blob at 0x184 checks the return value via `beqz a0, .L45`, so the
@@ -9362,7 +17123,7 @@ proc mm_bcn_transmit*(vifIdx: uint8) {.exportc, cdecl.} =
     # txl_frame_push returns non-zero. Nim's txl_frame_push is declared
     # void; capture a0 after the call via inline asm to preserve the
     # semantics.
-    let bcnFrame = cast[pointer](vifApBeaconFrameDesc(vif))
+    let bcnFrame = cast[pointer](bcnDesc)
     txl_frame_push(bcnFrame, 4)
     var pushResult: uint32
     {.emit: ["asm volatile(\"mv %0, a0\" : \"=r\"(", pushResult, ") );"].}
@@ -9378,7 +17139,7 @@ proc mm_bcn_transmit*(vifIdx: uint8) {.exportc, cdecl.} =
       let baFlags = bcnSta.trafficFlags
       if (baFlags and 2) != 0:
         bcnSta.psStatus = 9
-        discard sta_mgmt_send_postponed_frame(cast[pointer](vifEntry),
+        discard sta_mgmt_send_postponed_frame(cast[pointer](vif),
           cast[pointer](staEntryU), 0'u32)
         bcnSta.psStatus = 0
 
@@ -9703,7 +17464,7 @@ proc chan_ctxt_unlink*(vifIdx: uint8) {.exportc, cdecl.} =
   let env = chanEnvView()
   # Extract VIF's TBTT node (vif+68) from chan_env scheduling list
   let tbttNode = chanTbttHdr(addr vif.tbttNode)
-  co_list_extract(addr env.freeList, tbttNode)
+  co_list_extract(chanTbttPrimaryList(), tbttNode)
   # Clear VIF's link to channel context
   vif.tbttNode.state = 0
   vif.chanCtxt = nil
@@ -9759,7 +17520,7 @@ proc chan_ctxt_unlink*(vifIdx: uint8) {.exportc, cdecl.} =
     if env.slotPeriod != 0:
       env.slotPeriod = 0
   # Post-unlink operations (blob: chan_tbtt_schedule + chan_update_tx_power + mm_timer_clear + chan_ctxt_op_evt)
-  chan_tbtt_schedule(cast[pointer](addr vif.tbttNode))
+  chan_tbtt_schedule(nil)
   chan_update_tx_power(chanCtxtPtr)
   mm_timer_clear(chanTbttSwitchTimer())
   chan_ctxt_op_evt()
@@ -9793,9 +17554,7 @@ proc chan_ctxt_update*(param: pointer) {.exportc, cdecl.} =
     rxl_timer_int_handler()
     rxl_cntrl_evt()
     # Apply PHY channel settings (blob: phy_set_channel at 0x74)
-    phy_set_channel(ctxt.channel.band, ctxt.channel.chanType,
-      ctxt.channel.primFreq, ctxt.channel.centerFreq1,
-      ctxt.channel.centerFreq2, ctxt.channel.txPower)
+    phySetChannel(addr ctxt.channel)
     irqRestore(saved)
   # Store context as current
   env.currentCtxt = thisCtxt
@@ -9902,6 +17661,12 @@ proc chan_is_tx_allowed*(vifEntry: pointer): bool {.exportc, cdecl.} =
   let curCtxt = env.currentCtxt
   return chanCtxtAt(curCtxt).status == 6
 
+proc chanScanDurationTicks(req: ptr ChanScanReqPayload): uint16 {.inline.} =
+  (req.duration shr 10).uint16
+
+template chanScanChannel(req: ptr ChanScanReqPayload): ptr ChanCtxtDefView =
+  cast[ptr ChanCtxtDefView](addr req.band)
+
 proc chan_scan_req*(param: pointer) {.exportc, cdecl.} =
   ## Request channel scan (65 instrs in blob).
   ## Blob keeps scan context state in chan_ctxt_pool, not chan_env.
@@ -9920,13 +17685,18 @@ proc chan_scan_req*(param: pointer) {.exportc, cdecl.} =
       assert_err("chan.c", "chan.c", 0x9E5)
     scan.slot = 3
     scan.vifIdx = 0xFF
-    let scanBand = scanReq.vifIdx
-    scan.band = scanBand
+    scan.requestVifIdx = scanReq.vifIdx
     scan.active = 1
-    let scanFreq = scanReq.duration
-    nimFwTrace2U32("[WIFI-NIMFW] chan_scan_req freq ", scanBand.uint32, scanFreq)
-    scan.durationTicks = (scanFreq shr 10).uint16
-    discard c_memcpy(addr scan.channel, addr scanReq.band, sizeof(ChanCtxtDefView).csize_t)
+    nimFwTrace2U32("[WIFI-NIMFW] chan_scan_req duration ",
+                   scan.requestVifIdx.uint32, scanReq.duration)
+    scan.durationTicks = chanScanDurationTicks(scanReq)
+    discard c_memcpy(addr scan.channel, chanScanChannel(scanReq),
+                     sizeof(ChanCtxtDefView).csize_t)
+    nimFwDbgChanScanChanMeta = packChannelMeta(addr scan.channel)
+    nimFwDbgChanScanChanFreq = packChannelFreq(addr scan.channel)
+    nimFwTrace2U32("[WIFI-NIMFW] chan_scan_req channel ",
+                   scan.channel.band.uint32,
+                   scan.channel.primFreq.uint32)
     let chanFlags = env.flags
     env.flags = chanFlags or 0x02
     nimFwTrace2U32("[WIFI-NIMFW] chan_scan_req flags ", chanFlags.uint32, env.flags.uint32)
@@ -9956,7 +17726,6 @@ proc chan_roc_req*(param: pointer) {.exportc, cdecl, noinline.} =
     let newCount = req.remainingCount - 1
     req.remainingCount = newCount
     return  # blob returns (newCount != 0) in a0
-  let chanBase = cast[uint](addr chan_env[0])
   let roc = chanRocOverlay()
   if roc.slot != 0xFF:
     return  # ROC slot busy, return 1
@@ -9982,7 +17751,7 @@ proc chan_roc_req*(param: pointer) {.exportc, cdecl, noinline.} =
     env.flags = chanFlags or 0x14  # ROC + connless flags
     let schedCtxt = env.scheduledCtxt
     if schedCtxt == nil:
-      chan_switch_start(cast[pointer](chanBase + 4 * CHAN_CTXT_SIZE.uint))
+      chan_switch_start(cast[pointer](chanCtxtForIdx(4)))
   else:
     env.flags = chanFlags or 0x01  # ROC pending flag
     chan_conn_less_delay_prog()
@@ -10060,7 +17829,7 @@ proc chan_tbtt_switch_update*(vifEntry: pointer, tbttTime: uint32) {.exportc, cd
     return
   # Clear scheduling state and re-insert into TBTT list
   tbttNode.state = 0
-  co_list_extract(addr chanEnvView().freeList, chanTbttHdr(tbttNode))
+  co_list_extract(chanTbttPrimaryList(), chanTbttHdr(tbttNode))
   chan_tbtt_schedule(cast[pointer](tbttNode))  # blob: chan_tbtt_schedule (not chan_tbtt_insert)
 
 proc chan_update_tx_power*(ctxt: pointer) {.exportc, cdecl.} =
@@ -10074,12 +17843,11 @@ proc chan_update_tx_power*(ctxt: pointer) {.exportc, cdecl.} =
   let ctxtView = chanCtxtAt(ctxt)
   if ctxtView.linkCount == 0:
     return
-  let vifBase = cast[uint](addr vif_info_tab[0])
   # Check VIF 0's channel context.
-  let vif0Ctxt = vifChannelAt(vifBase).chanCtxt
+  let vif0 = vifChannelForIdx(0)
+  let vif0Ctxt = vif0.chanCtxt
   var minPower: int8 = 127  # start with max
   if ctxt == vif0Ctxt:
-    let vif0 = vifChannelAt(vifBase)
     let p0 = vif0.txPower
     let p1 = vif0.maxTxPower
     if p0 < p1:
@@ -10087,12 +17855,11 @@ proc chan_update_tx_power*(ctxt: pointer) {.exportc, cdecl.} =
     else:
       minPower = p1
   # Check VIF 1's channel context.
-  let vif1 = vifBase + VIF_ENTRY_SIZE.uint
-  let vif1Ctxt = vifChannelAt(vif1).chanCtxt
+  let vif1 = vifChannelForIdx(1)
+  let vif1Ctxt = vif1.chanCtxt
   if ctxt == vif1Ctxt:
-    let vif1View = vifChannelAt(vif1)
-    let p0 = vif1View.txPower
-    let p1 = vif1View.maxTxPower
+    let p0 = vif1.txPower
+    let p1 = vif1.maxTxPower
     var minP: int8
     if p0 < p1:
       minP = p0
@@ -10199,7 +17966,6 @@ proc chan_pre_switch_channel*(ctxt: pointer) {.exportc, cdecl.} =
   ## If ctxt type (ctxt+23) == 3 or 4, sets HW state bits.
   ## If type <= 2, walks VIF list checking for matching channel context.
   let env = chanEnvView()
-  let poolBase = cast[uint](addr chan_ctxt_pool[0])
   mm_timer_clear(chanCtxtOpTimer())
   # Check and clear bit 5 in flags
   var chanFlags = env.flags
@@ -10211,13 +17977,13 @@ proc chan_pre_switch_channel*(ctxt: pointer) {.exportc, cdecl.} =
   chanFlags = env.flags
   let schedCtxt = env.scheduledCtxt
   if (chanFlags and 0x08) != 0:
-    targetCtxt = cast[pointer](poolBase + 0x54'u)
+    targetCtxt = cast[pointer](chanCtxtForIdx(3))
     # Mark scheduled context status=1 if it exists
     if schedCtxt != nil:
       chanCtxtAt(schedCtxt).status = 1
     env.scheduledCtxt = targetCtxt
   elif (chanFlags and 0x04) != 0:
-    targetCtxt = cast[pointer](poolBase + 0x70'u)
+    targetCtxt = cast[pointer](chanCtxtForIdx(4))
     if schedCtxt != nil:
       chanCtxtAt(schedCtxt).status = 1
     env.scheduledCtxt = targetCtxt
@@ -10247,10 +18013,15 @@ proc chan_pre_switch_channel*(ctxt: pointer) {.exportc, cdecl.} =
   if targetCtxt == nil:
     return
   let ctxt = chanCtxtAt(targetCtxt)
+  nimFwDbgChanPreChanMeta = packChannelMeta(addr ctxt.channel)
+  nimFwDbgChanPreChanFreq = packChannelFreq(addr ctxt.channel)
+  # Drain pending RX descriptors before retuning the PHY; vendor does this on
+  # scan channel switches so received beacons/probe responses reach RXU.
+  rxl_timer_int_handler()
+  rxl_cntrl_evt()
   # .LBB497/.LBE497: Call phy_set_channel with extracted params
   # a5=0, a0..a4 = band,chanType,primFreq,centerFreq1,centerFreq2
-  phy_set_channel(ctxt.channel.band, ctxt.channel.chanType,
-    ctxt.channel.primFreq, ctxt.channel.centerFreq1, ctxt.channel.centerFreq2, 0)
+  phySetChannel(addr ctxt.channel)
 
   # Call tpc_update with TX power from context offset 12
   tpc_update_tx_power(ctxt.channel.txPower)
@@ -10276,8 +18047,16 @@ proc chan_pre_switch_channel*(ctxt: pointer) {.exportc, cdecl.} =
     irqRestore(saved)
     let ccaBusy = regRead(MACHW_BASE + 0x4C'u)
     env.surveySnapshot = (ccaBusy and 0xFF).uint8
+    when defined(bl808WifiUseBl808Rf):
+      rfPhyTraceCheckpoint(0x45'u32)
+      rfPriPrepareWb03MacActiveScanState()
+      rfPhyTraceCheckpoint(0x46'u32)
     blmac_pwr_mgt_setf(0)
+    when defined(bl808WifiUseBl808Rf):
+      rfPhyTraceCheckpoint(0x47'u32)
     mm_active()
+    when defined(bl808WifiUseBl808Rf):
+      rfPhyTraceCheckpoint(0x48'u32)
   elif ctxtType == 4:
     # .L232: ROC type -- IRQ-safe flag set + schedule survey
     let saved = irqSave()
@@ -10290,6 +18069,8 @@ proc chan_pre_switch_channel*(ctxt: pointer) {.exportc, cdecl.} =
     # Blob 0x130: blmac_pwr_mgt_setf(0) to disable power-save during ROC
     blmac_pwr_mgt_setf(0)
     mm_active()
+    when defined(bl808WifiUseBl808Rf):
+      waitRfUs(1000'u32)
   elif ctxtType <= 2:
     let ps = psEnvView()
     if ps.enabled == 0 or (ps.statusFlags and 8'u32) != 0:
@@ -10340,7 +18121,6 @@ proc chan_conn_less_delay_evt*() {.exportc, cdecl.} =
   ##     tail-call chan_distribute_slots, then check chan_env+36 for pre-switch.
   ##   Neither: return.
   let env = chanEnvView()
-  let poolBase = cast[uint](addr chan_ctxt_pool[0])
   var flags = env.flags
   # Blob uses a single shared chan_switch_start tail site with the
   # slotArg differing per branch. Use a switchArg variable + single
@@ -10353,7 +18133,7 @@ proc chan_conn_less_delay_evt*() {.exportc, cdecl.} =
     flags = flags or 0x04
     env.flags = flags
     if env.scheduledCtxt == nil:
-      switchArg = cast[pointer](poolBase + 0x70'u)
+      switchArg = cast[pointer](chanCtxtForIdx(4))
   elif (flags and 0x02) != 0:
     if (flags and 0x08) != 0:
       assert_err("chan.c", "chan.c", 888)
@@ -10361,7 +18141,7 @@ proc chan_conn_less_delay_evt*() {.exportc, cdecl.} =
     flags = flags or 0x08
     env.flags = flags
     if env.scheduledCtxt == nil:
-      switchArg = cast[pointer](poolBase + 0x54'u)
+      switchArg = cast[pointer](chanCtxtForIdx(3))
   if switchArg != nil:
     chan_switch_start(switchArg)
 
@@ -11018,6 +18798,11 @@ proc scan_set_channel_request*(param: pointer) {.exportc, cdecl.} =
   chanCfg.center1Freq = prim20Freq
   chanCfg.center2Freq = 0
   chanCfg.txPower = scanChan.txPower
+  if chanCfg.txPower == 0'i8:
+    chanCfg.txPower = -1'i8
+  let chanCfgView = chanScanChannel(addr chanCfg)
+  nimFwDbgScanReqChanMeta = packChannelMeta(chanCfgView)
+  nimFwDbgScanReqChanFreq = packChannelFreq(chanCfgView)
   var txPowerIdx: uint8 = 0
   let chanInfoPtr = scan_env.chanInfoPtr
   if chanBand == 0:
@@ -11146,6 +18931,18 @@ proc scan_probe_req_tx*(param: pointer): uint8 {.exportc, cdecl.} =
 
     # Set THD fields
     thd.payloadPtr = scanProbeReqIePayloadPtr(scan_probe_req_ie)
+    nimFwDbgProbeIeLen = ieLen.uint32
+    for k in 0 ..< nimFwDbgProbeIeRaw.len:
+      nimFwDbgProbeIeRaw[k] = 0
+    let ieCopyLen =
+      if ieLen.uint32 < nimFwDbgProbeIeRaw.len.uint32:
+        ieLen.uint32
+      else:
+        nimFwDbgProbeIeRaw.len.uint32
+    if ieCopyLen != 0:
+      discard c_memcpy(addr nimFwDbgProbeIeRaw[0],
+                       scanProbeReqIeDataPtr(scan_probe_req_ie),
+                       ieCopyLen.csize_t)
 
     # Adjust THD buffer length: subtract IE length
     thd.bufLen = thd.bufLen - ieLen.uint32
@@ -11526,11 +19323,53 @@ proc scanu_find_result*(bssid: pointer, allocIfMissing: uint8 = 0): pointer {.ex
         return entry
   return nil
 
+proc scanuCachedSsidFor(entry: ptr ScanuResultEntry): ptr ScanuCachedSsid {.inline.} =
+  for i in 0 ..< SCANU_MAX_RESULT_ENTRIES:
+    if (addr scanu_env.entries[i]) == entry:
+      return addr scanuCachedSsids[i]
+  return nil
+
+proc scanuClearCachedSsid(entry: ptr ScanuResultEntry) {.inline.} =
+  let cached = scanuCachedSsidFor(entry)
+  if cached != nil:
+    discard c_memset(cached, 0, sizeof(ScanuCachedSsid).csize_t)
+
+proc scanuCacheSsid(entry: ptr ScanuResultEntry;
+                    ssid: ptr ScanSsidSlotView) {.inline.} =
+  let cached = scanuCachedSsidFor(entry)
+  if cached == nil:
+    return
+  discard c_memset(cached, 0, sizeof(ScanuCachedSsid).csize_t)
+  cached.valid = 1
+  cached.length = ssid.length
+  for i in 0 ..< cached.length.int:
+    cached.data[i] = ssid.data[i]
+
+proc scanuCachedSsidMatches(entry: ptr ScanuResultEntry;
+                            searchData: pointer;
+                            searchLen: uint8): bool {.inline.} =
+  let cached = scanuCachedSsidFor(entry)
+  if cached == nil or cached.valid == 0:
+    return false
+  if cached.length != searchLen:
+    return false
+  if searchLen == 0:
+    return true
+  c_memcmp(searchData, addr cached.data[0], searchLen.csize_t) == 0
+
+proc scanuCachedSsidMeta(entry: ptr ScanuResultEntry): uint32 {.inline.} =
+  let cached = scanuCachedSsidFor(entry)
+  if cached == nil:
+    return 0
+  cached.valid.uint32 or (cached.length.uint32 shl 8) or
+    (cached.data[0].uint32 shl 16) or (cached.data[1].uint32 shl 24)
+
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void scanu_frame_handler(void*,unsigned long);".}
 proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
   ## Handle received beacon/probe response during active scan.
   ## Reverse-engineered from the blob (859 instructions).
   let rx = rxuMgtIndAt(frame)
+  inc nimFwDbgScanFrameSeen
   let totalLen = rx.frameLen
   let ieStart = rxuMgtIndIeStart(frame)
   var ieLen = if totalLen > 36: totalLen.uint32 - 36 else: 0'u32
@@ -11648,6 +19487,12 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
     ssidScratch.length = min(ssid.ie.len, 32)
     for i in 0 ..< ssidScratch.length.int:
       ssidScratch.data[i] = ssid.data[i]
+  scanuCacheSsid(entry, addr ssidScratch)
+  nimFwDbgScanSsidLast =
+    ssidScratch.length.uint32 or
+    (ssidScratch.data[0].uint32 shl 8) or
+    (ssidScratch.data[1].uint32 shl 16) or
+    (ssidScratch.data[2].uint32 shl 24)
 
   # "Not broadcast" SSID debug logging. Blob calls strlen 3 times
   # (once per length-threshold check at 0xa1c/0xa50/0xaae) with the
@@ -11720,7 +19565,7 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
       let smP = sm.connectInfo
       let ci = connectInfoView(smP)
       let smF = ci.channelDuration
-      let vSR = cast[uint](vif) + 348
+      let vSR = cast[pointer](htCaps)
       let vRO = cast[pointer](addr vifView.basicRates[0])
 
       vifView.scanBand = entry.band
@@ -11878,9 +19723,9 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
             secCi.channelDuration = secCi.channelDuration or 9
             if stF == 4: secCi.authType = 3
 
-      me_bw_check(cast[pointer](vSR))
-      me_extract_power_constraint(ieStart, ieLen, cast[pointer](vSR))
-      me_extract_country_reg(ieStart, ieLen, cast[pointer](vSR))
+      me_bw_check(vSR)
+      me_extract_power_constraint(ieStart, ieLen, vSR)
+      me_extract_country_reg(ieStart, ieLen, vSR)
       apCfg.securityFlags = apCfg.securityFlags or 0x80000000'u32
       scanu_env.directedFound = 1
 
@@ -11913,6 +19758,12 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
       ke_msg_forward_and_change_id(frame, 0x804'u16, 9, 2)
       return
   entry.valid = 1
+  inc nimFwDbgScanFrameAccepted
+  nimFwDbgScanFrameLast =
+    scanu_env.resultCount.uint32 or
+    (entry.rssi.uint8.uint32 shl 8) or
+    (entry.band.uint32 shl 16) or
+    (bfOn.uint32 shl 24)
 
   if bfOn != 0:
     if entry.rawMsgPtr != nil:
@@ -11962,6 +19813,9 @@ proc scanu_search_by_ssid*(ssid: pointer, entryIndexOut: pointer): pointer {.exp
     (ssidSlot.data[1].uint32 shl 8) or
     (ssidSlot.data[2].uint32 shl 16) or
     (ssidSlot.data[3].uint32 shl 24)
+  nimFwDbgSsidSearch = searchLen.uint32 or (searchWord shl 8)
+  nimFwDbgSsidEntries = 0
+  nimFwDbgSsidHits = 0
   nimFwTrace2U32("[WIFI-NIMFW] ssid_s ", searchLen.uint32, searchWord)
   if searchLen == 0:
     return nil
@@ -11975,11 +19829,19 @@ proc scanu_search_by_ssid*(ssid: pointer, entryIndexOut: pointer): pointer {.exp
   var bestRssi: int8 = -128
   for i in 0'u8 ..< SCANU_MAX_RESULT_ENTRIES.uint8:
     let entry = addr scanu_env.entries[i]
+    when defined(bl808WifiConnectTrace):
+      nimFwConnectTrace2U32("[WIFI-CT] ssid_entry ",
+                            i.uint32 or (entry.valid.uint32 shl 8) or
+                              (entry.rssi.uint8.uint32 shl 16),
+                            cast[uint32](entry.chanPtr))
+      nimFwConnectTrace2U32("[WIFI-CT] ssid_cache ",
+                            i.uint32, scanuCachedSsidMeta(entry))
     nimFwTrace2U32("[WIFI-NIMFW] ssid_i ",
                    i.uint32 or (entry.valid.uint32 shl 8),
                    cast[uint32](entry.rawMsgPtr))
     if entry.valid == 0:
       continue
+    inc nimFwDbgSsidEntries
     # If filter active, check channel info pattern
     if filterState != 0:
       let chanInfo = cast[uint32](entry.rawMsgPtr)
@@ -11995,35 +19857,42 @@ proc scanu_search_by_ssid*(ssid: pointer, entryIndexOut: pointer): pointer {.exp
     let rawMsgPtr = entry.rawMsgPtr
     if rawMsgPtr == nil:
       nimFwTrace2U32("[WIFI-NIMFW] ssid_raw0 ", i.uint32, cast[uint32](entry))
-      continue
-    # Find SSID IE in the cached RXU_MGT_IND payload. The RXU header is 32
-    # bytes, followed by the MAC header (24) and beacon fixed fields (12).
-    let rawRx = rxuMgtIndAt(rawMsgPtr)
-    let totalLen = rawRx.frameLen
-    let ieLen = if totalLen > 36'u16: totalLen.uint32 - 36'u32 else: 0'u32
-    let ieStart = rxuMgtIndIeStart(rawMsgPtr)
-    let ssidIe = mac_ie_find(ieStart, ieLen, IE_ID_SSID)
-    if ssidIe == nil:
-      continue
-    let entrySsid = ssidIeAt(ssidIe)
-    let entrySsidLen = entrySsid.ie.len
-    let entryWord = entrySsid.data[0].uint32 or
-      (entrySsid.data[1].uint32 shl 8) or
-      (entrySsid.data[2].uint32 shl 16) or
-      (entrySsid.data[3].uint32 shl 24)
-    let entryMeta = i.uint32 or (entry.valid.uint32 shl 8) or
-      (entrySsidLen.uint32 shl 16) or (rssi.uint8.uint32 shl 24)
-    nimFwTrace2U32("[WIFI-NIMFW] ssid_e ", entryMeta, entryWord)
-    if entrySsidLen != searchLen:
-      continue
-    if searchLen > 0:
-      let cmpResult = c_memcmp(searchData,
-                               addr entrySsid.data[0],
-                               searchLen.csize_t)
-      if cmpResult != 0:
-        nimFwTrace2U32("[WIFI-NIMFW] ssid_cmp ", i.uint32, cast[uint32](cmpResult))
+      if not scanuCachedSsidMatches(entry, searchData, searchLen):
         continue
+    else:
+      # Find SSID IE in the cached RXU_MGT_IND payload. The RXU header is 32
+      # bytes, followed by the MAC header (24) and beacon fixed fields (12).
+      let rawRx = rxuMgtIndAt(rawMsgPtr)
+      let totalLen = rawRx.frameLen
+      let ieLen = if totalLen > 36'u16: totalLen.uint32 - 36'u32 else: 0'u32
+      let ieStart = rxuMgtIndIeStart(rawMsgPtr)
+      let ssidIe = mac_ie_find(ieStart, ieLen, IE_ID_SSID)
+      if ssidIe == nil:
+        if not scanuCachedSsidMatches(entry, searchData, searchLen):
+          continue
+      else:
+        let entrySsid = ssidIeAt(ssidIe)
+        let entrySsidLen = entrySsid.ie.len
+        let entryWord = entrySsid.data[0].uint32 or
+          (entrySsid.data[1].uint32 shl 8) or
+          (entrySsid.data[2].uint32 shl 16) or
+          (entrySsid.data[3].uint32 shl 24)
+        let entryMeta = i.uint32 or (entry.valid.uint32 shl 8) or
+          (entrySsidLen.uint32 shl 16) or (rssi.uint8.uint32 shl 24)
+        nimFwTrace2U32("[WIFI-NIMFW] ssid_e ", entryMeta, entryWord)
+        if entrySsidLen != searchLen:
+          if not scanuCachedSsidMatches(entry, searchData, searchLen):
+            continue
+        if searchLen > 0:
+          let cmpResult = c_memcmp(searchData,
+                                   addr entrySsid.data[0],
+                                   searchLen.csize_t)
+          if cmpResult != 0:
+            nimFwTrace2U32("[WIFI-NIMFW] ssid_cmp ", i.uint32, cast[uint32](cmpResult))
+            if not scanuCachedSsidMatches(entry, searchData, searchLen):
+              continue
     nimFwTrace2U32("[WIFI-NIMFW] ssid_hit ", i.uint32, rssi.uint8.uint32)
+    inc nimFwDbgSsidHits
     # Match found: log via g_bl_ops_funcs[204]
     let logFnMatch = getLogFunc(204)
     if logFnMatch != nil:
@@ -12094,6 +19963,7 @@ proc scanu_rm_exist_ssid*(ssid: pointer, ssidLen: uint8) {.exportc, cdecl.} =
     logFn(2, 0, nil, 1043)
 
   # Clear the cached result entry.
+  scanuClearCachedSsid(entry)
   discard c_memset(entry, 0, sizeof(ScanuResultEntry).csize_t)
 
   # Log exit
@@ -12104,6 +19974,7 @@ proc scanu_cached_scanresult_clear*() {.exportc, cdecl.} =
   ## Clear all cached scan results in scanu_env.
   for i in 0 ..< SCANU_MAX_RESULT_ENTRIES:
     let e = addr scanu_env.entries[i]
+    scanuClearCachedSsid(e)
     e.valid = 0
     e.rssi = -128'i8
     if e.rawMsgPtr != nil:
@@ -12186,6 +20057,20 @@ proc scanu_raw_send_cfm*(result: pointer, destId: uint8) {.exportc, cdecl.} =
     msg.result = cast[uint32](result)
     ke_msg_send(msg)
 
+proc bestDirectedScanuResult(): ptr ScanuResultEntry {.inline.} =
+  if scanu_env.directedFound == 0:
+    return nil
+  var best: ptr ScanuResultEntry = nil
+  var bestRssi: int8 = -128
+  for i in 0 ..< SCANU_MAX_RESULT_ENTRIES:
+    let entry = addr scanu_env.entries[i]
+    if entry.valid == 0 or entry.chanPtr == nil:
+      continue
+    if best == nil or entry.rssi > bestRssi:
+      best = entry
+      bestRssi = entry.rssi
+  return best
+
 # ###########################################################################
 #                   SM: Station State Machine
 # ###########################################################################
@@ -12217,6 +20102,22 @@ proc sm_get_bss_params*(resultOut: ptr pointer, chanPtrOut: ptr pointer): bool {
   chanPtrOut[] = nil
 
   let bssidPtr = cast[pointer](addr ci.bssid[0])
+  nimFwDbgBssIn =
+    connectInfoSsidLen(ci).uint32 or
+    (scanu_env.resultCount.uint32 shl 8) or
+    (scanu_env.directedFound.uint32 shl 24)
+  when defined(bl808WifiConnectTrace):
+    let ssid0 = ci.ssid[0].uint32 or (ci.ssid[1].uint32 shl 8) or
+      (ci.ssid[2].uint32 shl 16) or (ci.ssid[3].uint32 shl 24)
+    let bssid0 = ci.bssid[0].uint32 or (ci.bssid[1].uint32 shl 8) or
+      (ci.bssid[2].uint32 shl 16) or (ci.bssid[3].uint32 shl 24)
+    nimFwConnectTrace2U32("[WIFI-CT] bss_in ",
+                          connectInfoSsidLen(ci).uint32 or
+                            (scanu_env.resultCount.uint32 shl 8) or
+                            (scanu_env.directedFound.uint32 shl 24),
+                          ssid0)
+    nimFwConnectTrace2U32("[WIFI-CT] bss_bssid ", bssid0,
+                          ci.bssid[4].uint32 or (ci.bssid[5].uint32 shl 8))
 
   # Log the BSSID we're searching for (3 iterations logging pairs)
   if logFn != nil:
@@ -12263,9 +20164,7 @@ proc sm_get_bss_params*(resultOut: ptr pointer, chanPtrOut: ptr pointer): bool {
           cast[proc(a0: pointer){.cdecl.}](logFn)(nil)
         return true
 
-      # Check if connect info has a frequency hint at offset 40
-      let freqHint = cast[ptr uint16](addr ci.channelHint[0])[]
-      if freqHint != 0xFFFF'u16:
+      if connectInfoHasChannelHint(ci):
         chanPtrOut[] = connectInfoChannelHint(connInfo)
 
   if searchBySsid:
@@ -12274,7 +20173,17 @@ proc sm_get_bss_params*(resultOut: ptr pointer, chanPtrOut: ptr pointer): bool {
       cast[proc(a0: pointer){.cdecl.}](logFn)(nil)
 
     var resultIndex: int32 = -1
-    let ssidResult = scanu_search_by_ssid(connInfo, cast[pointer](addr resultIndex))
+    var searchSlot {.noinit.}: ScanSsidSlotView
+    connectInfoFillSsidSlot(addr searchSlot, ci)
+    let ssidResult = scanu_search_by_ssid(addr searchSlot,
+                                          cast[pointer](addr resultIndex))
+    nimFwDbgBssSsidResult =
+      cast[uint32](cast[uint](ssidResult)) or
+      ((resultIndex.uint32 and 0xFF'u32) shl 24)
+    when defined(bl808WifiConnectTrace):
+      nimFwConnectTrace2U32("[WIFI-CT] bss_ssid_result ",
+                            cast[uint32](cast[uint](ssidResult)),
+                            cast[uint32](resultIndex))
     if ssidResult != nil:
       if resultIndex >= 0:
         resultOut[] = ssidResult
@@ -12282,17 +20191,32 @@ proc sm_get_bss_params*(resultOut: ptr pointer, chanPtrOut: ptr pointer): bool {
       let chanPtr = scanuResultAt(ssidResult).chanPtr
       chanPtrOut[] = chanPtr
     else:
-      # Check if connect info has a frequency hint at offset 40
-      let freqHint = cast[ptr uint16](addr ci.channelHint[0])[]
-      if freqHint != 0xFFFF'u16:
+      let directed = bestDirectedScanuResult()
+      nimFwDbgBssDirected =
+        cast[uint32](cast[uint](directed)) or
+        (scanu_env.directedFound.uint32 shl 24)
+      when defined(bl808WifiConnectTrace):
+        nimFwConnectTrace2U32("[WIFI-CT] bss_directed ",
+                              cast[uint32](cast[uint](directed)),
+                              scanu_env.directedFound.uint32)
+      if directed != nil:
+        resultOut[] = cast[pointer](directed)
+        chanPtrOut[] = directed.chanPtr
+      elif connectInfoHasChannelHint(ci):
         chanPtrOut[] = connectInfoChannelHint(connInfo)
 
   if chanPtrOut[] == nil:
-    let freqHint = cast[ptr uint16](addr ci.channelHint[0])[]
-    if freqHint != 0xFFFF'u16:
+    if connectInfoHasChannelHint(ci):
       chanPtrOut[] = connectInfoChannelHint(connInfo)
 
   # Final log
+  nimFwDbgBssOut =
+    cast[uint32](cast[uint](resultOut[])) xor
+    (cast[uint32](cast[uint](chanPtrOut[])) shl 1)
+  when defined(bl808WifiConnectTrace):
+    nimFwConnectTrace2U32("[WIFI-CT] bss_out ",
+                          cast[uint32](cast[uint](resultOut[])),
+                          cast[uint32](cast[uint](chanPtrOut[])))
   if logFn != nil:
     cast[proc(a0: pointer){.cdecl.}](logFn)(nil)
   return resultOut[] != nil
@@ -12319,9 +20243,7 @@ proc sm_scan_bss*(bssid: pointer, ssid: pointer, chanInfo: pointer) {.exportc, c
   msg.vifIdx = vifIdx
   msg.probeReqIeLen = 0
 
-  # Copy connect info (34 bytes starting from connInfo) into msg+252
-  discard c_memcpy(addr msg.ssidFilter[0], connInfo,
-                   msg.ssidFilter.len.csize_t)
+  connectInfoFillSsidSlot(scanSsidSlot(msg, 0), ci)
 
   # Set active scan flag
   msg.scanType = 1
@@ -12387,9 +20309,7 @@ proc sm_join_bss*(bssid: pointer, ssid: pointer, joinInfo: pointer, flag: uint32
   # Set join-specific flag
   msg.channelCount = 1
 
-  # Copy connect info (34 bytes) into msg+252
-  discard c_memcpy(addr msg.ssidFilter[0], connInfo,
-                   msg.ssidFilter.len.csize_t)
+  connectInfoFillSsidSlot(scanSsidSlot(msg, 0), ci)
 
   # Set active scan
   msg.scanType = 1
@@ -12434,8 +20354,8 @@ proc sm_add_chan_ctx*(param: pointer): uint8 {.exportc, cdecl, discardable.} =
   chanReq.band = chan.band
   chanReq.chanType = connectInfoChannelContext(connInfo).chanType
   chanReq.primFreq = chan.prim20Freq
-  chanReq.centerFreq1 = uint16(vif.channelFreqPair and 0xFFFF'u32)
-  chanReq.centerFreq2 = uint16((vif.channelFreqPair shr 16) and 0xFFFF'u32)
+  chanReq.centerFreq1 = vifChannelCenterFreq1(vif, chan.prim20Freq)
+  chanReq.centerFreq2 = vifChannelCenterFreq2(vif)
   chanReq.txPower = cast[uint8](chan.txPower)
   return chan_ctxt_add(cast[pointer](addr chanReq), cast[ptr uint8](param))
 
@@ -12568,10 +20488,8 @@ proc sm_handle_connection*(vifIdxOrFlag: uint32, status: uint32,
   ##   mfp_protect_mgmt_frame, txu_cntrl_protect_mgmt_frame (conditional),
   ##   me_build_deauthenticate(bodyStart, 3), mfp_add_mgmt_mic (conditional),
   ##   txl_frame_push(frame, 3). On fail: failureFn(vifEntry, status, 3).
-  let vifTab = cast[uint](addr vif_info_tab[0])
   let vifIdx = vifIdxOrFlag.uint8
-  let vifEntry = vifTab + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let vif = vifChannelAt(vifEntry)
+  let vif = vifChannelForIdx(vifIdx)
 
   # Early exit if VIF byte at +86 is non-zero (blob: lbu a5,86(s3); bnez)
   let vifFlag = vif.vifType
@@ -12590,43 +20508,39 @@ proc sm_handle_connection*(vifIdxOrFlag: uint32, status: uint32,
     # Failure: tail-call failureFn(vifEntry, status, 3)
     if failureFn != nil:
       cast[proc(a: pointer, b: uint32, c: uint32){.cdecl.}](failureFn)(
-        cast[pointer](vifEntry), status, 3)
+        cast[pointer](vif), status, 3)
     return
 
   let desc = hostTxDescAt(frame)
 
   # Update TX power (blob: tpc_update_frame_tx_power(vifEntry, frame))
-  tpc_update_frame_tx_power(cast[pointer](vifEntry), frame)
+  tpc_update_frame_tx_power(cast[pointer](vif), frame)
 
   # Get link descriptor from frame (blob: lw s1,108(s0) -> s1 = frame[108]).
-  # The MAC header BUFFER lives at linkDesc+348 (matches hwDesc[20] set up by
-  # txl_frame_init_desc). All blob `sb/sw N(s1)` stores are offsets into that
-  # buffer, so add 348 here to get the actual MAC header start.
-  let macHdr = hostTxMacHdrAddr(desc)
+  # The MAC header buffer lives in link.macHeader (linkDesc+348).
+  let link = hostTxLinkDescAt(desc.bufDesc)
+  let hdr = hostTxDataHeader(desc)
   let sta = staInfoForIdx(staIdx)
   let staMac = cast[pointer](addr sta.macAddr[0])
 
   # Set frame control byte (blob: li a5,-64 = 0xC0; sb a5,348(s1))
-  cast[ptr uint8](macHdr + 0)[] = 0xC0'u8
-  cast[ptr uint8](macHdr + 1)[] = 0
-  cast[ptr uint8](macHdr + 2)[] = 0
-  cast[ptr uint8](macHdr + 3)[] = 0
+  hdr.frameControl = 0x00C0'u16
+  hdr.duration = 0
 
   # DA from sta_info_tab+4 (blob: memcpy dst=s1+348+4 -> macHdr+4)
-  discard c_memcpy(cast[pointer](macHdr + 4), staMac, 6.csize_t)
+  discard c_memcpy(addr hdr.addr1[0], staMac, 6.csize_t)
   # SA from vifEntry+80 (blob: memcpy dst=s1+348+10 -> macHdr+10)
-  discard c_memcpy(cast[pointer](macHdr + 10), cast[pointer](addr vif.macAddr[0]), 6.csize_t)
+  discard c_memcpy(addr hdr.addr2[0], cast[pointer](addr vif.macAddr[0]), 6.csize_t)
   # BSSID from sta_info_tab+4 (blob: memcpy dst=s1+348+16 -> macHdr+16)
-  discard c_memcpy(cast[pointer](macHdr + 16), staMac, 6.csize_t)
+  discard c_memcpy(addr hdr.addr3[0], staMac, 6.csize_t)
 
   # Get sequence control (blob: txl_get_seq_ctrl at 0xBE)
   let seqCtrl = txl_get_seq_ctrl()
-  cast[ptr uint8](macHdr + 22)[] = cast[uint8](seqCtrl and 0xFF)
-  cast[ptr uint8](macHdr + 23)[] = cast[uint8](seqCtrl shr 8)
+  hdr.seqCtrl = seqCtrl
 
   # Store callback/ctx at frame+208/212 (blob: sw s6,208(s0); sw s3,212(s0))
   desc.callback = callbackCtx
-  desc.callbackArg = cast[pointer](vifEntry)
+  desc.callbackArg = cast[pointer](vif)
   # Store VIF/STA info (blob: sb s7,47(s0); sb zero,98,100; sb a5,49(s0))
   desc.vifIdx = vifIdx
   desc.hdrLen = 0
@@ -12634,15 +20548,12 @@ proc sm_handle_connection*(vifIdxOrFlag: uint32, status: uint32,
   desc.staInfoIdx = staIdx
 
   # MFP protection (blob: mfp_protect_mgmt_frame at 0xFE)
-  # Reads FC bytes from macHdr+0/+1, passes as (lo | hi<<8)
-  let fcLo = cast[ptr uint8](macHdr + 1)[]
-  let fcHi = cast[ptr uint8](macHdr + 0)[]
-  let fc = (fcHi.uint16 shl 8) or fcLo.uint16
+  let fc = hdr.frameControl
   let mfpResult = mfp_protect_mgmt_frame(frame, fc.uint32)
 
   # Track body start offset (macHdr + secHdrLen)
   var bodyOffset: uint = 24  # base MAC header size
-  let macHdrPtr = cast[pointer](macHdr + 0)
+  let macHdrPtr = cast[pointer](hdr)
 
   # Conditional: txu_cntrl_protect_mgmt_frame if mfp returned 1
   if mfpResult == 1:
@@ -12651,7 +20562,7 @@ proc sm_handle_connection*(vifIdxOrFlag: uint32, status: uint32,
     bodyOffset = desc.hdrLen.uint + 24
 
   # Build deauthentication body (blob: me_build_deauthenticate(macHdr+bodyOffset, 3))
-  let bodyStart = cast[pointer](macHdr + bodyOffset)
+  let bodyStart = cast[pointer](addr link.macHeader[bodyOffset])
   let deauthLen = me_build_deauthenticate(bodyStart, 3)
   var totalLen = bodyOffset + deauthLen.uint
 
@@ -12666,11 +20577,11 @@ proc sm_handle_connection*(vifIdxOrFlag: uint32, status: uint32,
     totalLen = totalLen + secTailLen.uint
 
   # TX descriptor setup (blob: lw a4,112(s0); lw a5,20(a4); ...)
-  let txDesc = cast[uint](desc.hwDesc)
-  if txDesc != 0:
-    let payloadLen = cast[ptr uint32](txDesc + 20)[]
-    cast[ptr uint32](txDesc + 24)[] = payloadLen - 1 + totalLen.uint32
-    cast[ptr uint32](txDesc + 28)[] = totalLen.uint32 + 4
+  if desc.hwDesc != nil:
+    let txDesc = hostTxHwDescAt(desc.hwDesc)
+    let payloadLen = txDesc.payloadStart
+    txDesc.payloadEnd = payloadLen - 1 + totalLen.uint32
+    txDesc.frameLen = totalLen.uint32 + 4
 
   # Push frame to TX queue (blob: txl_frame_push(frame, 3))
   txl_frame_push(frame, 3)
@@ -12678,7 +20589,7 @@ proc sm_handle_connection*(vifIdxOrFlag: uint32, status: uint32,
   # Completion: tail-call failureFn(vifEntry, status, 3)
   if failureFn != nil:
     cast[proc(a: pointer, b: uint32, c: uint32){.cdecl.}](failureFn)(
-      cast[pointer](vifEntry), status, 3)
+      cast[pointer](vif), status, 3)
 
 proc sm_disconnect_process*(param: pointer, statusCode: uint16 = 0, reasonCode: uint16 = 0) {.exportc, cdecl.} =
   ## Process a disconnect request (122 bytes in blob, 39 instrs).
@@ -12697,7 +20608,7 @@ proc sm_disconnect_process*(param: pointer, statusCode: uint16 = 0, reasonCode: 
   let sm = smEnvView()
   # Clean up SM resources before clearing sm_env[0]; sm_delete_resources reads
   # the active connection pointer from sm_env[0].
-  sm_delete_resources()
+  sm_delete_resources(param)
   sm.connectInfo = nil
   msg.status = statusCode
   msg.reason = reasonCode
@@ -12721,11 +20632,9 @@ proc sm_connect_ind*(statusCode: uint16, reasonCode: uint16) {.exportc, cdecl, n
   let sm = smEnvView()
   let connInfo = sm.connectInfo
   let ci = connectInfoView(connInfo)
-  let vifTab = cast[uint](addr vif_info_tab[0])
 
   let vifIdx = ci.vifIdx
-  let vifEntry = vifTab + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let vif = vifChannelAt(vifEntry)
+  let vif = vifChannelForIdx(vifIdx)
 
   # Get sm_env secondary fields.
   # Blob re-uses the 860-byte message that sm_connect_req_handler parked at
@@ -12734,71 +20643,55 @@ proc sm_connect_ind*(statusCode: uint16, reasonCode: uint16) {.exportc, cdecl, n
   # downstream. The blob's smEnvSecond pointer and the "msg" pointer are
   # the same object.
   let smEnvSecond = sm.connectIndMsg
-  let smEnvSecU = cast[uint](smEnvSecond)
   let msg = smEnvSecond
   if msg == nil:
     return
-  let m = smEnvSecU
+  let ind = smConnectIndPayloadAt(msg)
   let msgHdr = keMsgHdrFromPayload(msg)
   msgHdr.id = SM_CONNECT_IND_MSG
   msgHdr.destId = TASK_API
   msgHdr.srcId = TASK_SM
 
-  # Fill vifIdx at msg+11
-  cast[ptr uint8](m + 11)[] = vifIdx
+  ind.vifIdx = vifIdx
 
-  # Copy BSSID from vif_info_tab+380 (6 bytes) to msg+4
-  let bssid = cast[uint](addr vif.bssid[0])
-  cast[ptr uint32](m + 4)[] = cast[ptr uint32](bssid)[]
-  cast[ptr uint16](m + 8)[] = cast[ptr uint16](bssid + 4)[]
+  discard c_memcpy(addr ind.bssid[0], addr vif.bssid[0], 6.csize_t)
 
-  # Copy AID from vif+96 to msg+12
-  let aid = vif.staIdx
-  cast[ptr uint8](m + 12)[] = aid
+  ind.aid = vif.staIdx
 
   # Copy channel info from vif+64 pointer
   let chanPtr = vif.chanCtxt
-  if chanPtr != nil:
-    # No channel info
-    cast[ptr uint8](m + 13)[] = 0
-  else:
-    cast[ptr uint8](m + 13)[] = 0
+  ind.channelStatus = 0
 
   # Fill channel and VHT capability fields from chanPtr if available
   if chanPtr != nil:
-    let cpU = cast[uint](chanPtr)
-    cast[ptr uint8](m + 822)[] = cast[ptr uint8](cpU + 4)[]
-    cast[ptr uint16](m + 824)[] = cast[ptr uint16](cpU + 6)[]
-    cast[ptr uint32](m + 828)[] = cast[ptr uint16](cpU + 8)[].uint32
-    cast[ptr uint32](m + 832)[] = cast[ptr uint16](cpU + 10)[].uint32
-    cast[ptr uint8](m + 826)[] = cast[ptr uint8](cpU + 5)[]
-    # Store freq info to sm_env secondary struct
-    cast[ptr uint16](smEnvSecU + 32)[] = cast[ptr uint16](cpU + 6)[]
-    cast[ptr uint16](smEnvSecU + 34)[] = cast[ptr uint16](cpU + 8)[]
+    let chan = chanCtxtAt(chanPtr)
+    ind.chanBand = chan.channel.band
+    ind.chanPrimFreq = chan.channel.primFreq
+    ind.chanType = chan.channel.chanType
+    ind.chanCenterFreq1 = chan.channel.centerFreq1.uint32
+    ind.chanCenterFreq2 = chan.channel.centerFreq2.uint32
+    ind.assocIeBuffer[12] = (chan.channel.primFreq and 0xFF).uint8
+    ind.assocIeBuffer[13] = (chan.channel.primFreq shr 8).uint8
+    ind.assocIeBuffer[14] = (chan.channel.centerFreq1 and 0xFF).uint8
+    ind.assocIeBuffer[15] = (chan.channel.centerFreq1 shr 8).uint8
   else:
-    cast[ptr uint8](m + 822)[] = 0
-    cast[ptr uint16](m + 824)[] = 0
-    cast[ptr uint32](m + 828)[] = 0
-    cast[ptr uint32](m + 832)[] = 0
-    cast[ptr uint8](m + 826)[] = 0
+    ind.chanBand = 0
+    ind.chanPrimFreq = 0
+    ind.chanCenterFreq1 = 0
+    ind.chanCenterFreq2 = 0
+    ind.chanType = 0
 
-  # Check if AP uses WMM (byte 14 of msg)
-  let hasWmm = cast[ptr uint8](m + 14)[]
+  let hasWmm = ind.hasWmm
   var qosFlag: uint8 = 0
   if hasWmm != 0:
-    # Check if peer VIF supports QoS
-    let peerVifEntry = vifTab + vifIdx.uint * VIF_ENTRY_SIZE.uint
-    let qosCap = cast[ptr uint8](peerVifEntry + 453)[]
-    qosFlag = qosCap
+    qosFlag = vif.wmmAcFlags
 
-  cast[ptr uint8](m + 15)[] = qosFlag
+  ind.qosFlag = qosFlag
 
-  # Clear security status byte
-  cast[ptr uint8](m + 10)[] = 0
+  ind.securityStatus = 0
 
-  # Write status and reason code to message
-  cast[ptr uint16](m + 0)[] = statusCode
-  cast[ptr uint16](m + 2)[] = reasonCode
+  ind.statusCode = statusCode
+  ind.reasonCode = reasonCode
 
   # Blob state handling (offsets 0xda-0xf4, 0x14a-0x1a0):
   #   if statusCode == 0:  ke_state_set(TASK_SM, 0)       ; success -> idle
@@ -12836,6 +20729,8 @@ proc sm_connect_ind*(statusCode: uint16, reasonCode: uint16) {.exportc, cdecl, n
 
   # Blob: sm_delete_resources — cleanup SM resources (offset 0x198, tail-call)
   sm_delete_resources()
+  if statusCode != 0 and ke_state_get(TASK_SM) == SmDisconnectingState:
+    ke_state_set(TASK_SM, SmIdleState)
 
 proc sm_connect_abort_process*(param: pointer, statusCode: uint16 = 0, reasonCode: uint16 = 0) {.exportc, cdecl.} =
   ## Process a connect abort request.
@@ -12857,10 +20752,8 @@ proc sm_deauth_send*(param: pointer, reason: uint16) {.exportc, cdecl.} =
   let connInfo = smEnvView().connectInfo
   if connInfo == nil:
     return
-  let vifTab = cast[uint](addr vif_info_tab[0])
   let vifIdx = connectInfoView(connInfo).vifIdx
-  let vifEntry = vifTab + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let vif = vifChannelAt(vifEntry)
+  let vif = vifChannelForIdx(vifIdx)
   let staIdx = vif.staIdx
   let sta = staInfoForIdx(staIdx)
   let bssidPtr = cast[pointer](addr sta.macAddr[0])
@@ -12870,8 +20763,9 @@ proc sm_deauth_send*(param: pointer, reason: uint16) {.exportc, cdecl.} =
     return
   let desc = hostTxDescAt(frame)
   # Blob prepares TX power before using the frame body pointer.
-  tpc_update_frame_tx_power(cast[pointer](vifEntry), frame)
+  tpc_update_frame_tx_power(cast[pointer](vif), frame)
   # Build deauth MAC header at frameBody+348.
+  let link = hostTxLinkDescAt(desc.bufDesc)
   let hdr = hostTxDataHeader(desc)
   hdr.frameControl = 0x00C0'u16
   hdr.duration = 0
@@ -12882,12 +20776,12 @@ proc sm_deauth_send*(param: pointer, reason: uint16) {.exportc, cdecl.} =
   # Sequence control (blob: txl_get_seq_ctrl)
   hdr.seqCtrl = txl_get_seq_ctrl()
   # Frame metadata
-  desc.callbackArg = cast[pointer](vifEntry)
+  desc.callbackArg = cast[pointer](vif)
   desc.callback = nil
   desc.vifIdx = vif.vifIdx
   desc.staInfoIdx = staIdx
   # Build deauth body
-  let bodyPtr = cast[pointer](cast[uint](hdr) + sizeof(MacDataFrameHeaderView).uint)
+  let bodyPtr = cast[pointer](addr link.macHeader[sizeof(MacDataFrameHeaderView)])
   let deauthLen = me_build_deauthenticate(bodyPtr, 3)
   # Set TX descriptor lengths on the HW descriptor pointed to by frame+112.
   let txDesc = hostTxHwDescAt(desc.hwDesc)
@@ -12939,9 +20833,7 @@ proc sm_auth_send*(authSeqNum: uint16, statusCode: uint32) {.exportc, cdecl.} =
   let ci = connectInfoView(connInfo)
 
   let vifIdx = ci.vifIdx
-  let vifBase = cast[uint](addr vif_info_tab[0])
-  let vifEntry = vifBase + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let vif = vifChannelAt(vifEntry)
+  let vif = vifChannelForIdx(vifIdx)
   let staIdx = vif.staIdx
   let sta = staInfoForIdx(staIdx)
   let bssidPtr = cast[pointer](addr sta.macAddr[0])
@@ -12958,29 +20850,25 @@ proc sm_auth_send*(authSeqNum: uint16, statusCode: uint32) {.exportc, cdecl.} =
     return
   let desc = hostTxDescAt(frame)
 
-  tpc_update_frame_tx_power(cast[pointer](vifEntry), frame)
+  tpc_update_frame_tx_power(cast[pointer](vif), frame)
 
-  # Set up frame via me_build_authenticate
-  # Frame body is at desc+108 in the TX descriptor
-  let bodyU = cast[uint](desc.bufDesc)
+  let link = hostTxLinkDescAt(desc.bufDesc)
+  let hdr = hostTxDataHeader(desc)
 
-  # Build auth frame body: writes subtype bytes at body[348..351] = 0xB0, 0, 0, 0
-  cast[ptr uint8](bodyU + 348)[] = 0xB0'u8
-  cast[ptr uint8](bodyU + 349)[] = 0
-  cast[ptr uint8](bodyU + 350)[] = 0
-  cast[ptr uint8](bodyU + 351)[] = 0
+  # Build auth frame header.
+  hdr.frameControl = 0x00B0'u16
+  hdr.duration = 0
 
   # Copy DA (6 bytes) from BSSID to frame body+352
-  discard c_memcpy(cast[pointer](bodyU + 352), bssidPtr, 6)
+  discard c_memcpy(addr hdr.addr1[0], bssidPtr, 6)
   # Copy SA (6 bytes) from VIF+80 to frame body+358
-  discard c_memcpy(cast[pointer](bodyU + 358), cast[pointer](addr vif.macAddr[0]), 6)
+  discard c_memcpy(addr hdr.addr2[0], cast[pointer](addr vif.macAddr[0]), 6)
   # Copy BSSID (6 bytes) from BSSID to frame body+364
-  discard c_memcpy(cast[pointer](bodyU + 364), bssidPtr, 6)
+  discard c_memcpy(addr hdr.addr3[0], bssidPtr, 6)
 
   # Generate and write sequence number (frame body+370..371)
   let seqNum = txl_get_seq_ctrl()  # blob uses txl_get_seq_ctrl for sequence numbers
-  cast[ptr uint8](bodyU + 370)[] = (seqNum and 0xFF).uint8
-  cast[ptr uint8](bodyU + 371)[] = ((seqNum shr 8) and 0xFF).uint8
+  hdr.seqCtrl = seqNum
 
   # Store AP channel info at frame+47
   let apChanIdx = vif.vifIdx
@@ -12997,20 +20885,19 @@ proc sm_auth_send*(authSeqNum: uint16, statusCode: uint32) {.exportc, cdecl.} =
   if authType == 1 and authSeqNum == 3:
     # Shared key auth seq 3: append challenge text from connect info
     bodyLen = 24  # me_build_authenticate handles this internally
-    let ieStartPtr = cast[pointer](bodyU + 348 + bodyLen.uint)
+    let ieStartPtr = cast[pointer](addr link.macHeader[bodyLen])
     # Copy challenge text IE (24 bytes) from connect_info
     let extraLen = desc.hdrLen
     bodyLen += extraLen.uint32 + 24
 
   # .L117/.L128: Write auth body via me_build_authenticate
-  let authBodyPtr = cast[pointer](bodyLen.uint + bodyU + 348)
+  let authBodyPtr = cast[pointer](addr link.macHeader[bodyLen])
   let builtLen = me_build_authenticate(
     authBodyPtr, authAlgo.uint16, authSeqNum, statusCode.uint16, nil)
 
   # Update frame lengths
   # .L128: Set TX descriptor fields
-  let thdPtr = desc.hwDesc
-  let thdU = cast[uint](thdPtr)
+  let thd = hostTxHwDescAt(desc.hwDesc)
   desc.callback = nil
   desc.callbackArg = frame
 
@@ -13020,9 +20907,28 @@ proc sm_auth_send*(authSeqNum: uint16, statusCode: uint32) {.exportc, cdecl.} =
   totalLen += extraIeLen.uint32
 
   # Set THD length fields
-  let thdBase = cast[ptr uint32](thdU + 20)[]
-  cast[ptr uint32](thdU + 24)[] = thdBase - 1 + totalLen
-  cast[ptr uint32](thdU + 28)[] = totalLen + 4
+  let thdBase = thd.payloadStart
+  thd.payloadEnd = thdBase - 1 + totalLen
+  thd.frameLen = totalLen + 4
+  let authRawLen = if totalLen > nimFwDbgAuthTxRaw.len.uint32:
+    nimFwDbgAuthTxRaw.len.uint32
+  else:
+    totalLen
+  nimFwDbgAuthTxLen = totalLen
+  nimFwDbgAuthTxMeta = authSeqNum.uint32 or (authAlgo.uint32 shl 16) or
+    (vifIdx.uint32 shl 24) or (staIdx.uint32 shl 28)
+  nimFwDbgAuthTxDesc = thd.frameLen or (authRawLen shl 16)
+  discard c_memset(addr nimFwDbgAuthTxRaw[0], 0, nimFwDbgAuthTxRaw.len.csize_t)
+  discard c_memcpy(addr nimFwDbgAuthTxRaw[0],
+                   cast[pointer](addr link.macHeader[0]),
+                   authRawLen.csize_t)
+  let authTrace = cast[ptr AuthBodyTraceView](authBodyPtr)
+  let authTraceWord0 =
+    authTrace.fixed.authAlgo.uint32 or (authTrace.fixed.authSeq.uint32 shl 16)
+  let authTraceWord1 =
+    authTrace.fixed.statusCode.uint32 or
+    (authTrace.challengeTag.uint32 shl 16) or
+    (authTrace.challengeLen.uint32 shl 24)
   nimFwTrace2U32("[WIFI-NIMFW] auth_tx ",
                  authSeqNum.uint32 or (authAlgo.uint32 shl 16),
                  vifIdx.uint32 or (staIdx.uint32 shl 8) or
@@ -13033,30 +20939,34 @@ proc sm_auth_send*(authSeqNum: uint16, statusCode: uint32) {.exportc, cdecl.} =
                           vifIdx.uint32 or (staIdx.uint32 shl 8) or
                             ((statusCode and 0xFFFF'u32) shl 16))
     nimFwConnectTrace2U32("[WIFI-CT] auth_hdr0 ",
-                          cast[ptr uint32](bodyU + 348)[],
-                          cast[ptr uint32](bodyU + 352)[])
+                          cast[ptr uint32](addr link.macHeader[0])[],
+                          cast[ptr uint32](addr link.macHeader[4])[])
     nimFwConnectTrace2U32("[WIFI-CT] auth_hdr1 ",
-                          cast[ptr uint32](bodyU + 356)[],
-                          cast[ptr uint32](bodyU + 360)[])
+                          cast[ptr uint32](addr link.macHeader[8])[],
+                          cast[ptr uint32](addr link.macHeader[12])[])
     nimFwConnectTrace2U32("[WIFI-CT] auth_hdr2 ",
-                          cast[ptr uint32](bodyU + 364)[],
-                          cast[ptr uint32](bodyU + 368)[])
+                          cast[ptr uint32](addr link.macHeader[16])[],
+                          cast[ptr uint32](addr link.macHeader[20])[])
     nimFwConnectTrace2U32("[WIFI-CT] auth_body ",
-                          cast[ptr uint32](authBodyPtr)[],
-                          cast[ptr uint32](cast[uint](authBodyPtr) + 4)[])
+                          authTraceWord0,
+                          authTraceWord1)
     nimFwConnectTrace2U32("[WIFI-CT] auth_len ",
                           totalLen,
-                          cast[ptr uint32](thdU + 28)[])
+                          thd.frameLen)
+    nimFwConnectTraceBytes("[WIFI-RAW] auth_tx ",
+                           cast[pointer](addr link.macHeader[0]),
+                           totalLen,
+                           96)
     nimFwConnectTraceHw("[WIFI-CT] auth_hw ")
   nimFwTrace2U32("[WIFI-NIMFW] auth_mac ",
-                 cast[ptr uint32](bodyU + 352)[],
-                 cast[ptr uint32](bodyU + 364)[])
+                 cast[ptr uint32](addr link.macHeader[4])[],
+                 cast[ptr uint32](addr link.macHeader[16])[])
   nimFwTrace2U32("[WIFI-NIMFW] auth_len ",
                  totalLen,
-                 cast[ptr uint32](thdU + 28)[])
+                 thd.frameLen)
   nimFwTrace2U32("[WIFI-NIMFW] auth_body ",
-                 cast[ptr uint32](authBodyPtr)[],
-                 cast[ptr uint32](cast[uint](authBodyPtr) + 4)[])
+                 authTraceWord0,
+                 authTraceWord1)
 
   # Check for SAE auth (blob: me_build_sae_authenticate path)
   if authAlgo == 3:
@@ -13066,6 +20976,12 @@ proc sm_auth_send*(authSeqNum: uint16, statusCode: uint32) {.exportc, cdecl.} =
       txl_frame_release(frame)
       sm_connect_ind(2, 0xFFFF)
       return
+
+  when defined(bl808WifiUseBl808Rf):
+    rfPriApplyWb03AuthTxLatches()
+    rfPriCaptureWb03AuthTxPrePush()
+    applyForcedInternalMgmtTxPower(thd)
+    captureAuthTxHwPrePush(desc, thd)
 
   # Push frame to TX queue (AC=3 = VO)
   txl_frame_push(frame, 3)
@@ -13079,8 +20995,9 @@ proc sm_auth_send*(authSeqNum: uint16, statusCode: uint32) {.exportc, cdecl.} =
   # Set auth response timeout timer (blob: ke_timer_set)
   ke_timer_set(SM_RSP_TIMEOUT_IND, TASK_SM, listenInterval)
 
-  # Set auth state.
-  ke_state_set(TASK_SM, SmAuthenticatingState)
+  # Vendor waits for the auth response in state 5. State 6 is the
+  # association-response wait state after a successful auth response.
+  ke_state_set(TASK_SM, SmAuthStartingState)
 
   smConnecting = true
 
@@ -13104,19 +21021,18 @@ proc sm_auth_start*(param: pointer) {.exportc, cdecl.} =
 
 proc sm_assoc_req_send*(param: pointer) {.exportc, cdecl.} =
   ## Send association request frame (424 bytes in blob).
-  ## Blob call sequence: txl_frame_get(512), tpc_update_frame_tx_power,
+  ## Blob call sequence: txl_frame_get(256), tpc_update_frame_tx_power,
   ##   memcpy x3 (DA/SA/BSSID), txl_get_seq_ctrl, me_build_associate_req,
-  ##   txl_frame_push(3), ke_timer_set, ke_state_set(SM,8).
+  ##   txl_frame_push(3), ke_timer_set, ke_state_set(SM,6).
   ## On alloc failure: sm_connect_ind(0,0).
   let sm = smEnvView()
   let connInfo = sm.connectInfo
   if connInfo == nil: return
   let ci = connectInfoView(connInfo)
   let vifIdx = ci.vifIdx
-  let vifBase = cast[uint](addr vif_info_tab[0])
-  let vifEntry = vifBase + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let vif = vifChannelAt(vifEntry)
+  let vif = vifChannelForIdx(vifIdx)
   let staIdx = vif.staIdx
+  inc nimFwDbgAssocReqSend
 
   # Allocate TX frame via txl_frame_get(512) - NOT ke_msg_alloc
   let frame = txl_frame_get(512)
@@ -13126,20 +21042,18 @@ proc sm_assoc_req_send*(param: pointer) {.exportc, cdecl.} =
   let desc = hostTxDescAt(frame)
 
   # TPC update (blob: tpc_update_frame_tx_power at 0x5a)
-  tpc_update_frame_tx_power(cast[pointer](vifEntry), frame)
+  tpc_update_frame_tx_power(cast[pointer](vif), frame)
 
   # Get STA entry for addresses
   let sta = staInfoForIdx(staIdx)
   let staMac = cast[pointer](addr sta.macAddr[0])
 
-  # Get MAC header from frame descriptor (blob: lw s1,108(s0))
-  let macHdr = cast[uint](desc.bufDesc)
+  let link = hostTxLinkDescAt(desc.bufDesc)
+  let hdr = hostTxDataHeader(desc)
 
-  # Clear frame control bytes (blob: sb zero,348-351)
-  cast[ptr uint8](macHdr + 348)[] = 0
-  cast[ptr uint8](macHdr + 349)[] = 0
-  cast[ptr uint8](macHdr + 350)[] = 0
-  cast[ptr uint8](macHdr + 351)[] = 0
+  # Clear frame control/duration fields (blob: sb zero,348-351)
+  hdr.frameControl = 0
+  hdr.duration = 0
 
   # Snapshot vif+80 (frame SA) + MAC HW addr regs for crypto MAC consistency check.
   for i in 0 ..< 6:
@@ -13148,16 +21062,15 @@ proc sm_assoc_req_send*(param: pointer) {.exportc, cdecl.} =
   nimFwDbgMacHwHi = regRead(MACHW_BASE + 0x14'u)
 
   # DA from sta_info_tab+4 (blob: memcpy at 0x8e)
-  discard c_memcpy(cast[pointer](macHdr + 352), staMac, 6.csize_t)
+  discard c_memcpy(addr hdr.addr1[0], staMac, 6.csize_t)
   # SA from vifEntry+80 (blob: memcpy at 0xa0)
-  discard c_memcpy(cast[pointer](macHdr + 358), cast[pointer](addr vif.macAddr[0]), 6.csize_t)
+  discard c_memcpy(addr hdr.addr2[0], cast[pointer](addr vif.macAddr[0]), 6.csize_t)
   # BSSID from sta_info_tab+4 (blob: memcpy at 0xb0)
-  discard c_memcpy(cast[pointer](macHdr + 364), staMac, 6.csize_t)
+  discard c_memcpy(addr hdr.addr3[0], staMac, 6.csize_t)
 
   # Sequence control via txl_get_seq_ctrl (blob at 0xb8)
   let seqCtrl = txl_get_seq_ctrl()
-  cast[ptr uint8](macHdr + 370)[] = (seqCtrl and 0xFF).uint8
-  cast[ptr uint8](macHdr + 371)[] = ((seqCtrl shr 8) and 0xFF).uint8
+  hdr.seqCtrl = seqCtrl
 
   # Store VIF/STA info
   desc.vifIdx = vifIdx
@@ -13168,8 +21081,8 @@ proc sm_assoc_req_send*(param: pointer) {.exportc, cdecl.} =
   # a5=&bodyLen, a6=connect info.
   var assocCursor {.noinit.}: pointer
   var assocBodyLen {.noinit.}: uint16
-  let assocBodyPtr = cast[pointer](macHdr + 372)
-  let assocInfo = cast[pointer](vifEntry + 348)
+  let assocBodyPtr = cast[pointer](addr link.macHeader[sizeof(MacDataFrameHeaderView)])
+  let assocInfo = cast[pointer](vifHtCapabilities(vif))
   let instNbr = vif.vifIdx
   let builtLen = me_build_associate_req_impl(
     assocBodyPtr,
@@ -13181,32 +21094,42 @@ proc sm_assoc_req_send*(param: pointer) {.exportc, cdecl.} =
     connInfo)
 
   # Complete TX descriptor lengths to match the blob's sm_assoc_req_send.
-  let thdPtr = desc.hwDesc
-  let thdU = cast[uint](thdPtr)
+  let thd = hostTxHwDescAt(desc.hwDesc)
   desc.callback = nil
   desc.callbackArg = frame
-  let thdBase = cast[ptr uint32](thdU + 20)[]
-  cast[ptr uint32](thdU + 24)[] = thdBase + 23'u32 + builtLen
-  cast[ptr uint32](thdU + 28)[] = builtLen + 28'u32
+  let thdBase = thd.payloadStart
+  thd.payloadEnd = thdBase + 23'u32 + builtLen
+  thd.frameLen = builtLen + 28'u32
+  nimFwDbgAssocReqMeta =
+    vifIdx.uint32 or (staIdx.uint32 shl 8) or
+      (builtLen.uint32 shl 16) or (assocBodyLen.uint32 shl 24)
   let smEnvSecond = sm.connectIndMsg
   if smEnvSecond != nil:
-    cast[ptr uint16](cast[uint](smEnvSecond) + 16)[] = assocBodyLen
+    smConnectIndPayloadAt(smEnvSecond).assocReqIeLen = assocBodyLen
+  let assocFixed = cast[ptr AssocReqFixedBodyView](assocBodyPtr)
+  let assocTraceWord0 =
+    assocFixed.capabilityInfo.uint32 or (assocFixed.listenInterval.uint32 shl 16)
+  let assocTraceWord1 = cast[ptr uint32](addr assocFixed.reassocBssid[0])[]
   nimFwTrace2U32("[WIFI-NIMFW] assoc_tx_len ", builtLen, assocBodyLen.uint32)
   nimFwTrace2U32("[WIFI-NIMFW] assoc_tx_body ",
-                 cast[ptr uint32](assocBodyPtr)[],
-                 cast[ptr uint32](cast[uint](assocBodyPtr) + 4)[])
+                 assocTraceWord0,
+                 assocTraceWord1)
   nimFwTrace2U32("[WIFI-NIMFW] assoc_tx_rates ",
                  cast[ptr uint32](addr vif.basicRates[0])[],
                  cast[ptr uint32](addr vif.basicRates[4])[])
   when defined(bl808WifiConnectTrace):
     nimFwConnectTrace2U32("[WIFI-CT] assoc_tx_len ", builtLen, assocBodyLen.uint32)
     nimFwConnectTrace2U32("[WIFI-CT] assoc_tx_body ",
-                          cast[ptr uint32](assocBodyPtr)[],
-                          cast[ptr uint32](cast[uint](assocBodyPtr) + 4)[])
+                          assocTraceWord0,
+                          assocTraceWord1)
     nimFwConnectTrace2U32("[WIFI-CT] assoc_tx_rates ",
                           cast[ptr uint32](addr vif.basicRates[0])[],
                           cast[ptr uint32](addr vif.basicRates[4])[])
     nimFwConnectTraceHw("[WIFI-CT] assoc_hw ")
+
+  when defined(bl808WifiUseBl808Rf):
+    rfPriApplyWb03AuthTxLatches()
+    rfPriCaptureWb03AuthTxPrePush()
 
   # Push frame to TX (blob: txl_frame_push(frame, 3))
   txl_frame_push(frame, 3)
@@ -13214,7 +21137,7 @@ proc sm_assoc_req_send*(param: pointer) {.exportc, cdecl.} =
   # Set timeout timer
   let tmo = if sm.connectFlags != 0: 0x1E000'u32 else: 0x7D000'u32
   ke_timer_set(SM_RSP_TIMEOUT_IND, TASK_SM, tmo)
-  ke_state_set(TASK_SM, SmAssocRspState)
+  ke_state_set(TASK_SM, SmAuthenticatingState)
 
 proc sm_assoc_req_send_pre*(param: pointer) {.exportc, cdecl.} =
   ## Pre-send association request.
@@ -13287,6 +21210,10 @@ proc sm_auth_handler*(param: pointer) {.exportc, cdecl.} =
   let smConnInfo = smEnvView().connectInfo
 
   let statusCode = frame.statusCode
+  inc nimFwDbgAuthHandler
+  nimFwDbgAuthHandlerLast =
+    frame.authAlgo.uint32 or (frame.authSeq.uint32 shl 16) or
+      (statusCode.uint32 shl 24)
   when defined(bl808WifiConnectTrace):
     let authAlgoDbg = frame.authAlgo
     let authSeqDbg = frame.authSeq
@@ -13362,6 +21289,7 @@ proc sm_auth_handler*(param: pointer) {.exportc, cdecl.} =
       # Open System: clear auth state, proceed to association
       if smConnInfo != nil:
         connectInfoAuthRetry(smConnInfo)[] = 0
+      inc nimFwDbgAuthOpenSuccess
       sm_assoc_req_send_pre(param)
       return
     if authAlgo == 1:
@@ -13404,10 +21332,9 @@ proc sm_assoc_rsp_handler*(param: pointer) {.exportc, cdecl.} =
   let sm = smEnvView()
   let connInfo = sm.connectInfo
   let ci = connectInfoView(connInfo)
-  let vifTab = cast[uint](addr vif_info_tab[0])
 
   let vifIdx = ci.vifIdx
-  let vifEntry = vifTab + vifIdx.uint * VIF_ENTRY_SIZE.uint
+  let vif = vifChannelForIdx(vifIdx)
 
   # Read sm_env secondary struct
   let smEnvSecond = sm.connectIndMsg
@@ -13450,18 +21377,15 @@ proc sm_assoc_rsp_handler*(param: pointer) {.exportc, cdecl.} =
       if frameLen > 6:
         let iePtr = mac_ie_find(assocBody, (frameLen - 6).uint32, 56)
         if iePtr != nil:
-          let ouiType = cast[ptr uint8](cast[uint](iePtr) + 1)[]
-          if ouiType == 5:
-            let ouiSubtype = cast[ptr uint8](cast[uint](iePtr) + 2)[]
-            if ouiSubtype == 3:
+          let timeoutIe = timeoutIntervalIeAt(iePtr)
+          if timeoutIe.ie.len == 5:
+            if timeoutIe.intervalType == 3:
               # Clear SM connect info offset 60 and schedule the retry.
               connectInfoAuthRetry(connInfo)[] = 0
-              let retryBytes3 = cast[ptr uint8](cast[uint](iePtr) + 3)[]
-              let retryBytes4 = cast[ptr uint8](cast[uint](iePtr) + 4)[]
-              let retryBytes5 = cast[ptr uint8](cast[uint](iePtr) + 5)[]
-              let timerMs = ((retryBytes5.uint32 shl 16) or
-                             (retryBytes4.uint32 shl 8) or
-                             retryBytes3.uint32) shl 10
+              let retry = timeoutIe.intervalValue
+              let timerMs = ((retry[2].uint32 shl 16) or
+                             (retry[1].uint32 shl 8) or
+                             retry[0].uint32) shl 10
               ke_timer_set(smTimerIdEarly, TASK_SM, timerMs.uint16)
               return
     # Report failure: status code != 0.  The blob uses the printf-style slot
@@ -13481,28 +21405,24 @@ proc sm_assoc_rsp_handler*(param: pointer) {.exportc, cdecl.} =
     nimFwConnectTrace2U32("[WIFI-CT] assoc_rsp_aid ", aid.uint32,
                           connectInfoAuthRetry(connInfo)[].uint32)
 
-  # Build and send ME_STA_ADD_REQ
-  let staBase = cast[uint](addr sta_info_tab[0])
-  let staEntrySize = STA_ENTRY_SIZE.uint
-
   # Store association response IE diagnostics in the connect indication.
   # Layout: +16 assoc_req_ie_len, +18 assoc_rsp_ie_len, +20 assoc IE buffer.
   # The blob copies response IEs after the request IEs; it does not synthesize
   # the later AID field here.
   if smEnvSecond != nil:
-    let smSec = cast[uint](smEnvSecond)
+    let ind = smConnectIndPayloadAt(smEnvSecond)
     let rspIeLen = if frameLen > 6: frameLen - 6 else: 0'u16
-    let reqIeLen = cast[ptr uint16](smSec + 16)[]
-    cast[ptr uint16](smSec + 18)[] = rspIeLen
+    let reqIeLen = ind.assocReqIeLen
+    ind.assocRspIeLen = rspIeLen
     if rspIeLen != 0 and reqIeLen.uint + rspIeLen.uint <= 800'u:
-      discard c_memcpy(cast[pointer](smSec + 20'u + reqIeLen.uint),
+      discard c_memcpy(addr ind.assocIeBuffer[reqIeLen.int],
                        assocBody,
                        rspIeLen.csize_t)
 
   # Blob: sm_assoc_done — mark association complete (offset 0xB6)
   when defined(bl808WifiConnectTrace):
     nimFwConnectTrace2U32("[WIFI-CT] assoc_rsp_before_done ", vifIdx.uint32,
-                          cast[uint32](vifEntry))
+                          pointerAddrU32(cast[pointer](vif)))
   sm_assoc_done(aid)
   when defined(bl808WifiConnectTrace):
     nimFwConnectTrace2U32("[WIFI-CT] assoc_rsp_after_done ", ke_state_get(TASK_SM).uint32,
@@ -13510,13 +21430,11 @@ proc sm_assoc_rsp_handler*(param: pointer) {.exportc, cdecl.} =
 
   # Blob: me_init_rate — initialize rate control for the associated STA
   # recorded in the VIF entry.
-  let vif = vifChannelAt(vifEntry)
   let staIdx = vif.staIdx
+  let staEntry = cast[pointer](staInfoForIdx(staIdx))
   when defined(bl808WifiConnectTrace):
-    let staDbgAddr = staBase + staIdx.uint * staEntrySize
     nimFwConnectTrace2U32("[WIFI-CT] assoc_rsp_before_rate ", staIdx.uint32,
-                          cast[uint32](staDbgAddr))
-  let staEntry = cast[pointer](staBase + staIdx.uint * staEntrySize)
+                          pointerAddrU32(staEntry))
   me_init_rate(staEntry)
   when defined(bl808WifiConnectTrace):
     nimFwConnectTrace2U32("[WIFI-CT] assoc_rsp_after_rate ", staIdx.uint32,
@@ -13525,7 +21443,8 @@ proc sm_assoc_rsp_handler*(param: pointer) {.exportc, cdecl.} =
   # Blob: tpc_update_vif_tx_power — update TX power after association (offset 0xFA)
   let chanPtr = vif.operChan
   if chanPtr != nil:
-    var tpcPower: uint8 = cast[ptr uint8](cast[uint](chanPtr) + 4)[]
+    let chan = cast[ptr ScanChannelEntry](chanPtr)
+    var tpcPower: uint8 = cast[ptr uint8](addr chan.txPower)[]
     var tpcRate: uint8
     when defined(bl808WifiConnectTrace):
       nimFwConnectTrace2U32("[WIFI-CT] assoc_rsp_before_tpc ", cast[uint32](cast[uint](chanPtr)),
@@ -13546,7 +21465,7 @@ proc sm_assoc_rsp_handler*(param: pointer) {.exportc, cdecl.} =
     let wpsCbs = wps_cbs
     if wpsCbs != nil:
       # Call wps callback offset 12
-      let wpsStaAddCb = cast[ptr pointer](cast[uint](wpsCbs) + 12)[]
+      let wpsStaAddCb = wpsCallbacks().staAddConfirm
       if wpsStaAddCb != nil:
         cast[proc(){.cdecl.}](wpsStaAddCb)()
 
@@ -13558,13 +21477,11 @@ proc sm_deauth_handler*(param: pointer) {.exportc, cdecl.} =
   let deauth = smDeauthFrameView(param)
   let vifIdx = deauth.vifIdx
   let sm = smEnvView()
-  let vifBase = cast[uint](addr vif_info_tab[0])
-  let vifE = vifBase + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let vif = vifChannelAt(vifE)
+  let vif = vifChannelForIdx(vifIdx)
 
-  # Validate BSSID: param[48..53] vs vif+380..385
+  # Validate BSSID: param[48..53] vs vif.bssid.
   for i in 0 ..< 6:
-    if deauth.bssid[i] != cast[ptr uint8](vifE + 380 + i.uint)[]:
+    if deauth.bssid[i] != vif.bssid[i]:
       # BSSID mismatch - blob logs debug with line 1503 and returns 0
       return
 
@@ -13632,7 +21549,7 @@ proc sm_deauth_handler*(param: pointer) {.exportc, cdecl.} =
     if logFn != nil:
       cast[PlatformLogFunc](logFn)(3, 0, nil, 0, reason.uint32, 0, 0)
     # 3. Call sm_disconnect_process(vifEntry, 7, reason)
-    sm_disconnect_process(cast[pointer](vifE), 7, reason)
+    sm_disconnect_process(cast[pointer](vif), 7, reason)
 
 proc sm_get_set_machwkey_index*(getFlag: uint32, vifIdx: uint32, keyBuf: pointer, keyType: uint32): uint8 {.exportc, cdecl, noinline.} =
   ## Get/set MAC HW key index for SM.
@@ -13652,22 +21569,15 @@ proc sm_get_set_machwkey_index*(getFlag: uint32, vifIdx: uint32, keyBuf: pointer
   if vifIdx > 1:
     return 0xFF'u8
 
-  let vifBase = cast[uint](addr vif_info_tab[0])
-  let vifEntry = vifBase + vifIdx * VIF_ENTRY_SIZE.uint
+  let vif = vifChannelForIdx(vifIdx.uint8)
+  let indexes = vifMachwKeyIndexes(vif)
 
-  # Determine key byte offset within VIF entry based on keyType
-  # From VIF layout: key indices are stored in the security area
-  # keyType 0 -> offset 172 (primary pairwise key index)
-  # keyType 1 -> offset 173 (secondary pairwise key index)
-  # keyType 2 -> offset 174 (group key index)
-  var keyOffset: uint
+  var keyAddr: ptr uint8
   case keyType
-  of 0: keyOffset = 172
-  of 1: keyOffset = 173
-  of 2: keyOffset = 174
+  of 0: keyAddr = addr indexes.primaryPairwise
+  of 1: keyAddr = addr indexes.secondaryPairwise
+  of 2: keyAddr = addr indexes.group
   else: return 0xFF'u8
-
-  let keyAddr = cast[ptr uint8](vifEntry + keyOffset)
 
   if getFlag == 0:
     # SET: write from keyBuf to vif entry
@@ -13702,7 +21612,7 @@ proc sm_handle_eapol_input*(staIdx: uint8, srcAddr: pointer, eapolBuf: pointer,
   if smEnvView().state == 2:
     # WPS mode: dispatch to WPS callback
     if wps_cbs != nil:
-      let wpsHandler = cast[ptr pointer](cast[uint](wps_cbs) + 4)[]
+      let wpsHandler = wpsCallbacks().eapolHandler
       if cast[uint](wpsHandler) > 0x1000'u:
         cast[proc(src: pointer, buf: pointer, len: uint32) {.cdecl.}](wpsHandler)(
           srcAddr, eapolBuf, eapolLen)
@@ -13715,7 +21625,7 @@ proc sm_handle_eapol_input*(staIdx: uint8, srcAddr: pointer, eapolBuf: pointer,
   if smState == SM_ACTIVATING_STATE:
     # In activating state: forward to WPA supplicant
     if wpa_cbs != nil:
-      let wpaHandler = cast[ptr pointer](cast[uint](wpa_cbs) + 20)[]
+      let wpaHandler = wpaCallbacks().eapolHandler
       if cast[uint](wpaHandler) > 0x1000'u:
         inc nimFwDbgEapolCbInv
         cast[proc(src: pointer, buf: pointer, len: uint32) {.cdecl.}](wpaHandler)(
@@ -13739,7 +21649,6 @@ proc sm_handle_supplicant_result*(result_code: uint8, reason: uint8) {.exportc, 
   ## Otherwise: transitions SM state to disconnecting, allocates TX frame via txl_frame_get(512),
   ## builds deauth frame with VIF info, calls me_build_deauthenticate, then
   ## txl_frame_push to transmit. On failure, calls sm_connect_ind(9/10, reason).
-  let vifTab = cast[uint](addr vif_info_tab[0])
   let sta = staInfoForIdx(result_code)
 
   # Check SM task state
@@ -13778,52 +21687,47 @@ proc sm_handle_supplicant_result*(result_code: uint8, reason: uint8) {.exportc, 
     return
 
   let vifIdx = sta.instNbr
-  let vifEntryBase = vifTab + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  tpc_update_frame_tx_power(cast[pointer](vifEntryBase), frame)
+  let vif = vifChannelForIdx(vifIdx)
+  tpc_update_frame_tx_power(cast[pointer](vif), frame)
 
-  let linkDesc = cast[ptr pointer](cast[uint](frame) + 108)[]
-  if linkDesc == nil:
+  let desc = hostTxDescAt(frame)
+  if desc.bufDesc == nil:
     sm_connect_ind(10, reason.uint16)
     return
-  let linkU = cast[uint](linkDesc)
+  let link = hostTxLinkDescAt(desc.bufDesc)
+  let hdr = hostTxDataHeader(desc)
 
-  # Build MAC header for deauth frame
-  # Set subtype/type at sta+348..351
-  let frameHdrBase = linkU
-  cast[ptr uint8](frameHdrBase + 348)[] = 0xC0'u8  # deauth frame type
-  cast[ptr uint8](frameHdrBase + 349)[] = 0
-  cast[ptr uint8](frameHdrBase + 350)[] = 0
-  cast[ptr uint8](frameHdrBase + 351)[] = 0
+  # Build MAC header for deauth frame.
+  hdr.frameControl = 0x00C0'u16
+  hdr.duration = 0
 
   # Copy addresses (DA=BSSID, SA=own MAC, BSSID)
-  discard c_memcpy(cast[pointer](frameHdrBase + 352),
+  discard c_memcpy(addr hdr.addr1[0],
                    cast[pointer](addr sta.macAddr[0]), 6.csize_t)
-  discard c_memcpy(cast[pointer](frameHdrBase + 358),
-                   cast[pointer](vifEntryBase + 80), 6.csize_t)
-  discard c_memcpy(cast[pointer](frameHdrBase + 364),
+  discard c_memcpy(addr hdr.addr2[0],
+                   addr vif.macAddr[0], 6.csize_t)
+  discard c_memcpy(addr hdr.addr3[0],
                    cast[pointer](addr sta.macAddr[0]), 6.csize_t)
 
-  # Get sequence control (blob: txl_get_seq_ctrl)
+  # Get sequence control (blob: txl_get_seq_ctrl).
   let seqCtrl = txl_get_seq_ctrl()
-  cast[ptr uint8](frameHdrBase + 370)[] = (seqCtrl and 0xFF).uint8
-  cast[ptr uint8](frameHdrBase + 371)[] = ((seqCtrl shr 8) and 0xFF).uint8
+  hdr.seqCtrl = seqCtrl
 
   # Register TX-completion callback. Blob: `addi a5, s1, 128; sw &cfm, 80(a5);
   # sw vif, 84(a5)` — i.e. frame+208 = &sm_supplicant_deauth_cfm,
   # frame+212 = &vif_entry.
-  cast[ptr pointer](cast[uint](frame) + 208)[] = cast[pointer](sm_supplicant_deauth_cfm)
-  cast[ptr pointer](cast[uint](frame) + 212)[] = cast[pointer](vifEntryBase)
-  cast[ptr uint8](cast[uint](frame) + 47)[] = vifIdx
-  cast[ptr uint8](cast[uint](frame) + 49)[] = result_code
+  desc.callback = cast[pointer](sm_supplicant_deauth_cfm)
+  desc.callbackArg = cast[pointer](vif)
+  desc.vifIdx = vifIdx
+  desc.staInfoIdx = result_code
 
   # Build deauthenticate body
-  let bodyPtr = cast[pointer](frameHdrBase + 372)
+  let bodyPtr = cast[pointer](addr link.macHeader[sizeof(MacDataFrameHeaderView)])
   let bodyLen = me_build_deauthenticate(bodyPtr, reason.uint16)
 
   # Update THD length fields.
-  let thdPtr = cast[ptr pointer](cast[uint](frame) + 112)[]
-  let thdU = cast[uint](thdPtr)
-  let payloadStart = cast[ptr uint32](thdU + 20)[]
+  let thd = hostTxHwDescAt(desc.hwDesc)
+  let payloadStart = thd.payloadStart
   when defined(bl808WifiConnectTrace):
     nimFwConnectTrace2U32("[WIFI-CT] supp_deauth ",
                           reason.uint32 or (result_code.uint32 shl 8) or
@@ -13831,9 +21735,9 @@ proc sm_handle_supplicant_result*(result_code: uint8, reason: uint8) {.exportc, 
                           cast[uint32](cast[uint](frame)))
     nimFwConnectTrace2U32("[WIFI-CT] supp_thd ",
                           payloadStart,
-                          cast[uint32](linkU + 348))
-  cast[ptr uint32](thdU + 24)[] = payloadStart + 23 + bodyLen
-  cast[ptr uint32](thdU + 28)[] = bodyLen + 28
+                          cast[uint32](cast[uint](addr link.macHeader[0])))
+  thd.payloadEnd = payloadStart + 23 + bodyLen
+  thd.frameLen = bodyLen + 28
 
   # Push frame for TX (tail call in blob)
   txl_frame_push(frame, 3)
@@ -13851,47 +21755,38 @@ proc sm_send_sa_query*(vifIdx: uint8, transId: uint16, isTx: uint8) {.exportc, c
   ##   Builds MAC header: FC=0xD0 (action), addresses from STA/VIF
   ##   Body: category=8 (SA Query), action=0/1, transId
   ##   Updates frame lengths and pushes via txl_frame_push(desc, 3)
-  let vifBase = cast[uint](addr vif_info_tab[0])
   let sta = staInfoForIdx(vifIdx)
-  let vifEntry = vifBase + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let vif = vifChannelAt(vifEntry)
+  let vif = vifChannelForIdx(vifIdx)
   let staFormatMod = sta.instNbr
-  let staMacAddr = cast[pointer](addr sta.macAddr[0])
-  let vifMacAddr = cast[pointer](addr vif.macAddr[0])
   # Allocate frame (512 bytes payload capacity)
   let frame = txl_frame_get(512)
   if frame == nil:
     return
   let desc = hostTxDescAt(frame)
-  # Build MAC header at linkDesc+348
-  let macHdr = hostTxMacHdrAddr(desc)
+  let link = hostTxLinkDescAt(desc.bufDesc)
+  let hdr = hostTxDataHeader(desc)
   # Frame Control: 0xD0 = management, action frame
-  cast[ptr uint8](macHdr)[] = 0xD0'u8
-  cast[ptr uint8](macHdr + 1)[] = 0x00'u8
-  cast[ptr uint8](macHdr + 2)[] = 0x00'u8  # duration
-  cast[ptr uint8](macHdr + 3)[] = 0x00'u8
+  hdr.frameControl = 0x00D0'u16
+  hdr.duration = 0
   # Addr1 (RA) = STA MAC (BSSID)
-  discard c_memcpy(cast[pointer](macHdr + 4), staMacAddr, 6.csize_t)
+  discard c_memcpy(addr hdr.addr1[0], addr sta.macAddr[0], 6.csize_t)
   # Addr2 (SA) = VIF MAC
-  discard c_memcpy(cast[pointer](macHdr + 10), vifMacAddr, 6.csize_t)
+  discard c_memcpy(addr hdr.addr2[0], addr vif.macAddr[0], 6.csize_t)
   # Addr3 (BSSID) = STA MAC
-  discard c_memcpy(cast[pointer](macHdr + 16), staMacAddr, 6.csize_t)
+  discard c_memcpy(addr hdr.addr3[0], addr sta.macAddr[0], 6.csize_t)
   # Generate sequence number (blob: txl_get_seq_ctrl)
   let seqCtrl = txl_get_seq_ctrl()
-  cast[ptr uint8](macHdr + 22)[] = (seqCtrl and 0xFF).uint8
-  cast[ptr uint8](macHdr + 23)[] = ((seqCtrl shr 8) and 0xFF).uint8
+  hdr.seqCtrl = seqCtrl
   # SA Query body at linkDesc+348+24 = linkAddr+372
   # The body offset depends on frame header: 24-byte header for non-QoS mgmt
-  let bodyBase = macHdr + 24  # offset from MAC header start
   let bodyOff = desc.hdrLen  # header length
-  let realBody = macHdr + bodyOff.uint
+  let body = saQueryActionBodyAt(addr link.macHeader[bodyOff])
   # Category = 8 (SA Query)
-  cast[ptr uint8](realBody)[] = 8
+  body.category = 8
   # Action = isTx (0=request, 1=response)
-  cast[ptr uint8](realBody + 1)[] = isTx
+  body.action = isTx
   # Transaction ID (2 bytes)
-  cast[ptr uint8](realBody + 2)[] = (transId and 0xFF).uint8
-  cast[ptr uint8](realBody + 3)[] = ((transId shr 8) and 0xFF).uint8
+  body.transId = transId
   # Update frame lengths
   let totalHdrLen = bodyOff.uint32
   let bodyLen = 4'u32  # category + action + transId(2)
@@ -13905,9 +21800,9 @@ proc sm_send_sa_query*(vifIdx: uint8, transId: uint16, isTx: uint8) {.exportc, c
   desc.hdrLen = 0  # clear
   desc.secTailLen = 0  # clear
   # Apply mgmt frame protection (blob: txu_cntrl_protect_mgmt_frame)
-  txu_cntrl_protect_mgmt_frame(frame, cast[pointer](macHdr), 0)
+  txu_cntrl_protect_mgmt_frame(frame, cast[pointer](hdr), 0)
   # Apply TX power control (blob: tpc_update_frame_tx_power)
-  tpc_update_frame_tx_power(cast[pointer](vifEntry), frame)
+  tpc_update_frame_tx_power(cast[pointer](vif), frame)
   # Push frame for TX on AC 3 (VO)
   txl_frame_push(frame, 3)
 
@@ -13925,9 +21820,7 @@ proc sm_sa_query_handler*(param: pointer) {.exportc, cdecl.} =
   ## timer and resets state.
   let frame = smSaQueryFrameView(param)
   let vifIdx = frame.vifIdx
-  let vifBase = cast[uint](addr vif_info_tab[0])
-  let vifEntry = vifBase + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let vif = vifChannelAt(vifEntry)
+  let vif = vifChannelForIdx(vifIdx)
   # Check VIF active
   let active = vif.state
   if active == 0:
@@ -13984,9 +21877,9 @@ proc sm_issue_sa_query_request*() {.exportc, cdecl.} =
 proc sm_set_channel_coex_connected*(channel: uint8) {.exportc, cdecl.} =
   ## Set channel coexistence info after connection (10 instrs).
   ## From blob: loads primary freq from sm_env+32, center freq from sm_env+34,
-  ## then tail-calls phy_set_channel(0, 0, primFreq, centerFreq, 0, 0).
+  ## then applies the PHY channel descriptor for the STA channel.
   let sm = smEnvView()
-  phy_set_channel(0, 0, sm.primaryFreq, sm.centerFreq, 0, 0)
+  phySetChannel(0, 0, sm.primaryFreq, sm.centerFreq, 0, 0)
 
 proc sm_connection_tlv_set*(id: uint8, data: pointer, len: uint16) {.exportc, cdecl, noinline.} =
   ## Set a TLV in the connection data chain.
@@ -14030,21 +21923,20 @@ proc sm_connection_sta_add_ind*(param: pointer) {.exportc, cdecl.} =
   if msg == nil:
     return
   # Copy VIF index from sm_env connection info
-  let vifBase = cast[uint](addr vif_info_tab[0])
   let vifIdx = ci.vifIdx
   msg.vifIdx = vifIdx
   # Get VIF entry and copy the associated STA index
-  let vifEntry = vifBase + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let staIdx = vifChannelAt(vifEntry).staIdx
+  let vif = vifChannelForIdx(vifIdx)
+  let staIdx = vif.staIdx
   msg.staIdx = staIdx
   # Copy WPA flag (VIF+484 bit 0)
-  let wpaFlags = vifApConfigAt(vifEntry).securityFlags
+  let wpaFlags = vifApConfig(vif).securityFlags
   msg.wpa = (wpaFlags and 1).uint8
   when defined(bl808WifiConnectTrace):
     nimFwConnectTrace2U32("[WIFI-CT] sta_add_ind ",
                           vifIdx.uint32 or (staIdx.uint32 shl 8) or
                             ((wpaFlags and 1).uint32 shl 16),
-                          vifSecurityAt(vifEntry).connected.uint32)
+                          vifSecurity(vif).connected.uint32)
   ke_msg_send(msg)
 
 proc sm_connect_auth_assoc_req() {.exportc, cdecl.} =
@@ -14117,8 +22009,7 @@ proc apm_start_cfm*(param: pointer) {.exportc, cdecl.} =
   if status == 0:
     # --- Success path ---
     let vifIdx = apInfo.vifIdx
-    let vifEntry = vifEntryAddr(vifIdx)
-    let vif = vifChannelAt(vifEntry)
+    let vif = vifChannelForIdx(vifIdx)
     let selfStaIdx = vifIdx + 5  # Self-STA index = vifIdx + NX_REMOTE_STA_MAX
 
     # 1. Send MM_SET_VIF_STATE_REQ to activate VIF
@@ -14131,7 +22022,7 @@ proc apm_start_cfm*(param: pointer) {.exportc, cdecl.} =
       ke_msg_send(msg2)
 
     # 2. Copy beacon-related fields from connect info to VIF entry
-    vifKeyPointersAt(vifEntry).flags = apInfo.beaconRateInfo
+    vifKeyPointers(vif).flags = apInfo.beaconRateInfo
     vif.psBaCounter = 0
     vif.apStartBeaconInterval = apInfo.vifBeaconInterval
 
@@ -14263,10 +22154,8 @@ proc apm_set_bss_param*(param: pointer) {.exportc, cdecl.} =
   let apm = apmEnvView()
   let connInfo = apm.connectInfo
   let apInfo = apmStartInfoView(connInfo)
-  let vifTab = cast[uint](addr vif_info_tab[0])
   let vifIdx = apInfo.vifIdx
-  let vifEntry = vifTab + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let vif = vifChannelAt(vifEntry)
+  let vif = vifChannelForIdx(vifIdx)
   let apmListPtr = addr apm.pendingBssParams
 
   template pushMsg(msg: pointer) =
@@ -14350,7 +22239,6 @@ proc apm_bcn_set*(param: pointer) {.exportc, cdecl.} =
   let connInfo = apm.connectInfo
   if connInfo == nil: return
   let apInfo = apmStartInfoView(connInfo)
-  let vifTabBase = cast[uint](addr vif_info_tab[0])
 
   # Compute paramLen from beacon length + 12 (header)
   let bcnLen = apInfo.beaconLength
@@ -14369,10 +22257,10 @@ proc apm_bcn_set*(param: pointer) {.exportc, cdecl.} =
 
   # Look up VIF entry for beacon buffer copy
   let instNbr = apInfo.vifIdx
-  let vifEntry = vifTabBase + instNbr.uint * VIF_ENTRY_SIZE.uint
+  let vif = vifChannelForIdx(instNbr)
 
   # Check if embedded AP mode is enabled (blob: apm_embedded_enabled at 0x66)
-  let embEnabled = apm_embedded_enabled(cast[pointer](vifEntry))
+  let embEnabled = apm_embedded_enabled(cast[pointer](vif))
   if embEnabled:
     # Blob copies the separately allocated beacon buffer at apm_env+16 into
     # the MM request, frees it through g_bl_ops_funcs[188], then clears it.
@@ -14457,8 +22345,8 @@ proc apm_sta_fw_delete*(staIdx: uint8, vifIdx: uint8, reason: uint16) {.exportc,
   ## Delete station from firmware tables (28 bytes in blob, 8 instrs).
   ## From blob: tail-calls apm_sta_delete with packed ABI:
   ##   a0=staIdx, a1=sta_info_tab+4+staIdx*368 (MAC addr), a2=vifIdx, a3=reason.
-  let staBase = cast[uint](addr sta_info_tab[0])
-  let staMacAddr = staBase + 4 + staIdx.uint * STA_ENTRY_SIZE.uint
+  let sta = staInfoForIdx(staIdx)
+  let staMacAddr = cast[pointer](addr sta.macAddr[0])
   # Pass a1=macAddr, a2=vifIdx, a3=reason to apm_sta_delete (which reads them via asm)
   {.emit: ["asm volatile(\"mv a1, %0\" : : \"r\"(", staMacAddr, ") );"].}
   {.emit: ["asm volatile(\"mv a2, %0\" : : \"r\"(", vifIdx, ") );"].}
@@ -14476,17 +22364,16 @@ proc apm_probe_req_handler*(param: pointer) {.exportc, cdecl.} =
   ## Finally tail-calls apm_send_mlme to send probe response.
   let req = apmProbeReqView(param)
   let vifIdx = req.vifIdx
-  let vifBase = cast[uint](addr vif_info_tab[0])
-  var vifEntry: uint
-  if vifIdx == 0xFF:
-    # Search for AP VIF
-    let apVif = vif_mgmt_get_first_ap_inf()
-    if apVif == nil:
-      return
-    vifEntry = cast[uint](apVif)
-  else:
-    vifEntry = vifBase + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let vif = vifChannelAt(vifEntry)
+  let vif =
+    if vifIdx == 0xFF:
+      # Search for AP VIF
+      let apVif = vif_mgmt_get_first_ap_inf()
+      if apVif == nil:
+        return
+      vifChannelAt(apVif)
+    else:
+      vifChannelForIdx(vifIdx)
+  let apSsid = vifApProbeSsid(vif)
   # Check VIF is active and has channel context
   let active = vif.state
   if active == 0:
@@ -14501,31 +22388,28 @@ proc apm_probe_req_handler*(param: pointer) {.exportc, cdecl.} =
   # Use mac_ie_find with the available frame info
   let ssidIe = mac_ie_find(bodyPtr, bodyLen.uint32, 0)
   if ssidIe != nil:
-    let ssidIeAddr = cast[uint](ssidIe)
-    let ieLen = cast[ptr uint8](ssidIeAddr + 1)[]
+    let ssid = cast[ptr MacIeView](ssidIe)
+    let ieLen = ssid.len
     if ieLen != 0:
-      # Compare SSID against AP's SSID (at vifEntry+386=SSID len, +387=SSID data)
-      let apSsidLen = vif.supportedRatesLong[0]
+      let apSsidLen = apSsid.ssidLen
       if ieLen != apSsidLen:
         return
-      let result = c_memcmp(cast[pointer](ssidIeAddr + 2),
-                            cast[pointer](addr vif.supportedRatesLong[1]), ieLen.csize_t)
+      let result = c_memcmp(cast[pointer](addr ssid.macIePayload[0]),
+                            cast[pointer](addr apSsid.ssidData[0]), ieLen.csize_t)
       if result != 0:
         return
   else:
-    # No SSID IE: check if hidden SSID mode (vifEntry+385)
-    let hiddenFlag = cast[ptr uint8](vifEntry + 385)[]
-    if hiddenFlag != 0:
+    if apSsid.hiddenSsidMode != 0:
       return
   # Check supported rates (IE ID=1) for band compatibility
   let ratesIe = mac_ie_find(bodyPtr, bodyLen.uint32, 1)
   if ratesIe != nil:
-    let ratesAddr = cast[uint](ratesIe)
-    let rateVal = cast[ptr uint8](ratesAddr + 2)[]
-    # Check rate table from vifEntry+424
-    let rateInfo = vifChannelAt(vifEntry).operChan
+    let rates = cast[ptr MacIeView](ratesIe)
+    let rateVal = rates.macIePayload[0]
+    let rateInfo = vif.operChan
     if rateInfo != nil:
-      let band = cast[ptr uint8](cast[uint](rateInfo) + 2)[]
+      let chan = cast[ptr ScanChannelEntry](rateInfo)
+      let band = chan.band
       # Perform rate/band compatibility check
       if band == 0:
         # 2.4GHz: check basic rate range (blob computes rate offset and divides by 5)
@@ -14539,7 +22423,7 @@ proc apm_probe_req_handler*(param: pointer) {.exportc, cdecl.} =
           return
   # Send probe response: tail-call apm_send_mlme
   # Args: a0=vifEntry, a1=0x50(probe_resp subtype), a2=param+42(src addr), a3..a5=0
-  apm_send_mlme(cast[pointer](vifEntry), 0x50'u16,
+  apm_send_mlme(cast[pointer](vif), 0x50'u16,
                 cast[pointer](addr req.staMac[0]), nil, nil, nil)
 
 proc apm_auth_handler*(param: pointer) {.exportc, cdecl.} =
@@ -14547,20 +22431,19 @@ proc apm_auth_handler*(param: pointer) {.exportc, cdecl.} =
   ## a0 = RX frame descriptor (param).
   ## Flow:
   ##   1. Read vifIdx from param[8]; if 0xFF, return.
-  ##   2. Compute VIF entry: vif_info_tab + vifIdx * 1512.
+  ##   2. Get VIF entry from the typed VIF table overlay.
   ##   3. Get STA MAC from param+42.
   ##   4. Look up station by MAC; if not found, try to add one.
   ##   5. Check how many STAs are associated. If > 1, update VIF[338] (STA count)
   ##      and ensure channel context via vif[64].
-  ##   6. Tail-call apm_send_mlme(vifEntry, 0xB0, macAddr, nil, nil, nil) to send
+  ##   6. Tail-call apm_send_mlme(vif, 0xB0, macAddr, nil, nil, nil) to send
   ##      auth response (frame type 0xB0 = authentication = 176).
   let rx = apmRxMgmtPrefix(param)
   let vifIdx = rx.vifIdx
   if vifIdx == 0xFF:
     return
 
-  let vifBase = cast[uint](addr vif_info_tab[0])
-  let vifEntry = vifBase + vifIdx.uint * VIF_ENTRY_SIZE.uint
+  let vif = vifChannelForIdx(vifIdx)
   let staMac = cast[pointer](addr rx.staMac[0])
 
   # Look up STA by MAC address via HW search
@@ -14573,13 +22456,12 @@ proc apm_auth_handler*(param: pointer) {.exportc, cdecl.} =
   # Get channel context count
   let ctxtCnt = chan_ctxt_cnt()
   if ctxtCnt > 1:
-    let vif = vifChannelAt(vifEntry)
     let chanCtxt = vif.chanCtxt
     vif.apChanSwitchPending = 1
     chan_ctxt_trigger(chanCtxt)
 
   # Send authentication response frame: tail-call apm_send_mlme
-  apm_send_mlme(cast[pointer](vifEntry), 0xB0, staMac, nil, nil, nil)
+  apm_send_mlme(cast[pointer](vif), 0xB0, staMac, nil, nil, nil)
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void apm_assoc_req_handler(void*,unsigned long);".}
 proc apm_assoc_req_handler*(param: pointer, reassoc: uint32 = 0) {.exportc, cdecl.} =
@@ -14647,11 +22529,9 @@ proc apm_assoc_req_handler*(param: pointer, reassoc: uint32 = 0) {.exportc, cdec
     iePtr = cast[pointer](addr rx.bodyPrefix[0])
     ieLen = if totalIeLen > 28: totalIeLen.uint32 - 28 else: 0'u32
 
-  let vifBase = cast[uint](addr vif_info_tab[0])
-  let vifOff = vifIdx.uint * VIF_ENTRY_SIZE
-  let vif = vifBase + vifOff
-  let vifView = vifChannelAt(vif)
-  let vifMaxRate = cast[ptr uint16](vif + 518)[]
+  let vifView = vifChannelForIdx(vifIdx)
+  let apCfg = vifApConfig(vifView)
+  let vifMaxRate = apCfg.maxAssocRate
 
   var status: uint8 = 0
 
@@ -14660,10 +22540,10 @@ proc apm_assoc_req_handler*(param: pointer, reassoc: uint32 = 0) {.exportc, cdec
   if ssidIe != nil:
     let ssid = cast[ptr MacIeView](ssidIe)
     let ssidLen = ssid.len
-    let vifSsidLen = cast[ptr uint8](vif + 520)[]
+    let vifSsidLen = apCfg.privacyFlag
     if ssidLen != vifSsidLen or
        c_memcmp(cast[pointer](ssid.macIePayload),
-                cast[pointer](vif + 521), ssidLen.csize_t) != 0:
+                cast[pointer](addr apCfg.ssidData[0]), ssidLen.csize_t) != 0:
       status = 12  # SSID mismatch
 
   # Parse Supported Rates (id=1) and check against VIF max
@@ -14747,7 +22627,7 @@ proc apm_assoc_req_handler*(param: pointer, reassoc: uint32 = 0) {.exportc, cdec
   # mac_ie_find/mac_vsie_find) but does NOT memcmp the IE body against
   # the VIF template. Removing the spurious memcmp to match blob's
   # 3-site memcmp count.
-  if vifChannelAt(vif).securityTimer.link.next != nil:
+  if vifView.securityTimer.link.next != nil:
     let rsnIe = mac_ie_find(iePtr, ieLen, 48)
     if rsnIe == nil:
       let wpaOui = cast[pointer](addr WPA_OUI[0])
@@ -14822,7 +22702,7 @@ proc apm_assoc_req_handler*(param: pointer, reassoc: uint32 = 0) {.exportc, cdec
   # Send association/reassociation response via apm_send_mlme (blob: call at 0x23E)
   # Blob always sends regardless of status; passes apm_tx_cfm_handler as callback
   # and msg as callbackArg. The TX confirm handler sends or frees the msg.
-  let vifPtr = cast[pointer](vif)
+  let vifPtr = cast[pointer](vifView)
   let frameType: uint16 = if reassoc != 0: 0x30'u16 else: 0x10'u16
   apm_send_mlme(vifPtr, frameType, staMac,
     cast[pointer](apm_tx_cfm_handler), cast[pointer](msg), nil)
@@ -14872,9 +22752,9 @@ proc apm_disassoc_handler*(param: pointer) {.exportc, cdecl.} =
   ##   2. Read staIdx from param[7]; if 0xFF, return.
   ##   3. Extract reason code from param[56..57] (LE16).
   ##   4. Log at line 1074 with reason code.
-  ##   5. Compute VIF entry from vifIdx (vif_info_tab + vifIdx * 1512).
+  ##   5. Get VIF entry from the typed VIF table overlay.
   ##   6. Get STA MAC from param+42.
-  ##   7. Call apm_send_mlme(vifEntry, 0xC0, macAddr, nil, nil, nil) to send
+  ##   7. Call apm_send_mlme(vif, 0xC0, macAddr, nil, nil, nil) to send
   ##      disassociation response.
   ##   8. Tail-call apm_sta_delete(staIdx, macAddr, 3, reason) to remove STA.
   let rx = apmRxMgmtPrefix(param)
@@ -14893,13 +22773,12 @@ proc apm_disassoc_handler*(param: pointer) {.exportc, cdecl.} =
   if logFn != nil:
     logFn(2, 0, nil, 1074, reason.uint32)
 
-  # Compute VIF entry
-  let vifBase = cast[uint](addr vif_info_tab[0])
-  let vifEntry = cast[pointer](vifBase + vifIdx.uint * VIF_ENTRY_SIZE.uint)
+  # Get VIF entry from the typed VIF table overlay.
+  let vif = vifChannelForIdx(vifIdx)
   let staMac = cast[pointer](addr rx.staMac[0])
 
   # Send disassociation response
-  apm_send_mlme(vifEntry, 0xC0, staMac, nil, nil, nil)
+  apm_send_mlme(cast[pointer](vif), 0xC0, staMac, nil, nil, nil)
 
   # Remove station: blob tail-calls apm_sta_delete(packed args)
   apm_sta_delete(cast[pointer](staIdx.uint or (3'u shl 16) or (reason.uint shl 8)))
@@ -14946,16 +22825,15 @@ proc apm_handle_eapol_input*(staIdx: uint8, rxBuf: pointer, rxLen: uint32) {.exp
   if hostapdCtx == nil:
     return
   let instNbr = staInfoForIdx(staIdx).instNbr
-  let vifBase = cast[uint](addr vif_info_tab[0])
-  let vifEntry = vifBase + instNbr.uint * VIF_ENTRY_SIZE.uint
+  let vif = vifChannelForIdx(instNbr)
   # Load hostapd ops table pointer from vif_mgmt_env offset 12
-  let opsPtr = cast[ptr pointer](cast[uint](addr vif_mgmt_env[0]) + 12)[]
+  let opsPtr = vifMgmtHostapdOpsEnv().hostapdOps
   if opsPtr == nil: return
   # Get EAPOL RX handler at offset 44 in ops table
-  let eapolHandler = cast[ptr pointer](cast[uint](opsPtr) + 44)[]
+  let eapolHandler = hostapdOpsAt(opsPtr).eapolRx
   if eapolHandler == nil: return
   # Load VIF's hostapd private data from vif+364
-  let vifPriv = cast[ptr pointer](vifEntry + 364)[]
+  let vifPriv = vifHostapdPriv(vif).hostapdPriv
   # Call the handler: eapolHandler(hostapd_ctx, vifPriv, rxBuf, rxLen)
   type EapolHandlerFn = proc(ctx: pointer, priv: pointer, buf: pointer, length: uint32) {.cdecl.}
   cast[EapolHandlerFn](eapolHandler)(hostapdCtx, vifPriv, rxBuf, rxLen)
@@ -14989,30 +22867,27 @@ proc apm_send_mlme*(vifEntry: pointer, frameType: uint16, destAddr: pointer,
     return
 
   let desc = hostTxDescAt(frame)
-  let thdU = cast[uint](desc.bufDesc)
+  let link = hostTxLinkDescAt(desc.bufDesc)
+  let hdr = hostTxDataHeader(desc)
 
-  # Build MAC header at thd+348
-  cast[ptr uint8](thdU + 348)[] = (frameType and 0xFF).uint8
-  cast[ptr uint8](thdU + 349)[] = ((frameType shr 8) and 0xFF).uint8
-  cast[ptr uint8](thdU + 350)[] = 0  # duration low
-  cast[ptr uint8](thdU + 351)[] = 0  # duration high
+  # Build MAC header at link.macHeader.
+  hdr.frameControl = frameType
+  hdr.duration = 0
 
-  # DA = destAddr (6 bytes at thd+352)
-  discard c_memcpy(cast[pointer](thdU + 352), destAddr, 6.csize_t)
+  # DA = destAddr.
+  discard c_memcpy(addr hdr.addr1[0], destAddr, 6.csize_t)
 
-  # SA = VIF MAC at vifEntry+80 (6 bytes at thd+358)
-  let vifMac = cast[pointer](addr vif.macAddr[0])
-  discard c_memcpy(cast[pointer](thdU + 358), vifMac, 6.csize_t)
+  # SA = VIF MAC at vifEntry+80.
+  discard c_memcpy(addr hdr.addr2[0], addr vif.macAddr[0], 6.csize_t)
 
-  # BSSID = VIF MAC (same as SA for AP mode, 6 bytes at thd+364)
-  discard c_memcpy(cast[pointer](thdU + 364), vifMac, 6.csize_t)
+  # BSSID = VIF MAC (same as SA for AP mode).
+  discard c_memcpy(addr hdr.addr3[0], addr vif.macAddr[0], 6.csize_t)
 
   let seqField = nextTxSeqCtrl()
-  cast[ptr uint8](thdU + 370)[] = (seqField and 0xFF).uint8
-  cast[ptr uint8](thdU + 371)[] = ((seqField shr 8) and 0xFF).uint8
+  hdr.seqCtrl = seqField
 
-  # Dispatch on frame type to build frame body at thd+372
-  let bodyBuf = cast[pointer](thdU + 372)
+  # Dispatch on frame type to build frame body after the MAC header.
+  let bodyBuf = cast[pointer](addr link.macHeader[sizeof(MacDataFrameHeaderView)])
   let instNbr = vif.vifIdx
   var totalLen: uint32 = 24  # default: MAC header only
 
@@ -15035,7 +22910,7 @@ proc apm_send_mlme*(vifEntry: pointer, frameType: uint16, destAddr: pointer,
     # Add customer IEs (blob: me_add_ie_customer at 0x110)
     let apm = apmEnvView()
     let custIeLen = me_add_ie_customer(
-      cast[pointer](thdU + 372 + bodyLen.uint),
+      cast[pointer](addr link.macHeader[sizeof(MacDataFrameHeaderView) + bodyLen.int]),
       addr apm.securityIe[0],
       apm.cryptoType.uint32)
     totalLen += custIeLen
@@ -15158,8 +23033,7 @@ proc apm_tx_int_ps_check*(txDesc: pointer): bool {.exportc, cdecl.} =
   let staPeerPtr = tx.staPeer
   if staPeerPtr == nil:
     return true
-  let staPeerU = cast[uint](staPeerPtr)
-  let staRateInfo = cast[ptr uint16](staPeerU + 32)[]
+  let staRateInfo = staInfoAt(staPeerPtr).rateSet
   if staRateInfo != 0:
     return true
 
@@ -15176,9 +23050,8 @@ proc apm_tx_int_ps_check*(txDesc: pointer): bool {.exportc, cdecl.} =
   if frameType == 0xC4:
     return true  # Control frame, allow TX
 
-  # Look up VIF entry
-  let vifBase = cast[uint](addr vif_info_tab[0])
-  let vifType = vifChannelAt(vifBase).vifType
+  # Blob checks the first AP VIF slot here.
+  let vifType = vifChannelForIdx(0).vifType
   if vifType != 2:
     return true  # Not AP mode
 
@@ -15269,26 +23142,25 @@ proc apm_tx_int_ps_get_postpone*(vifEntry: pointer, staEntry: pointer, postponeF
   var prev: pointer = nil
   let psCheckSeqz = cast[uint32](if (psStatus - 2) == 0: 1 else: 0)
   while cur != nil:
-    let curU = cast[uint](cur)
-    let frameTid = cast[ptr uint8](curU + 46)[]
+    let curDesc = apmTxDescPsAt(cur)
+    let frameTid = curDesc.tid
     let tidMatch = frameTid and delivMask
     let tidSeqz = cast[uint32](if tidMatch == 0: 1 else: 0)
     if tidSeqz != psCheckSeqz:
       co_list_remove(addr sta.postponedList, cast[ptr CoListHdr](prev), cast[ptr CoListHdr](cur))
-      cast[ptr uint8](curU + 46)[] = cast[uint8]((psStatus and 3) + 3)
+      curDesc.tid = cast[uint8]((psStatus and 3) + 3)
       var nextScan =
-        if prev != nil: cast[ptr pointer](cast[uint](prev))[]
+        if prev != nil: cast[pointer](cast[ptr CoListHdr](prev).next)
         else: cast[pointer](sta.postponedList.first)
       var hasMore = false
       var scan = nextScan
       while scan != nil:
-        let sU = cast[uint](scan)
-        let sTid = cast[ptr uint8](sU + 46)[]
+        let sTid = apmTxDescPsAt(scan).tid
         let sSeqz = cast[uint32](if (sTid and delivMask) == 0: 1 else: 0)
         let sChk = cast[uint32](if (sta.psStatus - 2) == 0: 1 else: 0)
         if sSeqz != sChk:
           hasMore = true; break
-        scan = cast[ptr pointer](sU)[]
+        scan = cast[pointer](cast[ptr CoListHdr](scan).next)
       if not hasMore:
         var nf = staFlags and (not checkMask)
         sta.trafficFlags = nf
@@ -15303,7 +23175,7 @@ proc apm_tx_int_ps_get_postpone*(vifEntry: pointer, staEntry: pointer, postponeF
             ke_msg_send(tm)
       return cur
     prev = cur
-    cur = cast[ptr pointer](curU)[]
+    cur = cast[pointer](cast[ptr CoListHdr](cur).next)
   assert_warn("apm.c", "apm.c", 377)
   postponeFlag[] = 1
   return nil
@@ -15422,7 +23294,6 @@ proc me_beacon_check*(vifIdx: uint8, frameDesc: pointer, iesBase: pointer) {.exp
   ## bandwidth flags and calls sta_mgmt_register if needed.
   ##
   ## a0=vifIdx(->s5), a1=frameDesc (adjusted -36), a2=iesBase (adjusted +36 -> s6)
-  let staTab = cast[uint](addr sta_info_tab[0])
   let vif = vifChannelForIdx(vifIdx)
   let vifEntry = cast[uint](vif)
 
@@ -15433,7 +23304,8 @@ proc me_beacon_check*(vifIdx: uint8, frameDesc: pointer, iesBase: pointer) {.exp
 
   # Get current channel context info from VIF
   let chanPtr = vif.operChan
-  let chanBand = if chanPtr != nil: cast[ptr uint8](cast[uint](chanPtr) + 2)[] else: 0'u8
+  let chan = if chanPtr != nil: cast[ptr ScanChannelEntry](chanPtr) else: nil
+  let chanBand = if chan != nil: chan.band else: 0'u8
   let htOp = vifHtOperation(vif)
 
   # Save current HT operation params
@@ -15472,17 +23344,16 @@ proc me_beacon_check*(vifIdx: uint8, frameDesc: pointer, iesBase: pointer) {.exp
 
   # Call me_extract_power_constraint with (iesBase, ?, staEntry)
   # Blob relocation at 0xb4: me_extract_power_constraint(a0=iesBase, ?, a2=staEntry)
-  let staInfoOff = vifIdx.uint * STA_ENTRY_SIZE.uint + 348
-  let staInfoBase = staTab + staInfoOff
-  me_extract_power_constraint(cast[pointer](iesBuf), 0, cast[pointer](staInfoBase))
+  let staPowerConstraint = staPowerConstraintOut(staInfoForIdx(vifIdx))
+  me_extract_power_constraint(cast[pointer](iesBuf), 0, staPowerConstraint)
 
   # Check if channel width changed (vif[480])
   let newChanWidth = htOp.chanWidth
   if newChanWidth != prevChanWidth:
     # Channel width changed: compute delta and call tpc_update_vif_tx_power
     # Blob: delta = chanCtx[4] - newChanWidth, stored on stack, passed to tpc_update_vif_tx_power
-    if chanPtr != nil:
-      let chanBw = cast[ptr uint8](cast[uint](chanPtr) + 4)[]
+    if chan != nil:
+      let chanBw = cast[ptr uint8](addr chan.txPower)[]
       var bwDelta: uint8 = chanBw - newChanWidth
       var outParam: uint8
       # tpc_update_vif_tx_power blob ABI: (a0=vifEntry, a1=&delta, a2=&outParam)
@@ -15538,11 +23409,12 @@ proc me_set_sta_ht_vht_param*(staEntry: pointer, param: pointer) {.exportc, cdec
   ## Loads a config byte from me_env global, clears sta+312 (half-word),
   ## stores config byte at sta+316, returns 0.
   ## NOTE: blob's a0 is the sta pointer; a1 is unused.
-  let sta = cast[uint](staEntry)
   let meBase = cast[uint](addr me_env[0])
   let configByte = cast[ptr uint8](meBase)[]  # first byte of me_env
-  cast[ptr uint16](sta + 312)[] = 0'u16
-  cast[ptr uint8](sta + 316)[] = configByte
+  let sta = staInfoAt(staEntry)
+  sta.bwConfigState = 0'u8
+  sta.nssBwMax = 0'u8
+  sta.htVhtConfig = configByte
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void* me_update_buffer_control(void*);".}
 proc me_update_buffer_control*(sta: pointer): pointer {.exportc, cdecl.} =
@@ -15554,26 +23426,26 @@ proc me_update_buffer_control*(sta: pointer): pointer {.exportc, cdecl.} =
   let txPolicy = staView.txPolicy
   if rcFlags == 0:
     return txPolicy
+  let policy = txPolicyAt(txPolicy)
 
-  # Read current policy word at offset 4 and mirror the vendor stack copies:
-  # txPolicy+20..32 are rate words, txPolicy+36..48 are TX power words.
-  var policyWord = cast[ptr uint32](cast[uint](txPolicy) + 4)[]
+  # Mirror the vendor stack copies before updating the descriptor under IRQ.
+  var policyWord = policy.bufferAddr
   var rateWords: array[4, uint32]
   var txPowerWords: array[4, uint32]
   for acIdx in 0 ..< 4:
-    rateWords[acIdx] = cast[ptr uint32](cast[uint](txPolicy) + 20'u + acIdx.uint * 4'u)[]
-    txPowerWords[acIdx] = cast[ptr uint32](cast[uint](txPolicy) + 36'u + acIdx.uint * 4'u)[]
+    rateWords[acIdx] = policy.retryRate[acIdx]
+    txPowerWords[acIdx] = policy.txPower[acIdx]
 
   if (rcFlags and 1) != 0:
     # RC active: update retry-chain rate words from RC stats.
     let rcStats = staView.rcStats
     let vifIdx = staView.instNbr
-    let vifBase = cast[uint](addr vif_info_tab[0]) + vifIdx.uint * VIF_ENTRY_SIZE.uint
-    let vifRatePowerBase = vifBase + 0x15F'u
+    let vif = vifChannelForIdx(vifIdx)
+    let vifHtCaps = vifHtCapabilities(vif)
     let retryRotate = rcU8(rcStats, RCS_ANOTHER_FLAG) # 0xB0
     let staMaxNss = staView.htVhtConfig
 
-    rcU8(rcStats, 0xBF) = cast[ptr uint8](vifBase + 0x16B'u)[]
+    rcU8(rcStats, 0xBF) = vifHtCaps.mcsSet[12]
 
     var foundSameNssChain: uint8 = 0
     var firstNssGroup: uint32 = 0
@@ -15587,7 +23459,7 @@ proc me_update_buffer_control*(sta: pointer): pointer {.exportc, cdecl.} =
 
       if ((rateWord shr 11) and 0x6'u32) != 0:
         var mcsOrGroup = rateWord and 0x7F'u32
-        let vifBitmap = cast[ptr uint8](vifRatePowerBase + acIdx.uint)[]
+        let vifBitmap = vifHtCaps.mcsSet[acIdx]
         rcU8(rcStats, RCS_RATE_BITMAP + acIdx) = vifBitmap
 
         if acIdx == 0:
@@ -15641,10 +23513,10 @@ proc me_update_buffer_control*(sta: pointer): pointer {.exportc, cdecl.} =
 
   # Critical section: write back policy word under IRQ protection
   let irqState = irqSave()
-  cast[ptr uint32](cast[uint](txPolicy) + 4)[] = policyWord
+  policy.bufferAddr = policyWord
   for acIdx in 0 ..< 4:
-    cast[ptr uint32](cast[uint](txPolicy) + 20'u + acIdx.uint * 4'u)[] = rateWords[acIdx]
-    cast[ptr uint32](cast[uint](txPolicy) + 36'u + acIdx.uint * 4'u)[] = txPowerWords[acIdx]
+    policy.retryRate[acIdx] = rateWords[acIdx]
+    policy.txPower[acIdx] = txPowerWords[acIdx]
 
   irqRestore(irqState)
   # Clear RC flags to mark update complete
@@ -15658,8 +23530,8 @@ proc me_tx_cfm_singleton*(param: pointer) {.exportc, cdecl.} =
   ## If success: calls rc_check(frame) first, then rc_update_counters.
   ## Always: computes attempts=retries+1, successes=successBit+retries.
   let desc = hostTxDescAt(param)
-  let thd = cast[ptr pointer](desc.hwDesc)[]
-  let statusWord = cast[ptr uint32](cast[uint](thd) + 16)[]
+  let thd = hostTxHeadThd(hostTxHwDescAt(desc.hwDesc))
+  let statusWord = thd.flags
   # Extract retry count via custom bit extraction (approximate: bits 15:8)
   let retries = (statusWord shr 8) and 0xFF'u32
   # Check success bit (bit 16 = 0x10000)
@@ -15668,8 +23540,11 @@ proc me_tx_cfm_singleton*(param: pointer) {.exportc, cdecl.} =
   let successes = successBit + retries
   # If success, call rf_dump_status (blob: rf_dump_status, NOT rc_check)
   if (statusWord and 0x10000'u32) != 0:
-    proc rf_dump_status(staIdx: uint8) {.importc, cdecl.}
-    rf_dump_status(desc.staInfoIdx)
+    when defined(bl808WifiUseBl808Rf):
+      rf_dump_status()
+    else:
+      proc rf_dump_status(staIdx: uint8) {.importc, cdecl.}
+      rf_dump_status(desc.staInfoIdx)
   let staIdx = desc.staInfoIdx
   rc_update_counters(staIdx, attempts, successes)
 
@@ -15701,7 +23576,7 @@ proc me_tx_cfm_amsdu*(param: pointer) {.exportc, cdecl.} =
     return
   let rcStats = sta.rcStats
   if rcStats != nil:
-    let amsduLen = cast[ptr uint16](cast[uint](rcStats) + RCS_RATE_MAP_L)[]
+    let amsduLen = rcStatsCounters(rcStats).legacyRateMap
     {.emit: ["asm volatile(\"mv a0, %0\" : : \"r\"(", amsduLen, ") );"].}
   else:
     {.emit: ["asm volatile(\"li a0, 0\");"].}
@@ -15711,13 +23586,13 @@ proc me_add_ie_ssid*(buf: pointer, ssid: pointer, ssidLen: uint8): uint32 {.expo
   ## Add SSID IE to buffer. buf is ptr-to-write-pointer (ptr-ptr pattern).
   ## Writes IE ID=0, length, then SSID data. Advances *buf. Returns total bytes.
   let bufPtrPtr = cast[ptr pointer](buf)
-  let p = cast[uint](bufPtrPtr[])
-  cast[ptr uint8](p)[] = 0'u8  # SSID element ID
-  cast[ptr uint8](p + 1)[] = ssidLen
+  let ie = ssidIeAt(bufPtrPtr[])
+  ie.ie.id = 0'u8
+  ie.ie.len = ssidLen
   if ssidLen > 0 and ssid != nil:
-    co_pack8p(cast[pointer](p + 2), ssid, ssidLen.uint32)
+    co_pack8p(addr ie.data[0], ssid, ssidLen.uint32)
   let total = ssidLen.uint32 + 2
-  bufPtrPtr[] = cast[pointer](p + total.uint)
+  bufPtrPtr[] = addr ie.data[ssidLen]
   return total
 
 proc me_add_ie_supp_rates*(buf: pointer, rateSetPtr: pointer): uint32 {.exportc, cdecl.} =
@@ -15727,20 +23602,20 @@ proc me_add_ie_supp_rates*(buf: pointer, rateSetPtr: pointer): uint32 {.exportc,
   ## Writes IE with ID=1, length=min(count,8), copies min(count,8) rate bytes.
   ## Advances *buf, returns bytes written (count clipped to 8, + 2).
   let bufPtrPtr = cast[ptr pointer](buf)
-  let rateCount = cast[ptr uint8](rateSetPtr)[]
+  let rateSet = rateSetAt(rateSetPtr)
+  let rateCount = rateSet.count
   var writeCount = rateCount
   if writeCount > 8:
     writeCount = 8
-  let p = cast[uint](bufPtrPtr[])
+  let ie = macIeDataAt(bufPtrPtr[])
   # Write IE header: ID=1 (Supported Rates), length
-  cast[ptr uint8](p)[] = 1'u8
-  cast[ptr uint8](p + 1)[] = writeCount
+  ie.ie.id = 1'u8
+  ie.ie.len = writeCount
   # Copy rate bytes — blob uses co_pack8p, not memcpy.
-  co_pack8p(cast[pointer](p + 2), cast[pointer](cast[uint](rateSetPtr) + 1),
-            writeCount.uint32)
+  co_pack8p(addr ie.data[0], addr rateSet.rates[0], writeCount.uint32)
   # Advance buffer pointer
   let totalLen = writeCount.uint32 + 2
-  bufPtrPtr[] = cast[pointer](p + totalLen.uint)
+  bufPtrPtr[] = addr ie.data[writeCount]
   return totalLen
 
 proc me_add_ie_ext_supp_rates*(buf: pointer, rateSetPtr: pointer, totalCount: uint32): uint32 {.exportc, cdecl.} =
@@ -15750,30 +23625,29 @@ proc me_add_ie_ext_supp_rates*(buf: pointer, rateSetPtr: pointer, totalCount: ui
   ## Writes IE with ID=50, length=count-8, data=rates[9..count].
   ## Advances *buf. Returns total bytes written (count-8+2 = count-6).
   let bufPtrPtr = cast[ptr pointer](buf)
+  let rateSet = rateSetAt(rateSetPtr)
   let extCount = totalCount - 8
-  let p = cast[uint](bufPtrPtr[])
+  let ie = macIeDataAt(bufPtrPtr[])
   # Write IE header: ID=50 (Extended Supported Rates)
-  cast[ptr uint8](p)[] = 50'u8
-  cast[ptr uint8](p + 1)[] = (totalCount - 8).uint8
+  ie.ie.id = 50'u8
+  ie.ie.len = extCount.uint8
   # Copy extended rate bytes (starting from rate_set[9], skipping first 8) —
   # blob uses co_pack8p, not memcpy.
-  co_pack8p(cast[pointer](p + 2),
-            cast[pointer](cast[uint](rateSetPtr) + 9),
-            extCount.uint32)
+  co_pack8p(addr ie.data[0], addr rateSet.rates[8], extCount.uint32)
   # Advance buffer pointer
   let written = totalCount - 6  # (count-8) + 2
-  bufPtrPtr[] = cast[pointer](p + written.uint)
+  bufPtrPtr[] = addr ie.data[extCount]
   return written
 
 proc me_add_ie_ds*(buf: pointer, channel: uint8): uint32 {.exportc, cdecl.} =
   ## Add DS Parameter Set IE (ID=3, length=1, total=3 bytes).
   ## buf is ptr-to-write-pointer (ptr-ptr pattern). Advances *buf by 3.
   let bufPtrPtr = cast[ptr pointer](buf)
-  let p = cast[uint](bufPtrPtr[])
-  cast[ptr uint8](p)[] = 3'u8         # DS Parameter Set IE ID
-  cast[ptr uint8](p + 1)[] = 1'u8     # length = 1
-  cast[ptr uint8](p + 2)[] = channel  # channel number
-  bufPtrPtr[] = cast[pointer](p + 3)
+  let ds = dsParamSetIeAt(bufPtrPtr[])
+  ds.ie.id = 3'u8
+  ds.ie.len = 1'u8
+  ds.currentChannel = channel
+  bufPtrPtr[] = addr ds.next[0]
   return 3
 
 proc me_add_ie_erp*(buf: pointer, erpInfo: uint8 = 0): uint32 {.exportc, cdecl.} =
@@ -15781,11 +23655,11 @@ proc me_add_ie_erp*(buf: pointer, erpInfo: uint8 = 0): uint32 {.exportc, cdecl.}
   ## buf is ptr-to-write-pointer (ptr-ptr pattern). Advances *buf by 3.
   ## erpInfo is the ERP information byte (protection flags etc).
   let bufPtrPtr = cast[ptr pointer](buf)
-  let p = cast[uint](bufPtrPtr[])
-  cast[ptr uint8](p)[] = 42'u8     # ERP IE ID
-  cast[ptr uint8](p + 1)[] = 1'u8  # length = 1
-  cast[ptr uint8](p + 2)[] = erpInfo
-  bufPtrPtr[] = cast[pointer](p + 3)
+  let erp = oneByteMacIeAt(bufPtrPtr[])
+  erp.ie.id = 42'u8
+  erp.ie.len = 1'u8
+  erp.value = erpInfo
+  bufPtrPtr[] = addr erp.next[0]
   return 3
 
 proc me_add_ie_ht_capa*(buf: pointer): uint32 {.exportc, cdecl.} =
@@ -15793,31 +23667,30 @@ proc me_add_ie_ht_capa*(buf: pointer): uint32 {.exportc, cdecl.} =
   ## buf is ptr-to-write-pointer (ptr-ptr pattern). Advances *buf by 28.
   ## Loads HT cap fields from me_env global.
   let bufPtrPtr = cast[ptr pointer](buf)
-  let p = cast[uint](bufPtrPtr[])
+  let ht = htCapIeAt(bufPtrPtr[])
   let me = meEnvView()
-  cast[ptr uint8](p)[] = 45'u8  # HT Capabilities IE ID
-  cast[ptr uint8](p + 1)[] = 26'u8  # length
+  ht.ie.id = 45'u8
+  ht.ie.len = 26'u8
   # HT Capability Info: clear SM Power Save bits 2-3, set LDPC/40MHz/SGI
   var htCapInfo = cast[ptr uint16](addr me.htCaps[0])[]
   htCapInfo = htCapInfo and (not 0x000C'u16)
   htCapInfo = htCapInfo or 0x002D'u16
-  cast[ptr uint8](p + 2)[] = (htCapInfo and 0xFF).uint8
-  cast[ptr uint8](p + 3)[] = ((htCapInfo shr 8) and 0xFF).uint8
+  ht.capInfo = htCapInfo
   # A-MPDU parameters
-  cast[ptr uint8](p + 4)[] = me.htCaps[2]
+  ht.ampduParams = me.htCaps[2]
   # Supported MCS set (16 bytes) — blob uses co_pack8p (byte-by-byte pack),
   # not memcpy. Matching the call lets call-graph audit tools line up.
-  co_pack8p(cast[pointer](p + 5), cast[pointer](addr me.htCaps[3]), 16)
+  co_pack8p(addr ht.mcsSet[0], cast[pointer](addr me.htCaps[3]), 16)
   # HT Extended Capabilities
   let htExtCap = cast[ptr uint16](addr me.htCaps[20])[]
-  cast[ptr uint8](p + 21)[] = (htExtCap and 0xFF).uint8
-  cast[ptr uint8](p + 22)[] = ((htExtCap shr 8) and 0xFF).uint8
+  ht.extCap = htExtCap
   # TX Beamforming Capabilities (4 bytes) — same pack pattern.
-  co_pack8p(cast[pointer](p + 23), cast[pointer](addr me.htCaps[22]), 4)
+  co_pack8p(cast[pointer](addr ht.txBfCapsLo),
+            cast[pointer](addr me.htCaps[22]), 4)
   # ASEL Capabilities
-  cast[ptr uint8](p + 27)[] = me.htCaps[28]
+  ht.aselCap = me.htCaps[28]
   # Advance write pointer
-  bufPtrPtr[] = cast[pointer](p + 28)
+  bufPtrPtr[] = addr ht.next[0]
   return 28
 
 proc me_add_ie_ht_oper*(buf: pointer, vifEntry: pointer = nil): uint32 {.exportc, cdecl.} =
@@ -15828,9 +23701,9 @@ proc me_add_ie_ht_oper*(buf: pointer, vifEntry: pointer = nil): uint32 {.exportc
   ## [8]=center1_freq(u16). Calls phy_freq_to_channel for primary channel.
   ## Secondary offset: 7 if no secondary, 5 if center1 >= prim.
   let bufPtrPtr = cast[ptr pointer](buf)
-  let p = cast[uint](bufPtrPtr[])
-  cast[ptr uint8](p)[] = 61'u8   # HT Operation IE ID
-  cast[ptr uint8](p + 1)[] = 22'u8   # length
+  let oper = htOperIeAt(bufPtrPtr[])
+  oper.ie.id = 61'u8
+  oper.ie.len = 22'u8
 
   # Determine primary channel and secondary offset from channel context
   var chanNum: uint8 = 0
@@ -15848,21 +23721,12 @@ proc me_add_ie_ht_oper*(buf: pointer, vifEntry: pointer = nil): uint32 {.exportc
       else:
         secOffset = 7  # SCB (secondary channel below)
 
-  cast[ptr uint8](p + 2)[] = chanNum      # primary channel
-  cast[ptr uint8](p + 3)[] = secOffset    # secondary channel offset
-  cast[ptr uint8](p + 4)[] = 3'u8         # HT protection: non-HT mixed mode
-  cast[ptr uint8](p + 5)[] = 0'u8
-  cast[ptr uint8](p + 6)[] = 0'u8
-  cast[ptr uint8](p + 7)[] = 0'u8
-  cast[ptr uint8](p + 8)[] = 0xFF'u8      # Basic MCS set: MCS 0-7 supported
-  # Clear remaining bytes 9..23 — blob inlines these as explicit zero stores
-  # (no memset call in its graph). Four zero-word stores fit exactly.
-  cast[ptr uint32](p + 9)[] = 0
-  cast[ptr uint32](p + 13)[] = 0
-  cast[ptr uint32](p + 17)[] = 0
-  cast[ptr uint16](p + 21)[] = 0
-  cast[ptr uint8](p + 23)[] = 0
-  bufPtrPtr[] = cast[pointer](p + 24)
+  oper.primaryChannel = chanNum
+  oper.secondaryOffset = secOffset
+  oper.htProtection = 3'u8
+  oper.operationMode = [0'u8, 0, 0]
+  oper.basicMcsSet = [0xFF'u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  bufPtrPtr[] = addr oper.next[0]
   return 24
 
 proc me_add_ie_rsn*(buf: pointer, secMode: uint8 = 0): uint32 {.exportc, cdecl.} =
@@ -15876,67 +23740,35 @@ proc me_add_ie_rsn*(buf: pointer, secMode: uint8 = 0): uint32 {.exportc, cdecl.}
   ## and bufCtx[0] is advanced by the IE length.
   ## For Nim callers that pass buf directly (not a context struct), secMode
   ## defaults to 0 which returns 0 (no RSN), preserving backward compatibility.
+  let bufPtrPtr = cast[ptr pointer](buf)
   if secMode == 1:
     # RSN IE: CCMP only + PSK AKM (22 bytes total)
-    let p = cast[ptr UncheckedArray[uint8]](cast[ptr pointer](buf)[])
-    p[0]  = 48         # IE ID: RSN
-    p[1]  = 20         # Length
-    p[2]  = 1          # RSN Version 1 (LE16)
-    p[3]  = 0
-    p[4]  = 0          # Group Cipher Suite OUI: 00:0F:AC
-    p[5]  = 15
-    p[6]  = 0xAC'u8
-    p[7]  = 4          # Group Cipher: CCMP
-    p[8]  = 1          # Pairwise Cipher Count: 1 (LE16)
-    p[9]  = 0
-    p[10] = 0          # Pairwise Cipher Suite OUI: 00:0F:AC
-    p[11] = 15
-    p[12] = 0xAC'u8
-    p[13] = 4          # Pairwise Cipher: CCMP
-    p[14] = 1          # AKM Count: 1 (LE16)
-    p[15] = 0
-    p[16] = 0          # AKM Suite OUI: 00:0F:AC
-    p[17] = 15
-    p[18] = 0xAC'u8
-    p[19] = 2          # AKM Type: PSK
-    p[20] = 0          # RSN Capabilities: 0 (LE16)
-    p[21] = 0
-    # Advance write pointer
-    let pp = cast[ptr pointer](buf)
-    pp[] = cast[pointer](cast[uint](pp[]) + 22)
+    let rsn = rsnCcmpPskIeAt(bufPtrPtr[])
+    rsn.ie.id = 48'u8
+    rsn.ie.len = 20'u8
+    rsn.version = 1'u16
+    rsn.groupCipher = RsnSuiteView(oui: [0'u8, 15'u8, 0xAC'u8], suiteType: 4'u8)
+    rsn.pairwiseCount = 1'u16
+    rsn.pairwiseCipher = RsnSuiteView(oui: [0'u8, 15'u8, 0xAC'u8], suiteType: 4'u8)
+    rsn.akmCount = 1'u16
+    rsn.akmSuite = RsnSuiteView(oui: [0'u8, 15'u8, 0xAC'u8], suiteType: 2'u8)
+    rsn.capabilities = 0'u16
+    bufPtrPtr[] = addr rsn.next[0]
     return 22
   elif secMode == 2:
     # RSN IE: TKIP+CCMP + 802.1X AKM (26 bytes total)
-    let p = cast[ptr UncheckedArray[uint8]](cast[ptr pointer](buf)[])
-    p[0]  = 48         # IE ID: RSN
-    p[1]  = 24         # Length
-    p[2]  = 1          # RSN Version 1 (LE16) -- actually 0x10 in blob for secMode=2
-    p[3]  = 0
-    p[4]  = 0          # Group Cipher Suite OUI: 00:0F:AC
-    p[5]  = 15
-    p[6]  = 0xAC'u8
-    p[7]  = 2          # Group Cipher: TKIP
-    p[8]  = 2          # Pairwise Cipher Count: 2 (LE16)
-    p[9]  = 0
-    p[10] = 0          # Pairwise Cipher Suite 1 OUI: 00:0F:AC
-    p[11] = 15
-    p[12] = 0xAC'u8
-    p[13] = 2          # Pairwise Cipher 1: TKIP
-    p[14] = 0          # Pairwise Cipher Suite 2 OUI: 00:0F:AC
-    p[15] = 15
-    p[16] = 0xAC'u8
-    p[17] = 4          # Pairwise Cipher 2: CCMP
-    p[18] = 1          # AKM Count: 1 (LE16)
-    p[19] = 0
-    p[20] = 0          # AKM Suite OUI: 00:0F:AC
-    p[21] = 15
-    p[22] = 0xAC'u8
-    p[23] = 2          # AKM Type: 802.1X
-    p[24] = 0          # RSN Capabilities: 0 (LE16)
-    p[25] = 0
-    # Advance write pointer
-    let pp = cast[ptr pointer](buf)
-    pp[] = cast[pointer](cast[uint](pp[]) + 26)
+    let rsn = rsnTkipCcmpIeAt(bufPtrPtr[])
+    rsn.ie.id = 48'u8
+    rsn.ie.len = 24'u8
+    rsn.version = 1'u16
+    rsn.groupCipher = RsnSuiteView(oui: [0'u8, 15'u8, 0xAC'u8], suiteType: 2'u8)
+    rsn.pairwiseCount = 2'u16
+    rsn.pairwiseCipher[0] = RsnSuiteView(oui: [0'u8, 15'u8, 0xAC'u8], suiteType: 2'u8)
+    rsn.pairwiseCipher[1] = RsnSuiteView(oui: [0'u8, 15'u8, 0xAC'u8], suiteType: 4'u8)
+    rsn.akmCount = 1'u16
+    rsn.akmSuite = RsnSuiteView(oui: [0'u8, 15'u8, 0xAC'u8], suiteType: 2'u8)
+    rsn.capabilities = 0'u16
+    bufPtrPtr[] = addr rsn.next[0]
     return 26
   else:
     # Unknown secMode or 0: no RSN IE
@@ -15955,37 +23787,55 @@ proc me_add_ie_wpa*(buf: pointer, secMode: uint32 = 0): uint32 {.exportc, cdecl.
   if secMode != 2:
     return 0
   let bufPtrPtr = cast[ptr pointer](buf)
-  let p = cast[uint](bufPtrPtr[])
-  cast[ptr uint8](p + 0)[]  = 221'u8; cast[ptr uint8](p + 1)[]  = 28'u8
-  cast[ptr uint8](p + 2)[]  = 0x00'u8; cast[ptr uint8](p + 3)[]  = 0x50'u8
-  cast[ptr uint8](p + 4)[]  = 0xF2'u8; cast[ptr uint8](p + 5)[]  = 0x01'u8
-  cast[ptr uint8](p + 6)[]  = 0x01'u8; cast[ptr uint8](p + 7)[]  = 0x00'u8
-  cast[ptr uint8](p + 8)[]  = 0x00'u8; cast[ptr uint8](p + 9)[]  = 0x50'u8
-  cast[ptr uint8](p + 10)[] = 0xF2'u8; cast[ptr uint8](p + 11)[] = 0x02'u8
-  cast[ptr uint8](p + 12)[] = 0x02'u8; cast[ptr uint8](p + 13)[] = 0x00'u8
-  cast[ptr uint8](p + 14)[] = 0x00'u8; cast[ptr uint8](p + 15)[] = 0x50'u8
-  cast[ptr uint8](p + 16)[] = 0xF2'u8; cast[ptr uint8](p + 17)[] = 0x02'u8
-  cast[ptr uint8](p + 18)[] = 0x00'u8; cast[ptr uint8](p + 19)[] = 0x50'u8
-  cast[ptr uint8](p + 20)[] = 0xF2'u8; cast[ptr uint8](p + 21)[] = 0x04'u8
-  cast[ptr uint8](p + 22)[] = 0x01'u8; cast[ptr uint8](p + 23)[] = 0x00'u8
-  cast[ptr uint8](p + 24)[] = 0x00'u8; cast[ptr uint8](p + 25)[] = 0x50'u8
-  cast[ptr uint8](p + 26)[] = 0xF2'u8; cast[ptr uint8](p + 27)[] = 0x02'u8
-  bufPtrPtr[] = cast[pointer](p + 30)
+  let wpa = wpaVendorIeAt(bufPtrPtr[])
+  wpa.ie.id = 221'u8
+  wpa.ie.len = 28'u8
+  wpa.vendorType = [0x00'u8, 0x50'u8, 0xF2'u8, 0x01'u8]
+  wpa.version = 1'u16
+  wpa.groupCipher = RsnSuiteView(oui: [0x00'u8, 0x50'u8, 0xF2'u8], suiteType: 2'u8)
+  wpa.pairwiseCount = 2'u16
+  wpa.pairwiseCipher[0] = RsnSuiteView(oui: [0x00'u8, 0x50'u8, 0xF2'u8], suiteType: 2'u8)
+  wpa.pairwiseCipher[1] = RsnSuiteView(oui: [0x00'u8, 0x50'u8, 0xF2'u8], suiteType: 4'u8)
+  wpa.akmCount = 1'u16
+  wpa.akmSuite = RsnSuiteView(oui: [0x00'u8, 0x50'u8, 0xF2'u8], suiteType: 2'u8)
+  bufPtrPtr[] = addr wpa.next[2]
   return 30
+
+proc writeWpaPskVendorIe(ieBuf: pointer, cipherType: uint8): pointer {.inline.} =
+  let wpa = wpaPskVendorIeAt(ieBuf)
+  wpa.ie.id = 0xDD'u8
+  wpa.ie.len = 22'u8
+  wpa.vendorType = [0x00'u8, 0x50'u8, 0xF2'u8, 0x01'u8]
+  wpa.version = 1'u16
+  wpa.groupCipher = RsnSuiteView(oui: [0x00'u8, 0x50'u8, 0xF2'u8], suiteType: cipherType)
+  wpa.pairwiseCount = 1'u16
+  wpa.pairwiseCipher = RsnSuiteView(oui: [0x00'u8, 0x50'u8, 0xF2'u8], suiteType: cipherType)
+  wpa.akmCount = 1'u16
+  wpa.akmSuite = RsnSuiteView(oui: [0x00'u8, 0x50'u8, 0xF2'u8], suiteType: 2'u8)
+  addr wpa.next[0]
+
+proc writeCsaIe(ieBuf: pointer; switchMode, newChannel, switchCount: uint8): pointer {.inline.} =
+  let csa = csaIeAt(ieBuf)
+  csa.ie.id = 37'u8
+  csa.ie.len = 3'u8
+  csa.switchMode = switchMode
+  csa.newChannel = newChannel
+  csa.switchCount = switchCount
+  addr csa.next[0]
 
 proc me_add_ie_tim*(buf: pointer, dtimBitmap: uint8 = 0): uint32 {.exportc, cdecl.} =
   ## Add TIM IE (ID=5, length=4, total=6 bytes).
   ## buf is ptr-to-write-pointer (ptr-ptr pattern). Advances *buf by 6.
   ## dtimBitmap is stored at offset 3 (DTIM count field in blob).
   let bufPtr = cast[ptr pointer](buf)
-  let p = cast[uint](bufPtr[])
-  cast[ptr uint8](p + 0)[] = 5'u8          # TIM Element ID
-  cast[ptr uint8](p + 1)[] = 4'u8          # Length
-  cast[ptr uint8](p + 2)[] = 0'u8          # DTIM count
-  cast[ptr uint8](p + 3)[] = dtimBitmap    # DTIM period / bitmap
-  cast[ptr uint8](p + 4)[] = 0'u8          # Bitmap control
-  cast[ptr uint8](p + 5)[] = 0'u8          # Partial virtual bitmap
-  bufPtr[] = cast[pointer](p + 6)
+  let tim = timIeAt(bufPtr[])
+  tim.ie.id = 5'u8
+  tim.ie.len = 4'u8
+  tim.dtimCount = 0'u8
+  tim.dtimPeriod = dtimBitmap
+  tim.bitmapControl = 0'u8
+  tim.partialBitmap[0] = 0'u8
+  bufPtr[] = addr tim.partialBitmap[1]
   return 6
 
 proc me_add_ie_csa*(buf: pointer): uint32 {.exportc, cdecl.} =
@@ -16009,26 +23859,21 @@ proc me_build_authenticate*(buf: pointer, authAlgo: uint16, authSeq: uint16,
   ## From blob (27 instrs): writes auth_algo, auth_seq, status_code as LE16.
   ## If challengeText != nil, appends challenge text IE (ID=16, len=128).
   ## Returns 6 (no challenge) or 136 (with challenge).
-  let p = cast[ptr UncheckedArray[uint8]](buf)
-  # Auth Algorithm Number (LE16)
-  p[0] = (authAlgo and 0xFF).uint8
-  p[1] = ((authAlgo shr 8) and 0xFF).uint8
-  # Auth Transaction Sequence Number (LE16)
-  p[2] = (authSeq and 0xFF).uint8
-  p[3] = ((authSeq shr 8) and 0xFF).uint8
-  # Status Code (LE16)
-  p[4] = (statusCode and 0xFF).uint8
-  p[5] = ((statusCode shr 8) and 0xFF).uint8
+  let fixed = cast[ptr AuthFixedBodyView](buf)
+  fixed.authAlgo = authAlgo
+  fixed.authSeq = authSeq
+  fixed.statusCode = statusCode
   if challengeText != nil:
+    let challenge = authChallengeBodyAt(buf)
     # Challenge Text IE: ID=16, Length=128
-    p[6] = 16
-    p[7] = 128
+    challenge.challengeTag = 16
+    challenge.challengeLen = 128
     # Blob copies the 128-byte challenge via a byte-loop + T-Head custom
     # insn (no memcpy call emitted). Emit the equivalent byte copy inline
     # so the call graph stays at 0 calls (matching blob).
     let src = cast[ptr UncheckedArray[uint8]](challengeText)
     for i in 0 ..< 128:
-      p[8 + i] = src[i]
+      challenge.challengeText[i] = src[i]
     return 136
   return 6
 
@@ -16036,25 +23881,18 @@ proc me_build_sae_authenticate*(buf: pointer, authAlgo: uint16, authSeq: uint16,
     statusCode: uint16, vifIdx: uint32): uint32 {.exportc, cdecl.} =
   ## Build SAE authentication frame body.
   ## From blob (53 instrs): writes auth header (6 bytes), then loads SAE state
-  ## from VIF entry (vifIdx * 1512 + vif_info_tab), calls SAE callback to get
+  ## from the VIF entry, calls SAE callback to get
   ## payload, copies to buf+6. Returns total length or 0 on failure.
-  let p = cast[ptr UncheckedArray[uint8]](buf)
-  # Auth Algorithm Number (LE16)
-  p[0] = (authAlgo and 0xFF).uint8
-  p[1] = ((authAlgo shr 8) and 0xFF).uint8
-  # Auth Transaction Sequence Number (LE16)
-  p[2] = (authSeq and 0xFF).uint8
-  p[3] = ((authSeq shr 8) and 0xFF).uint8
-  # Status Code (LE16)
-  p[4] = (statusCode and 0xFF).uint8
-  p[5] = ((statusCode shr 8) and 0xFF).uint8
+  let body = cast[ptr AuthBodyDataView](buf)
+  body.fixed.authAlgo = authAlgo
+  body.fixed.authSeq = authSeq
+  body.fixed.statusCode = statusCode
 
   # SAE payload: call WPA callback to get SAE frame data from VIF SAE context.
-  # Blob: loads VIF entry, computes SAE context at vifEntry+80, then calls
+  # Blob: loads VIF entry, computes SAE context at vif+80, then calls
   # wpa_cbs[14] (offset 56 = func pointer for get_sae_frame) with context.
-  let vifTabBase = cast[uint](addr vif_info_tab[0])
-  let vifEntry = vifTabBase + vifIdx * VIF_ENTRY_SIZE.uint
-  let saeCtx = cast[pointer](vifEntry + 80)
+  let vif = vifChannelForIdx(vifIdx.uint8)
+  let saeCtx = cast[pointer](addr vif.macAddr[0])
 
   if wpa_cbs != nil:
     let wpaCbArr = cast[ptr UncheckedArray[pointer]](wpa_cbs)
@@ -16064,8 +23902,8 @@ proc me_build_sae_authenticate*(buf: pointer, authAlgo: uint16, authSeq: uint16,
       var saeLen: uint32 = 0
       let saeData = cast[SaeFrameFn](getSaeFrame)(saeCtx, addr saeLen)
       if saeData != nil:
-        discard c_memcpy(cast[pointer](cast[uint](buf) + 6), saeData, saeLen.csize_t)
-        return saeLen + 6
+        discard c_memcpy(addr body.data[0], saeData, saeLen.csize_t)
+        return saeLen + sizeof(AuthFixedBodyView).uint32
   return 0
 
 proc me_build_associate_req_impl(buf: pointer, assocInfo: pointer,
@@ -16082,9 +23920,8 @@ proc me_build_associate_req_impl(buf: pointer, assocInfo: pointer,
   ## association/security IE block, HT Capabilities (if 11n), WMM, and
   ## vendor-specific IEs from sm_env.
   ## Returns total body length in a0 (via bodyLenOut).
-  let assoc = cast[ptr UncheckedArray[uint8]](assocInfo)
-  let assocU = cast[uint](assocInfo)
-  let secFlags = cast[ptr uint32](assocU + 136)[]
+  let assoc = vifAssocInfo(assocInfo)
+  let secFlags = assoc.securityFlags
 
   # Read listen interval from connInfo+54 (a6+54 in blob), default 5.
   var listenInt: uint16 = 5
@@ -16100,20 +23937,15 @@ proc me_build_associate_req_impl(buf: pointer, assocInfo: pointer,
   # then uses a stack-local pointer-to-pointer for the IE helper calls.
   let bufBase = cast[uint](buf)
   var writePtr = bufBase
-  cast[ptr uint8](writePtr)[] = (capInfo and 0xFF).uint8
-  cast[ptr uint8](writePtr + 1)[] = ((capInfo shr 8) and 0xFF).uint8
-
-  # Write listen interval at buf[2..3]
-  cast[ptr uint8](writePtr + 2)[] = (listenInt and 0xFF).uint8
-  cast[ptr uint8](writePtr + 3)[] = ((listenInt shr 8) and 0xFF).uint8
+  let fixedReq = cast[ptr AssocReqFixedBodyView](buf)
+  fixedReq.capabilityInfo = capInfo
+  fixedReq.listenInterval = listenInt
 
   # Check for reassoc (reassocBssid ptr != nil).
   # If present, copy 6 BSSID bytes and hdrSize becomes 10
   var hdrSize: uint = 4
   if reassocBssid != nil:
-    cast[ptr uint16](writePtr + 4)[] = cast[ptr uint16](reassocBssid)[]
-    cast[ptr uint16](writePtr + 6)[] = cast[ptr uint16](cast[uint](reassocBssid) + 2)[]
-    cast[ptr uint16](writePtr + 8)[] = cast[ptr uint16](cast[uint](reassocBssid) + 4)[]
+    discard c_memcpy(addr fixedReq.reassocBssid[0], reassocBssid, 6.csize_t)
     hdrSize = 10
 
   # Advance write pointer past header, store to the caller's cursor slot, and
@@ -16125,24 +23957,25 @@ proc me_build_associate_req_impl(buf: pointer, assocInfo: pointer,
   var totalLen: uint32 = hdrSize.uint32
 
   # Add SSID IE: blob uses assocInfo+38 (vif+386 len, vif+387 data).
-  let ssidIeLen = me_add_ie_ssid(addr cursor, cast[pointer](assocU + 39), assoc[38])
+  let ssidIeLen = me_add_ie_ssid(addr cursor,
+    cast[pointer](addr assoc.ssidData[0]), assoc.ssidLen)
   totalLen += ssidIeLen
 
   # Add Supported Rates IE with rates pointer from assocInfo+88 (vif+436).
-  let ratesPtr = cast[pointer](assocU + 88)
+  let ratesPtr = cast[pointer](addr assoc.basicRates[0])
   let suppLen = me_add_ie_supp_rates(addr cursor, ratesPtr)
   totalLen += suppLen
 
   # Add Extended Supported Rates IE (if > 8 rates)
-  let rateCount = cast[ptr uint8](assocU + 88)[]
+  let rateCount = assoc.basicRates[0]
   if rateCount > 8:
     let extLen = me_add_ie_ext_supp_rates(addr cursor, ratesPtr, rateCount.uint32)
     totalLen += extLen
 
   # Copy the prebuilt association/security IE block from assocInfo+144/+148.
   # The blob performs this copy before checking the capability flags.
-  let assocIeSrc = cast[ptr pointer](assocU + 144)[]
-  let assocIeLen = cast[ptr uint8](assocU + 148)[].uint32
+  let assocIeSrc = cast[pointer](assoc.rsnIePtr)
+  let assocIeLen = assoc.rsnIeLen.uint32
   nimFwDbgVifIeLenAtAssoc = assocIeLen or (cast[uint32](assocIeSrc) shl 8)
   if assocIeSrc != nil and assocIeLen != 0:
     discard c_memcpy(cursor, assocIeSrc, assocIeLen.csize_t)
@@ -16157,29 +23990,23 @@ proc me_build_associate_req_impl(buf: pointer, assocInfo: pointer,
   # Blob: memcpy(scratch, .LANCHOR0, 10); conditionally overwrite scratch[8];
   # co_pack8p(buf, scratch, 9).
   if (secFlags and 1) != 0:
-    let meBase = cast[uint](addr me_env[0])
     let qosInfo =
       if connInfo != nil: connectInfoView(connInfo).qosInfo
-      else: cast[ptr uint8](meBase + 452)[]
-    var wmmIe {.noinit.}: array[9, uint8]
-    wmmIe[0] = 0xDD    # Vendor Specific IE ID
-    wmmIe[1] = 7       # Length
-    wmmIe[2] = 0x00    # OUI 00:50:F2
-    wmmIe[3] = 0x50
-    wmmIe[4] = 0xF2
-    wmmIe[5] = 0x02    # WMM type
-    wmmIe[6] = 0x00    # subtype (Information Element)
-    wmmIe[7] = 0x01    # version
-    wmmIe[8] = qosInfo
-    let wp = cast[uint](cursor)
-    co_pack8p(cast[pointer](wp), addr wmmIe[0], 9)
-    cursor = cast[pointer](wp + 9)
-    totalLen += 9
+      else: assoc.modeByte104
+    let wmm = wmmInfoIeAt(cursor)
+    wmm.ie.id = 0xDD'u8
+    wmm.ie.len = 7'u8
+    wmm.oui = [0x00'u8, 0x50, 0xF2]
+    wmm.ouiType = 0x02'u8
+    wmm.ouiSubtype = 0x00'u8
+    wmm.version = 0x01'u8
+    wmm.qosInfo = qosInfo
+    cursor = addr wmm.next[0]
+    totalLen += sizeof(WmmInfoIeView).uint32
 
   # Handle HT Capabilities IE (if bit 1 set in secFlags and me_env HT enabled).
   if (secFlags and 2) != 0:
-    let meEnvHtFlag = cast[ptr uint8](cast[uint](addr me_env[0]) + 0x82)[]
-    if meEnvHtFlag != 0:
+    if meEnvView().htSupp != 0:
       let htLen = me_add_ie_ht_capa(addr cursor)
       totalLen += htLen
 
@@ -16213,13 +24040,13 @@ proc me_build_associate_rsp_impl(buf: pointer, staEntry: pointer,
   ## Writes: cap info (2B), status code (2B), AID (2B), then Supported Rates,
   ## Ext Rates, HT Cap, HT Oper, WMM Parameter, and BSS Max Idle Period IEs.
   ## Returns total length in a0.
-  let vifTabBase = cast[uint](addr vif_info_tab[0])
   # staEntry parameter is actually used as VIF index in the blob
   # (me_build_capability(a0=a1) where a1 is the VIF index).
-  # The blob computes: vif_entry = vif_info_tab + a1 * 1512
+  # The blob computes the VIF entry from a1.
   let vifIdx = cast[uint](staEntry)
-  let vifEntry = vifTabBase + vifIdx * VIF_ENTRY_SIZE.uint
-  let privacy = cast[ptr uint8](vifEntry + 520)[]
+  let vif = vifChannelForIdx(vifIdx.uint8)
+  let apCfg = vifApConfig(vif)
+  let privacy = apCfg.privacyFlag
 
   # Build capability info using VIF index
   var capInfo = me_build_capability(staEntry)  # staEntry is really vifIdx
@@ -16227,23 +24054,16 @@ proc me_build_associate_rsp_impl(buf: pointer, staEntry: pointer,
     capInfo = capInfo or 16
 
   var writePtr = cast[uint](cast[ptr pointer](buf)[])
+  let fixedRsp = cast[ptr AssocRspFixedBodyView](cast[pointer](writePtr))
+  fixedRsp.capabilityInfo = capInfo
+  fixedRsp.statusCode = statusCode
 
-  # Write capability info (LE16)
-  cast[ptr uint8](writePtr)[] = (capInfo and 0xFF).uint8
-  cast[ptr uint8](writePtr + 1)[] = ((capInfo shr 8) and 0xFF).uint8
-
-  # Write status code (LE16)
-  cast[ptr uint8](writePtr + 2)[] = (statusCode and 0xFF).uint8
-  cast[ptr uint8](writePtr + 3)[] = ((statusCode shr 8) and 0xFF).uint8
-
-  # Write AID with 2 MSBs set (LE16)
-  # Blob: a3 parameter is actually a STA entry pointer. AID is at staEntry+68.
-  # The 'aid' parameter is typed uint16 but at runtime it's a pointer value.
-  let staEntryPtr = cast[uint](aid)  # a3 is really a pointer
-  let aidVal = cast[ptr uint16](staEntryPtr + 68)[]
+  # Write AID with 2 MSBs set (LE16). Blob's a3 is the APM STA-add payload
+  # pointer even though this compatibility wrapper receives it as uint16.
+  let staAdd = cast[ptr ApmAssocStaAddIndPayload](cast[uint](aid))
+  let aidVal = staAdd.aid
   let aidField = aidVal or 0xC000'u16
-  cast[ptr uint8](writePtr + 4)[] = (aidField and 0xFF).uint8
-  cast[ptr uint8](writePtr + 5)[] = ((aidField shr 8) and 0xFF).uint8
+  fixedRsp.aid = aidField
 
   writePtr += 6
   cast[ptr pointer](buf)[] = cast[pointer](writePtr)
@@ -16251,75 +24071,55 @@ proc me_build_associate_rsp_impl(buf: pointer, staEntry: pointer,
 
   # Add Supported Rates IE -- rates from STA entry at staEntry+6
   # Blob: addi a1, s2, 6 where s2=a3=staEntry
-  let ratesPtr = cast[pointer](staEntryPtr + 6)
+  let ratesPtr = cast[pointer](addr staAdd.rateCount)
   totalLen += me_add_ie_supp_rates(buf, ratesPtr)
 
   # Add Extended Supported Rates if > 8 rates
   # Blob: lbu a4, 6(s2) -> rate count from staEntry+6 (first byte of rates struct)
-  let rateCount = cast[ptr uint8](staEntryPtr + 6)[]
+  let rateCount = staAdd.rateCount
   if rateCount > 8:
     totalLen += me_add_ie_ext_supp_rates(buf, ratesPtr, rateCount.uint32)
 
   # Check STA HT capabilities from staEntry+64 (blob: lw a5, 64(s2))
-  let staCap = cast[ptr uint32](staEntryPtr + 64)[]
+  let staCap = staAdd.flags
   if (staCap and 2) != 0:
     # Add HT Capabilities IE
     totalLen += me_add_ie_ht_capa(buf)
 
     # Add HT Operation IE with VIF entry for channel context
-    totalLen += me_add_ie_ht_oper(buf, cast[pointer](vifEntry))
+    totalLen += me_add_ie_ht_oper(buf, cast[pointer](vif))
 
   # Check WMM capabilities (bit 0 of staCap from staEntry+64)
   if (staCap and 1) != 0:
     # Write WMM Parameter Element (IEEE 802.11 vendor-specific IE)
-    let wp = cast[uint](cast[ptr pointer](buf)[])
-    let meEnvBase = cast[uint](addr me_env[0])
+    let bufPtrPtr = cast[ptr pointer](buf)
+    let wmm = wmmParameterIeAt(bufPtrPtr[])
+    let wmmSrc = mmWmmParameterSource()
+    wmm.ie.id = 0xDD'u8
+    wmm.ie.len = 0x18'u8
+    wmm.oui = [0x00'u8, 0x50, 0xF2]
+    wmm.ouiType = 0x02'u8
+    wmm.ouiSubtype = 0x01'u8
+    wmm.version = 0x01'u8
+    wmm.qosInfo = vif.modeByte452
+    wmm.reserved9 = 0
+    wmm.ac[0].setLe32(wmmSrc.acBe)
+    wmm.ac[1].setLe32(wmmSrc.acBk)
+    wmm.ac[2].setLe32(wmmSrc.acVi)
+    wmm.ac[3].setLe32(wmmSrc.acVo)
 
-    # Blob builds a 10-byte stack buffer: memcpy(sp+16, .LANCHOR0, 10) — this
-    # is the WMM template header including OUI/type/subtype/version. It then
-    # overwrites the QoS-Info byte at sp+24 from me_env+452, and zeros
-    # halfwords at sp+26/28/30 (reserved). Finally co_pack8p 9 bytes from
-    # sp+16..24 to the output (wp). Mirror this two-step layout.
-    var wmmStaging {.noinit.}: array[10, uint8]
-    const wmmIeTemplate: array[10, uint8] = [
-      0xDD'u8, 0x18, 0x00, 0x50, 0xF2, 0x02, 0x01, 0x01, 0x00, 0x00]
-    discard c_memcpy(addr wmmStaging[0], unsafeAddr wmmIeTemplate[0], 10.csize_t)
-    wmmStaging[8] = cast[ptr uint8](meEnvBase + 452)[]
-    # Pack the 9-byte header (DD/len/OUI/type/subtype/ver/QoS/reserved0)
-    co_pack8p(cast[pointer](wp), addr wmmStaging[0], 9)
-
-    # AC_BE parameters (from me_env+12)
-    let acBe = cast[ptr uint32](meEnvBase + 12)[]
-    cast[ptr uint32](wp + 10)[] = acBe
-
-    # AC_BK parameters (from me_env+8)
-    let acBk = cast[ptr uint32](meEnvBase + 8)[]
-    cast[ptr uint32](wp + 14)[] = acBk
-
-    # AC_VI parameters (from me_env+16)
-    let acVi = cast[ptr uint32](meEnvBase + 16)[]
-    cast[ptr uint32](wp + 18)[] = acVi
-
-    # AC_VO parameters (from me_env+20)
-    let acVo = cast[ptr uint32](meEnvBase + 20)[]
-    cast[ptr uint32](wp + 22)[] = acVo
-
-    let wmmLen: uint32 = 26  # 2 (header) + 24 (body)
-    cast[ptr pointer](buf)[] = cast[pointer](wp + wmmLen.uint)
+    let wmmLen = sizeof(WmmParameterIeView).uint32
+    bufPtrPtr[] = addr wmm.next[0]
     totalLen += wmmLen
 
     # BSS Max Idle Period IE (ID=90, Length=3)
-    # Blob: reads idle period from me_env+24 (halfword) and options from me_env+26 (byte)
-    let bp = cast[uint](cast[ptr pointer](buf)[])
-    cast[ptr uint8](bp + 0)[] = 90'u8         # BSS Max Idle Period IE ID
-    cast[ptr uint8](bp + 1)[] = 3'u8          # Length
-    let idlePeriod = cast[ptr uint16](meEnvBase + 24)[]
-    cast[ptr uint8](bp + 2)[] = (idlePeriod and 0xFF).uint8
-    cast[ptr uint8](bp + 3)[] = ((idlePeriod shr 8) and 0xFF).uint8
-    let idleOpts = cast[ptr uint8](meEnvBase + 26)[]
-    cast[ptr uint8](bp + 4)[] = idleOpts
-    cast[ptr pointer](buf)[] = cast[pointer](bp + 5)
-    totalLen += 5
+    let bssMaxIdle = bssMaxIdlePeriodIeAt(bufPtrPtr[])
+    bssMaxIdle.ie.id = 90'u8
+    bssMaxIdle.ie.len = 3'u8
+    bssMaxIdle.idlePeriod = wmmSrc.idlePeriod
+    bssMaxIdle.idleOptions = wmmSrc.idleOptions
+    bufPtrPtr[] = addr bssMaxIdle.next[0]
+    totalLen += sizeof(BssMaxIdlePeriodIeView).uint32
 
   return totalLen
 
@@ -16328,9 +24128,7 @@ proc me_build_deauthenticate*(buf: pointer, reason: uint16): uint32 {.exportc, c
   ## From blob (5 instrs): a0=buf, a1=reason_code(u16).
   ## Writes reason_code as LE16 at buf[0..1]. Returns 2.
   ## noinline: blob calls this as a real function.
-  let p = cast[ptr UncheckedArray[uint8]](buf)
-  p[0] = (reason and 0xFF).uint8
-  p[1] = ((reason shr 8) and 0xFF).uint8
+  managementReasonBodyAt(buf).reason = reason
   return 2
 
 proc me_build_beacon*(buf: pointer, vifIdx: uint8, lenOut: ptr uint16,
@@ -16341,36 +24139,31 @@ proc me_build_beacon*(buf: pointer, vifIdx: uint8, lenOut: ptr uint16,
   ## Writes 802.11 beacon frame header at buf[0..35], then appends IEs.
   ## Returns total body length (header + IEs).
   let vif = vifChannelForIdx(vifIdx)
-  let vifBase = cast[uint](vif)
   let apCfg = vifApConfig(vif)
   let privacy = apCfg.privacyFlag
-  let p = cast[ptr UncheckedArray[uint8]](buf)
+  let frame = beaconFrameFixedView(buf)
 
   # Write frame control: beacon = 0x80
-  p[0] = 0x80'u8; p[1] = 0; p[2] = 0; p[3] = 0
+  frame.frameControl = 0x0080'u16
+  frame.duration = 0
 
   # Write DA at offset 4..9: broadcast (FF:FF:FF:FF:FF:FF). Blob copies from
   # the global mac_addr_bcst symbol, not a function-local const — match so
   # the reloc shape is identical (PCREL_HI20 → mac_addr_bcst).
-  discard c_memcpy(cast[pointer](cast[uint](buf) + 4), addr mac_addr_bcst_fwd[0], 6)
-  discard c_memcpy(cast[pointer](cast[uint](buf) + 10),
-                   cast[pointer](addr vif.macAddr[0]), 6)
-  discard c_memcpy(cast[pointer](cast[uint](buf) + 16),
-                   cast[pointer](addr vif.macAddr[0]), 6)
+  discard c_memcpy(addr frame.addr1[0], addr mac_addr_bcst_fwd[0], 6.csize_t)
+  discard c_memcpy(addr frame.addr2[0], cast[pointer](addr vif.macAddr[0]), 6.csize_t)
+  discard c_memcpy(addr frame.addr3[0], cast[pointer](addr vif.macAddr[0]), 6.csize_t)
 
   # Sequence number: increment and write at offset 22..23
-  let meBase = cast[uint](addr me_env[0])
-  var seqNum = cast[ptr uint16](meBase + 84)[]
+  let meSeq = meBeaconSequence()
+  var seqNum = meSeq.seqCounter
   seqNum += 1
-  cast[ptr uint16](meBase + 84)[] = seqNum
+  meSeq.seqCounter = seqNum
   let seqField = seqNum shl 4
-  p[22] = (seqField and 0xFF).uint8
-  p[23] = ((seqField shr 8) and 0xFF).uint8
+  frame.seqCtrl = seqField
 
   let bcnInt = apCfg.beaconInterval
-  let bufU = cast[uint](buf)
-  cast[ptr uint8](bufU + 32)[] = (bcnInt and 0xFF).uint8
-  cast[ptr uint8](bufU + 33)[] = ((bcnInt shr 8) and 0xFF).uint8
+  frame.beaconInterval = bcnInt
 
   # Capability info
   var capInfo = me_build_capability(cast[pointer](vifIdx.uint))
@@ -16381,12 +24174,11 @@ proc me_build_beacon*(buf: pointer, vifIdx: uint8, lenOut: ptr uint16,
   let ssidDataPtr = cast[pointer](addr vif.supportedRatesLong[1])
 
   # Write capability at buf+34..35
-  cast[ptr uint8](bufU + 34)[] = (capInfo and 0xFF).uint8
-  cast[ptr uint8](bufU + 35)[] = ((capInfo shr 8) and 0xFF).uint8
+  frame.capabilityInfo = capInfo
 
   # Start building IEs at buf+36 (after 24-byte MAC header + 12-byte beacon body)
   # Blob: sp+12 tracks current write position (ptr-ptr pattern)
-  var ieBuf: pointer = cast[pointer](cast[uint](buf) + 36)
+  var ieBuf: pointer = beaconFrameIeBody(frame)
 
   # Add SSID IE (blob tail-merges into a single me_add_ie_ssid call).
   var ssidArgPtr: pointer = nil
@@ -16411,7 +24203,8 @@ proc me_build_beacon*(buf: pointer, vifIdx: uint8, lenOut: ptr uint16,
   # Add DS Parameter Set IE: compute channel from VIF channel frequency
   # Blob computes: channel = ((freq - 2412) / 5) + 1 for 2.4GHz
   let chanPtr = vif.operChan
-  let chanFreq = cast[ptr uint16](chanPtr)[]
+  let chan = cast[ptr ScanChannelEntry](chanPtr)
+  let chanFreq = chan.prim20Freq
   let chanNum = (((chanFreq.int - 2412) div 5) + 1).uint8
   bodyLen += me_add_ie_ds(addr ieBuf, chanNum)
 
@@ -16429,14 +24222,12 @@ proc me_build_beacon*(buf: pointer, vifIdx: uint8, lenOut: ptr uint16,
   bodyLen += timLen
 
   # Add WPA/RSN IE from VIF+492 (pre-built IE pointer) if present
-  let sec = vifSecurityAt(vifBase)
+  let sec = vifSecurity(vif)
   let wpaIePtr = cast[pointer](sec.rsnIePtr)
   if wpaIePtr != nil:
     let wpaIeLen = sec.rsnIeLen
-    let wp = cast[uint](ieBuf)
-    discard c_memcpy(ieBuf, wpaIePtr, wpaIeLen.csize_t)
+    ieBuf = copyIeBytes(ieBuf, wpaIePtr, wpaIeLen.uint)
     bodyLen += wpaIeLen.uint32
-    ieBuf = cast[pointer](wp + wpaIeLen.uint)
 
   # Add ERP IE (blob: li a1,0 -> no protection)
   bodyLen += me_add_ie_erp(addr ieBuf, 0)
@@ -16451,64 +24242,32 @@ proc me_build_beacon*(buf: pointer, vifIdx: uint8, lenOut: ptr uint16,
   bodyLen += me_add_ie_ht_capa(addr ieBuf)
 
   # Add HT Operation IE
-  bodyLen += me_add_ie_ht_oper(addr ieBuf, cast[pointer](vifBase))
+  bodyLen += me_add_ie_ht_oper(addr ieBuf, cast[pointer](vif))
 
   # Build WPA1 vendor IE inline if flagsWord bit 0 is set (from blob)
   if (flagsWord and 1) != 0:
-    let cipherType = vifWpaCipher(vifChannelAt(vifBase))
-    let wpaBase = cast[uint](ieBuf)
-    cast[ptr uint8](wpaBase + 0)[] = 0xDD   # vendor IE
-    cast[ptr uint8](wpaBase + 2)[] = 0x00   # OUI
-    cast[ptr uint8](wpaBase + 3)[] = 0x50
-    cast[ptr uint8](wpaBase + 4)[] = 0xF2
-    cast[ptr uint8](wpaBase + 5)[] = 0x01   # WPA type
-    cast[ptr uint8](wpaBase + 6)[] = 0x01   # version
-    cast[ptr uint8](wpaBase + 7)[] = 0x00
-    cast[ptr uint8](wpaBase + 8)[] = 0x00   # group cipher OUI
-    cast[ptr uint8](wpaBase + 9)[] = 0x50
-    cast[ptr uint8](wpaBase + 10)[] = 0xF2
-    cast[ptr uint8](wpaBase + 11)[] = cipherType
-    cast[ptr uint8](wpaBase + 12)[] = 0x01  # unicast count
-    cast[ptr uint8](wpaBase + 13)[] = 0x00
-    cast[ptr uint8](wpaBase + 14)[] = 0x00  # unicast cipher OUI
-    cast[ptr uint8](wpaBase + 15)[] = 0x50
-    cast[ptr uint8](wpaBase + 16)[] = 0xF2
-    cast[ptr uint8](wpaBase + 17)[] = cipherType
-    cast[ptr uint8](wpaBase + 18)[] = 0x01  # AKM count
-    cast[ptr uint8](wpaBase + 19)[] = 0x00
-    cast[ptr uint8](wpaBase + 20)[] = 0x00  # AKM OUI (PSK)
-    cast[ptr uint8](wpaBase + 21)[] = 0x50
-    cast[ptr uint8](wpaBase + 22)[] = 0xF2
-    cast[ptr uint8](wpaBase + 23)[] = 0x02
-    cast[ptr uint8](wpaBase + 1)[] = 22     # IE body length
-    ieBuf = cast[pointer](wpaBase + 24)
+    let cipherType = vifWpaCipher(vif)
+    ieBuf = writeWpaPskVendorIe(ieBuf, cipherType)
     bodyLen += 24
 
   # Add CSA IE if channel switch is pending (blob: co_pack8p at 0x26e)
   # Gate: chan_ctxt slot[14] != 0xFF indicates a pending CSA.
-  let chanCtxPtr = vifChannelAt(vifBase).chanCtxt
+  let chanCtxPtr = vif.chanCtxt
   if chanCtxPtr != nil:
     let chanCtx = chanCtxtAt(chanCtxPtr)
     let csaCount = chanCtx.invalidMarker
     if csaCount != 0xFF and csaCount != 0:
-      var csaIe {.noinit.}: array[5, uint8]
-      csaIe[0] = 37  # CSA IE ID
-      csaIe[1] = 3   # Length
-      csaIe[2] = chanCtx.channel.txPower  # switch mode
       # Blob uses T-Head custom insns to compute the channel inline.
       # For 2.4GHz, chan = ((freq - 2412) / 5) + 1. Inlining avoids the
       # phy_freq_to_channel call that blob doesn't emit from the CSA path.
       let csaFreq = chanCtx.channel.primFreq
-      csaIe[3] = ((csaFreq.int - 2412) div 5 + 1).uint8
-      csaIe[4] = csaCount  # switch count
-      co_pack8p(ieBuf, addr csaIe[0], 5)
-      ieBuf = cast[pointer](cast[uint](ieBuf) + 5)
+      let csaChannel = ((csaFreq.int - 2412) div 5 + 1).uint8
+      ieBuf = writeCsaIe(ieBuf, chanCtx.channel.txPower, csaChannel, csaCount)
       bodyLen += 5
 
   # Add application beacon IEs if registered
   if appIeBeaconLen > 0 and appIeBeaconPtr != nil:
-    discard c_memcpy(ieBuf, appIeBeaconPtr, appIeBeaconLen.csize_t)
-    ieBuf = cast[pointer](cast[uint](ieBuf) + appIeBeaconLen.uint)
+    ieBuf = copyIeBytes(ieBuf, appIeBeaconPtr, appIeBeaconLen.uint)
     bodyLen += appIeBeaconLen.uint32
 
   return bodyLen
@@ -16524,26 +24283,22 @@ proc me_build_probe_rsp*(buf: pointer, vifIdx: uint8,
   ## for DS param, and passes privacy to ERP IE.
   ## Returns total body length.
   let vif = vifChannelForIdx(vifIdx)
-  let vifBase = cast[uint](vif)
   let apCfg = vifApConfig(vif)
   let privacy = apCfg.privacyFlag
-  let p = cast[ptr UncheckedArray[uint8]](buf)
+  let frame = probeRspFixedBodyView(buf)
 
   let bcnInt = apCfg.beaconInterval
-  p[8] = (bcnInt and 0xFF).uint8
-  p[9] = ((bcnInt shr 8) and 0xFF).uint8
+  frame.beaconInterval = bcnInt
 
   # Capability info
   var capInfo = me_build_capability(cast[pointer](vifIdx.uint))
   if privacy != 0:
     capInfo = capInfo or 16  # set privacy bit
 
-  # Write capability at offset 10..11
-  p[10] = (capInfo and 0xFF).uint8
-  p[11] = ((capInfo shr 8) and 0xFF).uint8
+  frame.capabilityInfo = capInfo
 
   # Start building IEs at offset 12 (after timestamp+interval+capability)
-  var ieBuf: pointer = cast[pointer](cast[uint](buf) + 12)
+  var ieBuf: pointer = probeRspIeBody(frame)
 
   # Add SSID IE from VIF+386 (length) and VIF+387 (data)
   let ssidLen = vif.supportedRatesLong[0]
@@ -16567,8 +24322,9 @@ proc me_build_probe_rsp*(buf: pointer, vifIdx: uint8,
   # computes inline). Blob: lbu a0,2(a5) -> band; lhu a1,0(a5) -> freq;
   # call phy_freq_to_channel
   let chanPtr = vif.operChan
-  let chanFreq = cast[ptr uint16](chanPtr)[]
-  let chanBand = cast[ptr uint8](cast[uint](chanPtr) + 2)[]
+  let chan = cast[ptr ScanChannelEntry](chanPtr)
+  let chanFreq = chan.prim20Freq
+  let chanBand = chan.band
   let chanNum = phy_freq_to_channel(chanBand, chanFreq)
   let dsLen = me_add_ie_ds(addr ieBuf, chanNum)
 
@@ -16587,7 +24343,7 @@ proc me_build_probe_rsp*(buf: pointer, vifIdx: uint8,
   # Blob: beqz flagsWord&2 → skip HT IEs, jump to me_add_ie_wpa
   if (flagsWord and 2) != 0:
     bodyLen += me_add_ie_ht_capa(addr ieBuf)
-    bodyLen += me_add_ie_ht_oper(addr ieBuf, cast[pointer](vifBase))
+    bodyLen += me_add_ie_ht_oper(addr ieBuf, cast[pointer](vif))
 
   # Add WPA IE unconditionally (blob: a1=privacy as secMode, reloc 0x13e)
   bodyLen += me_add_ie_wpa(addr ieBuf, privacy)
@@ -16597,66 +24353,26 @@ proc me_build_probe_rsp*(buf: pointer, vifIdx: uint8,
     # Build WPA1 vendor IE inline (blob builds 4 cipher suites from VIF crypto state)
     # WPA OUI: 00-50-F2-01, version 1, group cipher, unicast cipher count
     let cipherType = vifWpaCipher(vif)
-    # WPA IE header: tag=0xDD, len, OUI(4), version(2), group_cipher(4), unicast_count(2), unicast(4), akm_count(2), akm(4)
-    let wpaIeBase = cast[uint](ieBuf)
-    cast[ptr uint8](wpaIeBase + 0)[] = 0xDD  # vendor IE tag
-    cast[ptr uint8](wpaIeBase + 2)[] = 0x00  # OUI byte 0
-    cast[ptr uint8](wpaIeBase + 3)[] = 0x50  # OUI byte 1
-    cast[ptr uint8](wpaIeBase + 4)[] = 0xF2  # OUI byte 2
-    cast[ptr uint8](wpaIeBase + 5)[] = 0x01  # WPA type
-    cast[ptr uint8](wpaIeBase + 6)[] = 0x01  # version low
-    cast[ptr uint8](wpaIeBase + 7)[] = 0x00  # version high
-    # Group cipher suite OUI (00-50-F2) + cipher type
-    cast[ptr uint8](wpaIeBase + 8)[] = 0x00
-    cast[ptr uint8](wpaIeBase + 9)[] = 0x50
-    cast[ptr uint8](wpaIeBase + 10)[] = 0xF2
-    cast[ptr uint8](wpaIeBase + 11)[] = cipherType
-    # Unicast cipher count = 1
-    cast[ptr uint8](wpaIeBase + 12)[] = 0x01
-    cast[ptr uint8](wpaIeBase + 13)[] = 0x00
-    # Unicast cipher suite
-    cast[ptr uint8](wpaIeBase + 14)[] = 0x00
-    cast[ptr uint8](wpaIeBase + 15)[] = 0x50
-    cast[ptr uint8](wpaIeBase + 16)[] = 0xF2
-    cast[ptr uint8](wpaIeBase + 17)[] = cipherType
-    # AKM count = 1
-    cast[ptr uint8](wpaIeBase + 18)[] = 0x01
-    cast[ptr uint8](wpaIeBase + 19)[] = 0x00
-    # AKM suite (PSK)
-    cast[ptr uint8](wpaIeBase + 20)[] = 0x00
-    cast[ptr uint8](wpaIeBase + 21)[] = 0x50
-    cast[ptr uint8](wpaIeBase + 22)[] = 0xF2
-    cast[ptr uint8](wpaIeBase + 23)[] = 0x02  # PSK
-    # Set length byte
-    cast[ptr uint8](wpaIeBase + 1)[] = 22  # total IE body length
-    # Advance buffer pointer and body length
-    ieBuf = cast[pointer](wpaIeBase + 24)
+    ieBuf = writeWpaPskVendorIe(ieBuf, cipherType)
     bodyLen += 24
 
   # Add CSA IE if channel switch is pending (blob: co_pack8p at 0x192)
-  let chanCtxPtr = vifChannelAt(vifBase).chanCtxt
+  let chanCtxPtr = vif.chanCtxt
   if chanCtxPtr != nil:
     let chanCtx = chanCtxtAt(chanCtxPtr)
     let csaCount = chanCtx.invalidMarker
     if csaCount != 0xFF and csaCount != 0:
-      var csaIe {.noinit.}: array[5, uint8]
-      csaIe[0] = 37  # CSA IE ID
-      csaIe[1] = 3   # Length
-      csaIe[2] = chanCtx.channel.txPower  # switch mode
       # Blob uses T-Head custom insns to compute the channel inline.
       # For 2.4GHz, chan = ((freq - 2412) / 5) + 1. Inlining avoids the
       # phy_freq_to_channel call that blob doesn't emit from the CSA path.
       let csaFreq = chanCtx.channel.primFreq
-      csaIe[3] = ((csaFreq.int - 2412) div 5 + 1).uint8
-      csaIe[4] = csaCount  # switch count
-      co_pack8p(ieBuf, addr csaIe[0], 5)
-      ieBuf = cast[pointer](cast[uint](ieBuf) + 5)
+      let csaChannel = ((csaFreq.int - 2412) div 5 + 1).uint8
+      ieBuf = writeCsaIe(ieBuf, chanCtx.channel.txPower, csaChannel, csaCount)
       bodyLen += 5
 
   # Add application probe response IEs if registered
   if appIeProbeRespLen > 0 and appIeProbeRespPtr != nil:
-    discard c_memcpy(ieBuf, appIeProbeRespPtr, appIeProbeRespLen.csize_t)
-    ieBuf = cast[pointer](cast[uint](ieBuf) + appIeProbeRespLen.uint)
+    ieBuf = copyIeBytes(ieBuf, appIeProbeRespPtr, appIeProbeRespLen.uint)
     bodyLen += appIeProbeRespLen.uint32
 
   # Write total length output
@@ -16672,29 +24388,22 @@ proc me_build_add_ba_req*(buf: pointer, param: pointer): uint32 {.exportc, cdecl
   ## [15]=buffer_size(u8), [16]=TID(u8), [17]=dialog_token(u8).
   ## Frame: [0]=category(3), [1]=action(0=ADDBA_REQ), [2]=dialog_token,
   ## [3..4]=BA_param_set(LE16), [5..6]=BA_timeout(LE16), [7..8]=start_seq(LE16).
-  let p = cast[ptr UncheckedArray[uint8]](buf)
-  p[0] = 3  # Category: Block Ack
-  p[1] = 0  # Action: ADDBA Request
+  let body = addBaReqActionBodyAt(buf)
+  body.category = 3  # Block Ack
+  body.action = 0    # ADDBA Request
   if param == nil:
     return 9
   let req = meAddBaReqParamView(param)
-  p[2] = req.dialogToken
+  body.dialogToken = req.dialogToken
   # BA Parameter Set: bit0=amsdu, bits1-4=TID, bits6-15=buffer_size
   let amsdu = req.amsduSupported.uint16 shl 1
   let tid = req.tid.uint16 shl 2
   let bufSize = req.bufferSize.uint16 shl 6
-  let baParams = amsdu or tid or bufSize
-  p[3] = (baParams and 0xFF).uint8
-  p[4] = ((baParams shr 8) and 0xFF).uint8
+  body.baParams = amsdu or tid or bufSize
   # BA Timeout Value
-  let timeout = req.timeout
-  p[5] = (timeout and 0xFF).uint8
-  p[6] = ((timeout shr 8) and 0xFF).uint8
+  body.timeout = req.timeout
   # Starting Sequence Number (SSN << 4)
-  let ssn = req.ssn
-  let ssnField = ssn shl 4
-  p[7] = (ssnField and 0xFF).uint8
-  p[8] = ((ssnField shr 8) and 0xFF).uint8
+  body.startSeq = req.ssn shl 4
   return 9
 
 proc me_build_add_ba_rsp*(buf: pointer, unused: pointer, baParams: uint16,
@@ -16703,43 +24412,31 @@ proc me_build_add_ba_rsp*(buf: pointer, unused: pointer, baParams: uint16,
   ## From blob (15 instrs): writes category, action, dialog token,
   ## status code, BA parameter set, and zero timeout.
   ## noinline: blob calls this as a real function.
-  let p = cast[ptr UncheckedArray[uint8]](buf)
-  p[0] = 3  # Category: Block Ack
-  p[1] = 1  # Action: ADDBA Response
-  p[2] = dialogToken
-  # Status Code (LE16)
-  p[3] = (statusCode and 0xFF).uint8
-  p[4] = ((statusCode shr 8) and 0xFF).uint8
-  # BA Parameter Set (LE16)
-  p[5] = (baParams and 0xFF).uint8
-  p[6] = ((baParams shr 8) and 0xFF).uint8
-  # BA Timeout Value = 0
-  p[7] = 0
-  p[8] = 0
+  let body = addBaRspActionBodyAt(buf)
+  body.category = 3  # Block Ack
+  body.action = 1    # ADDBA Response
+  body.dialogToken = dialogToken
+  body.statusCode = statusCode
+  body.baParams = baParams
+  body.timeout = 0
   return 9
 
 proc me_build_del_ba*(buf: pointer, baInfo: pointer, reasonCode: uint16): uint32 {.exportc, cdecl.} =
   ## Build DELBA action frame body (6 bytes).
   ## From blob (25 instrs): writes category=3, action=2, DELBA params, reason code.
   ## DELBA params: bit11 = initiator, bits 12-15 = TID.
-  let p = cast[ptr UncheckedArray[uint8]](buf)
-  p[0] = 3  # Category: Block Ack
-  p[1] = 2  # Action: DELBA
+  let body = delBaActionBodyAt(buf)
+  body.category = 3  # Block Ack
+  body.action = 2    # DELBA
   # Build DELBA Parameter Set
   var delbaParams: uint16 = 0
   if baInfo != nil:
-    let s = cast[ptr UncheckedArray[uint8]](baInfo)
-    let tid = s[16].uint16
-    let initiator = s[13].uint8
-    delbaParams = tid shl 12
-    if initiator == 1:
+    let info = delBaInfoView(baInfo)
+    delbaParams = info.tid.uint16 shl 12
+    if info.initiator == 1:
       delbaParams = delbaParams or 0x0800'u16  # set initiator bit
-  # DELBA Parameter Set (LE16)
-  p[2] = (delbaParams and 0xFF).uint8
-  p[3] = ((delbaParams shr 8) and 0xFF).uint8
-  # Reason Code (LE16)
-  p[4] = (reasonCode and 0xFF).uint8
-  p[5] = ((reasonCode shr 8) and 0xFF).uint8
+  body.delbaParams = delbaParams
+  body.reasonCode = reasonCode
   return 6
 
 proc me_build_capability*(param: pointer): uint16 {.exportc, cdecl.} =
@@ -16749,12 +24446,11 @@ proc me_build_capability*(param: pointer): uint16 {.exportc, cdecl.} =
   ## from vif[434] to determine short preamble (bit 4) and short slot (bit 5).
   ## Always sets ESS (bit 0) and privacy (bit 10).
   let vifIdx = encodedArgU8(param)
-  let vif = vifEntryAddr(vifIdx)
-  let vifView = vifChannelAt(vif)
+  let vif = vifChannelForIdx(vifIdx)
   var cap = 1'u16  # ESS bit
-  let vifType = vifView.vifType
+  let vifType = vif.vifType
   if vifType == VIF_TYPE_STA:
-    let beaconCap = cast[ptr uint16](vif + 434)[]
+    let beaconCap = vif.capabilityInfo
     if (beaconCap and 0x10) != 0:  # short preamble
       cap = cap or 0x10
     if (beaconCap and 0x20) != 0:  # short slot time
@@ -16792,15 +24488,15 @@ proc me_legacy_rate_bitfield_build*(rates: pointer, count: uint8): uint32 {.expo
   ## the index <= 11, sets (1 << index) in the result bitfield.
   ## Asserts at line 411 if me_rate_translate returns > 11.
   var bitfield: uint32 = 0
-  let ratesArr = cast[ptr UncheckedArray[uint8]](rates)
+  let rateSet = rateSetAt(rates)
   # The blob reads loop count from rates[0] (the rate count byte in the struct).
   # count parameter (a1) is used as a flag: when non-zero, extra rate filtering
   # is applied via custom instructions. When zero, all rates are included.
-  let rateCount = ratesArr[0].int
+  let rateCount = rateSet.count.int
   var i: int = 0
   while i < rateCount:
     # Each rate byte is at rates[1+i]; mask off basic rate flag (bit 7)
-    let rateByte = ratesArr[1 + i] and 0x7F
+    let rateByte = rateSet.rates[i] and 0x7F
     let rateIdx = me_rate_translate(rateByte.uint32)
     if rateIdx <= 11:
       bitfield = bitfield or (1'u32 shl rateIdx)
@@ -16857,22 +24553,21 @@ proc me_get_basic_rates*(vifIdx: uint8): uint32 {.exportc, cdecl.} =
   ## copies to output[output[0]+1], increments output[0].
   var outputBuf: pointer
   {.emit: ["asm volatile(\"mv %0, a1\" : \"=r\"(", outputBuf, ") );"].}
-  let rateSetPtr = cast[uint](cast[pointer](vifIdx))  # a0 = rate_set_ptr
-  let outU = cast[uint](outputBuf)
+  let rateSet = rateSetAt(cast[pointer](vifIdx))  # a0 = rate_set_ptr
+  let output = rateSetAt(outputBuf)
   # Clear output count
-  cast[ptr uint8](outU)[] = 0
+  output.count = 0
   # Iterate rate set
-  let rateCount = cast[ptr uint8](rateSetPtr)[]
+  let rateCount = rateSet.count
   var i: uint8 = 0
-  let dataStart = rateSetPtr + 1  # rates begin at offset 1
   while i < rateCount:
-    let rate = cast[ptr uint8](dataStart + i.uint)[]
+    let rate = rateSet.rates[i]
     # Sign-extend byte to check bit 7 (basic rate indicator)
     let sextRate = cast[int8](rate)
     if sextRate < 0:  # bit 7 set = basic rate
-      let curCount = cast[ptr uint8](outU)[]
-      cast[ptr uint8](outU + curCount.uint + 1)[] = rate
-      cast[ptr uint8](outU)[] = curCount + 1
+      let curCount = output.count
+      output.rates[curCount] = rate
+      output.count = curCount + 1
     i += 1
   return 0
 
@@ -16967,41 +24662,36 @@ proc me_extract_country_reg*(ieBuf: pointer, ieLen: uint32, out_ptr: pointer) {.
   if ie == nil:
     return
 
-  let ieAddr = cast[uint](ie)
-  let outU = cast[uint](out_ptr)
-
   # out_ptr+76 (0x4C) points to the channel regulatory struct
-  let chanRegBase = cast[ptr pointer](outU + 76)[]
-  let chanRegU = cast[uint](chanRegBase)
+  let chanReg = countryRegAt(countryRegOutputAt(out_ptr).channelReg)
 
   # Read environment byte from chanReg[2] (not from IE!)
-  let envByte = cast[ptr uint8](chanRegU + 2)[]
+  let envByte = chanReg.environment
   var envStep: uint8 = 1
   if envByte != 0:
     envStep = 4
 
   # Read country code from chanReg[0..1] and get target channel
-  let countryHalf = cast[ptr uint16](chanRegU)[]
-  let targetChan = phy_freq_to_channel(countryHalf.uint8, envStep.uint16)
+  let targetChan = phy_freq_to_channel(chanReg.countryHalf.uint8, envStep.uint16)
   let targetChanU8 = targetChan
 
   # IE data: [0]=id, [1]=len, then data starts at [2].
   # Country IE data: [2..3]=country code string, [4]=environment, [5..]=triplets
-  let ieLength = cast[ptr uint8](ieAddr + 1)[]
+  let countryIe = cast[ptr MacIeView](ie)
+  let ieLength = countryIe.len
   var pos: uint8 = 5  # first triplet starts at IE+5
 
   while pos.int < ieLength.int + 2:  # while within IE bounds (id+len+data)
-    let tripletBase = ieAddr + pos.uint
-    var firstChan = cast[ptr uint8](tripletBase)[]
-    let numChan = cast[ptr uint8](tripletBase + 1)[]
+    let payloadOff = pos - 2
+    let triplet = countryTripletAt(addr countryIe.macIePayload[payloadOff])
+    var firstChan = triplet.firstChan
 
     # Iterate through all channels in this triplet
     var chanIdx: uint8 = 0
-    while chanIdx != numChan:
+    while chanIdx != triplet.numChan:
       if firstChan == targetChanU8:
         # Match found: store max power from triplet byte 2
-        let maxPower = cast[ptr uint8](tripletBase + 2)[]
-        cast[ptr uint8](chanRegU + 4)[] = maxPower
+        chanReg.maxPower = triplet.maxPower
         return
       firstChan = firstChan + envStep
       chanIdx += 1
@@ -17112,13 +24802,14 @@ proc me_extract_csa*(ieBuf: pointer, ieLen: uint32, band: pointer,
 proc me_extract_power_constraint*(ieBuf: pointer, ieLen: uint32, out_ptr: pointer) {.exportc, cdecl.} =
   ## Extract power constraint from frame IEs (14 instructions in blob).
   ## Searches for IE with ID=32 (Power Constraint). If found, reads byte at
-  ## IE+2 (the constraint value) and stores it at out_ptr+132 (0x84).
+  ## IE+2 (the constraint value) and stores it in the blob output overlay
+  ## constraint slot at out_ptr+132 (0x84).
   ## If not found, stores 0 at that offset.
   let ie = mac_ie_find(ieBuf, ieLen, 32)
   var constraintVal: uint8 = 0
   if ie != nil:
     constraintVal = cast[ptr MacIeView](ie).macIePayload[0]
-  cast[ptr uint8](cast[uint](out_ptr) + 132)[] = constraintVal
+  powerConstraintOutputAt(out_ptr).constraint = constraintVal
 
 proc me_11n_nss_max*(param: pointer): uint8 {.exportc, cdecl.} =
   ## Get max NSS for 11n.
@@ -17161,10 +24852,9 @@ proc michael_block*(ctx: pointer, val: uint32) {.exportc, cdecl.} =
   ## ctx layout: [0]=uint32 L, [4]=uint32 R.
   ## From blob (43 instrs): XOR val into L, then perform the Michael
   ## permutation rounds: XSWAP, XOR, rotate, add operations.
-  let pL = cast[ptr uint32](ctx)
-  let pR = cast[ptr uint32](cast[uint](ctx) + 4)
-  var L = pL[]
-  var R = pR[]
+  let mic = michaelMicContextAt(ctx)
+  var L = mic.left
+  var R = mic.right
 
   L = L xor val
 
@@ -17188,8 +24878,8 @@ proc michael_block*(ctx: pointer, val: uint32) {.exportc, cdecl.} =
 
   L = L + R
 
-  pL[] = R
-  pR[] = L
+  mic.left = R
+  mic.right = L
 
 proc me_mic_init*(micCtx: pointer, key: pointer, sa: pointer, da: pointer,
                   priority: uint8) {.exportc, cdecl.} =
@@ -17199,12 +24889,13 @@ proc me_mic_init*(micCtx: pointer, key: pointer, sa: pointer, da: pointer,
   ## Loads key into L,R, then processes a2[0..5] || a3[0..5] || priority
   ## via four michael_block calls.
   let ctx = micCtx
+  let mic = michaelMicContextAt(ctx)
 
   # Load key words into ctx
-  cast[ptr uint32](ctx)[] = cast[ptr uint32](key)[]
-  cast[ptr uint32](cast[uint](ctx) + 4)[] = cast[ptr uint32](cast[uint](key) + 4)[]
-  cast[ptr uint32](cast[uint](ctx) + 8)[] = 0   # pending = 0
-  cast[ptr uint8](cast[uint](ctx) + 12)[] = 0   # nBytes = 0
+  mic.left = cast[ptr uint32](key)[]
+  mic.right = cast[ptr UncheckedArray[uint32]](key)[1]
+  mic.pending = 0
+  mic.nBytes = 0
 
   # Build packed LE32 words from sa (a2) and da (a3) per blob byte-build sequence
   let a2 = cast[ptr UncheckedArray[uint8]](sa)
@@ -17236,10 +24927,10 @@ proc me_mic_calc*(ctx: pointer, data: pointer, dataLen: uint32) {.exportc, cdecl
   ##
   ## Assembly trace: handles unaligned start and bulk 4-byte processing.
   ## Uses word-aligned loads with shift/mask for efficiency.
-  let ctxAddr = cast[uint](ctx)
+  let mic = michaelMicContextAt(ctx)
   let buf = cast[ptr UncheckedArray[uint8]](data)
-  var nBytes = cast[ptr uint8](ctxAddr + 12)[]
-  var pending = cast[ptr uint32](ctxAddr + 8)[]
+  var nBytes = mic.nBytes
+  var pending = mic.pending
   var offset: uint32 = 0
   var remaining = dataLen
 
@@ -17282,17 +24973,17 @@ proc me_mic_calc*(ctx: pointer, data: pointer, dataLen: uint32) {.exportc, cdecl
       nBytes = 0
 
   # Store state back
-  cast[ptr uint32](ctxAddr + 8)[] = pending
-  cast[ptr uint8](ctxAddr + 12)[] = nBytes
+  mic.pending = pending
+  mic.nBytes = nBytes
 
 proc me_mic_end*(ctx: pointer) {.exportc, cdecl.} =
   ## Finalize MIC calculation (from disassembly).
   ## Pads the remaining bytes with 0x5A marker byte, then performs a final
   ## michael_block call to produce the final MIC value.
   ## ctx layout: [0]=L, [4]=R, [8]=pending_word, [12]=nBytes.
-  let ctxAddr = cast[uint](ctx)
-  let nBytes = cast[ptr uint8](ctxAddr + 12)[]
-  let pending = cast[ptr uint32](ctxAddr + 8)[]
+  let mic = michaelMicContextAt(ctx)
+  let nBytes = mic.nBytes
+  let pending = mic.pending
   # Assert nBytes <= 3
   if nBytes > 3:
     # Blob uses assert_err, not assert_rec.
@@ -17576,10 +25267,11 @@ proc rc_init*(staEntry: pointer) {.exportc, cdecl.} =
   rcU8(stats, RCS_RETRY_LIMIT) = 5
 
   let txPolicy = sta.txPolicy
+  let policy = txPolicyAt(txPolicy)
 
-  # Encode 4 retry chain entries into txPolicy+20..+36
+  # Encode 4 retry chain entries into the policy descriptor retry-rate slots.
   # Each entry uses the index bytes stored at stats+128, +136, +144, +152
-  # and writes rate_config[index] | 0x80000000 to txPolicy+20+i*4.
+  # and writes rate_config[index] | 0x80000000.
   let retryIndexOffsets = [RCS_MAX_TP_IDX, RCS_MAX_TP2_IDX, RCS_MAX_PROB_IDX, RCS_RESERVED_U16]
   for i in 0 ..< 4:
     let retryIdx = rcU8(stats, retryIndexOffsets[i]).uint16
@@ -17587,7 +25279,7 @@ proc rc_init*(staEntry: pointer) {.exportc, cdecl.} =
       if retryIdx < nRates: rcRateConfig(stats, retryIdx.int)
       else: 0xFFFF'u16
     let packed = entryRate.uint32 or 0x80000000'u32
-    cast[ptr uint32](cast[uint](txPolicy) + 20 + (i * 4).uint)[] = packed
+    policy.retryRate[i] = packed
 
   # Read MACHW timestamp low for TX descriptor
   let tsNow = regRead(MACHW_TIMLO_REG)
@@ -17595,24 +25287,16 @@ proc rc_init*(staEntry: pointer) {.exportc, cdecl.} =
   # pkt_type = ((infoIdx + 8) & 0xFF) << 10
   let pktType = ((infoIdx.uint32 + 8) and 0xFF) shl 10
 
-  # status = 0xBADCAB1E
-  cast[ptr uint32](cast[uint](txPolicy) + 0)[] = 0xBADCAB1E'u32
-  # bufAddr
-  cast[ptr uint32](cast[uint](txPolicy) + 4)[] = bufAddr
-  # bufMask = (1 << (phy_get_ntx() + 1)) - 1
-  cast[ptr uint32](cast[uint](txPolicy) + 8)[] =
-    (1'u32 shl (ntx2.uint32 + 1'u32)) - 1'u32
-  # pkt_type
-  cast[ptr uint32](cast[uint](txPolicy) + 12)[] = pktType
-  # controlInfo: bits[7:0] and [15:8] encode per-rate retry counts. Bumped
-  # from blob default 0xFFFF0704 (4 + 7 tries) to 0xFFFF1F1F (31 + 31 tries)
-  # to give MAC HW many more chances to land an EAPOL ACK during 4-way.
-  cast[ptr uint32](cast[uint](txPolicy) + 16)[] = 0xFFFF1F1F'u32
-  # edcaParam0 = 0x2200
-  cast[ptr uint32](cast[uint](txPolicy) + 52)[] = 0x2200'u32
-  # edcaParam1 = VIF pointer
-  cast[ptr uint32](cast[uint](txPolicy) + 56)[] =
-    cast[uint32](cast[uint](sta.vif))
+  policy.status = 0xBADCAB1E'u32
+  policy.bufferAddr = bufAddr
+  policy.bufferMask = (1'u32 shl (ntx2.uint32 + 1'u32)) - 1'u32
+  policy.packetType = pktType
+  # controlInfo: bits[7:0] and [15:8] encode per-rate retry counts.
+  # Keep the vendor default for normal data frames; control-port robustness is
+  # handled by the EAPOL-specific retry template in txl_buffer_alloc.
+  policy.controlInfo = 0xFFFF0704'u32
+  policy.edcaParam0 = 0x2200'u32
+  policy.edcaParam1 = cast[uint32](cast[uint](sta.vif))
 
   # Set RC flags on station: sta[334] |= 0x11
   sta.mmFlagsBytes[0] = sta.mmFlagsBytes[0] or 0x11'u8
@@ -17890,19 +25574,19 @@ proc rc_calc_tp*(entry: pointer, stats: pointer): uint32 {.exportc, cdecl.} =
   ##   4. call rc_get_duration(rateConfig); s0 += duration
   ##   5. tp = (probEwma * 1000) / s0; tp *= 0xF4240 (→ scales to 1e6 basis)
   ##   6. return tp
-  let entryPtr = cast[uint](entry)
-  let statsPtr = stats
+  let rateEntry = rcRateEntryAt(entry)
+  let statsView = if stats != nil: rcStatsCounters(stats) else: nil
 
-  let probEwma = cast[ptr uint16](entryPtr + 8)[]
+  let probEwma = rateEntry.probEwma
   if probEwma < 0x1998'u16:
     return 0
-  let rateConfig = cast[ptr uint16](entryPtr + 10)[]
+  let rateConfig = rateEntry.rateConfig
 
   # AMPDU overhead: added only when rate is NOT a CCK rate.
   var overhead: uint32 = 0
   if not is_cck_group(rateConfig.uint32):
-    if statsPtr != nil:
-      let ampduLen = cast[ptr uint16](cast[uint](statsPtr) + RCS_AVG_AMPDU_LEN)[]
+    if statsView != nil:
+      let ampduLen = statsView.avgAmpduLen
       if ampduLen != 0:
         overhead = 0x35390'u32 div ampduLen.uint32
 
@@ -17921,6 +25605,11 @@ proc rc_update_counters*(staIdx: uint8, attemptCount: uint32, successCount: uint
   ## and total success counters. Then iterates per-rate entries at stats+128..160
   ## (5 AC slots, 8 bytes each), adding attempts/successes to each slot's counters
   ## with overflow checking via assert_err.
+  inc nimFwDbgRcUpdateCalls
+  nimFwDbgRcUpdateMeta = staIdx.uint32
+  nimFwDbgRcUpdateArgs =
+    (attemptCount and 0xFFFF'u32) or ((successCount and 0xFFFF'u32) shl 16)
+
   if staIdx > 4:
     return
 
@@ -17934,66 +25623,79 @@ proc rc_update_counters*(staIdx: uint8, attemptCount: uint32, successCount: uint
   if stats == nil:
     assert_err("rc.c", "rc.c", 1998)
     return
+  let counters = rcStatsCounters(stats)
 
   var attempts = attemptCount
   var successes = successCount
 
   # Increment total counters
-  let totalSuccess = rcU16(stats, RCS_TOTAL_SUCCESS)
-  rcU16(stats, RCS_TOTAL_SUCCESS) = totalSuccess + 1
-  let totalAttempts = rcU16(stats, RCS_TOTAL_ATTEMPTS)
-  rcU16(stats, RCS_TOTAL_ATTEMPTS) = totalAttempts + 1
+  counters.totalSuccess = counters.totalSuccess + 1
+  counters.totalAttempts = counters.totalAttempts + 1
 
   # Iterate retry-chain slots at stats+128..stats+152. Each slot stores a
   # rate-table index; the counters live in the selected rate entry.
-  var acOff: uint = 128
-  let acEnd: uint = 160
-  while acOff < acEnd:
+  var slotIdx = 0
+  while slotIdx < counters.retrySlots.len:
     if attempts == 0:
       break
 
-    let rateIdx = rcU16(stats, acOff.int)
-    let entryBase = cast[uint](stats) + rateIdx.uint * RC_RATE_ENTRY_SIZE.uint
-    var entryAttempts = cast[ptr uint16](entryBase + 4)[]
+    let rateIdx = counters.retrySlots[slotIdx].rateIdx
+    let entry = rcRateEntry(stats, rateIdx)
+    var entryAttempts = entry.attempts
+    nimFwDbgRcUpdateSlot =
+      slotIdx.uint32 or
+      (rateIdx.uint32 shl 8) or
+      ((attempts and 0xFF'u32) shl 16) or
+      ((successes and 0xFF'u32) shl 24)
+    nimFwDbgRcUpdateEntry = pointerAddrU32(cast[pointer](entry))
+    nimFwDbgRcUpdateCounts =
+      entry.attempts.uint32 or (entry.failures.uint32 shl 16)
 
     if successes > 3:
       entryAttempts = entryAttempts + 4'u16
-      cast[ptr uint16](entryBase + 4)[] = entryAttempts
+      entry.attempts = entryAttempts
       attempts -= 4
       successes -= 4
     else:
-      let addAttempts = (attempts and 0xFFFF'u32).uint16
+      let addAttempts32 = attempts and 0xFFFF'u32
+      let addAttempts = addAttempts32.uint16
       entryAttempts = entryAttempts + addAttempts
-      cast[ptr uint16](entryBase + 4)[] = entryAttempts
+      entry.attempts = entryAttempts
 
-      var entryFailures = cast[ptr uint16](entryBase + 6)[]
-      entryFailures = entryFailures + addAttempts - successes.uint16
-      cast[ptr uint16](entryBase + 6)[] = entryFailures
+      let oldFailures = entry.failures
+      let newFailures32 =
+        (oldFailures.uint32 + addAttempts32 - (successes and 0xFFFF'u32)) and
+        0xFFFF'u32
+      let entryFailures = newFailures32.uint16
+      entry.failures = entryFailures
       attempts = 0
       successes = 0
 
     # Vendor asserts when recorded attempts fall below recorded failures.
-    let curAttempts = cast[ptr uint16](entryBase + 4)[]
-    let curFailures = cast[ptr uint16](entryBase + 6)[]
-    if curAttempts < curFailures:
+    if entry.attempts < entry.failures:
+      nimFwDbgRcUpdateFail =
+        entry.attempts.uint32 or
+        (entry.failures.uint32 shl 16) or
+        ((rateIdx.uint32 and 0xFF'u32) shl 24) or
+        ((slotIdx.uint32 and 0xFF'u32) shl 28)
       assert_err("rc.c", "rc.c", 2040)
 
-    acOff += 8
+    inc slotIdx
 
   # Check update stage and advance state machine
-  let stage = rcU8(stats, RCS_UPDATE_STAGE)
+  let stage = counters.updateStage
   if stage == 0:
     # Check retry limit
-    let retryLimit = rcU8(stats, RCS_RETRY_LIMIT)
+    let retryLimit = counters.retryLimit
     if retryLimit == 0:
-      rcU8(stats, RCS_UPDATE_STAGE) = 1
+      counters.updateStage = 1
     else:
       let newLimit = retryLimit - 1
-      rcU8(stats, RCS_RETRY_LIMIT) = newLimit
+      counters.retryLimit = newLimit
   elif stage == 2:
     # Re-check with sta flags
     if (sta.mmFlagsBytes[0] and 1) == 0:
-      rcU8(stats, RCS_UPDATE_STAGE) = 3
+      counters.updateStage = 3
 
 proc rc_get_duration*(rateConfig: uint32, length: uint32): uint32 {.exportc, cdecl.} =
   ## Compute frame TX duration in microseconds for given rate_config and frame length
@@ -18074,8 +25776,6 @@ proc rc_update_bw_nss_max*(staIdx: uint8, nss: uint8, groupCnt: uint8) {.exportc
     assert_err("rc.c", "rc.c", 0x95D.cint)
     return
 
-  let rc = cast[uint](rcStats)
-
   # Check if nss and groupCnt are unchanged -- early exit
   if rcU8(rcStats, RCS_NO_SS) == nss and rcU8(rcStats, RCS_GROUP_CNT) == groupCnt:
     return
@@ -18118,11 +25818,7 @@ proc rc_update_bw_nss_max*(staIdx: uint8, nss: uint8, groupCnt: uint8) {.exportc
 
   # Clear all entry stats fields (throughput, attempts, old_prob, etc.)
   for i in 0 ..< nRates.int:
-    let entryBase = rc + i.uint * RC_RATE_ENTRY_SIZE.uint
-    cast[ptr uint8](entryBase + 6)[] = 0        # sample_skipped = 0
-    cast[ptr uint8](entryBase + 7)[] = 1        # initialized = 1
-    cast[ptr uint16](entryBase + 0)[] = 0       # attempts = 0
-    cast[ptr uint8](entryBase + 5)[] = 0        # old_prob = 0
+    rcClearRateEntryTransientStats(rcStats, i.uint16)
 
   # Sort by throughput and rebuild retry chain
   var tpArray {.noinit.}: array[RC_MAX_RATE_ENTRIES, uint32]
@@ -18146,8 +25842,6 @@ proc rc_update_preamble_type*(staIdx: uint8, shortPreamble: uint8) {.exportc, cd
     assert_err("rc.c", "rc.c", 0x9A2.cint)
     return
 
-  let rc = cast[uint](stats)
-
   # Check if preamble type actually changed
   let curBwMax = rcU8(stats, RCS_BW_MAX)
   if curBwMax == shortPreamble:
@@ -18166,8 +25860,8 @@ proc rc_update_preamble_type*(staIdx: uint8, shortPreamble: uint8) {.exportc, cd
   # Iterate rate entries and toggle short preamble bit
   var idx: uint16 = 0
   while idx < rcU16(stats, RCS_N_RATES):
-    let entryBase = rc + idx.uint * RC_RATE_ENTRY_SIZE.uint
-    var rateConfig = rcU16(stats, (idx.int * RC_RATE_ENTRY_SIZE + 10))
+    let entry = rcRateEntry(stats, idx)
+    var rateConfig = entry.rateConfig
 
     # Use the explicit is_cck_group helper to match blob's call-graph;
     # Nim's inlined `(rate>>11)&6 == 0 && mcs<4` test was equivalent but
@@ -18188,11 +25882,8 @@ proc rc_update_preamble_type*(staIdx: uint8, shortPreamble: uint8) {.exportc, cd
 
     # Store updated rate config
     # Clear and reinitialize entry fields
-    cast[ptr uint8](entryBase + 6)[] = 0    # sample_skipped = 0
-    cast[ptr uint8](entryBase + 7)[] = 1    # initialized = 1
-    rcU16(stats, idx.int * RC_RATE_ENTRY_SIZE + 10) = rateConfig
-    cast[ptr uint16](entryBase + 0)[] = 0   # attempts = 0
-    cast[ptr uint8](entryBase + 5)[] = 0    # old_prob = 0
+    rcClearRateEntryTransientStats(stats, idx)
+    entry.rateConfig = rateConfig
 
     idx += 1
 
@@ -18213,17 +25904,15 @@ proc rc_init_bcmc_rate*(staEntry: pointer, band: uint32) {.exportc, cdecl.} =
   ## Writes to 4 retry slots at txPolicy offsets 20, 24, 28, 32.
   let sta = staInfoAt(staEntry)
   let txPolicy = sta.txPolicy
+  let policy = txPolicyAt(txPolicy)
   let suppRates = sta.supportedRatesBitmap
   var rateConfig = band
   # Conditionally include CCK rate bit if band <= 3
   if band <= 3:
     rateConfig = rateConfig or (suppRates.uint32 and 0x400'u32)
   rateConfig = rateConfig or 0x20000000'u32  # format mod
-  let tp = cast[uint](txPolicy)
-  cast[ptr uint32](tp + 20)[] = rateConfig
-  cast[ptr uint32](tp + 24)[] = rateConfig
-  cast[ptr uint32](tp + 28)[] = rateConfig
-  cast[ptr uint32](tp + 32)[] = rateConfig
+  for retry in mitems(policy.retryRate):
+    retry = rateConfig
 
 proc rc_check_fixed_rate_config*(staIdx: uint8): bool {.exportc, cdecl.} =
   ## Check if fixed rate is valid for the station's capabilities (54 instrs in blob).
@@ -18538,8 +26227,7 @@ proc rc_update_retry_chain*(stats: pointer, param: pointer) {.exportc, cdecl.} =
       # Blob: is_cck_group at offset 0x13a — check if candidate is CCK
       if is_cck_group(scanRate.uint32):
         # CCK rate found during scan: clear initialized flag (blob: sb zero, 15(entry))
-        let scanEntryBase = cast[uint](stats) + scanIdx.uint * RC_RATE_ENTRY_SIZE.uint
-        cast[ptr uint8](scanEntryBase + 15)[] = 0
+        rcRateResetFields(stats, scanIdx.uint16).initialized = 0
       scanIdx -= 1
 
   # Step 3: Set max_tp2 from best remaining rate
@@ -18663,12 +26351,10 @@ proc rc_update_stats*(stats: pointer, needUpdate: uint8): uint8 {.exportc, cdecl
     # Clear all rate entry counters
     let nR = rcU16(stats, RCS_N_RATES)
     if nR <= 9:
-      var entryOff = cast[uint](stats) + 4  # first entry at offset 4
       for i in 0'u32 ..< nR.uint32:
-        # Clear attempt/success counters at entry+0 and entry+2
-        cast[ptr uint16](entryOff)[] = 0
-        cast[ptr uint16](entryOff + 2)[] = 0
-        entryOff += RC_RATE_ENTRY_SIZE.uint
+        let entry = rcRateEntry(stats, i.uint16)
+        entry.attempts = 0
+        entry.failures = 0
     return 0
 
   # Phase 4: Build 6-entry throughput table (blob: 6-step loop at 0x15E)
@@ -18838,26 +26524,27 @@ proc rc_sort_samples_tp*(stats: pointer, tpArray: pointer) {.exportc, cdecl.} =
   let nRates = rcU16(stats, RCS_N_RATES)
   if nRates <= 1:
     return
+  let tp = rcThroughputArray(tpArray)
   # Simple insertion sort of throughput values
   var n = nRates.int - 1
   while n > 0:
     for i in 1 ..< n:
-      let tp1 = cast[ptr uint32](cast[uint](tpArray) + (i * 4).uint)[]
-      let tp0 = cast[ptr uint32](cast[uint](tpArray) + ((i - 1) * 4).uint)[]
+      let tp1 = tp[i]
+      let tp0 = tp[i - 1]
       if tp1 > tp0:
         # Swap corresponding rate entries. Blob calls memmove (not memcpy)
         # for these 12-byte swaps — presumably the blob's standard-library
         # headers route the call through memmove. Using memmove keeps the
         # blob's call graph aligned.
-        var tmp {.noinit.}: array[12, uint8]
+        var tmp {.noinit.}: RcRateEntryView
         let e1 = rcRateEntryPtr(stats, i)
         let e0 = rcRateEntryPtr(stats, i - 1)
-        discard c_memmove(addr tmp[0], e1, 12.csize_t)
-        discard c_memmove(e1, e0, 12.csize_t)
-        discard c_memmove(e0, addr tmp[0], 12.csize_t)
+        discard c_memmove(addr tmp, e1, sizeof(RcRateEntryView).csize_t)
+        discard c_memmove(e1, e0, sizeof(RcRateEntryView).csize_t)
+        discard c_memmove(e0, addr tmp, sizeof(RcRateEntryView).csize_t)
         # Swap tp values
-        cast[ptr uint32](cast[uint](tpArray) + (i * 4).uint)[] = tp0
-        cast[ptr uint32](cast[uint](tpArray) + ((i - 1) * 4).uint)[] = tp1
+        tp[i] = tp0
+        tp[i - 1] = tp1
     dec n
 
 proc rc_calc_prob_ewma*(entry: pointer) {.exportc, cdecl.} =
@@ -18902,6 +26589,23 @@ proc rc_calc_prob_ewma*(entry: pointer) {.exportc, cdecl.} =
 #                   TX LAYER (txl_*)
 # ###########################################################################
 
+proc captureDhcpTxRateRaw(rate: ptr HostTxRateTemplateView) =
+  if rate == nil:
+    return
+  nimFwDbgDhcpTxRateRaw[0] = rate.magic
+  nimFwDbgDhcpTxRateRaw[1] = rate.ntxConfig
+  nimFwDbgDhcpTxRateRaw[2] = rate.bwMask
+  nimFwDbgDhcpTxRateRaw[3] = rate.pendingCount
+  nimFwDbgDhcpTxRateRaw[4] = rate.policyWord
+  nimFwDbgDhcpTxRateRaw[5] = rate.rateWord
+  nimFwDbgDhcpTxRateRaw[6] = rate.word24
+  nimFwDbgDhcpTxRateRaw[7] = rate.word28
+  nimFwDbgDhcpTxRateRaw[8] = rate.word32
+  nimFwDbgDhcpTxRateRaw[9] = cast[uint32](rate.txPower)
+  nimFwDbgDhcpTxRateRaw[10] = rate.word40
+  nimFwDbgDhcpTxRateRaw[11] = rate.word44
+  nimFwDbgDhcpTxRateRaw[12] = rate.word48
+
 # TX Buffer
 proc txl_buffer_init*() {.exportc, cdecl.} =
   ## Initialize TX buffer control descriptors.
@@ -18910,67 +26614,76 @@ proc txl_buffer_init*() {.exportc, cdecl.} =
   txl_buffer_reinit()
 
   for i in 0 ..< TX_BUFFER_POOL_SIZE:
-    let d = cast[uint](addr txl_buffer_control_desc[0]) + i.uint * 60'u
-    cast[ptr uint32](d + 0)[] = 0xBADCAB1E'u32
-    cast[ptr uint32](d + 4)[] = phy_get_ntx().uint32 shl 14
+    let d = txBufferControlDescAt(i)
+    d.magic = 0xBADCAB1E'u32
+    d.ntxConfig = phy_get_ntx().uint32 shl 14
     let maskNtx = phy_get_ntx().uint32
-    cast[ptr uint32](d + 8)[] = (1'u32 shl (maskNtx + 1'u32)) - 1'u32
-    cast[ptr uint32](d + 12)[] = 0
-    cast[ptr uint32](d + 16)[] = 0xFFFF0704'u32
-    cast[ptr uint32](d + 20)[] = 0
-    cast[ptr uint32](d + 24)[] = 0
-    cast[ptr uint32](d + 28)[] = 0
-    cast[ptr uint32](d + 32)[] = 0
-    cast[ptr uint32](d + 36)[] = regRead(MACHW_RNG_REG) and 0xFF'u32
-    cast[ptr uint32](d + 40)[] = regRead(MACHW_RNG_REG) and 0xFF'u32
-    cast[ptr uint32](d + 44)[] = regRead(MACHW_RNG_REG) and 0xFF'u32
-    cast[ptr uint32](d + 48)[] = regRead(MACHW_RNG_REG) and 0xFF'u32
-    cast[ptr uint32](d + 52)[] = 0x2200'u32
-    cast[ptr uint32](d + 56)[] = 0x003F0000'u32
+    d.bwMask = (1'u32 shl (maskNtx + 1'u32)) - 1'u32
+    d.pendingCount = 0
+    d.policyWord = 0xFFFF0704'u32
+    d.rateWord = 0
+    d.word24 = 0
+    d.word28 = 0
+    d.word32 = 0
+    d.txPower = cast[int32](regRead(MACHW_RNG_REG) and 0xFF'u32)
+    d.word40 = regRead(MACHW_RNG_REG) and 0xFF'u32
+    d.word44 = regRead(MACHW_RNG_REG) and 0xFF'u32
+    d.word48 = regRead(MACHW_RNG_REG) and 0xFF'u32
+    d.word52 = 0x2200'u32
+    d.word56 = 0x003F0000'u32
 
   for i in 0 ..< 2:
-    let d = cast[uint](addr txl_buffer_control_desc_bcmc[0]) + i.uint * 60'u
-    cast[ptr uint32](d + 0)[] = 0xBADCAB1E'u32
-    cast[ptr uint32](d + 4)[] = phy_get_ntx().uint32 shl 14
+    let d = txBufferControlBcmcDescAt(i)
+    d.magic = 0xBADCAB1E'u32
+    d.ntxConfig = phy_get_ntx().uint32 shl 14
     let maskNtx = phy_get_ntx().uint32
-    cast[ptr uint32](d + 8)[] = (1'u32 shl (maskNtx + 1'u32)) - 1'u32
-    cast[ptr uint32](d + 12)[] = 0
-    cast[ptr uint32](d + 16)[] = 0xFFFF0704'u32
-    cast[ptr uint32](d + 20)[] = 0
-    cast[ptr uint32](d + 24)[] = 0
-    cast[ptr uint32](d + 28)[] = 0
-    cast[ptr uint32](d + 32)[] = 0
-    cast[ptr uint32](d + 36)[] = regRead(MACHW_RNG_REG) and 0xFF'u32
-    cast[ptr uint32](d + 40)[] = 0
-    cast[ptr uint32](d + 44)[] = 0
-    cast[ptr uint32](d + 48)[] = 0
-    cast[ptr uint32](d + 52)[] = 0
-    cast[ptr uint32](d + 56)[] = 0x003F0000'u32
+    d.bwMask = (1'u32 shl (maskNtx + 1'u32)) - 1'u32
+    d.pendingCount = 0
+    d.policyWord = 0xFFFF0704'u32
+    d.rateWord = 0
+    d.word24 = 0
+    d.word28 = 0
+    d.word32 = 0
+    d.txPower = cast[int32](regRead(MACHW_RNG_REG) and 0xFF'u32)
+    d.word40 = 0
+    d.word44 = 0
+    d.word48 = 0
+    d.word52 = 0
+    d.word56 = 0x003F0000'u32
 
 proc txl_buffer_reinit*() {.exportc, cdecl.} =
   ## Reinitialize TX buffer pool indices (5 instrs).
-  ## From blob: loads txl_buffer_env base, stores 0 to offset 180 (allocIdx)
-  ## and offset 184 (freeIdx). This matches the TxBufferDesc field offsets
-  ## after the descriptor arrays. Same as clearing allocIdx and freeIdx.
-  cast[ptr uint32](cast[uint](addr txl_buffer_env[0]) + 180'u)[] = 0
-  cast[ptr uint32](cast[uint](addr txl_buffer_env[0]) + 184'u)[] = 0
+  ## From blob: clears txl_buffer_env offsets 180/184, which are the first
+  ## backup queue head/tail pointers in the exported buffer environment.
+  txlBufferEnvView().backupQueues[0].first = nil
+  txlBufferEnvView().backupQueues[0].last = nil
 
 proc txl_buffer_reset*() {.exportc, cdecl, noinline.} =
   ## Reset TX buffer pool indices.
-  cast[ptr uint32](cast[uint](addr txl_buffer_env[0]) + 180'u)[] = 0
-  cast[ptr uint32](cast[uint](addr txl_buffer_env[0]) + 184'u)[] = 0
+  txlBufferEnvView().backupQueues[0].first = nil
+  txlBufferEnvView().backupQueues[0].last = nil
 
-proc txlApplyEapolRetryPolicy(dmaBase: uint) {.inline.} =
-  ## Vendor keeps the primary control-port rate from RC, but mixes in robust
-  ## legacy fallbacks for EAPOL retries. Leaving all retries as high HT rates
-  ## makes M2 unreliable on the AP used by the hardware validation test.
-  cast[ptr uint32](dmaBase + 24'u)[] = 0x8000040A'u32
-  cast[ptr uint32](dmaBase + 28'u)[] = 0x80001007'u32
-  cast[ptr uint32](dmaBase + 32'u)[] = 0x80000400'u32
-  cast[ptr uint32](dmaBase + 36'u)[] = 0x00000070'u32
-  cast[ptr uint32](dmaBase + 40'u)[] = 0x00000070'u32
-  cast[ptr uint32](dmaBase + 44'u)[] = 0x00000070'u32
-  cast[ptr uint32](dmaBase + 48'u)[] = 0x00000070'u32
+proc txlApplyEapolRetryPolicy(rate: ptr HostTxRateTemplateView) {.inline.} =
+  ## Control-port frames must be ACKed before WPA can advance. The negotiated
+  ## RC primary can select data rates that this AP will not ACK for EAPOL M2;
+  ## use the same low basic-rate word that already works for management TX.
+  when not defined(bl808WifiKeepEapolRcPrimary):
+    rate.rateWord = 0x80000400'u32
+  when defined(bl808WifiForceEapolPrimaryLegacy):
+    rate.rateWord = 0x8000040A'u32
+  rate.word24 = 0x8000040A'u32
+  rate.word28 = 0x80001007'u32
+  rate.word32 = 0x80000400'u32
+  rate.txPower = 0x00000070'i32
+  rate.word40 = 0x00000070'u32
+  rate.word44 = 0x00000070'u32
+  rate.word48 = 0x00000070'u32
+
+proc txlApplyBootstrapDataRetryPolicy(rate: ptr HostTxRateTemplateView) {.inline.} =
+  ## Immediately after 4WHS the normal RC template can still pick a primary
+  ## data rate that the AP does not ACK. Keep DHCP/ARP bootstrap traffic on the
+  ## same conservative retry chain used for ACK-critical control-port frames.
+  txlApplyEapolRetryPolicy(rate)
 
 proc txl_buffer_alloc*(param: pointer, queueIdx: uint32, flags: uint32): pointer {.exportc, cdecl.} =
   ## Allocate a TX buffer descriptor. Blob ABI: a0=tx_desc, a1=queue idx, a2=user_idx.
@@ -19005,23 +26718,71 @@ proc txl_buffer_alloc*(param: pointer, queueIdx: uint32, flags: uint32): pointer
   bufLink.userIdx = cast[uint8](flags and 0xFF'u32)
 
   # Compute MAC header write point: bufPtr = desc + 556 + hdrLen.
-  let bufPtr = cast[pointer](cast[uint](addr bufLink.macHeader[0]) + hdrLen.uint)
+  let bufPtr = hostTxLinkMacHdrPtr(bufLink, hdrLen.uint)
 
   # Build the 802.11 header inline at bufPtr.
   txu_cntrl_frame_build(param, bufPtr)
 
   # Copy the TX buffer control template. Vendor emits T-Head indexed load/store
-  # opcodes here, equivalent to copying 15 u32 words from buf_control+0.
-  let bufferControl = cast[uint](desc.policy)
-  let dmaBase = cast[uint](hostTxRateTemplate(bufLink))
-  for i in 0'u32 ..< 15'u32:
-    cast[ptr uint32](dmaBase + i * 4'u32)[] =
-      cast[ptr uint32](bufferControl + i.uint * 4'u)[]
+  # opcodes here, equivalent to copying the 60-byte TxBufferControlView.
+  let bufferControl = txBufferControlAt(desc.policy)
+  let rateTemplate = hostTxRateTemplate(bufLink)
+  discard c_memcpy(addr bufLink.rateTemplate[0], bufferControl,
+                   sizeof(TxBufferControlView).csize_t)
 
   let protoTrace = desc.frameLen
+  let protoFrameType = lmacGateHalfword(protoTrace)
+  let isBootstrapData =
+    protoFrameType == 0x0800'u16 or protoFrameType == 0x0806'u16
+  if isBootstrapData:
+    txlApplyBootstrapDataRetryPolicy(rateTemplate)
+  if protoFrameType == 0x0800'u16:
+    nimFwDbgDhcpTxPolicy = pointerAddrU32(desc.policy)
+    nimFwDbgDhcpTxBufDesc = pointerAddrU32(cast[pointer](bufLink))
+    nimFwDbgDhcpTxHwDesc = pointerAddrU32(desc.hwDesc)
+    captureDhcpTxRateRaw(rateTemplate)
+    nimFwDbgDhcpTxRate0 =
+      rateTemplate.magic xor (rateTemplate.ntxConfig shl 16)
+    nimFwDbgDhcpTxRate1 =
+      rateTemplate.pendingCount xor (rateTemplate.policyWord shl 16)
+    nimFwDbgDhcpTxRate2 =
+      rateTemplate.rateWord xor (cast[uint32](rateTemplate.txPower) shl 16)
+    nimFwDbgDhcpTxRate3 =
+      rateTemplate.word40 xor (rateTemplate.word44 shl 16) xor
+      rateTemplate.word48
+    nimFwDbgDhcpTxLink0 = bufLink.word308
+    nimFwDbgDhcpTxLink1 = bufLink.word312
   let isEapol = protoTrace == 0x8E88'u16 or protoTrace == 0x888E'u16
   if isEapol:
-    txlApplyEapolRetryPolicy(dmaBase)
+    txlApplyEapolRetryPolicy(rateTemplate)
+    nimFwDbgEapolTxPolicy = pointerAddrU32(desc.policy)
+    nimFwDbgEapolTxBufDesc = pointerAddrU32(cast[pointer](bufLink))
+    nimFwDbgEapolTxHwDesc = pointerAddrU32(desc.hwDesc)
+    nimFwDbgEapolTxRate0 =
+      rateTemplate.magic xor (rateTemplate.ntxConfig shl 16)
+    nimFwDbgEapolTxRate1 =
+      rateTemplate.pendingCount xor (rateTemplate.policyWord shl 16)
+    nimFwDbgEapolTxRate2 =
+      rateTemplate.rateWord xor (cast[uint32](rateTemplate.txPower) shl 16)
+    nimFwDbgEapolTxRate3 =
+      rateTemplate.word24 xor (rateTemplate.word28 shl 1) xor
+      (rateTemplate.word32 shl 2) xor (rateTemplate.word48 shl 16)
+    nimFwDbgEapolTxLink0 = bufLink.word308
+    nimFwDbgEapolTxLink1 = bufLink.word312
+  when defined(bl808WifiConnectTrace):
+    if protoFrameType == 0x0800'u16 or protoFrameType == 0x0806'u16:
+      nimFwConnectTrace2U32("[WIFI-CT] txbuf_data ",
+                            protoFrameType.uint32 or
+                              (queueIdx shl 16) or
+                              (hdrLen.uint32 shl 24),
+                            bufLink.headerThd.payloadStart)
+      nimFwConnectTrace2U32("[WIFI-CT] txbuf_data2 ",
+                            bufLink.headerThd.payloadEnd,
+                            bufLink.headerThd.flags)
+      nimFwConnectTraceBytes("[WIFI-RAW] tx_data ",
+                             cast[pointer](addr bufLink.macHeader[0]),
+                             hdrLen.uint32,
+                             80)
 
   # Link into txl_buffer_env[queueIdx + 22], matching txl_int_fake_transfer.
   # dmaEntry = desc + 208 is both the return value and the node pushed.
@@ -19031,8 +26792,8 @@ proc txl_buffer_alloc*(param: pointer, queueIdx: uint32, flags: uint32): pointer
                    queueIdx or (hdrLen.uint32 shl 8),
                    cast[uint32](dmaEntry))
     nimFwTrace2U32("[WIFI-NIMFW] txbuf_ctrl ",
-                   cast[uint32](bufferControl),
-                   cast[ptr uint32](dmaBase)[])
+                   cast[uint32](cast[uint](bufferControl)),
+                   rateTemplate.magic)
     when defined(bl808WifiConnectTrace):
       if nimFwDbgEapolTraceCount < 64'u32:
         nimFwConnectTrace2U32("[WIFI-CT] txbuf_eapol ",
@@ -19040,14 +26801,14 @@ proc txl_buffer_alloc*(param: pointer, queueIdx: uint32, flags: uint32): pointer
                                 (padLen.uint32 shl 16),
                               cast[uint32](dmaEntry))
         nimFwConnectTrace2U32("[WIFI-CT] txbuf_ctrl ",
-                              cast[uint32](bufferControl),
-                              cast[ptr uint32](dmaBase)[])
+                              cast[uint32](cast[uint](bufferControl)),
+                              rateTemplate.magic)
         nimFwConnectTrace2U32("[WIFI-CT] txbuf_pol0 ",
-                              cast[ptr uint32](dmaBase + 4)[],
-                              cast[ptr uint32](dmaBase + 20)[])
+                              rateTemplate.ntxConfig,
+                              rateTemplate.rateWord)
         nimFwConnectTrace2U32("[WIFI-CT] txbuf_pol1 ",
-                              cast[ptr uint32](dmaBase + 36)[],
-                              cast[ptr uint32](dmaBase + 52)[])
+                              cast[uint32](rateTemplate.txPower),
+                              rateTemplate.word48)
   let head = txBackupQueueHeadPtr(queueIdx)
   let tailPtr = txBackupQueueTailPtr(queueIdx)
   let listTail = head[]
@@ -19111,6 +26872,33 @@ proc txl_buffer_update_thd*(param: pointer) {.exportc, cdecl.} =
     lastEntry.flags = 0
     lastEntry.next = nil
   hwDesc.controlFlags = 256
+  let protoFrameType = lmacGateHalfword(desc.frameLen)
+  if protoFrameType == 0x0800'u16:
+    nimFwDbgDhcpTxThd0 =
+      hwDesc.status xor (hwDesc.frameLen shl 16)
+    nimFwDbgDhcpTxThd1 =
+      hwDesc.word36 xor (pointerAddrU32(hwDesc.chainedThd) shl 16)
+    nimFwDbgDhcpTxThd2 =
+      hwDesc.word56 xor (hwDesc.controlFlags shl 16)
+  when defined(bl808WifiConnectTrace):
+    if protoFrameType == 0x0800'u16 or protoFrameType == 0x0806'u16:
+      let payload0 = addr linkDesc.payloadThd[0]
+      nimFwConnectTrace2U32("[WIFI-CT] txthd_data ",
+                            protoFrameType.uint32 or
+                              (desc.hdrLen.uint32 shl 16) or
+                              (desc.secTailLen.uint32 shl 24),
+                            hwDesc.frameLen)
+      nimFwConnectTrace2U32("[WIFI-CT] txthd_ptr ",
+                            payload0.payloadStart,
+                            payload0.payloadEnd)
+      nimFwConnectTrace2U32("[WIFI-CT] txthd_buf ",
+                            desc.bufferPtrs[0],
+                            desc.bufferLens[0])
+      if desc.bufferPtrs[0] != 0:
+        nimFwConnectTraceBytes("[WIFI-RAW] tx_payload ",
+                               cast[pointer](desc.bufferPtrs[0].uint),
+                               desc.bufferLens[0],
+                               384)
 
 # TX Confirm
 proc txl_cfm_init*() {.exportc, cdecl.} =
@@ -19128,6 +26916,50 @@ proc txl_cfm_init*() {.exportc, cdecl.} =
   co_list_init(addr cfmEnv.lists[3])
   co_list_init(addr cfmEnv.lists[4])
 
+proc noteMgmtTxConfirm(desc: ptr HostTxDescView; status: uint32; phase: uint32) {.inline.} =
+  if desc == nil or desc.bufDesc == nil or desc.hwDesc == nil:
+    return
+  let link = hostTxLinkDescAt(desc.bufDesc)
+  let fc = link.macHeader[0].uint32 or (link.macHeader[1].uint32 shl 8)
+  if fc != 0x00B0'u32 and fc != 0x0000'u32:
+    return
+  let hw = hostTxHwDescAt(desc.hwDesc)
+  let meta =
+    desc.frameLen.uint32 or
+    (desc.staInfoIdx.uint32 shl 16) or
+    (desc.vifIdx.uint32 shl 24) or
+    (phase shl 28)
+  if fc == 0x00B0'u32:
+    case phase
+    of 0'u32:
+      inc nimFwDbgAuthCfmPush
+    of 1'u32:
+      inc nimFwDbgAuthCfmFrame
+    of 2'u32:
+      inc nimFwDbgAuthCfmEvt
+    else:
+      discard
+    nimFwDbgAuthCfmStatus = status
+    nimFwDbgAuthCfmHwStatus = hw.confirmStatus or (hw.status shl 16)
+    nimFwDbgAuthCfmDesc = pointerAddrU32(cast[pointer](desc))
+    nimFwDbgAuthCfmMeta = meta
+    nimFwDbgAuthCfmFc = fc
+  else:
+    case phase
+    of 0'u32:
+      inc nimFwDbgAssocCfmPush
+    of 1'u32:
+      inc nimFwDbgAssocCfmFrame
+    of 2'u32:
+      inc nimFwDbgAssocCfmEvt
+    else:
+      discard
+    nimFwDbgAssocCfmStatus = status
+    nimFwDbgAssocCfmHwStatus = hw.confirmStatus or (hw.status shl 16)
+    nimFwDbgAssocCfmDesc = pointerAddrU32(cast[pointer](desc))
+    nimFwDbgAssocCfmMeta = meta
+    nimFwDbgAssocCfmFc = fc
+
 proc txl_cfm_push*(desc: pointer, status: uint32, acIdx: uint32) {.exportc, cdecl.} =
   ## Push a TX descriptor to confirmation queue.
   ## Blob ABI: a0=desc, a1=status, a2=ac_idx.
@@ -19141,6 +26973,7 @@ proc txl_cfm_push*(desc: pointer, status: uint32, acIdx: uint32) {.exportc, cdec
   ## target; the blob signals the KE scheduler, not the host IPC.
   inc nimFwDbgCfmPush
   let txDesc = hostTxDescAt(desc)
+  noteMgmtTxConfirm(txDesc, status, 0'u32)
   let fenvPtr = txDesc.hwDesc
   var cfmHeadTrace = 0'u32
   if fenvPtr != nil:
@@ -19457,16 +27290,13 @@ proc txl_cntrl_init*() {.exportc, cdecl.} =
   txl_frame_init()
   let txCtrl = txControlEnv()
   discard c_memset(txCtrl, 0, 92.csize_t)
-  # MAC HW TX descriptor base addresses: 0x24A00080 + ac*4
   for ac in 0'u32 ..< NUM_TX_QUEUES.uint32:
     let acCtrl = txControlAc(ac)
     # co_list_init on the list at offset 4
     co_list_init(addr acCtrl.pending)
     # Clear first descriptor pointer
     acCtrl.current = nil
-    # Store MAC HW descriptor address (base 0x24A00080 + ac*4) as half-word
-    let hwDescAddr = (0x24A00080'u32 + ac * 4).uint16
-    acCtrl.packetCount = hwDescAddr
+    acCtrl.packetCount = ipcTxHwDescWordAddrHalfword(ac)
     # Clear busy flag
     acCtrl.reserved14 = 0
   # Clear global busy flag
@@ -19533,7 +27363,7 @@ proc txl_cntrl_push*(param: pointer, ac: uint8): uint8 {.exportc, cdecl.} =
     let bufDesc = txl_buffer_alloc(param, ac.uint32, 0'u32)
     desc.bufDesc = bufDesc
     if bufDesc != nil:
-      cast[ptr pointer](cast[uint](bufDesc) + 20)[] = param
+      hostTxBufferedLinkAt(bufDesc).txDesc = param
     txl_buffer_update_thd(param)
   # Handle payload backup (blob: txl_payload_handle_backup at 0x66)
   txl_payload_handle_backup(nil)
@@ -19562,7 +27392,6 @@ proc txl_cntrl_push_int*(param: pointer, ac: uint8): uint8 {.exportc, cdecl.} =
   inc nimFwDbgTxIntEnter
   let rcStatsPtr = desc.hwDesc
   let txCtrl = txControlEnv()
-  let staTabBase = cast[uint](addr sta_info_tab[0])
   let linkPtrTrace = desc.bufDesc
   let fcTrace =
     if linkPtrTrace != nil: hostTxLinkDescAt(linkPtrTrace).macHeader[0]
@@ -19590,8 +27419,21 @@ proc txl_cntrl_push_int*(param: pointer, ac: uint8): uint8 {.exportc, cdecl.} =
 
   # Step 1: Check TX readiness (blob computes VIF from desc[47], then calls txl_cntrl_tx_check)
   let vifIdxTx = desc.vifIdx
-  let vifEntryTx = cast[pointer](cast[uint](addr vif_info_tab[0]) + vifIdxTx.uint * VIF_ENTRY_SIZE.uint)
+  let vifTx = vifChannelForIdx(vifIdxTx)
+  let vifEntryTx = cast[pointer](vifTx)
   let txReady = txl_cntrl_tx_check(vifEntryTx)
+  let chanEnvForDiag = chanEnvView()
+  nimFwDbgTxIntLastMeta =
+    ac.uint32 or (vifIdxTx.uint32 shl 8) or
+    (desc.staIdx.uint32 shl 16) or (desc.staInfoIdx.uint32 shl 24)
+  nimFwDbgTxIntLastChan =
+    txReady.uint32 or
+    (chan_is_on_channel(vifEntryTx).uint32 shl 8) or
+    (chanEnvForDiag.flags.uint32 shl 16) or
+    (chanEnvForDiag.ctxtCount.uint32 shl 24)
+  nimFwDbgTxIntLastQueue =
+    pointerAddrU32(cast[pointer](txControlAc(ac.uint32).pending.first))
+  nimFwDbgTxIntLastHw = pointerAddrU32(desc.hwDesc)
   if traceMgmt:
     nimFwTrace2U32("[WIFI-NIMFW] txint_enter ",
                    ac.uint32 or (vifIdxTx.uint32 shl 8) or
@@ -19600,7 +27442,7 @@ proc txl_cntrl_push_int*(param: pointer, ac: uint8): uint8 {.exportc, cdecl.} =
     let chanEnvTrace = chanEnvView()
     let curCtxtTrace = chanEnvTrace.currentCtxt
     let schedCtxtTrace = chanEnvTrace.scheduledCtxt
-    let vifCtxtTrace = vifChannelAt(vifEntryTx).chanCtxt
+    let vifCtxtTrace = vifTx.chanCtxt
     let flagsTrace = chanEnvTrace.flags
     let cntTrace = chanEnvTrace.ctxtCount
     let onChanTrace = chan_is_on_channel(vifEntryTx)
@@ -19608,10 +27450,10 @@ proc txl_cntrl_push_int*(param: pointer, ac: uint8): uint8 {.exportc, cdecl.} =
     var cur23Trace = 0'u8
     var cur25Trace = 0'u8
     if curCtxtTrace != nil:
-      let curUTrace = cast[uint](curCtxtTrace)
-      cur22Trace = cast[ptr uint8](curUTrace + 22)[]
-      cur23Trace = cast[ptr uint8](curUTrace + 23)[]
-      cur25Trace = cast[ptr uint8](curUTrace + 25)[]
+      let curTrace = chanCtxtAt(curCtxtTrace)
+      cur22Trace = curTrace.status
+      cur23Trace = curTrace.idx
+      cur25Trace = curTrace.altIdx
     nimFwTrace2U32("[WIFI-NIMFW] txint_chan ",
                    txReady.uint32 or (onChanTrace.uint32 shl 8) or
                      (flagsTrace.uint32 shl 16) or (cntTrace.uint32 shl 24),
@@ -19630,13 +27472,21 @@ proc txl_cntrl_push_int*(param: pointer, ac: uint8): uint8 {.exportc, cdecl.} =
                               (desc.staInfoIdx.uint32 shl 16),
                             txReady.uint32 or (onChanTrace.uint32 shl 8) or
                               (flagsTrace.uint32 shl 16) or (cntTrace.uint32 shl 24))
+      let linkRawTrace = hostTxLinkDescAt(linkPtrTrace)
+      nimFwConnectTraceBytes("[WIFI-RAW] tx_mgt ",
+                             cast[pointer](addr linkRawTrace.macHeader[0]),
+                             hostTxHwDescAt(desc.hwDesc).frameLen,
+                             96)
       nimFwConnectTrace2U32("[WIFI-CT] txint_ctxt ",
                             cast[uint32](cast[uint](curCtxtTrace)),
                             cast[uint32](cast[uint](vifCtxtTrace)))
   if txReady:
+    inc nimFwDbgTxIntReady
     # TX allowed: check AP PS state
     # Step 2: apm_tx_int_ps_check (blob 0x50)
     let psOk = apm_tx_int_ps_check(param)
+    if psOk:
+      inc nimFwDbgTxIntPsOk
     if traceMgmt:
       let chanEnv = chanEnvView()
       let curCtxt = chanEnv.currentCtxt
@@ -19648,10 +27498,7 @@ proc txl_cntrl_push_int*(param: pointer, ac: uint8): uint8 {.exportc, cdecl.} =
         nimFwConnectTrace2U32("[WIFI-CT] txint_ready ",
                               txReady.uint32 or (psOk.uint32 shl 8),
                               cast[uint32](cast[uint](curCtxt) xor cast[uint](pendCtxt)))
-    if not psOk:
-      # PS check failed: fall through to not-ready path
-      discard
-    else:
+    if psOk:
       # Success path: set rcStats flag, DMA transfer, push to queue
       if rcStatsPtr != nil:
         let rcStats = hostTxHwDescAt(rcStatsPtr)
@@ -19678,11 +27525,14 @@ proc txl_cntrl_push_int*(param: pointer, ac: uint8): uint8 {.exportc, cdecl.} =
                                 cast[uint32](cast[uint](desc.hwDesc)))
       if isTrackedNullFrame:
         inc nimFwDbgNullFrameQueued
+      inc nimFwDbgTxIntPush
       return 1'u8
+    # PS check failed: fall through to the not-ready/postpone path.
 
   # Not-ready path (L103): check STA for off-channel deferral
   let staInstNbr = desc.staInfoIdx
   if staInstNbr == 0xFF:
+    inc nimFwDbgTxIntRelease
     if traceMgmt:
       nimFwTrace2U32("[WIFI-NIMFW] txint_release ",
                      txReady.uint32, staInstNbr.uint32)
@@ -19699,24 +27549,25 @@ proc txl_cntrl_push_int*(param: pointer, ac: uint8): uint8 {.exportc, cdecl.} =
   desc.postponeFlag = 1
   if isTrackedNullFrame:
     inc nimFwDbgNullFramePostponed
+  inc nimFwDbgTxIntPostpone
   desc.staIdx = ac
-  let staEntry = staTabBase + staInstNbr.uint * STA_ENTRY_SIZE.uint
-  let sta = staInfoAt(staEntry)
+  let sta = staInfoForIdx(staInstNbr)
+  let staEntry = cast[pointer](sta)
   if traceMgmt:
     nimFwTrace2U32("[WIFI-NIMFW] txint_postpone ",
                    txReady.uint32 or (staInstNbr.uint32 shl 8),
-                   cast[uint32](staEntry))
+                   pointerAddrU32(staEntry))
     when defined(bl808WifiConnectTrace):
       nimFwConnectTrace2U32("[WIFI-CT] txint_postpone ",
                             txReady.uint32 or (staInstNbr.uint32 shl 8),
-                            cast[uint32](staEntry))
+                            pointerAddrU32(staEntry))
   # Store MAC time if not already pending
   if desc.pendingMacTime == 0:
     desc.pendingMacTime = macTimeNow()
   # Push to STA pending list (blob: co_list_push_back at 0xE2)
   co_list_push_back(addr sta.postponedList, cast[ptr CoListHdr](param))
   # Notify PS postpone (blob: apm_tx_int_ps_postpone at 0xEE)
-  apm_tx_int_ps_postpone(param, cast[pointer](sta))
+  apm_tx_int_ps_postpone(param, staEntry)
   # Increment frame env counter
   let frameEnv = txFrameEnv()
   frameEnv.postponedCount = frameEnv.postponedCount + 1
@@ -19936,15 +27787,15 @@ proc txl_cntrl_env_dump*() {.exportc, cdecl, noinline.} =
     # Walk descriptor chain (L162 in blob: while s3 != nil)
     var curDesc = listFirst
     while curDesc != nil:
-      let curU = cast[uint](curDesc)
+      let desc = hostTxDescAt(curDesc)
       # Print descriptor address and its status (blob: L165)
-      let thd = cast[ptr pointer](curU + 112)[]
+      let thd = desc.hwDesc
       if thd != nil:
-        let thdU = cast[uint](thd)
-        let thdStatus = cast[ptr uint32](thdU + 64)[]
+        let hw = hostTxHwDescAt(thd)
+        let thdStatus = hw.confirmStatus
         logFn7(2, 0, "txl_cntrl.c", 0x8EF, "thd",
                cast[uint32](thd), thdStatus, cast[uint32](curDesc))
-      curDesc = cast[ptr pointer](curU)[]  # next in list
+      curDesc = desc.link.next  # next in list
 
     # Log separator after list walk (blob: line 0x939)
     logFn(2, 0, "txl_cntrl.c", 0x939)
@@ -19952,87 +27803,65 @@ proc txl_cntrl_env_dump*() {.exportc, cdecl, noinline.} =
     # Walk the same list again for detailed THD sub-fields (L169/L174)
     curDesc = listFirst
     while curDesc != nil:
-      let curU = cast[uint](curDesc)
-      let thd = cast[ptr pointer](curU + 112)[]
+      let desc = hostTxDescAt(curDesc)
+      let thd = desc.hwDesc
       if thd != nil:
-        let thdU = cast[uint](thd)
+        let hw = hostTxHwDescAt(thd)
 
         # Print THD header: desc ptr, desc[4] status, thd ptr (blob: L174, line 0x8EF)
-        let descW4 = cast[ptr uint32](curU + 4)[]
+        let descW4 = desc.descWord4
         logFn7(2, 0, "txl_cntrl.c", 0x8EF, "desc",
                cast[uint32](curDesc), descW4, cast[uint32](thd))
 
         # Print THD sub-fields: [28]=dataLen, [56]/[60]=rate, [40]=rateThd
-        # Blob (L174, offset 0x184): reads thd[112] fields and prints
-        let thdDataLen = cast[ptr uint32](thdU + 28)[]
-        let thdW56 = cast[ptr uint32](thdU + 56)[]
-        let thdW60 = cast[ptr uint32](thdU + 60)[]
+        # Blob (L174, offset 0x184): reads thd[112] fields and prints.
+        let thdDataLen = hw.frameLen
+        let thdW56 = hw.word56
+        let thdW60 = hw.controlFlags
         logFn7(2, 0, "txl_cntrl.c", 0x8F0, "thd_detail",
                thdDataLen, thdW56, thdW60)
 
-        # Walk sub-descriptor chain at THD+40 (rate control descriptor)
-        let rateThdPtr = cast[ptr pointer](thdU + 40)[]
+        # Walk sub-descriptor chain at THD+40 (rate control descriptor).
+        let rateThdPtr = hw.chainedThd
         if rateThdPtr != nil:
-          let rThdU = cast[uint](rateThdPtr)
-          # Print rate descriptor summary (blob: L174 offset 0x1B4)
-          # Fields: [0], [4], [8], [12], [16] (5 words)
-          let rW0 = cast[ptr uint32](rThdU + 0)[]
-          let rW4 = cast[ptr uint32](rThdU + 4)[]
-          let rW8 = cast[ptr uint32](rThdU + 8)[]
+          let rate = txDumpRateDescAt(rateThdPtr)
           logFn7(2, 0, "txl_cntrl.c", 0x8FB, "rate",
-                 rW0, rW4, rW8)
-          let rW12 = cast[ptr uint32](rThdU + 12)[]
-          let rW16 = cast[ptr uint32](rThdU + 16)[]
-          logFn5(2, 0, "txl_cntrl.c", 0x903, "rate2", rW12)
+                 rate.word0, rate.word4, rate.word8)
+          logFn5(2, 0, "txl_cntrl.c", 0x903, "rate2", rate.word12)
 
-          # Print rate policy table entries (4 entries at offsets 20..35)
-          # Blob: loop at L170 (offset 0x20E), stride 4, 4 iterations
-          for i in 0'u32 ..< 4:
-            let polAddr = rThdU + 20 + i.uint * 4
-            let polVal = cast[ptr uint32](polAddr)[]
+          for polVal in rate.policy0:
             if printFn != nil:
               let fn = cast[proc(fmt: cstring, arg: pointer) {.cdecl.}](printFn)
               fn("pol", cast[pointer](polVal))
 
-          # Print rate policy second table (blob: line 0x907/0x908)
           logFn(2, 0, "txl_cntrl.c", 0x907)
           logFn(2, 0, "txl_cntrl.c", 0x908)
 
-          # Print rate policy table entries (4 entries at offsets 36..51)
-          # Blob: loop at L171 (offset 0x25E), stride 4, 4 iterations
-          for i in 0'u32 ..< 4:
-            let polAddr = rThdU + 36 + i.uint * 4
-            let polVal = cast[ptr uint32](polAddr)[]
+          for polVal in rate.policy1:
             if printFn != nil:
               let fn = cast[proc(fmt: cstring, arg: pointer) {.cdecl.}](printFn)
               fn("pol2", cast[pointer](polVal))
 
-          # Print rate descriptor chain footer (blob: line 0x90C)
           logFn(2, 0, "txl_cntrl.c", 0x90C)
 
-          # Walk next rate descriptor at rThd[16] (blob: L172, offset 0x298)
-          var nextRateThd = cast[ptr pointer](rThdU + 16)[]
+          var nextRateThd = rate.next
           var rateIdx: uint32 = 0
           while nextRateThd != nil and rateIdx < 4:
-            let nrU = cast[uint](nextRateThd)
             logFn5(2, 0, "txl_cntrl.c", 0x90E, "rchain", rateIdx)
-            nextRateThd = cast[ptr pointer](nrU + 16)[]
+            nextRateThd = txDumpRateDescAt(nextRateThd).next
             rateIdx += 1
 
-        # Walk buffer descriptor chain at THD[16] (next pointer)
-        var subDesc = cast[ptr pointer](thdU + 16)[]
+        # Walk buffer descriptor chain at THD[16] (next pointer).
+        var subDesc = cast[pointer](hw.status)
         var subIdx: uint32 = 0
         while subDesc != nil:
-          let subU = cast[uint](subDesc)
-          let subW0 = cast[ptr uint32](subU + 0)[]
-          let subW1 = cast[ptr uint32](subU + 4)[]
-          let subW2 = cast[ptr uint32](subU + 8)[]
+          let sub = txDumpBufferDescAt(subDesc)
           logFn7(2, 0, "txl_cntrl.c", 0x911, "buf",
-                 subIdx, subW0, subW1)
-          subDesc = cast[ptr pointer](subU + 4)[]  # next buf desc
+                 subIdx, sub.word0, pointerAddrU32(sub.next))
+          subDesc = sub.next  # next buf desc
           inc subIdx
 
-      curDesc = cast[ptr pointer](curU)[]  # next in list
+      curDesc = desc.link.next  # next in list
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void txl_payload_handle_backup(void*);".}
 proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
@@ -20053,12 +27882,6 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
   ## Call graph: assert_rec, blmac_abs_timer_set, txl_machdr_format,
   ##             txu_cntrl_tkip_mic_append
   inc nimFwDbgPayBackupEntry
-  const
-    HW_TRIGGER_REG = 0x24B08180'u      # MAC HW TX trigger
-    HW_AGG_SET_REG = 0x24B08088'u      # MAC HW aggregation set
-    HW_AGG_OR_REG  = 0x24B0808C'u      # MAC HW aggregation OR
-
-  let vifBase = cast[uint](addr vif_info_tab[0])
 
   template txlDmaStatusField(status: uint32, acIdx: uint32): uint32 =
     ## Vendor uses T-Head bit-extracts here:
@@ -20112,6 +27935,68 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
         if actualDesc != nil: actual.frameLen
         else: 0'u16
       let traceEapol = protoTrace == 0x8E88'u16 or protoTrace == 0x888E'u16
+      if fcTrace == 0x40'u8 and actualDesc != nil:
+        nimFwDbgProbePayMeta =
+          (ac and 0xff'u32) or
+          ((if actual.queueFirst != nil: 1'u32 else: 0'u32) shl 8) or
+          (uint32(actual.staIdx) shl 16) or
+          (uint32(actual.vifIdx) shl 24)
+        nimFwDbgProbePayDesc = pointerAddrU32(actualDesc)
+        nimFwDbgProbePayLink = pointerAddrU32(actual.bufDesc)
+        nimFwDbgProbePayHw = pointerAddrU32(actual.hwDesc)
+        let probeLink = hostTxLinkDescAt(actual.bufDesc)
+        let probeHw = hostTxHwDescAt(actual.hwDesc)
+        let probeMacLen =
+          if probeHw != nil and probeHw.frameLen >= 4'u32:
+            probeHw.frameLen - 4'u32
+          else:
+            0'u32
+        nimFwDbgProbePayLen =
+          probeMacLen or (uint32(actual.frameLen) shl 16)
+        if probeLink != nil:
+          nimFwDbgProbePayLink0 = probeLink.headerLen
+          nimFwDbgProbePayLink1 = probeLink.word308 xor probeLink.word312
+        else:
+          nimFwDbgProbePayLink0 = 0
+          nimFwDbgProbePayLink1 = 0
+        if probeHw != nil:
+          nimFwDbgProbePayThd = pointerAddrU32(cast[pointer](addr probeHw.magic))
+          nimFwDbgProbePayHw0 = probeHw.word0
+          nimFwDbgProbePayHw1 = probeHw.magic
+          nimFwDbgProbePayHw2 = probeHw.word8
+          nimFwDbgProbePayHw3 = probeHw.word12
+          nimFwDbgProbePayHwStart = probeHw.payloadStart
+          nimFwDbgProbePayHwEnd = probeHw.payloadEnd
+          nimFwDbgProbePayHwFrameLen = probeHw.frameLen
+          nimFwDbgProbePayHwStatus = probeHw.status
+          nimFwDbgProbePayHwCtrl = probeHw.controlFlags
+          nimFwDbgProbePayHwChain = pointerAddrU32(probeHw.chainedThd)
+          nimFwDbgProbePayHwWord36 = probeHw.word36
+          nimFwDbgProbePayHwWord56 = probeHw.word56
+        else:
+          nimFwDbgProbePayThd = 0
+          nimFwDbgProbePayHw0 = 0
+          nimFwDbgProbePayHw1 = 0
+          nimFwDbgProbePayHw2 = 0
+          nimFwDbgProbePayHw3 = 0
+          nimFwDbgProbePayHwStart = 0
+          nimFwDbgProbePayHwEnd = 0
+          nimFwDbgProbePayHwFrameLen = 0
+          nimFwDbgProbePayHwStatus = 0
+          nimFwDbgProbePayHwCtrl = 0
+          nimFwDbgProbePayHwChain = 0
+          nimFwDbgProbePayHwWord36 = 0
+          nimFwDbgProbePayHwWord56 = 0
+        let copyLen = if probeMacLen < nimFwDbgProbePayRaw.len.uint32:
+          probeMacLen
+        else:
+          nimFwDbgProbePayRaw.len.uint32
+        for i in 0 ..< nimFwDbgProbePayRaw.len:
+          nimFwDbgProbePayRaw[i] = 0
+        if copyLen != 0 and probeLink != nil:
+          discard c_memcpy(addr nimFwDbgProbePayRaw[0],
+                           addr probeLink.macHeader[0],
+                           copyLen)
 
       # Gate: only do beacon/machdr/tkip/thd patching if actualDesc[8] != nil
       let hasPayload = actual.queueFirst
@@ -20133,13 +28018,16 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
                                 ac or ((if hasPayload != nil: 1'u32 else: 0'u32) shl 8),
                                 cast[uint32](actualU))
       if traceEapol:
-        let hdrBaseTrace = cast[uint](addr backupDesc.macHeader[0])
+        let macHdrTrace = cast[ptr MacDataFrameHeaderView](addr backupDesc.macHeader[0])
+        let macHdrWord0 =
+          macHdrTrace.frameControl.uint32 or (macHdrTrace.duration.uint32 shl 16)
+        let macHdrAddr3Word0 = macAddrWord0(addr macHdrTrace.addr3)
         nimFwTrace2U32("[WIFI-NIMFW] pay_eapol ",
                        ac or ((if hasPayload != nil: 1'u32 else: 0'u32) shl 8),
                        cast[uint32](actualU))
         nimFwTrace2U32("[WIFI-NIMFW] pay_eapol_hdr ",
-                       cast[ptr uint32](hdrBaseTrace)[],
-                       cast[ptr uint32](hdrBaseTrace + 24)[])
+                       macHdrWord0,
+                       macHdrAddr3Word0)
         when defined(bl808WifiConnectTrace):
           if nimFwDbgEapolTraceCount < 64'u32:
             nimFwConnectTrace2U32("[WIFI-CT] pay_eapol ",
@@ -20147,24 +28035,29 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
                                     (nimFwDbgEapolTraceCount shl 16),
                                   cast[uint32](actualU))
             nimFwConnectTrace2U32("[WIFI-CT] pay_eapol_hdr ",
-                                  cast[ptr uint32](hdrBaseTrace)[],
-                                  cast[ptr uint32](hdrBaseTrace + 24)[])
+                                  macHdrWord0,
+                                  macHdrAddr3Word0)
       when declared(NimFwForcedMgmtTxPower):
         let fcForce = cast[ptr uint16](addr backupDesc.macHeader[0])[]
         if ((fcForce.uint32 shr 2) and 3'u32) == 0'u32:
           let forceLink = hostTxLinkDescAt(actual.bufDesc)
           if forceLink != nil:
-            hostTxLinkWordAt(forceLink, 292'u)[] = NimFwForcedMgmtTxPower
-            hostTxLinkWordAt(forceLink, 296'u)[] = NimFwForcedMgmtTxPower
-            hostTxLinkWordAt(forceLink, 300'u)[] = NimFwForcedMgmtTxPower
-            hostTxLinkWordAt(forceLink, 304'u)[] = NimFwForcedMgmtTxPower
+            let forceRate = hostTxRateTemplate(forceLink)
+            forceRate.txPower = NimFwForcedMgmtTxPower.int32
+            forceRate.word40 = NimFwForcedMgmtTxPower
+            forceRate.word44 = NimFwForcedMgmtTxPower
+            forceRate.word48 = NimFwForcedMgmtTxPower
       if hasPayload != nil:
         inc nimFwDbgPayHasPayload
+        when declared(rfPriApplyWb03AuthTxLatches):
+          let fcForRfLatch = cast[ptr uint16](addr backupDesc.macHeader[0])[]
+          let typeForRfLatch = (fcForRfLatch.uint32 shr 2) and 3'u32
+          if ac < 4'u32 and typeForRfLatch == 2'u32:
+            inc nimFwDbgStaTxRfLatch
+            rfPriApplyWb03AuthTxLatches()
         # For AC==4 (BCN), special beacon handling
         if ac == 4:
-          let vifIdx = actual.vifIdx  # blob: lbu a3,47(s0)
-          let vifEntry = vifBase + vifIdx.uint * VIF_ENTRY_SIZE.uint
-          let vif = vifChannelAt(vifEntry)
+          let vif = vifChannelForIdx(actual.vifIdx)  # blob: lbu a3,47(s0)
           let protFlags = vif.timFlags
           let isProtected = backupDesc.macHeader[1]  # blob: lbu a3,349(a0)
           if isProtected != 0:
@@ -20183,18 +28076,64 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
         txu_cntrl_tkip_mic_append(actualDesc)
 
         # Patch THD fields from link descriptor's rate/policy info (unconditional)
-        thd.word56 = hostTxLinkWord(linkDesc, 308'u)
+        thd.word56 = linkDesc.word308
         thd.chainedThd = cast[pointer](hostTxRateTemplate(linkDesc))
-        thd.word36 = hostTxLinkWord(linkDesc, 312'u)
+        thd.word36 = linkDesc.word312
+        if lmacGateHalfword(actual.frameLen) == 0x0800'u16:
+          let rateForDhcp = hostTxRateTemplate(linkDesc)
+          nimFwDbgDhcpTxBufDesc = pointerAddrU32(actual.bufDesc)
+          nimFwDbgDhcpTxHwDesc = pointerAddrU32(actual.hwDesc)
+          captureDhcpTxRateRaw(rateForDhcp)
+          nimFwDbgDhcpTxRate0 =
+            rateForDhcp.magic xor (rateForDhcp.ntxConfig shl 16)
+          nimFwDbgDhcpTxRate1 =
+            rateForDhcp.pendingCount xor (rateForDhcp.policyWord shl 16)
+          nimFwDbgDhcpTxRate2 =
+            rateForDhcp.rateWord xor (cast[uint32](rateForDhcp.txPower) shl 16)
+          nimFwDbgDhcpTxRate3 =
+            rateForDhcp.word40 xor (rateForDhcp.word44 shl 16) xor
+            rateForDhcp.word48
+          nimFwDbgDhcpTxLink0 = linkDesc.word308
+          nimFwDbgDhcpTxLink1 = linkDesc.word312
+          nimFwDbgDhcpTxThd0 =
+            thd.status xor (thd.frameLen shl 16)
+          nimFwDbgDhcpTxThd1 =
+            thd.word36 xor (pointerAddrU32(thd.chainedThd) shl 16)
+          nimFwDbgDhcpTxThd2 =
+            thd.word56 xor (thd.controlFlags shl 16)
+          nimFwDbgDhcpTxFinalDesc0 =
+            actual.frameLen.uint32 or
+            (actual.hdrLen.uint32 shl 16) or
+            (actual.qosExtLen.uint32 shl 24)
+          nimFwDbgDhcpTxFinalDesc1 =
+            actual.secTailLen.uint32 or
+            (actual.staIdx.uint32 shl 8) or
+            (actual.vifIdx.uint32 shl 16) or
+            (actual.staInfoIdx.uint32 shl 24)
+          nimFwDbgDhcpTxFinalBuf0 = actual.bufferPtrs[0]
+          nimFwDbgDhcpTxFinalLen0 = actual.bufferLens[0]
+          nimFwDbgDhcpTxFinalHwStart = thd.payloadStart
+          nimFwDbgDhcpTxFinalHwEnd = thd.payloadEnd
+          nimFwDbgDhcpTxFinalHwLen = thd.frameLen
+          nimFwDbgDhcpTxFinalHwFlags = thd.controlFlags
+          nimFwDbgDhcpTxFinalHthdStart = linkDesc.headerThd.payloadStart
+          nimFwDbgDhcpTxFinalHthdEnd = linkDesc.headerThd.payloadEnd
+          nimFwDbgDhcpTxFinalHthdNext = pointerAddrU32(linkDesc.headerThd.next)
+          nimFwDbgDhcpTxFinalHthdFlags = linkDesc.headerThd.flags
+          nimFwDbgDhcpTxFinalPthdStart = linkDesc.payloadThd[0].payloadStart
+          nimFwDbgDhcpTxFinalPthdEnd = linkDesc.payloadThd[0].payloadEnd
+          nimFwDbgDhcpTxFinalPthdNext = pointerAddrU32(linkDesc.payloadThd[0].next)
+          nimFwDbgDhcpTxFinalPthdFlags = linkDesc.payloadThd[0].flags
+          nimFwDbgDhcpTxFinalBreakpoint()
         if traceMgmt or traceEapol:
           nimFwTrace2U32("[WIFI-NIMFW] pay_rate ",
-                         hostTxLinkWord(linkDesc, 308'u),
-                         hostTxLinkWord(linkDesc, 312'u))
+                         linkDesc.word308,
+                         linkDesc.word312)
           if traceMgmt:
             when defined(bl808WifiConnectTrace):
               nimFwConnectTrace2U32("[WIFI-CT] pay_rate ",
-                                    hostTxLinkWord(linkDesc, 308'u),
-                                    hostTxLinkWord(linkDesc, 312'u))
+                                    linkDesc.word308,
+                                    linkDesc.word312)
 
       # Increment per-AC packet counter at acCtrlBase+12 (half-word)
       acCtrl.packetCount = acCtrl.packetCount + 1
@@ -20207,7 +28146,7 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
       # Check if per-AC HW queue list is empty
       let listFirst = acCtrl.current
       if traceMgmt or traceEapol:
-        let thdStatusBefore = cast[ptr uint32](thdForLink + 64)[]
+        let thdStatusBefore = thdForLinkView.confirmStatus
         nimFwTrace2U32("[WIFI-NIMFW] pay_link ",
                        ac or ((if listFirst == nil: 1'u32 else: 0'u32) shl 8),
                        cast[uint32](thdLink) xor thdStatusBefore)
@@ -20216,131 +28155,133 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
             nimFwConnectTrace2U32("[WIFI-CT] pay_link ",
                                   ac or ((if listFirst == nil: 1'u32 else: 0'u32) shl 8),
                                   cast[uint32](thdLink) xor thdStatusBefore)
-            let linkUTrace = cast[uint](actual.bufDesc)
+            let linkTrace = hostTxLinkDescAt(actual.bufDesc)
+            let rateTrace = hostTxRateTemplate(linkTrace)
             nimFwConnectTrace2U32("[WIFI-CT] pay_hw0 ",
-                                  cast[ptr uint32](thdForLink + 24)[],
-                                  cast[ptr uint32](thdForLink + 28)[])
+                                  thdForLinkView.payloadEnd,
+                                  thdForLinkView.frameLen)
             nimFwConnectTrace2U32("[WIFI-CT] pay_hw1 ",
-                                  cast[ptr uint32](thdForLink + 36)[],
-                                  cast[ptr uint32](thdForLink + 40)[])
+                                  thdForLinkView.word36,
+                                  pointerAddrU32(thdForLinkView.chainedThd))
             nimFwConnectTrace2U32("[WIFI-CT] pay_hw2 ",
-                                  cast[ptr uint32](thdForLink + 56)[],
-                                  cast[ptr uint32](thdForLink + 60)[])
+                                  thdForLinkView.word56,
+                                  thdForLinkView.controlFlags)
             nimFwConnectTrace2U32("[WIFI-CT] pay_pol0 ",
-                                  cast[ptr uint32](linkUTrace + 256)[],
-                                  cast[ptr uint32](linkUTrace + 260)[])
+                                  rateTrace.magic,
+                                  rateTrace.ntxConfig)
             nimFwConnectTrace2U32("[WIFI-CT] pay_pol1 ",
-                                  cast[ptr uint32](linkUTrace + 272)[],
-                                  cast[ptr uint32](linkUTrace + 276)[])
+                                  rateTrace.policyWord,
+                                  rateTrace.rateWord)
             nimFwConnectTrace2U32("[WIFI-CT] pay_pol2 ",
-                                  cast[ptr uint32](linkUTrace + 288)[],
-                                  cast[ptr uint32](linkUTrace + 292)[])
+                                  rateTrace.word32,
+                                  cast[uint32](rateTrace.txPower))
             nimFwConnectTrace2U32("[WIFI-CT] pay_pol3 ",
-                                  cast[ptr uint32](linkUTrace + 296)[],
-                                  cast[ptr uint32](linkUTrace + 300)[])
+                                  rateTrace.word40,
+                                  rateTrace.word44)
             nimFwConnectTrace2U32("[WIFI-CT] pay_pol4 ",
-                                  cast[ptr uint32](linkUTrace + 304)[],
-                                  cast[ptr uint32](linkUTrace + 308)[])
+                                  rateTrace.word48,
+                                  linkTrace.word308)
         if traceEapol:
-          let linkU = cast[uint](actual.bufDesc)
+          let link = hostTxBufferedLinkAt(actual.bufDesc)
+          let rate = hostTxRateTemplate(link)
           nimFwTrace2U32("[WIFI-NIMFW] pay_desc0 ",
-                         cast[ptr uint32](actualU + 8)[],
-                         cast[ptr uint32](actualU + 12)[])
+                         pointerAddrU32(actual.queueFirst),
+                         actual.seqPassthrough.uint32)
           nimFwTrace2U32("[WIFI-NIMFW] pay_desc1 ",
-                         cast[ptr uint32](actualU + 52)[],
-                         cast[ptr uint32](actualU + 68)[])
+                         actual.bufferPtrs[0],
+                         actual.bufferLens[0])
           nimFwTrace2U32("[WIFI-NIMFW] pay_link0 ",
-                         cast[ptr uint32](linkU + 72)[],
-                         cast[ptr uint32](linkU + 76)[])
+                         link.headerThd.magic,
+                         pointerAddrU32(link.headerThd.next))
           nimFwTrace2U32("[WIFI-NIMFW] pay_link1 ",
-                         cast[ptr uint32](linkU + 80)[],
-                         cast[ptr uint32](linkU + 84)[])
+                         link.headerThd.payloadStart,
+                         link.headerThd.payloadEnd)
           nimFwTrace2U32("[WIFI-NIMFW] pay_hw0 ",
-                         cast[ptr uint32](thdForLink + 4)[],
-                         cast[ptr uint32](thdForLink + 8)[])
+                         thdForLinkView.magic,
+                         thdForLinkView.word8)
           nimFwTrace2U32("[WIFI-NIMFW] pay_hw1 ",
-                         cast[ptr uint32](thdForLink + 12)[],
-                         cast[ptr uint32](thdForLink + 16)[])
+                         thdForLinkView.word12,
+                         thdForLinkView.status)
           nimFwTrace2U32("[WIFI-NIMFW] pay_hw2 ",
-                         cast[ptr uint32](thdForLink + 28)[],
-                         cast[ptr uint32](thdForLink + 36)[])
+                         thdForLinkView.frameLen,
+                         thdForLinkView.word36)
           nimFwTrace2U32("[WIFI-NIMFW] pay_hw3 ",
-                         cast[ptr uint32](thdForLink + 40)[],
-                         cast[ptr uint32](thdForLink + 56)[])
+                         pointerAddrU32(thdForLinkView.chainedThd),
+                         thdForLinkView.word56)
           nimFwTrace2U32("[WIFI-NIMFW] pay_hw4 ",
-                         cast[ptr uint32](thdForLink + 60)[],
-                         cast[ptr uint32](thdForLink + 64)[])
+                         thdForLinkView.controlFlags,
+                         thdForLinkView.confirmStatus)
           nimFwTrace2U32("[WIFI-NIMFW] pay_buf0 ",
-                         cast[ptr uint32](linkU + 92)[],
-                         cast[ptr uint32](linkU + 96)[])
+                         link.payloadThd[0].magic,
+                         pointerAddrU32(link.payloadThd[0].next))
           nimFwTrace2U32("[WIFI-NIMFW] pay_buf1 ",
-                         cast[ptr uint32](linkU + 100)[],
-                         cast[ptr uint32](linkU + 104)[])
+                         link.payloadThd[0].payloadStart,
+                         link.payloadThd[0].payloadEnd)
           nimFwTrace2U32("[WIFI-NIMFW] pay_pol0 ",
-                         cast[ptr uint32](linkU + 256)[],
-                         cast[ptr uint32](linkU + 260)[])
+                         rate.magic,
+                         rate.ntxConfig)
           nimFwTrace2U32("[WIFI-NIMFW] pay_pol1 ",
-                         cast[ptr uint32](linkU + 264)[],
-                         cast[ptr uint32](linkU + 268)[])
+                         rate.bwMask,
+                         rate.pendingCount)
           nimFwTrace2U32("[WIFI-NIMFW] pay_pol2 ",
-                         cast[ptr uint32](linkU + 272)[],
-                         cast[ptr uint32](linkU + 276)[])
+                         rate.policyWord,
+                         rate.rateWord)
           nimFwTrace2U32("[WIFI-NIMFW] pay_pol3 ",
-                         cast[ptr uint32](linkU + 280)[],
-                         cast[ptr uint32](linkU + 284)[])
+                         rate.word24,
+                         rate.word28)
           nimFwTrace2U32("[WIFI-NIMFW] pay_pol4 ",
-                         cast[ptr uint32](linkU + 288)[],
-                         cast[ptr uint32](linkU + 292)[])
+                         rate.word32,
+                         cast[uint32](rate.txPower))
           when defined(bl808WifiConnectTrace):
             if nimFwDbgEapolTraceCount < 64'u32:
               nimFwConnectTrace2U32("[WIFI-CT] pay_desc0 ",
-                                    cast[ptr uint32](actualU + 8)[],
-                                    cast[ptr uint32](actualU + 12)[])
+                                    pointerAddrU32(actual.queueFirst),
+                                    actual.seqPassthrough.uint32)
               nimFwConnectTrace2U32("[WIFI-CT] pay_desc1 ",
-                                    cast[ptr uint32](actualU + 52)[],
-                                    cast[ptr uint32](actualU + 68)[])
+                                    actual.bufferPtrs[0],
+                                    actual.bufferLens[0])
               nimFwConnectTrace2U32("[WIFI-CT] pay_link0 ",
-                                    cast[ptr uint32](linkU + 72)[],
-                                    cast[ptr uint32](linkU + 76)[])
+                                    link.headerThd.magic,
+                                    pointerAddrU32(link.headerThd.next))
               nimFwConnectTrace2U32("[WIFI-CT] pay_link1 ",
-                                    cast[ptr uint32](linkU + 80)[],
-                                    cast[ptr uint32](linkU + 84)[])
+                                    link.headerThd.payloadStart,
+                                    link.headerThd.payloadEnd)
               nimFwConnectTrace2U32("[WIFI-CT] pay_hw0 ",
-                                    cast[ptr uint32](thdForLink + 4)[],
-                                    cast[ptr uint32](thdForLink + 8)[])
+                                    thdForLinkView.magic,
+                                    thdForLinkView.word8)
               nimFwConnectTrace2U32("[WIFI-CT] pay_hw1 ",
-                                    cast[ptr uint32](thdForLink + 12)[],
-                                    cast[ptr uint32](thdForLink + 16)[])
+                                    thdForLinkView.word12,
+                                    thdForLinkView.status)
               nimFwConnectTrace2U32("[WIFI-CT] pay_hw2 ",
-                                    cast[ptr uint32](thdForLink + 28)[],
-                                    cast[ptr uint32](thdForLink + 36)[])
+                                    thdForLinkView.frameLen,
+                                    thdForLinkView.word36)
               nimFwConnectTrace2U32("[WIFI-CT] pay_hw3 ",
-                                    cast[ptr uint32](thdForLink + 40)[],
-                                    cast[ptr uint32](thdForLink + 56)[])
+                                    pointerAddrU32(thdForLinkView.chainedThd),
+                                    thdForLinkView.word56)
               nimFwConnectTrace2U32("[WIFI-CT] pay_hw4 ",
-                                    cast[ptr uint32](thdForLink + 60)[],
-                                    cast[ptr uint32](thdForLink + 64)[])
+                                    thdForLinkView.controlFlags,
+                                    thdForLinkView.confirmStatus)
               nimFwConnectTrace2U32("[WIFI-CT] pay_buf0 ",
-                                    cast[ptr uint32](linkU + 92)[],
-                                    cast[ptr uint32](linkU + 96)[])
+                                    link.payloadThd[0].magic,
+                                    pointerAddrU32(link.payloadThd[0].next))
               nimFwConnectTrace2U32("[WIFI-CT] pay_buf1 ",
-                                    cast[ptr uint32](linkU + 100)[],
-                                    cast[ptr uint32](linkU + 104)[])
+                                    link.payloadThd[0].payloadStart,
+                                    link.payloadThd[0].payloadEnd)
               nimFwConnectTrace2U32("[WIFI-CT] pay_pol0 ",
-                                    cast[ptr uint32](linkU + 256)[],
-                                    cast[ptr uint32](linkU + 260)[])
+                                    rate.magic,
+                                    rate.ntxConfig)
               nimFwConnectTrace2U32("[WIFI-CT] pay_pol1 ",
-                                    cast[ptr uint32](linkU + 264)[],
-                                    cast[ptr uint32](linkU + 268)[])
+                                    rate.bwMask,
+                                    rate.pendingCount)
               nimFwConnectTrace2U32("[WIFI-CT] pay_pol2 ",
-                                    cast[ptr uint32](linkU + 272)[],
-                                    cast[ptr uint32](linkU + 276)[])
+                                    rate.policyWord,
+                                    rate.rateWord)
               nimFwConnectTrace2U32("[WIFI-CT] pay_pol3 ",
-                                    cast[ptr uint32](linkU + 280)[],
-                                    cast[ptr uint32](linkU + 284)[])
+                                    rate.word24,
+                                    rate.word28)
               nimFwConnectTrace2U32("[WIFI-CT] pay_pol4 ",
-                                    cast[ptr uint32](linkU + 288)[],
-                                    cast[ptr uint32](linkU + 292)[])
+                                    rate.word32,
+                                    cast[uint32](rate.txPower))
               nimFwDbgEapolTraceCount = nimFwDbgEapolTraceCount + 1
       if listFirst == nil:
         inc nimFwDbgPayEmptyList
@@ -20352,7 +28293,7 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
         # Blob tail-merges the 5 per-AC assert_rec calls into one common
         # site — hoist the DMA status check out of the per-AC branches.
         let ipcSharedBase = cast[ptr uint32](0x24B00120'u)[]
-        let dmaStatus = regRead(0x24B08188'u)
+        let dmaStatus = machwTxDmaStatus()
         let dmaField = txlDmaStatusField(dmaStatus, ac)
         var assertLine: cint = 0
         var timerVal: uint32
@@ -20389,46 +28330,52 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
           var trigBits: uint32 = 0
           case ac
           of 0:
-            regWrite(0x24B0819C'u, cast[uint32](thdLink))
+            machwTxSetHead(ac, thdLink)
             trigBits = 512
           of 1:
-            regWrite(0x24B081A0'u, cast[uint32](thdLink))
+            machwTxSetHead(ac, thdLink)
             trigBits = 1024
           of 2:
-            regWrite(0x24B081A4'u, cast[uint32](thdLink))
+            machwTxSetHead(ac, thdLink)
             trigBits = 2048
           of 3:
-            regWrite(0x24B081A8'u, cast[uint32](thdLink))
+            machwTxSetHead(ac, thdLink)
             trigBits = 4096
           of 4:
-            regWrite(0x24B08198'u, cast[uint32](thdLink))
+            machwTxSetHead(ac, thdLink)
             trigBits = 256
           else:
             discard
-          regWrite(HW_TRIGGER_REG, trigBits)
+          machwTxTrigger(trigBits)
           nimFwDbgPayTriggerLast = trigBits or (ac shl 16) or 0x80000000'u32
+          nimFwDbgPayTxStatus = machwTxStatus()
+          nimFwDbgPayTxAgg = machwTxAggActive()
+          nimFwDbgPayTxDma = dmaStatus
+          nimFwDbgPayTxCurrent = pointerAddrU32(acCtrl.current)
+          nimFwDbgPayTxThd = pointerAddrU32(thdLink)
+          nimFwDbgPayTxHead = machwTxHeadValue(ac)
           if isTrackedNullFrame:
             nimFwDbgNullFramePayTrigger = nimFwDbgPayTriggerLast
           blmac_abs_timer_set(ac, timerVal)
           # Set HW aggregation bits
-          regWrite(HW_AGG_SET_REG, acBit)
-          let aggOr = regRead(HW_AGG_OR_REG)
-          regWrite(HW_AGG_OR_REG, acBit or aggOr)
+          machwTxAggSet(acBit)
+          let aggOr = machwTxAggActive()
+          machwTxAggActiveSet(acBit or aggOr)
           if traceMgmt or traceEapol:
             nimFwTrace2U32("[WIFI-NIMFW] pay_regs ",
-                           regRead(0x24B08078'u),
-                           regRead(0x24B0808C'u))
+                           machwTxStatus(),
+                           machwTxAggActive())
             if traceMgmt:
               when defined(bl808WifiConnectTrace):
                 nimFwConnectTrace2U32("[WIFI-CT] pay_regs ",
-                                      regRead(0x24B08078'u),
-                                      regRead(0x24B0808C'u))
+                                      machwTxStatus(),
+                                      machwTxAggActive())
       else:
         inc nimFwDbgPayNonEmpty
         if isTrackedNullFrame:
           inc nimFwDbgNullFramePayNonEmpty
         # Non-empty list: link into existing chain and write trigger
-        cast[ptr pointer](cast[uint](listFirst) + 4)[] = thdLink
+        hostTxThdAt(listFirst).next = thdLink
         var triggerVal: uint32
         case ac
         of 3: triggerVal = 16
@@ -20436,19 +28383,25 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
         of 2: triggerVal = 8
         of 1: triggerVal = 4
         else: triggerVal = 2    # AC0
-        regWrite(HW_TRIGGER_REG, triggerVal)
+        machwTxTrigger(triggerVal)
         nimFwDbgPayTriggerLast = triggerVal or (ac shl 16) or 0x40000000'u32
+        nimFwDbgPayTxStatus = machwTxStatus()
+        nimFwDbgPayTxAgg = machwTxAggActive()
+        nimFwDbgPayTxDma = machwTxDmaStatus()
+        nimFwDbgPayTxCurrent = pointerAddrU32(acCtrl.current)
+        nimFwDbgPayTxThd = pointerAddrU32(thdLink)
+        nimFwDbgPayTxHead = machwTxHeadValue(ac)
         if isTrackedNullFrame:
           nimFwDbgNullFramePayTrigger = nimFwDbgPayTriggerLast
         if traceMgmt or traceEapol:
           nimFwTrace2U32("[WIFI-NIMFW] pay_regs ",
-                         regRead(0x24B08078'u),
-                         regRead(0x24B0808C'u))
+                         machwTxStatus(),
+                         machwTxAggActive())
           if traceMgmt:
             when defined(bl808WifiConnectTrace):
               nimFwConnectTrace2U32("[WIFI-CT] pay_regs ",
-                                    regRead(0x24B08078'u),
-                                    regRead(0x24B0808C'u))
+                                    machwTxStatus(),
+                                    machwTxAggActive())
 
       # Update list head
       acCtrl.current = thdLink
@@ -20466,7 +28419,7 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
   ## From disassembly (122 instrs).
   ##
   ## Blob flow:
-  ##   1. Read TX status reg 0x24B08078, mask bits [10:6]
+  ##   1. Read MACHW TX status through the typed register overlay, mask bits [10:6]
   ##   2. CLZ to find highest-priority AC (ac = 25 - CLZ)
   ##   3. Process ONLY that single AC per invocation
   ##   4. Loop within that AC's descriptor chain until THD not ready
@@ -20474,15 +28427,13 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
   ##   6. Tail-call hal_machw_trigger_set(ac, ipc_base + offset) to start TX
   inc nimFwDbgTxTrigEntry
   const
-    MACHW_TX_STATUS_REG = 0x24B08078'u  # TX status with AC ready bits
-    MACHW_TX_TRIG_STAT  = 0x24B0808C'u
     IPC_SHARED_TX_BASE  = 0x24B00120'u
     TX_TIMEOUT_LOCAL    = [200000'u32, 2000000'u32, 400000'u32, 200000'u32, 50000'u32]
 
   # Check MAC HW TX status. The reference path uses bits [10:6], but BL808
   # also reports active TX queues in the halt/status field used by
   # txl_cntrl_halt_ac: AC0..AC3 at bits [16..19], beacon at bit 15.
-  let txStatus = regRead(MACHW_TX_STATUS_REG)
+  let txStatus = machwTxStatus()
   let acReady = txStatus and 0x7C0'u32  # bits [10:6]
   let acReadyHigh = txStatus and 0x000F8000'u32
   nimFwDbgTxTrigAcReady = txStatus
@@ -20518,7 +28469,7 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
 
   # Store the AC readiness bit to INTC trigger register for HW readback
   let readyBit = 1'u32 shl (ac + 6)
-  regWrite(0x24B0807C'u, readyBit)
+  machwTxReadyAck(readyBit)
 
   let acCtrl = txControlAc(ac)
   var drained = 0'u32
@@ -20528,10 +28479,11 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
     inc nimFwDbgTxTrigLoops
     let descPtr = cast[pointer](acCtrl.pending.first)
     if descPtr == nil:
+      inc nimFwDbgTxTrigNoDesc
       # No descriptor (.L130): clear AC bit in INTC status, clear cntrl_env[0]
-      let intcStat = regRead(MACHW_TX_TRIG_STAT)
+      let intcStat = machwTxAggActive()
       acCtrl.current = nil
-      regWrite(MACHW_TX_TRIG_STAT, intcStat and clearMask)
+      machwTxAggActiveSet(intcStat and clearMask)
       return
     if not txl_tx_desc_pointer_plausible(descPtr):
       inc nimFwDbgTxPendingInvalid
@@ -20539,8 +28491,8 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
       acCtrl.pending.first = nil
       acCtrl.pending.last = nil
       acCtrl.current = nil
-      let intcStat = regRead(MACHW_TX_TRIG_STAT)
-      regWrite(MACHW_TX_TRIG_STAT, intcStat and clearMask)
+      let intcStat = machwTxAggActive()
+      machwTxAggActiveSet(intcStat and clearMask)
       discard txl_frame_rebuild_free_list()
       return
 
@@ -20548,15 +28500,17 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
     let desc = hostTxDescAt(descPtr)
     let descAddr = cast[uint](desc)
     let linkPtrTrace = desc.bufDesc
-    let linkUTrace = cast[uint](linkPtrTrace)
-    let fcTrace = if linkPtrTrace != nil: cast[ptr uint8](linkUTrace + 348)[] else: 0'u8
-    let fcTrace1 = if linkPtrTrace != nil: cast[ptr uint8](linkUTrace + 349)[] else: 0'u8
+    let linkTrace = hostTxBufferedLinkAt(linkPtrTrace)
+    let fcTrace = if linkTrace != nil: linkTrace.macHeader[0] else: 0'u8
+    let fcTrace1 = if linkTrace != nil: linkTrace.macHeader[1] else: 0'u8
     let traceMgmt = linkPtrTrace != nil and nimFwMgmtFcTrace(fcTrace)
     let protoTrace = desc.frameLen
     let traceEapol = protoTrace == 0x8E88'u16 or protoTrace == 0x888E'u16
     let hwDesc = hostTxHwDescAt(desc.hwDesc)
     let thdAddr = cast[uint](hwDesc)
     let thdStatus = cast[int32](hwDesc.confirmStatus)
+    nimFwDbgTxTrigLastDesc = pointerAddrU32(descPtr)
+    nimFwDbgTxTrigLastStatus = hwDesc.confirmStatus
     if traceMgmt or traceEapol:
       nimFwTrace2U32("[WIFI-NIMFW] txtrig_desc ",
                      ac.uint32 or (txStatus shl 8),
@@ -20567,6 +28521,7 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
                                 ac.uint32 or (txStatus shl 8),
                                 cast[uint32](thdStatus))
     if thdStatus >= 0:
+      inc nimFwDbgTxTrigNotReady
       return  # THD not ready (bit 31 clear) -- .L126
 
     # Check for chained descriptors at desc[8] and desc[108]
@@ -20576,7 +28531,7 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
       if chainedThd != nil:
         desc.bufDesc = nil
 
-    # Program DMA: THD[0] -> head register, write thdStatus to head[16]
+    # Program DMA: THD[0] -> head descriptor status.
     let dmaHead = hwDesc.word0.uint
     if traceMgmt or traceEapol:
       nimFwTrace2U32("[WIFI-NIMFW] txtrig_dma ",
@@ -20587,18 +28542,18 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
           nimFwConnectTrace2U32("[WIFI-CT] txtrig_dma ",
                                 cast[uint32](dmaHead),
                                 cast[uint32](thdAddr))
-    cast[ptr uint32](dmaHead + 16)[] = thdStatus.uint32
+    hostTxHwDescAt(cast[pointer](dmaHead)).status = thdStatus.uint32
 
     # Check secondary THD chain at THD+8
     let secThd = cast[pointer](hwDesc.word8.uint)
     if secThd == nil:
       # No secondary chain (.L133): clear AC bit in INTC status
-      let intcStat = regRead(MACHW_TX_TRIG_STAT)
+      let intcStat = machwTxAggActive()
       acCtrl.current = nil
-      regWrite(MACHW_TX_TRIG_STAT, intcStat and clearMask)
+      machwTxAggActiveSet(intcStat and clearMask)
       # Fall through to .L134 path
     else:
-      let secStatus = cast[ptr int32](cast[uint](secThd) + 60)[]
+      let secStatus = cast[int32](hostTxHwDescAt(secThd).controlFlags)
       if secStatus >= 0:
         # Secondary THD not ready to pop: vendor rearms the AC timeout only.
         let ipcBase = regRead(IPC_SHARED_TX_BASE)
@@ -20682,7 +28637,7 @@ proc txl_current_desc_get*(ac: uint8): pointer {.exportc, cdecl.} =
   let txDesc = hostTxDescAt(firstElem).hwDesc
   if txDesc == nil:
     return nil
-  return cast[pointer](cast[uint](txDesc) + 4)
+  return cast[pointer](addr hostTxHwDescAt(txDesc).magic)
 
 proc txl_reset*() {.exportc, cdecl.} =
   ## Reset TX layer (87 instrs).
@@ -20760,23 +28715,13 @@ proc txl_reset*() {.exportc, cdecl.} =
   txCtrl.seqCounter = savedSeqNum
 
   # Re-initialize per-AC descriptors and cfm lists
-  let ipcBase = 0x24A00080'u  # IPC shared AC descriptor base
-  let ipcEnd = 0x24A00094'u
-  var ipcOff = ipcBase
   for ac in 0'u32 ..< 5:
     # Initialize each AC's CoList (cfm list)
     let cfmList = txCfmList(ac)
     # Initialize cfm CoList via real call (blob: co_list_init)
     co_list_init(cfmList)
     txControlAc(ac).current = nil
-    # Initialize the IPC shared descriptor area
-    let ipcDescPtr = cast[ptr uint32](ipcOff + 4)
-    cast[ptr uint32](ipcOff)[] = 0             # clear descriptor
-    # T-Head ext: clear additional fields
-    cast[ptr uint8](ipcOff + 14)[] = 0         # clear busy flag
-    let seqRestore = savedSeqNum
-    cast[ptr uint16](ipcOff + 12)[] = 0        # clear per-AC counter
-    ipcOff += 16
+    ipcTxAcDescClear(ac)
 
 proc txl_machdr_format*(param: pointer) {.exportc, cdecl.} =
   ## Format MAC header for TX frame.
@@ -20884,9 +28829,8 @@ proc txl_frame_desc_active(p: pointer): bool =
       return true
     if txl_frame_link_list_contains_desc(txBackupQueueHeadPtr(ac)[], p):
       return true
-  let staBase = cast[uint](addr sta_info_tab[0])
   for i in 0 ..< STA_INFO_TAB_ENTRIES:
-    let sta = staInfoAt(staBase + i.uint * STA_ENTRY_SIZE.uint)
+    let sta = staInfoForIdx(i.uint8)
     if txl_frame_list_contains(addr sta.postponedList, p):
       return true
   false
@@ -20896,9 +28840,8 @@ proc txl_frame_rebuild_free_list(): uint32 =
   let saved = irqSave()
   frameEnv.freeList.first = nil
   frameEnv.freeList.last = nil
-  let base = cast[uint](addr txl_frame_desc_storage[0])
   for i in 0'u32 ..< TxlFrameDescCount:
-    let descPtr = cast[pointer](base + i.uint * TxlFrameDescSize)
+    let descPtr = cast[pointer](txlFrameDescAt(i))
     if not txl_frame_desc_active(descPtr):
       co_list_push_back(addr frameEnv.freeList, cast[ptr CoListHdr](descPtr))
       inc result
@@ -20954,41 +28897,32 @@ proc txl_frame_init*() {.exportc, cdecl.} =
 
   # 2. Loop over 4 private frame descriptors (.LANCHOR0 to +0x370,
   # stride 0xDC=220). Each descriptor links to the exported per-frame pools.
-  let descArrayBase = cast[uint](addr txl_frame_desc_storage[0])
-  let linkPoolBase = cast[uint](addr txl_frame_pool[0])
-  let hwPoolBase = cast[uint](addr txl_frame_hwdesc_pool[0])
-  let hwCfmBase = cast[uint](addr txl_frame_hwdesc_cfms[0])
-  let payloadPoolBase = cast[uint](addr txl_frame_buf_ctrl[0])
   for i in 0'u32 ..< TxlFrameDescCount:
-    let descSize = 220'u32  # 0xDC
-    let descBase = descArrayBase + i.uint * descSize.uint
-    let frameDesc = hostTxDescAt(cast[pointer](descBase))
-    let linkDesc = linkPoolBase + i.uint * 860'u
-    let hwDesc = hwPoolBase + i.uint * 72'u
-    let hwCfm = hwCfmBase + i.uint * 20'u
-    let payloadDesc = payloadPoolBase + i.uint * 60'u
+    let frameDesc = txlFrameDescAt(i)
+    let link = txlFrameLinkDescAt(i)
+    let hw = txlFrameHwDescAt(i)
+    let hwCfm = txlFrameHwCfmAt(i)
+    let payload = txlFramePayloadDescAt(i)
     # Blob: checks byte at desc+217 (used flag); if nonzero, skip init
     if frameDesc.postponeFlag != 0:
       discard  # already initialized
     else:
-      let hw = hostTxHwDescAt(cast[pointer](hwDesc))
-      let payload = txBufferControlAt(cast[pointer](payloadDesc))
       # memset entire 220-byte descriptor to zero
-      discard c_memset(cast[pointer](descBase), 0, descSize.csize_t)
-      frameDesc.bufDesc = cast[pointer](linkDesc)
-      frameDesc.policy = cast[pointer](payloadDesc)
-      frameDesc.hwDesc = cast[pointer](hwDesc)
+      discard c_memset(cast[pointer](frameDesc), 0, sizeof(TxlFrameDescSlotView).csize_t)
+      frameDesc.bufDesc = cast[pointer](link)
+      frameDesc.policy = cast[pointer](payload)
+      frameDesc.hwDesc = cast[pointer](hw)
       frameDesc.usedFlag = 0
-      hw.word0 = cast[uint32](hwCfm)
+      hw.word0 = cast[uint32](cast[uint](hwCfm))
       hw.magic = 0xCAFEBABE'u32
-      hw.payloadStart = cast[uint32](linkDesc + 348'u)
+      hw.payloadStart = cast[uint32](hostTxLinkMacHdrAddr(link))
       hw.word32 = 0
       hw.word44 = 0
       hw.word48 = 0
       hw.word52 = 0
       payload.magic = 0xBADCAB1E'u32
       # CRITICAL: push descriptor onto free list (blob: co_list_push_back at 0xD8)
-      txl_frame_free_list_push(cast[pointer](descBase))
+      txl_frame_free_list_push(cast[pointer](frameDesc))
 
   # 3. Post-loop: init txl_buffer_control_24G globals
   let bufCtrl = txBufferControl24G()
@@ -21027,7 +28961,7 @@ proc txl_frame_init_desc*(desc: pointer, linkDesc: pointer, hwDesc: pointer, pay
   discard c_memset(desc, 0, 220.csize_t)
   # Set THD magic and chain pointer
   hw.magic = 0xCAFEBABE'u32
-  hw.payloadStart = cast[uint32](cast[uint](linkDesc) + 348)
+  hw.payloadStart = cast[uint32](hostTxLinkMacHdrAddr(hostTxLinkDescAt(linkDesc)))
   hw.word32 = 0
   hw.word44 = 0
   hw.word48 = 0
@@ -21108,10 +29042,9 @@ proc txl_frame_get*(length: uint32): pointer {.exportc, cdecl.} =
     # then reads macHdr=desc[108]=nil and writes the deauth at addr 0, while
     # txl_frame_push reads a stale hwDesc[20] and asserts on bit 0.
     if desc.bufDesc == nil:
-      let linkPoolBase = cast[uint](addr txl_frame_pool[0])
       let idx = txl_frame_desc_index(cast[pointer](freeNode))
       if idx < TxlFrameDescCount:
-        desc.bufDesc = cast[pointer](linkPoolBase + idx * 860'u)
+        desc.bufDesc = cast[pointer](txlFrameLinkDescAt(idx))
     let linkDesc = hostTxLinkDescAt(desc.bufDesc)
 
     # Set buffer length fields in hwDesc. Internal frame descriptors always
@@ -21184,14 +29117,13 @@ proc txl_frame_push*(param: pointer, ac: uint8): uint8 {.exportc, cdecl, noinlin
   # Mask bits [22:15] of control flags
   var ctrlFlags = hwDesc.controlFlags
   ctrlFlags = ctrlFlags and 0xFF87FFFF'u32
-  let thdPtr = thdField
+  let hdr = macDataFrameAt(cast[pointer](thdField.uint))
   hwDesc.word8 = 0
   hwDesc.word12 = 0
   hwDesc.controlFlags = ctrlFlags
   # Check THD type to set hwDesc[56]
-  let thdByte0 = cast[ptr uint8](cast[uint](thdPtr))[]
-  let typeBits = thdByte0 and 0x0C  # bits [3:2]
-  if typeBits == 4 or (cast[ptr uint8](cast[uint](thdPtr) + 4)[] and 1) != 0:
+  let typeBits = cast[uint8](hdr.frameControl and 0x000C'u16)  # bits [3:2]
+  if typeBits == 4 or (hdr.addr1[0] and 1) != 0:
     hwDesc.word56 = 0
   else:
     hwDesc.word56 = 512  # 0x200
@@ -21218,13 +29150,12 @@ proc txl_frame_push_force*(param: pointer, ac: uint8) {.exportc, cdecl.} =
   # Mask bits [22:15] of control flags
   var ctrlFlags = hwDesc.controlFlags
   ctrlFlags = ctrlFlags and 0xFF87FFFF'u32
-  let thdPtr = thdField
+  let hdr = macDataFrameAt(cast[pointer](thdField.uint))
   hwDesc.word8 = 0
   hwDesc.word12 = 0
   hwDesc.controlFlags = ctrlFlags
   # hwDesc[56] = (THD[4] bit 0 == 0) ? 512 : 0
-  let thdByte4 = cast[ptr uint8](cast[uint](thdPtr) + 4)[]
-  let notBit0 = if (thdByte4 and 1) == 0: 1'u32 else: 0'u32
+  let notBit0 = if (hdr.addr1[0] and 1) == 0: 1'u32 else: 0'u32
   hwDesc.word56 = notBit0 shl 9  # 0 or 512
   hwDesc.confirmStatus = 0
   discard txl_cntrl_push_int_force(param, ac)
@@ -21235,6 +29166,8 @@ proc txl_frame_cfm*(param: pointer) {.exportc, cdecl.} =
   ## the TX frame confirm event (0x80000) for txl_frame_evt.
   inc nimFwDbgFrameCfm
   let desc = hostTxDescAt(param)
+  if desc.hwDesc != nil:
+    noteMgmtTxConfirm(desc, hostTxHwDescAt(desc.hwDesc).confirmStatus, 1'u32)
   let linkDesc = desc.bufDesc
   if linkDesc != nil:
     let fcTrace = hostTxLinkDescAt(linkDesc).macHeader[0]
@@ -21315,8 +29248,7 @@ proc txl_frame_evt*() {.exportc, cdecl.} =
   ke_evt_clear(0x00080000'u32)
   let txCtrl = txControlEnv()
   let frameEnv = txFrameEnv()
-  var drained = 0'u32
-  while drained < WifiTxFrameDrainLimit and txlFrameConfirmPending(frameEnv):
+  while txlFrameConfirmPending(frameEnv):
     # Pop from pending list under interrupt protection
     let saved = irqSave()
     let node = co_list_pop_front(addr frameEnv.usedList)
@@ -21335,6 +29267,8 @@ proc txl_frame_evt*() {.exportc, cdecl.} =
           cast[uint32](cast[uint](desc.callback))
         if desc.callback == nil:
           inc nimFwDbgNullFrameEvtCbNil
+    if desc.hwDesc != nil:
+      noteMgmtTxConfirm(desc, hostTxHwDescAt(desc.hwDesc).confirmStatus, 2'u32)
     # Decrement pending frame counter at txl_cntrl_env[80].
     if txCtrl.packetCounter > 0:
       txCtrl.packetCounter = txCtrl.packetCounter - 1
@@ -21351,7 +29285,6 @@ proc txl_frame_evt*() {.exportc, cdecl.} =
       # Check retry flag at desc[218]
       if desc.retryFlag != 0:
         desc.retryFlag = 0
-        inc drained
         continue  # re-process (loop back)
     # If not internally allocated (desc[216] == 0), return to free list
     if desc.usedFlag == 0:
@@ -21360,13 +29293,6 @@ proc txl_frame_evt*() {.exportc, cdecl.} =
       txl_frame_free_list_push(cast[pointer](node))
     else:
       inc nimFwDbgFrameEvtUsedSkip
-    inc drained
-
-  if txlFrameConfirmPending(frameEnv):
-    inc nimFwDbgFrameEvtYield
-    nimFwDbgFrameEvtYieldHead =
-      pointerAddrU32(cast[pointer](frameEnv.usedList.first))
-    ke_evt_set(0x00080000'u32)
 
 proc txl_frame_send_null_frame*(staIdx: uint8, cfmCallback: pointer, cfmArg: uint32): uint8 {.exportc, cdecl, discardable.} =
   ## Build and send a null data frame (for PS notification).
@@ -21379,9 +29305,8 @@ proc txl_frame_send_null_frame*(staIdx: uint8, cfmCallback: pointer, cfmArg: uin
   nimFwDbgNullFrameCallerRA = nfRA
   let sta = staInfoForIdx(staIdx)
   let vifIdx = sta.instNbr
-  let vifBase = cast[uint](addr vif_info_tab[0])
-  let vifEntry = vifBase + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let vif = vifChannelAt(vifEntry)
+  let vif = vifChannelForIdx(vifIdx)
+  let vifEntry = cast[pointer](vif)
   let staMacAddr = cast[pointer](addr sta.macAddr[0])
   # Allocate frame (24 bytes for null data header)
   # Blob passes a0=24 (frame size) and a1=staIdx (original param, used as length hint)
@@ -21389,7 +29314,7 @@ proc txl_frame_send_null_frame*(staIdx: uint8, cfmCallback: pointer, cfmArg: uin
   if frame == nil:
     return 1
   let desc = hostTxDescAt(frame)
-  tpc_update_frame_tx_power(cast[pointer](vifEntry), frame)
+  tpc_update_frame_tx_power(vifEntry, frame)
   let hdr = hostTxDataHeader(desc)
   # Build null data frame header at linkDesc+348.
   hdr.frameControl = 0x0148'u16  # null data, To-DS
@@ -21446,8 +29371,8 @@ proc wifi_nimfw_null_frame_cfm(arg: pointer, status: uint32) {.cdecl.} =
   discard arg
   inc nimFwDbgNullFrameCfm
   nimFwDbgNullFrameLastStatus = status
-  nimFwDbgBleWifiTxCfmBcn = regRead(0x24B00400'u)
-  nimFwDbgBleWifiTxCfmPti = regRead(0x24B00404'u)
+  nimFwDbgBleWifiTxCfmBcn = wlanCoexControl()
+  nimFwDbgBleWifiTxCfmPti = wlanCoexPti()
   if (status and WifiTxFrameSuccessfulBit) != 0'u32:
     inc nimFwDbgNullFrameAckOk
   else:
@@ -21504,9 +29429,8 @@ proc wifi_nimfw_send_checked_qosnull_frame(staIdx: uint8): uint8 =
 
 proc wifi_nimfw_actual_postponed_count(): uint32 =
   var total = 0'u32
-  let staBase = cast[uint](addr sta_info_tab[0])
-  for i in 0 ..< STA_INFO_TAB_ENTRIES:
-    let sta = staInfoAt(staBase + i.uint * STA_ENTRY_SIZE.uint)
+  for i in 0'u8 ..< STA_INFO_TAB_ENTRIES.uint8:
+    let sta = staInfoForIdx(i)
     total += co_list_cnt(addr sta.postponedList)
   total
 
@@ -21526,12 +29450,10 @@ proc wifi_nimfw_service_sta_postponed*(limit: uint32): uint32 {.exportc, cdecl.}
   let maxFrames = if limit == 0'u32: 1'u32 else: limit
   var sent = 0'u32
   for i in 0'u8 ..< MAX_VIFS.uint8:
-    let vifEntry = cast[pointer](cast[uint](addr vif_info_tab[0]) +
-      i.uint * VIF_ENTRY_SIZE.uint)
-    let vif = vifChannelAt(vifEntry)
+    let vif = vifChannelForIdx(i)
+    let vifEntry = cast[pointer](vif)
     if vif.vifType == VIF_TYPE_STA and vif.state != 0'u8:
-      let staEntry = cast[pointer](cast[uint](addr sta_info_tab[0]) +
-        vif.staIdx.uint * STA_ENTRY_SIZE.uint)
+      let staEntry = cast[pointer](staInfoForIdx(vif.staIdx))
       if txl_cntrl_tx_check(vifEntry):
         let remaining = maxFrames - sent
         let n = sta_mgmt_send_postponed_frame(vifEntry, staEntry, remaining)
@@ -21555,9 +29477,9 @@ var
 proc wifi_nimfw_prepare_sta_tx_channel*() {.exportc, cdecl.} =
   ## Restore the WiFi RF channel before STA TX when another radio user, such as
   ## BLE, may have borrowed the shared RF programming path.
-  ## rf_init() only passes fullInit=true into rfc_init() on the first process
-  ## call. BLE coexistence needs a real RF reclaim because BLE writes the shared
-  ## 0x2000xxxx RF plane between WiFi transmissions.
+  ## rf_init() calls the cold modem init path only on the first process call and
+  ## uses restore on later calls. BLE coexistence still needs a real RF reclaim
+  ## because BLE writes the shared 0x2000xxxx RF plane between WiFi transmissions.
   let sm = smEnvView()
   var band = 0'u8
   var chanType = 0'u8
@@ -21586,9 +29508,9 @@ proc wifi_nimfw_prepare_sta_tx_channel*() {.exportc, cdecl.} =
     if nimFwBleWifiRoleWindowEnabled == 0'u32:
       inc nimFwDbgStaTxRfRestore
       wifi_hosal_rf_turn_on()
-      rf_init(40000000'u32)
+      wifiRfCoreInit(40000000'u32)
       phy_init(nil)
-      phy_set_channel(band, chanType, primaryFreq, centerFreq1, centerFreq2, txPower)
+      phySetChannel(band, chanType, primaryFreq, centerFreq1, centerFreq2, txPower)
       return
     let reclaimNeeded = nim_ble_coex_wifi_rf_reclaim_needed() != 0'u32
     let channelChanged =
@@ -21602,9 +29524,12 @@ proc wifi_nimfw_prepare_sta_tx_channel*() {.exportc, cdecl.} =
       wifi_hosal_rf_turn_on()
       if reclaimNeeded:
         inc nimFwDbgStaTxRfFullRestore
-        rfc_init(40000000'u32, 1'u32)
+        when defined(bl808WifiUseBl808Rf):
+          wifiRfCoreInitMode(40000000'u32, WlApiModeAll)
+        else:
+          rfc_init(40000000'u32, 1'u32)
         phy_init(nil)
-      phy_set_channel(band, chanType, primaryFreq, centerFreq1, centerFreq2, txPower)
+      phySetChannel(band, chanType, primaryFreq, centerFreq1, centerFreq2, txPower)
       nimFwStaTxPreparedBand = band
       nimFwStaTxPreparedChanType = chanType
       nimFwStaTxPreparedPrimaryFreq = primaryFreq
@@ -21617,38 +29542,32 @@ proc wifi_nimfw_coex_force_wifi_role*(): uint32 {.exportc, cdecl.} =
   ## PTI-priority force mode. Use the transient window only while a WiFi frame is
   ## outstanding; BLE scheduling is paused through the callback below.
   const
-    PtaCtrl = 0x24920004'u
-    PtaCtrl2 = 0x24920028'u
-    PtaMirror = 0x24920404'u
-    PtaClear = 0x24920428'u
-    WlanCoexControl = 0x24B00400'u
-    WlanCoexPti = 0x24B00404'u
     WifiRoleCtrl = 0x50000013'u32
     WifiRoleCtrl2 = 0'u32
   if nimFwBleWifiRoleWindowActive != 0'u32:
-    nimFwDbgBleWifiRoleLastCtrl = regRead(PtaCtrl)
-    nimFwDbgBleWifiRoleLastCtrl2 = regRead(PtaCtrl2)
-    nimFwDbgBleWifiRoleLastMirror = regRead(PtaMirror)
+    nimFwDbgBleWifiRoleLastCtrl = ptaCoexControl()
+    nimFwDbgBleWifiRoleLastCtrl2 = ptaCoexControl2()
+    nimFwDbgBleWifiRoleLastMirror = ptaCoexMirror()
     return 1'u32
   if nim_ble_coex_wifi_tx_window_enter() == 0'u32:
-    nimFwDbgBleWifiRoleLastCtrl = regRead(PtaCtrl)
-    nimFwDbgBleWifiRoleLastCtrl2 = regRead(PtaCtrl2)
-    nimFwDbgBleWifiRoleLastMirror = regRead(PtaMirror)
+    nimFwDbgBleWifiRoleLastCtrl = ptaCoexControl()
+    nimFwDbgBleWifiRoleLastCtrl2 = ptaCoexControl2()
+    nimFwDbgBleWifiRoleLastMirror = ptaCoexMirror()
     return 0'u32
   nimFwBleWifiRoleWindowActive = 1'u32
-  regWrite(PtaClear, 0'u32)
-  regWrite(WlanCoexControl, 0x00000F48'u32)
-  regWrite(WlanCoexPti, 0xFFFFFFFF'u32)
-  regWrite(WlanCoexControl, 0x00000F49'u32)
-  regWrite(PtaCtrl, WifiRoleCtrl)
-  regWrite(PtaCtrl2, WifiRoleCtrl2)
-  regWrite(PtaMirror, WifiRoleCtrl)
-  nimFwDbgBleWifiTxPreBcn = regRead(0x24B00400'u)
-  nimFwDbgBleWifiTxPrePti = regRead(0x24B00404'u)
-  nimFwDbgBleWifiTxPreStat = regRead(0x24B00408'u)
-  nimFwDbgBleWifiRoleLastCtrl = regRead(PtaCtrl)
-  nimFwDbgBleWifiRoleLastCtrl2 = regRead(PtaCtrl2)
-  nimFwDbgBleWifiRoleLastMirror = regRead(PtaMirror)
+  ptaCoexClear()
+  wlanCoexWriteControl(0x00000F48'u32)
+  wlanCoexWritePti(0xFFFFFFFF'u32)
+  wlanCoexWriteControl(0x00000F49'u32)
+  ptaCoexWriteControl(WifiRoleCtrl)
+  ptaCoexWriteControl2(WifiRoleCtrl2)
+  ptaCoexWriteMirror(WifiRoleCtrl)
+  nimFwDbgBleWifiTxPreBcn = wlanCoexControl()
+  nimFwDbgBleWifiTxPrePti = wlanCoexPti()
+  nimFwDbgBleWifiTxPreStat = wlanCoexStatus()
+  nimFwDbgBleWifiRoleLastCtrl = ptaCoexControl()
+  nimFwDbgBleWifiRoleLastCtrl2 = ptaCoexControl2()
+  nimFwDbgBleWifiRoleLastMirror = ptaCoexMirror()
   inc nimFwDbgBleWifiRoleEnter
   1'u32
 
@@ -21656,26 +29575,20 @@ proc wifi_nimfw_coex_force_ble_role*() {.exportc, cdecl.} =
   ## Return the shared RF/PTA fabric to BLE/BT after the WiFi TX confirmation.
   ## Mirrors the BL808 SDK wifi_bt_coex_force_bt_impl PTI-priority force mode.
   const
-    PtaCtrl = 0x24920004'u
-    PtaCtrl2 = 0x24920028'u
-    PtaMirror = 0x24920404'u
-    PtaClear = 0x24920428'u
-    WlanCoexControl = 0x24B00400'u
-    WlanCoexPti = 0x24B00404'u
     BtRoleCtrl = 0x50000013'u32
     BtRoleCtrl2 = 0'u32
-  regWrite(PtaClear, 0'u32)
-  regWrite(WlanCoexControl, 0x00000048'u32)
-  regWrite(WlanCoexPti, 0'u32)
-  regWrite(WlanCoexControl, 0x00000049'u32)
-  regWrite(PtaCtrl, BtRoleCtrl)
-  regWrite(PtaCtrl2, BtRoleCtrl2)
-  regWrite(PtaMirror, BtRoleCtrl)
+  ptaCoexClear()
+  wlanCoexWriteControl(0x00000048'u32)
+  wlanCoexWritePti(0'u32)
+  wlanCoexWriteControl(0x00000049'u32)
+  ptaCoexWriteControl(BtRoleCtrl)
+  ptaCoexWriteControl2(BtRoleCtrl2)
+  ptaCoexWriteMirror(BtRoleCtrl)
   nimFwBleWifiRoleWindowActive = 0'u32
   nim_ble_coex_wifi_tx_window_leave()
-  nimFwDbgBleWifiRoleLastCtrl = regRead(PtaCtrl)
-  nimFwDbgBleWifiRoleLastCtrl2 = regRead(PtaCtrl2)
-  nimFwDbgBleWifiRoleLastMirror = regRead(PtaMirror)
+  nimFwDbgBleWifiRoleLastCtrl = ptaCoexControl()
+  nimFwDbgBleWifiRoleLastCtrl2 = ptaCoexControl2()
+  nimFwDbgBleWifiRoleLastMirror = ptaCoexMirror()
   inc nimFwDbgBleWifiRoleLeave
 
 proc wifi_nimfw_set_sta_tx_channel_prepare_enabled*(enabled: uint32)
@@ -21795,9 +29708,8 @@ proc txl_frame_send_qosnull_frame*(staIdx: uint8, qosCtrl: uint16,
   ##   Calls txl_frame_push(desc, 3), returns (result^1)&0xFF
   let sta = staInfoForIdx(staIdx)
   let vifIdx = sta.instNbr
-  let vifBase = cast[uint](addr vif_info_tab[0])
-  let vifEntry = vifBase + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let vif = vifChannelAt(vifEntry)
+  let vif = vifChannelForIdx(vifIdx)
+  let vifEntry = cast[pointer](vif)
   let staMacAddr = cast[pointer](addr sta.macAddr[0])
   let vifMacAddr = cast[pointer](addr vif.macAddr[0])
   # Allocate frame (26 bytes for QoS null header)
@@ -21805,7 +29717,7 @@ proc txl_frame_send_qosnull_frame*(staIdx: uint8, qosCtrl: uint16,
   if frame == nil:
     return 1'u8
   let desc = hostTxDescAt(frame)
-  tpc_update_frame_tx_power(cast[pointer](vifEntry), frame)
+  tpc_update_frame_tx_power(vifEntry, frame)
   let hdr = hostTxQosDataHeader(desc)
   # Check VIF type (STA or AP) to determine To-DS/From-DS
   let vifType = vif.vifType
@@ -22032,47 +29944,26 @@ proc txu_cntrl_frame_build*(desc: pointer, bufPtr: pointer) {.exportc, cdecl.} =
   if bufPtrU == 0:
     return
   let frameLen = txDesc.frameLen
-  var secHdrPtrU = bufPtrU
+  let frameType = lmacGateHalfword(frameLen)
+  let layout = txFrameBuildLayout(txDesc, bufPtr, frameType)
 
-  let vifBase = cast[uint](addr vif_info_tab[0])
-
-  # If txdesc[32] is an Ethernet-II ethertype, prepend the LLC/SNAP bridge
-  # header. The vendor uses a T-Head store-with-address-update here, so the
-  # security-header/MAC-header construction pointer moves back by 8 bytes.
-  if frameLen > 1535:
-    secHdrPtrU = bufPtrU - 8
-    # LLC/SNAP bridge header: AA AA 03 00 00 00 + ethertype.
-    cast[ptr uint16](secHdrPtrU + 0)[] = 0xAAAA'u16
-    cast[ptr uint16](secHdrPtrU + 2)[] = 3
-    cast[ptr uint16](secHdrPtrU + 4)[] = 0
-    cast[ptr uint16](secHdrPtrU + 6)[] = frameLen
-
-  let secHdrEnd = cast[uint](txu_cntrl_sec_hdr_append(desc, cast[pointer](secHdrPtrU), 1'u32))
+  txFrameWriteSnap(layout, frameLen)
+  discard txu_cntrl_sec_hdr_append(desc, cast[pointer](layout.sec), 1'u32)
 
   let vifIdx = txDesc.vifIdx
   let staInfoIdx = txDesc.staInfoIdx
-  let vifEntry = vifBase + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let vif = vifChannelAt(vifEntry)
+  let vif = vifChannelForIdx(vifIdx)
   let sta = staInfoForIdx(staInfoIdx)
 
   # Get rate table from STA entry: sta_entry[244] -> rate_ctrl pointer
   let rateCtrl = sta.keyMat
   let pairwiseKey =
     if rateCtrl == nil: 0'u32
-    else: cast[ptr uint32](cast[uint](rateCtrl))[]
+    else: pointerAddrU32(txSecurityKeyListAt(rateCtrl).pairwiseKey)
 
-  # Compute MAC header pointer offset
   let staIdx = txDesc.staIdx
-  var hdrOff: int
-  if staIdx == 0xFF:
-    hdrOff = -24  # no STA: shorter header
-  else:
-    hdrOff = -26  # with STA: include HTC
-
-  let hdrBufBase =
-    if hdrOff < 0: secHdrEnd - uint(-hdrOff)
-    else: secHdrEnd + uint(hdrOff)
-  let hdr = cast[ptr MacQosDataFrameHeaderView](hdrBufBase)
+  let hdr = layout.mac
+  let hdrBufBase = cast[uint](hdr)
 
   # Build frame control
   var fc: uint16 = 0
@@ -22122,44 +30013,105 @@ proc txu_cntrl_frame_build*(desc: pointer, bufPtr: pointer) {.exportc, cdecl.} =
     discard c_memcpy(addr hdr.data.addr1[0], addr txDesc.da[0], 6.csize_t)
     discard c_memcpy(addr hdr.data.addr3[0], addr vif.bssid[0], 6.csize_t)
 
+  let headerStaIdx = txDesc.staIdx
+  if headerStaIdx != 0xFF'u8:
+    hdr.qosCtrl = headerStaIdx.uint16
+
+  if frameType == 0x0800'u16:
+    nimFwDbgDhcpTxDescBytes =
+      txDesc.staIdx.uint32 or
+      (txDesc.vifIdx.uint32 shl 8) or
+      (txDesc.hostVifType.uint32 shl 16) or
+      (txDesc.staInfoIdx.uint32 shl 24)
+    nimFwDbgDhcpTxHdr0 =
+      hdr.data.frameControl.uint32 or
+      (hdr.data.seqCtrl.uint32 shl 16)
+    nimFwDbgDhcpTxHdr1 =
+      macAddrLo32(addr hdr.data.addr1) or
+      (cast[ptr uint16](addr hdr.data.addr2[0])[].uint32 shl 16)
+    nimFwDbgDhcpTxHdr2 =
+      macAddrLo32(addr hdr.data.addr3) or
+      (hdr.qosCtrl.uint32 shl 16)
+
+  if frameType == 0x8E88'u16 or frameType == 0x888E'u16:
+    nimFwDbgEapolTxDescBytes =
+      txDesc.staIdx.uint32 or
+      (txDesc.vifIdx.uint32 shl 8) or
+      (txDesc.hostVifType.uint32 shl 16) or
+      (txDesc.staInfoIdx.uint32 shl 24)
+    nimFwDbgEapolTxHdr0 =
+      hdr.data.frameControl.uint32 or
+      (hdr.data.seqCtrl.uint32 shl 16)
+    nimFwDbgEapolTxHdr1 = macAddrLo32(addr hdr.data.addr1)
+    nimFwDbgEapolTxHdr2 = macAddrLo32(addr hdr.data.addr2)
+    nimFwDbgEapolTxHdr3 =
+      macAddrLo32(addr hdr.data.addr3) or
+      (hdr.qosCtrl.uint32 shl 16)
+    nimFwDbgEapolTxAddrHi =
+      macAddrHi16(addr hdr.data.addr1) or
+      (macAddrHi16(addr hdr.data.addr2) shl 16)
+
   when defined(bl808WifiConnectTrace):
     let protoTrace = frameLen
     if protoTrace == 0x8E88'u16:
       nimFwConnectTrace2U32("[WIFI-CT] tx_eapol_fc ",
                             fullFc.uint32 or (vifMode.uint32 shl 16),
                             cast[uint32](hdrBufBase))
-      let addr1Trace = cast[ptr uint16](hdrBufBase + 4)[].uint32 or
-        (cast[ptr uint16](hdrBufBase + 6)[].uint32 shl 16)
-      let addr2Trace = cast[ptr uint16](hdrBufBase + 10)[].uint32 or
-        (cast[ptr uint16](hdrBufBase + 12)[].uint32 shl 16)
-      let addr3Trace = cast[ptr uint16](hdrBufBase + 16)[].uint32 or
-        (cast[ptr uint16](hdrBufBase + 18)[].uint32 shl 16)
+      let addr1Trace = macAddrLo32(addr hdr.data.addr1)
+      let addr2Trace = macAddrLo32(addr hdr.data.addr2)
+      let addr3Trace = macAddrLo32(addr hdr.data.addr3)
       nimFwConnectTrace2U32("[WIFI-CT] tx_eapol_a12 ", addr1Trace, addr2Trace)
       nimFwConnectTrace2U32("[WIFI-CT] tx_eapol_a3 ", addr3Trace, frameLen.uint32)
-      let addrHi12Trace = cast[ptr uint16](hdrBufBase + 8)[].uint32 or
-        (cast[ptr uint16](hdrBufBase + 14)[].uint32 shl 16)
-      let addrHi3Trace = cast[ptr uint16](hdrBufBase + 20)[].uint32
+      let addrHi12Trace = macAddrHi16(addr hdr.data.addr1) or
+        (macAddrHi16(addr hdr.data.addr2) shl 16)
+      let addrHi3Trace = macAddrHi16(addr hdr.data.addr3)
       nimFwConnectTrace2U32("[WIFI-CT] tx_eapol_ahi ", addrHi12Trace, addrHi3Trace)
       nimFwConnectTrace2U32("[WIFI-CT] tx_eapol_snap ",
-                            cast[ptr uint32](hdrBufBase + 24)[],
-                            cast[ptr uint32](hdrBufBase + 28)[])
+                            snapTraceLo(layout),
+                            snapTraceHi(layout))
 
-  # Check if NAV protection (RTS/CTS) is needed
-  # Read the STA's HT capabilities for RTS threshold check
+  # Protected data frames need the Protected bit when a pairwise key is active.
+  # The reference skips only the control-port EtherType gate; other Ethernet-II
+  # data frames (DHCP/ARP/IP) are encrypted and must advertise that in FC.
   if pairwiseKey != 0:
-    let staHtCaps = vifKeyPointersAt(vifEntry).flags
-    if (staHtCaps and 2) != 0:
-      # STA supports HT -- check if frame length exceeds RTS threshold
-      let rtsThreshold = sta.rateWord
-      if rtsThreshold != frameLen:
-        # Set "more data" / NAV protection bit in FC
-        let fc0 = cast[ptr uint8](hdrBufBase)[]
-        let fc1 = cast[ptr uint8](hdrBufBase + 1)[]
-        var navFc = fc0.uint16 or (fc1.uint16 shl 8)
-        navFc = navFc or 0x4000  # more data / nav
-        let newFc1 = ((navFc shr 8) and 0xFF).uint8
-        cast[ptr uint8](hdrBufBase)[] = (navFc and 0xFF).uint8
-        cast[ptr uint8](hdrBufBase + 1)[] = newFc1
+    let keyFlags = vifKeyPointers(vif).flags
+    let isControlPort =
+      (keyFlags and 2) != 0 and sta.rateWord == lmacGateHalfword(frameLen)
+    if not isControlPort:
+      hdr.data.frameControl = hdr.data.frameControl or 0x4000'u16
+
+  if frameType == 0x0800'u16:
+    let finalStaIdx = txDesc.staIdx
+    if finalStaIdx != 0xFF'u8:
+      hdr.qosCtrl = finalStaIdx.uint16
+    nimFwDbgDhcpTxLayout[0] = pointerAddrU32(bufPtr)
+    nimFwDbgDhcpTxLayout[1] = pointerAddrU32(cast[pointer](layout.mac))
+    nimFwDbgDhcpTxLayout[2] = pointerAddrU32(cast[pointer](layout.sec))
+    nimFwDbgDhcpTxLayout[3] = pointerAddrU32(cast[pointer](layout.snap))
+    nimFwDbgDhcpTxLayout[4] =
+      txDesc.hdrLen.uint32 or
+      (layout.macLen.uint32 shl 8) or
+      (layout.secLen.uint32 shl 16) or
+      (layout.snapLen.uint32 shl 24)
+    nimFwDbgDhcpTxLayout[5] =
+      debugLoadLe32(cast[pointer](layout.sec))
+    nimFwDbgDhcpTxLayout[6] =
+      debugLoadLe32(cast[pointer](layout.snap))
+    nimFwDbgDhcpTxLayout[7] =
+      debugLoadLe32(bufPtr)
+    nimFwDbgDhcpTxHdr0 =
+      hdr.data.frameControl.uint32 or
+      (hdr.data.seqCtrl.uint32 shl 16)
+    nimFwDbgDhcpTxHdr2 =
+      macAddrLo32(addr hdr.data.addr3) or
+      (hdr.qosCtrl.uint32 shl 16)
+    var macRawLen = txDesc.hdrLen.uint32 + 32'u32
+    nimFwDbgDhcpMacRawLen = macRawLen
+    if macRawLen > nimFwDbgDhcpMacRaw.len.uint32:
+      macRawLen = nimFwDbgDhcpMacRaw.len.uint32
+    if macRawLen != 0'u32:
+      discard c_memcpy(addr nimFwDbgDhcpMacRaw[0], cast[pointer](layout.mac),
+                       macRawLen.csize_t)
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void txu_cntrl_push(void*);".}
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void txu_cntrl_push(void*);".}
@@ -22202,7 +30154,6 @@ proc txu_cntrl_push*(param: pointer) {.exportc, cdecl.} =
   ## Drop path (L69): sets up error counters in stack (0x20000, 0x80000,
   ## 0x100000) and returns without transmitting.
   let desc = hostTxDescAt(param)
-  let vifBase = cast[uint](addr vif_info_tab[0])
 
   # Blob ABI: a0=txdesc (param), a1=ac. Capture a1 since Nim only sees a0.
   var acFromCaller: pointer
@@ -22240,7 +30191,8 @@ proc txu_cntrl_push*(param: pointer) {.exportc, cdecl.} =
 
   # Step 2: Look up VIF for this frame
   let vifIdx = desc.vifIdx
-  let vifEntryU = vifBase + vifIdx.uint * VIF_ENTRY_SIZE.uint
+  let vif = vifChannelForIdx(vifIdx)
+  let vifEntry = cast[pointer](vif)
 
   # Blob funnels the 3 drop paths (dropFrame / crypto-pending /
   # tx-not-ready) through a shared tail with one txl_cntrl_inc_pck_cnt
@@ -22249,17 +30201,16 @@ proc txu_cntrl_push*(param: pointer) {.exportc, cdecl.} =
   var dropErrFlags: uint32 = 0
   if dropFrame:
     if vifIdx != 0:
-      vifChannelAt(vifEntryU).psFlags = 1
+      vif.psFlags = 1
     doDrop = true
     dropErrFlags = 0xC0000000'u32 or vifIdx.uint32
   else:
-    let vif = vifChannelAt(vifEntryU)
     if vif.vifType == 0:
       if vif.keyPsState != 0:
         vif.psFlags = 1
         doDrop = true
         dropErrFlags = 0xC0000001'u32
-    if not doDrop and not txl_cntrl_tx_check(cast[pointer](vifEntryU)):
+    if not doDrop and not txl_cntrl_tx_check(vifEntry):
       vif.psFlags = 1
       doDrop = true
       dropErrFlags = 0xC0000000'u32 or vifIdx.uint32
@@ -22275,12 +30226,11 @@ proc txu_cntrl_push*(param: pointer) {.exportc, cdecl.} =
   var hdrLen: uint16 = 24
   if staIdx != 0xFF:
     let staInfoForSeq = desc.staInfoIdx
-    let staEntrySeq = cast[uint](staInfoForIdx(staInfoForSeq))
+    let staSeq = staTxSequence(staInfoForIdx(staInfoForSeq))
     hdrLen = 26
-    let tidSeqBase = staEntrySeq + 24
-    let seqNum = cast[ptr uint16](tidSeqBase + 4)[]
+    let seqNum = staSeq.seqCounter
     let nextSeq = (seqNum + 1) and 0xFFF'u16
-    cast[ptr uint16](tidSeqBase + 4)[] = nextSeq
+    staSeq.seqCounter = nextSeq
     desc.seqAssigned = seqNum
 
   # Step 5: Compute security header length.
@@ -22301,8 +30251,9 @@ proc txu_cntrl_push*(param: pointer) {.exportc, cdecl.} =
   #   desc[99]   = 8 if frame_len > 1536 else 0   ; QoS/SNAP extension length
   #   desc[100]  = secTailLen                     ; MIC/ICV byte count
   let frameLen = desc.frameLen
+  let frameType = lmacGateHalfword(frameLen)
   var qosExt: uint8 = 0
-  if frameLen > 1536:
+  if frameType > 1536:
     qosExt = 8
     hdrLen += 8
 
@@ -22310,6 +30261,12 @@ proc txu_cntrl_push*(param: pointer) {.exportc, cdecl.} =
   desc.hdrLen = (hdrLen + secHdrLen.uint16).uint8
   desc.qosExtLen = qosExt
   desc.secTailLen = secTailLen
+  if frameType == 0x0800'u16:
+    nimFwDbgDhcpTxSec =
+      secHdrLen.uint32 or
+      (secTailLen.uint32 shl 8) or
+      (hdrLen.uint32 shl 16) or
+      (qosExt.uint32 shl 24)
   when defined(bl808WifiConnectTrace):
     let protoTraceSec = desc.frameLen
     if protoTraceSec == 0x8E88'u16 or protoTraceSec == 0x888E'u16:
@@ -22334,7 +30291,11 @@ proc txu_cntrl_push*(param: pointer) {.exportc, cdecl.} =
 
   # Step 11: Store result, clear flags, tail-call txl_cntrl_push
   desc.policy = txPolicyForPush
-  vifChannelAt(vifEntryU).psFlags = 0
+  if lmacGateHalfword(desc.frameLen) == 0x0800'u16:
+    nimFwDbgDhcpTxPolicy = pointerAddrU32(txPolicyForPush)
+    nimFwDbgDhcpTxBufDesc = pointerAddrU32(desc.bufDesc)
+    nimFwDbgDhcpTxHwDesc = pointerAddrU32(desc.hwDesc)
+  vif.psFlags = 0
 
   # Tail-call to txl_cntrl_push (blob: a0=desc, a1=ac; jr t1 at 0x162)
   discard txl_cntrl_push(param, ac)
@@ -22351,7 +30312,7 @@ proc txu_cntrl_cfm*(param: pointer) {.exportc, cdecl.} =
   # THD[16] |= 1  (set confirm-done bit)
   thd.flags = thd.flags or 1
   # THD[12] = 0x0101  (confirm type/status = 257)
-  cast[ptr uint16](addr thd.payloadEnd)[] = 0x0101'u16
+  hostTxThdConfirmAt(thd).confirmType = 0x0101'u16
   # Clear ke_msg linkage at param[-4]
   hostTxConfirmLinkWord(desc)[] = 0
   # Copy final THD[16] to confirm pointer
@@ -22377,12 +30338,10 @@ proc txu_cntrl_tkip_mic_append*(txdesc: pointer) {.exportc, cdecl.} =
   let keySlot = cast[ptr pointer](cast[uint](keyHolder))[]
   if keySlot == nil:
     return
-  let keyAddr = cast[uint](keySlot)
   let key = cast[ptr VifKeySlotView](keySlot)
   let keyType = key.cipherType
   let linkDesc = desc.bufDesc
   let link = hostTxLinkDescAt(linkDesc)
-  let linkAddr = cast[uint](linkDesc)
   # Determine MIC key offset based on key type
   var micKeyOff: uint
   if keyType == 1:
@@ -22393,15 +30352,14 @@ proc txu_cntrl_tkip_mic_append*(txdesc: pointer) {.exportc, cdecl.} =
     micKeyOff = 48
   else:
     return
-  # Check if MIC calculation context already set up (key+72 or similar area has ptr at +4)
-  let micAreaBase = keyAddr + micKeyOff - 24
-  let existingPtr = cast[ptr pointer](micAreaBase + 4)[]
-  if existingPtr != nil:
+  # Check if MIC calculation context already set up.
+  let micArea = tkipMicKeyArea(key, micKeyOff)
+  if micArea.scratch != nil:
     return  # MIC already in progress
   # Set up MIC context at linkDesc+316..348 area
   # Layout: [316]=magic(0xCAFEFADE), [320]=L_init, [324]=data_ptr, [328]=end_ptr, [332]=pending
   let scratch = addr link.micScratch
-  cast[ptr pointer](micAreaBase + 4)[] = cast[pointer](scratch)
+  micArea.scratch = cast[pointer](scratch)
   scratch.dataPtr = cast[pointer](addr scratch.data[0])
   if keyType == 1:
     scratch.endPtr = cast[pointer](addr scratch.data[3])
@@ -22416,12 +30374,10 @@ proc txu_cntrl_tkip_mic_append*(txdesc: pointer) {.exportc, cdecl.} =
     let priority = desc.staIdx
     let payloadLen = desc.qosExtLen
     # Get payload pointer from link descriptor
-    let payloadPtr = desc.bufDesc
-    let frameHdr = cast[uint](payloadPtr) + 348  # MAC header starts at link+348
     # Initialize MIC: da (link+352), sa (link+358)
     var micCtx {.noinit.}: array[16, uint8]
     let micCtxPtr = cast[pointer](addr micCtx[0])
-    let keyMaterial = cast[pointer](keyAddr + micKeyOff)
+    let keyMaterial = cast[pointer](addr micArea.keyMaterial[0])
     me_mic_init(micCtxPtr, keyMaterial,
                 cast[pointer](addr desc.sa[0]),
                 cast[pointer](addr desc.da[0]),
@@ -22433,21 +30389,18 @@ proc txu_cntrl_tkip_mic_append*(txdesc: pointer) {.exportc, cdecl.} =
     me_mic_calc(micCtxPtr, hdrStart, 14.uint32)  # DA(6)+SA(6)+prio(1)+pad(1)
     me_mic_end(micCtxPtr)
     # Pass 2: MIC over frame body (blob: me_mic_calc at 0x12c, me_mic_end at 0x13e)
-    let bodyStart = linkAddr + 348 + 26  # skip MAC header
+    let bodyStart = hostTxLinkMacHdrPtr(link, 26'u)  # skip MAC header
     let bodyLen = payloadLen
-    me_mic_calc(micCtxPtr, cast[pointer](bodyStart), bodyLen.uint32)
+    me_mic_calc(micCtxPtr, bodyStart, bodyLen.uint32)
     # Finalize and write MIC
     me_mic_end(micCtxPtr)
-    # Copy 8-byte MIC result to end of frame
-    let txPayloadEnd = desc.bufDesc
-    let endOff = cast[ptr uint32](linkAddr + 76)[]
     let micDst = cast[ptr UncheckedArray[uint8]](scratch)
     let micResult = cast[ptr UncheckedArray[uint8]](micCtxPtr)
     for i in 0 ..< 8:
       micDst[i] = micResult[i]
-  else:
-    # Group key MIC: similar but with different addresses
-    discard
+  # Group-key/other TKIP modes follow the reference path that only arms the
+  # link descriptor scratch state above; no immediate software MIC is appended.
+  return
 
 proc txu_cntrl_protect_mgmt_frame*(param: pointer, hdrPtr: pointer, extraLen: uint32) {.exportc, cdecl.} =
   ## Apply management frame protection (108 bytes in blob).
@@ -22468,14 +30421,10 @@ proc txu_cntrl_protect_mgmt_frame*(param: pointer, hdrPtr: pointer, extraLen: ui
     # Use cached values
     secHdrLen = desc.hdrLen
     secTailLen = desc.secTailLen
-  # Set Protected Frame bit (0x4000) in frame header bytes
+  # Set Protected Frame bit (0x4000) in the frame-control field.
+  let fc = macFrameControlAt(hdrPtr)
+  fc.frameControl = fc.frameControl or 0x4000'u16
   let hdrAddr = cast[uint](hdrPtr)
-  let fc0 = cast[ptr uint8](hdrAddr)[]
-  let fc1 = cast[ptr uint8](hdrAddr + 1)[]
-  let fc16 = fc0.uint16 or (fc1.uint16 shl 8)
-  let protFc = fc16 or 0x4000'u16
-  cast[ptr uint8](hdrAddr)[] = cast[uint8](protFc and 0xFF)
-  cast[ptr uint8](hdrAddr + 1)[] = cast[uint8]((protFc shr 8) and 0xFF)
   # Compute position for security header: hdrPtr + extraLen + secHdrLen
   let secHdrPos = cast[pointer](hdrAddr + extraLen.uint + secHdrLen.uint)
   # Append security header (blob: txu_cntrl_sec_hdr_append(param, secHdrPos))
@@ -22485,15 +30434,18 @@ proc txu_cntrl_protect_mgmt_frame*(param: pointer, hdrPtr: pointer, extraLen: ui
 #                   RX LAYER (rxl_*)
 # ###########################################################################
 
+proc nimFwRxDmaAfterInitProbe*() {.exportc, cdecl, noinline.} =
+  {.emit: "asm volatile(\"nop\" ::: \"memory\");".}
+
+proc nimFwScanRxFilterProbe*() {.exportc, cdecl, noinline.} =
+  {.emit: "asm volatile(\"nop\" ::: \"memory\");".}
+
 proc rx_swdesc_init*() {.exportc, cdecl.} =
   ## Initialize RX software descriptors.
   ## Blob layout is 41 entries of 24 bytes. Each software descriptor stores its
   ## paired RX header descriptor at offset +4.
-  let swBase = cast[uint](addr rx_swdesc_tab[0])
-  let hdBase = cast[uint](addr rx_dma_hdrdesc[0])
-  for i in 0'u ..< 41'u:
-    cast[ptr pointer](swBase + i * 24'u + 4'u)[] =
-      cast[pointer](hdBase + i * 100'u)
+  for i in 0 ..< 41:
+    rxSwTableDescAt(i).firstHeaderDesc = cast[pointer](rxHeaderHwDescAt(i))
 
 proc rxl_hwdesc_init*(resetAll: uint32) {.exportc, cdecl.} =
   ## Initialize RX HW descriptors and program DMA.
@@ -22503,12 +30455,12 @@ proc rxl_hwdesc_init*(resetAll: uint32) {.exportc, cdecl.} =
   ## 1. HD (Header Descriptor) chain: 41 entries, stride 100 bytes each.
   ##    Each HD is initialized with 0xBAADF00D magic if DMA-owned (field[96]==1).
   ##    Fields cleared: [16,20,64,24,8,28] = 0. Chain linked via [4] pointers.
-  ##    HD head written to MAC register 0x24B081B8. Trigger 0x4000000 -> 0x24B08180.
+  ##    HD head written through machwRxSetHdSubmittedHead, then HD DMA is triggered.
   ##
   ## 2. PD (Payload Descriptor) chain: 41 entries, stride 52 bytes each.
   ##    Each PD is initialized with 0xC0DEDBAD magic if DMA-owned (field[20]==1).
   ##    Fields cleared: [16,4,8,0,24] = 0, [12] = next desc addr.
-  ##    PD head written to MAC register 0x24B081BC. Trigger 0x8000000 -> 0x24B08180.
+  ##    PD head written through machwRxSetPdSubmittedHead, then PD DMA is triggered.
   ##
   ## 3. Stores chain head/tail pointers into rxl_hwdesc_env.
   ## 4. Tail-calls g_bl_ops_funcs[24] (platform free) to release scratch buffer.
@@ -22523,12 +30475,7 @@ proc rxl_hwdesc_init*(resetAll: uint32) {.exportc, cdecl.} =
   const BAADF00D = 0xBAADF00D'u32
   const C0DEDBAD = 0xC0DEDBAD'u32
   const HD_COUNT = 41
-  const HD_STRIDE = 100
   const PD_COUNT = 41
-  const PD_STRIDE = 52
-  const MAC_RX_HD_REG = 0x24B081B8'u  # HD chain head register
-  const MAC_RX_PD_REG = 0x24B081BC'u  # PD chain head register
-  const MAC_TRIGGER_REG = 0x24B08180'u
   # Initialize HD chain
   # HD descriptors are in a contiguous block; we walk through checking DMA ownership
   var hdCurrent: pointer = nil
@@ -22536,42 +30483,39 @@ proc rxl_hwdesc_init*(resetAll: uint32) {.exportc, cdecl.} =
   var hdTail: pointer = nil
   var hdPrev: pointer = nil
   var hdCount: uint32 = 0
-  let hdBase = cast[uint](addr rx_dma_hdrdesc[0])  # blob: sym rx_dma_hdrdesc
-  let swBase = cast[uint](addr rx_swdesc_tab[0])
   for i in 0 ..< HD_COUNT:
-    let hdAddr = hdBase + i.uint * HD_STRIDE.uint
-    let dmaOwned = cast[ptr uint32](hdAddr + 96)[]
+    let hd = rxHeaderHwDescAt(i)
+    let dmaOwned = hd.usedFlag
     if resetAll != 0 or dmaOwned != 1:
       if hdPrev != nil:
-        cast[ptr pointer](cast[uint](hdPrev) + 4)[] = cast[pointer](hdAddr)
+        cast[ptr RxHeaderHwDescView](hdPrev).next = cast[pointer](hd)
       # Initialize descriptor fields
-      let nextAddr = hdBase + (i + 1).uint * HD_STRIDE.uint
-      cast[ptr uint32](hdAddr + 16)[] = 0   # next THD
-      cast[ptr uint32](hdAddr + 20)[] = 0   # status
-      cast[ptr uint32](hdAddr + 64)[] = 0   # flags
-      cast[ptr uint32](hdAddr + 24)[] = 0   # reserved
-      cast[ptr uint32](hdAddr + 8)[]  = 0   # buf ptr
-      cast[ptr uint32](hdAddr + 12)[] = cast[uint32](swBase + i.uint * 24'u)
-      cast[ptr uint32](hdAddr + 0)[]  = BAADF00D  # magic
-      cast[ptr uint32](hdAddr + 4)[]  = cast[uint32](nextAddr)
-      cast[ptr uint16](hdAddr + 28)[] = 0   # status half
-      hdPrev = cast[pointer](hdAddr)
+      hd.nextThd = 0
+      hd.status = 0
+      hd.flags = 0
+      hd.reserved24 = 0
+      hd.bufferAddr = 0
+      hd.swDesc = cast[uint32](rxSwTableDescAt(i))
+      hd.magic = BAADF00D
+      hd.next = if i + 1 < HD_COUNT: cast[pointer](rxHeaderHwDescAt(i + 1)) else: nil
+      hd.statusHalf = 0
+      hdPrev = cast[pointer](hd)
       if hdCount == 0:
-        hdCurrent = cast[pointer](hdAddr)
+        hdCurrent = cast[pointer](hd)
       elif hdCount == 1:
-        hdHead = cast[pointer](hdAddr)
-      hdTail = cast[pointer](hdAddr)
+        hdHead = cast[pointer](hd)
+      hdTail = cast[pointer](hd)
       hdCount += 1
     else:
       if hdPrev != nil:
-        cast[ptr pointer](cast[uint](hdPrev) + 4)[] = nil
+        cast[ptr RxHeaderHwDescView](hdPrev).next = nil
   # Terminate HD chain
   if hdPrev != nil:
-    cast[ptr pointer](cast[uint](hdPrev) + 4)[] = nil
+    cast[ptr RxHeaderHwDescView](hdPrev).next = nil
   # Write HD head to MAC register
-  regWrite(MAC_RX_HD_REG, cast[uint32](hdHead))
+  machwRxSetHdSubmittedHead(cast[uint32](hdHead))
   # Trigger HD DMA: write 0x4000000 to trigger register
-  regWrite(MAC_TRIGGER_REG, 0x04000000'u32)
+  machwRxDmaTrigger(0x04000000'u32)
   # Initialize PD chain
   var pdCurrent: pointer = nil
   var pdHead: pointer = nil
@@ -22579,37 +30523,38 @@ proc rxl_hwdesc_init*(resetAll: uint32) {.exportc, cdecl.} =
   var pdPrev: pointer = nil
   var pdCount: uint32 = 0
   for i in 0 ..< PD_COUNT:
-    let pdAddr = cast[uint](addr rx_payload_desc[0]) + i.uint * PD_STRIDE.uint
-    let dmaOwned = cast[ptr uint32](pdAddr + 20)[]
+    let pd = rxPayloadHwDescAt(i)
+    let dmaOwned = pd.usedFlag
     if resetAll != 0 or dmaOwned != 1:
       # Initialize PD descriptor
       if pdPrev != nil:
-        cast[ptr pointer](cast[uint](pdPrev) + 4)[] = cast[pointer](pdAddr)
-      let nextAddr = cast[uint](addr rx_payload_desc[0]) + (i + 1).uint * PD_STRIDE.uint
-      let bufAddr = cast[uint](addr rx_payload_desc_buffer[0]) + i.uint * 1736'u
-      cast[ptr uint32](pdAddr + 0)[]  = C0DEDBAD  # magic
-      cast[ptr uint32](pdAddr + 4)[]  = cast[uint32](nextAddr)
-      cast[ptr uint32](pdAddr + 16)[] = 0   # status
-      cast[ptr uint32](pdAddr + 8)[]  = cast[uint32](bufAddr)
-      cast[ptr uint32](pdAddr + 12)[] = cast[uint32](bufAddr + 1735'u)
-      cast[ptr uint32](pdAddr + 24)[] = cast[uint32](bufAddr)
-      pdPrev = cast[pointer](pdAddr)
+        cast[ptr RxPayloadHwDescView](pdPrev).next = cast[pointer](pd)
+      let buf = rxPayloadBufferAt(i)
+      pd.magic = C0DEDBAD
+      pd.next = if i + 1 < PD_COUNT: cast[pointer](rxPayloadHwDescAt(i + 1)) else: nil
+      cast[ptr uint16](addr pd.status)[] = 0
+      pd.bufferAddr = cast[uint32](addr buf.bytes[0])
+      pd.bufferEnd = cast[uint32](addr buf.bytes[1735])
+      pd.bufferStart = cast[uint32](addr buf.bytes[0])
+      pdPrev = cast[pointer](pd)
       if pdCount == 0:
-        pdCurrent = cast[pointer](pdAddr)
+        pdCurrent = cast[pointer](pd)
       elif pdCount == 1:
-        pdHead = cast[pointer](pdAddr)
-      pdTail = cast[pointer](pdAddr)
+        pdHead = cast[pointer](pd)
+      pdTail = cast[pointer](pd)
       pdCount += 1
     else:
       if pdPrev != nil:
-        cast[ptr pointer](cast[uint](pdPrev) + 4)[] = nil
+        cast[ptr RxPayloadHwDescView](pdPrev).next = nil
   # Terminate PD chain
   if pdPrev != nil:
-    cast[ptr pointer](cast[uint](pdPrev) + 4)[] = nil
+    cast[ptr RxPayloadHwDescView](pdPrev).next = nil
   # Write PD head to MAC register
-  regWrite(MAC_RX_PD_REG, cast[uint32](pdHead))
+  machwRxSetPdSubmittedHead(cast[uint32](pdHead))
   # Trigger PD DMA: write 0x8000000 to trigger register
-  regWrite(MAC_TRIGGER_REG, 0x08000000'u32)
+  machwRxDmaTrigger(0x08000000'u32)
+  when defined(bl808WifiUseBl808Rf):
+    nimFwRxDmaAfterInitProbe()
   # Sanity check: all chain pointers should be non-nil
   if hdCurrent == nil or hdHead == nil or hdTail == nil or pdCurrent == nil or pdHead == nil or pdTail == nil:
     # Log error via g_bl_ops_funcs[4]
@@ -22628,6 +30573,8 @@ proc rxl_hwdesc_init*(resetAll: uint32) {.exportc, cdecl.} =
   let rxHwEnv = rxHwDescEnvView()
   rxHwEnv.pdTail = pdTail
   rxHwEnv.pdCurrent = pdCurrent
+  when defined(bl808WifiUseBl808Rf):
+    rfPhyTraceCheckpoint(0x10'u32)
   # Free scratch buffer via g_bl_ops_funcs[24] (platform free)
   let freeFnPtr = blOpsFunc(24)
   if freeFnPtr != nil:
@@ -22646,18 +30593,13 @@ proc rxl_reset*() {.exportc, cdecl.} =
   ## Reset RX layer — blob rxl_cntrl.o::rxl_reset (46 bytes, 3 calls):
   ##   rxl_hwdesc_init(0)
   ##   co_list_init(&rxl_cntrl_env)        # primary RX cntrl queue
-  ##   co_list_init(&rxu_cntrl_env + 0x40) # (tail-call) upload list
+  ##   co_list_init(&rxu_cntrl_env.uploadList) # (tail-call) upload list
   ## Previous Nim called rx_swdesc_init / rxu_cntrl_init which do a superset
   ## of work — that duplicates state resets and diverges from blob's behavior
   ## when other reset sequences call those separately.
   rxl_hwdesc_init(0)
   co_list_init(addr rxlCntrlEnvView().queue)
-  # rxu_cntrl_env is declared further down in the module; reach it via the
-  # exported C symbol so we don't need a Nim forward declaration.
-  var uploadList: ptr CoList
-  {.emit: ["extern unsigned char rxu_cntrl_env[];\n",
-          uploadList, " = (void*)(rxu_cntrl_env + 0x40);"].}
-  co_list_init(uploadList)
+  co_list_init(addr rxuCntrlEnvView().uploadList)
 
 proc rxl_hwdesc_dump*() {.exportc, cdecl, noinline.} =
   ## Dump RX HW descriptor state for debugging.
@@ -22690,38 +30632,24 @@ proc rxl_hwdesc_dump*() {.exportc, cdecl, noinline.} =
     putsFn("rxl_hwdesc dump")
   # Print HD chain header with count
   printFn("HD chain (%d entries):", 41)
-  # Get HD chain base from rxl_hwdesc_env
-  let rxlEnv = cast[uint](addr rxl_hwdesc_env[0])
   # Snapshot function for timing (g_bl_ops_funcs[20])
   let snapFuncPtr = blOpsFunc(20)
   var snapResult: pointer = nil
   if snapFuncPtr != nil:
     type SnapFn = proc(): pointer {.cdecl.}
     snapResult = cast[SnapFn](snapFuncPtr)()
-  # Walk HD chain - 41 entries, stride 100 (blob sym: rx_dma_hdrdesc)
-  let hdBase = cast[uint](addr rx_dma_hdrdesc[0])
+  # Walk HD chain - 41 typed entries (blob sym: rx_dma_hdrdesc)
   for i in 0'u32 ..< 41:
-    let hdAddr = hdBase + i * 100
-    let w0 = cast[ptr uint32](hdAddr + 0)[]
-    let w1 = cast[ptr uint32](hdAddr + 4)[]
-    let w2 = cast[ptr uint32](hdAddr + 8)[]
-    let w3 = cast[ptr uint32](hdAddr + 12)[]
-    printFn("HD[%d] @%p: %08x %08x %08x %08x", i, hdAddr, w0, w1, w2, w3)
-    let w4 = cast[ptr uint32](hdAddr + 16)[]
-    let w5 = cast[ptr uint32](hdAddr + 20)[]
-    let w6 = cast[ptr uint32](hdAddr + 24)[]
-    let h7 = cast[ptr uint16](hdAddr + 28)[]
-    let h8 = cast[ptr uint16](hdAddr + 30)[]
-    printFn("  %08x %08x %08x %04x %04x", w4, w5, w6, h7, h8)
-    let w9  = cast[ptr uint32](hdAddr + 32)[]
-    let w10 = cast[ptr uint32](hdAddr + 36)[]
-    let w11 = cast[ptr uint32](hdAddr + 44)[]
-    let w12 = cast[ptr uint32](hdAddr + 48)[]
-    let w13 = cast[ptr uint32](hdAddr + 52)[]
-    let w14 = cast[ptr uint32](hdAddr + 56)[]
-    let w15 = cast[ptr uint32](hdAddr + 60)[]
-    let w16 = cast[ptr uint32](hdAddr + 64)[]
-    printFn("  %08x %08x %08x %08x %08x %08x %08x %08x", w9, w10, w11, w12, w13, w14, w15, w16)
+    let hd = rxHeaderHwDescAt(i.int)
+    printFn("HD[%d] @%p: %08x %08x %08x %08x",
+            i, cast[pointer](hd), hd.magic, pointerAddrU32(hd.next),
+            hd.bufferAddr, hd.swDesc)
+    printFn("  %08x %08x %08x %04x %04x",
+            hd.nextThd, hd.status, hd.reserved24, hd.statusHalf,
+            hd.statusHalf2)
+    printFn("  %08x %08x %08x %08x %08x %08x %08x %08x",
+            hd.word32, hd.word36, hd.word44, hd.word48, hd.word52, hd.word56,
+            hd.word60, hd.flags)
   # Restore/free snapshot
   if snapFuncPtr != nil and snapResult != nil:
     let freeFuncPtr = blOpsFunc(24)
@@ -22731,46 +30659,40 @@ proc rxl_hwdesc_dump*() {.exportc, cdecl, noinline.} =
   # Print PD chain
   printFn("PD chain (%d entries):", 41)
   for i in 0'u32 ..< 41:
-    let pdAddr = hdBase + 41'u * 100 + i * 52
-    let w0 = cast[ptr uint32](pdAddr + 0)[]
-    let w1 = cast[ptr uint32](pdAddr + 4)[]
-    let w2 = cast[ptr uint32](pdAddr + 8)[]
-    let w3 = cast[ptr uint32](pdAddr + 12)[]
+    let pd = rxPayloadHwDescAt(i.int)
     # Compute length: if end != 0 then end+1-start else 0
-    let endAddr = cast[ptr uint32](pdAddr + 12)[]
-    let startAddr = cast[ptr uint32](pdAddr + 8)[]
     var pktLen: uint32 = 0
-    if endAddr != 0:
-      pktLen = endAddr + 1 - startAddr
-    let h4 = cast[ptr uint16](pdAddr + 16)[]
-    let h5 = cast[ptr uint16](pdAddr + 18)[]
+    if pd.bufferEnd != 0:
+      pktLen = pd.bufferEnd + 1 - pd.bufferStart
     printFn("PD[%d] @%p: %08x %08x %08x %08x len=%d %04x %04x",
-            i, pdAddr, w0, w1, w2, w3, pktLen, h4, h5)
+            i, cast[pointer](pd), pd.magic, pointerAddrU32(pd.next),
+            pd.bufferAddr, pd.bufferEnd, pktLen, uint16(pd.status and 0xFFFF'u32),
+            uint16(pd.status shr 16))
 
 proc rxl_hd_append*(desc: pointer) {.exportc, cdecl.} =
   ## Append a header descriptor to the RX HD chain.
   ## From disassembly (38 instrs): asserts desc non-nil, reads MAC HW RX header
-  ## head (0x24B08548), manages HD chain in rxl_hwdesc_env[8..16], clears desc
-  ## fields, links into chain, writes 0x10000000 to trigger (0x24B08180).
+  ## head through machwRxHwHdHead, manages HD chain in rxl_hwdesc_env[8..16],
+  ## clears desc fields, links into chain, and triggers RX HD DMA.
   if desc == nil:
     assert_err("rxl_hwdesc.c", "rxl_hwdesc.c", 267)
     return
   let env = rxlCntrlEnvView()
-  let hwHead = regRead(0x24B08548'u)
+  let hwHead = machwRxHwHdHead()
   var appendDesc = desc
   let envCur = cast[uint32](env.currentHd)
   if envCur != hwHead:
     env.currentHd = desc
     appendDesc = cast[pointer](envCur)
-  let dAddr = cast[uint](appendDesc)
-  cast[ptr uint32](dAddr + 4)[] = 0
-  cast[ptr uint32](dAddr + 8)[] = 0
+  let hd = rxHeaderHwDescView(appendDesc)
+  hd.next = nil
+  hd.bufferAddr = 0
   let lastPtr = env.submittedTail
-  cast[ptr uint32](dAddr + 64)[] = 0
-  cast[ptr uint16](dAddr + 28)[] = 0
+  hd.flags = 0
+  hd.statusHalf = 0
   if lastPtr != nil:
-    cast[ptr uint32](cast[uint](lastPtr) + 4)[] = cast[uint32](appendDesc)
-  regWrite(0x24B08180'u, 0x10000000'u32)
+    rxHeaderHwDescView(lastPtr).next = appendDesc
+  machwRxDmaTrigger(0x01000000'u32)
   let firstPtr = env.submittedHead
   env.submittedTail = appendDesc
   if firstPtr == nil:
@@ -22779,27 +30701,27 @@ proc rxl_hd_append*(desc: pointer) {.exportc, cdecl.} =
 proc rxl_pd_append*(swdesc: pointer, prevDesc: pointer, pddesc: pointer) {.exportc, cdecl.} =
   ## Append a payload descriptor to the RX PD chain.
   ## From disassembly (48 instrs): asserts pddesc non-nil, reads MAC HW RX
-  ## payload head (0x24B0854C), manages PD chain in rxl_hwdesc_env[0..4],
-  ## links pddesc, clears status, writes 0x20000000 to trigger (0x24B08180).
+  ## payload head through machwRxHwPdHead, manages PD chain in
+  ## rxl_hwdesc_env[0..4], links pddesc, clears status, and triggers RX PD DMA.
   if pddesc == nil:
     assert_err("rxl_hwdesc.c", "rxl_hwdesc.c", 314)
     return
   let env = rxHwDescEnvView()
-  let hwPdHead = regRead(0x24B0854C'u)
-  let pdAddr = cast[uint](pddesc)
+  let hwPdHead = machwRxHwPdHead()
+  let pd = rxDmaProgressDescAt(pddesc)
   let envTail = cast[uint32](env.pdCurrent)
   if envTail == hwPdHead:
-    cast[ptr uint16](pdAddr + 16)[] = 0
+    cast[ptr uint16](addr pd.status)[] = 0
   else:
     env.pdCurrent = pddesc
     if prevDesc != nil:
-      cast[ptr uint32](cast[uint](swdesc) + 4)[] = cast[uint32](pddesc)
-    cast[ptr uint16](pdAddr + 16)[] = 0
+      rxFrameBufferChainAt(swdesc).next = pddesc
+    cast[ptr uint16](addr pd.status)[] = 0
   let oldLast = env.pdTail
-  cast[ptr uint32](pdAddr + 4)[] = 0
+  pd.next = nil
   if oldLast != nil:
-    cast[ptr uint32](cast[uint](oldLast) + 4)[] = cast[uint32](pddesc)
-  regWrite(0x24B08180'u, 0x20000000'u32)
+    rxDmaProgressDescAt(oldLast).next = pddesc
+  machwRxDmaTrigger(0x02000000'u32)
   env.pdTail = pddesc
 
 proc rxl_frame_release*(desc: pointer) {.exportc, cdecl.} =
@@ -22825,17 +30747,17 @@ proc rxl_mpdu_free*(desc: pointer) {.exportc, cdecl.} =
   let rx = rxMpduDescView(desc)
   let swDescPtr = rx.swDesc
   let sw = rxSwDescView(swDescPtr)
-  var curHw = cast[uint](sw.bufferChain)
+  var curHw = rxDmaProgressDescAt(sw.bufferChain)
   # Call platform get_status via env[20]
   let getStatusFn = blOpsFunc(20)
   var savedStatus: pointer = nil
   if getStatusFn != nil:
     savedStatus = cast[proc(): pointer {.cdecl.}](getStatusFn)()
   sw.uploadDone = 0
-  var prevHw: uint32 = 0
-  while curHw != 0:
-    let hwStatus = cast[ptr uint16](curHw + 16)[]
-    cast[ptr uint32](curHw + 20)[] = 0
+  var prevHw: ptr RxDmaProgressDescView = nil
+  while curHw != nil:
+    let hwStatus = curHw.status
+    curHw.usedFlag = 0
     if (hwStatus and 1) != 0:
       # DMA owned -- save position and release
       rx.curDesc = cast[pointer](curHw)
@@ -22845,9 +30767,8 @@ proc rxl_mpdu_free*(desc: pointer) {.exportc, cdecl.} =
       if cleanFn != nil:
         cast[proc(a: pointer) {.cdecl.}](cleanFn)(savedStatus)
       return
-    let nextHw = cast[ptr uint32](curHw + 4)[]
-    prevHw = cast[uint32](curHw)
-    curHw = cast[uint](nextHw)
+    prevHw = curHw
+    curHw = rxDmaProgressDescAt(curHw.next)
   assert_rec("rxl_hwdesc.c", "rxl_hwdesc.c", 872)
   let cleanFn = blOpsFunc(24)
   if cleanFn != nil:
@@ -22870,27 +30791,24 @@ proc rxl_mpdu_transfer*(desc: pointer) {.exportc, cdecl.} =
   # Get current PHY channel info into swDesc+68 (blob: phy_get_channel(swDesc+68, 0)).
   phy_get_channel_raw(cast[pointer](addr sw.channelInfo[0]), 0)
   # Get HW descriptor chain head from swDesc[8]
-  var cur = cast[ptr RxHwDesc](sw.bufferChain)
+  var cur = rxDmaProgressDescAt(sw.bufferChain)
   # Clear dmaCount at desc[21]
   rx.descCount = 0
-  var prev: ptr RxHwDesc = nil
+  var prev: ptr RxDmaProgressDescView = nil
   while cur != nil:
-    let status = cast[ptr uint16](cast[uint](cur) + 16)[]
-    if (status and 1) != 0:
+    if (cur.status and 1) != 0:
       # DMA still owns this descriptor -- save state and return
       rx.prevDesc = cast[pointer](prev)
       rx.curDesc = cast[pointer](cur)
       return
     # Increment dmaCount
     rx.descCount = rx.descCount + 1
-    # Follow next pointer at offset 4
-    let nextPtr = cast[ptr pointer](cast[uint](cur) + 4)[]
-    if nextPtr == nil:
+    if cur.next == nil:
       # Chain exhausted without finding DMA-owned descriptor: assert
       assert_rec("rxl_mpdu.c", "rxl_mpdu.c", 160)
       return
     prev = cur
-    cur = cast[ptr RxHwDesc](nextPtr)
+    cur = rxDmaProgressDescAt(cur.next)
 
 proc rxl_cntrl_evt*() {.exportc, cdecl.} =
   ## RX control event handler (352 instrs).
@@ -22900,10 +30818,11 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
   ## The blob processes up to 5 frames per invocation (loop counter on stack[0]).
   ## For each frame iteration:
   ##   1. Read current RX HW descriptor from rxl_hwdesc_env[0] (-> s6)
-  ##   2. Call hal_machw_disable_int(0x100000) to mask RX interrupts
+  ##   2. Call hal_machw_disable_int with RX event mask in a0; blob helper
+  ##      ignores a0 and clears the top-level MAC interrupt gate.
   ##   3. Check rxl_hwdesc_env[24] != 0 (processing flag) -> exit
   ##   4. Check s6 == NULL -> exit
-  ##   5. Decrement loop counter; if 0 -> tail-call hal_machw_enable_int(0x100000)
+  ##   5. Decrement loop counter; if 0 -> tail-call ke_evt_set(0x100000)
   ##   6. csrrci mstatus,8 to disable IRQs; call rxl_mpdu_transfer(s1); restore
   ##   7. s8 = s6[4] (SW descriptor); s2 = s8[8] (buf chain); assert s2 != nil
   ##   8. s5 = s8[64] (HW status flags)
@@ -22924,10 +30843,11 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
   ##   - Incrementing VIF pending BA counter at vif_entry[334]
   ##   - Power save wakeup notifications
 
-  let vifBase = cast[uint](addr vif_info_tab[0])
   # Blob s1 = &rxl_cntrl_env, s6 = rxl_cntrl_env[0] (first queued RX desc)
   let cntrlEnv = rxlCntrlEnvView()
   let hwFlagsClearMask = 0xFDFFFFFF'u32  # ~0x02000000
+  inc nimFwDbgRxlCntrlEvt
+  nimFwDbgRxlCntrlHead = pointerAddrU32(cast[pointer](cntrlEnv.queue.first))
 
   # Clear RX event bit before processing (blob: ke_evt_clear at entry)
   ke_evt_clear(0x00100000'u32)
@@ -22954,13 +30874,13 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
     irqRestore(irqState)
 
     # Read SW descriptor and buffer chain
-    let swDesc = cast[ptr pointer](cast[uint](curHwDesc) + 4)[]
+    let swDesc = rxMpduDescView(curHwDesc).swDesc
     let sw = rxSwDescView(swDesc)
     let bufChain = sw.bufferChain
     var hwFlags = sw.hwFlags
     var staIdx: uint8 = 0
     var sta: ptr StaInfoView = nil
-    var staEntryU: uint = 0
+    var staEntry: pointer = nil
     # Blob has ONE rxl_mpdu_free call site at the loop tail; all early
     # exits converge here via the frameWork block.
     var releaseFrame = true
@@ -22970,9 +30890,8 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
        break frameWork
 
      # Validate frame: both valid and associated bits must be set
-     let dbgBuf = cast[uint](bufChain)
      let dbgPayload =
-       if dbgBuf != 0: cast[ptr uint32](dbgBuf + 8)[]
+       if bufChain != nil: pointerAddrU32(rxFrameBufferChainAt(bufChain).frameData)
        else: 0'u32
      let dbgFc =
        if dbgPayload != 0: cast[ptr uint16](dbgPayload.uint)[].uint32
@@ -22987,7 +30906,7 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
 
      # Look up STA entry, check active flag
      sta = staInfoForIdx(staIdx)
-     staEntryU = cast[uint](sta)
+     staEntry = cast[pointer](sta)
      if sta.valid == 0:
        hwFlags = hwFlags and hwFlagsClearMask
        sw.hwFlags = hwFlags
@@ -22996,12 +30915,12 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
 
      # VIF lookup
      let vifIdx = sta.instNbr
-     let vifEntryU = vifBase + vifIdx.uint * VIF_ENTRY_SIZE.uint
-     let vif = vifChannelAt(vifEntryU)
+     let vif = vifChannelForIdx(vifIdx)
+     let vifEntry = cast[pointer](vif)
 
      # Read frame control from RX header
-     let rxHdrPtr = cast[ptr pointer](cast[uint](bufChain) + 8)[]
-     let frameCtrl = cast[ptr uint16](cast[uint](rxHdrPtr))[]
+     let rxHdrPtr = macDataFrameAt(rxFrameBufferChainAt(bufChain).frameData)
+     let frameCtrl = rxHdrPtr.frameControl
      let tid = vif.vifIdx
      let maskedFC = frameCtrl and 0x00FC
 
@@ -23022,7 +30941,7 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
           if fcCheck == 0x0008:
             # Standard QoS data with BA handling
             mm_ps_change_ind(staIdx, 0)
-            apm_tx_int_ps_clear(cast[pointer](vifEntryU), staIdx)
+            apm_tx_int_ps_clear(vifEntry, staIdx)
             dispatchFrame = true
             let pendBA = vif.psBaCounter
             if pendBA > 0:
@@ -23030,7 +30949,7 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
               if pendBA - 1 == 0:
                 let psStaIdx = cast[uint8]((tid.uint + 5'u) and 0xff'u)
                 mm_ps_change_ind(psStaIdx, 0)
-                apm_tx_int_ps_clear(cast[pointer](vifEntryU), psStaIdx)
+                apm_tx_int_ps_clear(vifEntry, psStaIdx)
             break frameDispatch
 
          # Check per-TID BA state
@@ -23043,8 +30962,8 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
              let baCount = sta.uapsdBitmap
              sta.psStatus = 2
              dispatchFrame = true
-             discard sta_mgmt_send_postponed_frame(cast[pointer](vifEntryU),
-               cast[pointer](staEntryU), baCount.uint32)
+             discard sta_mgmt_send_postponed_frame(vifEntry,
+               staEntry, baCount.uint32)
              if baCount != 0 and (baCount.int - 1) <= 0:
                sta.psStatus = 0
                let staVifIdx = sta.infoIdx
@@ -23082,8 +31001,7 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
            # Blob does NOT call rxu_cntrl_frame_handle here — that was a bug
            # which double-processed the PS-Poll descriptor.
            sta.psStatus = sta.psStatus or 1
-           discard sta_mgmt_send_postponed_frame(cast[pointer](vifEntryU),
-             cast[pointer](staEntryU), 1)
+           discard sta_mgmt_send_postponed_frame(vifEntry, staEntry, 1)
            sta.psStatus = sta.psStatus and not 1'u32
          else:
            # .L59: no BA yet — request a PS-Poll BAM indication.
@@ -23113,9 +31031,8 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
          ke_msg_send(msgP)
 
      # L54: Post-dispatch -- check pending crypto and VIF mode
-     # Recompute vifEntry for vifIdx (blob does mul-add with 1512 stride)
-     let postVifEntryU = vifBase + sta.instNbr.uint * VIF_ENTRY_SIZE.uint
-     let postVif = vifChannelAt(postVifEntryU)
+     let postVif = vifChannelForIdx(sta.instNbr)
+     let postVifEntry = cast[pointer](postVif)
      let pendingCrypto = postVif.state
      if pendingCrypto != 0 and (frameCtrl and 4) == 0:
        # Blob 0x1ee: td_pck_ind(a0=vif[87], a1=staIdx, a2=1) for traffic-detect
@@ -23138,8 +31055,8 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
          # Beacon processing path (blob offsets 0x212-0x254).
          # mm_check_beacon ABI: (a0=bufChain, a1=vifEntry, a2=staEntry, a3=&resultVar)
          var bcnResult: uint32 = 0
-         let pVif = cast[pointer](postVifEntryU)
-         let pSta = cast[pointer](staEntryU)
+         let pVif = postVifEntry
+         let pSta = staEntry
          let pBuf = cast[pointer](bufChain)
          let pResult = addr bcnResult
          {.emit: ["asm volatile(\"mv a3, %0\" :: \"r\"(", pResult, ") : \"a3\");"].}
@@ -23170,9 +31087,8 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
 
      # Increment VIF pending-BA counter for QoS frames (blob: L65 at 0x3E6)
      if (maskedFC and 0x8C) == 0x88:
-       let postVif2 = vifBase + sta.instNbr.uint * VIF_ENTRY_SIZE.uint
-       let postVif2View = vifChannelAt(postVif2)
-       postVif2View.psBaCounter = postVif2View.psBaCounter + 1
+       let postVif2 = vifChannelForIdx(sta.instNbr)
+       postVif2.psBaCounter = postVif2.psBaCounter + 1
 
     # L52: Free RX descriptor and loop if the upper RX path did not take it.
     if releaseFrame:
@@ -23221,12 +31137,17 @@ proc rxl_dma_evt*() {.exportc, cdecl.} =
   let logFn = getLogFunc(204)
   if logFn != nil:
     cast[proc(a0: uint32, a1: uint32, a2: cstring, a3: uint32) {.cdecl.}](logFn)(2, 0, "rxl_cntrl.c", 826)
+  inc nimFwDbgRxlDmaEvt
   ke_evt_clear(0x00400000'u32)
   regWrite(0x24A00020'u, 0x20'u32)
 
 proc submittedRxReady(desc: pointer): bool {.inline.} =
   desc != nil and
-    (cast[ptr uint32](cast[uint](desc) + 64)[] and 0x4000'u32) != 0
+    (cast[ptr RxlSubmittedDescView](desc).status and 0x4000'u32) != 0
+
+proc rxlScheduleQueuedRx(env: ptr RxlCntrlEnvView) {.inline.} =
+  if env.queue.first != nil:
+    ke_evt_set(0x00100000'u32)
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void rxl_timer_int_handler(void);".}
 proc rxl_timer_int_handler*() {.exportc, cdecl.} =
@@ -23243,23 +31164,21 @@ proc rxl_timer_int_handler*() {.exportc, cdecl.} =
   ## Call graph: co_list_push_back, assert_rec, rxl_hd_append, ke_evt_set
   regWrite(0x24B0807C'u, 0x000A0000'u32)
   let env = rxlCntrlEnvView()
+  inc nimFwDbgRxlTimerEvt
+  nimFwDbgRxlTimerHead = pointerAddrU32(env.submittedHead)
   var drained = 0'u32
-  template scheduleQueuedRx() =
-    if env.queue.first != nil:
-      ke_evt_set(0x00100000'u32)
 
   while drained < WifiRxTimerDrainLimit and submittedRxReady(env.submittedHead):
+    inc nimFwDbgRxlTimerReady
     let descPtr = env.submittedHead
-    let descAddr = cast[uint](descPtr)
+    let submitted = cast[ptr RxlSubmittedDescView](descPtr)
     # Dequeue: advance first to next
-    let nextDesc = cast[ptr uint32](descAddr + 4)[]
-    let swDescLink = cast[uint](cast[ptr uint32](descAddr + 12)[])
-    env.submittedHead = cast[pointer](nextDesc)
-    let bufChain = cast[ptr uint32](descAddr + 8)[]
-    let innerDesc = cast[uint](cast[ptr uint32](swDescLink + 4)[])
-    cast[ptr uint32](swDescLink + 8)[] = bufChain
-    let statusHalf = cast[ptr uint16](innerDesc + 28)[]
-    let field8 = cast[ptr uint32](innerDesc + 8)[]
+    let swDescLink = rxMpduDescView(submitted.swDesc)
+    env.submittedHead = submitted.next
+    let innerDesc = cast[ptr RxPayloadHwDescView](swDescLink.swDesc)
+    swDescLink.reserved08 = cast[uint32](cast[uint](submitted.bufferChain))
+    let statusHalf = innerDesc.frameLen
+    let field8 = innerDesc.bufferAddr
     if statusHalf != 0:
       if field8 == 0:
         # Error: valid status but no buffer (blob: assert_rec line 193)
@@ -23273,18 +31192,18 @@ proc rxl_timer_int_handler*() {.exportc, cdecl.} =
         assert_rec("rxl_cntrl.c", "rxl_cntrl.c", 227)
       else:
         # Empty descriptor: clear sw_desc fields and re-append HD for reuse
-        cast[ptr uint32](swDescLink + 16)[] = 0
-        cast[ptr uint32](swDescLink + 12)[] = 0
+        swDescLink.curDesc = nil
+        swDescLink.prevDesc = nil
         rxl_hd_append(cast[pointer](innerDesc))
     inc drained
 
   if submittedRxReady(env.submittedHead):
     inc nimFwDbgRxTimerYield
     nimFwDbgRxTimerYieldHead = pointerAddrU32(env.submittedHead)
-    scheduleQueuedRx()
+    rxlScheduleQueuedRx(env)
     regWrite(0x24B0807C'u, 0x000A0000'u32)
     return
-  scheduleQueuedRx()
+  rxlScheduleQueuedRx(env)
 
 proc rxl_timeout_int_handler*() {.exportc, cdecl.} =
   ## RX timeout interrupt handler.
@@ -23311,11 +31230,6 @@ proc rxl_current_desc_get*(): pointer {.exportc, cdecl.} =
 # ###########################################################################
 #                   RX Upper (rxu_*)
 # ###########################################################################
-
-## rxu_cntrl_env: static context structure used by the RX upper control path.
-## Declared here so rxu_cntrl_init can reference it.
-## Full layout documentation is at the original declaration site below.
-var rxu_cntrl_env* {.exportc.}: array[96, uint8]
 
 proc rxu_cntrl_init*() {.exportc, cdecl.} =
   ## Initialize RX upper control (84 bytes in blob, 24 instrs).
@@ -23394,76 +31308,61 @@ proc rxu_cntrl_machdr_len_get*(frameCtrl: uint16): uint8 {.exportc, cdecl, noinl
   if (frameCtrl and 0x8000) != 0: length += 4
   return length
 
+proc rxuQosSeqCachePtr(tid: uint8): ptr uint16 {.inline.} =
+  addr rxuQosSeqCacheTable().entries[tid.int].seqCtrl
+
+proc rxuProtectedKey(env: ptr RxuCntrlEnvView, keyIdx: uint8,
+                     flagged: bool): ptr VifKeySlotView {.inline.} =
+  ## Reference rxu_cntrl.o resolves unflagged protected data to the STA key
+  ## context at sta+0x50. The flagged path uses the VIF key table at vif+0x208.
+  if flagged:
+    let vif = vifChannelForIdx(env.vifIdx)
+    return vifRxProtectedKeySlot(vif, keyIdx.uint)
+  let sta = staInfoForIdx(env.staIdx)
+  cast[ptr VifKeySlotView](addr sta.keyArea[0])
+
 proc rxu_cntrl_protected_handle*(rxuCtx: pointer, hwRxhdrFlags: uint32): cint {.exportc, cdecl.} =
   ## Handle protected frame: parse CCMP/TKIP header, set up security context (94 instrs).
   ## a0 = RX upload context pointer, a1 = HW RX header flags.
   ## Dispatches on frame type (bits 4:2 of a1) to determine header type:
-  ##   20 = WEP (4-byte hdr), 24 = CCMP (8-byte hdr), 28 = TKIP (8-byte hdr).
+  ##   20 = WEP (4-byte hdr), 24 = TKIP (8-byte hdr), 28 = CCMP (8-byte hdr).
   ## Extracts key index from header, looks up STA entry, resolves security key,
   ## stores key address and PN (packet number) into the RX context.
   ## Returns 1 on success, 0 on unrecognized frame type.
-  let ctxAddr = cast[uint](rxuCtx)
-  let hdrOffset = cast[ptr uint8](ctxAddr + 8)[]  # current header parse offset
+  let env = rxuCntrlEnvView()
+  let hdrOffset = env.machdrLen
   let frameType = hwRxhdrFlags and 0x1C  # bits 4:2 (cipher type * 4)
-  let isQos = (hwRxhdrFlags and 0x400) != 0  # bit 10 = QoS flag
-  # Get pointer to encrypted frame data
-  let buf = cast[ptr UncheckedArray[uint8]](cast[uint](rxuCtx) + hdrOffset.uint)
+  let flaggedKeyTable = (hwRxhdrFlags and 0x400) != 0
+  nimFwDbgRxuProtType = frameType or (hwRxhdrFlags and 0x400'u32)
   case frameType
-  of 24:  # CCMP (8 byte header)
-    # Update header offset (+8 for CCMP header)
-    cast[ptr uint8](ctxAddr + 8)[] = hdrOffset + 8
-    # Extract key index from byte 3 bits 7:6
-    let keyIdx = (buf[3] shr 6) and 0x03
-    # Extract PN (packet number): PN0=buf[0], PN1=buf[1], PN2=buf[4], PN3=buf[5], PN4=buf[6], PN5=buf[7]
-    let pnLow = buf[0].uint32 or (buf[1].uint32 shl 8) or
-                (buf[4].uint32 shl 16) or (buf[5].uint32 shl 24)
-    let pnHigh = buf[6].uint32 or (buf[7].uint32 shl 8)
-    # Store PN into context (offset 16, 20)
-    cast[ptr uint32](ctxAddr + 16)[] = pnLow
-    cast[ptr uint32](ctxAddr + 20)[] = pnHigh
-    # Mark cipher type in context
-    cast[ptr uint8](ctxAddr + 48)[] = cast[ptr uint8](ctxAddr + 48)[] or 0x02  # CCMP flag
-    # Look up key: if QoS, use STA pairwise key; else use group key
-    if isQos:
-      # Pairwise: look up STA entry from context byte 10
-      let staIdx = cast[ptr uint8](ctxAddr + 10)[]
-      let staBase = cast[uint](addr sta_info_tab[0])
-      let staEntry = staBase + staIdx.uint * STA_ENTRY_SIZE.uint
-      let keyAddr = staEntry + 528 + keyIdx.uint * 160  # key area at STA+528
-      cast[ptr pointer](ctxAddr + 32)[] = cast[pointer](keyAddr)
-    else:
-      # Group key: look up from STA with context byte 9
-      let staIdx = cast[ptr uint8](ctxAddr + 9)[]
-      let staBase = cast[uint](addr sta_info_tab[0])
-      let staEntry = staBase + staIdx.uint * STA_ENTRY_SIZE.uint
-      let keyAddr = staEntry + 528 + keyIdx.uint * 160
-      cast[ptr pointer](ctxAddr + 32)[] = cast[pointer](keyAddr)
+  of 24:  # TKIP (8 byte header)
+    let hdr = rxSecurityHeaderAt[TkipSecurityHeaderView](rxuCtx, hdrOffset)
+    env.machdrLen = hdrOffset + 8
+    let keyIdx = (hdr.keyId shr 6) and 0x03
+    env.secInfo0 = hdr.tsc1.uint32 or (hdr.tsc0.uint32 shl 8) or
+      (hdr.tsc2.uint32 shl 16) or (hdr.tsc3.uint32 shl 24)
+    env.secInfo1 = hdr.tsc4.uint32 or (hdr.tsc5.uint32 shl 8)
+    env.secFlags = env.secFlags or 0x03'u8
+    env.secKeyPtr = cast[pointer](rxuProtectedKey(env, keyIdx, flaggedKeyTable))
+    nimFwDbgRxuProtKey = pointerAddrU32(env.secKeyPtr)
+    nimFwDbgRxuProtPnLo = env.secInfo0
+    nimFwDbgRxuProtPnHi = env.secInfo1
     return 1
-  of 28:  # TKIP (8 byte header)
-    # TKIP: similar to CCMP but with different PN extraction
-    cast[ptr uint8](ctxAddr + 8)[] = hdrOffset + 8
-    let keyIdx = (buf[3] shr 6) and 0x03
-    let pnLow = buf[0].uint32 or (buf[2].uint32 shl 8) or
-                (buf[4].uint32 shl 16) or (buf[5].uint32 shl 24)
-    let pnHigh = buf[6].uint32 or (buf[7].uint32 shl 8)
-    cast[ptr uint32](ctxAddr + 16)[] = pnLow
-    cast[ptr uint32](ctxAddr + 20)[] = pnHigh
-    cast[ptr uint8](ctxAddr + 48)[] = cast[ptr uint8](ctxAddr + 48)[] or 0x03  # TKIP flag
-    if isQos:
-      let staIdx = cast[ptr uint8](ctxAddr + 10)[]
-      let staBase = cast[uint](addr sta_info_tab[0])
-      let staEntry = staBase + staIdx.uint * STA_ENTRY_SIZE.uint
-      let keyAddr = staEntry + 528 + keyIdx.uint * 160
-      cast[ptr pointer](ctxAddr + 32)[] = cast[pointer](keyAddr)
-    else:
-      let staIdx = cast[ptr uint8](ctxAddr + 9)[]
-      let staBase = cast[uint](addr sta_info_tab[0])
-      let staEntry = staBase + staIdx.uint * STA_ENTRY_SIZE.uint
-      let keyAddr = staEntry + 528 + keyIdx.uint * 160
-      cast[ptr pointer](ctxAddr + 32)[] = cast[pointer](keyAddr)
+  of 28:  # CCMP (8 byte header)
+    let hdr = rxSecurityHeaderAt[CcmpSecurityHeaderView](rxuCtx, hdrOffset)
+    env.machdrLen = hdrOffset + 8
+    let keyIdx = (hdr.keyId shr 6) and 0x03
+    env.secInfo0 = hdr.pn0.uint32 or (hdr.pn1.uint32 shl 8) or
+      (hdr.pn2.uint32 shl 16) or (hdr.pn3.uint32 shl 24)
+    env.secInfo1 = hdr.pn4.uint32 or (hdr.pn5.uint32 shl 8)
+    env.secFlags = env.secFlags or 0x02'u8
+    env.secKeyPtr = cast[pointer](rxuProtectedKey(env, keyIdx, flaggedKeyTable))
+    nimFwDbgRxuProtKey = pointerAddrU32(env.secKeyPtr)
+    nimFwDbgRxuProtPnLo = env.secInfo0
+    nimFwDbgRxuProtPnHi = env.secInfo1
     return 1
   of 20:  # WEP (4 byte header)
-    cast[ptr uint8](ctxAddr + 8)[] = hdrOffset + 4
+    env.machdrLen = hdrOffset + 4
     return 1
   else:
     return 0
@@ -23471,47 +31370,59 @@ proc rxu_cntrl_protected_handle*(rxuCtx: pointer, hwRxhdrFlags: uint32): cint {.
 proc rxu_cntrl_check_pn*(secKeyPtr: pointer, tid: uint8): cint {.exportc, cdecl.} =
   ## Check PN (Packet Number) for replay detection (90 bytes in blob).
   ## From blob (rxu_cntrl.o, 0xAE bytes):
-  ##   keyType = secKeyPtr[156]
+  ##   hasRxPn = secKeyPtr[156]
   ##   pnLo/pnHi loaded from rxu_cntrl_env[16]/[20] (loaded by caller path)
-  ##   if keyType == 0: pairwise path — inline compare/update at
-  ##       entry = secKeyPtr + tid*16; accept if (storedHi < pnHi) or
-  ##       (storedHi == pnHi && storedLo < pnLo). Returns 1 on accept, 0 on replay.
-  ##   if keyType != 0: group path — if tid==8, remap to 0; then tail-call
+  ##   if hasRxPn == 0: pairwise path — increments incoming PN and compares
+  ##       against entry = secKeyPtr + tid*16. Accept if the stored value is
+  ##       lower than the incremented incoming value.
+  ##   if hasRxPn != 0: group path — if tid==8, remap to 0; then tail-call
   ##       replay_counter_validate(entry, pnLo, pnHi).
-  let keyAddr = cast[uint](secKeyPtr)
-  let keyType = cast[ptr uint8](keyAddr + 156)[]
+  let key = cast[ptr VifKeySlotView](secKeyPtr)
+  let hasRxPn = key.hasRxPn
 
   # Read incoming PN from descriptor (loaded earlier in call chain)
   let env = rxuCntrlEnvView()
   let pnLo = env.secInfo0
   let pnHi = env.secInfo1
 
-  if keyType == 0:
+  if hasRxPn == 0:
     # Pairwise key — inline compare/update per TID
-    let tidOffset = tid.uint * 16
-    let entryAddr = keyAddr + tidOffset
-    let storedHi = cast[ptr uint32](entryAddr + 4)[]
+    let nextLo = pnLo + 1
+    let nextHi = pnHi + (if nextLo < pnLo: 1'u32 else: 0'u32)
+    let entry = addr key.replayCounters[tid.int]
+    let storedHi = entry.pnHigh
+    let storedLo = entry.pnLow
+    nimFwDbgRxuPnMeta = tid.uint32 or (hasRxPn.uint32 shl 8) or
+      (env.secFlags.uint32 shl 16)
+    nimFwDbgRxuPnStoredLo = storedLo
+    nimFwDbgRxuPnStoredHi = storedHi
+    nimFwDbgRxuPnNextLo = nextLo
+    nimFwDbgRxuPnNextHi = nextHi
     var accept = false
-    if storedHi < pnHi:
+    if storedHi < nextHi:
       accept = true
-    elif storedHi == pnHi:
-      let storedLo = cast[ptr uint32](entryAddr)[]
-      # Blob: `bgeu a5, a2, .L18` — if storedLo >= pnLo, reject.
-      # Accept only when storedLo < pnLo (i.e., pnLo > storedLo).
-      if storedLo < pnLo:
+    elif storedHi == nextHi:
+      if storedLo < nextLo:
         accept = true
     if not accept:
       return 0  # replay detected
     # Update stored PN
-    cast[ptr uint32](entryAddr)[] = pnLo
-    cast[ptr uint32](entryAddr + 4)[] = pnHi
+    entry.pnLow = nextLo
+    entry.pnHigh = nextHi
     return 1
   else:
     # Group key / TID map: if tid==8, remap to 0 (TID 8 used for non-QoS group).
     var adjTid = tid
     if tid == 8:
       adjTid = 0
-    let entryAddr = keyAddr + adjTid.uint * 16
+    let entry = addr key.replayCounters[adjTid.int]
+    let entryAddr = cast[uint](entry)
+    nimFwDbgRxuPnMeta = tid.uint32 or (hasRxPn.uint32 shl 8) or
+      (env.secFlags.uint32 shl 16)
+    nimFwDbgRxuPnStoredLo = entry.pnLow
+    nimFwDbgRxuPnStoredHi = entry.pnHigh
+    nimFwDbgRxuPnNextLo = pnLo
+    nimFwDbgRxuPnNextHi = pnHi
     # Tail-call replay_counter_validate(entry, pnLo, pnHi). The callee reads
     # a1/a2 via inline asm, so we emit a direct RISC-V call that pins a0/a1/a2
     # before the call and captures the return in a0.
@@ -23541,8 +31452,9 @@ proc rxu_cntrl_desc_prepare*(swdesc: pointer) {.exportc, cdecl, noinline.} =
   ##   if (saved & 8) csrsi(mstatus, 0x08)    ; restore MIE
   {.emit: ["asm volatile(\"\" ::: \"memory\");"].}
   if swdesc == nil: return
+  inc nimFwDbgRxuDescPrepare
   # Mark descriptor status = 3 (ready for upload)
-  cast[ptr uint8](cast[uint](swdesc) + 20)[] = 3'u8
+  rxMpduDescView(swdesc).descFlag = 3'u8
   # Push under IRQ lock
   let saved = irqSave()
   co_list_push_back(addr rxuCntrlEnvView().uploadList, cast[ptr CoListHdr](swdesc))
@@ -23567,27 +31479,20 @@ proc rxu_mpdu_upload_and_indicate*(param: pointer) {.exportc, cdecl.} =
   ##  13. Restore interrupts if they were enabled
   let env = rxuCntrlEnvView()
   let mpdu = rxMpduDescView(param)
-  let swdescAddr = cast[uint](mpdu.swDesc)
+  let swdesc = rxSwDescView(mpdu.swDesc)
 
   # Build upload flags from env bytes 9,10, OR into swdesc control word at offset 76
   let flagsHi = env.staIdx.uint32 shl 16
   let flagsMid = env.vifIdx.uint32 shl 8
-  let existingFlags = cast[ptr uint32](swdescAddr + 76)[]
-  cast[ptr uint32](swdescAddr + 76)[] = existingFlags or flagsHi or flagsMid or 2'u32
+  swdesc.frameControlFlags = swdesc.frameControlFlags or flagsHi or flagsMid or 2'u32
 
   # Clear upload-active flag
   env.frameCtrl = env.frameCtrl and 0xFF00'u16
 
   # Read DMA chain to get frame control
-  let dmaDescPtr = cast[ptr uint32](swdescAddr + 4)[]  # first DMA desc
-  let dmaChainAddr = cast[uint](dmaDescPtr)
-  let bufPtr = cast[ptr uint32](dmaChainAddr + 8)[]
-  let bufAddr = cast[uint](bufPtr)
-  let fcBufAddr = cast[ptr uint32](bufAddr + 24)[]
-  let fcBufU = cast[uint](fcBufAddr)
-  let fcLo = cast[ptr uint8](fcBufU)[]
-  let fcHi = cast[ptr uint8](fcBufU + 1)[]
-  let fc = fcLo.uint16 or (fcHi.uint16 shl 8)
+  let dmaDesc = cast[ptr RxPayloadHwDescView](swdesc.firstDmaDesc)
+  let frameRef = cast[ptr RxFrameBufferRefView](cast[pointer](dmaDesc.bufferAddr))
+  let fc = cast[ptr MacDataFrameHeaderView](frameRef.frameData).frameControl
 
   # Compute header size from FC via rxu_cntrl_machdr_len_get (blob 0x5a)
   let macHdrLen = rxu_cntrl_machdr_len_get(fc)
@@ -23600,16 +31505,16 @@ proc rxu_mpdu_upload_and_indicate*(param: pointer) {.exportc, cdecl.} =
       assert_warn(cast[cstring](0), cast[cstring](0), 364)
     # Adjust buffer pointers to strip MAC header
     let halfAdj = adjustment.uint32 shr 1
+    discard halfAdj
     # Update DMA descriptor frame length
-    let curLen = cast[ptr uint16](dmaChainAddr + 28)[]
-    cast[ptr uint16](dmaChainAddr + 28)[] = curLen - adjustment.uint16
+    dmaDesc.frameLen = dmaDesc.frameLen - adjustment.uint16
     # Update env header offset
     env.stripLen = adjustment.uint8
     let newHdrOff = envHdrLen - fc.uint8
     env.machdrLen = envHdrLen - newHdrOff
 
   # Clear DMA complete flag
-  cast[ptr uint32](swdescAddr + 84)[] = 0
+  swdesc.bufferOffset = 0
 
   # Initiate DMA transfer
   rxl_mpdu_transfer(param)
@@ -23637,13 +31542,13 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
   let swdescPtr = rxMpduDescView(param).swDesc
   let swdesc = rxSwDescView(swdescPtr)
   let hwFlags = swdesc.hwFlags
+  nimFwDbgRxuLastHwFlags = hwFlags
+  nimFwDbgRxuLastStatus = (hwFlags and 0x1C'u32) shr 2
+  nimFwDbgRxuLastLen = swdesc.payloadLenHalf.uint32
 
   # Epilogue helper: break to the common tail which emits a single
   # ke_evt_set (matching blob's 1-site pattern). Any caller using
   # doReturn() will exit the rcfhScope and run the shared tail below.
-  # The frame-action flags let each branch request an upload or release;
-  # both converge on single shared call sites after the block.
-  var uploadFrame = false
   var returnValue: uint32 = 0
   template doReturn() =
     break rcfhScope
@@ -23651,12 +31556,13 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
   block rcfhScope:
     # Check valid-frame bit 0x2000
     if (hwFlags and 0x2000) == 0:
+      inc nimFwDbgRxuDropInvalid
       doReturn()
+    inc nimFwDbgRxuFrameValid
 
     # .L137: Frame valid -- begin classification
-    let bufChain = cast[uint](swdesc.bufferChain)
-    let payload = cast[uint](cast[ptr uint32](bufChain + 8)[])
-    let rawFC = cast[ptr uint16](payload)[]
+    let frame = macDataFrameAt(rxFramePayload(swdesc))
+    let rawFC = frame.frameControl
     nimFwTrace2U32("[WIFI-NIMFW] rxu_fc ", hwFlags, rawFC.uint32)
 
     # NOTE: The blob does NOT call tcpip_stack_input from rxu_cntrl_frame_handle.
@@ -23665,6 +31571,12 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
 
     # Clear swdesc status accumulator at offset 76
     swdesc.frameControlFlags = 0
+    env.secInfo0 = 0
+    env.secInfo1 = 0
+    env.secKeyPtr = nil
+    env.secFlags = 0
+    env.meshFlag = 0
+    env.stripLen = 0
 
     # Init sta_idx = 0xFF, vif_idx = 0xFF
     env.staIdx = 0xFF
@@ -23673,8 +31585,8 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
     # Store frame control at env[0]
     env.frameCtrl = rawFC
 
-    # Store sequence control from payload[22..23] at env[2]
-    let seqCtrl = cast[ptr uint16](payload + 22)[]
+    # Store sequence control from the MAC header at env[2]
+    let seqCtrl = frame.seqCtrl
     env.seqCtrl = seqCtrl
 
     # Clear duplicate-detect flag
@@ -23686,28 +31598,24 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
 
     # ---- QoS TID extraction ----
     # Blob at .L139 clears env[7] (TID) for non-QoS frames. If env[7] retained
-    # a value from a previous QoS frame, downstream per-TID lookups (seq cache
-    # at staEntry + (tid-0x57)*0xB8, PN replay index, etc.) would index wrong
-    # entries and reject valid frames. Must clear to 0 on non-QoS path.
-    if (rawFC.uint8 and 0x88) == 0x88:
-      if (rawFC and 0x0300) == 0x0300:
-        env.tid = (cast[ptr uint16](payload + 30)[] and 7).uint8
-      else:
-        env.tid = (cast[ptr uint16](payload + 24)[] and 7).uint8
-    else:
-      env.tid = 0'u8
-
+    # a value from a previous QoS frame, downstream per-TID lookups in the
+    # QoS sequence-cache overlay and PN replay index would index wrong entries
+    # and reject valid frames. Must clear to 0 on non-QoS path.
     # .L142: Compute MAC header length
     let machdrLen = rxu_cntrl_machdr_len_get(rawFC)
     env.machdrLen = machdrLen
+    if (rawFC.uint8 and 0x88) == 0x88:
+      env.tid = (rxQosControl(frame, machdrLen) and 7).uint8
+    else:
+      env.tid = 0'u8
     when defined(bl808WifiConnectTrace):
       let rxTraceState = ke_state_get(TASK_SM)
       let rxTraceType = rawFC and 0x000C
-      if rxTraceState >= SM_ACTIVATING_STATE or rxTraceType == 8:
+      if rxTraceState >= SmAuthStartingState or rxTraceType == 8:
         let rxTraceLen = swdesc.payloadLenHalf
         let rxTraceEth =
           if rxTraceLen >= machdrLen.uint16 + 8'u16:
-            cast[ptr uint16](payload + machdrLen.uint + 6)[].uint32
+            rxMsdu(frame, machdrLen).ethertype.uint32
         else:
             0'u32
         nimFwConnectTrace2U32("[WIFI-CT] rx_enter ",
@@ -23716,6 +31624,11 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
         nimFwConnectTrace2U32("[WIFI-CT] rx_len ",
                               rxTraceLen.uint32 or (rxTraceEth shl 16),
                               rxTraceState.uint32)
+        if rxTraceState >= SmAuthStartingState or rxTraceType == 8:
+          nimFwConnectTraceBytes("[WIFI-RAW] rx_any ",
+                                 cast[pointer](frame),
+                                 rxTraceLen.uint32,
+                                 96)
 
     # ---- Address extraction: ToDS/FromDS ----
     let toDs = (rawFC and 0x0100) != 0
@@ -23723,21 +31636,21 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
 
     if toDs:
       # DA from Addr3 (offset 16)
-      discard c_memcpy(addr env.da[0], cast[pointer](payload + 16), 6.csize_t)
+      rxCopyAddr(addr env.da, addr frame.addr3)
       if fromDs:
         # WDS: SA from Addr4 (offset 24)
-        discard c_memcpy(addr env.sa[0], cast[pointer](payload + 24), 6.csize_t)
+        rxCopyAddr(addr env.sa, addr macQos4AddrFrameAt(frame).addr4)
       else:
         # ToDS only: SA from Addr2 (offset 10)
-        discard c_memcpy(addr env.sa[0], cast[pointer](payload + 10), 6.csize_t)
+        rxCopyAddr(addr env.sa, addr frame.addr2)
     elif fromDs:
       # FromDS only: DA from Addr1 (offset 4), SA from Addr3 (offset 16)
-      discard c_memcpy(addr env.da[0], cast[pointer](payload + 4), 6.csize_t)
-      discard c_memcpy(addr env.sa[0], cast[pointer](payload + 16), 6.csize_t)
+      rxCopyAddr(addr env.da, addr frame.addr1)
+      rxCopyAddr(addr env.sa, addr frame.addr3)
     else:
       # No DS: DA from Addr1 (offset 4), SA from Addr2 (offset 10)
-      discard c_memcpy(addr env.da[0], cast[pointer](payload + 4), 6.csize_t)
-      discard c_memcpy(addr env.sa[0], cast[pointer](payload + 10), 6.csize_t)
+      rxCopyAddr(addr env.da, addr frame.addr1)
+      rxCopyAddr(addr env.sa, addr frame.addr2)
 
     # ================================================================
     # Branch: associated/monitor (hwFlags bit 25, blob `lui 0x2000`) vs unassociated
@@ -23747,20 +31660,18 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
       # Extract STA index from hwFlags via B-extension insn (approximate)
       let staIdx = (((hwFlags shr 15) and 0x3FF'u32) - 8).uint8
 
-      let vifBase = cast[uint](addr vif_info_tab[0])
       let sta = staInfoForIdx(staIdx)
-      let staEntry = cast[uint](sta)
 
       # Check STA active at sta_entry[42]
       if sta.valid == 0:
+        inc nimFwDbgRxuDropStaInactive
         when defined(bl808WifiConnectTrace):
           nimFwConnectTrace2U32("[WIFI-CT] rx_drop ", 1, staIdx.uint32)
         doReturn()
 
       let vifIdx = sta.instNbr
       env.hwRxhdr = hwFlags
-      let vifEntry = vifBase + vifIdx.uint * VIF_ENTRY_SIZE.uint
-      let vif = vifChannelAt(vifEntry)
+      let vif = vifChannelForIdx(vifIdx)
       env.vifIdx = vifIdx
       env.staIdx = staIdx
 
@@ -23773,66 +31684,117 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
       if (rawFC and 0x0300) == 0x0300:
         swdesc.frameControlFlags = swdesc.frameControlFlags or 4
 
-      # .L156: Protected frame check (FC bit 14)
+        # .L156: Protected frame check (FC bit 14)
       if (env.frameCtrl and 0x4000) != 0:
         if rxu_cntrl_protected_handle(
-             cast[ptr uint8](payload), env.hwRxhdr) == 0:
+             cast[ptr uint8](frame), env.hwRxhdr) == 0:
           doReturn()
 
       # .L160: Frame type dispatch
       let fType = rawFC and 0x000C
 
       if fType != 0 and fType != 8:
+        inc nimFwDbgRxuDropFtype
         when defined(bl808WifiConnectTrace):
           nimFwConnectTrace2U32("[WIFI-CT] rx_drop ", 2, rawFC.uint32)
         doReturn()
 
       if fType == 8:
+        inc nimFwDbgRxuAssocData
+        nimFwDbgRxuDataFc = rawFC.uint32 or (hwFlags and 0xFFFF0000'u32)
+        nimFwDbgRxuDataSeq = env.seqCtrl.uint32 or
+          (env.tid.uint32 shl 16) or (env.machdrLen.uint32 shl 24)
         # ---- Data frame (type 2) in associated path ----
         # Blob .L160 at 0x3e6: rawFC & 0x40 = Null subtype (bit 6).
         # Null/CF-Poll frames are keepalive-only (no payload); blob just pokes
         # the keepalive timestamp and returns. Previously Nim incorrectly called
         # rxl_frame_release here which double-released the descriptor.
         if (rawFC and 0x0040) != 0:
+          inc nimFwDbgRxuDropNull
+          nimFwDbgRxuDropNullFc = rawFC.uint32 or (hwFlags and 0xFFFF0000'u32)
+          nimFwDbgRxuDropNullSeq = env.seqCtrl.uint32 or
+            (env.tid.uint32 shl 16) or (env.machdrLen.uint32 shl 24)
           when defined(bl808WifiConnectTrace):
             nimFwConnectTrace2U32("[WIFI-CT] rx_drop ", 3, rawFC.uint32)
           mm_cfg_element_keepalive_timestamp_update()
           doReturn()
 
         # Sequence/reorder context
-        var seqCachePtr: uint
+        var seqCachePtr: ptr uint16
         if (rawFC and 0x0080) != 0:
-          seqCachePtr = staEntry + ((env.tid.uint + 0xA9) and 0xFF) * 0xB8
+          seqCachePtr = rxuQosSeqCachePtr(env.tid)
         else:
-          seqCachePtr = cast[uint](addr sta.supportedRatesBitmap)
+          seqCachePtr = addr sta.supportedRatesBitmap
 
         # Duplicate sequence check
         let envSeq = env.seqCtrl
         if rawFC != 0:
-          if cast[ptr uint16](seqCachePtr)[] == envSeq:
+          let retryFrame = (rawFC and 0x0800'u16) != 0
+          let protectedReplayChecked = (env.secFlags and 2) != 0
+          if retryFrame and not protectedReplayChecked and
+              seqCachePtr[] == envSeq and nimFwDbgRxuAssocUploadReady != 0:
+            inc nimFwDbgRxuDropDup
+            nimFwDbgRxuDropDupFc = rawFC.uint32 or (hwFlags and 0xFFFF0000'u32)
+            nimFwDbgRxuDropDupSeq = envSeq.uint32 or
+              (env.tid.uint32 shl 16) or (env.machdrLen.uint32 shl 24)
+            nimFwDbgRecordRxuDupDrop(frame, hwFlags, envSeq, env.tid,
+                                     env.machdrLen, seqCachePtr[],
+                                     swdesc.payloadLenHalf)
             when defined(bl808WifiConnectTrace):
               nimFwConnectTrace2U32("[WIFI-CT] rx_drop ", 5, envSeq.uint32)
             doReturn()
-        cast[ptr uint16](seqCachePtr)[] = envSeq
+        seqCachePtr[] = envSeq
 
         # PN replay check
         if (env.secFlags and 2) != 0:
           if rxu_cntrl_check_pn(
                env.secKeyPtr,
                env.tid) == 0:
+            inc nimFwDbgRxuDropPn
+            nimFwDbgRecordRxuPnDrop(frame, hwFlags, envSeq, env.tid,
+                                    env.machdrLen, swdesc.payloadLenHalf)
             when defined(bl808WifiConnectTrace):
               nimFwConnectTrace2U32("[WIFI-CT] rx_drop ", 6, rawFC.uint32)
             doReturn()
+          if nimFwDbgRxuDhcpMsg(frame, env.machdrLen,
+                                swdesc.payloadLenHalf) != 0:
+            nimFwDbgRecordRxuPnAccept(1'u32, frame, hwFlags, envSeq, env.tid,
+                                      env.machdrLen, swdesc.payloadLenHalf)
 
-        # .L171: EAPOL detection at msduStart+6 (EtherType 0x888E)
-        let msduStart = payload + machdrLen.uint
-        let ethType = cast[ptr uint16](msduStart + 6)[]
-        if ethType == 0x8E88'u16:
+        # .L171: EAPOL detection requires RFC1042 SNAP then EtherType 0x888E.
+        let msdu = rxMsduView(frame, env.machdrLen)
+        nimFwDbgRxuSnapLo = rxSnapTraceLo(addr msdu.snap)
+        nimFwDbgRxuSnapHi = rxSnapTraceHi(addr msdu.snap)
+        let hasRfc1042Snap = rxSnapIsRfc1042(addr msdu.snap)
+        if hasRfc1042Snap:
+          inc nimFwDbgRxuAssocSnap
+          case msdu.snap.ethertype
+          of 0x0008'u16:
+            inc nimFwDbgRxuAssocIp
+            nimFwDbgRxuIpv4Preupload(frame, env.machdrLen, env.tid,
+                                     swdesc.payloadLenHalf)
+          of 0x0608'u16:
+            inc nimFwDbgRxuAssocArp
+          of 0x8E88'u16:
+            discard
+          else:
+            inc nimFwDbgRxuAssocOther
+        else:
+          inc nimFwDbgRxuAssocOther
+        when defined(bl808WifiConnectTrace):
+          nimFwConnectTrace2U32("[WIFI-CT] rx_data ",
+                                msdu.snap.ethertype.uint32 or
+                                  ((if hasRfc1042Snap: 1'u32 else: 0'u32) shl 16) or
+                                  (env.tid.uint32 shl 24),
+                                swdesc.payloadLenHalf.uint32 or
+                                  (env.machdrLen.uint32 shl 16))
+        if hasRfc1042Snap and msdu.snap.ethertype == 0x8E88'u16:
+          inc nimFwDbgRxuAssocEapol
           # .LBB303: EAPOL frame detected -- route based on VIF type
           let vifType = vif.vifType
           let adjustedLen = swdesc.payloadLenHalf
-          let eapolData = cast[pointer](msduStart + 8)  # skip LLC/SNAP header
-          let eapolLen = adjustedLen - machdrLen.uint16 - 8
+          let eapolData = rxMsduPayload(msdu)
+          let eapolLen = adjustedLen - env.machdrLen.uint16 - sizeof(LlcSnapHeaderView).uint16
           when defined(bl808WifiConnectTrace):
             nimFwConnectTrace2U32("[WIFI-CT] eapol_rx ", staIdx.uint32 or (vifType.uint32 shl 8), eapolLen.uint32)
           if vifType == 2:
@@ -23847,8 +31809,20 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
         # .L170/.L173: Protected + A-MSDU/fragment checks
         let fcR = env.frameCtrl
         if (fcR and 0x4000) != 0:
-          if (fcR and 0x0400) != 0: doReturn()
-          if env.fragNum != 0: doReturn()
+          if (fcR and 0x0400) != 0:
+            if nimFwDbgRxuDhcpMsg(frame, env.machdrLen,
+                                  swdesc.payloadLenHalf) != 0:
+              nimFwDbgRecordRxuPnAccept(0xE1'u32, frame, hwFlags, envSeq,
+                                        env.tid, env.machdrLen,
+                                        swdesc.payloadLenHalf)
+            doReturn()
+          if env.fragNum != 0:
+            if nimFwDbgRxuDhcpMsg(frame, env.machdrLen,
+                                  swdesc.payloadLenHalf) != 0:
+              nimFwDbgRecordRxuPnAccept(0xE2'u32, frame, hwFlags, envSeq,
+                                        env.tid, env.machdrLen,
+                                        swdesc.payloadLenHalf)
+            doReturn()
 
         # .LBB312/.LBB313: MIC verification (Michael MIC for TKIP)
         # Blob builds local DMA descriptor chain from buffer chain, calls me_mic_init/
@@ -23872,11 +31846,11 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
                       tidVal)
 
           # 2. Walk buffer chain computing MIC over MSDU payload
-          var curBuf = cast[uint](swdesc.bufferChain)
+          var curBuf = rxFrameBufferChainAt(swdesc.bufferChain)
           var skipBytes = hdrLen2.int  # skip MAC header in first segment
           const MAX_DMA_SEG = 1736
-          while dataLen > 0 and curBuf != 0:
-            let bufPayload = cast[uint](cast[ptr uint32](curBuf + 8)[])
+          while dataLen > 0 and curBuf != nil:
+            let bufPayload = cast[uint](curBuf.frameData)
             var segStart = bufPayload + skipBytes.uint
             var segLen = dataLen + skipBytes
             if segLen > MAX_DMA_SEG:
@@ -23888,8 +31862,8 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
               me_mic_calc(addr micCtx[0], cast[pointer](segStart), segLen.uint32)
               dataLen -= segLen
             if dataLen > 0:
-              curBuf = cast[uint](cast[ptr uint32](curBuf + 4)[])
-              if curBuf == 0:
+              curBuf = rxFrameBufferChainAt(curBuf.next)
+              if curBuf == nil:
                 assert_rec("rxu_cntrl.c", "rxu_cntrl.c", 811)
                 doReturn()
             skipBytes = 0  # only first segment has header to skip
@@ -23899,49 +31873,49 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
           # 3. Read received MIC from tail of frame (last 8 bytes)
           # Walk buffer chain again to find MIC location
           var micOff: int = frameSize.int - 8  # offset of MIC from frame start
-          var micBuf = cast[uint](swdesc.bufferChain)
+          var micBuf = rxFrameBufferChainAt(swdesc.bufferChain)
           var rxMic {.noinit.}: array[2, uint32]
           rxMic[0] = 0; rxMic[1] = 0
           var micSkip = 0
-          while micOff > 0 and micBuf != 0:
-            let segPayload = cast[uint](cast[ptr uint32](micBuf + 8)[])
+          while micOff > 0 and micBuf != nil:
+            let segPayload = cast[uint](micBuf.frameData)
             var segAvail = MAX_DMA_SEG - micSkip
             if segAvail > micOff:
               # MIC starts in this segment
               let micPtr = segPayload + micSkip.uint + micOff.uint
-              rxMic[0] = cast[ptr uint32](micPtr)[]
-              rxMic[1] = cast[ptr uint32](micPtr + 4)[]
+              let micWords = rxMicWordsAt(micPtr)
+              rxMic[0] = micWords.lo
+              rxMic[1] = micWords.hi
               micOff = 0
             else:
               micOff -= segAvail
-              micBuf = cast[uint](cast[ptr uint32](micBuf + 4)[])
-              if micBuf == 0:
+              micBuf = rxFrameBufferChainAt(micBuf.next)
+              if micBuf == nil:
                 assert_rec("rxu_cntrl.c", "rxu_cntrl.c", 852)
                 doReturn()
             micSkip = 0
 
           # 4. Compare computed MIC with received MIC
           if rxMic[0] != micCtx[0] or rxMic[1] != micCtx[1]:
+            if nimFwDbgRxuDhcpMsg(frame, env.machdrLen,
+                                  swdesc.payloadLenHalf) != 0:
+              nimFwDbgRecordRxuPnAccept(0xE3'u32, frame, hwFlags, envSeq,
+                                        env.tid, env.machdrLen,
+                                        swdesc.payloadLenHalf)
             # MIC failure: send indication to host
             let failMsg = ke_msg_alloc(0xC04'u16, TASK_CFG, TASK_ME, 24)
             if failMsg != nil:
-              let msgU = cast[uint](failMsg)
+              let msg = rxMicFailureIndAt(failMsg)
               # Fill MIC failure indication: BSSID from sta_info_tab
               let staIdxF = env.staIdx
               let staF = staInfoForIdx(staIdxF)
-              let staMacF = cast[uint](addr staF.macAddr[0])
-              cast[ptr uint32](msgU)[] = cast[ptr uint32](staMacF)[]
-              cast[ptr uint16](msgU + 4)[] = cast[ptr uint16](staMacF + 4)[]
-              # PN/IV from env+16..24
-              cast[ptr uint32](msgU + 8)[] = env.secInfo0
-              cast[ptr uint32](msgU + 12)[] = env.secInfo1
-              cast[ptr uint32](msgU + 16)[] = env.hwRxhdr
-              # TID and vifIdx
-              let tidMsgBits = (tidVal.uint32 shl 24) or (0xFF'u32 and tidVal.uint32)
-              cast[ptr uint8](msgU + 16)[] = tidVal
-              cast[ptr uint8](msgU + 18)[] = env.vifIdx
-              # Key type from secKey
-              cast[ptr uint8](msgU + 17)[] = secKey.staIdx
+              rxCopyAddr(addr msg.bssid, addr staF.macAddr)
+              msg.pnLow = env.secInfo0
+              msg.pnHigh = env.secInfo1
+              msg.tid = tidVal
+              msg.keyType = secKey.staIdx
+              msg.vifIdx = env.vifIdx
+              msg.hwRxhdrHigh = (env.hwRxhdr shr 24).uint8
               ke_msg_send(failMsg)
             doReturn()
 
@@ -23954,14 +31928,12 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
         swdesc.frameControlFlags = combined
 
         # .LBB349: Reparse FC for QoS TID/AMSDU bits
-        let bufC2 = cast[uint](swdesc.bufferChain)
-        let payB = cast[uint](cast[ptr uint32](bufC2 + 8)[])
-        let fcFinal = cast[ptr uint16](payB)[]
+        let finalFrame = macDataFrameAt(rxFramePayload(swdesc))
+        let fcFinal = finalFrame.frameControl
         swdesc.frameControlFlags = swdesc.frameControlFlags and 0xFFFFFF8F'u32
 
         if (fcFinal.uint8 and 0xFC) == 0x88:
-          let qOff: uint = if (fcFinal and 0x0300) == 0x0300: 30 else: 24
-          let qos = cast[ptr uint16](payB + qOff)[]
+          let qos = rxQosControl(finalFrame, rxu_cntrl_machdr_len_get(fcFinal))
           let tidBits = (qos and 7).uint32 shl 4
           let amsdu = if (qos and 0x80) != 0: 1'u32 else: 0'u32
           swdesc.frameControlFlags = swdesc.frameControlFlags or tidBits or amsdu
@@ -23969,46 +31941,34 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
         # .L185: LLC/SNAP header check for proper strip length computation.
         # Blob uses two memcmp calls against 6-byte RFC1042 + bridge-tunnel
         # headers at .LANCHOR0 and .LANCHOR1.
-        const rfc1042Hdr: array[6, uint8] = [0xAA'u8, 0xAA, 0x03, 0x00, 0x00, 0x00]
-        const bridgeTunnelHdr: array[6, uint8] = [0xAA'u8, 0xAA, 0x03, 0x00, 0x00, 0xF8]
         var stripLen = machdrLen and 0xFE
-        let msduPtr = payB + stripLen.uint
+        let msduSnap = rxMsdu(finalFrame, stripLen)
 
-        var isLlcSnap = c_memcmp(cast[pointer](msduPtr),
-                                 unsafeAddr rfc1042Hdr[0], 6.csize_t) == 0
+        let isRfc1042 = rxSnapIsRfc1042(msduSnap)
+        let isIpx = isRfc1042 and msduSnap.ethertype == 0x3781'u16 # 0x8137 LE
+        let isBridgeTunnel =
+          (not isRfc1042 or isIpx) and rxSnapIsBridgeTunnel(msduSnap)
 
-        if isLlcSnap:
-          # Check ethertype at MSDU+6 for IPX (0x8137)
-          let ethType2 = cast[ptr uint16](msduPtr + 6)[]
-          if ethType2 == 0x3781'u16:  # 0x8137 LE
-            isLlcSnap = false  # treat IPX as non-LLC
-
-        if isLlcSnap:
-          # .L190: Check for bridge tunnel header (AA AA 03 00 00 F8)
-          let isBridge = c_memcmp(cast[pointer](msduPtr),
-                                  unsafeAddr bridgeTunnelHdr[0], 6.csize_t) == 0
-          if isBridge:
-            # A-MSDU sub-frame: strip 14 more bytes, write sub-frame length header
-            stripLen = (stripLen.int - 14).uint8
-            let adjustedLen2 = swdesc.payloadLenHalf
-            # Write 2-byte A-MSDU length at msduPtr-2..msduPtr-1
-            let lenVal = adjustedLen2 - env.stripLen.uint16
-            cast[ptr uint8](msduPtr - 2)[] = (lenVal and 0xFF).uint8
-            cast[ptr uint8](msduPtr - 1)[] = ((lenVal shr 8) and 0xFF).uint8
-            env.meshFlag = 1  # A-MSDU sub-frame indicator
+        if (isRfc1042 and not isIpx) or isBridgeTunnel:
+          # .L192: Standard RFC1042/bridge SNAP: strip 6 bytes, keep ethertype.
+          stripLen = (stripLen.int - 6).uint8
         else:
-            # .L192: Standard LLC/SNAP: strip 6 bytes (keep ethertype)
-            stripLen = (stripLen.int - 6).uint8
-        # else: non-LLC: keep stripLen as machdrLen & 0xFE
+          # .L190: A-MSDU sub-frame: strip 14 bytes and write the sub-frame length.
+          stripLen = (stripLen.int - 14).uint8
+          let adjustedLen2 = swdesc.payloadLenHalf
+          let lenVal = adjustedLen2 - (machdrLen and 0xFE).uint16
+          let lenPtr = cast[ptr uint16](addr rxFrameBytes(finalFrame)[(machdrLen and 0xFE).int - 2])
+          lenPtr[] = lenVal
+          env.meshFlag = 1
 
         # Clear env[49] for non-A-MSDU frames
         if env.meshFlag != 1:
           env.meshFlag = 0
 
         # .L191: Rewrite DA/SA into Ethernet-II header
-        let hdr = payB + stripLen.uint - 14
-        discard c_memcpy(cast[pointer](hdr), addr env.da[0], 6.csize_t)
-        discard c_memcpy(cast[pointer](hdr + 6), addr env.sa[0], 6.csize_t)
+        let ethHdr = rxEthernetRewriteHeader(finalFrame, stripLen)
+        rxCopyAddr(addr ethHdr.da, addr env.da)
+        rxCopyAddr(addr ethHdr.sa, addr env.sa)
 
         # Adjust length, set strip info
         swdesc.payloadLenHalf = swdesc.payloadLenHalf - stripLen.uint16
@@ -24017,14 +31977,20 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
 
         # DMA transfer MPDU, then prepare descriptor under irq lock
         # Blob order: rxl_mpdu_transfer → csrrci(irq disable) → rxu_cntrl_desc_prepare
+        inc nimFwDbgRxuAssocUploadReady
+        if nimFwDbgRxuDhcpMsg(frame, env.machdrLen,
+                              swdesc.payloadLenHalf) != 0:
+          nimFwDbgRecordRxuPnAccept(4'u32, frame, hwFlags, envSeq, env.tid,
+                                    env.machdrLen, swdesc.payloadLenHalf)
         rxl_mpdu_transfer(param)
         let savedIrq = irqSave()
         rxu_cntrl_desc_prepare(param)
         irqRestore(savedIrq)
-        uploadFrame = true
+        returnValue = 1
         break rcfhScope
 
       else:
+        inc nimFwDbgRxuAssocMgmt
         # fType == 0: Management in associated path
         let envSeq = env.seqCtrl
         if rawFC != 0:
@@ -24036,6 +32002,9 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
           if rxu_cntrl_check_pn(
                env.secKeyPtr,
                env.tid) == 0:
+            inc nimFwDbgRxuDropPn
+            nimFwDbgRecordRxuPnDrop(frame, hwFlags, envSeq, env.tid,
+                                    env.machdrLen, swdesc.payloadLenHalf)
             doReturn()
 
         # Blob's associated mgmt path (.L158 -> .L163 -> .L234) routes through
@@ -24051,22 +32020,22 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
 
     if fType == 0:
       # ---- Management frame (type 0) ----
-      let addr2Ptr = cast[pointer](payload + 10)
-      let fcByte1 = cast[ptr uint8](payload + 1)[]
+      let addr2Ptr = rxAddrPtr(addr frame.addr2)
+      let fcByte1 = (rawFC shr 8).uint8
       let retryFrame = (fcByte1 and 0x08'u8) != 0
 
       if retryFrame:
         let cachedSeq = env.bssidSeq
-        if cast[ptr uint16](payload + 22)[] == cachedSeq:
+        if frame.seqCtrl == cachedSeq:
           if c_memcmp(addr2Ptr, cast[pointer](addr rxu_mgmt_dup_addr[0]), 6) == 0:
             doReturn()
 
-      env.bssidSeq = cast[ptr uint16](payload + 22)[]
+      env.bssidSeq = frame.seqCtrl
       discard c_memcpy(cast[pointer](addr rxu_mgmt_dup_addr[0]), addr2Ptr, 6)
 
       if (env.frameCtrl and 0x4000) != 0:
         if (hwFlags and 0x1C) != 20: doReturn()
-        if rxu_cntrl_protected_handle(cast[ptr uint8](payload), hwFlags) != 0:
+        if rxu_cntrl_protected_handle(cast[ptr uint8](frame), hwFlags) != 0:
           doReturn()
 
       # Management frame filter check (blob: rxu_mgt_frame_check at reloc 0x324)
@@ -24076,15 +32045,16 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
       doReturn()
 
     elif fType == 8:
+      inc nimFwDbgRxuNonassocData
       # ---- Data frame (type 2) -- non-associated ----
       # Blob: check if DA matches a known VIF BSSID. If so, forward to
       # scan_indicate for scan module processing. Otherwise release.
       let firstVif = vif_mgmt_get_first_ap_inf()
       if firstVif != nil:
-        let vifBssid = cast[uint](firstVif) + 80  # BSSID at vif[80..85]
-        if c_memcmp(cast[pointer](payload + 4), cast[pointer](vifBssid), 6) == 0:
+        let apVif = vifChannelAt(firstVif)
+        if c_memcmp(rxAddrPtr(addr frame.addr1), addr apVif.macAddr[0], 6) == 0:
           # DA matches our BSSID: forward to AP MLME
-          apm_send_mlme(firstVif, 192, cast[pointer](payload + 10), nil, nil, cast[pointer](1))
+          apm_send_mlme(firstVif, 192, rxAddrPtr(addr frame.addr2), nil, nil, cast[pointer](1))
           doReturn()
       # Blob does NOT call rxl_frame_release here; frame is left for
       # the TX-pool recycler. Previous Nim spuriously released.
@@ -24094,11 +32064,7 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
       # Control frame (type 1) or reserved: blob also does NOT release.
       break rcfhScope
 
-  # Common tail: single upload + single ke_evt_set site (matches blob
-  # 0x238 upload and 0x3c ke_evt_set).
-  if uploadFrame:
-    rxu_mpdu_upload_and_indicate(param)
-    returnValue = 1
+  # Common tail: single ke_evt_set site (matches blob's shared event tail).
   if env.uploadList.first != nil:
     ke_evt_set(0x00800000'u32)
   return returnValue
@@ -24113,15 +32079,18 @@ proc rxu_swdesc_upload_evt*() {.exportc, cdecl.} =
   ## tcpip_stack_input. On success, updates upload count via platform
   ## callbacks. On failure or limit exceeded, frees the descriptor via rxl_mpdu_free.
   ke_evt_clear(0x00800000'u32)
+  inc nimFwDbgRxuUploadEvt
   let env = rxuCntrlEnvView()
   var entry = co_list_pop_front(addr env.uploadList)
-  let uploadEnv = cast[uint](addr rxuUploadEnv[0])
+  let uploadEnv = cast[ptr RxuUploadEnvView](addr rxuUploadEnv[0])
+  let hwdescCallbacks = cast[ptr RxlHwdescCallbackEnvView](addr rxl_hwdesc_env[0])
   const MAX_DMA_ENTRIES = 4
   const MAX_DMA_SIZE = 1736'u32
   while entry != nil:
-    let descAddr = cast[uint](entry)
+    inc nimFwDbgRxuUploadEntry
+    let desc = cast[ptr RxMpduDescView](entry)
     # Check upload count limit
-    let uploadCount = cast[ptr uint32](uploadEnv + 20)[]
+    let uploadCount = uploadEnv.uploadCount
     if (41 - uploadCount) <= 2:
       # Over limit -- log warning and release
       let logFn = getLogFunc(204)
@@ -24131,53 +32100,49 @@ proc rxu_swdesc_upload_evt*() {.exportc, cdecl.} =
       entry = co_list_pop_front(addr env.uploadList)
       continue
     # Get sw_desc and compute total remaining bytes
-    let swDescPtr = cast[ptr pointer](descAddr + 4)[]
-    let swDesc = rxSwDescView(swDescPtr)
+    let swDesc = rxSwDescView(desc.swDesc)
     var remaining = swDesc.payloadLenHalf.uint32 + swDesc.bufferOffset
     # Clear local DMA descriptor array (40 bytes on stack, matching blob layout).
     # Blob: addresses at offsets 0,4,8,12; lengths (uint16) at offsets 32,34,36,38.
-    var dmaArray {.noinit.}: array[10, uint32]  # 40 bytes
-    discard c_memset(addr dmaArray[0], 0, 40.csize_t)
+    var dmaArray {.noinit.}: RxUploadDmaArrayView
+    discard c_memset(addr dmaArray, 0, sizeof(RxUploadDmaArrayView).csize_t)
     # Get first HW descriptor
-    var curHwDesc = cast[uint](swDesc.bufferChain)
+    var curHwDesc = cast[ptr RxPayloadHwDescView](swDesc.bufferChain)
     var dmaIdx = 0'u32
     # Build DMA entries from HW descriptor chain
-    while remaining > 0:
+    while remaining > 0 and curHwDesc != nil:
       if dmaIdx >= MAX_DMA_ENTRIES.uint32:
         break  # at most 4 entries
       # Increment DMA count in desc
-      let dmaCount = cast[ptr uint8](descAddr + 21)[]
-      cast[ptr uint8](descAddr + 21)[] = dmaCount + 1
+      desc.descCount = desc.descCount + 1
       # Store buffer address from hw_desc[8] (offsets 0,4,8,12 in dmaArray)
-      dmaArray[dmaIdx] = cast[ptr uint32](curHwDesc + 8)[]
+      dmaArray.bufferAddrs[dmaIdx] = curHwDesc.bufferAddr
       # Compute transfer length (capped at MAX_DMA_SIZE)
       var xferLen = remaining
       if xferLen > MAX_DMA_SIZE:
         xferLen = MAX_DMA_SIZE
       # Store length as uint16 at offset 32 + dmaIdx*2 in dmaArray
-      let lenPtr = cast[ptr uint16](cast[uint](addr dmaArray[0]) + 32 + dmaIdx * 2)
-      lenPtr[] = xferLen.uint16
+      dmaArray.lengths[dmaIdx] = xferLen.uint16
       # Check hw_desc[20] for warning
-      let hwFlag = cast[ptr uint32](curHwDesc + 20)[]
-      if hwFlag != 0:
+      if curHwDesc.usedFlag != 0:
         let logFn = getLogFunc(204)
         if logFn != nil:
           cast[proc(a0: uint32, a1: uint32, a2: cstring, a3: uint32) {.cdecl.}](logFn)(2, 0, "rxu_cntrl.c", 2023)
       # Mark hw_desc as used
-      cast[ptr uint32](curHwDesc + 20)[] = 1
+      curHwDesc.usedFlag = 1
       # Advance
       if remaining > MAX_DMA_SIZE:
         remaining -= MAX_DMA_SIZE
       else:
         remaining = 0
-      curHwDesc = cast[uint](cast[ptr uint32](curHwDesc + 4)[])
+      curHwDesc = cast[ptr RxPayloadHwDescView](curHwDesc.next)
       dmaIdx += 1
     # Set sw_desc[96] = 1 (upload done flag)
     swDesc.uploadDone = 1
     # Call tcpip_stack_input to deliver frame to TCP/IP stack.
     # Blob args: a0=entry, a1=desc[20] byte, a2=swDesc+28, a3=swDesc[84],
     #            a4=&dmaArray, a5=swDesc[76]&1
-    let descFlag = cast[ptr uint8](descAddr + 20)[].uint32
+    let descFlag = desc.descFlag.uint32
     let swPayload = cast[pointer](addr swDesc.payloadLenHalf)
     let swBufOff = swDesc.bufferOffset
     let swFcFlag = swDesc.frameControlFlags and 1
@@ -24186,25 +32151,28 @@ proc rxu_swdesc_upload_evt*() {.exportc, cdecl.} =
       descFlag,
       swPayload,
       swBufOff,
-      cast[pointer](addr dmaArray[0]),
+      cast[pointer](addr dmaArray),
       swFcFlag,
     )
     if uploadResult != 0:
+      inc nimFwDbgRxuUploadTcpipFail
       # Upload failed -- free descriptor and try next
       rxl_mpdu_free(entry)
       entry = co_list_pop_front(addr env.uploadList)
       continue
-    # Upload succeeded -- call platform callbacks and update count
-    let envBase = cast[uint](addr rxl_hwdesc_env[0])
-    let getStatusFn = cast[ptr pointer](envBase + 20)[]
-    if getStatusFn != nil:
-      cast[proc() {.cdecl.}](getStatusFn)()
-    let curCount = cast[ptr uint8](descAddr + 21)[]
-    let newUploadCount = cast[ptr uint32](uploadEnv + 20)[] + curCount.uint32
-    cast[ptr uint32](uploadEnv + 20)[] = newUploadCount
-    let cleanFn = cast[ptr pointer](envBase + 24)[]
-    if cleanFn != nil:
-      cast[proc() {.cdecl.}](cleanFn)()
+    inc nimFwDbgRxuUploadTcpipOk
+    when defined(bl808WifiRxPbufInput):
+      # tcpip_stack_input copies RX bytes into PBUF_RAM before calling lwIP.
+      # The copied pbuf owns the network packet; recycle the LMAC descriptor
+      # immediately so uploadCount does not starve the RX path.
+      rxl_mpdu_free(entry)
+    else:
+      # Upload succeeded -- call platform callbacks and update count
+      if hwdescCallbacks.getStatus != nil:
+        cast[proc() {.cdecl.}](hwdescCallbacks.getStatus)()
+      uploadEnv.uploadCount = uploadEnv.uploadCount + desc.descCount.uint32
+      if hwdescCallbacks.clean != nil:
+        cast[proc() {.cdecl.}](hwdescCallbacks.clean)()
     entry = co_list_pop_front(addr env.uploadList)
 
 # ###########################################################################
@@ -24252,11 +32220,10 @@ proc vif_mgmt_init*() {.exportc, cdecl.} =
   vif0View.txPower = 127
   vif0View.maxTxPower = 127
 
-  # Store vif_mgmt_bcn_to_evt callback at vif+44 (blob value, NOT bcn_to_prog)
-  # and self-pointer at vif+48.
+  # Store vif_mgmt_bcn_to_evt callback in the beacon timeout timer.
   let bcnToEvtAddr = cast[pointer](vif_mgmt_bcn_to_evt)
-  cast[ptr pointer](vif0 + 44)[] = bcnToEvtAddr
-  cast[ptr pointer](vif0 + 48)[] = cast[pointer](vif0)
+  vif0View.beaconTimeoutTimer.callback = bcnToEvtAddr
+  vif0View.beaconTimeoutTimer.env = cast[uint32](vif0)
 
   # Push VIF entry 0 onto the free list
   co_list_push_back(addr env.freeList, cast[ptr CoListHdr](vif0))
@@ -24265,16 +32232,12 @@ proc vif_mgmt_init*() {.exportc, cdecl.} =
   let vif1 = vifTabBase + VIF_ENTRY_SIZE.uint
   discard c_memset(cast[pointer](vif1), 0, VIF_ENTRY_SIZE.csize_t)
 
-  # Store bcn callback at vif1+44 and self-ptr at vif1+48. Blob loads
-  # a5 = vif_info_tab + 0x600 (= vif1 + 24) and does `sw s2, 20(a5);
-  # sw a1, 24(a5)` — i.e. (vif1+24)+20 = vif1+44, (vif1+24)+24 = vif1+48.
   let vif1Entry = vif1
-  cast[ptr pointer](vif1Entry + 44)[] = bcnToEvtAddr
-  cast[ptr pointer](vif1Entry + 48)[] = cast[pointer](vif1Entry)
-
-  # Set default fields for VIF entry 1 (at vif_info_tab + 1512 + offsets)
-  # The blob computes 1598 = 1512 + 86, 1601 = 1512 + 89, 1602 = 1512 + 90
   let vif1View = vifChannelAt(vif1Entry)
+  vif1View.beaconTimeoutTimer.callback = bcnToEvtAddr
+  vif1View.beaconTimeoutTimer.env = cast[uint32](vif1Entry)
+
+  # Set default fields for VIF entry 1.
   vif1View.vifType = 4
   vif1View.txPower = 127
   vif1View.maxTxPower = 127
@@ -24293,7 +32256,6 @@ proc vif_mgmt_register*(macAddr: pointer, vifType: uint8, p2p: bool, vifIdxOut: 
   ## increments AP count, calls mm_bcn_init_vif. Then calls td_start and
   ## co_list_push_back to add to active VIF list.
   let env = vifMgmtEnvView()
-  let vifTabBase = cast[uint](addr vif_info_tab[0])
   # Check if VIF management is initialized (vif_mgmt_env[0] = list head)
   let listHead = env.freeList.first
   if listHead == nil:
@@ -24324,15 +32286,18 @@ proc vif_mgmt_register*(macAddr: pointer, vifType: uint8, p2p: bool, vifIdxOut: 
   let entry = co_list_pop_front(addr env.freeList)
   if entry == nil:
     return 1
-  let vifEntry = cast[uint](entry)
+  let vifEntry = cast[pointer](entry)
   let vif = vifChannelAt(vifEntry)
   # Set VIF type
   vif.vifType = vifType
   # Copy MAC address (6 bytes) to vif+80
   discard c_memcpy(cast[pointer](addr vif.macAddr[0]), macAddr, 6.csize_t)
-  # Compute VIF index from pointer arithmetic (blob uses fixed-point multiply trick)
-  let rawDiff = vifEntry - vifTabBase
-  let vifIdx = (rawDiff div VIF_ENTRY_SIZE.uint).uint8
+  # Find the popped VIF in the typed table.
+  var vifIdx = 0'u8
+  while vifIdx < MAX_VIFS.uint8 and vifChannelForIdx(vifIdx) != vif:
+    inc vifIdx
+  if vifIdx >= MAX_VIFS.uint8:
+    return 1
   vif.vifIdx = vifIdx
   # Set default EDCA register constants (matching blob values)
   vif.edcaRegs[0] = 0x0A47'u32
@@ -24340,26 +32305,25 @@ proc vif_mgmt_register*(macAddr: pointer, vifType: uint8, p2p: bool, vifIdxOut: 
   vif.edcaRegs[2] = 0x5E432'u32
   vif.edcaRegs[3] = 0x2F322'u32
   vif.chanCtxt = nil
-  cast[ptr uint8](vifEntry + 76)[] = vifIdx
+  vif.tbttNode.vifIdx = vifIdx
   # Type-specific initialization
   if vifType == VIF_TYPE_STA:
     # STA mode
-    cast[ptr uint32](vifEntry + 32)[] = cast[uint32](vifEntry)  # self-pointer
+    vif.tbttTimer.env = pointerAddrU32(vifEntry)
     env.staCount = env.staCount + 1
     # Set up STA-mode timer callbacks
     let bcnTimeoutCb = cast[pointer](mm_sta_timer_bcn_timeout)
     let staTbttCb = cast[pointer](mm_sta_tbtt)
     let dataTimeoutCb = cast[pointer](mm_sta_timer_data_timeout)
-    cast[ptr pointer](vifEntry + 28)[] = staTbttCb
-    # Timer at vif+128: bcn_timeout callback at +16, vif ptr at +20
-    cast[ptr pointer](vifEntry + 128 + 16)[] = bcnTimeoutCb
-    cast[ptr pointer](vifEntry + 128 + 20)[] = cast[pointer](vifEntry)
-    # Timer at vif+128+48: data_timeout callback at +48, vif ptr at +52
-    cast[ptr pointer](vifEntry + 128 + 48)[] = dataTimeoutCb
-    cast[ptr pointer](vifEntry + 128 + 52)[] = cast[pointer](vifEntry)
+    vif.tbttTimer.callback = staTbttCb
+    vif.keepAliveTimer.callback = bcnTimeoutCb
+    vif.keepAliveTimer.env = pointerAddrU32(vifEntry)
+    vif.securityTimer.callback = dataTimeoutCb
+    vif.securityTimer.env = pointerAddrU32(vifEntry)
     # STA-specific fields
     vif.staIdx = 0xFF
-    cast[ptr uint16](vifEntry + 192)[] = 0
+    vif.reserved192[0] = 0
+    vif.reserved192[1] = 0
     # Call WPA init callback if available
     let wpaCbsPtr = cast[uint](addr wpa_cbs)
     let wpaCbsVal = cast[ptr pointer](wpaCbsPtr)[]
@@ -24374,7 +32338,7 @@ proc vif_mgmt_register*(macAddr: pointer, vifType: uint8, p2p: bool, vifIdxOut: 
       mm_hw_ap_info_set(0)
     env.apCount = env.apCount + 1
     # Initialize beacon for this VIF
-    mm_bcn_init_vif(cast[pointer](vifEntry))
+    mm_bcn_init_vif(vifEntry)
   # Common: call td_start, push to active VIF list, write vifIdx output
   td_start(vifIdx)
   vifIdxOut[] = vifIdx
@@ -24386,10 +32350,9 @@ proc vif_mgmt_unregister*(vifIdx: uint8) {.exportc, cdecl.} =
   ## From blob: removes VIF from active list, decrements STA/AP count,
   ## clears timers, resets TD, zeroes the VIF entry, reinitializes to free
   ## state, pushes back onto free list, then tail-calls co_list_push_back.
-  let vifTabBase = cast[uint](addr vif_info_tab[0])
   let env = vifMgmtEnvView()
-  let vifEntry = vifTabBase + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let vif = vifChannelAt(vifEntry)
+  let vif = vifChannelForIdx(vifIdx)
+  let vifEntry = cast[pointer](vif)
 
   # Remove VIF from active list
   co_list_extract(addr env.activeList, cast[ptr CoListHdr](vifEntry))
@@ -24416,32 +32379,33 @@ proc vif_mgmt_unregister*(vifIdx: uint8) {.exportc, cdecl.} =
 
     # Update beacon control from remaining VIF's channel context
     let otherVifIdx = if vifIdx == 0: 1'u8 else: 0'u8
-    let otherVif = vifTabBase + otherVifIdx.uint * VIF_ENTRY_SIZE.uint
-    let chanPtr = cast[ptr uint32](otherVif + 56)[]
-    regWrite(MACHW_BASE + 0x020'u, chanPtr)
-    let chanHalf = cast[ptr uint16](otherVif + 60)[]
-    regWrite(MACHW_BASE + 0x024'u, chanHalf.uint32)
+    let otherVif = vifChannelForIdx(otherVifIdx)
+    let bssidLow = otherVif.currentBssid[0].uint32 or
+      (otherVif.currentBssid[1].uint32 shl 8) or
+      (otherVif.currentBssid[2].uint32 shl 16) or
+      (otherVif.currentBssid[3].uint32 shl 24)
+    let bssidHigh = otherVif.currentBssid[4].uint32 or
+      (otherVif.currentBssid[5].uint32 shl 8)
+    regWrite(MACHW_BASE + 0x020'u, bssidLow)
+    regWrite(MACHW_BASE + 0x024'u, bssidHigh)
 
   # Check if WPA deinit callback should be called (for STA type)
-  let otherVifEntry = vifTabBase  # check first VIF
   var scanIdx: uint8 = 0
   while scanIdx < MAX_VIFS.uint8:
-    let scanVif = vifTabBase + scanIdx.uint * VIF_ENTRY_SIZE.uint
-    let scanType = vifChannelAt(scanVif).vifType
+    let scanType = vifChannelForIdx(scanIdx).vifType
     if scanType == VIF_TYPE_STA:
       break
     scanIdx += 1
 
   if scanIdx >= MAX_VIFS.uint8:
     # No STA VIFs left: call WPA deinit
-    let wpaCbsPtr = cast[ptr pointer](addr wpa_cbs)[]
-    if wpaCbsPtr != nil:
-      let deinitFn = cast[ptr pointer](cast[uint](wpaCbsPtr) + 4)[]
+    if wpa_cbs != nil:
+      let deinitFn = wpaCallbacks().deinit
       if deinitFn != nil:
         cast[proc(){.cdecl.}](deinitFn)()
 
   # Check for AP beacon clear
-  let otherVifType = vifChannelAt(vifTabBase + (if vifIdx == 0: VIF_ENTRY_SIZE.uint else: 0)).vifType
+  let otherVifType = vifChannelForIdx(if vifIdx == 0: 1'u8 else: 0'u8).vifType
   if otherVifType == VIF_TYPE_AP:
     txl_cntrl_clear_bcn_ac()
 
@@ -24452,56 +32416,62 @@ proc vif_mgmt_unregister*(vifIdx: uint8) {.exportc, cdecl.} =
   td_reset(vifIdx)
 
   # Zero the entire VIF entry (1512 bytes)
-  discard c_memset(cast[pointer](vifEntry), 0, VIF_ENTRY_SIZE.csize_t)
+  discard c_memset(vifEntry, 0, VIF_ENTRY_SIZE.csize_t)
 
   # Reinitialize entry to free state
   vif.vifType = 4
   vif.txPower = 127
   vif.maxTxPower = 127
-  # Restore bcn-timeout callback. Blob stores &vif_mgmt_bcn_to_evt (NOT bcn_to_prog).
-  cast[ptr pointer](vifEntry + 44)[] = cast[pointer](vif_mgmt_bcn_to_evt)
-  cast[ptr pointer](vifEntry + 48)[] = cast[pointer](vifEntry)
+  # Restore bcn-timeout callback. Blob stores &vif_mgmt_bcn_to_evt.
+  vif.beaconTimeoutTimer.callback = cast[pointer](vif_mgmt_bcn_to_evt)
+  vif.beaconTimeoutTimer.env = pointerAddrU32(vifEntry)
 
   # Push entry back onto free list
   co_list_push_back(addr env.freeList, cast[ptr CoListHdr](vifEntry))
 
-proc vif_mgmt_add_key*(vifIdx: uint8, param: pointer) {.exportc, cdecl.} =
+proc vif_mgmt_add_key*(param: pointer, hwKeyIdx: uint8) {.exportc, cdecl.} =
   ## Add encryption key for a VIF (185 instructions).
+  ##
+  ## Blob ABI: a0=56-byte key parameter, a1=hardware key index.
   ##
   ## param layout (byte offsets from disassembly -- same as mm_sec_machwkey_wr param):
   ##   [0]   u8: staIndex / MAC address index
-  ##   [34]  u8: cipherType (0=WEP40, 1=TKIP, 3=WEP104, 5=CCMP)
-  ##   [35]  u8: keyIdx (key slot)
-  ##   [36]  u8: spp
-  ##   [37]  u8: has_rx_pn flag
   ##   [8..23]  key material
   ##   [24..39] RX PN / TKIP MIC key (6 x 32-bit words at [24..47])
   ##   [44..51] TX/RX sequence counters (2 x 32-bit words)
+  ##   [52]  u8: cipherType (0=WEP40, 1=TKIP, 3=WEP104, 5=CCMP)
+  ##   [53]  u8: keyIdx / VIF slot selector
+  ##   [54]  u8: spp
+  ##   [55]  u8: has_rx_pn flag
   ##
   ## VIF entry layout (stride = 1512 = 0x5E8 bytes):
   ##   +528 (0x210): start of per-key entries (8 entries, 16 bytes each = 128 bytes)
-  ##   +656 (0x290): per-key PN low  (offset from vif+vifIdx*1512)
+  ##   +656 (0x290): per-key PN low
   ##   +660 (0x294): per-key PN high
-  ##   +664 (0x298): key material (4 x 32-bit words for TKIP)
+  ##   +664 (0x298): key material (4 x 32-bit words)
   ##   +680 (0x2A8): cipher type
   ##   +681 (0x2A9): sta index
   ##   +682 (0x2AA): keyIdx (key slot HW index written by mm_sec_machwaddr_wr)
   ##   +683 (0x2AB): key installed flag
   ##   +684 (0x2AC): has_rx_pn flag
-  ##   +1488 (0x5D0): default CCMP key material pointer (for rx)
-  ##   +1492 (0x5D4): CCMP installed key material pointer
+  ##   +1488 (0x5D0): default key material pointer
+  ##   +1492 (0x5D4): group key material pointer
+  ##   +1496 (0x5D8): VIF flags
 
   let req = vifMgmtAddKeyParamView(param)
   let keySlot = req.keySlot  # s7 in blob = keyIdx field from param
   let staIdx = req.staIdx    # s9
 
-  let vifBase = cast[uint](addr vif_info_tab[0])
-  let vifOff = keySlot.uint * VIF_ENTRY_SIZE.uint  # s6/s8
-  let vifEntry = vifBase + vifOff  # s2 = vif_info_tab + keySlot * 1512
-  let keyView = vifKeySlotAt(vifEntry, 0)
+  let vif = vifChannelForIdx(keySlot)
+  let keyView = vifKeySlot(vif, 0)
 
-  # Store keyIdx (from vifIdx argument) to vif+682
-  keyView.keyIdx = vifIdx
+  # Zero the per-key context area at vif+528, 128 bytes before populating the
+  # metadata fields. Clearing after these stores erases cipher/key identity and
+  # leaves group-key RX unable to resolve protected broadcast frames.
+  discard c_memset(cast[pointer](keyView), 0, 128.csize_t)
+
+  # Store hardware key index from a1 to vif+682.
+  keyView.keyIdx = hwKeyIdx
 
   # Copy cipher type from param[34] to vif+680
   let cipherType = req.cipherType
@@ -24513,10 +32483,6 @@ proc vif_mgmt_add_key*(vifIdx: uint8, param: pointer) {.exportc, cdecl.} =
   # Copy has_rx_pn from param[37] to vif+684
   let hasRxPn = req.hasRxPn
   keyView.hasRxPn = hasRxPn
-
-  # Zero the per-key context area at vif+528, 128 bytes
-  let keyCtxBase = cast[uint](keyView)  # s3
-  discard c_memset(cast[pointer](keyCtxBase), 0, 128.csize_t)
 
   # Dispatch on cipher type
   case cipherType
@@ -24551,8 +32517,8 @@ proc vif_mgmt_add_key*(vifIdx: uint8, param: pointer) {.exportc, cdecl.} =
     keyView.pnHigh = 0
 
   # Read TX/RX sequence counters from param[44..51] (PN from host)
-  let pnLo = req.pnLow
-  let pnHi = req.pnHigh
+  let pnLo = le32(addr req.pnLowBytes)
+  let pnHi = le32(addr req.pnHighBytes)
 
   if (pnLo or pnHi) != 0:
     # Host provided a non-zero PN; check if has_rx_pn and cipher != CCMP
@@ -24569,15 +32535,12 @@ proc vif_mgmt_add_key*(vifIdx: uint8, param: pointer) {.exportc, cdecl.} =
         inc i
     else:
       # Unicast PN: write to per-STA rx reorder context
-      # staIdx * 10 + 33, shifted left 4, offset from vifBase+vifOff+vifBase(s1)
-      let reorderBase = (staIdx.uint * 10 + 33) * 16 + vifOff + vifBase
+      # staIdx * 10 + 33, shifted left 4, offset from the VIF entry.
+      let staReplay = vifKeySlot(vif, staIdx.uint)
       var i = 0
       while i < 8:
-        # Store PN pair at each slot
-        let slotAddr = reorderBase + i.uint * 16
-        # The blob calls a helper that stores two 32-bit values
-        cast[ptr uint32](slotAddr + 0)[] = pnLo
-        cast[ptr uint32](slotAddr + 4)[] = pnHi
+        staReplay.replayCounters[i].pnLow = pnLo
+        staReplay.replayCounters[i].pnHigh = pnHi
         inc i
 
   # Validate replay counter before marking key installed
@@ -24589,48 +32552,47 @@ proc vif_mgmt_add_key*(vifIdx: uint8, param: pointer) {.exportc, cdecl.} =
 
   # If cipher type is CCMP, update the CCMP key material pointer
   let installedCipher = keyView.cipherType
-  let keyPtrs = vifKeyPointersAt(vifEntry)
+  let keyPtrs = vifKeyPointers(vif)
   if installedCipher == 5:
     # Store pointer to key context base in vif+1492
-    keyPtrs.groupKeyPtr = cast[uint32](keyCtxBase)
+    keyPtrs.groupKeyPtr = vifKeySlotPtr(vif, 0)
   else:
-    # Store to vif+1488 (default key pointer)
-    keyPtrs.defaultKeyPtr = cast[uint32](keyCtxBase)
+    # Store to vif+1480 (default key pointer)
+    keyPtrs.defaultKeyPtr = vifKeySlotPtr(vif, 0)
 
 proc vif_mgmt_del_key*(vifEntry: pointer, keySlot: uint8) {.exportc, cdecl, noinline.} =
   ## Delete encryption key for a VIF (35 instrs).
   ## noinline: blob calls this from mm_sec_machwkey_del.
   ## From blob: a0=vifEntry pointer, a1=keySlot index.
   ## Computes key context offset = keySlot * 160 + 528 within VIF entry.
-  ## Clears the key valid flag at vif[keyOffset + 683-528] = vif[keySlot*160+683].
+  ## Clears the key valid flag at vif[keyOffset + 675-520] = vif[keySlot*160+675].
   ## Then checks if vif+1488 (default TX key ptr) points to this key context.
   ## If so, scans other key slots (0..3) for a valid key to replace it.
   ## If no valid key found, clears vif+1488. Similarly checks vif+1492 (group key).
   {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
-  let vif = cast[uint](vifEntry)
+  let vif = vifChannelAt(vifEntry)
   let keySlotU = keySlot.uint
-  let keyOffset = keySlotU * 160 + 528
-  let keyView = vifKeySlotAt(vif, keySlotU)
-  let keyPtrs = vifKeyPointersAt(vif)
+  let keyView = vifKeySlot(vif, keySlotU)
+  let keyPtrs = vifKeyPointers(vif)
   # Clear key valid flag
   keyView.installed = 0
   # Check if this was the default TX key (vif+1488)
   let defaultKeyPtr = keyPtrs.defaultKeyPtr
-  let thisKeyBase = vif + keyOffset
-  if defaultKeyPtr == cast[uint32](thisKeyBase):
+  let thisKeyBase = vifKeySlotPtr(vif, keySlotU)
+  if defaultKeyPtr == thisKeyBase:
     # This key was the default; find replacement
     keyPtrs.defaultKeyPtr = 0
     # Scan slots 0..3 for a valid key
     for i in 0'u .. 3'u:
-      let slotValid = vifKeySlotAt(vif, i).installed
+      let slotValid = vifKeySlot(vif, i).installed
       if slotValid != 0:
-        keyPtrs.defaultKeyPtr = cast[uint32](vif + i * 160 + 528)
+        keyPtrs.defaultKeyPtr = vifKeySlotPtr(vif, i)
         break
-  # Check group key pointer (vif+1492)
+  # Check group key pointer (vif+1484)
   let groupKeyPtr = keyPtrs.groupKeyPtr
-  if groupKeyPtr == cast[uint32](thisKeyBase):
+  if groupKeyPtr == thisKeyBase:
     # Scan for replacement group key
-    let validFlag = cast[ptr uint8](vif + keySlotU * 160 + 1323 - 528)[]
+    let validFlag = vifKeySlot(vif, keySlotU + 4'u).installed
     if validFlag == 0:
       keyPtrs.groupKeyPtr = 0
 
@@ -24645,10 +32607,10 @@ proc vif_mgmt_send_postponed_frame*(vifEntry: pointer) {.exportc, cdecl.} =
   ##     s0 = *(u32*)s0                          ; next
   ## Prior Nim bug: called txl_cntrl_push_int(0, cur) — completely wrong:
   ## it would try to push STA list nodes as TX frames.
-  let vif = cast[uint](vifEntry)
-  var cur = cast[ptr pointer](vif + 340)[]
+  let vif = vifChannelAt(vifEntry)
+  var cur = vif.postponedStaHead
   while cur != nil:
-    let next = cast[ptr pointer](cast[uint](cur))[]
+    let next = cast[pointer](cast[ptr CoListHdr](cur).next)
     discard sta_mgmt_send_postponed_frame(vifEntry, cur, 0'u32)
     cur = next
 
@@ -24756,8 +32718,7 @@ proc vif_mgmt_get_vif*(vifIdx: uint8): pointer {.exportc, cdecl, noinline.} =
   ## Otherwise computes vif_info_tab + vifIdx * 1512 and returns pointer.
   if vifIdx >= MAX_VIFS.uint8:
     return nil
-  let vifTab = cast[uint](addr vif_info_tab[0])
-  return cast[pointer](vifTab + vifIdx.uint * VIF_ENTRY_SIZE.uint)
+  return cast[pointer](vifChannelForIdx(vifIdx))
 
 proc vif_mgmt_get_first_ap_inf*(): pointer {.exportc, cdecl.} =
   ## Get the first AP VIF info pointer.
@@ -24828,52 +32789,42 @@ proc sta_mgmt_init*() {.exportc, cdecl.} =
   ## Initialize station management (84 instrs).
   ## From blob: calls co_list_init(&sta_info_env). Loops over the five normal
   ## STA entries, calling sta_mgmt_entry_init and co_list_push_back for each.
-  ## Then initializes 2 extra "broadcast" STA entries at
-  ## sta_info_tab+0x730 (entry 5 = broadcast STA for VIF 0) and sta_info_tab+0x8A0
+  ## Then initializes 2 extra "broadcast" STA entries at table slots 5 and 6
   ## (entry 6 = broadcast STA for VIF 1). Sets up buffer control pointers,
   ## logs via g_bl_ops_funcs[0xCC], and stores cross-references between
   ## VIF and STA tables.
-  let staBase = cast[uint](addr sta_info_tab[0])
-  let staEnd = staBase + STA_MGMT_FREE_STAS.uint * STA_ENTRY_SIZE.uint
-  let vifBase = cast[uint](addr vif_info_tab[0])
   # Initialize STA free list
   co_list_init(addr sta_info_env)
   # Init each STA entry and push to free list
-  var cur = staBase
-  while cur < staEnd:
-    sta_mgmt_entry_init(cast[pointer](cur))
-    co_list_push_back(addr sta_info_env, cast[ptr CoListHdr](cur))
-    cur += STA_ENTRY_SIZE.uint
-  # Initialize broadcast STA entry for VIF 0 at sta_info_tab + 0x730 (offset 1840)
-  let bcStaVif0 = staBase + 0x730'u  # 10*368=3680, but blob uses 0x730=1840
+  var idx = 0'u8
+  while idx < STA_MGMT_FREE_STAS.uint8:
+    let sta = staInfoForIdx(idx)
+    sta_mgmt_entry_init(cast[pointer](sta))
+    co_list_push_back(addr sta_info_env, cast[ptr CoListHdr](sta))
+    inc idx
+
+  # Initialize broadcast STA entry for VIF 0.
+  let bcStaVif0 = staInfoForIdx(STA_MGMT_FREE_STAS.uint8)
   sta_mgmt_entry_init(cast[pointer](bcStaVif0))
-  # Clear postponed flag at offset 0x757 from sta_info_tab base
-  cast[ptr uint8](staBase + 0x757)[] = 0
-  # Set up buffer control pointers for broadcast STA
-  let bcmcDescBase = cast[uint](addr txl_buffer_control_desc_bcmc[0])
-  let staEnvOffset0x800 = staBase + 0x800'u
-  cast[ptr pointer](staEnvOffset0x800 + 112)[] = cast[pointer](bcmcDescBase)
-  # Load vif_info_tab+0x5D0 (VIF 0 key material pointer area)
-  let vif0KeyPtr = cast[ptr pointer](vifBase + 0x5D0)[]
-  cast[ptr uint8](staBase + 0x778)[] = 0  # clear flag
-  cast[ptr pointer](staEnvOffset0x800 + 36)[] = cast[pointer](vifBase + 0x5D0'u)
+  bcStaVif0.instNbr = 0
+  bcStaVif0.rxNss = 0
+  bcStaVif0.txPolicy = cast[pointer](txBufferControlBcmcDescAt(0))
+  bcStaVif0.keyMat = cast[pointer](vifKeyPointers(vifChannelForIdx(0)))
   # Log
   let logFn = getLogFunc(204)
   if logFn != nil:
     cast[proc(a0: uint32, a1: uint32, a2: pointer, a3: uint32, a4: uint32){.cdecl.}](logFn)(
       2, 0, nil, 157, 157)
-  # Initialize broadcast STA entry for VIF 1 at sta_info_tab + 0x8A0
-  let bcStaVif1 = staBase + 0x8A0'u
+
+  # Initialize broadcast STA entry for VIF 1.
+  let bcStaVif1 = staInfoForIdx(STA_MGMT_FREE_STAS.uint8 + 1'u8)
   sta_mgmt_entry_init(cast[pointer](bcStaVif1))
-  cast[ptr uint8](staBase + 0x8C7)[] = 1  # mark as broadcast
-  # Set up buffer control for VIF 1 broadcast
-  let staEnvOffset0x980 = staBase + 0x980'u
-  cast[ptr pointer](staEnvOffset0x980 + 96)[] = cast[pointer](bcmcDescBase + 0x3C'u)
-  cast[ptr uint8](staBase + 0x8E8)[] = 0
-  cast[ptr pointer](staEnvOffset0x980 + 20)[] = cast[pointer](vifBase + 0xBB8'u)
+  bcStaVif1.instNbr = 1
+  bcStaVif1.rxNss = 0
+  bcStaVif1.txPolicy = cast[pointer](txBufferControlBcmcDescAt(1))
+  bcStaVif1.keyMat = cast[pointer](vifKeyPointers(vifChannelForIdx(1)))
   # Final log via g_bl_ops_funcs
   let logFn2 = getLogFunc(204)
-  let vif1KeyPtr = cast[ptr pointer](vifBase + 0xBB8)[]
   if logFn2 != nil:
     cast[proc(a0: uint32, a1: uint32, a2: pointer, a3: uint32, a4: uint32){.cdecl.}](logFn2)(
       2, 0, nil, 157, 157)
@@ -24885,8 +32836,6 @@ proc sta_mgmt_register*(param: pointer, staIdxOut: ptr uint8): uint8 {.exportc, 
   ## initializes postponed descriptor halfwords to 0xFFFF, links RC stats pointer,
   ## clears postponed flag, checks VIF HT flags, logs, links STA to VIF list.
   let req = staMgmtRegisterParamView(param)
-  let staTabBase = cast[uint](addr sta_info_tab[0])
-  let vifTabBase = cast[uint](addr vif_info_tab[0])
   let instNbr = req.instNbr
   # Pop free STA entry from sta_info_env free list
   let entry = co_list_pop_front(addr sta_info_env)
@@ -24909,9 +32858,12 @@ proc sta_mgmt_register*(param: pointer, staIdxOut: ptr uint8): uint8 {.exportc, 
   sta.registerWord0 = req.registerWord0
   sta.registerWord1 = req.registerWord1
   sta.paramFlag = req.paramFlag
-  # Compute station index via pointer arithmetic (blob uses fixed-point multiply)
-  let rawDiff = staEntry - staTabBase
-  let staIdx = (rawDiff div STA_ENTRY_SIZE.uint).uint8
+  # Find the popped STA in the typed table.
+  var staIdx = 0'u8
+  while staIdx < STA_MGMT_FREE_STAS.uint8 and staInfoForIdx(staIdx) != sta:
+    inc staIdx
+  if staIdx >= STA_MGMT_FREE_STAS.uint8:
+    return 1
   staIdxOut[] = staIdx
   sta.infoIdx = staIdx
   # Initial rate config
@@ -24922,23 +32874,22 @@ proc sta_mgmt_register*(param: pointer, staIdxOut: ptr uint8): uint8 {.exportc, 
   for i in 0 ..< 9:
     cast[ptr uint16](descAddr)[] = 0xFFFF'u16
     descAddr += 4
+  for tid in 0'u8 .. 8'u8:
+    rxuQosSeqCachePtr(tid)[] = 0xFFFF'u16
   # Store TX policy descriptor pointer at sta+320.
   # Vendor uses one 60-byte txl_buffer_control_desc entry per STA; rc_init
   # later writes the RC stats pointer at sta+324.
-  let txPolicyBase = cast[uint](addr txl_buffer_control_desc[0])
-  sta.txPolicy = cast[pointer](txPolicyBase + staIdx.uint * 60'u)
+  sta.txPolicy = cast[pointer](txBufferControlDescAt(staIdx.int))
   # Clear postponed flag at sta+72
   sta.trafficFlags = 0
+  let vif = vifChannelForIdx(instNbr)
+  let keyPtrs = vifKeyPointers(vif)
   # Check VIF HT flags at vif+1496
-  let vifOffset = instNbr.uint * VIF_ENTRY_SIZE.uint
-  let vifEntry = vifTabBase + vifOffset
-  let keyPtrs = vifKeyPointersAt(vifEntry)
   let vifFlags = keyPtrs.flags
   let logFn = getLogFunc(204)
   if (vifFlags and 8) != 0:
     # HT-capable VIF: postponed list self-pointer at sta+240
-    let postponedListAddr = staEntry + 240
-    sta.keyMat = cast[pointer](postponedListAddr)
+    sta.keyMat = cast[pointer](addr sta.keyHolder)
     if logFn != nil:
       cast[proc(a0, a1: uint32, c: pointer, d, e: uint32){.cdecl.}](logFn)(2, 0, nil, 282, 282)
   else:
@@ -24950,9 +32901,8 @@ proc sta_mgmt_register*(param: pointer, staIdxOut: ptr uint8): uint8 {.exportc, 
   let vifFlags2 = keyPtrs.flags
   if (vifFlags2 and 16) != 0:
     sta.capabilityFlags = sta.capabilityFlags or 8
-  # Push STA onto VIF's STA list at vif+instNbr*1512+340
-  let vifStaListAddr = vifOffset + 340 + vifTabBase
-  co_list_push_back(cast[ptr CoList](vifStaListAddr), cast[ptr CoListHdr](staEntry))
+  # Push STA onto the VIF's postponed-STA list.
+  co_list_push_back(vifPostponedStaList(vif), cast[ptr CoListHdr](staEntry))
   # Mark station as active
   sta.valid = 1
   return 0
@@ -24964,30 +32914,26 @@ proc sta_mgmt_unregister*(staIdx: uint8) {.exportc, cdecl.} =
   ## calls co_list_extract to remove STA from VIF's STA list (at vif+340),
   ## calls sta_mgmt_entry_init to reset the STA entry,
   ## then pushes back to sta_info_env free list via co_list_push_back.
-  let vifBase = cast[uint](addr vif_info_tab[0])
   let sta = staInfoForIdx(staIdx)
   let instNbr = sta.instNbr
-  # Compute VIF STA list address at vif_info_tab + instNbr*1512 + 340
-  let vifStaListAddr = vifBase + instNbr.uint * VIF_ENTRY_SIZE.uint + 340
   # Extract STA from VIF's STA list
-  co_list_extract(cast[ptr CoList](vifStaListAddr), cast[ptr CoListHdr](sta))
+  let vif = vifChannelForIdx(instNbr)
+  co_list_extract(vifPostponedStaList(vif), cast[ptr CoListHdr](sta))
   # Re-initialize the STA entry (clears all fields)
   sta_mgmt_entry_init(cast[pointer](sta))
   # Push back to free list
   co_list_push_back(addr sta_info_env, cast[ptr CoListHdr](sta))
 
-proc sta_mgmt_add_key*(staIdx: uint8, param: pointer) {.exportc, cdecl.} =
+proc sta_mgmt_add_key*(param: pointer, hwKeyIdx: uint8) {.exportc, cdecl.} =
   ## Add encryption key for a station (81 instrs).
-  ## a0 = key parameter struct, a1 = STA index.
-  ## NOTE: blob ABI has a0=param, a1=staIdx (reversed from Nim signature).
-  ## The C export uses the Nim parameter order; the blob order is handled by linkage.
+  ## Blob ABI: a0 = key parameter struct, a1 = hardware key index.
   ##
   ## Assembly trace:
-  ##   s4 = param[1] (key index from param)
+  ##   s4 = param[1] (STA index from param)
   ##   s0 = STA_ENTRY_SIZE(368) * s4 (offset into sta_info_tab)
   ##   s1 = param pointer
   ##   s2 = sta_info_tab base
-  ##   Stores param[1] at sta[234] (key HW index)
+  ##   Stores a1 at sta[234] (key HW index)
   ##   Stores param[52] at sta[232] (key type: 0=none, 1=CCMP, 3=TKIP)
   ##   Stores param[0] at sta[233] (key cipher suite)
   ##   Stores param[55] at sta[236] (key flags)
@@ -24996,13 +32942,20 @@ proc sta_mgmt_add_key*(staIdx: uint8, param: pointer) {.exportc, cdecl.} =
   ##     type 1 (CCMP): clear PN (sta+208..215), copy 16-byte key from param+24..39 to sta+208
   ##     type 3 (TKIP): generate PRNG-based IV, store at sta+208..215
   ##   Sets sta[235] = 1 (key installed), sta[240] = ptr to sta+80 (key material)
-  let req = staKeyReqView(param)
+  let req = machwKeyWriteParamView(param)
+  let staIdx = req.keyType
   let sta = staInfoForIdx(staIdx)
+  inc nimFwDbgStaAddKeyCalls
+  nimFwDbgStaAddKeyMeta = staIdx.uint32 or (hwKeyIdx.uint32 shl 8) or
+    (req.cipherType.uint32 shl 16) or (req.keyFlags.uint32 shl 24)
+  nimFwDbgStaAddKeyPtrs0 = pointerAddrU32(cast[pointer](sta))
+  nimFwDbgStaAddKeyPtrs1 = pointerAddrU32(sta.keyMat)
+  nimFwDbgStaAddKeyPtrs2 = pointerAddrU32(sta.keyHolder)
   # Store key metadata
-  sta.hwKeyIdx = staIdx
-  let keyType = req.keyType
+  sta.hwKeyIdx = hwKeyIdx
+  let keyType = req.cipherType
   sta.keyType = keyType
-  let cipherSuite = req.cipherSuite
+  let cipherSuite = req.addrIdx
   sta.cipherSuite = cipherSuite
   let keyFlags = req.keyFlags
   sta.keyFlags = keyFlags
@@ -25010,16 +32963,18 @@ proc sta_mgmt_add_key*(staIdx: uint8, param: pointer) {.exportc, cdecl.} =
   discard c_memset(cast[pointer](addr sta.keyArea[0]), 0, 128.csize_t)
   # Dispatch on key type
   case keyType
-  of 1:
-    # CCMP: clear PN, copy key from param+24
+  of 1, 2:
+    # CCMP: clear PN, copy key from param+24. The supplicant set_key path
+    # passes translated cipher 2, while the vendor branch also accepts the
+    # CCMP table value 1.
     sta.pnLow = 0
     sta.pnHigh = 0
-    # Copy 32-byte temporal key from param+24 to sta+128+88. Blob inlines
-    # the word-by-word copy (8 × 4-byte loads+stores); Nim previously
+    # Copy 16-byte temporal key from param+24 to sta+128+88. Blob inlines
+    # the word-by-word copy (4 x 4-byte loads+stores); Nim previously
     # used two memcpy calls that aren't in blob's call graph.
-    let keySrcU = cast[uint](staKeyDataPtr(req))
+    let keySrcU = cast[uint](machwKeyWriteKeyTailPtr(req))
     let keyDstU = cast[uint](addr sta.keyTail[0])
-    for i in 0 ..< 8:
+    for i in 0 ..< 4:
       cast[ptr uint32](keyDstU + (i * 4).uint)[] =
         cast[ptr uint32](keySrcU + (i * 4).uint)[]
   of 3:
@@ -25035,6 +32990,8 @@ proc sta_mgmt_add_key*(staIdx: uint8, param: pointer) {.exportc, cdecl.} =
   sta.keyInstalled = 1
   # Store pointer to key material
   sta.keyHolder = cast[pointer](addr sta.keyArea[0])
+  nimFwDbgStaAddKeyPtrs1 = pointerAddrU32(sta.keyMat)
+  nimFwDbgStaAddKeyPtrs2 = pointerAddrU32(sta.keyHolder)
 
 proc sta_mgmt_del_key*(staIdx: uint8, keyIdx: uint8) {.exportc, cdecl.} =
   ## Delete encryption key for a station.
@@ -25067,17 +33024,15 @@ proc sta_mgmt_send_postponed_frame*(vifEntry: pointer, staEntry: pointer, maxCou
   let psFlags = vifView.psFlags
   if psFlags != 0:
     let vifType = vifView.vifType
-    let keEnvBase = cast[uint](addr ke_env[0])
+    let ps = keEnvPsFlags()
     if vifType == VIF_TYPE_AP:
       # AP mode: set bit 1 in ke_env+28 and set ke_env+29 = 1
-      let envByte = cast[ptr uint8](keEnvBase + 28)[]
-      cast[ptr uint8](keEnvBase + 28)[] = envByte or 2
-      cast[ptr uint8](keEnvBase + 29)[] = 1
+      ps.flags = ps.flags or 2
+      ps.apPending = 1
     elif vifType != VIF_TYPE_STA:
       # Other mode: set bit 0 in ke_env+28 and set ke_env+31 = 1
-      let envByte = cast[ptr uint8](keEnvBase + 28)[]
-      cast[ptr uint8](keEnvBase + 28)[] = envByte or 1
-      cast[ptr uint8](keEnvBase + 31)[] = 1
+      ps.flags = ps.flags or 1
+      ps.otherPending = 1
   # Signal TX event
   ke_evt_set(256)
   # Walk postponed descriptor list
@@ -25148,21 +33103,33 @@ proc sta_mgmt_postponed_desc_release*(staEntry: pointer, flag: uint32): uint32 {
   let frameEnv = txFrameEnv()
   var cur = cast[pointer](sta.postponedList.first)
   while cur != nil:
-    let curU = cast[uint](cur)
-    let next = cast[ptr pointer](curU)[]
+    if not wifiRamPointer(cur):
+      inc nimFwDbgPostponedRelease
+      nimFwDbgPostponedReleaseDesc = pointerAddrU32(cur)
+      nimFwDbgPostponedReleaseCb = 0xFFFFFFFF'u32
+      nimFwDbgPostponedReleaseFc = 0xFFFFFFFF'u32
+      nimFwDbgPostponedReleaseFlags = flag or 0x80000000'u32
+      if prev == nil:
+        sta.postponedList.first = nil
+      else:
+        cast[ptr CoListHdr](prev).next = nil
+      sta.postponedList.last = cast[ptr CoListHdr](prev)
+      frameEnv.postponedCount = 0
+      break
+    let txDesc = hostTxDescAt(cur)
+    let next = cast[pointer](cast[ptr CoListHdr](cur).next)
     var doRelease = false
     if flag != 0:
       doRelease = true
     else:
       # Check age: frame TX timestamp at offset 84
-      let txTime = cast[ptr uint32](curU + 84)[]
+      let txTime = txDesc.pendingMacTime
       let age = macTime - txTime
       if age > maxAge:
         doRelease = true
     if doRelease:
       # Remove from postponed list (blob: co_list_remove)
       co_list_remove(addr sta.postponedList, cast[ptr CoListHdr](prev), cast[ptr CoListHdr](cur))
-      let txDesc = hostTxDescAt(cur)
       inc nimFwDbgPostponedRelease
       nimFwDbgPostponedReleaseDesc = pointerAddrU32(cur)
       nimFwDbgPostponedReleaseCb = pointerAddrU32(txDesc.callback)
@@ -25196,14 +33163,11 @@ proc sta_mgmt_aging_postponed_desc*(staEntry: pointer, maxCount: uint32): uint32
   ## From blob: iterates all entries physically present in sta_info_tab
   ## (7 entries, 368 bytes each), calling sta_mgmt_postponed_desc_release(staEntry, 0).
   ## Accumulates total released count. Returns total.
-  let staBase = cast[uint](addr sta_info_tab[0])
-  let staEnd = staBase + (STA_INFO_TAB_ENTRIES * STA_ENTRY_SIZE).uint
   var total: uint32 = 0
-  var cur = staBase
-  while cur < staEnd:
-    let released = sta_mgmt_postponed_desc_release(cast[pointer](cur), 0)
+  for i in 0'u8 ..< STA_INFO_TAB_ENTRIES.uint8:
+    let sta = staInfoForIdx(i)
+    let released = sta_mgmt_postponed_desc_release(cast[pointer](sta), 0)
     total += released
-    cur += STA_ENTRY_SIZE.uint
   return total
 
 # ###########################################################################
@@ -25305,7 +33269,6 @@ proc tpc_update_vif_tx_power*(vifEntry: pointer, txPowerElem: pointer, rateParam
   if powerVal == 127:
     return  # sentinel: no power configured
 
-  let vifU = cast[uint](vifEntry)
   let vif = vifChannelAt(vifEntry)
   let oldPower = vif.txPower
 
@@ -25330,14 +33293,12 @@ proc tpc_update_vif_tx_power*(vifEntry: pointer, txPowerElem: pointer, rateParam
   if newPower == oldPower:
     return  # no change
 
-  # Walk STA linked list at vifEntry+340 to update RC flags
-  var staNode = cast[ptr pointer](vifU + 340)[]
+  # Walk the VIF postponed-STA list and mark rate control for recomputation.
+  var staNode = vif.postponedStaHead
   while staNode != nil:
-    let staNodeU = cast[uint](staNode)
-    # Set bit 4 in STA RC flags to trigger power-related rate re-computation
-    let rcFlagsPtr = cast[ptr uint8](staNodeU + 334)
-    rcFlagsPtr[] = rcFlagsPtr[] or 0x10
-    staNode = cast[ptr pointer](staNodeU)[]
+    let sta = staInfoAt(staNode)
+    sta.mmFlagsBytes[0] = sta.mmFlagsBytes[0] or 0x10
+    staNode = cast[pointer](sta.link.next)
 
   # Check if VIF has a channel context
   let chanCtxt = vif.chanCtxt
@@ -25501,107 +33462,94 @@ proc bam_send_air_action_frame*(staIdx: uint8, tid: uint8, isAddba: uint8,
   let staEntry = cast[uint](sta)
   let vifIdx = sta.instNbr
 
-  let vifTabBase = cast[uint](addr vif_info_tab[0])
-  let vifOff = vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let vifEntry = vifTabBase + vifOff  # s11 = vifOff in blob
-  let vif = vifChannelAt(vifEntry)
+  let vif = vifChannelForIdx(vifIdx)
 
   # Allocate TX frame from frame pool (blob: txl_frame_get at 0x46)
   let frame = txl_frame_get(512)
   if frame == nil:
     return
 
-  let frameAddr = cast[uint](frame)
+  let desc = hostTxDescAt(frame)
 
   # Update TX power (blob: tpc_update_frame_tx_power at 0x6E)
-  tpc_update_frame_tx_power(cast[pointer](vifEntry), frame)
+  tpc_update_frame_tx_power(cast[pointer](vif), frame)
 
   # The MAC header lives in the link descriptor, not inline in the frame
   # descriptor. Writing at frame+348 corrupts the frame pool metadata.
-  let linkDesc = cast[uint](cast[ptr pointer](frameAddr + 108)[])
-  let macHdr = linkDesc + 348
+  let link = hostTxLinkDescAt(desc.bufDesc)
+  let hdr = hostTxDataHeader(desc)
 
   # Set frame control: Action frame = 0xD0
-  cast[ptr uint8](macHdr + 0)[] = 0xD0'u8
-  cast[ptr uint8](macHdr + 1)[] = 0
-  cast[ptr uint8](macHdr + 2)[] = 0  # Duration
-  cast[ptr uint8](macHdr + 3)[] = 0
+  hdr.frameControl = 0x00D0'u16
+  hdr.duration = 0
 
   # Copy addresses from sta and vif entries
   # Addr2 (SA) = VIF MAC at vifEntry+80
-  let vifMac = cast[uint](addr vif.macAddr[0])
   # Addr3 (BSSID) = same as DA for infrastructure mode
 
   # MAC address fields start at offsets 4, 10, and 16. Offset 10 is not
   # 32-bit aligned on BL808, so use byte-safe copies instead of word stores.
-  let bssid = cast[uint](addr sta.macAddr[0])
-  template copy6(dst, src: uint) =
-    discard c_memcpy(cast[pointer](dst), cast[pointer](src), 6.csize_t)
-  copy6(macHdr + 4, bssid)                # Addr1 (DA)
-  copy6(macHdr + 10, vifMac)              # Addr2 (SA)
+  discard c_memcpy(addr hdr.addr1[0], addr sta.macAddr[0], 6.csize_t)
+  discard c_memcpy(addr hdr.addr2[0], addr vif.macAddr[0], 6.csize_t)
   let staType = cast[ptr uint8](staEntry + 86)[]
   if staType == 2:
-    copy6(macHdr + 16, vifMac)            # Addr3 = VIF MAC (AP)
+    discard c_memcpy(addr hdr.addr3[0], addr vif.macAddr[0], 6.csize_t)
   else:
-    copy6(macHdr + 16, bssid)             # Addr3 = BSSID
+    discard c_memcpy(addr hdr.addr3[0], addr sta.macAddr[0], 6.csize_t)
 
   let seqField = nextTxSeqCtrl()
-  cast[ptr uint8](macHdr + 22)[] = cast[uint8](seqField and 0xFF)
-  cast[ptr uint8](macHdr + 23)[] = cast[uint8]((seqField shr 8) and 0xFF)
+  hdr.seqCtrl = seqField
 
   # Store staIdx and vifIdx into frame descriptor
-  cast[ptr uint8](frameAddr + 49)[] = staIdx
-  cast[ptr uint8](frameAddr + 47)[] = vifIdx
+  desc.staInfoIdx = staIdx
+  desc.vifIdx = vifIdx
 
   # Clear counters
-  cast[ptr uint8](frameAddr + 98)[] = 0   # extra IE length
-  cast[ptr uint8](frameAddr + 100)[] = 0  # padding
+  desc.hdrLen = 0       # extra IE length
+  desc.secTailLen = 0   # padding
 
   # Read frame control back to compute total header size
-  let fc0 = cast[ptr uint8](macHdr + 0)[]
-  let fc1 = cast[ptr uint8](macHdr + 1)[]
   var hdrLen: uint32 = 24  # standard MAC header
 
   # Management frame protection. For BA action frames the category is 3.
   # The blob only inserts a security header when MFP returns CCMP (1); in that
   # case the BA body starts after the protected-management header extension.
-  let fcVal = fc0.uint32 or (fc1.uint32 shl 8)
-  let mfpResult = mfp_protect_mgmt_frame(frame, fcVal, 3'u32)
+  let mfpResult = mfp_protect_mgmt_frame(frame, hdr.frameControl.uint32, 3'u32)
   if mfpResult == 1:
-    txu_cntrl_protect_mgmt_frame(frame, cast[pointer](macHdr), 24)
-    let secHdrLen = cast[ptr uint8](frameAddr + 98)[]
+    txu_cntrl_protect_mgmt_frame(frame, cast[pointer](hdr), 24)
+    let secHdrLen = desc.hdrLen
     hdrLen += secHdrLen.uint32
 
   # Call appropriate build function based on isAddba
   var bodyLen: uint32 = 0
   if isAddba == 1:
     # Build ADDBA response (blob: me_build_add_ba_rsp at 0x172)
-    let bodyPtr = cast[pointer](macHdr + hdrLen)
+    let bodyPtr = cast[pointer](addr link.macHeader[hdrLen])
     bodyLen = me_build_add_ba_rsp(bodyPtr, cast[pointer](tid.uint),
                                   statusCode, dialogToken, extraFlags.uint16)
   elif isAddba == 0:
     # Build ADDBA request
-    let bodyPtr = cast[pointer](macHdr + hdrLen)
+    let bodyPtr = cast[pointer](addr link.macHeader[hdrLen])
     bodyLen = me_build_add_ba_req(bodyPtr, nil)
   else:
     assert_err("bam.c", "bam.c", 589)
 
   # Compute total payload length
   hdrLen += bodyLen
-  let extraPad = cast[ptr uint8](frameAddr + 100)[]
+  let extraPad = desc.secTailLen
   hdrLen += extraPad.uint32
 
   # Update TX descriptor lengths
-  let txDescPtr = cast[uint](cast[ptr pointer](frameAddr + 112)[])
-  let oldPayLen = cast[ptr uint32](txDescPtr + 20)[]
-  cast[ptr uint32](txDescPtr + 24)[] = oldPayLen + hdrLen - 1
+  let txDesc = hostTxHwDescAt(desc.hwDesc)
+  let oldPayLen = txDesc.payloadStart
+  txDesc.payloadEnd = oldPayLen + hdrLen - 1
   let totalLen = hdrLen + 4  # +4 for FCS
-  cast[ptr uint32](txDescPtr + 28)[] = totalLen
+  txDesc.frameLen = totalLen
 
   # Store TX callback if provided
   if txCallback != nil:
-    cast[ptr pointer](frameAddr + 208)[] = txCallback
-    cast[ptr pointer](frameAddr + 212)[] = cast[pointer](cast[uint](tid))
+    desc.callback = txCallback
+    desc.callbackArg = cast[pointer](cast[uint](tid))
 
   # Push frame to TX with AC=3 (voice), tail call
   txl_frame_push(frame, 3)
@@ -25789,8 +33737,7 @@ proc ps_set_mode*(mode: uint8) {.exportc, cdecl.} =
     volatileStore(cast[ptr uint32](0x24B0004C'u32), r and not 4'u32)
     # PS disable confirm (blob: ps_disable_cfm_handle at 0x9A)
     let vifIdxForDisable = cast[uint8](ps.statusFlags and 0xFF)
-    let vifEntryDisable = cast[pointer](cast[uint](addr vif_info_tab[0]) +
-      vifIdxForDisable.uint * VIF_ENTRY_SIZE.uint)
+    let vifEntryDisable = cast[pointer](vifChannelForIdx(vifIdxForDisable))
     discard ps_disable_cfm_handle(vifEntryDisable)
   else:
     if mode == 2:
@@ -25819,7 +33766,6 @@ proc ps_set_mode*(mode: uint8) {.exportc, cdecl.} =
   var nullFrameQueued: bool = false
   while vifNode != nil:
     let vif = vifChannelAt(vifNode)
-    let vifU = cast[uint](vif)
     # .L47: Check VIF type at offset 86; skip non-STA VIFs.
     if vif.vifType == VIF_TYPE_STA:
       # Check connless at offset 88
@@ -25833,7 +33779,8 @@ proc ps_set_mode*(mode: uint8) {.exportc, cdecl.} =
           if vif.uapsdBitmap != 0:
             ps.psActive = 1
           # Blob: txl_frame_send_null_frame(vif[96], s3=cfmCallback, vifNode)
-          discard txl_frame_send_null_frame(vif.staIdx, cfmCallback, cast[uint32](vifU))
+          discard txl_frame_send_null_frame(vif.staIdx, cfmCallback,
+                                            pointerAddrU32(vifNode))
     # Next VIF: offset 0 is next pointer
     vifNode = vif.next
 
@@ -25844,8 +33791,7 @@ proc ps_set_mode*(mode: uint8) {.exportc, cdecl.} =
   # PS enable/disable completion (blob: ps_enable_cfm_handle at 0x14E or via s3 callback)
   if mode != 0:
     let vifIdxForPs = cast[uint8](ps.statusFlags and 0xFF)
-    let vifEntryForPs = cast[pointer](cast[uint](addr vif_info_tab[0]) +
-      vifIdxForPs.uint * VIF_ENTRY_SIZE.uint)
+    let vifEntryForPs = cast[pointer](vifChannelForIdx(vifIdxForPs))
     ps_enable_cfm_handle(vifEntryForPs)
 
 proc ps_check_beacon*(rxHdr: pointer, unused: uint32, vifEntry: pointer) {.exportc, cdecl.} =
@@ -26001,10 +33947,10 @@ proc ps_check_frame*(rxHdr: pointer, frameFlags: uint32, vifEntry: pointer) {.ex
   let hdr = macDataFrameAt(rxHdr)
   let frameCtrl = hdr.frameControl
 
-  # Check FromDS bit (bit 0 of rxHdr[4])
-  let fromDs = cast[ptr UncheckedArray[uint8]](rxHdr)[4]
-  if (fromDs and 1) != 0:
-    # FromDS set: check if protected frame
+  # Check Addr1 group bit (bit 0 of rxHdr[4])
+  let addr1Group = hdr.addr1[0] and 1'u8
+  if addr1Group != 0:
+    # Group-addressed frame: check if protected frame
     let protectedBit = frameCtrl and 0x2000'u16
     if protectedBit != 0:
       if vif.psOptions != 0:
@@ -26472,7 +34418,7 @@ proc set_mac_to_doze*(): uint32 {.exportc, cdecl.} =
   ctrlReg = ctrlReg or 0x40'u32
   regWrite(MACHW_STATUS_REG, ctrlReg)
   # Read current state from MAC state/control register
-  let curState = regRead(MACHW_STATE_CNTRL_REG) and 0x0F'u32
+  let curState = regRead(MACHW_STATE_CNTRL_REG) and 0x3F'u32
   if curState != 0:
     # MAC not idle - call assert and diagnostic function pointers
     let mmBase = cast[uint](addr mm_env[0])
@@ -26485,7 +34431,7 @@ proc set_mac_to_doze*(): uint32 {.exportc, cdecl.} =
       cast[proc(a0: pointer, line: uint32, file: pointer, param: pointer) {.cdecl.}](diagFn)(
         nil, 287, nil, nil)
   # Set doze-in-progress flag
-  cast[ptr uint32](cast[uint](addr ps_env[0]) + 56)[] = 1
+  psDozeEnvView().dozeInProgress = 1
   # Write DOZE command (0x20) to MAC state register
   regWrite(MACHW_STATE_CNTRL_REG, 0x20'u32)
   return 0
@@ -26497,7 +34443,7 @@ proc wait_mac_goto_idle*(): uint32 {.exportc, cdecl.} =
   ## state register. Polls INTC status bit 2 with timeout (0x4C4B3F iterations).
   ## After poll: reads final state, writes 4 to INTC ack, clears bit 2,
   ## sets bit 31 back. Returns 0 if idle reached, 1 if state non-zero.
-  let curState = regRead(MACHW_STATE_CNTRL_REG) and 0x0F'u32
+  let curState = regRead(MACHW_STATE_CNTRL_REG) and 0x3F'u32
   if curState == 0:
     return 0  # Already idle
   # Clear bit 31 of INTC unmask (offset 0x074)
@@ -26515,7 +34461,7 @@ proc wait_mac_goto_idle*(): uint32 {.exportc, cdecl.} =
   while (status and 0x04'u32) == 0 and macTimeNow() - startTime < timeout:
     status = regRead(MACHW_INTC_BASE + 0x06C'u)
   # Read final state
-  let finalState = regRead(MACHW_STATE_CNTRL_REG) and 0x0F'u32
+  let finalState = regRead(MACHW_STATE_CNTRL_REG) and 0x3F'u32
   # Ack: write 4 to ack register, clear bit 2
   regWrite(MACHW_INTC_BASE + 0x070'u, 0x04'u32)
   unmask = regRead(intcCtrl)
@@ -26532,7 +34478,7 @@ proc wait_mac_goto_prestate*(): uint32 {.exportc, cdecl.} =
   ## From blob (ps.o, 23 instrs): reads saved pre-state byte,
   ## if 0 returns immediately. Shifts left by 4 (into bits [7:4]),
   ## writes to state register, then polls until state[3:0] matches.
-  let preState = cast[ptr uint8](cast[uint](addr ps_env[0]) + 60)[]  # saved pre-state
+  let preState = psDozeEnvView().preState
   if preState == 0:
     return 0
   let targetBits = preState.uint32 shl 4
@@ -26575,7 +34521,7 @@ proc wakeup_from_doze_pre*(): uint32 {.exportc, cdecl.} =
   dozeReg = dozeReg or 0x80000000'u32
   regWrite(MACHW_INTC_BASE + 0x048'u, dozeReg)
   # Clear doze-in-progress
-  cast[ptr uint32](cast[uint](addr ps_env[0]) + 56)[] = 0
+  psDozeEnvView().dozeInProgress = 0
   # Short spin waiting for INTC bit 2
   var spins = 501'u32
   while spins > 0:
@@ -26675,10 +34621,9 @@ proc ps_disable_cfm_handle*(vifEntry: pointer): uint32 {.exportc, cdecl.} =
     # s1[196] = 0  (blob unconditionally)
     vif.keyPsState = 0
     if flagByte != 0:
-      let keU = cast[uint](addr ke_env[0])
-      let oldKe = cast[ptr uint8](keU + 28)[]
-      cast[ptr uint8](keU + 28)[] = oldKe or 1
-      cast[ptr uint8](keU + 32)[] = 1
+      let ps = keEnvPsFlags()
+      ps.flags = ps.flags or 1
+      ps.staPending = 1
       ke_evt_set(0x100'u32)
 
   # .L66
@@ -26865,36 +34810,25 @@ proc ps_send_pspoll*(vifEntry: pointer): uint8 {.exportc, cdecl, noinline.} =
     return 1  # Allocation failed
   # Update TX power
   tpc_update_frame_tx_power(vifEntry, txdesc)
-  let txAddr = cast[uint](txdesc)
-  # Get MAC header pointer from txdesc (offset 0x6c)
-  let macHdr = cast[ptr pointer](txAddr + 0x6C)[]
-  let hdrAddr = cast[uint](macHdr)
+  let desc = hostTxDescAt(txdesc)
+  let hdr = hostTxPsPollHeader(desc)
   # Build PS-Poll frame control (0x00A4)
-  cast[ptr uint8](hdrAddr + 0x15C)[] = 0xA4'u8  # FC low: PS-Poll
-  cast[ptr uint8](hdrAddr + 0x15D)[] = 0x00'u8  # FC high
+  hdr.frameControl = 0x00A4'u16
   # Get STA info for AID and BSSID
   let sta = staInfoForIdx(staIdx)
   let aid = sta.aid
   let aidWithBits = aid or 0xC000'u16  # Set bits 14-15 per 802.11 spec
-  cast[ptr uint8](hdrAddr + 0x15E)[] = (aidWithBits and 0xFF).uint8  # Duration/AID low
-  cast[ptr uint8](hdrAddr + 0x15F)[] = ((aidWithBits shr 8) and 0xFF).uint8  # Duration/AID high
+  hdr.aid = aidWithBits
   # Copy BSSID to Addr1 (6 bytes from sta[4])
-  discard c_memcpy(cast[pointer](hdrAddr + 0x160),
-                   cast[pointer](addr sta.macAddr[0]), 6.csize_t)
+  discard c_memcpy(addr hdr.bssid[0], addr sta.macAddr[0], 6.csize_t)
   # Copy own MAC to Addr2 (6 bytes from vif[0x50])
-  discard c_memcpy(cast[pointer](hdrAddr + 0x166),
-                   cast[pointer](addr vif.macAddr[0]), 6.csize_t)
+  discard c_memcpy(addr hdr.transmitterAddr[0], addr vif.macAddr[0], 6.csize_t)
   # Set TX control flags in SW descriptor
-  let swDesc = cast[ptr pointer](txAddr + 0x70)[]
-  let swAddr = cast[uint](swDesc)
-  var ctrl = cast[ptr uint32](swAddr + 0x3C)[]
-  ctrl = ctrl or 0x10000053'u32
-  cast[ptr uint32](swAddr + 0x3C)[] = ctrl
+  let hwDesc = hostTxHwDescAt(desc.hwDesc)
+  hwDesc.controlFlags = hwDesc.controlFlags or 0x10000053'u32
   # Copy rate info from STA
-  let rateIdx = sta.instNbr
-  cast[ptr uint8](txAddr + 0x2F)[] = rateIdx
-  let rateFmt = sta.infoIdx
-  cast[ptr uint8](txAddr + 0x31)[] = rateFmt
+  desc.vifIdx = sta.instNbr
+  desc.staInfoIdx = sta.infoIdx
   # Push frame for transmission
   txl_frame_push(txdesc, 3)  # AC_VO = 3
   return 0
@@ -27040,8 +34974,8 @@ proc td_timer_end*(tdEntry: pointer) {.exportc, cdecl.} =
   td.clearTrafficCounters()
 
   # Compute VIF active status and reschedule timer
-  let vifBase = cast[uint](addr vif_info_tab[0]) + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let vifConnected = vifChannelAt(vifBase).chanCtxt
+  let vif = vifChannelForIdx(vifIdx)
+  let vifConnected = vif.chanCtxt
   # Check if connection is active (blob: compares vif[64] with a global)
   let isActive = (vifConnected != nil).uint8
   td.endActive = isActive
@@ -27071,7 +35005,7 @@ proc phyif_utils_decode*(rxvec: pointer, rssi: ptr int8): uint32 {.exportc, cdec
     rssi[] = cast[int8](scaled and 0xFF)
   else:
     # Slow path: word0-based computation with float math
-    let mcsField = (word0 shr 2) and 0x0F'u32  # extract from custom insn
+    let mcsField = (word0 shr 2) and 0x3F'u32  # extract from custom insn
     if mcsField > 3:
       # Use bytes 19-20 path anyway (fallback)
       let scaled = rxv.rssiRaw.int32 div 122
@@ -27093,22 +35027,19 @@ proc phyif_utils_decode*(rxvec: pointer, rssi: ptr int8): uint32 {.exportc, cdec
 proc ipc_emb_msg_push*(msgDescPtr: pointer) {.exportc, cdecl.} =
   if msgDescPtr == nil:
     return
-  let msgDesc = cast[ptr IpcEmbMsgDescView](msgDescPtr)
-  let sharedBase = cast[uint](addr ipcSharedEnv[0])
+  let msg = cast[ptr IpcEmbMsgEnvelopeView](msgDescPtr)
+  let msgDesc = addr msg.desc
+  let shared = cast[ptr IpcSharedMsgView](addr ipcSharedEnv[0])
   # Mirror layout used by ipc_emb_msg_evt on the receive (host→emb) side:
   #   ipc_shared_env[4..5] = id, [6] = dst, [7] = src, [8..11] = paramLen,
   #   [12..] = payload words.
-  cast[ptr uint16](sharedBase + 4)[] = msgDesc.id
-  cast[ptr uint8](sharedBase + 6)[] = msgDesc.dstId
-  cast[ptr uint8](sharedBase + 7)[] = msgDesc.srcId
-  cast[ptr uint32](sharedBase + 8)[] = msgDesc.paramLen
+  shared.id = msgDesc.id
+  shared.dstId = msgDesc.dstId
+  shared.srcId = msgDesc.srcId
+  shared.paramLen = msgDesc.paramLen
   # Copy payload words from after the 8-byte header.
-  let paySrc = cast[uint](msgDescPtr) + IpcEmbMsgDescViewSize.uint
-  var cursor: uint32 = 0
-  while cursor < msgDesc.paramLen:
-    let v = cast[ptr uint32](paySrc + cursor.uint)[]
-    cast[ptr uint32](sharedBase + 12'u + cursor.uint)[] = v
-    cursor += 4
+  copyIpcPayloadWords(addr shared.payload[0], addr msg.payload[0],
+                      msgDesc.paramLen)
   # Raise host-side IpcIrqE2aMsgAck (= 1<<2). The chip's emb→app trigger
   # register is at 0x24800100.
   regWrite(0x24800100'u, 1'u32 shl 2)
@@ -27134,10 +35065,10 @@ proc ipc_emb_init*() {.exportc, cdecl.} =
   # Stash shared-memory ring-cursor pointers at offsets 12 and 16 of
   # ipc_emb_env. Blob writes &ipc_shared_env[0x24cc] and [0x24d4] here —
   # two cursor slots near the end of the shared region used by TX/msg rings.
-  let base = cast[uint](addr ipcEmbEnvStruct[0])
-  let sharedBase = cast[uint](addr ipcSharedEnv[0])
-  cast[ptr pointer](base + 12)[] = cast[pointer](sharedBase + 0x24cc'u)
-  cast[ptr pointer](base + 16)[] = cast[pointer](sharedBase + 0x24d4'u)
+  let env = ipcEmbEnvView()
+  let shared = ipcSharedEnvView()
+  env.hostTxList = addr shared.hostTxListCursor
+  env.hostTxCfmList = addr shared.hostTxCfmCursor
 
   # Verify IPC magic value at 0x24800140
   let magic = regRead(IPC_EMB_MAGIC_REG)
@@ -27264,7 +35195,7 @@ proc ipc_emb_tx_evt*(ac: uint32) {.exportc, cdecl.} =
   ## from ipc_emb_env[12], for each: checks BCN flag (bit 13) and flow control.
   ## Sets up DMA pointers, clears status fields, inits confirm list, marks active.
   ## Advances list. On empty: acks IPC. On flow control: tail-calls backup handler.
-  let ipcEnvBase = cast[uint](addr ipcEmbEnvStruct[0])
+  let env = ipcEmbEnvView()
   # Blob: custom insn extracts AC index, then log if non-zero
   if ac != 0:
     let logFn = getLogFunc(0xCC)
@@ -27279,12 +35210,11 @@ proc ipc_emb_tx_evt*(ac: uint32) {.exportc, cdecl.} =
   # Load descriptor list and BCN flag
   let isBcn = (eventMask and 0x2000'u32) != 0
   # Deref list head -> first descriptor
-  let listHeadPtr = cast[ptr pointer](ipcEnvBase + 12)[]
-  var descPtr = cast[ptr pointer](cast[uint](listHeadPtr))[]
-  nimFwTrace2U32("[WIFI-NIMFW] ipc_tx_evt ", ac, cast[uint32](cast[uint](descPtr)))
-  while descPtr != nil:
-    let descAddr = cast[uint](descPtr)
-    let txDesc = hostTxDescAt(cast[pointer](descAddr + 12))
+  var wrapper = ipcHostTxHead(env)
+  nimFwTrace2U32("[WIFI-NIMFW] ipc_tx_evt ", ac, pointerAddrU32(cast[pointer](wrapper)))
+  var drained = 0'u32
+  while drained < WifiIpcTxDrainLimit and wrapper != nil:
+    let txDesc = addr wrapper.txDesc
     let ethTypeTrace = txDesc.frameLen
     let pktLenTrace = txDesc.seqPassthrough
     let traceIpc = nimFwDbgIpcTxTraceCount < 16'u32 or
@@ -27310,29 +35240,34 @@ proc ipc_emb_tx_evt*(ac: uint32) {.exportc, cdecl.} =
     # Write IPC TX status acknowledgement (blob: sw s7,264(s6) at 0xd0)
     volatileStore(cast[ptr uint32](0x24800108'u), 256'u32)
     # Set up DMA descriptor chain fields (blob at 0xd4-0xe2)
-    cast[ptr uint32](descAddr + 128)[] = cast[uint32](descAddr + 200)  # agg desc ptr
-    cast[ptr uint32](descAddr + 124)[] = cast[uint32](descAddr + 128)  # first desc ptr
+    txDesc.aggDescPtr = cast[uint32](cast[uint](addr txDesc.aggDescStorage[0]))
+    txDesc.hwDesc = cast[pointer](addr txDesc.aggDescPtr)
     # Clear status fields (blob at 0xe2-0xf6)
-    cast[ptr uint32](descAddr + 100)[] = 0    # TX status
-    cast[ptr uint32](descAddr + 116)[] = 0    # TX timestamp
-    cast[ptr uint32](descAddr + 216)[] = 0    # cfm status
-    cast[ptr uint32](descAddr + 172)[] = 0    # retry count
-    cast[ptr uint32](descAddr + 176)[] = 0    # lifetime
-    cast[ptr uint32](descAddr + 180)[] = 0    # flags
+    txDesc.policy = nil
+    txDesc.dmaLink = nil
+    txDesc.cfmStatus = 0
+    txDesc.retryCount = 0
+    txDesc.lifetime = 0
+    txDesc.txFlags = 0
     # CRITICAL: Push descriptor to TX queue via txu_cntrl_push (blob at 0x100).
     # The blob explicitly loads a1=0 before this call; txu_cntrl_push reads a1
     # as the access-category argument even though the C ABI only exposes a0.
-    let txParam = cast[pointer](descAddr + 12)
+    let txParam = cast[pointer](txDesc)
     {.emit: ["asm volatile(\"mv a1, zero\" ::: \"a1\", \"memory\");"].}
     txu_cntrl_push(txParam)
     # Mark descriptor as active (blob: sw s8,8(s0) where s8=1)
-    cast[ptr uint32](descAddr + 8)[] = 1
+    wrapper.active = 1
     # Pop from IPC list (blob: utils_list_pop_front at 0x110)
-    let listPtr = cast[ptr pointer](ipcEnvBase + 12)[]
-    discard utils_list_pop_front(cast[ptr CoList](listPtr))
+    discard utils_list_pop_front(env.hostTxList)
     # Reload and loop
-    let listReload = cast[ptr pointer](ipcEnvBase + 12)[]
-    descPtr = cast[ptr pointer](cast[uint](listReload))[]
+    wrapper = ipcHostTxHead(env)
+    inc drained
+  if wrapper != nil:
+    inc nimFwDbgIpcTxYield
+    nimFwDbgIpcTxYieldAc = ac
+    nimFwDbgIpcTxYieldHead = pointerAddrU32(cast[pointer](wrapper))
+    ke_evt_set(eventMask)
+    return
   # No more descriptors: write 256 to IPC completion register (blob at 0x86)
   volatileStore(cast[ptr uint32](0x2480010C'u), 256'u32)
 
@@ -27381,8 +35316,8 @@ proc ipc_emb_msg_evt*() {.exportc, cdecl.} =
   ## signals the MACHW event, and dispatches via ke_msg_send.
   const
     IPC_MSG_BIT = 2'u32  # bit 1 in IPC status for messages
-  let sharedBase = cast[uint](addr ipcSharedEnv[0])
-  let envBase = cast[uint](addr ipcEmbEnvStruct[0])
+  let shared = cast[ptr IpcSharedMsgView](addr ipcSharedEnv[0])
+  let env = ipcEmbEnvView()
   var ipcStatus = regRead(0x24800104'u)
   var drained = 0'u32
   while drained < WifiIpcMsgDrainLimit and ipcMessagePending(ipcStatus, IPC_MSG_BIT):
@@ -27390,9 +35325,9 @@ proc ipc_emb_msg_evt*() {.exportc, cdecl.} =
     # Ack the msg bit (0x24800108) before processing.
     regWrite(0x24800108'u, IPC_MSG_BIT)
     # Read message metadata directly from ipc_shared_env (NOT via a pointer).
-    let msgId = cast[ptr uint16](sharedBase + 4)[]
-    let msgDst = cast[ptr uint8](sharedBase + 6)[]
-    let msgParamLen = cast[ptr uint32](sharedBase + 8)[]
+    let msgId = shared.id
+    let msgDst = shared.dstId
+    let msgParamLen = shared.paramLen
     # Platform allocator at g_bl_ops_funcs[184]: takes total byte count
     # (paramLen + sizeof(KeMsgHdr) for the ke_msg_hdr prefix), returns the new header.
     # Blob: `lw a5, 184(s6); addi a0, a0, 12; jalr a5` with a0 = paramLen.
@@ -27411,17 +35346,12 @@ proc ipc_emb_msg_evt*() {.exportc, cdecl.} =
     hdr.paramLen = msgParamLen
     # Copy payload word-by-word from ipc_shared_env+12 into the typed ke_msg
     # payload area, matching the vendor IPC word-copy behavior.
-    let payloadBase = cast[uint](keMsgPayload(hdr))
-    var cursor: uint32 = 0
-    while cursor < msgParamLen:
-      let srcWord = cast[ptr uint32](sharedBase + 12'u + cursor.uint)[]
-      cast[ptr uint32](payloadBase + cursor.uint)[] = srcWord
-      cursor += 4
+    copyIpcPayloadWords(keMsgPayload(hdr), addr shared.payload[0], msgParamLen)
     # Advance per-message counter (stored at ipc_emb_env[0]) and stamp it
     # into the srcId-adjacent slot at ipc_shared_env[7].
-    let counter = cast[ptr uint8](envBase)[]
-    cast[ptr uint8](sharedBase + 7)[] = counter
-    cast[ptr uint8](envBase)[] = counter + 1
+    let counter = env.counter
+    shared.srcId = counter
+    env.counter = counter + 1
     # Validate destination task id (blob: two chained assertions; msgDst
     # must be in [0, 8]; > 10 asserts at line 127, > 8 asserts at line 503).
     let dstCheck = hdr.destId
@@ -27457,10 +35387,9 @@ proc ipc_emb_txcfm*(desc: pointer) {.exportc, cdecl.} =
   ## From blob (5 instrs): a1 = desc - 12, loads ipc_emb_env[16] into a0,
   ## tail-calls utils_list_push_back(host_tx_cfm_list, desc-12). The element is
   ## the host wrapper node, not a lower-MAC txl_cfm_env descriptor.
-  let elem = cast[ptr CoListHdr](cast[uint](desc) - 12)
-  let ipcEnvBase = cast[uint](addr ipcEmbEnvStruct[0])
-  let listPtr = cast[ptr pointer](ipcEnvBase + 16)[]
-  utils_list_push_back(cast[ptr CoList](listPtr), elem)
+  let wrapper = ipcHostTxWrapperFromDesc(hostTxDescAt(desc))
+  let env = ipcEmbEnvView()
+  utils_list_push_back(env.hostTxCfmList, addr wrapper.link)
 
 proc ipc_emb_txcfm_ind*(acBit: uint32 = 0) {.exportc, cdecl, noinline.} =
   ## TX confirmation indication to host.
@@ -27542,6 +35471,8 @@ proc bl_irq_handler*() {.exportc, cdecl.} =
   ke_evt_set(0x80'u32)
   ipc_emb_notify(0'u32)
 
+proc wifiMainHasPendingWork(): bool
+
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void bl_sleep_schedule(void);".}
 proc bl_sleep_schedule*() {.exportc, cdecl.} =
   ## Schedule sleep check (68 instrs in blob).
@@ -27561,7 +35492,9 @@ proc bl_sleep_schedule*() {.exportc, cdecl.} =
   let pmState = wifi_hosal_pm_state_run()
   var newState: uint32
 
-  if pmState != 0:
+  if wifiMainHasPendingWork():
+    newState = 0
+  elif pmState != 0:
     # Can sleep: clear state
     napScheduleState = 0
     newState = 0
@@ -27903,37 +35836,37 @@ proc setKey(vifIdx: uint8, a1Byte: uint8, keyIdxOrPairwise: uint8,
   ##   +55  = cipher (raw)
   var buf {.noinit.}: array[56, uint8]
   discard c_memset(addr buf[0], 0, 56.csize_t)
-  buf[53] = vifIdx
-  buf[1]  = a1Byte
-  buf[55] = cipher
+  let req = cast[ptr SupplicantKeyParamView](addr buf[0])
+  req.keyIdx = vifIdx
+  req.keyType = a1Byte
+  req.rawCipher = cipher
   if cipher == 0:
-    buf[1] = 0xFF'u8
-  buf[0] = keyIdxOrPairwise
-  # Optional macAddr memcpy (AP caller passes NULL; STA caller passes BSSID)
+    req.keyType = 0xFF'u8
+  req.addrIdx = keyIdxOrPairwise
   if macAddr != nil:
-    discard c_memcpy(addr buf[44], macAddr, macLen.csize_t)
-    buf[40] = macLen
-  # Key data memcpy
-  buf[4] = keyLen
-  discard c_memcpy(addr buf[8], keyData, keyLen.csize_t)
-  # Cipher translation
+    discard c_memcpy(addr req.macAddr[0], macAddr, macLen.csize_t)
+    req.macLen = macLen
+  req.keyLen = keyLen
+  discard c_memcpy(addr req.keyData[0], keyData, keyLen.csize_t)
   if keyLen == 16:
-    buf[52] = 2  # CCMP
+    req.translatedCipher = 2  # CCMP
   elif keyLen == 32:
     # TKIP: swap MIC key halves at buf[24..31] ↔ buf[32..39]
-    let w0a = cast[ptr uint32](addr buf[24])[]
-    let w1a = cast[ptr uint32](addr buf[28])[]
-    let w0b = cast[ptr uint32](addr buf[32])[]
-    let w1b = cast[ptr uint32](addr buf[36])[]
-    cast[ptr uint32](addr buf[24])[] = w0b
-    cast[ptr uint32](addr buf[28])[] = w1b
-    cast[ptr uint32](addr buf[32])[] = w0a
-    cast[ptr uint32](addr buf[36])[] = w1a
-    buf[52] = 1  # TKIP
+    let tkip = supplicantTkipKeyData(req)
+    let micTx = tkip.micTx
+    tkip.micTx = tkip.micRx
+    tkip.micRx = micTx
+    req.translatedCipher = 1  # TKIP
   elif keyLen == 13:
-    buf[52] = 3  # WEP-104
+    req.translatedCipher = 3  # WEP-104
   elif keyLen == 5:
-    buf[52] = 0  # WEP-40
+    req.translatedCipher = 0  # WEP-40
+  nimFwDbgSetKey0 = req.addrIdx.uint32 or (req.keyType.uint32 shl 8) or
+    (req.keyLen.uint32 shl 16) or (req.macLen.uint32 shl 24)
+  nimFwDbgSetKey1 = req.translatedCipher.uint32 or (req.keyIdx.uint32 shl 8) or
+    (req.spp.uint32 shl 16) or (req.rawCipher.uint32 shl 24)
+  nimFwDbgSetKey2 = pointerAddrU32(keyData)
+  nimFwDbgSetKey3 = pointerAddrU32(macAddr)
   mm_sec_machwkey_wr(addr buf[0])
 
 proc bl_wifi_set_ap_key_internal*(param: pointer) {.exportc, cdecl.} =
@@ -27981,34 +35914,34 @@ proc bl_wifi_set_ap_key_internal*(param: pointer) {.exportc, cdecl.} =
            keyData_arg, keyLen_arg.uint8,   # keyData, keyLen
            cipher_arg.uint8)                # cipher
 
-proc bl_wifi_set_sta_key_internal*(vifIdx: uint8, macAddr: pointer, pairwise: uint8,
-    keyIdx: uint8, keyLen: uint8, keyData: pointer, cipher: uint8,
-    seqData: pointer, seqLen: uint8) {.exportc, cdecl.} =
+proc bl_wifi_set_sta_key_internal*(vifIdx: uint8, staIdx: uint8, alg: uint32,
+    keyIdx: int32, setTx: int32, seqData: pointer, seqLen: csize_t,
+    keyData: pointer, keyLen: csize_t, pairwise: bool): cint {.exportc, cdecl.} =
   ## Set STA encryption key (83 instrs).
-  ## Blob call: set_key.constprop.0(vifIdx, macAddrByte, pairwise, macAddr,
-  ##                                macLen=6, keyData, keyLen, cipher),
+  ## Blob call: set_key.constprop.0(vifIdx, staIdx, keyIdx, seq, seqLen,
+  ##                                keyData, keyLen, pairwise),
   ##            sm_get_set_machwkey_index(0, vifIdx, &status, keyType).
-  ## Pair-wise vs group selection is via the pairwise byte at buffer +0;
-  ## STA path stores BSSID via macAddr memcpy at +44.
-  let macByte = if macAddr != nil: cast[ptr uint8](macAddr)[] else: 0'u8
+  discard setTx
+  let pairwiseByte = if pairwise: 1'u8 else: 0'u8
   setKey(vifIdx,
-         macByte,                       # a1Byte = low byte of macAddr
-         pairwise,                      # keyIdxOrPairwise = pairwise for STA
-         macAddr, 6'u8,                 # macAddr ptr + macLen=6
-         keyData, keyLen,               # keyData, keyLen
-         cipher)                        # cipher
+         staIdx,                        # a1Byte = STA index / key type
+         keyIdx.uint8,                  # key index / VIF key slot selector
+         seqData, seqLen.uint8,         # replay counter / PN seed
+         keyData, keyLen.uint8,         # keyData, keyLen
+         pairwiseByte)                  # 0 => default/group key path
   # Blob: sm_get_set_machwkey_index(0, vifIdx, &status_byte, keyType)
   var statusByte: uint8 = 0
-  let keyType: uint32 = if pairwise == 0: 1 else: 0
+  let keyType: uint32 = if pairwiseByte == 0: 1 else: 0
   discard sm_get_set_machwkey_index(0, vifIdx.uint32,
     cast[pointer](addr statusByte), keyType)
   # Log the operation via g_bl_ops_funcs[204]
   let logFnPtr = getLogFunc(204)
   if logFnPtr != nil:
     let logFn = cast[PlatformLogFunc](logFnPtr)
-    logFn(1, 0, nil, 211, vifIdx.uint32, pairwise.uint32)
-    logFn(1, 0, nil, 212, keyLen.uint32, keyIdx.uint32, cipher.uint32)
+    logFn(1, 0, nil, 211, vifIdx.uint32, pairwiseByte.uint32)
+    logFn(1, 0, nil, 212, keyLen.uint32, keyIdx.uint32, alg)
     logFn(1, 0, nil, 213)
+  return 0
 
 proc bl_wifi_set_igtk_internal*(vifIdx: uint8, macAddr: pointer, keyIdx: uint8,
     keyData: pointer, keyLen: uint8) {.exportc, cdecl.} =
@@ -28028,25 +35961,26 @@ proc bl_wifi_set_igtk_internal*(vifIdx: uint8, macAddr: pointer, keyIdx: uint8,
   ##   Then calls mm_sec_machwaddr_wr with address setup.
   ##   Logs via g_bl_ops_funcs[204], returns 0.
   var keyBuf {.noinit.}: array[96, uint8]
-  let bufAddr = cast[uint](addr keyBuf[0])
+  let stack = cast[ptr IgtkKeyWriteStackView](addr keyBuf[0])
+  let req = addr stack.req
   # Clear buffer
-  discard c_memset(cast[pointer](bufAddr + 40), 0, 56.csize_t)
+  discard c_memset(cast[pointer](req), 0, sizeof(MachwKeyWriteParamView).csize_t)
   # Set up key parameters
-  cast[ptr uint8](bufAddr + 41)[] = 0xFF  # broadcast
-  cast[ptr uint8](bufAddr + 92)[] = 5     # IGTK type
-  cast[ptr uint8](bufAddr + 93)[] = vifIdx
-  cast[ptr uint8](bufAddr + 40)[] = keyIdx
-  cast[ptr uint8](bufAddr + 44)[] = 16    # 16-byte key
+  req.keyType = 0xFF'u8  # broadcast
+  req.cipherType = 5     # IGTK type
+  req.keyIdx = vifIdx
+  req.addrIdx = keyIdx
+  req.keyLen = 16        # 16-byte key
   # Copy 16-byte key data
-  discard c_memcpy(cast[pointer](bufAddr + 48), keyData, 16.csize_t)
+  discard c_memcpy(addr req.keyWords[0], keyData, 16.csize_t)
   # Set address type and copy MAC address
-  cast[ptr uint8](bufAddr + 80)[] = 6
-  discard c_memcpy(cast[pointer](bufAddr + 84), macAddr, 6.csize_t)
+  req.macLen = 6
+  discard c_memcpy(addr req.macAddr[0], macAddr, 6.csize_t)
   # Write IGTK to MAC HW
-  mm_sec_machwkey_wr(cast[pointer](bufAddr + 40))
+  mm_sec_machwkey_wr(cast[pointer](req))
   # Get/set MAC HW key index (blob: sm_get_set_machwkey_index)
-  let resultByte = cast[ptr uint8](bufAddr + 39)[]
-  discard sm_get_set_machwkey_index(0, vifIdx.uint32, cast[pointer](bufAddr + 40), 5)
+  let resultByte = stack.resultByte
+  discard sm_get_set_machwkey_index(0, vifIdx.uint32, cast[pointer](req), 5)
   # Log the operation
   let logFnPtr = getLogFunc(204)
   if logFnPtr != nil:
@@ -28116,8 +36050,8 @@ proc bl_wifi_get_assoc_bssid_internal*(vifIdx: uint8, output: pointer): cint {.e
   let vifEntry = vif_mgmt_get_vif(vifIdx)
   if vifEntry == nil:
     return -1
-  let bssidSrc = cast[pointer](cast[uint](vifEntry) + 380)
-  discard c_memcpy(output, bssidSrc, 6)
+  let vif = vifChannelAt(vifEntry)
+  discard c_memcpy(output, addr vif.bssid[0], 6.csize_t)
   return 0
 
 proc bl_wifi_get_hostap_private_internal*(): pointer {.exportc, cdecl.} =
@@ -28218,8 +36152,6 @@ proc mfp_ignore_mgmt_frame*(param: pointer): bool {.exportc, cdecl.} =
   # T-Head custom insn extracts subtype field; we use standard shift/mask
   let subtypeField = (frameCtrl shr 4) and 0x0F'u16
   let isRobust = mfp_is_robust_frame(frameCtrl.uint32, subtypeField.uint32)
-  let frameEnd = cast[uint](frameBodyPtr) + bodyOff.uint
-
   if not isRobust:
     # Blob returns immediately for ordinary management frames without
     # touching the caller's acceptance byte.
@@ -28236,9 +36168,9 @@ proc mfp_ignore_mgmt_frame*(param: pointer): bool {.exportc, cdecl.} =
       outFlagPtr[] = 0
     return false
 
-  # Compute VIF entry and check security context
-  let vifEntryBase = cast[uint](addr vif_info_tab[0]) + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let keyPtrs = vifKeyPointersAt(vifEntryBase)
+  # Check VIF security context.
+  let vif = vifChannelForIdx(vifIdx)
+  let keyPtrs = vifKeyPointers(vif)
   let secCtxPtr = keyPtrs.groupKeyPtr
   if secCtxPtr == 0:
     if outFlagPtr != nil:
@@ -28257,7 +36189,7 @@ proc mfp_ignore_mgmt_frame*(param: pointer): bool {.exportc, cdecl.} =
 
     # Compute IE search region: body starts at frame_body + bodyOff + 2, length = frameTotalLen - bodyOff - 2
     let ieSearchLen = frameTotalLen.int - bodyOff.int - 2
-    let ieSearchStart = cast[pointer](cast[uint](frameBodyPtr) + bodyOff.uint + 2)
+    let ieSearchStart = ieCursorAfter(frameBodyPtr, bodyOff.uint + 2)
 
     # Find MMIE (IE_ID=76) in the frame
     let mmiePtr = mac_ie_find(ieSearchStart, ieSearchLen.uint32, 76)
@@ -28266,13 +36198,11 @@ proc mfp_ignore_mgmt_frame*(param: pointer): bool {.exportc, cdecl.} =
         outFlagPtr[] = 0
       return false
 
-    let mmieU = cast[uint](mmiePtr)
+    let mmie = mmieAt(mmiePtr)
     # MMIE structure: [0]=IE_ID(76), [1]=len(16), [2..3]=keyID, [4..9]=IPN, [10..17]=MIC
     # Blob: reads keyID from MMIE[2..3] as LE16, checks (keyID - 4) <= 1
     # Valid MMIE keyIDs are 4 and 5 (IGTK key slots)
-    let keyIdLo = cast[ptr uint8](mmieU + 2)[]
-    let keyIdHi = cast[ptr uint8](mmieU + 3)[]
-    let keyId = keyIdLo.uint16 or (keyIdHi.uint16 shl 8)
+    let keyId = mmie.keyId
     if (keyId - 4) > 1:
       if outFlagPtr != nil:
         outFlagPtr[] = 0
@@ -28281,23 +36211,23 @@ proc mfp_ignore_mgmt_frame*(param: pointer): bool {.exportc, cdecl.} =
     # Look up IGTK key in VIF entry: offset 160 * keyIdAdj + sec base + 683
     # Blob: li a5,160; madd a5,s8,s3,a5 -> offset = keyIdAdj * 160 + vifBase + 683
     let keyIdAdj = keyId - 4  # 0 or 1
-    if vifKeySlotAt(vifEntryBase, keyIdAdj.uint).installed == 0:
+    if vifKeySlot(vif, keyIdAdj.uint).installed == 0:
       if outFlagPtr != nil:
         outFlagPtr[] = 0
       return false
 
     # Extract IPN (6 bytes) from MMIE[4..9]
-    let ipnLo = cast[ptr uint8](mmieU + 5)[].uint16 or (cast[ptr uint8](mmieU + 4)[].uint16 shl 8)
-    let ipnMid = cast[ptr uint8](mmieU + 7)[].uint16 or (cast[ptr uint8](mmieU + 6)[].uint16 shl 8)
-    let ipnByte4 = cast[ptr uint8](mmieU + 8)[].uint32
-    let ipnByte5 = cast[ptr uint8](mmieU + 9)[].uint32
+    let ipnLo = mmie.ipn[1].uint16 or (mmie.ipn[0].uint16 shl 8)
+    let ipnMid = mmie.ipn[3].uint16 or (mmie.ipn[2].uint16 shl 8)
+    let ipnByte4 = mmie.ipn[4].uint32
+    let ipnByte5 = mmie.ipn[5].uint32
 
     # Build 48-bit IPN as two 32-bit words
     let ipnW0 = ipnLo.uint32 or (ipnMid.uint32 shl 16)
     let ipnW1 = ipnByte4 or (ipnByte5 shl 8)
 
     # Compare against stored IPN at VIF secCtx offsets 528/532
-    let bipKey = vifKeySlotAt(vifEntryBase, 0)
+    let bipKey = vifKeySlot(vif, 0)
     let storedIpnLo = bipKey.replayCounters[0].pnLow
     let storedIpnHi = bipKey.replayCounters[0].pnHigh
 
@@ -28321,8 +36251,9 @@ proc mfp_ignore_mgmt_frame*(param: pointer): bool {.exportc, cdecl.} =
       cast[pointer](bipKey),  # IGTK key at vif+528
       frameBodyPtr, frameTotalLen, bodyOff.uint32)
     # Compare 8-byte MIC at MMIE[10..17]
-    let expectedMicLo = cast[ptr uint32](mmieU + 10)[]
-    let expectedMicHi = cast[ptr uint32](mmieU + 14)[]
+    let expectedMic = mmieMicWords(mmie)
+    let expectedMicLo = expectedMic[0]
+    let expectedMicHi = expectedMic[1]
     let resultLo = (micResult and 0xFFFFFFFF'u64).uint32
     let resultHi = (micResult shr 32).uint32
     if resultLo != expectedMicLo or resultHi != expectedMicHi:
@@ -28363,7 +36294,7 @@ proc mfp_protect_mgmt_frame*(frameDesc: pointer, fc: uint32, action: uint32 = 0)
   ## Blob (110 bytes, 41 instrs, mfp.c.o):
   ##   a0 = frameDesc, a1 = fc, a2 = action category
   ##   vifIdx = frameDesc[47]
-  ##   secCtx = vif_info_tab[vifIdx].secCtx (at +1492)
+  ##   secCtx = vif_info_tab[vifIdx].secCtx (at +1484)
   ##   if secCtx == NULL: return 0
   ##   if !mfp_is_robust_frame(fc, action): return 0
   ##   staIdx = frameDesc[49]
@@ -28371,16 +36302,15 @@ proc mfp_protect_mgmt_frame*(frameDesc: pointer, fc: uint32, action: uint32 = 0)
   ##   if (sta_info_tab[staIdx].flags308 & 1) == 0: return 2  # no PMF cap → BIP
   ##   return CCMP_from_vif_crypto (via T-Head bit extract on sta[308])
   {.emit: ["asm volatile(\"\" ::: \"memory\");"].}
-  let fd = cast[ptr UncheckedArray[uint8]](frameDesc)
-  let vifIdx = fd[47]
-  let vifBase = cast[uint](addr vif_info_tab[0])
-  let vifEntry = vifBase + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let secCtx = cast[pointer](vifKeyPointersAt(vifEntry).groupKeyPtr)
+  let desc = hostTxDescAt(frameDesc)
+  let vifIdx = desc.vifIdx
+  let vif = vifChannelForIdx(vifIdx)
+  let secCtx = cast[pointer](vifKeyPointers(vif).groupKeyPtr)
   if secCtx == nil:
     return 0
   if not mfp_is_robust_frame(fc, action):
     return 0
-  let staIdx = fd[49]
+  let staIdx = desc.staInfoIdx
   if staIdx == 0xFF:
     return 2
   let sta = staInfoForIdx(staIdx)
@@ -28393,24 +36323,21 @@ proc mfp_add_mgmt_mic*(frameDesc: pointer, bodyLen: uint32, totalLen: uint32): u
   ## From blob (86 instrs): builds MMIE with IE_ID=76, length=16.
   ## Contains key ID, IPN (packet number), and 8-byte MIC via AES-CMAC.
   ## Returns 18 (MMIE size) or 0 if no security context.
-  let fd = cast[ptr UncheckedArray[uint8]](frameDesc)
-  let vifIdx = fd[47]
-  let vifBase = cast[uint](addr vif_info_tab[0])
-  let vifEntry = vifBase + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  # Check security context at VIF+1492
-  let secCtx = cast[pointer](vifKeyPointersAt(vifEntry).groupKeyPtr)
+  let desc = hostTxDescAt(frameDesc)
+  let vifIdx = desc.vifIdx
+  # Check security context at VIF+1484
+  let vif = vifChannelForIdx(vifIdx)
+  let secCtx = cast[pointer](vifKeyPointers(vif).groupKeyPtr)
   if secCtx == nil:
     return 0
   let sec = cast[ptr VifKeySlotView](secCtx)
   # Compute MMIE write position: frameDesc body + bodyLen
-  let mmiePos = cast[uint](frameDesc) + bodyLen
-  let mmie = cast[ptr UncheckedArray[uint8]](mmiePos)
+  let mmie = mmieAt(ieCursorAfter(frameDesc, bodyLen.uint))
   # Write MMIE header
-  mmie[0] = 76   # MMIE IE ID
-  mmie[1] = 16   # length
+  mmie.ie.id = 76   # MMIE IE ID
+  mmie.ie.len = 16  # length
   # Key ID from sec_ctx+153
-  mmie[2] = sec.staIdx
-  mmie[3] = 0
+  mmie.keyId = sec.staIdx.uint16
   # Copy and increment IPN (6 bytes from sec_ctx+128..133)
   let ipnLo = sec.pnLow
   let ipnHi = sec.pnHigh
@@ -28426,11 +36353,12 @@ proc mfp_add_mgmt_mic*(frameDesc: pointer, bodyLen: uint32, totalLen: uint32): u
         ((newIpnLo shr (idx * 8)) and 0xFF).uint8
       else:
         ((newIpnHi shr ((idx - 4) * 8)) and 0xFF).uint8
-    mmie[4 + idx] = ipnByte
+    mmie.ipn[idx.int] = ipnByte
     inc idx
   # Clear MIC area and nonce — blob inlines two zero-word stores.
-  cast[ptr uint32](mmiePos + 10)[] = 0
-  cast[ptr uint32](mmiePos + 14)[] = 0
+  let micWords = mmieMicWords(mmie)
+  micWords[0] = 0
+  micWords[1] = 0
   # Compute BIP MIC using mfp_compute_bip
   # Blob passes secCtx directly as key (IGTK at start of sec context)
   let mic = mfp_compute_bip(secCtx, frameDesc, bodyLen + 18, 24)
@@ -28440,13 +36368,13 @@ proc mfp_add_mgmt_mic*(frameDesc: pointer, bodyLen: uint32, totalLen: uint32): u
   var micV {.volatile.}: uint64 = mic
   idx = 0
   while idx < 4:
-    mmie[10 + idx] = ((micV shr (idx * 8)) and 0xFF'u64).uint8
+    mmie.mic[idx.int] = ((micV shr (idx * 8)) and 0xFF'u64).uint8
     inc idx
   {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
   var micV2 {.volatile.}: uint64 = mic
   idx = 4
   while idx < 8:
-    mmie[10 + idx] = ((micV2 shr (idx * 8)) and 0xFF'u64).uint8
+    mmie.mic[idx.int] = ((micV2 shr (idx * 8)) and 0xFF'u64).uint8
     inc idx
   return 18
 
@@ -28529,13 +36457,12 @@ proc mfp_compute_bip*(key: pointer, frame: pointer, frameLen: uint32,
     aes_cmac_shift_sub_key(addr subKey[0])  # K2
     let halfLen = dataLen.uint32 shr 1
     xor_bytes(addr subKey[0], cast[pointer](dataPtr), halfLen)
-    # Padding: set 0x80 byte after data (if odd length, adjust)
+  # Padding: set 0x80 byte after data (if odd length, adjust)
     let isOdd = (dataLen and 1) != 0
     if isOdd:
       let padByte = 0x80'u8 or 0x80'u8  # blob builds padding value
       let byteIdx = halfLen
-      let subKeyPtr = cast[ptr uint8](cast[uint](addr subKey[0]) + byteIdx)
-      subKeyPtr[] = subKeyPtr[] xor padByte
+      subKey[byteIdx.int] = subKey[byteIdx.int] xor padByte
 
   # Final: XOR subkey into CBC-MAC state and encrypt
   xor_bytes(addr cbcState[0], addr subKey[0], 8)
@@ -28543,7 +36470,7 @@ proc mfp_compute_bip*(key: pointer, frame: pointer, frameLen: uint32,
 
   # Return first 8 bytes of CBC-MAC as (lo, hi) uint64
   let micLo = cast[ptr uint32](addr cbcState[0])[]
-  let micHi = cast[ptr uint32](cast[uint](addr cbcState[0]) + 4)[]
+  let micHi = cast[ptr uint32](addr cbcState[4])[]
   return cast[uint64](micLo) or (cast[uint64](micHi) shl 32)
 
 # ###########################################################################
@@ -28627,9 +36554,11 @@ proc aes_encrypt_block*(roundKeys: pointer, state: pointer) {.exportc, cdecl.} =
 #                  HSU: Hardware Security Unit
 # ###########################################################################
 
+var hsuMichaelCtx: array[16, uint8]
+
 proc hsu_init*() {.exportc, cdecl.} =
   ## Initialize hardware security unit.
-  discard
+  discard c_memset(addr hsuMichaelCtx[0], 0, hsuMichaelCtx.len.csize_t)
 
 proc hsu_aes_cmac*(key: pointer, msg: pointer, msgLen: uint32, mac: pointer) {.exportc, cdecl.} =
   ## Compute AES-CMAC-128 per RFC 4493.
@@ -28703,16 +36632,24 @@ proc hsu_aes_cmac*(key: pointer, msg: pointer, msgLen: uint32, mac: pointer) {.e
   discard c_memcpy(mac, addr state[0], 16.csize_t)
 
 proc hsu_michael_init*(key: pointer) {.exportc, cdecl.} =
-  ## Initialize Michael MIC calculation.
-  discard
+  ## Initialize the HSU Michael MIC streaming context with an 8-byte key.
+  discard c_memset(addr hsuMichaelCtx[0], 0, hsuMichaelCtx.len.csize_t)
+  if key == nil:
+    return
+  discard c_memcpy(addr hsuMichaelCtx[0], key, 8.csize_t)
 
 proc hsu_michael_calc*(data: pointer, dataLen: uint32) {.exportc, cdecl.} =
-  ## Process data for Michael MIC.
-  discard
+  ## Process data for the HSU Michael MIC streaming context.
+  if data == nil or dataLen == 0:
+    return
+  me_mic_calc(addr hsuMichaelCtx[0], data, dataLen)
 
 proc hsu_michael_end*(mic: pointer) {.exportc, cdecl.} =
-  ## Finalize Michael MIC calculation.
-  discard
+  ## Finalize the HSU Michael MIC and write the 8-byte result.
+  if mic == nil:
+    return
+  me_mic_end(addr hsuMichaelCtx[0])
+  discard c_memcpy(mic, addr hsuMichaelCtx[0], 8.csize_t)
 
 # ###########################################################################
 #                  MAC Utilities
@@ -28777,14 +36714,34 @@ proc mac_irq*() {.exportc, cdecl.} =
   # Read IRQ handler index
   let irqIdx = regRead(MAC_PL_IRQ_HANDLER)
   let irqSlot = irqIdx and 0x3F'u32
+  let status1 = regRead(MAC_PL_IRQ_STATUS1)
+  inc nimFwDbgMacIrq
+  nimFwDbgMacIrqLast = irqSlot or (status0 shl 8) or (status1 shl 16)
+  nimFwDbgMacIrqLastHandler = irqIdx
+  nimFwDbgMacIrqLastIntRaw = regRead(MACHW_INTC_STATUS_RAW)
+  nimFwDbgMacIrqLastGenRaw = regRead(MACHW_INTC_GEN_RAW)
+  nimFwDbgMacIrqLastRxCtrl = regRead(MACHW_RX_CNTRL_REG)
+  nimFwDbgMacIrqLastHd = machwRxHdSubmittedHead()
+  nimFwDbgMacIrqLastPd = machwRxPdSubmittedHead()
+  case irqSlot
+  of 50'u32:
+    inc nimFwDbgMacIrqSlot50
+  of 52'u32:
+    inc nimFwDbgMacIrqSlot52
+  of 53'u32:
+    inc nimFwDbgMacIrqSlot53
+  of 54'u32:
+    inc nimFwDbgMacIrqSlot54
+  else:
+    inc nimFwDbgMacIrqSlotOther
   if irqSlot == 53'u32 or irqSlot == 54'u32:
     nimFwTrace2U32("[WIFI-NIMFW] macirq_tx ",
                    irqSlot or (status0 shl 8),
-                   regRead(MAC_PL_IRQ_STATUS1))
+                   status1)
     when defined(bl808WifiConnectTrace):
       nimFwConnectTrace2U32("[WIFI-CT] macirq_tx ",
                             irqSlot or (status0 shl 8),
-                            regRead(MAC_PL_IRQ_STATUS1))
+                            status1)
   let handler = cast[proc() {.cdecl.}](intc_handler_tab[irqIdx and 0x3F])
   if handler == nil:
     assert_err("intc.c", "intc.c", 154)
@@ -28876,21 +36833,23 @@ proc notifier_chain_insert_ordered(headPtr: ptr pointer, notifier: ptr CoListHdr
   ##   offset 8: priority (int32, higher = inserted earlier)
   ## From blob: walks list via offset 4, compares int32 at offset 8.
   ## Inserts before the first node whose priority < new node's priority.
-  let newPrio = cast[ptr int32](cast[uint](notifier) + 8)[]
+  let newNode = notifierNodeView(notifier)
+  let newPrio = newNode.priority
   var pos = headPtr
   var cur = cast[ptr CoListHdr](pos[])
   while cur != nil:
-    let curPrio = cast[ptr int32](cast[uint](cur) + 8)[]
+    let curNode = notifierNodeView(cur)
+    let curPrio = curNode.priority
     if curPrio < newPrio:
       # Insert notifier before cur
-      cast[ptr pointer](cast[uint](notifier) + 4)[] = cast[pointer](cur)
+      newNode.next = cast[pointer](cur)
       pos[] = cast[pointer](notifier)
       return
     # Advance: pos = &cur->next (offset 4)
-    pos = cast[ptr pointer](cast[uint](cur) + 4)
+    pos = addr curNode.next
     cur = cast[ptr CoListHdr](pos[])
   # End of list or empty: insert here
-  cast[ptr pointer](cast[uint](notifier) + 4)[] = nil
+  newNode.next = nil
   pos[] = cast[pointer](notifier)
 
 proc notifier_chain_remove(headPtr: ptr pointer, notifier: ptr CoListHdr) =
@@ -28902,9 +36861,9 @@ proc notifier_chain_remove(headPtr: ptr pointer, notifier: ptr CoListHdr) =
   while cur != nil:
     if cur == notifier:
       # Unlink: *pos = notifier->next
-      pos[] = cast[ptr pointer](cast[uint](notifier) + 4)[]
+      pos[] = notifierNodeView(notifier).next
       return
-    pos = cast[ptr pointer](cast[uint](cur) + 4)
+    pos = addr notifierNodeView(cur).next
     cur = cast[ptr CoListHdr](pos[])
 
 proc notifier_chain_regsiter*(chain: ptr CoList, notifier: ptr CoListHdr) {.exportc, cdecl.} =
@@ -28942,9 +36901,10 @@ proc notifier_chain_call*(chain: ptr CoList, event: uint32, data: pointer) {.exp
   let saved = irqSave()
   var cur = chain.first
   while cur != nil:
-    let next = cast[ptr CoListHdr](cast[ptr pointer](cast[uint](cur) + 4)[])
+    let node = notifierNodeView(cur)
+    let next = cast[ptr CoListHdr](node.next)
     let cb = cast[proc(node: ptr CoListHdr, event: uint32, data: pointer): cint {.cdecl.}](
-      cast[ptr pointer](cast[uint](cur))[]
+      node.callback
     )
     if cb != nil:
       discard cb(cur, event, data)
@@ -28958,12 +36918,13 @@ proc notifier_chain_call_fromeCritical*(chain: ptr CoList, event: uint32, data: 
   ##   lw s0, 4(s0) => next. No interrupt manipulation.
   var cur = chain.first
   while cur != nil:
+    let node = notifierNodeView(cur)
     let cb = cast[proc(node: ptr CoListHdr, event: uint32, data: pointer): cint {.cdecl.}](
-      cast[ptr pointer](cast[uint](cur))[]
+      node.callback
     )
     if cb != nil:
       discard cb(cur, event, data)
-    cur = cast[ptr CoListHdr](cast[ptr pointer](cast[uint](cur) + 4)[])
+    cur = cast[ptr CoListHdr](node.next)
 
 # ###########################################################################
 #                  Replay Counter
@@ -29399,15 +37360,15 @@ proc cfg_api_element_general_set*(entry: pointer, value: pointer) {.exportc, cde
   ##   typeId 6,7: sw (store word from value[0..3] to data[0..3])
   ## Returns 0 always.
   if entry == nil or value == nil: return
-  let entryU = cast[uint](entry)
+  let cfg = cfgApiElementEntryAt(entry)
   # Log: blob calls g_bl_ops_funcs[204] with entry[8] (name string)
-  let nameStr = cast[ptr pointer](entryU + 8)[]
+  let nameStr = cfg.name
   let logFnPtr = getLogFunc(204)
   if logFnPtr != nil and nameStr != nil:
     let logFn = cast[PlatformLogFunc](logFnPtr)
     logFn(1, 0, nameStr, 188)
-  let typeId = cast[ptr uint16](entryU + 6)[]
-  let dataPtr = cast[ptr pointer](entryU + 12)[]
+  let typeId = cfg.typeId
+  let dataPtr = cfg.data
   if dataPtr == nil: return
   let dst = cast[uint](dataPtr)
   case typeId
@@ -29473,20 +37434,21 @@ proc cfg_api_element_set*(id: uint32, subId: uint16, typeId: uint16,
   # Build a virtual entry struct on stack matching the blob's layout:
   #   [0..3] = id, [4..5] = subId, [6..7] = typeId,
   #   [8..11] = name ptr, [12..15] = data ptr, [16..19] = set handler
-  var entry {.noinit.}: array[28, uint8]
-  let entryAddr = cast[uint](addr entry[0])
-  cast[ptr uint32](entryAddr)[] = id
-  cast[ptr uint16](entryAddr + 4)[] = subId
-  cast[ptr uint16](entryAddr + 6)[] = typeId
+  var entry {.noinit.}: CfgApiElementEntryView
+  discard c_memset(addr entry, 0, sizeof(CfgApiElementEntryView).csize_t)
+  entry.id = id
+  entry.subId = subId
+  entry.typeId = typeId
   # Data pointer: for cfgElements, point to the element slot
   if id < 32:
-    cast[ptr pointer](entryAddr + 12)[] = cast[pointer](addr cfgElements[id])
+    entry.data = cast[pointer](addr cfgElements[id])
     # Blob dispatches to the set handler via a function pointer stored in
     # the config entry — indirect call (not counted as R_RISCV_CALL).
     # Mirror that by calling through a pointer variable.
     let setFn {.volatile.}: proc(entry: pointer, value: pointer) {.cdecl.} =
       cfg_api_element_general_set
-    setFn(cast[pointer](entryAddr), value)
+    entry.setHandler = cast[pointer](setFn)
+    setFn(cast[pointer](addr entry), value)
     if id >= cfgElementCount:
       cfgElementCount = id + 1
 
@@ -29562,14 +37524,13 @@ proc coex_dump_pta*() {.exportc, cdecl.} =
   ## logs each via g_bl_ops_funcs[76] with line numbers 363..395.
   ## Blob reloads logFunc before each call.
   type LogV = proc(a0, a1: uint32, fmt: pointer, line: uint32, val: uint32) {.cdecl, varargs.}
-  const PTA_REG = 0x24920004'u32
   # Log header
   let lf0 = cast[LogV](getLogFunc(76)); if lf0 != nil: lf0(2, 0, nil, 400, 0)
   # Read PTA register, log full value
-  var reg = volatileLoad(cast[ptr uint32](PTA_REG))
+  var reg = ptaCoexControl()
   let lf1 = cast[LogV](getLogFunc(76)); if lf1 != nil: lf1(2, 0, nil, 363, reg)
   # Re-read and extract bitfields
-  reg = volatileLoad(cast[ptr uint32](PTA_REG))
+  reg = ptaCoexControl()
   let lf2 = cast[LogV](getLogFunc(76)); if lf2 != nil: lf2(2, 0, nil, 382, reg shr 28)
   let lf3 = cast[LogV](getLogFunc(76)); if lf3 != nil: lf3(2, 0, nil, 383, (reg shr 24) and 0xF)
   let lf4 = cast[LogV](getLogFunc(76)); if lf4 != nil: lf4(2, 0, nil, 384, (reg shr 20) and 0xF)
@@ -29584,7 +37545,7 @@ proc coex_dump_pta*() {.exportc, cdecl.} =
   let lf13 = cast[LogV](getLogFunc(76)); if lf13 != nil: lf13(2, 0, nil, 393, reg and 0x3)
   let lf14 = cast[LogV](getLogFunc(76)); if lf14 != nil: lf14(2, 0, nil, 394, reg and 0x1)
   # Final: re-read register for bit 0
-  let reg2 = volatileLoad(cast[ptr uint32](PTA_REG))
+  let reg2 = ptaCoexControl()
   let lf15 = cast[LogV](getLogFunc(76)); if lf15 != nil: lf15(2, 0, nil, 395, reg2 and 0x1)
 
 proc coex_dump_wifi*() {.exportc, cdecl.} =
@@ -29592,14 +37553,13 @@ proc coex_dump_wifi*() {.exportc, cdecl.} =
   ## Reads MAC HW registers at 0x24B00400/404/408, extracts bitfields,
   ## logs each via g_bl_ops_funcs[76]. Blob reloads logFunc before each call.
   type LogV = proc(a0, a1: uint32, fmt: pointer, line: uint32, val: uint32) {.cdecl, varargs.}
-  const MACHW_COEX_BASE = 0x24B00400'u32
   # Header
   var lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 513, 0)
   # Reg0 full
-  var reg0 = volatileLoad(cast[ptr uint32](MACHW_COEX_BASE))
+  var reg0 = wlanCoexControl()
   lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 421, reg0)
   # Reg0 bitfields
-  reg0 = volatileLoad(cast[ptr uint32](MACHW_COEX_BASE))
+  reg0 = wlanCoexControl()
   lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 439, reg0 shr 28)
   lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 440, (reg0 shr 22) and 0x3F)
   lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 441, (reg0 shr 18) and 0xF)
@@ -29617,10 +37577,10 @@ proc coex_dump_wifi*() {.exportc, cdecl.} =
   # Header 2
   lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 515, 0)
   # Reg1 full
-  var reg1 = volatileLoad(cast[ptr uint32](MACHW_COEX_BASE + 4))
+  var reg1 = wlanCoexPti()
   lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 466, reg1)
   # Reg1 bitfields
-  reg1 = volatileLoad(cast[ptr uint32](MACHW_COEX_BASE + 4))
+  reg1 = wlanCoexPti()
   lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 470, reg1 shr 28)
   lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 471, (reg1 shr 22) and 0x3F)
   lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 472, (reg1 shr 16) and 0x3F)
@@ -29632,10 +37592,10 @@ proc coex_dump_wifi*() {.exportc, cdecl.} =
   # Header 3
   lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 517, 0)
   # Reg2 full
-  var reg2 = volatileLoad(cast[ptr uint32](MACHW_COEX_BASE + 8))
+  var reg2 = wlanCoexStatus()
   lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 490, reg2)
   # Reg2 bitfields
-  reg2 = volatileLoad(cast[ptr uint32](MACHW_COEX_BASE + 8))
+  reg2 = wlanCoexStatus()
   lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 502, (reg2 shr 4) and 0xF)
   lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 503, (reg2 shr 2) and 0x1)
   lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 504, (reg2 shr 1) and 0x1)
@@ -29656,26 +37616,25 @@ proc coex_wifi_pti_forece_enable*(enable: bool) {.exportc, cdecl.} =
   ## Common path (both enable/disable):
   ##   Reads MACHW_BASE+0x400, masks with 0xFBFFFFFF (clear bit 26),
   ##   shifts and ORs based on enable flag, writes back.
-  let ptaReg = MACHW_BASE + 0x400'u
   if enable:
-    var val = regRead(ptaReg)
+    var val = wlanCoexControl()
     # Clear bits [27:24], set to 0xF (max priority)
     val = val and 0x0FFFFFFF'u32
     val = val or 0xF0000000'u32
     # Set bit 4 (force enable)
     val = val or 0x10'u32
-    regWrite(ptaReg, val)
+    wlanCoexWriteControl(val)
     # Re-read and set additional enable bits
-    val = regRead(ptaReg)
+    val = wlanCoexControl()
     val = val or 0x10'u32
-    regWrite(ptaReg, val)
+    wlanCoexWriteControl(val)
   # Common: update auto-control bits
-  var val = regRead(ptaReg)
+  var val = wlanCoexControl()
   val = val and 0xFBFFFFFF'u32  # clear bit 26
   if not enable:
     # Clearing: restore auto-control
     val = val and (not 0x10'u32)  # clear force bit
-  regWrite(ptaReg, val)
+  wlanCoexWriteControl(val)
 
 proc coex_wifi_pta_forece_enable*(enable: bool) {.exportc, cdecl.} =
   ## Force enable/disable WiFi PTA (Packet Traffic Arbitration).
@@ -29738,87 +37697,40 @@ proc coex_pta_force_autocontrol_set*(mode: uint32) {.exportc, cdecl.} =
   ## Mode 0: Disable PTA - WiFi always on
   ## Mode 1: WiFi-priority PTA
   ## Mode 2: BT-priority PTA
-  const PTA_BASE = 0x24920000'u
-  const PTA_CTRL = PTA_BASE + 0x004'u
-  const PTA_CLR  = PTA_BASE + 0x428'u
-  const MACHW_BCN_STATUS = 0x24B00400'u
-
   let enableVal = mode
 
   if enableVal == 1:
     # Mode 1: WiFi-priority PTA
-    volatileStore(cast[ptr uint32](PTA_CLR), 0'u32)  # clear PTA
-    var reg = volatileLoad(cast[ptr uint32](PTA_CTRL))
-    reg = reg and not 1'u32                    # clear bit 0
-    volatileStore(cast[ptr uint32](PTA_CTRL), reg)
-    reg = volatileLoad(cast[ptr uint32](PTA_CTRL))
-    reg = reg and 0xFFF7FFFF'u32               # clear bit 19 (WiFi priority high)
-    volatileStore(cast[ptr uint32](PTA_CTRL), reg)
-    reg = volatileLoad(cast[ptr uint32](PTA_CTRL))
-    reg = reg and 0xFFFBFFFF'u32               # clear bit 18 (BT priority high)
-    volatileStore(cast[ptr uint32](PTA_CTRL), reg)
-    reg = volatileLoad(cast[ptr uint32](PTA_CTRL))
-    reg = reg and 0xFFFDFFFF'u32               # clear bit 17
-    reg = reg or 0x00020000'u32                # set bit 17 (WiFi priority = high)
-    volatileStore(cast[ptr uint32](PTA_CTRL), reg)
-    reg = volatileLoad(cast[ptr uint32](PTA_CTRL))
-    reg = reg and 0xFFFEFFFF'u32               # clear bit 16
-    reg = reg or 0x00010000'u32                # set bit 16 (BT priority = mid)
-    volatileStore(cast[ptr uint32](PTA_CTRL), reg)
+    ptaCoexClear()
+    ptaCoexUpdateControl(not 1'u32, 0'u32)
+    ptaCoexUpdateControl(0xFFF7FFFF'u32, 0'u32)
+    ptaCoexUpdateControl(0xFFFBFFFF'u32, 0'u32)
+    ptaCoexUpdateControl(0xFFFDFFFF'u32, 0x00020000'u32)
+    ptaCoexUpdateControl(0xFFFEFFFF'u32, 0x00010000'u32)
 
   elif enableVal == 2:
     # Mode 2: BT-priority PTA
-    volatileStore(cast[ptr uint32](PTA_CLR), 0'u32)  # clear PTA
-    var reg = volatileLoad(cast[ptr uint32](PTA_CTRL))
-    reg = reg and not 1'u32                    # clear bit 0
-    volatileStore(cast[ptr uint32](PTA_CTRL), reg)
-    reg = volatileLoad(cast[ptr uint32](PTA_CTRL))
-    reg = reg and 0xFFF7FFFF'u32               # clear bit 19
-    reg = reg or 0x00080000'u32                # set bit 19 (WiFi priority = mid)
-    volatileStore(cast[ptr uint32](PTA_CTRL), reg)
-    reg = volatileLoad(cast[ptr uint32](PTA_CTRL))
-    reg = reg and 0xFFFBFFFF'u32               # clear bit 18
-    reg = reg or 0x00040000'u32                # set bit 18 (BT priority = high)
-    volatileStore(cast[ptr uint32](PTA_CTRL), reg)
-    reg = volatileLoad(cast[ptr uint32](PTA_CTRL))
-    reg = reg and 0xFFFDFFFF'u32               # clear bit 17
-    volatileStore(cast[ptr uint32](PTA_CTRL), reg)
-    reg = volatileLoad(cast[ptr uint32](PTA_CTRL))
-    reg = reg and 0xFFFEFFFF'u32               # clear bit 16
-    volatileStore(cast[ptr uint32](PTA_CTRL), reg)
+    ptaCoexClear()
+    ptaCoexUpdateControl(not 1'u32, 0'u32)
+    ptaCoexUpdateControl(0xFFF7FFFF'u32, 0x00080000'u32)
+    ptaCoexUpdateControl(0xFFFBFFFF'u32, 0x00040000'u32)
+    ptaCoexUpdateControl(0xFFFDFFFF'u32, 0'u32)
+    ptaCoexUpdateControl(0xFFFEFFFF'u32, 0'u32)
 
   else:
     # Mode 0 (default): Disable PTA auto-control - WiFi always on
-    volatileStore(cast[ptr uint32](PTA_CLR), 0'u32)  # clear PTA
-    var reg = volatileLoad(cast[ptr uint32](MACHW_BCN_STATUS))
-    reg = reg and not 1'u32                    # clear bit 0
-    volatileStore(cast[ptr uint32](MACHW_BCN_STATUS), reg)
-    reg = volatileLoad(cast[ptr uint32](PTA_CTRL))
-    reg = reg and 0xFFFDFFFF'u32               # clear bit 17
-    volatileStore(cast[ptr uint32](PTA_CTRL), reg)
-    reg = volatileLoad(cast[ptr uint32](PTA_CTRL))
-    reg = reg and 0xFFFEFFFF'u32               # clear bit 16
-    volatileStore(cast[ptr uint32](PTA_CTRL), reg)
-    reg = volatileLoad(cast[ptr uint32](PTA_CTRL))
-    reg = reg and 0xFFF7FFFF'u32               # clear bit 19
-    volatileStore(cast[ptr uint32](PTA_CTRL), reg)
-    reg = volatileLoad(cast[ptr uint32](PTA_CTRL))
-    reg = reg and 0xFFFBFFFF'u32               # clear bit 18
-    volatileStore(cast[ptr uint32](PTA_CTRL), reg)
+    ptaCoexClear()
+    wlanCoexWriteControl(wlanCoexControl() and not 1'u32)
+    ptaCoexUpdateControl(0xFFFDFFFF'u32, 0'u32)
+    ptaCoexUpdateControl(0xFFFEFFFF'u32, 0'u32)
+    ptaCoexUpdateControl(0xFFF7FFFF'u32, 0'u32)
+    ptaCoexUpdateControl(0xFFFBFFFF'u32, 0'u32)
     # Set WiFi always-on bits: bit 4 (auto), bit 1 (priority), bit 0 (enable)
-    reg = volatileLoad(cast[ptr uint32](PTA_CTRL))
-    reg = reg or 0x10'u32                      # bit 4
-    volatileStore(cast[ptr uint32](PTA_CTRL), reg)
-    reg = volatileLoad(cast[ptr uint32](PTA_CTRL))
-    reg = reg or 0x02'u32                      # bit 1
-    volatileStore(cast[ptr uint32](PTA_CTRL), reg)
-    reg = volatileLoad(cast[ptr uint32](PTA_CTRL))
-    reg = reg or 0x01'u32                      # bit 0
-    volatileStore(cast[ptr uint32](PTA_CTRL), reg)
+    ptaCoexUpdateControl(not 0'u32, 0x10'u32)
+    ptaCoexUpdateControl(not 0'u32, 0x02'u32)
+    ptaCoexUpdateControl(not 0'u32, 0x01'u32)
     # Re-enable MAC HW
-    reg = volatileLoad(cast[ptr uint32](MACHW_BCN_STATUS))
-    reg = reg or 0x01'u32
-    volatileStore(cast[ptr uint32](MACHW_BCN_STATUS), reg)
+    wlanCoexWriteControl(wlanCoexControl() or 0x01'u32)
 
 # ###########################################################################
 #                  Interrupt Controller (intc_*)
@@ -29929,7 +37841,7 @@ proc mm_reset_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ke_msg_send_basic(MM_RESET_CFM, TASK_API, TASK_MM)
   ke_state_set(TASK_MM, MM_IDLE)
   nimFwTrace("[WIFI-NIMFW] mm_reset_req done")
-  return 0
+  return KeMsgConsumed
 
 proc mm_start_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle MM_START_REQ: start MAC management after reset (186 bytes in blob).
@@ -29949,11 +37861,11 @@ proc mm_start_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   if state != MM_IDLE.uint16:
     assert_err("mm_task.c", "mm_task.c", 308)
   # Initialize PHY (blob: phy_init at 0x3a)
-  {.emit: ["extern void phy_init(void*); phy_init(0);"].}
+  phy_init(nil)
   # Set channel from param (blob: phy_set_channel at 0x52)
   let req = mmStartReqView(param)
-  phy_set_channel(req.band, req.chanType, req.prim20Freq, req.center1Freq,
-                  req.center2Freq, req.txPower)
+  phySetChannel(req.band, req.chanType, req.prim20Freq, req.center1Freq,
+                req.center2Freq, req.txPower)
   # Update TX power (blob: tpc_update_tx_power at 0x5c)
   tpc_update_tx_power(0)
   # Send start confirmation (blob: ke_msg_send_basic at 0x88)
@@ -29964,7 +37876,7 @@ proc mm_start_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   hal_machw_idle_req()
   # Set state (blob: ke_state_set at 0xa4)
   ke_state_set(TASK_MM, MM_ACTIVE_STATE.uint16)
-  return 0
+  return KeMsgConsumed
 
 proc mm_version_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle MM_VERSION_REQ (84 bytes in blob).
@@ -29984,7 +37896,7 @@ proc mm_version_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   # Feature flags
   cfm.features = 0x001089DF'u32
   ke_msg_send(cfm)
-  return 0
+  return KeMsgConsumed
 
 proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle HW configuration messages (1276 bytes / 399 instrs in blob).
@@ -30012,7 +37924,7 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
     if msgId == MM_SET_VIF_STATE_REQ and
         cast[ptr MmSetVifStateReqPayload](msgBody).state == 0:
       rxlCntrlEnvView().processingFlag = 1
-    return 2  # KE_MSG_SAVED -- re-dispatch after the MAC becomes idle
+    return KeMsgSaved
 
   # Assert HW is truly idle
   let hwState = regRead(MACHW_STATE_CNTRL_REG) and 0x0F'u32
@@ -30055,8 +37967,8 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
       ke_msg_alloc(MM_SET_CHANNEL_CFM, destId, srcId,
                    MmSetChannelCfmPayloadSize))
     if req.index != 0:
-      phy_set_channel(req.band, req.chanType, req.prim20Freq,
-                      req.center1Freq, req.center2Freq, 0)
+      phySetChannel(req.band, req.chanType, req.prim20Freq,
+                    req.center1Freq, req.center2Freq, 0)
     cfmPtr = cast[pointer](cfm)
 
   of 16:  # MM_SET_BEACON_INT_REQ -> set beacon interval
@@ -30222,20 +38134,20 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
   regWrite(MACHW_STATE_CNTRL_REG, shiftedMode)
   let savedState = mm.previousState
   ke_state_set(srcId, savedState.uint16)
-  return 0
+  return KeMsgConsumed
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) int mm_set_idle_req_handler(void*);".}
 proc mm_set_idle_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle MM_SET_IDLE_REQ (188 bytes in blob, 47 instrs).
   ## From blob (me_task.o): Complex state machine handler.
-  ## If state==3 (CONNECTED): return 2 (save message).
+  ## If state==3 (CONNECTED): return KeMsgSaved.
   ## Stores idle flag from req[0] to mm_env(0x1a).
   ## If going idle: checks state, requests HW idle, sets state to 2.
   ## If going active: calls mm_active.
   ## Sends MM_SET_IDLE_CFM (id=27) via basic send.
   let state = ke_state_get(TASK_ME)
   if state == HW_ACTIVE.uint16:
-    return 2  # CONNECTED state, return SAVED
+    return KeMsgSaved
   let idle = mmSetIdleReqView(param).idle
   let mm = mmEnvView()
   mm.idleFlag = idle
@@ -30244,25 +38156,25 @@ proc mm_set_idle_req_handler*(param: pointer): cint {.exportc, cdecl.} =
     let curState = ke_state_get(TASK_ME)
     if curState == MeIdleState:
       # Already idle - verify HW idle, then send cfm
-      let hwState = regRead(MACHW_STATE_CNTRL_REG) and 0x0F'u32
+      let hwState = regRead(MACHW_STATE_CNTRL_REG) and 0x3F'u32
       if hwState != 0:
         assert_err("mm_task.c", "mm_task.c", 946)
       mm.previousState = 0
       mm.hardwareMode = 0
       ke_msg_send_basic(MM_SET_IDLE_CFM, TASK_API, TASK_ME)
-      return 0
+      return KeMsgConsumed
     if curState == MeGoingIdleState:
-      return 0  # Already in idle transition
+      return KeMsgConsumed
     hal_machw_idle_req()
     ke_state_set(TASK_ME, MeGoingIdleState)
   else:
     # Going active
     let curState = ke_state_get(TASK_ME)
     if curState == MeGoingIdleState:
-      return 0
+      return KeMsgConsumed
     mm_active()
     ke_msg_send_basic(MM_SET_IDLE_CFM, TASK_API, TASK_ME)
-  return 0
+  return KeMsgConsumed
 
 proc mm_set_idle_cfm_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle MM_SET_IDLE_CFM (106 bytes in blob, me_task.o).
@@ -30273,8 +38185,7 @@ proc mm_set_idle_cfm_handler*(param: pointer): cint {.exportc, cdecl.} =
   if state != MeBusyState:
     assert_err("me_task.c", "me_task.c", 504)
   # Check if ME has a connection (me_env byte at offset 0x7e)
-  let meBase = cast[uint](addr me_env[0])
-  let connIdx = cast[ptr uint8](meBase + 0x7E)[]
+  let connIdx = meEnvView().psMode
   if connIdx != 0xFF:
     ke_msg_send_basic(ME_SET_ACTIVE_REQ, TASK_ME, TASK_ME)
   ke_state_set(TASK_ME, MeIdleState)
@@ -30318,20 +38229,20 @@ proc mm_sta_add_cfm_handler*(param: pointer) {.exportc, cdecl.} =
   let staIdx = cfm.staIdx
   let sta = staInfoForIdx(staIdx)
   let vifIdx = sta.instNbr
-  let vifBase = cast[uint](addr vif_info_tab[0]) + vifIdx.uint * VIF_ENTRY_SIZE.uint
+  let vif = vifChannelForIdx(vifIdx)
   # Copy 13 bytes from vif.bssid(436) to sta(248)
   discard c_memcpy(cast[pointer](addr sta.supportedRates[0]),
-                   cast[pointer](vifBase + 436), 13.csize_t)
+                   addr vif.basicRates[0], 13.csize_t)
   # Set HT/VHT capability flags
-  let vifFlags = vifApConfigAt(vifBase).securityFlags
+  let vifFlags = vifApConfig(vif).securityFlags
   if (vifFlags and 1) != 0:  # HT flag
     sta.capabilityFlags = sta.capabilityFlags or 1
   if (vifFlags and 2) != 0:  # VHT flag
     sta.capabilityFlags = sta.capabilityFlags or 2
     # Copy 32 bytes of HT/VHT caps from vif(348) to sta(264)
     discard c_memcpy(cast[pointer](addr sta.vhtCaps[0]),
-                     cast[pointer](vifBase + 348), 32.csize_t)
-    me_set_sta_ht_vht_param(cast[pointer](sta), cast[pointer](vifBase))
+                     cast[pointer](vifHtCapabilities(vif)), 32.csize_t)
+    me_set_sta_ht_vht_param(cast[pointer](sta), cast[pointer](vif))
   sm_set_bss_param(param)
 
 proc mm_sta_del_req_handler*(param: pointer) {.exportc, cdecl.} =
@@ -30389,7 +38300,7 @@ proc mm_set_ps_mode_cfm_handler*(param: pointer) {.exportc, cdecl.} =
   let srcTask = keMsgHdrFromPayload(param).destId
   if ke_state_get(srcTask) != TaskActiveState:
     assert_err("mm_task.c", "mm_task.c", 609)
-  let marker = cast[ptr uint8](cast[uint](addr me_env[0]) + 0x7E)[]
+  let marker = meEnvView().psMode
   if marker != 0xFF'u8:
     ke_msg_send_basic(ME_SET_PS_DISABLE_CFM, srcTask, 0'u8)
   ke_state_set(srcTask, TaskIdleState)
@@ -30405,8 +38316,7 @@ proc mm_set_ps_options_req_handler*(param: pointer) {.exportc, cdecl.} =
   let destId = hdr.srcId
   let req = cast[ptr MmSetPsOptionsReqPayload](msgBody)
   let vifIdx = req.vifIdx
-  let vifBase = cast[uint](addr vif_info_tab[0]) + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let vif = vifChannelAt(vifBase)
+  let vif = vifChannelForIdx(vifIdx)
   # Assert VIF type is STA (0)
   let vifType = vif.vifType
   if vifType != 0:
@@ -30434,7 +38344,7 @@ proc mm_set_vif_state_cfm_handler*(param: pointer) {.exportc, cdecl.} =
     return
   let ci = connectInfoView(connInfo)
   let vifIdx = ci.vifIdx
-  let vifBase = cast[uint](addr vif_info_tab[0]) + vifIdx.uint * VIF_ENTRY_SIZE.uint
+  let vif = vifChannelForIdx(vifIdx)
   # Allocate and send MM_SET_PS_OPTIONS_REQ (vendor blob msg id 0x39).
   let msg = cast[ptr MmSetPsOptionsReqPayload](
     ke_msg_alloc(MM_SET_PS_OPTIONS_REQ, TASK_MM, TASK_SM,
@@ -30445,9 +38355,9 @@ proc mm_set_vif_state_cfm_handler*(param: pointer) {.exportc, cdecl.} =
     msg.options = ci.psOptions
     ke_msg_send(msg)
   # Compute PS mode and store to STA entry
-  let staIdx = vifChannelAt(vifBase).staIdx
+  let staIdx = vif.staIdx
   let sta = staInfoForIdx(staIdx)
-  let flags1496 = vifKeyPointersAt(vifBase).flags
+  let flags1496 = vifKeyPointers(vif).flags
   let psMode = 2'u8 - (flags1496 and 1).uint8
   sta.rxNss = psMode
   sta.rateWord = lmacGateHalfword(ci.ctrlPortEthertype)
@@ -30465,7 +38375,7 @@ proc mm_set_vif_state_cfm_handler*(param: pointer) {.exportc, cdecl.} =
   # Blob sends SM_STA_ADD_IND here so the host TX table is ready for EAPOL 2/4.
   # WPA completion later calls sm_connect_ind via bl_wifi_auth_done_internal.
   sm_connection_sta_add_ind(nil)
-  let sec = vifSecurityAt(vifBase)
+  let sec = vifSecurity(vif)
   nimFwDbgVifSecType = sec.cipher.uint32
   if sec.cipher <= 1'u8:
     inc nimFwDbgConnectIndPrePath
@@ -30509,8 +38419,7 @@ proc mm_tim_update_proceed*(param: pointer) {.exportc, cdecl, noinline.} =
   let aid = req.aid
   let setFlag = req.setFlag
   let vifIdx = req.vifIdx
-  let vifBase = cast[uint](addr vif_info_tab[0]) + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let vif = vifChannelAt(vifBase)
+  let vif = vifChannelForIdx(vifIdx)
   let bitmapBase = cast[uint](addr txl_tim_bitmap_pool[0])
   let timDesc = timDescView()
   let timIe = timIeAt(addr txl_tim_ie_pool[0])
@@ -30690,13 +38599,13 @@ proc mm_force_idle_req_handler*(param: pointer): cint {.exportc, cdecl.} =
     let callbackPtr = cast[ptr pointer](param)[]
     if callbackPtr != nil:
       cast[proc() {.cdecl.}](callbackPtr)()
-    return 0
+    return KeMsgConsumed
   elif state == MM_GOING_TO_IDLE.uint16:
-    return 2
+    return KeMsgSaved
   else:
     hal_machw_idle_req()
     ke_state_set(TASK_MM, MM_GOING_TO_IDLE)
-    return 2
+    return KeMsgSaved
 
 proc mm_remain_on_channel_req_handler*(param: pointer) {.exportc, cdecl.} =
   ## Handle MM_REMAIN_ON_CHANNEL_REQ.
@@ -30750,11 +38659,11 @@ proc mm_monitor_enable_req_handler*(param: pointer) {.exportc, cdecl.} =
     # Copy channel band from request
     cfm.channel = mmMonitorReqView(param).channel
     # Initialize PHY with zeroed config buffer, then set channel
-    var phyCfg {.noinit.}: array[16, uint32]
+    var phyCfg {.noinit.}: array[64, uint32]
     discard c_memset(addr phyCfg[0], 0, 64.csize_t)
     phyCfg[0] = 0
     phy_init(addr phyCfg[0])
-    phy_set_channel(0, 0, 2437, 2437, 0, 0)
+    phySetChannel(0, 0, 2437, 2437, 0, 0)
     mm_active()
     # Mark success and send
     cfm.status = 0'u32
@@ -30785,7 +38694,7 @@ proc mm_monitor_channel_req_handler*(param: pointer) {.exportc, cdecl.} =
     let chanFreq = uint16(channel and 0xFFFF'u32)
     cfm.channel = channel
     # Set channel
-    phy_set_channel(0, 0, chanFreq, chanFreq, 0, 0)
+    phySetChannel(0, 0, chanFreq, chanFreq, 0, 0)
     # Mark success and send
     cfm.status = 0'u32
     ke_msg_send(cfm)
@@ -30801,6 +38710,10 @@ proc applyScanChannelRxFilter*(passiveFlag: uint8) {.inline.} =
   let rxFlags = mm.rxFilterExtra or scanChannelRxFilterBits(passiveFlag)
   mm.rxFilterExtra = rxFlags
   regWrite(MACHW_RX_CNTRL_REG, rxFlags or mm.rxFilterBase)
+  when defined(bl808WifiUseBl808Rf):
+    rfPriApplyWb03ScanRxLatches()
+    rfPhyTraceCheckpoint(0x4F'u32)
+  nimFwScanRxFilterProbe()
 
 proc scheduleActiveScanProbeTimer*(scanParam: pointer) {.inline.} =
   discard scan_probe_req_tx(scanParam)
@@ -30820,23 +38733,29 @@ proc mm_scan_channel_start_ind_handler*(param: pointer): cint {.exportc, cdecl.}
   ## Handle scan channel start indication (68 instrs in blob).
   ## From blob (scan_task.o): checks ke_state_get(SCAN)==2 (asserts), reads scan
   ## config, sets EDCA params with passive/active flag, writes to MACHW RX filter
-  ## register (0x24B00060), calls scan_set_channel_request, sends SCAN_DONE_IND
-  ## with ke_msg_alloc(0x407, 1, 3, ...), sets ke_state(SCAN, 3).
+  ## register (0x24B00060), optionally sends active-scan probe requests, arms
+  ## SCAN_PROBE_TIMER, and sets ke_state(SCAN, 3).
   let state = ke_state_get(TASK_SCAN)
   if state != ScanChannelPendingState:
     assert_err("scan_task.c", "scan_task.c", 159)
   # Read scan env parameters
   let scanParam = scan_env.paramPtr
-  if scanParam == nil: return 0
+  if scanParam == nil: return KeMsgConsumed
   # Set EDCA params for scan: check passive flag (param byte 3, bit 0)
   let scanReq = scanStartReqView(scanParam)
   let passiveFlag = scanReq.channelList[scan_env.channelIndex.int].flags
   applyScanChannelRxFilter(passiveFlag)
+  nimFwDbgScanStartRxCtrl = regRead(MACHW_RX_CNTRL_REG)
+  nimFwDbgScanStartIrqRaw = regRead(MACHW_INTC_STATUS_RAW)
+  nimFwDbgScanStartGenRaw = regRead(MACHW_INTC_GEN_RAW)
+  snapshotPhyChannel(nimFwDbgScanStartPhyRaw)
+  when defined(bl808WifiUseBl808Rf):
+    rfPhyTraceCheckpoint(0x50'u32)
   # Active scan: send probe requests and set scan timer
   if (passiveFlag and 1) == 0:
     scheduleActiveScanProbeTimer(scanParam)
   enterScanChannelRunningState()
-  return 0
+  return KeMsgConsumed
 
 proc clearScanEdcaRxFilter*() {.inline.} =
   let mm = mmEnvView()
@@ -30877,6 +38796,12 @@ proc mm_scan_channel_end_ind_handler*(param: pointer): cint {.exportc, cdecl.} =
   ke_timer_clear(scanTimerId, TASK_SCAN)
   let scanParam = scan_env.paramPtr
   clearScanEdcaRxFilter()
+  nimFwDbgScanEndRxCtrl = regRead(MACHW_RX_CNTRL_REG)
+  nimFwDbgScanEndIrqRaw = regRead(MACHW_INTC_STATUS_RAW)
+  nimFwDbgScanEndGenRaw = regRead(MACHW_INTC_GEN_RAW)
+  snapshotPhyChannel(nimFwDbgScanEndPhyRaw)
+  when defined(bl808WifiUseBl808Rf):
+    rfPhyTraceCheckpoint(0x51'u32)
   let chanIdx = advanceScanChannelIndex()
   let scanReq = scanStartReqView(scanParam)
   let totalChans = scanReq.channelCount
@@ -30894,7 +38819,7 @@ proc mm_scan_channel_end_ind_handler*(param: pointer): cint {.exportc, cdecl.} =
   else:
     # More channels: request next
     scan_set_channel_request(scanParam)
-  return 0
+  return KeMsgConsumed
 
 proc mm_scan_channel_end_early_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle early scan channel end (19 instrs in blob).
@@ -30904,7 +38829,7 @@ proc mm_scan_channel_end_early_handler*(param: pointer): cint {.exportc, cdecl.}
   if state == ScanIdleState:
     assert_err("scan_task.c", "scan_task.c", 186)
   scan_terminate_channel_request()
-  return 0
+  return KeMsgConsumed
 
 # --- Scan Task Handlers (scan_task.o) ---
 
@@ -30935,7 +38860,7 @@ proc sendScanStartConfirmation*(cfm: pointer, status: uint8) {.inline.} =
 
 proc finishAcceptedScanStartReq*(param: pointer): cint {.inline.} =
   scan_ie_download(param)
-  return 1
+  return KeMsgNoFree
 
 proc cacheScanuStartRequest*(
     param: pointer,
@@ -30956,7 +38881,7 @@ proc scan_start_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Checks scan state; if busy: cfm->status=8. If idle: asserts chan_cnt>0,
   ## stores scan params in scan_env (param@0, src_id@8, channelIndex@9,
   ## active/passive durations@12/@16), calls scan_ie_download, sends cfm.
-  ## Returns KE_MSG_NO_FREE (1) on success to keep req message alive.
+  ## Returns KeMsgNoFree on success to keep req message alive.
   let reqHdr = keMsgHdrFromPayload(param)
   let cfm = ke_msg_alloc(SCAN_START_CFM, reqHdr.srcId, TASK_SCAN,
                          StatusCfmPayloadSize)
@@ -30978,7 +38903,7 @@ proc scan_start_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   sendScanStartConfirmation(cfm, cfmStatus)
   if doDownload:
     return finishAcceptedScanStartReq(param)
-  return 0
+  return KeMsgConsumed
 
 proc scan_start_cfm_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle SCAN_START_CFM (30 bytes in blob).
@@ -30987,7 +38912,7 @@ proc scan_start_cfm_handler*(param: pointer): cint {.exportc, cdecl.} =
   let status = statusCfmView(param).status
   if status != 0:
     scanu_confirm(status)
-  return 0
+  return KeMsgConsumed
 
 proc advanceScanuScanBand*() {.inline.} =
   scanu_env.scanBand = scanu_env.scanBand + 1
@@ -31003,7 +38928,7 @@ proc scan_done_ind_handler*(param: pointer): cint {.exportc, cdecl.} =
   let rawResult = scanu_env.pendingRawMsg
   if joinFlag == 0 or rawResult == nil:
     advanceScanuScanBand()
-    return 0
+    return KeMsgConsumed
 
   scanu_env.pendingRawMsg = nil
   let reqSrcId = scanu_env.requester
@@ -31020,7 +38945,7 @@ proc scan_done_ind_handler*(param: pointer): cint {.exportc, cdecl.} =
   if msg != nil:
     ke_msg_send(msg)
   ke_state_set(TASK_SCANU, ScanuIdleState)
-  return 0
+  return KeMsgConsumed
 
 proc scan_cancel_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle SCAN_CANCEL_REQ: cancel ongoing scan.
@@ -31033,7 +38958,7 @@ proc scan_cancel_req_handler*(param: pointer): cint {.exportc, cdecl.} =
     scan_env.abortFlag = 1
   else:
     scan_send_cancel_cfm(1)
-  return 0
+  return KeMsgConsumed
 
 proc scan_abort_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle SCAN_ABORT_REQ — blob scan_task.o (74 bytes):
@@ -31055,7 +38980,7 @@ proc scan_abort_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   if logPtr != nil:
     const tag: cstring = "scan_abort_req"
     cast[proc(a: cstring, b: pointer){.cdecl, varargs.}](logPtr)(tag, nil)
-  return 0
+  return KeMsgConsumed
 
 proc scan_probe_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Probe-req periodic handler.
@@ -31068,12 +38993,12 @@ proc scan_probe_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Prior Nim bug: read scan_env[0] and logged nothing useful. The blob
   ## does the actual probe-request TX via scan_probe_req_tx.
   if not scanTaskInChannelRunningState():
-    return 0
+    return KeMsgConsumed
   sendPeriodicScanProbeRequest()
   # Blob's final log call is only on ret!=0 path; since our scan_probe_req_tx
   # returns void we skip the conditional log. Semantically equivalent: the
   # absent log does not affect RF state or pending scan bookkeeping.
-  return 0
+  return KeMsgConsumed
 
 # --- SCANU Task Handlers (scanu_task.o) ---
 
@@ -31085,13 +39010,13 @@ proc scanu_start_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ##   3. Clear scanu_env[222] and scanu_env[228] (result state bytes)
   ##   4. Store source task id into scanu_env[176]
   ##   5. Copy 6 bytes from param+286 (BSSID filter) into scanu_env+182
-  ##   6. Tail-call scanu_start(), returns 1
-  if param == nil: return 0
+  ##   6. Tail-call scanu_start(), returns KeMsgNoFree
+  if param == nil: return KeMsgConsumed
   let req = scanuStartReqView(param)
   let reqHdr = keMsgHdrFromPayload(param)
   cacheScanuStartRequest(param, req, reqHdr.srcId)
   scanu_start(param)
-  return 1
+  return KeMsgNoFree
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void scanu_start_cfm_handler(void*);".}
 proc scanu_start_cfm_handler*(param: pointer) {.exportc, cdecl.} =
@@ -31134,7 +39059,8 @@ proc scanu_start_cfm_handler*(param: pointer) {.exportc, cdecl.} =
     sm_connect_ind(WLAN_FW_CONNECT_ABORT_WHEN_SCANNING.uint16, 0xFFFF'u16)
   elif resultPtr != nil and chanPtr != nil:
     # Found BSS - join it
-    let vifMac = cast[pointer](cast[uint](vifEntry) + 80)
+    let vif = vifChannelAt(vifEntry)
+    let vifMac = cast[pointer](addr vif.macAddr[0])
     sm_join_bss(vifMac, resultPtr, chanPtr, 0)
   else:
     # No BSS found
@@ -31157,7 +39083,7 @@ proc scanu_join_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ##  11. If fails: call scanu_confirm(fail)
   let req = scanuStartReqView(param)
   let vifIdx = req.vifIdx
-  let vifBase = cast[uint](addr vif_info_tab[0]) + vifIdx.uint * VIF_ENTRY_SIZE.uint
+  let vif = vifChannelForIdx(vifIdx)
   let reqHdr = keMsgHdrFromPayload(param)
 
   # Store param pointer in scanu_env
@@ -31165,7 +39091,7 @@ proc scanu_join_req_handler*(param: pointer): cint {.exportc, cdecl.} =
 
   # Store requester source task and set flags
   scanu_env.requester = reqHdr.srcId
-  vifApConfigAt(vifBase).securityFlags = 0
+  vifApConfig(vif).securityFlags = 0
   scanu_env.bssidFilterEnabled = 1
   scanu_env.scanBand = 0
 
@@ -31231,8 +39157,7 @@ proc scanu_join_cfm_handler*(param: pointer) {.exportc, cdecl.} =
   let connInfo = sm.connectInfo
   let ci = connectInfoView(connInfo)
   let vifIdx = ci.vifIdx
-  let vifBase = cast[uint](addr vif_info_tab[0]) + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let vif = vifChannelAt(vifBase)
+  let vif = vifChannelForIdx(vifIdx)
   let apCfg = vifApConfig(vif)
   let flags = cast[int32](apCfg.securityFlags)
   if flags < 0:  # bit31 set (has channel context to add)
@@ -31257,7 +39182,7 @@ proc scanu_join_cfm_handler*(param: pointer) {.exportc, cdecl.} =
         # Set HT rate mask from vif flags
         let vifFlags32 = apCfg.securityFlags
         if (vifFlags32 and 2) != 0:
-          let htCap = cast[ptr uint8](vifBase + 350)[]
+          let htCap = vifHtCapabilities(vif).ampduParams
           let nss = htCap and 3
           let rateMask = (1'u16 shl (nss + 13)) - 1
           msg.rateMask = rateMask
@@ -31271,7 +39196,7 @@ proc scanu_join_cfm_handler*(param: pointer) {.exportc, cdecl.} =
       ke_state_set(TASK_SM, SmAddingChanState)
     # Copy connection flags to vif[1496]
     let connFlags = ci.channelDuration
-    vifKeyPointersAt(vifBase).flags = connFlags
+    vifKeyPointers(vif).flags = connFlags
     if (connFlags and 4) != 0:
       var f = apCfg.securityFlags
       f = f and (not 7'u32)  # Clear bits 0-2
@@ -31362,7 +39287,7 @@ proc sm_connect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## existing connections, allocates connect env message, initiates scan.
   ##
   ## Flow from disasm:
-  ##   1. ke_state_get(TASK_SM=4): if state==10, return s1=2 (MSG_SAVED)
+  ##   1. ke_state_get(TASK_SM=4): if state==10, return KeMsgSaved
   ##   2. Allocate SM_CONNECT_CFM (0x1001) for response
   ##   3. ke_state_get(TASK_SM=4): if state!=0, return status=8 (busy)
   ##   4. Resolve VIF: check vif_info_tab[vif_idx].type(+86) and active(+88)
@@ -31373,14 +39298,14 @@ proc sm_connect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ##   9. Allocate large connect msg (0x1002, size=860)
   ##  10. Setup: store connect params, clear flags, initiate scan
   ##  11. Return: write status to CFM and send
-  if param == nil: return 0
+  if param == nil: return KeMsgConsumed
   let req = connectInfoView(param)
   let vifIdx = req.vifIdx
 
   # Check SM state first
   let state1 = ke_state_get(TASK_SM)
   if state1 == 10:
-    return 2  # SM busy, message will be re-queued
+    return KeMsgSaved
 
   var cfmStatus: uint8 = 0
   var earlyExit = false
@@ -31429,14 +39354,13 @@ proc sm_connect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
     if cfm != nil:
       cfm.status = cfmStatus
       ke_msg_send(cfm)
-    return 0
+    return KeMsgConsumed
 
   # Post-CFM success steps (blob: direct join when a target BSSID/channel is
   # already known, otherwise start a scan using the VIF MAC as the source).
   var resultPtr: pointer = nil
   var chanPtr: pointer = nil
-  let freqHint = cast[ptr uint16](addr req.channelHint[0])[]
-  if freqHint != 0xFFFF'u16:
+  if connectInfoHasChannelHint(req):
     resultPtr = cast[pointer](addr req.bssid[0])
     chanPtr = connectInfoChannelHint(param)
   else:
@@ -31461,7 +39385,7 @@ proc sm_connect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
     sm_join_bss(vifMac, resultPtr, chanPtr, 0)
   else:
     sm_scan_bss(vifMac, resultPtr, chanPtr)
-  return 1
+  return KeMsgNoFree
 
 proc sm_disconnect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle SM_DISCONNECT_REQ: disconnect from BSS (88 bytes in blob).
@@ -31474,14 +39398,14 @@ proc sm_disconnect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   let state = ke_state_get(TASK_SM)
   nimFwDbgDisconnectReqState = state.uint32
   if state != SmIdleState:
-    return 2
+    return KeMsgSaved
   sm_connection_tlv_set(0, nil, 0)  # stub (just ret in blob)
   let vifIdx = smReqVifIdxOrZero(param)
   sm_handle_connection(vifIdx.uint32, 19'u32,
     cast[pointer](sm_disconnect_deauth_cfm),
     cast[pointer](sm_disconnect_process))
   ke_msg_send_basic(SM_DISCONNECT_CFM, TASK_API, TASK_SM)
-  return 0
+  return KeMsgConsumed
 
 proc sm_connect_abort_req_handler*(param: pointer) {.exportc, cdecl.} =
   ## Handle SM_CONNECT_ABORT_REQ: abort ongoing connection (198 bytes in blob).
@@ -31529,8 +39453,7 @@ proc sm_rsp_timeout_ind_handler*(param: pointer) {.exportc, cdecl.} =
   ##   - If no connection env: return 0
   ##   - State must be in the auth/assoc response window after channel grant
   ##   - Check retry count (conn_env[60]) vs max retries (sm_env word at byte 24)
-  ##   - If retries available: increment, state 6 -> wpa_cbs[64]() + sm_auth_send_pre(1,0);
-  ##     state 7 -> sm_assoc_req_send_pre()
+  ##   - If retries available: increment, state 5/6 -> wpa_cbs[64]() + sm_auth_send(1,0)
   ##   - If retries exhausted: sm_connect_ind(11, 0xFFFF)
   let sm = smEnvView()
   let connEnv = sm.connectInfo
@@ -31542,7 +39465,7 @@ proc sm_rsp_timeout_ind_handler*(param: pointer) {.exportc, cdecl.} =
                           state.uint32, cast[uint32](cast[uint](connEnv)))
   if connEnv == nil:
     return
-  if state < SmAuthenticatingState or state > SM_ACTIVATING_STATE:
+  if state != SmAuthStartingState and state != SmAuthenticatingState:
     return
   let retryCount = connectInfoAuthRetry(connEnv)[]
   let maxRetries = sm.authRetryLimit
@@ -31557,16 +39480,12 @@ proc sm_rsp_timeout_ind_handler*(param: pointer) {.exportc, cdecl.} =
     return
   # Increment retry count
   connectInfoAuthRetry(connEnv)[] = retryCount + 1
-  if state == SmAuthenticatingState:
-    # Auth timeout: call wpa_cbs[64] callback, then retry auth
-    if wpa_cbs != nil:
-      let wpaCbFn = cast[ptr pointer](cast[uint](wpa_cbs) + 64)[]
-      if wpaCbFn != nil:
-        cast[proc() {.cdecl.}](wpaCbFn)()
-    sm_auth_send_pre(1'u16, 0)
-  else:
-    # Assoc/activation timeout: retry association
-    sm_assoc_req_send_pre(nil)
+  # Vendor retries authentication for both response-wait states.
+  if wpa_cbs != nil:
+    let wpaCbFn = wpaCallbacks().authTimeout
+    if wpaCbFn != nil:
+      cast[proc() {.cdecl.}](wpaCbFn)()
+  sm_auth_send(1'u16, 0)
 
 proc sm_sa_query_timeout_ind_handler*(param: pointer) {.exportc, cdecl.} =
   ## Handle SM_SA_QUERY_TIMEOUT_IND (158b in blob, sm.o).
@@ -31585,12 +39504,11 @@ proc sm_sa_query_timeout_ind_handler*(param: pointer) {.exportc, cdecl.} =
     return
   # Retry count exhausted: disconnect
   let staIdx = sm.saQueryVifIdx
-  let staBase = cast[uint](addr sta_info_tab[0])
-  let staEntry = staBase + staIdx.uint * STA_ENTRY_SIZE.uint
+  let sta = staInfoForIdx(staIdx)
   # Read VIF idx from sm_env halfword at offset 42
   let vifIdx = sm.saQueryReason
   let saField = sm.saQueryField39
-  let vifBase = cast[uint](addr vif_info_tab[0]) + vifIdx.uint * VIF_ENTRY_SIZE.uint
+  let vif = vifChannelForIdx(vifIdx.uint8)
   # Clear SA query flag
   sm.saQueryActive = 0
   ke_state_set(TASK_SM, SmDisconnectingState)
@@ -31598,9 +39516,9 @@ proc sm_sa_query_timeout_ind_handler*(param: pointer) {.exportc, cdecl.} =
   let logFn = blOpsFunc(204)
   if logFn != nil:
     cast[proc(a0: pointer, a1: uint16) {.cdecl.}](logFn)(
-      cast[pointer](staEntry), vifIdx)
+      cast[pointer](sta), vifIdx)
   # Disconnect (blob: sm_disconnect_process, not sm_disconnect)
-  sm_disconnect_process(cast[pointer](vifBase), 20, 0xFFFF'u16)
+  sm_disconnect_process(cast[pointer](vif), 20, 0xFFFF'u16)
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void sm_disconnect(void*);".}
 proc sm_disconnect*(param: pointer) {.exportc, cdecl.} =
@@ -31615,7 +39533,8 @@ proc sm_disconnect*(param: pointer) {.exportc, cdecl.} =
   let smConnInfo = smEnvView().connectInfo
   if smConnInfo == nil:
     return
-  let vifIdx = connectInfoView(smConnInfo).vifIdx
+  let ci = connectInfoView(smConnInfo)
+  let vifIdx = ci.vifIdx
   let vif = vifChannelForIdx(vifIdx)
   if vif.vifType != 0:
     return  # not a STA VIF
@@ -31630,28 +39549,28 @@ proc sm_disconnect*(param: pointer) {.exportc, cdecl.} =
     # Blob: tail-call sm_disconnect_process(vif, 20, 3) on frame alloc failure
     sm_disconnect_process(cast[pointer](vif), 20, reason)
     return
+  let desc = hostTxDescAt(txFrame)
+  let hdr = hostTxDataHeader(desc)
   # Build deauth frame body using me_build_deauthenticate
-  let frameBodyPtr = cast[pointer](cast[uint](txFrame) + 348)
+  let frameBodyPtr = cast[pointer](hdr)
   let bodyLen = me_build_deauthenticate(frameBodyPtr, reason)
   # Set sequence control
   let seqCtrl = txl_get_seq_ctrl()
+  hdr.seqCtrl = seqCtrl
   # Copy DA, SA, BSSID from VIF/STA entries
-  let smBssid = cast[uint](smConnInfo) + 4  # BSSID at connInfo+4
-  discard c_memcpy(cast[pointer](cast[uint](txFrame) + 352), cast[pointer](smBssid), 6.csize_t)  # DA
-  discard c_memcpy(cast[pointer](cast[uint](txFrame) + 358),
+  discard c_memcpy(addr hdr.addr1[0], addr ci.bssid[0], 6.csize_t)  # DA
+  discard c_memcpy(addr hdr.addr2[0],
                    cast[pointer](addr vif.macAddr[0]), 6.csize_t)  # SA
-  discard c_memcpy(cast[pointer](cast[uint](txFrame) + 364), cast[pointer](smBssid), 6.csize_t)  # BSSID
+  discard c_memcpy(addr hdr.addr3[0], addr ci.bssid[0], 6.csize_t)  # BSSID
   # Set STA/VIF info in frame descriptor
-  cast[ptr uint8](cast[uint](txFrame) + 47)[] = staIdx
-  cast[ptr uint8](cast[uint](txFrame) + 49)[] = vif.staIdx
+  desc.vifIdx = staIdx
+  desc.staInfoIdx = vif.staIdx
   # Register deauth TX-completion callback (blob: sw &sm_disconnect_deauth_cfm
   # at descriptor+208). Fires when the HW actually sends the deauth frame.
-  cast[ptr pointer](cast[uint](txFrame) + 208)[] = cast[pointer](sm_disconnect_deauth_cfm)
+  desc.callback = cast[pointer](sm_disconnect_deauth_cfm)
   # MFP protection. Blob reads fc from frame body header (bytes 0/1 of the
   # MAC header living at txFrame+348, i.e. frameBodyPtr[0..1]).
-  let fcLoD = cast[ptr uint8](frameBodyPtr)[]
-  let fcHiD = cast[ptr uint8](cast[uint](frameBodyPtr) + 1)[]
-  let fcD = fcLoD.uint32 or (fcHiD.uint32 shl 8)
+  let fcD = hdr.frameControl.uint32
   discard mfp_protect_mgmt_frame(txFrame, fcD, 0'u32)
   # Apply MFP protection and MIC
   txu_cntrl_protect_mgmt_frame(txFrame, frameBodyPtr, bodyLen)
@@ -31664,38 +39583,26 @@ proc sm_disconnect*(param: pointer) {.exportc, cdecl.} =
   # Do NOT send another SM_DISCONNECT_IND here (would be duplicate)
   sm_disconnect_process(cast[pointer](vif), 0, reason)
 
-proc sm_delete_resources*() {.exportc, cdecl.} =
+proc sm_delete_resources*(param: pointer = nil) {.exportc, cdecl.} =
   ## Clean up SM resources after disconnect (76 instrs in blob).
-  ## From blob (sm.o): sends SM_DISCONNECT_IND (msgId=0xC0F), sends
-  ## SM_CONNECT_IND (msgId=0xC0D), clears VIF linkage, calls ke_state_set(4,0),
-  ## clears STA entry if assigned (sta_idx != 0xFF), clears channel context
-  ## if assigned (vif[64] != nil). Clears sm_env connection state.
-  var statusByte: uint8
-  {.emit: ["asm volatile(\"mv %0, a0\" : \"=r\"(", statusByte, ") );"].}
+  ## From blob (sm.o): clears VIF linkage, calls ke_state_set(4,0), clears STA
+  ## entry if assigned (sta_idx != 0xFF), clears channel context if assigned
+  ## (vif[64] != nil). Host indications are sent by sm_connect_ind or
+  ## sm_disconnect_process; cleanup itself must not emit them.
+  inc nimFwDbgDisconnectInd
   let sm = smEnvView()
   let smConnInfo = sm.connectInfo
-  if smConnInfo == nil:
-    return
-  let vifIdx = connectInfoView(smConnInfo).vifIdx
-  let vif = vifChannelForIdx(vifIdx)
-  # Send SM_DISCONNECT_IND (0xC0F) to the host API task.
-  let discInd = cast[ptr SmDisconnectIndPayload](
-    ke_msg_alloc(SM_DISCONNECT_IND, TASK_API, TASK_SM,
-                 SmDisconnectIndPayloadSize))
-  if discInd != nil:
-    discInd.status = 0
-    discInd.vifIdx = vifIdx
-    ke_msg_send(discInd)
-  # Send SM_CONNECT_IND (0xC0D) to the host API task.
-  let connInd = cast[ptr Status4CfmPayload](
-    ke_msg_alloc(SM_CONNECT_IND_MSG, TASK_API, TASK_SM,
-                 Status4CfmPayloadSize))
-  if connInd != nil:
-    connInd.status = 0
-    ke_msg_send(connInd)
+  var vif: ptr VifChannelView = nil
+  var vifIdx: uint8 = 0
+  if param != nil:
+    vif = vifChannelAt(param)
+    vifIdx = vif.vifIdx
+  elif smConnInfo != nil:
+    vifIdx = connectInfoView(smConnInfo).vifIdx
+    vif = vifChannelForIdx(vifIdx)
   # Clear station entry if assigned
-  let staIdx = vif.staIdx
-  if staIdx != 0xFF:
+  let staIdx = if vif != nil: vif.staIdx else: 0xFF'u8
+  if staIdx != 0xFF'u8:
     # Send STA del message
     let staDel = cast[ptr MeStaDelReqPayload](
       ke_msg_alloc(MM_STA_DEL_REQ, TASK_MM, TASK_SM,
@@ -31704,7 +39611,7 @@ proc sm_delete_resources*() {.exportc, cdecl.} =
       staDel.staIdx = staIdx
       ke_msg_send(staDel)
   # Clear VIF active flag
-  if vif.state != 0:
+  if vif != nil and vif.state != 0:
     let vifStateMsg = cast[ptr MmSetVifStateReqPayload](
       ke_msg_alloc(MM_SET_VIF_STATE_REQ, TASK_MM, TASK_SM,
                    MmSetVifStateReqPayloadSize))
@@ -31714,14 +39621,12 @@ proc sm_delete_resources*() {.exportc, cdecl.} =
       vifStateMsg.vifIdx = vifIdx
       ke_msg_send(vifStateMsg)
   # Clear channel context link
-  let chanCtxt = vif.chanCtxt
+  let chanCtxt = if vif != nil: vif.chanCtxt else: nil
   if chanCtxt != nil:
     chan_ctxt_unlink(vifIdx)  # blob: chan_ctxt_unlink (not mm_sta_del)
-  # Blob sends SM_DISCONNECT_IND once (already emitted above). Previous Nim
-  # issued a second "finalInd" SM_DISCONNECT_IND, duplicating the host
-  # notification. Removed.
   # Clear sm_env[484] (status word)
-  vifApConfig(vif).securityFlags = 0
+  if vif != nil:
+    vifApConfig(vif).securityFlags = 0
   sm.connectInfo = nil
   ke_state_set(TASK_SM, SmIdleState)
 
@@ -31738,6 +39643,7 @@ proc sm_auth_assoc_send_according_chan*(nextState: uint16 = 0, param1: uint16 = 
   if connInfo == nil:
     return
   let vifIdx = connectInfoView(connInfo).vifIdx
+  let vif = vifChannelForIdx(vifIdx)
   # Check if we can send directly (single channel or dominant)
   let chanCnt = chan_ctxt_cnt()
   when defined(bl808WifiConnectTrace):
@@ -31762,13 +39668,12 @@ proc sm_auth_assoc_send_according_chan*(nextState: uint16 = 0, param1: uint16 = 
       sm_assoc_req_send(nil)
     return
   # Check remaining channel time
-  let vifBase = cast[uint](addr vif_info_tab[0]) + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let remaining = chan_ctxt_get_remaining_time_ms(cast[pointer](vifBase))
+  let remaining = chan_ctxt_get_remaining_time_ms(cast[pointer](vif))
   when defined(bl808WifiConnectTrace):
     nimFwTrace2U32("[WIFI-NIMFW] auth_sched_rem ",
-                   remaining, cast[uint32](cast[uint](vifBase)))
+                   remaining, pointerAddrU32(cast[pointer](vif)))
     nimFwConnectTrace2U32("[WIFI-CT] auth_rem ",
-                          remaining, cast[uint32](cast[uint](vifBase)))
+                          remaining, pointerAddrU32(cast[pointer](vif)))
   if remaining == 0 or (remaining - 41) <= 158:
     # Not enough time, send directly
     when defined(bl808WifiConnectTrace):
@@ -31841,7 +39746,6 @@ proc apm_start_req_handler*(param: pointer) {.exportc, cdecl.} =
   # letting every branch fall through to the shared send at the bottom.
   let vifIdx = req.vifIdx
   let vif = vifChannelForIdx(vifIdx)
-  let vifBase = cast[uint](vif)
   let apm = apmEnvView()
   var earlyExit = false
 
@@ -31890,7 +39794,7 @@ proc apm_start_req_handler*(param: pointer) {.exportc, cdecl.} =
    vif.operChan = chanPtr
    let apCfg = vifApConfig(vif)
    # Set bandwidth type
-   cast[ptr uint8](vifBase + 4)[] = req.channel.chanType  # via chan_ptr
+   vifChannelTypeByte(vif)[] = req.channel.chanType  # via chan_ptr
    # Store center frequencies
    vif.channelFreqPair =
      req.channel.primFreq.uint32 or (req.channel.centerFreq.uint32 shl 16)
@@ -31906,7 +39810,7 @@ proc apm_start_req_handler*(param: pointer) {.exportc, cdecl.} =
    apm.beaconIntervalIndex = req.beaconIntervalIndex
    apm.flags = req.flags
    # Check if AP embedded mode is enabled
-   let embedded = apm_embedded_enabled(cast[pointer](vifBase))
+   let embedded = apm_embedded_enabled(cast[pointer](vif))
    if not embedded:
      discard  # Skip embedded-only setup, jump to beacon build
    else:
@@ -31942,7 +39846,8 @@ proc apm_start_req_handler*(param: pointer) {.exportc, cdecl.} =
      # Clear probe response length
      vif.modeByte452 = 0
      # Set AID bitmap and feature flag
-     apCfg.aidBitmapFeature = 0xFFFF0000'u32
+     apCfg.aidBitmapFeatureLow = 0
+     apCfg.maxAssocRate = 0xFFFF'u16
    # Allocate the transient beacon buffer. Blob calls g_bl_ops_funcs[184] with
    # 333 bytes and stores the returned pointer at apm_env+16; apm_bcn_set copies
    # from this buffer, frees it through g_bl_ops_funcs[188], then clears it.
@@ -31961,7 +39866,7 @@ proc apm_start_req_handler*(param: pointer) {.exportc, cdecl.} =
    # Store VIF index
    apm.vifIdx = vifIdx
    # Clear WPA type
-   let sec = vifSecurityAt(vifBase)
+   let sec = vifSecurity(vif)
    sec.cipher = 0
    # HT capability check. Blob builds a 112-byte stack descriptor then
    # invokes wpa_cbs[24] (register-beacon callback):
@@ -31975,25 +39880,23 @@ proc apm_start_req_handler*(param: pointer) {.exportc, cdecl.} =
    if req.htCapSsidLen != 0:
      var haBuf {.noinit.}: array[144, uint8]
      discard c_memset(addr haBuf[0], 0, 112.csize_t)
-     haBuf[0] = req.vifIdx
-     # 6-byte BSSID inlined as word+halfword (blob inlines, no memcpy call)
-     cast[ptr uint32](addr haBuf[1])[] =
-       cast[ptr uint32](addr vif.bssid[0])[]
-     cast[ptr uint16](addr haBuf[5])[] =
-       cast[ptr uint16](addr vif.bssid[4])[]
+     let beaconReg = cast[ptr WpaBeaconRegisterParamView](addr haBuf[0])
+     beaconReg.vifIdx = req.vifIdx
+     beaconReg.bssid = vif.bssid
      let rateCount = vif.supportedRatesLong[0]
-     cast[ptr uint32](addr haBuf[40])[] = rateCount.uint32
-     discard c_memcpy(addr haBuf[44], addr vif.supportedRatesLong[1],
+     beaconReg.rateCount = rateCount.uint32
+     discard c_memcpy(addr beaconReg.rates[0], addr vif.supportedRatesLong[1],
                      rateCount.csize_t)
-     cast[ptr uint16](addr haBuf[76])[] = 0x0403'u16
+     beaconReg.marker = 0x0403'u16
      let ssidP = cast[pointer](addr req.ssid[0])
      let ssidLen = c_strlen(ssidP)
-     discard c_memcpy(addr haBuf[78], ssidP, ssidLen)
-     haBuf[142] = 0
+     discard c_memcpy(addr beaconReg.ssid[0], ssidP, ssidLen)
+     beaconReg.terminator = 0
      sec.cipher = 3
-     let wpaBcnCb = cast[ptr pointer](cast[uint](wpa_cbs) + 24)[]
-     if wpaBcnCb != nil:
-       cast[proc(buf: pointer) {.cdecl.}](wpaBcnCb)(addr haBuf[0])
+     if wpa_cbs != nil:
+       let wpaBcnCb = wpaCallbacks().beaconRegister
+       if wpaBcnCb != nil:
+         cast[proc(buf: pointer) {.cdecl.}](wpaBcnCb)(addr haBuf[0])
    # Build beacon into the transient AP buffer and store the generated length
    # back into the request payload at offset 36, matching blob `sh a0,36(s0)`.
    var bcnLen: uint16 = 0
@@ -32029,8 +39932,12 @@ proc apm_start_req_handler*(param: pointer) {.exportc, cdecl.} =
    var tpcPowerByte: uint8
    var tpcRateParam: uint8
    if chanPtrForTpc != nil:
-     tpcPowerByte = cast[ptr uint8](cast[uint](chanPtrForTpc) + 4)[]
-   tpc_update_vif_tx_power(cast[pointer](vifBase), cast[pointer](addr tpcPowerByte), cast[pointer](addr tpcRateParam))
+     let chan = cast[ptr ScanChannelEntry](chanPtrForTpc)
+     tpcPowerByte = cast[ptr uint8](addr chan.txPower)[]
+   tpc_update_vif_tx_power(
+     cast[pointer](vif),
+     cast[pointer](addr tpcPowerByte),
+     cast[pointer](addr tpcRateParam))
    # Success path: errorCode = 0 for the shared tail CFM send below. Blob
    # does NOT call ke_state_set here (state transition happens elsewhere).
    errorCode = 0
@@ -32075,9 +39982,11 @@ proc apm_stop_req_handler*(param: pointer) {.exportc, cdecl.} =
       # Call apm_stop (blob: apm_stop at 0x88)
       apm_stop(cast[pointer](vif))
       # Call wpa_cbs[7] (offset 28) with apm_env[0xac] as arg (blob: no null checks)
-      let wpaCbFn = cast[ptr pointer](cast[uint](wpa_cbs) + 28)[]
-      let timerArg = cast[uint32](cast[uint](apm.hostapdCtx))
-      cast[proc(a0: uint32) {.cdecl.}](wpaCbFn)(timerArg)
+      if wpa_cbs != nil:
+        let wpaCbFn = wpaCallbacks().apStopped
+        if wpaCbFn != nil:
+          let timerArg = cast[uint32](cast[uint](apm.hostapdCtx))
+          cast[proc(a0: uint32) {.cdecl.}](wpaCbFn)(timerArg)
       # Clear apm timer pointer at apm_env[0xac]
       apm.hostapdCtx = nil
 
@@ -32119,7 +40028,7 @@ proc apm_sta_add_cfm_handler*(param: pointer) {.exportc, cdecl.} =
         if apm.hostapdCtx != nil:
           let wpaCbsPtr = wpa_cbs
           if wpaCbsPtr != nil:
-            let cbFn = cast[ptr pointer](cast[uint](wpaCbsPtr) + 36)[]
+            let cbFn = wpaCallbacks().staAdd
             if cbFn != nil:
               let stored = cast[uint32](slot.staHandle)
               cast[proc(p: pointer, v: uint32) {.cdecl.}](cbFn)(param, stored)
@@ -32283,7 +40192,6 @@ proc me_config_req_handler*(param: pointer) {.exportc, cdecl.} =
   # Process HT capabilities
   if htSupp != 0:
     # Get NSS from PHY (blob: phy_get_nss at 0x64)
-    proc phy_get_nss(): uint8 {.importc, cdecl.}
     let nss = phy_get_nss()
     me.nss = nss
     let htCapInfo = cast[ptr uint16](addr me.htCaps[0])[]
@@ -32371,10 +40279,10 @@ proc me_sta_add_req_handler*(param: pointer) {.exportc, cdecl.} =
                        32.csize_t)
     sta.capabilityFlags = capaFlags
     # Set HT/VHT params
-    # Blob: me_set_sta_ht_vht_param(staEntry, vif_info_tab + staIdx*VIF_SIZE + 348)
-    let vifEntryBase = cast[uint](addr vif_info_tab[0]) + staIdx.uint * 1512'u  # VIF_ENTRY_SIZE * staIdx (blob uses 1512=0x5E8)
+    let vif = vifChannelForIdx(staIdx)
     # Cast to match blob ABI: first arg is sta entry pointer
-    me_set_sta_ht_vht_param(cast[pointer](sta), cast[pointer](vifEntryBase + 348))
+    me_set_sta_ht_vht_param(cast[pointer](sta),
+                            cast[pointer](vifHtCapabilities(vif)))
     # Check HE flag (bit 3 of req[64])
     if (htCapBit and 8) != 0:
       var capa2 = sta.capabilityFlags
@@ -32384,14 +40292,11 @@ proc me_sta_add_req_handler*(param: pointer) {.exportc, cdecl.} =
     me_init_rate(cast[pointer](sta))
     # Set mm_flags bit 4 in sta[334] (blob: ori a5,a5,0x10 at offset ~0x17E)
     sta.mmFlagsBytes[0] = sta.mmFlagsBytes[0] or 0x10'u8
-    # Compute rx_nss from VIF entry and write to sta[72]
-    # Blob: rx_nss = 2 - (vif_info_tab[vif*1512 + 0x5D8] & 1)
-    let nssFlag = cast[ptr uint8](vifEntryBase + 0x5D8)[]
+    # Compute rx_nss from VIF key flags and write to sta[72].
+    let nssFlag = (vifKeyPointers(vif).flags and 0xFF).uint8
     let rxNss = 2'u8 - (nssFlag and 1)
     sta.rxNss = rxNss
-    # Copy u16 from vif_info_tab[vif+0x150] to sta[70]
-    let vifRateWord = cast[ptr uint16](vifEntryBase + 0x150)[]
-    sta.rateWord = vifRateWord
+    sta.rateWord = vif.apStartBeaconInterval
     # Copy UAPSD info from req[70,71] to sta[314,315]
     sta.psState = req.uapsd0
     sta.uapsdBitmap = req.uapsd1
@@ -32422,13 +40327,13 @@ proc me_sta_del_req_handler*(param: pointer) {.exportc, cdecl.} =
 proc me_set_active_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle ME_SET_ACTIVE_REQ (196 bytes in blob, 52 instrs).
   ## From blob (me_task.o): manages per-VIF bitmask me_env.active_mask(offset 0).
-  ## If ME is busy: returns 2. Reads req[0]=active(bool), req[1]=vif_idx.
+  ## If ME is busy: returns KeMsgSaved. Reads req[0]=active(bool), req[1]=vif_idx.
   ## If active: set bit; else clear bit. Allocates ME_SET_ACTIVE_CFM (id=26),
   ## sets status=seqz(mask), sends cfm, transitions to BUSY.
   ## Fast path: if mask already 0 and deactivating, just send basic cfm.
   let state = ke_state_get(TASK_ME)
   if state == MeBusyState:
-    return 2  # ME_BUSY, message saved
+    return KeMsgSaved
   let me = meEnvView()
   let hdr = keMsgHdrFromPayload(param)
   let reqSrc = hdr.srcId
@@ -32441,12 +40346,12 @@ proc me_set_active_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   if oldMask == 0 and active == 0:
     # Already all inactive, just send basic cfm
     ke_msg_send_basic(ME_SET_ACTIVE_CFM, reqSrc, reqDst)
-    return 0
+    return KeMsgConsumed
   if oldMask != 0 and active != 0:
     # Set bit and send basic (already active path)
     me.activeMask = oldMask or bit
     ke_msg_send_basic(ME_SET_ACTIVE_CFM, reqSrc, reqDst)
-    return 0
+    return KeMsgConsumed
   # Main path: alloc full cfm
   var newMask: uint32
   if active != 0:
@@ -32461,7 +40366,25 @@ proc me_set_active_req_handler*(param: pointer): cint {.exportc, cdecl.} =
     cfm.status = if newMask == 0: 1'u8 else: 0'u8
     ke_msg_send(cfm)
   ke_state_set(TASK_ME, MeBusyState)
-  return 0
+  return KeMsgConsumed
+
+proc smSetActiveCfmStateAllowed(): bool {.inline.} =
+  ## Preserve the blob's two independent TASK_SM state reads while making the
+  ## allowed confirmation states explicit.
+  if ke_state_get(TASK_SM) == SmSettingBssState:
+    return true
+  if ke_state_get(TASK_SM) == SmDisconnectingState:
+    return true
+  return false
+
+proc apmSetActiveCfmStateAllowed(): bool {.inline.} =
+  ## Preserve the blob's two independent TASK_APM state reads while making the
+  ## allowed confirmation states explicit.
+  if ke_state_get(TASK_APM) == ApmActiveState:
+    return true
+  if ke_state_get(TASK_APM) == ApmIdleState:
+    return true
+  return false
 
 proc me_set_active_cfm_handler_sm*(param: pointer) {.exportc: "me_set_active_cfm_handler_sm", cdecl.} =
   ## Blob sm_task.o::me_set_active_cfm_handler (136 bytes).
@@ -32472,11 +40395,7 @@ proc me_set_active_cfm_handler_sm*(param: pointer) {.exportc: "me_set_active_cfm
   ##   .L31: if ke_state_get(SM) == disconnecting → set idle; return
   ##   .L33: if sm_env[17] != 0 → sm_deauth_send; sm_env[17] = 0
   ##         sm_auth_start(NULL)
-  if ke_state_get(TASK_SM) == SmSettingBssState:
-    discard
-  elif ke_state_get(TASK_SM) == SmDisconnectingState:
-    discard
-  else:
+  if not smSetActiveCfmStateAllowed():
     assert_err("me_task.c", "me_task.c", 690)
   if ke_state_get(TASK_SM) == SmDisconnectingState:
     ke_state_set(TASK_SM, SmIdleState)
@@ -32516,11 +40435,7 @@ proc me_set_active_cfm_handler_apm*(param: pointer) {.exportc: "me_set_active_cf
   ##   .L69: if ke_state_get(APM) == active:
   ##     if apm_env[4] != NULL → assert_err(320)
   ##     apm_bcn_set(NULL)
-  if ke_state_get(TASK_APM) == ApmActiveState:
-    discard
-  elif ke_state_get(TASK_APM) == ApmIdleState:
-    discard
-  else:
+  if not apmSetActiveCfmStateAllowed():
     assert_err("apm_task.c", "apm_task.c", 313)
   if ke_state_get(TASK_APM) == ApmActiveState:
     if apmEnvView().pendingBssParams.first != nil:
@@ -32540,10 +40455,10 @@ proc me_set_ps_disable_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   if me.psOn == 0:
     # PS not configured, just send basic cfm
     ke_msg_send_basic(ME_SET_PS_DISABLE_CFM, reqSrc, reqDst)
-    return 0
+    return KeMsgConsumed
   let state = ke_state_get(TASK_ME)
   if state == MeBusyState:
-    return 2  # ME_BUSY
+    return KeMsgSaved
   let oldMask = me.psDisableMask
   let req = cast[ptr MeSetPsDisableReqPayload](param)
   let psDisable = req.disable
@@ -32551,11 +40466,11 @@ proc me_set_ps_disable_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   let bit = 1'u32 shl vifIdx
   if oldMask == 0 and psDisable == 0:
     ke_msg_send_basic(ME_SET_PS_DISABLE_CFM, reqSrc, reqDst)
-    return 0
+    return KeMsgConsumed
   if oldMask != 0 and psDisable != 0:
     me.psDisableMask = oldMask or bit
     ke_msg_send_basic(ME_SET_PS_DISABLE_CFM, reqSrc, reqDst)
-    return 0
+    return KeMsgConsumed
   # Main path
   var newMask: uint32
   if psDisable != 0:
@@ -32570,7 +40485,7 @@ proc me_set_ps_disable_req_handler*(param: pointer): cint {.exportc, cdecl.} =
     cfm.status = if newMask == 0: 2'u8 else: 0'u8
     ke_msg_send(cfm)
   ke_state_set(TASK_ME, MeBusyState)
-  return 0
+  return KeMsgConsumed
 
 proc me_set_ps_disable_cfm_handler_sm*(param: pointer) {.exportc: "me_set_ps_disable_cfm_handler_sm", cdecl.} =
   ## Blob sm_task.o (108 bytes). Linear structure: 4 ke_state_get calls
@@ -32615,18 +40530,17 @@ proc me_rc_set_rate_req_handler*(param: pointer) {.exportc, cdecl.} =
   if rcPtr == nil:
     assert_err("me_task.c", "me_task.c", 653)
   let rcBase = cast[uint](rcPtr)
+  let rc = rcStatsCounters(rcPtr)
   let fixedRate = req.fixedRate
   if fixedRate == 0xFFFF:
     # Auto rate: clear fixed_rate, clear bits 5,6 of flags,
     # then call rc_update_bw_nss_max(sta[40], rc[187], rc[188])
-    cast[ptr uint16](rcBase + 198)[] = 0xFFFF'u16
-    var flags = cast[ptr uint8](rcBase + 175)[]
+    rc.fixedRate = 0xFFFF'u16
+    var flags = rc.flags
     flags = flags and not 0x60'u8  # Clear bits 5,6
-    cast[ptr uint8](rcBase + 175)[] = flags
+    rc.flags = flags
     let staField40 = sta.infoIdx
-    let rcNss = cast[ptr uint8](rcBase + 187)[]
-    let rcBw = cast[ptr uint8](rcBase + 188)[]
-    rc_update_bw_nss_max(staField40, rcNss, rcBw)
+    rc_update_bw_nss_max(staField40, rc.nssMax, rc.bwMax)
   else:
     # Fixed rate mode: call rc_check_fixed_rate_config(rcPtr, fixedRate)
     # Blob ABI: a0=rcPtr, a1=fixedRate. Nim's signature takes (staIdx: uint8)
@@ -32639,11 +40553,11 @@ proc me_rc_set_rate_req_handler*(param: pointer) {.exportc, cdecl.} =
     """, configOk, """ = rc_check_fixed_rate_config((NU8)(NI)_a0);
     """].}
     if configOk:
-      cast[ptr uint16](rcBase + 198)[] = fixedRate
-      var flags = cast[ptr uint8](rcBase + 175)[]
+      rc.fixedRate = fixedRate
+      var flags = rc.flags
       flags = flags and not 0x60'u8  # Clear bits 5,6
       flags = flags or 0x20'u8  # Set bit 5 (fixed rate flag)
-      cast[ptr uint8](rcBase + 175)[] = flags
+      rc.flags = flags
   # Check mcs_rate field at req[4]
   if req.mcsRate != 0:
     sta.mmFlagsBytes[0] = sta.mmFlagsBytes[0] or 0x10'u8
@@ -32750,7 +40664,6 @@ proc chan_get_next_chan*(): pointer {.exportc, cdecl.} =
   ## Stage 3: Scan 3 candidate channel entries, pick highest priority active one.
   ## Stage 4: Return best or ASSERT if none found.
   let env = chanEnvView()
-  let chanBase = cast[uint](env)
   let curChan = env.currentCtxt
   let rocChan = cast[pointer](env.tbttSwitchList.first)
   let macTime = regRead(MACHW_TIMLO_REG)
@@ -32759,8 +40672,8 @@ proc chan_get_next_chan*(): pointer {.exportc, cdecl.} =
   # Stage 1: Check current channel
   if curChan != nil:
     if rocChan != nil:
-      let rocType = cast[ptr uint8](cast[uint](rocChan) + 10)[]
-      if rocType == 2:
+      let rocNode = chanTbttNodeAt(rocChan)
+      if rocNode.state == 2:
         return curChan
     # Check if timestamp is not overdue (TSF + 5120 >= timestamp)
     let margin = macTime + 5120'u32
@@ -32771,15 +40684,14 @@ proc chan_get_next_chan*(): pointer {.exportc, cdecl.} =
       return curChan
   # Stage 2: Check ROC channel
   if rocChan != nil:
-    let rocDeadline = cast[ptr uint32](cast[uint](rocChan) + 4)[]
+    let rocNode = chanTbttNodeAt(rocChan)
+    let rocDeadline = rocNode.targetTime
     if cast[int32](rocDeadline - timestamp) >= 0:
       # ROC not expired, skip to candidates
       discard
     else:
       # ROC expired: look up channel entry
-      let rocIdx = cast[ptr uint8](cast[uint](rocChan) + 8)[]
-      let vifBase = cast[uint](addr vif_info_tab[0]) + rocIdx.uint * VIF_ENTRY_SIZE.uint
-      best = vifChannelAt(vifBase).chanCtxt
+      best = vifChannelForIdx(rocNode.vifIdx).chanCtxt
       if best == nil:
         assert_err("chan.c", "chan.c", 338)
       # Check if (TSF + 5120) - deadline is within acceptable range
@@ -32792,19 +40704,15 @@ proc chan_get_next_chan*(): pointer {.exportc, cdecl.} =
       let delta = cast[int32](rocDeadline - macTime)
       if delta > 0 and delta.uint32 <= slotDur.uint32:
         return best
-  # Stage 3: Scan 3 candidate channel entries for best priority
+  # Stage 3: Scan the three channel-context pool entries for best priority.
   best = nil
   var bestPrio: uint16 = 0
-  # Candidates are at a fixed location relative to chan_env
-  # Each candidate is 28 bytes, with state at +22 and priority at +18
-  let candBase = chanBase + 80  # Approximate offset for candidate array
-  for i in 0..2:
-    let candAddr = candBase + (i * 28).uint
-    let candState = cast[ptr uint8](candAddr + 22)[]
-    if candState != 0:
-      let candPrio = cast[ptr uint16](candAddr + 18)[]
+  for i in 0'u8 .. 2'u8:
+    let cand = chanCtxtForIdx(i)
+    if cand.status != 0:
+      let candPrio = cand.opSlot
       if candPrio >= bestPrio:
-        best = cast[pointer](candAddr)
+        best = cast[pointer](cand)
         bestPrio = candPrio
   if best == nil:
     assert_err("chan.c", "chan.c", 414)
@@ -32964,15 +40872,13 @@ proc chan_goto_idle_cb*() {.exportc, cdecl.} =
   vifNode = cast[pointer](vifMgmt.activeList.first)
   while vifNode != nil:
     let vif = vifChannelAt(cast[pointer](vifNode))
-    let vifAddr = cast[uint](vif)
     let vifType = vif.vifType
     let vifChanCtxt = vif.chanCtxt
     if vifType == 2 and vifChanCtxt != nil:
       if cast[uint](vifChanCtxt) == curChanAddr:
         let active = vif.state
         if active != 0:
-          let bcnBuf = cast[ptr pointer](vifAddr + 340)[]
-          if bcnBuf != nil:
+          if vif.postponedStaHead != nil:
             # Compute beacon interval in TU
             let bcnInt = cast[ptr uint16](curChanAddr + 16)[]
             let intervalUs = (bcnInt.uint32 shl 10) div 1000
@@ -32993,6 +40899,29 @@ proc chan_goto_idle_cb*() {.exportc, cdecl.} =
     # No frames needed: proceed with channel switch
     chan_pre_switch_channel(chanCtxt)
 
+proc chanConnLessDelay(flags: uint8, ctxtCount: uint8): uint32 {.inline.} =
+  const DelayUnit = 0x7530'u32
+  if ctxtCount == 0:
+    return 0
+  if (flags and 0x01) != 0:
+    return DelayUnit
+  if (flags and 0x02) == 0:
+    return DelayUnit
+  if scan_env.channelIndex == 0:
+    return DelayUnit
+
+  # Blob does not call chan_get_dominant_chan here. It uses the scan cursor and
+  # channel-context count to pick the next connectionless delay window.
+  let nextCnt = (scan_env.channelIndex + 1) and 3
+  if nextCnt != 0:
+    return DelayUnit
+  if ctxtCount <= 1:
+    return DelayUnit * 4
+  if cast[int8](flags) < 0:
+    DelayUnit * 8
+  else:
+    DelayUnit * 16
+
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void chan_conn_less_delay_prog(void);".}
 proc chan_conn_less_delay_prog*() {.exportc, cdecl.} =
   ## Program connectionless delay timer (67 instrs, 190 bytes in blob).
@@ -33010,42 +40939,7 @@ proc chan_conn_less_delay_prog*() {.exportc, cdecl.} =
   let ctxtCount = env.ctxtCount
   # Read current MAC timestamp for timer base
   let macTime = regRead(MACHW_BASE + 0x120)
-  var delay: uint32 = 0
-  if ctxtCount == 0:
-    delay = 0'u32
-  else:
-    # Check connection type flags
-    if (flags and 0x01) != 0:
-      # Type bit 0 set -> single delay
-      delay = 0x7530'u32
-    elif (flags and 0x02) != 0:
-      # Type bit 1 set -> check scan_env for active entries
-      let scanActive = scan_env.channelIndex
-      if scanActive == 0:
-        delay = 0x7530'u32
-      else:
-        # Blob does NOT call chan_get_dominant_chan here — previous Nim
-        # added a redundant check. Proceed straight to flags/bit7 test.
-        if false: # placeholder removed
-          delay = 0x7530'u32
-        else:
-          # Check flags bit 7 (negative means set)
-          let nextCnt = (scan_env.channelIndex + 1) and 3
-          if nextCnt != 0:
-            # More scan steps pending
-            delay = 0x7530'u32  # 1x base
-          else:
-            # All scan steps done: check count vs 1
-            if ctxtCount <= 1:
-              delay = 0x7530'u32 * 4
-            else:
-              let signedFlags = cast[int8](flags)
-              if signedFlags < 0:  # bit 7 set
-                delay = 0x7530'u32 * 8
-              else:
-                delay = 0x7530'u32 * 16
-    else:
-      delay = 0x7530'u32  # default: single delay
+  let delay = chanConnLessDelay(flags, ctxtCount)
   # Program timer with computed timeout
   nimFwTrace2U32("[WIFI-NIMFW] cld_prog delay ", macTime, delay)
   mm_timer_set(chanConnLessDelayTimer(), macTime + delay)
@@ -33092,7 +40986,7 @@ proc txl_int_fake_transfer*(txDesc: pointer, queueIdx: uint32) {.exportc, cdecl.
   ## stores back-pointer at THD+20, links THD into internal queue via
   ## index computed from a1+22, clears THD+16 (next pointer).
   let desc = hostTxDescAt(txDesc)
-  let link = hostTxBufferedLinkAt(desc.bufDesc)
+  let link = hostTxInternalLinkNodeAt(desc.bufDesc)
   if link != nil and nimFwMgmtFcTrace(link.macHeader[0]):
     nimFwTrace2U32("[WIFI-NIMFW] fake_tx ",
                    queueIdx,
@@ -33125,7 +41019,7 @@ proc txl_int_fake_transfer*(txDesc: pointer, queueIdx: uint32) {.exportc, cdecl.
   if head[] == nil:
     head[] = cast[pointer](link)
   else:
-    hostTxBufferedLinkAt(tailPtr[]).next = cast[pointer](link)
+    hostTxInternalLinkNodeAt(tailPtr[]).next = cast[pointer](link)
   tailPtr[] = cast[pointer](link)
   link.next = nil
   if isTrackedNullFrame:
@@ -33141,80 +41035,126 @@ proc cfm_raw_send*(param: pointer) {.exportc, cdecl.} =
   if cfmFn != nil:
     cast[proc(p: pointer) {.cdecl.}](cfmFn)(param)
 
+proc txSecKeyFor(desc: ptr HostTxDescView): ptr VifKeySlotView {.inline.} =
+  let sta = staInfoForIdx(desc.staInfoIdx)
+  let keyMatPtr = sta.keyMat
+  nimFwDbgTxSecHdrStaKey0 = sta.keyType.uint32 or
+    (sta.cipherSuite.uint32 shl 8) or
+    (sta.hwKeyIdx.uint32 shl 16) or
+    (sta.keyInstalled.uint32 shl 24)
+  nimFwDbgTxSecHdrStaKey1 = pointerAddrU32(cast[pointer](addr sta.keyHolder))
+  nimFwDbgTxSecHdrStaKey2 = pointerAddrU32(sta.keyHolder)
+  if keyMatPtr == nil:
+    inc nimFwDbgTxSecHdrNoKeyMat
+    nimFwDbgTxSecHdrMissMeta = desc.staInfoIdx.uint32 or
+      (desc.vifIdx.uint32 shl 8)
+    nimFwDbgTxSecHdrMissLen = desc.frameLen.uint32
+    nimFwDbgTxSecHdrMissKeyMat = 0
+    return nil
+  let keySlot = txSecurityKeyListAt(keyMatPtr).pairwiseKey
+  if keySlot == nil:
+    inc nimFwDbgTxSecHdrNoKeySlot
+    nimFwDbgTxSecHdrMissMeta = desc.staInfoIdx.uint32 or
+      (desc.vifIdx.uint32 shl 8)
+    nimFwDbgTxSecHdrMissLen = desc.frameLen.uint32
+    nimFwDbgTxSecHdrMissKeyMat = pointerAddrU32(keyMatPtr)
+    return nil
+  let vif = vifChannelForIdx(desc.vifIdx)
+  if (vifKeyPointers(vif).flags and 0x02) != 0:
+    if lmacGateHalfword(desc.frameLen) == sta.rateWord:
+      return nil
+  result = cast[ptr VifKeySlotView](keySlot)
+  nimFwDbgTxSecHdrCipher = result.cipherType.uint32
+
+proc txSecBumpPn(key: ptr VifKeySlotView, dst: pointer, bytes: csize_t) {.inline.} =
+  let oldLo = key.pnLow
+  let carry = if oldLo == 0xFFFFFFFF'u32: 1'u32 else: 0'u32
+  key.pnLow = oldLo + 1
+  key.pnHigh = key.pnHigh + carry
+  discard c_memcpy(dst, addr key.pnLow, bytes)
+
+proc writeTxCcmpHeader(secHdr: pointer; desc: ptr HostTxDescView;
+                       key: ptr VifKeySlotView) {.inline.} =
+  ## CCMP header byte layout is PN0, PN1, reserved, key-id/ext-IV,
+  ## PN2, PN3, PN4, PN5. Use the explicit overlay instead of packing
+  ## the bytes through uint16 words; the latter puts the ext-IV bit in
+  ## the wrong byte on little-endian targets.
+  let hdr = cast[ptr CcmpSecurityHeaderView](secHdr)
+  hdr.pn0 = desc.pnScratch[0]
+  hdr.pn1 = desc.pnScratch[1]
+  hdr.reserved2 = 0
+  hdr.keyId = ((key.staIdx and 0x03'u8) shl 6) or 0x20'u8
+  hdr.pn2 = desc.pnScratch[2]
+  hdr.pn3 = desc.pnScratch[3]
+  hdr.pn4 = desc.pnScratch[4]
+  hdr.pn5 = desc.pnScratch[5]
+
+proc txSecControlTemplate(desc: ptr HostTxDescView;
+                          updateCurrentDesc: uint32): ptr HostTxRateTemplateView {.inline.} =
+  if updateCurrentDesc != 0:
+    if desc.policy == nil:
+      return nil
+    return hostTxRateTemplateAt(desc.policy)
+
+  if desc.bufDesc == nil:
+    return nil
+  hostTxRateTemplate(hostTxLinkDescAt(desc.bufDesc))
+
+proc patchTxSecControlWord(ctrl: ptr HostTxRateTemplateView;
+                           key: ptr VifKeySlotView) {.inline.} =
+  if ctrl == nil:
+    return
+  let patched = (ctrl.pendingCount and 0x000FFC00'u32) or key.keyIdx.uint32
+  ctrl.pendingCount = patched
+  nimFwDbgDhcpTxSecCtl = patched
+
 proc txu_cntrl_sec_hdr_append*(txDesc: pointer, secHdr: pointer,
                                updateCurrentDesc: uint32): pointer {.exportc, cdecl.} =
   ## Append security header to TX frame (77 instrs in blob).
   ## From blob (txu_cntrl.o): reads STA index from txDesc[49], resolves STA entry
   ## via sta_info_tab with stride 368. Reads key material from sta_info_tab+244.
-  ## Checks VIF's security type (via VIF entry linked from STA). If CCMP: writes
-  ## 2-byte PN + key_id to secHdr[0..1], 6-byte PN to secHdr[2..7]. If TKIP: writes
-  ## 4-byte TSC to secHdr, 2-byte key_id, 2-byte ext TSC. Increments PN/TSC counter.
-  ## If WEP: writes 3-byte IV + key_id. Then patches HW descriptor control field.
+  ## Checks VIF's security type (via VIF entry linked from STA). Cipher 2 uses
+  ## the 8-byte CCMP-style header required for protected data accepted by the AP.
+  ## Then patches HW descriptor control field.
   let desc = hostTxDescAt(txDesc)
-  let sec = cast[ptr TxSecurityHeaderView](secHdr)
-  let staIdx = desc.staInfoIdx
-  let sta = staInfoForIdx(staIdx)
-  let keyMatPtr = sta.keyMat
-  if keyMatPtr == nil:
-    return secHdr  # no key material, nothing to append
-  let keyData = cast[uint](keyMatPtr)
-  let keySlot = cast[ptr pointer](keyData)[]
-  if keySlot == nil:
+  inc nimFwDbgTxSecHdrAppend
+  let key = txSecKeyFor(desc)
+  if key == nil:
     return secHdr
-  let key = cast[ptr VifKeySlotView](keySlot)
-  let vifIdx = desc.vifIdx
-  let vifAddr = cast[uint](addr vif_info_tab[0]) + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let secMode = vifKeyPointersAt(vifAddr).flags
-  if (secMode and 0x02) != 0:
-    if lmacGateHalfword(desc.frameLen) == sta.rateWord:
-      return secHdr
-  # Read cipher type from key slot
-  let cipherType = key.cipherType
-  case cipherType
+  let pn = hostTxPnScratch(desc)
+  case key.cipherType
   of 0:  # Open or WEP-40
-    let pn = cast[ptr uint16](addr desc.pnScratch[0])[]
-    sec.w0 = pn
+    let sec = cast[ptr TxSecurityHeaderView](secHdr)
+    sec.w0 = pn.lo
     let keyIdByte = key.staIdx
-    let pn2 = cast[ptr uint16](addr desc.pnScratch[2])[]
-    sec.w1 = (keyIdByte.uint16 shl 14) or pn2
-  of 1:  # WEP-104 (same as WEP-40 with longer key)
-    let pn = cast[ptr uint16](addr desc.pnScratch[0])[]
-    sec.w0 = pn
+    sec.w1 = (keyIdByte.uint16 shl 14) or pn.mid
+  of 1:  # TKIP
+    let sec = cast[ptr TxSecurityHeaderView](secHdr)
+    sec.w0 = pn.lo
     let keyIdByte = key.staIdx
-    let pn2 = cast[ptr uint16](addr desc.pnScratch[2])[]
-    sec.w1 = (keyIdByte.uint16 shl 14) or pn2
-    # Extended IV
-    sec.w2 = cast[ptr uint16](addr desc.pnScratch[2])[]
-    sec.w3 = cast[ptr uint16](addr desc.pnScratch[4])[]
-  of 2:  # TKIP
-    let pn = cast[ptr uint16](addr desc.pnScratch[0])[]
-    sec.w0 = pn
+    sec.w1 = (keyIdByte.uint16 shl 14) or pn.mid
+    sec.w2 = pn.mid
+    sec.w3 = pn.hi
+  of 2:  # CCMP (AES)
+    writeTxCcmpHeader(secHdr, desc, key)
+  of 3:  # WEP-104
+    let sec = cast[ptr TxSecurityHeaderView](secHdr)
+    sec.w0 = pn.lo
     let keyIdByte = key.staIdx
-    sec.w1 = (keyIdByte.uint16 shl 14) or pn
-  of 3:  # CCMP (AES)
-    let pn = cast[ptr uint16](addr desc.pnScratch[0])[]
-    sec.w0 = pn or 0x2000'u16  # set ExtIV bit
-    let keyIdByte = key.staIdx
-    let pn2 = desc.pnScratch[0]
-    sec.w1 = (keyIdByte.uint16 shl 14) or pn2.uint16 or 0x2000'u16
-    sec.w2 = cast[ptr uint16](addr desc.pnScratch[2])[]
-    sec.w3 = cast[ptr uint16](addr desc.pnScratch[4])[]
+    sec.w1 = (keyIdByte.uint16 shl 14) or pn.mid
   else:
     discard
-  # Patch HW descriptor: if txDesc[88] (ac desc) has pending flag, update control field
-  let ctrlPtr =
-    if updateCurrentDesc != 0:
-      desc.policy
-    else:
-      let linkDesc = desc.bufDesc
-      if linkDesc == nil: nil
-      else: cast[pointer](cast[uint](linkDesc) + 256)
-  if ctrlPtr != nil:
-    let hwDesc = cast[uint](ctrlPtr)
-    let ctrlWord = cast[ptr uint32](hwDesc + 12)[]
-    let secLenField = key.keyIdx
-    let newCtrl = (ctrlWord and 0x000FFC00'u32) or secLenField.uint32
-    cast[ptr uint32](hwDesc + 12)[] = newCtrl
+  let secWords = cast[ptr TxSecurityHeaderView](secHdr)
+  nimFwDbgDhcpTxSecHdr0 =
+    secWords.w0.uint32 or (secWords.w1.uint32 shl 16)
+  nimFwDbgDhcpTxSecHdr1 =
+    secWords.w2.uint32 or (secWords.w3.uint32 shl 16)
+  nimFwDbgDhcpTxSecKey =
+    key.cipherType.uint32 or
+    (key.staIdx.uint32 shl 8) or
+    (key.keyIdx.uint32 shl 16) or
+    (key.installed.uint32 shl 24)
+  patchTxSecControlWord(txSecControlTemplate(desc, updateCurrentDesc), key)
   return secHdr
 
 proc txu_cntrl_sechdr_len_compute*(txDesc: pointer, lenOut: ptr uint32): uint32 {.exportc, cdecl.} =
@@ -33222,69 +41162,41 @@ proc txu_cntrl_sechdr_len_compute*(txDesc: pointer, lenOut: ptr uint32): uint32 
   ## From blob (txu_cntrl.o): reads STA index from txDesc[49], resolves STA entry.
   ## Reads key slot pointer from sta+244. If no key, returns 0 with lenOut[]=0.
   ## Checks VIF security type. Based on cipher type at key_slot+152:
-  ##   cipher 0 (WEP40) or 3 (CCMP): len=4, copies 4 bytes from key+128 to txDesc+34
-  ##   cipher 2 (TKIP): len=8, copies 6 bytes from key+128 to txDesc+34
-  ##   cipher 1 (WEP104): len=12
+  ##   cipher 0 (WEP40): len=4; cipher 2 (CCMP): len=8
+  ##   cipher 1 (TKIP): len=8, tail=12; cipher 3 (WEP104): len=4
   ## Increments 64-bit PN counter at key_slot+128. Returns header length.
   if lenOut != nil:
     lenOut[] = 0
+  inc nimFwDbgTxSecHdrCalls
   let desc = hostTxDescAt(txDesc)
-  let staIdx = desc.staInfoIdx
-  let sta = staInfoForIdx(staIdx)
-  let keyMatPtr = sta.keyMat
-  if keyMatPtr == nil:
+  let key = txSecKeyFor(desc)
+  if key == nil:
     return 0
-  let keyData = cast[uint](keyMatPtr)
-  let keySlot = cast[ptr pointer](keyData)[]
-  if keySlot == nil:
-    return 0
-  let key = cast[ptr VifKeySlotView](keySlot)
-  let vifIdx = desc.vifIdx
-  let vifAddr = cast[uint](addr vif_info_tab[0]) + vifIdx.uint * VIF_ENTRY_SIZE.uint
-  let secMode = vifKeyPointersAt(vifAddr).flags
-  if (secMode and 0x02) != 0:
-    if lmacGateHalfword(desc.frameLen) == sta.rateWord:
-      return 0  # same cipher pair
-  let cipherType = key.cipherType
   var hdrLen: uint32 = 0
-  case cipherType
-  of 0, 3:  # WEP-40 or CCMP
+  case key.cipherType
+  of 0:  # WEP-40
     hdrLen = 4
     if lenOut != nil:
       lenOut[] = 4
-    # Copy 4 bytes from key PN (offset 128) to txDesc+34
-    let pnLo = key.pnLow
-    let pnHi = key.pnHigh
-    # Increment 64-bit PN
-    var lo = pnLo
-    var hi = pnHi
-    let carry = if lo == 0xFFFFFFFF'u32: 1'u32 else: 0'u32
-    lo = lo + 1
-    hi = hi + carry
-    key.pnLow = lo
-    key.pnHigh = hi
-    # Copy to txDesc
-    discard c_memcpy(addr desc.pnScratch[0], addr key.pnLow, 4.csize_t)
-  of 2:  # TKIP
+    txSecBumpPn(key, addr desc.pnScratch[0], 4.csize_t)
+  of 1:  # TKIP
+    hdrLen = 8
+    if lenOut != nil:
+      lenOut[] = 12
+    txSecBumpPn(key, addr desc.pnScratch[0], 6.csize_t)
+  of 2:  # CCMP
     hdrLen = 8
     if lenOut != nil:
       lenOut[] = 8
-    # Copy 6 bytes, increment PN
-    let pnLo = key.pnLow
-    let pnHi = key.pnHigh
-    var lo = pnLo + 1
-    var hi = pnHi
-    if pnLo == 0xFFFFFFFF'u32:
-      hi = hi + 1
-    key.pnLow = lo
-    key.pnHigh = hi
-    discard c_memcpy(addr desc.pnScratch[0], addr key.pnLow, 6.csize_t)
-  of 1:  # WEP-104
-    hdrLen = 12
+    txSecBumpPn(key, addr desc.pnScratch[0], 6.csize_t)
+  of 3:  # WEP-104
+    hdrLen = 4
     if lenOut != nil:
-      lenOut[] = 12
+      lenOut[] = 4
+    txSecBumpPn(key, addr desc.pnScratch[0], 4.csize_t)
   else:
     discard
+  nimFwDbgTxSecHdrLen = hdrLen
   return hdrLen
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) unsigned long rxu_mgt_frame_check(void*, unsigned char);".}
@@ -33317,20 +41229,24 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
 
   # Traverse: rxDesc[8] -> bufDesc -> bufDesc[24] -> frameHdr (s0)
   let bufDesc = rx.bufferChain
-  let frameHdr = cast[uint](cast[ptr pointer](cast[uint](bufDesc) + 24)[])
+  let frame = rxFrameAtRef(bufDesc)
+  let frameHdr = cast[pointer](frame)
 
-  # Read frame control (2 bytes LE) from frameHdr
-  let fcLo = cast[ptr uint8](frameHdr)[]
-  let fcHi = cast[ptr uint8](frameHdr + 1)[]
-  let fcFull = fcLo.uint16 or (fcHi.uint16 shl 8)
+  let fcFull = frame.frameControl
+  inc nimFwDbgMgtSeen
+  nimFwDbgMgtLastFc = fcFull.uint32 or (rx.hwFlags and 0xFFFF0000'u32)
 
   # Reject if bit 10 set (protected frame bit — wrong context for mgmt)
   if (fcFull and 0x0400'u16) != 0:
+    inc nimFwDbgMgtRejected
+    nimFwDbgMgtDropReason = 1'u32 or (fcFull.uint32 shl 8)
     return 0
 
   # Reject if fragment number non-zero (byte 22, low nibble)
-  let seqCtrlByte = cast[ptr uint8](frameHdr + 22)[]
-  if (seqCtrlByte and 0x0F'u8) != 0:
+  if (frame.seqCtrl and 0x000F'u16) != 0:
+    inc nimFwDbgMgtRejected
+    nimFwDbgMgtDropReason = 2'u32 or (fcFull.uint32 shl 8) or
+      (frame.seqCtrl.uint32 shl 24)
     return 0
 
   # --- VIF index resolution (blob 0x54-0x6a, 0x120-0x258) ---
@@ -33348,14 +41264,14 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
       if fcFull == 0x00B0'u16:
         authToApVif = true
         for j in 0'u ..< 6:
-          if cast[ptr uint8](frameHdr + 4 + j)[] != cast[ptr uint8](frameHdr + 16 + j)[]:
+          if frame.addr1[j] != frame.addr3[j]:
             authToApVif = false
             break
       while vifEntry != nil:
         let vif = vifChannelAt(vifEntry)
         var macMatch = true
         for j in 0'u ..< 6:
-          if vif.macAddr[j] != cast[ptr uint8](frameHdr + 4 + j)[]:
+          if vif.macAddr[j] != frame.addr1[j]:
             macMatch = false
             break
         if macMatch:
@@ -33376,11 +41292,10 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
   # So we call it with a0=envPtr and set a1-a4 via asm before the call.
   let bodyLen = rx.payloadLenHalf
   let envPtr = cast[pointer](env)
-  let frameHdrPtr = cast[pointer](frameHdr)
   var mfpResult: bool
   {.emit: ["""
   {
-    register void* _a1 __asm__("a1") = """, frameHdrPtr, """;
+    register void* _a1 __asm__("a1") = """, frameHdr, """;
     register unsigned int _a2 __asm__("a2") = (unsigned int)""", bodyLen, """;
     register unsigned char* _a3 __asm__("a3") = &""", acceptedByte, """;
     register unsigned char* _a4 __asm__("a4") = &""", secondaryByte, """;
@@ -33434,7 +41349,7 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
           let vifBeaconFlag = vifChannelAt(vifEntry).state
           if vifBeaconFlag != 0:
             # Call me_beacon_check (blob 0x3e8)
-            me_beacon_check(rxuEnvVifIdx, cast[pointer](frameHdr), cast[pointer](bodyLen.uint))
+            me_beacon_check(rxuEnvVifIdx, frameHdr, cast[pointer](bodyLen.uint))
       else:
         # vifIdx == 0xFF path (blob .L82 at 0x404)
         # Blob calls ke_state_get(TASK_SCAN) a second time and apm_embedded_enabled
@@ -33522,7 +41437,7 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
         accepted = 0
       else:
         # Read action category using machdrLen offset (blob: th.lrbu a3,s0,s8,0)
-        let catByte = cast[ptr uint8](frameHdr + machdrLen.uint)[]
+        let catByte = rxFrameBodyByte(frame, machdrLen)
         if catByte == 3:  # Block Ack (BA)
           msgSubtype = 6
           skipSecHdr = true
@@ -33535,9 +41450,8 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
             # Check body length: bodyLen - machdrLen > 3
             if (bodyLen.int - machdrLen.int) > 3:
               # Check vif_info_tab[vifIdx][86] (VIF type) for SA Query acceptance
-              let viTab = cast[uint](addr vif_info_tab[0])
-              let viType = cast[ptr uint8](viTab + rxuEnvVifIdx.uint * VIF_ENTRY_SIZE.uint + 86)[]
-              if viType == 0xFF:
+              let saQueryVif = vif_mgmt_get_vif(rxuEnvVifIdx)
+              if saQueryVif == nil or vifChannelAt(saQueryVif).vifType == 0xFF:
                 accepted = 0
               else:
                 # Look up STA via sta_info_tab using vif_info_tab approach
@@ -33566,6 +41480,22 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
     (msgSubtype.uint32 shl 16) or (vifIdx.uint32 shl 8) or rxuEnvVifIdx.uint32
   let dbgMgt1 = (dbgState shl 24) or
     (bodyLen.uint32 shl 8) or machdrLen.uint32
+  nimFwDbgMgtLast0 = dbgMgt0
+  nimFwDbgMgtLast1 = dbgMgt1
+  if accepted != 0 and msgSubtype != 0xFF:
+    inc nimFwDbgMgtAccepted
+  else:
+    inc nimFwDbgMgtRejected
+    nimFwDbgMgtDropReason = 3'u32 or (subtypeBits.uint32 shl 8) or
+      (msgSubtype.uint32 shl 16) or (accepted.uint32 shl 24)
+  if subtypeBits == 0xB0'u16:
+    inc nimFwDbgAuthMgtSeen
+    nimFwDbgAuthMgtLast0 = dbgMgt0
+    nimFwDbgAuthMgtLast1 = dbgMgt1
+    if accepted != 0 and msgSubtype != 0xFF:
+      inc nimFwDbgAuthMgtAccepted
+    else:
+      inc nimFwDbgAuthMgtRejected
   nimFwTrace2U32("[WIFI-NIMFW] mgt_pre ", dbgMgt0, dbgMgt1)
   when defined(bl808WifiConnectTrace):
     if subtypeBits == 0xB0'u16 or subtypeBits == 0x10'u16 or subtypeBits == 0x30'u16:
@@ -33589,7 +41519,7 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
         allocLogFn(2, 0, cast[pointer](cstring"rxl_cntrl.c"), 1482)
       accepted = 0
     else:
-      let msgAddr = cast[uint](msg)
+      let ind = rxuMgtIndMsgAt(msg)
 
       # --- Adjust source pointer for security header (blob 0x460-0x48e) ---
       var copySrc = frameHdr
@@ -33600,57 +41530,45 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
           assert_warn("rxl_cntrl.c", "rxl_cntrl.c", 1491)
         # Adjust: subtract machdrLen from bodyLen, advance frameHdr past MAC header
         copyLen = copyLen - machdrLen.uint16
-        copySrc = copySrc + machdrLen.uint
+        copySrc = rxFrameCursor(copySrc, machdrLen.uint)
       # else: skip adjustment (s6=1), copy from frameHdr as-is
 
       # --- Populate message fields (blob 0x4a2-0x4fa) ---
       # msg[0..1] = copied frame/body length (blob stores s2 after the optional
       # MAC-header adjustment via th.shia before copying to msg+32).
-      cast[ptr uint16](msgAddr)[] = copyLen
-      # msg[2..3] = FC
-      cast[ptr uint16](msgAddr + 2)[] = fcFull
-      # msg[7] = vifIdx (s5)
-      cast[ptr uint8](msgAddr + 7)[] = vifIdx
-      # msg[8] = rxu_cntrl_env[10]
-      cast[ptr uint8](msgAddr + 8)[] = rxuEnvVifIdx
-      # msg[4..6] come from phy_channel_info.info1.
-      cast[ptr uint16](msgAddr + 4)[] = (chanInfo[0] shr 16).uint16
-      cast[ptr uint8](msgAddr + 6)[] = (chanInfo[0] and 0xFF).uint8
-      # msg[25] = rssiResult (from phyif_utils_decode)
-      cast[ptr uint8](msgAddr + 25)[] = cast[uint8](rssiResult)
-      # msg[26] = rssiResult again
-      cast[ptr uint8](msgAddr + 26)[] = cast[uint8](rssiResult)
-      # msg[24] = rxDesc[51] (byte 51 of RX descriptor)
-      cast[ptr uint8](msgAddr + 24)[] = rx.phyVector[11]
-      # msg[27] = secondaryByte (from mfp_ignore_mgmt_frame)
-      cast[ptr uint8](msgAddr + 27)[] = secondaryByte
+      ind.frameLen = copyLen
+      ind.frameCtrl = fcFull
+      ind.vifIdx = vifIdx
+      ind.rxuVifIdx = rxuEnvVifIdx
+      ind.freq = (chanInfo[0] shr 16).uint16
+      ind.band = (chanInfo[0] and 0xFF).uint8
+      ind.rssi = rssiResult
+      ind.noiseFloor = rssiResult
+      ind.phyVector11 = rx.phyVector[11]
+      ind.secondary = secondaryByte
 
       if subtypeBits == 0x10'u16 or subtypeBits == 0x30'u16:
         nimFwTrace2U32("[WIFI-NIMFW] assoc_copy ",
                        copyLen.uint32,
-                       cast[ptr uint32](copySrc)[])
+                       rxFrameWords(copySrc)[0])
         nimFwTrace2U32("[WIFI-NIMFW] assoc_copy2 ",
-                       cast[ptr uint32](copySrc + 4)[],
-                       cast[ptr uint32](copySrc + 8)[])
+                       rxFrameWords(copySrc)[1],
+                       rxFrameWords(copySrc)[2])
 
       # Probe Req special fields: if msgSubtype==5 and sendStaIdx==0
       if msgSubtype == 5 and sendStaIdx == 0:
-        # msg[16..19] = rxDesc[32..35]
-        cast[ptr uint32](msgAddr + 16)[] = rx.timestampLow
-        # msg[20..23] = rxDesc[36..39]
-        cast[ptr uint32](msgAddr + 20)[] = rx.timestampHigh
-        # msg[28] = rxDesc[40] (T-Head insn in blob; just byte load)
-        cast[ptr uint8](msgAddr + 28)[] = rx.phyVector[0]
+        ind.timestampLow = rx.timestampLow
+        ind.timestampHigh = rx.timestampHigh
+        ind.phyVector0 = rx.phyVector[0]
 
       # --- Copy frame body word-by-word (blob .L91/.L92 at 0x49e-0x518) ---
-      let wordCount = (copyLen.uint32 + 3) shr 2
-      let dst = msgAddr + 32
-      let src = copySrc
-      for w in 0'u32 ..< wordCount:
-        cast[ptr uint32](dst + w * 4)[] = cast[ptr uint32](src + w * 4)[]
+      copyRoundedRxWords(addr ind.body[0], copySrc, copyLen)
 
       # Send message via ke_msg_send (blob 0x504)
       ke_msg_send(msg)
+      inc nimFwDbgMgtMsgSent
+      if subtypeBits == 0xB0'u16:
+        inc nimFwDbgAuthMgtMsgSent
       accepted = acceptedByte
 
   # --- Epilogue (blob 0x30e-0x544): post-send check ---
@@ -33694,12 +41612,14 @@ proc rxu_mgt_ind_handler_sm(param: pointer) {.exportc: "rxu_mgt_ind_handler_sm",
   let frameType = msg.frameCtrl and 0xFC'u16
   case frameType
   of 0xB0: # Authentication
+    inc nimFwDbgAuthSmDispatch
+    nimFwDbgAuthSmState = ke_state_get(TASK_SM).uint32
     when defined(bl808WifiConnectTrace):
       let traceWord = msg.staIdx.uint32 or (msg.traceByte8.uint32 shl 8)
       nimFwConnectTrace2U32("[WIFI-CT] sm_mgt_auth ",
-                            ke_state_get(TASK_SM).uint32,
+                            nimFwDbgAuthSmState,
                             traceWord)
-    if ke_state_get(TASK_SM) != SmAuthenticatingState: return
+    if nimFwDbgAuthSmState != SmAuthStartingState: return
     sm_auth_handler(param)
   of 0x10: # Association Response
     when defined(bl808WifiConnectTrace):
@@ -33707,7 +41627,7 @@ proc rxu_mgt_ind_handler_sm(param: pointer) {.exportc: "rxu_mgt_ind_handler_sm",
       nimFwConnectTrace2U32("[WIFI-CT] sm_mgt_assoc ",
                             ke_state_get(TASK_SM).uint32,
                             traceWord)
-    if ke_state_get(TASK_SM) != SmAssocRspState: return
+    if ke_state_get(TASK_SM) != SmAuthenticatingState: return
     sm_assoc_rsp_handler(param)
   of 0x30: # Reassociation Response
     when defined(bl808WifiConnectTrace):
@@ -33715,7 +41635,7 @@ proc rxu_mgt_ind_handler_sm(param: pointer) {.exportc: "rxu_mgt_ind_handler_sm",
       nimFwConnectTrace2U32("[WIFI-CT] sm_mgt_reassoc ",
                             ke_state_get(TASK_SM).uint32,
                             traceWord)
-    if ke_state_get(TASK_SM) != SmAssocRspState: return
+    if ke_state_get(TASK_SM) != SmAuthenticatingState: return
     sm_assoc_rsp_handler(param)
   of 0xC0: # Deauthentication
     let state = ke_state_get(TASK_SM)
@@ -34232,27 +42152,29 @@ proc ke_task_init*() {.exportc, cdecl.} =
 #                  WiFi Main Entry Point
 # ###########################################################################
 
-type
-  WifiMainServiceMode = enum
-    wifiServiceNonblocking
-    wifiServiceBlockingIdle
-
-proc wifiMainHasPendingWork(): bool {.inline.} =
+proc wifiEventPendingWork(): bool {.inline.} =
   keEvtField != 0
 
-proc wifiMainModeFromAbi(blockWhenIdle: uint8): WifiMainServiceMode {.inline.} =
-  if blockWhenIdle == 0'u8:
-    wifiServiceNonblocking
-  else:
-    wifiServiceBlockingIdle
+proc wifiKernelTimerPendingWork(): bool {.inline.} =
+  keTimerExpired(cast[ptr KeTimerEntry](keTimerQueue.first))
 
-proc wifiMainServiceStep(mode: WifiMainServiceMode): bool =
-  ## Run one WiFi firmware service iteration.
-  ##
-  ## The blob's wifi_main blocks in ipc_emb_wait() when idle because host and
-  ## embedded firmware run independently. In this pure Nim port, CPS callers can
-  ## drive WiFi and BLE from one scheduler, so they must use the nonblocking
-  ## form and let the scheduler decide when to sleep.
+proc wifiMmTimerPendingWork(): bool {.inline.} =
+  mmTimerExpired(mm_timer_list.first)
+
+proc wifiMessagePendingWork(): bool {.inline.} =
+  keMsgQueueSent.first != nil or keSavedReschedTask != TASK_NONE
+
+proc wifiMessageEventPending(): bool {.inline.} =
+  (keEvtField and KE_EVT_KE_MESSAGE) != 0
+
+proc wifiHiddenMessagePendingWork(): bool {.inline.} =
+  wifiMessagePendingWork() and not wifiMessageEventPending()
+
+proc wifiMainHasPendingWork(): bool =
+  wifiEventPendingWork() or wifiKernelTimerPendingWork() or
+    wifiMmTimerPendingWork() or wifiMessagePendingWork()
+
+proc wifiUpdateMacPlCtrl() {.inline.} =
   let tslo = macTimeNow()
   var ctrl = regRead(MAC_PL_CTRL_REG)
   if (tslo and 0x00080000'u32) != 0:
@@ -34261,20 +42183,52 @@ proc wifiMainServiceStep(mode: WifiMainServiceMode): bool =
     ctrl = ctrl and not 0x01'u32
   regWrite(MAC_PL_CTRL_REG, ctrl)
 
-  bl_sleep_schedule()
-
-  result = wifiMainHasPendingWork()
-  if mode == wifiServiceBlockingIdle and not result:
+proc wifiWaitForWorkIfIdle(blockWhenIdle, hasWork: bool): bool =
+  result = hasWork
+  if blockWhenIdle and not result:
     ipc_emb_wait()
     result = wifiMainHasPendingWork()
 
+proc wifiDrainScheduledWork(): bool =
+  if wifiKernelTimerPendingWork():
+    result = true
+    ke_timer_schedule()
+  if wifiMmTimerPendingWork():
+    result = true
+    mm_timer_schedule()
+  if wifiEventPendingWork():
+    result = true
   ke_evt_schedule()
+  if wifiHiddenMessagePendingWork():
+    result = true
+    ke_task_schedule()
+
+proc wifiMainServiceStep(blockWhenIdle = false): bool =
+  ## Run one WiFi firmware service iteration.
+  ##
+  ## The blob's wifi_main blocks in the idle wait primitive because host and
+  ## embedded firmware run independently. In this pure Nim port, CPS callers can
+  ## drive WiFi and BLE from one scheduler, so they must use the nonblocking
+  ## form and let the scheduler decide when to sleep.
+  wifiUpdateMacPlCtrl()
+  bl_sleep_schedule()
+
+  result = wifiWaitForWorkIfIdle(blockWhenIdle, wifiMainHasPendingWork())
+
+  if wifiDrainScheduledWork():
+    result = true
+
+proc wifiMainServiceNonblocking(): bool =
+  wifiMainServiceStep()
+
+proc wifiMainServiceBlockingIdle(): bool =
+  wifiMainServiceStep(blockWhenIdle = true)
 
 proc wifi_main_service_step*(blockWhenIdle: uint8 = 0'u8) {.exportc, cdecl.} =
-  discard wifiMainServiceStep(wifiMainModeFromAbi(blockWhenIdle))
+  discard wifiMainServiceStep(blockWhenIdle != 0'u8)
 
 proc wifi_main_poll_once*() {.exportc, cdecl.} =
-  discard wifiMainServiceStep(wifiServiceNonblocking)
+  discard wifiMainServiceNonblocking()
 
 proc wifi_main*(param: pointer) {.exportc, cdecl.} =
   ## WiFi firmware main entry point (157 instructions in blob).
@@ -34306,7 +42260,7 @@ proc wifi_main*(param: pointer) {.exportc, cdecl.} =
 
   # RF initialization (external platform functions)
   wifi_hosal_rf_turn_on()
-  rf_init(40000000'u32)
+  wifiRfCoreInit(40000000'u32)
 
   # Keep the init sequence linear so GCC doesn't clone the function around
   # per-call logFn==nil checks (previously produced two bl_init /
@@ -34372,4 +42326,4 @@ proc wifi_main*(param: pointer) {.exportc, cdecl.} =
   #   load keEvtField; if == 0: call ipc_emb_wait;
   #   call ke_evt_schedule; j .L23
   while true:
-    discard wifiMainServiceStep(wifiServiceBlockingIdle)
+    discard wifiMainServiceBlockingIdle()

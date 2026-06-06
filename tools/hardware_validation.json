@@ -430,7 +430,7 @@
         "mdw 0x28000100 2",
         "mdw 0x280009c0 3"
       ],
-      "timeout": 90
+      "timeout": 45
     },
     {
       "name": "m0_ble_nim_controller_hal_test",
@@ -733,7 +733,7 @@
         "[PASS] ble blob controller deinit",
         "=== Test Complete ==="
       ],
-      "timeout": 45
+      "timeout": 90
     },
     {
       "name": "m0_ble_bl606p_hal_test",
@@ -1465,6 +1465,7 @@
           "flash": "m0",
           "defines": {
             "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
             "WifiScanOnly": "1"
           }
         }
@@ -1478,6 +1479,110 @@
         "[PASS] wifi ap start",
         "[PASS] wifi ap stop",
         "=== Test Complete ==="
+      ],
+      "jtag_snapshot": [
+        "poll",
+        "reg pc",
+        "reg sp",
+        "reg ra",
+        "reg mepc",
+        "reg mcause",
+        "reg mtval",
+        "mdw 0x24b0806c 5",
+        "mdw 0x24b08180 1",
+        "mdw 0x24b081b8 2",
+        "mdw 0x24b08548 2",
+        "mdw 0x24b0004c 1",
+        "mdw 0x24b00060 1",
+        "mdw {sym:rx_dma_hdrdesc} 25",
+        "mdw {sym:rx_payload_desc} 39",
+        "mdw {sym:rx_swdesc_tab} 24",
+        "mdw {sym:rx_payload_desc_buffer} 16",
+        "mdw {sym:rxl_cntrl_env} 7",
+        "mdw {sym:rx_hwdesc_env} 2",
+        "mdw {sym:nimfw_dbg_rxl_snap_pd_status} 13",
+        "mdw {sym:nimfw_dbg_rf_phy_trace_count} 1",
+        "mdw {sym:nimfw_dbg_rf_phy_trace_phase} 64",
+        "mdw {sym:nimfw_dbg_rf_phy_trace_device} 64",
+        "mdw {sym:nimfw_dbg_rf_phy_trace_hd} 64",
+        "mdw {sym:nimfw_dbg_rf_phy_trace_pd} 64",
+        "mdw {sym:nimfw_dbg_rf_phy_trace_hwhd} 64",
+        "mdw {sym:nimfw_dbg_rf_phy_trace_hwpd} 64",
+        "mdw {sym:nimfw_dbg_rf_phy_trace_rxctrl} 64",
+        "mdw {sym:nimfw_dbg_rf_phy_trace_rf70} 64",
+        "mdw {sym:nimfw_dbg_rf_phy_trace_rf88} 64",
+        "mdw {sym:nimfw_dbg_rf_phy_trace_rfd0} 64",
+        "mdw {sym:nim_wifi_rf_stage_snapshot_count} 1",
+        "mdw {sym:nim_wifi_rf_stage_tag_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rf4c_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rf70_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rf7c_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rf80_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rf88_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rfa0_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rfd0_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rf1600_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rf162c_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rfb0_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rfb4_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rfbc_log} 8",
+        "mdw {sym:nim_wifi_rf_optimize_count} 1",
+        "mdw {sym:nim_wifi_rf_optimize_channel_log} 8",
+        "mdw {sym:nim_wifi_rf_optimize_device_log} 8",
+        "mdw {sym:nim_wifi_rf_optimize_rfd0_log} 8",
+        "mdw {sym:nim_wifi_rf_optimize_rf70_log} 8",
+        "mdw {sym:nim_wifi_rf_optimize_nibble_log} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_count} 1",
+        "mdw {sym:nimfw_dbg_rxu_dup_break_hits} 1",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_fc} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_seq} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_cache} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_snap_lo} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_snap_hi} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_addr0} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_addr1} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_ip0} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_udp0} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_bootp0} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_bootp1} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_bootp_yiaddr} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_dhcp_msg} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_dhcp_server} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_count} 1",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_fc} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_seq} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_pn_lo} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_pn_hi} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_stored_lo} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_stored_hi} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_snap_lo} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_snap_hi} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_udp0} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_bootp_yiaddr} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_dhcp_msg} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_dhcp_server} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_count} 1",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_stage} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_fc} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_seq} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_pn_lo} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_pn_hi} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_stored_lo} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_stored_hi} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_next_lo} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_next_hi} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_snap_lo} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_snap_hi} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_udp0} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_bootp_yiaddr} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_dhcp_msg} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_dhcp_server} 8",
+        "mdw {sym:nim_wifi_rf_last_txcal_word0} 1",
+        "mdw {sym:nim_wifi_rf_last_txcal_word1} 1",
+        "mdw {sym:nim_wifi_rf_last_txcal_amp} 1",
+        "mdw {sym:nim_wifi_rf_last_txcal_amp_mean} 1",
+        "mdw {sym:nim_wifi_rf_last_txcal_tmxcs} 1",
+        "mdw {sym:nim_wifi_rf_txcal_word0_log} 16"
       ],
       "timeout": 80
     },
@@ -1498,10 +1603,6 @@
             },
             "WifiPassword": {
               "secret_env": "BL808_WIFI_PASSWORD"
-            },
-            "WifiChannel": {
-              "env": "BL808_WIFI_CHANNEL",
-              "default": 0
             }
           }
         }
@@ -1574,16 +1675,13 @@
           "flash": "m0",
           "defines": {
             "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
             "bl808WifiForcePmfCapable": "1",
             "WifiSsid": {
               "env": "BL808_WIFI_SSID"
             },
             "WifiPassword": {
               "secret_env": "BL808_WIFI_PASSWORD"
-            },
-            "WifiChannel": {
-              "env": "BL808_WIFI_CHANNEL",
-              "default": 0
             }
           }
         }
@@ -1604,6 +1702,84 @@
         "[PASS] wifi ap stop",
         "=== Test Complete ==="
       ],
+      "jtag_snapshot": [
+        "poll",
+        "reg pc",
+        "reg sp",
+        "reg ra",
+        "reg mepc",
+        "reg mcause",
+        "reg mtval",
+        "mdw {sym:nimfw_dbg_eth_tx_eapol} 1",
+        "mdw {sym:nimfw_dbg_bl_output_eapol} 1",
+        "mdw {sym:nimfw_dbg_bl_tx_cfm_eapol} 1",
+        "mdw {sym:nimfw_dbg_eapol_cfm_count} 1",
+        "mdw {sym:nimfw_dbg_eapol_cfm_ack_ok} 1",
+        "mdw {sym:nimfw_dbg_eapol_cfm_ack_fail} 1",
+        "mdw {sym:nimfw_dbg_eapol_cfm_status} 1",
+        "mdw {sym:nimfw_dbg_eapol_cfm_ring_idx} 1",
+        "mdw {sym:nimfw_dbg_eapol_cfm_status_log} 4",
+        "mdw {sym:nimfw_dbg_eapol_cfm_meta_log} 4",
+        "mdw {sym:nimfw_dbg_eapol_cfm_key_log} 4",
+        "mdw {sym:nimfw_dbg_eapol_cfm_replay_log} 4",
+        "mdw {sym:nimfw_dbg_eapol_cfm_cb_log} 4",
+        "mdw {sym:nimfw_dbg_eapol_tx_desc_bytes} 1",
+        "mdw {sym:nimfw_dbg_eapol_tx_hdr0} 1",
+        "mdw {sym:nimfw_dbg_eapol_tx_hdr1} 1",
+        "mdw {sym:nimfw_dbg_eapol_tx_hdr2} 1",
+        "mdw {sym:nimfw_dbg_eapol_tx_hdr3} 1",
+        "mdw {sym:nimfw_dbg_eapol_tx_addr_hi} 1",
+        "mdw {sym:nimfw_dbg_eapol_tx_policy} 1",
+        "mdw {sym:nimfw_dbg_eapol_tx_buf_desc} 1",
+        "mdw {sym:nimfw_dbg_eapol_tx_hw_desc} 1",
+        "mdw {sym:nimfw_dbg_eapol_tx_rate0} 1",
+        "mdw {sym:nimfw_dbg_eapol_tx_rate1} 1",
+        "mdw {sym:nimfw_dbg_eapol_tx_rate2} 1",
+        "mdw {sym:nimfw_dbg_eapol_tx_rate3} 1",
+        "mdw {sym:nimfw_dbg_eapol_tx_link0} 1",
+        "mdw {sym:nimfw_dbg_eapol_tx_link1} 1",
+        "mdw {sym:nimfw_dbg_ipc_host_txcfm_irq} 1",
+        "mdw {sym:nimfw_dbg_ipc_host_txcfm_handler} 1",
+        "mdw {sym:nimfw_dbg_ipc_host_txcfm_drained} 1",
+        "mdw {sym:nimfw_dbg_ipc_host_txdesc_push} 1",
+        "mdw {sym:nimfw_dbg_ipc_host_txdesc_nil} 1",
+        "mdw {sym:nim_wifi_rf_breakpoint_tag} 1",
+        "mdw {sym:nim_wifi_rf_breakpoint_count} 1",
+        "mdw {sym:nim_wifi_rf_stage_snapshot_count} 1",
+        "mdw {sym:nim_wifi_rf_stage_tag_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rf70_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rf88_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rfd0_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rfa0_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rf1600_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rfb4_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rfbc_log} 8",
+        "mdw {sym:nim_wifi_rf_optimize_count} 1",
+        "mdw {sym:nim_wifi_rf_optimize_channel_log} 8",
+        "mdw {sym:nim_wifi_rf_optimize_device_log} 8",
+        "mdw {sym:nim_wifi_rf_optimize_rfd0_log} 8",
+        "mdw {sym:nim_wifi_rf_optimize_rf70_log} 8",
+        "mdw {sym:nim_wifi_rf_optimize_nibble_log} 8",
+        "mdw {sym:nim_wifi_rf_pri_txcal_count} 1",
+        "mdw {sym:nim_wifi_rf_pri_lo_fcal_count} 1",
+        "mdw {sym:nim_wifi_rf_pri_lo_acal_count} 1",
+        "mdw {sym:nim_wifi_rf_pri_roscal_count} 1",
+        "mdw {sym:nim_wifi_rf_pri_rccal_count} 1",
+        "mdw {sym:nim_wifi_rf_pri_rxcal_count} 1",
+        "mdw {sym:nim_wifi_rf_bz_txcal_snapshot_count} 1",
+        "mdw {sym:nim_wifi_rf_bz_txcal_tag_log} 8",
+        "mdw {sym:nim_wifi_rf_bz_txcal_word0_log} 9",
+        "mdw {sym:nim_wifi_rf_bz_txcal_word1_log} 9",
+        "mdw {sym:nim_wifi_rf_bz_txcal_ok_mask_log} 9",
+        "mdw {sym:nim_wifi_rf_bz_txcal_power_log} 9",
+        "mdw {sym:nim_wifi_rf_bz_txcal_rf88_log} 8",
+        "mdw {sym:nim_wifi_rf_bz_txcal_rf1600_log} 8",
+        "mdw 0x20001070 1",
+        "mdw 0x20001088 1",
+        "mdw 0x200010D0 1",
+        "mdw 0x24B0806C 1",
+        "mdw 0x24B08180 1"
+      ],
       "timeout": 80
     },
     {
@@ -1619,6 +1795,7 @@
           "flash": "m0",
           "defines": {
             "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
             "bl808WifiForcePmfCapable": "1",
             "WifiKeepaliveFrames": "3",
             "WifiSsid": {
@@ -1626,10 +1803,6 @@
             },
             "WifiPassword": {
               "secret_env": "BL808_WIFI_PASSWORD"
-            },
-            "WifiChannel": {
-              "env": "BL808_WIFI_CHANNEL",
-              "default": 0
             }
           }
         }
@@ -1819,6 +1992,7 @@
           "flash": "m0",
           "defines": {
             "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
             "bl808WifiForcePmfCapable": "1",
             "WifiKeepaliveFrames": "3",
             "WifiKeepaliveQosNull": "1",
@@ -1827,10 +2001,6 @@
             },
             "WifiPassword": {
               "secret_env": "BL808_WIFI_PASSWORD"
-            },
-            "WifiChannel": {
-              "env": "BL808_WIFI_CHANNEL",
-              "default": 0
             }
           }
         }
@@ -1898,10 +2068,6 @@
               "env": "BL808_WIFI_BAD_PASSWORD",
               "default": "dummy-password"
             },
-            "WifiChannel": {
-              "env": "BL808_WIFI_CHANNEL",
-              "default": 0
-            },
             "WifiExpectConnectFailure": "1",
             "WifiExpectedConnectStatus": "8",
             "WifiExpectedConnectReason": "15"
@@ -1936,16 +2102,13 @@
           "flash": "m0",
           "defines": {
             "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
             "WifiSsid": {
               "env": "BL808_WIFI_SSID"
             },
             "WifiPassword": {
               "env": "BL808_WIFI_BAD_PASSWORD",
               "default": "dummy-password"
-            },
-            "WifiChannel": {
-              "env": "BL808_WIFI_CHANNEL",
-              "default": 0
             },
             "WifiExpectConnectFailure": "1",
             "WifiExpectedConnectStatus": "8",
@@ -2174,10 +2337,6 @@
             },
             "WifiPassword": {
               "secret_env": "BL808_WIFI_PASSWORD"
-            },
-            "WifiChannel": {
-              "env": "BL808_WIFI_CHANNEL",
-              "default": 0
             }
           }
         }
@@ -2255,6 +2414,7 @@
           "flash": "m0",
           "defines": {
             "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
             "bl808BleNimPureConnection": "1",
             "bl808BleNimManualConnTx": "1",
             "bl808BleNimConTimingPath": "1",
@@ -2268,10 +2428,6 @@
             },
             "WifiPassword": {
               "secret_env": "BL808_WIFI_PASSWORD"
-            },
-            "WifiChannel": {
-              "env": "BL808_WIFI_CHANNEL",
-              "default": 0
             }
           }
         }
@@ -2410,6 +2566,7 @@
           "flash": "m0",
           "defines": {
             "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
             "bl808BleNimPureConnection": "1",
             "bl808BleNimManualConnTx": "1",
             "bl808BleNimConTimingPath": "1",
@@ -2419,6 +2576,8 @@
             "WifiBleCoexPtaMode": "1",
             "WifiBleCoexServicePeriodUs": "1000",
             "WifiBleCoexServiceIterations": "1",
+            "WifiHeapDiag": "1",
+            "HwValidationLogCapacity": "4096",
             "BleHostWindowIterations": "80000",
             "BlePollIterations": "1",
             "BlePostAdvertiseQuietMs": "500",
@@ -2427,10 +2586,6 @@
             },
             "WifiPassword": {
               "secret_env": "BL808_WIFI_PASSWORD"
-            },
-            "WifiChannel": {
-              "env": "BL808_WIFI_CHANNEL",
-              "default": 0
             }
           }
         }
@@ -2521,6 +2676,7 @@
           "flash": "m0",
           "defines": {
             "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
             "bl808BleNimPureConnection": "1",
             "bl808BleNimManualConnTx": "1",
             "bl808BleNimConTimingPath": "1",
@@ -2536,6 +2692,8 @@
             "WifiBleTrafficBusyRetryMs": "10",
             "WifiBlePostTrafficFrames": "3",
             "BleTrafficStartDelayMs": "5000",
+            "WifiHeapDiag": "1",
+            "HwValidationLogCapacity": "4096",
             "BleHostWindowIterations": "80000",
             "BleHostMinWindowIterations": "8000",
             "BlePollIterations": "1",
@@ -2546,10 +2704,6 @@
             },
             "WifiPassword": {
               "secret_env": "BL808_WIFI_PASSWORD"
-            },
-            "WifiChannel": {
-              "env": "BL808_WIFI_CHANNEL",
-              "default": 0
             }
           }
         }
@@ -3238,15 +3392,31 @@
           "source": "examples/m0_wifi_lwip_smoke.nim",
           "flash": "m0",
           "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "bl808WifiRealLwip": "1",
+            "bl808WifiRxPbufInput": "1",
             "WifiSsid": {
               "env": "BL808_WIFI_SSID"
             },
             "WifiPassword": {
               "secret_env": "BL808_WIFI_PASSWORD"
             },
-            "WifiChannel": {
-              "env": "BL808_WIFI_CHANNEL",
-              "default": 0
+            "WifiIcmpTargetA": {
+              "env": "BL808_WIFI_ICMP_TARGET_A",
+              "default": 1
+            },
+            "WifiIcmpTargetB": {
+              "env": "BL808_WIFI_ICMP_TARGET_B",
+              "default": 1
+            },
+            "WifiIcmpTargetC": {
+              "env": "BL808_WIFI_ICMP_TARGET_C",
+              "default": 1
+            },
+            "WifiIcmpTargetD": {
+              "env": "BL808_WIFI_ICMP_TARGET_D",
+              "default": 1
             },
             "AttemptsTotal": {
               "env": "BL808_WIFI_E2E_ATTEMPTS",
@@ -3256,7 +3426,184 @@
         }
       ],
       "required": [
+        "@e2e dhcp:ok",
+        "@e2e icmp:start dst=0x01010101",
+        "@e2e icmp:ok",
         "=== BL808 LwIP Smoke Complete ==="
+      ],
+      "jtag_snapshot": [
+        "poll",
+        "reg pc",
+        "reg sp",
+        "reg ra",
+        "reg mepc",
+        "reg mcause",
+        "reg mtval",
+        "mdw {sym:nimfw_dbg_rf_phase} 1",
+        "mdw {sym:nimfw_dbg_rf_restore} 1",
+        "mdw {sym:nimfw_dbg_rf_assert_count} 1",
+        "mdw {sym:nimfw_dbg_rf_assert_line} 1",
+        "mdw {sym:nimfw_dbg_rf_assert_reg3c} 1",
+        "mdw {sym:nimfw_dbg_rf_cal_ptr} 1",
+        "mdw {sym:nimfw_dbg_rf_cal_words} 8",
+        "mdw {sym:nim_wifi_dbg_delay_calls} 1",
+        "mdw {sym:nim_wifi_dbg_delay_last_us} 1",
+        "mdw {sym:nim_wifi_dbg_delay_fallbacks} 1",
+        "mdw {sym:nim_wifi_dbg_delay_last_stale} 1",
+        "mdw {sym:nim_wifi_dbg_delay_last_start_lo} 1",
+        "mdw {sym:nim_wifi_dbg_delay_last_now_lo} 1",
+        "mdw {sym:nim_wifi_dbg_delay_caller_ra} 1",
+        "mdw {sym:nim_wifi_rf_stage_snapshot_count} 1",
+        "mdw {sym:nim_wifi_rf_stage_tag_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rf70_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rf88_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rfd0_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rfa0_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rf1600_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rfb4_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rfbc_log} 8",
+        "mdw {sym:nim_wifi_rf_optimize_count} 1",
+        "mdw {sym:nim_wifi_rf_optimize_channel_log} 8",
+        "mdw {sym:nim_wifi_rf_optimize_device_log} 8",
+        "mdw {sym:nim_wifi_rf_optimize_rfd0_log} 8",
+        "mdw {sym:nim_wifi_rf_optimize_rf70_log} 8",
+        "mdw {sym:nim_wifi_rf_optimize_nibble_log} 8",
+        "mdw {sym:nimfw_dbg_tx_sta_lookup} 1",
+        "mdw {sym:nimfw_dbg_tx_sta_lookup_fail} 1",
+        "mdw {sym:nimfw_dbg_tx_sta_lookup_mode} 1",
+        "mdw {sym:nimfw_dbg_tx_sta_lookup_vif} 1",
+        "mdw {sym:nimfw_dbg_tx_sta_lookup_sta} 1",
+        "mdw {sym:nimfw_dbg_tx_sta_lookup_result} 1",
+        "mdw {sym:nimfw_dbg_tx_sta_lookup_eth} 1",
+        "mdw {sym:nimfw_dbg_tx_sta_lookup_dst0} 1",
+        "mdw {sym:nimfw_dbg_tx_sta_lookup_dst1} 1",
+        "mdw {sym:nimfw_dbg_rx_sm_sta_add} 1",
+        "mdw {sym:nimfw_dbg_rx_sm_sta_add_meta} 1",
+        "mdw {sym:nimfw_dbg_rx_sm_sta_add_vif} 1",
+        "mdw {sym:nimfw_dbg_rx_sm_sta_add_sta} 1",
+        "mdw {sym:nimfw_dbg_rx_sm_sta_add_error} 1",
+        "mdw {sym:nimfw_dbg_rx_sm_disc} 1",
+        "mdw {sym:nimfw_dbg_rx_sm_seq} 1",
+        "mdw {sym:nimfw_dbg_rx_sm_sta_add_seq} 1",
+        "mdw {sym:nimfw_dbg_rx_sm_disc_seq} 1",
+        "mdw {sym:nimfw_dbg_rx_sm_disc_meta} 1",
+        "mdw {sym:nimfw_dbg_rx_sm_disc_vif} 1",
+        "mdw {sym:nimfw_dbg_rx_sm_disc_sta} 1",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_count} 1",
+        "mdw {sym:nimfw_dbg_rxu_dup_break_hits} 1",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_fc} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_seq} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_cache} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_snap_lo} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_snap_hi} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_addr0} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_addr1} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_ip0} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_udp0} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_bootp0} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_bootp1} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_bootp_yiaddr} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_dhcp_msg} 8",
+        "mdw {sym:nimfw_dbg_rxu_dup_trace_dhcp_server} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_count} 1",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_fc} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_seq} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_pn_lo} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_pn_hi} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_stored_lo} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_stored_hi} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_snap_lo} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_snap_hi} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_udp0} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_bootp_yiaddr} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_dhcp_msg} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_drop_trace_dhcp_server} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_count} 1",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_stage} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_fc} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_seq} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_pn_lo} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_pn_hi} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_stored_lo} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_stored_hi} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_next_lo} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_next_hi} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_snap_lo} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_snap_hi} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_udp0} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_bootp_yiaddr} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_dhcp_msg} 8",
+        "mdw {sym:nimfw_dbg_rxu_pn_accept_trace_dhcp_server} 8",
+        "mdw {sym:nimfw_dbg_dhcp_tx_policy} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_buf_desc} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_hw_desc} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_rate0} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_rate1} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_rate2} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_rate3} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_link0} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_link1} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_thd0} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_thd1} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_thd2} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_final_break_hits} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_final_desc0} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_final_desc1} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_final_buf0} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_final_len0} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_final_hw_start} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_final_hw_end} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_final_hw_len} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_final_hw_flags} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_final_hthd_start} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_final_hthd_end} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_final_hthd_next} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_final_hthd_flags} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_final_pthd_start} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_final_pthd_end} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_final_pthd_next} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_final_pthd_flags} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_break_hits} 1",
+        "mdw {sym:nimfw_dbg_dhcp_request_tx_break_hits} 1",
+        "mdw {sym:nimfw_dbg_dhcp_tx_msg_hist} 8",
+        "mdw {sym:nimfw_dbg_dhcp_udp_csum_repair} 1",
+        "mdw {sym:nimfw_dbg_dhcp_udp_csum_before} 1",
+        "mdw {sym:nimfw_dbg_dhcp_udp_csum_calc} 1",
+        "mdw {sym:nimfw_dbg_dhcp_udp_csum_after} 1",
+        "mdw {sym:nimfw_dbg_dhcp_udp_csum_vbefore} 1",
+        "mdw {sym:nimfw_dbg_dhcp_udp_csum_vafter} 1",
+        "mdw {sym:nimfw_dbg_dhcp_req_udp_csum_before} 1",
+        "mdw {sym:nimfw_dbg_dhcp_req_udp_csum_calc} 1",
+        "mdw {sym:nimfw_dbg_dhcp_req_udp_csum_after} 1",
+        "mdw {sym:nimfw_dbg_dhcp_req_udp_csum_vbefore} 1",
+        "mdw {sym:nimfw_dbg_dhcp_req_udp_csum_vafter} 1",
+        "mdw {sym:nimfw_dbg_dhcp_req_udp_csum_at_copy} 1",
+        "mdw {sym:nimfw_dbg_rc_update_calls} 1",
+        "mdw {sym:nimfw_dbg_rc_update_meta} 1",
+        "mdw {sym:nimfw_dbg_rc_update_args} 1",
+        "mdw {sym:nimfw_dbg_rc_update_slot} 1",
+        "mdw {sym:nimfw_dbg_rc_update_entry} 1",
+        "mdw {sym:nimfw_dbg_rc_update_counts} 1",
+        "mdw {sym:nimfw_dbg_rc_update_fail} 1",
+        "mdw {sym:wifi_hw} 64",
+        "mdw {sym:nim_wifi_dbg_rf_latch_service_enabled} 1",
+        "mdw {sym:nim_wifi_dbg_rf_txcal_latch_count} 1",
+        "mdw {sym:nim_wifi_dbg_rf_txcal_before} 1",
+        "mdw {sym:nim_wifi_dbg_rf_txcal_after} 1",
+        "mdw 0x24C00000 16",
+        "mdw 0x24C0003C 1",
+        "mdw 0x24C00824 1",
+        "mdw 0x24C00834 1",
+        "mdw 0x24C00874 1",
+        "mdw 0x24C09000 32",
+        "mdw 0x24C0A000 32",
+        "mdw 0x24C0B340 4",
+        "mdw 0x24C0B390 1",
+        "mdw 0x24B0004C 1",
+        "mdw 0x24B00060 1",
+        "mdw 0x24B0806C 1",
+        "mdw 0x24B08074 1",
+        "mdw 0x24B08080 1"
       ],
       "timeout": 240
     },
@@ -3273,6 +3620,7 @@
           "flash": "m0",
           "defines": {
             "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
             "bl808WifiNimFwTrace": "1"
           }
         }
@@ -3284,6 +3632,94 @@
         "=== BL808 NimFw Boot Probe Complete ==="
       ],
       "timeout": 30
+    },
+    {
+      "name": "m0_wifi_http_server",
+      "tiers": [
+        "smoke"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wifi_http_server.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "bl808WifiRealLwip": "1",
+            "bl808WifiRealLwipTcp": "1",
+            "bl808WifiRxPbufInput": "1",
+            "WifiSsid": {
+              "env": "BL808_WIFI_SSID"
+            },
+            "WifiPassword": {
+              "secret_env": "BL808_WIFI_PASSWORD"
+            },
+            "HttpPort": {
+              "env": "BL808_WIFI_HTTP_PORT",
+              "default": 80
+            },
+            "UdpEchoPort": {
+              "env": "BL808_WIFI_UDP_ECHO_PORT",
+              "default": 65000
+            },
+            "UdpProbeTargetA": {
+              "env": "BL808_WIFI_UDP_PROBE_TARGET_A",
+              "default": 0
+            },
+            "UdpProbeTargetB": {
+              "env": "BL808_WIFI_UDP_PROBE_TARGET_B",
+              "default": 0
+            },
+            "UdpProbeTargetC": {
+              "env": "BL808_WIFI_UDP_PROBE_TARGET_C",
+              "default": 0
+            },
+            "UdpProbeTargetD": {
+              "env": "BL808_WIFI_UDP_PROBE_TARGET_D",
+              "default": 0
+            },
+            "UdpProbePort": {
+              "env": "BL808_WIFI_UDP_PROBE_PORT",
+              "default": 65001
+            }
+          }
+        }
+      ],
+      "required": [
+        "=== BL808 WiFi HTTP Server ===",
+        "@e2e scan:ok",
+        "@e2e dhcp:ok",
+        "@e2e tcp:start",
+        "proto=udp",
+        "Ready for HTTP/1.1 and UDP echo client requests",
+        "[PASS] lwIP TCP HTTP/1.1 response",
+        "[PASS] lwIP UDP echo bytes="
+      ],
+      "host_actions": [
+        {
+          "after_marker": "Ready for HTTP/1.1 and UDP echo client requests",
+          "cmd": [
+            "{python}",
+            "tools/probe_wifi_lwip_tcp_udp.py",
+            "--ip",
+            "{e2e:dhcp:ok:ip}",
+            "--http-port",
+            "80",
+            "--udp-port",
+            "65000",
+            "--timeout",
+            "10"
+          ],
+          "required": [
+            "[PASS] lwIP TCP HTTP/1.1 response",
+            "[PASS] lwIP UDP echo bytes="
+          ],
+          "timeout": 15
+        }
+      ],
+      "timeout": 90
     }
   ]
 }

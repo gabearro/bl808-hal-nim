@@ -71,6 +71,15 @@ type
   RecvInd = proc(pthis, hostId: pointer): uint8 {.cdecl.}
   TbttInd = proc(pthis: pointer) {.cdecl.}
 
+var nimFwDbgIpcHostIrq* {.exportc: "nimfw_dbg_ipc_host_irq".}: uint32
+var nimFwDbgIpcHostIrqStatus* {.exportc: "nimfw_dbg_ipc_host_irq_status".}: uint32
+var nimFwDbgIpcHostTxCfmIrq* {.exportc: "nimfw_dbg_ipc_host_txcfm_irq".}: uint32
+var nimFwDbgIpcHostTxCfmHandler* {.exportc: "nimfw_dbg_ipc_host_txcfm_handler".}: uint32
+var nimFwDbgIpcHostTxCfmDrained* {.exportc: "nimfw_dbg_ipc_host_txcfm_drained".}: uint32
+var nimFwDbgIpcHostTxCfmLastHost* {.exportc: "nimfw_dbg_ipc_host_txcfm_host".}: uint32
+var nimFwDbgIpcHostTxDescGetNil* {.exportc: "nimfw_dbg_ipc_host_txdesc_nil".}: uint32
+var nimFwDbgIpcHostTxDescPush* {.exportc: "nimfw_dbg_ipc_host_txdesc_push".}: uint32
+
 proc c_memset(s: pointer, c: cint, n: csize_t): pointer
   {.importc: "memset", header: "<string.h>", cdecl.}
 proc c_memcpy(dest, src: pointer, n: csize_t): pointer
@@ -224,8 +233,11 @@ proc ipc_host_txbuf_free*(buf: pointer) {.exportc, cdecl.} =
 
 proc ipc_host_txdesc_get*(env: pointer): pointer {.exportc, cdecl.} =
   if env == nil:
+    inc nimFwDbgIpcHostTxDescGetNil
     return nil
-  listPick(loadPtr(env, EnvListFreeOff))
+  result = listPick(loadPtr(env, EnvListFreeOff))
+  if result == nil:
+    inc nimFwDbgIpcHostTxDescGetNil
 
 proc ipc_host_txdesc_left*(env: pointer; queueIdx, userPos: cint): cint {.exportc, cdecl.} =
   discard queueIdx
@@ -243,6 +255,7 @@ proc ipc_host_txdesc_push*(env, hostId: pointer) {.exportc, cdecl.} =
   let txdesc = listPopFront(freeList)
   if txdesc == nil:
     return
+  inc nimFwDbgIpcHostTxDescPush
   storeU32(txdesc, TxdescHostReadyOff, 0xffff_ffff'u32)
   storePtr(txdesc, TxdescHostHostIdOff, hostId)
   listPushBack(loadPtr(env, EnvListOngoingOff), txdesc)
@@ -257,10 +270,14 @@ proc ipcHostMsgAckHandler(env: pointer) =
   callRecvMsgAck(env, hostId)
 
 proc ipcHostTxCfmHandler(env: pointer) =
+  inc nimFwDbgIpcHostTxCfmHandler
   let cfmList = loadPtr(env, EnvListCfmOff)
   var txdesc = listPopFront(cfmList)
   while txdesc != nil:
-    callSendDataCfm(env, loadPtr(txdesc, TxdescHostHostIdOff))
+    let hostId = loadPtr(txdesc, TxdescHostHostIdOff)
+    nimFwDbgIpcHostTxCfmLastHost = cast[uint32](cast[uint](hostId))
+    callSendDataCfm(env, hostId)
+    inc nimFwDbgIpcHostTxCfmDrained
     storePtr(txdesc, TxdescHostHostIdOff, nil)
     listPushBack(loadPtr(env, EnvListFreeOff), txdesc)
     txdesc = listPopFront(cfmList)
@@ -274,11 +291,14 @@ proc ipcHostDbgHandler(env: pointer) =
 proc ipc_host_irq*(env: pointer; statusIn: uint32) {.exportc, cdecl.} =
   if env == nil:
     return
+  inc nimFwDbgIpcHostIrq
 
   regWrite(IpcEmb2AppAck, statusIn)
   let status = statusIn or regRead(IpcEmb2AppStatus)
+  nimFwDbgIpcHostIrqStatus = status
 
   if (status and IpcIrqE2aTxCfm) != 0'u32:
+    inc nimFwDbgIpcHostTxCfmIrq
     for i in 0 ..< IpcTxQueueCnt:
       if (status and (1'u32 shl (i + IpcIrqE2aTxCfmPos))) != 0'u32:
         ipcHostTxCfmHandler(env)

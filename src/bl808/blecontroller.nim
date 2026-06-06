@@ -128,6 +128,10 @@ var nim_ble_wifi_tx_window_defer_count* {.exportc.}: uint32
 var nim_ble_wifi_tx_window_resume_count* {.exportc.}: uint32
 var nim_ble_wifi_tx_window_last_intmask* {.exportc.}: uint32
 var nim_ble_wifi_tx_window_last_intstat* {.exportc.}: uint32
+var nim_ble_hci_reset_settle_pending* {.exportc.}: uint32
+var nim_ble_hci_reset_settle_yield_count* {.exportc.}: uint32
+var nim_ble_hci_reset_settle_deadline_lo* {.exportc.}: uint32
+var bleHciResetSettleDeadline: uint64
 
 when defined(BleDebugCounters):
   var nim_ble_p256_stage* {.exportc.}: uint32
@@ -157,13 +161,22 @@ proc bleSettleAfterLldInit() {.inline.} =
   ## allocating messages and touching controller state.
   delayUs(NimBlePostLldInitSettleUs)
 
-proc bleSettleAfterHciReset() {.inline.} =
+proc bleArmHciResetSettle() {.inline.} =
   ## HCI Reset rewrites clocked BTBLE/EM control state. The vendor controller
   ## reaches command-complete through its task scheduler; keep the pure Nim path
-  ## from accepting the next command in the same hardware instant.
-  let deadline = clicReadMtime() + NimBlePostHciResetSettleUs.uint64
-  while clicReadMtime() < deadline:
-    core.fence()
+  ## from accepting the next controller work in the same hardware instant.
+  bleHciResetSettleDeadline =
+    clicReadMtime() + NimBlePostHciResetSettleUs.uint64
+  nim_ble_hci_reset_settle_pending = 1
+  nim_ble_hci_reset_settle_deadline_lo = bleHciResetSettleDeadline.uint32
+
+proc bleHciResetSettlePending(): bool {.inline.} =
+  if nim_ble_hci_reset_settle_pending == 0'u32:
+    return false
+  if clicReadMtime() < bleHciResetSettleDeadline:
+    return true
+  nim_ble_hci_reset_settle_pending = 0
+  false
 
 when defined(bl808BleConnectTrace) or defined(bl808BlePrintNimLlcMsg):
   proc bleTraceByte(ch: uint8) =
@@ -228,6 +241,36 @@ when defined(bl808m0) and
       rssiFloorDbm*: int8
       calibrationWord*: uint16
 
+    BleMacPhyRegs {.packed.} = object
+      reserved000*: array[0x30, uint8]
+      sleepCtrl*: uint32
+      reserved034*: array[0x84C, uint8]
+      reset880*: uint32
+      reset884*: uint32
+      reset888*: uint32
+      reset88c*: uint32
+      reset890*: uint32
+      reset894*: uint32
+      reset898*: uint32
+      reset89c*: uint32
+      reserved8a0*: array[0xE0, uint8]
+      settle980*: uint32
+      settle984*: uint32
+      settle988*: uint32
+      settle98c*: uint32
+      reserved990*: array[0x30, uint8]
+      trim9c0*: uint32
+
+    BlePhyCtrlRegs {.packed.} = object
+      reserved00*: array[0x08, uint8]
+      phyCtrl08*: uint32
+      reserved0c*: array[0x80, uint8]
+      phyCtrl8c*: uint32
+
+    BlePhyAgcRegs {.packed.} = object
+      reserved00*: array[0x84, uint8]
+      agcCtrl84*: uint32
+
   const
     BtbleRfEmConfigWord = 0x2000'u16
     BtbleRfRssiFloorDbm = -40'i8
@@ -247,8 +290,35 @@ when defined(bl808m0) and
     doAssert offsetof(BtbleRfTableView, emConfigWord) == 0x38
     doAssert offsetof(BtbleRfTableView, rssiFloorDbm) == 0x3D
     doAssert offsetof(BtbleRfTableView, calibrationWord) == 0x3E
+    doAssert offsetof(BleMacPhyRegs, sleepCtrl) == 0x30
+    doAssert offsetof(BleMacPhyRegs, reset880) == 0x880
+    doAssert offsetof(BleMacPhyRegs, reset89c) == 0x89C
+    doAssert offsetof(BleMacPhyRegs, settle980) == 0x980
+    doAssert offsetof(BleMacPhyRegs, settle98c) == 0x98C
+    doAssert offsetof(BleMacPhyRegs, trim9c0) == 0x9C0
+    doAssert offsetof(BlePhyCtrlRegs, phyCtrl08) == 0x08
+    doAssert offsetof(BlePhyCtrlRegs, phyCtrl8c) == 0x8C
+    doAssert offsetof(BlePhyAgcRegs, agcCtrl84) == 0x84
 
   var g_ble_max_txpower_dbm: int8
+
+  template bleMacPhyRegs(): ptr BleMacPhyRegs =
+    cast[ptr BleMacPhyRegs](0x28000000'u)
+
+  template blePhyCtrlRegs(): ptr BlePhyCtrlRegs =
+    cast[ptr BlePhyCtrlRegs](0x20002800'u)
+
+  template blePhyAgcRegs(): ptr BlePhyAgcRegs =
+    cast[ptr BlePhyAgcRegs](0x20002C00'u)
+
+  proc regLoad(reg: ptr uint32): uint32 {.inline.} =
+    regRead(cast[uint](reg))
+
+  proc regStore(reg: ptr uint32, value: uint32) {.inline.} =
+    regWrite(cast[uint](reg), value)
+
+  proc regUpdateField(reg: ptr uint32, clearMask, setMask: uint32) {.inline.} =
+    regStore(reg, (regLoad(reg) and clearMask) or setMask)
 
   proc nimBleRfTxpowerMaxSet(dbm: int8) {.cdecl.} =
     g_ble_max_txpower_dbm = dbm
@@ -285,35 +355,33 @@ when defined(bl808m0) and
     discard value
 
   proc nimRfSleep() {.cdecl.} =
-    regWrite(0x28000030'u32.uint, regRead(0x28000030'u32.uint) or 7'u32)
+    regStore(addr bleMacPhyRegs().sleepCtrl,
+             regLoad(addr bleMacPhyRegs().sleepCtrl) or 7'u32)
 
   proc nimRfReset() {.cdecl.} =
-    regWrite(0x28000880'u32.uint, 0x00500350'u32)
-    regWrite(0x28000884'u32.uint, 0x00500350'u32)
-    regWrite(0x28000888'u32.uint, 0x00500350'u32)
-    regWrite(0x2800088C'u32.uint, 0x00000350'u32)
-    regWrite(0x28000890'u32.uint, 0x04000703'u32)
-    regWrite(0x28000894'u32.uint, 0x00000502'u32)
-    regWrite(0x28000898'u32.uint, 0x08000703'u32)
-    regWrite(0x2800089C'u32.uint, 0x08000003'u32)
-    regWrite(0x28000890'u32.uint,
-             (regRead(0x28000890'u32.uint) and 0xFF80FFFF'u32) or 0x00280000'u32)
-    regWrite(0x28000894'u32.uint,
-             (regRead(0x28000894'u32.uint) and 0xFF80FFFF'u32) or 0x001E0000'u32)
-    regWrite(0x28000898'u32.uint,
-             (regRead(0x28000898'u32.uint) and 0xFF00FFFF'u32) or 0x00870000'u32)
-    regWrite(0x2800089C'u32.uint,
-             (regRead(0x2800089C'u32.uint) and 0xFF80FFFF'u32) or 0x00280000'u32)
-    regWrite(0x280009C0'u32.uint,
-             regRead(0x280009C0'u32.uint) or 0x00004000'u32)
-    regWrite(0x20002C84'u32.uint, 0x1208102B'u32)
-    regWrite(0x2000288C'u32.uint,
-             (regRead(0x2000288C'u32.uint) and 0xFF803FFF'u32) or 0x00014000'u32)
-    regWrite(0x20002808'u32.uint, 0x0842001A'u32)
-    regWrite(0x28000980'u32.uint, 0x02120013'u32)
-    regWrite(0x28000984'u32.uint, 0x02120013'u32)
-    regWrite(0x28000988'u32.uint, 0x02120013'u32)
-    regWrite(0x2800098C'u32.uint, 0x02120013'u32)
+    let mac = bleMacPhyRegs()
+    let phy = blePhyCtrlRegs()
+    let agc = blePhyAgcRegs()
+    regStore(addr mac.reset880, 0x00500350'u32)
+    regStore(addr mac.reset884, 0x00500350'u32)
+    regStore(addr mac.reset888, 0x00500350'u32)
+    regStore(addr mac.reset88c, 0x00000350'u32)
+    regStore(addr mac.reset890, 0x04000703'u32)
+    regStore(addr mac.reset894, 0x00000502'u32)
+    regStore(addr mac.reset898, 0x08000703'u32)
+    regStore(addr mac.reset89c, 0x08000003'u32)
+    regUpdateField(addr mac.reset890, 0xFF80FFFF'u32, 0x00280000'u32)
+    regUpdateField(addr mac.reset894, 0xFF80FFFF'u32, 0x001E0000'u32)
+    regUpdateField(addr mac.reset898, 0xFF00FFFF'u32, 0x00870000'u32)
+    regUpdateField(addr mac.reset89c, 0xFF80FFFF'u32, 0x00280000'u32)
+    regStore(addr mac.trim9c0, regLoad(addr mac.trim9c0) or 0x00004000'u32)
+    regStore(addr agc.agcCtrl84, 0x1208102B'u32)
+    regUpdateField(addr phy.phyCtrl8c, 0xFF803FFF'u32, 0x00014000'u32)
+    regStore(addr phy.phyCtrl08, 0x0842001A'u32)
+    regStore(addr mac.settle980, 0x02120013'u32)
+    regStore(addr mac.settle984, 0x02120013'u32)
+    regStore(addr mac.settle988, 0x02120013'u32)
+    regStore(addr mac.settle98c, 0x02120013'u32)
 
   proc nimRfForceAgcEnable() {.cdecl.} =
     discard
@@ -386,7 +454,11 @@ const
 
   BtbleBusyBit = 0x80000000'u32
   BtbleCommandPollLimit = 100_000'u32
+  BleKeMessageEventId = 2'u8
+  BleKeMessageEventBit = 1'u32 shl 2
   BleKeEventDrainLimit = 8'u32
+  BleKeTimerDrainLimit = 8'u32
+  BleArbCallbackDrainLimit = 4'u32
   BleScanReportDrainLimit = 2'u32
 
 var
@@ -394,6 +466,9 @@ var
   nim_btble_cmd_wait_last_reg* {.exportc.}: uint32
   nim_ble_ke_event_yield_count* {.exportc.}: uint32
   nim_ble_ke_event_yield_field* {.exportc.}: uint32
+  nim_ble_ke_timer_yield_count* {.exportc.}: uint32
+  nim_ble_ke_timer_yield_time* {.exportc.}: uint32
+  nim_ble_arb_callback_yield_count* {.exportc.}: uint32
   nim_ble_scan_report_yield_count* {.exportc.}: uint32
   nim_ble_scan_report_yield_pending* {.exportc.}: uint32
 
@@ -636,6 +711,49 @@ proc regUpdate(regAddr: uint32, mask: uint32, value: uint32) {.inline.} =
   let current = regRead(regAddr.uint)
   regWrite(regAddr.uint, (current and not mask) or (value and mask))
 
+type
+  BlePhyMemoryRegs {.packed.} = object
+    reserved000*: array[0x824, uint8]
+    memMode*: uint32
+    reserved828*: array[0x0C, uint8]
+    ldpcMode*: uint32
+    reserved838*: array[0x3C, uint8]
+    agcMemGate*: uint32
+    reserved878*: array[0xAAC8, uint8]
+    ldpcCtrlB340*: uint32
+    ldpcCtrlB344*: uint32
+    ldpcCtrlB348*: uint32
+    reservedB34c*: array[0x44, uint8]
+    agcLoad*: uint32
+
+static:
+  doAssert offsetof(BlePhyMemoryRegs, memMode) == 0x824
+  doAssert offsetof(BlePhyMemoryRegs, ldpcMode) == 0x834
+  doAssert offsetof(BlePhyMemoryRegs, agcMemGate) == 0x874
+  doAssert offsetof(BlePhyMemoryRegs, ldpcCtrlB340) == 0xB340
+  doAssert offsetof(BlePhyMemoryRegs, ldpcCtrlB344) == 0xB344
+  doAssert offsetof(BlePhyMemoryRegs, ldpcCtrlB348) == 0xB348
+  doAssert offsetof(BlePhyMemoryRegs, agcLoad) == 0xB390
+
+template blePhyMemoryRegs(): ptr BlePhyMemoryRegs =
+  cast[ptr BlePhyMemoryRegs](0x24C00000'u)
+
+proc bleRegLoadPtr(reg: ptr uint32): uint32 {.inline.} =
+  regRead(cast[uint](reg))
+
+proc bleRegStorePtr(reg: ptr uint32, value: uint32) {.inline.} =
+  regWrite(cast[uint](reg), value)
+
+proc bleRegOrPtr(reg: ptr uint32, mask: uint32) {.inline.} =
+  bleRegStorePtr(reg, bleRegLoadPtr(reg) or mask)
+
+proc bleRegClearPtr(reg: ptr uint32, mask: uint32) {.inline.} =
+  bleRegStorePtr(reg, bleRegLoadPtr(reg) and not mask)
+
+proc bleRegUpdatePtr(reg: ptr uint32, mask: uint32, value: uint32) {.inline.} =
+  let current = bleRegLoadPtr(reg)
+  bleRegStorePtr(reg, (current and not mask) or (value and mask))
+
 proc disableM0ClicDeliveryForPolledBle() {.inline.} =
   when defined(bl808m0) and not bl808BleNimRuntimeClicIrq:
     core.csrWriteMie(core.csrReadMie() and not (1'u shl 11))
@@ -816,22 +934,20 @@ proc configureBtPriorityPta() =
     const
       PtaCtrl = 0x24920004'u
       PtaClear = 0x24920428'u
-    volatileStore(cast[ptr uint32](PtaClear), 0'u32)
-    var reg = volatileLoad(cast[ptr uint32](PtaCtrl))
-    reg = reg and not 1'u32
-    volatileStore(cast[ptr uint32](PtaCtrl), reg)
-    reg = volatileLoad(cast[ptr uint32](PtaCtrl))
-    reg = (reg and 0xFFF7FFFF'u32) or 0x00080000'u32
-    volatileStore(cast[ptr uint32](PtaCtrl), reg)
-    reg = volatileLoad(cast[ptr uint32](PtaCtrl))
-    reg = (reg and 0xFFFBFFFF'u32) or 0x00040000'u32
-    volatileStore(cast[ptr uint32](PtaCtrl), reg)
-    reg = volatileLoad(cast[ptr uint32](PtaCtrl))
-    reg = reg and 0xFFFDFFFF'u32
-    volatileStore(cast[ptr uint32](PtaCtrl), reg)
-    reg = volatileLoad(cast[ptr uint32](PtaCtrl))
-    reg = reg and 0xFFFEFFFF'u32
-    volatileStore(cast[ptr uint32](PtaCtrl), reg)
+
+    template ptaReg(regAddr: uint): ptr uint32 =
+      cast[ptr uint32](regAddr)
+
+    proc updatePtaCtrl(keepMask, setMask: uint32) {.inline.} =
+      let reg = (volatileLoad(ptaReg(PtaCtrl)) and keepMask) or setMask
+      volatileStore(ptaReg(PtaCtrl), reg)
+
+    volatileStore(ptaReg(PtaClear), 0'u32)
+    updatePtaCtrl(not 1'u32, 0'u32)
+    updatePtaCtrl(0xFFF7FFFF'u32, 0x00080000'u32)
+    updatePtaCtrl(0xFFFBFFFF'u32, 0x00040000'u32)
+    updatePtaCtrl(0xFFFDFFFF'u32, 0'u32)
+    updatePtaCtrl(0xFFFEFFFF'u32, 0'u32)
 
 type
   BleRegInit = object
@@ -2438,24 +2554,23 @@ proc restoreBleRfIdle1MState(channelMhz: uint16) =
 proc loadBlePhyMemories() =
   ## Program the BL606P-compatible PHY data memories used by BLE 1M RX.
   inc nim_ble_phy_mem_load_count
-  regOr(BlePhyAgcLoadReg, BlePhyAgcLoadEnableMask)
-  regOr(BlePhyAgcMemGateReg, BlePhyAgcMemGateMask)
+  let phyMem = blePhyMemoryRegs()
+  bleRegOrPtr(addr phyMem.agcLoad, BlePhyAgcLoadEnableMask)
+  bleRegOrPtr(addr phyMem.agcMemGate, BlePhyAgcMemGateMask)
   clearBleMemoryWords(blerfdata.BleAgcMemBase, blerfdata.BleAgcMemWords)
   writeBleMemoryWords(blerfdata.BleAgcMemBase, blerfdata.BleAgcMemPrefix)
   regWrite((blerfdata.BleAgcMemBase +
             uint32(blerfdata.BleAgcMemLastWordOffset) * 4'u32).uint,
            blerfdata.BleAgcMemLastWord)
-  regWrite(BlePhyAgcMemGateReg.uint,
-           regRead(BlePhyAgcMemGateReg.uint) and not BlePhyAgcMemGateMask)
-  regWrite(BlePhyAgcLoadReg.uint,
-           regRead(BlePhyAgcLoadReg.uint) and not BlePhyAgcLoadEnableMask)
+  bleRegClearPtr(addr phyMem.agcMemGate, BlePhyAgcMemGateMask)
+  bleRegClearPtr(addr phyMem.agcLoad, BlePhyAgcLoadEnableMask)
 
-  regUpdate(BlePhyLdpcModeReg, BlePhyLdpcLoadModeMask, BlePhyLdpcLoadMode)
-  regWrite(0x24C0B340'u32.uint, 0'u32)
-  regWrite(0x24C0B344'u32.uint, 0'u32)
-  regWrite(0x24C0B348'u32.uint, 0'u32)
-  regWrite(BlePhyMemModeReg.uint,
-           regRead(BlePhyMemModeReg.uint) and not BlePhyLdpcMemSelectMask)
+  bleRegUpdatePtr(addr phyMem.ldpcMode, BlePhyLdpcLoadModeMask,
+                  BlePhyLdpcLoadMode)
+  bleRegStorePtr(addr phyMem.ldpcCtrlB340, 0'u32)
+  bleRegStorePtr(addr phyMem.ldpcCtrlB344, 0'u32)
+  bleRegStorePtr(addr phyMem.ldpcCtrlB348, 0'u32)
+  bleRegClearPtr(addr phyMem.memMode, BlePhyLdpcMemSelectMask)
   writeBleMemoryWords(blerfdata.BleLdpcMemBase, blerfdata.BleLdpcMem,
                       BleLdpcInitWords)
 
@@ -2608,6 +2723,10 @@ type
   KeTaskId* = uint16
   KeMsgId* = uint16
 
+const
+  KeMsgConsumed* = 1'i32
+  KeMsgSaved* = 2'i32
+
 # ---------------------------------------------------------------------------
 # co_list: singly-linked list (next pointer at offset 0)
 # ---------------------------------------------------------------------------
@@ -2628,6 +2747,14 @@ type
   BdAddr* {.packed.} = object
     data*: array[6, uint8]
 
+  BtbleScanReqPduView* {.packed.} = object
+    scanA*: BdAddr
+    advA*: BdAddr
+
+  BtbleAdvPduView* {.packed.} = object
+    advA*: BdAddr
+    data*: array[31, uint8]
+
 # ---------------------------------------------------------------------------
 # ke_msg: message header + payload
 # Layout from disasm: offset 0 = next (4 bytes, linked list pointer)
@@ -2645,6 +2772,10 @@ type
     dest_id*: uint16                ## destination task id
     src_id*: uint16                 ## source task id
     param_len*: uint16              ## parameter length
+
+  KeMsgEnvelope* {.packed.} = object
+    header*: KeMsgHeader
+    param*: UncheckedArray[uint8]
 
 # ---------------------------------------------------------------------------
 # ke_timer: timer element
@@ -2742,6 +2873,96 @@ type
     data_len*: uint16
     reserved8*: uint16
 
+  EmBufRxFreeSlot* {.packed.} = object
+    status*: uint16
+    reserved2*: array[6, uint8]
+    buf_ptr*: uint16
+    reserved10*: array[4, uint8]
+
+  BtbleRxDescView* {.packed.} = object
+    status*: uint16
+    reserved02*: uint16
+    header*: uint16
+    timing0*: uint16
+    rxClock*: uint16
+    timing1*: uint16
+    meta*: uint16
+    reserved0E*: array[6, uint8]
+    dataOffset*: uint16
+    reserved16*: array[10, uint8]
+
+  BtbleConnTxDescView* {.packed.} = object
+    status*: uint16
+    header*: uint16
+    dataOffset*: uint16
+    reserved06*: array[10, uint8]
+
+  BtbleConnEventView* {.packed.} = object
+    activityType*: uint16
+    control*: uint16
+    reserved04*: uint16
+    phyControl*: uint16
+    reserved08*: array[6, uint8]
+    accessAddrLow*: uint16
+    accessAddrHigh*: uint16
+    crcInitLow*: uint16
+    crcInitHigh*: uint16
+    reserved16*: array[2, uint8]
+    channel*: uint16
+    rfConfig*: uint16
+    eventCountEnable*: uint16
+    rxSync*: uint16
+    reserved20*: array[4, uint8]
+    txDescPtr*: uint16
+    reserved26*: array[8, uint8]
+    txDuration*: uint16
+    rxDuration*: uint16
+    channelMap01*: uint16
+    channelMap23*: uint16
+    channelMapHop*: uint16
+    rxTiming*: uint16
+    reserved3A*: uint16
+    reserved3C*: array[36, uint8]
+    eventCounter*: uint16
+    eventCounterAux0*: uint16
+    eventCounterAux1*: uint16
+    eventCounterAux2*: uint16
+
+  BtbleAccessAddressWordsView* {.packed.} = object
+    accessAddrLow*: uint16
+    accessAddrHigh*: uint16
+    crcInitLow*: uint16
+    crcInitHigh*: uint16
+
+  BtbleProgramSlotView* {.packed.} = object
+    control*: uint16
+    targetLow*: uint16
+    targetHigh*: uint16
+    fineBackoff*: uint16
+    emPtr*: uint16
+    duration*: uint16
+    rates*: uint16
+    tail*: uint16
+
+  SchProgRequestView* {.packed.} = object
+    callback*: uint32
+    targetTime*: uint32
+    fineTime*: uint16
+    reserved0A*: array[6, uint8]
+    duration*: uint32
+    context*: uint32
+    primaryType*: uint8
+    rate0*: uint8
+    rate1*: uint8
+    tail*: uint8
+    eventIndex*: uint8
+    noBackoff*: uint8
+    ctrlType*: uint8
+    auxControl*: uint8
+    hasAux*: uint8
+    auxRate*: uint8
+    reserved22*: array[2, uint8]
+
   NimLlcStartEnvView {.packed.} = object
     reserved0*: array[8, uint8]
     peerFeatureSeed*: array[5, uint8]
@@ -2808,7 +3029,8 @@ type
     timingSelector*: uint8
     rate*: uint8
     peerRxAddrType*: uint16
-    reserved40*: array[8, uint8]
+    centralRole*: uint8
+    reserved41*: array[7, uint8]
 
   NimLlcControllerDefaultsView {.packed.} = object
     maxTxTime*: uint16
@@ -2841,6 +3063,29 @@ type
     anchorClock*: uint32
     rate*: uint8
     timingSelector*: uint8
+    peerRxAddrType*: uint16
+    controllerDefaults*: NimLlcControllerDefaultsView
+    reserved55*: uint8
+
+  NimVendorLlcStartParamsView {.packed.} = object
+    accessAddress*: uint32
+    crcInit*: array[3, uint8]
+    transmitWindowSize*: uint8
+    windowOffset*: uint16
+    connIntervalMin*: uint16
+    connIntervalMax*: uint16
+    connLatency*: uint16
+    peerFeatureSeed*: array[5, uint8]
+    hopSca*: uint8
+    peerRate*: uint8
+    reserved23*: uint8
+    timingFine*: uint16
+    reserved26*: uint8
+    transmitWindowSizeMirror*: uint8
+    timingClock*: uint32
+    anchorClock*: uint32
+    phyRate*: uint8
+    directAnchorMode*: uint8
     peerRxAddrType*: uint16
     controllerDefaults*: NimLlcControllerDefaultsView
     reserved55*: uint8
@@ -2925,6 +3170,8 @@ static:
   doAssert offsetof(KeMsgHeader, dest_id) == 6
   doAssert offsetof(KeMsgHeader, src_id) == 8
   doAssert offsetof(KeMsgHeader, param_len) == 10
+  doAssert offsetof(KeMsgEnvelope, header) == 0
+  doAssert offsetof(KeMsgEnvelope, param) == sizeof(KeMsgHeader)
   doAssert sizeof(EmBufRxDesc) == EM_BUF_RX_DESC_SIZE
   doAssert offsetof(EmBufRxDesc, status) == 0
   doAssert offsetof(EmBufRxDesc, data_len) == 4
@@ -2933,6 +3180,57 @@ static:
   doAssert offsetof(EmBufTxDesc, status) == 0
   doAssert offsetof(EmBufTxDesc, buf_ptr) == 4
   doAssert offsetof(EmBufTxDesc, data_len) == 6
+  doAssert sizeof(EmBufRxFreeSlot) == EM_BUF_RX_DESC_SIZE
+  doAssert offsetof(EmBufRxFreeSlot, status) == 0
+  doAssert offsetof(EmBufRxFreeSlot, buf_ptr) == 8
+  doAssert sizeof(BtbleScanReqPduView) == 12
+  doAssert offsetof(BtbleScanReqPduView, scanA) == 0
+  doAssert offsetof(BtbleScanReqPduView, advA) == 6
+  doAssert offsetof(BtbleAdvPduView, advA) == 0
+  doAssert offsetof(BtbleAdvPduView, data) == 6
+  doAssert sizeof(BtbleRxDescView) == 0x20
+  doAssert offsetof(BtbleRxDescView, status) == 0
+  doAssert offsetof(BtbleRxDescView, header) == 0x04
+  doAssert offsetof(BtbleRxDescView, rxClock) == 0x08
+  doAssert offsetof(BtbleRxDescView, meta) == 0x0C
+  doAssert offsetof(BtbleRxDescView, dataOffset) == 0x14
+  doAssert sizeof(BtbleConnTxDescView) == 0x10
+  doAssert offsetof(BtbleConnTxDescView, status) == 0
+  doAssert offsetof(BtbleConnTxDescView, header) == 0x02
+  doAssert offsetof(BtbleConnTxDescView, dataOffset) == 0x04
+  doAssert sizeof(BtbleConnEventView) == 0x68
+  doAssert offsetof(BtbleConnEventView, activityType) == 0
+  doAssert offsetof(BtbleConnEventView, phyControl) == 0x06
+  doAssert offsetof(BtbleConnEventView, accessAddrLow) == 0x0E
+  doAssert offsetof(BtbleConnEventView, channel) == 0x18
+  doAssert offsetof(BtbleConnEventView, rxSync) == 0x1E
+  doAssert offsetof(BtbleConnEventView, txDescPtr) == 0x24
+  doAssert offsetof(BtbleConnEventView, txDuration) == 0x2E
+  doAssert offsetof(BtbleConnEventView, channelMap01) == 0x32
+  doAssert offsetof(BtbleConnEventView, rxTiming) == 0x38
+  doAssert offsetof(BtbleConnEventView, eventCounter) == 0x60
+  doAssert sizeof(BtbleAccessAddressWordsView) == 0x08
+  doAssert offsetof(BtbleAccessAddressWordsView, accessAddrLow) == 0
+  doAssert offsetof(BtbleAccessAddressWordsView, accessAddrHigh) == 0x02
+  doAssert offsetof(BtbleAccessAddressWordsView, crcInitLow) == 0x04
+  doAssert offsetof(BtbleAccessAddressWordsView, crcInitHigh) == 0x06
+  doAssert sizeof(BtbleProgramSlotView) == 0x10
+  doAssert offsetof(BtbleProgramSlotView, control) == 0
+  doAssert offsetof(BtbleProgramSlotView, targetLow) == 0x02
+  doAssert offsetof(BtbleProgramSlotView, targetHigh) == 0x04
+  doAssert offsetof(BtbleProgramSlotView, fineBackoff) == 0x06
+  doAssert offsetof(BtbleProgramSlotView, emPtr) == 0x08
+  doAssert offsetof(BtbleProgramSlotView, duration) == 0x0A
+  doAssert offsetof(BtbleProgramSlotView, rates) == 0x0C
+  doAssert offsetof(BtbleProgramSlotView, tail) == 0x0E
+  doAssert sizeof(SchProgRequestView) == 36
+  doAssert offsetof(SchProgRequestView, targetTime) == 0x04
+  doAssert offsetof(SchProgRequestView, fineTime) == 0x08
+  doAssert offsetof(SchProgRequestView, duration) == 0x10
+  doAssert offsetof(SchProgRequestView, context) == 0x14
+  doAssert offsetof(SchProgRequestView, primaryType) == 0x18
+  doAssert offsetof(SchProgRequestView, eventIndex) == 0x1C
+  doAssert offsetof(SchProgRequestView, hasAux) == 0x20
   doAssert sizeof(NimLlcStartEnvView) == 0x8C
   doAssert offsetof(NimLlcStartEnvView, peerFeatureSeed) == 8
   doAssert offsetof(NimLlcStartEnvView, pendingList) == 36
@@ -2954,6 +3252,7 @@ static:
   doAssert offsetof(NimLldConStartParamsView, timingClock) == 28
   doAssert offsetof(NimLldConStartParamsView, timingSelector) == 36
   doAssert offsetof(NimLldConStartParamsView, peerRxAddrType) == 38
+  doAssert offsetof(NimLldConStartParamsView, centralRole) == 40
   doAssert sizeof(NimLlcControllerDefaultsView) == 15
   doAssert offsetof(NimLlcControllerDefaultsView, maxRxTime) == 2
   doAssert offsetof(NimLlcControllerDefaultsView, authPayloadTimeout) == 8
@@ -2963,6 +3262,19 @@ static:
   doAssert offsetof(NimLlcStartParamsView, rate) == 36
   doAssert offsetof(NimLlcStartParamsView, timingSelector) == 37
   doAssert offsetof(NimLlcStartParamsView, controllerDefaults) == 40
+  doAssert sizeof(NimVendorLlcStartParamsView) == 56
+  doAssert offsetof(NimVendorLlcStartParamsView, connIntervalMin) == 10
+  doAssert offsetof(NimVendorLlcStartParamsView, connIntervalMax) == 12
+  doAssert offsetof(NimVendorLlcStartParamsView, connLatency) == 14
+  doAssert offsetof(NimVendorLlcStartParamsView, peerFeatureSeed) == 16
+  doAssert offsetof(NimVendorLlcStartParamsView, peerRate) == 22
+  doAssert offsetof(NimVendorLlcStartParamsView, timingFine) == 24
+  doAssert offsetof(NimVendorLlcStartParamsView, timingClock) == 28
+  doAssert offsetof(NimVendorLlcStartParamsView, anchorClock) == 32
+  doAssert offsetof(NimVendorLlcStartParamsView, phyRate) == 36
+  doAssert offsetof(NimVendorLlcStartParamsView, directAnchorMode) == 37
+  doAssert offsetof(NimVendorLlcStartParamsView, peerRxAddrType) == 38
+  doAssert offsetof(NimVendorLlcStartParamsView, controllerDefaults) == 40
   doAssert offsetof(LlmAdvertiserConnView, intervalMinSlots) == 24
   doAssert offsetof(LlmAdvertiserConnView, peerAddr) == 40
   doAssert offsetof(LlmAdvertiserConnView, state) == 72
@@ -3032,6 +3344,85 @@ type
     opcode*: uint16
     paramLen*: uint8
     params*: array[1, uint8]
+
+  HciCmdStatusDescView {.packed.} = object
+    reserved00*: array[8, uint8]
+    expectedStatusWord*: uint32
+
+  HciRawCmdView {.packed.} = object
+    opcode*: uint16
+    paramLen*: uint8
+    params*: UncheckedArray[uint8]
+
+  HciEventRoutingView {.packed.} = object
+    eventCode*: uint8
+    route*: uint8
+    hostLid*: uint8
+
+  HciAclHostPacketView {.packed.} = object
+    handleFlags*: uint16
+    length*: uint16
+    payload*: UncheckedArray[uint8]
+
+  HciDisconnectCompleteEventView {.packed.} = object
+    status*: uint8
+    handle*: uint16
+    reason*: uint8
+
+  HciEncryptionChangeEventView {.packed.} = object
+    status*: uint8
+    handle*: uint16
+    enabled*: uint8
+
+  HciRemoteVersionInfoCompleteEventView {.packed.} = object
+    status*: uint8
+    handle*: uint16
+    version*: uint8
+    companyId*: uint16
+    subversion*: uint16
+
+  HciLeConnectionCompleteEventView {.packed.} = object
+    subevent*: uint8
+    status*: uint8
+    handle*: uint16
+    role*: uint8
+    peerAddrType*: uint8
+    peerAddr*: BdAddr
+    interval*: uint16
+    latency*: uint16
+    timeout*: uint16
+    accuracy*: uint8
+
+  HciLeConnectionUpdateCompleteEventView {.packed.} = object
+    subevent*: uint8
+    status*: uint8
+    handle*: uint16
+    interval*: uint16
+    latency*: uint16
+    timeout*: uint16
+
+  HciLeRemoteFeaturesCompleteEventView {.packed.} = object
+    subevent*: uint8
+    status*: uint8
+    handle*: uint16
+    features*: array[8, uint8]
+
+  HciLePhyUpdateCompleteEventView {.packed.} = object
+    subevent*: uint8
+    status*: uint8
+    handle*: uint16
+    txPhy*: uint8
+    rxPhy*: uint8
+
+  HciAclDataIndView {.packed.} = object
+    handleFlags*: uint16
+    length*: uint16
+    dataAddr*: uint32
+
+  LldAclRxIndView {.packed.} = object
+    bufRef*: uint16
+    length*: uint16
+    llidFlags*: uint8
 
   HciLeCreateConnReqView* {.packed.} = object
     scanInterval*: uint16
@@ -3116,6 +3507,59 @@ static:
   doAssert offsetof(HciRawCommandPacket, opcode) == 0
   doAssert offsetof(HciRawCommandPacket, paramLen) == 2
   doAssert offsetof(HciRawCommandPacket, params) == 3
+  doAssert sizeof(HciCmdStatusDescView) == 12
+  doAssert offsetof(HciCmdStatusDescView, expectedStatusWord) == 8
+  doAssert offsetof(HciRawCmdView, opcode) == 0
+  doAssert offsetof(HciRawCmdView, paramLen) == 2
+  doAssert offsetof(HciRawCmdView, params) == 3
+  doAssert sizeof(HciEventRoutingView) == 3
+  doAssert offsetof(HciEventRoutingView, route) == 1
+  doAssert offsetof(HciEventRoutingView, hostLid) == 2
+  doAssert offsetof(HciAclHostPacketView, handleFlags) == 0
+  doAssert offsetof(HciAclHostPacketView, length) == 2
+  doAssert offsetof(HciAclHostPacketView, payload) == 4
+  doAssert sizeof(HciDisconnectCompleteEventView) == 4
+  doAssert offsetof(HciDisconnectCompleteEventView, handle) == 1
+  doAssert offsetof(HciDisconnectCompleteEventView, reason) == 3
+  doAssert sizeof(HciEncryptionChangeEventView) == 4
+  doAssert offsetof(HciEncryptionChangeEventView, handle) == 1
+  doAssert offsetof(HciEncryptionChangeEventView, enabled) == 3
+  doAssert sizeof(HciRemoteVersionInfoCompleteEventView) == 8
+  doAssert offsetof(HciRemoteVersionInfoCompleteEventView, handle) == 1
+  doAssert offsetof(HciRemoteVersionInfoCompleteEventView, version) == 3
+  doAssert offsetof(HciRemoteVersionInfoCompleteEventView, companyId) == 4
+  doAssert offsetof(HciRemoteVersionInfoCompleteEventView, subversion) == 6
+  doAssert sizeof(HciLeConnectionCompleteEventView) == 19
+  doAssert offsetof(HciLeConnectionCompleteEventView, status) == 1
+  doAssert offsetof(HciLeConnectionCompleteEventView, handle) == 2
+  doAssert offsetof(HciLeConnectionCompleteEventView, role) == 4
+  doAssert offsetof(HciLeConnectionCompleteEventView, peerAddrType) == 5
+  doAssert offsetof(HciLeConnectionCompleteEventView, peerAddr) == 6
+  doAssert offsetof(HciLeConnectionCompleteEventView, interval) == 12
+  doAssert offsetof(HciLeConnectionCompleteEventView, latency) == 14
+  doAssert offsetof(HciLeConnectionCompleteEventView, timeout) == 16
+  doAssert offsetof(HciLeConnectionCompleteEventView, accuracy) == 18
+  doAssert sizeof(HciLeConnectionUpdateCompleteEventView) == 10
+  doAssert offsetof(HciLeConnectionUpdateCompleteEventView, status) == 1
+  doAssert offsetof(HciLeConnectionUpdateCompleteEventView, handle) == 2
+  doAssert offsetof(HciLeConnectionUpdateCompleteEventView, interval) == 4
+  doAssert offsetof(HciLeConnectionUpdateCompleteEventView, latency) == 6
+  doAssert offsetof(HciLeConnectionUpdateCompleteEventView, timeout) == 8
+  doAssert sizeof(HciLeRemoteFeaturesCompleteEventView) == 12
+  doAssert offsetof(HciLeRemoteFeaturesCompleteEventView, status) == 1
+  doAssert offsetof(HciLeRemoteFeaturesCompleteEventView, handle) == 2
+  doAssert offsetof(HciLeRemoteFeaturesCompleteEventView, features) == 4
+  doAssert sizeof(HciLePhyUpdateCompleteEventView) == 6
+  doAssert offsetof(HciLePhyUpdateCompleteEventView, status) == 1
+  doAssert offsetof(HciLePhyUpdateCompleteEventView, handle) == 2
+  doAssert offsetof(HciLePhyUpdateCompleteEventView, txPhy) == 4
+  doAssert offsetof(HciLePhyUpdateCompleteEventView, rxPhy) == 5
+  doAssert sizeof(HciAclDataIndView) == 8
+  doAssert offsetof(HciAclDataIndView, length) == 2
+  doAssert offsetof(HciAclDataIndView, dataAddr) == 4
+  doAssert sizeof(LldAclRxIndView) == 5
+  doAssert offsetof(LldAclRxIndView, length) == 2
+  doAssert offsetof(LldAclRxIndView, llidFlags) == 4
   doAssert sizeof(HciLeCreateConnReqView) == 25
   doAssert offsetof(HciLeCreateConnReqView, peerAddrType) == 5
   doAssert offsetof(HciLeCreateConnReqView, peerAddr) == 6
@@ -3162,6 +3606,16 @@ type
     ## Per-connection LLC environment (opaque, ~420 bytes from disasm)
     data*: array[420, uint8]
 
+  LlcChannelAssessmentView {.packed.} = object
+    reserved00*: array[344, uint8]
+    flags*: uint16
+    channelMap*: array[5, uint8]
+
+  LlcDisconnectStateView {.packed.} = object
+    reserved00*: array[413, uint8]
+    reason*: uint8
+    active*: uint8
+
   LldEvtEnv* = object
     ## LLD event environment
     data*: array[256, uint8]
@@ -3169,6 +3623,18 @@ type
   LlmEnv* = object
     ## LLM environment block
     data*: array[512, uint8]
+
+  LlmChannelMapView {.packed.} = object
+    reserved00*: array[344, uint8]
+    localMap*: array[5, uint8]
+    masterMap*: array[5, uint8]
+
+doAssert offsetof(LlcChannelAssessmentView, flags) == 344
+doAssert offsetof(LlcChannelAssessmentView, channelMap) == 346
+doAssert offsetof(LlcDisconnectStateView, reason) == 413
+doAssert offsetof(LlcDisconnectStateView, active) == 414
+doAssert offsetof(LlmChannelMapView, localMap) == 344
+doAssert offsetof(LlmChannelMapView, masterMap) == 349
 
 # ---------------------------------------------------------------------------
 # ECC types
@@ -3594,6 +4060,18 @@ when defined(bl808m0):
         nim_lld_adv_rand_state * 1103515245'u32 + 12345'u32
       cint((nim_lld_adv_rand_state shr 16) and 0x7FFF'u32)
 
+template llcChannelAssessment(env: ptr LlcConEnv): ptr LlcChannelAssessmentView =
+  cast[ptr LlcChannelAssessmentView](env)
+
+template llcDisconnectState(env: ptr LlcConEnv): ptr LlcDisconnectStateView =
+  cast[ptr LlcDisconnectStateView](env)
+
+template llmChannelMaps(): ptr LlmChannelMapView =
+  cast[ptr LlmChannelMapView](addr llm_env_data)
+
+template llmAdvertiserConn(): ptr LlmAdvertiserConnView =
+  cast[ptr LlmAdvertiserConnView](addr llm_env_data)
+
 proc bleCentralTraceReadSp(): uint32 {.inline.} =
   var v: uint32
   {.emit: ["asm volatile(\"mv %0, sp\" : \"=r\"(", v, "));"].}
@@ -3637,12 +4115,43 @@ proc write16(regAddr: uint32, value: uint16) {.inline.} =
 proc write8(regAddr: uint32, value: uint8) {.inline.} =
   volatileStore(cast[ptr uint8](regAddr.uint), value)
 
+template bleEmBytes(): ptr UncheckedArray[uint8] =
+  cast[ptr UncheckedArray[uint8]](BLE_EM_BASE)
+
+template btbleEmBytes(): ptr UncheckedArray[uint8] =
+  cast[ptr UncheckedArray[uint8]](BTBLE_EM_BASE)
+
+proc bleEmPointer(offset: uint16): pointer {.inline.} =
+  cast[pointer](addr bleEmBytes()[offset])
+
+proc btbleEmBytePtr(offset: uint16): ptr uint8 {.inline.} =
+  addr btbleEmBytes()[offset]
+
+proc btbleEmPayload(offset: uint16): ptr UncheckedArray[uint8] {.inline.} =
+  cast[ptr UncheckedArray[uint8]](btbleEmBytePtr(offset))
+
+template btbleAdvPduAt(buf: uint16): ptr BtbleAdvPduView =
+  cast[ptr BtbleAdvPduView](BTBLE_EM_BASE + buf.uint32)
+
+proc btbleEmRead8(offset: uint16): uint8 {.inline.} =
+  volatileLoad(btbleEmBytePtr(offset))
+
+proc btbleEmWrite8(offset: uint16, value: uint8) {.inline.} =
+  volatileStore(btbleEmBytePtr(offset), value)
+
 proc copyBytes(dstAddr: uint32, src: ptr uint8, len: int) =
   if src == nil or len <= 0:
     return
   let raw = cast[ptr UncheckedArray[uint8]](src)
   for i in 0 ..< len:
     write8(dstAddr + i.uint32, raw[i])
+
+proc copyBtbleEmBytes(dstOffset: uint16, src: ptr uint8, len: int) =
+  if src == nil or len <= 0:
+    return
+  let raw = cast[ptr UncheckedArray[uint8]](src)
+  for i in 0 ..< len:
+    btbleEmWrite8(dstOffset + i.uint16, raw[i])
 
 proc writeBtbleInterruptMask(mask: uint32) =
   ## BTBLE's mask register gates the hardware status sources that the
@@ -3735,24 +4244,23 @@ proc sendHostAclBytes(handle: uint16, llid: uint8,
   if data == nil or len == 0'u8 or len.uint16 > NimBleLeMaxDataOctets:
     return false
   var pkt: array[4 + NimBleLeMaxDataOctets.int, uint8]
+  let acl = cast[ptr HciAclHostPacketView](addr pkt[0])
   let pbFlag =
     if llid == 0x01'u8:
       0x01'u16
     else:
       0x02'u16
   let hciHandle = (handle and 0x0FFF'u16) or (pbFlag shl 12)
-  pkt[0] = uint8(hciHandle and 0x00FF'u16)
-  pkt[1] = uint8((hciHandle shr 8) and 0x00FF'u16)
-  pkt[2] = len
-  pkt[3] = 0'u8
+  acl.handleFlags = hciHandle
+  acl.length = len.uint16
   let src = cast[ptr UncheckedArray[uint8]](data)
   for i in 0 ..< len.int:
-    pkt[4 + i] = src[i]
+    acl.payload[i] = src[i]
   invokeOnChipHci(BtHciAclData, handle, addr pkt[0], len + 4'u8)
 
 proc sendHostAclData(handle: uint16, llid: uint8,
                      dataOff: uint16, len: uint8): bool =
-  let data = cast[ptr uint8](BTBLE_EM_BASE + dataOff.uint32)
+  let data = btbleEmBytePtr(dataOff)
   sendHostAclBytes(handle, llid, data, len)
 
 proc sendLeEncryptComplete(opcode: uint16, params: ptr uint8,
@@ -3798,18 +4306,26 @@ proc connDataPayloadLen(header: uint16): uint8 {.inline.} =
 proc advPayloadLen(header: uint16): uint8 {.inline.} =
   uint8((header shr 8) and 0x003F'u16)
 
+template hciRawCmd(data: pointer): ptr HciRawCmdView =
+  cast[ptr HciRawCmdView](data)
+
 proc hciRawOpcode(data: pointer): uint16 {.inline.} =
-  let raw = cast[ptr UncheckedArray[uint8]](data)
-  raw[0].uint16 or (raw[1].uint16 shl 8)
+  hciRawCmd(data).opcode
 
 proc hciRawParamLen(data: pointer): uint8 {.inline.} =
-  cast[ptr UncheckedArray[uint8]](data)[2]
+  hciRawCmd(data).paramLen
 
 proc hciRawParams(data: pointer): ptr uint8 {.inline.} =
-  cast[ptr uint8](cast[uint](data) + 3'u)
+  addr hciRawCmd(data).params[0]
 
 template hciLeCreateConnReq(params: ptr uint8): ptr HciLeCreateConnReqView =
   cast[ptr HciLeCreateConnReqView](params)
+
+template nimVendorLlcStartParams(params: pointer): ptr NimVendorLlcStartParamsView =
+  cast[ptr NimVendorLlcStartParamsView](params)
+
+template nimLldConStartParams(params: pointer): ptr NimLldConStartParamsView =
+  cast[ptr NimLldConStartParamsView](params)
 
 template hciLeConnUpdateReq(params: ptr uint8): ptr HciLeConnUpdateReqView =
   cast[ptr HciLeConnUpdateReqView](params)
@@ -3870,21 +4386,17 @@ proc sendLeConnectionCompleteStatusHandle(params: ptr uint8, paramLen: uint8,
     return
   let req = hciLeCreateConnReq(params)
   var evt: array[19, uint8]
-  evt[0] = 0x01'u8
-  evt[1] = status
-  evt[2] = uint8(handle and 0x00FF'u16)
-  evt[3] = uint8((handle shr 8) and 0x00FF'u16)
-  evt[4] = role
-  evt[5] = req.peerAddrType
-  for i in 0 ..< 6:
-    evt[6 + i] = req.peerAddr.data[i]
-  evt[12] = uint8(req.connIntervalMin and 0xFF'u16)
-  evt[13] = uint8(req.connIntervalMin shr 8)
-  evt[14] = uint8(req.connLatency and 0xFF'u16)
-  evt[15] = uint8(req.connLatency shr 8)
-  evt[16] = uint8(req.supervisionTimeout and 0xFF'u16)
-  evt[17] = uint8(req.supervisionTimeout shr 8)
-  evt[18] = 0
+  let body = cast[ptr HciLeConnectionCompleteEventView](addr evt[0])
+  body.subevent = 0x01'u8
+  body.status = status
+  body.handle = handle
+  body.role = role
+  body.peerAddrType = req.peerAddrType
+  body.peerAddr = req.peerAddr
+  body.interval = req.connIntervalMin
+  body.latency = req.connLatency
+  body.timeout = req.supervisionTimeout
+  body.accuracy = 0
   if status == 0'u8:
     nim_conn_active = true
     nim_conn_handle = handle
@@ -3911,10 +4423,10 @@ proc sendDisconnectComplete(handle: uint16, reason: uint8) =
   if onchiphci_recv_cb == nil:
     return
   var evt: array[4, uint8]
-  evt[0] = 0'u8
-  evt[1] = uint8(handle and 0xFF)
-  evt[2] = uint8((handle shr 8) and 0xFF)
-  evt[3] = reason
+  let body = cast[ptr HciDisconnectCompleteEventView](addr evt[0])
+  body.status = 0'u8
+  body.handle = handle
+  body.reason = reason
   sendHostEvent(HciEvtDisconnectComplete, addr evt[0], evt.len.uint8)
 
 when defined(bl808m0):
@@ -3994,17 +4506,17 @@ when defined(bl808m0):
     let dataLen = pduLen - 6
     if dataLen > 31:
       return
-    let payloadBase = BTBLE_EM_BASE + buf.uint32
+    let advPdu = btbleAdvPduAt(buf)
     var evt: array[43, uint8]
     evt[0] = 0x02'u8 # LE Advertising Report
     evt[1] = 0x01'u8 # one report
     evt[2] = eventType
     evt[3] = uint8((header shr 6) and 0x0001'u16)
     for i in 0 ..< 6:
-      evt[4 + i] = read8(payloadBase + i.uint32)
+      evt[4 + i] = advPdu.advA.data[i]
     evt[10] = dataLen.uint8
     for i in 0 ..< dataLen:
-      evt[11 + i] = read8(payloadBase + 6'u32 + i.uint32)
+      evt[11 + i] = advPdu.data[i]
     evt[11 + dataLen] = 0x7F'u8 # RSSI unavailable.
     when bl808BleNimPureCentral:
       if (nim_scan_params[0] and 0x01'u8) != 0'u8 and
@@ -4211,27 +4723,158 @@ when defined(bl808m0) and
     discard c_memset(addr rwip_rf[0], 0, rwip_rf.len.csize_t)
     btble_rf_init(addr rwip_rf[0])
 
-  proc clearBtbleProgramSlots() =
-    for slot in 0'u32 ..< 18'u32:
-      let slotAddr = BTBLE_EM_BASE + slot * 0x10'u32
-      for off in countup(0'u32, 0x08'u32, 4'u32):
-        write16(slotAddr + off, 0'u16)
-        write16(slotAddr + off + 2'u32, 0'u16)
-      write16(slotAddr + 0x0C'u32, 0'u16)
-      write16(slotAddr + 0x0E'u32,
-              uint16((btbleAdvSlotTail(slot) shr 16) and 0xFFFF'u32))
-
 const
   BtbleRxDescRingBaseOffset = 0x458'u32
   BtbleRxDescRingStride = 0x20'u32
   BtbleRxDescRingCount = 8'u32
+  BtbleRxDescDone = 0x8000'u16
+  BtbleRxDescLinkMask = 0x7FFF'u16
 
 proc btbleRxDescOffset(idx: uint32): uint32 {.inline.} =
   BtbleRxDescRingBaseOffset +
     (idx and (BtbleRxDescRingCount - 1'u32)) * BtbleRxDescRingStride
 
+template btbleRxDescAt(descAddr: uint32): ptr BtbleRxDescView =
+  cast[ptr BtbleRxDescView](descAddr.uint)
+
+proc btbleRxDescStatus(descAddr: uint32): uint16 {.inline.} =
+  volatileLoad(addr btbleRxDescAt(descAddr).status)
+
+proc btbleRxDescHeader(descAddr: uint32): uint16 {.inline.} =
+  volatileLoad(addr btbleRxDescAt(descAddr).header)
+
+proc btbleRxDescClock(descAddr: uint32): uint16 {.inline.} =
+  volatileLoad(addr btbleRxDescAt(descAddr).rxClock)
+
+proc btbleRxDescMeta(descAddr: uint32): uint16 {.inline.} =
+  volatileLoad(addr btbleRxDescAt(descAddr).meta)
+
+proc btbleRxDescDataOffset(descAddr: uint32): uint16 {.inline.} =
+  volatileLoad(addr btbleRxDescAt(descAddr).dataOffset)
+
+proc btbleRxDescSetStatus(descAddr: uint32; status: uint16) {.inline.} =
+  volatileStore(addr btbleRxDescAt(descAddr).status, status)
+
+proc btbleRxDescSetDataOffset(descAddr: uint32; offset: uint16) {.inline.} =
+  volatileStore(addr btbleRxDescAt(descAddr).dataOffset, offset)
+
+proc btbleRxDescReset(descAddr, nextOffset, dataOffset: uint32) {.inline.} =
+  let desc = btbleRxDescAt(descAddr)
+  volatileStore(addr desc.status, uint16((nextOffset shr 2) and 0xFFFF'u32))
+  volatileStore(addr desc.reserved02, 0'u16)
+  volatileStore(addr desc.header, 0'u16)
+  volatileStore(addr desc.timing0, 0'u16)
+  volatileStore(addr desc.rxClock, 0'u16)
+  volatileStore(addr desc.timing1, 0'u16)
+  volatileStore(addr desc.meta, 0'u16)
+  for i in 0 ..< desc.reserved0E.len:
+    volatileStore(addr desc.reserved0E[i], 0'u8)
+  volatileStore(addr desc.dataOffset, uint16(dataOffset and 0xFFFF'u32))
+  for i in 0 ..< desc.reserved16.len:
+    volatileStore(addr desc.reserved16[i], 0'u8)
+
+proc btbleRxDescClearDone(descAddr: uint32; status: uint16) {.inline.} =
+  btbleRxDescSetStatus(descAddr, status and not BtbleRxDescDone)
+
+proc btbleRxDescReleaseLink(descAddr: uint32; status: uint16) {.inline.} =
+  btbleRxDescSetStatus(descAddr, status and BtbleRxDescLinkMask)
+
 proc btbleRxDescPtr(idx: uint32): uint32 {.inline.} =
   btbleRxDescOffset(idx) shr 2
+
+template btbleLegacyTxDescAt(descAddr: uint32): ptr BtbleConnTxDescView =
+  cast[ptr BtbleConnTxDescView](descAddr.uint)
+
+proc btbleLegacyTxDescProgram(descAddr: uint32; status, header,
+                              dataOffset: uint16) {.inline.} =
+  let desc = btbleLegacyTxDescAt(descAddr)
+  volatileStore(addr desc.status, status)
+  volatileStore(addr desc.header, header)
+  volatileStore(addr desc.dataOffset, dataOffset)
+  for i in 0 ..< desc.reserved06.len:
+    volatileStore(addr desc.reserved06[i], 0'u8)
+
+template btbleAccessWordsAt(emAddr: uint32): ptr BtbleAccessAddressWordsView =
+  cast[ptr BtbleAccessAddressWordsView](emAddr.uint)
+
+proc writeBtbleDefaultAccessWords(emAddr: uint32) {.inline.} =
+  let words = btbleAccessWordsAt(emAddr)
+  volatileStore(addr words.accessAddrLow, 0xBED6'u16)
+  volatileStore(addr words.accessAddrHigh, 0x8E89'u16)
+  volatileStore(addr words.crcInitLow, 0x5555'u16)
+  volatileStore(addr words.crcInitHigh, 0x0055'u16)
+
+proc btbleProgramSlotAddr(slot: uint32): uint32 {.inline.} =
+  BTBLE_EM_BASE + slot * 0x10'u32
+
+template btbleProgramSlotAt(slot: uint32): ptr BtbleProgramSlotView =
+  cast[ptr BtbleProgramSlotView](btbleProgramSlotAddr(slot).uint)
+
+proc btbleProgramSlotControl(slot: uint32): uint16 {.inline.} =
+  volatileLoad(addr btbleProgramSlotAt(slot).control)
+
+proc btbleProgramSlotTarget(slot: uint32): uint32 {.inline.} =
+  let view = btbleProgramSlotAt(slot)
+  volatileLoad(addr view.targetLow).uint32 or
+    ((volatileLoad(addr view.targetHigh).uint32 and 0x0FFF'u32) shl 16)
+
+proc btbleProgramSlotTail(slot: uint32): uint16 {.inline.} =
+  volatileLoad(addr btbleProgramSlotAt(slot).tail)
+
+proc btbleProgramSlotSetControl(slot: uint32; value: uint16) {.inline.} =
+  volatileStore(addr btbleProgramSlotAt(slot).control, value)
+
+proc btbleProgramSlotSetDisabled(slot: uint32) {.inline.} =
+  let control = btbleProgramSlotControl(slot)
+  btbleProgramSlotSetControl(slot, (control and not 0x0038'u16) or 0x0018'u16)
+
+proc btbleProgramSlotSetTail(slot: uint32; value: uint16) {.inline.} =
+  volatileStore(addr btbleProgramSlotAt(slot).tail, value)
+
+proc btbleProgramSlotClear(slot: uint32; tail: uint16) {.inline.} =
+  let view = btbleProgramSlotAt(slot)
+  volatileStore(addr view.control, 0'u16)
+  volatileStore(addr view.targetLow, 0'u16)
+  volatileStore(addr view.targetHigh, 0'u16)
+  volatileStore(addr view.fineBackoff, 0'u16)
+  volatileStore(addr view.emPtr, 0'u16)
+  volatileStore(addr view.duration, 0'u16)
+  volatileStore(addr view.rates, 0'u16)
+  volatileStore(addr view.tail, tail)
+
+proc btbleProgramSlotProgram(slot: uint32; target: uint32; fineBackoff,
+                             duration, rates, tail, control,
+                             emPtr: uint16; writeControlAndPtr: bool) {.inline.} =
+  let view = btbleProgramSlotAt(slot)
+  volatileStore(addr view.targetLow, uint16(target and 0xFFFF'u32))
+  volatileStore(addr view.targetHigh, uint16((target shr 16) and 0x0FFF'u32))
+  volatileStore(addr view.fineBackoff, fineBackoff)
+  volatileStore(addr view.duration, duration)
+  volatileStore(addr view.rates, rates)
+  volatileStore(addr view.tail, tail)
+  if writeControlAndPtr:
+    volatileStore(addr view.control, control)
+    volatileStore(addr view.emPtr, emPtr)
+
+proc btbleProgramSlotProgramRaw(slot: uint32; control, targetLow, targetHigh,
+                                fineBackoff, emPtr, duration, rates,
+                                tail: uint16) {.inline.} =
+  let view = btbleProgramSlotAt(slot)
+  volatileStore(addr view.control, control)
+  volatileStore(addr view.targetLow, targetLow)
+  volatileStore(addr view.targetHigh, targetHigh)
+  volatileStore(addr view.fineBackoff, fineBackoff)
+  volatileStore(addr view.emPtr, emPtr)
+  volatileStore(addr view.duration, duration)
+  volatileStore(addr view.rates, rates)
+  volatileStore(addr view.tail, tail)
+
+when defined(bl808m0) and
+    (bl808BleNimConnectionEnabled or bl808BleNimPureCentral):
+  proc clearBtbleProgramSlots() =
+    for slot in 0'u32 ..< 18'u32:
+      btbleProgramSlotClear(slot,
+        uint16((btbleAdvSlotTail(slot) shr 16) and 0xFFFF'u32))
 
 proc writeBtbleRxDescHeadIndex(idx: uint32) {.inline.} =
   regWrite((BLE_BASE + 0x828'u32).uint, btbleRxDescPtr(idx))
@@ -4252,10 +4895,7 @@ proc resetBtbleAdvRxRing() =
     let desc = BTBLE_EM_BASE + btbleRxDescOffset(i)
     let nextOff = btbleRxDescOffset(i + 1'u32)
     let rxBuf = 0x0B0D'u32 + i * 0x104'u32
-    for off in countup(0'u32, 0x1E'u32, 2'u32):
-      write16(desc + off, 0'u16)
-    write16(desc, uint16((nextOff shr 2) and 0xFFFF'u32))
-    write16(desc + 0x14'u32, uint16(rxBuf and 0xFFFF'u32))
+    btbleRxDescReset(desc, nextOff, rxBuf)
 
 proc prepareBtbleConnectionRxRingForHandoff() =
   ## The vendor lld_adv_frm_isr frees the consumed CONNECT_IND descriptor and
@@ -4381,17 +5021,8 @@ when defined(bl808m0) and
     var nim_sch_prog_last_intstat* {.exportc.}: uint32
     var nim_sch_prog_elapsed_count* {.exportc: "nim_vendor_sch_prog_elapsed_count".}: uint32
 
-    proc schProgGet16(p: ptr UncheckedArray[uint8], off: int): uint16 =
-      uint16(p[off]) or (uint16(p[off + 1]) shl 8)
-
-    proc schProgGet32(p: ptr UncheckedArray[uint8], off: int): uint32 =
-      uint32(p[off]) or (uint32(p[off + 1]) shl 8) or
-      (uint32(p[off + 2]) shl 16) or (uint32(p[off + 3]) shl 24)
-
     proc schProgSlotTarget(slot: uint8): uint32 {.inline.} =
-      let slotAddr = BTBLE_EM_BASE + uint32(slot and 0x0F'u8) * 0x10'u32
-      uint32(read16(slotAddr + 0x02'u32)) or
-        ((uint32(read16(slotAddr + 0x04'u32)) and 0x0FFF'u32) shl 16)
+      btbleProgramSlotTarget(uint32(slot and 0x0F'u8))
 
     proc schProgClockReached(now, target: uint32): bool {.inline.} =
       (((now - target) and 0x0FFFFFFF'u32) < 0x08000000'u32)
@@ -4487,7 +5118,7 @@ when defined(bl808m0) and
 
     proc sch_prog_end_isr*(idx: uint8) {.exportc, cdecl.} =
       let slot = idx and 0x0F'u8
-      let rawStatus = read16(BTBLE_EM_BASE + uint32(slot) * 0x10'u32)
+      let rawStatus = btbleProgramSlotControl(uint32(slot))
       let status = (rawStatus shr 3) and 0x0007'u16
       let event =
         if status == 3'u16: 0'u8
@@ -4557,10 +5188,7 @@ when defined(bl808m0) and
           if untilTarget < 0x08000000'u32:
             inc nearFuture
             continue
-          let slotAddr = BTBLE_EM_BASE + uint32(slot) * 0x10'u32
-          let disabled =
-            (read16(slotAddr) and not 0x0038'u16) or 0x0018'u16
-          write16(slotAddr, disabled)
+          btbleProgramSlotSetDisabled(uint32(slot))
           schProgElapsedEndArmed[slot.int] = 0
           inc nim_ble_wifi_tx_window_skip_count
           inc skipped
@@ -4613,9 +5241,7 @@ when defined(bl808m0) and
       nim_sch_prog_last_intstat = 0
       nim_sch_prog_elapsed_count = 0
       for slot in 0'u32 ..< 16'u32:
-        let slotAddr = BTBLE_EM_BASE + slot * 0x10'u32
-        let v = (read16(slotAddr) and not 0x0038'u16) or 0x0018'u16
-        write16(slotAddr, v)
+        btbleProgramSlotSetDisabled(slot)
 
     proc sch_prog_push*(prog: pointer) {.exportc, cdecl.} =
       if prog == nil:
@@ -4624,18 +5250,17 @@ when defined(bl808m0) and
       defer:
         btbleIrqRestore(irqState)
       nim_sch_prog_last_stage = 0x1000'u32
-      let p = cast[ptr UncheckedArray[uint8]](prog)
-      p[24] = p[24] shr 3
-      p[25] = p[25] shr 3
-      p[26] = p[26] shr 3
+      let req = cast[ptr SchProgRequestView](prog)
+      req.primaryType = req.primaryType shr 3
+      req.rate0 = req.rate0 shr 3
+      req.rate1 = req.rate1 shr 3
 
       let slot = schProgWriteIdx and 0x0F'u8
-      let slotAddr = BTBLE_EM_BASE + uint32(slot) * 0x10'u32
-      let cbRaw = schProgGet32(p, 0)
-      let target = schProgGet32(p, 4)
-      let fine = schProgGet16(p, 8)
-      let dur = schProgGet32(p, 16)
-      let ctxRaw = schProgGet32(p, 20)
+      let cbRaw = req.callback
+      let target = req.targetTime
+      let fine = req.fineTime
+      let dur = req.duration
+      let ctxRaw = req.context
       nim_sch_prog_last_stage = 0x1010'u32
       nim_sch_prog_last_cb = cbRaw
       nim_sch_prog_last_ctx = ctxRaw
@@ -4662,20 +5287,20 @@ when defined(bl808m0) and
         return
 
       nim_sch_prog_last_stage = 0x1200'u32
-      let emPtr = uint16((uint32(p[28]) * 0x94'u32 + 0x0120'u32) shr 2)
+      let emPtr = uint16((uint32(req.eventIndex) * 0x94'u32 + 0x0120'u32) shr 2)
       let crowded =
         if ((uint32(schProgWriteIdx) - uint32(schProgReadIdx)) and 0x0F'u32) >=
             14'u32: 1'u16
         else: 0'u16
       var ctrl0 = (crowded shl 10) or
-                  (uint16(p[30]) shl 8)
+                  (uint16(req.ctrlType) shl 8)
       let primaryType =
-        if p[24] > 31'u8: 31'u16
-        else: uint16(p[24])
-      if p[32] != 0'u8:
+        if req.primaryType > 31'u8: 31'u16
+        else: uint16(req.primaryType)
+      if req.hasAux != 0'u8:
         ctrl0 = ctrl0 or (primaryType shl 11) or
-                (uint16(p[33]) shl 9) or
-                (uint16(p[31]) shl 7) or 0x0042'u16
+                (uint16(req.auxRate) shl 9) or
+                (uint16(req.auxControl) shl 7) or 0x0042'u16
       else:
         ctrl0 = ctrl0 or (primaryType shl 11) or 0x0002'u16
       let durHalf =
@@ -4688,27 +5313,21 @@ when defined(bl808m0) and
         if fine <= 624'u16: 624'u16 - fine
         else: 0'u16
       let rate0 =
-        if p[25] > 31'u8: 31'u16
-        else: uint16(p[25])
+        if req.rate0 > 31'u8: 31'u16
+        else: uint16(req.rate0)
       let rate1 =
-        if p[26] > 31'u8: 31'u16
-        else: uint16(p[26])
-      let tail = (read16(slotAddr + 0x0E'u32) and 0xE0FF'u16) or
-                 (uint16(p[27]) shl 8)
+        if req.rate1 > 31'u8: 31'u16
+        else: uint16(req.rate1)
+      let slotU32 = uint32(slot)
+      let tail = (btbleProgramSlotTail(slotU32) and 0xE0FF'u16) or
+                 (uint16(req.tail) shl 8)
 
       schProgSetEntry(slot, cbRaw, ctxRaw)
       schProgLastTime = target
       nim_sch_prog_last_stage = 0x1210'u32
 
-      write16(slotAddr + 0x02'u32, uint16(target and 0xFFFF'u32))
-      write16(slotAddr + 0x04'u32, uint16((target shr 16) and 0x0FFF'u32))
-      write16(slotAddr + 0x06'u32, fineBackoff)
-      write16(slotAddr + 0x0A'u32, durHalf)
-      write16(slotAddr + 0x0C'u32, rate0 or (rate1 shl 8))
-      write16(slotAddr + 0x0E'u32, tail)
-      if p[29] == 0'u8:
-        write16(slotAddr + 0x00'u32, ctrl0)
-        write16(slotAddr + 0x08'u32, emPtr)
+      btbleProgramSlotProgram(slotU32, target, fineBackoff, durHalf,
+        rate0 or (rate1 shl 8), tail, ctrl0, emPtr, req.noBackoff == 0'u8)
 
       nim_sch_prog_last_stage = 0x1220'u32
       regWrite((BLE_BASE + 0x110'u32).uint, 0x80000000'u32 or slot.uint32)
@@ -4868,6 +5487,96 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
     NimLlcpPdu = object
       payloadLen: uint8
       data: array[32, uint8]
+
+    NimLlcpLengthPduView {.packed.} = object
+      opcode: uint8
+      maxRxOctets: uint16
+      maxRxTime: uint16
+      maxTxOctets: uint16
+      maxTxTime: uint16
+
+    NimLlcpConnectionUpdateIndView {.packed.} = object
+      opcode: uint8
+      winSize: uint8
+      winOffset: uint16
+      interval: uint16
+      latency: uint16
+      timeout: uint16
+      instant: uint16
+
+    NimLlcpChannelMapIndView {.packed.} = object
+      opcode: uint8
+      channelMap: array[5, uint8]
+      instant: uint16
+
+    NimLlcpVersionIndView {.packed.} = object
+      opcode: uint8
+      version: uint8
+      companyId: uint16
+      subversion: uint16
+
+    NimLlcpPhyPairPduView {.packed.} = object
+      opcode: uint8
+      txPhys: uint8
+      rxPhys: uint8
+
+    NimLlcpRejectIndView {.packed.} = object
+      opcode: uint8
+      errorCode: uint8
+
+    NimLlcpRejectExtIndView {.packed.} = object
+      opcode: uint8
+      rejectedOpcode: uint8
+      errorCode: uint8
+
+    NimLlcpUnknownRspView {.packed.} = object
+      opcode: uint8
+      unknownOpcode: uint8
+
+    NimLlcpTerminateIndView {.packed.} = object
+      opcode: uint8
+      reason: uint8
+
+    NimConnTxElementView {.packed.} = object
+      reserved00: array[4, uint8]
+      emOffset: uint16
+      length: uint16
+
+  static:
+    doAssert sizeof(NimLlcpLengthPduView) == 9
+    doAssert offsetof(NimLlcpLengthPduView, maxRxOctets) == 1
+    doAssert offsetof(NimLlcpLengthPduView, maxRxTime) == 3
+    doAssert offsetof(NimLlcpLengthPduView, maxTxOctets) == 5
+    doAssert offsetof(NimLlcpLengthPduView, maxTxTime) == 7
+    doAssert sizeof(NimLlcpConnectionUpdateIndView) == 12
+    doAssert offsetof(NimLlcpConnectionUpdateIndView, winSize) == 1
+    doAssert offsetof(NimLlcpConnectionUpdateIndView, winOffset) == 2
+    doAssert offsetof(NimLlcpConnectionUpdateIndView, interval) == 4
+    doAssert offsetof(NimLlcpConnectionUpdateIndView, latency) == 6
+    doAssert offsetof(NimLlcpConnectionUpdateIndView, timeout) == 8
+    doAssert offsetof(NimLlcpConnectionUpdateIndView, instant) == 10
+    doAssert sizeof(NimLlcpChannelMapIndView) == 8
+    doAssert offsetof(NimLlcpChannelMapIndView, channelMap) == 1
+    doAssert offsetof(NimLlcpChannelMapIndView, instant) == 6
+    doAssert sizeof(NimLlcpVersionIndView) == 6
+    doAssert offsetof(NimLlcpVersionIndView, version) == 1
+    doAssert offsetof(NimLlcpVersionIndView, companyId) == 2
+    doAssert offsetof(NimLlcpVersionIndView, subversion) == 4
+    doAssert sizeof(NimLlcpPhyPairPduView) == 3
+    doAssert offsetof(NimLlcpPhyPairPduView, txPhys) == 1
+    doAssert offsetof(NimLlcpPhyPairPduView, rxPhys) == 2
+    doAssert sizeof(NimLlcpRejectIndView) == 2
+    doAssert offsetof(NimLlcpRejectIndView, errorCode) == 1
+    doAssert sizeof(NimLlcpRejectExtIndView) == 3
+    doAssert offsetof(NimLlcpRejectExtIndView, rejectedOpcode) == 1
+    doAssert offsetof(NimLlcpRejectExtIndView, errorCode) == 2
+    doAssert sizeof(NimLlcpUnknownRspView) == 2
+    doAssert offsetof(NimLlcpUnknownRspView, unknownOpcode) == 1
+    doAssert sizeof(NimLlcpTerminateIndView) == 2
+    doAssert offsetof(NimLlcpTerminateIndView, reason) == 1
+    doAssert sizeof(NimConnTxElementView) == 8
+    doAssert offsetof(NimConnTxElementView, emOffset) == 4
+    doAssert offsetof(NimConnTxElementView, length) == 6
 
   when bl808BleNimPureConnection:
     type
@@ -5114,9 +5823,9 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
     let slot = nim_llcp_rx_log_index and 0x07'u32
     var word = uint32(header) shl 16
     if pduLen > 0'u16:
-      word = word or uint32(read8(BTBLE_EM_BASE + dataOff.uint32))
+      word = word or uint32(btbleEmRead8(dataOff))
     if pduLen > 1'u16:
-      word = word or (uint32(read8(BTBLE_EM_BASE + dataOff.uint32 + 1'u32)) shl 8)
+      word = word or (uint32(btbleEmRead8(dataOff + 1'u16)) shl 8)
     nim_llcp_rx_log[slot.int] = word
     nim_llcp_rx_log_index = nim_llcp_rx_log_index + 1'u32
 
@@ -5180,6 +5889,51 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
   proc getLe16(src: ptr UncheckedArray[uint8], off: int): uint16 =
     uint16(src[off]) or (uint16(src[off + 1]) shl 8)
 
+  template nimLlcpLengthPduAt(pdu: ptr UncheckedArray[uint8]): ptr NimLlcpLengthPduView =
+    cast[ptr NimLlcpLengthPduView](pdu)
+
+  template nimLlcpLengthPdu(pdu: var NimLlcpPdu): ptr NimLlcpLengthPduView =
+    cast[ptr NimLlcpLengthPduView](addr pdu.data[0])
+
+  template nimLlcpConnectionUpdateInd(pdu: var NimLlcpPdu): ptr NimLlcpConnectionUpdateIndView =
+    cast[ptr NimLlcpConnectionUpdateIndView](addr pdu.data[0])
+
+  template nimLlcpConnectionUpdateIndAt(pdu: ptr UncheckedArray[uint8]): ptr NimLlcpConnectionUpdateIndView =
+    cast[ptr NimLlcpConnectionUpdateIndView](pdu)
+
+  template nimLlcpChannelMapInd(pdu: var NimLlcpPdu): ptr NimLlcpChannelMapIndView =
+    cast[ptr NimLlcpChannelMapIndView](addr pdu.data[0])
+
+  template nimLlcpChannelMapIndAt(pdu: ptr UncheckedArray[uint8]): ptr NimLlcpChannelMapIndView =
+    cast[ptr NimLlcpChannelMapIndView](pdu)
+
+  template nimLlcpVersionInd(pdu: var NimLlcpPdu): ptr NimLlcpVersionIndView =
+    cast[ptr NimLlcpVersionIndView](addr pdu.data[0])
+
+  template nimLlcpPhyPairPdu(pdu: var NimLlcpPdu): ptr NimLlcpPhyPairPduView =
+    cast[ptr NimLlcpPhyPairPduView](addr pdu.data[0])
+
+  template nimLlcpRejectInd(pdu: var NimLlcpPdu): ptr NimLlcpRejectIndView =
+    cast[ptr NimLlcpRejectIndView](addr pdu.data[0])
+
+  template nimLlcpRejectExtInd(pdu: var NimLlcpPdu): ptr NimLlcpRejectExtIndView =
+    cast[ptr NimLlcpRejectExtIndView](addr pdu.data[0])
+
+  template nimLlcpUnknownRsp(pdu: var NimLlcpPdu): ptr NimLlcpUnknownRspView =
+    cast[ptr NimLlcpUnknownRspView](addr pdu.data[0])
+
+  template nimLlcpTerminateInd(pdu: var NimLlcpPdu): ptr NimLlcpTerminateIndView =
+    cast[ptr NimLlcpTerminateIndView](addr pdu.data[0])
+
+  template nimConnTxElementAt(buf: pointer): ptr NimConnTxElementView =
+    cast[ptr NimConnTxElementView](buf)
+
+  proc nimConnTxElementInit(buf: pointer; emOffset, length: uint16) =
+    let tx = nimConnTxElementAt(buf)
+    discard c_memset(buf, 0, sizeof(NimConnTxElementView).csize_t)
+    tx.emOffset = emOffset
+    tx.length = length
+
   proc nimLlcpResetDataLengthState() =
     nim_llcp_state.dataLengthKnown = false
     nim_llcp_state.localTxOctets = NimBleLeMaxDataOctets
@@ -5203,11 +5957,11 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
       return
     if pdu == nil or pduLen < 9'u8:
       return
-    let opcode = pdu[0]
-    if opcode != LlcpLengthReq and opcode != LlcpLengthRsp:
+    let lengthPdu = nimLlcpLengthPduAt(pdu)
+    if lengthPdu.opcode != LlcpLengthReq and lengthPdu.opcode != LlcpLengthRsp:
       return
-    nimLlcpStorePeerDataLength(getLe16(pdu, 1), getLe16(pdu, 3),
-                              getLe16(pdu, 5), getLe16(pdu, 7))
+    nimLlcpStorePeerDataLength(lengthPdu.maxRxOctets, lengthPdu.maxRxTime,
+                              lengthPdu.maxTxOctets, lengthPdu.maxTxTime)
 
   proc nimLlcpConfigCount(value: int): uint8 {.inline.} =
     if value <= 0:
@@ -5313,29 +6067,24 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
     ## advertising environment as connected after llc_start succeeds.  The Nim
     ## CONNECT_IND shortcut bypasses that handler, so mirror the consumed fields
     ## for advertiser slot 0.
+    let conn = llmAdvertiserConn()
     if raw != nil:
       for i in 0 ..< 6:
-        llm_env_data.data[40 + i] = raw[i]
-    llm_env_data.data[46] = uint8((header shr 6) and 0x01'u16)
-    llm_env_data.data[47] = 1'u8
-    llm_env_data.data[72] = 9'u8
-    putLe16(cast[ptr UncheckedArray[uint8]](addr llm_env_data.data[0]),
-            24, uint16(interval * 4'u32))
-    putLe16(cast[ptr UncheckedArray[uint8]](addr llm_env_data.data[0]),
-            26, uint16(interval * 4'u32))
-    putLe32(cast[ptr UncheckedArray[uint8]](addr llm_env_data.data[0]),
-            28, 0x00040004'u32)
-    putLe16(cast[ptr UncheckedArray[uint8]](addr llm_env_data.data[0]),
-            32, uint16((latency + 1'u32) * interval))
-    putLe16(cast[ptr UncheckedArray[uint8]](addr llm_env_data.data[0]),
-            34, uint16((latency + 1'u32) * interval))
+        conn.peerAddr.data[i] = raw[i]
+    conn.peerAddrType = uint8((header shr 6) and 0x01'u16)
+    conn.connected = 1'u8
+    conn.state = 9'u8
+    conn.intervalMinSlots = uint16(interval * 4'u32)
+    conn.intervalMaxSlots = uint16(interval * 4'u32)
+    conn.intervalLatencyWord = 0x00040004'u32
+    conn.supervisionMinSlots = uint16((latency + 1'u32) * interval)
+    conn.supervisionMaxSlots = uint16((latency + 1'u32) * interval)
     let intervalLatency = (latency + 1'u32) * interval
     let scaIdx = peerSca and 0x07'u8
     let driftPpm = uint32(co_sca2ppm[scaIdx.int]) + rwip_max_drift_get(scaIdx)
     let driftSlots = (((driftPpm * intervalLatency) div 400'u32) * 2'u32 +
                       312'u32) div 625'u32 + 1'u32
-    putLe16(cast[ptr UncheckedArray[uint8]](addr llm_env_data.data[0]),
-            36, uint16(driftSlots and 0xFFFF'u32))
+    conn.driftSlots = uint16(driftSlots and 0xFFFF'u32)
 
   proc clearNimConnectionStateForDisconnect(reason: uint8) =
     discard reason
@@ -5424,7 +6173,7 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
 
   proc rejectConnRxDescriptor(desc: uint32, status, header: uint16,
                               cur: uint32) =
-    write16(desc, status and NimRxDescLinkMask)
+    btbleRxDescReleaseLink(desc, status)
     noteNimRxDescConsumed(cur)
     inc nim_lld_rx_free_count
     when bl808BleNimPureConnection:
@@ -5441,15 +6190,10 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
       if nim_acl_host_tx_pending != 0:
         nim_acl_empty_tx_queued = 1
         return false
-      discard c_memset(addr nim_acl_empty_tx_buf[0], 0,
-                       nim_acl_empty_tx_buf.len.csize_t)
       # lld_con_data_tx takes an LLD ACL TX element, not a raw LL PDU.
       # Offset +4 is the EM payload offset and +6 carries the pending length.
-      write8(BTBLE_EM_BASE + NimAclTxEmOffset.uint32, 0'u8)
-      let txb = cast[ptr UncheckedArray[uint8]](
-        addr nim_acl_empty_tx_buf[0])
-      putLe16(txb, 4, NimAclTxEmOffset)
-      putLe16(txb, 6, 0'u16)
+      btbleEmWrite8(NimAclTxEmOffset, 0'u8)
+      nimConnTxElementInit(addr nim_acl_empty_tx_buf[0], NimAclTxEmOffset, 0'u16)
       nim_acl_empty_tx_pending = 1
       inc nim_acl_empty_tx_count
       nim_acl_empty_last_status =
@@ -5475,13 +6219,8 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
         return false
       nimLlcpRecordTx(pdu, len)
       for i in 0 ..< len.int:
-        write8(BTBLE_EM_BASE + NimLlcpTxEmOffset.uint32 + i.uint32,
-               pdu[i])
-      discard c_memset(addr nim_llcp_tx_buf[0], 0,
-                       nim_llcp_tx_buf.len.csize_t)
-      let txb = cast[ptr UncheckedArray[uint8]](addr nim_llcp_tx_buf[0])
-      putLe16(txb, 4, NimLlcpTxEmOffset)
-      txb[6] = len
+        btbleEmWrite8(NimLlcpTxEmOffset + i.uint16, pdu[i])
+      nimConnTxElementInit(addr nim_llcp_tx_buf[0], NimLlcpTxEmOffset, len.uint16)
       nim_llcp_tx_pending = 1
       inc nim_llcp_tx_count
       nim_llcp_last_status =
@@ -5610,12 +6349,12 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
 
     proc nimLlcpBuildLengthPdu(opcode: uint8): NimLlcpPdu =
       result.payloadLen = 9'u8
-      result.data[0] = opcode
-      let raw = cast[ptr UncheckedArray[uint8]](addr result.data[0])
-      putLe16(raw, 1, NimBleLeMaxDataOctets)
-      putLe16(raw, 3, NimBleLeMaxDataTime)
-      putLe16(raw, 5, nim_llcp_state.localTxOctets)
-      putLe16(raw, 7, nim_llcp_state.localTxTime)
+      let body = nimLlcpLengthPdu(result)
+      body.opcode = opcode
+      body.maxRxOctets = NimBleLeMaxDataOctets
+      body.maxRxTime = NimBleLeMaxDataTime
+      body.maxTxOctets = nim_llcp_state.localTxOctets
+      body.maxTxTime = nim_llcp_state.localTxTime
 
     proc nimLlcpBuildOpcodePdu(opcode: uint8): NimLlcpPdu =
       result.payloadLen = 1'u8
@@ -5644,7 +6383,8 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
 
     proc nimLlcpBuildConnectionUpdateInd(req: ptr HciLeConnUpdateReqView): NimLlcpPdu =
       result.payloadLen = 12'u8
-      result.data[0] = LlcpConnectionUpdateInd
+      let body = nimLlcpConnectionUpdateInd(result)
+      body.opcode = LlcpConnectionUpdateInd
       if req == nil:
         return
       let interval = req.connIntervalMin
@@ -5653,13 +6393,12 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
           uint16(nim_conn_state.eventCounter + 6'u16)
         else:
           6'u16
-      result.data[1] = 1'u8
-      let raw = cast[ptr UncheckedArray[uint8]](addr result.data[0])
-      putLe16(raw, 2, 0'u16)
-      putLe16(raw, 4, interval)
-      putLe16(raw, 6, req.connLatency)
-      putLe16(raw, 8, req.supervisionTimeout)
-      putLe16(raw, 10, instant)
+      body.winSize = 1'u8
+      body.winOffset = 0'u16
+      body.interval = interval
+      body.latency = req.connLatency
+      body.timeout = req.supervisionTimeout
+      body.instant = instant
 
     proc nimLlcpStartConnectionUpdate(conhdl: uint16,
                                      req: ptr HciLeConnUpdateReqView): uint8 =
@@ -5679,13 +6418,14 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
         var pdu = nimLlcpBuildConnectionUpdateInd(req)
         if not nimLlcpQueuePdu(conhdl, pdu):
           return HciStatusCommandDisallowed
+        let update = nimLlcpConnectionUpdateInd(pdu)
         nimConnStorePendingConnectionUpdate(
-          pdu.data[1],
-          getLe16(cast[ptr UncheckedArray[uint8]](addr pdu.data[0]), 2),
+          update.winSize,
+          update.winOffset,
           req.connIntervalMin,
           req.connLatency,
           req.supervisionTimeout,
-          getLe16(cast[ptr UncheckedArray[uint8]](addr pdu.data[0]), 10),
+          update.instant,
           notifyHost = true)
         HciStatusSuccess
       else:
@@ -5695,27 +6435,23 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
 
     proc nimLlcpBuildChannelMapInd(): NimLlcpPdu =
       result.payloadLen = 8'u8
-      result.data[0] = LlcpChannelMapInd
-      var map: array[5, uint8]
-      nimBleCurrentChannelMap(cast[ptr UncheckedArray[uint8]](addr map[0]))
-      for i in 0 ..< map.len:
-        result.data[i + 1] = map[i]
+      let body = nimLlcpChannelMapInd(result)
+      body.opcode = LlcpChannelMapInd
+      nimBleCurrentChannelMap(cast[ptr UncheckedArray[uint8]](addr body.channelMap[0]))
       let instant =
         when bl808BleNimPureConnection:
           uint16(nim_conn_state.eventCounter + 6'u16)
         else:
           6'u16
-      putLe16(cast[ptr UncheckedArray[uint8]](addr result.data[0]), 6,
-              instant)
+      body.instant = instant
 
     proc nimLlcpBuildVersionInd(): NimLlcpPdu =
       result.payloadLen = 6'u8
-      result.data[0] = LlcpVersionInd
-      result.data[1] = NimLlcpLocalVersion
-      putLe16(cast[ptr UncheckedArray[uint8]](addr result.data[0]), 2,
-              NimLlcpLocalCompanyId)
-      putLe16(cast[ptr UncheckedArray[uint8]](addr result.data[0]), 4,
-              NimLlcpLocalSubversion)
+      let body = nimLlcpVersionInd(result)
+      body.opcode = LlcpVersionInd
+      body.version = NimLlcpLocalVersion
+      body.companyId = NimLlcpLocalCompanyId
+      body.subversion = NimLlcpLocalSubversion
 
     proc nimLlcpBuildFeatureRsp(): NimLlcpPdu =
       let features = nimLlcpUsedFeaturesForPeer()
@@ -5724,9 +6460,10 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
 
     proc nimLlcpBuildPhyRsp(): NimLlcpPdu =
       result.payloadLen = 3'u8
-      result.data[0] = LlcpPhyRsp
-      result.data[1] = NimLlcpPhy1M
-      result.data[2] = NimLlcpPhy1M
+      let body = nimLlcpPhyPairPdu(result)
+      body.opcode = LlcpPhyRsp
+      body.txPhys = NimLlcpPhy1M
+      body.rxPhys = NimLlcpPhy1M
 
     proc nimLlcpBuildPingRsp(): NimLlcpPdu =
       nimLlcpBuildOpcodePdu(LlcpPingRsp)
@@ -5736,22 +6473,31 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
 
     proc nimLlcpBuildRejectInd(errorCode: uint8): NimLlcpPdu =
       result.payloadLen = 2'u8
-      result.data[0] = LlcpRejectInd
-      result.data[1] = errorCode
+      let body = nimLlcpRejectInd(result)
+      body.opcode = LlcpRejectInd
+      body.errorCode = errorCode
 
     proc nimLlcpBuildRejectExtInd(rejectedOpcode, errorCode: uint8): NimLlcpPdu =
       result.payloadLen = 3'u8
-      result.data[0] = LlcpRejectExtInd
-      result.data[1] = rejectedOpcode
-      result.data[2] = errorCode
+      let body = nimLlcpRejectExtInd(result)
+      body.opcode = LlcpRejectExtInd
+      body.rejectedOpcode = rejectedOpcode
+      body.errorCode = errorCode
 
     proc nimLlcpBuildUnsupportedFeatureRsp(opcode: uint8): NimLlcpPdu =
       nimLlcpBuildRejectExtInd(opcode, BleErrorUnsupportedRemoteFeature)
 
     proc nimLlcpBuildUnknownRsp(opcode: uint8): NimLlcpPdu =
       result.payloadLen = 2'u8
-      result.data[0] = LlcpUnknownRsp
-      result.data[1] = opcode
+      let body = nimLlcpUnknownRsp(result)
+      body.opcode = LlcpUnknownRsp
+      body.unknownOpcode = opcode
+
+    proc nimLlcpBuildTerminateInd(reason: uint8): NimLlcpPdu =
+      result.payloadLen = 2'u8
+      let body = nimLlcpTerminateInd(result)
+      body.opcode = LlcpTerminateInd
+      body.reason = reason
 
     proc nimLlcpRespond(conhdl: uint16, opcode: uint8,
                              reason: uint8 = NimLlcpDefaultReason) =
@@ -6033,6 +6779,30 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
     proc nimConnEmAddr(conhdl: uint16, off: uint32): uint32 {.inline.} =
       BTBLE_EM_BASE + nimConnEmOffset(conhdl) + off
 
+    template btbleConnEventAt(eventAddr: uint32): ptr BtbleConnEventView =
+      cast[ptr BtbleConnEventView](eventAddr.uint)
+
+    proc nimConnEventView(conhdl: uint16): ptr BtbleConnEventView {.inline.} =
+      btbleConnEventAt(nimConnEmAddr(conhdl, 0))
+
+    proc nimConnEventSetRxSync(conhdl: uint16; timing: uint16) {.inline.} =
+      volatileStore(addr nimConnEventView(conhdl).rxSync, timing)
+
+    proc nimConnEventSetPacketDurations(conhdl: uint16;
+                                        duration: uint16) {.inline.} =
+      let event = nimConnEventView(conhdl)
+      volatileStore(addr event.txDuration, duration)
+      volatileStore(addr event.rxDuration, duration)
+
+    proc nimConnEventSetTxDescPtr(conhdl: uint16; descPtr: uint16) {.inline.} =
+      volatileStore(addr nimConnEventView(conhdl).txDescPtr, descPtr)
+
+    proc nimConnEventSetChannel(conhdl: uint16; channelWord: uint16) {.inline.} =
+      volatileStore(addr nimConnEventView(conhdl).channel, channelWord)
+
+    proc nimConnEventSetEventCounter(conhdl: uint16; eventCounter: uint16) {.inline.} =
+      volatileStore(addr nimConnEventView(conhdl).eventCounter, eventCounter)
+
     proc nimConnDescAddr(off: uint16): uint32 {.inline.} =
       BTBLE_EM_BASE + uint32(off)
 
@@ -6044,6 +6814,29 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
       result = nimConnDescPtr(nextOff)
       if softwareOwned:
         result = result or NimConnTxDescSoftwareOwned
+
+    template btbleConnTxDescAt(descAddr: uint32): ptr BtbleConnTxDescView =
+      cast[ptr BtbleConnTxDescView](descAddr.uint)
+
+    proc btbleConnTxDescStatus(descAddr: uint32): uint16 {.inline.} =
+      volatileLoad(addr btbleConnTxDescAt(descAddr).status)
+
+    proc btbleConnTxDescSetStatus(descAddr: uint32; status: uint16) {.inline.} =
+      volatileStore(addr btbleConnTxDescAt(descAddr).status, status)
+
+    proc btbleConnTxDescSetHeader(descAddr: uint32; header: uint16) {.inline.} =
+      volatileStore(addr btbleConnTxDescAt(descAddr).header, header)
+
+    proc btbleConnTxDescSetDataOffset(descAddr: uint32; offset: uint16) {.inline.} =
+      volatileStore(addr btbleConnTxDescAt(descAddr).dataOffset, offset)
+
+    proc btbleConnTxDescClear(descAddr: uint32; nextOff: uint16) {.inline.} =
+      let desc = btbleConnTxDescAt(descAddr)
+      volatileStore(addr desc.status, nimConnDescStatus(nextOff, softwareOwned = true))
+      volatileStore(addr desc.header, 0'u16)
+      volatileStore(addr desc.dataOffset, 0'u16)
+      for i in 0 ..< desc.reserved06.len:
+        volatileStore(addr desc.reserved06[i], 0'u8)
 
     proc nimConnEmDescPtr(off: uint16): uint16 {.inline.} =
       nimConnDescPtr(off)
@@ -6107,30 +6900,38 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
       nim_conn_state.centralRole or
         nim_conn_state.rxAcquiredEvents >= NimConnPeripheralAcquireRxEvents
 
-    proc nimConnAnchorFromTiming(p: ptr UncheckedArray[uint8],
+    proc nimConnCrcInit(params: ptr NimLldConStartParamsView): uint32 {.inline.} =
+      uint32(params.crcInit[0]) or
+        (uint32(params.crcInit[1]) shl 8) or
+        (uint32(params.crcInit[2]) shl 16)
+
+    proc nimConnLegacyLeadSelector(params: ptr NimLldConStartParamsView): uint8 {.inline.} =
+      uint8(params.peerRxAddrType shr 8)
+
+    proc nimConnChannelSelection2(params: ptr NimLldConStartParamsView): bool {.inline.} =
+      (params.peerRxAddrType and 0x00FF'u16) != 0'u16
+
+    proc nimConnAnchorFromTiming(params: ptr NimLldConStartParamsView,
                                  outFine: var uint16): uint32 =
       refreshNimSyncPositions()
-      let rateIdx = p[37]
+      let rateIdx = params.rate
       let syncPos =
         if rateIdx.int < lld_exp_sync_pos_tab.len:
           lld_exp_sync_pos_tab[rateIdx.int]
         else:
           0'u16
-      var clock =
-        (uint32(p[28]) or (uint32(p[29]) shl 8) or
-         (uint32(p[30]) shl 16) or (uint32(p[31]) shl 24)) and
-        0x0FFFFFFF'u32
-      var fine = int32(getLe16(p, 24)) + int32(syncPos) * 2'i32
+      var clock = params.timingClock and 0x0FFFFFFF'u32
+      var fine = int32(params.timingFine) + int32(syncPos) * 2'i32
       nimConnNormalizeFine(clock, fine)
       outFine = uint16(fine)
 
       let windowSizeHalfSlots =
-        uint32(p[7]) * NimConnHalfSlotsPerConnIntervalUnit
+        uint32(params.transmitWindowSize) * NimConnHalfSlotsPerConnIntervalUnit
       let windowOffsetHalfSlots =
-        uint32(getLe16(p, 8)) * NimConnHalfSlotsPerConnIntervalUnit
+        uint32(params.windowOffset) * NimConnHalfSlotsPerConnIntervalUnit
       var phyLeadHalfSlots =
         if rateIdx <= 1'u8: 8'u32 else: 12'u32
-      if (uint16(p[39]) and NimConnAdvTypeTimingBit) == 0'u16:
+      if (uint16(nimConnLegacyLeadSelector(params)) and NimConnAdvTypeTimingBit) == 0'u16:
         phyLeadHalfSlots = 4'u32
       (clock + (windowSizeHalfSlots shr 1) + windowOffsetHalfSlots +
        phyLeadHalfSlots) and 0x0FFFFFFF'u32
@@ -6196,7 +6997,7 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
           nimConnRxWindowControl(nim_conn_state.rxTimingHalfUs)
         else:
           nimConnRxSyncPosition()
-      write16(nimConnEmAddr(conhdl, 0x1E'u32), timing)
+      nimConnEventSetRxSync(conhdl, timing)
 
     proc nimConnTxOctets(): uint16 =
       result = NimBleLeMaxDataOctets
@@ -6248,8 +7049,7 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
         nimConnTxOctets(), nimConnTxTime(),
         nimConnRxOctets(), nimConnRxTime(),
         nim_conn_state.rate)
-      write16(nimConnEmAddr(conhdl, 0x2E'u32), durationHalfUs)
-      write16(nimConnEmAddr(conhdl, 0x30'u32), durationHalfUs)
+      nimConnEventSetPacketDurations(conhdl, durationHalfUs)
 
     proc nimConnPacketEventDurationHalfUs(): uint32 =
       ## Match lld_con_evt_time_update: the scheduler duration is the packet
@@ -6274,28 +7074,21 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
 
     proc nimConnResetTxDesc(off, nextOff: uint16) =
       let desc = nimConnDescAddr(off)
-      write16(desc, nimConnDescStatus(nextOff, softwareOwned = true))
-      write16(desc + 0x02'u32, 0'u16)
-      write16(desc + 0x04'u32, 0'u16)
-      write16(desc + 0x06'u32, 0'u16)
-      write16(desc + 0x08'u32, 0'u16)
-      write16(desc + 0x0A'u32, 0'u16)
-      write16(desc + 0x0C'u32, 0'u16)
-      write16(desc + 0x0E'u32, 0'u16)
+      btbleConnTxDescClear(desc, nextOff)
 
     proc nimConnArmTxDesc(off, nextOff, dataOff: uint16,
                           descHeader: uint16) =
       let desc = nimConnDescAddr(off)
-      write16(desc + 0x02'u32, descHeader)
-      write16(desc + 0x04'u32, dataOff)
-      write16(desc, nimConnDescStatus(nextOff, softwareOwned = false))
+      btbleConnTxDescSetHeader(desc, descHeader)
+      btbleConnTxDescSetDataOffset(desc, dataOff)
+      btbleConnTxDescSetStatus(desc, nimConnDescStatus(nextOff, softwareOwned = false))
 
     proc nimConnTxDescriptorComplete(): bool =
       ## Reference lld_con_frm_cbk treats a returned software-owned TX
       ## descriptor as the controller TX confirmation for LLCP/ACL payloads.
       if not nim_conn_state.txAckArmed or nim_conn_state.txAckDescOff == 0'u16:
         return false
-      (read16(nimConnDescAddr(nim_conn_state.txAckDescOff)) and
+      (btbleConnTxDescStatus(nimConnDescAddr(nim_conn_state.txAckDescOff)) and
         NimConnTxDescSoftwareOwned) != 0'u16
 
     proc nimConnInitTxDescriptors(conhdl: uint16) =
@@ -6305,7 +7098,7 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
       let secondOff = nimConnTxDescOffset(1'u8)
       nimConnResetTxDesc(firstOff, secondOff)
       nimConnResetTxDesc(secondOff, firstOff)
-      write16(nimConnEmAddr(conhdl, 0x24'u32), nimConnEmDescPtr(firstOff))
+      nimConnEventSetTxDescPtr(conhdl, nimConnEmDescPtr(firstOff))
       nim_conn_state.txDescCursor = 0'u8
 
     proc nimConnEventReached(target: uint16): bool {.inline.} =
@@ -6522,12 +7315,12 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
                                           pduLen: uint8) =
       if pdu == nil or pduLen < 8'u8:
         return
+      let body = nimLlcpChannelMapIndAt(pdu)
       for i in 0 ..< nim_conn_state.pendingChannelMap.len:
-        nim_conn_state.pendingChannelMap[i] = pdu[i + 1]
+        nim_conn_state.pendingChannelMap[i] = body.channelMap[i]
       nim_conn_state.pendingChannelMap[4] =
         nim_conn_state.pendingChannelMap[4] and 0x1F'u8
-      nim_conn_state.channelMapInstant =
-        uint16(pdu[6]) or (uint16(pdu[7]) shl 8)
+      nim_conn_state.channelMapInstant = body.instant
       nim_conn_state.channelMapPending = true
       nimConnApplyPendingChannelMap()
 
@@ -6540,20 +7333,18 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
                                                 pduLen: uint8) =
       if pdu == nil or pduLen < 12'u8:
         return
-      let winSize = uint32(pdu[1])
-      let winOffset = uint32(getLe16(pdu, 2))
-      let interval = getLe16(pdu, 4)
-      let latency = getLe16(pdu, 6)
-      let timeout = getLe16(pdu, 8)
+      let update = nimLlcpConnectionUpdateIndAt(pdu)
+      let interval = update.interval
+      let latency = update.latency
+      let timeout = update.timeout
       if interval < 6'u16 or interval > 3200'u16:
         return
       if latency > 499'u16:
         return
       if timeout < 10'u16 or timeout > 3200'u16:
         return
-      nimConnStorePendingConnectionUpdate(uint8(winSize and 0xFF'u32),
-        uint16(winOffset and 0xFFFF'u32), interval, latency, timeout,
-        uint16(pdu[10]) or (uint16(pdu[11]) shl 8), notifyHost = true)
+      nimConnStorePendingConnectionUpdate(update.winSize, update.winOffset,
+        interval, latency, timeout, update.instant, notifyHost = true)
       nimConnApplyPendingConnectionUpdate()
 
     proc nimConnReceivePhyUpdateIndBytes(pdu: ptr UncheckedArray[uint8],
@@ -6604,11 +7395,10 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
       let descOff = nimConnTxDescOffset(descSlot)
       let nextOff = nimConnTxDescOffset(descSlot xor 1'u8)
       if pduLen == 0'u8:
-        write8(BTBLE_EM_BASE + uint32(NimConnEmptyDataEmOffset), 0'u8)
+        btbleEmWrite8(NimConnEmptyDataEmOffset, 0'u8)
         nimConnResetTxDesc(nextOff, descOff)
         nimConnArmTxDesc(descOff, nextOff, NimConnEmptyDataEmOffset, header)
-        write16(nimConnEmAddr(nim_conn_state.handle, 0x24'u32),
-                nimConnEmDescPtr(descOff))
+        nimConnEventSetTxDescPtr(nim_conn_state.handle, nimConnEmDescPtr(descOff))
         nim_conn_state.txDescCursor = descSlot xor 1'u8
         nim_conn_state.txProgrammed = false
         nim_conn_state.txProgrammedEvent = 0'u16
@@ -6618,8 +7408,7 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
 
       nimConnResetTxDesc(nextOff, descOff)
       nimConnArmTxDesc(descOff, nextOff, emOff, header)
-      write16(nimConnEmAddr(nim_conn_state.handle, 0x24'u32),
-              nimConnEmDescPtr(descOff))
+      nimConnEventSetTxDescPtr(nim_conn_state.handle, nimConnEmDescPtr(descOff))
       nim_conn_state.txDescCursor = descSlot xor 1'u8
       if pduLen != 0'u8:
         nim_conn_state.txProgrammed = true
@@ -6644,15 +7433,14 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
       if nim_conn_state.txKind == nimConnTxAclData and
           nim_conn_state.txLen != 0'u8:
         return
-      let raw = cast[ptr UncheckedArray[uint8]](
-        addr nim_acl_host_tx_buf[0])
-      let len = getLe16(raw, 6)
+      let tx = nimConnTxElementAt(addr nim_acl_host_tx_buf[0])
+      let len = tx.length
       if len == 0'u16 or len > NimBleLeMaxDataOctets:
         nim_acl_host_tx_pending = 0
         inc nim_acl_host_tx_reject_count
         return
       nim_conn_state.txKind = nimConnTxAclData
-      nim_conn_state.txEmOffset = getLe16(raw, 4)
+      nim_conn_state.txEmOffset = tx.emOffset
       nim_conn_state.txLen = uint8(len)
       nim_conn_state.txPendingSeq = nim_conn_state.txSeq
       nim_conn_state.txAckArmed = false
@@ -6670,40 +7458,43 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
 
       let activityType =
         if nim_conn_state.directAnchorMode: 0x0002'u16 else: 0x0003'u16
-      write16(base + 0x00'u32, activityType)
-      write16(base + 0x02'u32,
-              uint16(((conhdl and 0x00FF'u16) shl 8) or 0x0020'u16))
+      let event = nimConnEventView(conhdl)
+      volatileStore(addr event.activityType, activityType)
+      volatileStore(addr event.control,
+        uint16(((conhdl and 0x00FF'u16) shl 8) or 0x0020'u16))
       let phyControl =
         NimConnPhyControlBase or
         uint16(uint32(nim_conn_state.rate) * uint32(NimConnPhyControlStep))
-      write16(base + 0x06'u32, phyControl)
-      write16(base + 0x0E'u32, uint16(nim_conn_state.accessAddress and 0xFFFF'u32))
-      write16(base + 0x10'u32,
-              uint16((nim_conn_state.accessAddress shr 16) and 0xFFFF'u32))
-      write16(base + 0x12'u32, uint16(nim_conn_state.crcInit and 0xFFFF'u32))
+      volatileStore(addr event.phyControl, phyControl)
+      volatileStore(addr event.accessAddrLow,
+        uint16(nim_conn_state.accessAddress and 0xFFFF'u32))
+      volatileStore(addr event.accessAddrHigh,
+        uint16((nim_conn_state.accessAddress shr 16) and 0xFFFF'u32))
+      volatileStore(addr event.crcInitLow,
+        uint16(nim_conn_state.crcInit and 0xFFFF'u32))
       let crcHigh =
         uint16((nim_conn_state.crcInit shr 16) and 0x00FF'u32)
-      write16(base + 0x14'u32, crcHigh)
-      write16(base + 0x1A'u32, uint16(rwip_rf[NimConnRfConfigIndex]))
-      write16(base + 0x1C'u32, 1'u16)
-      write16(base + 0x1E'u32, nimConnRxSyncPosition())
-      write16(base + 0x24'u32, nimConnEmDescPtr(nimConnTxDescOffset(0'u8)))
+      volatileStore(addr event.crcInitHigh, crcHigh)
+      volatileStore(addr event.rfConfig, uint16(rwip_rf[NimConnRfConfigIndex]))
+      volatileStore(addr event.eventCountEnable, 1'u16)
+      volatileStore(addr event.rxSync, nimConnRxSyncPosition())
+      volatileStore(addr event.txDescPtr, nimConnEmDescPtr(nimConnTxDescOffset(0'u8)))
       nimConnProgramPacketDurations(conhdl)
-      write16(base + 0x32'u32,
-              uint16(nim_conn_state.channelMap[0]) or
-              (uint16(nim_conn_state.channelMap[1]) shl 8))
-      write16(base + 0x34'u32,
-              uint16(nim_conn_state.channelMap[2]) or
-              (uint16(nim_conn_state.channelMap[3]) shl 8))
-      write16(base + 0x36'u32,
-              uint16(nim_conn_state.channelMap[4] and 0x1F'u8) or
-              (uint16(nim_conn_state.hopIncrement and 0x1F'u8) shl 8))
-      write16(base + 0x38'u32, NimConnRxTimingDefault)
-      write16(base + 0x3A'u32, 0'u16)
-      write16(base + 0x60'u32, nim_conn_state.eventCounter)
-      write16(base + 0x62'u32, 0'u16)
-      write16(base + 0x64'u32, 0'u16)
-      write16(base + 0x66'u32, 0'u16)
+      volatileStore(addr event.channelMap01,
+        uint16(nim_conn_state.channelMap[0]) or
+        (uint16(nim_conn_state.channelMap[1]) shl 8))
+      volatileStore(addr event.channelMap23,
+        uint16(nim_conn_state.channelMap[2]) or
+        (uint16(nim_conn_state.channelMap[3]) shl 8))
+      volatileStore(addr event.channelMapHop,
+        uint16(nim_conn_state.channelMap[4] and 0x1F'u8) or
+        (uint16(nim_conn_state.hopIncrement and 0x1F'u8) shl 8))
+      volatileStore(addr event.rxTiming, NimConnRxTimingDefault)
+      volatileStore(addr event.reserved3A, 0'u16)
+      volatileStore(addr event.eventCounter, nim_conn_state.eventCounter)
+      volatileStore(addr event.eventCounterAux0, 0'u16)
+      volatileStore(addr event.eventCounterAux1, 0'u16)
+      volatileStore(addr event.eventCounterAux2, 0'u16)
       nimConnInitTxDescriptors(conhdl)
       nimConnProgramTxDescriptors()
 
@@ -6728,8 +7519,8 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
         uint16(channelField and 0x3F'u8)
       if nim_conn_state.channelSelection2:
         channelWord = channelWord or NimConnChannelSelect2Bit
-      write16(nimConnEmAddr(conhdl, 0x18'u32), channelWord)
-      write16(nimConnEmAddr(conhdl, 0x60'u32), nim_conn_state.eventCounter)
+      nimConnEventSetChannel(conhdl, channelWord)
+      nimConnEventSetEventCounter(conhdl, nim_conn_state.eventCounter)
       nim_conn_last_channel = channel.uint32
       nim_conn_last_unmapped_channel = nim_conn_state.lastUnmappedChannel.uint32
       nim_conn_last_channel_word = channelWord.uint32
@@ -6835,17 +7626,17 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
 
       discard c_memset(addr nim_conn_sch_prog[0], 0,
                        nim_conn_sch_prog.len.csize_t)
-      let p = cast[ptr UncheckedArray[uint8]](addr nim_conn_sch_prog[0])
-      putLe32(p, 0x00, cast[uint32](cast[uint](nimConnSchProgCb)))
-      putLe32(p, 0x04, targetClock)
-      putLe16(p, 0x08, targetFine)
-      putLe32(p, 0x10, scheduleDuration)
-      putLe32(p, 0x14, uint32(nim_conn_state.handle))
-      p[0x18] = rwip_priority[10]
-      p[0x19] = 0'u8
-      p[0x1A] = 0'u8
-      p[0x1B] = 0x1F'u8
-      p[0x1C] = uint8(nim_conn_state.handle and 0x00FF'u16)
+      let req = cast[ptr SchProgRequestView](addr nim_conn_sch_prog[0])
+      req.callback = cast[uint32](cast[uint](nimConnSchProgCb))
+      req.targetTime = targetClock
+      req.fineTime = targetFine
+      req.duration = scheduleDuration
+      req.context = uint32(nim_conn_state.handle)
+      req.primaryType = rwip_priority[10]
+      req.rate0 = 0'u8
+      req.rate1 = 0'u8
+      req.tail = 0x1F'u8
+      req.eventIndex = uint8(nim_conn_state.handle and 0x00FF'u16)
       sch_prog_push(addr nim_conn_sch_prog[0])
 
     proc nimConnObserveRxHeader(header: uint16,
@@ -7090,62 +7881,55 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
         nim_lld_con_start_status = 0x0C'u32
         return 0x0C'u8
 
-      let p = cast[ptr UncheckedArray[uint8]](params)
+      let start = nimLldConStartParams(params)
+      let snapshotBytes = cast[ptr UncheckedArray[uint8]](params)
       for i in 0 ..< nim_lld_con_start_param.len:
-        nim_lld_con_start_param[i] = p[i]
+        nim_lld_con_start_param[i] = snapshotBytes[i]
 
       discard c_memset(addr nim_conn_state, 0, sizeof(NimConnState).csize_t)
       nim_conn_state.active = true
       nim_conn_state.dataFlowEnabled = true
-      nim_conn_state.centralRole = p[NimConnStartCentralRoleOffset] != 0'u8
-      nim_conn_state.directAnchorMode = p[36] == 0'u8
+      nim_conn_state.centralRole = start.centralRole != 0'u8
+      nim_conn_state.directAnchorMode = start.timingSelector == 0'u8
       nim_conn_state.handle = conhdl
       nim_conn_state.txDescBaseOffset = nimConnTxDescBaseOffsetForHandle(conhdl)
-      nim_conn_state.accessAddress =
-        uint32(p[0]) or (uint32(p[1]) shl 8) or
-        (uint32(p[2]) shl 16) or (uint32(p[3]) shl 24)
-      nim_conn_state.crcInit =
-        uint32(p[4]) or (uint32(p[5]) shl 8) or (uint32(p[6]) shl 16)
+      nim_conn_state.accessAddress = start.accessAddress
+      nim_conn_state.crcInit = nimConnCrcInit(start)
       nim_conn_state.intervalSlots =
-        uint32(getLe16(p, 10)) * NimConnHalfSlotsPerConnIntervalUnit
+        uint32(start.interval) * NimConnHalfSlotsPerConnIntervalUnit
       if nim_conn_state.intervalSlots == 0'u32:
         nim_conn_state.intervalSlots =
           24'u32 * NimConnHalfSlotsPerConnIntervalUnit
       nim_conn_state.supervisionSlots =
-        uint32(getLe16(p, 14)) * NimConnHalfSlotsPerSupervisionUnit
-      for i in 0 ..< 5:
-        nim_conn_state.channelMap[i] = p[16 + i]
+        uint32(start.supervisionTimeout) * NimConnHalfSlotsPerSupervisionUnit
+      nim_conn_state.channelMap = start.channelMap
       nim_conn_state.channelMap[4] = nim_conn_state.channelMap[4] and 0x1F'u8
-      nim_conn_state.hopIncrement = p[21] and 0x1F'u8
+      nim_conn_state.hopIncrement = start.hopIncrement and 0x1F'u8
       if nim_conn_state.hopIncrement == 0'u8:
         nim_conn_state.hopIncrement = 5'u8
       # CSA#1 starts the first data-channel event one hop after channel zero.
       # Keep emUnmappedChannel as the unmapped channel for the next scheduled
       # event; event completion and skipped-event handling advance it after use.
       nim_conn_state.emUnmappedChannel = nimConnHopIncrement()
-      nim_conn_state.channelSelection2 = p[38] != 0'u8
-      nim_conn_state.rate = p[37]
+      nim_conn_state.channelSelection2 = nimConnChannelSelection2(start)
+      nim_conn_state.rate = start.rate
       nim_conn_state.phy =
-        if p[37].int < co_rate_to_phy.len:
-          co_rate_to_phy[p[37].int]
+        if start.rate.int < co_rate_to_phy.len:
+          co_rate_to_phy[start.rate.int]
         else:
           co_rate_to_phy[0]
       if nim_conn_state.phy == 0'u8:
         nim_conn_state.phy = co_rate_to_phy[0]
-      if p[36] != 0'u8:
+      if start.timingSelector != 0'u8:
         nim_conn_state.timingReferenceClock =
-          (uint32(p[28]) or (uint32(p[29]) shl 8) or
-           (uint32(p[30]) shl 16) or (uint32(p[31]) shl 24)) and
-          0x0FFFFFFF'u32
+          start.timingClock and 0x0FFFFFFF'u32
         nim_conn_state.nextAnchor =
-          nimConnAnchorFromTiming(p, nim_conn_state.anchorFine)
+          nimConnAnchorFromTiming(start, nim_conn_state.anchorFine)
         nim_conn_state.rxWindowHalfUs =
-          uint32(p[7]) * NimConnHalfUsPerConnWindowUnit
+          uint32(start.transmitWindowSize) * NimConnHalfUsPerConnWindowUnit
       else:
         nim_conn_state.nextAnchor =
-          (uint32(p[32]) or (uint32(p[33]) shl 8) or
-           (uint32(p[34]) shl 16) or (uint32(p[35]) shl 24)) and
-          0x0FFFFFFF'u32
+          start.anchorClock and 0x0FFFFFFF'u32
         nim_conn_state.anchorFine = 0'u16
         # Direct central handoff gives the exact first master-packet time we
         # selected inside the CONNECT_IND transmit window.  A peripheral only
@@ -7153,9 +7937,9 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
         # this path is enabled for a peripheral build.
         nim_conn_state.rxWindowHalfUs =
           if nim_conn_state.centralRole: 0'u32
-          else: uint32(p[7]) * NimConnHalfUsPerConnWindowUnit
+          else: uint32(start.transmitWindowSize) * NimConnHalfUsPerConnWindowUnit
         nim_conn_state.timingReferenceClock = nim_conn_state.nextAnchor
-      let scaIdx = p[22] and 0x07'u8
+      let scaIdx = start.peerSleepClockAccuracy and 0x07'u8
       nim_conn_state.peerSca = scaIdx
       nim_conn_state.peerDriftPpm =
         if scaIdx.int < co_sca2ppm.len:
@@ -7165,7 +7949,7 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
       if nim_conn_state.nextAnchor == 0'u32:
         nim_conn_state.nextAnchor =
           (currentBtbleTime() +
-           uint32(getLe16(p, 8)) * NimConnHalfSlotsPerConnIntervalUnit) and
+           uint32(start.windowOffset) * NimConnHalfSlotsPerConnIntervalUnit) and
           0x0FFFFFFF'u32
         nim_conn_state.anchorFine = 0'u16
         nim_conn_state.timingReferenceClock = nim_conn_state.nextAnchor
@@ -7198,10 +7982,10 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
     proc nimLldConLlcpTx(conhdl: uint16, buf: pointer): uint8 {.cdecl.} =
       if not nim_conn_state.active or conhdl != nim_conn_state.handle or buf == nil:
         return 0xFF'u8
-      let raw = cast[ptr UncheckedArray[uint8]](buf)
+      let tx = nimConnTxElementAt(buf)
       nim_conn_state.txKind = nimConnTxLlcp
-      nim_conn_state.txEmOffset = getLe16(raw, 4)
-      nim_conn_state.txLen = raw[6]
+      nim_conn_state.txEmOffset = tx.emOffset
+      nim_conn_state.txLen = uint8(tx.length)
       nim_conn_state.txPendingSeq = nim_conn_state.txSeq
       nim_conn_state.txAckArmed = false
       nim_conn_state.txAckObserved = false
@@ -7219,8 +8003,8 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
           nim_conn_state.txKind == nimConnTxLlcp:
         nim_acl_empty_tx_queued = 1
         return 0'u8
-      let raw = cast[ptr UncheckedArray[uint8]](buf)
-      let len = getLe16(raw, 6)
+      let tx = nimConnTxElementAt(buf)
+      let len = tx.length
       if len > NimBleLeMaxDataOctets:
         return HciStatusInvalidParams
       if len != 0'u16 and not nim_conn_state.dataFlowEnabled:
@@ -7228,7 +8012,7 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
       if len != 0'u16 and nim_acl_host_tx_pending == 0'u32:
         return HciStatusCommandDisallowed
       nim_conn_state.txKind = nimConnTxAclData
-      nim_conn_state.txEmOffset = getLe16(raw, 4)
+      nim_conn_state.txEmOffset = tx.emOffset
       nim_conn_state.txLen = uint8(len)
       nim_conn_state.txProgrammed = false
       nimConnProgramTxDescriptors()
@@ -7320,7 +8104,9 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
 
     when bl808BleNimPureConnection:
       var snapshotAnchorFine: uint16
-      let snapshotAnchor = nimConnAnchorFromTiming(outp, snapshotAnchorFine)
+      let snapshotAnchor =
+        nimConnAnchorFromTiming(nimLldConStartParams(addr nim_conn_params[0]),
+                                snapshotAnchorFine)
       nim_connect_timing_snapshot[0] = baseClock
       nim_connect_timing_snapshot[1] = rxFine.uint32
       nim_connect_timing_snapshot[2] = timingClock
@@ -7473,18 +8259,12 @@ proc pushBtbleAdvProgram(leadSlots: uint32 = 8'u32) =
       bl808BleNimSchProgEnabled:
     let slot = uint32(schProgWriteIdx and 0x0F'u8)
     let slotTail = btbleAdvSlotTail(slot)
-    let slotAddr = BTBLE_EM_BASE + slot * 0x10'u32
     discard c_memset(addr nim_sch_prog[0], 0, nim_sch_prog.len.csize_t)
 
-    write16(slotAddr, 0x281A'u16)
-    write16(slotAddr + 0x02'u32, uint16(clock and 0xFFFF'u32))
-    write16(slotAddr + 0x04'u32, 0'u16)
-    write16(slotAddr + 0x06'u32, 0x0270'u16)
-    write16(slotAddr + 0x08'u32, 0x0048'u16)
-    write16(slotAddr + 0x0A'u32, 0x085A'u16)
-    write16(slotAddr + 0x0C'u32, uint16(slotTail and 0xFFFF'u32))
-    write16(slotAddr + 0x0E'u32,
-            uint16((slotTail shr 16) and 0xFFFF'u32))
+    btbleProgramSlotProgramRaw(slot, 0x281A'u16,
+      uint16(clock and 0xFFFF'u32), 0'u16, 0x0270'u16, 0x0048'u16,
+      0x085A'u16, uint16(slotTail and 0xFFFF'u32),
+      uint16((slotTail shr 16) and 0xFFFF'u32))
 
     schProgWrite32(0x00, cast[uint32](cast[uint](nimSchProgCb)))
     schProgWrite32(0x04, targetClock)    # coarse target time
@@ -7509,17 +8289,10 @@ proc pushBtbleAdvProgram(leadSlots: uint32 = 8'u32) =
 
   let directSlot = uint32(nim_adv_schedule_slot) mod 10'u32
   let directSlotTail = btbleAdvSlotTail(directSlot)
-  let directSlotAddr = BTBLE_EM_BASE + directSlot * 0x10'u32
-  write16(directSlotAddr, 0x2802'u16)
-  write16(directSlotAddr + 0x02'u32, uint16(clock and 0xFFFF'u32))
-  write16(directSlotAddr + 0x04'u32, 0'u16)
-  write16(directSlotAddr + 0x06'u32, 0x0270'u16)
-  write16(directSlotAddr + 0x08'u32, 0x0048'u16)
-  write16(directSlotAddr + 0x0A'u32, 0x085A'u16)
-  write16(directSlotAddr + 0x0C'u32,
-          uint16(directSlotTail and 0xFFFF'u32))
-  write16(directSlotAddr + 0x0E'u32,
-          uint16((directSlotTail shr 16) and 0xFFFF'u32))
+  btbleProgramSlotProgramRaw(directSlot, 0x2802'u16,
+    uint16(clock and 0xFFFF'u32), 0'u16, 0x0270'u16, 0x0048'u16,
+    0x085A'u16, uint16(directSlotTail and 0xFFFF'u32),
+    uint16((directSlotTail shr 16) and 0xFFFF'u32))
 
   regWrite((BLE_BASE + 0x110'u32).uint, 0x80000000'u32 or directSlot)
   nim_adv_schedule_slot = uint8((directSlot + 1'u32) mod 10'u32)
@@ -7571,6 +8344,18 @@ proc readBleAddrHigh(addrBase: uint32): uint32 =
   read8(addrBase + 4'u32).uint32 or
     (read8(addrBase + 5'u32).uint32 shl 8)
 
+template btbleScanReqPduAt(buf: uint16): ptr BtbleScanReqPduView =
+  cast[ptr BtbleScanReqPduView](BTBLE_EM_BASE + buf.uint32)
+
+proc bdAddrLow(bd: ptr BdAddr): uint32 {.inline.} =
+  bd.data[0].uint32 or
+    (bd.data[1].uint32 shl 8) or
+    (bd.data[2].uint32 shl 16) or
+    (bd.data[3].uint32 shl 24)
+
+proc bdAddrHigh(bd: ptr BdAddr): uint32 {.inline.} =
+  bd.data[4].uint32 or (bd.data[5].uint32 shl 8)
+
 proc fallbackLocalAddrByte(idx: int): uint8 {.inline.} =
   case idx
   of 0: 0x01'u8
@@ -7593,30 +8378,31 @@ proc expectedAdvAddrByte(idx: int): uint8 =
 proc btbleAdvRxFine(desc: uint32): uint16 {.inline.} =
   ## Vendor lld_adv_frm_isr uses descriptor +0x0C low 10 bits as the raw RX
   ## fine timestamp before subtracting the advertising sync position.
-  read16(desc + 0x0C'u32) and 0x03FF'u16
+  btbleRxDescMeta(desc) and 0x03FF'u16
 
 proc btbleAdvRxClock(desc: uint32): uint32 {.inline.} =
   ## Reference lld_adv_frm_isr uses descriptor +0x08 as the coarse RX clock for
   ## the advertising-channel PDU.
-  read16(desc + 0x08'u32).uint32
+  btbleRxDescClock(desc).uint32
 
 proc btbleConnRxFine(desc: uint32): uint16 {.inline.} =
   ## Reference lld_con_frm_cbk uses descriptor +0x0C low 10 bits as the
   ## data-channel RX fine timestamp before subtracting the PHY sync position.
-  read16(desc + 0x0C'u32) and 0x03FF'u16
+  btbleRxDescMeta(desc) and 0x03FF'u16
 
 proc btbleConnRxClock(desc: uint32): uint32 {.inline.} =
   ## Reference lld_con_frm_cbk uses descriptor +0x08 as the data-channel coarse
   ## RX clock. The pure path expands this 16-bit hardware value near the
   ## scheduled anchor.
-  read16(desc + 0x08'u32).uint32
+  btbleRxDescClock(desc).uint32
 
 proc btbleRecordConnectDescTiming(desc: uint32) =
   when defined(bl808m0) and bl808BleNimConnectionEnabled:
-    nim_connect_desc_fields[0] = read16(desc + 0x06'u32).uint32
-    nim_connect_desc_fields[1] = read16(desc + 0x08'u32).uint32
-    nim_connect_desc_fields[2] = read16(desc + 0x0A'u32).uint32
-    nim_connect_desc_fields[3] = read16(desc + 0x0C'u32).uint32
+    let rxDesc = btbleRxDescAt(desc)
+    nim_connect_desc_fields[0] = volatileLoad(addr rxDesc.timing0).uint32
+    nim_connect_desc_fields[1] = btbleRxDescClock(desc).uint32
+    nim_connect_desc_fields[2] = volatileLoad(addr rxDesc.timing1).uint32
+    nim_connect_desc_fields[3] = btbleRxDescMeta(desc).uint32
 
 when defined(bl808m0) and bl808BleNimPureCentral:
   proc handleNimInitiatorAdvRx(header: uint16, buf: uint16, desc: uint32,
@@ -7638,14 +8424,14 @@ proc serviceBtbleAdvRxDescriptors() =
       if nim_conn_started:
         nimConnMark(0x160'u32 or step)
     let i = (startIdx + step) and 0x07'u32
-    let desc = BTBLE_EM_BASE + 0x458'u32 + i * 0x20'u32
-    let status = read16(desc)
-    if (status and 0x8000'u16) == 0:
+    let desc = BTBLE_EM_BASE + btbleRxDescOffset(i)
+    let status = btbleRxDescStatus(desc)
+    if (status and BtbleRxDescDone) == 0:
       continue
 
-    let header = read16(desc + 0x04'u32)
-    let buf = read16(desc + 0x14'u32)
-    let meta = read16(desc + 0x0C'u32)
+    let header = btbleRxDescHeader(desc)
+    let buf = btbleRxDescDataOffset(desc)
+    let meta = btbleRxDescMeta(desc)
     let pduType = uint8(header and 0x000F'u16)
     let pduLen = uint8((header shr 8) and 0x003F'u16)
 
@@ -7657,14 +8443,14 @@ proc serviceBtbleAdvRxDescriptors() =
 
     if pduType == 0x03'u8 and pduLen == 12'u8:
       inc nim_ble_dbg_rx_scan_req_count
-      let payloadBase = BTBLE_EM_BASE + buf.uint32
-      nim_ble_dbg_rx_scan_req_last_scana0 = readBleAddrLow(payloadBase)
-      nim_ble_dbg_rx_scan_req_last_scana1 = readBleAddrHigh(payloadBase)
-      nim_ble_dbg_rx_scan_req_last_adva0 = readBleAddrLow(payloadBase + 6'u32)
-      nim_ble_dbg_rx_scan_req_last_adva1 = readBleAddrHigh(payloadBase + 6'u32)
+      let scanReq = btbleScanReqPduAt(buf)
+      nim_ble_dbg_rx_scan_req_last_scana0 = bdAddrLow(addr scanReq.scanA)
+      nim_ble_dbg_rx_scan_req_last_scana1 = bdAddrHigh(addr scanReq.scanA)
+      nim_ble_dbg_rx_scan_req_last_adva0 = bdAddrLow(addr scanReq.advA)
+      nim_ble_dbg_rx_scan_req_last_adva1 = bdAddrHigh(addr scanReq.advA)
       var advaMatches = true
       for j in 0 ..< 6:
-        if read8(payloadBase + 6'u32 + j.uint32) != expectedAdvAddrByte(j):
+        if scanReq.advA.data[j] != expectedAdvAddrByte(j):
           advaMatches = false
       if advaMatches:
         inc nim_ble_dbg_rx_scan_req_match_count
@@ -7677,11 +8463,10 @@ proc serviceBtbleAdvRxDescriptors() =
         let rxFine = btbleAdvRxFine(desc)
         let rxClock = btbleAdvRxClock(desc)
         var connectPdu: array[34, uint8]
-        let payload = cast[ptr UncheckedArray[uint8]](
-          (BTBLE_EM_BASE + buf.uint32).uint)
+        let payload = btbleEmPayload(buf)
         for j in 0 ..< connectPdu.len:
           connectPdu[j] = payload[j]
-        write16(desc, status and not 0x8000'u16)
+        btbleRxDescClearDone(desc, status)
         noteNimRxDescConsumed(i)
         let advRxSp = bleCentralTraceReadSp()
         let advRxRa = regRead((advRxSp + 124'u32).uint)
@@ -7717,7 +8502,7 @@ proc serviceBtbleAdvRxDescriptors() =
       if nim_conn_started and pduType != 0x03'u8 and pduType != 0x05'u8:
         continue
 
-    write16(desc, status and not 0x8000'u16)
+    btbleRxDescClearDone(desc, status)
     when defined(bl808m0) and
         (bl808BleNimConnectionEnabled or
          bl808BleNimPureCentral):
@@ -7835,17 +8620,11 @@ proc initBleCoreRegisters() =
   ]:
     regWrite((BLE_BASE + off).uint, 0'u32)
 
-  write16(BLE_EM_BASE + 0x0F0'u32, 0xBED6'u16)
-  write16(BLE_EM_BASE + 0x0F2'u32, 0x8E89'u16)
-  write16(BLE_EM_BASE + 0x0F4'u32, 0x5555'u16)
-  write16(BLE_EM_BASE + 0x0F6'u32, 0x0055'u16)
+  writeBtbleDefaultAccessWords(BLE_EM_BASE + 0x0F0'u32)
   write16(BLE_EM_BASE + 0x106'u32, 0'u16)
   write16(BLE_EM_BASE + 0x108'u32, 0'u16)
   write16(BLE_EM_BASE + 0x10A'u32, 0'u16)
-  write16(BLE_EM_BASE + 0x14C'u32, 0xBED6'u16)
-  write16(BLE_EM_BASE + 0x14E'u32, 0x8E89'u16)
-  write16(BLE_EM_BASE + 0x150'u32, 0x5555'u16)
-  write16(BLE_EM_BASE + 0x152'u32, 0x0055'u16)
+  writeBtbleDefaultAccessWords(BLE_EM_BASE + 0x14C'u32)
   write16(BLE_EM_BASE + 0x162'u32, 0'u16)
   write16(BLE_EM_BASE + 0x164'u32, 0'u16)
   write16(BLE_EM_BASE + 0x166'u32, 0'u16)
@@ -8293,10 +9072,7 @@ proc programBtbleLegacyAdv(advDataLen: uint8) =
   write16(BTBLE_EM_BASE + 0x122'u32, advEventHeader)
   write16(BTBLE_EM_BASE + 0x124'u32, BtbleLegacyAdvEventWord124)
   write16(BTBLE_EM_BASE + 0x126'u32, 0'u16)
-  write16(BTBLE_EM_BASE + 0x12E'u32, 0xBED6'u16)
-  write16(BTBLE_EM_BASE + 0x130'u32, 0x8E89'u16)
-  write16(BTBLE_EM_BASE + 0x132'u32, 0x5555'u16)
-  write16(BTBLE_EM_BASE + 0x134'u32, 0x0055'u16)
+  writeBtbleDefaultAccessWords(BTBLE_EM_BASE + 0x12E'u32)
   write16(BTBLE_EM_BASE + 0x136'u32, 0'u16)
   write16(BTBLE_EM_BASE + 0x138'u32, BtbleLegacyAdvWord138)
   write16(BTBLE_EM_BASE + 0x13A'u32, 0x0020'u16)
@@ -8472,9 +9248,8 @@ when defined(bl808m0) and bl808BleNimPureCentral:
 
   proc programBtbleScanReqTxDesc() =
     let desc = BTBLE_EM_BASE + NimScanReqTxDescOffset
-    write16(desc + 0x00'u32, 0'u16)
-    write16(desc + 0x02'u32, if nimScanActive(): nimScanReqHeader() else: 0'u16)
-    write16(desc + 0x04'u32, 0'u16)
+    let header = if nimScanActive(): nimScanReqHeader() else: 0'u16
+    btbleLegacyTxDescProgram(desc, 0'u16, header, 0'u16)
 
   proc nimScanIntervalSlots(): uint32 {.inline.} =
     uint32(nimScanIntervalUnits()) * NimScanHalfSlotsPerScanUnit
@@ -8752,9 +9527,8 @@ when defined(bl808m0) and bl808BleNimPureCentral:
     ## active scanning uses for SCAN_REQ.  Rebuild the descriptor as CONNECT_IND
     ## before scheduling, matching the vendor lld_init_start descriptor path.
     let desc = BTBLE_EM_BASE + NimInitTxDescOffset
-    write16(desc + 0x00'u32, 0'u16)
-    write16(desc + 0x02'u32, nimInitConnectIndHeader())
-    write16(desc + 0x04'u32, NimInitConnReqDataOffset0)
+    btbleLegacyTxDescProgram(
+      desc, 0'u16, nimInitConnectIndHeader(), NimInitConnReqDataOffset0)
 
   proc nimInitRecordRx(header, status, buf: uint16, peer0, peer1,
                        reason: uint32) =
@@ -8958,10 +9732,7 @@ when defined(bl808m0) and bl808BleNimPureCentral:
             0x0020'u16 or uint16(nim_scan_params[5] and 0x01'u8))
     write16(em + 0x06'u32, 0x1000'u16)
     copyBytes(em + 0x08'u32, addr addrBytes[0], addrBytes.len)
-    write16(em + 0x0E'u32, 0xBED6'u16)
-    write16(em + 0x10'u32, 0x8E89'u16)
-    write16(em + 0x12'u32, 0x5555'u16)
-    write16(em + 0x14'u32, 0x0055'u16)
+    writeBtbleDefaultAccessWords(em + 0x0E'u32)
     let scanCtrl =
       0x0008'u16 or
       (uint16(nim_scan_params[0] and 0x01'u8) shl 4) or
@@ -9002,10 +9773,7 @@ when defined(bl808m0) and bl808BleNimPureCentral:
     write16(em + 0x04'u32, nimInitLegacyCtlWord(advChannel))
     write16(em + 0x06'u32, 0x1000'u16)
     copyBytes(em + 0x08'u32, addr addrBytes[0], addrBytes.len)
-    write16(em + 0x0E'u32, 0xBED6'u16)
-    write16(em + 0x10'u32, 0x8E89'u16)
-    write16(em + 0x12'u32, 0x5555'u16)
-    write16(em + 0x14'u32, 0x0055'u16)
+    writeBtbleDefaultAccessWords(em + 0x0E'u32)
     write16(em + 0x16'u32, uint16(nim_init_hci_params[4] and 0x01'u8) shl 8)
     write16(em + 0x18'u32, 0x8000'u16 or (advChannel and 0x003F'u16))
     write16(em + 0x1A'u32, 0'u16)
@@ -9039,10 +9807,7 @@ when defined(bl808m0) and bl808BleNimPureCentral:
     write16(em + 0x8C'u32, uint16(currentBtbleTime() and 0x0000FFFF'u32))
     write16(em + 0x8E'u32, NimInitTailFlags)
     copyBytes(em + 0x90'u32, addr addrBytes[0], addrBytes.len)
-    write16(em + 0x96'u32, 0xBED6'u16)
-    write16(em + 0x98'u32, 0x8E89'u16)
-    write16(em + 0x9A'u32, 0x5555'u16)
-    write16(em + 0x9C'u32, 0x0055'u16)
+    writeBtbleDefaultAccessWords(em + 0x96'u32)
     regWrite((BLE_BASE + 0x934'u32).uint, 0x00010001'u32)
 
   when defined(BleDebugCounters):
@@ -9394,7 +10159,7 @@ when defined(bl808m0) and bl808BleNimPureCentral:
     nim_init_pending_desc = 0
     nim_init_pending_desc_status = 0
     nim_init_pending_desc_idx = 0
-    write16(desc, status and not 0x8000'u16)
+    btbleRxDescClearDone(desc, status)
     when bl808BleNimPureConnection:
       noteNimRxDescConsumed(idx)
     else:
@@ -9884,6 +10649,9 @@ proc ble_xQueueReceive(q: pointer, item: pointer, timeout: uint32): uint32 {.exp
   dec queue.count
   1
 
+proc bleQueuePending(q: pointer): bool {.inline.} =
+  q != nil and cast[ptr BleQueue](q).count != 0
+
 proc ble_vTaskDelete(t: pointer) {.exportc, cdecl.} =
   discard t
 
@@ -10368,6 +11136,9 @@ proc ble_ke_event_flush*() {.exportc, cdecl.} =
       return
   ke_event_field = 0
 
+proc bleKeEventYieldNeeded(drained, field: uint32): bool {.inline.} =
+  drained >= BleKeEventDrainLimit and field != 0
+
 proc patch_ble_ke_event_schedule*() {.exportc: "_patch_ble_ke_event_schedule", cdecl.} =
   var field = ke_event_field
   var drained = 0'u32
@@ -10386,7 +11157,7 @@ proc patch_ble_ke_event_schedule*() {.exportc: "_patch_ble_ke_event_schedule", c
       ke_event_slots[bit].callback(bit)
     inc drained
     field = ke_event_field
-    if drained >= BleKeEventDrainLimit and field != 0:
+    if bleKeEventYieldNeeded(drained, field):
       inc nim_ble_ke_event_yield_count
       nim_ble_ke_event_yield_field = field
       return
@@ -10524,24 +11295,44 @@ proc ble_ke_debug_mem_info*() {.exportc, cdecl.} =
 
 proc getMsgHeader(param: pointer): ptr KeMsgHeader {.inline.} =
   ## Given a pointer to the message parameters, get the header
-  cast[ptr KeMsgHeader](cast[uint](param) - 12)
+  let envelope = cast[ptr KeMsgEnvelope](
+    cast[uint](param) - offsetof(KeMsgEnvelope, param).uint)
+  addr envelope.header
 
 proc getMsgParam(hdr: ptr KeMsgHeader): pointer {.inline.} =
-  cast[pointer](cast[uint](hdr) + 12)
+  let envelope = cast[ptr KeMsgEnvelope](hdr)
+  cast[pointer](addr envelope.param[0])
+
+proc keStateHandlerAt(base: ptr KeStateHandler, idx: uint8): ptr KeStateHandler {.inline.} =
+  addr cast[ptr UncheckedArray[KeStateHandler]](base)[idx]
+
+proc keMsgHandlerEntryAt(base: ptr KeStateMsgHandler,
+                         idx: uint16): ptr KeStateMsgHandler {.inline.} =
+  addr cast[ptr UncheckedArray[KeStateMsgHandler]](base)[idx]
+
+template emRxDescTableAt(base: uint32): ptr UncheckedArray[EmBufRxDesc] =
+  cast[ptr UncheckedArray[EmBufRxDesc]](base)
+
+template emTxDescTableAt(base: uint32): ptr UncheckedArray[EmBufTxDesc] =
+  cast[ptr UncheckedArray[EmBufTxDesc]](base)
+
+template emRxFreeTable(): ptr UncheckedArray[EmBufRxFreeSlot] =
+  cast[ptr UncheckedArray[EmBufRxFreeSlot]](bleEmPointer(0x35C'u16))
 
 proc emRxDescAt(base: uint32, idx: uint16): ptr EmBufRxDesc {.inline.} =
-  cast[ptr EmBufRxDesc](base + idx.uint32 * EM_BUF_RX_DESC_SIZE)
+  addr emRxDescTableAt(base)[idx]
 
 proc emTxDescAt(base: uint32, idx: uint16): ptr EmBufTxDesc {.inline.} =
-  cast[ptr EmBufTxDesc](base + idx.uint32 * EM_BUF_TX_DESC_SIZE)
+  addr emTxDescTableAt(base)[idx]
+
+proc emRxFreeSlotAt(idx: uint16): ptr EmBufRxFreeSlot {.inline.} =
+  addr emRxFreeTable()[idx]
 
 proc emRxFreeStatusField(idx: uint16): ptr uint16 {.inline.} =
-  cast[ptr uint16](BLE_EM_BASE + 0x35C'u32 +
-                   idx.uint32 * EM_BUF_RX_DESC_SIZE)
+  addr emRxFreeSlotAt(idx).status
 
 proc emRxBufferPointerField(idx: uint16): ptr uint16 {.inline.} =
-  cast[ptr uint16](BLE_EM_BASE + 0x364'u32 +
-                   idx.uint32 * EM_BUF_RX_DESC_SIZE)
+  addr emRxFreeSlotAt(idx).buf_ptr
 
 proc emTxPoolDescForBufferOffset(offset: uint32): ptr EmBufTxDesc {.inline.} =
   let txDescBase = BLE_EM_BASE + 0x264'u32
@@ -10561,9 +11352,9 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled and
       let dataOff = uint16(p[4]) or (uint16(p[5]) shl 8)
       nimLlcpRecordRx(0'u16, dataOff, pduLen)
       if pduLen > 0'u16:
-        let opcode = read8(BTBLE_EM_BASE + dataOff.uint32)
+        let opcode = btbleEmRead8(dataOff)
         let reason =
-          if pduLen > 1'u16: read8(BTBLE_EM_BASE + dataOff.uint32 + 1'u32)
+          if pduLen > 1'u16: btbleEmRead8(dataOff + 1'u16)
           else: NimLlcpDefaultReason
         if nimLlcpRxPduValid(opcode, pduLen):
           inc nim_llcp_rx_count
@@ -10579,9 +11370,9 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled and
       let llid = p[4] and 0x03'u8
       if llid == NimDataLlIdControl and pduLen > 0'u16:
         nimLlcpRecordRx(uint16(llid), dataOff, pduLen)
-        let opcode = read8(BTBLE_EM_BASE + dataOff.uint32)
+        let opcode = btbleEmRead8(dataOff)
         let reason =
-          if pduLen > 1'u16: read8(BTBLE_EM_BASE + dataOff.uint32 + 1'u32)
+          if pduLen > 1'u16: btbleEmRead8(dataOff + 1'u16)
           else: NimLlcpDefaultReason
         if nimLlcpRxPduValid(opcode, pduLen):
           inc nim_llcp_rx_count
@@ -10597,7 +11388,7 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled and
 proc patch_ble_ke_msg_alloc*(id: KeMsgId, dest_id: KeTaskId,
                                  src_id: KeTaskId, param_len: uint16): pointer {.exportc: "_patch_ble_ke_msg_alloc", cdecl.} =
   ## Allocate a kernel message with header + param space
-  let total = param_len.uint32 + 12  # header is 12 bytes
+  let total = param_len.uint32 + offsetof(KeMsgEnvelope, param).uint32
   let mem = ble_ke_malloc(total, 0)
   if mem == nil:
     return nil
@@ -10631,7 +11422,7 @@ proc patch_ble_ke_msg_send*(param: pointer) {.exportc: "_patch_ble_ke_msg_send",
   let hdr = getMsgHeader(param)
   ble_co_list_push_back(addr ke_msg_queue, cast[ptr CoListNode](hdr))
   restoreInterrupts(old)
-  ble_ke_event_set(2)  # KE_EVT_MESSAGE
+  ble_ke_event_set(BleKeMessageEventId)
 
 proc ble_ke_msg_send*(param: pointer) {.exportc, cdecl.} =
   if ke_msg_send_patch != nil:
@@ -10692,6 +11483,9 @@ when defined(bl808m0) and
     var nim_conn_arb_pending_cb: SchArbStartCb
     var nim_conn_arb_pending_elt: pointer
 
+    proc nimArbCallbackPending(): bool {.inline.} =
+      nim_conn_arb_pending_cb != nil
+
     proc queueNimArbCallback(cb: SchArbStartCb, elt: pointer): bool =
       if nim_conn_arb_pending_cb != nil:
         return false
@@ -10700,13 +11494,17 @@ when defined(bl808m0) and
       true
 
     proc serviceNimArbCallbacks() =
-      while nim_conn_arb_pending_cb != nil:
+      var drained = 0'u32
+      while drained < BleArbCallbackDrainLimit and nimArbCallbackPending():
         let cb = nim_conn_arb_pending_cb
         let elt = nim_conn_arb_pending_elt
         nim_conn_arb_pending_cb = nil
         nim_conn_arb_pending_elt = nil
         if cb != nil:
           runNimArbCallback(cb, elt)
+        inc drained
+      if nimArbCallbackPending():
+        inc nim_ble_arb_callback_yield_count
 
   proc nimLldRxDescAddr(idx: uint8): uint32 {.inline.} =
     BTBLE_EM_BASE + btbleRxDescOffset(uint32(idx))
@@ -10720,7 +11518,7 @@ when defined(bl808m0) and
     while (mask and 1'u8) == 0'u8:
       inc idx
       mask = mask shr 1
-    write16(nimLldRxDescAddr(idx) + 0x14'u32, buf)
+    btbleRxDescSetDataOffset(nimLldRxDescAddr(idx), buf)
     lld_env[16] = pending and not (1'u8 shl idx)
     1
 
@@ -10731,18 +11529,18 @@ when defined(bl808m0) and
     for step in 0'u32 ..< 8'u32:
       let cur = lld_env[14] and 0x07'u8
       let desc = nimLldRxDescAddr(cur)
-      let status = read16(desc)
-      let header = read16(desc + 0x04'u32)
-      let meta = read16(desc + 0x0C'u32)
+      let status = btbleRxDescStatus(desc)
+      let header = btbleRxDescHeader(desc)
+      let meta = btbleRxDescMeta(desc)
       nim_lld_rx_last_idx = idx.uint32
       nim_lld_rx_last_env_idx = cur.uint32
       nim_lld_rx_last_status = status.uint32
       nim_lld_rx_last_header = header.uint32
       nim_lld_rx_last_meta = meta.uint32
-      if (status and 0x8000'u16) == 0:
+      if (status and BtbleRxDescDone) == 0:
         break
       if header == 0'u16:
-        write16(desc, status and not 0x8000'u16)
+        btbleRxDescClearDone(desc, status)
         lld_env[14] = uint8((uint32(cur) + 1'u32) and 0x07'u32)
         inc nim_lld_rx_free_count
         continue
@@ -10758,7 +11556,7 @@ when defined(bl808m0) and
           if advLen >= 6'u8 and
               (pduType == 0x00'u8 or pduType == 0x02'u8 or
                pduType == 0x04'u8 or pduType == 0x06'u8):
-            sendLeAdvertisingReportFromRxDesc(header, read16(desc + 0x14'u32))
+            sendLeAdvertisingReportFromRxDesc(header, btbleRxDescDataOffset(desc))
           else:
             scanDescUnsupported = true
       when bl808BleNimConnectionEnabled:
@@ -10768,11 +11566,11 @@ when defined(bl808m0) and
           let rxFine = btbleAdvRxFine(desc)
           let rxClock = btbleAdvRxClock(desc)
           var connectPdu: array[34, uint8]
-          let payload = cast[ptr UncheckedArray[uint8]](
-            (BTBLE_EM_BASE + read16(desc + 0x14'u32).uint32).uint)
+          let dataOff = btbleRxDescDataOffset(desc)
+          let payload = btbleEmPayload(dataOff)
           for j in 0 ..< connectPdu.len:
             connectPdu[j] = payload[j]
-          write16(desc, status and not 0x8000'u16)
+          btbleRxDescClearDone(desc, status)
           noteNimRxDescConsumed(cur.uint32)
           inc nim_lld_rx_free_count
           handleNimConnectInd(uint8(cur and 0x07'u8),
@@ -10785,7 +11583,7 @@ when defined(bl808m0) and
             rejectConnRxDescriptor(desc, status, header, cur.uint32)
             continue
           if nim_conn_started and not validConnDataHeader(header):
-            write16(desc, status and NimRxDescLinkMask)
+            btbleRxDescReleaseLink(desc, status)
             noteNimRxDescConsumed(cur.uint32)
             inc nim_lld_rx_free_count
             continue
@@ -10794,11 +11592,11 @@ when defined(bl808m0) and
           if nim_conn_started and
               dataLlId == NimDataLlIdControl and connLen > 0'u8:
             let conhdl = activeNimConnectionHandle()
-            let dataOff = read16(desc + NimRxDescDataOffsetOffset)
+            let dataOff = btbleRxDescDataOffset(desc)
             nimLlcpRecordRx(header, dataOff, connLen.uint16)
-            let opcode = read8(BTBLE_EM_BASE + dataOff.uint32)
+            let opcode = btbleEmRead8(dataOff)
             let reason =
-              if connLen > 1'u8: read8(BTBLE_EM_BASE + dataOff.uint32 + 1'u32)
+              if connLen > 1'u8: btbleEmRead8(dataOff + 1'u16)
               else: NimLlcpDefaultReason
             if nimLlcpRxPduValid(opcode, connLen.uint16):
               inc nim_llcp_rx_count
@@ -10808,17 +11606,17 @@ when defined(bl808m0) and
               nimLlcpRespond(conhdl, opcode, reason)
             else:
               nimLlcpRecordMalformed(header, opcode, connLen.uint16)
-            write16(desc, status and NimRxDescLinkMask)
+            btbleRxDescReleaseLink(desc, status)
             noteNimRxDescConsumed(cur.uint32)
             inc nim_lld_rx_free_count
             continue
       if pduType == 0x03'u8 and advLen == 12'u8:
-        write16(desc, status and not 0x8000'u16)
+        btbleRxDescClearDone(desc, status)
         lld_env[14] = uint8((uint32(cur) + 1'u32) and 0x07'u32)
         inc nim_lld_rx_free_count
         continue
       if scanDescUnsupported:
-        write16(desc, status and not 0x8000'u16)
+        btbleRxDescClearDone(desc, status)
         lld_env[14] = uint8((uint32(cur) + 1'u32) and 0x07'u32)
         inc nim_lld_rx_free_count
         continue
@@ -10829,7 +11627,7 @@ when defined(bl808m0) and
             rejectConnRxDescriptor(desc, status, header, cur.uint32)
             continue
           if nim_conn_started and not validConnDataHeader(header):
-            write16(desc, status and NimRxDescLinkMask)
+            btbleRxDescReleaseLink(desc, status)
             noteNimRxDescConsumed(cur.uint32)
             inc nim_lld_rx_free_count
             continue
@@ -10837,11 +11635,11 @@ when defined(bl808m0) and
             noteNimPeripheralConnected(activeNimConnectionHandle())
           if dataLlId == NimDataLlIdControl and connLen > 0'u8:
             let conhdl = activeNimConnectionHandle()
-            let dataOff = read16(desc + NimRxDescDataOffsetOffset)
+            let dataOff = btbleRxDescDataOffset(desc)
             nimLlcpRecordRx(header, dataOff, connLen.uint16)
-            let opcode = read8(BTBLE_EM_BASE + dataOff.uint32)
+            let opcode = btbleEmRead8(dataOff)
             let reason =
-              if connLen > 1'u8: read8(BTBLE_EM_BASE + dataOff.uint32 + 1'u32)
+              if connLen > 1'u8: btbleEmRead8(dataOff + 1'u16)
               else: NimLlcpDefaultReason
             if nimLlcpRxPduValid(opcode, connLen.uint16):
               nim_llcp_last_opcode =
@@ -10859,7 +11657,7 @@ when defined(bl808m0) and
           nim_bridge_stage = 0x6100'u32 or cur.uint32
         return cast[pointer](desc)
       if scanDescObserved:
-        write16(desc, status and not 0x8000'u16)
+        btbleRxDescClearDone(desc, status)
         lld_env[14] = uint8((uint32(cur) + 1'u32) and 0x07'u32)
         inc nim_lld_rx_free_count
         continue
@@ -10877,8 +11675,8 @@ when defined(bl808m0) and
     inc nim_lld_rx_free_count
     let cur = lld_env[14] and 0x07'u8
     let descAddr = nimLldRxDescAddr(cur)
-    let status = read16(descAddr)
-    write16(descAddr, status and not 0x8000'u16)
+    let status = btbleRxDescStatus(descAddr)
+    btbleRxDescClearDone(descAddr, status)
     lld_env[14] = uint8((uint32(cur) + 1'u32) and 0x07'u32)
     nim_lld_rx_desc_idx = lld_env[14]
     nim_lld_rx_desc_active = 0'u8
@@ -10892,11 +11690,11 @@ when defined(bl808m0) and
       for step in 0'u32 ..< 8'u32:
         let cur = (startIdx + step) and 0x07'u32
         let desc = nimLldRxDescAddr(uint8(cur))
-        let status = read16(desc)
-        if (status and NimRxDescDone) == 0:
+        let status = btbleRxDescStatus(desc)
+        if (status and BtbleRxDescDone) == 0:
           break
-        let header = read16(desc + NimRxDescHeaderOffset)
-        let meta = read16(desc + 0x0C'u32)
+        let header = btbleRxDescHeader(desc)
+        let meta = btbleRxDescMeta(desc)
         nim_lld_rx_last_idx = cur
         nim_lld_rx_last_env_idx = uint32(lld_env[14] and 0x07'u8)
         nim_lld_rx_last_status = status.uint32
@@ -10906,7 +11704,7 @@ when defined(bl808m0) and
           rejectConnRxDescriptor(desc, status, header, cur)
           continue
         if not validConnDataHeader(header):
-          write16(desc, status and NimRxDescLinkMask)
+          btbleRxDescReleaseLink(desc, status)
           noteNimRxDescConsumed(cur)
           inc nim_lld_rx_free_count
           continue
@@ -10922,12 +11720,12 @@ when defined(bl808m0) and
             nimConnObserveRxHeader(header, rxClock, rxFine)
             payloadFresh = nim_conn_state.rxPayloadFresh
         if dataLlId == NimDataLlIdControl and pduLen > 0'u8:
-          let dataOff = read16(desc + NimRxDescDataOffsetOffset)
+          let dataOff = btbleRxDescDataOffset(desc)
           if payloadFresh:
             nimLlcpRecordRx(header, dataOff, pduLen.uint16)
-            let opcode = read8(BTBLE_EM_BASE + dataOff.uint32)
+            let opcode = btbleEmRead8(dataOff)
             let reason =
-              if pduLen > 1'u8: read8(BTBLE_EM_BASE + dataOff.uint32 + 1'u32)
+              if pduLen > 1'u8: btbleEmRead8(dataOff + 1'u16)
               else: NimLlcpDefaultReason
             if nimLlcpRxPduValid(opcode, pduLen.uint16):
               inc nim_llcp_rx_count
@@ -10938,24 +11736,24 @@ when defined(bl808m0) and
               nimLlcpRespond(conhdl, opcode, reason)
             else:
               nimLlcpRecordMalformed(header, opcode, pduLen.uint16)
-          write16(desc, status and NimRxDescLinkMask)
+          btbleRxDescReleaseLink(desc, status)
           if (lld_env[14] and 0x07'u8) == uint8(cur and 0x07'u32):
             noteNimRxDescConsumed(cur)
           inc nim_lld_rx_free_count
         elif (dataLlId == NimDataLlIdStart or
               dataLlId == NimDataLlIdContinuation) and pduLen > 0'u8:
-          let dataOff = read16(desc + NimRxDescDataOffsetOffset)
+          let dataOff = btbleRxDescDataOffset(desc)
           if payloadFresh:
             if sendHostAclData(conhdl, dataLlId, dataOff, pduLen):
               inc nim_acl_rx_count
             else:
               inc nim_acl_rx_drop_count
-          write16(desc, status and NimRxDescLinkMask)
+          btbleRxDescReleaseLink(desc, status)
           if (lld_env[14] and 0x07'u8) == uint8(cur and 0x07'u32):
             noteNimRxDescConsumed(cur)
           inc nim_lld_rx_free_count
         else:
-          write16(desc, status and NimRxDescLinkMask)
+          btbleRxDescReleaseLink(desc, status)
           if (lld_env[14] and 0x07'u8) == uint8(cur and 0x07'u32):
             noteNimRxDescConsumed(cur)
           inc nim_lld_rx_free_count
@@ -11032,12 +11830,12 @@ proc ble_ke_msg_in_queue*(param: pointer): bool {.exportc, cdecl.} =
 proc ble_ke_msg_discard*(msgid: KeMsgId, dest_id: KeTaskId,
                           src_id: KeTaskId, param: pointer): int32 {.exportc, cdecl.} =
   ## Default message handler: discard (consume the message)
-  return 1  # KE_MSG_CONSUMED
+  return KeMsgConsumed
 
 proc ble_ke_msg_save*(msgid: KeMsgId, dest_id: KeTaskId,
                        src_id: KeTaskId, param: pointer): int32 {.exportc, cdecl.} =
   ## Default message handler: save (keep in queue)
-  return 2  # KE_MSG_SAVED
+  return KeMsgSaved
 
 # ---------------------------------------------------------------------------
 # ======================== KE_QUEUE ========================================
@@ -11139,8 +11937,7 @@ proc patch_ble_ke_task_saved_update*(task_type: uint16) {.exportc: "_patch_ble_k
     if desc.state != nil and desc.state_handler != nil:
       let st = desc.state[]
       if st < desc.state_max:
-        let handler_ptr = cast[uint](desc.state_handler) + (st.uint * sizeof(KeStateHandler).uint)
-        ke_task_saved[task_type] = cast[ptr KeStateHandler](handler_ptr)
+        ke_task_saved[task_type] = keStateHandlerAt(desc.state_handler, st)
 
 proc ble_ke_task_saved_update*(task_type: uint16) {.exportc, cdecl.} =
   if ke_task_saved_update_patch != nil:
@@ -11155,19 +11952,16 @@ proc patch_ble_ke_handler_search*(msg_id: KeMsgId, task_desc: ptr KeTaskDesc): K
   let st = task_desc.state[]
   if st >= task_desc.state_max:
     return nil
-  let handler_ptr = cast[uint](task_desc.state_handler) + (st.uint * sizeof(KeStateHandler).uint)
-  let state_handler = cast[ptr KeStateHandler](handler_ptr)
+  let state_handler = keStateHandlerAt(task_desc.state_handler, st)
   if state_handler.msg_table != nil:
     for i in 0'u16 ..< state_handler.msg_cnt:
-      let entry_ptr = cast[uint](state_handler.msg_table) + (i.uint * sizeof(KeStateMsgHandler).uint)
-      let entry = cast[ptr KeStateMsgHandler](entry_ptr)
+      let entry = keMsgHandlerEntryAt(state_handler.msg_table, i)
       if entry.id == msg_id:
         return entry.handler
   # Check default handler
   if task_desc.default_handler != nil and task_desc.default_handler.msg_table != nil:
     for i in 0'u16 ..< task_desc.default_handler.msg_cnt:
-      let entry_ptr = cast[uint](task_desc.default_handler.msg_table) + (i.uint * sizeof(KeStateMsgHandler).uint)
-      let entry = cast[ptr KeStateMsgHandler](entry_ptr)
+      let entry = keMsgHandlerEntryAt(task_desc.default_handler.msg_table, i)
       if entry.id == msg_id:
         return entry.handler
   return nil
@@ -11195,6 +11989,18 @@ proc ble_ke_task_handler_get*(msg_id: KeMsgId, task_id: KeTaskId): KeMsgHandler 
       return cast[KeMsgHandler](res)
   return patch_ble_ke_task_handler_get(msg_id, task_id)
 
+proc bleKeTaskClearEventIfQueueEmpty() {.inline.} =
+  let old = disableInterrupts()
+  if ke_msg_queue.first == nil:
+    ke_event_field = ke_event_field and not BleKeMessageEventBit
+  restoreInterrupts(old)
+
+proc bleKeTaskRescheduleIfQueued() {.inline.} =
+  let old = disableInterrupts()
+  if ke_msg_queue.first != nil:
+    ble_ke_event_set(BleKeMessageEventId)
+  restoreInterrupts(old)
+
 proc patch_ble_ke_task_schedule*() {.exportc: "_patch_ble_ke_task_schedule", cdecl.} =
   ## Process one message from the message queue
   let old = disableInterrupts()
@@ -11202,10 +12008,7 @@ proc patch_ble_ke_task_schedule*() {.exportc: "_patch_ble_ke_task_schedule", cde
   restoreInterrupts(old)
   if node == nil:
     # Check if queue empty, if so clear event
-    let old2 = disableInterrupts()
-    if ke_msg_queue.first == nil:
-      ke_event_field = ke_event_field and not (1'u32 shl 2)
-    restoreInterrupts(old2)
+    bleKeTaskClearEventIfQueueEmpty()
     return
   let hdr = cast[ptr KeMsgHeader](node)
   hdr.next = cast[ptr KeMsgHeader](cast[uint32](0xFFFFFFFF'u32))
@@ -11217,28 +12020,19 @@ proc patch_ble_ke_task_schedule*() {.exportc: "_patch_ble_ke_task_schedule", cde
   if handler != nil:
     let result = handler(hdr.id, param, hdr.dest_id, hdr.src_id)
     case result
-    of 1:  # KE_MSG_CONSUMED
-      let old3 = disableInterrupts()
-      if ke_msg_queue.first != nil:
-        ble_ke_event_set(2)
-      restoreInterrupts(old3)
-    of 2:  # KE_MSG_SAVED
+    of KeMsgConsumed:
+      bleKeTaskRescheduleIfQueued()
+    of KeMsgSaved:
       # Re-insert into saved list
       let old3 = disableInterrupts()
       ble_co_list_push_back(addr ke_msg_queue, cast[ptr CoListNode](hdr))
       restoreInterrupts(old3)
     else:
       ble_ke_msg_free(hdr)
-      let old3 = disableInterrupts()
-      if ke_msg_queue.first != nil:
-        ble_ke_event_set(2)
-      restoreInterrupts(old3)
+      bleKeTaskRescheduleIfQueued()
   else:
     ble_ke_msg_free(hdr)
-    let old3 = disableInterrupts()
-    if ke_msg_queue.first != nil:
-      ble_ke_event_set(2)
-    restoreInterrupts(old3)
+    bleKeTaskRescheduleIfQueued()
   when defined(bl808m0) and bl808BleNimConnectionEnabled and
       bl808BleNimManualConnTx:
     if nimLlcpTxCfm and nim_llcp_tx_pending == 0:
@@ -11392,18 +12186,33 @@ proc ble_ke_timer_hw_set*(timer: ptr KeTimer) {.exportc, cdecl.} =
     return
   patch_ble_ke_timer_hw_set(timer)
 
+proc bleKeTimerHead(): ptr KeTimer {.inline.} =
+  cast[ptr KeTimer](ke_timer_list.first)
+
+proc bleKeTimerExpired(timer: ptr KeTimer): bool {.inline.} =
+  timer != nil and ble_ke_time_past(timer.time)
+
+proc bleKeTimerPendingWork(): bool {.inline.} =
+  bleKeTimerExpired(bleKeTimerHead())
+
 proc patch_ble_ke_timer_schedule*() {.exportc: "_patch_ble_ke_timer_schedule", cdecl.} =
   ## Process expired timers
-  while ke_timer_list.first != nil:
-    let timer = cast[ptr KeTimer](ke_timer_list.first)
-    if not ble_ke_time_past(timer.time):
+  var drained = 0'u32
+  while drained < BleKeTimerDrainLimit:
+    let timer = bleKeTimerHead()
+    if not bleKeTimerExpired(timer):
       break
     discard ble_co_list_pop_front(addr ke_timer_list)
     ble_ke_msg_send_basic(timer.id, timer.task, timer.task)
     ble_ke_free(timer)
+    inc drained
   # Reprogram HW timer
-  if ke_timer_list.first != nil:
-    ble_ke_timer_hw_set(cast[ptr KeTimer](ke_timer_list.first))
+  let next = bleKeTimerHead()
+  if next != nil:
+    if drained >= BleKeTimerDrainLimit and bleKeTimerExpired(next):
+      inc nim_ble_ke_timer_yield_count
+      nim_ble_ke_timer_yield_time = next.time
+    ble_ke_timer_hw_set(next)
 
 proc ble_ke_timer_schedule*() {.exportc, cdecl.} =
   if ke_timer_schedule_patch != nil:
@@ -11544,6 +12353,8 @@ proc ble_ke_init*() {.exportc, cdecl.} =
       return
   patch_ble_ke_init()
 
+proc bleControllerHasPendingWork(): bool {.inline.}
+
 proc patch_ble_ke_flush*() {.exportc: "_patch_ble_ke_flush", cdecl.} =
   ## Flush all pending messages and timers
   # Drain timer list
@@ -11563,7 +12374,7 @@ proc ble_ke_flush*() {.exportc, cdecl.} =
   patch_ble_ke_flush()
 
 proc patch_ble_ke_sleep_check*(): bool {.exportc: "_patch_ble_ke_sleep_check", cdecl.} =
-  return ke_event_field == 0 and ke_msg_queue.first == nil
+  return not bleControllerHasPendingWork()
 
 proc ble_ke_sleep_check*(): bool {.exportc, cdecl.} =
   if ke_sleep_check_patch != nil:
@@ -11611,13 +12422,13 @@ proc em_buf_rx_buff_addr_get*(idx: uint16): pointer {.exportc, cdecl.} =
   ## Get the address of an RX buffer's data area
   let buf_ptr = emRxBufferPointerField(idx)
   let offset = volatileLoad(buf_ptr)
-  return cast[pointer](BLE_EM_BASE + offset.uint32)
+  return bleEmPointer(offset)
 
 proc em_buf_tx_buff_addr_get*(desc: pointer): pointer {.exportc, cdecl.} =
   ## Get TX buffer data address from descriptor
   let txDesc = cast[ptr EmBufTxDesc](desc)
   let offset = volatileLoad(addr txDesc.buf_ptr)
-  return cast[pointer](BLE_EM_BASE + offset.uint32)
+  return bleEmPointer(offset)
 
 proc em_buf_tx_free*(desc: pointer) {.exportc, cdecl.} =
   ## Free a TX buffer
@@ -11905,14 +12716,8 @@ proc hciAclTxDataStatus(handle: uint16, pbBcFlag: uint8,
     if nim_acl_host_tx_pending != 0'u32:
       inc nim_acl_host_tx_reject_count
       return HciStatusCommandDisallowed
-    copyBytes(BTBLE_EM_BASE + NimAclTxEmOffset.uint32,
-              cast[ptr uint8](data), len.int)
-    discard c_memset(addr nim_acl_host_tx_buf[0], 0,
-                     nim_acl_host_tx_buf.len.csize_t)
-    let txb = cast[ptr UncheckedArray[uint8]](
-      addr nim_acl_host_tx_buf[0])
-    putLe16(txb, 4, NimAclTxEmOffset)
-    putLe16(txb, 6, len)
+    copyBtbleEmBytes(NimAclTxEmOffset, cast[ptr uint8](data), len.int)
+    nimConnTxElementInit(addr nim_acl_host_tx_buf[0], NimAclTxEmOffset, len)
     nim_acl_host_tx_pending = 1
     inc nim_acl_host_tx_count
     nimConnArmPendingHostAclTx()
@@ -12475,10 +13280,7 @@ proc llc_llcp_start_enc_rsp_pdu_send*(conhdl: uint16) {.exportc, cdecl.} =
 proc llc_llcp_terminate_ind_pdu_send*(conhdl: uint16, reason: uint8) {.exportc, cdecl.} =
   when defined(bl808m0) and bl808BleNimConnectionEnabled and
       bl808BleNimManualConnTx:
-    var pdu: NimLlcpPdu
-    pdu.payloadLen = 2'u8
-    pdu.data[0] = LlcpTerminateInd
-    pdu.data[1] = reason
+    var pdu = nimLlcpBuildTerminateInd(reason)
     discard nimLlcpQueuePdu(conhdl, pdu)
   else:
     discard conhdl
@@ -12536,8 +13338,8 @@ proc llc_version_rd_event_send*(conhdl: uint16, status: uint8) {.exportc, cdecl.
 proc llc_ch_assess_get_current_ch_map*(conhdl: uint16, map: ptr uint8) {.exportc, cdecl.} =
   ## Get the current channel map for the connection
   if conhdl < LLC_CON_MAX and llc_env[conhdl] != nil:
-    let env = llc_env[conhdl]
-    discard c_memcpy(map, addr env.data[346], 5)
+    let assess = llcChannelAssessment(llc_env[conhdl])
+    discard c_memcpy(map, addr assess.channelMap[0], 5)
 
 proc llc_ch_assess_get_local_ch_map*(map: ptr uint8) {.exportc, cdecl.} =
   ## Get the local channel assessment map
@@ -12560,11 +13362,11 @@ proc llc_util_clear_operation_ptr*(conhdl: uint16, op_type: uint8) {.exportc, cd
 proc llc_util_dicon_procedure*(conhdl: uint16, reason: uint8) {.exportc, cdecl.} =
   ## Initiate disconnection procedure
   if conhdl < LLC_CON_MAX and llc_env[conhdl] != nil:
-    let env = llc_env[conhdl]
-    if env.data[414] != 0:
+    let disconnect = llcDisconnectState(llc_env[conhdl])
+    if disconnect.active != 0:
       return  # Already disconnecting
-    env.data[413] = reason
-    env.data[414] = 1
+    disconnect.reason = reason
+    disconnect.active = 1
 
 proc llc_util_get_free_conhdl*(): uint16 {.exportc, cdecl.} =
   for i in 0'u16 ..< LLC_CON_MAX.uint16:
@@ -12584,16 +13386,16 @@ proc llc_util_set_auth_payl_to_margin*(conhdl: uint16, margin: uint16) {.exportc
 
 proc llc_util_set_llcp_discard_enable*(conhdl: uint16, enable: bool) {.exportc, cdecl.} =
   if conhdl < LLC_CON_MAX and llc_env[conhdl] != nil:
-    let env = llc_env[conhdl]
-    let flags_ptr = cast[ptr uint16](addr env.data[344])
+    let assess = llcChannelAssessment(llc_env[conhdl])
     if enable:
-      flags_ptr[] = flags_ptr[] or 0x0008'u16
+      assess.flags = assess.flags or 0x0008'u16
     else:
-      flags_ptr[] = flags_ptr[] and not 0x0008'u16
+      assess.flags = assess.flags and not 0x0008'u16
 
 proc llc_util_update_channel_map*(conhdl: uint16, map: ptr uint8) {.exportc, cdecl.} =
   if conhdl < LLC_CON_MAX and llc_env[conhdl] != nil:
-    discard c_memcpy(addr llc_env[conhdl].data[346], map, 5)
+    let assess = llcChannelAssessment(llc_env[conhdl])
+    discard c_memcpy(addr assess.channelMap[0], map, 5)
 
 # ---------------------------------------------------------------------------
 # ======================== LLD (Link Layer Driver) =========================
@@ -12899,13 +13701,14 @@ proc llm_init*() {.exportc, cdecl.} =
   discard c_memset(addr llm_env_data, 0, sizeof(LlmEnv).csize_t)
   discard c_memset(addr llm_wl[0], 0, sizeof(llm_wl).csize_t)
   discard c_memset(addr llm_wl_type[0], 0, sizeof(llm_wl_type).csize_t)
+  let maps = llmChannelMaps()
   for i in 0 ..< hci_le_evt_mask.len:
     llm_env_data.data[4 + i] = hci_le_evt_mask[i]
-  for i in 0 ..< 5:
-    llm_env_data.data[344 + i] = 0xFF'u8
-    llm_env_data.data[349 + i] = 0xFF'u8
-  llm_env_data.data[348] = llm_env_data.data[348] and 0x1F'u8
-  llm_env_data.data[353] = llm_env_data.data[353] and 0x1F'u8
+  for i in 0 ..< maps.localMap.len:
+    maps.localMap[i] = 0xFF'u8
+    maps.masterMap[i] = 0xFF'u8
+  maps.localMap[4] = maps.localMap[4] and 0x1F'u8
+  maps.masterMap[4] = maps.masterMap[4] and 0x1F'u8
   llm_env_data.data[428] = 0xA0'u8
   llm_env_data.data[429] = 0x1F'u8
   llm_env_data.data[430] = 27'u8
@@ -12958,7 +13761,7 @@ proc llm_clk_acc_set*(position: uint8, enable: uint8) {.exportc, cdecl.} =
   llm_env_data.data[3] = uint8((mask shr 24) and 0x000000FF'u32)
 
 proc llm_master_ch_map_get*(): ptr uint8 {.exportc, cdecl.} =
-  addr llm_env_data.data[349]
+  addr llmChannelMaps().masterMap[0]
 
 proc llm_rx_path_comp_get*(): int16 {.exportc, cdecl.} =
   cast[int16](uint16(llm_env_data.data[482]) or
@@ -13236,12 +14039,13 @@ proc llm_util_get_channel_map*(map: ptr uint8) {.exportc, cdecl.} =
 
 proc llm_ch_map_update*(): uint32 {.exportc, cdecl.} =
   var nextMap: array[5, uint8]
+  let maps = llmChannelMaps()
   for i in 0 ..< nextMap.len:
-    nextMap[i] = llm_env_data.data[349 + i]
+    nextMap[i] = maps.masterMap[i]
   if not llm_util_check_map_validity(addr nextMap[0]):
     llm_util_get_channel_map(addr nextMap[0])
   for i in 0 ..< nextMap.len:
-    llm_env_data.data[344 + i] = nextMap[i]
+    maps.localMap[i] = nextMap[i]
   lld_ch_map_set(addr nextMap[0])
   0
 
@@ -14025,6 +14829,8 @@ proc bflbip_reset*() {.exportc, cdecl.} =
 proc bflbip_version*(): uint32 {.exportc, cdecl.} =
   return bflbble_version()
 
+proc bleControllerServiceNonblocking(): bool
+
 proc bflbip_schedule*() {.exportc, cdecl.} =
   when defined(bl808BleConnectTrace) and defined(bl808m0) and
       bl808BleNimConnectionEnabled:
@@ -14032,7 +14838,7 @@ proc bflbip_schedule*() {.exportc, cdecl.} =
       bleTrace("[CON] before sched\r\n")
   when defined(bl808m0) and bl808BleNimConnectionEnabled:
     serviceQueuedNimConnectInd()
-  ble_ke_event_schedule()
+  discard bleControllerServiceNonblocking()
   when defined(bl808BleConnectTrace) and defined(bl808m0) and
       bl808BleNimConnectionEnabled:
     if nim_conn_started:
@@ -14206,46 +15012,94 @@ proc ble_controller_sleep_is_ongoing*(): bool {.exportc, cdecl.} =
 proc ble_controller_update_adv_scan_aa*() {.exportc, cdecl.} =
   lld_update_adv_scan_aa()
 
-type
-  BleControllerServiceMode = enum
-    bleServiceNonblocking
-    bleServiceMainLoop
+proc coDjobAnyPending(): bool
 
-proc bleControllerHasPendingWork(): bool {.inline.} =
+proc bleEventPendingWork(): bool {.inline.} =
   ble_ke_event_get_all() != 0'u32
 
-proc bleControllerModeFromAbi(blockWhenIdle: uint8): BleControllerServiceMode {.inline.} =
-  if blockWhenIdle == 0'u8:
-    bleServiceNonblocking
-  else:
-    bleServiceMainLoop
+proc bleMessagePendingWork(): bool {.inline.} =
+  ke_msg_queue.first != nil
 
-proc bleControllerServiceStep(mode: BleControllerServiceMode): bool =
+proc bleMessageEventPending(): bool {.inline.} =
+  (ble_ke_event_get_all() and BleKeMessageEventBit) != 0
+
+proc bleHiddenMessagePendingWork(): bool {.inline.} =
+  bleMessagePendingWork() and not bleMessageEventPending()
+
+proc bleMainQueuePendingWork(): bool {.inline.} =
+  bleQueuePending(bflb_main_queue_handle)
+
+proc bleDrainKernelEvents(): bool {.inline.} =
+  if not bleEventPendingWork():
+    return false
+  ble_ke_event_schedule()
+  true
+
+proc bleControllerHasPendingWork(): bool =
+  result = bleHciResetSettlePending() or bleEventPendingWork() or bleKeTimerPendingWork() or
+    bleMessagePendingWork() or bleMainQueuePendingWork() or
+    coDjobAnyPending()
+  when defined(bl808m0) and bl808BleNimConnectionEnabled:
+    result = result or nimArbCallbackPending()
+
+proc bleDrainMainQueueMessage(): bool =
+  if bflb_main_queue_handle == nil:
+    return false
+  var msg_buf: array[8, uint8]
+  let ret = ble_xQueueReceive(bflb_main_queue_handle, addr msg_buf[0], 0)
+  if ret != 1 or msg_buf[0] != 1:
+    return false
+  let param = cast[pointer](cast[ptr uint32](addr msg_buf[4])[])
+  if param != nil:
+    let hdr = getMsgHeader(param)
+    ble_ke_msg_free(hdr)
+  true
+
+proc bleDrainScheduledWork(): bool =
+  if bleHciResetSettlePending():
+    inc nim_ble_hci_reset_settle_yield_count
+    return true
+  if bleKeTimerPendingWork():
+    result = true
+    ble_ke_timer_schedule()
+  when defined(bl808m0) and bl808BleNimConnectionEnabled:
+    if nimArbCallbackPending():
+      result = true
+      serviceNimArbCallbacks()
+  if bleDrainKernelEvents():
+    result = true
+  if bleHiddenMessagePendingWork():
+    result = true
+    ble_ke_task_schedule()
+
+proc bleControllerServiceStep(blockWhenIdle = false): bool =
   ## Service one BLE controller scheduler turn. The pure Nim queue receive path
   ## is nonblocking, so CPS callers can use this without pinning the scheduler.
-  discard mode
   result = bleControllerHasPendingWork()
-  var msg_buf: array[8, uint8]
-  if bflb_main_queue_handle != nil:
-    let ret = ble_xQueueReceive(bflb_main_queue_handle, addr msg_buf[0], 0)
-    if ret == 1 and msg_buf[0] == 1:
-      result = true
-      let param = cast[pointer](cast[ptr uint32](addr msg_buf[4])[])
-      if param != nil:
-        let hdr = getMsgHeader(param)
-        ble_ke_msg_free(hdr)
-  ble_ke_event_schedule()
+  if bleDrainMainQueueMessage():
+    result = true
+  if bleDrainScheduledWork():
+    result = true
+  if blockWhenIdle and not result:
+    discard bflbip_sleep()
+    result = bleControllerHasPendingWork()
+
+proc bleControllerServiceNonblocking(): bool =
+  bleControllerServiceStep()
+
+proc bleControllerServiceBlockingIdle(): bool =
+  bleControllerServiceStep(blockWhenIdle = true)
 
 proc blecontroller_service_step*(blockWhenIdle: uint8 = 0'u8) {.exportc, cdecl.} =
-  discard bleControllerServiceStep(bleControllerModeFromAbi(blockWhenIdle))
+  discard bleControllerServiceStep(blockWhenIdle != 0'u8)
 
 proc blecontroller_poll_once*() {.exportc, cdecl.} =
-  discard bleControllerServiceStep(bleServiceNonblocking)
+  discard bleControllerServiceNonblocking()
 
 proc blecontroller_main*() {.exportc, cdecl.} =
   ## Main BLE controller loop
   while true:
-    discard bleControllerServiceStep(bleServiceMainLoop)
+    discard bleControllerServiceBlockingIdle()
 
 # ---------------------------------------------------------------------------
 # ======================== BLE_DBG / ASSERT ================================
@@ -14398,7 +15252,7 @@ proc ble_rf_set_pwr_offset_table*(table: ptr int8) {.exportc, cdecl.} =
 
 proc ble_rf_get_pwr_offset*(channel: uint8): int8 {.exportc, cdecl.} =
   if rf_pwr_offset_table != nil and channel < 40:
-    return cast[ptr int8](cast[uint](rf_pwr_offset_table) + channel.uint)[]
+    return cast[ptr UncheckedArray[int8]](rf_pwr_offset_table)[channel]
   return 0
 
 proc ble_rf_set_tx_channel*(channel: uint16) {.exportc, cdecl.} =
@@ -14734,7 +15588,7 @@ proc btble_ke_mem_init*(mtype: uint8, heap: ptr uint8, size: uint16)
     {.exportc, cdecl.} =
   discard mtype
   ke_mem_heap = heap
-  ke_mem_heap_end = cast[ptr uint8](cast[uint](heap) + size.uint)
+  ke_mem_heap_end = addr cast[ptr UncheckedArray[uint8]](heap)[size.int]
   ble_ke_mem_init()
 
 proc btble_ke_mem_is_empty*(): bool {.exportc, cdecl.} =
@@ -15076,7 +15930,7 @@ proc rwipResetCore() =
   bflbip_prevent_sleep_mask = 0
   nim_btble_sw_pending = false
   resetNimControllerState()
-  bleSettleAfterHciReset()
+  bleArmHciResetSettle()
   quiesceM0PolledBleClicSources()
 
 proc rwip_reset*() {.exportc, cdecl.} =
@@ -15091,7 +15945,7 @@ proc rwip_isr*() {.exportc, cdecl.} =
   bflbble_isr()
 
 proc rwip_schedule*() {.exportc, cdecl.} =
-  ble_ke_event_schedule()
+  discard bleControllerServiceNonblocking()
 
 proc rwip_sleep*(): int32 {.exportc, cdecl.} =
   bflbip_sleep().int32
@@ -15504,26 +16358,26 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled and bl808BleNimLlcStart:
 
     let env = addr nim_llc_start_env_storage[conhdl][0]
     let envView = cast[ptr NimLlcStartEnvView](env)
-    let p = cast[ptr UncheckedArray[uint8]](params)
+    let start = nimVendorLlcStartParams(params)
     discard c_memset(env, 0, nim_llc_start_env_storage[conhdl].len.csize_t)
     nim_llc_start_env_slots[conhdl] = env
 
     btble_ke_state_set(KeTaskId((conhdl shl 8) or 1'u16), 0'u8)
     btble_co_list_init(addr envView.pendingList)
 
-    envView.connIntervalMin = getLe16(p, 10)
-    envView.connIntervalMax = getLe16(p, 12)
-    envView.connLatency = getLe16(p, 14)
-    envView.peerRate = p[22]
+    envView.connIntervalMin = start.connIntervalMin
+    envView.connIntervalMax = start.connIntervalMax
+    envView.connLatency = start.connLatency
+    envView.peerRate = start.peerRate
     discard c_memcpy(cast[pointer](addr envView.peerFeatureSeed[0]),
-                     cast[pointer](addr p[16]), 5)
+                     cast[pointer](addr start.peerFeatureSeed[0]), 5)
     llm_le_features_get(cast[pointer](addr envView.leFeatures[0]))
     envView.leFeatures[0] = envView.leFeatures[0] and 0xFB'u8
     envView.leFeatures[3] = envView.leFeatures[3] and 0xFD'u8
     envView.supervisionTimeout = 27'u16
 
     let rateIdx =
-      if p[36] < co_rate_to_phy.len.uint8: co_rate_to_phy[p[36]]
+      if start.phyRate < co_rate_to_phy.len.uint8: co_rate_to_phy[start.phyRate]
       else: co_rate_to_phy[0]
     envView.txRate = rateIdx
     envView.rxRate = rateIdx
@@ -15532,40 +16386,44 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled and bl808BleNimLlcStart:
     envView.txPacketTime = 27'u16
     envView.txOctets = 328'u16
     envView.rxOctets = 328'u16
-    envView.maxTxTime = getLe16(p, 40)
+    envView.maxTxTime = start.controllerDefaults.maxTxTime
     let maxRxTime =
       if rateIdx == 3'u8:
-        let a = getLe16(p, 42)
+        let a = start.controllerDefaults.maxRxTime
         if a < 0x0A90'u16: a else: 0x0A90'u16
       else:
-        getLe16(p, 42)
+        start.controllerDefaults.maxRxTime
     envView.maxRxTime = maxRxTime
-    envView.minEventSpacing = getLe16(p, 44)
-    envView.localSleepClockAccuracy = p[46]
-    envView.peerSleepClockAccuracy = p[47]
+    envView.minEventSpacing = start.controllerDefaults.minEventSpacing
+    envView.localSleepClockAccuracy = start.controllerDefaults.localSleepClockAccuracy
+    envView.peerSleepClockAccuracy = start.controllerDefaults.peerSleepClockAccuracy
     var envFlags = envView.flags and 0xFFFE'u16
-    if p[37] == 0'u8:
+    if start.directAnchorMode == 0'u8:
       envFlags = envFlags or 1'u16
     envView.flags = envFlags
-    envView.authPayloadTimeout = p[48]
-    envView.channelSelection = p[54]
-    envView.connEventLenMin = getLe16(p, 50)
-    envView.connEventLenMax = getLe16(p, 52)
+    envView.authPayloadTimeout = start.controllerDefaults.authPayloadTimeout
+    envView.channelSelection = start.controllerDefaults.channelSelection
+    envView.connEventLenMin = start.controllerDefaults.connEventLenMin
+    envView.connEventLenMax = start.controllerDefaults.connEventLenMax
 
     var lldParams: array[48, uint8]
-    let l = cast[ptr UncheckedArray[uint8]](addr lldParams[0])
-    for i in 0 ..< 23:
-      l[i] = p[i]
-    putLe16(l, 24, getLe16(p, 24))
-    putLe32(l, 28,
-      uint32(p[28]) or (uint32(p[29]) shl 8) or
-      (uint32(p[30]) shl 16) or (uint32(p[31]) shl 24))
-    putLe32(l, 32,
-      uint32(p[32]) or (uint32(p[33]) shl 8) or
-      (uint32(p[34]) shl 16) or (uint32(p[35]) shl 24))
-    l[36] = p[37]
-    l[37] = p[36]
-    putLe16(l, 38, getLe16(p, 38))
+    let lld = nimLldConStartParams(addr lldParams[0])
+    lld.accessAddress = start.accessAddress
+    lld.crcInit = start.crcInit
+    lld.transmitWindowSize = start.transmitWindowSize
+    lld.windowOffset = start.windowOffset
+    lld.interval = start.connIntervalMin
+    lld.latency = start.connIntervalMax
+    lld.supervisionTimeout = start.connLatency
+    lld.channelMap = start.peerFeatureSeed
+    lld.hopIncrement = start.hopSca
+    lld.peerSleepClockAccuracy = start.peerRate
+    lld.timingFine = start.timingFine
+    lld.timingClock = start.timingClock
+    lld.anchorClock = start.anchorClock
+    lld.timingSelector = start.directAnchorMode
+    lld.rate = start.phyRate
+    lld.peerRxAddrType = start.peerRxAddrType
 
     result = nimLldConStart(conhdl, addr lldParams[0])
     discard llc_le_ping_set(conhdl, 3000'u16)
@@ -15595,7 +16453,22 @@ proc llc_role_get*(conhdl: uint16): uint8 {.exportc, cdecl.} =
 type LlcProcErrCallback = proc(conhdl: uint16, status: uint8,
                                param: pointer) {.cdecl.}
 
+type LlcProcEnvView {.packed.} = object
+  errCallback: pointer
+  procId: uint8
+  state: uint8
+  reserved06: uint8
+
+static:
+  doAssert offsetof(LlcProcEnvView, errCallback) == 0
+  doAssert offsetof(LlcProcEnvView, procId) == 4
+  doAssert offsetof(LlcProcEnvView, state) == 5
+  doAssert offsetof(LlcProcEnvView, reserved06) == 6
+
 var llc_proc_slots: array[LLC_CON_MAX, array[LlcProcSlotCount, pointer]]
+
+template llcProcEnv(procEnv: pointer): ptr LlcProcEnvView =
+  cast[ptr LlcProcEnvView](procEnv)
 
 proc llcProcUpdateTaskState(conhdl: uint16, procId: uint8, setBit: bool) =
   if procId >= 8'u8:
@@ -15628,13 +16501,13 @@ proc llc_proc_state_get*(procEnv: pointer): uint8
   if procEnv == nil:
     0
   else:
-    cast[ptr UncheckedArray[uint8]](procEnv)[5]
+    llcProcEnv(procEnv).state
 
 proc llc_proc_state_set*(procEnv: pointer, conhdl: uint16, state: uint8)
     {.exportc, cdecl.} =
   discard conhdl
   if procEnv != nil:
-    cast[ptr UncheckedArray[uint8]](procEnv)[5] = state
+    llcProcEnv(procEnv).state = state
 
 proc llc_proc_timer_pause_set*(conhdl: uint16, enable: bool)
     {.exportc, cdecl.} =
@@ -16019,19 +16892,21 @@ proc sendHandleCmdComplete(opcode: uint16, status: uint8, handle: uint16) =
   sendCmdCompletePayload(opcode, addr rsp[0], rsp.len.uint8)
 
 proc sendEncryptionChange(handle: uint16, status: uint8, enabled: uint8) =
-  var evt = [status, uint8(handle and 0xFF),
-             uint8((handle shr 8) and 0xFF), enabled]
+  var evt: array[4, uint8]
+  let body = cast[ptr HciEncryptionChangeEventView](addr evt[0])
+  body.status = status
+  body.handle = handle
+  body.enabled = enabled
   sendHostEvent(HciEvtEncryptionChange, addr evt[0], evt.len.uint8)
 
 proc sendRemoteVersionInfoComplete(handle: uint16, status: uint8) =
-  var evt = [
-    status,
-    uint8(handle and 0xFF),
-    uint8((handle shr 8) and 0xFF),
-    0x09'u8,   # Bluetooth Core 5.0 HCI version
-    0xBF'u8, 0x01'u8,
-    0x01'u8, 0x00'u8
-  ]
+  var evt: array[8, uint8]
+  let body = cast[ptr HciRemoteVersionInfoCompleteEventView](addr evt[0])
+  body.status = status
+  body.handle = handle
+  body.version = 0x09'u8   # Bluetooth Core 5.0 HCI version
+  body.companyId = 0x01BF'u16
+  body.subversion = 0x0001'u16
   sendHostEvent(HciEvtRemoteVersionInfoComplete, addr evt[0], evt.len.uint8)
 
 proc sendLeConnectionUpdateComplete(handle: uint16, status: uint8,
@@ -16051,38 +16926,37 @@ proc sendLeConnectionUpdateCompleteValues(handle: uint16, status: uint8,
                                           interval, latency,
                                           timeout: uint16) =
   var evt: array[10, uint8]
-  evt[0] = 0x03'u8
-  evt[1] = status
-  evt[2] = uint8(handle and 0xFF)
-  evt[3] = uint8((handle shr 8) and 0xFF)
-  evt[4] = uint8(interval and 0xFF'u16)
-  evt[5] = uint8(interval shr 8)
-  evt[6] = uint8(latency and 0xFF'u16)
-  evt[7] = uint8(latency shr 8)
-  evt[8] = uint8(timeout and 0xFF'u16)
-  evt[9] = uint8(timeout shr 8)
+  let body = cast[ptr HciLeConnectionUpdateCompleteEventView](addr evt[0])
+  body.subevent = 0x03'u8
+  body.status = status
+  body.handle = handle
+  body.interval = interval
+  body.latency = latency
+  body.timeout = timeout
   sendLeMetaPayload(addr evt[0], evt.len.uint8)
 
 proc sendLeRemoteFeaturesComplete(handle: uint16, status: uint8) =
-  var evt = [
-    0x04'u8,
-    status,
-    uint8(handle and 0xFF),
-    uint8((handle shr 8) and 0xFF),
-    0x00'u8, 0x00'u8, 0x00'u8, 0x00'u8,
-    0x00'u8, 0x00'u8, 0x00'u8, 0x00'u8
-  ]
+  var evt: array[12, uint8]
+  let body = cast[ptr HciLeRemoteFeaturesCompleteEventView](addr evt[0])
+  body.subevent = 0x04'u8
+  body.status = status
+  body.handle = handle
   let features = nimBleCurrentRemoteFeatures()
   for i in 0 ..< 8:
-    evt[4 + i] = nimBleFeatureByte(features, i)
+    body.features[i] = nimBleFeatureByte(features, i)
   sendLeMetaPayload(addr evt[0], evt.len.uint8)
 
 proc sendLePhyUpdateComplete(handle: uint16, status: uint8, params: ptr uint8) =
   discard params
   let txPhy = nimBleCurrentPhy()
   let rxPhy = nimBleCurrentPhy()
-  var evt = [0x0C'u8, status, uint8(handle and 0xFF),
-             uint8((handle shr 8) and 0xFF), txPhy, rxPhy]
+  var evt: array[6, uint8]
+  let body = cast[ptr HciLePhyUpdateCompleteEventView](addr evt[0])
+  body.subevent = 0x0C'u8
+  body.status = status
+  body.handle = handle
+  body.txPhy = txPhy
+  body.rxPhy = rxPhy
   sendLeMetaPayload(addr evt[0], evt.len.uint8)
 
 proc sendLeEncryptComplete(opcode: uint16, params: ptr uint8,
@@ -16192,7 +17066,8 @@ proc sendLeGenerateDhKeyComplete(opcode: uint16, params: ptr uint8,
   var evt: array[34, uint8]
   evt[0] = 0x09'u8
   discard c_memset(addr pka_result[0], 0, pka_result.len.csize_t)
-  let peerY = cast[ptr uint8](cast[uint](params) + ECC_KEY_LEN.uint)
+  let peerPoint = cast[ptr EccPoint256](params)
+  let peerY = addr peerPoint.y[0]
   if not bleP256IsValidScalarLe(addr ecc_private_key[0]):
     bleP256Mark(0x00000320'u32)
     evt[1] = HciStatusCommandDisallowed
@@ -16822,9 +17697,17 @@ proc coDjobEventId(index: int): uint8 =
   else:
     0'u8
 
-proc coDjobPending(index: int): bool =
+proc coDjobPending(index: int): bool {.inline.} =
   let irq = disableInterrupts()
   result = co_djob_queues[index].first != nil
+  restoreInterrupts(irq)
+
+proc coDjobAnyPending(): bool =
+  let irq = disableInterrupts()
+  for queue in co_djob_queues:
+    if queue.first != nil:
+      result = true
+      break
   restoreInterrupts(irq)
 
 proc coDjobRun(eventId: uint8) {.cdecl.} =
@@ -16882,23 +17765,31 @@ proc co_djob_init*(job: pointer, cb: pointer) {.exportc, cdecl.} =
   djob.node.next = nil
   djob.cb = cast[CoDjobCallback](cb)
 
+template hciCmdStatusDescView(desc: pointer): ptr HciCmdStatusDescView =
+  cast[ptr HciCmdStatusDescView](desc)
+
+template hciEventRouting(evt: pointer): ptr HciEventRoutingView =
+  cast[ptr HciEventRoutingView](evt)
+
 proc hci_msg_cmd_status_exp*(desc: pointer): uint8 {.exportc, cdecl.} =
   if desc == nil:
-    1
+    return 1
+  if hciCmdStatusDescView(desc).expectedStatusWord == 0'u32:
+    1'u8
   else:
-    if cast[ptr uint32](cast[uint](desc) + 8'u)[] == 0'u32: 1'u8 else: 0'u8
+    0'u8
 
 proc hci_msg_evt_get_hl_tl_dest*(evt: pointer): uint8 {.exportc, cdecl.} =
   if evt == nil:
     0
   else:
-    cast[ptr UncheckedArray[uint8]](evt)[1] and 0x03'u8
+    hciEventRouting(evt).route and 0x03'u8
 
 proc hci_msg_evt_host_lid_get*(evt: pointer): uint8 {.exportc, cdecl.} =
   if evt == nil:
     0
   else:
-    cast[ptr UncheckedArray[uint8]](evt)[2]
+    hciEventRouting(evt).hostLid
 
 proc led_init*() {.exportc, cdecl.} =
   discard
@@ -16913,11 +17804,11 @@ proc llc_proc_init*(procEnv: pointer, procId: uint8, cb: pointer)
     {.exportc, cdecl.} =
   if procEnv == nil:
     return
-  let raw = cast[ptr UncheckedArray[uint8]](procEnv)
-  cast[ptr pointer](procEnv)[] = cb
-  raw[4] = procId
-  raw[5] = 0
-  raw[6] = 0
+  let env = llcProcEnv(procEnv)
+  env.errCallback = cb
+  env.procId = procId
+  env.state = 0
+  env.reserved06 = 0
 
 proc Add2SelfBigHex256*(dst, other: pointer) {.exportc, cdecl.} =
   bleBigHexAddSelf(dst, other)
@@ -16996,20 +17887,20 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled and
       return
     result = uint16(srcId shr 8)
 
+  template hciAclDataInd(param: pointer): ptr HciAclDataIndView =
+    cast[ptr HciAclDataIndView](param)
+
   proc hci_acl_data_handler*(msgid: KeMsgId, param: pointer,
                              dest_id: KeTaskId, src_id: KeTaskId): uint32
       {.exportc, cdecl.} =
     discard msgid
     if param == nil:
       return 0
-    let raw = cast[ptr UncheckedArray[uint8]](param)
-    let handleFlags = getLe16(raw, 0)
-    let len = getLe16(raw, 2)
+    let ind = hciAclDataInd(param)
+    let handleFlags = ind.handleFlags
+    let len = ind.length
     let handle = aclTaskHandle(dest_id, src_id, handleFlags)
-    let dataAddr =
-      uint32(raw[4]) or (uint32(raw[5]) shl 8) or
-      (uint32(raw[6]) shl 16) or (uint32(raw[7]) shl 24)
-    let data = cast[ptr uint8](dataAddr.uint)
+    let data = cast[ptr uint8](ind.dataAddr.uint)
     let pbBcFlag = uint8((handleFlags shr 12) and 0x000F'u16)
     discard hciOwnedAclTxDataReceived(handle, pbBcFlag, data, len)
     0
@@ -17298,9 +18189,9 @@ proc llc_op_ver_exch_ind_handler*(msgid: KeMsgId, param: pointer,
 abiNoopHandler(llc_proc_collision_check)
 proc llc_proc_err_ind*(conhdl: uint16, procId: uint8, status: uint8,
                        param: pointer): uint32 {.exportc, cdecl.} =
-  let env = llc_proc_get(conhdl, procId)
-  if env != nil:
-    let cb = cast[ptr pointer](env)[]
+  let procEnv = llc_proc_get(conhdl, procId)
+  if procEnv != nil:
+    let cb = llcProcEnv(procEnv).errCallback
     if cb != nil:
       cast[LlcProcErrCallback](cb)(conhdl, status, param)
   0
@@ -17311,13 +18202,13 @@ proc llc_proc_id_get*(conhdl: uint16, procId: uint8): uint8
   if env == nil:
     0
   else:
-    cast[ptr UncheckedArray[uint8]](env)[4]
+    llcProcEnv(env).procId
 
 proc llc_proc_id_set*(conhdl: uint16, procId: uint8,
                       newProcId: uint8): uint32 {.exportc, cdecl.} =
   let env = llc_proc_get(conhdl, procId)
   if env != nil:
-    cast[ptr UncheckedArray[uint8]](env)[4] = newProcId
+    llcProcEnv(env).procId = newProcId
     if newProcId < LlcProcSlotCount.uint8 and newProcId != procId:
       llc_proc_slots[int(conhdl)][int(newProcId)] = env
       llc_proc_slots[int(conhdl)][int(procId)] = nil
@@ -17329,7 +18220,7 @@ proc llc_proc_reg*(conhdl: uint16, procId: uint8,
   if slot != nil:
     slot[] = procEnv
     if procEnv != nil:
-      cast[ptr UncheckedArray[uint8]](procEnv)[4] = procId
+      llcProcEnv(procEnv).procId = procId
     llcProcUpdateTaskState(conhdl, procId, procEnv != nil)
   0
 when defined(bl808m0) and bl808BleNimConnectionEnabled:
@@ -17340,16 +18231,19 @@ else:
   abiNoopHandler(llc_stopped_ind_handler)
 when defined(bl808m0) and bl808BleNimConnectionEnabled and
     bl808BleNimManualConnTx:
+  template lldAclRxInd(param: pointer): ptr LldAclRxIndView =
+    cast[ptr LldAclRxIndView](param)
+
   proc lld_acl_rx_ind_handler*(msgid: KeMsgId, param: pointer,
                                dest_id: KeTaskId, src_id: KeTaskId): uint32
       {.exportc, cdecl.} =
     discard msgid
     if param == nil:
       return 0
-    let raw = cast[ptr UncheckedArray[uint8]](param)
-    let bufRef = getLe16(raw, 0)
-    let len = getLe16(raw, 2)
-    let llid = raw[4] and 0x03'u8
+    let ind = lldAclRxInd(param)
+    let bufRef = ind.bufRef
+    let len = ind.length
+    let llid = ind.llidFlags and 0x03'u8
     let handle = aclTaskHandle(dest_id, src_id, 0'u16)
     if len > 0'u16 and len <= NimBleLeMaxDataOctets and
         (llid == NimDataLlIdStart or

@@ -275,6 +275,43 @@ def test_ble_rf_init_and_channel_retune_settle_calibration_latches():
     )
 
 
+def test_ble_phy_memory_loader_uses_typed_ldpc_agc_overlay():
+    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
+    text = source.read_text(encoding="utf-8")
+
+    assert "BlePhyMemoryRegs {.packed.} = object" in text
+    assert "doAssert offsetof(BlePhyMemoryRegs, memMode) == 0x824" in text
+    assert "doAssert offsetof(BlePhyMemoryRegs, ldpcMode) == 0x834" in text
+    assert "doAssert offsetof(BlePhyMemoryRegs, agcMemGate) == 0x874" in text
+    assert "doAssert offsetof(BlePhyMemoryRegs, ldpcCtrlB340) == 0xB340" in text
+    assert "doAssert offsetof(BlePhyMemoryRegs, ldpcCtrlB344) == 0xB344" in text
+    assert "doAssert offsetof(BlePhyMemoryRegs, ldpcCtrlB348) == 0xB348" in text
+    assert "doAssert offsetof(BlePhyMemoryRegs, agcLoad) == 0xB390" in text
+
+    load_body = text.split("proc loadBlePhyMemories() =", 1)[1].split(
+        "proc bleRfChannelMhz", 1
+    )[0]
+    assert "let phyMem = blePhyMemoryRegs()" in load_body
+    assert "bleRegOrPtr(addr phyMem.agcLoad, BlePhyAgcLoadEnableMask)" in load_body
+    assert "bleRegOrPtr(addr phyMem.agcMemGate, BlePhyAgcMemGateMask)" in load_body
+    assert "bleRegUpdatePtr(addr phyMem.ldpcMode, BlePhyLdpcLoadModeMask" in load_body
+    assert "bleRegStorePtr(addr phyMem.ldpcCtrlB340, 0'u32)" in load_body
+    assert "bleRegStorePtr(addr phyMem.ldpcCtrlB344, 0'u32)" in load_body
+    assert "bleRegStorePtr(addr phyMem.ldpcCtrlB348, 0'u32)" in load_body
+    assert "bleRegClearPtr(addr phyMem.memMode, BlePhyLdpcMemSelectMask)" in load_body
+    assert "writeBleMemoryWords(blerfdata.BleLdpcMemBase, blerfdata.BleLdpcMem" in load_body
+    for raw in (
+        "0x24C0B340",
+        "0x24C0B344",
+        "0x24C0B348",
+        "BlePhyMemModeReg.uint",
+        "BlePhyLdpcModeReg",
+        "BlePhyAgcMemGateReg.uint",
+        "BlePhyAgcLoadReg.uint",
+    ):
+        assert raw not in load_body
+
+
 def test_ble_rf_lo_fcal_search_direction_matches_reference():
     source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
     text = source.read_text(encoding="utf-8")
@@ -618,9 +655,27 @@ def test_pure_ble_rf_table_preserves_connection_em_config_byte():
     assert "doAssert offsetof(BtbleRfTableView, emConfigWord) == 0x38" in text
     assert "doAssert offsetof(BtbleRfTableView, rssiFloorDbm) == 0x3D" in text
     assert "doAssert offsetof(BtbleRfTableView, calibrationWord) == 0x3E" in text
+    assert "BleMacPhyRegs {.packed.} = object" in text
+    assert "BlePhyCtrlRegs {.packed.} = object" in text
+    assert "BlePhyAgcRegs {.packed.} = object" in text
+    assert "doAssert offsetof(BleMacPhyRegs, sleepCtrl) == 0x30" in text
+    assert "doAssert offsetof(BleMacPhyRegs, reset880) == 0x880" in text
+    assert "doAssert offsetof(BleMacPhyRegs, reset89c) == 0x89C" in text
+    assert "doAssert offsetof(BleMacPhyRegs, settle980) == 0x980" in text
+    assert "doAssert offsetof(BleMacPhyRegs, settle98c) == 0x98C" in text
+    assert "doAssert offsetof(BleMacPhyRegs, trim9c0) == 0x9C0" in text
+    assert "doAssert offsetof(BlePhyCtrlRegs, phyCtrl08) == 0x08" in text
+    assert "doAssert offsetof(BlePhyCtrlRegs, phyCtrl8c) == 0x8C" in text
+    assert "doAssert offsetof(BlePhyAgcRegs, agcCtrl84) == 0x84" in text
 
     init_body = text.split("proc btble_rf_init", 1)[1].split(
         "# ---------------------------------------------------------------------------", 1
+    )[0]
+    sleep_body = text.split("proc nimRfSleep", 1)[1].split(
+        "proc nimRfReset", 1
+    )[0]
+    reset_body = text.split("proc nimRfReset", 1)[1].split(
+        "proc nimRfForceAgcEnable", 1
     )[0]
     assert "proc nimRfTxpwrDbmGet(cs: uint8, high: uint8): int8 {.cdecl.}" in text
     assert "table.reserved08 = nil" in init_body
@@ -629,11 +684,33 @@ def test_pure_ble_rf_table_preserves_connection_em_config_byte():
     assert "table.emConfigWord = BtbleRfEmConfigWord" in init_body
     assert "table.rssiFloorDbm = BtbleRfRssiFloorDbm" in init_body
     assert "table.calibrationWord = BtbleRfCalibrationWord" in init_body
+    assert "regStore(addr bleMacPhyRegs().sleepCtrl" in sleep_body
+    assert "0x28000030" not in sleep_body
+    assert "let mac = bleMacPhyRegs()" in reset_body
+    assert "let phy = blePhyCtrlRegs()" in reset_body
+    assert "let agc = blePhyAgcRegs()" in reset_body
+    assert "regStore(addr mac.reset880" in reset_body
+    assert "regUpdateField(addr mac.reset890" in reset_body
+    assert "regStore(addr mac.trim9c0" in reset_body
+    assert "regStore(addr agc.agcCtrl84" in reset_body
+    assert "regUpdateField(addr phy.phyCtrl8c" in reset_body
+    assert "regStore(addr phy.phyCtrl08" in reset_body
+    for raw in (
+        "0x28000880",
+        "0x2800088C",
+        "0x28000890",
+        "0x280009C0",
+        "0x20002C84",
+        "0x2000288C",
+        "0x20002808",
+        "0x28000980",
+    ):
+        assert raw not in reset_body
 
     program_em = text.split("proc nimConnProgramEm", 1)[1].split(
         "proc nimConnProgramChannel", 1
     )[0]
-    assert "write16(base + 0x1A'u32, uint16(rwip_rf[NimConnRfConfigIndex]))" in (
+    assert "volatileStore(addr event.rfConfig, uint16(rwip_rf[NimConnRfConfigIndex]))" in (
         program_em
     )
 
@@ -888,7 +965,7 @@ def test_pure_ble_peripheral_uses_reference_transmit_window_timing():
     program_rx_body = text.split("proc nimConnProgramRxTiming", 1)[1].split(
         "proc nimConnTxOctets", 1
     )[0]
-    assert "write16(base + 0x1E'u32, nimConnRxSyncPosition())" in program_em_body
+    assert "volatileStore(addr event.rxSync, nimConnRxSyncPosition())" in program_em_body
     assert "not nim_conn_state.directAnchorMode" in program_rx_body
     assert "nim_conn_state.rxTimingHalfUs != 0'u32" in program_rx_body
     assert "nimConnRxWindowControl(nim_conn_state.rxTimingHalfUs)" in program_rx_body
@@ -1087,7 +1164,7 @@ def test_pure_ble_connection_programs_rf_channel_indexes():
         "proc nimConnProgramChannel", 1
     )[0]
     assert (
-        "write16(base + 0x12'u32, uint16(nim_conn_state.crcInit and 0xFFFF'u32))"
+        "volatileStore(addr event.crcInitLow,\n        uint16(nim_conn_state.crcInit and 0xFFFF'u32))"
         in program_em
     )
     assert "uint16((nim_conn_state.crcInit shr 16) and 0x00FF'u32)" in program_em
@@ -2404,3 +2481,15 @@ def test_ble_scheduler_program_path_uses_pure_nim_names():
     for line in text.splitlines():
         if "nim_vendor_" in line:
             assert "exportc:" in line
+
+
+def test_ble_ke_heap_end_uses_typed_byte_overlay():
+    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
+    text = source.read_text(encoding="utf-8")
+    body = text.split(
+        "proc btble_ke_mem_init*(mtype: uint8, heap: ptr uint8, size: uint16)",
+        1,
+    )[1].split("proc btble_ke_mem_is_empty*", 1)[0]
+
+    assert "ke_mem_heap_end = addr cast[ptr UncheckedArray[uint8]](heap)[size.int]" in body
+    assert "cast[uint](heap) + size.uint" not in body

@@ -71,6 +71,7 @@ when defined(bl808m0) and defined(bl808WifiNimFw):
     PbufRefOff = 14'u
     PbufCustomFreeOff = 16'u
     PbufFlagIsCustom = 0x02'u8
+    PbufDefaultHeadroom = 64'u
 
     MgmrStaOff = 8'u
     MgmrApOff = 128'u
@@ -243,6 +244,26 @@ when defined(bl808m0) and defined(bl808WifiNimFw):
       readIdx: uint32
       writeIdx: uint32
 
+  when defined(bl808WifiRealLwip):
+    {.emit: """
+#include <lwip/netif.h>
+static struct netif bl808_real_sta_netif;
+static struct netif bl808_real_ap_netif;
+static uint8_t *bl808_real_netif_hwaddr(struct netif *netif) {
+  return netif->hwaddr;
+}
+static void bl808_real_netif_set_name(struct netif *netif, char a, char b) {
+  netif->name[0] = a;
+  netif->name[1] = b;
+}
+""".}
+    var bl808_real_sta_netif {.importc, nodecl.}: Netif
+    var bl808_real_ap_netif {.importc, nodecl.}: Netif
+    proc realNetifHwaddr(netif: ptr Netif): ptr uint8
+      {.importc: "bl808_real_netif_hwaddr", cdecl.}
+    proc realNetifSetName(netif: ptr Netif; a, b: char)
+      {.importc: "bl808_real_netif_set_name", cdecl.}
+
   {.emit: "extern struct bl_hw wifi_hw;".}
   var wifi_hw {.importc, header: "bl_defs.h".}: BlHw
   var ipc_shared_env {.importc, header: "ipc_shared.h".}: uint8
@@ -312,7 +333,6 @@ when defined(bl808m0) and defined(bl808WifiNimFw):
   proc bl_init() {.importc, cdecl.}
   proc bl_pm_ops_register() {.importc, cdecl.}
   proc ke_evt_set(events: uint32) {.importc, cdecl.}
-  proc ke_evt_schedule() {.importc, cdecl.}
   proc wifi_main_poll_once() {.importc, cdecl.}
   proc bl_irq_handler() {.importc, cdecl.}
   proc bl_main_event_handle(param: cint; txFcField: pointer) {.importc, cdecl.}
@@ -354,8 +374,21 @@ when defined(bl808m0) and defined(bl808WifiNimFw):
   proc mgmrRaw(): pointer {.inline.} = cast[pointer](addr wifiMgmr)
   proc staIface(): pointer {.inline.} = ptrAt(mgmrRaw(), MgmrStaOff)
   proc apIface(): pointer {.inline.} = ptrAt(mgmrRaw(), MgmrApOff)
-  proc ifaceNetif(iface: pointer): pointer {.inline.} = ptrAt(iface, WifiIfaceNetifOff)
-  proc netifHwaddr(netif: pointer): ptr uint8 {.inline.} = cast[ptr uint8](ptrAt(netif, NetifHwaddrOff))
+  proc ifaceNetif(iface: pointer): pointer {.inline.} =
+    when defined(bl808WifiRealLwip):
+      if iface == staIface():
+        cast[pointer](addr bl808_real_sta_netif)
+      elif iface == apIface():
+        cast[pointer](addr bl808_real_ap_netif)
+      else:
+        nil
+    else:
+      ptrAt(iface, WifiIfaceNetifOff)
+  proc netifHwaddr(netif: pointer): ptr uint8 {.inline.} =
+    when defined(bl808WifiRealLwip):
+      realNetifHwaddr(cast[ptr Netif](netif))
+    else:
+      cast[ptr uint8](ptrAt(netif, NetifHwaddrOff))
   proc vifAt(idx: uint): pointer {.inline.} = ptrAt(ptrAt(wifiHwRaw(), BlHwVifTableOff), idx * BlVifSize)
 
   proc vendorPrintChar(c: char)
@@ -366,7 +399,10 @@ when defined(bl808m0) and defined(bl808WifiNimFw):
   proc bl_wifi_clock_enable*(): cint {.exportc, cdecl.}
   proc bl_wifi_enable_irq*(): cint {.exportc, cdecl.}
   proc bl_wifi_mac_addr_get*(mac: ptr uint8): cint {.exportc, cdecl.}
-  proc pbuf_free*(p: ptr Pbuf): uint8 {.exportc, cdecl.}
+  when defined(bl808WifiRealLwip):
+    proc pbuf_free*(p: ptr Pbuf): uint8 {.importc: "pbuf_free", header: "<lwip/pbuf.h>", cdecl.}
+  else:
+    proc pbuf_free*(p: ptr Pbuf): uint8 {.exportc, cdecl.}
   proc bl_pm_init*(): cint {.exportc, cdecl.}
   proc bl_pm_deinit*(): cint {.exportc, cdecl.}
   proc bl_pm_state_run*(): cint {.exportc, cdecl.}
@@ -378,6 +414,40 @@ when defined(bl808m0) and defined(bl808WifiNimFw):
   proc rawDelay(loops: uint32) =
     for _ in 0'u32 ..< loops:
       {.emit: "__asm__ volatile(\"nop\");".}
+
+  var nimWifiDbgDelayCalls* {.exportc: "nim_wifi_dbg_delay_calls".}: uint32
+  var nimWifiDbgDelayLastUs* {.exportc: "nim_wifi_dbg_delay_last_us".}: uint32
+  var nimWifiDbgDelayFallbacks* {.exportc: "nim_wifi_dbg_delay_fallbacks".}: uint32
+  var nimWifiDbgDelayLastStale* {.exportc: "nim_wifi_dbg_delay_last_stale".}: uint32
+  var nimWifiDbgDelayLastStartLo* {.exportc: "nim_wifi_dbg_delay_last_start_lo".}: uint32
+  var nimWifiDbgDelayLastNowLo* {.exportc: "nim_wifi_dbg_delay_last_now_lo".}: uint32
+  var nimWifiDbgDelayCallerRa* {.exportc: "nim_wifi_dbg_delay_caller_ra".}: uint32
+  var nimWifiDbgRfLatchServiceEnabled* {.exportc: "nim_wifi_dbg_rf_latch_service_enabled".}: uint32
+  var nimWifiDbgRfTxcalLatchCount* {.exportc: "nim_wifi_dbg_rf_txcal_latch_count".}: uint32
+  var nimWifiDbgRfTxcalBefore* {.exportc: "nim_wifi_dbg_rf_txcal_before".}: uint32
+  var nimWifiDbgRfTxcalAfter* {.exportc: "nim_wifi_dbg_rf_txcal_after".}: uint32
+
+  const
+    WifiRfTxPowerReg = 0x200010B4'u32
+    WifiRfTxcalLatchMask = 0x01100000'u32
+
+  proc serviceWifiRfCalibrationLatch() =
+    ## The BL808 RF archive calls udelay while polling TXCAL latch bits.  BLE's
+    ## reference-equivalent delay hook clears those same live latches; mirror it
+    ## only during WiFi RF bring-up so stale latch state cannot wedge cold init.
+    when defined(bl808WifiUseBl808Rf):
+      if nimWifiDbgRfLatchServiceEnabled == 0'u32:
+        return
+      var txcal = regRead32(WifiRfTxPowerReg)
+      nimWifiDbgRfTxcalBefore = txcal
+      if (txcal and WifiRfTxcalLatchMask) != 0'u32:
+        inc nimWifiDbgRfTxcalLatchCount
+        txcal = txcal and not WifiRfTxcalLatchMask
+        regWrite32(WifiRfTxPowerReg, txcal)
+      nimWifiDbgRfTxcalAfter = regRead32(WifiRfTxPowerReg)
+
+  proc nim_wifi_rf_latch_service_enable*(enable: uint32) {.exportc, cdecl.} =
+    nimWifiDbgRfLatchServiceEnabled = enable
 
   proc readMtimeUs(): uint64 =
     let mtime = cast[ptr UncheckedArray[uint32]](MtimeBase.uint)
@@ -391,24 +461,43 @@ when defined(bl808m0) and defined(bl808WifiNimFw):
     (uint64(hi1) shl 32) or uint64(lo)
 
   proc delayMtimeUs(us: uint32) =
+    inc nimWifiDbgDelayCalls
+    nimWifiDbgDelayLastUs = us
     var now = readMtimeUs()
+    nimWifiDbgDelayLastStartLo = uint32(now and 0xFFFF_FFFF'u64)
     var last = now
     let deadline = now + us.uint64
     var staleReads: uint32
     while int64(now - deadline) < 0:
       rawDelay(32)
       now = readMtimeUs()
+      nimWifiDbgDelayLastNowLo = uint32(now and 0xFFFF_FFFF'u64)
       if now == last:
         inc staleReads
+        nimWifiDbgDelayLastStale = staleReads
         if staleReads > 1024:
+          inc nimWifiDbgDelayFallbacks
           rawDelay(us * 96'u32 + 2048'u32)
           return
       else:
         last = now
         staleReads = 0
 
-  proc arch_delay_us*(us: uint32) {.exportc, cdecl.} = delayMtimeUs(us)
-  proc udelay*(us: uint32) {.exportc, cdecl.} = arch_delay_us(us)
+  proc arch_delay_us*(us: uint32) {.exportc, cdecl.} =
+    var caller: uint32
+    {.emit: ["asm volatile(\"mv %0, ra\" : \"=r\"(", caller, "));"].}
+    nimWifiDbgDelayCallerRa = caller
+    serviceWifiRfCalibrationLatch()
+    delayMtimeUs(us)
+    serviceWifiRfCalibrationLatch()
+
+  proc udelay*(us: uint32) {.exportc, cdecl.} =
+    var caller: uint32
+    {.emit: ["asm volatile(\"mv %0, ra\" : \"=r\"(", caller, "));"].}
+    nimWifiDbgDelayCallerRa = caller
+    serviceWifiRfCalibrationLatch()
+    delayMtimeUs(us)
+    serviceWifiRfCalibrationLatch()
   proc wrapWaitUs*(us: uint32) {.exportc: "__wrap_wait_us", cdecl.} = arch_delay_us(us)
 
   proc vendorPrintChar(c: char) =
@@ -955,6 +1044,9 @@ void bl808_nim_os_log_write(uint32_t level, char *tag, char *file,
     bl808WifiBackendPowerOnXtalWifiPll()
     bl808WifiBackendConfigureDigClock()
     bl808WifiBackendEnableWirelessClocks()
+    # Vendor WiFi bring-up resets only the WiFi wireless block here. The BLE
+    # helper also resets BTDM/BLE2, but doing that in WiFi init can disturb the
+    # shared RF latch state before RF/PHY calibration.
     bl808WifiBackendSwResetCfg0(4)
     bl808WifiBackendConfigureDigClock()
     bl808WifiBackendEnableWirelessClocks()
@@ -1027,9 +1119,14 @@ void bl808_nim_os_log_write(uint32_t level, char *tag, char *file,
     bl808WifiBackendTrace("wifi_hosal_rf_turn_on begin")
     discard wifi_hosal_rf_turn_on(nil)
     bl808WifiBackendTrace("wifi_hosal_rf_turn_on done")
-    bl808WifiBackendTrace("rf_init begin")
-    rf_init(40_000_000)
-    bl808WifiBackendTrace("rf_init done")
+    when defined(bl808WifiUseBl808Rf):
+      bl808WifiBackendTrace("wifi_rf_core_init begin")
+      wifiRfCoreInit(40_000_000)
+      bl808WifiBackendTrace("wifi_rf_core_init done")
+    else:
+      bl808WifiBackendTrace("rf_init begin")
+      rf_init(40_000_000)
+      bl808WifiBackendTrace("rf_init done")
     bl808WifiBackendTrace("high_power_profile begin")
     bl808WifiBackendApplyHighPowerProfile()
     bl808WifiBackendTrace("high_power_profile done")
@@ -1075,7 +1172,7 @@ void bl808_nim_os_log_write(uint32_t level, char *tag, char *file,
         bl_irq_handler()
         didWork = true
       if keEvtField != 0:
-        ke_evt_schedule()
+        wifi_main_poll_once()
         didWork = true
       if hostPollEnabled and loadPtr(wifiHwRaw(), 48) != nil:
         if bl808WifiBackendHostIpcStatus() != 0:
@@ -1140,109 +1237,164 @@ void bl808_nim_os_log_write(uint32_t level, char *tag, char *file,
 
   proc netifapi_netif_add*(netif: ptr Netif; ipaddr, netmask, gw: ptr Ip4Addr;
                            state: pointer; init: NetifInitFn; input: NetifInputFn): int8 {.exportc, cdecl.} =
-    discard ipaddr; discard netmask; discard gw
-    if netif == nil: return -1
-    storePtr(cast[pointer](netif), NetifStateOff, state)
-    storePtr(cast[pointer](netif), NetifInputOff, cast[pointer](input))
-    if init != nil: init(netif) else: 0
+    when defined(bl808WifiRealLwip):
+      proc realNetifAdd(netif: ptr Netif; ipaddr, netmask, gw: ptr Ip4Addr;
+                        state: pointer; init: NetifInitFn; input: NetifInputFn): ptr Netif
+        {.importc: "netif_add", header: "<lwip/netif.h>".}
+      if realNetifAdd(netif, ipaddr, netmask, gw, state, init, input) != nil: 0'i8 else: -1'i8
+    else:
+      discard ipaddr; discard netmask; discard gw
+      if netif == nil: return -1
+      storePtr(cast[pointer](netif), NetifStateOff, state)
+      storePtr(cast[pointer](netif), NetifInputOff, cast[pointer](input))
+      if init != nil: init(netif) else: 0
   proc netifapi_netif_common*(netif: ptr Netif; voidfunc: NetifVoidFn; errtfunc: NetifErrFn): int8 {.exportc, cdecl.} =
     if voidfunc != nil: voidfunc(netif)
     if errtfunc != nil: errtfunc(netif) else: 0
   proc netifapi_netif_set_addr*(netif: ptr Netif; ipaddr, netmask, gw: ptr Ip4Addr): int8 {.exportc, cdecl.} =
-    if netif == nil: return -1
-    if ipaddr != nil: storeU32(cast[pointer](netif), NetifIpOff, loadU32(cast[pointer](ipaddr), 0))
-    if netmask != nil: storeU32(cast[pointer](netif), NetifNetmaskOff, loadU32(cast[pointer](netmask), 0))
-    if gw != nil: storeU32(cast[pointer](netif), NetifGwOff, loadU32(cast[pointer](gw), 0))
-    0
-  proc netif_set_default*(netif: ptr Netif) {.exportc, cdecl.} = discard netif
+    when defined(bl808WifiRealLwip):
+      proc realNetifSetAddr(netif: ptr Netif; ipaddr, netmask, gw: ptr Ip4Addr)
+        {.importc: "netif_set_addr", header: "<lwip/netif.h>".}
+      if netif == nil: return -1
+      realNetifSetAddr(netif, ipaddr, netmask, gw)
+      0
+    else:
+      if netif == nil: return -1
+      if ipaddr != nil: storeU32(cast[pointer](netif), NetifIpOff, loadU32(cast[pointer](ipaddr), 0))
+      if netmask != nil: storeU32(cast[pointer](netif), NetifNetmaskOff, loadU32(cast[pointer](netmask), 0))
+      if gw != nil: storeU32(cast[pointer](netif), NetifGwOff, loadU32(cast[pointer](gw), 0))
+      0
+  when defined(bl808WifiRealLwip):
+    proc netif_set_default*(netif: ptr Netif) {.importc: "netif_set_default", header: "<lwip/netif.h>".}
+  else:
+    proc netif_set_default*(netif: ptr Netif) {.exportc, cdecl.} = discard netif
   proc netifapi_netif_set_default*(netif: ptr Netif) {.exportc, cdecl.} = netif_set_default(netif)
-  proc netif_set_up*(netif: ptr Netif) {.exportc, cdecl.} =
-    if netif != nil: storeU8(cast[pointer](netif), NetifFlagsOff, loadU8(cast[pointer](netif), NetifFlagsOff) or NetifFlagUp)
+  when defined(bl808WifiRealLwip):
+    proc netif_set_up*(netif: ptr Netif) {.importc: "netif_set_up", header: "<lwip/netif.h>".}
+  else:
+    proc netif_set_up*(netif: ptr Netif) {.exportc, cdecl.} =
+      if netif != nil: storeU8(cast[pointer](netif), NetifFlagsOff, loadU8(cast[pointer](netif), NetifFlagsOff) or NetifFlagUp)
   proc netifapi_netif_set_up*(netif: ptr Netif) {.exportc, cdecl.} = netif_set_up(netif)
-  proc netif_set_link_up*(netif: ptr Netif) {.exportc, cdecl.} =
-    if netif != nil: storeU8(cast[pointer](netif), NetifFlagsOff, loadU8(cast[pointer](netif), NetifFlagsOff) or NetifFlagLinkUp)
-  proc netif_set_link_down*(netif: ptr Netif) {.exportc, cdecl.} =
-    if netif != nil: storeU8(cast[pointer](netif), NetifFlagsOff, loadU8(cast[pointer](netif), NetifFlagsOff) and not NetifFlagLinkUp)
+  when defined(bl808WifiRealLwip):
+    proc netif_set_link_up*(netif: ptr Netif) {.importc: "netif_set_link_up", header: "<lwip/netif.h>".}
+    proc netif_set_link_down*(netif: ptr Netif) {.importc: "netif_set_link_down", header: "<lwip/netif.h>".}
+  else:
+    proc netif_set_link_up*(netif: ptr Netif) {.exportc, cdecl.} =
+      if netif != nil: storeU8(cast[pointer](netif), NetifFlagsOff, loadU8(cast[pointer](netif), NetifFlagsOff) or NetifFlagLinkUp)
+    proc netif_set_link_down*(netif: ptr Netif) {.exportc, cdecl.} =
+      if netif != nil: storeU8(cast[pointer](netif), NetifFlagsOff, loadU8(cast[pointer](netif), NetifFlagsOff) and not NetifFlagLinkUp)
   proc netifapi_netif_set_link_up*(netif: ptr Netif) {.exportc, cdecl.} = netif_set_link_up(netif)
   proc netifapi_netif_set_link_down*(netif: ptr Netif) {.exportc, cdecl.} = netif_set_link_down(netif)
-  proc netif_set_status_callback*(netif: ptr Netif; cb: NetifVoidFn) {.exportc, cdecl.} =
-    if netif != nil: storePtr(cast[pointer](netif), NetifStatusCbOff, cast[pointer](cb))
+  when defined(bl808WifiRealLwip):
+    proc netif_set_status_callback*(netif: ptr Netif; cb: NetifVoidFn)
+      {.importc: "netif_set_status_callback", header: "<lwip/netif.h>".}
+  else:
+    proc netif_set_status_callback*(netif: ptr Netif; cb: NetifVoidFn) {.exportc, cdecl.} =
+      if netif != nil: storePtr(cast[pointer](netif), NetifStatusCbOff, cast[pointer](cb))
   proc tcpip_input*(p: ptr Pbuf; inp: ptr Netif): int8 {.exportc, cdecl.} =
-    discard inp
-    discard pbuf_free(p)
-    0
-  proc etharp_output*(netif: ptr Netif; q: ptr Pbuf; ipaddr: ptr Ip4Addr): int8 {.exportc, cdecl.} =
-    discard netif; discard q; discard ipaddr; 0
-  {.emit: """
+    when defined(bl808WifiRealLwip):
+      proc realEthernetInput(p: ptr Pbuf; inp: ptr Netif): int8
+        {.importc: "ethernet_input", header: "<netif/ethernet.h>", cdecl.}
+      realEthernetInput(p, inp)
+    else:
+      discard inp
+      discard pbuf_free(p)
+      0
+  when defined(bl808WifiRealLwip):
+    proc etharp_output*(netif: ptr Netif; q: ptr Pbuf; ipaddr: ptr Ip4Addr): int8
+      {.importc: "etharp_output", header: "<lwip/etharp.h>", cdecl.}
+  else:
+    proc etharp_output*(netif: ptr Netif; q: ptr Pbuf; ipaddr: ptr Ip4Addr): int8 {.exportc, cdecl.} =
+      discard netif; discard q; discard ipaddr; 0
+  when not defined(bl808WifiRealLwip):
+    {.emit: """
 #include <lwip/ip4_addr.h>
 u32_t ipaddr_addr(const char *cp) { (void)cp; return 0; }
 char *ip4addr_ntoa(const ip4_addr_t *addr) { (void)addr; return "0.0.0.0"; }
 unsigned long inet_addr(const char *cp) { return ipaddr_addr(cp); }
 """.}
 
-  proc pbuf_alloc*(layer: PbufLayer; length: uint16; ptype: PbufType): ptr Pbuf {.exportc, cdecl.} =
-    discard layer; discard ptype
-    let mem = c_calloc(1, PbufSize.csize_t + length.csize_t)
-    if mem == nil: return nil
-    storePtr(mem, PbufPayloadOff, ptrAt(mem, PbufSize))
-    storeU16(mem, PbufLenOff, length)
-    storeU16(mem, PbufTotLenOff, length)
-    storeU16(mem, PbufRefOff, 1)
-    cast[ptr Pbuf](mem)
-  proc pbuf_alloced_custom*(layer: PbufLayer; length: uint16; ptype: PbufType; p: ptr PbufCustom;
-                            payloadMem: pointer; payloadMemLen: uint16): ptr Pbuf {.exportc, cdecl.} =
-    discard layer; discard ptype; discard payloadMemLen
-    if p == nil: return nil
-    zero(cast[pointer](p), PbufSize)
-    storePtr(cast[pointer](p), PbufPayloadOff, payloadMem)
-    storeU16(cast[pointer](p), PbufLenOff, length)
-    storeU16(cast[pointer](p), PbufTotLenOff, length)
-    storeU16(cast[pointer](p), PbufRefOff, 1)
-    cast[ptr Pbuf](p)
-  proc pbuf_free*(p: ptr Pbuf): uint8 {.exportc, cdecl.} =
-    var cur = cast[pointer](p)
-    while cur != nil:
-      let next = loadPtr(cur, PbufNextOff)
-      if (loadU8(cur, PbufFlagsOff) and PbufFlagIsCustom) != 0:
-        let fn = cast[PbufFreeFn](loadPtr(cur, PbufCustomFreeOff))
-        if fn != nil: fn(cast[ptr Pbuf](cur))
-      else:
-        c_free(cur)
-      cur = next
-    1
-  proc pbuf_ref*(p: ptr Pbuf) {.exportc, cdecl.} =
-    if p != nil: storeU16(cast[pointer](p), PbufRefOff, loadU16(cast[pointer](p), PbufRefOff) + 1)
-  proc pbufTakeImpl(buf: ptr Pbuf; dataptr: pointer; length: uint16): int8 {.exportc: "bl808_nim_pbuf_take_impl", cdecl.} =
-    if buf == nil or dataptr == nil or loadPtr(cast[pointer](buf), PbufPayloadOff) == nil or length > loadU16(cast[pointer](buf), PbufLenOff):
-      return -1
-    copyMem(loadPtr(cast[pointer](buf), PbufPayloadOff), dataptr, length.uint)
-    0
-  {.emit: """
+  when not defined(bl808WifiRealLwip):
+    proc pbuf_alloc*(layer: PbufLayer; length: uint16; ptype: PbufType): ptr Pbuf {.exportc, cdecl.} =
+      discard layer; discard ptype
+      let mem = c_calloc(1, PbufSize.csize_t + PbufDefaultHeadroom.csize_t + length.csize_t)
+      if mem == nil: return nil
+      storePtr(mem, PbufPayloadOff, ptrAt(mem, PbufSize + PbufDefaultHeadroom))
+      storeU16(mem, PbufLenOff, length)
+      storeU16(mem, PbufTotLenOff, length)
+      storeU16(mem, PbufRefOff, 1)
+      cast[ptr Pbuf](mem)
+    proc pbuf_alloced_custom*(layer: PbufLayer; length: uint16; ptype: PbufType; p: ptr PbufCustom;
+                              payloadMem: pointer; payloadMemLen: uint16): ptr Pbuf {.exportc, cdecl.} =
+      discard layer; discard ptype; discard payloadMemLen
+      if p == nil: return nil
+      zero(cast[pointer](p), PbufSize)
+      storePtr(cast[pointer](p), PbufPayloadOff, payloadMem)
+      storeU16(cast[pointer](p), PbufLenOff, length)
+      storeU16(cast[pointer](p), PbufTotLenOff, length)
+      storeU16(cast[pointer](p), PbufRefOff, 1)
+      cast[ptr Pbuf](p)
+    proc pbuf_free*(p: ptr Pbuf): uint8 {.exportc, cdecl.} =
+      var cur = cast[pointer](p)
+      while cur != nil:
+        let next = loadPtr(cur, PbufNextOff)
+        let refCount = loadU16(cur, PbufRefOff)
+        if refCount > 1'u16:
+          storeU16(cur, PbufRefOff, refCount - 1'u16)
+          return 0
+        if (loadU8(cur, PbufFlagsOff) and PbufFlagIsCustom) != 0:
+          let fn = cast[PbufFreeFn](loadPtr(cur, PbufCustomFreeOff))
+          if fn != nil: fn(cast[ptr Pbuf](cur))
+        else:
+          c_free(cur)
+        cur = next
+      1
+    proc pbuf_ref*(p: ptr Pbuf) {.exportc, cdecl.} =
+      if p != nil: storeU16(cast[pointer](p), PbufRefOff, loadU16(cast[pointer](p), PbufRefOff) + 1)
+    proc pbufTakeAtImpl(buf: ptr Pbuf; dataptr: pointer; length, offset: uint16): int8 {.exportc: "bl808_nim_pbuf_take_at_impl", cdecl.} =
+      if buf == nil or dataptr == nil or loadPtr(cast[pointer](buf), PbufPayloadOff) == nil:
+        return -1
+      if offset.uint32 + length.uint32 > loadU16(cast[pointer](buf), PbufLenOff).uint32:
+        return -1
+      copyMem(ptrAt(loadPtr(cast[pointer](buf), PbufPayloadOff), offset.uint), dataptr, length.uint)
+      0
+    proc pbufTakeImpl(buf: ptr Pbuf; dataptr: pointer; length: uint16): int8 {.exportc: "bl808_nim_pbuf_take_impl", cdecl.} =
+      pbufTakeAtImpl(buf, dataptr, length, 0'u16)
+    {.emit: """
 #include <lwip/pbuf.h>
 err_t pbuf_take(struct pbuf *buf, const void *dataptr, u16_t len) {
   return bl808_nim_pbuf_take_impl(buf, (void *)dataptr, len);
 }
+err_t pbuf_take_at(struct pbuf *buf, const void *dataptr, u16_t len, u16_t offset) {
+  return bl808_nim_pbuf_take_at_impl(buf, (void *)dataptr, len, offset);
+}
 """.}
-  proc pbuf_cat*(head, tail: ptr Pbuf) {.exportc, cdecl.} =
-    if head == nil: return
-    var p = cast[pointer](head)
-    while loadPtr(p, PbufNextOff) != nil: p = loadPtr(p, PbufNextOff)
-    storePtr(p, PbufNextOff, cast[pointer](tail))
-    if tail != nil:
-      storeU16(cast[pointer](head), PbufTotLenOff, loadU16(cast[pointer](head), PbufTotLenOff) + loadU16(cast[pointer](tail), PbufTotLenOff))
-  proc pbuf_header*(p: ptr Pbuf; inc: int16): uint8 {.exportc, cdecl.} =
-    if p == nil: return 1
-    let raw = cast[pointer](p)
-    let payload = cast[uint](loadPtr(raw, PbufPayloadOff))
-    let nextPayload =
-      if inc >= 0:
-        cast[pointer](payload - inc.uint)
-      else:
-        cast[pointer](payload + uint(-inc))
-    storePtr(raw, PbufPayloadOff, nextPayload)
-    storeU16(raw, PbufLenOff, uint16(loadU16(raw, PbufLenOff).int + inc.int))
-    storeU16(raw, PbufTotLenOff, uint16(loadU16(raw, PbufTotLenOff).int + inc.int))
-    0
+    proc pbuf_cat*(head, tail: ptr Pbuf) {.exportc, cdecl.} =
+      if head == nil: return
+      var p = cast[pointer](head)
+      while loadPtr(p, PbufNextOff) != nil: p = loadPtr(p, PbufNextOff)
+      storePtr(p, PbufNextOff, cast[pointer](tail))
+      if tail != nil:
+        storeU16(cast[pointer](head), PbufTotLenOff, loadU16(cast[pointer](head), PbufTotLenOff) + loadU16(cast[pointer](tail), PbufTotLenOff))
+    proc pbuf_header*(p: ptr Pbuf; inc: int16): uint8 {.exportc, cdecl.} =
+      if p == nil: return 1
+      let raw = cast[pointer](p)
+      let payload = cast[uint](loadPtr(raw, PbufPayloadOff))
+      if inc > 0 and (loadU8(raw, PbufFlagsOff) and PbufFlagIsCustom) == 0:
+        let pbufStart = cast[uint](raw) + PbufSize.uint
+        if payload < pbufStart + inc.uint:
+          return 1
+      let nextPayload =
+        if inc >= 0:
+          cast[pointer](payload - inc.uint)
+        else:
+          cast[pointer](payload + uint(-inc))
+      if inc < 0 and loadU16(raw, PbufLenOff).int < -inc.int:
+        return 1
+      storePtr(raw, PbufPayloadOff, nextPayload)
+      storeU16(raw, PbufLenOff, uint16(loadU16(raw, PbufLenOff).int + inc.int))
+      storeU16(raw, PbufTotLenOff, uint16(loadU16(raw, PbufTotLenOff).int + inc.int))
+      0
 
   proc aos_post_event*(`type`: uint16; code: uint16; value: culong): cint {.exportc, cdecl.} = discard `type`; discard code; discard value; 0
   proc aos_register_event_filter*(`type`: uint16; cb, privateData: pointer): cint {.exportc, cdecl.} = discard `type`; discard cb; discard privateData; 0
@@ -1515,11 +1667,16 @@ err_t pbuf_take(struct pbuf *buf, const void *dataptr, u16_t len) {
     storeI32(iface, WifiIfaceModeOff, 0)
     discard bl_wifi_mac_addr_get(addr mac[0])
     copyMem(ptrAt(iface, WifiIfaceMacOff), addr mac[0], 6)
-    copyMem(ptrAt(nif, NetifHwaddrOff), addr mac[0], 6)
+    when not defined(bl808WifiRealLwip):
+      copyMem(ptrAt(nif, NetifHwaddrOff), addr mac[0], 6)
     discard netifapi_netif_add(cast[ptr Netif](nif), cast[ptr Ip4Addr](addr zeroIp), cast[ptr Ip4Addr](addr zeroIp), cast[ptr Ip4Addr](addr zeroIp),
                                nil, bl606a0_wifi_netif_init, tcpip_input)
-    storeU8(nif, NetifNameOff, 's'.uint8)
-    storeU8(nif, NetifNameOff + 1, 't'.uint8)
+    when defined(bl808WifiRealLwip):
+      copyMem(netifHwaddr(nif), addr mac[0], 6)
+      realNetifSetName(cast[ptr Netif](nif), 's', 't')
+    else:
+      storeU8(nif, NetifNameOff, 's'.uint8)
+      storeU8(nif, NetifNameOff + 1, 't'.uint8)
     netif_set_default(cast[ptr Netif](nif))
     netif_set_up(cast[ptr Netif](nif))
     var addIfCfm: array[MmAddIfCfmSize.int, uint8]
