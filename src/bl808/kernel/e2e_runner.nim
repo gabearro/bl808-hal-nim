@@ -15,6 +15,7 @@ proc e2eRun*(
   totalAttempts: int,
   runOne: proc (): bool {.nimcall.},
   deinitForRetry: proc () {.nimcall.} = nil,
+  stopAfterSuccess = false,
 ) =
   ## Run the test body `totalAttempts` times. `runOne` returns true on success.
   ## Emits attempt:start before each attempt and attempt:ok|fail after.
@@ -27,6 +28,8 @@ proc e2eRun*(
       phaseMark(Phase.attempt, Kind.ok):
         kvWrite("n", i.uint32)
         kvWrite("total", totalAttempts.uint32)
+      if stopAfterSuccess:
+        break
     else:
       phaseMark(Phase.attempt, Kind.fail):
         kvWrite("n", i.uint32)

@@ -117,6 +117,81 @@ def test_nim_wifi_connect_snapshot_captures_rf70_rf88_rfd0_trace_state():
         assert command in snapshot
 
 
+def test_nim_wifi_cold_scan_validation_exercises_cold_rf_init_path():
+    test = _tests_by_name()["m0_wifi_nimfw_cold_scan_hal_test"]
+    assert "experimental" in test.get("tiers", [])
+
+    defines = _all_defines(test)
+    assert defines.get("bl808WifiNimFw") == "1"
+    assert defines.get("bl808WifiUseBl808Rf") == "1"
+    assert defines.get("bl808WifiRfColdInit") == "1"
+    assert defines.get("WifiScanOnly") == "1"
+
+    snapshot = test.get("jtag_snapshot", [])
+    for command in (
+        "mdw {sym:nimfw_dbg_rf_phase} 1",
+        "mdw {sym:nimfw_dbg_rf_restore} 1",
+        "mdw {sym:nimfw_dbg_rf_api_mode} 1",
+        "mdw {sym:nimfw_dbg_phy_init_count} 1",
+        "mdw {sym:nimfw_dbg_phy_init_phase} 1",
+        "mdw {sym:nimfw_dbg_phy_modem_version} 1",
+        "mdw {sym:nimfw_dbg_phy_clock_count} 1",
+        "mdw {sym:nimfw_dbg_phy_agc_copy_count} 1",
+        "mdw {sym:nimfw_dbg_phy_agc_source_first} 1",
+        "mdw {sym:nimfw_dbg_phy_agc_source_last} 1",
+        "mdw {sym:nimfw_dbg_phy_agc_dest_first} 1",
+        "mdw {sym:nimfw_dbg_phy_agc_dest_last} 1",
+        "mdw {sym:nimfw_dbg_phy_wifi_ldpc_absent} 1",
+        "mdw {sym:nim_wifi_rf_fixed_val_count} 1",
+        "mdw {sym:nim_wifi_rf_fixed_val_device} 1",
+        "mdw {sym:nim_wifi_rf_fixed_val_branch} 1",
+        "mdw {sym:nim_wifi_rf_fixed_val_rf70} 1",
+        "mdw {sym:nim_wifi_rf_fixed_val_rf88} 1",
+        "mdw {sym:nim_wifi_rf_fixed_val_rfd0} 1",
+        "mdw {sym:nim_wifi_rf_fixed_val_rf814} 1",
+        "mdw {sym:nim_wifi_rf_fixed_val_rfa0} 1",
+        "mdw {sym:nim_wifi_rf_rf70_replay_apply_count} 1",
+        "mdw {sym:nim_wifi_rf_rf70_replay_reason} 1",
+        "mdw {sym:nim_wifi_rf_rf70_replay_reg_before} 1",
+        "mdw {sym:nim_wifi_rf_rf70_replay_reg_after} 1",
+        "mdw {sym:nim_wifi_rf_rf70_replay_cal_word3_before} 1",
+        "mdw {sym:nim_wifi_rf_rf70_replay_cal_word4_before} 1",
+        "mdw {sym:nim_wifi_rf_rf70_replay_cal_word3_after} 1",
+        "mdw {sym:nim_wifi_rf_rf70_replay_cal_word4_after} 1",
+        "mdw {sym:nim_wifi_rf_rf70_txcal_window_mask} 1",
+        "mdw {sym:nim_wifi_rf_rf70_txcal_window0_nibble} 1",
+        "mdw {sym:nim_wifi_rf_rf70_txcal_window1_nibble} 1",
+        "mdw {sym:nim_wifi_rf_rf70_txcal_window2_nibble} 1",
+        "mdw {sym:nim_wifi_rf_rf70_txcal_search_count} 1",
+        "mdw {sym:nim_wifi_rf_rf70_txcal_search_ok_mask} 1",
+        "mdw {sym:nim_wifi_rf_rf70_txcal_search_best_nibble} 3",
+        "mdw {sym:nim_wifi_rf_rf70_txcal_search_runner_nibble} 3",
+        "mdw {sym:nim_wifi_rf_rf70_txcal_search_best_sample} 3",
+        "mdw {sym:nim_wifi_rf_rf70_txcal_search_runner_sample} 3",
+        "mdw {sym:nim_wifi_rf_rf70_txcal_search_ctrl} 3",
+        "mdw {sym:nim_wifi_rf_rf70_txcal_search_mode} 3",
+        "mdw {sym:nim_wifi_rf_rf70_txcal_search_i_raw} 3",
+        "mdw {sym:nim_wifi_rf_rf70_txcal_candidate_ok_mask} 3",
+        "mdw {sym:nim_wifi_rf_rf70_txcal_candidate_sample} 48",
+        "mdw {sym:nim_wifi_rf_pre_rf70_txcal_amp} 1",
+        "mdw {sym:nim_wifi_rf_pre_rf70_txcal_amp_mean} 1",
+        "mdw {sym:nim_wifi_rf_pre_rf70_rf70} 1",
+        "mdw {sym:nim_wifi_rf_pre_rf70_rf6c} 1",
+        "mdw {sym:nim_wifi_rf_pre_rf70_rf120c} 1",
+        "mdw {sym:nim_wifi_rf_pre_rf70_rf1214} 1",
+        "mdw {sym:nim_wifi_rf_pre_rf70_rf1218} 1",
+        "mdw {sym:nim_wifi_rf_pre_rf70_rf1618} 1",
+        "mdw {sym:nim_wifi_rf_pre_rf70_rf161c} 1",
+        "mdw {sym:nim_wifi_rf_stage_rf70_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rf88_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rfd0_log} 8",
+        "mdw 0x20001070 1",
+        "mdw 0x20001088 1",
+        "mdw 0x200010D0 1",
+    ):
+        assert command in snapshot
+
+
 def test_pure_nim_central_scan_validation_is_not_vendor_assisted():
     test = _tests_by_name()["m0_ble_nim_controller_pure_scan_hal_test"]
     assert "full" in test.get("tiers", [])
@@ -265,7 +340,7 @@ def test_mixed_ble_wifi_jtag_flash_keeps_runtime_jtag():
         assert test.get("jtag_flash_runtime_jtag") is True
 
 
-def test_wifi_lwip_smoke_requires_dhcp_and_public_icmp_success():
+def test_wifi_lwip_smoke_requires_dhcp_local_icmp_and_public_icmp_diagnostics():
     test = _tests_by_name()["m0_wifi_lwip_smoke"]
     defines = _all_defines(test)
     required = test.get("required", [])
@@ -290,6 +365,13 @@ def test_wifi_lwip_smoke_requires_dhcp_and_public_icmp_success():
         "mdw {sym:nimfw_dbg_dhcp_tx_break_hits} 1",
         "mdw {sym:nimfw_dbg_dhcp_request_tx_break_hits} 1",
         "mdw {sym:nimfw_dbg_dhcp_tx_msg_hist} 8",
+        "mdw {sym:nimfw_dbg_icmp_tx_target} 1",
+        "mdw {sym:nimfw_dbg_icmp_tx_rc} 1",
+        "mdw {sym:nimfw_dbg_icmp_tcpip_ok_before} 1",
+        "mdw {sym:nimfw_dbg_icmp_tcpip_ok_after} 1",
+        "mdw {sym:nimfw_dbg_icmp_cb_count} 1",
+        "mdw {sym:nimfw_dbg_icmp_cb_ip0} 1",
+        "mdw {sym:nimfw_dbg_icmp_cb_reject} 1",
         "mdw {sym:nimfw_dbg_dhcp_udp_csum_repair} 1",
         "mdw {sym:nimfw_dbg_dhcp_udp_csum_vafter} 1",
         "mdw {sym:nimfw_dbg_dhcp_req_udp_csum_at_copy} 1",

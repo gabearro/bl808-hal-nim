@@ -44,6 +44,18 @@
 #define LWIP_UDP                       1
 #define LWIP_DHCP                      1
 
+/*
+ * Keep DHCP replies broadcast until the netif has an address. The Nim WiFi RX
+ * path is still being brought up; requesting broadcast ACKs avoids depending on
+ * pre-bind unicast delivery to the offered address.
+ */
+#define LWIP_HOOK_DHCP_APPEND_OPTIONS(netif, dhcp, state, msg, msg_type, options_len_ptr) \
+  do { \
+    if ((msg_type) == DHCP_DISCOVER || (msg_type) == DHCP_REQUEST) { \
+      (msg)->flags = PP_HTONS(0x8000U); \
+    } \
+  } while (0)
+
 #define LWIP_TCP                       0
 #define LWIP_DNS                       0
 #define LWIP_NETCONN                   0

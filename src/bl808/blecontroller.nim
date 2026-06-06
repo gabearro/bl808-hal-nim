@@ -224,20 +224,20 @@ when defined(bl808m0) and
     BtbleRfTableView {.packed.} = object
       reset*: pointer
       forceAgcEnable*: pointer
-      reserved08*: pointer
-      reserved0C*: pointer
+      unusedCallback08*: pointer
+      unusedCallback0c*: pointer
       txpwrMaxSet*: pointer
       txpwrMaxGet*: pointer
-      reserved18*: pointer
+      unusedCallback18*: pointer
       txpwrDbmGet*: pointer
       txpwrCsGet*: pointer
       rssiConvert*: pointer
-      reserved28*: pointer
+      unusedCallback28*: pointer
       regRead*: pointer
       regWrite*: pointer
       sleep*: pointer
       emConfigWord*: uint16
-      reserved3A*: array[3, uint8]
+      emConfigPadding3a*: array[3, uint8]
       rssiFloorDbm*: int8
       calibrationWord*: uint16
 
@@ -263,13 +263,13 @@ when defined(bl808m0) and
 
     BlePhyCtrlRegs {.packed.} = object
       reserved00*: array[0x08, uint8]
-      phyCtrl08*: uint32
+      resetInitCtrl08*: uint32
       reserved0c*: array[0x80, uint8]
-      phyCtrl8c*: uint32
+      resetTuningCtrl8c*: uint32
 
     BlePhyAgcRegs {.packed.} = object
       reserved00*: array[0x84, uint8]
-      agcCtrl84*: uint32
+      resetAgcConfig84*: uint32
 
   const
     BtbleRfEmConfigWord = 0x2000'u16
@@ -277,17 +277,20 @@ when defined(bl808m0) and
     BtbleRfCalibrationWord = 0xBAC4'u16
 
   static:
-    doAssert offsetof(BtbleRfTableView, reserved08) == 0x08
-    doAssert offsetof(BtbleRfTableView, reserved0C) == 0x0C
+    doAssert offsetof(BtbleRfTableView, unusedCallback08) == 0x08
+    doAssert offsetof(BtbleRfTableView, unusedCallback0c) == 0x0C
     doAssert offsetof(BtbleRfTableView, txpwrMaxSet) == 0x10
     doAssert offsetof(BtbleRfTableView, txpwrMaxGet) == 0x14
+    doAssert offsetof(BtbleRfTableView, unusedCallback18) == 0x18
     doAssert offsetof(BtbleRfTableView, txpwrDbmGet) == 0x1C
     doAssert offsetof(BtbleRfTableView, txpwrCsGet) == 0x20
     doAssert offsetof(BtbleRfTableView, rssiConvert) == 0x24
+    doAssert offsetof(BtbleRfTableView, unusedCallback28) == 0x28
     doAssert offsetof(BtbleRfTableView, regRead) == 0x2C
     doAssert offsetof(BtbleRfTableView, regWrite) == 0x30
     doAssert offsetof(BtbleRfTableView, sleep) == 0x34
     doAssert offsetof(BtbleRfTableView, emConfigWord) == 0x38
+    doAssert offsetof(BtbleRfTableView, emConfigPadding3a) == 0x3A
     doAssert offsetof(BtbleRfTableView, rssiFloorDbm) == 0x3D
     doAssert offsetof(BtbleRfTableView, calibrationWord) == 0x3E
     doAssert offsetof(BleMacPhyRegs, sleepCtrl) == 0x30
@@ -296,9 +299,9 @@ when defined(bl808m0) and
     doAssert offsetof(BleMacPhyRegs, settle980) == 0x980
     doAssert offsetof(BleMacPhyRegs, settle98c) == 0x98C
     doAssert offsetof(BleMacPhyRegs, trim9c0) == 0x9C0
-    doAssert offsetof(BlePhyCtrlRegs, phyCtrl08) == 0x08
-    doAssert offsetof(BlePhyCtrlRegs, phyCtrl8c) == 0x8C
-    doAssert offsetof(BlePhyAgcRegs, agcCtrl84) == 0x84
+    doAssert offsetof(BlePhyCtrlRegs, resetInitCtrl08) == 0x08
+    doAssert offsetof(BlePhyCtrlRegs, resetTuningCtrl8c) == 0x8C
+    doAssert offsetof(BlePhyAgcRegs, resetAgcConfig84) == 0x84
 
   var g_ble_max_txpower_dbm: int8
 
@@ -375,9 +378,9 @@ when defined(bl808m0) and
     regUpdateField(addr mac.reset898, 0xFF00FFFF'u32, 0x00870000'u32)
     regUpdateField(addr mac.reset89c, 0xFF80FFFF'u32, 0x00280000'u32)
     regStore(addr mac.trim9c0, regLoad(addr mac.trim9c0) or 0x00004000'u32)
-    regStore(addr agc.agcCtrl84, 0x1208102B'u32)
-    regUpdateField(addr phy.phyCtrl8c, 0xFF803FFF'u32, 0x00014000'u32)
-    regStore(addr phy.phyCtrl08, 0x0842001A'u32)
+    regStore(addr agc.resetAgcConfig84, 0x1208102B'u32)
+    regUpdateField(addr phy.resetTuningCtrl8c, 0xFF803FFF'u32, 0x00014000'u32)
+    regStore(addr phy.resetInitCtrl08, 0x0842001A'u32)
     regStore(addr mac.settle980, 0x02120013'u32)
     regStore(addr mac.settle984, 0x02120013'u32)
     regStore(addr mac.settle988, 0x02120013'u32)
@@ -392,20 +395,20 @@ when defined(bl808m0) and
     let table = cast[ptr BtbleRfTableView](rf)
     table.reset = cast[pointer](nimRfReset)
     table.forceAgcEnable = cast[pointer](nimRfForceAgcEnable)
-    table.reserved08 = nil
-    table.reserved0C = nil
+    table.unusedCallback08 = nil
+    table.unusedCallback0c = nil
     table.txpwrMaxSet = cast[pointer](nimBleRfTxpowerMaxSet)
     table.txpwrMaxGet = cast[pointer](nimBleRfTxpowerMaxGet)
-    table.reserved18 = nil
+    table.unusedCallback18 = nil
     table.txpwrDbmGet = cast[pointer](nimRfTxpwrDbmGet)
     table.txpwrCsGet = cast[pointer](nimRfTxpwrCsGet)
     table.rssiConvert = cast[pointer](nimRfRssiConvert)
-    table.reserved28 = nil
+    table.unusedCallback28 = nil
     table.regRead = cast[pointer](nimRfRegRead)
     table.regWrite = cast[pointer](nimRfRegWrite)
     table.sleep = cast[pointer](nimRfSleep)
     table.emConfigWord = BtbleRfEmConfigWord
-    table.reserved3A = [0'u8, 0, 0]
+    table.emConfigPadding3a = [0'u8, 0, 0]
     table.rssiFloorDbm = BtbleRfRssiFloorDbm
     table.calibrationWord = BtbleRfCalibrationWord
     g_ble_max_txpower_dbm = 15'i8
@@ -959,7 +962,79 @@ type
     keepMask: uint32
     setMask: uint32
 
+  BleRfRegBlock {.packed.} = object
+    baseCtrl0: uint32
+    baseCtrl1: uint32
+    reserved008: array[5, uint32]
+    calCtrl1c: uint32
+    capability20: uint32
+    reserved024: array[2, uint32]
+    synthCtrl2c: uint32
+    priModeCtrl30: uint32
+    reserved034: array[5, uint32]
+    rccalTone48: uint32
+    reserved04c: array[3, uint32]
+    txcalBias58: uint32
+    reserved05c: array[2, uint32]
+    txcalGain64: uint32
+    txcalGain68: uint32
+    txcalDc6c: uint32
+    txcalParam70: uint32
+    reserved074: array[3, uint32]
+    rbbRccalCtrl80: uint32
+    rccalReplay84: uint32
+    txcalDfe88: uint32
+    calPathConfig8c: uint32
+    reserved090: array[4, uint32]
+    fcalCtrlA0: uint32
+    acalCtrlA4: uint32
+    calResultA8: uint32
+    fcalAc: uint32
+    channelCalStrobeB0: uint32
+    channelCalStatusB4: uint32
+    txcalCtrlB8: uint32
+    channelFcalConfigBc: uint32
+    sdmCtrlC0: uint32
+    sdmDivC4: uint32
+    reserved0c8: uint32
+    rfPriBiasTrimCc: uint32
+    optimizeCtrlD0: uint32
+    rfBiasTrimD4: uint32
+    reserved0d8: array[6, uint32]
+    calMixerStateF0: uint32
+    reserved0f4: array[18, uint32]
+    vcoPairTable13c: array[10, uint32]
+    vcoPair2484Mhz164: uint32
+    roscalCal0: uint32
+    roscalCal1: uint32
+    reserved170: array[39, uint32]
+    calSingenCtrl20c: uint32
+    reserved210: uint32
+    calSingenAmpLo214: uint32
+    calSingenAmpHi218: uint32
+    reserved21c: uint32
+    rxMode220: uint32
+    reserved224: array[6, uint32]
+    calDfeGate23c: uint32
+    calDfeState240: uint32
+    calDfeState244: uint32
+    reserved248: array[238, uint32]
+    txcalTosdac600: uint32
+    reserved604: array[2, uint32]
+    calMeasurePrep60c: uint32
+    reserved610: array[2, uint32]
+    measureCtrl618: uint32
+    measureMode61c: uint32
+    measureI620: uint32
+    measureQ624: uint32
+
+  BleRfDfeInitBlock {.packed.} = object
+    reserved000: array[12, uint32]
+    hbnCtrl30: uint32
+
 const
+  BleRfBase = 0x20001000'u
+  BleRfDfeInitBase = 0x2000F000'u
   BleRfDefaultChannelMhz = 2402'u16
   BleRfCtrlReg = 0x20001004'u32
   BleRfSynthCtrlReg = 0x2000102C'u32
@@ -983,6 +1058,7 @@ const
   BleRfTxcalCtrlReg = 0x200010B8'u32
   BleRfRoscalCtrlReg = 0x2000107C'u32
   BleRfRbbRccalReg = 0x20001080'u32
+  BleRfRccalReplayReg = 0x20001084'u32
   BleRfRoscalReg0 = 0x20001168'u32
   BleRfRoscalReg1 = 0x2000116C'u32
   BleRfMeasureCtrlReg = 0x20001618'u32
@@ -994,26 +1070,31 @@ const
   BleRfPriRccalSingenReg0 = 0x2000120C'u32
   BleRfPriRccalSingenReg1 = 0x20001214'u32
   BleRfPriRccalSingenReg2 = 0x20001218'u32
+  BleRfPriCalDfeGateReg = 0x2000123C'u32
+  BleRfPriCalDfeState0Reg = 0x20001240'u32
+  BleRfPriCalDfeState1Reg = 0x20001244'u32
   BleRfPriRccalMeasurePrepReg = 0x2000160C'u32
   BleRfPriRccalToneReg = 0x20001048'u32
-  BleRfPriInitPllReg = 0x20000830'u32
-  BleRfPriInitHbnReg = 0x2000F030'u32
-  BleRfPriInitDfeReg = 0x2000F820'u32
-  BleRfPriInitF884Reg = 0x2000F884'u32
-  BleRfPriInit58Reg = 0x20001058'u32
-  BleRfPriInitD4Reg = 0x200010D4'u32
-  BleRfPriInit64Reg = 0x20001064'u32
-  BleRfPriInit68Reg = 0x20001068'u32
+  BleRfPllEnableReg = 0x20000830'u32
+  BleRfDfeHbnCtrlReg = 0x2000F030'u32
+  BleRfDfeStaticCtrlReg = 0x2000F820'u32
+  BleRfDfeFixedDefault884Reg = 0x2000F884'u32
+  BleRfTxcalBiasReg = 0x20001058'u32
+  BleRfBiasTrimD4Reg = 0x200010D4'u32
+  BleRfTxcalGain64Reg = 0x20001064'u32
+  BleRfTxcalGain68Reg = 0x20001068'u32
   BleRfPriTxcalDfeReg = 0x20001088'u32
-  BleRfPriInit8cReg = 0x2000108C'u32
+  BleRfCalPathConfigReg = 0x2000108C'u32
   BleRfPriTxcalDcReg = 0x2000106C'u32
-  BleRfPriInit90Reg = 0x20001090'u32
-  BleRfPriInit128Reg = 0x20001128'u32
-  BleRfPriInit12cReg = 0x2000112C'u32
-  BleRfPriInit130Reg = 0x20001130'u32
-  BleRfPriInit138Reg = 0x20001138'u32
-  BleRfPriInit1618Reg = 0x20001618'u32
-  BleRfPriInit163cReg = 0x2000163C'u32
+  BleRfCalPathCtrlReg = 0x20001090'u32
+  BleRfPriBiasTrimReg = 0x200010CC'u32
+  BleRfPriCalMixerStateReg = 0x200010F0'u32
+  BleRfTxcalDefaultProfile128Reg = 0x20001128'u32
+  BleRfTxcalDefaultProfile12cReg = 0x2000112C'u32
+  BleRfTxcalDefaultProfile130Reg = 0x20001130'u32
+  BleRfCalModeDefaultReg = 0x20001138'u32
+  BleRfAverageMeasureCtrlReg = 0x20001618'u32
+  BleRfSynthDfePathControlReg = 0x2000163C'u32
   BleRfCtrlIdleEnableMask = 0x00000006'u32
   BleRfCtrlTuneEnableMask = 0x00000002'u32
   BleRfSynthIdleClearMask = 0x00000020'u32
@@ -1111,6 +1192,57 @@ const
   BlePhyAgcLoadEnableMask = 0x00001000'u32
   BleLdpcInitWords = 190
 
+static:
+  doAssert offsetof(BleRfRegBlock, baseCtrl1) == 0x04
+  doAssert offsetof(BleRfRegBlock, calCtrl1c) == 0x1C
+  doAssert offsetof(BleRfRegBlock, capability20) == 0x20
+  doAssert offsetof(BleRfRegBlock, synthCtrl2c) == 0x2C
+  doAssert offsetof(BleRfRegBlock, priModeCtrl30) == 0x30
+  doAssert offsetof(BleRfRegBlock, rccalTone48) == 0x48
+  doAssert offsetof(BleRfRegBlock, txcalBias58) == 0x58
+  doAssert offsetof(BleRfRegBlock, txcalGain64) == 0x64
+  doAssert offsetof(BleRfRegBlock, txcalGain68) == 0x68
+  doAssert offsetof(BleRfRegBlock, txcalParam70) == 0x70
+  doAssert offsetof(BleRfRegBlock, rbbRccalCtrl80) == 0x80
+  doAssert offsetof(BleRfRegBlock, txcalDfe88) == 0x88
+  doAssert offsetof(BleRfRegBlock, rccalReplay84) == 0x84
+  doAssert offsetof(BleRfRegBlock, calPathConfig8c) == 0x8C
+  doAssert offsetof(BleRfRegBlock, fcalCtrlA0) == 0xA0
+  doAssert offsetof(BleRfRegBlock, acalCtrlA4) == 0xA4
+  doAssert offsetof(BleRfRegBlock, calResultA8) == 0xA8
+  doAssert offsetof(BleRfRegBlock, fcalAc) == 0xAC
+  doAssert offsetof(BleRfRegBlock, channelCalStrobeB0) == 0xB0
+  doAssert offsetof(BleRfRegBlock, channelCalStatusB4) == 0xB4
+  doAssert offsetof(BleRfRegBlock, txcalCtrlB8) == 0xB8
+  doAssert offsetof(BleRfRegBlock, channelFcalConfigBc) == 0xBC
+  doAssert offsetof(BleRfRegBlock, sdmCtrlC0) == 0xC0
+  doAssert offsetof(BleRfRegBlock, sdmDivC4) == 0xC4
+  doAssert offsetof(BleRfRegBlock, rfPriBiasTrimCc) == 0xCC
+  doAssert offsetof(BleRfRegBlock, optimizeCtrlD0) == 0xD0
+  doAssert offsetof(BleRfRegBlock, rfBiasTrimD4) == 0xD4
+  doAssert offsetof(BleRfRegBlock, calMixerStateF0) == 0xF0
+  doAssert offsetof(BleRfRegBlock, vcoPairTable13c) == 0x13C
+  doAssert offsetof(BleRfRegBlock, vcoPair2484Mhz164) == 0x164
+  doAssert offsetof(BleRfRegBlock, calSingenCtrl20c) == 0x20C
+  doAssert offsetof(BleRfRegBlock, calSingenAmpLo214) == 0x214
+  doAssert offsetof(BleRfRegBlock, calSingenAmpHi218) == 0x218
+  doAssert offsetof(BleRfRegBlock, rxMode220) == 0x220
+  doAssert offsetof(BleRfRegBlock, calDfeGate23c) == 0x23C
+  doAssert offsetof(BleRfRegBlock, calDfeState240) == 0x240
+  doAssert offsetof(BleRfRegBlock, calDfeState244) == 0x244
+  doAssert offsetof(BleRfRegBlock, txcalTosdac600) == 0x600
+  doAssert offsetof(BleRfRegBlock, calMeasurePrep60c) == 0x60C
+  doAssert offsetof(BleRfRegBlock, measureCtrl618) == 0x618
+  doAssert offsetof(BleRfRegBlock, measureMode61c) == 0x61C
+  doAssert offsetof(BleRfDfeInitBlock, hbnCtrl30) == 0x30
+
+template bleRfRegs(): ptr BleRfRegBlock =
+  cast[ptr BleRfRegBlock](BleRfBase)
+
+template bleRfDfeInitRegs(): ptr BleRfDfeInitBlock =
+  cast[ptr BleRfDfeInitBlock](BleRfDfeInitBase)
+
+const
   BlePhyAgcInit: array[88, BleRegInit] = [
     BleRegInit(address: 0x24C00800'u32, value: 0x00000000'u32),
     BleRegInit(address: 0x24C00820'u32, value: 0x0000130D'u32),
@@ -1213,53 +1345,53 @@ const
     BleRegInit(address: 0x200010C0'u32, value: 0x00130101'u32),
     BleRegInit(address: 0x200010C4'u32, value: 0x1501C71C'u32),
     BleRegInit(address: 0x200010C8'u32, value: 0x14A7FFF9'u32),
-    BleRegInit(address: 0x200010CC'u32, value: 0x50000002'u32)
+    BleRegInit(address: BleRfPriBiasTrimReg, value: 0x50000002'u32)
   ]
 
   BleRfPriStaticInit: array[23, BleRegMaskInit] = [
-    BleRegMaskInit(address: BleRfPriInitPllReg,
+    BleRegMaskInit(address: BleRfPllEnableReg,
                    keepMask: 0xFFFFF9FF'u32, setMask: 0x000001FC'u32),
-    BleRegMaskInit(address: BleRfPriInitPllReg,
+    BleRegMaskInit(address: BleRfPllEnableReg,
                    keepMask: 0xFFFFFFFF'u32, setMask: 0x00000002'u32),
-    BleRegMaskInit(address: BleRfPriInitPllReg,
+    BleRegMaskInit(address: BleRfPllEnableReg,
                    keepMask: 0xFFFFFFFF'u32, setMask: 0x00000001'u32),
     BleRegMaskInit(address: BleRfRxModeReg,
                    keepMask: 0xFFFFE67D'u32, setMask: 0x00000000'u32),
     BleRegMaskInit(address: BleRfRxModeReg,
                    keepMask: 0xFFFFFF9E'u32, setMask: 0x00000000'u32),
-    BleRegMaskInit(address: BleRfPriInitDfeReg,
+    BleRegMaskInit(address: BleRfDfeStaticCtrlReg,
                    keepMask: 0xFF0FFFFF'u32, setMask: 0x00300000'u32),
-    BleRegMaskInit(address: BleRfPriInitHbnReg,
+    BleRegMaskInit(address: BleRfDfeHbnCtrlReg,
                    keepMask: 0xF0FFFFFF'u32, setMask: 0x08000000'u32),
     BleRegMaskInit(address: BleRfPriModeCtrlReg,
                    keepMask: 0xFFFFFFFF'u32, setMask: 0x00001003'u32),
-    BleRegMaskInit(address: BleRfPriInitF884Reg,
+    BleRegMaskInit(address: BleRfDfeFixedDefault884Reg,
                    keepMask: 0xF000FFFF'u32, setMask: 0x082000F4'u32),
-    BleRegMaskInit(address: 0x200010CC'u32,
+    BleRegMaskInit(address: BleRfPriBiasTrimReg,
                    keepMask: 0xFFFFFFFF'u32, setMask: 0x10000000'u32),
-    BleRegMaskInit(address: BleRfPriInit163cReg,
+    BleRegMaskInit(address: BleRfSynthDfePathControlReg,
                    keepMask: 0x00000000'u32, setMask: 0x00000000'u32),
-    BleRegMaskInit(address: BleRfPriInit64Reg,
+    BleRegMaskInit(address: BleRfTxcalGain64Reg,
                    keepMask: 0xFFFE0008'u32, setMask: 0x00004C2C'u32),
-    BleRegMaskInit(address: BleRfPriInit128Reg,
+    BleRegMaskInit(address: BleRfTxcalDefaultProfile128Reg,
                    keepMask: 0xFF800800'u32, setMask: 0x004C2491'u32),
-    BleRegMaskInit(address: BleRfPriInit12cReg,
+    BleRegMaskInit(address: BleRfTxcalDefaultProfile12cReg,
                    keepMask: 0xFF800800'u32, setMask: 0x004C2582'u32),
-    BleRegMaskInit(address: BleRfPriInit130Reg,
+    BleRegMaskInit(address: BleRfTxcalDefaultProfile130Reg,
                    keepMask: 0xFF800FFF'u32, setMask: 0x00491000'u32),
-    BleRegMaskInit(address: BleRfPriInitD4Reg,
+    BleRegMaskInit(address: BleRfBiasTrimD4Reg,
                    keepMask: 0xFFF0F00F'u32, setMask: 0x00F013C1'u32),
-    BleRegMaskInit(address: BleRfPriInit90Reg,
+    BleRegMaskInit(address: BleRfCalPathCtrlReg,
                    keepMask: 0xFFFFFFFF'u32, setMask: 0x00010000'u32),
     BleRegMaskInit(address: BleRfTxcalCtrlReg,
                    keepMask: 0xFFFFFFFF'u32, setMask: 0x00000010'u32),
-    BleRegMaskInit(address: BleRfPriInit138Reg,
+    BleRegMaskInit(address: BleRfCalModeDefaultReg,
                    keepMask: 0xFFFFFFFF'u32, setMask: 0x00000003'u32),
-    BleRegMaskInit(address: BleRfPriInit130Reg,
+    BleRegMaskInit(address: BleRfTxcalDefaultProfile130Reg,
                    keepMask: 0xFFFFFE92'u32, setMask: 0x00000092'u32),
-    BleRegMaskInit(address: BleRfPriInit8cReg,
+    BleRegMaskInit(address: BleRfCalPathConfigReg,
                    keepMask: 0xFFFFFFF8'u32, setMask: 0x00000002'u32),
-    BleRegMaskInit(address: BleRfPriInit1618Reg,
+    BleRegMaskInit(address: BleRfAverageMeasureCtrlReg,
                    keepMask: 0x3FFFFFFF'u32, setMask: 0x00000000'u32),
     BleRegMaskInit(address: BleRfRxModeReg,
                    keepMask: 0xFFFFFFEF'u32, setMask: 0x00000000'u32)
@@ -1288,7 +1420,7 @@ const
                    keepMask: 0xC00007FF'u32, setMask: 0x11FC0000'u32),
     BleRegMaskInit(address: BleRfSynthCtrlReg,
                    keepMask: 0xFFFFFFFF'u32, setMask: 0x00004007'u32),
-    BleRegMaskInit(address: BleRfPriInit163cReg,
+    BleRegMaskInit(address: BleRfSynthDfePathControlReg,
                    keepMask: 0xFFFFFFFF'u32, setMask: 0x00008080'u32)
   ]
 
@@ -1315,17 +1447,6 @@ const
     [6'u32, 4'u32, 4'u32, 0x00010000'u32, 7'u32],
     [6'u32, 4'u32, 4'u32, 0x00010000'u32, 7'u32],
     [6'u32, 4'u32, 4'u32, 0x00010000'u32, 7'u32]
-  ]
-
-  BleRfPriCalSavedRegs: array[29, uint32] = [
-    0x20001004'u32, 0x2000102C'u32, 0x2000101C'u32, 0x20001030'u32,
-    0x200010B8'u32, 0x200010C0'u32, 0x200010C4'u32, 0x2000F030'u32,
-    0x20001084'u32, 0x2000108C'u32, 0x20001600'u32, 0x2000160C'u32,
-    0x20001618'u32, 0x2000161C'u32, 0x20001048'u32, 0x2000120C'u32,
-    0x20001214'u32, 0x20001218'u32, 0x2000123C'u32, 0x20001240'u32,
-    0x20001244'u32, 0x200010F0'u32, 0x20001064'u32, 0x20001058'u32,
-    0x20001220'u32, 0x20001070'u32, 0x200010A4'u32, 0x20001068'u32,
-    0x20001088'u32
   ]
 
   BleRfChannelDivTable40M: array[BleRfLoChannelCount, uint32] = [
@@ -1364,7 +1485,35 @@ type
     txcal: array[16, uint32]
 
   BleRfPriCalState = object
-    words: array[BleRfPriCalSavedRegs.len, uint32]
+    baseCtrl1: uint32
+    synthCtrl2c: uint32
+    calCtrl1c: uint32
+    priModeCtrl30: uint32
+    txcalCtrlB8: uint32
+    sdmCtrlC0: uint32
+    sdmDivC4: uint32
+    hbnCtrl30: uint32
+    rbbRccalCtrl80: uint32
+    calPathConfig8c: uint32
+    txcalTosdac600: uint32
+    calMeasurePrep60c: uint32
+    measureCtrl618: uint32
+    measureMode61c: uint32
+    rccalTone48: uint32
+    calSingenCtrl20c: uint32
+    calSingenAmpLo214: uint32
+    calSingenAmpHi218: uint32
+    calDfeGate23c: uint32
+    calDfeState240: uint32
+    calDfeState244: uint32
+    calMixerStateF0: uint32
+    txcalGain64: uint32
+    txcalBias58: uint32
+    rxMode220: uint32
+    txcalParam70: uint32
+    acalCtrlA4: uint32
+    txcalGain68: uint32
+    txcalDfe88: uint32
 
 const
   BleRfCalibDataSize = sizeof(BleRfCalibData)
@@ -1524,12 +1673,70 @@ proc resetBleRfCalibData() =
     bleRfChannelAcalTable[i] = 0
 
 proc saveBleRfPriCalState(): BleRfPriCalState =
-  for i, regAddr in BleRfPriCalSavedRegs:
-    result.words[i] = regRead(regAddr.uint)
+  let rf = bleRfRegs()
+  let dfe = bleRfDfeInitRegs()
+  result.baseCtrl1 = volatileLoad(addr rf.baseCtrl1)
+  result.synthCtrl2c = volatileLoad(addr rf.synthCtrl2c)
+  result.calCtrl1c = volatileLoad(addr rf.calCtrl1c)
+  result.priModeCtrl30 = volatileLoad(addr rf.priModeCtrl30)
+  result.txcalCtrlB8 = volatileLoad(addr rf.txcalCtrlB8)
+  result.sdmCtrlC0 = volatileLoad(addr rf.sdmCtrlC0)
+  result.sdmDivC4 = volatileLoad(addr rf.sdmDivC4)
+  result.hbnCtrl30 = volatileLoad(addr dfe.hbnCtrl30)
+  result.rbbRccalCtrl80 = volatileLoad(addr rf.rbbRccalCtrl80)
+  result.calPathConfig8c = volatileLoad(addr rf.calPathConfig8c)
+  result.txcalTosdac600 = volatileLoad(addr rf.txcalTosdac600)
+  result.calMeasurePrep60c = volatileLoad(addr rf.calMeasurePrep60c)
+  result.measureCtrl618 = volatileLoad(addr rf.measureCtrl618)
+  result.measureMode61c = volatileLoad(addr rf.measureMode61c)
+  result.rccalTone48 = volatileLoad(addr rf.rccalTone48)
+  result.calSingenCtrl20c = volatileLoad(addr rf.calSingenCtrl20c)
+  result.calSingenAmpLo214 = volatileLoad(addr rf.calSingenAmpLo214)
+  result.calSingenAmpHi218 = volatileLoad(addr rf.calSingenAmpHi218)
+  result.calDfeGate23c = volatileLoad(addr rf.calDfeGate23c)
+  result.calDfeState240 = volatileLoad(addr rf.calDfeState240)
+  result.calDfeState244 = volatileLoad(addr rf.calDfeState244)
+  result.calMixerStateF0 = volatileLoad(addr rf.calMixerStateF0)
+  result.txcalGain64 = volatileLoad(addr rf.txcalGain64)
+  result.txcalBias58 = volatileLoad(addr rf.txcalBias58)
+  result.rxMode220 = volatileLoad(addr rf.rxMode220)
+  result.txcalParam70 = volatileLoad(addr rf.txcalParam70)
+  result.acalCtrlA4 = volatileLoad(addr rf.acalCtrlA4)
+  result.txcalGain68 = volatileLoad(addr rf.txcalGain68)
+  result.txcalDfe88 = volatileLoad(addr rf.txcalDfe88)
 
 proc restoreBleRfPriCalState(state: BleRfPriCalState) =
-  for i, regAddr in BleRfPriCalSavedRegs:
-    regWrite(regAddr.uint, state.words[i])
+  let rf = bleRfRegs()
+  let dfe = bleRfDfeInitRegs()
+  volatileStore(addr rf.baseCtrl1, state.baseCtrl1)
+  volatileStore(addr rf.synthCtrl2c, state.synthCtrl2c)
+  volatileStore(addr rf.calCtrl1c, state.calCtrl1c)
+  volatileStore(addr rf.priModeCtrl30, state.priModeCtrl30)
+  volatileStore(addr rf.txcalCtrlB8, state.txcalCtrlB8)
+  volatileStore(addr rf.sdmCtrlC0, state.sdmCtrlC0)
+  volatileStore(addr rf.sdmDivC4, state.sdmDivC4)
+  volatileStore(addr dfe.hbnCtrl30, state.hbnCtrl30)
+  volatileStore(addr rf.rbbRccalCtrl80, state.rbbRccalCtrl80)
+  volatileStore(addr rf.calPathConfig8c, state.calPathConfig8c)
+  volatileStore(addr rf.txcalTosdac600, state.txcalTosdac600)
+  volatileStore(addr rf.calMeasurePrep60c, state.calMeasurePrep60c)
+  volatileStore(addr rf.measureCtrl618, state.measureCtrl618)
+  volatileStore(addr rf.measureMode61c, state.measureMode61c)
+  volatileStore(addr rf.rccalTone48, state.rccalTone48)
+  volatileStore(addr rf.calSingenCtrl20c, state.calSingenCtrl20c)
+  volatileStore(addr rf.calSingenAmpLo214, state.calSingenAmpLo214)
+  volatileStore(addr rf.calSingenAmpHi218, state.calSingenAmpHi218)
+  volatileStore(addr rf.calDfeGate23c, state.calDfeGate23c)
+  volatileStore(addr rf.calDfeState240, state.calDfeState240)
+  volatileStore(addr rf.calDfeState244, state.calDfeState244)
+  volatileStore(addr rf.calMixerStateF0, state.calMixerStateF0)
+  volatileStore(addr rf.txcalGain64, state.txcalGain64)
+  volatileStore(addr rf.txcalBias58, state.txcalBias58)
+  volatileStore(addr rf.rxMode220, state.rxMode220)
+  volatileStore(addr rf.txcalParam70, state.txcalParam70)
+  volatileStore(addr rf.acalCtrlA4, state.acalCtrlA4)
+  volatileStore(addr rf.txcalGain68, state.txcalGain68)
+  volatileStore(addr rf.txcalDfe88, state.txcalDfe88)
 
 proc waitBleRfFcalReady(): bool =
   for _ in 0 ..< BleRfFcalWaitLimit:
@@ -1819,32 +2026,34 @@ proc applyBleRfRoscalCodes(iCode, qCode: uint32) =
   nim_ble_rf_last_roscal_q = qBits
 
 proc prepareBleRfPriRoscal() =
-  regClear32(BleRfCtrlReg, BleRfCtrlTuneEnableMask)
-  regWrite(BleRfSynthCtrlReg.uint, 0'u32)
-  regOr(BleRfPriModeCtrlReg, 0x00000002'u32)
-  regWrite(BleRfPriModeCtrlReg.uint,
-           (regRead(BleRfPriModeCtrlReg.uint) and 0x21F0FEFF'u32) or
-           0x21F06E00'u32)
+  let rf = bleRfRegs()
+  bleRegClearPtr(addr rf.baseCtrl1, BleRfCtrlTuneEnableMask)
+  bleRegStorePtr(addr rf.synthCtrl2c, 0'u32)
+  bleRegOrPtr(addr rf.priModeCtrl30, 0x00000002'u32)
+  bleRegStorePtr(addr rf.priModeCtrl30,
+                 (bleRegLoadPtr(addr rf.priModeCtrl30) and 0x21F0FEFF'u32) or
+                 0x21F06E00'u32)
   bleRfDelayUs(0)
 
-  regClear32(BleRfRxModeReg, 0x00000180'u32)
-  regWrite(BleRfRxModeReg.uint,
-           (regRead(BleRfRxModeReg.uint) and 0xFFFFE7FF'u32) or
-           0x00001082'u32)
-  regWrite(BleRfRxModeReg.uint,
-           (regRead(BleRfRxModeReg.uint) and not 0x00000010'u32) or
-           0x00000100'u32)
-  regWrite(BleRfRxModeReg.uint,
-           (regRead(BleRfRxModeReg.uint) and not 0x00000060'u32) or
-           0x00000061'u32)
-  regOr(BleRfCalCtrlReg, 0x00000200'u32)
-  regWrite(0x20001048'u32.uint,
-           (regRead(0x20001048'u32.uint) and 0xFFFF8CFF'u32) or
-           0x00003137'u32)
+  bleRegClearPtr(addr rf.rxMode220, 0x00000180'u32)
+  bleRegStorePtr(addr rf.rxMode220,
+                 (bleRegLoadPtr(addr rf.rxMode220) and 0xFFFFE7FF'u32) or
+                 0x00001082'u32)
+  bleRegStorePtr(addr rf.rxMode220,
+                 (bleRegLoadPtr(addr rf.rxMode220) and not 0x00000010'u32) or
+                 0x00000100'u32)
+  bleRegStorePtr(addr rf.rxMode220,
+                 (bleRegLoadPtr(addr rf.rxMode220) and not 0x00000060'u32) or
+                 0x00000061'u32)
+  bleRegOrPtr(addr rf.calCtrl1c, 0x00000200'u32)
+  bleRegStorePtr(addr rf.rccalTone48,
+                 (bleRegLoadPtr(addr rf.rccalTone48) and 0xFFFF8CFF'u32) or
+                 0x00003137'u32)
   regClear32(BleRfRoscalCtrlReg, 0x80000000'u32)
 
 proc runBleRfPriRoscal() =
-  if (regRead(0x20001020'u32.uint) and BleRfRoscalCapabilityMask) == 0'u32:
+  let rf = bleRfRegs()
+  if (bleRegLoadPtr(addr rf.capability20) and BleRfRoscalCapabilityMask) == 0'u32:
     regClear32(BleRfCalModeReg, BleRfRoscalModeMask)
     return
 
@@ -1964,11 +2173,11 @@ proc prepareBleRfPriRccal() =
   startBleRfPriTxDfeForCal()
   startBleRfPriRxDfeForCal()
 
-  regClear32(0x20001084'u32, 0x00030000'u32)
-  regWrite(0x20001084'u32.uint,
-           (regRead(0x20001084'u32.uint) and 0xFCFF_FFFF'u32) or
+  regClear32(BleRfRccalReplayReg, 0x00030000'u32)
+  regWrite(BleRfRccalReplayReg.uint,
+           (regRead(BleRfRccalReplayReg.uint) and 0xFCFF_FFFF'u32) or
            0x0200_0000'u32)
-  regOr(BleRfPriInit8cReg, 0x00001000'u32)
+  regOr(BleRfCalPathConfigReg, 0x00001000'u32)
   regOr(BleRfCalCtrlReg, 0x00000800'u32)
   regClear32(BleRfPriRccalMeasurePrepReg, 0x00000400'u32)
   regOr(BleRfPriRccalMeasurePrepReg, 0x04000000'u32)
@@ -2104,7 +2313,8 @@ proc chooseBleRfRccalCode(): tuple[ok: bool, code: uint32] =
   (ok, lastMeasuredCode)
 
 proc runBleRfPriRccal() =
-  if (regRead(0x20001020'u32.uint) and BleRfRccalCapabilityMask) == 0'u32:
+  let rf = bleRfRegs()
+  if (bleRegLoadPtr(addr rf.capability20) and BleRfRccalCapabilityMask) == 0'u32:
     regClear32(BleRfCalModeReg, BleRfRccalModeMask)
     return
 
@@ -2280,17 +2490,17 @@ proc prepareBleRfTxcalSearchStage() =
   regWrite(BleRfPriRccalSingenReg2.uint,
            (regRead(BleRfPriRccalSingenReg2.uint) and 0x003F_FFFF'u32) or
            0xC000_0000'u32)
-  regWrite(BleRfPriInit64Reg.uint,
-           (regRead(BleRfPriInit64Reg.uint) and 0x0FC3_FFFF'u32) or
+  regWrite(BleRfTxcalGain64Reg.uint,
+           (regRead(BleRfTxcalGain64Reg.uint) and 0x0FC3_FFFF'u32) or
            0x9030_0000'u32)
-  regWrite(BleRfPriInit58Reg.uint,
-           (regRead(BleRfPriInit58Reg.uint) and 0xFFF8_FFFF'u32) or
+  regWrite(BleRfTxcalBiasReg.uint,
+           (regRead(BleRfTxcalBiasReg.uint) and 0xFFF8_FFFF'u32) or
            0x0004_0000'u32)
   regWrite(BleRfPriRccalToneReg.uint,
            (regRead(BleRfPriRccalToneReg.uint) and 0xCE0F_FFFF'u32) or
            0x0077_0000'u32)
-  regWrite(BleRfPriInit8cReg.uint,
-           (regRead(BleRfPriInit8cReg.uint) and not 0x0000_0030'u32) or
+  regWrite(BleRfCalPathConfigReg.uint,
+           (regRead(BleRfCalPathConfigReg.uint) and not 0x0000_0030'u32) or
            0x0000_0010'u32)
 
 proc sampleBleRfTxcalPower(measFreq: uint32): tuple[ok: bool, power: uint32] =
@@ -2375,12 +2585,12 @@ proc storeBleRfTxcalRecord(index: int, p0, p1, p2, p3: int32, power: uint32) =
     nim_ble_rf_txcal_power_log[index] = power
 
 proc configureBleRfPriTxcalGain(param: array[5, uint32]) =
-  regWrite(BleRfPriInit64Reg.uint,
-           (regRead(BleRfPriInit64Reg.uint) and 0x0FC3FFFF'u32) or
+  regWrite(BleRfTxcalGain64Reg.uint,
+           (regRead(BleRfTxcalGain64Reg.uint) and 0x0FC3FFFF'u32) or
            ((param[0] and 0x0F'u32) shl 28) or
            ((param[2] and 0x0F'u32) shl 18))
-  regWrite(BleRfPriInit58Reg.uint,
-           (regRead(BleRfPriInit58Reg.uint) and 0xFFF8FFFF'u32) or
+  regWrite(BleRfTxcalBiasReg.uint,
+           (regRead(BleRfTxcalBiasReg.uint) and 0xFFF8FFFF'u32) or
            ((param[1] and 0x07'u32) shl 16))
   regWrite(BleRfPriRccalToneReg.uint,
            (regRead(BleRfPriRccalToneReg.uint) and 0xCE08FFFF'u32) or
@@ -2395,13 +2605,13 @@ proc prepareBleRfPriTxcal() =
            0xCEFF7800'u32)
   bleRfDelayUs(1)
 
-  regOr(0x2000123C'u32, 0x00040000'u32)
+  regOr(BleRfPriCalDfeGateReg, 0x00040000'u32)
   startBleRfPriTxDfeForCal()
   startBleRfPriRxDfeForCal()
-  regOr(0x2000123C'u32, 0x00040000'u32)
+  regOr(BleRfPriCalDfeGateReg, 0x00040000'u32)
   regOr(BleRfCalCtrlReg, 0x00003000'u32)
   regOr(BleRfPriTxcalDfeReg, 0x80000000'u32)
-  regOr(BleRfPriInit64Reg, 0x00400000'u32)
+  regOr(BleRfTxcalGain64Reg, 0x00400000'u32)
   regWrite(BleRfPriTxcalDcReg.uint,
            (regRead(BleRfPriTxcalDcReg.uint) and not 0x00000007'u32) or
            0x00000004'u32)
@@ -2418,17 +2628,17 @@ proc prepareBleRfPriTxcal() =
   regOr(BleRfPriRccalSingenReg0, 0x80000000'u32)
 
   regOr(BleRfPriModeCtrlReg, 0x00000003'u32)
-  regWrite(BleRfPriInit64Reg.uint,
-           (regRead(BleRfPriInit64Reg.uint) and 0x0FC3FFFF'u32) or
+  regWrite(BleRfTxcalGain64Reg.uint,
+           (regRead(BleRfTxcalGain64Reg.uint) and 0x0FC3FFFF'u32) or
            0x50000000'u32)
-  regWrite(BleRfPriInit58Reg.uint,
-           (regRead(BleRfPriInit58Reg.uint) and 0xFFF8FFFF'u32) or
+  regWrite(BleRfTxcalBiasReg.uint,
+           (regRead(BleRfTxcalBiasReg.uint) and 0xFFF8FFFF'u32) or
            0x00040000'u32)
   regWrite(BleRfPriRccalToneReg.uint,
            (regRead(BleRfPriRccalToneReg.uint) and 0xCE08FFFF'u32) or
            0x00870000'u32)
-  regWrite(BleRfPriInit68Reg.uint,
-           (regRead(BleRfPriInit68Reg.uint) and 0x1DFFFFFF'u32) or
+  regWrite(BleRfTxcalGain68Reg.uint,
+           (regRead(BleRfTxcalGain68Reg.uint) and 0x1DFFFFFF'u32) or
            0xE0000000'u32)
   regWrite(BleRfMeasureModeReg.uint,
            (regRead(BleRfMeasureModeReg.uint) and BleRfMeasureModeKeepMask) or
@@ -2491,19 +2701,20 @@ proc applyBleRfTxcalRecordToTable(words: var array[43, uint32],
     (p3 shl 14) or (p0 shl 8) or (p1 shl 2)
 
 proc applyBleRfVcoTableFromCal() =
+  let rf = bleRfRegs()
   for i in 0 ..< BleRfLoChannelCount:
-    let regAddr = 0x2000113C'u32 + uint32(i div 2) * 4'u32
-    var word = regRead(regAddr.uint)
+    let pairIndex = i div 2
+    var word = volatileLoad(addr rf.vcoPairTable13c[pairIndex])
     let fcal = uint32(rfLoFcal(bleRfCalibData.lo[i])) and 0xFF'u32
     let acal = uint32(rfLoAcal(bleRfCalibData.lo[i])) and 0x1F'u32
     if (i and 1) == 0:
       word = (word and 0xFFFF00E0'u32) or (fcal shl 8) or acal
     else:
       word = (word and 0x00E0FFFF'u32) or (fcal shl 24) or (acal shl 16)
-    regWrite(regAddr.uint, word)
+    volatileStore(addr rf.vcoPairTable13c[pairIndex], word)
   inc nim_ble_rf_pri_vco_table_count
-  nim_ble_rf_last_vco_113c = regRead(0x2000113C'u32.uint)
-  nim_ble_rf_last_vco_1164 = regRead(0x20001164'u32.uint)
+  nim_ble_rf_last_vco_113c = volatileLoad(addr rf.vcoPairTable13c[0])
+  nim_ble_rf_last_vco_1164 = volatileLoad(addr rf.vcoPair2484Mhz164)
 
 proc runBleRfPriLoCalibration() =
   resetBleRfCalibData()
@@ -2520,8 +2731,8 @@ proc applyBleRfPriStaticInit() =
   ## separate RF HAL task; this keeps the fixed RF defaults synchronized.
   writeBleRegMaskInit(BleRfPriStaticInit)
   inc nim_ble_rf_pri_static_count
-  nim_ble_rf_last_pri_init_64 = regRead(BleRfPriInit64Reg.uint)
-  nim_ble_rf_last_pri_init_d4 = regRead(BleRfPriInitD4Reg.uint)
+  nim_ble_rf_last_pri_init_64 = regRead(BleRfTxcalGain64Reg.uint)
+  nim_ble_rf_last_pri_init_d4 = regRead(BleRfBiasTrimD4Reg.uint)
 
 proc applyBleRfPriGainInit() =
   ## Mirror the vendor rf_pri_gain_table_WR2REG follow-up register phase.

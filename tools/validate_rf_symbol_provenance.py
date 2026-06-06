@@ -14,14 +14,70 @@ from pathlib import Path
 WIFI_RF_SYMBOLS = [
     "wl_init",
     "wl_cfg_get",
+    "wl_rf_cfg_init",
+    "wl_rmem_size_get",
+    "wl_env_get",
     "rf_init",
     "rfc_init",
+    "rfc_config_bandwidth",
+    "rfc_config_channel",
     "modem_init_core",
+    "modem_init",
+    "modem_restore",
+    "rf_dump_status",
     "phy_init",
+    "phy_get_mac_freq",
+    "phy_get_version",
+    "phy_get_channel",
+    "phy_mdm_isr",
+    "phy_rc_isr",
+    "phy_get_ntx",
+    "phy_get_nss",
+    "phy_get_nrx",
+    "phy_get_bw",
+    "phy_vht_supported",
+    "phy_he_supported",
+    "phy_uf_supported",
+    "phy_uf_enable",
+    "phy_ldpc_tx_supported",
+    "phy_ldpc_rx_supported",
+    "phy_bfmee_supported",
+    "phy_bfmer_supported",
+    "phy_mu_mimo_rx_supported",
+    "phy_mu_mimo_tx_supported",
+    "phy_get_rf_gain_idx",
+    "phy_get_rf_gain_capab",
+    "phy_get_antenna_set",
+    "phy_switch_antenna_paths",
+    "phy_get_channel_switch_dur",
+    "phy_stop",
+    "phy_mdm_reset",
+    "phy_set_aid",
+    "phy_set_group_id_info",
+    "phy_update_power_table",
+    "phy_set_channel",
+    "phy_powroffset_set",
+    "trpc_power_get",
+    "trpc_update_power_11b",
+    "trpc_update_power_11g",
+    "trpc_update_power_11n",
+    "trpc_update_power_11ac",
+    "trpc_update_power_11ax",
+    "trpc_update_power",
+    "trpc_init",
+    "trpc_get_default_power_idx",
+    "trpc_get_power_idx",
     "rf_pri_init",
+    "rf_pri_input_xtalfreq",
+    "rf_pri_config_mode",
     "rf_pri_input_device_info",
+    "rf_pri_update_param",
+    "rf_pri_get_notch_param",
     "rf_pri_optimize",
     "rf_pri_set_channel_pwr_comp",
+    "rf_pri_set_bandwidth",
+    "rf_pri_get_vco_freq_cw",
+    "rf_pri_get_vco_idac_cw",
 ]
 
 FORBIDDEN_RF_ARCHIVE_MARKERS = [
@@ -34,7 +90,15 @@ FORBIDDEN_RF_ARCHIVE_MARKERS = [
 
 BLE_RF_SYMBOLS = [
     "btble_rf_init",
+    "ble_rf_init",
+    "ble_rf_set_pwr_offset_table",
+    "ble_rf_get_pwr_offset",
+    "ble_rf_set_tx_channel",
+    "rf_txpwr_dbm2cs",
+    "rf_txpwr_cs2dbm",
     "rwip_wlcoex_set",
+    "nim_ble_coex_wifi_tx_window_enter",
+    "nim_ble_coex_wifi_tx_window_leave",
     "nim_ble_coex_wifi_rf_reclaim_needed",
 ]
 
@@ -194,6 +258,38 @@ def check_wifi_phy_memory_init(archive: Path) -> list[str]:
     return failures
 
 
+def check_wifi_object_phy_memory_init(obj: Path) -> list[str]:
+    """Validate the pure-Nim WiFi object copies AGC RAM and has no LDPC RAM load."""
+    failures: list[str] = []
+    symbols = subprocess.check_output(
+        ["riscv64-unknown-elf-objdump", "-t", str(obj)],
+        text=True,
+        errors="ignore",
+    ).lower()
+    if "agcmem" not in symbols:
+        print(f"{obj}: missing Nim agcmem symbol")
+        failures.append(f"{obj}:missing-nim-agcmem")
+    if "ldpcmem" in symbols:
+        print(f"{obj}: unexpected Nim ldpcmem symbol")
+        failures.append(f"{obj}:unexpected-nim-ldpcmem-symbol")
+
+    objdump = llvm_objdump_cmd()
+    disasm = subprocess.check_output(
+        [objdump, "-dr", f"--mattr={THEAD_MATTR}", str(obj)],
+        text=True,
+        errors="ignore",
+    ).lower()
+    if "copyagcmemory" not in disasm or "agcmem" not in disasm or "24c0a" not in disasm:
+        print(f"{obj}: missing Nim AGC copy evidence to 0x24C0A000")
+        failures.append(f"{obj}:missing-nim-agcmem-copy")
+    if "24c09" in disasm:
+        print(f"{obj}: unexpected Nim WiFi LDPC RAM reference 0x24C09000")
+        failures.append(f"{obj}:unexpected-nim-ldpc-ram-reference")
+    if not failures:
+        print(f"{obj}: Nim WiFi PHY memory init copies agcmem and has no LDPC RAM path")
+    return failures
+
+
 def hw_validation_nimcache_object(elf: Path, object_name: str) -> Path | None:
     parts = elf.parts
     for index in range(0, len(parts) - 2):
@@ -204,8 +300,28 @@ def hw_validation_nimcache_object(elf: Path, object_name: str) -> Path | None:
     return None
 
 
+def add_hw_validation_test_inputs(
+    test_name: str, work_dir: Path, args: argparse.Namespace
+) -> None:
+    """Expand a hw-validation test name into its provenance artifacts."""
+    elf = work_dir / "bin" / test_name / "kernel.elf"
+    args.elf.append(elf)
+
+    link_map = elf.with_suffix(".map")
+    if link_map.exists() and link_map not in args.link_map:
+        args.link_map.append(link_map)
+
+    build_log = work_dir / "logs" / f"{test_name}.kernel.build.log"
+    if build_log.exists() and build_log not in args.build_log:
+        args.build_log.append(build_log)
+
+
 def check_hw_validation_nimcache_objects(
-    elf: Path, require: bool, require_labels: set[str], infer_required: bool
+    elf: Path,
+    require: bool,
+    require_labels: set[str],
+    infer_required: bool,
+    check_wifi_phy_memory: bool,
 ) -> list[str]:
     failures: list[str] = []
     inferred_labels = inferred_hw_validation_labels(elf) if infer_required else set()
@@ -224,6 +340,8 @@ def check_hw_validation_nimcache_objects(
             continue
         missing = check_defined(obj, symbols, f"{elf} {label}-nimcache-object")
         failures.extend(f"{obj}:missing:{symbol}" for symbol in missing)
+        if label == "wifi" and check_wifi_phy_memory:
+            failures.extend(check_wifi_object_phy_memory_init(obj))
     return failures
 
 
@@ -235,6 +353,22 @@ def main() -> int:
     parser.add_argument("--build-log", type=Path, action="append", default=[])
     parser.add_argument("--link-map", type=Path, action="append", default=[])
     parser.add_argument("--elf", type=Path, action="append", default=[])
+    parser.add_argument(
+        "--hw-validation-test",
+        action="append",
+        default=[],
+        help=(
+            "expand build/hw-validation artifacts for a test name: "
+            "bin/<test>/kernel.elf, kernel.map, kernel build log, and "
+            "inferred Nim cache objects"
+        ),
+    )
+    parser.add_argument(
+        "--hw-validation-work-dir",
+        type=Path,
+        default=Path("build/hw-validation"),
+        help="work directory used with --hw-validation-test",
+    )
     parser.add_argument(
         "--check-wifi-phy-memory-init",
         action="store_true",
@@ -294,6 +428,13 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.hw_validation_test:
+        args.check_hw_validation_nimcache_objects = True
+        args.infer_hw_validation_nimcache_objects = True
+        for test_name in args.hw_validation_test:
+            add_hw_validation_test_inputs(
+                test_name, args.hw_validation_work_dir, args)
+
     failures: list[str] = []
     required_hw_labels: set[str] = set()
     if args.require_hw_validation_wifi_nimcache_object:
@@ -305,18 +446,22 @@ def main() -> int:
         args.wifi_object is None
         and args.ble_object is None
         and args.rf_archive is None
+        and not args.hw_validation_test
         and not args.elf
         and not args.build_log
         and not args.link_map
     ):
         parser.error(
-            "provide --wifi-object, --ble-object, --rf-archive, --elf, --build-log, or --link-map"
+            "provide --wifi-object, --ble-object, --rf-archive, --elf, "
+            "--hw-validation-test, --build-log, or --link-map"
         )
 
     if args.wifi_object is not None:
         require_existing(args.wifi_object, "WiFi object")
         missing = check_defined(args.wifi_object, WIFI_RF_SYMBOLS, "wifi-object")
         failures.extend(f"wifi-object:{symbol}" for symbol in missing)
+        if args.check_wifi_phy_memory_init:
+            failures.extend(check_wifi_object_phy_memory_init(args.wifi_object))
 
     if args.ble_object is not None:
         require_existing(args.ble_object, "BLE object")
@@ -363,6 +508,7 @@ def main() -> int:
                     args.require_hw_validation_nimcache_objects,
                     required_hw_labels,
                     args.infer_hw_validation_nimcache_objects,
+                    args.check_wifi_phy_memory_init,
                 )
             )
 

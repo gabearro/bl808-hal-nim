@@ -359,7 +359,8 @@ def test_ble_rf_init_ports_bl606p_reference_fixed_register_phases():
     assert "BleRfPriTxcalParams: array[BleRfTxcalSearchRecords, array[5, uint32]]" in text
     assert "BleRfCalibDataSize = sizeof(BleRfCalibData)" in text
     assert "doAssert BleRfCalibDataSize == 168" in text
-    assert "BleRfPriCalSavedRegs: array[29, uint32]" in text
+    assert "BleRfPriCalState = object" in text
+    assert "BleRfPriCalSavedRegs:" not in text
     assert "BleRfChannelDivTable40M: array[BleRfLoChannelCount, uint32]" in text
     assert "BleRfChannelCntTable40M: array[BleRfLoChannelCount, uint16]" in text
     assert "BleRfFcalWaitLimit = 5000" in text
@@ -375,9 +376,9 @@ def test_ble_rf_init_ports_bl606p_reference_fixed_register_phases():
     assert "proc writeBleRfTxcalParam" in text
 
     for needle in [
-        "BleRfPriInit64Reg = 0x20001064'u32",
+        "BleRfTxcalGain64Reg = 0x20001064'u32",
         "BleRfPriTxcalDcReg = 0x2000106C'u32",
-        "BleRfPriInitD4Reg = 0x200010D4'u32",
+        "BleRfBiasTrimD4Reg = 0x200010D4'u32",
         "BleRfPriModeCtrlReg = 0x20001030'u32",
         "BleRfRoscalCtrlReg = 0x2000107C'u32",
         "BleRfRbbRccalReg = 0x20001080'u32",
@@ -389,8 +390,8 @@ def test_ble_rf_init_ports_bl606p_reference_fixed_register_phases():
         "BleRfTxcalParam2Mask = 0x007FF000'u32",
         "BleRfTxcalParam2EnableBit = 0x00800000'u32",
         "BleRfMeasureFrequencyShift = 10",
-        "(regRead(BleRfPriInit64Reg.uint) and 0x0FC3FFFF'u32) or",
-        "regOr(BleRfPriInit64Reg, 0x00400000'u32)",
+        "(regRead(BleRfTxcalGain64Reg.uint) and 0x0FC3FFFF'u32) or",
+        "regOr(BleRfTxcalGain64Reg, 0x00400000'u32)",
         "(regRead(BleRfPriTxcalDcReg.uint) and not 0x00000007'u32) or",
         "0x50000000'u32",
         "BleRegMaskInit(address: BleRfPriModeCtrlReg",
@@ -401,11 +402,76 @@ def test_ble_rf_init_ports_bl606p_reference_fixed_register_phases():
         "keepMask: 0xFFFFFFFF'u32, setMask: 0x00008080'u32",
         "0x004524D4'u32, 0x0028E3D0'u32, 0x135FC000'u32, 0x00000000'u32",
         "0x00003189'u32, 0x11FC0000'u32, 0x00000000'u32, 0x115C0000'u32",
-        "0x20001004'u32, 0x2000102C'u32, 0x2000101C'u32, 0x20001030'u32",
+        "baseCtrl1: uint32",
+        "capability20: uint32",
+        "synthCtrl2c: uint32",
+        "calCtrl1c: uint32",
+        "priModeCtrl30: uint32",
+        "doAssert offsetof(BleRfRegBlock, capability20) == 0x20",
+        "doAssert offsetof(BleRfRegBlock, vcoPairTable13c) == 0x13C",
+        "doAssert offsetof(BleRfRegBlock, vcoPair2484Mhz164) == 0x164",
+        "result.baseCtrl1 = volatileLoad(addr rf.baseCtrl1)",
+        "volatileStore(addr rf.baseCtrl1, state.baseCtrl1)",
         "0x14088889'u32, 0x14111111'u32, 0x1419999A'u32, 0x14222222'u32",
         "0xA6EB'u16, 0xA732'u16, 0xA779'u16, 0xA7C0'u16, 0xA808'u16",
     ]:
         assert needle in text
+
+    roscal_prep = text.split("proc prepareBleRfPriRoscal", 1)[1].split(
+        "proc runBleRfPriRoscal", 1
+    )[0]
+    for needle in [
+        "let rf = bleRfRegs()",
+        "addr rf.baseCtrl1",
+        "addr rf.synthCtrl2c",
+        "addr rf.priModeCtrl30",
+        "addr rf.rxMode220",
+        "addr rf.calCtrl1c",
+        "addr rf.rccalTone48",
+    ]:
+        assert needle in roscal_prep
+
+    rccal_body = text.split("proc runBleRfPriRccal() =", 1)[1].split(
+        "proc clampBleRfTxcalParam",
+        1,
+    )[0]
+    assert "let rf = bleRfRegs()" in rccal_body
+    assert "addr rf.capability20" in rccal_body
+    assert "0x20001020" not in rccal_body
+
+    vco_body = text.split("proc applyBleRfVcoTableFromCal() =", 1)[1].split(
+        "proc runBleRfPriLoCalibration",
+        1,
+    )[0]
+    for needle in [
+        "let rf = bleRfRegs()",
+        "let pairIndex = i div 2",
+        "addr rf.vcoPairTable13c[pairIndex]",
+        "addr rf.vcoPairTable13c[0]",
+        "addr rf.vcoPair2484Mhz164",
+    ]:
+        assert needle in vco_body
+    for raw_addr in [
+        "0x2000113C",
+        "0x20001164",
+    ]:
+        assert raw_addr not in vco_body
+    for forbidden in [
+        "BleRfCtrlReg",
+        "BleRfSynthCtrlReg",
+        "BleRfPriModeCtrlReg",
+        "BleRfRxModeReg",
+        "BleRfCalCtrlReg",
+        "0x20001048'u32",
+    ]:
+        assert forbidden not in roscal_prep
+
+    roscal_run = text.split("proc runBleRfPriRoscal", 1)[1].split(
+        "proc startBleRfPriTxDfeForCal", 1
+    )[0]
+    assert "let rf = bleRfRegs()" in roscal_run
+    assert "addr rf.capability20" in roscal_run
+    assert "regRead(0x20001020'u32.uint)" not in roscal_run
 
     init_body = text.split("proc configureBleRf1M", 1)[1].split(
         "when defined(bl808m0) and defined(bl808WifiNimFw):", 1
@@ -646,8 +712,8 @@ def test_pure_ble_rf_table_preserves_connection_em_config_byte():
     assert "BtbleRfEmConfigWord = 0x2000'u16" in text
     assert "BtbleRfRssiFloorDbm = -40'i8" in text
     assert "BtbleRfCalibrationWord = 0xBAC4'u16" in text
-    assert "doAssert offsetof(BtbleRfTableView, reserved08) == 0x08" in text
-    assert "doAssert offsetof(BtbleRfTableView, reserved0C) == 0x0C" in text
+    assert "doAssert offsetof(BtbleRfTableView, unusedCallback08) == 0x08" in text
+    assert "doAssert offsetof(BtbleRfTableView, unusedCallback0c) == 0x0C" in text
     assert "doAssert offsetof(BtbleRfTableView, txpwrMaxSet) == 0x10" in text
     assert "doAssert offsetof(BtbleRfTableView, txpwrMaxGet) == 0x14" in text
     assert "doAssert offsetof(BtbleRfTableView, txpwrDbmGet) == 0x1C" in text
@@ -664,9 +730,9 @@ def test_pure_ble_rf_table_preserves_connection_em_config_byte():
     assert "doAssert offsetof(BleMacPhyRegs, settle980) == 0x980" in text
     assert "doAssert offsetof(BleMacPhyRegs, settle98c) == 0x98C" in text
     assert "doAssert offsetof(BleMacPhyRegs, trim9c0) == 0x9C0" in text
-    assert "doAssert offsetof(BlePhyCtrlRegs, phyCtrl08) == 0x08" in text
-    assert "doAssert offsetof(BlePhyCtrlRegs, phyCtrl8c) == 0x8C" in text
-    assert "doAssert offsetof(BlePhyAgcRegs, agcCtrl84) == 0x84" in text
+    assert "doAssert offsetof(BlePhyCtrlRegs, resetInitCtrl08) == 0x08" in text
+    assert "doAssert offsetof(BlePhyCtrlRegs, resetTuningCtrl8c) == 0x8C" in text
+    assert "doAssert offsetof(BlePhyAgcRegs, resetAgcConfig84) == 0x84" in text
 
     init_body = text.split("proc btble_rf_init", 1)[1].split(
         "# ---------------------------------------------------------------------------", 1
@@ -678,8 +744,8 @@ def test_pure_ble_rf_table_preserves_connection_em_config_byte():
         "proc nimRfForceAgcEnable", 1
     )[0]
     assert "proc nimRfTxpwrDbmGet(cs: uint8, high: uint8): int8 {.cdecl.}" in text
-    assert "table.reserved08 = nil" in init_body
-    assert "table.reserved0C = nil" in init_body
+    assert "table.unusedCallback08 = nil" in init_body
+    assert "table.unusedCallback0c = nil" in init_body
     assert "table.txpwrMaxGet = cast[pointer](nimBleRfTxpowerMaxGet)" in init_body
     assert "table.emConfigWord = BtbleRfEmConfigWord" in init_body
     assert "table.rssiFloorDbm = BtbleRfRssiFloorDbm" in init_body
@@ -692,9 +758,9 @@ def test_pure_ble_rf_table_preserves_connection_em_config_byte():
     assert "regStore(addr mac.reset880" in reset_body
     assert "regUpdateField(addr mac.reset890" in reset_body
     assert "regStore(addr mac.trim9c0" in reset_body
-    assert "regStore(addr agc.agcCtrl84" in reset_body
-    assert "regUpdateField(addr phy.phyCtrl8c" in reset_body
-    assert "regStore(addr phy.phyCtrl08" in reset_body
+    assert "regStore(addr agc.resetAgcConfig84" in reset_body
+    assert "regUpdateField(addr phy.resetTuningCtrl8c" in reset_body
+    assert "regStore(addr phy.resetInitCtrl08" in reset_body
     for raw in (
         "0x28000880",
         "0x2800088C",

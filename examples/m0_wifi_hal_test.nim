@@ -214,6 +214,7 @@ when defined(bl808WifiNimFw):
   var nimfw_dbg_scan_end_phy_raw {.importc.}: array[4, uint32]
   var nimfw_dbg_rf_phy_trace_count {.importc.}: uint32
   var nimfw_dbg_rf_phy_trace_phase {.importc.}: array[NimFwRfPhyTraceLen, uint32]
+  var nimfw_dbg_rf_phy_trace_device {.importc.}: array[NimFwRfPhyTraceLen, uint32]
   var nimfw_dbg_rf_phy_trace_chan_meta {.importc.}: array[NimFwRfPhyTraceLen, uint32]
   var nimfw_dbg_rf_phy_trace_chan_freq {.importc.}: array[NimFwRfPhyTraceLen, uint32]
   var nimfw_dbg_rf_phy_trace_rf70 {.importc.}: array[NimFwRfPhyTraceLen, uint32]
@@ -259,6 +260,50 @@ when defined(bl808WifiNimFw):
   var nimfw_dbg_rf_cal_save_rf2c {.importc.}: uint32
   var nimfw_dbg_rf_cal_restore_rf2c {.importc.}: uint32
   var nimfw_dbg_rf_cal_restore_readback_rf2c {.importc.}: uint32
+  var nimfw_dbg_rf_phase {.importc.}: uint32
+  var nimfw_dbg_rf_restore {.importc.}: uint32
+  var nimfw_dbg_rf_api_mode {.importc.}: uint32
+  var nimfw_dbg_phy_init_count {.importc.}: uint32
+  var nimfw_dbg_phy_init_phase {.importc.}: uint32
+  var nimfw_dbg_phy_modem_version {.importc.}: uint32
+  var nimfw_dbg_phy_clock_count {.importc.}: uint32
+  var nimfw_dbg_phy_agc_copy_count {.importc.}: uint32
+  var nimfw_dbg_phy_agc_source_first {.importc.}: uint32
+  var nimfw_dbg_phy_agc_source_last {.importc.}: uint32
+  var nimfw_dbg_phy_agc_dest_first {.importc.}: uint32
+  var nimfw_dbg_phy_agc_dest_last {.importc.}: uint32
+  var nimfw_dbg_phy_wifi_ldpc_absent {.importc.}: uint32
+  var nim_wifi_rf_fixed_val_count {.importc.}: uint32
+  var nim_wifi_rf_fixed_val_device {.importc.}: uint32
+  var nim_wifi_rf_fixed_val_branch {.importc.}: uint32
+  var nim_wifi_rf_fixed_val_rf70 {.importc.}: uint32
+  var nim_wifi_rf_fixed_val_rf88 {.importc.}: uint32
+  var nim_wifi_rf_fixed_val_rfd0 {.importc.}: uint32
+  var nim_wifi_rf_fixed_val_rf814 {.importc.}: uint32
+  var nim_wifi_rf_fixed_val_rfa0 {.importc.}: uint32
+  var nim_wifi_rf_rf70_replay_apply_count {.importc.}: uint32
+  var nim_wifi_rf_rf70_replay_reason {.importc.}: uint32
+  var nim_wifi_rf_rf70_replay_reg_before {.importc.}: uint32
+  var nim_wifi_rf_rf70_replay_reg_after {.importc.}: uint32
+  var nim_wifi_rf_rf70_replay_cal_word3_before {.importc.}: uint32
+  var nim_wifi_rf_rf70_replay_cal_word4_before {.importc.}: uint32
+  var nim_wifi_rf_rf70_replay_cal_word3_after {.importc.}: uint32
+  var nim_wifi_rf_rf70_replay_cal_word4_after {.importc.}: uint32
+  var nim_wifi_rf_rf70_txcal_window0_nibble {.importc.}: uint32
+  var nim_wifi_rf_rf70_txcal_window1_nibble {.importc.}: uint32
+  var nim_wifi_rf_rf70_txcal_window2_nibble {.importc.}: uint32
+  var nim_wifi_rf_rf70_txcal_window_mask {.importc.}: uint32
+  var nim_wifi_rf_rf70_txcal_search_count {.importc.}: uint32
+  var nim_wifi_rf_rf70_txcal_search_ok_mask {.importc.}: uint32
+  var nim_wifi_rf_rf70_txcal_search_best_nibble {.importc.}: array[3, uint32]
+  var nim_wifi_rf_rf70_txcal_search_runner_nibble {.importc.}: array[3, uint32]
+  var nim_wifi_rf_rf70_txcal_search_best_sample {.importc.}: array[3, uint32]
+  var nim_wifi_rf_rf70_txcal_search_runner_sample {.importc.}: array[3, uint32]
+  var nim_wifi_rf_rf70_txcal_search_ctrl {.importc.}: array[3, uint32]
+  var nim_wifi_rf_rf70_txcal_search_mode {.importc.}: array[3, uint32]
+  var nim_wifi_rf_rf70_txcal_search_i_raw {.importc.}: array[3, uint32]
+  var nim_wifi_rf_rf70_txcal_candidate_ok_mask {.importc.}: array[3, uint32]
+  var nim_wifi_rf_rf70_txcal_candidate_sample {.importc.}: array[48, uint32]
   var nim_wifi_rf_pri_txcal_count {.importc.}: uint32
   var nim_wifi_rf_pri_lo_fcal_count {.importc.}: uint32
   var nim_wifi_rf_pri_lo_acal_count {.importc.}: uint32
@@ -286,6 +331,15 @@ when defined(bl808WifiNimFw):
   var nim_wifi_rf_last_txcal_amp_mean {.importc.}: uint32
   var nim_wifi_rf_last_txcal_tmxcs {.importc.}: uint32
   var nim_wifi_rf_last_txcal_tmxcs_power {.importc.}: uint32
+  var nim_wifi_rf_pre_rf70_txcal_amp {.importc.}: uint32
+  var nim_wifi_rf_pre_rf70_txcal_amp_mean {.importc.}: uint32
+  var nim_wifi_rf_pre_rf70_rf70 {.importc.}: uint32
+  var nim_wifi_rf_pre_rf70_rf6c {.importc.}: uint32
+  var nim_wifi_rf_pre_rf70_rf120c {.importc.}: uint32
+  var nim_wifi_rf_pre_rf70_rf1214 {.importc.}: uint32
+  var nim_wifi_rf_pre_rf70_rf1218 {.importc.}: uint32
+  var nim_wifi_rf_pre_rf70_rf1618 {.importc.}: uint32
+  var nim_wifi_rf_pre_rf70_rf161c {.importc.}: uint32
   var nim_wifi_rf_last_rxcal_word0 {.importc.}: uint32
   var nim_wifi_rf_last_rxcal_word1 {.importc.}: uint32
   var nim_wifi_rf_last_rxcal_power {.importc.}: uint32
@@ -379,6 +433,136 @@ when defined(bl808WifiNimFw):
       discard console.sendLine("")
 
   proc dumpRfCalSummary() =
+    discard console.sendString("[WIFI-NIMFW] rfcore phase=")
+    console.sendHex32(nimfw_dbg_rf_phase)
+    discard console.sendString(" restore=")
+    console.sendHex32(nimfw_dbg_rf_restore)
+    discard console.sendString(" api=")
+    console.sendHex32(nimfw_dbg_rf_api_mode)
+    discard console.sendLine("")
+    discard console.sendString("[WIFI-NIMFW] phyinit count=")
+    console.sendHex32(nimfw_dbg_phy_init_count)
+    discard console.sendString(" phase=")
+    console.sendHex32(nimfw_dbg_phy_init_phase)
+    discard console.sendString(" version=")
+    console.sendHex32(nimfw_dbg_phy_modem_version)
+    discard console.sendString(" clk=")
+    console.sendHex32(nimfw_dbg_phy_clock_count)
+    discard console.sendString(" agc_copy=")
+    console.sendHex32(nimfw_dbg_phy_agc_copy_count)
+    discard console.sendString(" src0=")
+    console.sendHex32(nimfw_dbg_phy_agc_source_first)
+    discard console.sendString(" srcN=")
+    console.sendHex32(nimfw_dbg_phy_agc_source_last)
+    discard console.sendString(" dst0=")
+    console.sendHex32(nimfw_dbg_phy_agc_dest_first)
+    discard console.sendString(" dstN=")
+    console.sendHex32(nimfw_dbg_phy_agc_dest_last)
+    discard console.sendString(" wifi_ldpc_absent=")
+    console.sendHex32(nimfw_dbg_phy_wifi_ldpc_absent)
+    discard console.sendLine("")
+    discard console.sendString("[WIFI-NIMFW] rffixed count=")
+    console.sendHex32(nim_wifi_rf_fixed_val_count)
+    discard console.sendString(" dev=")
+    console.sendHex32(nim_wifi_rf_fixed_val_device)
+    discard console.sendString(" branch=")
+    console.sendHex32(nim_wifi_rf_fixed_val_branch)
+    discard console.sendString(" r70=")
+    console.sendHex32(nim_wifi_rf_fixed_val_rf70)
+    discard console.sendString(" r88=")
+    console.sendHex32(nim_wifi_rf_fixed_val_rf88)
+    discard console.sendString(" rfd0=")
+    console.sendHex32(nim_wifi_rf_fixed_val_rfd0)
+    discard console.sendString(" r814=")
+    console.sendHex32(nim_wifi_rf_fixed_val_rf814)
+    discard console.sendString(" rfa0=")
+    console.sendHex32(nim_wifi_rf_fixed_val_rfa0)
+    discard console.sendLine("")
+    discard console.sendString("[WIFI-NIMFW] rf70replay apply_count=")
+    console.sendHex32(nim_wifi_rf_rf70_replay_apply_count)
+    discard console.sendString(" reason=")
+    console.sendHex32(nim_wifi_rf_rf70_replay_reason)
+    discard console.sendString(" reg_before=")
+    console.sendHex32(nim_wifi_rf_rf70_replay_reg_before)
+    discard console.sendString(" reg_after=")
+    console.sendHex32(nim_wifi_rf_rf70_replay_reg_after)
+    discard console.sendString(" cal3_before=")
+    console.sendHex32(nim_wifi_rf_rf70_replay_cal_word3_before)
+    discard console.sendString(" cal4_before=")
+    console.sendHex32(nim_wifi_rf_rf70_replay_cal_word4_before)
+    discard console.sendString(" cal3_after=")
+    console.sendHex32(nim_wifi_rf_rf70_replay_cal_word3_after)
+    discard console.sendString(" cal4_after=")
+    console.sendHex32(nim_wifi_rf_rf70_replay_cal_word4_after)
+    discard console.sendString(" winmask=")
+    console.sendHex32(nim_wifi_rf_rf70_txcal_window_mask)
+    discard console.sendString(" w0=")
+    console.sendHex32(nim_wifi_rf_rf70_txcal_window0_nibble)
+    discard console.sendString(" w1=")
+    console.sendHex32(nim_wifi_rf_rf70_txcal_window1_nibble)
+    discard console.sendString(" w2=")
+    console.sendHex32(nim_wifi_rf_rf70_txcal_window2_nibble)
+    discard console.sendString(" search=")
+    console.sendHex32(nim_wifi_rf_rf70_txcal_search_count)
+    discard console.sendString(" okmask=")
+    console.sendHex32(nim_wifi_rf_rf70_txcal_search_ok_mask)
+    for i in 0 ..< 3:
+      discard console.sendString(" best")
+      discard console.sendString($i)
+      discard console.sendString("=")
+      console.sendHex32(nim_wifi_rf_rf70_txcal_search_best_nibble[i])
+      discard console.sendString("/")
+      console.sendHex32(nim_wifi_rf_rf70_txcal_search_best_sample[i])
+      discard console.sendString(" runner")
+      discard console.sendString($i)
+      discard console.sendString("=")
+      console.sendHex32(nim_wifi_rf_rf70_txcal_search_runner_nibble[i])
+      discard console.sendString("/")
+      console.sendHex32(nim_wifi_rf_rf70_txcal_search_runner_sample[i])
+      discard console.sendString(" ctrl")
+      discard console.sendString($i)
+      discard console.sendString("=")
+      console.sendHex32(nim_wifi_rf_rf70_txcal_search_ctrl[i])
+      discard console.sendString(" mode")
+      discard console.sendString($i)
+      discard console.sendString("=")
+      console.sendHex32(nim_wifi_rf_rf70_txcal_search_mode[i])
+      discard console.sendString(" i")
+      discard console.sendString($i)
+      discard console.sendString("=")
+      console.sendHex32(nim_wifi_rf_rf70_txcal_search_i_raw[i])
+    discard console.sendLine("")
+    for window in 0 ..< 3:
+      discard console.sendString("[WIFI-NIMFW] rf70cand win=")
+      console.sendHex32(window.uint32)
+      discard console.sendString(" okmask=")
+      console.sendHex32(nim_wifi_rf_rf70_txcal_candidate_ok_mask[window])
+      for candidate in 0 ..< 16:
+        discard console.sendString(" c")
+        discard console.sendString($candidate)
+        discard console.sendString("=")
+        console.sendHex32(
+          nim_wifi_rf_rf70_txcal_candidate_sample[window * 16 + candidate])
+      discard console.sendLine("")
+    discard console.sendString("[WIFI-NIMFW] rf70setup amp=")
+    console.sendHex32(nim_wifi_rf_pre_rf70_txcal_amp)
+    discard console.sendString(" mean=")
+    console.sendHex32(nim_wifi_rf_pre_rf70_txcal_amp_mean)
+    discard console.sendString(" r70=")
+    console.sendHex32(nim_wifi_rf_pre_rf70_rf70)
+    discard console.sendString(" r6c=")
+    console.sendHex32(nim_wifi_rf_pre_rf70_rf6c)
+    discard console.sendString(" r120c=")
+    console.sendHex32(nim_wifi_rf_pre_rf70_rf120c)
+    discard console.sendString(" r1214=")
+    console.sendHex32(nim_wifi_rf_pre_rf70_rf1214)
+    discard console.sendString(" r1218=")
+    console.sendHex32(nim_wifi_rf_pre_rf70_rf1218)
+    discard console.sendString(" r1618=")
+    console.sendHex32(nim_wifi_rf_pre_rf70_rf1618)
+    discard console.sendString(" r161c=")
+    console.sendHex32(nim_wifi_rf_pre_rf70_rf161c)
+    discard console.sendLine("")
     discard console.sendString("[WIFI-NIMFW] rfcal state save=")
     console.sendHex32(nimfw_dbg_rf_cal_save_count)
     discard console.sendString(" restore=")
@@ -606,6 +790,8 @@ when defined(bl808WifiNimFw):
       console.sendHex32(seq)
       discard console.sendString(" ph=")
       console.sendHex32(nimfw_dbg_rf_phy_trace_phase[idx])
+      discard console.sendString(" dev=")
+      console.sendHex32(nimfw_dbg_rf_phy_trace_device[idx])
       discard console.sendString(" meta=")
       console.sendHex32(nimfw_dbg_rf_phy_trace_chan_meta[idx])
       discard console.sendString(" freq=")
