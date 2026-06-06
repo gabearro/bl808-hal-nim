@@ -57,6 +57,7 @@ const
   WifiBleTrafficBusyRetryMs {.intdefine.} = 25
   WifiBleTrafficRequireAck {.booldefine.} = true
   WifiBlePostTrafficFrames {.intdefine.} = 0
+  WifiHeapDiag {.booldefine.} = false
   BleTrafficStartDelayMs {.intdefine.} = 2000
   BleRequireDisconnectedCallback {.booldefine.} = true
   BleDisconnectDrainMs {.intdefine.} = 5000
@@ -105,6 +106,21 @@ var nimfw_keepalive_target_cfm {.importc.}: uint32
 var nimfw_dbg_keepalive_rc {.importc.}: uint32
 var nimfw_dbg_keepalive_post_before {.importc.}: uint32
 var nimfw_dbg_keepalive_post_after {.importc.}: uint32
+
+proc printHeap(label: string) =
+  when WifiHeapDiag:
+    let hs = heapStats()
+    discard console.sendString("[HEAP] ")
+    discard console.sendString(label)
+    discard console.sendString(" used=")
+    console.sendHex32(hs.usedBytes.uint32)
+    discard console.sendString(" free=")
+    console.sendHex32(hs.freeBytes.uint32)
+    discard console.sendString(" largest=")
+    console.sendHex32(hs.largestFreeBytes.uint32)
+    discard console.sendString(" fails=")
+    console.sendHex32(hs.allocFailCount.uint32)
+    discard console.sendLine("")
 
 proc check(label: string, ok: bool) =
   discard console.sendString(if ok: "[PASS] " else: "[FAIL] ")
@@ -479,8 +495,10 @@ proc smokeWifi(): CpsVoidFuture {.cps.} =
 
   var iface = wifi_mgmr_sta_enable()
   check("wifi sta enable", iface != nil)
+  printHeap("before-scan")
   let scanItems = await wifiScanAsync(30_000)
   check("wifi scan", true)
+  printHeap("after-scan")
   discard console.sendString("[WIFI] scan items=")
   console.sendHex32(scanItems)
   discard console.sendString(" done=")
@@ -499,8 +517,10 @@ proc smokeWifi(): CpsVoidFuture {.cps.} =
 
   discard console.sendString("[WIFI] connecting ssid=")
   discard console.sendLine(WifiSsid)
-  check("wifi connect Frog",
-        (await wifiConnectAsync(WifiSsid, WifiPassword, WifiChannel.uint8)) == wifiOk)
+  printHeap("before-connect")
+  let connectOk = (await wifiConnectAsync(WifiSsid, WifiPassword, WifiChannel.uint8)) == wifiOk
+  printHeap("after-connect")
+  check("wifi connect Frog", connectOk)
   check("wifi netif", wifiGetNetif() != nil)
   when WifiBleSimultaneous:
     check("wifi still connected before ble", wifiStaAssociated())

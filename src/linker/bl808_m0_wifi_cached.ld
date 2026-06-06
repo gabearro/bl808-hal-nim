@@ -53,12 +53,22 @@ SECTIONS
         _edata = .;
     } > RAM AT > FLASH
 
-    .bss (NOLOAD) : ALIGN(4)
-    {
-        _sbss = .;
-        *(.ram_wifi_ctrl*)
-        *(.bss .bss.*)
-        *(.sbss .sbss.*)
+	    .bss (NOLOAD) : ALIGN(4)
+	    {
+	        _sbss = .;
+	        . = ALIGN(16);
+	        KEEP(*(.wifibss.rx_dma.0_hd))
+	        . = ALIGN(16);
+	        KEEP(*(.wifibss.rx_dma.1_pd))
+	        . = ALIGN(16);
+	        KEEP(*(.wifibss.rx_dma.2_sw))
+	        . = ALIGN(16);
+	        KEEP(*(.wifibss.rx_dma.3_buf))
+	        . = ALIGN(16);
+	        *(.wifibss .wifibss.*)
+	        *(.ram_wifi_ctrl*)
+	        *(.bss .bss.*)
+	        *(.sbss .sbss.*)
         *(COMMON)
         . = ALIGN(4);
         _ebss = .;

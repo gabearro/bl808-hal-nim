@@ -18,7 +18,7 @@ MEMORY
     WIFI_RAM (rw)  : ORIGIN = 0x22030000, LENGTH = 144K
 }
 
-_stack_size = 16K;
+_stack_size = 8K;
 
 SECTIONS
 {
@@ -55,10 +55,10 @@ SECTIONS
         _edata = .;
     } > RAM AT > FLASH
 
-    .wifibss (NOLOAD) : ALIGN(16)
-    {
-        PROVIDE(__wifi_bss_start = .);
-        *ipc_shared.o(COMMON)
+	    .wifibss (NOLOAD) : ALIGN(16)
+	    {
+	        PROVIDE(__wifi_bss_start = .);
+	        *ipc_shared.o(COMMON)
         *sdu_shared.o(COMMON)
         *hal_desc.o(COMMON)
         *txl_buffer_shared.o(COMMON)
@@ -70,14 +70,24 @@ SECTIONS
         *bl_sta_mgmt_others.o(COMMON)
         *bl_pmk_mgmt.o(COMMON)
         *bl_pmk_mgmt_internal.o(COMMON)
-        *libwifi_drv.a:bl_utils.o(COMMON)
-        *libwifi_drv.a:bl_utils.o(.bss*)
-        *swifi_fw.nim.c.o(COMMON)
-        *swifi_fw.nim.c.o(.bss*)
-        *(.wifi_ram*)
-        . = ALIGN(16);
-        PROVIDE(__wifi_bss_end = .);
-    } > WIFI_RAM
+	        *libwifi_drv.a:bl_utils.o(COMMON)
+	        *libwifi_drv.a:bl_utils.o(.bss*)
+	        . = ALIGN(16);
+	        KEEP(*(.wifibss.rx_dma.0_hd))
+	        . = ALIGN(16);
+	        KEEP(*(.wifibss.rx_dma.1_pd))
+	        . = ALIGN(16);
+	        KEEP(*(.wifibss.rx_dma.2_sw))
+	        . = ALIGN(16);
+	        KEEP(*(.wifibss.rx_dma.3_buf))
+	        . = ALIGN(16);
+	        *swifi_fw.nim.c.o(COMMON)
+	        *swifi_fw.nim.c.o(.bss*)
+	        *(.wifi_ram*)
+	        *(.wifibss .wifibss.*)
+	        . = ALIGN(16);
+	        PROVIDE(__wifi_bss_end = .);
+	    } > WIFI_RAM
 
     .bss (NOLOAD) : ALIGN(4)
     {

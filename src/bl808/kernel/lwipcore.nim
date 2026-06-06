@@ -19,40 +19,70 @@ import ./clock
 # C compilation
 # =============================================================================
 
-# Include paths for lwIP headers
-{.passC: "-I vendor/lwip/src/include".}
-{.passC: "-I src/bl808/kernel".}        # for lwipopts.h
+# Include paths and sources. WiFi firmware images must use the SDK lwIP tree
+# because the WiFi headers put the SDK lwIP include directory first; compiling
+# the vendored lwIP C files against those headers mixes incompatible versions.
+when defined(bl808WifiNimFw):
+  const LwipRoot = "build/bl_iot_sdk_b773b3f/components/network/lwip"
+  when defined(bl808WifiRealLwip):
+    when defined(bl808WifiRealLwipTcp):
+      {.passC: "-Isrc/bl808/kernel/lwip_wifi_http".}
+      {.passC: "-include src/bl808/kernel/lwip_wifi_http/lwipopts.h".}
+      {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/os/freertos_e907/include".}
+      {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/os/freertos_e907/portable/GCC/RISC-V".}
+    else:
+      {.passC: "-Isrc/bl808/kernel/lwip_wifi_smoke".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/lwip/src/include".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/lwip/lwip-port".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/lwip/lwip-port/arch".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/lwip/lwip-port/config".}
+  {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/lwip/lwip-port/FreeRTOS".}
+else:
+  const LwipRoot = "vendor/lwip"
+  {.passC: "-I vendor/lwip/src/include".}
+  {.passC: "-I src/bl808/kernel".}        # for lwipopts.h
 
 # Core files
-{.compile: "vendor/lwip/src/core/init.c".}
-{.compile: "vendor/lwip/src/core/def.c".}
-{.compile: "vendor/lwip/src/core/mem.c".}
-{.compile: "vendor/lwip/src/core/memp.c".}
-{.compile: "vendor/lwip/src/core/pbuf.c".}
-{.compile: "vendor/lwip/src/core/netif.c".}
-{.compile: "vendor/lwip/src/core/ip.c".}
-{.compile: "vendor/lwip/src/core/raw.c".}
-{.compile: "vendor/lwip/src/core/tcp.c".}
-{.compile: "vendor/lwip/src/core/tcp_in.c".}
-{.compile: "vendor/lwip/src/core/tcp_out.c".}
-{.compile: "vendor/lwip/src/core/udp.c".}
-{.compile: "vendor/lwip/src/core/inet_chksum.c".}
-{.compile: "vendor/lwip/src/core/timeouts.c".}
-{.compile: "vendor/lwip/src/core/dns.c".}
-{.compile: "vendor/lwip/src/core/sys.c".}
-{.compile: "vendor/lwip/src/core/stats.c".}
+{.compile: LwipRoot & "/src/core/init.c".}
+{.compile: LwipRoot & "/src/core/def.c".}
+{.compile: LwipRoot & "/src/core/mem.c".}
+{.compile: LwipRoot & "/src/core/memp.c".}
+{.compile: LwipRoot & "/src/core/pbuf.c".}
+{.compile: LwipRoot & "/src/core/netif.c".}
+{.compile: LwipRoot & "/src/core/ip.c".}
+{.compile: LwipRoot & "/src/core/raw.c".}
+when defined(bl808WifiRealLwipTcp):
+  {.compile: "src/bl808/kernel/lwip_wifi_http/tcp_enabled.c".}
+  {.compile: "src/bl808/kernel/lwip_wifi_http/tcp_in_enabled.c".}
+  {.compile: "src/bl808/kernel/lwip_wifi_http/tcp_out_enabled.c".}
+elif not defined(bl808WifiRealLwip):
+  {.compile: LwipRoot & "/src/core/tcp.c".}
+  {.compile: LwipRoot & "/src/core/tcp_in.c".}
+  {.compile: LwipRoot & "/src/core/tcp_out.c".}
+{.compile: LwipRoot & "/src/core/udp.c".}
+{.compile: LwipRoot & "/src/core/inet_chksum.c".}
+when defined(bl808WifiRealLwip):
+  {.compile: "src/bl808/kernel/lwip_wifi_smoke/timeouts.c".}
+else:
+  {.compile: LwipRoot & "/src/core/timeouts.c".}
+when not defined(bl808WifiRealLwip):
+  {.compile: LwipRoot & "/src/core/dns.c".}
+{.compile: LwipRoot & "/src/core/sys.c".}
+when not defined(bl808WifiRealLwip):
+  {.compile: LwipRoot & "/src/core/stats.c".}
 
 # IPv4
-{.compile: "vendor/lwip/src/core/ipv4/acd.c".}
-{.compile: "vendor/lwip/src/core/ipv4/etharp.c".}
-{.compile: "vendor/lwip/src/core/ipv4/ip4.c".}
-{.compile: "vendor/lwip/src/core/ipv4/ip4_addr.c".}
-{.compile: "vendor/lwip/src/core/ipv4/ip4_frag.c".}
-{.compile: "vendor/lwip/src/core/ipv4/icmp.c".}
-{.compile: "vendor/lwip/src/core/ipv4/dhcp.c".}
+when not defined(bl808WifiNimFw):
+  {.compile: LwipRoot & "/src/core/ipv4/acd.c".}
+{.compile: LwipRoot & "/src/core/ipv4/etharp.c".}
+{.compile: LwipRoot & "/src/core/ipv4/ip4.c".}
+{.compile: LwipRoot & "/src/core/ipv4/ip4_addr.c".}
+{.compile: LwipRoot & "/src/core/ipv4/ip4_frag.c".}
+{.compile: LwipRoot & "/src/core/ipv4/icmp.c".}
+{.compile: LwipRoot & "/src/core/ipv4/dhcp.c".}
 
 # Netif
-{.compile: "vendor/lwip/src/netif/ethernet.c".}
+{.compile: LwipRoot & "/src/netif/ethernet.c".}
 
 # Arch
 {.compile: "src/bl808/kernel/sys_arch.c".}
@@ -137,6 +167,10 @@ proc pbufFree*(p: ptr Pbuf): uint8 {.importc: "pbuf_free",
 proc pbufTake*(buf: ptr Pbuf, data: pointer, len: uint16): ErrT
   {.importc: "pbuf_take", header: "lwip/pbuf.h".}
 
+proc pbufCopyPartial*(p: ptr Pbuf, buf: pointer, len: uint16,
+                      offset: uint16): uint16
+  {.importc: "pbuf_copy_partial", header: "lwip/pbuf.h".}
+
 proc pbufPayload*(p: ptr Pbuf): pointer =
   {.emit: "result = `p`->payload;".}
 
@@ -213,6 +247,29 @@ proc etharpOutput*(netif: ptr Netif, q: ptr Pbuf,
 
 proc dhcpStart*(netif: ptr Netif): ErrT
   {.importc: "dhcp_start", header: "lwip/dhcp.h".}
+
+# =============================================================================
+# Raw API
+# =============================================================================
+
+type
+  RawPcb* {.importc: "struct raw_pcb", header: "lwip/raw.h",
+             incompleteStruct.} = object
+
+  RawRecvFn* = proc(arg: pointer, pcb: ptr RawPcb, p: ptr Pbuf,
+                    address: ptr IpAddr): uint8 {.cdecl.}
+
+proc rawNew*(proto: uint8): ptr RawPcb
+  {.importc: "raw_new", header: "lwip/raw.h".}
+
+proc rawRecv*(pcb: ptr RawPcb, recv: RawRecvFn, arg: pointer)
+  {.importc: "raw_recv", header: "lwip/raw.h".}
+
+proc rawSendto*(pcb: ptr RawPcb, p: ptr Pbuf, dst: ptr IpAddr): ErrT
+  {.importc: "raw_sendto", header: "lwip/raw.h".}
+
+proc rawRemove*(pcb: ptr RawPcb)
+  {.importc: "raw_remove", header: "lwip/raw.h".}
 
 # =============================================================================
 # IP address helpers

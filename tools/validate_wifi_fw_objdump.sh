@@ -9,6 +9,16 @@ Usage:
 Examples:
   tools/validate_wifi_fw_objdump.sh /tmp/libfirmware_ad2a37.a /tmp/nimcache_wifi_fw_shim3/@pbl808@swifi_fw.nim.c.o
   tools/validate_wifi_fw_objdump.sh /tmp/libfirmware_ad2a37.a /tmp/libwifi_fw_nim.a
+
+Optional RF/PHY provenance checks:
+  VALIDATE_RF_ELF=/tmp/kernel.elf tools/validate_wifi_fw_objdump.sh <ref> <nim_obj>
+  VALIDATE_RF_BUILD_LOG=build.log tools/validate_wifi_fw_objdump.sh <ref> <nim_obj>
+  VALIDATE_RF_LINK_MAP=kernel.map tools/validate_wifi_fw_objdump.sh <ref> <nim_obj>
+  VALIDATE_RF_REQUIRE_HW_NIMCACHE=1 VALIDATE_RF_ELF=build/hw-validation/bin/<test>/kernel.elf tools/validate_wifi_fw_objdump.sh <ref> <nim_obj>
+  When src/bl808/librf_bl808.a is present, the RF provenance step also checks
+  that WiFi phy_init copies agcmem to 0x24C0A000 and has no LDPC RAM path.
+  When a hw-validation kernel.map exists beside VALIDATE_RF_ELF, the RF
+  provenance step also rejects extracted RF archive members in the link map.
 USAGE
   exit 2
 fi
@@ -16,7 +26,19 @@ fi
 REF="$1"
 NIM_BIN="$2"
 
-for tool in riscv64-unknown-elf-nm riscv64-unknown-elf-objdump python3; do
+LLVM_OBJDUMP="${LLVM_OBJDUMP:-}"
+if [[ -z "$LLVM_OBJDUMP" ]]; then
+  if command -v llvm-objdump >/dev/null 2>&1; then
+    LLVM_OBJDUMP="$(command -v llvm-objdump)"
+  elif [[ -x /opt/homebrew/opt/llvm/bin/llvm-objdump ]]; then
+    LLVM_OBJDUMP=/opt/homebrew/opt/llvm/bin/llvm-objdump
+  else
+    echo "Missing required tool: llvm-objdump" >&2
+    exit 1
+  fi
+fi
+
+for tool in riscv64-unknown-elf-nm python3; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "Missing required tool: $tool" >&2
     exit 1
@@ -59,7 +81,7 @@ if [[ "$(comm -23 "$NIM_FUNCS" "$REF_FUNCS" | wc -l | tr -d ' ')" -gt 0 ]]; then
   comm -23 "$NIM_FUNCS" "$REF_FUNCS" | sed -n '1,20p'
 fi
 
-python3 - "$REF" "$NIM_BIN" "$REF_FUNCS" "$NIM_FUNCS" <<'PY'
+python3 - "$REF" "$NIM_BIN" "$REF_FUNCS" "$NIM_FUNCS" "$LLVM_OBJDUMP" <<'PY'
 import re
 import subprocess
 import sys
@@ -69,11 +91,17 @@ ref = sys.argv[1]
 nim = sys.argv[2]
 ref_funcs = set(Path(sys.argv[3]).read_text().split())
 nim_funcs = set(Path(sys.argv[4]).read_text().split())
+llvm_objdump = sys.argv[5]
 common = sorted(ref_funcs & nim_funcs)
+
+THEAD_MATTR = (
+    "+xtheadba,+xtheadbb,+xtheadbs,+xtheadcmo,+xtheadcondmov,"
+    "+xtheadfmemidx,+xtheadmac,+xtheadmemidx,+xtheadmempair,+xtheadsync"
+)
 
 def parse_objdump(path: str):
     txt = subprocess.check_output(
-        ["riscv64-unknown-elf-objdump", "-d", path],
+        [llvm_objdump, "-d", f"--mattr={THEAD_MATTR}", path],
         text=True,
         errors="ignore",
     )
@@ -130,3 +158,28 @@ if len(byte_eq) != len(checked):
         print(f"  {f}: {rl} vs {nl} (delta {d})")
 PY
 
+if [[ -f tools/validate_rf_symbol_provenance.py ]]; then
+  RF_ARGS=(--wifi-object "$NIM_BIN")
+  if [[ -f src/bl808/librf_bl808.a ]]; then
+    RF_ARGS+=(--rf-archive src/bl808/librf_bl808.a --check-wifi-phy-memory-init)
+  fi
+  if [[ -n "${VALIDATE_RF_ELF:-}" ]]; then
+    RF_ARGS+=(--elf "$VALIDATE_RF_ELF" --check-hw-validation-nimcache-objects)
+    inferred_map="${VALIDATE_RF_ELF%.elf}.map"
+    if [[ -f "$inferred_map" ]]; then
+      RF_ARGS+=(--link-map "$inferred_map")
+    fi
+    if [[ -n "${VALIDATE_RF_REQUIRE_HW_NIMCACHE:-}" ]]; then
+      RF_ARGS+=(--require-hw-validation-wifi-nimcache-object)
+    fi
+  fi
+  if [[ -n "${VALIDATE_RF_BUILD_LOG:-}" ]]; then
+    RF_ARGS+=(--build-log "$VALIDATE_RF_BUILD_LOG")
+  fi
+  if [[ -n "${VALIDATE_RF_LINK_MAP:-}" ]]; then
+    RF_ARGS+=(--link-map "$VALIDATE_RF_LINK_MAP")
+  fi
+  echo ""
+  echo "RF/PHY symbol provenance:"
+  python3 tools/validate_rf_symbol_provenance.py "${RF_ARGS[@]}"
+fi

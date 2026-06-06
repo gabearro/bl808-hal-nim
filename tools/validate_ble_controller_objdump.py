@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +23,25 @@ from pathlib import Path
 
 def run(args: list[str]) -> str:
     return subprocess.check_output(args, text=True, errors="ignore")
+
+
+THEAD_MATTR = (
+    "+xtheadba,+xtheadbb,+xtheadbs,+xtheadcmo,+xtheadcondmov,"
+    "+xtheadfmemidx,+xtheadmac,+xtheadmemidx,+xtheadmempair,+xtheadsync"
+)
+
+
+def llvm_objdump() -> str:
+    configured = os.environ.get("LLVM_OBJDUMP")
+    if configured:
+        return configured
+    found = shutil.which("llvm-objdump")
+    if found:
+        return found
+    homebrew = Path("/opt/homebrew/opt/llvm/bin/llvm-objdump")
+    if homebrew.exists():
+        return str(homebrew)
+    raise SystemExit("Missing required tool: llvm-objdump")
 
 
 def nm_functions(path: Path) -> set[str]:
@@ -34,7 +55,7 @@ def nm_functions(path: Path) -> set[str]:
 
 
 def parse_objdump(path: Path) -> dict[str, dict[str, list[str]]]:
-    text = run(["riscv64-unknown-elf-objdump", "-d", str(path)])
+    text = run([llvm_objdump(), "-d", f"--mattr={THEAD_MATTR}", str(path)])
     current: str | None = None
     out: dict[str, dict[str, list[str]]] = {}
     for line in text.splitlines():

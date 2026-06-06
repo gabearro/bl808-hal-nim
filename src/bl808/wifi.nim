@@ -168,6 +168,8 @@ when defined(bl808m0):
     {.passC: "-DBL808_WIFI_FORCE_RESP_TX_POWER=0x70 -DBL808_WIFI_FORCE_RESP_TX_POWER_ALL".}
   {.passC: "-fcommon -fshort-enums -Wno-incompatible-pointer-types -Wno-int-conversion -Wno-implicit-function-declaration".}
   {.passC: "-Isrc/bl808".}
+  when defined(bl808WifiRealLwip):
+    {.passC: "-Isrc/bl808/kernel/lwip_wifi_smoke".}
   {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver/include".}
   {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi_manager/bl60x_wifi_driver".}
   {.passC: "-Ibuild/bl_iot_sdk_b773b3f/components/network/wifi/include".}
@@ -261,7 +263,7 @@ when defined(bl808m0):
   when defined(bl808WifiConnectTraceRawRx):
     {.passL: "-Wl,--wrap=rxl_cntrl_evt".}
   when defined(bl808WifiUseBl808Rf):
-    {.passL: "-Wl,--start-group src/bl808/librf_bl808.a -Wl,--end-group".}
+    {.passL: "-Wl,--wrap=phy_assert_err".}
   else:
     {.passL: "-Wl,--start-group build/bl_iot_sdk_b773b3f/components/platform/soc/bl606p/bl606p_phyrf/lib/libbl606p_phyrf.a -Wl,--end-group".}
 
@@ -359,7 +361,7 @@ when defined(bl808m0):
     ## Returns struct netif* (lwIP network interface for STA).
 
   # --- PHY/RF companion archive used by the Nim firmware backend ---
-  proc phy_init*(cfg: pointer): cint
+  proc phy_init*(cfg: pointer)
     {.importc, cdecl.}
     ## Initialize PHY. Called internally by wifi_mgmr_init.
 
@@ -728,6 +730,7 @@ when defined(bl808m0):
     if wifiBackendUsesEventFutures():
       for _ in 0 ..< 30_000:
         wifiBackendPoll(8)
+        wifiNimFirmwareServiceTx(8)
         if wifiBackendConnectDone():
           break
     return if wifiBackendConnected(): wifiOk else: wifiFail
@@ -789,7 +792,7 @@ when defined(bl808m0):
       var loopIter: int = 0
       for _ in 0 ..< 10_000:
         wifiBackendPoll(8)
-        if wifiBackendDisconnectDone() or wifiNimFirmwareStaIdle():
+        if wifiNimFirmwareStaIdle():
           return wifiOk
         inc loopIter
         if (loopIter mod 500) == 0:

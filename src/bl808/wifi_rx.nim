@@ -235,6 +235,18 @@ when defined(bl808m0) and defined(bl808WifiNimFw):
   var cbRssiEnv: pointer
   var cbEvent: EventCb
   var cbEventEnv: pointer
+  var nimFwDbgRxSmStaAdd* {.exportc: "nimfw_dbg_rx_sm_sta_add".}: uint32
+  var nimFwDbgRxSmStaAddMeta* {.exportc: "nimfw_dbg_rx_sm_sta_add_meta".}: uint32
+  var nimFwDbgRxSmStaAddVif* {.exportc: "nimfw_dbg_rx_sm_sta_add_vif".}: uint32
+  var nimFwDbgRxSmStaAddSta* {.exportc: "nimfw_dbg_rx_sm_sta_add_sta".}: uint32
+  var nimFwDbgRxSmStaAddError* {.exportc: "nimfw_dbg_rx_sm_sta_add_error".}: uint32
+  var nimFwDbgRxSmDisc* {.exportc: "nimfw_dbg_rx_sm_disc".}: uint32
+  var nimFwDbgRxSmSeq* {.exportc: "nimfw_dbg_rx_sm_seq".}: uint32
+  var nimFwDbgRxSmStaAddSeq* {.exportc: "nimfw_dbg_rx_sm_sta_add_seq".}: uint32
+  var nimFwDbgRxSmDiscSeq* {.exportc: "nimfw_dbg_rx_sm_disc_seq".}: uint32
+  var nimFwDbgRxSmDiscMeta* {.exportc: "nimfw_dbg_rx_sm_disc_meta".}: uint32
+  var nimFwDbgRxSmDiscVif* {.exportc: "nimfw_dbg_rx_sm_disc_vif".}: uint32
+  var nimFwDbgRxSmDiscSta* {.exportc: "nimfw_dbg_rx_sm_disc_sta".}: uint32
 
   proc c_memset(s: pointer; c: cint; n: csize_t): pointer
     {.importc: "memset", header: "<string.h>", cdecl.}
@@ -600,10 +612,24 @@ when defined(bl808m0) and defined(bl808WifiNimFw):
     0
 
   proc blRxSmDisconnectInd(blHw, cmd, msg: pointer): cint {.cdecl.} =
+    inc nimFwDbgRxSmDisc
     let ind = msgParam(msg)
     let vif = vifAt(blHw, BlVifSta)
     var indNew: array[WifiDiscEventSize.int, uint8]
     var addrAny: uint32
+    inc nimFwDbgRxSmSeq
+    nimFwDbgRxSmDiscSeq = nimFwDbgRxSmSeq
+    nimFwDbgRxSmDiscMeta = loadU16(ind, SmDiscStatusOff).uint32 or
+      (loadU16(ind, SmDiscReasonOff).uint32 shl 16)
+    nimFwDbgRxSmDiscVif = loadU8(vif, BlVifLinksNumOff).uint32 or
+      (loadU8(vif, BlVifFixedStaIdxOff).uint32 shl 8) or
+      (loadU8(vif, BlVifFcChanOff).uint32 shl 16) or
+      (loadU8(vif, BlVifStaPsOff).uint32 shl 24)
+    let discSta = staAt(blHw, loadU8(vif, BlVifFixedStaIdxOff).uint)
+    nimFwDbgRxSmDiscSta = loadU8(discSta, BlStaIsUsedOff).uint32 or
+      (loadU8(discSta, BlStaStaIdxOff).uint32 shl 8) or
+      (loadU8(discSta, BlStaVifIdxOff).uint32 shl 16) or
+      (loadU8(discSta, BlStaQosOff).uint32 shl 24)
     bl_os_printf("[RX]   sm_disconnect_ind\r\n       status_code %u\r\n       802.11 reason_code %u\r\n",
                  loadU16(ind, SmDiscStatusOff).cuint, loadU16(ind, SmDiscReasonOff).cuint)
     bl_os_printf("[RX]   disconnect reason: %s\r\n", smStatusStr(loadU16(ind, SmDiscStatusOff)))
@@ -638,7 +664,15 @@ when defined(bl808m0) and defined(bl808WifiNimFw):
   proc blRxSmStaAddInd(blHw, cmd, msg: pointer): cint {.cdecl.} =
     let ind = msgParam(msg)
     let vif = vifAt(blHw, BlVifSta)
+    inc nimFwDbgRxSmStaAdd
+    inc nimFwDbgRxSmSeq
+    nimFwDbgRxSmStaAddSeq = nimFwDbgRxSmSeq
+    nimFwDbgRxSmStaAddMeta = loadU8(ind, SmStaAddApIdxOff).uint32 or
+      (loadU8(ind, SmStaAddQosOff).uint32 shl 8) or
+      (loadU8(vif, BlVifLinksNumOff).uint32 shl 16) or
+      (loadU8(vif, BlVifFixedStaIdxOff).uint32 shl 24)
     if loadU8(vif, BlVifLinksNumOff) > 0:
+      inc nimFwDbgRxSmStaAddError
       bl_os_printf("[WF] Error: illegal sm_sta_add, sta_idx: %d\r\n", loadU8(ind, SmStaAddApIdxOff).cint)
       return -1
     storeU8(vif, BlVifLinksNumOff, loadU8(vif, BlVifLinksNumOff) + 1)
@@ -650,6 +684,14 @@ when defined(bl808m0) and defined(bl808WifiNimFw):
     storeU8(sta, BlStaQosOff, loadU8(ind, SmStaAddQosOff))
     storeU8(sta, BlStaFcPsOff, 0)
     storeU8(sta, BlStaIsUsedOff, 1)
+    nimFwDbgRxSmStaAddVif = loadU8(vif, BlVifLinksNumOff).uint32 or
+      (loadU8(vif, BlVifFixedStaIdxOff).uint32 shl 8) or
+      (loadU8(vif, BlVifFcChanOff).uint32 shl 16) or
+      (loadU8(vif, BlVifStaPsOff).uint32 shl 24)
+    nimFwDbgRxSmStaAddSta = loadU8(sta, BlStaIsUsedOff).uint32 or
+      (loadU8(sta, BlStaStaIdxOff).uint32 shl 8) or
+      (loadU8(sta, BlStaVifIdxOff).uint32 shl 16) or
+      (loadU8(sta, BlStaQosOff).uint32 shl 24)
     bl_tx_cntrl_link_up(cast[ptr BlSta](sta))
     0
 
