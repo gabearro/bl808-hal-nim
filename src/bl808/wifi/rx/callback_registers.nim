@@ -1,0 +1,4 @@
+include callback_registers_parts/packet
+include callback_registers_parts/station
+include callback_registers_parts/scan
+include callback_registers_parts/misc

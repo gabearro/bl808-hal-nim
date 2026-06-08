@@ -1,0 +1,71 @@
+proc bl808WifiBackendApplyHighPowerProfile() =
+  var ch: array[14, int8]
+  var pwr11b = [0x1c'i8, 0x1c'i8, 0x1c'i8, 0x1c'i8]
+  var pwr11g = [0x1c'i8, 0x1c'i8, 0x1c'i8, 0x1c'i8, 0x1c'i8, 0x1c'i8, 0x1c'i8, 0x1c'i8]
+  var pwr11n = [0x1c'i8, 0x1c'i8, 0x1c'i8, 0x1c'i8, 0x1c'i8, 0x1c'i8, 0x1c'i8, 0x1c'i8]
+  phy_powroffset_set(addr ch[0])
+  bl_tpc_update_power_rate_11b(addr pwr11b[0])
+  bl_tpc_update_power_rate_11g(addr pwr11g[0])
+  bl_tpc_update_power_rate_11n(addr pwr11n[0])
+
+proc bl808WifiBackendTrace(step: cstring) =
+  validationPutsRaw("[WIFI-NIMFW] ")
+  validationPutsRaw(step)
+  validationPutsRaw("\r\n")
+  vendorPutsRaw("[WIFI-NIMFW] ")
+  vendorPutsRaw(step)
+  vendorPutsRaw("\r\n")
+
+proc bl808WifiBackendFwStart() =
+  if fwStarted: return
+  setupBlOps()
+  setupHosal()
+  discard bl_wifi_clock_enable()
+  let irqState = osEnterCritical()
+  regWrite32(IntcPend, regRead32(IntcPend) or 0x10)
+  arch_delay_us(100)
+  regWrite32(IntcPend, regRead32(IntcPend) and not 0x10'u32)
+  arch_delay_us(100)
+  osExitCritical(irqState)
+  bl808WifiBackendTrace("wifi_hosal_rf_turn_on begin")
+  discard wifi_hosal_rf_turn_on(nil)
+  bl808WifiBackendTrace("wifi_hosal_rf_turn_on done")
+  when defined(bl808WifiUseBl808Rf):
+    bl808WifiBackendTrace("wifi_rf_core_init begin")
+    wifiRfCoreInit(40_000_000)
+    bl808WifiBackendTrace("wifi_rf_core_init done")
+  else:
+    bl808WifiBackendTrace("rf_init begin")
+    rf_init(40_000_000)
+    bl808WifiBackendTrace("rf_init done")
+  bl808WifiBackendTrace("high_power_profile begin")
+  bl808WifiBackendApplyHighPowerProfile()
+  bl808WifiBackendTrace("high_power_profile done")
+  bl808WifiBackendTrace("mpif_clk_init begin")
+  mpif_clk_init()
+  bl808WifiBackendTrace("mpif_clk_init done")
+  bl808WifiBackendTrace("sysctrl_init begin")
+  sysctrl_init()
+  bl808WifiBackendTrace("sysctrl_init done")
+  bl808WifiBackendTrace("intc_init begin")
+  intc_init()
+  bl808WifiBackendTrace("intc_init done")
+  bl808WifiBackendTrace("ipc_emb_init begin")
+  ipc_emb_init()
+  bl808WifiBackendTrace("ipc_emb_init done")
+  bl808WifiBackendClearEmbIpc()
+  bl808WifiBackendClearHostIpc()
+  bl808WifiBackendTrace("bl_init begin")
+  bl_init()
+  bl808WifiBackendTrace("bl_init done")
+  bl808WifiBackendTrace("bl_pm_ops_register begin")
+  bl_pm_ops_register()
+  bl808WifiBackendTrace("bl_pm_ops_register done")
+  regWrite32(BcnStatus + 4, 0x0024_f037'u32)
+  regWrite32(BcnStatus, regRead32(BcnStatus) or 0x01)
+  regWrite32(BcnStatus, regRead32(BcnStatus) and not 0x01'u32)
+  regWrite32(BcnStatus, 0x68)
+  regWrite32(BcnStatus, regRead32(BcnStatus) or 0x01)
+  regWrite32(BcnStatus, regRead32(BcnStatus) and not 0x20'u32)
+  regWrite32(CoexCtrl, 0x5010_001f'u32)
+  fwStarted = true

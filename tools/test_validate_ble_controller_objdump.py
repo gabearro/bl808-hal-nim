@@ -6,6 +6,27 @@ from pathlib import Path
 import validate_ble_controller_objdump as audit
 
 
+def nim_source_with_includes(path: Path) -> str:
+    lines: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("include "):
+            include_name = stripped.split(None, 1)[1].split("#", 1)[0].strip()
+            include_path = path.parent / (include_name.replace(".", "/") + ".nim")
+            if include_path.exists():
+                indent = line[: len(line) - len(line.lstrip())]
+                included = nim_source_with_includes(include_path)
+                lines.append("\n".join(indent + included_line for included_line in included.splitlines()))
+                continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def blecontroller_policy_source() -> str:
+    source = Path(__file__).resolve().parents[1] / "src/bl808/blecontroller.nim"
+    return nim_source_with_includes(source)
+
+
 def test_function_instruction_count_includes_compiler_body_fragments():
     disassembly = {
         "sch_prog_push": {"bytes": ["c509", "00000317", "00030067"], "mnem": []},
@@ -114,8 +135,7 @@ def test_likely_active_placeholder_ignores_compiled_wrapper_fallback(tmp_path):
 
 
 def test_llcp_data_length_response_is_feature_gated():
-    source = Path(__file__).resolve().parents[1] / "src/bl808/blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     feature_block = text.split("NimBleConservativeLeFeatures =", 1)[1].split(
         "proc nimBleFeatureByte", 1
@@ -151,8 +171,7 @@ def test_llcp_data_length_response_is_feature_gated():
 
 
 def test_hci_local_supported_features_matches_advertised_bitmap():
-    source = Path(__file__).resolve().parents[1] / "src/bl808/blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "HciOpLeReadLocalSupportedFeatures = 0x2003'u16" in text
     assert "sendLeReadLocalSupportedFeaturesComplete" in text
@@ -171,8 +190,7 @@ def test_hci_local_supported_features_matches_advertised_bitmap():
 
 
 def test_remote_feature_exchange_tracks_feature_req_and_hci_pending_event():
-    source = Path(__file__).resolve().parents[1] / "src/bl808/blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "HciOpLeReadRemoteFeatures = 0x2016'u16" in text
 
@@ -216,8 +234,7 @@ def test_remote_feature_exchange_tracks_feature_req_and_hci_pending_event():
 
 
 def test_read_remote_version_info_is_async_command_status_then_complete_event():
-    source = Path(__file__).resolve().parents[1] / "src/bl808/blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "HciOpReadRemoteVersionInfo = 0x041D'u16" in text
 
@@ -242,8 +259,7 @@ def test_read_remote_version_info_is_async_command_status_then_complete_event():
 
 
 def test_connection_update_command_queues_llcp_and_completes_at_instant():
-    source = Path(__file__).resolve().parents[1] / "src/bl808/blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "HciOpLeConnectionUpdate = 0x2013'u16" in text
 
@@ -276,8 +292,7 @@ def test_connection_update_command_queues_llcp_and_completes_at_instant():
 
 
 def test_remote_connection_parameter_reply_is_not_fake_success():
-    source = Path(__file__).resolve().parents[1] / "src/bl808/blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     reply = text.split(
         "proc hci_le_rem_con_param_req_reply_cmd_handler", 1
@@ -293,8 +308,7 @@ def test_remote_connection_parameter_reply_is_not_fake_success():
 
 
 def test_ble_controller_trng_polling_masks_done_interrupt():
-    source = Path(__file__).resolve().parents[1] / "src/bl808/blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     wait_idle = text.split("proc bleTrngWaitIdle", 1)[1].split(
         "proc bleTrngClearInterrupt", 1
@@ -313,8 +327,7 @@ def test_ble_controller_trng_polling_masks_done_interrupt():
 
 
 def test_hci_p256_crypto_outputs_are_marshaled_from_controller_buffer():
-    source = Path(__file__).resolve().parents[1] / "src/bl808/blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     read_p256 = text.rsplit("proc sendLeReadLocalP256Complete", 1)[1].split(
         "proc sendLeGenerateDhKeyComplete", 1

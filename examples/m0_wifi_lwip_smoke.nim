@@ -165,8 +165,8 @@ var nimfw_dbg_probe_pay_hw_frame_len {.importc.}: uint32
 var nimfw_dbg_probe_pay_hw_status {.importc.}: uint32
 var nimfw_dbg_probe_pay_hw_ctrl {.importc.}: uint32
 var nimfw_dbg_probe_pay_hw_chain {.importc.}: uint32
-var nimfw_dbg_probe_pay_hw_word36 {.importc.}: uint32
-var nimfw_dbg_probe_pay_hw_word56 {.importc.}: uint32
+var probePayHwRetryLimitControl {.importc: "nimfw_dbg_probe_pay_hw_retry_limit_control".}: uint32
+var probePayHwAckPolicyControl {.importc: "nimfw_dbg_probe_pay_hw_ack_policy_control".}: uint32
 var nimfw_dbg_probe_pay_raw {.importc.}: array[96, uint8]
 var nimfw_dbg_probe_ie_len {.importc.}: uint32
 var nimfw_dbg_probe_ie_raw {.importc.}: array[64, uint8]
@@ -998,8 +998,8 @@ proc runOneAttempt(): bool {.nimcall.} =
       kvWrite("probe_hstat", nimfw_dbg_probe_pay_hw_status)
       kvWrite("probe_hctrl", nimfw_dbg_probe_pay_hw_ctrl)
       kvWrite("probe_hchain", nimfw_dbg_probe_pay_hw_chain)
-      kvWrite("probe_h36", nimfw_dbg_probe_pay_hw_word36)
-      kvWrite("probe_h56", nimfw_dbg_probe_pay_hw_word56)
+      kvWrite("probe_retry_limit_control", probePayHwRetryLimitControl)
+      kvWrite("probe_ack_policy", probePayHwAckPolicyControl)
       kvWrite("probe_ie_len", nimfw_dbg_probe_ie_len)
       kvWrite("probe_ie0", loadLe32(nimfw_dbg_probe_ie_raw, 0))
       kvWrite("probe_ie4", loadLe32(nimfw_dbg_probe_ie_raw, 4))

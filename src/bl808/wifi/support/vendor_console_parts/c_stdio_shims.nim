@@ -1,0 +1,6 @@
+include c_stdio_shims_parts/headers
+include c_stdio_shims_parts/unsigned_format
+include c_stdio_shims_parts/format_dispatch
+include c_stdio_shims_parts/weak_stdio
+include c_stdio_shims_parts/string_format_stub
+include c_stdio_shims_parts/os_log_bridge

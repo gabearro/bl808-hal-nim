@@ -7,6 +7,53 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def nim_source_with_includes(path: Path) -> str:
+    lines = []
+    for line in path.read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("include "):
+            include_name = stripped.split(None, 1)[1].split("#", 1)[0].strip()
+            include_rel = include_name.replace(".", "/") + ".nim"
+            include_path = path.parent / include_rel
+            if not include_path.exists():
+                include_path = ROOT / "src/bl808/wifi" / include_rel
+            if include_path.exists():
+                indent = line[: len(line) - len(line.lstrip())]
+                included = nim_source_with_includes(include_path)
+                lines.append("\n".join(indent + included_line for included_line in included.splitlines()))
+                continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def wifi_fw_policy_source() -> str:
+    return "\n".join(
+        [
+            nim_source_with_includes(ROOT / "src/bl808/wifi_fw.nim"),
+            (ROOT / "src/bl808/radio_phy.nim").read_text(),
+            nim_source_with_includes(ROOT / "src/bl808/wifi/fw_constants.nim"),
+            nim_source_with_includes(ROOT / "src/bl808/wifi/fw_messages.nim"),
+        ]
+    )
+
+
+def wifi_fw_policy_paths() -> list[Path]:
+    return [
+        ROOT / "src/bl808/wifi_fw.nim",
+        *sorted((ROOT / "src/bl808/wifi/fw").glob("*.nim")),
+    ]
+
+
+def blecontroller_policy_source() -> str:
+    return nim_source_with_includes(ROOT / "src/bl808/blecontroller.nim")
+
+def blecontroller_policy_paths() -> list[Path]:
+    return [
+        ROOT / "src/bl808/blecontroller.nim",
+        *sorted((ROOT / "src/bl808/blecontroller").glob("*.nim")),
+    ]
+
+
 def llvm_objdump_cmd():
     return shutil.which("llvm-objdump") or "/opt/homebrew/opt/llvm/bin/llvm-objdump"
 
@@ -70,7 +117,7 @@ def test_ble_wifi_coexistence_mode_keeps_sta_connected_during_ble():
 
 
 def test_ble_bt_priority_pta_uses_single_masked_update_helper():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
     body = ble.split(
         "proc configureBtPriorityPta()", 1
     )[1].split(
@@ -95,7 +142,7 @@ def test_ble_bt_priority_pta_uses_single_masked_update_helper():
 
 
 def test_wifi_pta_autocontrol_uses_single_masked_update_helper():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
     body = wifi_fw.rsplit(
         "proc coex_pta_force_autocontrol_set*", 1
     )[1].split(
@@ -139,9 +186,9 @@ def test_mixed_ble_wifi_harness_has_no_vendor_path_branches():
 
 
 def test_wifi_async_lifecycle_uses_event_futures_not_poll_loops():
-    wifi = (ROOT / "src/bl808/wifi.nim").read_text()
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
-    wifi_support = (ROOT / "src/bl808/wifi_support.nim").read_text()
+    wifi = nim_source_with_includes(ROOT / "src/bl808/wifi.nim")
+    wifi_fw = wifi_fw_policy_source()
+    wifi_support = nim_source_with_includes(ROOT / "src/bl808/wifi/support.nim")
     assert "wifiCompletePendingEvents()" in wifi
     assert "proc wifiInstallServiceHook*" in wifi
     assert "proc wifiConfigureServiceHook*" in wifi
@@ -220,7 +267,7 @@ def test_wifi_async_lifecycle_uses_event_futures_not_poll_loops():
     assert wifi_drain.index("ke_evt_schedule()") < wifi_drain.index(
         "if wifiHiddenMessagePendingWork():"
     )
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
     assert "proc blecontroller_service_step*" in ble
     assert "proc blecontroller_poll_once*" in ble
     assert "BleControllerServiceMode = enum" not in ble
@@ -325,7 +372,7 @@ def test_wifi_async_lifecycle_uses_event_futures_not_poll_loops():
 
 
 def test_wifi_sync_connect_services_nim_firmware_tx():
-    wifi = (ROOT / "src/bl808/wifi.nim").read_text()
+    wifi = nim_source_with_includes(ROOT / "src/bl808/wifi.nim")
 
     body = wifi.split(
         "proc wifiConnect*(ssid, password: string, channel: uint8 = 0): WifiError =",
@@ -347,7 +394,7 @@ def test_wifi_sync_connect_services_nim_firmware_tx():
 
 
 def test_wifi_firmware_hardware_waits_are_bounded_for_cps_runtime():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     assert "WifiHwPollLimit = 100_000'u32" in wifi_fw
     assert "nimfw_dbg_hw_wait_timeout_count" in wifi_fw
@@ -474,7 +521,7 @@ def test_wifi_firmware_hardware_waits_are_bounded_for_cps_runtime():
 
 
 def test_wifi_machwkey_delete_uses_vif_overlay_lookup():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split("proc mm_sec_machwkey_del*", 1)[1].split(
         "proc mm_sec_machwkey_get*", 1
@@ -494,7 +541,7 @@ def test_wifi_machwkey_delete_uses_vif_overlay_lookup():
 
 
 def test_wifi_tx_descriptor_update_does_not_hard_trap_cps_runtime():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     thd_body = wifi_fw.split("proc txl_buffer_update_thd*", 1)[1].split(
         "proc txl_cfm_init*", 1
@@ -511,7 +558,7 @@ def test_wifi_tx_descriptor_update_does_not_hard_trap_cps_runtime():
 
 
 def test_wifi_apm_sta_add_confirm_does_not_trap_scheduler():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     apm_body = wifi_fw.split("proc apm_sta_add_cfm_handler*", 1)[1].split(
         "{.emit: \"__attribute__((optimize(\\\"crossjumping\\\"))) void apm_sta_del_req_handler",
@@ -528,7 +575,7 @@ def test_wifi_apm_sta_add_confirm_does_not_trap_scheduler():
 
 
 def test_wifi_assert_err_requests_reset_without_blocking_scheduler():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     assert_body = wifi_fw.split(
         "proc assert_err*(cond: cstring, file: cstring, line: cint) {.exportc, cdecl.} =",
@@ -549,7 +596,7 @@ def test_wifi_assert_err_requests_reset_without_blocking_scheduler():
 
 
 def test_wifi_tx_confirm_event_yields_under_backlog():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     cfm_body = wifi_fw.split(
         "proc txl_cfm_evt*() {.exportc, cdecl.} =",
@@ -573,7 +620,7 @@ def test_wifi_tx_confirm_event_yields_under_backlog():
 
 
 def test_wifi_tx_confirm_flush_uses_explicit_list_drain_condition():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     flush_body = wifi_fw.split(
         "proc txl_cfm_flush*() {.exportc, cdecl, noinline.} =",
@@ -590,7 +637,7 @@ def test_wifi_tx_confirm_flush_uses_explicit_list_drain_condition():
 
 
 def test_wifi_tx_control_ps_check_uses_positive_queueing_guard():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     push_body = wifi_fw.split(
         "proc txl_cntrl_push_int*(param: pointer, ac: uint8): uint8 {.exportc, cdecl.} =",
@@ -608,7 +655,7 @@ def test_wifi_tx_control_ps_check_uses_positive_queueing_guard():
 
 
 def test_wifi_tx_control_uses_typed_vif_overlay_for_tx_check():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     push_body = wifi_fw.split(
         "proc txl_cntrl_push_int*(param: pointer, ac: uint8): uint8 {.exportc, cdecl.} =",
@@ -645,7 +692,7 @@ def test_wifi_tx_control_uses_typed_vif_overlay_for_tx_check():
 
 
 def test_wifi_tx_push_uses_buffered_link_overlay_for_allocated_bufdesc():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
         "proc txl_cntrl_push*(param: pointer, ac: uint8): uint8 {.exportc, cdecl.} =",
@@ -661,21 +708,25 @@ def test_wifi_tx_push_uses_buffered_link_overlay_for_allocated_bufdesc():
 
 
 def test_wifi_tx_inline_buffer_helpers_use_desc_field_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     assert "doAssert offsetof(HostTxDescView, callback) == 208" in wifi_fw
+    assert "doAssert offsetof(HostTxAuxWordsView, rateConfig) == 0" in wifi_fw
+    assert "doAssert offsetof(HostTxAuxWordsView, navValue) == 4" in wifi_fw
     assert "template hostTxInlineBufferedLink(desc: ptr HostTxDescView): ptr HostTxBufferedLinkView =\n  cast[ptr HostTxBufferedLinkView](addr desc.callback)" in wifi_fw
     assert "template hostTxAuxWords(desc: ptr HostTxDescView): ptr HostTxAuxWordsView =\n  cast[ptr HostTxAuxWordsView](addr desc.callback)" in wifi_fw
 
     for forbidden in [
         "cast[ptr HostTxBufferedLinkView](cast[uint](desc) + 208'u)",
         "cast[ptr HostTxAuxWordsView](cast[uint](desc) + 208'u)",
+        "aux.word0",
+        "aux.word1",
     ]:
         assert forbidden not in wifi_fw
 
 
 def test_wifi_tx_buffer_init_uses_typed_control_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
         "proc txl_buffer_init*() {.exportc, cdecl.} =",
@@ -698,8 +749,8 @@ def test_wifi_tx_buffer_init_uses_typed_control_overlays():
         "d.bwMask = (1'u32 shl (maskNtx + 1'u32)) - 1'u32",
         "d.policyWord = 0xFFFF0704'u32",
         "d.txPower = cast[int32](regRead(MACHW_RNG_REG) and 0xFF'u32)",
-        "d.word52 = 0x2200'u32",
-        "d.word56 = 0x003F0000'u32",
+        "d.ackPolicyControl = 0x2200'u32",
+        "d.retryLimitControl = 0x003F0000'u32",
         "let d = txBufferControlBcmcDescAt(i)",
     ]:
         assert expected in body
@@ -727,7 +778,7 @@ def test_wifi_tx_buffer_init_uses_typed_control_overlays():
 
 
 def test_wifi_tx_frame_init_uses_typed_mac_header_address():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     frame_init = wifi_fw.split(
         "proc txl_frame_init*() {.exportc, cdecl.} =",
@@ -758,7 +809,7 @@ def test_wifi_tx_frame_init_uses_typed_mac_header_address():
 
 
 def test_wifi_tx_frame_private_pools_use_typed_slot_tables():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     frame_init = wifi_fw.split(
         "proc txl_frame_init*() {.exportc, cdecl.} =",
@@ -783,6 +834,9 @@ def test_wifi_tx_frame_private_pools_use_typed_slot_tables():
         "doAssert sizeof(TxlFrameHwDescSlotView) == 72",
         "doAssert sizeof(TxlFrameHwCfmSlotView) == 20",
         "doAssert sizeof(TxlFramePayloadSlotView) == 60",
+        "doAssert offsetof(HostTxHwDescView, txConfirmDescPtr) == 0",
+        "doAssert offsetof(HostTxHwDescView, secondaryThdPtr) == 8",
+        "doAssert offsetof(HostTxHwDescView, txHwReserved12) == 12",
         "template txlFrameDescAt(idx: uint32): ptr HostTxDescView",
         "template txlFrameLinkDescAt(idx: uint32): ptr HostTxLinkDescView",
         "template txlFrameHwDescAt(idx: uint32): ptr HostTxHwDescView",
@@ -802,7 +856,7 @@ def test_wifi_tx_frame_private_pools_use_typed_slot_tables():
         "frameDesc.bufDesc = cast[pointer](link)",
         "frameDesc.policy = cast[pointer](payload)",
         "frameDesc.hwDesc = cast[pointer](hw)",
-        "hw.word0 = cast[uint32](cast[uint](hwCfm))",
+        "hw.txConfirmDescPtr = cast[uint32](cast[uint](hwCfm))",
         "txl_frame_free_list_push(cast[pointer](frameDesc))",
     ]:
         assert expected in frame_init + rebuild_body
@@ -825,7 +879,7 @@ def test_wifi_tx_frame_private_pools_use_typed_slot_tables():
 
 
 def test_wifi_tx_buffer_alloc_uses_typed_mac_header_body_pointer():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
         "proc txl_buffer_alloc*(param: pointer, queueIdx: uint32, flags: uint32): pointer {.exportc, cdecl.} =",
@@ -842,7 +896,7 @@ def test_wifi_tx_buffer_alloc_uses_typed_mac_header_body_pointer():
 
 
 def test_wifi_tx_buffer_alloc_copies_policy_with_typed_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
         "proc txl_buffer_alloc*(param: pointer, queueIdx: uint32, flags: uint32): pointer {.exportc, cdecl.} =",
@@ -869,7 +923,7 @@ def test_wifi_tx_buffer_alloc_copies_policy_with_typed_overlay():
 
 
 def test_wifi_eapol_retry_policy_uses_typed_rate_template():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     policy_body = wifi_fw.split(
         "proc txlApplyEapolRetryPolicy", 1
@@ -888,13 +942,35 @@ def test_wifi_eapol_retry_policy_uses_typed_rate_template():
     assert "txlApplyEapolRetryPolicy(rate)" in policy_body
 
     for expected in [
-        "rate.word24 = 0x8000040A'u32",
-        "rate.word28 = 0x80001007'u32",
-        "rate.word32 = 0x80000400'u32",
+        "retryRateControl0*: uint32",
+        "retryRateControl1*: uint32",
+        "retryRateControl2*: uint32",
+        "retryTxPowerControl0*: uint32",
+        "retryTxPowerControl1*: uint32",
+        "retryTxPowerControl2*: uint32",
+        "doAssert offsetof(HostTxRateTemplateView, retryRateControl0) == 24",
+        "doAssert offsetof(HostTxRateTemplateView, retryRateControl1) == 28",
+        "doAssert offsetof(HostTxRateTemplateView, retryRateControl2) == 32",
+        "doAssert offsetof(HostTxRateTemplateView, retryTxPowerControl0) == 40",
+        "doAssert offsetof(HostTxRateTemplateView, retryTxPowerControl1) == 44",
+        "doAssert offsetof(HostTxRateTemplateView, retryTxPowerControl2) == 48",
+        "doAssert offsetof(TxBufferControlView, retryRateControl0) == 24",
+        "doAssert offsetof(TxBufferControlView, retryRateControl1) == 28",
+        "doAssert offsetof(TxBufferControlView, retryRateControl2) == 32",
+        "doAssert offsetof(TxBufferControlView, retryTxPowerControl0) == 40",
+        "doAssert offsetof(TxBufferControlView, retryTxPowerControl1) == 44",
+        "doAssert offsetof(TxBufferControlView, retryTxPowerControl2) == 48",
+    ]:
+        assert expected in wifi_fw
+
+    for expected in [
+        "rate.retryRateControl0 = 0x8000040A'u32",
+        "rate.retryRateControl1 = 0x80001007'u32",
+        "rate.retryRateControl2 = 0x80000400'u32",
         "rate.txPower = 0x00000070'i32",
-        "rate.word40 = 0x00000070'u32",
-        "rate.word44 = 0x00000070'u32",
-        "rate.word48 = 0x00000070'u32",
+        "rate.retryTxPowerControl0 = 0x00000070'u32",
+        "rate.retryTxPowerControl1 = 0x00000070'u32",
+        "rate.retryTxPowerControl2 = 0x00000070'u32",
     ]:
         assert expected in policy_body
 
@@ -917,13 +993,19 @@ def test_wifi_eapol_retry_policy_uses_typed_rate_template():
         "cast[ptr uint32](dmaBase + 40'u)[]",
         "cast[ptr uint32](dmaBase + 44'u)[]",
         "cast[ptr uint32](dmaBase + 48'u)[]",
+        "rate.word24",
+        "rate.word28",
+        "rate.word32",
+        "rate.word40",
+        "rate.word44",
+        "rate.word48",
     ]:
         assert forbidden not in policy_body
         assert forbidden not in alloc_body
 
 
 def test_wifi_apm_tx_ps_check_uses_typed_sta_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
         "proc apm_tx_int_ps_check*(txDesc: pointer): bool {.exportc, cdecl.} =",
@@ -949,7 +1031,7 @@ def test_wifi_apm_tx_ps_check_uses_typed_sta_overlay():
 
 
 def test_wifi_tx_trigger_yields_under_descriptor_backlog():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     trigger_body = wifi_fw.split(
         "proc txl_transmit_trigger*() {.exportc, cdecl.} =",
@@ -975,7 +1057,7 @@ def test_wifi_tx_trigger_yields_under_descriptor_backlog():
 
 
 def test_wifi_tx_trigger_uses_typed_link_overlay_for_frame_control():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     trigger_body = wifi_fw.split(
         "proc txl_transmit_trigger*() {.exportc, cdecl.} =",
@@ -997,7 +1079,7 @@ def test_wifi_tx_trigger_uses_typed_link_overlay_for_frame_control():
 
 
 def test_wifi_machw_tx_queue_regs_use_typed_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     payload_body = wifi_fw.split(
         "proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =",
@@ -1066,7 +1148,7 @@ def test_wifi_machw_tx_queue_regs_use_typed_overlay():
 
 
 def test_wifi_tx_buffer_eapol_trace_uses_typed_rate_template_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
         "proc txl_buffer_alloc*(param: pointer, queueIdx: uint32, flags: uint32): pointer {.exportc, cdecl.} =",
@@ -1081,7 +1163,7 @@ def test_wifi_tx_buffer_eapol_trace_uses_typed_rate_template_overlay():
     assert "rateTemplate.ntxConfig" in body
     assert "rateTemplate.rateWord" in body
     assert "rateTemplate.txPower" in body
-    assert "rateTemplate.word48" in body
+    assert "rateTemplate.retryTxPowerControl2" in body
     assert "let dmaBase = cast[uint](rateTemplate)" not in body
     assert "dmaBase + 4" not in body
     assert "dmaBase + 20" not in body
@@ -1090,7 +1172,7 @@ def test_wifi_tx_buffer_eapol_trace_uses_typed_rate_template_overlay():
 
 
 def test_wifi_txl_current_desc_get_uses_typed_hwdesc_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
         "proc txl_current_desc_get*(ac: uint8): pointer {.exportc, cdecl.} =",
@@ -1105,7 +1187,7 @@ def test_wifi_txl_current_desc_get_uses_typed_hwdesc_overlay():
 
 
 def test_wifi_tx_frame_event_drains_pending_confirmations():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     frame_body = wifi_fw.split(
         "proc txl_frame_evt*() {.exportc, cdecl.} =",
@@ -1128,7 +1210,7 @@ def test_wifi_tx_frame_event_drains_pending_confirmations():
 
 
 def test_wifi_tx_frame_get_uses_explicit_retry_condition():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     get_body = wifi_fw.split(
         "proc txl_frame_get*(length: uint32): pointer {.exportc, cdecl.} =",
@@ -1155,7 +1237,7 @@ def test_wifi_tx_frame_get_uses_explicit_retry_condition():
 
 
 def test_wifi_tx_frame_push_uses_typed_mac_header_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     push_body = wifi_fw.split(
         "proc txl_frame_push*(param: pointer, ac: uint8): uint8 {.exportc, cdecl, noinline, discardable.} =",
@@ -1182,7 +1264,7 @@ def test_wifi_tx_frame_push_uses_typed_mac_header_overlay():
 
 
 def test_wifi_rx_timer_handler_yields_under_descriptor_backlog():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     rx_body = wifi_fw.split(
         "proc rxl_timer_int_handler*() {.exportc, cdecl.} =",
@@ -1209,7 +1291,7 @@ def test_wifi_rx_timer_handler_yields_under_descriptor_backlog():
 
 
 def test_wifi_rx_control_event_uses_explicit_frame_batch_limit():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     rx_body = wifi_fw.split(
         "proc rxl_cntrl_evt*() {.exportc, cdecl.} =",
@@ -1230,7 +1312,7 @@ def test_wifi_rx_control_event_uses_explicit_frame_batch_limit():
 
 
 def test_wifi_rx_control_event_uses_typed_vif_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     rx_body = wifi_fw.split(
         "proc rxl_cntrl_evt*() {.exportc, cdecl.} =",
@@ -1268,7 +1350,7 @@ def test_wifi_rx_control_event_uses_typed_vif_overlays():
 
 
 def test_wifi_rx_mpdu_free_uses_explicit_descriptor_chain_condition():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     free_body = wifi_fw.split(
         "proc rxl_mpdu_free*(desc: pointer) {.exportc, cdecl.} =",
@@ -1288,7 +1370,7 @@ def test_wifi_rx_mpdu_free_uses_explicit_descriptor_chain_condition():
 
 
 def test_wifi_rxl_reset_uses_rxu_upload_list_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
         "proc rxl_reset*() {.exportc, cdecl.} =",
@@ -1305,7 +1387,7 @@ def test_wifi_rxl_reset_uses_rxu_upload_list_overlay():
 
 
 def test_wifi_debug_snapshot_exports_unpacked_mac_rx_registers():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
     smoke = (ROOT / "examples/m0_wifi_lwip_smoke.nim").read_text()
 
     body = wifi_fw.split(
@@ -1345,7 +1427,7 @@ def test_wifi_debug_snapshot_exports_unpacked_mac_rx_registers():
 
 
 def test_wifi_smoke_dumps_auth_tx_raw_frame_snapshot():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
     smoke = (ROOT / "examples/m0_wifi_lwip_smoke.nim").read_text()
 
     body = wifi_fw.split(
@@ -1374,7 +1456,7 @@ def test_wifi_smoke_dumps_auth_tx_raw_frame_snapshot():
 
 
 def test_wifi_rate_retry_scan_uses_typed_rate_reset_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
         "proc rc_update_retry_chain*(stats: pointer, param: pointer) {.exportc, cdecl.} =",
@@ -1390,7 +1472,7 @@ def test_wifi_rate_retry_scan_uses_typed_rate_reset_overlay():
 
 
 def test_wifi_rx_hwdesc_init_uses_typed_descriptor_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     sw_body = wifi_fw.split(
         "proc rx_swdesc_init*() {.exportc, cdecl.} =",
@@ -1536,7 +1618,7 @@ def test_wifi_rx_hwdesc_init_uses_typed_descriptor_overlays():
 
 
 def test_wifi_rxl_hwdesc_dump_uses_typed_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
     dump_body = wifi_fw.split("proc rxl_hwdesc_dump*", 1)[1].split(
         "proc rxl_hd_append*", 1
     )[0]
@@ -1566,7 +1648,7 @@ def test_wifi_rxl_hwdesc_dump_uses_typed_overlays():
 
 
 def test_wifi_channel_tbtt_reschedule_uses_explicit_list_drain_condition():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     tbtt_body = wifi_fw.split(
         "proc chan_tbtt_schedule*(tbttEntry: pointer) {.exportc, cdecl.} =",
@@ -1583,7 +1665,7 @@ def test_wifi_channel_tbtt_reschedule_uses_explicit_list_drain_condition():
 
 
 def test_wifi_chan_get_next_uses_typed_vif_overlay_for_roc_lookup():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
         "proc chan_get_next_chan*(): pointer {.exportc, cdecl.} =",
@@ -1613,7 +1695,7 @@ def test_wifi_chan_get_next_uses_typed_vif_overlay_for_roc_lookup():
 
 
 def test_wifi_channel_tx_power_uses_typed_vif_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc chan_update_tx_power*", 1)[1].split(
         "proc chan_conn_less_delay_evt*", 1
@@ -1641,7 +1723,7 @@ def test_wifi_channel_tx_power_uses_typed_vif_overlays():
 
 
 def test_wifi_channel_scan_roc_slots_use_typed_context_pool_helpers():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     pre_body = wifi_fw.split(
         "proc chan_pre_switch_channel*(ctxt: pointer) {.exportc, cdecl.} =",
@@ -1678,7 +1760,7 @@ def test_wifi_channel_scan_roc_slots_use_typed_context_pool_helpers():
 
 
 def test_wifi_ipc_message_event_yields_under_host_backlog():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     ipc_body = wifi_fw.split(
         "proc ipc_emb_msg_evt*() {.exportc, cdecl.} =",
@@ -1705,7 +1787,7 @@ def test_wifi_ipc_message_event_yields_under_host_backlog():
 
 
 def test_wifi_ipc_message_payload_copy_uses_typed_word_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     push_body = wifi_fw.split(
         "proc ipc_emb_msg_push*(msgDescPtr: pointer) {.exportc, cdecl.} =",
@@ -1755,7 +1837,7 @@ def test_wifi_ipc_message_payload_copy_uses_typed_word_overlay():
 
 
 def test_wifi_ipc_tx_event_yields_under_host_descriptor_backlog():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     tx_body = wifi_fw.split(
         "proc ipc_emb_tx_evt*(ac: uint32) {.exportc, cdecl.} =",
@@ -1785,7 +1867,7 @@ def test_wifi_ipc_tx_event_yields_under_host_descriptor_backlog():
 
 
 def test_wifi_saved_messages_reschedule_in_bounded_batches():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     hdr_body = wifi_fw.split("template keMsgHdrFromPayload*", 1)[1].split(
         "template keMsgPayload*", 1
@@ -1856,7 +1938,7 @@ def test_wifi_saved_messages_reschedule_in_bounded_batches():
 
 
 def test_wifi_task_handlers_use_named_ke_message_statuses():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     def body(start, end):
         return wifi_fw.split(start, 1)[1].split(end, 1)[0]
@@ -1962,7 +2044,7 @@ def test_wifi_task_handlers_use_named_ke_message_statuses():
 
 
 def test_wifi_connect_info_channel_hint_uses_typed_frequency_helper():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     bss_body = wifi_fw.rsplit(
         "proc sm_get_bss_params*", 1
@@ -2004,7 +2086,7 @@ def test_wifi_connect_info_channel_hint_uses_typed_frequency_helper():
 
 
 def test_wifi_bss_params_falls_back_to_typed_directed_scan_result():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     helper_body = wifi_fw.split(
         "proc bestDirectedScanuResult()", 1
@@ -2035,7 +2117,7 @@ def test_wifi_bss_params_falls_back_to_typed_directed_scan_result():
 
 
 def test_wifi_sta_join_channel_context_uses_typed_center_frequency_helpers():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
         "proc sm_add_chan_ctx*", 1
@@ -2060,7 +2142,7 @@ def test_wifi_sta_join_channel_context_uses_typed_center_frequency_helpers():
 
 
 def test_wifi_chan_scan_request_uses_typed_channel_overlay_helpers():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
         "proc chan_scan_req*", 1
@@ -2092,7 +2174,7 @@ def test_wifi_chan_scan_request_uses_typed_channel_overlay_helpers():
 
 
 def test_wifi_auth_rx_debug_counters_cover_classifier_dispatch_and_handler():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
     smoke = (ROOT / "examples/m0_wifi_lwip_smoke.nim").read_text()
 
     for expected in [
@@ -2122,8 +2204,8 @@ def test_wifi_auth_rx_debug_counters_cover_classifier_dispatch_and_handler():
 
 
 def test_wifi_lwip_smoke_dumps_dhcp_final_tx_chain():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
-    wifi_tx = (ROOT / "src/bl808/wifi_tx.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
+    wifi_tx = nim_source_with_includes(ROOT / "src/bl808/wifi/tx.nim")
     smoke = (ROOT / "examples/m0_wifi_lwip_smoke.nim").read_text()
 
     for expected in [
@@ -2186,7 +2268,7 @@ def test_wifi_lwip_smoke_dumps_dhcp_final_tx_chain():
 
 
 def test_wifi_legacy_rate_diagnostic_define_disables_ht_advertising():
-    msg_tx = (ROOT / "src/bl808/wifi_msg_tx.nim").read_text()
+    msg_tx = nim_source_with_includes(ROOT / "src/bl808/wifi/msg_tx.nim")
 
     config_body = msg_tx.split("proc bl_send_me_config_req*", 1)[1].split(
         "proc bl_send_me_chan_config_req*", 1
@@ -2204,7 +2286,7 @@ def test_wifi_legacy_rate_diagnostic_define_disables_ht_advertising():
 
 
 def test_wifi_kernel_flush_uses_explicit_queue_drain_conditions():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     flush_body = wifi_fw.split(
         "proc ke_flush*() {.exportc, cdecl.} =",
@@ -2222,7 +2304,7 @@ def test_wifi_kernel_flush_uses_explicit_queue_drain_conditions():
 
 
 def test_wifi_list_and_postpone_helpers_use_explicit_loop_conditions():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     extract_body = wifi_fw.split("proc co_list_extract*", 1)[1].split(
         "proc co_list_find*", 1
@@ -2341,7 +2423,7 @@ def test_wifi_list_and_postpone_helpers_use_explicit_loop_conditions():
 
 
 def test_wifi_vif_unregister_uses_typed_vif_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
         "proc vif_mgmt_unregister*(vifIdx: uint8) {.exportc, cdecl.} =",
@@ -2373,7 +2455,7 @@ def test_wifi_vif_unregister_uses_typed_vif_overlays():
 
 
 def test_wifi_send_postponed_frames_uses_explicit_budget_condition():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     service_body = wifi_fw.split(
         "proc sta_mgmt_send_postponed_frame*(vifEntry: pointer, staEntry: pointer, maxCount: uint32): uint32 {.exportc, cdecl.} =",
@@ -2424,7 +2506,7 @@ def test_wifi_send_postponed_frames_uses_explicit_budget_condition():
 
 
 def test_wifi_ke_env_ps_flags_use_typed_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     bl_event_body = wifi_fw.rsplit("proc bl_event_handle*", 1)[1].split(
         "proc bl_fw_statistic_dump*", 1
@@ -2487,7 +2569,7 @@ def test_wifi_ke_env_ps_flags_use_typed_overlay():
 
 
 def test_wifi_sta_ht_vht_param_uses_sta_info_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
         "proc me_set_sta_ht_vht_param*(staEntry: pointer, param: pointer) {.exportc, cdecl.} =",
@@ -2516,7 +2598,7 @@ def test_wifi_sta_ht_vht_param_uses_sta_info_overlay():
 
 
 def test_wifi_beacon_transmit_uses_typed_frame_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc mm_bcn_transmit*", 1)[1].split(
         "proc mm_tim_update*", 1
@@ -2557,7 +2639,7 @@ def test_wifi_beacon_transmit_uses_typed_frame_overlays():
 
 
 def test_wifi_wpa_rsn_ie_and_beacon_update_use_typed_vif_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     rsn_body = wifi_fw.rsplit("proc mm_set_wpa_rsn_ie*", 1)[1].split(
         "proc mm_force_idle_req*", 1
@@ -2591,7 +2673,7 @@ def test_wifi_wpa_rsn_ie_and_beacon_update_use_typed_vif_overlays():
 
 
 def test_wifi_beacon_probe_builders_use_vif_overlay_directly():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     beacon_body = wifi_fw.rsplit("proc me_build_beacon*", 1)[1].split(
         "proc me_build_probe_rsp*", 1
@@ -2658,7 +2740,7 @@ def test_wifi_beacon_probe_builders_use_vif_overlay_directly():
 
 
 def test_wifi_sae_and_assoc_rsp_builders_use_typed_vif_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     sae_body = wifi_fw.rsplit("proc me_build_sae_authenticate*", 1)[1].split(
         "proc me_build_associate_req_impl", 1
@@ -2770,7 +2852,7 @@ def test_wifi_sae_and_assoc_rsp_builders_use_typed_vif_overlays():
 
 
 def test_wifi_ssid_ie_builder_uses_typed_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc me_add_ie_ssid*", 1)[1].split(
         "proc me_add_ie_supp_rates*", 1
@@ -2804,7 +2886,7 @@ def test_wifi_ssid_ie_builder_uses_typed_overlay():
 
 
 def test_wifi_capability_builder_uses_typed_vif_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc me_build_capability*", 1)[1].split(
         "# ME rate/capability helpers", 1
@@ -2828,7 +2910,7 @@ def test_wifi_capability_builder_uses_typed_vif_overlay():
 
 
 def test_wifi_supported_rate_ies_use_typed_rate_set_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     bitfield_body = wifi_fw.rsplit("proc me_legacy_rate_bitfield_build*", 1)[1].split(
         "proc me_legacy_ridx_min*", 1
@@ -2916,7 +2998,7 @@ def test_wifi_supported_rate_ies_use_typed_rate_set_overlay():
 
 
 def test_wifi_one_byte_ies_use_typed_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     ds_body = wifi_fw.rsplit("proc me_add_ie_ds*", 1)[1].split(
         "proc me_add_ie_erp*", 1
@@ -2967,7 +3049,7 @@ def test_wifi_one_byte_ies_use_typed_overlays():
 
 
 def test_wifi_tim_ie_builder_uses_typed_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc me_add_ie_tim*", 1)[1].split(
         "proc me_add_ie_csa*", 1
@@ -3010,7 +3092,7 @@ def test_wifi_tim_ie_builder_uses_typed_overlay():
 
 
 def test_wifi_ht_capability_ie_builder_uses_typed_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc me_add_ie_ht_capa*", 1)[1].split(
         "proc me_add_ie_ht_oper*", 1
@@ -3062,7 +3144,7 @@ def test_wifi_ht_capability_ie_builder_uses_typed_overlay():
 
 
 def test_wifi_ht_operation_ie_builder_uses_typed_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc me_add_ie_ht_oper*", 1)[1].split(
         "proc me_add_ie_rsn*", 1
@@ -3117,7 +3199,7 @@ def test_wifi_ht_operation_ie_builder_uses_typed_overlay():
 
 
 def test_wifi_rsn_ie_builder_uses_typed_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc me_add_ie_rsn*", 1)[1].split(
         "{.emit: \"__attribute__((noipa)) unsigned long me_add_ie_wpa", 1
@@ -3172,7 +3254,7 @@ def test_wifi_rsn_ie_builder_uses_typed_overlays():
 
 
 def test_wifi_wpa_ie_builder_uses_typed_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc me_add_ie_wpa*", 1)[1].split(
         "proc me_add_ie_tim*", 1
@@ -3220,7 +3302,7 @@ def test_wifi_wpa_ie_builder_uses_typed_overlay():
 
 
 def test_wifi_inline_wpa_psk_vendor_ie_uses_typed_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     helper_body = wifi_fw.rsplit("proc writeWpaPskVendorIe", 1)[1].split(
         "proc me_add_ie_tim*", 1
@@ -3268,7 +3350,7 @@ def test_wifi_inline_wpa_psk_vendor_ie_uses_typed_overlay():
 
 
 def test_wifi_power_constraint_extractor_uses_typed_output_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc me_extract_power_constraint*", 1)[1].split(
         "proc me_11n_nss_max*", 1
@@ -3291,7 +3373,7 @@ def test_wifi_power_constraint_extractor_uses_typed_output_overlay():
 
 
 def test_wifi_country_reg_extractor_uses_typed_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc me_extract_country_reg*", 1)[1].split(
         "proc me_extract_csa*", 1
@@ -3346,7 +3428,7 @@ def test_wifi_country_reg_extractor_uses_typed_overlays():
 
 
 def test_wifi_csa_ie_builder_uses_typed_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     helper_body = wifi_fw.rsplit("proc writeCsaIe", 1)[1].split(
         "proc me_add_ie_tim*", 1
@@ -3410,7 +3492,7 @@ def test_wifi_csa_ie_builder_uses_typed_overlay():
 
 
 def test_wifi_beacon_probe_variable_ie_copies_use_cursor_helper():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     beacon_body = wifi_fw.rsplit("proc me_build_beacon*", 1)[1].split(
         "proc me_build_probe_rsp*", 1
@@ -3461,7 +3543,7 @@ def test_wifi_beacon_probe_variable_ie_copies_use_cursor_helper():
 
 
 def test_wifi_assoc_rsp_handler_uses_scan_channel_overlay_for_tpc():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc sm_assoc_rsp_handler*", 1)[1].split(
         "proc sm_deauth_handler*", 1
@@ -3506,7 +3588,7 @@ def test_wifi_assoc_rsp_handler_uses_scan_channel_overlay_for_tpc():
 
 
 def test_wifi_beacon_channel_reads_use_scan_channel_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     check_body = wifi_fw.rsplit("proc me_beacon_check*", 1)[1].split(
         "proc me_build_capability*", 1
@@ -3562,7 +3644,7 @@ def test_wifi_beacon_channel_reads_use_scan_channel_overlay():
 
 
 def test_wifi_auth_builder_uses_typed_fixed_body_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc me_build_authenticate*", 1)[1].split(
         "proc me_build_sae_authenticate*", 1
@@ -3616,7 +3698,7 @@ def test_wifi_auth_builder_uses_typed_fixed_body_overlay():
 
 
 def test_wifi_deauth_builder_uses_typed_reason_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc me_build_deauthenticate*", 1)[1].split(
         "proc me_build_beacon*", 1
@@ -3646,7 +3728,7 @@ def test_wifi_deauth_builder_uses_typed_reason_overlay():
 
 
 def test_wifi_assoc_req_builder_uses_typed_assoc_info_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc me_build_associate_req_impl", 1)[1].split(
         "proc me_build_associate_rsp_impl", 1
@@ -3731,7 +3813,7 @@ def test_wifi_assoc_req_builder_uses_typed_assoc_info_overlay():
 
 
 def test_wifi_notifier_chain_uses_shared_explicit_list_helpers():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     insert_body = wifi_fw.split("proc notifier_chain_insert_ordered", 1)[1].split(
         "proc notifier_chain_remove", 1
@@ -3826,7 +3908,7 @@ def test_wifi_notifier_chain_uses_shared_explicit_list_helpers():
 
 
 def test_wifi_rate_control_random_sample_selection_is_bounded():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     helper_body = wifi_fw.split("proc rc_pick_non_duplicate_rate", 1)[1].split(
         "proc rcRateEntryTp", 1
@@ -3858,7 +3940,7 @@ def test_wifi_rate_control_random_sample_selection_is_bounded():
 
 
 def test_wifi_kernel_timer_scheduler_yields_under_expired_backlog():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     timer_body = wifi_fw.split(
         "proc ke_timer_schedule*() {.exportc, cdecl.} =",
@@ -3884,7 +3966,7 @@ def test_wifi_kernel_timer_scheduler_yields_under_expired_backlog():
 
 
 def test_wifi_mm_timer_scheduler_yields_under_expired_backlog():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     timer_body = wifi_fw.split(
         "proc mm_timer_schedule*() {.exportc, cdecl.} =",
@@ -3911,7 +3993,7 @@ def test_wifi_mm_timer_scheduler_yields_under_expired_backlog():
 
 
 def test_ble_event_scheduler_yields_under_backlog():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     event_body = ble.split("proc patch_ble_ke_event_schedule*", 1)[1].split(
         "proc ble_ke_event_schedule*", 1
@@ -3930,7 +4012,7 @@ def test_ble_event_scheduler_yields_under_backlog():
 
 
 def test_ble_timer_scheduler_yields_under_expired_backlog():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     timer_body = ble.split("proc patch_ble_ke_timer_schedule*", 1)[1].split(
         "proc ble_ke_timer_schedule*", 1
@@ -3957,7 +4039,7 @@ def test_ble_timer_scheduler_yields_under_expired_backlog():
 
 
 def test_ble_hci_reset_settle_is_cps_state_not_busy_wait():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     settle_body = ble.split("proc bleArmHciResetSettle()", 1)[1].split(
         "proc bleHciResetSettlePending()", 1
@@ -3988,7 +4070,7 @@ def test_ble_hci_reset_settle_is_cps_state_not_busy_wait():
 
 
 def test_ble_hci_cmd_status_uses_typed_descriptor_overlay():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     body = ble.split("proc hci_msg_cmd_status_exp*", 1)[1].split(
         "proc hci_msg_evt_get_hl_tl_dest*", 1
@@ -4020,7 +4102,7 @@ def test_ble_hci_cmd_status_uses_typed_descriptor_overlay():
 
 
 def test_ble_raw_hci_rf_and_ecc_paths_use_typed_overlays():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     hci_helpers = ble.split("proc hciRawOpcode(data: pointer)", 1)[1].split(
         "template hciLeCreateConnReq", 1
@@ -4063,7 +4145,7 @@ def test_ble_raw_hci_rf_and_ecc_paths_use_typed_overlays():
 
 
 def test_ble_em_buffer_helpers_use_typed_descriptor_tables():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     helper_body = ble.split("proc emRxDescAt", 1)[1].split(
         "when defined(bl808m0) and bl808BleNimConnectionEnabled and",
@@ -4142,7 +4224,7 @@ def test_ble_em_buffer_helpers_use_typed_descriptor_tables():
 
 
 def test_ble_vendor_llc_start_uses_typed_param_overlays():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     body = ble.split(
         'proc nimLlcStart(conhdl: uint16, params: pointer): uint8',
@@ -4237,7 +4319,7 @@ def test_ble_vendor_llc_start_uses_typed_param_overlays():
 
 
 def test_ble_btble_rx_ring_uses_typed_descriptor_overlay():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     adv_body = ble.split("proc serviceBtbleAdvRxDescriptors", 1)[1].split(
         "proc resetBtbleLinkLayerCore", 1
@@ -4350,7 +4432,7 @@ def test_ble_btble_rx_ring_uses_typed_descriptor_overlay():
 
 
 def test_ble_scan_report_uses_typed_advertising_pdu_overlay():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     body = ble.split(
         "proc sendLeAdvertisingReportFromRxDesc(header: uint16, buf: uint16) =",
@@ -4382,7 +4464,7 @@ def test_ble_scan_report_uses_typed_advertising_pdu_overlay():
 
 
 def test_ble_legacy_scan_init_tx_descs_use_typed_overlay():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     scan_body = ble.split("proc programBtbleScanReqTxDesc", 1)[1].split(
         "proc nimScanIntervalSlots", 1
@@ -4425,7 +4507,7 @@ def test_ble_legacy_scan_init_tx_descs_use_typed_overlay():
 
 
 def test_ble_connection_tx_ring_uses_typed_descriptor_overlay():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     conn_body = ble.split("proc nimConnDescAddr", 1)[1].split(
         "proc nimConnEventReached", 1
@@ -4473,7 +4555,7 @@ def test_ble_connection_tx_ring_uses_typed_descriptor_overlay():
 
 
 def test_ble_lld_connection_start_uses_typed_param_overlay():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     anchor_body = ble.split("proc nimConnAnchorFromTiming", 1)[1].split(
         "proc nimConnAnchorFromRxTimestamp", 1
@@ -4552,7 +4634,7 @@ def test_ble_lld_connection_start_uses_typed_param_overlay():
 
 
 def test_ble_llcp_fixed_pdus_use_typed_overlays():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     length_record_body = ble.split("proc nimLlcpRecordPeerDataLength", 1)[1].split(
         "proc nimLlcpConfigCount", 1
@@ -4842,7 +4924,7 @@ def test_ble_llcp_fixed_pdus_use_typed_overlays():
 
 
 def test_ble_connection_tx_elements_use_typed_overlay():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     manual_tx_body = ble.split("when bl808BleNimManualConnTx:", 1)[1].split(
         "proc nimLlcpWireLength", 1
@@ -4906,7 +4988,7 @@ def test_ble_connection_tx_elements_use_typed_overlay():
 
 
 def test_ble_llc_proc_env_uses_typed_overlay():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     state_body = ble.split("proc llc_proc_state_get", 1)[1].split(
         "proc llc_proc_timer_pause_set", 1
@@ -4981,7 +5063,7 @@ def test_ble_llc_proc_env_uses_typed_overlay():
 
 
 def test_ble_acl_indications_use_typed_overlays():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     hci_body = ble.split("proc hci_acl_data_handler*", 1)[1].split(
         "else:\n  abiNoopHandler(hci_acl_data_handler)", 1
@@ -5039,7 +5121,7 @@ def test_ble_acl_indications_use_typed_overlays():
 
 
 def test_ble_host_acl_packet_builder_uses_typed_overlay():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     body = ble.split("proc sendHostAclBytes", 1)[1].split(
         "proc sendHostAclData", 1
@@ -5071,7 +5153,7 @@ def test_ble_host_acl_packet_builder_uses_typed_overlay():
 
 
 def test_ble_disconnect_complete_event_uses_typed_overlay():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     body = ble.split("proc sendDisconnectComplete", 1)[1].split(
         "proc drainNimScanReport", 1
@@ -5102,7 +5184,7 @@ def test_ble_disconnect_complete_event_uses_typed_overlay():
 
 
 def test_ble_connection_complete_event_uses_typed_overlay():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     body = ble.rsplit("proc sendLeConnectionCompleteStatusHandle", 1)[1].split(
         "proc sendLeConnectionCompleteStatus", 1
@@ -5164,7 +5246,7 @@ def test_ble_connection_complete_event_uses_typed_overlay():
 
 
 def test_ble_encryption_change_event_uses_typed_overlay():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     body = ble.rsplit("proc sendEncryptionChange", 1)[1].split(
         "proc sendRemoteVersionInfoComplete", 1
@@ -5193,7 +5275,7 @@ def test_ble_encryption_change_event_uses_typed_overlay():
 
 
 def test_ble_remote_version_complete_event_uses_typed_overlay():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     body = ble.rsplit("proc sendRemoteVersionInfoComplete", 1)[1].split(
         "proc sendLeConnectionUpdateComplete", 1
@@ -5231,7 +5313,7 @@ def test_ble_remote_version_complete_event_uses_typed_overlay():
 
 
 def test_ble_connection_update_complete_event_uses_typed_overlay():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     body = ble.rsplit("proc sendLeConnectionUpdateCompleteValues", 1)[1].split(
         "proc sendLeRemoteFeaturesComplete", 1
@@ -5277,7 +5359,7 @@ def test_ble_connection_update_complete_event_uses_typed_overlay():
 
 
 def test_ble_le_phy_update_complete_event_uses_typed_overlay():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     body = ble.rsplit("proc sendLePhyUpdateComplete", 1)[1].split(
         "proc sendLeEncryptComplete", 1
@@ -5312,7 +5394,7 @@ def test_ble_le_phy_update_complete_event_uses_typed_overlay():
 
 
 def test_ble_le_remote_features_complete_event_uses_typed_overlay():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     body = ble.rsplit("proc sendLeRemoteFeaturesComplete", 1)[1].split(
         "proc sendLePhyUpdateComplete", 1
@@ -5346,7 +5428,7 @@ def test_ble_le_remote_features_complete_event_uses_typed_overlay():
 
 
 def test_ble_connection_event_record_uses_typed_overlay():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     helper_body = ble.split("template btbleConnEventAt", 1)[1].split(
         "proc nimConnDescAddr", 1
@@ -5447,7 +5529,7 @@ def test_ble_connection_event_record_uses_typed_overlay():
 
 
 def test_ble_llc_channel_maps_use_typed_overlays():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     llc_body = ble.split(
         "proc llc_ch_assess_get_current_ch_map*", 1
@@ -5539,7 +5621,7 @@ def test_ble_llc_channel_maps_use_typed_overlays():
 
 
 def test_ble_advertiser_connection_uses_typed_overlay():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     note_body = ble.split("proc noteNimAdvertiserConnected", 1)[1].split(
         "proc clearNimConnectionStateForDisconnect", 1
@@ -5591,7 +5673,7 @@ def test_ble_advertiser_connection_uses_typed_overlay():
 
 
 def test_ble_access_words_use_typed_overlay():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     helper_body = ble.split("template btbleAccessWordsAt", 1)[1].split(
         "proc btbleProgramSlotAddr", 1
@@ -5668,7 +5750,7 @@ def test_ble_access_words_use_typed_overlay():
 
 
 def test_ble_scheduler_program_slots_use_typed_overlay():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     helper_body = ble.split("proc btbleProgramSlotAddr", 1)[1].split(
         "proc writeBtbleRxDescHeadIndex", 1
@@ -5799,7 +5881,7 @@ def test_ble_scheduler_program_slots_use_typed_overlay():
 
 
 def test_ble_arb_callbacks_are_bounded_and_cps_driven():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     arb_body = ble.split("proc serviceNimArbCallbacks()", 1)[1].split(
         "proc nimLldRxDescAddr", 1
@@ -5825,7 +5907,7 @@ def test_ble_arb_callbacks_are_bounded_and_cps_driven():
 
 
 def test_ble_task_scheduler_uses_shared_queue_event_helpers():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     schedule_body = ble.split("proc patch_ble_ke_task_schedule*", 1)[1].split(
         "proc ble_ke_task_schedule*", 1
@@ -5855,7 +5937,7 @@ def test_ble_task_scheduler_uses_shared_queue_event_helpers():
 
 
 def test_ble_scan_reports_drain_in_bounded_host_poll_batches():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
     ble_host = (ROOT / "src/bl808/ble.nim").read_text()
 
     drain_body = ble.split("proc bleControllerDrainScanReports*", 1)[1].split(
@@ -5880,7 +5962,7 @@ def test_ble_scan_reports_drain_in_bounded_host_poll_batches():
 
 
 def test_ble_hci_format_parser_uses_explicit_terminator_loop():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     format_body = ble.split("proc hciUtilCopyByFormat", 1)[1].split(
         "proc hci_util_pack*", 1
@@ -5892,13 +5974,25 @@ def test_ble_hci_format_parser_uses_explicit_terminator_loop():
 
 
 def test_ble_rf_and_connection_convergence_loops_are_explicit():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     btble_rf_table = ble.split("BtbleRfTableView {.packed.} = object", 1)[1].split(
         "BleMacPhyRegs {.packed.} = object", 1
     )[0]
     btble_rf_init = ble.split("proc btble_rf_init*(rf: pointer) {.exportc, cdecl.} =", 1)[1].split(
         "when defined(bl808m0) and bl808BleNimConnectionEnabled:", 1
+    )[0]
+    ble_mac_phy_regs = ble.split("BleMacPhyRegs {.packed.} = object", 1)[1].split(
+        "BlePhyCtrlRegs {.packed.} = object", 1
+    )[0]
+    ble_phy_ctrl_regs = ble.split("BlePhyCtrlRegs {.packed.} = object", 1)[1].split(
+        "BlePhyAgcRegs {.packed.} = object", 1
+    )[0]
+    ble_phy_agc_regs = ble.split("BlePhyAgcRegs {.packed.} = object", 1)[1].split(
+        "const\n    BtbleRfEmConfigWord", 1
+    )[0]
+    nim_rf_reset_body = ble.split("proc nimRfReset() {.cdecl.} =", 1)[1].split(
+        "proc nimRfForceAgcEnable", 1
     )[0]
     txcal_body = ble.split("proc tuneBleRfTxcalSingenPower", 1)[1].split(
         "proc writeBleRfTxcalMixerCs", 1
@@ -5921,6 +6015,48 @@ def test_ble_rf_and_connection_convergence_loops_are_explicit():
     ]:
         assert expected in ble
     for expected in [
+        "rfResetTiming0*: uint32",
+        "rfResetTiming1*: uint32",
+        "rfResetTiming2*: uint32",
+        "rfResetTiming3*: uint32",
+        "rfResetGainWindow0*: uint32",
+        "rfResetGainWindow1*: uint32",
+        "rfResetGainWindow2*: uint32",
+        "rfResetGainWindow3*: uint32",
+        "rfPacketSettleTiming0*: uint32",
+        "rfPacketSettleTiming3*: uint32",
+        "analogTrimControl*: uint32",
+        "doAssert offsetof(BleMacPhyRegs, rfResetTiming0) == 0x880",
+        "doAssert offsetof(BleMacPhyRegs, rfResetGainWindow3) == 0x89C",
+        "doAssert offsetof(BleMacPhyRegs, rfPacketSettleTiming0) == 0x980",
+        "doAssert offsetof(BleMacPhyRegs, rfPacketSettleTiming3) == 0x98C",
+        "doAssert offsetof(BleMacPhyRegs, analogTrimControl) == 0x9C0",
+    ]:
+        assert expected in ble
+    for expected in [
+        "rfResetInitControl*: uint32",
+        "rfResetTuningControl*: uint32",
+        "doAssert offsetof(BlePhyCtrlRegs, rfResetInitControl) == 0x08",
+        "doAssert offsetof(BlePhyCtrlRegs, rfResetTuningControl) == 0x8C",
+    ]:
+        assert expected in ble
+    for expected in [
+        "resetAgcConfig*: uint32",
+        "doAssert offsetof(BlePhyAgcRegs, resetAgcConfig) == 0x84",
+    ]:
+        assert expected in ble
+    for expected in [
+        "regStore(addr mac.rfResetTiming0, 0x00500350'u32)",
+        "regStore(addr mac.rfResetGainWindow0, 0x04000703'u32)",
+        "regUpdateField(addr mac.rfResetGainWindow2, 0xFF00FFFF'u32, 0x00870000'u32)",
+        "regStore(addr mac.analogTrimControl,",
+        "regStore(addr agc.resetAgcConfig, 0x1208102B'u32)",
+        "regUpdateField(addr phy.rfResetTuningControl, 0xFF803FFF'u32,",
+        "regStore(addr phy.rfResetInitControl, 0x0842001A'u32)",
+        "regStore(addr mac.rfPacketSettleTiming0, 0x02120013'u32)",
+    ]:
+        assert expected in nim_rf_reset_body
+    for expected in [
         "table.unusedCallback08 = nil",
         "table.unusedCallback0c = nil",
         "table.unusedCallback18 = nil",
@@ -5936,6 +6072,31 @@ def test_ble_rf_and_connection_convergence_loops_are_explicit():
         "reserved3A*",
     ]:
         assert forbidden not in btble_rf_table
+    for forbidden in [
+        "reset880*",
+        "reset884*",
+        "reset888*",
+        "reset88c*",
+        "reset890*",
+        "reset894*",
+        "reset898*",
+        "reset89c*",
+        "settle980*",
+        "settle984*",
+        "settle988*",
+        "settle98c*",
+        "trim9c0*",
+    ]:
+        assert forbidden not in ble_mac_phy_regs
+        assert forbidden.replace("*", "") not in nim_rf_reset_body
+    for forbidden in [
+        "resetInitCtrl08*",
+        "resetTuningCtrl8c*",
+    ]:
+        assert forbidden not in ble_phy_ctrl_regs
+        assert forbidden.replace("*", "") not in nim_rf_reset_body
+    assert "resetAgcConfig84*" not in ble_phy_agc_regs
+    assert "resetAgcConfig84" not in nim_rf_reset_body
     assert "var tuning = true" in txcal_body
     assert "while tuning:" in txcal_body
     assert "while true:" not in txcal_body
@@ -5946,7 +6107,7 @@ def test_ble_rf_and_connection_convergence_loops_are_explicit():
 
 
 def test_ble_deferred_jobs_yield_under_backlog():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     djob_body = ble.split("proc coDjobRun", 1)[1].split(
         "proc coDjobRegister", 1
@@ -5969,7 +6130,7 @@ def test_ble_deferred_jobs_yield_under_backlog():
 
 
 def test_ble_sleep_check_uses_controller_pending_work_state():
-    ble = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    ble = blecontroller_policy_source()
 
     sleep_body = ble.split(
         "proc patch_ble_ke_sleep_check*(): bool {.exportc: \"_patch_ble_ke_sleep_check\", cdecl.} =",
@@ -5984,7 +6145,7 @@ def test_ble_sleep_check_uses_controller_pending_work_state():
 
 
 def test_wifi_firmware_is_pure_nim_without_sdk_vendor_links():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     for forbidden in [
         "{.passL:",
@@ -5997,9 +6158,9 @@ def test_wifi_firmware_is_pure_nim_without_sdk_vendor_links():
 
 
 def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
-    wifi = (ROOT / "src/bl808/wifi.nim").read_text()
-    wifi_support = (ROOT / "src/bl808/wifi_support.nim").read_text()
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi = nim_source_with_includes(ROOT / "src/bl808/wifi.nim")
+    wifi_support = nim_source_with_includes(ROOT / "src/bl808/wifi/support.nim")
+    wifi_fw = wifi_fw_policy_source()
     bl808_rf = ROOT / "src/bl808/librf_bl808.a"
     bl606p_rf = (
         ROOT
@@ -6010,8 +6171,14 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     assert "proc rf_init*(xtalfreqHz: uint32)" in wifi
     assert "when defined(bl808WifiUseBl808Rf):" in wifi
     assert "-Wl,--wrap=phy_assert_err" in wifi
+    assert "elif defined(bl808WifiAllowLegacyBl606pRfFallback):" in wifi
     assert "libbl606p_phyrf.a" in wifi
+    assert (
+        "BL808 WiFi RF requires bl808WifiUseBl808Rf; "
+        "define bl808WifiAllowLegacyBl606pRfFallback only for archive comparison builds"
+    ) in wifi
     assert "src/bl808/librf_bl808.a" not in wifi
+    assert 'else:\n    {.passL: "-Wl,--start-group build/bl_iot_sdk_b773b3f/components/platform/soc/bl606p/bl606p_phyrf/lib/libbl606p_phyrf.a -Wl,--end-group".}' not in wifi
 
     fw_start = wifi_support.split("proc bl808WifiBackendFwStart()", 1)[1].split(
         "proc wifiMainServiceBlockingIdle", 1
@@ -6102,6 +6269,19 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     assert "doAssert offsetof(WlRfMemoryOverlay, calib) == 212" in wifi_fw
     assert "doAssert offsetof(WlRfMemoryOverlay, env) == 532" in wifi_fw
     for expected in [
+        "WlLowPowerStatusEnv {.packed.} = object",
+        "lastStatusCode: int8",
+        "inactiveUpdateCount: uint16",
+        "lastUpdateContext: uint32",
+        "statusValid: uint8",
+        "doAssert sizeof(WlLowPowerStatusEnv) == 12",
+        "doAssert offsetof(WlLowPowerStatusEnv, lastStatusCode) == 0",
+        "doAssert offsetof(WlLowPowerStatusEnv, inactiveUpdateCount) == 2",
+        "doAssert offsetof(WlLowPowerStatusEnv, lastUpdateContext) == 4",
+        "doAssert offsetof(WlLowPowerStatusEnv, statusValid) == 9",
+    ]:
+        assert expected in wifi_fw
+    for expected in [
         "PhyEnvView {.packed.} = object",
         "initCfgWords: array[9, uint32]",
         "channelBandType: uint16",
@@ -6109,6 +6289,16 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "centerFreq1: uint16",
         "centerFreq2OrTxPower: uint16",
         "txPowerAndReserved: uint16",
+        "RfcLpXtalConfig {.packed.} = object",
+        "doAssert sizeof(RfcLpXtalConfig) == 16",
+        "doAssert offsetof(RfcLpXtalConfig, xtalCountWindowMin) == 0",
+        "doAssert offsetof(RfcLpXtalConfig, xtalCountWindowMax) == 4",
+        "doAssert offsetof(RfcLpXtalConfig, xtalDividerConfig) == 8",
+        "doAssert offsetof(RfcLpXtalConfig, xtalControlCode) == 12",
+        'var rfcXtalCfg* {.align: 4, exportc: "rfc_xtal_cfg".}: array[6, RfcLpXtalConfig]',
+        "doAssert sizeof(rfcXtalCfg) == 0x60",
+        "xtalDividerConfig: 0x14400000'u32",
+        "xtalControlCode: 0x0000097E'u32",
         "BbaRxVectorView {.packed.} = object",
         "rxFormatWord0: uint32",
         "rxFormatWord1Rate: uint8",
@@ -6167,10 +6357,12 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "doAssert offsetof(WifiModemBlock, intStatusB41c) == 0xB41C",
         "doAssert offsetof(WifiModemBlock, intAckB420) == 0xB420",
         "doAssert offsetof(WifiModemBlock, rxGainTailCtrlC018) == 0xC018",
+        "doAssert offsetof(WifiModemBlock, rxGainInitC040) == 0xC040",
         "doAssert offsetof(WifiModemBlock, rxGainTimingC044) == 0xC044",
         "doAssert offsetof(WifiModemBlock, rxGainTable0C080) == 0xC080",
         "doAssert offsetof(WifiModemBlock, rxGainTable1C084) == 0xC084",
         "doAssert offsetof(WifiModemBlock, rxGainTable2C088) == 0xC088",
+        "doAssert offsetof(WifiModemBlock, lowPowerRxPathCtrlC814) == 0xC814",
         "doAssert offsetof(RfRegBlock, txcalBias58) == 0x58",
         "doAssert offsetof(RfRegBlock, txcalGain64) == 0x64",
         "doAssert offsetof(RfRegBlock, txcalGain68) == 0x68",
@@ -6243,8 +6435,8 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "wifiOnly = 1'u8",
         "bleOnly = 2'u8",
         "wifiBleCoex = 3'u8",
-        "proc radioPhyModeFromApi(apiMode: uint8): RadioPhyMode {.inline.} =",
-        "proc apiFromRadioPhyMode(mode: RadioPhyMode): uint8 {.inline.} =",
+        "proc radioPhyModeFromApi*(apiMode: uint8): RadioPhyMode {.inline.} =",
+        "proc apiFromRadioPhyMode*(mode: RadioPhyMode): uint8 {.inline.} =",
     ]:
         assert expected in wifi_fw
     assert "proc wlModeFromApi" not in wifi_fw
@@ -6269,6 +6461,30 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "proc rfc_config_bandwidth*(bandwidth: uint32) {.exportc, cdecl.} =",
         1,
     )[1].split("proc rfc_config_channel*", 1)[0]
+    rfc_get_power_level_body = wifi_fw.split(
+        "proc rfc_get_power_level*(rateClass: uint32; requestedPowerTenths: int32): uint32",
+        1,
+    )[1].split("proc rfc_apply_tx_dvga_offset", 1)[0]
+    rfc_power_meas_body = wifi_fw.split(
+        "iOut, qOut: ptr int32) {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc rfc_sg_start*", 1)[0]
+    rfc_sg_start_body = wifi_fw.split(
+        "signedQuadraturePath: uint32) {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc rfc_sg_stop*", 1)[0]
+    rfc_sg_stop_body = wifi_fw.split(
+        "proc rfc_sg_stop*() {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc rfc_rf_fsm_force*", 1)[0]
+    rfc_rf_fsm_force_body = wifi_fw.split(
+        "proc rfc_rf_fsm_force*(mode: uint32) {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc rfc_rc_fsm_force*", 1)[0]
+    rfc_rc_fsm_force_body = wifi_fw.split(
+        "proc rfc_rc_fsm_force*(mode: uint32) {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc rfc_config_channel*", 1)[0]
     rfc_channel_body = wifi_fw.split(
         "proc rfc_config_channel*(channelMhz: uint32) {.exportc, cdecl.} =",
         1,
@@ -6278,7 +6494,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         1,
     )[1].split("proc modemInitCoreMode", 1)[0]
     rf_restore_body = wifi_fw.split(
-        "proc rfPriRestoreCalReg() =",
+        "proc replayRfPriCalRegisters() =",
         1,
     )[1].split("proc rfPriWriteTotalPowerComp", 1)[0]
     restore_cal_state_body = wifi_fw.split(
@@ -6289,6 +6505,18 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "proc saveRfPriCalState(): RfPriCalState =",
         1,
     )[1].split("proc restoreRfPriCalState", 1)[0]
+    vendor_save_cal_state_body = wifi_fw.split(
+        "proc rf_pri_save_state_before_cal() {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc rf_pri_restore_state_after_cal", 1)[0]
+    vendor_restore_cal_state_body = wifi_fw.split(
+        "proc rf_pri_restore_state_after_cal() {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc rf_pri_cw_stop", 1)[0]
+    rf_pri_cw_stop_body = wifi_fw.split(
+        "proc rf_pri_cw_stop() {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc rfPriConfigChannelForCal", 1)[0]
     total_power_comp_body = wifi_fw.split(
         "proc rfPriWriteTotalPowerComp(channelIndex: uint32) =",
         1,
@@ -6328,7 +6556,11 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     wifi_pll_config_body = wifi_fw.split(
         "proc rfPriWifiPllConfig() =",
         1,
-    )[1].split("proc rfPriEfuseInit", 1)[0]
+    )[1].split("proc rf_pri_xtalfreq", 1)[0]
+    rf_pri_xtalfreq_body = wifi_fw.split(
+        "proc rf_pri_xtalfreq() {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc rfPriEfuseXtalCapPairValid", 1)[0]
     rf_optimize_body = wifi_fw.split(
         "proc rf_pri_optimize(channelMhz: uint32) {.exportc, cdecl.} =",
         1,
@@ -6369,6 +6601,62 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "proc wl_rf_cfg_init*() {.exportc, cdecl.} =",
         1,
     )[1].split("proc wl_cfg_get", 1)[0]
+    wl_tcal_body = wifi_fw.split(
+        "proc wl_rf_tcal_handler*(temperatureC: int32): int32 {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc wl_rf_tcal_period_get", 1)[0]
+    wl_lp_status_clear_body = wifi_fw.split(
+        "proc wl_lp_status_clear*(context: uint32) {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc wl_lp_status_update", 1)[0]
+    wl_lp_init_body = wifi_fw.split(
+        "proc wl_lp_init*(rmem: ptr WlRfMemoryOverlay; phyCfg: pointer): int32",
+        1,
+    )[1].split("proc wl_lp_status_clear", 1)[0]
+    wl_lp_early_phy_body = wifi_fw.split(
+        "proc wlLpProgramEarlyPhyRegs(xtalIndex: uint32) =",
+        1,
+    )[1].split("proc wl_lp_init", 1)[0]
+    wl_lp_api_mode_branch_body = wifi_fw.split(
+        "proc wlLpProgramApiModePhyBranchStart() =",
+        1,
+    )[1].split("proc wlLpProgramApiModeTuneAndAgcPrep", 1)[0]
+    wl_lp_api_mode_active_body = wifi_fw.split(
+        "proc wlLpApiModeActive(): bool {.inline.} =",
+        1,
+    )[1].split("proc wlLpProgramApiModePhyBranchStart", 1)[0]
+    wl_lp_tune_agc_prep_body = wifi_fw.split(
+        "proc wlLpProgramApiModeTuneAndAgcPrep(phyCfg: pointer) =",
+        1,
+    )[1].split("proc wlLpCopyAgcMemoryAndReleaseGate", 1)[0]
+    wl_lp_agc_copy_body = wifi_fw.split(
+        "proc wlLpCopyAgcMemoryAndReleaseGate() =",
+        1,
+    )[1].split("proc wlLpProgramAgcCoreRegs", 1)[0]
+    wl_lp_agc_core_body = wifi_fw.split(
+        "proc wlLpProgramAgcCoreRegs() =",
+        1,
+    )[1].split("proc wlLpProgramPostAgcPowerDetectTail", 1)[0]
+    wl_lp_post_agc_tail_body = wifi_fw.split(
+        "proc wlLpProgramPostAgcPowerDetectTail() =",
+        1,
+    )[1].split("proc wl_lp_init", 1)[0]
+    wl_lp_status_update_body = wifi_fw.split(
+        "proc wl_lp_status_update*(active: uint32; statusCode: int8;",
+        1,
+    )[1].split("proc rf_pri_init_calib_mem", 1)[0]
+    rf_pri_cfg_init_body = wifi_fw.split(
+        "proc rf_pri_cfg_init() {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc wl_rf_cfg_init", 1)[0]
+    rf_pri_get_xtalfreq_body = wifi_fw.split(
+        "proc rf_pri_get_xtalfreq(): uint32 {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc rfPriXtalRefdivRatio", 1)[0]
+    rf_pri_init_calib_mem_body = wifi_fw.split(
+        "proc rf_pri_init_calib_mem() {.exportc, cdecl.} =",
+        1,
+    )[1].split("type\n    RfPriCalState", 1)[0]
     modem_init_mode_body = wifi_fw.split(
         "proc modemInitCoreMode(xtalfreqHz, restoreExistingCalibration: uint32;",
         1,
@@ -6377,14 +6665,410 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     assert "mode: RadioPhyMode; requestFullCalibration: uint8" in wifi_fw
     assert "cfg.paramLoadCallback = nil" in wifi_fw
     for expected in [
+        "proc wl_wlan_power_table_update*() {.exportc, cdecl.} =",
+        "proc wl_rf_tcal_handler*(temperatureC: int32): int32 {.exportc, cdecl.} =",
+        "proc wl_rf_tcal_period_get*(): int32 {.exportc, cdecl.} =",
+        "proc wl_bz_rx_optimize*(channelMhz: uint32) {.exportc, cdecl.} =",
+        "proc wl_bz_rx_optimize_restore*() {.exportc, cdecl.} =",
+        "proc wl_rf_set_bz_target_power_table*(targetPowerDbm: int32)",
+        "proc wl_rf_set_channel_pwr_comp*(channelIndex: uint32) {.exportc, cdecl.} =",
+        "proc wl_wlan_bb_reset*() {.exportc, cdecl.} =",
+        "proc wl_wlan_bb_pre_proc*(rxVector: pointer) {.exportc, cdecl.} =",
+        "proc wl_wlan_bb_post_proc*(rxVector: pointer; frameType: uint32)",
+        "proc wl_wlan_rssi_get*(rxVector: pointer): int8 {.exportc, cdecl.} =",
+        "proc wl_wlan_ppm_get*(rxVector: pointer): int8 {.exportc, cdecl.} =",
+        "proc wl_wlan_power_cfg_get*(rateClass, rateIndex: uint32): int8",
+        "proc wl_154_power_cfg_get*(): int8 {.exportc, cdecl.} =",
+        "proc wl_bt_power_cfg_get*(index: uint32): int8 {.exportc, cdecl.} =",
+        "proc wl_ble_power_cfg_get*(): int8 {.exportc, cdecl.} =",
+        "proc wl_lp_init*(rmem: ptr WlRfMemoryOverlay; phyCfg: pointer): int32",
+        "proc wl_lp_status_update*(active: uint32; statusCode: int8;",
+    ]:
+        assert expected in wifi_fw
+    assert "rf_pri_set_temp_comp(temperatureC)" in wl_tcal_body
+    assert "rf_pri_set_bz_temp_comp(temperatureC)" in wl_tcal_body
+    assert "1'i32" in wl_tcal_body
+    assert "bba_reset()" in wifi_fw
+    assert "bba_rssi_correction(rxVector)" in wifi_fw
+    assert "bba_loop(rxVector, frameType)" in wifi_fw
+    assert "calc_ppm(rxVector)" in wifi_fw
+    for expected in [
+        "wl_lp_init+0x0..0xa6",
+        "wlCfgGlobal = cast[pointer](addr rmem.config)",
+        "wlCalGlobal = cast[pointer](addr rmem.calib[0])",
+        "wlEnvGlobal = cast[pointer](addr rmem.env[0])",
+        "rfCalibDataGlobal = wlCalGlobal",
+        "wlLpDefaultInit()",
+        "rf_pri_input_xtalfreq(cfg.xtalfreqHz)",
+        "rf_pri_init(0'u32, uint32(cfg.apiMode))",
+        "let lpXtalIndex = wlLpXtalIndex(cfg.xtalfreqHz)",
+        "wlLpProgramEarlyPhyRegs(lpXtalIndex)",
+        "wlLpProgramApiModePhyBranchStart()",
+        "wlLpProgramApiModeTuneAndAgcPrep(phyCfg)",
+        "wlLpCopyAgcMemoryAndReleaseGate()",
+        "wlLpProgramAgcCoreRegs()",
+        "wlLpProgramPostAgcPowerDetectTail()",
+        "phy_init(phyCfg)",
+        "recovered lp_phy_init register phases",
+        "hardware validation proves whether the fallback can be removed",
+    ]:
+        assert expected in wl_lp_init_body
+    assert "Remaining unknown:" not in wl_lp_init_body
+    assert "lp_default_init+0x0..0xb4" in wifi_fw
+    for expected in [
+        "lp_phy_init+0x0..0x16a",
+        "let xtalCfg = rfcXtalCfg[idx]",
+        "addr rf.xtalControlCode1c0",
+        "xtalCfg.xtalControlCode and 0x00000FFF'u32",
+        "addr rf.xtalDividerConfig1c4",
+        "xtalCfg.xtalDividerConfig and 0x1FFFFFFF'u32",
+        "addr rf.xtalCountWindowMin1c8",
+        "addr rf.xtalCountWindowMax1cc",
+        "let calWords = cast[ptr UncheckedArray[uint32]](wlCalGlobal)",
+        "volatileStore(addr rf.vcoPairTable13c[i], calWords[i + 7])",
+        "volatileStore(addr rf.vcoPair2484Mhz164, calWords[17])",
+        "addr rf.channelTuneStrobe268",
+        "0x00001040'u32",
+        "addr rf.channelTuneCtrl26c",
+        "addr rf.scanSynthControl608",
+        "0x20000000'u32",
+    ]:
+        assert expected in wl_lp_early_phy_body
+    for expected in [
+        "lp_phy_init+0x184..0x236",
+        "addr mdm.lowPowerRxPathCtrlC814",
+        "not 0x00000003'u32",
+        "not 0x0000003C'u32",
+        "not 0x000003C0'u32",
+        "addr mdm.rxGainInitC040",
+        "0x00C00000'u32",
+        "0x00018000'u32",
+        "addr mdm.rxGainTimingC044",
+        "0x00000800'u32",
+        "rc2_config_rxgain(-5'i8)",
+        "addr rf.channelTuneCtrl26c",
+        "0x05000000'u32",
+        "addr crm.modemReset18",
+        "0x00000050'u32",
+        "crm_init()",
+        "crm_mdm_reset()",
+    ]:
+        assert expected in wl_lp_api_mode_branch_body
+    assert "(cfg.apiMode and 0xFD'u8) == 1'u8" in wl_lp_api_mode_active_body
+    for expected in [
+        "lp_phy_init+0x236..0x35c",
+        "addr mdm.preAgcCtrl324",
+        "0x002D0000'u32",
+        "addr crm.rfClockMux10",
+        "0x08000000'u32",
+        "volatileStore(addr bba.macActiveC01c, 0x000000A0'u32)",
+        "addr bba.agcCoreTableC80c",
+        "0xA8000000'u32",
+        "addr rf.channelTuneGate228",
+        "0x00000008'u32",
+        "addr rf.synthCtrl2c",
+        "0x00000040'u32",
+        "0x00000200'u32",
+        "0x00000001'u32",
+        "addr rf.channelFreqMhz264",
+        "pointerAddrU32(phyCfg) and 0x00000FFF'u32",
+        "addr rf.channelTuneStrobe268",
+        "0x00020000'u32",
+        "waitRfUs(1'u32)",
+        "addr rf.channelTuneCtrl26c",
+        "0x00000002'u32",
+        "addr bba.pdGain390",
+        "0x00001000'u32",
+        "0x20000000'u32",
+    ]:
+        assert expected in wl_lp_tune_agc_prep_body
+    for expected in [
+        "lp_phy_init+0x364..0x3a6",
+        "copyAgcMemory()",
+        "addr crm.rfClockMux10",
+        "0xDFFFFFFF'u32",
+        "addr bba.pdGain390",
+        "0xFFFFEFFF'u32",
+    ]:
+        assert expected in wl_lp_agc_copy_body
+    for expected in [
+        "lp_phy_init+0x3a6..0x774",
+        "register-identical to the typed main-PHY AGC core phase",
+        "wlLpApiModeActive()",
+        "bl808PhyProgramAgcCoreRegs()",
+    ]:
+        assert expected in wl_lp_agc_core_body
+    for expected in [
+        "agcCoreLowPowerThreshold304: uint32",
+        "lowPowerPdThresholdC044: uint32",
+        "lowPowerPdCompC834: uint32",
+        "lowPowerPdCompC864: uint32",
+        "lowPowerActiveLatch: uint8",
+        "doAssert offsetof(BbaAgcBlock, agcCoreLowPowerThreshold304) == 0x304",
+        "doAssert offsetof(BbaAgcBlock, lowPowerPdThresholdC044) == 0x1044",
+        "doAssert offsetof(BbaAgcBlock, lowPowerPdCompC834) == 0x1834",
+        "doAssert offsetof(BbaAgcBlock, lowPowerPdCompC864) == 0x1864",
+        "doAssert offsetof(WlLowPowerStatusEnv, lowPowerActiveLatch) == 8",
+    ]:
+        assert expected in wifi_fw
+    for expected in [
+        "lp_phy_init+0x774..0x86c",
+        "wlLpApiModeActive()",
+        "addr bba.lowPowerPdCompC864",
+        "0x0000C078'u32",
+        "addr bba.pdGain390",
+        "0xFFFFFF0F'u32",
+        "addr bba.lowPowerPdCompC834",
+        "0xFFFFFFFC'u32",
+        "addr bba.agcCoreLowPowerThreshold304",
+        "0xFFFF80FF'u32",
+        "0x00004B00'u32",
+        "crm_clk_set(0'u32)",
+        "0xFFFFFEFF'u32",
+        "0x00000200'u32",
+        "addr bba.macActiveB3a0",
+        "0x000000A8'u32",
+        "addr bba.pdSlope3c0",
+        "0x0000AB00'u32",
+        "0x000000AB'u32",
+        "addr bba.lowPowerPdThresholdC044",
+        "0x00000600'u32",
+        "addr bba.pdComp36c",
+        "0x00000500'u32",
+        "0x00000014'u32",
+        "addr bba.pdCompC830",
+        "0xFC0FFFFF'u32",
+        "addr env.lowPowerActiveLatch",
+        "addr rf.channelTuneCtrl26c",
+        "waitRfUs(1'u32)",
+        "addr rf.channelTuneGate228",
+        "0xFFFFFFF7'u32",
+    ]:
+        assert expected in wl_lp_post_agc_tail_body
+    for expected in [
+        "volatileStore(addr rf.modemPathEnable504, 0x002C0000'u32)",
+        "volatileStore(addr rf.reserved508, 0x003C0002'u32)",
+        "volatileStore(addr rf.pdCompLatchCtrl50c, 0x003FFC02'u32)",
+        "volatileStore(pdsSleepRetainMaskReg(), 0xFFFFFF00'u32)",
+        "volatileStore(addr crm.rfClockMux10, 0'u32)",
+        "volatileStore(addr crm.reserved014, 0'u32)",
+        "cfg.apiMode != 1'u8",
+        "addr rf.rfcSequencerBias400",
+        "addr aux.rfcAuxPathSelect540",
+        "addr aux.rfcAuxPathGate544",
+    ]:
+        assert expected in wifi_fw
+    for expected in [
+        "wl_lp_status_clear+0x0..0x1a",
+        "let env = wlLowPowerStatusEnv()",
+        "env.inactiveUpdateCount = 0'u16",
+        "env.lastStatusCode = cast[int8](0xA6'u8)",
+        "env.lastUpdateContext = context",
+        "env.statusValid = 0'u8",
+    ]:
+        assert expected in wl_lp_status_clear_body
+    for forbidden in [
+        "cast[ptr UncheckedArray[uint8]](wlEnvGlobal)[",
+        "cast[ptr uint16](cast[uint](wlEnvGlobal)",
+        "cast[ptr uint32](cast[uint](wlEnvGlobal)",
+    ]:
+        assert forbidden not in wl_lp_status_clear_body
+    for expected in [
+        "wl_lp_status_update+0x0..0x60",
+        "let env = wlLowPowerStatusEnv()",
+        "active == 0'u32",
+        "env.inactiveUpdateCount >= 1'u16",
+        "env.inactiveUpdateCount = 0'u16",
+        "env.statusValid = 0'u8",
+        "env.lastStatusCode = statusCode",
+        "env.statusValid = 1'u8",
+        "env.lastUpdateContext = context",
+    ]:
+        assert expected in wl_lp_status_update_body
+    for forbidden in [
+        "cast[ptr UncheckedArray[uint8]](wlEnvGlobal)[",
+        "cast[ptr uint16](cast[uint](wlEnvGlobal)",
+        "cast[ptr uint32](cast[uint](wlEnvGlobal)",
+    ]:
+        assert forbidden not in wl_lp_status_update_body
+    wl_power_cfg_body = wifi_fw.split(
+        "proc wl_wlan_power_cfg_get*(rateClass, rateIndex: uint32): int8",
+        1,
+    )[1].split("proc wl_rf_tcal_handler", 1)[0]
+    for expected in [
+        "of 0'u32, 1'u32:",
+        "adjusted = (rateIndex - 4'u32) and 0xFF'u32",
+        "trpc_get_default_power_idx(group, adjusted.uint8)",
+        "of 2'u32, 3'u32:",
+        "trpc_get_default_power_idx(2'u32, rateIndex.uint8)",
+        "of 4'u32:",
+        "trpc_get_default_power_idx(3'u32, rateIndex.uint8)",
+        "of 5'u32, 6'u32, 7'u32:",
+        "trpc_get_default_power_idx(4'u32, rateIndex.uint8)",
+        "wlInvalidPowerCfgIndex()",
+    ]:
+        assert expected in wl_power_cfg_body
+    assert "cfg.ratePowerTablePostamble[3]" in wifi_fw
+    assert "cfg.ratePowerLimitDbm" in wifi_fw
+    assert 'var trpcEnv* {.align: 4, exportc: "trpc_env".}: array[2, uint32]' in wifi_fw
+    for expected in [
+        "proc crm_get_cpu_freq*(): uint32 {.exportc, cdecl.} =",
+        "50_000_000'u32",
+        "proc rf_set_channel*(unusedBand: uint32, channelMhz: uint32)",
+        "rfc_config_channel(channelMhz)",
+        "proc rfc_wlan_mode_force*(mode: uint32) {.exportc, cdecl.} =",
+        "mode <= 4'u32",
+        "proc rfc_dump*() {.exportc, cdecl.} =",
+        "rxModeDumpReadback224: uint32",
+        "doAssert offsetof(RfRegBlock, rxModeDumpReadback224) == 0x224",
+        "volatileLoad(addr rf.rxModeDumpReadback224)",
+        "proc rfc_get_power_level*(rateClass: uint32; requestedPowerTenths: int32): uint32",
+        "proc rfc_power_meas*(clockSelect: uint32; offsetHz: int32;",
+    ]:
+        assert expected in wifi_fw
+    for expected in [
+        "librf_bl808.a:rfc_helper.c.o rfc_config_power is ret-only",
+        "librf_bl808.a:rfc_helper.c.o rfc_apply_tx_dvga_offset is ret-only",
+        "librf_bl808.a:rfc_helper.c.o rfc_apply_tx_dvga is ret-only",
+        "librf_bl808.a:rfc_helper.c.o rfc_apply_tx_power_offset is ret-only",
+    ]:
+        assert expected in wifi_fw
+    for stale_provenance in [
+        "librf_bl808.a:rfc.c.o rfc_config_power is ret-only",
+        "librf_bl808.a:rfc.c.o rfc_apply_tx_dvga_offset is ret-only",
+        "librf_bl808.a:rfc.c.o rfc_apply_tx_dvga is ret-only",
+        "librf_bl808.a:rfc.c.o rfc_apply_tx_power_offset is ret-only",
+    ]:
+        assert stale_provenance not in wifi_fw
+    for expected in [
+        "rfc_get_power_level+0x0..0x4a",
+        "if rateClass == 0'u32:",
+        "elif rateClass == 1'u32:",
+        "rfPriGetTxGainIndex(requestedPowerTenths, group) shl 2",
+    ]:
+        assert expected in rfc_get_power_level_body
+    for expected in [
+        "RfPriTxPowerRowTxGainTenthsIndex = 6",
+        "RfPriTxPowerRowPowerThresholdTenthsIndex = 8",
+        "proc rfPriGetTxGainIndex(requestedPowerTenths: int32;",
+        "rf_pri_get_txgain_index(power, group)",
+        "recovered BL602 implementation",
+        "adjustedPower -= 30'i32",
+        "bl808RfTxPowerTable[idx][RfPriTxPowerRowPowerThresholdTenthsIndex]",
+        "bl808RfTxGainComp.int32",
+        "return idx.uint32",
+        "15'u32",
+    ]:
+        assert expected in wifi_fw
+    for body, expected in [
+        (rfc_power_meas_body, [
+            "rfc_power_meas+0x0..0x1b2",
+            "rfcPowerMeasureFrequencyWord(clockSelect, offsetHz)",
+            "addr rf.measureCtrl618",
+            "addr rf.measureMode61c",
+            "addr rf.measureI620",
+            "addr rf.measureQ624",
+            "RfMeasureReadyMask",
+            "signedRfAverageMeasurement",
+            "if iOut != nil:",
+            "if qOut != nil:",
+        ]),
+        (rfc_sg_start_body, [
+            "rfc_sg_start+0x0..0x146",
+            "let rf = rfRegs()",
+            "let magnitudeHz",
+            "let frequencyControl",
+            "uint64(magnitudeHz) * 1024'u64",
+            "80_000_000'u64",
+            "let amplitudeCode",
+            "if amplitude > 1023'u32: 1023'u32 else: amplitude",
+            "let highPathPhase",
+            "0x40000000'u32",
+            "0xC0000000'u32",
+            "addr rf.calSingenCtrl20c",
+            "addr rf.calSingenMeasurePrep21c",
+            "addr rf.calSingenAmpLo214",
+            "addr rf.calSingenAmpHi218",
+            "signedQuadraturePath != 0'u32",
+        ]),
+        (rfc_sg_stop_body, [
+            "rfc_sg_stop+0x0..0x16",
+            "addr rfRegs().calSingenCtrl20c",
+            "not 0x80000000'u32",
+        ]),
+        (rfc_rf_fsm_force_body, [
+            "rfc_rf_fsm_force+0x0..0x6a",
+            "addr rf.channelTuneCtrl26c",
+            "mode == 15'u32",
+            "mode and 0x7'u32",
+            "waitRfUs(20)",
+            "0x8'u32",
+        ]),
+        (rfc_rc_fsm_force_body, [
+            "rfc_rc_fsm_force+0x0..0xb0",
+            "addr rf.baseCtrl1",
+            "mode == 15'u32",
+            "(mode shl 8) and 0x700'u32",
+            "waitRfUs(20)",
+            "0x800'u32",
+        ]),
+    ]:
+        for item in expected:
+            assert item in body
+        for forbidden in [
+            "regWrite(0x200010",
+            "rfRegWrite(",
+            "cast[ptr uint32](0x200010",
+            "cast[ptr uint32](0x2000120C'u)",
+            "cast[ptr uint32](0x20001210'u)",
+            "cast[ptr uint32](0x20001214'u)",
+            "cast[ptr uint32](0x20001218'u)",
+            "cast[ptr uint32](0x2000121C'u)",
+            "cast[ptr uint32](0x20001618'u)",
+            "cast[ptr uint32](0x2000161C'u)",
+            "cast[ptr uint32](0x20001620'u)",
+            "cast[ptr uint32](0x20001624'u)",
+        ]:
+            assert forbidden not in body
+    for expected in [
+        "rf_pri_cfg_init+0x0..0x7a",
         "cfg.channelFreqSeedPair0 = 0x096C0100'u32",
         "cfg.channelFreqSeedPair1 = 0x098A097B'u32",
         "cfg.channelFreqSeedPair2 = 0x09A80999'u32",
         "cfg.channelFreqSeedPadding.mitems",
         "cfg.ratePowerTablePreamble = 0'u16",
         "cfg.ratePowerLimitDbm = 20'u8",
+        "cfg.efuseTrimControl = 0x02000000'u32",
+        "cfg.efuseTxGainComp = 0x01'u8",
+        "cfg.efuseXtalCapCode0 = 0x80'u8",
+        "cfg.efuseXtalCapCode1 = 0x80'u8",
+        "cfg.efuseDfeTrim = 0x80'u8",
+        "cfg.temperaturePowerComp = 35'u8",
+        "cfg.temperaturePowerCompPadding = 0'u16",
+        "cfg.channelPowerComp.mitems",
+        "cfg.channelLowPowerComp.mitems",
     ]:
-        assert expected in wl_cfg_init_body
+        assert expected in rf_pri_cfg_init_body
+    for expected in [
+        "rf_pri_get_xtalfreq",
+        "WlXtal24M",
+        "WlXtal26M",
+        "WlXtal32M",
+        "WlXtal38P4M",
+        "WlXtal40M",
+        "WlXtal52M",
+        "0'u32",
+    ]:
+        assert expected in rf_pri_get_xtalfreq_body
+    for expected in [
+        "rf_calib_data.c.o rf_pri_init_calib_mem",
+        "rfCalibDataGlobal = wlCalGlobal",
+    ]:
+        assert expected in rf_pri_init_calib_mem_body
+    assert "seedWlCfgTxPowerDefaults()" in wl_cfg_init_body
+    assert "rf_pri_cfg_init()" in wl_cfg_init_body
+    assert "wlCfgSetU32(WlRfCfgRxcalA8Offset, WlRfCfgWb03RxcalA8Default)" in wl_cfg_init_body
+    assert "wlCfgSetU32(WlRfCfgRxcalA8Offset" not in rf_pri_cfg_init_body
     assert "var wifiBl808RfInited: uint32" in wifi_fw
     assert "bl808WifiRfColdInit" not in wifi_fw
     assert (
@@ -6401,7 +7085,12 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     assert "let restore = 1'u32" not in wifi_fw
     assert "discard wl_init()" in wifi_fw
     assert "wifiBl808RfInited = 1'u32" in wifi_fw
+    assert (
+        "BL808 WiFi firmware RF/PHY requires bl808WifiUseBl808Rf; "
+        "define bl808WifiAllowLegacyBl606pRfFallback only for archive comparison builds"
+    ) in wifi_fw
     assert "when defined(bl808WifiUseBl808Rf):" in wifi_fw
+    assert "elif defined(bl808WifiAllowLegacyBl606pRfFallback):" in wifi_fw
     assert "proc phy_set_channel*(channel: ptr ChanCtxtDefView, force: uint32)" in wifi_fw
     assert "proc phy_set_channel_scalar*(band, chanType, primFreq, centerFreq1: uint32)" in wifi_fw
     assert '{.importc: "phy_set_channel", cdecl.}' in wifi_fw
@@ -6520,6 +7209,45 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "nimFwDbgRfCalRestoreRf88 = state.txcalDfe88",
     ]:
         assert expected in restore_cal_state_body
+    assert "RfPriVendorCalState = object" in wifi_fw
+    for expected in [
+        "bl808RfPriVendorCalState: RfPriVendorCalState",
+        "calPathCtrl90: uint32",
+        "rf_pri_save_state_before_cal+0x0..0x13a",
+        "let rf = rfRegs()",
+        "let dfe = rfDfeInitRegs()",
+        "bl808RfPriVendorCalState.synthCtrl2c = volatileLoad(addr rf.synthCtrl2c)",
+        "bl808RfPriVendorCalState.hbnCtrl30 = volatileLoad(addr dfe.hbnCtrl30)",
+        "bl808RfPriVendorCalState.calPathCtrl90 = volatileLoad(addr rf.calPathCtrl90)",
+        "bl808RfPriVendorCalState.rxMode220 = volatileLoad(addr rf.rxMode220)",
+    ]:
+        assert expected in wifi_fw if expected.startswith("bl808RfPriVendorCalState:") or expected == "calPathCtrl90: uint32" else expected in vendor_save_cal_state_body
+    for expected in [
+        "rf_pri_restore_state_after_cal+0x0..0x13a",
+        "let rf = rfRegs()",
+        "let dfe = rfDfeInitRegs()",
+        "volatileStore(addr rf.synthCtrl2c, bl808RfPriVendorCalState.synthCtrl2c)",
+        "volatileStore(addr dfe.hbnCtrl30, bl808RfPriVendorCalState.hbnCtrl30)",
+        "volatileStore(addr rf.calPathCtrl90, bl808RfPriVendorCalState.calPathCtrl90)",
+        "volatileStore(addr rf.rxMode220, bl808RfPriVendorCalState.rxMode220)",
+    ]:
+        assert expected in vendor_restore_cal_state_body
+    assert "addr rf.calPathConfig8c" not in vendor_save_cal_state_body
+    assert "volatileStore(addr rf.calPathConfig8c" not in vendor_restore_cal_state_body
+    for expected in [
+        "rf_pri_cw_stop+0x0..0x1a",
+        "let rf = rfRegs()",
+        "addr rf.rxMode220",
+        "0xFFFFE67D'u32",
+        "rf_pri_restore_state_after_cal()",
+    ]:
+        assert expected in rf_pri_cw_stop_body
+    for forbidden in [
+        "regWrite(0x20001220",
+        "rfRegWrite(",
+        "rfRegRead(",
+    ]:
+        assert forbidden not in rf_pri_cw_stop_body
     for forbidden in [
         "for i, regAddr in RfPriCalSavedRegAddrs:",
         "result.words[i]",
@@ -6529,7 +7257,9 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     ]:
         assert forbidden not in save_cal_state_body
         assert forbidden not in restore_cal_state_body
-    ble_controller = (ROOT / "src/bl808/blecontroller.nim").read_text()
+        assert forbidden not in vendor_save_cal_state_body
+        assert forbidden not in vendor_restore_cal_state_body
+    ble_controller = blecontroller_policy_source()
     save_ble_cal_state_body = ble_controller.split(
         "proc saveBleRfPriCalState(): BleRfPriCalState =",
         1,
@@ -6687,7 +7417,8 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "doAssert offsetof(RfRegBlock, rfGainTable76c) == 0x76C",
         "doAssert offsetof(RfRegBlock, rfGainTable774) == 0x774",
         "doAssert offsetof(RfRegBlock, rfGainTable77c) == 0x77C",
-        "doAssert offsetof(RfRegBlock, rfGainTable784) == 0x784",
+        "doAssert offsetof(RfRegBlock, rfGainOrBzTempComp784) == 0x784",
+        "doAssert offsetof(RfRegBlock, bzTemperatureComp7b8) == 0x7B8",
         "doAssert offsetof(RfRegBlock, rfGainTable78c) == 0x78C",
         "doAssert offsetof(RfRegBlock, rfGainTable794) == 0x794",
         "doAssert offsetof(RfRegBlock, rfGainTable79c) == 0x79C",
@@ -6902,7 +7633,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "addr rf.rfGainTable79c",
         "addr rf.rfGainTable794",
         "addr rf.rfGainTable78c",
-        "addr rf.rfGainTable784",
+        "addr rf.rfGainOrBzTempComp784",
         "addr rf.rfGainTable77c",
         "addr rf.rfGainTable774",
         "addr rf.rfGainTable76c",
@@ -7000,6 +7731,12 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     ]:
         assert expected in xtal_tenths_body
     for expected in [
+        "rf_pri.c.o rf_pri_xtalfreq",
+        "private PLL",
+        "rfPriWifiPllConfig()",
+    ]:
+        assert expected in rf_pri_xtalfreq_body
+    for expected in [
         "let rf = rfRegs()",
         "addr rf.txPowerComp704",
         "addr rf.txPowerComp7ac",
@@ -7086,7 +7823,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     assert "typeForRfLatch == 2'u32" in tx_payload_body
     assert "inc nimFwDbgStaTxRfLatch" in tx_payload_body
     assert "rfPriApplyWb03AuthTxLatches()" in tx_payload_body
-    assert "rwip_wlcoex_set*(en: bool)" in (ROOT / "src/bl808/blecontroller.nim").read_text()
+    assert "rwip_wlcoex_set*(en: bool)" in blecontroller_policy_source()
     for phase in [
         "proc phyInitValidateClock() =",
         "proc phyInitProgramBasebandAndAgc() =",
@@ -7149,8 +7886,8 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         'proc phy_ldpc_tx_supported(): bool {.importc: "phy_ldpc_tx_supported", cdecl.}'
         in wifi_fw
     )
-    assert "External non-BL808 PHY fallback: reports whether TX LDPC is supported." in wifi_fw
-    assert wifi_fw.index("when not defined(bl808WifiUseBl808Rf):") < wifi_fw.index(
+    assert "Explicit legacy BL606P PHY fallback: reports whether TX LDPC is supported." in wifi_fw
+    assert wifi_fw.index("when defined(bl808WifiAllowLegacyBl606pRfFallback):") < wifi_fw.index(
         'proc phy_ldpc_tx_supported(): bool {.importc: "phy_ldpc_tx_supported", cdecl.}'
     )
     assert "proc copyAgcMemory() =" in wifi_fw
@@ -7184,10 +7921,21 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     assert "volatileStore(addr dst.words[i], src[i])" in wifi_fw
     assert "cast[ptr UncheckedArray[uint32]](AgcMemoryBase)" not in wifi_fw
     assert "copyAgcMemory()" in wifi_fw
+    phy_field_assert_body = wifi_fw.split(
+        "proc validatePhyInitFieldFits(cond: cstring; value, shift, mask: uint32)",
+        1,
+    )[1].split("proc phyClockCountFromVersion", 1)[0]
+    for expected in [
+        "if (((value shl shift) and not mask) != 0'u32):",
+        'wrapPhyAssertErr("phy.c", cond, 0x35C4.cint)',
+    ]:
+        assert expected in phy_field_assert_body
     recovered_phy_body = wifi_fw.split(
         "proc bl808PhyProgramRecoveredRegs() =",
         1,
     )[1].split("proc bl808PhyProgramAgcCopyTailRegs()", 1)[0]
+    assert "Typed translation of librf_bl808.a:phy.c.o phy_init+0x5a..0x310" in recovered_phy_body
+    assert "Partial translation" not in recovered_phy_body
     assert "let mdm = wifiModemRegs()" in recovered_phy_body
     assert "let macPhy = macPhyCtrlRegs()" in recovered_phy_body
     for expected in [
@@ -7196,6 +7944,14 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "let heOrBandwidthProfile =",
         "let modemCapability21 =",
         "let modemCapability30 =",
+        "validatePhyInitFieldFits(",
+        "(((uint32_t)rxnssmax << 4) & ~((uint32_t)0x00000070)) == 0",
+        "(((uint32_t)rxndpnstsmax << 12) & ~((uint32_t)0x00007000)) == 0",
+        "(((uint32_t)confnrx << 8) & ~((uint32_t)0x00000F00)) == 0",
+        "(((uint32_t)txnssmax << 4) & ~((uint32_t)0x00000070)) == 0",
+        "(((uint32_t)ntxmax << 20) & ~((uint32_t)0x00700000)) == 0",
+        "(((uint32_t)maxsupportednss << 20) & ~((uint32_t)0x00700000)) == 0",
+        "(((uint32_t)confntx << 4) & ~((uint32_t)0x000000F0)) == 0",
     ]:
         assert expected in recovered_phy_body
     for forbidden in [
@@ -7332,6 +8088,17 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "phyEnvWord(40'u)",
     ]:
         assert forbidden not in phy_get_channel_body
+    phy_vht_body = wifi_fw.split(
+        "proc phy_vht_supported*(): bool {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc phy_he_supported*", 1)[0]
+    for expected in [
+        "let version = modemVersionReg()",
+        "((version shr 21) and 1'u32) != 0'u32",
+        "((version shr 24) and 0x3'u32) != 0'u32",
+    ]:
+        assert expected in phy_vht_body
+    assert "(modemVersionReg() and (1'u32 shl 16)) != 0" not in wifi_fw
     phy_stop_body = wifi_fw.split(
         "proc phy_stop*() {.exportc, cdecl.} =",
         1,
@@ -7342,9 +8109,14 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "proc phy_set_aid*(aid: uint16)",
         1,
     )[1].split("proc phy_set_group_id_info*", 1)[0]
+    assert "if (aid.uint32 and not 0x7FF'u32) != 0'u32:" in phy_aid_body
+    assert "(((uint32_t)hestaid << 0) & ~((uint32_t)0x000007FF)) == 0" in phy_aid_body
+    assert "0x35C3.cint" in phy_aid_body
     assert "addr mdm.aid" in phy_aid_body
     assert "addr mdm.aidMaskLo" in phy_aid_body
     assert "addr mdm.aidMaskHi" in phy_aid_body
+    assert "volatileStore(addr mdm.aid, aid.uint32)" in phy_aid_body
+    assert "aid.uint32 and 0x7FF'u32" not in phy_aid_body
     phy_group_body = wifi_fw.split(
         "proc phy_set_group_id_info*(membership: pointer, userPosition: pointer)",
         1,
@@ -7363,7 +8135,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         assert forbidden not in phy_aid_body
         assert forbidden not in phy_group_body
     bba_pd_gain_body = wifi_fw.split(
-        "proc bbaSetPdGain(gain: uint32) =",
+        "proc bbaProgramPdGain(gain: uint32) =",
         1,
     )[1].split("proc bba_init()", 1)[0]
     assert "let mdm = wifiModemRegs()" in bba_pd_gain_body
@@ -7384,6 +8156,65 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "cast[ptr uint32](0x24C0B3AC'u)",
     ]:
         assert forbidden not in bba_pd_gain_body
+    for expected in [
+        'var bbaEnv* {.align: 4, exportc: "bba_env".}: BbaRuntimeState',
+        "proc bba_get_pd_gain*(): uint8 {.exportc, cdecl.} =",
+        "proc bba_get_pd_state*(): uint8 {.exportc, cdecl.} =",
+        "proc bba_get_pd_mile*(): uint8 {.exportc, cdecl.} =",
+        "proc bba_set_pd_gain*(gain: uint32) {.exportc, cdecl.} =",
+        "proc bba_set_pd_ofdm*(enable: uint32) {.exportc, cdecl.} =",
+        "proc bba_set_pd_dsss*(enable: uint32) {.exportc, cdecl.} =",
+        "proc bba_set_pd_rssi*(rssiThreshold: uint32) {.exportc, cdecl.} =",
+        "proc bba_set_pd_mile*(enable: uint32) {.exportc, cdecl.} =",
+        "proc bba_set_pd_state*(state: uint32) {.exportc, cdecl.} =",
+        "proc bba_get_pd_cfg*(ofdmOut, dsssOut, rssiOut: pointer) {.exportc, cdecl.} =",
+        "proc bba_pd_reset*() {.exportc, cdecl.} =",
+        "proc bba_ce_reset*() {.exportc, cdecl.} =",
+        "proc bba_ce_update_capcode*() {.exportc, cdecl.} =",
+        "proc bba_ce_loop*(rssi: int32, ppm: int32) {.exportc, cdecl.} =",
+        "proc bba_pd_loop*(rssi: int32) {.exportc, cdecl.} =",
+    ]:
+        assert expected in wifi_fw
+    bba_public_body = wifi_fw.split(
+        "proc bba_get_pd_gain*(): uint8 {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc bba_init()", 1)[0]
+    for expected in [
+        "volatileLoad(addr bbaState().pdGainCode)",
+        "volatileLoad(addr bbaState().pdRssiState)",
+        "volatileLoad(addr bbaState().pdCompLatch)",
+        "bbaProgramPdGain(gain)",
+        "addr bbaAgcRegs().pdGain390",
+        "addr bbaAgcRegs().pdCompC830",
+        "addr bbaAgcRegs().pdSlope3c0",
+        "bbaSetPdLatch(enable != 0'u32)",
+        "let saved = bbaIrqSave()",
+        "let oldState = volatileLoad(addr bbaState().pdRssiState).uint32",
+        "bba_set_pd_ofdm(1'u32)",
+        "bba_set_pd_dsss(1'u32)",
+        "bba_set_pd_ofdm(0'u32)",
+        "bba_set_pd_dsss(0'u32)",
+        "bbaSetPdLatch(false)",
+        "bbaSetPdLatch(true)",
+        "bbaProgramPdGain(0'u32)",
+        "bbaProgramPdGain(1'u32)",
+        "bbaProgramPdGain(2'u32)",
+        "volatileStore(addr bbaState().pdRssiState, state.uint8)",
+        "bbaIrqRestore(saved)",
+        "volatileStore(addr bbaState().cePpmAccumulator, 0'u16)",
+        "volatileStore(addr bbaState().ceUpdateInterval, 16'u8)",
+        "bbaApplyCarrierErrorCapcode()",
+        "bbaRunCarrierErrorLoop(rssi, ppm)",
+        "bbaRunPowerDetectLoop(rssi)",
+    ]:
+        assert expected in bba_public_body
+    for forbidden in [
+        "cast[ptr uint32](0x24C0B390'u)",
+        "cast[ptr uint32](0x24C0B3C0'u)",
+        "cast[ptr uint32](0x24C0C830'u)",
+        "cast[ptr uint32](0x2000150C'u)",
+    ]:
+        assert forbidden not in bba_public_body
     bba_init_body = wifi_fw.split(
         "proc bba_init() {.exportc, cdecl.} =",
         1,
@@ -7399,7 +8230,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     bba_update_pd_comp_body = wifi_fw.split(
         "proc bbaUpdatePdComp(target: uint8) =",
         1,
-    )[1].split("proc bbaCeUpdateCapcode", 1)[0]
+    )[1].split("proc bbaApplyCarrierErrorCapcode", 1)[0]
     for body in [bba_init_body, bba_reset_body, bba_update_pd_comp_body]:
         assert "let bba = bbaAgcRegs()" in body
         assert "addr bba.pdGain390" in body
@@ -7438,6 +8269,16 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     assert "RfBase + 0x26C'u" not in rx_tail_body
     assert "cast[ptr uint32](0x24C0C018'u)" not in rx_tail_body
     assert "let clkCount = phyClockCountFromVersion(version)" in wifi_fw
+    phy_get_antenna_body = wifi_fw.split(
+        "proc phy_get_antenna_set*(): uint8 {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc phy_switch_antenna_paths*", 1)[0]
+    for expected in [
+        "let rxChainCount = modemVersionReg() and 0xF'u32",
+        "uint8((1'u32 shl rxChainCount) - 1'u32)",
+    ]:
+        assert expected in phy_get_antenna_body
+    assert "proc phy_get_antenna_set*(): uint8 {.exportc, cdecl.} =\n    1'u8" not in wifi_fw
     copy_phy_cfg_body = wifi_fw.split(
         "proc copyPhyInitCfg(cfg: pointer) =",
         1,
@@ -7592,18 +8433,36 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     assert "let mdm = wifiModemRegs()" in wrap_phy_assert_body
     assert "volatileLoad(addr mdm.versionScratch3c)" in wrap_phy_assert_body
     assert "regRead(0x24C0003C'u32)" not in wrap_phy_assert_body
+    for expected in [
+        "proc phy_assert_rec*(fileOrCond, condOrFile: cstring, line: cint)",
+        "proc phy_assert_warn*(fileOrCond, condOrFile: cstring, line: cint)",
+        "proc phy_assert_err*(fileOrCond, condOrFile: cstring, line: cint)",
+        "wrapPhyAssertErr(fileOrCond, condOrFile, line)",
+    ]:
+        assert expected in wifi_fw
     assert "line == 586.cint or line == 0x20FA.cint or line == 0x2A60.cint" in wifi_fw
-    blecontroller = (ROOT / "src/bl808/blecontroller.nim").read_text()
+    blecontroller = blecontroller_policy_source()
     blerfdata = (ROOT / "src/bl808/blerfdata.nim").read_text()
     assert "BleLdpcMemBase* = 0x24C09000'u32" in blerfdata
     assert "BleLdpcMem*: array[375, uint32]" in blerfdata
     assert "BleLdpcInitWords = 190" in blecontroller
     assert "BlePhyMemoryRegs {.packed.} = object" in blecontroller
     assert "doAssert offsetof(BlePhyMemoryRegs, ldpcMode) == 0x834" in blecontroller
+    assert "doAssert offsetof(BlePhyMemoryRegs, ldpcLoadAddress) == 0xB340" in blecontroller
+    assert "doAssert offsetof(BlePhyMemoryRegs, ldpcLoadLength) == 0xB344" in blecontroller
+    assert "doAssert offsetof(BlePhyMemoryRegs, ldpcLoadControl) == 0xB348" in blecontroller
     assert "bleRegUpdatePtr(addr phyMem.ldpcMode, BlePhyLdpcLoadModeMask" in blecontroller
-    assert "bleRegStorePtr(addr phyMem.ldpcCtrlB340, 0'u32)" in blecontroller
+    assert "bleRegStorePtr(addr phyMem.ldpcLoadAddress, 0'u32)" in blecontroller
+    assert "bleRegStorePtr(addr phyMem.ldpcLoadLength, 0'u32)" in blecontroller
+    assert "bleRegStorePtr(addr phyMem.ldpcLoadControl, 0'u32)" in blecontroller
     assert "bleRegClearPtr(addr phyMem.memMode, BlePhyLdpcMemSelectMask)" in blecontroller
     assert "writeBleMemoryWords(blerfdata.BleLdpcMemBase, blerfdata.BleLdpcMem" in blecontroller
+    for forbidden in [
+        "ldpcCtrlB340",
+        "ldpcCtrlB344",
+        "ldpcCtrlB348",
+    ]:
+        assert forbidden not in blecontroller
 
     for archive in [bl808_rf, bl606p_rf]:
         symbols = subprocess.check_output(
@@ -7696,8 +8555,13 @@ def test_rf_symbol_provenance_checker_rejects_archive_fallbacks():
         "Nim WiFi PHY memory init copies agcmem and has no LDPC RAM path",
         "unexpected Nim WiFi LDPC RAM reference 0x24C09000",
         "failures.extend(check_wifi_object_phy_memory_init(args.wifi_object))",
+        "PRIMARY_WIFI_RF_PHY_ENTRYPOINTS = [",
+        "def check_primary_wifi_entrypoints(path: Path, label: str) -> list[str]:",
+        "PRIMARY_WIFI_RF_PHY_ENTRYPOINTS",
+        'f"{label} primary WiFi RF/PHY entrypoints"',
         'missing = check_defined(args.wifi_object, WIFI_RF_SYMBOLS, "wifi-object")',
         'failures.extend(f"wifi-object:{symbol}" for symbol in missing)',
+        'f"wifi-object:missing-primary:{symbol}"',
         'missing = check_defined(args.ble_object, BLE_RF_SYMBOLS, "ble-object")',
         'failures.extend(f"ble-object:{symbol}" for symbol in missing)',
         "24c09000",
@@ -7719,6 +8583,8 @@ def test_rf_symbol_provenance_checker_rejects_archive_fallbacks():
         "check_wifi_phy_memory: bool",
         'missing = check_defined(obj, symbols, f"{elf} {label}-nimcache-object")',
         'failures.extend(f"{obj}:missing:{symbol}" for symbol in missing)',
+        'if label == "wifi":',
+        'f"{obj}:missing-primary:{symbol}"',
         'if label == "wifi" and check_wifi_phy_memory:',
         "failures.extend(check_wifi_object_phy_memory_init(obj))",
         "args.check_wifi_phy_memory_init",
@@ -7738,13 +8604,46 @@ def test_rf_symbol_provenance_checker_rejects_archive_fallbacks():
         "required_symbols.extend(WIFI_RF_SYMBOLS)",
         "required_symbols.extend(BLE_RF_SYMBOLS)",
         '"wl_rf_cfg_init"',
+        '"wl_wlan_power_table_update"',
+        '"wl_rf_tcal_handler"',
+        '"wl_rf_tcal_period_get"',
+        '"wl_bz_rx_optimize"',
+        '"wl_bz_rx_optimize_restore"',
+        '"wl_rf_set_bz_target_power_table"',
+        '"wl_rf_set_channel_pwr_comp"',
+        '"wl_wlan_bb_reset"',
+        '"wl_wlan_bb_pre_proc"',
+        '"wl_wlan_bb_post_proc"',
+        '"wl_wlan_rssi_get"',
+        '"wl_wlan_ppm_get"',
+        '"wl_wlan_power_cfg_get"',
+        '"wl_154_power_cfg_get"',
+        '"wl_bt_power_cfg_get"',
+        '"wl_ble_power_cfg_get"',
+        '"wl_init"',
+        '"rf_init"',
+        '"rfc_init"',
+        '"modem_init_core"',
+        '"phy_init"',
+        '"rf_set_channel"',
+        '"rfc_wlan_mode_force"',
+        '"rfc_dump"',
+        '"crm_get_cpu_freq"',
+        '"phy_assert_err"',
+        '"phy_assert_rec"',
+        '"phy_assert_warn"',
         '"wl_rmem_size_get"',
         '"wl_env_get"',
+        '"wl_lp_init"',
+        '"wl_lp_status_clear"',
+        '"wl_lp_status_update"',
         '"rfc_config_bandwidth"',
         '"rfc_config_channel"',
         '"modem_init"',
         '"modem_restore"',
         '"rf_dump_status"',
+        '"rf_lo_isr"',
+        '"rf_clkpll_isr"',
         '"phy_get_mac_freq"',
         '"phy_get_version"',
         '"phy_get_channel"',
@@ -7756,17 +8655,80 @@ def test_rf_symbol_provenance_checker_rejects_archive_fallbacks():
         '"phy_powroffset_set"',
         '"trpc_update_power"',
         '"trpc_get_default_power_idx"',
+        '"bba_get_pd_cfg"',
+        '"bba_get_pd_gain"',
+        '"bba_get_pd_mile"',
+        '"bba_get_pd_state"',
+        '"bba_pd_reset"',
+        '"bba_ce_reset"',
+        '"bba_ce_update_capcode"',
+        '"bba_ce_loop"',
+        '"bba_pd_loop"',
+        '"bba_set_pd_dsss"',
+        '"bba_set_pd_gain"',
+        '"bba_set_pd_mile"',
+        '"bba_set_pd_ofdm"',
+        '"bba_set_pd_rssi"',
+        '"bba_set_pd_state"',
         '"rf_pri_init"',
         '"rf_pri_input_xtalfreq"',
+        '"rf_pri_get_xtalfreq"',
+        '"rf_pri_xtalfreq"',
+        '"rf_pri_init_calib_mem"',
         '"rf_pri_config_mode"',
+        '"rf_pri_cfg_init"',
         '"rf_pri_input_device_info"',
+        '"rf_pri_input_chip_ver"',
+        '"rf_pri_get_wl_cfg"',
+        '"rf_pri_get_txgain_max"',
+        '"rf_pri_get_txgain_min"',
+        '"rf_pri_roscal"',
+        '"rf_pri_rccal"',
+        '"rf_pri_manual_incremental_cal_start"',
+        '"rf_pri_manual_incremental_cal_stop"',
+        '"rf_pri_set_rcal_code"',
+        '"rf_pri_save_state_before_cal"',
+        '"rf_pri_restore_state_after_cal"',
+        '"rf_pri_cw_start"',
+        '"rf_pri_cw_stop"',
+        '"rf_pri_lo_fcal"',
+        '"rf_pri_lo_acal"',
+        '"rf_pri_txcal"',
+        '"rf_pri_bz_txcal"',
+        '"rf_pri_rxcal"',
+        '"rf_pri_full_cal"',
+        '"rf_pri_restore_cal_reg"',
         '"rf_pri_update_param"',
+        '"rf_pri_read"',
         '"rf_pri_get_notch_param"',
         '"rf_pri_optimize"',
+        '"rf_pri_bz_optimize"',
+        '"rf_pri_bz_optimize_restore"',
+        '"rf_pri_input_channel_pwr_comp"',
+        '"rf_pri_input_channel_lp_pwr_comp"',
+        '"rf_pri_set_channel_lp_pwr_comp"',
+        '"rf_pri_input_temp_comp_param"',
+        '"rf_pri_set_temp_comp"',
+        '"rf_pri_input_bz_channel_pwr_comp"',
+        '"rf_pri_set_bz_channel_pwr_comp"',
+        '"rf_pri_set_bz_temp_comp"',
+        '"rf_pri_get_bz_temp_mp_comp"',
+        '"rf_pri_input_bz_target_power"',
         '"rf_pri_set_channel_pwr_comp"',
+        '"rf_pri_set_channel_total_pwr_comp"',
         '"rf_pri_set_bandwidth"',
         '"rf_pri_get_vco_freq_cw"',
         '"rf_pri_get_vco_idac_cw"',
+        '"rfc_config_power"',
+        '"rfc_get_power_level"',
+        '"rfc_power_meas"',
+        '"rfc_apply_tx_dvga_offset"',
+        '"rfc_apply_tx_dvga"',
+        '"rfc_apply_tx_power_offset"',
+        '"rfc_sg_start"',
+        '"rfc_sg_stop"',
+        '"rfc_rf_fsm_force"',
+        '"rfc_rc_fsm_force"',
         '"ble_rf_init"',
         '"ble_rf_set_pwr_offset_table"',
         '"ble_rf_get_pwr_offset"',
@@ -7817,7 +8779,7 @@ def test_rf_symbol_provenance_checker_rejects_archive_fallbacks():
 
 
 def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
     manifest = (ROOT / "tools/hardware_validation.json").read_text()
 
     fixed_body = wifi_fw.split("proc writeRfPriFixedValueRegs() =", 1)[1].split(
@@ -7860,6 +8822,22 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
         "proc rfPriApplyWb03ScanBaseline() =",
         1,
     )[1].split("proc wlCfgU32", 1)[0]
+    manual_incremental_cal_stop_body = wifi_fw.split(
+        "proc rf_pri_manual_incremental_cal_stop() {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc rf_pri_get_wl_cfg", 1)[0]
+    cw_sdm_body = wifi_fw.split(
+        "proc rfPriCwSdmDivWord(channelMhz: uint32): uint32 {.inline.} =",
+        1,
+    )[1].split("proc rfPriProgramCwChannel", 1)[0]
+    cw_program_body = wifi_fw.split(
+        "proc rfPriProgramCwChannel(channelMhz: uint32) =",
+        1,
+    )[1].split("proc rfPriStartCwDfeStrobes", 1)[0]
+    cw_start_body = wifi_fw.split(
+        "proc rf_pri_cw_start(targetPowerDbm: int32; channelMhz: uint32)",
+        1,
+    )[1].split("proc signedRfPowerMeasurement", 1)[0]
     rf70_search_body = wifi_fw.split(
         "proc rfPriSearchRf70ReplayWindow(window: int): tuple[ok: bool, nibble: uint32] =",
         1,
@@ -7895,6 +8873,59 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
         "rfPriRecordRf70SearchWindow(\n      window, ok, bestNibble, runnerUpNibble, bestSample, runnerUpSample,",
     ]:
         assert expected in wifi_fw if expected.startswith("exportc") else expected in rf70_search_body
+    for expected in [
+        "rf_pri_manual_incremental_cal_stop+0x0..0x1e",
+        "let rf = rfRegs()",
+        "addr rf.synthCtrl2c",
+        "0x00000040'u32",
+        "addr rf.baseCtrl1",
+        "not 0x0000000C'u32",
+        "0x00000004'u32",
+        "addr rf.calCtrl1c",
+        "0x00000060'u32",
+    ]:
+        assert expected in manual_incremental_cal_stop_body
+    for forbidden in [
+        "regWrite(0x2000102C",
+        "regWrite(0x20001004",
+        "regWrite(0x2000101C",
+        "rfRegWrite(",
+        "rfRegOr(",
+    ]:
+        assert forbidden not in manual_incremental_cal_stop_body
+    for expected in [
+        "uint64(channelMhz) * 40'u64 * (1'u64 shl 22)",
+        "uint64(divisorTenths)",
+        "0x3FFF_FFFF'u32",
+    ]:
+        assert expected in cw_sdm_body
+    for expected in [
+        "rf_pri_cw_start+0x1d2..0x25c",
+        "let index = rfPriCwLoCalIndex(channelMhz)",
+        "let fcalByte = uint32(rfLoFcal(index))",
+        "let acalByte = uint32(rfLoAcal(index))",
+        "addr rf.fcalCtrlA0",
+        "addr rf.channelFcalConfigBc",
+        "let sdmDivWord = rfPriCwSdmDivWord(channelMhz)",
+        "nim_wifi_rf_cw_start_sdm_div = sdmDivWord",
+        "addr rf.sdmDivC4",
+        "addr rf.sdmCtrlC0",
+        "not 0x00001000'u32",
+    ]:
+        assert expected in cw_program_body
+    for expected in [
+        "rf_pri_cw_start+0xe6..0x172",
+        "720'u32",
+        "780'u32",
+        "960'u32",
+        "1152'u32",
+        "1200'u32",
+        "1560'u32",
+    ]:
+        assert expected in wifi_fw
+    assert "rfPriProgramCwChannel(channelMhz)" in cw_start_body
+    assert "rfPriConfigChannelForCal(rfPriCwLoCalIndex(channelMhz))" not in cw_start_body
+    assert "Remaining unknown" not in cw_start_body
     assert "bl808WifiRfWb03ApplyMeasuredRf70Replay* {.booldefine.}: bool = false" in wifi_fw
     for expected in [
         "if bl808WifiRfWb03ApplyMeasuredRf70Replay:",
@@ -7909,6 +8940,15 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
         "RfPriRf70ReplayFieldsMeasuredFallback",
     ]:
         assert expected in rf70_populate_body
+    for expected in [
+        "proc rfPriApplyTxcalLowBandRf70ReplayNibble() =",
+        "rf_pri_txcal+0x534..0x54a",
+        "rf_calib_data+0x0c bits 27:24",
+        "addr rfRegs().txcalParam70",
+        "rfPriRf70ReplayWindow0Nibble()",
+        "rfPriPopulateWb03TxcalRf70ReplayFields()\n    rfPriApplyTxcalLowBandRf70ReplayNibble()\n    discard chooseRfTxcalMixerCs()",
+    ]:
+        assert expected in wifi_fw if expected.startswith("proc ") else expected in wifi_fw
     for expected in [
         "RfCalibRf70ReplayLowBandWordIndex",
         "RfCalibRf70ReplayHighBandWordIndex",
@@ -8032,6 +9072,14 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
     seed_bz_txcal_body = wifi_fw.split(
         "proc rfPriSeedBzTxcalFallbackRecords() =",
         1,
+    )[1].split("proc rfPriTxcalReplayRecordsComplete()", 1)[0]
+    txcal_replay_complete_body = wifi_fw.split(
+        "proc rfPriTxcalReplayRecordsComplete(): bool =",
+        1,
+    )[1].split("proc rfPriBzTxcalReplayRecordsComplete()", 1)[0]
+    bz_txcal_replay_complete_body = wifi_fw.split(
+        "proc rfPriBzTxcalReplayRecordsComplete(): bool =",
+        1,
     )[1].split("proc rfPriWriteTxPowerTable()", 1)[0]
     write_tx_power_table_body = wifi_fw.split(
         "proc rfPriWriteTxPowerTable() =",
@@ -8047,6 +9095,10 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
     )[1].split("proc prepareRfPriRoscal()", 1)[0]
     run_roscal_body = wifi_fw.split(
         "proc runRfPriRoscal() =",
+        1,
+    )[1].split("proc waitRfRccalMeasurementReady()", 1)[0]
+    rf_pri_roscal_body = wifi_fw.split(
+        "proc rf_pri_roscal() {.exportc, cdecl.} =",
         1,
     )[1].split("proc waitRfRccalMeasurementReady()", 1)[0]
     wait_roscal_measure_body = wifi_fw.split(
@@ -8091,6 +9143,10 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
     )[1].split("proc prepareRfPriRccal()", 1)[0]
     run_rccal_body = wifi_fw.split(
         "proc runRfPriRccal() =",
+        1,
+    )[1].split("proc clampRfTxcalParam", 1)[0]
+    rf_pri_rccal_body = wifi_fw.split(
+        "proc rf_pri_rccal() {.exportc, cdecl.} =",
         1,
     )[1].split("proc clampRfTxcalParam", 1)[0]
     txcal_singen_amp_body = wifi_fw.split(
@@ -8165,6 +9221,34 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
         "proc rfPriApplyEfuseDfeTrim(cfg: ptr WlRfConfig) =",
         1,
     )[1].split("proc rfPriEfuseInit", 1)[0]
+    rf_pri_lo_fcal_body = wifi_fw.split(
+        "proc rf_pri_lo_fcal() {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc rf_pri_lo_acal", 1)[0]
+    rf_pri_lo_acal_body = wifi_fw.split(
+        "proc rf_pri_lo_acal() {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc rf_pri_txcal", 1)[0]
+    rf_pri_txcal_body = wifi_fw.split(
+        "proc rf_pri_txcal() {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc rf_pri_bz_txcal", 1)[0]
+    rf_pri_bz_txcal_body = wifi_fw.split(
+        "proc rf_pri_bz_txcal() {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc rf_pri_rxcal", 1)[0]
+    rf_pri_rxcal_body = wifi_fw.split(
+        "proc rf_pri_rxcal() {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc rf_pri_full_cal", 1)[0]
+    rf_pri_full_cal_body = wifi_fw.split(
+        "proc rf_pri_full_cal() {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc rf_pri_restore_cal_reg", 1)[0]
+    rf_pri_restore_cal_reg_body = wifi_fw.split(
+        "proc rf_pri_restore_cal_reg() {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc rf_pri_init", 1)[0]
     rf_pri_init_body = wifi_fw.split(
         "proc rf_pri_init(coldInit, mode: uint32) {.exportc, cdecl.} =",
         1,
@@ -8231,12 +9315,71 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
     ]:
         assert expected in seed_bz_txcal_body
     for expected in [
+        "bl808WifiRfWb03ReplayCompleteTxPowerCal* {.booldefine.}: bool = false",
+        "RfPriTxPowerReplayBaseOnly = 0x00000000'u32",
+        "RfPriTxPowerReplayCalRecords = 0x00000001'u32",
+        "RfPriTxPowerReplayWb03RestoreBaseline = 0x00000002'u32",
+        "RfPriTxPowerReplayWb03CompleteRecords = 0x00000003'u32",
+        "RfPriTxPowerSkipWb03TxcalIncomplete = 0x00000002'u32",
+        "RfPriTxPowerSkipWb03BzTxcalIncomplete = 0x00000003'u32",
+        "RfPriTxPowerSkipWb03OptInDisabled = 0x00000004'u32",
+        "var nim_wifi_rf_tx_power_replay_mode* {.exportc.}: uint32",
+        "var nim_wifi_rf_tx_power_replay_skip_reason* {.exportc.}: uint32",
+        "var nim_wifi_rf_tx_power_txcal_complete* {.exportc.}: uint32",
+        "var nim_wifi_rf_tx_power_bz_txcal_complete* {.exportc.}: uint32",
+        "librf_bl808.a:rf_pri.c.o .data.tx_pwr_table_idx",
+        "0000 0100 0200 0300 0400 0500 0600 0900 0a00 0b00 0c00 0d00 0e00",
+        "librf_bl808.a:rf_pri.c.o .data.bz_tx_pwr_table_idx",
+        "0100 0200 0300 0600",
+    ]:
+        assert expected in wifi_fw
+    for expected in [
+        "rf_calib_data+0x68",
+        "indexed by .data.tx_pwr_table_idx",
+        "for record in RfPriTxcalReplayRecordIds:",
+        "let txcalRecordWord0 =",
+        "let txcalRecordWord1 =",
+        "if (txcalRecordWord0 or txcalRecordWord1) == 0'u32:",
+        "return false",
+        "true",
+    ]:
+        assert expected in txcal_replay_complete_body
+    for expected in [
+        "rf_calib_data+0xf8",
+        "indexed by .data.bz_tx_pwr_table_idx",
+        "for record in bl808RfBzTargetPowerRecords:",
+        "let bzTxcalRecordWord0 = rfCalibBzTxcalRecordWord0(record)",
+        "let bzTxcalRecordWord1 = rfCalibBzTxcalRecordWord1(record)",
+        "let txcalParam0 = bzTxcalRecordWord0 and 0x3F'u32",
+        "let txcalParam1 = (bzTxcalRecordWord0 shr 8) and 0x3F'u32",
+        "let txcalParam2 = (bzTxcalRecordWord0 shr 16) and 0x07FF'u32",
+        "let txcalParam3 = bzTxcalRecordWord1 and 0x03FF'u32",
+        "return false",
+        "true",
+    ]:
+        assert expected in bz_txcal_replay_complete_body
+    for expected in [
         "let wb03Xtal40 = rfPriIsWb03() and",
         "bl808RfXtalIndex == xtalIndex(WlXtal40M)",
-        "if wb03Xtal40:",
+        "let txcalRecordsComplete = rfPriTxcalReplayRecordsComplete()",
+        "let bzTxcalRecordsComplete = rfPriBzTxcalReplayRecordsComplete()",
+        "nim_wifi_rf_tx_power_txcal_complete",
+        "nim_wifi_rf_tx_power_bz_txcal_complete",
+        "let wb03CompleteCalReplayAllowed = wb03Xtal40 and",
+        "bl808WifiRfWb03ReplayCompleteTxPowerCal and",
+        "let useCalReplay = rfCalibDataGlobal != nil and",
+        "let useWb03RestoreBaseline = wb03Xtal40 and",
+        "if useWb03RestoreBaseline:",
+        "nim_wifi_rf_tx_power_replay_mode =",
+        "RfPriTxPowerReplayWb03RestoreBaseline",
+        "RfPriTxPowerSkipWb03TxcalIncomplete",
+        "RfPriTxPowerSkipWb03BzTxcalIncomplete",
+        "RfPriTxPowerSkipWb03OptInDisabled",
+        "RfPriTxPowerReplayWb03CompleteRecords",
+        "RfPriTxPowerReplayCalRecords",
         "RfPriWb03TxPowerRegisterBaseline",
         "RfPriTxPowerRegisterBase",
-        "if rfCalibDataGlobal != nil and not wb03Xtal40:",
+        "if useCalReplay:",
         "var txPowerTableWords =",
         "rfPriApplyTxcalRecordToTable(\n          txPowerTableWords, 3 + slot * 2, record)",
         "rfPriApplyBzTxcalRecordToTable(txPowerTableWords,",
@@ -8561,6 +9704,20 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
         "Remaining unknown:",
     ]:
         assert vague_name not in efuse_init_body
+    for body, expected in [
+        (rf_pri_lo_fcal_body, "runRfPriLoFcal()"),
+        (rf_pri_lo_acal_body, "runRfPriLoAcal()"),
+        (rf_pri_txcal_body, "runRfPriTxcal()"),
+        (rf_pri_bz_txcal_body, "runRfPriBzTxcal()"),
+        (rf_pri_rxcal_body, "runRfPriRxcal()"),
+        (rf_pri_full_cal_body, "runRfPriFullCalRestoreBaseline()"),
+        (rf_pri_restore_cal_reg_body, "replayRfPriCalRegisters()"),
+    ]:
+        assert "Public ABI wrapper for librf_bl808.a:rf_pri.c.o" in body
+        assert expected in body
+        assert "discard" not in body
+        assert "regWrite(" not in body
+        assert "rfRegWrite(" not in body
     for expected in [
         "addr rfDfeInitRegs().dfeTrim824",
         "addr rf.calPathCtrl90",
@@ -8929,6 +10086,8 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
         "RfRoscalModeMask",
     ]:
         assert expected in run_roscal_body
+    assert "runRfPriRoscal()" in rf_pri_roscal_body
+    assert "addr rf.capability20" not in rf_pri_roscal_body
     for forbidden in ["RfCapabilityReg", "RfCalModeReg"]:
         assert forbidden not in run_roscal_body
     for body in [
@@ -9003,6 +10162,8 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
         "RfRccalFailMode",
     ]:
         assert expected in run_rccal_body
+    assert "runRfPriRccal()" in rf_pri_rccal_body
+    assert "addr rf.capability20" not in rf_pri_rccal_body
     for forbidden in ["RfCapabilityReg", "RfCalModeReg"]:
         assert forbidden not in run_rccal_body
     for expected in [
@@ -9379,8 +10540,8 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
 
 
 def test_wifi_rx_tx_dhcp_path_uses_typed_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
-    wifi_tx = (ROOT / "src/bl808/wifi_tx.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
+    wifi_tx = nim_source_with_includes(ROOT / "src/bl808/wifi/tx.nim")
     lwip_smoke = (ROOT / "examples/m0_wifi_lwip_smoke.nim").read_text()
     e2e_runner = (ROOT / "src/bl808/kernel/e2e_runner.nim").read_text()
     assert "stopAfterSuccess = false" in e2e_runner
@@ -9525,7 +10686,7 @@ def test_wifi_rx_tx_dhcp_path_uses_typed_overlays():
 
 
 def test_wifi_security_rx_indication_uses_typed_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc mm_sec_macrx_ind*", 1)[1].split(
         "proc mm_sec_machwkey_wr*", 1
@@ -9549,7 +10710,7 @@ def test_wifi_security_rx_indication_uses_typed_overlay():
 
 
 def test_wifi_machw_key_control_word_uses_reference_switch_tables():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc mm_sec_machwkey_wr*", 1)[1].split(
         "proc mm_sec_machwkey_del*", 1
@@ -9575,7 +10736,7 @@ def test_wifi_machw_key_control_word_uses_reference_switch_tables():
 
 
 def test_wifi_tcpip_input_converts_80211_mpdu_for_lwip():
-    wifi_utils = (ROOT / "src/bl808/wifi_utils.nim").read_text()
+    wifi_utils = nim_source_with_includes(ROOT / "src/bl808/wifi/utils.nim")
 
     body = wifi_utils.rsplit("proc tcpip_stack_input*", 1)[1].split(
         "proc bl_utils_dump*", 1
@@ -9701,7 +10862,7 @@ def test_wifi_tcpip_input_converts_80211_mpdu_for_lwip():
     ]:
         assert expected in smoke
 
-    fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    fw = wifi_fw_policy_source()
     manifest = (ROOT / "tools/hardware_validation.json").read_text()
     for expected in [
         'exportc: "nimfw_dbg_rxu_dup_trace_count"',
@@ -9795,7 +10956,7 @@ def test_wifi_tcpip_input_converts_80211_mpdu_for_lwip():
 
 
 def test_wifi_assoc_data_duplicate_filter_requires_retry_bit():
-    fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    fw = wifi_fw_policy_source()
     body = fw.split("proc rxu_cntrl_frame_handle*", 1)[1].split(
         "# .L171: EAPOL detection requires RFC1042 SNAP", 1
     )[0]
@@ -9810,7 +10971,7 @@ def test_wifi_assoc_data_duplicate_filter_requires_retry_bit():
 
 
 def test_wifi_igtk_install_uses_typed_machw_key_request():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc bl_wifi_set_igtk_internal*", 1)[1].split(
         "proc bl_wifi_get_sta_gtk*", 1
@@ -9869,7 +11030,7 @@ def test_wifi_igtk_install_uses_typed_machw_key_request():
 
 
 def test_wifi_set_key_tkip_mic_swap_uses_typed_key_data_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc setKey(", 1)[1].split(
         "proc bl_wifi_set_ap_key_internal*", 1
@@ -9910,7 +11071,7 @@ def test_wifi_set_key_tkip_mic_swap_uses_typed_key_data_overlay():
 
 
 def test_wifi_cfg_api_element_set_uses_typed_entry_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     general_body = wifi_fw.rsplit("proc cfg_api_element_general_set*", 1)[1].split(
         "proc cfg_api_element_set*", 1
@@ -9973,7 +11134,7 @@ def test_wifi_cfg_api_element_set_uses_typed_entry_overlay():
 
 
 def test_wifi_mfp_uses_typed_vif_key_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     ignore_body = wifi_fw.rsplit("proc mfp_ignore_mgmt_frame*", 1)[1].split(
         "proc mfp_protect_mgmt_frame*", 1
@@ -10056,7 +11217,7 @@ def test_wifi_mfp_uses_typed_vif_key_overlays():
 
 
 def test_wifi_tx_policy_writers_use_typed_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     update_body = wifi_fw.split("proc me_update_buffer_control*", 1)[1].split(
         "proc me_tx_cfm_singleton*", 1
@@ -10140,7 +11301,7 @@ def test_wifi_tx_policy_writers_use_typed_overlay():
 
 
 def test_wifi_tx_cfm_singleton_uses_typed_thd_flags():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
         "proc me_tx_cfm_singleton*(param: pointer) {.exportc, cdecl.} =",
@@ -10157,7 +11318,7 @@ def test_wifi_tx_cfm_singleton_uses_typed_thd_flags():
 
 
 def test_wifi_txu_cfm_uses_typed_thd_confirm_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit(
         "proc txu_cntrl_cfm*(param: pointer) {.exportc, cdecl.} =",
@@ -10187,7 +11348,7 @@ def test_wifi_txu_cfm_uses_typed_thd_confirm_overlay():
 
 
 def test_wifi_rate_control_counters_use_typed_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     calc_body = wifi_fw.rsplit("proc rc_calc_tp*", 1)[1].split(
         "proc rc_update_counters*", 1
@@ -10381,7 +11542,7 @@ def test_wifi_rate_control_counters_use_typed_overlays():
         assert forbidden not in sort_body
 
 def test_wifi_vif_lookup_helper_uses_typed_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc vif_mgmt_get_vif*", 1)[1].split(
         "proc vif_mgmt_get_first_ap_inf*", 1
@@ -10396,7 +11557,7 @@ def test_wifi_vif_lookup_helper_uses_typed_overlay():
 
 
 def test_wifi_vif_add_key_uses_typed_key_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc vif_mgmt_add_key*", 1)[1].split(
         "proc vif_mgmt_del_key*", 1
@@ -10473,7 +11634,7 @@ def test_wifi_vif_add_key_uses_typed_key_overlays():
 
 
 def test_wifi_vif_management_uses_typed_timer_and_bssid_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     init_body = wifi_fw.rsplit("proc vif_mgmt_init*", 1)[1].split(
         "proc vif_mgmt_register*", 1
@@ -10546,7 +11707,7 @@ def test_wifi_vif_management_uses_typed_timer_and_bssid_overlays():
 
 
 def test_wifi_vif_overlay_helpers_use_field_anchors():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     for expected in [
         "doAssert offsetof(VifChannelView, reserved344) == 344",
@@ -10569,7 +11730,7 @@ def test_wifi_vif_overlay_helpers_use_field_anchors():
 
 
 def test_wifi_sta_bandwidth_overlay_uses_field_anchor():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     for expected in [
         "doAssert offsetof(StaInfoView, reserved74) == 74",
@@ -10583,7 +11744,7 @@ def test_wifi_sta_bandwidth_overlay_uses_field_anchor():
 
 
 def test_wifi_mm_sta_delete_uses_vif_overlay_pointer():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc mm_sta_del*(staIdx: uint8)", 1)[1].split(
         "proc mm_check_rssi*", 1
@@ -10601,7 +11762,7 @@ def test_wifi_mm_sta_delete_uses_vif_overlay_pointer():
 
 
 def test_wifi_ps_check_frame_uses_typed_mac_header():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc ps_check_frame*", 1)[1].split(
         "proc ps_check_tx_frame*", 1
@@ -10625,7 +11786,7 @@ def test_wifi_ps_check_frame_uses_typed_mac_header():
 
 
 def test_wifi_txu_push_uses_typed_vif_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
         "proc txu_cntrl_push*(param: pointer) {.exportc, cdecl.} =",
@@ -10653,7 +11814,7 @@ def test_wifi_txu_push_uses_typed_vif_overlay():
 
 
 def test_wifi_null_frame_callbacks_use_pointer_addr_helper():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     beacon_body = wifi_fw.rsplit("proc mm_check_beacon*", 1)[1].split(
         "proc chan_bcn_detect_start*", 1
@@ -10678,7 +11839,7 @@ def test_wifi_null_frame_callbacks_use_pointer_addr_helper():
 
 
 def test_wifi_ps_set_mode_uses_typed_vif_confirmation_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     ps_body = wifi_fw.rsplit("proc ps_set_mode*", 1)[1].split(
         "proc ps_check_beacon*", 1
@@ -10701,7 +11862,7 @@ def test_wifi_ps_set_mode_uses_typed_vif_confirmation_overlays():
 
 
 def test_wifi_null_frame_and_postponed_service_use_typed_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     null_body = wifi_fw.split(
         "proc txl_frame_send_null_frame*(staIdx: uint8, cfmCallback: pointer, cfmArg: uint32): uint8 {.exportc, cdecl, discardable.} =",
@@ -10714,6 +11875,12 @@ def test_wifi_null_frame_and_postponed_service_use_typed_overlays():
         1,
     )[1].split(
         "proc txl_frame_send_selfcts_frame*", 1
+    )[0]
+    selfcts_body = wifi_fw.split(
+        "proc txl_frame_send_selfcts_frame*(vifInfo: pointer, duration: uint16, rateConfig: uint32, navValue: uint32) {.exportc, cdecl.} =",
+        1,
+    )[1].split(
+        "const WifiTxFrameSuccessfulBit", 1
     )[0]
     service_body = wifi_fw.split(
         "proc wifi_nimfw_service_sta_postponed*(limit: uint32): uint32 {.exportc, cdecl.} =",
@@ -10735,6 +11902,13 @@ def test_wifi_null_frame_and_postponed_service_use_typed_overlays():
     ]:
         assert expected in null_body
         assert expected in qosnull_body
+
+    for expected in [
+        "let aux = hostTxAuxWords(desc)",
+        "aux.rateConfig = rateConfig",
+        "aux.navValue = navValue",
+    ]:
+        assert expected in selfcts_body
 
     for expected in [
         "let vif = vifChannelForIdx(i)",
@@ -10763,7 +11937,7 @@ def test_wifi_null_frame_and_postponed_service_use_typed_overlays():
 
 
 def test_wifi_frame_active_scan_uses_typed_sta_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split("proc txl_frame_desc_active", 1)[1].split(
         "proc txl_frame_rebuild_free_list", 1
@@ -10780,7 +11954,7 @@ def test_wifi_frame_active_scan_uses_typed_sta_overlays():
 
 
 def test_wifi_tpc_update_vif_tx_power_uses_typed_sta_list_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc tpc_update_vif_tx_power*", 1)[1].split(
         "proc tpc_get_vif_tx_power_vs_rate*", 1
@@ -10796,7 +11970,7 @@ def test_wifi_tpc_update_vif_tx_power_uses_typed_sta_list_overlay():
 
 
 def test_wifi_ap_start_uses_vif_overlay_for_channel_and_security():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc apm_start_req_handler*", 1)[1].split(
         "proc apm_stop_req_handler*", 1
@@ -10857,7 +12031,7 @@ def test_wifi_ap_start_uses_vif_overlay_for_channel_and_security():
 
 
 def test_wifi_mm_state_handlers_use_vif_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     ps_options_body = wifi_fw.rsplit("proc mm_set_ps_options_req_handler*", 1)[1].split(
         "proc mm_set_vif_state_cfm_handler*", 1
@@ -10893,7 +12067,7 @@ def test_wifi_mm_state_handlers_use_vif_overlays():
 
 
 def test_wifi_tim_update_uses_vif_overlay_fields():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc mm_tim_update_proceed*", 1)[1].split(
         "proc mm_connection_loss_ind_handler*", 1
@@ -10922,7 +12096,7 @@ def test_wifi_tim_update_uses_vif_overlay_fields():
 
 
 def test_wifi_traffic_detection_timer_uses_vif_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc td_timer_end*", 1)[1].split(
         "proc phyif_utils_decode*", 1
@@ -10945,7 +12119,7 @@ def test_wifi_traffic_detection_timer_uses_vif_overlay():
 
 
 def test_wifi_txl_buffer_env_uses_typed_backup_queue_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     helpers_body = wifi_fw.split("template txlBufferEnvView()", 1)[1].split(
         "template hostTxMacHdrAddr", 1
@@ -10994,7 +12168,7 @@ def test_wifi_txl_buffer_env_uses_typed_backup_queue_overlay():
 
 
 def test_wifi_txl_payload_backup_uses_typed_link_rate_fields():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
         "proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =",
@@ -11010,23 +12184,51 @@ def test_wifi_txl_payload_backup_uses_typed_link_rate_fields():
     )[0]
 
     for expected in [
+        "ackPolicyControl*: uint32",
+        "retryLimitControl*: uint32",
+        "secondaryThdPtr*: uint32",
+        "txHwReserved32*: uint32",
+        "txHwReserved44*: uint32",
+        "txHwReserved48*: uint32",
+        "txHwReserved52*: uint32",
+        "doAssert offsetof(HostTxHwDescView, secondaryThdPtr) == 8",
+        "doAssert offsetof(HostTxHwDescView, txHwReserved12) == 12",
+        "doAssert offsetof(HostTxHwDescView, txHwReserved32) == 32",
+        "doAssert offsetof(HostTxHwDescView, retryLimitControl) == 36",
+        "doAssert offsetof(HostTxHwDescView, txHwReserved44) == 44",
+        "doAssert offsetof(HostTxHwDescView, txHwReserved48) == 48",
+        "doAssert offsetof(HostTxHwDescView, txHwReserved52) == 52",
+        "doAssert offsetof(HostTxHwDescView, ackPolicyControl) == 56",
+        "doAssert offsetof(TxBufferControlView, ackPolicyControl) == 52",
+        "doAssert offsetof(TxBufferControlView, retryLimitControl) == 56",
+        "doAssert offsetof(HostTxLinkDescView, ackPolicyControl) == 308",
+        "doAssert offsetof(HostTxLinkDescView, retryLimitControl) == 312",
+        "doAssert offsetof(HostTxInternalLinkNodeView, ackPolicyControl) == 308",
+        "doAssert offsetof(HostTxInternalLinkNodeView, retryLimitControl) == 312",
+        "doAssert offsetof(HostTxBufferedLinkView, ackPolicyControl) == 308",
+        "doAssert offsetof(HostTxBufferedLinkView, retryLimitControl) == 312",
+    ]:
+        assert expected in wifi_fw
+
+    for expected in [
         "let forceRate = hostTxRateTemplate(forceLink)",
         "forceRate.txPower = NimFwForcedMgmtTxPower.int32",
-        "forceRate.word40 = NimFwForcedMgmtTxPower",
-        "forceRate.word44 = NimFwForcedMgmtTxPower",
-        "forceRate.word48 = NimFwForcedMgmtTxPower",
+        "forceRate.retryTxPowerControl0 = NimFwForcedMgmtTxPower",
+        "forceRate.retryTxPowerControl1 = NimFwForcedMgmtTxPower",
+        "forceRate.retryTxPowerControl2 = NimFwForcedMgmtTxPower",
         "let vif = vifChannelForIdx(actual.vifIdx)",
         "let protFlags = vif.timFlags",
         "vif.timFlags = protFlags or 2",
         "vif.timFlags = protFlags and not 2'u8",
-        "thd.word56 = linkDesc.word308",
-        "thd.word36 = linkDesc.word312",
+        "thd.ackPolicyControl = linkDesc.ackPolicyControl",
+        "thd.retryLimitControl = linkDesc.retryLimitControl",
         "template hostTxThdAt(p: pointer): ptr HostTxThdEntryView",
         "hostTxThdAt(listFirst).next = thdLink",
-        "nimFwTrace2U32(\"[WIFI-NIMFW] pay_rate \",\n                         linkDesc.word308,\n                         linkDesc.word312)",
+        "nimFwTrace2U32(\"[WIFI-NIMFW] pay_rate \",\n                         linkDesc.ackPolicyControl,\n                         linkDesc.retryLimitControl)",
     ]:
         assert expected in wifi_fw if expected.startswith("template ") else expected in body
 
+    assert "let secThd = cast[pointer](hwDesc.secondaryThdPtr.uint)" in tx_trigger_body
     assert "let secStatus = cast[int32](hostTxHwDescAt(secThd).controlFlags)" in tx_trigger_body
 
     for forbidden in [
@@ -11034,14 +12236,27 @@ def test_wifi_txl_payload_backup_uses_typed_link_rate_fields():
         "template hostTxLinkWordAt(",
         "hostTxLinkWord(",
         "hostTxLinkWordAt(",
+        "thdWord36Patch",
+        "thdWord56Patch",
+        "word36Patch",
+        "word56Patch",
         "cast[ptr uint32](cast[uint](link) + byteOff)",
         "hostTxLinkWordAt(forceLink, 292'u)",
         "hostTxLinkWordAt(forceLink, 296'u)",
         "hostTxLinkWordAt(forceLink, 300'u)",
         "hostTxLinkWordAt(forceLink, 304'u)",
         "cast[ptr pointer](cast[uint](listFirst) + 4)",
+        "linkDesc.word308",
+        "linkDesc.word312",
+        "bufLink.word308",
+        "bufLink.word312",
+        "forceRate.word40",
+        "forceRate.word44",
+        "forceRate.word48",
     ]:
         assert forbidden not in wifi_fw
+
+    assert re.search(r"\b[a-zA-Z_]\w*Word\d+Patch\*\s*:", wifi_fw) is None
 
     assert "cast[ptr int32](cast[uint](secThd) + 60)" not in tx_trigger_body
 
@@ -11054,7 +12269,7 @@ def test_wifi_txl_payload_backup_uses_typed_link_rate_fields():
 
 
 def test_wifi_txl_env_dump_uses_typed_descriptor_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     dump_body = wifi_fw.split(
         "proc txl_cntrl_env_dump*() {.exportc, cdecl, noinline.} =",
@@ -11099,8 +12314,8 @@ def test_wifi_txl_env_dump_uses_typed_descriptor_overlays():
         "curDesc = desc.link.next",
         "let descW4 = desc.descWord4",
         "let thdDataLen = hw.frameLen",
-        "let thdW56 = hw.word56",
-        "let thdW60 = hw.controlFlags",
+        "let ackPolicyControl = hw.ackPolicyControl",
+        "let thdControlFlags = hw.controlFlags",
         "let rateThdPtr = hw.chainedThd",
         "let rate = txDumpRateDescAt(rateThdPtr)",
         "for polVal in rate.policy0:",
@@ -11140,7 +12355,7 @@ def test_wifi_txl_env_dump_uses_typed_descriptor_overlays():
 
 
 def test_wifi_disconnect_deauth_uses_typed_frame_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc sm_disconnect*(param: pointer)", 1)[1].split(
         "proc sm_delete_resources*", 1
@@ -11177,7 +12392,7 @@ def test_wifi_disconnect_deauth_uses_typed_frame_overlays():
 
 
 def test_wifi_sm_delete_resources_does_not_emit_host_indications():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc sm_delete_resources*", 1)[1].split(
         "proc sm_auth_assoc_send_according_chan*", 1
@@ -11201,7 +12416,7 @@ def test_wifi_sm_delete_resources_does_not_emit_host_indications():
 
 
 def test_wifi_sm_deauth_send_uses_typed_frame_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc sm_deauth_send*", 1)[1].split(
         "proc sm_auth_send*", 1
@@ -11240,7 +12455,7 @@ def test_wifi_sm_deauth_send_uses_typed_frame_overlays():
 
 
 def test_wifi_sm_handle_connection_uses_typed_frame_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc sm_handle_connection*", 1)[1].split(
         "proc sm_disconnect_process*", 1
@@ -11293,7 +12508,7 @@ def test_wifi_sm_handle_connection_uses_typed_frame_overlays():
 
 
 def test_wifi_supplicant_deauth_uses_typed_frame_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc sm_handle_supplicant_result*", 1)[1].split(
         "proc sm_send_sa_query*", 1
@@ -11354,7 +12569,7 @@ def test_wifi_supplicant_deauth_uses_typed_frame_overlays():
 
 
 def test_wifi_auth_assoc_tx_builders_use_typed_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     auth_body = wifi_fw.rsplit(
         "proc sm_auth_send*(authSeqNum: uint16, statusCode: uint32) {.exportc, cdecl.} =",
@@ -11458,7 +12673,7 @@ def test_wifi_auth_assoc_tx_builders_use_typed_overlays():
 
 
 def test_wifi_connect_ind_uses_typed_payload_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     connect_body = wifi_fw.rsplit("proc sm_connect_ind*", 1)[1].split(
         "proc sm_connect_abort_process*", 1
@@ -11563,7 +12778,7 @@ def test_wifi_connect_ind_uses_typed_payload_overlay():
 
 
 def test_wifi_sta_add_ind_uses_typed_vif_security_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc sm_connection_sta_add_ind*", 1)[1].split(
         "proc sm_connect_auth_assoc_req", 1
@@ -11588,7 +12803,7 @@ def test_wifi_sta_add_ind_uses_typed_vif_security_overlays():
 
 
 def test_wifi_sm_deauth_handler_uses_vif_bssid_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc sm_deauth_handler*", 1)[1].split(
         "proc sm_get_set_machwkey_index*", 1
@@ -11612,7 +12827,7 @@ def test_wifi_sm_deauth_handler_uses_vif_bssid_overlay():
 
 
 def test_wifi_machw_key_index_uses_typed_vif_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc sm_get_set_machwkey_index*", 1)[1].split(
         "proc sm_handle_eapol_input*", 1
@@ -11652,7 +12867,7 @@ def test_wifi_machw_key_index_uses_typed_vif_overlay():
 
 
 def test_wifi_rxu_protected_key_uses_typed_key_table_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc rxuProtectedKey", 1)[1].split(
         "proc rxu_cntrl_protected_handle*", 1
@@ -11661,7 +12876,7 @@ def test_wifi_rxu_protected_key_uses_typed_key_table_overlay():
     for expected in [
         "VifRxProtectedKeyTableOverlay {.packed.} = object",
         "slots*: UncheckedArray[VifKeySlotView]",
-        "doAssert offsetof(VifRxProtectedKeyTableOverlay, slots) == 520",
+        "doAssert offsetof(VifRxProtectedKeyTableOverlay, slots) == 528",
         "template vifRxProtectedKeySlot(vif: ptr VifChannelView, slot: uint): ptr VifKeySlotView",
     ]:
         assert expected in wifi_fw
@@ -11684,7 +12899,7 @@ def test_wifi_rxu_protected_key_uses_typed_key_table_overlay():
 
 
 def test_wifi_sta_mgmt_init_uses_typed_sta_and_vif_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc sta_mgmt_init*", 1)[1].split(
         "proc sta_mgmt_register*", 1
@@ -11730,7 +12945,7 @@ def test_wifi_sta_mgmt_init_uses_typed_sta_and_vif_overlays():
 
 
 def test_wifi_assoc_bssid_accessor_uses_vif_bssid_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc bl_wifi_get_assoc_bssid_internal*", 1)[1].split(
         "proc bl_wifi_get_hostap_private_internal*", 1
@@ -11748,7 +12963,7 @@ def test_wifi_assoc_bssid_accessor_uses_vif_bssid_overlay():
 
 
 def test_wifi_scan_confirm_join_uses_vif_mac_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc scanu_start_cfm_handler*", 1)[1].split(
         "proc scanu_join_req_handler*", 1
@@ -11767,7 +12982,7 @@ def test_wifi_scan_confirm_join_uses_vif_mac_overlay():
 
 
 def test_wifi_scan_join_uses_vif_ht_key_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     req_body = wifi_fw.rsplit("proc scanu_join_req_handler*", 1)[1].split(
         "proc scanu_join_cfm_handler*", 1
@@ -11802,7 +13017,7 @@ def test_wifi_scan_join_uses_vif_ht_key_overlays():
 
 
 def test_wifi_mm_sta_add_confirm_uses_vif_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc mm_sta_add_cfm_handler*", 1)[1].split(
         "proc mm_sta_del_req_handler*", 1
@@ -11831,7 +13046,7 @@ def test_wifi_mm_sta_add_confirm_uses_vif_overlays():
 
 
 def test_wifi_me_sta_add_request_uses_vif_ht_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc me_sta_add_req_handler*", 1)[1].split(
         "proc me_sta_del_req_handler*", 1
@@ -11857,7 +13072,7 @@ def test_wifi_me_sta_add_request_uses_vif_ht_overlay():
 
 
 def test_wifi_rxu_pn_check_uses_typed_replay_counters():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc rxu_cntrl_check_pn*", 1)[1].split(
         "proc rxu_cntrl_desc_prepare*", 1
@@ -11908,7 +13123,7 @@ def test_wifi_rxu_pn_check_uses_typed_replay_counters():
 
 
 def test_wifi_rx_michael_mic_read_uses_typed_word_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc rxu_cntrl_frame_handle*", 1)[1].split(
         "proc rxu_swdesc_upload_evt*", 1
@@ -11939,7 +13154,7 @@ def test_wifi_rx_michael_mic_read_uses_typed_word_overlay():
 
 
 def test_wifi_tx_sequence_assignment_uses_typed_sta_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc txu_cntrl_push*", 1)[1].split(
         "proc txu_cntrl_tkip_mic_append*", 1
@@ -11970,7 +13185,7 @@ def test_wifi_tx_sequence_assignment_uses_typed_sta_overlay():
 
 
 def test_wifi_tx_trigger_dma_status_write_uses_typed_thd_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc txl_cntrl_tx_check*", 1)[1].split(
         "proc txl_reset*", 1
@@ -11979,18 +13194,19 @@ def test_wifi_tx_trigger_dma_status_write_uses_typed_thd_overlay():
     for expected in [
         "HostTxHwDescView {.packed.} = object",
         "status*: uint32",
+        "secondaryThdPtr*: uint32",
         "doAssert offsetof(HostTxHwDescView, status) == 16",
         "template hostTxHwDescAt(p: pointer): ptr HostTxHwDescView",
     ]:
         assert expected in wifi_fw
 
-    assert "let dmaHead = hwDesc.word0.uint" in body
+    assert "let dmaHead = hwDesc.txConfirmDescPtr.uint" in body
     assert "hostTxHwDescAt(cast[pointer](dmaHead)).status = thdStatus.uint32" in body
     assert "cast[ptr uint32](dmaHead + 16)[]" not in body
 
 
 def test_wifi_rxu_mgt_ie_start_uses_typed_tail_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     helper_body = wifi_fw.rsplit("proc rxuMgtIndIeStart", 1)[1].split(
         "proc rxuMgtIndSsidLogPtr", 1
@@ -12010,7 +13226,7 @@ def test_wifi_rxu_mgt_ie_start_uses_typed_tail_overlay():
 
 
 def test_wifi_beacon_ie_body_uses_typed_tail_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     helper_body = wifi_fw.rsplit("template beaconFrameIeBody", 1)[1].split(
         "template htMcsNssPrefixView", 1
@@ -12039,7 +13255,7 @@ def test_wifi_beacon_ie_body_uses_typed_tail_overlay():
 
 
 def test_wifi_scanu_directed_result_uses_vif_ht_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc scanu_frame_handler*", 1)[1].split(
         "proc bl_hw_rxhdr_get_status*", 1
@@ -12065,7 +13281,7 @@ def test_wifi_scanu_directed_result_uses_vif_ht_overlay():
 
 
 def test_wifi_sa_query_tx_uses_typed_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     tx_body = wifi_fw.rsplit("proc sm_send_sa_query*", 1)[1].split(
         "proc sm_sa_query_handler*", 1
@@ -12132,7 +13348,7 @@ def test_wifi_sa_query_tx_uses_typed_overlays():
 
 
 def test_wifi_sa_query_timeout_uses_sta_vif_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc sm_sa_query_timeout_ind_handler*", 1)[1].split(
         "proc sm_disconnect*", 1
@@ -12157,7 +13373,7 @@ def test_wifi_sa_query_timeout_uses_sta_vif_overlays():
 
 
 def test_wifi_ap_sta_fw_delete_uses_sta_mac_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc apm_sta_fw_delete*", 1)[1].split(
         "proc apm_probe_req_handler*", 1
@@ -12175,7 +13391,7 @@ def test_wifi_ap_sta_fw_delete_uses_sta_mac_overlay():
 
 
 def test_wifi_auth_assoc_scheduler_uses_vif_overlay_pointer():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc sm_auth_assoc_send_according_chan*", 1)[1].split(
         "proc sm_supplicant_deauth_cfm*", 1
@@ -12197,7 +13413,7 @@ def test_wifi_auth_assoc_scheduler_uses_vif_overlay_pointer():
 
 
 def test_wifi_tbtt_switch_update_extracts_from_primary_tbtt_list():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc chan_tbtt_switch_update*", 1)[1].split(
         "proc chan_update_tx_power*", 1
@@ -12208,7 +13424,7 @@ def test_wifi_tbtt_switch_update_extracts_from_primary_tbtt_list():
 
 
 def test_wifi_chan_ctxt_unlink_removes_tbtt_without_reinserting_vif_node():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc chan_ctxt_unlink*", 1)[1].split(
         "proc chan_ctxt_update*", 1
@@ -12221,7 +13437,7 @@ def test_wifi_chan_ctxt_unlink_removes_tbtt_without_reinserting_vif_node():
 
 
 def test_wifi_apm_send_mlme_uses_typed_frame_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc apm_send_mlme*", 1)[1].split(
         "proc aidListDelete", 1
@@ -12261,7 +13477,7 @@ def test_wifi_apm_send_mlme_uses_typed_frame_overlays():
 
 
 def test_wifi_ap_auth_disassoc_handlers_use_typed_vif_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     auth_body = wifi_fw.rsplit("proc apm_auth_handler*", 1)[1].split(
         "{.emit: \"__attribute__((optimize(\\\"crossjumping\\\"))) void apm_assoc_req_handler",
@@ -12298,7 +13514,7 @@ def test_wifi_ap_auth_disassoc_handlers_use_typed_vif_overlays():
 
 
 def test_wifi_ap_assoc_handler_uses_typed_vif_ap_config_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc apm_assoc_req_handler*", 1)[1].split(
         "proc apm_deauth_handler*", 1
@@ -12347,7 +13563,7 @@ def test_wifi_ap_assoc_handler_uses_typed_vif_ap_config_overlay():
 
 
 def test_wifi_ap_probe_req_handler_uses_typed_ie_and_channel_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc apm_probe_req_handler*", 1)[1].split(
         "proc apm_auth_handler*", 1
@@ -12407,7 +13623,7 @@ def test_wifi_ap_probe_req_handler_uses_typed_ie_and_channel_overlays():
 
 
 def test_wifi_ap_eapol_dispatch_uses_typed_hostapd_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc apm_handle_eapol_input*", 1)[1].split(
         "proc apm_handle_auth_done*", 1
@@ -12450,7 +13666,7 @@ def test_wifi_ap_eapol_dispatch_uses_typed_hostapd_overlays():
 
 
 def test_wifi_bam_air_action_uses_typed_frame_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc bam_send_air_action_frame*", 1)[1].split(
         "proc tdEntryForVif", 1
@@ -12510,7 +13726,7 @@ def test_wifi_bam_air_action_uses_typed_frame_overlays():
 
 
 def test_wifi_block_ack_action_builders_use_typed_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     req_body = wifi_fw.rsplit("proc me_build_add_ba_req*", 1)[1].split(
         "proc me_build_add_ba_rsp*", 1
@@ -12599,7 +13815,7 @@ def test_wifi_block_ack_action_builders_use_typed_overlays():
 
 
 def test_wifi_ipc_host_tx_queue_uses_typed_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     for expected in [
         "hostTxList*: ptr CoList",
@@ -12664,7 +13880,7 @@ def test_wifi_ipc_host_tx_queue_uses_typed_overlays():
 
 
 def test_wifi_ipc_tx_ac_reset_uses_typed_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     helper_body = wifi_fw.split("template ipcTxAcDescAt", 1)[1].split(
         "template hostTxLinkMacHdrAddr", 1
@@ -12717,7 +13933,7 @@ def test_wifi_ipc_tx_ac_reset_uses_typed_overlay():
 
 
 def test_wifi_scan_ssid_selection_has_typed_cache_fallback():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     helper_body = wifi_fw.split("proc scanuCachedSsidFor", 1)[1].split(
         '{.emit: "__attribute__((optimize(\\"crossjumping\\"))) void scanu_frame_handler',
@@ -12757,7 +13973,7 @@ def test_wifi_scan_ssid_selection_has_typed_cache_fallback():
 
 
 def test_wifi_tx_control_init_uses_ipc_descriptor_word_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     helper_body = wifi_fw.split("template ipcTxHwDescWordTable", 1)[1].split(
         "template hostTxLinkMacHdrAddr", 1
@@ -12790,7 +14006,7 @@ def test_wifi_tx_control_init_uses_ipc_descriptor_word_overlay():
 
 
 def test_wifi_pspoll_tx_uses_typed_frame_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc ps_send_pspoll*", 1)[1].split(
         "proc mac_recovery*", 1
@@ -12842,7 +14058,7 @@ def test_wifi_pspoll_tx_uses_typed_frame_overlays():
 
 
 def test_wifi_wpa_wps_callbacks_use_typed_overlays():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     for expected in [
         "WpsCallbacksView {.packed.} = object",
@@ -12898,7 +14114,7 @@ def test_wifi_wpa_wps_callbacks_use_typed_overlays():
 
 
 def test_wifi_wpa_beacon_register_param_uses_typed_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc apm_start_req_handler*", 1)[1].split(
         "proc apm_stop_req_handler*", 1
@@ -12950,7 +14166,7 @@ def test_wifi_wpa_beacon_register_param_uses_typed_overlay():
 
 
 def test_wifi_wpa_key_write_param_uses_typed_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc mm_sta_add*", 1)[1].split(
         "proc mm_sta_del*", 1
@@ -12998,7 +14214,7 @@ def test_wifi_wpa_key_write_param_uses_typed_overlay():
 
 
 def test_wifi_wep_key_write_param_uses_typed_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc mm_sta_add*", 1)[1].split(
         "proc mm_sta_del*", 1
@@ -13052,11 +14268,11 @@ def test_wifi_wep_key_write_param_uses_typed_overlay():
 
 
 def test_ble_wifi_firmware_have_no_vendor_when_branches():
-    for relative in [
-        "src/bl808/blecontroller.nim",
-        "src/bl808/wifi_fw.nim",
+    for source in [
+        *blecontroller_policy_paths(),
+        *wifi_fw_policy_paths(),
     ]:
-        source = ROOT / relative
+        relative = source.relative_to(ROOT)
         for line_number, line in enumerate(source.read_text().splitlines(), 1):
             stripped = line.strip()
             if stripped.startswith("when ") and (
@@ -13069,19 +14285,18 @@ def test_ble_wifi_firmware_have_no_vendor_when_branches():
 
 
 def test_pure_nim_wifi_firmware_has_no_backend_selection_guards():
-    for relative in [
-        "src/bl808/blecontroller.nim",
-        "src/bl808/wifi_fw.nim",
-        "examples/m0_ble_wifi_hal_test.nim",
+    for source in [
+        *blecontroller_policy_paths(),
+        *wifi_fw_policy_paths(),
+        ROOT / "examples/m0_ble_wifi_hal_test.nim",
     ]:
-        source = ROOT / relative
         text = source.read_text()
         assert "when defined(bl808WifiNimFw)" not in text
         assert "when not defined(bl808WifiNimFw)" not in text
 
 
 def test_wifi_firmware_task_state_transitions_use_named_constants():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
     code_lines = [
         line.strip()
         for line in wifi_fw.splitlines()
@@ -13132,7 +14347,7 @@ def test_wifi_firmware_task_state_transitions_use_named_constants():
 
 
 def test_wifi_hsu_michael_exports_are_real_pure_nim_wrappers():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     block_body = wifi_fw.split("proc michael_block*", 1)[1].split(
         "proc me_mic_init*", 1
@@ -13207,7 +14422,7 @@ def test_wifi_hsu_michael_exports_are_real_pure_nim_wrappers():
 
 
 def test_wifi_tkip_group_mic_path_is_explicit_reference_return():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
     body = wifi_fw.rsplit("proc txu_cntrl_tkip_mic_append*", 1)[1].split(
         "proc txu_cntrl_protect_mgmt_frame*", 1
     )[0]
@@ -13245,7 +14460,7 @@ def test_wifi_tkip_group_mic_path_is_explicit_reference_return():
 
 
 def test_wifi_mgmt_protection_uses_typed_frame_control_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
     body = wifi_fw.rsplit("proc txu_cntrl_protect_mgmt_frame*", 1)[1].split(
         "# ###########################################################################\n#                   RX LAYER",
         1,
@@ -13274,7 +14489,7 @@ def test_wifi_mgmt_protection_uses_typed_frame_control_overlay():
 
 
 def test_wifi_rx_mgt_copy_uses_typed_cursor_and_word_overlay():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
     body = wifi_fw.rsplit("proc rxu_mgt_frame_check*", 1)[1].split(
         "# ###########################################################################\n#                  SCAN TASK",
         1,
@@ -13307,7 +14522,7 @@ def test_wifi_rx_mgt_copy_uses_typed_cursor_and_word_overlay():
 
 
 def test_wifi_mm_rx_upload_flags_are_named_by_effect():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
     hw_info_body = wifi_fw.rsplit("proc mm_hw_info_set*", 1)[1].split(
         "proc mm_hw_ap_info_set*", 1
     )[0]
@@ -13343,7 +14558,7 @@ def test_wifi_mm_rx_upload_flags_are_named_by_effect():
 
 
 def test_wifi_set_active_confirm_handlers_use_state_predicates():
-    wifi_fw = (ROOT / "src/bl808/wifi_fw.nim").read_text()
+    wifi_fw = wifi_fw_policy_source()
 
     assert "proc smSetActiveCfmStateAllowed(): bool {.inline.}" in wifi_fw
     assert "proc apmSetActiveCfmStateAllowed(): bool {.inline.}" in wifi_fw

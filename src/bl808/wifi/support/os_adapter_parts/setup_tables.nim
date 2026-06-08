@@ -1,0 +1,77 @@
+## Populate the SDK OS adapter and WiFi HOSAL callback tables.
+
+proc setupBlOps() =
+  let base = cast[pointer](addr g_bl_ops_funcs)
+  storeU32(base, OpVersionOff, BlOsAdapterVersion)
+  storePtr(base, OpPrintfOff, cast[pointer](osPrintf))
+  storePtr(base, OpPutsOff, cast[pointer](osPuts))
+  storePtr(base, OpAssertOff, cast[pointer](osAssert))
+  storePtr(base, OpInitOff, nil)
+  storePtr(base, OpEnterCriticalOff, cast[pointer](osEnterCritical))
+  storePtr(base, OpExitCriticalOff, cast[pointer](osExitCritical))
+  storePtr(base, OpMsleepOff, cast[pointer](osMsleep))
+  storePtr(base, OpSleepOff, cast[pointer](osSleep))
+  storePtr(base, OpEventGroupCreateOff, cast[pointer](osEventGroupCreate))
+  storePtr(base, OpEventGroupDeleteOff, cast[pointer](osEventGroupDelete))
+  storePtr(base, OpEventGroupSendOff, cast[pointer](osEventGroupSend))
+  storePtr(base, OpEventGroupWaitOff, cast[pointer](osEventGroupWait))
+  storePtr(base, OpEventRegisterOff, cast[pointer](osEventRegister))
+  storePtr(base, OpEventNotifyOff, cast[pointer](osEventNotify))
+  storePtr(base, OpTaskCreateOff, cast[pointer](osTaskCreate))
+  storePtr(base, OpTaskDeleteOff, cast[pointer](osTaskDelete))
+  storePtr(base, OpTaskGetCurrentOff, cast[pointer](osTaskGetCurrent))
+  storePtr(base, OpTaskNotifyCreateOff, cast[pointer](osTaskNotifyCreate))
+  storePtr(base, OpTaskNotifyOff, cast[pointer](osTaskNotify))
+  storePtr(base, OpTaskWaitOff, cast[pointer](osTaskWait))
+  storePtr(base, OpLockGaintOff, cast[pointer](osNoopVoid))
+  storePtr(base, OpUnlockGaintOff, cast[pointer](osNoopVoid))
+  storePtr(base, OpIrqAttachOff, cast[pointer](osIrqAttach))
+  storePtr(base, OpIrqEnableOff, cast[pointer](osIrqEnable))
+  storePtr(base, OpIrqDisableOff, cast[pointer](osIrqDisable))
+  storePtr(base, OpWorkqueueCreateOff, cast[pointer](osWorkqueueCreate))
+  storePtr(base, OpWorkqueueSubmitHpOff, cast[pointer](osWorkqueueSubmit))
+  storePtr(base, OpWorkqueueSubmitLpOff, cast[pointer](osWorkqueueSubmit))
+  storePtr(base, OpTimerCreateOff, cast[pointer](osTimerCreate))
+  storePtr(base, OpTimerDeleteOff, cast[pointer](osTimerDelete))
+  storePtr(base, OpTimerStartOnceOff, cast[pointer](osTimerStart))
+  storePtr(base, OpTimerStartPeriodicOff, cast[pointer](osTimerStart))
+  storePtr(base, OpSemCreateOff, cast[pointer](osSemCreate))
+  storePtr(base, OpSemDeleteOff, cast[pointer](osSemDelete))
+  storePtr(base, OpSemTakeOff, cast[pointer](osSemTake))
+  storePtr(base, OpSemGiveOff, cast[pointer](osSemGive))
+  storePtr(base, OpMutexCreateOff, cast[pointer](osMutexCreate))
+  storePtr(base, OpMutexDeleteOff, cast[pointer](osMutexDelete))
+  storePtr(base, OpMutexLockOff, cast[pointer](osMutexLock))
+  storePtr(base, OpMutexUnlockOff, cast[pointer](osMutexUnlock))
+  storePtr(base, OpQueueCreateOff, cast[pointer](osQueueCreate))
+  storePtr(base, OpQueueDeleteOff, cast[pointer](osQueueDelete))
+  storePtr(base, OpQueueSendWaitOff, cast[pointer](osQueueSendWait))
+  storePtr(base, OpQueueSendOff, cast[pointer](osQueueSend))
+  storePtr(base, OpQueueRecvOff, cast[pointer](osQueueRecv))
+  storePtr(base, OpMallocOff, cast[pointer](osMalloc))
+  storePtr(base, OpFreeOff, cast[pointer](osFree))
+  storePtr(base, OpZallocOff, cast[pointer](osZalloc))
+  storePtr(base, OpGetTimeMsOff, cast[pointer](osGetTimeMs))
+  storePtr(base, OpGetTickOff, cast[pointer](osGetTick))
+  storePtr(base, OpLogWriteOff, cast[pointer](osLogWrite))
+  storePtr(base, OpTaskNotifyIsrOff, cast[pointer](osTaskNotifyIsr))
+  storePtr(base, OpYieldFromIsrOff, cast[pointer](osYieldFromIsr))
+  storePtr(base, OpMsToTickOff, cast[pointer](osMsToTick))
+  storePtr(base, OpSetTimeoutOff, cast[pointer](osSetTimeout))
+  storePtr(base, OpCheckTimeoutOff, cast[pointer](osCheckTimeout))
+
+proc hosalRetZero(arg: pointer): cint {.cdecl.} = discard arg; 0
+proc hosalAdcDeviceGet(): pointer {.cdecl.} = nil
+proc setupHosal() =
+  g_wifi_hosal_funcs.efuseReadMac = bl_wifi_mac_addr_get
+  g_wifi_hosal_funcs.rfTurnOn = hosalRetZero
+  g_wifi_hosal_funcs.rfTurnOff = hosalRetZero
+  g_wifi_hosal_funcs.adcDeviceGet = hosalAdcDeviceGet
+  g_wifi_hosal_funcs.adcTsenValueGet = hosalRetZero
+  g_wifi_hosal_funcs.pmInit = bl_pm_init
+  g_wifi_hosal_funcs.pmEventRegister = bl_pm_event_register
+  g_wifi_hosal_funcs.pmDeinit = bl_pm_deinit
+  g_wifi_hosal_funcs.pmStateRun = bl_pm_state_run
+  g_wifi_hosal_funcs.pmCapacitySet = bl_pm_capacity_set
+  g_wifi_hosal_funcs.pmPostEvent = pm_post_event
+  g_wifi_hosal_funcs.pmEventSwitch = bl_pm_event_switch

@@ -15,16 +15,44 @@ WIFI_RF_SYMBOLS = [
     "wl_init",
     "wl_cfg_get",
     "wl_rf_cfg_init",
+    "wl_wlan_power_table_update",
+    "wl_rf_tcal_handler",
+    "wl_rf_tcal_period_get",
+    "wl_bz_rx_optimize",
+    "wl_bz_rx_optimize_restore",
+    "wl_rf_set_bz_target_power_table",
+    "wl_rf_set_channel_pwr_comp",
+    "wl_wlan_bb_reset",
+    "wl_wlan_bb_pre_proc",
+    "wl_wlan_bb_post_proc",
+    "wl_wlan_rssi_get",
+    "wl_wlan_ppm_get",
+    "wl_wlan_power_cfg_get",
+    "wl_154_power_cfg_get",
+    "wl_bt_power_cfg_get",
+    "wl_ble_power_cfg_get",
     "wl_rmem_size_get",
     "wl_env_get",
+    "wl_lp_init",
+    "wl_lp_status_clear",
+    "wl_lp_status_update",
     "rf_init",
     "rfc_init",
     "rfc_config_bandwidth",
     "rfc_config_channel",
+    "rf_set_channel",
+    "rfc_wlan_mode_force",
+    "rfc_dump",
     "modem_init_core",
     "modem_init",
     "modem_restore",
     "rf_dump_status",
+    "rf_lo_isr",
+    "rf_clkpll_isr",
+    "crm_get_cpu_freq",
+    "phy_assert_err",
+    "phy_assert_rec",
+    "phy_assert_warn",
     "phy_init",
     "phy_get_mac_freq",
     "phy_get_version",
@@ -67,17 +95,88 @@ WIFI_RF_SYMBOLS = [
     "trpc_init",
     "trpc_get_default_power_idx",
     "trpc_get_power_idx",
+    "bba_get_pd_cfg",
+    "bba_get_pd_gain",
+    "bba_get_pd_mile",
+    "bba_get_pd_state",
+    "bba_pd_reset",
+    "bba_ce_reset",
+    "bba_ce_update_capcode",
+    "bba_ce_loop",
+    "bba_pd_loop",
+    "bba_set_pd_dsss",
+    "bba_set_pd_gain",
+    "bba_set_pd_mile",
+    "bba_set_pd_ofdm",
+    "bba_set_pd_rssi",
+    "bba_set_pd_state",
     "rf_pri_init",
     "rf_pri_input_xtalfreq",
+    "rf_pri_get_xtalfreq",
+    "rf_pri_xtalfreq",
+    "rf_pri_init_calib_mem",
     "rf_pri_config_mode",
+    "rf_pri_cfg_init",
     "rf_pri_input_device_info",
+    "rf_pri_input_chip_ver",
+    "rf_pri_get_wl_cfg",
+    "rf_pri_get_txgain_max",
+    "rf_pri_get_txgain_min",
+    "rf_pri_roscal",
+    "rf_pri_rccal",
+    "rf_pri_manual_incremental_cal_start",
+    "rf_pri_manual_incremental_cal_stop",
+    "rf_pri_set_rcal_code",
+    "rf_pri_save_state_before_cal",
+    "rf_pri_restore_state_after_cal",
+    "rf_pri_cw_start",
+    "rf_pri_cw_stop",
+    "rf_pri_lo_fcal",
+    "rf_pri_lo_acal",
+    "rf_pri_txcal",
+    "rf_pri_bz_txcal",
+    "rf_pri_rxcal",
+    "rf_pri_full_cal",
+    "rf_pri_restore_cal_reg",
     "rf_pri_update_param",
+    "rf_pri_read",
     "rf_pri_get_notch_param",
     "rf_pri_optimize",
+    "rf_pri_bz_optimize",
+    "rf_pri_bz_optimize_restore",
+    "rf_pri_input_channel_pwr_comp",
+    "rf_pri_input_channel_lp_pwr_comp",
+    "rf_pri_set_channel_lp_pwr_comp",
+    "rf_pri_input_temp_comp_param",
+    "rf_pri_set_temp_comp",
+    "rf_pri_input_bz_channel_pwr_comp",
+    "rf_pri_set_bz_channel_pwr_comp",
+    "rf_pri_set_bz_temp_comp",
+    "rf_pri_get_bz_temp_mp_comp",
+    "rf_pri_input_bz_target_power",
     "rf_pri_set_channel_pwr_comp",
+    "rf_pri_set_channel_total_pwr_comp",
     "rf_pri_set_bandwidth",
     "rf_pri_get_vco_freq_cw",
     "rf_pri_get_vco_idac_cw",
+    "rfc_config_power",
+    "rfc_get_power_level",
+    "rfc_power_meas",
+    "rfc_apply_tx_dvga_offset",
+    "rfc_apply_tx_dvga",
+    "rfc_apply_tx_power_offset",
+    "rfc_sg_start",
+    "rfc_sg_stop",
+    "rfc_rf_fsm_force",
+    "rfc_rc_fsm_force",
+]
+
+PRIMARY_WIFI_RF_PHY_ENTRYPOINTS = [
+    "wl_init",
+    "rf_init",
+    "rfc_init",
+    "modem_init_core",
+    "phy_init",
 ]
 
 FORBIDDEN_RF_ARCHIVE_MARKERS = [
@@ -157,6 +256,15 @@ def check_defined(path: Path, symbols: list[str], label: str) -> list[str]:
         print(f"{label}: missing defined text symbols: {', '.join(missing)}")
     else:
         print(f"{label}: defines {', '.join(symbols)}")
+    return missing
+
+
+def check_primary_wifi_entrypoints(path: Path, label: str) -> list[str]:
+    missing = check_defined(
+        path,
+        PRIMARY_WIFI_RF_PHY_ENTRYPOINTS,
+        f"{label} primary WiFi RF/PHY entrypoints",
+    )
     return missing
 
 
@@ -340,6 +448,14 @@ def check_hw_validation_nimcache_objects(
             continue
         missing = check_defined(obj, symbols, f"{elf} {label}-nimcache-object")
         failures.extend(f"{obj}:missing:{symbol}" for symbol in missing)
+        if label == "wifi":
+            primary_missing = check_primary_wifi_entrypoints(
+                obj, f"{elf} wifi-nimcache-object"
+            )
+            failures.extend(
+                f"{obj}:missing-primary:{symbol}"
+                for symbol in primary_missing
+            )
         if label == "wifi" and check_wifi_phy_memory:
             failures.extend(check_wifi_object_phy_memory_init(obj))
     return failures
@@ -460,6 +576,13 @@ def main() -> int:
         require_existing(args.wifi_object, "WiFi object")
         missing = check_defined(args.wifi_object, WIFI_RF_SYMBOLS, "wifi-object")
         failures.extend(f"wifi-object:{symbol}" for symbol in missing)
+        primary_missing = check_primary_wifi_entrypoints(
+            args.wifi_object, "wifi-object"
+        )
+        failures.extend(
+            f"wifi-object:missing-primary:{symbol}"
+            for symbol in primary_missing
+        )
         if args.check_wifi_phy_memory_init:
             failures.extend(check_wifi_object_phy_memory_init(args.wifi_object))
 

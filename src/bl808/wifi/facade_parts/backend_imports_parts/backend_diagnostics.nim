@@ -1,0 +1,25 @@
+proc bl808_wifi_backend_scan_count*(): uint32
+  {.importc: "bl808_wifi_backend_scan_count", cdecl.}
+proc bl808_wifi_backend_scan_done_count*(): uint32
+  {.importc: "bl808_wifi_backend_scan_done_count", cdecl.}
+proc bl808_wifi_backend_scan_diag_count*(): uint32
+  {.importc: "bl808_wifi_backend_scan_diag_count", cdecl.}
+proc bl808_wifi_backend_scan_diag_get*(index: uint32,
+                                       ssidLen: ptr uint8,
+                                       ssid: ptr uint8,
+                                       channel: ptr uint8,
+                                       rssi: ptr int8,
+                                       auth: ptr uint8,
+                                       cipher: ptr uint8,
+                                       bssid: ptr uint8): cint
+  {.importc: "bl808_wifi_backend_scan_diag_get", cdecl.}
+proc bl808_wifi_backend_mac_irq_count*(): uint32
+  {.importc: "bl808_wifi_backend_mac_irq_count", cdecl.}
+proc bl808_wifi_backend_mac_poll_irq_count*(): uint32
+  {.importc: "bl808_wifi_backend_mac_poll_irq_count", cdecl.}
+proc bl808_wifi_backend_mac_trap_irq_count*(): uint32
+  {.importc: "bl808_wifi_backend_mac_trap_irq_count", cdecl.}
+proc bl808_wifi_backend_ipc_trap_irq_count*(): uint32
+  {.importc: "bl808_wifi_backend_ipc_trap_irq_count", cdecl.}
+proc bl808_wifi_backend_ipc_poll_irq_count*(): uint32
+  {.importc: "bl808_wifi_backend_ipc_poll_irq_count", cdecl.}

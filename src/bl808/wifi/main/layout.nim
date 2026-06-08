@@ -1,0 +1,6 @@
+include layout_parts/status_values
+include layout_parts/interface_tables
+include layout_parts/connect_request
+include layout_parts/scan_request
+include layout_parts/confirmations
+include layout_parts/ap_station_info

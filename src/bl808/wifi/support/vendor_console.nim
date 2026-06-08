@@ -1,0 +1,5 @@
+include vendor_console_parts/uart_output
+include vendor_console_parts/exported_bridge
+include vendor_console_parts/validation_log
+include vendor_console_parts/number_format
+include vendor_console_parts/c_stdio_shims

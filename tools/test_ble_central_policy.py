@@ -9,6 +9,26 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def nim_source_with_includes(path: Path) -> str:
+    lines: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("include "):
+            include_name = stripped.split(None, 1)[1].split("#", 1)[0].strip()
+            include_path = path.parent / (include_name.replace(".", "/") + ".nim")
+            if include_path.exists():
+                indent = line[: len(line) - len(line.lstrip())]
+                included = nim_source_with_includes(include_path)
+                lines.append("\n".join(indent + included_line for included_line in included.splitlines()))
+                continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def blecontroller_policy_source() -> str:
+    return nim_source_with_includes(REPO_ROOT / "src" / "bl808" / "blecontroller.nim")
+
+
 def test_name_based_central_connect_rediscover_defaults_to_no_stale_retries():
     source = REPO_ROOT / "src" / "bl808" / "ble.nim"
     text = source.read_text(encoding="utf-8")
@@ -94,8 +114,7 @@ def test_macos_ble_helper_is_signed_with_bluetooth_entitlement_by_default():
 
 
 def test_reset_nim_controller_state_keeps_ready_ble_core_warm():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     reset_body = text.split("proc resetNimControllerState() =", 1)[1].split(
         "proc localAddrBytes", 1
@@ -112,8 +131,7 @@ def test_reset_nim_controller_state_keeps_ready_ble_core_warm():
 
 
 def test_hci_and_controller_reset_use_reference_rwip_reset_path():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     hci_reset_body = text.split("of HciOpReset:", 1)[1].split(
         "of HciOpDisconnect:", 1
@@ -146,8 +164,7 @@ def test_hci_and_controller_reset_use_reference_rwip_reset_path():
 
 
 def test_m0_ble_reset_masks_rf_top_source_interrupts():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     init_body = text.split("proc bflbble_init*()", 1)[1].split(
         "proc bflbble_reset*()", 1
@@ -205,8 +222,7 @@ def test_ble_central_timeouts_use_kernel_clock_abstraction():
 
 
 def test_ble_rf_delay_service_clears_txcal_latch_without_faking_fcal_ready():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     service_body = text.split("proc serviceBleRfCalibrationLatch() =", 1)[1].split(
         "proc bleRfDelayUs", 1
@@ -222,8 +238,7 @@ def test_ble_rf_delay_service_clears_txcal_latch_without_faking_fcal_ready():
 
 
 def test_ble_rf_init_and_channel_retune_settle_calibration_latches():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     delay_body = text.split("proc bleRfDelayUs", 1)[1].split(
         "proc settleBleRfCalibrationLatches", 1
@@ -276,8 +291,7 @@ def test_ble_rf_init_and_channel_retune_settle_calibration_latches():
 
 
 def test_ble_phy_memory_loader_uses_typed_ldpc_agc_overlay():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "BlePhyMemoryRegs {.packed.} = object" in text
     assert "doAssert offsetof(BlePhyMemoryRegs, memMode) == 0x824" in text
@@ -313,8 +327,7 @@ def test_ble_phy_memory_loader_uses_typed_ldpc_agc_overlay():
 
 
 def test_ble_rf_lo_fcal_search_direction_matches_reference():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     search_body = text.split("proc chooseBleRfBaseFcalCode", 1)[1].split(
         "proc runBleRfPriLoFcal", 1
@@ -331,8 +344,7 @@ def test_ble_rf_lo_fcal_search_direction_matches_reference():
 
 
 def test_ble_rf_lo_fcal_uses_reference_txcal_control_register():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "BleRfTxPowerReg = 0x200010B4'u32" in text
     assert "BleRfTxcalCtrlReg = 0x200010B8'u32" in text
@@ -348,8 +360,7 @@ def test_ble_rf_lo_fcal_uses_reference_txcal_control_register():
 
 
 def test_ble_rf_init_ports_bl606p_reference_fixed_register_phases():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "type\n  BleRegInit = object" in text
     assert "BleRegMaskInit = object" in text
@@ -514,8 +525,7 @@ def test_ble_rf_init_ports_bl606p_reference_fixed_register_phases():
 
 
 def test_ble_role_starts_do_not_rerun_full_rf_calibration():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "var bleRf1MConfigured: bool" in text
     ensure_body = text.split("proc ensureBleRf1MConfigured() =", 1)[1].split(
@@ -543,8 +553,7 @@ def test_ble_role_starts_do_not_rerun_full_rf_calibration():
 
 
 def test_wireless_domain_reset_invalidates_ble_rf_ready_cache():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "proc invalidateBleRf1MConfig() {.inline.} =" in text
     prepare_body = text.split("proc prepareWirelessDomain() =", 1)[1].split(
@@ -562,8 +571,7 @@ def test_wireless_domain_reset_invalidates_ble_rf_ready_cache():
 
 
 def test_ble_connection_handoff_preserves_rx_descriptor_ring():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "proc prepareBtbleConnectionRxRingForHandoff()" in text
     prepare_body = text.split("proc prepareBtbleConnectionRxRingForHandoff()", 1)[1].split(
@@ -597,8 +605,7 @@ def test_ble_connection_handoff_preserves_rx_descriptor_ring():
 
 
 def test_lld_rxdesc_free_matches_sdk_head_advance_semantics():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     body = text.split("proc lld_rxdesc_free*", 1)[1].split(
         "when bl808BleNimManualConnTx:", 1
@@ -613,8 +620,7 @@ def test_lld_rxdesc_free_matches_sdk_head_advance_semantics():
 
 
 def test_hci_reset_preserves_public_identity_address_for_advertising():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "nim_public_addr*: array[6, uint8]" in text
     assert "nim_public_addr_valid*: bool" in text
@@ -697,8 +703,7 @@ def test_ble_host_uses_static_random_identity_by_default():
 
 
 def test_pure_ble_controller_does_not_link_vendor_rf_library():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "bl606p_phyrf" not in text
     assert 'importc: "rf_init"' not in text
@@ -706,8 +711,7 @@ def test_pure_ble_controller_does_not_link_vendor_rf_library():
 
 
 def test_pure_ble_rf_table_preserves_connection_em_config_byte():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "BtbleRfEmConfigWord = 0x2000'u16" in text
     assert "BtbleRfRssiFloorDbm = -40'i8" in text
@@ -782,8 +786,7 @@ def test_pure_ble_rf_table_preserves_connection_em_config_byte():
 
 
 def test_pure_ble_legacy_advertiser_uses_known_good_em_words():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "BtbleLegacyAdvEventHeaderBase = 0x0020'u16" in text
     assert "BtbleLegacyAdvEventWord124 = 0xE3F5'u16" in text
@@ -805,8 +808,7 @@ def test_pure_ble_legacy_advertiser_uses_known_good_em_words():
 
 
 def test_legacy_advertising_uses_spec_random_adv_delay():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "BleLegacyAdvDelayMaxHalfUs = 20_000'u32" in text
     assert "proc nextLegacyAdvDelayHalfUs" in text
@@ -825,8 +827,7 @@ def test_legacy_advertising_uses_spec_random_adv_delay():
 
 
 def test_legacy_advertising_chsel_matches_supported_features():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "const bl808BleNimPeripheralChSel2* {.booldefine.}: bool = true" in text
     assert "NimBleFeatureChannelSelectionAlgorithm2 = 1'u64 shl 14" in text
@@ -876,8 +877,7 @@ def test_legacy_advertising_chsel_matches_supported_features():
 
 
 def test_pure_ble_scanner_uses_vendor_scan_activity_words():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "proc btbleIrqSave(): uint" in text
     assert "core.csrReadMstatus()" in text
@@ -923,8 +923,7 @@ def test_pure_ble_scanner_uses_vendor_scan_activity_words():
 
 
 def test_pure_ble_initiator_programs_connect_ind_tx_descriptor():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "NimInitConnectIndPduType = 0x0005'u16" in text
     assert "NimInitTxDescPtr = 0x0304'u16" in text
@@ -957,8 +956,7 @@ def test_pure_ble_initiator_programs_connect_ind_tx_descriptor():
 
 
 def test_pure_ble_initiator_reschedules_skipped_programs_without_rx_drain():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "NimInitMinLeadSlots = 32'u32" in text
 
@@ -978,8 +976,7 @@ def test_pure_ble_initiator_reschedules_skipped_programs_without_rx_drain():
 
 
 def test_pure_ble_peripheral_uses_reference_transmit_window_timing():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "NimConnTrackedRxWindowHalfUs = 2500'u32" in text
     assert "NimConnPeripheralAcquireRxEvents = 4'u8" in text
@@ -1083,8 +1080,7 @@ def test_pure_ble_peripheral_uses_reference_transmit_window_timing():
 
 
 def test_rwip_priority_tables_match_sdk_reference_bytes():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     tables = re.findall(
         r"var rwip_priority\* \{\.exportc\.\}: array\[32, uint8\] =\n\s+\[(.*?)\]",
@@ -1103,8 +1099,7 @@ def test_rwip_priority_tables_match_sdk_reference_bytes():
 
 
 def test_rwip_timing_defaults_match_sdk_reference_fallbacks():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "RwipDefaultProgramDelaySlots = 3'u16" in text
     assert "RwipDefaultMaxDriftPpm = 500'u32" in text
@@ -1140,8 +1135,7 @@ def test_rwip_timing_defaults_match_sdk_reference_fallbacks():
 
 
 def test_sch_prog_fifo_marks_mac_done_after_event_end():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "var rwip_mac_done* {.exportc.}: uint8" in text
     assert "proc rwip_mac_done_set*() {.exportc, cdecl.} =" in text
@@ -1163,8 +1157,7 @@ def test_sch_prog_fifo_marks_mac_done_after_event_end():
 
 
 def test_pure_ble_connection_programs_rf_channel_indexes():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
     irq_text = (REPO_ROOT / "src" / "bl808" / "irq.nim").read_text(
         encoding="utf-8"
     )
@@ -1385,8 +1378,7 @@ def test_pure_ble_connection_programs_rf_channel_indexes():
 
 
 def test_pure_central_runtime_clic_routes_ble_scheduler_to_nim_isr():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "proc bflbble_isr*() {.exportc, cdecl.}" in text
 
@@ -1449,8 +1441,7 @@ def test_pure_central_runtime_clic_routes_ble_scheduler_to_nim_isr():
 
 
 def test_pure_ble_connection_em_duration_matches_lld_time_update_units():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "NimConnEventDurationMarginUs = 290'u32" in text
     assert "NimConnPacketDurationMarginUnits" not in text
@@ -1498,8 +1489,7 @@ def test_pure_ble_connection_em_duration_matches_lld_time_update_units():
 
 
 def test_pure_ble_connection_tx_descriptor_header_leaves_sequence_to_hardware():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "NimConnDataHeaderMoreDataBit = 0x0010'u16" in text
     assert "NimConnDataHeaderNesnBit" not in text
@@ -1519,8 +1509,7 @@ def test_pure_ble_connection_tx_descriptor_header_leaves_sequence_to_hardware():
 
 
 def test_pure_ble_connection_tx_descriptors_keep_valid_empty_pdu_armed():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     init_body = text.split("proc nimConnInitTxDescriptors", 1)[1].split(
         "proc nimConnEventReached", 1
@@ -1555,8 +1544,7 @@ def test_pure_ble_connection_tx_descriptors_keep_valid_empty_pdu_armed():
 
 
 def test_pure_ble_connection_schedules_reference_em_channel_path():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "NimConnMaxScheduleAheadSlots" not in text
     schedule_body = text.split("proc nimConnSchedule() =", 1)[1].split(
@@ -1573,8 +1561,7 @@ def test_pure_ble_connection_schedules_reference_em_channel_path():
 
 
 def test_pure_ble_connection_tx_confirm_uses_descriptor_completion():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "txAckDescOff: uint16" in text
     complete_helper = text.split("proc nimConnTxDescriptorComplete", 1)[1].split(
@@ -1601,8 +1588,7 @@ def test_pure_ble_connection_tx_confirm_uses_descriptor_completion():
 
 
 def test_pure_ble_llcp_filters_malformed_control_pdus():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "proc nimLlcpRxPduValid(opcode: uint8, pduLen: uint16): bool" in text
     assert "let expected = nimLlcpWireLength(opcode)" in text
@@ -1614,8 +1600,7 @@ def test_pure_ble_llcp_filters_malformed_control_pdus():
 
 
 def test_pure_ble_llcp_rejects_unadvertised_optional_procedures():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "proc nimBlePhyUpdateSupported(): bool" in text
     assert "NimBleFeatureLePing" not in text.split(
@@ -1639,8 +1624,7 @@ def test_pure_ble_llcp_rejects_unadvertised_optional_procedures():
 
 
 def test_llc_procedure_state_helpers_match_vendor_proc_env_abi():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "proc llc_proc_state_get*(procEnv: pointer): uint8" in text
     assert (
@@ -1658,8 +1642,7 @@ def test_llc_procedure_state_helpers_match_vendor_proc_env_abi():
 
 
 def test_authenticated_payload_timeout_path_is_real_nim_not_zero_stub():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "abiNoopHandler(llc_auth_payl_nearly_to_handler)" not in text
     assert "abiNoopHandler(llc_auth_payl_real_to_handler)" not in text
@@ -1689,8 +1672,7 @@ def test_authenticated_payload_timeout_path_is_real_nim_not_zero_stub():
 
 
 def test_pure_ble_feature_response_uses_peer_intersection():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     build_pdu = text.split("proc nimLlcpBuildFeaturePdu", 1)[1].split(
         "proc nimLlcpBuildLengthPdu", 1
@@ -1719,8 +1701,7 @@ def test_pure_ble_feature_response_uses_peer_intersection():
 
 
 def test_pure_ble_connection_does_not_reprocess_duplicate_data_pdus():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     observe_body = text.split("proc nimConnObserveRxHeader", 1)[1].split(
         "proc nimConnSupervisionExpired", 1
@@ -1742,8 +1723,7 @@ def test_pure_ble_connection_does_not_reprocess_duplicate_data_pdus():
 
 
 def test_pure_ble_connection_accepts_done_rx_link_status_before_payload():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "NimRxDescLinkMask = 0x7FFF'u16" in text
     assert "NimRxDescConnErrorMask" not in text
@@ -1768,8 +1748,7 @@ def test_pure_ble_connection_accepts_done_rx_link_status_before_payload():
 
 
 def test_pure_ble_connection_drains_rx_inside_rx_callback():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     callback_body = text.split("proc nimConnSchProgCb", 1)[1].split(
         "proc nimLldConStart", 1
@@ -1788,8 +1767,7 @@ def test_pure_ble_connection_drains_rx_inside_rx_callback():
 
 
 def test_pure_ble_peripheral_primes_startup_version_procedure():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     prime_body = text.split("proc nimLlcpPrimeStartup", 1)[1].split(
         "proc nimLlcpTrySendStartup", 1
@@ -1813,8 +1791,7 @@ def test_pure_ble_peripheral_primes_startup_version_procedure():
 
 
 def test_polled_m0_ble_roles_use_interrupt_mask_helper():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "const bl808BleNimUseClicIrq* {.booldefine.}: bool = false" in text
     assert "const bl808BleNimRuntimeClicIrq =" in text
@@ -1852,8 +1829,7 @@ def test_polled_m0_ble_roles_use_interrupt_mask_helper():
 
 
 def test_connect_ind_handoff_waits_for_advertising_scheduler_end():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     adv_cb_body = text.split("proc nimSchProgCb", 1)[1].split(
         "proc pushBtbleAdvProgram", 1
@@ -1951,8 +1927,7 @@ def test_connect_ind_handoff_waits_for_advertising_scheduler_end():
 
 
 def test_pure_advertising_scheduler_uses_committed_fifo_slot_metadata():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "proc btbleAdvSlotTail" in text
 
@@ -1978,8 +1953,7 @@ def test_pure_advertising_scheduler_uses_committed_fifo_slot_metadata():
 
 
 def test_pure_scheduler_initializes_reference_slice_defaults():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     body = text.split("proc initBtbleLinkLayerRegisters", 1)[1].split(
         "proc initBleCoreRegisters", 1
@@ -1991,8 +1965,7 @@ def test_pure_scheduler_initializes_reference_slice_defaults():
 
 
 def test_wireless_domain_preserves_wifi_only_when_coex_enabled():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     body = text.split("proc wifiMacLooksActive", 1)[1].split(
         "proc prepareWirelessDomain", 1
@@ -2003,8 +1976,7 @@ def test_wireless_domain_preserves_wifi_only_when_coex_enabled():
 
 
 def test_pure_ble_controller_has_no_vendor_scan_or_init_scheduler_branches():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     for forbidden in [
         "normalizeVendorLldInitArbElement",
@@ -2029,8 +2001,7 @@ def test_pure_ble_controller_has_no_vendor_scan_or_init_scheduler_branches():
 
 
 def test_pure_ble_initiator_uses_hci_create_connection_params():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "proc programNimInitiator" in text
     init_body = text.split("proc programNimInitiator", 1)[1].split(
@@ -2049,8 +2020,7 @@ def test_pure_ble_initiator_uses_hci_create_connection_params():
 
 
 def test_polled_scheduler_services_elapsed_frame_ends():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     elapsed_body = text.split("proc sch_prog_elapsed_isr*", 1)[1].split(
         "proc sch_prog_init*", 1
@@ -2071,8 +2041,7 @@ def test_polled_scheduler_services_elapsed_frame_ends():
 
 
 def test_btble_command_waits_are_bounded_and_diagnostic():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     assert "BtbleCommandPollLimit = 100_000'u32" in text
     assert "nim_btble_cmd_wait_timeout_count" in text
@@ -2226,8 +2195,7 @@ def test_central_disconnect_wait_drains_queued_hci_events():
 
 
 def test_hci_disconnect_stops_pure_connection_scheduler_state():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     disconnect_complete = text.split("proc sendDisconnectComplete", 1)[1].split(
         "when defined(bl808m0):", 1
@@ -2322,8 +2290,7 @@ def test_clic_startup_matches_reference_vector_return_semantics():
 def test_clic_init_uses_reference_vector_attributes():
     irq_source = REPO_ROOT / "src" / "bl808" / "irq.nim"
     irq_text = irq_source.read_text(encoding="utf-8")
-    ble_source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    ble_text = ble_source.read_text(encoding="utf-8")
+    ble_text = blecontroller_policy_source()
 
     assert "ClicAttrNonVector* = 0x00'u8" in irq_text
     assert "ClicAttrVector* = 0x01'u8" in irq_text
@@ -2407,8 +2374,7 @@ def test_m0_ble_p256_uses_pka_for_secret_scalar_work_not_public_validation():
 
 
 def test_ble_scheduler_program_path_uses_pure_nim_names():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
 
     for forbidden in [
         "bl808BleWrapLldConStartDiag",
@@ -2550,8 +2516,7 @@ def test_ble_scheduler_program_path_uses_pure_nim_names():
 
 
 def test_ble_ke_heap_end_uses_typed_byte_overlay():
-    source = REPO_ROOT / "src" / "bl808" / "blecontroller.nim"
-    text = source.read_text(encoding="utf-8")
+    text = blecontroller_policy_source()
     body = text.split(
         "proc btble_ke_mem_init*(mtype: uint8, heap: ptr uint8, size: uint16)",
         1,

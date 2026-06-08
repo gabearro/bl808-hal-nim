@@ -1,0 +1,6 @@
+include lwip_facade_parts/netif_api
+include lwip_facade_parts/netif_state
+include lwip_facade_parts/input_output
+include lwip_facade_parts/address_stubs
+include lwip_facade_parts/pbuf_alloc
+include lwip_facade_parts/pbuf_mutation

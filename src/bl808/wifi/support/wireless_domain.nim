@@ -1,0 +1,4 @@
+include wireless_domain_parts/reset
+include wireless_domain_parts/clocks
+include wireless_domain_parts/pll_power
+include wireless_domain_parts/prepare
