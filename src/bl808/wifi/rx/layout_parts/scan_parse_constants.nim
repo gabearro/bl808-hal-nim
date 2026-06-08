@@ -1,0 +1,41 @@
+const
+  WifiModeB = 0x01'u32
+  WifiModeG = 0x04'u32
+  WifiModeN24 = 0x08'u32
+  AuthOpen = 0'u8
+  AuthWep = 1'u8
+  AuthWpaPsk = 2'u8
+  AuthWpa2Psk = 3'u8
+  AuthWpaWpa2Psk = 4'u8
+  AuthWpa3Sae = 6'u8
+  AuthWpa2PskWpa3Sae = 7'u8
+  CipherWep = 1'u8
+  CipherAes = 2'u8
+  CipherTkip = 3'u8
+  CipherTkipAes = 4'u8
+
+  WlanCapabilityPrivacy = 1'u16 shl 4
+  IeIdSsid = 0'u8
+  IeIdDsChannel = 3'u8
+  MacEltIdHtCapa = 45'u8
+  MacEltIdExtRates = 50'u8
+  MacEltIdRsn = 48'u8
+  MacInfoEltLenOff = 1'u
+  MacInfoEltInfoOff = 2'u32
+  WifiCipherTkip = 3'i32
+  WifiCipherCcmp = 4'i32
+  WifiCipherTkipCcmp = 5'i32
+  WpaProtoWpa = 1'i32
+  WpaProtoRsn = 2'i32
+  WpaKeyMgmtPsk = 2'i32
+  WpaKeyMgmtPskSha256 = 256'i32
+  WpaKeyMgmtSae = 1024'i32
+
+  Ieee80211FctlFtype = 0x000c'u16
+  Ieee80211FctlStype = 0x00f0'u16
+  Ieee80211StypeProbeResp = 0x0050'u16
+  Ieee80211StypeBeacon = 0x0080'u16
+  MgmtFrameControlOff = 0'u
+  MgmtBssidOff = 16'u
+  MgmtBeaconCapabOff = 34'u
+  MgmtBeaconVariableOff = 36'u

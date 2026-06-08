@@ -284,6 +284,7 @@ def test_mixed_ble_wifi_snapshots_capture_connection_failure_state():
 
     for name in (
         "m0_ble_wifi_nim_hal_test",
+        "m0_ble_wifi_nim_coex_hal_test",
         "m0_ble_wifi_nim_coex_long_hal_test",
         "m0_ble_wifi_nim_scan_hal_test",
     ):
@@ -411,6 +412,7 @@ def test_wifi_http_server_example_uses_pure_nim_wifi_and_real_lwip():
     assert "Ready for HTTP/1.1 and UDP echo client requests" in required
     assert "[PASS] lwIP TCP HTTP/1.1 response" in required
     assert "[PASS] lwIP UDP echo bytes=" in required
+    assert "[PASS] lwIP HTTP diagnostics reflect UDP RX/TX" in required
     host_actions = test.get("host_actions", [])
     assert len(host_actions) == 1
     host = host_actions[0]
@@ -429,8 +431,10 @@ def test_wifi_http_server_example_uses_pure_nim_wifi_and_real_lwip():
     ]
     assert "[PASS] lwIP TCP HTTP/1.1 response" in host.get("required", [])
     assert "[PASS] lwIP UDP echo bytes=" in host.get("required", [])
+    assert "[PASS] lwIP HTTP diagnostics reflect UDP RX/TX" in host.get("required", [])
 
     example = (REPO_ROOT / "examples/m0_wifi_http_server.nim").read_text()
+    probe = (REPO_ROOT / "tools/probe_wifi_lwip_tcp_udp.py").read_text()
     for expected in [
         "import bl808/kernel/lwipcore",
         "lwipInit()",
@@ -460,6 +464,17 @@ def test_wifi_http_server_example_uses_pure_nim_wifi_and_real_lwip():
         "phaseMark(Phase.tcp, Kind.ok)",
     ]:
         assert expected in example
+
+    for expected in [
+        "def parse_http_diagnostics(response: str) -> dict[str, str]:",
+        "diagnostics = parse_http_diagnostics(response)",
+        "response_after_udp = tcp_http_probe(host, args.http_port, args.timeout)",
+        'require_int_at_least(diagnostics_after_udp, "http_requests", 2)',
+        'require_int_at_least(diagnostics_after_udp, "udp_rx_packets", 1)',
+        'require_int_at_least(diagnostics_after_udp, "udp_tx_packets", 1)',
+        '"[PASS] lwIP HTTP diagnostics reflect UDP RX/TX"',
+    ]:
+        assert expected in probe
 
 
 def test_wifi_validation_targets_do_not_pin_scan_channel():

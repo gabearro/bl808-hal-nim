@@ -1,0 +1,26 @@
+const
+  IpcHostEnvSize = 140'u
+  BlCmdMgrLlindOff = 32'u
+  BlHwIpcEnvOff = 48'u
+  BlHwVifTableOff = 60'u
+  BlHwStaTableOff = 100'u
+  BlVifSize = 20'u
+  BlVifDevOff = 8'u
+  BlVifUpOff = 12'u
+  BlStaSize = 40'u
+  BlStaAddrOff = 16'u
+  BlStaIsUsedOff = 22'u
+  BlStaVifIdxOff = 24'u
+  NxRemoteStaStoreMax = 3
+  RxStatusForward = 1'u32
+  RxFlagsOff = 48'u
+  RxFlagIs80211Mpdu = 1'u32 shl 1
+  RxFlagStaIdxShift = 16
+  RxFlagStaIdxMask = 0xff'u32
+  WifiPktFragCount = 4
+  WifiPktPktOff = 0'u
+  WifiPktLenOff = 32'u
+  PbufRaw = 0.cint
+  PbufRam = 0x0280.cint
+  PbufFlagAmsdu = 0x80'u8
+  BlRxStatusAmsdu = 1'u32

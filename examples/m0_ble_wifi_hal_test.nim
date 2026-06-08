@@ -312,9 +312,21 @@ proc smokeBle(): CpsVoidFuture {.cps.} =
   check("ble conn callback register", true)
 
   var advParam: BtLeAdvParam
-  var advData: BtData
+  advParam.intervalMin = 0x0020'u16
+  advParam.intervalMax = 0x0020'u16
+  var advFlags = 0x06'u8
+  var advName = [
+    uint8('b'), uint8('l'), uint8('8'), uint8('0'), uint8('8'),
+    uint8('-'), uint8('h'), uint8('a'), uint8('l')
+  ]
+  var advData = [
+    BtData(dataType: 0x01'u8, dataLen: 1'u8, data: addr advFlags),
+    BtData(dataType: 0x09'u8, dataLen: advName.len.uint8,
+           data: addr advName[0])
+  ]
   check("ble advertising start",
-        (await bleStartAdvertisingAsync(addr advParam, addr advData, 0)) == bleOk)
+        (await bleStartAdvertisingAsync(addr advParam, addr advData[0],
+                                        advData.len)) == bleOk)
   printHciStatus("adv-start")
   for _ in 0 ..< 2000:
     await sleepUs(BlePollDelayUs.uint64)

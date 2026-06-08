@@ -455,6 +455,7 @@
             "bl808TrapFrameDiag": "1",
             "BleHostWindowIterations": "80000",
             "BlePollIterations": "1",
+            "BlePeripheralIdleDisconnectPolls": "3000",
             "BleExpectPeripheralLink": "1"
           }
         }
@@ -2755,12 +2756,39 @@
         "mdw {sym:nim_conn_rx_status_reject_count} 1",
         "mdw {sym:nim_conn_rx_last_rejected_status} 1",
         "mdw {sym:nim_conn_deferred_schedule_count} 1",
+        "mdw {sym:nim_connect_ind_pending} 1",
+        "mdw {sym:nim_connect_ind_queued_count} 1",
+        "mdw {sym:nim_connect_ind_service_count} 1",
+        "mdw {sym:nim_connect_ind_return_count} 1",
+        "mdw {sym:nim_adv_sch_event_active} 1",
+        "mdw {sym:nim_conn_start_return_count} 1",
+        "mdb {sym:nim_adv_enabled} 1",
+        "mdb {sym:nim_adv_data_len} 1",
+        "mdb {sym:nim_scan_rsp_data_len} 1",
+        "mdb {sym:nim_adv_params} 15",
+        "mdb {sym:nim_adv_data} 31",
+        "mdb {sym:nim_scan_rsp_data} 31",
+        "mdw {sym:nim_adv_sch_program_count} 1",
+        "mdw {sym:nim_adv_sch_event_count} 1",
+        "mdw {sym:nim_adv_sch_end_count} 1",
+        "mdw {sym:nim_adv_sch_last_event} 1",
+        "mdw {sym:nim_ble_dbg_rx_scan_req_count} 1",
+        "mdw {sym:nim_ble_dbg_rx_scan_req_match_count} 1",
         "mdw {sym:nim_vendor_lld_con_start_count} 2",
         "mdw {sym:nim_vendor_lld_con_start_param} 12",
+        "mdw {sym:nim_conn_sched_delta_log} 8",
+        "mdw {sym:nim_conn_sched_channel_log} 8",
+        "mdw {sym:nim_llcp_tx_count} 1",
+        "mdw {sym:nim_llcp_rx_count} 1",
+        "mdw {sym:nim_llcp_rx_malformed_count} 1",
+        "mdw {sym:nim_acl_rx_count} 1",
+        "mdw {sym:nim_acl_rx_drop_count} 1",
+        "mdw {sym:nim_vendor_llcp_rx_count} 1",
         "mdw 0x24920004 1",
         "mdw 0x24920404 1",
         "mdw 0x24b00400 1",
         "mdw 0x24b00404 1",
+        "mdw 0x28010000 32",
         "mdw 0x28000000 32",
         "mdw 0x28010000 32"
       ],
@@ -3814,7 +3842,8 @@
         "proto=udp",
         "Ready for HTTP/1.1 and UDP echo client requests",
         "[PASS] lwIP TCP HTTP/1.1 response",
-        "[PASS] lwIP UDP echo bytes="
+        "[PASS] lwIP UDP echo bytes=",
+        "[PASS] lwIP HTTP diagnostics reflect UDP RX/TX"
       ],
       "host_actions": [
         {
@@ -3833,7 +3862,8 @@
           ],
           "required": [
             "[PASS] lwIP TCP HTTP/1.1 response",
-            "[PASS] lwIP UDP echo bytes="
+            "[PASS] lwIP UDP echo bytes=",
+            "[PASS] lwIP HTTP diagnostics reflect UDP RX/TX"
           ],
           "timeout": 15
         }

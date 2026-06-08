@@ -1,0 +1,3 @@
+const
+  CFG_START_REQ*   = KE_FIRST_MSG(TASK_CFG.uint16) + 0
+  CFG_START_CFM*   = KE_FIRST_MSG(TASK_CFG.uint16) + 1

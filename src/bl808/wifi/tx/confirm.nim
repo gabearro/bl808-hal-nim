@@ -1,0 +1,4 @@
+include confirm_parts/dhcp_log
+include confirm_parts/repush
+include confirm_parts/eapol_log
+include confirm_parts/complete

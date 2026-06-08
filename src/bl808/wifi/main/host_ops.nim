@@ -1,0 +1,8 @@
+include host_ops_parts/lifecycle
+include host_ops_parts/station
+include host_ops_parts/radio_controls
+include host_ops_parts/interface_management
+include host_ops_parts/ap_management
+include host_ops_parts/config_tasks
+include host_ops_parts/scan
+include host_ops_parts/connect_abort

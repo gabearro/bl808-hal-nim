@@ -1,0 +1,17 @@
+when defined(bl808WifiConnectTrace):
+  {.compile: "src/bl808/wifi_connect_trace.c".}
+{.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/ap/ap_config.c".}
+{.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/ap/wpa_auth_ie.c".}
+{.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/ap/wpa_auth_rsn_ccmp_only.c".}
+{.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/bl_supplicant/bl_hostap.c".}
+{.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/bl_supplicant/bl_wpa3.c".}
+{.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/bl_supplicant/bl_wpa_main.c".}
+{.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/bl_supplicant/bl_wpas_glue.c".}
+{.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/common/sae.c".}
+{.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/common/wpa_common.c".}
+{.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/eap_peer/eap_common.c".}
+{.compile: "src/bl808/wifi_supplicant_wpa_overlay.c".}
+{.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/rsn_supp/wpa_ie.c".}
+{.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/utils/common.c".}
+{.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/utils/wpa_debug.c".}
+{.compile: "build/bl_iot_sdk_b773b3f/components/security/wpa_supplicant/src/utils/wpabuf.c".}

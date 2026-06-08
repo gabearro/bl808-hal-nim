@@ -1,0 +1,11 @@
+var nimWifiDbgDelayCalls* {.exportc: "nim_wifi_dbg_delay_calls".}: uint32
+var nimWifiDbgDelayLastUs* {.exportc: "nim_wifi_dbg_delay_last_us".}: uint32
+var nimWifiDbgDelayFallbacks* {.exportc: "nim_wifi_dbg_delay_fallbacks".}: uint32
+var nimWifiDbgDelayLastStale* {.exportc: "nim_wifi_dbg_delay_last_stale".}: uint32
+var nimWifiDbgDelayLastStartLo* {.exportc: "nim_wifi_dbg_delay_last_start_lo".}: uint32
+var nimWifiDbgDelayLastNowLo* {.exportc: "nim_wifi_dbg_delay_last_now_lo".}: uint32
+var nimWifiDbgDelayCallerRa* {.exportc: "nim_wifi_dbg_delay_caller_ra".}: uint32
+var nimWifiDbgRfLatchServiceEnabled* {.exportc: "nim_wifi_dbg_rf_latch_service_enabled".}: uint32
+var nimWifiDbgRfTxcalLatchCount* {.exportc: "nim_wifi_dbg_rf_txcal_latch_count".}: uint32
+var nimWifiDbgRfTxcalBefore* {.exportc: "nim_wifi_dbg_rf_txcal_before".}: uint32
+var nimWifiDbgRfTxcalAfter* {.exportc: "nim_wifi_dbg_rf_txcal_after".}: uint32

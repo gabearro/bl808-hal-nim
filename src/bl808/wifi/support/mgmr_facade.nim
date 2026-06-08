@@ -1,0 +1,6 @@
+include mgmr_facade_parts/callbacks
+include mgmr_facade_parts/backend_init
+include mgmr_facade_parts/station_interface
+include mgmr_facade_parts/scan_connect
+include mgmr_facade_parts/ap_control
+include mgmr_facade_parts/notifications

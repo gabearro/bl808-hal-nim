@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import socket
 import sys
 import time
@@ -55,6 +56,29 @@ def udp_echo_probe(host: str, port: int, timeout_s: float) -> bytes:
     raise TimeoutError(f"UDP echo probe timed out after {timeout_s}s")
 
 
+def parse_http_diagnostics(response: str) -> dict[str, str]:
+    diagnostics: dict[str, str] = {}
+    for line in response.splitlines():
+        if "=" in line and not line.startswith("HTTP/"):
+            key, value = line.split("=", 1)
+            diagnostics[key.strip()] = value.strip()
+    return diagnostics
+
+
+def require_int_at_least(diag: dict[str, str], key: str, minimum: int) -> int:
+    if key not in diag:
+        raise RuntimeError(f"HTTP diagnostics missing {key}")
+    try:
+        value = int(diag[key], 0)
+    except ValueError as exc:
+        raise RuntimeError(f"HTTP diagnostics {key} is not an integer: {diag[key]}") from exc
+    if value < minimum:
+        raise RuntimeError(
+            f"HTTP diagnostics {key}={value} below expected minimum {minimum}"
+        )
+    return value
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ip", required=True,
@@ -75,13 +99,34 @@ def main() -> int:
     if "Hello World! from Nim on BL808" not in response:
         print(response, end="")
         raise RuntimeError("HTTP probe missing greeting")
-    if "device_mac=" not in response or "ip=" not in response:
+    diagnostics = parse_http_diagnostics(response)
+    if "device_mac" not in diagnostics or "ip" not in diagnostics:
         print(response, end="")
         raise RuntimeError("HTTP probe missing diagnostics")
+    if not re.fullmatch(r"[0-9A-F]{2}(:[0-9A-F]{2}){5}", diagnostics["device_mac"]):
+        print(response, end="")
+        raise RuntimeError(f"HTTP probe malformed device_mac={diagnostics['device_mac']}")
+    if diagnostics["ip"] != host:
+        print(response, end="")
+        raise RuntimeError(f"HTTP probe ip={diagnostics['ip']} does not match {host}")
     print("[PASS] lwIP TCP HTTP/1.1 response", flush=True)
 
     data = udp_echo_probe(host, args.udp_port, args.timeout)
     print(f"[PASS] lwIP UDP echo bytes={len(data)}", flush=True)
+
+    response_after_udp = tcp_http_probe(host, args.http_port, args.timeout)
+    diagnostics_after_udp = parse_http_diagnostics(response_after_udp)
+    require_int_at_least(diagnostics_after_udp, "http_requests", 2)
+    require_int_at_least(diagnostics_after_udp, "udp_rx_packets", 1)
+    require_int_at_least(diagnostics_after_udp, "udp_tx_packets", 1)
+    require_int_at_least(diagnostics_after_udp, "udp_rx_bytes_total", len(data))
+    require_int_at_least(diagnostics_after_udp, "udp_tx_bytes_total", len(data))
+    if diagnostics_after_udp.get("udp_last_remote_ip", "0.0.0.0") == "0.0.0.0":
+        print(response_after_udp, end="")
+        raise RuntimeError(
+            "HTTP diagnostics did not record the UDP host remote IP"
+        )
+    print("[PASS] lwIP HTTP diagnostics reflect UDP RX/TX", flush=True)
     return 0
 
 

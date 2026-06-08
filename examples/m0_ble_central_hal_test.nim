@@ -421,9 +421,9 @@ proc printNimInitiatorDiag() =
     discard console.sendString(" last_status=")
     console.sendHex32(blecontroller.nim_init_last_status)
     discard console.sendString(" con_status=")
-    console.sendHex32(blecontroller.nim_vendor_con_last_status)
+    console.sendHex32(blecontroller.bleNimDbgVendorConLastStatus())
     discard console.sendString(" con_evt=")
-    console.sendHex32(blecontroller.nim_vendor_conn_evt_count)
+    console.sendHex32(blecontroller.bleNimPeripheralConnEventCount())
     discard console.sendLine("")
 
     when defined(BleDebugCounters):
