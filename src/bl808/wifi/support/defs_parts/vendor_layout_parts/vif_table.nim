@@ -1,5 +1,5 @@
 const
-  VendorScanDiagMax = 8
+  VendorScanDiagMax = 64
   VendorVifEntrySize = 1512'u
   VendorVifMacOff = 80'u
   CfgVirtDevMax = 2'u8

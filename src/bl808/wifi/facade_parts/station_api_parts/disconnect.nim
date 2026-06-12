@@ -13,8 +13,8 @@ proc wifiWaitStaIdleAsync(timeoutMs: uint32 = 2_000): CpsFuture[WifiError] =
 
 proc wifiIssueDisconnectAsync(timeoutMs: uint32 = 10_000): CpsFuture[WifiError] =
   if not wifiBackendUsesEventFutures():
-    let rc = wifiNimFirmwareIssueDisconnect()
-    return completedLocalFuture(if rc == 0: wifiOk else: wifiFail)
+    let disconnectIssueStatus = wifiNimFirmwareIssueDisconnect()
+    return completedLocalFuture(if disconnectIssueStatus == 0: wifiOk else: wifiFail)
   wifiDisconnectFuture = newLocalCpsFuture[WifiError]()
   wifiDisconnectIssuePending = true
   wifiDisconnectIssueTimeoutMs = timeoutMs
@@ -33,10 +33,10 @@ proc wifiDisconnect*(): WifiError =
         break
       wifiBackendPoll(8)
     wifiDisconnectTrace("[DC] pre-loop done\n")
-  let rc = wifiBackendStaDisconnect()
+  let disconnectStatus = wifiBackendStaDisconnect()
   if wifiNimFirmwareDisconnectNeedsDrain():
-    wifiDisconnectTraceRc("[DC] sta_disconnect rc=", rc.cint)
-    if rc != 0:
+    wifiDisconnectTraceRc("[DC] sta_disconnect rc=", disconnectStatus.cint)
+    if disconnectStatus != 0:
       return wifiFail
     var loopIter: int = 0
     for _ in 0 ..< 10_000:
@@ -52,7 +52,7 @@ proc wifiDisconnect*(): WifiError =
                               if wifiBackendDisconnectDone(): 1.cint else: 0.cint)
     return wifiFail
   else:
-    if rc == 0: wifiOk else: wifiFail
+    if disconnectStatus == 0: wifiOk else: wifiFail
 
 proc wifiDisconnectAsync*(timeoutMs: uint32 = 10_000): CpsFuture[WifiError] =
   if wifiDisconnectFuture != nil and not wifiDisconnectFuture.finished:

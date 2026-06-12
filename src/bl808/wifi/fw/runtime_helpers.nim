@@ -23,10 +23,10 @@ proc macTimeNow(): uint32 {.inline.} =
 proc platformDelay(us: uint32) {.inline.} =
   ## Simple busy-wait delay (approximate microseconds).
   ## From blob: wifi_main calls delay(100) during INTC clock toggle.
-  var cnt = us * 10'u32  # approximate loop count for ~1us per 10 iterations
-  while cnt > 0:
+  var delayLoopBudget = us * 10'u32  # approximate loop count for ~1us per 10 iterations
+  while delayLoopBudget > 0:
     {.emit: ["asm volatile(\"nop\");"].}
-    dec cnt
+    dec delayLoopBudget
 
 # =============================================================================
 # RC helper: typed access to rc_sta_stats fields from raw byte pointer
@@ -50,19 +50,19 @@ template rcPrngNext(): uint32 =
   rcPrngState = rcPrngState * RC_PRNG_MULT + RC_PRNG_INCR
   rcPrngState
 
-proc rcRateEntryPtr(stats: pointer, idx: int): pointer {.inline.} =
-  ## Get pointer to rate entry i within rc_sta_stats.
+proc rcRateEntryPtr(stats: pointer, rateEntryIndex: int): pointer {.inline.} =
+  ## Get pointer to a rate entry within rc_sta_stats.
   ## Rate entries start at offset 0, each 12 bytes.
-  cast[pointer](cast[uint](stats) + (idx * RC_RATE_ENTRY_SIZE).uint)
+  cast[pointer](cast[uint](stats) + (rateEntryIndex * RC_RATE_ENTRY_SIZE).uint)
 
 template rcRateEntryAt(p: pointer): ptr RcRateEntryView =
   cast[ptr RcRateEntryView](p)
 
-template rcRateEntry(stats: pointer, idx: uint16): ptr RcRateEntryView =
-  cast[ptr RcRateEntryView](cast[uint](stats) + idx.uint * RC_RATE_ENTRY_SIZE.uint)
+template rcRateEntry(stats: pointer, rateEntryIndex: uint16): ptr RcRateEntryView =
+  cast[ptr RcRateEntryView](cast[uint](stats) + rateEntryIndex.uint * RC_RATE_ENTRY_SIZE.uint)
 
-template rcRateResetFields(stats: pointer, idx: uint16): ptr RcRateResetFieldsView =
-  cast[ptr RcRateResetFieldsView](cast[uint](stats) + idx.uint * RC_RATE_ENTRY_SIZE.uint)
+template rcRateResetFields(stats: pointer, rateEntryIndex: uint16): ptr RcRateResetFieldsView =
+  cast[ptr RcRateResetFieldsView](cast[uint](stats) + rateEntryIndex.uint * RC_RATE_ENTRY_SIZE.uint)
 
 template rcThroughputArray(tpArray: pointer): ptr UncheckedArray[uint32] =
   cast[ptr UncheckedArray[uint32]](tpArray)
@@ -70,20 +70,20 @@ template rcThroughputArray(tpArray: pointer): ptr UncheckedArray[uint32] =
 template rcStatsCounters(stats: pointer): ptr RcStatsCounterView =
   cast[ptr RcStatsCounterView](stats)
 
-proc rcClearRateEntryTransientStats(stats: pointer; idx: uint16) {.inline.} =
-  let entry = rcRateResetFields(stats, idx)
-  entry.sampleSkipped = 0
-  entry.initialized = 1
-  entry.attempts0 = 0
-  entry.oldProb = 0
+proc rcClearRateEntryTransientStats(stats: pointer; rateEntryIndex: uint16) {.inline.} =
+  let resetFields = rcRateResetFields(stats, rateEntryIndex)
+  resetFields.sampleSkipped = 0
+  resetFields.initialized = 1
+  resetFields.attempts0 = 0
+  resetFields.oldProb = 0
 
-proc rcRateConfig(stats: pointer, idx: int): uint16 {.inline.} =
-  ## Read rate_config from entry i (at entry base + 10).
-  rcU16(stats, idx * RC_RATE_ENTRY_SIZE + 10)
+proc rcRateConfig(stats: pointer, rateEntryIndex: int): uint16 {.inline.} =
+  ## Read rate_config from rate entry base + 10.
+  rcU16(stats, rateEntryIndex * RC_RATE_ENTRY_SIZE + 10)
 
-proc rcSetRateConfig(stats: pointer, idx: int, val: uint16) {.inline.} =
-  ## Write rate_config to entry i.
-  rcU16(stats, idx * RC_RATE_ENTRY_SIZE + 10) = val
+proc rcSetRateConfig(stats: pointer, rateEntryIndex: int, rateConfigWord: uint16) {.inline.} =
+  ## Write rate_config to rate entry base + 10.
+  rcU16(stats, rateEntryIndex * RC_RATE_ENTRY_SIZE + 10) = rateConfigWord
 
 const RcRandomRateAttemptLimit = 64
 
@@ -105,19 +105,19 @@ proc rc_pick_non_duplicate_rate(stats: pointer): uint16 =
     let lo = rcU8(stats, RCS_LOWEST_IDX)
     let hi = rcU8(stats, RCS_HIGHEST_IDX)
     let bw = rcU8(stats, RCS_BW_MAX).uint16 shl 10
-    var idx = lo
-    while idx <= hi:
-      if ((rateMap shr idx) and 1'u16) != 0:
-        var candidate = (fmtForFill.uint16 shl 11) or idx.uint16
-        if idx == 0:
+    var fallbackRateIndex = lo
+    while fallbackRateIndex <= hi:
+      if ((rateMap shr fallbackRateIndex) and 1'u16) != 0:
+        var candidate = (fmtForFill.uint16 shl 11) or fallbackRateIndex.uint16
+        if fallbackRateIndex == 0:
           candidate = candidate or 0x400'u16
-        elif idx - 1 <= 2:
+        elif fallbackRateIndex - 1 <= 2:
           candidate = candidate or bw
         if rc_check_rate_duplicated(stats, candidate) == 0:
           return candidate
-      if idx == 0xFF'u8:
+      if fallbackRateIndex == 0xFF'u8:
         break
-      inc idx
+      inc fallbackRateIndex
   else:
     let groupCnt = rcU8(stats, RCS_GROUP_CNT)
     let maxMcs = rcU8(stats, RCS_MAX_NSS_MCS)
@@ -140,40 +140,39 @@ proc rc_pick_non_duplicate_rate(stats: pointer): uint16 =
       inc group
   0xFFFF'u16
 
-proc rcRateEntryTp(stats: pointer, idx: int): uint16 {.inline.} =
-  ## Read throughput estimate from entry i (at entry base + 8).
-  rcU16(stats, idx * RC_RATE_ENTRY_SIZE + 8)
+proc rcRateEntryTp(stats: pointer, rateEntryIndex: int): uint16 {.inline.} =
+  ## Read throughput estimate from rate entry base + 8.
+  rcU16(stats, rateEntryIndex * RC_RATE_ENTRY_SIZE + 8)
 
-proc rcRateEntryProb(stats: pointer, idx: int): uint16 {.inline.} =
-  ## Read probability EWMA from entry i (at entry base + 4).
-  rcU16(stats, idx * RC_RATE_ENTRY_SIZE + 4)
+proc rcRateEntryProb(stats: pointer, rateEntryIndex: int): uint16 {.inline.} =
+  ## Read probability EWMA from rate entry base + 4.
+  rcU16(stats, rateEntryIndex * RC_RATE_ENTRY_SIZE + 4)
 
-proc rcRateTp(stats: pointer, idx: int): uint16 {.inline.} =
-  ## Read throughput value from entry i (at entry base + 8).
-  rcU16(stats, idx * RC_RATE_ENTRY_SIZE + 8)
+proc rcRateTp(stats: pointer, rateEntryIndex: int): uint16 {.inline.} =
+  ## Read throughput value from rate entry base + 8.
+  rcU16(stats, rateEntryIndex * RC_RATE_ENTRY_SIZE + 8)
 
-proc rcRateEntryRetry(stats: pointer, idx: int): uint8 {.inline.} =
-  ## Read retry count from entry i (at entry base + 12).
-  rcU8(stats, idx * RC_RATE_ENTRY_SIZE + 12)
+proc rcRateEntryRetry(stats: pointer, rateEntryIndex: int): uint8 {.inline.} =
+  ## Read retry count from rate entry base + 12.
+  rcU8(stats, rateEntryIndex * RC_RATE_ENTRY_SIZE + 12)
 
-proc rcRateEntryFlags(stats: pointer, idx: int): uint8 {.inline.} =
-  ## Read flags byte from entry i (at entry base + 13).
-  rcU8(stats, idx * RC_RATE_ENTRY_SIZE + 13)
+proc rcRateEntryFlags(stats: pointer, rateEntryIndex: int): uint8 {.inline.} =
+  ## Read flags byte from rate entry base + 13.
+  rcU8(stats, rateEntryIndex * RC_RATE_ENTRY_SIZE + 13)
 
 proc rcCountBitsInMap(rateMap: uint16, fromBit: int, toBit: int): uint16 =
   ## Count set bits in rateMap from fromBit to toBit (inclusive).
   var count: uint16 = 0
-  for i in fromBit .. toBit:
-    if (rateMap and (1'u16 shl i)) != 0:
+  for rateMapBitIndex in fromBit .. toBit:
+    if (rateMap and (1'u16 shl rateMapBitIndex)) != 0:
       inc count
   return count
 
-proc rcHighestBit(val: uint8): uint8 =
-  ## Find index of highest set bit in a byte (0-7). Returns 0 if val==0.
-  var idx: uint8 = 0
-  var v = val
-  while v > 1:
-    v = v shr 1
-    inc idx
-  return idx
-
+proc rcHighestBit(rateBitmapByte: uint8): uint8 =
+  ## Find index of highest set bit in a byte (0-7). Returns 0 if rateBitmapByte==0.
+  var highestSetBitIndex: uint8 = 0
+  var remainingBits = rateBitmapByte
+  while remainingBits > 1:
+    remainingBits = remainingBits shr 1
+    inc highestSetBitIndex
+  return highestSetBitIndex

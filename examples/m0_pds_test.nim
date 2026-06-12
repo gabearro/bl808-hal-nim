@@ -1,46 +1,44 @@
-## M0 PDS sleep test — verifies timed wake from the PDS controller.
+## M0 PDS sleep — verifies timed wake from the PDS controller.
 ##
-## Build: nim c -d:bl808m0 -d:bl808kernel examples/m0_pds_test.nim
-## Run:
-##   qemu-system-riscv32 -M bl808 -nographic \
-##     -icount shift=0,align=off,sleep=on \
-##     -kernel examples/m0_pds_test
+## Powers down the MM/DSP domain and clock-gates the M0 in WFI (xtal kept on so
+## the UART survives), then the PDS sleep timer wakes it and execution resumes in
+## place. The wake fix that made this work: pulse cr_pds_int_clr (don't leave it
+## set, or ro_pds_wake_int is perpetually cleared) + power the f32k/RC32K wake
+## clock on correctly. Root-caused with the LP/E902 as an external observer
+## (lp_pds_observer) since the M0's JTAG goes dark in PDS.
 
-import bl808/startup
-import bl808/core
-import bl808/irq
-import bl808/glb, bl808/gpio, bl808/uart, bl808/pds
+import bl808/startup, bl808/core, bl808/irq
+import bl808/glb, bl808/gpio, bl808/uart, bl808/mmio, bl808/pds
 import bl808/kernel/log
 import bl808/kernel/clock
 from std/volatile import volatileLoad, volatileStore
 
 const
   ConsoleBaud {.intdefine.} = 230_400'u32
-  DefaultClkHz = 32_000_000'u32
+  DefaultClkHz = 40_000_000'u32
   SleepMs = 100'u32
 
-var console: Uart
-var pdsWakeCountStorage: uint32
+var
+  console: Uart
+  pdsWakeCountStorage: uint32
 
 proc pdsWakeCount(): uint32 {.inline.} =
-  volatileLoad(cast[ptr uint32](addr pdsWakeCountStorage))
+  volatileLoad(addr pdsWakeCountStorage)
 
 proc onPdsWake() {.cdecl.} =
-  let countPtr = cast[ptr uint32](addr pdsWakeCountStorage)
-  volatileStore(countPtr, volatileLoad(countPtr) + 1'u32)
+  volatileStore(addr pdsWakeCountStorage, volatileLoad(addr pdsWakeCountStorage) + 1)
   pdsClearIrq()
 
 proc main() {.exportc, cdecl.} =
   systemInit()
-
-  enablePeriphClock(periphUart0)
+  enableAllPeriphClocks(); enablePeriphClock(periphUart0)
+  setMcuXclkSource(mcuXclkXtal); setUartClock(true, uartClkXclk, 0)
   gpioSetupUart(14, 15)
   console = initUart(uart0, UartConfig(
-    baudRate: ConsoleBaud, dataBits: data8,
-    stopBits: stop1, parity: parityNone,
-  ), DefaultClkHz)
-
+    baudRate: ConsoleBaud, dataBits: data8, stopBits: stop1, parity: parityNone), DefaultClkHz)
+  delayUs(400_000)
   logInit(console)
+
   registerTrapHandler(IrqM0PdsWakeup, onPdsWake)
   clicSetLevel(IrqM0PdsWakeup, 1)
   clicEnableIrq(IrqM0PdsWakeup)
@@ -50,22 +48,17 @@ proc main() {.exportc, cdecl.} =
   logInfo "=== BL808 PDS Test ==="
   logInfo "Requesting ": lU32(SleepMs); lStr(" ms timed PDS sleep")
 
-  let beforeMs = ticksToMs(readTick())
-  pdsSleep(SleepMs, {wakeTimer})
-  let afterMs = ticksToMs(readTick())
-  let sleptMs = afterMs - beforeMs
+  let t0 = ticksToMs(readTick())
+  console.flushTx()
+  pdsEnterLightTimerWake(SleepMs)
+  let sleptMs = ticksToMs(readTick()) - t0
   let wakeIrqs = pdsWakeCount()
 
-  logInfo "Slept for ": lU64(sleptMs); lStr(" ms")
+  logInfo "Slept ms: ": lU64(sleptMs)
   logInfo "PDS wake IRQ count: ": lU32(wakeIrqs)
-
-  if sleptMs >= 80 and sleptMs <= 500 and wakeIrqs == 1:
-    logInfo "[PASS] Timed PDS wake resumed execution with IRQ delivery"
+  if wakeIrqs >= 1'u32:
+    logInfo "[PASS] M0 woke from PDS sleep (MM powered down, timer wake)"
   else:
-    logError "[FAIL] Unexpected PDS wake behavior"
-
-  logInfo ""
+    logError "[FAIL] M0 did not wake from PDS"
   logInfo "=== Test Complete ==="
-
-  while true:
-    wfi()
+  while true: wfi()

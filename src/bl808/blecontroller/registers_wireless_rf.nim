@@ -76,26 +76,31 @@ proc regUpdate(regAddr: uint32, mask: uint32, value: uint32) {.inline.} =
 
 type
   BlePhyMemoryRegs {.packed.} = object
-    reserved000*: array[0x824, uint8]
+    phyMemBaseToModePadding*: array[0x824, uint8]
     memMode*: uint32
-    reserved828*: array[0x0C, uint8]
+    memModeToLdpcModePadding*: array[0x0C, uint8]
     ldpcMode*: uint32
-    reserved838*: array[0x3C, uint8]
+    ldpcModeToAgcGatePadding*: array[0x3C, uint8]
     agcMemGate*: uint32
-    reserved878*: array[0xAAC8, uint8]
+    agcGateToLdpcLoaderPadding*: array[0xAAC8, uint8]
     ldpcLoadAddress*: uint32
     ldpcLoadLength*: uint32
     ldpcLoadControl*: uint32
-    reservedB34c*: array[0x44, uint8]
+    ldpcLoaderToAgcLoadPadding*: array[0x44, uint8]
     agcLoad*: uint32
 
 static:
+  doAssert offsetof(BlePhyMemoryRegs, phyMemBaseToModePadding) == 0x000
   doAssert offsetof(BlePhyMemoryRegs, memMode) == 0x824
+  doAssert offsetof(BlePhyMemoryRegs, memModeToLdpcModePadding) == 0x828
   doAssert offsetof(BlePhyMemoryRegs, ldpcMode) == 0x834
+  doAssert offsetof(BlePhyMemoryRegs, ldpcModeToAgcGatePadding) == 0x838
   doAssert offsetof(BlePhyMemoryRegs, agcMemGate) == 0x874
+  doAssert offsetof(BlePhyMemoryRegs, agcGateToLdpcLoaderPadding) == 0x878
   doAssert offsetof(BlePhyMemoryRegs, ldpcLoadAddress) == 0xB340
   doAssert offsetof(BlePhyMemoryRegs, ldpcLoadLength) == 0xB344
   doAssert offsetof(BlePhyMemoryRegs, ldpcLoadControl) == 0xB348
+  doAssert offsetof(BlePhyMemoryRegs, ldpcLoaderToAgcLoadPadding) == 0xB34C
   doAssert offsetof(BlePhyMemoryRegs, agcLoad) == 0xB390
 
 template blePhyMemoryRegs(): ptr BlePhyMemoryRegs =
@@ -163,20 +168,24 @@ proc configureBleEm() =
 
 proc configureDigClock() =
   let digReg = GlbBase + 0x250'u32
-  var v = regRead(digReg.uint)
-  let dig32En = v and (1'u32 shl 12)
+  var digitalClockControl = regRead(digReg.uint)
+  let dig32En = digitalClockControl and (1'u32 shl 12)
 
-  v = v and not ((1'u32 shl 24) or (1'u32 shl 12))
-  regWrite(digReg.uint, v)
+  digitalClockControl =
+    digitalClockControl and not ((1'u32 shl 24) or (1'u32 shl 12))
+  regWrite(digReg.uint, digitalClockControl)
 
-  v = regRead(digReg.uint)
-  v = (v and not (3'u32 shl 28)) or (1'u32 shl 28)
-  regWrite(digReg.uint, v)
+  digitalClockControl = regRead(digReg.uint)
+  digitalClockControl =
+    (digitalClockControl and not (3'u32 shl 28)) or (1'u32 shl 28)
+  regWrite(digReg.uint, digitalClockControl)
 
-  v = regRead(digReg.uint)
-  v = v and not (0x7F'u32 shl 16)
-  v = v or (0x4E'u32 shl 16) or (1'u32 shl 25) or (1'u32 shl 24) or dig32En
-  regWrite(digReg.uint, v)
+  digitalClockControl = regRead(digReg.uint)
+  digitalClockControl = digitalClockControl and not (0x7F'u32 shl 16)
+  digitalClockControl =
+    digitalClockControl or (0x4E'u32 shl 16) or (1'u32 shl 25) or
+    (1'u32 shl 24) or dig32En
+  regWrite(digReg.uint, digitalClockControl)
 
 proc powerOnXtalWifiPll() =
   let hbnRsv3 = HbnBase + 0x10C'u32
@@ -325,27 +334,27 @@ type
   BleRfRegBlock {.packed.} = object
     baseCtrl0: uint32
     baseCtrl1: uint32
-    reserved008: array[5, uint32]
+    baseCtrlToCalCtrlPadding: array[5, uint32]
     calCtrl1c: uint32
     capability20: uint32
-    reserved024: array[2, uint32]
+    capabilityToSynthCtrlPadding: array[2, uint32]
     synthCtrl2c: uint32
     priModeCtrl30: uint32
-    reserved034: array[5, uint32]
+    priModeToRccalTonePadding: array[5, uint32]
     rccalTone48: uint32
-    reserved04c: array[3, uint32]
+    rccalToneToTxcalBiasPadding: array[3, uint32]
     txcalBias58: uint32
-    reserved05c: array[2, uint32]
+    txcalBiasToTxcalGainPadding: array[2, uint32]
     txcalGain64: uint32
     txcalGain68: uint32
     txcalDc6c: uint32
     txcalParam70: uint32
-    reserved074: array[3, uint32]
+    txcalParamToRbbRccalPadding: array[3, uint32]
     rbbRccalCtrl80: uint32
     rccalReplay84: uint32
     txcalDfe88: uint32
     calPathConfig8c: uint32
-    reserved090: array[4, uint32]
+    calPathToFcalPadding: array[4, uint32]
     fcalCtrlA0: uint32
     acalCtrlA4: uint32
     calResultA8: uint32
@@ -356,40 +365,40 @@ type
     channelFcalConfigBc: uint32
     sdmCtrlC0: uint32
     sdmDivC4: uint32
-    reserved0c8: uint32
+    sdmDivToRfPriBiasTrimPadding: uint32
     rfPriBiasTrimCc: uint32
     optimizeCtrlD0: uint32
     rfBiasTrimD4: uint32
-    reserved0d8: array[6, uint32]
+    rfBiasTrimToCalMixerStatePadding: array[6, uint32]
     calMixerStateF0: uint32
-    reserved0f4: array[18, uint32]
+    calMixerStateToVcoPairTablePadding: array[18, uint32]
     vcoPairTable13c: array[10, uint32]
     vcoPair2484Mhz164: uint32
     roscalCal0: uint32
     roscalCal1: uint32
-    reserved170: array[39, uint32]
+    roscalToCalSingenPadding: array[39, uint32]
     calSingenCtrl20c: uint32
-    reserved210: uint32
+    calSingenCtrlToAmpPadding: uint32
     calSingenAmpLo214: uint32
     calSingenAmpHi218: uint32
-    reserved21c: uint32
+    calSingenAmpToRxModePadding: uint32
     rxMode220: uint32
-    reserved224: array[6, uint32]
+    rxModeToCalDfePadding: array[6, uint32]
     calDfeGate23c: uint32
     calDfeState240: uint32
     calDfeState244: uint32
-    reserved248: array[238, uint32]
+    calDfeToTxcalTosdacPadding: array[238, uint32]
     txcalTosdac600: uint32
-    reserved604: array[2, uint32]
+    txcalTosdacToMeasurePrepPadding: array[2, uint32]
     calMeasurePrep60c: uint32
-    reserved610: array[2, uint32]
+    calMeasurePrepToMeasureCtrlPadding: array[2, uint32]
     measureCtrl618: uint32
     measureMode61c: uint32
     measureI620: uint32
     measureQ624: uint32
 
   BleRfDfeInitBlock {.packed.} = object
-    reserved000: array[12, uint32]
+    dfeInitBaseToHbnCtrlPadding: array[12, uint32]
     hbnCtrl30: uint32
 
 const
@@ -553,20 +562,27 @@ const
   BleLdpcInitWords = 190
 
 static:
+  doAssert offsetof(BleRfRegBlock, baseCtrlToCalCtrlPadding) == 0x08
   doAssert offsetof(BleRfRegBlock, baseCtrl1) == 0x04
+  doAssert offsetof(BleRfRegBlock, capabilityToSynthCtrlPadding) == 0x24
   doAssert offsetof(BleRfRegBlock, calCtrl1c) == 0x1C
   doAssert offsetof(BleRfRegBlock, capability20) == 0x20
   doAssert offsetof(BleRfRegBlock, synthCtrl2c) == 0x2C
   doAssert offsetof(BleRfRegBlock, priModeCtrl30) == 0x30
+  doAssert offsetof(BleRfRegBlock, priModeToRccalTonePadding) == 0x34
   doAssert offsetof(BleRfRegBlock, rccalTone48) == 0x48
+  doAssert offsetof(BleRfRegBlock, rccalToneToTxcalBiasPadding) == 0x4C
   doAssert offsetof(BleRfRegBlock, txcalBias58) == 0x58
+  doAssert offsetof(BleRfRegBlock, txcalBiasToTxcalGainPadding) == 0x5C
   doAssert offsetof(BleRfRegBlock, txcalGain64) == 0x64
   doAssert offsetof(BleRfRegBlock, txcalGain68) == 0x68
   doAssert offsetof(BleRfRegBlock, txcalParam70) == 0x70
+  doAssert offsetof(BleRfRegBlock, txcalParamToRbbRccalPadding) == 0x74
   doAssert offsetof(BleRfRegBlock, rbbRccalCtrl80) == 0x80
   doAssert offsetof(BleRfRegBlock, txcalDfe88) == 0x88
   doAssert offsetof(BleRfRegBlock, rccalReplay84) == 0x84
   doAssert offsetof(BleRfRegBlock, calPathConfig8c) == 0x8C
+  doAssert offsetof(BleRfRegBlock, calPathToFcalPadding) == 0x90
   doAssert offsetof(BleRfRegBlock, fcalCtrlA0) == 0xA0
   doAssert offsetof(BleRfRegBlock, acalCtrlA4) == 0xA4
   doAssert offsetof(BleRfRegBlock, calResultA8) == 0xA8
@@ -577,23 +593,34 @@ static:
   doAssert offsetof(BleRfRegBlock, channelFcalConfigBc) == 0xBC
   doAssert offsetof(BleRfRegBlock, sdmCtrlC0) == 0xC0
   doAssert offsetof(BleRfRegBlock, sdmDivC4) == 0xC4
+  doAssert offsetof(BleRfRegBlock, sdmDivToRfPriBiasTrimPadding) == 0xC8
   doAssert offsetof(BleRfRegBlock, rfPriBiasTrimCc) == 0xCC
   doAssert offsetof(BleRfRegBlock, optimizeCtrlD0) == 0xD0
   doAssert offsetof(BleRfRegBlock, rfBiasTrimD4) == 0xD4
+  doAssert offsetof(BleRfRegBlock, rfBiasTrimToCalMixerStatePadding) == 0xD8
   doAssert offsetof(BleRfRegBlock, calMixerStateF0) == 0xF0
+  doAssert offsetof(BleRfRegBlock, calMixerStateToVcoPairTablePadding) == 0xF4
   doAssert offsetof(BleRfRegBlock, vcoPairTable13c) == 0x13C
   doAssert offsetof(BleRfRegBlock, vcoPair2484Mhz164) == 0x164
+  doAssert offsetof(BleRfRegBlock, roscalToCalSingenPadding) == 0x170
   doAssert offsetof(BleRfRegBlock, calSingenCtrl20c) == 0x20C
+  doAssert offsetof(BleRfRegBlock, calSingenCtrlToAmpPadding) == 0x210
   doAssert offsetof(BleRfRegBlock, calSingenAmpLo214) == 0x214
   doAssert offsetof(BleRfRegBlock, calSingenAmpHi218) == 0x218
+  doAssert offsetof(BleRfRegBlock, calSingenAmpToRxModePadding) == 0x21C
   doAssert offsetof(BleRfRegBlock, rxMode220) == 0x220
+  doAssert offsetof(BleRfRegBlock, rxModeToCalDfePadding) == 0x224
   doAssert offsetof(BleRfRegBlock, calDfeGate23c) == 0x23C
   doAssert offsetof(BleRfRegBlock, calDfeState240) == 0x240
   doAssert offsetof(BleRfRegBlock, calDfeState244) == 0x244
+  doAssert offsetof(BleRfRegBlock, calDfeToTxcalTosdacPadding) == 0x248
   doAssert offsetof(BleRfRegBlock, txcalTosdac600) == 0x600
+  doAssert offsetof(BleRfRegBlock, txcalTosdacToMeasurePrepPadding) == 0x604
   doAssert offsetof(BleRfRegBlock, calMeasurePrep60c) == 0x60C
+  doAssert offsetof(BleRfRegBlock, calMeasurePrepToMeasureCtrlPadding) == 0x610
   doAssert offsetof(BleRfRegBlock, measureCtrl618) == 0x618
   doAssert offsetof(BleRfRegBlock, measureMode61c) == 0x61C
+  doAssert offsetof(BleRfDfeInitBlock, dfeInitBaseToHbnCtrlPadding) == 0x00
   doAssert offsetof(BleRfDfeInitBlock, hbnCtrl30) == 0x30
 
 template bleRfRegs(): ptr BleRfRegBlock =
@@ -929,24 +956,27 @@ proc settleBleRfCalibrationLatches(iterations: int = 8) =
     bleRfDelayUs(10)
   serviceBleRfCalibrationLatch()
 
-proc writeBleMemoryWords(base: uint32, words: openArray[uint32]) =
-  for i, word in words:
-    regWrite((base + uint32(i) * 4'u32).uint, word)
+proc writeBleMemoryWords(memoryBaseAddress: uint32, words: openArray[uint32]) =
+  for memoryWordIndex, memoryWordValue in words:
+    regWrite((memoryBaseAddress + uint32(memoryWordIndex) * 4'u32).uint,
+             memoryWordValue)
 
-proc writeBleMemoryWords(base: uint32, words: openArray[uint32], count: int) =
-  let limit = min(count, words.len)
-  for i in 0 ..< limit:
-    regWrite((base + uint32(i) * 4'u32).uint, words[i])
+proc writeBleMemoryWords(memoryBaseAddress: uint32, words: openArray[uint32],
+                         count: int) =
+  let memoryWordCount = min(count, words.len)
+  for memoryWordIndex in 0 ..< memoryWordCount:
+    regWrite((memoryBaseAddress + uint32(memoryWordIndex) * 4'u32).uint,
+             words[memoryWordIndex])
 
-proc clearBleMemoryWords(base: uint32, count: int) =
-  for i in 0 ..< count:
-    regWrite((base + uint32(i) * 4'u32).uint, 0'u32)
+proc clearBleMemoryWords(memoryBaseAddress: uint32, count: int) =
+  for memoryWordIndex in 0 ..< count:
+    regWrite((memoryBaseAddress + uint32(memoryWordIndex) * 4'u32).uint, 0'u32)
 
 var nim_ble_rf_tune_count* {.exportc.}: uint32
 var nim_ble_rf_last_channel_mhz* {.exportc.}: uint32
-var nim_ble_rf_last_notch_word* {.exportc.}: uint32
+var nim_ble_rf_last_notch_control* {.exportc: "nim_ble_rf_last_notch_word".}: uint32
 var nim_ble_rf_optimize_count* {.exportc.}: uint32
-var nim_ble_rf_last_optimize_word* {.exportc.}: uint32
+var nim_ble_rf_last_optimize_control* {.exportc: "nim_ble_rf_last_optimize_word".}: uint32
 var nim_ble_rf_init_count* {.exportc.}: uint32
 var nim_ble_wifi_rf_dirty_epoch* {.exportc.}: uint32
 var nim_ble_wifi_rf_reclaimed_epoch* {.exportc.}: uint32
@@ -995,8 +1025,8 @@ var nim_ble_rf_last_txcal_amp* {.exportc.}: uint32
 var nim_ble_rf_last_txcal_amp_mean* {.exportc.}: uint32
 var nim_ble_rf_last_txcal_tmxcs* {.exportc.}: uint32
 var nim_ble_rf_last_txcal_tmxcs_power* {.exportc.}: uint32
-var nim_ble_rf_last_txcal_word0* {.exportc.}: uint32
-var nim_ble_rf_last_txcal_word1* {.exportc.}: uint32
+var lastBleRfTxcalRecordWord0* {.exportc: "nim_ble_rf_last_txcal_word0".}: uint32
+var lastBleRfTxcalRecordWord1* {.exportc: "nim_ble_rf_last_txcal_word1".}: uint32
 var nim_ble_rf_last_vco_113c* {.exportc.}: uint32
 var nim_ble_rf_last_vco_1164* {.exportc.}: uint32
 var nim_ble_rf_fcal_search_log* {.exportc.}: array[16, uint32]
@@ -1004,33 +1034,34 @@ var nim_ble_rf_roscal_search_log* {.exportc.}: array[16, uint32]
 var nim_ble_rf_roscal_raw_log* {.exportc.}: array[16, uint32]
 var nim_ble_rf_rccal_search_log* {.exportc.}: array[16, uint32]
 var nim_ble_rf_rccal_power_log* {.exportc.}: array[16, uint32]
-var nim_ble_rf_txcal_word0_log* {.exportc.}: array[BleRfTxcalSearchRecords, uint32]
-var nim_ble_rf_txcal_word1_log* {.exportc.}: array[BleRfTxcalSearchRecords, uint32]
+var bleRfTxcalRecordWord0Log* {.exportc: "nim_ble_rf_txcal_word0_log".}: array[BleRfTxcalSearchRecords, uint32]
+var bleRfTxcalRecordWord1Log* {.exportc: "nim_ble_rf_txcal_word1_log".}: array[BleRfTxcalSearchRecords, uint32]
 var nim_ble_rf_txcal_power_log* {.exportc.}: array[BleRfTxcalSearchRecords, uint32]
 var nim_ble_rf_txcal_amp_log* {.exportc.}: array[BleRfTxcalSearchRecords, uint32]
 var nim_ble_rf_txcal_tmxcs_power_log* {.exportc.}: array[BleRfTxcalMixerCsCount, uint32]
 
-proc rfLoFcal(word: uint16): uint16 {.inline.} =
-  word and 0x00FF'u16
+proc rfLoFcal(packedLoCalibration: uint16): uint16 {.inline.} =
+  packedLoCalibration and 0x00FF'u16
 
-proc rfLoAcal(word: uint16): uint16 {.inline.} =
-  (word shr 8) and 0x001F'u16
+proc rfLoAcal(packedLoCalibration: uint16): uint16 {.inline.} =
+  (packedLoCalibration shr 8) and 0x001F'u16
 
-proc setRfLoFcal(index: int, fcal: uint16) =
-  let value = (bleRfCalibData.lo[index] and 0xFF00'u16) or (fcal and 0x00FF'u16)
-  bleRfCalibData.lo[index] = value
+proc setRfLoFcal(loChannelIndex: int, fcal: uint16) =
+  let packedLoCalibrationHalfword =
+    (bleRfCalibData.lo[loChannelIndex] and 0xFF00'u16) or (fcal and 0x00FF'u16)
+  bleRfCalibData.lo[loChannelIndex] = packedLoCalibrationHalfword
 
-proc setRfLoAcal(index: int, acal: uint16) =
-  let value = (bleRfCalibData.lo[index] and 0xE0FF'u16) or
+proc setRfLoAcal(loChannelIndex: int, acal: uint16) =
+  let packedLoCalibrationHalfword = (bleRfCalibData.lo[loChannelIndex] and 0xE0FF'u16) or
     ((acal and 0x001F'u16) shl 8)
-  bleRfCalibData.lo[index] = value
+  bleRfCalibData.lo[loChannelIndex] = packedLoCalibrationHalfword
 
 proc resetBleRfCalibData() =
   bleRfCalibData = default(BleRfCalibData)
   bleRfCalibData.inited = 1
-  for i in 0 ..< BleRfLoChannelCount:
-    bleRfChannelFcalTable[i] = 0
-    bleRfChannelAcalTable[i] = 0
+  for loChannelIndex in 0 ..< BleRfLoChannelCount:
+    bleRfChannelFcalTable[loChannelIndex] = 0
+    bleRfChannelAcalTable[loChannelIndex] = 0
 
 proc saveBleRfPriCalState(): BleRfPriCalState =
   let rf = bleRfRegs()
@@ -1149,23 +1180,23 @@ proc chooseBleRfBaseFcalCode(): uint16 =
   var code = 0x80'u16
   var logIndex = 0
   for _ in 0 ..< 4:
-    var bit = 0x40'u16
-    while bit != 0:
+    var fcalSearchStep = 0x40'u16
+    while fcalSearchStep != 0:
       writeBleRfFcalCode(code)
       bleRfDelayUs(100)
       let count = sampleBleRfFcalCount()
       if logIndex < nim_ble_rf_fcal_search_log.len:
         nim_ble_rf_fcal_search_log[logIndex] =
-          (uint32(code) shl 24) or (uint32(bit) shl 16) or uint32(count)
+          (uint32(code) shl 24) or (uint32(fcalSearchStep) shl 16) or uint32(count)
         inc logIndex
       if count < BleRfLoFcalLowCount:
-        code = uint16((uint32(code) - uint32(bit)) and 0x00FF'u32)
+        code = uint16((uint32(code) - uint32(fcalSearchStep)) and 0x00FF'u32)
       elif count > BleRfLoFcalHighCount:
-        code = uint16((uint32(code) + uint32(bit)) and 0x00FF'u32)
+        code = uint16((uint32(code) + uint32(fcalSearchStep)) and 0x00FF'u32)
       else:
-        bit = 0
+        fcalSearchStep = 0
         break
-      bit = bit shr 1
+      fcalSearchStep = fcalSearchStep shr 1
     if code >= 15'u16 and code <= 240'u16:
       return code
     regClear32(BleRfSdm1Reg, 0x00010000'u32)
@@ -1210,17 +1241,18 @@ proc runBleRfPriLoFcal() =
       (uint32(baseCode) shl 24) or (uint32(measuredLen) shl 16) or
         uint32(measured[min(measuredLen - 1, measured.high)])
 
-  for i in 0 ..< BleRfLoChannelCount:
-    var offset = 0
-    while offset < measuredLen and measured[offset] < BleRfChannelCntTable40M[i]:
-      inc offset
-    var fcal = int(baseCode) + 2 - offset
+  for loChannelIndex in 0 ..< BleRfLoChannelCount:
+    var channelCountCrossingIndex = 0
+    while channelCountCrossingIndex < measuredLen and
+        measured[channelCountCrossingIndex] < BleRfChannelCntTable40M[loChannelIndex]:
+      inc channelCountCrossingIndex
+    var fcal = int(baseCode) + 2 - channelCountCrossingIndex
     if fcal < 0:
       fcal = 0
     elif fcal > 255:
       fcal = 255
-    setRfLoFcal(i, uint16(fcal))
-    bleRfChannelFcalTable[i] = uint16(fcal)
+    setRfLoFcal(loChannelIndex, uint16(fcal))
+    bleRfChannelFcalTable[loChannelIndex] = uint16(fcal)
 
   restoreBleRfPriCalState(saved)
   regOr(BleRfCalModeReg, 0x00000030'u32)
@@ -1246,23 +1278,23 @@ proc runBleRfPriLoAcal() =
   let saved = saveBleRfPriCalState()
   prepareBleRfPriLoAcal()
 
-  for i in 0 ..< BleRfLoChannelCount:
+  for loChannelIndex in 0 ..< BleRfLoChannelCount:
     regUpdate(BleRfAcalCtrlReg, 0x00000700'u32, 0x00000400'u32)
     regUpdate(BleRfFcalCtrlReg, 0x001F0000'u32, 0x00100000'u32)
-    writeBleRfFcalCode(rfLoFcal(bleRfCalibData.lo[i]))
-    regWrite(BleRfSdm2Reg.uint, BleRfChannelDivTable40M[i])
+    writeBleRfFcalCode(rfLoFcal(bleRfCalibData.lo[loChannelIndex]))
+    regWrite(BleRfSdm2Reg.uint, BleRfChannelDivTable40M[loChannelIndex])
     bleRfDelayUs(1)
 
     var acal = 0x10'u16
-    var bit = 0x08'u16
-    while bit != 0'u16:
+    var acalSearchStep = 0x08'u16
+    while acalSearchStep != 0'u16:
       writeBleRfAcalCode(acal)
       bleRfDelayUs(1)
       if (regRead(BleRfAcalCtrlReg.uint) and BleRfAcalComparatorMask) == 0'u32:
-        acal = uint16((uint32(acal) + uint32(bit)) and 0xFFFF'u32)
+        acal = uint16((uint32(acal) + uint32(acalSearchStep)) and 0xFFFF'u32)
       else:
-        acal = uint16((uint32(acal) - uint32(bit)) and 0xFFFF'u32)
-      bit = bit shr 1
+        acal = uint16((uint32(acal) - uint32(acalSearchStep)) and 0xFFFF'u32)
+      acalSearchStep = acalSearchStep shr 1
 
     writeBleRfAcalCode(acal)
     bleRfDelayUs(1)
@@ -1270,18 +1302,18 @@ proc runBleRfPriLoAcal() =
         acal <= 30'u16:
       inc acal
     acal = acal and 0x001F'u16
-    setRfLoAcal(i, acal)
-    bleRfChannelAcalTable[i] = acal
+    setRfLoAcal(loChannelIndex, acal)
+    bleRfChannelAcalTable[loChannelIndex] = acal
 
   restoreBleRfPriCalState(saved)
   regOr(BleRfCalModeReg, 0x000000C0'u32)
   nim_ble_rf_last_lo_acal = rfLoAcal(bleRfCalibData.lo[BleRfLoChannelCount - 1])
 
-proc signedBleRfMeasurement(word: uint32): int32 {.inline.} =
+proc signedBleRfMeasurement(measurementWord: uint32): int32 {.inline.} =
   ## Vendor ROS calibration uses th.ext(sample, sample, 0x18, 0): signed
   ## extract of the low 25-bit ADC measurement field.
-  result = int32(word and 0x01FF_FFFF'u32)
-  if (word and 0x0100_0000'u32) != 0'u32:
+  result = int32(measurementWord and 0x01FF_FFFF'u32)
+  if (measurementWord and 0x0100_0000'u32) != 0'u32:
     result = result - 0x0200_0000'i32
 
 proc waitBleRfRoscalMeasurementReady(): bool =
@@ -1293,15 +1325,15 @@ proc waitBleRfRoscalMeasurementReady(): bool =
   false
 
 proc writeBleRfRoscalCandidate(iBranch: bool, code: uint32) =
-  let value = code and BleRfRoscalCodeMask
+  let maskedRoscalCode = code and BleRfRoscalCodeMask
   if iBranch:
-    regUpdate(BleRfRoscalCtrlReg, BleRfRoscalIRegMask, value shl 8)
+    regUpdate(BleRfRoscalCtrlReg, BleRfRoscalIRegMask, maskedRoscalCode shl 8)
   else:
-    regUpdate(BleRfRoscalCtrlReg, BleRfRoscalQRegMask, value)
+    regUpdate(BleRfRoscalCtrlReg, BleRfRoscalQRegMask, maskedRoscalCode)
 
 type
   BleRfRoscalSample = object
-    raw: uint32
+    measurementWord: uint32
     signed: int32
 
 proc sampleBleRfRoscalMeasurement(iBranch: bool): BleRfRoscalSample =
@@ -1313,39 +1345,40 @@ proc sampleBleRfRoscalMeasurement(iBranch: bool): BleRfRoscalSample =
   discard waitBleRfRoscalMeasurementReady()
   let sampleReg =
     if iBranch: BleRfMeasureIReg else: BleRfMeasureQReg
-  result.raw = regRead(sampleReg.uint)
-  result.signed = signedBleRfMeasurement(result.raw)
+  result.measurementWord = regRead(sampleReg.uint)
+  result.signed = signedBleRfMeasurement(result.measurementWord)
   if iBranch:
-    nim_ble_rf_last_roscal_raw_i = result.raw
+    nim_ble_rf_last_roscal_raw_i = result.measurementWord
   else:
-    nim_ble_rf_last_roscal_raw_q = result.raw
+    nim_ble_rf_last_roscal_raw_q = result.measurementWord
   regClear32(BleRfMeasureCtrlReg, BleRfMeasureTriggerClearMask)
 
-proc logBleRfRoscalSearch(index: var int, iBranch: bool, code: uint32,
+proc logBleRfRoscalSearch(roscalSearchLogSlotIndex: var int, iBranch: bool,
+                          code: uint32,
                           sample: BleRfRoscalSample) =
-  if index < nim_ble_rf_roscal_search_log.len:
+  if roscalSearchLogSlotIndex < nim_ble_rf_roscal_search_log.len:
     let branchBit =
       if iBranch: 0x80000000'u32 else: 0'u32
     let sampleBits = uint32(sample.signed) and 0x0000FFFF'u32
-    nim_ble_rf_roscal_search_log[index] =
+    nim_ble_rf_roscal_search_log[roscalSearchLogSlotIndex] =
       branchBit or ((code and BleRfRoscalCodeMask) shl 16) or sampleBits
-    nim_ble_rf_roscal_raw_log[index] = sample.raw
-    inc index
+    nim_ble_rf_roscal_raw_log[roscalSearchLogSlotIndex] = sample.measurementWord
+    inc roscalSearchLogSlotIndex
 
 proc chooseBleRfRoscalCode(iBranch: bool): uint8 =
   var code = 0'u32
-  var bit = 32'u32
+  var roscalSearchStep = 32'u32
   var logIndex =
     if iBranch: 0 else: 8
 
   for _ in 0 ..< 6:
-    let candidate = (code + bit) and BleRfRoscalCodeMask
+    let candidate = (code + roscalSearchStep) and BleRfRoscalCodeMask
     writeBleRfRoscalCandidate(iBranch, candidate)
     let sample = sampleBleRfRoscalMeasurement(iBranch)
     logBleRfRoscalSearch(logIndex, iBranch, candidate, sample)
     if sample.signed > 0:
       code = candidate
-    bit = bit shr 1
+    roscalSearchStep = roscalSearchStep shr 1
 
   var history = 0'u32
   for attempt in 0 ..< 63:
@@ -1369,11 +1402,12 @@ proc chooseBleRfRoscalCode(iBranch: bool): uint8 =
 proc applyBleRfRoscalCodes(iCode, qCode: uint32) =
   let iBits = iCode and BleRfRoscalCodeMask
   let qBits = qCode and BleRfRoscalCodeMask
-  for entry in 0 ..< 4:
-    let wordIndex = entry * 2
-    var word = bleRfCalibData.rxcal[wordIndex]
-    word = (word and not 0x00000FFF'u32) or iBits or (qBits shl 6)
-    bleRfCalibData.rxcal[wordIndex] = word
+  for rxcalRecordIndex in 0 ..< 4:
+    let rxcalRecordBaseWordIndex = rxcalRecordIndex * 2
+    var rxcalRecordWord = bleRfCalibData.rxcal[rxcalRecordBaseWordIndex]
+    rxcalRecordWord =
+      (rxcalRecordWord and not 0x00000FFF'u32) or iBits or (qBits shl 6)
+    bleRfCalibData.rxcal[rxcalRecordBaseWordIndex] = rxcalRecordWord
 
   let packed = iBits or (qBits shl 8) or (iBits shl 16) or (qBits shl 24)
   regWrite(BleRfRoscalReg0.uint,
@@ -1443,11 +1477,11 @@ proc startBleRfPriRxDfeForCal() =
            (regRead(BleRfRxModeReg.uint) and not 0x00000060'u32) or
            0x00000061'u32)
 
-proc signedBleRfPowerMeasurement(word: uint32): int32 {.inline.} =
+proc signedBleRfPowerMeasurement(measurementWord: uint32): int32 {.inline.} =
   ## RCCAL power accumulation uses the signed 16-bit sample in bits 24:9.
-  let sample = (word shr 9) and 0x0000FFFF'u32
-  result = int32(sample)
-  if (sample and 0x00008000'u32) != 0'u32:
+  let signedPowerSample = (measurementWord shr 9) and 0x0000FFFF'u32
+  result = int32(signedPowerSample)
+  if (signedPowerSample and 0x00008000'u32) != 0'u32:
     result = result - 0x00010000'i32
 
 proc waitBleRfRccalMeasurementReady(): bool =
@@ -1459,13 +1493,13 @@ proc waitBleRfRccalMeasurementReady(): bool =
   false
 
 proc squareSample(sample: int32): uint64 {.inline.} =
-  let value = int64(sample)
-  uint64(value * value)
+  let signedSample = int64(sample)
+  uint64(signedSample * signedSample)
 
-proc signedBleRfAverageMeasurement(word: uint32): int32 {.inline.} =
-  let sample = word and 0x01FF_FFFF'u32
-  result = int32(sample)
-  if (sample and 0x0100_0000'u32) != 0'u32:
+proc signedBleRfAverageMeasurement(measurementWord: uint32): int32 {.inline.} =
+  let signedAverageSample = measurementWord and 0x01FF_FFFF'u32
+  result = int32(signedAverageSample)
+  if (signedAverageSample and 0x0100_0000'u32) != 0'u32:
     result = result - 0x0200_0000'i32
 
 proc saturatingUint32(value: uint64): uint32 {.inline.} =
@@ -1505,21 +1539,25 @@ proc primeBleRfRccalPowerMeasurement() =
   regClear32(BleRfMeasureCtrlReg, BleRfMeasureRccalTriggerMask)
 
 proc writeBleRfRccalCode(code: uint32) =
-  let value = code and BleRfRccalCodeMask
-  let packed = value or (value shl 8) or (value shl 16) or (value shl 24)
+  let maskedRccalCode = code and BleRfRccalCodeMask
+  let packedRccalLaneWord = maskedRccalCode or (maskedRccalCode shl 8) or
+    (maskedRccalCode shl 16) or (maskedRccalCode shl 24)
   regWrite(BleRfRbbRccalReg.uint,
            (regRead(BleRfRbbRccalReg.uint) and BleRfRccalRegisterKeepMask) or
-           packed)
+           packedRccalLaneWord)
   bleRfCalibData.rxcal[2] =
     (bleRfCalibData.rxcal[2] and not 0x00FF_FFFF'u32) or
-    value or (value shl 6) or (value shl 12) or (value shl 18)
+    maskedRccalCode or (maskedRccalCode shl 6) or
+    (maskedRccalCode shl 12) or (maskedRccalCode shl 18)
 
 proc writeBleRfRccalSearchCode(code: uint32) =
-  let value = code and BleRfRccalCodeMask
-  var word = regRead(BleRfRbbRccalReg.uint)
-  word = (word and 0xC0FF_FFFF'u32) or (value shl 24)
-  word = (word and 0xFFFF_C0FF'u32) or (value shl 8)
-  regWrite(BleRfRbbRccalReg.uint, word)
+  let maskedRccalSearchCode = code and BleRfRccalCodeMask
+  var rbbRccalControl = regRead(BleRfRbbRccalReg.uint)
+  rbbRccalControl =
+    (rbbRccalControl and 0xC0FF_FFFF'u32) or (maskedRccalSearchCode shl 24)
+  rbbRccalControl =
+    (rbbRccalControl and 0xFFFF_C0FF'u32) or (maskedRccalSearchCode shl 8)
+  regWrite(BleRfRbbRccalReg.uint, rbbRccalControl)
 
 proc prepareBleRfPriRccal() =
   regClear32(BleRfCtrlReg, BleRfCtrlTuneEnableMask)
@@ -1588,17 +1626,18 @@ proc prepareBleRfPriRccalTone() =
            (regRead(BleRfMeasureCtrlReg.uint) and 0xFFF00000'u32) or
            BleRfRccalToneMeasureCtrl)
 
-proc logBleRfRccalSearch(index: var int, code, power: uint32) =
-  if index < nim_ble_rf_rccal_search_log.len:
-    nim_ble_rf_rccal_search_log[index] =
+proc logBleRfRccalSearch(rccalSearchLogSlotIndex: var int, code,
+                         power: uint32) =
+  if rccalSearchLogSlotIndex < nim_ble_rf_rccal_search_log.len:
+    nim_ble_rf_rccal_search_log[rccalSearchLogSlotIndex] =
       ((code and BleRfRccalCodeMask) shl 24) or (power and 0x00FF_FFFF'u32)
-    nim_ble_rf_rccal_power_log[index] = power
-    inc index
+    nim_ble_rf_rccal_power_log[rccalSearchLogSlotIndex] = power
+    inc rccalSearchLogSlotIndex
 
 proc chooseBleRfRccalCode(): tuple[ok: bool, code: uint32] =
-  for i in 0 ..< nim_ble_rf_rccal_search_log.len:
-    nim_ble_rf_rccal_search_log[i] = 0
-    nim_ble_rf_rccal_power_log[i] = 0
+  for rccalSearchLogSlotIndex in 0 ..< nim_ble_rf_rccal_search_log.len:
+    nim_ble_rf_rccal_search_log[rccalSearchLogSlotIndex] = 0
+    nim_ble_rf_rccal_power_log[rccalSearchLogSlotIndex] = 0
 
   primeBleRfRccalPowerMeasurement()
   let baseline = sampleBleRfRccalPower()
@@ -1617,21 +1656,21 @@ proc chooseBleRfRccalCode(): tuple[ok: bool, code: uint32] =
 
   var logIndex = 0
   var code = 0'u32
-  var bit = 0x20'u32
+  var rccalSearchStep = 0x20'u32
   var lastMeasuredCode = BleRfRccalBaselineCode
   var lastMeasuredPower = baseline
 
   prepareBleRfPriRccalTone()
 
   for _ in 0 ..< 6:
-    let candidate = (code + bit) and BleRfRccalCodeMask
+    let candidate = (code + rccalSearchStep) and BleRfRccalCodeMask
     writeBleRfRccalSearchCode(candidate)
     bleRfDelayUs(1)
     let power = sampleBleRfRccalPower()
     lastMeasuredCode = candidate
     lastMeasuredPower = power
     logBleRfRccalSearch(logIndex, candidate, power)
-    if bit == BleRfRccalBaselineCode and
+    if rccalSearchStep == BleRfRccalBaselineCode and
         baseline < BleRfRccalMinReferencePower and
         power > BleRfRccalMinReferencePower:
       target = (uint64(power) * BleRfRccalFallbackTargetNumerator) div
@@ -1639,7 +1678,7 @@ proc chooseBleRfRccalCode(): tuple[ok: bool, code: uint32] =
       nim_ble_rf_last_rccal_target = saturatingUint32(target)
     if power != 0'u32 and uint64(power) > target:
       code = candidate
-    bit = bit shr 1
+    rccalSearchStep = rccalSearchStep shr 1
 
   var history = 0'u32
   var ok = false
@@ -1765,9 +1804,11 @@ proc clampBleRfTxcalAmp(value: int32): uint32 {.inline.} =
     uint32(value)
 
 proc writeBleRfTxcalSingenAmplitude(amp: uint32) =
-  let value = amp and BleRfTxcalSingenAmplitudeMask
-  regUpdate(BleRfPriRccalSingenReg1, BleRfTxcalSingenAmplitudeMask, value)
-  regUpdate(BleRfPriRccalSingenReg2, BleRfTxcalSingenAmplitudeMask, value)
+  let maskedTxcalSingenAmplitude = amp and BleRfTxcalSingenAmplitudeMask
+  regUpdate(BleRfPriRccalSingenReg1, BleRfTxcalSingenAmplitudeMask,
+            maskedTxcalSingenAmplitude)
+  regUpdate(BleRfPriRccalSingenReg2, BleRfTxcalSingenAmplitudeMask,
+            maskedTxcalSingenAmplitude)
   regClear32(BleRfPriRccalSingenReg0, 0x80000000'u32)
   regOr(BleRfPriRccalSingenReg0, 0x80000000'u32)
   startBleRfPriTxDfeForCal()
@@ -1923,26 +1964,31 @@ proc searchBleRfTxcalParam(paramInd: uint32, center, delta: int32,
   else:
     (false, bestValue, 0'u32)
 
-proc packBleRfTxcalWord0(p0, p1, p2: int32): uint32 {.inline.} =
-  (uint32(clampBleRfTxcalParam(0'u32, p0)) and 0x3F'u32) or
-    ((uint32(clampBleRfTxcalParam(1'u32, p1)) and 0x3F'u32) shl 6) or
-    ((uint32(clampBleRfTxcalParam(2'u32, p2)) and 0x7FF'u32) shl 12)
+proc packBleRfTxcalWord0(txcalParam0, txcalParam1,
+                         txcalParam2: int32): uint32 {.inline.} =
+  (uint32(clampBleRfTxcalParam(0'u32, txcalParam0)) and 0x3F'u32) or
+    ((uint32(clampBleRfTxcalParam(1'u32, txcalParam1)) and 0x3F'u32) shl 6) or
+    ((uint32(clampBleRfTxcalParam(2'u32, txcalParam2)) and 0x7FF'u32) shl 12)
 
-proc packBleRfTxcalWord1(p3: int32): uint32 {.inline.} =
-  encodeBleRfTxcalParam3(p3)
+proc packBleRfTxcalWord1(txcalParam3: int32): uint32 {.inline.} =
+  encodeBleRfTxcalParam3(txcalParam3)
 
-proc storeBleRfTxcalRecord(index: int, p0, p1, p2, p3: int32, power: uint32) =
-  let word0 = packBleRfTxcalWord0(p0, p1, p2)
-  let word1 = packBleRfTxcalWord1(p3)
-  let base = index * 2
-  bleRfCalibData.txcal[base] = word0
-  bleRfCalibData.txcal[base + 1] = word1
-  nim_ble_rf_last_txcal_word0 = word0
-  nim_ble_rf_last_txcal_word1 = word1
-  if index >= 0 and index < BleRfTxcalSearchRecords:
-    nim_ble_rf_txcal_word0_log[index] = word0
-    nim_ble_rf_txcal_word1_log[index] = word1
-    nim_ble_rf_txcal_power_log[index] = power
+proc storeBleRfTxcalRecord(txcalRecordIndex: int,
+                           txcalParam0, txcalParam1: int32;
+                           txcalParam2, txcalParam3: int32,
+                           power: uint32) =
+  let packedParamWord0 =
+    packBleRfTxcalWord0(txcalParam0, txcalParam1, txcalParam2)
+  let packedParamWord1 = packBleRfTxcalWord1(txcalParam3)
+  let txcalRecordBaseWordIndex = txcalRecordIndex * 2
+  bleRfCalibData.txcal[txcalRecordBaseWordIndex] = packedParamWord0
+  bleRfCalibData.txcal[txcalRecordBaseWordIndex + 1] = packedParamWord1
+  lastBleRfTxcalRecordWord0 = packedParamWord0
+  lastBleRfTxcalRecordWord1 = packedParamWord1
+  if txcalRecordIndex >= 0 and txcalRecordIndex < BleRfTxcalSearchRecords:
+    bleRfTxcalRecordWord0Log[txcalRecordIndex] = packedParamWord0
+    bleRfTxcalRecordWord1Log[txcalRecordIndex] = packedParamWord1
+    nim_ble_rf_txcal_power_log[txcalRecordIndex] = power
 
 proc configureBleRfPriTxcalGain(param: array[5, uint32]) =
   regWrite(BleRfTxcalGain64Reg.uint,
@@ -2018,27 +2064,31 @@ proc runBleRfPriTxcal() =
   prepareBleRfPriTxcal()
 
   var allOk = true
-  for i in 0 ..< BleRfTxcalSearchRecords:
-    configureBleRfPriTxcalGain(BleRfPriTxcalParams[i])
+  for txcalRecordIndex in 0 ..< BleRfTxcalSearchRecords:
+    configureBleRfPriTxcalGain(BleRfPriTxcalParams[txcalRecordIndex])
     let amp = tuneBleRfTxcalSingenPower(BleRfTxcalGainAmp,
                                         BleRfTxcalGainAdcMax,
                                         BleRfTxcalGainAdcMin)
-    if i >= 0 and i < nim_ble_rf_txcal_amp_log.len:
-      nim_ble_rf_txcal_amp_log[i] = amp
+    if txcalRecordIndex >= 0 and txcalRecordIndex < nim_ble_rf_txcal_amp_log.len:
+      nim_ble_rf_txcal_amp_log[txcalRecordIndex] = amp
 
-    let p0a = searchBleRfTxcalParam(0'u32, 0x20'i32, 0x10'i32, 0x3D'u32)
-    let p1a = searchBleRfTxcalParam(1'u32, 0x20'i32, 0x10'i32, 0x3D'u32)
-    let p0b = searchBleRfTxcalParam(0'u32, p0a.value, 0x08'i32, 0x3D'u32)
-    let p1b = searchBleRfTxcalParam(1'u32, p1a.value, 0x08'i32, 0x3D'u32)
-    let p2a = searchBleRfTxcalParam(2'u32, 0x400'i32, 0x80'i32, 0x7A'u32)
-    let p3a = searchBleRfTxcalParam(3'u32, 0'i32, 0x40'i32, 0x7A'u32)
-    let p2b = searchBleRfTxcalParam(2'u32, p2a.value, 0x40'i32, 0x7A'u32)
-    let p3b = searchBleRfTxcalParam(3'u32, p3a.value, 0x20'i32, 0x7A'u32)
+    let param0Coarse = searchBleRfTxcalParam(0'u32, 0x20'i32, 0x10'i32, 0x3D'u32)
+    let param1Coarse = searchBleRfTxcalParam(1'u32, 0x20'i32, 0x10'i32, 0x3D'u32)
+    let param0Refined = searchBleRfTxcalParam(0'u32, param0Coarse.value, 0x08'i32, 0x3D'u32)
+    let param1Refined = searchBleRfTxcalParam(1'u32, param1Coarse.value, 0x08'i32, 0x3D'u32)
+    let param2Coarse = searchBleRfTxcalParam(2'u32, 0x400'i32, 0x80'i32, 0x7A'u32)
+    let param3Coarse = searchBleRfTxcalParam(3'u32, 0'i32, 0x40'i32, 0x7A'u32)
+    let param2Refined = searchBleRfTxcalParam(2'u32, param2Coarse.value, 0x40'i32, 0x7A'u32)
+    let param3Refined = searchBleRfTxcalParam(3'u32, param3Coarse.value, 0x20'i32, 0x7A'u32)
 
-    allOk = allOk and p0a.ok and p1a.ok and p0b.ok and p1b.ok and
-      p2a.ok and p3a.ok and p2b.ok and p3b.ok
-    storeBleRfTxcalRecord(i, p0b.value, p1b.value, p2b.value, p3b.value,
-                          p0b.power or p1b.power or p2b.power or p3b.power)
+    allOk = allOk and param0Coarse.ok and param1Coarse.ok and
+      param0Refined.ok and param1Refined.ok and param2Coarse.ok and
+      param3Coarse.ok and param2Refined.ok and param3Refined.ok
+    storeBleRfTxcalRecord(txcalRecordIndex,
+                          param0Refined.value, param1Refined.value,
+                          param2Refined.value, param3Refined.value,
+                          param0Refined.power or param1Refined.power or
+                            param2Refined.power or param3Refined.power)
 
   restoreBleRfPriCalState(saved)
   if allOk:
@@ -2048,30 +2098,33 @@ proc runBleRfPriTxcal() =
 
 proc applyBleRfTxcalRecordToTable(words: var array[43, uint32],
                                   start, record: int) =
-  let word0 = bleRfCalibData.txcal[record * 2]
-  let word1 = bleRfCalibData.txcal[record * 2 + 1]
-  let p0 = word0 and 0x3F'u32
-  let p1 = (word0 shr 6) and 0x3F'u32
-  let p2 = (word0 shr 12) and 0x7FF'u32
-  let p3 = word1 and 0x3FF'u32
-  let index = start + record * 2
+  let packedParamWord0 = bleRfCalibData.txcal[record * 2]
+  let packedParamWord1 = bleRfCalibData.txcal[record * 2 + 1]
+  let txcalParam0 = packedParamWord0 and 0x3F'u32
+  let txcalParam1 = (packedParamWord0 shr 6) and 0x3F'u32
+  let txcalParam2 = (packedParamWord0 shr 12) and 0x7FF'u32
+  let txcalParam3 = packedParamWord1 and 0x3FF'u32
+  let txcalTableWordIndex = start + record * 2
 
-  words[index] = (words[index] and 0xFFFFF800'u32) or p2
-  words[index + 1] = (words[index + 1] and 0xFF000003'u32) or
-    (p3 shl 14) or (p0 shl 8) or (p1 shl 2)
+  words[txcalTableWordIndex] =
+    (words[txcalTableWordIndex] and 0xFFFFF800'u32) or txcalParam2
+  words[txcalTableWordIndex + 1] =
+    (words[txcalTableWordIndex + 1] and 0xFF000003'u32) or
+    (txcalParam3 shl 14) or (txcalParam0 shl 8) or (txcalParam1 shl 2)
 
 proc applyBleRfVcoTableFromCal() =
   let rf = bleRfRegs()
-  for i in 0 ..< BleRfLoChannelCount:
-    let pairIndex = i div 2
-    var word = volatileLoad(addr rf.vcoPairTable13c[pairIndex])
-    let fcal = uint32(rfLoFcal(bleRfCalibData.lo[i])) and 0xFF'u32
-    let acal = uint32(rfLoAcal(bleRfCalibData.lo[i])) and 0x1F'u32
-    if (i and 1) == 0:
-      word = (word and 0xFFFF00E0'u32) or (fcal shl 8) or acal
+  for loChannelIndex in 0 ..< BleRfLoChannelCount:
+    let vcoPairIndex = loChannelIndex div 2
+    var vcoPairWord = volatileLoad(addr rf.vcoPairTable13c[vcoPairIndex])
+    let fcal = uint32(rfLoFcal(bleRfCalibData.lo[loChannelIndex])) and 0xFF'u32
+    let acal = uint32(rfLoAcal(bleRfCalibData.lo[loChannelIndex])) and 0x1F'u32
+    if (loChannelIndex and 1) == 0:
+      vcoPairWord = (vcoPairWord and 0xFFFF00E0'u32) or (fcal shl 8) or acal
     else:
-      word = (word and 0x00E0FFFF'u32) or (fcal shl 24) or (acal shl 16)
-    volatileStore(addr rf.vcoPairTable13c[pairIndex], word)
+      vcoPairWord =
+        (vcoPairWord and 0x00E0FFFF'u32) or (fcal shl 24) or (acal shl 16)
+    volatileStore(addr rf.vcoPairTable13c[vcoPairIndex], vcoPairWord)
   inc nim_ble_rf_pri_vco_table_count
   nim_ble_rf_last_vco_113c = volatileLoad(addr rf.vcoPairTable13c[0])
   nim_ble_rf_last_vco_1164 = volatileLoad(addr rf.vcoPair2484Mhz164)
@@ -2104,9 +2157,9 @@ proc applyBleRfPriTxPowerTableInit() =
   ## phase. The fixed gain-table fields come from the reference table layout;
   ## per-board TX DC calibration fields are filled from the live TXCAL search.
   var words = BleRfPriTxPowerRegisterBase
-  for i in 0 ..< BleRfTxcalSearchRecords:
-    applyBleRfTxcalRecordToTable(words, 2, i)
-    applyBleRfTxcalRecordToTable(words, 25, i)
+  for txcalRecordIndex in 0 ..< BleRfTxcalSearchRecords:
+    applyBleRfTxcalRecordToTable(words, 2, txcalRecordIndex)
+    applyBleRfTxcalRecordToTable(words, 25, txcalRecordIndex)
   writeBleMemoryWords(0x20001700'u32, words)
   inc nim_ble_rf_pri_tx_power_table_count
 
@@ -2167,15 +2220,15 @@ proc applyBleRfChannelOptimize(channelMhz: uint16) =
   ## The vendor routine clears this RF bit only for the 2452-2472 MHz band and
   ## sets it outside that range; CoreBluetooth commonly opens links on those
   ## mid-band data channels.
-  var word = regRead(BleRfOptimizeReg.uint)
+  var optimizeControl = regRead(BleRfOptimizeReg.uint)
   if channelMhz >= BleRfOptimizeMidBandFirstMhz and
       channelMhz <= BleRfOptimizeMidBandLastMhz:
-    word = word and not BleRfOptimizeMidBandMask
+    optimizeControl = optimizeControl and not BleRfOptimizeMidBandMask
   else:
-    word = word or BleRfOptimizeMidBandMask
-  regWrite(BleRfOptimizeReg.uint, word)
+    optimizeControl = optimizeControl or BleRfOptimizeMidBandMask
+  regWrite(BleRfOptimizeReg.uint, optimizeControl)
   inc nim_ble_rf_optimize_count
-  nim_ble_rf_last_optimize_word = word
+  nim_ble_rf_last_optimize_control = optimizeControl
 
 proc bleRfLegacyScanChannelMhz(channelIndex: uint16): uint16 {.inline.} =
   ## Scanner EM uses RF indexes for the legacy advertising channels.
@@ -2228,7 +2281,7 @@ proc configureBleRfChannelMhz(channelMhz: uint16) =
   applyBleRfChannelOptimize(channelMhz)
   inc nim_ble_rf_tune_count
   nim_ble_rf_last_channel_mhz = channelMhz.uint32
-  nim_ble_rf_last_notch_word = notchWord
+  nim_ble_rf_last_notch_control = notchWord
   markBleRfDirtyForWifi()
   settleBleRfCalibrationLatches()
   when defined(bl808m0):
@@ -2263,7 +2316,7 @@ proc configureBleRf1M() =
   regWrite(BleRfTxPowerReg.uint, BleRfPower4DbmTxCal)
   settleBleRfCalibrationLatches()
   nim_ble_rf_last_channel_mhz = BleRfDefaultChannelMhz.uint32
-  nim_ble_rf_last_notch_word = regRead(BleRfNotchReg.uint)
+  nim_ble_rf_last_notch_control = regRead(BleRfNotchReg.uint)
   nim_ble_rf_last_init_a0 = regRead(0x200010A0'u32.uint)
   nim_ble_rf_last_init_b0 = regRead(0x200010B0'u32.uint)
   nim_ble_rf_last_init_b4 = regRead(0x200010B4'u32.uint)
@@ -2285,4 +2338,3 @@ when defined(bl808m0):
     prepareWirelessDomain()
     configureBtPriorityPta()
     configureBleRf1M()
-

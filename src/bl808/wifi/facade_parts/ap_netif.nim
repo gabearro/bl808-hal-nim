@@ -1,7 +1,7 @@
 proc wifiStartAp*(ssid, password: string, channel: int = 1): WifiError =
-  let rc = wifi_mgmr_ap_start(addr staIface, ssid.cstring,
-                               0, password.cstring, channel.cint)
-  if rc == 0:
+  let apStartStatus = wifi_mgmr_ap_start(addr staIface, ssid.cstring,
+                                          0, password.cstring, channel.cint)
+  if apStartStatus == 0:
     wifiApEnabled = true
     wifiOk
   else:
@@ -12,8 +12,8 @@ proc wifiStartApAsync*(ssid, password: string,
   return wifiStartAp(ssid, password, channel)
 
 proc wifiStopAp*(): WifiError =
-  let rc = wifi_mgmr_ap_stop(addr staIface)
-  if rc == 0:
+  let apStopStatus = wifi_mgmr_ap_stop(addr staIface)
+  if apStopStatus == 0:
     wifiApEnabled = false
     wifiOk
   else:

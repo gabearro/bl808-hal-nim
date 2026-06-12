@@ -106,10 +106,10 @@ proc vif_mgmt_register*(macAddr: pointer, vifType: uint8, p2p: bool, vifIdxOut: 
   # Set up HW info
   mm_hw_info_set(macAddr)
   # Pop free VIF entry from list
-  let entry = co_list_pop_front(addr env.freeList)
-  if entry == nil:
+  let freeVifListNode = co_list_pop_front(addr env.freeList)
+  if freeVifListNode == nil:
     return 1
-  let vifEntry = cast[pointer](entry)
+  let vifEntry = cast[pointer](freeVifListNode)
   let vif = vifChannelAt(vifEntry)
   # Set VIF type
   vif.vifType = vifType
@@ -145,8 +145,8 @@ proc vif_mgmt_register*(macAddr: pointer, vifType: uint8, p2p: bool, vifIdxOut: 
     vif.securityTimer.env = pointerAddrU32(vifEntry)
     # STA-specific fields
     vif.staIdx = 0xFF
-    vif.reserved192[0] = 0
-    vif.reserved192[1] = 0
+    vif.rssiStatePadding[0] = 0
+    vif.rssiStatePadding[1] = 0
     # Call WPA init callback if available
     let wpaCbsPtr = cast[uint](addr wpa_cbs)
     let wpaCbsVal = cast[ptr pointer](wpaCbsPtr)[]
@@ -351,20 +351,20 @@ proc vif_mgmt_add_key*(param: pointer, hwKeyIdx: uint8) {.exportc, cdecl.} =
       # Broadcast PN: replicate to all 8 key context slots
       # Clear installed flag (will set below)
       keyView.installed = 0
-      var i = 0
-      while i < 8:
-        keyView.replayCounters[i].pnLow = pnLo
-        keyView.replayCounters[i].pnHigh = pnHi
-        inc i
+      var replayCounterIndex = 0
+      while replayCounterIndex < 8:
+        keyView.replayCounters[replayCounterIndex].pnLow = pnLo
+        keyView.replayCounters[replayCounterIndex].pnHigh = pnHi
+        inc replayCounterIndex
     else:
       # Unicast PN: write to per-STA rx reorder context
       # staIdx * 10 + 33, shifted left 4, offset from the VIF entry.
       let staReplay = vifKeySlot(vif, staIdx.uint)
-      var i = 0
-      while i < 8:
-        staReplay.replayCounters[i].pnLow = pnLo
-        staReplay.replayCounters[i].pnHigh = pnHi
-        inc i
+      var replayCounterIndex = 0
+      while replayCounterIndex < 8:
+        staReplay.replayCounters[replayCounterIndex].pnLow = pnLo
+        staReplay.replayCounters[replayCounterIndex].pnHigh = pnHi
+        inc replayCounterIndex
 
   # Validate replay counter before marking key installed
   # Blob calls replay_counter_validate at reloc 0x214 with key PN context
@@ -406,10 +406,10 @@ proc vif_mgmt_del_key*(vifEntry: pointer, keySlot: uint8) {.exportc, cdecl, noin
     # This key was the default; find replacement
     keyPtrs.defaultKeyPtr = 0
     # Scan slots 0..3 for a valid key
-    for i in 0'u .. 3'u:
-      let slotValid = vifKeySlot(vif, i).installed
+    for replacementKeySlotIndex in 0'u .. 3'u:
+      let slotValid = vifKeySlot(vif, replacementKeySlotIndex).installed
       if slotValid != 0:
-        keyPtrs.defaultKeyPtr = vifKeySlotPtr(vif, i)
+        keyPtrs.defaultKeyPtr = vifKeySlotPtr(vif, replacementKeySlotIndex)
         break
   # Check group key pointer (vif+1484)
   let groupKeyPtr = keyPtrs.groupKeyPtr
@@ -431,11 +431,11 @@ proc vif_mgmt_send_postponed_frame*(vifEntry: pointer) {.exportc, cdecl.} =
   ## Prior Nim bug: called txl_cntrl_push_int(0, cur) — completely wrong:
   ## it would try to push STA list nodes as TX frames.
   let vif = vifChannelAt(vifEntry)
-  var cur = vif.postponedStaHead
-  while cur != nil:
-    let next = cast[pointer](cast[ptr CoListHdr](cur).next)
-    discard sta_mgmt_send_postponed_frame(vifEntry, cur, 0'u32)
-    cur = next
+  var postponedStaNode = vif.postponedStaHead
+  while postponedStaNode != nil:
+    let nextPostponedStaNode = cast[pointer](cast[ptr CoListHdr](postponedStaNode).next)
+    discard sta_mgmt_send_postponed_frame(vifEntry, postponedStaNode, 0'u32)
+    postponedStaNode = nextPostponedStaNode
 
 proc vif_mgmt_reset*() {.exportc, cdecl.} =
   ## "Reset" step in the VIF-management path.
@@ -447,11 +447,11 @@ proc vif_mgmt_reset*() {.exportc, cdecl.} =
   ## Prior Nim bug: walked the active-vif list but called
   ## vif_mgmt_entry_init (reinit fields) instead of flushing postponed frames.
   ## That would corrupt live VIF state on every reset-trigger path.
-  var cur = cast[pointer](vifMgmtEnvView().activeList.first)
-  while cur != nil:
-    let next = vifChannelAt(cur).next
-    vif_mgmt_send_postponed_frame(cur)
-    cur = next
+  var activeVifNode = cast[pointer](vifMgmtEnvView().activeList.first)
+  while activeVifNode != nil:
+    let nextActiveVifNode = vifChannelAt(activeVifNode).next
+    vif_mgmt_send_postponed_frame(activeVifNode)
+    activeVifNode = nextActiveVifNode
 
 proc vif_mgmt_bcn_recv*(vifEntry: pointer) {.exportc, cdecl.} =
   ## Beacon received for a VIF.
@@ -525,9 +525,9 @@ proc vif_mgmt_set_ap_bcn_int*(vifEntry: pointer, interval: uint16) {.exportc, cd
       cv.beaconDivisor = divisor.uint8
       curVifPtr = cv.next
   # Write minimum interval to HW beacon interval register (lower 16 bits)
-  let curVal = regRead(MACHW_BCN_INT_REG)
-  let masked = curVal and 0xFFFF0000'u32
-  regWrite(MACHW_BCN_INT_REG, masked or minInterval.uint32)
+  let beaconIntervalRegValue = regRead(MACHW_BCN_INT_REG)
+  let beaconIntervalRegHighHalf = beaconIntervalRegValue and 0xFFFF0000'u32
+  regWrite(MACHW_BCN_INT_REG, beaconIntervalRegHighHalf or minInterval.uint32)
   # Restore interrupts
   irqRestore(prevIrq)
 
@@ -551,12 +551,12 @@ proc vif_mgmt_get_first_ap_inf*(): pointer {.exportc, cdecl.} =
   let env = vifMgmtEnvView()
   if env.apCount == 0:
     return nil
-  var entry = cast[pointer](env.activeList.first)
-  while entry != nil:
-    let vif = vifChannelAt(entry)
+  var activeVifListNode = cast[pointer](env.activeList.first)
+  while activeVifListNode != nil:
+    let vif = vifChannelAt(activeVifListNode)
     if vif.vifType == VIF_TYPE_AP:
-      return entry
-    entry = vif.next  # follow linked list next
+      return activeVifListNode
+    activeVifListNode = vif.next  # follow linked list next
   return nil
 
 proc vif_mgmt_statistic_dump*() {.exportc, cdecl.} =
@@ -603,4 +603,3 @@ proc vif_mgmt_statistic_dump*() {.exportc, cdecl.} =
     puts("")
     # Follow linked list
     vifPtr = vif.next
-

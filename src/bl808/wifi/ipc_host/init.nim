@@ -16,5 +16,7 @@ proc ipc_host_init*(env, cb, sharedEnv, pthis: pointer) {.exportc, cdecl.} =
   listInit(freeList)
   listInit(ongoingList)
   listInit(cfmList)
-  for i in 0'u ..< NxTxDescCnt.uint:
-    listPushBack(freeList, ptrAt(sharedEnv, SharedTxdesc0Off + i * SharedTxdescHostSize))
+  for sharedTxDescIndex in 0'u ..< NxTxDescCnt.uint:
+    listPushBack(
+      freeList,
+      ptrAt(sharedEnv, SharedTxdesc0Off + sharedTxDescIndex * SharedTxdescHostSize))

@@ -253,27 +253,29 @@ elif defined(bl808lp):
   }
   """.}
 else:
-  # M0 (RV32I) trap handler
+  # M0 (RV32I) trap vector table. Exceptions enter the mtvec base (table[0]);
+  # the enclave build overrides mtvec at runtime (umode.nim) to route U-mode
+  # ecalls/faults, so this table is identical for both builds.
   {.emit: """
-  __attribute__((section(".rodata.__trap_vector_table"), aligned(64), used))
-  void (*const __trap_vector_table[128])(void) = {
-    [0 ... 127] = __clic_interrupt_handler,
-    [0] = __trap_handler,
-    [1] = __trap_handler,
-    [2] = __trap_handler,
-    [4] = __trap_handler,
-    [5] = __trap_handler,
-    [6] = __trap_handler,
-    [8] = __trap_handler,
-    [9] = __trap_handler,
-    [10] = __trap_handler,
-    [11] = __trap_handler,
-    [12] = __trap_handler,
-    [13] = __trap_handler,
-    [14] = __trap_handler,
-    [15] = __trap_handler
-  };
-  """.}
+    __attribute__((section(".rodata.__trap_vector_table"), aligned(64), used))
+    void (*const __trap_vector_table[128])(void) = {
+      [0 ... 127] = __clic_interrupt_handler,
+      [0] = __trap_handler,
+      [1] = __trap_handler,
+      [2] = __trap_handler,
+      [4] = __trap_handler,
+      [5] = __trap_handler,
+      [6] = __trap_handler,
+      [8] = __trap_handler,
+      [9] = __trap_handler,
+      [10] = __trap_handler,
+      [11] = __trap_handler,
+      [12] = __trap_handler,
+      [13] = __trap_handler,
+      [14] = __trap_handler,
+      [15] = __trap_handler
+    };
+    """.}
 
   {.emit: """
   __attribute__((naked, aligned(64)))
@@ -682,20 +684,15 @@ else:
     asm volatile(
       /* Disable interrupts */
       "csrci mstatus, 0x8\n"
-      /* Match Bouffalo startup: enable T-Head ISA/MM extensions before C code. */
-      "csrr t0, 0x7c0\n"
-      "li t1, ((1 << 22) | (1 << 15))\n"
-      "or t0, t0, t1\n"
-      "csrw 0x7c0, t0\n"
-      /* Set stack pointer */
+      /* NOTE: the E902 (RV32EMC) does NOT implement the E907/C906 T-Head
+         MXSTATUS (CSR 0x7c0) extension bits nor CLIC mtvt (CSR 0x307); writing
+         them takes an illegal-instruction trap before mtvec is set and hangs the
+         core (verified on HW — a pure-asm _start with none of this runs, this
+         did not). Keep the E902 entry minimal: stack, direct-mode mtvec, init. */
       "la sp, _sp\n"
       "csrw mscratch, sp\n"
-      /* Set CLIC vector bases: mtvt handles vector IRQs, mtvec handles exceptions. */
-      "la t0, __trap_vector_table\n"
-      "csrw 0x307, t0\n"    /* mtvt: T-Head CLIC hardware vector table */
       "la t0, __trap_handler\n"
-      "ori t0, t0, 0x3\n"  /* CLIC mode: mtvec[1:0] = 0b11 */
-      "csrw mtvec, t0\n"
+      "csrw mtvec, t0\n"   /* direct mode (mtvec[1:0]=0) */
       /* Clear BSS */
       "call __clear_bss\n"
       /* Copy initialized data */

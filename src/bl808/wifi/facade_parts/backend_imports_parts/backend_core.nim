@@ -14,6 +14,6 @@ proc bl808_wifi_backend_last_reason*(): cint
   {.importc: "bl808_wifi_backend_last_reason", cdecl.}
 
 proc wifi_mgmr_init*(conf: ptr WifiConf): cint {.cdecl.} =
-  let rc = bl808_wifi_backend_init(conf)
-  wifiInitialized = rc == 0
-  rc
+  let backendStatus = bl808_wifi_backend_init(conf)
+  wifiInitialized = backendStatus == 0
+  backendStatus

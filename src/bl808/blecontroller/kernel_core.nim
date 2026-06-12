@@ -2,12 +2,12 @@
 # ---------------------------------------------------------------------------
 
 proc csrRead(csr: uint32): uint32 {.inline.} =
-  var val: uint32
+  var mstatusValue: uint32
   asm """
     csrr %0, mstatus
-    : "=r"(`val`)
+    : "=r"(`mstatusValue`)
   """
-  val
+  mstatusValue
 
 proc disableInterrupts(): uint32 {.inline.} =
   ## Save mstatus, clear MIE (bit 3). Returns old mstatus.
@@ -30,8 +30,8 @@ proc restoreInterrupts(mstatus: uint32) {.inline.} =
 proc ble_co_list_init*(list: ptr CoList) {.exportc, cdecl.} =
   ## Initialize a linked list (set first and last to nil)
   if co_list_init_patch != nil:
-    let r = co_list_init_patch(0, list)
-    if r != 0:
+    let patchStatus = co_list_init_patch(0, list)
+    if patchStatus != 0:
       return
   list.first = nil
   list.last = nil
@@ -39,8 +39,8 @@ proc ble_co_list_init*(list: ptr CoList) {.exportc, cdecl.} =
 proc ble_co_list_push_back*(list: ptr CoList, node: ptr CoListNode) {.exportc, cdecl.} =
   ## Push a node to the back of the list
   if co_list_push_back_patch != nil:
-    let r = co_list_push_back_patch(0, list, node)
-    if r != 0:
+    let patchStatus = co_list_push_back_patch(0, list, node)
+    if patchStatus != 0:
       return
   if node == nil:
     return
@@ -54,8 +54,8 @@ proc ble_co_list_push_back*(list: ptr CoList, node: ptr CoListNode) {.exportc, c
 proc ble_co_list_push_front*(list: ptr CoList, node: ptr CoListNode) {.exportc, cdecl.} =
   ## Push a node to the front of the list
   if co_list_push_front_patch != nil:
-    let r = co_list_push_front_patch(0, list, node)
-    if r != 0:
+    let patchStatus = co_list_push_front_patch(0, list, node)
+    if patchStatus != 0:
       return
   if node == nil:
     return
@@ -66,11 +66,11 @@ proc ble_co_list_push_front*(list: ptr CoList, node: ptr CoListNode) {.exportc, 
 
 proc ble_co_list_pop_front*(list: ptr CoList): ptr CoListNode {.exportc, cdecl.} =
   ## Pop the first node from the list
-  var res: pointer
+  var patchedNode: pointer
   if co_list_pop_front_patch != nil:
-    let r = co_list_pop_front_patch(addr res, list)
-    if r != 0:
-      return cast[ptr CoListNode](res)
+    let patchStatus = co_list_pop_front_patch(addr patchedNode, list)
+    if patchStatus != 0:
+      return cast[ptr CoListNode](patchedNode)
   let node = list.first
   if node == nil:
     return nil
@@ -83,31 +83,31 @@ proc ble_co_list_extract*(list: ptr CoList, node: ptr CoListNode) {.exportc, cde
   ## Extract a specific node from the list
   if co_list_extract_patch != nil:
     var found: uint8
-    let r = co_list_extract_patch(addr found, list, node, 0)
-    if r != 0:
+    let patchStatus = co_list_extract_patch(addr found, list, node, 0)
+    if patchStatus != 0:
       return
   if node == nil:
     return
-  var cur = list.first
-  var prev: ptr CoListNode = nil
-  while cur != nil:
-    if cur == node:
-      if prev == nil:
-        list.first = cur.next
+  var candidateNode = list.first
+  var previousNode: ptr CoListNode = nil
+  while candidateNode != nil:
+    if candidateNode == node:
+      if previousNode == nil:
+        list.first = candidateNode.next
       else:
-        prev.next = cur.next
-      if list.last == cur:
-        list.last = prev
+        previousNode.next = candidateNode.next
+      if list.last == candidateNode:
+        list.last = previousNode
       return
-    prev = cur
-    cur = cur.next
+    previousNode = candidateNode
+    candidateNode = candidateNode.next
 
 proc ble_co_list_extract_after*(list: ptr CoList, prev_node: ptr CoListNode,
                                  node: ptr CoListNode) {.exportc, cdecl.} =
   ## Extract a node that is known to follow prev_node
   if co_list_extract_after_patch != nil:
-    let r = co_list_extract_after_patch(0, list, prev_node, node)
-    if r != 0:
+    let patchStatus = co_list_extract_after_patch(0, list, prev_node, node)
+    if patchStatus != 0:
       return
   if node == nil:
     return
@@ -121,23 +121,23 @@ proc ble_co_list_extract_after*(list: ptr CoList, prev_node: ptr CoListNode,
 
 proc ble_co_list_find*(list: ptr CoList, node: ptr CoListNode): bool {.exportc, cdecl.} =
   ## Check if a node is in the list
-  var res: pointer
+  var patchedFound: pointer
   if co_list_find_patch != nil:
-    let r = co_list_find_patch(addr res, list, node)
-    if r != 0:
-      return cast[uint32](res) != 0
-  var cur = list.first
-  while cur != nil:
-    if cur == node:
+    let patchStatus = co_list_find_patch(addr patchedFound, list, node)
+    if patchStatus != 0:
+      return cast[uint32](patchedFound) != 0
+  var candidateNode = list.first
+  while candidateNode != nil:
+    if candidateNode == node:
       return true
-    cur = cur.next
+    candidateNode = candidateNode.next
   return false
 
 proc ble_co_list_merge*(dest: ptr CoList, src: ptr CoList) {.exportc, cdecl.} =
   ## Merge src list into dest (appending src to end of dest)
   if co_list_merge_patch != nil:
-    let r = co_list_merge_patch(0, dest, src)
-    if r != 0:
+    let patchStatus = co_list_merge_patch(0, dest, src)
+    if patchStatus != 0:
       return
   if src.first == nil:
     return
@@ -153,8 +153,8 @@ proc ble_co_list_insert_before*(list: ptr CoList, before_node: ptr CoListNode,
                                  node: ptr CoListNode) {.exportc, cdecl.} =
   ## Insert node before before_node in the list
   if co_list_insert_before_patch != nil:
-    let r = co_list_insert_before_patch(0, list, before_node, node)
-    if r != 0:
+    let patchStatus = co_list_insert_before_patch(0, list, before_node, node)
+    if patchStatus != 0:
       return
   if node == nil:
     return
@@ -165,20 +165,20 @@ proc ble_co_list_insert_before*(list: ptr CoList, before_node: ptr CoListNode,
     if list.last == nil:
       list.last = node
     return
-  var cur = list.first
-  while cur != nil:
-    if cur.next == before_node:
+  var nodeBeforeInsert = list.first
+  while nodeBeforeInsert != nil:
+    if nodeBeforeInsert.next == before_node:
       node.next = before_node
-      cur.next = node
+      nodeBeforeInsert.next = node
       return
-    cur = cur.next
+    nodeBeforeInsert = nodeBeforeInsert.next
 
 proc ble_co_list_insert_after*(list: ptr CoList, after_node: ptr CoListNode,
                                 node: ptr CoListNode) {.exportc, cdecl.} =
   ## Insert node after after_node in the list
   if co_list_insert_after_patch != nil:
-    let r = co_list_insert_after_patch(0, list, after_node, node)
-    if r != 0:
+    let patchStatus = co_list_insert_after_patch(0, list, after_node, node)
+    if patchStatus != 0:
       return
   if node == nil:
     return
@@ -196,32 +196,32 @@ proc ble_co_list_insert_after*(list: ptr CoList, after_node: ptr CoListNode,
 
 proc ble_co_list_size*(list: ptr CoList): uint32 {.exportc, cdecl.} =
   ## Return the number of elements in the list
-  var res: uint32
+  var patchedSize: uint32
   if co_list_size_patch != nil:
-    let r = co_list_size_patch(addr res, list)
-    if r != 0:
-      return res
+    let patchStatus = co_list_size_patch(addr patchedSize, list)
+    if patchStatus != 0:
+      return patchedSize
   var count: uint32 = 0
-  var cur = list.first
-  while cur != nil:
+  var countedNode = list.first
+  while countedNode != nil:
     inc count
-    cur = cur.next
+    countedNode = countedNode.next
   return count
 
 proc ble_co_list_check_size_available*(list: ptr CoList, limit: uint32): bool {.exportc, cdecl.} =
   ## Check if the list has fewer than limit elements
-  var res: uint8
+  var patchedAvailable: uint8
   if co_list_check_size_available_patch != nil:
-    let r = co_list_check_size_available_patch(addr res, list, limit)
-    if r != 0:
-      return res != 0
+    let patchStatus = co_list_check_size_available_patch(addr patchedAvailable, list, limit)
+    if patchStatus != 0:
+      return patchedAvailable != 0
   var count: uint32 = 0
-  var cur = list.first
-  while cur != nil:
+  var countedNode = list.first
+  while countedNode != nil:
     inc count
     if count >= limit:
       return false
-    cur = cur.next
+    countedNode = countedNode.next
   return true
 
 proc ble_co_list_pool_init*(list: ptr CoList, pool: pointer, elt_size: uint32,
@@ -229,14 +229,14 @@ proc ble_co_list_pool_init*(list: ptr CoList, pool: pointer, elt_size: uint32,
   ## Initialize a list from a pool of fixed-size elements
   ble_co_list_init(list)
   var base = cast[uint](pool)
-  for i in 0'u32 ..< count:
+  for poolElementIndex in 0'u32 ..< count:
     let node = cast[ptr CoListNode](base)
-    if init_cb != nil and i < count - 1:
-      let cb = cast[proc(p: pointer, data: pointer) {.cdecl.}](init_cb)
-      cb(pool, cast[pointer](base))
-    if i == count - 1 and last_cb != nil:
-      let cb = cast[proc(p: pointer, data: pointer) {.cdecl.}](last_cb)
-      cb(pool, cast[pointer](base))
+    if init_cb != nil and poolElementIndex < count - 1:
+      let poolInitCallback = cast[proc(p: pointer, data: pointer) {.cdecl.}](init_cb)
+      poolInitCallback(pool, cast[pointer](base))
+    if poolElementIndex == count - 1 and last_cb != nil:
+      let poolLastCallback = cast[proc(p: pointer, data: pointer) {.cdecl.}](last_cb)
+      poolLastCallback(pool, cast[pointer](base))
     ble_co_list_push_back(list, node)
     base += elt_size
 
@@ -275,19 +275,19 @@ proc patch_ble_co_list_pop_front*(list: ptr CoList): ptr CoListNode {.exportc: "
 proc patch_ble_co_list_extract*(list: ptr CoList, node: ptr CoListNode) {.exportc: "_patch_ble_co_list_extract", cdecl.} =
   if node == nil:
     return
-  var cur = list.first
-  var prev: ptr CoListNode = nil
-  while cur != nil:
-    if cur == node:
-      if prev == nil:
-        list.first = cur.next
+  var candidateNode = list.first
+  var previousNode: ptr CoListNode = nil
+  while candidateNode != nil:
+    if candidateNode == node:
+      if previousNode == nil:
+        list.first = candidateNode.next
       else:
-        prev.next = cur.next
-      if list.last == cur:
-        list.last = prev
+        previousNode.next = candidateNode.next
+      if list.last == candidateNode:
+        list.last = previousNode
       return
-    prev = cur
-    cur = cur.next
+    previousNode = candidateNode
+    candidateNode = candidateNode.next
 
 proc patch_ble_co_list_extract_after*(list: ptr CoList, prev_node: ptr CoListNode,
                                           node: ptr CoListNode) {.exportc: "_patch_ble_co_list_extract_after", cdecl.} =
@@ -301,11 +301,11 @@ proc patch_ble_co_list_extract_after*(list: ptr CoList, prev_node: ptr CoListNod
     list.last = prev_node
 
 proc patch_ble_co_list_find*(list: ptr CoList, node: ptr CoListNode): bool {.exportc: "_patch_ble_co_list_find", cdecl.} =
-  var cur = list.first
-  while cur != nil:
-    if cur == node:
+  var candidateNode = list.first
+  while candidateNode != nil:
+    if candidateNode == node:
       return true
-    cur = cur.next
+    candidateNode = candidateNode.next
   return false
 
 proc patch_ble_co_list_merge*(dest: ptr CoList, src: ptr CoList) {.exportc: "_patch_ble_co_list_merge", cdecl.} =
@@ -329,13 +329,13 @@ proc patch_ble_co_list_insert_before*(list: ptr CoList, before_node: ptr CoListN
     if list.last == nil:
       list.last = node
     return
-  var cur = list.first
-  while cur != nil:
-    if cur.next == before_node:
+  var nodeBeforeInsert = list.first
+  while nodeBeforeInsert != nil:
+    if nodeBeforeInsert.next == before_node:
       node.next = before_node
-      cur.next = node
+      nodeBeforeInsert.next = node
       return
-    cur = cur.next
+    nodeBeforeInsert = nodeBeforeInsert.next
 
 proc patch_ble_co_list_insert_after*(list: ptr CoList, after_node: ptr CoListNode,
                                          node: ptr CoListNode) {.exportc: "_patch_ble_co_list_insert_after", cdecl.} =
@@ -354,20 +354,20 @@ proc patch_ble_co_list_insert_after*(list: ptr CoList, after_node: ptr CoListNod
 
 proc patch_ble_co_list_size*(list: ptr CoList): uint32 {.exportc: "_patch_ble_co_list_size", cdecl.} =
   var count: uint32 = 0
-  var cur = list.first
-  while cur != nil:
+  var countedNode = list.first
+  while countedNode != nil:
     inc count
-    cur = cur.next
+    countedNode = countedNode.next
   return count
 
 proc patch_ble_co_list_check_size_available*(list: ptr CoList, limit: uint32): bool {.exportc: "_patch_ble_co_list_check_size_available", cdecl.} =
   var count: uint32 = 0
-  var cur = list.first
-  while cur != nil:
+  var countedNode = list.first
+  while countedNode != nil:
     inc count
     if count >= limit:
       return false
-    cur = cur.next
+    countedNode = countedNode.next
   return true
 
 # ---------------------------------------------------------------------------
@@ -389,118 +389,118 @@ proc patch_ble_ke_event_init*() {.exportc: "_patch_ble_ke_event_init", cdecl.} =
 
 proc ble_ke_event_init*() {.exportc, cdecl.} =
   if ke_event_init_patch != nil:
-    let r = ke_event_init_patch(0)
-    if r != 0:
+    let patchStatus = ke_event_init_patch(0)
+    if patchStatus != 0:
       return
   discard c_memset(addr ke_event_slots[0], 0, (sizeof(KeEventSlot) * KE_EVENT_MAX).csize_t)
 
-proc patch_ble_ke_event_callback_set*(idx: uint8, cb: KeEventCallback) {.exportc: "_patch_ble_ke_event_callback_set", cdecl.} =
-  if idx < KE_EVENT_MAX and cb != nil:
-    ke_event_slots[idx].callback = cb
+proc patch_ble_ke_event_callback_set*(eventId: uint8, cb: KeEventCallback) {.exportc: "_patch_ble_ke_event_callback_set", cdecl.} =
+  if eventId < KE_EVENT_MAX and cb != nil:
+    ke_event_slots[eventId].callback = cb
 
-proc ble_ke_event_callback_set*(idx: uint8, cb: KeEventCallback) {.exportc, cdecl.} =
+proc ble_ke_event_callback_set*(eventId: uint8, cb: KeEventCallback) {.exportc, cdecl.} =
   if ke_event_callback_set_patch != nil:
     var status: uint8
-    let r = ke_event_callback_set_patch(addr status, idx, cb)
-    if r != 0:
+    let patchStatus = ke_event_callback_set_patch(addr status, eventId, cb)
+    if patchStatus != 0:
       return
-  if idx < KE_EVENT_MAX and cb != nil:
-    ke_event_slots[idx].callback = cb
+  if eventId < KE_EVENT_MAX and cb != nil:
+    ke_event_slots[eventId].callback = cb
 
-proc patch_ble_ke_event_set*(idx: uint8) {.exportc: "_patch_ble_ke_event_set", cdecl.} =
-  if idx < KE_EVENT_MAX:
+proc patch_ble_ke_event_set*(eventId: uint8) {.exportc: "_patch_ble_ke_event_set", cdecl.} =
+  if eventId < KE_EVENT_MAX:
     let old = disableInterrupts()
-    ke_event_field = ke_event_field or (1'u32 shl idx)
+    kePendingEventBits = kePendingEventBits or (1'u32 shl eventId)
     restoreInterrupts(old)
 
-proc ble_ke_event_set*(idx: uint8) {.exportc, cdecl.} =
+proc ble_ke_event_set*(eventId: uint8) {.exportc, cdecl.} =
   if ke_event_set_patch != nil:
-    let r = ke_event_set_patch(0, idx)
-    if r != 0:
+    let patchStatus = ke_event_set_patch(0, eventId)
+    if patchStatus != 0:
       return
-  if idx < KE_EVENT_MAX:
+  if eventId < KE_EVENT_MAX:
     let old = disableInterrupts()
-    ke_event_field = ke_event_field or (1'u32 shl idx)
+    kePendingEventBits = kePendingEventBits or (1'u32 shl eventId)
     restoreInterrupts(old)
 
-proc patch_ble_ke_event_clear*(idx: uint8) {.exportc: "_patch_ble_ke_event_clear", cdecl.} =
-  if idx < KE_EVENT_MAX:
+proc patch_ble_ke_event_clear*(eventId: uint8) {.exportc: "_patch_ble_ke_event_clear", cdecl.} =
+  if eventId < KE_EVENT_MAX:
     let old = disableInterrupts()
-    ke_event_field = ke_event_field and not (1'u32 shl idx)
+    kePendingEventBits = kePendingEventBits and not (1'u32 shl eventId)
     restoreInterrupts(old)
 
-proc ble_ke_event_clear*(idx: uint8) {.exportc, cdecl.} =
+proc ble_ke_event_clear*(eventId: uint8) {.exportc, cdecl.} =
   if ke_event_clear_patch != nil:
-    let r = ke_event_clear_patch(0, idx)
-    if r != 0:
+    let patchStatus = ke_event_clear_patch(0, eventId)
+    if patchStatus != 0:
       return
-  if idx < KE_EVENT_MAX:
+  if eventId < KE_EVENT_MAX:
     let old = disableInterrupts()
-    ke_event_field = ke_event_field and not (1'u32 shl idx)
+    kePendingEventBits = kePendingEventBits and not (1'u32 shl eventId)
     restoreInterrupts(old)
 
-proc ble_ke_event_get*(idx: uint8): bool {.exportc, cdecl.} =
+proc ble_ke_event_get*(eventId: uint8): bool {.exportc, cdecl.} =
   ## Check if an event is set
-  if idx >= KE_EVENT_MAX:
+  if eventId >= KE_EVENT_MAX:
     return false
-  return (ke_event_field and (1'u32 shl idx)) != 0
+  return (kePendingEventBits and (1'u32 shl eventId)) != 0
 
 proc patch_ble_ke_event_get_all*(): uint32 {.exportc: "_patch_ble_ke_event_get_all", cdecl.} =
-  return ke_event_field
+  return kePendingEventBits
 
 proc ble_ke_event_get_all*(): uint32 {.exportc, cdecl.} =
   if ke_event_get_all_patch != nil:
-    var res: uint32
-    let r = ke_event_get_all_patch(addr res)
-    if r != 0:
-      return res
-  return ke_event_field
+    var patchedEventBits: uint32
+    let patchStatus = ke_event_get_all_patch(addr patchedEventBits)
+    if patchStatus != 0:
+      return patchedEventBits
+  return kePendingEventBits
 
 proc patch_ble_ke_event_flush*() {.exportc: "_patch_ble_ke_event_flush", cdecl.} =
-  ke_event_field = 0
+  kePendingEventBits = 0
 
 proc ble_ke_event_flush*() {.exportc, cdecl.} =
   if ke_event_flush_patch != nil:
-    let r = ke_event_flush_patch()
-    if r != 0:
+    let patchStatus = ke_event_flush_patch()
+    if patchStatus != 0:
       return
-  ke_event_field = 0
+  kePendingEventBits = 0
 
-proc bleKeEventYieldNeeded(drained, field: uint32): bool {.inline.} =
-  drained >= BleKeEventDrainLimit and field != 0
+proc bleKeEventYieldNeeded(drainedCount, pendingEventBits: uint32): bool {.inline.} =
+  drainedCount >= BleKeEventDrainLimit and pendingEventBits != 0
 
 proc patch_ble_ke_event_schedule*() {.exportc: "_patch_ble_ke_event_schedule", cdecl.} =
-  var field = ke_event_field
-  var drained = 0'u32
-  while field != 0:
+  var pendingEventBits = kePendingEventBits
+  var drainedCount = 0'u32
+  while pendingEventBits != 0:
     # Find lowest set bit
-    var bit = 0'u8
-    var tmp = field
-    while (tmp and 1) == 0:
-      tmp = tmp shr 1
-      inc bit
+    var eventId = 0'u8
+    var pendingBitScan = pendingEventBits
+    while (pendingBitScan and 1) == 0:
+      pendingBitScan = pendingBitScan shr 1
+      inc eventId
     # Clear and dispatch
-    let old = disableInterrupts()
-    ke_event_field = ke_event_field and not (1'u32 shl bit)
-    restoreInterrupts(old)
-    if bit < KE_EVENT_MAX and ke_event_slots[bit].callback != nil:
-      ke_event_slots[bit].callback(bit)
-    inc drained
-    field = ke_event_field
-    if bleKeEventYieldNeeded(drained, field):
+    let savedInterruptState = disableInterrupts()
+    kePendingEventBits = kePendingEventBits and not (1'u32 shl eventId)
+    restoreInterrupts(savedInterruptState)
+    if eventId < KE_EVENT_MAX and ke_event_slots[eventId].callback != nil:
+      ke_event_slots[eventId].callback(eventId)
+    inc drainedCount
+    pendingEventBits = kePendingEventBits
+    if bleKeEventYieldNeeded(drainedCount, pendingEventBits):
       inc nim_ble_ke_event_yield_count
-      nim_ble_ke_event_yield_field = field
+      nim_ble_ke_event_yield_field = pendingEventBits
       return
 
 proc ble_ke_event_schedule*() {.exportc, cdecl.} =
   if ke_event_schedule_patch != nil:
-    let r = ke_event_schedule_patch(0)
-    if r != 0:
+    let patchStatus = ke_event_schedule_patch(0)
+    if patchStatus != 0:
       return
   patch_ble_ke_event_schedule()
 
 proc ble_ke_get_event_field*(): uint32 {.exportc, cdecl.} =
-  return ke_event_field
+  return kePendingEventBits
 
 # ---------------------------------------------------------------------------
 # ======================== KE_MEM ==========================================
@@ -510,17 +510,17 @@ var
   ke_mem_pool*: array[KE_MEM_POOL_MAX, uint8]  ## Pool tracking
 
 proc patch_ble_ke_mem_is_in_heap*(p: pointer): bool {.exportc: "_patch_ble_ke_mem_is_in_heap", cdecl.} =
-  let addr_val = cast[uint](p)
+  let heapCandidateAddress = cast[uint](p)
   let heap_start = cast[uint](ke_mem_heap)
   let heap_end = cast[uint](ke_mem_heap_end)
-  return addr_val >= heap_start and addr_val < heap_end
+  return heapCandidateAddress >= heap_start and heapCandidateAddress < heap_end
 
 proc ble_ke_mem_is_in_heap*(p: pointer): bool {.exportc, cdecl.} =
   if ke_mem_is_in_heap_patch != nil:
-    var res: uint8
-    let r = ke_mem_is_in_heap_patch(addr res, p)
-    if r != 0:
-      return res != 0
+    var patchedInHeap: uint8
+    let patchStatus = ke_mem_is_in_heap_patch(addr patchedInHeap, p)
+    if patchStatus != 0:
+      return patchedInHeap != 0
   return patch_ble_ke_mem_is_in_heap(p)
 
 proc patch_ble_ke_mem_init*() {.exportc: "_patch_ble_ke_mem_init", cdecl.} =
@@ -529,8 +529,8 @@ proc patch_ble_ke_mem_init*() {.exportc: "_patch_ble_ke_mem_init", cdecl.} =
 
 proc ble_ke_mem_init*() {.exportc, cdecl.} =
   if ke_mem_init_patch != nil:
-    let r = ke_mem_init_patch(0)
-    if r != 0:
+    let patchStatus = ke_mem_init_patch(0)
+    if patchStatus != 0:
       return
   patch_ble_ke_mem_init()
 
@@ -551,21 +551,21 @@ proc patch_ble_ke_malloc*(size: uint32, mtype: uint32): pointer {.exportc: "_pat
   ## Allocate memory from kernel heap
   ## Uses simple first-fit free-list allocator
   ## Each block has a 4-byte header: [size:31 | free:1]
-  var res: pointer
+  var patchedAllocation: pointer
   if ke_malloc_patch != nil:
-    let r = ke_malloc_patch(addr res, size, mtype)
-    if r != 0:
-      return res
+    let patchStatus = ke_malloc_patch(addr patchedAllocation, size, mtype)
+    if patchStatus != 0:
+      return patchedAllocation
   # Fallback to C malloc
   proc cmalloc(s: csize_t): pointer {.importc: "malloc", cdecl.}
   return cmalloc(size.csize_t)
 
 proc ble_ke_malloc*(size: uint32, mtype: uint32): pointer {.exportc, cdecl.} =
   if ke_malloc_patch != nil:
-    var res: pointer
-    let r = ke_malloc_patch(addr res, size, mtype)
-    if r != 0:
-      return res
+    var patchedAllocation: pointer
+    let patchStatus = ke_malloc_patch(addr patchedAllocation, size, mtype)
+    if patchStatus != 0:
+      return patchedAllocation
   return patch_ble_ke_malloc(size, mtype)
 
 proc patch_ble_ke_free*(p: pointer) {.exportc: "_patch_ble_ke_free", cdecl.} =
@@ -587,17 +587,17 @@ proc patch_ble_ke_is_free*(p: pointer): bool {.exportc: "_patch_ble_ke_is_free",
   if p == nil:
     return true
   if ke_is_free_patch != nil:
-    var res: uint8
-    discard ke_is_free_patch(addr res, p)
-    return res != 0
+    var patchedIsFree: uint8
+    discard ke_is_free_patch(addr patchedIsFree, p)
+    return patchedIsFree != 0
   return false
 
 proc ble_ke_is_free*(p: pointer): bool {.exportc, cdecl.} =
   if ke_is_free_patch != nil:
-    var res: uint8
-    let r = ke_is_free_patch(addr res, p)
-    if r != 0:
-      return res != 0
+    var patchedIsFree: uint8
+    let patchStatus = ke_is_free_patch(addr patchedIsFree, p)
+    if patchStatus != 0:
+      return patchedIsFree != 0
   return patch_ble_ke_is_free(p)
 
 proc ble_controller_trace_malloc_init*() {.exportc, cdecl.} =
@@ -610,9 +610,9 @@ proc trace_malloc*(size: uint32, p: pointer) {.exportc, cdecl.} =
     inc trace_malloc_idx
 
 proc trace_free*(p: pointer) {.exportc, cdecl.} =
-  for i in 0 ..< 16:
-    if trace_malloc_info[i] == cast[uint32](p):
-      trace_malloc_info[i] = 0
+  for traceMallocSlotIndex in 0 ..< 16:
+    if trace_malloc_info[traceMallocSlotIndex] == cast[uint32](p):
+      trace_malloc_info[traceMallocSlotIndex] = 0
       break
 
 proc ble_ke_debug_mem_info*() {.exportc, cdecl.} =
@@ -633,12 +633,12 @@ proc getMsgParam(hdr: ptr KeMsgHeader): pointer {.inline.} =
   let envelope = cast[ptr KeMsgEnvelope](hdr)
   cast[pointer](addr envelope.param[0])
 
-proc keStateHandlerAt(base: ptr KeStateHandler, idx: uint8): ptr KeStateHandler {.inline.} =
-  addr cast[ptr UncheckedArray[KeStateHandler]](base)[idx]
+proc keStateHandlerAt(base: ptr KeStateHandler, stateHandlerIndex: uint8): ptr KeStateHandler {.inline.} =
+  addr cast[ptr UncheckedArray[KeStateHandler]](base)[stateHandlerIndex]
 
 proc keMsgHandlerEntryAt(base: ptr KeStateMsgHandler,
-                         idx: uint16): ptr KeStateMsgHandler {.inline.} =
-  addr cast[ptr UncheckedArray[KeStateMsgHandler]](base)[idx]
+                         messageHandlerIndex: uint16): ptr KeStateMsgHandler {.inline.} =
+  addr cast[ptr UncheckedArray[KeStateMsgHandler]](base)[messageHandlerIndex]
 
 template emRxDescTableAt(base: uint32): ptr UncheckedArray[EmBufRxDesc] =
   cast[ptr UncheckedArray[EmBufRxDesc]](base)
@@ -649,20 +649,20 @@ template emTxDescTableAt(base: uint32): ptr UncheckedArray[EmBufTxDesc] =
 template emRxFreeTable(): ptr UncheckedArray[EmBufRxFreeSlot] =
   cast[ptr UncheckedArray[EmBufRxFreeSlot]](bleEmPointer(0x35C'u16))
 
-proc emRxDescAt(base: uint32, idx: uint16): ptr EmBufRxDesc {.inline.} =
-  addr emRxDescTableAt(base)[idx]
+proc emRxDescAt(base: uint32, rxDescIndex: uint16): ptr EmBufRxDesc {.inline.} =
+  addr emRxDescTableAt(base)[rxDescIndex]
 
-proc emTxDescAt(base: uint32, idx: uint16): ptr EmBufTxDesc {.inline.} =
-  addr emTxDescTableAt(base)[idx]
+proc emTxDescAt(base: uint32, txDescIndex: uint16): ptr EmBufTxDesc {.inline.} =
+  addr emTxDescTableAt(base)[txDescIndex]
 
-proc emRxFreeSlotAt(idx: uint16): ptr EmBufRxFreeSlot {.inline.} =
-  addr emRxFreeTable()[idx]
+proc emRxFreeSlotAt(rxFreeSlotIndex: uint16): ptr EmBufRxFreeSlot {.inline.} =
+  addr emRxFreeTable()[rxFreeSlotIndex]
 
-proc emRxFreeStatusField(idx: uint16): ptr uint16 {.inline.} =
-  addr emRxFreeSlotAt(idx).status
+proc emRxFreeStatusField(rxFreeSlotIndex: uint16): ptr uint16 {.inline.} =
+  addr emRxFreeSlotAt(rxFreeSlotIndex).status
 
-proc emRxBufferPointerField(idx: uint16): ptr uint16 {.inline.} =
-  addr emRxFreeSlotAt(idx).buf_ptr
+proc emRxBufferPointerField(rxFreeSlotIndex: uint16): ptr uint16 {.inline.} =
+  addr emRxFreeSlotAt(rxFreeSlotIndex).emBufferOffset
 
 proc emTxPoolDescForBufferOffset(offset: uint32): ptr EmBufTxDesc {.inline.} =
   let txDescBase = BLE_EM_BASE + 0x264'u32
@@ -674,12 +674,12 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled and
     if param == nil:
       return false
     let hdr = getMsgHeader(param)
-    let p = cast[ptr UncheckedArray[uint8]](param)
+    let messageBytes = cast[ptr UncheckedArray[uint8]](param)
     let conhdl = uint16((hdr.dest_id shr 8) and 0x00FF'u16)
     case hdr.id
     of 523'u16:
-      let pduLen = uint16(p[2])
-      let dataOff = uint16(p[4]) or (uint16(p[5]) shl 8)
+      let pduLen = uint16(messageBytes[2])
+      let dataOff = uint16(messageBytes[4]) or (uint16(messageBytes[5]) shl 8)
       nimLlcpRecordRx(0'u16, dataOff, pduLen)
       if pduLen > 0'u16:
         let opcode = btbleEmRead8(dataOff)
@@ -695,9 +695,9 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled and
           nimLlcpRecordMalformed(0'u16, opcode, pduLen)
       true
     of 525'u16:
-      let dataOff = uint16(p[0]) or (uint16(p[1]) shl 8)
-      let pduLen = uint16(p[2]) or (uint16(p[3]) shl 8)
-      let llid = p[4] and 0x03'u8
+      let dataOff = uint16(messageBytes[0]) or (uint16(messageBytes[1]) shl 8)
+      let pduLen = uint16(messageBytes[2]) or (uint16(messageBytes[3]) shl 8)
+      let llid = messageBytes[4] and 0x03'u8
       if llid == NimDataLlIdControl and pduLen > 0'u16:
         nimLlcpRecordRx(uint16(llid), dataOff, pduLen)
         let opcode = btbleEmRead8(dataOff)
@@ -728,17 +728,17 @@ proc patch_ble_ke_msg_alloc*(id: KeMsgId, dest_id: KeTaskId,
   hdr.dest_id = dest_id
   hdr.src_id = src_id
   hdr.param_len = param_len
-  let param = getMsgParam(hdr)
-  discard c_memset(param, 0, param_len.csize_t)
-  return param
+  let msgParam = getMsgParam(hdr)
+  discard c_memset(msgParam, 0, param_len.csize_t)
+  return msgParam
 
 proc ble_ke_msg_alloc*(id: KeMsgId, dest_id: KeTaskId,
                         src_id: KeTaskId, param_len: uint16): pointer {.exportc, cdecl.} =
   if ke_msg_alloc_patch != nil:
-    var res: pointer
-    let r = ke_msg_alloc_patch(addr res, id, dest_id, src_id, param_len)
-    if r != 0:
-      return res
+    var patchedParam: pointer
+    let patchStatus = ke_msg_alloc_patch(addr patchedParam, id, dest_id, src_id, param_len)
+    if patchStatus != 0:
+      return patchedParam
   return patch_ble_ke_msg_alloc(id, dest_id, src_id, param_len)
 
 proc patch_ble_ke_msg_send*(param: pointer) {.exportc: "_patch_ble_ke_msg_send", cdecl.} =
@@ -756,27 +756,27 @@ proc patch_ble_ke_msg_send*(param: pointer) {.exportc: "_patch_ble_ke_msg_send",
 
 proc ble_ke_msg_send*(param: pointer) {.exportc, cdecl.} =
   if ke_msg_send_patch != nil:
-    let r = ke_msg_send_patch(0, param)
-    if r != 0:
+    let patchStatus = ke_msg_send_patch(0, param)
+    if patchStatus != 0:
       return
   patch_ble_ke_msg_send(param)
 
 proc patch_ble_ke_msg_get_sent_num*(id: KeMsgId): uint32 {.exportc: "_patch_ble_ke_msg_get_sent_num", cdecl.} =
   ## Count messages with given id in the queue
   var count: uint32 = 0
-  var cur = cast[ptr KeMsgHeader](ke_msg_queue.first)
-  while cur != nil:
-    if cur.id == id:
+  var queuedMsg = cast[ptr KeMsgHeader](ke_msg_queue.first)
+  while queuedMsg != nil:
+    if queuedMsg.id == id:
       inc count
-    cur = cast[ptr KeMsgHeader](cur.next)
+    queuedMsg = cast[ptr KeMsgHeader](queuedMsg.next)
   return count
 
 proc ble_ke_msg_get_sent_num*(id: KeMsgId): uint32 {.exportc, cdecl.} =
   if ke_msg_get_sent_num_patch != nil:
-    var res: uint32
-    let r = ke_msg_get_sent_num_patch(addr res, id)
-    if r != 0:
-      return res
+    var patchedSentCount: uint32
+    let patchStatus = ke_msg_get_sent_num_patch(addr patchedSentCount, id)
+    if patchStatus != 0:
+      return patchedSentCount
   return patch_ble_ke_msg_get_sent_num(id)
 
 proc patch_ble_ke_msg_send_basic*(id: KeMsgId, dest_id: KeTaskId,
@@ -788,15 +788,15 @@ proc patch_ble_ke_msg_send_basic*(id: KeMsgId, dest_id: KeTaskId,
       discard src_id
       noteNimPeripheralDisconnectedFrom(3'u32, NimLlcpDefaultReason)
       return
-  let param = ble_ke_msg_alloc(id, dest_id, src_id, 0)
-  if param != nil:
-    ble_ke_msg_send(param)
+  let basicMsgParam = ble_ke_msg_alloc(id, dest_id, src_id, 0)
+  if basicMsgParam != nil:
+    ble_ke_msg_send(basicMsgParam)
 
 proc ble_ke_msg_send_basic*(id: KeMsgId, dest_id: KeTaskId,
                              src_id: KeTaskId) {.exportc, cdecl.} =
   if ke_msg_send_basic_patch != nil:
-    let r = ke_msg_send_basic_patch(0, id, dest_id, src_id)
-    if r != 0:
+    let patchStatus = ke_msg_send_basic_patch(0, id, dest_id, src_id)
+    if patchStatus != 0:
       return
   patch_ble_ke_msg_send_basic(id, dest_id, src_id)
 
@@ -826,44 +826,44 @@ when defined(bl808m0) and
     proc serviceNimArbCallbacks() =
       var drained = 0'u32
       while drained < BleArbCallbackDrainLimit and nimArbCallbackPending():
-        let cb = nim_conn_arb_pending_cb
-        let elt = nim_conn_arb_pending_elt
+        let pendingArbCallback = nim_conn_arb_pending_cb
+        let pendingArbElement = nim_conn_arb_pending_elt
         nim_conn_arb_pending_cb = nil
         nim_conn_arb_pending_elt = nil
-        if cb != nil:
-          runNimArbCallback(cb, elt)
+        if pendingArbCallback != nil:
+          runNimArbCallback(pendingArbCallback, pendingArbElement)
         inc drained
       if nimArbCallbackPending():
         inc nim_ble_arb_callback_yield_count
 
-  proc nimLldRxDescAddr(idx: uint8): uint32 {.inline.} =
-    BTBLE_EM_BASE + btbleRxDescOffset(uint32(idx))
+  proc nimLldRxDescAddr(rxDescRingIndex: uint8): uint32 {.inline.} =
+    BTBLE_EM_BASE + btbleRxDescOffset(uint32(rxDescRingIndex))
 
   proc lld_rxdesc_buf_ready*(buf: uint16): uint8 {.exportc, cdecl.} =
     let pending = lld_env[16]
     if pending == 0'u8:
       return 0
-    var idx = 0'u8
+    var pendingRxDescRingIndex = 0'u8
     var mask = pending
     while (mask and 1'u8) == 0'u8:
-      inc idx
+      inc pendingRxDescRingIndex
       mask = mask shr 1
-    btbleRxDescSetDataOffset(nimLldRxDescAddr(idx), buf)
-    lld_env[16] = pending and not (1'u8 shl idx)
+    btbleRxDescSetDataOffset(nimLldRxDescAddr(pendingRxDescRingIndex), buf)
+    lld_env[16] = pending and not (1'u8 shl pendingRxDescRingIndex)
     1
 
-  proc lld_rxdesc_check*(idx: uint8): pointer {.exportc, cdecl.} =
+  proc lld_rxdesc_check*(requestedRxDescIndex: uint8): pointer {.exportc, cdecl.} =
     when defined(bl808BleBridgeDiag):
-      nim_bridge_stage = 0x6000'u32 or idx.uint32
+      nim_bridge_stage = 0x6000'u32 or requestedRxDescIndex.uint32
     inc nim_lld_rx_check_count
     for step in 0'u32 ..< 8'u32:
-      let cur = lld_env[14] and 0x07'u8
-      let desc = nimLldRxDescAddr(cur)
+      let rxDescRingIdx = lld_env[14] and 0x07'u8
+      let desc = nimLldRxDescAddr(rxDescRingIdx)
       let status = btbleRxDescStatus(desc)
       let header = btbleRxDescHeader(desc)
       let meta = btbleRxDescMeta(desc)
-      nim_lld_rx_last_idx = idx.uint32
-      nim_lld_rx_last_env_idx = cur.uint32
+      nim_lld_rx_last_idx = requestedRxDescIndex.uint32
+      nim_lld_rx_last_env_idx = rxDescRingIdx.uint32
       nim_lld_rx_last_status = status.uint32
       nim_lld_rx_last_header = header.uint32
       nim_lld_rx_last_meta = meta.uint32
@@ -871,7 +871,7 @@ when defined(bl808m0) and
         break
       if header == 0'u16:
         btbleRxDescClearDone(desc, status)
-        lld_env[14] = uint8((uint32(cur) + 1'u32) and 0x07'u32)
+        lld_env[14] = uint8((uint32(rxDescRingIdx) + 1'u32) and 0x07'u32)
         inc nim_lld_rx_free_count
         continue
       let pduType = uint8(header and 0x000F'u16)
@@ -898,23 +898,23 @@ when defined(bl808m0) and
           var connectPdu: array[34, uint8]
           let dataOff = btbleRxDescDataOffset(desc)
           let payload = btbleEmPayload(dataOff)
-          for j in 0 ..< connectPdu.len:
-            connectPdu[j] = payload[j]
+          for connectPduByteIndex in 0 ..< connectPdu.len:
+            connectPdu[connectPduByteIndex] = payload[connectPduByteIndex]
           btbleRxDescClearDone(desc, status)
-          noteNimRxDescConsumed(cur.uint32)
+          noteNimRxDescConsumed(rxDescRingIdx.uint32)
           inc nim_lld_rx_free_count
-          handleNimConnectInd(uint8(cur and 0x07'u8),
+          handleNimConnectInd(uint8(rxDescRingIdx and 0x07'u8),
             cast[ptr UncheckedArray[uint8]](addr connectPdu[0]),
             header, rxClock, rxFine)
           nimConnMark(0x250'u32)
           continue
         when bl808BleNimManualConnTx:
           if nim_conn_started and not connRxStatusAcceptsPayload(status):
-            rejectConnRxDescriptor(desc, status, header, cur.uint32)
+            rejectConnRxDescriptor(desc, status, header, rxDescRingIdx.uint32)
             continue
           if nim_conn_started and not validConnDataHeader(header):
             btbleRxDescReleaseLink(desc, status)
-            noteNimRxDescConsumed(cur.uint32)
+            noteNimRxDescConsumed(rxDescRingIdx.uint32)
             inc nim_lld_rx_free_count
             continue
           if nim_conn_started:
@@ -937,28 +937,28 @@ when defined(bl808m0) and
             else:
               nimLlcpRecordMalformed(header, opcode, connLen.uint16)
             btbleRxDescReleaseLink(desc, status)
-            noteNimRxDescConsumed(cur.uint32)
+            noteNimRxDescConsumed(rxDescRingIdx.uint32)
             inc nim_lld_rx_free_count
             continue
       if pduType == 0x03'u8 and advLen == 12'u8:
         btbleRxDescClearDone(desc, status)
-        lld_env[14] = uint8((uint32(cur) + 1'u32) and 0x07'u32)
+        lld_env[14] = uint8((uint32(rxDescRingIdx) + 1'u32) and 0x07'u32)
         inc nim_lld_rx_free_count
         continue
       if scanDescUnsupported:
         btbleRxDescClearDone(desc, status)
-        lld_env[14] = uint8((uint32(cur) + 1'u32) and 0x07'u32)
+        lld_env[14] = uint8((uint32(rxDescRingIdx) + 1'u32) and 0x07'u32)
         inc nim_lld_rx_free_count
         continue
-      let descIdx = uint8((meta shr 11) and 0x001F'u16)
-      if descIdx == (idx and 0x1F'u8):
+      let rxDescMetaIndex = uint8((meta shr 11) and 0x001F'u16)
+      if rxDescMetaIndex == (requestedRxDescIndex and 0x1F'u8):
         when bl808BleNimManualConnTx:
           if nim_conn_started and not connRxStatusAcceptsPayload(status):
-            rejectConnRxDescriptor(desc, status, header, cur.uint32)
+            rejectConnRxDescriptor(desc, status, header, rxDescRingIdx.uint32)
             continue
           if nim_conn_started and not validConnDataHeader(header):
             btbleRxDescReleaseLink(desc, status)
-            noteNimRxDescConsumed(cur.uint32)
+            noteNimRxDescConsumed(rxDescRingIdx.uint32)
             inc nim_lld_rx_free_count
             continue
           if nim_conn_started:
@@ -980,21 +980,21 @@ when defined(bl808m0) and
               nimLlcpRespond(conhdl, opcode, reason)
             else:
               nimLlcpRecordMalformed(header, opcode, connLen.uint16)
-        nim_lld_rx_desc_idx = cur
+        nim_lld_rx_desc_idx = rxDescRingIdx
         nim_lld_rx_desc_active = 1'u8
         inc nim_lld_rx_check_hit_count
         when defined(bl808BleBridgeDiag):
-          nim_bridge_stage = 0x6100'u32 or cur.uint32
+          nim_bridge_stage = 0x6100'u32 or rxDescRingIdx.uint32
         return cast[pointer](desc)
       if scanDescObserved:
         btbleRxDescClearDone(desc, status)
-        lld_env[14] = uint8((uint32(cur) + 1'u32) and 0x07'u32)
+        lld_env[14] = uint8((uint32(rxDescRingIdx) + 1'u32) and 0x07'u32)
         inc nim_lld_rx_free_count
         continue
       break
     inc nim_lld_rx_check_miss_count
     when defined(bl808BleBridgeDiag):
-      nim_bridge_stage = 0x6200'u32 or idx.uint32
+      nim_bridge_stage = 0x6200'u32 or requestedRxDescIndex.uint32
     nil
 
   proc lld_rxdesc_free*(desc: pointer) {.exportc, cdecl.} =
@@ -1003,11 +1003,11 @@ when defined(bl808m0) and
         (cast[uint32](desc) and 0x000000FF'u32)
     discard desc
     inc nim_lld_rx_free_count
-    let cur = lld_env[14] and 0x07'u8
-    let descAddr = nimLldRxDescAddr(cur)
+    let rxDescRingIdx = lld_env[14] and 0x07'u8
+    let descAddr = nimLldRxDescAddr(rxDescRingIdx)
     let status = btbleRxDescStatus(descAddr)
     btbleRxDescClearDone(descAddr, status)
-    lld_env[14] = uint8((uint32(cur) + 1'u32) and 0x07'u32)
+    lld_env[14] = uint8((uint32(rxDescRingIdx) + 1'u32) and 0x07'u32)
     nim_lld_rx_desc_idx = lld_env[14]
     nim_lld_rx_desc_active = 0'u8
 
@@ -1018,24 +1018,24 @@ when defined(bl808m0) and
       var handledLlcp = false
       let startIdx = uint32(lld_env[14] and 0x07'u8)
       for step in 0'u32 ..< 8'u32:
-        let cur = (startIdx + step) and 0x07'u32
-        let desc = nimLldRxDescAddr(uint8(cur))
+        let rxDescRingIdx = (startIdx + step) and 0x07'u32
+        let desc = nimLldRxDescAddr(uint8(rxDescRingIdx))
         let status = btbleRxDescStatus(desc)
         if (status and BtbleRxDescDone) == 0:
           break
         let header = btbleRxDescHeader(desc)
         let meta = btbleRxDescMeta(desc)
-        nim_lld_rx_last_idx = cur
+        nim_lld_rx_last_idx = rxDescRingIdx
         nim_lld_rx_last_env_idx = uint32(lld_env[14] and 0x07'u8)
         nim_lld_rx_last_status = status.uint32
         nim_lld_rx_last_header = header.uint32
         nim_lld_rx_last_meta = meta.uint32
         if not connRxStatusAcceptsPayload(status):
-          rejectConnRxDescriptor(desc, status, header, cur)
+          rejectConnRxDescriptor(desc, status, header, rxDescRingIdx)
           continue
         if not validConnDataHeader(header):
           btbleRxDescReleaseLink(desc, status)
-          noteNimRxDescConsumed(cur)
+          noteNimRxDescConsumed(rxDescRingIdx)
           inc nim_lld_rx_free_count
           continue
         let conhdl = activeNimConnectionHandle()
@@ -1067,8 +1067,8 @@ when defined(bl808m0) and
             else:
               nimLlcpRecordMalformed(header, opcode, pduLen.uint16)
           btbleRxDescReleaseLink(desc, status)
-          if (lld_env[14] and 0x07'u8) == uint8(cur and 0x07'u32):
-            noteNimRxDescConsumed(cur)
+          if (lld_env[14] and 0x07'u8) == uint8(rxDescRingIdx and 0x07'u32):
+            noteNimRxDescConsumed(rxDescRingIdx)
           inc nim_lld_rx_free_count
         elif (dataLlId == NimDataLlIdStart or
               dataLlId == NimDataLlIdContinuation) and pduLen > 0'u8:
@@ -1079,13 +1079,13 @@ when defined(bl808m0) and
             else:
               inc nim_acl_rx_drop_count
           btbleRxDescReleaseLink(desc, status)
-          if (lld_env[14] and 0x07'u8) == uint8(cur and 0x07'u32):
-            noteNimRxDescConsumed(cur)
+          if (lld_env[14] and 0x07'u8) == uint8(rxDescRingIdx and 0x07'u32):
+            noteNimRxDescConsumed(rxDescRingIdx)
           inc nim_lld_rx_free_count
         else:
           btbleRxDescReleaseLink(desc, status)
-          if (lld_env[14] and 0x07'u8) == uint8(cur and 0x07'u32):
-            noteNimRxDescConsumed(cur)
+          if (lld_env[14] and 0x07'u8) == uint8(rxDescRingIdx and 0x07'u32):
+            noteNimRxDescConsumed(rxDescRingIdx)
           inc nim_lld_rx_free_count
           continue
       if not handledLlcp:
@@ -1177,19 +1177,19 @@ type
 proc patch_ble_ke_queue_extract*(queue: ptr CoList, cmp: QueueCmpFunc,
                                      arg: pointer): ptr CoListNode {.exportc: "_patch_ble_ke_queue_extract", cdecl.} =
   ## Extract first element matching comparison from queue
-  var cur = queue.first
-  var prev: ptr CoListNode = nil
-  while cur != nil:
-    if cmp(cur, cast[ptr CoListNode](arg), nil):
-      if prev == nil:
-        queue.first = cur.next
+  var candidateNode = queue.first
+  var previousNode: ptr CoListNode = nil
+  while candidateNode != nil:
+    if cmp(candidateNode, cast[ptr CoListNode](arg), nil):
+      if previousNode == nil:
+        queue.first = candidateNode.next
       else:
-        prev.next = cur.next
-      if queue.last == cur:
-        queue.last = prev
-      return cur
-    prev = cur
-    cur = cur.next
+        previousNode.next = candidateNode.next
+      if queue.last == candidateNode:
+        queue.last = previousNode
+      return candidateNode
+    previousNode = candidateNode
+    candidateNode = candidateNode.next
   return nil
 
 proc ble_ke_queue_extract*(queue: ptr CoList, cmp: QueueCmpFunc,
@@ -1201,19 +1201,19 @@ proc ble_ke_queue_extract*(queue: ptr CoList, cmp: QueueCmpFunc,
 proc patch_ble_ke_queue_insert*(queue: ptr CoList, node: ptr CoListNode,
                                     cmp: QueueCmpFunc) {.exportc: "_patch_ble_ke_queue_insert", cdecl.} =
   ## Insert into sorted queue
-  var cur = queue.first
-  var prev: ptr CoListNode = nil
-  while cur != nil:
-    if cmp(node, cur, nil):
-      if prev == nil:
+  var insertionPoint = queue.first
+  var nodeBeforeInsertion: ptr CoListNode = nil
+  while insertionPoint != nil:
+    if cmp(node, insertionPoint, nil):
+      if nodeBeforeInsertion == nil:
         node.next = queue.first
         queue.first = node
       else:
-        node.next = cur
-        prev.next = node
+        node.next = insertionPoint
+        nodeBeforeInsertion.next = node
       return
-    prev = cur
-    cur = cur.next
+    nodeBeforeInsertion = insertionPoint
+    insertionPoint = insertionPoint.next
   # Insert at end
   ble_co_list_push_back(queue, node)
 
@@ -1284,24 +1284,27 @@ proc patch_ble_ke_handler_search*(msg_id: KeMsgId, task_desc: ptr KeTaskDesc): K
     return nil
   let state_handler = keStateHandlerAt(task_desc.state_handler, st)
   if state_handler.msg_table != nil:
-    for i in 0'u16 ..< state_handler.msg_cnt:
-      let entry = keMsgHandlerEntryAt(state_handler.msg_table, i)
-      if entry.id == msg_id:
-        return entry.handler
+    for stateHandlerEntryIndex in 0'u16 ..< state_handler.msg_cnt:
+      let stateMessageHandlerEntry =
+        keMsgHandlerEntryAt(state_handler.msg_table, stateHandlerEntryIndex)
+      if stateMessageHandlerEntry.id == msg_id:
+        return stateMessageHandlerEntry.handler
   # Check default handler
   if task_desc.default_handler != nil and task_desc.default_handler.msg_table != nil:
-    for i in 0'u16 ..< task_desc.default_handler.msg_cnt:
-      let entry = keMsgHandlerEntryAt(task_desc.default_handler.msg_table, i)
-      if entry.id == msg_id:
-        return entry.handler
+    for defaultHandlerEntryIndex in 0'u16 ..< task_desc.default_handler.msg_cnt:
+      let defaultMessageHandlerEntry =
+        keMsgHandlerEntryAt(task_desc.default_handler.msg_table,
+                            defaultHandlerEntryIndex)
+      if defaultMessageHandlerEntry.id == msg_id:
+        return defaultMessageHandlerEntry.handler
   return nil
 
 proc ble_ke_handler_search*(msg_id: KeMsgId, task_desc: ptr KeTaskDesc): KeMsgHandler {.exportc, cdecl.} =
   if ke_handler_search_patch != nil:
-    var res: pointer
-    let r = ke_handler_search_patch(addr res, msg_id, task_desc)
-    if r != 0:
-      return cast[KeMsgHandler](res)
+    var patchedHandler: pointer
+    let patchStatus = ke_handler_search_patch(addr patchedHandler, msg_id, task_desc)
+    if patchStatus != 0:
+      return cast[KeMsgHandler](patchedHandler)
   return patch_ble_ke_handler_search(msg_id, task_desc)
 
 proc patch_ble_ke_task_handler_get*(msg_id: KeMsgId, task_id: KeTaskId): KeMsgHandler {.exportc: "_patch_ble_ke_task_handler_get", cdecl.} =
@@ -1313,16 +1316,16 @@ proc patch_ble_ke_task_handler_get*(msg_id: KeMsgId, task_id: KeTaskId): KeMsgHa
 
 proc ble_ke_task_handler_get*(msg_id: KeMsgId, task_id: KeTaskId): KeMsgHandler {.exportc, cdecl.} =
   if ke_task_handler_get_patch != nil:
-    var res: pointer
-    let r = ke_task_handler_get_patch(addr res, msg_id, task_id)
-    if r != 0:
-      return cast[KeMsgHandler](res)
+    var patchedHandler: pointer
+    let patchStatus = ke_task_handler_get_patch(addr patchedHandler, msg_id, task_id)
+    if patchStatus != 0:
+      return cast[KeMsgHandler](patchedHandler)
   return patch_ble_ke_task_handler_get(msg_id, task_id)
 
 proc bleKeTaskClearEventIfQueueEmpty() {.inline.} =
   let old = disableInterrupts()
   if ke_msg_queue.first == nil:
-    ke_event_field = ke_event_field and not BleKeMessageEventBit
+    kePendingEventBits = kePendingEventBits and not BleKeMessageEventBit
   restoreInterrupts(old)
 
 proc bleKeTaskRescheduleIfQueued() {.inline.} =
@@ -1346,9 +1349,9 @@ proc patch_ble_ke_task_schedule*() {.exportc: "_patch_ble_ke_task_schedule", cde
       bl808BleNimManualConnTx:
     let nimLlcpTxCfm = hdr.id == 524'u16
   let handler = ble_ke_task_handler_get(hdr.id, hdr.dest_id)
-  let param = getMsgParam(hdr)
+  let handlerParam = getMsgParam(hdr)
   if handler != nil:
-    let result = handler(hdr.id, param, hdr.dest_id, hdr.src_id)
+    let result = handler(hdr.id, handlerParam, hdr.dest_id, hdr.src_id)
     case result
     of KeMsgConsumed:
       bleKeTaskRescheduleIfQueued()
@@ -1370,8 +1373,8 @@ proc patch_ble_ke_task_schedule*() {.exportc: "_patch_ble_ke_task_schedule", cde
 
 proc ble_ke_task_schedule*() {.exportc, cdecl.} =
   if ke_task_schedule_patch != nil:
-    let r = ke_task_schedule_patch(0)
-    if r != 0:
+    let patchStatus = ke_task_schedule_patch(0)
+    if patchStatus != 0:
       return
   patch_ble_ke_task_schedule()
 
@@ -1380,8 +1383,8 @@ proc patch_ble_ke_task_init*() {.exportc: "_patch_ble_ke_task_init", cdecl.} =
 
 proc ble_ke_task_init*() {.exportc, cdecl.} =
   if ke_task_init_patch != nil:
-    let r = ke_task_init_patch(0)
-    if r != 0:
+    let patchStatus = ke_task_init_patch(0)
+    if patchStatus != 0:
       return
   patch_ble_ke_task_init()
 
@@ -1423,29 +1426,29 @@ proc patch_ble_ke_state_get*(task_id: KeTaskId): uint8 {.exportc: "_patch_ble_ke
 
 proc ble_ke_state_get*(task_id: KeTaskId): uint8 {.exportc, cdecl.} =
   if ke_state_get_patch != nil:
-    var res: uint8
-    let r = ke_state_get_patch(addr res, task_id)
-    if r != 0:
-      return res
+    var patchedState: uint8
+    let patchStatus = ke_state_get_patch(addr patchedState, task_id)
+    if patchStatus != 0:
+      return patchedState
   return patch_ble_ke_state_get(task_id)
 
 proc ble_ke_task_msg_flush*(task_id: KeTaskId) {.exportc, cdecl.} =
   ## Flush all messages for a given task from the queue
-  var cur = cast[ptr KeMsgHeader](ke_msg_queue.first)
-  var prev: ptr KeMsgHeader = nil
-  while cur != nil:
-    let next = cast[ptr KeMsgHeader](cur.next)
-    if cur.dest_id == task_id:
-      if prev == nil:
-        ke_msg_queue.first = cast[ptr CoListNode](next)
+  var queuedMsg = cast[ptr KeMsgHeader](ke_msg_queue.first)
+  var previousQueuedMsg: ptr KeMsgHeader = nil
+  while queuedMsg != nil:
+    let nextQueuedMsg = cast[ptr KeMsgHeader](queuedMsg.next)
+    if queuedMsg.dest_id == task_id:
+      if previousQueuedMsg == nil:
+        ke_msg_queue.first = cast[ptr CoListNode](nextQueuedMsg)
       else:
-        prev.next = next
-      if ke_msg_queue.last == cast[ptr CoListNode](cur):
-        ke_msg_queue.last = cast[ptr CoListNode](prev)
-      ble_ke_msg_free(cur)
+        previousQueuedMsg.next = nextQueuedMsg
+      if ke_msg_queue.last == cast[ptr CoListNode](queuedMsg):
+        ke_msg_queue.last = cast[ptr CoListNode](previousQueuedMsg)
+      ble_ke_msg_free(queuedMsg)
     else:
-      prev = cur
-    cur = next
+      previousQueuedMsg = queuedMsg
+    queuedMsg = nextQueuedMsg
 
 proc ble_ke_task_check*(task_type: uint8): bool {.exportc, cdecl.} =
   if task_type >= KE_TASK_MAX:
@@ -1471,10 +1474,10 @@ proc patch_ke_time*(): uint32 {.exportc: "_patch_ke_time", cdecl.} =
 
 proc ble_ke_time*(): uint32 {.exportc, cdecl.} =
   if ke_time_patch != nil:
-    var res: uint32
-    let r = ke_time_patch(addr res)
-    if r != 0:
-      return res
+    var patchedTime: uint32
+    let patchStatus = ke_time_patch(addr patchedTime)
+    if patchStatus != 0:
+      return patchedTime
   return patch_ke_time()
 
 proc patch_ble_ke_time_cmp*(t1: uint32, t2: uint32): bool {.exportc: "_patch_ble_ke_time_cmp", cdecl.} =
@@ -1484,10 +1487,10 @@ proc patch_ble_ke_time_cmp*(t1: uint32, t2: uint32): bool {.exportc: "_patch_ble
 
 proc ble_ke_time_cmp*(t1: uint32, t2: uint32): bool {.exportc, cdecl.} =
   if ke_time_cmp_patch != nil:
-    var res: uint8
-    let r = ke_time_cmp_patch(addr res, t1, t2)
-    if r != 0:
-      return res != 0
+    var patchedComparison: uint8
+    let patchStatus = ke_time_cmp_patch(addr patchedComparison, t1, t2)
+    if patchStatus != 0:
+      return patchedComparison != 0
   return patch_ble_ke_time_cmp(t1, t2)
 
 proc patch_ble_ke_time_past*(t: uint32): bool {.exportc: "_patch_ble_ke_time_past", cdecl.} =
@@ -1497,10 +1500,10 @@ proc patch_ble_ke_time_past*(t: uint32): bool {.exportc: "_patch_ble_ke_time_pas
 
 proc ble_ke_time_past*(t: uint32): bool {.exportc, cdecl.} =
   if ke_time_past_patch != nil:
-    var res: uint8
-    let r = ke_time_past_patch(addr res, t)
-    if r != 0:
-      return res != 0
+    var patchedPastFlag: uint8
+    let patchStatus = ke_time_past_patch(addr patchedPastFlag, t)
+    if patchStatus != 0:
+      return patchedPastFlag != 0
   return patch_ble_ke_time_past(t)
 
 proc patch_ble_ke_timer_hw_set*(timer: ptr KeTimer) {.exportc: "_patch_ble_ke_timer_hw_set", cdecl.} =
@@ -1537,12 +1540,12 @@ proc patch_ble_ke_timer_schedule*() {.exportc: "_patch_ble_ke_timer_schedule", c
     ble_ke_free(timer)
     inc drained
   # Reprogram HW timer
-  let next = bleKeTimerHead()
-  if next != nil:
-    if drained >= BleKeTimerDrainLimit and bleKeTimerExpired(next):
+  let nextTimer = bleKeTimerHead()
+  if nextTimer != nil:
+    if drained >= BleKeTimerDrainLimit and bleKeTimerExpired(nextTimer):
       inc nim_ble_ke_timer_yield_count
-      nim_ble_ke_timer_yield_time = next.time
-    ble_ke_timer_hw_set(next)
+      nim_ble_ke_timer_yield_time = nextTimer.time
+    ble_ke_timer_hw_set(nextTimer)
 
 proc ble_ke_timer_schedule*() {.exportc, cdecl.} =
   if ke_timer_schedule_patch != nil:
@@ -1574,14 +1577,14 @@ proc patch_ble_ke_timer_set*(id: uint16, task: uint16, delay: uint32) {.exportc:
     existing = true
 
   # Search and remove existing timer with this id/task
-  var cur = cast[ptr KeTimer](ke_timer_list.first)
+  var matchingTimerSearch = cast[ptr KeTimer](ke_timer_list.first)
   var timer: ptr KeTimer = nil
-  while cur != nil:
-    if cur.id == id and cur.task == task:
-      timer = cur
+  while matchingTimerSearch != nil:
+    if matchingTimerSearch.id == id and matchingTimerSearch.task == task:
+      timer = matchingTimerSearch
       patch_ble_co_list_extract(addr ke_timer_list, cast[ptr CoListNode](timer))
       break
-    cur = cur.next
+    matchingTimerSearch = matchingTimerSearch.next
 
   # Allocate new timer if not found
   if timer == nil:
@@ -1606,24 +1609,24 @@ proc patch_ble_ke_timer_set*(id: uint16, task: uint16, delay: uint32) {.exportc:
 
 proc ble_ke_timer_set*(id: uint16, task: uint16, delay: uint32) {.exportc, cdecl.} =
   if ke_timer_set_patch != nil:
-    let r = ke_timer_set_patch(0, id, task, delay)
-    if r != 0:
+    let patchStatus = ke_timer_set_patch(0, id, task, delay)
+    if patchStatus != 0:
       return
   patch_ble_ke_timer_set(id, task, delay)
 
 proc patch_ble_ke_timer_clear*(id: uint16, task: uint16) {.exportc: "_patch_ble_ke_timer_clear", cdecl.} =
   ## Clear cancel a timer
-  var cur = cast[ptr KeTimer](ke_timer_list.first)
-  while cur != nil:
-    if cur.id == id and cur.task == task:
-      let removedFirst = ke_timer_list.first == cast[ptr CoListNode](cur)
-      patch_ble_co_list_extract(addr ke_timer_list, cast[ptr CoListNode](cur))
-      ble_ke_free(cur)
+  var timerToClear = cast[ptr KeTimer](ke_timer_list.first)
+  while timerToClear != nil:
+    if timerToClear.id == id and timerToClear.task == task:
+      let removedFirst = ke_timer_list.first == cast[ptr CoListNode](timerToClear)
+      patch_ble_co_list_extract(addr ke_timer_list, cast[ptr CoListNode](timerToClear))
+      ble_ke_free(timerToClear)
       # Reprogram if we removed the first
       if removedFirst and ke_timer_list.first != nil:
         ble_ke_timer_hw_set(cast[ptr KeTimer](ke_timer_list.first))
       return
-    cur = cur.next
+    timerToClear = timerToClear.next
 
 proc ble_ke_timer_clear*(id: uint16, task: uint16) {.exportc, cdecl.} =
   if ke_timer_clear_patch != nil:
@@ -1632,19 +1635,19 @@ proc ble_ke_timer_clear*(id: uint16, task: uint16) {.exportc, cdecl.} =
   patch_ble_ke_timer_clear(id, task)
 
 proc patch_ble_ke_timer_active*(id: uint16, task: uint16): bool {.exportc: "_patch_ble_ke_timer_active", cdecl.} =
-  var cur = cast[ptr KeTimer](ke_timer_list.first)
-  while cur != nil:
-    if cur.id == id and cur.task == task:
+  var activeTimerSearch = cast[ptr KeTimer](ke_timer_list.first)
+  while activeTimerSearch != nil:
+    if activeTimerSearch.id == id and activeTimerSearch.task == task:
       return true
-    cur = cur.next
+    activeTimerSearch = activeTimerSearch.next
   return false
 
 proc ble_ke_timer_active*(id: uint16, task: uint16): bool {.exportc, cdecl.} =
   if ke_timer_active_patch != nil:
-    var res: uint8
-    let r = ke_timer_active_patch(addr res, id, task)
-    if r != 0:
-      return res != 0
+    var patchedActiveFlag: uint8
+    let patchStatus = ke_timer_active_patch(addr patchedActiveFlag, id, task)
+    if patchStatus != 0:
+      return patchedActiveFlag != 0
   return patch_ble_ke_timer_active(id, task)
 
 proc ble_ke_timer_adjust_all*() {.exportc, cdecl.} =
@@ -1659,10 +1662,10 @@ proc patch_ble_ke_timer_target_get*(): uint32 {.exportc: "_patch_ble_ke_timer_ta
 
 proc ble_ke_timer_target_get*(): uint32 {.exportc, cdecl.} =
   if ke_timer_target_get_patch != nil:
-    var res: uint32
-    let r = ke_timer_target_get_patch(addr res)
-    if r != 0:
-      return res
+    var patchedTimerTarget: uint32
+    let patchStatus = ke_timer_target_get_patch(addr patchedTimerTarget)
+    if patchStatus != 0:
+      return patchedTimerTarget
   return patch_ble_ke_timer_target_get()
 
 # ---------------------------------------------------------------------------
@@ -1678,8 +1681,8 @@ proc patch_ble_ke_init*() {.exportc: "_patch_ble_ke_init", cdecl.} =
 
 proc ble_ke_init*() {.exportc, cdecl.} =
   if ke_init_patch != nil:
-    let r = ke_init_patch(0)
-    if r != 0:
+    let patchStatus = ke_init_patch(0)
+    if patchStatus != 0:
       return
   patch_ble_ke_init()
 
@@ -1695,7 +1698,7 @@ proc patch_ble_ke_flush*() {.exportc: "_patch_ble_ke_flush", cdecl.} =
   while ke_msg_queue.first != nil:
     let node = ble_co_list_pop_front(addr ke_msg_queue)
     ble_ke_free(node)
-  ke_event_field = 0
+  kePendingEventBits = 0
 
 proc ble_ke_flush*() {.exportc, cdecl.} =
   if ke_flush_patch != nil:
@@ -1708,10 +1711,10 @@ proc patch_ble_ke_sleep_check*(): bool {.exportc: "_patch_ble_ke_sleep_check", c
 
 proc ble_ke_sleep_check*(): bool {.exportc, cdecl.} =
   if ke_sleep_check_patch != nil:
-    var res: uint8
-    let r = ke_sleep_check_patch(addr res)
-    if r != 0:
-      return res != 0
+    var patchedCanSleep: uint8
+    let patchStatus = ke_sleep_check_patch(addr patchedCanSleep)
+    if patchStatus != 0:
+      return patchedCanSleep != 0
   return patch_ble_ke_sleep_check()
 
 proc ble_ke_tx_queue_num*(): uint32 {.exportc, cdecl.} =
@@ -1728,47 +1731,47 @@ proc em_buf_init*() {.exportc, cdecl.} =
 
   # Initialize RX buffer pool (5 descriptors of 14 bytes starting at EM offset)
   let rx_base = BLE_EM_BASE + 0x262'u32  # from disasm: 0x28008262
-  for i in 0'u16 ..< EM_BUF_RX_COUNT:
-    let desc = emRxDescAt(rx_base, i)
-    # Set buffer pointer (offset from EM base) = 0x3CC + i * 38
-    let buf_offset = 0x3CC'u16 + i * EM_BUF_RX_DATA_SIZE.uint16
-    volatileStore(addr desc.buf_ptr, buf_offset)
+  for rxBufferSlotIndex in 0'u16 ..< EM_BUF_RX_COUNT:
+    let desc = emRxDescAt(rx_base, rxBufferSlotIndex)
+    # Set buffer pointer (offset from EM base) = 0x3CC + slot * 38
+    let buf_offset = 0x3CC'u16 + rxBufferSlotIndex * EM_BUF_RX_DATA_SIZE.uint16
+    volatileStore(addr desc.emBufferOffset, buf_offset)
     # Clear status/flags
     volatileStore(addr desc.status, 0'u16)
     volatileStore(addr desc.data_len, 0'u16)
 
   # Initialize TX buffer pool descriptors
   let tx_base = BLE_EM_BASE + 0x298'u32
-  for i in 0'u16 ..< EM_BUF_TX_COUNT.uint16:
-    volatileStore(addr emTxDescAt(tx_base, i).status, 0'u16)
+  for txBufferSlotIndex in 0'u16 ..< EM_BUF_TX_COUNT.uint16:
+    volatileStore(addr emTxDescAt(tx_base, txBufferSlotIndex).status, 0'u16)
 
-proc em_buf_rx_free*(idx: uint16) {.exportc, cdecl.} =
+proc em_buf_rx_free*(rxFreeSlotIndex: uint16) {.exportc, cdecl.} =
   ## Free an RX buffer by clearing the used bit in status
-  let status_ptr = emRxFreeStatusField(idx)
-  let v = volatileLoad(status_ptr)
-  volatileStore(status_ptr, v and 0x7FFF'u16)  # Clear bit 15 (used/done flag)
+  let statusField = emRxFreeStatusField(rxFreeSlotIndex)
+  let freeSlotStatus = volatileLoad(statusField)
+  volatileStore(statusField, freeSlotStatus and 0x7FFF'u16)  # Clear bit 15 (used/done flag)
 
-proc em_buf_rx_buff_addr_get*(idx: uint16): pointer {.exportc, cdecl.} =
+proc em_buf_rx_buff_addr_get*(rxFreeSlotIndex: uint16): pointer {.exportc, cdecl.} =
   ## Get the address of an RX buffer's data area
-  let buf_ptr = emRxBufferPointerField(idx)
-  let offset = volatileLoad(buf_ptr)
-  return bleEmPointer(offset)
+  let bufferPointerField = emRxBufferPointerField(rxFreeSlotIndex)
+  let emBufferOffset = volatileLoad(bufferPointerField)
+  return bleEmPointer(emBufferOffset)
 
 proc em_buf_tx_buff_addr_get*(desc: pointer): pointer {.exportc, cdecl.} =
   ## Get TX buffer data address from descriptor
   let txDesc = cast[ptr EmBufTxDesc](desc)
-  let offset = volatileLoad(addr txDesc.buf_ptr)
-  return bleEmPointer(offset)
+  let txEmBufferOffset = volatileLoad(addr txDesc.emBufferOffset)
+  return bleEmPointer(txEmBufferOffset)
 
 proc em_buf_tx_free*(desc: pointer) {.exportc, cdecl.} =
   ## Free a TX buffer
   let txDesc = cast[ptr EmBufTxDesc](desc)
-  let offset = volatileLoad(addr txDesc.buf_ptr)
+  let txEmBufferOffset = volatileLoad(addr txDesc.emBufferOffset)
   # Clear allocation status in TX pool
-  let pool_idx = offset.uint32
+  let txPoolBufferOffset = txEmBufferOffset.uint32
   let old = disableInterrupts()
   # Mark buffer as free in the TX descriptor
-  let poolDesc = emTxPoolDescForBufferOffset(pool_idx)
+  let poolDesc = emTxPoolDescForBufferOffset(txPoolBufferOffset)
   volatileStore(addr poolDesc.status, 0'u16)
   restoreInterrupts(old)
 
@@ -1810,8 +1813,8 @@ proc ea_elt_cancel*(elt: ptr EaEltTag) {.exportc, cdecl.} =
     return
   ea_elt_remove(elt)
   if elt.ea_cb_cancel != nil:
-    let cb = cast[proc(elt: ptr EaEltTag) {.cdecl.}](elt.ea_cb_cancel)
-    cb(elt)
+    let eaCancelCallback = cast[proc(elt: ptr EaEltTag) {.cdecl.}](elt.ea_cb_cancel)
+    eaCancelCallback(elt)
 
 proc ea_interval_create*(intv: ptr EaIntervalTag) {.exportc, cdecl.} =
   ## Create an interval element
@@ -1840,13 +1843,13 @@ proc ea_interval_duration_req*(intv: ptr EaIntervalTag): uint32 {.exportc, cdecl
 proc ea_sw_isr*() {.exportc, cdecl.} =
   ## Software ISR for event arbiter
   # Process completed events
-  var cur = cast[ptr EaEltTag](ea_env_list.first)
-  while cur != nil:
-    let next = cast[ptr EaEltTag](cur.node.next)
-    if cur.ea_cb_start != nil:
-      let cb = cast[proc(elt: ptr EaEltTag) {.cdecl.}](cur.ea_cb_start)
-      cb(cur)
-    cur = next
+  var scheduledEaElement = cast[ptr EaEltTag](ea_env_list.first)
+  while scheduledEaElement != nil:
+    let nextScheduledEaElement = cast[ptr EaEltTag](scheduledEaElement.node.next)
+    if scheduledEaElement.ea_cb_start != nil:
+      let eaStartCallback = cast[proc(elt: ptr EaEltTag) {.cdecl.}](scheduledEaElement.ea_cb_start)
+      eaStartCallback(scheduledEaElement)
+    scheduledEaElement = nextScheduledEaElement
 
 proc ea_finetimer_isr*() {.exportc, cdecl.} =
   ## Fine timer ISR

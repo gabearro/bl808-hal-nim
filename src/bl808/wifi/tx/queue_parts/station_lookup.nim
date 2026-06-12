@@ -50,14 +50,14 @@ proc txCntrlGetStaId(isSta: int; isBroadcast: bool; macAddr: pointer): int =
     nimFwDbgTxStaLookupResult = 0xffffffff'u32
     return -1
 
-  for i in 0 ..< NxRemoteStaStoreMax:
-    if i == bcmcStaIdx:
+  for remoteStaIndex in 0 ..< NxRemoteStaStoreMax:
+    if remoteStaIndex == bcmcStaIdx:
       continue
-    let sta = staView(staAt(i))
+    let sta = staView(staAt(remoteStaIndex))
     if sta.isUsed != 0'u8 and
         c_memcmp(cast[pointer](addr sta.macAddr[0]), macAddr, EthAlen.csize_t) == 0:
-      nimFwDbgTxStaLookupResult = i.uint32
-      return i
+      nimFwDbgTxStaLookupResult = remoteStaIndex.uint32
+      return remoteStaIndex
   inc nimFwDbgTxStaLookupFail
   nimFwDbgTxStaLookupResult = 0xffffffff'u32
   -1

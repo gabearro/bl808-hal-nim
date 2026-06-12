@@ -153,8 +153,10 @@ proc tzcConfigureRomRegion*(region: TzcRomRegion, startAddr, length: uint32,
   ## Configure a ROM TZC region. Set `lock` only when policy should persist
   ## until the next reset.
   let r = region.uint32
-  let groupMask = TzcRegionGroupMask shl (r * TzcRegionGroupBits)
-  let groupBits = (1'u32 shl group.uint32) shl (r * TzcRegionGroupBits)
+  # ROM uses a 2-bit one-hot group field per region (stride 2), not 4. The
+  # field holds a bitmask of allowed groups, so group g -> bit g.
+  let groupMask = 0x3'u32 shl (r * 2'u32)
+  let groupBits = (1'u32 shl group.uint32) shl (r * 2'u32)
   regModify(TzcSecRomCtrl, groupMask, groupBits)
   regWrite(TzcSecRomR0 + region.uint * 4'u, tzcPackWindow(startAddr, length, 10))
   var ctrl = regRead(TzcSecRomCtrl) or (1'u32 shl (TzcRegionEnableShift + r))
@@ -186,3 +188,221 @@ proc tzcLockRegion*(region: TzcRegion) =
   ## Lock a ROM region configuration until reset.
   if region <= 2:
     regSet(TzcSecRomCtrl, 1'u32 shl (TzcRegionLockShift + region.uint32))
+
+# =============================================================================
+# Bus masters, slaves, and protected blocks
+#
+# TZC assigns every bus master to an authorisation group (0 or 1) and every
+# protected slave/memory-window to a set of groups allowed to reach it. The
+# enclave model puts the secure core (M0) and secure resources in group 0 and
+# every untrusted master (DMA, WiFi, USB, D0/LP, ...) in group 1, then locks.
+#
+# Bit-level behaviour mirrors Bouffalo's bl808_tzc_sec.c. Enum values follow
+# TZC_SEC_Master_Type / TZC_SEC_Slave_Type so the split points used by the
+# hardware (D0 splits master banks; EMI_MISC/MM split slave banks) stay exact.
+# =============================================================================
+type
+  TzcMaster* = enum
+    tzcMasterLp     = 0   ## LP (E902) CPU
+    tzcMasterMmBus  = 1   ## MM subsystem bus
+    tzcMasterUsb    = 2
+    tzcMasterWifi   = 3
+    tzcMasterCci    = 4
+    tzcMasterSdh    = 5
+    tzcMasterEmac   = 6
+    tzcMasterM0     = 7   ## M0 (E907) CPU
+    tzcMasterDma0   = 8
+    tzcMasterDma1   = 9
+    tzcMasterLz4    = 10
+    tzcMasterD0     = 11  ## C906 CPU (first MM-bank master)
+    tzcMasterBlai   = 12
+    tzcMasterCodec  = 13
+    tzcMaster2dDma  = 14
+    tzcMasterDma2   = 15
+
+  TzcSlave* = enum
+    tzcSlaveGlb        = 0
+    tzcSlaveMix        = 1
+    tzcSlaveGpip       = 2
+    tzcSlaveDbg        = 3
+    tzcSlaveRsvd       = 4
+    tzcSlaveTzc1       = 5
+    tzcSlaveTzc2       = 6
+    tzcSlaveRsvd2      = 7
+    tzcSlaveCci        = 8
+    tzcSlaveMcuMisc    = 9
+    tzcSlavePeripheral = 10
+    tzcSlaveEmiMisc    = 16
+    tzcSlavePsramA     = 17
+    tzcSlavePsramB     = 18
+    tzcSlaveUsb        = 19
+    tzcSlaveRf2        = 20
+    tzcSlaveAudio      = 21
+    tzcSlaveEfCtrl     = 22
+    tzcSlaveMm         = 32
+    tzcSlaveDma0       = 33
+    tzcSlaveDma1       = 34
+    tzcSlavePwr        = 35
+
+  TzcSeBlock* = enum
+    tzcSeSha = 0, tzcSeAes, tzcSeTrng, tzcSePka, tzcSeCdet, tzcSeGmac
+
+  TzcSfCtrlBlock* = enum
+    tzcSfCr = 0   ## SF_CTRL control register group
+    tzcSfSec      ## SF_CTRL security (XIP AES) register group
+
+  TzcWindow* = enum
+    tzcWinRom, tzcWinOcram, tzcWinWram, tzcWinXram, tzcWinSf
+
+  TzcWindowDesc = object
+    ctrl, r0, msb: uint   ## register addresses (msb = 0 when the window has none)
+    regions: int          ## number of address regions
+    idWidth: uint32       ## group-field width: 2 (one-hot) or 4 (IBUS/DBUS x grp)
+    enShift, lockShift: uint32
+
+const TzcWindows: array[TzcWindow, TzcWindowDesc] = [
+  tzcWinRom:   TzcWindowDesc(ctrl: TzcSecRomCtrl,   r0: TzcSecRomR0,   msb: 0,
+                             regions: 3, idWidth: 2, enShift: 16, lockShift: 24),
+  tzcWinOcram: TzcWindowDesc(ctrl: TzcSecOcramCtrl, r0: TzcSecOcramR0, msb: 0,
+                             regions: 3, idWidth: 4, enShift: 16, lockShift: 20),
+  tzcWinWram:  TzcWindowDesc(ctrl: TzcSecWramCtrl,  r0: TzcSecWramR0,  msb: 0,
+                             regions: 3, idWidth: 4, enShift: 16, lockShift: 20),
+  tzcWinXram:  TzcWindowDesc(ctrl: TzcSecXramCtrl,  r0: TzcSecXramR0,  msb: 0,
+                             regions: 3, idWidth: 2, enShift: 16, lockShift: 24),
+  tzcWinSf:    TzcWindowDesc(ctrl: TzcSecSfCtrl,    r0: TzcSecSfR0,    msb: TzcSecSfRMsb,
+                             regions: 4, idWidth: 4, enShift: 20, lockShift: 25),
+]
+
+proc tzcGroupField(groups: set[TzcAuthGroup], width: uint32): uint32 =
+  ## Encode an allowed-group set into a window's group field.
+  ## width 2: one-hot bit per group (bit g = group g allowed).
+  ## width 4: per group g, both IBUS and DBUS bits (0b11 shl (2*g)).
+  for g in groups:
+    if g.uint32 <= 1:
+      if width == 2: result = result or (1'u32 shl g.uint32)
+      else:          result = result or (0x3'u32 shl (2'u32 * g.uint32))
+
+proc tzcConfigureWindowRegion*(window: TzcWindow, region: int,
+                               startAddr, length: uint32,
+                               groups: set[TzcAuthGroup], lock = false): bool =
+  ## Program one address region of a memory window: which groups may reach
+  ## `[startAddr, startAddr+length)`, then enable (and optionally lock) it.
+  ## Returns false for an out-of-range region index. 1 KB granularity.
+  let d = TzcWindows[window]
+  if region < 0 or region >= d.regions:
+    return false
+  let r = region.uint32
+  let field = tzcGroupField(groups, d.idWidth)
+  let fmask = ((1'u32 shl d.idWidth) - 1) shl (r * d.idWidth)
+  regModify(d.ctrl, fmask, field shl (r * d.idWidth))
+
+  regWrite(d.r0 + region.uint * 4'u, tzcPackWindow(startAddr, length, 10))
+
+  if d.msb != 0:
+    # Serial-flash windows extend start/end with 3 high bits each, one byte
+    # per region. Clear only this region's byte (the vendor driver keeps the
+    # wrong byte here; we preserve the other regions instead).
+    let alignEnd = (startAddr + length + 1023'u32) and not 0x3FF'u32
+    let ext = ((alignEnd shr 26) and 0x7'u32) or
+              (((startAddr shr 26) and 0x7'u32) shl 3)
+    let keep = regRead(d.msb) and not (0xFF'u32 shl (8'u32 * r))
+    regWrite(d.msb, keep or (ext shl (8'u32 * r)))
+
+  var ctrl = regRead(d.ctrl) or (1'u32 shl (d.enShift + r))
+  if lock:
+    ctrl = ctrl or (1'u32 shl (d.lockShift + r))
+  regWrite(d.ctrl, ctrl)
+  true
+
+proc tzcWindowRegionLocked*(window: TzcWindow, region: int): bool =
+  ## True if the region's lock bit is set (configuration frozen until reset).
+  let d = TzcWindows[window]
+  if region < 0 or region >= d.regions:
+    return false
+  (regRead(d.ctrl) and (1'u32 shl (d.lockShift + region.uint32))) != 0
+
+proc tzcWindowRegionGroupField*(window: TzcWindow, region: int): uint32 =
+  ## Read back the group bitmask (`1 shl group`) authorised for a window region.
+  ## E.g. 0x1 = group 0 only; 0x3 = both groups. 0xFFFFFFFF for a bad region.
+  let d = TzcWindows[window]
+  if region < 0 or region >= d.regions:
+    return 0xFFFFFFFF'u32
+  let r = region.uint32
+  let mask = (1'u32 shl d.idWidth) - 1
+  (regRead(d.ctrl) shr (r * d.idWidth)) and mask
+
+proc tzcWindowRegionEnabled*(window: TzcWindow, region: int): bool =
+  ## True if the region's enable bit is set.
+  let d = TzcWindows[window]
+  if region < 0 or region >= d.regions:
+    return false
+  (regRead(d.ctrl) and (1'u32 shl (d.enShift + region.uint32))) != 0
+
+proc tzcSetMasterGroup*(master: TzcMaster, group: TzcAuthGroup, lock = false) =
+  ## Assign a bus master to auth group 0 or 1. Always sets the per-master
+  ## write-confirm bit so the assignment takes effect; locks separately.
+  let m = master.ord
+  if m < tzcMasterD0.ord:
+    let bit = m.uint32
+    var v = regRead(TzcSecBmxTzmid)
+    if group == 0: v = v and not (1'u32 shl bit)
+    else:          v = v or (1'u32 shl bit)
+    v = v or (1'u32 shl (bit + 16))
+    regWrite(TzcSecBmxTzmid, v)
+    if lock: regSet(TzcSecBmxTzmidLock, 1'u32 shl bit)
+  else:
+    let bit = (m - tzcMasterD0.ord).uint32
+    var v = regRead(TzcSecMmBmxTzmid)
+    if group == 0: v = v and not (1'u32 shl bit)
+    else:          v = v or (1'u32 shl bit)
+    v = v or (1'u32 shl (bit + 16))
+    regWrite(TzcSecMmBmxTzmid, v)
+    if lock: regSet(TzcSecMmBmxTzmidLock, 1'u32 shl bit)
+
+proc tzcMasterGroup*(master: TzcMaster): TzcAuthGroup =
+  ## Read back a master's current auth group (for verification).
+  let m = master.ord
+  let (reg, bit) =
+    if m < tzcMasterD0.ord: (TzcSecBmxTzmid, m.uint32)
+    else: (TzcSecMmBmxTzmid, (m - tzcMasterD0.ord).uint32)
+  if (regRead(reg) and (1'u32 shl bit)) != 0: 1.TzcAuthGroup else: 0.TzcAuthGroup
+
+proc tzcSetSlaveGroup*(slave: TzcSlave, group: TzcAuthGroup, lock = false) =
+  ## Assign a peripheral/slave to an auth group. The 2-bit field is a one-hot
+  ## allowed-group mask; banks and lock placement follow the hardware split.
+  let g = 1'u32 shl group.uint32
+  let s = slave.ord
+  if s >= tzcSlaveMm.ord:
+    let idx = (s - tzcSlaveMm.ord).uint32
+    regModify(TzcSecBmxS0, 0x3'u32 shl (idx * 2), g shl (idx * 2))
+    if lock: regSet(TzcSecBmxS0, 1'u32 shl (idx + 16))
+  elif s < tzcSlaveEmiMisc.ord:
+    let idx = s.uint32
+    regModify(TzcSecBmxS1, 0x3'u32 shl (idx * 2), g shl (idx * 2))
+    if lock: regSet(TzcSecBmxSLock, 1'u32 shl idx)
+  else:
+    let idx = (s - tzcSlaveEmiMisc.ord).uint32
+    regModify(TzcSecBmxS2, 0x3'u32 shl (idx * 2), g shl (idx * 2))
+    if lock: regSet(TzcSecBmxSLock, 1'u32 shl (idx + 16))
+
+proc tzcSetSeBlockGroup*(blk: TzcSeBlock, group: TzcAuthGroup, lock = false) =
+  ## Restrict a SEC_ENG block (SHA/AES/TRNG/PKA/CDET/GMAC) to an auth group.
+  let i = blk.ord.uint32
+  regModify(TzcSecSeCtrl0, 0x3'u32 shl (i * 2), (1'u32 shl group.uint32) shl (i * 2))
+  if lock: regSet(TzcSecSeCtrl2, 1'u32 shl i)
+
+proc tzcSetSfCtrlGroup*(blk: TzcSfCtrlBlock, group: TzcAuthGroup, lock = false) =
+  ## Restrict an SF_CTRL register group to an auth group.
+  let i = blk.ord.uint32
+  regModify(TzcSecSeCtrl1, 0x3'u32 shl (i * 2), (1'u32 shl group.uint32) shl (i * 2))
+  if lock: regSet(TzcSecSeCtrl2, 1'u32 shl (i + 16))
+
+proc tzcLockMasterGroups*() =
+  ## Freeze all currently-assigned master groups until reset.
+  regWrite(TzcSecBmxTzmidLock, 0xFFFF_FFFF'u32)
+  regWrite(TzcSecMmBmxTzmidLock, 0xFFFF_FFFF'u32)
+
+proc tzcSetSbootDone*() =
+  ## Latch secure-boot-done in the ROM control register (4-bit field = 0xF).
+  ## After this the boot ROM window policy is frozen.
+  regModify(TzcSecRomCtrl, TzcRomSbootDoneMask, TzcRomSbootDoneMask)

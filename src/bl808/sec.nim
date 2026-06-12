@@ -133,6 +133,7 @@ type
     aesEcb = 0
     aesCtr = 1
     aesCbc = 2
+    aesXts = 3
 
   AesKeySize* = enum
     aes128 = 0
@@ -191,6 +192,8 @@ proc aesEncryptBlock*(src, dst: uint32, length: uint32,
   cfg = cfg or (mode.uint32 shl AesCfgModeShift)
   cfg = cfg or (aesKeyMode(keySize) shl AesCfgKeySizeShift)
   cfg = cfg or ((aesBlocks(length) shl AesCfgMsgLenShift) and AesCfgMsgLenMask)
+  # Preserve a hardware-key selection set via aesSetKeySource.
+  cfg = cfg or (regRead(AesCfg) and (1'u32 shl AesCfgHwKeyEn))
   cfg = cfg or (1'u32 shl AesCfgTrigger)
   regWrite(AesCfg, cfg)
 
@@ -217,6 +220,7 @@ proc aesDecryptBlock*(src, dst: uint32, length: uint32,
   cfg = cfg or (mode.uint32 shl AesCfgModeShift)
   cfg = cfg or (aesKeyMode(keySize) shl AesCfgKeySizeShift)
   cfg = cfg or ((aesBlocks(length) shl AesCfgMsgLenShift) and AesCfgMsgLenMask)
+  cfg = cfg or (regRead(AesCfg) and (1'u32 shl AesCfgHwKeyEn))
   cfg = cfg or (1'u32 shl AesCfgTrigger)
   regWrite(AesCfg, cfg)
 
@@ -396,4 +400,155 @@ proc trngFillBuffer*(buf: var openArray[uint8]): SecError =
         buf[i] = ((w shr (b * 8)) and 0xFF).uint8
         i.inc
   trngDisable()
+  secOk
+
+# =============================================================================
+# Per-block group ownership
+#
+# Each SEC_ENG block carries a CTRL_PROT register that arbitrates access
+# between CPU groups. Writing 0x02 claims the block for group 0, 0x06 releases
+# it; the owner is read back from SecCtrlProtRead with a 2-bit field per block.
+# This generalises the existing TRNG claim/release protocol to every block so
+# the enclave can reserve AES/SHA/PKA/GMAC to the secure world.
+# =============================================================================
+type
+  SecBlock* = enum
+    secBlkSha = 0, secBlkAes, secBlkTrng, secBlkPka, secBlkCdet, secBlkGmac
+
+const
+  SecOwnerGroup0* = 0x01'u32   ## group 0 holds the block
+  SecOwnerGroup1* = 0x02'u32
+  SecOwnerFree*   = 0x03'u32
+  SecReqGroup0*   = 0x02'u32   ## value written to CTRL_PROT to claim group 0
+  SecRelease*     = 0x06'u32   ## value written to CTRL_PROT to release
+
+proc secCtrlProtAddr*(blk: SecBlock): uint {.inline.} =
+  SecBase + 0xFC'u + blk.ord.uint * 0x100'u
+
+proc secBlockOwner*(blk: SecBlock): uint32 {.inline.} =
+  (regRead(SecCtrlProtRead) shr (2 * blk.ord)) and 0x03'u32
+
+proc secClaimGroup0*(blk: SecBlock, release: var bool): bool =
+  ## Acquire a SEC_ENG block for group 0. `release` is set true only if this
+  ## call performed the claim (so callers know whether to release afterwards).
+  release = false
+  case secBlockOwner(blk)
+  of SecOwnerGroup0:
+    true
+  of SecOwnerFree:
+    regWrite(secCtrlProtAddr(blk), SecReqGroup0)
+    if secBlockOwner(blk) == SecOwnerGroup0:
+      release = true
+      true
+    else:
+      false
+  else:
+    false
+
+proc secReleaseGroup0*(blk: SecBlock, release: bool) =
+  if release:
+    regWrite(secCtrlProtAddr(blk), SecRelease)
+
+# =============================================================================
+# AES hardware key source
+#
+# The AES engine can run from a software key (the AesKey0..7 registers) or from
+# an eFuse-backed key slot whose bytes software never sees. Selecting an eFuse
+# slot sets HW_KEY_EN; aesEncryptBlock/aesDecryptBlock preserve that bit.
+# =============================================================================
+type
+  AesKeySource* = enum
+    aesKeySoft, aesKeyEfuse0, aesKeyEfuse1, aesKeyEfuse2, aesKeyEfuse3
+
+const
+  AesCfgDecKeySel* = 6   # AesCfg bit: decrypt uses hardware key slot
+
+proc aesSetKeySource*(src: AesKeySource) =
+  ## Select software key or an eFuse hardware key slot (0..3).
+  if src == aesKeySoft:
+    regClear(AesCfg, 1'u32 shl AesCfgHwKeyEn)
+  else:
+    let slot = (src.ord - 1).uint32
+    regModify(AesKeySel0, 0x3'u32, slot)
+    regSet(AesCfg, (1'u32 shl AesCfgHwKeyEn) or (1'u32 shl AesCfgDecKeySel))
+
+proc aesKeySource*(): AesKeySource =
+  if (regRead(AesCfg) and (1'u32 shl AesCfgHwKeyEn)) == 0:
+    aesKeySoft
+  else:
+    AesKeySource(1 + (regRead(AesKeySel0) and 0x3'u32).int)
+
+# =============================================================================
+# AES-XTS
+#
+# XTS-AES-128 uses a 256-bit key = key1 || key2. The data path reuses the
+# standard block engine with mode field = 3 (XTS) and the XTS_MODE bit in the
+# SBOOT register. (XIP-flash XTS lives in sfaes.nim; this is the data-buffer
+# path.)
+# =============================================================================
+const
+  AesSbootXtsMode* = 15   # AesSboot bit: enable XTS mode
+
+proc aesSetXtsMode*(enable: bool) =
+  if enable: regSet(AesSboot, 1'u32 shl AesSbootXtsMode)
+  else:      regClear(AesSboot, 1'u32 shl AesSbootXtsMode)
+
+proc aesXtsSetKeys*(key1, key2: array[4, uint32]) =
+  ## Load an XTS-AES-128 key pair as a single 256-bit key (key1 || key2).
+  var k: array[8, uint32]
+  for i in 0 ..< 4:
+    k[i] = key1[i]
+    k[i + 4] = key2[i]
+  aesSetKey(k)
+
+# =============================================================================
+# GMAC (Galois MAC) — link-mode descriptor engine
+#
+# GMAC always runs from a link descriptor whose address is written to LCA. The
+# descriptor (and the message it points at) must live in DMA-visible RAM. The
+# result tag is written back into the descriptor.
+# =============================================================================
+const
+  GmacCtrl0*   = SecBase + 0x500'u
+  GmacLca*     = SecBase + 0x504'u
+  GmacStatus*  = SecBase + 0x508'u
+  GmacBusy*    = 0
+  GmacTrig*    = 1
+  GmacEn*      = 2
+
+type
+  GmacLinkDesc* {.packed.} = object
+    ctrl*: uint32             ## [31:16] msgLen in 128-bit blocks, [10]intSet [9]intClr
+    srcAddr*: uint32
+    key*: array[4, uint32]
+    result*: array[4, uint32]
+
+proc gmacCompute*(desc: ptr GmacLinkDesc, timeout: uint32 = 1_000_000): SecError =
+  ## Run GMAC over a prepared link descriptor. `desc` must reside in
+  ## DMA-visible (uncached) RAM with ctrl/srcAddr/key filled in; the tag is
+  ## written to desc.result. Claims the GMAC block for group 0 for the run.
+  ## NOTE: pending Phase-0 GMAC validation on hardware (endianness/cache).
+  var release = false
+  if not secClaimGroup0(secBlkGmac, release):
+    return secBusy
+
+  var countdown = timeout
+  while (regRead(GmacCtrl0) and (1'u32 shl GmacBusy)) != 0:
+    if countdown == 0:
+      secReleaseGroup0(secBlkGmac, release)
+      return secBusy
+    countdown.dec
+
+  regWrite(GmacLca, cast[uint32](desc))
+  var ctrl = regRead(GmacCtrl0) or (1'u32 shl GmacEn) or (1'u32 shl GmacTrig)
+  regWrite(GmacCtrl0, ctrl)
+
+  countdown = timeout
+  while (regRead(GmacCtrl0) and (1'u32 shl GmacBusy)) != 0:
+    if countdown == 0:
+      secReleaseGroup0(secBlkGmac, release)
+      return secTimeout
+    countdown.dec
+
+  secReleaseGroup0(secBlkGmac, release)
   secOk

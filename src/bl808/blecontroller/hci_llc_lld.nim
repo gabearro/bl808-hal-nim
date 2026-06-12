@@ -18,7 +18,7 @@ proc hci_tl_init*() {.exportc, cdecl.} =
   ## Initialize HCI transport layer
   discard
 
-proc hci_tl_send*(buf: pointer, len: uint16): bool {.exportc, cdecl.} =
+proc hci_tl_send*(transportPacket: pointer, packetLen: uint16): bool {.exportc, cdecl.} =
   ## Send data over HCI transport
   return true
 
@@ -92,29 +92,29 @@ proc hci_evt_mask_set*(mask: ptr uint8) {.exportc, cdecl.} =
 proc hci_cmd_get_max_param_size*(): uint16 {.exportc, cdecl.} =
   return 255
 
-proc hci_cmd_received*(buf: pointer, len: uint16) {.exportc, cdecl.} =
+proc hci_cmd_received*(commandPacket: pointer, commandPacketLen: uint16) {.exportc, cdecl.} =
   ## Process received HCI command
-  if buf == nil or len < 3:
+  if commandPacket == nil or commandPacketLen < 3:
     return
-  let opcode = hciRawOpcode(buf)
-  let paramLen = hciRawParamLen(buf)
-  if len < uint16(paramLen.int + 3):
+  let opcode = hciRawOpcode(commandPacket)
+  let paramLen = hciRawParamLen(commandPacket)
+  if commandPacketLen < uint16(paramLen.int + 3):
     sendCmdComplete(opcode, 0x12'u8)
     return
   let params =
     if paramLen == 0: nil
-    else: hciRawParams(buf)
+    else: hciRawParams(commandPacket)
   discard completeHciCommand(opcode, params, paramLen)
 
 proc hci_command_handler*(msgid: KeMsgId, dest_id: KeTaskId,
-                           src_id: KeTaskId, param: pointer): int32 {.exportc, cdecl.} =
+                           src_id: KeTaskId, commandMsgParam: pointer): int32 {.exportc, cdecl.} =
   return 1  # KE_MSG_CONSUMED
 
-proc hci_send_2_controller*(param: pointer) {.exportc, cdecl.} =
-  ble_ke_msg_send(param)
+proc hci_send_2_controller*(controllerMsg: pointer) {.exportc, cdecl.} =
+  ble_ke_msg_send(controllerMsg)
 
-proc hci_send_2_host*(param: pointer) {.exportc, cdecl.} =
-  ble_ke_msg_send(param)
+proc hci_send_2_host*(hostMsg: pointer) {.exportc, cdecl.} =
+  ble_ke_msg_send(hostMsg)
 
 proc hci_look_for_cmd_desc*(opcode: uint16): pointer {.exportc, cdecl.} =
   return nil
@@ -125,36 +125,37 @@ proc hci_look_for_evt_desc*(code: uint8): pointer {.exportc, cdecl.} =
 proc hci_look_for_le_evt_desc*(subcode: uint8): pointer {.exportc, cdecl.} =
   return nil
 
-proc hci_build_evt*(code: uint8, param: pointer, param_len: uint16): pointer {.exportc, cdecl.} =
-  let msg = ble_ke_msg_alloc(code.KeMsgId, 0, 0, param_len)
-  if msg != nil and param != nil and param_len > 0:
-    discard c_memcpy(msg, param, param_len.csize_t)
-  return msg
+proc hci_build_evt*(eventCode: uint8, eventPayload: pointer, eventPayloadLen: uint16): pointer {.exportc, cdecl.} =
+  let eventMsg = ble_ke_msg_alloc(eventCode.KeMsgId, 0, 0, eventPayloadLen)
+  if eventMsg != nil and eventPayload != nil and eventPayloadLen > 0:
+    discard c_memcpy(eventMsg, eventPayload, eventPayloadLen.csize_t)
+  return eventMsg
 
-proc hci_build_le_evt*(subcode: uint8, param: pointer, param_len: uint16): pointer {.exportc, cdecl.} =
-  return hci_build_evt(0x3E, param, param_len)
+proc hci_build_le_evt*(leSubeventCode: uint8, leEventPayload: pointer, leEventPayloadLen: uint16): pointer {.exportc, cdecl.} =
+  discard leSubeventCode
+  return hci_build_evt(0x3E, leEventPayload, leEventPayloadLen)
 
-proc hci_build_cc_evt*(opcode: uint16, param: pointer, param_len: uint16): pointer {.exportc, cdecl.} =
-  return hci_build_evt(0x0E, param, param_len)
+proc hci_build_cc_evt*(opcode: uint16, commandCompletePayload: pointer, commandCompletePayloadLen: uint16): pointer {.exportc, cdecl.} =
+  return hci_build_evt(0x0E, commandCompletePayload, commandCompletePayloadLen)
 
-proc hci_build_acl_rx_data*(handle: uint16, data: pointer, len: uint16): pointer {.exportc, cdecl.} =
-  let msg = ble_ke_msg_alloc(0, handle, 0, len)
-  if msg != nil and data != nil and len > 0:
-    discard c_memcpy(msg, data, len.csize_t)
-  return msg
+proc hci_build_acl_rx_data*(handle: uint16, aclRxPayload: pointer, aclRxPayloadLen: uint16): pointer {.exportc, cdecl.} =
+  let aclRxMsg = ble_ke_msg_alloc(0, handle, 0, aclRxPayloadLen)
+  if aclRxMsg != nil and aclRxPayload != nil and aclRxPayloadLen > 0:
+    discard c_memcpy(aclRxMsg, aclRxPayload, aclRxPayloadLen.csize_t)
+  return aclRxMsg
 
-proc hci_acl_tx_data_alloc*(handle: uint16, len: uint16): pointer {.exportc, cdecl.} =
-  return ble_ke_msg_alloc(0, handle, 0, len)
+proc hci_acl_tx_data_alloc*(handle: uint16, aclTxPayloadLen: uint16): pointer {.exportc, cdecl.} =
+  return ble_ke_msg_alloc(0, handle, 0, aclTxPayloadLen)
 
 proc hciAclTxDataStatus(handle: uint16, pbBcFlag: uint8,
-                        data: pointer, len: uint16): uint8 =
+                        aclTxPayload: pointer, aclTxPayloadLen: uint16): uint8 =
   let pb = pbBcFlag and 0x03'u8
   let bc = (pbBcFlag shr 2) and 0x03'u8
   if bc != 0'u8 or (pb != 0'u8 and pb != 0x02'u8):
     return HciStatusUnsupportedFeatureParam
-  if data == nil or len == 0'u16:
+  if aclTxPayload == nil or aclTxPayloadLen == 0'u16:
     return HciStatusInvalidParams
-  if len > NimBleLeMaxDataOctets:
+  if aclTxPayloadLen > NimBleLeMaxDataOctets:
     return HciStatusInvalidParams
   when defined(bl808m0) and bl808BleNimConnectionEnabled and
       bl808BleNimManualConnTx and bl808BleNimPureConnection:
@@ -168,8 +169,8 @@ proc hciAclTxDataStatus(handle: uint16, pbBcFlag: uint8,
     if nim_acl_host_tx_pending != 0'u32:
       inc nim_acl_host_tx_reject_count
       return HciStatusCommandDisallowed
-    copyBtbleEmBytes(NimAclTxEmOffset, cast[ptr uint8](data), len.int)
-    nimConnTxElementInit(addr nim_acl_host_tx_buf[0], NimAclTxEmOffset, len)
+    copyBtbleEmBytes(NimAclTxEmOffset, cast[ptr uint8](aclTxPayload), aclTxPayloadLen.int)
+    nimConnTxElementInit(addr nim_acl_host_tx_buf[0], NimAclTxEmOffset, aclTxPayloadLen)
     nim_acl_host_tx_pending = 1
     inc nim_acl_host_tx_count
     nimConnArmPendingHostAclTx()
@@ -178,15 +179,15 @@ proc hciAclTxDataStatus(handle: uint16, pbBcFlag: uint8,
     HciStatusUnsupportedFeatureParam
 
 proc hciOwnedAclTxDataReceived(handle: uint16, pbBcFlag: uint8,
-                               data: pointer, len: uint16): uint8 =
-  result = hciAclTxDataStatus(handle, pbBcFlag, data, len)
-  if data != nil:
-    ble_util_buf_acl_tx_free(data)
+                               ownedAclTxPayload: pointer, ownedAclTxPayloadLen: uint16): uint8 =
+  result = hciAclTxDataStatus(handle, pbBcFlag, ownedAclTxPayload, ownedAclTxPayloadLen)
+  if ownedAclTxPayload != nil:
+    ble_util_buf_acl_tx_free(ownedAclTxPayload)
   if result != HciStatusSuccess:
     sendNumberOfCompletedPackets(handle and 0x0FFF'u16, 1'u16)
 
-proc hci_acl_tx_data_received*(handle: uint16, data: pointer, len: uint16) {.exportc, cdecl.} =
-  discard hciOwnedAclTxDataReceived(handle, 0x02'u8, data, len)
+proc hci_acl_tx_data_received*(handle: uint16, aclTxPayload: pointer, aclTxPayloadLen: uint16) {.exportc, cdecl.} =
+  discard hciOwnedAclTxDataReceived(handle, 0x02'u8, aclTxPayload, aclTxPayloadLen)
 
 proc hci_get_tx_queue_num*(): uint32 {.exportc, cdecl.} =
   when defined(bl808m0) and bl808BleNimConnectionEnabled and
@@ -216,34 +217,35 @@ proc hciUtilCopyByFormat(outBuf: pointer, inBuf: pointer, format: cstring,
     outLen[] = 0
   if outBuf == nil or inBuf == nil or format == nil:
     return
-  let outRaw = cast[ptr UncheckedArray[uint8]](outBuf)
-  let inRaw = cast[ptr UncheckedArray[uint8]](inBuf)
-  let fmt = cast[ptr UncheckedArray[uint8]](format)
-  var fmtOff = 0
-  var inOff = 0
-  var outOff = 0
-  var repeat = 0
-  while fmt[fmtOff] != 0'u8:
-    let ch = fmt[fmtOff]
-    inc fmtOff
-    if ch >= uint8('0') and ch <= uint8('9'):
-      repeat = repeat * 10 + int(ch - uint8('0'))
+  let outputBytes = cast[ptr UncheckedArray[uint8]](outBuf)
+  let inputBytes = cast[ptr UncheckedArray[uint8]](inBuf)
+  let formatBytes = cast[ptr UncheckedArray[uint8]](format)
+  var formatOffset = 0
+  var inputOffset = 0
+  var outputOffset = 0
+  var repeatCount = 0
+  while formatBytes[formatOffset] != 0'u8:
+    let formatToken = formatBytes[formatOffset]
+    inc formatOffset
+    if formatToken >= uint8('0') and formatToken <= uint8('9'):
+      repeatCount = repeatCount * 10 + int(formatToken - uint8('0'))
       continue
-    if ch == uint8(' ') or ch == uint8(',') or ch == uint8(':'):
+    if formatToken == uint8(' ') or formatToken == uint8(',') or formatToken == uint8(':'):
       continue
-    var size = hciFormatFieldSize(ch)
-    if size == 0:
-      repeat = 0
+    var fieldSize = hciFormatFieldSize(formatToken)
+    if fieldSize == 0:
+      repeatCount = 0
       continue
-    if repeat > 0:
-      size = size * repeat
-      repeat = 0
-    for i in 0 ..< size:
-      outRaw[outOff + i] = inRaw[inOff + i]
-    inOff += size
-    outOff += size
+    if repeatCount > 0:
+      fieldSize = fieldSize * repeatCount
+      repeatCount = 0
+    for fieldByteOffset in 0 ..< fieldSize:
+      outputBytes[outputOffset + fieldByteOffset] =
+        inputBytes[inputOffset + fieldByteOffset]
+    inputOffset += fieldSize
+    outputOffset += fieldSize
   if outLen != nil:
-    outLen[] = outOff.uint16
+    outLen[] = outputOffset.uint16
 
 proc hci_util_pack*(out_buf: pointer, in_buf: pointer, format: cstring, out_len: ptr uint16) {.exportc, cdecl.} =
   ## Pack HCI parameters according to the compact controller format string.
@@ -258,11 +260,11 @@ proc hci_util_unpack*(out_buf: pointer, in_buf: pointer, format: cstring, out_le
 # ---------------------------------------------------------------------------
 
 proc llc_init*() {.exportc, cdecl.} =
-  for i in 0 ..< LLC_CON_MAX:
-    llc_env[i] = nil
+  for connectionHandleIndex in 0 ..< LLC_CON_MAX:
+    llc_env[connectionHandleIndex] = nil
   when defined(bl808m0) and bl808BleNimConnectionEnabled and bl808BleNimLlcStart:
-    for i in 0 ..< nim_llc_start_env_slots.len:
-      nim_llc_start_env_slots[i] = nil
+    for llcStartSlotIndex in 0 ..< nim_llc_start_env_slots.len:
+      nim_llc_start_env_slots[llcStartSlotIndex] = nil
 
 proc llc_reset*() {.exportc, cdecl.} =
   llc_init()
@@ -342,23 +344,23 @@ proc nimBleCurrentRemoteFeatures(): uint64 =
       return nim_llcp_state.peerFeatures
   0'u64
 
-proc hciPutLe16(dst: ptr UncheckedArray[uint8], off: int, value: uint16) =
-  dst[off] = uint8(value and 0x00FF'u16)
-  dst[off + 1] = uint8((value shr 8) and 0x00FF'u16)
+proc hciPutLe16(destBytes: ptr UncheckedArray[uint8], byteOffset: int, value: uint16) =
+  destBytes[byteOffset] = uint8(value and 0x00FF'u16)
+  destBytes[byteOffset + 1] = uint8((value shr 8) and 0x00FF'u16)
 
-proc nimBleCurrentChannelMap(dst: ptr UncheckedArray[uint8]) =
-  if dst == nil:
+proc nimBleCurrentChannelMap(channelMapOut: ptr UncheckedArray[uint8]) =
+  if channelMapOut == nil:
     return
-  dst[0] = 0xFF'u8
-  dst[1] = 0xFF'u8
-  dst[2] = 0xFF'u8
-  dst[3] = 0xFF'u8
-  dst[4] = 0x1F'u8
+  channelMapOut[0] = 0xFF'u8
+  channelMapOut[1] = 0xFF'u8
+  channelMapOut[2] = 0xFF'u8
+  channelMapOut[3] = 0xFF'u8
+  channelMapOut[4] = 0x1F'u8
   when defined(bl808m0) and bl808BleNimPureConnection:
     if nim_conn_state.active:
-      for i in 0 ..< 5:
-        dst[i] = nim_conn_state.channelMap[i]
-      dst[4] = dst[4] and 0x1F'u8
+      for channelMapByteIndex in 0 ..< 5:
+        channelMapOut[channelMapByteIndex] = nim_conn_state.channelMap[channelMapByteIndex]
+      channelMapOut[4] = channelMapOut[4] and 0x1F'u8
 
 proc nimBleCurrentPhy(): uint8 =
   when defined(bl808m0) and bl808BleNimPureConnection:
@@ -605,8 +607,8 @@ proc llc_feats_rd_event_send*(conhdl: uint16, status: uint8) {.exportc, cdecl.} 
              uint8((conhdl shr 8) and 0xFF), 0'u8, 0'u8, 0'u8, 0'u8,
              0'u8, 0'u8, 0'u8, 0'u8]
   let features = nimBleCurrentRemoteFeatures()
-  for i in 0 ..< 8:
-    evt[4 + i] = nimBleFeatureByte(features, i)
+  for remoteFeatureByteIndex in 0 ..< 8:
+    evt[4 + remoteFeatureByteIndex] = nimBleFeatureByte(features, remoteFeatureByteIndex)
   sendLeMetaPayload(addr evt[0], evt.len.uint8)
 
 proc llc_le_ch_sel_algo_evt_send*(conhdl: uint16, algo: uint8) {.exportc, cdecl.} =
@@ -821,17 +823,17 @@ proc llc_util_dicon_procedure*(conhdl: uint16, reason: uint8) {.exportc, cdecl.}
     disconnect.active = 1
 
 proc llc_util_get_free_conhdl*(): uint16 {.exportc, cdecl.} =
-  for i in 0'u16 ..< LLC_CON_MAX.uint16:
-    if llc_env[i] == nil:
-      return i
+  for freeConnectionHandle in 0'u16 ..< LLC_CON_MAX.uint16:
+    if llc_env[freeConnectionHandle] == nil:
+      return freeConnectionHandle
   return 0xFFFF'u16
 
 proc llc_util_get_nb_active_link*(): uint8 {.exportc, cdecl.} =
-  var count: uint8 = 0
-  for i in 0 ..< LLC_CON_MAX:
-    if llc_env[i] != nil:
-      inc count
-  return count
+  var activeLinkCount: uint8 = 0
+  for connectionHandleIndex in 0 ..< LLC_CON_MAX:
+    if llc_env[connectionHandleIndex] != nil:
+      inc activeLinkCount
+  return activeLinkCount
 
 proc llc_util_set_auth_payl_to_margin*(conhdl: uint16, margin: uint16) {.exportc, cdecl.} =
   discard
@@ -856,7 +858,7 @@ proc llc_util_update_channel_map*(conhdl: uint16, map: ptr uint8) {.exportc, cde
 proc lld_init*(reset: bool) {.exportc, cdecl.} =
   discard reset
   blePlatformInitMark(0x200'u32)
-  discard c_memset(addr lld_evt_env_data[0], 0, sizeof(lld_evt_env_data).csize_t)
+  discard c_memset(addr lld_evt_env_storage[0], 0, sizeof(lld_evt_env_storage).csize_t)
   blePlatformInitMark(0x201'u32)
   initBleCoreRegisters()
   blePlatformInitMark(0x202'u32)
@@ -1097,24 +1099,24 @@ proc lld_util_freq2chnl*(freq: uint8): uint8 {.exportc, cdecl.} =
 proc lld_util_get_bd_address*(addr_out: ptr BdAddr) {.exportc, cdecl.} =
   if addr_out == nil:
     return
-  for i in 0 ..< addr_out.data.len:
-    addr_out.data[i] =
-      if nim_public_addr_valid: nim_public_addr[i]
-      else: fallbackLocalAddrByte(i)
+  for publicAddressByteIndex in 0 ..< addr_out.bytes.len:
+    addr_out.bytes[publicAddressByteIndex] =
+      if nim_public_addr_valid: nim_public_addr[publicAddressByteIndex]
+      else: fallbackLocalAddrByte(publicAddressByteIndex)
 
 proc lld_util_set_bd_address*(addr_in: ptr BdAddr) {.exportc, cdecl.} =
   if addr_in == nil:
     return
-  let lo = addr_in.data[0].uint32 or
-           (addr_in.data[1].uint32 shl 8) or
-           (addr_in.data[2].uint32 shl 16) or
-           (addr_in.data[3].uint32 shl 24)
-  let hi = addr_in.data[4].uint32 or
-           (addr_in.data[5].uint32 shl 8)
-  regWrite(BLE_BASE + 0x24'u32, lo)
-  regWrite(BLE_BASE + 0x28'u32, hi)
-  for i in 0 ..< nim_public_addr.len:
-    nim_public_addr[i] = addr_in.data[i]
+  let publicAddrLowWord = addr_in.bytes[0].uint32 or
+           (addr_in.bytes[1].uint32 shl 8) or
+           (addr_in.bytes[2].uint32 shl 16) or
+           (addr_in.bytes[3].uint32 shl 24)
+  let publicAddrHighWord = addr_in.bytes[4].uint32 or
+           (addr_in.bytes[5].uint32 shl 8)
+  regWrite(BLE_BASE + 0x24'u32, publicAddrLowWord)
+  regWrite(BLE_BASE + 0x28'u32, publicAddrHighWord)
+  for publicAddressByteIndex in 0 ..< nim_public_addr.len:
+    nim_public_addr[publicAddressByteIndex] = addr_in.bytes[publicAddressByteIndex]
   nim_public_addr_valid = true
 
 proc lld_util_get_local_offset*(): int16 {.exportc, cdecl.} =
@@ -1150,169 +1152,171 @@ else:
     discard elt
 
 proc llm_init*() {.exportc, cdecl.} =
-  discard c_memset(addr llm_env_data, 0, sizeof(LlmEnv).csize_t)
+  discard c_memset(addr llm_env_storage, 0, sizeof(LlmEnv).csize_t)
   discard c_memset(addr llm_wl[0], 0, sizeof(llm_wl).csize_t)
   discard c_memset(addr llm_wl_type[0], 0, sizeof(llm_wl_type).csize_t)
   let maps = llmChannelMaps()
-  for i in 0 ..< hci_le_evt_mask.len:
-    llm_env_data.data[4 + i] = hci_le_evt_mask[i]
-  for i in 0 ..< maps.localMap.len:
-    maps.localMap[i] = 0xFF'u8
-    maps.masterMap[i] = 0xFF'u8
+  let runtimeCfg = llmRuntimeConfig()
+  for leEventMaskByteIndex in 0 ..< hci_le_evt_mask.len:
+    runtimeCfg.leEventMask[leEventMaskByteIndex] = hci_le_evt_mask[leEventMaskByteIndex]
+  for dataChannelMapByteIndex in 0 ..< maps.localMap.len:
+    maps.localMap[dataChannelMapByteIndex] = 0xFF'u8
+    maps.masterMap[dataChannelMapByteIndex] = 0xFF'u8
   maps.localMap[4] = maps.localMap[4] and 0x1F'u8
   maps.masterMap[4] = maps.masterMap[4] and 0x1F'u8
-  llm_env_data.data[428] = 0xA0'u8
-  llm_env_data.data[429] = 0x1F'u8
-  llm_env_data.data[430] = 27'u8
-  llm_env_data.data[431] = 0'u8
-  llm_env_data.data[432] = 0x48'u8
-  llm_env_data.data[433] = 0x01'u8
-  llm_env_data.data[436] = 0x07'u8
-  llm_env_data.data[437] = 0x07'u8
-  llm_env_data.data[439] = 0x2C'u8
-  llm_env_data.data[478] = 0x84'u8
-  llm_env_data.data[479] = 0x03'u8
+  runtimeCfg.connectionAcceptTimeout = 0x1FA0'u16
+  runtimeCfg.suggestedMaxTxOctets = 27'u16
+  runtimeCfg.suggestedMaxTxTime = 0x0148'u16
+  runtimeCfg.featureSet[0] = 0x07'u8
+  runtimeCfg.featureSet[1] = 0x07'u8
+  runtimeCfg.featureSet[3] = 0x2C'u8
+  runtimeCfg.suggestedMaxRxOctets = 0x0384'u16
 
 proc llm_ble_ready*() {.exportc, cdecl.} =
   discard
 
 proc llm_le_evt_mask_check*(evtBit: uint8): uint8 {.exportc, cdecl.} =
-  let byteIdx = int(evtBit shr 3)
-  if byteIdx >= 8:
+  let eventMaskByteIndex = int(evtBit shr 3)
+  if eventMaskByteIndex >= 8:
     return 0
   let bitIdx = evtBit and 0x07'u8
-  if (llm_env_data.data[4 + byteIdx] and (1'u8 shl bitIdx)) != 0'u8:
+  if (llmRuntimeConfig().leEventMask[eventMaskByteIndex] and
+      (1'u8 shl bitIdx)) != 0'u8:
     1
   else:
     0
 
 proc llm_get_connection_accept_timeout*(): uint16 {.exportc, cdecl.} =
-  uint16(llm_env_data.data[428]) or
-    (uint16(llm_env_data.data[429]) shl 8)
+  llmRuntimeConfig().connectionAcceptTimeout
 
 proc llm_set_connection_accept_timeout*(timeout: uint16) {.exportc, cdecl.} =
-  llm_env_data.data[428] = uint8(timeout and 0x00FF'u16)
-  llm_env_data.data[429] = uint8((timeout shr 8) and 0x00FF'u16)
+  llmRuntimeConfig().connectionAcceptTimeout = timeout
 
 proc llm_clk_acc_set*(position: uint8, enable: uint8) {.exportc, cdecl.} =
-  let bit = 1'u32 shl (position and 0x1F'u8)
-  var mask = uint32(llm_env_data.data[0]) or
-    (uint32(llm_env_data.data[1]) shl 8) or
-    (uint32(llm_env_data.data[2]) shl 16) or
-    (uint32(llm_env_data.data[3]) shl 24)
+  let clockAccuracyBit = 1'u32 shl (position and 0x1F'u8)
+  let runtimeCfg = llmRuntimeConfig()
+  var mask = runtimeCfg.clockAccuracyMask
   if enable != 0'u8:
-    mask = mask or bit
+    mask = mask or clockAccuracyBit
     rwip_prevent_sleep_set(0x0200'u16)
   else:
-    mask = mask and not bit
+    mask = mask and not clockAccuracyBit
     if mask == 0'u32:
       rwip_prevent_sleep_clear(0x0200'u16)
-  llm_env_data.data[0] = uint8(mask and 0x000000FF'u32)
-  llm_env_data.data[1] = uint8((mask shr 8) and 0x000000FF'u32)
-  llm_env_data.data[2] = uint8((mask shr 16) and 0x000000FF'u32)
-  llm_env_data.data[3] = uint8((mask shr 24) and 0x000000FF'u32)
+  runtimeCfg.clockAccuracyMask = mask
 
 proc llm_master_ch_map_get*(): ptr uint8 {.exportc, cdecl.} =
   addr llmChannelMaps().masterMap[0]
 
 proc llm_rx_path_comp_get*(): int16 {.exportc, cdecl.} =
-  cast[int16](uint16(llm_env_data.data[482]) or
-    (uint16(llm_env_data.data[483]) shl 8))
+  llmRuntimeConfig().rxPathCompensation
 
 proc llm_tx_path_comp_get*(): int16 {.exportc, cdecl.} =
-  cast[int16](uint16(llm_env_data.data[484]) or
-    (uint16(llm_env_data.data[485]) shl 8))
+  llmRuntimeConfig().txPathCompensation
+
+proc llmActivityStateByte(activityId: uint8): ptr uint8 {.inline.} =
+  let stateOffset = int(activityId) * 64 + 72
+  if stateOffset >= llm_env_storage.storage.len:
+    return nil
+  if activityId < 5'u8:
+    addr llmActivitySlot(activityId.int).state
+  else:
+    addr llm_env_storage.storage[stateOffset]
+
+proc llmActivityPlanElementPtr(activityId: uint8; requireFullWindow: bool): pointer {.inline.} =
+  let planOffset = int(activityId) * 64 + 16
+  if planOffset >= llm_env_storage.storage.len:
+    return nil
+  if requireFullWindow and planOffset + 56 >= llm_env_storage.storage.len:
+    return nil
+  if activityId < 5'u8:
+    cast[pointer](addr llmActivitySlot(activityId.int).schedulerPlanElement[0])
+  else:
+    cast[pointer](addr llm_env_storage.storage[planOffset])
 
 proc llm_plan_elt_get*(activityId: uint8): pointer {.exportc, cdecl.} =
-  let off = int(activityId) * 64 + 16
-  if off >= llm_env_data.data.len:
-    return nil
-  cast[pointer](addr llm_env_data.data[off])
+  llmActivityPlanElementPtr(activityId, false)
 
 proc llm_is_adv_itf_legacy*(): uint8 {.exportc, cdecl.} =
-  if llm_env_data.data[487] == 1'u8: 1 else: 0
+  if llmRuntimeConfig().advertisingInterfaceMode == 1'u8: 1 else: 0
 
 proc llm_adv_itf_extended_set*() {.exportc, cdecl.} =
-  if llm_env_data.data[487] == 0'u8:
-    llm_env_data.data[487] = 2'u8
+  let runtimeCfg = llmRuntimeConfig()
+  if runtimeCfg.advertisingInterfaceMode == 0'u8:
+    runtimeCfg.advertisingInterfaceMode = 2'u8
 
 proc llm_dev_list_empty_entry*(): uint8 {.exportc, cdecl.} =
-  for i in 0 ..< 7:
-    if (llm_env_data.data[365 + i * 10] and 1'u8) == 0'u8:
-      return uint8(i)
+  for emptyDeviceListIndex in 0 ..< 7:
+    if (llmDeviceListEntry(emptyDeviceListIndex).flags and 1'u8) == 0'u8:
+      return uint8(emptyDeviceListIndex)
   7'u8
 
 proc llm_dev_list_search*(addrIn: ptr BdAddr, addrType: uint8): uint8
     {.exportc, cdecl.} =
-  for i in 0 ..< 7:
-    let base = 356 + i * 10
-    if (llm_env_data.data[base + 9] and 1'u8) != 0'u8 and
-        llm_env_data.data[base + 8] == addrType and addrIn != nil:
-      let entry = cast[ptr BdAddr](addr llm_env_data.data[base])
-      if co_bdaddr_compare(entry, addrIn):
-        return uint8(i)
+  for deviceListIndex in 0 ..< 7:
+    let deviceEntry = llmDeviceListEntry(deviceListIndex)
+    if (deviceEntry.flags and 1'u8) != 0'u8 and
+        deviceEntry.addrType == addrType and addrIn != nil:
+      if co_bdaddr_compare(addr deviceEntry.deviceAddr, addrIn):
+        return uint8(deviceListIndex)
   7'u8
 
 proc llm_is_dev_connected*(addrIn: ptr BdAddr, addrType: uint8): uint8
     {.exportc, cdecl.} =
   if addrIn == nil:
     return 0
-  for i in 0 ..< 5:
-    let base = 40 + i * 64
-    if llm_env_data.data[base + 32] == 9'u8 and
-        (llm_env_data.data[base + 6] xor addrType) == 0'u8:
-      let entry = cast[ptr BdAddr](addr llm_env_data.data[base])
-      if co_bdaddr_compare(addrIn, entry):
+  for connectedActivityIndex in 0 ..< 5:
+    let activity = llmActivitySlot(connectedActivityIndex)
+    if activity.state == 9'u8 and (activity.peerAddrType xor addrType) == 0'u8:
+      if co_bdaddr_compare(addrIn, addr activity.peerAddr):
         return 1
   0
 
 proc llm_activity_free_get*(activityId: ptr uint8): uint8 {.exportc, cdecl.} =
   if activityId == nil:
     return 7
-  for i in 0 ..< 5:
-    if llm_env_data.data[72 + i * 64] == 0'u8:
-      activityId[] = uint8(i)
-      discard c_memset(addr llm_env_data.data[40 + i * 64], 0, 32)
+  for freeActivityIndex in 0 ..< 5:
+    let activity = llmActivitySlot(freeActivityIndex)
+    if activity.state == 0'u8:
+      activityId[] = uint8(freeActivityIndex)
+      discard c_memset(addr activity.peerAddr, 0, 32)
       return 0
   activityId[] = 5'u8
   7
 
 proc llm_activity_free_set*(activityId: uint8) {.exportc, cdecl.} =
-  let off = int(activityId) * 64 + 16
-  if off + 56 >= llm_env_data.data.len:
+  let activityStateByte = llmActivityStateByte(activityId)
+  let planElement = llmActivityPlanElementPtr(activityId, true)
+  if activityStateByte == nil or planElement == nil:
     return
-  llm_env_data.data[72 + int(activityId) * 64] = 0'u8
-  sch_plan_rem(cast[pointer](addr llm_env_data.data[off]))
+  activityStateByte[] = 0'u8
+  sch_plan_rem(planElement)
 
 proc llm_adv_hdl_to_id*(advHandle: uint8, paramOut: ptr pointer): uint8
     {.exportc, cdecl.} =
-  for i in 0 ..< 5:
-    let base = 12 + i * 64
-    let state = llm_env_data.data[base + 60]
-    if state >= 1'u8 and state <= 3'u8:
-      let raw = uint32(llm_env_data.data[base]) or
-        (uint32(llm_env_data.data[base + 1]) shl 8) or
-        (uint32(llm_env_data.data[base + 2]) shl 16) or
-        (uint32(llm_env_data.data[base + 3]) shl 24)
-      if raw != 0'u32:
-        let param = cast[ptr UncheckedArray[uint8]](raw.uint)
-        if param[0] == advHandle:
+  for advertisingActivityIndex in 0 ..< 5:
+    let activity = llmActivitySlot(advertisingActivityIndex)
+    if activity.state >= 1'u8 and activity.state <= 3'u8:
+      let advertisingParamAddr = activity.advertisingParamPtr
+      if advertisingParamAddr != 0'u32:
+        let advParams = cast[ptr UncheckedArray[uint8]](advertisingParamAddr.uint)
+        if advParams[0] == advHandle:
           if paramOut != nil:
-            paramOut[] = cast[pointer](raw.uint)
-          return uint8(i)
+            paramOut[] = cast[pointer](advertisingParamAddr.uint)
+          return uint8(advertisingActivityIndex)
   0xFF'u8
 
 proc llm_cmd_cmp_send*(opcode: uint16, status: uint8) {.exportc, cdecl.} =
-  let param = ble_ke_msg_alloc(0x1100'u16, 0'u16, opcode, 1'u16)
-  if param != nil:
-    cast[ptr uint8](param)[] = status
-    hci_send_2_host(param)
+  let cmdCompleteStatusParam = ble_ke_msg_alloc(0x1100'u16, 0'u16, opcode, 1'u16)
+  if cmdCompleteStatusParam != nil:
+    cast[ptr uint8](cmdCompleteStatusParam)[] = status
+    hci_send_2_host(cmdCompleteStatusParam)
 
 proc llm_cmd_stat_send*(opcode: uint16, status: uint8) {.exportc, cdecl.} =
-  let param = ble_ke_msg_alloc(0x1101'u16, 0'u16, opcode, 1'u16)
-  if param != nil:
-    cast[ptr uint8](param)[] = status
-    hci_send_2_host(param)
+  let cmdStatusParam = ble_ke_msg_alloc(0x1101'u16, 0'u16, opcode, 1'u16)
+  if cmdStatusParam != nil:
+    cast[ptr uint8](cmdStatusParam)[] = status
+    hci_send_2_host(cmdStatusParam)
 
 when not (defined(bl808m0) and
     (bl808BleNimConnectionEnabled or bl808BleNimPureCentral)):
@@ -1376,10 +1380,10 @@ proc llm_pdu_defer*() {.exportc, cdecl.} =
   discard
 
 proc llm_set_adv_data*(data: ptr uint8, len: uint8) {.exportc, cdecl.} =
-  let n = min(len.int, nim_adv_data.len)
-  nim_adv_data_len = n.uint8
+  let advDataCopyLen = min(len.int, nim_adv_data.len)
+  nim_adv_data_len = advDataCopyLen.uint8
   if data != nil:
-    discard c_memcpy(addr nim_adv_data[0], data, n.csize_t)
+    discard c_memcpy(addr nim_adv_data[0], data, advDataCopyLen.csize_t)
 
 proc llm_set_adv_en*(en: bool) {.exportc, cdecl.} =
   discard programNimAdvertising(en)
@@ -1398,10 +1402,10 @@ proc llm_set_scan_param*(params: pointer) {.exportc, cdecl.} =
                      nim_scan_params.len.csize_t)
 
 proc llm_set_scan_rsp_data*(data: ptr uint8, len: uint8) {.exportc, cdecl.} =
-  let n = min(len.int, nim_scan_rsp_data.len)
-  nim_scan_rsp_data_len = n.uint8
+  let scanRspDataCopyLen = min(len.int, nim_scan_rsp_data.len)
+  nim_scan_rsp_data_len = scanRspDataCopyLen.uint8
   if data != nil:
-    discard c_memcpy(addr nim_scan_rsp_data[0], data, n.csize_t)
+    discard c_memcpy(addr nim_scan_rsp_data[0], data, scanRspDataCopyLen.csize_t)
   if nim_adv_enabled:
     programBtbleLegacyAdv(nim_adv_data_len)
 
@@ -1412,15 +1416,17 @@ proc llm_util_apply_bd_addr*(addr_in: ptr BdAddr) {.exportc, cdecl.} =
   lld_util_set_bd_address(addr_in)
 
 proc llm_util_bd_addr_in_wl*(addr_in: ptr BdAddr, addr_type: uint8): bool {.exportc, cdecl.} =
-  for i in 0 ..< LLM_WL_MAX:
-    if llm_wl_type[i] == addr_type and co_bdaddr_compare(addr llm_wl[i], addr_in):
+  for whitelistLookupSlot in 0 ..< LLM_WL_MAX:
+    if llm_wl_type[whitelistLookupSlot] == addr_type and
+        co_bdaddr_compare(addr llm_wl[whitelistLookupSlot], addr_in):
       return true
   return false
 
 proc llm_util_bd_addr_wl_position*(addr_in: ptr BdAddr, addr_type: uint8): int32 {.exportc, cdecl.} =
-  for i in 0 ..< LLM_WL_MAX:
-    if llm_wl_type[i] == addr_type and co_bdaddr_compare(addr llm_wl[i], addr_in):
-      return i.int32
+  for whitelistPositionSlot in 0 ..< LLM_WL_MAX:
+    if llm_wl_type[whitelistPositionSlot] == addr_type and
+        co_bdaddr_compare(addr llm_wl[whitelistPositionSlot], addr_in):
+      return whitelistPositionSlot.int32
   return -1
 
 proc llmWlSlotAvailable(slot: int): bool {.inline.} =
@@ -1435,13 +1441,14 @@ proc llmWlNormalizeSlot(position: uint8): int {.inline.} =
 proc llm_util_bl_add*(addr_in: ptr BdAddr, addr_type: uint8): bool {.exportc, cdecl.} =
   if addr_in == nil:
     return false
-  for i in 0 ..< LLM_WL_MAX:
-    if llm_wl_type[i] == addr_type and co_bdaddr_compare(addr llm_wl[i], addr_in):
+  for existingWhitelistSlot in 0 ..< LLM_WL_MAX:
+    if llm_wl_type[existingWhitelistSlot] == addr_type and
+        co_bdaddr_compare(addr llm_wl[existingWhitelistSlot], addr_in):
       return true
-  for i in 0 ..< LLM_WL_MAX:
-    if llm_wl_type[i] == 0xFF:  # Empty slot
-      co_bdaddr_set(addr llm_wl[i], addr_in)
-      llm_wl_type[i] = addr_type
+  for freeWhitelistSlot in 0 ..< LLM_WL_MAX:
+    if llm_wl_type[freeWhitelistSlot] == 0xFF:  # Empty slot
+      co_bdaddr_set(addr llm_wl[freeWhitelistSlot], addr_in)
+      llm_wl_type[freeWhitelistSlot] = addr_type
       return true
   return false
 
@@ -1453,10 +1460,11 @@ proc llm_util_bl_check*(addr_in: ptr BdAddr, addr_type: uint8): bool {.exportc, 
 proc llm_util_bl_rem*(addr_in: ptr BdAddr, addr_type: uint8): bool {.exportc, cdecl.} =
   if addr_in == nil:
     return false
-  for i in 0 ..< LLM_WL_MAX:
-    if llm_wl_type[i] == addr_type and co_bdaddr_compare(addr llm_wl[i], addr_in):
-      discard c_memset(addr llm_wl[i], 0, sizeof(BdAddr).csize_t)
-      llm_wl_type[i] = 0xFF
+  for removeWhitelistSlot in 0 ..< LLM_WL_MAX:
+    if llm_wl_type[removeWhitelistSlot] == addr_type and
+        co_bdaddr_compare(addr llm_wl[removeWhitelistSlot], addr_in):
+      discard c_memset(addr llm_wl[removeWhitelistSlot], 0, sizeof(BdAddr).csize_t)
+      llm_wl_type[removeWhitelistSlot] = 0xFF
       return true
   return false
 
@@ -1474,14 +1482,14 @@ proc llm_util_check_evt_mask*(evt_bit: uint8): bool {.exportc, cdecl.} =
 proc llm_util_check_map_validity*(map: ptr uint8): bool {.exportc, cdecl.} =
   ## Check if channel map has at least 2 used channels
   let mapBytes = cast[ptr UncheckedArray[uint8]](map)
-  var count = 0
-  for i in 0 ..< 5:
-    let byte_val = mapBytes[i]
-    for b in 0 ..< 8:
-      if i * 8 + b < 37:  # Only 37 data channels
-        if (byte_val and (1'u8 shl b)) != 0:
-          inc count
-  return count >= 2
+  var enabledDataChannelCount = 0
+  for channelMapByteIndex in 0 ..< 5:
+    let channelMapByte = mapBytes[channelMapByteIndex]
+    for channelMapBitIndex in 0 ..< 8:
+      if channelMapByteIndex * 8 + channelMapBitIndex < 37:  # Only 37 data channels
+        if (channelMapByte and (1'u8 shl channelMapBitIndex)) != 0:
+          inc enabledDataChannelCount
+  return enabledDataChannelCount >= 2
 
 proc llm_util_get_channel_map*(map: ptr uint8) {.exportc, cdecl.} =
   discard c_memset(map, 0xFF, 5)
@@ -1492,12 +1500,12 @@ proc llm_util_get_channel_map*(map: ptr uint8) {.exportc, cdecl.} =
 proc llm_ch_map_update*(): uint32 {.exportc, cdecl.} =
   var nextMap: array[5, uint8]
   let maps = llmChannelMaps()
-  for i in 0 ..< nextMap.len:
-    nextMap[i] = maps.masterMap[i]
+  for masterChannelMapByteIndex in 0 ..< nextMap.len:
+    nextMap[masterChannelMapByteIndex] = maps.masterMap[masterChannelMapByteIndex]
   if not llm_util_check_map_validity(addr nextMap[0]):
     llm_util_get_channel_map(addr nextMap[0])
-  for i in 0 ..< nextMap.len:
-    maps.localMap[i] = nextMap[i]
+  for localChannelMapByteIndex in 0 ..< nextMap.len:
+    maps.localMap[localChannelMapByteIndex] = nextMap[localChannelMapByteIndex]
   lld_ch_map_set(addr nextMap[0])
   0
 

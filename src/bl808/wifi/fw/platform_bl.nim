@@ -134,11 +134,11 @@ proc bl_nap_calculate*(): uint32 {.exportc, cdecl.} =
   let activeMask = regRead(MACHW_INTC_BASE + 0x08C'u)  # Active timer bitmask
   var minRemaining: uint32 = 0xFFFFFFFF'u32
 
-  for i in 0'u32 ..< 9'u32:
-    if (activeMask and (1'u32 shl i)) != 0:
-      # Read absolute timer target for slot i.
-      # Timer targets are at MACHW_BASE + 0x128 + i*4 (inferred from blob).
-      let target = regRead(MACHW_BASE + 0x128'u + i * 4)
+  for machwTimerSlotIndex in 0'u32 ..< 9'u32:
+    if (activeMask and (1'u32 shl machwTimerSlotIndex)) != 0:
+      # Read absolute timer target for this MACHW timer slot.
+      # Timer targets are at MACHW_BASE + 0x128 + slot*4 (inferred from blob).
+      let target = regRead(MACHW_BASE + 0x128'u + machwTimerSlotIndex * 4)
       let current = regRead(MACHW_TIMLO_REG)
       if current < target:
         let remaining = target - current
@@ -413,41 +413,41 @@ proc setKey(vifIdx: uint8, a1Byte: uint8, keyIdxOrPairwise: uint8,
   ##   +44  = macAddr memcpy   — only if macAddr != NULL
   ##   +52  = translated cipher (16→2, 32→1, 13→3, 5→0, else raw)
   ##   +53  = vifIdx
-  ##   +55  = cipher (raw)
-  var buf {.noinit.}: array[56, uint8]
-  discard c_memset(addr buf[0], 0, 56.csize_t)
-  let req = cast[ptr SupplicantKeyParamView](addr buf[0])
-  req.keyIdx = vifIdx
-  req.keyType = a1Byte
-  req.rawCipher = cipher
+  ##   +55  = caller-requested cipher
+  var keyDescriptorBuffer {.noinit.}: array[56, uint8]
+  discard c_memset(addr keyDescriptorBuffer[0], 0, 56.csize_t)
+  let keyDescriptor = cast[ptr SupplicantKeyParamView](addr keyDescriptorBuffer[0])
+  keyDescriptor.keyIdx = vifIdx
+  keyDescriptor.keyType = a1Byte
+  keyDescriptor.requestedCipher = cipher
   if cipher == 0:
-    req.keyType = 0xFF'u8
-  req.addrIdx = keyIdxOrPairwise
+    keyDescriptor.keyType = 0xFF'u8
+  keyDescriptor.addrIdx = keyIdxOrPairwise
   if macAddr != nil:
-    discard c_memcpy(addr req.macAddr[0], macAddr, macLen.csize_t)
-    req.macLen = macLen
-  req.keyLen = keyLen
-  discard c_memcpy(addr req.keyData[0], keyData, keyLen.csize_t)
+    discard c_memcpy(addr keyDescriptor.macAddr[0], macAddr, macLen.csize_t)
+    keyDescriptor.macLen = macLen
+  keyDescriptor.keyLen = keyLen
+  discard c_memcpy(addr keyDescriptor.keyData[0], keyData, keyLen.csize_t)
   if keyLen == 16:
-    req.translatedCipher = 2  # CCMP
+    keyDescriptor.translatedCipher = 2  # CCMP
   elif keyLen == 32:
-    # TKIP: swap MIC key halves at buf[24..31] ↔ buf[32..39]
-    let tkip = supplicantTkipKeyData(req)
+    # TKIP: swap MIC key halves at descriptor[24..31] and descriptor[32..39].
+    let tkip = supplicantTkipKeyData(keyDescriptor)
     let micTx = tkip.micTx
     tkip.micTx = tkip.micRx
     tkip.micRx = micTx
-    req.translatedCipher = 1  # TKIP
+    keyDescriptor.translatedCipher = 1  # TKIP
   elif keyLen == 13:
-    req.translatedCipher = 3  # WEP-104
+    keyDescriptor.translatedCipher = 3  # WEP-104
   elif keyLen == 5:
-    req.translatedCipher = 0  # WEP-40
-  nimFwDbgSetKey0 = req.addrIdx.uint32 or (req.keyType.uint32 shl 8) or
-    (req.keyLen.uint32 shl 16) or (req.macLen.uint32 shl 24)
-  nimFwDbgSetKey1 = req.translatedCipher.uint32 or (req.keyIdx.uint32 shl 8) or
-    (req.spp.uint32 shl 16) or (req.rawCipher.uint32 shl 24)
+    keyDescriptor.translatedCipher = 0  # WEP-40
+  nimFwDbgSetKey0 = keyDescriptor.addrIdx.uint32 or (keyDescriptor.keyType.uint32 shl 8) or
+    (keyDescriptor.keyLen.uint32 shl 16) or (keyDescriptor.macLen.uint32 shl 24)
+  nimFwDbgSetKey1 = keyDescriptor.translatedCipher.uint32 or (keyDescriptor.keyIdx.uint32 shl 8) or
+    (keyDescriptor.spp.uint32 shl 16) or (keyDescriptor.requestedCipher.uint32 shl 24)
   nimFwDbgSetKey2 = pointerAddrU32(keyData)
   nimFwDbgSetKey3 = pointerAddrU32(macAddr)
-  mm_sec_machwkey_wr(addr buf[0])
+  mm_sec_machwkey_wr(addr keyDescriptorBuffer[0])
 
 proc bl_wifi_set_ap_key_internal*(param: pointer) {.exportc, cdecl.} =
   ## Set AP encryption key (59 instructions in blob).
@@ -693,4 +693,3 @@ proc bl_wifi_sta_update_ap_info_internal*(param: pointer) {.exportc, cdecl.} =
   ## Update AP info.
   ## From blob (2 instrs): li a0,1; ret -- always returns 1 (success).
   discard  # void return; blob returns 1 in a0 for C ABI
-

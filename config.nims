@@ -63,6 +63,10 @@ when defined(bl808m0):
     switch("passL", "-T src/linker/bl808_m0_wifi_cached.ld")
   elif defined(bl808WifiNimFw):
     switch("passL", "-T src/linker/bl808_m0_wifi.ld")
+  elif defined(bl808enclave):
+    switch("passL", "-T src/linker/bl808_m0_enclave.ld")
+  elif defined(bl808puf):
+    switch("passL", "-T src/linker/bl808_m0_puf.ld")
   else:
     switch("passL", "-T src/linker/bl808_m0.ld")
   switch("passL", "-lgcc")  # GCC builtins (__clzsi2, __ctzsi2, etc.)

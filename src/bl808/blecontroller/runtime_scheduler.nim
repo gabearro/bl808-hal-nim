@@ -46,19 +46,20 @@ proc btbleEmRead8(offset: uint16): uint8 {.inline.} =
 proc btbleEmWrite8(offset: uint16, value: uint8) {.inline.} =
   volatileStore(btbleEmBytePtr(offset), value)
 
-proc copyBytes(dstAddr: uint32, src: ptr uint8, len: int) =
-  if src == nil or len <= 0:
+proc copyBytes(destAddress: uint32, sourceBytesPtr: ptr uint8, byteCount: int) =
+  if sourceBytesPtr == nil or byteCount <= 0:
     return
-  let raw = cast[ptr UncheckedArray[uint8]](src)
-  for i in 0 ..< len:
-    write8(dstAddr + i.uint32, raw[i])
+  let sourceBytes = cast[ptr UncheckedArray[uint8]](sourceBytesPtr)
+  for copyByteIndex in 0 ..< byteCount:
+    write8(destAddress + copyByteIndex.uint32, sourceBytes[copyByteIndex])
 
-proc copyBtbleEmBytes(dstOffset: uint16, src: ptr uint8, len: int) =
-  if src == nil or len <= 0:
+proc copyBtbleEmBytes(destEmOffset: uint16, sourceBytesPtr: ptr uint8, byteCount: int) =
+  if sourceBytesPtr == nil or byteCount <= 0:
     return
-  let raw = cast[ptr UncheckedArray[uint8]](src)
-  for i in 0 ..< len:
-    btbleEmWrite8(dstOffset + i.uint16, raw[i])
+  let sourceBytes = cast[ptr UncheckedArray[uint8]](sourceBytesPtr)
+  for btbleEmCopyByteIndex in 0 ..< byteCount:
+    btbleEmWrite8(destEmOffset + btbleEmCopyByteIndex.uint16,
+                  sourceBytes[btbleEmCopyByteIndex])
 
 proc writeBtbleInterruptMask(mask: uint32) =
   ## BTBLE's mask register gates the hardware status sources that the
@@ -82,26 +83,27 @@ proc enableBtbleInterruptMaskBits(mask: uint32) =
   else:
     regOr(BLE_BASE + BTBLE_INTMASK_OFFSET, mask)
 
-proc invokeOnChipHci(pktType: uint8, srcId: uint16, payload: ptr uint8,
-                     len: uint8): bool =
-  let cb = onchiphci_recv_cb
-  nim_hci_debug_cb = cast[uint32](cast[uint](cb))
-  if cb == nil:
+proc invokeOnChipHci(pktType: uint8, srcId: uint16, hciPayload: ptr uint8,
+                     payloadLength: uint8): bool =
+  let hciReceiveCallback = onchiphci_recv_cb
+  nim_hci_debug_cb = cast[uint32](cast[uint](hciReceiveCallback))
+  if hciReceiveCallback == nil:
     return false
-  if len.int > onchiphci_cb_payload.len:
+  if payloadLength.int > onchiphci_cb_payload.len:
     return false
 
   var cbPayload: ptr uint8 = nil
-  if len != 0'u8:
-    if payload == nil:
+  if payloadLength != 0'u8:
+    if hciPayload == nil:
       return false
-    let src = cast[ptr UncheckedArray[uint8]](payload)
-    for i in 0 ..< len.int:
-      onchiphci_cb_payload[i] = src[i]
+    let hciPayloadBytes = cast[ptr UncheckedArray[uint8]](hciPayload)
+    for hciCallbackPayloadByteIndex in 0 ..< payloadLength.int:
+      onchiphci_cb_payload[hciCallbackPayloadByteIndex] =
+        hciPayloadBytes[hciCallbackPayloadByteIndex]
     cbPayload = addr onchiphci_cb_payload[0]
 
   nim_hci_debug_stage = 0x4010'u32
-  cb(pktType, srcId, cbPayload, len)
+  hciReceiveCallback(pktType, srcId, cbPayload, payloadLength)
   nim_hci_debug_stage = 0x4020'u32
   true
 
@@ -120,22 +122,22 @@ proc sendCmdComplete2(opcode: uint16, status: uint8, value: uint8) =
   discard invokeOnChipHci(HciPktCmdComplete, opcode, addr cc[0],
                           cc.len.uint8)
 
-proc sendCmdCompletePayload(opcode: uint16, payload: ptr uint8, len: uint8) =
+proc sendCmdCompletePayload(opcode: uint16, commandCompletePayload: ptr uint8, payloadLength: uint8) =
   nim_hci_debug_stage = 0x4030'u32
   nim_hci_debug_opcode = opcode.uint32
-  nim_hci_debug_len = len.uint32
-  discard invokeOnChipHci(HciPktCmdComplete, opcode, payload, len)
+  nim_hci_debug_len = payloadLength.uint32
+  discard invokeOnChipHci(HciPktCmdComplete, opcode, commandCompletePayload, payloadLength)
   nim_hci_debug_stage = 0x4031'u32
 
 proc sendCmdStatus(opcode: uint16, status: uint8) =
   var cs = [status]
   discard invokeOnChipHci(HciPktCmdStatus, opcode, addr cs[0], 1)
 
-proc sendHostEvent(eventCode: uint16, payload: ptr uint8, len: uint8) =
-  discard invokeOnChipHci(HciPktEvent, eventCode, payload, len)
+proc sendHostEvent(eventCode: uint16, eventPayload: ptr uint8, payloadLength: uint8) =
+  discard invokeOnChipHci(HciPktEvent, eventCode, eventPayload, payloadLength)
 
-proc sendLeMetaPayload(payload: ptr uint8, len: uint8) =
-  discard invokeOnChipHci(HciPktLeMeta, 0, payload, len)
+proc sendLeMetaPayload(leMetaPayload: ptr uint8, payloadLength: uint8) =
+  discard invokeOnChipHci(HciPktLeMeta, 0, leMetaPayload, payloadLength)
 
 proc sendNumberOfCompletedPackets(handle, count: uint16) =
   var evt = [1'u8, uint8(handle and 0x00FF'u16),
@@ -160,9 +162,9 @@ proc sendHostAclBytes(handle: uint16, llid: uint8,
   let hciHandle = (handle and 0x0FFF'u16) or (pbFlag shl 12)
   acl.handleFlags = hciHandle
   acl.length = len.uint16
-  let src = cast[ptr UncheckedArray[uint8]](data)
-  for i in 0 ..< len.int:
-    acl.payload[i] = src[i]
+  let aclPayloadBytes = cast[ptr UncheckedArray[uint8]](data)
+  for aclPayloadByteIndex in 0 ..< len.int:
+    acl.payload[aclPayloadByteIndex] = aclPayloadBytes[aclPayloadByteIndex]
   invokeOnChipHci(BtHciAclData, handle, addr pkt[0], len + 4'u8)
 
 proc sendHostAclData(handle: uint16, llid: uint8,
@@ -201,8 +203,8 @@ proc sendLeWriteSuggestedDefaultDataLengthComplete(opcode: uint16,
                                                    paramLen: uint8): uint8
 proc sendLeReadMaximumDataLengthComplete(opcode: uint16,
                                          paramLen: uint8): uint8
-proc nimBleCurrentChannelMap(dst: ptr UncheckedArray[uint8])
-proc bleFillRandomBytes(dst: ptr uint8, len: int): bool
+proc nimBleCurrentChannelMap(channelMapOut: ptr UncheckedArray[uint8])
+proc bleFillRandomBytes(randomOut: ptr uint8, byteCount: int): bool
 proc ble_util_buf_acl_tx_free*(buf: pointer) {.exportc, cdecl.}
 proc llc_llcp_feats_req_pdu_send*(conhdl: uint16) {.exportc, cdecl.}
 proc ble_util_buf_rx_free*(buf: pointer) {.exportc, cdecl.}
@@ -355,17 +357,19 @@ when defined(bl808m0):
   var nim_scan_unsupported_buf* {.exportc.}: uint32
   var nim_scan_unsupported_data* {.exportc.}: array[40, uint8]
 
-  proc enqueueLeAdvertisingReport(payload: ptr uint8, len: uint8): bool =
-    if payload == nil or len == 0'u8 or len.int > 43:
+  proc enqueueLeAdvertisingReport(reportPayload: ptr uint8, reportLength: uint8): bool =
+    if reportPayload == nil or reportLength == 0'u8 or reportLength.int > 43:
       return false
     if nim_pending_scan_report_count >= NimPendingScanReportSlots.uint8:
       inc nim_pending_scan_report_dropped
       return false
-    let src = cast[ptr UncheckedArray[uint8]](payload)
-    let slot = nim_pending_scan_report_tail.int
-    nim_pending_scan_reports[slot].len = len
-    for i in 0 ..< len.int:
-      nim_pending_scan_reports[slot].payload[i] = src[i]
+    let reportPayloadBytes = cast[ptr UncheckedArray[uint8]](reportPayload)
+    let pendingScanReportTailSlot = nim_pending_scan_report_tail.int
+    nim_pending_scan_reports[pendingScanReportTailSlot].len = reportLength
+    for scanReportPayloadByteIndex in 0 ..< reportLength.int:
+      nim_pending_scan_reports[pendingScanReportTailSlot].
+        payload[scanReportPayloadByteIndex] =
+        reportPayloadBytes[scanReportPayloadByteIndex]
     nim_pending_scan_report_tail =
       uint8((nim_pending_scan_report_tail.uint32 + 1'u32) mod
       NimPendingScanReportSlots.uint32)
@@ -379,9 +383,10 @@ when defined(bl808m0):
     discard drainNimInitPeerComplete()
     var drained = 0'u32
     while pendingScanReportsReady() and drained < BleScanReportDrainLimit:
-      let slot = nim_pending_scan_report_head.int
-      let reportLen = nim_pending_scan_reports[slot].len
-      sendLeMetaPayload(addr nim_pending_scan_reports[slot].payload[0],
+      let pendingScanReportHeadSlot = nim_pending_scan_report_head.int
+      let reportLen = nim_pending_scan_reports[pendingScanReportHeadSlot].len
+      sendLeMetaPayload(
+        addr nim_pending_scan_reports[pendingScanReportHeadSlot].payload[0],
                         reportLen)
       nim_pending_scan_report_head =
         uint8((nim_pending_scan_report_head.uint32 + 1'u32) mod
@@ -419,11 +424,13 @@ when defined(bl808m0):
     evt[1] = 0x01'u8 # one report
     evt[2] = eventType
     evt[3] = uint8((header shr 6) and 0x0001'u16)
-    for i in 0 ..< 6:
-      evt[4 + i] = advPdu.advA.data[i]
+    for advertiserAddressByteIndex in 0 ..< 6:
+      evt[4 + advertiserAddressByteIndex] =
+        advPdu.advA.bytes[advertiserAddressByteIndex]
     evt[10] = dataLen.uint8
-    for i in 0 ..< dataLen:
-      evt[11 + i] = advPdu.data[i]
+    for advertisingDataByteIndex in 0 ..< dataLen:
+      evt[11 + advertisingDataByteIndex] =
+        advPdu.advPayload[advertisingDataByteIndex]
     evt[11 + dataLen] = 0x7F'u8 # RSSI unavailable.
     when bl808BleNimPureCentral:
       if (nim_scan_params[0] and 0x01'u8) != 0'u8 and
@@ -458,8 +465,9 @@ when defined(bl808m0):
     nim_scan_unsupported_header = header.uint32
     nim_scan_unsupported_len = copyLen.uint32
     nim_scan_unsupported_buf = buf.uint32
-    for i in 0 ..< copyLen:
-      nim_scan_unsupported_data[i] = read8(payloadBase + i.uint32)
+    for unsupportedScanPayloadByteIndex in 0 ..< copyLen:
+      nim_scan_unsupported_data[unsupportedScanPayloadByteIndex] =
+        read8(payloadBase + unsupportedScanPayloadByteIndex.uint32)
 
 proc initBtbleTimeRegisters() =
   regWrite((BLE_BASE + 0x000'u32).uint,
@@ -637,57 +645,57 @@ const
   BtbleRxDescDone = 0x8000'u16
   BtbleRxDescLinkMask = 0x7FFF'u16
 
-proc btbleRxDescOffset(idx: uint32): uint32 {.inline.} =
+proc btbleRxDescOffset(rxDescRingIndex: uint32): uint32 {.inline.} =
   BtbleRxDescRingBaseOffset +
-    (idx and (BtbleRxDescRingCount - 1'u32)) * BtbleRxDescRingStride
+    (rxDescRingIndex and (BtbleRxDescRingCount - 1'u32)) * BtbleRxDescRingStride
 
-template btbleRxDescAt(descAddr: uint32): ptr BtbleRxDescView =
-  cast[ptr BtbleRxDescView](descAddr.uint)
+template btbleRxDescAt(rxDescAddress: uint32): ptr BtbleRxDescView =
+  cast[ptr BtbleRxDescView](rxDescAddress.uint)
 
-proc btbleRxDescStatus(descAddr: uint32): uint16 {.inline.} =
-  volatileLoad(addr btbleRxDescAt(descAddr).status)
+proc btbleRxDescStatus(rxDescAddress: uint32): uint16 {.inline.} =
+  volatileLoad(addr btbleRxDescAt(rxDescAddress).status)
 
-proc btbleRxDescHeader(descAddr: uint32): uint16 {.inline.} =
-  volatileLoad(addr btbleRxDescAt(descAddr).header)
+proc btbleRxDescHeader(rxDescAddress: uint32): uint16 {.inline.} =
+  volatileLoad(addr btbleRxDescAt(rxDescAddress).header)
 
-proc btbleRxDescClock(descAddr: uint32): uint16 {.inline.} =
-  volatileLoad(addr btbleRxDescAt(descAddr).rxClock)
+proc btbleRxDescClock(rxDescAddress: uint32): uint16 {.inline.} =
+  volatileLoad(addr btbleRxDescAt(rxDescAddress).rxClock)
 
-proc btbleRxDescMeta(descAddr: uint32): uint16 {.inline.} =
-  volatileLoad(addr btbleRxDescAt(descAddr).meta)
+proc btbleRxDescMeta(rxDescAddress: uint32): uint16 {.inline.} =
+  volatileLoad(addr btbleRxDescAt(rxDescAddress).meta)
 
-proc btbleRxDescDataOffset(descAddr: uint32): uint16 {.inline.} =
-  volatileLoad(addr btbleRxDescAt(descAddr).dataOffset)
+proc btbleRxDescDataOffset(rxDescAddress: uint32): uint16 {.inline.} =
+  volatileLoad(addr btbleRxDescAt(rxDescAddress).dataOffset)
 
-proc btbleRxDescSetStatus(descAddr: uint32; status: uint16) {.inline.} =
-  volatileStore(addr btbleRxDescAt(descAddr).status, status)
+proc btbleRxDescSetStatus(rxDescAddress: uint32; status: uint16) {.inline.} =
+  volatileStore(addr btbleRxDescAt(rxDescAddress).status, status)
 
-proc btbleRxDescSetDataOffset(descAddr: uint32; offset: uint16) {.inline.} =
-  volatileStore(addr btbleRxDescAt(descAddr).dataOffset, offset)
+proc btbleRxDescSetDataOffset(rxDescAddress: uint32; rxDataEmOffset: uint16) {.inline.} =
+  volatileStore(addr btbleRxDescAt(rxDescAddress).dataOffset, rxDataEmOffset)
 
-proc btbleRxDescReset(descAddr, nextOffset, dataOffset: uint32) {.inline.} =
-  let desc = btbleRxDescAt(descAddr)
-  volatileStore(addr desc.status, uint16((nextOffset shr 2) and 0xFFFF'u32))
-  volatileStore(addr desc.reserved02, 0'u16)
+proc btbleRxDescReset(rxDescAddress, nextDescEmOffset, rxDataEmOffset: uint32) {.inline.} =
+  let desc = btbleRxDescAt(rxDescAddress)
+  volatileStore(addr desc.status, uint16((nextDescEmOffset shr 2) and 0xFFFF'u32))
+  volatileStore(addr desc.linkControlPadding, 0'u16)
   volatileStore(addr desc.header, 0'u16)
   volatileStore(addr desc.timing0, 0'u16)
   volatileStore(addr desc.rxClock, 0'u16)
   volatileStore(addr desc.timing1, 0'u16)
   volatileStore(addr desc.meta, 0'u16)
-  for i in 0 ..< desc.reserved0E.len:
-    volatileStore(addr desc.reserved0E[i], 0'u8)
-  volatileStore(addr desc.dataOffset, uint16(dataOffset and 0xFFFF'u32))
-  for i in 0 ..< desc.reserved16.len:
-    volatileStore(addr desc.reserved16[i], 0'u8)
+  for rxMetaPaddingByteIndex in 0 ..< desc.rxMetaPadding.len:
+    volatileStore(addr desc.rxMetaPadding[rxMetaPaddingByteIndex], 0'u8)
+  volatileStore(addr desc.dataOffset, uint16(rxDataEmOffset and 0xFFFF'u32))
+  for rxPayloadTailPaddingByteIndex in 0 ..< desc.rxPayloadTailPadding.len:
+    volatileStore(addr desc.rxPayloadTailPadding[rxPayloadTailPaddingByteIndex], 0'u8)
 
-proc btbleRxDescClearDone(descAddr: uint32; status: uint16) {.inline.} =
-  btbleRxDescSetStatus(descAddr, status and not BtbleRxDescDone)
+proc btbleRxDescClearDone(rxDescAddress: uint32; status: uint16) {.inline.} =
+  btbleRxDescSetStatus(rxDescAddress, status and not BtbleRxDescDone)
 
-proc btbleRxDescReleaseLink(descAddr: uint32; status: uint16) {.inline.} =
-  btbleRxDescSetStatus(descAddr, status and BtbleRxDescLinkMask)
+proc btbleRxDescReleaseLink(rxDescAddress: uint32; status: uint16) {.inline.} =
+  btbleRxDescSetStatus(rxDescAddress, status and BtbleRxDescLinkMask)
 
-proc btbleRxDescPtr(idx: uint32): uint32 {.inline.} =
-  btbleRxDescOffset(idx) shr 2
+proc btbleRxDescPtr(rxDescRingIndex: uint32): uint32 {.inline.} =
+  btbleRxDescOffset(rxDescRingIndex) shr 2
 
 template btbleLegacyTxDescAt(descAddr: uint32): ptr BtbleConnTxDescView =
   cast[ptr BtbleConnTxDescView](descAddr.uint)
@@ -698,8 +706,8 @@ proc btbleLegacyTxDescProgram(descAddr: uint32; status, header,
   volatileStore(addr desc.status, status)
   volatileStore(addr desc.header, header)
   volatileStore(addr desc.dataOffset, dataOffset)
-  for i in 0 ..< desc.reserved06.len:
-    volatileStore(addr desc.reserved06[i], 0'u8)
+  for txPayloadTailPaddingByteIndex in 0 ..< desc.txPayloadTailPadding.len:
+    volatileStore(addr desc.txPayloadTailPadding[txPayloadTailPaddingByteIndex], 0'u8)
 
 template btbleAccessWordsAt(emAddr: uint32): ptr BtbleAccessAddressWordsView =
   cast[ptr BtbleAccessAddressWordsView](emAddr.uint)
@@ -779,12 +787,12 @@ proc btbleProgramSlotProgramRaw(slot: uint32; control, targetLow, targetHigh,
 when defined(bl808m0) and
     (bl808BleNimConnectionEnabled or bl808BleNimPureCentral):
   proc clearBtbleProgramSlots() =
-    for slot in 0'u32 ..< 18'u32:
-      btbleProgramSlotClear(slot,
-        uint16((btbleAdvSlotTail(slot) shr 16) and 0xFFFF'u32))
+    for schedulerProgramSlotIndex in 0'u32 ..< 18'u32:
+      btbleProgramSlotClear(schedulerProgramSlotIndex,
+        uint16((btbleAdvSlotTail(schedulerProgramSlotIndex) shr 16) and 0xFFFF'u32))
 
-proc writeBtbleRxDescHeadIndex(idx: uint32) {.inline.} =
-  regWrite((BLE_BASE + 0x828'u32).uint, btbleRxDescPtr(idx))
+proc writeBtbleRxDescHeadIndex(rxDescRingIndex: uint32) {.inline.} =
+  regWrite((BLE_BASE + 0x828'u32).uint, btbleRxDescPtr(rxDescRingIndex))
 
 proc resetBtbleAdvRxRing() =
   ## Drop advertising-channel RX descriptors from a previous scanner,
@@ -798,10 +806,10 @@ proc resetBtbleAdvRxRing() =
     lld_env[16] = 0
     nim_lld_rx_desc_idx = 0
     nim_lld_rx_desc_active = 0
-  for i in 0'u32 ..< 8'u32:
-    let desc = BTBLE_EM_BASE + btbleRxDescOffset(i)
-    let nextOff = btbleRxDescOffset(i + 1'u32)
-    let rxBuf = 0x0B0D'u32 + i * 0x104'u32
+  for advertisingRxDescIndex in 0'u32 ..< 8'u32:
+    let desc = BTBLE_EM_BASE + btbleRxDescOffset(advertisingRxDescIndex)
+    let nextOff = btbleRxDescOffset(advertisingRxDescIndex + 1'u32)
+    let rxBuf = 0x0B0D'u32 + advertisingRxDescIndex * 0x104'u32
     btbleRxDescReset(desc, nextOff, rxBuf)
 
 proc prepareBtbleConnectionRxRingForHandoff() =
@@ -837,15 +845,15 @@ proc requestBtbleSwInterrupt() =
 
 when defined(bl808m0) and
     bl808BleNimSchProgEnabled:
-  proc schProgWrite16(off: int, value: uint16) =
-    nim_sch_prog[off] = uint8(value and 0x00FF'u16)
-    nim_sch_prog[off + 1] = uint8((value shr 8) and 0x00FF'u16)
+  proc schProgWrite16(programByteOffset: int, value: uint16) =
+    nim_sch_prog[programByteOffset] = uint8(value and 0x00FF'u16)
+    nim_sch_prog[programByteOffset + 1] = uint8((value shr 8) and 0x00FF'u16)
 
-  proc schProgWrite32(off: int, value: uint32) =
-    nim_sch_prog[off] = uint8(value and 0x000000FF'u32)
-    nim_sch_prog[off + 1] = uint8((value shr 8) and 0x000000FF'u32)
-    nim_sch_prog[off + 2] = uint8((value shr 16) and 0x000000FF'u32)
-    nim_sch_prog[off + 3] = uint8((value shr 24) and 0x000000FF'u32)
+  proc schProgWrite32(programByteOffset: int, value: uint32) =
+    nim_sch_prog[programByteOffset] = uint8(value and 0x000000FF'u32)
+    nim_sch_prog[programByteOffset + 1] = uint8((value shr 8) and 0x000000FF'u32)
+    nim_sch_prog[programByteOffset + 2] = uint8((value shr 16) and 0x000000FF'u32)
+    nim_sch_prog[programByteOffset + 3] = uint8((value shr 24) and 0x000000FF'u32)
 
 when defined(bl808m0) and
     bl808BleNimSchProgEnabled:
@@ -947,24 +955,25 @@ when defined(bl808m0) and
     proc schProgFutureDistance(now, target: uint32): uint32 {.inline.} =
       (target - now) and 0x0FFFFFFF'u32
 
-    proc schProgCall(idx: uint8, event: uint8) =
-      let slot = idx and 0x0F'u8
-      if schProgActive[slot.int] == 0:
+    proc schProgCall(schedulerProgramIndex: uint8, event: uint8) =
+      let schedulerProgramSlot = schedulerProgramIndex and 0x0F'u8
+      if schProgActive[schedulerProgramSlot.int] == 0:
         when defined(bl808BleBridgeDiag):
           nim_bridge_stage = 0x52F0'u32 or uint32(event)
         return
-      let cb = schProgCb[slot.int]
-      let timestamp = schProgSlotTarget(slot)
+      let schedulerSlotCallback = schProgCb[schedulerProgramSlot.int]
+      let timestamp = schProgSlotTarget(schedulerProgramSlot)
       when defined(bl808BleBridgeDiag):
         nim_bridge_stage = 0x5300'u32 or uint32(event)
         inc nim_sch_call_count
-        nim_sch_call_last_slot = slot.uint32
+        nim_sch_call_last_slot = schedulerProgramSlot.uint32
         nim_sch_call_last_event = event.uint32
-        nim_sch_call_last_cb = cast[uint32](cast[uint](cb))
+        nim_sch_call_last_cb = cast[uint32](cast[uint](schedulerSlotCallback))
         nim_sch_call_last_ctx =
-          cast[uint32](cast[uint](schProgCtx[slot.int]))
-      if cb != nil:
-        cb(timestamp, schProgCtx[slot.int], event)
+          cast[uint32](cast[uint](schProgCtx[schedulerProgramSlot.int]))
+      if schedulerSlotCallback != nil:
+        schedulerSlotCallback(timestamp, schProgCtx[schedulerProgramSlot.int],
+                              event)
         when defined(bl808BleBridgeDiag):
           inc nim_sch_call_return_count
           nim_bridge_stage = 0x5400'u32 or uint32(event)
@@ -973,13 +982,14 @@ when defined(bl808m0) and
           nim_bridge_stage = 0x53F0'u32 or uint32(event)
 
     proc schProgFindNextRead(fromSlot: uint8, untilSlot: uint8): uint8 =
-      var slot = fromSlot and 0x0F'u8
-      let stop = untilSlot and 0x0F'u8
-      while slot != stop:
-        slot = (slot + 1'u8) and 0x0F'u8
-        if schProgActive[slot.int] != 0:
-          return slot
-      stop
+      var schedulerReadCandidateSlot = fromSlot and 0x0F'u8
+      let schedulerStopSlot = untilSlot and 0x0F'u8
+      while schedulerReadCandidateSlot != schedulerStopSlot:
+        schedulerReadCandidateSlot =
+          (schedulerReadCandidateSlot + 1'u8) and 0x0F'u8
+        if schProgActive[schedulerReadCandidateSlot.int] != 0:
+          return schedulerReadCandidateSlot
+      schedulerStopSlot
 
     proc schProgSetEntry(slot: uint8, cbRaw: uint32, ctxRaw: uint32) =
       let s = slot and 0x0F'u8
@@ -987,20 +997,20 @@ when defined(bl808m0) and
       schProgCtx[s.int] = cast[pointer](ctxRaw.uint)
       schProgActive[s.int] = 1
 
-    proc sch_prog_rx_isr*(idx: uint8) {.exportc, cdecl.} =
-      schProgCall(idx, 2'u8)
+    proc sch_prog_rx_isr*(schedulerProgramIndex: uint8) {.exportc, cdecl.} =
+      schProgCall(schedulerProgramIndex, 2'u8)
 
-    proc sch_prog_tx_isr*(idx: uint8) {.exportc, cdecl.} =
-      schProgCall(idx, 3'u8)
+    proc sch_prog_tx_isr*(schedulerProgramIndex: uint8) {.exportc, cdecl.} =
+      schProgCall(schedulerProgramIndex, 3'u8)
 
-    proc sch_prog_skip_isr*(idx: uint8) {.exportc, cdecl.} =
-      let slot = idx and 0x0F'u8
-      if schProgActive[slot.int] != 0:
-        schProgCall(slot, 4'u8)
-        schProgElapsedEndArmed[slot.int] = 0
-        if schProgReadIdx == slot and skipFlag == 0'u8:
-          schProgReadIdx = (slot + 1'u8) and 0x0F'u8
-        schProgActive[slot.int] = 0
+    proc sch_prog_skip_isr*(schedulerProgramIndex: uint8) {.exportc, cdecl.} =
+      let schedulerSkipSlot = schedulerProgramIndex and 0x0F'u8
+      if schProgActive[schedulerSkipSlot.int] != 0:
+        schProgCall(schedulerSkipSlot, 4'u8)
+        schProgElapsedEndArmed[schedulerSkipSlot.int] = 0
+        if schProgReadIdx == schedulerSkipSlot and skipFlag == 0'u8:
+          schProgReadIdx = (schedulerSkipSlot + 1'u8) and 0x0F'u8
+        schProgActive[schedulerSkipSlot.int] = 0
         if schProgCount != 0:
           dec schProgCount
         if schProgCount == 1'u8 and skipFlag == 0'u8:
@@ -1023,16 +1033,16 @@ when defined(bl808m0) and
       if schProgCount == 0:
         rwip_prevent_sleep_clear(64'u16)
 
-    proc sch_prog_end_isr*(idx: uint8) {.exportc, cdecl.} =
-      let slot = idx and 0x0F'u8
-      let rawStatus = btbleProgramSlotControl(uint32(slot))
-      let status = (rawStatus shr 3) and 0x0007'u16
+    proc sch_prog_end_isr*(schedulerProgramIndex: uint8) {.exportc, cdecl.} =
+      let schedulerEndSlot = schedulerProgramIndex and 0x0F'u8
+      let slotControlWord = btbleProgramSlotControl(uint32(schedulerEndSlot))
+      let slotEndStatusBits = (slotControlWord shr 3) and 0x0007'u16
       let event =
-        if status == 3'u16: 0'u8
-        elif status == 4'u16: 1'u8
-        elif status == 5'u16: 7'u8
+        if slotEndStatusBits == 3'u16: 0'u8
+        elif slotEndStatusBits == 4'u16: 1'u8
+        elif slotEndStatusBits == 5'u16: 7'u8
         else: 0xFF'u8
-      schProgFinishSlot(slot, event)
+      schProgFinishSlot(schedulerEndSlot, event)
 
     proc rwip_mac_done_set*() {.exportc, cdecl.} =
       rwip_mac_done = 1'u8
@@ -1053,15 +1063,16 @@ when defined(bl808m0) and
 
     proc sch_prog_elapsed_isr*() {.exportc, cdecl.} =
       let now = currentBtbleTime()
-      for rawSlot in 0'u8 ..< 16'u8:
-        let slot = rawSlot and 0x0F'u8
-        if schProgActive[slot.int] == 0 or
-            schProgElapsedEndArmed[slot.int] == 0:
+      for schedulerSlotCandidate in 0'u8 ..< 16'u8:
+        let schedulerElapsedSlot = schedulerSlotCandidate and 0x0F'u8
+        if schProgActive[schedulerElapsedSlot.int] == 0 or
+            schProgElapsedEndArmed[schedulerElapsedSlot.int] == 0:
           continue
-        if not schProgClockReached(now, schProgElapsedEndTarget[slot.int]):
+        if not schProgClockReached(now,
+                                   schProgElapsedEndTarget[schedulerElapsedSlot.int]):
           continue
         inc nim_sch_prog_elapsed_count
-        schProgFinishSlot(slot, 0'u8)
+        schProgFinishSlot(schedulerElapsedSlot, 0'u8)
         rwip_mac_done_set()
 
     proc nim_ble_coex_wifi_tx_window_enter*(): uint32 {.exportc, cdecl.} =
@@ -1084,10 +1095,10 @@ when defined(bl808m0) and
       let now = currentBtbleTime()
       var skipped = 0'u32
       var nearFuture = 0'u32
-      for rawSlot in 0'u8 ..< 16'u8:
-        let slot = rawSlot and 0x0F'u8
-        if schProgActive[slot.int] != 0:
-          let target = schProgSlotTarget(slot)
+      for schedulerSlotCandidate in 0'u8 ..< 16'u8:
+        let schedulerWifiCoexSlot = schedulerSlotCandidate and 0x0F'u8
+        if schProgActive[schedulerWifiCoexSlot.int] != 0:
+          let target = schProgSlotTarget(schedulerWifiCoexSlot)
           let untilTarget = schProgFutureDistance(now, target)
           if untilTarget < 0x08000000'u32 and
               untilTarget > NimBleWifiTxGuardSlots:
@@ -1095,11 +1106,11 @@ when defined(bl808m0) and
           if untilTarget < 0x08000000'u32:
             inc nearFuture
             continue
-          btbleProgramSlotSetDisabled(uint32(slot))
-          schProgElapsedEndArmed[slot.int] = 0
+          btbleProgramSlotSetDisabled(uint32(schedulerWifiCoexSlot))
+          schProgElapsedEndArmed[schedulerWifiCoexSlot.int] = 0
           inc nim_ble_wifi_tx_window_skip_count
           inc skipped
-          sch_prog_skip_isr(slot)
+          sch_prog_skip_isr(schedulerWifiCoexSlot)
       if skipped != 0'u32 or nearFuture != 0'u32:
         writeBtbleInterruptMask(BtbleIntConnection)
         if skipped != 0'u32:
@@ -1147,8 +1158,8 @@ when defined(bl808m0) and
       nim_sch_prog_last_intmask = 0
       nim_sch_prog_last_intstat = 0
       nim_sch_prog_elapsed_count = 0
-      for slot in 0'u32 ..< 16'u32:
-        btbleProgramSlotSetDisabled(slot)
+      for schedulerInitSlot in 0'u32 ..< 16'u32:
+        btbleProgramSlotSetDisabled(schedulerInitSlot)
 
     proc sch_prog_push*(prog: pointer) {.exportc, cdecl.} =
       if prog == nil:
@@ -1162,7 +1173,7 @@ when defined(bl808m0) and
       req.rate0 = req.rate0 shr 3
       req.rate1 = req.rate1 shr 3
 
-      let slot = schProgWriteIdx and 0x0F'u8
+      let schedulerWriteSlot = schProgWriteIdx and 0x0F'u8
       let cbRaw = req.callback
       let target = req.targetTime
       let fine = req.fineTime
@@ -1172,7 +1183,7 @@ when defined(bl808m0) and
       nim_sch_prog_last_cb = cbRaw
       nim_sch_prog_last_ctx = ctxRaw
       nim_sch_prog_last_target = target
-      nim_sch_prog_last_slot = slot.uint32
+      nim_sch_prog_last_slot = schedulerWriteSlot.uint32
       nim_sch_prog_last_intmask = regRead(BLE_BASE + BTBLE_INTMASK_OFFSET)
       nim_sch_prog_last_intstat = regRead(BLE_BASE + BTBLE_INTSTAT_OFFSET)
 
@@ -1183,8 +1194,8 @@ when defined(bl808m0) and
       if ((now[0] + 1'u32) >= target) or (target == schProgLastTime):
         nim_sch_prog_last_stage = 0x1100'u32
         schProgLastTime = target
-        schProgSetEntry(slot, cbRaw, ctxRaw)
-        nimSchProgSkipIndex = slot.uint32
+        schProgSetEntry(schedulerWriteSlot, cbRaw, ctxRaw)
+        nimSchProgSkipIndex = schedulerWriteSlot.uint32
         inc schProgCount
         skipFlag = 1'u8
         rwip_prevent_sleep_set(64'u16)
@@ -1225,25 +1236,26 @@ when defined(bl808m0) and
       let rate1 =
         if req.rate1 > 31'u8: 31'u16
         else: uint16(req.rate1)
-      let slotU32 = uint32(slot)
-      let tail = (btbleProgramSlotTail(slotU32) and 0xE0FF'u16) or
+      let schedulerWriteSlotU32 = uint32(schedulerWriteSlot)
+      let tail = (btbleProgramSlotTail(schedulerWriteSlotU32) and 0xE0FF'u16) or
                  (uint16(req.tail) shl 8)
 
-      schProgSetEntry(slot, cbRaw, ctxRaw)
+      schProgSetEntry(schedulerWriteSlot, cbRaw, ctxRaw)
       schProgLastTime = target
       nim_sch_prog_last_stage = 0x1210'u32
 
-      btbleProgramSlotProgram(slotU32, target, fineBackoff, durHalf,
+      btbleProgramSlotProgram(schedulerWriteSlotU32, target, fineBackoff, durHalf,
         rate0 or (rate1 shl 8), tail, ctrl0, emPtr, req.noBackoff == 0'u8)
 
       nim_sch_prog_last_stage = 0x1220'u32
-      regWrite((BLE_BASE + 0x110'u32).uint, 0x80000000'u32 or slot.uint32)
+      regWrite((BLE_BASE + 0x110'u32).uint,
+               0x80000000'u32 or schedulerWriteSlot.uint32)
       nim_sch_prog_last_stage = 0x1230'u32
-      schProgWriteIdx = (slot + 1'u8) and 0x0F'u8
+      schProgWriteIdx = (schedulerWriteSlot + 1'u8) and 0x0F'u8
       inc schProgCount
-      schProgElapsedEndTarget[slot.int] =
+      schProgElapsedEndTarget[schedulerWriteSlot.int] =
         (target + schProgDurationSlots(dur) + 1'u32) and 0x0FFFFFFF'u32
-      schProgElapsedEndArmed[slot.int] = 1
+      schProgElapsedEndArmed[schedulerWriteSlot.int] = 1
       rwip_prevent_sleep_set(64'u16)
       if skipFlag != 0:
         nim_sch_prog_last_stage = 0x1240'u32
@@ -1258,8 +1270,8 @@ when defined(bl808m0) and
     proc nimSchProgFifoIsr() {.cdecl.} =
       sch_prog_fifo_isr()
 
-    proc nimSchProgSkipIsr(idx: uint8) {.cdecl.} =
-      sch_prog_skip_isr(idx)
+    proc nimSchProgSkipIsr(schedulerProgramIndex: uint8) {.cdecl.} =
+      sch_prog_skip_isr(schedulerProgramIndex)
 
     proc nimSchProgPush(prog: pointer) {.cdecl.} =
       sch_prog_push(prog)
@@ -1445,7 +1457,7 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
       reason: uint8
 
     NimConnTxElementView {.packed.} = object
-      reserved00: array[4, uint8]
+      txElementPrefixPadding: array[4, uint8]
       emOffset: uint16
       length: uint16
 
@@ -1482,6 +1494,7 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
     doAssert sizeof(NimLlcpTerminateIndView) == 2
     doAssert offsetof(NimLlcpTerminateIndView, reason) == 1
     doAssert sizeof(NimConnTxElementView) == 8
+    doAssert offsetof(NimConnTxElementView, txElementPrefixPadding) == 0
     doAssert offsetof(NimConnTxElementView, emOffset) == 4
     doAssert offsetof(NimConnTxElementView, length) == 6
 
@@ -1580,7 +1593,7 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
     var nim_conn_last_schedule_delta* {.exportc.}: uint32
     var nim_conn_last_schedule_duration* {.exportc.}: uint32
     var nim_conn_last_rx_timing* {.exportc.}: uint32
-    var nim_conn_last_channel_word* {.exportc.}: uint32
+    var nim_conn_last_channel_control* {.exportc: "nim_conn_last_channel_word".}: uint32
     var nim_conn_last_channel* {.exportc.}: uint32
     var nim_conn_last_unmapped_channel* {.exportc.}: uint32
     var nim_conn_last_event_counter* {.exportc.}: uint32
@@ -1713,52 +1726,53 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
     LlcpPhyUpdateInd = 0x18'u8
     LlcpMinUsedChannelsInd = 0x19'u8
 
-  proc noteNimRxDescConsumed(idx: uint32) =
-    lld_env[14] = uint8((idx + 1'u32) and 0x07'u32)
+  proc noteNimRxDescConsumed(rxDescRingIndex: uint32) =
+    lld_env[14] = uint8((rxDescRingIndex + 1'u32) and 0x07'u32)
 
-  proc putLe16(dst: ptr UncheckedArray[uint8], off: int, value: uint16) =
-    dst[off] = uint8(value and 0x00FF'u16)
-    dst[off + 1] = uint8((value shr 8) and 0x00FF'u16)
+  proc putLe16(destBytes: ptr UncheckedArray[uint8], byteOffset: int, value: uint16) =
+    destBytes[byteOffset] = uint8(value and 0x00FF'u16)
+    destBytes[byteOffset + 1] = uint8((value shr 8) and 0x00FF'u16)
 
-  proc putLe32(dst: ptr UncheckedArray[uint8], off: int, value: uint32) =
-    dst[off] = uint8(value and 0x000000FF'u32)
-    dst[off + 1] = uint8((value shr 8) and 0x000000FF'u32)
-    dst[off + 2] = uint8((value shr 16) and 0x000000FF'u32)
-    dst[off + 3] = uint8((value shr 24) and 0x000000FF'u32)
+  proc putLe32(destBytes: ptr UncheckedArray[uint8], byteOffset: int, value: uint32) =
+    destBytes[byteOffset] = uint8(value and 0x000000FF'u32)
+    destBytes[byteOffset + 1] = uint8((value shr 8) and 0x000000FF'u32)
+    destBytes[byteOffset + 2] = uint8((value shr 16) and 0x000000FF'u32)
+    destBytes[byteOffset + 3] = uint8((value shr 24) and 0x000000FF'u32)
 
-  proc nimLlcpRecordRx(header: uint16, dataOff: uint16, pduLen: uint16) =
-    let slot = nim_llcp_rx_log_index and 0x07'u32
-    var word = uint32(header) shl 16
+  proc nimLlcpRecordRx(header: uint16, rxDataEmOffset: uint16, pduLen: uint16) =
+    let llcpRxLogSlot = nim_llcp_rx_log_index and 0x07'u32
+    var rxLogWord = uint32(header) shl 16
     if pduLen > 0'u16:
-      word = word or uint32(btbleEmRead8(dataOff))
+      rxLogWord = rxLogWord or uint32(btbleEmRead8(rxDataEmOffset))
     if pduLen > 1'u16:
-      word = word or (uint32(btbleEmRead8(dataOff + 1'u16)) shl 8)
-    nim_llcp_rx_log[slot.int] = word
+      rxLogWord = rxLogWord or (uint32(btbleEmRead8(rxDataEmOffset + 1'u16)) shl 8)
+    nim_llcp_rx_log[llcpRxLogSlot.int] = rxLogWord
     nim_llcp_rx_log_index = nim_llcp_rx_log_index + 1'u32
 
-  proc nimLlcpRecordTx(pdu: ptr UncheckedArray[uint8], len: uint8) =
-    let slot = nim_llcp_tx_log_index and 0x07'u32
-    var word = uint32(len) shl 24
-    if pdu != nil and len > 0'u8:
-      word = word or uint32(pdu[0])
-    if pdu != nil and len > 1'u8:
-      word = word or (uint32(pdu[1]) shl 8)
-    if pdu != nil and len > 2'u8:
-      word = word or (uint32(pdu[2]) shl 16)
-    nim_llcp_tx_log[slot.int] = word
+  proc nimLlcpRecordTx(llcpPdu: ptr UncheckedArray[uint8], pduLen: uint8) =
+    let llcpTxLogSlot = nim_llcp_tx_log_index and 0x07'u32
+    var txLogWord = uint32(pduLen) shl 24
+    if llcpPdu != nil and pduLen > 0'u8:
+      txLogWord = txLogWord or uint32(llcpPdu[0])
+    if llcpPdu != nil and pduLen > 1'u8:
+      txLogWord = txLogWord or (uint32(llcpPdu[1]) shl 8)
+    if llcpPdu != nil and pduLen > 2'u8:
+      txLogWord = txLogWord or (uint32(llcpPdu[2]) shl 16)
+    nim_llcp_tx_log[llcpTxLogSlot.int] = txLogWord
     nim_llcp_tx_log_index = nim_llcp_tx_log_index + 1'u32
 
-  proc nimLlcpRecordPeerFeatures(pdu: ptr UncheckedArray[uint8],
+  proc nimLlcpRecordPeerFeatures(llcpPdu: ptr UncheckedArray[uint8],
                                 pduLen: uint8): bool =
-    if pdu == nil or pduLen < 9'u8:
+    if llcpPdu == nil or pduLen < 9'u8:
       return
-    let opcode = pdu[0]
+    let opcode = llcpPdu[0]
     if opcode != LlcpFeatureReq and opcode != LlcpFeatureRsp and
         opcode != LlcpSlaveFeatureReq:
       return
     var features = 0'u64
-    for i in 0 ..< 8:
-      features = features or (uint64(pdu[i + 1]) shl (i * 8))
+    for llcpFeatureByteIndex in 0 ..< 8:
+      features = features or
+        (uint64(llcpPdu[llcpFeatureByteIndex + 1]) shl (llcpFeatureByteIndex * 8))
     nim_llcp_state.peerFeatures = features
     nim_llcp_state.peerFeaturesKnown = true
     nim_llcp_peer_features[0] =
@@ -1793,17 +1807,17 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
       nim_llcp_state.remoteFeaturesEventPending = false
       sendLeRemoteFeaturesComplete(conhdl, HciStatusSuccess)
 
-  proc getLe16(src: ptr UncheckedArray[uint8], off: int): uint16 =
-    uint16(src[off]) or (uint16(src[off + 1]) shl 8)
+  proc getLe16(sourceBytes: ptr UncheckedArray[uint8], byteOffset: int): uint16 =
+    uint16(sourceBytes[byteOffset]) or (uint16(sourceBytes[byteOffset + 1]) shl 8)
 
-  template nimLlcpLengthPduAt(pdu: ptr UncheckedArray[uint8]): ptr NimLlcpLengthPduView =
-    cast[ptr NimLlcpLengthPduView](pdu)
+  template nimLlcpLengthPduAt(llcpPdu: ptr UncheckedArray[uint8]): ptr NimLlcpLengthPduView =
+    cast[ptr NimLlcpLengthPduView](llcpPdu)
 
-  template nimLlcpLengthPdu(pdu: var NimLlcpPdu): ptr NimLlcpLengthPduView =
-    cast[ptr NimLlcpLengthPduView](addr pdu.data[0])
+  template nimLlcpLengthPdu(llcpPdu: var NimLlcpPdu): ptr NimLlcpLengthPduView =
+    cast[ptr NimLlcpLengthPduView](addr llcpPdu.data[0])
 
-  template nimLlcpConnectionUpdateInd(pdu: var NimLlcpPdu): ptr NimLlcpConnectionUpdateIndView =
-    cast[ptr NimLlcpConnectionUpdateIndView](addr pdu.data[0])
+  template nimLlcpConnectionUpdateInd(llcpPdu: var NimLlcpPdu): ptr NimLlcpConnectionUpdateIndView =
+    cast[ptr NimLlcpConnectionUpdateIndView](addr llcpPdu.data[0])
 
   template nimLlcpConnectionUpdateIndAt(pdu: ptr UncheckedArray[uint8]): ptr NimLlcpConnectionUpdateIndView =
     cast[ptr NimLlcpConnectionUpdateIndView](pdu)
@@ -1880,38 +1894,38 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
 
   when defined(bl808BlePrintNimLlcMsg):
     proc nimLlcMsgWord(index: int): uint32 =
-      let off = index * 4
-      uint32(nim_llc_msg[off]) or
-        (uint32(nim_llc_msg[off + 1]) shl 8) or
-        (uint32(nim_llc_msg[off + 2]) shl 16) or
-        (uint32(nim_llc_msg[off + 3]) shl 24)
+      let llcMsgWordByteOffset = index * 4
+      uint32(nim_llc_msg[llcMsgWordByteOffset]) or
+        (uint32(nim_llc_msg[llcMsgWordByteOffset + 1]) shl 8) or
+        (uint32(nim_llc_msg[llcMsgWordByteOffset + 2]) shl 16) or
+        (uint32(nim_llc_msg[llcMsgWordByteOffset + 3]) shl 24)
 
     proc printNimLlcMsg(label: static[string]) =
       bleTrace("[NIMLLC] ")
       bleTrace(label)
       bleTrace(" words=")
-      for i in 0 ..< 14:
-        if i != 0:
+      for llcMessageWordIndex in 0 ..< 14:
+        if llcMessageWordIndex != 0:
           bleTrace(",")
-        bleTraceHex32(nimLlcMsgWord(i))
+        bleTraceHex32(nimLlcMsgWord(llcMessageWordIndex))
       bleTrace("\r\n")
 
   when bl808BleConnStageDiag:
     template nimConnReadRa(): uint32 =
       block:
-        var v: uint32
+        var returnAddress: uint32
         {.emit: [
-          "asm volatile(\"mv %0, ra\" : \"=r\"(", v, ") : : \"memory\");"
+          "asm volatile(\"mv %0, ra\" : \"=r\"(", returnAddress, ") : : \"memory\");"
         ].}
-        v
+        returnAddress
 
     template nimConnReadSp(): uint32 =
       block:
-        var v: uint32
+        var stackPointer: uint32
         {.emit: [
-          "asm volatile(\"mv %0, sp\" : \"=r\"(", v, ") : : \"memory\");"
+          "asm volatile(\"mv %0, sp\" : \"=r\"(", stackPointer, ") : : \"memory\");"
         ].}
-        v
+        stackPointer
 
     proc nimConnMark(stage: uint32) {.inline.} =
       nim_conn_stage = stage
@@ -1924,17 +1938,18 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
       discard stage
 
   proc recordNimPeripheralPeer(conhdl: uint16,
-                                  raw: ptr UncheckedArray[uint8],
+                                  connectIndPayload: ptr UncheckedArray[uint8],
                                   header: uint16) =
     nimConnMark(0x130'u32)
     nim_conn_evt_handle = conhdl.uint32
     nim_conn_evt_peer_type = (uint32(header) shr 6) and 0x01'u32
-    if raw != nil:
+    if connectIndPayload != nil:
       nim_conn_evt_peer_a0 =
-        uint32(raw[0]) or (uint32(raw[1]) shl 8) or
-        (uint32(raw[2]) shl 16) or (uint32(raw[3]) shl 24)
+        uint32(connectIndPayload[0]) or (uint32(connectIndPayload[1]) shl 8) or
+        (uint32(connectIndPayload[2]) shl 16) or
+        (uint32(connectIndPayload[3]) shl 24)
       nim_conn_evt_peer_a1 =
-        uint32(raw[4]) or (uint32(raw[5]) shl 8)
+        uint32(connectIndPayload[4]) or (uint32(connectIndPayload[5]) shl 8)
 
   proc noteNimPeripheralConnected(conhdl: uint16) =
     if nim_conn_evt_reported:
@@ -1965,7 +1980,7 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
     else:
       discard conhdl
 
-  proc noteNimAdvertiserConnected(raw: ptr UncheckedArray[uint8],
+  proc noteNimAdvertiserConnected(connectIndPayload: ptr UncheckedArray[uint8],
                                      header: uint16,
                                      interval: uint32,
                                      latency: uint32,
@@ -1975,9 +1990,10 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
     ## CONNECT_IND shortcut bypasses that handler, so mirror the consumed fields
     ## for advertiser slot 0.
     let conn = llmAdvertiserConn()
-    if raw != nil:
-      for i in 0 ..< 6:
-        conn.peerAddr.data[i] = raw[i]
+    if connectIndPayload != nil:
+      for peerAddressByteIndex in 0 ..< 6:
+        conn.peerAddr.bytes[peerAddressByteIndex] =
+          connectIndPayload[peerAddressByteIndex]
     conn.peerAddrType = uint8((header shr 6) and 0x01'u16)
     conn.connected = 1'u8
     conn.state = 9'u8
@@ -2079,9 +2095,9 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
     (status and NimRxDescDone) != 0'u16
 
   proc rejectConnRxDescriptor(desc: uint32, status, header: uint16,
-                              cur: uint32) =
+                              rxDescRingIdx: uint32) =
     btbleRxDescReleaseLink(desc, status)
-    noteNimRxDescConsumed(cur)
+    noteNimRxDescConsumed(rxDescRingIdx)
     inc nim_lld_rx_free_count
     when bl808BleNimPureConnection:
       inc nim_conn_rx_status_reject_count
@@ -2125,8 +2141,9 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
       if pdu == nil or len == 0'u8 or len > NimLlcpMaxPayloadLen:
         return false
       nimLlcpRecordTx(pdu, len)
-      for i in 0 ..< len.int:
-        btbleEmWrite8(NimLlcpTxEmOffset + i.uint16, pdu[i])
+      for llcpTxPayloadByteIndex in 0 ..< len.int:
+        btbleEmWrite8(NimLlcpTxEmOffset + llcpTxPayloadByteIndex.uint16,
+                      pdu[llcpTxPayloadByteIndex])
       nimConnTxElementInit(addr nim_llcp_tx_buf[0], NimLlcpTxEmOffset, len.uint16)
       nim_llcp_tx_pending = 1
       inc nim_llcp_tx_count
@@ -2153,14 +2170,14 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
         return
       if nim_llcp_tx_queued == 0:
         return
-      let slot = nim_llcp_tx_queue_head and 0x07'u32
+      let llcpTxQueueHeadSlot = nim_llcp_tx_queue_head and 0x07'u32
       nim_llcp_tx_queue_head =
         (nim_llcp_tx_queue_head + 1'u32) and 0x07'u32
       dec nim_llcp_tx_queued
-      discard nimLlcpSendPduNow(nim_llcp_tx_queue_conhdl[slot.int],
+      discard nimLlcpSendPduNow(nim_llcp_tx_queue_conhdl[llcpTxQueueHeadSlot.int],
         cast[ptr UncheckedArray[uint8]](
-          addr nim_llcp_tx_queue[slot.int][0]),
-        nim_llcp_tx_queue_len[slot.int])
+          addr nim_llcp_tx_queue[llcpTxQueueHeadSlot.int][0]),
+        nim_llcp_tx_queue_len[llcpTxQueueHeadSlot.int])
 
     proc nimLlcpQueuePdu(conhdl: uint16, pdu: ptr UncheckedArray[uint8],
                             len: uint8): bool =
@@ -2177,13 +2194,14 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
           nim_llcp_tx_queue_len.len.uint32:
         inc nim_llcp_tx_dropped
         return false
-      let slot = nim_llcp_tx_queue_tail and 0x07'u32
+      let llcpTxQueueTailSlot = nim_llcp_tx_queue_tail and 0x07'u32
       nim_llcp_tx_queue_tail =
         (nim_llcp_tx_queue_tail + 1'u32) and 0x07'u32
-      nim_llcp_tx_queue_conhdl[slot.int] = conhdl
-      nim_llcp_tx_queue_len[slot.int] = len
-      for i in 0 ..< len.int:
-        nim_llcp_tx_queue[slot.int][i] = pdu[i]
+      nim_llcp_tx_queue_conhdl[llcpTxQueueTailSlot.int] = conhdl
+      nim_llcp_tx_queue_len[llcpTxQueueTailSlot.int] = len
+      for queuedLlcpPayloadByteIndex in 0 ..< len.int:
+        nim_llcp_tx_queue[llcpTxQueueTailSlot.int][queuedLlcpPayloadByteIndex] =
+          pdu[queuedLlcpPayloadByteIndex]
       inc nim_llcp_tx_queued
       true
 
@@ -2251,8 +2269,9 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
         features: uint64 = NimBleConservativeLeFeatures): NimLlcpPdu =
       result.payloadLen = 9'u8
       result.data[0] = opcode
-      for i in 0 ..< 8:
-        result.data[i + 1] = nimBleFeatureByte(features, i)
+      for llcpFeatureByteIndex in 0 ..< 8:
+        result.data[llcpFeatureByteIndex + 1] =
+          nimBleFeatureByte(features, llcpFeatureByteIndex)
 
     proc nimLlcpBuildLengthPdu(opcode: uint8): NimLlcpPdu =
       result.payloadLen = 9'u8
@@ -2571,8 +2590,8 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
       if not nimLlcpRxPduValid(opcode, pduLen.uint16):
         nimLlcpRecordMalformed(rxHeader, opcode, pduLen.uint16)
         return 0'u32
-      let slot = nim_llcp_rx_log_index and 0x07'u32
-      nim_llcp_rx_log[slot.int] =
+      let llcpRxConsumedLogSlot = nim_llcp_rx_log_index and 0x07'u32
+      nim_llcp_rx_log[llcpRxConsumedLogSlot.int] =
         (uint32(rxHeader) shl 16) or (uint32(reason) shl 8) or
         uint32(opcode)
       nim_llcp_rx_log_index = nim_llcp_rx_log_index + 1'u32
@@ -2683,8 +2702,8 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
     proc nimConnEmOffset(conhdl: uint16): uint32 {.inline.} =
       NimConnEmBaseOffset + NimConnEmStride * uint32(conhdl and 0x000F'u16)
 
-    proc nimConnEmAddr(conhdl: uint16, off: uint32): uint32 {.inline.} =
-      BTBLE_EM_BASE + nimConnEmOffset(conhdl) + off
+    proc nimConnEmAddr(conhdl: uint16, connEventByteOffset: uint32): uint32 {.inline.} =
+      BTBLE_EM_BASE + nimConnEmOffset(conhdl) + connEventByteOffset
 
     template btbleConnEventAt(eventAddr: uint32): ptr BtbleConnEventView =
       cast[ptr BtbleConnEventView](eventAddr.uint)
@@ -2710,11 +2729,11 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
     proc nimConnEventSetEventCounter(conhdl: uint16; eventCounter: uint16) {.inline.} =
       volatileStore(addr nimConnEventView(conhdl).eventCounter, eventCounter)
 
-    proc nimConnDescAddr(off: uint16): uint32 {.inline.} =
-      BTBLE_EM_BASE + uint32(off)
+    proc nimConnDescAddr(descEmOffset: uint16): uint32 {.inline.} =
+      BTBLE_EM_BASE + uint32(descEmOffset)
 
-    proc nimConnDescPtr(off: uint16): uint16 {.inline.} =
-      uint16((uint32(off) shr 2) and 0xFFFF'u32)
+    proc nimConnDescPtr(descEmOffset: uint16): uint16 {.inline.} =
+      uint16((uint32(descEmOffset) shr 2) and 0xFFFF'u32)
 
     proc nimConnDescStatus(nextOff: uint16,
                            softwareOwned: bool): uint16 {.inline.} =
@@ -2742,11 +2761,11 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
       volatileStore(addr desc.status, nimConnDescStatus(nextOff, softwareOwned = true))
       volatileStore(addr desc.header, 0'u16)
       volatileStore(addr desc.dataOffset, 0'u16)
-      for i in 0 ..< desc.reserved06.len:
-        volatileStore(addr desc.reserved06[i], 0'u8)
+      for connTxPayloadTailPaddingByteIndex in 0 ..< desc.txPayloadTailPadding.len:
+        volatileStore(addr desc.txPayloadTailPadding[connTxPayloadTailPaddingByteIndex], 0'u8)
 
-    proc nimConnEmDescPtr(off: uint16): uint16 {.inline.} =
-      nimConnDescPtr(off)
+    proc nimConnEmDescPtr(descEmOffset: uint16): uint16 {.inline.} =
+      nimConnDescPtr(descEmOffset)
 
     proc nimConnTxDescBaseOffsetForHandle(handle: uint16): uint16 {.inline.} =
       ## Match vendor lld_con_start: connection TX descriptors start at
@@ -2760,15 +2779,15 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
 
     proc captureNimConnStartSnapshot(conhdl: uint16) =
       let txBase = nimConnTxDescBaseOffsetForHandle(conhdl)
-      for i in 0 ..< nim_conn_start_em_snapshot.len:
-        nim_conn_start_em_snapshot[i] =
-          read32(nimConnEmAddr(conhdl, uint32(i) * 4'u32))
-      for i in 0 ..< nim_conn_start_rx_snapshot.len:
-        nim_conn_start_rx_snapshot[i] =
-          read32(BTBLE_EM_BASE + BtbleRxDescRingBaseOffset + uint32(i) * 4'u32)
-      for i in 0 ..< nim_conn_start_tx_snapshot.len:
-        nim_conn_start_tx_snapshot[i] =
-          read32(BTBLE_EM_BASE + uint32(txBase) + uint32(i) * 4'u32)
+      for connStartEmWordIndex in 0 ..< nim_conn_start_em_snapshot.len:
+        nim_conn_start_em_snapshot[connStartEmWordIndex] =
+          read32(nimConnEmAddr(conhdl, uint32(connStartEmWordIndex) * 4'u32))
+      for connStartRxDescWordIndex in 0 ..< nim_conn_start_rx_snapshot.len:
+        nim_conn_start_rx_snapshot[connStartRxDescWordIndex] =
+          read32(BTBLE_EM_BASE + BtbleRxDescRingBaseOffset + uint32(connStartRxDescWordIndex) * 4'u32)
+      for connStartTxDescWordIndex in 0 ..< nim_conn_start_tx_snapshot.len:
+        nim_conn_start_tx_snapshot[connStartTxDescWordIndex] =
+          read32(BTBLE_EM_BASE + uint32(txBase) + uint32(connStartTxDescWordIndex) * 4'u32)
       nim_conn_start_reg_snapshot[0] =
         regRead((BLE_BASE + BTBLE_INTMASK_OFFSET).uint)
       nim_conn_start_reg_snapshot[1] =
@@ -2791,8 +2810,8 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
 
     proc nimConnExpandClock(rawClock, referenceClock: uint32): uint32 =
       let reference = referenceClock and 0x0FFFFFFF'u32
-      let rawLow = rawClock and 0x0000FFFF'u32
-      var candidate = (reference and 0x0FFF0000'u32) or rawLow
+      let rxClockLow16 = rawClock and 0x0000FFFF'u32
+      var candidate = (reference and 0x0FFF0000'u32) or rxClockLow16
       let ahead = (candidate - reference) and 0x0FFFFFFF'u32
       if ahead < 0x08000000'u32:
         if ahead > 0x00008000'u32:
@@ -2979,16 +2998,16 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
       if moreData:
         result = result or NimConnDataHeaderMoreDataBit
 
-    proc nimConnResetTxDesc(off, nextOff: uint16) =
-      let desc = nimConnDescAddr(off)
-      btbleConnTxDescClear(desc, nextOff)
+    proc nimConnResetTxDesc(txDescEmOffset, nextDescEmOffset: uint16) =
+      let txDescAddress = nimConnDescAddr(txDescEmOffset)
+      btbleConnTxDescClear(txDescAddress, nextDescEmOffset)
 
-    proc nimConnArmTxDesc(off, nextOff, dataOff: uint16,
+    proc nimConnArmTxDesc(txDescEmOffset, nextDescEmOffset, txDataEmOffset: uint16,
                           descHeader: uint16) =
-      let desc = nimConnDescAddr(off)
-      btbleConnTxDescSetHeader(desc, descHeader)
-      btbleConnTxDescSetDataOffset(desc, dataOff)
-      btbleConnTxDescSetStatus(desc, nimConnDescStatus(nextOff, softwareOwned = false))
+      let txDescAddress = nimConnDescAddr(txDescEmOffset)
+      btbleConnTxDescSetHeader(txDescAddress, descHeader)
+      btbleConnTxDescSetDataOffset(txDescAddress, txDataEmOffset)
+      btbleConnTxDescSetStatus(txDescAddress, nimConnDescStatus(nextDescEmOffset, softwareOwned = false))
 
     proc nimConnTxDescriptorComplete(): bool =
       ## Reference lld_con_frm_cbk treats a returned software-owned TX
@@ -3047,8 +3066,8 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
 
     proc nimConnRecordTxHeader(header: uint16, pduLen: uint8) =
       when defined(BleDebugCounters):
-        let slot = nim_conn_tx_header_log_index and 0x0F'u32
-        nim_conn_tx_header_log[slot.int] =
+        let connTxHeaderLogSlot = nim_conn_tx_header_log_index and 0x0F'u32
+        nim_conn_tx_header_log[connTxHeaderLogSlot.int] =
           uint32(header) or (uint32(nim_conn_state.eventCounter) shl 16)
         var state = uint32(ord(nim_conn_state.txKind)) or
           (uint32(nim_conn_state.txSeq and 1'u8) shl 4) or
@@ -3060,15 +3079,15 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
           state = state or (1'u32 shl 9)
         if nim_conn_state.txAckObserved:
           state = state or (1'u32 shl 10)
-        nim_conn_tx_state_log[slot.int] = state
+        nim_conn_tx_state_log[connTxHeaderLogSlot.int] = state
         nim_conn_tx_header_log_index = nim_conn_tx_header_log_index + 1'u32
 
     proc nimConnRecordRxSeq(header: uint16, peerNesn, peerSn,
                             txSeqBefore: uint8, llcpPending,
                             llcpAcked: bool) =
       when defined(BleDebugCounters):
-        let slot = nim_conn_rx_seq_log_index and 0x0F'u32
-        nim_conn_rx_seq_log[slot.int] =
+        let connRxSeqLogSlot = nim_conn_rx_seq_log_index and 0x0F'u32
+        nim_conn_rx_seq_log[connRxSeqLogSlot.int] =
           uint32(header) or (uint32(nim_conn_state.eventCounter) shl 16)
         var state =
           uint32(peerNesn and 1'u8) or
@@ -3085,40 +3104,43 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
           state = state or (1'u32 shl 10)
         if llcpAcked:
           state = state or (1'u32 shl 11)
-        nim_conn_rx_state_log[slot.int] = state
+        nim_conn_rx_state_log[connRxSeqLogSlot.int] = state
         nim_conn_rx_seq_log_index = nim_conn_rx_seq_log_index + 1'u32
 
     proc nimConnRecordSchEvent(timestamp: uint32, event: uint8) =
       when defined(BleDebugCounters):
-        let slot = int(nim_conn_sch_event_log_index and 0x0F'u32)
+        let connSchedulerEventLogSlot =
+          int(nim_conn_sch_event_log_index and 0x0F'u32)
         let intStat = regRead(BLE_BASE + 0x024'u32)
         let eventSlot = (intStat shr 24) and 0x0F'u32
         let slotStatus = uint32(read16(BTBLE_EM_BASE + eventSlot * 0x10'u32))
-        nim_conn_sch_event_code_log[slot] =
+        nim_conn_sch_event_code_log[connSchedulerEventLogSlot] =
           event.uint32 or (eventSlot shl 8) or (slotStatus shl 16)
-        nim_conn_sch_event_time_log[slot] = timestamp and 0x0FFFFFFF'u32
-        nim_conn_sch_event_now_log[slot] = currentBtbleTime()
-        nim_conn_sch_event_state_log[slot] =
+        nim_conn_sch_event_time_log[connSchedulerEventLogSlot] =
+          timestamp and 0x0FFFFFFF'u32
+        nim_conn_sch_event_now_log[connSchedulerEventLogSlot] =
+          currentBtbleTime()
+        nim_conn_sch_event_state_log[connSchedulerEventLogSlot] =
           (if nim_conn_state.active: 1'u32 else: 0'u32) or
           (if nim_conn_state.centralRole: 2'u32 else: 0'u32) or
           (if nim_conn_state.directAnchorMode: 4'u32 else: 0'u32) or
           (if nim_conn_state.reschedulePending: 8'u32 else: 0'u32) or
           (uint32(nim_conn_state.eventCounter) shl 16)
-        nim_conn_sch_event_counts_log[slot] =
+        nim_conn_sch_event_counts_log[connSchedulerEventLogSlot] =
           uint32(nim_conn_state.txDescCursor and 0x0F'u8) or
           (uint32(ord(nim_conn_state.txKind) and 0x0F) shl 4) or
           (uint32(nim_conn_state.txNesn and 1'u8) shl 8) or
           (uint32(nim_conn_state.txSeq and 1'u8) shl 9) or
           (uint32(nim_conn_state.rxNextExpectedSeq and 1'u8) shl 10) or
           (uint32(nim_conn_state.lastRxEventCounter) shl 16)
-        nim_conn_sch_event_int_log[slot] = intStat
+        nim_conn_sch_event_int_log[connSchedulerEventLogSlot] = intStat
         nim_conn_sch_event_log_index = nim_conn_sch_event_log_index + 1'u32
 
     proc nimConnChannelUsed(ch: uint8): bool =
       if ch >= 37'u8:
         return false
-      let bit = ch and 0x07'u8
-      (nim_conn_state.channelMap[(ch shr 3).int] and (1'u8 shl bit)) != 0
+      let channelMapBit = ch and 0x07'u8
+      (nim_conn_state.channelMap[(ch shr 3).int] and (1'u8 shl channelMapBit)) != 0
 
     proc nimConnBuildRemap() =
       nim_conn_state.usedChannelCount = 0
@@ -3135,11 +3157,15 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
         inc nim_conn_state.usedChannelCount
 
     proc nimConnPermute(value: uint16): uint16 {.inline.} =
-      var x = value
-      x = ((x and 0xAAAA'u16) shr 1) or ((x and 0x5555'u16) shl 1)
-      x = ((x and 0xCCCC'u16) shr 2) or ((x and 0x3333'u16) shl 2)
-      x = ((x and 0xF0F0'u16) shr 4) or ((x and 0x0F0F'u16) shl 4)
-      ((x and 0xFF00'u16) shr 8) or ((x and 0x00FF'u16) shl 8)
+      var permuted = value
+      permuted = ((permuted and 0xAAAA'u16) shr 1) or
+        ((permuted and 0x5555'u16) shl 1)
+      permuted = ((permuted and 0xCCCC'u16) shr 2) or
+        ((permuted and 0x3333'u16) shl 2)
+      permuted = ((permuted and 0xF0F0'u16) shr 4) or
+        ((permuted and 0x0F0F'u16) shl 4)
+      ((permuted and 0xFF00'u16) shr 8) or
+        ((permuted and 0x00FF'u16) shl 8)
 
     proc nimConnMam(a, b: uint16): uint16 {.inline.} =
       uint16((uint32(a) * 17'u32 + uint32(b)) and 0xFFFF'u32)
@@ -3212,8 +3238,9 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
         return
       if not nimConnEventReached(nim_conn_state.channelMapInstant):
         return
-      for i in 0 ..< nim_conn_state.channelMap.len:
-        nim_conn_state.channelMap[i] = nim_conn_state.pendingChannelMap[i]
+      for channelMapByteIndex in 0 ..< nim_conn_state.channelMap.len:
+        nim_conn_state.channelMap[channelMapByteIndex] =
+          nim_conn_state.pendingChannelMap[channelMapByteIndex]
       nim_conn_state.channelMap[4] = nim_conn_state.channelMap[4] and 0x1F'u8
       nimConnBuildRemap()
       nim_conn_state.channelMapPending = false
@@ -3223,8 +3250,9 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
       if pdu == nil or pduLen < 8'u8:
         return
       let body = nimLlcpChannelMapIndAt(pdu)
-      for i in 0 ..< nim_conn_state.pendingChannelMap.len:
-        nim_conn_state.pendingChannelMap[i] = body.channelMap[i]
+      for channelMapByteIndex in 0 ..< nim_conn_state.pendingChannelMap.len:
+        nim_conn_state.pendingChannelMap[channelMapByteIndex] =
+          body.channelMap[channelMapByteIndex]
       nim_conn_state.pendingChannelMap[4] =
         nim_conn_state.pendingChannelMap[4] and 0x1F'u8
       nim_conn_state.channelMapInstant = body.instant
@@ -3360,8 +3388,8 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
 
     proc nimConnProgramEm(conhdl: uint16) =
       let base = nimConnEmAddr(conhdl, 0)
-      for off in countup(0'u32, NimConnEmStride - 2'u32, 2'u32):
-        write16(base + off, 0'u16)
+      for connEmClearHalfwordOffset in countup(0'u32, NimConnEmStride - 2'u32, 2'u32):
+        write16(base + connEmClearHalfwordOffset, 0'u16)
 
       let activityType =
         if nim_conn_state.directAnchorMode: 0x0002'u16 else: 0x0003'u16
@@ -3397,7 +3425,7 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
         uint16(nim_conn_state.channelMap[4] and 0x1F'u8) or
         (uint16(nim_conn_state.hopIncrement and 0x1F'u8) shl 8))
       volatileStore(addr event.rxTiming, NimConnRxTimingDefault)
-      volatileStore(addr event.reserved3A, 0'u16)
+      volatileStore(addr event.rxTimingPadding, 0'u16)
       volatileStore(addr event.eventCounter, nim_conn_state.eventCounter)
       volatileStore(addr event.eventCounterAux0, 0'u16)
       volatileStore(addr event.eventCounterAux1, 0'u16)
@@ -3430,7 +3458,7 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
       nimConnEventSetEventCounter(conhdl, nim_conn_state.eventCounter)
       nim_conn_last_channel = channel.uint32
       nim_conn_last_unmapped_channel = nim_conn_state.lastUnmappedChannel.uint32
-      nim_conn_last_channel_word = channelWord.uint32
+      nim_conn_last_channel_control = channelWord.uint32
       nim_conn_last_event_counter = nim_conn_state.eventCounter.uint32
       channel
 
@@ -3525,7 +3553,7 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
       nim_conn_sched_channel_log[schedIdx.int] =
         nim_conn_last_channel or
         (nim_conn_last_unmapped_channel shl 8) or
-        (nim_conn_last_channel_word shl 16)
+        (nim_conn_last_channel_control shl 16)
       nim_conn_sched_timing_log[schedIdx.int] =
         targetFine.uint32 or
         ((nim_conn_state.rxTimingHalfUs and 0xFFFF'u32) shl 16)
@@ -3790,8 +3818,9 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
 
       let start = nimLldConStartParams(params)
       let snapshotBytes = cast[ptr UncheckedArray[uint8]](params)
-      for i in 0 ..< nim_lld_con_start_param.len:
-        nim_lld_con_start_param[i] = snapshotBytes[i]
+      for connStartSnapshotByteIndex in 0 ..< nim_lld_con_start_param.len:
+        nim_lld_con_start_param[connStartSnapshotByteIndex] =
+          snapshotBytes[connStartSnapshotByteIndex]
 
       discard c_memset(addr nim_conn_state, 0, sizeof(NimConnState).csize_t)
       nim_conn_state.active = true
@@ -3945,34 +3974,37 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
                      nim_conn_params.len.csize_t)
     discard c_memset(addr nim_llc_msg[0], 0,
                      nim_llc_msg.len.csize_t)
-    let outp = cast[ptr UncheckedArray[uint8]](addr nim_conn_params[0])
-    let llc = cast[ptr UncheckedArray[uint8]](addr nim_llc_msg[0])
-    for i in 0 ..< nim_connect_ind_work_payload.len:
-      nim_connect_ind_work_payload[i] = payload[i]
-    let raw = cast[ptr UncheckedArray[uint8]](
+    let connStartParams = cast[ptr UncheckedArray[uint8]](addr nim_conn_params[0])
+    let llcMsgBytes = cast[ptr UncheckedArray[uint8]](addr nim_llc_msg[0])
+    for connectIndPayloadByteIndex in 0 ..< nim_connect_ind_work_payload.len:
+      nim_connect_ind_work_payload[connectIndPayloadByteIndex] =
+        payload[connectIndPayloadByteIndex]
+    let connectIndPayload = cast[ptr UncheckedArray[uint8]](
       addr nim_connect_ind_work_payload[0])
 
     # Keep this handoff byte-exact. A typed packed-object rewrite produced the
     # same-looking buffers under JTAG but hard-faulted after llc_start.
-    for i in 0 ..< 4:
-      outp[i] = raw[12 + i]      # access address
-    outp[4] = raw[16]            # CRC init
-    outp[5] = raw[17]
-    outp[6] = raw[18]
-    outp[7] = raw[19]            # transmit window size
-    putLe16(outp, 8, getLe16(raw, 20))
-    putLe16(outp, 10, getLe16(raw, 22))
-    putLe16(outp, 12, getLe16(raw, 24))
-    putLe16(outp, 14, getLe16(raw, 26))
-    for i in 0 ..< 5:
-      outp[16 + i] = raw[28 + i]
-    outp[21] = raw[33] and 0x1F'u8
-    outp[22] = raw[33] shr 5
+    for accessAddressByteIndex in 0 ..< 4:
+      connStartParams[accessAddressByteIndex] =
+        connectIndPayload[12 + accessAddressByteIndex]
+    connStartParams[4] = connectIndPayload[16]            # CRC init
+    connStartParams[5] = connectIndPayload[17]
+    connStartParams[6] = connectIndPayload[18]
+    connStartParams[7] = connectIndPayload[19]            # transmit window size
+    putLe16(connStartParams, 8, getLe16(connectIndPayload, 20))
+    putLe16(connStartParams, 10, getLe16(connectIndPayload, 22))
+    putLe16(connStartParams, 12, getLe16(connectIndPayload, 24))
+    putLe16(connStartParams, 14, getLe16(connectIndPayload, 26))
+    for channelMapByteIndex in 0 ..< 5:
+      connStartParams[16 + channelMapByteIndex] =
+        connectIndPayload[28 + channelMapByteIndex]
+    connStartParams[21] = connectIndPayload[33] and 0x1F'u8
+    connStartParams[22] = connectIndPayload[33] shr 5
 
-    let winOffset = uint32(getLe16(raw, 20))
-    let interval = uint32(getLe16(raw, 22))
-    let latency = uint32(getLe16(raw, 24))
-    let timeout = uint32(getLe16(raw, 26))
+    let winOffset = uint32(getLe16(connectIndPayload, 20))
+    let interval = uint32(getLe16(connectIndPayload, 22))
+    let latency = uint32(getLe16(connectIndPayload, 24))
+    let timeout = uint32(getLe16(connectIndPayload, 26))
     let baseClock =
       if rxClock != 0'u32: rxClock and 0x0FFFFFFF'u32
       else: currentBtbleTime()
@@ -3998,16 +4030,16 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
       when bl808BleNimConTimingClockBiasSlots != 0:
         timingClock = addBtbleClockSlots(timingClock,
           bl808BleNimConTimingClockBiasSlots)
-      putLe16(outp, 24, timingFine)
-      putLe32(outp, 28, timingClock)
-      putLe32(outp, 32, directAnchor)
-      outp[36] = 1'u8            # normal advertiser timing path
+      putLe16(connStartParams, 24, timingFine)
+      putLe32(connStartParams, 28, timingClock)
+      putLe32(connStartParams, 32, directAnchor)
+      connStartParams[36] = 1'u8            # normal advertiser timing path
     else:
-      putLe32(outp, 32, directAnchor)
-      outp[36] = 0'u8            # direct handoff with precomputed anchor
-    outp[37] = rateIdx           # vendor rate enum: 0 maps to LE 1M
-    outp[38] = uint8((header shr 5) and 0x01'u16)
-    outp[39] = nimConnLegacyAdvLeadSelector()
+      putLe32(connStartParams, 32, directAnchor)
+      connStartParams[36] = 0'u8            # direct handoff with precomputed anchor
+    connStartParams[37] = rateIdx           # vendor rate enum: 0 maps to LE 1M
+    connStartParams[38] = uint8((header shr 5) and 0x01'u16)
+    connStartParams[39] = nimConnLegacyAdvLeadSelector()
 
     when bl808BleNimPureConnection:
       var snapshotAnchorFine: uint16
@@ -4021,8 +4053,8 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
       nim_connect_timing_snapshot[4] = snapshotAnchor
       nim_connect_timing_snapshot[5] = snapshotAnchorFine.uint32
       nim_connect_timing_snapshot[6] =
-        uint32(outp[36]) or (uint32(outp[37]) shl 8) or
-        (uint32(outp[38]) shl 16) or (uint32(outp[39]) shl 24)
+        uint32(connStartParams[36]) or (uint32(connStartParams[37]) shl 8) or
+        (uint32(connStartParams[38]) shl 16) or (uint32(connStartParams[39]) shl 24)
       nim_connect_timing_snapshot[7] = currentBtbleTime()
 
     nim_conn_last_rx_clock = baseClock
@@ -4032,11 +4064,11 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
     nim_conn_last_interval = interval
     nim_conn_last_timeout = timeout
     nim_conn_last_access_addr =
-      uint32(raw[12]) or (uint32(raw[13]) shl 8) or
-      (uint32(raw[14]) shl 16) or (uint32(raw[15]) shl 24)
+      uint32(connectIndPayload[12]) or (uint32(connectIndPayload[13]) shl 8) or
+      (uint32(connectIndPayload[14]) shl 16) or (uint32(connectIndPayload[15]) shl 24)
     nim_conn_last_crcinit =
-      uint32(raw[16]) or (uint32(raw[17]) shl 8) or
-      (uint32(raw[18]) shl 16)
+      uint32(connectIndPayload[16]) or (uint32(connectIndPayload[17]) shl 8) or
+      (uint32(connectIndPayload[18]) shl 16)
 
     prepareBtbleConnectionRxRingForHandoff()
     writeBtbleInterruptMask(BtbleIntConnection)
@@ -4052,8 +4084,8 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
     when defined(bl808BleConnectTrace):
       bleTrace("[CON] after lld\r\n")
     if nim_conn_last_status == 0'u32:
-      noteNimAdvertiserConnected(raw, header, interval, latency, raw[33] shr 5)
-      recordNimPeripheralPeer(1'u16, raw, header)
+      noteNimAdvertiserConnected(connectIndPayload, header, interval, latency, connectIndPayload[33] shr 5)
+      recordNimPeripheralPeer(1'u16, connectIndPayload, header)
       when bl808BleNimManualConnTx:
         nimLlcpPrimeStartup()
         when bl808BleNimPureConnection:
@@ -4117,8 +4149,8 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled:
       nim_connect_ind_pending_header = header
       nim_connect_ind_pending_rx_clock = rxClock
       nim_connect_ind_pending_rx_fine = rxFine
-      for j in 0 ..< nim_connect_ind_pending_payload.len:
-        nim_connect_ind_pending_payload[j] = payload[j]
+      for payloadIndex in 0 ..< nim_connect_ind_pending_payload.len:
+        nim_connect_ind_pending_payload[payloadIndex] = payload[payloadIndex]
       nim_connect_ind_pending = 1
       inc nim_connect_ind_queued_count
       nim_adv_enabled = false
@@ -4164,11 +4196,11 @@ proc pushBtbleAdvProgram(leadSlots: uint32 = 8'u32) =
 
   when defined(bl808m0) and
       bl808BleNimSchProgEnabled:
-    let slot = uint32(schProgWriteIdx and 0x0F'u8)
-    let slotTail = btbleAdvSlotTail(slot)
+    let advertisingSchedulerSlot = uint32(schProgWriteIdx and 0x0F'u8)
+    let slotTail = btbleAdvSlotTail(advertisingSchedulerSlot)
     discard c_memset(addr nim_sch_prog[0], 0, nim_sch_prog.len.csize_t)
 
-    btbleProgramSlotProgramRaw(slot, 0x281A'u16,
+    btbleProgramSlotProgramRaw(advertisingSchedulerSlot, 0x281A'u16,
       uint16(clock and 0xFFFF'u32), 0'u16, 0x0270'u16, 0x0048'u16,
       0x085A'u16, uint16(slotTail and 0xFFFF'u32),
       uint16((slotTail shr 16) and 0xFFFF'u32))
@@ -4191,7 +4223,7 @@ proc pushBtbleAdvProgram(leadSlots: uint32 = 8'u32) =
     nim_adv_sch_event_active = 1
     inc nim_adv_sch_program_count
     sch_prog_push(addr nim_sch_prog[0])
-    nim_adv_schedule_slot = uint8((slot + 1'u32) mod 16'u32)
+    nim_adv_schedule_slot = uint8((advertisingSchedulerSlot + 1'u32) mod 16'u32)
     return
 
   let directSlot = uint32(nim_adv_schedule_slot) mod 10'u32
@@ -4251,20 +4283,20 @@ proc readBleAddrHigh(addrBase: uint32): uint32 =
   read8(addrBase + 4'u32).uint32 or
     (read8(addrBase + 5'u32).uint32 shl 8)
 
-template btbleScanReqPduAt(buf: uint16): ptr BtbleScanReqPduView =
-  cast[ptr BtbleScanReqPduView](BTBLE_EM_BASE + buf.uint32)
+template btbleScanReqPduAt(scanReqDataEmOffset: uint16): ptr BtbleScanReqPduView =
+  cast[ptr BtbleScanReqPduView](BTBLE_EM_BASE + scanReqDataEmOffset.uint32)
 
 proc bdAddrLow(bd: ptr BdAddr): uint32 {.inline.} =
-  bd.data[0].uint32 or
-    (bd.data[1].uint32 shl 8) or
-    (bd.data[2].uint32 shl 16) or
-    (bd.data[3].uint32 shl 24)
+  bd.bytes[0].uint32 or
+    (bd.bytes[1].uint32 shl 8) or
+    (bd.bytes[2].uint32 shl 16) or
+    (bd.bytes[3].uint32 shl 24)
 
 proc bdAddrHigh(bd: ptr BdAddr): uint32 {.inline.} =
-  bd.data[4].uint32 or (bd.data[5].uint32 shl 8)
+  bd.bytes[4].uint32 or (bd.bytes[5].uint32 shl 8)
 
-proc fallbackLocalAddrByte(idx: int): uint8 {.inline.} =
-  case idx
+proc fallbackLocalAddrByte(localAddrByteIndex: int): uint8 {.inline.} =
+  case localAddrByteIndex
   of 0: 0x01'u8
   of 1: 0x23'u8
   of 2: 0x45'u8
@@ -4272,15 +4304,15 @@ proc fallbackLocalAddrByte(idx: int): uint8 {.inline.} =
   of 4: 0x89'u8
   else: 0xAB'u8
 
-proc selectedLocalAddrByte(idx: int, ownAddrType: uint8): uint8 =
+proc selectedLocalAddrByte(localAddrByteIndex: int, ownAddrType: uint8): uint8 =
   if (ownAddrType and 0x01'u8) != 0'u8 and nim_local_addr_valid:
-    return nim_local_addr[idx]
+    return nim_local_addr[localAddrByteIndex]
   if nim_public_addr_valid:
-    return nim_public_addr[idx]
-  fallbackLocalAddrByte(idx)
+    return nim_public_addr[localAddrByteIndex]
+  fallbackLocalAddrByte(localAddrByteIndex)
 
-proc expectedAdvAddrByte(idx: int): uint8 =
-  selectedLocalAddrByte(idx, nim_adv_params[5])
+proc expectedAdvAddrByte(localAddrByteIndex: int): uint8 =
+  selectedLocalAddrByte(localAddrByteIndex, nim_adv_params[5])
 
 proc btbleAdvRxFine(desc: uint32): uint16 {.inline.} =
   ## Vendor lld_adv_frm_isr uses descriptor +0x0C low 10 bits as the raw RX
@@ -4312,8 +4344,9 @@ proc btbleRecordConnectDescTiming(desc: uint32) =
     nim_connect_desc_fields[3] = btbleRxDescMeta(desc).uint32
 
 when defined(bl808m0) and bl808BleNimPureCentral:
-  proc handleNimInitiatorAdvRx(header: uint16, buf: uint16, desc: uint32,
-                               status: uint16, idx: uint32): bool
+  proc handleNimInitiatorAdvRx(rxHeader: uint16, rxDataOffset: uint16,
+                               rxDescAddr: uint32, rxStatus: uint16,
+                               rxRingIndex: uint32): bool
 
 proc serviceBtbleAdvRxDescriptors() =
   ## The BL808 BTBLE advertising engine writes received advertising-channel
@@ -4321,43 +4354,42 @@ proc serviceBtbleAdvRxDescriptors() =
   ## consumes these on scheduler FIFO completion; the Nim scheduler bypasses
   ## that callback path, so service the ring directly until the full LLD event
   ## callback model is ported.
-  var startIdx = 0'u32
+  var rxRingStartIndex = 0'u32
   when defined(bl808m0) and
       (bl808BleNimConnectionEnabled or
        bl808BleNimPureCentral):
-    startIdx = uint32(lld_env[14] and 0x07'u8)
+    rxRingStartIndex = uint32(lld_env[14] and 0x07'u8)
   for step in 0'u32 ..< 8'u32:
     when defined(bl808m0) and bl808BleNimConnectionEnabled:
       if nim_conn_started:
         nimConnMark(0x160'u32 or step)
-    let i = (startIdx + step) and 0x07'u32
-    let desc = BTBLE_EM_BASE + btbleRxDescOffset(i)
-    let status = btbleRxDescStatus(desc)
-    if (status and BtbleRxDescDone) == 0:
+    let rxRingIndex = (rxRingStartIndex + step) and 0x07'u32
+    let rxDescAddr = BTBLE_EM_BASE + btbleRxDescOffset(rxRingIndex)
+    let rxStatus = btbleRxDescStatus(rxDescAddr)
+    if (rxStatus and BtbleRxDescDone) == 0:
       continue
 
-    let header = btbleRxDescHeader(desc)
-    let buf = btbleRxDescDataOffset(desc)
-    let meta = btbleRxDescMeta(desc)
-    let pduType = uint8(header and 0x000F'u16)
-    let pduLen = uint8((header shr 8) and 0x003F'u16)
+    let rxHeader = btbleRxDescHeader(rxDescAddr)
+    let rxDataOffset = btbleRxDescDataOffset(rxDescAddr)
+    let pduType = uint8(rxHeader and 0x000F'u16)
+    let pduLen = uint8((rxHeader shr 8) and 0x003F'u16)
 
     inc nim_ble_dbg_rx_ready_count
-    nim_ble_dbg_rx_last_header = header.uint32
-    nim_ble_dbg_rx_last_status = status.uint32
-    nim_ble_dbg_rx_last_desc = desc
-    nim_ble_dbg_rx_last_buf = buf.uint32
+    nim_ble_dbg_rx_last_header = rxHeader.uint32
+    nim_ble_dbg_rx_last_status = rxStatus.uint32
+    nim_ble_dbg_rx_last_desc = rxDescAddr
+    nim_ble_dbg_rx_last_buf = rxDataOffset.uint32
 
     if pduType == 0x03'u8 and pduLen == 12'u8:
       inc nim_ble_dbg_rx_scan_req_count
-      let scanReq = btbleScanReqPduAt(buf)
+      let scanReq = btbleScanReqPduAt(rxDataOffset)
       nim_ble_dbg_rx_scan_req_last_scana0 = bdAddrLow(addr scanReq.scanA)
       nim_ble_dbg_rx_scan_req_last_scana1 = bdAddrHigh(addr scanReq.scanA)
       nim_ble_dbg_rx_scan_req_last_adva0 = bdAddrLow(addr scanReq.advA)
       nim_ble_dbg_rx_scan_req_last_adva1 = bdAddrHigh(addr scanReq.advA)
       var advaMatches = true
-      for j in 0 ..< 6:
-        if scanReq.advA.data[j] != expectedAdvAddrByte(j):
+      for advAddrIndex in 0 ..< 6:
+        if scanReq.advA.bytes[advAddrIndex] != expectedAdvAddrByte(advAddrIndex):
           advaMatches = false
       if advaMatches:
         inc nim_ble_dbg_rx_scan_req_match_count
@@ -4366,22 +4398,22 @@ proc serviceBtbleAdvRxDescriptors() =
         bleTrace("\r\n[CON] rx connect\r\n")
       when defined(bl808m0) and bl808BleNimConnectionEnabled:
         # Match vendor lld_adv_frm_isr timing extraction.
-        btbleRecordConnectDescTiming(desc)
-        let rxFine = btbleAdvRxFine(desc)
-        let rxClock = btbleAdvRxClock(desc)
+        btbleRecordConnectDescTiming(rxDescAddr)
+        let rxFine = btbleAdvRxFine(rxDescAddr)
+        let rxClock = btbleAdvRxClock(rxDescAddr)
         var connectPdu: array[34, uint8]
-        let payload = btbleEmPayload(buf)
-        for j in 0 ..< connectPdu.len:
-          connectPdu[j] = payload[j]
-        btbleRxDescClearDone(desc, status)
-        noteNimRxDescConsumed(i)
+        let payload = btbleEmPayload(rxDataOffset)
+        for payloadIndex in 0 ..< connectPdu.len:
+          connectPdu[payloadIndex] = payload[payloadIndex]
+        btbleRxDescClearDone(rxDescAddr, rxStatus)
+        noteNimRxDescConsumed(rxRingIndex)
         let advRxSp = bleCentralTraceReadSp()
         let advRxRa = regRead((advRxSp + 124'u32).uint)
         let isrRa = regRead((advRxSp + 156'u32).uint)
-        handleNimConnectInd(uint8(i and 0x07'u32),
+        handleNimConnectInd(uint8(rxRingIndex and 0x07'u32),
                                cast[ptr UncheckedArray[uint8]](
                                  addr connectPdu[0]),
-                               header, rxClock, rxFine)
+                               rxHeader, rxClock, rxFine)
         if advRxRa != 0'u32:
           regWrite((advRxSp + 124'u32).uint, advRxRa)
         if isrRa != 0'u32:
@@ -4397,24 +4429,24 @@ proc serviceBtbleAdvRxDescriptors() =
         nimConnMark(0x170'u32 or step)
 
     when defined(bl808m0) and bl808BleNimPureCentral:
-      if handleNimInitiatorAdvRx(header, buf, desc, status, i):
+      if handleNimInitiatorAdvRx(rxHeader, rxDataOffset, rxDescAddr, rxStatus, rxRingIndex):
         return
 
     when defined(bl808m0):
       if nim_scan_enabled and pduLen >= 6'u8 and
           (pduType == 0x00'u8 or pduType == 0x02'u8 or
            pduType == 0x04'u8 or pduType == 0x06'u8):
-        sendLeAdvertisingReportFromRxDesc(header, buf)
+        sendLeAdvertisingReportFromRxDesc(rxHeader, rxDataOffset)
     when defined(bl808m0) and bl808BleNimConnectionEnabled:
       if nim_conn_started and pduType != 0x03'u8 and pduType != 0x05'u8:
         continue
 
-    btbleRxDescClearDone(desc, status)
+    btbleRxDescClearDone(rxDescAddr, rxStatus)
     when defined(bl808m0) and
         (bl808BleNimConnectionEnabled or
          bl808BleNimPureCentral):
-      if (lld_env[14] and 0x07'u8) == uint8(i and 0x07'u32):
-        lld_env[14] = uint8((i + 1'u32) and 0x07'u32)
+      if (lld_env[14] and 0x07'u8) == uint8(rxRingIndex and 0x07'u32):
+        lld_env[14] = uint8((rxRingIndex + 1'u32) and 0x07'u32)
 
 proc resetBtbleLinkLayerCore() =
   regWrite((BLE_BASE + 0x800'u32).uint,
@@ -4424,9 +4456,9 @@ proc resetBtbleLinkLayerCore() =
   discard waitBtbleCommandDone((BLE_BASE + 0x800'u32).uint)
   regWrite((BLE_BASE + 0x80C'u32).uint, 0'u32)
   regWrite((BLE_BASE + 0x814'u32).uint, 0xFFFFFFFF'u32)
-  for off in [0x404'u32, 0x410'u32, 0x41C'u32, 0x428'u32,
-              0x434'u32, 0x440'u32, 0x44C'u32]:
-    write16(BTBLE_EM_BASE + off, 0'u16)
+  for btbleCoreActivityStatusOffset in [0x404'u32, 0x410'u32, 0x41C'u32, 0x428'u32,
+                                        0x434'u32, 0x440'u32, 0x44C'u32]:
+    write16(BTBLE_EM_BASE + btbleCoreActivityStatusOffset, 0'u16)
   regWrite((BLE_BASE + 0x8D0'u32).uint,
            regRead((BLE_BASE + 0x8D0'u32).uint) and not 0x00001000'u32)
   regWrite((BLE_BASE + 0x850'u32).uint, 0'u32)
@@ -4446,8 +4478,8 @@ proc initBtbleLinkLayerRegisters() =
       rwip_param.set = rwipParamDummySet
       rwip_param.del = rwipParamDummyDel
     nimSchProgInit(3'u8)
-  for off in countup(0'u32, 0x00F0'u32, 0x10):
-    write16(BTBLE_EM_BASE + off, 0x281A'u16)
+  for btbleProgramSlotControlOffset in countup(0'u32, 0x00F0'u32, 0x10):
+    write16(BTBLE_EM_BASE + btbleProgramSlotControlOffset, 0x281A'u16)
 
   regWrite((BLE_BASE + 0x800'u32).uint, 0x00100607'u32)
   regOr(BLE_BASE + 0x800'u32, 0x00400000'u32)
@@ -4481,9 +4513,11 @@ proc initBtbleLinkLayerRegisters() =
   regWrite((BLE_BASE + 0x98C'u32).uint, 0x02120013'u32)
 
   var seq = 0'u16
-  for off in [0x122'u32, 0x1B6'u32, 0x24A'u32, 0x2DE'u32, 0x372'u32]:
-    let v = (read16(BTBLE_EM_BASE + off) and 0xE0FF'u16) or seq
-    write16(BTBLE_EM_BASE + off, v)
+  for btbleAdvertisingChannelSequenceOffset in [0x122'u32, 0x1B6'u32, 0x24A'u32,
+                                                0x2DE'u32, 0x372'u32]:
+    let channelSequenceWord =
+      (read16(BTBLE_EM_BASE + btbleAdvertisingChannelSequenceOffset) and 0xE0FF'u16) or seq
+    write16(BTBLE_EM_BASE + btbleAdvertisingChannelSequenceOffset, channelSequenceWord)
     seq = seq + 0x0100'u16
 
   let seed0 = (currentBtbleTime() xor 0x00243B9F'u32) and 0x003FFFFF'u32
@@ -4520,12 +4554,12 @@ proc initBleCoreRegisters() =
   regWrite((BLE_BASE + 0x124'u32).uint, 0x00000003'u32)
   regWrite((BLE_BASE + 0x02C'u32).uint, 0x0000035C'u32)
 
-  for off in [
+  for bleCoreRegisterClearOffset in [
     0x02C'u32, 0x090'u32, 0x0A0'u32, 0x0A8'u32, 0x0AC'u32,
     0x0B0'u32, 0x0B4'u32, 0x0B8'u32, 0x0BC'u32, 0x0F0'u32,
     0x120'u32, 0x124'u32
   ]:
-    regWrite((BLE_BASE + off).uint, 0'u32)
+    regWrite((BLE_BASE + bleCoreRegisterClearOffset).uint, 0'u32)
 
   writeBtbleDefaultAccessWords(BLE_EM_BASE + 0x0F0'u32)
   write16(BLE_EM_BASE + 0x106'u32, 0'u16)
@@ -4538,16 +4572,16 @@ proc initBleCoreRegisters() =
   write16(BLE_EM_BASE + 0x0FC'u32, ble_tx_pwr.uint16)
   write16(BLE_EM_BASE + 0x158'u32, ble_tx_pwr.uint16)
 
-  for off in countup(0'u32, 0x3C'u32, 4):
-    write16(BLE_EM_BASE + off, 0'u16)
-    write16(BLE_EM_BASE + off + 2'u32, 0'u16)
+  for legacyAccessAddressClearWordOffset in countup(0'u32, 0x3C'u32, 4):
+    write16(BLE_EM_BASE + legacyAccessAddressClearWordOffset, 0'u16)
+    write16(BLE_EM_BASE + legacyAccessAddressClearWordOffset + 2'u32, 0'u16)
 
-  var v = read16(BLE_EM_BASE + 0x0EA'u32)
-  v = v and not 0x0700'u16
-  write16(BLE_EM_BASE + 0x0EA'u32, v)
-  v = read16(BLE_EM_BASE + 0x146'u32)
-  v = v and not 0x0700'u16
-  write16(BLE_EM_BASE + 0x146'u32, v)
+  var legacyScanTimingWord = read16(BLE_EM_BASE + 0x0EA'u32)
+  legacyScanTimingWord = legacyScanTimingWord and not 0x0700'u16
+  write16(BLE_EM_BASE + 0x0EA'u32, legacyScanTimingWord)
+  legacyScanTimingWord = read16(BLE_EM_BASE + 0x146'u32)
+  legacyScanTimingWord = legacyScanTimingWord and not 0x0700'u16
+  write16(BLE_EM_BASE + 0x146'u32, legacyScanTimingWord)
 
   regWrite((BLE_BASE + 0x1A0'u32).uint, 0'u32)
   regWrite((BLE_BASE + 0x0E0'u32).uint,
@@ -4606,12 +4640,12 @@ proc resetNimControllerState() =
     nim_scan_last_adv_channel = 0
     nim_scan_req_peer_addr_type = 0
     nim_scan_peer_hint_write_index = 0
-    for i in 0 ..< NimScanPeerHintSlots:
-      nim_scan_peer_hint_addr0[i] = 0
-      nim_scan_peer_hint_addr1[i] = 0
-      nim_scan_peer_hint_type[i] = 0
-      nim_scan_peer_hint_channel_index[i] = 0
-      nim_scan_peer_hint_adv_channel[i] = 0
+    for scanPeerHintSlotIndex in 0 ..< NimScanPeerHintSlots:
+      nim_scan_peer_hint_addr0[scanPeerHintSlotIndex] = 0
+      nim_scan_peer_hint_addr1[scanPeerHintSlotIndex] = 0
+      nim_scan_peer_hint_type[scanPeerHintSlotIndex] = 0
+      nim_scan_peer_hint_channel_index[scanPeerHintSlotIndex] = 0
+      nim_scan_peer_hint_adv_channel[scanPeerHintSlotIndex] = 0
     nim_init_active = 0
     nim_init_program_count = 0
     nim_init_event_count = 0
@@ -4653,12 +4687,12 @@ proc resetNimControllerState() =
     nim_init_total_hci_complete_count = 0
     nim_init_connect_ind_header_flags = 0
     nim_init_rx_log_index = 0
-    for i in 0 ..< nim_init_rx_header_log.len:
-      nim_init_rx_header_log[i] = 0
-      nim_init_rx_status_log[i] = 0
-      nim_init_rx_peer0_log[i] = 0
-      nim_init_rx_peer1_log[i] = 0
-      nim_init_rx_reason_log[i] = 0
+    for initRxLogIndex in 0 ..< nim_init_rx_header_log.len:
+      nim_init_rx_header_log[initRxLogIndex] = 0
+      nim_init_rx_status_log[initRxLogIndex] = 0
+      nim_init_rx_peer0_log[initRxLogIndex] = 0
+      nim_init_rx_peer1_log[initRxLogIndex] = 0
+      nim_init_rx_reason_log[initRxLogIndex] = 0
     nim_init_next_program_at = 0
     nim_init_event_target_clock = 0
     nim_init_rx_event_clock = 0
@@ -4700,61 +4734,61 @@ proc resetNimControllerState() =
     when defined(BleDebugCounters):
       nim_init_program_snapshot_count = 0
       nim_init_program_snapshot_channel = 0
-      for i in 0 ..< nim_init_program_snapshot_timing.len:
-        nim_init_program_snapshot_timing[i] = 0
-      for i in 0 ..< nim_init_program_snapshot_em.len:
-        nim_init_program_snapshot_em[i] = 0
-      for i in 0 ..< nim_init_program_snapshot_tx_desc.len:
-        nim_init_program_snapshot_tx_desc[i] = 0
-      for i in 0 ..< nim_init_program_snapshot_sched.len:
-        nim_init_program_snapshot_sched[i] = 0
+      for initProgramTimingWordIndex in 0 ..< nim_init_program_snapshot_timing.len:
+        nim_init_program_snapshot_timing[initProgramTimingWordIndex] = 0
+      for initProgramEmWordIndex in 0 ..< nim_init_program_snapshot_em.len:
+        nim_init_program_snapshot_em[initProgramEmWordIndex] = 0
+      for initProgramTxDescWordIndex in 0 ..< nim_init_program_snapshot_tx_desc.len:
+        nim_init_program_snapshot_tx_desc[initProgramTxDescWordIndex] = 0
+      for initProgramSchedulerWordIndex in 0 ..< nim_init_program_snapshot_sched.len:
+        nim_init_program_snapshot_sched[initProgramSchedulerWordIndex] = 0
       nim_init_sch_event_log_index = 0
-      for i in 0 ..< nim_init_sch_event_code_log.len:
-        nim_init_sch_event_code_log[i] = 0
-        nim_init_sch_event_time_log[i] = 0
-        nim_init_sch_event_now_log[i] = 0
-        nim_init_sch_event_state_log[i] = 0
-        nim_init_sch_event_counts_log[i] = 0
-        nim_init_sch_event_done_log[i] = 0
-        nim_init_sch_event_int_log[i] = 0
+      for initSchEventLogIndex in 0 ..< nim_init_sch_event_code_log.len:
+        nim_init_sch_event_code_log[initSchEventLogIndex] = 0
+        nim_init_sch_event_time_log[initSchEventLogIndex] = 0
+        nim_init_sch_event_now_log[initSchEventLogIndex] = 0
+        nim_init_sch_event_state_log[initSchEventLogIndex] = 0
+        nim_init_sch_event_counts_log[initSchEventLogIndex] = 0
+        nim_init_sch_event_done_log[initSchEventLogIndex] = 0
+        nim_init_sch_event_int_log[initSchEventLogIndex] = 0
       nim_init_handoff_snapshot_count = 0
       nim_init_handoff_snapshot_reason = 0
-      for i in 0 ..< nim_init_handoff_snapshot_timing.len:
-        nim_init_handoff_snapshot_timing[i] = 0
-      for i in 0 ..< nim_init_handoff_snapshot_em.len:
-        nim_init_handoff_snapshot_em[i] = 0
-      for i in 0 ..< nim_init_handoff_snapshot_desc.len:
-        nim_init_handoff_snapshot_desc[i] = 0
-      for i in 0 ..< nim_init_handoff_snapshot_data.len:
-        nim_init_handoff_snapshot_data[i] = 0
+      for initHandoffTimingWordIndex in 0 ..< nim_init_handoff_snapshot_timing.len:
+        nim_init_handoff_snapshot_timing[initHandoffTimingWordIndex] = 0
+      for initHandoffEmWordIndex in 0 ..< nim_init_handoff_snapshot_em.len:
+        nim_init_handoff_snapshot_em[initHandoffEmWordIndex] = 0
+      for initHandoffDescWordIndex in 0 ..< nim_init_handoff_snapshot_desc.len:
+        nim_init_handoff_snapshot_desc[initHandoffDescWordIndex] = 0
+      for initHandoffDataWordIndex in 0 ..< nim_init_handoff_snapshot_data.len:
+        nim_init_handoff_snapshot_data[initHandoffDataWordIndex] = 0
     discard c_memset(addr nim_init_hci_params[0], 0,
                      nim_init_hci_params.len.csize_t)
     discard c_memset(addr nim_init_ll_data[0], 0,
                      nim_init_ll_data.len.csize_t)
   when defined(bl808m0) and bl808BleNimPureConnection:
     nim_conn_sched_log_index = 0
-    for i in 0 ..< nim_conn_sched_now_log.len:
-      nim_conn_sched_now_log[i] = 0
-      nim_conn_sched_target_log[i] = 0
-      nim_conn_sched_delta_log[i] = 0
-      nim_conn_sched_duration_log[i] = 0
-      nim_conn_sched_event_log[i] = 0
-      nim_conn_sched_channel_log[i] = 0
-      nim_conn_sched_timing_log[i] = 0
+    for connScheduleLogIndex in 0 ..< nim_conn_sched_now_log.len:
+      nim_conn_sched_now_log[connScheduleLogIndex] = 0
+      nim_conn_sched_target_log[connScheduleLogIndex] = 0
+      nim_conn_sched_delta_log[connScheduleLogIndex] = 0
+      nim_conn_sched_duration_log[connScheduleLogIndex] = 0
+      nim_conn_sched_event_log[connScheduleLogIndex] = 0
+      nim_conn_sched_channel_log[connScheduleLogIndex] = 0
+      nim_conn_sched_timing_log[connScheduleLogIndex] = 0
     nim_conn_last_schedule_now = 0
     nim_conn_last_schedule_target = 0
     nim_conn_last_schedule_fine = 0
     nim_conn_last_schedule_delta = 0
     nim_conn_last_schedule_duration = 0
     nim_conn_last_rx_timing = 0
-    nim_conn_last_channel_word = 0
+    nim_conn_last_channel_control = 0
     nim_conn_last_channel = 0
     nim_conn_last_unmapped_channel = 0
     nim_conn_last_event_counter = 0
     nim_conn_last_schedule_anchor = 0
     nim_conn_last_schedule_anchor_fine = 0
-    for i in 0 ..< nim_conn_first_schedule_snapshot.len:
-      nim_conn_first_schedule_snapshot[i] = 0
+    for connFirstScheduleSnapshotWordIndex in 0 ..< nim_conn_first_schedule_snapshot.len:
+      nim_conn_first_schedule_snapshot[connFirstScheduleSnapshotWordIndex] = 0
     nim_conn_missed_event_fallback_count = 0
     nim_conn_rx_acquire_events = 0
     nim_conn_rx_acquire_reset_count = 0
@@ -4770,17 +4804,17 @@ proc resetNimControllerState() =
       nim_conn_tx_header_log_index = 0
       nim_conn_rx_seq_log_index = 0
       nim_conn_sch_event_log_index = 0
-      for i in 0 ..< nim_conn_tx_header_log.len:
-        nim_conn_tx_header_log[i] = 0
-        nim_conn_tx_state_log[i] = 0
-        nim_conn_rx_seq_log[i] = 0
-        nim_conn_rx_state_log[i] = 0
-        nim_conn_sch_event_code_log[i] = 0
-        nim_conn_sch_event_time_log[i] = 0
-        nim_conn_sch_event_now_log[i] = 0
-        nim_conn_sch_event_state_log[i] = 0
-        nim_conn_sch_event_counts_log[i] = 0
-        nim_conn_sch_event_int_log[i] = 0
+      for connDebugLogSlotIndex in 0 ..< nim_conn_tx_header_log.len:
+        nim_conn_tx_header_log[connDebugLogSlotIndex] = 0
+        nim_conn_tx_state_log[connDebugLogSlotIndex] = 0
+        nim_conn_rx_seq_log[connDebugLogSlotIndex] = 0
+        nim_conn_rx_state_log[connDebugLogSlotIndex] = 0
+        nim_conn_sch_event_code_log[connDebugLogSlotIndex] = 0
+        nim_conn_sch_event_time_log[connDebugLogSlotIndex] = 0
+        nim_conn_sch_event_now_log[connDebugLogSlotIndex] = 0
+        nim_conn_sch_event_state_log[connDebugLogSlotIndex] = 0
+        nim_conn_sch_event_counts_log[connDebugLogSlotIndex] = 0
+        nim_conn_sch_event_int_log[connDebugLogSlotIndex] = 0
   when defined(bl808m0):
     nim_scan_unsupported_count = 0
     nim_scan_unsupported_header = 0
@@ -4834,10 +4868,10 @@ proc resetNimControllerState() =
     nim_conn_last_timeout = 0
     nim_conn_last_access_addr = 0
     nim_conn_last_crcinit = 0
-    for i in 0 ..< nim_connect_desc_fields.len:
-      nim_connect_desc_fields[i] = 0
-    for i in 0 ..< nim_connect_timing_snapshot.len:
-      nim_connect_timing_snapshot[i] = 0
+    for connectDescFieldIndex in 0 ..< nim_connect_desc_fields.len:
+      nim_connect_desc_fields[connectDescFieldIndex] = 0
+    for connectTimingSnapshotWordIndex in 0 ..< nim_connect_timing_snapshot.len:
+      nim_connect_timing_snapshot[connectTimingSnapshotWordIndex] = 0
     nim_conn_start_return_count = 0
     nim_lld_con_start_count = 0
     nim_lld_con_start_status = 0
@@ -4945,15 +4979,16 @@ proc resetNimControllerState() =
   else:
     initBleCoreRegisters()
 
-proc localAddrBytes(dst: ptr uint8, ownAddrType: uint8 = 0'u8) =
-  if dst == nil:
+proc localAddrBytes(localAddrOut: ptr uint8, ownAddrType: uint8 = 0'u8) =
+  if localAddrOut == nil:
     return
-  let raw = cast[ptr UncheckedArray[uint8]](dst)
-  for i in 0 ..< 6:
-    raw[i] = selectedLocalAddrByte(i, ownAddrType)
+  let localAddressBytes = cast[ptr UncheckedArray[uint8]](localAddrOut)
+  for localAddressByteIndex in 0 ..< 6:
+    localAddressBytes[localAddressByteIndex] =
+      selectedLocalAddrByte(localAddressByteIndex, ownAddrType)
 
-proc defaultLocalAddrBytes(dst: ptr uint8) =
-  localAddrBytes(dst)
+proc defaultLocalAddrBytes(localAddrOut: ptr uint8) =
+  localAddrBytes(localAddrOut)
 
 proc programBtbleLegacyAdv(advDataLen: uint8) =
   let advLen = min(advDataLen.int, 31)
@@ -5106,27 +5141,33 @@ when defined(bl808m0) and bl808BleNimPureCentral:
     NimInitConnectIndChSelBit =
       when bl808BleNimCentralChSel2: 0x0020'u16 else: 0'u16
 
-  proc nimScanParam16(off: int, fallback: uint16): uint16 =
-    let raw = uint16(nim_scan_params[off]) or
-      (uint16(nim_scan_params[off + 1]) shl 8)
-    if raw == 0'u16: fallback else: raw
+  proc nimScanParam16(scanParamByteOffset: int, fallback: uint16): uint16 =
+    let scanParamValue = uint16(nim_scan_params[scanParamByteOffset]) or
+      (uint16(nim_scan_params[scanParamByteOffset + 1]) shl 8)
+    if scanParamValue == 0'u16: fallback else: scanParamValue
 
-  proc nimInitPutLe16(dst: ptr UncheckedArray[uint8], off: int,
+  proc nimInitPutLe16(initParamBytes: ptr UncheckedArray[uint8],
+                      initParamByteOffset: int,
                       value: uint16) {.inline.} =
-    dst[off] = uint8(value and 0x00FF'u16)
-    dst[off + 1] = uint8((value shr 8) and 0x00FF'u16)
+    initParamBytes[initParamByteOffset] = uint8(value and 0x00FF'u16)
+    initParamBytes[initParamByteOffset + 1] =
+      uint8((value shr 8) and 0x00FF'u16)
 
-  proc nimInitPutLe32(dst: ptr UncheckedArray[uint8], off: int,
+  proc nimInitPutLe32(initParamBytes: ptr UncheckedArray[uint8],
+                      initParamByteOffset: int,
                       value: uint32) {.inline.} =
-    dst[off] = uint8(value and 0x000000FF'u32)
-    dst[off + 1] = uint8((value shr 8) and 0x000000FF'u32)
-    dst[off + 2] = uint8((value shr 16) and 0x000000FF'u32)
-    dst[off + 3] = uint8((value shr 24) and 0x000000FF'u32)
+    initParamBytes[initParamByteOffset] = uint8(value and 0x000000FF'u32)
+    initParamBytes[initParamByteOffset + 1] =
+      uint8((value shr 8) and 0x000000FF'u32)
+    initParamBytes[initParamByteOffset + 2] =
+      uint8((value shr 16) and 0x000000FF'u32)
+    initParamBytes[initParamByteOffset + 3] =
+      uint8((value shr 24) and 0x000000FF'u32)
 
-  proc nimInitParam16(off: int, fallback: uint16): uint16 =
-    let raw = uint16(nim_init_hci_params[off]) or
-      (uint16(nim_init_hci_params[off + 1]) shl 8)
-    if raw == 0'u16: fallback else: raw
+  proc nimInitParam16(initParamByteOffset: int, fallback: uint16): uint16 =
+    let initParamValue = uint16(nim_init_hci_params[initParamByteOffset]) or
+      (uint16(nim_init_hci_params[initParamByteOffset + 1]) shl 8)
+    if initParamValue == 0'u16: fallback else: initParamValue
 
   proc nimInitConnIntervalUnits(): uint16 {.inline.} =
     nimInitParam16(13, NimInitDefaultConnInterval)
@@ -5198,21 +5239,21 @@ when defined(bl808m0) and bl808BleNimPureCentral:
       when not bl808BleNimRuntimeClicIrq:
         nimDisableM0BleClicIrq()
 
-  proc nimAdvRfChannelIndex(idx: uint8): uint16 {.inline.} =
+  proc nimAdvRfChannelIndex(advChannelRotationIndex: uint8): uint16 {.inline.} =
     ## The BL808 legacy activity channel field is programmed with the RF
     ## frequency index for scanner activities.  BLE advertising channels
     ## 39/37/38 map to RF indexes 39/0/12.
-    case idx mod 3'u8
+    case advChannelRotationIndex mod 3'u8
     of 0'u8: 39'u16
     of 1'u8: 0'u16
     else: 12'u16
 
-  proc nimInitAdvChannelNumber(idx: uint8): uint16 {.inline.} =
+  proc nimInitAdvChannelNumber(advChannelRotationIndex: uint8): uint16 {.inline.} =
     ## Legacy initiator activities use the Bluetooth advertising channel
     ## number in the same EM field where scanner activities use an RF index.
     ## This matches vendor LLD init snapshots, which program values such as
     ## 0x8026 for advertising channel 38.
-    case idx mod 3'u8
+    case advChannelRotationIndex mod 3'u8
     of 0'u8: 39'u16
     of 1'u8: 37'u16
     else: 38'u16
@@ -5245,22 +5286,22 @@ when defined(bl808m0) and bl808BleNimPureCentral:
     else: 0x85E5'u16
 
   proc nimScanNextAdvChannel(): uint16 =
-    let idx = nim_scan_channel_cursor mod 3'u8
+    let scanAdvChannelIndex = nim_scan_channel_cursor mod 3'u8
     nim_scan_channel_cursor = (nim_scan_channel_cursor + 1'u8) mod 3'u8
-    result = nimAdvRfChannelIndex(idx)
-    nim_scan_last_channel_index = idx.uint32
+    result = nimAdvRfChannelIndex(scanAdvChannelIndex)
+    nim_scan_last_channel_index = scanAdvChannelIndex.uint32
     nim_scan_last_adv_channel = result.uint32
 
   proc nimInitPeerAddrLow(params: ptr uint8): uint32 {.inline.} =
     let req = hciLeCreateConnReq(params)
-    uint32(req.peerAddr.data[0]) or
-      (uint32(req.peerAddr.data[1]) shl 8) or
-      (uint32(req.peerAddr.data[2]) shl 16) or
-      (uint32(req.peerAddr.data[3]) shl 24)
+    uint32(req.peerAddr.bytes[0]) or
+      (uint32(req.peerAddr.bytes[1]) shl 8) or
+      (uint32(req.peerAddr.bytes[2]) shl 16) or
+      (uint32(req.peerAddr.bytes[3]) shl 24)
 
   proc nimInitPeerAddrHigh(params: ptr uint8): uint32 {.inline.} =
     let req = hciLeCreateConnReq(params)
-    uint32(req.peerAddr.data[4]) or (uint32(req.peerAddr.data[5]) shl 8)
+    uint32(req.peerAddr.bytes[4]) or (uint32(req.peerAddr.bytes[5]) shl 8)
 
   proc nimInitSeedChannelFromScanHint(params: ptr uint8): bool =
     ## LE Create Connection consumes a peer address learned from advertising
@@ -5277,16 +5318,18 @@ when defined(bl808m0) and bl808BleNimPureCentral:
       else:
         NimScanPeerHintSlots.uint32
     for age in 0'u32 ..< limit:
-      let slot =
+      let scanPeerHintLookupSlot =
         ((written - 1'u32 - age) mod NimScanPeerHintSlots.uint32).int
-      if nim_scan_peer_hint_type[slot] == peerType and
-          nim_scan_peer_hint_addr0[slot] == peer0 and
-          nim_scan_peer_hint_addr1[slot] == peer1:
-        let idx = nim_scan_peer_hint_channel_index[slot] mod 3'u32
-        nim_init_channel_cursor = uint8(idx)
-        nim_init_channel_seed = idx or 0x80000000'u32
-        nim_init_channel_hint_index = idx
-        nim_init_channel_hint_adv_channel = nim_scan_peer_hint_adv_channel[slot]
+      if nim_scan_peer_hint_type[scanPeerHintLookupSlot] == peerType and
+          nim_scan_peer_hint_addr0[scanPeerHintLookupSlot] == peer0 and
+          nim_scan_peer_hint_addr1[scanPeerHintLookupSlot] == peer1:
+        let hintedAdvChannelIndex =
+          nim_scan_peer_hint_channel_index[scanPeerHintLookupSlot] mod 3'u32
+        nim_init_channel_cursor = uint8(hintedAdvChannelIndex)
+        nim_init_channel_seed = hintedAdvChannelIndex or 0x80000000'u32
+        nim_init_channel_hint_index = hintedAdvChannelIndex
+        nim_init_channel_hint_adv_channel =
+          nim_scan_peer_hint_adv_channel[scanPeerHintLookupSlot]
         inc nim_init_channel_hint_hit_count
         return true
     nim_init_channel_hint_index = 0xFFFFFFFF'u32
@@ -5363,10 +5406,10 @@ when defined(bl808m0) and bl808BleNimPureCentral:
         not nimInitTargetReached(targetClock, nim_init_channel_window_deadline):
       return uint16(nim_init_last_adv_channel and 0xFFFF'u32)
 
-    let idx = nim_init_channel_cursor mod 3'u8
+    let initAdvChannelIndex = nim_init_channel_cursor mod 3'u8
     nim_init_channel_cursor = (nim_init_channel_cursor + 1'u8) mod 3'u8
-    result = nimInitAdvChannelNumber(idx)
-    nim_init_last_channel_index = idx.uint32
+    result = nimInitAdvChannelNumber(initAdvChannelIndex)
+    nim_init_last_channel_index = initAdvChannelIndex.uint32
     nim_init_last_adv_channel = result.uint32
     nim_init_channel_window_valid = 1
     nim_init_channel_window_deadline =
@@ -5437,60 +5480,61 @@ when defined(bl808m0) and bl808BleNimPureCentral:
     btbleLegacyTxDescProgram(
       desc, 0'u16, nimInitConnectIndHeader(), NimInitConnReqDataOffset0)
 
-  proc nimInitRecordRx(header, status, buf: uint16, peer0, peer1,
+  proc nimInitRecordRx(rxHeader, rxStatus, rxDataOffset: uint16, peerAddrLow, peerAddrHigh,
                        reason: uint32) =
-    let slot = nim_init_rx_log_index and 0x07'u32
-    nim_init_rx_header_log[slot.int] = header.uint32
-    nim_init_rx_status_log[slot.int] =
-      (status.uint32 shl 16) or uint32(buf)
-    nim_init_rx_peer0_log[slot.int] = peer0
-    nim_init_rx_peer1_log[slot.int] = peer1
-    nim_init_rx_reason_log[slot.int] = reason
+    let initiatorRxLogSlot = nim_init_rx_log_index and 0x07'u32
+    nim_init_rx_header_log[initiatorRxLogSlot.int] = rxHeader.uint32
+    nim_init_rx_status_log[initiatorRxLogSlot.int] =
+      (rxStatus.uint32 shl 16) or uint32(rxDataOffset)
+    nim_init_rx_peer0_log[initiatorRxLogSlot.int] = peerAddrLow
+    nim_init_rx_peer1_log[initiatorRxLogSlot.int] = peerAddrHigh
+    nim_init_rx_reason_log[initiatorRxLogSlot.int] = reason
     nim_init_rx_log_index = nim_init_rx_log_index + 1'u32
 
-  proc nimInitPeerMatches(header: uint16, buf: uint16, status: uint16): bool =
+  proc nimInitPeerMatches(rxHeader: uint16, rxDataOffset: uint16, rxStatus: uint16): bool =
     inc nim_init_rx_count
     inc nim_init_total_rx_count
-    nim_init_rx_last_header = header.uint32
-    nim_init_rx_last_buf = buf.uint32
-    let pduType = uint8(header and 0x000F'u16)
+    nim_init_rx_last_header = rxHeader.uint32
+    nim_init_rx_last_buf = rxDataOffset.uint32
+    let pduType = uint8(rxHeader and 0x000F'u16)
     if pduType != 0x00'u8:
       inc nim_init_rx_pdu_mismatch_count
       inc nim_init_total_pdu_mismatch_count
       nim_init_rx_match_reason = 1
-      nimInitRecordRx(header, status, buf, 0, 0, 1)
+      nimInitRecordRx(rxHeader, rxStatus, rxDataOffset, 0, 0, 1)
       return false
-    let pduLen = uint8((header shr 8) and 0x003F'u16)
+    let pduLen = uint8((rxHeader shr 8) and 0x003F'u16)
     if pduLen < 6'u8:
       inc nim_init_rx_short_count
       inc nim_init_total_short_count
       nim_init_rx_match_reason = 3
-      nimInitRecordRx(header, status, buf, 0, 0, 3)
+      nimInitRecordRx(rxHeader, rxStatus, rxDataOffset, 0, 0, 3)
       return false
-    let payloadBase = BTBLE_EM_BASE + buf.uint32
+    let payloadBase = BTBLE_EM_BASE + rxDataOffset.uint32
     nim_init_rx_last_peer0 = readBleAddrLow(payloadBase)
     nim_init_rx_last_peer1 = readBleAddrHigh(payloadBase)
-    for j in 0 ..< 6:
-      if read8(payloadBase + j.uint32) != nim_init_hci_params[6 + j]:
+    for peerAddrIndex in 0 ..< 6:
+      if read8(payloadBase + peerAddrIndex.uint32) !=
+          nim_init_hci_params[6 + peerAddrIndex]:
         inc nim_init_rx_addr_mismatch_count
         inc nim_init_total_addr_mismatch_count
         nim_init_rx_match_reason = 4
-        nimInitRecordRx(header, status, buf, nim_init_rx_last_peer0,
+        nimInitRecordRx(rxHeader, rxStatus, rxDataOffset, nim_init_rx_last_peer0,
                         nim_init_rx_last_peer1, 4)
         return false
     inc nim_init_rx_addr_match_count
     inc nim_init_total_addr_match_count
-    let actualAddrType = uint8((header shr 6) and 0x0001'u16)
+    let actualAddrType = uint8((rxHeader shr 6) and 0x0001'u16)
     let expectedAddrType = nim_init_hci_params[5] and 0x01'u8
     if actualAddrType != expectedAddrType:
       inc nim_init_rx_type_mismatch_count
       inc nim_init_total_type_mismatch_count
       nim_init_rx_match_reason = 2
-      nimInitRecordRx(header, status, buf, nim_init_rx_last_peer0,
+      nimInitRecordRx(rxHeader, rxStatus, rxDataOffset, nim_init_rx_last_peer0,
                       nim_init_rx_last_peer1, 2)
       return false
     nim_init_rx_match_reason = 0
-    nimInitRecordRx(header, status, buf, nim_init_rx_last_peer0,
+    nimInitRecordRx(rxHeader, rxStatus, rxDataOffset, nim_init_rx_last_peer0,
                     nim_init_rx_last_peer1, 0)
     true
 
@@ -5559,8 +5603,8 @@ when defined(bl808m0) and bl808BleNimPureCentral:
 
   proc nimInitExpandRxClock(rawClock, referenceClock: uint32): uint32 =
     let reference = referenceClock and 0x0FFFFFFF'u32
-    let rawLow = rawClock and 0x0000FFFF'u32
-    var candidate = (reference and 0x0FFF0000'u32) or rawLow
+    let rxClockLow16 = rawClock and 0x0000FFFF'u32
+    var candidate = (reference and 0x0FFF0000'u32) or rxClockLow16
     let ahead = (candidate - reference) and 0x0FFFFFFF'u32
     if ahead < 0x08000000'u32:
       if ahead > 0x00008000'u32:
@@ -5622,8 +5666,8 @@ when defined(bl808m0) and bl808BleNimPureCentral:
     ## The BL808 activity record is a 0x94-byte EM object.  Every role transition
     ## must install a complete record instead of inheriting opaque state left by
     ## a previous role or by hardware.
-    for off in countup(0'u32, 0x92'u32, 2'u32):
-      write16(em + off, 0'u16)
+    for legacyEventEmClearHalfwordOffset in countup(0'u32, 0x92'u32, 2'u32):
+      write16(em + legacyEventEmClearHalfwordOffset, 0'u16)
 
   proc programBtbleLegacyScanEm() =
     let em = BTBLE_EM_BASE + NimScanEventEmOffset
@@ -5731,18 +5775,19 @@ when defined(bl808m0) and bl808BleNimPureCentral:
       nim_init_program_snapshot_timing[5] = nim_init_channel_seed
       nim_init_program_snapshot_timing[6] = nim_init_channel_hint_index
       nim_init_program_snapshot_timing[7] = nim_init_program_count
-      for i in 0 ..< nim_init_program_snapshot_em.len:
-        nim_init_program_snapshot_em[i] = read32(em + uint32(i * 4))
-      for i in 0 ..< nim_init_program_snapshot_tx_desc.len:
-        nim_init_program_snapshot_tx_desc[i] =
-          read32(BTBLE_EM_BASE + NimInitTxDescOffset + uint32(i * 4))
-      for i in 0 ..< nim_init_program_snapshot_sched.len:
-        let off = i * 4
-        nim_init_program_snapshot_sched[i] =
-          uint32(nim_sch_prog[off]) or
-          (uint32(nim_sch_prog[off + 1]) shl 8) or
-          (uint32(nim_sch_prog[off + 2]) shl 16) or
-          (uint32(nim_sch_prog[off + 3]) shl 24)
+      for initProgramEmWordIndex in 0 ..< nim_init_program_snapshot_em.len:
+        nim_init_program_snapshot_em[initProgramEmWordIndex] =
+          read32(em + uint32(initProgramEmWordIndex * 4))
+      for initProgramTxDescWordIndex in 0 ..< nim_init_program_snapshot_tx_desc.len:
+        nim_init_program_snapshot_tx_desc[initProgramTxDescWordIndex] =
+          read32(BTBLE_EM_BASE + NimInitTxDescOffset + uint32(initProgramTxDescWordIndex * 4))
+      for initProgramSchedulerWordIndex in 0 ..< nim_init_program_snapshot_sched.len:
+        let schedulerSnapshotByteOffset = initProgramSchedulerWordIndex * 4
+        nim_init_program_snapshot_sched[initProgramSchedulerWordIndex] =
+          uint32(nim_sch_prog[schedulerSnapshotByteOffset]) or
+          (uint32(nim_sch_prog[schedulerSnapshotByteOffset + 1]) shl 8) or
+          (uint32(nim_sch_prog[schedulerSnapshotByteOffset + 2]) shl 16) or
+          (uint32(nim_sch_prog[schedulerSnapshotByteOffset + 3]) shl 24)
 
     proc nimInitCaptureHandoffSnapshot(reason: uint32, header: uint16,
                                        rxClock: uint32, rxFine: uint16) =
@@ -5769,34 +5814,39 @@ when defined(bl808m0) and bl808BleNimPureCentral:
       nim_init_handoff_snapshot_timing[13] = nim_init_program_count
       nim_init_handoff_snapshot_timing[14] = nim_init_next_program_at
       nim_init_handoff_snapshot_timing[15] = nim_init_pending_desc
-      for i in 0 ..< nim_init_handoff_snapshot_em.len:
-        nim_init_handoff_snapshot_em[i] = read32(em + uint32(i * 4))
-      for i in 0 ..< nim_init_handoff_snapshot_desc.len:
-        nim_init_handoff_snapshot_desc[i] =
-          read32(BTBLE_EM_BASE + 0x0458'u32 + uint32(i * 4))
-      for i in 0 ..< nim_init_handoff_snapshot_data.len:
-        nim_init_handoff_snapshot_data[i] =
-          read32(BTBLE_EM_BASE + 0x1780'u32 + uint32(i * 4))
+      for initHandoffEmWordIndex in 0 ..< nim_init_handoff_snapshot_em.len:
+        nim_init_handoff_snapshot_em[initHandoffEmWordIndex] =
+          read32(em + uint32(initHandoffEmWordIndex * 4))
+      for initHandoffDescWordIndex in 0 ..< nim_init_handoff_snapshot_desc.len:
+        nim_init_handoff_snapshot_desc[initHandoffDescWordIndex] =
+          read32(BTBLE_EM_BASE + 0x0458'u32 + uint32(initHandoffDescWordIndex * 4))
+      for initHandoffDataWordIndex in 0 ..< nim_init_handoff_snapshot_data.len:
+        nim_init_handoff_snapshot_data[initHandoffDataWordIndex] =
+          read32(BTBLE_EM_BASE + 0x1780'u32 + uint32(initHandoffDataWordIndex * 4))
 
     proc nimInitRecordSchEvent(timestamp: uint32, event: uint8) =
-      let slot = int(nim_init_sch_event_log_index and 0x0F'u32)
+      let initiatorSchedulerEventLogSlot =
+        int(nim_init_sch_event_log_index and 0x0F'u32)
       let intStat = regRead(BLE_BASE + 0x024'u32)
       let eventSlot = (intStat shr 24) and 0x0F'u32
       let slotStatus = uint32(read16(BTBLE_EM_BASE + eventSlot * 0x10'u32))
-      nim_init_sch_event_code_log[slot] =
+      nim_init_sch_event_code_log[initiatorSchedulerEventLogSlot] =
         event.uint32 or (eventSlot shl 8) or (slotStatus shl 16)
-      nim_init_sch_event_time_log[slot] = timestamp and 0x0FFFFFFF'u32
-      nim_init_sch_event_now_log[slot] = currentBtbleTime()
-      nim_init_sch_event_state_log[slot] =
+      nim_init_sch_event_time_log[initiatorSchedulerEventLogSlot] =
+        timestamp and 0x0FFFFFFF'u32
+      nim_init_sch_event_now_log[initiatorSchedulerEventLogSlot] =
+        currentBtbleTime()
+      nim_init_sch_event_state_log[initiatorSchedulerEventLogSlot] =
         (nim_init_active and 0x01'u32) or
         ((nim_init_handoff_pending and 0x01'u32) shl 1) or
         ((nim_init_rx_service_pending and 0x01'u32) shl 2) or
         ((nim_init_last_adv_channel and 0xFF'u32) shl 8)
-      nim_init_sch_event_counts_log[slot] =
+      nim_init_sch_event_counts_log[initiatorSchedulerEventLogSlot] =
         (nim_init_program_count and 0xFFFF'u32) or
         ((nim_init_tx_event_count and 0xFFFF'u32) shl 16)
-      nim_init_sch_event_done_log[slot] = nim_init_event_done_program_count
-      nim_init_sch_event_int_log[slot] = intStat
+      nim_init_sch_event_done_log[initiatorSchedulerEventLogSlot] =
+        nim_init_event_done_program_count
+      nim_init_sch_event_int_log[initiatorSchedulerEventLogSlot] = intStat
       inc nim_init_sch_event_log_index
 
   proc pushNimScanProgram(leadSlots: uint32 = NimScanMinLeadSlots)
@@ -5987,8 +6037,9 @@ when defined(bl808m0) and bl808BleNimPureCentral:
       ensureBleRf1MConfigured()
       initNimRwipRfTable()
       refreshNimSyncPositions()
-      for i in 0 ..< nim_init_hci_params.len:
-        nim_init_hci_params[i] = cast[ptr UncheckedArray[uint8]](params)[i]
+      for createConnectionParamByteIndex in 0 ..< nim_init_hci_params.len:
+        nim_init_hci_params[createConnectionParamByteIndex] =
+          cast[ptr UncheckedArray[uint8]](params)[createConnectionParamByteIndex]
       nim_scan_enabled = false
       sch_prog_init(3'u8)
       clearBtbleProgramSlots()
@@ -6062,15 +6113,15 @@ when defined(bl808m0) and bl808BleNimPureCentral:
       return
     let desc = nim_init_pending_desc
     let status = uint16(nim_init_pending_desc_status and 0xFFFF'u32)
-    let idx = nim_init_pending_desc_idx and 0x07'u32
+    let pendingRxDescRingIndex = nim_init_pending_desc_idx and 0x07'u32
     nim_init_pending_desc = 0
     nim_init_pending_desc_status = 0
     nim_init_pending_desc_idx = 0
     btbleRxDescClearDone(desc, status)
     when bl808BleNimPureConnection:
-      noteNimRxDescConsumed(idx)
+      noteNimRxDescConsumed(pendingRxDescRingIndex)
     else:
-      lld_env[14] = uint8((idx + 1'u32) and 0x07'u32)
+      lld_env[14] = uint8((pendingRxDescRingIndex + 1'u32) and 0x07'u32)
 
   proc failPendingNimInitiator(status: uint8) =
     if nim_init_complete_pending == 0'u32 and nim_init_active == 0'u32:
@@ -6148,28 +6199,29 @@ when defined(bl808m0) and bl808BleNimPureCentral:
       let pduLen = uint8((header shr 8) and 0x003F'u16)
       let handoffClock = currentBtbleTime()
       let anchor = nimInitFirstAnchor(rxClock, pduLen, handoffClock)
-      let p = cast[ptr UncheckedArray[uint8]](addr nim_conn_params[0])
+      let connStartParams = cast[ptr UncheckedArray[uint8]](addr nim_conn_params[0])
       discard c_memset(addr nim_conn_params[0],
                        0, nim_conn_params.len.csize_t)
-      for i in 0 .. 20:
-        p[i] = nim_init_ll_data[i]
-      p[21] = nim_init_ll_data[21] and 0x1F'u8
-      p[22] = (nim_init_ll_data[21] shr 5) and 0x07'u8
-      nimInitPutLe16(p, 24, rxFine)
-      nimInitPutLe32(p, 28, rxClock)
-      nimInitPutLe32(p, 32, anchor)
+      for connectIndPreambleByteIndex in 0 .. 20:
+        connStartParams[connectIndPreambleByteIndex] =
+          nim_init_ll_data[connectIndPreambleByteIndex]
+      connStartParams[21] = nim_init_ll_data[21] and 0x1F'u8
+      connStartParams[22] = (nim_init_ll_data[21] shr 5) and 0x07'u8
+      nimInitPutLe16(connStartParams, 24, rxFine)
+      nimInitPutLe32(connStartParams, 28, rxClock)
+      nimInitPutLe32(connStartParams, 32, anchor)
       # The initiator path has already converted the matched advertising RX
       # timestamp into the first master-packet anchor inside the CONNECT_IND
       # transmit window.  Use direct-anchor mode so the connection scheduler
-      # consumes p[32..35] instead of deriving an earlier anchor from rxClock.
-      p[36] = 0'u8
-      p[37] = 0'u8
+      # consumes connStartParams[32..35] instead of deriving an earlier anchor from rxClock.
+      connStartParams[36] = 0'u8
+      connStartParams[37] = 0'u8
       # lld_con_start takes ChSel as a byte bool(ean) and shifts it into the EM
       # channel-control word. Keep CONNECT_IND and the connection scheduler on
       # the same channel-selection algorithm.
-      p[38] =
+      connStartParams[38] =
         when bl808BleNimCentralChSel2: 1'u8 else: 0'u8
-      p[NimConnStartCentralRoleOffset] = NimInitRoleCentral
+      connStartParams[NimConnStartCentralRoleOffset] = NimInitRoleCentral
 
       nim_init_last_rx_clock = rxClock
       nim_init_last_rx_fine = rxFine.uint32
@@ -6269,19 +6321,21 @@ when defined(bl808m0) and bl808BleNimPureCentral:
     nimInitReleasePendingRxDesc()
     discard startNimInitiatorConnection(header, 0'u16, rxClock, rxFine)
 
-  proc handleNimInitiatorAdvRx(header: uint16, buf: uint16, desc: uint32,
-                               status: uint16, idx: uint32): bool =
-    nim_init_rx_last_status = status.uint32
+  proc handleNimInitiatorAdvRx(rxHeader: uint16, rxDataOffset: uint16,
+                               rxDescAddr: uint32, rxStatus: uint16,
+                               rxRingIndex: uint32): bool =
+    nim_init_rx_last_status = rxStatus.uint32
     if nim_init_active == 0'u32 or nim_init_handoff_pending != 0'u32:
       return false
-    if not nimInitPeerMatches(header, buf, status):
+    if not nimInitPeerMatches(rxHeader, rxDataOffset, rxStatus):
       return false
     inc nim_init_match_count
     inc nim_init_total_match_count
-    let rxFine = btbleAdvRxFine(desc)
-    let rxClock = nimInitRxClock(btbleAdvRxClock(desc))
+    let rxFine = btbleAdvRxFine(rxDescAddr)
+    let rxClock = nimInitRxClock(btbleAdvRxClock(rxDescAddr))
     inc nim_init_complete_count
-    nimInitQueueConnectionHandoff(header, rxClock, rxFine, desc, status, idx)
+    nimInitQueueConnectionHandoff(rxHeader, rxClock, rxFine, rxDescAddr,
+                                  rxStatus, rxRingIndex)
     true
 
   proc programNimScanning(enable: bool): uint8 =
@@ -6303,12 +6357,12 @@ when defined(bl808m0) and bl808BleNimPureCentral:
     nim_scan_last_status = 0
     nim_scan_next_program_at = 0
     nim_scan_peer_hint_write_index = 0
-    for i in 0 ..< NimScanPeerHintSlots:
-      nim_scan_peer_hint_addr0[i] = 0
-      nim_scan_peer_hint_addr1[i] = 0
-      nim_scan_peer_hint_type[i] = 0
-      nim_scan_peer_hint_channel_index[i] = 0
-      nim_scan_peer_hint_adv_channel[i] = 0
+    for scanPeerHintSlotIndex in 0 ..< NimScanPeerHintSlots:
+      nim_scan_peer_hint_addr0[scanPeerHintSlotIndex] = 0
+      nim_scan_peer_hint_addr1[scanPeerHintSlotIndex] = 0
+      nim_scan_peer_hint_type[scanPeerHintSlotIndex] = 0
+      nim_scan_peer_hint_channel_index[scanPeerHintSlotIndex] = 0
+      nim_scan_peer_hint_adv_channel[scanPeerHintSlotIndex] = 0
     resetBtbleAdvRxRing()
     enableBtbleLegacySchedulerEvents()
     regOr(BLE_BASE + 0x000'u32, 0x00000100'u32)
@@ -6341,8 +6395,8 @@ proc programNimAdvertising(enable: bool): uint8 =
   pdu[0] = 0x00'u8
   pdu[1] = uint8(6 + advLen)
   localAddrBytes(addr pdu[2], nim_adv_params[5])
-  for i in 0 ..< advLen:
-    pdu[8 + i] = nim_adv_data[i]
+  for advertisingDataByteIndex in 0 ..< advLen:
+    pdu[8 + advertisingDataByteIndex] = nim_adv_data[advertisingDataByteIndex]
   copyBytes(BLE_EM_BASE + 0x600'u32, addr pdu[0], 8 + advLen)
   programBtbleLegacyAdv(advLen.uint8)
   nim_adv_debug_stage = 0x7040'u32
@@ -6416,16 +6470,18 @@ proc handleNimHciCommand(opcode: uint16, params: ptr uint8,
     if paramLen != 6 or params == nil:
       return 0x12'u8
     let req = hciLeSetRandomAddressReq(params)
-    for i in 0 ..< nim_local_addr.len:
-      nim_local_addr[i] = req.address.data[i]
+    for randomAddressByteIndex in 0 ..< nim_local_addr.len:
+      nim_local_addr[randomAddressByteIndex] =
+        req.address.bytes[randomAddressByteIndex]
     nim_local_addr_valid = true
     0
   of HciOpLeSetAdvParams:
     if paramLen != 15 or params == nil:
       return 0x12'u8
     let req = hciLeSetAdvParamsReq(params)
-    for i in 0 ..< 15:
-      nim_adv_params[i] = req.bytes[i]
+    for advertisingParamByteIndex in 0 ..< 15:
+      nim_adv_params[advertisingParamByteIndex] =
+        req.encodedParams[advertisingParamByteIndex]
     0
   of HciOpLeSetAdvData:
     if paramLen != 32 or params == nil:
@@ -6433,10 +6489,11 @@ proc handleNimHciCommand(opcode: uint16, params: ptr uint8,
     let req = hciLeDataPayloadReq(params)
     if req.length > 31'u8:
       return 0x12'u8
-    let n = min(req.length.int, nim_adv_data.len)
-    nim_adv_data_len = n.uint8
-    for i in 0 ..< n:
-      nim_adv_data[i] = req.data[i]
+    let advDataCopyLen = min(req.length.int, nim_adv_data.len)
+    nim_adv_data_len = advDataCopyLen.uint8
+    for advertisingDataByteIndex in 0 ..< advDataCopyLen:
+      nim_adv_data[advertisingDataByteIndex] =
+        req.payload[advertisingDataByteIndex]
     0
   of HciOpLeSetScanRspData:
     if paramLen != 32 or params == nil:
@@ -6444,10 +6501,11 @@ proc handleNimHciCommand(opcode: uint16, params: ptr uint8,
     let req = hciLeDataPayloadReq(params)
     if req.length > 31'u8:
       return 0x12'u8
-    let n = min(req.length.int, nim_scan_rsp_data.len)
-    nim_scan_rsp_data_len = n.uint8
-    for i in 0 ..< n:
-      nim_scan_rsp_data[i] = req.data[i]
+    let scanRspDataCopyLen = min(req.length.int, nim_scan_rsp_data.len)
+    nim_scan_rsp_data_len = scanRspDataCopyLen.uint8
+    for scanResponseDataByteIndex in 0 ..< scanRspDataCopyLen:
+      nim_scan_rsp_data[scanResponseDataByteIndex] =
+        req.payload[scanResponseDataByteIndex]
     if nim_adv_enabled:
       programBtbleLegacyAdv(nim_adv_data_len)
     0
@@ -6511,23 +6569,23 @@ proc handleNimHciCommand(opcode: uint16, params: ptr uint8,
 # Platform RTOS wrappers. The HAL validation build has no FreeRTOS layer, so
 # provide a bounded single-queue shim that is enough for controller smoke tests.
 type BleQueue = object
-  length: uint32
+  capacity: uint32
   itemSize: uint32
-  head: uint32
-  tail: uint32
-  count: uint32
-  storage: array[20 * 8, uint8]
+  headIndex: uint32
+  tailIndex: uint32
+  itemCount: uint32
+  itemStorage: array[20 * 8, uint8]
 
 var bleMainQueue: BleQueue
 
 proc ble_xQueueCreate(length: uint32, item_size: uint32): pointer {.exportc, cdecl.} =
-  if length == 0 or item_size == 0 or length * item_size > bleMainQueue.storage.len.uint32:
+  if length == 0 or item_size == 0 or length * item_size > bleMainQueue.itemStorage.len.uint32:
     return nil
-  bleMainQueue.length = length
+  bleMainQueue.capacity = length
   bleMainQueue.itemSize = item_size
-  bleMainQueue.head = 0
-  bleMainQueue.tail = 0
-  bleMainQueue.count = 0
+  bleMainQueue.headIndex = 0
+  bleMainQueue.tailIndex = 0
+  bleMainQueue.itemCount = 0
   cast[pointer](addr bleMainQueue)
 
 proc ble_xQueueSend(q: pointer, item: pointer, timeout: uint32): uint32 {.exportc, cdecl.} =
@@ -6535,12 +6593,13 @@ proc ble_xQueueSend(q: pointer, item: pointer, timeout: uint32): uint32 {.export
   if q == nil or item == nil:
     return 0
   let queue = cast[ptr BleQueue](q)
-  if queue.count >= queue.length:
+  if queue.itemCount >= queue.capacity:
     return 0
-  let off = queue.tail * queue.itemSize
-  discard c_memcpy(addr queue.storage[off], item, queue.itemSize.csize_t)
-  queue.tail = (queue.tail + 1) mod queue.length
-  inc queue.count
+  let itemByteOffset = queue.tailIndex * queue.itemSize
+  discard c_memcpy(
+    addr queue.itemStorage[itemByteOffset], item, queue.itemSize.csize_t)
+  queue.tailIndex = (queue.tailIndex + 1) mod queue.capacity
+  inc queue.itemCount
   1
 
 proc ble_xQueueReceive(q: pointer, item: pointer, timeout: uint32): uint32 {.exportc, cdecl.} =
@@ -6548,16 +6607,17 @@ proc ble_xQueueReceive(q: pointer, item: pointer, timeout: uint32): uint32 {.exp
   if q == nil or item == nil:
     return 0
   let queue = cast[ptr BleQueue](q)
-  if queue.count == 0:
+  if queue.itemCount == 0:
     return 0
-  let off = queue.head * queue.itemSize
-  discard c_memcpy(item, addr queue.storage[off], queue.itemSize.csize_t)
-  queue.head = (queue.head + 1) mod queue.length
-  dec queue.count
+  let itemByteOffset = queue.headIndex * queue.itemSize
+  discard c_memcpy(
+    item, addr queue.itemStorage[itemByteOffset], queue.itemSize.csize_t)
+  queue.headIndex = (queue.headIndex + 1) mod queue.capacity
+  dec queue.itemCount
   1
 
 proc bleQueuePending(q: pointer): bool {.inline.} =
-  q != nil and cast[ptr BleQueue](q).count != 0
+  q != nil and cast[ptr BleQueue](q).itemCount != 0
 
 proc ble_vTaskDelete(t: pointer) {.exportc, cdecl.} =
   discard t

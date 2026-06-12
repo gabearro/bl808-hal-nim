@@ -30,32 +30,36 @@ proc osQueueCreate(queueLen, itemSize: uint32): pointer {.cdecl.} =
   let total = sizeof(SimpleQueue).uint + queueLen.uint * itemSize.uint
   result = c_calloc(1, total.csize_t)
   if result != nil:
-    let q = cast[ptr SimpleQueue](result)
-    q.itemSize = itemSize
-    q.depth = queueLen
+    let queueState = cast[ptr SimpleQueue](result)
+    queueState.itemSize = itemSize
+    queueState.depth = queueLen
 proc osQueueDelete(queue: pointer) {.cdecl.} = c_free(queue)
 proc osQueueSendWait(queue, item: pointer; length, ticks: uint32; prio: cint): cint {.cdecl.} =
   discard ticks; discard prio
   if queue == nil: return -1
-  let q = cast[ptr SimpleQueue](queue)
-  if item == nil or length != q.itemSize or (q.writeIdx - q.readIdx) >= q.depth:
+  let queueState = cast[ptr SimpleQueue](queue)
+  if item == nil or length != queueState.itemSize or (queueState.writeIdx - queueState.readIdx) >= queueState.depth:
     return -1
-  let slot = ptrAt(queue, sizeof(SimpleQueue).uint + (q.writeIdx mod q.depth).uint * q.itemSize.uint)
-  copyMem(slot, item, q.itemSize.uint)
-  inc q.writeIdx
+  let queueWriteStorageSlot =
+    ptrAt(queue, sizeof(SimpleQueue).uint +
+      (queueState.writeIdx mod queueState.depth).uint * queueState.itemSize.uint)
+  copyMem(queueWriteStorageSlot, item, queueState.itemSize.uint)
+  inc queueState.writeIdx
   0
 proc osQueueSend(queue, item: pointer; length: uint32): cint {.cdecl.} =
   osQueueSendWait(queue, item, length, 0, 0)
 proc osQueueRecv(queue, item: pointer; length, tick: uint32): cint {.cdecl.} =
   if queue == nil or item == nil: return -1
-  let q = cast[ptr SimpleQueue](queue)
-  if length != q.itemSize: return -1
+  let queueState = cast[ptr SimpleQueue](queue)
+  if length != queueState.itemSize: return -1
   var loops = if tick != 0: tick else: 1'u32
   while tick == BlOsWaitingForever or loops != 0:
-    if q.readIdx != q.writeIdx:
-      let slot = ptrAt(queue, sizeof(SimpleQueue).uint + (q.readIdx mod q.depth).uint * q.itemSize.uint)
-      copyMem(item, slot, q.itemSize.uint)
-      inc q.readIdx
+    if queueState.readIdx != queueState.writeIdx:
+      let queueReadStorageSlot =
+        ptrAt(queue, sizeof(SimpleQueue).uint +
+          (queueState.readIdx mod queueState.depth).uint * queueState.itemSize.uint)
+      copyMem(item, queueReadStorageSlot, queueState.itemSize.uint)
+      inc queueState.readIdx
       return 0
     if tick != BlOsWaitingForever:
       dec loops

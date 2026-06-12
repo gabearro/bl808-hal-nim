@@ -1,32 +1,32 @@
 proc rxHandlerFor(id: uint16): MsgCbProc =
   let task = msgTask(id)
-  let index = msgIndex(id)
+  let taskMessageIndex = msgIndex(id)
   case task
   of TaskMM:
-    case index
+    case taskMessageIndex
     of MmChannelSwitchI: blRxChanSwitchInd
     of MmChannelPreSwitchI, MmRemainOnChannelExpI, MmPsChangeI,
        MmTrafficReqI, MmChannelSurveyI: blCommonInd
     of MmRssiStatusI: blRxRssiStatusInd
     else: nil
   of TaskScanu:
-    case index
+    case taskMessageIndex
     of ScanuStartCfmI: blRxScanuStartCfm
     of ScanuJoinCfmI: blRxScanuJoinCfm
     of ScanuResultI: blRxScanuResultInd
     else: nil
   of TaskMe:
-    case index
+    case taskMessageIndex
     of MeTkipMicFailureI, MeTxCreditsUpdateI: blCommonInd
     else: nil
   of TaskSm:
-    case index
+    case taskMessageIndex
     of SmConnectI: blRxSmConnectInd
     of SmDisconnectI: blRxSmDisconnectInd
     of SmStaAddI: blRxSmStaAddInd
     else: nil
   of TaskApm:
-    case index
+    case taskMessageIndex
     of ApmStaAddI: blRxApmStaAddInd
     of ApmStaDelI: blRxApmStaDelInd
     else: nil
@@ -39,8 +39,8 @@ proc dispatchMsg(blHw, msg: pointer) =
   let cmdMgr = ptrAt(blHw, BlHwCmdMgrOff)
   let msgind = cast[CmdMsgindProc](loadPtr(cmdMgr, CmdMgrMsgindOff))
   if msgind != nil:
-    let cb = rxHandlerFor(loadU16(msg, IpcMsgIdOff))
-    discard msgind(cmdMgr, msg, cb)
+    let rxMessageHandler = rxHandlerFor(loadU16(msg, IpcMsgIdOff))
+    discard msgind(cmdMgr, msg, rxMessageHandler)
 
 proc bl_rx_handle_msg*(blHw: ptr BlHw; msg: pointer) {.exportc, cdecl.} =
   dispatchMsg(cast[pointer](blHw), msg)

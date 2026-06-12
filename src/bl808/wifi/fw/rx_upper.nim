@@ -160,9 +160,9 @@ proc rxu_cntrl_check_pn*(secKeyPtr: pointer, tid: uint8): cint {.exportc, cdecl.
     # Pairwise key — inline compare/update per TID
     let nextLo = pnLo + 1
     let nextHi = pnHi + (if nextLo < pnLo: 1'u32 else: 0'u32)
-    let entry = addr key.replayCounters[tid.int]
-    let storedHi = entry.pnHigh
-    let storedLo = entry.pnLow
+    let replayCounter = addr key.replayCounters[tid.int]
+    let storedHi = replayCounter.pnHigh
+    let storedLo = replayCounter.pnLow
     nimFwDbgRxuPnMeta = tid.uint32 or (hasRxPn.uint32 shl 8) or
       (env.secFlags.uint32 shl 16)
     nimFwDbgRxuPnStoredLo = storedLo
@@ -178,29 +178,29 @@ proc rxu_cntrl_check_pn*(secKeyPtr: pointer, tid: uint8): cint {.exportc, cdecl.
     if not accept:
       return 0  # replay detected
     # Update stored PN
-    entry.pnLow = nextLo
-    entry.pnHigh = nextHi
+      replayCounter.pnLow = nextLo
+      replayCounter.pnHigh = nextHi
     return 1
   else:
     # Group key / TID map: if tid==8, remap to 0 (TID 8 used for non-QoS group).
     var adjTid = tid
     if tid == 8:
       adjTid = 0
-    let entry = addr key.replayCounters[adjTid.int]
-    let entryAddr = cast[uint](entry)
+    let replayCounterEntry = addr key.replayCounters[adjTid.int]
+    let replayCounterEntryAddr = cast[uint](replayCounterEntry)
     nimFwDbgRxuPnMeta = tid.uint32 or (hasRxPn.uint32 shl 8) or
       (env.secFlags.uint32 shl 16)
-    nimFwDbgRxuPnStoredLo = entry.pnLow
-    nimFwDbgRxuPnStoredHi = entry.pnHigh
+    nimFwDbgRxuPnStoredLo = replayCounterEntry.pnLow
+    nimFwDbgRxuPnStoredHi = replayCounterEntry.pnHigh
     nimFwDbgRxuPnNextLo = pnLo
     nimFwDbgRxuPnNextHi = pnHi
     # Tail-call replay_counter_validate(entry, pnLo, pnHi). The callee reads
     # a1/a2 via inline asm, so we emit a direct RISC-V call that pins a0/a1/a2
     # before the call and captures the return in a0.
-    var rc: cint
+    var replayValidationStatus: cint
     {.emit: ["""
     {
-      register unsigned long _a0 __asm__("a0") = (unsigned long)""", entryAddr, """;
+      register unsigned long _a0 __asm__("a0") = (unsigned long)""", replayCounterEntryAddr, """;
       register unsigned long _a1 __asm__("a1") = (unsigned long)""", pnLo, """;
       register unsigned long _a2 __asm__("a2") = (unsigned long)""", pnHi, """;
       __asm__ volatile (
@@ -209,10 +209,10 @@ proc rxu_cntrl_check_pn*(secKeyPtr: pointer, tid: uint8): cint {.exportc, cdecl.
         :
         : "ra","memory","a3","a4","a5","a6","a7",
           "t0","t1","t2","t3","t4","t5","t6");
-      """, rc, """ = (int)_a0;
+      """, replayValidationStatus, """ = (int)_a0;
     }
     """].}
-    return rc
+    return replayValidationStatus
 
 proc rxu_cntrl_desc_prepare*(swdesc: pointer) {.exportc, cdecl, noinline.} =
   ## Set descriptor status=3, push to rxu_cntrl_env upload list under IRQ lock.
@@ -307,7 +307,7 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
   ## Returns (via s2): 0 = dropped, 1 = uploaded to host.
   ##
   ## Register map: s0=env s1=payload s2=retval s3=param s4=sta_info_tab
-  ##   s5=rawFC s6=staIdx s7=hwFlags/vif_info_tab s8=swdesc/fType
+  ##   s5=frameControl s6=staIdx s7=hwFlags/vif_info_tab s8=frameTypeBits
 
   let env = rxuCntrlEnvView()
   let swdescPtr = rxMpduDescView(param).swDesc
@@ -315,7 +315,7 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
   let hwFlags = swdesc.hwFlags
   nimFwDbgRxuLastHwFlags = hwFlags
   nimFwDbgRxuLastStatus = (hwFlags and 0x1C'u32) shr 2
-  nimFwDbgRxuLastLen = swdesc.payloadLenHalf.uint32
+  nimFwDbgRxuLastLen = swdesc.mpduLengthBytes.uint32
 
   # Epilogue helper: break to the common tail which emits a single
   # ke_evt_set (matching blob's 1-site pattern). Any caller using
@@ -333,8 +333,8 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
 
     # .L137: Frame valid -- begin classification
     let frame = macDataFrameAt(rxFramePayload(swdesc))
-    let rawFC = frame.frameControl
-    nimFwTrace2U32("[WIFI-NIMFW] rxu_fc ", hwFlags, rawFC.uint32)
+    let frameControl = frame.frameControl
+    nimFwTrace2U32("[WIFI-NIMFW] rxu_fc ", hwFlags, frameControl.uint32)
 
     # NOTE: The blob does NOT call tcpip_stack_input from rxu_cntrl_frame_handle.
     # The fast-path delivery happens only in rxu_swdesc_upload_evt.
@@ -354,7 +354,7 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
     env.vifIdx = 0xFF
 
     # Store frame control at env[0]
-    env.frameCtrl = rawFC
+    env.frameCtrl = frameControl
 
     # Store sequence control from the MAC header at env[2]
     let seqCtrl = frame.seqCtrl
@@ -373,24 +373,24 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
     # QoS sequence-cache overlay and PN replay index would index wrong entries
     # and reject valid frames. Must clear to 0 on non-QoS path.
     # .L142: Compute MAC header length
-    let machdrLen = rxu_cntrl_machdr_len_get(rawFC)
+    let machdrLen = rxu_cntrl_machdr_len_get(frameControl)
     env.machdrLen = machdrLen
-    if (rawFC.uint8 and 0x88) == 0x88:
+    if (frameControl.uint8 and 0x88) == 0x88:
       env.tid = (rxQosControl(frame, machdrLen) and 7).uint8
     else:
       env.tid = 0'u8
     when defined(bl808WifiConnectTrace):
       let rxTraceState = ke_state_get(TASK_SM)
-      let rxTraceType = rawFC and 0x000C
+      let rxTraceType = frameControl and 0x000C
       if rxTraceState >= SmAuthStartingState or rxTraceType == 8:
-        let rxTraceLen = swdesc.payloadLenHalf
+        let rxTraceLen = swdesc.mpduLengthBytes
         let rxTraceEth =
           if rxTraceLen >= machdrLen.uint16 + 8'u16:
             rxMsdu(frame, machdrLen).ethertype.uint32
         else:
             0'u32
         nimFwConnectTrace2U32("[WIFI-CT] rx_enter ",
-                              rawFC.uint32 or (machdrLen.uint32 shl 16),
+                              frameControl.uint32 or (machdrLen.uint32 shl 16),
                               hwFlags)
         nimFwConnectTrace2U32("[WIFI-CT] rx_len ",
                               rxTraceLen.uint32 or (rxTraceEth shl 16),
@@ -402,8 +402,8 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
                                  96)
 
     # ---- Address extraction: ToDS/FromDS ----
-    let toDs = (rawFC and 0x0100) != 0
-    let fromDs = (rawFC and 0x0200) != 0
+    let toDs = (frameControl and 0x0100) != 0
+    let fromDs = (frameControl and 0x0200) != 0
 
     if toDs:
       # DA from Addr3 (offset 16)
@@ -452,7 +452,7 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
           env.dstIdx = hal_machw_search_addr(addr env.da[0], 0).uint8
 
       # Mark HT QoS in status accumulator
-      if (rawFC and 0x0300) == 0x0300:
+      if (frameControl and 0x0300) == 0x0300:
         swdesc.frameControlFlags = swdesc.frameControlFlags or 4
 
         # .L156: Protected frame check (FC bit 14)
@@ -462,55 +462,55 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
           doReturn()
 
       # .L160: Frame type dispatch
-      let fType = rawFC and 0x000C
+      let frameTypeBits = frameControl and 0x000C
 
-      if fType != 0 and fType != 8:
+      if frameTypeBits != 0 and frameTypeBits != 8:
         inc nimFwDbgRxuDropFtype
         when defined(bl808WifiConnectTrace):
-          nimFwConnectTrace2U32("[WIFI-CT] rx_drop ", 2, rawFC.uint32)
+          nimFwConnectTrace2U32("[WIFI-CT] rx_drop ", 2, frameControl.uint32)
         doReturn()
 
-      if fType == 8:
+      if frameTypeBits == 8:
         inc nimFwDbgRxuAssocData
-        nimFwDbgRxuDataFc = rawFC.uint32 or (hwFlags and 0xFFFF0000'u32)
+        nimFwDbgRxuDataFc = frameControl.uint32 or (hwFlags and 0xFFFF0000'u32)
         nimFwDbgRxuDataSeq = env.seqCtrl.uint32 or
           (env.tid.uint32 shl 16) or (env.machdrLen.uint32 shl 24)
         # ---- Data frame (type 2) in associated path ----
-        # Blob .L160 at 0x3e6: rawFC & 0x40 = Null subtype (bit 6).
+        # Blob .L160 at 0x3e6: frameControl & 0x40 = Null subtype (bit 6).
         # Null/CF-Poll frames are keepalive-only (no payload); blob just pokes
         # the keepalive timestamp and returns. Previously Nim incorrectly called
         # rxl_frame_release here which double-released the descriptor.
-        if (rawFC and 0x0040) != 0:
+        if (frameControl and 0x0040) != 0:
           inc nimFwDbgRxuDropNull
-          nimFwDbgRxuDropNullFc = rawFC.uint32 or (hwFlags and 0xFFFF0000'u32)
+          nimFwDbgRxuDropNullFc = frameControl.uint32 or (hwFlags and 0xFFFF0000'u32)
           nimFwDbgRxuDropNullSeq = env.seqCtrl.uint32 or
             (env.tid.uint32 shl 16) or (env.machdrLen.uint32 shl 24)
           when defined(bl808WifiConnectTrace):
-            nimFwConnectTrace2U32("[WIFI-CT] rx_drop ", 3, rawFC.uint32)
+            nimFwConnectTrace2U32("[WIFI-CT] rx_drop ", 3, frameControl.uint32)
           mm_cfg_element_keepalive_timestamp_update()
           doReturn()
 
         # Sequence/reorder context
         var seqCachePtr: ptr uint16
-        if (rawFC and 0x0080) != 0:
+        if (frameControl and 0x0080) != 0:
           seqCachePtr = rxuQosSeqCachePtr(env.tid)
         else:
           seqCachePtr = addr sta.supportedRatesBitmap
 
         # Duplicate sequence check
         let envSeq = env.seqCtrl
-        if rawFC != 0:
-          let retryFrame = (rawFC and 0x0800'u16) != 0
+        if frameControl != 0:
+          let retryFrame = (frameControl and 0x0800'u16) != 0
           let protectedReplayChecked = (env.secFlags and 2) != 0
           if retryFrame and not protectedReplayChecked and
               seqCachePtr[] == envSeq and nimFwDbgRxuAssocUploadReady != 0:
             inc nimFwDbgRxuDropDup
-            nimFwDbgRxuDropDupFc = rawFC.uint32 or (hwFlags and 0xFFFF0000'u32)
+            nimFwDbgRxuDropDupFc = frameControl.uint32 or (hwFlags and 0xFFFF0000'u32)
             nimFwDbgRxuDropDupSeq = envSeq.uint32 or
               (env.tid.uint32 shl 16) or (env.machdrLen.uint32 shl 24)
             nimFwDbgRecordRxuDupDrop(frame, hwFlags, envSeq, env.tid,
                                      env.machdrLen, seqCachePtr[],
-                                     swdesc.payloadLenHalf)
+                                     swdesc.mpduLengthBytes)
             when defined(bl808WifiConnectTrace):
               nimFwConnectTrace2U32("[WIFI-CT] rx_drop ", 5, envSeq.uint32)
             doReturn()
@@ -523,14 +523,14 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
                env.tid) == 0:
             inc nimFwDbgRxuDropPn
             nimFwDbgRecordRxuPnDrop(frame, hwFlags, envSeq, env.tid,
-                                    env.machdrLen, swdesc.payloadLenHalf)
+                                    env.machdrLen, swdesc.mpduLengthBytes)
             when defined(bl808WifiConnectTrace):
-              nimFwConnectTrace2U32("[WIFI-CT] rx_drop ", 6, rawFC.uint32)
+              nimFwConnectTrace2U32("[WIFI-CT] rx_drop ", 6, frameControl.uint32)
             doReturn()
           if nimFwDbgRxuDhcpMsg(frame, env.machdrLen,
-                                swdesc.payloadLenHalf) != 0:
+                                swdesc.mpduLengthBytes) != 0:
             nimFwDbgRecordRxuPnAccept(1'u32, frame, hwFlags, envSeq, env.tid,
-                                      env.machdrLen, swdesc.payloadLenHalf)
+                                      env.machdrLen, swdesc.mpduLengthBytes)
 
         # .L171: EAPOL detection requires RFC1042 SNAP then EtherType 0x888E.
         let msdu = rxMsduView(frame, env.machdrLen)
@@ -543,7 +543,7 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
           of 0x0008'u16:
             inc nimFwDbgRxuAssocIp
             nimFwDbgRxuIpv4Preupload(frame, env.machdrLen, env.tid,
-                                     swdesc.payloadLenHalf)
+                                     swdesc.mpduLengthBytes)
           of 0x0608'u16:
             inc nimFwDbgRxuAssocArp
           of 0x8E88'u16:
@@ -557,13 +557,13 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
                                 msdu.snap.ethertype.uint32 or
                                   ((if hasRfc1042Snap: 1'u32 else: 0'u32) shl 16) or
                                   (env.tid.uint32 shl 24),
-                                swdesc.payloadLenHalf.uint32 or
+                                swdesc.mpduLengthBytes.uint32 or
                                   (env.machdrLen.uint32 shl 16))
         if hasRfc1042Snap and msdu.snap.ethertype == 0x8E88'u16:
           inc nimFwDbgRxuAssocEapol
           # .LBB303: EAPOL frame detected -- route based on VIF type
           let vifType = vif.vifType
-          let adjustedLen = swdesc.payloadLenHalf
+          let adjustedLen = swdesc.mpduLengthBytes
           let eapolData = rxMsduPayload(msdu)
           let eapolLen = adjustedLen - env.machdrLen.uint16 - sizeof(LlcSnapHeaderView).uint16
           when defined(bl808WifiConnectTrace):
@@ -582,17 +582,17 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
         if (fcR and 0x4000) != 0:
           if (fcR and 0x0400) != 0:
             if nimFwDbgRxuDhcpMsg(frame, env.machdrLen,
-                                  swdesc.payloadLenHalf) != 0:
+                                  swdesc.mpduLengthBytes) != 0:
               nimFwDbgRecordRxuPnAccept(0xE1'u32, frame, hwFlags, envSeq,
                                         env.tid, env.machdrLen,
-                                        swdesc.payloadLenHalf)
+                                        swdesc.mpduLengthBytes)
             doReturn()
           if env.fragNum != 0:
             if nimFwDbgRxuDhcpMsg(frame, env.machdrLen,
-                                  swdesc.payloadLenHalf) != 0:
+                                  swdesc.mpduLengthBytes) != 0:
               nimFwDbgRecordRxuPnAccept(0xE2'u32, frame, hwFlags, envSeq,
                                         env.tid, env.machdrLen,
-                                        swdesc.payloadLenHalf)
+                                        swdesc.mpduLengthBytes)
             doReturn()
 
         # .LBB312/.LBB313: MIC verification (Michael MIC for TKIP)
@@ -604,7 +604,7 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
           let secKey = cast[ptr VifKeySlotView](secKeyBase)
           let tidVal = env.tid
           let hdrLen2 = env.machdrLen
-          let frameSize = swdesc.payloadLenHalf
+          let frameSize = swdesc.mpduLengthBytes
           # dataLen = frameSize - 8 (MIC) - hdrLen
           var dataLen: int = frameSize.int - 8 - hdrLen2.int
 
@@ -617,24 +617,25 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
                       tidVal)
 
           # 2. Walk buffer chain computing MIC over MSDU payload
-          var curBuf = rxFrameBufferChainAt(swdesc.bufferChain)
+          var micPayloadBuffer = rxFrameBufferChainAt(swdesc.bufferChain)
           var skipBytes = hdrLen2.int  # skip MAC header in first segment
           const MAX_DMA_SEG = 1736
-          while dataLen > 0 and curBuf != nil:
-            let bufPayload = cast[uint](curBuf.frameData)
-            var segStart = bufPayload + skipBytes.uint
-            var segLen = dataLen + skipBytes
-            if segLen > MAX_DMA_SEG:
-              segLen = MAX_DMA_SEG
-            segLen -= skipBytes
-            if segLen > dataLen:
-              segLen = dataLen
-            if segLen > 0:
-              me_mic_calc(addr micCtx[0], cast[pointer](segStart), segLen.uint32)
-              dataLen -= segLen
+          while dataLen > 0 and micPayloadBuffer != nil:
+            let micPayloadBase = cast[uint](micPayloadBuffer.frameData)
+            var micSegmentStart = micPayloadBase + skipBytes.uint
+            var micSegmentLen = dataLen + skipBytes
+            if micSegmentLen > MAX_DMA_SEG:
+              micSegmentLen = MAX_DMA_SEG
+            micSegmentLen -= skipBytes
+            if micSegmentLen > dataLen:
+              micSegmentLen = dataLen
+            if micSegmentLen > 0:
+              me_mic_calc(addr micCtx[0], cast[pointer](micSegmentStart),
+                          micSegmentLen.uint32)
+              dataLen -= micSegmentLen
             if dataLen > 0:
-              curBuf = rxFrameBufferChainAt(curBuf.next)
-              if curBuf == nil:
+              micPayloadBuffer = rxFrameBufferChainAt(micPayloadBuffer.next)
+              if micPayloadBuffer == nil:
                 assert_rec("rxu_cntrl.c", "rxu_cntrl.c", 811)
                 doReturn()
             skipBytes = 0  # only first segment has header to skip
@@ -669,10 +670,10 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
           # 4. Compare computed MIC with received MIC
           if rxMic[0] != micCtx[0] or rxMic[1] != micCtx[1]:
             if nimFwDbgRxuDhcpMsg(frame, env.machdrLen,
-                                  swdesc.payloadLenHalf) != 0:
+                                  swdesc.mpduLengthBytes) != 0:
               nimFwDbgRecordRxuPnAccept(0xE3'u32, frame, hwFlags, envSeq,
                                         env.tid, env.machdrLen,
-                                        swdesc.payloadLenHalf)
+                                        swdesc.mpduLengthBytes)
             # MIC failure: send indication to host
             let failMsg = ke_msg_alloc(0xC04'u16, TASK_CFG, TASK_ME, 24)
             if failMsg != nil:
@@ -691,11 +692,11 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
             doReturn()
 
         # .L174: Build status word for host upload
-        let curStat = swdesc.frameControlFlags
+        let currentFrameControlFlags = swdesc.frameControlFlags
         let combined = (env.staIdx.uint32 shl 16) or
                        (env.vifIdx.uint32 shl 8) or
                        (env.dstIdx.uint32 shl 24) or
-                       curStat or 2
+                       currentFrameControlFlags or 2
         swdesc.frameControlFlags = combined
 
         # .LBB349: Reparse FC for QoS TID/AMSDU bits
@@ -726,7 +727,7 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
         else:
           # .L190: A-MSDU sub-frame: strip 14 bytes and write the sub-frame length.
           stripLen = (stripLen.int - 14).uint8
-          let adjustedLen2 = swdesc.payloadLenHalf
+          let adjustedLen2 = swdesc.mpduLengthBytes
           let lenVal = adjustedLen2 - (machdrLen and 0xFE).uint16
           let lenPtr = cast[ptr uint16](addr rxFrameBytes(finalFrame)[(machdrLen and 0xFE).int - 2])
           lenPtr[] = lenVal
@@ -742,7 +743,7 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
         rxCopyAddr(addr ethHdr.sa, addr env.sa)
 
         # Adjust length, set strip info
-        swdesc.payloadLenHalf = swdesc.payloadLenHalf - stripLen.uint16
+        swdesc.mpduLengthBytes = swdesc.mpduLengthBytes - stripLen.uint16
         swdesc.bufferOffset = stripLen.uint32
         env.stripLen = stripLen
 
@@ -750,9 +751,9 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
         # Blob order: rxl_mpdu_transfer → csrrci(irq disable) → rxu_cntrl_desc_prepare
         inc nimFwDbgRxuAssocUploadReady
         if nimFwDbgRxuDhcpMsg(frame, env.machdrLen,
-                              swdesc.payloadLenHalf) != 0:
+                              swdesc.mpduLengthBytes) != 0:
           nimFwDbgRecordRxuPnAccept(4'u32, frame, hwFlags, envSeq, env.tid,
-                                    env.machdrLen, swdesc.payloadLenHalf)
+                                    env.machdrLen, swdesc.mpduLengthBytes)
         rxl_mpdu_transfer(param)
         let savedIrq = irqSave()
         rxu_cntrl_desc_prepare(param)
@@ -762,9 +763,9 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
 
       else:
         inc nimFwDbgRxuAssocMgmt
-        # fType == 0: Management in associated path
+        # frameTypeBits == 0: Management in associated path
         let envSeq = env.seqCtrl
-        if rawFC != 0:
+        if frameControl != 0:
           let cachedSeq = sta.supportedRatesBitmap
           if cachedSeq == envSeq: doReturn()
         sta.supportedRatesBitmap = envSeq
@@ -775,25 +776,25 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
                env.tid) == 0:
             inc nimFwDbgRxuDropPn
             nimFwDbgRecordRxuPnDrop(frame, hwFlags, envSeq, env.tid,
-                                    env.machdrLen, swdesc.payloadLenHalf)
+                                    env.machdrLen, swdesc.mpduLengthBytes)
             doReturn()
 
         # Blob's associated mgmt path (.L158 -> .L163 -> .L234) routes through
         # rxu_mgt_frame_check(param, sta_idx), not the data upload path.
         returnValue = rxu_mgt_frame_check(param, env.staIdx)
-        nimFwTrace2U32("[WIFI-NIMFW] rxu_mgt_assoc ", rawFC.uint32, returnValue)
+        nimFwTrace2U32("[WIFI-NIMFW] rxu_mgt_assoc ", frameControl.uint32, returnValue)
         doReturn()
 
     # ================================================================
     # Non-associated path: dispatch by frame type bits [3:2]
     # ================================================================
-    let fType = rawFC and 0x000C
+    let frameTypeBits = frameControl and 0x000C
 
-    if fType == 0:
+    if frameTypeBits == 0:
       # ---- Management frame (type 0) ----
       let addr2Ptr = rxAddrPtr(addr frame.addr2)
-      let fcByte1 = (rawFC shr 8).uint8
-      let retryFrame = (fcByte1 and 0x08'u8) != 0
+      let frameControlFlagByte = (frameControl shr 8).uint8
+      let retryFrame = (frameControlFlagByte and 0x08'u8) != 0
 
       if retryFrame:
         let cachedSeq = env.bssidSeq
@@ -811,11 +812,11 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
 
       # Management frame filter check (blob: rxu_mgt_frame_check at reloc 0x324)
       let mgtAccepted = rxu_mgt_frame_check(param, 0xFF'u8)
-      nimFwTrace2U32("[WIFI-NIMFW] rxu_mgt ", rawFC.uint32, mgtAccepted)
+      nimFwTrace2U32("[WIFI-NIMFW] rxu_mgt ", frameControl.uint32, mgtAccepted)
       returnValue = mgtAccepted
       doReturn()
 
-    elif fType == 8:
+    elif frameTypeBits == 8:
       inc nimFwDbgRxuNonassocData
       # ---- Data frame (type 2) -- non-associated ----
       # Blob: check if DA matches a known VIF BSSID. If so, forward to
@@ -852,14 +853,14 @@ proc rxu_swdesc_upload_evt*() {.exportc, cdecl.} =
   ke_evt_clear(0x00800000'u32)
   inc nimFwDbgRxuUploadEvt
   let env = rxuCntrlEnvView()
-  var entry = co_list_pop_front(addr env.uploadList)
+  var uploadListNode = co_list_pop_front(addr env.uploadList)
   let uploadEnv = cast[ptr RxuUploadEnvView](addr rxuUploadEnv[0])
   let hwdescCallbacks = cast[ptr RxlHwdescCallbackEnvView](addr rxl_hwdesc_env[0])
   const MAX_DMA_ENTRIES = 4
   const MAX_DMA_SIZE = 1736'u32
-  while entry != nil:
+  while uploadListNode != nil:
     inc nimFwDbgRxuUploadEntry
-    let desc = cast[ptr RxMpduDescView](entry)
+    let desc = cast[ptr RxMpduDescView](uploadListNode)
     # Check upload count limit
     let uploadCount = uploadEnv.uploadCount
     if (41 - uploadCount) <= 2:
@@ -867,27 +868,27 @@ proc rxu_swdesc_upload_evt*() {.exportc, cdecl.} =
       let logFn = getLogFunc(204)
       if logFn != nil:
         cast[proc(a0: uint32, a1: uint32, a2: cstring, a3: uint32) {.cdecl.}](logFn)(2, 0, "rxu_cntrl.c", 2002)
-      rxl_mpdu_free(entry)
-      entry = co_list_pop_front(addr env.uploadList)
+      rxl_mpdu_free(uploadListNode)
+      uploadListNode = co_list_pop_front(addr env.uploadList)
       continue
     # Get sw_desc and compute total remaining bytes
     let swDesc = rxSwDescView(desc.swDesc)
-    var remaining = swDesc.payloadLenHalf.uint32 + swDesc.bufferOffset
+    var remaining = swDesc.mpduLengthBytes.uint32 + swDesc.bufferOffset
     # Clear local DMA descriptor array (40 bytes on stack, matching blob layout).
     # Blob: addresses at offsets 0,4,8,12; lengths (uint16) at offsets 32,34,36,38.
     var dmaArray {.noinit.}: RxUploadDmaArrayView
     discard c_memset(addr dmaArray, 0, sizeof(RxUploadDmaArrayView).csize_t)
-    # Get first HW descriptor
-    var curHwDesc = cast[ptr RxPayloadHwDescView](swDesc.bufferChain)
+    # Get first payload HW descriptor
+    var uploadPayloadHwDesc = cast[ptr RxPayloadHwDescView](swDesc.bufferChain)
     var dmaIdx = 0'u32
     # Build DMA entries from HW descriptor chain
-    while remaining > 0 and curHwDesc != nil:
+    while remaining > 0 and uploadPayloadHwDesc != nil:
       if dmaIdx >= MAX_DMA_ENTRIES.uint32:
         break  # at most 4 entries
       # Increment DMA count in desc
       desc.descCount = desc.descCount + 1
       # Store buffer address from hw_desc[8] (offsets 0,4,8,12 in dmaArray)
-      dmaArray.bufferAddrs[dmaIdx] = curHwDesc.bufferAddr
+      dmaArray.bufferAddrs[dmaIdx] = uploadPayloadHwDesc.bufferAddr
       # Compute transfer length (capped at MAX_DMA_SIZE)
       var xferLen = remaining
       if xferLen > MAX_DMA_SIZE:
@@ -895,18 +896,18 @@ proc rxu_swdesc_upload_evt*() {.exportc, cdecl.} =
       # Store length as uint16 at offset 32 + dmaIdx*2 in dmaArray
       dmaArray.lengths[dmaIdx] = xferLen.uint16
       # Check hw_desc[20] for warning
-      if curHwDesc.usedFlag != 0:
+      if uploadPayloadHwDesc.usedFlag != 0:
         let logFn = getLogFunc(204)
         if logFn != nil:
           cast[proc(a0: uint32, a1: uint32, a2: cstring, a3: uint32) {.cdecl.}](logFn)(2, 0, "rxu_cntrl.c", 2023)
       # Mark hw_desc as used
-      curHwDesc.usedFlag = 1
+      uploadPayloadHwDesc.usedFlag = 1
       # Advance
       if remaining > MAX_DMA_SIZE:
         remaining -= MAX_DMA_SIZE
       else:
         remaining = 0
-      curHwDesc = cast[ptr RxPayloadHwDescView](curHwDesc.next)
+      uploadPayloadHwDesc = cast[ptr RxPayloadHwDescView](uploadPayloadHwDesc.next)
       dmaIdx += 1
     # Set sw_desc[96] = 1 (upload done flag)
     swDesc.uploadDone = 1
@@ -914,11 +915,11 @@ proc rxu_swdesc_upload_evt*() {.exportc, cdecl.} =
     # Blob args: a0=entry, a1=desc[20] byte, a2=swDesc+28, a3=swDesc[84],
     #            a4=&dmaArray, a5=swDesc[76]&1
     let descFlag = desc.descFlag.uint32
-    let swPayload = cast[pointer](addr swDesc.payloadLenHalf)
+    let swPayload = cast[pointer](addr swDesc.mpduLengthBytes)
     let swBufOff = swDesc.bufferOffset
     let swFcFlag = swDesc.frameControlFlags and 1
     let uploadResult = tcpip_stack_input(
-      entry,
+      uploadListNode,
       descFlag,
       swPayload,
       swBufOff,
@@ -928,15 +929,15 @@ proc rxu_swdesc_upload_evt*() {.exportc, cdecl.} =
     if uploadResult != 0:
       inc nimFwDbgRxuUploadTcpipFail
       # Upload failed -- free descriptor and try next
-      rxl_mpdu_free(entry)
-      entry = co_list_pop_front(addr env.uploadList)
+      rxl_mpdu_free(uploadListNode)
+      uploadListNode = co_list_pop_front(addr env.uploadList)
       continue
     inc nimFwDbgRxuUploadTcpipOk
     when defined(bl808WifiRxPbufInput):
       # tcpip_stack_input copies RX bytes into PBUF_RAM before calling lwIP.
       # The copied pbuf owns the network packet; recycle the LMAC descriptor
       # immediately so uploadCount does not starve the RX path.
-      rxl_mpdu_free(entry)
+      rxl_mpdu_free(uploadListNode)
     else:
       # Upload succeeded -- call platform callbacks and update count
       if hwdescCallbacks.getStatus != nil:
@@ -944,5 +945,4 @@ proc rxu_swdesc_upload_evt*() {.exportc, cdecl.} =
       uploadEnv.uploadCount = uploadEnv.uploadCount + desc.descCount.uint32
       if hwdescCallbacks.clean != nil:
         cast[proc() {.cdecl.}](hwdescCallbacks.clean)()
-    entry = co_list_pop_front(addr env.uploadList)
-
+    uploadListNode = co_list_pop_front(addr env.uploadList)

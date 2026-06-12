@@ -1,15 +1,15 @@
 proc vendorPrintU32(value: uint32; base: uint32) =
-  var v = value
-  var buf: array[11, char]
+  var remainingValue = value
+  var reverseDigits: array[11, char]
   var pos = 0
-  if v == 0:
+  if remainingValue == 0:
     vendorPrintChar('0')
     return
-  while v != 0 and pos < buf.len:
-    let d = v mod base
-    buf[pos] = char(if d < 10: ord('0') + d.int else: ord('A') + d.int - 10)
+  while remainingValue != 0 and pos < reverseDigits.len:
+    let digit = remainingValue mod base
+    reverseDigits[pos] = char(if digit < 10: ord('0') + digit.int else: ord('A') + digit.int - 10)
     inc pos
-    v = v div base
+    remainingValue = remainingValue div base
   while pos > 0:
     dec pos
-    vendorPrintChar(buf[pos])
+    vendorPrintChar(reverseDigits[pos])

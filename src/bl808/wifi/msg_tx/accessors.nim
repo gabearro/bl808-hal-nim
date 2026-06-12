@@ -1,54 +1,54 @@
-template ptrAt(base: pointer; off: uint): pointer =
-  cast[pointer](cast[uint](base) + off)
+template ptrAt(base: pointer; byteOffset: uint): pointer =
+  cast[pointer](cast[uint](base) + byteOffset)
 
-proc opPtr(off: uint): pointer {.inline.} =
-  cast[ptr pointer](cast[uint](addr g_bl_ops_funcs) + off)[]
+proc opPtr(operationSlotByteOffset: uint): pointer {.inline.} =
+  cast[ptr pointer](cast[uint](addr g_bl_ops_funcs) + operationSlotByteOffset)[]
 
 proc osMalloc(size: uint): pointer {.inline.} =
-  let fn = cast[MallocProc](opPtr(OpMallocOff))
-  if fn == nil: nil else: fn(size.csize_t)
+  let allocFn = cast[MallocProc](opPtr(OpMallocOff))
+  if allocFn == nil: nil else: allocFn(size.csize_t)
 
-proc osFree(p: pointer) {.inline.} =
-  let fn = cast[FreeProc](opPtr(OpFreeOff))
-  if fn != nil:
-    fn(p)
+proc osFree(memory: pointer) {.inline.} =
+  let freeFn = cast[FreeProc](opPtr(OpFreeOff))
+  if freeFn != nil:
+    freeFn(memory)
 
-proc zero(p: pointer; n: uint) {.inline.} =
-  discard c_memset(p, 0, n.csize_t)
+proc zero(memory: pointer; byteCount: uint) {.inline.} =
+  discard c_memset(memory, 0, byteCount.csize_t)
 
-proc copyMem(dest, src: pointer; n: uint) {.inline.} =
-  if dest != nil and src != nil and n != 0:
-    discard c_memcpy(dest, src, n.csize_t)
+proc copyMem(dest, source: pointer; byteCount: uint) {.inline.} =
+  if dest != nil and source != nil and byteCount != 0:
+    discard c_memcpy(dest, source, byteCount.csize_t)
 
-proc loadPtr(base: pointer; off: uint): pointer {.inline.} =
-  cast[ptr pointer](ptrAt(base, off))[]
+proc loadPtr(base: pointer; byteOffset: uint): pointer {.inline.} =
+  cast[ptr pointer](ptrAt(base, byteOffset))[]
 
-proc storePtr(base: pointer; off: uint; value: pointer) {.inline.} =
-  cast[ptr pointer](ptrAt(base, off))[] = value
+proc storePtr(base: pointer; byteOffset: uint; value: pointer) {.inline.} =
+  cast[ptr pointer](ptrAt(base, byteOffset))[] = value
 
-proc loadU8(base: pointer; off: uint): uint8 {.inline.} =
-  cast[ptr uint8](ptrAt(base, off))[]
+proc loadU8(base: pointer; byteOffset: uint): uint8 {.inline.} =
+  cast[ptr uint8](ptrAt(base, byteOffset))[]
 
-proc storeU8(base: pointer; off: uint; value: uint8) {.inline.} =
-  cast[ptr uint8](ptrAt(base, off))[] = value
+proc storeU8(base: pointer; byteOffset: uint; value: uint8) {.inline.} =
+  cast[ptr uint8](ptrAt(base, byteOffset))[] = value
 
-proc loadU16(base: pointer; off: uint): uint16 {.inline.} =
-  cast[ptr uint16](ptrAt(base, off))[]
+proc loadU16(base: pointer; byteOffset: uint): uint16 {.inline.} =
+  cast[ptr uint16](ptrAt(base, byteOffset))[]
 
-proc storeU16(base: pointer; off: uint; value: uint16) {.inline.} =
-  cast[ptr uint16](ptrAt(base, off))[] = value
+proc storeU16(base: pointer; byteOffset: uint; value: uint16) {.inline.} =
+  cast[ptr uint16](ptrAt(base, byteOffset))[] = value
 
-proc loadU32(base: pointer; off: uint): uint32 {.inline.} =
-  cast[ptr uint32](ptrAt(base, off))[]
+proc loadU32(base: pointer; byteOffset: uint): uint32 {.inline.} =
+  cast[ptr uint32](ptrAt(base, byteOffset))[]
 
-proc storeU32(base: pointer; off: uint; value: uint32) {.inline.} =
-  cast[ptr uint32](ptrAt(base, off))[] = value
+proc storeU32(base: pointer; byteOffset: uint; value: uint32) {.inline.} =
+  cast[ptr uint32](ptrAt(base, byteOffset))[] = value
 
-proc loadI32(base: pointer; off: uint): int32 {.inline.} =
-  cast[ptr int32](ptrAt(base, off))[]
+proc loadI32(base: pointer; byteOffset: uint): int32 {.inline.} =
+  cast[ptr int32](ptrAt(base, byteOffset))[]
 
-proc storeI32(base: pointer; off: uint; value: int32) {.inline.} =
-  cast[ptr int32](ptrAt(base, off))[] = value
+proc storeI32(base: pointer; byteOffset: uint; value: int32) {.inline.} =
+  cast[ptr int32](ptrAt(base, byteOffset))[] = value
 
 proc swap16(value: uint16): uint16 {.inline.} =
   ((value and 0x00ff'u16) shl 8) or (value shr 8)

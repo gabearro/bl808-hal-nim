@@ -19,7 +19,7 @@ proc vendorPrintChar(c: char) =
 proc vendorPutsRaw(s: cstring) =
   if s == nil:
     return
-  var i = 0
-  while s[i] != '\0':
-    vendorPrintChar(s[i])
-    inc i
+  var charIndex = 0
+  while s[charIndex] != '\0':
+    vendorPrintChar(s[charIndex])
+    inc charIndex

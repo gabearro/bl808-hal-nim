@@ -21,11 +21,11 @@ proc allocFramePbuf(msduOffset: uint32; pkt: pointer): ptr Pbuf =
     discard pbuf_free(result)
     return nil
 
-  for i in 1 ..< WifiPktFragCount:
-    let fragLen = loadU16(pkt, WifiPktLenOff + uint(i * 2))
+  for wifiPacketFragmentIndex in 1 ..< WifiPktFragCount:
+    let fragLen = loadU16(pkt, WifiPktLenOff + uint(wifiPacketFragmentIndex * 2))
     if fragLen == 0'u16:
       break
-    let fragPayload = cast[pointer](loadU32(pkt, WifiPktPktOff + uint(i * 4)).uint)
+    let fragPayload = cast[pointer](loadU32(pkt, WifiPktPktOff + uint(wifiPacketFragmentIndex * 4)).uint)
     let frag = pbuf_alloc(PbufRaw, fragLen, PbufRam)
     if frag == nil:
       inc nimFwDbgPbufAllocFail

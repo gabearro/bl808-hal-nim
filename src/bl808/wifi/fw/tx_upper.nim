@@ -78,18 +78,18 @@ proc txu_cntrl_frame_build*(desc: pointer, bufPtr: pointer) {.exportc, cdecl.} =
   if staIdx != 0xFF:
     # Set frame control: Data frame (type=2, subtype from txdesc)
     fc = 0x0080'u16  # QoS data subtype in the low FC byte.
-    hdr.data.frameControl = fc
+    hdr.header.frameControl = fc
 
     # Write sequence control from txdesc[42]
-    hdr.data.seqCtrl = txDesc.seqAssigned shl 4
+    hdr.header.seqCtrl = txDesc.seqAssigned shl 4
     hdr.qosCtrl = staIdx.uint16
   else:
     # No STA: zero out frame control and address fields
-    hdr.data.frameControl = 0
-    hdr.data.seqCtrl = 0
+    hdr.header.frameControl = 0
+    hdr.header.seqCtrl = 0
 
   # OR in "Data" frame type (0x0008) into FC
-  var fullFc = hdr.data.frameControl
+  var fullFc = hdr.header.frameControl
   fullFc = fullFc or 0x0008  # Data type bit
 
   # VIF mode selects ToDS/FromDS in the vendor frame builder:
@@ -101,25 +101,25 @@ proc txu_cntrl_frame_build*(desc: pointer, bufPtr: pointer) {.exportc, cdecl.} =
     fullFc = fullFc or 0x0208'u16
 
   # Write back FC
-  hdr.data.frameControl = fullFc
+  hdr.header.frameControl = fullFc
 
   # Addr2 is always the local VIF MAC in the vendor builder.
-  discard c_memcpy(addr hdr.data.addr2[0], addr vif.macAddr[0], 6.csize_t)
+  discard c_memcpy(addr hdr.header.addr2[0], addr vif.macAddr[0], 6.csize_t)
 
   # Fill addresses based on To/From DS bits
   let toFromDs = fullFc and 0x0300
   if toFromDs == 0x0100:
     # ToDS=1, FromDS=0: Addr1=BSSID (from STA), Addr2=SA (from VIF), Addr3=DA
-    discard c_memcpy(addr hdr.data.addr1[0], addr sta.macAddr[0], 6.csize_t)
-    discard c_memcpy(addr hdr.data.addr3[0], addr txDesc.da[0], 6.csize_t)
+    discard c_memcpy(addr hdr.header.addr1[0], addr sta.macAddr[0], 6.csize_t)
+    discard c_memcpy(addr hdr.header.addr3[0], addr txDesc.da[0], 6.csize_t)
   elif toFromDs == 0x0200:
     # ToDS=0, FromDS=1: Addr1=DA, Addr2=BSSID, Addr3=SA
-    discard c_memcpy(addr hdr.data.addr1[0], addr txDesc.da[0], 6.csize_t)
-    discard c_memcpy(addr hdr.data.addr3[0], addr txDesc.sa[0], 6.csize_t)
+    discard c_memcpy(addr hdr.header.addr1[0], addr txDesc.da[0], 6.csize_t)
+    discard c_memcpy(addr hdr.header.addr3[0], addr txDesc.sa[0], 6.csize_t)
   else:
     # No DS or WDS: Addr1=DA, Addr2=SA, Addr3=BSSID
-    discard c_memcpy(addr hdr.data.addr1[0], addr txDesc.da[0], 6.csize_t)
-    discard c_memcpy(addr hdr.data.addr3[0], addr vif.bssid[0], 6.csize_t)
+    discard c_memcpy(addr hdr.header.addr1[0], addr txDesc.da[0], 6.csize_t)
+    discard c_memcpy(addr hdr.header.addr3[0], addr vif.bssid[0], 6.csize_t)
 
   let headerStaIdx = txDesc.staIdx
   if headerStaIdx != 0xFF'u8:
@@ -132,13 +132,13 @@ proc txu_cntrl_frame_build*(desc: pointer, bufPtr: pointer) {.exportc, cdecl.} =
       (txDesc.hostVifType.uint32 shl 16) or
       (txDesc.staInfoIdx.uint32 shl 24)
     nimFwDbgDhcpTxHdr0 =
-      hdr.data.frameControl.uint32 or
-      (hdr.data.seqCtrl.uint32 shl 16)
+      hdr.header.frameControl.uint32 or
+      (hdr.header.seqCtrl.uint32 shl 16)
     nimFwDbgDhcpTxHdr1 =
-      macAddrLo32(addr hdr.data.addr1) or
-      (cast[ptr uint16](addr hdr.data.addr2[0])[].uint32 shl 16)
+      macAddrLo32(addr hdr.header.addr1) or
+      (cast[ptr uint16](addr hdr.header.addr2[0])[].uint32 shl 16)
     nimFwDbgDhcpTxHdr2 =
-      macAddrLo32(addr hdr.data.addr3) or
+      macAddrLo32(addr hdr.header.addr3) or
       (hdr.qosCtrl.uint32 shl 16)
 
   if frameType == 0x8E88'u16 or frameType == 0x888E'u16:
@@ -148,16 +148,16 @@ proc txu_cntrl_frame_build*(desc: pointer, bufPtr: pointer) {.exportc, cdecl.} =
       (txDesc.hostVifType.uint32 shl 16) or
       (txDesc.staInfoIdx.uint32 shl 24)
     nimFwDbgEapolTxHdr0 =
-      hdr.data.frameControl.uint32 or
-      (hdr.data.seqCtrl.uint32 shl 16)
-    nimFwDbgEapolTxHdr1 = macAddrLo32(addr hdr.data.addr1)
-    nimFwDbgEapolTxHdr2 = macAddrLo32(addr hdr.data.addr2)
+      hdr.header.frameControl.uint32 or
+      (hdr.header.seqCtrl.uint32 shl 16)
+    nimFwDbgEapolTxHdr1 = macAddrLo32(addr hdr.header.addr1)
+    nimFwDbgEapolTxHdr2 = macAddrLo32(addr hdr.header.addr2)
     nimFwDbgEapolTxHdr3 =
-      macAddrLo32(addr hdr.data.addr3) or
+      macAddrLo32(addr hdr.header.addr3) or
       (hdr.qosCtrl.uint32 shl 16)
     nimFwDbgEapolTxAddrHi =
-      macAddrHi16(addr hdr.data.addr1) or
-      (macAddrHi16(addr hdr.data.addr2) shl 16)
+      macAddrHi16(addr hdr.header.addr1) or
+      (macAddrHi16(addr hdr.header.addr2) shl 16)
 
   when defined(bl808WifiConnectTrace):
     let protoTrace = frameLen
@@ -165,14 +165,14 @@ proc txu_cntrl_frame_build*(desc: pointer, bufPtr: pointer) {.exportc, cdecl.} =
       nimFwConnectTrace2U32("[WIFI-CT] tx_eapol_fc ",
                             fullFc.uint32 or (vifMode.uint32 shl 16),
                             cast[uint32](hdrBufBase))
-      let addr1Trace = macAddrLo32(addr hdr.data.addr1)
-      let addr2Trace = macAddrLo32(addr hdr.data.addr2)
-      let addr3Trace = macAddrLo32(addr hdr.data.addr3)
+      let addr1Trace = macAddrLo32(addr hdr.header.addr1)
+      let addr2Trace = macAddrLo32(addr hdr.header.addr2)
+      let addr3Trace = macAddrLo32(addr hdr.header.addr3)
       nimFwConnectTrace2U32("[WIFI-CT] tx_eapol_a12 ", addr1Trace, addr2Trace)
       nimFwConnectTrace2U32("[WIFI-CT] tx_eapol_a3 ", addr3Trace, frameLen.uint32)
-      let addrHi12Trace = macAddrHi16(addr hdr.data.addr1) or
-        (macAddrHi16(addr hdr.data.addr2) shl 16)
-      let addrHi3Trace = macAddrHi16(addr hdr.data.addr3)
+      let addrHi12Trace = macAddrHi16(addr hdr.header.addr1) or
+        (macAddrHi16(addr hdr.header.addr2) shl 16)
+      let addrHi3Trace = macAddrHi16(addr hdr.header.addr3)
       nimFwConnectTrace2U32("[WIFI-CT] tx_eapol_ahi ", addrHi12Trace, addrHi3Trace)
       nimFwConnectTrace2U32("[WIFI-CT] tx_eapol_snap ",
                             snapTraceLo(layout),
@@ -186,7 +186,7 @@ proc txu_cntrl_frame_build*(desc: pointer, bufPtr: pointer) {.exportc, cdecl.} =
     let isControlPort =
       (keyFlags and 2) != 0 and sta.rateWord == lmacGateHalfword(frameLen)
     if not isControlPort:
-      hdr.data.frameControl = hdr.data.frameControl or 0x4000'u16
+      hdr.header.frameControl = hdr.header.frameControl or 0x4000'u16
 
   if frameType == 0x0800'u16:
     let finalStaIdx = txDesc.staIdx
@@ -208,10 +208,10 @@ proc txu_cntrl_frame_build*(desc: pointer, bufPtr: pointer) {.exportc, cdecl.} =
     nimFwDbgDhcpTxLayout[7] =
       debugLoadLe32(bufPtr)
     nimFwDbgDhcpTxHdr0 =
-      hdr.data.frameControl.uint32 or
-      (hdr.data.seqCtrl.uint32 shl 16)
+      hdr.header.frameControl.uint32 or
+      (hdr.header.seqCtrl.uint32 shl 16)
     nimFwDbgDhcpTxHdr2 =
-      macAddrLo32(addr hdr.data.addr3) or
+      macAddrLo32(addr hdr.header.addr3) or
       (hdr.qosCtrl.uint32 shl 16)
     var macRawLen = txDesc.hdrLen.uint32 + 32'u32
     nimFwDbgDhcpMacRawLen = macRawLen
@@ -288,10 +288,10 @@ proc txu_cntrl_push*(param: pointer) {.exportc, cdecl.} =
 
     if not dropFrame:
       # Step 2: Check STA type and gate halfword (blob uses sta_info_tab, NOT vif).
-      let staType = sta.rxNss
-      if staType == 2:
+      let stationControlPortState = sta.controlPortState
+      if stationControlPortState == 2:
         discard  # Type 2 (AP): skip the STA control-port gate.
-      elif staType == 1:
+      elif stationControlPortState == 1:
         if sta.rateWord != lmacGateHalfword(desc.frameLen):
           dropFrame = true
       else:
@@ -465,17 +465,18 @@ proc txu_cntrl_tkip_mic_append*(txdesc: pointer) {.exportc, cdecl.} =
   if micArea.scratch != nil:
     return  # MIC already in progress
   # Set up MIC context at linkDesc+316..348 area
-  # Layout: [316]=magic(0xCAFEFADE), [320]=L_init, [324]=data_ptr, [328]=end_ptr, [332]=pending
+  # Layout: [316]=magic, [320]=initial L, [324]=input cursor,
+  # [328]=input end, [332]=pending MIC word.
   let scratch = addr link.micScratch
   micArea.scratch = cast[pointer](scratch)
-  scratch.dataPtr = cast[pointer](addr scratch.data[0])
+  scratch.micInputCursor = cast[pointer](addr scratch.micInputScratch[0])
   if keyType == 1:
-    scratch.endPtr = cast[pointer](addr scratch.data[3])
+    scratch.micInputEnd = cast[pointer](addr scratch.micInputScratch[3])
   else:
-    scratch.endPtr = cast[pointer](addr scratch.data[11])
+    scratch.micInputEnd = cast[pointer](addr scratch.micInputScratch[11])
   scratch.magic = 0xCAFEFADE'u32
-  scratch.pending = 0
-  scratch.micLInit = 0
+  scratch.pendingWord = 0
+  scratch.initialLeftWord = 0
   if keyType == 1:
     # For pairwise: build MIC header from frame header addresses
     # Extract header fields for MIC init
@@ -504,8 +505,8 @@ proc txu_cntrl_tkip_mic_append*(txdesc: pointer) {.exportc, cdecl.} =
     me_mic_end(micCtxPtr)
     let micDst = cast[ptr UncheckedArray[uint8]](scratch)
     let micResult = cast[ptr UncheckedArray[uint8]](micCtxPtr)
-    for i in 0 ..< 8:
-      micDst[i] = micResult[i]
+    for micByteIndex in 0 ..< 8:
+      micDst[micByteIndex] = micResult[micByteIndex]
   # Group-key/other TKIP modes follow the reference path that only arms the
   # link descriptor scratch state above; no immediate software MIC is appended.
   return
@@ -537,4 +538,3 @@ proc txu_cntrl_protect_mgmt_frame*(param: pointer, hdrPtr: pointer, extraLen: ui
   let secHdrPos = cast[pointer](hdrAddr + extraLen.uint + secHdrLen.uint)
   # Append security header (blob: txu_cntrl_sec_hdr_append(param, secHdrPos))
   discard txu_cntrl_sec_hdr_append(param, secHdrPos, 0'u32)
-

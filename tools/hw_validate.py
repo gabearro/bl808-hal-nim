@@ -3993,6 +3993,11 @@ def load_firmware_over_jtag(
                 f"{item.build_id}:{item.core}->{item.flash_core}"
             )
         entry = jtag_load_entry(item)
+        # Reset-halt at the BootROM first, so any lingering PMP/TZC config from
+        # the firmware currently in flash (e.g. an enclave image that locks OCRAM
+        # out of U-mode/exec) is cleared before we load and run the RAM image.
+        # Without this, the RAM entry can take an instruction-access fault.
+        session.command("reset halt", timeout_s=10)
         session.command(f"load_image {item.elf}", timeout_s=60)
         return entry
 

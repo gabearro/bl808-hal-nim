@@ -29,15 +29,15 @@ proc mac_vsie_find*(buf: pointer, bufLen: uint32, oui: pointer, ouiLen: uint8): 
   ## .L7: lbu len, 1(pos); pos += len + 2; loop back.
   var pos = cast[uint](buf)
   let endPos = pos + bufLen.uint
-  let ouiArr = cast[ptr UncheckedArray[uint8]](oui)
+  let targetOuiBytes = cast[ptr UncheckedArray[uint8]](oui)
   while pos < endPos:
     let ie = macIeAt(pos)
     if ie.id == 0xDD'u8:
       # Vendor-specific IE found, compare OUI bytes
-      let ieData = ie.macIePayload
+      let vendorIePayload = ie.macIePayload
       var match = true
-      for i in 0'u8 ..< ouiLen:
-        if ieData[i] != ouiArr[i]:
+      for ouiByteIndex in 0'u8 ..< ouiLen:
+        if vendorIePayload[ouiByteIndex] != targetOuiBytes[ouiByteIndex]:
           match = false
           break
       if match:
@@ -101,29 +101,30 @@ proc mac_paid_gid_sta_compute*(bssid: pointer): uint32 {.exportc, cdecl.} =
   ## From blob: lbu a5, 4(a0); lbu a0, 5(a0); andi a5, 128;
   ##   slli a0, 1; or a0, a5; slli a0, 22; ret.
   ## Extracts bytes 4-5 of BSSID, combines and shifts into PAID/GID format.
-  let b = cast[ptr UncheckedArray[uint8]](bssid)
-  let byte4 = b[4].uint32 and 0x80  # bit 7 of byte 4
-  let byte5 = b[5].uint32
-  result = ((byte5 shl 1) or byte4) shl 22
+  let bssidBytes = cast[ptr UncheckedArray[uint8]](bssid)
+  let bssidOctet4Msb = bssidBytes[4].uint32 and 0x80'u32
+  let bssidOctet5ForPartialAid = bssidBytes[5].uint32
+  result = ((bssidOctet5ForPartialAid shl 1) or bssidOctet4Msb) shl 22
 
 proc mac_paid_gid_ap_compute*(bssid: pointer, aid: uint16): uint32 {.exportc, cdecl.} =
   ## Compute Partial AID and Group ID for AP (13 instructions in blob).
-  ## From blob: lbu a5, 5(a0) => byte5 of BSSID
+  ## From blob: lbu a5, 5(a0) => octet 5 of BSSID
   ##   andi a1, 511 => partialAID = aid & 0x1FF
-  ##   srai a0, a5, 4 => upperNibble = byte5 >> 4
-  ##   xor a0, a0, a5 => mixed = upperNibble ^ byte5
+  ##   srai a0, a5, 4 => upperNibble = bssid octet 5 >> 4
+  ##   xor a0, a0, a5 => mixed = upperNibble ^ bssid octet 5
   ##   slli a0, 5 => mixed <<= 5
   ##   andi a0, 480 => mixed &= 0x1E0 (5-bit field in bits 8:5)
   ##   add a0, a1 => combined = mixed + partialAID
   ##   lui a5, 0x7FC00; slli a0, 22; and a0, a5 => PAID field in bits 30:22
   ##   lui a5, 0x3F0; or a0, a5 => set GID=0x3F (broadcast) in bits 21:16
-  let b = cast[ptr UncheckedArray[uint8]](bssid)
-  let byte5 = b[5].uint32
+  let bssidBytes = cast[ptr UncheckedArray[uint8]](bssid)
+  let bssidOctet5ForPartialAid = bssidBytes[5].uint32
   let partialAid = aid.uint32 and 0x1FF'u32
-  let upperNibble = byte5 shr 4
-  var mixed = (upperNibble xor byte5) shl 5
-  mixed = mixed and 0x1E0'u32
-  let combined = mixed + partialAid
+  let bssidOctet5UpperNibble = bssidOctet5ForPartialAid shr 4
+  var bssidMixedAidBits =
+    (bssidOctet5UpperNibble xor bssidOctet5ForPartialAid) shl 5
+  bssidMixedAidBits = bssidMixedAidBits and 0x1E0'u32
+  let combined = bssidMixedAidBits + partialAid
   let paidField = (combined shl 22) and 0x7FC00000'u32
   result = paidField or 0x003F0000'u32  # GID = 63 (broadcast)
 
@@ -143,11 +144,11 @@ proc bl60x_edca_get*(ac: cint, aifs: ptr uint8, cwmin: ptr uint8, cwmax: ptr uin
   of 2: regAddr = MACHW_EDCA_AC_VI_REG  # AC_VI
   of 3: regAddr = MACHW_EDCA_AC_VO_REG  # AC_VO
   else: return -1
-  let word = regRead(regAddr)
-  aifs[] = (word and 0xF).uint8             # bits [3:0]
-  cwmin[] = ((word shr 4) and 0xF).uint8    # bits [7:4]
-  cwmax[] = ((word shr 8) and 0xF).uint8    # bits [11:8]
-  txop[] = (word shr 12).uint16             # bits [31:12]
+  let edcaParamWord = regRead(regAddr)
+  aifs[] = (edcaParamWord and 0xF).uint8             # bits [3:0]
+  cwmin[] = ((edcaParamWord shr 4) and 0xF).uint8    # bits [7:4]
+  cwmax[] = ((edcaParamWord shr 8) and 0xF).uint8    # bits [11:8]
+  txop[] = (edcaParamWord shr 12).uint16             # bits [31:12]
   return 0
 
 proc bl60x_firmwre_mpdu_free*(param: pointer) {.exportc, cdecl.} =
@@ -182,36 +183,36 @@ proc notifier_chain_insert_ordered(headPtr: ptr pointer, notifier: ptr CoListHdr
   ## Inserts before the first node whose priority < new node's priority.
   let newNode = notifierNodeView(notifier)
   let newPrio = newNode.priority
-  var pos = headPtr
-  var cur = cast[ptr CoListHdr](pos[])
-  while cur != nil:
-    let curNode = notifierNodeView(cur)
-    let curPrio = curNode.priority
-    if curPrio < newPrio:
-      # Insert notifier before cur
-      newNode.next = cast[pointer](cur)
-      pos[] = cast[pointer](notifier)
+  var linkSlot = headPtr
+  var currentNotifier = cast[ptr CoListHdr](linkSlot[])
+  while currentNotifier != nil:
+    let currentNode = notifierNodeView(currentNotifier)
+    let currentPriority = currentNode.priority
+    if currentPriority < newPrio:
+      # Insert notifier before currentNotifier
+      newNode.next = cast[pointer](currentNotifier)
+      linkSlot[] = cast[pointer](notifier)
       return
-    # Advance: pos = &cur->next (offset 4)
-    pos = addr curNode.next
-    cur = cast[ptr CoListHdr](pos[])
+    # Advance: linkSlot = &currentNotifier->next (offset 4)
+    linkSlot = addr currentNode.next
+    currentNotifier = cast[ptr CoListHdr](linkSlot[])
   # End of list or empty: insert here
   newNode.next = nil
-  pos[] = cast[pointer](notifier)
+  linkSlot[] = cast[pointer](notifier)
 
 proc notifier_chain_remove(headPtr: ptr pointer, notifier: ptr CoListHdr) =
   ## Remove a notifier from a singly-linked list by pointer match.
   ## From blob: walks list via offset 4 (next), compares pointer,
   ## unlinks by setting prev->next = node->next.
-  var pos = headPtr
-  var cur = cast[ptr CoListHdr](pos[])
-  while cur != nil:
-    if cur == notifier:
-      # Unlink: *pos = notifier->next
-      pos[] = notifierNodeView(notifier).next
+  var linkSlot = headPtr
+  var currentNotifier = cast[ptr CoListHdr](linkSlot[])
+  while currentNotifier != nil:
+    if currentNotifier == notifier:
+      # Unlink: *linkSlot = notifier->next
+      linkSlot[] = notifierNodeView(notifier).next
       return
-    pos = addr notifierNodeView(cur).next
-    cur = cast[ptr CoListHdr](pos[])
+    linkSlot = addr notifierNodeView(currentNotifier).next
+    currentNotifier = cast[ptr CoListHdr](linkSlot[])
 
 proc notifier_chain_regsiter*(chain: ptr CoList, notifier: ptr CoListHdr) {.exportc, cdecl.} =
   ## Register notifier with irqSave (64 bytes in blob, 30 instrs).
@@ -246,16 +247,16 @@ proc notifier_chain_call*(chain: ptr CoList, event: uint32, data: pointer) {.exp
   ##   s0 = s0[4] => advance to next
   ## irqRestore, return 0.
   let saved = irqSave()
-  var cur = chain.first
-  while cur != nil:
-    let node = notifierNodeView(cur)
-    let next = cast[ptr CoListHdr](node.next)
-    let cb = cast[proc(node: ptr CoListHdr, event: uint32, data: pointer): cint {.cdecl.}](
-      node.callback
+  var currentNotifier = chain.first
+  while currentNotifier != nil:
+    let notifierNode = notifierNodeView(currentNotifier)
+    let nextNotifier = cast[ptr CoListHdr](notifierNode.next)
+    let callback = cast[proc(node: ptr CoListHdr, event: uint32, data: pointer): cint {.cdecl.}](
+      notifierNode.callback
     )
-    if cb != nil:
-      discard cb(cur, event, data)
-    cur = next
+    if callback != nil:
+      discard callback(currentNotifier, event, data)
+    currentNotifier = nextNotifier
   irqRestore(saved)
 
 proc notifier_chain_call_fromeCritical*(chain: ptr CoList, event: uint32, data: pointer) {.exportc, cdecl.} =
@@ -263,15 +264,15 @@ proc notifier_chain_call_fromeCritical*(chain: ptr CoList, event: uint32, data: 
   ## From blob (23 instrs): s0 = chain.first, for each node:
   ##   lw a5, 0(s0) => callback, call callback(node, event, data),
   ##   lw s0, 4(s0) => next. No interrupt manipulation.
-  var cur = chain.first
-  while cur != nil:
-    let node = notifierNodeView(cur)
-    let cb = cast[proc(node: ptr CoListHdr, event: uint32, data: pointer): cint {.cdecl.}](
-      node.callback
+  var currentNotifier = chain.first
+  while currentNotifier != nil:
+    let notifierNode = notifierNodeView(currentNotifier)
+    let callback = cast[proc(node: ptr CoListHdr, event: uint32, data: pointer): cint {.cdecl.}](
+      notifierNode.callback
     )
-    if cb != nil:
-      discard cb(cur, event, data)
-    cur = cast[ptr CoListHdr](node.next)
+    if callback != nil:
+      discard callback(currentNotifier, event, data)
+    currentNotifier = cast[ptr CoListHdr](notifierNode.next)
 
 # ###########################################################################
 #                  Replay Counter
@@ -458,26 +459,26 @@ proc bugkiller_fw_queue_dump(queue: ptr CoList) {.exportc: "fw_queue_dumpp", cde
     let n2 = c_strlen(cursor).int32
     cursor = puts_space(padPtr, 10'i32 - n2)
 
-  var cur = queue.first
-  while cur != nil:
-    let msg = cast[ptr KeMsgHdr](cur)
+  var queueNode = queue.first
+  while queueNode != nil:
+    let msg = cast[ptr KeMsgHdr](queueNode)
     if allocFnPtr != nil:
       let allocFn = cast[AllocFnType](allocFnPtr)
-      let buf = allocFn(256)
-      if buf != nil:
-        var col: pointer = buf
-        c_sprintf(col, "%d", msg.id.cint);        formatCol(col)
-        c_sprintf(col, "%d", msg.destId.cint);    formatCol(col)
-        c_sprintf(col, "%d", msg.srcId.cint);     formatCol(col)
-        c_sprintf(col, "%d", msg.paramLen.cint);  formatCol(col)
-        c_sprintf(col, "0x%08x",
-                  cast[uint32](cast[uint](msg) + 12)); formatCol(col)
+      let lineBuffer = allocFn(256)
+      if lineBuffer != nil:
+        var columnCursor: pointer = lineBuffer
+        c_sprintf(columnCursor, "%d", msg.id.cint);        formatCol(columnCursor)
+        c_sprintf(columnCursor, "%d", msg.destId.cint);    formatCol(columnCursor)
+        c_sprintf(columnCursor, "%d", msg.srcId.cint);     formatCol(columnCursor)
+        c_sprintf(columnCursor, "%d", msg.paramLen.cint);  formatCol(columnCursor)
+        c_sprintf(columnCursor, "0x%08x",
+                  cast[uint32](cast[uint](msg) + 12)); formatCol(columnCursor)
         if putsFn != nil:
-          puts(buf)
+          puts(lineBuffer)
           puts(nil)
         if freeFnPtr != nil:
-          cast[FreeFnType](freeFnPtr)(buf)
-    cur = cur.next
+          cast[FreeFnType](freeFnPtr)(lineBuffer)
+    queueNode = queueNode.next
   if putsFn != nil:
     puts(nil)
 
@@ -526,7 +527,7 @@ proc bugkiller_fw_queue_timer_dump*() {.exportc, cdecl.} =
   puts(nil)  # header 2
 
   # Walk the timer queue
-  var entry = keTimerQueue.first
+  var timerQueueEntry = keTimerQueue.first
   let allocFnPtr = blOpsFunc(184)
   let freeFnPtr = blOpsFunc(188)
   let snprintfPtr = blOpsFunc(4)
@@ -537,38 +538,39 @@ proc bugkiller_fw_queue_timer_dump*() {.exportc, cdecl.} =
     let n2 = c_strlen(cursor).int32
     cursor = puts_space(padPtr, 10'i32 - n2)
 
-  while entry != nil:
+  while timerQueueEntry != nil:
     # Allocate 128-byte formatting buffer
     if allocFnPtr != nil:
       let allocFn = cast[proc(size: uint32): pointer {.cdecl.}](allocFnPtr)
-      let buf = allocFn(128)
-      if buf != nil:
-        let entryU = cast[uint](entry)
-        var col: pointer = buf
+      let timerLineBuffer = allocFn(128)
+      if timerLineBuffer != nil:
+        let timerQueueEntryAddr = cast[uint](timerQueueEntry)
+        var columnCursor: pointer = timerLineBuffer
 
         # Format timer ID (half-word at offset 4)
-        let timerId = cast[ptr uint16](entryU + 4)[]
-        c_sprintf(col, "%d", timerId.cint);   formatCol(col)
+        let timerId = cast[ptr uint16](timerQueueEntryAddr + 4)[]
+        c_sprintf(columnCursor, "%d", timerId.cint);   formatCol(columnCursor)
 
         # Format task ID (byte at offset 6)
-        let taskId = cast[ptr uint8](entryU + 6)[]
-        c_sprintf(col, "%d", taskId.cint);    formatCol(col)
+        let taskId = cast[ptr uint8](timerQueueEntryAddr + 6)[]
+        c_sprintf(columnCursor, "%d", taskId.cint);    formatCol(columnCursor)
 
         # Format expiry time (word at offset 8)
-        let expiryTime = cast[ptr uint32](entryU + 8)[]
-        c_sprintf(col, "0x%08x", expiryTime); formatCol(col)
+        let expiryTime = cast[ptr uint32](timerQueueEntryAddr + 8)[]
+        c_sprintf(columnCursor, "0x%08x", expiryTime); formatCol(columnCursor)
 
         # Print the formatted line
-        puts(buf)
+        puts(timerLineBuffer)
         puts(nil)  # newline ("\r\n" in blob)
 
         # Free buffer
         if freeFnPtr != nil:
           let freeFn = cast[proc(p: pointer) {.cdecl.}](freeFnPtr)
-          freeFn(buf)
+          freeFn(timerLineBuffer)
 
     # Next entry (linked list next at offset 0)
-    entry = cast[ptr CoListHdr](cast[ptr pointer](cast[uint](entry))[])
+    timerQueueEntry =
+      cast[ptr CoListHdr](cast[ptr pointer](cast[uint](timerQueueEntry))[])
 
   # Print footer
   puts(nil)
@@ -605,41 +607,41 @@ proc dump_ke_task*() {.exportc: "_dump_ke_task", cdecl.} =
   {.emit: ["asm volatile(\"mv %0, a1\" : \"=r\"(", state, ") );"].}
   let allocFn = cast[proc(sz: uint32): pointer {.cdecl.}](
     blOpsFunc(0xB8))
-  let buf = allocFn(128)
-  if buf == nil:
+  let taskLineBuffer = allocFn(128)
+  if taskLineBuffer == nil:
     return
-  var col: pointer = buf
+  var columnCursor: pointer = taskLineBuffer
   template formatCol(cursor: var pointer) =
     let n1 = c_strlen(cursor).int32
     let padPtr = cast[pointer](cast[uint](cursor) + n1.uint)
     let n2 = c_strlen(cursor).int32
     cursor = puts_space(padPtr, 10'i32 - n2)
-  c_sprintf(col, "Task %d", taskId.cint);   formatCol(col)
-  c_sprintf(col, "State %d", state.cint);   formatCol(col)
+  c_sprintf(columnCursor, "Task %d", taskId.cint);   formatCol(columnCursor)
+  c_sprintf(columnCursor, "State %d", state.cint);   formatCol(columnCursor)
   let putsFn = blOpsFunc(8)
   if putsFn != nil:
-    cast[proc(s: pointer) {.cdecl.}](putsFn)(buf)
+    cast[proc(s: pointer) {.cdecl.}](putsFn)(taskLineBuffer)
     cast[proc(s: cstring) {.cdecl.}](putsFn)("\r\n")
-  platformFree(buf)
+  platformFree(taskLineBuffer)
 
 proc puts_space*(buf: pointer, count: cint): pointer {.exportc: "_puts_space", cdecl, discardable.} =
   ## Internal: pad-column helper (a0=buf, a1=count). Fills buf[0..count)
   ## with ' ', null-terminates at buf[count], returns buf+count.
-  var c: int32 = count
-  if c < 0: c = 0
+  var paddingByteCount: int32 = count
+  if paddingByteCount < 0: paddingByteCount = 0
   let bufU = cast[uint](buf)
-  var i: int32 = 0
-  while i < c:
-    cast[ptr uint8](bufU + i.uint)[] = 0x20'u8
-    i += 1
-  cast[ptr uint8](bufU + c.uint)[] = 0
-  return cast[pointer](bufU + c.uint)
+  var padOffset: int32 = 0
+  while padOffset < paddingByteCount:
+    cast[ptr uint8](bufU + padOffset.uint)[] = 0x20'u8
+    padOffset += 1
+  cast[ptr uint8](bufU + paddingByteCount.uint)[] = 0
+  return cast[pointer](bufU + paddingByteCount.uint)
 
 # ###########################################################################
 #                  Configuration (cfg_*)
 # ###########################################################################
 
-proc cfg_api_element_dump*(dataPtr: pointer, typeId: uint32,
+proc cfg_api_element_dump*(valueStorage: pointer, typeId: uint32,
     outputBuf: pointer): pointer {.exportc, cdecl.} =
   ## Dump a config element value to output buffer (434 bytes in blob).
   ## Returns pointer to type name string ("Boolean", "SINT8", etc.) or nil.
@@ -655,37 +657,37 @@ proc cfg_api_element_dump*(dataPtr: pointer, typeId: uint32,
 
   case typeId
   of 1:
-    let val = cast[ptr uint8](dataPtr)[]
-    let strPtr = if val != 0: cstring"True" else: cstring"False"
+    let boolValue = cast[ptr uint8](valueStorage)[]
+    let strPtr = if boolValue != 0: cstring"True" else: cstring"False"
     var written = c_snprintf(outputBuf, BUFSIZE, "%s", strPtr)
     return dumpFmt(written, cstring"Boolean")
   of 2:
-    let val = cast[ptr int8](dataPtr)[]
-    var written = c_snprintf(outputBuf, BUFSIZE, "%d", val.cint)
+    let sint8Value = cast[ptr int8](valueStorage)[]
+    var written = c_snprintf(outputBuf, BUFSIZE, "%d", sint8Value.cint)
     return dumpFmt(written, cstring"SINT8")
   of 3:
-    let val = cast[ptr uint8](dataPtr)[]
-    var written = c_snprintf(outputBuf, BUFSIZE, "%u", val.cuint)
+    let uint8Value = cast[ptr uint8](valueStorage)[]
+    var written = c_snprintf(outputBuf, BUFSIZE, "%u", uint8Value.cuint)
     return dumpFmt(written, cstring"UINT8")
   of 4:
-    let val = cast[ptr int16](dataPtr)[]
-    var written = c_snprintf(outputBuf, BUFSIZE, "%d", val.cint)
+    let sint16Value = cast[ptr int16](valueStorage)[]
+    var written = c_snprintf(outputBuf, BUFSIZE, "%d", sint16Value.cint)
     return dumpFmt(written, cstring"SINT16")
   of 5:
-    let val = cast[ptr uint16](dataPtr)[]
-    var written = c_snprintf(outputBuf, BUFSIZE, "%u", val.cuint)
+    let uint16Value = cast[ptr uint16](valueStorage)[]
+    var written = c_snprintf(outputBuf, BUFSIZE, "%u", uint16Value.cuint)
     return dumpFmt(written, cstring"UINT16")
   of 6:
-    let val = cast[ptr int32](dataPtr)[]
-    var written = c_snprintf(outputBuf, BUFSIZE, "%ld", val.clong)
+    let sint32Value = cast[ptr int32](valueStorage)[]
+    var written = c_snprintf(outputBuf, BUFSIZE, "%ld", sint32Value.clong)
     return dumpFmt(written, cstring"SINT32")
   of 7:
-    let val = cast[ptr uint32](dataPtr)[]
-    var written = c_snprintf(outputBuf, BUFSIZE, "%lu", val.culong)
+    let uint32Value = cast[ptr uint32](valueStorage)[]
+    var written = c_snprintf(outputBuf, BUFSIZE, "%lu", uint32Value.culong)
     return dumpFmt(written, cstring"UINT32")
   of 8:
-    let val = cast[ptr uint32](dataPtr)[]
-    var written = c_snprintf(outputBuf, BUFSIZE, "%lu", val.culong)
+    let stringOffsetValue = cast[ptr uint32](valueStorage)[]
+    var written = c_snprintf(outputBuf, BUFSIZE, "%lu", stringOffsetValue.culong)
     return dumpFmt(written, cstring"STRING")
   else:
     return nil
@@ -699,7 +701,7 @@ proc cfg_api_element_general_set*(entry: pointer, value: pointer) {.exportc, cde
   ## Actual blob ABI: a0=config table entry ptr, a1=value ptr.
   ## Called as the set handler from cfg_api_element_set for each config table entry.
   ## Flow: calls a log function with entry[8] (name string), then reads entry[6]
-  ## (typeId halfword), entry[12] (data pointer), and dispatches by type:
+  ## (typeId halfword), entry[12] (value storage pointer), and dispatches by type:
   ##   typeId 1,3: sb (store unsigned byte from value[0] to data[0])
   ##   typeId 2:   sb (store signed byte from value[0] to data[0])
   ##   typeId 4:   sh (store signed halfword from value[0..1] to data[0..1])
@@ -715,30 +717,30 @@ proc cfg_api_element_general_set*(entry: pointer, value: pointer) {.exportc, cde
     let logFn = cast[PlatformLogFunc](logFnPtr)
     logFn(1, 0, nameStr, 188)
   let typeId = cfg.typeId
-  let dataPtr = cfg.data
-  if dataPtr == nil: return
-  let dst = cast[uint](dataPtr)
+  let valueStorage = cfg.valueStorage
+  if valueStorage == nil: return
+  let dst = cast[uint](valueStorage)
   case typeId
   of 1, 3:
     # Unsigned byte
-    let v = cast[ptr uint8](value)[]
-    cast[ptr uint8](dst)[] = v
+    let unsignedByteValue = cast[ptr uint8](value)[]
+    cast[ptr uint8](dst)[] = unsignedByteValue
   of 2:
     # Signed byte
-    let v = cast[ptr int8](value)[]
-    cast[ptr int8](dst)[] = v
+    let signedByteValue = cast[ptr int8](value)[]
+    cast[ptr int8](dst)[] = signedByteValue
   of 4:
     # Signed halfword
-    let v = cast[ptr int16](value)[]
-    cast[ptr int16](dst)[] = v
+    let signedHalfwordValue = cast[ptr int16](value)[]
+    cast[ptr int16](dst)[] = signedHalfwordValue
   of 5:
     # Unsigned halfword
-    let v = cast[ptr uint16](value)[]
-    cast[ptr uint16](dst)[] = v
+    let unsignedHalfwordValue = cast[ptr uint16](value)[]
+    cast[ptr uint16](dst)[] = unsignedHalfwordValue
   of 6, 7:
     # Word (32-bit)
-    let v = cast[ptr uint32](value)[]
-    cast[ptr uint32](dst)[] = v
+    let wordValue = cast[ptr uint32](value)[]
+    cast[ptr uint32](dst)[] = wordValue
   else:
     discard
 
@@ -758,7 +760,7 @@ proc cfg_api_element_set*(id: uint32, subId: uint16, typeId: uint16,
   ## Since we don't have the exact linker-resolved config table, we search
   ## a virtual config table. The blob's cfg_api_element_general_set function
   ## (which is the typical set handler) reads entry[6] for type, entry[12]
-  ## for data pointer, and writes the value according to the type width.
+  ## for value storage pointer, and writes the value according to the type width.
   ## We implement the dispatch logic that the blob uses.
   ##
   ## For the reimplementation, we use our cfgElements array as a flat store,
@@ -780,22 +782,22 @@ proc cfg_api_element_set*(id: uint32, subId: uint16, typeId: uint16,
     return
   # Build a virtual entry struct on stack matching the blob's layout:
   #   [0..3] = id, [4..5] = subId, [6..7] = typeId,
-  #   [8..11] = name ptr, [12..15] = data ptr, [16..19] = set handler
-  var entry {.noinit.}: CfgApiElementEntryView
-  discard c_memset(addr entry, 0, sizeof(CfgApiElementEntryView).csize_t)
-  entry.id = id
-  entry.subId = subId
-  entry.typeId = typeId
+  #   [8..11] = name ptr, [12..15] = value storage ptr, [16..19] = set handler
+  var cfgApiEntry {.noinit.}: CfgApiElementEntryView
+  discard c_memset(addr cfgApiEntry, 0, sizeof(CfgApiElementEntryView).csize_t)
+  cfgApiEntry.id = id
+  cfgApiEntry.subId = subId
+  cfgApiEntry.typeId = typeId
   # Data pointer: for cfgElements, point to the element slot
   if id < 32:
-    entry.data = cast[pointer](addr cfgElements[id])
+    cfgApiEntry.valueStorage = cast[pointer](addr cfgElements[id])
     # Blob dispatches to the set handler via a function pointer stored in
     # the config entry — indirect call (not counted as R_RISCV_CALL).
     # Mirror that by calling through a pointer variable.
     let setFn {.volatile.}: proc(entry: pointer, value: pointer) {.cdecl.} =
       cfg_api_element_general_set
-    entry.setHandler = cast[pointer](setFn)
-    setFn(cast[pointer](addr entry), value)
+    cfgApiEntry.setHandler = cast[pointer](setFn)
+    setFn(cast[pointer](addr cfgApiEntry), value)
     if id >= cfgElementCount:
       cfgElementCount = id + 1
 
@@ -831,11 +833,11 @@ proc dump_cfg_entries*() {.exportc, cdecl.} =
   # The blob references these via auipc relocations. We use our cfgElements array.
   let cfgBase = cast[uint](addr cfgElements[0])
   let cfgCount = cfgElementCount
-  var buf {.noinit.}: array[64, uint8]
-  for i in 0'u32 ..< cfgCount:
-    let entryAddr = cfgBase + i * 28
+  var formattedValueBuffer {.noinit.}: array[64, uint8]
+  for cfgElementIndex in 0'u32 ..< cfgCount:
+    let entryAddr = cfgBase + cfgElementIndex * 28
     # Log entry index
-    printf("entry %d:", cast[pointer](i))
+    printf("entry %d:", cast[pointer](cfgElementIndex))
     # Log entry name (offset 0 = ptr to name string)
     let namePtr = cast[ptr pointer](entryAddr)[]
     printf(" name=%s", namePtr)
@@ -849,15 +851,14 @@ proc dump_cfg_entries*() {.exportc, cdecl.} =
     let subType = cast[ptr uint16](entryAddr + 10)[]
     printf(" sub=%d", cast[pointer](subType.uint))
     # Dump formatted value
-    let dataPtr = cast[ptr pointer](entryAddr + 16)[]
+    let valueStorage = cast[ptr pointer](entryAddr + 16)[]
     let typeVal = cast[ptr uint8](entryAddr + 10)[]
-    let typeName = cfg_api_element_dump(dataPtr, typeVal.uint32,
-                                       cast[pointer](addr buf[0]))
-    printf(" [%s]", cast[pointer](addr buf[0]))
+    let typeName = cfg_api_element_dump(valueStorage, typeVal.uint32,
+                                       cast[pointer](addr formattedValueBuffer[0]))
+    printf(" [%s]", cast[pointer](addr formattedValueBuffer[0]))
     if typeName != nil:
       printf("    type    : %s\r\n", typeName)
     # Separator
     puts("")
   # Print footer
   puts("--- end cfg ---")
-

@@ -13,18 +13,18 @@ proc sta_mgmt_init*() {.exportc, cdecl.} =
   # Initialize STA free list
   co_list_init(addr sta_info_env)
   # Init each STA entry and push to free list
-  var idx = 0'u8
-  while idx < STA_MGMT_FREE_STAS.uint8:
-    let sta = staInfoForIdx(idx)
+  var freeStaIndex = 0'u8
+  while freeStaIndex < STA_MGMT_FREE_STAS.uint8:
+    let sta = staInfoForIdx(freeStaIndex)
     sta_mgmt_entry_init(cast[pointer](sta))
     co_list_push_back(addr sta_info_env, cast[ptr CoListHdr](sta))
-    inc idx
+    inc freeStaIndex
 
   # Initialize broadcast STA entry for VIF 0.
   let bcStaVif0 = staInfoForIdx(STA_MGMT_FREE_STAS.uint8)
   sta_mgmt_entry_init(cast[pointer](bcStaVif0))
   bcStaVif0.instNbr = 0
-  bcStaVif0.rxNss = 0
+  bcStaVif0.controlPortState = 0
   bcStaVif0.txPolicy = cast[pointer](txBufferControlBcmcDescAt(0))
   bcStaVif0.keyMat = cast[pointer](vifKeyPointers(vifChannelForIdx(0)))
   # Log
@@ -37,7 +37,7 @@ proc sta_mgmt_init*() {.exportc, cdecl.} =
   let bcStaVif1 = staInfoForIdx(STA_MGMT_FREE_STAS.uint8 + 1'u8)
   sta_mgmt_entry_init(cast[pointer](bcStaVif1))
   bcStaVif1.instNbr = 1
-  bcStaVif1.rxNss = 0
+  bcStaVif1.controlPortState = 0
   bcStaVif1.txPolicy = cast[pointer](txBufferControlBcmcDescAt(1))
   bcStaVif1.keyMat = cast[pointer](vifKeyPointers(vifChannelForIdx(1)))
   # Final log via g_bl_ops_funcs
@@ -55,10 +55,10 @@ proc sta_mgmt_register*(param: pointer, staIdxOut: ptr uint8): uint8 {.exportc, 
   let req = staMgmtRegisterParamView(param)
   let instNbr = req.instNbr
   # Pop free STA entry from sta_info_env free list
-  let entry = co_list_pop_front(addr sta_info_env)
-  if entry == nil:
+  let freeStaInfoListNode = co_list_pop_front(addr sta_info_env)
+  if freeStaInfoListNode == nil:
     return 1
-  let staEntry = cast[uint](entry)
+  let staEntry = cast[uint](freeStaInfoListNode)
   let sta = staInfoAt(staEntry)
   # Copy MAC address (6 bytes) from param+6 to staEntry+4
   discard c_memcpy(cast[pointer](addr sta.macAddr[0]),
@@ -72,8 +72,8 @@ proc sta_mgmt_register*(param: pointer, staIdxOut: ptr uint8): uint8 {.exportc, 
   sta.vif = req.vif
   sta.instNbr = instNbr
   sta.extFlag = req.extFlag
-  sta.registerWord0 = req.registerWord0
-  sta.registerWord1 = req.registerWord1
+  sta.assocInfoWord0 = req.assocInfoWord0
+  sta.assocInfoWord1 = req.assocInfoWord1
   sta.paramFlag = req.paramFlag
   # Find the popped STA in the typed table.
   var staIdx = 0'u8
@@ -87,10 +87,10 @@ proc sta_mgmt_register*(param: pointer, staIdxOut: ptr uint8): uint8 {.exportc, 
   sta.initialRateConfig = 0x19000'u32
   sta.supportedRatesBitmap = 0xFFFF'u16
   # Initialize postponed frame descriptors: 9 halfwords at sta+338 stride 4, set to 0xFFFF
-  var descAddr = staEntry + 338
-  for i in 0 ..< 9:
-    cast[ptr uint16](descAddr)[] = 0xFFFF'u16
-    descAddr += 4
+  var postponedDescTimerAddr = staEntry + 338
+  for postponedDescSlotIndex in 0 ..< 9:
+    cast[ptr uint16](postponedDescTimerAddr)[] = 0xFFFF'u16
+    postponedDescTimerAddr += 4
   for tid in 0'u8 .. 8'u8:
     rxuQosSeqCachePtr(tid)[] = 0xFFFF'u16
   # Store TX policy descriptor pointer at sta+320.
@@ -189,11 +189,11 @@ proc sta_mgmt_add_key*(param: pointer, hwKeyIdx: uint8) {.exportc, cdecl.} =
     # Copy 16-byte temporal key from param+24 to sta+128+88. Blob inlines
     # the word-by-word copy (4 x 4-byte loads+stores); Nim previously
     # used two memcpy calls that aren't in blob's call graph.
-    let keySrcU = cast[uint](machwKeyWriteKeyTailPtr(req))
-    let keyDstU = cast[uint](addr sta.keyTail[0])
-    for i in 0 ..< 4:
-      cast[ptr uint32](keyDstU + (i * 4).uint)[] =
-        cast[ptr uint32](keySrcU + (i * 4).uint)[]
+    let temporalKeySrcU = cast[uint](machwKeyWriteKeyTailPtr(req))
+    let temporalKeyDstU = cast[uint](addr sta.keyTail[0])
+    for temporalKeyWordIndex in 0 ..< 4:
+      cast[ptr uint32](temporalKeyDstU + (temporalKeyWordIndex * 4).uint)[] =
+        cast[ptr uint32](temporalKeySrcU + (temporalKeyWordIndex * 4).uint)[]
   of 3:
     # TKIP: generate random IV using PRNG
     let rng = rcPrngNext()
@@ -225,7 +225,7 @@ proc sta_mgmt_del_key*(staIdx: uint8, keyIdx: uint8) {.exportc, cdecl.} =
   let sta = staInfoAt(staPtr)
   sta.keyInstalled = 0
   sta.keyHolder = nil
-  sta.rxNss = 1
+  sta.controlPortState = 1
 
 proc sta_mgmt_send_postponed_frame*(vifEntry: pointer, staEntry: pointer, maxCount: uint32): uint32 {.exportc, cdecl.} =
   ## Send postponed frames for a station (full loop with ~100 instrs).
@@ -253,9 +253,10 @@ proc sta_mgmt_send_postponed_frame*(vifEntry: pointer, staEntry: pointer, maxCou
   # Signal TX event
   ke_evt_set(256)
   # Walk postponed descriptor list
-  var count: uint32 = 0
+  var postponedFramesSent: uint32 = 0
   let frameEnv = txFrameEnv()
-  while sta.postponedList.first != nil and (maxCount == 0 or count < maxCount):
+  while sta.postponedList.first != nil and
+      (maxCount == 0 or postponedFramesSent < maxCount):
     let head = sta.postponedList.first
     # Check TX allowed
     let txOk = txl_cntrl_tx_check(vifEntry)
@@ -280,7 +281,7 @@ proc sta_mgmt_send_postponed_frame*(vifEntry: pointer, staEntry: pointer, maxCou
     let txDesc = hostTxDescAt(frameDesc)
     let tid = txDesc.staIdx
     txDesc.postponeFlag = 0
-    count += 1
+    postponedFramesSent += 1
     # Push to TX control
     discard txl_cntrl_push_int(frameDesc, tid)
     # Decrement global postponed count in txl_frame_env+16
@@ -288,7 +289,7 @@ proc sta_mgmt_send_postponed_frame*(vifEntry: pointer, staEntry: pointer, maxCou
       frameEnv.postponedCount = frameEnv.postponedCount - 1
   # Release remaining postponed descriptors
   discard sta_mgmt_postponed_desc_release(staEntry, 0)
-  return count
+  return postponedFramesSent
 
 proc sta_mgmt_entry_init*(staEntry: pointer) {.exportc, cdecl.} =
   ## Reset a STA entry to default/free state.
@@ -314,27 +315,27 @@ proc sta_mgmt_postponed_desc_release*(staEntry: pointer, flag: uint32): uint32 {
   ## Released frames are freed via keFreeFunc. Returns count of released frames.
   let sta = staInfoAt(staEntry)
   var released: uint32 = 0
-  var prev: pointer = nil
+  var previousPostponedTxDesc: pointer = nil
   let macTime = regRead(MACHW_TIMLO_REG)
   let maxAge = 0x1D4C0'u32  # ~120ms in MAC ticks
   let frameEnv = txFrameEnv()
-  var cur = cast[pointer](sta.postponedList.first)
-  while cur != nil:
-    if not wifiRamPointer(cur):
+  var postponedTxDesc = cast[pointer](sta.postponedList.first)
+  while postponedTxDesc != nil:
+    if not wifiRamPointer(postponedTxDesc):
       inc nimFwDbgPostponedRelease
-      nimFwDbgPostponedReleaseDesc = pointerAddrU32(cur)
+      nimFwDbgPostponedReleaseDesc = pointerAddrU32(postponedTxDesc)
       nimFwDbgPostponedReleaseCb = 0xFFFFFFFF'u32
       nimFwDbgPostponedReleaseFc = 0xFFFFFFFF'u32
       nimFwDbgPostponedReleaseFlags = flag or 0x80000000'u32
-      if prev == nil:
+      if previousPostponedTxDesc == nil:
         sta.postponedList.first = nil
       else:
-        cast[ptr CoListHdr](prev).next = nil
-      sta.postponedList.last = cast[ptr CoListHdr](prev)
+        cast[ptr CoListHdr](previousPostponedTxDesc).next = nil
+      sta.postponedList.last = cast[ptr CoListHdr](previousPostponedTxDesc)
       frameEnv.postponedCount = 0
       break
-    let txDesc = hostTxDescAt(cur)
-    let next = cast[pointer](cast[ptr CoListHdr](cur).next)
+    let txDesc = hostTxDescAt(postponedTxDesc)
+    let nextPostponedTxDesc = cast[pointer](cast[ptr CoListHdr](postponedTxDesc).next)
     var doRelease = false
     if flag != 0:
       doRelease = true
@@ -346,9 +347,12 @@ proc sta_mgmt_postponed_desc_release*(staEntry: pointer, flag: uint32): uint32 {
         doRelease = true
     if doRelease:
       # Remove from postponed list (blob: co_list_remove)
-      co_list_remove(addr sta.postponedList, cast[ptr CoListHdr](prev), cast[ptr CoListHdr](cur))
+      co_list_remove(
+        addr sta.postponedList,
+        cast[ptr CoListHdr](previousPostponedTxDesc),
+        cast[ptr CoListHdr](postponedTxDesc))
       inc nimFwDbgPostponedRelease
-      nimFwDbgPostponedReleaseDesc = pointerAddrU32(cur)
+      nimFwDbgPostponedReleaseDesc = pointerAddrU32(postponedTxDesc)
       nimFwDbgPostponedReleaseCb = pointerAddrU32(txDesc.callback)
       nimFwDbgPostponedReleaseFlags =
         flag or (txDesc.usedFlag.uint32 shl 8) or
@@ -366,13 +370,13 @@ proc sta_mgmt_postponed_desc_release*(staEntry: pointer, flag: uint32): uint32 {
       # preserves the descriptor-pool invariant while normal TX confirmations
       # still use txl_frame_evt for valid callbacks.
       {.emit: ["asm volatile(\"mv a1, zero\" ::: \"a1\");"].}
-      txl_frame_release(cur)
+      txl_frame_release(postponedTxDesc)
       if frameEnv.postponedCount > 0:
         frameEnv.postponedCount = frameEnv.postponedCount - 1
       released += 1
     else:
-      prev = cur
-    cur = next
+      previousPostponedTxDesc = postponedTxDesc
+    postponedTxDesc = nextPostponedTxDesc
   return released
 
 proc sta_mgmt_aging_postponed_desc*(staEntry: pointer, maxCount: uint32): uint32 {.exportc, cdecl.} =
@@ -381,9 +385,8 @@ proc sta_mgmt_aging_postponed_desc*(staEntry: pointer, maxCount: uint32): uint32
   ## (7 entries, 368 bytes each), calling sta_mgmt_postponed_desc_release(staEntry, 0).
   ## Accumulates total released count. Returns total.
   var total: uint32 = 0
-  for i in 0'u8 ..< STA_INFO_TAB_ENTRIES.uint8:
-    let sta = staInfoForIdx(i)
+  for postponedStaIndex in 0'u8 ..< STA_INFO_TAB_ENTRIES.uint8:
+    let sta = staInfoForIdx(postponedStaIndex)
     let released = sta_mgmt_postponed_desc_release(cast[pointer](sta), 0)
     total += released
   return total
-

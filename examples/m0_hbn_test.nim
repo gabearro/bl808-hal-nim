@@ -49,9 +49,9 @@ proc main() {.exportc, cdecl.} =
 
   logInfo "=== BL808 HBN Test ==="
   if hbnReadRetention(0) != BootMagic:
-    logInfo "First boot: arming 100 ms HBN RTC wake"
+    logInfo "First boot: arming HBN RTC wake"
     hbnWriteRetention(0, BootMagic)
-    hbnEnter(SleepMs)
+    hbnEnterRtcWake(5)   # superseded by m0_hbn_rtc_test; kept compiling only
 
   logInfo "Second boot: checking retained HBN wake state"
   let initialStat = regRead(HbnIrqStat)

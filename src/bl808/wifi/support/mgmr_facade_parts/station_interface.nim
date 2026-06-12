@@ -23,9 +23,11 @@ proc wifi_mgmr_sta_enable*(): pointer {.exportc, cdecl.} =
   var addIfCfm: array[MmAddIfCfmSize.int, uint8]
   for _ in 0 ..< 20:
     zero(addr addIfCfm[0], MmAddIfCfmSize)
-    let rc = bl_send_add_if(cast[ptr BlHw](addr wifi_hw), netifHwaddr(nif),
-                            Nl80211IftypeStation, false, addr addIfCfm[0])
-    if rc == 0 and loadU8(addr addIfCfm[0], MmAddIfStatusOff) == CoOk.uint8:
+    let addIfRequestStatus =
+      bl_send_add_if(cast[ptr BlHw](addr wifi_hw), netifHwaddr(nif),
+                     Nl80211IftypeStation, false, addr addIfCfm[0])
+    let addIfConfirmStatus = loadU8(addr addIfCfm[0], MmAddIfStatusOff)
+    if addIfRequestStatus == 0 and addIfConfirmStatus == CoOk.uint8:
       let vif = vifAt(BlVifSta)
       let inst = loadU8(addr addIfCfm[0], MmAddIfInstNbrOff)
       storeU8(vif, BlVifVifIdxOff, inst)

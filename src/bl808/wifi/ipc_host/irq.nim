@@ -20,8 +20,8 @@ proc ipcHostTxCfmHandler(env: pointer) =
     txdesc = listPopFront(cfmList)
 
 proc ipcHostDbgHandler(env: pointer) =
-  let idx = loadU8(env, EnvDbgIdxOff).uint
-  let hostId = loadPtr(env, EnvDbgArrayOff + idx * 8'u)
+  let debugHostSlotIndex = loadU8(env, EnvDbgIdxOff).uint
+  let hostId = loadPtr(env, EnvDbgArrayOff + debugHostSlotIndex * 8'u)
   while callRecvDbg(env, hostId) == 0'u8:
     discard
 
@@ -36,8 +36,8 @@ proc ipc_host_irq*(env: pointer; statusIn: uint32) {.exportc, cdecl.} =
 
   if (status and IpcIrqE2aTxCfm) != 0'u32:
     inc nimFwDbgIpcHostTxCfmIrq
-    for i in 0 ..< IpcTxQueueCnt:
-      if (status and (1'u32 shl (i + IpcIrqE2aTxCfmPos))) != 0'u32:
+    for txCfmQueueIndex in 0 ..< IpcTxQueueCnt:
+      if (status and (1'u32 shl (txCfmQueueIndex + IpcIrqE2aTxCfmPos))) != 0'u32:
         ipcHostTxCfmHandler(env)
 
   if (status and IpcIrqE2aMsgAck) != 0'u32:

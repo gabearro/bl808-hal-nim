@@ -78,8 +78,8 @@ proc tpc_get_vif_tx_power*(vifIdx: uint8): int8 {.exportc, cdecl.} =
   ## Get TX power for a VIF.
   ## From blob (4 instrs): reads MACHW_TX_POWER_REG, returns low byte.
   ## The low byte of this register holds the current TX power level.
-  let val = regRead(MACHW_TX_POWER_REG)
-  return cast[int8](val and 0xFF)
+  let txPowerReg = regRead(MACHW_TX_POWER_REG)
+  return cast[int8](txPowerReg and 0xFF)
 
 proc tpc_update_vif_tx_power*(vifEntry: pointer, txPowerElem: pointer, rateParam: pointer) {.exportc, cdecl.} =
   ## Update VIF TX power (168 bytes in blob, 58 instrs).
@@ -125,7 +125,7 @@ proc tpc_update_vif_tx_power*(vifEntry: pointer, txPowerElem: pointer, rateParam
   var staNode = vif.postponedStaHead
   while staNode != nil:
     let sta = staInfoAt(staNode)
-    sta.mmFlagsBytes[0] = sta.mmFlagsBytes[0] or 0x10
+    sta.txPolicyUpdateFlags[0] = sta.txPolicyUpdateFlags[0] or StaTxPolicyUpdateTxPower
     staNode = cast[pointer](sta.link.next)
 
   # Check if VIF has a channel context
@@ -202,11 +202,11 @@ proc bl_tpc_update_power_table*(powerTable: ptr array[38, int8]) {.exportc, cdec
   proc phy_powroffset_set(powerOffset: ptr int8) {.importc, cdecl.}
   trpc_update_power(powerTable)
   var scaled {.noinit.}: array[14, int8]
-  for i in 0 ..< 14:
-    let offset = powerTable[24 + i]
-    tpcChannelOffsetTable[i] = offset
-    tpcPowerTable[24 + i] = offset
-    scaled[i] = cast[int8](offset.int32 * 4'i32)
+  for channelOffsetIndex in 0 ..< 14:
+    let channelPowerOffset = powerTable[24 + channelOffsetIndex]
+    tpcChannelOffsetTable[channelOffsetIndex] = channelPowerOffset
+    tpcPowerTable[24 + channelOffsetIndex] = channelPowerOffset
+    scaled[channelOffsetIndex] = cast[int8](channelPowerOffset.int32 * 4'i32)
   phy_powroffset_set(addr scaled[0])
 
 proc bl_tpc_update_power_table_rate*(powerTable: ptr array[24, int8]) {.exportc, cdecl.} =
@@ -225,14 +225,14 @@ proc bl_tpc_update_power_table_channel_offset*(powerTable: ptr array[38, int8]) 
 
   let printFn = cast[PrintfFn](blOpsFunc(4))
   var scaled {.noinit.}: array[14, int8]
-  for i in 0 ..< 14:
-    let offset = powerTable[24 + i]
-    let phyOffset = offset.int32 * 4'i32
-    tpcChannelOffsetTable[i] = offset
-    tpcPowerTable[24 + i] = offset
-    scaled[i] = cast[int8](phyOffset)
+  for channelOffsetIndex in 0 ..< 14:
+    let channelPowerOffset = powerTable[24 + channelOffsetIndex]
+    let scaledPhyOffset = channelPowerOffset.int32 * 4'i32
+    tpcChannelOffsetTable[channelOffsetIndex] = channelPowerOffset
+    tpcPowerTable[24 + channelOffsetIndex] = channelPowerOffset
+    scaled[channelOffsetIndex] = cast[int8](scaledPhyOffset)
     if printFn != nil:
-      printFn(cstring"pwr chan[%d] offset:%d\r\n", i.cint, phyOffset.cint)
+      printFn(cstring"pwr chan[%d] offset:%d\r\n", channelOffsetIndex.cint, scaledPhyOffset.cint)
   if printFn != nil:
     printFn(cstring"dynamic update channel offset\r\n")
   phy_powroffset_set(addr scaled[0])
@@ -256,6 +256,5 @@ proc bl_tpc_power_table_get*(powerTable: ptr array[38, int8]) {.exportc, cdecl.}
   # Get rate data from TRPC (fills first 24 bytes)
   trpc_power_get(powerTable)
   # Copy channel offset table (bytes 24..37)
-  for i in 0 ..< 14:
-    powerTable[24 + i] = tpcChannelOffsetTable[i]
-
+  for channelOffsetIndex in 0 ..< 14:
+    powerTable[24 + channelOffsetIndex] = tpcChannelOffsetTable[channelOffsetIndex]

@@ -12,8 +12,9 @@ proc rx_swdesc_init*() {.exportc, cdecl.} =
   ## Initialize RX software descriptors.
   ## Blob layout is 41 entries of 24 bytes. Each software descriptor stores its
   ## paired RX header descriptor at offset +4.
-  for i in 0 ..< 41:
-    rxSwTableDescAt(i).firstHeaderDesc = cast[pointer](rxHeaderHwDescAt(i))
+  for rxSwTableIndex in 0 ..< 41:
+    rxSwTableDescAt(rxSwTableIndex).firstHeaderDesc =
+      cast[pointer](rxHeaderHwDescAt(rxSwTableIndex))
 
 proc rxl_hwdesc_init*(resetAll: uint32) {.exportc, cdecl.} =
   ## Initialize RX HW descriptors and program DMA.
@@ -51,8 +52,8 @@ proc rxl_hwdesc_init*(resetAll: uint32) {.exportc, cdecl.} =
   var hdTail: pointer = nil
   var hdPrev: pointer = nil
   var hdCount: uint32 = 0
-  for i in 0 ..< HD_COUNT:
-    let hd = rxHeaderHwDescAt(i)
+  for headerDescIndex in 0 ..< HD_COUNT:
+    let hd = rxHeaderHwDescAt(headerDescIndex)
     let dmaOwned = hd.usedFlag
     if resetAll != 0 or dmaOwned != 1:
       if hdPrev != nil:
@@ -61,12 +62,24 @@ proc rxl_hwdesc_init*(resetAll: uint32) {.exportc, cdecl.} =
       hd.nextThd = 0
       hd.status = 0
       hd.flags = 0
-      hd.rxStatusWord24 = 0
+      hd.rxVectorLengthAmpdu = 0
+      hd.tsfLow = 0
+      hd.tsfHigh = 0
+      hd.rxVector1a = 0
+      hd.rxVector1b = 0
+      hd.rxVector1c = 0
+      hd.rxVector1d = 0
+      hd.rxVector2a = 0
+      hd.rxVector2b = 0
+      hd.rxVectorStatus = 0
       hd.bufferAddr = 0
-      hd.swDesc = cast[uint32](rxSwTableDescAt(i))
+      hd.swDesc = cast[uint32](rxSwTableDescAt(headerDescIndex))
       hd.magic = BAADF00D
-      hd.next = if i + 1 < HD_COUNT: cast[pointer](rxHeaderHwDescAt(i + 1)) else: nil
-      hd.statusHalf = 0
+      hd.next =
+        if headerDescIndex + 1 < HD_COUNT:
+          cast[pointer](rxHeaderHwDescAt(headerDescIndex + 1))
+        else:
+          nil
       hdPrev = cast[pointer](hd)
       if hdCount == 0:
         hdCurrent = cast[pointer](hd)
@@ -90,20 +103,24 @@ proc rxl_hwdesc_init*(resetAll: uint32) {.exportc, cdecl.} =
   var pdTail: pointer = nil
   var pdPrev: pointer = nil
   var pdCount: uint32 = 0
-  for i in 0 ..< PD_COUNT:
-    let pd = rxPayloadHwDescAt(i)
+  for payloadDescIndex in 0 ..< PD_COUNT:
+    let pd = rxPayloadHwDescAt(payloadDescIndex)
     let dmaOwned = pd.usedFlag
     if resetAll != 0 or dmaOwned != 1:
       # Initialize PD descriptor
       if pdPrev != nil:
         cast[ptr RxPayloadHwDescView](pdPrev).next = cast[pointer](pd)
-      let buf = rxPayloadBufferAt(i)
+      let payloadBuffer = rxPayloadBufferAt(payloadDescIndex)
       pd.magic = C0DEDBAD
-      pd.next = if i + 1 < PD_COUNT: cast[pointer](rxPayloadHwDescAt(i + 1)) else: nil
+      pd.next =
+        if payloadDescIndex + 1 < PD_COUNT:
+          cast[pointer](rxPayloadHwDescAt(payloadDescIndex + 1))
+        else:
+          nil
       pd.status = 0
-      pd.bufferAddr = cast[uint32](addr buf.bytes[0])
-      pd.bufferEnd = cast[uint32](addr buf.bytes[1735])
-      pd.bufferStart = cast[uint32](addr buf.bytes[0])
+      pd.bufferAddr = cast[uint32](addr payloadBuffer.payloadBytes[0])
+      pd.bufferEnd = cast[uint32](addr payloadBuffer.payloadBytes[1735])
+      pd.bufferStart = cast[uint32](addr payloadBuffer.payloadBytes[0])
       pdPrev = cast[pointer](pd)
       if pdCount == 0:
         pdCurrent = cast[pointer](pd)
@@ -121,8 +138,7 @@ proc rxl_hwdesc_init*(resetAll: uint32) {.exportc, cdecl.} =
   machwRxSetPdSubmittedHead(cast[uint32](pdHead))
   # Trigger PD DMA: write 0x8000000 to trigger register
   machwRxDmaTrigger(0x08000000'u32)
-  when defined(bl808WifiUseBl808Rf):
-    nimFwRxDmaAfterInitProbe()
+  nimFwRxDmaAfterInitProbe()
   # Sanity check: all chain pointers should be non-nil
   if hdCurrent == nil or hdHead == nil or hdTail == nil or pdCurrent == nil or pdHead == nil or pdTail == nil:
     # Log error via g_bl_ops_funcs[4]
@@ -141,8 +157,7 @@ proc rxl_hwdesc_init*(resetAll: uint32) {.exportc, cdecl.} =
   let rxHwEnv = rxHwDescEnvView()
   rxHwEnv.pdTail = pdTail
   rxHwEnv.pdCurrent = pdCurrent
-  when defined(bl808WifiUseBl808Rf):
-    rfPhyTraceCheckpoint(0x10'u32)
+  rfPhyTraceCheckpoint(0x10'u32)
   # Free scratch buffer via g_bl_ops_funcs[24] (platform free)
   let freeFnPtr = blOpsFunc(24)
   if freeFnPtr != nil:
@@ -207,18 +222,17 @@ proc rxl_hwdesc_dump*() {.exportc, cdecl, noinline.} =
     type SnapFn = proc(): pointer {.cdecl.}
     snapResult = cast[SnapFn](snapFuncPtr)()
   # Walk HD chain - 41 typed entries (blob sym: rx_dma_hdrdesc)
-  for i in 0'u32 ..< 41:
-    let hd = rxHeaderHwDescAt(i.int)
+  for headerDescDumpIndex in 0'u32 ..< 41:
+    let hd = rxHeaderHwDescAt(headerDescDumpIndex.int)
     printFn("HD[%d] @%p: %08x %08x %08x %08x",
-            i, cast[pointer](hd), hd.magic, pointerAddrU32(hd.next),
+            headerDescDumpIndex, cast[pointer](hd), hd.magic, pointerAddrU32(hd.next),
             hd.bufferAddr, hd.swDesc)
-    printFn("  %08x %08x %08x %04x %04x",
-            hd.nextThd, hd.status, hd.rxStatusWord24, hd.statusHalf,
-            hd.statusHalf2)
-    printFn("  %08x %08x %08x %08x %08x %08x %08x %08x",
-            hd.rxVectorWord32, hd.rxVectorWord36, hd.word44,
-            hd.rxVectorWord48, hd.rxVectorWord52, hd.rxVectorWord56,
-            hd.rxVectorWord60, hd.flags)
+    printFn("  %08x %08x %08x %08x",
+            hd.nextThd, hd.status, hd.rxVectorLengthAmpdu, hd.tsfLow)
+    printFn("  %08x %08x %08x %08x %08x %08x %08x %08x %08x",
+            hd.tsfHigh, hd.rxVector1a, hd.rxVector1b, hd.rxVector1c,
+            hd.rxVector1d, hd.rxVector2a, hd.rxVector2b,
+            hd.rxVectorStatus, hd.flags)
   # Restore/free snapshot
   if snapFuncPtr != nil and snapResult != nil:
     let freeFuncPtr = blOpsFunc(24)
@@ -227,14 +241,14 @@ proc rxl_hwdesc_dump*() {.exportc, cdecl, noinline.} =
       cast[FreeFn](freeFuncPtr)(snapResult)
   # Print PD chain
   printFn("PD chain (%d entries):", 41)
-  for i in 0'u32 ..< 41:
-    let pd = rxPayloadHwDescAt(i.int)
+  for payloadDescDumpIndex in 0'u32 ..< 41:
+    let pd = rxPayloadHwDescAt(payloadDescDumpIndex.int)
     # Compute length: if end != 0 then end+1-start else 0
     var pktLen: uint32 = 0
     if pd.bufferEnd != 0:
       pktLen = pd.bufferEnd + 1 - pd.bufferStart
     printFn("PD[%d] @%p: %08x %08x %08x %08x len=%d %04x %04x",
-            i, cast[pointer](pd), pd.magic, pointerAddrU32(pd.next),
+            payloadDescDumpIndex, cast[pointer](pd), pd.magic, pointerAddrU32(pd.next),
             pd.bufferAddr, pd.bufferEnd, pktLen, uint16(pd.status and 0xFFFF'u32),
             uint16(pd.status shr 16))
 
@@ -258,7 +272,7 @@ proc rxl_hd_append*(desc: pointer) {.exportc, cdecl.} =
   hd.bufferAddr = 0
   let lastPtr = env.submittedTail
   hd.flags = 0
-  hd.statusHalf = 0
+  hd.tsfLow = 0
   if lastPtr != nil:
     rxHeaderHwDescView(lastPtr).next = appendDesc
   machwRxDmaTrigger(0x10000000'u32)
@@ -316,28 +330,28 @@ proc rxl_mpdu_free*(desc: pointer) {.exportc, cdecl.} =
   let rx = rxMpduDescView(desc)
   let swDescPtr = rx.swDesc
   let sw = rxSwDescView(swDescPtr)
-  var curHw = rxDmaProgressDescAt(sw.bufferChain)
+  var dmaProgressDesc = rxDmaProgressDescAt(sw.bufferChain)
   # Call platform get_status via env[20]
   let getStatusFn = blOpsFunc(20)
   var savedStatus: pointer = nil
   if getStatusFn != nil:
     savedStatus = cast[proc(): pointer {.cdecl.}](getStatusFn)()
   sw.uploadDone = 0
-  var prevHw: ptr RxDmaProgressDescView = nil
-  while curHw != nil:
-    let hwStatus = curHw.status
-    curHw.usedFlag = 0
-    if (hwStatus and 1) != 0:
+  var previousDmaProgressDesc: ptr RxDmaProgressDescView = nil
+  while dmaProgressDesc != nil:
+    let dmaDescriptorStatus = dmaProgressDesc.status
+    dmaProgressDesc.usedFlag = 0
+    if (dmaDescriptorStatus and 1) != 0:
       # DMA owned -- save position and release
-      rx.curDesc = cast[pointer](curHw)
-      rx.prevDesc = cast[pointer](prevHw)
+      rx.curDesc = cast[pointer](dmaProgressDesc)
+      rx.prevDesc = cast[pointer](previousDmaProgressDesc)
       rxl_frame_release(desc)
       let cleanFn = blOpsFunc(24)
       if cleanFn != nil:
         cast[proc(a: pointer) {.cdecl.}](cleanFn)(savedStatus)
       return
-    prevHw = curHw
-    curHw = rxDmaProgressDescAt(curHw.next)
+    previousDmaProgressDesc = dmaProgressDesc
+    dmaProgressDesc = rxDmaProgressDescAt(dmaProgressDesc.next)
   assert_rec("rxl_hwdesc.c", "rxl_hwdesc.c", 872)
   let cleanFn = blOpsFunc(24)
   if cleanFn != nil:
@@ -360,24 +374,24 @@ proc rxl_mpdu_transfer*(desc: pointer) {.exportc, cdecl.} =
   # Get current PHY channel info into swDesc+68 (blob: phy_get_channel(swDesc+68, 0)).
   phy_get_channel_raw(cast[pointer](addr sw.channelInfo[0]), 0)
   # Get HW descriptor chain head from swDesc[8]
-  var cur = rxDmaProgressDescAt(sw.bufferChain)
+  var dmaProgressDesc = rxDmaProgressDescAt(sw.bufferChain)
   # Clear dmaCount at desc[21]
   rx.descCount = 0
-  var prev: ptr RxDmaProgressDescView = nil
-  while cur != nil:
-    if (cur.status and 1) != 0:
+  var previousDmaProgressDesc: ptr RxDmaProgressDescView = nil
+  while dmaProgressDesc != nil:
+    if (dmaProgressDesc.status and 1) != 0:
       # DMA still owns this descriptor -- save state and return
-      rx.prevDesc = cast[pointer](prev)
-      rx.curDesc = cast[pointer](cur)
+      rx.prevDesc = cast[pointer](previousDmaProgressDesc)
+      rx.curDesc = cast[pointer](dmaProgressDesc)
       return
     # Increment dmaCount
     rx.descCount = rx.descCount + 1
-    if cur.next == nil:
+    if dmaProgressDesc.next == nil:
       # Chain exhausted without finding DMA-owned descriptor: assert
       assert_rec("rxl_mpdu.c", "rxl_mpdu.c", 160)
       return
-    prev = cur
-    cur = rxDmaProgressDescAt(cur.next)
+    previousDmaProgressDesc = dmaProgressDesc
+    dmaProgressDesc = rxDmaProgressDescAt(dmaProgressDesc.next)
 
 proc rxl_cntrl_evt*() {.exportc, cdecl.} =
   ## RX control event handler (352 instrs).
@@ -427,8 +441,8 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
   # MAC HW interrupts around the loop — only masks via csrrci mstatus in the
   # co_list_pop critical section below.
   while loopCount > 0:
-    let curHwDesc = cast[pointer](cntrlEnv.queue.first)
-    if cntrlEnv.processingFlag != 0 or curHwDesc == nil:
+    let queuedRxMpduDesc = cast[pointer](cntrlEnv.queue.first)
+    if cntrlEnv.processingFlag != 0 or queuedRxMpduDesc == nil:
       # L43 in blob: no tail-call to ke_evt_set here — blob simply returns.
       return
 
@@ -443,7 +457,7 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
     irqRestore(irqState)
 
     # Read SW descriptor and buffer chain
-    let swDesc = rxMpduDescView(curHwDesc).swDesc
+    let swDesc = rxMpduDescView(queuedRxMpduDesc).swDesc
     let sw = rxSwDescView(swDesc)
     let bufChain = sw.bufferChain
     var hwFlags = sw.hwFlags
@@ -467,7 +481,7 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
        else: 0'u32
      nimFwTrace2U32("[WIFI-NIMFW] rxl_frame ", hwFlags, dbgFc)
      if (hwFlags and 0x20020000'u32) != 0x20020000'u32:
-       releaseFrame = rxu_cntrl_frame_handle(curHwDesc) == 0
+       releaseFrame = rxu_cntrl_frame_handle(queuedRxMpduDesc) == 0
        break frameWork
 
      # Blob uses th.extu(hwFlags, 24, 15), then subtracts the MAC HW STA base.
@@ -479,7 +493,7 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
      if sta.valid == 0:
        hwFlags = hwFlags and hwFlagsClearMask
        sw.hwFlags = hwFlags
-       releaseFrame = rxu_cntrl_frame_handle(curHwDesc) == 0
+       releaseFrame = rxu_cntrl_frame_handle(queuedRxMpduDesc) == 0
        break frameWork
 
      # VIF lookup
@@ -583,7 +597,7 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
      # Shared tail for all dispatch paths (blob has 1 rxu_cntrl_frame_handle
      # site; dispatchFrame flag set by each path above).
      if dispatchFrame:
-       releaseFrame = rxu_cntrl_frame_handle(curHwDesc) == 0
+       releaseFrame = rxu_cntrl_frame_handle(queuedRxMpduDesc) == 0
        if not releaseFrame:
          break frameWork
 
@@ -661,7 +675,7 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
 
     # L52: Free RX descriptor and loop if the upper RX path did not take it.
     if releaseFrame:
-      rxl_mpdu_free(curHwDesc)
+      rxl_mpdu_free(queuedRxMpduDesc)
 
   # Unreachable exit (loop exits via return)
   ke_evt_set(0x00100000'u32)
@@ -686,10 +700,10 @@ proc rxl_cntrl_dump*() {.exportc, cdecl, noinline.} =
   let env = rxlCntrlEnvView()
   let count = co_list_cnt(addr env.queue)
   logProc(2, 0, "rxl_cntrl.c", 766, count)
-  var cur = env.queue.first
-  while cur != nil:
-    logProc(2, 0, "rxl_cntrl.c", 770, cast[uint32](cast[uint](cur)))
-    cur = cur.next
+  var queuedRxDesc = env.queue.first
+  while queuedRxDesc != nil:
+    logProc(2, 0, "rxl_cntrl.c", 770, cast[uint32](cast[uint](queuedRxDesc)))
+    queuedRxDesc = queuedRxDesc.next
   logProc(2, 0, "rxl_cntrl.c", 774)
 
 proc rxl_dma_evt*() {.exportc, cdecl.} =
@@ -725,10 +739,10 @@ proc rxl_timer_int_handler*() {.exportc, cdecl.} =
   ## (0x24B0807C), then loops over the HD chain (rxl_hwdesc_env[8]). For each
   ## descriptor with bit 14 (0x4000) set in status[64], dequeues it, extracts
   ## the sw_desc, moves buffer chain, checks status fields, and dispatches:
-  ##   - statusHalf!=0, field8!=0: co_list_push_back(rxl_cntrl_env, sw_desc)
-  ##   - statusHalf!=0, field8==0: assert_rec (line 193)
-  ##   - statusHalf==0, field8!=0: assert_rec (line 227)
-  ##   - statusHalf==0, field8==0: clear sw_desc[12,16], rxl_hd_append(innerDesc)
+  ##   - frameLen!=0, field8!=0: co_list_push_back(rxl_cntrl_env, sw_desc)
+  ##   - frameLen!=0, field8==0: assert_rec (line 193)
+  ##   - frameLen==0, field8!=0: assert_rec (line 227)
+  ##   - frameLen==0, field8==0: clear sw_desc[12,16], rxl_hd_append(innerDesc)
   ## After processing, if PD chain exists, tail-calls ke_evt_set(0x100000).
   ## Call graph: co_list_push_back, assert_rec, rxl_hd_append, ke_evt_set
   regWrite(0x24B0807C'u, 0x000A0000'u32)
@@ -745,18 +759,18 @@ proc rxl_timer_int_handler*() {.exportc, cdecl.} =
     let swDescLink = rxMpduDescView(submitted.swDesc)
     env.submittedHead = submitted.next
     let innerDesc = cast[ptr RxPayloadHwDescView](swDescLink.swDesc)
-    swDescLink.reserved08 = cast[uint32](cast[uint](submitted.bufferChain))
-    let statusHalf = innerDesc.frameLen
-    let field8 = innerDesc.bufferAddr
-    if statusHalf != 0:
-      if field8 == 0:
+    swDescLink.bufferChain = cast[uint32](cast[uint](submitted.bufferChain))
+    let frameLen = innerDesc.frameLen
+    let payloadBufferAddr = innerDesc.bufferAddr
+    if frameLen != 0:
+      if payloadBufferAddr == 0:
         # Error: valid status but no buffer (blob: assert_rec line 193)
         assert_rec("rxl_cntrl.c", "rxl_cntrl.c", 193)
       else:
         # Valid frame: push sw_desc onto rxl_cntrl_env processing list
         co_list_push_back(addr env.queue, cast[ptr CoListHdr](swDescLink))
     else:
-      if field8 != 0:
+      if payloadBufferAddr != 0:
         # Error: no status but has buffer (blob: assert_rec line 227)
         assert_rec("rxl_cntrl.c", "rxl_cntrl.c", 227)
       else:
@@ -779,9 +793,9 @@ proc rxl_timeout_int_handler*() {.exportc, cdecl.} =
   ## From blob (5 instrs): reads MACHW reg at 0x24B0808C (MACHW_BASE+0x8C),
   ## clears bit 6 (AND with ~64 = 0xFFFFFFBF), writes back; ret.
   let regAddr = MACHW_BASE + 0x8C'u
-  var val = volatileLoad(cast[ptr uint32](regAddr))
-  val = val and (not 64'u32)  # clear bit 6
-  volatileStore(cast[ptr uint32](regAddr), val)
+  var machwInterruptControl = volatileLoad(cast[ptr uint32](regAddr))
+  machwInterruptControl = machwInterruptControl and (not 64'u32)  # clear bit 6
+  volatileStore(cast[ptr uint32](regAddr), machwInterruptControl)
 
 proc rxl_current_desc_get*(): pointer {.exportc, cdecl.} =
   ## Get current RX descriptor pointers.
@@ -795,4 +809,3 @@ proc rxl_current_desc_get*(): pointer {.exportc, cdecl.} =
   if outLast != nil:
     outLast[] = rxHwDescEnvView().pdCurrent
   return currentDesc
-

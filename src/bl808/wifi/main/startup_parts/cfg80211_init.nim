@@ -1,14 +1,14 @@
 proc cfg80211_init(blHw: ptr BlHw): cint =
   if blHw == nil:
     return -1
-  let raw = cast[pointer](blHw)
-  initListHead(raw, BlHwVifsOff)
-  storePtr(raw, BlHwModParamsOff, cast[pointer](addr bl_mod_params))
+  let blHwStorage = cast[pointer](blHw)
+  initListHead(blHwStorage, BlHwVifsOff)
+  storePtr(blHwStorage, BlHwModParamsOff, cast[pointer](addr bl_mod_params))
 
   result = bl_platform_on(blHw)
   if result != 0:
     return result
-  ipc_host_enable_irq(loadPtr(raw, BlHwIpcEnvOff), IpcIrqE2aAll)
+  ipc_host_enable_irq(loadPtr(blHwStorage, BlHwIpcEnvOff), IpcIrqE2aAll)
   discard bl_wifi_enable_irq()
 
   result = bl_send_reset(blHw)

@@ -6,13 +6,13 @@ proc bl808WifiBackendEnableWirelessClocks() =
 
 proc bl808WifiBackendConfigureDigClock() =
   let reg = GlbBase + 0x250'u32
-  var v = regRead32(reg)
-  let dig32 = v and (1'u32 shl 12)
-  v = v and not ((1'u32 shl 24) or (1'u32 shl 12))
-  regWrite32(reg, v)
-  v = regRead32(reg)
-  v = (v and not (3'u32 shl 28)) or (1'u32 shl 28)
-  regWrite32(reg, v)
-  v = regRead32(reg)
-  v = (v and not (0x7f'u32 shl 16)) or (0x4e'u32 shl 16) or (1'u32 shl 25) or (1'u32 shl 24) or dig32
-  regWrite32(reg, v)
+  var clockConfig = regRead32(reg)
+  let dig32 = clockConfig and (1'u32 shl 12)
+  clockConfig = clockConfig and not ((1'u32 shl 24) or (1'u32 shl 12))
+  regWrite32(reg, clockConfig)
+  clockConfig = regRead32(reg)
+  clockConfig = (clockConfig and not (3'u32 shl 28)) or (1'u32 shl 28)
+  regWrite32(reg, clockConfig)
+  clockConfig = regRead32(reg)
+  clockConfig = (clockConfig and not (0x7f'u32 shl 16)) or (0x4e'u32 shl 16) or (1'u32 shl 25) or (1'u32 shl 24) or dig32
+  regWrite32(reg, clockConfig)

@@ -9,9 +9,9 @@ proc vendorPollOnce() =
     bl_main_event_handle(0, nil)
 
 proc vendorPollFor(iterations: uint32) =
-  var i = iterations
-  while i != 0:
-    dec i
+  var pollsRemaining = iterations
+  while pollsRemaining != 0:
+    dec pollsRemaining
     vendorPollOnce()
     delayMtimeUs(100)
 

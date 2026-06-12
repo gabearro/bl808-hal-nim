@@ -18,6 +18,8 @@ proc disconnectCb(env, ind: pointer) {.cdecl.} =
 proc beaconCb(env, ind: pointer) {.cdecl.} =
   discard env
   scanDiagStore(ind)
+  when defined(bl808WifiConnectCacheHint):
+    scanCacheStore(ind)
   inc scanItemCount
   vendorPutsRaw("[WIFI] scan item ch=")
   vendorPrintU32(if ind != nil: loadU8(ind, WifiBeaconChannelOff).uint32 else: 0, 10)
@@ -27,6 +29,25 @@ proc beaconCb(env, ind: pointer) {.cdecl.} =
     vendorPrintU32(uint32(-loadI8(ind, WifiBeaconRssiOff).int), 10)
   else:
     vendorPrintU32(if ind != nil: loadI8(ind, WifiBeaconRssiOff).uint32 else: 0, 10)
+  if ind != nil:
+    vendorPutsRaw(" auth=")
+    vendorPrintU32(loadU8(ind, WifiBeaconAuthOff).uint32, 10)
+    vendorPutsRaw(" cipher=")
+    vendorPrintU32(loadU8(ind, WifiBeaconCipherOff).uint32, 10)
+    vendorPutsRaw(" ssid=")
+    let ssidLenRaw = loadI32(ind, WifiBeaconSsidLenOff)
+    let ssidLen =
+      if ssidLenRaw < 0: 0
+      elif ssidLenRaw > 32: 32
+      else: ssidLenRaw
+    var ssidByteIndex = 0
+    while ssidByteIndex < ssidLen:
+      let ch = loadU8(ind, WifiBeaconSsidOff + ssidByteIndex.uint)
+      if ch >= 32'u8 and ch <= 126'u8:
+        vendorPrintChar(ch.char)
+      else:
+        vendorPrintChar('.')
+      inc ssidByteIndex
   vendorPutsRaw("\r\n")
 
 proc eventCb(env, event: pointer) {.cdecl.} =

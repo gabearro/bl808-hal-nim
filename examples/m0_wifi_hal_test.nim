@@ -98,8 +98,6 @@ when defined(bl808WifiNimFw):
     discard console.sendString("[WIFI] scan diag count=")
     console.sendHex32(count)
     discard console.sendLine("")
-    if count > 8'u32:
-      count = 8'u32
     var i = 0'u32
     while i < count:
       var ssidLen: uint8
@@ -1185,6 +1183,28 @@ when defined(bl808WifiNimFw):
   var nimfw_dbg_scan_at            {.importc.}: uint32
   var nimfw_dbg_scan_smf           {.importc.}: uint32
   var nimfw_dbg_scan_caps          {.importc.}: uint32
+  var nimfw_dbg_scan_ssid_last     {.importc.}: uint32
+  var nimfw_dbg_bss_in             {.importc.}: uint32
+  var nimfw_dbg_bss_ssid_result    {.importc.}: uint32
+  var nimfw_dbg_bss_directed       {.importc.}: uint32
+  var nimfw_dbg_bss_out            {.importc.}: uint32
+  var nimfw_dbg_bss_chan_fix_meta  {.importc.}: uint32
+  var nimfw_dbg_bss_chan_fix_ptr   {.importc.}: uint32
+  var nimfw_dbg_bss_chan_fix_raw   {.importc.}: uint32
+  var nimfw_dbg_bss_rx_freq        {.importc.}: uint32
+  var nimfw_dbg_bss_ds_freq        {.importc.}: uint32
+  var nimfw_dbg_bss_selected_freq  {.importc.}: uint32
+  var nimfw_dbg_sta_tx_channel_source {.importc.}: uint32
+  var nimfw_dbg_sta_tx_channel_req0 {.importc.}: uint32
+  var nimfw_dbg_sta_tx_channel_req1 {.importc.}: uint32
+  var nimfw_dbg_sta_tx_channel_vif  {.importc.}: uint32
+  var nimfw_dbg_sm_chan_ctx_req0    {.importc.}: uint32
+  var nimfw_dbg_sm_chan_ctx_req1    {.importc.}: uint32
+  var nimfw_dbg_sm_chan_ctx_ptrs    {.importc.}: uint32
+  var nimfw_dbg_sm_chan_ctx_result  {.importc.}: uint32
+  var nimfw_dbg_ssid_search        {.importc.}: uint32
+  var nimfw_dbg_ssid_entries       {.importc.}: uint32
+  var nimfw_dbg_ssid_hits          {.importc.}: uint32
   var nimfw_dbg_m4_tx_state        {.importc.}: uint32
   var nimfw_dbg_m4_cb_ptr          {.importc.}: uint32
   var nimfw_dbg_cfm_cb_ptr_last    {.importc.}: uint32
@@ -1196,6 +1216,11 @@ when defined(bl808WifiNimFw):
   var nimfw_dbg_eapol_cfm_count    {.importc.}: uint32
   var nimfw_dbg_eapol_cfm_ack_ok   {.importc.}: uint32
   var nimfw_dbg_eapol_cfm_ack_fail {.importc.}: uint32
+  var nimfw_dbg_eapol_cfm_status_log {.importc.}: array[4, uint32]
+  var nimfw_dbg_eapol_cfm_meta_log {.importc.}: array[4, uint32]
+  var nimfw_dbg_eapol_cfm_key_log {.importc.}: array[4, uint32]
+  var nimfw_dbg_eapol_cfm_replay_log {.importc.}: array[4, uint32]
+  var nimfw_dbg_eapol_cfm_cb_log {.importc.}: array[4, uint32]
   var nimfw_dbg_disconnect_req     {.importc.}: uint32
   var nimfw_dbg_disconnect_req_state {.importc.}: uint32
   var nimfw_dbg_disconnect_process {.importc.}: uint32
@@ -1306,6 +1331,24 @@ when defined(bl808WifiNimFw):
     console.sendHex32(nimfw_dbg_auth_cfm_meta)
     discard console.sendString(" fc=")
     console.sendHex32(nimfw_dbg_auth_cfm_fc)
+    discard console.sendLine("")
+    discard console.sendString("[WIFI-NIMFW] tx_counters sta_tx_chan src=")
+    console.sendHex32(nimfw_dbg_sta_tx_channel_source)
+    discard console.sendString(" req0=")
+    console.sendHex32(nimfw_dbg_sta_tx_channel_req0)
+    discard console.sendString(" req1=")
+    console.sendHex32(nimfw_dbg_sta_tx_channel_req1)
+    discard console.sendString(" vif=")
+    console.sendHex32(nimfw_dbg_sta_tx_channel_vif)
+    discard console.sendLine("")
+    discard console.sendString("[WIFI-NIMFW] tx_counters sm_chan_ctx req0=")
+    console.sendHex32(nimfw_dbg_sm_chan_ctx_req0)
+    discard console.sendString(" req1=")
+    console.sendHex32(nimfw_dbg_sm_chan_ctx_req1)
+    discard console.sendString(" ptrs=")
+    console.sendHex32(nimfw_dbg_sm_chan_ctx_ptrs)
+    discard console.sendString(" result=")
+    console.sendHex32(nimfw_dbg_sm_chan_ctx_result)
     discard console.sendLine("")
     discard console.sendString("[WIFI-NIMFW] tx_counters assoc_cfm=")
     console.sendHex32((nimfw_dbg_assoc_cfm_push and 0xff'u32) or
@@ -1756,6 +1799,70 @@ when defined(bl808WifiNimFw):
       discard console.sendString(" scan_caps=")
       console.sendHex32(nimfw_dbg_scan_caps)
       discard console.sendLine("")
+      discard console.sendString("[BSS] in=")
+      console.sendHex32(nimfw_dbg_bss_in)
+      discard console.sendString(" ssid_result=")
+      console.sendHex32(nimfw_dbg_bss_ssid_result)
+      discard console.sendString(" directed=")
+      console.sendHex32(nimfw_dbg_bss_directed)
+      discard console.sendString(" out=")
+      console.sendHex32(nimfw_dbg_bss_out)
+      discard console.sendLine("")
+      discard console.sendString("[BSS] chan_meta=")
+      console.sendHex32(nimfw_dbg_bss_chan_fix_meta)
+      discard console.sendString(" chan_ptr=")
+      console.sendHex32(nimfw_dbg_bss_chan_fix_ptr)
+      discard console.sendString(" raw=")
+      console.sendHex32(nimfw_dbg_bss_chan_fix_raw)
+      discard console.sendString(" ssid_last=")
+      console.sendHex32(nimfw_dbg_scan_ssid_last)
+      discard console.sendLine("")
+      discard console.sendString("[BSS] freq rx=")
+      console.sendHex32(nimfw_dbg_bss_rx_freq)
+      discard console.sendString(" ds=")
+      console.sendHex32(nimfw_dbg_bss_ds_freq)
+      discard console.sendString(" selected=")
+      console.sendHex32(nimfw_dbg_bss_selected_freq)
+      discard console.sendLine("")
+      discard console.sendString("[BSS] ssid_search=")
+      console.sendHex32(nimfw_dbg_ssid_search)
+      discard console.sendString(" entries=")
+      console.sendHex32(nimfw_dbg_ssid_entries)
+      discard console.sendString(" hits=")
+      console.sendHex32(nimfw_dbg_ssid_hits)
+      discard console.sendLine("")
+    discard console.sendString("[BSS] in=")
+    console.sendHex32(nimfw_dbg_bss_in)
+    discard console.sendString(" ssid_result=")
+    console.sendHex32(nimfw_dbg_bss_ssid_result)
+    discard console.sendString(" directed=")
+    console.sendHex32(nimfw_dbg_bss_directed)
+    discard console.sendString(" out=")
+    console.sendHex32(nimfw_dbg_bss_out)
+    discard console.sendLine("")
+    discard console.sendString("[BSS] chan_meta=")
+    console.sendHex32(nimfw_dbg_bss_chan_fix_meta)
+    discard console.sendString(" chan_ptr=")
+    console.sendHex32(nimfw_dbg_bss_chan_fix_ptr)
+    discard console.sendString(" raw=")
+    console.sendHex32(nimfw_dbg_bss_chan_fix_raw)
+    discard console.sendString(" ssid_last=")
+    console.sendHex32(nimfw_dbg_scan_ssid_last)
+    discard console.sendLine("")
+    discard console.sendString("[BSS] freq rx=")
+    console.sendHex32(nimfw_dbg_bss_rx_freq)
+    discard console.sendString(" ds=")
+    console.sendHex32(nimfw_dbg_bss_ds_freq)
+    discard console.sendString(" selected=")
+    console.sendHex32(nimfw_dbg_bss_selected_freq)
+    discard console.sendLine("")
+    discard console.sendString("[BSS] ssid_search=")
+    console.sendHex32(nimfw_dbg_ssid_search)
+    discard console.sendString(" entries=")
+    console.sendHex32(nimfw_dbg_ssid_entries)
+    discard console.sendString(" hits=")
+    console.sendHex32(nimfw_dbg_ssid_hits)
+    discard console.sendLine("")
     discard console.sendString("[M4] tx_state=")
     console.sendHex32(nimfw_dbg_m4_tx_state)
     discard console.sendString(" cb_ptr_supp=")
@@ -1780,6 +1887,20 @@ when defined(bl808WifiNimFw):
     discard console.sendString(" last_status=")
     console.sendHex32(nimfw_dbg_eapol_cfm_status)
     discard console.sendLine("")
+    for eapolCfmLogIndex in 0 ..< 4:
+      discard console.sendString("[EAPOL-CFM] log")
+      console.sendHex32(eapolCfmLogIndex.uint32)
+      discard console.sendString(" status=")
+      console.sendHex32(nimfw_dbg_eapol_cfm_status_log[eapolCfmLogIndex])
+      discard console.sendString(" meta=")
+      console.sendHex32(nimfw_dbg_eapol_cfm_meta_log[eapolCfmLogIndex])
+      discard console.sendString(" key=")
+      console.sendHex32(nimfw_dbg_eapol_cfm_key_log[eapolCfmLogIndex])
+      discard console.sendString(" replay=")
+      console.sendHex32(nimfw_dbg_eapol_cfm_replay_log[eapolCfmLogIndex])
+      discard console.sendString(" cb=")
+      console.sendHex32(nimfw_dbg_eapol_cfm_cb_log[eapolCfmLogIndex])
+      discard console.sendLine("")
     discard console.sendString("[WIFI-NIMFW] tx_counters sta_tbtt_enter=")
     console.sendHex32(nimfw_dbg_sta_tbtt_enter)
     discard console.sendString(" assoc=")

@@ -1,20 +1,20 @@
-proc repushTxConfirmIfNeeded(txhdr, sta: pointer; staO: ptr BlStaView; linksNum: uint8;
-                             ret: int; value: uint32): bool =
-  if ret != 0 or txHdrRepush(txhdr) >= 3'u8 or linksNum == 0'u8 or staO.isUsed == 0'u8:
+proc repushTxConfirmIfNeeded(txHeaderPtr, station: pointer; stationState: ptr BlStaView; stationLinkCount: uint8;
+                             txConfirmResult: int; txStatusWord: uint32): bool =
+  if txConfirmResult != 0 or txHdrRepush(txHeaderPtr) >= 3'u8 or stationLinkCount == 0'u8 or stationState.isUsed == 0'u8:
     return false
 
-  if (value and RetryLimitReachedBit) != 0'u32:
-    txCntrlStaTriggerPending = txCntrlStaTriggerPending or bitSta(staO.staIdx)
-  elif (value and FrameRepushableChanBit) != 0'u32:
-    vifView(staVif(sta)).fcChan = 1
-  elif (value and FrameRepushablePsBit) != 0'u32:
-    staO.fcPs = 1
+  if (txStatusWord and RetryLimitReachedBit) != 0'u32:
+    txCntrlStaTriggerPending = txCntrlStaTriggerPending or bitSta(stationState.staIdx)
+  elif (txStatusWord and FrameRepushableChanBit) != 0'u32:
+    vifView(staVif(station)).fcChan = 1
+  elif (txStatusWord and FrameRepushablePsBit) != 0'u32:
+    stationState.fcPs = 1
   else:
     discard
 
-  if (value and (RetryLimitReachedBit or FrameRepushableChanBit or FrameRepushablePsBit)) == 0'u32:
+  if (txStatusWord and (RetryLimitReachedBit or FrameRepushableChanBit or FrameRepushablePsBit)) == 0'u32:
     return false
 
-  setTxHdrRepush(txhdr, txHdrRepush(txhdr) + 1'u8)
-  listPushBack(cast[pointer](addr staO.pendingList), txhdr)
+  setTxHdrRepush(txHeaderPtr, txHdrRepush(txHeaderPtr) + 1'u8)
+  listPushBack(cast[pointer](addr stationState.pendingList), txHeaderPtr)
   true

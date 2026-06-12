@@ -1,6 +1,6 @@
 proc clearHostname() =
-  for i in 0 ..< wifiMgmr.hostname.len:
-    wifiMgmr.hostname[i] = 0.cchar
+  for hostnameByteIndex in 0 ..< wifiMgmr.hostname.len:
+    wifiMgmr.hostname[hostnameByteIndex] = 0.cchar
 
 proc putHostnameChar(pos: var int; ch: char) =
   if pos < wifiMgmr.hostname.len - 1:

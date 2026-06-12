@@ -30,14 +30,9 @@ proc bl808WifiBackendFwStart() =
   bl808WifiBackendTrace("wifi_hosal_rf_turn_on begin")
   discard wifi_hosal_rf_turn_on(nil)
   bl808WifiBackendTrace("wifi_hosal_rf_turn_on done")
-  when defined(bl808WifiUseBl808Rf):
-    bl808WifiBackendTrace("wifi_rf_core_init begin")
-    wifiRfCoreInit(40_000_000)
-    bl808WifiBackendTrace("wifi_rf_core_init done")
-  else:
-    bl808WifiBackendTrace("rf_init begin")
-    rf_init(40_000_000)
-    bl808WifiBackendTrace("rf_init done")
+  bl808WifiBackendTrace("wifi_rf_core_init begin")
+  wifiRfCoreInit(40_000_000)
+  bl808WifiBackendTrace("wifi_rf_core_init done")
   bl808WifiBackendTrace("high_power_profile begin")
   bl808WifiBackendApplyHighPowerProfile()
   bl808WifiBackendTrace("high_power_profile done")

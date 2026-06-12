@@ -373,8 +373,8 @@ proc ipc_emb_txcfm_ind*(acBit: uint32 = 0) {.exportc, cdecl, noinline.} =
   ## TX confirmation indication to host.
   ## From blob (4 instrs): slli a0,a0,7; writes a0 to IPC_EMB_STATUS_REG (0x24800100); ret.
   ## acBit is shifted left 7 to form the IPC TX confirm bit, then written to status reg.
-  let val = acBit shl 7
-  volatileStore(cast[ptr uint32](IPC_EMB_STATUS_REG), val)
+  let txConfirmStatusBit = acBit shl 7
+  volatileStore(cast[ptr uint32](IPC_EMB_STATUS_REG), txConfirmStatusBit)
 
 proc ipc_emb_prim_tbtt_ind*() {.exportc, cdecl.} =
   ## Primary TBTT indication to host — 4 instrs in blob:
@@ -395,4 +395,3 @@ proc ipc_emb_dump*() {.exportc, cdecl, noinline.} =
   ## bl_fw_statistic_dump; without the barrier GCC elides the call of an
   ## empty, side-effect-free proc.
   {.emit: ["asm volatile(\"\" ::: \"memory\");"].}
-

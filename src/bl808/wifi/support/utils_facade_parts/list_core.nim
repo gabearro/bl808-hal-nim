@@ -1,7 +1,7 @@
 proc utils_list_init*(list: ptr UtilsList) {.exportc, cdecl.} =
-  let raw = cast[pointer](list)
-  storePtr(raw, 0, nil)
-  storePtr(raw, 4, nil)
+  let listStorage = cast[pointer](list)
+  storePtr(listStorage, 0, nil)
+  storePtr(listStorage, 4, nil)
 
 proc utils_list_push_back*(list: ptr UtilsList; hdr: ptr UtilsListHdr) {.exportc, cdecl.} =
   let listRaw = cast[pointer](list)
@@ -27,34 +27,34 @@ proc utils_list_pop_front*(list: ptr UtilsList): ptr UtilsListHdr {.exportc, cde
     if loadPtr(listRaw, 0) == nil: storePtr(listRaw, 4, nil)
     storePtr(resultRaw, 0, nil)
 
-proc utils_list_remove*(list: ptr UtilsList; prev, element: ptr UtilsListHdr) {.exportc, cdecl.} =
+proc utils_list_remove*(list: ptr UtilsList; previousElement, element: ptr UtilsListHdr) {.exportc, cdecl.} =
   let listRaw = cast[pointer](list)
-  let prevRaw = cast[pointer](prev)
+  let previousElementRaw = cast[pointer](previousElement)
   let elementRaw = cast[pointer](element)
   if element == nil: return
-  if prev != nil: storePtr(prevRaw, 0, loadPtr(elementRaw, 0))
+  if previousElement != nil: storePtr(previousElementRaw, 0, loadPtr(elementRaw, 0))
   elif loadPtr(listRaw, 0) == elementRaw: storePtr(listRaw, 0, loadPtr(elementRaw, 0))
   else: return
-  if loadPtr(listRaw, 4) == elementRaw: storePtr(listRaw, 4, prevRaw)
+  if loadPtr(listRaw, 4) == elementRaw: storePtr(listRaw, 4, previousElementRaw)
   storePtr(elementRaw, 0, nil)
 
 proc utils_list_extract*(list: ptr UtilsList; hdr: ptr UtilsListHdr) {.exportc, cdecl.} =
   let listRaw = cast[pointer](list)
   let hdrRaw = cast[pointer](hdr)
-  var prev: pointer
-  var cur = loadPtr(listRaw, 0)
-  while cur != nil:
-    if cur == hdrRaw:
-      utils_list_remove(list, cast[ptr UtilsListHdr](prev), cast[ptr UtilsListHdr](cur))
+  var previousNode: pointer
+  var currentNode = loadPtr(listRaw, 0)
+  while currentNode != nil:
+    if currentNode == hdrRaw:
+      utils_list_remove(list, cast[ptr UtilsListHdr](previousNode), cast[ptr UtilsListHdr](currentNode))
       return
-    prev = cur
-    cur = loadPtr(cur, 0)
+    previousNode = currentNode
+    currentNode = loadPtr(currentNode, 0)
 
 proc utils_list_find*(list: ptr UtilsList; hdr: ptr UtilsListHdr): cint {.exportc, cdecl.} =
   let listRaw = cast[pointer](list)
   let hdrRaw = cast[pointer](hdr)
-  var cur = loadPtr(listRaw, 0)
-  while cur != nil:
-    if cur == hdrRaw: return 1
-    cur = loadPtr(cur, 0)
+  var currentNode = loadPtr(listRaw, 0)
+  while currentNode != nil:
+    if currentNode == hdrRaw: return 1
+    currentNode = loadPtr(currentNode, 0)
   0

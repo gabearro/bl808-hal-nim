@@ -1,5 +1,5 @@
 proc cmdMgrMsgind(cmdMgr, msg, cbPtr: pointer): cint {.cdecl.} =
-  let cb = cast[MsgCbProc](cbPtr)
+  let msgConfirmCallback = cast[MsgCbProc](cbPtr)
   let blHw = cmdMgr
   var found = false
   when defined(bl808WifiCmdTrace):
@@ -13,7 +13,7 @@ proc cmdMgrMsgind(cmdMgr, msg, cbPtr: pointer): cint {.cdecl.} =
   while cmd != head:
     if loadU16(cmd, CmdReqidOff) == loadU16(msg, IpcE2aMsgIdOff) and
         (loadU16(cmd, CmdFlagsOff) and RwnxCmdFlagWaitCfm) != 0'u16:
-      if cb == nil or cb(blHw, cmd, msg) == 0:
+      if msgConfirmCallback == nil or msgConfirmCallback(blHw, cmd, msg) == 0:
         found = true
         when defined(bl808WifiCmdTrace):
           c_printf("[WIFI-CMD] msg found cmd=%p msgid=0x%x flags=0x%x\r\n",
@@ -31,6 +31,6 @@ proc cmdMgrMsgind(cmdMgr, msg, cbPtr: pointer): cint {.cdecl.} =
     cmd = listNext(cmd)
   cmdMgrUnlock(cmdMgr)
 
-  if not found and cb != nil:
-    discard cb(blHw, nil, msg)
+  if not found and msgConfirmCallback != nil:
+    discard msgConfirmCallback(blHw, nil, msg)
   0

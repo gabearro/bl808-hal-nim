@@ -21,6 +21,7 @@ proc bl_send_add_if(blHw: ptr BlHw; mac: ptr uint8; iftype: cint; p2p: bool; cfm
 proc bl_main_scan(netif: ptr Netif; fixedChannels: ptr uint16; channelNum: uint16;
                   bssid: ptr MacAddr; ssid: ptr MacSsid; scanMode: uint8;
                   durationScan: uint32): cint {.importc, cdecl.}
+proc bl_msg_get_channel_nums(): cint {.importc, cdecl.}
 proc bl_main_connect(ssid: ptr uint8; ssidLen: cint; psk: ptr uint8; pskLen: cint;
                      pmk: ptr uint8; pmkLen: cint; mac: ptr uint8; band: uint8;
                      freq: uint16; flags: uint32): cint {.importc, cdecl.}
@@ -42,7 +43,6 @@ proc bl_irq_handler() {.importc, cdecl.}
 proc bl_main_event_handle(param: cint; txFcField: pointer) {.importc, cdecl.}
 proc mac_irq() {.importc, cdecl.}
 proc hal_machw_gen_handler() {.importc, cdecl.}
-proc rf_init(xtalFreqHz: uint32) {.importc, cdecl.}
 proc phy_powroffset_set(powerOffset: ptr int8) {.importc, cdecl.}
 proc bl_tpc_update_power_rate_11b(p: ptr int8) {.importc, cdecl.}
 proc bl_tpc_update_power_rate_11g(p: ptr int8) {.importc, cdecl.}

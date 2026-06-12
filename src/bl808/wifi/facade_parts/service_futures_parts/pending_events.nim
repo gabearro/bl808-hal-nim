@@ -11,8 +11,8 @@ proc wifiCompletePendingEvents() =
   if wifiDisconnectIssuePending and wifiDisconnectFuture != nil and
       not wifiDisconnectFuture.finished:
     wifiDisconnectIssuePending = false
-    let rc = wifiNimFirmwareIssueDisconnect()
-    if rc != 0:
+    let disconnectIssueStatus = wifiNimFirmwareIssueDisconnect()
+    if disconnectIssueStatus != 0:
       completeWifiDisconnect(wifiFail)
     elif wifiDisconnectIssueTimeoutMs != 0'u32:
       wifiDisconnectTimer = addTimerMs(

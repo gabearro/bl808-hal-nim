@@ -4,12 +4,15 @@ type
     last*: pointer
 
   BlVifView {.packed.} = object
-    reserved0*: array[13, uint8]
+    driverPrivatePrefix*: array[8, uint8]
+    netifDev*: pointer
+    isUp*: uint8
     vifIdx*: uint8
     linksNum*: uint8
     fixedStaIdx*: uint8
     fcChan*: uint8
-    reserved17*: array[3, uint8]
+    staPsMode*: uint8
+    driverPrivateTail*: array[2, uint8]
 
   BlStaView {.packed.} = object
     waitingList*: CoListView
@@ -18,15 +21,19 @@ type
     isUsed*: uint8
     staIdx*: uint8
     vifIdx*: uint8
-    reserved25*: uint8
+    linkState*: uint8
     fcPs*: uint8
     qos*: uint8
-    reserved28*: array[12, uint8]
+    rssi*: int8
+    dataRate*: uint8
+    rxStatsPadding*: array[2, uint8]
+    tsfLo*: uint32
+    tsfHi*: uint32
 
   BlHwView {.packed.} = object
-    reserved0*: array[48, uint8]
+    driverPrivatePrefix*: array[48, uint8]
     ipcEnv*: pointer
-    reserved52*: array[8, uint8]
+    driverPrivateAfterIpc*: array[8, uint8]
     vifs*: array[2, BlVifView]
     stas*: array[NxRemoteStaStoreMax, BlStaView]
 

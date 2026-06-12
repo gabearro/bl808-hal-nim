@@ -47,12 +47,12 @@ proc blSendMsg(blHw: ptr BlHw; msgParams: pointer; reqcfm: cint;
   storeU16(cmd, BlCmdFlagsOff, flags)
 
   let queue = cast[CmdQueueProc](loadPtr(hw, BlHwCmdMgrQueueOff))
-  var ret = if queue == nil: -Ebusy else: queue(hw, cmd)
+  var queueStatus = if queue == nil: -Ebusy else: queue(hw, cmd)
   if not nonblock:
     osFree(cmd)
   else:
-    ret = loadI32(cmd, BlCmdResultOff).cint
-  ret
+    queueStatus = loadI32(cmd, BlCmdResultOff).cint
+  queueStatus
 
 proc sendEmpty(blHw: ptr BlHw; id: uint16; dest: uint8; reqcfm: cint;
                reqid: uint16; cfm: pointer): cint =

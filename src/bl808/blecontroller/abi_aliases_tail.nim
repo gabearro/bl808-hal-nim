@@ -71,37 +71,37 @@ proc btble_co_list_extract_sublist*(list: ptr CoList,
     {.exportc, cdecl.} =
   if firstNode == nil:
     return
-  var prev: ptr CoListNode = nil
-  var cur = list.first
-  while cur != nil and cur != firstNode:
-    prev = cur
-    cur = cur.next
-  if cur == nil:
+  var nodeBeforeSublist: ptr CoListNode = nil
+  var sublistHeadSearch = list.first
+  while sublistHeadSearch != nil and sublistHeadSearch != firstNode:
+    nodeBeforeSublist = sublistHeadSearch
+    sublistHeadSearch = sublistHeadSearch.next
+  if sublistHeadSearch == nil:
     return
   let afterLast =
     if lastNode != nil: lastNode.next
     else: nil
-  if prev == nil:
+  if nodeBeforeSublist == nil:
     list.first = afterLast
   else:
-    prev.next = afterLast
+    nodeBeforeSublist.next = afterLast
   if list.last == lastNode:
-    list.last = prev
+    list.last = nodeBeforeSublist
   if lastNode != nil:
     lastNode.next = nil
 
-proc btble_ke_event_callback_set*(idx: uint8, cb: KeEventCallback)
+proc btble_ke_event_callback_set*(eventId: uint8, cb: KeEventCallback)
     {.exportc, cdecl.} =
-  ble_ke_event_callback_set(idx, cb)
+  ble_ke_event_callback_set(eventId, cb)
 
-proc btble_ke_event_clear*(idx: uint8) {.exportc, cdecl.} =
-  ble_ke_event_clear(idx)
+proc btble_ke_event_clear*(eventId: uint8) {.exportc, cdecl.} =
+  ble_ke_event_clear(eventId)
 
 proc btble_ke_event_flush*() {.exportc, cdecl.} =
   ble_ke_event_flush()
 
-proc btble_ke_event_get*(idx: uint8): bool {.exportc, cdecl.} =
-  ble_ke_event_get(idx)
+proc btble_ke_event_get*(eventId: uint8): bool {.exportc, cdecl.} =
+  ble_ke_event_get(eventId)
 
 proc btble_ke_event_get_all*(): uint32 {.exportc, cdecl.} =
   ble_ke_event_get_all()
@@ -112,8 +112,8 @@ proc btble_ke_event_init*() {.exportc, cdecl.} =
 proc btble_ke_event_schedule*() {.exportc, cdecl.} =
   ble_ke_event_schedule()
 
-proc btble_ke_event_set*(idx: uint8) {.exportc, cdecl.} =
-  ble_ke_event_set(idx)
+proc btble_ke_event_set*(eventId: uint8) {.exportc, cdecl.} =
+  ble_ke_event_set(eventId)
 
 proc btble_ke_init*() {.exportc, cdecl.} =
   ble_ke_init()
@@ -255,11 +255,11 @@ proc btble_ke_timer_flush*() {.exportc, cdecl.} =
 
 proc btble_ke_timer_get*(id: uint16, task: uint16): uint32
     {.exportc, cdecl.} =
-  var cur = cast[ptr KeTimer](ke_timer_list.first)
-  while cur != nil:
-    if cur.id == id and cur.task == task:
-      return cur.time
-    cur = cur.next
+  var timerEntry = cast[ptr KeTimer](ke_timer_list.first)
+  while timerEntry != nil:
+    if timerEntry.id == id and timerEntry.task == task:
+      return timerEntry.time
+    timerEntry = timerEntry.next
   0
 
 proc btble_ke_timer_set*(id: uint16, task: uint16, delay: uint32)
@@ -326,9 +326,9 @@ proc ble_util_buf_acl_tx_free*(buf: pointer) {.exportc, cdecl.} =
         (cast[uint32](buf) and 0x000000FF'u32)
   when defined(bl808m0) and bl808BleNimConnectionEnabled and
       bl808BleNimManualConnTx:
-    let raw = cast[uint32](buf)
-    if raw == NimAclTxEmOffset.uint32 or
-        raw == cast[uint32](addr nim_acl_empty_tx_buf[0]):
+    let txBufferAddress = cast[uint32](buf)
+    if txBufferAddress == NimAclTxEmOffset.uint32 or
+        txBufferAddress == cast[uint32](addr nim_acl_empty_tx_buf[0]):
       nim_acl_empty_tx_pending = 0
       if nim_conn_started and nim_acl_empty_tx_queued != 0:
         nim_acl_empty_tx_queued = 0
@@ -349,19 +349,19 @@ proc ble_util_buf_elt_rx_get*(idx: uint8): pointer {.exportc, cdecl.} =
   nil
 
 proc ble_util_buf_llcp_tx_alloc*(len: uint16): pointer {.exportc, cdecl.} =
-  let buf = ble_ke_malloc(len.uint32, 0)
+  let llcpTxBuffer = ble_ke_malloc(len.uint32, 0)
   when defined(bl808m0) and bl808BleNimConnectionEnabled:
     inc nim_llcp_alloc_count
     nim_llcp_alloc_last_len = len.uint32
-    nim_llcp_alloc_last_ptr = cast[uint32](buf)
+    nim_llcp_alloc_last_ptr = cast[uint32](llcpTxBuffer)
     nim_llcp_alloc_last_emoff = 0
     nim_llcp_alloc_last_len_field = 0
-    if buf != nil and len >= 7'u16:
-      let raw = cast[ptr UncheckedArray[uint8]](buf)
+    if llcpTxBuffer != nil and len >= 7'u16:
+      let llcpTxElementBytes = cast[ptr UncheckedArray[uint8]](llcpTxBuffer)
       nim_llcp_alloc_last_emoff =
-        uint32(raw[4]) or (uint32(raw[5]) shl 8)
-      nim_llcp_alloc_last_len_field = raw[6].uint32
-  buf
+        uint32(llcpTxElementBytes[4]) or (uint32(llcpTxElementBytes[5]) shl 8)
+      nim_llcp_alloc_last_len_field = llcpTxElementBytes[6].uint32
+  llcpTxBuffer
 
 proc ble_util_buf_llcp_tx_free*(buf: pointer) {.exportc, cdecl.} =
   when defined(bl808m0) and
@@ -370,11 +370,11 @@ proc ble_util_buf_llcp_tx_free*(buf: pointer) {.exportc, cdecl.} =
       nim_bridge_stage = 0x8400'u32 or
         (cast[uint32](buf) and 0x000000FF'u32)
   when defined(bl808m0) and bl808BleNimConnectionEnabled:
-    let raw = cast[uint32](buf)
+    let llcpTxBufferAddress = cast[uint32](buf)
     inc nim_llcp_free_count
-    nim_llcp_free_last_raw = raw
-    if raw == NimLlcpTxEmOffset.uint32 or
-        raw == cast[uint32](addr nim_llcp_tx_buf[0]):
+    nim_llcp_free_last_raw = llcpTxBufferAddress
+    if llcpTxBufferAddress == NimLlcpTxEmOffset.uint32 or
+        llcpTxBufferAddress == cast[uint32](addr nim_llcp_tx_buf[0]):
       nim_llcp_tx_pending = 0
       inc nim_llcp_free_manual_count
       when bl808BleNimManualConnTx:
@@ -393,11 +393,12 @@ proc ble_util_buf_rx_alloc*(len: uint16): pointer {.exportc, cdecl.} =
 proc ble_util_buf_rx_free*(buf: pointer) {.exportc, cdecl.} =
   if buf == nil:
     return
-  let raw = cast[uint32](buf)
-  if raw < 0x00010000'u32:
+  let rxBufferAddress = cast[uint32](buf)
+  if rxBufferAddress < 0x00010000'u32:
     return
   when defined(bl808m0):
-    if raw >= BTBLE_EM_BASE and raw < BTBLE_EM_BASE + 0x00010000'u32:
+    if rxBufferAddress >= BTBLE_EM_BASE and
+        rxBufferAddress < BTBLE_EM_BASE + 0x00010000'u32:
       return
   ble_ke_free(buf)
 
@@ -406,10 +407,11 @@ proc ble_util_nb_good_channels*(map: ptr uint8): uint8 {.exportc, cdecl.} =
     return 0
   let mapBytes = cast[ptr UncheckedArray[uint8]](map)
   var count: uint8 = 0
-  for i in 0 ..< 5:
-    let byteVal = mapBytes[i]
-    for bit in 0 ..< 8:
-      if i * 8 + bit < 37 and (byteVal and (1'u8 shl bit)) != 0:
+  for channelMapByteIndex in 0 ..< 5:
+    let channelMapByte = mapBytes[channelMapByteIndex]
+    for channelMapBitIndex in 0 ..< 8:
+      if channelMapByteIndex * 8 + channelMapBitIndex < 37 and
+          (channelMapByte and (1'u8 shl channelMapBitIndex)) != 0:
         inc count
   count
 
@@ -446,10 +448,10 @@ when not (defined(bl808m0) and
   proc rwip_time_get*(time: pointer) {.exportc, cdecl.} =
     if time == nil:
       return
-    let words = cast[ptr UncheckedArray[uint32]](time)
-    words[0] = currentBtbleTime()
-    words[1] = 0
-    words[2] = regRead((BLE_BASE + 0x9C4'u32).uint)
+    let rwipTimeWords = cast[ptr UncheckedArray[uint32]](time)
+    rwipTimeWords[0] = currentBtbleTime()
+    rwipTimeWords[1] = 0
+    rwipTimeWords[2] = regRead((BLE_BASE + 0x9C4'u32).uint)
 
   proc rwip_prevent_sleep_set*(mask: uint16) {.exportc, cdecl.} =
     bflbip_prevent_sleep_mask = bflbip_prevent_sleep_mask or mask.uint32
@@ -578,12 +580,12 @@ proc bleAesDeliver(cb: pointer, ctx: pointer, status: uint8,
 proc bleAesCompleteOp(op: pointer, status: uint8, result: ptr uint8) =
   if op == nil:
     return
-  let hdr = cast[ptr BleAesOpHeader](op)
+  let aesOp = cast[ptr BleAesOpHeader](op)
   var callFinal = true
-  if status == 0'u8 and hdr.continueCb != nil:
-    callFinal = cast[BleAesContinueCb](hdr.continueCb)(op, result) != 0'u8
+  if status == 0'u8 and aesOp.continueCb != nil:
+    callFinal = cast[BleAesContinueCb](aesOp.continueCb)(op, result) != 0'u8
   if callFinal:
-    bleAesDeliver(hdr.resultCb, hdr.ctx, status, result)
+    bleAesDeliver(aesOp.resultCb, aesOp.ctx, status, result)
     ble_ke_free(op)
 
 const
@@ -660,17 +662,17 @@ proc bleTrngWaitIdle(): bool =
   true
 
 proc bleTrngClearInterrupt() =
-  var v = regRead(TrngCtrl) or TrngIntMask
-  regWrite(TrngCtrl, v or TrngIntClear)
-  v = regRead(TrngCtrl) or TrngIntMask
-  regWrite(TrngCtrl, v and not TrngIntClear)
+  var trngCtrlWord = regRead(TrngCtrl) or TrngIntMask
+  regWrite(TrngCtrl, trngCtrlWord or TrngIntClear)
+  trngCtrlWord = regRead(TrngCtrl) or TrngIntMask
+  regWrite(TrngCtrl, trngCtrlWord and not TrngIntClear)
 
 proc bleTrngDisable() =
   regWrite(TrngCtrl, (regRead(TrngCtrl) and not TrngEnable) or TrngIntMask)
   bleTrngClearInterrupt()
 
-proc bleTrngReadBlock(dst: ptr uint8): bool =
-  if dst == nil:
+proc bleTrngReadBlock(randomBlockOut: ptr uint8): bool =
+  if randomBlockOut == nil:
     return false
   regWrite(TrngCtrl3, regRead(TrngCtrl3) or TrngRoscEnable)
   regWrite(TrngCtrl, regRead(TrngCtrl) or TrngEnable or TrngIntMask)
@@ -687,15 +689,15 @@ proc bleTrngReadBlock(dst: ptr uint8): bool =
     bleTrngDisable()
     return false
 
-  let outp = cast[ptr UncheckedArray[uint8]](dst)
+  let randomBlockBytes = cast[ptr UncheckedArray[uint8]](randomBlockOut)
   var nonZero = false
-  for wordIndex in 0 ..< 8:
-    let word = regRead(TrngData + uint(wordIndex * 4))
-    if word != 0'u32:
+  for trngDataWordIndex in 0 ..< 8:
+    let trngSampleWord = regRead(TrngData + uint(trngDataWordIndex * 4))
+    if trngSampleWord != 0'u32:
       nonZero = true
-    for byteIndex in 0 ..< 4:
-      outp[wordIndex * 4 + byteIndex] =
-        uint8((word shr (byteIndex * 8)) and 0xFF'u32)
+    for sampleByteIndex in 0 ..< 4:
+      randomBlockBytes[trngDataWordIndex * 4 + sampleByteIndex] =
+        uint8((trngSampleWord shr (sampleByteIndex * 8)) and 0xFF'u32)
 
   regWrite(TrngCtrl, (regRead(TrngCtrl) and not TrngTrigger) or TrngIntMask)
   regWrite(TrngCtrl, regRead(TrngCtrl) or TrngDataClear or TrngIntMask)
@@ -703,23 +705,23 @@ proc bleTrngReadBlock(dst: ptr uint8): bool =
   bleTrngDisable()
   nonZero
 
-proc bleFillRandomBytesUnlocked(dst: ptr uint8, len: int): bool =
-  if len < 0:
+proc bleFillRandomBytesUnlocked(randomOut: ptr uint8, byteCount: int): bool =
+  if byteCount < 0:
     return false
-  if len == 0:
+  if byteCount == 0:
     return true
-  if dst == nil:
+  if randomOut == nil:
     return false
   var releaseTrng = false
   if not bleRequestTrngGroup0(releaseTrng):
     return false
-  let outp = cast[ptr UncheckedArray[uint8]](dst)
+  let randomOutBytes = cast[ptr UncheckedArray[uint8]](randomOut)
   const
     BlockLen = 32
     MaxAttempts = 3
   var trngBlock: array[BlockLen, uint8]
-  var offset = 0
-  while offset < len:
+  var randomOutputByteOffset = 0
+  while randomOutputByteOffset < byteCount:
     var ok = false
     for attempt in 0 ..< MaxAttempts:
       discard attempt
@@ -730,21 +732,23 @@ proc bleFillRandomBytesUnlocked(dst: ptr uint8, len: int): bool =
       bleReleaseTrngGroup0(releaseTrng)
       return false
     var blockIndex = 0
-    while blockIndex < BlockLen and offset < len:
-      outp[offset] = trngBlock[blockIndex]
+    while blockIndex < BlockLen and randomOutputByteOffset < byteCount:
+      randomOutBytes[randomOutputByteOffset] = trngBlock[blockIndex]
       inc blockIndex
-      inc offset
+      inc randomOutputByteOffset
   bleReleaseTrngGroup0(releaseTrng)
   true
 
-proc bleFillRandomBytes(dst: ptr uint8, len: int): bool =
+proc bleFillRandomBytes(randomOut: ptr uint8, byteCount: int): bool =
   let status = disableInterrupts()
-  result = bleFillRandomBytesUnlocked(dst, len)
+  result = bleFillRandomBytesUnlocked(randomOut, byteCount)
   restoreInterrupts(status)
 
-proc bleReadLe32(src: ptr UncheckedArray[uint8], off: int): uint32 {.inline.} =
-  uint32(src[off]) or (uint32(src[off + 1]) shl 8) or
-    (uint32(src[off + 2]) shl 16) or (uint32(src[off + 3]) shl 24)
+proc bleReadLe32(sourceBytes: ptr UncheckedArray[uint8], byteOffset: int): uint32 {.inline.} =
+  uint32(sourceBytes[byteOffset]) or
+    (uint32(sourceBytes[byteOffset + 1]) shl 8) or
+    (uint32(sourceBytes[byteOffset + 2]) shl 16) or
+    (uint32(sourceBytes[byteOffset + 3]) shl 24)
 
 proc rwip_aes_encrypt*(input: ptr uint8, key: ptr uint8) {.exportc, cdecl.} =
   blecrypto.bleAesEncryptBlock(key, input, addr nim_aes_last_result[0])
@@ -756,11 +760,11 @@ proc rwip_aes_encrypt*(input: ptr uint8, key: ptr uint8) {.exportc, cdecl.} =
   restoreInterrupts(status)
 
   copyBytes(BTBLE_EM_BASE + 0x100'u32, key, 16)
-  let raw = cast[ptr UncheckedArray[uint8]](input)
-  regWrite((BLE_BASE + 0x0B4'u32).uint, bleReadLe32(raw, 0))
-  regWrite((BLE_BASE + 0x0B8'u32).uint, bleReadLe32(raw, 4))
-  regWrite((BLE_BASE + 0x0BC'u32).uint, bleReadLe32(raw, 8))
-  regWrite((BLE_BASE + 0x0C0'u32).uint, bleReadLe32(raw, 12))
+  let inputBlockBytes = cast[ptr UncheckedArray[uint8]](input)
+  regWrite((BLE_BASE + 0x0B4'u32).uint, bleReadLe32(inputBlockBytes, 0))
+  regWrite((BLE_BASE + 0x0B8'u32).uint, bleReadLe32(inputBlockBytes, 4))
+  regWrite((BLE_BASE + 0x0BC'u32).uint, bleReadLe32(inputBlockBytes, 8))
+  regWrite((BLE_BASE + 0x0C0'u32).uint, bleReadLe32(inputBlockBytes, 12))
   regWrite((BLE_BASE + 0x0C4'u32).uint, 64'u32)
   regWrite((BLE_BASE + BTBLE_INTACK_OFFSET).uint, BtbleIntAesDone)
   enableBtbleInterruptMaskBits(BtbleIntAesDone)
@@ -775,8 +779,8 @@ proc rwble_isr*() {.exportc, cdecl.} =
 
 when not (defined(bl808m0) and
     (bl808BleNimConnectionEnabled or bl808BleNimPureCentral)):
-  proc lld_rxdesc_check*(idx: uint8): pointer {.exportc, cdecl.} =
-    discard idx
+  proc lld_rxdesc_check*(requestedRxDescIndex: uint8): pointer {.exportc, cdecl.} =
+    discard requestedRxDescIndex
     nil
 
   proc lld_rxdesc_free*(desc: pointer) {.exportc, cdecl.} =
@@ -813,12 +817,6 @@ const
   LlcAuthPayloadNearlyOpMsgId = 0x010C'u16
   LlcAuthPayloadExpiredMsgId = 0x1102'u16
   LlcProcLePing = 8'u8
-  LlcEnvConnIntervalOff = 14
-  LlcEnvConnLatencyOff = 16
-  LlcEnvAuthPayloadToOff = 58
-  LlcEnvAuthPayloadRealToOff = 60
-  LlcEnvLinkFlagsOff = 128
-  LlcEnvLlcpStateOff = 130
   LlcEnvEncryptedFlag = 0x0020'u16
   LlcLlcpDisconnectedState = 3'u8
 
@@ -831,26 +829,14 @@ proc llcEnvFor(conhdl: uint16): ptr LlcConEnv {.inline.} =
   else:
     nil
 
-proc llcEnvRaw(env: ptr LlcConEnv): ptr UncheckedArray[uint8] {.inline.} =
-  cast[ptr UncheckedArray[uint8]](addr env.data[0])
-
-proc llcEnvRead16(env: ptr LlcConEnv, off: int): uint16 {.inline.} =
-  let raw = llcEnvRaw(env)
-  uint16(raw[off]) or (uint16(raw[off + 1]) shl 8)
-
-proc llcEnvWrite16(env: ptr LlcConEnv, off: int, value: uint16) {.inline.} =
-  let raw = llcEnvRaw(env)
-  raw[off] = uint8(value and 0x00FF'u16)
-  raw[off + 1] = uint8((value shr 8) and 0x00FF'u16)
-
 proc llcEnvConnectionOpen(env: ptr LlcConEnv): bool {.inline.} =
   env != nil and
-    ((llcEnvRaw(env)[LlcEnvLlcpStateOff] and 0x03'u8) !=
+    ((llcConnectionRuntime(env).llcpStateFlags and 0x03'u8) !=
       LlcLlcpDisconnectedState)
 
 proc llcEnvEncrypted(env: ptr LlcConEnv): bool {.inline.} =
   env != nil and
-    (llcEnvRead16(env, LlcEnvLinkFlagsOff) and LlcEnvEncryptedFlag) != 0'u16
+    (llcConnectionRuntime(env).linkFlags and LlcEnvEncryptedFlag) != 0'u16
 
 proc llm_le_features_get*(features: pointer) {.exportc, cdecl.} =
   if features != nil:
@@ -858,8 +844,9 @@ proc llm_le_features_get*(features: pointer) {.exportc, cdecl.} =
     discard c_memcpy(features, addr f, 8)
 
 proc llcAuthPayloadNearMargin(env: ptr LlcConEnv, timeout: uint16): uint16 =
-  let interval = uint32(llcEnvRead16(env, LlcEnvConnIntervalOff))
-  let latency = uint32(llcEnvRead16(env, LlcEnvConnLatencyOff))
+  let runtime = llcConnectionRuntime(env)
+  let interval = uint32(runtime.connInterval)
+  let latency = uint32(runtime.connLatency)
   let eventSpan = (latency + 1'u32) * interval
   if eventSpan == 0'u32:
     return 1'u16
@@ -882,12 +869,13 @@ proc llcArmAuthPayloadTimers(conhdl: uint16, env: ptr LlcConEnv) =
   if not llcEnvEncrypted(env):
     return
   let task = llcTaskId(conhdl)
+  let runtime = llcConnectionRuntime(env)
   btble_ke_timer_set(
     LlcAuthPayloadNearlyTimerId, task,
-    uint32(llcEnvRead16(env, LlcEnvAuthPayloadToOff)) * 2'u32)
+    uint32(runtime.authPayloadTimeout) * 2'u32)
   btble_ke_timer_set(
     LlcAuthPayloadRealTimerId, task,
-    uint32(llcEnvRead16(env, LlcEnvAuthPayloadRealToOff)) * 2'u32)
+    uint32(runtime.authPayloadRealTimeout) * 2'u32)
 
 proc llc_le_ping_set*(conhdl: uint16, timeout: uint16): uint8
     {.exportc, cdecl.} =
@@ -897,8 +885,9 @@ proc llc_le_ping_set*(conhdl: uint16, timeout: uint16): uint8
   let margin = llcAuthPayloadNearMargin(env, timeout)
   if timeout <= margin:
     return HciStatusUnsupportedFeatureParam
-  llcEnvWrite16(env, LlcEnvAuthPayloadRealToOff, timeout - margin)
-  llcEnvWrite16(env, LlcEnvAuthPayloadToOff, timeout)
+  let runtime = llcConnectionRuntime(env)
+  runtime.authPayloadRealTimeout = timeout - margin
+  runtime.authPayloadTimeout = timeout
   llcArmAuthPayloadTimers(conhdl, env)
   HciStatusSuccess
 
@@ -1017,13 +1006,13 @@ type LlcProcEnvView {.packed.} = object
   errCallback: pointer
   procId: uint8
   state: uint8
-  reserved06: uint8
+  statePadding: uint8
 
 static:
   doAssert offsetof(LlcProcEnvView, errCallback) == 0
   doAssert offsetof(LlcProcEnvView, procId) == 4
   doAssert offsetof(LlcProcEnvView, state) == 5
-  doAssert offsetof(LlcProcEnvView, reserved06) == 6
+  doAssert offsetof(LlcProcEnvView, statePadding) == 6
 
 var llc_proc_slots: array[LLC_CON_MAX, array[LlcProcSlotCount, pointer]]
 
@@ -1050,11 +1039,11 @@ proc llcProcSlot(conhdl: uint16, procId: uint8): ptr pointer =
 
 proc llc_proc_get*(conhdl: uint16, procId: uint8): pointer
     {.exportc, cdecl.} =
-  let slot = llcProcSlot(conhdl, procId)
-  if slot == nil:
+  let llcProcedureSlot = llcProcSlot(conhdl, procId)
+  if llcProcedureSlot == nil:
     nil
   else:
-    slot[]
+    llcProcedureSlot[]
 
 proc llc_proc_state_get*(procEnv: pointer): uint8
     {.exportc, cdecl.} =
@@ -1099,10 +1088,10 @@ proc aes_alloc*(size: uint32, continueCb: pointer, cb: pointer,
   if result == nil:
     return
   discard c_memset(result, 0, allocSize.csize_t)
-  let hdr = cast[ptr BleAesOpHeader](result)
-  hdr.continueCb = continueCb
-  hdr.resultCb = cb
-  hdr.ctx = ctx
+  let aesOp = cast[ptr BleAesOpHeader](result)
+  aesOp.continueCb = continueCb
+  aesOp.resultCb = cb
+  aesOp.ctx = ctx
 
 proc aes_rand*(cb: pointer, ctx: pointer) {.exportc, cdecl.} =
   if not bleFillRandomBytes(addr nim_aes_last_result[0], 8):
@@ -1124,19 +1113,19 @@ proc aes_shift_left_128*(dst: ptr uint8, src: ptr uint8) {.exportc, cdecl.} =
   if dst == nil or src == nil:
     return
   var carry = 0'u8
-  for i in countdown(15, 0):
-    let v = cast[ptr UncheckedArray[uint8]](src)[i]
-    cast[ptr UncheckedArray[uint8]](dst)[i] = (v shl 1) or carry
-    carry = (v shr 7) and 1
+  for blockByteIndex in countdown(15, 0):
+    let sourceByte = cast[ptr UncheckedArray[uint8]](src)[blockByteIndex]
+    cast[ptr UncheckedArray[uint8]](dst)[blockByteIndex] = (sourceByte shl 1) or carry
+    carry = (sourceByte shr 7) and 1
 
 proc aes_xor_128*(dst: ptr uint8, a: ptr uint8, b: ptr uint8)
     {.exportc, cdecl.} =
   if dst == nil or a == nil or b == nil:
     return
-  for i in 0 ..< 16:
-    cast[ptr UncheckedArray[uint8]](dst)[i] =
-      cast[ptr UncheckedArray[uint8]](a)[i] xor
-      cast[ptr UncheckedArray[uint8]](b)[i]
+  for blockByteIndex in 0 ..< 16:
+    cast[ptr UncheckedArray[uint8]](dst)[blockByteIndex] =
+      cast[ptr UncheckedArray[uint8]](a)[blockByteIndex] xor
+      cast[ptr UncheckedArray[uint8]](b)[blockByteIndex]
 
 proc bleAesValidBlockArgs(key: ptr uint8, value: ptr uint8): bool {.inline.} =
   key != nil and value != nil
@@ -1154,9 +1143,9 @@ proc aes_start*(op: pointer, key: ptr uint8, value: ptr uint8)
     else:
       discard c_memset(addr nim_aes_last_result[0], 0, 16)
     return
-  let hdr = cast[ptr BleAesOpHeader](op)
-  hdr.key = key
-  hdr.value = value
+  let aesOp = cast[ptr BleAesOpHeader](op)
+  aesOp.key = key
+  aesOp.value = value
   if ok:
     blecrypto.bleAesEncryptBlock(key, value, addr nim_aes_last_result[0])
   else:
@@ -1400,10 +1389,10 @@ proc flash_init*() {.exportc, cdecl.} =
 
 proc flash_identify*(pid: ptr uint8): int32 {.exportc, cdecl.} =
   if pid != nil:
-    let raw = cast[ptr UncheckedArray[uint8]](pid)
-    raw[0] = 0
-    raw[1] = 0
-    raw[2] = 0
+    let flashIdBytes = cast[ptr UncheckedArray[uint8]](pid)
+    flashIdBytes[0] = 0
+    flashIdBytes[1] = 0
+    flashIdBytes[2] = 0
   0
 
 proc flash_read*(address: uint32, data: ptr uint8, len: uint32): int32
@@ -1502,8 +1491,9 @@ proc sendLeRemoteFeaturesComplete(handle: uint16, status: uint8) =
   body.status = status
   body.handle = handle
   let features = nimBleCurrentRemoteFeatures()
-  for i in 0 ..< 8:
-    body.features[i] = nimBleFeatureByte(features, i)
+  for remoteFeatureByteIndex in 0 ..< 8:
+    body.features[remoteFeatureByteIndex] =
+      nimBleFeatureByte(features, remoteFeatureByteIndex)
   sendLeMetaPayload(addr evt[0], evt.len.uint8)
 
 proc sendLePhyUpdateComplete(handle: uint16, status: uint8, params: ptr uint8) =
@@ -1525,10 +1515,10 @@ proc sendLeEncryptComplete(opcode: uint16, params: ptr uint8,
   if params == nil or paramLen != 32'u8:
     rsp[0] = HciStatusInvalidParams
   else:
-    let raw = cast[ptr UncheckedArray[uint8]](params)
+    let encryptParams = cast[ptr UncheckedArray[uint8]](params)
     rsp[0] = HciStatusSuccess
-    blecrypto.bleAesEncryptBlock(cast[ptr uint8](addr raw[0]),
-                       cast[ptr uint8](addr raw[16]),
+    blecrypto.bleAesEncryptBlock(cast[ptr uint8](addr encryptParams[0]),
+                       cast[ptr uint8](addr encryptParams[16]),
                        addr rsp[1])
   sendCmdCompletePayload(opcode, addr rsp[0], rsp.len.uint8)
   rsp[0]
@@ -1572,8 +1562,9 @@ proc sendLeReadLocalSupportedFeaturesComplete(opcode: uint16,
     if paramLen == 0'u8: HciStatusSuccess else: HciStatusInvalidParams
   var rsp: array[9, uint8]
   rsp[0] = result
-  for i in 0 ..< 8:
-    rsp[i + 1] = nimBleFeatureByte(NimBleConservativeLeFeatures, i)
+  for localFeatureByteIndex in 0 ..< 8:
+    rsp[localFeatureByteIndex + 1] =
+      nimBleFeatureByte(NimBleConservativeLeFeatures, localFeatureByteIndex)
   sendCmdCompletePayload(opcode, addr rsp[0], rsp.len.uint8)
 
 proc sendLeReadLocalP256Complete(opcode: uint16, paramLen: uint8): uint8 =
@@ -1809,8 +1800,9 @@ proc hci_le_set_adv_set_rand_addr_cmd_handler*(params: ptr uint8,
   var status = 0x12'u8
   if params != nil:
     let req = hciLeSetAdvRandomAddrReq(params)
-    for i in 0 ..< nim_local_addr.len:
-      nim_local_addr[i] = req.randomAddress.data[i]
+    for localAddressByteIndex in 0 ..< nim_local_addr.len:
+      nim_local_addr[localAddressByteIndex] =
+        req.randomAddress.bytes[localAddressByteIndex]
     nim_local_addr_valid = true
     status = 0'u8
   sendCmdComplete(opcode, status)
@@ -1963,15 +1955,15 @@ proc lldAccessAddressValid(aa: uint32): bool =
   var run = 1
   var last = aa and 1'u32
   for bit in 1 ..< 32:
-    let cur = (aa shr bit) and 1'u32
-    if cur == last:
+    let accessAddressBit = (aa shr bit) and 1'u32
+    if accessAddressBit == last:
       inc run
       if run > 6:
         return false
     else:
       inc transitions
       run = 1
-      last = cur
+      last = accessAddressBit
   transitions >= 2
 
 proc lld_aa_gen*(outAddr: ptr uint8, seed: uint8) {.exportc, cdecl.} =
@@ -1991,27 +1983,28 @@ proc lld_aa_gen*(outAddr: ptr uint8, seed: uint8) {.exportc, cdecl.} =
     inc guard
   if not lldAccessAddressValid(aa):
     aa = 0xA77C2B91'u32 xor (uint32(seed) shl 8)
-  let raw = cast[ptr UncheckedArray[uint8]](outAddr)
-  raw[0] = uint8(aa and 0xFF)
-  raw[1] = uint8((aa shr 8) and 0xFF)
-  raw[2] = uint8((aa shr 16) and 0xFF)
-  raw[3] = uint8((aa shr 24) and 0xFF)
+  let accessAddressBytes = cast[ptr UncheckedArray[uint8]](outAddr)
+  accessAddressBytes[0] = uint8(aa and 0xFF)
+  accessAddressBytes[1] = uint8((aa shr 8) and 0xFF)
+  accessAddressBytes[2] = uint8((aa shr 16) and 0xFF)
+  accessAddressBytes[3] = uint8((aa shr 24) and 0xFF)
   when defined(bl808m0):
     nim_lld_aa_last = aa
 
 proc lld_ch_map_set*(chMap: ptr uint8) {.exportc, cdecl.} =
   var count: uint8 = 0
-  let raw =
+  let channelMapBytes =
     if chMap == nil:
       nil
     else:
       cast[ptr UncheckedArray[uint8]](chMap)
   for channel in 0 ..< 37:
     let enabled =
-      if raw == nil:
+      if channelMapBytes == nil:
         true
       else:
-        (raw[channel shr 3] and (1'u8 shl uint8(channel and 0x07))) != 0'u8
+        (channelMapBytes[channel shr 3] and
+          (1'u8 shl uint8(channel and 0x07))) != 0'u8
     if enabled:
       lld_env[17 + int(count)] = uint8(channel)
       inc count
@@ -2022,11 +2015,12 @@ proc lld_ch_map_set*(chMap: ptr uint8) {.exportc, cdecl.} =
   lld_env[54] = count
 
 proc lld_ch_idx_get*(): uint8 {.exportc, cdecl.} =
-  let count = lld_env[54]
-  if count == 0'u8:
+  let enabledChannelCount = lld_env[54]
+  if enabledChannelCount == 0'u8:
     return uint8(currentBtbleTime() mod 37'u32)
-  let idx = int(currentBtbleTime() mod uint32(count))
-  lld_env[17 + idx]
+  let enabledChannelMapIndex =
+    int(currentBtbleTime() mod uint32(enabledChannelCount))
+  lld_env[17 + enabledChannelMapIndex]
 
 proc lld_con_current_tx_power_get*(conhdl: uint16): int8 {.exportc, cdecl.} =
   discard conhdl
@@ -2181,13 +2175,13 @@ proc lld_white_list_add*(position: uint8, peerAddr: ptr BdAddr,
                          addrType: uint8): uint32 {.exportc, cdecl.} =
   if addrType == 0xFF'u8:
     return 0
-  let slot = llmWlNormalizeSlot(position)
-  if slot >= 0 and peerAddr != nil and
-      (llmWlSlotAvailable(slot) or
-       (llm_wl_type[slot] == addrType and
-        co_bdaddr_compare(addr llm_wl[slot], peerAddr))):
-    co_bdaddr_set(addr llm_wl[slot], peerAddr)
-    llm_wl_type[slot] = addrType
+  let whitelistPositionSlot = llmWlNormalizeSlot(position)
+  if whitelistPositionSlot >= 0 and peerAddr != nil and
+      (llmWlSlotAvailable(whitelistPositionSlot) or
+       (llm_wl_type[whitelistPositionSlot] == addrType and
+        co_bdaddr_compare(addr llm_wl[whitelistPositionSlot], peerAddr))):
+    co_bdaddr_set(addr llm_wl[whitelistPositionSlot], peerAddr)
+    llm_wl_type[whitelistPositionSlot] = addrType
   elif not llm_util_bl_add(peerAddr, addrType):
     return 1
   0
@@ -2196,10 +2190,12 @@ proc lld_white_list_rem*(position: uint8, peerAddr: ptr BdAddr,
                          addrType: uint8): uint32 {.exportc, cdecl.} =
   if addrType == 0xFF'u8:
     return 0
-  let slot = llmWlNormalizeSlot(position)
-  if slot >= 0 and llm_wl_type[slot] != 0xFF'u8:
-    discard c_memset(addr llm_wl[slot], 0, sizeof(BdAddr).csize_t)
-    llm_wl_type[slot] = 0xFF'u8
+  let whitelistPositionSlot = llmWlNormalizeSlot(position)
+  if whitelistPositionSlot >= 0 and
+      llm_wl_type[whitelistPositionSlot] != 0xFF'u8:
+    discard c_memset(addr llm_wl[whitelistPositionSlot], 0,
+                     sizeof(BdAddr).csize_t)
+    llm_wl_type[whitelistPositionSlot] = 0xFF'u8
   elif not llm_util_bl_rem(peerAddr, addrType):
     return 1
   0
@@ -2243,23 +2239,23 @@ var
   nim_ble_codjob_yield_event* {.exportc.}: uint32
 
 proc coDjobQueueIndex(eventId: uint8): int =
-  for i in 0 ..< CoDjobEventIds.len:
-    if CoDjobEventIds[i] == eventId:
-      return i
+  for codJobQueueIndex in 0 ..< CoDjobEventIds.len:
+    if CoDjobEventIds[codJobQueueIndex] == eventId:
+      return codJobQueueIndex
   if eventId < CoDjobQueueCount.uint8:
     int(eventId)
   else:
     -1
 
-proc coDjobEventId(index: int): uint8 =
-  if index >= 0 and index < CoDjobEventIds.len:
-    CoDjobEventIds[index]
+proc coDjobEventId(deferredJobQueueIndex: int): uint8 =
+  if deferredJobQueueIndex >= 0 and deferredJobQueueIndex < CoDjobEventIds.len:
+    CoDjobEventIds[deferredJobQueueIndex]
   else:
     0'u8
 
-proc coDjobPending(index: int): bool {.inline.} =
+proc coDjobPending(deferredJobQueueIndex: int): bool {.inline.} =
   let irq = disableInterrupts()
-  result = co_djob_queues[index].first != nil
+  result = co_djob_queues[deferredJobQueueIndex].first != nil
   restoreInterrupts(irq)
 
 proc coDjobAnyPending(): bool =
@@ -2271,47 +2267,51 @@ proc coDjobAnyPending(): bool =
   restoreInterrupts(irq)
 
 proc coDjobRun(eventId: uint8) {.cdecl.} =
-  let index = coDjobQueueIndex(eventId)
-  if index < 0:
+  let deferredJobQueueIndex = coDjobQueueIndex(eventId)
+  if deferredJobQueueIndex < 0:
     return
   var drained = 0'u32
   while drained < CoDjobDrainLimit:
     let irq = disableInterrupts()
-    let node = ble_co_list_pop_front(addr co_djob_queues[index])
+    let node = ble_co_list_pop_front(addr co_djob_queues[deferredJobQueueIndex])
     restoreInterrupts(irq)
     if node == nil:
       return
     let job = cast[ptr CoDjob](node)
-    let cb = job.cb
+    let deferredJobCallback = job.cb
     job.node.next = nil
-    if cb != nil:
-      cb()
+    if deferredJobCallback != nil:
+      deferredJobCallback()
     inc drained
 
-  if coDjobPending(index):
+  if coDjobPending(deferredJobQueueIndex):
     inc nim_ble_codjob_yield_count
     nim_ble_codjob_yield_event = eventId.uint32
-    ble_ke_event_set(coDjobEventId(index))
+    ble_ke_event_set(coDjobEventId(deferredJobQueueIndex))
 
-proc coDjobRegister(index: int, job: ptr CoDjob) =
-  if index < 0 or index >= CoDjobQueueCount or job == nil:
+proc coDjobRegister(deferredJobQueueIndex: int, job: ptr CoDjob) =
+  if deferredJobQueueIndex < 0 or
+      deferredJobQueueIndex >= CoDjobQueueCount or job == nil:
     return
   let irq = disableInterrupts()
-  if not ble_co_list_find(addr co_djob_queues[index], addr job.node):
-    let wasEmpty = co_djob_queues[index].first == nil
-    ble_co_list_push_back(addr co_djob_queues[index], addr job.node)
+  if not ble_co_list_find(addr co_djob_queues[deferredJobQueueIndex],
+                          addr job.node):
+    let wasEmpty = co_djob_queues[deferredJobQueueIndex].first == nil
+    ble_co_list_push_back(addr co_djob_queues[deferredJobQueueIndex],
+                          addr job.node)
     restoreInterrupts(irq)
     if wasEmpty:
-      ble_ke_event_set(coDjobEventId(index))
+      ble_ke_event_set(coDjobEventId(deferredJobQueueIndex))
   else:
     restoreInterrupts(irq)
 
-proc coDjobUnregister(index: int, job: ptr CoDjob) =
+proc coDjobUnregister(deferredJobQueueIndex: int, job: ptr CoDjob) =
   if job == nil:
     return
   let irq = disableInterrupts()
-  if index >= 0 and index < CoDjobQueueCount:
-    ble_co_list_extract(addr co_djob_queues[index], addr job.node)
+  if deferredJobQueueIndex >= 0 and deferredJobQueueIndex < CoDjobQueueCount:
+    ble_co_list_extract(addr co_djob_queues[deferredJobQueueIndex],
+                        addr job.node)
   else:
     for queue in mitems(co_djob_queues):
       ble_co_list_extract(addr queue, addr job.node)
@@ -2368,7 +2368,7 @@ proc llc_proc_init*(procEnv: pointer, procId: uint8, cb: pointer)
   env.errCallback = cb
   env.procId = procId
   env.state = 0
-  env.reserved06 = 0
+  env.statePadding = 0
 
 proc Add2SelfBigHex256*(dst, other: pointer) {.exportc, cdecl.} =
   bleBigHexAddSelf(dst, other)
@@ -2419,9 +2419,9 @@ proc SubtractFromSelfBigHexSign256*(dst, other: pointer) {.exportc, cdecl.} =
 proc co_djob_initialize*(initType: uint8) {.exportc, cdecl.} =
   case initType
   of 1'u8:
-    for i in 0 ..< CoDjobQueueCount:
-      ble_ke_event_callback_set(CoDjobEventIds[i], coDjobRun)
-      ble_co_list_init(addr co_djob_queues[i])
+    for codJobQueueIndex in 0 ..< CoDjobQueueCount:
+      ble_ke_event_callback_set(CoDjobEventIds[codJobQueueIndex], coDjobRun)
+      ble_co_list_init(addr co_djob_queues[codJobQueueIndex])
   of 2'u8, 3'u8:
     for queue in mitems(co_djob_queues):
       ble_co_list_init(addr queue)
@@ -2618,17 +2618,17 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled and
     discard procEnv
     if pdu == nil:
       return 0
-    let raw = cast[ptr UncheckedArray[uint8]](pdu)
-    let len = nimLlcpWireLength(raw[0])
+    let llcpPduBytes = cast[ptr UncheckedArray[uint8]](pdu)
+    let len = nimLlcpWireLength(llcpPduBytes[0])
     if len != 0'u8:
-      discard nimLlcpQueuePdu(conhdl, raw, len)
+      discard nimLlcpQueuePdu(conhdl, llcpPduBytes, len)
     0
 
   proc llc_llcp_state_set*(conhdl: uint16, stateKind: uint8,
                            state: uint8): uint32 {.exportc, cdecl.} =
     if conhdl < LLC_CON_MAX.uint16 and llc_env[conhdl] != nil:
-      let env = llc_env[conhdl]
-      var flags = env.data[130]
+      let runtime = llcConnectionRuntime(llc_env[conhdl])
+      var flags = runtime.llcpStateFlags
       let bits = state and 0x03'u8
       case stateKind
       of 0'u8:
@@ -2639,7 +2639,7 @@ when defined(bl808m0) and bl808BleNimConnectionEnabled and
         flags = (flags and 0xF0'u8) or bits or uint8(bits shl 2)
       else:
         discard
-      env.data[130] = flags
+      runtime.llcpStateFlags = flags
     0
 else:
   abiNoopHandler(llc_ll_reject_ind_pdu_send)
@@ -2751,9 +2751,9 @@ proc llc_proc_err_ind*(conhdl: uint16, procId: uint8, status: uint8,
                        param: pointer): uint32 {.exportc, cdecl.} =
   let procEnv = llc_proc_get(conhdl, procId)
   if procEnv != nil:
-    let cb = llcProcEnv(procEnv).errCallback
-    if cb != nil:
-      cast[LlcProcErrCallback](cb)(conhdl, status, param)
+    let llcProcedureErrorCallback = llcProcEnv(procEnv).errCallback
+    if llcProcedureErrorCallback != nil:
+      cast[LlcProcErrCallback](llcProcedureErrorCallback)(conhdl, status, param)
   0
 
 proc llc_proc_id_get*(conhdl: uint16, procId: uint8): uint8
@@ -2776,9 +2776,9 @@ proc llc_proc_id_set*(conhdl: uint16, procId: uint8,
 
 proc llc_proc_reg*(conhdl: uint16, procId: uint8,
                    procEnv: pointer): uint32 {.exportc, cdecl.} =
-  let slot = llcProcSlot(conhdl, procId)
-  if slot != nil:
-    slot[] = procEnv
+  let llcProcedureSlot = llcProcSlot(conhdl, procId)
+  if llcProcedureSlot != nil:
+    llcProcedureSlot[] = procEnv
     if procEnv != nil:
       llcProcEnv(procEnv).procId = procId
     llcProcUpdateTaskState(conhdl, procId, procEnv != nil)
@@ -2828,31 +2828,31 @@ else:
 
 proc updateNimLegacyAdvPayload(data: pointer, length: uint16,
                                emOffset: uint16, scanRsp: bool) =
-  let n = min(length.int, 31)
+  let advPayloadCopyLen = min(length.int, 31)
   let source = cast[uint](data)
   let sourceIsRam = data != nil and source >= 0x20000000'u and source < 0x30000000'u
   let sourceIsBtbleEm =
     data != nil and source >= BTBLE_EM_BASE.uint and
     source < (BTBLE_EM_BASE + 0x8000'u32).uint
-  let raw = cast[ptr UncheckedArray[uint8]](data)
+  let advPayloadBytes = cast[ptr UncheckedArray[uint8]](data)
   if scanRsp:
-    nim_scan_rsp_data_len = n.uint8
+    nim_scan_rsp_data_len = advPayloadCopyLen.uint8
   else:
-    nim_adv_data_len = n.uint8
-  for i in 0 ..< n:
-    let b =
+    nim_adv_data_len = advPayloadCopyLen.uint8
+  for payloadOffset in 0 ..< advPayloadCopyLen:
+    let advertisingPayloadByte =
       if sourceIsRam:
-        raw[i]
+        advPayloadBytes[payloadOffset]
       elif sourceIsBtbleEm:
-        read8(uint32(source) + i.uint32)
+        read8(uint32(source) + payloadOffset.uint32)
       elif emOffset != 0'u16:
-        read8(BTBLE_EM_BASE + emOffset.uint32 + i.uint32)
+        read8(BTBLE_EM_BASE + emOffset.uint32 + payloadOffset.uint32)
       else:
         0'u8
     if scanRsp:
-      nim_scan_rsp_data[i] = b
+      nim_scan_rsp_data[payloadOffset] = advertisingPayloadByte
     else:
-      nim_adv_data[i] = b
+      nim_adv_data[payloadOffset] = advertisingPayloadByte
   if nim_adv_enabled:
     programBtbleLegacyAdv(nim_adv_data_len)
 

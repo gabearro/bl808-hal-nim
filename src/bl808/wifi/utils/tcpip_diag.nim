@@ -24,17 +24,18 @@ proc noteTcpipNoPbuf(stage, status, flags, msduOffset: uint32;
     ((if usedMpduInput: 1'u32 else: 0'u32) shl 16) or
     (if pkt == nil: 0'u32 else: loadU16(pkt, WifiPktLenOff).uint32 shl 17)
   nimFwDbgTcpipInputNoPbufPkt = cast[uint](pkt).uint32
-  for i in 0 ..< nimFwDbgTcpipInputNoPbufRaw.len:
-    nimFwDbgTcpipInputNoPbufRaw[i] = 0
+  for noPbufRawByteIndex in 0 ..< nimFwDbgTcpipInputNoPbufRaw.len:
+    nimFwDbgTcpipInputNoPbufRaw[noPbufRawByteIndex] = 0
   if pkt != nil and loadU16(pkt, WifiPktLenOff) != 0'u16:
-    let raw = cast[pointer](loadU32(pkt, WifiPktPktOff).uint)
-    let limit =
+    let uploadFrameData = cast[pointer](loadU32(pkt, WifiPktPktOff).uint)
+    let noPbufRawCopyLimit =
       if loadU16(pkt, WifiPktLenOff).int < nimFwDbgTcpipInputNoPbufRaw.len:
         loadU16(pkt, WifiPktLenOff).int
       else:
         nimFwDbgTcpipInputNoPbufRaw.len
-    for i in 0 ..< limit:
-      nimFwDbgTcpipInputNoPbufRaw[i] = loadU8(raw, i.uint)
+    for noPbufRawByteIndex in 0 ..< noPbufRawCopyLimit:
+      nimFwDbgTcpipInputNoPbufRaw[noPbufRawByteIndex] =
+        loadU8(uploadFrameData, noPbufRawByteIndex.uint)
 
 proc wifi_nimfw_tcpip_input_calls*(): uint32 {.exportc, cdecl.} =
   nimFwDbgTcpipInputCalls

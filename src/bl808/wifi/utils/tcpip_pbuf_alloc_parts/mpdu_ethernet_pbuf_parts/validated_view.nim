@@ -55,8 +55,9 @@ proc loadMpduEthernetView(msduOffset: uint32; pkt: pointer;
   let firstPayloadLen = firstLen - payloadStart
   view.firstPayloadLen = firstPayloadLen
   var totalLen = 14'u32 + firstPayloadLen
-  for i in 1 ..< WifiPktFragCount:
-    let fragLen = loadU16(pkt, WifiPktLenOff + uint(i * 2)).uint32
+  for wifiPacketFragmentIndex in 1 ..< WifiPktFragCount:
+    let fragLen =
+      loadU16(pkt, WifiPktLenOff + uint(wifiPacketFragmentIndex * 2)).uint32
     if fragLen == 0:
       break
     totalLen += fragLen

@@ -652,6 +652,10 @@ const
   PicoCpuReset    = 1'u32 shl 3       # LP CPU reset in GLB_SWRST_CFG2
   PicoClkEn       = 1'u32 shl 28      # LP clock enable in PDS_CPU_CORE_CFG0
   PdsCpuCoreCfg0Addr = PdsBase + 0x110'u
+  PdsCpuCoreCfg7Addr = PdsBase + 0x12C'u  # LP clock divider (PICO_DIV [7:0])
+  PicoDivMask        = 0xFF'u32           # PDS_REG_PICO_DIV
+  PicoClkDivActPulse = 1'u32 shl 16       # GLB_SYS_CFG1: activate the pico div
+  PicoClkProtDone    = 1'u32 shl 18       # GLB_SYS_CFG1: pico div applied
   PdsCpuCoreCfg13Addr = PdsBase + 0x144'u # LP boot address register
   SfCtrlImageOffset0 = SfCtrlBase + 0x0A0'u # Physical flash offset mapped at FlashXipBase
   SfCtrlImageOffsetMask = 0x0FFF_FFFF'u32
@@ -735,21 +739,43 @@ proc releaseD0*(forceLoad: bool = true) =
   regClear(MmSwSysReset, MmCpu0Reset)   # deassert reset
   core.fenceIo()
 
-proc releaseLP*() =
-  ## Release LP (E902) from reset and enable its clock.
+proc releaseLPAt*(bootAddr: uint) =
+  ## Release LP (E902) from reset with an explicit boot address — e.g. a WRAM
+  ## address that M0 has populated with a verified LP image (secure handoff).
   regSet(GlbSwrstCfg2Addr, PicoCpuReset)    # hold reset while retargeting PC
   core.fenceIo()
-  when defined(bl808jtagram):
-    regWrite(PdsCpuCoreCfg13Addr, JtagLPEntryAddr.uint32)
-  else:
-    regWrite(PdsCpuCoreCfg13Addr, (FlashXipBase + Ox64LPBootOffset).uint32)
+  regWrite(PdsCpuCoreCfg13Addr, bootAddr.uint32)
   core.fenceIo()
   pdsConfigureLpMtimerClock()
   core.fenceIo()
+  # Activate the pico (LP) CPU clock divider: PICO_DIV=0 (/1) + act pulse +
+  # prot-done handshake. Enabling the clock GATE (PicoClkEn) alone leaves the
+  # E902 with no running clock, so it never fetches — this is the bring-up step
+  # the SDK does in GLB_Set_MCU_System_CLK_Div that we were missing.
+  regClear(PdsCpuCoreCfg7Addr, PicoDivMask)
+  core.fenceIo()
+  regSet(GlbSysCfg1, PicoClkDivActPulse)
+  block:
+    var timeout = 4096
+    while timeout > 0 and (regRead(GlbSysCfg1) and PicoClkProtDone) == 0:
+      dec timeout
+  core.fenceIo()
   regSet(PdsCpuCoreCfg0Addr, PicoClkEn)     # enable clock
   core.fenceIo()
+  core.delayUs(10)                          # let the LP clock stabilize before
+                                            # releasing reset (SDK GLB_Release_CPU
+                                            # delays here; without it the E902
+                                            # comes out of reset on an unsettled
+                                            # clock and never starts fetching)
   regClear(GlbSwrstCfg2Addr, PicoCpuReset)  # deassert reset
   core.fenceIo()
+
+proc releaseLP*() =
+  ## Release LP (E902) from reset and enable its clock.
+  when defined(bl808jtagram):
+    releaseLPAt(JtagLPEntryAddr)
+  else:
+    releaseLPAt(FlashXipBase + Ox64LPBootOffset)
 
 # =============================================================================
 # System level clock gating (CGEN_CFG0, CGEN_CFG2)
