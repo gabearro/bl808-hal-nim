@@ -101,24 +101,24 @@ proc coex_wifi_pti_forece_enable*(enable: bool) {.exportc, cdecl.} =
   ##   Reads MACHW_BASE+0x400, masks with 0xFBFFFFFF (clear bit 26),
   ##   shifts and ORs based on enable flag, writes back.
   if enable:
-    var val = wlanCoexControl()
+    var coexControl = wlanCoexControl()
     # Clear bits [27:24], set to 0xF (max priority)
-    val = val and 0x0FFFFFFF'u32
-    val = val or 0xF0000000'u32
+    coexControl = coexControl and 0x0FFFFFFF'u32
+    coexControl = coexControl or 0xF0000000'u32
     # Set bit 4 (force enable)
-    val = val or 0x10'u32
-    wlanCoexWriteControl(val)
+    coexControl = coexControl or 0x10'u32
+    wlanCoexWriteControl(coexControl)
     # Re-read and set additional enable bits
-    val = wlanCoexControl()
-    val = val or 0x10'u32
-    wlanCoexWriteControl(val)
+    coexControl = wlanCoexControl()
+    coexControl = coexControl or 0x10'u32
+    wlanCoexWriteControl(coexControl)
   # Common: update auto-control bits
-  var val = wlanCoexControl()
-  val = val and 0xFBFFFFFF'u32  # clear bit 26
+  var coexControl = wlanCoexControl()
+  coexControl = coexControl and 0xFBFFFFFF'u32  # clear bit 26
   if not enable:
     # Clearing: restore auto-control
-    val = val and (not 0x10'u32)  # clear force bit
-  wlanCoexWriteControl(val)
+    coexControl = coexControl and (not 0x10'u32)  # clear force bit
+  wlanCoexWriteControl(coexControl)
 
 proc coex_wifi_pta_forece_enable*(enable: bool) {.exportc, cdecl.} =
   ## Force enable/disable WiFi PTA (Packet Traffic Arbitration).
@@ -227,19 +227,19 @@ proc intc_enable_irq*(irqNum: uint32) {.exportc, cdecl, noinline.} =
   ## into the WiFi platform interrupt enable registers at 0x24910010/14/...
   ## The parent CPU interrupt is enabled by the host support glue.
   let bank = irqNum shr 5
-  let bit = 1'u32 shl (irqNum and 31'u32)
-  regWrite(0x24910010'u + bank.uint * 4'u, bit)
+  let sourceEnableBit = 1'u32 shl (irqNum and 31'u32)
+  regWrite(0x24910010'u + bank.uint * 4'u, sourceEnableBit)
 
 proc intc_handlers_init() =
   ## Populate the MAC platform IRQ dispatch table from the vendor
   ## .rodata.intc_irq_handlers layout.
-  for i in 0 ..< intc_handler_tab.len:
-    intc_handler_tab[i] = nil
+  for irqHandlerSlotIndex in 0 ..< intc_handler_tab.len:
+    intc_handler_tab[irqHandlerSlotIndex] = nil
 
   intc_handler_tab[10] = cast[pointer](phy_mdm_isr)
   intc_handler_tab[11] = cast[pointer](phy_rc_isr)
-  for i in 24 .. 39:
-    intc_handler_tab[i] = cast[pointer](intc_spurious)
+  for spuriousIrqSlotIndex in 24 .. 39:
+    intc_handler_tab[spuriousIrqSlotIndex] = cast[pointer](intc_spurious)
   intc_handler_tab[50] = cast[pointer](rxl_timer_int_handler)
   intc_handler_tab[51] = cast[pointer](intc_spurious)
   intc_handler_tab[52] = cast[pointer](rxl_timer_int_handler)
@@ -309,4 +309,3 @@ proc sysctrl_init*() {.exportc, cdecl.} =
 # ###########################################################################
 # These are the ke_msg handler functions referenced by task descriptor tables.
 # They receive a message pointer (param) containing the message payload.
-

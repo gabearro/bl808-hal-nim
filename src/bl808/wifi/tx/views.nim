@@ -1,60 +1,60 @@
-proc zero(p: pointer; n: uint) {.inline.} =
-  discard c_memset(p, 0, n.csize_t)
+proc zero(memory: pointer; byteCount: uint) {.inline.} =
+  discard c_memset(memory, 0, byteCount.csize_t)
 
-proc copyMem(dest, src: pointer; n: uint) {.inline.} =
-  if dest != nil and src != nil and n != 0:
-    discard c_memcpy(dest, src, n.csize_t)
+proc copyMem(dest, src: pointer; byteCount: uint) {.inline.} =
+  if dest != nil and src != nil and byteCount != 0:
+    discard c_memcpy(dest, src, byteCount.csize_t)
 
-template pbufView(p: pointer): ptr PbufView =
-  cast[ptr PbufView](p)
+template pbufView(packet: pointer): ptr PbufView =
+  cast[ptr PbufView](packet)
 
-template ethernetHeaderAt(p: pointer): ptr EthernetHeaderView =
-  cast[ptr EthernetHeaderView](p)
+template ethernetHeaderAt(packet: pointer): ptr EthernetHeaderView =
+  cast[ptr EthernetHeaderView](packet)
 
-template hostTxDescAt(p: pointer): ptr HostTxDescView =
-  cast[ptr HostTxDescView](p)
+template hostTxDescAt(txDescriptor: pointer): ptr HostTxDescView =
+  cast[ptr HostTxDescView](txDescriptor)
 
-template coListAt(p: pointer): ptr CoListView =
-  cast[ptr CoListView](p)
+template coListAt(listStorage: pointer): ptr CoListView =
+  cast[ptr CoListView](listStorage)
 
 template hwView(): ptr BlHwView =
   cast[ptr BlHwView](addr wifi_hw)
 
-template vifView(p: pointer): ptr BlVifView =
-  cast[ptr BlVifView](p)
+template vifView(vifEntry: pointer): ptr BlVifView =
+  cast[ptr BlVifView](vifEntry)
 
-template staView(p: pointer): ptr BlStaView =
-  cast[ptr BlStaView](p)
+template staView(stationEntry: pointer): ptr BlStaView =
+  cast[ptr BlStaView](stationEntry)
 
-template keTxFcView(p: pointer): ptr KeTxFcView =
-  cast[ptr KeTxFcView](p)
+template keTxFcView(flowControlEntry: pointer): ptr KeTxFcView =
+  cast[ptr KeTxFcView](flowControlEntry)
 
-template txHdrView(p: pointer): ptr TxHdrView =
-  cast[ptr TxHdrView](p)
+template txHdrView(txHeader: pointer): ptr TxHdrView =
+  cast[ptr TxHdrView](txHeader)
 
-template txbufView(p: pointer): ptr TxbufView =
-  cast[ptr TxbufView](p)
+template txbufView(txBuffer: pointer): ptr TxbufView =
+  cast[ptr TxbufView](txBuffer)
 
-template txdescHostView(p: pointer): ptr TxdescHostView =
-  cast[ptr TxdescHostView](p)
+template txdescHostView(txDescriptor: pointer): ptr TxdescHostView =
+  cast[ptr TxdescHostView](txDescriptor)
 
 template ipv4HeaderAt(eth: ptr EthernetHeaderView): ptr Ipv4HeaderView =
   cast[ptr Ipv4HeaderView](addr eth.payload[0])
 
-template byteView(p: pointer): ptr UncheckedArray[uint8] =
-  cast[ptr UncheckedArray[uint8]](p)
+template byteView(memory: pointer): ptr UncheckedArray[uint8] =
+  cast[ptr UncheckedArray[uint8]](memory)
 
-proc bufferAt(base: pointer; off: uint): pointer {.inline.} =
-  cast[pointer](addr byteView(base)[off])
+proc bufferAt(base: pointer; byteOffset: uint): pointer {.inline.} =
+  cast[pointer](addr byteView(base)[byteOffset])
 
-proc txbufHostBuf(p: pointer): pointer {.inline.} =
-  cast[pointer](addr txbufView(p).hostBuf[0])
+proc txbufHostBuf(txBuffer: pointer): pointer {.inline.} =
+  cast[pointer](addr txbufView(txBuffer).hostBuf[0])
 
-proc txdescHostPad(p: pointer): pointer {.inline.} =
-  cast[pointer](addr txdescHostView(p).pad[0])
+proc txdescHostPad(txDescriptor: pointer): pointer {.inline.} =
+  cast[pointer](addr txdescHostView(txDescriptor).hostDescPadding[0])
 
-proc txdescUpperHost(p: pointer): ptr HostTxDescView {.inline.} =
-  addr txdescHostView(p).upperHost
+proc txdescUpperHost(txDescriptor: pointer): ptr HostTxDescView {.inline.} =
+  addr txdescHostView(txDescriptor).upperHost
 
 proc udpHeaderAt(ip: ptr Ipv4HeaderView): ptr UdpHeaderView {.inline.} =
   let ihlWords = ip.versionIhl and 0x0f'u8

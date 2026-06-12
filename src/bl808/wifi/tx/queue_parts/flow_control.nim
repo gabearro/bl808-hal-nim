@@ -1,11 +1,11 @@
-proc bitSta(idx: uint8): uint32 {.inline.} =
-  1'u32 shl idx
+proc bitSta(stationIndex: uint8): uint32 {.inline.} =
+  1'u32 shl stationIndex
 
-proc bitSta(idx: int): uint32 {.inline.} =
-  1'u32 shl idx
+proc bitSta(stationIndex: int): uint32 {.inline.} =
+  1'u32 shl stationIndex
 
-proc bitVif(idx: int): uint8 {.inline.} =
-  1'u8 shl idx
+proc bitVif(vifRoleIndex: int): uint8 {.inline.} =
+  1'u8 shl vifRoleIndex
 
 proc isBcMc(firstByte: uint8): bool {.inline.} =
   (firstByte and 1'u8) != 0'u8
@@ -15,9 +15,9 @@ proc txCntrlCheckFc(sta: pointer): bool =
 
 proc txCntrlUpdateFc(txFcField: pointer): uint32 =
   let fc = keTxFcView(txFcField)
-  for i in 0 ..< 2:
-    if (fc.vifBits and bitVif(i)) != 0'u8:
-      if i == BlVifSta:
+  for vifRoleIndex in 0 ..< 2:
+    if (fc.vifBits and bitVif(vifRoleIndex)) != 0'u8:
+      if vifRoleIndex == BlVifSta:
         let vif = vifView(vifAt(BlVifSta))
         let fixedStaIdx = vif.fixedStaIdx
         if fc.staFcChan != 0'u8:

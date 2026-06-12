@@ -22,7 +22,7 @@ proc tcpip_stack_input*(swdesc: pointer; status: uint32; hwhdr: pointer;
       return -1
 
     let usedMpduInput = (flags and RxFlagIs80211Mpdu) != 0'u32 and msduOffset == 0'u32
-    var p =
+    var inputPbuf =
       if usedMpduInput:
         allocMpduEthernetPbuf(msduOffset, pkt)
       else:
@@ -32,28 +32,28 @@ proc tcpip_stack_input*(swdesc: pointer; status: uint32; hwhdr: pointer;
         let resolvedOffset = ethernetOffsetForUpload(pkt, ethOffset)
         nimFwDbgTcpipInputFrameLast0 = resolvedOffset or (msduOffset shl 16)
         allocFramePbuf(resolvedOffset, pkt)
-    if p == nil:
+    if inputPbuf == nil:
       noteTcpipNoPbuf(1'u32, status, flags, msduOffset, usedMpduInput, pkt)
       return -1
     if (extraStatus and BlRxStatusAmsdu) != 0'u32:
-      p.flags = p.flags or PbufFlagAmsdu
+      inputPbuf.flags = inputPbuf.flags or PbufFlagAmsdu
 
-    if not noteEthernetInput(p) and
+    if not noteEthernetInput(inputPbuf) and
         not usedMpduInput and pkt != nil:
-      discard pbuf_free(p)
+      discard pbuf_free(inputPbuf)
       let mpduOffset =
         if msduOffset >= 4'u32: msduOffset - 4'u32
         else: 0'u32
-      p = allocMpduEthernetPbuf(mpduOffset, pkt)
-      if p == nil and mpduOffset != 0'u32:
-        p = allocMpduEthernetPbuf(0'u32, pkt)
-      if p == nil:
+      inputPbuf = allocMpduEthernetPbuf(mpduOffset, pkt)
+      if inputPbuf == nil and mpduOffset != 0'u32:
+        inputPbuf = allocMpduEthernetPbuf(0'u32, pkt)
+      if inputPbuf == nil:
         noteTcpipNoPbuf(2'u32, status, flags, mpduOffset, true, pkt)
         return -1
-      discard noteEthernetInput(p)
-    if bl808_nim_netif_input_call(p, netif) != 0'i8:
+      discard noteEthernetInput(inputPbuf)
+    if bl808_nim_netif_input_call(inputPbuf, netif) != 0'i8:
       inc nimFwDbgTcpipInputFail
-      discard pbuf_free(p)
+      discard pbuf_free(inputPbuf)
       return -1
     else:
       inc nimFwDbgTcpipInputOk

@@ -1,33 +1,35 @@
-proc bl_tx_cfm*(pthis, hostId: pointer): cint {.exportc, cdecl.} =
+proc bl_tx_cfm*(callbackContext, hostTxBuffer: pointer): cint {.exportc, cdecl.} =
   {.emit: "{ extern volatile unsigned int nimfw_dbg_bl_tx_cfm; nimfw_dbg_bl_tx_cfm++; }".}
-  discard pthis
-  let buf = txbufHostBuf(hostId)
-  let txhdr = bufferAt(buf, alignPads(buf).uint)
-  let eth = bufferAt(buf, PbufLinkEncapsulationHlen.uint)
-  let ethHdr = ethernetHeaderAt(eth)
-  let ethTypeBytes = ethHdr.ethertype
-  if ethTypeBytes == 0x8e88'u16 or ethTypeBytes == 0x888e'u16:
+  discard callbackContext
+  let txPayloadStorage = txbufHostBuf(hostTxBuffer)
+  let txHeaderPtr = bufferAt(txPayloadStorage, alignPads(txPayloadStorage).uint)
+  let ethernetFramePtr = bufferAt(txPayloadStorage, PbufLinkEncapsulationHlen.uint)
+  let ethernetHeader = ethernetHeaderAt(ethernetFramePtr)
+  let etherType = ethernetHeader.ethertype
+  if etherType == 0x8e88'u16 or etherType == 0x888e'u16:
     {.emit: "{ extern volatile unsigned int nimfw_dbg_bl_tx_cfm_eapol; nimfw_dbg_bl_tx_cfm_eapol++; }".}
-  let value = txHdrView(txhdr).status
-  if value == 0'u32:
+  let txStatusWord = txHdrView(txHeaderPtr).status
+  if txStatusWord == 0'u32:
     bl_os_printf("[TX] FW return status is NULL!!!\n\r")
 
-  let ret = txCheckRet(txHdrVifType(txhdr), if isBcMc(ethHdr.dst[0]): 1'u8 else: 0'u8, value)
-  logDhcpTxConfirm(ethHdr, txhdr, ret, value)
+  let txConfirmResult = txCheckRet(
+    txHdrVifType(txHeaderPtr), if isBcMc(ethernetHeader.dst[0]): 1'u8 else: 0'u8, txStatusWord)
+  logDhcpTxConfirm(ethernetHeader, txHeaderPtr, txConfirmResult, txStatusWord)
 
-  let sta = staAt(txHdrStaId(txhdr).int)
-  let staO = staView(sta)
-  let linksNum = vifView(staVif(sta)).linksNum
-  if repushTxConfirmIfNeeded(txhdr, sta, staO, linksNum, ret, value):
+  let station = staAt(txHdrStaId(txHeaderPtr).int)
+  let stationState = staView(station)
+  let stationLinkCount = vifView(staVif(station)).linksNum
+  if repushTxConfirmIfNeeded(txHeaderPtr, station, stationState, stationLinkCount, txConfirmResult, txStatusWord):
     return 0
 
-  let cb = cast[TxCallback](txHdrView(txhdr).cfmCb)
-  let cbArg = txHdrView(txhdr).cfmArg
-  logEapolTxConfirm(ethHdr, txhdr, cb, ethTypeBytes, ret, value)
-  if cb != nil:
+  let txConfirmCallback = cast[TxCallback](txHdrView(txHeaderPtr).cfmCb)
+  let txConfirmCallbackArg = txHdrView(txHeaderPtr).cfmArg
+  logEapolTxConfirm(
+    ethernetHeader, txHeaderPtr, txConfirmCallback, etherType, txConfirmResult, txStatusWord)
+  if txConfirmCallback != nil:
     {.emit: "{ extern volatile unsigned int nimfw_dbg_bl_tx_cfm_cb; nimfw_dbg_bl_tx_cfm_cb++; }".}
-  ipc_host_txbuf_free(hostId)
-  txCntrlStaTriggerPending = txCntrlStaTriggerPending or bitSta(staO.staIdx)
-  if cb != nil:
-    cb(cbArg, ret > 0)
-  ret.cint
+  ipc_host_txbuf_free(hostTxBuffer)
+  txCntrlStaTriggerPending = txCntrlStaTriggerPending or bitSta(stationState.staIdx)
+  if txConfirmCallback != nil:
+    txConfirmCallback(txConfirmCallbackArg, txConfirmResult > 0)
+  txConfirmResult.cint

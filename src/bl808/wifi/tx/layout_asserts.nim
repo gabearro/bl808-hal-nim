@@ -11,10 +11,13 @@ static:
   doAssert sizeof(UdpHeaderView) == 8
   doAssert offsetof(UdpHeaderView, dstPort) == 2
   doAssert sizeof(CoListView) == 8
+  doAssert offsetof(BlVifView, netifDev) == int(BlVifDevOff)
+  doAssert offsetof(BlVifView, isUp) == int(BlVifUpOff)
   doAssert offsetof(BlVifView, vifIdx) == int(BlVifVifIdxOff)
   doAssert offsetof(BlVifView, linksNum) == int(BlVifLinksNumOff)
   doAssert offsetof(BlVifView, fixedStaIdx) == int(BlVifFixedStaIdxOff)
   doAssert offsetof(BlVifView, fcChan) == int(BlVifFcChanOff)
+  doAssert offsetof(BlVifView, staPsMode) == int(BlVifStaPsOff)
   doAssert offsetof(BlStaView, waitingList) == int(BlStaWaitingListOff)
   doAssert offsetof(BlStaView, pendingList) == int(BlStaPendingListOff)
   doAssert offsetof(BlStaView, macAddr) == int(BlStaAddrOff)
@@ -23,6 +26,10 @@ static:
   doAssert offsetof(BlStaView, vifIdx) == int(BlStaVifIdxOff)
   doAssert offsetof(BlStaView, fcPs) == int(BlStaFcPsOff)
   doAssert offsetof(BlStaView, qos) == int(BlStaQosOff)
+  doAssert offsetof(BlStaView, rssi) == int(BlStaRssiOff)
+  doAssert offsetof(BlStaView, dataRate) == int(BlStaDataRateOff)
+  doAssert offsetof(BlStaView, tsfLo) == int(BlStaTsfloOff)
+  doAssert offsetof(BlStaView, tsfHi) == int(BlStaTsfhiOff)
   doAssert offsetof(BlHwView, ipcEnv) == int(BlHwIpcEnvOff)
   doAssert offsetof(BlHwView, vifs) == int(BlHwVifTableOff)
   doAssert offsetof(BlHwView, stas) == int(BlHwStaTableOff)
@@ -38,7 +45,7 @@ static:
   doAssert offsetof(TxHdrView, len) == int(TxHdrLenOff)
   doAssert offsetof(TxHdrView, vifStaRepush) == int(TxHdrVifStaRepushOff)
   doAssert offsetof(TxbufView, hostBuf) == int(TxbufHostBufOff)
-  doAssert offsetof(TxdescHostView, pad) == int(TxdescHostPadTxdescOff)
+  doAssert offsetof(TxdescHostView, hostDescPadding) == int(TxdescHostPadTxdescOff)
   doAssert offsetof(TxdescHostView, upperHost) == int(TxdescHostPadTxdescOff + TxdescUpperHostOff)
   doAssert offsetof(HostTxDescView, pbufAddr) == 0
   doAssert offsetof(HostTxDescView, packetAddr) == 4

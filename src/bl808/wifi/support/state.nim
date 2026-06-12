@@ -26,4 +26,5 @@ var ipcPollIrqCount: uint32
 var lastStatusCode = -1'i32
 var lastReasonCode = -1'i32
 var scanDiag: array[VendorScanDiagMax, ScanDiagItem]
+var scanCache: array[VendorScanDiagMax, ScanCacheItem]
 var vendorRandomState = 0x6d2b_79f5'u32

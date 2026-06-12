@@ -28,7 +28,7 @@ type
 
 type
   BdAddr* {.packed.} = object
-    data*: array[6, uint8]
+    bytes*: array[6, uint8]
 
   BtbleScanReqPduView* {.packed.} = object
     scanA*: BdAddr
@@ -36,7 +36,7 @@ type
 
   BtbleAdvPduView* {.packed.} = object
     advA*: BdAddr
-    data*: array[31, uint8]
+    advPayload*: array[31, uint8]
 
 # ---------------------------------------------------------------------------
 # ke_msg: message header + payload
@@ -144,68 +144,68 @@ type
 type
   EmBufRxDesc* {.packed.} = object
     status*: uint16
-    reserved2*: uint16
+    rxDescCtrlPadding*: uint16
     data_len*: uint16
-    buf_ptr*: uint16
-    reserved8*: array[6, uint8]
+    emBufferOffset*: uint16
+    rxDescTailPadding*: array[6, uint8]
 
   EmBufTxDesc* {.packed.} = object
     status*: uint16
-    reserved2*: uint16
-    buf_ptr*: uint16
+    txDescCtrlPadding*: uint16
+    emBufferOffset*: uint16
     data_len*: uint16
-    reserved8*: uint16
+    txDescTailPadding*: uint16
 
   EmBufRxFreeSlot* {.packed.} = object
     status*: uint16
-    reserved2*: array[6, uint8]
-    buf_ptr*: uint16
-    reserved10*: array[4, uint8]
+    freeSlotStatusPadding*: array[6, uint8]
+    emBufferOffset*: uint16
+    freeSlotTailPadding*: array[4, uint8]
 
   BtbleRxDescView* {.packed.} = object
     status*: uint16
-    reserved02*: uint16
+    linkControlPadding*: uint16
     header*: uint16
     timing0*: uint16
     rxClock*: uint16
     timing1*: uint16
     meta*: uint16
-    reserved0E*: array[6, uint8]
+    rxMetaPadding*: array[6, uint8]
     dataOffset*: uint16
-    reserved16*: array[10, uint8]
+    rxPayloadTailPadding*: array[10, uint8]
 
   BtbleConnTxDescView* {.packed.} = object
     status*: uint16
     header*: uint16
     dataOffset*: uint16
-    reserved06*: array[10, uint8]
+    txPayloadTailPadding*: array[10, uint8]
 
   BtbleConnEventView* {.packed.} = object
     activityType*: uint16
     control*: uint16
-    reserved04*: uint16
+    controlPadding*: uint16
     phyControl*: uint16
-    reserved08*: array[6, uint8]
+    accessAddressPrefixPadding*: array[6, uint8]
     accessAddrLow*: uint16
     accessAddrHigh*: uint16
     crcInitLow*: uint16
     crcInitHigh*: uint16
-    reserved16*: array[2, uint8]
+    crcInitPadding*: array[2, uint8]
     channel*: uint16
     rfConfig*: uint16
     eventCountEnable*: uint16
     rxSync*: uint16
-    reserved20*: array[4, uint8]
+    rxSyncPadding*: array[4, uint8]
     txDescPtr*: uint16
-    reserved26*: array[8, uint8]
+    txDescPtrPadding*: array[8, uint8]
     txDuration*: uint16
     rxDuration*: uint16
     channelMap01*: uint16
     channelMap23*: uint16
     channelMapHop*: uint16
     rxTiming*: uint16
-    reserved3A*: uint16
-    reserved3C*: array[36, uint8]
+    rxTimingPadding*: uint16
+    eventCounterPrefixPadding*: array[36, uint8]
     eventCounter*: uint16
     eventCounterAux0*: uint16
     eventCounterAux1*: uint16
@@ -231,7 +231,7 @@ type
     callback*: uint32
     targetTime*: uint32
     fineTime*: uint16
-    reserved0A*: array[6, uint8]
+    timingPadding*: array[6, uint8]
     duration*: uint32
     context*: uint32
     primaryType*: uint8
@@ -244,12 +244,12 @@ type
     auxControl*: uint8
     hasAux*: uint8
     auxRate*: uint8
-    reserved22*: array[2, uint8]
+    auxRatePadding*: array[2, uint8]
 
   NimLlcStartEnvView {.packed.} = object
-    reserved0*: array[8, uint8]
+    startEnvPrefixPadding*: array[8, uint8]
     peerFeatureSeed*: array[5, uint8]
-    reserved13*: uint8
+    peerFeatureSeedPadding*: uint8
     connIntervalMin*: uint16
     connIntervalMax*: uint16
     connLatency*: uint16
@@ -261,16 +261,16 @@ type
     rxRate*: uint8
     eventCounter*: uint16
     peerRate*: uint8
-    reserved33*: array[3, uint8]
+    peerRatePadding*: array[3, uint8]
     pendingList*: CoList
     leFeatures*: array[8, uint8]
-    reserved52*: array[56, uint8]
+    controllerFeaturePadding*: array[56, uint8]
     authPayloadTimeout*: uint8
-    reserved109*: uint8
+    authPayloadTimeoutPadding*: uint8
     connEventLenMin*: uint16
     connEventLenMax*: uint16
     channelSelection*: uint8
-    reserved115*: uint8
+    channelSelectionPadding*: uint8
     maxTxTime*: uint16
     maxRxTime*: uint16
     schedulerWord*: uint32
@@ -278,7 +278,7 @@ type
     localSleepClockAccuracy*: uint8
     peerSleepClockAccuracy*: uint8
     flags*: uint16
-    reserved130*: array[10, uint8]
+    flagsTailPadding*: array[10, uint8]
 
   ConnectIndPayloadView {.packed.} = object
     initiatorAddr*: BdAddr
@@ -304,16 +304,16 @@ type
     channelMap*: array[5, uint8]
     hopIncrement*: uint8
     peerSleepClockAccuracy*: uint8
-    reserved23*: uint8
+    sleepClockAccuracyPadding*: uint8
     timingFine*: uint16
-    reserved26*: array[2, uint8]
+    timingFinePadding*: array[2, uint8]
     timingClock*: uint32
     anchorClock*: uint32
     timingSelector*: uint8
     rate*: uint8
     peerRxAddrType*: uint16
     centralRole*: uint8
-    reserved41*: array[7, uint8]
+    centralRolePadding*: array[7, uint8]
 
   NimLlcControllerDefaultsView {.packed.} = object
     maxTxTime*: uint16
@@ -322,7 +322,7 @@ type
     localSleepClockAccuracy*: uint8
     peerSleepClockAccuracy*: uint8
     authPayloadTimeout*: uint8
-    reserved49*: uint8
+    authPayloadTimeoutPadding*: uint8
     connEventLenMin*: uint16
     connEventLenMax*: uint16
     channelSelection*: uint8
@@ -338,9 +338,9 @@ type
     channelMap*: array[5, uint8]
     hopIncrement*: uint8
     peerSleepClockAccuracy*: uint8
-    reserved23*: uint8
+    sleepClockAccuracyPadding*: uint8
     timingFine*: uint16
-    reserved26*: uint8
+    timingFinePadding*: uint8
     transmitWindowSizeMirror*: uint8
     timingClock*: uint32
     anchorClock*: uint32
@@ -348,7 +348,7 @@ type
     timingSelector*: uint8
     peerRxAddrType*: uint16
     controllerDefaults*: NimLlcControllerDefaultsView
-    reserved55*: uint8
+    controllerDefaultsPadding*: uint8
 
   NimVendorLlcStartParamsView {.packed.} = object
     accessAddress*: uint32
@@ -361,9 +361,9 @@ type
     peerFeatureSeed*: array[5, uint8]
     hopSca*: uint8
     peerRate*: uint8
-    reserved23*: uint8
+    peerRatePadding*: uint8
     timingFine*: uint16
-    reserved26*: uint8
+    timingFinePadding*: uint8
     transmitWindowSizeMirror*: uint8
     timingClock*: uint32
     anchorClock*: uint32
@@ -371,40 +371,40 @@ type
     directAnchorMode*: uint8
     peerRxAddrType*: uint16
     controllerDefaults*: NimLlcControllerDefaultsView
-    reserved55*: uint8
+    controllerDefaultsPadding*: uint8
 
   LlmAdvertiserConnView {.packed.} = object
-    reserved0*: array[24, uint8]
+    advertiserConnPrefixPadding*: array[24, uint8]
     intervalMinSlots*: uint16
     intervalMaxSlots*: uint16
     intervalLatencyWord*: uint32
     supervisionMinSlots*: uint16
     supervisionMaxSlots*: uint16
     driftSlots*: uint16
-    reserved38*: array[2, uint8]
+    driftSlotsPadding*: array[2, uint8]
     peerAddr*: BdAddr
     peerAddrType*: uint8
     connected*: uint8
-    reserved48*: array[24, uint8]
+    connectionStatePadding*: array[24, uint8]
     state*: uint8
 
   NimLldAdvParamsView {.packed.} = object
     advA*: BdAddr
     initA*: BdAddr
-    reserved12*: array[4, uint8]
+    addrPairPadding*: array[4, uint8]
     advDataPtr*: uint16
-    reserved18*: array[2, uint8]
+    advDataPtrPadding*: array[2, uint8]
     advDataLen*: uint16
-    reserved22*: array[2, uint8]
+    advDataLenPadding*: array[2, uint8]
     advType*: uint8
-    reserved25*: array[4, uint8]
+    advTypePadding*: array[4, uint8]
     channelMap*: uint8
-    reserved30*: array[3, uint8]
+    channelMapPadding*: array[3, uint8]
     txPower*: uint8
     primaryPhy*: uint8
     secondaryMaxSkip*: uint8
     secondaryPhy*: uint8
-    reserved37*: array[3, uint8]
+    secondaryPhyPadding*: array[3, uint8]
 
   NimLldScanParamsView {.packed.} = object
     localAddr*: BdAddr
@@ -417,7 +417,7 @@ type
     scanType*: uint8
     scanTypeMirror*: uint8
     filterPolicy*: uint8
-    reserved19*: array[3, uint8]
+    filterPolicyPadding*: array[3, uint8]
     duration*: uint16
     schedulerOverlay*: array[104, uint8]
 
@@ -425,13 +425,13 @@ type
     localAddr*: BdAddr
     peerAddr*: BdAddr
     channelMap*: array[5, uint8]
-    reserved17*: uint8
+    channelMapPadding*: uint8
     phyMask*: uint8
     activityId*: uint8
     ownAddrType*: uint8
     peerAddrType*: uint8
     filterPolicy*: uint8
-    reserved23*: uint8
+    filterPolicyPadding*: uint8
     scanInterval*: uint16
     scanWindow*: uint16
     connInterval*: uint16
@@ -444,8 +444,8 @@ type
 
   EmBufNode* {.packed.} = object
     next*: ptr EmBufNode
-    idx*: uint16
-    buf_ptr*: uint16
+    poolSlotIndex*: uint16
+    emBufferOffset*: uint16
 
 static:
   doAssert sizeof(KeMsgHeader) == 12
@@ -458,21 +458,26 @@ static:
   doAssert sizeof(EmBufRxDesc) == EM_BUF_RX_DESC_SIZE
   doAssert offsetof(EmBufRxDesc, status) == 0
   doAssert offsetof(EmBufRxDesc, data_len) == 4
-  doAssert offsetof(EmBufRxDesc, buf_ptr) == 6
+  doAssert offsetof(EmBufRxDesc, emBufferOffset) == 6
   doAssert sizeof(EmBufTxDesc) == EM_BUF_TX_DESC_SIZE
   doAssert offsetof(EmBufTxDesc, status) == 0
-  doAssert offsetof(EmBufTxDesc, buf_ptr) == 4
+  doAssert offsetof(EmBufTxDesc, emBufferOffset) == 4
   doAssert offsetof(EmBufTxDesc, data_len) == 6
   doAssert sizeof(EmBufRxFreeSlot) == EM_BUF_RX_DESC_SIZE
   doAssert offsetof(EmBufRxFreeSlot, status) == 0
-  doAssert offsetof(EmBufRxFreeSlot, buf_ptr) == 8
+  doAssert offsetof(EmBufRxFreeSlot, emBufferOffset) == 8
+  doAssert sizeof(EmBufNode) == 8
+  doAssert offsetof(EmBufNode, next) == 0
+  doAssert offsetof(EmBufNode, poolSlotIndex) == 4
+  doAssert offsetof(EmBufNode, emBufferOffset) == 6
   doAssert sizeof(BtbleScanReqPduView) == 12
   doAssert offsetof(BtbleScanReqPduView, scanA) == 0
   doAssert offsetof(BtbleScanReqPduView, advA) == 6
   doAssert offsetof(BtbleAdvPduView, advA) == 0
-  doAssert offsetof(BtbleAdvPduView, data) == 6
+  doAssert offsetof(BtbleAdvPduView, advPayload) == 6
   doAssert sizeof(BtbleRxDescView) == 0x20
   doAssert offsetof(BtbleRxDescView, status) == 0
+  doAssert offsetof(BtbleRxDescView, linkControlPadding) == 0x02
   doAssert offsetof(BtbleRxDescView, header) == 0x04
   doAssert offsetof(BtbleRxDescView, rxClock) == 0x08
   doAssert offsetof(BtbleRxDescView, meta) == 0x0C
@@ -483,14 +488,21 @@ static:
   doAssert offsetof(BtbleConnTxDescView, dataOffset) == 0x04
   doAssert sizeof(BtbleConnEventView) == 0x68
   doAssert offsetof(BtbleConnEventView, activityType) == 0
+  doAssert offsetof(BtbleConnEventView, controlPadding) == 0x04
   doAssert offsetof(BtbleConnEventView, phyControl) == 0x06
+  doAssert offsetof(BtbleConnEventView, accessAddressPrefixPadding) == 0x08
   doAssert offsetof(BtbleConnEventView, accessAddrLow) == 0x0E
+  doAssert offsetof(BtbleConnEventView, crcInitPadding) == 0x16
   doAssert offsetof(BtbleConnEventView, channel) == 0x18
   doAssert offsetof(BtbleConnEventView, rxSync) == 0x1E
+  doAssert offsetof(BtbleConnEventView, rxSyncPadding) == 0x20
   doAssert offsetof(BtbleConnEventView, txDescPtr) == 0x24
+  doAssert offsetof(BtbleConnEventView, txDescPtrPadding) == 0x26
   doAssert offsetof(BtbleConnEventView, txDuration) == 0x2E
   doAssert offsetof(BtbleConnEventView, channelMap01) == 0x32
   doAssert offsetof(BtbleConnEventView, rxTiming) == 0x38
+  doAssert offsetof(BtbleConnEventView, rxTimingPadding) == 0x3A
+  doAssert offsetof(BtbleConnEventView, eventCounterPrefixPadding) == 0x3C
   doAssert offsetof(BtbleConnEventView, eventCounter) == 0x60
   doAssert sizeof(BtbleAccessAddressWordsView) == 0x08
   doAssert offsetof(BtbleAccessAddressWordsView, accessAddrLow) == 0
@@ -509,19 +521,28 @@ static:
   doAssert sizeof(SchProgRequestView) == 36
   doAssert offsetof(SchProgRequestView, targetTime) == 0x04
   doAssert offsetof(SchProgRequestView, fineTime) == 0x08
+  doAssert offsetof(SchProgRequestView, timingPadding) == 0x0A
   doAssert offsetof(SchProgRequestView, duration) == 0x10
   doAssert offsetof(SchProgRequestView, context) == 0x14
   doAssert offsetof(SchProgRequestView, primaryType) == 0x18
   doAssert offsetof(SchProgRequestView, eventIndex) == 0x1C
   doAssert offsetof(SchProgRequestView, hasAux) == 0x20
+  doAssert offsetof(SchProgRequestView, auxRatePadding) == 0x22
   doAssert sizeof(NimLlcStartEnvView) == 0x8C
+  doAssert offsetof(NimLlcStartEnvView, startEnvPrefixPadding) == 0
   doAssert offsetof(NimLlcStartEnvView, peerFeatureSeed) == 8
+  doAssert offsetof(NimLlcStartEnvView, peerFeatureSeedPadding) == 13
+  doAssert offsetof(NimLlcStartEnvView, peerRatePadding) == 33
   doAssert offsetof(NimLlcStartEnvView, pendingList) == 36
   doAssert offsetof(NimLlcStartEnvView, leFeatures) == 44
+  doAssert offsetof(NimLlcStartEnvView, controllerFeaturePadding) == 52
   doAssert offsetof(NimLlcStartEnvView, authPayloadTimeout) == 108
+  doAssert offsetof(NimLlcStartEnvView, authPayloadTimeoutPadding) == 109
   doAssert offsetof(NimLlcStartEnvView, connEventLenMin) == 110
+  doAssert offsetof(NimLlcStartEnvView, channelSelectionPadding) == 115
   doAssert offsetof(NimLlcStartEnvView, schedulerWord) == 120
   doAssert offsetof(NimLlcStartEnvView, flags) == 128
+  doAssert offsetof(NimLlcStartEnvView, flagsTailPadding) == 130
   doAssert sizeof(ConnectIndPayloadView) == 34
   doAssert offsetof(ConnectIndPayloadView, accessAddress) == 12
   doAssert offsetof(ConnectIndPayloadView, crcInit) == 16
@@ -531,58 +552,79 @@ static:
   doAssert offsetof(NimLldConStartParamsView, crcInit) == 4
   doAssert offsetof(NimLldConStartParamsView, windowOffset) == 8
   doAssert offsetof(NimLldConStartParamsView, channelMap) == 16
+  doAssert offsetof(NimLldConStartParamsView, sleepClockAccuracyPadding) == 23
   doAssert offsetof(NimLldConStartParamsView, timingFine) == 24
+  doAssert offsetof(NimLldConStartParamsView, timingFinePadding) == 26
   doAssert offsetof(NimLldConStartParamsView, timingClock) == 28
   doAssert offsetof(NimLldConStartParamsView, timingSelector) == 36
   doAssert offsetof(NimLldConStartParamsView, peerRxAddrType) == 38
   doAssert offsetof(NimLldConStartParamsView, centralRole) == 40
+  doAssert offsetof(NimLldConStartParamsView, centralRolePadding) == 41
   doAssert sizeof(NimLlcControllerDefaultsView) == 15
   doAssert offsetof(NimLlcControllerDefaultsView, maxRxTime) == 2
   doAssert offsetof(NimLlcControllerDefaultsView, authPayloadTimeout) == 8
+  doAssert offsetof(NimLlcControllerDefaultsView, authPayloadTimeoutPadding) == 9
   doAssert offsetof(NimLlcControllerDefaultsView, channelSelection) == 14
   doAssert sizeof(NimLlcStartParamsView) == 56
+  doAssert offsetof(NimLlcStartParamsView, sleepClockAccuracyPadding) == 23
+  doAssert offsetof(NimLlcStartParamsView, timingFinePadding) == 26
   doAssert offsetof(NimLlcStartParamsView, transmitWindowSizeMirror) == 27
   doAssert offsetof(NimLlcStartParamsView, rate) == 36
   doAssert offsetof(NimLlcStartParamsView, timingSelector) == 37
   doAssert offsetof(NimLlcStartParamsView, controllerDefaults) == 40
+  doAssert offsetof(NimLlcStartParamsView, controllerDefaultsPadding) == 55
   doAssert sizeof(NimVendorLlcStartParamsView) == 56
   doAssert offsetof(NimVendorLlcStartParamsView, connIntervalMin) == 10
   doAssert offsetof(NimVendorLlcStartParamsView, connIntervalMax) == 12
   doAssert offsetof(NimVendorLlcStartParamsView, connLatency) == 14
   doAssert offsetof(NimVendorLlcStartParamsView, peerFeatureSeed) == 16
   doAssert offsetof(NimVendorLlcStartParamsView, peerRate) == 22
+  doAssert offsetof(NimVendorLlcStartParamsView, peerRatePadding) == 23
   doAssert offsetof(NimVendorLlcStartParamsView, timingFine) == 24
+  doAssert offsetof(NimVendorLlcStartParamsView, timingFinePadding) == 26
   doAssert offsetof(NimVendorLlcStartParamsView, timingClock) == 28
   doAssert offsetof(NimVendorLlcStartParamsView, anchorClock) == 32
   doAssert offsetof(NimVendorLlcStartParamsView, phyRate) == 36
   doAssert offsetof(NimVendorLlcStartParamsView, directAnchorMode) == 37
   doAssert offsetof(NimVendorLlcStartParamsView, peerRxAddrType) == 38
   doAssert offsetof(NimVendorLlcStartParamsView, controllerDefaults) == 40
+  doAssert offsetof(NimVendorLlcStartParamsView, controllerDefaultsPadding) == 55
   doAssert offsetof(LlmAdvertiserConnView, intervalMinSlots) == 24
+  doAssert offsetof(LlmAdvertiserConnView, advertiserConnPrefixPadding) == 0
   doAssert offsetof(LlmAdvertiserConnView, peerAddr) == 40
+  doAssert offsetof(LlmAdvertiserConnView, driftSlotsPadding) == 38
+  doAssert offsetof(LlmAdvertiserConnView, connectionStatePadding) == 48
   doAssert offsetof(LlmAdvertiserConnView, state) == 72
   doAssert sizeof(NimLldAdvParamsView) == 40
   doAssert offsetof(NimLldAdvParamsView, advDataPtr) == 16
+  doAssert offsetof(NimLldAdvParamsView, advDataPtrPadding) == 18
   doAssert offsetof(NimLldAdvParamsView, advDataLen) == 20
+  doAssert offsetof(NimLldAdvParamsView, advDataLenPadding) == 22
   doAssert offsetof(NimLldAdvParamsView, advType) == 24
+  doAssert offsetof(NimLldAdvParamsView, advTypePadding) == 25
   doAssert offsetof(NimLldAdvParamsView, channelMap) == 29
+  doAssert offsetof(NimLldAdvParamsView, channelMapPadding) == 30
   doAssert offsetof(NimLldAdvParamsView, txPower) == 33
   doAssert offsetof(NimLldAdvParamsView, primaryPhy) == 34
   doAssert offsetof(NimLldAdvParamsView, secondaryPhy) == 36
+  doAssert offsetof(NimLldAdvParamsView, secondaryPhyPadding) == 37
   doAssert sizeof(NimLldScanParamsView) == 128
   doAssert offsetof(NimLldScanParamsView, addrType) == 6
   doAssert offsetof(NimLldScanParamsView, flags) == 7
   doAssert offsetof(NimLldScanParamsView, intervalMin) == 8
   doAssert offsetof(NimLldScanParamsView, windowMax) == 14
   doAssert offsetof(NimLldScanParamsView, filterPolicy) == 18
+  doAssert offsetof(NimLldScanParamsView, filterPolicyPadding) == 19
   doAssert offsetof(NimLldScanParamsView, duration) == 22
   doAssert sizeof(NimLldInitParamsView) == 68
   doAssert offsetof(NimLldInitParamsView, channelMap) == 12
+  doAssert offsetof(NimLldInitParamsView, channelMapPadding) == 17
   doAssert offsetof(NimLldInitParamsView, phyMask) == 18
   doAssert offsetof(NimLldInitParamsView, activityId) == 19
   doAssert offsetof(NimLldInitParamsView, ownAddrType) == 20
   doAssert offsetof(NimLldInitParamsView, peerAddrType) == 21
   doAssert offsetof(NimLldInitParamsView, filterPolicy) == 22
+  doAssert offsetof(NimLldInitParamsView, filterPolicyPadding) == 23
   doAssert offsetof(NimLldInitParamsView, scanInterval) == 24
   doAssert offsetof(NimLldInitParamsView, connInterval) == 28
   doAssert offsetof(NimLldInitParamsView, connOffset) == 30
@@ -629,7 +671,7 @@ type
     params*: array[1, uint8]
 
   HciCmdStatusDescView {.packed.} = object
-    reserved00*: array[8, uint8]
+    statusDescriptorPrefixPadding*: array[8, uint8]
     expectedStatusWord*: uint32
 
   HciRawCmdView {.packed.} = object
@@ -761,11 +803,11 @@ type
     address*: BdAddr
 
   HciLeSetAdvParamsReqView* {.packed.} = object
-    bytes*: array[15, uint8]
+    encodedParams*: array[15, uint8]
 
   HciLeDataPayloadReqView* {.packed.} = object
     length*: uint8
-    data*: array[31, uint8]
+    payload*: array[31, uint8]
 
   HciLeSetAdvEnableReqView* {.packed.} = object
     enabled*: uint8
@@ -791,6 +833,7 @@ static:
   doAssert offsetof(HciRawCommandPacket, paramLen) == 2
   doAssert offsetof(HciRawCommandPacket, params) == 3
   doAssert sizeof(HciCmdStatusDescView) == 12
+  doAssert offsetof(HciCmdStatusDescView, statusDescriptorPrefixPadding) == 0
   doAssert offsetof(HciCmdStatusDescView, expectedStatusWord) == 8
   doAssert offsetof(HciRawCmdView, opcode) == 0
   doAssert offsetof(HciRawCmdView, paramLen) == 2
@@ -871,7 +914,7 @@ static:
   doAssert sizeof(HciLeSetRandomAddressReqView) == 6
   doAssert sizeof(HciLeSetAdvParamsReqView) == 15
   doAssert sizeof(HciLeDataPayloadReqView) == 32
-  doAssert offsetof(HciLeDataPayloadReqView, data) == 1
+  doAssert offsetof(HciLeDataPayloadReqView, payload) == 1
   doAssert sizeof(HciLeSetAdvEnableReqView) == 1
   doAssert sizeof(HciLeSetScanParamsReqView) == 7
   doAssert offsetof(HciLeSetScanParamsReqView, interval) == 1
@@ -887,37 +930,116 @@ static:
 type
   LlcConEnv* = object
     ## Per-connection LLC environment (opaque, ~420 bytes from disasm)
-    data*: array[420, uint8]
+    storage*: array[420, uint8]
+
+  LlcConnectionRuntimeView {.packed.} = object
+    connectionTimingPrefix*: array[14, uint8]
+    connInterval*: uint16
+    connLatency*: uint16
+    authPayloadPrefix*: array[40, uint8]
+    authPayloadTimeout*: uint16
+    authPayloadRealTimeout*: uint16
+    linkStatePrefix*: array[66, uint8]
+    linkFlags*: uint16
+    llcpStateFlags*: uint8
 
   LlcChannelAssessmentView {.packed.} = object
-    reserved00*: array[344, uint8]
+    channelAssessmentPrefix*: array[344, uint8]
     flags*: uint16
     channelMap*: array[5, uint8]
 
   LlcDisconnectStateView {.packed.} = object
-    reserved00*: array[413, uint8]
+    disconnectStatePrefix*: array[413, uint8]
     reason*: uint8
     active*: uint8
 
   LldEvtEnv* = object
     ## LLD event environment
-    data*: array[256, uint8]
+    storage*: array[256, uint8]
 
   LlmEnv* = object
     ## LLM environment block
-    data*: array[512, uint8]
+    storage*: array[512, uint8]
+
+  LlmRuntimeConfigView {.packed.} = object
+    clockAccuracyMask*: uint32
+    leEventMask*: array[8, uint8]
+    runtimePadding12*: array[332, uint8]
+    localChannelMap*: array[5, uint8]
+    masterChannelMap*: array[5, uint8]
+    runtimePadding354*: array[74, uint8]
+    connectionAcceptTimeout*: uint16
+    suggestedMaxTxOctets*: uint16
+    suggestedMaxTxTime*: uint16
+    runtimePadding434*: array[2, uint8]
+    featureSet*: array[4, uint8]
+    runtimePadding440*: array[38, uint8]
+    suggestedMaxRxOctets*: uint16
+    suggestedMaxRxTime*: uint16
+    rxPathCompensation*: int16
+    txPathCompensation*: int16
+    runtimePadding486*: uint8
+    advertisingInterfaceMode*: uint8
 
   LlmChannelMapView {.packed.} = object
-    reserved00*: array[344, uint8]
+    channelMapPrefix*: array[344, uint8]
     localMap*: array[5, uint8]
     masterMap*: array[5, uint8]
 
+  LlmActivitySlotView {.packed.} = object
+    advertisingParamPtr*: uint32
+    schedulerPlanElement*: array[24, uint8]
+    peerAddr*: BdAddr
+    peerAddrType*: uint8
+    activityPadding35*: array[25, uint8]
+    state*: uint8
+    activityTailPadding61*: array[3, uint8]
+
+  LlmDeviceListEntryView {.packed.} = object
+    deviceAddr*: BdAddr
+    deviceListPadding6*: array[2, uint8]
+    addrType*: uint8
+    flags*: uint8
+
+doAssert offsetof(LlcChannelAssessmentView, channelAssessmentPrefix) == 0
 doAssert offsetof(LlcChannelAssessmentView, flags) == 344
 doAssert offsetof(LlcChannelAssessmentView, channelMap) == 346
+doAssert offsetof(LlcConnectionRuntimeView, connInterval) == 14
+doAssert offsetof(LlcConnectionRuntimeView, connLatency) == 16
+doAssert offsetof(LlcConnectionRuntimeView, authPayloadTimeout) == 58
+doAssert offsetof(LlcConnectionRuntimeView, authPayloadRealTimeout) == 60
+doAssert offsetof(LlcConnectionRuntimeView, linkFlags) == 128
+doAssert offsetof(LlcConnectionRuntimeView, llcpStateFlags) == 130
+doAssert offsetof(LlcDisconnectStateView, disconnectStatePrefix) == 0
 doAssert offsetof(LlcDisconnectStateView, reason) == 413
 doAssert offsetof(LlcDisconnectStateView, active) == 414
+doAssert offsetof(LlmChannelMapView, channelMapPrefix) == 0
 doAssert offsetof(LlmChannelMapView, localMap) == 344
 doAssert offsetof(LlmChannelMapView, masterMap) == 349
+doAssert sizeof(LlmRuntimeConfigView) == 488
+doAssert offsetof(LlmRuntimeConfigView, clockAccuracyMask) == 0
+doAssert offsetof(LlmRuntimeConfigView, leEventMask) == 4
+doAssert offsetof(LlmRuntimeConfigView, localChannelMap) == 344
+doAssert offsetof(LlmRuntimeConfigView, masterChannelMap) == 349
+doAssert offsetof(LlmRuntimeConfigView, connectionAcceptTimeout) == 428
+doAssert offsetof(LlmRuntimeConfigView, suggestedMaxTxOctets) == 430
+doAssert offsetof(LlmRuntimeConfigView, suggestedMaxTxTime) == 432
+doAssert offsetof(LlmRuntimeConfigView, featureSet) == 436
+doAssert offsetof(LlmRuntimeConfigView, suggestedMaxRxOctets) == 478
+doAssert offsetof(LlmRuntimeConfigView, suggestedMaxRxTime) == 480
+doAssert offsetof(LlmRuntimeConfigView, rxPathCompensation) == 482
+doAssert offsetof(LlmRuntimeConfigView, txPathCompensation) == 484
+doAssert offsetof(LlmRuntimeConfigView, advertisingInterfaceMode) == 487
+doAssert sizeof(LlmActivitySlotView) == 64
+doAssert offsetof(LlmActivitySlotView, advertisingParamPtr) == 0
+doAssert offsetof(LlmActivitySlotView, schedulerPlanElement) == 4
+doAssert offsetof(LlmActivitySlotView, peerAddr) == 28
+doAssert offsetof(LlmActivitySlotView, peerAddrType) == 34
+doAssert offsetof(LlmActivitySlotView, state) == 60
+doAssert sizeof(LlmDeviceListEntryView) == 10
+doAssert offsetof(LlmDeviceListEntryView, deviceAddr) == 0
+doAssert offsetof(LlmDeviceListEntryView, addrType) == 8
+doAssert offsetof(LlmDeviceListEntryView, flags) == 9
 
 # ---------------------------------------------------------------------------
 # ECC types
@@ -948,13 +1070,13 @@ var
   co_list_check_size_available_patch: proc(result_out: ptr uint8, list: ptr CoList, limit: uint32): int32 {.cdecl.}
 
   # ke_event
-  ke_event_field*: uint32
+  kePendingEventBits*: uint32
   ke_event_slots*: array[KE_EVENT_MAX, KeEventSlot]
 
   ke_event_init_patch: proc(a0: uint32): int32 {.cdecl.}
-  ke_event_callback_set_patch: proc(status: ptr uint8, idx: uint8, cb: KeEventCallback): int32 {.cdecl.}
-  ke_event_set_patch: proc(a0: uint32, idx: uint8): int32 {.cdecl.}
-  ke_event_clear_patch: proc(a0: uint32, idx: uint8): int32 {.cdecl.}
+  ke_event_callback_set_patch: proc(status: ptr uint8, eventId: uint8, cb: KeEventCallback): int32 {.cdecl.}
+  ke_event_set_patch: proc(a0: uint32, eventId: uint8): int32 {.cdecl.}
+  ke_event_clear_patch: proc(a0: uint32, eventId: uint8): int32 {.cdecl.}
   ke_event_get_all_patch: proc(result_out: ptr uint32): int32 {.cdecl.}
   ke_event_flush_patch: proc(): int32 {.cdecl.}
   ke_event_schedule_patch: proc(a0: uint32): int32 {.cdecl.}
@@ -1099,13 +1221,13 @@ var
 
   # LLC global
   llc_env*: array[LLC_CON_MAX, ptr LlcConEnv]
-  llc_env_data*: array[LLC_CON_MAX, LlcConEnv]
+  llc_env_storage*: array[LLC_CON_MAX, LlcConEnv]
 
   # LLD global
-  lld_evt_env_data*: array[512, uint8]
+  lld_evt_env_storage*: array[512, uint8]
 
   # LLM global
-  llm_env_data*: LlmEnv
+  llm_env_storage*: LlmEnv
   llm_wl*: array[LLM_WL_MAX, BdAddr]
   llm_wl_type*: array[LLM_WL_MAX, uint8]
 
@@ -1346,19 +1468,33 @@ when defined(bl808m0):
 template llcChannelAssessment(env: ptr LlcConEnv): ptr LlcChannelAssessmentView =
   cast[ptr LlcChannelAssessmentView](env)
 
+template llcConnectionRuntime(env: ptr LlcConEnv): ptr LlcConnectionRuntimeView =
+  cast[ptr LlcConnectionRuntimeView](env)
+
 template llcDisconnectState(env: ptr LlcConEnv): ptr LlcDisconnectStateView =
   cast[ptr LlcDisconnectStateView](env)
 
 template llmChannelMaps(): ptr LlmChannelMapView =
-  cast[ptr LlmChannelMapView](addr llm_env_data)
+  cast[ptr LlmChannelMapView](addr llm_env_storage)
+
+template llmRuntimeConfig(): ptr LlmRuntimeConfigView =
+  cast[ptr LlmRuntimeConfigView](addr llm_env_storage)
+
+template llmActivitySlot(activityIndex: int): ptr LlmActivitySlotView =
+  addr cast[ptr UncheckedArray[LlmActivitySlotView]](
+    addr llm_env_storage.storage[12])[activityIndex]
+
+template llmDeviceListEntry(deviceListIndex: int): ptr LlmDeviceListEntryView =
+  addr cast[ptr UncheckedArray[LlmDeviceListEntryView]](
+    addr llm_env_storage.storage[356])[deviceListIndex]
 
 template llmAdvertiserConn(): ptr LlmAdvertiserConnView =
-  cast[ptr LlmAdvertiserConnView](addr llm_env_data)
+  cast[ptr LlmAdvertiserConnView](addr llm_env_storage)
 
 proc bleCentralTraceReadSp(): uint32 {.inline.} =
-  var v: uint32
-  {.emit: ["asm volatile(\"mv %0, sp\" : \"=r\"(", v, "));"].}
-  v
+  var stackPointer: uint32
+  {.emit: ["asm volatile(\"mv %0, sp\" : \"=r\"(", stackPointer, "));"].}
+  stackPointer
 
 proc bleCentralDebugMark*(stage, detail: uint32) {.exportc, cdecl.} =
   discard stage
@@ -1373,4 +1509,3 @@ proc bleCentralTraceStoreRawRa(offset: uint) {.inline.} =
 
 proc bleCentralTraceCheckRawRa(stage: uint32) {.inline.} =
   discard stage
-

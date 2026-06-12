@@ -1,39 +1,42 @@
 proc osMutexCreate(): pointer {.inline.} =
-  let fn = cast[MutexCreateProc](opPtr(OpMutexCreateOff))
-  if fn == nil: nil else: fn()
+  let mutexCreate = cast[MutexCreateProc](opPtr(OpMutexCreateOff))
+  if mutexCreate == nil: nil else: mutexCreate()
 
 proc osMutexLock(mutex: pointer) {.inline.} =
-  let fn = cast[MutexLockProc](opPtr(OpMutexLockOff))
-  if fn != nil:
-    discard fn(mutex)
+  let mutexLock = cast[MutexLockProc](opPtr(OpMutexLockOff))
+  if mutexLock != nil:
+    discard mutexLock(mutex)
 
 proc osMutexUnlock(mutex: pointer) {.inline.} =
-  let fn = cast[MutexUnlockProc](opPtr(OpMutexUnlockOff))
-  if fn != nil:
-    discard fn(mutex)
+  let mutexUnlock = cast[MutexUnlockProc](opPtr(OpMutexUnlockOff))
+  if mutexUnlock != nil:
+    discard mutexUnlock(mutex)
 
 proc osEventCreate(): pointer {.inline.} =
-  let fn = cast[EventGroupCreateProc](opPtr(OpEventGroupCreateOff))
-  if fn == nil: nil else: fn()
+  let eventGroupCreate = cast[EventGroupCreateProc](opPtr(OpEventGroupCreateOff))
+  if eventGroupCreate == nil: nil else: eventGroupCreate()
 
 proc osEventDelete(event: pointer) {.inline.} =
-  let fn = cast[EventGroupDeleteProc](opPtr(OpEventGroupDeleteOff))
-  if fn != nil:
-    fn(event)
+  let eventGroupDelete = cast[EventGroupDeleteProc](opPtr(OpEventGroupDeleteOff))
+  if eventGroupDelete != nil:
+    eventGroupDelete(event)
 
 proc osEventSend(event: pointer; bits: uint32) {.inline.} =
-  let fn = cast[EventGroupSendProc](opPtr(OpEventGroupSendOff))
-  if fn != nil:
-    discard fn(event, bits)
+  let eventGroupSend = cast[EventGroupSendProc](opPtr(OpEventGroupSendOff))
+  if eventGroupSend != nil:
+    discard eventGroupSend(event, bits)
 
 proc osEventWait(event: pointer; bits: uint32): uint32 {.inline.} =
-  let fn = cast[EventGroupWaitProc](opPtr(OpEventGroupWaitOff))
-  if fn == nil: 0'u32 else: fn(event, bits, 1, 0, 0xffff_ffff'u32)
+  let eventGroupWait = cast[EventGroupWaitProc](opPtr(OpEventGroupWaitOff))
+  if eventGroupWait == nil:
+    0'u32
+  else:
+    eventGroupWait(event, bits, 1, 0, 0xffff_ffff'u32)
 
 proc osFree(p: pointer) {.inline.} =
-  let fn = cast[FreeProc](opPtr(OpFreeOff))
-  if fn != nil:
-    fn(p)
+  let freeFn = cast[FreeProc](opPtr(OpFreeOff))
+  if freeFn != nil:
+    freeFn(p)
 
 proc waitComplete(flags: uint16): bool {.inline.} =
   (flags and (RwnxCmdFlagWaitAck or RwnxCmdFlagWaitCfm)) == 0'u16

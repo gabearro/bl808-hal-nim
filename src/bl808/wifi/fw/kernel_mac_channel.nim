@@ -5,8 +5,8 @@
 proc ascii_to_hex*(c: uint8): uint8 {.exportc, cdecl.} =
   ## Convert a single ASCII hex character to its 4-bit value.
   ## '0'-'9' -> 0-9, 'a'-'f' -> 10-15, 'A'-'F' -> 10-15, else 0.
-  let v = c - ord('0').uint8
-  if v <= 9: return v
+  let decimalDigit = c - ord('0').uint8
+  if decimalDigit <= 9: return decimalDigit
   let lower = c - ord('a').uint8
   if lower <= 5: return c - 87  # 'a' - 87 = 10
   let upper = c - ord('A').uint8
@@ -65,53 +65,54 @@ proc co_list_extract*(list: ptr CoList, elem: ptr CoListHdr) {.exportc, cdecl.} 
   ## Blob asserts list!=nil; does NOT update list.last when removing first element.
   if list == nil:
     assert_err("co_list.c", "co_list.c", 129)
-  var cur = list.first
-  if cur == nil: return
-  if cur == elem:
+  var currentNode = list.first
+  if currentNode == nil: return
+  if currentNode == elem:
     list.first = elem.next
     return
-  while cur.next != nil:
-    var nxt = cur.next
-    if nxt == elem:
+  while currentNode.next != nil:
+    var nextNode = currentNode.next
+    if nextNode == elem:
       if list.last == elem:
-        list.last = cur
-      cur.next = elem.next
+        list.last = currentNode
+      currentNode.next = elem.next
       return
-    cur = nxt
+    currentNode = nextNode
 
 proc co_list_find*(list: ptr CoList, elem: ptr CoListHdr): bool {.exportc, cdecl.} =
   ## Return true if element is in the list.
-  var cur = list.first
-  while cur != nil:
-    if cur == elem: return true
-    cur = cur.next
+  var currentNode = list.first
+  while currentNode != nil:
+    if currentNode == elem: return true
+    currentNode = currentNode.next
   return false
 
 proc co_list_cnt*(list: ptr CoList): uint32 {.exportc, cdecl.} =
   ## Count elements in the list.
   result = 0
-  var cur = list.first
-  while cur != nil:
+  var currentNode = list.first
+  while currentNode != nil:
     inc result
-    cur = cur.next
+    currentNode = currentNode.next
 
 proc co_list_insert*(list: ptr CoList, elem: ptr CoListHdr, cmp: proc(a, b: ptr CoListHdr): bool {.cdecl.}) {.exportc, cdecl.} =
-  ## Sorted insert: walk the list calling cmp(elem, cur). Insert elem before
-  ## the first cur where cmp returns true. If cmp never returns true, append.
-  var cur = list.first
-  var prev: ptr CoListHdr = nil
-  while cur != nil:
-    if cmp(elem, cur):
+  ## Sorted insert: walk the list calling cmp(elem, currentNode). Insert elem
+  ## before the first currentNode where cmp returns true. If cmp never returns
+  ## true, append.
+  var currentNode = list.first
+  var previousNode: ptr CoListHdr = nil
+  while currentNode != nil:
+    if cmp(elem, currentNode):
       break
-    prev = cur
-    cur = cur.next
-  if cur == nil:
+    previousNode = currentNode
+    currentNode = currentNode.next
+  if currentNode == nil:
     list.last = elem
-  elem.next = cur
-  if prev == nil:
+  elem.next = currentNode
+  if previousNode == nil:
     list.first = elem
   else:
-    prev.next = elem
+    previousNode.next = elem
 
 proc co_list_insert_after*(list: ptr CoList, refElem: ptr CoListHdr, elem: ptr CoListHdr) {.exportc, cdecl.} =
   ## Insert elem after refElem in the list. If refElem is nil, push to front.
@@ -119,22 +120,23 @@ proc co_list_insert_after*(list: ptr CoList, refElem: ptr CoListHdr, elem: ptr C
   if refElem == nil:
     co_list_push_front(list, elem)
     return
-  var cur = list.first
-  while cur != nil:
-    if cur == refElem:
+  var currentNode = list.first
+  while currentNode != nil:
+    if currentNode == refElem:
       elem.next = refElem.next
       refElem.next = elem
       if elem.next == nil:
         list.last = elem
       return
-    cur = cur.next
+    currentNode = currentNode.next
 
 proc co_list_insert_before*(list: ptr CoList, refElem: ptr CoListHdr, elem: ptr CoListHdr) {.exportc, cdecl.} =
   ## Insert elem before refElem.
   ## Blob algorithm:
   ##   if refElem == NULL: tail-call co_list_push_back(list, elem)
   ##   else if list->first == refElem: tail-call co_list_push_front(list, elem)
-  ##   else: walk until cur->next == refElem; elem->next = refElem; cur->next = elem
+  ##   else: walk until previousNode->next == refElem; elem->next = refElem;
+  ##   previousNode->next = elem
   ## Prior Nim bug: on refElem==nil it called co_list_push_front (would drop
   ## elem at the head instead of the tail, inverting ordering semantics).
   if refElem == nil:
@@ -143,13 +145,13 @@ proc co_list_insert_before*(list: ptr CoList, refElem: ptr CoListHdr, elem: ptr 
   if list.first == refElem:
     co_list_push_front(list, elem)
     return
-  var prev = list.first
-  while prev != nil:
-    if prev.next == refElem:
+  var previousNode = list.first
+  while previousNode != nil:
+    if previousNode.next == refElem:
       elem.next = refElem
-      prev.next = elem
+      previousNode.next = elem
       return
-    prev = prev.next
+    previousNode = previousNode.next
 
 proc co_list_concat*(dst: ptr CoList, src: ptr CoList) {.exportc, cdecl.} =
   ## Concatenate src list onto the end of dst, then clear src.
@@ -162,23 +164,23 @@ proc co_list_concat*(dst: ptr CoList, src: ptr CoList) {.exportc, cdecl.} =
   dst.last = src.last
   src.first = nil
 
-proc co_list_remove*(list: ptr CoList, prev: ptr CoListHdr, elem: ptr CoListHdr) {.exportc, cdecl.} =
-  ## Remove elem from list, given its predecessor prev (156 bytes in blob).
-  ## If prev is nil, elem is assumed to be the first element.
+proc co_list_remove*(list: ptr CoList, previousNode: ptr CoListHdr, elem: ptr CoListHdr) {.exportc, cdecl.} =
+  ## Remove elem from list, given its predecessor previousNode (156 bytes in blob).
+  ## If previousNode is nil, elem is assumed to be the first element.
   ## Clears elem.next after removal.
   if list == nil:
     assert_err("co_list.c", "co_list.c", 360)
   if elem == nil:
     assert_err("co_list.c", "co_list.c", 362)
-  if prev != nil:
-    # Validate that prev actually points to elem
-    if prev.next != elem:
+  if previousNode != nil:
+    # Validate that previousNode actually points to elem
+    if previousNode.next != elem:
       assert_err("co_list.c", "co_list.c", 361)
-    # Unlink: prev->next = elem->next
-    prev.next = elem.next
-    # If elem was the last element, update list.last to prev
+    # Unlink: previousNode->next = elem->next
+    previousNode.next = elem.next
+    # If elem was the last element, update list.last to previousNode
     if list.last == elem:
-      list.last = prev
+      list.last = previousNode
   else:
     # elem is the first element — blob does NOT assert on list.first mismatch
     # here (only 3 asserts at lines 360/361/362); previous Nim added an
@@ -198,7 +200,7 @@ proc co_list_pool_init*(list: ptr CoList, pool: pointer, elemSize: uint32, poolS
   list.first = nil
   list.last = nil
   var base = cast[uint](pool)
-  for i in 0'u32 ..< poolSize:
+  for listPoolSlotIndex in 0'u32 ..< poolSize:
     let node = cast[ptr CoListHdr](base)
     if defaultValue != nil:
       copyMem(cast[pointer](base), defaultValue, elemSize.int)
@@ -209,7 +211,7 @@ proc co_list_pool_init*(list: ptr CoList, pool: pointer, elemSize: uint32, poolS
 proc co_dlist_init*(list: ptr CoDlist) {.exportc, cdecl.} =
   list.first = nil
   list.last = nil
-  list.cnt = 0
+  list.elementCount = 0
 
 proc co_dlist_push_back*(list: ptr CoDlist, elem: ptr CoDlistHdr) {.exportc, cdecl.} =
   if list.first == nil:
@@ -219,7 +221,7 @@ proc co_dlist_push_back*(list: ptr CoDlist, elem: ptr CoDlistHdr) {.exportc, cde
   elem.prev = list.last
   elem.next = nil
   list.last = elem
-  inc list.cnt
+  inc list.elementCount
 
 proc co_dlist_push_front*(list: ptr CoDlist, elem: ptr CoDlistHdr) {.exportc, cdecl.} =
   if list.first == nil:
@@ -229,12 +231,12 @@ proc co_dlist_push_front*(list: ptr CoDlist, elem: ptr CoDlistHdr) {.exportc, cd
   elem.next = list.first
   elem.prev = nil
   list.first = elem
-  inc list.cnt
+  inc list.elementCount
 
 proc co_dlist_pop_front*(list: ptr CoDlist): ptr CoDlistHdr {.exportc, cdecl.} =
   result = list.first
   if result == nil: return
-  dec list.cnt
+  dec list.elementCount
   list.first = result.next
   if list.first != nil:
     list.first.prev = nil
@@ -256,11 +258,11 @@ proc co_dlist_extract*(list: ptr CoDlist, elem: ptr CoDlistHdr) {.exportc, cdecl
       list.last = elem.prev
     else:
       elem.next.prev = elem.prev
-  dec list.cnt
+  dec list.elementCount
 
 # Pool operations
 #
-# The blob's co_pool uses a separate node array (8 bytes per node: {next, data})
+# The blob's co_pool uses a separate node array (8 bytes per node: {next, element})
 # to track free pool elements. The pool struct is just {head_ptr, free_count}.
 # This differs from co_list which embeds the next pointer in the element itself.
 
@@ -280,31 +282,31 @@ proc co_pool_init*(pool: ptr CoPool, nodeArray: pointer, poolMem: pointer, elemS
   var nodeBase = cast[uint](nodeArray)
   var elemBase = cast[uint](poolMem)
   # Build the free-list chain in the node array
-  for i in 0'u32 ..< elemCount:
-    let node = cast[ptr CoPoolNode](nodeBase + i.uint * 8)
-    node.data = cast[pointer](elemBase + i.uint * elemSize.uint)
-    if i + 1 < elemCount:
-      node.next = cast[ptr CoPoolNode](nodeBase + (i.uint + 1) * 8)
+  for poolNodeIndex in 0'u32 ..< elemCount:
+    let node = cast[ptr CoPoolNode](nodeBase + poolNodeIndex.uint * 8)
+    node.element = cast[pointer](elemBase + poolNodeIndex.uint * elemSize.uint)
+    if poolNodeIndex + 1 < elemCount:
+      node.next = cast[ptr CoPoolNode](nodeBase + (poolNodeIndex.uint + 1) * 8)
     else:
       node.next = nil
   pool.first = cast[ptr CoPoolNode](nodeBase)
-  pool.cnt = elemCount
+  pool.freeNodeCount = elemCount
 
 proc co_pool_alloc*(pool: ptr CoPool, count: uint32): pointer {.exportc, cdecl.} =
   ## Allocate 'count' nodes from the pool. Returns head of allocated chain,
   ## or nil if not enough free nodes.
   if count == 0:
     assert_err("co_pool.c", "co_pool.c", 73)
-  if pool.cnt < count:
+  if pool.freeNodeCount < count:
     return nil
   result = cast[pointer](pool.first)
   # Walk 'count' nodes to find the new head
   var last = pool.first
-  for i in 1'u32 ..< count:
+  for allocatedNodeIndex in 1'u32 ..< count:
     last = last.next
   # Detach the chain: new pool head is after the last allocated node
   pool.first = last.next
-  pool.cnt -= count
+  pool.freeNodeCount -= count
   last.next = nil  # Null-terminate the returned chain
 
 proc co_pool_free*(pool: ptr CoPool, elemChain: pointer, count: uint32) {.exportc, cdecl.} =
@@ -317,10 +319,10 @@ proc co_pool_free*(pool: ptr CoPool, elemChain: pointer, count: uint32) {.export
   var head = cast[ptr CoPoolNode](elemChain)
   let oldFirst = pool.first
   pool.first = head
-  pool.cnt += count
+  pool.freeNodeCount += count
   # Walk to end of returned chain (blob does NOT assert on nil tail.next).
   var tail = head
-  for i in 1'u32 ..< count:
+  for freedNodeIndex in 1'u32 ..< count:
     tail = tail.next
   # Splice: last node of returned chain points to old head
   tail.next = oldFirst
@@ -329,9 +331,9 @@ proc co_pack8p*(dst: pointer, src: pointer, count: uint32) {.exportc, cdecl.} =
   ## Pack byte array from src into dst, 'count' bytes.
   ## From blob: loop copying bytes from src to dst using T-Head extension insns.
   ## (co_list.o / co_ring.o)
-  for i in 0'u32 ..< count:
-    let b = cast[ptr uint8](cast[uint](src) + i)[]
-    cast[ptr uint8](cast[uint](dst) + i)[] = b
+  for byteOffset in 0'u32 ..< count:
+    let sourceByte = cast[ptr uint8](cast[uint](src) + byteOffset)[]
+    cast[ptr uint8](cast[uint](dst) + byteOffset)[] = sourceByte
 
 # ###########################################################################
 #                      KERNEL: EVENTS (ke_evt_*)
@@ -345,50 +347,50 @@ template keEnvPsFlags(): ptr KeEnvPsFlagsView =
 
 proc ke_evt_set*(evtBit: uint32) {.exportc, cdecl.} =
   ## Set event bit(s) in the kernel event field (interrupt-safe).
-  let saved = irqSave()
-  let next = keEvtField or evtBit
-  keEvtField = next
-  keEnvEventField()[] = next
+  let savedIrqState = irqSave()
+  let updatedEventField = keEvtField or evtBit
+  keEvtField = updatedEventField
+  keEnvEventField()[] = updatedEventField
   if (evtBit and 0x98000000'u32) != 0:
-    nimFwTrace2U32("[WIFI-NIMFW] evt_set ", evtBit, next)
-  irqRestore(saved)
+    nimFwTrace2U32("[WIFI-NIMFW] evt_set ", evtBit, updatedEventField)
+  irqRestore(savedIrqState)
 
 proc ke_evt_clear*(evtBit: uint32) {.exportc, cdecl, noinline.} =
   ## Clear event bit(s) in the kernel event field (interrupt-safe).
   ## noinline: blob keeps this as a standalone function.
   {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
-  let saved = irqSave()
-  let next = keEvtField and (not evtBit)
-  keEvtField = next
-  keEnvEventField()[] = next
+  let savedIrqState = irqSave()
+  let updatedEventField = keEvtField and (not evtBit)
+  keEvtField = updatedEventField
+  keEnvEventField()[] = updatedEventField
   if (evtBit and 0x98000000'u32) != 0:
-    nimFwTrace2U32("[WIFI-NIMFW] evt_clear ", evtBit, next)
-  irqRestore(saved)
+    nimFwTrace2U32("[WIFI-NIMFW] evt_clear ", evtBit, updatedEventField)
+  irqRestore(savedIrqState)
 
 proc eventIndex32(x: uint32): uint32 {.inline.} =
   ## Blob ke_evt_schedule calls __clzsi2(event_field) directly. Event bit 31
   ## maps to handler index 0, and bit 6 maps to index 25.
   if x == 0: return 32
   var clzResult: cuint
-  let field: cuint = x.cuint
-  {.emit: [clzResult, " = __builtin_clz(", field, ");"].}
+  let eventField: cuint = x.cuint
+  {.emit: [clzResult, " = __builtin_clz(", eventField, ");"].}
   return clzResult.uint32
 
 proc ke_evt_schedule*() {.exportc, cdecl.} =
   ## Process the highest-priority pending event by calling its handler.
   ## From blob: uses clz to find the highest set bit, asserts bit < KE_EVT_MAX,
   ## then dispatches through keEvtHandlers[bit] with indirect call.
-  let field = keEvtField
-  if field == 0: return
-  let bit = eventIndex32(field)
-  nimFwTrace2U32("[WIFI-NIMFW] evt_sched ", field, bit)
-  if bit >= KE_EVT_MAX.uint32:
+  let pendingEventField = keEvtField
+  if pendingEventField == 0: return
+  let eventIndex = eventIndex32(pendingEventField)
+  nimFwTrace2U32("[WIFI-NIMFW] evt_sched ", pendingEventField, eventIndex)
+  if eventIndex >= KE_EVT_MAX.uint32:
     assert_err("ke_event.c", "ke_event.c", 236)
-  let handler = keEvtHandlers[bit].handler
+  let handler = keEvtHandlers[eventIndex].handler
   if handler == nil:
     assert_err("ke_event.c", "ke_event.c", 236)
-  let fn = cast[proc(param: pointer) {.cdecl.}](handler)
-  fn(keEvtHandlers[bit].param)
+  let eventHandler = cast[proc(param: pointer) {.cdecl.}](handler)
+  eventHandler(keEvtHandlers[eventIndex].param)
 
 # ###########################################################################
 #                      KERNEL: MESSAGES (ke_msg_*)
@@ -516,21 +518,21 @@ proc ke_msg_save*(param: pointer): cint {.exportc, cdecl.} =
 
 proc ke_queue_extract*(queue: ptr CoList, cmpFn: proc(elem: ptr CoListHdr, param: pointer): bool {.cdecl.}, param: pointer): ptr CoListHdr {.exportc, cdecl.} =
   ## Extract first element matching cmpFn from queue.
-  var prev: ptr CoListHdr = nil
-  var cur = queue.first
-  while cur != nil:
-    let next = cur.next
-    if cmpFn(cur, param):
-      if prev == nil:
-        queue.first = next
+  var previousNode: ptr CoListHdr = nil
+  var currentNode = queue.first
+  while currentNode != nil:
+    let nextNode = currentNode.next
+    if cmpFn(currentNode, param):
+      if previousNode == nil:
+        queue.first = nextNode
       else:
-        prev.next = next
-      if next == nil:
-        queue.last = prev
-      cur.next = nil
-      return cur
-    prev = cur
-    cur = next
+        previousNode.next = nextNode
+      if nextNode == nil:
+        queue.last = previousNode
+      currentNode.next = nil
+      return currentNode
+    previousNode = currentNode
+    currentNode = nextNode
   return nil
 
 # ###########################################################################
@@ -580,11 +582,11 @@ proc cmp_dest_id(elem: ptr CoListHdr, param: pointer): bool {.exportc, cdecl.} =
   return hdr.destId == encodedArgU8(param)
 
 proc ke_saved_queue_has_dest(taskId: uint8): bool =
-  var cur = keMsgQueueSaved.first
-  while cur != nil:
-    if cast[ptr KeMsgHdr](cur).destId == taskId:
+  var currentNode = keMsgQueueSaved.first
+  while currentNode != nil:
+    if cast[ptr KeMsgHdr](currentNode).destId == taskId:
       return true
-    cur = cur.next
+    currentNode = currentNode.next
   false
 
 proc ke_reschedule_saved_messages(taskId: uint8,
@@ -670,14 +672,14 @@ proc ke_handler_search*(msgId: uint16, desc: ptr KeMsgHandlerDesc): pointer {.ex
   ## From blob: iterates handler table in reverse order (countdown from numHandlers-1).
   if desc.numHandlers == 0: return nil
   let table = desc.handlers
-  var i = desc.numHandlers.int - 1
-  while i >= 0:
-    let entry = keMsgHandlerEntryAt(table, i.uint16)
-    if uint16(entry.msgId) == msgId:
-      if entry.handler == nil:
+  var handlerIndex = desc.numHandlers.int - 1
+  while handlerIndex >= 0:
+    let messageHandlerEntry = keMsgHandlerEntryAt(table, handlerIndex.uint16)
+    if uint16(messageHandlerEntry.msgId) == msgId:
+      if messageHandlerEntry.handler == nil:
         assert_err("ke_task.c", "ke_task.c", 233)
-      return entry.handler
-    dec i
+      return messageHandlerEntry.handler
+    dec handlerIndex
   return nil
 
 proc keResumeSavedMessagesIfIdle() {.inline.} =
@@ -763,18 +765,18 @@ proc ke_task_schedule*() {.exportc, cdecl.} =
     # in a0, so Nim handlers received msgId instead of the payload.
     let handler = cast[proc(param: pointer): cint {.cdecl.}](handlerFn)
     nimFwTrace("[WIFI-NIMFW] task_sched call")
-    let rawRes = handler(param)
-    let res =
-      if rawRes >= KeMsgConsumed and rawRes <= KeMsgSaved:
-        rawRes
+    let rawHandlerResult = handler(param)
+    let normalizedHandlerResult =
+      if rawHandlerResult >= KeMsgConsumed and rawHandlerResult <= KeMsgSaved:
+        rawHandlerResult
       else:
         KeMsgConsumed
-    if rawRes != res:
+    if rawHandlerResult != normalizedHandlerResult:
       nimFwTrace2U32("[WIFI-NIMFW] task_sched res norm ",
-                     rawRes.uint32, res.uint32)
+                     rawHandlerResult.uint32, normalizedHandlerResult.uint32)
     else:
-      nimFwTraceU32("[WIFI-NIMFW] task_sched res=", res.uint32)
-    case res
+      nimFwTraceU32("[WIFI-NIMFW] task_sched res=", normalizedHandlerResult.uint32)
+    case normalizedHandlerResult
     of KeMsgConsumed:
       ke_msg_free(node)
     of KeMsgNoFree:
@@ -979,29 +981,29 @@ proc ke_timer_schedule*() {.exportc, cdecl.} =
 
     # Timer expired: pop, send message, free
     let popped = co_list_pop_front(addr keTimerQueue)
-    let entry = cast[ptr KeTimerEntry](popped)
-    ke_msg_send_basic(entry.id, entry.taskId, 0xFF)
-    platformFree(cast[pointer](entry))
+    let expiredTimerEntry = cast[ptr KeTimerEntry](popped)
+    ke_msg_send_basic(expiredTimerEntry.id, expiredTimerEntry.taskId, 0xFF)
+    platformFree(cast[pointer](expiredTimerEntry))
     inc drained
 
-  let next = cast[ptr KeTimerEntry](keTimerQueue.first)
-  if next != nil:
-    nimFwDbgKeTimerYieldHead = next.time
-    if keTimerExpired(next):
+  let nextTimer = cast[ptr KeTimerEntry](keTimerQueue.first)
+  if nextTimer != nil:
+    nimFwDbgKeTimerYieldHead = nextTimer.time
+    if keTimerExpired(nextTimer):
       inc nimFwDbgKeTimerYield
       ke_evt_set(KE_EVT_KE_TIMER)
     else:
-      ke_timer_hw_set(next)
+      ke_timer_hw_set(nextTimer)
   else:
     ke_timer_hw_set(nil)
 
 proc ke_timer_active*(taskId: uint16, instId: uint8): bool {.exportc, cdecl.} =
   ## Check if a timer is active.
-  var cur = cast[ptr KeTimerEntry](keTimerQueue.first)
-  while cur != nil:
-    if cur.id == taskId and cur.taskId == instId:
+  var timerEntry = cast[ptr KeTimerEntry](keTimerQueue.first)
+  while timerEntry != nil:
+    if timerEntry.id == taskId and timerEntry.taskId == instId:
       return true
-    cur = cast[ptr KeTimerEntry](cast[ptr CoListHdr](cur).next)
+    timerEntry = cast[ptr KeTimerEntry](cast[ptr CoListHdr](timerEntry).next)
   return false
 
 # ###########################################################################
@@ -1030,7 +1032,7 @@ proc bl_fw_statistic_dump*() {.exportc, cdecl.} =
   ## rxl_cntrl_dump, etc.) to print queue states, then irqRestore.
   let allocFn = cast[proc(sz: uint32): pointer {.cdecl.}](
     blOpsFunc(0xB8))
-  let buf = allocFn(64)
+  let statisticScratch = allocFn(64)
   let saved = irqSave()
   let logFn = blOpsFunc(204)
   if logFn != nil:
@@ -1051,8 +1053,8 @@ proc bl_fw_statistic_dump*() {.exportc, cdecl.} =
     cast[proc(a: uint32, b: uint32, c: cstring, d: uint32) {.cdecl.}](logFn)(
       2, 0, "wifi_mgmr.c", 175)
   irqRestore(saved)
-  if buf != nil:
-    platformFree(buf)
+  if statisticScratch != nil:
+    platformFree(statisticScratch)
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void bl60x_fw_dump_statistic(int);".}
 proc bl60x_fw_dump_statistic*(forced: cint) {.exportc, cdecl.} =
@@ -1072,33 +1074,22 @@ proc bl60x_fw_dump_statistic*(forced: cint) {.exportc, cdecl.} =
 #                     HAL MAC HW (hal_machw_*)
 # ###########################################################################
 
-when defined(bl808WifiAllowLegacyBl606pRfFallback):
-  proc phy_get_ntx(): uint8 {.importc: "phy_get_ntx", cdecl.}
-  proc phy_get_nss(): uint8 {.importc: "phy_get_nss", cdecl.}
-  proc phy_ldpc_tx_supported(): bool {.importc: "phy_ldpc_tx_supported", cdecl.}
-    ## Explicit legacy BL606P PHY fallback: reports whether TX LDPC is supported.
-  proc phy_get_rf_gain_idx(txPowerElem: pointer, rateParam: pointer) {.importc: "phy_get_rf_gain_idx", cdecl.}
-    ## Explicit legacy BL606P fallback: converts TX power element to RF gain index.
 proc tcpip_stack_input(entry: pointer, descFlag: uint32, payload: pointer, bufOff: uint32, dmaArray: pointer, fcFlag: uint32): cint {.importc: "tcpip_stack_input", cdecl.}
   ## External: fast-path delivery of RX data frames to TCP/IP stack.
-when defined(bl808WifiAllowLegacyBl606pRfFallback):
-  proc trpc_get_default_power_idx(rateType: uint32, rateIdx: uint8): int8 {.importc: "trpc_get_default_power_idx", cdecl.}
-    ## Explicit legacy BL606P fallback: get default TX power index.
 
 proc bl808ApplyPureRfMacTimingBaseline() {.inline.} =
-  when defined(bl808WifiUseBl808Rf):
-    ## Match the passing vendor MAC timing state observed at the scan
-    ## mm_active edge. These timing registers directly gate RX/TX PHY delays.
-    regWrite(MACHW_BASE + 0x0E8'u, 0x00016809'u32)
-    regWrite(MACHW_BASE + 0x0F0'u, 0x05414002'u32)
-    regWrite(MACHW_BASE + 0x0F4'u, 0x0001900A'u32)
-    regWrite(MACHW_BASE + 0x0F8'u, 0x00028010'u32)
-    regWrite(MACHW_BASE + 0x104'u, 0x0C814028'u32)
-    nimFwDbgMacTimingE8 = regRead(MACHW_BASE + 0x0E8'u)
-    nimFwDbgMacTimingF0 = regRead(MACHW_BASE + 0x0F0'u)
-    nimFwDbgMacTimingF4 = regRead(MACHW_BASE + 0x0F4'u)
-    nimFwDbgMacTimingF8 = regRead(MACHW_BASE + 0x0F8'u)
-    nimFwDbgMacTiming104 = regRead(MACHW_BASE + 0x104'u)
+  ## Match the passing vendor MAC timing state observed at the scan
+  ## mm_active edge. These timing registers directly gate RX/TX PHY delays.
+  regWrite(MACHW_BASE + 0x0E8'u, 0x00016809'u32)
+  regWrite(MACHW_BASE + 0x0F0'u, 0x05414002'u32)
+  regWrite(MACHW_BASE + 0x0F4'u, 0x0001900A'u32)
+  regWrite(MACHW_BASE + 0x0F8'u, 0x00028010'u32)
+  regWrite(MACHW_BASE + 0x104'u, 0x0C814028'u32)
+  nimFwDbgMacTimingE8 = regRead(MACHW_BASE + 0x0E8'u)
+  nimFwDbgMacTimingF0 = regRead(MACHW_BASE + 0x0F0'u)
+  nimFwDbgMacTimingF4 = regRead(MACHW_BASE + 0x0F4'u)
+  nimFwDbgMacTimingF8 = regRead(MACHW_BASE + 0x0F8'u)
+  nimFwDbgMacTiming104 = regRead(MACHW_BASE + 0x104'u)
 
 proc hal_machw_init*() {.exportc, cdecl.} =
   ## Initialize MAC HW registers.
@@ -1134,7 +1125,7 @@ proc hal_machw_init*() {.exportc, cdecl.} =
     COEX_004             = COEX_BASE + 0x004'u   # COEX control
     COEX_028             = COEX_BASE + 0x028'u   # COEX timing
 
-  var r: uint32
+  var registerWriteback: uint32
 
   # -----------------------------------------------------------------------
   # Block 1: Trigger soft reset and wait for completion (0x0a - 0x1a)
@@ -1150,27 +1141,27 @@ proc hal_machw_init*() {.exportc, cdecl.} =
   regWrite(REG_404, 0x0024F637'u32)
 
   # Read BCN_STATUS, set bit 0 (enable), write back
-  r = regRead(REG_400)
-  r = r or 0x01'u32
-  regWrite(REG_400, r)
+  registerWriteback = regRead(REG_400)
+  registerWriteback = registerWriteback or 0x01'u32
+  regWrite(REG_400, registerWriteback)
 
   # Read BCN_STATUS, clear bit 0 (disable), write back
-  r = regRead(REG_400)
-  r = r and not 0x01'u32
-  regWrite(REG_400, r)
+  registerWriteback = regRead(REG_400)
+  registerWriteback = registerWriteback and not 0x01'u32
+  regWrite(REG_400, registerWriteback)
 
   # Write 0x68 = core mode (basic MAC, ACK/CTS enabled, etc)
   regWrite(REG_400, 0x68'u32)
 
   # Read back, set bit 0 (re-enable)
-  r = regRead(REG_400)
-  r = r or 0x01'u32
-  regWrite(REG_400, r)
+  registerWriteback = regRead(REG_400)
+  registerWriteback = registerWriteback or 0x01'u32
+  regWrite(REG_400, registerWriteback)
 
   # Read back, clear bit 5 (soft-reset-done indicator)
-  r = regRead(REG_400)
-  r = r and not 0x20'u32
-  regWrite(REG_400, r)
+  registerWriteback = regRead(REG_400)
+  registerWriteback = registerWriteback and not 0x20'u32
+  regWrite(REG_400, registerWriteback)
 
   # -----------------------------------------------------------------------
   # Block 3: COEX and early config (0x5e - 0x6c)
@@ -1197,124 +1188,124 @@ proc hal_machw_init*() {.exportc, cdecl.} =
   let divisor = if oldClk == 0: newClk else: oldClk
 
   # Write new clock freq (40) into bits[7:0] of reg[0xE4]
-  r = regRead(REG_0E4)
-  r = (r and 0xFFFFFF00'u32) or (MACHW_CLK_FREQ and 0xFF'u32)
-  regWrite(REG_0E4, r)
+  registerWriteback = regRead(REG_0E4)
+  registerWriteback = (registerWriteback and 0xFFFFFF00'u32) or (MACHW_CLK_FREQ and 0xFF'u32)
+  regWrite(REG_0E4, registerWriteback)
 
   # --- Rescale reg[0xE4] bits[17:8] (10-bit field: slot time) ---
   block:
-    let raw = regRead(REG_0E4)
-    let field = (raw shr 8) and 0x3FF'u32  # extract bits[17:8]
-    let scaled = ((field * newClk) div divisor) shl 8
+    let slotTimeControl = regRead(REG_0E4)
+    let slotTimeField = (slotTimeControl shr 8) and 0x3FF'u32  # extract bits[17:8]
+    let scaled = ((slotTimeField * newClk) div divisor) shl 8
     # Assert no overflow into bits[23:18]
     if (scaled and 0x00FC0000'u32) != 0:
       assert_err("hal_machw.c", "hal_machw.c", 0x1D59.cint)
     # Write back bits[17:8]
-    r = regRead(REG_0E4)
-    r = (r and 0xFFFC00FF'u32) or (scaled and 0x0003FF00'u32)
-    regWrite(REG_0E4, r)
+    registerWriteback = regRead(REG_0E4)
+    registerWriteback = (registerWriteback and 0xFFFC00FF'u32) or (scaled and 0x0003FF00'u32)
+    regWrite(REG_0E4, registerWriteback)
 
   # --- Set reg[0xE4] bits[27:18] = 0x88 (fixed value, OR'd as 0x02200000) ---
-  r = regRead(REG_0E4)
-  r = (r and 0xF003FFFF'u32) or 0x02200000'u32
-  regWrite(REG_0E4, r)
+  registerWriteback = regRead(REG_0E4)
+  registerWriteback = (registerWriteback and 0xF003FFFF'u32) or 0x02200000'u32
+  regWrite(REG_0E4, registerWriteback)
 
   # --- Rescale reg[0xE8] bits[23:8] (16-bit field: SIFS time) ---
   block:
-    let raw = regRead(REG_0E8)
-    let field = (raw shr 8) and 0xFFFF'u32  # extract bits[23:8]
-    let scaled = ((field * newClk) div divisor) shl 8
+    let sifsTimeControl = regRead(REG_0E8)
+    let sifsTimeField = (sifsTimeControl shr 8) and 0xFFFF'u32  # extract bits[23:8]
+    let scaled = ((sifsTimeField * newClk) div divisor) shl 8
     # Merge: keep bits[31:24] and bits[7:0], replace bits[23:8]
-    let preserved = raw and 0xFF0000FF'u32
+    let preserved = sifsTimeControl and 0xFF0000FF'u32
     regWrite(REG_0E8, (scaled and 0x00FFFF00'u32) or preserved)
 
   # --- Set reg[0xEC] bits[27:20] = 0x27 (fixed, OR'd as 0x02700000) ---
-  r = regRead(REG_0EC)
-  r = (r and 0xC00FFFFF'u32) or 0x02700000'u32
-  regWrite(REG_0EC, r)
+  registerWriteback = regRead(REG_0EC)
+  registerWriteback = (registerWriteback and 0xC00FFFFF'u32) or 0x02700000'u32
+  regWrite(REG_0EC, registerWriteback)
 
   # --- Rescale reg[0xEC] bits[19:10] (10-bit field) ---
   block:
-    let raw = regRead(REG_0EC)
-    let field = (raw shr 10) and 0x3FF'u32
-    let scaled = ((field * newClk) div divisor) shl 10
+    let machwTimingEcControl = regRead(REG_0EC)
+    let timingEcField = (machwTimingEcControl shr 10) and 0x3FF'u32
+    let scaled = ((timingEcField * newClk) div divisor) shl 10
     # Assert no overflow into bits[25:20]
     if (scaled and 0x03F00000'u32) != 0:
       assert_err("hal_machw.c", "hal_machw.c", 0x1EA2.cint)
     # Write back bits[19:10]
-    r = regRead(REG_0EC)
-    r = (r and 0xFFF003FF'u32) or (scaled and 0x000FFC00'u32)
-    regWrite(REG_0EC, r)
+    registerWriteback = regRead(REG_0EC)
+    registerWriteback = (registerWriteback and 0xFFF003FF'u32) or (scaled and 0x000FFC00'u32)
+    regWrite(REG_0EC, registerWriteback)
 
   # --- Set reg[0xEC] bits[9:0] = 180 (0xB4) ---
-  r = regRead(REG_0EC)
-  r = (r and 0xFFFFFC00'u32) or 180'u32
-  regWrite(REG_0EC, r)
+  registerWriteback = regRead(REG_0EC)
+  registerWriteback = (registerWriteback and 0xFFFFFC00'u32) or 180'u32
+  regWrite(REG_0EC, registerWriteback)
 
   # --- Set reg[0xF0] bits[1:0] based on clock frequency ---
-  r = regRead(REG_0F0)
+  registerWriteback = regRead(REG_0F0)
   if newClk <= 29:
-    r = r or 0x03'u32               # divider = 3
+    registerWriteback = registerWriteback or 0x03'u32               # divider = 3
   elif newClk <= 59:
-    r = (r and not 0x03'u32) or 0x02'u32  # divider = 2
+    registerWriteback = (registerWriteback and not 0x03'u32) or 0x02'u32  # divider = 2
   else:
-    r = (r and not 0x03'u32) or 0x01'u32  # divider = 1
-  regWrite(REG_0F0, r)
+    registerWriteback = (registerWriteback and not 0x03'u32) or 0x01'u32  # divider = 1
+  regWrite(REG_0F0, registerWriteback)
 
   # --- Rescale reg[0xF4] bits[23:8] (16-bit field) ---
   block:
-    let raw = regRead(REG_0F4)
-    let field = (raw shr 8) and 0xFFFF'u32
-    let scaled = ((field * newClk) div divisor) shl 8
-    let preserved = raw and 0xFF0000FF'u32
+    let machwTimingF4Control = regRead(REG_0F4)
+    let timingF4Field = (machwTimingF4Control shr 8) and 0xFFFF'u32
+    let scaled = ((timingF4Field * newClk) div divisor) shl 8
+    let preserved = machwTimingF4Control and 0xFF0000FF'u32
     regWrite(REG_0F4, (scaled and 0x00FFFF00'u32) or preserved)
 
   # --- Rescale reg[0xF8] bits[23:8] (16-bit field) ---
   block:
-    let raw = regRead(REG_0F8)
-    let field = (raw shr 8) and 0xFFFF'u32
-    let scaled = ((field * newClk) div divisor) shl 8
-    let preserved = raw and 0xFF0000FF'u32
+    let machwTimingF8Control = regRead(REG_0F8)
+    let timingF8Field = (machwTimingF8Control shr 8) and 0xFFFF'u32
+    let scaled = ((timingF8Field * newClk) div divisor) shl 8
+    let preserved = machwTimingF8Control and 0xFF0000FF'u32
     regWrite(REG_0F8, (scaled and 0x00FFFF00'u32) or preserved)
 
   # --- Rescale reg[0x104] bits[29:20] (10-bit field) ---
   block:
-    let raw = regRead(REG_104)
-    let field = (raw shr 20) and 0x3FF'u32
-    let scaled = ((field * newClk) div divisor) shl 20
+    let machwTiming104Control = regRead(REG_104)
+    let timing104HighField = (machwTiming104Control shr 20) and 0x3FF'u32
+    let scaled = ((timing104HighField * newClk) div divisor) shl 20
     # Assert no overflow into bits[31:30]
     if (scaled and 0xC0000000'u32) != 0:
       assert_err("hal_machw.c", "hal_machw.c", 0x228A.cint)
     # Write back bits[29:20], preserve rest
-    r = regRead(REG_104)
-    r = (r and 0xC00FFFFF'u32) or (scaled and 0x3FF00000'u32)
-    regWrite(REG_104, r)
+    registerWriteback = regRead(REG_104)
+    registerWriteback = (registerWriteback and 0xC00FFFFF'u32) or (scaled and 0x3FF00000'u32)
+    regWrite(REG_104, registerWriteback)
 
   # --- Rescale reg[0x104] bits[19:10] (10-bit field) ---
   block:
-    let raw = regRead(REG_104)
-    let field = (raw shr 10) and 0x3FF'u32
-    let scaled = ((field * newClk) div divisor) shl 10
+    let machwTiming104Control = regRead(REG_104)
+    let timing104MidField = (machwTiming104Control shr 10) and 0x3FF'u32
+    let scaled = ((timing104MidField * newClk) div divisor) shl 10
     # Assert no overflow into bits[25:20]
     if (scaled and 0x03F00000'u32) != 0:
       assert_err("hal_machw.c", "hal_machw.c", 0x22A4.cint)
     # Write back bits[19:10], preserve rest
-    r = regRead(REG_104)
-    r = (r and 0xFFF003FF'u32) or (scaled and 0x000FFC00'u32)
-    regWrite(REG_104, r)
+    registerWriteback = regRead(REG_104)
+    registerWriteback = (registerWriteback and 0xFFF003FF'u32) or (scaled and 0x000FFC00'u32)
+    regWrite(REG_104, registerWriteback)
 
   # --- Rescale reg[0x104] bits[9:0] (10-bit field) ---
   block:
-    let raw = regRead(REG_104)
-    let field = raw and 0x3FF'u32
-    let scaled = (field * newClk) div divisor
+    let machwTiming104Control = regRead(REG_104)
+    let timing104LowField = machwTiming104Control and 0x3FF'u32
+    let scaled = (timing104LowField * newClk) div divisor
     # Assert no overflow beyond 10 bits
     if (scaled and 0xFC00'u32) != 0:
       assert_err("hal_machw.c", "hal_machw.c", 0x22BE.cint)
     # Write back bits[9:0], preserve rest
-    r = regRead(REG_104)
-    r = (r and 0xFFFFFC00'u32) or (scaled and 0x3FF'u32)
-    regWrite(REG_104, r)
+    registerWriteback = regRead(REG_104)
+    registerWriteback = (registerWriteback and 0xFFFFFC00'u32) or (scaled and 0x3FF'u32)
+    regWrite(REG_104, registerWriteback)
 
   # -----------------------------------------------------------------------
   # Block 6: INTC / IRQ configuration (0x308 - 0x320)
@@ -1323,9 +1314,9 @@ proc hal_machw_init*() {.exportc, cdecl.} =
   regWrite(MACHW_INTC_UNMASK_REG, 0x8373F14C'u32)
 
   # Clear bit 11 in STATUS register (0x4C)
-  r = regRead(REG_04C)
-  r = r and 0xFFFFF7FF'u32  # clear bit 11
-  regWrite(REG_04C, r)
+  registerWriteback = regRead(REG_04C)
+  registerWriteback = registerWriteback and 0xFFFFF7FF'u32  # clear bit 11
+  regWrite(REG_04C, registerWriteback)
 
   # -----------------------------------------------------------------------
   # Block 7: Signature / version assert (0x322 - 0x34a)
@@ -1356,14 +1347,14 @@ proc hal_machw_init*() {.exportc, cdecl.} =
 
   # Set bits in STATUS register (0x4C): OR in 0x040007C0
   # (bits 26, 10, 9, 8, 7, 6 = active_clk_gate, CCA, TX, RX enables)
-  r = regRead(REG_04C)
-  r = r or 0x040007C0'u32
-  regWrite(REG_04C, r)
+  registerWriteback = regRead(REG_04C)
+  registerWriteback = registerWriteback or 0x040007C0'u32
+  regWrite(REG_04C, registerWriteback)
 
   # Set bit 16 in DOZE_CNTRL2 (0x54)
-  r = regRead(REG_054)
-  r = (r and 0xFFFEFFFF'u32) or 0x00010000'u32
-  regWrite(REG_054, r)
+  registerWriteback = regRead(REG_054)
+  registerWriteback = (registerWriteback and 0xFFFEFFFF'u32) or 0x00010000'u32
+  regWrite(REG_054, registerWriteback)
 
   # Write RX control register (0x60) = 0x7FFFFFDE
   regWrite(REG_060, 0x7FFFFFDE'u32)
@@ -1384,22 +1375,22 @@ proc hal_machw_init*() {.exportc, cdecl.} =
   regWrite(REG_0A0, 0x00002020'u32)
 
   # Set bit 12 in STATUS register (0x4C)
-  r = regRead(REG_04C)
-  r = (r and 0xFFFFEFFF'u32) or 0x00001000'u32
-  regWrite(REG_04C, r)
+  registerWriteback = regRead(REG_04C)
+  registerWriteback = (registerWriteback and 0xFFFFEFFF'u32) or 0x00001000'u32
+  regWrite(REG_04C, registerWriteback)
 
   # Set bit 13 in STATUS register (0x4C)
-  r = regRead(REG_04C)
-  r = (r and 0xFFFFDFFF'u32) or 0x00002000'u32
-  regWrite(REG_04C, r)
+  registerWriteback = regRead(REG_04C)
+  registerWriteback = (registerWriteback and 0xFFFFDFFF'u32) or 0x00002000'u32
+  regWrite(REG_04C, registerWriteback)
 
   # Write rate control config (0x510) = 0x1C25
   regWrite(REG_510, 0x00001C25'u32)
 
   # Set bit 7 in MAC core control 2 (0x310)
-  r = regRead(REG_310)
-  r = r or 0x80'u32
-  regWrite(REG_310, r)
+  registerWriteback = regRead(REG_310)
+  registerWriteback = registerWriteback or 0x80'u32
+  regWrite(REG_310, registerWriteback)
 
   # -----------------------------------------------------------------------
   # Block 10: Antenna / TX chain config (0x402 - 0x448)
@@ -1413,14 +1404,14 @@ proc hal_machw_init*() {.exportc, cdecl.} =
     if (ntxField and 0xE0000000'u32) != 0:
       assert_err("hal_machw.c", "hal_machw.c", 0x1539.cint)
     # Write bits[28:26] of reg[0x9C]
-    r = regRead(REG_09C)
-    r = (r and 0xE3FFFFFF'u32) or (ntxField and 0x1C000000'u32)
-    regWrite(REG_09C, r)
+    registerWriteback = regRead(REG_09C)
+    registerWriteback = (registerWriteback and 0xE3FFFFFF'u32) or (ntxField and 0x1C000000'u32)
+    regWrite(REG_09C, registerWriteback)
 
   # Set bit 25 in STATUS register (0x4C)
-  r = regRead(REG_04C)
-  r = (r and 0xFDFFFFFF'u32) or 0x02000000'u32
-  regWrite(REG_04C, r)
+  registerWriteback = regRead(REG_04C)
+  registerWriteback = (registerWriteback and 0xFDFFFFFF'u32) or 0x02000000'u32
+  regWrite(REG_04C, registerWriteback)
   bl808ApplyPureRfMacTimingBaseline()
 
 proc hal_machw_reset*() {.exportc, cdecl.} =
@@ -1556,7 +1547,7 @@ proc hal_machw_disable_int*() {.exportc, cdecl.} =
   genStatus = genStatus and not 0x80000000'u32
   regWrite(MACHW_INTC_GEN_STATUS, genStatus)
 
-proc hal_machw_search_addr*(addr_ptr: pointer, idx: uint32): uint32 {.exportc, cdecl.} =
+proc hal_machw_search_addr*(macAddrPtr: pointer, unusedCompatArg: uint32): uint32 {.exportc, cdecl.} =
   ## Search MAC HW address table for a MAC address (32 instrs).
   ## From blob: writes the 6-byte MAC address into MACHW registers at
   ## 0x24B000BC (lower 4 bytes) and 0x24B000C0 (upper 2 bytes).
@@ -1564,7 +1555,8 @@ proc hal_machw_search_addr*(addr_ptr: pointer, idx: uint32): uint32 {.exportc, c
   ## Polls 0x24B000C4 until bit 29 (0x20000000) clears.
   ## Then checks bit 28 (0x10000000): if set, result = 0xFF (not found),
   ## else result = ((reg >> 16) - 8) & 0xFF.
-  let addrView = macAddrAt(addr_ptr)
+  discard unusedCompatArg
+  let addrView = macAddrAt(macAddrPtr)
   # Write to MACHW search registers
   regWrite(MACHW_BASE + 0x0BC'u, addrView.lowLe)
   regWrite(MACHW_BASE + 0x0C0'u, addrView.highLe)
@@ -1635,12 +1627,12 @@ proc hal_machw_sleep_check*(): bool {.exportc, cdecl.} =
     MACHW_CHAN_STAT_BASE = MACHW_BASE + 0x128'u
   let activeAcs = regRead(MACHW_ACTIVE_AC_REG)
   let macTime = regRead(MACHW_TIMLO_REG)
-  for i in 0'u32 ..< 10:
-    let acBit = 1'u32 shl i
+  for accessCategoryIndex in 0'u32 ..< 10:
+    let acBit = 1'u32 shl accessCategoryIndex
     if (activeAcs and acBit) == 0:
       continue
     # Read per-AC channel timestamp
-    let perAcTime = regRead(MACHW_CHAN_STAT_BASE + i * 4)
+    let perAcTime = regRead(MACHW_CHAN_STAT_BASE + accessCategoryIndex * 4)
     # Check if recently active: -2000 - macTime + perAcTime < 0 means recent
     let delta = cast[int32](-2000) - cast[int32](macTime) + cast[int32](perAcTime)
     if delta >= 0:
@@ -1815,10 +1807,10 @@ proc hal_machw_timing_info*() {.exportc, cdecl.} =
 
   # --- REG 0xE4: Timing Set 1 ---
   block:
-    let r = regRead(REG_0E4)
-    let txStartDelayOFDM = (r shr 18) and 0x3FF'u32   # bits[27:18]
-    let slotTime         = (r shr 8)  and 0xFFFF'u32   # bits[17:8] (blob uses & 0xFFFF)
-    let macCoreClkFreq   = r and 0xFF'u32              # bits[7:0]
+    let timingSet1 = regRead(REG_0E4)
+    let txStartDelayOFDM = (timingSet1 shr 18) and 0x3FF'u32   # bits[27:18]
+    let slotTime         = (timingSet1 shr 8)  and 0xFFFF'u32   # bits[17:8] (blob uses & 0xFFFF)
+    let macCoreClkFreq   = timingSet1 and 0xFF'u32              # bits[7:0]
     if printHdrFn != nil:
       pHdr("hal_machw.c", 0, 0)
     if printFldFn != nil:
@@ -1828,19 +1820,19 @@ proc hal_machw_timing_info*() {.exportc, cdecl.} =
 
   # --- REG 0xE8: Timing Set 2 ---
   block:
-    let r = regRead(REG_0E8)
-    let txChainDelay = (r shr 8) and 0xFFFF'u32       # bits[23:8]
-    let txDEDelay    = r and 0xFF'u32                  # bits[7:0]
+    let timingSet2 = regRead(REG_0E8)
+    let txChainDelay = (timingSet2 shr 8) and 0xFFFF'u32       # bits[23:8]
+    let txDEDelay    = timingSet2 and 0xFF'u32                  # bits[7:0]
     if printFldFn != nil:
       pFld("txChainDelay", txChainDelay, txChainDelay)
       pFld("txDEDelay", txDEDelay, txDEDelay)
 
   # --- REG 0xEC: Timing Set 3 ---
   block:
-    let r = regRead(REG_0EC)
-    let rxRFDelay       = (r shr 20) and 0x3FF'u32    # bits[29:20]
-    let txDelayRFOnOff  = (r shr 10) and 0x3FF'u32    # bits[19:10]
-    let macProcDelay    = r and 0x3FF'u32              # bits[9:0]
+    let timingSet3 = regRead(REG_0EC)
+    let rxRFDelay       = (timingSet3 shr 20) and 0x3FF'u32    # bits[29:20]
+    let txDelayRFOnOff  = (timingSet3 shr 10) and 0x3FF'u32    # bits[19:10]
+    let macProcDelay    = timingSet3 and 0x3FF'u32              # bits[9:0]
     if printFldFn != nil:
       pFld("rxRFDelay", rxRFDelay, rxRFDelay)
       pFld("txDelayRFOnOff", txDelayRFOnOff, txDelayRFOnOff)
@@ -1848,10 +1840,10 @@ proc hal_machw_timing_info*() {.exportc, cdecl.} =
 
   # --- REG 0xF0: Timing Set 4 ---
   block:
-    let r = regRead(REG_0F0)
-    let radioWakeUpTime = r shr 22                     # bits[31:22]
-    let radioChirpTime  = (r shr 12) and 0x3FF'u32    # bits[21:12]
-    let clkDivider      = r and 0x3'u32                # bits[1:0]
+    let timingSet4 = regRead(REG_0F0)
+    let radioWakeUpTime = timingSet4 shr 22                     # bits[31:22]
+    let radioChirpTime  = (timingSet4 shr 12) and 0x3FF'u32    # bits[21:12]
+    let clkDivider      = timingSet4 and 0x3'u32                # bits[1:0]
     if printFldFn != nil:
       pFld("radioWakeUpTime", radioWakeUpTime, radioWakeUpTime)
       pFld("radioChirpTime", radioChirpTime, radioChirpTime)
@@ -1859,38 +1851,38 @@ proc hal_machw_timing_info*() {.exportc, cdecl.} =
 
   # --- REG 0xF4: Timing Set 5 ---
   block:
-    let r = regRead(REG_0F4)
-    let ofdmRxStartDelay = (r shr 8) and 0xFFFF'u32   # bits[23:8]
-    let ofdmRxChainDelay = r and 0xFF'u32              # bits[7:0]
+    let timingSet5 = regRead(REG_0F4)
+    let ofdmRxStartDelay = (timingSet5 shr 8) and 0xFFFF'u32   # bits[23:8]
+    let ofdmRxChainDelay = timingSet5 and 0xFF'u32              # bits[7:0]
     if printFldFn != nil:
       pFld("ofdmRxStartDelay", ofdmRxStartDelay, ofdmRxStartDelay)
       pFld("ofdmRxChainDelay", ofdmRxChainDelay, ofdmRxChainDelay)
 
   # --- REG 0xF8: Timing Set 6 ---
   block:
-    let r = regRead(REG_0F8)
-    let dsssRxStartDelay = (r shr 8) and 0xFFFF'u32   # bits[23:8]
-    let dsssRxChainDelay = r and 0xFF'u32              # bits[7:0]
+    let timingSet6 = regRead(REG_0F8)
+    let dsssRxStartDelay = (timingSet6 shr 8) and 0xFFFF'u32   # bits[23:8]
+    let dsssRxChainDelay = timingSet6 and 0xFF'u32              # bits[7:0]
     if printFldFn != nil:
       pFld("dsssRxStartDelay", dsssRxStartDelay, dsssRxStartDelay)
       pFld("dsssRxChainDelay", dsssRxChainDelay, dsssRxChainDelay)
 
   # --- REG 0xFC: Timing Set 7 ---
   block:
-    let r = regRead(REG_0FC)
-    let edcaTriggerTimer = (r shr 8) and 0xF'u32      # bits[11:8]
-    let slotCounterAddr  = r and 0xFF'u32              # bits[7:0]
+    let timingSet7 = regRead(REG_0FC)
+    let edcaTriggerTimer = (timingSet7 shr 8) and 0xF'u32      # bits[11:8]
+    let slotCounterAddr  = timingSet7 and 0xFF'u32              # bits[7:0]
     if printFldFn != nil:
       pFld("edcaTriggerTimer", edcaTriggerTimer, edcaTriggerTimer)
       pFld("slotCounterAddr", slotCounterAddr, slotCounterAddr)
 
   # --- REG 0x100: Timing Set 8 ---
   block:
-    let r = regRead(REG_100)
-    let sifsBDelay   = (r shr 24) and 0xFF'u32        # bits[31:24]
-    let sifsADelay   = (r shr 16) and 0xFF'u32        # bits[23:16]
-    let eifsDuration = (r shr 8)  and 0xFF'u32        # bits[15:8]
-    let slotTime2    = r and 0xFF'u32                  # bits[7:0]
+    let timingSet8 = regRead(REG_100)
+    let sifsBDelay   = (timingSet8 shr 24) and 0xFF'u32        # bits[31:24]
+    let sifsADelay   = (timingSet8 shr 16) and 0xFF'u32        # bits[23:16]
+    let eifsDuration = (timingSet8 shr 8)  and 0xFF'u32        # bits[15:8]
+    let slotTime2    = timingSet8 and 0xFF'u32                  # bits[7:0]
     if printFldFn != nil:
       pFld("sifsBDelay", sifsBDelay, sifsBDelay)
       pFld("sifsADelay", sifsADelay, sifsADelay)
@@ -1899,24 +1891,24 @@ proc hal_machw_timing_info*() {.exportc, cdecl.} =
 
   # --- REG 0x104: Timing Set 9 ---
   block:
-    let r = regRead(REG_104)
-    let txDMAProcDelay = (r shr 20) and 0x3FF'u32     # bits[29:20]
-    let rifsToDelay    = (r shr 10) and 0x3FF'u32     # bits[19:10]
-    let rifsTOInMACClk = r and 0x3FF'u32              # bits[9:0]
+    let timingSet9 = regRead(REG_104)
+    let txDMAProcDelay = (timingSet9 shr 20) and 0x3FF'u32     # bits[29:20]
+    let rifsToDelay    = (timingSet9 shr 10) and 0x3FF'u32     # bits[19:10]
+    let rifsTOInMACClk = timingSet9 and 0x3FF'u32              # bits[9:0]
     if printFldFn != nil:
       pFld("txDMAProcDelay", txDMAProcDelay, txDMAProcDelay)
       pFld("rifsToDelay", rifsToDelay, rifsToDelay)
       pFld("rifsTOInMACClk", rifsTOInMACClk, rifsTOInMACClk)
 
-proc blmac_abs_timer_set*(idx: uint32, value: uint32) {.exportc, cdecl, noinline.} =
+proc blmac_abs_timer_set*(timerIndex: uint32, timerValue: uint32) {.exportc, cdecl, noinline.} =
   ## Set an absolute timer by index (0..9).
-  ## From blob (hal_machw.o, 19 instrs): asserts idx <= 9, then computes
-  ## address = (0x092C004A + idx) << 2 and stores value there.
-  ## The address formula maps to MACHW_INTC_BASE + 0x128 + idx*4.
-  if idx > 9:
+  ## From blob (hal_machw.o, 19 instrs): asserts timerIndex <= 9, then
+  ## computes address = (0x092C004A + timerIndex) << 2 and stores timerValue
+  ## there. The address formula maps to MACHW_INTC_BASE + 0x128 + timerIndex*4.
+  if timerIndex > 9:
     assert_err("hal_machw.c", "hal_machw.c", 0x26A0)
-  let timerAddr = MACHW_INTC_BASE + 0x128'u + idx * 4
-  regWrite(timerAddr, value)
+  let timerAddr = MACHW_INTC_BASE + 0x128'u + timerIndex * 4
+  regWrite(timerAddr, timerValue)
 
 proc blmac_pwr_mgt_setf*(value: uint32) {.exportc, cdecl, noinline.} =
   ## Set power management field in MAC HW state register.
@@ -1937,10 +1929,10 @@ proc blmac_soft_reset_getf*(): uint8 {.exportc, cdecl, noinline.} =
   ## Read soft reset status field from MACHW_INTC.
   ## From blob (hal_machw.o, 14 instrs): reads MACHW_INTC_BASE+0x050,
   ## asserts only bit 0 is used (andi ~1 must be 0), returns low byte.
-  let val = regRead(MACHW_INTC_BASE + 0x050'u)
-  if (val and not 0x01'u32) != 0:
+  let softResetStatus = regRead(MACHW_INTC_BASE + 0x050'u)
+  if (softResetStatus and not 0x01'u32) != 0:
     assert_err("hal_machw.c", "hal_machw.c", 285)
-  return (val and 0xFF'u32).uint8
+  return (softResetStatus and 0xFF'u32).uint8
 
 proc hal_machw_rx_duration*(rxvec: pointer, band: uint32): uint32 {.exportc, cdecl.} =
   ## Calculate RX frame duration from RX vector descriptor.
@@ -2005,10 +1997,10 @@ proc is_cck_group*(rateConfig: uint32): bool {.exportc, cdecl, noinline.} =
 proc xor_bytes*(dst: pointer, src: pointer, count: uint32) {.exportc: "xor", cdecl.} =
   ## XOR 'count' bytes from src into dst (in-place).
   ## From blob (mfp_bip.o, 9 instrs): loop XORing byte by byte.
-  for i in 0'u32 ..< count:
-    let s = cast[ptr uint8](cast[uint](src) + i)[]
-    let d = cast[ptr uint8](cast[uint](dst) + i)[]
-    cast[ptr uint8](cast[uint](dst) + i)[] = d xor s
+  for xorByteOffset in 0'u32 ..< count:
+    let sourceByte = cast[ptr uint8](cast[uint](src) + xorByteOffset)[]
+    let destinationByte = cast[ptr uint8](cast[uint](dst) + xorByteOffset)[]
+    cast[ptr uint8](cast[uint](dst) + xorByteOffset)[] = destinationByte xor sourceByte
 
 proc add_round_key*(roundKeys: pointer, state: pointer, round: uint32) {.exportc, cdecl, noinline.} =
   ## XOR a 16-byte AES round key into state.
@@ -2017,10 +2009,10 @@ proc add_round_key*(roundKeys: pointer, state: pointer, round: uint32) {.exportc
   ## aes_encrypt_block (11 sites); without noinline GCC inlines/merges calls.
   {.emit: ["asm volatile(\"\" ::: \"memory\");"].}
   let keyBase = cast[uint](roundKeys) + round * 16
-  for i in 0'u32 ..< 4:
-    let kw = cast[ptr uint32](keyBase + i * 4)[]
-    let sw = cast[ptr uint32](cast[uint](state) + i * 4)[]
-    cast[ptr uint32](cast[uint](state) + i * 4)[] = sw xor kw
+  for roundKeyWordIndex in 0'u32 ..< 4:
+    let kw = cast[ptr uint32](keyBase + roundKeyWordIndex * 4)[]
+    let sw = cast[ptr uint32](cast[uint](state) + roundKeyWordIndex * 4)[]
+    cast[ptr uint32](cast[uint](state) + roundKeyWordIndex * 4)[] = sw xor kw
 
 proc aes_cmac_shift_sub_key*(key: pointer) {.exportc, cdecl.} =
   ## Shift AES-CMAC subkey: byte-level left shift of 128-bit key by 1 bit.
@@ -2028,9 +2020,12 @@ proc aes_cmac_shift_sub_key*(key: pointer) {.exportc, cdecl.} =
   ## carrying bit 7 of each byte to bit 0 of the preceding byte (big-endian order).
   ## Inter-word carry: bit 7 of word[k+1] byte[0] -> word[k] byte[3] bit 0.
   ## If original MSB (word[0] byte[0] bit 7) was set, XOR word[3] with 0x87000000.
-  let p = cast[ptr UncheckedArray[uint32]](key)
-  let w0 = p[0]; let w1 = p[1]; let w2 = p[2]; let w3 = p[3]
-  let msb = (w0 and 0x80'u32) != 0  # byte[0] bit 7 = big-endian MSB
+  let subkeyWords = cast[ptr UncheckedArray[uint32]](key)
+  let subkeyWord0 = subkeyWords[0]
+  let subkeyWord1 = subkeyWords[1]
+  let subkeyWord2 = subkeyWords[2]
+  let subkeyWord3 = subkeyWords[3]
+  let msb = (subkeyWord0 and 0x80'u32) != 0  # byte[0] bit 7 = big-endian MSB
   # Byte-level left shift: each byte shifts left by 1, carry across bytes
   # Intra-word carry: bit 7 of byte[i] -> bit 0 of byte[i-1] (higher word position)
   # Masks: 0xFEFEFEFE clears carry-in positions, 0x00010101 extracts carries,
@@ -2038,12 +2033,19 @@ proc aes_cmac_shift_sub_key*(key: pointer) {.exportc, cdecl.} =
   const shiftMask = 0xFEFEFEFE'u32
   const carryMask = 0x00010101'u32
   const interMask = 0x01000000'u32
-  p[0] = ((w0 shl 1) and shiftMask) or ((w0 shr 15) and carryMask) or ((w1 shl 17) and interMask)
-  p[1] = ((w1 shl 1) and shiftMask) or ((w1 shr 15) and carryMask) or ((w2 shl 17) and interMask)
-  p[2] = ((w2 shl 1) and shiftMask) or ((w2 shr 15) and carryMask) or ((w3 shl 17) and interMask)
-  p[3] = ((w3 shl 1) and shiftMask) or ((w3 shr 15) and carryMask)
+  subkeyWords[0] = ((subkeyWord0 shl 1) and shiftMask) or
+    ((subkeyWord0 shr 15) and carryMask) or
+    ((subkeyWord1 shl 17) and interMask)
+  subkeyWords[1] = ((subkeyWord1 shl 1) and shiftMask) or
+    ((subkeyWord1 shr 15) and carryMask) or
+    ((subkeyWord2 shl 17) and interMask)
+  subkeyWords[2] = ((subkeyWord2 shl 1) and shiftMask) or
+    ((subkeyWord2 shr 15) and carryMask) or
+    ((subkeyWord3 shl 17) and interMask)
+  subkeyWords[3] = ((subkeyWord3 shl 1) and shiftMask) or
+    ((subkeyWord3 shr 15) and carryMask)
   if msb:
-    p[3] = p[3] xor 0x87000000'u32  # AES-128 CMAC polynomial (Rb)
+    subkeyWords[3] = subkeyWords[3] xor 0x87000000'u32  # AES-128 CMAC polynomial (Rb)
 
 proc mfp_is_robust_frame*(frameCtrl: uint32, subtype: uint32): bool {.exportc, cdecl, noinline.} =
   ## Check if a management frame requires protection (MFP).
@@ -2084,17 +2086,17 @@ proc mm_timer_hw_set*(timer: pointer) {.exportc, cdecl, noinline.} =
     regWrite(MACHW_ABS_TIMER_REG, expiry)
     # Enable absolute timer IRQ: set bit 7 (0x80) in INTC unmask
     let intcUnmask = MACHW_INTC_BASE + 0x08C'u  # Unmask set/status register
-    let cur = regRead(intcUnmask)
-    if (cur and 0x80'u32) == 0:
+    let unmaskStatus = regRead(intcUnmask)
+    if (unmaskStatus and 0x80'u32) == 0:
       # Write 0x80 to unmask set register
       regWrite(MACHW_INTC_BASE + 0x088'u, 0x80'u32)
-    regWrite(intcUnmask, cur or 0x80'u32)
+    regWrite(intcUnmask, unmaskStatus or 0x80'u32)
     nimFwTrace2U32("[WIFI-NIMFW] mm_timer_hw regs ", regRead(MACHW_ABS_TIMER_REG), regRead(MACHW_INTC_BASE + 0x08C'u))
   else:
     # Clear timer IRQ: clear bit 7 (0x80) from INTC unmask
     let intcUnmask = MACHW_INTC_BASE + 0x08C'u
-    let cur = regRead(intcUnmask)
-    regWrite(intcUnmask, cur and not 0x80'u32)
+    let unmaskStatus = regRead(intcUnmask)
+    regWrite(intcUnmask, unmaskStatus and not 0x80'u32)
   if (saved and 8) != 0:
     irqRestore(saved)
 
@@ -2430,7 +2432,8 @@ proc mm_sta_add*(param: pointer, staIdxOut: ptr uint8, hwStaIdxOut: ptr uint8): 
 
   # ---- Step 3: Write MAC address to HW ----
   # mm_sec_machwaddr_wr(staIdx, instNbr, ...)
-  # Note: current stub signature is (vifIdx, addr_ptr, idx) but blob ABI is (staIdx, instNbr).
+  # Note: current stub signature is (staIdx, keySlotRaw, unusedCompatArg) but
+  # blob ABI is (staIdx, instNbr).
   # Cast-call to match the 2-arg blob ABI; the stub discards args anyway.
   type MacHwAddrWrProc = proc(staIdx: uint8, instNbr: uint8): uint8 {.cdecl.}
   let machwaddrWr = cast[MacHwAddrWrProc](mm_sec_machwaddr_wr)
@@ -2456,8 +2459,8 @@ proc mm_sta_add*(param: pointer, staIdxOut: ptr uint8, hwStaIdxOut: ptr uint8): 
           let vifHwIdx = vif.vifIdx
           let cbStaIdx = staIdxOut[]
           type WpsCbProc = proc(vifHwIdx: uint8, staIdx: uint8) {.cdecl.}
-          let cb = cast[WpsCbProc](cbFuncPtr)
-          cb(vifHwIdx, cbStaIdx)
+          let wpsStaConnectedCallback = cast[WpsCbProc](cbFuncPtr)
+          wpsStaConnectedCallback(vifHwIdx, cbStaIdx)
     else:
       # Not WPS -- check cipher type at vif_entry[497]
       let cipher = sec.cipher
@@ -2555,13 +2558,13 @@ proc mm_sta_add*(param: pointer, staIdxOut: ptr uint8, hwStaIdxOut: ptr uint8): 
           if (hexLen and 1) != 0:
             hexLen = hexLen and 0xFE'u8
           if hexLen > 0:
-            var i: int = 0
+            var hexIndex: int = 0
             let hexChars = cast[ptr UncheckedArray[uint8]](wepKeyStr)
-            while i < hexLen.int:
-              let hi = ascii_to_hex(hexChars[i])
-              let lo = ascii_to_hex(hexChars[i + 1])
-              wepReq.keyData[i div 2] = (hi shl 4) or lo
-              i += 2
+            while hexIndex < hexLen.int:
+              let hi = ascii_to_hex(hexChars[hexIndex])
+              let lo = ascii_to_hex(hexChars[hexIndex + 1])
+              wepReq.keyData[hexIndex div 2] = (hi shl 4) or lo
+              hexIndex += 2
           wepReq.keyLen = keyLen shr 1
         else:
           # Unknown WEP key length -- log error, unregister, return error
@@ -2694,8 +2697,8 @@ proc mm_check_rssi*(vifEntry: pointer, newRssi: int8) {.exportc, cdecl.} =
       ke_msg_alloc(0x43, 9, 0, MmRssiStatusIndPayloadSize))
     if msg != nil:
       msg.vifIdx = vif.vifIdx
-      msg.value1 = newRssi.uint8
-      msg.value2 = prevState
+      msg.thresholdState = prevState
+      msg.rssiDbm = newRssi.uint8
       rssiTimer[] = macTime
       ke_msg_send(msg)
     return
@@ -2729,15 +2732,15 @@ proc mm_check_rssi*(vifEntry: pointer, newRssi: int8) {.exportc, cdecl.} =
       ke_msg_alloc(0x43, 9, 0, MmRssiStatusIndPayloadSize))
     if msg != nil:
       msg.vifIdx = vif.vifIdx
-      msg.value1 = newState
-      msg.value2 = newRssi.uint8
+      msg.thresholdState = newState
+      msg.rssiDbm = newRssi.uint8
       ke_msg_send(msg)
   vif.rssiState = newState
 
 proc mm_check_beacon*(param: pointer) {.exportc, cdecl.} =
   ## Process a received beacon frame (290 instructions in blob).
   ##
-  ## Blob ABI: a0=param(rxdesc), a1=vifEntry, a2=staEntry, a3=resultPtr
+  ## Blob ABI: a0=param(rxdesc), a1=vifEntry, a2=staEntry, a3=timIeAddrOut
   ## 14 function calls: mm_check_rssi, 2x hal_machw_rx_duration,
   ## utils_crc32_stream_init/feed_block/results, __udivdi3,
   ## mm_timer_set, mm_timer_clear, mac_ie_find, mm_send_connection_loss_ind,
@@ -2745,10 +2748,10 @@ proc mm_check_beacon*(param: pointer) {.exportc, cdecl.} =
 
   var vifEntry {.noinit.}: pointer
   var staEntry {.noinit.}: pointer
-  var resultPtr {.noinit.}: ptr uint32
+  var timIeAddrOut {.noinit.}: ptr uint32
   {.emit: ["asm volatile(\"mv %0, a1\" : \"=r\"(", vifEntry, "));"].}
   {.emit: ["asm volatile(\"mv %0, a2\" : \"=r\"(", staEntry, "));"].}
-  {.emit: ["asm volatile(\"mv %0, a3\" : \"=r\"(", resultPtr, "));"].}
+  {.emit: ["asm volatile(\"mv %0, a3\" : \"=r\"(", timIeAddrOut, "));"].}
 
   let rx = beaconRxDescView(param)
   let vif = vifChannelAt(vifEntry)
@@ -2833,26 +2836,27 @@ proc mm_check_beacon*(param: pointer) {.exportc, cdecl.} =
   # Feed 4-byte beacon interval/capability field
   utils_crc32_stream_feed_block(addr crcState[0], addr frame.beaconInterval, 4)
 
-  resultPtr[] = 0  # no change yet
+  timIeAddrOut[] = 0  # no TIM IE found yet
 
   # IE walk: find TIM IE and feed non-TIM IEs into CRC
   var timIe: ptr MacIeView = nil
-  var iePos = cast[uint](ieBody)
+  var currentIeAddr = cast[uint](ieBody)
   var remaining = ieBodyLen
   while remaining > 0:
-    let ie = macIeAt(iePos)
+    let ie = macIeAt(currentIeAddr)
     let ieId = ie.id
     let ieLen = ie.len
     let totalLen = ieLen.uint32 + 2
     if totalLen > remaining: break
     if ieId == 5:  # TIM IE
-      resultPtr[] = cast[uint32](iePos)
+      timIeAddrOut[] = cast[uint32](currentIeAddr)
       timIe = ie
     else:
       # Feed non-TIM IEs into CRC for beacon change detection
-      utils_crc32_stream_feed_block(addr crcState[0], cast[pointer](iePos), ieLen.uint32)
+      utils_crc32_stream_feed_block(addr crcState[0], cast[pointer](currentIeAddr),
+                                    ieLen.uint32)
     remaining -= totalLen
-    iePos += totalLen
+    currentIeAddr += totalLen
 
   # Finalize CRC and store as beacon fingerprint
   let crcResult = utils_crc32_stream_results(addr crcState[0])
@@ -3123,10 +3127,11 @@ proc mm_sta_timer_data_timeout*(param: pointer) {.exportc, cdecl.} =
       1, 0, nil, 611, param)
 
 # MM Security operations
-proc mm_sec_machwaddr_wr*(vifIdx: uint8, addr_ptr: pointer, idx: uint8): uint8 {.exportc, cdecl, discardable.} =
+proc mm_sec_machwaddr_wr*(staIdx: uint8, keySlotRaw: pointer,
+                          unusedCompatArg: uint8): uint8 {.exportc, cdecl, discardable.} =
   ## Write MAC address to HW address table (53 instructions in blob).
   ## Blob ABI: a0=staIdx, a1=keySlot. Looks up MAC from sta_info_tab[a0*368].
-  ## Nim ABI keeps (vifIdx, addr_ptr, idx) for compatibility but addr_ptr is
+  ## Nim ABI keeps three parameters for compatibility but keySlotRaw is
   ## actually the keySlot passed in a1; we read MAC from sta_info_tab internally.
   ##
   ## MACHW register layout (base 0x24B00000 in blob / 0x44B00000 actual):
@@ -3134,28 +3139,29 @@ proc mm_sec_machwaddr_wr*(vifIdx: uint8, addr_ptr: pointer, idx: uint8): uint8 {
   ##   +0x0C0: address data high (halfword at sta_entry+8)
   ##   +0x0AC..0x0B8: key material words 0..3 (cleared to 0 for addr write)
   ##   +0x0C4: control register (write hwStaIdx<<16 | keySlot<<4 | 0x40000002)
+  discard unusedCompatArg
 
   # Blob reads the station MAC from sta_info_tab[staIdx].
-  let mac = staMacWords(staInfoForIdx(vifIdx))
+  let mac = staMacWords(staInfoForIdx(staIdx))
 
   # Compute HW station index: (staIdx + 8) & 0xFF
-  let hwStaIdx = ((vifIdx.uint32 + 8) and 0xFF)
+  let hwStaIdx = ((staIdx.uint32 + 8) and 0xFF)
 
   machwSecurityWriteAddress(mac.lo, mac.hi)
   machwSecurityClearKeyMaterial()
 
   # Validate keySlot field (shifted left 4)
-  # Blob: a1 is keySlot. In Nim ABI, addr_ptr carries this value.
+  # Blob: a1 is keySlot. In Nim ABI, keySlotRaw carries this value.
   # Blob: andi a5,s2,-241 = s2 & 0xFFFFFF0F, asserts if non-zero
   # This checks that (keySlot << 4) has no bits outside 4..7 set
-  let keySlot = cast[uint32](addr_ptr)
+  let keySlot = cast[uint32](keySlotRaw)
   let idxField = keySlot shl 4
   if (idxField and 0xFFFFFF0F'u32) != 0:
     assert_err("mm_sec.c", "mm_sec.c", 6259)
 
   # Build control word: hwStaIdx<<16 | idxField | 0x40000002
   let ctrlWord = (hwStaIdx shl 16) or idxField or 0x40000002'u32
-  nimFwConnectTrace2U32("[WIFI-CT] machwaddr ", (vifIdx.uint32 or (hwStaIdx shl 8) or (keySlot shl 16)), ctrlWord)
+  nimFwConnectTrace2U32("[WIFI-CT] machwaddr ", (staIdx.uint32 or (hwStaIdx shl 8) or (keySlot shl 16)), ctrlWord)
   nimFwConnectTrace2U32("[WIFI-CT] machwmac ", mac.lo, mac.hi)
   machwSecurityWriteControl(ctrlWord)
 
@@ -3163,14 +3169,14 @@ proc mm_sec_machwaddr_wr*(vifIdx: uint8, addr_ptr: pointer, idx: uint8): uint8 {
   discard waitMachwSecurityControlClear(0x40000000'u32)
   return hwStaIdx.uint8
 
-proc mm_sec_machwaddr_del*(idx: uint8) {.exportc, cdecl.} =
+proc mm_sec_machwaddr_del*(staIdx: uint8) {.exportc, cdecl.} =
   ## Delete MAC address from HW address table (42 instructions in blob).
   ## Writes all-ones to address data, zeros to key material, then triggers
   ## the HW with (hwStaIdx<<16 | 0x40000000) and polls until done.
   machwSecurityWriteAddress(0xFFFFFFFF'u32, 0xFFFFFFFF'u32)
 
-  # Compute HW station index: (idx + 8) & 0xFF
-  let hwStaIdx = ((idx.uint32 + 8) and 0xFF)
+  # Compute HW station index: (staIdx + 8) & 0xFF
+  let hwStaIdx = ((staIdx.uint32 + 8) and 0xFF)
 
   machwSecurityClearKeyMaterial()
 
@@ -3187,14 +3193,14 @@ proc mm_sec_macrx_ind*(staIdx: uint8, payload: pointer, length: uint16) {.export
   ## keFreeFunc Nim-only globals).
   let allocFn = cast[proc(sz: uint32): pointer {.cdecl.}](
     blOpsFunc(0xB8))
-  let buf = allocFn(length.uint32 + 16)
-  if buf != nil:
-    let ind = secMacRxIndAt(buf)
+  let securityIndicationMsg = allocFn(length.uint32 + 16)
+  if securityIndicationMsg != nil:
+    let ind = secMacRxIndAt(securityIndicationMsg)
     ind.staIdx = staIdx
     ind.length = length
     discard c_memcpy(addr ind.payload[0], payload, length.csize_t)
-    ipc_emb_msg_push(buf)
-    platformFree(buf)
+    ipc_emb_msg_push(securityIndicationMsg)
+    platformFree(securityIndicationMsg)
 
 proc mm_sec_machwkey_wr*(param: pointer) {.exportc, cdecl.} =
   ## Write encryption key to MAC HW key table (143 instructions).
@@ -3356,9 +3362,9 @@ proc mm_sec_machwkey_del*(keyIdx: uint8) {.exportc, cdecl.} =
     #   vif = vif_info_tab[hwIdx]
     # Blob tail-calls vif_mgmt_del_key here — must RETURN WITHOUT clearing
     # the MACHW key-RAM (that is only done on the group/STA paths below).
-    let offset = keyIdx.int - topCount.int - 1
-    let hwIdx = offset div 2
-    let vifSlot = 4 + (offset and 1)
+    let pairwiseKeySlotOffset = keyIdx.int - topCount.int - 1
+    let hwIdx = pairwiseKeySlotOffset div 2
+    let vifSlot = 4 + (pairwiseKeySlotOffset and 1)
     let vif = vifChannelForIdx(hwIdx.uint8)
     vif_mgmt_del_key(cast[pointer](vif), vifSlot.uint8)
     return
@@ -3461,29 +3467,29 @@ proc mm_sec_keydump*() {.exportc, cdecl.} =
   let keyCount = cast[int32](volatileLoad(addr regs.keyCount))
   if logFunc != nil: cast[LogV](logFunc)(2, 0, nil, 977, keyCount.uint32)
 
-  var idx: int32 = 0
-  while idx <= keyCount:
-    volatileStore(addr regs.control, (idx.uint32 shl 16) or READ_TRIGGER)
+  var keyTableIndex: int32 = 0
+  while keyTableIndex <= keyCount:
+    volatileStore(addr regs.control, (keyTableIndex.uint32 shl 16) or READ_TRIGGER)
     discard waitMachwSecurityControlClear(READ_TRIGGER)
 
     let kdLo = volatileLoad(addr regs.dataLow)
     let kdHi = volatileLoad(addr regs.dataHigh)
     # Blob asserts upper 16 bits of kdHi must be zero (offset 0x116-0x12e)
     if (kdHi and 0xFFFF0000'u32) != 0:
-      assert_err("mm_sec.c", "mm_sec.c", idx.cint)
+      assert_err("mm_sec.c", "mm_sec.c", keyTableIndex.cint)
     let maskedHi = kdHi and 0xFFFF'u32
 
-    if logFunc != nil: cast[LogV](logFunc)(2, 0, nil, 989, idx.uint32,
+    if logFunc != nil: cast[LogV](logFunc)(2, 0, nil, 989, keyTableIndex.uint32,
       kdLo and 0xFF, (kdLo shr 8) and 0xFF,
       (kdLo shr 16) and 0xFF, kdLo shr 24,
       maskedHi and 0xFF, maskedHi shr 8)
 
-    let c1 = volatileLoad(addr regs.control)
-    if logFunc != nil: cast[LogV](logFunc)(2, 0, nil, 998, c1 and 1)
-    let c2 = volatileLoad(addr regs.control)
-    if logFunc != nil: cast[LogV](logFunc)(2, 0, nil, 999, (c2 shr 1) and 0x7FFF)
-    let c3 = volatileLoad(addr regs.control)
-    if logFunc != nil: cast[LogV](logFunc)(2, 0, nil, 1000, (c3 shr 16) and 0xFFFF)
+    let keyControlValid = volatileLoad(addr regs.control)
+    if logFunc != nil: cast[LogV](logFunc)(2, 0, nil, 998, keyControlValid and 1)
+    let keyControlCipher = volatileLoad(addr regs.control)
+    if logFunc != nil: cast[LogV](logFunc)(2, 0, nil, 999, (keyControlCipher shr 1) and 0x7FFF)
+    let keyControlAddr = volatileLoad(addr regs.control)
+    if logFunc != nil: cast[LogV](logFunc)(2, 0, nil, 1000, (keyControlAddr shr 16) and 0xFFFF)
 
     let kw0 = volatileLoad(addr regs.keyMaterial[0])
     let kw1 = volatileLoad(addr regs.keyMaterial[1])
@@ -3500,35 +3506,39 @@ proc mm_sec_keydump*() {.exportc, cdecl.} =
       kw3 and 0xFF, (kw3 shr 8) and 0xFF,
       (kw3 shr 16) and 0xFF, kw3 shr 24)
     if logFunc != nil: cast[Log0](logFunc)(2, 0, nil, 1014)
-    idx += 1
+    keyTableIndex += 1
 
   if logFunc != nil: cast[Log0](logFunc)(2, 0, nil, 1016)
 
-  # Dump MAC address words from g_bl_ops_funcs struct
-  let mw0 = ops.macWord0
-  let mw1 = ops.macWord1
+  # Dump MAC address bytes from g_bl_ops_funcs struct.
+  let macAddrLow = ops.macAddrLow
+  let macAddrHigh = ops.macAddrHigh
   if logFunc != nil: cast[LogV](logFunc)(2, 0, nil, 1019,
-    mw0 and 0xFF, (mw0 shr 8) and 0xFF, (mw0 shr 16) and 0xFF, mw0 shr 24,
-    mw1 and 0xFF, (mw1 shr 8) and 0xFF)
+    macAddrLow and 0xFF, (macAddrLow shr 8) and 0xFF,
+    (macAddrLow shr 16) and 0xFF, macAddrLow shr 24,
+    macAddrHigh and 0xFF, (macAddrHigh shr 8) and 0xFF)
 
-  let p2 = ops.word24()
-  let p3 = ops.adapterTimingConfig28
+  let beaconTimeoutConfig = ops.beaconTimeoutConfigWord()
+  let adapterTimingConfig28 = ops.adapterTimingConfig28
   if logFunc != nil: cast[LogV](logFunc)(2, 0, nil, 1029,
-    p2 and 0xFF, (p2 shr 8) and 0xFF, (p2 shr 16) and 0xFF, p2 shr 24,
-    p3 and 0xFF, (p3 shr 8) and 0xFF)
+    beaconTimeoutConfig and 0xFF, (beaconTimeoutConfig shr 8) and 0xFF,
+    (beaconTimeoutConfig shr 16) and 0xFF, beaconTimeoutConfig shr 24,
+    adapterTimingConfig28 and 0xFF, (adapterTimingConfig28 shr 8) and 0xFF)
   if logFunc != nil: cast[Log0](logFunc)(2, 0, nil, 1037)
 
-  let p4 = ops.beaconProbeCountdown
-  let p5 = ops.adapterTimingConfig36
+  let beaconProbeCountdown = ops.beaconProbeCountdown
+  let adapterTimingConfig36 = ops.adapterTimingConfig36
   if logFunc != nil: cast[LogV](logFunc)(2, 0, nil, 1041,
-    p4 and 0xFF, (p4 shr 8) and 0xFF, (p4 shr 16) and 0xFF, p4 shr 24,
-    p5 and 0xFF, (p5 shr 8) and 0xFF)
+    beaconProbeCountdown and 0xFF, (beaconProbeCountdown shr 8) and 0xFF,
+    (beaconProbeCountdown shr 16) and 0xFF, beaconProbeCountdown shr 24,
+    adapterTimingConfig36 and 0xFF, (adapterTimingConfig36 shr 8) and 0xFF)
 
-  let p6 = ops.adapterTimingConfig40
-  let p7 = ops.adapterTimingConfig44
+  let adapterTimingConfig40 = ops.adapterTimingConfig40
+  let adapterTimingConfig44 = ops.adapterTimingConfig44
   if logFunc != nil: cast[LogV](logFunc)(2, 0, nil, 1051,
-    p6 and 0xFF, (p6 shr 8) and 0xFF, (p6 shr 16) and 0xFF, p6 shr 24,
-    p7 and 0xFF, (p7 shr 8) and 0xFF)
+    adapterTimingConfig40 and 0xFF, (adapterTimingConfig40 shr 8) and 0xFF,
+    (adapterTimingConfig40 shr 16) and 0xFF, adapterTimingConfig40 shr 24,
+    adapterTimingConfig44 and 0xFF, (adapterTimingConfig44 shr 8) and 0xFF)
   if logFunc != nil: cast[Log0](logFunc)(2, 0, nil, 1059)
 
   # Tail call to hal_machw_timing_info (blob reloc at 0x3ee)
@@ -3609,8 +3619,8 @@ proc mm_bcn_init_vif*(vifEntry: pointer) {.exportc, cdecl.} =
     hwDesc.status = 0
   # Clear bcn_end_desc fields
   bcnEnd.status = 0
-  bcnEnd.word0 = 0xCAFEFADE'u32
-  bcnEnd.word4 = 0
+  bcnEnd.magic = 0xCAFEFADE'u32
+  bcnEnd.next = 0
   # Store mm_bcn_transmitted callback and VIF pointer
   let frameDesc = vifApBeaconFrameDesc(vif)
   frameDesc.callback = cast[pointer](mm_bcn_transmitted)
@@ -3717,18 +3727,18 @@ proc mm_bcn_update*(vifEntry: pointer): pointer {.exportc, cdecl, noinline.} =
   env.active = 1
 
   # Send notification: ke_msg_send_basic(46=MM_BCN_CHANGE_CFM, src_id, 0)
-  let s1 = env.templatePtr
-  let msgHdr = keMsgHdrFromPayload(cast[pointer](s1))
+  let templatePtr = env.templatePtr
+  let msgHdr = keMsgHdrFromPayload(cast[pointer](templatePtr))
   ke_msg_send_basic(46, msgHdr.srcId, 0'u8)
 
   # Recompute VIF from vifIdx (blob uses multiply: vifIdx * 1512)
   let vif = vifChannelForIdx(vifIdx)
 
   # Read entry metrics
-  let entry = beaconChangeReqAt(s1)
-  let entryFrameLen = entry.frameLen       # lhu a5,4(s1)
-  let entryFlagByte = entry.flagByte       # lbu s5,8(s1)
-  let entryHdrLen = entry.headerLen        # lhu s6,6(s1)
+  let beaconChangeReq = beaconChangeReqAt(templatePtr)
+  let entryFrameLen = beaconChangeReq.frameLen       # lhu a5,4(templatePtr)
+  let entryFlagByte = beaconChangeReq.flagByte       # lbu s5,8(templatePtr)
+  let entryHdrLen = beaconChangeReq.headerLen        # lhu s6,6(templatePtr)
   let bodyLen = entryFrameLen - entryFlagByte.uint16           # sub s5,a5,s5
   let hdrLenPlus3 = entryHdrLen + 3                            # addi s6,s6,3
 
@@ -3736,18 +3746,18 @@ proc mm_bcn_update*(vifEntry: pointer): pointer {.exportc, cdecl, noinline.} =
   let txDescPtr = vif.beaconTxDesc                 # lw s0,208(s2)
   let txDesc = hostTxHwDescAt(txDescPtr)
   let staType = vif.vifIdx                         # lbu a0,87(s2)
-  let s8 = txDesc.payloadStart                     # lw s8,20(s0) = baseOff
+  let beaconPayloadStart = txDesc.payloadStart      # lw s8,20(s0) = baseOff
 
   # Store body length to VIF entry
   vif.beaconBodyLength = bodyLen                    # sh s5,316(s2)
 
   # Call me_beacon_check(vifIdx, entryFrameLen_as_ptr, txDesc[20]_as_ptr)
   # blob: a0=staType(=vifIdx), a1=entryFrameLen, a2=txDesc[20]
-  me_beacon_check(staType, cast[pointer](entryFrameLen.uint), cast[pointer](s8.uint))
+  me_beacon_check(staType, cast[pointer](entryFrameLen.uint), cast[pointer](beaconPayloadStart.uint))
 
   # Update TX descriptors
   let endDesc = beaconEndDesc()
-  let adjLen = s8 + (entryHdrLen - 1).uint32
+  let adjLen = beaconPayloadStart + (entryHdrLen - 1).uint32
   txDesc.payloadEnd = adjLen                         # sw adjLen, 24(s0)
   let endLen = entryFlagByte.uint32 + 1
   let endAddr = adjLen + endLen
@@ -3779,7 +3789,7 @@ proc mm_bcn_update*(vifEntry: pointer): pointer {.exportc, cdecl, noinline.} =
 
   # Load TIM bitmap control byte from beacon frame (blob: th.lrbu a5, s8, s6)
   # s8 = txDesc base (beacon buffer), s6 = hdrLenPlus3 = entryHdrLen + 3
-  let timByte = cast[ptr uint8](s8 + hdrLenPlus3.uint)[]
+  let timByte = cast[ptr uint8](beaconPayloadStart + hdrLenPlus3.uint)[]
   timIeAt(addr txl_tim_ie_pool[0]).dtimPeriod = timByte # txl_tim_ie_pool[3]
 
   # Clear mm_bcn_env active flag
@@ -4121,25 +4131,25 @@ proc mm_timer_schedule*() {.exportc, cdecl.} =
     discard co_list_pop_front(addr mm_timer_list)
 
     # Get callback and env from timer entry
-    let cb = headTimer.callback
-    let env = cast[pointer](headTimer.env)
-    if cb == nil:
+    let mmTimerCallback = headTimer.callback
+    let mmTimerEnv = cast[pointer](headTimer.env)
+    if mmTimerCallback == nil:
       # No callback: assert (blob: assert_err "mm_timer.c" line 223)
       assert_err("mm_timer.c", "mm_timer.c", 223)
     # Call callback(env) -- blob reloads and calls unconditionally after assert
-    let cbFn = cast[proc(env: pointer) {.cdecl.}](cb)
-    cbFn(env)
+    let invokeMmTimerCallback = cast[proc(env: pointer) {.cdecl.}](mmTimerCallback)
+    invokeMmTimerCallback(mmTimerEnv)
     inc drained
 
-  let next = mm_timer_list.first
-  if next != nil:
-    let nextTimer = mmTimerAt(next)
+  let nextTimerNode = mm_timer_list.first
+  if nextTimerNode != nil:
+    let nextTimer = mmTimerAt(nextTimerNode)
     nimFwDbgMmTimerYieldHead = nextTimer.expiry
-    if mmTimerExpired(next):
+    if mmTimerExpired(nextTimerNode):
       inc nimFwDbgMmTimerYield
       ke_evt_set(KE_EVT_MM_TIMER)
     else:
-      mm_timer_hw_set(cast[pointer](next))
+      mm_timer_hw_set(cast[pointer](nextTimerNode))
   else:
     mm_timer_hw_set(nil)
 
@@ -4165,13 +4175,13 @@ proc chan_init*() {.exportc, cdecl.} =
   let env = chanEnvView()
   discard c_memset(env, 0, sizeof(ChanEnvView).csize_t)
   let poolBase = cast[uint](addr chan_ctxt_pool[0])
-  for i in 0 ..< 5:
-    let ctxt = chanCtxtAt(poolBase + i.uint * sizeof(ChanCtxtView).uint)
+  for chanCtxtPoolIndex in 0 ..< 5:
+    let ctxt = chanCtxtAt(poolBase + chanCtxtPoolIndex.uint * sizeof(ChanCtxtView).uint)
     discard c_memset(cast[pointer](ctxt), 0, sizeof(ChanCtxtView).csize_t)
     # Store 0xFF at offset 14 and 23 (invalid channel context index)
     ctxt.markInvalid()
     # For slots 0..2, push to the channel context free list
-    if i <= 2:
+    if chanCtxtPoolIndex <= 2:
       co_list_push_back(addr env.freeList, ctxt.chanCtxtHdr)
   # Store callback function pointers — ORDER MATTERS (earlier Nim versions
   # had these mis-wired, routing HW events to the wrong handlers).
@@ -4196,19 +4206,20 @@ proc chan_ctxt_add*(param: pointer, ctxtIdxOut: ptr uint8): uint8 {.exportc, cde
   ## From disassembly (68 instrs).
   let env = chanEnvView()
   let poolBase = cast[uint](addr chan_ctxt_pool[0])
-  for i in 0'u8 ..< 3:
-    let ctxt = chanCtxtAt(poolBase + i.uint * sizeof(ChanCtxtView).uint)
-    if ctxt.idx != 0xFF:
+  for existingChannelContextIndex in 0'u8 ..< 3:
+    let ctxt = chanCtxtAt(poolBase + existingChannelContextIndex.uint * sizeof(ChanCtxtView).uint)
+    if ctxt.contextIndexOrMarker != 0xFF:
       if c_memcmp(addr ctxt.channel, param, 8.csize_t) == 0:
-        ctxtIdxOut[] = i
+        ctxtIdxOut[] = existingChannelContextIndex
         return 0
   let freeCtxt = co_list_pop_front(addr env.freeList)
   if freeCtxt == nil:
     return 1
   let ctxt = chanCtxtAt(cast[pointer](freeCtxt))
-  let idx = ((cast[uint](ctxt) - poolBase) div sizeof(ChanCtxtView).uint).uint8
-  ctxt.idx = idx
-  ctxtIdxOut[] = idx
+  let chanCtxtPoolIndex =
+    ((cast[uint](ctxt) - poolBase) div sizeof(ChanCtxtView).uint).uint8
+  ctxt.contextIndexOrMarker = chanCtxtPoolIndex
+  ctxtIdxOut[] = chanCtxtPoolIndex
   ctxt.channel = cast[ptr ChanCtxtDefView](param)[]
   return 0
 
@@ -4220,7 +4231,7 @@ proc chan_ctxt_del*(ctxtIdx: uint8) {.exportc, cdecl.} =
   let env = chanEnvView()
   let ctxt = chanCtxtForIdx(ctxtIdx)
   # Validate: context must be in use
-  if ctxt.idx == 0xFF:
+  if ctxt.contextIndexOrMarker == 0xFF:
     # Blob uses assert_err for chan_ctxt_del invariants.
     assert_err("chan.c", "chan.c", 0xAD0)
   if ctxt.linkCount != 0:
@@ -4237,7 +4248,7 @@ proc chan_ctxt_link*(ctxtIdx: uint8, vifIdx: uint8) {.exportc, cdecl.} =
   ## Computes channel context slot = chan_ctxt_pool + ctxtIdx*28,
   ## computes VIF entry = vif_info_tab + vifIdx*1512.
   ## Asserts VIF's current channel ctx (vif+64) is null.
-  ## Asserts slot's idx byte (slot+23) != 0xFF (slot in use).
+  ## Asserts slot's context-index/marker byte (slot+23) != 0xFF (slot in use).
   ## Stores slot pointer into VIF's channel ctx (vif+64).
   ## Adds survey frequency to chan_env accumulator (offset 108).
   ## Increments link count (slot+24). If link count becomes 1:
@@ -4250,8 +4261,8 @@ proc chan_ctxt_link*(ctxtIdx: uint8, vifIdx: uint8) {.exportc, cdecl.} =
   # Assert VIF has no current channel context
   if vif.chanCtxt != nil:
     assert_err("chan.c", "chan.c", 0xAFE)
-  # Assert slot is in use (idx byte != 0xFF)
-  if ctxt.idx == 0xFF:
+  # Assert slot is in use (context-index/marker byte != 0xFF)
+  if ctxt.contextIndexOrMarker == 0xFF:
     assert_err("chan.c", "chan.c", 0xAFF)
   # Store slot pointer into VIF's channel context field
   vif.chanCtxt = cast[pointer](ctxt)
@@ -4339,7 +4350,7 @@ proc chan_ctxt_unlink*(vifIdx: uint8) {.exportc, cdecl.} =
         ctxt.status = 0
   # Check link count for deletion (both scan-linked and non-scan-linked paths)
   if ctxt.linkCount == 0:
-    chan_ctxt_del(ctxt.idx)
+    chan_ctxt_del(ctxt.contextIndexOrMarker)
   # Update chan_env flags: clear bit 7
   let remCtxtCnt = env.ctxtCount
   env.flags = env.flags and 0x7F
@@ -4453,9 +4464,9 @@ proc chan_is_on_channel*(vifEntry: pointer): bool {.exportc, cdecl, noinline.} =
   if currentCtxt == nil:
     return false
   let ctxt = chanCtxtAt(currentCtxt)
-  let status = ctxt.idx
+  let contextIndexOrMarker = ctxt.contextIndexOrMarker
   let vif = vifChannelAt(vifEntry)
-  if status <= 2:
+  if contextIndexOrMarker <= 2:
     return vif.chanCtxt == currentCtxt
   else:
     return ctxt.altIdx == vif.vifIdx
@@ -4471,7 +4482,7 @@ proc chan_is_on_operational_channel*(vifEntry: pointer): bool {.exportc, cdecl, 
   if currentCtxt == nil:
     return false
   let ctxt = chanCtxtAt(currentCtxt)
-  if ctxt.idx > 2:
+  if ctxt.contextIndexOrMarker > 2:
     return false
   return vifChannelAt(vifEntry).chanCtxt == currentCtxt
 
@@ -4641,12 +4652,12 @@ proc chan_tbtt_switch_update*(vifEntry: pointer, tbttTime: uint32) {.exportc, cd
     return
   let ctxtCount = chanEnvView().ctxtCount
   # Select timing offset: 9000 us for multi-context, 3000 us for single
-  var offset: uint32
+  var tbttLeadTimeUs: uint32
   if ctxtCount > 1:
-    offset = 9000'u32   # 0x2328
+    tbttLeadTimeUs = 9000'u32   # 0x2328
   else:
-    offset = 3000'u32   # 0xBB8
-  let tbttTarget = tbttTime - offset
+    tbttLeadTimeUs = 3000'u32   # 0xBB8
+  let tbttTarget = tbttTime - tbttLeadTimeUs
   let tbttNode = addr vif.tbttNode
   # Check if already set to this value
   let curTarget = tbttNode.targetTime
@@ -4678,25 +4689,25 @@ proc chan_update_tx_power*(ctxt: pointer) {.exportc, cdecl.} =
   let vif0Ctxt = vif0.chanCtxt
   var minPower: int8 = 127  # start with max
   if ctxt == vif0Ctxt:
-    let p0 = vif0.txPower
-    let p1 = vif0.maxTxPower
-    if p0 < p1:
-      minPower = p0
+    let currentTxPower = vif0.txPower
+    let maxTxPower = vif0.maxTxPower
+    if currentTxPower < maxTxPower:
+      minPower = currentTxPower
     else:
-      minPower = p1
+      minPower = maxTxPower
   # Check VIF 1's channel context.
   let vif1 = vifChannelForIdx(1)
   let vif1Ctxt = vif1.chanCtxt
   if ctxt == vif1Ctxt:
-    let p0 = vif1.txPower
-    let p1 = vif1.maxTxPower
-    var minP: int8
-    if p0 < p1:
-      minP = p0
+    let currentTxPower = vif1.txPower
+    let maxTxPower = vif1.maxTxPower
+    var effectiveTxPower: int8
+    if currentTxPower < maxTxPower:
+      effectiveTxPower = currentTxPower
     else:
-      minP = p1
-    if minP < minPower:
-      minPower = minP
+      effectiveTxPower = maxTxPower
+    if effectiveTxPower < minPower:
+      minPower = effectiveTxPower
   # Store the minimum power back to the context
   if minPower != 127:
     ctxtView.channel.txPower = cast[uint8](minPower)
@@ -4864,8 +4875,8 @@ proc chan_pre_switch_channel*(ctxt: pointer) {.exportc, cdecl.} =
   # Call chan_upd_ctxt_status to finalize
   chan_upd_ctxt_status(targetCtxt, 4)
   # Check context type for additional handling
-  let ctxtType = ctxt.idx
-  if ctxtType == 3:
+  let contextIndexOrMarker = ctxt.contextIndexOrMarker
+  if contextIndexOrMarker == 3:
     # .L219 -> .L232 -> .L233: scan type clears MAC scan state, queues the
     # scan-channel start indication, disables PM for the connectionless slot,
     # then reactivates the MAC before the queued indication is dispatched.
@@ -4877,17 +4888,14 @@ proc chan_pre_switch_channel*(ctxt: pointer) {.exportc, cdecl.} =
     irqRestore(saved)
     let ccaBusy = regRead(MACHW_BASE + 0x4C'u)
     env.surveySnapshot = (ccaBusy and 0xFF).uint8
-    when defined(bl808WifiUseBl808Rf):
-      rfPhyTraceCheckpoint(0x45'u32)
-      rfPriPrepareWb03MacActiveScanState()
-      rfPhyTraceCheckpoint(0x46'u32)
+    rfPhyTraceCheckpoint(0x45'u32)
+    rfPriPrepareWb03MacActiveScanState()
+    rfPhyTraceCheckpoint(0x46'u32)
     blmac_pwr_mgt_setf(0)
-    when defined(bl808WifiUseBl808Rf):
-      rfPhyTraceCheckpoint(0x47'u32)
+    rfPhyTraceCheckpoint(0x47'u32)
     mm_active()
-    when defined(bl808WifiUseBl808Rf):
-      rfPhyTraceCheckpoint(0x48'u32)
-  elif ctxtType == 4:
+    rfPhyTraceCheckpoint(0x48'u32)
+  elif contextIndexOrMarker == 4:
     # .L232: ROC type -- IRQ-safe flag set + schedule survey
     let saved = irqSave()
     let ps = psEnvView()
@@ -4899,9 +4907,8 @@ proc chan_pre_switch_channel*(ctxt: pointer) {.exportc, cdecl.} =
     # Blob 0x130: blmac_pwr_mgt_setf(0) to disable power-save during ROC
     blmac_pwr_mgt_setf(0)
     mm_active()
-    when defined(bl808WifiUseBl808Rf):
-      waitRfUs(1000'u32)
-  elif ctxtType <= 2:
+    waitRfUs(1000'u32)
+  elif contextIndexOrMarker <= 2:
     let ps = psEnvView()
     if ps.enabled == 0 or (ps.statusFlags and 8'u32) != 0:
       # Blob .L221: leave PS mode before notifying associated STA VIFs on the
@@ -5070,10 +5077,10 @@ proc chan_ctxt_op_evt*() {.exportc, cdecl.} =
   if status != 4:
     return
 
-  # status == 4: dispatch on sub-status at ctxt[23]
-  let subStatus = ctxt.idx
+  # status == 4: dispatch on the context-index/marker byte at ctxt[23]
+  let contextIndexOrMarker = ctxt.contextIndexOrMarker
 
-  if subStatus <= 2:
+  if contextIndexOrMarker <= 2:
     # sub 0-2: Set status=1, then switch channel
     ctxt.status = 1
     let ctxtCnt = env.ctxtCount
@@ -5124,15 +5131,15 @@ proc chan_ctxt_op_evt*() {.exportc, cdecl.} =
   # the new channel as already current.
   env.currentCtxt = nil
 
-  if subStatus == 3 or subStatus == 4:
-    if subStatus == 4:
+  if contextIndexOrMarker == 3 or contextIndexOrMarker == 4:
+    if contextIndexOrMarker == 4:
       # sub 4: clear bcn_detect flag (bit 6) if ctxt[14]==0
       if ctxt.invalidMarker == 0:
         env.flags = env.flags and not 0x40'u8
       # Clear conflict flag (bit 2)
       env.flags = env.flags and not 0x04'u8
     # sub 3 path (also reached from sub 4):
-    if subStatus == 3:
+    if contextIndexOrMarker == 3:
       # Clear chan_env[120] bit 3
       env.flags = env.flags and not 0x08'u8
       # Set power management bit in MAC HW (blob: blmac_pwr_mgt_setf at 0x11e)
@@ -5140,7 +5147,7 @@ proc chan_ctxt_op_evt*() {.exportc, cdecl.} =
       # Send ke_msg_send_basic(77, 1, 0xFF) = MM_CHAN_CTXT_SCHED_CFM
       ke_msg_send_basic(77, 1, 0xFF)
     # Common: set ctxt[23]=0xFF, clear chan_env[120] bit 4
-    ctxt.idx = 0xFF
+    ctxt.contextIndexOrMarker = 0xFF
     let curFlags = env.flags
     env.flags = curFlags and not 0x10'u8
     # Check chan_env[120] bits 0-1 for conn_less
@@ -5156,7 +5163,7 @@ proc chan_ctxt_op_evt*() {.exportc, cdecl.} =
 
   # sub > 4: call chan_cde_evt or mm_force_idle_req + mm_back_to_host_idle
   let ctxtCnt = env.ctxtCount
-  if ctxtCnt < subStatus:
+  if ctxtCnt < contextIndexOrMarker:
     # Blob: chan_cde_evt with a0 = &local (stack byte = 2)
     # chan_cde_evt grabs a0 via inline asm
     var cdeParam: uint8 = 2
@@ -5197,12 +5204,12 @@ proc chan_distribute_slots*() {.exportc, cdecl.} =
     let chanCtxt = vif.chanCtxt
     if chanCtxt != nil:
       let ctxt = chanCtxtAt(chanCtxt)
-      let ctxtSlotIdx = ctxt.idx  # context slot index
+      let baseContextSlotIndex = ctxt.contextIndexOrMarker
       activeCount += 1
 
       # Accumulate base slot: read ctxt+23 as index into slotAccum, increment by 2
-      if ctxtSlotIdx < 3:
-        slotAccum[ctxtSlotIdx] = slotAccum[ctxtSlotIdx] + 2
+      if baseContextSlotIndex < 3:
+        slotAccum[baseContextSlotIndex] = slotAccum[baseContextSlotIndex] + 2
 
       let connlessFlag = vif.state
 
@@ -5212,9 +5219,9 @@ proc chan_distribute_slots*() {.exportc, cdecl.} =
           env.scanCtxt = chanCtxt
 
         # Accumulate additional slot: read ctxt+23 as index, increment by 8
-        let ctxtSlot2 = ctxt.idx
-        if ctxtSlot2 < 3:
-          slotAccum[ctxtSlot2] = slotAccum[ctxtSlot2] + 8
+        let rocContextSlotIndex = ctxt.contextIndexOrMarker
+        if rocContextSlotIndex < 3:
+          slotAccum[rocContextSlotIndex] = slotAccum[rocContextSlotIndex] + 8
 
         if not needsScan:
           accumA0 = 1
@@ -5225,9 +5232,10 @@ proc chan_distribute_slots*() {.exportc, cdecl.} =
       let staType = vif.vifIdx
       let staStatus = staInfoForIdx(staType).psMode
       if (staStatus and 3) != 0:
-        let ctxtSlot3 = ctxt.idx
-        if ctxtSlot3 < 3:
-          slotAccum[ctxtSlot3] = slotAccum[ctxtSlot3] + 1
+        let stationPowerSaveContextSlotIndex = ctxt.contextIndexOrMarker
+        if stationPowerSaveContextSlotIndex < 3:
+          slotAccum[stationPowerSaveContextSlotIndex] =
+            slotAccum[stationPowerSaveContextSlotIndex] + 1
 
       # Check VIF type at vif+86
       let vifType = vif.vifType
@@ -5240,18 +5248,20 @@ proc chan_distribute_slots*() {.exportc, cdecl.} =
         let schedState = env.schedState
         if schedState == 1:
           if connlessFlag == 0:
-            let ctxtSlot4 = ctxt.idx
-            if ctxtSlot4 < 3:
-              slotAccum[ctxtSlot4] = slotAccum[ctxtSlot4] + 8
+            let scheduledRocContextSlotIndex = ctxt.contextIndexOrMarker
+            if scheduledRocContextSlotIndex < 3:
+              slotAccum[scheduledRocContextSlotIndex] =
+                slotAccum[scheduledRocContextSlotIndex] + 8
           env.schedState = 2
           needsSwitch = schedState
       elif vifType == 2:
         let apFlag = vif.apChanSwitchPending
         if apFlag != 0:
           vif.apChanSwitchPending = 0
-          let ctxtSlot5 = ctxt.idx
-          if ctxtSlot5 < 3:
-            slotAccum[ctxtSlot5] = slotAccum[ctxtSlot5] + 6
+          let apChannelSwitchContextSlotIndex = ctxt.contextIndexOrMarker
+          if apChannelSwitchContextSlotIndex < 3:
+            slotAccum[apChannelSwitchContextSlotIndex] =
+              slotAccum[apChannelSwitchContextSlotIndex] + 6
         if not needsScan:
           accumA0 = 1
           needsScan = true
@@ -5307,8 +5317,8 @@ proc chan_distribute_slots*() {.exportc, cdecl.} =
           let scanCredit = vif.listenInterval
           if scanCredit > 1:
             # Slot = chanCtxtCount * 50 (from blob: mul a5,a5,a7 where a7=50)
-            let slot = env.ctxtCount.uint16 * 50
-            ctxt.schedSlot = slot
+            let scanCreditSlotDuration = env.ctxtCount.uint16 * 50
+            ctxt.schedSlot = scanCreditSlotDuration
           else:
             # No scan credit: set to -1 (0xFFFF)
             ctxt.schedSlot = 0xFFFF'u16
@@ -5317,8 +5327,8 @@ proc chan_distribute_slots*() {.exportc, cdecl.} =
           ctxt.schedSlot = 0xFFFF'u16
       else:
         # No scan needed: compute slot from context weight and multiplier
-        let ctxtWeight = ctxt.idx
-        let weightedSlot = finalMul * ctxtWeight.uint32 * 50
+        let contextSlotWeight = ctxt.contextIndexOrMarker
+        let weightedSlot = finalMul * contextSlotWeight.uint32 * 50
         # Divide by total slot sum with rounding
         let slotVal = if slotSum > 0: (weightedSlot + slotSum - 1) div slotSum
                       else: weightedSlot
@@ -5371,10 +5381,10 @@ proc chan_tbtt_detect_conflict*(newTime: uint32, curTime: uint32): bool {.export
       env.schedState = 1
     env.flags = env.flags or 0x80
   else:
-    let cnt = chanTbttConflictCounter()[]
-    if cnt > 0:
-      chanTbttConflictCounter()[] = cnt - 1
-      if cnt - 1 == 0:
+    let tbttConflictClearCountdown = chanTbttConflictCounter()[]
+    if tbttConflictClearCountdown > 0:
+      chanTbttConflictCounter()[] = tbttConflictClearCountdown - 1
+      if tbttConflictClearCountdown - 1 == 0:
         env.flags = env.flags and 0x7F
   return isConflict
 
@@ -5392,45 +5402,45 @@ proc chan_tbtt_insert*(tbttNode: pointer) {.exportc, cdecl.} =
   let nodePrio = node.priority
 
   # Phase 1: Walk list to find insertion point, count displacements
-  var cur = cast[ptr CoListHdr](tbttList.first)
+  var scheduledTbttNode = cast[ptr CoListHdr](tbttList.first)
   var insertAfter: ptr CoListHdr = nil  # s4: node to insert after
   var displacedStart: ptr CoListHdr = nil  # s0: first entry to displace
   var displaceCount: uint8 = 0  # s2: number of entries to displace
   var needInsert: bool = false  # s1: whether to do insertion
 
-  while cur != nil:
-    let curNode = chanTbttNodeAt(cast[pointer](cur))
-    if curNode == node:
+  while scheduledTbttNode != nil:
+    let scheduledTbtt = chanTbttNodeAt(cast[pointer](scheduledTbttNode))
+    if scheduledTbtt == node:
       assert_err("chan.c", "chan.c", 1960)
-    let curType = curNode.state
-    let curTime = curNode.targetTime
+    let scheduledTbttState = scheduledTbtt.state
+    let scheduledTbttTime = scheduledTbtt.targetTime
 
-    if curType == 2:
+    if scheduledTbttState == 2:
       # Type 2 (scheduled): direct time compare
-      if nodeTime >= curTime:
+      if nodeTime >= scheduledTbttTime:
         # Check conflict
-        if not chan_tbtt_detect_conflict(nodeTime, curTime):
+        if not chan_tbtt_detect_conflict(nodeTime, scheduledTbttTime):
           # No conflict, insert before this entry
-          insertAfter = cur
+          insertAfter = scheduledTbttNode
       else:
-        # nodeTime < curTime: displace this entry
+        # nodeTime < scheduledTbttTime: displace this entry
         displacedStart = cast[ptr CoListHdr](tbttNode)
         displaceCount = 1
         needInsert = false  # will be set below
         break
     else:
       # Non-scheduled: use conflict detection
-      if not chan_tbtt_detect_conflict(nodeTime, curTime):
+      if not chan_tbtt_detect_conflict(nodeTime, scheduledTbttTime):
         # No conflict: compare times for ordering
-        if nodeTime < curTime:
-          # Insert before cur
+        if nodeTime < scheduledTbttTime:
+          # Insert before scheduledTbttNode
           needInsert = true
           break
-        insertAfter = cur
+        insertAfter = scheduledTbttNode
       else:
         # Conflict: compare priorities
-        let curPrio = curNode.priority
-        if curPrio < nodePrio:
+        let scheduledTbttPriority = scheduledTbtt.priority
+        if scheduledTbttPriority < nodePrio:
           # Current has higher priority (lower value), stop here
           displacedStart = cast[ptr CoListHdr](tbttNode)
           displaceCount = 1
@@ -5438,11 +5448,11 @@ proc chan_tbtt_insert*(tbttNode: pointer) {.exportc, cdecl.} =
         # Current lower priority: will be displaced
         displaceCount += 1
         if displacedStart == nil:
-          displacedStart = cur
+          displacedStart = scheduledTbttNode
 
-    cur = cast[ptr CoListHdr](cur.next)
+    scheduledTbttNode = cast[ptr CoListHdr](scheduledTbttNode.next)
 
-  if cur == nil and not needInsert:
+  if scheduledTbttNode == nil and not needInsert:
     needInsert = true
 
   # Phase 2: Re-insert displaced entries to resched queue
@@ -5500,7 +5510,7 @@ proc chan_upd_ctxt_status*(chanCtxtPtr: pointer, newStatus: uint8) {.exportc, cd
     targetTime = macTime + 0xFA0'u32 + extra
   elif status == 4:
     # Operating status: check context type
-    if ctxt.idx <= 2:
+    if ctxt.contextIndexOrMarker <= 2:
       let ctxtCount = env.ctxtCount
       if ctxtCount > 1:
         if status.uint16 < ctxt.schedSlot:
@@ -5545,13 +5555,13 @@ proc phy_freq_to_channel*(band: uint8, freq: uint16): uint8 {.weakExport, cdecl.
   if band == 0:
     # 2.4GHz: special case ch14 = 2484 MHz
     if freq == 2484: return 14
-    let offset = freq.int - 2412
-    if offset < 0 or offset > 72: return 0
+    let freqOffsetFromChannelOneMhz = freq.int - 2412
+    if freqOffsetFromChannelOneMhz < 0 or freqOffsetFromChannelOneMhz > 72: return 0
     return ((freq.int - 2407) div 5).uint8
   elif band == 1:
     # 5GHz: channels start at 5000 MHz
-    let offset = freq.int - 5000
-    if offset < 0 or offset > 820: return 0
+    let freqOffsetFromFiveGhzBaseMhz = freq.int - 5000
+    if freqOffsetFromFiveGhzBaseMhz < 0 or freqOffsetFromFiveGhzBaseMhz > 820: return 0
     return ((freq.int - 5000) div 5).uint8
   return 0
 
@@ -5560,4 +5570,3 @@ proc find_wpa_rsn_ie*(ieBuf: pointer, ieLen: uint32,
   let wpaOuiPtr = unsafeAddr WPA_OUI[0]
   wpaOut[] = mac_vsie_find(ieBuf, ieLen, cast[pointer](wpaOuiPtr), 4)
   rsnOut[] = mac_ie_find(ieBuf, ieLen, IE_ID_RSN)
-

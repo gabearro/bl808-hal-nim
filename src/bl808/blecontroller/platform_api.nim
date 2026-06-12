@@ -537,14 +537,14 @@ proc bleNimDbgVendorLldConStartStatus*(): uint32 {.exportc, cdecl.} =
   else:
     0'u32
 
-proc bleNimDbgVendorLldConStartParamWord*(word: uint32): uint32
+proc bleNimDbgVendorLldConStartParamWord*(paramWordIndex: uint32): uint32
     {.exportc, cdecl.} =
   when defined(bl808m0) and bl808BleNimConnectionEnabled:
-    let base = (word and 0x0F'u32) * 4'u32
-    uint32(nim_lld_con_start_param[base.int]) or
-      (uint32(nim_lld_con_start_param[base.int + 1]) shl 8) or
-      (uint32(nim_lld_con_start_param[base.int + 2]) shl 16) or
-      (uint32(nim_lld_con_start_param[base.int + 3]) shl 24)
+    let paramByteOffset = (paramWordIndex and 0x0F'u32) * 4'u32
+    uint32(nim_lld_con_start_param[paramByteOffset.int]) or
+      (uint32(nim_lld_con_start_param[paramByteOffset.int + 1]) shl 8) or
+      (uint32(nim_lld_con_start_param[paramByteOffset.int + 2]) shl 16) or
+      (uint32(nim_lld_con_start_param[paramByteOffset.int + 3]) shl 24)
   else:
     0'u32
 
@@ -949,13 +949,13 @@ proc bleControllerHasPendingWork(): bool =
 proc bleDrainMainQueueMessage(): bool =
   if bflb_main_queue_handle == nil:
     return false
-  var msg_buf: array[8, uint8]
-  let ret = ble_xQueueReceive(bflb_main_queue_handle, addr msg_buf[0], 0)
-  if ret != 1 or msg_buf[0] != 1:
+  var mainQueueMessage: array[8, uint8]
+  let receiveStatus = ble_xQueueReceive(bflb_main_queue_handle, addr mainQueueMessage[0], 0)
+  if receiveStatus != 1 or mainQueueMessage[0] != 1:
     return false
-  let param = cast[pointer](cast[ptr uint32](addr msg_buf[4])[])
-  if param != nil:
-    let hdr = getMsgHeader(param)
+  let queuedPayload = cast[pointer](cast[ptr uint32](addr mainQueueMessage[4])[])
+  if queuedPayload != nil:
+    let hdr = getMsgHeader(queuedPayload)
     ble_ke_msg_free(hdr)
   true
 
@@ -1075,8 +1075,8 @@ proc bflb_main_task_post*(fn: pointer, arg: pointer): bool {.exportc, cdecl.} =
   msg[0] = 1  # message type
   msg[1] = cast[uint32](fn)
   msg[2] = cast[uint32](arg)
-  let ret = ble_xQueueSend(bflb_main_queue_handle, addr msg[0], 0)
-  return ret == 1
+  let sendStatus = ble_xQueueSend(bflb_main_queue_handle, addr msg[0], 0)
+  return sendStatus == 1
 
 proc bflb_main_task_post_from_fw*(fn: pointer, arg: pointer) {.exportc, cdecl.} =
   ## Post task from firmware context
@@ -1114,34 +1114,36 @@ proc bflb_main_get_task_priority*(): uint8 {.exportc, cdecl.} =
 
 proc bl_read_mac_addr*(mac: ptr uint8) {.exportc, cdecl.} =
   ## Read MAC address from eFuse
-  let lo = regRead(0x40007014'u)
-  let hi = regRead(0x40007018'u)
+  let efuseMacLowWord = regRead(0x40007014'u)
+  let efuseMacHighWord = regRead(0x40007018'u)
   let macBytes = cast[ptr UncheckedArray[uint8]](mac)
-  for i in 0 ..< 4:
-    macBytes[i] = uint8((lo shr (i * 8)) and 0xFF'u32)
-  for i in 0 ..< 2:
-    macBytes[4 + i] = uint8((hi shr (i * 8)) and 0xFF'u32)
+  for lowWordByteIndex in 0 ..< 4:
+    macBytes[lowWordByteIndex] =
+      uint8((efuseMacLowWord shr (lowWordByteIndex * 8)) and 0xFF'u32)
+  for highWordByteIndex in 0 ..< 2:
+    macBytes[4 + highWordByteIndex] =
+      uint8((efuseMacHighWord shr (highWordByteIndex * 8)) and 0xFF'u32)
   # Check if all zero or all 0x01 => use default
-  var all_zero = true
-  var all_same = true
-  for i in 0 ..< 6:
-    let b = macBytes[i]
-    if b != 0:
-      all_zero = false
-    if b != 1:
-      all_same = false
-  if all_zero or all_same:
+  var efuseMacAllZero = true
+  var efuseMacAllOnesSentinel = true
+  for macByteIndex in 0 ..< 6:
+    let macByte = macBytes[macByteIndex]
+    if macByte != 0:
+      efuseMacAllZero = false
+    if macByte != 1:
+      efuseMacAllOnesSentinel = false
+  if efuseMacAllZero or efuseMacAllOnesSentinel:
     # Use default MAC
-    let default_mac = [0xC0'u8, 0x01, 0x02, 0x03, 0x04, 0x05]
-    discard c_memcpy(mac, unsafeAddr default_mac[0], 6)
+    let fallbackBleMac = [0xC0'u8, 0x01, 0x02, 0x03, 0x04, 0x05]
+    discard c_memcpy(mac, unsafeAddr fallbackBleMac[0], 6)
 
 proc bdaddr_init*() {.exportc, cdecl.} =
   ## Initialize BD address from stored/eFuse MAC
-  var addr_buf: BdAddr
-  bl_read_mac_addr(addr addr_buf.data[0])
+  var publicAddress: BdAddr
+  bl_read_mac_addr(addr publicAddress.bytes[0])
   # Increment first byte by 1 as the BLE address
-  addr_buf.data[0] = addr_buf.data[0] + 1
-  llm_util_set_public_addr(addr addr_buf)
+  publicAddress.bytes[0] = publicAddress.bytes[0] + 1
+  llm_util_set_public_addr(addr publicAddress)
 
 # ---------------------------------------------------------------------------
 # ======================== BLE RF ==========================================

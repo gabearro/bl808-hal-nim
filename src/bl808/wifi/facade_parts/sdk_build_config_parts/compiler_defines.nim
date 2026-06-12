@@ -40,8 +40,7 @@ when defined(bl808WifiValidationLog):
   {.passC: "-DBL808_WIFI_VENDOR_LOG_TO_VALIDATION_BUFFER".}
 when defined(bl808WifiOfficialPowerProfile):
   {.passC: "-DBL808_WIFI_VENDOR_OFFICIAL_POWER_PROFILE".}
-when defined(bl808WifiUseBl808Rf):
-  {.passC: "-DBL808_WIFI_VENDOR_USE_BL808_RF".}
+{.passC: "-DBL808_WIFI_VENDOR_USE_BL808_RF".}
 when defined(bl808WifiConnectPassphraseOnly):
   {.passC: "-DBL808_WIFI_CONNECT_PASSPHRASE_ONLY".}
 when defined(bl808WifiConnectHexPmkAsPassphrase):

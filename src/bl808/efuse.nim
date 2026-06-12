@@ -147,3 +147,161 @@ proc efuseProgramWord*(index: uint32, value: uint32): EfuseError =
 proc efuseAutoLoadDone*(): bool =
   ## Check if the eFuse auto-load at boot completed successfully.
   (regRead(EfCtrl0) and 1) != 0
+
+# =============================================================================
+# Security configuration map (ef_data_0)
+#
+# Word indices are byte-offset / 4. Verified against the vendored
+# ef_data_0_reg.h. All accessors are read-only; nothing here programs eFuse.
+# =============================================================================
+const
+  EfWordCfg0*        = 0x00 div 4    # security configuration word
+  EfWordDbgPwdLow*   = 0x04 div 4
+  EfWordDbgPwdHigh*  = 0x08 div 4
+  EfWordKeySlot0*    = 0x1C div 4    # 4 words per slot; slots 1..3 at +4 words
+  EfWordKeySlot1*    = 0x2C div 4
+  EfWordKeySlot2*    = 0x3C div 4
+  EfWordKeySlot3*    = 0x4C div 4
+  EfWordSwUsage0*    = 0x5C div 4
+  EfWordLock*        = 0x7C div 4    # read/write lock + lifecycle word
+
+  # cfg0 fields
+  EfCfgSfAesModeShift* = 0
+  EfCfgSfAesModeMask*  = 0x3'u32
+  EfCfgSbootEnShift*   = 4
+  EfCfgSbootEnMask*    = 0x3'u32 shl 4
+  EfCfgSeDbgDis*       = 22
+  EfCfgEfuseDbgDis*    = 23
+  EfCfgJtag1DisShift*  = 24
+  EfCfgJtag1DisMask*   = 0x3'u32 shl 24
+  EfCfgJtag0DisShift*  = 26
+  EfCfgJtag0DisMask*   = 0x3'u32 shl 26
+  EfCfgDbgModeShift*   = 28
+  EfCfgDbgModeMask*    = 0xF'u32 shl 28
+
+  # sw_usage_0 fields
+  EfSwSbootSignShift*  = 8
+  EfSwSbootSignMask*   = 0x3'u32 shl 8
+
+  # lock word bit positions
+  EfLockWrDbgPwd*      = 15
+  EfLockWrKeySlot0*    = 17    # slots 1..3 at +1
+  EfLockWrSwUsage0*    = 21
+  EfLockRdDbgPwd*      = 26
+  EfLockRdKeySlot0*    = 27    # slots 1..3 at +1
+
+type
+  SfAesMode* = enum
+    sfAesNone = 0, sfAesM1 = 1, sfAesM2 = 2, sfAesM3 = 3
+  SbootSignMode* = enum
+    signNone = 0, signRsa = 1, signEccP256 = 2
+  DbgMode* = enum
+    dbgOpen = 0, dbgPassword = 1, dbgClosed = 4
+
+  EfuseSecState* = object
+    sbootEn*: uint32             ## cfg0 [5:4] (nonzero => secure boot enabled)
+    sfAesMode*: SfAesMode
+    seDbgDisabled*: bool
+    efuseDbgDisabled*: bool
+    jtag0Disable*, jtag1Disable*: uint32
+    dbgModeRaw*: uint32
+    signMode*: SbootSignMode
+    keySlotReadLocked*: array[4, bool]
+    keySlotWriteLocked*: array[4, bool]
+    dbgPwdReadLocked*, dbgPwdWriteLocked*: bool
+
+proc efuseDecodeSecState*(cfg0, sw0, lock: uint32): EfuseSecState =
+  ## Pure decoder for the three ef_data_0 security words. Split out so the
+  ## interpretation of an enforced/provisioned device can be tested against known
+  ## words without touching real OTP (the inverse of computeProvisionPlan).
+  result.sbootEn = (cfg0 and EfCfgSbootEnMask) shr EfCfgSbootEnShift
+  result.sfAesMode = ((cfg0 and EfCfgSfAesModeMask) shr EfCfgSfAesModeShift).SfAesMode
+  result.seDbgDisabled = (cfg0 and (1'u32 shl EfCfgSeDbgDis)) != 0
+  result.efuseDbgDisabled = (cfg0 and (1'u32 shl EfCfgEfuseDbgDis)) != 0
+  result.jtag0Disable = (cfg0 and EfCfgJtag0DisMask) shr EfCfgJtag0DisShift
+  result.jtag1Disable = (cfg0 and EfCfgJtag1DisMask) shr EfCfgJtag1DisShift
+  result.dbgModeRaw = (cfg0 and EfCfgDbgModeMask) shr EfCfgDbgModeShift
+  let sm = (sw0 and EfSwSbootSignMask) shr EfSwSbootSignShift
+  result.signMode = (if sm <= 2: sm.SbootSignMode else: signNone)
+  for s in 0 ..< 4:
+    result.keySlotWriteLocked[s] = (lock and (1'u32 shl (EfLockWrKeySlot0 + s))) != 0
+    result.keySlotReadLocked[s]  = (lock and (1'u32 shl (EfLockRdKeySlot0 + s))) != 0
+  result.dbgPwdWriteLocked = (lock and (1'u32 shl EfLockWrDbgPwd)) != 0
+  result.dbgPwdReadLocked  = (lock and (1'u32 shl EfLockRdDbgPwd)) != 0
+
+proc efuseProductionLocked*(s: EfuseSecState): bool =
+  ## True iff this device is fully production-provisioned: secure boot enabled
+  ## with a real sign mode AND debug closed (JTAG both halves disabled). This is
+  ## the gate the framework uses to decide "trust the BootROM root of trust".
+  s.sbootEn != 0 and s.signMode != signNone and
+    s.jtag0Disable == 0x3 and s.jtag1Disable == 0x3
+
+proc efuseReadSecState*(): EfuseSecState =
+  ## Snapshot this chip's eFuse security configuration (read-only).
+  efuseDecodeSecState(efuseReadWord(EfWordCfg0.uint32),
+                      efuseReadWord(EfWordSwUsage0.uint32),
+                      efuseReadWord(EfWordLock.uint32))
+
+proc efuseKeySlotReadLocked*(slot: range[0..3]): bool =
+  ## True if a hardware AES key slot is read-protected (software cannot read
+  ## its bytes; the SEC_ENG hardware-key path can still use it).
+  let lock = efuseReadWord(EfWordLock.uint32)
+  (lock and (1'u32 shl (EfLockRdKeySlot0 + slot))) != 0
+
+# =============================================================================
+# Provisioning descriptor (pure — NEVER programs eFuse)
+#
+# Computes the (word, orMask) writes a production burn WOULD apply, so host
+# tooling and documentation can show exactly what provisioning does without
+# touching the OTP. eFuse bits only go 0->1, so every write is an OR mask.
+# =============================================================================
+type
+  ProvisionWrite* = object
+    word*: uint32      ## eFuse word index
+    orMask*: uint32    ## bits to set (0 -> 1)
+
+  ProvisionSpec* = object
+    enableSecureBoot*: bool
+    signMode*: SbootSignMode
+    sfAesMode*: SfAesMode
+    disableJtag*: bool          ## set both jtag-disable fields
+    disableSeDbg*: bool
+    lockKeySlotsRead*: set[range[0..3]]
+    lockKeySlotsWrite*: set[range[0..3]]
+
+  ProvisionPlan* = object
+    writes*: array[8, ProvisionWrite]
+    count*: int
+
+proc add(plan: var ProvisionPlan, word, orMask: uint32) =
+  if orMask == 0: return
+  # merge into an existing entry for the same word
+  for i in 0 ..< plan.count:
+    if plan.writes[i].word == word:
+      plan.writes[i].orMask = plan.writes[i].orMask or orMask
+      return
+  if plan.count < plan.writes.len:
+    plan.writes[plan.count] = ProvisionWrite(word: word, orMask: orMask)
+    inc plan.count
+
+proc computeProvisionPlan*(spec: ProvisionSpec): ProvisionPlan =
+  ## Pure function: the eFuse words/bits a production burn would set for this
+  ## spec. Never executed against hardware in reversible mode.
+  var cfg0 = 0'u32
+  if spec.enableSecureBoot:
+    cfg0 = cfg0 or (1'u32 shl EfCfgSbootEnShift)   # sboot_en = 1
+  cfg0 = cfg0 or ((spec.sfAesMode.uint32 and 0x3) shl EfCfgSfAesModeShift)
+  if spec.disableSeDbg:
+    cfg0 = cfg0 or (1'u32 shl EfCfgSeDbgDis)
+  if spec.disableJtag:
+    cfg0 = cfg0 or EfCfgJtag0DisMask or EfCfgJtag1DisMask
+    cfg0 = cfg0 or (4'u32 shl EfCfgDbgModeShift)   # dbg_mode = closed
+  result.add(EfWordCfg0.uint32, cfg0)
+
+  if spec.signMode != signNone:
+    result.add(EfWordSwUsage0.uint32, spec.signMode.uint32 shl EfSwSbootSignShift)
+
+  var lock = 0'u32
+  for s in spec.lockKeySlotsRead:  lock = lock or (1'u32 shl (EfLockRdKeySlot0 + s))
+  for s in spec.lockKeySlotsWrite: lock = lock or (1'u32 shl (EfLockWrKeySlot0 + s))
+  result.add(EfWordLock.uint32, lock)

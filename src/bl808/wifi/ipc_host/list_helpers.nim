@@ -16,9 +16,9 @@ proc listPushBack(list, hdr: pointer) {.inline.} =
 proc listPopFront(list: pointer): pointer {.inline.} =
   result = loadPtr(list, 0)
   if result != nil:
-    let next = loadPtr(result, 0)
-    storePtr(list, 0, next)
-    if next == nil:
+    let nextHeader = loadPtr(result, 0)
+    storePtr(list, 0, nextHeader)
+    if nextHeader == nil:
       storePtr(list, 4, nil)
     storePtr(result, 0, nil)
 

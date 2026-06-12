@@ -8,15 +8,15 @@ proc utils_list_concat*(list1, list2: ptr UtilsList) {.exportc, cdecl.} =
   utils_list_init(list2)
 
 proc utils_list_cnt*(list: ptr ConstUtilsList): cuint {.exportc, cdecl.} =
-  var cur = loadPtr(cast[pointer](list), 0)
-  while cur != nil:
+  var currentNode = loadPtr(cast[pointer](list), 0)
+  while currentNode != nil:
     inc result
-    cur = loadPtr(cur, 0)
+    currentNode = loadPtr(currentNode, 0)
 
 proc utils_list_pool_init*(list: ptr UtilsList; pool: pointer; elmtSize: csize_t; elmtCnt: cuint; defaultValue: pointer) {.exportc, cdecl.} =
   utils_list_init(list)
-  var cur = pool
+  var poolElement = pool
   for _ in 0'u32 ..< elmtCnt.uint32:
-    if defaultValue != nil: copyMem(cur, defaultValue, elmtSize.uint) else: zero(cur, elmtSize.uint)
-    utils_list_push_back(list, cast[ptr UtilsListHdr](cur))
-    cur = ptrAt(cur, elmtSize.uint)
+    if defaultValue != nil: copyMem(poolElement, defaultValue, elmtSize.uint) else: zero(poolElement, elmtSize.uint)
+    utils_list_push_back(list, cast[ptr UtilsListHdr](poolElement))
+    poolElement = ptrAt(poolElement, elmtSize.uint)

@@ -231,14 +231,14 @@ proc mfp_add_mgmt_mic*(frameDesc: pointer, bodyLen: uint32, totalLen: uint32): u
   sec.pnLow = newIpnLo
   sec.pnHigh = newIpnHi
   # Store IPN in MMIE[4..9] (6 bytes, little-endian)
-  var idx = 0'u32
-  while idx < 6:
-    let ipnByte = if idx < 4:
-        ((newIpnLo shr (idx * 8)) and 0xFF).uint8
+  var ipnByteIndex = 0'u32
+  while ipnByteIndex < 6:
+    let ipnByte = if ipnByteIndex < 4:
+        ((newIpnLo shr (ipnByteIndex * 8)) and 0xFF).uint8
       else:
-        ((newIpnHi shr ((idx - 4) * 8)) and 0xFF).uint8
-    mmie.ipn[idx.int] = ipnByte
-    inc idx
+        ((newIpnHi shr ((ipnByteIndex - 4) * 8)) and 0xFF).uint8
+    mmie.ipn[ipnByteIndex.int] = ipnByte
+    inc ipnByteIndex
   # Clear MIC area and nonce — blob inlines two zero-word stores.
   let micWords = mmieMicWords(mmie)
   micWords[0] = 0
@@ -250,16 +250,16 @@ proc mfp_add_mgmt_mic*(frameDesc: pointer, bodyLen: uint32, totalLen: uint32): u
   # each emits a runtime 64-bit shift (__lshrdi3 call). Volatile barrier
   # keeps GCC from merging them back into one.
   var micV {.volatile.}: uint64 = mic
-  idx = 0
-  while idx < 4:
-    mmie.mic[idx.int] = ((micV shr (idx * 8)) and 0xFF'u64).uint8
-    inc idx
+  var micLowByteIndex = 0'u32
+  while micLowByteIndex < 4:
+    mmie.mic[micLowByteIndex.int] = ((micV shr (micLowByteIndex * 8)) and 0xFF'u64).uint8
+    inc micLowByteIndex
   {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
   var micV2 {.volatile.}: uint64 = mic
-  idx = 4
-  while idx < 8:
-    mmie.mic[idx.int] = ((micV2 shr (idx * 8)) and 0xFF'u64).uint8
-    inc idx
+  var micHighByteIndex = 4'u32
+  while micHighByteIndex < 8:
+    mmie.mic[micHighByteIndex.int] = ((micV2 shr (micHighByteIndex * 8)) and 0xFF'u64).uint8
+    inc micHighByteIndex
   return 18
 
 # Forward declaration for aes_encrypt_block (defined later in AES section)
@@ -390,24 +390,24 @@ proc aes_encrypt_block*(roundKeys: pointer, state: pointer) {.exportc, cdecl.} =
   ## From blob (mfp_bip.o, 261 instrs): standard AES-128 with 10 rounds.
   ## SubBytes, ShiftRows, MixColumns (9 rounds), final round no MixColumns.
   ## Blob calls add_round_key as a separate function (not inlined).
-  let s = cast[ptr array[16, uint8]](state)
+  let stateBytes = cast[ptr array[16, uint8]](state)
 
   # Blob structure: initial add_round_key, 9-round loop with MixColumns +
   # add_round_key, then final round 10 (no MixColumns) tail-calling
   # add_round_key — 3 separate call sites to match the blob.
   template subBytesShiftRows(shifted: var array[16, uint8]) =
-    var tmp {.noinit.}: array[16, uint8]
-    for i in 0 ..< 16:
-      tmp[i] = AES_SBOX[s[i].int]
-    shifted[0] = tmp[0]; shifted[4] = tmp[4]; shifted[8] = tmp[8]; shifted[12] = tmp[12]
-    shifted[1] = tmp[5]; shifted[5] = tmp[9]; shifted[9] = tmp[13]; shifted[13] = tmp[1]
-    shifted[2] = tmp[10]; shifted[6] = tmp[14]; shifted[10] = tmp[2]; shifted[14] = tmp[6]
-    shifted[3] = tmp[15]; shifted[7] = tmp[3]; shifted[11] = tmp[7]; shifted[15] = tmp[11]
+    var substituted {.noinit.}: array[16, uint8]
+    for substitutionByteIndex in 0 ..< 16:
+      substituted[substitutionByteIndex] = AES_SBOX[stateBytes[substitutionByteIndex].int]
+    shifted[0] = substituted[0]; shifted[4] = substituted[4]; shifted[8] = substituted[8]; shifted[12] = substituted[12]
+    shifted[1] = substituted[5]; shifted[5] = substituted[9]; shifted[9] = substituted[13]; shifted[13] = substituted[1]
+    shifted[2] = substituted[10]; shifted[6] = substituted[14]; shifted[10] = substituted[2]; shifted[14] = substituted[6]
+    shifted[3] = substituted[15]; shifted[7] = substituted[3]; shifted[11] = substituted[7]; shifted[15] = substituted[11]
 
   template xtime(x: uint8): uint8 =
     let xv = x
-    let r = xv.uint16 shl 1
-    (if (xv and 0x80'u8) != 0: (r xor 0x1B).uint8 else: r.uint8)
+    let doubled = xv.uint16 shl 1
+    (if (xv and 0x80'u8) != 0: (doubled xor 0x1B).uint8 else: doubled.uint8)
 
   add_round_key(roundKeys, state, 0)
 
@@ -416,22 +416,26 @@ proc aes_encrypt_block*(roundKeys: pointer, state: pointer) {.exportc, cdecl.} =
     subBytesShiftRows(shifted)
     # MixColumns
     for col in 0 ..< 4:
-      let b = col * 4
-      let a0 = shifted[b]
-      let a1 = shifted[b+1]
-      let a2 = shifted[b+2]
-      let a3 = shifted[b+3]
-      s[b]   = xtime(a0) xor xtime(a1) xor a1 xor a2 xor a3
-      s[b+1] = a0 xor xtime(a1) xor xtime(a2) xor a2 xor a3
-      s[b+2] = a0 xor a1 xor xtime(a2) xor xtime(a3) xor a3
-      s[b+3] = xtime(a0) xor a0 xor a1 xor a2 xor xtime(a3)
+      let columnByteOffset = col * 4
+      let col0 = shifted[columnByteOffset]
+      let col1 = shifted[columnByteOffset + 1]
+      let col2 = shifted[columnByteOffset + 2]
+      let col3 = shifted[columnByteOffset + 3]
+      stateBytes[columnByteOffset] =
+        xtime(col0) xor xtime(col1) xor col1 xor col2 xor col3
+      stateBytes[columnByteOffset + 1] =
+        col0 xor xtime(col1) xor xtime(col2) xor col2 xor col3
+      stateBytes[columnByteOffset + 2] =
+        col0 xor col1 xor xtime(col2) xor xtime(col3) xor col3
+      stateBytes[columnByteOffset + 3] =
+        xtime(col0) xor col0 xor col1 xor col2 xor xtime(col3)
     add_round_key(roundKeys, state, round.uint32)
 
   # Round 10: SubBytes + ShiftRows (no MixColumns) then tail add_round_key
   var shifted {.noinit.}: array[16, uint8]
   subBytesShiftRows(shifted)
-  for i in 0 ..< 16:
-    s[i] = shifted[i]
+  for finalStateByteIndex in 0 ..< 16:
+    stateBytes[finalStateByteIndex] = shifted[finalStateByteIndex]
   add_round_key(roundKeys, state, 10)
 
 # ###########################################################################
@@ -451,22 +455,23 @@ proc hsu_aes_cmac*(key: pointer, msg: pointer, msgLen: uint32, mac: pointer) {.e
   var roundKeys: array[176, uint8]
   discard c_memcpy(addr roundKeys[0], key, 16.csize_t)
   # Expand key schedule
-  for i in 4'u32 ..< 44:
-    var tmp: array[4, uint8]
-    let prevOff = (i - 1) * 4
-    for j in 0 ..< 4:
-      tmp[j] = roundKeys[prevOff.int + j]
-    if (i mod 4) == 0:
+  for roundKeyWordIndex in 4'u32 ..< 44:
+    var scheduleWord: array[4, uint8]
+    let previousWordByteOffset = (roundKeyWordIndex - 1) * 4
+    for wordByteIndex in 0 ..< 4:
+      scheduleWord[wordByteIndex] = roundKeys[previousWordByteOffset.int + wordByteIndex]
+    if (roundKeyWordIndex mod 4) == 0:
       # RotWord + SubWord + Rcon
-      let t0 = tmp[0]
-      tmp[0] = AES_SBOX[tmp[1].int] xor cast[uint8](AES_RCON[(i div 4 - 1).int])
-      tmp[1] = AES_SBOX[tmp[2].int]
-      tmp[2] = AES_SBOX[tmp[3].int]
-      tmp[3] = AES_SBOX[t0.int]
-    let off = i * 4
-    let prevWordOff = (i - 4) * 4
-    for j in 0 ..< 4:
-      roundKeys[off.int + j] = roundKeys[prevWordOff.int + j] xor tmp[j]
+      let rotatedFirstByte = scheduleWord[0]
+      scheduleWord[0] = AES_SBOX[scheduleWord[1].int] xor cast[uint8](AES_RCON[(roundKeyWordIndex div 4 - 1).int])
+      scheduleWord[1] = AES_SBOX[scheduleWord[2].int]
+      scheduleWord[2] = AES_SBOX[scheduleWord[3].int]
+      scheduleWord[3] = AES_SBOX[rotatedFirstByte.int]
+    let roundKeyWordByteOffset = roundKeyWordIndex * 4
+    let previousRoundKeyWordByteOffset = (roundKeyWordIndex - 4) * 4
+    for wordByteIndex in 0 ..< 4:
+      roundKeys[roundKeyWordByteOffset.int + wordByteIndex] =
+        roundKeys[previousRoundKeyWordByteOffset.int + wordByteIndex] xor scheduleWord[wordByteIndex]
   # 2. Generate subkeys K1, K2
   var k1: array[16, uint8]
   var k2: array[16, uint8]
@@ -487,8 +492,8 @@ proc hsu_aes_cmac*(key: pointer, msg: pointer, msgLen: uint32, mac: pointer) {.e
   if nBlocks > 1:
     for blk in 0'u32 ..< (nBlocks - 1):
       let src = cast[ptr UncheckedArray[uint8]](msg)
-      for j in 0 ..< 16:
-        state[j] = state[j] xor src[pos + j.uint32]
+      for cmacBlockByteIndex in 0 ..< 16:
+        state[cmacBlockByteIndex] = state[cmacBlockByteIndex] xor src[pos + cmacBlockByteIndex.uint32]
       aes_encrypt_block(addr roundKeys[0], addr state[0])
       pos += 16
   # Process last block with K1 or K2
@@ -497,8 +502,8 @@ proc hsu_aes_cmac*(key: pointer, msg: pointer, msgLen: uint32, mac: pointer) {.e
   if lastBlockComplete and remaining == 16:
     # Complete last block: XOR with K1
     let src = cast[ptr UncheckedArray[uint8]](msg)
-    for j in 0 ..< 16:
-      lastBlock[j] = src[pos + j.uint32] xor k1[j]
+    for lastBlockByteIndex in 0 ..< 16:
+      lastBlock[lastBlockByteIndex] = src[pos + lastBlockByteIndex.uint32] xor k1[lastBlockByteIndex]
   else:
     # Incomplete last block: pad with 0x80 then zeros, XOR with K2
     discard c_memset(addr lastBlock[0], 0, 16.csize_t)
@@ -506,11 +511,11 @@ proc hsu_aes_cmac*(key: pointer, msg: pointer, msgLen: uint32, mac: pointer) {.e
       let src = cast[ptr UncheckedArray[uint8]](msg)
       discard c_memcpy(addr lastBlock[0], cast[pointer](cast[uint](msg) + pos), remaining.csize_t)
     lastBlock[remaining.int] = 0x80'u8
-    for j in 0 ..< 16:
-      lastBlock[j] = lastBlock[j] xor k2[j]
+    for lastBlockByteIndex in 0 ..< 16:
+      lastBlock[lastBlockByteIndex] = lastBlock[lastBlockByteIndex] xor k2[lastBlockByteIndex]
   # XOR last block with state and encrypt
-  for j in 0 ..< 16:
-    state[j] = state[j] xor lastBlock[j]
+  for finalCmacByteIndex in 0 ..< 16:
+    state[finalCmacByteIndex] = state[finalCmacByteIndex] xor lastBlock[finalCmacByteIndex]
   aes_encrypt_block(addr roundKeys[0], addr state[0])
   # 4. Output MAC
   discard c_memcpy(mac, addr state[0], 16.csize_t)
@@ -534,4 +539,3 @@ proc hsu_michael_end*(mic: pointer) {.exportc, cdecl.} =
     return
   me_mic_end(addr hsuMichaelCtx[0])
   discard c_memcpy(mic, addr hsuMichaelCtx[0], 8.csize_t)
-

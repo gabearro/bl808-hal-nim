@@ -1,23 +1,23 @@
-proc envCb(env: pointer; off: uint): pointer {.inline.} =
-  loadPtr(env, off)
+proc envCb(callbackEnv: pointer; callbackSlotByteOffset: uint): pointer {.inline.} =
+  loadPtr(callbackEnv, callbackSlotByteOffset)
 
-proc callSendDataCfm(env, hostId: pointer) {.inline.} =
-  let fn = cast[SendDataCfm](envCb(env, 0))
-  if fn != nil:
-    discard fn(loadPtr(env, EnvPthisOff), hostId)
+proc callSendDataCfm(callbackEnv, hostId: pointer) {.inline.} =
+  let sendDataConfirm = cast[SendDataCfm](envCb(callbackEnv, 0))
+  if sendDataConfirm != nil:
+    discard sendDataConfirm(loadPtr(callbackEnv, EnvPthisOff), hostId)
 
-proc callRecvMsgAck(env, hostId: pointer) {.inline.} =
-  let fn = cast[RecvInd](envCb(env, 16))
-  if fn != nil:
-    discard fn(loadPtr(env, EnvPthisOff), hostId)
+proc callRecvMsgAck(callbackEnv, hostId: pointer) {.inline.} =
+  let messageAckIndication = cast[RecvInd](envCb(callbackEnv, 16))
+  if messageAckIndication != nil:
+    discard messageAckIndication(loadPtr(callbackEnv, EnvPthisOff), hostId)
 
-proc callRecvDbg(env, hostId: pointer): uint8 {.inline.} =
-  let fn = cast[RecvInd](envCb(env, 20))
-  if fn == nil:
+proc callRecvDbg(callbackEnv, hostId: pointer): uint8 {.inline.} =
+  let debugIndication = cast[RecvInd](envCb(callbackEnv, 20))
+  if debugIndication == nil:
     return 1
-  fn(loadPtr(env, EnvPthisOff), hostId)
+  debugIndication(loadPtr(callbackEnv, EnvPthisOff), hostId)
 
-proc callTbtt(env: pointer; off: uint) {.inline.} =
-  let fn = cast[TbttInd](envCb(env, off))
-  if fn != nil:
-    fn(loadPtr(env, EnvPthisOff))
+proc callTbtt(callbackEnv: pointer; callbackSlotByteOffset: uint) {.inline.} =
+  let tbttIndication = cast[TbttInd](envCb(callbackEnv, callbackSlotByteOffset))
+  if tbttIndication != nil:
+    tbttIndication(loadPtr(callbackEnv, EnvPthisOff))

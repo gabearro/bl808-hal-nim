@@ -326,7 +326,7 @@ proc configureKeTaskDesc(taskId: uint8, stateTable: pointer,
   desc.stateTable = stateTable
   desc.defaultHandler = defaultHandler
   desc.statePtr = statePtr
-  desc.reserved = 0
+  desc.stateCountPadding = 0
   desc.stateCount = stateCount
 
 type
@@ -340,4 +340,3 @@ type
 proc configureKeTaskDesc(spec: KeTaskInitSpec) {.inline.} =
   configureKeTaskDesc(spec.taskId, spec.stateTable, spec.defaultHandler,
                       spec.statePtr, spec.stateCount)
-

@@ -173,9 +173,9 @@ when defined(bl808BleConnectTrace) or defined(bl808BlePrintNimLlcMsg):
       bleTraceByte(ch.uint8)
 
   proc bleTraceHexNibble(value: uint8) =
-    let n = value and 0x0F'u8
-    bleTraceByte(if n < 10'u8: uint8(ord('0')) + n
-                 else: uint8(ord('A')) + n - 10'u8)
+    let hexNibble = value and 0x0F'u8
+    bleTraceByte(if hexNibble < 10'u8: uint8(ord('0')) + hexNibble
+                 else: uint8(ord('A')) + hexNibble - 10'u8)
 
   proc bleTraceHex32(value: uint32) =
     bleTrace("0x")
@@ -184,15 +184,11 @@ when defined(bl808BleConnectTrace) or defined(bl808BlePrintNimLlcMsg):
 
 when defined(bl808m0) and
     bl808BleNimSchProgEnabled:
-  proc nimSchProgInit(initType: uint8) {.cdecl.}
-  proc nimSchProgFifoIsr() {.cdecl.}
-  proc nimSchProgSkipIsr(idx: uint8) {.cdecl.}
   var nimSchProgSkipIndex {.exportc: "m_sw_skip_et_idx".}: uint32
 
 when defined(bl808m0):
   when not bl808BleNimSchProg:
     {.error: "M0 BLE requires the pure Nim scheduler program path".}
-  proc nimSchProgPush(prog: pointer) {.cdecl.}
 
 when defined(bl808m0) and
     (bl808BleNimConnectionEnabled or bl808BleNimPureCentral):
@@ -200,27 +196,27 @@ when defined(bl808m0) and
     BtbleRfTableView {.packed.} = object
       reset*: pointer
       forceAgcEnable*: pointer
-      unusedCallback08*: pointer
-      unusedCallback0c*: pointer
+      unsupportedCallbackSlot08*: pointer
+      unsupportedCallbackSlot0c*: pointer
       txpwrMaxSet*: pointer
       txpwrMaxGet*: pointer
-      unusedCallback18*: pointer
+      unsupportedCallbackSlot18*: pointer
       txpwrDbmGet*: pointer
       txpwrCsGet*: pointer
       rssiConvert*: pointer
-      unusedCallback28*: pointer
+      unsupportedCallbackSlot28*: pointer
       regRead*: pointer
       regWrite*: pointer
       sleep*: pointer
-      emConfigWord*: uint16
+      emConfigFlags*: uint16
       emConfigPadding3a*: array[3, uint8]
       rssiFloorDbm*: int8
-      calibrationWord*: uint16
+      calibrationSignature*: uint16
 
     BleMacPhyRegs {.packed.} = object
-      reserved000*: array[0x30, uint8]
+      macPhyBaseToSleepCtrlPadding*: array[0x30, uint8]
       sleepCtrl*: uint32
-      reserved034*: array[0x84C, uint8]
+      sleepCtrlToRfResetTimingPadding*: array[0x84C, uint8]
       rfResetTiming0*: uint32
       rfResetTiming1*: uint32
       rfResetTiming2*: uint32
@@ -229,54 +225,61 @@ when defined(bl808m0) and
       rfResetGainWindow1*: uint32
       rfResetGainWindow2*: uint32
       rfResetGainWindow3*: uint32
-      reserved8a0*: array[0xE0, uint8]
+      rfResetGainToPacketSettlePadding*: array[0xE0, uint8]
       rfPacketSettleTiming0*: uint32
       rfPacketSettleTiming1*: uint32
       rfPacketSettleTiming2*: uint32
       rfPacketSettleTiming3*: uint32
-      reserved990*: array[0x30, uint8]
+      packetSettleToAnalogTrimPadding*: array[0x30, uint8]
       analogTrimControl*: uint32
 
     BlePhyCtrlRegs {.packed.} = object
-      reserved00*: array[0x08, uint8]
+      phyCtrlBaseToRfResetInitPadding*: array[0x08, uint8]
       rfResetInitControl*: uint32
-      reserved0c*: array[0x80, uint8]
+      rfResetInitToTuningPadding*: array[0x80, uint8]
       rfResetTuningControl*: uint32
 
     BlePhyAgcRegs {.packed.} = object
-      reserved00*: array[0x84, uint8]
+      agcBaseToResetConfigPadding*: array[0x84, uint8]
       resetAgcConfig*: uint32
 
   const
-    BtbleRfEmConfigWord = 0x2000'u16
+    BtbleRfEmConfigFlags = 0x2000'u16
     BtbleRfRssiFloorDbm = -40'i8
-    BtbleRfCalibrationWord = 0xBAC4'u16
+    BtbleRfCalibrationSignature = 0xBAC4'u16
 
   static:
-    doAssert offsetof(BtbleRfTableView, unusedCallback08) == 0x08
-    doAssert offsetof(BtbleRfTableView, unusedCallback0c) == 0x0C
+    doAssert offsetof(BtbleRfTableView, unsupportedCallbackSlot08) == 0x08
+    doAssert offsetof(BtbleRfTableView, unsupportedCallbackSlot0c) == 0x0C
     doAssert offsetof(BtbleRfTableView, txpwrMaxSet) == 0x10
     doAssert offsetof(BtbleRfTableView, txpwrMaxGet) == 0x14
-    doAssert offsetof(BtbleRfTableView, unusedCallback18) == 0x18
+    doAssert offsetof(BtbleRfTableView, unsupportedCallbackSlot18) == 0x18
     doAssert offsetof(BtbleRfTableView, txpwrDbmGet) == 0x1C
     doAssert offsetof(BtbleRfTableView, txpwrCsGet) == 0x20
     doAssert offsetof(BtbleRfTableView, rssiConvert) == 0x24
-    doAssert offsetof(BtbleRfTableView, unusedCallback28) == 0x28
+    doAssert offsetof(BtbleRfTableView, unsupportedCallbackSlot28) == 0x28
     doAssert offsetof(BtbleRfTableView, regRead) == 0x2C
     doAssert offsetof(BtbleRfTableView, regWrite) == 0x30
     doAssert offsetof(BtbleRfTableView, sleep) == 0x34
-    doAssert offsetof(BtbleRfTableView, emConfigWord) == 0x38
+    doAssert offsetof(BtbleRfTableView, emConfigFlags) == 0x38
     doAssert offsetof(BtbleRfTableView, emConfigPadding3a) == 0x3A
     doAssert offsetof(BtbleRfTableView, rssiFloorDbm) == 0x3D
-    doAssert offsetof(BtbleRfTableView, calibrationWord) == 0x3E
+    doAssert offsetof(BtbleRfTableView, calibrationSignature) == 0x3E
+    doAssert offsetof(BleMacPhyRegs, macPhyBaseToSleepCtrlPadding) == 0x00
     doAssert offsetof(BleMacPhyRegs, sleepCtrl) == 0x30
+    doAssert offsetof(BleMacPhyRegs, sleepCtrlToRfResetTimingPadding) == 0x34
     doAssert offsetof(BleMacPhyRegs, rfResetTiming0) == 0x880
     doAssert offsetof(BleMacPhyRegs, rfResetGainWindow3) == 0x89C
+    doAssert offsetof(BleMacPhyRegs, rfResetGainToPacketSettlePadding) == 0x8A0
     doAssert offsetof(BleMacPhyRegs, rfPacketSettleTiming0) == 0x980
     doAssert offsetof(BleMacPhyRegs, rfPacketSettleTiming3) == 0x98C
+    doAssert offsetof(BleMacPhyRegs, packetSettleToAnalogTrimPadding) == 0x990
     doAssert offsetof(BleMacPhyRegs, analogTrimControl) == 0x9C0
+    doAssert offsetof(BlePhyCtrlRegs, phyCtrlBaseToRfResetInitPadding) == 0x00
     doAssert offsetof(BlePhyCtrlRegs, rfResetInitControl) == 0x08
+    doAssert offsetof(BlePhyCtrlRegs, rfResetInitToTuningPadding) == 0x0C
     doAssert offsetof(BlePhyCtrlRegs, rfResetTuningControl) == 0x8C
+    doAssert offsetof(BlePhyAgcRegs, agcBaseToResetConfigPadding) == 0x00
     doAssert offsetof(BlePhyAgcRegs, resetAgcConfig) == 0x84
 
   var g_ble_max_txpower_dbm: int8
@@ -373,22 +376,22 @@ when defined(bl808m0) and
     let table = cast[ptr BtbleRfTableView](rf)
     table.reset = cast[pointer](nimRfReset)
     table.forceAgcEnable = cast[pointer](nimRfForceAgcEnable)
-    table.unusedCallback08 = nil
-    table.unusedCallback0c = nil
+    table.unsupportedCallbackSlot08 = nil
+    table.unsupportedCallbackSlot0c = nil
     table.txpwrMaxSet = cast[pointer](nimBleRfTxpowerMaxSet)
     table.txpwrMaxGet = cast[pointer](nimBleRfTxpowerMaxGet)
-    table.unusedCallback18 = nil
+    table.unsupportedCallbackSlot18 = nil
     table.txpwrDbmGet = cast[pointer](nimRfTxpwrDbmGet)
     table.txpwrCsGet = cast[pointer](nimRfTxpwrCsGet)
     table.rssiConvert = cast[pointer](nimRfRssiConvert)
-    table.unusedCallback28 = nil
+    table.unsupportedCallbackSlot28 = nil
     table.regRead = cast[pointer](nimRfRegRead)
     table.regWrite = cast[pointer](nimRfRegWrite)
     table.sleep = cast[pointer](nimRfSleep)
-    table.emConfigWord = BtbleRfEmConfigWord
+    table.emConfigFlags = BtbleRfEmConfigFlags
     table.emConfigPadding3a = [0'u8, 0, 0]
     table.rssiFloorDbm = BtbleRfRssiFloorDbm
-    table.calibrationWord = BtbleRfCalibrationWord
+    table.calibrationSignature = BtbleRfCalibrationSignature
     g_ble_max_txpower_dbm = 15'i8
 
 when defined(bl808m0) and bl808BleNimConnectionEnabled:

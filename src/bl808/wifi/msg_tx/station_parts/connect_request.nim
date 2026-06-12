@@ -27,8 +27,8 @@ proc bl_send_sm_connect_req*(blHw: ptr BlHw; sme: ptr Cfg80211ConnectParams;
   if bssid != nil and not macIsSpecial(bssid, 0xff) and not macIsSpecial(bssid, 0):
     copyMem(ptrAt(req, SmBssidOff), bssid, 6)
   else:
-    for i in 0 ..< 6:
-      storeU8(req, SmBssidOff + i.uint, 0xff)
+    for bssidByteOffset in 0 ..< 6:
+      storeU8(req, SmBssidOff + bssidByteOffset.uint, 0xff)
 
   storeU8(req, SmVifIdxOff, staVifIdx(blHw))
   if loadU16(smeRaw, ConnChannelOff + ConnChanFreqOff) != 0'u16:

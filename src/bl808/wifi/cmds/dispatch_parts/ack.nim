@@ -6,17 +6,17 @@ proc cmdMgrLlind(cmdMgr, cmd: pointer): cint {.cdecl.} =
              cmd, loadU32(cmd, CmdTknOff).cuint, loadU16(cmd, CmdFlagsOff).cuint)
   cmdMgrLock(cmdMgr)
   let head = ptrAt(cmdMgr, MgrCmdsOff)
-  var cur = listNext(head)
-  while cur != head:
+  var queuedCmd = listNext(head)
+  while queuedCmd != head:
     if acked == nil:
-      if loadU32(cur, CmdTknOff) == loadU32(cmd, CmdTknOff):
-        acked = cur
-        cur = listNext(cur)
+      if loadU32(queuedCmd, CmdTknOff) == loadU32(cmd, CmdTknOff):
+        acked = queuedCmd
+        queuedCmd = listNext(queuedCmd)
         continue
-    if (loadU16(cur, CmdFlagsOff) and RwnxCmdFlagWaitPush) != 0'u16:
-      nextCmd = cur
+    if (loadU16(queuedCmd, CmdFlagsOff) and RwnxCmdFlagWaitPush) != 0'u16:
+      nextCmd = queuedCmd
       break
-    cur = listNext(cur)
+    queuedCmd = listNext(queuedCmd)
 
   if acked != nil:
     when defined(bl808WifiCmdTrace):

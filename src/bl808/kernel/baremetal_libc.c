@@ -173,6 +173,11 @@ __attribute__((weak)) int abs(int value) {
     return value < 0 ? -value : value;
 }
 
+/* The double-precision log() fallback drags in soft-float (__divdf3 etc). The
+ * E902 (LP) builds rv32emc / ilp32e and has no FP, and the toolchain ships no
+ * rv32e libgcc multilib, so linking it fails. M0/D0 have FP and keep it; LP
+ * never calls log(), so omit it there. */
+#ifndef __riscv_abi_rve
 __attribute__((weak)) double log(double x) {
     union {
         double d;
@@ -203,6 +208,7 @@ __attribute__((weak)) double log(double x) {
     }
     return 2.0 * sum + (double)exp * ln2;
 }
+#endif /* !__riscv_abi_rve */
 
 /* Nim's ARC runtime calls exit() on fatal errors */
 void exit(int status) {

@@ -21,19 +21,19 @@ when not defined(bl808WifiRealLwip):
     cast[ptr Pbuf](p)
 
   proc pbuf_free*(p: ptr Pbuf): uint8 {.exportc, cdecl.} =
-    var cur = cast[pointer](p)
-    while cur != nil:
-      let next = loadPtr(cur, PbufNextOff)
-      let refCount = loadU16(cur, PbufRefOff)
+    var pbufNode = cast[pointer](p)
+    while pbufNode != nil:
+      let nextPbufNode = loadPtr(pbufNode, PbufNextOff)
+      let refCount = loadU16(pbufNode, PbufRefOff)
       if refCount > 1'u16:
-        storeU16(cur, PbufRefOff, refCount - 1'u16)
+        storeU16(pbufNode, PbufRefOff, refCount - 1'u16)
         return 0
-      if (loadU8(cur, PbufFlagsOff) and PbufFlagIsCustom) != 0:
-        let fn = cast[PbufFreeFn](loadPtr(cur, PbufCustomFreeOff))
-        if fn != nil: fn(cast[ptr Pbuf](cur))
+      if (loadU8(pbufNode, PbufFlagsOff) and PbufFlagIsCustom) != 0:
+        let customFree = cast[PbufFreeFn](loadPtr(pbufNode, PbufCustomFreeOff))
+        if customFree != nil: customFree(cast[ptr Pbuf](pbufNode))
       else:
-        c_free(cur)
-      cur = next
+        c_free(pbufNode)
+      pbufNode = nextPbufNode
     1
 
   proc pbuf_ref*(p: ptr Pbuf) {.exportc, cdecl.} =

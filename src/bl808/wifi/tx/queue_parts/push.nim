@@ -1,60 +1,58 @@
-proc txPush(sta, txdescHost, ptxbuf, txhdr: pointer) =
-  zero(txdescHostPad(txdescHost), 208)
-  let txbuf = ptxbuf
-  let txbufBuf = txbufHostBuf(txbuf)
-  var p: pointer = nil
-  var ethhdr: pointer
+proc txPush(station, hostTxDescStorage, txBuffer, txHeaderPtr: pointer) =
+  zero(txdescHostPad(hostTxDescStorage), 208)
+  let txPayloadStorage = txbufHostBuf(txBuffer)
+  var sourcePbuf: pointer = nil
+  var ethernetFramePtr: pointer
 
-  if txHdrView(txhdr).pbuf != txbuf:
-    p = txHdrView(txhdr).pbuf
-    ethhdr = bufferAt(pbufView(p).payload, PbufLinkEncapsulationHlen.uint)
+  if txHdrView(txHeaderPtr).pbuf != txBuffer:
+    sourcePbuf = txHdrView(txHeaderPtr).pbuf
+    ethernetFramePtr = bufferAt(pbufView(sourcePbuf).payload, PbufLinkEncapsulationHlen.uint)
   else:
-    ethhdr = bufferAt(txbufBuf, PbufLinkEncapsulationHlen.uint)
+    ethernetFramePtr = bufferAt(txPayloadStorage, PbufLinkEncapsulationHlen.uint)
 
-  let staO = staView(sta)
-  let hostDesc = txdescUpperHost(txdescHost)
-  let eth = ethernetHeaderAt(ethhdr)
-  copyMem(addr hostDesc.ethDest[0], addr eth.dst[0], EthAlen)
-  copyMem(addr hostDesc.ethSrc[0], addr eth.src[0], EthAlen)
-  hostDesc.ethertype = eth.ethertype
-  hostDesc.vifType = txHdrVifType(txhdr)
-  hostDesc.packetLen = txHdrLen(txhdr) - LinkOffsetLen
-  hostDesc.vifIdx = vifView(staVif(sta)).vifIdx
-  hostDesc.staId = staO.staIdx
-  hostDesc.tid = if staO.qos != 0'u8: 0'u8 else: 0xff'u8
-  hostDesc.packetAddr = 0x1111_1111'u32
-  hostDesc.flags = 0
+  let stationState = staView(station)
+  let hostTxDesc = txdescUpperHost(hostTxDescStorage)
+  let ethernetHeader = ethernetHeaderAt(ethernetFramePtr)
+  copyMem(addr hostTxDesc.ethDest[0], addr ethernetHeader.dst[0], EthAlen)
+  copyMem(addr hostTxDesc.ethSrc[0], addr ethernetHeader.src[0], EthAlen)
+  hostTxDesc.ethertype = ethernetHeader.ethertype
+  hostTxDesc.vifType = txHdrVifType(txHeaderPtr)
+  hostTxDesc.packetLen = txHdrLen(txHeaderPtr) - LinkOffsetLen
+  hostTxDesc.vifIdx = vifView(staVif(station)).vifIdx
+  hostTxDesc.staId = stationState.staIdx
+  hostTxDesc.tid = if stationState.qos != 0'u8: 0'u8 else: 0xff'u8
+  hostTxDesc.packetAddr = 0x1111_1111'u32
+  hostTxDesc.flags = 0
 
-  var newTxhdr = txhdr
+  var pushedTxHeaderPtr = txHeaderPtr
   var totalLen: uint16
-  if txHdrView(txhdr).pbuf != txbuf:
-    let alignSrc = alignPads(pbufView(p).payload)
-    let alignDst = alignPads(txbufBuf)
-    newTxhdr = bufferAt(txbufBuf, alignDst.uint)
-    var q = p
-    var loop = 0
+  if txHdrView(txHeaderPtr).pbuf != txBuffer:
+    let targetPayloadAlignOffset = alignPads(txPayloadStorage)
+    pushedTxHeaderPtr = bufferAt(txPayloadStorage, targetPayloadAlignOffset.uint)
+    var chainedPbuf = sourcePbuf
+    var chainIndex = 0
     totalLen = 0
-    while q != nil:
-      let qView = pbufView(q)
-      let qPayload = qView.payload
-      let qLen = qView.len
-      if loop == 0:
-        copyMem(bufferAt(txbufBuf, PbufLinkEncapsulationHlen.uint),
-                bufferAt(qPayload, PbufLinkEncapsulationHlen.uint),
-                (qLen - PbufLinkEncapsulationHlen).uint)
+    while chainedPbuf != nil:
+      let chainedPbufView = pbufView(chainedPbuf)
+      let chainedPayload = chainedPbufView.payload
+      let chainedLen = chainedPbufView.len
+      if chainIndex == 0:
+        copyMem(bufferAt(txPayloadStorage, PbufLinkEncapsulationHlen.uint),
+                bufferAt(chainedPayload, PbufLinkEncapsulationHlen.uint),
+                (chainedLen - PbufLinkEncapsulationHlen).uint)
       else:
-        copyMem(bufferAt(txbufBuf, totalLen.uint), qPayload, qLen.uint)
-      totalLen = totalLen + qLen
-      inc loop
-      q = qView.next
-    copyMem(newTxhdr, txhdr, TxHdrSize)
-    txHdrView(newTxhdr).pbuf = txbuf
-    discard pbuf_free(cast[ptr Pbuf](p))
+        copyMem(bufferAt(txPayloadStorage, totalLen.uint), chainedPayload, chainedLen.uint)
+      totalLen = totalLen + chainedLen
+      inc chainIndex
+      chainedPbuf = chainedPbufView.next
+    copyMem(pushedTxHeaderPtr, txHeaderPtr, TxHdrSize)
+    txHdrView(pushedTxHeaderPtr).pbuf = txBuffer
+    discard pbuf_free(cast[ptr Pbuf](sourcePbuf))
   else:
-    totalLen = txHdrLen(newTxhdr)
+    totalLen = txHdrLen(pushedTxHeaderPtr)
 
-  hostDesc.pbufChainedPtr = cast[uint](bufferAt(txbufBuf, LinkOffsetLen.uint)).uint32
-  hostDesc.pbufChainedLen = (totalLen - LinkOffsetLen).uint32
-  hostDesc.statusAddr = cast[uint](addr txHdrView(newTxhdr).status).uint32
-  hostDesc.pbufAddr = cast[uint](txbuf).uint32
-  ipc_host_txdesc_push(hwView().ipcEnv, txbuf)
+  hostTxDesc.pbufChainedPtr = cast[uint](bufferAt(txPayloadStorage, LinkOffsetLen.uint)).uint32
+  hostTxDesc.pbufChainedLen = (totalLen - LinkOffsetLen).uint32
+  hostTxDesc.statusAddr = cast[uint](addr txHdrView(pushedTxHeaderPtr).status).uint32
+  hostTxDesc.pbufAddr = cast[uint](txBuffer).uint32
+  ipc_host_txdesc_push(hwView().ipcEnv, txBuffer)

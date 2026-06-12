@@ -5,7 +5,7 @@ proc usePairwiseKey(crypto: pointer): bool {.inline.} =
 proc macIsSpecial(mac: pointer; value: uint8): bool =
   if mac == nil:
     return false
-  for i in 0 ..< 6:
-    if cast[ptr UncheckedArray[uint8]](mac)[i] != value:
+  for macByteIndex in 0 ..< 6:
+    if cast[ptr UncheckedArray[uint8]](mac)[macByteIndex] != value:
       return false
   true

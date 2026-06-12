@@ -39,8 +39,8 @@ proc ps_set_mode*(mode: uint8) {.exportc, cdecl.} =
     # Disable PS: clear enable byte, clear MACHW bit
     # (blob: ps_disable_cfm_handle at 0x9A)
     ps.enabled = 0
-    let r = volatileLoad(cast[ptr uint32](0x24B0004C'u32))
-    volatileStore(cast[ptr uint32](0x24B0004C'u32), r and not 4'u32)
+    let machwPowerControl = volatileLoad(cast[ptr uint32](0x24B0004C'u32))
+    volatileStore(cast[ptr uint32](0x24B0004C'u32), machwPowerControl and not 4'u32)
     # PS disable confirm (blob: ps_disable_cfm_handle at 0x9A)
     let vifIdxForDisable = cast[uint8](ps.statusFlags and 0xFF)
     let vifEntryDisable = cast[pointer](vifChannelForIdx(vifIdxForDisable))
@@ -54,8 +54,8 @@ proc ps_set_mode*(mode: uint8) {.exportc, cdecl.} =
         cast[LP](logFn)(1, 0, "ps.c", 702)
       ps.flags = ps.flags or 1
     # Enable PS: set MACHW bit
-    let r = volatileLoad(cast[ptr uint32](0x24B0004C'u32))
-    volatileStore(cast[ptr uint32](0x24B0004C'u32), r or 4'u32)
+    let machwPowerControl = volatileLoad(cast[ptr uint32](0x24B0004C'u32))
+    volatileStore(cast[ptr uint32](0x24B0004C'u32), machwPowerControl or 4'u32)
 
   # .L39: Load active VIF linked-list head from vif_mgmt_env.
   var vifNode = cast[pointer](vifMgmtEnvView().activeList.first)
@@ -519,13 +519,13 @@ extern unsigned int ps_check_tx_status_part0(void*, void*) __asm__("ps_check_tx_
       return
     # Non-zero means TX confirm arrived, fall through to decrement path
   # Decrement TX confirm counter and clear timer
-  let cnt = ps.pendingCount
-  if cnt == 0:
+  let pendingNullConfirmCount = ps.pendingCount
+  if pendingNullConfirmCount == 0:
     return
-  let newCnt = cnt - 1
-  ps.pendingCount = newCnt
+  let remainingNullConfirmCount = pendingNullConfirmCount - 1
+  ps.pendingCount = remainingNullConfirmCount
   mm_timer_clear(psTxNullTimer())
-  if newCnt != 0:
+  if remainingNullConfirmCount != 0:
     return
   # All confirms received: finalize disable
   discard ps_disable_cfm_handle(vifEntry)
@@ -694,11 +694,12 @@ proc ps_tx_null_timer_handle*() {.exportc, cdecl.} =
   let flags = ps.flags
   if (flags and 1) == 0:
     return
-  let cnt = ps.pendingCount
-  if cnt == 0:
+  let pendingNullConfirmCount = ps.pendingCount
+  if pendingNullConfirmCount == 0:
     return
-  ps.pendingCount = cnt - 1
-  if cnt - 1 != 0:
+  let remainingNullConfirmCount = pendingNullConfirmCount - 1
+  ps.pendingCount = remainingNullConfirmCount
+  if remainingNullConfirmCount != 0:
     return
   # All null frames confirmed: dispatch based on PS mode
   if (flags and 2) != 0:
@@ -909,7 +910,7 @@ proc ps_disable_cfm_handle*(vifEntry: pointer): uint32 {.exportc, cdecl.} =
     # .L64: send basic message
     ps.enabled = 0
     ps.mode = 0
-    ps.reserved02 = [0'u8, 0'u8]
+    ps.modeStatusPadding = [0'u8, 0'u8]
     let destTask = ps.mode
     # ke_msg_send_basic(32, ps_env[1], 0)
     ke_msg_send_basic(32'u16, destTask, 0)
@@ -966,10 +967,10 @@ extern unsigned int ps_check_tx_status_part0(void*, void*) __asm__("ps_check_tx_
     if checkResult == 0:
       return
   # finalize path
-  let cnt = ps.pendingCount
-  if cnt == 0:
+  let pendingNullConfirmCount = ps.pendingCount
+  if pendingNullConfirmCount == 0:
     return
-  ps.pendingCount = cnt - 1
+  ps.pendingCount = pendingNullConfirmCount - 1
   # Clear TX-null timer at ps_env + 0x24 (byte offset 36, NOT 12)
   mm_timer_clear(psTxNullTimer())
   if ps.pendingCount != 0:
@@ -1067,8 +1068,8 @@ proc ps_dpsm_update*(enable: uint32) {.exportc, cdecl.} =
       vifPtr = vif.next
       continue
     # Increment active counter, clear PS state, load PS mode
-    let c = ps.pendingCount
-    ps.pendingCount = c + 1
+    let pendingNullConfirmSnapshot = ps.pendingCount
+    ps.pendingCount = pendingNullConfirmSnapshot + 1
     vif.psNullRetry = 0
     if enable != 0:
       # Enable path: send null frame PM=1 (blob: txl_frame_send_null_frame)
@@ -1079,7 +1080,7 @@ proc ps_dpsm_update*(enable: uint32) {.exportc, cdecl.} =
       # Disable path: send null frame PM=0 (blob: txl_frame_send_null_frame)
       let staIdx = vif.staIdx
       discard txl_frame_send_null_frame(staIdx, cast[pointer](ps_disable_cfm), cast[uint32](vifAddr))
-      if ps.pendingCount == c + 1:
+      if ps.pendingCount == pendingNullConfirmSnapshot + 1:
         ps.pendingCount = ps.pendingCount - 1
       else:
         # Store current VIF for async completion
@@ -1155,20 +1156,20 @@ proc bl_pwr_find*(levels: pointer, count: uint32): uint32 {.exportc, cdecl.} =
   ## levels[0] is already the max).
   if count == 0:
     return 0
-  let p = cast[ptr UncheckedArray[uint8]](levels)
-  var refVal = p[0]  # running max (unsigned byte)
-  var bestIdx = 0'u32
-  let n = count - 1
-  var i = 0'u32
-  while i < n:
-    let entry = cast[int8](p[i + 1])  # blob uses lb (signed load)
-    i += 1
-    i = i and 0xFF  # blob: zext.b
-    if cast[int8](refVal) >= entry:  # blob: bge (signed compare)
+  let powerLevelBytes = cast[ptr UncheckedArray[uint8]](levels)
+  var highestLevel = powerLevelBytes[0]  # running max (unsigned byte)
+  var bestIndex = 0'u32
+  let lastScanIndex = count - 1
+  var scanIndex = 0'u32
+  while scanIndex < lastScanIndex:
+    let candidateLevel = cast[int8](powerLevelBytes[scanIndex + 1])  # blob uses lb (signed load)
+    scanIndex += 1
+    scanIndex = scanIndex and 0xFF  # blob: zext.b
+    if cast[int8](highestLevel) >= candidateLevel:  # blob: bge (signed compare)
       continue
-    refVal = cast[uint8](entry) and 0xFF  # blob: zext.b on new max
-    bestIdx = i
-  return bestIdx
+    highestLevel = cast[uint8](candidateLevel) and 0xFF  # blob: zext.b on new max
+    bestIndex = scanIndex
+  return bestIndex
 
 proc ble_rf_ops*(enable: uint32) {.exportc, cdecl.} =
   ## BLE RF operations toggle (34 bytes in blob, 9 instrs).
@@ -1208,14 +1209,14 @@ proc mm_ap_traffic_probe_cfm*(vifEntry: pointer, status: uint32) {.exportc, cdec
     mm.keepAliveLimit = 10  # reset counter at mm_env offset 32
     vifChannelAt(vifEntry).beaconTimeoutBase = macTimeNow()
   else:
-    let cnt = mm.keepAliveLimit
-    if cnt == 0:
+    let keepAliveMissBudget = mm.keepAliveLimit
+    if keepAliveMissBudget == 0:
       mm.keepAliveLimit = 10
       # Tail-call connection loss: blob passes vifEntry as a0, reason=22 as a1
       let vifIdx = vifChannelAt(vifEntry).vifIdx
       mm_send_connection_loss_ind(vifIdx, 22)
     else:
-      mm.keepAliveLimit = cnt - 1
+      mm.keepAliveLimit = keepAliveMissBudget - 1
 
 proc td_timer_end*(tdEntry: pointer) {.exportc, cdecl.} =
   ## End traffic detection timer and update TD state (312 bytes in blob, 79 instrs).
@@ -1223,7 +1224,7 @@ proc td_timer_end*(tdEntry: pointer) {.exportc, cdecl.} =
   ## TX/RX counters vs threshold, calls notification on direction change, then
   ## resets counters and reschedules timer.
   ##
-  ## Entry layout: [0]=timer_hdr, [16]=period, [24]=rx_count, [28]=tx_count,
+  ## Entry layout: [0]=timer link, [12]=expiry, [16]=period, [24]=rx_count, [28]=tx_count,
   ##   [32]=ps_rx_count, [36]=ps_tx_count, [40]=vif_idx, [41]=prev_flags,
   ##   [42]=active, [43]=timer-end active latch.
   let td = tdEntryAt(tdEntry)
@@ -1293,25 +1294,25 @@ proc td_timer_end*(tdEntry: pointer) {.exportc, cdecl.} =
 
 proc phyif_utils_decode*(rxvec: pointer, rssi: ptr int8): uint32 {.exportc, cdecl.} =
   ## Decode PHY RSSI from RX vector (128 bytes in blob, 36 instrs).
-  ## From blob: reads word1(a0[4]) and byte19(a0[19]). Extracts format bits.
+  ## From blob: reads rx-vector word at a0[4] and byte19(a0[19]). Extracts format bits.
   ## Fast path (fmtVal > 1): combines bytes 19+20 as (byte20<<8)|byte19,
   ##   applies custom PHY insn, divides by 122, converts int→float→int.
-  ## Slow path (fmtVal <= 1): reads word0, extracts MCS field, checks > 3,
+  ## Slow path (fmtVal <= 1): reads rx-vector word at a0[0], extracts MCS field, checks > 3,
   ##   calls 3 external functions (__floatsisf, __divsf3, __fixsfsi) for
   ##   float-based RSSI computation.
   ## Returns 0 on success, stores result byte via rssi ptr.
   let rxv = phyRxVectorAt(rxvec)
-  let word0 = rxv.word0
-  let word1 = rxv.word1
-  # Extract format field from word1 via custom PHY insn (approximated)
-  let fmtVal = word1 and 0x03'u32
+  let mcsBitsWord = rxv.mcsBitsWord
+  let formatBitsWord = rxv.formatBitsWord
+  # Extract format field from the second RX-vector word via custom PHY insn (approximated)
+  let fmtVal = formatBitsWord and 0x03'u32
   if fmtVal > 1:
     # Fast path: RSSI from combined bytes 19-20, divide by 122
     let scaled = rxv.rssiRaw.int32 div 122
     rssi[] = cast[int8](scaled and 0xFF)
   else:
-    # Slow path: word0-based computation with float math
-    let mcsField = (word0 shr 2) and 0x3F'u32  # extract from custom insn
+    # Slow path: MCS-bit word computation with float math.
+    let mcsField = (mcsBitsWord shr 2) and 0x3F'u32  # extract from custom insn
     if mcsField > 3:
       # Use bytes 19-20 path anyway (fallback)
       let scaled = rxv.rssiRaw.int32 div 122
@@ -1325,4 +1326,3 @@ proc phyif_utils_decode*(rxvec: pointer, rssi: ptr int8): uint32 {.exportc, cdec
       {.emit: [scaledC, " = (int)((double)", negVal, " * 0.7);"].}
       rssi[] = cast[int8](scaledC and 0xFF)
   return 0
-

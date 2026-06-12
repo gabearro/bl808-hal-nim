@@ -11,14 +11,14 @@ proc listEmpty(head: pointer): bool {.inline.} =
   listNext(head) == head
 
 proc listAddTail(node, head: pointer) {.inline.} =
-  let prev = listPrev(head)
+  let previousTail = listPrev(head)
   listSetNext(node, head)
-  listSetPrev(node, prev)
-  listSetNext(prev, node)
+  listSetPrev(node, previousTail)
+  listSetNext(previousTail, node)
   listSetPrev(head, node)
 
 proc listDel(node: pointer) {.inline.} =
-  let prev = listPrev(node)
-  let next = listNext(node)
-  listSetNext(prev, next)
-  listSetPrev(next, prev)
+  let previousNode = listPrev(node)
+  let nextNode = listNext(node)
+  listSetNext(previousNode, nextNode)
+  listSetPrev(nextNode, previousNode)

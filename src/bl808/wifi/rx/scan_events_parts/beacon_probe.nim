@@ -11,8 +11,9 @@ proc rxHandleBeacon(ind, mgmt: pointer) =
   let varAddr = cast[uint32](cast[uint](variable))
   let length = loadU16(ind, ScanuLengthOff)
   let varLen = length - MgmtBeaconVariableOff.uint16
-  discard findIeSsid(variable, length.cint, ptrAt(addr indNew[0], WifiBeaconSsidOff), addr ssidLen)
-  discard findIeDs(variable, length.cint, addr channel)
+  discard findIeSsid(variable, varLen.cint,
+                     ptrAt(addr indNew[0], WifiBeaconSsidOff), addr ssidLen)
+  discard findIeDs(variable, varLen.cint, addr channel)
   storeI32(addr indNew[0], WifiBeaconSsidLenOff, ssidLen.int32)
   storeU8(addr indNew[0], WifiBeaconChannelOff, channel)
 

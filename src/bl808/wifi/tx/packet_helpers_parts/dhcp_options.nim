@@ -1,18 +1,18 @@
-proc dhcpMsgTypeFromEthernet(raw: ptr UncheckedArray[uint8]; len: uint32): uint8 =
-  if len <= 282'u32 or loadBe32(raw, 278'u) != 0x63825363'u32:
+proc dhcpMsgTypeFromEthernet(ethernetFrameBytes: ptr UncheckedArray[uint8]; ethernetFrameLength: uint32): uint8 =
+  if ethernetFrameLength <= 282'u32 or loadBe32(ethernetFrameBytes, 278'u) != 0x63825363'u32:
     return 0'u8
-  var off = 282'u
-  while off + 1'u < len.uint:
-    let opt = raw[off]
-    if opt == 0xff'u8:
+  var dhcpOptionOffset = 282'u
+  while dhcpOptionOffset + 1'u < ethernetFrameLength.uint:
+    let dhcpOptionCode = ethernetFrameBytes[dhcpOptionOffset]
+    if dhcpOptionCode == 0xff'u8:
       break
-    if opt == 0'u8:
-      inc off
+    if dhcpOptionCode == 0'u8:
+      inc dhcpOptionOffset
       continue
-    let optLen = raw[off + 1'u]
-    if off + 2'u + optLen.uint > len.uint:
+    let dhcpOptionLength = ethernetFrameBytes[dhcpOptionOffset + 1'u]
+    if dhcpOptionOffset + 2'u + dhcpOptionLength.uint > ethernetFrameLength.uint:
       break
-    if opt == 53'u8 and optLen >= 1'u8:
-      return raw[off + 2'u]
-    off += 2'u + optLen.uint
+    if dhcpOptionCode == 53'u8 and dhcpOptionLength >= 1'u8:
+      return ethernetFrameBytes[dhcpOptionOffset + 2'u]
+    dhcpOptionOffset += 2'u + dhcpOptionLength.uint
   0'u8

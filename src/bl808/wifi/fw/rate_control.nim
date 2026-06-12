@@ -176,13 +176,13 @@ proc rc_init*(staEntry: pointer) {.exportc, cdecl.} =
     # From disasm (L310/L315): complex bit-counting loop
     var nRates: uint16 = 0
     # Count bits in positions 0..3 (CCK rates)
-    for i in 0 ..< 4:
-      if (rMap and (1'u16 shl i)) != 0:
+    for cckRateBitIndex in 0 ..< 4:
+      if (rMap and (1'u16 shl cckRateBitIndex)) != 0:
         inc nRates
     # Count bits in positions 4..11 (OFDM rates)
-    for i in 4 ..< 12:
-      let bit = (rMap shr i.uint16) and 1
-      nRates = nRates + bit
+    for ofdmRateBitIndex in 4 ..< 12:
+      let ofdmRateBit = (rMap shr ofdmRateBitIndex.uint16) and 1
+      nRates = nRates + ofdmRateBit
     if nRates > 10:
       nRates = 10
     rcU16(statsBase, RCS_N_RATES) = nRates
@@ -222,8 +222,8 @@ proc rc_init*(staEntry: pointer) {.exportc, cdecl.} =
 
   # Initialize all rate_config slots to 0xFFFF.
   let nRates = rcU16(stats, RCS_N_RATES)
-  for i in 0 ..< nRates.int:
-    rcSetRateConfig(stats, i, 0xFFFF'u16)
+  for rateEntryIndex in 0 ..< nRates.int:
+    rcSetRateConfig(stats, rateEntryIndex, 0xFFFF'u16)
 
   # Vendor layout:
   #   entry[0]          = lowest usable rate
@@ -276,13 +276,13 @@ proc rc_init*(staEntry: pointer) {.exportc, cdecl.} =
   # Each entry uses the index bytes stored at stats+128, +136, +144, +152
   # and writes rate_config[index] | 0x80000000.
   let retryIndexOffsets = [RCS_MAX_TP_IDX, RCS_MAX_TP2_IDX, RCS_MAX_PROB_IDX, RCS_RESERVED_U16]
-  for i in 0 ..< 4:
-    let retryIdx = rcU8(stats, retryIndexOffsets[i]).uint16
+  for retryPolicySlotIndex in 0 ..< 4:
+    let retryIdx = rcU8(stats, retryIndexOffsets[retryPolicySlotIndex]).uint16
     let entryRate =
       if retryIdx < nRates: rcRateConfig(stats, retryIdx.int)
       else: 0xFFFF'u16
     let packed = entryRate.uint32 or 0x80000000'u32
-    policy.retryRate[i] = packed
+    policy.retryRate[retryPolicySlotIndex] = packed
 
   # Read MACHW timestamp low for TX descriptor
   let tsNow = regRead(MACHW_TIMLO_REG)
@@ -301,8 +301,9 @@ proc rc_init*(staEntry: pointer) {.exportc, cdecl.} =
   policy.edcaParam0 = 0x2200'u32
   policy.edcaParam1 = cast[uint32](cast[uint](sta.vif))
 
-  # Set RC flags on station: sta[334] |= 0x11
-  sta.mmFlagsBytes[0] = sta.mmFlagsBytes[0] or 0x11'u8
+  # Mark retry-chain and TX-power policy refresh work for this STA.
+  sta.txPolicyUpdateFlags[0] = sta.txPolicyUpdateFlags[0] or
+    (StaTxPolicyUpdateRateControl or StaTxPolicyUpdateTxPower)
 
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void rc_check(unsigned char);".}
@@ -561,8 +562,8 @@ proc rc_check*(staIdx: uint8) {.exportc, cdecl.} =
 
   # ---- If stats updated, mark sta for TX policy refresh (disasm L369) ----
   if didUpdate != 0:
-    # Set sta[334] |= 1 (disasm 0x1B4..0x1C0)
-    sta.mmFlagsBytes[0] = sta.mmFlagsBytes[0] or 0x01'u8
+    # Mark the STA TX policy retry chain stale.
+    sta.txPolicyUpdateFlags[0] = sta.txPolicyUpdateFlags[0] or StaTxPolicyUpdateRateControl
 
 
 proc rc_calc_tp*(entry: pointer, stats: pointer): uint32 {.exportc, cdecl.} =
@@ -637,53 +638,53 @@ proc rc_update_counters*(staIdx: uint8, attemptCount: uint32, successCount: uint
 
   # Iterate retry-chain slots at stats+128..stats+152. Each slot stores a
   # rate-table index; the counters live in the selected rate entry.
-  var slotIdx = 0
-  while slotIdx < counters.retrySlots.len:
+  var retrySlotIndex = 0
+  while retrySlotIndex < counters.retrySlots.len:
     if attempts == 0:
       break
 
-    let rateIdx = counters.retrySlots[slotIdx].rateIdx
-    let entry = rcRateEntry(stats, rateIdx)
-    var entryAttempts = entry.attempts
+    let retryRateIndex = counters.retrySlots[retrySlotIndex].rateIdx
+    let retryRateEntry = rcRateEntry(stats, retryRateIndex)
+    var entryAttempts = retryRateEntry.attempts
     nimFwDbgRcUpdateSlot =
-      slotIdx.uint32 or
-      (rateIdx.uint32 shl 8) or
+      retrySlotIndex.uint32 or
+      (retryRateIndex.uint32 shl 8) or
       ((attempts and 0xFF'u32) shl 16) or
       ((successes and 0xFF'u32) shl 24)
-    nimFwDbgRcUpdateEntry = pointerAddrU32(cast[pointer](entry))
+    nimFwDbgRcUpdateEntry = pointerAddrU32(cast[pointer](retryRateEntry))
     nimFwDbgRcUpdateCounts =
-      entry.attempts.uint32 or (entry.failures.uint32 shl 16)
+      retryRateEntry.attempts.uint32 or (retryRateEntry.failures.uint32 shl 16)
 
     if successes > 3:
       entryAttempts = entryAttempts + 4'u16
-      entry.attempts = entryAttempts
+      retryRateEntry.attempts = entryAttempts
       attempts -= 4
       successes -= 4
     else:
       let addAttempts32 = attempts and 0xFFFF'u32
       let addAttempts = addAttempts32.uint16
       entryAttempts = entryAttempts + addAttempts
-      entry.attempts = entryAttempts
+      retryRateEntry.attempts = entryAttempts
 
-      let oldFailures = entry.failures
+      let oldFailures = retryRateEntry.failures
       let newFailures32 =
         (oldFailures.uint32 + addAttempts32 - (successes and 0xFFFF'u32)) and
         0xFFFF'u32
       let entryFailures = newFailures32.uint16
-      entry.failures = entryFailures
+      retryRateEntry.failures = entryFailures
       attempts = 0
       successes = 0
 
     # Vendor asserts when recorded attempts fall below recorded failures.
-    if entry.attempts < entry.failures:
+    if retryRateEntry.attempts < retryRateEntry.failures:
       nimFwDbgRcUpdateFail =
-        entry.attempts.uint32 or
-        (entry.failures.uint32 shl 16) or
-        ((rateIdx.uint32 and 0xFF'u32) shl 24) or
-        ((slotIdx.uint32 and 0xFF'u32) shl 28)
+        retryRateEntry.attempts.uint32 or
+        (retryRateEntry.failures.uint32 shl 16) or
+        ((retryRateIndex.uint32 and 0xFF'u32) shl 24) or
+        ((retrySlotIndex.uint32 and 0xFF'u32) shl 28)
       assert_err("rc.c", "rc.c", 2040)
 
-    inc slotIdx
+    inc retrySlotIndex
 
   # Check update stage and advance state machine
   let stage = counters.updateStage
@@ -697,7 +698,7 @@ proc rc_update_counters*(staIdx: uint8, attemptCount: uint32, successCount: uint
       counters.retryLimit = newLimit
   elif stage == 2:
     # Re-check with sta flags
-    if (sta.mmFlagsBytes[0] and 1) == 0:
+    if (sta.txPolicyUpdateFlags[0] and StaTxPolicyUpdateRateControl) == 0:
       counters.updateStage = 3
 
 proc rc_get_duration*(rateConfig: uint32, length: uint32): uint32 {.exportc, cdecl.} =
@@ -811,25 +812,25 @@ proc rc_update_bw_nss_max*(staIdx: uint8, nss: uint8, groupCnt: uint8) {.exportc
   # Fill entries[1..nRates-2] with random non-duplicate sample rates.
   # Blob keeps a single rc_new_random_rate call site inside a do-while; use a
   # bounded helper so bad RNG state cannot trap the cooperative scheduler here.
-  var idx: int = 1
-  while idx < nRates.int - 1:
+  var sampleRateEntryIndex: int = 1
+  while sampleRateEntryIndex < nRates.int - 1:
     let randomRate = rc_pick_non_duplicate_rate(rcStats)
     if randomRate == 0xFFFF'u16:
       break
-    rcSetRateConfig(rcStats, idx, randomRate)
-    idx += 1
+    rcSetRateConfig(rcStats, sampleRateEntryIndex, randomRate)
+    sampleRateEntryIndex += 1
 
   # Clear all entry stats fields (throughput, attempts, old_prob, etc.)
-  for i in 0 ..< nRates.int:
-    rcClearRateEntryTransientStats(rcStats, i.uint16)
+  for rateEntryIndex in 0 ..< nRates.int:
+    rcClearRateEntryTransientStats(rcStats, rateEntryIndex.uint16)
 
   # Sort by throughput and rebuild retry chain
   var tpArray {.noinit.}: array[RC_MAX_RATE_ENTRIES, uint32]
   rc_sort_samples_tp(rcStats, addr tpArray[0])
   rc_update_retry_chain(rcStats, addr tpArray[0])
 
-  # Re-compute staEntry and set RC flags bit 0 (needs update)
-  sta.mmFlagsBytes[0] = sta.mmFlagsBytes[0] or 1'u8
+  # Re-compute staEntry and mark the TX policy retry chain stale.
+  sta.txPolicyUpdateFlags[0] = sta.txPolicyUpdateFlags[0] or StaTxPolicyUpdateRateControl
 
 proc rc_update_preamble_type*(staIdx: uint8, shortPreamble: uint8) {.exportc, cdecl.} =
   ## Update preamble type for rate control (94 instrs).
@@ -861,10 +862,10 @@ proc rc_update_preamble_type*(staIdx: uint8, shortPreamble: uint8) {.exportc, cd
     return
 
   # Iterate rate entries and toggle short preamble bit
-  var idx: uint16 = 0
-  while idx < rcU16(stats, RCS_N_RATES):
-    let entry = rcRateEntry(stats, idx)
-    var rateConfig = entry.rateConfig
+  var rateEntryIndex: uint16 = 0
+  while rateEntryIndex < rcU16(stats, RCS_N_RATES):
+    let preambleRateEntry = rcRateEntry(stats, rateEntryIndex)
+    var rateConfig = preambleRateEntry.rateConfig
 
     # Use the explicit is_cck_group helper to match blob's call-graph;
     # Nim's inlined `(rate>>11)&6 == 0 && mcs<4` test was equivalent but
@@ -885,10 +886,10 @@ proc rc_update_preamble_type*(staIdx: uint8, shortPreamble: uint8) {.exportc, cd
 
     # Store updated rate config
     # Clear and reinitialize entry fields
-    rcClearRateEntryTransientStats(stats, idx)
-    entry.rateConfig = rateConfig
+    rcClearRateEntryTransientStats(stats, rateEntryIndex)
+    preambleRateEntry.rateConfig = rateConfig
 
-    idx += 1
+    rateEntryIndex += 1
 
   # Rebuild rate ordering and retry chain
   var tpArray {.noinit.}: array[12, uint8]  # stack-allocated TP array
@@ -897,7 +898,7 @@ proc rc_update_preamble_type*(staIdx: uint8, shortPreamble: uint8) {.exportc, cd
   rc_update_retry_chain(stats, sta.txPolicy)
 
   # Mark STA for RC update
-  sta.mmFlagsBytes[0] = sta.mmFlagsBytes[0] or 1'u8
+  sta.txPolicyUpdateFlags[0] = sta.txPolicyUpdateFlags[0] or StaTxPolicyUpdateRateControl
 
 proc rc_init_bcmc_rate*(staEntry: pointer, band: uint32) {.exportc, cdecl.} =
   ## Initialize broadcast/multicast rate.
@@ -987,8 +988,8 @@ proc rc_get_mcs_index*(rateConfig: uint16): uint8 {.exportc, cdecl.} =
     let nss = ((rateConfig shr 11) and 0x6).uint8
     if nss < 2:
       return 0
-    let idx = (nss - 2) and 0xFF
-    if idx > 1:
+    let nssEncodingOffset = (nss - 2) and 0xFF
+    if nssEncodingOffset > 1:
       return 0
     return (rateConfig and 0x7).uint8
 
@@ -997,8 +998,8 @@ proc rc_get_nss*(rateConfig: uint16): uint8 {.exportc, cdecl, noinline.} =
   let nss = ((rateConfig shr 11) and 0x6).uint8
   if nss < 2:
     return 0
-  let idx = nss - 2
-  if idx > 1:
+  let nssEncodingOffset = nss - 2
+  if nssEncodingOffset > 1:
     return 0
   return (rateConfig and 0x7).uint8
 
@@ -1010,9 +1011,9 @@ proc rc_check_valid_rate*(stats: pointer, rateConfig: uint16): uint8 {.exportc, 
   let fmtMod = (rateConfig shr 11) and 0x6
   if fmtMod == 0:
     # Legacy: check if rate index is in rate_map
-    let idx = rc_get_mcs_index(rateConfig)
+    let legacyRateBitIndex = rc_get_mcs_index(rateConfig)
     let rateMap = rcU16(stats, RCS_RATE_MAP)
-    return ((rateMap shr idx) and 1).uint8
+    return ((rateMap shr legacyRateBitIndex) and 1).uint8
   else:
     # HT/VHT: check MCS bitmap
     let nssField = ((rateConfig shr 11) and 0x6).uint8
@@ -1034,8 +1035,8 @@ proc rc_check_rate_duplicated*(stats: pointer, rateConfig: uint16): uint8 {.expo
   ## Check if rateConfig already exists in the rate table.
   ## Returns 1 if duplicated, 0 if not.
   let nRates = rcU16(stats, RCS_N_RATES)
-  for i in 0 ..< nRates.int:
-    if rcRateConfig(stats, i) == rateConfig:
+  for rateEntryIndex in 0 ..< nRates.int:
+    if rcRateConfig(stats, rateEntryIndex) == rateConfig:
       return 1
   return 0
 
@@ -1048,8 +1049,8 @@ proc rc_get_initial_rate_config*(stats: pointer): uint16 {.exportc, cdecl.} =
     # Legacy
     let bwMax = rcU8(stats, RCS_BW_MAX)
     let hiIdx = rcU8(stats, RCS_HIGHEST_IDX)
-    var rc = (fmtMod.uint16 shl 11) or (bwMax.uint16 shl 10) or hiIdx.uint16
-    return rc
+    var rateConfig = (fmtMod.uint16 shl 11) or (bwMax.uint16 shl 10) or hiIdx.uint16
+    return rateConfig
   else:
     # HT/VHT
     let groupCnt = rcU8(stats, RCS_GROUP_CNT)
@@ -1062,12 +1063,12 @@ proc rc_get_initial_rate_config*(stats: pointer): uint16 {.exportc, cdecl.} =
     var hiMcs: uint8 = 0
     if mcsByte != 0:
       var clzIn: cuint = mcsByte.cuint
-      var c: cint
-      {.emit: [c, " = __builtin_clz(", clzIn, ");"].}
-      hiMcs = (31 - c).uint8
-    var rc = (fmtMod.uint16 shl 11) or (sgi.uint16 shl 9) or
+      var leadingZeroCount: cint
+      {.emit: [leadingZeroCount, " = __builtin_clz(", clzIn, ");"].}
+      hiMcs = (31 - leadingZeroCount).uint8
+    var rateConfig = (fmtMod.uint16 shl 11) or (sgi.uint16 shl 9) or
              (noSS.uint16 shl 7) or (lastGroup.uint16 shl 3) or hiMcs.uint16
-    return rc
+    return rateConfig
 
 proc rc_get_lowest_rate_config*(stats: pointer): uint16 {.exportc, cdecl.} =
   ## Build rate_config for the lowest supported rate.
@@ -1113,12 +1114,12 @@ proc rc_new_random_rate*(stats: pointer): uint16 {.exportc, cdecl.} =
       rateConfig = rateConfig or (bwMax.uint16 shl 10)
       return rateConfig
     let range = highest - lowest + 1
-    let rndIdx = (prngHi.uint32 and 0x7F) mod range.uint32
-    let idx = lowest + rndIdx.uint8
+    let randomRateOffset = (prngHi.uint32 and 0x7F) mod range.uint32
+    let candidateRateIndex = lowest + randomRateOffset.uint8
     # Check if rate is supported in rate_map
     let rateMap = rcU16(stats, RCS_RATE_MAP)
-    let supported = (rateMap shr idx) and 1
-    var mcsIdx = idx.uint16
+    let supported = (rateMap shr candidateRateIndex) and 1
+    var mcsIdx = candidateRateIndex.uint16
     if supported == 0:
       # Vendor falls back to the highest supported index when the random bit
       # picks a hole in the supported-rate map.
@@ -1174,13 +1175,13 @@ proc rc_new_random_rate*(stats: pointer): uint16 {.exportc, cdecl.} =
       if lowest >= highest:
         return rateConfig or 0x400'u16
       let range = highest - lowest + 1
-      let rndIdx = (prngHi and 0x7F) mod range.uint32
-      let idx = lowest + rndIdx.uint8
+      let randomRateOffset = (prngHi and 0x7F) mod range.uint32
+      let candidateRateIndex = lowest + randomRateOffset.uint8
       let rateMap = rcU16(stats, RCS_RATE_MAP_L)
-      let supported = (rateMap shr idx) and 1
+      let supported = (rateMap shr candidateRateIndex) and 1
       if supported == 0:
         return rateConfig or 0x400'u16
-      var mcsIdx = idx.uint16
+      var mcsIdx = candidateRateIndex.uint16
       if mcsIdx > 0:
         mcsIdx = mcsIdx - 1
       let bwMax = rcU8(stats, RCS_BW_MAX)
@@ -1263,27 +1264,27 @@ proc rc_update_retry_chain*(stats: pointer, param: pointer) {.exportc, cdecl.} =
   var bestProbProbVal: uint8 = 0
   let probThreshold = 0xF332'u16  # from blob: lui a6,0xf; addi a6,818
 
-  for i in 0 ..< nRates.int:
-    let entryProb = rcRateEntryProb(stats, i)
-    let entryTp = rcRateEntryTp(stats, i)
-    let entryRetry = rcRateEntryRetry(stats, i)
+  for rateEntryIndex in 0 ..< nRates.int:
+    let entryProb = rcRateEntryProb(stats, rateEntryIndex)
+    let entryTp = rcRateEntryTp(stats, rateEntryIndex)
+    let entryRetry = rcRateEntryRetry(stats, rateEntryIndex)
     # Skip if this is the max_tp index
-    if i.uint16 == maxTpIdx:
+    if rateEntryIndex.uint16 == maxTpIdx:
       continue
     # Check initialized flag (entry+7 = byte at offset 7 within entry)
-    if entryRetry != 0 and i.uint16 != maxTpIdx:
-      let entryRateU16 = rcRateConfig(stats, i)
+    if entryRetry != 0 and rateEntryIndex.uint16 != maxTpIdx:
+      let entryRateU16 = rcRateConfig(stats, rateEntryIndex)
       # Compare: if prob > probThreshold AND tp > bestProbTp, update
       if entryRateU16 >= probThreshold:
         # Blob: compares entry throughput with current best
         if entryTp > bestProbTp:
           bestProbTp = entryTp
           bestProbProbVal = entryRetry
-          bestProbIdx = i.uint16
+          bestProbIdx = rateEntryIndex.uint16
       elif entryTp > bestProbTp:
         # Lower prob but higher throughput
         bestProbTp = entryTp
-        bestProbIdx = i.uint16
+        bestProbIdx = rateEntryIndex.uint16
 
   # Store final retry chain results
   rcU16(stats, RCS_MAX_PROB_IDX) = bestProbIdx
@@ -1323,8 +1324,8 @@ proc rc_update_stats*(stats: pointer, needUpdate: uint8): uint8 {.exportc, cdecl
   var tempEntries {.noinit.}: array[10 * 12, uint8]  # max 10 rates * 12 bytes each
   discard c_memcpy(addr tempEntries[0], cast[pointer](statsU + 14), min(nRates.int * 12, 120).csize_t)
 
-  for i in 0'u32 ..< nRates.uint32:
-    let entryPtr = rcRateEntryPtr(stats, i.int)
+  for rateEntryIndex in 0'u32 ..< nRates.uint32:
+    let entryPtr = rcRateEntryPtr(stats, rateEntryIndex.int)
     rc_calc_prob_ewma(entryPtr)
     # Blob: rc_calc_tp immediately after rc_calc_prob_ewma for each rate
     discard rc_calc_tp(entryPtr, stats)
@@ -1354,10 +1355,10 @@ proc rc_update_stats*(stats: pointer, needUpdate: uint8): uint8 {.exportc, cdecl
     # Clear all rate entry counters
     let nR = rcU16(stats, RCS_N_RATES)
     if nR <= 9:
-      for i in 0'u32 ..< nR.uint32:
-        let entry = rcRateEntry(stats, i.uint16)
-        entry.attempts = 0
-        entry.failures = 0
+      for rateEntryIndex in 0'u32 ..< nR.uint32:
+        let statsResetRateEntry = rcRateEntry(stats, rateEntryIndex.uint16)
+        statsResetRateEntry.attempts = 0
+        statsResetRateEntry.failures = 0
     return 0
 
   # Phase 4: Build 6-entry throughput table (blob: 6-step loop at 0x15E)
@@ -1441,14 +1442,13 @@ proc rc_update_stats*(stats: pointer, needUpdate: uint8): uint8 {.exportc, cdecl
   # Those are only called in the sampleIdx==0xFFFF path above.
   var retVal: uint8 = 0
   let destBase = statsU + 128
-  var srcOff: uint32 = 0
-  for i in 0'u32 ..< 4:
-    let tpVal = cast[ptr uint16](cast[uint](addr sortParam[0]) + srcOff + 4)[]
-    let curVal = cast[ptr uint16](destBase + srcOff + 4)[]
-    if tpVal != curVal:
+  for sortedThroughputSlotIndex in 0'u32 ..< 4:
+    let sortedThroughputByteOffset = sortedThroughputSlotIndex * 8
+    let tpVal = cast[ptr uint16](cast[uint](addr sortParam[0]) + sortedThroughputByteOffset + 4)[]
+    let storedSortedThroughput = cast[ptr uint16](destBase + sortedThroughputByteOffset + 4)[]
+    if tpVal != storedSortedThroughput:
       retVal = 1
-    cast[ptr uint16](destBase + srcOff + 4)[] = tpVal
-    srcOff += 8
+    cast[ptr uint16](destBase + sortedThroughputByteOffset + 4)[] = tpVal
 
   return retVal
 
@@ -1529,26 +1529,26 @@ proc rc_sort_samples_tp*(stats: pointer, tpArray: pointer) {.exportc, cdecl.} =
     return
   let tp = rcThroughputArray(tpArray)
   # Simple insertion sort of throughput values
-  var n = nRates.int - 1
-  while n > 0:
-    for i in 1 ..< n:
-      let tp1 = tp[i]
-      let tp0 = tp[i - 1]
-      if tp1 > tp0:
+  var sortPassLimit = nRates.int - 1
+  while sortPassLimit > 0:
+    for throughputSortIndex in 1 ..< sortPassLimit:
+      let currentThroughput = tp[throughputSortIndex]
+      let previousThroughput = tp[throughputSortIndex - 1]
+      if currentThroughput > previousThroughput:
         # Swap corresponding rate entries. Blob calls memmove (not memcpy)
         # for these 12-byte swaps — presumably the blob's standard-library
         # headers route the call through memmove. Using memmove keeps the
         # blob's call graph aligned.
-        var tmp {.noinit.}: RcRateEntryView
-        let e1 = rcRateEntryPtr(stats, i)
-        let e0 = rcRateEntryPtr(stats, i - 1)
-        discard c_memmove(addr tmp, e1, sizeof(RcRateEntryView).csize_t)
-        discard c_memmove(e1, e0, sizeof(RcRateEntryView).csize_t)
-        discard c_memmove(e0, addr tmp, sizeof(RcRateEntryView).csize_t)
+        var swapEntry {.noinit.}: RcRateEntryView
+        let currentRateEntry = rcRateEntryPtr(stats, throughputSortIndex)
+        let previousRateEntry = rcRateEntryPtr(stats, throughputSortIndex - 1)
+        discard c_memmove(addr swapEntry, currentRateEntry, sizeof(RcRateEntryView).csize_t)
+        discard c_memmove(currentRateEntry, previousRateEntry, sizeof(RcRateEntryView).csize_t)
+        discard c_memmove(previousRateEntry, addr swapEntry, sizeof(RcRateEntryView).csize_t)
         # Swap tp values
-        tp[i] = tp0
-        tp[i - 1] = tp1
-    dec n
+        tp[throughputSortIndex] = previousThroughput
+        tp[throughputSortIndex - 1] = currentThroughput
+    dec sortPassLimit
 
 proc rc_calc_prob_ewma*(entry: pointer) {.exportc, cdecl.} =
   ## Calculate probability EWMA for a single rate entry.
@@ -1573,12 +1573,12 @@ proc rc_calc_prob_ewma*(entry: pointer) {.exportc, cdecl.} =
 
   if initialized == 0:
     # First measurement: use raw probability (minus 1 if < 100%)
-    var p = prob.uint16
+    var initialProbability = prob.uint16
     if successes < attempts:
-      if p > 0: dec p
+      if initialProbability > 0: dec initialProbability
       rcU16(entry, 4) = 0
     else:
-      rcU16(entry, 4) = p
+      rcU16(entry, 4) = initialProbability
   else:
     # EWMA: new = (old * 96 + new * 32) / 128
     let oldProb = rcU16(entry, 4).uint32
@@ -1587,4 +1587,3 @@ proc rc_calc_prob_ewma*(entry: pointer) {.exportc, cdecl.} =
 
   # Mark as initialized
   rcU8(entry, 9) = 1
-

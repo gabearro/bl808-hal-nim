@@ -22,10 +22,13 @@ const
   BlHwVifTableOff = 60'u
   BlHwStaTableOff = 100'u
   BlVifSize = 20'u
+  BlVifDevOff = 8'u
+  BlVifUpOff = 12'u
   BlVifVifIdxOff = 13'u
   BlVifLinksNumOff = 14'u
   BlVifFixedStaIdxOff = 15'u
   BlVifFcChanOff = 16'u
+  BlVifStaPsOff = 17'u
   BlStaSize = 40'u
   BlStaWaitingListOff = 0'u
   BlStaPendingListOff = 8'u
@@ -35,6 +38,10 @@ const
   BlStaVifIdxOff = 24'u
   BlStaFcPsOff = 26'u
   BlStaQosOff = 27'u
+  BlStaRssiOff = 28'u
+  BlStaDataRateOff = 29'u
+  BlStaTsfloOff = 32'u
+  BlStaTsfhiOff = 36'u
 
   TxCfmCbOff = 0'u
   TxCfmCbArgOff = 4'u

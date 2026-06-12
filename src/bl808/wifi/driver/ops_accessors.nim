@@ -4,14 +4,14 @@ when defined(bl808WifiNimDriverTrace):
 else:
   template trace(msg: cstring) = discard
 
-proc opPtr(off: uint): pointer {.inline.} =
-  cast[ptr pointer](cast[uint](addr g_bl_ops_funcs) + off)[]
+proc opPtr(operationSlotByteOffset: uint): pointer {.inline.} =
+  cast[ptr pointer](cast[uint](addr g_bl_ops_funcs) + operationSlotByteOffset)[]
 
 proc blOsTaskNotify(task: pointer) {.inline.} =
-  let fn = cast[TaskNotifyProc](opPtr(OpTaskNotifyOff))
-  if fn != nil:
-    fn(task)
+  let taskNotify = cast[TaskNotifyProc](opPtr(OpTaskNotifyOff))
+  if taskNotify != nil:
+    taskNotify(task)
 
 proc blOsTaskGetCurrentTask(): pointer {.inline.} =
-  let fn = cast[TaskGetCurrentTaskProc](opPtr(OpTaskGetCurrentTaskOff))
-  if fn == nil: nil else: fn()
+  let getCurrentTask = cast[TaskGetCurrentTaskProc](opPtr(OpTaskGetCurrentTaskOff))
+  if getCurrentTask == nil: nil else: getCurrentTask()

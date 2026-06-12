@@ -11,12 +11,12 @@ proc bl_tx_try_flush*(param: cint; txFcField: ptr KeTxFc) {.exportc, cdecl.} =
   txCntrlStaTrigger = 0
   bl_os_exit_critical()
 
-  for i in 0 ..< NxRemoteStaStoreMax:
+  for remoteStaIndex in 0 ..< NxRemoteStaStoreMax:
     if staTrigger == 0'u32:
       break
-    let sta = staAt(i)
+    let sta = staAt(remoteStaIndex)
     let staO = staView(sta)
-    if (staTrigger and bitSta(i)) == 0'u32 or not txCntrlCheckFc(sta):
+    if (staTrigger and bitSta(remoteStaIndex)) == 0'u32 or not txCntrlCheckFc(sta):
       continue
 
     while not listEmpty(cast[pointer](addr staO.pendingList)):

@@ -1,10 +1,10 @@
 proc wifiConnect*(ssid, password: string, channel: uint8 = 0): WifiError =
   ## Connect to a WiFi AP.
   wifiNimFirmwarePruneScanCache(ssid)
-  let rc = wifi_mgmr_sta_connect(
+  let connectStartStatus = wifi_mgmr_sta_connect(
     addr staIface, ssid.cstring, password.cstring,
     nil, nil, 0, channel)
-  if rc != 0:
+  if connectStartStatus != 0:
     return wifiFail
   if wifiBackendUsesEventFutures():
     for _ in 0 ..< 30_000:
@@ -21,9 +21,9 @@ proc wifiConnectAsync*(ssid, password: string,
     return failedLocalFuture[WifiError](
       newException(CatchableError, "WiFi connect already pending"))
   wifiNimFirmwarePruneScanCache(ssid)
-  let rc = wifi_mgmr_sta_connect(
+  let connectStartStatus = wifi_mgmr_sta_connect(
     addr staIface, ssid.cstring, password.cstring,
     nil, nil, 0, channel)
-  if rc != 0:
+  if connectStartStatus != 0:
     return completedLocalFuture(wifiFail)
   return wifiBeginConnectWait(timeoutMs)

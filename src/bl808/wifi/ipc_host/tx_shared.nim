@@ -4,15 +4,15 @@ proc ipc_host_txbuf_get*(env: pointer): pointer {.exportc, cdecl.} =
   let txbuf = loadPtr(env, EnvTxbufOff)
   if txbuf == nil:
     return nil
-  for i in 0'u ..< NxTxDescCnt.uint:
-    let buf = ptrAt(txbuf, i * SharedTxbufSize)
-    if loadU32(buf, 0) == 0'u32:
-      storeU32(buf, 0, 1'u32)
-      return buf
+  for txBufferSlotIndex in 0'u ..< NxTxDescCnt.uint:
+    let txBufferSlot = ptrAt(txbuf, txBufferSlotIndex * SharedTxbufSize)
+    if loadU32(txBufferSlot, 0) == 0'u32:
+      storeU32(txBufferSlot, 0, 1'u32)
+      return txBufferSlot
 
-proc ipc_host_txbuf_free*(buf: pointer) {.exportc, cdecl.} =
-  if buf != nil:
-    storeU32(buf, 0, 0'u32)
+proc ipc_host_txbuf_free*(txBufferSlot: pointer) {.exportc, cdecl.} =
+  if txBufferSlot != nil:
+    storeU32(txBufferSlot, 0, 0'u32)
 
 proc ipc_host_txdesc_get*(env: pointer): pointer {.exportc, cdecl.} =
   if env == nil:

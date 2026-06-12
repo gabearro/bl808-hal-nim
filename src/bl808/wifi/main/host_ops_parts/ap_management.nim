@@ -54,9 +54,9 @@ proc bl_main_apm_sta_delete*(staIdx: uint8): cint {.exportc, cdecl.} =
   0
 
 proc bl_main_apm_remove_all_sta*(): cint {.exportc, cdecl.} =
-  for i in 0'u ..< NxRemoteStaStoreMax:
-    if loadU8(staAt(i), BlStaIsUsedOff) == 1'u8:
-      discard bl_main_apm_sta_delete(i.uint8)
+  for remoteStaStoreIndex in 0'u ..< NxRemoteStaStoreMax:
+    if loadU8(staAt(remoteStaStoreIndex), BlStaIsUsedOff) == 1'u8:
+      discard bl_main_apm_sta_delete(remoteStaStoreIndex.uint8)
   0
 
 proc bl_main_conf_max_sta*(maxStaSupported: uint8): cint {.exportc, cdecl.} =

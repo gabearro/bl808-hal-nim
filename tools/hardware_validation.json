@@ -216,6 +216,533 @@
       "timeout": 25
     },
     {
+      "name": "m0_enclave_probe",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_enclave_probe.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "=== BL808 Enclave Phase-0 Probe ===",
+        "[PROBE] pmp_addr_regs=",
+        "=== Probe Complete ==="
+      ],
+      "timeout": 25
+    },
+    {
+      "name": "m0_enclave_services_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_enclave_services_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808enclave": "true"
+          }
+        }
+      ],
+      "required": [
+        "=== BL808 Enclave Services Test ===",
+        "[PASS] enclaveInit",
+        "[PASS] sha256 digest[0]=0xba",
+        "[PASS] aeadOpen round-trip",
+        "[PASS] aeadOpen rejects tampered tag",
+        "[PASS] unsealBlob round-trip",
+        "=== Test Complete ==="
+      ],
+      "timeout": 40
+    },
+    {
+      "name": "m0_umode_pmp_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_umode_pmp_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808enclave": "true"
+          }
+        }
+      ],
+      "required": [
+        "=== BL808 U-mode PMP Test ===",
+        "[PASS] enclaveInit + partition applied",
+        "[PASS] U-mode ecall reached",
+        "[PASS] U-mode secure read DENIED by PMP",
+        "=== Test Complete ==="
+      ],
+      "timeout": 40
+    },
+    {
+      "name": "m0_hbn_bypass_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_hbn_bypass_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808enclave": "true"
+          }
+        }
+      ],
+      "required": [
+        "=== BL808 HBN Warm-Boot Bypass Closure ===",
+        "[PASS] EHBN planted -> BootROM would warm-boot (armed)",
+        "[PASS] EHBN cleared by hbnClearWarmBootMagic",
+        "[PASS] HbnRsv0 zeroed",
+        "[PASS] WHBN cleared",
+        "[PASS] enclaveInit cleared the warm-boot magic",
+        "=== Test Complete ==="
+      ],
+      "timeout": 40
+    },
+    {
+      "name": "m0_hbn_resume_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_hbn_resume_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808enclave": "true"
+          }
+        }
+      ],
+      "required": [
+        "=== BL808 Measured HBN Resume ===",
+        "[PASS] enclaveArmHbnResume succeeded",
+        "[PASS] warm-boot fast path armed",
+        "[PASS] genuine resume descriptor validates",
+        "[PASS] validated app resume PC matches",
+        "[PASS] tampered app PC rejected",
+        "[PASS] tampered resume entry rejected",
+        "[PASS] tampered MAC tag rejected",
+        "[PASS] clear disarms warm-boot magic",
+        "=== Test Complete ==="
+      ],
+      "timeout": 40
+    },
+    {
+      "name": "m0_secret_leak_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_secret_leak_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808enclave": "true"
+          }
+        }
+      ],
+      "required": [
+        "=== BL808 Enclave Secret Non-Leakage ===",
+        "[PASS] positive control: planted root IS found",
+        "[PASS] svcSealBlob ok",
+        "[PASS] after seal: root absent from shared buffer",
+        "[PASS] after attest: attest scalar absent from shared buffer",
+        "[PASS] after aead: seal/aead key absent from shared buffer",
+        "=== Test Complete ==="
+      ],
+      "timeout": 50
+    },
+    {
+      "name": "m0_trng_health_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_trng_health_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "=== BL808 TRNG Health ===",
+        "[PASS] all TRNG draws succeeded",
+        "[PASS] no all-zero / all-ones sample",
+        "[PASS] no repeated sample",
+        "[PASS] no stuck byte position across samples",
+        "[PASS] monobit ratio in [40,60]%",
+        "=== Test Complete ==="
+      ],
+      "timeout": 40
+    },
+    {
+      "name": "m0_coverage_audit_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_coverage_audit_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808enclave": "true"
+          }
+        }
+      ],
+      "required": [
+        "=== BL808 Secure Coverage Audit ===",
+        "[PASS] secure RAM window non-empty",
+        "[PASS] vault key store inside secure window",
+        "[PASS] boot measurement inside secure window",
+        "[PASS] secure window disjoint from U-mode RAM",
+        "[PASS] secure window disjoint from shared buffer",
+        "[PASS] secure OCRAM group-0 allowed (bits[1:0]=0b11)",
+        "[PASS] secure OCRAM group-1 DENIED (bits[3:2]=0)",
+        "[PASS] secure OCRAM window locked",
+        "=== Test Complete ==="
+      ],
+      "timeout": 50
+    },
+    {
+      "name": "m0_efuse_provision_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_efuse_provision_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "=== BL808 eFuse Provision Plan (DRY-RUN, no burn) ===",
+        "[PASS] cfg0 byte-exact (0x4F400010)",
+        "[PASS] sw_usage0 byte-exact (0x200)",
+        "[PASS] lock word byte-exact (0x08020000)",
+        "[PASS] exactly 3 writes emitted",
+        "[PASS] empty spec -> no writes emitted (no accidental defaults)",
+        "[PASS] all-slot lock byte-exact",
+        "=== Test Complete ==="
+      ],
+      "timeout": 40
+    },
+    {
+      "name": "m0_efuse_consume_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_efuse_consume_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808enclave": "true"
+          }
+        }
+      ],
+      "required": [
+        "=== BL808 eFuse-Consuming Paths ===",
+        "[PASS] enforced: sign mode = ECC-P256",
+        "[PASS] enforced: JTAG both halves disabled",
+        "[PASS] enforced: efuseProductionLocked = true",
+        "[PASS] unprovisioned: efuseProductionLocked = false",
+        "[PASS] soft-key AES engine runs",
+        "[PASS] vaultUseForAes selects the hw slot",
+        "[PASS] AES key source is eFuse slot 0 (not soft)",
+        "[PASS] AES engine runs under eFuse hw-key source",
+        "=== Test Complete ==="
+      ],
+      "timeout": 50
+    },
+    {
+      "name": "m0_secureboot_verify_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_secureboot_verify_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "=== BL808 Secure Boot Verify Test ===",
+        "[PASS] genuine NSB1 image verifies",
+        "[PASS] tampered payload rejected",
+        "[PASS] tampered signature rejected",
+        "=== Test Complete ==="
+      ],
+      "timeout": 40
+    },
+    {
+      "name": "m0_secureboot_chain_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_secureboot_chain_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "=== BL808 Secure Boot Chain Test ===",
+        "[PASS] m0app image verifies + meets floor",
+        "[PASS] d0 image verifies + meets floor",
+        "[PASS] enclave image verifies + meets floor",
+        "[PASS] combined boot measurement matches host expectation",
+        "[PASS] core-release gate OPEN for clean image set",
+        "[PASS] tampered payload rejected",
+        "[PASS] wrong-key image rejected",
+        "[PASS] downgraded image rejected (rollback floor)",
+        "[PASS] core-release gate SHUT when set contains a failure",
+        "[PASS] payloadLen-overflow header rejected (no over-read)",
+        "=== Test Complete ==="
+      ],
+      "timeout": 40
+    },
+    {
+      "name": "m0_enclave_measure_bind_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_enclave_measure_bind_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808enclave": "true"
+          }
+        }
+      ],
+      "required": [
+        "=== BL808 Measurement-Binding Test ===",
+        "[PASS] chain verified the 3-image set",
+        "[PASS] published boot measurement == host-expected combined",
+        "[PASS] attestation produced a quote",
+        "[PASS] attestation quote carries the chain combined measurement",
+        "[PASS] seal under chain measurement ok",
+        "[PASS] unseal under same measurement recovers secret",
+        "[PASS] unseal FAILS under a different boot measurement",
+        "[PASS] unseal works again after restoring measurement",
+        "=== Test Complete ==="
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "m0_secureboot_encrypted_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_secureboot_encrypted_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "=== BL808 Encrypted Secure-Boot Image Test ===",
+        "[PASS] encrypted image verifies + decrypts with correct key",
+        "[PASS] decrypted plaintext matches the original payload",
+        "[PASS] wrong key rejected (plaintext hash mismatch)",
+        "[PASS] tampered signature rejected",
+        "=== Test Complete ==="
+      ],
+      "timeout": 90
+    },
+    {
+      "name": "m0_tzc_master_coverage_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_tzc_master_coverage_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808enclave": "true"
+          }
+        }
+      ],
+      "required": [
+        "=== BL808 TZC Master Coverage Test ===",
+        "[PASS] partition applied + locked",
+        "[PASS] M0 is group 0 (secure)",
+        "[PASS] all non-M0 masters are group 1 (untrusted)",
+        "[PASS] secure OCRAM window locked to group 0",
+        "=== Test Complete ==="
+      ],
+      "timeout": 45
+    },
+    {
+      "name": "m0_handoff_verify_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_handoff_verify_test.nim",
+          "flash": "m0"
+        },
+        {
+          "id": "d0",
+          "core": "bl808d0",
+          "source": "examples/d0_handoff_probe.nim",
+          "flash": "d0"
+        },
+        {
+          "id": "lp",
+          "core": "bl808lp",
+          "source": "examples/lp_handoff_probe.nim",
+          "flash": "lp"
+        }
+      ],
+      "required": [
+        "=== BL808 Verified Core Release Test ===",
+        "[PASS] D0 released and signaled after verification",
+        "[PASS] genuine LP manifest verifies",
+        "[M0] Releasing LP after verification",
+        "[PASS] LP executed and signaled after verification",
+        "=== Test Complete ==="
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "m0_enclave_coexist_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_enclave_coexist_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "WifiSsid": {
+              "env": "BL808_WIFI_SSID"
+            },
+            "WifiPassword": {
+              "secret_env": "BL808_WIFI_PASSWORD"
+            }
+          }
+        }
+      ],
+      "required": [
+        "=== BL808 Enclave + WiFi Coexistence Test ===",
+        "[PASS] hardware SHA works before partition lock",
+        "[PASS] enclave SHA works under locked partition",
+        "[PASS] wifi init under locked partition",
+        "[PASS] wifi scan results under locked partition",
+        "[PASS] enclave SHA still works with WiFi active",
+        "=== Test Complete ==="
+      ],
+      "timeout": 240
+    },
+    {
+      "name": "m0_enclave_coexist_load_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_enclave_coexist_load_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "WifiSsid": {
+              "env": "BL808_WIFI_SSID"
+            },
+            "WifiPassword": {
+              "secret_env": "BL808_WIFI_PASSWORD"
+            }
+          }
+        }
+      ],
+      "required": [
+        "=== BL808 Enclave + WiFi Coexistence Under Load ===",
+        "[PASS] enclave SHA works under locked partition",
+        "[PASS] wifi init under locked partition",
+        "[PASS] sustained WiFi TX: >= 12 scan bursts issued under lock",
+        "[PASS] WiFi RX/DMA progressed (scan results accumulated)",
+        "[PASS] enclave SHA bit-identical across all WiFi load rounds",
+        "[PASS] enclave SHA still correct after the load run",
+        "=== Test Complete ==="
+      ],
+      "timeout": 240
+    },
+    {
+      "name": "m0_tzc_enforce_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_tzc_enforce_test.nim",
+          "flash": "m0"
+        },
+        {
+          "id": "d0",
+          "core": "bl808d0",
+          "source": "examples/d0_tzc_probe.nim",
+          "flash": "d0"
+        }
+      ],
+      "required": [
+        "=== BL808 TZC Cross-Master Test ===",
+        "[M0] Releasing D0",
+        "[M0] D0 read result",
+        "[PASS] TZC denied D0 access to secure WRAM",
+        "=== Test Complete ==="
+      ],
+      "timeout": 90
+    },
+    {
       "name": "m0_hal_system_test",
       "tiers": [
         "full"
@@ -3869,6 +4396,623 @@
         }
       ],
       "timeout": 90
+    },
+    {
+      "name": "m0_puf_capture",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_puf_capture.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808puf": "true"
+          }
+        }
+      ],
+      "required": [
+        "=== BL808 SRAM PUF Capture ===",
+        "[PUF] ocram64k_ones=",
+        "@PUF_BEGIN",
+        "=== Capture Complete ==="
+      ],
+      "timeout": 40
+    },
+    {
+      "name": "m0_puf_root_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_puf_root_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808puf": "true"
+          }
+        }
+      ],
+      "required": [
+        "=== BL808 PUF Root Derivation Test ===",
+        "[PUF] rootsha=",
+        "=== Root Complete ==="
+      ],
+      "timeout": 40
+    },
+    {
+      "name": "m0_puf_vault_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_puf_vault_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808puf": "true"
+          }
+        }
+      ],
+      "required": [
+        "=== BL808 PUF Vault Root Test ===",
+        "[PASS] PUF root installed as vault root",
+        "[PASS] warm-boot path reuses cached root",
+        "[PASS] cached root matches reconstructed root",
+        "[PUF] vaultrootsha=",
+        "=== Vault Root Complete ==="
+      ],
+      "timeout": 45
+    },
+    {
+      "name": "m0_dma_tzc_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_dma_tzc_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "=== BL808 DMA Cross-Master TZC Test ===",
+        "[PASS] control: DMA reads secret when unrestricted",
+        "[PASS] enforced: TZC denies DMA read of secure WRAM",
+        "=== Test Complete ==="
+      ],
+      "timeout": 40
+    },
+    {
+      "name": "m0_tzc_lock_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_tzc_lock_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "=== BL808 TZC Lock Validation ===",
+        "[PASS] WRAM region 0 reports locked",
+        "[PASS] DMA0 still in group 1 after re-open attempt",
+        "[PASS] DMA still denied after re-open attempt",
+        "=== Test Complete ==="
+      ],
+      "timeout": 40
+    },
+    {
+      "name": "m0_enclave_e2e_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_enclave_e2e_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808enclave": "true"
+          }
+        }
+      ],
+      "required": [
+        "=== BL808 Enclave E2E Test ===",
+        "[PASS] enclaveInit with LOCKED partition",
+        "[PASS] U-mode ran the real enclave services via ecall",
+        "=== Test Complete ==="
+      ],
+      "timeout": 40
+    },
+    {
+      "name": "m0_enclave_abi_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_enclave_abi_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808enclave": "true"
+          }
+        }
+      ],
+      "required": [
+        "=== BL808 Enclave ABI Hardening Test ===",
+        "[PASS] deriveKey huge labelLen rejected",
+        "[PASS] aeadSeal huge ptLen rejected",
+        "[PASS] valid request still works",
+        "=== Test Complete ==="
+      ],
+      "timeout": 40
+    },
+    {
+      "name": "m0_attest_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_attest_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808enclave": "true"
+          }
+        }
+      ],
+      "required": [
+        "=== BL808 Attestation Round-Trip ===",
+        "ATTEST pubkey=",
+        "ATTEST quote=",
+        "=== Attestation Emitted ==="
+      ],
+      "timeout": 40
+    },
+    {
+      "name": "m0_seal_bind_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_seal_bind_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808enclave": "true"
+          }
+        }
+      ],
+      "required": [
+        "=== BL808 Seal Measurement-Binding Test ===",
+        "[PASS] unseal under same measurement recovers plaintext",
+        "[PASS] unseal under DIFFERENT measurement FAILS",
+        "[PASS] unseal works again after restoring measurement",
+        "=== Test Complete ==="
+      ],
+      "timeout": 40
+    },
+    {
+      "name": "m0_zeroize_fault_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_zeroize_fault_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808enclave": "true"
+          }
+        }
+      ],
+      "required": [
+        "=== BL808 Zeroize-on-Fault Test ===",
+        "[PASS] key present before U-mode fault",
+        "[PASS] vault zeroized after U-mode fault",
+        "=== Test Complete ==="
+      ],
+      "timeout": 40
+    },
+    {
+      "name": "m0_umode_irq_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_umode_irq_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808enclave": "true"
+          }
+        }
+      ],
+      "required": [
+        "=== BL808 U-mode Preemption Test ===",
+        "[PASS] enclaveInit",
+        "[PASS] timer preempted runaway U-mode app",
+        "[PASS] U-mode app was actually running (heartbeat advanced)",
+        "=== Test Complete ==="
+      ],
+      "timeout": 40
+    },
+    {
+      "name": "m0_lp_sleep_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_lp_sleep_test.nim",
+          "flash": "m0"
+        },
+        {
+          "id": "lp",
+          "core": "bl808lp",
+          "source": "examples/lp_sleep_probe.nim",
+          "flash": "lp"
+        }
+      ],
+      "required": [
+        "=== BL808 LP Timed Operation ===",
+        "[PASS] LP booted and started its sleep loop",
+        "[PASS] LP CORET mtime is ticking",
+        "[PASS] LP completed >= 6 timed periods on its CORET timer",
+        "=== Test Complete ==="
+      ],
+      "timeout": 60
+    },
+    {
+      "name": "m0_wfi_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wfi_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "=== BL808 M0 WFI Timer Wake ===",
+        "[PASS] M0 woke from WFI the expected number of times",
+        "[PASS] elapsed time matches the programmed sleep duration",
+        "=== Test Complete ==="
+      ],
+      "timeout": 40
+    },
+    {
+      "name": "m0_f32k_diag_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_f32k_diag_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "=== BL808 f32k / RC32K Diagnostic ===",
+        "=== Test Complete ==="
+      ],
+      "timeout": 30
+    },
+    {
+      "name": "m0_pds_observed_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_pds_observed_test.nim",
+          "flash": "m0"
+        },
+        {
+          "id": "lp",
+          "core": "bl808lp",
+          "source": "examples/lp_pds_observer.nim",
+          "flash": "lp"
+        }
+      ],
+      "required": [
+        "[LP] watching M0 PDS state:",
+        "[LP] observation complete"
+      ],
+      "timeout": 40
+    },
+    {
+      "name": "m0_pds_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_pds_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "[INF] === BL808 PDS Test ===",
+        "[INF] [PASS] M0 woke from PDS sleep (MM powered down, timer wake)",
+        "[INF] === Test Complete ==="
+      ],
+      "timeout": 25
+    },
+    {
+      "name": "m0_lp_wfi_debug",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_lp_wfi_debug.nim",
+          "flash": "m0"
+        },
+        {
+          "id": "lp",
+          "core": "bl808lp",
+          "source": "examples/lp_wfi_debug.nim",
+          "flash": "lp"
+        }
+      ],
+      "required": [
+        "=== BL808 LP WFI Timer Debug (M0 reporter) ===",
+        "=== Test Complete ==="
+      ],
+      "timeout": 40
+    },
+    {
+      "name": "m0_lp_wfi_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_lp_sleep_test.nim",
+          "flash": "m0"
+        },
+        {
+          "id": "lp",
+          "core": "bl808lp",
+          "source": "examples/lp_wfi_probe.nim",
+          "flash": "lp"
+        }
+      ],
+      "required": [
+        "=== BL808 LP Timed Operation ===",
+        "[PASS] LP CORET mtime is ticking",
+        "[PASS] LP completed >= 6 timed periods on its CORET timer",
+        "=== Test Complete ==="
+      ],
+      "timeout": 60
+    },
+    {
+      "name": "m0_d0_wfi_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_d0_wfi_test.nim",
+          "flash": "m0"
+        },
+        {
+          "id": "d0",
+          "core": "bl808d0",
+          "source": "examples/d0_wfi_probe.nim",
+          "flash": "d0"
+        }
+      ],
+      "required": [
+        "=== BL808 D0 Timed WFI Sleep ===",
+        "[PASS] D0 booted and started its WFI sleep loop",
+        "[PASS] D0 finished its timed WFI run (Ready handshake)",
+        "[PASS] D0 completed >= 30 timed WFI wakes on its CLINT timer",
+        "=== Test Complete ==="
+      ],
+      "timeout": 60
+    },
+    {
+      "name": "m0_d0_timer_diag",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_d0_timer_diag.nim",
+          "flash": "m0"
+        },
+        {
+          "id": "d0",
+          "core": "bl808d0",
+          "source": "examples/d0_timer_diag.nim",
+          "flash": "d0"
+        }
+      ],
+      "required": [
+        "=== Diagnostic Complete ==="
+      ],
+      "timeout": 60
+    },
+    {
+      "name": "m0_hbn_rtc_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_hbn_rtc_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "=== BL808 M0 HBN RTC Wake ===",
+        "[boot1] window closed - arming 5 s HBN RTC wake",
+        "[boot2] survived HBN deep sleep",
+        "[PASS] HBN RTC wake survived reset",
+        "=== Test Complete ==="
+      ],
+      "timeout": 140
+    },
+    {
+      "name": "m0_hbn_rtc_arm_diag",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_hbn_rtc_arm_diag.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "=== BL808 HBN RTC Arm Diagnostic (no sleep) ===",
+        "=== Diagnostic Complete ==="
+      ],
+      "timeout": 70
+    },
+    {
+      "name": "m0_hbn_min_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_hbn_min_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "=== BL808 M0 HBN Minimal ===",
+        "[boot1] window closed - arming 5 s HBN RTC wake",
+        "[boot2] survived MINIMAL HBN",
+        "[PASS] minimal HBN RTC wake survived reset",
+        "=== Test Complete ==="
+      ],
+      "timeout": 140
+    },
+    {
+      "name": "m0_hbn_disambig",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_hbn_disambig.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "=== BL808 M0 HBN Disambig ==="
+      ],
+      "timeout": 150
+    },
+    {
+      "name": "m0_lp_ldo_0p9_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_lp_ldo_0p9_test.nim",
+          "flash": "m0"
+        },
+        {
+          "id": "lp",
+          "core": "bl808lp",
+          "source": "examples/lp_ldo_0p9_probe.nim",
+          "flash": "lp"
+        }
+      ],
+      "required": [
+        "=== BL808 LP AON-LDO 0.90 V Survival ===",
+        "[PASS] LP booted and wrote the boot mark",
+        "[PASS] LP reached the post-0.90V-drop run loop",
+        "[PASS] LP keeps running at 0.90 V AON LDO (counter advances)",
+        "=== Test Complete ==="
+      ],
+      "timeout": 60
+    },
+    {
+      "name": "m0_lp_hbn_test",
+      "tiers": [
+        "experimental"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_lp_hbn_test.nim",
+          "flash": "m0"
+        },
+        {
+          "id": "lp",
+          "core": "bl808lp",
+          "source": "examples/lp_hbn_probe.nim",
+          "flash": "lp"
+        }
+      ],
+      "required": [
+        "=== BL808 LP 0.90 V HBN RTC Wake ===",
+        "[boot1] window closed - releasing LP to enter 0.90 V HBN",
+        "[boot2] survived LP 0.90 V HBN deep sleep",
+        "[PASS] LP 0.90 V HBN RTC wake survived reset",
+        "=== Test Complete ==="
+      ],
+      "timeout": 150
     }
   ]
 }

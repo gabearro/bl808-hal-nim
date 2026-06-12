@@ -46,10 +46,6 @@ export radio_phy
 export fw_constants
 export fw_messages
 
-when not defined(bl808WifiUseBl808Rf) and
-    not defined(bl808WifiAllowLegacyBl606pRfFallback):
-  {.error: "BL808 WiFi firmware RF/PHY requires bl808WifiUseBl808Rf; define bl808WifiAllowLegacyBl606pRfFallback only for archive comparison builds".}
-
 proc c_memcpy(dst, src: pointer, n: csize_t): pointer
   {.importc: "memcpy", header: "<string.h>".}
 

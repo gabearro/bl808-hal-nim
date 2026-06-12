@@ -1,23 +1,24 @@
-proc setCipherFlags(indNew: pointer; parsed: ptr WifiWpaIe; parsedLen: int) =
+proc setCipherFlags(scanIndication: pointer; parsedWpaIes: ptr WifiWpaIe;
+                    parsedIeCount: int) =
   var tkip = false
   var ccmp = false
   var groupTkip = false
   var groupCcmp = false
-  for i in 0 ..< parsedLen:
-    let ie = ptrAt(cast[pointer](parsed), uint(i) * sizeof(WifiWpaIe).uint)
-    let proto = cast[ptr cint](ptrAt(ie, 0))[]
-    let pairwise = cast[ptr cint](ptrAt(ie, 4))[]
-    let group = cast[ptr cint](ptrAt(ie, 8))[]
-    let keyMgmt = cast[ptr cint](ptrAt(ie, 12))[]
+  for parsedIeIndex in 0 ..< parsedIeCount:
+    let parsedIe = ptrAt(cast[pointer](parsedWpaIes), uint(parsedIeIndex) * sizeof(WifiWpaIe).uint)
+    let proto = cast[ptr cint](ptrAt(parsedIe, 0))[]
+    let pairwise = cast[ptr cint](ptrAt(parsedIe, 4))[]
+    let group = cast[ptr cint](ptrAt(parsedIe, 8))[]
+    let keyMgmt = cast[ptr cint](ptrAt(parsedIe, 12))[]
     if proto == WpaProtoWpa:
-      storeU8(indNew, WifiBeaconAuthOff, AuthWpaPsk)
+      storeU8(scanIndication, WifiBeaconAuthOff, AuthWpaPsk)
     elif proto == WpaProtoRsn:
       if (keyMgmt and (WpaKeyMgmtPsk or WpaKeyMgmtPskSha256)) != 0:
-        storeU8(indNew, WifiBeaconAuthOff, AuthWpa2Psk)
+        storeU8(scanIndication, WifiBeaconAuthOff, AuthWpa2Psk)
         if (keyMgmt and WpaKeyMgmtSae) != 0:
-          storeU8(indNew, WifiBeaconAuthOff, AuthWpa2PskWpa3Sae)
+          storeU8(scanIndication, WifiBeaconAuthOff, AuthWpa2PskWpa3Sae)
       elif (keyMgmt and WpaKeyMgmtSae) != 0:
-        storeU8(indNew, WifiBeaconAuthOff, AuthWpa3Sae)
+        storeU8(scanIndication, WifiBeaconAuthOff, AuthWpa3Sae)
     for cipher in [pairwise, group]:
       if cipher == WifiCipherTkip:
         tkip = true
@@ -33,20 +34,20 @@ proc setCipherFlags(indNew: pointer; parsed: ptr WifiWpaIe; parsedLen: int) =
         if cipher == group:
           groupTkip = true
           groupCcmp = true
-  if parsedLen == 2:
-    storeU8(indNew, WifiBeaconAuthOff, AuthWpaWpa2Psk)
-  elif parsedLen == 0:
-    storeU8(indNew, WifiBeaconAuthOff, AuthWep)
-    storeU8(indNew, WifiBeaconCipherOff, CipherWep)
+  if parsedIeCount == 2:
+    storeU8(scanIndication, WifiBeaconAuthOff, AuthWpaWpa2Psk)
+  elif parsedIeCount == 0:
+    storeU8(scanIndication, WifiBeaconAuthOff, AuthWep)
+    storeU8(scanIndication, WifiBeaconCipherOff, CipherWep)
   if ccmp:
-    storeU8(indNew, WifiBeaconCipherOff, CipherAes)
+    storeU8(scanIndication, WifiBeaconCipherOff, CipherAes)
   if tkip:
-    storeU8(indNew, WifiBeaconCipherOff, CipherTkip)
+    storeU8(scanIndication, WifiBeaconCipherOff, CipherTkip)
   if tkip and ccmp:
-    storeU8(indNew, WifiBeaconCipherOff, CipherTkipAes)
+    storeU8(scanIndication, WifiBeaconCipherOff, CipherTkipAes)
   if groupCcmp:
-    storeU8(indNew, WifiBeaconGroupCipherOff, CipherAes)
+    storeU8(scanIndication, WifiBeaconGroupCipherOff, CipherAes)
   if groupTkip:
-    storeU8(indNew, WifiBeaconGroupCipherOff, CipherTkip)
+    storeU8(scanIndication, WifiBeaconGroupCipherOff, CipherTkip)
   if groupTkip and groupCcmp:
-    storeU8(indNew, WifiBeaconGroupCipherOff, CipherTkipAes)
+    storeU8(scanIndication, WifiBeaconGroupCipherOff, CipherTkipAes)
