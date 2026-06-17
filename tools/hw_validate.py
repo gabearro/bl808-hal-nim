@@ -1295,6 +1295,16 @@ def missing_required(output: str, required: list[str]) -> list[str]:
     return [marker for marker in required if marker not in output]
 
 
+def missing_required_any(output: str, required_any: list[list[str]]) -> list[str]:
+    missing: list[str] = []
+    for group in required_any:
+        if not group:
+            continue
+        if not any(marker in output for marker in group):
+            missing.append(" or ".join(group))
+    return missing
+
+
 def check_forbidden(output: str, forbidden: list[str]) -> str | None:
     for marker in forbidden:
         if marker in output:
@@ -1480,7 +1490,7 @@ class JtagMemoryLogCapture:
         self.output = ""
         self.last_write = 0
         self.last_wrapped = 0
-        poll_interval = float(os.environ.get("HW_VALIDATE_JTAG_LOG_POLL_INTERVAL", "0.25"))
+        poll_interval = float(os.environ.get("HW_VALIDATE_JTAG_LOG_POLL_INTERVAL", "0.02"))
         initial_delay = float(os.environ.get("HW_VALIDATE_JTAG_LOG_INITIAL_DELAY", "0"))
         self.poll_interval = max(0.01, poll_interval)
         self.next_poll = time.monotonic() + max(0.0, initial_delay)
@@ -1494,9 +1504,9 @@ class JtagMemoryLogCapture:
             end - start,
         )
 
-    def read_available(self) -> str:
+    def read_available(self, *, force: bool = False) -> str:
         now = time.monotonic()
-        if now < self.next_poll:
+        if not force and now < self.next_poll:
             return ""
         self.next_poll = now + self.poll_interval
         chunks: list[bytes] = []
@@ -5313,6 +5323,7 @@ def run_hardware_test(
 ) -> TestResult:
     start = time.monotonic()
     required = list(test.get("required", []))
+    required_any = list(test.get("required_any", []))
     required_secondary = list(test.get("required_secondary", []))
     forbidden = list(defaults.get("forbidden", [])) + list(test.get("forbidden", []))
     uart_baud = int(args.uart_baud or defaults.get("uart_baud", 230_400))
@@ -5721,7 +5732,10 @@ def run_hardware_test(
                     time.sleep(0.02)
                     continue
 
-                missing = missing_required(combined, required)
+                missing = (
+                    missing_required(combined, required) +
+                    missing_required_any(combined, required_any)
+                )
                 missing_secondary = missing_required(secondary_output, required_secondary)
                 if not missing and not missing_secondary and not pending_host_actions:
                     ok = True
@@ -5735,12 +5749,19 @@ def run_hardware_test(
                 active_host_action = None
 
             if not ok and not reason:
+                for serial_port in serials:
+                    serial_port.drain_available()
+                if jtag_memory_log is not None:
+                    jtag_memory_log.read_available(force=True)
                 combined = (
                     "".join(serial.output for serial in serials)
                     + (jtag_memory_log.output if jtag_memory_log is not None else "")
                     + host_output
                 )
-                missing = missing_required(combined, required)
+                missing = (
+                    missing_required(combined, required) +
+                    missing_required_any(combined, required_any)
+                )
                 missing_secondary = missing_required(
                     secondary.output if secondary is not None else "",
                     required_secondary,

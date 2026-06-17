@@ -9,6 +9,7 @@
 #   make clean                                     # Remove build artifacts
 
 NIM ?= nim
+NIM_FLAGS ?= -d:bl808kernel
 OBJCOPY_RV32 ?= riscv32-unknown-elf-objcopy
 OBJCOPY_RV64 ?= riscv64-unknown-elf-objcopy
 SIZE_RV32 ?= riscv32-unknown-elf-size
@@ -34,7 +35,7 @@ RV32_SIZE := $(shell command -v $(SIZE_RV32) 2>/dev/null || command -v $(SIZE_RV
 RV64_OBJCOPY := $(shell command -v $(OBJCOPY_RV64) 2>/dev/null || echo "")
 RV64_SIZE := $(shell command -v $(SIZE_RV64) 2>/dev/null || echo "")
 
-.PHONY: m0 d0 lp ipc examples-check flash-m0 flash-d0 flash-lp venv hw-list hw-preflight hw-smoke hw-smoke-uart hw-smoke-anchor hw-smoke-jtag hw-allcore-jtag hw-e2e-quick hw-e2e-lwip-smoke hw-full hw-full-uart hw-full-anchor clean help
+.PHONY: m0 d0 lp ipc examples-check flash-m0 flash-d0 flash-lp venv hw-list hw-preflight hw-smoke hw-smoke-uart hw-smoke-anchor hw-smoke-jtag hw-allcore-jtag hw-npu-anchor-probe hw-npu-anchor-install hw-npu-smoke-anchor hw-e2e-quick hw-e2e-lwip-smoke hw-full hw-full-uart hw-full-anchor clean help
 
 help:
 	@echo "BL808 HAL build system"
@@ -55,6 +56,7 @@ help:
 	@echo "  make hw-smoke UART_PORT=<p> Build, JTAG-flash, and run smoke tests"
 	@echo "  make hw-smoke-uart UART_PORT=<p> Build, UART-flash, and run smoke tests"
 	@echo "  make hw-smoke-anchor UART_PORT=<p> Build, UART-anchor-flash, and run smoke tests"
+	@echo "  make hw-npu-smoke-anchor UART_PORT=<p> Probe/install anchor, then run NPU smoke via existing anchor"
 	@echo "  make hw-smoke-jtag UART_PORT=<p> Build and run smoke tests from RAM over JTAG"
 	@echo "  make hw-allcore-jtag UART_PORT=<p> Run the all-core RAM-load test over JTAG"
 	@echo "  make hw-full UART_PORT=<p>  Build, JTAG-flash, and run full tests"
@@ -67,6 +69,7 @@ help:
 	@echo "  UART_PORT=/dev/ttyUSB0      Runtime UART; also used for flashing by default"
 	@echo "  FLASH_PORT=$(UART_PORT)     Serial port for UART bootloader flashing"
 	@echo "  FLASH_BAUD=230400           Baud rate for flashing"
+	@echo "  NIM_FLAGS=-d:bl808kernel    Extra Nim flags for make build targets"
 	@echo "  VENV=.venv                  Python venv for the hardware harness"
 	@echo "  HW_VALIDATE_FLAGS=...       Extra flags, e.g. --openocd-sudo --ftdi-reset-sudo --sudo-askpass"
 	@echo ""
@@ -83,7 +86,7 @@ ifndef FILE
 	$(error FILE is not set. Usage: make m0 FILE=examples/m0_blinky.nim)
 endif
 	@echo "=== Building for M0 (E907) ==="
-	$(NIM) c -d:bl808m0 --nimcache:$(BUILD_DIR)/nimcache_m0 -o:$(BUILD_DIR)/m0_firmware.elf $(FILE)
+	$(NIM) c $(NIM_FLAGS) -d:bl808m0 --nimcache:$(BUILD_DIR)/nimcache_m0 -o:$(BUILD_DIR)/m0_firmware.elf $(FILE)
 	@echo "--- Converting to binary ---"
 	$(if $(RV32_OBJCOPY),$(RV32_OBJCOPY),$(error riscv32-unknown-elf-objcopy not found)) \
 		-O binary $(BUILD_DIR)/m0_firmware.elf $(BUILD_DIR)/m0_firmware.bin
@@ -98,7 +101,7 @@ ifndef FILE
 	$(error FILE is not set. Usage: make d0 FILE=examples/d0_uart_hello.nim)
 endif
 	@echo "=== Building for D0 (C906) ==="
-	$(NIM) c -d:bl808d0 --nimcache:$(BUILD_DIR)/nimcache_d0 -o:$(BUILD_DIR)/d0_firmware.elf $(FILE)
+	$(NIM) c $(NIM_FLAGS) -d:bl808d0 --nimcache:$(BUILD_DIR)/nimcache_d0 -o:$(BUILD_DIR)/d0_firmware.elf $(FILE)
 	@echo "--- Converting to binary ---"
 	$(if $(RV64_OBJCOPY),$(RV64_OBJCOPY),$(error riscv64-unknown-elf-objcopy not found)) \
 		-O binary $(BUILD_DIR)/d0_firmware.elf $(BUILD_DIR)/d0_firmware.bin
@@ -113,7 +116,7 @@ ifndef FILE
 	$(error FILE is not set. Usage: make lp FILE=examples/lp_minimal.nim)
 endif
 	@echo "=== Building for LP (E902) ==="
-	$(NIM) c -d:bl808lp --nimcache:$(BUILD_DIR)/nimcache_lp -o:$(BUILD_DIR)/lp_firmware.elf $(FILE)
+	$(NIM) c $(NIM_FLAGS) -d:bl808lp --nimcache:$(BUILD_DIR)/nimcache_lp -o:$(BUILD_DIR)/lp_firmware.elf $(FILE)
 	@echo "--- Converting to binary ---"
 	$(if $(RV32_OBJCOPY),$(RV32_OBJCOPY),$(error riscv32-unknown-elf-objcopy not found)) \
 		-O binary $(BUILD_DIR)/lp_firmware.elf $(BUILD_DIR)/lp_firmware.bin
@@ -125,11 +128,11 @@ endif
 # Build IPC demo (both M0 and D0)
 ipc: $(BUILD_DIR)
 	@echo "=== Building IPC demo for M0 ==="
-	$(NIM) c -d:bl808m0 --nimcache:$(BUILD_DIR)/nimcache_ipc_m0 -o:$(BUILD_DIR)/ipc_m0.elf examples/ipc_demo.nim
+	$(NIM) c $(NIM_FLAGS) -d:bl808m0 --nimcache:$(BUILD_DIR)/nimcache_ipc_m0 -o:$(BUILD_DIR)/ipc_m0.elf examples/ipc_demo.nim
 	$(if $(RV32_OBJCOPY),$(RV32_OBJCOPY),$(error objcopy not found)) \
 		-O binary $(BUILD_DIR)/ipc_m0.elf $(BUILD_DIR)/ipc_m0.bin
 	@echo "=== Building IPC demo for D0 ==="
-	$(NIM) c -d:bl808d0 --nimcache:$(BUILD_DIR)/nimcache_ipc_d0 -o:$(BUILD_DIR)/ipc_d0.elf examples/ipc_demo.nim
+	$(NIM) c $(NIM_FLAGS) -d:bl808d0 --nimcache:$(BUILD_DIR)/nimcache_ipc_d0 -o:$(BUILD_DIR)/ipc_d0.elf examples/ipc_demo.nim
 	$(if $(RV64_OBJCOPY),$(RV64_OBJCOPY),$(error objcopy not found)) \
 		-O binary $(BUILD_DIR)/ipc_d0.elf $(BUILD_DIR)/ipc_d0.bin
 	@echo ""
@@ -180,6 +183,26 @@ hw-smoke-jtag: venv
 
 hw-allcore-jtag: venv
 	$(HW_VALIDATE) --test m0_allcore_test --jtag-load --uart $(UART_PORT) --flash-port $(FLASH_PORT) --uart-baud $(UART_BAUD) --flash-baud $(FLASH_BAUD) --keep-going $(HW_VALIDATE_FLAGS)
+
+hw-npu-anchor-probe: venv
+	$(HW_VALIDATE) --uart-anchor-probe --uart $(UART_PORT) --uart-baud $(UART_BAUD) $(HW_VALIDATE_FLAGS)
+
+hw-npu-anchor-install: venv
+	$(HW_VALIDATE) --test m0_uart_flash_anchor --uart-anchor-flash --uart-anchor-runtime-jtag --uart-anchor-reset-after-flash --uart $(UART_PORT) --uart-baud $(UART_BAUD) $(HW_VALIDATE_FLAGS)
+
+hw-npu-smoke-anchor: venv
+	@$(HW_VALIDATE) --uart-anchor-probe --uart $(UART_PORT) --uart-baud $(UART_BAUD) $(HW_VALIDATE_FLAGS) || \
+	  $(HW_VALIDATE) --test m0_uart_flash_anchor --uart-anchor-flash --uart-anchor-runtime-jtag --uart-anchor-reset-after-flash --uart $(UART_PORT) --uart-baud $(UART_BAUD) $(HW_VALIDATE_FLAGS)
+	$(HW_VALIDATE) --test m0_npu_smoke_test --uart-anchor-flash --uart-anchor-existing --uart-anchor-runtime-jtag --jtag-memory-log --uart $(UART_PORT) --uart-baud $(UART_BAUD) $(HW_VALIDATE_FLAGS)
+	@$(HW_VALIDATE) --uart-anchor-probe --uart $(UART_PORT) --uart-baud $(UART_BAUD) $(HW_VALIDATE_FLAGS) || \
+	  $(HW_VALIDATE) --test m0_uart_flash_anchor --uart-anchor-flash --uart-anchor-runtime-jtag --uart-anchor-reset-after-flash --uart $(UART_PORT) --uart-baud $(UART_BAUD) $(HW_VALIDATE_FLAGS)
+	$(HW_VALIDATE) --test m0_npu_route_smoke_test --uart-anchor-flash --uart-anchor-existing --uart-anchor-runtime-jtag --jtag-memory-log --uart $(UART_PORT) --uart-baud $(UART_BAUD) $(HW_VALIDATE_FLAGS)
+	@$(HW_VALIDATE) --uart-anchor-probe --uart $(UART_PORT) --uart-baud $(UART_BAUD) $(HW_VALIDATE_FLAGS) || \
+	  $(HW_VALIDATE) --test m0_uart_flash_anchor --uart-anchor-flash --uart-anchor-runtime-jtag --uart-anchor-reset-after-flash --uart $(UART_PORT) --uart-baud $(UART_BAUD) $(HW_VALIDATE_FLAGS)
+	$(HW_VALIDATE) --test m0_npu_model_smoke_test --uart-anchor-flash --uart-anchor-existing --uart-anchor-runtime-jtag --jtag-memory-log --uart $(UART_PORT) --uart-baud $(UART_BAUD) $(HW_VALIDATE_FLAGS)
+	@$(HW_VALIDATE) --uart-anchor-probe --uart $(UART_PORT) --uart-baud $(UART_BAUD) $(HW_VALIDATE_FLAGS) || \
+	  $(HW_VALIDATE) --test m0_uart_flash_anchor --uart-anchor-flash --uart-anchor-runtime-jtag --uart-anchor-reset-after-flash --uart $(UART_PORT) --uart-baud $(UART_BAUD) $(HW_VALIDATE_FLAGS)
+	$(HW_VALIDATE) --test m0_npu_parse_smoke_test --uart-anchor-flash --uart-anchor-existing --uart-anchor-runtime-jtag --jtag-memory-log --uart $(UART_PORT) --uart-baud $(UART_BAUD) $(HW_VALIDATE_FLAGS)
 
 hw-full: venv
 	$(HW_VALIDATE) --tier full --jtag-flash --uart $(UART_PORT) --flash-port $(FLASH_PORT) --uart-baud $(UART_BAUD) --flash-baud $(FLASH_BAUD) --keep-going $(HW_VALIDATE_FLAGS)
