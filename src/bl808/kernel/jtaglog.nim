@@ -15,8 +15,15 @@ var
     HwValidationLogCapacity
   hwValidationLogWrite* {.exportc: "hw_validation_log_write".}: uint32 = 0
   hwValidationLogWrapped* {.exportc: "hw_validation_log_wrapped".}: uint32 = 0
-  hwValidationLogBuffer* {.exportc: "hw_validation_log_buffer".}:
-    array[HwValidationLogCapacity, uint8]
+when defined(HwValidationLogExternalBuffer):
+  var
+    hwValidationLogBuffer* {.exportc: "hw_validation_log_buffer",
+                             codegenDecl: "$# $# __attribute__((section(\".jtaglog\"), used))".}:
+      array[HwValidationLogCapacity, uint8]
+else:
+  var
+    hwValidationLogBuffer* {.exportc: "hw_validation_log_buffer".}:
+      array[HwValidationLogCapacity, uint8]
 
 proc hwValidationLogReset*() {.exportc: "hw_validation_log_reset", cdecl.} =
   hwValidationLogMagic = HwValidationLogMagic

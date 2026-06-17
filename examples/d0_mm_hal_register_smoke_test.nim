@@ -5,6 +5,7 @@
 import bl808/startup
 import bl808/core
 import bl808/mmio, bl808/memmap
+import bl808/kernel/alloc
 import bl808/dbi, bl808/dvp, bl808/glb, bl808/h264, bl808/irq, bl808/mjpeg, bl808/npu, bl808/osd
 
 const
@@ -221,6 +222,7 @@ proc smokeD0Irq() =
 
 proc main() {.exportc, cdecl.} =
   systemInit()
+  heapInit()
   regWrite(FailCodeAddr, 0)
   regWrite(FailGotAddr, 0)
   regWrite(FailExpectedAddr, 0)

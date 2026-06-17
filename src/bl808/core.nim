@@ -174,18 +174,30 @@ when defined(bl808d0):
   proc dcacheFlushAll*() {.importc: "__dcache_flush_all", nodecl.}
   proc dcacheInvalidateAll*() {.importc: "__dcache_invalidate_all", nodecl.}
   proc icacheInvalidateAll*() {.importc: "__icache_invalidate_all", nodecl.}
+  proc dcacheLineSize*(): uint {.importc: "__dcache_line_size", nodecl.}
+  proc dcacheCleanRange*(address, size: uint) {.importc: "__dcache_clean_range", nodecl.}
+  proc dcacheInvalidateRange*(address, size: uint) {.importc: "__dcache_invalidate_range", nodecl.}
+  proc dcacheCleanInvalidateRange*(address, size: uint) {.importc: "__dcache_clean_invalidate_range", nodecl.}
 
 when defined(bl808m0):
   # Inline functions defined in riscv_csr.h
   proc dcacheFlushAll*() {.importc: "__dcache_flush_all", nodecl.}
   proc dcacheInvalidateAll*() {.importc: "__dcache_invalidate_all", nodecl.}
   proc icacheInvalidateAll*() {.importc: "__icache_invalidate_all", nodecl.}
+  proc dcacheLineSize*(): uint {.importc: "__dcache_line_size", nodecl.}
+  proc dcacheCleanRange*(address, size: uint) {.importc: "__dcache_clean_range", nodecl.}
+  proc dcacheInvalidateRange*(address, size: uint) {.importc: "__dcache_invalidate_range", nodecl.}
+  proc dcacheCleanInvalidateRange*(address, size: uint) {.importc: "__dcache_clean_invalidate_range", nodecl.}
 
 when defined(bl808lp):
   # E902 has no caches — provide no-op stubs for cross-core compatibility
   proc dcacheFlushAll*() {.inline.} = fence()
   proc dcacheInvalidateAll*() {.inline.} = fence()
   proc icacheInvalidateAll*() {.inline.} = fence()
+  proc dcacheLineSize*(): uint {.inline.} = 0
+  proc dcacheCleanRange*(address, size: uint) {.inline.} = fence()
+  proc dcacheInvalidateRange*(address, size: uint) {.inline.} = fence()
+  proc dcacheCleanInvalidateRange*(address, size: uint) {.inline.} = fence()
 
 # =============================================================================
 # Delay utilities

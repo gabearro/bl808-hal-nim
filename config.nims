@@ -67,6 +67,8 @@ when defined(bl808m0):
     switch("passL", "-T src/linker/bl808_m0_enclave.ld")
   elif defined(bl808puf):
     switch("passL", "-T src/linker/bl808_m0_puf.ld")
+  elif defined(bl808LargeStack):
+    switch("passL", "-T src/linker/bl808_m0_model_smoke.ld")
   else:
     switch("passL", "-T src/linker/bl808_m0.ld")
   switch("passL", "-lgcc")  # GCC builtins (__clzsi2, __ctzsi2, etc.)

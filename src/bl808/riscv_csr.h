@@ -5,6 +5,8 @@
 #ifndef RISCV_CSR_H
 #define RISCV_CSR_H
 
+#include <stdint.h>
+
 static inline unsigned long __csr_read_mhartid(void) {
   unsigned long v; asm volatile("csrr %0, mhartid" : "=r"(v)); return v;
 }
@@ -84,6 +86,83 @@ static inline void __dcache_invalidate_all(void) {
 }
 static inline void __icache_invalidate_all(void) {
   asm volatile(".long 0x0100000b" ::: "memory");
+}
+
+static inline unsigned long __dcache_line_size(void) {
+#if __riscv_xlen == 64
+  return 64UL;
+#else
+  return 32UL;
+#endif
+}
+
+static inline void __dcache_ipa_addr(uintptr_t addr) {
+  register uintptr_t a0 asm("a0") = addr;
+  asm volatile(".long 0x02a5000b" :: "r"(a0) : "memory");
+}
+
+static inline void __dcache_cpa_addr(uintptr_t addr) {
+  register uintptr_t a0 asm("a0") = addr;
+  asm volatile(".long 0x0295000b" :: "r"(a0) : "memory");
+}
+
+static inline void __dcache_cipa_addr(uintptr_t addr) {
+  register uintptr_t a0 asm("a0") = addr;
+  asm volatile(".long 0x02b5000b" :: "r"(a0) : "memory");
+}
+
+static inline void __dcache_clean_range(uintptr_t addr, uintptr_t size) {
+  if (size == 0) return;
+  const uintptr_t line = __dcache_line_size();
+  uintptr_t op_size = size + (addr % line);
+  uintptr_t op_addr = addr & ~(line - 1UL);
+  __do_fence();
+  while (op_size > 0) {
+    __dcache_cpa_addr(op_addr);
+    op_addr += line;
+    if (op_size > line) {
+      op_size -= line;
+    } else {
+      op_size = 0;
+    }
+  }
+  __do_fence();
+}
+
+static inline void __dcache_invalidate_range(uintptr_t addr, uintptr_t size) {
+  if (size == 0) return;
+  const uintptr_t line = __dcache_line_size();
+  uintptr_t op_size = size + (addr % line);
+  uintptr_t op_addr = addr;
+  __do_fence();
+  while (op_size > 0) {
+    __dcache_ipa_addr(op_addr);
+    op_addr += line;
+    if (op_size > line) {
+      op_size -= line;
+    } else {
+      op_size = 0;
+    }
+  }
+  __do_fence();
+}
+
+static inline void __dcache_clean_invalidate_range(uintptr_t addr, uintptr_t size) {
+  if (size == 0) return;
+  const uintptr_t line = __dcache_line_size();
+  uintptr_t op_size = size + (addr % line);
+  uintptr_t op_addr = addr;
+  __do_fence();
+  while (op_size > 0) {
+    __dcache_cipa_addr(op_addr);
+    op_addr += line;
+    if (op_size > line) {
+      op_size -= line;
+    } else {
+      op_size = 0;
+    }
+  }
+  __do_fence();
 }
 
 #endif /* RISCV_CSR_H */
