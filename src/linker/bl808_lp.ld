@@ -15,9 +15,9 @@ ENTRY(_start)
 MEMORY
 {
     /* LP code in flash after M0 firmware */
-    FLASH (rx)  : ORIGIN = 0x58080000, LENGTH = 512K
+    FLASH   (rx)  : ORIGIN = 0x58080000, LENGTH = 512K
     /* LP gets the upper 16 KB of WRAM. */
-    RAM   (rwx) : ORIGIN = 0x62054000, LENGTH = 16K
+    RAM     (rwx) : ORIGIN = 0x62054000, LENGTH = 16K
 }
 
 _stack_size = 2K;
@@ -36,6 +36,17 @@ SECTIONS
         *(.srodata .srodata.*)
         . = ALIGN(4);
     } > FLASH
+
+    /* RAM-resident routines that must keep running after enclave TZC lock. */
+    _siramfunc = LOADADDR(.ramfunc);
+
+    .ramfunc : ALIGN(4)
+    {
+        _sramfunc = .;
+        *(.ramfunc .ramfunc.*)
+        . = ALIGN(4);
+        _eramfunc = .;
+    } > RAM AT > FLASH
 
     _sidata = LOADADDR(.data);
 

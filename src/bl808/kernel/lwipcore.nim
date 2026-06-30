@@ -201,6 +201,9 @@ proc netifSetUp*(netif: ptr Netif)
 proc netifSetLinkUp*(netif: ptr Netif)
   {.importc: "netif_set_link_up", header: "lwip/netif.h".}
 
+proc netifSetAddr*(netif: ptr Netif, ipaddr, netmask, gw: ptr IpAddr)
+  {.importc: "netif_set_addr", header: "lwip/netif.h".}
+
 proc netifSetStatusCallback*(netif: ptr Netif, cb: NetifStatusCb)
   {.importc: "netif_set_status_callback", header: "lwip/netif.h".}
 
@@ -241,12 +244,20 @@ proc etharpOutput*(netif: ptr Netif, q: ptr Pbuf,
                     ipaddr: ptr IpAddr): ErrT
   {.importc: "etharp_output", header: "lwip/etharp.h", cdecl.}
 
+proc etharpGratuitous*(netif: ptr Netif): ErrT =
+  ## Announce the current IPv4 address on Ethernet-style netifs.
+  ## lwIP exposes this as a macro, so call etharp_request with netif_ip4_addr.
+  {.emit: "`result` = etharp_request(`netif`, netif_ip4_addr(`netif`));".}
+
 # =============================================================================
 # DHCP
 # =============================================================================
 
 proc dhcpStart*(netif: ptr Netif): ErrT
   {.importc: "dhcp_start", header: "lwip/dhcp.h".}
+
+proc dhcpStop*(netif: ptr Netif)
+  {.importc: "dhcp_stop", header: "lwip/dhcp.h".}
 
 # =============================================================================
 # Raw API

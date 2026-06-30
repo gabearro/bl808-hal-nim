@@ -101,8 +101,18 @@ int memcmp(const void *s1, const void *s2, size_t n) {
     return 0;
 }
 
+void *memchr(const void *s, int c, size_t n) {
+    const unsigned char *p = (const unsigned char *)s;
+    unsigned char needle = (unsigned char)c;
+    while (n--) {
+        if (*p == needle) return (void *)p;
+        p++;
+    }
+    return (void *)0;
+}
+
 /* GCC builtins for platforms without libgcc (e.g., RV32E) */
-int __clzsi2(unsigned int x) {
+__attribute__((weak)) int __clzsi2(unsigned int x) {
     if (x == 0) return 32;
     int n = 0;
     if (x <= 0x0000FFFF) { n += 16; x <<= 16; }
@@ -113,7 +123,7 @@ int __clzsi2(unsigned int x) {
     return n;
 }
 
-int __ctzsi2(unsigned int x) {
+__attribute__((weak)) int __ctzsi2(unsigned int x) {
     if (x == 0) return 32;
     int n = 0;
     if ((x & 0x0000FFFF) == 0) { n += 16; x >>= 16; }
@@ -124,7 +134,7 @@ int __ctzsi2(unsigned int x) {
     return n;
 }
 
-uint64_t __udivdi3(uint64_t n, uint64_t d) {
+__attribute__((weak)) uint64_t __udivdi3(uint64_t n, uint64_t d) {
     uint64_t q = 0;
     uint64_t bit = 1;
 
@@ -147,6 +157,40 @@ uint64_t __udivdi3(uint64_t n, uint64_t d) {
     }
 
     return q;
+}
+
+__attribute__((weak)) uint64_t __umoddi3(uint64_t n, uint64_t d) {
+    if (d == 0) {
+        return 0;
+    }
+    return n - __udivdi3(n, d) * d;
+}
+
+__attribute__((weak)) int __popcountsi2(unsigned int x) {
+    int n = 0;
+    while (x != 0) {
+        n += (int)(x & 1u);
+        x >>= 1;
+    }
+    return n;
+}
+
+__attribute__((weak)) uint64_t __ashldi3(uint64_t value, int shift) {
+    if (shift <= 0) return value;
+    if (shift >= 64) return 0;
+    return value << shift;
+}
+
+__attribute__((weak)) uint64_t __lshrdi3(uint64_t value, int shift) {
+    if (shift <= 0) return value;
+    if (shift >= 64) return 0;
+    return value >> shift;
+}
+
+__attribute__((weak)) int64_t __ashrdi3(int64_t value, int shift) {
+    if (shift <= 0) return value;
+    if (shift >= 64) return value < 0 ? -1 : 0;
+    return value >> shift;
 }
 
 /* Network byte-order conversion (RISC-V is little-endian) */
@@ -172,6 +216,120 @@ unsigned int ntohl(unsigned int x) {
 __attribute__((weak)) int abs(int value) {
     return value < 0 ? -value : value;
 }
+
+__attribute__((weak)) double fabs(double x) {
+    union {
+        double d;
+        uint64_t u;
+    } v;
+    v.d = x;
+    v.u &= 0x7fffffffffffffffull;
+    return v.d;
+}
+
+__attribute__((weak)) float fabsf(float x) {
+    union {
+        float f;
+        uint32_t u;
+    } v;
+    v.f = x;
+    v.u &= 0x7fffffffu;
+    return v.f;
+}
+
+__attribute__((weak)) double copysign(double x, double y) {
+    union {
+        double d;
+        uint64_t u;
+    } vx, vy;
+    vx.d = x;
+    vy.d = y;
+    vx.u = (vx.u & 0x7fffffffffffffffull) | (vy.u & 0x8000000000000000ull);
+    return vx.d;
+}
+
+__attribute__((weak)) float copysignf(float x, float y) {
+    union {
+        float f;
+        uint32_t u;
+    } vx, vy;
+    vx.f = x;
+    vy.f = y;
+    vx.u = (vx.u & 0x7fffffffu) | (vy.u & 0x80000000u);
+    return vx.f;
+}
+
+#ifndef __riscv_abi_rve
+__attribute__((weak)) double floor(double x) {
+    int64_t i = (int64_t)x;
+    if ((double)i > x) {
+        i -= 1;
+    }
+    return (double)i;
+}
+
+__attribute__((weak)) float floorf(float x) {
+    int32_t i = (int32_t)x;
+    if ((float)i > x) {
+        i -= 1;
+    }
+    return (float)i;
+}
+
+__attribute__((weak)) double ceil(double x) {
+    int64_t i = (int64_t)x;
+    if ((double)i < x) {
+        i += 1;
+    }
+    return (double)i;
+}
+
+__attribute__((weak)) float ceilf(float x) {
+    int32_t i = (int32_t)x;
+    if ((float)i < x) {
+        i += 1;
+    }
+    return (float)i;
+}
+
+__attribute__((weak)) double trunc(double x) {
+    return (double)((int64_t)x);
+}
+
+__attribute__((weak)) float truncf(float x) {
+    return (float)((int32_t)x);
+}
+
+__attribute__((weak)) double round(double x) {
+    return x >= 0.0 ? floor(x + 0.5) : ceil(x - 0.5);
+}
+
+__attribute__((weak)) float roundf(float x) {
+    return x >= 0.0f ? floorf(x + 0.5f) : ceilf(x - 0.5f);
+}
+
+__attribute__((weak)) double sqrt(double x) {
+    if (x <= 0.0) {
+        return x == 0.0 ? 0.0 : 0.0 / 0.0;
+    }
+    double g = x >= 1.0 ? x : 1.0;
+    for (int i = 0; i < 16; i++) {
+        g = 0.5 * (g + x / g);
+    }
+    return g;
+}
+
+__attribute__((weak)) float sqrtf(float x) {
+    if (x <= 0.0f) {
+        return x == 0.0f ? 0.0f : 0.0f / 0.0f;
+    }
+    float g = x >= 1.0f ? x : 1.0f;
+    for (int i = 0; i < 10; i++) {
+        g = 0.5f * (g + x / g);
+    }
+    return g;
+}
+#endif /* !__riscv_abi_rve */
 
 /* The double-precision log() fallback drags in soft-float (__divdf3 etc). The
  * E902 (LP) builds rv32emc / ilp32e and has no FP, and the toolchain ships no

@@ -62,15 +62,13 @@ proc runChainCombined(): (Measurement, int) =
   (combineMeasurement(meas), meas.count)
 
 proc trySeal(): int =
-  for i in 0 ..< 16: buf()[i] = 0
-  for i in 0 ..< Msg.len: buf()[16 + i] = Msg[i].uint8
-  let (st, n) = enclaveDispatch(svcSealBlob, 16 + Msg.len, buf(), scratch.len)
+  for i in 0 ..< Msg.len: buf()[i] = Msg[i].uint8
+  let (st, n) = enclaveDispatch(svcSealBlob, Msg.len, buf(), scratch.len)
   if st != svcOk: -1 else: n
 
 proc tryUnseal(sealed: openArray[uint8]): bool =
-  for i in 0 ..< 16: buf()[i] = 0
-  for i in 0 ..< sealed.len: buf()[16 + i] = sealed[i]
-  let (st, n) = enclaveDispatch(svcUnsealBlob, 16 + sealed.len, buf(), scratch.len)
+  for i in 0 ..< sealed.len: buf()[i] = sealed[i]
+  let (st, n) = enclaveDispatch(svcUnsealBlob, sealed.len, buf(), scratch.len)
   if st != svcOk or n != Msg.len: return false
   for i in 0 ..< Msg.len:
     if buf()[i] != Msg[i].uint8: return false

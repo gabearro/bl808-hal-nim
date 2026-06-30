@@ -14,42 +14,6 @@ import mmio, memmap
 # =============================================================================
 when defined(bl808d0):
   {.emit: """/*TYPESECTION*/
-  static inline unsigned long __csr_read_sstatus(void) {
-    unsigned long v; asm volatile("csrr %0, sstatus" : "=r"(v)); return v;
-  }
-  static inline void __csr_write_sstatus(unsigned long v) {
-    asm volatile("csrw sstatus, %0" :: "r"(v));
-  }
-  static inline unsigned long __csr_read_stvec(void) {
-    unsigned long v; asm volatile("csrr %0, stvec" : "=r"(v)); return v;
-  }
-  static inline void __csr_write_stvec(unsigned long v) {
-    asm volatile("csrw stvec, %0" :: "r"(v));
-  }
-  static inline unsigned long __csr_read_sie(void) {
-    unsigned long v; asm volatile("csrr %0, sie" : "=r"(v)); return v;
-  }
-  static inline void __csr_write_sie(unsigned long v) {
-    asm volatile("csrw sie, %0" :: "r"(v));
-  }
-  static inline unsigned long __csr_read_sip(void) {
-    unsigned long v; asm volatile("csrr %0, sip" : "=r"(v)); return v;
-  }
-  static inline unsigned long __csr_read_scause(void) {
-    unsigned long v; asm volatile("csrr %0, scause" : "=r"(v)); return v;
-  }
-  static inline unsigned long __csr_read_stval(void) {
-    unsigned long v; asm volatile("csrr %0, stval" : "=r"(v)); return v;
-  }
-  static inline unsigned long __csr_read_sepc(void) {
-    unsigned long v; asm volatile("csrr %0, sepc" : "=r"(v)); return v;
-  }
-  static inline unsigned long __csr_read_satp(void) {
-    unsigned long v; asm volatile("csrr %0, satp" : "=r"(v)); return v;
-  }
-  static inline void __csr_write_satp(unsigned long v) {
-    asm volatile("csrw satp, %0" :: "r"(v));
-  }
   static inline void __csr_set_sstatus_sie(void) {
     asm volatile("csrsi sstatus, 0x2");
   }
@@ -77,6 +41,14 @@ when defined(bl808d0):
   proc csrReadSepc*(): uint {.importc: "__csr_read_sepc", nodecl.}
   proc csrReadSatp*(): uint {.importc: "__csr_read_satp", nodecl.}
   proc csrWriteSatp*(v: uint) {.importc: "__csr_write_satp", nodecl.}
+  proc csrReadMedeleg*(): uint {.importc: "__csr_read_medeleg", nodecl.}
+  proc csrWriteMedeleg*(v: uint) {.importc: "__csr_write_medeleg", nodecl.}
+  proc csrReadMideleg*(): uint {.importc: "__csr_read_mideleg", nodecl.}
+  proc csrWriteMideleg*(v: uint) {.importc: "__csr_write_mideleg", nodecl.}
+  proc csrReadMcounteren*(): uint {.importc: "__csr_read_mcounteren", nodecl.}
+  proc csrWriteMcounteren*(v: uint) {.importc: "__csr_write_mcounteren", nodecl.}
+  proc sfenceVma*() {.importc: "__do_sfence_vma", nodecl.}
+  proc enterSupervisor*(entry, stack: uint) {.importc: "__d0_enter_supervisor", nodecl, noreturn.}
   proc enableSupervisorInterrupts*() {.importc: "__csr_set_sstatus_sie", nodecl.}
     ## Set SIE bit in sstatus — globally enable S-mode interrupts.
   proc disableSupervisorInterrupts*() {.importc: "__csr_clear_sstatus_sie", nodecl.}

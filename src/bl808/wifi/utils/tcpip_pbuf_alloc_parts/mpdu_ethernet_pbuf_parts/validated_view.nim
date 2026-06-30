@@ -3,10 +3,32 @@ type MpduEthernetView = object
   snap: pointer
   firstLen: uint32
   macLen: uint32
+  snapOffset: uint32
   payloadStart: uint32
   firstPayloadLen: uint32
   totalLen: uint32
   frameControl: uint16
+
+proc findUploadSnapOffset(frame: pointer; frameAvail, preferredOffset: uint32): uint32 =
+  if preferredOffset + 8'u32 <= frameAvail:
+    let snap = ptrAt(frame, preferredOffset.uint)
+    if loadU8(snap, 0) == 0xAA'u8 and loadU8(snap, 1) == 0xAA'u8 and
+        loadU8(snap, 2) == 0x03'u8 and loadU8(snap, 3) == 0'u8 and
+        loadU8(snap, 4) == 0'u8 and
+        (loadU8(snap, 5) == 0'u8 or loadU8(snap, 5) == 0xF8'u8):
+      return preferredOffset
+
+  var offset = 24'u32
+  while offset + 8'u32 <= frameAvail and offset <= 72'u32:
+    let snap = ptrAt(frame, offset.uint)
+    if loadU8(snap, 0) == 0xAA'u8 and loadU8(snap, 1) == 0xAA'u8 and
+        loadU8(snap, 2) == 0x03'u8 and loadU8(snap, 3) == 0'u8 and
+        loadU8(snap, 4) == 0'u8 and
+        (loadU8(snap, 5) == 0'u8 or loadU8(snap, 5) == 0xF8'u8):
+      return offset
+    inc offset
+
+  preferredOffset
 
 proc loadMpduEthernetView(msduOffset: uint32; pkt: pointer;
                           view: var MpduEthernetView): bool =
@@ -38,7 +60,9 @@ proc loadMpduEthernetView(msduOffset: uint32; pkt: pointer;
     noteMpduFail(4)
     return false
 
-  let snap = ptrAt(frame, macLen.uint)
+  let snapOffset = findUploadSnapOffset(frame, frameAvail, macLen)
+  view.snapOffset = snapOffset
+  let snap = ptrAt(frame, snapOffset.uint)
   view.snap = snap
   nimFwDbgTcpipInputMpduLast2 = loadU8(snap, 0).uint32 or
     (loadU8(snap, 1).uint32 shl 8) or
@@ -50,7 +74,7 @@ proc loadMpduEthernetView(msduOffset: uint32; pkt: pointer;
     noteMpduFail(5)
     return false
 
-  let payloadStart = macLen + 8
+  let payloadStart = snapOffset + 8
   view.payloadStart = payloadStart
   let firstPayloadLen = firstLen - payloadStart
   view.firstPayloadLen = firstPayloadLen

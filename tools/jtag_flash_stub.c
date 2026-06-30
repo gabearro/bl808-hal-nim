@@ -259,8 +259,9 @@ static int flash_read_compare(uint32_t address, uint32_t offset, uint32_t length
             uint32_t word = read32(SF_CTRL_BUF + (i & ~3u));
             uint8_t got = (uint8_t)(word >> ((i & 3u) * 8u));
             if (got != expected[base + i]) {
-                mbox()->result = ((address + base + i) & 0x00FFFFFFu) |
-                                 ((uint32_t)got << 24);
+                mbox()->counter = ((uint32_t)expected[base + i] << 24) |
+                                  ((uint32_t)got << 16) |
+                                  ((base + i) & 0x0000FFFFu);
                 return -1;
             }
         }

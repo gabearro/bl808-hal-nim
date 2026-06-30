@@ -22,6 +22,60 @@ static inline unsigned long __csr_read_mie(void) {
 static inline void __csr_write_mie(unsigned long v) {
   asm volatile("csrw mie, %0" :: "r"(v));
 }
+static inline unsigned long __csr_read_medeleg(void) {
+  unsigned long v; asm volatile("csrr %0, medeleg" : "=r"(v)); return v;
+}
+static inline void __csr_write_medeleg(unsigned long v) {
+  asm volatile("csrw medeleg, %0" :: "r"(v));
+}
+static inline unsigned long __csr_read_mideleg(void) {
+  unsigned long v; asm volatile("csrr %0, mideleg" : "=r"(v)); return v;
+}
+static inline void __csr_write_mideleg(unsigned long v) {
+  asm volatile("csrw mideleg, %0" :: "r"(v));
+}
+static inline unsigned long __csr_read_mcounteren(void) {
+  unsigned long v; asm volatile("csrr %0, mcounteren" : "=r"(v)); return v;
+}
+static inline void __csr_write_mcounteren(unsigned long v) {
+  asm volatile("csrw mcounteren, %0" :: "r"(v));
+}
+static inline unsigned long __csr_read_sstatus(void) {
+  unsigned long v; asm volatile("csrr %0, sstatus" : "=r"(v)); return v;
+}
+static inline void __csr_write_sstatus(unsigned long v) {
+  asm volatile("csrw sstatus, %0" :: "r"(v));
+}
+static inline unsigned long __csr_read_stvec(void) {
+  unsigned long v; asm volatile("csrr %0, stvec" : "=r"(v)); return v;
+}
+static inline void __csr_write_stvec(unsigned long v) {
+  asm volatile("csrw stvec, %0" :: "r"(v));
+}
+static inline unsigned long __csr_read_sie(void) {
+  unsigned long v; asm volatile("csrr %0, sie" : "=r"(v)); return v;
+}
+static inline void __csr_write_sie(unsigned long v) {
+  asm volatile("csrw sie, %0" :: "r"(v));
+}
+static inline unsigned long __csr_read_sip(void) {
+  unsigned long v; asm volatile("csrr %0, sip" : "=r"(v)); return v;
+}
+static inline unsigned long __csr_read_scause(void) {
+  unsigned long v; asm volatile("csrr %0, scause" : "=r"(v)); return v;
+}
+static inline unsigned long __csr_read_stval(void) {
+  unsigned long v; asm volatile("csrr %0, stval" : "=r"(v)); return v;
+}
+static inline unsigned long __csr_read_sepc(void) {
+  unsigned long v; asm volatile("csrr %0, sepc" : "=r"(v)); return v;
+}
+static inline unsigned long __csr_read_satp(void) {
+  unsigned long v; asm volatile("csrr %0, satp" : "=r"(v)); return v;
+}
+static inline void __csr_write_satp(unsigned long v) {
+  asm volatile("csrw satp, %0" :: "r"(v));
+}
 static inline unsigned long __csr_read_mtvec(void) {
   unsigned long v; asm volatile("csrr %0, mtvec" : "=r"(v)); return v;
 }
@@ -59,7 +113,10 @@ static inline void __do_fence_io(void) {
   asm volatile("fence iorw, iorw" ::: "memory");
 }
 static inline void __do_fencei(void) {
-  asm volatile("fence.i" ::: "memory");
+  asm volatile(".long 0x0000100f" ::: "memory");
+}
+static inline void __do_sfence_vma(void) {
+  asm volatile("sfence.vma x0, x0" ::: "memory");
 }
 static inline void __do_ecall(void) {
   asm volatile("ecall");
@@ -75,6 +132,24 @@ static inline void __csr_set_mstatus_mie(void) {
 }
 static inline void __csr_clear_mstatus_mie(void) {
   asm volatile("csrci mstatus, 0x8");
+}
+
+__attribute__((noreturn))
+static inline void __d0_enter_supervisor(unsigned long entry, unsigned long stack) {
+  asm volatile(
+    "mv sp, %1\n"
+    "csrw mepc, %0\n"
+    "li t0, ~(3 << 11)\n"
+    "csrr t1, mstatus\n"
+    "and t1, t1, t0\n"
+    "li t0, (1 << 11)\n"
+    "or t1, t1, t0\n"
+    "csrw mstatus, t1\n"
+    "mret\n"
+    :
+    : "r"(entry), "r"(stack)
+    : "t0", "t1", "memory");
+  __builtin_unreachable();
 }
 
 /* T-Head cache maintenance (shared by D0 and M0) */

@@ -342,6 +342,8 @@ proc noteMgmtTxConfirm(desc: ptr HostTxDescView; status: uint32; phase: uint32) 
     (desc.staInfoIdx.uint32 shl 16) or
     (desc.vifIdx.uint32 shl 24) or
     (phase shl 28)
+  let thd = hostTxHeadThd(hw)
+  let thdFlags = if thd != nil: thd.flags else: 0'u32
   if fc == 0x00B0'u32:
     case phase
     of 0'u32:
@@ -354,6 +356,13 @@ proc noteMgmtTxConfirm(desc: ptr HostTxDescView; status: uint32; phase: uint32) 
       discard
     nimFwDbgAuthCfmStatus = status
     nimFwDbgAuthCfmHwStatus = hw.confirmStatus or (hw.status shl 16)
+    nimFwDbgAuthCfmThdFlags = thdFlags
+    if (thdFlags and 0x00010000'u32) != 0:
+      inc nimFwDbgAuthCfmAckOk16
+    elif (status and 0x00800000'u32) != 0'u32:
+      inc nimFwDbgAuthCfmAckOk23
+    elif phase == 0'u32:
+      inc nimFwDbgAuthCfmAckFail
     nimFwDbgAuthCfmDesc = pointerAddrU32(cast[pointer](desc))
     nimFwDbgAuthCfmMeta = meta
     nimFwDbgAuthCfmFc = fc
@@ -369,6 +378,13 @@ proc noteMgmtTxConfirm(desc: ptr HostTxDescView; status: uint32; phase: uint32) 
       discard
     nimFwDbgAssocCfmStatus = status
     nimFwDbgAssocCfmHwStatus = hw.confirmStatus or (hw.status shl 16)
+    nimFwDbgAssocCfmThdFlags = thdFlags
+    if (thdFlags and 0x00010000'u32) != 0:
+      inc nimFwDbgAssocCfmAckOk16
+    elif (status and 0x00800000'u32) != 0'u32:
+      inc nimFwDbgAssocCfmAckOk23
+    elif phase == 0'u32:
+      inc nimFwDbgAssocCfmAckFail
     nimFwDbgAssocCfmDesc = pointerAddrU32(cast[pointer](desc))
     nimFwDbgAssocCfmMeta = meta
     nimFwDbgAssocCfmFc = fc
@@ -703,6 +719,13 @@ proc txl_cntrl_init*() {.exportc, cdecl.} =
   txl_frame_init()
   let txCtrl = txControlEnv()
   discard c_memset(txCtrl, 0, 92.csize_t)
+  var seqSeed = txlSeqRetained
+  if seqSeed == 0'u16:
+    seqSeed = uint16(regRead(MACHW_RNG_REG) and 0x0FFF'u32)
+  else:
+    seqSeed = (seqSeed + 0x31'u16) and 0x0FFF'u16
+  txlSeqRetained = seqSeed
+  txCtrl.seqCounter = seqSeed
   for ac in 0'u32 ..< NUM_TX_QUEUES.uint32:
     let acCtrl = txControlAc(ac)
     # co_list_init on the list at offset 4
@@ -1421,6 +1444,40 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
           discard c_memcpy(addr nimFwDbgProbePayRaw[0],
                            addr probeLink.macHeader[0],
                            copyLen)
+      if (fcTrace == 0xB0'u8 or fcTrace == 0x00'u8) and actualDesc != nil:
+        let mgmtHw = hostTxHwDescAt(actual.hwDesc)
+        let mgmtLen =
+          if mgmtHw != nil and mgmtHw.frameLen >= 4'u32:
+            mgmtHw.frameLen - 4'u32
+          else:
+            0'u32
+        let mgmtMeta =
+          (ac and 0xff'u32) or
+          ((if actual.queueFirst != nil: 1'u32 else: 0'u32) shl 8) or
+          (uint32(actual.staIdx) shl 16) or
+          (uint32(actual.vifIdx) shl 24)
+        let hw0 =
+          if mgmtHw != nil: mgmtHw.payloadStart else: 0'u32
+        let hw1 =
+          if mgmtHw != nil: mgmtHw.payloadEnd else: 0'u32
+        let hw2 =
+          if mgmtHw != nil: mgmtHw.retryLimitControl else: 0'u32
+        let hw3 =
+          if mgmtHw != nil: mgmtHw.ackPolicyControl else: 0'u32
+        if fcTrace == 0xB0'u8:
+          nimFwDbgAuthPayMeta = mgmtMeta
+          nimFwDbgAuthPayLen = mgmtLen or (uint32(actual.frameLen) shl 16)
+          nimFwDbgAuthPayHw0 = hw0
+          nimFwDbgAuthPayHw1 = hw1
+          nimFwDbgAuthPayHw2 = hw2
+          nimFwDbgAuthPayHw3 = hw3
+        else:
+          nimFwDbgAssocPayMeta = mgmtMeta
+          nimFwDbgAssocPayLen = mgmtLen or (uint32(actual.frameLen) shl 16)
+          nimFwDbgAssocPayHw0 = hw0
+          nimFwDbgAssocPayHw1 = hw1
+          nimFwDbgAssocPayHw2 = hw2
+          nimFwDbgAssocPayHw3 = hw3
 
       # Gate: only do beacon/machdr/tkip/thd patching if actualDesc[8] != nil
       let hasPayload = actual.queueFirst
@@ -1471,7 +1528,9 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
             forceRate.retryTxPowerControl0 = NimFwForcedMgmtTxPower
             forceRate.retryTxPowerControl1 = NimFwForcedMgmtTxPower
             forceRate.retryTxPowerControl2 = NimFwForcedMgmtTxPower
-      if hasPayload != nil:
+      let isHeaderOnlyMgmt =
+        hasPayload == nil and actualDesc != nil and ((fcTrace.uint32 and 0x0C'u32) == 0'u32)
+      if hasPayload != nil or isHeaderOnlyMgmt:
         inc nimFwDbgPayHasPayload
         when declared(rfPriApplyWb03AuthTxLatches):
           let fcForRfLatch = cast[ptr uint16](addr backupDesc.macHeader[0])[]
@@ -1497,7 +1556,8 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
         # Save link descriptor across call, read THD (s11), call txu_cntrl_tkip_mic_append
         let linkDesc = hostTxLinkDescAt(actual.bufDesc)
         let thd = hostTxHwDescAt(actual.hwDesc)  # saved as s11 across call
-        txu_cntrl_tkip_mic_append(actualDesc)
+        if hasPayload != nil:
+          txu_cntrl_tkip_mic_append(actualDesc)
 
         # Copy the two MAC TX control trailer words that follow the 52-byte
         # rate template in TxBufferControlView into their hardware descriptor
@@ -1505,6 +1565,14 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
         thd.ackPolicyControl = linkDesc.ackPolicyControl
         thd.chainedThd = cast[pointer](hostTxRateTemplate(linkDesc))
         thd.retryLimitControl = linkDesc.retryLimitControl
+        if fcTrace == 0xB0'u8:
+          nimFwDbgAuthPayMeta = nimFwDbgAuthPayMeta or 0x80000000'u32
+          nimFwDbgAuthPayHw2 = thd.retryLimitControl
+          nimFwDbgAuthPayHw3 = thd.ackPolicyControl
+        elif fcTrace == 0x00'u8:
+          nimFwDbgAssocPayMeta = nimFwDbgAssocPayMeta or 0x80000000'u32
+          nimFwDbgAssocPayHw2 = thd.retryLimitControl
+          nimFwDbgAssocPayHw3 = thd.ackPolicyControl
         if lmacGateHalfword(actual.frameLen) == 0x0800'u16:
           let rateForDhcp = hostTxRateTemplate(linkDesc)
           nimFwDbgDhcpTxBufDesc = pointerAddrU32(actual.bufDesc)
@@ -2549,12 +2617,15 @@ proc txl_frame_push*(param: pointer, ac: uint8): uint8 {.exportc, cdecl, noinlin
   hwDesc.secondaryTxHwDescPtr = 0
   hwDesc.secondaryDescToStatusPadding = 0
   hwDesc.controlFlags = ctrlFlags
-  # Unicast data frames require MAC ACK policy bit 9; multicast/control paths do not.
+  # Unicast management and data frames require MAC ACK policy bit 9. Control
+  # and multicast/broadcast frames keep no-ACK policy.
   let typeBits = cast[uint8](hdr.frameControl and 0x000C'u16)  # bits [3:2]
   if typeBits == 4 or (hdr.addr1[0] and 1) != 0:
     hwDesc.ackPolicyControl = 0
-  else:
+  elif typeBits == 0 or typeBits == 8:
     hwDesc.ackPolicyControl = 512  # 0x200
+  else:
+    hwDesc.ackPolicyControl = 0
   hwDesc.confirmStatus = 0
   return txl_cntrl_push_int(param, ac)  # blob: tail-call txl_cntrl_push_int (not txl_cntrl_push)
 
@@ -2904,6 +2975,23 @@ var
   nimFwStaTxPreparedCenterFreq1: uint16
   nimFwStaTxPreparedCenterFreq2: uint16
 
+proc wifi_nimfw_apply_sta_tx_channel(
+    band: uint8,
+    chanType: uint8,
+    primaryFreq: uint16,
+    centerFreq1: uint16,
+    centerFreq2: uint16,
+    txPower: uint8
+  ) {.inline.} =
+  ## Keep the ad-hoc STA retune path aligned with chan_pre_switch_channel:
+  ## pending RX descriptors must be drained before the PHY moves, otherwise
+  ## the auth response can be missed after a successful auth TX ACK.
+  rxl_timer_int_handler()
+  rxl_cntrl_evt()
+  phySetChannel(band, chanType, primaryFreq, centerFreq1, centerFreq2, txPower)
+  tpc_update_tx_power(txPower)
+  regWrite(MACHW_BASE + 0x0DC'u, 0x1F0'u32)
+
 proc wifi_nimfw_prepare_sta_tx_channel*() {.exportc, cdecl.} =
   ## Restore the WiFi RF channel before STA TX when another radio user, such as
   ## BLE, may have borrowed the shared RF programming path.
@@ -2922,6 +3010,36 @@ proc wifi_nimfw_prepare_sta_tx_channel*() {.exportc, cdecl.} =
   if primaryFreq != 0'u16 and centerFreq1 != 0'u16:
     source = 1'u32
   if primaryFreq == 0'u16 or centerFreq1 == 0'u16:
+    let connInfo = sm.connectInfo
+    if connInfo != nil:
+      let vifIdx = connectInfoView(connInfo).vifIdx
+      let vif = vifChannelForIdx(vifIdx)
+      sourceVif = vifIdx.uint32 or
+        (vif.state.uint32 shl 8) or (vif.vifType.uint32 shl 16)
+      if vif.channelFreqPair != 0'u32:
+        if vif.chanCtxt != nil:
+          let ctxt = cast[ptr ChanCtxtView](vif.chanCtxt)
+          band = ctxt.channel.band
+          chanType = ctxt.channel.chanType
+          centerFreq2 = ctxt.channel.centerFreq2
+          txPower = ctxt.channel.txPower
+        primaryFreq = uint16(vif.channelFreqPair and 0xFFFF'u32)
+        centerFreq1 = uint16((vif.channelFreqPair shr 16) and 0xFFFF'u32)
+        if centerFreq1 == 0'u16:
+          centerFreq1 = primaryFreq
+        if txPower == 0'u8:
+          txPower = selectedMgmtTxPower().uint8
+        source = 5'u32
+      elif vif.chanCtxt != nil:
+        let ctxt = cast[ptr ChanCtxtView](vif.chanCtxt)
+        band = ctxt.channel.band
+        chanType = ctxt.channel.chanType
+        primaryFreq = ctxt.channel.primFreq
+        centerFreq1 = ctxt.channel.centerFreq1
+        centerFreq2 = ctxt.channel.centerFreq2
+        txPower = ctxt.channel.txPower
+        source = 4'u32
+  if primaryFreq == 0'u16 or centerFreq1 == 0'u16:
     for staTxChannelVifIndex in 0'u8 ..< MAX_VIFS.uint8:
       let vif = vifChannelForIdx(staTxChannelVifIndex)
       if vif.vifType == VIF_TYPE_STA and vif.state != 0'u8:
@@ -2939,8 +3057,18 @@ proc wifi_nimfw_prepare_sta_tx_channel*() {.exportc, cdecl.} =
           source = 2'u32
           break
         if vif.channelFreqPair != 0'u32:
+          if vif.chanCtxt != nil:
+            let ctxt = cast[ptr ChanCtxtView](vif.chanCtxt)
+            band = ctxt.channel.band
+            chanType = ctxt.channel.chanType
+            centerFreq2 = ctxt.channel.centerFreq2
+            txPower = ctxt.channel.txPower
           primaryFreq = uint16(vif.channelFreqPair and 0xFFFF'u32)
           centerFreq1 = uint16((vif.channelFreqPair shr 16) and 0xFFFF'u32)
+          if centerFreq1 == 0'u16:
+            centerFreq1 = primaryFreq
+          if txPower == 0'u8:
+            txPower = selectedMgmtTxPower().uint8
           source = 3'u32
           break
   nimFwDbgStaTxChannelSource = source
@@ -2949,14 +3077,9 @@ proc wifi_nimfw_prepare_sta_tx_channel*() {.exportc, cdecl.} =
     (band.uint32 shl 16) or (chanType.uint32 shl 24) or (txPower.uint32 shl 28)
   nimFwDbgStaTxChannelVif = sourceVif
   if primaryFreq != 0'u16 and centerFreq1 != 0'u16:
-    if nimFwBleWifiRoleWindowEnabled == 0'u32:
-      inc nimFwDbgStaTxRfRestore
-      wifi_hosal_rf_turn_on()
-      wifiRfCoreInit(40000000'u32)
-      phy_init(nil)
-      phySetChannel(band, chanType, primaryFreq, centerFreq1, centerFreq2, txPower)
-      return
-    let reclaimNeeded = nim_ble_coex_wifi_rf_reclaim_needed() != 0'u32
+    let reclaimNeeded =
+      nimFwBleWifiRoleWindowEnabled != 0'u32 and
+      nim_ble_coex_wifi_rf_reclaim_needed() != 0'u32
     let channelChanged =
       nimFwStaTxPreparedBand != band or
       nimFwStaTxPreparedChanType != chanType or
@@ -2965,12 +3088,13 @@ proc wifi_nimfw_prepare_sta_tx_channel*() {.exportc, cdecl.} =
       nimFwStaTxPreparedCenterFreq2 != centerFreq2
     if reclaimNeeded or channelChanged:
       inc nimFwDbgStaTxRfRestore
-      wifi_hosal_rf_turn_on()
       if reclaimNeeded:
+        wifi_hosal_rf_turn_on()
         inc nimFwDbgStaTxRfFullRestore
         wifiRfCoreInitMode(40000000'u32, wifiBleCoex)
         phy_init(nil)
-      phySetChannel(band, chanType, primaryFreq, centerFreq1, centerFreq2, txPower)
+      wifi_nimfw_apply_sta_tx_channel(band, chanType, primaryFreq,
+                                       centerFreq1, centerFreq2, txPower)
       nimFwStaTxPreparedBand = band
       nimFwStaTxPreparedChanType = chanType
       nimFwStaTxPreparedPrimaryFreq = primaryFreq

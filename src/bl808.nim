@@ -14,6 +14,9 @@ when not defined(bl808m0) and not defined(bl808d0) and not defined(bl808lp):
 import bl808/mmio;    export mmio
 import bl808/memmap;  export memmap
 import bl808/core;    export core
+when defined(bl808d0):
+  import bl808/mmu;   export mmu
+  import bl808/vm;    export vm
 
 # Clock and system control
 import bl808/glb;     export glb

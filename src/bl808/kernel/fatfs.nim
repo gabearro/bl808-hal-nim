@@ -1,7 +1,7 @@
 ## FatFs integration for the BL808 kernel.
 ##
-## Provides a thin Nim wrapper over ChaN's FatFs library for
-## FAT32 filesystem access on SD cards:
+## Provides a thin Nim wrapper over ChaN's FatFs library for FAT/exFAT
+## filesystem access on SD cards:
 ##
 ##   var fs: SdFs
 ##   fs.init()
@@ -11,6 +11,7 @@
 ##   fs.close(f)
 
 import ./sdblk
+import ./rtc
 
 # =============================================================================
 # Compile FatFs
@@ -30,11 +31,12 @@ type
   Dir* {.importc: "DIR", header: "ff.h", incompleteStruct.} = object
 
   Filinfo* {.importc: "FILINFO", header: "ff.h".} = object
-    fsize* {.importc: "fsize".}: uint32
+    fsize* {.importc: "fsize".}: uint64
     fdate* {.importc: "fdate".}: uint16
     ftime* {.importc: "ftime".}: uint16
     fattrib* {.importc: "fattrib".}: uint8
-    fname* {.importc: "fname".}: array[13, char]  # 8.3 name
+    altname* {.importc: "altname".}: array[13, char]
+    fname* {.importc: "fname".}: array[256, char]
 
   FResult* {.importc: "FRESULT", header: "ff.h".} = enum
     frOk = 0
@@ -96,7 +98,7 @@ proc f_write*(fp: ptr Fil, buff: pointer, btw: cuint,
               bw: ptr cuint): FResult
   {.importc, header: "ff.h", cdecl.}
 
-proc f_lseek*(fp: ptr Fil, ofs: uint32): FResult
+proc f_lseek*(fp: ptr Fil, ofs: uint64): FResult
   {.importc, header: "ff.h", cdecl.}
 
 proc f_sync*(fp: ptr Fil): FResult
@@ -140,7 +142,10 @@ type
 var mkfsWork: array[512, uint8]
 
 proc init*(fs: var SdFs) =
-  ## Mount the SD card filesystem, formatting FAT32 if needed.
+  ## Mount the SD card filesystem, formatting if needed.
+  ##
+  ## Prefer `mount` when the caller is managing removable media and should not
+  ## format on failure.
   let err = f_mount(addr fs.fatfs, "0:", 1)
   if err == frOk:
     fs.mounted = true
@@ -152,6 +157,11 @@ proc init*(fs: var SdFs) =
   let err2 = f_mount(addr fs.fatfs, "0:", 1)
   if err2 == frOk:
     fs.mounted = true
+
+proc mount*(fs: var SdFs): FResult =
+  ## Mount an existing SD card filesystem without formatting on failure.
+  result = f_mount(addr fs.fatfs, "0:", 1)
+  fs.mounted = result == frOk
 
 proc deinit*(fs: var SdFs) =
   if fs.mounted:
@@ -177,15 +187,15 @@ proc write*(fs: var SdFs, f: var Fil,
   let err = f_write(addr f, unsafeAddr data[0], data.len.cuint, addr bw)
   if err != frOk: -1 else: bw.int
 
-proc seek*(fs: var SdFs, f: var Fil, offset: uint32): FResult =
+proc seek*(fs: var SdFs, f: var Fil, offset: uint64): FResult =
   f_lseek(addr f, offset)
 
 proc sync*(fs: var SdFs, f: var Fil): FResult =
   f_sync(addr f)
 
-proc f_size_helper(fp: ptr Fil): uint32 {.importc: "f_size", header: "ff.h".}
+proc f_size_helper(fp: ptr Fil): uint64 {.importc: "f_size", header: "ff.h".}
 
-proc size*(f: var Fil): uint32 =
+proc size*(f: var Fil): uint64 =
   f_size_helper(addr f)
 
 proc remove*(fs: var SdFs, path: string): FResult =

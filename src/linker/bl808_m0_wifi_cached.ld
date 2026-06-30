@@ -47,6 +47,8 @@ SECTIONS
     .data : ALIGN(4)
     {
         _sdata = .;
+        *(.ramfunc .ramfunc.*)
+        . = ALIGN(4);
         *(.data .data.*)
         *(.sdata .sdata.*)
         . = ALIGN(4);

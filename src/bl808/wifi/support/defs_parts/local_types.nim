@@ -12,6 +12,7 @@ type
     cipher: uint8
   ScanCacheItem = object
     used: uint8
+    failCount: uint8
     ssidLen: uint8
     ssid: array[33, uint8]
     bssid: array[6, uint8]

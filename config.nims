@@ -55,14 +55,20 @@ when defined(bl808m0):
   switch("passL", "-nostdlib -nostartfiles -static")
   switch("passL", "-Wl,--gc-sections")
   when defined(bl808jtagram):
-    when defined(bl808M0JtagFullRam):
+    when defined(bl808M0CachedRam):
+      switch("passL", "-T src/linker/bl808_m0_ram_cached.ld")
+    elif defined(bl808M0JtagFullRam):
       switch("passL", "-T src/linker/bl808_m0_ram_full.ld")
     else:
       switch("passL", "-T src/linker/bl808_m0_ram.ld")
+  elif defined(bl808AllcoreWasmHttp):
+    switch("passL", "-T src/linker/bl808_m0_allcore_http.ld")
   elif defined(bl808WifiCachedBss):
     switch("passL", "-T src/linker/bl808_m0_wifi_cached.ld")
   elif defined(bl808WifiNimFw):
     switch("passL", "-T src/linker/bl808_m0_wifi.ld")
+  elif defined(bl808EnclaveWram):
+    switch("passL", "-T src/linker/bl808_m0_enclave_wram.ld")
   elif defined(bl808enclave):
     switch("passL", "-T src/linker/bl808_m0_enclave.ld")
   elif defined(bl808puf):

@@ -18,15 +18,22 @@ proc bl808WifiBackendTrace(step: cstring) =
 
 proc bl808WifiBackendFwStart() =
   if fwStarted: return
+  bl808WifiBackendTrace("fw_start setup_bl_ops")
   setupBlOps()
+  bl808WifiBackendTrace("fw_start setup_hosal")
   setupHosal()
+  bl808WifiBackendTrace("fw_start wireless_domain_reset")
+  bl808WifiBackendPrepareWirelessDomain(forceReset = true)
+  bl808WifiBackendTrace("fw_start clock_enable")
   discard bl_wifi_clock_enable()
+  bl808WifiBackendTrace("fw_start intc_toggle_begin")
   let irqState = osEnterCritical()
   regWrite32(IntcPend, regRead32(IntcPend) or 0x10)
   arch_delay_us(100)
   regWrite32(IntcPend, regRead32(IntcPend) and not 0x10'u32)
   arch_delay_us(100)
   osExitCritical(irqState)
+  bl808WifiBackendTrace("fw_start intc_toggle_done")
   bl808WifiBackendTrace("wifi_hosal_rf_turn_on begin")
   discard wifi_hosal_rf_turn_on(nil)
   bl808WifiBackendTrace("wifi_hosal_rf_turn_on done")

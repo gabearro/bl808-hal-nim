@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import hashlib
 import inspect
 import struct
 import zlib
@@ -21,6 +22,13 @@ BOOTHEADER_CPU_CFG_SIZE = 24
 BOOTHEADER_PT0_OFFSET = 0x0F4
 BOOTHEADER_PT1_OFFSET = 0x0F8
 BOOTHEADER_CRC_OFFSET = 0x15C
+BOOTHEADER_BOOTCFG_OFFSET = 0x080
+BOOTHEADER_HASH_OFFSET = BOOTHEADER_BOOTCFG_OFFSET + 16
+BOOTHEADER_M0_BOOT_ENTRY_OFFSET = 0x0C0
+BOOTHEADER_M0_IMAGE_ADDRESS_OFFSET = 0x0BC
+BOOTCFG_IMG_LEN_COUNT_OFFSET = BOOTHEADER_BOOTCFG_OFFSET + 12
+BOOTCFG_NO_SEGMENT_MASK = 1 << 8
+SEGMENT_HEADER_SIZE = 16
 
 FLASH_OFFSET_BOOT2 = 0x000000
 FLASH_OFFSET_PT0 = 0x00E000
@@ -29,6 +37,10 @@ FLASH_OFFSET_FW = 0x010000
 FLASH_OFFSET_LP = 0x020000
 FLASH_OFFSET_D0 = 0x100000
 FLASH_XIP_BASE = 0x58000000
+FLASH_XIP_SIZE = 0x04000000
+M0_CACHED_RAM_BASE = 0x62020000
+M0_UNCACHED_RAM_BASE = 0x22020000
+M0_RAM_ALIAS_SIZE = 0x00038000
 
 
 def bootheader_crc32(data: bytes) -> int:
@@ -79,11 +91,40 @@ def find_default_fw_bootinfo_template() -> Path | None:
     return None
 
 
-def build_fw_image(raw_fw: bytes, template_path: Path | None) -> bytes:
+def is_flash_xip_address(address: int) -> bool:
+    return FLASH_XIP_BASE <= address < FLASH_XIP_BASE + FLASH_XIP_SIZE
+
+
+def m0_segment_load_address(entry: int) -> int:
+    if M0_CACHED_RAM_BASE <= entry < M0_CACHED_RAM_BASE + M0_RAM_ALIAS_SIZE:
+        return M0_UNCACHED_RAM_BASE + (entry - M0_CACHED_RAM_BASE)
+    return entry
+
+
+def build_bl808_segment(load_address: int, payload: bytes) -> bytes:
+    padded_payload = payload + (b"\x00" * ((-len(payload)) % 16))
+    header = bytearray(SEGMENT_HEADER_SIZE - 4)
+    struct.pack_into(
+        "<III",
+        header,
+        0,
+        load_address,
+        len(padded_payload),
+        bootheader_crc32(padded_payload),
+    )
+    return bytes(header) + bootheader_crc32(header).to_bytes(4, "little") + padded_payload
+
+
+def build_fw_image(
+    raw_fw: bytes,
+    template_path: Path | None,
+    *,
+    m0_boot_entry: int | None = None,
+) -> bytes:
     if len(raw_fw) >= 12:
-      magic, _, flash_cfg_magic = struct.unpack_from("<III", raw_fw)
-      if magic == BOOTHEADER_MAGIC_BFNP and flash_cfg_magic == BOOTHEADER_FLASH_CFG_MAGIC:
-          return raw_fw
+        magic, _, flash_cfg_magic = struct.unpack_from("<III", raw_fw)
+        if magic == BOOTHEADER_MAGIC_BFNP and flash_cfg_magic == BOOTHEADER_FLASH_CFG_MAGIC:
+            return raw_fw
 
     if template_path is None:
         template_path = find_default_fw_bootinfo_template()
@@ -100,9 +141,49 @@ def build_fw_image(raw_fw: bytes, template_path: Path | None) -> bytes:
     if magic != BOOTHEADER_MAGIC_BFNP or flash_cfg_magic != BOOTHEADER_FLASH_CFG_MAGIC:
         raise ValueError(f"FW bootinfo template is not a BL808 BFNP header: {template_path}")
 
-    padded_fw = raw_fw + (b"\x00" * ((-len(raw_fw)) % 16))
-    bootinfo[0x8C:0x90] = len(padded_fw).to_bytes(4, "little")
-    return bytes(bootinfo) + (b"\xFF" * (FW_BOOTINFO_SIZE - len(bootinfo))) + padded_fw
+    if m0_boot_entry is not None and not is_flash_xip_address(m0_boot_entry):
+        load_address = m0_segment_load_address(m0_boot_entry)
+        fw_body = build_bl808_segment(load_address, raw_fw)
+        bootcfg = int.from_bytes(
+            bootinfo[BOOTHEADER_BOOTCFG_OFFSET:BOOTHEADER_BOOTCFG_OFFSET + 4],
+            "little",
+        )
+        bootcfg &= ~BOOTCFG_NO_SEGMENT_MASK
+        bootinfo[BOOTHEADER_BOOTCFG_OFFSET:BOOTHEADER_BOOTCFG_OFFSET + 4] = (
+            bootcfg.to_bytes(4, "little")
+        )
+        bootinfo[BOOTCFG_IMG_LEN_COUNT_OFFSET:BOOTCFG_IMG_LEN_COUNT_OFFSET + 4] = (
+            (1).to_bytes(4, "little")
+        )
+        bootinfo[BOOTHEADER_M0_IMAGE_ADDRESS_OFFSET:
+                 BOOTHEADER_M0_IMAGE_ADDRESS_OFFSET + 4] = (
+            load_address.to_bytes(4, "little")
+        )
+    else:
+        fw_body = raw_fw + (b"\x00" * ((-len(raw_fw)) % 16))
+        bootinfo[BOOTCFG_IMG_LEN_COUNT_OFFSET:BOOTCFG_IMG_LEN_COUNT_OFFSET + 4] = (
+            len(fw_body).to_bytes(4, "little")
+        )
+        if m0_boot_entry is not None:
+            bootinfo[BOOTHEADER_M0_IMAGE_ADDRESS_OFFSET:
+                     BOOTHEADER_M0_IMAGE_ADDRESS_OFFSET + 4] = (
+                (m0_boot_entry - FLASH_XIP_BASE).to_bytes(4, "little")
+            )
+    if m0_boot_entry is not None:
+        bootinfo[BOOTHEADER_M0_BOOT_ENTRY_OFFSET:
+                 BOOTHEADER_M0_BOOT_ENTRY_OFFSET + 4] = (
+            m0_boot_entry.to_bytes(4, "little")
+        )
+    bootinfo[BOOTHEADER_HASH_OFFSET:BOOTHEADER_HASH_OFFSET + 32] = (
+        hashlib.sha256(fw_body).digest()
+    )
+    struct.pack_into(
+        "<I",
+        bootinfo,
+        BOOTHEADER_CRC_OFFSET,
+        bootheader_crc32(bootinfo[:BOOTHEADER_CRC_OFFSET]),
+    )
+    return bytes(bootinfo) + (b"\xFF" * (FW_BOOTINFO_SIZE - len(bootinfo))) + fw_body
 
 
 def build_partition_table(*, age: int, fw_start: int, fw_max_len: int) -> bytes:
@@ -143,6 +224,8 @@ def parse_args() -> argparse.Namespace:
                         help="Primary M0 firmware .bin, raw or with a BL808 FW header")
     parser.add_argument("--fw-bootinfo-template", type=Path,
                         help="BL808 bootinfo.bin template used when --fw is raw")
+    parser.add_argument("--m0-boot-entry", type=lambda s: int(s, 0),
+                        help="Override the M0 boot-entry word in generated FW bootinfo")
     parser.add_argument("--lp", type=Path,
                         help="Optional LP firmware .bin placed at 0x20000")
     parser.add_argument("--d0", type=Path,
@@ -169,7 +252,11 @@ def main() -> int:
         pt0_offset=FLASH_OFFSET_PT0,
         pt1_offset=FLASH_OFFSET_PT1,
     )
-    fw = build_fw_image(args.fw.read_bytes(), args.fw_bootinfo_template)
+    fw = build_fw_image(
+        args.fw.read_bytes(),
+        args.fw_bootinfo_template,
+        m0_boot_entry=args.m0_boot_entry,
+    )
     pt = build_partition_table(age=1, fw_start=args.fw_offset,
                                fw_max_len=args.fw_max_len)
     lp = args.lp.read_bytes() if args.lp else None

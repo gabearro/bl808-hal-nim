@@ -40,6 +40,9 @@ proc validates(): bool =
   var pc: uint32
   enclaveValidateHbnResume(pc)
 
+proc rearm(): bool =
+  enclaveArmHbnResume(ResumeEntry, AppResumePc)
+
 proc main() {.exportc, cdecl.} =
   systemInit()
   heapInit()
@@ -70,32 +73,49 @@ proc main() {.exportc, cdecl.} =
   let ok = enclaveValidateHbnResume(pc)
   check("genuine resume descriptor validates", ok)
   check("validated app resume PC matches", pc == AppResumePc)
+  check("successful consume clears descriptor", not enclaveHbnResumeArmed())
   kv("[M0] resume PC = ", pc)
 
   # Tamper 1: flip the app resume PC -> MAC must reject.
+  check("re-arm for app PC tamper", rearm())
   let savedPc = slot().appResumePc
   slot().appResumePc = savedPc xor 0x100'u32
   fenceIo()
   check("tampered app PC rejected", not validates())
-  slot().appResumePc = savedPc; fenceIo()
-  check("restore -> validates again", validates())
+  check("tampered app PC clears descriptor", not enclaveHbnResumeArmed())
 
   # Tamper 2: flip the trusted resume entry -> reject.
+  check("re-arm for resume entry tamper", rearm())
   let savedEntry = slot().resumeEntry
   slot().resumeEntry = savedEntry xor 0xABCD'u32
   fenceIo()
   check("tampered resume entry rejected", not validates())
-  slot().resumeEntry = savedEntry; fenceIo()
+  check("tampered resume entry clears descriptor", not enclaveHbnResumeArmed())
 
   # Tamper 3: flip one MAC tag byte -> reject.
+  check("re-arm for tag tamper", rearm())
   let savedTag0 = slot().tag[0]
   slot().tag[0] = savedTag0 xor 0xFF'u8
   fenceIo()
   check("tampered MAC tag rejected", not validates())
-  slot().tag[0] = savedTag0; fenceIo()
-  check("restore tag -> validates again", validates())
+  check("tampered tag clears descriptor", not enclaveHbnResumeArmed())
+
+  # Tamper 4: authenticated descriptor with stale boot measurement -> reject.
+  check("re-arm for boot measurement mismatch", rearm())
+  slot().bootMeas[0] = slot().bootMeas[0] xor 0x1'u8
+  fenceIo()
+  check("boot measurement mismatch rejected", not validates())
+  check("boot measurement mismatch clears descriptor", not enclaveHbnResumeArmed())
+
+  # Tamper 5: HbnRsv1 must still match the authenticated resume entry.
+  check("re-arm for HbnRsv1 mismatch", rearm())
+  regWrite(HbnRsv1, ResumeEntry xor 0x1000'u32)
+  fenceIo()
+  check("HbnRsv1 mismatch rejected", not validates())
+  check("HbnRsv1 mismatch clears descriptor", not enclaveHbnResumeArmed())
 
   # Clear disarms the fast path and invalidates the descriptor.
+  discard rearm()
   enclaveClearHbnResume()
   check("clear disarms warm-boot magic", not hbnWarmBootMagicArmed())
   check("clear invalidates descriptor", not enclaveHbnResumeArmed())

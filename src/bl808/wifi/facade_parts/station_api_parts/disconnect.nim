@@ -23,6 +23,23 @@ proc wifiIssueDisconnectAsync(timeoutMs: uint32 = 10_000): CpsFuture[WifiError] 
 proc wifiDisconnect*(): WifiError =
   wifiBackendPoll(8)
   if not wifiBackendConnected():
+    if not wifiNimFirmwareStaIdle():
+      let abortStatus = wifiBackendStaConnectAbort()
+      if abortStatus != 0:
+        wifiNimFirmwareForceStaIdle()
+        wifiBackendPoll(64)
+        if wifiNimFirmwareStaIdle():
+          return wifiOk
+        return wifiFail
+      for _ in 0 ..< 4000:
+        wifiBackendPoll(8)
+        if wifiNimFirmwareStaIdle():
+          return wifiOk
+      wifiNimFirmwareForceStaIdle()
+      wifiBackendPoll(64)
+      if wifiNimFirmwareStaIdle():
+        return wifiOk
+      return wifiFail
     return wifiOk
   if wifiNimFirmwareDisconnectNeedsDrain():
     wifiDisconnectTrace("[DC] enter\n")
@@ -59,7 +76,7 @@ proc wifiDisconnectAsync*(timeoutMs: uint32 = 10_000): CpsFuture[WifiError] =
     return failedLocalFuture[WifiError](
       newException(CatchableError, "WiFi disconnect already pending"))
   wifiServicePump()
-  if not wifiBackendConnected():
+  if not wifiBackendConnected() and wifiNimFirmwareStaIdle():
     return completedLocalFuture(wifiOk)
   if wifiBackendUsesEventFutures():
     if wifiStaIdleFuture != nil and not wifiStaIdleFuture.finished:

@@ -102,9 +102,8 @@ proc main() {.exportc, cdecl.} =
   # 1. Seal a blob, then scan for leaks.
   block:
     let bc = sharedBufLen().int
-    for i in 0 ..< 16: b[i] = (0x10 + i).uint8                 # nonce
-    for i in 0 ..< 32: b[16 + i] = (0xC0 + i).uint8            # plaintext
-    let (st, rl) = enclaveDispatch(svcSealBlob, 48, b, bc)
+    for i in 0 ..< 32: b[i] = (0xC0 + i).uint8                 # plaintext
+    let (st, rl) = enclaveDispatch(svcSealBlob, 32, b, bc)
     check("svcSealBlob ok", st == svcOk and rl > 0)
     scanAll("after seal")
 

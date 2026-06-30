@@ -44,7 +44,9 @@ proc reconstructRoot*(windowAddr: uint, helperData: PufHelper,
     sha256Update(salt, [ (idx and 0xFF).uint8, ((idx shr 8) and 0xFF).uint8 ])
   let saltDigest = sha256Final(salt)
   var okm: array[32, uint8]
-  hkdf(saltDigest, packed, PufInfo, 32, okm)
+  if not hkdf(saltDigest, packed, PufInfo, 32, okm):
+    for i in 0 ..< 32: root[i] = 0
+    return
   for i in 0 ..< 32: root[i] = okm[i]
 
 proc vaultInitPufRoot*(helperData: PufHelper, windowAddr: uint,

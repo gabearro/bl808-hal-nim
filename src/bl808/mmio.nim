@@ -9,9 +9,17 @@ proc regRead*(address: uint): uint32 {.inline.} =
   ## Read a 32-bit memory-mapped register.
   volatileLoad(cast[ptr uint32](address))
 
+proc regRead16*(address: uint): uint16 {.inline.} =
+  ## Read a 16-bit memory-mapped register.
+  volatileLoad(cast[ptr uint16](address))
+
 proc regWrite*(address: uint, value: uint32) {.inline.} =
   ## Write a 32-bit memory-mapped register.
   volatileStore(cast[ptr uint32](address), value)
+
+proc regWrite16*(address: uint, value: uint16) {.inline.} =
+  ## Write a 16-bit memory-mapped register.
+  volatileStore(cast[ptr uint16](address), value)
 
 proc regSet*(address: uint, mask: uint32) {.inline.} =
   ## Set bits in a register (read-modify-write).

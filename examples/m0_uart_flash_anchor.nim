@@ -5,7 +5,7 @@
 
 import bl808/startup
 import bl808/mmio
-import bl808/glb, bl808/gpio, bl808/uart, bl808/flash
+import bl808/glb, bl808/gpio, bl808/uart, bl808/flash, bl808/cache, bl808/core
 
 const
   ConsoleUartTxPin = 14'u32
@@ -19,6 +19,7 @@ const
   CmdReadId = 1'u32
   CmdErase = 2'u32
   CmdWriteVerify = 3'u32
+  CmdReboot = 4'u32
   ErrOk = 0'u32
   ErrBadCommand = 1'u32
   ErrBadLength = 2'u32
@@ -29,6 +30,7 @@ const
   SfCtrlCfg1OwnerIahb = 1'u32 shl 28
   SfCtrlCfg1IfEn = 1'u32 shl 29
   SfCtrlCfg1Ahb2SifEn = 1'u32 shl 30
+  WholeChipReset = 1'u32 shl 5
 
 type
   Request = object
@@ -44,8 +46,15 @@ var
 proc spin() {.inline.} =
   discard regRead(GlbSocInfo0)
 
+proc delayCycles(count: uint32) =
+  for _ in 0'u32 ..< count:
+    asm """
+      nop
+    """
+
 proc sendBanner() =
   discard console.sendLine("BL808-UART-FLASH-ANCHOR v1")
+  console.flushTx()
 
 proc claimSfController() =
   var cfg1 = regRead(SfCtrlCfg1)
@@ -138,9 +147,8 @@ proc writeVerify(address, length, expectedChecksum: uint32): uint32 =
     return ErrChecksum
   if flashWrite(address, dataBuf.toOpenArray(0, length.int - 1)) != flashOk:
     return ErrTimeout
-  for i in 0 ..< length.int:
-    if flashReadXipByte(address + i.uint32) != dataBuf[i]:
-      return ErrVerify
+  if not flashRawMatches(address, dataBuf.toOpenArray(0, length.int - 1)):
+    return ErrVerify
   ErrOk
 
 proc sendResponse(status, value, counter: uint32) =
@@ -148,8 +156,33 @@ proc sendResponse(status, value, counter: uint32) =
   sendU32(status)
   sendU32(value)
   sendU32(counter)
+  console.flushTx()
+
+proc prepareForSoftReboot() =
+  discard l1cInvalidateAll()
+  cciFlushAll()
+  fenceIo()
+  fenceI()
+
+proc rebootChip() =
+  prepareForSoftReboot()
+  var value = regRead(GlbSwrstCfg2)
+  value = value and not WholeChipReset
+  regWrite(GlbSwrstCfg2, value)
+  delayCycles(1000)
+  value = value or WholeChipReset
+  regWrite(GlbSwrstCfg2, value)
+  delayCycles(1000)
+  value = value and not WholeChipReset
+  regWrite(GlbSwrstCfg2, value)
+  while true:
+    asm """
+      wfi
+    """
 
 proc main() {.exportc, cdecl.} =
+  systemInit()
+
   enablePeriphClock(periphUart0)
   setMcuXclkSource(mcuXclkXtal)
   setUartClock(true, uartClkXclk, 0)
@@ -160,14 +193,14 @@ proc main() {.exportc, cdecl.} =
     stopBits: stop1,
     parity: parityNone,
   ), ConsoleClkHz)
-  claimSfController()
-
   sendBanner()
+  claimSfController()
   while true:
     var req: Request
     recvRequest(req)
     var status = ErrOk
     var value = 0'u32
+    var rebootAfterResponse = false
     if req.headerChecksum != headerChecksum(req.command, req.address, req.length):
       status = ErrChecksum
     else:
@@ -184,6 +217,11 @@ proc main() {.exportc, cdecl.} =
       of CmdWriteVerify:
         let payloadChecksum = recvU32()
         status = writeVerify(req.address, req.length, payloadChecksum)
+      of CmdReboot:
+        rebootAfterResponse = true
       else:
         status = ErrBadCommand
     sendResponse(status, value, req.address + req.length)
+    if rebootAfterResponse:
+      delayCycles(100_000_000)
+      rebootChip()

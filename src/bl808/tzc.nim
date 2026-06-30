@@ -20,6 +20,8 @@ const
   # Secure controller, BMX master/slave grouping
   TzcSecBmxTzmid*      = TzcSecBase + 0x100'u
   TzcSecBmxTzmidLock*  = TzcSecBase + 0x104'u
+  TzcNsecBmxTzmid*     = TzcNsecBase + 0x100'u
+  TzcNsecBmxTzmidLock* = TzcNsecBase + 0x104'u
   TzcSecBmxS0*         = TzcSecBase + 0x108'u
   TzcSecBmxS1*         = TzcSecBase + 0x10C'u
   TzcSecBmxS2*         = TzcSecBase + 0x110'u
@@ -52,10 +54,15 @@ const
   TzcSecSfR2*          = TzcSecBase + 0x290'u
   TzcSecSfR3*          = TzcSecBase + 0x294'u
   TzcSecSfRMsb*        = TzcSecBase + 0x298'u
+  TzcNsecSfCtrl*       = TzcNsecBase + 0x280'u
+  TzcNsecSfR0*         = TzcNsecBase + 0x288'u
+  TzcNsecSfRMsb*       = TzcNsecBase + 0x298'u
 
   # Secure controller, MM domain windows
   TzcSecMmBmxTzmid*    = TzcSecBase + 0x300'u
   TzcSecMmBmxTzmidLock* = TzcSecBase + 0x304'u
+  TzcNsecMmBmxTzmid*   = TzcNsecBase + 0x300'u
+  TzcNsecMmBmxTzmidLock* = TzcNsecBase + 0x304'u
   TzcSecMmBmxS0*       = TzcSecBase + 0x308'u
   TzcSecMmBmxS1*       = TzcSecBase + 0x30C'u
   TzcSecMmBmxS2*       = TzcSecBase + 0x310'u
@@ -95,6 +102,8 @@ const
   TzcSecSeCtrl0*       = TzcSecBase + 0xF40'u
   TzcSecSeCtrl1*       = TzcSecBase + 0xF44'u
   TzcSecSeCtrl2*       = TzcSecBase + 0xF48'u
+  TzcNsecSeCtrl1*      = TzcNsecBase + 0xF44'u
+  TzcNsecSeCtrl2*      = TzcNsecBase + 0xF48'u
 
 # =============================================================================
 # TZC field constants
@@ -108,6 +117,8 @@ const
   TzcRomSbootDoneMask* = 0x0F'u32 shl TzcRomSbootDoneShift
   TzcBusRemapEn*       = 22'u32
   TzcBusRemapLock*     = 23'u32
+  TzcSfTzsidCtrlMode*  = 4'u32
+  TzcSfTzsidCtrlModeLock* = 18'u32
 
 type
   TzcRegion* = range[0..3]
@@ -252,7 +263,8 @@ type
     tzcSfSec      ## SF_CTRL security (XIP AES) register group
 
   TzcWindow* = enum
-    tzcWinRom, tzcWinOcram, tzcWinWram, tzcWinXram, tzcWinSf
+    tzcWinRom, tzcWinOcram, tzcWinWram, tzcWinXram, tzcWinSf,
+    tzcWinPsramA, tzcWinPsramB
 
   TzcWindowDesc = object
     ctrl, r0, msb: uint   ## register addresses (msb = 0 when the window has none)
@@ -271,6 +283,10 @@ const TzcWindows: array[TzcWindow, TzcWindowDesc] = [
                              regions: 3, idWidth: 2, enShift: 16, lockShift: 24),
   tzcWinSf:    TzcWindowDesc(ctrl: TzcSecSfCtrl,    r0: TzcSecSfR0,    msb: TzcSecSfRMsb,
                              regions: 4, idWidth: 4, enShift: 20, lockShift: 25),
+  tzcWinPsramA: TzcWindowDesc(ctrl: TzcSecPsramACtrl, r0: TzcSecPsramAR0, msb: 0,
+                              regions: 3, idWidth: 4, enShift: 16, lockShift: 20),
+  tzcWinPsramB: TzcWindowDesc(ctrl: TzcSecPsramBCtrl, r0: TzcSecPsramBR0, msb: 0,
+                              regions: 3, idWidth: 4, enShift: 16, lockShift: 20),
 ]
 
 proc tzcGroupField(groups: set[TzcAuthGroup], width: uint32): uint32 =
@@ -338,6 +354,72 @@ proc tzcWindowRegionEnabled*(window: TzcWindow, region: int): bool =
     return false
   (regRead(d.ctrl) and (1'u32 shl (d.enShift + region.uint32))) != 0
 
+proc tzcSetSfRegionXGroups*(groups: set[TzcAuthGroup], lock = false) =
+  ## Configure the serial-flash fallback region (region x). Hardware uses this
+  ## policy for SF accesses that do not hit regions 0..3.
+  let field = tzcGroupField(groups, 2)
+  regModify(TzcSecSfCtrl, 0xF'u32 shl 16, field shl 16)
+  var ctrl = regRead(TzcSecSfCtrl) or (1'u32 shl 24)
+  if lock:
+    ctrl = ctrl or (1'u32 shl 29)
+  regWrite(TzcSecSfCtrl, ctrl)
+
+proc tzcConfigureNsecSfRegion*(region: int, startAddr, length: uint32,
+                               groups: set[TzcAuthGroup], lock = false): bool =
+  ## Program one non-secure serial-flash address region. LP XIP fetches can be
+  ## checked by TZC_NSEC after the LP master is moved out of the secure group.
+  if region < 0 or region >= 4:
+    return false
+  let r = region.uint32
+  let field = tzcGroupField(groups, 4)
+  regModify(TzcNsecSfCtrl, 0xF'u32 shl (r * 4), field shl (r * 4))
+  regWrite(TzcNsecSfR0 + region.uint * 4'u, tzcPackWindow(startAddr, length, 10))
+
+  let alignEnd = (startAddr + length + 1023'u32) and not 0x3FF'u32
+  let ext = ((alignEnd shr 26) and 0x7'u32) or
+            (((startAddr shr 26) and 0x7'u32) shl 3)
+  let keep = regRead(TzcNsecSfRMsb) and not (0xFF'u32 shl (8'u32 * r))
+  regWrite(TzcNsecSfRMsb, keep or (ext shl (8'u32 * r)))
+
+  var ctrl = regRead(TzcNsecSfCtrl) or (1'u32 shl (20'u32 + r))
+  if lock:
+    ctrl = ctrl or (1'u32 shl (25'u32 + r))
+  regWrite(TzcNsecSfCtrl, ctrl)
+  true
+
+proc tzcSetNsecSfRegionXGroups*(groups: set[TzcAuthGroup], lock = false) =
+  ## Configure the non-secure serial-flash fallback region.
+  let field = tzcGroupField(groups, 2)
+  regModify(TzcNsecSfCtrl, 0xF'u32 shl 16, field shl 16)
+  var ctrl = regRead(TzcNsecSfCtrl) or (1'u32 shl 24)
+  if lock:
+    ctrl = ctrl or (1'u32 shl 29)
+  regWrite(TzcNsecSfCtrl, ctrl)
+
+proc tzcSetNsecSfCtrlGroups*(blk: TzcSfCtrlBlock, groups: set[TzcAuthGroup],
+                             lock = false) =
+  ## Allow one or both auth groups to reach a non-secure SF_CTRL register group.
+  var field = 0'u32
+  for g in groups:
+    if g.uint32 <= 1:
+      field = field or (1'u32 shl g.uint32)
+  let i = blk.ord.uint32
+  regModify(TzcNsecSeCtrl1, 0x3'u32 shl (i * 2), field shl (i * 2))
+  if lock:
+    regSet(TzcNsecSeCtrl2, 1'u32 shl (i + 16))
+
+proc tzcSetNsecSfCtrlModeTzc*(lock = false) =
+  ## Route non-secure serial-flash TZSID checks through the TZC policy fields.
+  regSet(TzcNsecSeCtrl1, 1'u32 shl TzcSfTzsidCtrlMode)
+  if lock:
+    regSet(TzcNsecSeCtrl2, 1'u32 shl TzcSfTzsidCtrlModeLock)
+
+proc tzcSetNsecSfCtrlModeArb*(lock = false) =
+  ## Route non-secure serial-flash TZSID checks through the SF arbiter source.
+  regClear(TzcNsecSeCtrl1, 1'u32 shl TzcSfTzsidCtrlMode)
+  if lock:
+    regSet(TzcNsecSeCtrl2, 1'u32 shl TzcSfTzsidCtrlModeLock)
+
 proc tzcSetMasterGroup*(master: TzcMaster, group: TzcAuthGroup, lock = false) =
   ## Assign a bus master to auth group 0 or 1. Always sets the per-master
   ## write-confirm bit so the assignment takes effect; locks separately.
@@ -358,6 +440,34 @@ proc tzcSetMasterGroup*(master: TzcMaster, group: TzcAuthGroup, lock = false) =
     v = v or (1'u32 shl (bit + 16))
     regWrite(TzcSecMmBmxTzmid, v)
     if lock: regSet(TzcSecMmBmxTzmidLock, 1'u32 shl bit)
+
+proc tzcSetNsecMasterGroup*(master: TzcMaster, group: TzcAuthGroup,
+                            lock = false) =
+  ## Assign a bus master in the non-secure TZC bank. Some paths, including LP
+  ## XIP fetches, are checked by TZC_NSEC after a core leaves group 0.
+  let m = master.ord
+  if m < tzcMasterD0.ord:
+    let bit = m.uint32
+    var v = regRead(TzcNsecBmxTzmid)
+    if group == 0: v = v and not (1'u32 shl bit)
+    else:          v = v or (1'u32 shl bit)
+    v = v or (1'u32 shl (bit + 16))
+    regWrite(TzcNsecBmxTzmid, v)
+    if lock: regSet(TzcNsecBmxTzmidLock, 1'u32 shl bit)
+  else:
+    let bit = (m - tzcMasterD0.ord).uint32
+    var v = regRead(TzcNsecMmBmxTzmid)
+    if group == 0: v = v and not (1'u32 shl bit)
+    else:          v = v or (1'u32 shl bit)
+    v = v or (1'u32 shl (bit + 16))
+    regWrite(TzcNsecMmBmxTzmid, v)
+    if lock: regSet(TzcNsecMmBmxTzmidLock, 1'u32 shl bit)
+
+proc tzcSetMasterGroupAll*(master: TzcMaster, group: TzcAuthGroup,
+                           lock = false) =
+  ## Keep secure and non-secure TZC master tables in step.
+  tzcSetMasterGroup(master, group, lock = lock)
+  tzcSetNsecMasterGroup(master, group, lock = lock)
 
 proc tzcMasterGroup*(master: TzcMaster): TzcAuthGroup =
   ## Read back a master's current auth group (for verification).
@@ -385,11 +495,50 @@ proc tzcSetSlaveGroup*(slave: TzcSlave, group: TzcAuthGroup, lock = false) =
     regModify(TzcSecBmxS2, 0x3'u32 shl (idx * 2), g shl (idx * 2))
     if lock: regSet(TzcSecBmxSLock, 1'u32 shl (idx + 16))
 
+proc tzcSetSlaveGroups*(slave: TzcSlave, groups: set[TzcAuthGroup],
+                        lock = false) =
+  ## Allow one or both auth groups to reach a peripheral/slave.
+  var field = 0'u32
+  for g in groups:
+    if g.uint32 <= 1:
+      field = field or (1'u32 shl g.uint32)
+  let s = slave.ord
+  if s >= tzcSlaveMm.ord:
+    let idx = (s - tzcSlaveMm.ord).uint32
+    regModify(TzcSecBmxS0, 0x3'u32 shl (idx * 2), field shl (idx * 2))
+    if lock: regSet(TzcSecBmxS0, 1'u32 shl (idx + 16))
+  elif s < tzcSlaveEmiMisc.ord:
+    let idx = s.uint32
+    regModify(TzcSecBmxS1, 0x3'u32 shl (idx * 2), field shl (idx * 2))
+    if lock: regSet(TzcSecBmxSLock, 1'u32 shl idx)
+  else:
+    let idx = (s - tzcSlaveEmiMisc.ord).uint32
+    regModify(TzcSecBmxS2, 0x3'u32 shl (idx * 2), field shl (idx * 2))
+    if lock: regSet(TzcSecBmxSLock, 1'u32 shl (idx + 16))
+
+proc tzcSlaveGroupField*(slave: TzcSlave): uint32 =
+  ## Read back a slave's one-hot allowed-group field.
+  let s = slave.ord
+  if s >= tzcSlaveMm.ord:
+    let idx = (s - tzcSlaveMm.ord).uint32
+    (regRead(TzcSecBmxS0) shr (idx * 2)) and 0x3'u32
+  elif s < tzcSlaveEmiMisc.ord:
+    let idx = s.uint32
+    (regRead(TzcSecBmxS1) shr (idx * 2)) and 0x3'u32
+  else:
+    let idx = (s - tzcSlaveEmiMisc.ord).uint32
+    (regRead(TzcSecBmxS2) shr (idx * 2)) and 0x3'u32
+
 proc tzcSetSeBlockGroup*(blk: TzcSeBlock, group: TzcAuthGroup, lock = false) =
   ## Restrict a SEC_ENG block (SHA/AES/TRNG/PKA/CDET/GMAC) to an auth group.
   let i = blk.ord.uint32
   regModify(TzcSecSeCtrl0, 0x3'u32 shl (i * 2), (1'u32 shl group.uint32) shl (i * 2))
   if lock: regSet(TzcSecSeCtrl2, 1'u32 shl i)
+
+proc tzcSeBlockGroupField*(blk: TzcSeBlock): uint32 =
+  ## Read back a SEC_ENG block's one-hot allowed-group field.
+  let i = blk.ord.uint32
+  (regRead(TzcSecSeCtrl0) shr (i * 2)) and 0x3'u32
 
 proc tzcSetSfCtrlGroup*(blk: TzcSfCtrlBlock, group: TzcAuthGroup, lock = false) =
   ## Restrict an SF_CTRL register group to an auth group.
@@ -397,10 +546,35 @@ proc tzcSetSfCtrlGroup*(blk: TzcSfCtrlBlock, group: TzcAuthGroup, lock = false) 
   regModify(TzcSecSeCtrl1, 0x3'u32 shl (i * 2), (1'u32 shl group.uint32) shl (i * 2))
   if lock: regSet(TzcSecSeCtrl2, 1'u32 shl (i + 16))
 
+proc tzcSetSfCtrlGroups*(blk: TzcSfCtrlBlock, groups: set[TzcAuthGroup],
+                         lock = false) =
+  ## Allow one or both auth groups to reach an SF_CTRL register group.
+  let i = blk.ord.uint32
+  var field = 0'u32
+  for g in groups:
+    if g.uint32 <= 1:
+      field = field or (1'u32 shl g.uint32)
+  regModify(TzcSecSeCtrl1, 0x3'u32 shl (i * 2), field shl (i * 2))
+  if lock: regSet(TzcSecSeCtrl2, 1'u32 shl (i + 16))
+
+proc tzcSetSfCtrlModeTzc*(lock = false) =
+  ## Route secure serial-flash TZSID checks through the TZC policy fields.
+  regSet(TzcSecSeCtrl1, 1'u32 shl TzcSfTzsidCtrlMode)
+  if lock:
+    regSet(TzcSecSeCtrl2, 1'u32 shl TzcSfTzsidCtrlModeLock)
+
+proc tzcSetSfCtrlModeArb*(lock = false) =
+  ## Route secure serial-flash TZSID checks through the SF arbiter source.
+  regClear(TzcSecSeCtrl1, 1'u32 shl TzcSfTzsidCtrlMode)
+  if lock:
+    regSet(TzcSecSeCtrl2, 1'u32 shl TzcSfTzsidCtrlModeLock)
+
 proc tzcLockMasterGroups*() =
   ## Freeze all currently-assigned master groups until reset.
   regWrite(TzcSecBmxTzmidLock, 0xFFFF_FFFF'u32)
   regWrite(TzcSecMmBmxTzmidLock, 0xFFFF_FFFF'u32)
+  regWrite(TzcNsecBmxTzmidLock, 0xFFFF_FFFF'u32)
+  regWrite(TzcNsecMmBmxTzmidLock, 0xFFFF_FFFF'u32)
 
 proc tzcSetSbootDone*() =
   ## Latch secure-boot-done in the ROM control register (4-bit field = 0xF).

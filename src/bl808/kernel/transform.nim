@@ -1012,9 +1012,30 @@ macro cps*(prc: untyped): untyped =
   let procParams = collect:
     for i in 1 ..< params.len:
       let identDef = params[i]
-      let typ = identDef[^2]
+      let explicitTyp = identDef[^2]
+      let defaultVal = identDef[^1]
+      let typ =
+        if explicitTyp.kind != nnkEmpty:
+          explicitTyp
+        elif defaultVal.kind != nnkEmpty:
+          nnkCall.newTree(ident"typeof", defaultVal.copyNimTree())
+        else:
+          explicitTyp
       for nameNode in identDef.identDefNames:
         ($nameNode, typ)
+
+  proc isOpenArrayType(typ: NimNode): bool =
+    typ.kind == nnkBracketExpr and typ.len == 2 and
+      typ[0].kind in {nnkIdent, nnkSym} and $typ[0] == "openArray"
+
+  proc envFieldType(typ: NimNode): NimNode =
+    ## `openArray[T]` cannot be stored in a ref object continuation
+    ## environment. Snapshot it as `seq[T]`; seq is accepted by callees that
+    ## take openArray, and it safely outlives the wrapper call.
+    if typ.isOpenArrayType:
+      nnkBracketExpr.newTree(ident"seq", typ[1].copyNimTree())
+    else:
+      typ.copyNimTree()
 
   # Collect local variables with explicit types
   var localVars: seq[VarInfo]
@@ -1570,10 +1591,12 @@ macro cps*(prc: untyped): untyped =
   envFields.add newIdentDefs(ident"fut", futureType)
 
   for (name, typ) in procParams:
-    envFields.add newIdentDefs(name, typ)
+    envFields.add newIdentDefs(name, envFieldType(typ))
 
   # Map of name -> type expression for typeof rewriting in field definitions.
-  var typeMap = procParams.toTable()
+  var typeMap = initTable[string, NimNode]()
+  for (name, typ) in procParams:
+    typeMap[name] = envFieldType(typ)
 
   let readSym = ident"read"
 
@@ -2543,10 +2566,14 @@ macro cps*(prc: untyped): untyped =
     wrapperBody.add quote do:
       `envLocal`.fut = `newTypedFutureSym`[`innerResultType`]()
 
-  for (name, _) in procParams:
+  for (name, typ) in procParams:
     let nameId = ident(name)
-    wrapperBody.add quote do:
-      `envLocal`.`nameId` = `nameId`
+    if typ.isOpenArrayType:
+      wrapperBody.add quote do:
+        `envLocal`.`nameId` = @`nameId`
+    else:
+      wrapperBody.add quote do:
+        `envLocal`.`nameId` = `nameId`
 
   wrapperBody.add quote do:
     `setFutureRootContinuationSym`(`envLocal`.fut, `envLocal`)

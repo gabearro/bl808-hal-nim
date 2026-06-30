@@ -218,6 +218,28 @@ def test_npu_model_smoke_manifest_requires_focused_previous_activation_markers()
         "[PASS] NPU model TFLite e2e first block",
         "[PASS] NPU model TFLite compare trailing",
         "[PASS] NPU model TFLite sequential short blocked",
+        "[PASS] NPU model MNIST TFLite oracle valid",
+        "[PASS] NPU model MNIST TFLite oracle input scale bits",
+        "[PASS] NPU model MNIST TFLite oracle fully connected wiring",
+        "[PASS] NPU model MNIST TFLite support metadata",
+        "[PASS] NPU model MNIST TFLite support fc reference",
+        "[PASS] NPU model MNIST TFLite support output pending",
+        "[PASS] NPU model MNIST TFLite support block",
+        "[PASS] NPU model MNIST converter dependency plan",
+        "[PASS] NPU model MNIST converter dependency missing",
+        "[PASS] NPU model MNIST converter dependency classes",
+        "[PASS] NPU model MNIST converter dependency first",
+        "[PASS] NPU model MNIST converter artifact regeneration plan",
+        "[PASS] NPU model MNIST converter artifact regeneration blocked",
+        "[PASS] NPU model MNIST converter artifact regeneration static",
+        "[PASS] NPU model MNIST converter artifact regeneration block",
+        "[PASS] NPU model MNIST toolchain SRAM readiness evidence",
+        "[PASS] NPU model MNIST toolchain SRAM readiness patch size",
+        "[PASS] NPU model MNIST toolchain SRAM readiness active slots",
+        "[PASS] NPU model MNIST toolchain SRAM readiness spare slots",
+        "[PASS] NPU model MNIST toolchain SRAM readiness persistent fit",
+        "[PASS] NPU model MNIST toolchain SRAM readiness output blocked",
+        "[PASS] NPU model TFLite fully connected reference fits",
         "[PASS] NPU model parsed single fixed diagnostics valid",
         "[PASS] NPU model parsed single fixed diagnostics readiness block",
         "[PASS] NPU model parsed layer fixed diagnostics valid",
@@ -363,6 +385,7 @@ def test_npu_model_smoke_manifest_requires_focused_previous_activation_markers()
         "[PASS] NPU model reset pulse plan delay",
         "[PASS] NPU model SRAM status blocked",
         "[PASS] NPU model SRAM status released",
+        "[PASS] NPU model SRAM status selected",
         "[PASS] NPU model reset status asserted",
         "[PASS] NPU model reset status released",
         "[PASS] NPU model wrapper state idle",
@@ -381,12 +404,20 @@ def test_npu_model_smoke_manifest_requires_focused_previous_activation_markers()
         "[PASS] NPU model interrupt MM aggregate route catalog",
         "[PASS] NPU model interrupt MM aggregate demux unknown",
         "[PASS] NPU model interrupt MM aggregate polling preserved",
+        "[PASS] NPU model interrupt MM aggregate SDK helper evidence",
+        "[PASS] NPU model interrupt MM aggregate SDK helper bank",
+        "[PASS] NPU model interrupt MM aggregate SDK helper clear",
+        "[PASS] NPU model interrupt MM aggregate SDK helper unmask",
         "[PASS] NPU model int cfg decode commands",
         "[PASS] NPU model int cfg decode relu",
         "[PASS] NPU model int cfg command plan clear",
         "[PASS] NPU model start transition plan first start",
         "[PASS] NPU model start transition plan resume",
         "[PASS] NPU model stop transition plan command",
+        "[PASS] NPU model stop wrapper valid",
+        "[PASS] NPU model stop wrapper command",
+        "[PASS] NPU model stop wrapper no error",
+        "[PASS] NPU model stop wrapper cold stop",
         "[PASS] NPU model tf cfg decode enabled",
         "[PASS] NPU model tf cfg compose enabled",
         "[PASS] NPU model general cfg compose image mode",
@@ -483,6 +514,14 @@ def test_npu_model_smoke_manifest_requires_focused_previous_activation_markers()
         "[PASS] NPU model completion ok status",
         "[PASS] NPU model runtime SDK interrupt semaphore",
         "[PASS] NPU model runtime active polling",
+        "[PASS] NPU model runtime lifecycle cold init",
+        "[PASS] NPU model runtime lifecycle repeated init noop",
+        "[PASS] NPU model runtime lifecycle initialized destroy clear",
+        "[PASS] NPU model runtime lifecycle cold destroy noop",
+        "[PASS] NPU model release plan valid",
+        "[PASS] NPU model release plan cn frees",
+        "[PASS] NPU model release plan layer overflow",
+        "[PASS] NPU model release plan cn overflow",
         "[PASS] NPU model completion plan timeout",
         "[PASS] NPU model completion result timeout",
         "[PASS] NPU model completion polling wait no polls",
@@ -751,12 +790,31 @@ def test_npu_model_smoke_manifest_requires_focused_previous_activation_markers()
         "[PASS] NPU model parsed configured workspace fixture active runtime clock source known",
         "[PASS] NPU model parsed configured workspace fixture active runtime clock source",
         "[PASS] NPU model parsed configured workspace fixture active runtime clock divider",
+        "[PASS] NPU model parsed configured workspace fixture active codec qos evidence",
+        "[PASS] NPU model parsed configured workspace fixture active codec qos aw",
+        "[PASS] NPU model parsed configured workspace fixture active codec qos ar",
+        "[PASS] NPU model parsed configured workspace fixture active codec qos encoded",
+        "[PASS] NPU model parsed configured workspace fixture active codec bus evidence",
+        "[PASS] NPU model parsed configured workspace fixture active codec bus pclk",
+        "[PASS] NPU model parsed configured workspace fixture active codec bus thresholds",
+        "[PASS] NPU model parsed configured workspace fixture active codec bus BLAI thresholds",
         "[PASS] NPU model parsed configured workspace fixture active runtime reset",
         "[PASS] NPU model parsed configured workspace fixture active runtime reset released",
         "[PASS] NPU model parsed configured workspace fixture active runtime reset not asserted",
         "[PASS] NPU model parsed configured workspace fixture active runtime SRAM",
         "[PASS] NPU model parsed configured workspace fixture active runtime SRAM released",
+        "[PASS] NPU model parsed configured workspace fixture active runtime SRAM selected",
         "[PASS] NPU model parsed configured workspace fixture active runtime SRAM set self-cleared",
+        "[PASS] NPU model parsed configured workspace fixture active runtime SDK boundary evidence",
+        "[PASS] NPU model parsed configured workspace fixture active runtime SDK clock source",
+        "[PASS] NPU model parsed configured workspace fixture active runtime SDK preserves clock",
+        "[PASS] NPU model parsed configured workspace fixture active runtime local clock",
+        "[PASS] NPU model parsed configured workspace fixture active runtime local reset",
+        "[PASS] NPU model parsed configured workspace fixture active runtime local SRAM",
+        "[PASS] NPU model parsed configured workspace fixture active runtime boundary explicit",
+        "[PASS] NPU model parsed configured workspace fixture active activation table reset evidence",
+        "[PASS] NPU model parsed configured workspace fixture active activation table reset raw",
+        "[PASS] NPU model parsed configured workspace fixture active activation table reset decoded",
         "[PASS] NPU model parsed configured workspace fixture active int cfg command RMW",
         "[PASS] NPU model parsed configured workspace fixture active int cfg start command",
         "[PASS] NPU model parsed configured workspace fixture active int cfg resume command",
@@ -949,6 +1007,10 @@ def test_npu_model_smoke_manifest_requires_focused_previous_activation_markers()
         "[PASS] NPU model parsed configured workspace fixture active MM aggregate wait-exit pending enum",
         "[PASS] NPU model parsed configured workspace fixture active MM aggregate wait-exit no named subroute",
         "[PASS] NPU model parsed configured workspace fixture active MM aggregate wait-exit subroute",
+        "[PASS] NPU model parsed configured workspace fixture active MM aggregate SDK helper evidence",
+        "[PASS] NPU model parsed configured workspace fixture active MM aggregate SDK helper bank",
+        "[PASS] NPU model parsed configured workspace fixture active MM aggregate SDK helper clear",
+        "[PASS] NPU model parsed configured workspace fixture active MM aggregate SDK helper unmask",
         "[PASS] NPU model parsed configured workspace fixture active completion route target MM aggregate",
         "[PASS] NPU model parsed configured workspace fixture active completion route target MM polling",
         "[PASS] NPU model parsed configured workspace fixture active route aggregate evidence",
@@ -959,6 +1021,18 @@ def test_npu_model_smoke_manifest_requires_focused_previous_activation_markers()
         "[PASS] NPU model parsed configured workspace fixture active output equivalence frontier live route",
         "[PASS] NPU model parsed configured workspace fixture active completion-output handoff route aggregate",
         "[PASS] NPU model parsed configured workspace fixture active completion-output handoff live route",
+        "[PASS] NPU model parsed configured workspace fixture active start edge evidence",
+        "[PASS] NPU model parsed configured workspace fixture active start edge retained",
+        "[PASS] NPU model parsed configured workspace fixture active start edge command",
+        "[PASS] NPU model parsed configured workspace fixture active start edge idle",
+        "[PASS] NPU model parsed configured workspace fixture active start edge no immediate edge",
+        "[PASS] NPU model parsed configured workspace fixture active start edge no interrupt",
+        "[PASS] NPU model parsed configured workspace fixture active start command surface evidence",
+        "[PASS] NPU model parsed configured workspace fixture active start command surface general",
+        "[PASS] NPU model parsed configured workspace fixture active start command surface int cfg",
+        "[PASS] NPU model parsed configured workspace fixture active start command surface no busy",
+        "[PASS] NPU model parsed configured workspace fixture active start command surface no interrupt",
+        "[PASS] NPU model parsed configured workspace fixture active start command surface SDK",
         "[PASS] NPU model parsed configured workspace fixture active polling signal evidence",
         "[PASS] NPU model parsed configured workspace fixture active polling signal signal",
         "[PASS] NPU model parsed configured workspace fixture active polling signal budget",
@@ -984,6 +1058,23 @@ def test_npu_model_smoke_manifest_requires_focused_previous_activation_markers()
         "[PASS] NPU model parsed configured workspace fixture active workspace WRAM weight",
         "[PASS] NPU model parsed configured workspace fixture active workspace WRAM bias",
         "[PASS] NPU model parsed configured workspace fixture active stream semantic evidence",
+        "[PASS] NPU model parsed configured workspace fixture active stream raw word evidence",
+        "[PASS] NPU model parsed configured workspace fixture active SDK stream walk",
+        "[PASS] NPU model parsed configured workspace fixture active SDK stream side record",
+        "[PASS] NPU model parsed configured workspace fixture active SDK stream layer record",
+        "[PASS] NPU model parsed configured workspace fixture active SDK stream layer count",
+        "[PASS] NPU model parsed configured workspace fixture active SDK stream stop",
+        "[PASS] NPU model parsed configured workspace fixture active terminal control",
+        "[PASS] NPU model parsed configured workspace fixture active terminal split bits",
+        "[PASS] NPU model parsed configured workspace fixture active terminal descriptor halt clear",
+        "[PASS] NPU model parsed configured workspace fixture active terminal stream end",
+        "[PASS] NPU model parsed configured workspace fixture active terminal control coherent",
+        "[PASS] NPU model parsed configured workspace fixture active toolchain run gate",
+        "[PASS] NPU model parsed configured workspace fixture active toolchain run CPU projection",
+        "[PASS] NPU model parsed configured workspace fixture toolchain run direct gate",
+        "[PASS] NPU model parsed configured workspace fixture toolchain run non-square gate",
+        "[PASS] NPU model parsed configured workspace fixture toolchain run stride2 kernel gate",
+        "[PASS] NPU model parsed configured workspace fixture toolchain run stride2 parity gate",
         "[PASS] NPU model parsed configured workspace fixture active stream operand plan",
         "[PASS] NPU model parsed configured workspace fixture active operand c2 zero",
         "[PASS] NPU model parsed configured workspace fixture active operand no extra info",
@@ -1084,6 +1175,9 @@ def test_npu_model_smoke_manifest_requires_focused_previous_activation_markers()
         "[PASS] NPU model parsed configured workspace fixture active config first cache clean",
         "[PASS] NPU model parsed configured workspace fixture active config first cache offset",
         "[PASS] NPU model parsed configured workspace fixture active config first cache bytes",
+        "[PASS] NPU model parsed configured workspace fixture active config patch register evidence",
+        "[PASS] NPU model parsed configured workspace fixture active config patch register SDK write",
+        "[PASS] NPU model parsed configured workspace fixture active config patch register imageSeg",
         "[PASS] NPU model parsed configured workspace fixture active data slot evidence",
         "[PASS] NPU model parsed configured workspace fixture active data slots",
         "[PASS] NPU model parsed configured workspace fixture active data slots distinct",
@@ -1224,6 +1318,18 @@ def test_npu_model_smoke_manifest_requires_focused_previous_activation_markers()
         "[PASS] NPU model parsed configured workspace fixture active started int cfg status clean",
         "[PASS] NPU model parsed configured workspace fixture active started int cfg clean",
         "[PASS] NPU model parsed configured workspace fixture active snapshot started mirror",
+        "[PASS] NPU model parsed configured workspace fixture active launch general cfg defaults",
+        "[PASS] NPU model parsed configured workspace fixture active launch general cfg ftable",
+        "[PASS] NPU model parsed configured workspace fixture active launch general cfg reserved",
+        "[PASS] NPU model parsed configured workspace fixture active started general cfg defaults",
+        "[PASS] NPU model parsed configured workspace fixture active started general cfg ftable",
+        "[PASS] NPU model parsed configured workspace fixture active started general cfg idle",
+        "[PASS] NPU model parsed configured workspace fixture active launch int cfg known fields",
+        "[PASS] NPU model parsed configured workspace fixture active launch int cfg reserved",
+        "[PASS] NPU model parsed configured workspace fixture active launch int cfg relu default",
+        "[PASS] NPU model parsed configured workspace fixture active started int cfg known fields",
+        "[PASS] NPU model parsed configured workspace fixture active started int cfg reserved",
+        "[PASS] NPU model parsed configured workspace fixture active started int cfg relu default",
         "[PASS] NPU model parsed configured workspace fixture active launch retention evidence",
         "[PASS] NPU model parsed configured workspace fixture active launch retention captures",
         "[PASS] NPU model parsed configured workspace fixture active launch retention addresses",
@@ -1277,6 +1383,41 @@ def test_npu_model_smoke_manifest_requires_focused_previous_activation_markers()
         "[PASS] NPU model parsed configured workspace fixture active cache contract workspace valid",
         "[PASS] NPU model parsed configured workspace fixture active cache contract data count",
         "[PASS] NPU model parsed configured workspace fixture active cache contract data clean",
+        "[PASS] NPU model parsed configured workspace fixture active launch cache register evidence",
+        "[PASS] NPU model parsed configured workspace fixture active launch cache register instruction",
+        "[PASS] NPU model parsed configured workspace fixture active launch cache register data",
+        "[PASS] NPU model parsed configured workspace fixture active launch cache register weight",
+        "[PASS] NPU model parsed configured workspace fixture active launch cache register bias",
+        "[PASS] NPU model parsed configured workspace fixture active launch cache register addresses",
+        "[PASS] NPU model parsed configured workspace fixture active launch cache register bytes",
+        "[PASS] NPU model parsed configured workspace fixture active launch SRAM address evidence",
+        "[PASS] NPU model parsed configured workspace fixture active launch SRAM address registers",
+        "[PASS] NPU model parsed configured workspace fixture active launch SRAM address instruction",
+        "[PASS] NPU model parsed configured workspace fixture active launch SRAM address data",
+        "[PASS] NPU model parsed configured workspace fixture active launch SRAM address weight",
+        "[PASS] NPU model parsed configured workspace fixture active launch SRAM address bias",
+        "[PASS] NPU model parsed configured workspace fixture active launch SRAM ownership",
+        "[PASS] NPU model parsed configured workspace fixture active launch SRAM latch",
+        "[PASS] NPU model parsed configured workspace fixture active launch WRAM span evidence",
+        "[PASS] NPU model parsed configured workspace fixture active launch WRAM span bus",
+        "[PASS] NPU model parsed configured workspace fixture active launch WRAM span instruction",
+        "[PASS] NPU model parsed configured workspace fixture active launch WRAM span data",
+        "[PASS] NPU model parsed configured workspace fixture active launch WRAM span weight",
+        "[PASS] NPU model parsed configured workspace fixture active launch WRAM span bias",
+        "[PASS] NPU model parsed configured workspace fixture active launch instruction fetch evidence",
+        "[PASS] NPU model parsed configured workspace fixture active launch instruction fetch address",
+        "[PASS] NPU model parsed configured workspace fixture active launch instruction fetch bytes",
+        "[PASS] NPU model parsed configured workspace fixture active launch instruction fetch records",
+        "[PASS] NPU model parsed configured workspace fixture active launch instruction fetch encoder",
+        "[PASS] NPU model parsed configured workspace fixture active launch instruction fetch SDK walk",
+        "[PASS] NPU model parsed configured workspace fixture active launch instruction fetch control",
+        "[PASS] NPU model parsed configured workspace fixture active launch operand fetch evidence",
+        "[PASS] NPU model parsed configured workspace fixture active launch operand fetch registers",
+        "[PASS] NPU model parsed configured workspace fixture active launch operand fetch segment",
+        "[PASS] NPU model parsed configured workspace fixture active launch operand fetch slots",
+        "[PASS] NPU model parsed configured workspace fixture active launch operand fetch single input",
+        "[PASS] NPU model parsed configured workspace fixture active launch operand fetch data",
+        "[PASS] NPU model parsed configured workspace fixture active launch operand fetch weights",
         "[PASS] NPU model parsed configured workspace fixture active terminal gate evidence",
         "[PASS] NPU model parsed configured workspace fixture active terminal classified",
         "[PASS] NPU model parsed configured workspace fixture active terminal gate known",
@@ -1290,6 +1431,10 @@ def test_npu_model_smoke_manifest_requires_focused_previous_activation_markers()
         "[PASS] NPU model parsed configured workspace fixture active terminal run-sequence evidence",
         "[PASS] NPU model parsed configured workspace fixture active terminal execution evidence",
         "[PASS] NPU model parsed configured workspace fixture active terminal output evidence",
+        "[PASS] NPU model parsed configured workspace fixture active bus decode status",
+        "[PASS] NPU model parsed configured workspace fixture active bus decode no MM error",
+        "[PASS] NPU model parsed configured workspace fixture active bus decode no MCU error",
+        "[PASS] NPU model parsed configured workspace fixture active bus decode no error",
         "[PASS] NPU model parsed configured workspace fixture active execution gate evidence",
         "[PASS] NPU model parsed configured workspace fixture active terminal execution gate",
         "[PASS] NPU model parsed configured workspace fixture active terminal execution",
@@ -1381,7 +1526,50 @@ def test_npu_model_smoke_manifest_requires_focused_previous_activation_markers()
         "[PASS] NPU model parsed configured workspace fixture active completion route resolution live frontier",
         "[PASS] NPU model parsed configured workspace fixture active completion route resolution output gate",
         "[PASS] NPU model parsed configured workspace fixture active completion route resolution coherent",
+        "[PASS] NPU model parsed configured workspace fixture active start clock evidence",
+        "[PASS] NPU model parsed configured workspace fixture active start clock enabled",
+        "[PASS] NPU model parsed configured workspace fixture active start clock source",
+        "[PASS] NPU model parsed configured workspace fixture active start clock divider",
+        "[PASS] NPU model parsed configured workspace fixture active start clock retained",
+        "[PASS] NPU model parsed configured workspace fixture active start transition evidence",
+        "[PASS] NPU model parsed configured workspace fixture active start transition first run",
+        "[PASS] NPU model parsed configured workspace fixture active start transition command",
+        "[PASS] NPU model parsed configured workspace fixture active start transition wrapper",
+        "[PASS] NPU model parsed configured workspace fixture active start transition SDK",
+        "[PASS] NPU model parsed configured workspace fixture active inference SDK sequence",
+        "[PASS] NPU model parsed configured workspace fixture active inference SDK sequence pending",
+        "[PASS] NPU model parsed configured workspace fixture active inference SDK sequence block",
+        "[PASS] NPU model parsed configured workspace fixture active SDK forward sequence",
+        "[PASS] NPU model parsed configured workspace fixture active SDK forward sequence deferred",
+        "[PASS] NPU model parsed configured workspace fixture active SDK forward sequence block",
+        "[PASS] NPU model parsed configured workspace fixture active CNN wrapper completion surface evidence",
+        "[PASS] NPU model parsed configured workspace fixture active CNN wrapper completion surface standard clear",
+        "[PASS] NPU model parsed configured workspace fixture active CNN wrapper completion surface candidate",
+        "[PASS] NPU model parsed configured workspace fixture active CNN wrapper completion surface wrapper only",
+        "[PASS] NPU model parsed configured workspace fixture active CNN wrapper completion surface conflict",
+        "[PASS] NPU model parsed configured workspace fixture active CNN wrapper completion surface read only",
+        "[PASS] NPU model parsed configured workspace fixture active CNN wrapper completion surface policy",
+        "[PASS] NPU model parsed configured workspace fixture active CNN IRQ controller evidence",
+        "[PASS] NPU model parsed configured workspace fixture active CNN IRQ controller line",
+        "[PASS] NPU model parsed configured workspace fixture active CNN IRQ controller source",
+        "[PASS] NPU model parsed configured workspace fixture active CNN IRQ controller alias",
+        "[PASS] NPU model parsed configured workspace fixture active CNN IRQ controller pending",
+        "[PASS] NPU model parsed configured workspace fixture active CNN IRQ controller disabled",
+        "[PASS] NPU model parsed configured workspace fixture active CNN IRQ controller masked",
+        "[PASS] NPU model parsed configured workspace fixture active CNN IRQ controller vector",
+        "[PASS] NPU model parsed configured workspace fixture active CNN IRQ controller deferred",
+        "[PASS] NPU model parsed configured workspace fixture active completion route binding safety evidence",
+        "[PASS] NPU model parsed configured workspace fixture active completion route binding safety M0 alias",
+        "[PASS] NPU model parsed configured workspace fixture active completion route binding safety suppressed",
+        "[PASS] NPU model parsed configured workspace fixture active completion route binding safety next",
+        "[PASS] NPU model parsed configured workspace fixture active completion route probe plan",
+        "[PASS] NPU model parsed configured workspace fixture active completion route probe plan subroute",
+        "[PASS] NPU model parsed configured workspace fixture active completion route probe plan action",
+        "[PASS] NPU model parsed configured workspace fixture active completion route probe plan readback",
         "[PASS] NPU model parsed configured workspace fixture active output equivalence readiness coherent",
+        "[PASS] NPU model MNIST TFLite active output validation evidence",
+        "[PASS] NPU model MNIST TFLite active output validation completion",
+        "[PASS] NPU model MNIST TFLite active output validation block",
         "[PASS] NPU model parsed configured workspace fixture active completion boundary evidence",
         "[PASS] NPU model parsed configured workspace fixture active completion boundary policy",
         "[PASS] NPU model parsed configured workspace fixture active completion boundary engine",
@@ -1399,6 +1587,17 @@ def test_npu_model_smoke_manifest_requires_focused_previous_activation_markers()
         "[PASS] NPU model parsed configured workspace fixture active completion gap wait-exit known",
         "[PASS] NPU model parsed configured workspace fixture active completion gap output gate",
         "[PASS] NPU model parsed configured workspace fixture active completion gap remaining progress",
+        "[PASS] NPU model parsed configured workspace fixture active BLAI TZMID missing evidence",
+        "[PASS] NPU model parsed configured workspace fixture active BLAI TZMID missing precondition",
+        "[PASS] NPU model parsed configured workspace fixture active BLAI TZMID configured evidence",
+        "[PASS] NPU model parsed configured workspace fixture active BLAI TZMID configured group",
+        "[PASS] NPU model parsed configured workspace fixture active BLAI TZMID configured lock",
+        "[PASS] NPU model parsed configured workspace fixture active BLAI TZMID plan evidence",
+        "[PASS] NPU model parsed configured workspace fixture active BLAI TZMID plan preserve",
+        "[PASS] NPU model parsed configured workspace fixture active BLAI TZMID live evidence",
+        "[PASS] NPU model parsed configured workspace fixture active BLAI TZMID live readable",
+        "[PASS] NPU model parsed configured workspace fixture active BLAI TZMID live group bounded",
+        "[PASS] NPU model parsed configured workspace fixture active BLAI TZMID live classification",
         "[PASS] NPU model parsed configured workspace fixture active execution timeout",
         "[PASS] NPU model parsed configured workspace fixture active wait no interrupt",
         "[PASS] NPU model parsed configured workspace fixture active wait int raw clear",
@@ -1407,6 +1606,9 @@ def test_npu_model_smoke_manifest_requires_focused_previous_activation_markers()
         "[PASS] NPU model parsed configured workspace fixture active wait int cfg clear clean",
         "[PASS] NPU model parsed configured workspace fixture active wait int cfg status clean",
         "[PASS] NPU model parsed configured workspace fixture active wait int cfg clean",
+        "[PASS] NPU model parsed configured workspace fixture active wait int cfg known fields",
+        "[PASS] NPU model parsed configured workspace fixture active wait int cfg reserved",
+        "[PASS] NPU model parsed configured workspace fixture active wait int cfg relu default",
         "[PASS] NPU model parsed configured workspace fixture active wait axi write state",
         "[PASS] NPU model parsed configured workspace fixture active wait axi read state",
         "[PASS] NPU model parsed configured workspace fixture active wait idle",
@@ -1419,6 +1621,133 @@ def test_npu_model_smoke_manifest_requires_focused_previous_activation_markers()
         "[PASS] NPU model SDK helper conv allocator mid inactive",
         "[PASS] NPU model SDK helper conv allocator mid source",
         "[PASS] NPU model SDK helper softmax allocator mid source",
+        "[PASS] NPU model SDK helper toolchain globals",
+        "[PASS] NPU model SDK helper toolchain patch size",
+        "[PASS] NPU model SDK helper toolchain max patches",
+        "[PASS] NPU model SDK helper initial request forced channels",
+        "[PASS] NPU model SDK helper initial request passthrough",
+        "[PASS] NPU model SDK helper initial request blocked",
+        "[PASS] NPU model SDK helper PSRAM allocate scratch",
+        "[PASS] NPU model SDK helper patch search call prepare",
+        "[PASS] NPU model SDK helper patch search call prepare inherited",
+        "[PASS] NPU model SDK helper patch search call prepare blocked",
+        "[PASS] NPU model SDK helper PSRAM input membership",
+        "[PASS] NPU model SDK helper PSRAM input membership blocked",
+        "[PASS] NPU model SDK helper PSRAM layer request",
+        "[PASS] NPU model SDK helper PSRAM skip request",
+        "[PASS] NPU model SDK helper PSRAM DSP request",
+        "[PASS] NPU model SDK helper PSRAM DSP request blocked",
+        "[PASS] NPU model SDK helper PSRAM DSP patch pair",
+        "[PASS] NPU model SDK helper PSRAM DSP patch pair blocked",
+        "[PASS] NPU model SDK helper PSRAM layer loop",
+        "[PASS] NPU model SDK helper PSRAM layer loop blocked",
+        "[PASS] NPU model SDK helper PSRAM TFLite request",
+        "[PASS] NPU model SDK helper PSRAM TFLite request blocked",
+        "[PASS] NPU model SDK helper PSRAM TFLite patch",
+        "[PASS] NPU model SDK helper PSRAM TFLite patch blocked",
+        "[PASS] NPU model SDK helper PSRAM request store",
+        "[PASS] NPU model SDK helper PSRAM request store blocked",
+        "[PASS] NPU model SDK helper set wei call",
+        "[PASS] NPU model SDK helper set wei call blocked",
+        "[PASS] NPU model SDK helper set wei return",
+        "[PASS] NPU model SDK helper set wei return blocked",
+        "[PASS] NPU model SDK helper PSRAM owner transfer",
+        "[PASS] NPU model SDK helper PSRAM owner release",
+        "[PASS] NPU model SDK helper PSRAM owner ignore",
+        "[PASS] NPU model SDK helper PSRAM owner missing start",
+        "[PASS] NPU model SDK helper PSRAM owner cleanup transfer",
+        "[PASS] NPU model SDK helper PSRAM owner cleanup route flag",
+        "[PASS] NPU model SDK helper PSRAM owner cleanup release",
+        "[PASS] NPU model SDK helper PSRAM owner cleanup ignore",
+        "[PASS] NPU model SDK helper PSRAM owner cleanup sweep transfer",
+        "[PASS] NPU model SDK helper PSRAM owner cleanup sweep release",
+        "[PASS] NPU model SDK helper PSRAM owner cleanup sweep blocked",
+        "[PASS] NPU model SDK helper PSRAM post-search slot retain",
+        "[PASS] NPU model SDK helper PSRAM post-search slot release",
+        "[PASS] NPU model SDK helper PSRAM post-search slot ignore",
+        "[PASS] NPU model SDK helper PSRAM post-search slot blocked",
+        "[PASS] NPU model SDK helper PSRAM metadata discard",
+        "[PASS] NPU model SDK helper PSRAM metadata discard banks",
+        "[PASS] NPU model SDK helper PSRAM metadata discard banks blocked",
+        "[PASS] NPU model SDK helper PSRAM metadata preserve",
+        "[PASS] NPU model SDK helper PSRAM metadata discard blocked",
+        "[PASS] NPU model SDK helper PSRAM fallback gate",
+        "[PASS] NPU model SDK helper PSRAM fallback gate blocked",
+        "[PASS] NPU model SDK helper PSRAM unassigned metadata",
+        "[PASS] NPU model SDK helper PSRAM unassigned metadata banks",
+        "[PASS] NPU model SDK helper PSRAM unassigned metadata banks blocked",
+        "[PASS] NPU model SDK helper PSRAM unassigned metadata preserve",
+        "[PASS] NPU model SDK helper PSRAM unassigned metadata blocked",
+        "[PASS] NPU model SDK helper PSRAM fallback metadata select",
+        "[PASS] NPU model SDK helper PSRAM fallback metadata banks",
+        "[PASS] NPU model SDK helper PSRAM fallback metadata banks blocked",
+        "[PASS] NPU model SDK helper PSRAM fallback metadata clear",
+        "[PASS] NPU model SDK helper PSRAM fallback metadata preserve",
+        "[PASS] NPU model SDK helper PSRAM fallback metadata blocked",
+        "[PASS] NPU model SDK helper PSRAM split metadata",
+        "[PASS] NPU model SDK helper PSRAM split metadata blocked",
+        "[PASS] NPU model SDK helper set wei page conv",
+        "[PASS] NPU model SDK helper set wei route gate",
+        "[PASS] NPU model SDK helper set wei route gate blocked",
+        "[PASS] NPU model SDK helper set wei route source",
+        "[PASS] NPU model SDK helper set wei route source blocked",
+        "[PASS] NPU model SDK helper set wei base offset",
+        "[PASS] NPU model SDK helper set wei page routew",
+        "[PASS] NPU model SDK helper set wei divisor routew",
+        "[PASS] NPU model SDK helper set wei divisor special",
+        "[PASS] NPU model SDK helper set wei store divisor",
+        "[PASS] NPU model SDK helper set wei store auxiliary",
+        "[PASS] NPU model SDK helper set wei store select",
+        "[PASS] NPU model SDK helper set wei store select forced",
+        "[PASS] NPU model SDK helper set wei pressure",
+        "[PASS] NPU model SDK helper set wei pressure blocked",
+        "[PASS] NPU model SDK helper set wei large flag masked",
+        "[PASS] NPU model SDK helper set wei large flag threshold",
+        "[PASS] NPU model SDK helper set wei large flag unmasked",
+        "[PASS] NPU model SDK helper set wei large flag range",
+        "[PASS] NPU model SDK helper set wei large split nondiv",
+        "[PASS] NPU model SDK helper set wei large split divisible",
+        "[PASS] NPU model SDK helper set wei large split invalid flag",
+        "[PASS] NPU model SDK helper set wei large split capacity",
+        "[PASS] NPU model SDK helper set wei large total valid",
+        "[PASS] NPU model SDK helper set wei large total invalid split",
+        "[PASS] NPU model SDK helper set wei large total overflow",
+        "[PASS] NPU model SDK helper set wei lower flag masked",
+        "[PASS] NPU model SDK helper set wei lower flag threshold",
+        "[PASS] NPU model SDK helper set wei lower flag unmasked",
+        "[PASS] NPU model SDK helper set wei lower flag divisor",
+        "[PASS] NPU model SDK helper set wei lower flag overflow",
+        "[PASS] NPU model SDK helper set wei lower split nondiv",
+        "[PASS] NPU model SDK helper set wei lower split divisible",
+        "[PASS] NPU model SDK helper set wei lower split invalid flag",
+        "[PASS] NPU model SDK helper set wei lower split capacity",
+        "[PASS] NPU model SDK helper set wei lower total valid",
+        "[PASS] NPU model SDK helper set wei lower total invalid split",
+        "[PASS] NPU model SDK helper set wei lower total overflow",
+        "[PASS] NPU model SDK helper set wei no patch valid",
+        "[PASS] NPU model SDK helper set wei no patch invalid",
+        "[PASS] NPU model SDK helper set wei branch large",
+        "[PASS] NPU model SDK helper set wei branch lower",
+        "[PASS] NPU model SDK helper set wei branch no patch",
+        "[PASS] NPU model SDK helper set wei branch large blocked",
+        "[PASS] NPU model SDK helper set wei branch lower blocked",
+        "[PASS] NPU model SDK helper set wei branch no patch blocked",
+        "[PASS] NPU model SDK helper patch previous owner flag",
+        "[PASS] NPU model SDK helper patch owner general",
+        "[PASS] NPU model SDK helper patch owner dsp",
+        "[PASS] NPU model SDK helper patch owner tflite",
+        "[PASS] NPU model SDK helper patch dispatch",
+        "[PASS] NPU model SDK helper patch dispatch dsp tflite",
+        "[PASS] NPU model SDK helper patch search valid",
+        "[PASS] NPU model SDK helper patch metadata general",
+        "[PASS] NPU model SDK helper patch metadata apply general",
+        "[PASS] NPU model SDK helper patch metadata dsp",
+        "[PASS] NPU model SDK helper patch metadata apply dsp",
+        "[PASS] NPU model SDK helper patch metadata tflite",
+        "[PASS] NPU model SDK helper patch metadata apply tflite",
+        "[PASS] NPU model SDK helper patch metadata apply blocked",
+        "[PASS] NPU model SDK helper patch apply valid",
+        "[PASS] NPU model SDK helper patch search start overflow",
         "[PASS] NPU model SDK helper conv stream",
         "[PASS] NPU model SDK helper conv resources",
         "[PASS] NPU model SDK helper conv transfer",
@@ -1654,6 +1983,128 @@ def test_npu_make_target_probes_anchor_before_existing_anchor_flash():
     )
     assert target.count("--uart-anchor-runtime-jtag") >= 5
     assert target.count("--jtag-memory-log") >= 4
+
+
+def test_d0_npu_start_probe_manifest_requires_two_image_d0_launch_markers():
+    manifest = _manifest()
+    test = {item["name"]: item for item in manifest["tests"]}["d0_npu_start_probe"]
+    required = test.get("required", [])
+    forbidden = manifest.get("defaults", {}).get("forbidden", []) + test.get("forbidden", [])
+
+    assert "full" in test.get("tiers", [])
+    assert test["build"] == [
+        {
+            "id": "kernel",
+            "core": "bl808m0",
+            "source": "examples/m0_d0_npu_start_probe.nim",
+            "flash": "m0",
+        },
+        {
+            "id": "d0",
+            "core": "bl808d0",
+            "source": "examples/d0_npu_start_probe.nim",
+            "flash": "d0",
+        },
+    ]
+    for marker in (
+        "=== BL808 D0 NPU Start Probe ===",
+        "[PASS] D0 NPU probe started",
+        "[PASS] D0 NPU probe buffers ready",
+        "[PASS] D0 NPU probe configured",
+        "[PASS] D0 NPU probe start attempted",
+        "[PASS] D0 NPU probe command idle sampled",
+        "[PASS] D0 NPU probe bus decode clean",
+        "[PASS] D0 NPU probe output moved",
+        "[PASS] D0 NPU start probe complete",
+        "[PASS] D0 NPU typed status evidence",
+        "[PASS] D0 NPU typed output movement",
+        "[PASS] D0 NPU typed model output still unvalidated",
+        "[PASS] D0 NPU typed movement without oracle",
+        "[PASS] D0 NPU IRQ binding ready",
+        "[PASS] D0 NPU IRQ binding applied",
+        "[PASS] D0 NPU typed probe stream decoded",
+        "[PASS] D0 NPU probe terminal end bit decoded",
+        "[PASS] D0 NPU output moved without completion edge",
+        "[PASS] D0 NPU active-weight experiment classified",
+        "[PASS] D0 NPU active-weight experiment moved DATA",
+        "=== Test Complete ===",
+    ):
+        assert marker in required
+
+    for marker in ("[FAIL]", "[FAULT]", "panic", "trap_entry", "fatal:"):
+        assert marker in forbidden
+
+
+def test_m0_npu_start_probe_manifest_requires_synthetic_route_markers():
+    manifest = _manifest()
+    test = {item["name"]: item for item in manifest["tests"]}["m0_npu_start_probe"]
+    required = test.get("required", [])
+    forbidden = manifest.get("defaults", {}).get("forbidden", []) + test.get("forbidden", [])
+
+    assert "full" in test.get("tiers", [])
+    assert test["build"] == [
+        {
+            "id": "kernel",
+            "core": "bl808m0",
+            "source": "examples/m0_npu_start_probe.nim",
+            "flash": "m0",
+        }
+    ]
+    for marker in (
+        "=== BL808 M0 NPU Start Probe ===",
+        "[PASS] M0 NPU probe buffers ready",
+        "[PASS] M0 NPU SDK D0 boot clock control decoded",
+        "[PASS] M0 NPU SDK D0 boot clock control plan decoded",
+        "[PASS] M0 NPU SDK D0 boot VRAM route decoded",
+        "[PASS] M0 NPU probe configured",
+        "[PASS] M0 NPU synthetic stream decoded",
+        "[PASS] M0 NPU synthetic terminal end bit",
+        "[PASS] M0 NPU probe start attempted",
+        "[PASS] M0 NPU probe input coherent",
+        "[PASS] M0 NPU probe command status decoded",
+        "[PASS] M0 NPU probe bus decode clean",
+        "[PASS] M0 NPU synthetic D0 route contrast classified",
+        "[PASS] M0 NPU synthetic active-weight stream gated DATA",
+        "[PASS] M0 NPU synthetic address projection ready",
+        "[PASS] M0 NPU projected probe configured",
+        "[PASS] M0 NPU projected probe start attempted",
+        "[PASS] M0 NPU projected probe input coherent",
+        "[PASS] M0 NPU projected probe command status decoded",
+        "[PASS] M0 NPU projected probe bus decode clean",
+        "[PASS] M0 NPU synthetic address alias contrast classified",
+        "[PASS] M0 NPU projected synthetic stream gated DATA",
+        "[PASS] M0 NPU DRAM probe buffers ready",
+        "[PASS] M0 NPU DRAM probe configured",
+        "[PASS] M0 NPU DRAM probe start attempted",
+        "[PASS] M0 NPU DRAM probe input coherent",
+        "[PASS] M0 NPU DRAM probe command status decoded",
+        "[PASS] M0 NPU DRAM probe bus decode clean",
+        "[PASS] M0 NPU DRAM completion surface classified",
+        "[PASS] M0 NPU synthetic DRAM contrast classified",
+        "[PASS] M0 NPU forced IRQ binding applied",
+        "[PASS] M0 NPU forced IRQ DRAM probe configured",
+        "[PASS] M0 NPU forced IRQ DRAM probe start attempted",
+        "[PASS] M0 NPU forced IRQ DRAM probe input coherent",
+        "[PASS] M0 NPU forced IRQ DRAM probe command status decoded",
+        "[PASS] M0 NPU forced IRQ DRAM probe bus decode clean",
+        "[PASS] M0 NPU forced IRQ DRAM contrast classified",
+        "[PASS] M0 NPU D0 boot clock control applied",
+        "[PASS] M0 NPU D0 boot clock DRAM probe configured",
+        "[PASS] M0 NPU D0 boot clock DRAM probe start attempted",
+        "[PASS] M0 NPU D0 boot clock DRAM probe input coherent",
+        "[PASS] M0 NPU D0 boot clock DRAM probe command status decoded",
+        "[PASS] M0 NPU D0 boot clock DRAM probe bus decode clean",
+        "[PASS] M0 NPU D0 boot clock DRAM contrast classified",
+        "[PASS] M0 NPU D0 boot VRAM route applied",
+        "[PASS] M0 NPU D0 boot VRAM route DRAM configuration sampled",
+        "[PASS] M0 NPU D0 boot VRAM route DRAM configuration blocked",
+        "[PASS] M0 NPU start probe complete",
+        "=== Test Complete ===",
+    ):
+        assert marker in required
+
+    for marker in ("[FAIL]", "[FAULT]", "panic", "trap_entry", "fatal:"):
+        assert marker in forbidden
 
 
 def test_nim_wifi_validation_uses_pure_bl808_rf_path():
@@ -1988,6 +2439,7 @@ def test_wifi_http_server_example_uses_pure_nim_wifi_and_real_lwip():
     assert "proto=udp" in required
     assert "Ready for HTTP/1.1 and UDP echo client requests" in required
     assert "[PASS] lwIP TCP HTTP/1.1 response" in required
+    assert "[PASS] lwIP WASM HTTP install/invoke/delete" in required
     assert "[PASS] lwIP UDP echo bytes=" in required
     assert "[PASS] lwIP HTTP diagnostics reflect UDP RX/TX" in required
     host_actions = test.get("host_actions", [])
@@ -2007,6 +2459,7 @@ def test_wifi_http_server_example_uses_pure_nim_wifi_and_real_lwip():
         "10",
     ]
     assert "[PASS] lwIP TCP HTTP/1.1 response" in host.get("required", [])
+    assert "[PASS] lwIP WASM HTTP install/invoke/delete" in host.get("required", [])
     assert "[PASS] lwIP UDP echo bytes=" in host.get("required", [])
     assert "[PASS] lwIP HTTP diagnostics reflect UDP RX/TX" in host.get("required", [])
 
@@ -2027,6 +2480,7 @@ def test_wifi_http_server_example_uses_pure_nim_wifi_and_real_lwip():
         "HTTP/1.1 200 OK",
         "Content-Length: ",
         "buildHttpBody(rxLen)",
+        "handleWasmHttpBytes(",
         "buildHttpHeader(body.len)",
         "appendText(result, \"device=BL808\\n\")",
         "appendText(result, \"device_mac=\")",
@@ -2061,6 +2515,545 @@ def test_wifi_validation_targets_do_not_pin_scan_channel():
     for name, test in _tests_by_name().items():
         defines = _all_defines(test)
         assert "WifiChannel" not in defines, name
+
+
+def test_wasm_sd_store_target_exercises_exfat_repository_workflow():
+    test = _tests_by_name()["m0_wasm_sd_store_test"]
+    required = test.get("required", [])
+    assert "[PASS] WASM program saved to SD" in required
+    assert "[PASS] WASM program listed on SD" in required
+    assert "[PASS] WASM program installed from SD" in required
+    assert "[PASS] WASM program invoked from SD-installed slot" in required
+    assert "[PASS] HTTP saved WASM program to SD repository" in required
+    assert "[PASS] HTTP listed SD WASM repository" in required
+    assert "[PASS] HTTP installed SD WASM program into flash slot" in required
+    assert "[PASS] HTTP invoked SD-installed WASM program" in required
+    assert "[PASS] HTTP deleted WASM program from SD repository" in required
+
+    example = (REPO_ROOT / "examples/m0_wasm_sd_store_test.nim").read_text()
+    for expected in [
+        "saveWasmProgramToSd(",
+        "listWasmProgramsOnSd(",
+        "installWasmProgramFromSd(",
+        "runWasmProgramI32(",
+        '"/wasm/repository/"',
+        '"/wasm/programs/2/invoke/add"',
+    ]:
+        assert expected in example
+
+    http = (REPO_ROOT / "src/bl808/wasm_http.nim").read_text()
+    for expected in [
+        'RepositoryPath = "/wasm/repository"',
+        "proc parseRepositoryPath",
+        "proc parseRepositoryInstallPath",
+        "saveWasmProgramToSd(",
+        "installNamedWasmProgramFromSd(",
+        "deleteWasmProgramFromSd(",
+    ]:
+        assert expected in http
+
+    sd_store = (REPO_ROOT / "src/bl808/wasm_sd_store.nim").read_text()
+    for expected in [
+        'WasmSdProgramDir* = "0:/programs"',
+        "proc validWasmSdName*",
+        "proc saveWasmProgramToSd*",
+        "proc listWasmProgramsOnSd*",
+        "proc installNamedWasmProgramFromSd*",
+        "proc installWasmProgramFromSdStreamed*",
+        "flashWrite(programSlot.flashOffset + WasmProgramHeaderLen + offset",
+        "parseFlashWasmModule(",
+    ]:
+        assert expected in sd_store
+
+
+def test_wasm_manager_target_exposes_runtime_capabilities():
+    test = _tests_by_name()["m0_wasm_manager_test"]
+    defines = _all_defines(test)
+    assert defines.get("bl808WasmCompact") == "1"
+    required = test.get("required", [])
+    assert "[PASS] manager runtime capabilities exposed" in required
+    assert "[PASS] http adapter exposed WASM capabilities" in required
+
+    runtime = (REPO_ROOT / "src/bl808/wasm_runtime.nim").read_text()
+    for expected in [
+        "WasmRuntimeCapabilities*",
+        "proc wasmRuntimeCapabilities*",
+        "proc wasmRuntimeCapabilityWord*",
+        "softwareF32*",
+        "supportsF64*",
+    ]:
+        assert expected in runtime
+
+    http = (REPO_ROOT / "src/bl808/wasm_http.nim").read_text()
+    for expected in [
+        'CapabilitiesPath = "/wasm/capabilities"',
+        "proc capabilitiesResponse()",
+        "wasmRuntimeCapabilities()",
+    ]:
+        assert expected in http
+
+    example = (REPO_ROOT / "examples/m0_wasm_manager_test.nim").read_text()
+    scheduler_smoke = (REPO_ROOT / "src/bl808/wasm_scheduler_smoke.nim").read_text()
+    for expected in [
+        "let caps = wasmRuntimeCapabilities()",
+        "caps.core != wasmCoreM0",
+        '"/wasm/capabilities"',
+        "runWasmSchedulerSmoke",
+        '"/wasm/programs/4/start/add"',
+        '"/wasm/tasks/run"',
+        '"/wasm/tasks"',
+    ]:
+        assert expected in example
+    for expected in [
+        "WasmSchedulerSmokeQuotaFailed",
+        "WasmSchedulerSmokeBlockFailed",
+        "wasmSchedQuotaExceeded",
+        "wasmTaskBlockedSd",
+    ]:
+        assert expected in scheduler_smoke
+
+    test = _tests_by_name()["m0_wasm_manager_test"]
+    required = test.get("required", [])
+    assert "[PASS] manager scheduled WASM tasks cooperatively" in required
+    assert "[PASS] http adapter started WASM task" in required
+    assert "[PASS] http adapter ran WASM scheduler" in required
+    assert "[PASS] http adapter listed WASM tasks" in required
+
+
+def test_wasm_cps_scheduler_target_prevents_runtime_starvation():
+    test = _tests_by_name()["m0_wasm_cps_scheduler_test"]
+    defines = _all_defines(test)
+    assert defines.get("bl808WasmCompact") == "1"
+    required = test.get("required", [])
+    assert "[PASS] CPS WASM program installed" in required
+    assert "[PASS] CPS drove WASM task without starving scheduler" in required
+    assert "[PASS] CPS WASM quota trap surfaced" in required
+
+    cps_runner = (REPO_ROOT / "src/bl808/wasm_cps.nim").read_text()
+    for expected in [
+        "proc runWasmTaskCps*",
+        "await yieldNow()",
+        "resumeWasmProgramTask",
+        "CpsFuture[WasmControlTaskResult]",
+        "return await runWasmTaskCps",
+    ]:
+        assert expected in cps_runner
+
+    example = (REPO_ROOT / "examples/m0_wasm_cps_scheduler_test.nim").read_text()
+    for expected in [
+        "import bl808/kernel/cps",
+        "heartbeatTask",
+        "startAndRunWasmProgramTaskCps",
+        "heartbeatTicks < 4'u32",
+        "runScheduler()",
+    ]:
+        assert expected in example
+
+
+def test_cross_core_wasm_smokes_expose_runtime_capability_profiles():
+    tests = _tests_by_name()
+    glb = (REPO_ROOT / "src/bl808/glb.nim").read_text()
+    assert "D0FlashCopyBytes* = 256'u * 1024'u" in glb
+
+    m0 = tests["m0_wasm_smoke_test"]
+    assert "[PASS] M0 WASM runtime capabilities match M0 profile" in m0.get("required", [])
+    assert "[PASS] M0 WASM task context switching smoke passed" in m0.get("required", [])
+    m0_example = (REPO_ROOT / "examples/m0_wasm_smoke_test.nim").read_text()
+    for expected in [
+        "ExpectedM0WasmCaps",
+        "wasmCoreM0",
+        "wasmRuntimeCapabilityWord()",
+        "runWasmTaskSmoke()",
+    ]:
+        assert expected in m0_example
+
+    d0 = tests["d0_wasm_smoke_test"]
+    assert "[PASS] D0 WASM runtime capabilities match D0 profile" in d0.get("required", [])
+    assert "[PASS] D0 WASM task context switching smoke passed" in d0.get("required", [])
+    d0_helper = (REPO_ROOT / "examples/m0_d0_wasm_smoke_test.nim").read_text()
+    d0_worker = (REPO_ROOT / "examples/d0_wasm_smoke_test.nim").read_text()
+    for expected in [
+        "D0WasmCapsAddr",
+        "D0WasmTaskStatusAddr",
+        "ExpectedD0WasmCaps",
+        "wasmCoreD0",
+        "wasmRuntimeCapabilityWord()",
+        "runWasmTaskSmoke()",
+    ]:
+        assert expected in d0_helper or expected in d0_worker
+
+    lp = tests["lp_wasm_smoke_test"]
+    assert "[PASS] LP WASM runtime capabilities match LP compact profile" in lp.get("required", [])
+    assert "[PASS] LP WASM task context switching smoke passed" in lp.get("required", [])
+    assert lp.get("jtag_flash_chunk_size") == 1024
+    lp_helper = (REPO_ROOT / "examples/m0_lp_wasm_smoke_test.nim").read_text()
+    lp_worker = (REPO_ROOT / "examples/lp_wasm_smoke_test.nim").read_text()
+    for expected in [
+        "LpWasmCapsAddr",
+        "LpWasmTaskStatusAddr",
+        "ExpectedLpWasmCaps",
+        "wasmCoreLP",
+        "wasmRuntimeCapabilityWord()",
+        "runWasmTaskSmoke()",
+    ]:
+        assert expected in lp_helper or expected in lp_worker
+
+
+def test_enclave_wasm_smoke_exercises_task_context_switching():
+    tests = _tests_by_name()
+    test = tests["m0_enclave_wasm_smoke_test"]
+    assert "[PASS] enclave WASM task context switching smoke passed" in test.get("required", [])
+
+    example = (REPO_ROOT / "examples/m0_enclave_wasm_smoke_test.nim").read_text()
+    for expected in [
+        "import bl808/wasm_task_smoke",
+        "runWasmTaskSmoke()",
+        "WasmTaskSmokeOk",
+    ]:
+        assert expected in example
+
+
+def test_allcore_wasm_slot_smoke_requires_compact_runtime_profiles():
+    test = _tests_by_name()["allcore_wasm_slot_smoke_test"]
+    required = test.get("required", [])
+    assert "[PASS] M0 WASM slot runtime capabilities match compact profile" in required
+    assert "[PASS] M0 invoked shared WASM slot" in required
+    assert "[PASS] D0 WASM slot runtime capabilities match compact profile" in required
+    assert "[PASS] LP WASM slot runtime capabilities match compact profile" in required
+    for build in test.get("build", []):
+        if build.get("core") in {"bl808d0", "bl808lp"}:
+            assert build.get("defines", {}).get("bl808WasmCompact") == "1"
+
+    example = (REPO_ROOT / "examples/m0_allcore_wasm_slot_smoke_test.nim").read_text()
+    for expected in [
+        "ExpectedM0CompactCaps",
+        "ExpectedD0CompactCaps",
+        "ExpectedLpCompactCaps",
+        "runWasmSlotSmoke()",
+        "WasmSlotD0CapsAddr",
+        "WasmSlotLpCapsAddr",
+    ]:
+        assert expected in example
+
+
+def test_allcore_wasm_cps_live_target_exercises_all_cores_and_enclave():
+    test = _tests_by_name()["allcore_wasm_cps_live_test"]
+    required = test.get("required", [])
+    for expected in [
+        "[PASS] M0 executed multiple WASM programs under CPS",
+        "[PASS] enclave executed multiple WASM programs under CPS load",
+        "[PASS] D0 executed multiple WASM programs under CPS",
+        "[PASS] LP executed multiple WASM programs under CPS",
+    ]:
+        assert expected in required
+    assert test.get("jtag_flash_chunk_size") == 1024
+
+    defines = _all_defines(test)
+    assert defines.get("bl808WasmCompact") == "1"
+    assert defines.get("bl808enclave") == "true"
+
+    m0 = (REPO_ROOT / "examples/m0_allcore_wasm_cps_live_test.nim").read_text()
+    d0 = (REPO_ROOT / "examples/d0_wasm_cps_live_worker.nim").read_text()
+    lp = (REPO_ROOT / "examples/lp_wasm_cps_live_worker.nim").read_text()
+    for expected in [
+        "startAndRunWasmProgramTaskCps",
+        "heartbeatTask",
+        "svcWasmTaskStartI32",
+        "svcWasmInvokeI32",
+        "releaseD0()",
+        "releaseLPAt(LpWramBootGateAddr)",
+        "pdsSetLpL1cRange(FlashXipBase + Ox64LPBootOffset",
+        "pdsDisableLpL1c()",
+        "sfCtrlSetLpImageOffsetToGroup1()",
+        "sfCtrlRestoreXip()",
+        "writeWasmSlotInvokeRequest(WasmSlotD0RequestAddr",
+        "writeWasmSlotInvokeRequest(WasmSlotLpRequestAddr",
+        "regWrite(WasmLiveLpStartAddr, WasmLiveLpStartMagic)",
+        "await m0Task",
+        "await enclaveTask",
+        "await d0Task",
+        "await lpTask",
+    ]:
+        assert expected in m0
+    for source in [d0, lp]:
+        assert "import bl808/kernel/cps" in source
+        assert "startAndRunWasmProgramTaskCps" in source
+        assert "heartbeatTask" in source
+        assert "runScheduler()" in source
+    assert "WasmLiveLpStartMagic" in lp
+
+    partition = (REPO_ROOT / "src/bl808/enclave/partition.nim").read_text()
+    for expected in [
+        "import ../mmio, ../memmap, ../tzc, ../pmp, ../flash_layout",
+        "let lpRaw = lpRuntimeMappedFlashSpan()",
+        "let wasmMcuXip = peerMcuXipFlashSpan()",
+        "let wasmRaw = wasmRepositoryRawFlashSpan()",
+        "let lpFlash = lpRuntimeXipSpan()",
+        "tzcConfigureWindowRegion(tzcWinSf, 0",
+        "tzcConfigureWindowRegion(tzcWinSf, 1",
+        "tzcConfigureWindowRegion(tzcWinSf, 2",
+        "tzcConfigureWindowRegion(tzcWinSf, 3",
+        "tzcSetSfCtrlGroups(tzcSfCr, {0.TzcAuthGroup, 1.TzcAuthGroup}",
+        "tzcSetSfCtrlGroups(tzcSfSec, {0.TzcAuthGroup, 1.TzcAuthGroup}",
+        "tzcSetSfCtrlModeArb(lock = p.lock)",
+        "tzcSetNsecSfCtrlModeArb(lock = p.lock)",
+        "tzcSetNsecMasterGroup(m, 0, lock = p.lock)",
+        "{0.TzcAuthGroup, 1.TzcAuthGroup}",
+    ]:
+        assert expected in partition
+    flash = (REPO_ROOT / "src/bl808/flash.nim").read_text()
+    assert "import mmio, memmap, flash_layout" in flash
+    assert "when defined(bl808d0) or defined(bl808lp):" in flash
+    assert "regRead(SfCtrlImageOffset1)" in flash
+    assert "flashXipAddrForCore(offset, mappedOffset)" in flash
+    assert "LpRuntimeFlashOffset - Ox64LPBootOffset.uint32" in flash
+    flash_layout = (REPO_ROOT / "src/bl808/flash_layout.nim").read_text()
+    for expected in [
+        "WasmRepositoryFlashOffset* = Ox64WasmStoreOffset.uint32",
+        "McuXipAliasBase* = FlashXipBase",
+        "D0XipAliasBase* = FlashXipBase",
+        "D0FlashRemapAliasBase* = FlashRemapBase",
+        "LpRuntimeFlashOffset* = 0x0C_0000'u32",
+        "LpRuntimeFlashLen* = (Ox64D0BootOffset - LpRuntimeFlashOffset.uint).uint32",
+        "proc flashXipAddrForCore*",
+        "if offset >= mappedOffset:",
+        "flashXipBaseForCore() + uint(offset - mappedOffset)",
+        "proc lpRuntimeFlashSpan*",
+        "proc lpRuntimeMappedFlashSpan*",
+        "proc lpRuntimeXipSpan*",
+        "proc wasmRepositoryRawFlashSpan*",
+        "proc peerMcuXipFlashSpan*",
+        "proc peerD0WasmFlashSpan*",
+    ]:
+        assert expected in flash_layout
+
+    probe = _tests_by_name()["allcore_wasm_cps_live_d0_flash_probe"]
+    assert "D0_status=0x574C5607" in probe.get("required", [])
+    probe_d0 = [b for b in probe.get("build", []) if b.get("core") == "bl808d0"][0]
+    assert probe_d0.get("defines", {}).get("bl808LiveD0FlashProbeOnly") == "1"
+    harness = (REPO_ROOT / "tools/hw_validate.py").read_text()
+    assert "JTAG_FLASH_LP_OFFSET = 0x0C0000" in harness
+
+
+def test_allcore_wasm_http_manager_keeps_enclave_and_validated_wifi_memory():
+    test = _tests_by_name()["allcore_wasm_http_manager_test"]
+    required = test.get("required", [])
+    for expected in [
+        "[PASS] enclave executed multiple WASM programs under CPS load",
+        "[PASS] D0 executed multiple WASM programs under CPS",
+        "[PASS] LP executed multiple WASM programs under CPS",
+        "[M0] allcore_http_dhcp_observed_lease",
+        "Ready for all-core WASM HTTP manager requests",
+    ]:
+        assert expected in required
+    assert test.get("jtag_flash_chunk_size") == 1024
+
+    defines = _all_defines(test)
+    for name in [
+        "bl808AllcoreWasmHttp",
+        "bl808WasmCompact",
+        "bl808WifiNimFw",
+        "bl808WifiUseBl808Rf",
+        "bl808WifiRealLwip",
+        "bl808WifiRealLwipTcp",
+        "bl808WifiRxPbufInput",
+        "bl808WifiConnectCacheHint",
+    ]:
+        assert defines.get(name) == "1"
+    assert defines.get("HwValidationLogExternalBuffer") == "1"
+    assert defines.get("bl808WifiRfWb03AuthTxSettleUs") == "5000"
+    assert defines.get("bl808enclave") == "true"
+    assert defines.get("bl808EnclaveWram") == "true"
+    assert defines.get("WifiSsid") == "Frog"
+    assert defines.get("WifiPassword") == "6509171272"
+    assert defines.get("StaticIpA") == "192"
+    assert defines.get("StaticIpB") == "168"
+    assert defines.get("StaticIpC") == "1"
+    assert defines.get("StaticIpD") == "223"
+    assert defines.get("StaticGatewayA") == "192"
+    assert defines.get("StaticGatewayB") == "168"
+    assert defines.get("StaticGatewayC") == "1"
+    assert defines.get("StaticGatewayD") == "254"
+    assert defines.get("StaticIpAfterDhcpAttempts") == "1"
+    assert "WifiChannel" not in defines
+
+    m0 = (REPO_ROOT / "examples/m0_allcore_wasm_cps_live_test.nim").read_text()
+    linker = (REPO_ROOT / "src/linker/bl808_m0_allcore_http.ld").read_text()
+    layout_types = (REPO_ROOT / "src/bl808/wifi/fw/layout_types.nim").read_text()
+    for expected in [
+        "initAllcoreHttpMemory()",
+        "psramInit(psram64mb, psramBurst64)",
+        "handleWasmCpsHttpTransport",
+        "await enclaveTask",
+        "holdD0Reset()",
+        "holdLPReset()",
+        "wifiInstallServiceHook",
+        "await wifiScanAsync",
+        "wifiConnectAsync(",
+        "bl808WpaCurrentState()",
+        "WpaCompletedState = 10'u32",
+        "Ready for all-core WASM HTTP manager requests",
+    ]:
+        assert expected in m0
+    assert "WifiChannel {.intdefine.} = 0" in m0
+    assert "WifiChannel.uint8" in m0
+    for expected in [
+        "HEAP_RAM (rw)  : ORIGIN = 0x50000000",
+        "WIFI_RAM (rw)  : ORIGIN = 0x22030000",
+        ".wifirxram",
+        "__wifi_rx_ram_start",
+        "__wifi_rx_ram_end",
+        ".psrambss",
+        ".wifibss",
+        "RAMFUNC  (rwx) : ORIGIN = 0x2204F000, LENGTH = 4K",
+        "RAM      (rwx) : ORIGIN = 0x62020000, LENGTH = 56K",
+        "_stack_size = 10K",
+        "*(.jtaglog .jtaglog.*)",
+        "__wifi_rx_ram_end <= __wifi_bss_end",
+        "_ebss <= _sstack - 1024",
+    ]:
+        assert expected in linker
+    assert "when defined(bl808AllcoreWasmHttp)" in layout_types
+    assert 'section(\\".wifirxram\\")' in layout_types
+    wifi_state = (REPO_ROOT / "src/bl808/wifi/support/state.nim").read_text()
+    assert "section(\\\".psrambss\\\")" in wifi_state
+    assert "var scanDiag {.allcoreHttpPsramBss.}" in wifi_state
+    assert "var scanCache {.allcoreHttpPsramBss.}" in wifi_state
+    partition = (REPO_ROOT / "src/bl808/enclave/partition.nim").read_text()
+    for expected in [
+        "lnkWifiBssStart()",
+        "lnkWifiBssEnd()",
+        "tzcConfigureWindowRegion(tzcWindowForCachedRam(lnkWifiBssStart()), 1",
+        "lnkWifiRxRamStart()",
+        "lnkWifiRxRamEnd()",
+        "tzcConfigureWindowRegion(tzcWinWram, 1",
+        "{tzcMasterM0, tzcMasterWifi, tzcMasterDma0, tzcMasterDma1}",
+    ]:
+        assert expected in partition
+    tzc = (REPO_ROOT / "src/bl808/tzc.nim").read_text()
+    assert "tzcWinPsramA" in tzc
+    assert "TzcSecPsramACtrl" in tzc
+
+
+def test_enclave_wasm_store_target_exercises_service_abi_contract():
+    test = _tests_by_name()["m0_enclave_wasm_store_test"]
+    required = test.get("required", [])
+    assert "[PASS] report WASM runtime capabilities through enclave service" in required
+    assert "[PASS] install WASM bytes through enclave service" in required
+    assert "[PASS] invoke enclave-installed WASM slot" in required
+    assert "[PASS] unload WASM slot through enclave service" in required
+    assert "[PASS] invoke flash-backed WASM slot through enclave service" in required
+    assert "[PASS] start WASM task through enclave service" in required
+    assert "[PASS] resume WASM task through enclave service" in required
+    assert "[PASS] report WASM task status through enclave service" in required
+    assert "[PASS] reap WASM task through enclave service" in required
+    assert "[PASS] reject malformed WASM enclave invoke request" in required
+    assert "[PASS] report bad WASM slot through enclave service" in required
+    assert "[PASS] seal flash-backed WASM result status" in required
+
+    example = (REPO_ROOT / "examples/m0_enclave_wasm_store_test.nim").read_text()
+    for expected in [
+        "svcWasmInvokeI32",
+        "svcWasmCapabilities",
+        "svcWasmInstallBytes",
+        "svcWasmUnloadSlot",
+        "svcWasmTaskStartI32",
+        "svcWasmTaskResume",
+        "svcWasmTaskStatus",
+        "svcWasmTaskKill",
+        "rdU32(buf(), 36) != 0'u32",
+        "rdU32(buf(), 40) != 0'u32",
+        "testEnclaveWasmInstallInvokeUnload",
+        "testEnclaveWasmTaskLifecycle",
+        "testEnclaveWasmCapabilities",
+        "testEnclaveWasmInvokeBadRequest",
+        "testEnclaveWasmInvokeBadSlot",
+        "svcBadRequest",
+        "wasmControlBadSlot",
+    ]:
+        assert expected in example
+
+
+def test_enclave_wasm_ecall_target_exercises_real_ecall_service():
+    test = _tests_by_name()["m0_enclave_wasm_ecall_test"]
+    defines = _all_defines(test)
+    assert defines.get("bl808enclave") == "true"
+    assert defines.get("bl808WasmCompact") == "true"
+    required = test.get("required", [])
+    assert "[PASS] installed WASM slot for U-mode ecall" in required
+    assert "[PASS] U-mode invoked WASM through enclave ecall" in required
+    assert "[PASS] U-mode managed WASM slot through enclave ecall" in required
+
+    example = (REPO_ROOT / "examples/m0_enclave_wasm_ecall_test.nim").read_text()
+    for expected in [
+        "installWasmSlotSmoke()",
+        "svcWasmCapabilities.uint32",
+        "svcWasmInvokeI32.uint32",
+        "svcWasmInstallBytes.uint32",
+        "svcWasmUnloadSlot.uint32",
+        "SvcReportManage",
+        "wasmControlOk.ord.uint32",
+        "callerUmodeAppCtx()",
+        "enclaveRunUmode(umodeAppAddr())",
+    ]:
+        assert expected in example
+
+
+def test_d0_enclave_wasm_ipc_target_exercises_peer_service_transport():
+    test = _tests_by_name()["m0_d0_enclave_wasm_ipc_test"]
+    builds = test.get("build", [])
+    assert [b.get("core") for b in builds] == ["bl808m0", "bl808d0"]
+    assert _all_defines(test).get("bl808enclave") == "true"
+    required = test.get("required", [])
+    assert "[PASS] D0 managed WASM through enclave IPC" in required
+
+    m0 = (REPO_ROOT / "examples/m0_d0_enclave_wasm_ipc_test.nim").read_text()
+    for expected in [
+        "enclaveInit(defaultPartition(lock = true), rkSoftDev)",
+        "enclaveIpcPoll()",
+        "releaseD0()",
+        "D0 managed WASM through enclave IPC",
+    ]:
+        assert expected in m0
+
+    d0 = (REPO_ROOT / "examples/d0_enclave_wasm_ipc_client.nim").read_text()
+    for expected in [
+        "svcWasmCapabilities",
+        "svcWasmInstallBytes",
+        "svcWasmInvokeI32",
+        "svcWasmUnloadSlot",
+        "ipcSendMessage(ipcM0, SvcIpcTagBase + svc.uint16",
+    ]:
+        assert expected in d0
+
+
+def test_lp_enclave_wasm_ipc_target_exercises_peer_service_transport():
+    test = _tests_by_name()["m0_lp_enclave_wasm_ipc_test"]
+    builds = test.get("build", [])
+    assert [b.get("core") for b in builds] == ["bl808m0", "bl808lp"]
+    assert _all_defines(test).get("bl808enclave") == "true"
+    assert test.get("jtag_flash_chunk_size") == 1024
+    required = test.get("required", [])
+    assert "[PASS] LP managed WASM through enclave IPC" in required
+
+    m0 = (REPO_ROOT / "examples/m0_lp_enclave_wasm_ipc_test.nim").read_text()
+    for expected in [
+        "enclaveInit(defaultPartition(lock = true), rkSoftDev)",
+        "enclaveIpcPoll()",
+        "releaseLP()",
+        "LP managed WASM through enclave IPC",
+    ]:
+        assert expected in m0
+
+    lp = (REPO_ROOT / "examples/lp_enclave_wasm_ipc_client.nim").read_text()
+    for expected in [
+        "svcWasmCapabilities",
+        "svcWasmInstallBytes",
+        "svcWasmInvokeI32",
+        "svcWasmUnloadSlot",
+        "sendM0RequestFast(SvcIpcTagBase + svc.uint16",
+    ]:
+        assert expected in lp
 
 
 def test_runtime_jtag_reset_capture_does_not_require_startup_banner():

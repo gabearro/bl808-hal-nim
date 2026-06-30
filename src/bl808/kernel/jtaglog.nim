@@ -8,20 +8,29 @@ const
   HwValidationLogMagic* = 0x474C544A'u32 # "JTLG" little-endian
   HwValidationLogCapacity* {.intdefine.} = 8192
 
-var
-  hwValidationLogMagic* {.exportc: "hw_validation_log_magic".}: uint32 =
-    HwValidationLogMagic
-  hwValidationLogCapacity* {.exportc: "hw_validation_log_capacity".}: uint32 =
-    HwValidationLogCapacity
-  hwValidationLogWrite* {.exportc: "hw_validation_log_write".}: uint32 = 0
-  hwValidationLogWrapped* {.exportc: "hw_validation_log_wrapped".}: uint32 = 0
 when defined(HwValidationLogExternalBuffer):
   var
+    hwValidationLogMagic* {.exportc: "hw_validation_log_magic",
+                            codegenDecl: "$# $# __attribute__((section(\".jtaglog\"), used))".}: uint32 =
+      HwValidationLogMagic
+    hwValidationLogCapacity* {.exportc: "hw_validation_log_capacity",
+                               codegenDecl: "$# $# __attribute__((section(\".jtaglog\"), used))".}: uint32 =
+      HwValidationLogCapacity
+    hwValidationLogWrite* {.exportc: "hw_validation_log_write",
+                            codegenDecl: "$# $# __attribute__((section(\".jtaglog\"), used))".}: uint32 = 0
+    hwValidationLogWrapped* {.exportc: "hw_validation_log_wrapped",
+                              codegenDecl: "$# $# __attribute__((section(\".jtaglog\"), used))".}: uint32 = 0
     hwValidationLogBuffer* {.exportc: "hw_validation_log_buffer",
                              codegenDecl: "$# $# __attribute__((section(\".jtaglog\"), used))".}:
       array[HwValidationLogCapacity, uint8]
 else:
   var
+    hwValidationLogMagic* {.exportc: "hw_validation_log_magic".}: uint32 =
+      HwValidationLogMagic
+    hwValidationLogCapacity* {.exportc: "hw_validation_log_capacity".}: uint32 =
+      HwValidationLogCapacity
+    hwValidationLogWrite* {.exportc: "hw_validation_log_write".}: uint32 = 0
+    hwValidationLogWrapped* {.exportc: "hw_validation_log_wrapped".}: uint32 = 0
     hwValidationLogBuffer* {.exportc: "hw_validation_log_buffer".}:
       array[HwValidationLogCapacity, uint8]
 

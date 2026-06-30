@@ -90,6 +90,10 @@ proc main() {.exportc, cdecl.} =
   check("secure OCRAM group-1 DENIED (bits[3:2]=0)", (grp and 0xC'u32) == 0'u32)
   check("secure OCRAM window enabled", tzcWindowRegionEnabled(tzcWinOcram, 0))
   check("secure OCRAM window locked", tzcWindowRegionLocked(tzcWinOcram, 0))
+  check("PWR/HBN slave assigned secure group",
+        tzcSlaveGroupField(tzcSlavePwr) == 0x1'u32)
+  check("TRNG SEC_ENG block assigned secure group",
+        tzcSeBlockGroupField(tzcSeTrng) == 0x1'u32)
 
   discard console.sendString("Result: ")
   console.sendHex32(passed.uint32)

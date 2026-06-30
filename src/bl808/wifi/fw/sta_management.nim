@@ -181,14 +181,11 @@ proc sta_mgmt_add_key*(param: pointer, hwKeyIdx: uint8) {.exportc, cdecl.} =
   # Dispatch on key type
   case keyType
   of 1, 2:
-    # CCMP: clear PN, copy key from param+24. The supplicant set_key path
-    # passes translated cipher 2, while the vendor branch also accepts the
-    # CCMP table value 1.
+    # CCMP: clear PN and install the pairwise temporal key. The supplicant
+    # set_key path passes translated cipher 2, while the vendor branch also
+    # accepts the CCMP table value 1.
     sta.pnLow = 0
     sta.pnHigh = 0
-    # Copy 16-byte temporal key from param+24 to sta+128+88. Blob inlines
-    # the word-by-word copy (4 x 4-byte loads+stores); Nim previously
-    # used two memcpy calls that aren't in blob's call graph.
     let temporalKeySrcU = cast[uint](machwKeyWriteKeyTailPtr(req))
     let temporalKeyDstU = cast[uint](addr sta.keyTail[0])
     for temporalKeyWordIndex in 0 ..< 4:

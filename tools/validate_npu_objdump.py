@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from collections import defaultdict
@@ -34,6 +35,16 @@ REGISTER_WINDOWS = {
 }
 
 
+def parse_missing_shared_libraries(ldd_text: str) -> list[str]:
+    """Return shared libraries reported as missing by an ldd-style probe."""
+    missing: list[str] = []
+    for line in ldd_text.splitlines():
+        match = re.match(r"\s*([^\s]+)\s+=>\s+not found\b", line)
+        if match:
+            missing.append(match.group(1))
+    return sorted(set(missing))
+
+
 def tool_path(name: str, env_name: str | None = None) -> str:
     if env_name and os.environ.get(env_name):
         return os.environ[env_name]
@@ -48,7 +59,8 @@ def tool_path(name: str, env_name: str | None = None) -> str:
 
 
 def run(cmd: list[str]) -> str:
-    return subprocess.check_output(cmd, text=True, errors="ignore")
+    return subprocess.check_output(
+        cmd, text=True, errors="ignore", stderr=subprocess.PIPE)
 
 
 def candidate_roots(args: argparse.Namespace) -> list[Path]:
@@ -79,6 +91,17 @@ def iter_inputs(roots: Iterable[Path], keywords: tuple[str, ...]) -> list[Path]:
             for path in root.rglob(suffix):
                 if is_candidate(path, keywords):
                     out.append(path)
+        for path in root.rglob("*"):
+            if not path.is_file() or path.suffix:
+                continue
+            if not is_candidate(path, keywords):
+                continue
+            try:
+                mode = path.stat().st_mode
+            except OSError:
+                continue
+            if mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+                out.append(path)
     return sorted(set(out))
 
 
@@ -203,7 +226,10 @@ def main() -> int:
 
     try:
         objdump = tool_path("llvm-objdump", "LLVM_OBJDUMP")
-        nm = tool_path("riscv64-unknown-elf-nm")
+        try:
+            nm = tool_path("llvm-nm", "LLVM_NM")
+        except RuntimeError:
+            nm = tool_path("riscv64-unknown-elf-nm")
         inputs = iter_inputs(roots, keywords)
         if not inputs:
             print("No candidate NPU/BLAI objects or archives found.", file=sys.stderr)
