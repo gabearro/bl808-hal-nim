@@ -21,3 +21,6 @@ proc wifiBackendUsesEventFutures(): bool {.inline.} =
 
 proc wifiBackendStaDisconnect(): cint {.inline.} =
   wifi_mgmr_sta_disconnect()
+
+proc wifiBackendStaConnectAbort(): cint {.inline.} =
+  wifi_mgmr_sta_connect_abort()

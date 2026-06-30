@@ -479,6 +479,16 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
      let dbgFc =
        if dbgPayload != 0: cast[ptr uint16](dbgPayload.uint)[].uint32
        else: 0'u32
+     inc nimFwDbgRxlFrameSeen
+     nimFwDbgRxlLastHwFlags = hwFlags
+     nimFwDbgRxlLastFc = dbgFc
+     if (dbgFc and 0x000C'u32) == 0'u32:
+       inc nimFwDbgRxlMgmtSeen
+       nimFwDbgRxlMgmtLast = dbgFc or (hwFlags and 0xFFFF0000'u32)
+     if (dbgFc and 0x00FC'u32) == 0x00B0'u32:
+       inc nimFwDbgRxlAuthLikeSeen
+       nimFwDbgRxlAuthLikeHwFlags = hwFlags
+       nimFwDbgRxlAuthLikeFc = dbgFc
      nimFwTrace2U32("[WIFI-NIMFW] rxl_frame ", hwFlags, dbgFc)
      if (hwFlags and 0x20020000'u32) != 0x20020000'u32:
        releaseFrame = rxu_cntrl_frame_handle(queuedRxMpduDesc) == 0

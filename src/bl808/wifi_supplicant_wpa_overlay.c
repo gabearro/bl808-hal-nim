@@ -12,6 +12,11 @@
 #undef aes_unwrap
 #undef wpa_set_bss
 
+uint32_t bl808_wpa_current_state(void)
+{
+    return (uint32_t)gWpaSm.wpa_state;
+}
+
 extern volatile uint32_t nimfw_dbg_keydata_decrypt_calls;
 extern volatile uint32_t nimfw_dbg_keydata_decrypt_len;
 extern volatile uint32_t nimfw_dbg_keydata_decrypt_out_len;

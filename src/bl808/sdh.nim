@@ -33,6 +33,7 @@ const
   SdhAdmaErr*       = SdhBase + 0x54'u   # ADMA error status
   SdhAdmaAddr*      = SdhBase + 0x58'u   # ADMA system address
   SdhSlotIntSts*    = SdhBase + 0xFC'u   # Slot interrupt status / host version
+  SdhTxCfg*         = SdhBase + 0x118'u  # BL808 SDH TX configuration
 
 # =============================================================================
 # Transfer mode / command fields
@@ -41,8 +42,10 @@ const
   # Transfer mode (lower 16 bits of 0x0C)
   TmDmaEn*          = 0       # DMA enable
   TmBlkCntEn*       = 1       # Block count enable
-  TmAutoCmd12*      = 2       # Auto CMD12 enable
-  TmAutoCmd23*      = 3       # Auto CMD23 enable
+  TmAutoCmdShift*   = 2       # Auto-command select [3:2]
+  TmAutoCmdDisable* = 0'u16   # Auto command disabled
+  TmAutoCmd12*      = 1'u16   # Auto CMD12 enable
+  TmAutoCmd23*      = 2'u16   # Auto CMD23 enable
   TmDataDir*        = 4       # Data direction (1=read, 0=write)
   TmMultiBlock*     = 5       # Multi-block transfer
 
@@ -53,6 +56,10 @@ const
   CmdIdxEn*         = 20      # Index check enable
   CmdDataPresent*   = 21      # Data present
   CmdTypeShift*     = 22      # Command type [23:22]
+  CmdTypeNormal*    = 0'u32   # Normal command
+  CmdTypeSuspend*   = 1'u32   # Suspend command
+  CmdTypeResume*    = 2'u32   # Resume command
+  CmdTypeAbort*     = 3'u32   # Abort command, used by CMD12 stop
   CmdIdxShift*      = 24      # Command index [29:24]
   CmdIdxMask*       = 0x3F'u32 shl 24
 
@@ -123,6 +130,7 @@ const
   Hc8BitMode*       = 5       # 8-bit data width (eMMC)
   HcBusPowerShift*  = 8       # Bus power [11:8]
   HcBusVoltShift*   = 9       # Bus voltage [11:9]
+  TxIntClkSel*      = 30      # BL808: select internal TX clock
 
 # =============================================================================
 # Types
@@ -158,6 +166,14 @@ proc sdhReset*() =
     timeout.dec
     if timeout == 0: break
 
+proc sdhResetData*() =
+  ## Reset only the DAT state machine/FIFO.
+  regSet(SdhClockCtrl, 1'u32 shl ClkSwRstDat)
+  var timeout = 100_000'u32
+  while (regRead(SdhClockCtrl) and (1'u32 shl ClkSwRstDat)) != 0:
+    timeout.dec
+    if timeout == 0: break
+
 proc sdhInit*(): SdhError =
   ## Initialize the SD Host Controller.
   sdhReset()
@@ -178,7 +194,12 @@ proc sdhInit*(): SdhError =
   # Set timeout
   regModify(SdhClockCtrl, ClkTimeoutMask, 0x0E'u32 shl ClkTimeoutShift)
 
+  # BL808 SDK sets TX_INT_CLK_SEL during SDH init. Without it, card-side
+  # high-speed mode can keep reads working while CMD24/CMD25 writes time out.
+  regSet(SdhTxCfg, 1'u32 shl TxIntClkSel)
+
   # Enable bus power (3.3V)
+  regModify(SdhHostCtrl, 0x03'u32 shl HcDmaSelShift, 2'u32 shl HcDmaSelShift)
   regModify(SdhHostCtrl, 0x0F'u32 shl HcBusPowerShift,
             (1'u32 shl HcBusPowerShift) or (7'u32 shl HcBusVoltShift))
 
@@ -205,6 +226,7 @@ proc sdhCardStable*(): bool =
 proc sdhSendCommand*(cmdIndex: uint32, argument: uint32,
                      respType: SdhRespType, dataPresent: bool = false,
                      transferMode: uint16 = 0, crcCheck: bool = true,
+                     cmdType: uint32 = CmdTypeNormal,
                      timeout: uint32 = 1_000_000): SdhError =
   ## Send an SD command and wait for completion.
 
@@ -214,13 +236,25 @@ proc sdhSendCommand*(cmdIndex: uint32, argument: uint32,
     countdown.dec
     if countdown == 0: return sdhTimeout
 
+  if dataPresent:
+    countdown = timeout
+    while (regRead(SdhPresentState) and (1'u32 shl PsDatInhibit)) != 0:
+      countdown.dec
+      if countdown == 0: return sdhTimeout
+
+  # Drop stale completion/error bits before issuing the next command. Leaving a
+  # previous data error pending can make the following FatFs flush fail even
+  # though the command line itself is usable.
+  regWrite(SdhIntStatus, 0xFFFF_FFFF'u32)
+
   # Set argument
   regWrite(SdhArgument, argument)
 
   # Build command register value
   var cmd = transferMode.uint32 or
             (cmdIndex shl CmdIdxShift) or
-            (respType.uint32 shl CmdRespTypeShift)
+            (respType.uint32 shl CmdRespTypeShift) or
+            ((cmdType and 0x3'u32) shl CmdTypeShift)
   if crcCheck and (respType == resp48bit or respType == resp48busy):
     # Enable CRC and index check for R1/R6/R7 responses.
     # R3 (OCR) has no CRC or index check, so callers pass crcCheck = false.
@@ -230,18 +264,30 @@ proc sdhSendCommand*(cmdIndex: uint32, argument: uint32,
   if dataPresent:
     cmd = cmd or (1'u32 shl CmdDataPresent)
 
-  # Send command
-  regWrite(SdhTransferMode, cmd)
+  # Program transfer mode first, then write the command halfword to trigger the
+  # transaction. BL808's SDK uses this ordering; ADMA can report descriptor
+  # length errors when mode+command are written as one 32-bit store.
+  regWrite16(SdhTransferMode, transferMode)
+  regWrite16(SdhTransferMode + 2'u, (cmd shr 16).uint16)
 
   # Wait for command complete
   countdown = timeout
   while countdown > 0:
     let sts = regRead(SdhIntStatus)
+    if dataPresent and (transferMode and (1'u16 shl TmDmaEn)) == 0:
+      if (transferMode and (1'u16 shl TmDataDir)) != 0:
+        if (sts and (1'u32 shl IntBufReadRdy)) != 0:
+          regWrite(SdhIntStatus, 0x000F_0000'u32)
+          return sdhOk
+      else:
+        if (sts and (1'u32 shl IntBufWriteRdy)) != 0:
+          regWrite(SdhIntStatus, 0x000F_0000'u32)
+          return sdhOk
+    if (sts and (1'u32 shl IntErrInt)) != 0:
+      regWrite(SdhIntStatus, 0xFFFF_0000'u32)
+      return sdhCmdError
     if (sts and (1'u32 shl IntCmdComplete)) != 0:
       regWrite(SdhIntStatus, 1'u32 shl IntCmdComplete)
-      if (sts and (1'u32 shl IntErrInt)) != 0:
-        regWrite(SdhIntStatus, 0xFFFF_0000'u32)
-        return sdhCmdError
       return sdhOk
     countdown.dec
 
@@ -289,21 +335,37 @@ proc sdhSetClockDiv*(divider: uint32) =
 proc sdhReadBlock*(buf: var openArray[uint32], timeout: uint32 = 1_000_000): SdhError =
   ## Read a block of data via PIO.
   var countdown = timeout
-  while (regRead(SdhPresentState) and (1'u32 shl PsBufReadEn)) == 0:
+  while true:
+    let sts = regRead(SdhIntStatus)
+    if (sts and (1'u32 shl IntErrInt)) != 0:
+      regWrite(SdhIntStatus, 0xFFFF_0000'u32)
+      return sdhDataError
+    if (regRead(SdhPresentState) and (1'u32 shl PsBufReadEn)) != 0 or
+        (sts and (1'u32 shl IntBufReadRdy)) != 0:
+      break
     countdown.dec
     if countdown == 0: return sdhTimeout
 
   for i in 0 ..< buf.len:
     buf[i] = regRead(SdhBufferData)
+  regWrite(SdhIntStatus, 1'u32 shl IntBufReadRdy)
   sdhOk
 
 proc sdhWriteBlock*(buf: openArray[uint32], timeout: uint32 = 1_000_000): SdhError =
   ## Write a block of data via PIO.
   var countdown = timeout
-  while (regRead(SdhPresentState) and (1'u32 shl PsBufWriteEn)) == 0:
+  while true:
+    let sts = regRead(SdhIntStatus)
+    if (sts and (1'u32 shl IntErrInt)) != 0:
+      regWrite(SdhIntStatus, 0xFFFF_0000'u32)
+      return sdhDataError
+    if (regRead(SdhPresentState) and (1'u32 shl PsBufWriteEn)) != 0 or
+        (sts and (1'u32 shl IntBufWriteRdy)) != 0:
+      break
     countdown.dec
     if countdown == 0: return sdhTimeout
 
   for word in buf:
     regWrite(SdhBufferData, word)
+  regWrite(SdhIntStatus, 1'u32 shl IntBufWriteRdy)
   sdhOk

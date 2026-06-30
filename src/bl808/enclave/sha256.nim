@@ -4,13 +4,22 @@
 ## enclave core, with no DMA/cache coupling — used for key derivation and small
 ## measurements. Bulk hashing can still use the hardware SHA in sec.nim.
 
+when defined(bl808enclave) and defined(bl808EnclaveTrace):
+  import ../mmio
+
+proc shaStage(code: uint32) {.inline.} =
+  when defined(bl808enclave) and defined(bl808EnclaveTrace):
+    regWrite(0x40002E90'u, code)
+  else:
+    discard code
+
 type
   Sha256Digest* = array[32, uint8]
   Sha256Ctx* = object
     h: array[8, uint32]
     buf: array[64, uint8]
     bufLen: int
-    total: uint64
+    total: uint32
 
 const K = [
   0x428a2f98'u32, 0x71374491'u32, 0xb5c0fbcf'u32, 0xe9b5dba5'u32,
@@ -64,7 +73,7 @@ proc sha256Block(ctx: var Sha256Ctx, p: ptr UncheckedArray[uint8], off: int) =
   ctx.h[4] += e; ctx.h[5] += f; ctx.h[6] += g; ctx.h[7] += h
 
 proc sha256Update*(ctx: var Sha256Ctx, data: openArray[uint8]) =
-  ctx.total += data.len.uint64
+  ctx.total += data.len.uint32
   var i = 0
   while i < data.len:
     let take = min(64 - ctx.bufLen, data.len - i)
@@ -77,18 +86,29 @@ proc sha256Update*(ctx: var Sha256Ctx, data: openArray[uint8]) =
       ctx.bufLen = 0
 
 proc sha256Final*(ctx: var Sha256Ctx): Sha256Digest =
-  let bits = ctx.total * 8
+  shaStage(0x53460100'u32)
+  let bitsHi = ctx.total shr 29
+  let bitsLo = ctx.total shl 3
   var pad: array[72, uint8]
   pad[0] = 0x80
   var padLen = if ctx.bufLen < 56: 56 - ctx.bufLen else: 120 - ctx.bufLen
-  for i in 0 ..< 8:
-    pad[padLen + i] = ((bits shr ((7 - i) * 8)) and 0xFF).uint8
+  pad[padLen + 0] = ((bitsHi shr 24) and 0xFF).uint8
+  pad[padLen + 1] = ((bitsHi shr 16) and 0xFF).uint8
+  pad[padLen + 2] = ((bitsHi shr 8) and 0xFF).uint8
+  pad[padLen + 3] = (bitsHi and 0xFF).uint8
+  pad[padLen + 4] = ((bitsLo shr 24) and 0xFF).uint8
+  pad[padLen + 5] = ((bitsLo shr 16) and 0xFF).uint8
+  pad[padLen + 6] = ((bitsLo shr 8) and 0xFF).uint8
+  pad[padLen + 7] = (bitsLo and 0xFF).uint8
+  shaStage(0x53460110'u32)
   sha256Update(ctx, toOpenArray(pad, 0, padLen + 8 - 1))
+  shaStage(0x53460120'u32)
   for i in 0 ..< 8:
     result[i*4]   = ((ctx.h[i] shr 24) and 0xFF).uint8
     result[i*4+1] = ((ctx.h[i] shr 16) and 0xFF).uint8
     result[i*4+2] = ((ctx.h[i] shr 8) and 0xFF).uint8
     result[i*4+3] = (ctx.h[i] and 0xFF).uint8
+  shaStage(0x53460130'u32)
 
 proc sha256*(data: openArray[uint8]): Sha256Digest =
   var ctx: Sha256Ctx
@@ -123,25 +143,53 @@ proc hmacSha256*(key, msg: openArray[uint8]): Sha256Digest =
 proc hkdfExtract*(salt, ikm: openArray[uint8]): Sha256Digest =
   hmacSha256(salt, ikm)
 
-proc hkdfExpand*(prk, info: openArray[uint8], outLen: int, output: var openArray[uint8]) =
+proc hkdfExpandBlock(prk: openArray[uint8], prev: Sha256Digest, prevLen: int,
+                     info: openArray[uint8], counter: uint8): Sha256Digest =
+  var k0: array[64, uint8]
+  if prk.len > 64:
+    let kh = sha256(prk)
+    for i in 0 ..< 32: k0[i] = kh[i]
+  else:
+    for i in 0 ..< prk.len: k0[i] = prk[i]
+  var ipad, opad: array[64, uint8]
+  for i in 0 ..< 64:
+    ipad[i] = k0[i] xor 0x36
+    opad[i] = k0[i] xor 0x5c
+  var inner: Sha256Ctx
+  sha256Init(inner)
+  sha256Update(inner, ipad)
+  if prevLen > 0:
+    sha256Update(inner, toOpenArray(prev, 0, prevLen - 1))
+  sha256Update(inner, info)
+  var ctr: array[1, uint8]
+  ctr[0] = counter
+  sha256Update(inner, ctr)
+  let innerDig = sha256Final(inner)
+  var outer: Sha256Ctx
+  sha256Init(outer)
+  sha256Update(outer, opad)
+  sha256Update(outer, innerDig)
+  sha256Final(outer)
+
+proc hkdfExpand*(prk, info: openArray[uint8], outLen: int,
+                 output: var openArray[uint8]): bool =
+  if outLen < 0 or outLen > output.len or outLen > 255 * 32:
+    return false
   var t: Sha256Digest
   var tLen = 0
   var produced = 0
   var counter = 1'u8
   while produced < outLen:
-    var msg: array[32 + 64 + 1, uint8]
-    var m = 0
-    for i in 0 ..< tLen: msg[m] = t[i]; inc m
-    for i in 0 ..< info.len: msg[m] = info[i]; inc m
-    msg[m] = counter; inc m
-    t = hmacSha256(prk, toOpenArray(msg, 0, m - 1))
+    t = hkdfExpandBlock(prk, t, tLen, info, counter)
     tLen = 32
     let take = min(32, outLen - produced)
     for i in 0 ..< take:
       output[produced + i] = t[i]
     produced += take
     inc counter
+  true
 
-proc hkdf*(salt, ikm, info: openArray[uint8], outLen: int, output: var openArray[uint8]) =
+proc hkdf*(salt, ikm, info: openArray[uint8], outLen: int,
+           output: var openArray[uint8]): bool =
   let prk = hkdfExtract(salt, ikm)
   hkdfExpand(prk, info, outLen, output)

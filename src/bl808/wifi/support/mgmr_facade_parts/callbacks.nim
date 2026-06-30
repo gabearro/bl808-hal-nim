@@ -3,6 +3,8 @@ proc connectCb(env, ind: pointer) {.cdecl.} =
   lastStatusCode = loadU16(ind, WifiConnStatusOff).int32
   lastReasonCode = loadU16(ind, WifiConnReasonOff).int32
   connectDone = lastStatusCode
+  when defined(bl808WifiConnectCacheHint):
+    scanCacheRecordConnectResult(lastStatusCode == 0)
   let stat = ptrAt(mgmrRaw(), MgmrStatInfoOff)
   storeU16(stat, StatStatusOff, lastStatusCode.uint16)
   storeU16(stat, StatReasonOff, lastReasonCode.uint16)

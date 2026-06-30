@@ -24,7 +24,10 @@ const
   PdsRam1*          = PdsBase + 0x20'u   # RAM retention/sleep config 1
   PdsCtl5*          = PdsBase + 0x24'u   # Additional control (WFI mask, LDO)
   PdsRam2*          = PdsBase + 0x28'u   # RAM retention/sleep config 2
+  PdsLpL1cRangeHigh* = PdsBase + 0x100'u # LP L1C cache range high
+  PdsLpL1cRangeLow* = PdsBase + 0x104'u  # LP L1C cache range low
   PdsCpuCoreCfg0*   = PdsBase + 0x110'u  # CPU core power config
+  PdsCpuCoreCfg2*   = PdsBase + 0x118'u  # LP L1C cache config
   PdsCpuCoreCfg8*   = PdsBase + 0x130'u  # LP E902 RTC/MTimer clock config
   PdsRc32mCtrl0*    = PdsBase + 0x300'u  # RC32M oscillator control
   PdsRc32mCtrl1*    = PdsBase + 0x304'u  # RC32M control
@@ -88,6 +91,16 @@ const
   PdsE902RtcEn*      = 1'u32 shl 31
   PdsE902RtcDiv1MHz* = 159'u32
     ## Ox64 LP normally uses a 160 MHz source; divider is value+1.
+
+  PdsLpL1cCacheable* = 1'u32 shl 0
+  PdsLpL1cCntEn*     = 1'u32 shl 1
+  PdsLpL1cInvalidEn* = 1'u32 shl 2
+  PdsLpL1cInvalidDone* = 1'u32 shl 3
+  PdsLpL1cWayDisMask* = 0x3'u32 shl 8
+  PdsLpL1cWayDisAll* = 0x3'u32 shl 8
+  PdsLpL1cBypass*    = 1'u32 shl 14
+  PdsLpL1cFlushEn*   = 1'u32 shl 28
+  PdsLpL1cFlushDone* = 1'u32 shl 29
 
 # =============================================================================
 # HBN_CTL (0x2000F000) bit positions — verified against vendor hbn_reg.h.
@@ -166,6 +179,56 @@ proc pdsConfigureLpMtimerClock*(divider: uint32 = PdsE902RtcDiv1MHz) =
   regModify(PdsCpuCoreCfg8, PdsE902RtcDivMask, divider)
   core.fenceIo()
   regSet(PdsCpuCoreCfg8, PdsE902RtcEn)
+  core.fenceIo()
+
+proc pdsSetLpL1cBypass*(enable: bool) =
+  ## Route LP core memory requests around L1C. This is useful while changing
+  ## TZC groups because stale LP instruction-cache state can block XIP fetches.
+  if enable:
+    regClear(PdsCpuCoreCfg2, PdsLpL1cCacheable)
+    core.fenceIo()
+    regSet(PdsCpuCoreCfg2, PdsLpL1cBypass)
+  else:
+    regClear(PdsCpuCoreCfg2, PdsLpL1cBypass)
+  core.fenceIo()
+
+proc pdsSetLpL1cRange*(startAddr, endAddr: uint) =
+  ## Program the LP L1C address window. The hardware stores address bits
+  ## [30:10], so keep the raw 1 KiB-aligned address form the SDK passes in.
+  let low = startAddr and not 0x3FF'u
+  let high = (endAddr - 1'u) and not 0x3FF'u
+  regWrite(PdsLpL1cRangeLow, low.uint32)
+  regWrite(PdsLpL1cRangeHigh, high.uint32)
+  core.fenceIo()
+
+proc pdsDisableLpL1c*() =
+  ## Disable LP L1C and leave LP memory accesses in bypass mode. Run this while
+  ## LP is held or executing from RAM, before TZC group changes affect XIP fetch.
+  regClear(PdsCpuCoreCfg2, PdsLpL1cCacheable)
+  core.fenceIo()
+  regSet(PdsCpuCoreCfg2, PdsLpL1cBypass)
+  core.fenceIo()
+  regClear(PdsCpuCoreCfg2, PdsLpL1cCntEn)
+  core.fenceIo()
+
+  regClear(PdsCpuCoreCfg2, PdsLpL1cInvalidEn)
+  core.fenceIo()
+  regSet(PdsCpuCoreCfg2, PdsLpL1cInvalidEn)
+  discard regWaitSet(PdsCpuCoreCfg2, PdsLpL1cInvalidDone, 10_000)
+  regClear(PdsCpuCoreCfg2, PdsLpL1cInvalidEn)
+  core.fenceIo()
+
+  regClear(PdsCpuCoreCfg2, PdsLpL1cFlushEn)
+  core.fenceIo()
+  regSet(PdsCpuCoreCfg2, PdsLpL1cFlushEn)
+  discard regWaitSet(PdsCpuCoreCfg2, PdsLpL1cFlushDone, 10_000)
+  regClear(PdsCpuCoreCfg2, PdsLpL1cFlushEn)
+  core.fenceIo()
+
+  regModify(PdsCpuCoreCfg2,
+            PdsLpL1cCacheable or PdsLpL1cCntEn or PdsLpL1cWayDisMask or
+              PdsLpL1cBypass,
+            PdsLpL1cWayDisAll or PdsLpL1cBypass)
   core.fenceIo()
 
 proc pdsSleep*(durationMs: uint32, sources: set[WakeupSource] = {wakeTimer}) =

@@ -39,3 +39,30 @@ proc verifyUdpPacket(packetBytes: ptr UncheckedArray[uint8];
                      ipHeaderOffset, udpHeaderOffset: uint;
                      udpLen: uint16): uint16 {.inline.} =
   checksumUdpPacket(packetBytes, ipHeaderOffset, udpHeaderOffset, udpLen, false)
+
+proc checksumTcpPacket(packetBytes: ptr UncheckedArray[uint8];
+                       ipHeaderOffset, tcpHeaderOffset: uint;
+                       tcpLen: uint16; zeroChecksum: bool): uint16 =
+  var acc = 0'u32
+  checksumAddBe16(acc, packetBytes, ipHeaderOffset + 12'u)
+  checksumAddBe16(acc, packetBytes, ipHeaderOffset + 14'u)
+  checksumAddBe16(acc, packetBytes, ipHeaderOffset + 16'u)
+  checksumAddBe16(acc, packetBytes, ipHeaderOffset + 18'u)
+  acc += 6'u32
+  acc += tcpLen.uint32
+  var tcpSegmentOffset = 0'u
+  while tcpSegmentOffset + 1'u < tcpLen.uint:
+    let checksumWordOffset = tcpHeaderOffset + tcpSegmentOffset
+    if zeroChecksum and tcpSegmentOffset == 16'u:
+      discard
+    else:
+      checksumAddBe16(acc, packetBytes, checksumWordOffset)
+    tcpSegmentOffset += 2'u
+  if (tcpLen and 1'u16) != 0'u16:
+    acc += packetBytes[tcpHeaderOffset + tcpLen.uint - 1'u].uint32 shl 8
+  checksumFinish(acc)
+
+proc verifyTcpPacket(packetBytes: ptr UncheckedArray[uint8];
+                     ipHeaderOffset, tcpHeaderOffset: uint;
+                     tcpLen: uint16): uint16 {.inline.} =
+  checksumTcpPacket(packetBytes, ipHeaderOffset, tcpHeaderOffset, tcpLen, false)

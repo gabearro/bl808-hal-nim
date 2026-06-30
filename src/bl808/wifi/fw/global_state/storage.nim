@@ -64,6 +64,7 @@ var
   #   offset 14: uint8 - busy flag
   #   offset 15: uint8 - padding
   txl_cntrl_env* {.exportc.}: array[23, uint32]  # 92 bytes = 23 words
+  txlSeqRetained* {.exportc: "txl_seq_retained".}: uint16
   txlCntrlBusy*: uint16  # Global TX busy flag (from blob)
   txlAcPending*: array[NUM_TX_QUEUES, uint32]
   txlAcBusy*: array[NUM_TX_QUEUES, bool]

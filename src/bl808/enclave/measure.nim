@@ -4,11 +4,15 @@
 ## firmware that produced it.
 
 import sha256
+when defined(bl808EnclaveTrace):
+  import ../mmio
 
 type Measurement* = Sha256Digest
 
 var bootMeasurement*: Measurement   # secure OCRAM (.bss); set once at boot
 var measured = false
+
+const EnclaveMeasureStageAddr = 0x40002E90'u
 
 # Image extent from the enclave link map: flash .text/.rodata.
 {.emit: """/*TYPESECTION*/
@@ -28,9 +32,13 @@ proc measureRegion*(startAddr, length: uint, dig: var Measurement) =
   var off = 0'u
   const chunk = 1024'u
   while off < length:
+    when defined(bl808EnclaveTrace):
+      regWrite(EnclaveMeasureStageAddr, 0x454D0000'u32 or uint32((off shr 10) and 0xFFFF'u))
     let n = min(chunk, length - off)
     sha256Update(ctx, toOpenArray(p, off.int, (off + n - 1).int))
     off += n
+  when defined(bl808EnclaveTrace):
+    regWrite(EnclaveMeasureStageAddr, 0x454DFFFF'u32)
   dig = sha256Final(ctx)
 
 proc measureImage*(): Measurement =

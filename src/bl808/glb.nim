@@ -54,6 +54,7 @@ const
   GlbPwmCfg0*       = GlbBase + 0x1D0'u  # PWM clock
   GlbEmiCfg0*       = GlbBase + 0x0E0'u  # EMI/PSRAM clock
   GlbRtcCfg0*       = GlbBase + 0x0F0'u  # RTC clock
+  GlbSdhCfg0*       = GlbBase + 0x430'u  # SDH clock
   GlbDigClkCfg0*    = GlbBase + 0x250'u  # Digital clock config 0 (was 0x100 - wrong)
   GlbDigClkCfg1*    = GlbBase + 0x254'u  # Digital clock config 1
   GlbDigClkCfg2*    = GlbBase + 0x258'u  # Digital clock config 2
@@ -145,6 +146,10 @@ type
     spiClkPll160m    ## PLL 160 MHz
     spiClkXclk       ## Crystal clock
 
+  SdhClkSrc* = enum
+    sdhClkWifiPll96m = 0
+    sdhClkCpuPll100m = 1
+
 # =============================================================================
 # Peripheral index for clock gating and reset (CGEN_CFG1 bit positions)
 # =============================================================================
@@ -185,6 +190,34 @@ proc resetPeriph*(periph: McuPeriph) =
   for i in 0 ..< 10:
     discard regRead(GlbSwrstCfg1)
   regClear(GlbSwrstCfg1, 1'u32 shl periph.uint32)
+
+# =============================================================================
+# SDH clock configuration
+# =============================================================================
+const
+  GlbSdhClkDivShift = 9
+  GlbSdhClkDivMask = 0x7'u32 shl GlbSdhClkDivShift
+  GlbSdhClkSelShift = 12
+  GlbSdhClkSelMask = 0x1'u32 shl GlbSdhClkSelShift
+  GlbSdhClkEnBit = 13
+
+proc setSdhClock*(enable: bool, src: SdhClkSrc = sdhClkWifiPll96m,
+                  divider: uint32 = 7'u32) =
+  ## Configure the BL808 GLB SDH root clock. The SDK initializes BL808 SDH as
+  ## WIFIPLL_96M divided by 8 (divider register value 7), then lets the SDH
+  ## controller divider derive the bus clock from that stable source.
+  var reg = regRead(GlbSdhCfg0)
+  reg = reg and not (1'u32 shl GlbSdhClkEnBit)
+  regWrite(GlbSdhCfg0, reg)
+
+  reg = regRead(GlbSdhCfg0)
+  reg = (reg and not GlbSdhClkSelMask) or
+        ((src.uint32 and 0x1'u32) shl GlbSdhClkSelShift)
+  reg = (reg and not GlbSdhClkDivMask) or
+        ((divider and 0x7'u32) shl GlbSdhClkDivShift)
+  if enable:
+    reg = reg or (1'u32 shl GlbSdhClkEnBit)
+  regWrite(GlbSdhCfg0, reg)
 
 # =============================================================================
 # UART clock configuration
@@ -660,7 +693,7 @@ const
   SfCtrlImageOffset0 = SfCtrlBase + 0x0A0'u # Physical flash offset mapped at FlashXipBase
   SfCtrlImageOffsetMask = 0x0FFF_FFFF'u32
   D0EntryFirstInsn = 0x3004_7073'u32   # csrci mstatus,8 from D0 startup
-  D0FlashCopyBytes* = 128'u * 1024'u
+  D0FlashCopyBytes* = 256'u * 1024'u
   JtagD0ImageMagic* = 0x4430_4A54'u32   # "D0JT"
   JtagD0ImageMagicAddr* = XramBase + 0x00'u
   JtagD0ImageSizeAddr* = XramBase + 0x04'u
@@ -739,6 +772,11 @@ proc releaseD0*(forceLoad: bool = true) =
   regClear(MmSwSysReset, MmCpu0Reset)   # deassert reset
   core.fenceIo()
 
+proc holdD0Reset*() =
+  ## Hold D0 (C906) in reset after a peer-core smoke stage has completed.
+  regSet(MmSwSysReset, MmCpu0Reset)
+  core.fenceIo()
+
 proc releaseLPAt*(bootAddr: uint) =
   ## Release LP (E902) from reset with an explicit boot address — e.g. a WRAM
   ## address that M0 has populated with a verified LP image (secure handoff).
@@ -768,6 +806,11 @@ proc releaseLPAt*(bootAddr: uint) =
                                             # comes out of reset on an unsettled
                                             # clock and never starts fetching)
   regClear(GlbSwrstCfg2Addr, PicoCpuReset)  # deassert reset
+  core.fenceIo()
+
+proc holdLPReset*() =
+  ## Hold LP (E902) in reset after a peer-core smoke stage has completed.
+  regSet(GlbSwrstCfg2Addr, PicoCpuReset)
   core.fenceIo()
 
 proc releaseLP*() =

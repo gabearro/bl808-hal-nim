@@ -25,6 +25,7 @@ const
   ConsoleClkHz {.intdefine.} = 40_000_000'u32
   SharedAddr = 0x6202F000'u       # SHARED region (bl808_m0_enclave.ld)
   SvcReport  = 0xAA'u32           # test-only: U-mode hands its tally to M0
+  SvcProgress = 0xAB'u32           # test-only: progress breadcrumbs
   ExpectTally = 4'u32             # number of service checks the app should pass
 
 var console: Uart
@@ -43,9 +44,21 @@ proc e2eDispatch(frame: ptr EcallFrame) {.nimcall.} =
     check("U-mode ran the real enclave services via ecall", frame.a1 == ExpectTally)
     line("=== Test Complete ===")
     frame.a0 = 0
+  elif frame.a0 == SvcProgress:
+    discard console.sendString("[M0] U-mode progress = ")
+    console.sendHex32(frame.a1)
+    discard console.sendLine("")
+    frame.a0 = 0
+    frame.a1 = 0
   else:
     let buf = cast[ptr UncheckedArray[uint8]](SharedAddr)
-    let (st, resp) = enclaveDispatch(toSvcId(frame.a0), frame.a1.int, buf, 4096)
+    let (st, resp) = enclaveDispatch(
+      callerUmodeAppCtx(),
+      toSvcId(frame.a0),
+      frame.a1.int,
+      buf,
+      4096,
+    )
     frame.a0 = st.uint32
     frame.a1 = resp.uint32
 
@@ -61,17 +74,23 @@ proc uEcall(svc, reqLen: uint32): tuple[status, rlen: uint32] =
   """.}
   (st, rl)
 
+proc uProgress(code: uint32) =
+  discard uEcall(SvcProgress, code)
+
 proc umodeApp() {.exportc: "umode_app", cdecl.} =
   let buf = cast[ptr UncheckedArray[uint8]](SharedAddr)
   var tally = 0'u32
 
   # 1. sha256("abc") -> known digest prefix 0xBA 0x78
+  uProgress(0xE2000001'u32)
   buf[0] = 0x61; buf[1] = 0x62; buf[2] = 0x63
   var r = uEcall(svcSha256.uint32, 3)
   if r.status == 0 and r.rlen == 32 and buf[0] == 0xBA'u8 and buf[1] == 0x78'u8:
     tally.inc
+  uProgress(0xE2000011'u32)
 
   # 2. getRandom(16) -> non-zero
+  uProgress(0xE2000002'u32)
   for i in 0 ..< 4: buf[i] = 0
   buf[0] = 16
   r = uEcall(svcGetRandom.uint32, 4)
@@ -80,29 +99,32 @@ proc umodeApp() {.exportc: "umode_app", cdecl.} =
     if buf[i] != 0: nz = true
   if r.status == 0 and r.rlen == 16 and nz:
     tally.inc
+  uProgress(0xE2000012'u32)
 
   # 3. sealBlob then unsealBlob round-trip (device-bound, uses the vault root)
+  uProgress(0xE2000003'u32)
   let msg = "u-mode-secret"
-  for i in 0 ..< 16: buf[i] = 0          # nonce
-  for i in 0 ..< msg.len: buf[16 + i] = msg[i].uint8
-  r = uEcall(svcSealBlob.uint32, (16 + msg.len).uint32)
+  for i in 0 ..< msg.len: buf[i] = msg[i].uint8
+  r = uEcall(svcSealBlob.uint32, msg.len.uint32)
   if r.status == 0:
     let sealedLen = r.rlen.int
     var sealed: array[64, uint8]
     for i in 0 ..< sealedLen: sealed[i] = buf[i]
-    for i in 0 ..< 16: buf[i] = 0
-    for i in 0 ..< sealedLen: buf[16 + i] = sealed[i]
-    let r2 = uEcall(svcUnsealBlob.uint32, (16 + sealedLen).uint32)
+    for i in 0 ..< sealedLen: buf[i] = sealed[i]
+    let r2 = uEcall(svcUnsealBlob.uint32, sealedLen.uint32)
     var ok = r2.status == 0 and r2.rlen.int == msg.len
     for i in 0 ..< msg.len:
       if buf[i] != msg[i].uint8: ok = false
     if ok: tally.inc
+  uProgress(0xE2000013'u32)
 
   # 4. attestation: id(8)+meas(32)+sig(64) = 104 bytes
+  uProgress(0xE2000004'u32)
   for i in 0 ..< 32: buf[i] = i.uint8     # nonce
   r = uEcall(svcGetAttestation.uint32, 32)
   if r.status == 0 and r.rlen == 104:
     tally.inc
+  uProgress(0xE2000014'u32)
 
   # report tally to M0
   discard uEcall(SvcReport, tally)

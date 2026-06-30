@@ -16,6 +16,7 @@ proc sm_deauth_send*(param: pointer, reason: uint16) {.exportc, cdecl.}
 proc sm_get_bss_params*(selectedBssResultOut: ptr pointer, selectedBssChannelOut: ptr pointer): bool {.exportc, cdecl.}
 proc sm_scan_bss*(bssid: pointer, ssid: pointer, chanInfo: pointer) {.exportc, cdecl.}
 proc sm_join_bss*(bssid: pointer, ssid: pointer, joinInfo: pointer, flag: uint32) {.exportc, cdecl.}
+proc sm_auth_handler*(param: pointer) {.exportc, cdecl.}
 proc me_beacon_check*(vifIdx: uint8, frameDesc: pointer, iesBase: pointer) {.exportc, cdecl.}
 proc rc_update_bw_nss_max*(staIdx: uint8, nss: uint8, groupCnt: uint8) {.exportc, cdecl.}
 proc me_build_deauthenticate*(buf: pointer, reason: uint16): uint32 {.exportc, cdecl, noinline.}

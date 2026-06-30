@@ -202,8 +202,59 @@ when defined(bl808m0) or defined(bl808lp):
       GlbMcuIntClear0* = GlbBase + 0x60'u
       GlbMcuIntClear1* = GlbBase + 0x64'u
       GlbMcuIntCount = 64'u32
+
+    type
+      M0GlbMcuInterruptMuxRegs* {.bycopy.} = object
+        ## GLB MCU interrupt mux registers backing CLIC peripheral sources.
+        status0*: uint32
+        status1*: uint32
+        mask0*: uint32
+        mask1*: uint32
+        clear0*: uint32
+        clear1*: uint32
+
+      M0ClicIrqSnapshot* = object
+        ## Read-only CLIC/GLB mux state for one M0 interrupt source.
+        irq*: uint32
+        sourceOffset*: uint32
+        withinClicRange*: bool
+        withinGlbRange*: bool
+        intip*: uint8
+        intie*: uint8
+        intattr*: uint8
+        intctl*: uint8
+        statusRaw*: uint32
+        maskRaw*: uint32
+        sourceMask*: uint32
+        glbPending*: bool
+        glbMasked*: bool
+        clicPending*: bool
+        clicEnabled*: bool
+        valid*: bool
+
   else:
     const ClicMaxIrq* = 48
+
+  type
+    ClicInterruptRegs* {.bycopy.} = object
+      ## Packed per-source CLIC register view.
+      intip*: uint8
+      intie*: uint8
+      intattr*: uint8
+      intctl*: uint8
+
+    ClicInterruptBlock* {.bycopy.} = object
+      ## Typed overlay for the CLIC interrupt register array.
+      interrupts*: array[ClicMaxIrq, ClicInterruptRegs]
+
+  template clicInterrupts(): ptr ClicInterruptBlock =
+    ## Localized typed overlay for the packed CLIC interrupt array.
+    cast[ptr ClicInterruptBlock](ClicIntBase)
+
+  when defined(bl808m0):
+    template m0GlbMcuInterruptMux(): ptr M0GlbMcuInterruptMuxRegs =
+      ## Localized typed overlay for the GLB MCU interrupt mux banks.
+      cast[ptr M0GlbMcuInterruptMuxRegs](GlbMcuIntStatus0)
 
   # Per-IRQ register offsets within each 4-byte packed struct
   const
@@ -262,6 +313,38 @@ when defined(bl808m0) or defined(bl808lp):
 
     proc m0McuIntBit(source: uint32): uint32 {.inline.} =
       1'u32 shl (source and 31'u32)
+
+    proc m0ClicIrqSnapshot*(irq: uint32): M0ClicIrqSnapshot =
+      ## Read CLIC and GLB mux state for one M0 interrupt source.
+      ##
+      ## This is intentionally read-only. It lets higher-level drivers verify
+      ## deferred IRQ binding state without changing interrupt routing.
+      result.irq = irq
+      result.withinClicRange = irq < ClicMaxIrq.uint32
+      if result.withinClicRange:
+        let entry = addr clicInterrupts()[].interrupts[irq.int]
+        result.intip = volatileLoad(addr entry[].intip)
+        result.intie = volatileLoad(addr entry[].intie)
+        result.intattr = volatileLoad(addr entry[].intattr)
+        result.intctl = volatileLoad(addr entry[].intctl)
+        result.clicPending = (result.intip and 1'u8) != 0
+        result.clicEnabled = (result.intie and 1'u8) != 0
+
+      result.withinGlbRange = m0McuIntHasSource(irq)
+      if result.withinGlbRange:
+        result.sourceOffset = m0McuIntSourceIndex(irq)
+        result.sourceMask = m0McuIntBit(result.sourceOffset)
+        let mux = m0GlbMcuInterruptMux()
+        if result.sourceOffset < 32'u32:
+          result.statusRaw = volatileLoad(addr mux[].status0)
+          result.maskRaw = volatileLoad(addr mux[].mask0)
+        else:
+          result.statusRaw = volatileLoad(addr mux[].status1)
+          result.maskRaw = volatileLoad(addr mux[].mask1)
+        result.glbPending = (result.statusRaw and result.sourceMask) != 0
+        result.glbMasked = (result.maskRaw and result.sourceMask) != 0
+
+      result.valid = result.withinClicRange and result.withinGlbRange
 
     proc m0McuIntMaskSource*(irq: uint32) =
       ## Mask the GLB MCU interrupt mux source feeding this M0 CLIC IRQ.

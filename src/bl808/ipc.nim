@@ -96,8 +96,15 @@ type
   IpcMsgHeader* {.packed.} = object
     tag*: uint16       ## Message type tag
     length*: uint16    ## Data length in bytes (after header)
+    sender*: uint8     ## Claimed sender core, validated by receiver
+    seq*: uint8        ## Sender-local sequence number for stale-buffer checks
+    magic*: uint16     ## Header integrity marker
 
-const IpcMsgHeaderSize* = 4
+const
+  IpcMsgHeaderSize* = 8
+  IpcMsgMagic* = 0xC0DE'u16
+
+var ipcSeq: uint8
 
 # =============================================================================
 # Send address resolution
@@ -199,6 +206,18 @@ const
   IpcSignalAck*     = 1  ## Signal bit 1: message acknowledged
   IpcSignalSync*    = 2  ## Signal bit 2: synchronization/handshake
 
+proc msgSignal(fromCore, toCore: IpcTarget): IpcSignal =
+  ## M0 receives from two peers through a shared pending register; use distinct
+  ## message bits so receiver-side polling can bind the pending source to the
+  ## peer-specific XRAM buffer. Other pairs keep the legacy signal.
+  if toCore == ipcM0:
+    case fromCore
+    of ipcD0: IpcSignalMsg
+    of ipcLP: 3.IpcSignal
+    of ipcM0: IpcSignalMsg
+  else:
+    IpcSignalMsg
+
 proc ipcSendMessage*(target: IpcTarget, tag: uint16, data: openArray[uint8]): bool =
   ## Send a tagged message to another core via XRAM.
   ## Returns false if the data doesn't fit in the buffer.
@@ -206,9 +225,17 @@ proc ipcSendMessage*(target: IpcTarget, tag: uint16, data: openArray[uint8]): bo
   if bufBase == 0: return false
   if data.len.uint32 + IpcMsgHeaderSize.uint32 > bufSize: return false
 
-  # Write message header
-  let header = (data.len.uint16.uint32 shl 16) or tag.uint32
-  regWrite(bufBase, header)
+  inc ipcSeq
+  if ipcSeq == 0: inc ipcSeq
+
+  # Write message header. The second word binds the XRAM buffer to the sender so
+  # a receiver that sees a shared pending bit cannot accidentally dispatch a
+  # stale buffer from a different peer.
+  let header0 = (data.len.uint16.uint32 shl 16) or tag.uint32
+  let header1 = selfCore.ord.uint32 or (ipcSeq.uint32 shl 8) or
+                (IpcMsgMagic.uint32 shl 16)
+  regWrite(bufBase, header0)
+  regWrite(bufBase + 4'u, header1)
 
   # Write message data (4 bytes at a time)
   var offset = IpcMsgHeaderSize.uint
@@ -233,7 +260,7 @@ proc ipcSendMessage*(target: IpcTarget, tag: uint16, data: openArray[uint8]): bo
   sharedWriteBarrier()
 
   # Signal the target core
-  ipcSendSignal(target, IpcSignalMsg)
+  ipcSendSignal(target, msgSignal(selfCore, target))
   true
 
 proc ipcRecvMessage*(fromCore: IpcTarget, tag: var uint16,
@@ -241,7 +268,8 @@ proc ipcRecvMessage*(fromCore: IpcTarget, tag: var uint16,
   ## Receive a message from another core.
   ## Returns the number of data bytes received, or -1 if no message.
   let signals = ipcReadSignals(fromCore)
-  if (signals and (1'u32 shl IpcSignalMsg)) == 0:
+  let sig = msgSignal(fromCore, selfCore)
+  if (signals and (1'u32 shl sig.uint32)) == 0:
     return -1
 
   let (bufBase, _) = bufferAddr(fromCore, selfCore)
@@ -251,6 +279,12 @@ proc ipcRecvMessage*(fromCore: IpcTarget, tag: var uint16,
 
   # Read message header
   let header = regRead(bufBase)
+  let source = regRead(bufBase + 4'u)
+  let sender = (source and 0xFF'u32).int
+  let magic = (source shr 16).uint16
+  if magic != IpcMsgMagic or sender != fromCore.ord:
+    ipcClearSignal(fromCore, sig)
+    return -1
   tag = (header and 0xFFFF).uint16
   let length = (header shr 16).int
 
@@ -273,11 +307,61 @@ proc ipcRecvMessage*(fromCore: IpcTarget, tag: var uint16,
       buf[i+j] = ((word shr (j * 8)) and 0xFF).uint8
 
   # Clear the signal
-  ipcClearSignal(fromCore, IpcSignalMsg)
+  ipcClearSignal(fromCore, sig)
+
+  # The payload has been consumed. Clear the durable XRAM header too, otherwise
+  # a later polling receive can replay this message through ipcRecvBufferedMessage
+  # after the edge-style signal is gone.
+  regWrite(bufBase, 0)
+  regWrite(bufBase + 4'u, 0)
+  sharedWriteBarrier()
 
   # Send acknowledgment
   ipcSendSignal(fromCore, IpcSignalAck)
 
+  copyLen
+
+proc ipcRecvBufferedMessage*(fromCore: IpcTarget, tag: var uint16,
+                             buf: var openArray[uint8]): int =
+  ## Receive a message by validating the peer's XRAM header without requiring
+  ## the hardware pending bit to still be set.
+  ##
+  ## This is useful for polling transports where the peer's payload is durable in
+  ## XRAM but the edge-style IPC signal has been missed or cleared by reset/JTAG
+  ## activity. The header is cleared after a successful copy to avoid replay.
+  let (bufBase, _) = bufferAddr(fromCore, selfCore)
+  if bufBase == 0: return -1
+
+  sharedReadBarrier()
+  let header = regRead(bufBase)
+  let source = regRead(bufBase + 4'u)
+  let sender = (source and 0xFF'u32).int
+  let magic = (source shr 16).uint16
+  if magic != IpcMsgMagic or sender != fromCore.ord:
+    return -1
+
+  tag = (header and 0xFFFF).uint16
+  let length = (header shr 16).int
+  let copyLen = min(length, buf.len)
+  var offset = IpcMsgHeaderSize.uint
+  var i = 0
+  while i + 3 < copyLen:
+    let word = regRead(bufBase + offset)
+    buf[i]   = (word and 0xFF).uint8
+    buf[i+1] = ((word shr 8) and 0xFF).uint8
+    buf[i+2] = ((word shr 16) and 0xFF).uint8
+    buf[i+3] = ((word shr 24) and 0xFF).uint8
+    offset += 4
+    i += 4
+
+  if i < copyLen:
+    let word = regRead(bufBase + offset)
+    for j in 0 ..< copyLen - i:
+      buf[i+j] = ((word shr (j * 8)) and 0xFF).uint8
+
+  regWrite(bufBase, 0)
+  regWrite(bufBase + 4'u, 0)
+  sharedWriteBarrier()
   copyLen
 
 # =============================================================================

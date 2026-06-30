@@ -5,10 +5,11 @@
 ## using 4KB sectors as LittleFS blocks.
 
 import ../flash
+import ../memmap
 
 const
   FlashFsOffset* = 0x800000'u32   ## Filesystem starts 8MB into flash
-  FlashFsSize* = 0x800000'u32     ## 8MB partition
+  FlashFsSize* = Ox64WasmStoreOffset.uint32 - FlashFsOffset
   FlashFsBlockSize* = 4096'u32    ## 4KB erase sectors
   FlashFsBlockCount* = FlashFsSize div FlashFsBlockSize  ## 2048 blocks
   FlashFsReadSize* = 256'u32      ## Read granularity

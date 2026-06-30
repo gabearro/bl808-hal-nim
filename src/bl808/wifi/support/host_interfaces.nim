@@ -25,8 +25,10 @@ proc bl_msg_get_channel_nums(): cint {.importc, cdecl.}
 proc bl_main_connect(ssid: ptr uint8; ssidLen: cint; psk: ptr uint8; pskLen: cint;
                      pmk: ptr uint8; pmkLen: cint; mac: ptr uint8; band: uint8;
                      freq: uint16; flags: uint32): cint {.importc, cdecl.}
+proc bl_main_connect_abort(status: ptr uint8): cint {.importc, cdecl.}
 proc bl_main_disconnect(): cint {.importc, cdecl.}
 proc bl_main_phy_up(): cint {.importc, cdecl.}
+proc bl_send_reset(blHw: ptr BlHw): cint {.importc, cdecl.}
 proc bl_main_apm_start(ssid, password: cstring; channel: cint; hiddenSsid: uint8;
                        bcnInt: uint16): cint {.importc, cdecl.}
 proc bl_main_apm_stop(): cint {.importc, cdecl.}

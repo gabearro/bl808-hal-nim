@@ -36,6 +36,36 @@ def tcp_http_probe(host: str, port: int, timeout_s: float) -> str:
     return b"".join(chunks).decode("utf-8", errors="replace")
 
 
+def tcp_http_request(
+    host: str,
+    port: int,
+    timeout_s: float,
+    method: str,
+    path: str,
+    body: bytes = b"",
+) -> bytes:
+    request = (
+        f"{method} {path} HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    ).encode("ascii") + body
+    chunks: list[bytes] = []
+    with socket.create_connection((host, port), timeout=timeout_s) as sock:
+        sock.settimeout(timeout_s)
+        sock.sendall(request)
+        while True:
+            try:
+                data = sock.recv(1024)
+            except socket.timeout:
+                break
+            if not data:
+                break
+            chunks.append(data)
+    return b"".join(chunks)
+
+
 def udp_echo_probe(host: str, port: int, timeout_s: float) -> bytes:
     payload = b"BL808 Nim lwIP UDP echo host probe"
     deadline = time.monotonic() + timeout_s
@@ -63,6 +93,48 @@ def parse_http_diagnostics(response: str) -> dict[str, str]:
             key, value = line.split("=", 1)
             diagnostics[key.strip()] = value.strip()
     return diagnostics
+
+
+ADD_WASM = bytes(
+    [
+        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x07, 0x01, 0x60, 0x02, 0x7F, 0x7F, 0x01,
+        0x7F, 0x03, 0x02, 0x01, 0x00, 0x07, 0x07, 0x01,
+        0x03, 0x61, 0x64, 0x64, 0x00, 0x00, 0x0A, 0x09,
+        0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6A,
+        0x0B,
+    ]
+)
+
+
+def require_http_status(response: bytes, expected: bytes) -> str:
+    text = response.decode("utf-8", errors="replace")
+    first = text.splitlines()[0] if text else ""
+    if expected.decode("ascii") not in first:
+        print(text, end="")
+        raise RuntimeError(
+            f"expected HTTP status {expected.decode('ascii')}, got {first or 'empty response'}"
+        )
+    return text
+
+
+def wasm_http_probe(host: str, port: int, timeout_s: float) -> None:
+    install = tcp_http_request(
+        host, port, timeout_s, "POST", "/wasm/programs/5", ADD_WASM
+    )
+    require_http_status(install, b"201 Created")
+
+    invoke = tcp_http_request(
+        host, port, timeout_s, "POST", "/wasm/programs/5/invoke/add", b"19,23"
+    )
+    invoke_text = require_http_status(invoke, b"200 OK")
+    if "value=42" not in invoke_text:
+        print(invoke_text, end="")
+        raise RuntimeError("WASM invoke response missing value=42")
+
+    delete = tcp_http_request(host, port, timeout_s, "DELETE", "/wasm/programs/5")
+    require_http_status(delete, b"200 OK")
+    print("[PASS] lwIP WASM HTTP install/invoke/delete", flush=True)
 
 
 def require_int_at_least(diag: dict[str, str], key: str, minimum: int) -> int:
@@ -110,6 +182,8 @@ def main() -> int:
         print(response, end="")
         raise RuntimeError(f"HTTP probe ip={diagnostics['ip']} does not match {host}")
     print("[PASS] lwIP TCP HTTP/1.1 response", flush=True)
+
+    wasm_http_probe(host, args.http_port, args.timeout)
 
     data = udp_echo_probe(host, args.udp_port, args.timeout)
     print(f"[PASS] lwIP UDP echo bytes={len(data)}", flush=True)

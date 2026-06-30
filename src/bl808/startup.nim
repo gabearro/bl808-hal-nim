@@ -32,6 +32,9 @@ extern unsigned long _ebss;
 extern unsigned long _sdata;
 extern unsigned long _edata;
 extern unsigned long _sidata;
+extern unsigned long _sramfunc __attribute__((weak));
+extern unsigned long _eramfunc __attribute__((weak));
+extern unsigned long _siramfunc __attribute__((weak));
 extern unsigned long _sp;
 extern unsigned long __wifi_bss_start __attribute__((weak));
 extern unsigned long __wifi_bss_end __attribute__((weak));
@@ -68,6 +71,13 @@ void __clear_bss(void) {
 {.emit: """
 __attribute__((used))
 void __copy_data(void) {
+  if (&_sramfunc && &_eramfunc && &_siramfunc) {
+    unsigned long *rsrc = &_siramfunc;
+    unsigned long *rdst = &_sramfunc;
+    while (rdst < &_eramfunc) {
+      *rdst++ = *rsrc++;
+    }
+  }
   unsigned long *src = &_sidata;
   unsigned long *dst = &_sdata;
   while (dst < &_edata) {
@@ -612,6 +622,11 @@ elif defined(bl808m0):
       asm volatile(
         /* Disable interrupts */
         "csrci mstatus, 0x8\n"
+        /* Install a basic exception vector before touching implementation CSRs. */
+        "la sp, _sp\n"
+        "csrw mscratch, sp\n"
+        "la t0, __trap_handler\n"
+        "csrw mtvec, t0\n"
         /* Match Bouffalo startup: enable T-Head ISA/MM extensions before C code. */
         "li t0, (1 << 13)\n"
         "csrs mstatus, t0\n"
@@ -619,12 +634,6 @@ elif defined(bl808m0):
         "li t1, ((1 << 22) | (1 << 15))\n"
         "or t0, t0, t1\n"
         "csrw 0x7c0, t0\n"
-        /* Set stack pointer */
-        "la sp, _sp\n"
-        "csrw mscratch, sp\n"
-        /* Direct trap mode for RAM-resident debug stubs. */
-        "la t0, __trap_handler\n"
-        "csrw mtvec, t0\n"
         /* Clear BSS */
         "call __clear_bss\n"
         /* Copy initialized data */

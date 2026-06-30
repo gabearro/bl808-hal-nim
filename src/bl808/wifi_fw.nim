@@ -54,13 +54,18 @@ include wifi/fw/register_constants
 include wifi/fw/layout_types
 include wifi/fw/global_state
 include wifi/fw/runtime_helpers
+include wifi/fw/rsn_parse
 include wifi/fw/kernel_mac_channel
 include wifi/fw/scan_station_ap_me
 include wifi/fw/rate_control
 include wifi/fw/tx_layer
 include wifi/fw/tx_upper
 include wifi/fw/rx_layer
+proc nim_ccmp_decrypt*(tk: pointer; hdr: pointer; data: pointer;
+                       dataLen: uint32; outPlain: pointer;
+                       outLen: ptr uint32): bool
 include wifi/fw/rx_upper
+include wifi/fw/key_install_policy
 include wifi/fw/vif_management
 include wifi/fw/sta_management
 include wifi/fw/tx_power_control

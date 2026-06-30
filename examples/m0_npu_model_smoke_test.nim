@@ -8,6 +8,7 @@ import bl808/glb
 import bl808/gpio
 import bl808/uart
 import bl808/npu
+import bl808/irq
 import bl808/panicoverride
 import bl808/kernel/alloc
 
@@ -17,6 +18,17 @@ const
   ConsoleBaud {.intdefine.} = 230_400'u32
   ConsoleClkHz {.intdefine.} = 40_000_000'u32
   ActiveNpuWorkspaceBytes = 2048
+
+when defined(blaiMeetkaiAsrFixture):
+  include "../build/generated-fixtures/meetkai_asr_npu_instruction_payload"
+
+  const
+    MeetkaiAsrGeneratedBlobBytes = 26304
+    MeetkaiAsrGeneratedHeaderBytes = 32
+    MeetkaiAsrCpuInstructionBytes = 18176
+    MeetkaiAsrNpuInstructionBytes = 8096
+    MeetkaiAsrNpuBiasBytes = 0
+    MeetkaiAsrNpuWeightBytes = 0
 
 type
   AddressFixtureResultScratch = object
@@ -118,6 +130,40 @@ proc logActiveMmAggregateScan(
   console.sendHex32(evidence.firstBlock.uint32)
   discard console.sendLine("")
 
+proc logCnnIrqControllerSnapshot(
+    label: string,
+    snapshot: M0ClicIrqSnapshot,
+    evidence: NpuCnnIrqControllerSnapshotEvidence) =
+  discard console.sendString("[INFO] ")
+  discard console.sendString(label)
+  discard console.sendString(" irq=")
+  console.sendHex32(snapshot.irq)
+  discard console.sendString(" source=")
+  console.sendHex32(snapshot.sourceOffset)
+  discard console.sendString(" intip=")
+  console.sendHex32(snapshot.intip.uint32)
+  discard console.sendString(" intie=")
+  console.sendHex32(snapshot.intie.uint32)
+  discard console.sendString(" intattr=")
+  console.sendHex32(snapshot.intattr.uint32)
+  discard console.sendString(" intctl=")
+  console.sendHex32(snapshot.intctl.uint32)
+  discard console.sendString(" status=")
+  console.sendHex32(snapshot.statusRaw)
+  discard console.sendString(" mask=")
+  console.sendHex32(snapshot.maskRaw)
+  discard console.sendString(" bit=")
+  console.sendHex32(snapshot.sourceMask)
+  discard console.sendString(" pending=")
+  console.sendHex32(if evidence.pendingClear: 0'u32 else: 1'u32)
+  discard console.sendString(" enabled=")
+  console.sendHex32(if evidence.clicDisabled: 0'u32 else: 1'u32)
+  discard console.sendString(" masked=")
+  console.sendHex32(if evidence.glbMasked: 1'u32 else: 0'u32)
+  discard console.sendString(" valid=")
+  console.sendHex32(if evidence.valid: 1'u32 else: 0'u32)
+  discard console.sendLine("")
+
 proc logNpuRegisterSnapshot(
     label: string,
     captured: bool,
@@ -183,6 +229,39 @@ proc logNpuWaitExitRegisters(
   console.sendHex32(clock.divider)
   discard console.sendLine("")
 
+proc logCnnWrapperCompletionSurface(
+    label: string,
+    evidence: NpuCnnWrapperCompletionSurfaceEvidence) =
+  discard console.sendString("[INFO] ")
+  discard console.sendString(label)
+  discard console.sendString(" general=")
+  console.sendHex32(evidence.generalCfg)
+  discard console.sendString(" int=")
+  console.sendHex32(evidence.intCfg)
+  discard console.sendString(" stdPending=")
+  console.sendHex32(if evidence.standardInterruptPending: 1'u32 else: 0'u32)
+  discard console.sendString(" wrapPending=")
+  console.sendHex32(if evidence.wrapperCandidatePending: 1'u32 else: 0'u32)
+  discard console.sendString(" wrapOnly=")
+  console.sendHex32(if evidence.wrapperPendingOnly: 1'u32 else: 0'u32)
+  discard console.sendString(" lower=")
+  console.sendHex32(evidence.wrapper.lowerConfigBits)
+  discard console.sendString(" ftableData=")
+  console.sendHex32(evidence.wrapper.blaiFtableDataBase)
+  discard console.sendString(" clear=")
+  console.sendHex32(if evidence.wrapper.interruptClearRequested: 1'u32 else: 0'u32)
+  discard console.sendString(" busReset=")
+  console.sendHex32(if evidence.wrapper.busResetRequested: 1'u32 else: 0'u32)
+  discard console.sendString(" axiIdle=")
+  console.sendHex32(if evidence.wrapper.axiIdle: 1'u32 else: 0'u32)
+  discard console.sendString(" conflict=")
+  console.sendHex32(if evidence.candidateConflictsWithStdHeader: 1'u32 else: 0'u32)
+  discard console.sendString(" readOnly=")
+  console.sendHex32(if evidence.readOnlyProbe: 1'u32 else: 0'u32)
+  discard console.sendString(" policy=")
+  console.sendHex32(if evidence.runtimePolicyUnchanged: 1'u32 else: 0'u32)
+  discard console.sendLine("")
+
 proc logBlaiCommandStatus(
     label: string,
     status: NpuBlaiCommandStatusResult) =
@@ -212,14 +291,55 @@ proc logBlaiCommandStatus(
   console.sendHex32(if status.anyCommandMode: 1'u32 else: 0'u32)
   discard console.sendLine("")
 
-proc instructionWord(inst: BlaiInstruction, wordIndex: uint32): uint32 =
-  let base = wordIndex.int * 4
-  if base + 3 >= inst.len:
-    return 0
-  inst[base].uint32 or
-    (inst[base + 1].uint32 shl 8) or
-    (inst[base + 2].uint32 shl 16) or
-    (inst[base + 3].uint32 shl 24)
+proc logBlaiTzmidStatus(label: string, status: NpuBlaiTzmidStatus) =
+  discard console.sendString("[INFO] ")
+  discard console.sendString(label)
+  discard console.sendString(" tzmid=")
+  console.sendHex32(status.tzmid)
+  discard console.sendString(" lock=")
+  console.sendHex32(status.lock)
+  discard console.sendString(" group=")
+  console.sendHex32(status.group)
+  discard console.sendString(" groupKnown=")
+  console.sendHex32(if status.groupKnown: 1'u32 else: 0'u32)
+  discard console.sendString(" selected=")
+  console.sendHex32(if status.selected: 1'u32 else: 0'u32)
+  discard console.sendString(" locked=")
+  console.sendHex32(if status.locked: 1'u32 else: 0'u32)
+  discard console.sendString(" candidate=")
+  console.sendHex32(if status.candidateCompletionPrecondition: 1'u32 else: 0'u32)
+  discard console.sendLine("")
+
+proc logBusDecodeStatus(
+    label: string,
+    status: NpuBusDecodeStatusResult) =
+  discard console.sendString("[INFO] ")
+  discard console.sendString(label)
+  discard console.sendString(" mmRaw=")
+  console.sendHex32(status.mmBusDecErr)
+  discard console.sendString(" mmAddr=")
+  console.sendHex32(status.mmBusDecErrAddr)
+  discard console.sendString(" mmLat=")
+  console.sendHex32(if status.mmErrorLatched: 1'u32 else: 0'u32)
+  discard console.sendString(" mmWr=")
+  console.sendHex32(if status.mmErrorWasWrite: 1'u32 else: 0'u32)
+  discard console.sendString(" mmSrc=")
+  console.sendHex32(status.mmErrorSource)
+  discard console.sendString(" mmId=")
+  console.sendHex32(status.mmErrorId)
+  discard console.sendString(" mcuRaw=")
+  console.sendHex32(status.mcuBusDecErr)
+  discard console.sendString(" mcuAddr=")
+  console.sendHex32(status.mcuBusDecErrAddr)
+  discard console.sendString(" mcuLat=")
+  console.sendHex32(if status.mcuErrorLatched: 1'u32 else: 0'u32)
+  discard console.sendString(" mcuWr=")
+  console.sendHex32(if status.mcuErrorWasWrite: 1'u32 else: 0'u32)
+  discard console.sendString(" mcuSrc=")
+  console.sendHex32(status.mcuErrorSource)
+  discard console.sendString(" mcuId=")
+  console.sendHex32(status.mcuErrorId)
+  discard console.sendLine("")
 
 proc workspaceByteAt(
     workspaceBytes: openArray[uint8],
@@ -282,22 +402,22 @@ proc logActiveFetchSurface(
   console.sendHex32(outputByte)
   if stream.len > 0:
     discard console.sendString(" inst0w0=")
-    console.sendHex32(instructionWord(stream[0], 0))
+    console.sendHex32(blaiInstructionWord(stream[0], 0))
     discard console.sendString(" inst0w1=")
-    console.sendHex32(instructionWord(stream[0], 1))
+    console.sendHex32(blaiInstructionWord(stream[0], 1))
     discard console.sendString(" inst0w2=")
-    console.sendHex32(instructionWord(stream[0], 2))
+    console.sendHex32(blaiInstructionWord(stream[0], 2))
     discard console.sendString(" inst0w3=")
-    console.sendHex32(instructionWord(stream[0], 3))
+    console.sendHex32(blaiInstructionWord(stream[0], 3))
   if stream.len > 1:
     discard console.sendString(" inst1w0=")
-    console.sendHex32(instructionWord(stream[1], 0))
+    console.sendHex32(blaiInstructionWord(stream[1], 0))
     discard console.sendString(" inst1w1=")
-    console.sendHex32(instructionWord(stream[1], 1))
+    console.sendHex32(blaiInstructionWord(stream[1], 1))
     discard console.sendString(" inst1w2=")
-    console.sendHex32(instructionWord(stream[1], 2))
+    console.sendHex32(blaiInstructionWord(stream[1], 2))
     discard console.sendString(" inst1w3=")
-    console.sendHex32(instructionWord(stream[1], 3))
+    console.sendHex32(blaiInstructionWord(stream[1], 3))
   discard console.sendString(" weight0=")
   console.sendHex32(if weights.len > 0: weights[0].uint32 else: 0'u32)
   discard console.sendString(" weight1=")
@@ -663,6 +783,699 @@ proc checkSequentialParsedModels() =
   check("NPU model TFLite sequential short blocked",
     not shortTflite.preflight.fit.modelInputFit and
       not shortTflite.readiness.execute and not shortTflite.executed)
+
+proc checkMnistTfliteModelOracle() =
+  let plan = blaiMnistTfliteModelPlan()
+  let sample = blaiMnistTfliteSampleOracle()
+  let support = blaiMnistTfliteSupportPlan(plan)
+  let generatedPackage = blaiMnistGeneratedPackageContract()
+  check("NPU model MNIST TFLite oracle valid", plan.valid)
+  checkEq("NPU model MNIST TFLite oracle bytes", plan.modelBytes, 40208)
+  checkEq("NPU model MNIST TFLite oracle tensors", plan.tensorCount, 18)
+  checkEq("NPU model MNIST TFLite oracle operators", plan.operatorCount, 6)
+  checkEq("NPU model MNIST TFLite oracle persistent bytes",
+    plan.persistentTensorBufferBytes, 36300)
+  checkEq("NPU model MNIST TFLite oracle input tensor",
+    plan.inputTensor, 0)
+  checkEq("NPU model MNIST TFLite oracle output tensor",
+    plan.outputTensor, 17)
+  check("NPU model MNIST TFLite oracle input shape",
+    plan.tensors[0].role == blaiMnistTensorInput and
+      plan.tensors[0].tensorType == blaiMnistTensorInt8 and
+      plan.tensors[0].shapeRank == 4'u32 and
+      plan.tensors[0].shape == [1'u32, 28, 28, 1])
+  checkEq("NPU model MNIST TFLite oracle input scale bits",
+    plan.tensors[0].quantization.scaleBits, 0x3B80_8081'u32)
+  checkEq("NPU model MNIST TFLite oracle input zero",
+    plan.tensors[0].quantization.zeroPoint.uint32, (-128'i32).uint32)
+  check("NPU model MNIST TFLite oracle output shape",
+    plan.tensors[17].role == blaiMnistTensorOutput and
+      plan.tensors[17].tensorType == blaiMnistTensorInt8 and
+      plan.tensors[17].shapeRank == 2'u32 and
+      plan.tensors[17].shape == [1'u32, 10, 0, 0])
+  checkEq("NPU model MNIST TFLite oracle output scale bits",
+    plan.tensors[17].quantization.scaleBits, 0x3E99_258E'u32)
+  checkEq("NPU model MNIST TFLite oracle output zero",
+    plan.tensors[17].quantization.zeroPoint.uint32, 4)
+  check("NPU model MNIST TFLite oracle conv0 wiring",
+    plan.operators[0].kind == blaiMnistOpConv2d and
+      plan.operators[0].inputCount == 3'u32 and
+      plan.operators[0].inputs == [0'u32, 2, 3] and
+      plan.operators[0].outputs == [12'u32])
+  check("NPU model MNIST TFLite oracle reshape wiring",
+    plan.operators[4].kind == blaiMnistOpReshape and
+      plan.operators[4].inputCount == 2'u32 and
+      plan.operators[4].inputs == [15'u32, 1, 0] and
+      plan.operators[4].outputs == [16'u32])
+  check("NPU model MNIST TFLite oracle fully connected wiring",
+    plan.operators[5].kind == blaiMnistOpFullyConnected and
+      plan.operators[5].inputCount == 3'u32 and
+      plan.operators[5].inputs == [16'u32, 10, 11] and
+      plan.operators[5].outputs == [17'u32])
+  checkEq("NPU model MNIST TFLite oracle conv weights",
+    plan.tensors[8].bufferBytes, 20736)
+  checkEq("NPU model MNIST TFLite oracle fc weights",
+    plan.tensors[10].bufferBytes, 1920)
+  checkEq("NPU model MNIST TFLite oracle fc bias",
+    plan.tensors[11].bufferBytes, 40)
+  check("NPU model MNIST TFLite oracle buffer digest",
+    plan.tensors[8].bufferDigest == BlaiMnistTfliteConv3WeightDigest and
+      plan.tensors[10].bufferDigest == BlaiMnistTfliteFcWeightDigest and
+      plan.tensors[11].bufferDigest == BlaiMnistTfliteFcBiasDigest)
+  check("NPU model MNIST TFLite sample oracle valid", sample.valid)
+  checkEq("NPU model MNIST TFLite sample image bytes",
+    sample.imageBytes, 1862)
+  checkEq("NPU model MNIST TFLite sample pixel sum",
+    sample.imagePixelSum, 13635)
+  checkEq("NPU model MNIST TFLite sample input min",
+    sample.inputQuantizedMin.uint32, (-128'i32).uint32)
+  checkEq("NPU model MNIST TFLite sample input max",
+    sample.inputQuantizedMax.uint32, 64)
+  checkEq("NPU model MNIST TFLite sample input sum",
+    sample.inputQuantizedSum.uint32, (-86717'i32).uint32)
+  checkOutputCompare("NPU model MNIST TFLite sample output",
+    blaiCompareInt8Outputs(
+      [-19'i8, 7, -1, -4, -18, -41, -50, 43, -22, -4],
+      sample.outputVector))
+  var mnistProjectedRaw: array[10, uint8]
+  let mnistRawProjection =
+    blaiProjectInt8OutputRawBytes(sample.outputVector, mnistProjectedRaw)
+  check("NPU model MNIST TFLite sample raw projection",
+    mnistRawProjection.projected and
+      mnistRawProjection.convertedElements == 10'u32 and
+      mnistProjectedRaw == [237'u8, 7, 255, 252, 238, 215, 206, 43, 234, 252])
+  var mnistRawValidationInto: BlaiMnistTfliteSampleRawOutputValidation
+  var mnistProjectedInto: array[10, uint8]
+  blaiValidateMnistTfliteSampleRawOutputInto(
+    sample, mnistProjectedRaw, mnistProjectedInto, mnistRawValidationInto)
+  var mnistProjectedValidation: array[10, uint8]
+  let mnistRawValidation =
+    blaiValidateMnistTfliteSampleRawOutput(
+      sample, mnistProjectedRaw, mnistProjectedValidation)
+  check("NPU model MNIST TFLite sample raw validation into equal",
+    mnistRawValidationInto == mnistRawValidation)
+  check("NPU model MNIST TFLite sample raw validation",
+    mnistRawValidation.valid and mnistRawValidation.projected and
+      mnistRawValidation.matched and mnistRawValidation.expectedElements == 10'u32 and
+      mnistRawValidation.observedElements == 10'u32 and
+      mnistRawValidation.firstBlock == blaiMnistTfliteSampleRawOutputNoBlock)
+  checkEq("NPU model MNIST TFLite sample top raw score",
+    mnistRawValidation.topScoreRaw.uint32, 43)
+  var mnistMismatchRaw = mnistProjectedRaw
+  mnistMismatchRaw[7] = mnistMismatchRaw[7] xor 0x01'u8
+  var mnistMismatchProjected: array[10, uint8]
+  let mnistMismatchValidation =
+    blaiValidateMnistTfliteSampleRawOutput(
+      sample, mnistMismatchRaw, mnistMismatchProjected)
+  check("NPU model MNIST TFLite sample raw mismatch",
+    not mnistMismatchValidation.valid and
+      mnistMismatchValidation.firstBlock ==
+        blaiMnistTfliteSampleRawOutputCompare and
+      mnistMismatchValidation.firstMismatch == 7 and
+      mnistMismatchValidation.expectedAtFirstMismatch == 43'u8 and
+      mnistMismatchValidation.actualAtFirstMismatch == 42'u8)
+  checkEq("NPU model MNIST TFLite sample top class",
+    sample.topClass, 7)
+  checkEq("NPU model MNIST TFLite sample top score",
+    sample.topScore.uint32, 43)
+  check("NPU model MNIST TFLite sample conv0 summary",
+    sample.layers[0].operatorIndex == 0'u32 and
+      sample.layers[0].kind == blaiMnistOpConv2d and
+      sample.layers[0].outputTensor == 12'u32 and
+      sample.layers[0].outputSum == -287009)
+  check("NPU model MNIST TFLite sample fc summary",
+    sample.layers[5].operatorIndex == 5'u32 and
+      sample.layers[5].kind == blaiMnistOpFullyConnected and
+      sample.layers[5].outputTensor == 17'u32 and
+      sample.layers[5].outputMin == -50 and
+      sample.layers[5].outputMax == 43 and
+      sample.layers[5].outputSum == -109)
+  check("NPU model MNIST generated package contract",
+    generatedPackage.valid)
+  checkEq("NPU model MNIST generated package header bytes",
+    generatedPackage.header.headerBytes, 32)
+  checkEq("NPU model MNIST generated package size words",
+    generatedPackage.header.sizeTableWords, 8)
+  check("NPU model MNIST generated package image sidecar",
+    generatedPackage.imageSidecar.valid and
+      generatedPackage.imageSidecar.imageArray == blaiGeneratedImageBinArray and
+      generatedPackage.imageSidecar.imageBytes == 1862'u32 and
+      generatedPackage.imageSidecar.imageDigest ==
+        BlaiMnistTfliteSampleImageDigest)
+  check("NPU model MNIST generated package converter outputs",
+    generatedPackage.converterReady and
+      generatedPackage.converterOutputs.artifactCount == 6'u32 and
+      generatedPackage.converterOutputs.cpuArtifactCount == 3'u32 and
+      generatedPackage.converterOutputs.npuArtifactCount == 3'u32 and
+      generatedPackage.converterOutputs.payloadOrderMatchesGenArray)
+  check("NPU model MNIST generated package converter first",
+    generatedPackage.converterOutputs.artifacts[0].output ==
+      blaiToolchainOutputDspInstructionBin and
+      generatedPackage.converterOutputs.artifacts[0].section ==
+        blaiGeneratedCpuInstructionSection)
+  check("NPU model MNIST generated package converter npu",
+    generatedPackage.converterOutputs.artifacts[3].output ==
+      blaiToolchainOutputInstructionBin and
+      generatedPackage.converterOutputs.artifacts[3].section ==
+        blaiGeneratedNpuInstructionSection)
+  let converterDependencyPlan = blaiToolchainConverterDependencyPlan()
+  check("NPU model MNIST converter dependency plan",
+    converterDependencyPlan.valid)
+  check("NPU model MNIST converter dependency missing",
+    converterDependencyPlan.blocksExecution and
+      converterDependencyPlan.missingCount == 14'u32)
+  check("NPU model MNIST converter dependency classes",
+    converterDependencyPlan.frameworkMissing == 5'u32 and
+      converterDependencyPlan.nnapiMissing == 3'u32 and
+      converterDependencyPlan.tensorflowMissing == 1'u32 and
+      converterDependencyPlan.darknetMissing == 1'u32 and
+      converterDependencyPlan.openCvMissing == 4'u32)
+  check("NPU model MNIST converter dependency first",
+    converterDependencyPlan.firstMissing ==
+      blaiToolchainConverterDependencyBuiltinOps)
+  let converterArtifactRegeneration =
+    blaiToolchainConverterArtifactRegenerationPlan(
+      generatedPackage.converterOutputs, converterDependencyPlan)
+  check("NPU model MNIST converter artifact regeneration plan",
+    converterArtifactRegeneration.valid)
+  check("NPU model MNIST converter artifact regeneration blocked",
+    converterArtifactRegeneration.blockedByDependencies and
+      not converterArtifactRegeneration.converterRunnable)
+  check("NPU model MNIST converter artifact regeneration static",
+    converterArtifactRegeneration.staticOutputContractUsable and
+      not converterArtifactRegeneration.artifactsAvailable)
+  check("NPU model MNIST converter artifact regeneration block",
+    converterArtifactRegeneration.firstBlock ==
+      blaiToolchainConverterArtifactRegenerationDependencies)
+  let mnistSramReadiness =
+    blaiMnistToolchainSramReadinessEvidence(
+      generatedPackage, blaiToolchainSramGlobalsEvidence())
+  check("NPU model MNIST toolchain SRAM readiness evidence",
+    mnistSramReadiness.valid)
+  check("NPU model MNIST toolchain SRAM readiness patch size",
+    mnistSramReadiness.patchSizeMatchesCfg and
+      mnistSramReadiness.patchSizeBytes == 262144'u32)
+  check("NPU model MNIST toolchain SRAM readiness active slots",
+    mnistSramReadiness.cfgCoversActivePlanner and
+      mnistSramReadiness.activePlannerSlots == 40'u32 and
+      mnistSramReadiness.cfgPatchSlots == 45'u32)
+  check("NPU model MNIST toolchain SRAM readiness spare slots",
+    mnistSramReadiness.cfgSpareSlotsExpected and
+      mnistSramReadiness.sparePatchSlots == 5'u32)
+  check("NPU model MNIST toolchain SRAM readiness persistent fit",
+    mnistSramReadiness.persistentBufferFitsOnePatch and
+      mnistSramReadiness.persistentTensorBufferBytes == 36300'u32)
+  check("NPU model MNIST toolchain SRAM readiness output blocked",
+    mnistSramReadiness.realModelPlannerReady and
+      mnistSramReadiness.outputValidationStillBlocked)
+  check("NPU model MNIST generated package cfg memory",
+    generatedPackage.cfgReady and
+      generatedPackage.cfgMemory.cfgPatchSizeBytes == 262144'u32 and
+      generatedPackage.cfgMemory.cfgPatchNum == 45'u32)
+  check("NPU model MNIST generated package oracle",
+    generatedPackage.modelMatchesSample and
+      generatedPackage.outputOracleReady and
+      generatedPackage.sample.outputVector == sample.outputVector)
+  check("NPU model MNIST TFLite support persistent buffers",
+    support.persistentBuffersIdentified)
+  check("NPU model MNIST TFLite support metadata",
+    support.metadataValid)
+  check("NPU model MNIST TFLite support conv",
+    support.convolutionOperatorsSupported)
+  check("NPU model MNIST TFLite support reshape",
+    support.reshapeOperatorSupported)
+  check("NPU model MNIST TFLite support fc present",
+    support.fullyConnectedOperatorPresent)
+  check("NPU model MNIST TFLite support fc reference",
+    support.fullyConnectedReferenceSupported)
+  check("NPU model MNIST TFLite support parsed reference",
+    support.parsedReferenceRunnable)
+  check("NPU model MNIST TFLite support output pending",
+    not support.npuOutputValidated)
+  checkEq("NPU model MNIST TFLite support first unsupported",
+    support.firstUnsupportedOperator, 0xFFFF_FFFF'u32)
+  check("NPU model MNIST TFLite support unsupported kind",
+    support.firstUnsupportedKind == blaiMnistOpFullyConnected)
+  check("NPU model MNIST TFLite support block",
+    support.supportBlock == blaiMnistTfliteNpuOutputValidationPending)
+  check("NPU model MNIST TFLite support runnable",
+    not support.runnable)
+  let fcPlan = BlaiReferenceTfliteFullyConnected2d(
+    batchCount: 1,
+    inputC: 2,
+    outputC: 2,
+    inputOffset: -128,
+    filterOffset: -128,
+    outputOffset: 128,
+    outputMultiplier: 1'i32 shl 30,
+    outputShift: 0,
+    activationMin: 0,
+    activationMax: 255,
+    useBias: true)
+  var fcInput = [128'u8, 128]
+  var fcWeights = [128'u8, 128, 128, 128]
+  var fcBiases = [0'i32, 0]
+  var fcOutput = [0'u8, 0]
+  let fc = blaiReferenceTfliteFullyConnected2d(
+    fcPlan, fcInput, fcWeights, fcBiases, fcOutput)
+  check("NPU model TFLite fully connected reference fits", fc.fits)
+  checkEq("NPU model TFLite fully connected reference output0",
+    fcOutput[0].uint32, 128)
+  checkEq("NPU model TFLite fully connected reference output1",
+    fcOutput[1].uint32, 128)
+
+proc checkGeneratedModelLoadPlan() =
+  const header: array[32, uint8] = [
+    0x10'u8, 0x00, 0x00, 0x00,
+    0x04'u8, 0x00, 0x00, 0x00,
+    0x04'u8, 0x00, 0x00, 0x00,
+    0x00'u8, 0x00, 0x00, 0x00,
+    0x10'u8, 0x00, 0x00, 0x00,
+    0x10'u8, 0x00, 0x00, 0x00,
+    0x10'u8, 0x00, 0x00, 0x00,
+    0x00'u8, 0x00, 0x00, 0x00]
+  var blob: array[0x90, uint8]
+  for i in 0 ..< header.len:
+    blob[i] = header[i]
+  let sectionPlan = blaiGeneratedModelSectionPlan(blob)
+  let loadPlan = blaiGeneratedModelLoadPlan(sectionPlan)
+  var loadPlanInto: BlaiGeneratedModelLoadPlan
+  blaiGeneratedModelLoadPlanInto(sectionPlan, loadPlanInto)
+
+  check("NPU model generated load plan valid",
+    loadPlan.valid and loadPlanInto == loadPlan)
+  checkEq("NPU model generated load plan sections",
+    loadPlan.sectionCount, 6)
+  checkEq("NPU model generated load plan present",
+    loadPlan.presentSectionCount, 6)
+  checkEq("NPU model generated load plan copied",
+    loadPlan.copiedSectionCount, 6)
+  checkEq("NPU model generated load plan cache clean",
+    loadPlan.cacheCleanSectionCount, 3)
+  check("NPU model generated load plan cpu section",
+    loadPlan.sections[0].kind == blaiGeneratedCpuInstructionSection and
+      loadPlan.sections[0].copiedToPsram and
+      not loadPlan.sections[0].cacheCleanRequired)
+  check("NPU model generated load plan npu section",
+    loadPlan.sections[3].kind == blaiGeneratedNpuInstructionSection and
+      loadPlan.sections[3].copiedToPsram and
+      loadPlan.sections[3].cacheCleanRequired)
+  check("NPU model generated load plan cpu weight guard",
+    loadPlan.sdkCpuWeightGuardUsesInstructionSize and
+      loadPlan.robustCpuWeightGuardUsesWeightSize and
+      not loadPlan.cpuWeightGuardMismatch and
+      loadPlan.sections[2].sdkAllocationGuardActive and
+      loadPlan.sections[2].robustAllocationGuardActive)
+
+proc checkSdkInputBufferPlan() =
+  let plan = blaiSdkInputBufferPlan(0x2200_8000'u32, 784'u32)
+  var planInto: BlaiSdkInputBufferPlan
+  blaiSdkInputBufferPlanInto(0x2200_8000'u32, 784'u32, planInto)
+  check("NPU model SDK input buffer plan valid",
+    plan.valid and planInto == plan)
+  checkEq("NPU model SDK input buffer token",
+    plan.bufferToken, 0x2200_8000'u32)
+  checkEq("NPU model SDK input buffer bytes", plan.bufferBytes, 784'u32)
+  let nullPlan = blaiSdkInputBufferPlan(0'u32, 784'u32)
+  check("NPU model SDK input buffer null invalid",
+    not nullPlan.valid and not nullPlan.bufferPresent and
+      nullPlan.capacityPresent)
+  let zeroCapacityPlan = blaiSdkInputBufferPlan(0x2200_8000'u32, 0'u32)
+  check("NPU model SDK input buffer zero capacity invalid",
+    not zeroCapacityPlan.valid and zeroCapacityPlan.bufferPresent and
+      not zeroCapacityPlan.capacityPresent)
+
+proc checkSdkCoreAccessorPlans() =
+  let coldCreate = blaiSdkCreatePlan(
+    initialNpuInited = false,
+    modelToken = 0x2200_1000'u32,
+    netToken = 0x2200_2000'u32)
+  var coldCreateInto: BlaiSdkCreatePlan
+  blaiSdkCreatePlanInto(
+    initialNpuInited = false,
+    modelToken = 0x2200_1000'u32,
+    netToken = 0x2200_2000'u32,
+    coldCreateInto)
+  check("NPU model SDK create cold valid",
+    coldCreate.valid and coldCreateInto == coldCreate)
+  check("NPU model SDK create cold init",
+    coldCreate.callsHardwareInit and coldCreate.finalNpuInited)
+  check("NPU model SDK create success state",
+    coldCreate.netZeroed and coldCreate.parentLinked and
+      coldCreate.shareBufferCleared and coldCreate.callsRuntimeInit and
+      coldCreate.returnsModel)
+  let repeatedCreate = blaiSdkCreatePlan(
+    initialNpuInited = true,
+    modelToken = 0x2200_1100'u32,
+    netToken = 0x2200_2100'u32)
+  check("NPU model SDK create repeated no hardware init",
+    repeatedCreate.valid and not repeatedCreate.callsHardwareInit and
+      repeatedCreate.finalNpuInited and repeatedCreate.callsRuntimeInit)
+  let noModelCreate = blaiSdkCreatePlan(
+    initialNpuInited = false, modelToken = 0'u32, netToken = 0'u32)
+  check("NPU model SDK create model alloc failure",
+    noModelCreate.valid and noModelCreate.callsHardwareInit and
+      noModelCreate.finalNpuInited and not noModelCreate.returnsModel)
+  let noNetCreate = blaiSdkCreatePlan(
+    initialNpuInited = true, modelToken = 0x2200_1000'u32, netToken = 0'u32)
+  check("NPU model SDK create net alloc failure",
+    noNetCreate.valid and not noNetCreate.callsRuntimeInit and
+      noNetCreate.freesModelOnNetFailure and not noNetCreate.returnsModel)
+
+  let netInfoPlan = blaiSdkNetInfoPlan(0x2200_1000'u32, 0x2200_2000'u32)
+  var netInfoPlanInto: BlaiSdkNetInfoPlan
+  blaiSdkNetInfoPlanInto(
+    0x2200_1000'u32, 0x2200_2000'u32, netInfoPlanInto)
+  check("NPU model SDK net info plan valid",
+    netInfoPlan.valid and netInfoPlanInto == netInfoPlan)
+  checkEq("NPU model SDK net info token",
+    netInfoPlan.netToken, 0x2200_2000'u32)
+  let missingNetPlan = blaiSdkNetInfoPlan(0x2200_1000'u32, 0'u32)
+  check("NPU model SDK net info null invalid",
+    not missingNetPlan.valid and missingNetPlan.modelPresent and
+      not missingNetPlan.netPresent)
+
+  let filePlan = blaiSdkLoadModelFromFilePlan(
+    0x2200_1000'u32, 0x2200_3000'u32)
+  var filePlanInto: BlaiSdkLoadModelFromFilePlan
+  blaiSdkLoadModelFromFilePlanInto(
+    0x2200_1000'u32, 0x2200_3000'u32, filePlanInto)
+  check("NPU model SDK file load invalid input",
+    filePlan.valid and filePlanInto == filePlan and
+      filePlan.status == blaiSdkInvalidInput)
+  let nullFilePlan = blaiSdkLoadModelFromFilePlan(0'u32, 0'u32)
+  check("NPU model SDK file load null still invalid input",
+    nullFilePlan.valid and nullFilePlan.returnsInvalidInput and
+      not nullFilePlan.modelPresent and not nullFilePlan.namePresent)
+
+  let startPlan = blaiSdkStartComputePlan(
+    0x2200_1000'u32, blaiSdkNoError)
+  var startPlanInto: BlaiSdkStartComputePlan
+  blaiSdkStartComputePlanInto(
+    0x2200_1000'u32, blaiSdkNoError, startPlanInto)
+  check("NPU model SDK start compute delegates",
+    startPlan.valid and startPlanInto == startPlan and
+      startPlan.delegatesToInference and
+      startPlan.status == blaiSdkNoError)
+  let failedStartPlan = blaiSdkStartComputePlan(
+    0x2200_1000'u32, blaiSdkOpFailed)
+  check("NPU model SDK start compute propagates status",
+    failedStartPlan.valid and failedStartPlan.delegatesToInference and
+      failedStartPlan.status == blaiSdkOpFailed)
+  let nullStartPlan = blaiSdkStartComputePlan(0'u32, blaiSdkNoError)
+  check("NPU model SDK start compute null unavailable",
+    nullStartPlan.valid and not nullStartPlan.modelPresent and
+      not nullStartPlan.delegatesToInference and
+      nullStartPlan.returnsUnavailableDevice and
+      nullStartPlan.status == blaiSdkUnavailableDevice)
+
+  let freePlan = blaiSdkFreePlan(
+    0x2200_1000'u32,
+    modelBufferAllocated = true,
+    netAllocated = true,
+    cpuInstructionAllocated = true,
+    cpuBiasAllocated = true,
+    cpuWeightsAllocated = true,
+    npuInstructionAllocated = true,
+    npuBiasAllocated = true,
+    npuWeightsAllocated = true)
+  var freePlanInto: BlaiSdkFreePlan
+  blaiSdkFreePlanInto(
+    0x2200_1000'u32,
+    modelBufferAllocated = true,
+    netAllocated = true,
+    cpuInstructionAllocated = true,
+    cpuBiasAllocated = true,
+    cpuWeightsAllocated = true,
+    npuInstructionAllocated = true,
+    npuBiasAllocated = true,
+    npuWeightsAllocated = true,
+    freePlanInto)
+  check("NPU model SDK free plan valid",
+    freePlan.valid and freePlanInto == freePlan)
+  check("NPU model SDK free plan buffers",
+    freePlan.freesModelBuffer and freePlan.freesNet and
+      freePlan.freesCpuInstruction and freePlan.freesCpuBias and
+      freePlan.freesCpuWeights and freePlan.freesNpuInstruction and
+      freePlan.freesNpuBias and freePlan.freesNpuWeights)
+  check("NPU model SDK free plan clears",
+    freePlan.clearsModelBuffer and freePlan.clearsNet and
+      freePlan.freesModel and freePlan.status == blaiSdkNoError)
+  check("NPU model SDK free preserves runtime",
+    freePlan.preservesNpuRuntime)
+  let minimalFreePlan = blaiSdkFreePlan(
+    0'u32,
+    modelBufferAllocated = false,
+    netAllocated = false,
+    cpuInstructionAllocated = false,
+    cpuBiasAllocated = false,
+    cpuWeightsAllocated = false,
+    npuInstructionAllocated = false,
+    npuBiasAllocated = false,
+    npuWeightsAllocated = false)
+  check("NPU model SDK free null model no handle free",
+    minimalFreePlan.valid and not minimalFreePlan.modelPresent and
+      not minimalFreePlan.freesModel and minimalFreePlan.callsInstRelease)
+
+proc checkSdkOutputBufferPlan() =
+  let layers = [
+    BlaiCpuInstLayer64(outLayerMem: 1'i32),
+    BlaiCpuInstLayer64(outLayerMem: 3'i32)]
+  let plan = blaiSdkOutputBufferPlan(
+    layers, layerCount = 2'u32, patchSize = 16'u32, bufferBytes = 80'u32)
+  var planInto: BlaiSdkOutputBufferPlan
+  blaiSdkOutputBufferPlanInto(
+    layers, layerCount = 2'u32, patchSize = 16'u32,
+    bufferBytes = 80'u32, planInto)
+  check("NPU model SDK output buffer plan valid",
+    plan.valid and planInto == plan)
+  checkEq("NPU model SDK output buffer size",
+    plan.sizeReturned, 16)
+  checkEq("NPU model SDK output buffer slot",
+    plan.outputSlot, 3)
+  checkEq("NPU model SDK output buffer offset",
+    plan.outputOffset, 48)
+  check("NPU model SDK output buffer range",
+    plan.rangeFits and plan.rangeFit.requiredBytes == 64'u32 and
+      plan.firstBlock == blaiSdkOutputBufferNoBlock)
+
+  let noLayerPlan = blaiSdkOutputBufferPlan(
+    layers, layerCount = 0'u32, patchSize = 16'u32, bufferBytes = 80'u32)
+  check("NPU model SDK output buffer no layer block",
+    not noLayerPlan.valid and
+      noLayerPlan.firstBlock == blaiSdkOutputBufferLayerCount)
+  let zeroPatchPlan = blaiSdkOutputBufferPlan(
+    layers, layerCount = 2'u32, patchSize = 0'u32, bufferBytes = 80'u32)
+  check("NPU model SDK output buffer zero patch block",
+    not zeroPatchPlan.valid and
+      zeroPatchPlan.firstBlock == blaiSdkOutputBufferPatchSize)
+  let shortBufferPlan = blaiSdkOutputBufferPlan(
+    layers, layerCount = 2'u32, patchSize = 16'u32, bufferBytes = 63'u32)
+  check("NPU model SDK output buffer range block",
+    not shortBufferPlan.valid and
+      shortBufferPlan.firstBlock == blaiSdkOutputBufferRange and
+      shortBufferPlan.rangeFit.requiredBytes == 64'u32)
+  let negativeSlotLayers = [BlaiCpuInstLayer64(outLayerMem: -1'i32)]
+  let negativeSlotPlan = blaiSdkOutputBufferPlan(
+    negativeSlotLayers, layerCount = 1'u32, patchSize = 16'u32,
+    bufferBytes = 80'u32)
+  check("NPU model SDK output buffer slot block",
+    not negativeSlotPlan.valid and
+      negativeSlotPlan.firstBlock == blaiSdkOutputBufferSlot)
+
+proc checkSdkResolutionPlans() =
+  let inputResolution = blaiSdkInputResolutionPlan(28'u32, 28'u32)
+  var inputResolutionInto: BlaiSdkInputResolutionPlan
+  blaiSdkInputResolutionPlanInto(28'u32, 28'u32, inputResolutionInto)
+  check("NPU model SDK input resolution plan valid",
+    inputResolution.valid and inputResolutionInto == inputResolution)
+  checkEq("NPU model SDK input resolution width",
+    inputResolution.width, 28)
+  checkEq("NPU model SDK input resolution height",
+    inputResolution.height, 28)
+  check("NPU model SDK input resolution zero invalid",
+    not blaiSdkInputResolutionPlan(0'u32, 28'u32).valid and
+      not blaiSdkInputResolutionPlan(28'u32, 0'u32).valid)
+
+  let sourceResolution = blaiSdkSourceResolutionPlan(320'u32, 240'u32)
+  var sourceResolutionInto: BlaiSdkSourceResolutionPlan
+  blaiSdkSourceResolutionPlanInto(320'u32, 240'u32, sourceResolutionInto)
+  check("NPU model SDK source resolution plan valid",
+    sourceResolution.valid and sourceResolutionInto == sourceResolution)
+  checkEq("NPU model SDK source resolution width",
+    sourceResolution.stateAfter.width, 320)
+  checkEq("NPU model SDK source resolution height",
+    sourceResolution.stateAfter.height, 240)
+  check("NPU model SDK source resolution zero invalid",
+    not blaiSdkSourceResolutionPlan(0'u32, 240'u32).valid and
+      not blaiSdkSourceResolutionPlan(320'u32, 0'u32).valid)
+
+proc checkSdkCallbackPlans() =
+  let emptyState = blaiSdkCallbackState()
+  let resultPlan = blaiSdkResultCallbackPlan(emptyState, 0x2200_1234'u32)
+  var resultPlanInto: BlaiSdkResultCallbackPlan
+  blaiSdkResultCallbackPlanInto(emptyState, 0x2200_1234'u32, resultPlanInto)
+  check("NPU model SDK result callback plan valid",
+    resultPlan.valid and resultPlanInto == resultPlan)
+  checkEq("NPU model SDK result callback token",
+    resultPlan.stateAfter.resultCallbackToken, 0x2200_1234'u32)
+  check("NPU model SDK result callback preserves custom",
+    not resultPlan.stateAfter.customPostprocessEnabled and
+      resultPlan.stateAfter.customPostprocessCallbackToken == 0'u32)
+  let nullResult = blaiSdkResultCallbackPlan(emptyState, 0'u32)
+  check("NPU model SDK result callback null invalid",
+    not nullResult.valid and nullResult.returnsNoError and
+      not nullResult.callbackPresent)
+
+  let customPlan = blaiSdkCustomPostprocessCallbackPlan(
+    resultPlan.stateAfter, 0x2200_5678'u32)
+  var customPlanInto: BlaiSdkCustomPostprocessCallbackPlan
+  blaiSdkCustomPostprocessCallbackPlanInto(
+    resultPlan.stateAfter, 0x2200_5678'u32, customPlanInto)
+  check("NPU model SDK custom callback plan valid",
+    customPlan.valid and customPlanInto == customPlan)
+  checkEq("NPU model SDK custom callback token",
+    customPlan.stateAfter.customPostprocessCallbackToken, 0x2200_5678'u32)
+  check("NPU model SDK custom callback enables flag",
+    customPlan.customPostprocessEnabled and
+      customPlan.stateAfter.customPostprocessEnabled)
+  check("NPU model SDK custom callback preserves result",
+    customPlan.stateAfter.resultCallbackToken == 0x2200_1234'u32)
+  let nullCustom = blaiSdkCustomPostprocessCallbackPlan(
+    resultPlan.stateAfter, 0'u32)
+  check("NPU model SDK custom callback null invalid",
+    not nullCustom.valid and nullCustom.returnsNoError and
+      nullCustom.customPostprocessEnabled and
+      not nullCustom.callbackPresent)
+
+when defined(blaiMeetkaiAsrFixture):
+  proc checkMeetkaiAsrGeneratedHeaderFixture() =
+    let instructionSection = BlaiGeneratedModelSectionWindow(
+      offset: 0,
+      bytes: MeetkaiAsrNpuInstructionBytes.uint32,
+      endExclusive: MeetkaiAsrNpuInstructionBytes.uint32,
+      ordered: true,
+      withinBlob: true,
+      active: true,
+      valid: true)
+    let biasSection = BlaiGeneratedModelSectionWindow(
+      offset: MeetkaiAsrNpuInstructionBytes.uint32,
+      bytes: 0,
+      endExclusive: MeetkaiAsrNpuInstructionBytes.uint32,
+      ordered: true,
+      withinBlob: true,
+      active: false,
+      valid: false)
+    let weightSection = biasSection
+    let payloadCopy = BlaiGeneratedNpuPayloadCopyResult(
+      sections: BlaiGeneratedNpuPayloadSections(
+        instruction: instructionSection,
+        bias: biasSection,
+        weight: weightSection,
+        instructionBytes: MeetkaiAsrNpuInstructionBytes.uint32,
+        biasBytes: MeetkaiAsrNpuBiasBytes.uint32,
+        weightBytes: MeetkaiAsrNpuWeightBytes.uint32,
+        totalBytes: MeetkaiAsrNpuInstructionBytes.uint32,
+        payloadFits: true,
+        valid: true),
+      instruction: BlaiGeneratedModelSectionCopyResult(
+        section: instructionSection,
+        destinationBytes: MeetkaiAsrNpuInstructionBytes.uint32,
+        sourceFits: true,
+        destinationFits: true,
+        copiedBytes: MeetkaiAsrNpuInstructionBytes.uint32,
+        firstByte: MeetkaiAsrNpuInstructionPayload[0],
+        lastByte: MeetkaiAsrNpuInstructionPayload[
+          MeetkaiAsrNpuInstructionPayload.len - 1],
+        copied: true,
+        valid: true),
+      bias: BlaiGeneratedModelSectionCopyResult(
+        section: biasSection,
+        destinationBytes: 0,
+        sourceFits: true,
+        destinationFits: true,
+        copied: true,
+        valid: true),
+      weight: BlaiGeneratedModelSectionCopyResult(
+        section: weightSection,
+        destinationBytes: 0,
+        sourceFits: true,
+        destinationFits: true,
+        copied: true,
+        valid: true),
+      instructionCopied: true,
+      biasCopied: true,
+      weightCopied: true,
+      copied: true,
+      valid: true)
+    var addressPlan: BlaiGeneratedNpuPayloadAddressPlan
+    blaiGeneratedNpuPayloadAddressPlanInto(
+      payloadCopy, 0x2200_7000'u32, 0'u32, 0'u32, addressPlan)
+    let staged = BlaiGeneratedNpuStagedPayloadResult(
+      sectionPlan: BlaiGeneratedModelSectionPlan(
+        blobBytes: MeetkaiAsrGeneratedBlobBytes.uint32,
+        headerBytes: MeetkaiAsrGeneratedHeaderBytes.uint32,
+        valid: true),
+      payloadCopy: payloadCopy,
+      addressPlan: addressPlan,
+      registerPlan: addressPlan.registerPlan,
+      copied: payloadCopy.copied,
+      addressesValid: addressPlan.valid,
+      readyToConfigure: payloadCopy.valid and addressPlan.valid,
+      valid: payloadCopy.valid and addressPlan.valid)
+    let prepared = BlaiGeneratedNpuPreparedPayloadResult(
+      sectionPlan: staged.sectionPlan,
+      staged: staged,
+      registerPlan: staged.registerPlan,
+      sectionPlanValid: true,
+      payloadStaged: staged.valid,
+      readyToConfigure: staged.readyToConfigure,
+      valid: staged.valid)
+    var configure: BlaiGeneratedNpuConfigurePlan
+    blaiGeneratedNpuConfigurePlanInto(prepared, configure)
+    var run: BlaiGeneratedNpuRunPreflightPlan
+    blaiGeneratedNpuRunPreflightPlanInto(configure, timeout = 37'u32, run)
+
+    check("NPU model MeetKai generated fixture valid", prepared.valid)
+    check("NPU model MeetKai generated fixture ready",
+      configure.valid and run.valid)
+    checkEq("NPU model MeetKai generated blob bytes",
+      prepared.sectionPlan.blobBytes, MeetkaiAsrGeneratedBlobBytes.uint32)
+    checkEq("NPU model MeetKai generated header bytes",
+      prepared.sectionPlan.headerBytes, MeetkaiAsrGeneratedHeaderBytes.uint32)
+    checkEq("NPU model MeetKai generated CPU instructions",
+      MeetkaiAsrCpuInstructionBytes.uint32, 18176)
+    checkEq("NPU model MeetKai generated NPU instructions",
+      payloadCopy.sections.instructionBytes,
+      MeetkaiAsrNpuInstructionBytes.uint32)
+    checkEq("NPU model MeetKai generated NPU bias bytes",
+      payloadCopy.sections.biasBytes,
+      MeetkaiAsrNpuBiasBytes.uint32)
+    checkEq("NPU model MeetKai generated NPU weight bytes",
+      payloadCopy.sections.weightBytes,
+      MeetkaiAsrNpuWeightBytes.uint32)
+    check("NPU model MeetKai generated payload copied",
+      payloadCopy.instructionCopied and payloadCopy.biasCopied and
+        payloadCopy.weightCopied)
+    checkEq("NPU model MeetKai generated copied bytes",
+      payloadCopy.instruction.copiedBytes,
+      MeetkaiAsrNpuInstructionBytes.uint32)
+    checkEq("NPU model MeetKai generated inst addr",
+      configure.registerPlan.instAddr, 0x2200_7000'u32)
+    checkEq("NPU model MeetKai generated bias addr",
+      configure.registerPlan.biasAddr, 0)
+    checkEq("NPU model MeetKai generated weight addr",
+      configure.registerPlan.weightAddr, 0)
+    check("NPU model MeetKai generated zero sections accepted",
+      addressPlan.biasAddressPresent and addressPlan.weightAddressPresent)
+    check("NPU model MeetKai generated address plan block",
+      addressPlan.firstBlock == blaiGeneratedNpuPayloadAddressNoBlock)
+    check("NPU model MeetKai generated run preflight",
+      run.runnableAfterConfigure and run.firstBlock == npuLayerRunNoBlock)
+    checkEq("NPU model MeetKai generated first byte",
+      MeetkaiAsrNpuInstructionPayload[0].uint32, 1)
+    checkEq("NPU model MeetKai generated timeout",
+      run.layerRun.waitPlan.timeout, 37)
 
 proc checkParsedSingleLayerDiagnostics() =
   let fixedLayer = BlaiCpuInstLayer64(
@@ -4535,29 +5348,82 @@ proc checkParsedConfiguredWorkspaceActiveMaterializedProbe() =
   var output: array[1, uint8]
   var materialization: BlaiForwardModelWorkspaceMaterializeResult
   var fixture: BlaiParsedForwardConfiguredWorkspaceFixtureResult
+  let activeDescriptorHalt = false
+  let activeRuntimeInitPlan = npuRuntimeInitRegisterPlan(
+    blaiLoadReg(cnnClockReset()[].mmClkCpu),
+    blaiLoadReg(cnnClockReset()[].swResetCodecSub),
+    blaiLoadReg(mmMiscVram()[].vramCtrl))
   npuInit()
   npuSetClockEnable(false)
   npuConfigureNetParams(NpuNetParams(
     unsignedInput: true,
     reluN: 0,
     tensorflowMode: true))
+  let activeDemoLimiterPlan = npuBusLimiterPlan(
+    BlaiDemoLimiterCommandCount, BlaiDemoLimiterCommandCount)
+  npuApplyBusLimiterPlan(activeDemoLimiterPlan)
+  let activeDemoLimiterStatus = npuBlaiCommandStatus()
+  let activeDemoLimiterEvidence =
+    npuBusLimiterReadbackEvidence(
+      activeDemoLimiterPlan, activeDemoLimiterStatus)
+  logBlaiCommandStatus(
+    "NPU model active demo limiter status",
+    activeDemoLimiterStatus)
+  check("NPU model parsed configured workspace fixture active demo limiter evidence",
+    activeDemoLimiterEvidence.valid)
+  check("NPU model parsed configured workspace fixture active demo limiter read",
+    activeDemoLimiterEvidence.readMatches and
+      activeDemoLimiterStatus.readCommandCount == BlaiDemoLimiterCommandCount and
+      activeDemoLimiterStatus.readCommandMode)
+  check("NPU model parsed configured workspace fixture active demo limiter write",
+    activeDemoLimiterEvidence.writeMatches and
+      activeDemoLimiterStatus.writeCommandCount == BlaiDemoLimiterCommandCount and
+      activeDemoLimiterStatus.writeCommandMode)
+  check("NPU model parsed configured workspace fixture active demo limiter MM idle",
+    activeDemoLimiterEvidence.noMmCommandActivity)
   let activeNoLimiterPlan = npuBusLimiterPlan(
     0'u32, 0'u32, readMode = false, writeMode = false)
   npuApplyBusLimiterPlan(activeNoLimiterPlan)
-  let activeDemoLimiterStatus = npuBlaiCommandStatus()
+  let activeNoLimiterStatus = npuBlaiCommandStatus()
+  let activeNoLimiterEvidence =
+    npuBusLimiterReadbackEvidence(activeNoLimiterPlan, activeNoLimiterStatus)
   logBlaiCommandStatus(
     "NPU model active no limiter status",
-    activeDemoLimiterStatus)
+    activeNoLimiterStatus)
   check("NPU model parsed configured workspace fixture active no limiter status",
-    activeDemoLimiterStatus.valid)
+    activeNoLimiterEvidence.valid)
   check("NPU model parsed configured workspace fixture active no limiter read",
-    activeDemoLimiterStatus.codecLimiterRead == activeNoLimiterPlan.read and
-      activeDemoLimiterStatus.readCommandCount == 0'u32 and
-      not activeDemoLimiterStatus.readCommandMode)
+    activeNoLimiterEvidence.readMatches and
+      activeNoLimiterStatus.readCommandCount == 0'u32 and
+      not activeNoLimiterStatus.readCommandMode)
   check("NPU model parsed configured workspace fixture active no limiter write",
-    activeDemoLimiterStatus.codecLimiterWrite == activeNoLimiterPlan.write and
-      activeDemoLimiterStatus.writeCommandCount == 0'u32 and
-      not activeDemoLimiterStatus.writeCommandMode)
+    activeNoLimiterEvidence.writeMatches and
+      activeNoLimiterStatus.writeCommandCount == 0'u32 and
+      not activeNoLimiterStatus.writeCommandMode)
+  let activeQosPlan = npuCodecQosPlan(
+    blaiLoadReg(codecMisc()[].qosCtrl), aw = true, ar = true)
+  npuApplyCodecQosPlan(activeQosPlan)
+  let activeQosStatus = npuCodecQosStatus()
+  let activeQosReadback =
+    npuCodecQosReadbackEvidence(activeQosPlan, activeQosStatus)
+  check("NPU model parsed configured workspace fixture active codec qos evidence",
+    activeQosReadback.valid)
+  check("NPU model parsed configured workspace fixture active codec qos aw",
+    activeQosReadback.awMatches and activeQosStatus.cnnAwqos)
+  check("NPU model parsed configured workspace fixture active codec qos ar",
+    activeQosReadback.arMatches and activeQosStatus.cnnArqos)
+  check("NPU model parsed configured workspace fixture active codec qos encoded",
+    activeQosReadback.encodedMatches)
+  let activeCodecBus = npuCodecBusStatus()
+  check("NPU model parsed configured workspace fixture active codec bus evidence",
+    activeCodecBus.valid)
+  check("NPU model parsed configured workspace fixture active codec bus pclk",
+    activeCodecBus.pclkForceOnMask <= CodecPclkForceOnMask)
+  check("NPU model parsed configured workspace fixture active codec bus thresholds",
+    activeCodecBus.blaiThresholdsKnown)
+  check("NPU model parsed configured workspace fixture active codec bus BLAI thresholds",
+    activeCodecBus.blai2SysramThreshold <= CodecBlaiThresholdMask and
+      activeCodecBus.blai2ExtThreshold <= CodecBlaiThresholdMask)
   let activeInitClock = npuClockStatus()
   let activeInitReset = npuResetStatus()
   let activeInitSram = npuSramStatus()
@@ -4587,8 +5453,39 @@ proc checkParsedConfiguredWorkspaceActiveMaterializedProbe() =
     activeRuntimeInit.sramValid)
   check("NPU model parsed configured workspace fixture active runtime SRAM released",
     activeRuntimeInit.sramReleased)
+  check("NPU model parsed configured workspace fixture active runtime SRAM selected",
+    activeRuntimeInit.sramSelected)
   check("NPU model parsed configured workspace fixture active runtime SRAM set self-cleared",
     activeRuntimeInit.sysramSetSelfCleared)
+  let activeRuntimeBoundary =
+    npuRuntimeInitSdkBoundaryEvidence(activeRuntimeInitPlan, activeRuntimeInit)
+  check("NPU model parsed configured workspace fixture active runtime SDK boundary evidence",
+    activeRuntimeBoundary.valid)
+  check("NPU model parsed configured workspace fixture active runtime SDK clock source",
+    activeRuntimeBoundary.sdkSelectsClockSource)
+  check("NPU model parsed configured workspace fixture active runtime SDK preserves clock",
+    activeRuntimeBoundary.sdkPreservesGate and
+      activeRuntimeBoundary.sdkPreservesDivider)
+  check("NPU model parsed configured workspace fixture active runtime local clock",
+    activeRuntimeBoundary.localEnablesClockDuringInit and
+      activeRuntimeBoundary.localDisablesClockAfterInit)
+  check("NPU model parsed configured workspace fixture active runtime local reset",
+    activeRuntimeBoundary.localPulsesReset)
+  check("NPU model parsed configured workspace fixture active runtime local SRAM",
+    activeRuntimeBoundary.localReleasesSram and
+      activeRuntimeBoundary.localSelectsSram)
+  check("NPU model parsed configured workspace fixture active runtime boundary explicit",
+    activeRuntimeBoundary.boundaryExplicit)
+  let activeActivationTable0Raw = blaiLoadReg(blaiRegs()[].actTable[0])
+  let activeActivationTable0 =
+    npuActivationTableDefaultEvidence(0'u32, activeActivationTable0Raw)
+  check("NPU model parsed configured workspace fixture active activation table reset evidence",
+    activeActivationTable0.valid)
+  check("NPU model parsed configured workspace fixture active activation table reset raw",
+    activeActivationTable0.rawMatchesReset)
+  check("NPU model parsed configured workspace fixture active activation table reset decoded",
+    activeActivationTable0.decodedValid and
+      activeActivationTable0.entriesMatchReset)
   check("NPU model parsed configured workspace fixture active int cfg command RMW",
     activeRuntimeInit.intCfgCommandsValid)
   check("NPU model parsed configured workspace fixture active int cfg start command",
@@ -4600,6 +5497,7 @@ proc checkParsedConfiguredWorkspaceActiveMaterializedProbe() =
   check("NPU model parsed configured workspace fixture active int cfg clear command",
     activeRuntimeInit.interruptClearCommandMatches)
   var activeBinding: BlaiForwardWorkspaceBufferBinding
+  var longBudgetFixture: BlaiParsedForwardConfiguredWorkspaceFixtureResult
   blaiBindForwardWorkspaceAddressInto(
     resources, activeWorkspaceProjection.hardwareAddress,
     blaiBufferLenU32(activeNpuWorkspace.len), activeBinding)
@@ -4612,6 +5510,7 @@ proc checkParsedConfiguredWorkspaceActiveMaterializedProbe() =
       cpuBiasBytes = cpuBiases, decodedWeights = decodedWeights,
       decodedBiases = decodedBiases, npuWeightBytes = npuWeights,
       npuBiases = npuBiases, temporaryWeights = temporaryWeights,
+      descriptorHalt = activeDescriptorHalt,
       outResult = materialization)
   var activeSdkTemp: BlaiForwardNpuTemporaryWeightBiasBufferResult
   if materialization.allReady:
@@ -4634,6 +5533,17 @@ proc checkParsedConfiguredWorkspaceActiveMaterializedProbe() =
           weightAddr: activeSdkTemp.weightAddr,
           biasAddr: activeSdkTemp.biasAddr),
         outResult = fixture, timeout = 11)
+      blaiValidateParsedForwardConfiguredWorkspaceAddressFixtureWithLayerBuffersInto(
+        states, modelResources = resources,
+        workspaceBaseAddress = activeWorkspaceProjection.hardwareAddress,
+        tensorPlan = tensorPlan, inputIndex = 0, input = [7'u8],
+        expectedOutput = [0'u8], output = output,
+        workspaceBytes = activeNpuWorkspace,
+        layerBuffers = NpuLayerBuffers(
+          instAddr: activeBinding.workspace.instruction.address,
+          weightAddr: activeSdkTemp.weightAddr,
+          biasAddr: activeSdkTemp.biasAddr),
+        outResult = longBudgetFixture, timeout = 101)
   let activeWorkspace = blaiPlanForwardModelWorkspace(
     resources, baseAddress = activeWorkspaceProjection.hardwareAddress)
   let activeWeightPlan = blaiPlanNpuWeightLoad(states[0].layer, useTflite = true)
@@ -4725,8 +5635,100 @@ proc checkParsedConfiguredWorkspaceActiveMaterializedProbe() =
   let activeStreamSemantics =
     blaiForwardWorkspaceInstructionStreamSemanticEvidence(
       activeStreamEvidence, states[0].layer, stream)
+  let activeStreamRawWords =
+    blaiForwardWorkspaceInstructionRawWordEvidence(activeStreamEvidence, stream)
+  let activeSdkStreamWalk =
+    blaiNpuSdkStreamWalkEvidence(
+      activeStreamEvidence, activeStreamRawWords, stream)
+  let activeTerminalControl =
+    blaiForwardWorkspaceInstructionTerminalControlEvidence(
+      activeStreamEvidence, activeStreamSemantics, activeStreamRawWords,
+      states[0].layer)
+  let activeToolchainRunGate =
+    blaiToolchainNpuRunGate(activeStreamEvidence.decodedLayer)
+  let activeToolchainRunGateFromCpu =
+    blaiToolchainNpuRunGate(states[0].layer)
+  let toolchainDirectRunGate = blaiToolchainNpuRunGate(
+    blaiToolchainNpuRunScalars(
+      BlaiToolchainNpuRunMatmulType, 1, 1, 1, 1, 4, 4, 4, 1, 1))
+  let toolchainNonSquareRunGate = blaiToolchainNpuRunGate(
+    blaiToolchainNpuRunScalars(
+      BlaiToolchainNpuRunConvType, 3, 5, 1, 1, 7, 7, 8, 1, 1))
+  let toolchainStride2KernelRunGate = blaiToolchainNpuRunGate(
+    blaiToolchainNpuRunScalars(
+      BlaiToolchainNpuRunConvType, 3, 3, 2, 1, 8, 8, 8, 1, 2))
+  let toolchainStride2ParityRunGate = blaiToolchainNpuRunGate(
+    blaiToolchainNpuRunScalars(
+      BlaiToolchainNpuRunConvType, 2, 2, 2, 1, 7, 8, 8, 1, 2))
   check("NPU model parsed configured workspace fixture active stream semantic evidence",
     activeStreamSemantics.valid)
+  check("NPU model parsed configured workspace fixture active stream raw word evidence",
+    activeStreamRawWords.valid)
+  check("NPU model parsed configured workspace fixture active stream raw word count",
+    activeStreamRawWords.countMatches)
+  check("NPU model parsed configured workspace fixture active stream raw quant words",
+    activeStreamRawWords.quantWordsMatch)
+  check("NPU model parsed configured workspace fixture active stream raw layer words",
+    activeStreamRawWords.layerWordsMatch)
+  check("NPU model parsed configured workspace fixture active stream raw instruction classes",
+    activeStreamRawWords.quantIsTfliteSide and
+      activeStreamRawWords.noExternalInstruction and
+      activeStreamRawWords.layerIsNormalInstruction and
+      activeStreamRawWords.layerHasHalt)
+  check("NPU model parsed configured workspace fixture active SDK stream walk",
+    activeSdkStreamWalk.valid)
+  check("NPU model parsed configured workspace fixture active SDK stream side record",
+    activeSdkStreamWalk.firstRecordSideInstruction and
+      activeSdkStreamWalk.firstRecordNotTerminal)
+  check("NPU model parsed configured workspace fixture active SDK stream layer record",
+    activeSdkStreamWalk.secondRecordLayerInstruction and
+      activeSdkStreamWalk.secondRecordTerminal)
+  check("NPU model parsed configured workspace fixture active SDK stream layer count",
+    activeSdkStreamWalk.wouldAllocateOneLayer and
+      activeSdkStreamWalk.decodedLayerCountMatches)
+  check("NPU model parsed configured workspace fixture active SDK stream stop",
+    activeSdkStreamWalk.scanStopsAtSecondRecord)
+  check("NPU model parsed configured workspace fixture active terminal control",
+    activeTerminalControl.valid)
+  check("NPU model parsed configured workspace fixture active terminal split bits",
+    activeTerminalControl.terminalBitsSplit == (not activeDescriptorHalt))
+  check("NPU model parsed configured workspace fixture active terminal descriptor halt clear",
+    activeTerminalControl.descriptorHaltBitClear == (not activeDescriptorHalt))
+  check("NPU model parsed configured workspace fixture active terminal stream end",
+    activeTerminalControl.streamEndBitSet)
+  check("NPU model parsed configured workspace fixture active terminal control coherent",
+    activeTerminalControl.controlCoherent)
+  check("NPU model parsed configured workspace fixture active toolchain run gate",
+    activeToolchainRunGate.kernelSquare and
+      activeToolchainRunGate.knownLayer and
+      activeToolchainRunGate.kernelSupported and
+      activeToolchainRunGate.strideXSupported and
+      activeToolchainRunGate.strideYSupported and
+      activeToolchainRunGate.dilationSupported and
+      activeToolchainRunGate.depthwisePressureAccepted and
+      activeToolchainRunGate.stride2KernelAccepted and
+      activeToolchainRunGate.stride2ParityAccepted and
+      activeToolchainRunGate.eligible)
+  check("NPU model parsed configured workspace fixture active toolchain run CPU projection",
+    activeToolchainRunGateFromCpu.eligible == activeToolchainRunGate.eligible and
+      activeToolchainRunGateFromCpu.kernelSquare ==
+        activeToolchainRunGate.kernelSquare and
+      activeToolchainRunGateFromCpu.knownLayer ==
+        activeToolchainRunGate.knownLayer)
+  check("NPU model parsed configured workspace fixture toolchain run direct gate",
+    toolchainDirectRunGate.directAcceptedLayer and
+      toolchainDirectRunGate.eligible)
+  check("NPU model parsed configured workspace fixture toolchain run non-square gate",
+    not toolchainNonSquareRunGate.kernelSquare and
+      not toolchainNonSquareRunGate.eligible)
+  check("NPU model parsed configured workspace fixture toolchain run stride2 kernel gate",
+    toolchainStride2KernelRunGate.kernelSquare and
+      not toolchainStride2KernelRunGate.stride2KernelAccepted and
+      not toolchainStride2KernelRunGate.eligible)
+  check("NPU model parsed configured workspace fixture toolchain run stride2 parity gate",
+    toolchainStride2ParityRunGate.kernelSquare and
+      not toolchainStride2ParityRunGate.stride2ParityAccepted and
+      not toolchainStride2ParityRunGate.eligible)
   check("NPU model parsed configured workspace fixture active stream operand plan",
     activeStreamSemantics.operandPlanMatches)
   check("NPU model parsed configured workspace fixture active operand c2 zero",
@@ -5001,6 +6003,15 @@ proc checkParsedConfiguredWorkspaceActiveMaterializedProbe() =
     activeRunEvidence.firstCacheRangeOffsetMatches)
   check("NPU model parsed configured workspace fixture active config first cache bytes",
     activeRunEvidence.firstCacheRangeBytesFitPatch)
+  let activePatchSizeRegisterEvidence =
+    npuLayerConfigPatchSizeRegisterEvidence(
+      npuPlanLayerConfigRegisters(activeRunPlan.layerConfig))
+  check("NPU model parsed configured workspace fixture active config patch register evidence",
+    activePatchSizeRegisterEvidence.valid)
+  check("NPU model parsed configured workspace fixture active config patch register SDK write",
+    activePatchSizeRegisterEvidence.sdkPatchSizeWritten)
+  check("NPU model parsed configured workspace fixture active config patch register imageSeg",
+    activePatchSizeRegisterEvidence.imageSegNamesPatchSize)
   let activeDataSlots = blaiForwardWorkspaceDataSlotEvidence(
     activeWorkspace, activeNpuWorkspace, states[0].layer, inputIndex = 0,
     expectedInputByte = 7'u8)
@@ -5332,6 +6343,46 @@ proc checkParsedConfiguredWorkspaceActiveMaterializedProbe() =
     startedEvidence.intCfgClean)
   check("NPU model parsed configured workspace fixture active snapshot started mirror",
     launchStartEvidence.snapshotStartedMatches)
+  let activeLaunchGeneralCfg =
+    npuGeneralCfgDefaultEvidence(
+      snapshot.launchRegisters, snapshot.launchRegistersCaptured,
+      expectedUnsignedInput = true)
+  let activeStartedGeneralCfg =
+    npuGeneralCfgDefaultEvidence(
+      snapshot.startedRegisters, snapshot.startedRegistersCaptured,
+      expectedUnsignedInput = true)
+  check("NPU model parsed configured workspace fixture active launch general cfg defaults",
+    activeLaunchGeneralCfg.valid)
+  check("NPU model parsed configured workspace fixture active launch general cfg ftable",
+    activeLaunchGeneralCfg.activationIndexBaseDefault and
+      activeLaunchGeneralCfg.activationDataBaseDefault)
+  check("NPU model parsed configured workspace fixture active launch general cfg reserved",
+    activeLaunchGeneralCfg.reservedBitsClear)
+  check("NPU model parsed configured workspace fixture active started general cfg defaults",
+    activeStartedGeneralCfg.valid)
+  check("NPU model parsed configured workspace fixture active started general cfg ftable",
+    activeStartedGeneralCfg.activationIndexBaseDefault and
+      activeStartedGeneralCfg.activationDataBaseDefault)
+  check("NPU model parsed configured workspace fixture active started general cfg idle",
+    activeStartedGeneralCfg.axiIdleBitsSet and activeStartedGeneralCfg.notBusy)
+  let activeLaunchIntCfg =
+    npuIntCfgKnownFieldEvidence(
+      snapshot.launchRegisters, snapshot.launchRegistersCaptured)
+  let activeStartedIntCfg =
+    npuIntCfgKnownFieldEvidence(
+      snapshot.startedRegisters, snapshot.startedRegistersCaptured)
+  check("NPU model parsed configured workspace fixture active launch int cfg known fields",
+    activeLaunchIntCfg.valid)
+  check("NPU model parsed configured workspace fixture active launch int cfg reserved",
+    activeLaunchIntCfg.reservedBitsClear)
+  check("NPU model parsed configured workspace fixture active launch int cfg relu default",
+    activeLaunchIntCfg.reluNMatches)
+  check("NPU model parsed configured workspace fixture active started int cfg known fields",
+    activeStartedIntCfg.valid)
+  check("NPU model parsed configured workspace fixture active started int cfg reserved",
+    activeStartedIntCfg.reservedBitsClear)
+  check("NPU model parsed configured workspace fixture active started int cfg relu default",
+    activeStartedIntCfg.reluNMatches)
   let launchRetention =
     blaiParsedForwardConfiguredWorkspaceLaunchRetentionEvidence(
       launchStartEvidence)
@@ -5446,6 +6497,110 @@ proc checkParsedConfiguredWorkspaceActiveMaterializedProbe() =
     activeCacheContract.dataRangeCountMatches)
   check("NPU model parsed configured workspace fixture active cache contract data clean",
     activeCacheContract.dataRangeCleanValid)
+  let activeLaunchCacheRegister =
+    blaiForwardLaunchCacheRegisterEvidence(
+      activeLaunchBridgeEvidence, activeCacheEvidence, activeCacheContract,
+      activeSdkTempEvidence)
+  check("NPU model parsed configured workspace fixture active launch cache register evidence",
+    activeLaunchCacheRegister.valid)
+  check("NPU model parsed configured workspace fixture active launch cache register instruction",
+    activeLaunchCacheRegister.instructionRegisterCacheClean)
+  check("NPU model parsed configured workspace fixture active launch cache register data",
+    activeLaunchCacheRegister.dataRegisterCacheClean)
+  check("NPU model parsed configured workspace fixture active launch cache register weight",
+    activeLaunchCacheRegister.weightRegisterCacheClean)
+  check("NPU model parsed configured workspace fixture active launch cache register bias",
+    activeLaunchCacheRegister.biasRegisterCacheClean)
+  check("NPU model parsed configured workspace fixture active launch cache register addresses",
+    activeLaunchCacheRegister.registerCacheAddressesMatch)
+  check("NPU model parsed configured workspace fixture active launch cache register bytes",
+    activeLaunchCacheRegister.registerCacheBytesReady)
+  let activeLaunchSramAddress =
+    blaiForwardLaunchSramAddressEvidence(
+      snapshot.launchRegisters, snapshot.launchRegistersCaptured,
+      activeWorkspaceWramEvidence, activeLaunchBridgeEvidence,
+      activeLaunchCacheRegister, activeRuntimeInit)
+  check("NPU model parsed configured workspace fixture active launch SRAM address evidence",
+    activeLaunchSramAddress.valid)
+  check("NPU model parsed configured workspace fixture active launch SRAM address registers",
+    activeLaunchSramAddress.registerAddressesInWram)
+  check("NPU model parsed configured workspace fixture active launch SRAM address instruction",
+    activeLaunchSramAddress.instructionRegisterInWram)
+  check("NPU model parsed configured workspace fixture active launch SRAM address data",
+    activeLaunchSramAddress.dataRegisterInWram)
+  check("NPU model parsed configured workspace fixture active launch SRAM address weight",
+    activeLaunchSramAddress.weightRegisterInWram)
+  check("NPU model parsed configured workspace fixture active launch SRAM address bias",
+    activeLaunchSramAddress.biasRegisterInWram)
+  check("NPU model parsed configured workspace fixture active launch SRAM ownership",
+    activeLaunchSramAddress.runtimeSramValid and
+      activeLaunchSramAddress.sramReleased and
+      activeLaunchSramAddress.sramSelected)
+  check("NPU model parsed configured workspace fixture active launch SRAM latch",
+    activeLaunchSramAddress.sysramSetSelfCleared)
+  let activeLaunchWramSpan =
+    blaiForwardLaunchWramSpanEvidence(
+      snapshot.launchRegisters, snapshot.launchRegistersCaptured,
+      activeLaunchSramAddress, activeWorkspaceBytes.instructionBytes,
+      snapshot.launchRegisters.imageSeg, activeSdkTemp.weightBytes,
+      activeSdkTemp.biasBytes)
+  check("NPU model parsed configured workspace fixture active launch WRAM span evidence",
+    activeLaunchWramSpan.valid)
+  check("NPU model parsed configured workspace fixture active launch WRAM span bus",
+    activeLaunchWramSpan.registerSpansFitBus)
+  check("NPU model parsed configured workspace fixture active launch WRAM span instruction",
+    activeLaunchWramSpan.instructionSpanInWram)
+  check("NPU model parsed configured workspace fixture active launch WRAM span data",
+    activeLaunchWramSpan.dataSpanInWram)
+  check("NPU model parsed configured workspace fixture active launch WRAM span weight",
+    activeLaunchWramSpan.weightSpanInWram)
+  check("NPU model parsed configured workspace fixture active launch WRAM span bias",
+    activeLaunchWramSpan.biasSpanInWram)
+  let activeLaunchInstructionFetch =
+    blaiForwardLaunchInstructionFetchEvidence(
+      snapshot.launchRegisters, snapshot.launchRegistersCaptured,
+      activeWorkspace, activeLaunchSramAddress, activeLaunchWramSpan,
+      activeStreamRawWords, activeSdkStreamWalk, activeTerminalControl)
+  check("NPU model parsed configured workspace fixture active launch instruction fetch evidence",
+    activeLaunchInstructionFetch.valid)
+  check("NPU model parsed configured workspace fixture active launch instruction fetch address",
+    activeLaunchInstructionFetch.instructionAddressMatchesWorkspace)
+  check("NPU model parsed configured workspace fixture active launch instruction fetch bytes",
+    activeLaunchInstructionFetch.instructionBytesMatchRawRecords)
+  check("NPU model parsed configured workspace fixture active launch instruction fetch records",
+    activeLaunchInstructionFetch.twoInstructionRecords)
+  check("NPU model parsed configured workspace fixture active launch instruction fetch encoder",
+    activeLaunchInstructionFetch.quantRecordMatchesEncoder and
+      activeLaunchInstructionFetch.layerRecordMatchesEncoder)
+  check("NPU model parsed configured workspace fixture active launch instruction fetch SDK walk",
+    activeLaunchInstructionFetch.sdkWalkAllocatesOneLayer and
+      activeLaunchInstructionFetch.terminalLayerRecord)
+  check("NPU model parsed configured workspace fixture active launch instruction fetch control",
+    activeLaunchInstructionFetch.descriptorControlCoherent)
+  let activeLaunchOperandFetch =
+    blaiForwardLaunchOperandFetchEvidence(
+      snapshot.launchRegisters, snapshot.launchRegistersCaptured,
+      activeRunEvidence, activeDataSlots, activeDataMapping,
+      activePackedWeightEvidence, activeSdkTemp, activeSdkTempEvidence,
+      activeLaunchWramSpan, activeStreamEvidence, activeStreamSemantics)
+  check("NPU model parsed configured workspace fixture active launch operand fetch evidence",
+    activeLaunchOperandFetch.valid)
+  check("NPU model parsed configured workspace fixture active launch operand fetch registers",
+    activeLaunchOperandFetch.dataRegisterMatchesRun and
+      activeLaunchOperandFetch.weightRegisterMatchesTemp and
+      activeLaunchOperandFetch.biasRegisterMatchesTemp)
+  check("NPU model parsed configured workspace fixture active launch operand fetch segment",
+    activeLaunchOperandFetch.dataSegmentMatchesPatch)
+  check("NPU model parsed configured workspace fixture active launch operand fetch slots",
+    activeLaunchOperandFetch.descriptorInputSlotMatchesData and
+      activeLaunchOperandFetch.descriptorOutputSlotMatchesData)
+  check("NPU model parsed configured workspace fixture active launch operand fetch single input",
+    activeLaunchOperandFetch.descriptorSingleInputMatches)
+  check("NPU model parsed configured workspace fixture active launch operand fetch data",
+    activeLaunchOperandFetch.stagedInputReady and
+      activeLaunchOperandFetch.outputSlotReady)
+  check("NPU model parsed configured workspace fixture active launch operand fetch weights",
+    activeLaunchOperandFetch.weightBiasBytesReady)
   case materialization.firstBlock
   of blaiForwardModelWorkspaceMaterializeNoBlock:
     check("NPU model parsed configured workspace fixture active materialization first none",
@@ -5827,6 +6982,28 @@ proc checkParsedConfiguredWorkspaceActiveMaterializedProbe() =
     fixture.execution.lastExecution.completion.poll.polls, 11)
   check("NPU model parsed configured workspace fixture active completion poll exhausted",
     fixture.execution.lastExecution.completion.poll.exhausted)
+  let activeLongPollingWait =
+    blaiNpuPollingWaitEvidence(longBudgetFixture.execution.lastExecution.completion)
+  let activePollingBudgetScale =
+    blaiNpuPollingBudgetScaleEvidence(activePollingWait, activeLongPollingWait)
+  check("NPU model parsed configured workspace fixture active polling budget scale evidence",
+    activePollingBudgetScale.valid)
+  checkEq("NPU model parsed configured workspace fixture active polling budget scale short",
+    activePollingBudgetScale.shortBudget, 11)
+  checkEq("NPU model parsed configured workspace fixture active polling budget scale long",
+    activePollingBudgetScale.longBudget, 101)
+  check("NPU model parsed configured workspace fixture active polling budget scale ordered",
+    activePollingBudgetScale.budgetsOrdered)
+  check("NPU model parsed configured workspace fixture active polling budget scale timeout",
+    activePollingBudgetScale.bothTimeout)
+  check("NPU model parsed configured workspace fixture active polling budget scale exhausted",
+    activePollingBudgetScale.bothBudgetExhausted)
+  check("NPU model parsed configured workspace fixture active polling budget scale longer polls",
+    activePollingBudgetScale.longerPollsObserved)
+  check("NPU model parsed configured workspace fixture active polling budget scale no interrupt",
+    activePollingBudgetScale.noInterruptObserved)
+  check("NPU model parsed configured workspace fixture active polling budget scale stable",
+    activePollingBudgetScale.statusStable and activePollingBudgetScale.terminalStable)
   let activeCompletionSideEffects =
     blaiNpuCompletionSideEffectEvidence(fixture.execution.lastExecution.completion)
   check("NPU model parsed configured workspace fixture active completion side effects",
@@ -5858,6 +7035,55 @@ proc checkParsedConfiguredWorkspaceActiveMaterializedProbe() =
     activeClockExit.waitExitClockDividerZero)
   check("NPU model parsed configured workspace fixture active clock exit disabled",
     activeClockExit.disabledAfterTimeout)
+  let activeStartClock =
+    blaiNpuStartClockEvidence(fixture.execution.lastExecution.completion)
+  check("NPU model parsed configured workspace fixture active start clock evidence",
+    activeStartClock.valid)
+  check("NPU model parsed configured workspace fixture active start clock enabled",
+    activeStartClock.startClockEnabled)
+  check("NPU model parsed configured workspace fixture active start clock source",
+    activeStartClock.startClockSourceKnown and
+      activeStartClock.startClockSource320M)
+  check("NPU model parsed configured workspace fixture active start clock divider",
+    activeStartClock.startClockDividerZero)
+  check("NPU model parsed configured workspace fixture active start clock retained",
+    activeStartClock.waitExitClockMatchesStart)
+  let activeStartTransition =
+    blaiNpuStartTransitionEvidence(fixture.execution.lastExecution.completion)
+  check("NPU model parsed configured workspace fixture active start transition evidence",
+    activeStartTransition.valid)
+  check("NPU model parsed configured workspace fixture active start transition first run",
+    activeStartTransition.startsFirstRun and
+      not activeStartTransition.initialWrapperStarted)
+  check("NPU model parsed configured workspace fixture active start transition command",
+    activeStartTransition.startCommandSelected and
+      not activeStartTransition.resumeCommandSelected)
+  check("NPU model parsed configured workspace fixture active start transition wrapper",
+    activeStartTransition.wrapperStateUpdated and
+      activeStartTransition.wrapperStartedAfterStart)
+  check("NPU model parsed configured workspace fixture active start transition SDK",
+    activeStartTransition.matchesSdk)
+  let activeInferenceSdkSequence =
+    blaiNpuInferenceSdkSequenceEvidence(
+      blaiNpuRuntimeOwnershipPlan(), fixture.execution.lastExecution.completion,
+      activeCompletionSideEffects, activeClockExit)
+  check("NPU model parsed configured workspace fixture active inference SDK sequence",
+    activeInferenceSdkSequence.valid)
+  check("NPU model parsed configured workspace fixture active inference SDK sequence semaphore",
+    activeInferenceSdkSequence.sdkWaitsOnSemaphore)
+  check("NPU model parsed configured workspace fixture active inference SDK sequence polling",
+    activeInferenceSdkSequence.activePollsInterrupt)
+  check("NPU model parsed configured workspace fixture active inference SDK sequence start",
+    activeInferenceSdkSequence.startIssued)
+  check("NPU model parsed configured workspace fixture active inference SDK sequence pending",
+    activeInferenceSdkSequence.waitStillPending)
+  check("NPU model parsed configured workspace fixture active inference SDK sequence ack deferred",
+    activeInferenceSdkSequence.interruptAckDeferredOnTimeout)
+  check("NPU model parsed configured workspace fixture active inference SDK sequence clock",
+    activeInferenceSdkSequence.clockDisabledAfterWait)
+  checkEq("NPU model parsed configured workspace fixture active inference SDK sequence block",
+    ord(activeInferenceSdkSequence.firstBlock).uint32,
+    ord(blaiNpuInferenceSdkSequenceNoBlock).uint32)
   let activeStopAfterInference =
     blaiNpuStopAfterInferenceEvidence(fixture.execution.lastExecution)
   check("NPU model parsed configured workspace fixture active stop-after-inference evidence",
@@ -5873,6 +7099,31 @@ proc checkParsedConfiguredWorkspaceActiveMaterializedProbe() =
     activeStopAfterInference.stopped and activeStopAfterInference.outcomeStopped)
   check("NPU model parsed configured workspace fixture active stop-after-inference timeout",
     activeStopAfterInference.stoppedAfterTimeout)
+  logNpuRegisterSnapshot(
+    "NPU model active post-stop BLAI registers",
+    fixture.execution.lastExecution.postStopRegistersCaptured,
+    fixture.execution.lastExecution.postStopRegisters)
+  let activePostStopSnapshot =
+    blaiNpuPostStopSnapshotEvidence(
+      activeRunPlan, fixture.execution.lastExecution)
+  check("NPU model parsed configured workspace fixture active post-stop snapshot evidence",
+    activePostStopSnapshot.valid)
+  check("NPU model parsed configured workspace fixture active post-stop snapshot captured",
+    activePostStopSnapshot.captured)
+  check("NPU model parsed configured workspace fixture active post-stop snapshot addresses",
+    activePostStopSnapshot.addressRetained)
+  check("NPU model parsed configured workspace fixture active post-stop snapshot segment",
+    activePostStopSnapshot.segmentRetained)
+  check("NPU model parsed configured workspace fixture active post-stop snapshot net",
+    activePostStopSnapshot.netRetained)
+  check("NPU model parsed configured workspace fixture active post-stop snapshot commands",
+    activePostStopSnapshot.commandStateKnown)
+  check("NPU model parsed configured workspace fixture active post-stop snapshot stop terminal",
+    activePostStopSnapshot.stopCommandTerminalKnown)
+  check("NPU model parsed configured workspace fixture active post-stop snapshot interrupt",
+    activePostStopSnapshot.interruptStillClear)
+  check("NPU model parsed configured workspace fixture active post-stop snapshot idle",
+    activePostStopSnapshot.engineIdle)
   let activePostCompletionCache =
     blaiNpuPostCompletionCacheEvidence(
       activeRunPlan, fixture.execution.lastExecution)
@@ -5889,6 +7140,27 @@ proc checkParsedConfiguredWorkspaceActiveMaterializedProbe() =
     activePostCompletionCache.invalidateDeferred)
   check("NPU model parsed configured workspace fixture active post-completion cache no invalidate",
     activePostCompletionCache.appliedInvalidateCount == 0)
+  let activeSdkSequence =
+    blaiForwardNpuSdkSequenceEvidence(
+      activeRunPlan, fixture.execution.lastExecution,
+      activeStopAfterInference, activePostCompletionCache)
+  check("NPU model parsed configured workspace fixture active SDK forward sequence",
+    activeSdkSequence.valid)
+  check("NPU model parsed configured workspace fixture active SDK forward sequence runtime",
+    activeSdkSequence.runtimeOwnsExecutionLock)
+  check("NPU model parsed configured workspace fixture active SDK forward sequence clean",
+    activeSdkSequence.cleanBeforeWait)
+  check("NPU model parsed configured workspace fixture active SDK forward sequence wait",
+    activeSdkSequence.waitStarted)
+  check("NPU model parsed configured workspace fixture active SDK forward sequence stop",
+    activeSdkSequence.stopAfterWait)
+  check("NPU model parsed configured workspace fixture active SDK forward sequence invalidate",
+    activeSdkSequence.outputInvalidatePlanned)
+  check("NPU model parsed configured workspace fixture active SDK forward sequence deferred",
+    activeSdkSequence.outputReadbackDeferredOnTimeout)
+  checkEq("NPU model parsed configured workspace fixture active SDK forward sequence block",
+    ord(activeSdkSequence.firstBlock).uint32,
+    ord(blaiForwardNpuSdkSequenceNoBlock).uint32)
   let activeTimeoutOutputInvalidate = blaiApplyCacheRange(
     activeRunPlan.layerConfig.inputBufferAddr,
     activeRunPlan.forwardPlan.outputInvalidateRange)
@@ -5922,12 +7194,28 @@ proc checkParsedConfiguredWorkspaceActiveMaterializedProbe() =
     activeOutputCacheGate.noInvalidateApplied)
   check("NPU model parsed configured workspace fixture active output cache gate coherent",
     activeOutputCacheGate.gateMatchesCache)
+  var activeOutputReadbackPlanInto:
+    BlaiParsedForwardConfiguredWorkspaceActiveOutputReadbackPlan
+  blaiParsedForwardConfiguredWorkspaceActiveOutputReadbackPlanInto(
+    tensorPlan, activeOutputBlocked, deferredOutputEvidence,
+    activeOutputCacheGate, activeOutputReadbackPlanInto)
+  let activeOutputReadbackPlanOnly =
+    blaiParsedForwardConfiguredWorkspaceActiveOutputReadbackPlan(
+      tensorPlan, activeOutputBlocked, deferredOutputEvidence,
+      activeOutputCacheGate)
+  check("NPU model parsed configured workspace fixture active output readback typed plan into",
+    activeOutputReadbackPlanInto == activeOutputReadbackPlanOnly)
+  check("NPU model parsed configured workspace fixture active output readback typed plan",
+    activeOutputReadbackPlanOnly.valid)
   let activeOutputReadbackPlan =
     blaiParsedForwardConfiguredWorkspaceActiveOutputReadbackPlanEvidence(
       tensorPlan, activeOutputBlocked, deferredOutputEvidence,
       activeOutputCacheGate)
   check("NPU model parsed configured workspace fixture active output readback plan evidence",
     activeOutputReadbackPlan.valid)
+  check("NPU model parsed configured workspace fixture active output readback plan mirrors typed",
+    activeOutputReadbackPlan.readbackDeferredByExecution ==
+      activeOutputReadbackPlanOnly.readbackDeferredByExecution)
   check("NPU model parsed configured workspace fixture active output readback plan runnable",
     activeOutputReadbackPlan.planRunnable)
   check("NPU model parsed configured workspace fixture active output readback plan output active",
@@ -6176,12 +7464,45 @@ proc checkParsedConfiguredWorkspaceActiveMaterializedProbe() =
       snapshot.lastExecutionWaitExitInterrupt,
       snapshot.lastExecutionWaitExitBusy,
       snapshot.lastExecutionWaitExitClock)
+    let activeCnnWrapperCompletion =
+      npuCnnWrapperCompletionSurfaceEvidence(
+        snapshot.lastExecutionWaitExitBusy.generalCfg,
+        snapshot.lastExecutionWaitExitInterrupt.intCfg)
+    logCnnWrapperCompletionSurface(
+      "NPU model active CNN wrapper completion surface",
+      activeCnnWrapperCompletion)
+    check("NPU model parsed configured workspace fixture active CNN wrapper completion surface evidence",
+      activeCnnWrapperCompletion.valid)
+    check("NPU model parsed configured workspace fixture active CNN wrapper completion surface standard clear",
+      activeCnnWrapperCompletion.standardStatusClear)
+    check("NPU model parsed configured workspace fixture active CNN wrapper completion surface candidate",
+      activeCnnWrapperCompletion.wrapperCandidatePending)
+    check("NPU model parsed configured workspace fixture active CNN wrapper completion surface wrapper only",
+      activeCnnWrapperCompletion.wrapperPendingOnly)
+    check("NPU model parsed configured workspace fixture active CNN wrapper completion surface conflict",
+      activeCnnWrapperCompletion.candidateConflictsWithStdHeader)
+    check("NPU model parsed configured workspace fixture active CNN wrapper completion surface read only",
+      activeCnnWrapperCompletion.readOnlyProbe)
+    check("NPU model parsed configured workspace fixture active CNN wrapper completion surface policy",
+      activeCnnWrapperCompletion.runtimePolicyUnchanged)
     let activeBlaiCommandStatus = npuBlaiCommandStatus()
     logBlaiCommandStatus(
       "NPU model active BLAI command status",
       activeBlaiCommandStatus)
     check("NPU model parsed configured workspace fixture active BLAI command status",
       activeBlaiCommandStatus.valid)
+    let activeBusDecodeStatus = npuBusDecodeStatus()
+    logBusDecodeStatus(
+      "NPU model active bus decode status",
+      activeBusDecodeStatus)
+    check("NPU model parsed configured workspace fixture active bus decode status",
+      activeBusDecodeStatus.valid)
+    check("NPU model parsed configured workspace fixture active bus decode no MM error",
+      not activeBusDecodeStatus.mmErrorLatched)
+    check("NPU model parsed configured workspace fixture active bus decode no MCU error",
+      not activeBusDecodeStatus.mcuErrorLatched)
+    check("NPU model parsed configured workspace fixture active bus decode no error",
+      activeBusDecodeStatus.noDecodeError)
     let executionGateEvidence =
       blaiParsedForwardConfiguredWorkspaceExecutionGateEvidence(snapshot)
     check("NPU model parsed configured workspace fixture active execution gate evidence",
@@ -6288,6 +7609,53 @@ proc checkParsedConfiguredWorkspaceActiveMaterializedProbe() =
         activeWaitExitEvidence.clockRetained)
       check("NPU model parsed configured workspace fixture active wait-exit status",
         activeWaitExitEvidence.statusValid)
+      let activeIdleCompletion =
+        blaiParsedForwardConfiguredWorkspaceActiveIdleCompletionEvidence(
+          executionGateEvidence, activeTimeoutEvidence, activeWaitExitEvidence)
+      check("NPU model parsed configured workspace fixture active idle completion evidence",
+        activeIdleCompletion.valid)
+      check("NPU model parsed configured workspace fixture active idle completion engine",
+        activeIdleCompletion.engineStarted)
+      check("NPU model parsed configured workspace fixture active idle completion no interrupt",
+        activeIdleCompletion.noCompletionInterrupt)
+      check("NPU model parsed configured workspace fixture active idle completion idle",
+        activeIdleCompletion.waitExitIdle)
+      check("NPU model parsed configured workspace fixture active idle completion axi",
+        activeIdleCompletion.axiWriteIdle and activeIdleCompletion.axiReadIdle)
+      check("NPU model parsed configured workspace fixture active idle completion gated",
+        activeIdleCompletion.outputStillGated)
+      let activeIdleOutputReadbackGate =
+        blaiParsedForwardConfiguredWorkspaceIdleOutputReadbackGateEvidence(
+          activeIdleCompletion, activeOutputReadbackPlan)
+      check("NPU model parsed configured workspace fixture active idle output readback gate evidence",
+        activeIdleOutputReadbackGate.valid)
+      check("NPU model parsed configured workspace fixture active idle output readback gate idle",
+        activeIdleOutputReadbackGate.idleCompletionCandidate)
+      check("NPU model parsed configured workspace fixture active idle output readback gate plan",
+        activeIdleOutputReadbackGate.readbackPlanReady)
+      check("NPU model parsed configured workspace fixture active idle output readback gate diagnostic",
+        activeIdleOutputReadbackGate.diagnosticReadbackAllowed)
+      check("NPU model parsed configured workspace fixture active idle output readback gate blocked",
+        activeIdleOutputReadbackGate.validationStillBlocked)
+      var activeIdleDiagnosticOutput: array[1, uint8]
+      let activeIdleReadbackDiagnostic =
+        blaiParsedForwardConfiguredWorkspaceIdleOutputReadbackDiagnostic(
+          activeIdleOutputReadbackGate, activeBinding, tensorPlan,
+          blaiForwardPrimaryOutput, activeNpuWorkspace, [0'u8],
+          activeIdleDiagnosticOutput)
+      check("NPU model parsed configured workspace fixture active idle output readback diagnostic evidence",
+        activeIdleReadbackDiagnostic.valid)
+      check("NPU model parsed configured workspace fixture active idle output readback diagnostic moved",
+        activeIdleReadbackDiagnostic.outputMoved)
+      check("NPU model parsed configured workspace fixture active idle output readback diagnostic compare",
+        activeIdleReadbackDiagnostic.outputMatched)
+      check("NPU model parsed configured workspace fixture active idle output readback diagnostic observed",
+        activeIdleReadbackDiagnostic.readbackObserved and
+          activeIdleReadbackDiagnostic.compareObserved)
+      check("NPU model parsed configured workspace fixture active idle output readback diagnostic blocked",
+        activeIdleReadbackDiagnostic.modelValidationStillBlocked)
+      checkEq("NPU model parsed configured workspace fixture active idle output readback diagnostic byte",
+        activeIdleDiagnosticOutput[0].uint32, 0)
       check("NPU model parsed configured workspace fixture active wait-exit mode bits",
         activeWaitExitEvidence.modeMatchesBusyBits)
       check("NPU model parsed configured workspace fixture active wait-exit mode known",
@@ -6405,12 +7773,80 @@ proc checkParsedConfiguredWorkspaceActiveMaterializedProbe() =
         activeCompletionGap.reasonMatchesEvidence)
       check("NPU model parsed configured workspace fixture active completion gap remaining progress",
         activeCompletionGap.remainingCompletionProgress)
+      let activeBlaiTzmidMissing = npuBlaiTzmidStatusFromRaw(0'u32, 0'u32)
+      check("NPU model parsed configured workspace fixture active BLAI TZMID missing evidence",
+        activeBlaiTzmidMissing.valid)
+      check("NPU model parsed configured workspace fixture active BLAI TZMID missing precondition",
+        activeBlaiTzmidMissing.candidateCompletionPrecondition)
+      let activeBlaiTzmidConfigured = npuBlaiTzmidStatusFromRaw(
+        TzcNsecMmBmxBlaiTzmidMask or TzcNsecMmBmxBlaiTzmidSelMask,
+        TzcNsecMmBmxBlaiTzmidLockMask)
+      check("NPU model parsed configured workspace fixture active BLAI TZMID configured evidence",
+        activeBlaiTzmidConfigured.valid)
+      check("NPU model parsed configured workspace fixture active BLAI TZMID configured group",
+        activeBlaiTzmidConfigured.groupKnown and
+          activeBlaiTzmidConfigured.group == 1'u32)
+      check("NPU model parsed configured workspace fixture active BLAI TZMID configured lock",
+        activeBlaiTzmidConfigured.locked)
+      let activeBlaiTzmidPlan = npuBlaiTzmidPlan(
+        0x0024_0004'u32, 0x0000_0020'u32, 1'u32, lockAfterWrite = true)
+      check("NPU model parsed configured workspace fixture active BLAI TZMID plan evidence",
+        activeBlaiTzmidPlan.valid)
+      check("NPU model parsed configured workspace fixture active BLAI TZMID plan preserve",
+        activeBlaiTzmidPlan.preservesOtherMasters)
+      let activeBlaiTzmidLive = npuBlaiTzmidStatus()
+      logBlaiTzmidStatus("NPU model active BLAI TZMID live",
+        activeBlaiTzmidLive)
+      check("NPU model parsed configured workspace fixture active BLAI TZMID live evidence",
+        activeBlaiTzmidLive.valid)
+      check("NPU model parsed configured workspace fixture active BLAI TZMID live readable",
+        activeBlaiTzmidLive.readable)
+      check("NPU model parsed configured workspace fixture active BLAI TZMID live group bounded",
+        activeBlaiTzmidLive.group <= 1'u32)
+      check("NPU model parsed configured workspace fixture active BLAI TZMID live classification",
+        activeBlaiTzmidLive.candidateCompletionPrecondition ==
+          (activeBlaiTzmidLive.readable and not activeBlaiTzmidLive.selected))
       let activeRuntimeOwnership = blaiNpuRuntimeOwnershipPlan()
       let activeInitPlanForInterrupt = npuPlanInitConfig(
         NpuLayerBuffers(), inputBufferAddr = 0x2204_1000'u32, patchSize = 1'u32,
         netParams = NpuNetParams(tensorflowMode: true))
       let activeInterruptBinding = npuInterruptBindingReadiness(
         activeInitPlanForInterrupt.interrupt, activeRuntimeOwnership)
+      let activeInitCfgPlan = npuPlanInitConfig(
+        activeRunPlan.layerConfig.buffers,
+        inputBufferAddr = activeRunPlan.layerConfig.inputBufferAddr,
+        patchSize = activeRunPlan.layerConfig.patchSize,
+        netParams = NpuNetParams(
+          unsignedInput: true,
+          reluN: layer.activation.uint32,
+          tensorflowMode: true))
+      let activeInitCfgRegisterPlan = npuPlanInitConfigRegisters(
+        activeInitCfgPlan,
+        snapshot.launchRegisters.generalCfg,
+        snapshot.launchRegisters.intCfg,
+        snapshot.launchRegisters.tfCfg0)
+      let activeInitCfgEvidence = npuBlaiInitCfgSdkSequenceEvidence(
+        activeInitCfgRegisterPlan,
+        npuSdkInterruptApiEvidence(activeInitCfgPlan.interrupt, true),
+        npuInterruptBindingReadiness(
+          activeInitCfgPlan.interrupt, activeRuntimeOwnership),
+        npuRecoveredHalNetParamObjdumpEvidence())
+      check("NPU model parsed configured workspace fixture active initCfg SDK sequence evidence",
+        activeInitCfgEvidence.valid)
+      check("NPU model parsed configured workspace fixture active initCfg SDK sequence layer",
+        activeInitCfgEvidence.layerSetupRepresented)
+      check("NPU model parsed configured workspace fixture active initCfg SDK sequence input",
+        activeInitCfgEvidence.inputBufferRepresented)
+      check("NPU model parsed configured workspace fixture active initCfg SDK sequence net",
+        activeInitCfgEvidence.netParamsRepresented)
+      check("NPU model parsed configured workspace fixture active initCfg SDK sequence IRQ",
+        activeInitCfgEvidence.interruptRequestMatchesSdk and
+          activeInitCfgEvidence.interruptOperationOrderMatchesSdk)
+      check("NPU model parsed configured workspace fixture active initCfg SDK sequence deferred",
+        activeInitCfgEvidence.activeBindingDeferred and
+          activeInitCfgEvidence.pollingPreserved)
+      check("NPU model parsed configured workspace fixture active initCfg SDK sequence no hidden completion",
+        activeInitCfgEvidence.noHiddenCompletionEnable)
       let activeCompletionSignal =
         blaiParsedForwardConfiguredWorkspaceCompletionSignalEvidence(
           activeRuntimeOwnership, activeInterruptBinding, activeCompletionPolicy,
@@ -6518,6 +7954,141 @@ proc checkParsedConfiguredWorkspaceActiveMaterializedProbe() =
         activeMmAggregateWaitExit.subrouteUnknown)
       check("NPU model parsed configured workspace fixture active MM aggregate wait-exit polling",
         activeMmAggregateWaitExit.pollingPreserved)
+      let activeMmAggregateSdkOffsetCandidate =
+        npuMmAggregateSdkOffsetCandidateEvidence(
+          npuInterruptGlbRouteMap(activeInitPlanForInterrupt.interrupt),
+          snapshot.lastExecutionWaitExitMmAggregate)
+      check("NPU model parsed configured workspace fixture active MM aggregate SDK offset candidate evidence",
+        activeMmAggregateSdkOffsetCandidate.valid)
+      check("NPU model parsed configured workspace fixture active MM aggregate SDK offset candidate index",
+        activeMmAggregateSdkOffsetCandidate.candidateIndex == NpuCnnIrqOffset)
+      check("NPU model parsed configured workspace fixture active MM aggregate SDK offset candidate bank",
+        activeMmAggregateSdkOffsetCandidate.bank1Candidate)
+      check("NPU model parsed configured workspace fixture active MM aggregate SDK offset candidate bit",
+        activeMmAggregateSdkOffsetCandidate.bitMatchesSdkOffset)
+      check("NPU model parsed configured workspace fixture active MM aggregate SDK offset candidate no pending",
+        activeMmAggregateSdkOffsetCandidate.noCandidatePending)
+      check("NPU model parsed configured workspace fixture active MM aggregate SDK offset candidate unverified",
+        activeMmAggregateSdkOffsetCandidate.subrouteStillUnverified)
+      check("NPU model parsed configured workspace fixture active MM aggregate SDK offset candidate polling",
+        activeMmAggregateSdkOffsetCandidate.pollingPreserved)
+      let activeMmAggregateSdkHelper =
+        npuMmAggregateSdkHelperEvidence(
+          activeMmAggregateSdkOffsetCandidate.candidateIndex,
+          snapshot.lastExecutionWaitExitMmAggregate.mask1)
+      check("NPU model parsed configured workspace fixture active MM aggregate SDK helper evidence",
+        activeMmAggregateSdkHelper.valid)
+      check("NPU model parsed configured workspace fixture active MM aggregate SDK helper bank",
+        activeMmAggregateSdkHelper.usesStatus1 and
+          activeMmAggregateSdkHelper.usesMask1 and
+          activeMmAggregateSdkHelper.usesClear1)
+      check("NPU model parsed configured workspace fixture active MM aggregate SDK helper clear",
+        activeMmAggregateSdkHelper.clearIsWriteOne and
+          activeMmAggregateSdkHelper.clearWrite ==
+            activeMmAggregateSdkOffsetCandidate.candidate.plan.mask)
+      check("NPU model parsed configured workspace fixture active MM aggregate SDK helper unmask",
+        activeMmAggregateSdkHelper.unmaskClearsMaskBit)
+      let activeLocalAggregateInterrupt =
+        blaiParsedForwardConfiguredWorkspaceActiveLocalAggregateInterruptEvidence(
+          activePollingWait, activeWaitExitEvidence, activeMmAggregateWaitExit)
+      check("NPU model parsed configured workspace fixture active local aggregate interrupt evidence",
+        activeLocalAggregateInterrupt.valid)
+      check("NPU model parsed configured workspace fixture active local aggregate interrupt local poll",
+        activeLocalAggregateInterrupt.localPollBitClear)
+      check("NPU model parsed configured workspace fixture active local aggregate interrupt local wait",
+        activeLocalAggregateInterrupt.localWaitExitBitClear)
+      check("NPU model parsed configured workspace fixture active local aggregate interrupt aggregate raw",
+        activeLocalAggregateInterrupt.aggregateNoRawPending)
+      check("NPU model parsed configured workspace fixture active local aggregate interrupt aggregate unmasked",
+        activeLocalAggregateInterrupt.aggregateNoUnmaskedPending)
+      check("NPU model parsed configured workspace fixture active local aggregate interrupt aggregate masked",
+        activeLocalAggregateInterrupt.aggregateNoMaskedPending)
+      check("NPU model parsed configured workspace fixture active local aggregate interrupt route",
+        activeLocalAggregateInterrupt.aggregateRouteUnresolved)
+      check("NPU model parsed configured workspace fixture active local aggregate interrupt agreement",
+        activeLocalAggregateInterrupt.localAndAggregateAgree)
+      check("NPU model parsed configured workspace fixture active local aggregate interrupt missing",
+        activeLocalAggregateInterrupt.completionSignalMissing)
+      let activeCommandIdle =
+        blaiParsedForwardConfiguredWorkspaceActiveCommandIdleEvidence(
+          activeBlaiCommandStatus, activeWaitExitEvidence,
+          activeLocalAggregateInterrupt)
+      check("NPU model parsed configured workspace fixture active command idle evidence",
+        activeCommandIdle.valid)
+      check("NPU model parsed configured workspace fixture active command idle counters",
+        activeCommandIdle.countersClear)
+      check("NPU model parsed configured workspace fixture active command idle modes",
+        activeCommandIdle.modesClear)
+      check("NPU model parsed configured workspace fixture active command idle activity",
+        activeCommandIdle.noCommandActivity)
+      check("NPU model parsed configured workspace fixture active command idle wait",
+        activeCommandIdle.waitExitIdle)
+      check("NPU model parsed configured workspace fixture active command idle interrupt",
+        activeCommandIdle.noCompletionInterrupt)
+      check("NPU model parsed configured workspace fixture active command idle missing",
+        activeCommandIdle.completionSignalMissing)
+      check("NPU model parsed configured workspace fixture active command idle coherent",
+        activeCommandIdle.commandIdleMatchesWaitExit)
+      let activeLaunchGap =
+        blaiParsedForwardConfiguredWorkspaceActiveLaunchGapEvidence(
+          launchRetention, activeEngineProgressEvidence, activeWaitExitEvidence,
+          activeLocalAggregateInterrupt)
+      check("NPU model parsed configured workspace fixture active launch gap evidence",
+        activeLaunchGap.valid)
+      check("NPU model parsed configured workspace fixture active launch gap retention",
+        activeLaunchGap.launchRetentionValid)
+      check("NPU model parsed configured workspace fixture active launch gap addresses",
+        activeLaunchGap.launchAddressesRetained)
+      check("NPU model parsed configured workspace fixture active launch gap net",
+        activeLaunchGap.launchNetRetained)
+      check("NPU model parsed configured workspace fixture active launch gap commands",
+        activeLaunchGap.launchCommandsClean)
+      check("NPU model parsed configured workspace fixture active launch gap engine",
+        activeLaunchGap.engineStarted)
+      check("NPU model parsed configured workspace fixture active launch gap incomplete",
+        activeLaunchGap.executionIncomplete)
+      check("NPU model parsed configured workspace fixture active launch gap wait",
+        activeLaunchGap.waitExitKnown)
+      check("NPU model parsed configured workspace fixture active launch gap missing",
+        activeLaunchGap.completionSignalMissing)
+      check("NPU model parsed configured workspace fixture active launch gap coherent",
+        activeLaunchGap.launchStateReachesCompletionGap)
+      let activeStartEdge =
+        blaiParsedForwardConfiguredWorkspaceActiveStartEdgeEvidence(
+          snapshot, launchRetention, activeWaitExitEvidence)
+      check("NPU model parsed configured workspace fixture active start edge evidence",
+        activeStartEdge.valid)
+      check("NPU model parsed configured workspace fixture active start edge retained",
+        activeStartEdge.registersRetained)
+      check("NPU model parsed configured workspace fixture active start edge command",
+        activeStartEdge.startCommandSelfCleared and
+          activeStartEdge.commandBitsCleanAfterStart)
+      check("NPU model parsed configured workspace fixture active start edge idle",
+        activeStartEdge.launchIdle and activeStartEdge.startedIdle and
+          activeStartEdge.waitExitIdle)
+      check("NPU model parsed configured workspace fixture active start edge no immediate edge",
+        activeStartEdge.noImmediateBusyOrInterruptEdge)
+      check("NPU model parsed configured workspace fixture active start edge no interrupt",
+        activeStartEdge.noPostStartInterrupt and
+          activeStartEdge.noWaitExitInterrupt)
+      let activeStartCommandSurface =
+        blaiParsedForwardConfiguredWorkspaceActiveStartCommandSurfaceEvidence(
+          snapshot, launchRetention, activeStartEdge)
+      check("NPU model parsed configured workspace fixture active start command surface evidence",
+        activeStartCommandSurface.valid)
+      check("NPU model parsed configured workspace fixture active start command surface general",
+        activeStartCommandSurface.generalStableToStart and
+          activeStartCommandSurface.generalStableToWaitExit)
+      check("NPU model parsed configured workspace fixture active start command surface int cfg",
+        activeStartCommandSurface.intCfgCleanBeforeStart and
+          activeStartCommandSurface.intCfgCleanAfterStart and
+          activeStartCommandSurface.startSelfCleared)
+      check("NPU model parsed configured workspace fixture active start command surface no busy",
+        activeStartCommandSurface.noBusyAfterStart)
+      check("NPU model parsed configured workspace fixture active start command surface no interrupt",
+        activeStartCommandSurface.noInterruptAfterStart)
+      check("NPU model parsed configured workspace fixture active start command surface SDK",
+        activeStartCommandSurface.startOnlyTouchesIntCfg)
       let activePollingSignal =
         blaiParsedForwardConfiguredWorkspaceActivePollingSignalEvidence(
           activeCompletionSignal, activeCompletionWaitBudget, activePollingWait)
@@ -6613,6 +8184,36 @@ proc checkParsedConfiguredWorkspaceActiveMaterializedProbe() =
         activeRouteAggregate.routeTargetDeferred)
       check("NPU model parsed configured workspace fixture active route aggregate coherent",
         activeRouteAggregate.routeMatchesLiveAggregate)
+      let activeLiveGlbRoute = npuInterruptGlbRouteMap(
+        activeInitPlanForInterrupt.interrupt)
+      let activeLiveMmRoute = npuMmAggregateInterruptRouteEvidence(
+        activeLiveGlbRoute, snapshot.lastExecutionWaitExitMmAggregate)
+      let activeLiveRoute =
+        blaiParsedForwardConfiguredWorkspaceActiveLiveRouteEvidence(
+          activeCompletionRouteTarget, activeMmAggregateWaitExit,
+          activeLiveMmRoute)
+      check("NPU model parsed configured workspace fixture active live route evidence",
+        activeLiveRoute.valid)
+      check("NPU model parsed configured workspace fixture active live route target",
+        activeLiveRoute.routeTargetValid)
+      check("NPU model parsed configured workspace fixture active live route aggregate",
+        activeLiveRoute.aggregateWaitExitValid)
+      check("NPU model parsed configured workspace fixture active live route snapshot",
+        activeLiveRoute.liveSnapshotValid)
+      check("NPU model parsed configured workspace fixture active live route raw pending",
+        activeLiveRoute.noRawPending)
+      check("NPU model parsed configured workspace fixture active live route unmasked",
+        activeLiveRoute.noUnmaskedPending)
+      check("NPU model parsed configured workspace fixture active live route masked",
+        activeLiveRoute.noMaskedOnlyPending)
+      check("NPU model parsed configured workspace fixture active live route subroute",
+        activeLiveRoute.subrouteUnknown)
+      check("NPU model parsed configured workspace fixture active live route polling",
+        activeLiveRoute.pollingPreserved)
+      check("NPU model parsed configured workspace fixture active live route no BLAI",
+        activeLiveRoute.noBlaiInterrupt)
+      check("NPU model parsed configured workspace fixture active live route coherent",
+        activeLiveRoute.routeMatchesLiveSnapshot)
       let activeOutputEquivalenceFrontier =
         blaiParsedForwardConfiguredWorkspaceOutputEquivalenceFrontierEvidence(
           activeCompletionRouteTarget, activeRouteAggregate, activeCompletionGap,
@@ -6750,6 +8351,93 @@ proc checkParsedConfiguredWorkspaceActiveMaterializedProbe() =
         activeCompletionRouteResolution.outputGateDeferred)
       check("NPU model parsed configured workspace fixture active completion route resolution coherent",
         activeCompletionRouteResolution.resolutionMatchesFrontier)
+      let activeCompletionRouteControlReadiness =
+        blaiParsedForwardConfiguredWorkspaceCompletionRouteControlReadinessEvidence(
+          activeCompletionRouteTarget, activeCompletionRouteResolution)
+      check("NPU model parsed configured workspace fixture active completion route control readiness evidence",
+        activeCompletionRouteControlReadiness.valid)
+      check("NPU model parsed configured workspace fixture active completion route control readiness SDK route",
+        activeCompletionRouteControlReadiness.sdkRoutePreserved)
+      check("NPU model parsed configured workspace fixture active completion route control readiness local binding",
+        activeCompletionRouteControlReadiness.localBindingDeferred)
+      check("NPU model parsed configured workspace fixture active completion route control readiness first operation",
+        activeCompletionRouteControlReadiness.firstDeferredOperation ==
+          npuInterruptBindingRegisterHandler)
+      check("NPU model parsed configured workspace fixture active completion route control readiness handler",
+        activeCompletionRouteControlReadiness.registerHandlerDeferred)
+      check("NPU model parsed configured workspace fixture active completion route control readiness pending clear",
+        activeCompletionRouteControlReadiness.clearPendingDeferred)
+      check("NPU model parsed configured workspace fixture active completion route control readiness priority",
+        activeCompletionRouteControlReadiness.setPriorityDeferred)
+      check("NPU model parsed configured workspace fixture active completion route control readiness enable",
+        activeCompletionRouteControlReadiness.enableIrqDeferred)
+      check("NPU model parsed configured workspace fixture active completion route control readiness operations",
+        activeCompletionRouteControlReadiness.routeOperationsDeferred)
+      check("NPU model parsed configured workspace fixture active completion route control readiness polling",
+        activeCompletionRouteControlReadiness.m0PollingPreserved)
+      check("NPU model parsed configured workspace fixture active completion route control readiness aggregate",
+        activeCompletionRouteControlReadiness.mmAggregateRouteValid and
+          activeCompletionRouteControlReadiness.mmAggregateSubrouteUnknown)
+      check("NPU model parsed configured workspace fixture active completion route control readiness readback gate",
+        activeCompletionRouteControlReadiness.mustBindRouteBeforeReadback)
+      let activeCnnIrqSnapshot = m0ClicIrqSnapshot(NpuCnnIrq)
+      let activeCnnIrqController =
+        npuCnnIrqControllerSnapshotEvidence(activeCnnIrqSnapshot)
+      logCnnIrqControllerSnapshot(
+        "NPU model active CNN IRQ controller snapshot",
+        activeCnnIrqSnapshot, activeCnnIrqController)
+      check("NPU model parsed configured workspace fixture active CNN IRQ controller evidence",
+        activeCnnIrqController.valid)
+      check("NPU model parsed configured workspace fixture active CNN IRQ controller line",
+        activeCnnIrqController.irqMatchesSdk)
+      check("NPU model parsed configured workspace fixture active CNN IRQ controller source",
+        activeCnnIrqController.sourceMatchesSdkOffset)
+      check("NPU model parsed configured workspace fixture active CNN IRQ controller alias",
+        activeCnnIrqController.sourceAliasesM0I2c1)
+      check("NPU model parsed configured workspace fixture active CNN IRQ controller pending",
+        activeCnnIrqController.pendingClear)
+      check("NPU model parsed configured workspace fixture active CNN IRQ controller disabled",
+        activeCnnIrqController.clicDisabled)
+      check("NPU model parsed configured workspace fixture active CNN IRQ controller masked",
+        activeCnnIrqController.glbMasked)
+      check("NPU model parsed configured workspace fixture active CNN IRQ controller vector",
+        activeCnnIrqController.attrVectorMode)
+      check("NPU model parsed configured workspace fixture active CNN IRQ controller deferred",
+        activeCnnIrqController.deferredBindingConsistent)
+      let activeCompletionRouteBindingSafety =
+        blaiParsedForwardConfiguredWorkspaceCompletionRouteBindingSafetyEvidence(
+          activeCompletionRouteTarget, activeCompletionRouteControlReadiness,
+          activeCnnIrqController)
+      check("NPU model parsed configured workspace fixture active completion route binding safety evidence",
+        activeCompletionRouteBindingSafety.valid)
+      check("NPU model parsed configured workspace fixture active completion route binding safety SDK route",
+        activeCompletionRouteBindingSafety.sdkRoutePreserved)
+      check("NPU model parsed configured workspace fixture active completion route binding safety M0 alias",
+        activeCompletionRouteBindingSafety.m0AliasObserved)
+      check("NPU model parsed configured workspace fixture active completion route binding safety controller",
+        activeCompletionRouteBindingSafety.controllerBindingDeferred)
+      check("NPU model parsed configured workspace fixture active completion route binding safety suppressed",
+        activeCompletionRouteBindingSafety.activeOperationsSuppressed and
+          activeCompletionRouteBindingSafety.mustNotEnableM0Alias)
+      check("NPU model parsed configured workspace fixture active completion route binding safety polling",
+        activeCompletionRouteBindingSafety.m0PollingPreserved)
+      check("NPU model parsed configured workspace fixture active completion route binding safety readback",
+        activeCompletionRouteBindingSafety.readbackGated)
+      check("NPU model parsed configured workspace fixture active completion route binding safety next",
+        activeCompletionRouteBindingSafety.nextRequiresVerifiedRoute)
+      let activeCompletionRouteProbePlan =
+        blaiParsedForwardConfiguredWorkspaceCompletionRouteProbePlan(
+          activeCompletionRouteTarget, activeLiveRoute,
+          activeCompletionRouteBindingSafety)
+      check("NPU model parsed configured workspace fixture active completion route probe plan",
+        activeCompletionRouteProbePlan.valid)
+      check("NPU model parsed configured workspace fixture active completion route probe plan subroute",
+        activeCompletionRouteProbePlan.mmAggregateSubrouteUnknown)
+      check("NPU model parsed configured workspace fixture active completion route probe plan action",
+        activeCompletionRouteProbePlan.nextAction ==
+          blaiParsedConfiguredCompletionRouteProbeVerifyMmSubroute)
+      check("NPU model parsed configured workspace fixture active completion route probe plan readback",
+        activeCompletionRouteProbePlan.routeProbeBeforeReadback)
       let activeOutputEquivalenceReadiness =
         blaiParsedForwardConfiguredWorkspaceOutputEquivalenceReadinessEvidence(
           activeCompletionRouteResolution, activeCompletionToOutputHandoff,
@@ -6778,6 +8466,69 @@ proc checkParsedConfiguredWorkspaceActiveMaterializedProbe() =
         activeOutputEquivalenceReadiness.nextStageOutputEquivalence)
       check("NPU model parsed configured workspace fixture active output equivalence readiness coherent",
         activeOutputEquivalenceReadiness.readinessMatchesEvidence)
+      let activeMnistOutputValidation =
+        blaiMnistTfliteActiveOutputValidationEvidence(
+          blaiMnistTfliteSupportPlan(), activeOutputEquivalenceReadiness)
+      check("NPU model MNIST TFLite active output validation evidence",
+        activeMnistOutputValidation.valid)
+      check("NPU model MNIST TFLite active output validation reference",
+        activeMnistOutputValidation.parsedReferenceRunnable)
+      check("NPU model MNIST TFLite active output validation pending",
+        activeMnistOutputValidation.npuOutputPending)
+      check("NPU model MNIST TFLite active output validation completion",
+        activeMnistOutputValidation.completionStillMissing)
+      check("NPU model MNIST TFLite active output validation readback",
+        activeMnistOutputValidation.readbackReadyAfterCompletion)
+      check("NPU model MNIST TFLite active output validation compare",
+        activeMnistOutputValidation.compareReadyAfterCompletion)
+      check("NPU model MNIST TFLite active output validation readiness block",
+        activeMnistOutputValidation.activeReadinessFirstBlock ==
+          blaiParsedConfiguredOutputEquivalenceReadinessCompletion)
+      check("NPU model MNIST TFLite active output validation block",
+        activeMnistOutputValidation.firstBlock ==
+          blaiMnistTfliteActiveOutputValidationNoBlock)
+      let activeMnistLiveCompletionRoute =
+        blaiMnistTfliteLiveCompletionRouteEvidence(
+          blaiMnistTfliteSupportPlan(), activeMnistOutputValidation,
+          activeMmAggregateWaitExit, activeRouteAggregate)
+      check("NPU model MNIST TFLite live completion route evidence",
+        activeMnistLiveCompletionRoute.valid)
+      check("NPU model MNIST TFLite live completion route buffers",
+        activeMnistLiveCompletionRoute.persistentBuffersIdentified)
+      check("NPU model MNIST TFLite live completion route aggregate",
+        activeMnistLiveCompletionRoute.aggregateWaitExitValid)
+      check("NPU model MNIST TFLite live completion route no raw pending",
+        activeMnistLiveCompletionRoute.noRawPending)
+      check("NPU model MNIST TFLite live completion route no unmasked pending",
+        activeMnistLiveCompletionRoute.noUnmaskedPending)
+      check("NPU model MNIST TFLite live completion route no masked pending",
+        activeMnistLiveCompletionRoute.noMaskedOnlyPending)
+      check("NPU model MNIST TFLite live completion route deferred",
+        activeMnistLiveCompletionRoute.routeDeferred)
+      check("NPU model MNIST TFLite live completion route output next",
+        activeMnistLiveCompletionRoute.nextStageOutputEquivalence)
+      check("NPU model MNIST TFLite live completion route coherent",
+        activeMnistLiveCompletionRoute.liveRouteMatchesModelFrontier)
+      let activeMnistNextStep =
+        blaiMnistTfliteLiveValidationNextStepEvidence(
+          activeMnistOutputValidation, activeMnistLiveCompletionRoute)
+      check("NPU model MNIST TFLite live validation next step evidence",
+        activeMnistNextStep.valid)
+      check("NPU model MNIST TFLite live validation next step completion first",
+        activeMnistNextStep.mustResolveCompletionRoute)
+      check("NPU model MNIST TFLite live validation next step no readback",
+        activeMnistNextStep.noPrematureReadback)
+      check("NPU model MNIST TFLite live validation next step readback ready",
+        activeMnistNextStep.readbackCompareReadyAfterRoute)
+      check("NPU model MNIST TFLite live validation next active block",
+        activeMnistNextStep.activeFirstBlock ==
+          blaiMnistTfliteActiveOutputValidationNoBlock)
+      check("NPU model MNIST TFLite live validation next route block",
+        activeMnistNextStep.liveRouteFirstBlock ==
+          blaiMnistTfliteLiveCompletionRouteNoBlock)
+      check("NPU model MNIST TFLite live validation next action",
+        activeMnistNextStep.nextAction ==
+          blaiMnistLiveValidationResolveCompletionRoute)
       check("NPU model parsed configured workspace fixture active execution timeout",
         executionGateEvidence.timeoutWaitEvidence)
       check("NPU model parsed configured workspace fixture active wait no interrupt",
@@ -6794,6 +8545,17 @@ proc checkParsedConfiguredWorkspaceActiveMaterializedProbe() =
         executionGateEvidence.waitInterruptStatusClean)
       check("NPU model parsed configured workspace fixture active wait int cfg clean",
         executionGateEvidence.waitInterruptConfigClean)
+      let activeWaitIntCfg =
+        npuIntCfgKnownFieldEvidence(
+          NpuRegisterSnapshot(
+            intCfg: snapshot.lastExecutionWaitExitInterrupt.intCfg),
+          snapshot.lastExecutionStarted)
+      check("NPU model parsed configured workspace fixture active wait int cfg known fields",
+        activeWaitIntCfg.valid)
+      check("NPU model parsed configured workspace fixture active wait int cfg reserved",
+        activeWaitIntCfg.reservedBitsClear)
+      check("NPU model parsed configured workspace fixture active wait int cfg relu default",
+        activeWaitIntCfg.reluNMatches)
       if executionGateEvidence.waitBusy:
         check("NPU model parsed configured workspace fixture active wait busy",
           true)
@@ -7003,6 +8765,19 @@ proc checkConfiguredExecutionGuards() =
     limiterPlan.read == (BlaiLimiterModeMask or 0x2345'u32))
   check("NPU model bus limiter compose write",
     limiterPlan.write == 0x4567'u32)
+  let demoLimiterPlan = npuBusLimiterPlan(
+    BlaiDemoLimiterCommandCount, BlaiDemoLimiterCommandCount)
+  let demoLimiterStatus = npuBlaiCommandStatusFromRaw(
+    0'u32, demoLimiterPlan.read, demoLimiterPlan.write)
+  let demoLimiterEvidence =
+    npuBusLimiterReadbackEvidence(demoLimiterPlan, demoLimiterStatus)
+  check("NPU model bus limiter demo readback evidence",
+    demoLimiterEvidence.valid)
+  check("NPU model bus limiter demo readback count",
+    demoLimiterStatus.readCommandCount == BlaiDemoLimiterCommandCount and
+      demoLimiterStatus.writeCommandCount == BlaiDemoLimiterCommandCount)
+  check("NPU model bus limiter demo readback mode",
+    demoLimiterStatus.readCommandMode and demoLimiterStatus.writeCommandMode)
   let resetWord = npuSwResetCodecSubWithCnnReset(0'u32, asserted = true)
   check("NPU model reset compose asserted",
     npuResetStatusFromSwResetCodecSub(resetWord).resetAsserted)
@@ -7045,6 +8820,8 @@ proc checkConfiguredExecutionGuards() =
     npuSramStatusFromVramCtrl(BlaiSramRelMask or SysramSetMask)
   check("NPU model SRAM status released",
     releasedSram.blaiSramReleased)
+  check("NPU model SRAM status selected",
+    npuSramStatusFromVramCtrl(BlaiSramRelMask or BlaiSramSelMask).blaiSramSelected)
   check("NPU model SRAM status set latched",
     releasedSram.sysramSetLatched)
   let resetAsserted = npuResetStatusFromSwResetCodecSub(CnnResetMask)
@@ -7124,10 +8901,57 @@ proc checkConfiguredExecutionGuards() =
   check("NPU model interrupt ack plan preserves",
     interruptAckPlan.preservesInterruptStatus and
       interruptAckPlan.preservesReluN)
+  var preStartClearInto: NpuCompletionPreStartClearPlan
+  npuCompletionPreStartClearPlanInto(
+    npuInterruptStatusFromIntCfg(
+      BlaiInterruptStatusMask or (7'u32 shl BlaiReluNShift)),
+    preStartClearInto)
+  let preStartClear =
+    npuCompletionPreStartClearPlan(
+      npuInterruptStatusFromIntCfg(
+        BlaiInterruptStatusMask or (7'u32 shl BlaiReluNShift)))
+  check("NPU model pre-start clear plan into matches",
+    preStartClearInto == preStartClear)
+  check("NPU model pre-start clear plan stale",
+    preStartClear.valid and preStartClear.stalePending and
+      preStartClear.clearRequired)
+  check("NPU model pre-start clear plan ack",
+    preStartClear.clearPlan == interruptAckPlan)
+  let cleanPreStartClear =
+    npuCompletionPreStartClearPlan(npuInterruptStatusFromIntCfg(0'u32))
+  check("NPU model pre-start clear plan clean",
+    cleanPreStartClear.valid and not cleanPreStartClear.stalePending and
+      not cleanPreStartClear.clearRequired)
   check("NPU model int cfg command masks",
     npuIntCfgCommandMask(npuIntCommandStart) == BlaiStartMask and
       npuIntCfgCommandMask(npuIntCommandResume) == BlaiResumeMask and
       npuIntCfgCommandMask(npuIntCommandStop) == BlaiStopMask)
+  var sdkCommandEvidenceInto: NpuIntCfgSdkCommandEvidence
+  let sdkCommandSeed =
+    BlaiInterruptStatusMask or (7'u32 shl BlaiReluNShift)
+  npuIntCfgSdkCommandEvidenceInto(sdkCommandSeed, sdkCommandEvidenceInto)
+  let sdkCommandEvidence = npuIntCfgSdkCommandEvidence(sdkCommandSeed)
+  check("NPU model int cfg SDK command evidence into matches",
+    sdkCommandEvidenceInto == sdkCommandEvidence)
+  check("NPU model int cfg SDK command evidence",
+    sdkCommandEvidence.valid)
+  check("NPU model int cfg SDK command start",
+    sdkCommandEvidence.startMatchesSdk)
+  check("NPU model int cfg SDK command resume",
+    sdkCommandEvidence.resumeMatchesSdk)
+  check("NPU model int cfg SDK command stop",
+    sdkCommandEvidence.stopMatchesSdk)
+  check("NPU model int cfg SDK command clear",
+    sdkCommandEvidence.clearMatchesSdk)
+  check("NPU model int cfg SDK command get int",
+    sdkCommandEvidence.getIntMatchesSdk and
+      sdkCommandEvidence.getInt.interruptPending)
+  check("NPU model int cfg SDK command masks distinct",
+    sdkCommandEvidence.commandMasksDistinct)
+  check("NPU model int cfg SDK command preserves relu",
+    sdkCommandEvidence.commandsPreserveReluN)
+  check("NPU model int cfg SDK command preserves status",
+    sdkCommandEvidence.commandsPreserveInterruptStatus)
   var startTransitionInto: NpuStartTransitionPlan
   npuPlanStartTransitionInto(
     BlaiInterruptStatusMask, alreadyStarted = false, startTransitionInto)
@@ -7165,6 +8989,24 @@ proc checkConfiguredExecutionGuards() =
   check("NPU model stop transition plan clears state",
     stopTransition.valid and stopTransition.initialStarted and
       not stopTransition.resultingStarted)
+  var stopWrapperInto: BlaiNpuStopWrapperEvidence
+  blaiNpuStopWrapperEvidenceInto(
+    BlaiInterruptStatusMask, alreadyStarted = true, stopWrapperInto)
+  let stopWrapper =
+    blaiNpuStopWrapperEvidence(BlaiInterruptStatusMask, alreadyStarted = true)
+  check("NPU model stop wrapper into matches",
+    stopWrapperInto == stopWrapper)
+  check("NPU model stop wrapper valid", stopWrapper.valid)
+  check("NPU model stop wrapper command",
+    stopWrapper.stopCommandIssued and
+      stopWrapper.transition.commandPlan.command == npuIntCommandStop)
+  check("NPU model stop wrapper clears state", stopWrapper.clearsStarted)
+  check("NPU model stop wrapper no error", stopWrapper.returnsNoError)
+  let coldStopWrapper =
+    blaiNpuStopWrapperEvidence(BlaiInterruptStatusMask, alreadyStarted = false)
+  check("NPU model stop wrapper cold stop",
+    coldStopWrapper.valid and coldStopWrapper.stopCommandIssued and
+      coldStopWrapper.clearsStarted)
   let tfCfgDecode = npuTfCfgDecodeFromRaw(BlaiTensorflowEnableMask)
   check("NPU model tf cfg decode enabled",
     tfCfgDecode.tensorflowMode)
@@ -7855,6 +9697,66 @@ proc checkCacheAndCompletionPlans() =
     ord(blaiNpuRuntimeWaitBareMetalPolling).uint32)
   check("NPU model runtime lock release",
     runtimeOwnership.forwardRunReleasesExecutionLock)
+  let coldInitLifecycle =
+    blaiNpuRuntimeLifecycleEvidence(false, blaiNpuRuntimeLifecycleInit)
+  check("NPU model runtime lifecycle cold init", coldInitLifecycle.valid)
+  check("NPU model runtime lifecycle cold init sem",
+    coldInitLifecycle.createsInterruptSemaphore)
+  check("NPU model runtime lifecycle cold init mutex",
+    coldInitLifecycle.createsExecutionMutex)
+  check("NPU model runtime lifecycle cold init clock",
+    coldInitLifecycle.disablesClockOnInit)
+  check("NPU model runtime lifecycle cold init final",
+    coldInitLifecycle.finalInitialized)
+  let repeatedInitLifecycle =
+    blaiNpuRuntimeLifecycleEvidence(true, blaiNpuRuntimeLifecycleInit)
+  check("NPU model runtime lifecycle repeated init",
+    repeatedInitLifecycle.valid)
+  check("NPU model runtime lifecycle repeated init noop",
+    repeatedInitLifecycle.initNoopWhenAlreadyInitialized)
+  let initializedDestroyLifecycle =
+    blaiNpuRuntimeLifecycleEvidence(true, blaiNpuRuntimeLifecycleDestroy)
+  check("NPU model runtime lifecycle initialized destroy",
+    initializedDestroyLifecycle.valid)
+  check("NPU model runtime lifecycle initialized destroy sem",
+    initializedDestroyLifecycle.deletesInterruptSemaphore)
+  check("NPU model runtime lifecycle initialized destroy mutex",
+    initializedDestroyLifecycle.deletesExecutionMutex)
+  check("NPU model runtime lifecycle initialized destroy clear",
+    initializedDestroyLifecycle.clearsInitialized and
+      not initializedDestroyLifecycle.finalInitialized)
+  let coldDestroyLifecycle =
+    blaiNpuRuntimeLifecycleEvidence(false, blaiNpuRuntimeLifecycleDestroy)
+  check("NPU model runtime lifecycle cold destroy", coldDestroyLifecycle.valid)
+  check("NPU model runtime lifecycle cold destroy noop",
+    coldDestroyLifecycle.destroyNoopWhenNotInitialized)
+  var npuReleaseLayers = [
+    BlaiCpuInstLayer64(npuOn: 1),
+    BlaiCpuInstLayer64(npuOn: 1),
+    BlaiCpuInstLayer64(npuOn: 1)]
+  let npuReleaseCnAllocated = [true, false, true]
+  var npuReleaseInto: BlaiNpuReleasePlan
+  blaiNpuReleasePlanInto(
+    npuReleaseLayers, npuReleaseCnAllocated, 3'u32, true, npuReleaseInto)
+  let npuRelease =
+    blaiNpuReleasePlan(npuReleaseLayers, npuReleaseCnAllocated, 3'u32, true)
+  check("NPU model release plan into matches", npuReleaseInto == npuRelease)
+  check("NPU model release plan valid", npuRelease.valid)
+  checkEq("NPU model release plan layers",
+    npuRelease.scannedLayerCount, 3)
+  checkEq("NPU model release plan cn frees", npuRelease.cnFreeCount, 2)
+  check("NPU model release plan table free", npuRelease.layerTableFree)
+  check("NPU model release plan no error", npuRelease.returnsNoError)
+  let npuReleaseLayerOverflow =
+    blaiNpuReleasePlan(npuReleaseLayers, npuReleaseCnAllocated, 4'u32, true)
+  check("NPU model release plan layer overflow",
+    not npuReleaseLayerOverflow.valid and
+      npuReleaseLayerOverflow.firstBlock == blaiNpuReleaseLayerStorage)
+  let npuReleaseCnOverflow =
+    blaiNpuReleasePlan(npuReleaseLayers, [true, false], 3'u32, true)
+  check("NPU model release plan cn overflow",
+    not npuReleaseCnOverflow.valid and
+      npuReleaseCnOverflow.firstBlock == blaiNpuReleaseCnStorage)
 
   let initPlanForInterrupt = npuPlanInitConfig(
     NpuLayerBuffers(), inputBufferAddr = 0x2204_1000'u32, patchSize = 1'u32,
@@ -7903,6 +9805,8 @@ proc checkCacheAndCompletionPlans() =
   let mmAggregateRouteEvidence =
     npuMmAggregateInterruptRouteEvidence(interruptGlbRouteMap,
       mmAggregatePending)
+  let mmAggregateSdkHelper =
+    npuMmAggregateSdkHelperEvidence(NpuCnnIrqOffset, mmAggregateNone.mask1)
   let interruptCorePolicy =
     npuInterruptCoreBindingPolicy(initPlanForInterrupt.interrupt, runtimeOwnership)
   check("NPU model interrupt binding requested",
@@ -8012,6 +9916,16 @@ proc checkCacheAndCompletionPlans() =
   check("NPU model interrupt MM aggregate polling preserved",
     mmAggregateRouteEvidence.pollingPreserved and
       mmAggregateRouteEvidence.directBindingUnsafe)
+  check("NPU model interrupt MM aggregate SDK helper evidence",
+    mmAggregateSdkHelper.valid)
+  check("NPU model interrupt MM aggregate SDK helper bank",
+    mmAggregateSdkHelper.usesStatus1 and mmAggregateSdkHelper.usesMask1 and
+      mmAggregateSdkHelper.usesClear1)
+  check("NPU model interrupt MM aggregate SDK helper clear",
+    mmAggregateSdkHelper.clearIsWriteOne and
+      mmAggregateSdkHelper.clearWrite == 0x80'u32)
+  check("NPU model interrupt MM aggregate SDK helper unmask",
+    mmAggregateSdkHelper.unmaskClearsMaskBit)
   check("NPU model interrupt core policy",
     interruptCorePolicy.valid and interruptBinding.corePolicy.valid)
   checkEq("NPU model interrupt core policy decision",
@@ -8061,10 +9975,55 @@ proc checkCacheAndCompletionPlans() =
     interruptApiContract.m0PollingPreserved)
   check("NPU model interrupt API contract D0",
     interruptApiContract.d0RoutePreserved)
+  let sdkInterruptApiEvidence =
+    npuSdkInterruptApiEvidence(initPlanForInterrupt.interrupt, true)
+  check("NPU model SDK interrupt init evidence",
+    sdkInterruptApiEvidence.valid)
+  check("NPU model SDK interrupt init sequence",
+    sdkInterruptApiEvidence.initOperationCount == 3'u8)
+  check("NPU model SDK interrupt priority semantics",
+    sdkInterruptApiEvidence.preemptPriorityApplied and
+      sdkInterruptApiEvidence.subPriorityIgnoredBySdk)
+  check("NPU model SDK interrupt pending clear separate",
+    sdkInterruptApiEvidence.clearPendingApiSeparate and
+      not sdkInterruptApiEvidence.initClearsPending)
   check("NPU model interrupt binding polling",
     interruptBinding.activeWaitIsPolling)
   check("NPU model interrupt binding not ready",
     not interruptBinding.bindingVerified and not interruptBinding.ready)
+  let interruptApplyPreflight =
+    npuInterruptBindingApplyPreflight(interruptOperationPlan)
+  check("NPU model interrupt apply preflight evidence",
+    interruptApplyPreflight.valid)
+  check("NPU model interrupt apply preflight deferred",
+    interruptApplyPreflight.deferredByPolicy)
+  check("NPU model interrupt apply preflight polling",
+    interruptApplyPreflight.m0PollingPreserved)
+  check("NPU model interrupt apply preflight no apply",
+    not interruptApplyPreflight.readyToApply)
+  let activeInterruptPolicy = NpuInterruptCoreBindingPolicy(
+    decision: npuInterruptCoreBindingActiveCoreReady,
+    requested: true,
+    priorityMatched: true,
+    activeCoreBindingVerified: true,
+    activeCoreReady: true,
+    decisionMatchesEvidence: true,
+    valid: true)
+  let activeInterruptOperationPlan =
+    npuInterruptBindingOperationPlan(
+      initPlanForInterrupt.interrupt, activeInterruptPolicy)
+  let activeInterruptApplyPreflight =
+    npuInterruptBindingApplyPreflight(activeInterruptOperationPlan)
+  check("NPU model interrupt apply preflight active evidence",
+    activeInterruptApplyPreflight.valid)
+  check("NPU model interrupt apply preflight active ready",
+    activeInterruptApplyPreflight.readyToApply)
+  check("NPU model interrupt apply preflight active sequence",
+    activeInterruptApplyPreflight.readiness.operationSequenceKnown and
+      activeInterruptApplyPreflight.readiness.operationsPlanned)
+  check("NPU model interrupt apply preflight active no block",
+    activeInterruptApplyPreflight.firstBlock ==
+      npuInterruptBindingOperationNoBlock)
 
   let waitPlan = npuPlanCompletionWait(
     timeout = 17, configured = true,
@@ -8433,6 +10392,23 @@ proc checkSdkHelperConvShapePlan() =
     outH: 2,
     outC: 5,
     midOut: 1))
+  let convSinglePatchApplyPlan =
+    blaiMemAllocSinglePatchApplyPlan(convSinglePatchPlan)
+  let convSinglePatchState =
+    blaiMemAllocSinglePatchState(convSinglePatchApplyPlan)
+  var convSinglePatchStateCtrl: BlaiPsramCtrl
+  blaiApplySinglePatchMemAllocState(
+    convSinglePatchStateCtrl, convSinglePatchState)
+  let linePatchPlan = blaiPlanLinePatchMemAlloc(BlaiCpuInstLayer64(
+    layerType: ord(blaiConvolutional).int32,
+    w: 9000,
+    c: 1,
+    outW: 9000,
+    outC: 1))
+  let linePatchApplyPlan = blaiMemAllocLinePatchApplyPlan(linePatchPlan)
+  let linePatchState = blaiMemAllocLinePatchState(linePatchApplyPlan)
+  var linePatchStateCtrl: BlaiPsramCtrl
+  blaiApplyLinePatchMemAllocState(linePatchStateCtrl, linePatchState)
   let softmaxSinglePatchPlan = blaiPlanSinglePatchMemAlloc(BlaiCpuInstLayer64(
     layerType: ord(blaiSoftmax).int32,
     w: 4,
@@ -8442,6 +10418,2102 @@ proc checkSdkHelperConvShapePlan() =
     outH: 1,
     outC: 5,
     midOut: 1))
+  var patchBitmap = [true, false, false, true, false, false, false, true]
+  var patchOwners = [-1'i32, -1, -1, -1, -1, -1, -1, -1]
+  var initialPatchBitmap = [false, false, false, false]
+  var initialPatchOwners = [-1'i32, -1, -1, -1]
+  let initialRequestPlan = blaiToolchainPatchInitialRequestPlan(
+    BlaiCpuInstLayer64(layerType: ord(blaiConvolutional).int32,
+      h: 256, w: 256, c: 2))
+  var initialRequestPlanInto: BlaiToolchainPatchInitialRequestPlan
+  blaiToolchainPatchInitialRequestPlanInto(
+    BlaiCpuInstLayer64(layerType: ord(blaiConvolutional).int32,
+      h: 256, w: 256, c: 2), initialRequestPlanInto)
+  let singleChannelInitialRequest = blaiToolchainPatchInitialRequestPlan(
+    BlaiCpuInstLayer64(layerType: ord(blaiConvolutional).int32,
+      h: 256, w: 256, c: 1))
+  let badShapeInitialRequest = blaiToolchainPatchInitialRequestPlan(
+    BlaiCpuInstLayer64(layerType: ord(blaiConvolutional).int32,
+      h: -1, w: 256, c: 2))
+  let overflowInitialRequest = blaiToolchainPatchInitialRequestPlan(
+    BlaiCpuInstLayer64(layerType: ord(blaiConvolutional).int32,
+      h: high(int32), w: high(int32), c: high(int32)))
+  var initialRequestMetadata = -1'i32
+  let initialStorePlan =
+    blaiToolchainPatchInitialStorePlan(initialRequestPlan)
+  var initialStorePlanInto: BlaiToolchainPatchInitialStorePlan
+  blaiToolchainPatchInitialStorePlanInto(
+    initialRequestPlan, initialStorePlanInto)
+  let initialStoreApplyPlan =
+    blaiToolchainPatchInitialStoreApplyPlan(initialStorePlan)
+  var initialStoreApplyPlanInto: BlaiToolchainPatchInitialStoreApplyPlan
+  blaiToolchainPatchInitialStoreApplyPlanInto(
+    initialStorePlan, initialStoreApplyPlanInto)
+  var initialStoreState =
+    blaiToolchainPatchInitialStoreState(0'u32, 0'u32, -1'i32, 0'u32)
+  let initialStoreStateApplied =
+    blaiApplyToolchainPatchInitialStoreState(
+      initialStoreState, initialStoreApplyPlan)
+  let initialStoreApplied =
+    blaiApplyToolchainPatchInitialStore(
+      initialRequestMetadata, initialStorePlan)
+  let zeroInitialStorePlan =
+    blaiToolchainPatchInitialStorePlan(singleChannelInitialRequest)
+  let blockedInitialStorePlan =
+    blaiToolchainPatchInitialStorePlan(badShapeInitialRequest)
+  let blockedInitialStoreApplyPlan =
+    blaiToolchainPatchInitialStoreApplyPlan(blockedInitialStorePlan)
+  var blockedInitialStoreState =
+    blaiToolchainPatchInitialStoreState(7'u32, 8'u32, 9'i32, 10'u32)
+  let blockedInitialStoreStateBefore = blockedInitialStoreState
+  let blockedInitialStoreStateApplied =
+    blaiApplyToolchainPatchInitialStoreState(
+      blockedInitialStoreState, blockedInitialStoreApplyPlan)
+  let initialPatchPlan = blaiToolchainPatchInitialPlan(
+    initialPatchBitmap, initialPatchOwners, 3'u32)
+  var initialPatchPlanInto: BlaiToolchainPatchInitialPlan
+  blaiToolchainPatchInitialPlanInto(
+    initialPatchBitmap, initialPatchOwners, 3'u32, initialPatchPlanInto)
+  let initialPatchApplyPlan =
+    blaiToolchainPatchInitialApplyPlan(
+      initialPatchPlan, initialPatchBitmap, initialPatchOwners)
+  var initialPatchApplyPlanInto: BlaiToolchainPatchInitialApplyPlan
+  blaiToolchainPatchInitialApplyPlanInto(
+    initialPatchPlan, initialPatchBitmap, initialPatchOwners,
+    initialPatchApplyPlanInto)
+  var initialPatchStateBitmap = [false, false, false, false]
+  var initialPatchStateOwners = [-1'i32, -1, -1, -1]
+  let initialPatchStateApplied =
+    blaiApplyToolchainPatchInitialReservationState(
+      initialPatchStateBitmap, initialPatchStateOwners,
+      initialPatchApplyPlan)
+  let initialPatchApplied = blaiApplyToolchainPatchInitialReservation(
+    initialPatchBitmap, initialPatchOwners, initialPatchPlan)
+  let zeroInitialPatchPlan = blaiToolchainPatchInitialPlan(
+    initialPatchBitmap, initialPatchOwners, 0'u32)
+  let shortInitialPatchPlan = blaiToolchainPatchInitialPlan(
+    [false, false], [-1'i32], 2'u32)
+  let blockedInitialPatchApplyPlan =
+    blaiToolchainPatchInitialApplyPlan(
+      shortInitialPatchPlan, initialPatchStateBitmap, initialPatchStateOwners)
+  let initialPatchStateBitmapBefore = initialPatchStateBitmap
+  let initialPatchStateOwnersBefore = initialPatchStateOwners
+  let blockedInitialPatchStateApplied =
+    blaiApplyToolchainPatchInitialReservationState(
+      initialPatchStateBitmap, initialPatchStateOwners,
+      blockedInitialPatchApplyPlan)
+  let inheritedPreviousOwnerPlan =
+    blaiToolchainPatchPreviousOwnerPlan(0'i32, true)
+  var inheritedPreviousOwnerPlanInto: BlaiToolchainPatchPreviousOwnerPlan
+  blaiToolchainPatchPreviousOwnerPlanInto(
+    0'i32, true, inheritedPreviousOwnerPlanInto)
+  let typePreviousOwnerPlan = blaiToolchainPatchPreviousOwnerPlan(
+    BlaiToolchainPatchPreviousOwnerType, false)
+  let noPreviousOwnerPlan = blaiToolchainPatchPreviousOwnerPlan(0'i32, false)
+  let generalPatchOwnerPlan = blaiToolchainPatchOwnerPlan(
+    blaiToolchainPatchOwnerGeneral, 3, -1, false, false)
+  var generalPatchOwnerPlanInto: BlaiToolchainPatchOwnerPlan
+  blaiToolchainPatchOwnerPlanInto(
+    blaiToolchainPatchOwnerGeneral, 3, -1, false, false,
+    generalPatchOwnerPlanInto)
+  let previousPatchOwnerPlan = blaiToolchainPatchOwnerPlan(
+    blaiToolchainPatchOwnerGeneral, 3, -1, false, true)
+  let consumerPatchOwnerPlan = blaiToolchainPatchOwnerPlan(
+    blaiToolchainPatchOwnerGeneral, 3, 9, true, false)
+  let dspDefaultPatchOwnerPlan = blaiToolchainPatchOwnerPlan(
+    blaiToolchainPatchOwnerDsp, 3, -1, false, false)
+  let dspPreviousPatchOwnerPlan = blaiToolchainPatchOwnerPlan(
+    blaiToolchainPatchOwnerDsp, 3, -1, false, true)
+  let dspConsumerPatchOwnerPlan = blaiToolchainPatchOwnerPlan(
+    blaiToolchainPatchOwnerDsp, 3, 7, true, false)
+  let tfliteDefaultPatchOwnerPlan = blaiToolchainPatchOwnerPlan(
+    blaiToolchainPatchOwnerTflite, 3, -1, false, false)
+  let tfliteConsumerPatchOwnerPlan = blaiToolchainPatchOwnerPlan(
+    blaiToolchainPatchOwnerTflite, 3, 8, true, false)
+  let generalPatchDispatchPlan = blaiToolchainPatchDispatchPlan(
+    blaiToolchainPatchOwnerGeneral, 3, 2'u32, 9, true, false, false)
+  var generalPatchDispatchPlanInto: BlaiToolchainPatchDispatchPlan
+  blaiToolchainPatchDispatchPlanInto(
+    blaiToolchainPatchOwnerGeneral, 3, 2'u32, 9, true, false, false,
+    generalPatchDispatchPlanInto)
+  let dspPatchDispatchPlan = blaiToolchainPatchDispatchPlan(
+    blaiToolchainPatchOwnerDsp, 3, 1'u32, -1, false, true, true)
+  let tflitePatchDispatchPlan = blaiToolchainPatchDispatchPlan(
+    blaiToolchainPatchOwnerTflite, 3, 1'u32, -1, false, false, true)
+  let invalidPatchDispatchPlan = blaiToolchainPatchDispatchPlan(
+    blaiToolchainPatchOwnerGeneral, -1, 1'u32, -1, false, false, false)
+  var patchSearchInto: BlaiToolchainPatchSearchPlan
+  blaiToolchainPatchSearchPlanInto(patchBitmap, 2'u32, patchSearchInto)
+  let patchSearch = blaiToolchainPatchSearchPlan(patchBitmap, 2'u32)
+  let generalPatchMetadataPlan = blaiToolchainPatchMetadataPlan(
+    blaiToolchainPatchMetadataGeneral, patchSearch, 3)
+  var generalPatchMetadataPlanInto: BlaiToolchainPatchMetadataPlan
+  blaiToolchainPatchMetadataPlanInto(
+    blaiToolchainPatchMetadataGeneral, patchSearch, 3,
+    generalPatchMetadataPlanInto)
+  let dspPatchMetadataPlan = blaiToolchainPatchMetadataPlan(
+    blaiToolchainPatchMetadataDsp, patchSearch, 3)
+  let tflitePatchMetadataPlan = blaiToolchainPatchMetadataPlan(
+    blaiToolchainPatchMetadataTflite, patchSearch, 3)
+  let generalPatchMetadataApplyPlan =
+    blaiToolchainPatchMetadataApplyPlan(generalPatchMetadataPlan)
+  var generalPatchMetadataApplyPlanInto:
+    BlaiToolchainPatchMetadataApplyPlan
+  blaiToolchainPatchMetadataApplyPlanInto(
+    generalPatchMetadataPlan, generalPatchMetadataApplyPlanInto)
+  var generalPatchMetadataState =
+    blaiToolchainPatchMetadataState(
+      blaiToolchainPatchMetadataDsp, -1, 0'u32, 0'u32, -1, -1, false)
+  let generalPatchMetadataStateApplied =
+    blaiApplyToolchainPatchMetadataState(
+      generalPatchMetadataState, generalPatchMetadataApplyPlan)
+  let invalidPatchMetadataApplyPlan =
+    blaiToolchainPatchMetadataApplyPlan(
+      blaiToolchainPatchMetadataPlan(
+        blaiToolchainPatchMetadataGeneral,
+        default(BlaiToolchainPatchSearchPlan), 3))
+  var blockedPatchMetadataState =
+    blaiToolchainPatchMetadataState(
+      blaiToolchainPatchMetadataDsp, 9, 10'u32, 11'u32, 12, 13, false)
+  let invalidPatchMetadataStateApplied =
+    blaiApplyToolchainPatchMetadataState(
+      blockedPatchMetadataState, invalidPatchMetadataApplyPlan)
+  var patchMetadataStartSlots = [-1'i32, -1, -1, -1]
+  var patchMetadataCounts = [-1'i32, -1, -1, -1]
+  let generalPatchMetadataApplied = blaiApplyToolchainPatchMetadata(
+    patchMetadataStartSlots, patchMetadataCounts, generalPatchMetadataPlan)
+  var dspPatchMetadataStartSlots = [-1'i32, -1, -1, -1]
+  var emptyPatchMetadataCounts: array[0, int32]
+  let dspPatchMetadataApplied = blaiApplyToolchainPatchMetadata(
+    dspPatchMetadataStartSlots, emptyPatchMetadataCounts, dspPatchMetadataPlan)
+  var tflitePatchMetadataStartSlots = [-1'i32, -1, -1, -1]
+  let tflitePatchMetadataApplied = blaiApplyToolchainPatchMetadata(
+    tflitePatchMetadataStartSlots, emptyPatchMetadataCounts,
+    tflitePatchMetadataPlan)
+  var shortPatchMetadataStartSlots = [-1'i32, -1, -1, -1]
+  var shortPatchMetadataCounts: array[0, int32]
+  let shortPatchMetadataApplied = blaiApplyToolchainPatchMetadata(
+    shortPatchMetadataStartSlots, shortPatchMetadataCounts,
+    generalPatchMetadataPlan)
+  let patchDebugSnapshotPlan = blaiToolchainPatchDebugMetadataSnapshotPlan(
+    3, true, 2, 1, 2, 5, 7, 11)
+  var patchDebugSnapshotPlanInto:
+    BlaiToolchainPatchDebugMetadataSnapshotPlan
+  blaiToolchainPatchDebugMetadataSnapshotPlanInto(
+    3, true, 2, 1, 2, 5, 7, 11, patchDebugSnapshotPlanInto)
+  let quietPatchDebugSnapshotPlan =
+    blaiToolchainPatchDebugMetadataSnapshotPlan(3, false, 2, 1, 2, 5, 7, 11)
+  let blockedPatchDebugSnapshotPlan =
+    blaiToolchainPatchDebugMetadataSnapshotPlan(-1, true, 2, 1, 2, 5, 7, 11)
+  let patchDebugSnapshotApplyPlan =
+    blaiToolchainPatchDebugMetadataSnapshotApplyPlan(patchDebugSnapshotPlan)
+  var patchDebugSnapshotApplyPlanInto:
+    BlaiToolchainPatchDebugMetadataSnapshotApplyPlan
+  blaiToolchainPatchDebugMetadataSnapshotApplyPlanInto(
+    patchDebugSnapshotPlan, patchDebugSnapshotApplyPlanInto)
+  var patchDebugSnapshotState =
+    blaiToolchainPatchDebugMetadataSnapshotState(-1, -1, -1, -1, -1, -1)
+  let patchDebugSnapshotApplied =
+    blaiApplyToolchainPatchDebugMetadataSnapshot(
+      patchDebugSnapshotState, patchDebugSnapshotApplyPlan)
+  let quietPatchDebugSnapshotApplyPlan =
+    blaiToolchainPatchDebugMetadataSnapshotApplyPlan(
+      quietPatchDebugSnapshotPlan)
+  var quietPatchDebugSnapshotState =
+    blaiToolchainPatchDebugMetadataSnapshotState(-7, -7, -7, -7, -7, -7)
+  let quietPatchDebugSnapshotApplied =
+    blaiApplyToolchainPatchDebugMetadataSnapshot(
+      quietPatchDebugSnapshotState, quietPatchDebugSnapshotApplyPlan)
+  let blockedPatchDebugSnapshotApplyPlan =
+    blaiToolchainPatchDebugMetadataSnapshotApplyPlan(
+      blockedPatchDebugSnapshotPlan)
+  var blockedPatchDebugSnapshotState =
+    blaiToolchainPatchDebugMetadataSnapshotState(-9, -9, -9, -9, -9, -9)
+  let blockedPatchDebugSnapshotApplied =
+    blaiApplyToolchainPatchDebugMetadataSnapshot(
+      blockedPatchDebugSnapshotState, blockedPatchDebugSnapshotApplyPlan)
+  let patchDebugStartSlotLookupPlan =
+    blaiToolchainPatchDebugStartSlotLookupPlan(3, true, 1, [10'i32, 20, 30])
+  var patchDebugStartSlotLookupPlanInto:
+    BlaiToolchainPatchDebugStartSlotLookupPlan
+  blaiToolchainPatchDebugStartSlotLookupPlanInto(
+    3, true, 1, [10'i32, 20, 30], patchDebugStartSlotLookupPlanInto)
+  let quietPatchDebugStartSlotLookupPlan =
+    blaiToolchainPatchDebugStartSlotLookupPlan(3, false, -1, [])
+  let blockedStartPatchDebugStartSlotLookupPlan =
+    blaiToolchainPatchDebugStartSlotLookupPlan(3, true, -1, [10'i32])
+  let blockedStoragePatchDebugStartSlotLookupPlan =
+    blaiToolchainPatchDebugStartSlotLookupPlan(3, true, 4, [10'i32])
+  let patchDebugStartSlotLookupApplyPlan =
+    blaiToolchainPatchDebugStartSlotLookupApplyPlan(
+      patchDebugStartSlotLookupPlan)
+  var patchDebugStartSlotLookupApplyPlanInto:
+    BlaiToolchainPatchDebugStartSlotLookupApplyPlan
+  blaiToolchainPatchDebugStartSlotLookupApplyPlanInto(
+    patchDebugStartSlotLookupPlan, patchDebugStartSlotLookupApplyPlanInto)
+  var patchDebugStartSlotLookupState =
+    blaiToolchainPatchDebugStartSlotLookupState(false, -1)
+  let patchDebugStartSlotLookupStateApplied =
+    blaiApplyToolchainPatchDebugStartSlotLookupState(
+      patchDebugStartSlotLookupState, patchDebugStartSlotLookupApplyPlan)
+  var patchDebugStartSlotValue = -1'i32
+  let patchDebugStartSlotLookupApplied =
+    blaiApplyToolchainPatchDebugStartSlotLookup(
+      patchDebugStartSlotValue, patchDebugStartSlotLookupApplyPlan)
+  let quietPatchDebugStartSlotLookupApplyPlan =
+    blaiToolchainPatchDebugStartSlotLookupApplyPlan(
+      quietPatchDebugStartSlotLookupPlan)
+  var quietPatchDebugStartSlotLookupState =
+    blaiToolchainPatchDebugStartSlotLookupState(true, -7)
+  let quietPatchDebugStartSlotLookupStateApplied =
+    blaiApplyToolchainPatchDebugStartSlotLookupState(
+      quietPatchDebugStartSlotLookupState,
+      quietPatchDebugStartSlotLookupApplyPlan)
+  var quietPatchDebugStartSlotValue = -7'i32
+  let quietPatchDebugStartSlotLookupApplied =
+    blaiApplyToolchainPatchDebugStartSlotLookup(
+      quietPatchDebugStartSlotValue, quietPatchDebugStartSlotLookupApplyPlan)
+  let blockedPatchDebugStartSlotLookupApplyPlan =
+    blaiToolchainPatchDebugStartSlotLookupApplyPlan(
+      blockedStartPatchDebugStartSlotLookupPlan)
+  var blockedPatchDebugStartSlotLookupState =
+    blaiToolchainPatchDebugStartSlotLookupState(true, -9)
+  let blockedPatchDebugStartSlotLookupStateApplied =
+    blaiApplyToolchainPatchDebugStartSlotLookupState(
+      blockedPatchDebugStartSlotLookupState,
+      blockedPatchDebugStartSlotLookupApplyPlan)
+  var blockedPatchDebugStartSlotValue = -9'i32
+  let blockedPatchDebugStartSlotLookupApplied =
+    blaiApplyToolchainPatchDebugStartSlotLookup(
+      blockedPatchDebugStartSlotValue, blockedPatchDebugStartSlotLookupApplyPlan)
+  let patchDebugSearchSnapshotPlan =
+    blaiToolchainPatchDebugSearchSnapshotPlan(3, true, 2, 4, true)
+  var patchDebugSearchSnapshotPlanInto:
+    BlaiToolchainPatchDebugSearchSnapshotPlan
+  blaiToolchainPatchDebugSearchSnapshotPlanInto(
+    3, true, 2, 4, true, patchDebugSearchSnapshotPlanInto)
+  let quietPatchDebugSearchSnapshotPlan =
+    blaiToolchainPatchDebugSearchSnapshotPlan(3, false, 2, 4, false)
+  let blockedPatchDebugSearchSnapshotPlan =
+    blaiToolchainPatchDebugSearchSnapshotPlan(-1, true, 2, 4, true)
+  let patchDebugSearchSnapshotApplyPlan =
+    blaiToolchainPatchDebugSearchSnapshotApplyPlan(
+      patchDebugSearchSnapshotPlan)
+  var patchDebugSearchSnapshotApplyPlanInto:
+    BlaiToolchainPatchDebugSearchSnapshotApplyPlan
+  blaiToolchainPatchDebugSearchSnapshotApplyPlanInto(
+    patchDebugSearchSnapshotPlan, patchDebugSearchSnapshotApplyPlanInto)
+  var patchDebugSearchSnapshotState =
+    blaiToolchainPatchDebugSearchSnapshotState(-1, -1, false)
+  let patchDebugSearchSnapshotApplied =
+    blaiApplyToolchainPatchDebugSearchSnapshot(
+      patchDebugSearchSnapshotState, patchDebugSearchSnapshotApplyPlan)
+  let quietPatchDebugSearchSnapshotApplyPlan =
+    blaiToolchainPatchDebugSearchSnapshotApplyPlan(
+      quietPatchDebugSearchSnapshotPlan)
+  var quietPatchDebugSearchSnapshotState =
+    blaiToolchainPatchDebugSearchSnapshotState(-7, -7, true)
+  let quietPatchDebugSearchSnapshotApplied =
+    blaiApplyToolchainPatchDebugSearchSnapshot(
+      quietPatchDebugSearchSnapshotState,
+      quietPatchDebugSearchSnapshotApplyPlan)
+  let blockedPatchDebugSearchSnapshotApplyPlan =
+    blaiToolchainPatchDebugSearchSnapshotApplyPlan(
+      blockedPatchDebugSearchSnapshotPlan)
+  var blockedPatchDebugSearchSnapshotState =
+    blaiToolchainPatchDebugSearchSnapshotState(-9, -9, true)
+  let blockedPatchDebugSearchSnapshotApplied =
+    blaiApplyToolchainPatchDebugSearchSnapshot(
+      blockedPatchDebugSearchSnapshotState,
+      blockedPatchDebugSearchSnapshotApplyPlan)
+  var patchApplyInto: BlaiToolchainPatchApplyPlan
+  blaiToolchainPatchApplyPlanInto(
+    patchSearch, patchOwners, consumerPatchOwnerPlan.selectedOwner,
+    patchApplyInto)
+  let patchApply = blaiToolchainPatchApplyPlan(
+    patchSearch, patchOwners, consumerPatchOwnerPlan.selectedOwner)
+  let patchAssignmentApplyPlan =
+    blaiToolchainPatchAssignmentApplyPlan(
+      patchApply, patchBitmap, patchOwners)
+  var patchAssignmentApplyPlanInto: BlaiToolchainPatchAssignmentApplyPlan
+  blaiToolchainPatchAssignmentApplyPlanInto(
+    patchApply, patchBitmap, patchOwners, patchAssignmentApplyPlanInto)
+  var patchAssignmentStateBitmap = patchBitmap
+  var patchAssignmentStateOwners = patchOwners
+  let patchAssignmentStateApplied =
+    blaiApplyToolchainPatchAssignmentState(
+      patchAssignmentStateBitmap, patchAssignmentStateOwners,
+      patchAssignmentApplyPlan)
+  let patchApplied =
+    blaiApplyToolchainPatchAssignment(patchBitmap, patchOwners, patchApply)
+  let shortPatchApply = blaiToolchainPatchApplyPlan(patchSearch, [-1'i32], 9)
+  let blockedPatchAssignmentApplyPlan =
+    blaiToolchainPatchAssignmentApplyPlan(
+      shortPatchApply, patchAssignmentStateBitmap, patchAssignmentStateOwners)
+  let patchAssignmentStateBitmapBefore = patchAssignmentStateBitmap
+  let patchAssignmentStateOwnersBefore = patchAssignmentStateOwners
+  let blockedPatchAssignmentStateApplied =
+    blaiApplyToolchainPatchAssignmentState(
+      patchAssignmentStateBitmap, patchAssignmentStateOwners,
+      blockedPatchAssignmentApplyPlan)
+  let toolchainSramGlobals = blaiToolchainSramGlobalsEvidence()
+  let toolchainCfgMemory = blaiToolchainCfgMemoryEvidence()
+  let toolchainPsramScratch = blaiToolchainPsramAllocateScratchPlan()
+  var toolchainRelationRow = [-1'i32, -1, -1, -1, -1]
+  var toolchainRelationCount = 0'u32
+  let toolchainRelationAppend = blaiToolchainPsramRelationAppendPlan(
+    4, BlaiToolchainPsramRelationRouteType, false, [3'i32, 1, 2],
+    toolchainRelationRow, toolchainRelationCount)
+  var toolchainRelationAppendInto: BlaiToolchainPsramRelationAppendPlan
+  blaiToolchainPsramRelationAppendPlanInto(
+    4, BlaiToolchainPsramRelationRouteType, false, [3'i32, 1, 2],
+    toolchainRelationRow, toolchainRelationCount, toolchainRelationAppendInto)
+  let toolchainRelationAppendApplyPlan =
+    blaiToolchainPsramRelationAppendApplyPlan(toolchainRelationAppend)
+  var toolchainRelationAppendApplyPlanInto:
+    BlaiToolchainPsramRelationAppendApplyPlan
+  blaiToolchainPsramRelationAppendApplyPlanInto(
+    toolchainRelationAppend, toolchainRelationAppendApplyPlanInto)
+  var toolchainRelationAppendState =
+    blaiToolchainPsramRelationAppendState(
+      -1, 0'u32, 0'u32, 0'u32, [-1'i32, -1, -1, -1, -1])
+  let toolchainRelationAppendStateApplied =
+    blaiApplyToolchainPsramRelationAppendState(
+      toolchainRelationAppendState, toolchainRelationAppendApplyPlan)
+  let toolchainRelationApplied = blaiApplyToolchainPsramRelationAppend(
+    toolchainRelationRow, toolchainRelationCount, toolchainRelationAppend)
+  let inactiveToolchainRelationAppend = blaiToolchainPsramRelationAppendPlan(
+    4, ord(blaiConvolutional).int32, false, [1'i32],
+    toolchainRelationRow, 0)
+  let inactiveToolchainRelationAppendApplyPlan =
+    blaiToolchainPsramRelationAppendApplyPlan(
+      inactiveToolchainRelationAppend)
+  var blockedToolchainRelationAppendState =
+    blaiToolchainPsramRelationAppendState(
+      9, 10'u32, 11'u32, 12'u32, [13'i32, 14, 15, 16, 17])
+  let blockedToolchainRelationAppendStateApplied =
+    blaiApplyToolchainPsramRelationAppendState(
+      blockedToolchainRelationAppendState,
+      inactiveToolchainRelationAppendApplyPlan)
+  let tfliteToolchainRelationAppend = blaiToolchainPsramRelationAppendPlan(
+    4, ord(blaiConvolutional).int32, true, [3'i32, 0],
+    toolchainRelationRow, 0)
+  let capacityToolchainRelationAppend = blaiToolchainPsramRelationAppendPlan(
+    4, BlaiToolchainPsramRelationRouteWType, false, [0'i32],
+    toolchainRelationRow, BlaiToolchainPsramAllocateRelationSlots)
+  let toolchainRelationCounts = [0'u32, 0, 2, 1, 1]
+  let toolchainRelationRows = [
+    [-1'i32, -1, -1, -1, -1],
+    [-1'i32, -1, -1, -1, -1],
+    [1'i32, 0, -1, -1, -1],
+    [2'i32, -1, -1, -1, -1],
+    [1'i32, -1, -1, -1, -1]]
+  let toolchainRelationConsumer = blaiToolchainPsramRelationConsumerPlan(
+    1, 5'u32, toolchainRelationCounts, toolchainRelationRows)
+  var toolchainRelationConsumerInto: BlaiToolchainPsramRelationConsumerPlan
+  blaiToolchainPsramRelationConsumerPlanInto(
+    1, 5'u32, toolchainRelationCounts, toolchainRelationRows,
+    toolchainRelationConsumerInto)
+  let missingToolchainRelationConsumer = blaiToolchainPsramRelationConsumerPlan(
+    4, 5'u32, toolchainRelationCounts, toolchainRelationRows)
+  let badIndexToolchainRelationConsumer = blaiToolchainPsramRelationConsumerPlan(
+    -1, 5'u32, toolchainRelationCounts, toolchainRelationRows)
+  let storageToolchainRelationConsumer = blaiToolchainPsramRelationConsumerPlan(
+    1, 6'u32, toolchainRelationCounts, toolchainRelationRows)
+  let overflowToolchainRelationCounts = [0'u32, 0, 6, 0, 0]
+  let capacityToolchainRelationConsumer = blaiToolchainPsramRelationConsumerPlan(
+    1, 5'u32, overflowToolchainRelationCounts, toolchainRelationRows)
+  let toolchainRelationConsumerApplyPlan =
+    blaiToolchainPsramRelationConsumerApplyPlan(toolchainRelationConsumer)
+  var toolchainRelationConsumerApplyPlanInto:
+    BlaiToolchainPsramRelationConsumerApplyPlan
+  blaiToolchainPsramRelationConsumerApplyPlanInto(
+    toolchainRelationConsumer, toolchainRelationConsumerApplyPlanInto)
+  var toolchainRelationConsumerState =
+    blaiToolchainPsramRelationConsumerState(false, -1)
+  let toolchainRelationConsumerApplied =
+    blaiApplyToolchainPsramRelationConsumer(
+      toolchainRelationConsumerState, toolchainRelationConsumerApplyPlan)
+  let missingToolchainRelationConsumerApplyPlan =
+    blaiToolchainPsramRelationConsumerApplyPlan(
+      missingToolchainRelationConsumer)
+  var missingToolchainRelationConsumerState =
+    blaiToolchainPsramRelationConsumerState(true, 7)
+  let missingToolchainRelationConsumerApplied =
+    blaiApplyToolchainPsramRelationConsumer(
+      missingToolchainRelationConsumerState,
+      missingToolchainRelationConsumerApplyPlan)
+  let blockedToolchainRelationConsumerApplyPlan =
+    blaiToolchainPsramRelationConsumerApplyPlan(
+      badIndexToolchainRelationConsumer)
+  var blockedToolchainRelationConsumerState =
+    blaiToolchainPsramRelationConsumerState(true, 9)
+  let blockedToolchainRelationConsumerApplied =
+    blaiApplyToolchainPsramRelationConsumer(
+      blockedToolchainRelationConsumerState,
+      blockedToolchainRelationConsumerApplyPlan)
+  let searchCallPreparePlan = blaiToolchainPatchSearchCallPreparePlan(
+    1, 5'u32, toolchainRelationCounts, toolchainRelationRows,
+    BlaiToolchainPatchPreviousOwnerType, false)
+  var searchCallPreparePlanInto: BlaiToolchainPatchSearchCallPreparePlan
+  blaiToolchainPatchSearchCallPreparePlanInto(
+    1, 5'u32, toolchainRelationCounts, toolchainRelationRows,
+    BlaiToolchainPatchPreviousOwnerType, false, searchCallPreparePlanInto)
+  let inheritedSearchCallPreparePlan =
+    blaiToolchainPatchSearchCallPreparePlan(
+      4, 5'u32, toolchainRelationCounts, toolchainRelationRows, 0'i32, true)
+  let blockedSearchCallPreparePlan = blaiToolchainPatchSearchCallPreparePlan(
+    1, 6'u32, toolchainRelationCounts, toolchainRelationRows, 0'i32, false)
+  let toolchainInputMembership = blaiToolchainPsramInputMembershipPlan(
+    3, 4, [0'i32, 2, 3, 5])
+  var toolchainInputMembershipInto: BlaiToolchainPsramInputMembershipPlan
+  blaiToolchainPsramInputMembershipPlanInto(
+    3, 4, [0'i32, 2, 3, 5], toolchainInputMembershipInto)
+  let toolchainInputMembershipApplyPlan =
+    blaiToolchainPsramInputMembershipApplyPlan(toolchainInputMembership)
+  var toolchainInputMembershipApplyPlanInto:
+    BlaiToolchainPsramInputMembershipApplyPlan
+  blaiToolchainPsramInputMembershipApplyPlanInto(
+    toolchainInputMembership, toolchainInputMembershipApplyPlanInto)
+  var toolchainInputMembershipState =
+    blaiToolchainPsramInputMembershipState(-1, 0, 0'u32, false)
+  let toolchainInputMembershipStateApplied =
+    blaiApplyToolchainPsramInputMembershipState(
+      toolchainInputMembershipState, toolchainInputMembershipApplyPlan)
+  let missingToolchainInputMembership = blaiToolchainPsramInputMembershipPlan(
+    4, 3, [0'i32, 2, 3])
+  let emptyToolchainInputMembership = blaiToolchainPsramInputMembershipPlan(
+    4, 0, [4'i32])
+  let badIndexToolchainInputMembership = blaiToolchainPsramInputMembershipPlan(
+    -1, 1, [0'i32])
+  let shortToolchainInputMembership = blaiToolchainPsramInputMembershipPlan(
+    3, 4, [0'i32, 2])
+  let shortToolchainInputMembershipApplyPlan =
+    blaiToolchainPsramInputMembershipApplyPlan(shortToolchainInputMembership)
+  var blockedToolchainInputMembershipState =
+    blaiToolchainPsramInputMembershipState(9, 10, 11'u32, true)
+  let blockedToolchainInputMembershipStateApplied =
+    blaiApplyToolchainPsramInputMembershipState(
+      blockedToolchainInputMembershipState,
+      shortToolchainInputMembershipApplyPlan)
+  let toolchainLayerRequest = blaiToolchainPsramLayerRequestPlan(
+    BlaiCpuInstLayer64(layerType: ord(blaiConvolutional).int32, h: 128, w: 128, c: 15))
+  let smallToolchainLayerRequest = blaiToolchainPsramLayerRequestPlan(
+    BlaiCpuInstLayer64(layerType: ord(blaiConvolutional).int32, h: 28, w: 28, c: 1))
+  let skippedToolchainLayerRequest = blaiToolchainPsramLayerRequestPlan(
+    BlaiCpuInstLayer64(layerType: BlaiToolchainPsramAllocateSkipLayerType,
+      h: 128, w: 128, c: 16))
+  let toolchainDspRequest = blaiToolchainPsramDspRequestPlan(
+    256, 256, 3)
+  var toolchainDspRequestInto: BlaiToolchainPsramDspRequestPlan
+  blaiToolchainPsramDspRequestPlanInto(256, 256, 3, toolchainDspRequestInto)
+  let smallToolchainDspRequest = blaiToolchainPsramDspRequestPlan(
+    128, 128, 1)
+  let badShapeToolchainDspRequest = blaiToolchainPsramDspRequestPlan(
+    -1, 128, 3)
+  let overflowToolchainDspRequest = blaiToolchainPsramDspRequestPlan(
+    high(int32), high(int32), high(int32))
+  let toolchainDspVolumeRequest =
+    blaiToolchainPsramDspVolumeRequestPlan(128, 128, 16)
+  var toolchainDspVolumeRequestInto:
+    BlaiToolchainPsramDspVolumeRequestPlan
+  blaiToolchainPsramDspVolumeRequestPlanInto(
+    128, 128, 16, toolchainDspVolumeRequestInto)
+  let smallToolchainDspVolumeRequest =
+    blaiToolchainPsramDspVolumeRequestPlan(128, 128, 1)
+  let badShapeToolchainDspVolumeRequest =
+    blaiToolchainPsramDspVolumeRequestPlan(-1, 128, 16)
+  let overflowToolchainDspVolumeRequest =
+    blaiToolchainPsramDspVolumeRequestPlan(
+      high(int32), high(int32), high(int32))
+  let generalPsramPatchPlan = blaiToolchainPsramGeneralPatchPlan(
+    2'u32, searchCallPreparePlan, true)
+  var generalPsramPatchPlanInto: BlaiToolchainPsramGeneralPatchPlan
+  blaiToolchainPsramGeneralPatchPlanInto(
+    2'u32, searchCallPreparePlan, true, generalPsramPatchPlanInto)
+  let inheritedGeneralPsramPatchPlan = blaiToolchainPsramGeneralPatchPlan(
+    1'u32, inheritedSearchCallPreparePlan, false)
+  let blockedGeneralPsramPatchPlan = blaiToolchainPsramGeneralPatchPlan(
+    1'u32, blockedSearchCallPreparePlan, false)
+  let generalPsramPatchApplyPlan =
+    blaiToolchainPsramGeneralPatchApplyPlan(generalPsramPatchPlan)
+  var generalPsramPatchApplyPlanInto: BlaiToolchainPsramGeneralPatchApplyPlan
+  blaiToolchainPsramGeneralPatchApplyPlanInto(
+    generalPsramPatchPlan, generalPsramPatchApplyPlanInto)
+  var generalPsramPatchState =
+    blaiToolchainPsramGeneralPatchState(
+      -1, 0'u32, -1, false, false, false, false,
+      blaiToolchainPatchMetadataDsp, -1)
+  let generalPsramPatchApplied =
+    blaiApplyToolchainPsramGeneralPatch(
+      generalPsramPatchState, generalPsramPatchApplyPlan)
+  let inheritedGeneralPsramPatchApplyPlan =
+    blaiToolchainPsramGeneralPatchApplyPlan(inheritedGeneralPsramPatchPlan)
+  var inheritedGeneralPsramPatchState =
+    blaiToolchainPsramGeneralPatchState(
+      -1, 0'u32, -1, false, false, true, false,
+      blaiToolchainPatchMetadataTflite, -1)
+  let inheritedGeneralPsramPatchApplied =
+    blaiApplyToolchainPsramGeneralPatch(
+      inheritedGeneralPsramPatchState, inheritedGeneralPsramPatchApplyPlan)
+  let blockedGeneralPsramPatchApplyPlan =
+    blaiToolchainPsramGeneralPatchApplyPlan(blockedGeneralPsramPatchPlan)
+  var blockedGeneralPsramPatchState =
+    blaiToolchainPsramGeneralPatchState(
+      7, 3'u32, 8, true, false, true, false,
+      blaiToolchainPatchMetadataTflite, 9)
+  let blockedGeneralPsramPatchApplied =
+    blaiApplyToolchainPsramGeneralPatch(
+      blockedGeneralPsramPatchState, blockedGeneralPsramPatchApplyPlan)
+  let dspPatchPairPlan = blaiToolchainPsramDspPatchPairPlan(
+    toolchainDspRequest, searchCallPreparePlan, true)
+  var dspPatchPairPlanInto: BlaiToolchainPsramDspPatchPairPlan
+  blaiToolchainPsramDspPatchPairPlanInto(
+    toolchainDspRequest, searchCallPreparePlan, true, dspPatchPairPlanInto)
+  let dspPatchPairApplyPlan =
+    blaiToolchainPsramDspPatchPairApplyPlan(dspPatchPairPlan)
+  var dspPatchPairApplyPlanInto:
+    BlaiToolchainPsramDspPatchPairApplyPlan
+  blaiToolchainPsramDspPatchPairApplyPlanInto(
+    dspPatchPairPlan, dspPatchPairApplyPlanInto)
+  var dspPatchPairState =
+    blaiToolchainPsramDspPatchPairState(
+      -1, 0'u32, -1, false, false, false, false, false,
+      blaiToolchainPatchMetadataGeneral, -1, 0'u32, 0'u32, false, false)
+  let dspPatchPairApplied =
+    blaiApplyToolchainPsramDspPatchPair(
+      dspPatchPairState, dspPatchPairApplyPlan)
+  let dspVolumePatchPairPlan =
+    blaiToolchainPsramDspVolumePatchPairPlan(
+      toolchainDspVolumeRequest, searchCallPreparePlan, true)
+  var dspVolumePatchPairPlanInto:
+    BlaiToolchainPsramDspVolumePatchPairPlan
+  blaiToolchainPsramDspVolumePatchPairPlanInto(
+    toolchainDspVolumeRequest, searchCallPreparePlan, true,
+    dspVolumePatchPairPlanInto)
+  let dspVolumePatchPairApplyPlan =
+    blaiToolchainPsramDspVolumePatchPairApplyPlan(dspVolumePatchPairPlan)
+  var dspVolumePatchPairApplyPlanInto:
+    BlaiToolchainPsramDspVolumePatchPairApplyPlan
+  blaiToolchainPsramDspVolumePatchPairApplyPlanInto(
+    dspVolumePatchPairPlan, dspVolumePatchPairApplyPlanInto)
+  var dspVolumePatchPairState =
+    blaiToolchainPsramDspVolumePatchPairState(
+      -1, 0'u32, -1, false, false, false, false, false,
+      blaiToolchainPatchMetadataGeneral, -1, 0'u32, false)
+  let dspVolumePatchPairApplied =
+    blaiApplyToolchainPsramDspVolumePatchPair(
+      dspVolumePatchPairState, dspVolumePatchPairApplyPlan)
+  let blockedDspPatchPairRequestPlan = blaiToolchainPsramDspPatchPairPlan(
+    badShapeToolchainDspRequest, searchCallPreparePlan, false)
+  let blockedDspPatchPairPreparePlan = blaiToolchainPsramDspPatchPairPlan(
+    toolchainDspRequest, blockedSearchCallPreparePlan, false)
+  let blockedDspPatchPairApplyPlan =
+    blaiToolchainPsramDspPatchPairApplyPlan(blockedDspPatchPairRequestPlan)
+  var blockedDspPatchPairState =
+    blaiToolchainPsramDspPatchPairState(
+      7, 3'u32, 8, true, true, false, true, true,
+      blaiToolchainPatchMetadataTflite, 9, 11'u32, 12'u32, true, false)
+  let blockedDspPatchPairApplied =
+    blaiApplyToolchainPsramDspPatchPair(
+      blockedDspPatchPairState, blockedDspPatchPairApplyPlan)
+  let blockedDspVolumePatchPairRequestPlan =
+    blaiToolchainPsramDspVolumePatchPairPlan(
+      badShapeToolchainDspVolumeRequest, searchCallPreparePlan, false)
+  let blockedDspVolumePatchPairPreparePlan =
+    blaiToolchainPsramDspVolumePatchPairPlan(
+      toolchainDspVolumeRequest, blockedSearchCallPreparePlan, false)
+  let blockedDspVolumePatchPairApplyPlan =
+    blaiToolchainPsramDspVolumePatchPairApplyPlan(
+      blockedDspVolumePatchPairRequestPlan)
+  var blockedDspVolumePatchPairState =
+    blaiToolchainPsramDspVolumePatchPairState(
+      7, 3'u32, 8, true, true, false, true, true,
+      blaiToolchainPatchMetadataTflite, 9, 11'u32, true)
+  let blockedDspVolumePatchPairApplied =
+    blaiApplyToolchainPsramDspVolumePatchPair(
+      blockedDspVolumePatchPairState, blockedDspVolumePatchPairApplyPlan)
+  let toolchainLayerLoop = blaiToolchainPsramLayerLoopPlan(
+    2, 5, BlaiToolchainPsramOwnerConvType)
+  var toolchainLayerLoopInto: BlaiToolchainPsramLayerLoopPlan
+  blaiToolchainPsramLayerLoopPlanInto(
+    2, 5, BlaiToolchainPsramOwnerConvType, toolchainLayerLoopInto)
+  let skippedToolchainLayerLoop = blaiToolchainPsramLayerLoopPlan(
+    2, 5, BlaiToolchainPsramAllocateSkipLayerType)
+  let badCountToolchainLayerLoop = blaiToolchainPsramLayerLoopPlan(
+    0, 0, BlaiToolchainPsramOwnerConvType)
+  let badIndexToolchainLayerLoop = blaiToolchainPsramLayerLoopPlan(
+    5, 5, BlaiToolchainPsramOwnerConvType)
+  let toolchainLayerTransition = blaiToolchainPsramLayerTransitionPlan(
+    1, 5, BlaiToolchainPsramOwnerConvType, 14)
+  var toolchainLayerTransitionInto: BlaiToolchainPsramLayerTransitionPlan
+  blaiToolchainPsramLayerTransitionPlanInto(
+    1, 5, BlaiToolchainPsramOwnerConvType, 14, toolchainLayerTransitionInto)
+  let skippedToolchainLayerTransition = blaiToolchainPsramLayerTransitionPlan(
+    1, 5, BlaiToolchainPsramAllocateSkipLayerType, 14)
+  let endToolchainLayerTransition = blaiToolchainPsramLayerTransitionPlan(
+    4, 5, BlaiToolchainPsramOwnerConvType, 14)
+  let negativeToolchainLayerTransition = blaiToolchainPsramLayerTransitionPlan(
+    1, 5, BlaiToolchainPsramOwnerConvType, -5)
+  let badCountToolchainLayerTransition = blaiToolchainPsramLayerTransitionPlan(
+    0, 0, BlaiToolchainPsramOwnerConvType, 14)
+  let badIndexToolchainLayerTransition = blaiToolchainPsramLayerTransitionPlan(
+    5, 5, BlaiToolchainPsramOwnerConvType, 14)
+  let toolchainTfliteRequest = blaiToolchainPsramTfliteRequestPlan(
+    256, 256, 3)
+  var toolchainTfliteRequestInto: BlaiToolchainPsramTfliteRequestPlan
+  blaiToolchainPsramTfliteRequestPlanInto(
+    256, 256, 3, toolchainTfliteRequestInto)
+  let smallToolchainTfliteRequest = blaiToolchainPsramTfliteRequestPlan(
+    128, 128, 1)
+  let badShapeToolchainTfliteRequest = blaiToolchainPsramTfliteRequestPlan(
+    -1, 128, 3)
+  let overflowToolchainTfliteRequest = blaiToolchainPsramTfliteRequestPlan(
+    high(int32), high(int32), high(int32))
+  let tflitePatchPlan = blaiToolchainPsramTflitePatchPlan(
+    toolchainTfliteRequest, searchCallPreparePlan, true)
+  var tflitePatchPlanInto: BlaiToolchainPsramTflitePatchPlan
+  blaiToolchainPsramTflitePatchPlanInto(
+    toolchainTfliteRequest, searchCallPreparePlan, true, tflitePatchPlanInto)
+  let tflitePatchApplyPlan =
+    blaiToolchainPsramTflitePatchApplyPlan(tflitePatchPlan)
+  var tflitePatchApplyPlanInto: BlaiToolchainPsramTflitePatchApplyPlan
+  blaiToolchainPsramTflitePatchApplyPlanInto(
+    tflitePatchPlan, tflitePatchApplyPlanInto)
+  var tflitePatchState =
+    blaiToolchainPsramTflitePatchState(
+      -1, 0'u32, -1, false, false, false, false,
+      blaiToolchainPatchMetadataGeneral, -1)
+  let tflitePatchApplied =
+    blaiApplyToolchainPsramTflitePatch(
+      tflitePatchState, tflitePatchApplyPlan)
+  let blockedTflitePatchRequestPlan = blaiToolchainPsramTflitePatchPlan(
+    badShapeToolchainTfliteRequest, searchCallPreparePlan, false)
+  let blockedTflitePatchPreparePlan = blaiToolchainPsramTflitePatchPlan(
+    toolchainTfliteRequest, blockedSearchCallPreparePlan, false)
+  let blockedTflitePatchApplyPlan =
+    blaiToolchainPsramTflitePatchApplyPlan(blockedTflitePatchRequestPlan)
+  var blockedTflitePatchState =
+    blaiToolchainPsramTflitePatchState(
+      7, 3'u32, 8, true, false, true, false,
+      blaiToolchainPatchMetadataDsp, 9)
+  let blockedTflitePatchApplied =
+    blaiApplyToolchainPsramTflitePatch(
+      blockedTflitePatchState, blockedTflitePatchApplyPlan)
+  var toolchainRequestTable = [0'u32, 0, 0, 0]
+  let toolchainRequestStorePlan = blaiToolchainPsramLayerRequestStorePlan(
+    toolchainLayerRequest, 2, toolchainRequestTable)
+  var toolchainRequestStorePlanInto: BlaiToolchainPsramLayerRequestStorePlan
+  blaiToolchainPsramLayerRequestStorePlanInto(
+    toolchainLayerRequest, 2, toolchainRequestTable, toolchainRequestStorePlanInto)
+  let toolchainRequestStoreApplyPlan =
+    blaiToolchainPsramLayerRequestStoreApplyPlan(toolchainRequestStorePlan)
+  var toolchainRequestStoreApplyPlanInto:
+    BlaiToolchainPsramLayerRequestStoreApplyPlan
+  blaiToolchainPsramLayerRequestStoreApplyPlanInto(
+    toolchainRequestStorePlan, toolchainRequestStoreApplyPlanInto)
+  var toolchainRequestStoreState =
+    blaiToolchainPsramLayerRequestStoreState(
+      -1, 0'u32, 0'u32, 0'u32, 0'u32, 0'u32)
+  let toolchainRequestStoreStateApplied =
+    blaiApplyToolchainPsramLayerRequestStoreState(
+      toolchainRequestStoreState, toolchainRequestStoreApplyPlan)
+  let toolchainRequestStored = blaiApplyToolchainPsramLayerRequestStore(
+    toolchainRequestTable, toolchainRequestStorePlan)
+  let invalidToolchainRequestStorePlan = blaiToolchainPsramLayerRequestStorePlan(
+    skippedToolchainLayerRequest, 2, toolchainRequestTable)
+  let shortToolchainRequestStorePlan = blaiToolchainPsramLayerRequestStorePlan(
+    toolchainLayerRequest, 8, toolchainRequestTable)
+  let blockedToolchainRequestStoreApplyPlan =
+    blaiToolchainPsramLayerRequestStoreApplyPlan(
+      invalidToolchainRequestStorePlan)
+  var blockedToolchainRequestStoreState =
+    blaiToolchainPsramLayerRequestStoreState(
+      7, 11'u32, 3'u32, 4'u32, 5'u32, 6'u32)
+  let blockedToolchainRequestStoreStateApplied =
+    blaiApplyToolchainPsramLayerRequestStoreState(
+      blockedToolchainRequestStoreState,
+      blockedToolchainRequestStoreApplyPlan)
+  let setWeiCallPlan =
+    blaiToolchainSetWeiPatchCallPlan(toolchainLayerRequest, 2, true)
+  var setWeiCallPlanInto: BlaiToolchainSetWeiPatchCallPlan
+  blaiToolchainSetWeiPatchCallPlanInto(
+    toolchainLayerRequest, 2, true, setWeiCallPlanInto)
+  let setWeiCallFramePlan =
+    blaiToolchainSetWeiPatchCallFramePlan(setWeiCallPlan)
+  var setWeiCallFramePlanInto: BlaiToolchainSetWeiPatchCallFramePlan
+  blaiToolchainSetWeiPatchCallFramePlanInto(
+    setWeiCallPlan, setWeiCallFramePlanInto)
+  let invalidSetWeiCallPlan =
+    blaiToolchainSetWeiPatchCallPlan(skippedToolchainLayerRequest, 2, false)
+  let invalidSetWeiCallFramePlan =
+    blaiToolchainSetWeiPatchCallFramePlan(invalidSetWeiCallPlan)
+  let badLayerSetWeiCallPlan =
+    blaiToolchainSetWeiPatchCallPlan(toolchainLayerRequest, -1, false)
+  let setWeiReturnPlan =
+    blaiToolchainSetWeiPatchReturnPlan(setWeiCallPlan, 3)
+  var setWeiReturnPlanInto: BlaiToolchainSetWeiPatchReturnPlan
+  blaiToolchainSetWeiPatchReturnPlanInto(
+    setWeiCallPlan, 3, setWeiReturnPlanInto)
+  let setWeiReturnApplyPlan =
+    blaiToolchainSetWeiPatchReturnApplyPlan(setWeiReturnPlan)
+  var setWeiReturnApplyPlanInto: BlaiToolchainSetWeiPatchReturnApplyPlan
+  blaiToolchainSetWeiPatchReturnApplyPlanInto(
+    setWeiReturnPlan, setWeiReturnApplyPlanInto)
+  var setWeiReturnState =
+    blaiToolchainSetWeiPatchReturnState(-1, -1, -1, false)
+  let setWeiReturnStateApplied =
+    blaiApplyToolchainSetWeiPatchReturnState(
+      setWeiReturnState, setWeiReturnApplyPlan)
+  var setWeiScratchPatchCount = 0'i32
+  let setWeiReturnApplied =
+    blaiApplyToolchainSetWeiPatchReturn(
+      setWeiScratchPatchCount, setWeiReturnPlan)
+  let setWeiReturnFramePlan =
+    blaiToolchainSetWeiPatchReturnFramePlan(
+      setWeiCallFramePlan, setWeiReturnPlan)
+  var setWeiReturnFramePlanInto: BlaiToolchainSetWeiPatchReturnFramePlan
+  blaiToolchainSetWeiPatchReturnFramePlanInto(
+    setWeiCallFramePlan, setWeiReturnPlan, setWeiReturnFramePlanInto)
+  let invalidSetWeiReturnPlan =
+    blaiToolchainSetWeiPatchReturnPlan(invalidSetWeiCallPlan, 3)
+  let invalidSetWeiReturnApplyPlan =
+    blaiToolchainSetWeiPatchReturnApplyPlan(invalidSetWeiReturnPlan)
+  var blockedSetWeiReturnState =
+    blaiToolchainSetWeiPatchReturnState(-9, -9, -9, true)
+  let blockedSetWeiReturnStateApplied =
+    blaiApplyToolchainSetWeiPatchReturnState(
+      blockedSetWeiReturnState, invalidSetWeiReturnApplyPlan)
+  let invalidCallFrameSetWeiReturnFramePlan =
+    blaiToolchainSetWeiPatchReturnFramePlan(
+      invalidSetWeiCallFramePlan, setWeiReturnPlan)
+  let invalidReturnSetWeiReturnFramePlan =
+    blaiToolchainSetWeiPatchReturnFramePlan(
+      setWeiCallFramePlan, invalidSetWeiReturnPlan)
+  let inputMembershipResumePlan =
+    blaiToolchainPsramInputMembershipResumePlan(
+      setWeiReturnFramePlan, 3, 4, 12'u32, [0'i32, 2, 3, 5])
+  var inputMembershipResumePlanInto:
+    BlaiToolchainPsramInputMembershipResumePlan
+  blaiToolchainPsramInputMembershipResumePlanInto(
+    setWeiReturnFramePlan, 3, 4, 12'u32, [0'i32, 2, 3, 5],
+    inputMembershipResumePlanInto)
+  let emptyInputMembershipResumePlan =
+    blaiToolchainPsramInputMembershipResumePlan(
+      setWeiReturnFramePlan, 4, 0, 0'u32, [4'i32])
+  let misalignedInputMembershipResumePlan =
+    blaiToolchainPsramInputMembershipResumePlan(
+      setWeiReturnFramePlan, 3, 4, 10'u32, [0'i32, 2, 3, 5])
+  let shortInputMembershipResumePlan =
+    blaiToolchainPsramInputMembershipResumePlan(
+      setWeiReturnFramePlan, 3, 4, 12'u32, [0'i32, 2])
+  let invalidReturnInputMembershipResumePlan =
+    blaiToolchainPsramInputMembershipResumePlan(
+      invalidCallFrameSetWeiReturnFramePlan, 3, 4, 12'u32,
+      [0'i32, 2, 3, 5])
+  let inputMembershipResumeApplyPlan =
+    blaiToolchainPsramInputMembershipResumeApplyPlan(
+      inputMembershipResumePlan)
+  var inputMembershipResumeApplyPlanInto:
+    BlaiToolchainPsramInputMembershipResumeApplyPlan
+  blaiToolchainPsramInputMembershipResumeApplyPlanInto(
+    inputMembershipResumePlan, inputMembershipResumeApplyPlanInto)
+  var inputMembershipFoundAfterResume = false
+  let inputMembershipResumeApplied =
+    blaiApplyToolchainPsramInputMembershipResume(
+      inputMembershipFoundAfterResume, inputMembershipResumeApplyPlan)
+  var inputMembershipResumeState =
+    blaiToolchainPsramInputMembershipResumeState(
+      -1, false, false, false, 0'u32)
+  let inputMembershipResumeStateApplied =
+    blaiApplyToolchainPsramInputMembershipResumeState(
+      inputMembershipResumeState, inputMembershipResumeApplyPlan)
+  let invalidInputMembershipResumeApplyPlan =
+    blaiToolchainPsramInputMembershipResumeApplyPlan(
+      invalidReturnInputMembershipResumePlan)
+  var blockedInputMembershipFoundAfterResume = true
+  let invalidInputMembershipResumeApplied =
+    blaiApplyToolchainPsramInputMembershipResume(
+      blockedInputMembershipFoundAfterResume,
+      invalidInputMembershipResumeApplyPlan)
+  var blockedInputMembershipResumeState =
+    blaiToolchainPsramInputMembershipResumeState(
+      9, true, true, true, 10'u32)
+  let invalidInputMembershipResumeStateApplied =
+    blaiApplyToolchainPsramInputMembershipResumeState(
+      blockedInputMembershipResumeState,
+      invalidInputMembershipResumeApplyPlan)
+  let initialInputGateScanPlan =
+    blaiToolchainPsramInitialInputGatePlan(0, true, 2, true)
+  var initialInputGateScanPlanInto: BlaiToolchainPsramInitialInputGatePlan
+  blaiToolchainPsramInitialInputGatePlanInto(
+    0, true, 2, true, initialInputGateScanPlanInto)
+  let initialInputGateSwitchPlan =
+    blaiToolchainPsramInitialInputGatePlan(3, true, 2, false)
+  let initialInputGateEmptySwitchPlan =
+    blaiToolchainPsramInitialInputGatePlan(0, true, 0, false)
+  let initialInputGateFirstLayerPlan =
+    blaiToolchainPsramInitialInputGatePlan(0, false, 2, false)
+  let initialInputGateBadLayerPlan =
+    blaiToolchainPsramInitialInputGatePlan(-1, true, 2, false)
+  let initialInputGateBadCountPlan =
+    blaiToolchainPsramInitialInputGatePlan(0, true, -1, false)
+  let initialInputGateApplyPlan =
+    blaiToolchainPsramInitialInputGateApplyPlan(initialInputGateScanPlan)
+  var initialInputGateApplyPlanInto:
+    BlaiToolchainPsramInitialInputGateApplyPlan
+  blaiToolchainPsramInitialInputGateApplyPlanInto(
+    initialInputGateScanPlan, initialInputGateApplyPlanInto)
+  var initialInputGateState =
+    blaiToolchainPsramInitialInputGateState(
+      blaiToolchainPsramInitialInputGateLayerTypeSwitch, false, false, 7)
+  let initialInputGateApplied =
+    blaiApplyToolchainPsramInitialInputGate(
+      initialInputGateState, initialInputGateApplyPlan)
+  let switchInitialInputGateApplyPlan =
+    blaiToolchainPsramInitialInputGateApplyPlan(initialInputGateSwitchPlan)
+  var switchInitialInputGateState =
+    blaiToolchainPsramInitialInputGateState(
+      blaiToolchainPsramInitialInputGateFirstLayerNoFlag, true, true, -3)
+  let switchInitialInputGateApplied =
+    blaiApplyToolchainPsramInitialInputGate(
+      switchInitialInputGateState, switchInitialInputGateApplyPlan)
+  let blockedInitialInputGateApplyPlan =
+    blaiToolchainPsramInitialInputGateApplyPlan(initialInputGateBadLayerPlan)
+  var blockedInitialInputGateState =
+    blaiToolchainPsramInitialInputGateState(
+      blaiToolchainPsramInitialInputGateFirstLayerNoFlag, true, true, -5)
+  let blockedInitialInputGateApplied =
+    blaiApplyToolchainPsramInitialInputGate(
+      blockedInitialInputGateState, blockedInitialInputGateApplyPlan)
+  let initialRelationRows = [
+    [-1'i32, -1, -1, -1, -1],
+    [-1'i32, -1, -1, -1, -1],
+    [1'i32, -1, -1, -1, -1],
+    [2'i32, -1, -1, -1, -1],
+    [-1'i32, -1, -1, -1, -1]]
+  let initialRelationScanPlan =
+    blaiToolchainPsramInitialRelationScanPlan(
+      initialInputGateScanPlan, 5'u32, toolchainRelationCounts,
+      initialRelationRows)
+  var initialRelationScanPlanInto:
+    BlaiToolchainPsramInitialRelationScanPlan
+  blaiToolchainPsramInitialRelationScanPlanInto(
+    initialInputGateScanPlan, 5'u32, toolchainRelationCounts,
+    initialRelationRows, initialRelationScanPlanInto)
+  let initialRelationScanApplyPlan =
+    blaiToolchainPsramInitialRelationScanApplyPlan(initialRelationScanPlan)
+  var initialRelationScanApplyPlanInto:
+    BlaiToolchainPsramInitialRelationScanApplyPlan
+  blaiToolchainPsramInitialRelationScanApplyPlanInto(
+    initialRelationScanPlan, initialRelationScanApplyPlanInto)
+  var initialRelationScanState =
+    blaiToolchainPsramInitialRelationScanState(
+      -1, -1, 0, 0'u32, 0'u32, 0'u32, false)
+  let initialRelationScanStateApplied =
+    blaiApplyToolchainPsramInitialRelationScanState(
+      initialRelationScanState, initialRelationScanApplyPlan)
+  let inactiveInitialRelationScanPlan =
+    blaiToolchainPsramInitialRelationScanPlan(
+      initialInputGateSwitchPlan, 5'u32, toolchainRelationCounts,
+      initialRelationRows)
+  let inactiveInitialRelationScanApplyPlan =
+    blaiToolchainPsramInitialRelationScanApplyPlan(
+      inactiveInitialRelationScanPlan)
+  var blockedInitialRelationScanState =
+    blaiToolchainPsramInitialRelationScanState(
+      9, 10, 11, 12'u32, 13'u32, 14'u32, true)
+  let blockedInitialRelationScanStateApplied =
+    blaiApplyToolchainPsramInitialRelationScanState(
+      blockedInitialRelationScanState, inactiveInitialRelationScanApplyPlan)
+  let storageInitialRelationScanPlan =
+    blaiToolchainPsramInitialRelationScanPlan(
+      initialInputGateScanPlan, 6'u32, toolchainRelationCounts,
+      initialRelationRows)
+  let capacityInitialRelationScanPlan =
+    blaiToolchainPsramInitialRelationScanPlan(
+      initialInputGateScanPlan, 5'u32, overflowToolchainRelationCounts,
+      initialRelationRows)
+  let noMatchInitialRelationRows = [
+    [7'i32, 8, -1, -1, -1],
+    [6'i32, 5, -1, -1, -1],
+    [1'i32, 2, -1, -1, -1],
+    [2'i32, 3, -1, -1, -1],
+    [4'i32, -1, -1, -1, -1]]
+  let noMatchInitialRelationScanPlan =
+    blaiToolchainPsramInitialRelationScanPlan(
+      initialInputGateScanPlan, 5'u32, toolchainRelationCounts,
+      noMatchInitialRelationRows)
+  let initialTfliteRequestPlan =
+    blaiToolchainPsramInitialTfliteRequestPlan(
+      initialRelationScanPlan, 256, 256, 3,
+      BlaiToolchainPatchPreviousOwnerType, false)
+  var initialTfliteRequestPlanInto:
+    BlaiToolchainPsramInitialTfliteRequestPlan
+  blaiToolchainPsramInitialTfliteRequestPlanInto(
+    initialRelationScanPlan, 256, 256, 3,
+    BlaiToolchainPatchPreviousOwnerType, false,
+    initialTfliteRequestPlanInto)
+  let initialTfliteRequestApplyPlan =
+    blaiToolchainPsramInitialTfliteRequestApplyPlan(
+      initialTfliteRequestPlan)
+  var initialTfliteRequestApplyPlanInto:
+    BlaiToolchainPsramInitialTfliteRequestApplyPlan
+  blaiToolchainPsramInitialTfliteRequestApplyPlanInto(
+    initialTfliteRequestPlan, initialTfliteRequestApplyPlanInto)
+  var initialTfliteRequestState =
+    blaiToolchainPsramInitialTfliteRequestState(
+      -1, 0'u32, 0'u32, 0'u32, 0, 0, 0, 0, 0, 0'u32, false)
+  let initialTfliteRequestStateApplied =
+    blaiApplyToolchainPsramInitialTfliteRequestState(
+      initialTfliteRequestState, initialTfliteRequestApplyPlan)
+  let initialTflitePatchPlan =
+    blaiToolchainPsramInitialTflitePatchPlan(
+      initialTfliteRequestPlan, true)
+  var initialTflitePatchPlanInto:
+    BlaiToolchainPsramInitialTflitePatchPlan
+  blaiToolchainPsramInitialTflitePatchPlanInto(
+    initialTfliteRequestPlan, true, initialTflitePatchPlanInto)
+  let initialTflitePatchApplyPlan =
+    blaiToolchainPsramInitialTflitePatchApplyPlan(
+      initialTflitePatchPlan)
+  var initialTflitePatchApplyPlanInto:
+    BlaiToolchainPsramInitialTflitePatchApplyPlan
+  blaiToolchainPsramInitialTflitePatchApplyPlanInto(
+    initialTflitePatchPlan, initialTflitePatchApplyPlanInto)
+  var initialTflitePatchState =
+    blaiToolchainPsramInitialTflitePatchState(
+      -1, 0'u32, -1, false, false, false, false,
+      blaiToolchainPatchMetadataGeneral, -1)
+  let initialTflitePatchStateApplied =
+    blaiApplyToolchainPsramInitialTflitePatchState(
+      initialTflitePatchState, initialTflitePatchApplyPlan)
+  var initialTflitePatchLayer = -1'i32
+  var initialTflitePatchCount = 0'u32
+  var initialTflitePatchOwner = -1'i32
+  let initialTflitePatchScalarsApplied =
+    blaiApplyToolchainPsramInitialTflitePatchScalars(
+      initialTflitePatchLayer, initialTflitePatchCount,
+      initialTflitePatchOwner, initialTflitePatchApplyPlan)
+  let inactiveInitialTfliteRequestPlan =
+    blaiToolchainPsramInitialTfliteRequestPlan(
+      inactiveInitialRelationScanPlan, 256, 256, 3, 0, false)
+  let inactiveInitialTfliteRequestApplyPlan =
+    blaiToolchainPsramInitialTfliteRequestApplyPlan(
+      inactiveInitialTfliteRequestPlan)
+  var blockedInitialTfliteRequestState =
+    blaiToolchainPsramInitialTfliteRequestState(
+      9, 10'u32, 11'u32, 12'u32, 13, 14, 15, 16'u32, 17, 18'u32,
+      true)
+  let blockedInitialTfliteRequestStateApplied =
+    blaiApplyToolchainPsramInitialTfliteRequestState(
+      blockedInitialTfliteRequestState,
+      inactiveInitialTfliteRequestApplyPlan)
+  let noSelectedInitialTfliteRequestPlan =
+    blaiToolchainPsramInitialTfliteRequestPlan(
+      noMatchInitialRelationScanPlan, 256, 256, 3, 0, false)
+  let badShapeInitialTfliteRequestPlan =
+    blaiToolchainPsramInitialTfliteRequestPlan(
+      initialRelationScanPlan, -1, 256, 3, 0, false)
+  let inactiveInitialTflitePatchPlan =
+    blaiToolchainPsramInitialTflitePatchPlan(
+      inactiveInitialTfliteRequestPlan, false)
+  let inactiveInitialTflitePatchApplyPlan =
+    blaiToolchainPsramInitialTflitePatchApplyPlan(
+      inactiveInitialTflitePatchPlan)
+  var blockedInitialTflitePatchState =
+    blaiToolchainPsramInitialTflitePatchState(
+      9, 10'u32, 11, true, true, false, true,
+      blaiToolchainPatchMetadataDsp, 12)
+  let blockedInitialTflitePatchStateApplied =
+    blaiApplyToolchainPsramInitialTflitePatchState(
+      blockedInitialTflitePatchState,
+      inactiveInitialTflitePatchApplyPlan)
+  var blockedInitialTflitePatchLayer = 9'i32
+  var blockedInitialTflitePatchCount = 10'u32
+  var blockedInitialTflitePatchOwner = 11'i32
+  let blockedInitialTflitePatchScalarsApplied =
+    blaiApplyToolchainPsramInitialTflitePatchScalars(
+      blockedInitialTflitePatchLayer, blockedInitialTflitePatchCount,
+      blockedInitialTflitePatchOwner,
+      inactiveInitialTflitePatchApplyPlan)
+  let initialTfliteLoopAgainPlan =
+    blaiToolchainPsramInitialTfliteLoopPlan(
+      initialTfliteRequestPlan, 2, BlaiToolchainPsramInitialTfliteLoopSentinel)
+  let initialTfliteLoopAgainEvidence =
+    blaiToolchainPsramInitialTfliteLoopEvidence(
+      initialTfliteRequestPlan, 2,
+      BlaiToolchainPsramInitialTfliteLoopSentinel)
+  var initialTfliteLoopAgainPlanInto:
+    BlaiToolchainPsramInitialTfliteLoopPlan
+  blaiToolchainPsramInitialTfliteLoopPlanInto(
+    initialTfliteRequestPlan, 2,
+    BlaiToolchainPsramInitialTfliteLoopSentinel,
+    initialTfliteLoopAgainPlanInto)
+  let initialTfliteLoopDonePlan =
+    blaiToolchainPsramInitialTfliteLoopPlan(
+      initialTfliteRequestPlan, 2, -2'i32)
+  let invalidInitialTfliteLoopRequestPlan =
+    blaiToolchainPsramInitialTfliteLoopPlan(
+      inactiveInitialTfliteRequestPlan, 2,
+      BlaiToolchainPsramInitialTfliteLoopSentinel)
+  let badCountInitialTfliteLoopPlan =
+    blaiToolchainPsramInitialTfliteLoopPlan(
+      initialTfliteRequestPlan, -1,
+      BlaiToolchainPsramInitialTfliteLoopSentinel)
+  let badSentinelInitialTfliteLoopPlan =
+    blaiToolchainPsramInitialTfliteLoopPlan(
+      initialTfliteRequestPlan, 2, low(int32))
+  let initialTfliteLoopApplyPlan =
+    blaiToolchainPsramInitialTfliteLoopApplyPlan(
+      initialTfliteLoopDonePlan)
+  var initialTfliteLoopApplyPlanInto:
+    BlaiToolchainPsramInitialTfliteLoopApplyPlan
+  blaiToolchainPsramInitialTfliteLoopApplyPlanInto(
+    initialTfliteLoopDonePlan, initialTfliteLoopApplyPlanInto)
+  var initialTfliteLoopSentinel = -2'i32
+  var initialTfliteLoopMembershipFound = false
+  var initialTfliteLoopState =
+    blaiToolchainPsramInitialTfliteLoopState(0, false, false, true, 0)
+  let initialTfliteLoopStateApplied =
+    blaiApplyToolchainPsramInitialTfliteLoopState(
+      initialTfliteLoopState, initialTfliteLoopApplyPlan)
+  let initialTfliteLoopApplied =
+    blaiApplyToolchainPsramInitialTfliteLoop(
+      initialTfliteLoopSentinel, initialTfliteLoopMembershipFound,
+      initialTfliteLoopApplyPlan)
+  let invalidInitialTfliteLoopApplyPlan =
+    blaiToolchainPsramInitialTfliteLoopApplyPlan(
+      invalidInitialTfliteLoopRequestPlan)
+  var blockedInitialTfliteLoopSentinel = -1'i32
+  var blockedInitialTfliteLoopMembershipFound = true
+  var blockedInitialTfliteLoopState =
+    blaiToolchainPsramInitialTfliteLoopState(-9, true, true, false, 16)
+  let invalidInitialTfliteLoopStateApplied =
+    blaiApplyToolchainPsramInitialTfliteLoopState(
+      blockedInitialTfliteLoopState, invalidInitialTfliteLoopApplyPlan)
+  let invalidInitialTfliteLoopApplied =
+    blaiApplyToolchainPsramInitialTfliteLoop(
+      blockedInitialTfliteLoopSentinel,
+      blockedInitialTfliteLoopMembershipFound,
+      invalidInitialTfliteLoopApplyPlan)
+  let initialTfliteJoinPlan =
+    blaiToolchainPsramInitialTfliteJoinPlan(
+      initialInputGateScanPlan, 5'u32,
+      BlaiToolchainPsramInitialTfliteLoopSentinel)
+  let initialTfliteJoinEvidence =
+    blaiToolchainPsramInitialTfliteJoinEvidence(
+      initialInputGateScanPlan, 5'u32,
+      BlaiToolchainPsramInitialTfliteLoopSentinel)
+  var initialTfliteJoinPlanInto:
+    BlaiToolchainPsramInitialTfliteJoinPlan
+  blaiToolchainPsramInitialTfliteJoinPlanInto(
+    initialInputGateScanPlan, 5'u32,
+    BlaiToolchainPsramInitialTfliteLoopSentinel,
+    initialTfliteJoinPlanInto)
+  let secondInitialTfliteJoinPlan =
+    blaiToolchainPsramInitialTfliteJoinPlan(
+      initialInputGateScanPlan, 5'u32, -2'i32)
+  let inactiveInitialTfliteJoinPlan =
+    blaiToolchainPsramInitialTfliteJoinPlan(
+      initialInputGateSwitchPlan, 5'u32,
+      BlaiToolchainPsramInitialTfliteLoopSentinel)
+  let badSentinelInitialTfliteJoinPlan =
+    blaiToolchainPsramInitialTfliteJoinPlan(
+      initialInputGateScanPlan, 5'u32, 0'i32)
+  let shortInitialTfliteJoinPlan =
+    blaiToolchainPsramInitialTfliteJoinPlan(
+      initialInputGateScanPlan, 1'u32, -2'i32)
+  let initialTfliteJoinApplyPlan =
+    blaiToolchainPsramInitialTfliteJoinApplyPlan(initialTfliteJoinPlan)
+  var initialTfliteJoinApplyPlanInto:
+    BlaiToolchainPsramInitialTfliteJoinApplyPlan
+  blaiToolchainPsramInitialTfliteJoinApplyPlanInto(
+    initialTfliteJoinPlan, initialTfliteJoinApplyPlanInto)
+  var initialTfliteJoinSelectedLayer = -1'i32
+  var initialTfliteJoinConsumerLayer = 7'i32
+  var initialTfliteJoinConsumerFound = true
+  let initialTfliteJoinApplied =
+    blaiApplyToolchainPsramInitialTfliteJoin(
+      initialTfliteJoinSelectedLayer, initialTfliteJoinConsumerLayer,
+      initialTfliteJoinConsumerFound, initialTfliteJoinApplyPlan)
+  var initialTfliteJoinState =
+    blaiToolchainPsramInitialTfliteJoinState(
+      -1, 7, true, false, false)
+  let initialTfliteJoinStateApplied =
+    blaiApplyToolchainPsramInitialTfliteJoinState(
+      initialTfliteJoinState, initialTfliteJoinApplyPlan)
+  let invalidInitialTfliteJoinApplyPlan =
+    blaiToolchainPsramInitialTfliteJoinApplyPlan(
+      inactiveInitialTfliteJoinPlan)
+  var blockedInitialTfliteJoinSelectedLayer = -1'i32
+  var blockedInitialTfliteJoinConsumerLayer = 7'i32
+  var blockedInitialTfliteJoinConsumerFound = true
+  let invalidInitialTfliteJoinApplied =
+    blaiApplyToolchainPsramInitialTfliteJoin(
+      blockedInitialTfliteJoinSelectedLayer,
+      blockedInitialTfliteJoinConsumerLayer,
+      blockedInitialTfliteJoinConsumerFound,
+      invalidInitialTfliteJoinApplyPlan)
+  var blockedInitialTfliteJoinState =
+    blaiToolchainPsramInitialTfliteJoinState(
+      -1, 7, true, false, false)
+  let invalidInitialTfliteJoinStateApplied =
+    blaiApplyToolchainPsramInitialTfliteJoinState(
+      blockedInitialTfliteJoinState, invalidInitialTfliteJoinApplyPlan)
+  let initialTfliteJoinRequestPlan =
+    blaiToolchainPsramInitialTfliteJoinRequestPlan(
+      initialTfliteJoinPlan, 256, 256, 3,
+      BlaiToolchainPatchPreviousOwnerType, false)
+  let initialTfliteJoinRequestEvidence =
+    blaiToolchainPsramInitialTfliteJoinRequestEvidence(
+      initialTfliteJoinPlan, 256, 256, 3,
+      BlaiToolchainPatchPreviousOwnerType, false)
+  var initialTfliteJoinRequestPlanInto:
+    BlaiToolchainPsramInitialTfliteJoinRequestPlan
+  blaiToolchainPsramInitialTfliteJoinRequestPlanInto(
+    initialTfliteJoinPlan, 256, 256, 3,
+    BlaiToolchainPatchPreviousOwnerType, false,
+    initialTfliteJoinRequestPlanInto)
+  let badJoinInitialTfliteJoinRequestPlan =
+    blaiToolchainPsramInitialTfliteJoinRequestPlan(
+      badSentinelInitialTfliteJoinPlan, 256, 256, 3,
+      BlaiToolchainPatchPreviousOwnerType, false)
+  let badShapeInitialTfliteJoinRequestPlan =
+    blaiToolchainPsramInitialTfliteJoinRequestPlan(
+      initialTfliteJoinPlan, -1, 256, 3,
+      BlaiToolchainPatchPreviousOwnerType, false)
+  let initialTfliteJoinRequestApplyPlan =
+    blaiToolchainPsramInitialTfliteJoinRequestApplyPlan(
+      initialTfliteJoinRequestPlan)
+  let initialTfliteJoinRequestApplyEvidence =
+    blaiToolchainPsramInitialTfliteJoinRequestApplyEvidence(
+      initialTfliteJoinRequestPlan)
+  var initialTfliteJoinRequestApplyPlanInto:
+    BlaiToolchainPsramInitialTfliteJoinRequestApplyPlan
+  blaiToolchainPsramInitialTfliteJoinRequestApplyPlanInto(
+    initialTfliteJoinRequestPlan, initialTfliteJoinRequestApplyPlanInto)
+  var initialTfliteJoinRequestState =
+    blaiToolchainPsramInitialTfliteJoinRequestState(
+      -1, 7, true, 1, 2, 3, 4, 5, 6, 7, 8, 9, false, false)
+  let initialTfliteJoinRequestStateApplied =
+    blaiApplyToolchainPsramInitialTfliteJoinRequestState(
+      initialTfliteJoinRequestState, initialTfliteJoinRequestApplyPlan)
+  var initialTfliteJoinRequestSelectedLayer = -1'i32
+  var initialTfliteJoinRequestConsumerLayer = 7'i32
+  var initialTfliteJoinRequestConsumerFound = true
+  var initialTfliteJoinRequestPatchCount = 9'u32
+  var initialTfliteJoinRequestPreviousOwner = false
+  var initialTfliteJoinRequestPath = false
+  let initialTfliteJoinRequestScalarsApplied =
+    blaiApplyToolchainPsramInitialTfliteJoinRequestScalars(
+      initialTfliteJoinRequestSelectedLayer,
+      initialTfliteJoinRequestConsumerLayer,
+      initialTfliteJoinRequestConsumerFound,
+      initialTfliteJoinRequestPatchCount,
+      initialTfliteJoinRequestPreviousOwner,
+      initialTfliteJoinRequestPath,
+      initialTfliteJoinRequestApplyPlan)
+  var initialTfliteJoinRequestSummaryLayer = -1'i32
+  var initialTfliteJoinRequestSummaryConsumer = 7'i32
+  var initialTfliteJoinRequestSummaryFound = true
+  var initialTfliteJoinRequestSummaryFactorAOffset = 1'u32
+  var initialTfliteJoinRequestSummaryFactorBOffset = 2'u32
+  var initialTfliteJoinRequestSummaryCountOffset = 3'u32
+  var initialTfliteJoinRequestSummaryFactorA = 4'i32
+  var initialTfliteJoinRequestSummaryFactorB = 5'i32
+  var initialTfliteJoinRequestSummaryCountToSelect = 6'i32
+  var initialTfliteJoinRequestSummarySelectedCount = 7'u32
+  var initialTfliteJoinRequestSummaryNextLayerType = 8'i32
+  var initialTfliteJoinRequestSummaryPatchCount = 9'u32
+  var initialTfliteJoinRequestSummaryPreviousOwner = false
+  var initialTfliteJoinRequestSummaryPath = false
+  let initialTfliteJoinRequestSummaryApplied =
+    blaiApplyToolchainPsramInitialTfliteJoinRequestSummaryScalars(
+      initialTfliteJoinRequestSummaryLayer,
+      initialTfliteJoinRequestSummaryConsumer,
+      initialTfliteJoinRequestSummaryFound,
+      initialTfliteJoinRequestSummaryFactorAOffset,
+      initialTfliteJoinRequestSummaryFactorBOffset,
+      initialTfliteJoinRequestSummaryCountOffset,
+      initialTfliteJoinRequestSummaryFactorA,
+      initialTfliteJoinRequestSummaryFactorB,
+      initialTfliteJoinRequestSummaryCountToSelect,
+      initialTfliteJoinRequestSummarySelectedCount,
+      initialTfliteJoinRequestSummaryNextLayerType,
+      initialTfliteJoinRequestSummaryPatchCount,
+      initialTfliteJoinRequestSummaryPreviousOwner,
+      initialTfliteJoinRequestSummaryPath,
+      initialTfliteJoinRequestApplyPlan)
+  let invalidInitialTfliteJoinRequestApplyPlan =
+    blaiToolchainPsramInitialTfliteJoinRequestApplyPlan(
+      badJoinInitialTfliteJoinRequestPlan)
+  var blockedInitialTfliteJoinRequestState =
+    blaiToolchainPsramInitialTfliteJoinRequestState(
+      -1, 7, true, 1, 2, 3, 4, 5, 6, 7, 8, 9, false, false)
+  let invalidInitialTfliteJoinRequestStateApplied =
+    blaiApplyToolchainPsramInitialTfliteJoinRequestState(
+      blockedInitialTfliteJoinRequestState,
+      invalidInitialTfliteJoinRequestApplyPlan)
+  var blockedInitialTfliteJoinRequestSelectedLayer = -1'i32
+  var blockedInitialTfliteJoinRequestConsumerLayer = 7'i32
+  var blockedInitialTfliteJoinRequestConsumerFound = true
+  var blockedInitialTfliteJoinRequestPatchCount = 9'u32
+  var blockedInitialTfliteJoinRequestPreviousOwner = false
+  var blockedInitialTfliteJoinRequestPath = false
+  let invalidInitialTfliteJoinRequestScalarsApplied =
+    blaiApplyToolchainPsramInitialTfliteJoinRequestScalars(
+      blockedInitialTfliteJoinRequestSelectedLayer,
+      blockedInitialTfliteJoinRequestConsumerLayer,
+      blockedInitialTfliteJoinRequestConsumerFound,
+      blockedInitialTfliteJoinRequestPatchCount,
+      blockedInitialTfliteJoinRequestPreviousOwner,
+      blockedInitialTfliteJoinRequestPath,
+      invalidInitialTfliteJoinRequestApplyPlan)
+  var transitionBitmap = [true, true, true, true]
+  var transitionOwners = [3'i32, 3, 7, 3]
+  let routeTransfer = blaiToolchainPsramOwnerTransitionPlan(
+    transitionOwners, 0'u32, 3, 4, blaiConvolutional, blaiRoute, 9, false)
+  let routeTransferApplyPlan =
+    blaiToolchainPsramOwnerTransitionApplyPlan(
+      routeTransfer, transitionBitmap, transitionOwners)
+  let routeTransferApplyEvidence =
+    blaiToolchainPsramOwnerTransitionApplyEvidence(
+      routeTransfer, transitionBitmap, transitionOwners)
+  let routeTransferred = blaiApplyToolchainPsramOwnerTransition(
+    transitionBitmap, transitionOwners, routeTransfer)
+  let releaseTransition = blaiToolchainPsramOwnerTransitionPlan(
+    transitionOwners, 1'u32, 3, 4, blaiConvolutional, blaiMaxpool, 9, false)
+  let releaseTransitionApplyPlan =
+    blaiToolchainPsramOwnerTransitionApplyPlan(
+      releaseTransition, transitionBitmap, transitionOwners)
+  let releasedTransition = blaiApplyToolchainPsramOwnerTransition(
+    transitionBitmap, transitionOwners, releaseTransition)
+  let ignoredTransition = blaiToolchainPsramOwnerTransitionPlan(
+    transitionOwners, 2'u32, 3, 4, blaiConvolutional, blaiRoute, 9, false)
+  let ignoredTransitionApplyPlan =
+    blaiToolchainPsramOwnerTransitionApplyPlan(
+      ignoredTransition, transitionBitmap, transitionOwners)
+  let missingStartTransfer = blaiToolchainPsramOwnerTransitionPlan(
+    transitionOwners, 3'u32, 3, 4, blaiMaxpool, blaiAvgpool, -1, false)
+  var blockedTransitionBitmap = [true]
+  var blockedTransitionOwners = [3'i32]
+  var noTransitionOwners: array[0, int32]
+  let blockedTransitionPlan = blaiToolchainPsramOwnerTransitionPlan(
+    blockedTransitionOwners, 0'u32, 3, 4, blaiConvolutional, blaiRoute,
+    9, false)
+  let blockedTransitionApplyPlan =
+    blaiToolchainPsramOwnerTransitionApplyPlan(
+      blockedTransitionPlan, blockedTransitionBitmap, noTransitionOwners)
+  let blockedTransitionApplied =
+    blaiApplyToolchainPsramOwnerTransitionState(
+      blockedTransitionBitmap, blockedTransitionOwners,
+      blockedTransitionApplyPlan)
+  var cleanupBitmap = [true, true, true, true, true]
+  var cleanupOwners = [3'i32, 3, 3, 7, 3]
+  let cleanupConvRoute = blaiToolchainPsramOwnerCleanupPlan(
+    cleanupOwners, 0'u32, 3, 4, BlaiToolchainPsramOwnerConvType,
+    BlaiToolchainPsramOwnerRouteType, 9, false)
+  var cleanupConvRouteInto: BlaiToolchainPsramOwnerCleanupPlan
+  blaiToolchainPsramOwnerCleanupPlanInto(
+    cleanupOwners, 0'u32, 3, 4, BlaiToolchainPsramOwnerConvType,
+    BlaiToolchainPsramOwnerRouteType, 9, false, cleanupConvRouteInto)
+  let cleanupConvRouteApplyPlan =
+    blaiToolchainPsramOwnerCleanupApplyPlan(
+      cleanupConvRoute, cleanupBitmap, cleanupOwners)
+  let cleanupConvRouteApplyEvidence =
+    blaiToolchainPsramOwnerCleanupApplyEvidence(
+      cleanupConvRoute, cleanupBitmap, cleanupOwners)
+  let cleanupConvRouteApplied = blaiApplyToolchainPsramOwnerCleanup(
+    cleanupBitmap, cleanupOwners, cleanupConvRoute)
+  let cleanupRouteDebug = blaiToolchainPsramOwnerCleanupPlan(
+    cleanupOwners, 1'u32, 3, 4, BlaiToolchainPsramRelationRouteType,
+    ord(blaiMaxpool).int32, 9, true)
+  let cleanupRelease = blaiToolchainPsramOwnerCleanupPlan(
+    cleanupOwners, 2'u32, 3, 4, BlaiToolchainPsramRelationRouteType,
+    ord(blaiMaxpool).int32, 9, false)
+  let cleanupReleaseApplyPlan =
+    blaiToolchainPsramOwnerCleanupApplyPlan(
+      cleanupRelease, cleanupBitmap, cleanupOwners)
+  let cleanupReleased = blaiApplyToolchainPsramOwnerCleanup(
+    cleanupBitmap, cleanupOwners, cleanupRelease)
+  let cleanupIgnore = blaiToolchainPsramOwnerCleanupPlan(
+    cleanupOwners, 3'u32, 3, 4, BlaiToolchainPsramOwnerConvType,
+    BlaiToolchainPsramOwnerRouteType, 9, false)
+  let cleanupIgnoreApplyPlan =
+    blaiToolchainPsramOwnerCleanupApplyPlan(
+      cleanupIgnore, cleanupBitmap, cleanupOwners)
+  var blockedCleanupBitmap = [true]
+  var blockedCleanupOwners = [3'i32]
+  var noCleanupOwners: array[0, int32]
+  let blockedCleanupPlan = blaiToolchainPsramOwnerCleanupPlan(
+    blockedCleanupOwners, 0'u32, 3, 4,
+    BlaiToolchainPsramOwnerConvType, BlaiToolchainPsramOwnerRouteType,
+    9, false)
+  let blockedCleanupApplyPlan =
+    blaiToolchainPsramOwnerCleanupApplyPlan(
+      blockedCleanupPlan, blockedCleanupBitmap, noCleanupOwners)
+  let blockedCleanupApplied =
+    blaiApplyToolchainPsramOwnerCleanupState(
+      blockedCleanupBitmap, blockedCleanupOwners, blockedCleanupApplyPlan)
+  var cleanupSweepTransferOwners:
+    array[BlaiToolchainMaxPsramPatchSlotsInt, int32]
+  var cleanupSweepTransferBitmap:
+    array[BlaiToolchainMaxPsramPatchSlotsInt, bool]
+  for slot in 0 ..< BlaiToolchainMaxPsramPatchSlotsInt:
+    cleanupSweepTransferOwners[slot] = 7
+    cleanupSweepTransferBitmap[slot] = true
+  cleanupSweepTransferOwners[0] = 3
+  cleanupSweepTransferOwners[1] = 3
+  cleanupSweepTransferOwners[2] = 3
+  let cleanupSweepTransfer = blaiToolchainPsramOwnerCleanupSweepPlan(
+    cleanupSweepTransferOwners, 3, 4, BlaiToolchainPsramOwnerConvType,
+    BlaiToolchainPsramOwnerRouteType, 9, false)
+  var cleanupSweepTransferInto: BlaiToolchainPsramOwnerCleanupSweepPlan
+  blaiToolchainPsramOwnerCleanupSweepPlanInto(
+    cleanupSweepTransferOwners, 3, 4, BlaiToolchainPsramOwnerConvType,
+    BlaiToolchainPsramOwnerRouteType, 9, false, cleanupSweepTransferInto)
+  let cleanupSweepTransferApplyPlan =
+    blaiToolchainPsramOwnerCleanupSweepApplyPlan(
+      cleanupSweepTransfer, cleanupSweepTransferBitmap,
+      cleanupSweepTransferOwners)
+  let cleanupSweepTransferApplyEvidence =
+    blaiToolchainPsramOwnerCleanupSweepApplyEvidence(
+      cleanupSweepTransfer, cleanupSweepTransferBitmap,
+      cleanupSweepTransferOwners)
+  let cleanupSweepTransferred = blaiApplyToolchainPsramOwnerCleanupSweep(
+    cleanupSweepTransferBitmap, cleanupSweepTransferOwners,
+    cleanupSweepTransfer)
+  var cleanupSweepReleaseOwners:
+    array[BlaiToolchainMaxPsramPatchSlotsInt, int32]
+  var cleanupSweepReleaseBitmap:
+    array[BlaiToolchainMaxPsramPatchSlotsInt, bool]
+  for slot in 0 ..< BlaiToolchainMaxPsramPatchSlotsInt:
+    cleanupSweepReleaseOwners[slot] = 7
+    cleanupSweepReleaseBitmap[slot] = true
+  cleanupSweepReleaseOwners[0] = 3
+  cleanupSweepReleaseOwners[1] = 3
+  let cleanupSweepRelease = blaiToolchainPsramOwnerCleanupSweepPlan(
+    cleanupSweepReleaseOwners, 3, 4, BlaiToolchainPsramRelationRouteType,
+    ord(blaiMaxpool).int32, 9, false)
+  let cleanupSweepReleaseApplyPlan =
+    blaiToolchainPsramOwnerCleanupSweepApplyPlan(
+      cleanupSweepRelease, cleanupSweepReleaseBitmap,
+      cleanupSweepReleaseOwners)
+  let cleanupSweepReleased = blaiApplyToolchainPsramOwnerCleanupSweep(
+    cleanupSweepReleaseBitmap, cleanupSweepReleaseOwners, cleanupSweepRelease)
+  let cleanupSweepBlocked = blaiToolchainPsramOwnerCleanupSweepPlan(
+    cleanupOwners, 3, 4, BlaiToolchainPsramOwnerConvType,
+    BlaiToolchainPsramOwnerRouteType, 9, false)
+  var shortCleanupSweepBitmap: array[1, bool]
+  var fullCleanupSweepOwners:
+    array[BlaiToolchainMaxPsramPatchSlotsInt, int32]
+  for slot in 0 ..< BlaiToolchainMaxPsramPatchSlotsInt:
+    fullCleanupSweepOwners[slot] = 3
+  shortCleanupSweepBitmap[0] = true
+  let shortCleanupSweep = blaiToolchainPsramOwnerCleanupSweepPlan(
+    fullCleanupSweepOwners, 3, 4, BlaiToolchainPsramOwnerConvType,
+    BlaiToolchainPsramOwnerRouteType, 9, false)
+  let shortCleanupSweepApplyPlan =
+    blaiToolchainPsramOwnerCleanupSweepApplyPlan(
+      shortCleanupSweep, shortCleanupSweepBitmap, fullCleanupSweepOwners)
+  let shortCleanupSweepApplied =
+    blaiApplyToolchainPsramOwnerCleanupSweep(
+      shortCleanupSweepBitmap, fullCleanupSweepOwners, shortCleanupSweep)
+  let cleanupEntry = blaiToolchainPsramCleanupEntryPlan(3, false)
+  var cleanupEntryInto: BlaiToolchainPsramCleanupEntryPlan
+  blaiToolchainPsramCleanupEntryPlanInto(
+    3, false, BlaiToolchainMaxPsramPatchSlots.int32, cleanupEntryInto)
+  let cleanupEntryDebug = blaiToolchainPsramCleanupEntryPlan(3, true)
+  let cleanupEntryEmpty =
+    blaiToolchainPsramCleanupEntryPlan(3, false, 0)
+  let cleanupEntryBadLayer =
+    blaiToolchainPsramCleanupEntryPlan(-1, false)
+  let cleanupEntryBadSlots =
+    blaiToolchainPsramCleanupEntryPlan(3, false, -1)
+  let cleanupEntryApplyPlan =
+    blaiToolchainPsramCleanupEntryApplyPlan(cleanupEntryDebug)
+  let cleanupEntryApplyEvidence =
+    blaiToolchainPsramCleanupEntryApplyEvidence(cleanupEntryDebug)
+  var cleanupEntryApplyPlanInto: BlaiToolchainPsramCleanupEntryApplyPlan
+  blaiToolchainPsramCleanupEntryApplyPlanInto(
+    cleanupEntryDebug, cleanupEntryApplyPlanInto)
+  var cleanupEntryNextLayer = -1'i32
+  var cleanupEntrySlot = 9'u32
+  var cleanupEntrySavedDebug = false
+  let cleanupEntryApplied = blaiApplyToolchainPsramCleanupEntry(
+    cleanupEntryNextLayer, cleanupEntrySlot, cleanupEntrySavedDebug,
+    cleanupEntryApplyPlan)
+  var cleanupEntryState =
+    blaiToolchainPsramCleanupEntryState(-1, 9'u32, false, false, false, true)
+  let cleanupEntryStateApplied =
+    blaiApplyToolchainPsramCleanupEntryState(
+      cleanupEntryState, cleanupEntryApplyPlan)
+  let invalidCleanupEntryApplyPlan =
+    blaiToolchainPsramCleanupEntryApplyPlan(cleanupEntryBadLayer)
+  var blockedCleanupEntryNextLayer = -1'i32
+  var blockedCleanupEntrySlot = 9'u32
+  var blockedCleanupEntrySavedDebug = true
+  let invalidCleanupEntryApplied = blaiApplyToolchainPsramCleanupEntry(
+    blockedCleanupEntryNextLayer, blockedCleanupEntrySlot,
+    blockedCleanupEntrySavedDebug, invalidCleanupEntryApplyPlan)
+  var blockedCleanupEntryState =
+    blaiToolchainPsramCleanupEntryState(-1, 9'u32, true, true, true, false)
+  let invalidCleanupEntryStateApplied =
+    blaiApplyToolchainPsramCleanupEntryState(
+      blockedCleanupEntryState, invalidCleanupEntryApplyPlan)
+  var postSearchSlotValues = [3'i32, 3, 7]
+  var postSearchOccupied = [true, true, true]
+  let postSearchRetainPlan = blaiToolchainPsramPostSearchSlotPlan(
+    postSearchSlotValues, 0'u32, 3, BlaiToolchainPsramOwnerConvType,
+    BlaiToolchainPsramOwnerRouteType, 9, false, 4)
+  var postSearchRetainPlanInto: BlaiToolchainPsramPostSearchSlotPlan
+  blaiToolchainPsramPostSearchSlotPlanInto(
+    postSearchSlotValues, 0'u32, 3, BlaiToolchainPsramOwnerConvType,
+    BlaiToolchainPsramOwnerRouteType, 9, false, 4,
+    postSearchRetainPlanInto)
+  let postSearchRetainApplyPlan =
+    blaiToolchainPsramPostSearchSlotApplyPlan(postSearchRetainPlan)
+  let postSearchRetainApplyEvidence =
+    blaiToolchainPsramPostSearchSlotApplyEvidence(postSearchRetainPlan)
+  var postSearchRetainApplyPlanInto:
+    BlaiToolchainPsramPostSearchSlotApplyPlan
+  blaiToolchainPsramPostSearchSlotApplyPlanInto(
+    postSearchRetainPlan, postSearchRetainApplyPlanInto)
+  var postSearchRetainState =
+    blaiToolchainPsramPostSearchSlotState(
+      9'u32, blaiToolchainPsramPostSearchSlotIgnore, -1, -1, false, -1)
+  let postSearchRetainStateApplied =
+    blaiApplyToolchainPsramPostSearchSlotState(
+      postSearchRetainState, postSearchRetainApplyPlan)
+  let postSearchRetained = blaiApplyToolchainPsramPostSearchSlot(
+    postSearchOccupied, postSearchSlotValues, postSearchRetainPlan)
+  let postSearchReleasePlan = blaiToolchainPsramPostSearchSlotPlan(
+    postSearchSlotValues, 1'u32, 3, BlaiToolchainPsramRelationRouteType,
+    ord(blaiMaxpool).int32, 9, false, 4)
+  let postSearchReleased = blaiApplyToolchainPsramPostSearchSlot(
+    postSearchOccupied, postSearchSlotValues, postSearchReleasePlan)
+  let postSearchIgnorePlan = blaiToolchainPsramPostSearchSlotPlan(
+    postSearchSlotValues, 2'u32, 3, BlaiToolchainPsramOwnerConvType,
+    BlaiToolchainPsramOwnerRouteType, 9, false, 4)
+  let postSearchBlockedPlan = blaiToolchainPsramPostSearchSlotPlan(
+    postSearchSlotValues, 0'u32, -1, BlaiToolchainPsramOwnerConvType,
+    BlaiToolchainPsramOwnerRouteType, 9, false, 4)
+  let postSearchBlockedApplyPlan =
+    blaiToolchainPsramPostSearchSlotApplyPlan(postSearchBlockedPlan)
+  var postSearchBlockedState =
+    blaiToolchainPsramPostSearchSlotState(
+      7'u32, blaiToolchainPsramPostSearchSlotRelease, 3, 4, false, 5)
+  let postSearchBlockedStateApplied =
+    blaiApplyToolchainPsramPostSearchSlotState(
+      postSearchBlockedState, postSearchBlockedApplyPlan)
+  let cleanupDebugSlotPlan =
+    blaiToolchainPsramCleanupDebugSlotPlan(postSearchOccupied, 1'u32, true)
+  var cleanupDebugSlotPlanInto: BlaiToolchainPsramCleanupDebugSlotPlan
+  blaiToolchainPsramCleanupDebugSlotPlanInto(
+    postSearchOccupied, 1'u32, true, cleanupDebugSlotPlanInto)
+  let quietCleanupDebugSlotPlan =
+    blaiToolchainPsramCleanupDebugSlotPlan([], 9'u32, false)
+  let blockedCleanupDebugSlotPlan =
+    blaiToolchainPsramCleanupDebugSlotPlan(postSearchOccupied, 9'u32, true)
+  let cleanupDebugSlotApplyPlan =
+    blaiToolchainPsramCleanupDebugSlotApplyPlan(cleanupDebugSlotPlan)
+  let cleanupDebugSlotApplyEvidence =
+    blaiToolchainPsramCleanupDebugSlotApplyEvidence(cleanupDebugSlotPlan)
+  var cleanupDebugSlotApplyPlanInto:
+    BlaiToolchainPsramCleanupDebugSlotApplyPlan
+  blaiToolchainPsramCleanupDebugSlotApplyPlanInto(
+    cleanupDebugSlotPlan, cleanupDebugSlotApplyPlanInto)
+  var cleanupDebugSlotState =
+    blaiToolchainPsramCleanupDebugSlotState(99'u32, true)
+  let cleanupDebugSlotApplied =
+    blaiApplyToolchainPsramCleanupDebugSlot(
+      cleanupDebugSlotState, cleanupDebugSlotApplyPlan)
+  let quietCleanupDebugSlotApplyPlan =
+    blaiToolchainPsramCleanupDebugSlotApplyPlan(quietCleanupDebugSlotPlan)
+  let quietCleanupDebugSlotApplyEvidence =
+    blaiToolchainPsramCleanupDebugSlotApplyEvidence(quietCleanupDebugSlotPlan)
+  var quietCleanupDebugSlotState =
+    blaiToolchainPsramCleanupDebugSlotState(7'u32, true)
+  let quietCleanupDebugSlotApplied =
+    blaiApplyToolchainPsramCleanupDebugSlot(
+      quietCleanupDebugSlotState, quietCleanupDebugSlotApplyPlan)
+  let blockedCleanupDebugSlotApplyPlan =
+    blaiToolchainPsramCleanupDebugSlotApplyPlan(blockedCleanupDebugSlotPlan)
+  let blockedCleanupDebugSlotApplyEvidence =
+    blaiToolchainPsramCleanupDebugSlotApplyEvidence(blockedCleanupDebugSlotPlan)
+  var blockedCleanupDebugSlotState =
+    blaiToolchainPsramCleanupDebugSlotState(11'u32, true)
+  let blockedCleanupDebugSlotApplied =
+    blaiApplyToolchainPsramCleanupDebugSlot(
+      blockedCleanupDebugSlotState, blockedCleanupDebugSlotApplyPlan)
+  let metadataDiscardPlan = blaiToolchainPsramMetadataDiscardPlan(
+    3, BlaiToolchainPsramMetadataDiscardInputCount,
+    BlaiToolchainPsramOwnerRouteType,
+    BlaiToolchainPsramMetadataDiscardFieldValue,
+    BlaiToolchainPsramMetadataDiscardFieldValue,
+    false, 7, 2)
+  var metadataDiscardPlanInto: BlaiToolchainPsramMetadataDiscardPlan
+  blaiToolchainPsramMetadataDiscardPlanInto(
+    3, BlaiToolchainPsramMetadataDiscardInputCount,
+    BlaiToolchainPsramOwnerRouteType,
+    BlaiToolchainPsramMetadataDiscardFieldValue,
+    BlaiToolchainPsramMetadataDiscardFieldValue,
+    false, 7, 2, metadataDiscardPlanInto)
+  let metadataDiscardApplyPlan =
+    blaiToolchainPsramMetadataDiscardApplyPlan(metadataDiscardPlan)
+  var metadataDiscardApplyPlanInto:
+    BlaiToolchainPsramMetadataDiscardApplyPlan
+  blaiToolchainPsramMetadataDiscardApplyPlanInto(
+    metadataDiscardPlan, metadataDiscardApplyPlanInto)
+  var metadataDiscardState =
+    blaiToolchainPsramMetadataDiscardState(
+      -1, 0'u32, 0'u32, false, 7, 2)
+  let metadataDiscardStateApplied =
+    blaiApplyToolchainPsramMetadataDiscardState(
+      metadataDiscardState, metadataDiscardApplyPlan)
+  var metadataDiscardStart = 7'i32
+  var metadataDiscardCount = 2'i32
+  let metadataDiscardApplied = blaiApplyToolchainPsramMetadataDiscard(
+    metadataDiscardStart, metadataDiscardCount, metadataDiscardPlan)
+  var metadataDiscardStartSlots = [-1'i32, -1, -1, 7]
+  var metadataDiscardCounts = [-1'i32, -1, -1, 2]
+  let metadataDiscardBanksApplied =
+    blaiApplyToolchainPsramMetadataDiscardBanks(
+      metadataDiscardStartSlots, metadataDiscardCounts, metadataDiscardPlan)
+  var metadataDiscardShortStartSlots = [-1'i32, -1, -1, 7]
+  var metadataDiscardShortCounts: array[0, int32]
+  let metadataDiscardShortBanksApplied =
+    blaiApplyToolchainPsramMetadataDiscardBanks(
+      metadataDiscardShortStartSlots, metadataDiscardShortCounts,
+      metadataDiscardPlan)
+  let metadataConsumerPreservePlan = blaiToolchainPsramMetadataDiscardPlan(
+    3, BlaiToolchainPsramMetadataDiscardInputCount,
+    BlaiToolchainPsramOwnerRouteType,
+    BlaiToolchainPsramMetadataDiscardFieldValue,
+    BlaiToolchainPsramMetadataDiscardFieldValue,
+    true, 7, 2)
+  let metadataFieldPreservePlan = blaiToolchainPsramMetadataDiscardPlan(
+    3, BlaiToolchainPsramMetadataDiscardInputCount,
+    BlaiToolchainPsramOwnerRouteType,
+    BlaiToolchainPsramMetadataDiscardFieldValue,
+    1, false, 7, 2)
+  let metadataDiscardBadLayerPlan = blaiToolchainPsramMetadataDiscardPlan(
+    -1, BlaiToolchainPsramMetadataDiscardInputCount,
+    BlaiToolchainPsramOwnerRouteType,
+    BlaiToolchainPsramMetadataDiscardFieldValue,
+    BlaiToolchainPsramMetadataDiscardFieldValue,
+    false, 7, 2)
+  let metadataDiscardBadLayerApplyPlan =
+    blaiToolchainPsramMetadataDiscardApplyPlan(metadataDiscardBadLayerPlan)
+  var metadataDiscardBlockedState =
+    blaiToolchainPsramMetadataDiscardState(
+      9, 11'u32, 12'u32, true, 13, 14)
+  let metadataDiscardBlockedStateApplied =
+    blaiApplyToolchainPsramMetadataDiscardState(
+      metadataDiscardBlockedState, metadataDiscardBadLayerApplyPlan)
+  let fallbackGatePlan = blaiToolchainPsramFallbackGatePlan(
+    BlaiToolchainPsramOwnerConvType, 2)
+  var fallbackGatePlanInto: BlaiToolchainPsramFallbackGatePlan
+  blaiToolchainPsramFallbackGatePlanInto(
+    BlaiToolchainPsramOwnerConvType, 2, fallbackGatePlanInto)
+  let fallbackRouteBlockedPlan = blaiToolchainPsramFallbackGatePlan(
+    BlaiToolchainPsramOwnerRouteType, 2)
+  let fallbackRelationBlockedPlan = blaiToolchainPsramFallbackGatePlan(
+    BlaiToolchainPsramRelationRouteType, 2)
+  let fallbackSpecialBlockedPlan = blaiToolchainPsramFallbackGatePlan(
+    BlaiToolchainPsramFallbackExcludedType, 2)
+  let fallbackInputCountBlockedPlan = blaiToolchainPsramFallbackGatePlan(
+    BlaiToolchainPsramOwnerConvType, 3)
+  let fallbackBadShapePlan = blaiToolchainPsramFallbackGatePlan(
+    BlaiToolchainPsramOwnerConvType, -1)
+  let unassignedMetadataPlan = blaiToolchainPsramUnassignedMetadataPlan(
+    3, false, true, 0, 4, 7, 2)
+  var unassignedMetadataPlanInto: BlaiToolchainPsramUnassignedMetadataPlan
+  blaiToolchainPsramUnassignedMetadataPlanInto(
+    3, false, true, 0, 4, 7, 2, unassignedMetadataPlanInto)
+  let unassignedMetadataApplyPlan =
+    blaiToolchainPsramUnassignedMetadataApplyPlan(unassignedMetadataPlan)
+  var unassignedMetadataApplyPlanInto:
+    BlaiToolchainPsramUnassignedMetadataApplyPlan
+  blaiToolchainPsramUnassignedMetadataApplyPlanInto(
+    unassignedMetadataPlan, unassignedMetadataApplyPlanInto)
+  var unassignedMetadataState =
+    blaiToolchainPsramUnassignedMetadataState(
+      -1, 0'u32, 0'u32, -1, false, 7, 2, 0)
+  let unassignedMetadataStateApplied =
+    blaiApplyToolchainPsramUnassignedMetadataState(
+      unassignedMetadataState, unassignedMetadataApplyPlan)
+  var unassignedStart = 7'i32
+  var unassignedCount = 2'i32
+  let unassignedApplied = blaiApplyToolchainPsramUnassignedMetadata(
+    unassignedStart, unassignedCount, unassignedMetadataPlan)
+  var unassignedStartSlots = [-1'i32, -1, -1, -1]
+  var unassignedCounts = [-1'i32, -1, -1, -1]
+  let unassignedBanksApplied =
+    blaiApplyToolchainPsramUnassignedMetadataBanks(
+      unassignedStartSlots, unassignedCounts, unassignedMetadataPlan)
+  var unassignedShortStartSlots = [-1'i32, -1, -1, -1]
+  var unassignedShortCounts: array[0, int32]
+  let unassignedShortBanksApplied =
+    blaiApplyToolchainPsramUnassignedMetadataBanks(
+      unassignedShortStartSlots, unassignedShortCounts,
+      unassignedMetadataPlan)
+  let unassignedPreservePlan = blaiToolchainPsramUnassignedMetadataPlan(
+    3, true, true, 0, 4, 7, 2)
+  let unassignedBadLayerPlan = blaiToolchainPsramUnassignedMetadataPlan(
+    -1, false, true, 0, 4, 7, 2)
+  let unassignedBadLayerApplyPlan =
+    blaiToolchainPsramUnassignedMetadataApplyPlan(unassignedBadLayerPlan)
+  var unassignedBlockedState =
+    blaiToolchainPsramUnassignedMetadataState(
+      8, 9'u32, 10'u32, 11, true, 12, 13, 14)
+  let unassignedBlockedStateApplied =
+    blaiApplyToolchainPsramUnassignedMetadataState(
+      unassignedBlockedState, unassignedBadLayerApplyPlan)
+  let fallbackMetadataUnassignedPlan =
+    blaiToolchainPsramFallbackMetadataPlan(
+      3, BlaiToolchainPsramOwnerConvType, false, true, 5, 7, 2)
+  var fallbackMetadataUnassignedInto:
+    BlaiToolchainPsramFallbackMetadataPlan
+  blaiToolchainPsramFallbackMetadataPlanInto(
+    3, BlaiToolchainPsramOwnerConvType, false, true, 5, 7, 2,
+    fallbackMetadataUnassignedInto)
+  let fallbackMetadataUnassignedApplyPlan =
+    blaiToolchainPsramFallbackMetadataApplyPlan(
+      fallbackMetadataUnassignedPlan)
+  var fallbackMetadataUnassignedApplyPlanInto:
+    BlaiToolchainPsramFallbackMetadataApplyPlan
+  blaiToolchainPsramFallbackMetadataApplyPlanInto(
+    fallbackMetadataUnassignedPlan, fallbackMetadataUnassignedApplyPlanInto)
+  var fallbackMetadataState =
+    blaiToolchainPsramFallbackMetadataState(
+      -1, 0'u32, 0'u32, blaiToolchainPsramFallbackMetadataPreserve,
+      -1, 7, 2, 0)
+  let fallbackMetadataStateApplied =
+    blaiApplyToolchainPsramFallbackMetadataState(
+      fallbackMetadataState, fallbackMetadataUnassignedApplyPlan)
+  var fallbackMetadataStart = 7'i32
+  var fallbackMetadataCount = 2'i32
+  let fallbackMetadataApplied = blaiApplyToolchainPsramFallbackMetadata(
+    fallbackMetadataStart, fallbackMetadataCount,
+    fallbackMetadataUnassignedPlan)
+  var fallbackMetadataStartSlots = [-1'i32, -1, -1, -1]
+  var fallbackMetadataCounts = [-1'i32, -1, -1, -1]
+  let fallbackMetadataBanksApplied =
+    blaiApplyToolchainPsramFallbackMetadataBanks(
+      fallbackMetadataStartSlots, fallbackMetadataCounts,
+      fallbackMetadataUnassignedPlan)
+  var fallbackMetadataShortStartSlots = [-1'i32, -1, -1, -1]
+  var fallbackMetadataShortCounts: array[0, int32]
+  let fallbackMetadataShortBanksApplied =
+    blaiApplyToolchainPsramFallbackMetadataBanks(
+      fallbackMetadataShortStartSlots, fallbackMetadataShortCounts,
+      fallbackMetadataUnassignedPlan)
+  let fallbackMetadataClearPlan = blaiToolchainPsramFallbackMetadataPlan(
+    3, BlaiToolchainPsramOwnerRouteType, false, true, 5, 7, 2)
+  let fallbackMetadataConsumerPreservePlan =
+    blaiToolchainPsramFallbackMetadataPlan(
+      3, BlaiToolchainPsramOwnerConvType, true, true, 5, 7, 2)
+  let fallbackMetadataGatePreservePlan =
+    blaiToolchainPsramFallbackMetadataPlan(
+      3, BlaiToolchainPsramOwnerConvType, false, false, 5, 7, 2)
+  let fallbackMetadataBadLayerPlan =
+    blaiToolchainPsramFallbackMetadataPlan(
+      -1, BlaiToolchainPsramOwnerConvType, false, true, 5, 7, 2)
+  let fallbackMetadataClearApplyPlan =
+    blaiToolchainPsramFallbackMetadataApplyPlan(fallbackMetadataClearPlan)
+  let fallbackMetadataBadLayerApplyPlan =
+    blaiToolchainPsramFallbackMetadataApplyPlan(
+      fallbackMetadataBadLayerPlan)
+  var fallbackMetadataBlockedState =
+    blaiToolchainPsramFallbackMetadataState(
+      8, 9'u32, 10'u32, blaiToolchainPsramFallbackMetadataClearInvalid,
+      11, 12, 13, 14)
+  let fallbackMetadataBlockedStateApplied =
+    blaiApplyToolchainPsramFallbackMetadataState(
+      fallbackMetadataBlockedState, fallbackMetadataBadLayerApplyPlan)
+  let splitMetadataPlan = blaiToolchainPsramSplitMetadataPlan(
+    3, 4, 12, 7)
+  var splitMetadataPlanInto: BlaiToolchainPsramSplitMetadataPlan
+  blaiToolchainPsramSplitMetadataPlanInto(
+    3, 4, 12, 7, splitMetadataPlanInto)
+  let splitMetadataApplyPlan =
+    blaiToolchainPsramSplitMetadataApplyPlan(splitMetadataPlan)
+  var splitMetadataApplyPlanInto:
+    BlaiToolchainPsramSplitMetadataApplyPlan
+  blaiToolchainPsramSplitMetadataApplyPlanInto(
+    splitMetadataPlan, splitMetadataApplyPlanInto)
+  var splitMetadataState =
+    blaiToolchainPsramSplitMetadataState(0, 0'u32, 0'u32, 0, 0, 0, 0, 0)
+  let splitMetadataStateApplied =
+    blaiApplyToolchainPsramSplitMetadataState(
+      splitMetadataState, splitMetadataApplyPlan)
+  var splitStartSlots = [-1'i32, -1, -1, -1]
+  let splitMetadataApplied = blaiApplyToolchainPsramSplitMetadata(
+    splitStartSlots, splitMetadataPlan)
+  var shortSplitStartSlots = [-1'i32, -1, -1]
+  let shortSplitMetadataApplied = blaiApplyToolchainPsramSplitMetadata(
+    shortSplitStartSlots, splitMetadataPlan)
+  let splitMetadataCursor1 =
+    blaiToolchainPsramSplitMetadataCursor(splitMetadataPlan, 1'u32)
+  var splitMetadataCursor2: BlaiToolchainPsramSplitMetadataCursor
+  blaiToolchainPsramSplitMetadataCursorInto(
+    splitMetadataPlan, 2'u32, splitMetadataCursor2)
+  let splitMetadataCursor3 =
+    blaiToolchainPsramSplitMetadataCursor(splitMetadataPlan, 3'u32)
+  let splitMetadataCursor0 =
+    blaiToolchainPsramSplitMetadataCursor(splitMetadataPlan, 0'u32)
+  let clampedSplitMetadataPlan = blaiToolchainPsramSplitMetadataPlan(
+    3, 1, 12, 7)
+  let splitMetadataBadLayerPlan = blaiToolchainPsramSplitMetadataPlan(
+    -1, 4, 12, 7)
+  let splitMetadataBadScratchPlan = blaiToolchainPsramSplitMetadataPlan(
+    3, 4, -1, 7)
+  let splitMetadataBadScratchApplyPlan =
+    blaiToolchainPsramSplitMetadataApplyPlan(splitMetadataBadScratchPlan)
+  var splitMetadataBlockedState =
+    blaiToolchainPsramSplitMetadataState(
+      9, 10'u32, 11'u32, 12, 13, 14, 15, 16)
+  let splitMetadataBlockedStateApplied =
+    blaiApplyToolchainPsramSplitMetadataState(
+      splitMetadataBlockedState, splitMetadataBadScratchApplyPlan)
+  let splitMetadataCursorBlocked =
+    blaiToolchainPsramSplitMetadataCursor(splitMetadataBadScratchPlan, 1'u32)
+  let routeSetWeiGatePlan = blaiToolchainSetWeiPatchRouteGatePlan(
+    1, BlaiToolchainPsramOwnerRouteType, BlaiToolchainPsramOwnerConvType,
+    BlaiToolchainPsramOwnerConvType, 1, 1, 2)
+  var routeSetWeiGatePlanInto: BlaiToolchainSetWeiPatchRouteGatePlan
+  blaiToolchainSetWeiPatchRouteGatePlanInto(
+    1, BlaiToolchainPsramOwnerRouteType, BlaiToolchainPsramOwnerConvType,
+    BlaiToolchainPsramOwnerConvType, 1, 1, 2, routeSetWeiGatePlanInto)
+  let previousConvRouteSetWeiGatePlan = blaiToolchainSetWeiPatchRouteGatePlan(
+    1, BlaiToolchainPsramOwnerRouteType, BlaiToolchainPsramOwnerConvType,
+    BlaiToolchainPsramOwnerConvType, 2, 2, 2)
+  let sourceRouteSetWeiGatePlan = blaiToolchainSetWeiPatchRouteGatePlan(
+    1, BlaiToolchainPsramOwnerRouteType, BlaiToolchainPsramOwnerRouteType,
+    BlaiToolchainPsramOwnerConvType, 1, 2, 2)
+  let blockedRouteSetWeiGatePlan = blaiToolchainSetWeiPatchRouteGatePlan(
+    1, BlaiToolchainPsramOwnerRouteType, BlaiToolchainPsramOwnerConvType,
+    BlaiToolchainPsramOwnerConvType, 1, 2, 2)
+  let badShapeRouteSetWeiGatePlan = blaiToolchainSetWeiPatchRouteGatePlan(
+    -1, BlaiToolchainPsramOwnerRouteType, BlaiToolchainPsramOwnerConvType,
+    BlaiToolchainPsramOwnerConvType, 1, 1, 2)
+  let routeSetWeiSourcePlan = blaiToolchainSetWeiPatchRouteSourcePlan(
+    BlaiToolchainPsramRelationRouteType, BlaiToolchainPsramOwnerConvType,
+    11, 13, 17)
+  var routeSetWeiSourcePlanInto: BlaiToolchainSetWeiPatchRouteSourcePlan
+  blaiToolchainSetWeiPatchRouteSourcePlanInto(
+    BlaiToolchainPsramRelationRouteType, BlaiToolchainPsramOwnerConvType,
+    11, 13, 17, routeSetWeiSourcePlanInto)
+  let routeMaxFromRouteSetWeiSourcePlan =
+    blaiToolchainSetWeiPatchRouteSourcePlan(
+      BlaiToolchainSetWeiPatchRouteMaxType,
+      BlaiToolchainPsramRelationRouteType, 11, 13, 17)
+  let routeMaxFromConvSetWeiSourcePlan =
+    blaiToolchainSetWeiPatchRouteSourcePlan(
+      BlaiToolchainSetWeiPatchRouteMaxType,
+      BlaiToolchainPsramOwnerConvType, 11, 13, 17)
+  let badTypeSetWeiSourcePlan = blaiToolchainSetWeiPatchRouteSourcePlan(
+    BlaiToolchainPsramOwnerConvType, BlaiToolchainPsramOwnerConvType,
+    11, 13, 17)
+  let badShapeSetWeiSourcePlan = blaiToolchainSetWeiPatchRouteSourcePlan(
+    BlaiToolchainPsramRelationRouteType, BlaiToolchainPsramOwnerConvType,
+    -1, 13, 17)
+  let maskedBaseOffsetPlan = blaiToolchainSetWeiPatchBaseOffsetPlan(
+    BlaiToolchainPsramRelationRouteWType, 0, 0)
+  var maskedBaseOffsetPlanInto: BlaiToolchainSetWeiPatchBaseOffsetPlan
+  blaiToolchainSetWeiPatchBaseOffsetPlanInto(
+    BlaiToolchainPsramRelationRouteWType, 0, 0, maskedBaseOffsetPlanInto)
+  let highCountBaseOffsetPlan = blaiToolchainSetWeiPatchBaseOffsetPlan(
+    BlaiToolchainPsramOwnerConvType, 2, 0)
+  let highFieldBaseOffsetPlan = blaiToolchainSetWeiPatchBaseOffsetPlan(
+    BlaiToolchainPsramOwnerConvType, 1, 4)
+  let lowBaseOffsetPlan = blaiToolchainSetWeiPatchBaseOffsetPlan(
+    BlaiToolchainPsramOwnerConvType, 1, 3)
+  let convSetWeiPagePlan = blaiToolchainSetWeiPatchPagePlan(
+    blaiConvolutional, 15'u32, 300'u32, 999'u32)
+  let routeWSetWeiPagePlan = blaiToolchainSetWeiPatchPagePlan(
+    blaiRouteW, 15'u32, 300'u32, 500'u32)
+  let routeWSetWeiDivisorPlan = blaiToolchainSetWeiPatchDivisorPlan(
+    routeWSetWeiPagePlan, ord(blaiRouteW).int32, 9'u32, 9'u32, 500'u32,
+    500'u32, maskedBaseOffsetPlan.basePatchOffset)
+  let specialSetWeiDivisorPlan = blaiToolchainSetWeiPatchDivisorPlan(
+    routeWSetWeiPagePlan, BlaiToolchainSetWeiPatchSpecialDoubleAuxType,
+    9'u32, 1'u32, 500'u32, 500'u32, 0'u32)
+  let routeWSetWeiStorePlan = blaiToolchainSetWeiPatchStorePlan(
+    routeWSetWeiDivisorPlan, routeWSetWeiPagePlan.auxiliaryPages,
+    routeWSetWeiPagePlan.auxiliaryBytes)
+  var setWeiStoreApplySplits = [0'u32, 0]
+  let setWeiStoreApplyPlan = blaiToolchainSetWeiPatchStoreApplyPlan(
+    routeWSetWeiStorePlan, setWeiStoreApplySplits)
+  var setWeiStoreApplyPlanInto: BlaiToolchainSetWeiPatchStoreApplyPlan
+  blaiToolchainSetWeiPatchStoreApplyPlanInto(
+    routeWSetWeiStorePlan, setWeiStoreApplySplits, setWeiStoreApplyPlanInto)
+  var emptySetWeiStoreStateSplits: array[BlaiMaxWeightPatches, uint32]
+  var setWeiStoreState =
+    blaiToolchainSetWeiPatchStoreState(
+      blaiToolchainSetWeiPatchStoreSingle, 99'u32, 0'u32,
+      emptySetWeiStoreStateSplits)
+  let setWeiStoreStateApplied =
+    blaiApplyToolchainSetWeiPatchStoreState(
+      setWeiStoreState, setWeiStoreApplyPlan)
+  var setWeiStoreApplyPatchCount = 0'u32
+  let setWeiStoreApplied = blaiApplyToolchainSetWeiPatchStore(
+    setWeiStoreApplyPatchCount, setWeiStoreApplySplits, setWeiStoreApplyPlan)
+  var shortSetWeiStoreApplySplits = [0'u32]
+  let shortSetWeiStoreApplyPlan = blaiToolchainSetWeiPatchStoreApplyPlan(
+    routeWSetWeiStorePlan, shortSetWeiStoreApplySplits)
+  var blockedSetWeiStoreState =
+    blaiToolchainSetWeiPatchStoreState(
+      blaiToolchainSetWeiPatchStoreSingle, 88'u32, 0'u32,
+      emptySetWeiStoreStateSplits)
+  let blockedSetWeiStoreStateApplied =
+    blaiApplyToolchainSetWeiPatchStoreState(
+      blockedSetWeiStoreState, shortSetWeiStoreApplyPlan)
+  let matchingSetWeiStoreSelectPlan =
+    blaiToolchainSetWeiPatchStoreSelectPlan(false, 3000'u32, 2'u32, 8000'u32)
+  var setWeiStoreCommitSplits = [0'u32, 0]
+  let setWeiStoreCommitPlan = blaiToolchainSetWeiPatchStoreCommitPlan(
+    matchingSetWeiStoreSelectPlan, routeWSetWeiStorePlan, setWeiStoreCommitSplits)
+  var setWeiStoreCommitPlanInto: BlaiToolchainSetWeiPatchStoreCommitPlan
+  blaiToolchainSetWeiPatchStoreCommitPlanInto(
+    matchingSetWeiStoreSelectPlan, routeWSetWeiStorePlan,
+    setWeiStoreCommitSplits, setWeiStoreCommitPlanInto)
+  let setWeiStoreCommitApplyPlan =
+    blaiToolchainSetWeiPatchStoreCommitApplyPlan(setWeiStoreCommitPlan)
+  var setWeiStoreCommitApplyPlanInto:
+    BlaiToolchainSetWeiPatchStoreCommitApplyPlan
+  blaiToolchainSetWeiPatchStoreCommitApplyPlanInto(
+    setWeiStoreCommitPlan, setWeiStoreCommitApplyPlanInto)
+  var setWeiStoreCommitState =
+    blaiToolchainSetWeiPatchStoreCommitState(
+      blaiToolchainSetWeiPatchStoreSingle, 0'u32, 0'u32,
+      emptySetWeiStoreStateSplits, 0'u32)
+  let setWeiStoreCommitStateApplied =
+    blaiApplyToolchainSetWeiPatchStoreCommitState(
+      setWeiStoreCommitState, setWeiStoreCommitApplyPlan)
+  var setWeiStoreCommitSummarySelectedMode =
+    blaiToolchainSetWeiPatchStoreSingle
+  var setWeiStoreCommitSummaryStoreMode =
+    blaiToolchainSetWeiPatchStoreSingle
+  var setWeiStoreCommitSummaryMode =
+    blaiToolchainSetWeiPatchStoreSingle
+  var setWeiStoreCommitSummaryStorage = 0'u32
+  var setWeiStoreCommitSummaryPatchCount = 0'u32
+  var setWeiStoreCommitSummarySplitCount = 0'u32
+  var setWeiStoreCommitSummaryWrites = 0'u32
+  let setWeiStoreCommitSummaryApplied =
+    blaiApplyToolchainSetWeiPatchStoreCommitSummaryScalars(
+      setWeiStoreCommitSummarySelectedMode,
+      setWeiStoreCommitSummaryStoreMode,
+      setWeiStoreCommitSummaryMode,
+      setWeiStoreCommitSummaryStorage,
+      setWeiStoreCommitSummaryPatchCount,
+      setWeiStoreCommitSummarySplitCount,
+      setWeiStoreCommitSummaryWrites,
+      setWeiStoreCommitApplyPlan)
+  var setWeiStoreCommitPatchCount = 0'u32
+  let setWeiStoreCommitApplied = blaiApplyToolchainSetWeiPatchStoreCommit(
+    setWeiStoreCommitPatchCount, setWeiStoreCommitSplits, setWeiStoreCommitPlan)
+  let mismatchSetWeiStoreCommitPlan = blaiToolchainSetWeiPatchStoreCommitPlan(
+    blaiToolchainSetWeiPatchStoreSelectPlan(false, 4096'u32, 1'u32, 8000'u32),
+    routeWSetWeiStorePlan, setWeiStoreCommitSplits)
+  let shortSetWeiStoreCommitPlan = blaiToolchainSetWeiPatchStoreCommitPlan(
+    matchingSetWeiStoreSelectPlan, routeWSetWeiStorePlan,
+    shortSetWeiStoreApplySplits)
+  let shortSetWeiStoreCommitApplyPlan =
+    blaiToolchainSetWeiPatchStoreCommitApplyPlan(shortSetWeiStoreCommitPlan)
+  let setWeiStoreCommitStateBefore = setWeiStoreCommitState
+  let shortSetWeiStoreCommitStateApplied =
+    blaiApplyToolchainSetWeiPatchStoreCommitState(
+      setWeiStoreCommitState, shortSetWeiStoreCommitApplyPlan)
+  let auxOnlySetWeiStorePlan = blaiToolchainSetWeiPatchStorePlan(
+    BlaiToolchainSetWeiPatchDivisorPlan(
+      primaryNumerator: 10, selectedDivisor: 1, primaryLocalBytes: 4096,
+      valid: true),
+    3'u32, 5000'u32)
+  let divisorSetWeiStoreSelectPlan =
+    blaiToolchainSetWeiPatchStoreSelectPlan(false, 5000'u32, 1'u32, 5000'u32)
+  let auxiliarySetWeiStoreSelectPlan =
+    blaiToolchainSetWeiPatchStoreSelectPlan(false, 4096'u32, 1'u32, 5000'u32)
+  let forcedSingleSetWeiStoreSelectPlan =
+    blaiToolchainSetWeiPatchStoreSelectPlan(true, 5000'u32, 2'u32, 5000'u32)
+  let oneByOneSetWeiPressurePlan = blaiToolchainSetWeiPatchPressurePlan(
+    38'i32, 15, 17, 0, 7, 5, 7, 1, 1)
+  var oneByOneSetWeiPressurePlanInto: BlaiToolchainSetWeiPatchPressurePlan
+  blaiToolchainSetWeiPatchPressurePlanInto(
+    38'i32, 15, 17, 0, 7, 5, 7, 1, 1,
+    oneByOneSetWeiPressurePlanInto)
+  let smallKernelSetWeiPressurePlan = blaiToolchainSetWeiPatchPressurePlan(
+    1'i32, 10, 10, 2, 3, 5, 7, 3, 1)
+  let largeKernelSetWeiPressurePlan = blaiToolchainSetWeiPatchPressurePlan(
+    38'i32, 10, 10, 2, 7, 5, 7, 5, 1)
+  let negativeSetWeiPressurePlan = blaiToolchainSetWeiPatchPressurePlan(
+    38'i32, -1, 10, 2, 7, 5, 7, 1, 1)
+  let overflowSetWeiPressurePlan = blaiToolchainSetWeiPatchPressurePlan(
+    38'i32, 10, 10, high(int32), 7, 5, 7, 1, 1)
+  let largeMaskedSetWeiFlagPlan = blaiToolchainSetWeiPatchLargeFlagPlan(
+    38'i32, BlaiToolchainSetWeiPatchLargeThresholdBytes + 1'u32)
+  var largeMaskedSetWeiFlagPlanInto: BlaiToolchainSetWeiPatchLargeFlagPlan
+  blaiToolchainSetWeiPatchLargeFlagPlanInto(
+    38'i32, BlaiToolchainSetWeiPatchLargeThresholdBytes + 1'u32,
+    largeMaskedSetWeiFlagPlanInto)
+  let thresholdSetWeiFlagPlan = blaiToolchainSetWeiPatchLargeFlagPlan(
+    38'i32, BlaiToolchainSetWeiPatchLargeThresholdBytes)
+  let unmaskedSetWeiFlagPlan = blaiToolchainSetWeiPatchLargeFlagPlan(
+    1'i32, BlaiToolchainSetWeiPatchLargeThresholdBytes + 1'u32)
+  let outOfRangeSetWeiFlagPlan = blaiToolchainSetWeiPatchLargeFlagPlan(
+    56'i32, BlaiToolchainSetWeiPatchLargeThresholdBytes + 1'u32)
+  let largeSetWeiSplitPlan = blaiToolchainSetWeiPatchLargeSplitPlan(
+    largeMaskedSetWeiFlagPlan, 100'u32)
+  var largeSetWeiSplitPlanInto: BlaiToolchainSetWeiPatchLargeSplitPlan
+  blaiToolchainSetWeiPatchLargeSplitPlanInto(
+    largeMaskedSetWeiFlagPlan, 100'u32, largeSetWeiSplitPlanInto)
+  let divisibleLargeSetWeiSplitPlan = blaiToolchainSetWeiPatchLargeSplitPlan(
+    blaiToolchainSetWeiPatchLargeFlagPlan(38'i32, 16384'u32), 100'u32)
+  let invalidLargeSetWeiSplitPlan = blaiToolchainSetWeiPatchLargeSplitPlan(
+    unmaskedSetWeiFlagPlan, 100'u32)
+  let capacityLargeSetWeiSplitPlan = blaiToolchainSetWeiPatchLargeSplitPlan(
+    blaiToolchainSetWeiPatchLargeFlagPlan(38'i32, 129'u32 * 8192'u32),
+    10000'u32)
+  let largeSetWeiTotalPlan = blaiToolchainSetWeiPatchLargeTotalPlan(
+    largeSetWeiSplitPlan, 9000'u32)
+  var largeSetWeiTotalPlanInto: BlaiToolchainSetWeiPatchLargeTotalPlan
+  blaiToolchainSetWeiPatchLargeTotalPlanInto(
+    largeSetWeiSplitPlan, 9000'u32, largeSetWeiTotalPlanInto)
+  let invalidLargeSetWeiTotalPlan = blaiToolchainSetWeiPatchLargeTotalPlan(
+    invalidLargeSetWeiSplitPlan, 9000'u32)
+  let overflowLargeSetWeiTotalPlan = blaiToolchainSetWeiPatchLargeTotalPlan(
+    largeSetWeiSplitPlan, high(uint32))
+  let lowerSetWeiFlagPlan = blaiToolchainSetWeiPatchLowerFlagPlan(
+    38'i32, 100'u32, 10'u32, 500'u32)
+  var lowerSetWeiFlagPlanInto: BlaiToolchainSetWeiPatchLowerFlagPlan
+  blaiToolchainSetWeiPatchLowerFlagPlanInto(
+    38'i32, 100'u32, 10'u32, 500'u32, lowerSetWeiFlagPlanInto)
+  let thresholdLowerSetWeiFlagPlan = blaiToolchainSetWeiPatchLowerFlagPlan(
+    38'i32, 100'u32, 10'u32, 409'u32)
+  let unmaskedLowerSetWeiFlagPlan = blaiToolchainSetWeiPatchLowerFlagPlan(
+    1'i32, 100'u32, 10'u32, 500'u32)
+  let zeroDivisorLowerSetWeiFlagPlan = blaiToolchainSetWeiPatchLowerFlagPlan(
+    38'i32, 100'u32, 0'u32, 500'u32)
+  let overflowLowerSetWeiFlagPlan = blaiToolchainSetWeiPatchLowerFlagPlan(
+    38'i32, high(uint32), 1'u32, 2'u32)
+  let lowerSetWeiSplitPlan = blaiToolchainSetWeiPatchLowerSplitPlan(
+    lowerSetWeiFlagPlan, 100'u32)
+  var lowerSetWeiSplitPlanInto: BlaiToolchainSetWeiPatchLowerSplitPlan
+  blaiToolchainSetWeiPatchLowerSplitPlanInto(
+    lowerSetWeiFlagPlan, 100'u32, lowerSetWeiSplitPlanInto)
+  let divisibleLowerSetWeiSplitPlan = blaiToolchainSetWeiPatchLowerSplitPlan(
+    blaiToolchainSetWeiPatchLowerFlagPlan(
+      38'i32, 8192'u32, 1'u32, 1'u32), 100'u32)
+  let invalidLowerSetWeiSplitPlan = blaiToolchainSetWeiPatchLowerSplitPlan(
+    unmaskedLowerSetWeiFlagPlan, 100'u32)
+  let capacityLowerSetWeiSplitPlan = blaiToolchainSetWeiPatchLowerSplitPlan(
+    blaiToolchainSetWeiPatchLowerFlagPlan(
+      38'i32, 129'u32 * 4096'u32, 1'u32, 1'u32),
+    10000'u32)
+  let lowerSetWeiTotalPlan = blaiToolchainSetWeiPatchLowerTotalPlan(
+    lowerSetWeiSplitPlan, 9000'u32)
+  var lowerSetWeiTotalPlanInto: BlaiToolchainSetWeiPatchLowerTotalPlan
+  blaiToolchainSetWeiPatchLowerTotalPlanInto(
+    lowerSetWeiSplitPlan, 9000'u32, lowerSetWeiTotalPlanInto)
+  let invalidLowerSetWeiTotalPlan = blaiToolchainSetWeiPatchLowerTotalPlan(
+    invalidLowerSetWeiSplitPlan, 9000'u32)
+  let overflowLowerSetWeiTotalPlan = blaiToolchainSetWeiPatchLowerTotalPlan(
+    lowerSetWeiSplitPlan, high(uint32))
+  let noPatchSetWeiPlan = blaiToolchainSetWeiPatchNoPatchPlan(123'u32, 7'u32)
+  var noPatchSetWeiPlanInto: BlaiToolchainSetWeiPatchNoPatchPlan
+  blaiToolchainSetWeiPatchNoPatchPlanInto(123'u32, 7'u32, noPatchSetWeiPlanInto)
+  let invalidNoPatchSetWeiPlan = blaiToolchainSetWeiPatchNoPatchPlan(0'u32, 7'u32)
+  let branchLargeSetWeiPlan = blaiToolchainSetWeiPatchBranchPlan(
+    largeSetWeiTotalPlan, lowerSetWeiTotalPlan, noPatchSetWeiPlan)
+  var branchLargeSetWeiPlanInto: BlaiToolchainSetWeiPatchBranchPlan
+  blaiToolchainSetWeiPatchBranchPlanInto(
+    largeSetWeiTotalPlan, lowerSetWeiTotalPlan, noPatchSetWeiPlan,
+    branchLargeSetWeiPlanInto)
+  let branchLowerSetWeiPlan = blaiToolchainSetWeiPatchBranchPlan(
+    invalidLargeSetWeiTotalPlan, lowerSetWeiTotalPlan, noPatchSetWeiPlan)
+  let branchNoPatchSetWeiPlan = blaiToolchainSetWeiPatchBranchPlan(
+    invalidLargeSetWeiTotalPlan, invalidLowerSetWeiTotalPlan, noPatchSetWeiPlan)
+  let branchLargeBlockedSetWeiPlan = blaiToolchainSetWeiPatchBranchPlan(
+    overflowLargeSetWeiTotalPlan, lowerSetWeiTotalPlan, noPatchSetWeiPlan)
+  let branchLowerBlockedSetWeiPlan = blaiToolchainSetWeiPatchBranchPlan(
+    invalidLargeSetWeiTotalPlan, overflowLowerSetWeiTotalPlan, noPatchSetWeiPlan)
+  let branchNoPatchBlockedSetWeiPlan = blaiToolchainSetWeiPatchBranchPlan(
+    invalidLargeSetWeiTotalPlan, invalidLowerSetWeiTotalPlan,
+    invalidNoPatchSetWeiPlan)
+  var branchApplySplits = [0'u32, 0, 0, 0]
+  let branchApplyPlan = blaiToolchainSetWeiPatchBranchApplyPlan(
+    branchLargeSetWeiPlan, branchApplySplits)
+  var branchApplyPlanInto: BlaiToolchainSetWeiPatchBranchApplyPlan
+  blaiToolchainSetWeiPatchBranchApplyPlanInto(
+    branchLargeSetWeiPlan, branchApplySplits, branchApplyPlanInto)
+  var branchApplyPatchCount = 0'u32
+  var branchApplyPsramTotal = 0'u32
+  var branchApplyFlag = 0'u32
+  var branchApplyReturned = 99'u32
+  var emptyBranchStateSplits: array[BlaiMaxWeightPatches, uint32]
+  var branchApplyState =
+    blaiToolchainSetWeiPatchBranchState(
+      blaiToolchainSetWeiPatchBranchNoPatch, 99'u32, 0'u32,
+      emptyBranchStateSplits, 88'u32, 77'u32, 66'u32)
+  let branchApplyStateApplied =
+    blaiApplyToolchainSetWeiPatchBranchState(
+      branchApplyState, branchApplyPlan)
+  var branchApplySummaryLargeActive = false
+  var branchApplySummaryLowerActive = true
+  var branchApplySummaryMode = blaiToolchainSetWeiPatchBranchNoPatch
+  var branchApplySummaryStorage = 0'u32
+  var branchApplySummaryPatchCount = 0'u32
+  var branchApplySummarySplitCount = 0'u32
+  var branchApplySummaryWrites = 0'u32
+  var branchApplySummaryPsramTotal = 0'u32
+  var branchApplySummaryFlag = 0'u32
+  var branchApplySummaryReturned = 0'u32
+  let branchApplySummaryApplied =
+    blaiApplyToolchainSetWeiPatchBranchSummaryScalars(
+      branchApplySummaryLargeActive, branchApplySummaryLowerActive,
+      branchApplySummaryMode, branchApplySummaryStorage,
+      branchApplySummaryPatchCount, branchApplySummarySplitCount,
+      branchApplySummaryWrites, branchApplySummaryPsramTotal,
+      branchApplySummaryFlag, branchApplySummaryReturned, branchApplyPlan)
+  let branchApplyApplied = blaiApplyToolchainSetWeiPatchBranch(
+    branchApplyPatchCount, branchApplySplits, branchApplyPsramTotal,
+    branchApplyFlag, branchApplyReturned, branchApplyPlan)
+  var shortBranchApplySplits = [0'u32, 0]
+  let shortBranchApplyPlan = blaiToolchainSetWeiPatchBranchApplyPlan(
+    branchLargeSetWeiPlan, shortBranchApplySplits)
+  var blockedBranchApplyState =
+    blaiToolchainSetWeiPatchBranchState(
+      blaiToolchainSetWeiPatchBranchNoPatch, 55'u32, 0'u32,
+      emptyBranchStateSplits, 44'u32, 33'u32, 22'u32)
+  let blockedBranchApplyStateApplied =
+    blaiApplyToolchainSetWeiPatchBranchState(
+      blockedBranchApplyState, shortBranchApplyPlan)
+  let branchNoPatchReturnPlan =
+    blaiToolchainSetWeiPatchBranchReturnPlan(
+      setWeiCallPlan, branchNoPatchSetWeiPlan)
+  let branchNoPatchReturnEvidence =
+    blaiToolchainSetWeiPatchBranchReturnEvidence(
+      setWeiCallPlan, branchNoPatchSetWeiPlan)
+  var branchNoPatchReturnPlanInto:
+    BlaiToolchainSetWeiPatchBranchReturnPlan
+  blaiToolchainSetWeiPatchBranchReturnPlanInto(
+    setWeiCallPlan, branchNoPatchSetWeiPlan, branchNoPatchReturnPlanInto)
+  let branchBlockedCallReturnPlan =
+    blaiToolchainSetWeiPatchBranchReturnPlan(
+      BlaiToolchainSetWeiPatchCallPlan(), branchNoPatchSetWeiPlan)
+  let branchBlockedBranchReturnPlan =
+    blaiToolchainSetWeiPatchBranchReturnPlan(
+      setWeiCallPlan, branchNoPatchBlockedSetWeiPlan)
+  let branchOversizedReturnedPlan =
+    blaiToolchainSetWeiPatchBranchReturnPlan(
+      setWeiCallPlan,
+      BlaiToolchainSetWeiPatchBranchPlan(
+        valid: true,
+        mode: blaiToolchainSetWeiPatchBranchNoPatch,
+        returnedPatchCount: high(uint32)))
 
   check("NPU model SDK helper conv allocator",
     encoded.encoded and encoded.allocation.fits and
@@ -8456,13 +12528,2394 @@ proc checkSdkHelperConvShapePlan() =
     convSinglePatchPlan.midSource == blaiMemAllocSinglePatchMidInputChannels and
       convSinglePatchPlan.midInputElements == 48 and
       convSinglePatchPlan.psramPatchSize == 32 and
-      convSinglePatchPlan.psramMidPatchCount == 2)
+      convSinglePatchPlan.psramMidPatchCount == 2 and
+      convSinglePatchApplyPlan.valid and
+      convSinglePatchState ==
+        blaiMemAllocSinglePatchState(1, 5, 32, 1, 2) and
+      convSinglePatchStateCtrl.weightPatchCount == 1 and
+      convSinglePatchStateCtrl.weightPatchOutC[0] == 5 and
+      convSinglePatchStateCtrl.psramPatchSize == 32 and
+      convSinglePatchStateCtrl.psramPatchCount == 1 and
+      convSinglePatchStateCtrl.psramMidPatchCount == 2)
   check("NPU model SDK helper softmax allocator mid source",
     softmaxSinglePatchPlan.midSource ==
       blaiMemAllocSinglePatchMidSoftmaxOutputChannels and
       softmaxSinglePatchPlan.midInputElements == 80 and
       softmaxSinglePatchPlan.psramPatchSize == 32 and
       softmaxSinglePatchPlan.psramMidPatchCount == 3)
+  check("NPU model SDK helper line allocator state",
+    linePatchPlan.fits and linePatchPlan.linePatchCount == 3 and
+      linePatchApplyPlan.valid and
+      linePatchState.linePatchCount == 3 and
+      linePatchState.linePatchW[1] == 3000 and
+      linePatchStateCtrl.linePatchCount == 3 and
+      linePatchStateCtrl.linePatchW[1] == 3000)
+  check("NPU model SDK helper toolchain globals",
+    toolchainSramGlobals.valid and
+      toolchainSramGlobals.maxPatchSlotsFitLocalPlanner and
+      toolchainSramGlobals.maxStartFitsPatchSlots)
+  checkEq("NPU model SDK helper toolchain patch size",
+    toolchainSramGlobals.patchSizeBytes, 262144)
+  check("NPU model SDK helper toolchain cfg memory evidence",
+    toolchainCfgMemory.valid)
+  checkEq("NPU model SDK helper toolchain cfg patch elements",
+    toolchainCfgMemory.cfgPatchSizeElements, 65_536)
+  checkEq("NPU model SDK helper toolchain cfg patch bytes",
+    toolchainCfgMemory.cfgPatchSizeBytes, toolchainSramGlobals.patchSizeBytes)
+  check("NPU model SDK helper toolchain cfg patch slots",
+    toolchainCfgMemory.cfgCoversPlannerSlots and
+      toolchainCfgMemory.cfgPatchNum == 45'u32)
+  check("NPU model SDK helper toolchain cfg capacity",
+    toolchainCfgMemory.cfgCapacityCoversPlanner and
+      toolchainCfgMemory.cfgTotalBytes == BlaiToolchainCfgTotalBytes and
+      toolchainCfgMemory.activePlannerBytes == 10_485_760'u32)
+  check("NPU model SDK helper toolchain cfg spare slots",
+    toolchainCfgMemory.sparePatchSlots == 5'u32 and
+      toolchainCfgMemory.sparePatchBytes == 1_310_720'u32)
+  checkEq("NPU model SDK helper toolchain max patches",
+    toolchainSramGlobals.maxPsramPatchSlots, 40)
+  checkEq("NPU model SDK helper toolchain local capacity",
+    toolchainSramGlobals.localPlannerCapacity, BlaiMaxWeightPatchesU32)
+  check("NPU model SDK helper initial request forced channels",
+    initialRequestPlan.valid and initialRequestPlanInto == initialRequestPlan and
+      initialRequestPlan.smallChannelForced and
+      initialRequestPlan.selectedChannels == 4 and
+      initialRequestPlan.inputBytes == 262144 and
+      initialRequestPlan.requestedPatchCount == 1)
+  check("NPU model SDK helper initial request passthrough",
+    singleChannelInitialRequest.valid and
+      not singleChannelInitialRequest.smallChannelForced and
+      singleChannelInitialRequest.selectedChannels == 1 and
+      singleChannelInitialRequest.requestedPatchCount == 0)
+  check("NPU model SDK helper initial request blocked",
+    not badShapeInitialRequest.valid and
+      badShapeInitialRequest.firstBlock ==
+        blaiToolchainPatchInitialRequestLayerShape and
+      not overflowInitialRequest.valid and
+      overflowInitialRequest.firstBlock ==
+        blaiToolchainPatchInitialRequestOverflow)
+  check("NPU model SDK helper initial request store",
+    initialStorePlan.valid and initialStorePlanInto == initialStorePlan and
+      initialStoreApplyPlan.valid and
+      initialStoreApplyPlanInto == initialStoreApplyPlan and
+      initialStoreApplyPlan.stateAfter ==
+        blaiToolchainPatchInitialStoreState(
+          BlaiToolchainPatchInitialRequestStoreOffset, 1'u32, 1'i32, 1'u32) and
+      initialStoreStateApplied and
+      initialStoreState == initialStoreApplyPlan.stateAfter and
+      initialStoreApplied and initialRequestMetadata == 1 and
+      initialStorePlan.metadataOffset ==
+        BlaiToolchainPatchInitialRequestStoreOffset and
+      initialStorePlan.storedRequestCount == 1 and
+      initialStorePlan.writesApplied == 1 and
+      zeroInitialStorePlan.valid and
+      zeroInitialStorePlan.storedRequestCount == 0)
+  check("NPU model SDK helper initial request store blocked",
+    not blockedInitialStorePlan.valid and
+      blockedInitialStorePlan.firstBlock ==
+        blaiToolchainPatchInitialStoreRequest and
+      not blockedInitialStoreApplyPlan.valid and
+      blockedInitialStoreApplyPlan.firstBlock ==
+        blaiToolchainPatchInitialStoreApplyStorePlan and
+      not blockedInitialStoreStateApplied and
+      blockedInitialStoreState == blockedInitialStoreStateBefore)
+  check("NPU model SDK helper initial patch reservation",
+    initialPatchPlan.valid and initialPatchPlanInto == initialPatchPlan and
+      initialPatchApplyPlan.valid and
+      initialPatchApplyPlanInto == initialPatchApplyPlan and
+      initialPatchApplyPlan.stateAfter.requestedPatchCount == 3 and
+      initialPatchApplyPlan.stateAfter.writesApplied == 3 and
+      initialPatchApplyPlan.stateAfter.occupiedAfter[0] and
+      initialPatchApplyPlan.stateAfter.ownerAfter[0] == 0 and
+      initialPatchStateApplied and initialPatchStateBitmap[0] and
+      initialPatchStateBitmap[2] and not initialPatchStateBitmap[3] and
+      initialPatchStateOwners[0] == 0 and
+      initialPatchStateOwners[2] == 0 and
+      initialPatchPlan.owner == 0 and initialPatchPlan.writesApplied == 3 and
+      initialPatchApplied and initialPatchBitmap[0] and
+      initialPatchBitmap[2] and not initialPatchBitmap[3] and
+      initialPatchOwners[0] == 0 and initialPatchOwners[2] == 0 and
+      initialPatchOwners[3] == -1)
+  check("NPU model SDK helper initial patch blocked",
+    not zeroInitialPatchPlan.valid and
+      zeroInitialPatchPlan.firstBlock ==
+        blaiToolchainPatchInitialRequestedCount and
+      not shortInitialPatchPlan.valid and
+      shortInitialPatchPlan.firstBlock == blaiToolchainPatchInitialStorage and
+      not blockedInitialPatchApplyPlan.valid and
+      blockedInitialPatchApplyPlan.firstBlock ==
+        blaiToolchainPatchInitialApplyReservationPlan and
+      not blockedInitialPatchStateApplied and
+      initialPatchStateBitmap == initialPatchStateBitmapBefore and
+      initialPatchStateOwners == initialPatchStateOwnersBefore)
+  check("NPU model SDK helper patch previous owner flag",
+    inheritedPreviousOwnerPlan.valid and
+      inheritedPreviousOwnerPlanInto == inheritedPreviousOwnerPlan and
+      inheritedPreviousOwnerPlan.selectedPreviousOwnerFlag and
+      not inheritedPreviousOwnerPlan.typeMatchesPreviousOwner and
+      typePreviousOwnerPlan.valid and
+      typePreviousOwnerPlan.typeMatchesPreviousOwner and
+      typePreviousOwnerPlan.selectedPreviousOwnerFlag and
+      noPreviousOwnerPlan.valid and
+      not noPreviousOwnerPlan.selectedPreviousOwnerFlag)
+  check("NPU model SDK helper patch owner general",
+    generalPatchOwnerPlan.valid and
+      generalPatchOwnerPlanInto == generalPatchOwnerPlan and
+      generalPatchOwnerPlan.selectedOwner == 4 and
+      previousPatchOwnerPlan.valid and
+      previousPatchOwnerPlan.selectedOwner == 2 and
+      consumerPatchOwnerPlan.valid and
+      consumerPatchOwnerPlan.selectedOwner == 9)
+  check("NPU model SDK helper patch owner dsp",
+    dspDefaultPatchOwnerPlan.valid and
+      dspDefaultPatchOwnerPlan.selectedOwner == 3 and
+      dspPreviousPatchOwnerPlan.valid and
+      dspPreviousPatchOwnerPlan.selectedOwner == 2 and
+      dspConsumerPatchOwnerPlan.valid and
+      dspConsumerPatchOwnerPlan.selectedOwner == 7)
+  check("NPU model SDK helper patch owner tflite",
+    tfliteDefaultPatchOwnerPlan.valid and
+      tfliteDefaultPatchOwnerPlan.selectedOwner == 1 and
+      tfliteConsumerPatchOwnerPlan.valid and
+      tfliteConsumerPatchOwnerPlan.selectedOwner == 8)
+  check("NPU model SDK helper patch dispatch",
+    generalPatchDispatchPlan.valid and
+      generalPatchDispatchPlanInto == generalPatchDispatchPlan and
+      generalPatchDispatchPlan.owner.selectedOwner == 9 and
+      generalPatchDispatchPlan.metadataMode ==
+        blaiToolchainPatchMetadataGeneral and
+      generalPatchDispatchPlan.generalSearchCall and
+      not generalPatchDispatchPlan.dspSearchCall and
+      not generalPatchDispatchPlan.tfliteSearchCall)
+  check("NPU model SDK helper patch dispatch dsp tflite",
+    dspPatchDispatchPlan.valid and
+      dspPatchDispatchPlan.owner.selectedOwner == 2 and
+      dspPatchDispatchPlan.metadataMode == blaiToolchainPatchMetadataDsp and
+      dspPatchDispatchPlan.generalSearchCall and
+      dspPatchDispatchPlan.dspSearchCall and
+      not dspPatchDispatchPlan.tfliteSearchCall and
+      tflitePatchDispatchPlan.valid and
+      tflitePatchDispatchPlan.owner.selectedOwner == 1 and
+      tflitePatchDispatchPlan.metadataMode ==
+        blaiToolchainPatchMetadataTflite and
+      tflitePatchDispatchPlan.tfliteSearchCall and
+      invalidPatchDispatchPlan.firstBlock == blaiToolchainPatchDispatchOwner)
+  check("NPU model SDK helper PSRAM allocate scratch",
+    toolchainPsramScratch.valid and
+      toolchainPsramScratch.relationEntryCount == 2500 and
+      toolchainPsramScratch.relationInitValue == -1 and
+      toolchainPsramScratch.bitmapSlotCount == 40)
+  check("NPU model SDK helper PSRAM relation append",
+    toolchainRelationAppend.valid and
+      toolchainRelationAppendInto == toolchainRelationAppend and
+      toolchainRelationAppend.directPredecessorIndex == 3 and
+      toolchainRelationAppend.skippedDirectPredecessorCount == 1 and
+      toolchainRelationAppend.appendedCount == 2 and
+      toolchainRelationAppend.relationValues[0] == 1 and
+      toolchainRelationAppend.relationValues[1] == 2 and
+      toolchainRelationAppendApplyPlan.valid and
+      toolchainRelationAppendApplyPlanInto ==
+        toolchainRelationAppendApplyPlan and
+      toolchainRelationAppendStateApplied and
+      toolchainRelationAppendState ==
+        blaiToolchainPsramRelationAppendState(
+          4, 2'u32, 2'u32, 1'u32, [1'i32, 2, -1, -1, -1]) and
+      toolchainRelationApplied and toolchainRelationCount == 2 and
+      toolchainRelationRow[0] == 1 and toolchainRelationRow[1] == 2)
+  check("NPU model SDK helper PSRAM relation inactive",
+    not inactiveToolchainRelationAppend.valid and
+      inactiveToolchainRelationAppend.firstBlock ==
+        blaiToolchainPsramRelationInactive and
+      not inactiveToolchainRelationAppendApplyPlan.valid and
+      inactiveToolchainRelationAppendApplyPlan.firstBlock ==
+        blaiToolchainPsramRelationAppendApplyAppendPlan and
+      not blockedToolchainRelationAppendStateApplied and
+      blockedToolchainRelationAppendState ==
+        blaiToolchainPsramRelationAppendState(
+          9, 10'u32, 11'u32, 12'u32, [13'i32, 14, 15, 16, 17]))
+  check("NPU model SDK helper PSRAM relation tflite",
+    tfliteToolchainRelationAppend.valid and
+      tfliteToolchainRelationAppend.appendedCount == 1 and
+      tfliteToolchainRelationAppend.relationValues[0] == 0)
+  check("NPU model SDK helper PSRAM relation capacity",
+    not capacityToolchainRelationAppend.valid and
+      capacityToolchainRelationAppend.firstBlock ==
+        blaiToolchainPsramRelationCapacity)
+  check("NPU model SDK helper PSRAM relation consumer",
+    toolchainRelationConsumer.valid and
+      toolchainRelationConsumerInto == toolchainRelationConsumer and
+      toolchainRelationConsumer.found and
+      toolchainRelationConsumer.scannedRows == 3 and
+      toolchainRelationConsumer.scannedEntries == 4 and
+      toolchainRelationConsumer.matchCount == 2 and
+      toolchainRelationConsumer.consumerLayerIndex == 4)
+  check("NPU model SDK helper PSRAM relation consumer missing",
+    missingToolchainRelationConsumer.valid and
+      not missingToolchainRelationConsumer.found and
+      missingToolchainRelationConsumer.consumerLayerIndex == -1)
+  check("NPU model SDK helper PSRAM relation consumer blocked",
+    not badIndexToolchainRelationConsumer.valid and
+      badIndexToolchainRelationConsumer.firstBlock ==
+        blaiToolchainPsramRelationConsumerLayerIndex and
+      not storageToolchainRelationConsumer.valid and
+      storageToolchainRelationConsumer.firstBlock ==
+        blaiToolchainPsramRelationConsumerStorage and
+      not capacityToolchainRelationConsumer.valid and
+      capacityToolchainRelationConsumer.firstBlock ==
+        blaiToolchainPsramRelationConsumerCapacity)
+  check("NPU model SDK helper PSRAM relation consumer apply",
+    toolchainRelationConsumerApplyPlan.valid and
+      toolchainRelationConsumerApplyPlanInto ==
+        toolchainRelationConsumerApplyPlan and
+      toolchainRelationConsumerApplyPlan.stateAfter ==
+        blaiToolchainPsramRelationConsumerState(true, 4) and
+      toolchainRelationConsumerApplied and
+      toolchainRelationConsumerState ==
+        blaiToolchainPsramRelationConsumerState(true, 4))
+  check("NPU model SDK helper PSRAM relation consumer apply missing",
+    missingToolchainRelationConsumerApplyPlan.valid and
+      missingToolchainRelationConsumerApplyPlan.stateAfter ==
+        blaiToolchainPsramRelationConsumerState(false, -1) and
+      missingToolchainRelationConsumerApplied and
+      missingToolchainRelationConsumerState ==
+        blaiToolchainPsramRelationConsumerState(false, -1))
+  check("NPU model SDK helper PSRAM relation consumer apply blocked",
+    not blockedToolchainRelationConsumerApplyPlan.valid and
+      blockedToolchainRelationConsumerApplyPlan.firstBlock ==
+        blaiToolchainPsramRelationConsumerApplyConsumerPlan and
+      not blockedToolchainRelationConsumerApplied and
+      blockedToolchainRelationConsumerState ==
+        blaiToolchainPsramRelationConsumerState(true, 9))
+  check("NPU model SDK helper patch search call prepare",
+    searchCallPreparePlan.valid and
+      searchCallPreparePlanInto == searchCallPreparePlan and
+      searchCallPreparePlan.relationConsumerFound and
+      searchCallPreparePlan.relationConsumerLayerIndex == 4 and
+      searchCallPreparePlan.previousOwner.typeMatchesPreviousOwner and
+      searchCallPreparePlan.selectedPreviousOwnerFlag)
+  check("NPU model SDK helper patch search call prepare inherited",
+    inheritedSearchCallPreparePlan.valid and
+      not inheritedSearchCallPreparePlan.relationConsumerFound and
+      inheritedSearchCallPreparePlan.relationConsumerLayerIndex == -1 and
+      inheritedSearchCallPreparePlan.selectedPreviousOwnerFlag)
+  check("NPU model SDK helper patch search call prepare blocked",
+    not blockedSearchCallPreparePlan.valid and
+      blockedSearchCallPreparePlan.firstBlock ==
+        blaiToolchainPatchSearchCallPrepareRelationConsumer)
+  check("NPU model SDK helper PSRAM input membership",
+    toolchainInputMembership.valid and
+      toolchainInputMembershipInto == toolchainInputMembership and
+      toolchainInputMembership.found and
+      toolchainInputMembership.scannedEntries == 4 and
+      toolchainInputMembershipApplyPlan.valid and
+      toolchainInputMembershipApplyPlanInto ==
+        toolchainInputMembershipApplyPlan and
+      toolchainInputMembershipStateApplied and
+      toolchainInputMembershipState ==
+        blaiToolchainPsramInputMembershipState(3, 4, 4'u32, true) and
+      missingToolchainInputMembership.valid and
+      not missingToolchainInputMembership.found and
+      emptyToolchainInputMembership.valid and
+      emptyToolchainInputMembership.scannedEntries == 0)
+  check("NPU model SDK helper PSRAM input membership blocked",
+    not badIndexToolchainInputMembership.valid and
+      badIndexToolchainInputMembership.firstBlock ==
+        blaiToolchainPsramInputMembershipLayerIndex and
+      not shortToolchainInputMembership.valid and
+      shortToolchainInputMembership.firstBlock ==
+        blaiToolchainPsramInputMembershipStorage and
+      not shortToolchainInputMembershipApplyPlan.valid and
+      shortToolchainInputMembershipApplyPlan.firstBlock ==
+        blaiToolchainPsramInputMembershipApplyMembershipPlan and
+      not blockedToolchainInputMembershipStateApplied and
+      blockedToolchainInputMembershipState ==
+        blaiToolchainPsramInputMembershipState(9, 10, 11'u32, true))
+  check("NPU model SDK helper PSRAM layer request",
+    toolchainLayerRequest.valid and
+      toolchainLayerRequest.alignedInputChannels == 16 and
+      toolchainLayerRequest.inputBytes == 262144 and
+      toolchainLayerRequest.requestedPatchCount == 1)
+  check("NPU model SDK helper PSRAM small request",
+    smallToolchainLayerRequest.valid and
+      smallToolchainLayerRequest.inputBytes == 3136 and
+      smallToolchainLayerRequest.requestedPatchCount == 0)
+  check("NPU model SDK helper PSRAM skip request",
+    not skippedToolchainLayerRequest.valid and
+      skippedToolchainLayerRequest.firstBlock ==
+        blaiToolchainPsramLayerRequestSkippedLayer)
+  check("NPU model SDK helper PSRAM DSP request",
+    toolchainDspRequest.valid and
+      toolchainDspRequestInto == toolchainDspRequest and
+      toolchainDspRequest.alignedCount == 4 and
+      toolchainDspRequest.areaElements == 65536 and
+      toolchainDspRequest.inputBytes == 262144 and
+      toolchainDspRequest.requestedPatchCount == 1)
+  check("NPU model SDK helper PSRAM DSP request blocked",
+    smallToolchainDspRequest.valid and
+      smallToolchainDspRequest.requestedPatchCount == 0 and
+      not badShapeToolchainDspRequest.valid and
+      badShapeToolchainDspRequest.firstBlock ==
+        blaiToolchainPsramDspRequestShape and
+      not overflowToolchainDspRequest.valid and
+      overflowToolchainDspRequest.firstBlock ==
+        blaiToolchainPsramDspRequestOverflow)
+  check("NPU model SDK helper PSRAM DSP volume request",
+    toolchainDspVolumeRequest.valid and
+      toolchainDspVolumeRequestInto == toolchainDspVolumeRequest and
+      toolchainDspVolumeRequest.factorA == 128 and
+      toolchainDspVolumeRequest.factorB == 128 and
+      toolchainDspVolumeRequest.factorC == 16 and
+      toolchainDspVolumeRequest.volumeElements == 262144 and
+      toolchainDspVolumeRequest.requestedPatchCount == 1)
+  check("NPU model SDK helper PSRAM DSP volume request blocked",
+    smallToolchainDspVolumeRequest.valid and
+      smallToolchainDspVolumeRequest.requestedPatchCount == 0 and
+      not badShapeToolchainDspVolumeRequest.valid and
+      badShapeToolchainDspVolumeRequest.firstBlock ==
+        blaiToolchainPsramDspVolumeRequestShape and
+      not overflowToolchainDspVolumeRequest.valid and
+      overflowToolchainDspVolumeRequest.firstBlock ==
+        blaiToolchainPsramDspVolumeRequestOverflow)
+  check("NPU model SDK helper PSRAM general patch",
+    generalPsramPatchPlan.valid and
+      generalPsramPatchPlanInto == generalPsramPatchPlan and
+      generalPsramPatchPlan.currentLayerIndex == 1 and
+      generalPsramPatchPlan.requestedPatchCount == 2 and
+      generalPsramPatchPlan.relationConsumerFound and
+      generalPsramPatchPlan.relationConsumerLayerIndex == 4 and
+      generalPsramPatchPlan.selectedPreviousOwnerFlag and
+      generalPsramPatchPlan.generalSearchCall and
+      generalPsramPatchPlan.metadataMode ==
+        blaiToolchainPatchMetadataGeneral and
+      generalPsramPatchPlan.owner == 0)
+  check("NPU model SDK helper PSRAM general patch inherited",
+    inheritedGeneralPsramPatchPlan.valid and
+      not inheritedGeneralPsramPatchPlan.relationConsumerFound and
+      inheritedGeneralPsramPatchPlan.selectedPreviousOwnerFlag and
+      inheritedGeneralPsramPatchPlan.owner == 3)
+  check("NPU model SDK helper PSRAM general patch blocked",
+    not blockedGeneralPsramPatchPlan.valid and
+      blockedGeneralPsramPatchPlan.firstBlock ==
+        blaiToolchainPsramGeneralPatchPrepare)
+  check("NPU model SDK helper PSRAM general patch apply",
+    generalPsramPatchApplyPlan.valid and
+      generalPsramPatchApplyPlanInto == generalPsramPatchApplyPlan and
+      generalPsramPatchApplyPlan.stateAfter ==
+        blaiToolchainPsramGeneralPatchState(
+          1, 2'u32, 4, true, true, true, true,
+          blaiToolchainPatchMetadataGeneral, 0) and
+      generalPsramPatchApplied and
+      generalPsramPatchState ==
+        blaiToolchainPsramGeneralPatchState(
+          1, 2'u32, 4, true, true, true, true,
+          blaiToolchainPatchMetadataGeneral, 0))
+  check("NPU model SDK helper PSRAM general patch apply inherited",
+      inheritedGeneralPsramPatchApplyPlan.valid and
+      inheritedGeneralPsramPatchApplyPlan.stateAfter ==
+        blaiToolchainPsramGeneralPatchState(
+          4, 1'u32, -1, false, true, false, true,
+          blaiToolchainPatchMetadataGeneral, 3) and
+      inheritedGeneralPsramPatchApplied and
+      inheritedGeneralPsramPatchState ==
+        blaiToolchainPsramGeneralPatchState(
+          4, 1'u32, -1, false, true, false, true,
+          blaiToolchainPatchMetadataGeneral, 3))
+  check("NPU model SDK helper PSRAM general patch apply blocked",
+    not blockedGeneralPsramPatchApplyPlan.valid and
+      blockedGeneralPsramPatchApplyPlan.firstBlock ==
+        blaiToolchainPsramGeneralPatchApplyPatchPlan and
+      not blockedGeneralPsramPatchApplied and
+      blockedGeneralPsramPatchState ==
+        blaiToolchainPsramGeneralPatchState(
+          7, 3'u32, 8, true, false, true, false,
+          blaiToolchainPatchMetadataTflite, 9))
+  check("NPU model SDK helper PSRAM DSP patch pair",
+    dspPatchPairPlan.valid and
+      dspPatchPairPlanInto == dspPatchPairPlan and
+      dspPatchPairPlan.currentLayerIndex == 1 and
+      dspPatchPairPlan.requestedPatchCount == 1 and
+      dspPatchPairPlan.relationConsumerFound and
+      dspPatchPairPlan.relationConsumerLayerIndex == 4 and
+      dspPatchPairPlan.selectedPreviousOwnerFlag and
+      dspPatchPairPlan.generalSearchCall and
+      dspPatchPairPlan.dspSearchCall and
+      dspPatchPairPlan.metadataMode == blaiToolchainPatchMetadataDsp and
+      dspPatchPairPlan.owner == 0)
+  check("NPU model SDK helper PSRAM DSP patch pair debug",
+    dspPatchPairPlan.valid and
+      dspPatchPairPlan.dspDebugPrintRequested and
+      dspPatchPairPlan.previousOwnerFlagPushed and
+      dspPatchPairPlan.dspDebugStartOffset ==
+        BlaiToolchainPsramDspDebugStartOffset and
+      dspPatchPairPlan.dspDebugStackBytes ==
+        BlaiToolchainPsramDspDebugStackBytes and
+      not blockedDspPatchPairPreparePlan.dspDebugPrintRequested)
+  check("NPU model SDK helper PSRAM DSP patch pair apply",
+    dspPatchPairApplyPlan.valid and
+      dspPatchPairApplyPlanInto == dspPatchPairApplyPlan and
+      dspPatchPairApplyPlan.stateAfter ==
+        blaiToolchainPsramDspPatchPairState(
+          1, 1'u32, 4, true, true, true, true, true,
+          blaiToolchainPatchMetadataDsp, 0,
+          BlaiToolchainPsramDspDebugStartOffset,
+          BlaiToolchainPsramDspDebugStackBytes, true, true) and
+      dspPatchPairApplied and
+      dspPatchPairState ==
+        blaiToolchainPsramDspPatchPairState(
+          1, 1'u32, 4, true, true, true, true, true,
+          blaiToolchainPatchMetadataDsp, 0,
+          BlaiToolchainPsramDspDebugStartOffset,
+          BlaiToolchainPsramDspDebugStackBytes, true, true))
+  check("NPU model SDK helper PSRAM DSP volume patch pair",
+    dspVolumePatchPairPlan.valid and
+      dspVolumePatchPairPlanInto == dspVolumePatchPairPlan and
+      dspVolumePatchPairPlan.currentLayerIndex == 1 and
+      dspVolumePatchPairPlan.requestedPatchCount == 1 and
+      dspVolumePatchPairPlan.relationConsumerFound and
+      dspVolumePatchPairPlan.relationConsumerLayerIndex == 4 and
+      dspVolumePatchPairPlan.selectedPreviousOwnerFlag and
+      dspVolumePatchPairPlan.generalSearchCall and
+      dspVolumePatchPairPlan.dspSearchCall and
+      dspVolumePatchPairPlan.metadataMode == blaiToolchainPatchMetadataDsp and
+      dspVolumePatchPairPlan.owner == 0 and
+      dspVolumePatchPairPlan.dspDebugPrintRequested and
+      dspVolumePatchPairPlan.dspDebugStartOffset ==
+        BlaiToolchainPsramDspDebugStartOffset)
+  check("NPU model SDK helper PSRAM DSP volume patch pair apply",
+    dspVolumePatchPairApplyPlan.valid and
+      dspVolumePatchPairApplyPlanInto == dspVolumePatchPairApplyPlan and
+      dspVolumePatchPairApplyPlan.stateAfter ==
+        blaiToolchainPsramDspVolumePatchPairState(
+          1, 1'u32, 4, true, true, true, true, true,
+          blaiToolchainPatchMetadataDsp, 0,
+          BlaiToolchainPsramDspDebugStartOffset, true) and
+      dspVolumePatchPairApplied and
+      dspVolumePatchPairState ==
+        blaiToolchainPsramDspVolumePatchPairState(
+          1, 1'u32, 4, true, true, true, true, true,
+          blaiToolchainPatchMetadataDsp, 0,
+          BlaiToolchainPsramDspDebugStartOffset, true))
+  check("NPU model SDK helper PSRAM DSP volume patch pair blocked",
+    not blockedDspVolumePatchPairRequestPlan.valid and
+      blockedDspVolumePatchPairRequestPlan.firstBlock ==
+        blaiToolchainPsramDspVolumePatchPairRequest and
+      not blockedDspVolumePatchPairPreparePlan.valid and
+      blockedDspVolumePatchPairPreparePlan.firstBlock ==
+        blaiToolchainPsramDspVolumePatchPairPrepare)
+  check("NPU model SDK helper PSRAM DSP volume patch pair apply blocked",
+    not blockedDspVolumePatchPairApplyPlan.valid and
+      blockedDspVolumePatchPairApplyPlan.firstBlock ==
+        blaiToolchainPsramDspVolumePatchPairApplyPairPlan and
+      not blockedDspVolumePatchPairApplied and
+      blockedDspVolumePatchPairState ==
+        blaiToolchainPsramDspVolumePatchPairState(
+          7, 3'u32, 8, true, true, false, true, true,
+          blaiToolchainPatchMetadataTflite, 9, 11'u32, true))
+  check("NPU model SDK helper PSRAM DSP patch pair blocked",
+    not blockedDspPatchPairRequestPlan.valid and
+      blockedDspPatchPairRequestPlan.firstBlock ==
+        blaiToolchainPsramDspPatchPairRequest and
+      not blockedDspPatchPairPreparePlan.valid and
+      blockedDspPatchPairPreparePlan.firstBlock ==
+        blaiToolchainPsramDspPatchPairPrepare)
+  check("NPU model SDK helper PSRAM DSP patch pair apply blocked",
+    not blockedDspPatchPairApplyPlan.valid and
+      blockedDspPatchPairApplyPlan.firstBlock ==
+        blaiToolchainPsramDspPatchPairApplyPairPlan and
+      not blockedDspPatchPairApplied and
+      blockedDspPatchPairState ==
+        blaiToolchainPsramDspPatchPairState(
+          7, 3'u32, 8, true, true, false, true, true,
+          blaiToolchainPatchMetadataTflite, 9, 11'u32, 12'u32, true, false))
+  check("NPU model SDK helper PSRAM layer loop",
+    toolchainLayerLoop.valid and
+      toolchainLayerLoopInto == toolchainLayerLoop and
+      toolchainLayerLoop.withinLoopBounds and
+      toolchainLayerLoop.processLayer and
+      not toolchainLayerLoop.skippedLayer)
+  check("NPU model SDK helper PSRAM layer loop blocked",
+    skippedToolchainLayerLoop.valid and
+      skippedToolchainLayerLoop.withinLoopBounds and
+      skippedToolchainLayerLoop.skippedLayer and
+      not skippedToolchainLayerLoop.processLayer and
+      not badCountToolchainLayerLoop.valid and
+      badCountToolchainLayerLoop.firstBlock ==
+        blaiToolchainPsramLayerLoopLayerCount and
+      not badIndexToolchainLayerLoop.valid and
+      badIndexToolchainLayerLoop.firstBlock ==
+        blaiToolchainPsramLayerLoopLayerIndex)
+  check("NPU model SDK helper PSRAM layer transition",
+    toolchainLayerTransition.valid and
+      toolchainLayerTransitionInto == toolchainLayerTransition and
+      toolchainLayerTransition.nextLayerIndex == 2 and
+      toolchainLayerTransition.layerStrideBytes ==
+        BlaiToolchainPsramLayerStrideBytes and
+      toolchainLayerTransition.layerCopyQwords ==
+        BlaiToolchainPsramLayerCopyQwords and
+      toolchainLayerTransition.layerCopyBytes ==
+        BlaiToolchainPsramLayerCopyBytes and
+      toolchainLayerTransition.copyRequested and
+      toolchainLayerTransition.processLayer and
+      toolchainLayerTransition.alignedScalar == 16)
+  check("NPU model SDK helper PSRAM layer transition skipped end",
+    skippedToolchainLayerTransition.valid and
+      skippedToolchainLayerTransition.copyRequested and
+      skippedToolchainLayerTransition.skippedLayer and
+      not skippedToolchainLayerTransition.processLayer and
+      skippedToolchainLayerTransition.alignedScalar == 14 and
+      endToolchainLayerTransition.valid and
+      endToolchainLayerTransition.endReached and
+      not endToolchainLayerTransition.copyRequested and
+      negativeToolchainLayerTransition.valid and
+      negativeToolchainLayerTransition.alignedScalar == 0)
+  check("NPU model SDK helper PSRAM layer transition blocked",
+    not badCountToolchainLayerTransition.valid and
+      badCountToolchainLayerTransition.firstBlock ==
+        blaiToolchainPsramLayerTransitionLayerCount and
+      not badIndexToolchainLayerTransition.valid and
+      badIndexToolchainLayerTransition.firstBlock ==
+        blaiToolchainPsramLayerTransitionLayerIndex)
+  check("NPU model SDK helper PSRAM TFLite request",
+    toolchainTfliteRequest.valid and
+      toolchainTfliteRequestInto == toolchainTfliteRequest and
+      toolchainTfliteRequest.smallCountForced and
+      toolchainTfliteRequest.selectedCount == 4 and
+      toolchainTfliteRequest.inputElements == 262144 and
+      toolchainTfliteRequest.requestedPatchCount == 1)
+  check("NPU model SDK helper PSRAM TFLite request blocked",
+    smallToolchainTfliteRequest.valid and
+      not smallToolchainTfliteRequest.smallCountForced and
+      smallToolchainTfliteRequest.requestedPatchCount == 0 and
+      not badShapeToolchainTfliteRequest.valid and
+      badShapeToolchainTfliteRequest.firstBlock ==
+        blaiToolchainPsramTfliteRequestShape and
+      not overflowToolchainTfliteRequest.valid and
+      overflowToolchainTfliteRequest.firstBlock ==
+        blaiToolchainPsramTfliteRequestOverflow)
+  check("NPU model SDK helper PSRAM TFLite patch",
+    tflitePatchPlan.valid and
+      tflitePatchPlanInto == tflitePatchPlan and
+      tflitePatchPlan.currentLayerIndex == 1 and
+      tflitePatchPlan.requestedPatchCount == 1 and
+      tflitePatchPlan.relationConsumerFound and
+      tflitePatchPlan.relationConsumerLayerIndex == 4 and
+      tflitePatchPlan.selectedPreviousOwnerFlag and
+      tflitePatchPlan.tfliteSearchCall and
+      tflitePatchPlan.metadataMode == blaiToolchainPatchMetadataTflite and
+      tflitePatchPlan.owner == 4)
+  check("NPU model SDK helper PSRAM TFLite patch apply",
+    tflitePatchApplyPlan.valid and
+      tflitePatchApplyPlanInto == tflitePatchApplyPlan and
+      tflitePatchApplyPlan.stateAfter ==
+        blaiToolchainPsramTflitePatchState(
+          1, 1'u32, 4, true, true, true, true,
+          blaiToolchainPatchMetadataTflite, 4) and
+      tflitePatchApplied and
+      tflitePatchState ==
+        blaiToolchainPsramTflitePatchState(
+          1, 1'u32, 4, true, true, true, true,
+          blaiToolchainPatchMetadataTflite, 4))
+  check("NPU model SDK helper PSRAM TFLite patch blocked",
+    not blockedTflitePatchRequestPlan.valid and
+      blockedTflitePatchRequestPlan.firstBlock ==
+        blaiToolchainPsramTflitePatchRequest and
+      not blockedTflitePatchPreparePlan.valid and
+      blockedTflitePatchPreparePlan.firstBlock ==
+        blaiToolchainPsramTflitePatchPrepare)
+  check("NPU model SDK helper PSRAM TFLite patch apply blocked",
+    not blockedTflitePatchApplyPlan.valid and
+      blockedTflitePatchApplyPlan.firstBlock ==
+        blaiToolchainPsramTflitePatchApplyPatchPlan and
+      not blockedTflitePatchApplied and
+      blockedTflitePatchState ==
+        blaiToolchainPsramTflitePatchState(
+          7, 3'u32, 8, true, false, true, false,
+          blaiToolchainPatchMetadataDsp, 9))
+  check("NPU model SDK helper PSRAM request store",
+    toolchainRequestStorePlan.valid and
+      toolchainRequestStorePlanInto == toolchainRequestStorePlan and
+      toolchainRequestStorePlan.requestTableOffset ==
+      BlaiToolchainPatchDebugRequestTableOffset and
+      toolchainRequestStored and toolchainRequestTable[2] == 1 and
+      toolchainRequestStorePlan.writesApplied == 1)
+  check("NPU model SDK helper PSRAM request store apply",
+    toolchainRequestStoreApplyPlan.valid and
+      toolchainRequestStoreApplyPlanInto == toolchainRequestStoreApplyPlan and
+      toolchainRequestStoreApplyPlan.stateAfter ==
+        blaiToolchainPsramLayerRequestStoreState(
+          2, BlaiToolchainPatchDebugRequestTableOffset, 2'u32, 4'u32,
+          1'u32, 1'u32) and
+      toolchainRequestStoreStateApplied and
+      toolchainRequestStoreState ==
+        blaiToolchainPsramLayerRequestStoreState(
+          2, BlaiToolchainPatchDebugRequestTableOffset, 2'u32, 4'u32,
+          1'u32, 1'u32))
+  check("NPU model SDK helper PSRAM request store blocked",
+    not invalidToolchainRequestStorePlan.valid and
+      invalidToolchainRequestStorePlan.firstBlock ==
+        blaiToolchainPsramLayerRequestStoreRequestPlan and
+      not shortToolchainRequestStorePlan.valid and
+      shortToolchainRequestStorePlan.firstBlock ==
+        blaiToolchainPsramLayerRequestStoreStorage)
+  check("NPU model SDK helper PSRAM request store apply blocked",
+    not blockedToolchainRequestStoreApplyPlan.valid and
+      blockedToolchainRequestStoreApplyPlan.firstBlock ==
+        blaiToolchainPsramLayerRequestStoreApplyStorePlan and
+      not blockedToolchainRequestStoreStateApplied and
+      blockedToolchainRequestStoreState ==
+        blaiToolchainPsramLayerRequestStoreState(
+          7, 11'u32, 3'u32, 4'u32, 5'u32, 6'u32))
+  check("NPU model SDK helper set wei call",
+    setWeiCallPlan.valid and setWeiCallPlanInto == setWeiCallPlan and
+      setWeiCallPlan.layerIndex == 2 and
+      setWeiCallPlan.requestedPatchCount ==
+        toolchainLayerRequest.requestedPatchCount and
+      setWeiCallPlan.debugLogFlag and
+      setWeiCallPlan.byRefPatchCountInitial == 0)
+  check("NPU model SDK helper set wei call frame",
+    setWeiCallFramePlan.valid and
+      setWeiCallFramePlanInto == setWeiCallFramePlan and
+      setWeiCallFramePlan.copiesLayerByValue and
+      setWeiCallFramePlan.copiesNetworkByValue and
+      setWeiCallFramePlan.byRefPatchCountPrepared and
+      setWeiCallFramePlan.layerCopyQwords ==
+        BlaiToolchainPsramLayerCopyQwords and
+      setWeiCallFramePlan.layerCopyBytes ==
+        BlaiToolchainPsramLayerCopyBytes and
+      setWeiCallFramePlan.networkCopyQwords ==
+        BlaiToolchainSetWeiPatchNetworkCopyQwords and
+      setWeiCallFramePlan.networkCopyBytes ==
+        BlaiToolchainSetWeiPatchNetworkCopyBytes and
+      setWeiCallFramePlan.callFrameBytes ==
+        BlaiToolchainSetWeiPatchCallFrameBytes)
+  check("NPU model SDK helper set wei call blocked",
+    not invalidSetWeiCallPlan.valid and
+      invalidSetWeiCallPlan.firstBlock ==
+        blaiToolchainSetWeiPatchCallRequestPlan and
+      not badLayerSetWeiCallPlan.valid and
+      badLayerSetWeiCallPlan.firstBlock ==
+        blaiToolchainSetWeiPatchCallLayerIndex)
+  check("NPU model SDK helper set wei call frame blocked",
+    not invalidSetWeiCallFramePlan.valid and
+      invalidSetWeiCallFramePlan.firstBlock ==
+        blaiToolchainSetWeiPatchCallFrameCallPlan)
+  check("NPU model SDK helper set wei return",
+    setWeiReturnPlan.valid and setWeiReturnPlanInto == setWeiReturnPlan and
+      setWeiReturnPlan.byRefPatchCountInitial == 0 and
+      setWeiReturnPlan.byRefPatchCountAfter == 3 and
+      setWeiReturnPlan.scratchPatchCount == 3 and
+      setWeiReturnPlan.changed and
+      setWeiReturnApplyPlanInto == setWeiReturnApplyPlan and
+      setWeiReturnApplyPlan.valid and
+      setWeiReturnApplyPlan.scratchPatchCountAfter == 3 and
+      setWeiReturnApplyPlan.stateAfter ==
+        blaiToolchainSetWeiPatchReturnState(3, 0, 3, true) and
+      setWeiReturnStateApplied and
+      setWeiReturnState == setWeiReturnApplyPlan.stateAfter and
+      setWeiReturnApplied and
+      setWeiScratchPatchCount == 3)
+  check("NPU model SDK helper set wei return frame",
+    setWeiReturnFramePlan.valid and
+      setWeiReturnFramePlanInto == setWeiReturnFramePlan and
+      setWeiReturnFramePlan.byRefResultFrameOffset ==
+        BlaiToolchainSetWeiPatchByRefResultFrameOffset and
+      setWeiReturnFramePlan.returnStoreFrameOffset ==
+        BlaiToolchainSetWeiPatchReturnStoreFrameOffset and
+      setWeiReturnFramePlan.frameUnwindBytes ==
+        BlaiToolchainSetWeiPatchCallFrameBytes and
+      setWeiReturnFramePlan.byRefPatchCountAfter == 3 and
+      setWeiReturnFramePlan.resultCopiedToCallerFrame and
+      setWeiReturnFramePlan.frameUnwindMatchesCallFrame)
+  check("NPU model SDK helper set wei return blocked",
+    not invalidSetWeiReturnPlan.valid and
+      invalidSetWeiReturnPlan.firstBlock ==
+        blaiToolchainSetWeiPatchReturnCallPlan and
+      not invalidSetWeiReturnApplyPlan.valid and
+      invalidSetWeiReturnApplyPlan.firstBlock ==
+        blaiToolchainSetWeiPatchReturnApplyReturnPlan and
+      not blockedSetWeiReturnStateApplied and
+      blockedSetWeiReturnState ==
+        blaiToolchainSetWeiPatchReturnState(-9, -9, -9, true))
+  check("NPU model SDK helper set wei return frame blocked",
+    not invalidCallFrameSetWeiReturnFramePlan.valid and
+      invalidCallFrameSetWeiReturnFramePlan.firstBlock ==
+        blaiToolchainSetWeiPatchReturnFrameCallFrame and
+      not invalidReturnSetWeiReturnFramePlan.valid and
+      invalidReturnSetWeiReturnFramePlan.firstBlock ==
+        blaiToolchainSetWeiPatchReturnFrameReturnPlan)
+  check("NPU model SDK helper PSRAM input membership resume",
+    inputMembershipResumePlan.valid and
+      inputMembershipResumePlanInto == inputMembershipResumePlan and
+      inputMembershipResumePlan.inputElementBytes ==
+        BlaiToolchainPsramInputListElementBytes and
+      inputMembershipResumePlan.inputBaseFrameOffset ==
+        BlaiToolchainPsramInputResumeBaseFrameOffset and
+      inputMembershipResumePlan.inputByteOffsetFrameOffset ==
+        BlaiToolchainPsramInputResumeByteOffsetFrameOffset and
+      inputMembershipResumePlan.endBiasBytes ==
+        BlaiToolchainPsramInputResumeEndBiasBytes and
+      inputMembershipResumePlan.scannedByteCount == 16 and
+      inputMembershipResumePlan.foundFlagCleared and
+      inputMembershipResumePlan.jumpsToMembershipLoop and
+      inputMembershipResumePlan.membership.found)
+  check("NPU model SDK helper PSRAM input membership resume blocked",
+    emptyInputMembershipResumePlan.valid and
+      emptyInputMembershipResumePlan.foundFlagCleared and
+      not emptyInputMembershipResumePlan.jumpsToMembershipLoop and
+      not misalignedInputMembershipResumePlan.valid and
+      misalignedInputMembershipResumePlan.firstBlock ==
+        blaiToolchainPsramInputMembershipResumeByteOffset and
+      not shortInputMembershipResumePlan.valid and
+      shortInputMembershipResumePlan.firstBlock ==
+        blaiToolchainPsramInputMembershipResumeMembership and
+      not invalidReturnInputMembershipResumePlan.valid and
+      invalidReturnInputMembershipResumePlan.firstBlock ==
+        blaiToolchainPsramInputMembershipResumeReturnFrame)
+  check("NPU model SDK helper PSRAM input membership resume apply",
+    inputMembershipResumeApplyPlan.valid and
+      inputMembershipResumeApplyPlanInto == inputMembershipResumeApplyPlan and
+      inputMembershipResumeApplyPlan.layerIndex == 3 and
+      inputMembershipResumeApplyPlan.foundAfterResume and
+      inputMembershipResumeApplyPlan.foundFlagCleared and
+      inputMembershipResumeApplyPlan.jumpsToMembershipLoop and
+      inputMembershipResumeApplyPlan.scannedEntries == 4'u32 and
+      inputMembershipResumeApplyPlan.stateAfter ==
+        blaiToolchainPsramInputMembershipResumeState(
+          3, true, true, true, 4'u32) and
+      inputMembershipResumeApplied and inputMembershipFoundAfterResume and
+      inputMembershipResumeStateApplied and
+      inputMembershipResumeState ==
+        blaiToolchainPsramInputMembershipResumeState(
+          3, true, true, true, 4'u32))
+  check("NPU model SDK helper PSRAM input membership resume apply blocked",
+    not invalidInputMembershipResumeApplyPlan.valid and
+      invalidInputMembershipResumeApplyPlan.firstBlock ==
+        blaiToolchainPsramInputMembershipResumeApplyResumePlan and
+      not invalidInputMembershipResumeApplied and
+      blockedInputMembershipFoundAfterResume and
+      not invalidInputMembershipResumeStateApplied and
+      blockedInputMembershipResumeState ==
+        blaiToolchainPsramInputMembershipResumeState(
+          9, true, true, true, 10'u32))
+  check("NPU model SDK helper PSRAM initial input gate",
+    initialInputGateScanPlan.valid and
+      initialInputGateScanPlanInto == initialInputGateScanPlan and
+      initialInputGateScanPlan.inputFlagOffset ==
+        BlaiToolchainPsramInitialInputFlagOffset and
+      initialInputGateScanPlan.inputCountOffset ==
+        BlaiToolchainPsramInitialInputCountOffset and
+      initialInputGateScanPlan.action ==
+        blaiToolchainPsramInitialInputGateScanInputs and
+      initialInputGateScanPlan.savedPreviousMembershipFound and
+      initialInputGateScanPlan.initializesRelationScan and
+      initialInputGateScanPlan.resetsScanSentinel)
+  check("NPU model SDK helper PSRAM initial input gate branches",
+    initialInputGateSwitchPlan.valid and
+      initialInputGateSwitchPlan.action ==
+        blaiToolchainPsramInitialInputGateLayerTypeSwitch and
+      initialInputGateEmptySwitchPlan.valid and
+      initialInputGateEmptySwitchPlan.action ==
+        blaiToolchainPsramInitialInputGateLayerTypeSwitch and
+      initialInputGateFirstLayerPlan.valid and
+      initialInputGateFirstLayerPlan.action ==
+        blaiToolchainPsramInitialInputGateFirstLayerNoFlag)
+  check("NPU model SDK helper PSRAM initial input gate blocked",
+    not initialInputGateBadLayerPlan.valid and
+      initialInputGateBadLayerPlan.firstBlock ==
+        blaiToolchainPsramInitialInputGateLayerIndex and
+      not initialInputGateBadCountPlan.valid and
+      initialInputGateBadCountPlan.firstBlock ==
+        blaiToolchainPsramInitialInputGateCount)
+  check("NPU model SDK helper PSRAM initial input gate apply",
+    initialInputGateApplyPlan.valid and
+      initialInputGateApplyPlanInto == initialInputGateApplyPlan and
+      initialInputGateApplyPlan.stateAfter ==
+        blaiToolchainPsramInitialInputGateState(
+          blaiToolchainPsramInitialInputGateScanInputs, true, true,
+          BlaiToolchainPsramInitialRelationSentinel) and
+      initialInputGateApplied and
+      initialInputGateState ==
+        blaiToolchainPsramInitialInputGateState(
+          blaiToolchainPsramInitialInputGateScanInputs, true, true,
+          BlaiToolchainPsramInitialRelationSentinel))
+  check("NPU model SDK helper PSRAM initial input gate apply switch",
+    switchInitialInputGateApplyPlan.valid and
+      switchInitialInputGateApplyPlan.stateAfter ==
+        blaiToolchainPsramInitialInputGateState(
+          blaiToolchainPsramInitialInputGateLayerTypeSwitch, false, false, 0) and
+      switchInitialInputGateApplied and
+      switchInitialInputGateState ==
+        blaiToolchainPsramInitialInputGateState(
+          blaiToolchainPsramInitialInputGateLayerTypeSwitch, false, false, 0))
+  check("NPU model SDK helper PSRAM initial input gate apply blocked",
+    not blockedInitialInputGateApplyPlan.valid and
+      blockedInitialInputGateApplyPlan.firstBlock ==
+        blaiToolchainPsramInitialInputGateApplyGatePlan and
+      not blockedInitialInputGateApplied and
+      blockedInitialInputGateState ==
+        blaiToolchainPsramInitialInputGateState(
+          blaiToolchainPsramInitialInputGateFirstLayerNoFlag, true, true, -5))
+  check("NPU model SDK helper PSRAM initial relation scan",
+    initialRelationScanPlan.valid and
+      initialRelationScanPlanInto == initialRelationScanPlan and
+      initialRelationScanPlan.relationSentinel ==
+        BlaiToolchainPsramInitialRelationSentinel and
+      initialRelationScanPlan.relationCountElementBytes ==
+        BlaiToolchainPsramRelationCountElementBytes and
+      initialRelationScanPlan.relationRowStrideBytes ==
+        BlaiToolchainPsramRelationRowStrideBytes and
+      initialRelationScanPlan.scanStartLayer == 0 and
+      initialRelationScanPlan.scannedRows == 5 and
+      initialRelationScanPlan.scannedEntries == 4 and
+      initialRelationScanPlan.matchCount == 2 and
+      initialRelationScanPlan.found and
+      initialRelationScanPlan.selectedLayerIndex == 4 and
+      initialRelationScanApplyPlan.valid and
+      initialRelationScanApplyPlanInto == initialRelationScanApplyPlan and
+      initialRelationScanStateApplied and
+      initialRelationScanState ==
+        blaiToolchainPsramInitialRelationScanState(
+          0, 4, BlaiToolchainPsramInitialRelationSentinel,
+          5'u32, 4'u32, 2'u32, true))
+  check("NPU model SDK helper PSRAM initial relation scan blocked",
+    not inactiveInitialRelationScanPlan.valid and
+      inactiveInitialRelationScanPlan.firstBlock ==
+        blaiToolchainPsramInitialRelationScanGate and
+      not inactiveInitialRelationScanApplyPlan.valid and
+      inactiveInitialRelationScanApplyPlan.firstBlock ==
+        blaiToolchainPsramInitialRelationScanApplyScanPlan and
+      not blockedInitialRelationScanStateApplied and
+      blockedInitialRelationScanState ==
+        blaiToolchainPsramInitialRelationScanState(
+          9, 10, 11, 12'u32, 13'u32, 14'u32, true) and
+      not storageInitialRelationScanPlan.valid and
+      storageInitialRelationScanPlan.firstBlock ==
+        blaiToolchainPsramInitialRelationScanStorage and
+      not capacityInitialRelationScanPlan.valid and
+      capacityInitialRelationScanPlan.firstBlock ==
+        blaiToolchainPsramInitialRelationScanCapacity)
+  check("NPU model SDK helper PSRAM initial tflite request",
+    initialTfliteRequestPlan.valid and
+      initialTfliteRequestPlanInto == initialTfliteRequestPlan and
+      initialTfliteRequestPlan.selectedLayerIndex == 4 and
+      initialTfliteRequestPlan.factorAOffset ==
+        BlaiToolchainPsramInitialTfliteFactorAOffset and
+      initialTfliteRequestPlan.factorBOffset ==
+        BlaiToolchainPsramInitialTfliteFactorBOffset and
+      initialTfliteRequestPlan.countOffset ==
+        BlaiToolchainPsramInitialTfliteCountOffset and
+      initialTfliteRequestPlan.request.smallCountForced and
+      initialTfliteRequestPlan.request.selectedCount == 4 and
+      initialTfliteRequestPlan.requestedPatchCount == 1 and
+      initialTfliteRequestPlan.selectedPreviousOwnerFlag and
+      initialTfliteRequestApplyPlan.valid and
+      initialTfliteRequestApplyPlanInto == initialTfliteRequestApplyPlan and
+      initialTfliteRequestApplyPlan.stateAfter ==
+        blaiToolchainPsramInitialTfliteRequestState(
+          4, BlaiToolchainPsramInitialTfliteFactorAOffset,
+          BlaiToolchainPsramInitialTfliteFactorBOffset,
+          BlaiToolchainPsramInitialTfliteCountOffset,
+          256, 256, 3, 4'u32, BlaiToolchainPatchPreviousOwnerType,
+          1'u32, true) and
+      initialTfliteRequestStateApplied and
+      initialTfliteRequestState ==
+        initialTfliteRequestApplyPlan.stateAfter)
+  check("NPU model SDK helper PSRAM initial tflite request blocked",
+    not inactiveInitialTfliteRequestPlan.valid and
+      inactiveInitialTfliteRequestPlan.firstBlock ==
+        blaiToolchainPsramInitialTfliteRequestScan and
+      not inactiveInitialTfliteRequestApplyPlan.valid and
+      inactiveInitialTfliteRequestApplyPlan.firstBlock ==
+        blaiToolchainPsramInitialTfliteRequestApplyRequestPlan and
+      not blockedInitialTfliteRequestStateApplied and
+      blockedInitialTfliteRequestState ==
+        blaiToolchainPsramInitialTfliteRequestState(
+          9, 10'u32, 11'u32, 12'u32, 13, 14, 15, 16'u32, 17,
+          18'u32, true) and
+      noMatchInitialRelationScanPlan.valid and
+      not noMatchInitialRelationScanPlan.found and
+      not noSelectedInitialTfliteRequestPlan.valid and
+      noSelectedInitialTfliteRequestPlan.firstBlock ==
+        blaiToolchainPsramInitialTfliteRequestSelectedLayer and
+      not badShapeInitialTfliteRequestPlan.valid and
+      badShapeInitialTfliteRequestPlan.firstBlock ==
+        blaiToolchainPsramInitialTfliteRequestRequest)
+  check("NPU model SDK helper PSRAM initial tflite patch",
+    initialTflitePatchPlan.valid and
+      initialTflitePatchPlanInto == initialTflitePatchPlan and
+      initialTflitePatchPlan.selectedLayerIndex == 4 and
+      initialTflitePatchPlan.requestedPatchCount == 1 and
+      initialTflitePatchPlan.relationConsumerFound and
+      initialTflitePatchPlan.relationConsumerLayerIndex == 4 and
+      initialTflitePatchPlan.selectedPreviousOwnerFlag and
+      initialTflitePatchPlan.tfliteSearchCall and
+      initialTflitePatchPlan.metadataMode ==
+        blaiToolchainPatchMetadataTflite and
+      initialTflitePatchPlan.owner == 4)
+  check("NPU model SDK helper PSRAM initial tflite patch apply",
+    initialTflitePatchApplyPlan.valid and
+      initialTflitePatchApplyPlanInto == initialTflitePatchApplyPlan and
+      initialTflitePatchApplyPlan.stateAfter ==
+        blaiToolchainPsramInitialTflitePatchState(
+          4, 1'u32, 4, true, true, true, true,
+          blaiToolchainPatchMetadataTflite, 4) and
+      initialTflitePatchStateApplied and
+      initialTflitePatchState ==
+        initialTflitePatchApplyPlan.stateAfter and
+      initialTflitePatchScalarsApplied and
+      initialTflitePatchLayer == 4 and
+      initialTflitePatchCount == 1 and
+      initialTflitePatchOwner == 4)
+  check("NPU model SDK helper PSRAM initial tflite patch blocked",
+    not inactiveInitialTflitePatchPlan.valid and
+      inactiveInitialTflitePatchPlan.firstBlock ==
+        blaiToolchainPsramInitialTflitePatchRequest and
+      not inactiveInitialTflitePatchApplyPlan.valid and
+      inactiveInitialTflitePatchApplyPlan.firstBlock ==
+        blaiToolchainPsramInitialTflitePatchApplyPatchPlan and
+      not blockedInitialTflitePatchStateApplied and
+      blockedInitialTflitePatchState ==
+        blaiToolchainPsramInitialTflitePatchState(
+          9, 10'u32, 11, true, true, false, true,
+          blaiToolchainPatchMetadataDsp, 12) and
+      not blockedInitialTflitePatchScalarsApplied and
+      blockedInitialTflitePatchLayer == 9 and
+      blockedInitialTflitePatchCount == 10 and
+      blockedInitialTflitePatchOwner == 11)
+  check("NPU model SDK helper PSRAM initial tflite loop",
+    initialTfliteLoopAgainPlan.valid and
+      initialTfliteLoopAgainEvidence.valid and
+      initialTfliteLoopAgainPlan.evidence ==
+        initialTfliteLoopAgainEvidence and
+      initialTfliteLoopAgainEvidence.requestValid and
+      initialTfliteLoopAgainEvidence.inputCountValid and
+      initialTfliteLoopAgainEvidence.sentinelValid and
+      initialTfliteLoopAgainPlanInto == initialTfliteLoopAgainPlan and
+      initialTfliteLoopAgainPlan.callAuxStackBytes ==
+        BlaiToolchainPsramInitialTfliteCallAuxStackBytes and
+      initialTfliteLoopAgainPlan.sentinelBefore ==
+        BlaiToolchainPsramInitialTfliteLoopSentinel and
+      initialTfliteLoopAgainPlan.comparisonOrdinal == 1 and
+      initialTfliteLoopAgainPlan.sentinelAfter == -2 and
+      initialTfliteLoopAgainPlan.loopAgain and
+      not initialTfliteLoopAgainPlan.restoreSavedMembershipFound and
+      initialTfliteLoopDonePlan.valid and
+      initialTfliteLoopDonePlan.comparisonOrdinal == 2 and
+      initialTfliteLoopDonePlan.sentinelAfter == -3 and
+      not initialTfliteLoopDonePlan.loopAgain and
+      initialTfliteLoopDonePlan.restoreSavedMembershipFound)
+  check("NPU model SDK helper PSRAM initial tflite loop apply",
+    initialTfliteLoopApplyPlan.valid and
+      initialTfliteLoopApplyPlanInto == initialTfliteLoopApplyPlan and
+      initialTfliteLoopApplyPlan.sentinelAfter == -3 and
+      initialTfliteLoopApplyPlan.updatesMembershipFound and
+      initialTfliteLoopApplyPlan.membershipFoundAfter and
+      initialTfliteLoopApplyPlan.stateAfter ==
+        blaiToolchainPsramInitialTfliteLoopState(
+          -3, true, true, false,
+          BlaiToolchainPsramInitialTfliteCallAuxStackBytes) and
+      initialTfliteLoopStateApplied and
+      initialTfliteLoopState == initialTfliteLoopApplyPlan.stateAfter and
+      initialTfliteLoopApplied and initialTfliteLoopSentinel == -3 and
+      initialTfliteLoopMembershipFound)
+  check("NPU model SDK helper PSRAM initial tflite loop blocked",
+    not invalidInitialTfliteLoopRequestPlan.valid and
+      invalidInitialTfliteLoopRequestPlan.firstBlock ==
+        blaiToolchainPsramInitialTfliteLoopRequest and
+      not badCountInitialTfliteLoopPlan.valid and
+      badCountInitialTfliteLoopPlan.firstBlock ==
+        blaiToolchainPsramInitialTfliteLoopInputCount and
+      not badSentinelInitialTfliteLoopPlan.valid and
+      badSentinelInitialTfliteLoopPlan.firstBlock ==
+        blaiToolchainPsramInitialTfliteLoopSentinel and
+      not invalidInitialTfliteLoopApplyPlan.valid and
+      invalidInitialTfliteLoopApplyPlan.firstBlock ==
+        blaiToolchainPsramInitialTfliteLoopApplyLoopPlan and
+      not invalidInitialTfliteLoopStateApplied and
+      blockedInitialTfliteLoopState ==
+        blaiToolchainPsramInitialTfliteLoopState(
+          -9, true, true, false, 16) and
+      not invalidInitialTfliteLoopApplied and
+      blockedInitialTfliteLoopSentinel == -1 and
+      blockedInitialTfliteLoopMembershipFound)
+  check("NPU model SDK helper PSRAM initial tflite join",
+    initialTfliteJoinPlan.valid and
+      initialTfliteJoinEvidence.valid and
+      initialTfliteJoinPlan.evidence == initialTfliteJoinEvidence and
+      initialTfliteJoinEvidence.gateValid and
+      initialTfliteJoinEvidence.scanInputGate and
+      initialTfliteJoinEvidence.sentinelValid and
+      initialTfliteJoinEvidence.selectedLayerAbi.valid and
+      initialTfliteJoinEvidence.selectedLayerInRange and
+      initialTfliteJoinPlanInto == initialTfliteJoinPlan and
+      initialTfliteJoinPlan.selectedLayerIndex == 0 and
+      initialTfliteJoinPlan.relationConsumerLayerIndex == 0 and
+      not initialTfliteJoinPlan.relationConsumerFound and
+      initialTfliteJoinPlan.selectedFromSentinel and
+      initialTfliteJoinPlan.clearsRelationScalars and
+      initialTfliteJoinPlan.joinsRequestPath and
+      secondInitialTfliteJoinPlan.valid and
+      secondInitialTfliteJoinPlan.selectedLayerIndex == 1)
+  check("NPU model SDK helper PSRAM initial tflite join apply",
+    initialTfliteJoinApplyPlan.valid and
+      initialTfliteJoinApplyPlanInto == initialTfliteJoinApplyPlan and
+      initialTfliteJoinApplyPlan.selectedLayerIndexAfter == 0 and
+      initialTfliteJoinApplyPlan.relationConsumerLayerIndexAfter == 0 and
+      not initialTfliteJoinApplyPlan.relationConsumerFoundAfter and
+      initialTfliteJoinApplyPlan.stateAfter ==
+        blaiToolchainPsramInitialTfliteJoinState(
+          0, 0, false, true, true) and
+      initialTfliteJoinApplied and initialTfliteJoinSelectedLayer == 0 and
+      initialTfliteJoinConsumerLayer == 0 and
+      not initialTfliteJoinConsumerFound and
+      initialTfliteJoinStateApplied and
+      initialTfliteJoinState == initialTfliteJoinApplyPlan.stateAfter)
+  check("NPU model SDK helper PSRAM initial tflite join blocked",
+    not inactiveInitialTfliteJoinPlan.valid and
+      inactiveInitialTfliteJoinPlan.firstBlock ==
+        blaiToolchainPsramInitialTfliteJoinGate and
+      not badSentinelInitialTfliteJoinPlan.valid and
+      badSentinelInitialTfliteJoinPlan.firstBlock ==
+        blaiToolchainPsramInitialTfliteJoinSentinel and
+      not shortInitialTfliteJoinPlan.valid and
+      shortInitialTfliteJoinPlan.firstBlock ==
+        blaiToolchainPsramInitialTfliteJoinLayerCount and
+      not invalidInitialTfliteJoinApplyPlan.valid and
+      invalidInitialTfliteJoinApplyPlan.firstBlock ==
+        blaiToolchainPsramInitialTfliteJoinApplyJoinPlan and
+      not invalidInitialTfliteJoinApplied and
+      not invalidInitialTfliteJoinStateApplied and
+      blockedInitialTfliteJoinSelectedLayer == -1 and
+      blockedInitialTfliteJoinConsumerLayer == 7 and
+      blockedInitialTfliteJoinConsumerFound and
+      blockedInitialTfliteJoinState ==
+        blaiToolchainPsramInitialTfliteJoinState(
+          -1, 7, true, false, false))
+  check("NPU model SDK helper PSRAM initial tflite join request",
+    initialTfliteJoinRequestPlan.valid and
+      initialTfliteJoinRequestEvidence.valid and
+      initialTfliteJoinRequestPlan.evidence ==
+        initialTfliteJoinRequestEvidence and
+      initialTfliteJoinRequestPlan.syntheticScan ==
+        initialTfliteJoinRequestEvidence.syntheticScan and
+      initialTfliteJoinRequestEvidence.joinValid and
+      initialTfliteJoinRequestEvidence.requestValid and
+      initialTfliteJoinRequestEvidence.syntheticScan.valid and
+      initialTfliteJoinRequestEvidence.syntheticScan.selectedLayerIndex == 0 and
+      initialTfliteJoinRequestPlanInto == initialTfliteJoinRequestPlan and
+      initialTfliteJoinRequestPlan.selectedLayerIndex == 0 and
+      initialTfliteJoinRequestPlan.relationConsumerLayerIndex == 0 and
+      not initialTfliteJoinRequestPlan.relationConsumerFound and
+      initialTfliteJoinRequestPlan.requestedPatchCount == 1 and
+      initialTfliteJoinRequestPlan.selectedPreviousOwnerFlag and
+      initialTfliteJoinRequestPlan.request.valid and
+      initialTfliteJoinRequestPlan.request.selectedLayerIndex == 0 and
+      initialTfliteJoinRequestPlan.request.requestedPatchCount == 1)
+  check("NPU model SDK helper PSRAM initial tflite join request apply",
+    initialTfliteJoinRequestApplyPlan.valid and
+      initialTfliteJoinRequestApplyEvidence.valid and
+      initialTfliteJoinRequestApplyEvidence.requestValid and
+      initialTfliteJoinRequestApplyPlan.evidence ==
+        initialTfliteJoinRequestApplyEvidence and
+      initialTfliteJoinRequestApplyPlan.stateAfter ==
+        initialTfliteJoinRequestApplyEvidence.stateAfter and
+      initialTfliteJoinRequestApplyPlan.summaryStateAfter ==
+        initialTfliteJoinRequestApplyEvidence.summaryStateAfter and
+      initialTfliteJoinRequestApplyPlanInto ==
+        initialTfliteJoinRequestApplyPlan and
+      initialTfliteJoinRequestApplyPlan.stateAfter ==
+        blaiToolchainPsramInitialTfliteJoinRequestState(
+          0, 0, false, BlaiToolchainPsramInitialTfliteFactorAOffset,
+          BlaiToolchainPsramInitialTfliteFactorBOffset,
+          BlaiToolchainPsramInitialTfliteCountOffset,
+          256, 256, 3, 4, BlaiToolchainPatchPreviousOwnerType,
+          1, true, true) and
+      initialTfliteJoinRequestApplyPlan.summaryStateAfter ==
+        blaiToolchainPsramInitialTfliteJoinRequestSummaryState(
+          0, 0, false, BlaiToolchainPsramInitialTfliteFactorAOffset,
+          BlaiToolchainPsramInitialTfliteFactorBOffset,
+          BlaiToolchainPsramInitialTfliteCountOffset,
+          256, 256, 3, 4, BlaiToolchainPatchPreviousOwnerType,
+          1, true, true) and
+      initialTfliteJoinRequestApplyPlan.stateAfter.factorAOffset ==
+        BlaiToolchainPsramInitialTfliteFactorAOffset and
+      initialTfliteJoinRequestApplyPlan.stateAfter.factorBOffset ==
+        BlaiToolchainPsramInitialTfliteFactorBOffset and
+      initialTfliteJoinRequestApplyPlan.stateAfter.countOffset ==
+        BlaiToolchainPsramInitialTfliteCountOffset and
+      initialTfliteJoinRequestApplyPlan.stateAfter.factorA == 256 and
+      initialTfliteJoinRequestApplyPlan.stateAfter.factorB == 256 and
+      initialTfliteJoinRequestApplyPlan.stateAfter.countToSelect == 3 and
+      initialTfliteJoinRequestApplyPlan.stateAfter.selectedCount == 4 and
+      initialTfliteJoinRequestApplyPlan.stateAfter.nextLayerTypeValue ==
+        BlaiToolchainPatchPreviousOwnerType and
+      initialTfliteJoinRequestStateApplied and
+      initialTfliteJoinRequestState ==
+        initialTfliteJoinRequestApplyPlan.stateAfter and
+      initialTfliteJoinRequestScalarsApplied and
+      initialTfliteJoinRequestSelectedLayer == 0 and
+      initialTfliteJoinRequestConsumerLayer == 0 and
+      not initialTfliteJoinRequestConsumerFound and
+      initialTfliteJoinRequestPatchCount == 1 and
+      initialTfliteJoinRequestPreviousOwner and
+      initialTfliteJoinRequestPath and
+      initialTfliteJoinRequestSummaryApplied and
+      initialTfliteJoinRequestSummaryLayer == 0 and
+      initialTfliteJoinRequestSummaryConsumer == 0 and
+      not initialTfliteJoinRequestSummaryFound and
+      initialTfliteJoinRequestSummaryFactorAOffset ==
+        BlaiToolchainPsramInitialTfliteFactorAOffset and
+      initialTfliteJoinRequestSummaryFactorBOffset ==
+        BlaiToolchainPsramInitialTfliteFactorBOffset and
+      initialTfliteJoinRequestSummaryCountOffset ==
+        BlaiToolchainPsramInitialTfliteCountOffset and
+      initialTfliteJoinRequestSummaryFactorA == 256 and
+      initialTfliteJoinRequestSummaryFactorB == 256 and
+      initialTfliteJoinRequestSummaryCountToSelect == 3 and
+      initialTfliteJoinRequestSummarySelectedCount == 4 and
+      initialTfliteJoinRequestSummaryNextLayerType ==
+        BlaiToolchainPatchPreviousOwnerType and
+      initialTfliteJoinRequestSummaryPatchCount == 1 and
+      initialTfliteJoinRequestSummaryPreviousOwner and
+      initialTfliteJoinRequestSummaryPath)
+  check("NPU model SDK helper PSRAM initial tflite join request blocked",
+    not badJoinInitialTfliteJoinRequestPlan.valid and
+      badJoinInitialTfliteJoinRequestPlan.firstBlock ==
+        blaiToolchainPsramInitialTfliteJoinRequestJoin and
+      not badShapeInitialTfliteJoinRequestPlan.valid and
+      badShapeInitialTfliteJoinRequestPlan.firstBlock ==
+        blaiToolchainPsramInitialTfliteJoinRequestRequest and
+      not invalidInitialTfliteJoinRequestApplyPlan.valid and
+      invalidInitialTfliteJoinRequestApplyPlan.firstBlock ==
+        blaiToolchainPsramInitialTfliteJoinRequestApplyRequestPlan and
+      not invalidInitialTfliteJoinRequestStateApplied and
+      not invalidInitialTfliteJoinRequestScalarsApplied and
+      blockedInitialTfliteJoinRequestState ==
+        blaiToolchainPsramInitialTfliteJoinRequestState(
+          -1, 7, true, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+          false, false) and
+      blockedInitialTfliteJoinRequestSelectedLayer == -1 and
+      blockedInitialTfliteJoinRequestConsumerLayer == 7 and
+      blockedInitialTfliteJoinRequestConsumerFound and
+      blockedInitialTfliteJoinRequestPatchCount == 9 and
+      not blockedInitialTfliteJoinRequestPreviousOwner and
+      not blockedInitialTfliteJoinRequestPath)
+  check("NPU model SDK helper PSRAM owner transfer",
+    routeTransfer.valid and routeTransferred and
+      routeTransferApplyPlan.valid and
+      routeTransferApplyEvidence.valid and
+      routeTransferApplyEvidence.transitionValid and
+      routeTransferApplyEvidence.storageValid and
+      routeTransferApplyEvidence.occupiedCursor.valid and
+      routeTransferApplyEvidence.ownerCursor.valid and
+      routeTransferApplyEvidence.writesOwner and
+      not routeTransferApplyEvidence.writesOccupied and
+      routeTransferApplyPlan.evidence == routeTransferApplyEvidence and
+      routeTransferApplyPlan.stateAfter ==
+        blaiToolchainPsramOwnerTransitionState(
+          0'u32, blaiToolchainPsramOwnerTransfer, 3, 4, true, true, false) and
+      routeTransfer.action == blaiToolchainPsramOwnerTransfer and
+      transitionOwners[0] == 4 and transitionBitmap[0])
+  check("NPU model SDK helper PSRAM owner release",
+    releaseTransition.valid and releasedTransition and
+      releaseTransitionApplyPlan.valid and
+      releaseTransitionApplyPlan.stateAfter ==
+        blaiToolchainPsramOwnerTransitionState(
+          1'u32, blaiToolchainPsramOwnerRelease, 3, 3, false, false, true) and
+      releaseTransition.action == blaiToolchainPsramOwnerRelease and
+      not transitionBitmap[1] and transitionOwners[1] == 3)
+  check("NPU model SDK helper PSRAM owner ignore",
+    ignoredTransition.valid and ignoredTransitionApplyPlan.valid and
+      ignoredTransitionApplyPlan.stateAfter ==
+        blaiToolchainPsramOwnerTransitionState(
+          2'u32, blaiToolchainPsramOwnerIgnore, 7, 7, true, false, false) and
+      ignoredTransition.action == blaiToolchainPsramOwnerIgnore and
+      transitionOwners[2] == 7 and transitionBitmap[2])
+  check("NPU model SDK helper PSRAM owner missing start",
+    missingStartTransfer.valid and
+      missingStartTransfer.action == blaiToolchainPsramOwnerTransfer)
+  check("NPU model SDK helper PSRAM owner transition blocked",
+    not blockedTransitionApplyPlan.valid and
+      blockedTransitionApplyPlan.firstBlock ==
+        blaiToolchainPsramOwnerTransitionApplyStorage and
+      not blockedTransitionApplied and blockedTransitionBitmap[0] and
+      blockedTransitionOwners[0] == 3)
+  check("NPU model SDK helper PSRAM owner cleanup transfer",
+    cleanupConvRoute.valid and cleanupConvRouteInto == cleanupConvRoute and
+      cleanupConvRouteApplied and
+      cleanupConvRouteApplyPlan.valid and
+      cleanupConvRouteApplyEvidence.valid and
+      cleanupConvRouteApplyEvidence.cleanupValid and
+      cleanupConvRouteApplyEvidence.storageValid and
+      cleanupConvRouteApplyEvidence.occupiedCursor.valid and
+      cleanupConvRouteApplyEvidence.ownerCursor.valid and
+      cleanupConvRouteApplyEvidence.writesOwner and
+      not cleanupConvRouteApplyEvidence.writesOccupied and
+      cleanupConvRouteApplyPlan.evidence == cleanupConvRouteApplyEvidence and
+      cleanupConvRouteApplyPlan.stateAfter ==
+        blaiToolchainPsramOwnerCleanupState(
+          0'u32, blaiToolchainPsramOwnerCleanupTransfer, 3, 4, true,
+          true, false) and
+      cleanupConvRoute.action == blaiToolchainPsramOwnerCleanupTransfer and
+      cleanupOwners[0] == 4 and cleanupBitmap[0])
+  check("NPU model SDK helper PSRAM owner cleanup route flag",
+    cleanupRouteDebug.valid and
+      cleanupRouteDebug.action == blaiToolchainPsramOwnerCleanupTransfer)
+  check("NPU model SDK helper PSRAM owner cleanup release",
+    cleanupRelease.valid and cleanupReleased and
+      cleanupReleaseApplyPlan.valid and
+      cleanupReleaseApplyPlan.stateAfter ==
+        blaiToolchainPsramOwnerCleanupState(
+          2'u32, blaiToolchainPsramOwnerCleanupRelease, 3, 3, false,
+          false, true) and
+      cleanupRelease.action == blaiToolchainPsramOwnerCleanupRelease and
+      not cleanupBitmap[2] and cleanupOwners[2] == 3)
+  check("NPU model SDK helper PSRAM owner cleanup ignore",
+    cleanupIgnore.valid and cleanupIgnoreApplyPlan.valid and
+      cleanupIgnoreApplyPlan.stateAfter ==
+        blaiToolchainPsramOwnerCleanupState(
+          3'u32, blaiToolchainPsramOwnerCleanupIgnore, 7, 7, true,
+          false, false) and
+      cleanupIgnore.action == blaiToolchainPsramOwnerCleanupIgnore and
+      cleanupOwners[3] == 7 and cleanupBitmap[3])
+  check("NPU model SDK helper PSRAM owner cleanup blocked",
+    not blockedCleanupApplyPlan.valid and
+      blockedCleanupApplyPlan.firstBlock ==
+        blaiToolchainPsramOwnerCleanupApplyStorage and
+      not blockedCleanupApplied and blockedCleanupBitmap[0] and
+      blockedCleanupOwners[0] == 3)
+  check("NPU model SDK helper PSRAM owner cleanup sweep transfer",
+    cleanupSweepTransfer.valid and
+      cleanupSweepTransferInto == cleanupSweepTransfer and
+      cleanupSweepTransferApplyPlan.valid and
+      cleanupSweepTransferApplyEvidence.valid and
+      cleanupSweepTransferApplyEvidence.sweepValid and
+      cleanupSweepTransferApplyEvidence.storageValid and
+      cleanupSweepTransferApplyEvidence.occupiedStorageCount ==
+        BlaiToolchainMaxPsramPatchSlots and
+      cleanupSweepTransferApplyEvidence.ownerStorageCount ==
+        BlaiToolchainMaxPsramPatchSlots and
+      cleanupSweepTransferApplyPlan.evidence ==
+        cleanupSweepTransferApplyEvidence and
+      cleanupSweepTransferApplyPlan.stateAfter ==
+        blaiToolchainPsramOwnerCleanupSweepState(
+          BlaiToolchainMaxPsramPatchSlots,
+          BlaiToolchainMaxPsramPatchSlots,
+          BlaiToolchainMaxPsramPatchSlots,
+          BlaiToolchainMaxPsramPatchSlots, 37'u32, 3'u32, 0'u32) and
+      cleanupSweepTransferred and
+      cleanupSweepTransfer.scannedSlots == BlaiToolchainMaxPsramPatchSlots and
+      cleanupSweepTransfer.transferredSlots == 3 and
+      cleanupSweepTransfer.releasedSlots == 0 and
+      cleanupSweepTransferOwners[0] == 4 and
+      cleanupSweepTransferBitmap[0])
+  check("NPU model SDK helper PSRAM owner cleanup sweep release",
+    cleanupSweepRelease.valid and cleanupSweepReleased and
+      cleanupSweepReleaseApplyPlan.valid and
+      cleanupSweepReleaseApplyPlan.stateAfter.releasedSlots == 2 and
+      cleanupSweepRelease.releasedSlots == 2 and
+      cleanupSweepRelease.transferredSlots == 0 and
+      not cleanupSweepReleaseBitmap[0] and
+      cleanupSweepReleaseOwners[0] == 3)
+  check("NPU model SDK helper PSRAM owner cleanup sweep blocked",
+    not cleanupSweepBlocked.valid and
+      cleanupSweepBlocked.firstBlock ==
+        blaiToolchainPsramOwnerCleanupSweepStorage and
+      shortCleanupSweep.valid and
+      not shortCleanupSweepApplyPlan.valid and
+      shortCleanupSweepApplyPlan.firstBlock ==
+        blaiToolchainPsramOwnerCleanupSweepApplyStorage and
+      not shortCleanupSweepApplied and shortCleanupSweepBitmap[0] and
+      fullCleanupSweepOwners[0] == 3)
+  check("NPU model SDK helper PSRAM cleanup entry",
+    cleanupEntry.valid and cleanupEntryInto == cleanupEntry and
+      cleanupEntry.nextLayerIndex == 4 and
+      cleanupEntry.cleanupSlotStart == 0 and
+      cleanupEntry.entersCleanupSweep and
+      not cleanupEntry.jumpsLayerTransition and
+      not cleanupEntry.savedDebugLogFlag and
+      not cleanupEntry.debugSnapshotPath and
+      cleanupEntryDebug.valid and
+      cleanupEntryDebug.savedDebugLogFlag and
+      cleanupEntryDebug.debugSnapshotPath and
+      cleanupEntryApplyPlan.valid and
+      cleanupEntryApplyEvidence.valid and
+      cleanupEntryApplyEvidence.entryValid and
+      cleanupEntryApplyPlan.evidence == cleanupEntryApplyEvidence and
+      cleanupEntryApplyPlan.stateAfter ==
+        cleanupEntryApplyEvidence.stateAfter and
+      cleanupEntryApplyPlanInto == cleanupEntryApplyPlan and
+      cleanupEntryApplyPlan.nextLayerIndexAfter == 4 and
+      cleanupEntryApplyPlan.cleanupSlotStartAfter == 0 and
+      cleanupEntryApplyPlan.savedDebugLogFlagAfter and
+      cleanupEntryApplyPlan.debugSnapshotPath and
+      cleanupEntryApplyPlan.stateAfter ==
+        blaiToolchainPsramCleanupEntryState(
+          4, 0'u32, true, true, true, false) and
+      cleanupEntryApplied and cleanupEntryNextLayer == 4 and
+      cleanupEntrySlot == 0 and cleanupEntrySavedDebug and
+      cleanupEntryStateApplied and
+      cleanupEntryState == cleanupEntryApplyPlan.stateAfter)
+  check("NPU model SDK helper PSRAM cleanup entry blocked",
+    cleanupEntryEmpty.valid and
+      not cleanupEntryEmpty.entersCleanupSweep and
+      cleanupEntryEmpty.jumpsLayerTransition and
+      not cleanupEntryBadLayer.valid and
+      cleanupEntryBadLayer.firstBlock ==
+        blaiToolchainPsramCleanupEntryLayerIndex and
+      not cleanupEntryBadSlots.valid and
+      cleanupEntryBadSlots.firstBlock ==
+        blaiToolchainPsramCleanupEntryMaxPatchSlots and
+      not invalidCleanupEntryApplyPlan.valid and
+      invalidCleanupEntryApplyPlan.firstBlock ==
+        blaiToolchainPsramCleanupEntryApplyEntryPlan and
+      not invalidCleanupEntryApplied and
+      not invalidCleanupEntryStateApplied and
+      blockedCleanupEntryNextLayer == -1 and
+      blockedCleanupEntrySlot == 9 and blockedCleanupEntrySavedDebug and
+      blockedCleanupEntryState ==
+        blaiToolchainPsramCleanupEntryState(
+          -1, 9'u32, true, true, true, false))
+  check("NPU model SDK helper PSRAM post-search slot retain",
+    postSearchRetainPlan.valid and
+      postSearchRetainPlanInto == postSearchRetainPlan and
+      postSearchRetainPlan.action ==
+        blaiToolchainPsramPostSearchSlotStoreRetained and
+      postSearchRetainPlan.slotValueAfter == 4 and
+      postSearchRetained and postSearchSlotValues[0] == 4 and
+      postSearchOccupied[0])
+  check("NPU model SDK helper PSRAM post-search slot apply",
+    postSearchRetainApplyPlan.valid and
+      postSearchRetainApplyEvidence.valid and
+      postSearchRetainApplyEvidence.slotPlanValid and
+      postSearchRetainApplyPlanInto == postSearchRetainApplyPlan and
+      postSearchRetainApplyPlan.evidence ==
+        postSearchRetainApplyEvidence and
+      postSearchRetainApplyEvidence.stateAfter ==
+        postSearchRetainApplyPlan.stateAfter and
+      postSearchRetainApplyPlan.stateAfter ==
+        blaiToolchainPsramPostSearchSlotState(
+          0'u32, blaiToolchainPsramPostSearchSlotStoreRetained,
+          3, 4, true, 4) and
+      postSearchRetainStateApplied and
+      postSearchRetainState ==
+        blaiToolchainPsramPostSearchSlotState(
+          0'u32, blaiToolchainPsramPostSearchSlotStoreRetained,
+          3, 4, true, 4))
+  check("NPU model SDK helper PSRAM post-search slot release",
+    postSearchReleasePlan.valid and
+      postSearchReleasePlan.action ==
+        blaiToolchainPsramPostSearchSlotRelease and
+      not postSearchReleasePlan.occupiedAfter and
+      postSearchReleased and not postSearchOccupied[1] and
+      postSearchSlotValues[1] == 3)
+  check("NPU model SDK helper PSRAM post-search slot ignore",
+    postSearchIgnorePlan.valid and
+      postSearchIgnorePlan.action ==
+        blaiToolchainPsramPostSearchSlotIgnore and
+      postSearchIgnorePlan.slotValueAfter == 7)
+  check("NPU model SDK helper PSRAM post-search slot blocked",
+    not postSearchBlockedPlan.valid and
+      postSearchBlockedPlan.firstBlock ==
+        blaiToolchainPsramPostSearchSlotLayerIndex and
+      not postSearchBlockedApplyPlan.valid and
+      postSearchBlockedApplyPlan.firstBlock ==
+        blaiToolchainPsramPostSearchSlotApplySlotPlan and
+      not postSearchBlockedStateApplied and
+      postSearchBlockedState ==
+        blaiToolchainPsramPostSearchSlotState(
+          7'u32, blaiToolchainPsramPostSearchSlotRelease, 3, 4, false, 5))
+  check("NPU model SDK helper PSRAM cleanup debug slot",
+    cleanupDebugSlotPlan.valid and
+      cleanupDebugSlotPlanInto == cleanupDebugSlotPlan and
+      cleanupDebugSlotPlan.printRequested and
+      cleanupDebugSlotPlan.occupiedStorageCount == 3 and
+      not cleanupDebugSlotPlan.occupiedValue)
+  check("NPU model SDK helper PSRAM cleanup debug slot quiet",
+    quietCleanupDebugSlotPlan.valid and
+      not quietCleanupDebugSlotPlan.printRequested and
+      quietCleanupDebugSlotPlan.occupiedStorageCount == 0)
+  check("NPU model SDK helper PSRAM cleanup debug slot blocked",
+    not blockedCleanupDebugSlotPlan.valid and
+      blockedCleanupDebugSlotPlan.firstBlock ==
+        blaiToolchainPsramCleanupDebugSlotSlot)
+  check("NPU model SDK helper PSRAM cleanup debug slot apply",
+    cleanupDebugSlotApplyPlan.valid and
+      cleanupDebugSlotApplyEvidence.valid and
+      cleanupDebugSlotApplyEvidence.slotPlanValid and
+      cleanupDebugSlotApplyPlan.evidence == cleanupDebugSlotApplyEvidence and
+      cleanupDebugSlotApplyPlanInto == cleanupDebugSlotApplyPlan and
+      cleanupDebugSlotApplyPlan.printRequested and
+      cleanupDebugSlotApplyEvidence.summaryStateAfter ==
+        cleanupDebugSlotApplyPlan.summaryStateAfter and
+      cleanupDebugSlotApplyPlan.stateAfter ==
+        blaiToolchainPsramCleanupDebugSlotState(1'u32, false) and
+      cleanupDebugSlotApplied and
+      cleanupDebugSlotState ==
+        blaiToolchainPsramCleanupDebugSlotState(1'u32, false))
+  check("NPU model SDK helper PSRAM cleanup debug slot apply quiet",
+    quietCleanupDebugSlotApplyPlan.valid and
+      quietCleanupDebugSlotApplyEvidence.valid and
+      quietCleanupDebugSlotApplyEvidence.slotPlanValid and
+      quietCleanupDebugSlotApplyPlan.evidence ==
+        quietCleanupDebugSlotApplyEvidence and
+      not quietCleanupDebugSlotApplyPlan.printRequested and
+      quietCleanupDebugSlotApplied and
+      quietCleanupDebugSlotState ==
+        blaiToolchainPsramCleanupDebugSlotState(7'u32, true))
+  check("NPU model SDK helper PSRAM cleanup debug slot apply blocked",
+    not blockedCleanupDebugSlotApplyPlan.valid and
+      not blockedCleanupDebugSlotApplyEvidence.valid and
+      not blockedCleanupDebugSlotApplyEvidence.slotPlanValid and
+      blockedCleanupDebugSlotApplyPlan.evidence ==
+        blockedCleanupDebugSlotApplyEvidence and
+      blockedCleanupDebugSlotApplyPlan.firstBlock ==
+        blaiToolchainPsramCleanupDebugSlotApplySlotPlan and
+      not blockedCleanupDebugSlotApplied and
+      blockedCleanupDebugSlotState ==
+        blaiToolchainPsramCleanupDebugSlotState(11'u32, true))
+  check("NPU model SDK helper PSRAM metadata discard",
+    metadataDiscardPlan.valid and
+      metadataDiscardPlanInto == metadataDiscardPlan and
+      metadataDiscardPlan.clearGeneralMetadata and
+      metadataDiscardApplied and metadataDiscardStart == -1 and
+      metadataDiscardCount == -1)
+  check("NPU model SDK helper PSRAM metadata discard apply",
+    metadataDiscardApplyPlan.valid and
+      metadataDiscardApplyPlanInto == metadataDiscardApplyPlan and
+      metadataDiscardApplyPlan.stateAfter ==
+        blaiToolchainPsramMetadataDiscardState(
+          3, BlaiToolchainPatchDebugGeneralStartOffset,
+          BlaiToolchainPatchDebugGeneralCountOffset, true, -1, -1) and
+      metadataDiscardStateApplied and
+      metadataDiscardState ==
+        blaiToolchainPsramMetadataDiscardState(
+          3, BlaiToolchainPatchDebugGeneralStartOffset,
+          BlaiToolchainPatchDebugGeneralCountOffset, true, -1, -1))
+  check("NPU model SDK helper PSRAM metadata discard banks",
+    metadataDiscardBanksApplied and metadataDiscardStartSlots[3] == -1 and
+      metadataDiscardCounts[3] == -1)
+  check("NPU model SDK helper PSRAM metadata discard banks blocked",
+    not metadataDiscardShortBanksApplied and
+      metadataDiscardShortStartSlots[3] == 7)
+  check("NPU model SDK helper PSRAM metadata discard offsets",
+    metadataDiscardPlan.valid and
+      metadataDiscardPlan.fieldAOffset ==
+        BlaiToolchainPsramMetadataDiscardFieldAOffset and
+      metadataDiscardPlan.fieldBOffset ==
+        BlaiToolchainPsramMetadataDiscardFieldBOffset and
+      metadataDiscardPlan.generalStartOffset ==
+        BlaiToolchainPatchDebugGeneralStartOffset and
+      metadataDiscardPlan.generalCountOffset ==
+        BlaiToolchainPatchDebugGeneralCountOffset)
+  check("NPU model SDK helper PSRAM metadata preserve",
+    metadataConsumerPreservePlan.valid and
+      not metadataConsumerPreservePlan.clearGeneralMetadata and
+      metadataConsumerPreservePlan.startPatchSlotAfter == 7 and
+      metadataFieldPreservePlan.valid and
+      not metadataFieldPreservePlan.clearGeneralMetadata)
+  check("NPU model SDK helper PSRAM metadata discard blocked",
+    not metadataDiscardBadLayerPlan.valid and
+      metadataDiscardBadLayerPlan.firstBlock ==
+        blaiToolchainPsramMetadataDiscardLayerIndex and
+      not metadataDiscardBadLayerApplyPlan.valid and
+      metadataDiscardBadLayerApplyPlan.firstBlock ==
+        blaiToolchainPsramMetadataDiscardApplyDiscardPlan and
+      not metadataDiscardBlockedStateApplied and
+      metadataDiscardBlockedState ==
+        blaiToolchainPsramMetadataDiscardState(
+          9, 11'u32, 12'u32, true, 13, 14))
+  check("NPU model SDK helper PSRAM fallback gate",
+    fallbackGatePlan.valid and
+      fallbackGatePlanInto == fallbackGatePlan and
+      fallbackGatePlan.inputCountWithinFallbackLimit and
+      fallbackGatePlan.fallbackArmed)
+  check("NPU model SDK helper PSRAM fallback gate blocked",
+    fallbackRouteBlockedPlan.valid and
+      fallbackRouteBlockedPlan.routeTypeExcluded and
+      not fallbackRouteBlockedPlan.fallbackArmed and
+      fallbackRelationBlockedPlan.valid and
+      fallbackRelationBlockedPlan.relationRouteTypeExcluded and
+      not fallbackRelationBlockedPlan.fallbackArmed and
+      fallbackSpecialBlockedPlan.valid and
+      fallbackSpecialBlockedPlan.specialTypeExcluded and
+      not fallbackSpecialBlockedPlan.fallbackArmed and
+      fallbackInputCountBlockedPlan.valid and
+      not fallbackInputCountBlockedPlan.fallbackArmed and
+      not fallbackBadShapePlan.valid and
+      fallbackBadShapePlan.firstBlock == blaiToolchainPsramFallbackGateShape)
+  check("NPU model SDK helper PSRAM unassigned metadata",
+    unassignedMetadataPlan.valid and
+      unassignedMetadataPlanInto == unassignedMetadataPlan and
+      unassignedMetadataApplyPlan.valid and
+      unassignedMetadataApplyPlanInto == unassignedMetadataApplyPlan and
+      unassignedMetadataPlan.writeFallbackMetadata and
+      unassignedMetadataPlan.unassignedStartSlot == 41 and
+      unassignedMetadataPlan.startPatchSlotAfter == 41 and
+      unassignedMetadataPlan.patchCountAfter == 4 and
+      unassignedMetadataPlan.writesApplied == 2 and
+      unassignedMetadataStateApplied and
+      unassignedMetadataState ==
+        blaiToolchainPsramUnassignedMetadataState(
+          3, BlaiToolchainPatchDebugGeneralStartOffset,
+          BlaiToolchainPatchDebugGeneralCountOffset, 41, true, 41, 4, 2) and
+      unassignedApplied and unassignedStart == 41 and unassignedCount == 4)
+  check("NPU model SDK helper PSRAM unassigned metadata banks",
+    unassignedBanksApplied and unassignedStartSlots[3] == 41 and
+      unassignedCounts[3] == 4)
+  check("NPU model SDK helper PSRAM unassigned metadata banks blocked",
+    not unassignedShortBanksApplied and unassignedShortStartSlots[3] == -1)
+  check("NPU model SDK helper PSRAM unassigned metadata blocked",
+    not unassignedBadLayerPlan.valid and
+      unassignedBadLayerPlan.firstBlock ==
+        blaiToolchainPsramUnassignedMetadataLayerIndex and
+      not unassignedBadLayerApplyPlan.valid and
+      unassignedBadLayerApplyPlan.firstBlock ==
+        blaiToolchainPsramUnassignedMetadataApplyMetadataPlan and
+      not unassignedBlockedStateApplied and
+      unassignedBlockedState ==
+        blaiToolchainPsramUnassignedMetadataState(
+          8, 9'u32, 10'u32, 11, true, 12, 13, 14))
+  check("NPU model SDK helper PSRAM unassigned metadata preserve",
+    unassignedPreservePlan.valid and
+      not unassignedPreservePlan.writeFallbackMetadata and
+      unassignedPreservePlan.startPatchSlotAfter == 7 and
+      unassignedPreservePlan.patchCountAfter == 2)
+  check("NPU model SDK helper PSRAM unassigned metadata blocked",
+    not unassignedBadLayerPlan.valid and
+      unassignedBadLayerPlan.firstBlock ==
+        blaiToolchainPsramUnassignedMetadataLayerIndex)
+  check("NPU model SDK helper PSRAM fallback metadata select",
+    fallbackMetadataUnassignedPlan.valid and
+      fallbackMetadataUnassignedInto == fallbackMetadataUnassignedPlan and
+      fallbackMetadataUnassignedPlan.mode ==
+        blaiToolchainPsramFallbackMetadataUnassigned and
+      fallbackMetadataUnassignedPlan.unassignedStartSlot == 41 and
+      fallbackMetadataUnassignedPlan.startPatchSlotAfter == 41 and
+      fallbackMetadataUnassignedPlan.patchCountAfter == 5 and
+      fallbackMetadataUnassignedPlan.writesApplied == 2 and
+      fallbackMetadataUnassignedApplyPlan.valid and
+      fallbackMetadataUnassignedApplyPlanInto ==
+        fallbackMetadataUnassignedApplyPlan and
+      fallbackMetadataStateApplied and
+      fallbackMetadataState ==
+        blaiToolchainPsramFallbackMetadataState(
+          3, BlaiToolchainPatchDebugGeneralStartOffset,
+          BlaiToolchainPatchDebugGeneralCountOffset,
+          blaiToolchainPsramFallbackMetadataUnassigned, 41, 41, 5, 2) and
+      fallbackMetadataApplied and fallbackMetadataStart == 41 and
+      fallbackMetadataCount == 5)
+  check("NPU model SDK helper PSRAM fallback metadata banks",
+    fallbackMetadataBanksApplied and fallbackMetadataStartSlots[3] == 41 and
+      fallbackMetadataCounts[3] == 5)
+  check("NPU model SDK helper PSRAM fallback metadata banks blocked",
+    not fallbackMetadataShortBanksApplied and
+      fallbackMetadataShortStartSlots[3] == -1)
+  check("NPU model SDK helper PSRAM fallback metadata clear",
+    fallbackMetadataClearPlan.valid and
+      fallbackMetadataClearPlan.mode ==
+        blaiToolchainPsramFallbackMetadataClearInvalid and
+      fallbackMetadataClearPlan.startPatchSlotAfter == -1 and
+      fallbackMetadataClearPlan.patchCountAfter == -1 and
+      fallbackMetadataClearPlan.writesApplied == 2 and
+      fallbackMetadataClearApplyPlan.valid and
+      fallbackMetadataClearApplyPlan.stateAfter ==
+        blaiToolchainPsramFallbackMetadataState(
+          3, BlaiToolchainPatchDebugGeneralStartOffset,
+          BlaiToolchainPatchDebugGeneralCountOffset,
+          blaiToolchainPsramFallbackMetadataClearInvalid, 41, -1, -1, 2))
+  check("NPU model SDK helper PSRAM fallback metadata preserve",
+    fallbackMetadataConsumerPreservePlan.valid and
+      fallbackMetadataConsumerPreservePlan.mode ==
+        blaiToolchainPsramFallbackMetadataPreserve and
+      fallbackMetadataConsumerPreservePlan.startPatchSlotAfter == 7 and
+      fallbackMetadataConsumerPreservePlan.patchCountAfter == 2 and
+      fallbackMetadataGatePreservePlan.valid and
+      fallbackMetadataGatePreservePlan.mode ==
+        blaiToolchainPsramFallbackMetadataPreserve)
+  check("NPU model SDK helper PSRAM fallback metadata blocked",
+    not fallbackMetadataBadLayerPlan.valid and
+      fallbackMetadataBadLayerPlan.firstBlock ==
+        blaiToolchainPsramFallbackMetadataLayerIndex and
+      not fallbackMetadataBadLayerApplyPlan.valid and
+      fallbackMetadataBadLayerApplyPlan.firstBlock ==
+        blaiToolchainPsramFallbackMetadataApplyMetadataPlan and
+      not fallbackMetadataBlockedStateApplied and
+      fallbackMetadataBlockedState ==
+        blaiToolchainPsramFallbackMetadataState(
+          8, 9'u32, 10'u32, blaiToolchainPsramFallbackMetadataClearInvalid,
+          11, 12, 13, 14))
+  check("NPU model SDK helper PSRAM split metadata",
+    splitMetadataPlan.valid and
+      splitMetadataPlanInto == splitMetadataPlan and
+      splitMetadataPlan.selectedSplitCount == 4 and
+      splitMetadataPlan.splitDenominator == 3 and
+      splitMetadataPlan.quotientPatchCount == 4 and
+      splitMetadataPlan.initialRemainingPatchCount == 8 and
+      splitMetadataPlan.firstStartPatchSlot == 15 and
+      splitMetadataPlan.lastStartPatchSlot == 7 and
+      splitMetadataPlan.writesApplied == 3 and
+      splitMetadataApplyPlan.valid and
+      splitMetadataApplyPlanInto == splitMetadataApplyPlan and
+      splitMetadataStateApplied and
+      splitMetadataState ==
+        blaiToolchainPsramSplitMetadataState(
+          3, 4'u32, 3'u32, 4, 8, 15, 7, 3) and
+      splitMetadataApplied and splitStartSlots[0] == -1 and
+      splitStartSlots[1] == 15 and splitStartSlots[2] == 11 and
+      splitStartSlots[3] == 7 and not shortSplitMetadataApplied and
+      shortSplitStartSlots[0] == -1 and shortSplitStartSlots[1] == -1 and
+      shortSplitStartSlots[2] == -1)
+  check("NPU model SDK helper PSRAM split metadata cursor",
+    splitMetadataCursor1.valid and splitMetadataCursor1.startPatchSlot == 15 and
+      splitMetadataCursor2.valid and splitMetadataCursor2.startPatchSlot == 11 and
+      splitMetadataCursor3.valid and splitMetadataCursor3.startPatchSlot == 7 and
+      splitMetadataCursor3.last)
+  check("NPU model SDK helper PSRAM split metadata cursor blocked",
+    not splitMetadataCursor0.valid and
+      splitMetadataCursor0.firstBlock ==
+        blaiToolchainPsramSplitMetadataCursorIndex and
+      not splitMetadataCursorBlocked.valid and
+      splitMetadataCursorBlocked.firstBlock ==
+        blaiToolchainPsramSplitMetadataCursorPlan)
+  check("NPU model SDK helper PSRAM split metadata blocked",
+    clampedSplitMetadataPlan.valid and
+      clampedSplitMetadataPlan.selectedSplitCount == 2 and
+      clampedSplitMetadataPlan.splitDenominator == 1 and
+      clampedSplitMetadataPlan.firstStartPatchSlot == 7 and
+      not splitMetadataBadLayerPlan.valid and
+      splitMetadataBadLayerPlan.firstBlock ==
+        blaiToolchainPsramSplitMetadataLayerIndex and
+      not splitMetadataBadScratchPlan.valid and
+      splitMetadataBadScratchPlan.firstBlock ==
+        blaiToolchainPsramSplitMetadataScratchCount and
+      not splitMetadataBadScratchApplyPlan.valid and
+      splitMetadataBadScratchApplyPlan.firstBlock ==
+        blaiToolchainPsramSplitMetadataApplyMetadataPlan and
+      not splitMetadataBlockedStateApplied and
+      splitMetadataBlockedState ==
+        blaiToolchainPsramSplitMetadataState(
+          9, 10'u32, 11'u32, 12, 13, 14, 15, 16))
+  check("NPU model SDK helper set wei page conv",
+    convSetWeiPagePlan.valid and convSetWeiPagePlan.alignedCount == 16 and
+      convSetWeiPagePlan.primaryBytes == 4800 and
+      convSetWeiPagePlan.auxiliaryBytes == 0 and
+      convSetWeiPagePlan.primaryPages == 2 and
+      convSetWeiPagePlan.selectedStartPatchCount == 0)
+  check("NPU model SDK helper set wei route gate",
+    routeSetWeiGatePlan.valid and
+      routeSetWeiGatePlanInto == routeSetWeiGatePlan and
+      routeSetWeiGatePlan.currentIsRawRoute and
+      routeSetWeiGatePlan.currentFieldsRequestRoute and
+      routeSetWeiGatePlan.routeFamilyPath and
+      previousConvRouteSetWeiGatePlan.previousConvMultiInput and
+      previousConvRouteSetWeiGatePlan.routeFamilyPath and
+      sourceRouteSetWeiGatePlan.sourceLayerRequestsRoute and
+      sourceRouteSetWeiGatePlan.routeFamilyPath)
+  check("NPU model SDK helper set wei route gate blocked",
+    blockedRouteSetWeiGatePlan.valid and
+      not blockedRouteSetWeiGatePlan.routeFamilyPath and
+      not badShapeRouteSetWeiGatePlan.valid and
+      badShapeRouteSetWeiGatePlan.firstBlock ==
+        blaiToolchainSetWeiPatchRouteGateShape)
+  check("NPU model SDK helper set wei route source",
+    routeSetWeiSourcePlan.valid and
+      routeSetWeiSourcePlanInto == routeSetWeiSourcePlan and
+      routeSetWeiSourcePlan.routeFamily and
+      not routeSetWeiSourcePlan.routeMax and
+      routeSetWeiSourcePlan.selectedCount == 13 and
+      routeSetWeiSourcePlan.selectedNumerator == 17 and
+      routeMaxFromRouteSetWeiSourcePlan.valid and
+      routeMaxFromRouteSetWeiSourcePlan.routeMaxUsesRouteCount and
+      routeMaxFromRouteSetWeiSourcePlan.selectedCount == 13 and
+      routeMaxFromConvSetWeiSourcePlan.valid and
+      not routeMaxFromConvSetWeiSourcePlan.routeMaxUsesRouteCount and
+      routeMaxFromConvSetWeiSourcePlan.selectedCount == 11)
+  check("NPU model SDK helper set wei route source blocked",
+    not badTypeSetWeiSourcePlan.valid and
+      badTypeSetWeiSourcePlan.firstBlock ==
+        blaiToolchainSetWeiPatchRouteSourceLayerType and
+      not badShapeSetWeiSourcePlan.valid and
+      badShapeSetWeiSourcePlan.firstBlock ==
+        blaiToolchainSetWeiPatchRouteSourceShape)
+  check("NPU model SDK helper set wei base offset",
+    maskedBaseOffsetPlan.valid and
+      maskedBaseOffsetPlanInto == maskedBaseOffsetPlan and
+      maskedBaseOffsetPlan.layerMaskBitSet and
+      maskedBaseOffsetPlan.basePatchOffset == 0 and
+      highCountBaseOffsetPlan.valid and
+      highCountBaseOffsetPlan.recoveredCountHigh and
+      highCountBaseOffsetPlan.basePatchOffset == 6 and
+      highFieldBaseOffsetPlan.valid and
+      highFieldBaseOffsetPlan.recoveredFieldHigh and
+      highFieldBaseOffsetPlan.basePatchOffset == 6 and
+      lowBaseOffsetPlan.valid and
+      lowBaseOffsetPlan.basePatchOffset == 2)
+  check("NPU model SDK helper set wei page routew",
+    routeWSetWeiPagePlan.valid and
+      routeWSetWeiPagePlan.routeWDoublePrimary and
+      routeWSetWeiPagePlan.primaryBytes == 9600 and
+      routeWSetWeiPagePlan.auxiliaryBytes == 8000 and
+      routeWSetWeiPagePlan.primaryPages == 3 and
+      routeWSetWeiPagePlan.auxiliaryPages == 2 and
+      routeWSetWeiPagePlan.selectedStartPatchCount == 2)
+  check("NPU model SDK helper set wei divisor routew",
+    routeWSetWeiDivisorPlan.valid and
+      routeWSetWeiDivisorPlan.selectedDivisor == 2 and
+      routeWSetWeiDivisorPlan.roundedPrimarySplit == 6 and
+      routeWSetWeiDivisorPlan.roundedAuxiliarySplit == 6 and
+      routeWSetWeiDivisorPlan.primaryLocalBytes == 3000 and
+      routeWSetWeiDivisorPlan.auxiliaryLocalBytes == 3000)
+  check("NPU model SDK helper set wei divisor special",
+    specialSetWeiDivisorPlan.valid and
+      specialSetWeiDivisorPlan.specialDoubleAuxiliary and
+      specialSetWeiDivisorPlan.selectedDivisor == 3 and
+      specialSetWeiDivisorPlan.roundedPrimarySplit == 4 and
+      specialSetWeiDivisorPlan.roundedAuxiliarySplit == 8 and
+      specialSetWeiDivisorPlan.auxiliaryLocalBytes == 4000)
+  check("NPU model SDK helper set wei store divisor",
+    routeWSetWeiStorePlan.valid and
+      routeWSetWeiStorePlan.mode == blaiToolchainSetWeiPatchStoreDivisor and
+      routeWSetWeiStorePlan.patchCount == 2 and
+      routeWSetWeiStorePlan.splitValues[0] == 6 and
+      routeWSetWeiStorePlan.splitValues[1] == 3)
+  check("NPU model SDK helper set wei store apply into matches",
+    setWeiStoreApplyPlanInto == setWeiStoreApplyPlan)
+  check("NPU model SDK helper set wei store apply writes",
+    setWeiStoreApplyPlan.valid and
+      setWeiStoreApplyPlan.mode == blaiToolchainSetWeiPatchStoreDivisor and
+      setWeiStoreApplyPlan.writesApplied == routeWSetWeiStorePlan.splitCount and
+      setWeiStoreApplyPlan.stateAfter.patchCount ==
+        routeWSetWeiStorePlan.patchCount and
+      setWeiStoreApplyPlan.stateAfter.splitValues[1] ==
+        routeWSetWeiStorePlan.splitValues[1] and
+      setWeiStoreStateApplied and
+      setWeiStoreState == setWeiStoreApplyPlan.stateAfter and
+      setWeiStoreApplied and
+      setWeiStoreApplyPatchCount == routeWSetWeiStorePlan.patchCount and
+      setWeiStoreApplySplits[0] == routeWSetWeiStorePlan.splitValues[0] and
+      setWeiStoreApplySplits[1] == routeWSetWeiStorePlan.splitValues[1])
+  check("NPU model SDK helper set wei store apply storage",
+    not shortSetWeiStoreApplyPlan.valid and
+      shortSetWeiStoreApplyPlan.firstBlock ==
+        blaiToolchainSetWeiPatchStoreApplySplitStorage and
+      not blockedSetWeiStoreStateApplied and
+      blockedSetWeiStoreState.patchCount == 88'u32)
+  check("NPU model SDK helper set wei store commit into matches",
+    setWeiStoreCommitPlanInto == setWeiStoreCommitPlan and
+      setWeiStoreCommitApplyPlanInto == setWeiStoreCommitApplyPlan)
+  check("NPU model SDK helper set wei store commit writes",
+    matchingSetWeiStoreSelectPlan.valid and
+      setWeiStoreCommitPlan.valid and
+      setWeiStoreCommitPlan.mode == blaiToolchainSetWeiPatchStoreDivisor and
+      setWeiStoreCommitApplyPlan.valid and
+      setWeiStoreCommitApplyPlan.stateAfter ==
+        blaiToolchainSetWeiPatchStoreCommitState(
+          blaiToolchainSetWeiPatchStoreDivisor,
+          routeWSetWeiStorePlan.patchCount,
+          routeWSetWeiStorePlan.splitCount,
+          routeWSetWeiStorePlan.splitValues,
+          routeWSetWeiStorePlan.splitCount) and
+      setWeiStoreCommitApplyPlan.summaryStateAfter ==
+        blaiToolchainSetWeiPatchStoreCommitSummaryState(
+          blaiToolchainSetWeiPatchStoreDivisor,
+          blaiToolchainSetWeiPatchStoreDivisor,
+          blaiToolchainSetWeiPatchStoreDivisor,
+          2'u32,
+          routeWSetWeiStorePlan.patchCount,
+          routeWSetWeiStorePlan.splitCount,
+          routeWSetWeiStorePlan.splitCount,
+          routeWSetWeiStorePlan.splitValues) and
+      setWeiStoreCommitStateApplied and
+      setWeiStoreCommitState == setWeiStoreCommitApplyPlan.stateAfter and
+      setWeiStoreCommitSummaryApplied and
+      setWeiStoreCommitSummarySelectedMode ==
+        blaiToolchainSetWeiPatchStoreDivisor and
+      setWeiStoreCommitSummaryStoreMode ==
+        blaiToolchainSetWeiPatchStoreDivisor and
+      setWeiStoreCommitSummaryMode ==
+        blaiToolchainSetWeiPatchStoreDivisor and
+      setWeiStoreCommitSummaryStorage == 2'u32 and
+      setWeiStoreCommitSummaryPatchCount ==
+        routeWSetWeiStorePlan.patchCount and
+      setWeiStoreCommitSummarySplitCount ==
+        routeWSetWeiStorePlan.splitCount and
+      setWeiStoreCommitSummaryWrites ==
+        routeWSetWeiStorePlan.splitCount and
+      setWeiStoreCommitApplied and
+      setWeiStoreCommitPatchCount == routeWSetWeiStorePlan.patchCount and
+      setWeiStoreCommitSplits[1] == routeWSetWeiStorePlan.splitValues[1])
+  check("NPU model SDK helper set wei store commit mismatch",
+    not mismatchSetWeiStoreCommitPlan.valid and
+      mismatchSetWeiStoreCommitPlan.firstBlock ==
+        blaiToolchainSetWeiPatchStoreCommitModeMismatch)
+  check("NPU model SDK helper set wei store commit apply block",
+    not shortSetWeiStoreCommitPlan.valid and
+      shortSetWeiStoreCommitPlan.firstBlock ==
+        blaiToolchainSetWeiPatchStoreCommitApplyPlan and
+      not shortSetWeiStoreCommitApplyPlan.valid and
+      shortSetWeiStoreCommitApplyPlan.firstBlock ==
+        blaiToolchainSetWeiPatchStoreCommitApplyCommitPlan and
+      not shortSetWeiStoreCommitStateApplied and
+      setWeiStoreCommitState == setWeiStoreCommitStateBefore)
+  check("NPU model SDK helper set wei store auxiliary",
+    auxOnlySetWeiStorePlan.valid and
+      auxOnlySetWeiStorePlan.mode == blaiToolchainSetWeiPatchStoreAuxiliary and
+      auxOnlySetWeiStorePlan.patchCount == 3 and
+      auxOnlySetWeiStorePlan.splitValues[0] == 3 and
+      auxOnlySetWeiStorePlan.splitValues[2] == 4)
+  check("NPU model SDK helper set wei store select",
+    divisorSetWeiStoreSelectPlan.valid and
+      divisorSetWeiStoreSelectPlan.primaryPressureExceedsLocal and
+      divisorSetWeiStoreSelectPlan.mode ==
+        blaiToolchainSetWeiPatchStoreDivisor and
+      auxiliarySetWeiStoreSelectPlan.valid and
+      auxiliarySetWeiStoreSelectPlan.auxiliaryPressureExceedsLocal and
+      auxiliarySetWeiStoreSelectPlan.mode ==
+        blaiToolchainSetWeiPatchStoreAuxiliary)
+  check("NPU model SDK helper set wei store select forced",
+    forcedSingleSetWeiStoreSelectPlan.valid and
+      forcedSingleSetWeiStoreSelectPlan.largeKernelFlagSet and
+      forcedSingleSetWeiStoreSelectPlan.divisorRequiresSplit and
+      forcedSingleSetWeiStoreSelectPlan.mode ==
+        blaiToolchainSetWeiPatchStoreSingle)
+  check("NPU model SDK helper set wei pressure",
+    oneByOneSetWeiPressurePlanInto == oneByOneSetWeiPressurePlan and
+      oneByOneSetWeiPressurePlan.valid and
+      oneByOneSetWeiPressurePlan.alignedCountA == 16 and
+      oneByOneSetWeiPressurePlan.alignedCountB == 20 and
+      oneByOneSetWeiPressurePlan.selectedGroupCount == 1 and
+      oneByOneSetWeiPressurePlan.groupDenominator == 8 and
+      oneByOneSetWeiPressurePlan.multiplier == 4 and
+      oneByOneSetWeiPressurePlan.oneByOne and
+      oneByOneSetWeiPressurePlan.maskBitSet and
+      oneByOneSetWeiPressurePlan.pressureMaskAllowed and
+      oneByOneSetWeiPressurePlan.bytePressure == 160 and
+      smallKernelSetWeiPressurePlan.valid and
+      not smallKernelSetWeiPressurePlan.maskBitSet and
+      smallKernelSetWeiPressurePlan.multiplier == 1 and
+      smallKernelSetWeiPressurePlan.groupDenominator == 18 and
+      smallKernelSetWeiPressurePlan.bytePressure == 72 and
+      largeKernelSetWeiPressurePlan.valid and
+      largeKernelSetWeiPressurePlan.largeKernelOrAux and
+      largeKernelSetWeiPressurePlan.bytePressure == 2592)
+  check("NPU model SDK helper set wei pressure blocked",
+    negativeSetWeiPressurePlan.firstBlock ==
+      blaiToolchainSetWeiPatchPressureShape and
+      overflowSetWeiPressurePlan.firstBlock ==
+        blaiToolchainSetWeiPatchPressureOverflow)
+  check("NPU model SDK helper set wei large flag into matches",
+    largeMaskedSetWeiFlagPlanInto == largeMaskedSetWeiFlagPlan)
+  check("NPU model SDK helper set wei large flag masked",
+    largeMaskedSetWeiFlagPlan.valid and
+      largeMaskedSetWeiFlagPlan.layerTypeInMaskRange and
+      largeMaskedSetWeiFlagPlan.layerMaskBitSet and
+      largeMaskedSetWeiFlagPlan.largeEnough and
+      largeMaskedSetWeiFlagPlan.flagSet)
+  check("NPU model SDK helper set wei large flag threshold",
+    thresholdSetWeiFlagPlan.valid and
+      thresholdSetWeiFlagPlan.layerMaskBitSet and
+      not thresholdSetWeiFlagPlan.flagSet)
+  check("NPU model SDK helper set wei large flag unmasked",
+    unmaskedSetWeiFlagPlan.valid and
+      unmaskedSetWeiFlagPlan.layerTypeInMaskRange and
+      not unmaskedSetWeiFlagPlan.layerMaskBitSet and
+      not unmaskedSetWeiFlagPlan.flagSet)
+  check("NPU model SDK helper set wei large flag range",
+    outOfRangeSetWeiFlagPlan.valid and
+      not outOfRangeSetWeiFlagPlan.layerTypeInMaskRange and
+      not outOfRangeSetWeiFlagPlan.flagSet)
+  check("NPU model SDK helper set wei large split into matches",
+    largeSetWeiSplitPlanInto == largeSetWeiSplitPlan)
+  check("NPU model SDK helper set wei large split nondiv",
+    largeSetWeiSplitPlan.valid and
+      largeSetWeiSplitPlan.nonDivisiblePageExtra and
+      largeSetWeiSplitPlan.pressurePageCount == 3 and
+      largeSetWeiSplitPlan.quotientBeforePowerOfTwo == 33 and
+      largeSetWeiSplitPlan.selectedSplit == 32 and
+      largeSetWeiSplitPlan.patchCount == 4 and
+      largeSetWeiSplitPlan.splitValues[3] == 4)
+  check("NPU model SDK helper set wei large split divisible",
+    divisibleLargeSetWeiSplitPlan.valid and
+      not divisibleLargeSetWeiSplitPlan.nonDivisiblePageExtra and
+      divisibleLargeSetWeiSplitPlan.pressurePageCount == 2 and
+      divisibleLargeSetWeiSplitPlan.selectedSplit == 32)
+  check("NPU model SDK helper set wei large split invalid flag",
+    not invalidLargeSetWeiSplitPlan.valid and
+      invalidLargeSetWeiSplitPlan.firstBlock ==
+        blaiToolchainSetWeiPatchLargeSplitFlagPlan)
+  check("NPU model SDK helper set wei large split capacity",
+    not capacityLargeSetWeiSplitPlan.valid and
+      capacityLargeSetWeiSplitPlan.firstBlock ==
+        blaiToolchainSetWeiPatchLargeSplitCapacity)
+  check("NPU model SDK helper set wei large total into matches",
+    largeSetWeiTotalPlanInto == largeSetWeiTotalPlan)
+  check("NPU model SDK helper set wei large total valid",
+    largeSetWeiTotalPlan.valid and
+      largeSetWeiTotalPlan.finalSplitValue == 4 and
+      largeSetWeiTotalPlan.selectedLocalBytes == 288000 and
+      largeSetWeiTotalPlan.remainderLocalBytes == 36000 and
+      largeSetWeiTotalPlan.maxLocalBytes == 288000 and
+      largeSetWeiTotalPlan.perPatchContribution == 1 and
+      largeSetWeiTotalPlan.splitCountContribution == 3 and
+      largeSetWeiTotalPlan.totalPatchCount == 7)
+  check("NPU model SDK helper set wei large total invalid split",
+    not invalidLargeSetWeiTotalPlan.valid and
+      invalidLargeSetWeiTotalPlan.firstBlock ==
+        blaiToolchainSetWeiPatchLargeTotalSplitPlan)
+  check("NPU model SDK helper set wei large total overflow",
+    not overflowLargeSetWeiTotalPlan.valid and
+      overflowLargeSetWeiTotalPlan.firstBlock ==
+        blaiToolchainSetWeiPatchLargeTotalOverflow)
+  check("NPU model SDK helper set wei lower flag into matches",
+    lowerSetWeiFlagPlanInto == lowerSetWeiFlagPlan)
+  check("NPU model SDK helper set wei lower flag masked",
+    lowerSetWeiFlagPlan.valid and
+      lowerSetWeiFlagPlan.layerMaskBitSet and
+      lowerSetWeiFlagPlan.quotient == 10 and
+      lowerSetWeiFlagPlan.bytePressure == 5000 and
+      lowerSetWeiFlagPlan.lowerEnough and
+      lowerSetWeiFlagPlan.flagValue ==
+        BlaiToolchainSetWeiPatchLowerFlagValue)
+  check("NPU model SDK helper set wei lower flag threshold",
+    thresholdLowerSetWeiFlagPlan.valid and
+      thresholdLowerSetWeiFlagPlan.bytePressure == 4090 and
+      not thresholdLowerSetWeiFlagPlan.lowerEnough and
+      thresholdLowerSetWeiFlagPlan.flagValue == 0)
+  check("NPU model SDK helper set wei lower flag unmasked",
+    unmaskedLowerSetWeiFlagPlan.valid and
+      unmaskedLowerSetWeiFlagPlan.lowerEnough and
+      not unmaskedLowerSetWeiFlagPlan.layerMaskBitSet and
+      unmaskedLowerSetWeiFlagPlan.flagValue == 0)
+  check("NPU model SDK helper set wei lower flag divisor",
+    not zeroDivisorLowerSetWeiFlagPlan.valid and
+      zeroDivisorLowerSetWeiFlagPlan.firstBlock ==
+        blaiToolchainSetWeiPatchLowerFlagDivisor)
+  check("NPU model SDK helper set wei lower flag overflow",
+    not overflowLowerSetWeiFlagPlan.valid and
+      overflowLowerSetWeiFlagPlan.firstBlock ==
+        blaiToolchainSetWeiPatchLowerFlagOverflow)
+  check("NPU model SDK helper set wei lower split into matches",
+    lowerSetWeiSplitPlanInto == lowerSetWeiSplitPlan)
+  check("NPU model SDK helper set wei lower split nondiv",
+    lowerSetWeiSplitPlan.valid and
+      lowerSetWeiSplitPlan.nonDivisiblePageExtra and
+      lowerSetWeiSplitPlan.pressurePageCount == 3 and
+      lowerSetWeiSplitPlan.quotientBeforePowerOfTwo == 33 and
+      lowerSetWeiSplitPlan.selectedSplit == 32 and
+      lowerSetWeiSplitPlan.patchCount == 4 and
+      lowerSetWeiSplitPlan.splitValues[3] == 4)
+  check("NPU model SDK helper set wei lower split divisible",
+    divisibleLowerSetWeiSplitPlan.valid and
+      not divisibleLowerSetWeiSplitPlan.nonDivisiblePageExtra and
+      divisibleLowerSetWeiSplitPlan.pressurePageCount == 2 and
+      divisibleLowerSetWeiSplitPlan.selectedSplit == 32)
+  check("NPU model SDK helper set wei lower split invalid flag",
+    not invalidLowerSetWeiSplitPlan.valid and
+      invalidLowerSetWeiSplitPlan.firstBlock ==
+        blaiToolchainSetWeiPatchLowerSplitFlagPlan)
+  check("NPU model SDK helper set wei lower split capacity",
+    not capacityLowerSetWeiSplitPlan.valid and
+      capacityLowerSetWeiSplitPlan.firstBlock ==
+        blaiToolchainSetWeiPatchLowerSplitCapacity)
+  check("NPU model SDK helper set wei lower total into matches",
+    lowerSetWeiTotalPlanInto == lowerSetWeiTotalPlan)
+  check("NPU model SDK helper set wei lower total valid",
+    lowerSetWeiTotalPlan.valid and
+      lowerSetWeiTotalPlan.finalSplitValue == 4 and
+      lowerSetWeiTotalPlan.selectedLocalBytes == 288000 and
+      lowerSetWeiTotalPlan.remainderLocalBytes == 36000 and
+      lowerSetWeiTotalPlan.maxLocalBytes == 288000 and
+      lowerSetWeiTotalPlan.perPatchContribution == 1 and
+      lowerSetWeiTotalPlan.splitCountContribution == 3 and
+      lowerSetWeiTotalPlan.totalPatchCount == 7)
+  check("NPU model SDK helper set wei lower total invalid split",
+    not invalidLowerSetWeiTotalPlan.valid and
+      invalidLowerSetWeiTotalPlan.firstBlock ==
+        blaiToolchainSetWeiPatchLowerTotalSplitPlan)
+  check("NPU model SDK helper set wei lower total overflow",
+    not overflowLowerSetWeiTotalPlan.valid and
+      overflowLowerSetWeiTotalPlan.firstBlock ==
+        blaiToolchainSetWeiPatchLowerTotalOverflow)
+  check("NPU model SDK helper set wei no patch into matches",
+    noPatchSetWeiPlanInto == noPatchSetWeiPlan)
+  check("NPU model SDK helper set wei no patch valid",
+    noPatchSetWeiPlan.valid and
+      noPatchSetWeiPlan.patchCount == 1 and
+      noPatchSetWeiPlan.splitCount == 1 and
+      noPatchSetWeiPlan.splitValues[0] == 123 and
+      noPatchSetWeiPlan.psramPatchTotal == 0 and
+      noPatchSetWeiPlan.flagValue ==
+        BlaiToolchainSetWeiPatchNoPatchFlagValue and
+      noPatchSetWeiPlan.returnedPatchCount == 7)
+  check("NPU model SDK helper set wei no patch invalid",
+    not invalidNoPatchSetWeiPlan.valid and
+      invalidNoPatchSetWeiPlan.firstBlock ==
+        blaiToolchainSetWeiPatchNoPatchNumerator)
+  check("NPU model SDK helper set wei branch into matches",
+    branchLargeSetWeiPlanInto == branchLargeSetWeiPlan)
+  check("NPU model SDK helper set wei branch large",
+    branchLargeSetWeiPlan.valid and
+      branchLargeSetWeiPlan.largeBranchActive and
+      branchLargeSetWeiPlan.mode == blaiToolchainSetWeiPatchBranchLarge and
+      branchLargeSetWeiPlan.patchCount == largeSetWeiSplitPlan.patchCount and
+      branchLargeSetWeiPlan.splitValues[0] ==
+        largeSetWeiSplitPlan.splitValues[0] and
+      branchLargeSetWeiPlan.splitValues[3] ==
+        largeSetWeiSplitPlan.splitValues[3] and
+      branchLargeSetWeiPlan.psramPatchTotal ==
+        largeSetWeiTotalPlan.totalPatchCount and
+      branchLargeSetWeiPlan.flagValue ==
+        BlaiToolchainSetWeiPatchLargeFlagValue)
+  check("NPU model SDK helper set wei branch lower",
+    branchLowerSetWeiPlan.valid and
+      not branchLowerSetWeiPlan.largeBranchActive and
+      branchLowerSetWeiPlan.lowerBranchActive and
+      branchLowerSetWeiPlan.mode == blaiToolchainSetWeiPatchBranchLower and
+      branchLowerSetWeiPlan.patchCount == lowerSetWeiSplitPlan.patchCount and
+      branchLowerSetWeiPlan.splitValues[0] ==
+        lowerSetWeiSplitPlan.splitValues[0] and
+      branchLowerSetWeiPlan.splitValues[3] ==
+        lowerSetWeiSplitPlan.splitValues[3] and
+      branchLowerSetWeiPlan.flagValue ==
+        BlaiToolchainSetWeiPatchLowerFlagValue)
+  check("NPU model SDK helper set wei branch no patch",
+    branchNoPatchSetWeiPlan.valid and
+      not branchNoPatchSetWeiPlan.largeBranchActive and
+      not branchNoPatchSetWeiPlan.lowerBranchActive and
+      branchNoPatchSetWeiPlan.mode == blaiToolchainSetWeiPatchBranchNoPatch and
+      branchNoPatchSetWeiPlan.splitValues[0] ==
+        noPatchSetWeiPlan.splitValues[0] and
+      branchNoPatchSetWeiPlan.flagValue ==
+        BlaiToolchainSetWeiPatchNoPatchFlagValue and
+      branchNoPatchSetWeiPlan.returnedPatchCount == 7)
+  check("NPU model SDK helper set wei branch large blocked",
+    not branchLargeBlockedSetWeiPlan.valid and
+      branchLargeBlockedSetWeiPlan.firstBlock ==
+        blaiToolchainSetWeiPatchBranchLargeTotal)
+  check("NPU model SDK helper set wei branch lower blocked",
+    not branchLowerBlockedSetWeiPlan.valid and
+      branchLowerBlockedSetWeiPlan.firstBlock ==
+        blaiToolchainSetWeiPatchBranchLowerTotal)
+  check("NPU model SDK helper set wei branch no patch blocked",
+    not branchNoPatchBlockedSetWeiPlan.valid and
+      branchNoPatchBlockedSetWeiPlan.firstBlock ==
+        blaiToolchainSetWeiPatchBranchNoPatchPlan)
+  check("NPU model SDK helper set wei branch apply into matches",
+    branchApplyPlanInto == branchApplyPlan)
+  check("NPU model SDK helper set wei branch apply valid",
+    branchApplyPlan.valid and
+      branchApplyPlan.mode == blaiToolchainSetWeiPatchBranchLarge and
+      branchApplyPlan.patchCount == branchLargeSetWeiPlan.patchCount and
+      branchApplyPlan.stateAfter.psramPatchTotal ==
+        branchLargeSetWeiPlan.psramPatchTotal and
+      branchApplyPlan.summaryStateAfter ==
+        blaiToolchainSetWeiPatchBranchSummaryState(
+          true, false, blaiToolchainSetWeiPatchBranchLarge,
+          4'u32, branchLargeSetWeiPlan.patchCount,
+          branchLargeSetWeiPlan.splitCount,
+          branchLargeSetWeiPlan.splitCount,
+          branchLargeSetWeiPlan.splitValues,
+          branchLargeSetWeiPlan.psramPatchTotal,
+          branchLargeSetWeiPlan.flagValue,
+          branchLargeSetWeiPlan.returnedPatchCount) and
+      branchApplyPlan.stateAfter.splitValues[3] ==
+        branchLargeSetWeiPlan.splitValues[3] and
+      branchApplyPlan.writesApplied == branchLargeSetWeiPlan.splitCount)
+  check("NPU model SDK helper set wei branch apply writes",
+    branchApplyStateApplied and
+      branchApplyState == branchApplyPlan.stateAfter and
+      branchApplySummaryApplied and
+      branchApplySummaryLargeActive and
+      not branchApplySummaryLowerActive and
+      branchApplySummaryMode == blaiToolchainSetWeiPatchBranchLarge and
+      branchApplySummaryStorage == 4'u32 and
+      branchApplySummaryPatchCount == branchLargeSetWeiPlan.patchCount and
+      branchApplySummarySplitCount == branchLargeSetWeiPlan.splitCount and
+      branchApplySummaryWrites == branchLargeSetWeiPlan.splitCount and
+      branchApplySummaryPsramTotal ==
+        branchLargeSetWeiPlan.psramPatchTotal and
+      branchApplySummaryFlag == branchLargeSetWeiPlan.flagValue and
+      branchApplySummaryReturned ==
+        branchLargeSetWeiPlan.returnedPatchCount and
+      branchApplyApplied and
+      branchApplyPatchCount == branchLargeSetWeiPlan.patchCount and
+      branchApplySplits[0] == branchLargeSetWeiPlan.splitValues[0] and
+      branchApplySplits[3] == branchLargeSetWeiPlan.splitValues[3] and
+      branchApplyPsramTotal == branchLargeSetWeiPlan.psramPatchTotal and
+      branchApplyFlag == BlaiToolchainSetWeiPatchLargeFlagValue and
+      branchApplyReturned == branchLargeSetWeiPlan.returnedPatchCount)
+  check("NPU model SDK helper set wei branch apply storage",
+    not shortBranchApplyPlan.valid and
+      shortBranchApplyPlan.firstBlock ==
+        blaiToolchainSetWeiPatchBranchApplySplitStorage and
+      not blockedBranchApplyStateApplied and
+      blockedBranchApplyState.patchCount == 55'u32)
+  check("NPU model SDK helper set wei branch return",
+    branchNoPatchReturnPlan.valid and
+      branchNoPatchReturnEvidence.valid and
+      branchNoPatchReturnPlanInto == branchNoPatchReturnPlan and
+      branchNoPatchReturnPlan.evidence == branchNoPatchReturnEvidence and
+      branchNoPatchReturnPlan.evidence.callValid and
+      branchNoPatchReturnPlan.evidence.branchValid and
+      branchNoPatchReturnPlan.evidence.returnedPatchCountValid and
+      branchNoPatchReturnPlan.evidence.returnPlanValid and
+      branchNoPatchReturnPlan.mode ==
+        blaiToolchainSetWeiPatchBranchNoPatch and
+      branchNoPatchReturnPlan.returnedPatchCount == 7 and
+      branchNoPatchReturnPlan.byRefPatchCountInitial == 0 and
+      branchNoPatchReturnPlan.byRefPatchCountAfter == 7 and
+      branchNoPatchReturnPlan.scratchPatchCount == 7 and
+      branchNoPatchReturnPlan.changed and
+      branchNoPatchReturnPlan.returnPlan ==
+        blaiToolchainSetWeiPatchReturnPlan(setWeiCallPlan, 7))
+  check("NPU model SDK helper set wei branch return blocked",
+    not branchBlockedCallReturnPlan.valid and
+      branchBlockedCallReturnPlan.firstBlock ==
+        blaiToolchainSetWeiPatchBranchReturnCallPlan and
+      not branchBlockedBranchReturnPlan.valid and
+      branchBlockedBranchReturnPlan.firstBlock ==
+        blaiToolchainSetWeiPatchBranchReturnBranchPlan and
+      not branchOversizedReturnedPlan.valid and
+      branchOversizedReturnedPlan.firstBlock ==
+        blaiToolchainSetWeiPatchBranchReturnReturnedCount)
+  check("NPU model SDK helper patch search into matches",
+    patchSearchInto == patchSearch)
+  check("NPU model SDK helper patch search valid",
+    patchSearch.valid and patchSearch.startPatchSlot == 1 and
+      patchSearch.assignedPatchCount == 2)
+  check("NPU model SDK helper patch metadata general",
+    generalPatchMetadataPlan.valid and
+      generalPatchMetadataPlanInto == generalPatchMetadataPlan and
+      generalPatchMetadataPlan.startOffset ==
+        BlaiToolchainPatchDebugGeneralStartOffset and
+      generalPatchMetadataPlan.countOffset ==
+        BlaiToolchainPatchDebugGeneralCountOffset and
+      generalPatchMetadataPlan.startPatchSlot == 1 and
+      generalPatchMetadataPlan.patchCount == 2 and
+      generalPatchMetadataPlan.storesPatchCount)
+  check("NPU model SDK helper patch metadata apply general",
+    generalPatchMetadataApplied and patchMetadataStartSlots[3] == 1 and
+      patchMetadataCounts[3] == 2)
+  check("NPU model SDK helper patch metadata state apply",
+    generalPatchMetadataApplyPlan.valid and
+      generalPatchMetadataApplyPlanInto == generalPatchMetadataApplyPlan and
+      generalPatchMetadataApplyPlan.stateAfter ==
+        blaiToolchainPatchMetadataState(
+          blaiToolchainPatchMetadataGeneral, 3,
+          BlaiToolchainPatchDebugGeneralStartOffset,
+          BlaiToolchainPatchDebugGeneralCountOffset, 1, 2, true) and
+      generalPatchMetadataStateApplied and
+      generalPatchMetadataState == generalPatchMetadataApplyPlan.stateAfter)
+  check("NPU model SDK helper patch metadata state apply blocked",
+    not invalidPatchMetadataApplyPlan.valid and
+      invalidPatchMetadataApplyPlan.firstBlock ==
+        blaiToolchainPatchMetadataApplyMetadataPlan and
+      not invalidPatchMetadataStateApplied and
+      blockedPatchMetadataState ==
+        blaiToolchainPatchMetadataState(
+          blaiToolchainPatchMetadataDsp, 9, 10'u32, 11'u32, 12, 13, false))
+  check("NPU model SDK helper patch metadata dsp",
+    dspPatchMetadataPlan.valid and
+      dspPatchMetadataPlan.startOffset ==
+        BlaiToolchainPsramDspDebugStartOffset and
+      dspPatchMetadataPlan.countOffset == 0 and
+      dspPatchMetadataPlan.startPatchSlot == 1 and
+      dspPatchMetadataPlan.patchCount == 0 and
+      not dspPatchMetadataPlan.storesPatchCount)
+  check("NPU model SDK helper patch metadata apply dsp",
+    dspPatchMetadataApplied and dspPatchMetadataStartSlots[3] == 1)
+  check("NPU model SDK helper patch metadata tflite",
+    tflitePatchMetadataPlan.valid and
+      tflitePatchMetadataPlan.startOffset ==
+        BlaiToolchainPsramTfliteStartOffset and
+      tflitePatchMetadataPlan.countOffset == 0 and
+      tflitePatchMetadataPlan.startPatchSlot == 1 and
+      tflitePatchMetadataPlan.patchCount == 0 and
+      not tflitePatchMetadataPlan.storesPatchCount)
+  check("NPU model SDK helper patch metadata apply tflite",
+    tflitePatchMetadataApplied and tflitePatchMetadataStartSlots[3] == 1)
+  check("NPU model SDK helper patch metadata apply blocked",
+    not shortPatchMetadataApplied and shortPatchMetadataStartSlots[3] == -1)
+  check("NPU model SDK helper patch debug metadata snapshot",
+    patchDebugSnapshotPlan.valid and
+      patchDebugSnapshotPlanInto == patchDebugSnapshotPlan and
+      patchDebugSnapshotPlan.printRequested and
+      patchDebugSnapshotPlan.requestTableCount == 2 and
+      patchDebugSnapshotPlan.generalStartPatchSlot == 1 and
+      patchDebugSnapshotPlan.generalPatchCount == 2 and
+      patchDebugSnapshotPlan.auxiliaryStartPatchSlot == 5 and
+      patchDebugSnapshotPlan.secondaryStartPatchSlot == 7 and
+      patchDebugSnapshotPlan.layerScalar == 11)
+  check("NPU model SDK helper patch debug metadata offsets",
+    patchDebugSnapshotPlan.valid and
+      patchDebugSnapshotPlan.requestTableOffset ==
+        BlaiToolchainPatchDebugRequestTableOffset and
+      patchDebugSnapshotPlan.generalStartOffset ==
+        BlaiToolchainPatchDebugGeneralStartOffset and
+      patchDebugSnapshotPlan.generalCountOffset ==
+        BlaiToolchainPatchDebugGeneralCountOffset and
+      patchDebugSnapshotPlan.auxiliaryStartOffset ==
+        BlaiToolchainPatchDebugAuxiliaryStartOffset and
+      patchDebugSnapshotPlan.secondaryStartOffset ==
+        BlaiToolchainPatchDebugSecondaryStartOffset and
+      patchDebugSnapshotPlan.metadataStackBytes ==
+        BlaiToolchainPatchDebugMetadataStackBytes)
+  check("NPU model SDK helper patch debug metadata snapshot quiet",
+    quietPatchDebugSnapshotPlan.valid and
+      not quietPatchDebugSnapshotPlan.printRequested)
+  check("NPU model SDK helper patch debug metadata snapshot blocked",
+    not blockedPatchDebugSnapshotPlan.valid and
+      blockedPatchDebugSnapshotPlan.firstBlock ==
+        blaiToolchainPatchDebugMetadataSnapshotLayerIndex)
+  check("NPU model SDK helper patch debug metadata snapshot apply",
+    patchDebugSnapshotApplyPlan.valid and
+      patchDebugSnapshotApplyPlanInto == patchDebugSnapshotApplyPlan and
+      patchDebugSnapshotApplyPlan.printRequested and
+      patchDebugSnapshotApplyPlan.stateAfter ==
+        blaiToolchainPatchDebugMetadataSnapshotState(2, 1, 2, 5, 7, 11) and
+      patchDebugSnapshotApplied and
+      patchDebugSnapshotState ==
+        blaiToolchainPatchDebugMetadataSnapshotState(2, 1, 2, 5, 7, 11))
+  check("NPU model SDK helper patch debug metadata snapshot apply quiet",
+    quietPatchDebugSnapshotApplyPlan.valid and
+      not quietPatchDebugSnapshotApplyPlan.printRequested and
+      quietPatchDebugSnapshotApplied and
+      quietPatchDebugSnapshotState ==
+        blaiToolchainPatchDebugMetadataSnapshotState(-7, -7, -7, -7, -7, -7))
+  check("NPU model SDK helper patch debug metadata snapshot apply blocked",
+    not blockedPatchDebugSnapshotApplyPlan.valid and
+      blockedPatchDebugSnapshotApplyPlan.firstBlock ==
+        blaiToolchainPatchDebugMetadataSnapshotApplySnapshotPlan and
+      not blockedPatchDebugSnapshotApplied and
+      blockedPatchDebugSnapshotState ==
+        blaiToolchainPatchDebugMetadataSnapshotState(-9, -9, -9, -9, -9, -9))
+  check("NPU model SDK helper patch debug start lookup",
+    patchDebugStartSlotLookupPlan.valid and
+      patchDebugStartSlotLookupPlanInto == patchDebugStartSlotLookupPlan and
+      patchDebugStartSlotLookupPlan.lookupRequested and
+      patchDebugStartSlotLookupPlan.generalStartPatchSlot == 1 and
+      patchDebugStartSlotLookupPlan.slotTableCount == 3 and
+      patchDebugStartSlotLookupPlan.slotTableValue == 20)
+  check("NPU model SDK helper patch debug start lookup quiet",
+    quietPatchDebugStartSlotLookupPlan.valid and
+      not quietPatchDebugStartSlotLookupPlan.lookupRequested and
+      quietPatchDebugStartSlotLookupPlan.generalStartPatchSlot == -1)
+  check("NPU model SDK helper patch debug start lookup blocked",
+    not blockedStartPatchDebugStartSlotLookupPlan.valid and
+      blockedStartPatchDebugStartSlotLookupPlan.firstBlock ==
+        blaiToolchainPatchDebugStartSlotLookupStartSlot and
+      not blockedStoragePatchDebugStartSlotLookupPlan.valid and
+      blockedStoragePatchDebugStartSlotLookupPlan.firstBlock ==
+        blaiToolchainPatchDebugStartSlotLookupStorage)
+  check("NPU model SDK helper patch debug start lookup apply",
+    patchDebugStartSlotLookupApplyPlan.valid and
+      patchDebugStartSlotLookupApplyPlanInto ==
+        patchDebugStartSlotLookupApplyPlan and
+      patchDebugStartSlotLookupApplyPlan.lookupRequested and
+      patchDebugStartSlotLookupApplyPlan.slotTableValueAfter == 20 and
+      patchDebugStartSlotLookupApplyPlan.stateAfter ==
+        blaiToolchainPatchDebugStartSlotLookupState(true, 20) and
+      patchDebugStartSlotLookupStateApplied and
+      patchDebugStartSlotLookupState ==
+        patchDebugStartSlotLookupApplyPlan.stateAfter and
+      patchDebugStartSlotLookupApplied and
+      patchDebugStartSlotValue == 20)
+  check("NPU model SDK helper patch debug start lookup apply quiet",
+    quietPatchDebugStartSlotLookupApplyPlan.valid and
+      not quietPatchDebugStartSlotLookupApplyPlan.lookupRequested and
+      quietPatchDebugStartSlotLookupApplyPlan.stateAfter ==
+        blaiToolchainPatchDebugStartSlotLookupState(false, 0) and
+      quietPatchDebugStartSlotLookupStateApplied and
+      quietPatchDebugStartSlotLookupState ==
+        quietPatchDebugStartSlotLookupApplyPlan.stateAfter and
+      quietPatchDebugStartSlotLookupApplied and
+      quietPatchDebugStartSlotValue == -7)
+  check("NPU model SDK helper patch debug start lookup apply blocked",
+    not blockedPatchDebugStartSlotLookupApplyPlan.valid and
+      blockedPatchDebugStartSlotLookupApplyPlan.firstBlock ==
+        blaiToolchainPatchDebugStartSlotLookupApplyLookupPlan and
+      not blockedPatchDebugStartSlotLookupStateApplied and
+      blockedPatchDebugStartSlotLookupState ==
+        blaiToolchainPatchDebugStartSlotLookupState(true, -9) and
+      not blockedPatchDebugStartSlotLookupApplied and
+      blockedPatchDebugStartSlotValue == -9)
+  check("NPU model SDK helper patch debug search snapshot",
+    patchDebugSearchSnapshotPlan.valid and
+      patchDebugSearchSnapshotPlanInto == patchDebugSearchSnapshotPlan and
+      patchDebugSearchSnapshotPlan.printRequested and
+      patchDebugSearchSnapshotPlan.patchCountScalar == 2 and
+      patchDebugSearchSnapshotPlan.layerCursorScalar == 4 and
+      patchDebugSearchSnapshotPlan.previousOwnerFlagBit == 1)
+  check("NPU model SDK helper patch debug search snapshot quiet",
+    quietPatchDebugSearchSnapshotPlan.valid and
+      not quietPatchDebugSearchSnapshotPlan.printRequested and
+      quietPatchDebugSearchSnapshotPlan.previousOwnerFlagBit == 0)
+  check("NPU model SDK helper patch debug search snapshot blocked",
+    not blockedPatchDebugSearchSnapshotPlan.valid and
+      blockedPatchDebugSearchSnapshotPlan.firstBlock ==
+        blaiToolchainPatchDebugSearchSnapshotLayerIndex)
+  check("NPU model SDK helper patch debug search snapshot apply",
+    patchDebugSearchSnapshotApplyPlan.valid and
+      patchDebugSearchSnapshotApplyPlanInto ==
+        patchDebugSearchSnapshotApplyPlan and
+      patchDebugSearchSnapshotApplyPlan.printRequested and
+      patchDebugSearchSnapshotApplyPlan.stateAfter ==
+        blaiToolchainPatchDebugSearchSnapshotState(2, 4, true) and
+      patchDebugSearchSnapshotApplied and
+      patchDebugSearchSnapshotState ==
+        blaiToolchainPatchDebugSearchSnapshotState(2, 4, true))
+  check("NPU model SDK helper patch debug search snapshot apply quiet",
+    quietPatchDebugSearchSnapshotApplyPlan.valid and
+      not quietPatchDebugSearchSnapshotApplyPlan.printRequested and
+      quietPatchDebugSearchSnapshotApplied and
+      quietPatchDebugSearchSnapshotState ==
+        blaiToolchainPatchDebugSearchSnapshotState(-7, -7, true))
+  check("NPU model SDK helper patch debug search snapshot apply blocked",
+    not blockedPatchDebugSearchSnapshotApplyPlan.valid and
+      blockedPatchDebugSearchSnapshotApplyPlan.firstBlock ==
+        blaiToolchainPatchDebugSearchSnapshotApplySnapshotPlan and
+      not blockedPatchDebugSearchSnapshotApplied and
+      blockedPatchDebugSearchSnapshotState ==
+        blaiToolchainPatchDebugSearchSnapshotState(-9, -9, true))
+  check("NPU model SDK helper patch apply into matches",
+    patchApplyInto == patchApply)
+  check("NPU model SDK helper patch apply valid",
+    patchApplied and patchApply.valid and
+      patchAssignmentApplyPlan.valid and
+      patchAssignmentApplyPlanInto == patchAssignmentApplyPlan and
+      patchAssignmentApplyPlan.stateAfter.startPatchSlot == 1 and
+      patchAssignmentApplyPlan.stateAfter.assignedPatchCount == 2 and
+      patchAssignmentApplyPlan.stateAfter.writesApplied == 2 and
+      patchAssignmentApplyPlan.stateAfter.occupiedAfter[0] and
+      patchAssignmentApplyPlan.stateAfter.ownerAfter[0] == 9 and
+      patchAssignmentStateApplied and patchAssignmentStateBitmap[1] and
+      patchAssignmentStateBitmap[2] and patchAssignmentStateOwners[1] == 9 and
+      patchAssignmentStateOwners[2] == 9 and patchOwners[1] == 9 and
+      patchOwners[2] == 9 and patchBitmap[1] and patchBitmap[2])
+  check("NPU model SDK helper patch apply blocked",
+    not shortPatchApply.valid and
+      shortPatchApply.firstBlock == blaiToolchainPatchSearchStorage and
+      not blockedPatchAssignmentApplyPlan.valid and
+      blockedPatchAssignmentApplyPlan.firstBlock ==
+        blaiToolchainPatchApplyAssignmentPlan and
+      not blockedPatchAssignmentStateApplied and
+      patchAssignmentStateBitmap == patchAssignmentStateBitmapBefore and
+      patchAssignmentStateOwners == patchAssignmentStateOwnersBefore)
+  check("NPU model SDK helper patch search no run",
+    blaiToolchainPatchSearchPlan([false, true, false, true], 2'u32).firstBlock ==
+      blaiToolchainPatchSearchNoRun)
+  var highStartPatchBitmap: array[34, bool]
+  for highStartIndex in 0'u32 ..< 32'u32:
+    let highStartCursor =
+      blaiU32ArrayIndexCursor(highStartIndex, highStartPatchBitmap.len)
+    if highStartCursor.valid:
+      highStartPatchBitmap[highStartCursor.index] = true
+  let highStartPatchSearch =
+    blaiToolchainPatchSearchPlan(highStartPatchBitmap, 2'u32)
+  check("NPU model SDK helper patch search start overflow",
+    not highStartPatchSearch.valid and
+      highStartPatchSearch.firstBlock == blaiToolchainPatchSearchStartSlot)
   check("NPU model SDK helper conv stream",
     layer.instCnt == 1 and blaiLayerCount(stream) == 1 and
       decodeBlaiLayer(stream[0]).activation == ord(blaiActRelu).uint32)
@@ -11047,6 +17500,15 @@ proc main() {.exportc, cdecl.} =
   discard console.sendLine("=== BL808 NPU Model Smoke Test ===")
 
   checkSequentialParsedModels()
+  checkMnistTfliteModelOracle()
+  checkGeneratedModelLoadPlan()
+  checkSdkInputBufferPlan()
+  checkSdkCoreAccessorPlans()
+  checkSdkOutputBufferPlan()
+  checkSdkResolutionPlans()
+  checkSdkCallbackPlans()
+  when defined(blaiMeetkaiAsrFixture):
+    checkMeetkaiAsrGeneratedHeaderFixture()
   checkParsedSingleLayerDiagnostics()
   checkFixedPreviousActivationShortcut()
   checkTflitePreviousActivationShortcut()

@@ -400,7 +400,8 @@ proc bl_wifi_unset_appie_internal*(vifIdx: uint8, ieType: uint8) {.exportc, cdec
 
 proc setKey(vifIdx: uint8, a1Byte: uint8, keyIdxOrPairwise: uint8,
             macAddr: pointer, macLen: uint8,
-            keyData: pointer, keyLen: uint8, cipher: uint8)
+            keyData: pointer, keyLen: uint8, alg: uint8,
+            pairwise: bool)
   {.exportc: "set_key_constprop0_nim", noinline.} =
   ## Blob `set_key.constprop.0` — shared AP/STA key-struct builder.
   ## Builds the 56-byte HW-key descriptor at a stack buffer and tail-calls
@@ -418,9 +419,9 @@ proc setKey(vifIdx: uint8, a1Byte: uint8, keyIdxOrPairwise: uint8,
   discard c_memset(addr keyDescriptorBuffer[0], 0, 56.csize_t)
   let keyDescriptor = cast[ptr SupplicantKeyParamView](addr keyDescriptorBuffer[0])
   keyDescriptor.keyIdx = vifIdx
-  keyDescriptor.keyType = a1Byte
-  keyDescriptor.requestedCipher = cipher
-  if cipher == 0:
+  keyDescriptor.keyType = if pairwise: a1Byte else: 0xFF'u8
+  keyDescriptor.requestedCipher = alg
+  if alg == 0:
     keyDescriptor.keyType = 0xFF'u8
   keyDescriptor.addrIdx = keyIdxOrPairwise
   if macAddr != nil:
@@ -429,7 +430,10 @@ proc setKey(vifIdx: uint8, a1Byte: uint8, keyIdxOrPairwise: uint8,
   keyDescriptor.keyLen = keyLen
   discard c_memcpy(addr keyDescriptor.keyData[0], keyData, keyLen.csize_t)
   if keyLen == 16:
-    keyDescriptor.translatedCipher = 2  # CCMP
+    # Vendor set_key translates 16-byte temporal keys to cipher 2. The VIF
+    # key table handles the group-vs-pairwise distinction separately from the
+    # hardware cipher selector.
+    keyDescriptor.translatedCipher = 2'u8
   elif keyLen == 32:
     # TKIP: swap MIC key halves at descriptor[24..31] and descriptor[32..39].
     let tkip = supplicantTkipKeyData(keyDescriptor)
@@ -492,7 +496,8 @@ proc bl_wifi_set_ap_key_internal*(param: pointer) {.exportc, cdecl.} =
            keyIdx_arg.uint8,                # keyIdxOrPairwise (blob AP: keyIdx)
            nil, 0'u8,                       # macAddr=NULL, macLen=0
            keyData_arg, keyLen_arg.uint8,   # keyData, keyLen
-           cipher_arg.uint8)                # cipher
+           cipher_arg.uint8,                # cipher
+           true)                            # AP pairwise path
 
 proc bl_wifi_set_sta_key_internal*(vifIdx: uint8, staIdx: uint8, alg: uint32,
     keyIdx: int32, setTx: int32, seqData: pointer, seqLen: csize_t,
@@ -508,7 +513,8 @@ proc bl_wifi_set_sta_key_internal*(vifIdx: uint8, staIdx: uint8, alg: uint32,
          keyIdx.uint8,                  # key index / VIF key slot selector
          seqData, seqLen.uint8,         # replay counter / PN seed
          keyData, keyLen.uint8,         # keyData, keyLen
-         pairwiseByte)                  # 0 => default/group key path
+         alg.uint8,                     # WPA algorithm enum
+         pairwise)                      # pairwise vs default/group key path
   # Blob: sm_get_set_machwkey_index(0, vifIdx, &status_byte, keyType)
   var statusByte: uint8 = 0
   let keyType: uint32 = if pairwiseByte == 0: 1 else: 0

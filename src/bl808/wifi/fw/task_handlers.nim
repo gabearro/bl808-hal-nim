@@ -173,6 +173,10 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
     let vifIdx = req.vifIdx
     let vifU = vifEntryAddr(vifIdx)
     let vif = vifChannelAt(vifU)
+    # The SM BSS-parameter path sources this request from VIF+380
+    # (vif.bssid in our layout). Keep that canonical field in sync with the
+    # MAC HW BSSID and the local currentBssid helper used by reset/switch code.
+    vif.bssid = req.bssid
     vif.currentBssid = req.bssid
     let bssidView = macAddrAt(addr req.bssid[0])
     let bssidLo = bssidView.lowLe
@@ -378,6 +382,10 @@ proc mm_sta_add_req_handler*(param: pointer) {.exportc, cdecl.} =
     cfm.status = mm_sta_add(param, addr staIdx, addr hwStaIdx)
     cfm.staIdx = staIdx
     cfm.hwStaIdx = hwStaIdx
+    inc nimFwDbgPreauthStaCfm
+    nimFwDbgPreauthStaCfmMeta =
+      cfm.status.uint32 or (cfm.staIdx.uint32 shl 8) or
+      (cfm.hwStaIdx.uint32 shl 16) or (requester.uint32 shl 24)
     ke_msg_send(cfm)
 
 proc mm_sta_add_cfm_handler*(param: pointer) {.exportc, cdecl.} =
@@ -533,6 +541,12 @@ proc mm_set_vif_state_cfm_handler*(param: pointer) {.exportc, cdecl.} =
   let controlPortState = 2'u8 - (keyPointerFlags and 1).uint8
   sta.controlPortState = controlPortState
   sta.rateWord = lmacGateHalfword(connectInfo.ctrlPortEthertype)
+  let mm = mmEnvView()
+  if mm.rxPromiscUploadFlag != 0:
+    mm.rxFilterBase = 0x3503A58C'u32
+  else:
+    mm.rxFilterBase = 0x3503858C'u32
+  mm_rx_filter_set()
   when defined(bl808WifiConnectTrace):
     nimFwConnectTrace2U32("[WIFI-CT] vif_state_cfm ", vifIdx.uint32 or (staIdx.uint32 shl 8), controlPortState.uint32)
   # If control-port state == 2, send the vendor PS-disable request to ME from SM.
@@ -1348,6 +1362,12 @@ proc scanu_join_cfm_handler*(param: pointer) {.exportc, cdecl.} =
         msg.vifIdx = vifIdx
         discard c_memcpy(addr msg.bssid[0], addr vif.bssid[0],
                          msg.bssid.len.csize_t)
+        inc nimFwDbgPreauthStaReq
+        nimFwDbgPreauthStaReqMeta =
+          vifIdx.uint32 or (vif.staIdx.uint32 shl 8) or
+          (chanIdx.uint32 shl 16) or (ke_state_get(TASK_SM).uint32 shl 24)
+        nimFwDbgPreauthStaReqBssid0 = cast[ptr uint32](addr msg.bssid[0])[]
+        nimFwDbgPreauthStaReqBssid1 = cast[ptr uint16](addr msg.bssid[4])[].uint32
         # Set HT rate mask from vif flags
         let apSecurityFlags = apConfig.securityFlags
         if (apSecurityFlags and 2) != 0:
@@ -1450,6 +1470,21 @@ proc scanu_raw_send_req_handler*(param: pointer) {.exportc, cdecl.} =
 
 # --- SM Task Handlers (sm_task.o) ---
 
+proc smConnectReqHasSpecificBssid(req: ptr ConnectInfoView): bool {.inline.} =
+  if req == nil:
+    return false
+  if (req.bssid[0] and 1'u8) != 0:
+    return false
+  var allZero = true
+  var allFf = true
+  for bssidByteIndex in 0 ..< 6:
+    let bssidByte = req.bssid[bssidByteIndex]
+    if bssidByte != 0'u8:
+      allZero = false
+    if bssidByte != 0xFF'u8:
+      allFf = false
+  not allZero and not allFf
+
 proc sm_connect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle SM_CONNECT_REQ: initiate STA connection (173 instrs in blob).
   ## From blob (sm_task.o): validates SM state, loads VIF info, checks
@@ -1494,10 +1529,22 @@ proc sm_connect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
           earlyExit = true
 
   if not earlyExit:
+    let sm = smEnvView()
     # Check STA index is unassigned (0xFF)
     let staIdx = vif.staIdx
     if staIdx != 0xFF:
-      assert_err("sm_task.c", "sm_task.c", 90)
+      if state2 == SmIdleState and sm.connectInfo == nil:
+        let staleChanCtx = vif.chanCtxt
+        if staleChanCtx != nil:
+          chan_ctxt_unlink(vifIdx)
+          vif.chanCtxt = nil
+        vif.staIdx = 0xFF'u8
+        vif.state = 0
+        if vifIdx < 8'u8:
+          nimFwWpaPendingMask = nimFwWpaPendingMask and
+            (not (1'u32 shl vifIdx))
+      else:
+        assert_err("sm_task.c", "sm_task.c", 90)
 
     # Check no existing channel context
     let chanCtx = vif.chanCtxt
@@ -1505,7 +1552,6 @@ proc sm_connect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
       assert_err("sm_task.c", "sm_task.c", 91)
 
     # Check no existing connection in sm_connect_env
-    let sm = smEnvView()
     if sm.connectInfo != nil:
       assert_err("sm_task.c", "sm_task.c", 94)
     sm.connectInfo = param
@@ -1529,13 +1575,16 @@ proc sm_connect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   # already known, otherwise start a scan using the VIF MAC as the source).
   var selectedBssResult: pointer = nil
   var selectedBssChannel: pointer = nil
-  if connectInfoHasChannelHint(req):
+  if connectInfoHasChannelHint(req) and smConnectReqHasSpecificBssid(req):
     selectedBssResult = cast[pointer](addr req.bssid[0])
     selectedBssChannel = connectInfoChannelHint(param)
   else:
     discard sm_get_bss_params(addr selectedBssResult, addr selectedBssChannel)
 
-  scanu_prune_scanresult_raw_frames()
+  if selectedBssResult != nil:
+    scanu_prune_scanresult_raw_frames_except_bssid(selectedBssResult)
+  else:
+    scanu_prune_scanresult_raw_frames()
   let connectConfirm = cast[ptr StatusCfmPayload](
     ke_msg_alloc(SM_CONNECT_CFM, TASK_API, TASK_SM, StatusCfmPayloadSize))
   if connectConfirm != nil:
@@ -1576,7 +1625,7 @@ proc sm_disconnect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ke_msg_send_basic(SM_DISCONNECT_CFM, TASK_API, TASK_SM)
   return KeMsgConsumed
 
-proc sm_connect_abort_req_handler*(param: pointer) {.exportc, cdecl.} =
+proc sm_connect_abort_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle SM_CONNECT_ABORT_REQ: abort ongoing connection (198 bytes in blob).
   ## Blob dispatches on SM state:
   ##   idle:    send cfm with status=0
@@ -1592,7 +1641,7 @@ proc sm_connect_abort_req_handler*(param: pointer) {.exportc, cdecl.} =
   let sm = smEnvView()
   if state > SmWaitingState and state <= SmSettingBssState:
     # States 3,4: message will be requeued (return 2)
-    return
+    return KeMsgSaved
   elif state == SmScanningState:
     # Scanning: mark abort, cancel scan, clear cache
     sm.cancelRequested = state.uint8
@@ -1615,6 +1664,7 @@ proc sm_connect_abort_req_handler*(param: pointer) {.exportc, cdecl.} =
   # Send CFM and return 0
   if cfm != nil:
     ke_msg_send(cfm)
+  return KeMsgConsumed
 
 proc sm_rsp_timeout_ind_handler*(param: pointer) {.exportc, cdecl.} =
   ## Handle SM_RSP_TIMEOUT_IND: auth/assoc response timeout (126 bytes in blob).
@@ -1627,6 +1677,9 @@ proc sm_rsp_timeout_ind_handler*(param: pointer) {.exportc, cdecl.} =
   let sm = smEnvView()
   let connEnv = sm.connectInfo
   let state = ke_state_get(TASK_SM)
+  inc nimFwDbgSmRspTimeout
+  nimFwDbgSmRspTimeoutState = state.uint32
+  nimFwDbgSmRspTimeoutRxCtrl = regRead(MACHW_RX_CNTRL_REG)
   when defined(bl808WifiConnectTrace):
     nimFwTrace2U32("[WIFI-NIMFW] sm_rsp_timeout ",
                    state.uint32, cast[uint32](cast[uint](connEnv)))
@@ -1636,6 +1689,33 @@ proc sm_rsp_timeout_ind_handler*(param: pointer) {.exportc, cdecl.} =
     return
   if state != SmAuthStartingState and state != SmAuthenticatingState:
     return
+  when defined(bl808WifiAckDrivenMgmtFallback):
+    if nimFwDbgAssocReqSend != 0 and
+        (nimFwDbgAssocCfmAckOk16 != 0 or nimFwDbgAssocCfmAckOk23 != 0) and
+        nimFwDbgAuthOpenSuccess != 0 and
+        nimFwDbgAssocDone == 0:
+      inc nimFwDbgAckFallbackAssoc
+      nimFwDbgAckFallbackLast =
+        0xB0000000'u32 or (state.uint32 shl 16) or
+        ((nimFwDbgAssocCfmAckOk16 + nimFwDbgAssocCfmAckOk23) and 0xFFFF'u32)
+      sm_assoc_done(1'u16)
+      return
+  when defined(bl808WifiAckDrivenMgmtFallback):
+    if state == SmAuthStartingState and
+        (nimFwDbgAuthCfmAckOk16 != 0 or nimFwDbgAuthCfmAckOk23 != 0) and
+        nimFwDbgAuthOpenSuccess == 0:
+      inc nimFwDbgAckFallbackAuth
+      nimFwDbgAckFallbackLast =
+        0xA0000000'u32 or (state.uint32 shl 16) or
+        ((nimFwDbgAuthCfmAckOk16 + nimFwDbgAuthCfmAckOk23) and 0xFFFF'u32)
+      var fallbackAuth {.noinit.}: SmAuthFrameView
+      discard c_memset(addr fallbackAuth, 0, sizeof(SmAuthFrameView).csize_t)
+      fallbackAuth.frameLen = 38'u16
+      fallbackAuth.authAlgo = 0'u16
+      fallbackAuth.authSeq = 2'u16
+      fallbackAuth.statusCode = 0'u16
+      sm_auth_handler(addr fallbackAuth)
+      return
   let retryCount = connectInfoAuthRetry(connEnv)[]
   let maxRetries = sm.authRetryLimit
   when defined(bl808WifiConnectTrace):
@@ -1654,6 +1734,7 @@ proc sm_rsp_timeout_ind_handler*(param: pointer) {.exportc, cdecl.} =
     let wpaCbFn = wpaCallbacks().authTimeout
     if wpaCbFn != nil:
       cast[proc() {.cdecl.}](wpaCbFn)()
+  sm_deauth_send(nil, 3)
   sm_auth_send(1'u16, 0)
 
 proc sm_sa_query_timeout_ind_handler*(param: pointer) {.exportc, cdecl.} =
@@ -1769,6 +1850,15 @@ proc sm_delete_resources*(param: pointer = nil) {.exportc, cdecl.} =
   elif smConnInfo != nil:
     vifIdx = connectInfoView(smConnInfo).vifIdx
     vif = vifChannelForIdx(vifIdx)
+  else:
+    for candidateIdx in 0'u8 ..< MAX_VIFS.uint8:
+      let candidate = vifChannelForIdx(candidateIdx)
+      if candidate.vifType == VIF_TYPE_STA and
+          (candidate.staIdx != 0xFF'u8 or candidate.chanCtxt != nil or
+           candidate.state != 0):
+        vif = candidate
+        vifIdx = candidateIdx
+        break
   # Clear station entry if assigned
   let staIdx = if vif != nil: vif.staIdx else: 0xFF'u8
   if staIdx != 0xFF'u8:
@@ -1779,6 +1869,7 @@ proc sm_delete_resources*(param: pointer = nil) {.exportc, cdecl.} =
     if staDel != nil:
       staDel.staIdx = staIdx
       ke_msg_send(staDel)
+    vif.staIdx = 0xFF'u8
   # Clear VIF active flag
   if vif != nil and vif.state != 0:
     let vifStateMsg = cast[ptr MmSetVifStateReqPayload](
@@ -1789,14 +1880,25 @@ proc sm_delete_resources*(param: pointer = nil) {.exportc, cdecl.} =
       vifStateMsg.state = 0
       vifStateMsg.vifIdx = vifIdx
       ke_msg_send(vifStateMsg)
+    vif.state = 0
   # Clear channel context link
   let chanCtxt = if vif != nil: vif.chanCtxt else: nil
   if chanCtxt != nil:
     chan_ctxt_unlink(vifIdx)  # blob: chan_ctxt_unlink (not mm_sta_del)
+    vif.chanCtxt = nil
+  if vif != nil and vifIdx < 8'u8:
+    nimFwWpaPendingMask = nimFwWpaPendingMask and (not (1'u32 shl vifIdx))
   # Clear sm_env[484] (status word)
   if vif != nil:
     vifApConfig(vif).securityFlags = 0
+  if sm.connectIndMsg != nil:
+    ke_msg_free(keMsgHdrFromPayload(sm.connectIndMsg))
+    sm.connectIndMsg = nil
   sm.connectInfo = nil
+  sm.cancelRequested = 0
+  sm.joinBssFlag = 0
+  sm.deauthPending = 0
+  sm.scanResultIndex = 0xFFFFFFFF'u32
   ke_state_set(TASK_SM, SmIdleState)
 
 proc sm_auth_assoc_send_according_chan*(nextState: uint16 = 0, param1: uint16 = 0, param2: uint32 = 0) {.exportc, cdecl.} =
@@ -1825,6 +1927,25 @@ proc sm_auth_assoc_send_according_chan*(nextState: uint16 = 0, param1: uint16 = 
                           vifIdx.uint32 or (chanCnt.uint32 shl 8) or
                             (ke_state_get(TASK_SM).uint32 shl 16))
   if chanCnt <= 1 or chan_ctxt_use_dominant_chan():
+    if vif.chanCtxt != nil and vif.channelFreqPair != 0'u32:
+      let ctxt = cast[ptr ChanCtxtView](vif.chanCtxt)
+      let selectedPrimary = uint16(vif.channelFreqPair and 0xFFFF'u32)
+      var selectedCenter = uint16((vif.channelFreqPair shr 16) and 0xFFFF'u32)
+      if selectedCenter == 0'u16:
+        selectedCenter = selectedPrimary
+      if selectedPrimary != 0'u16 and
+          (ctxt.channel.primFreq != selectedPrimary or
+           ctxt.channel.centerFreq1 != selectedCenter):
+        ctxt.channel.primFreq = selectedPrimary
+        ctxt.channel.centerFreq1 = selectedCenter
+        ctxt.channel.centerFreq2 = 0'u16
+      let chanEnv = chanEnvView()
+      chanEnv.flags = chanEnv.flags and not 0x0C'u8
+      chanEnv.scheduledCtxt = vif.chanCtxt
+      chanEnv.currentCtxt = vif.chanCtxt
+      chan_upd_ctxt_status(vif.chanCtxt, 4)
+    if vif.chanCtxt != nil:
+      chan_pre_switch_channel(vif.chanCtxt)
     # Direct send path
     when defined(bl808WifiConnectTrace):
       nimFwTrace2U32("[WIFI-NIMFW] auth_sched_direct ",
@@ -3149,7 +3270,11 @@ proc txl_get_seq_ctrl*(): uint16 {.exportc, cdecl.} =
   ## Get next TX sequence control number.
   ## From blob (txl_frame.o, 7 instrs): reads global seq counter,
   ## increments, wraps to 12 bits, shifts left 4 (sequence number field).
-  return nextTxSeqCtrl()
+  let seqCtrl = nextTxSeqCtrl()
+  txlSeqRetained = txControlEnv().seqCounter
+  nimFwDbgTxSeqLast = seqCtrl.uint32
+  nimFwDbgTxSeqCounter = txlSeqRetained.uint32
+  return seqCtrl
 
 proc txl_int_fake_transfer*(txDesc: pointer, queueIdx: uint32) {.exportc, cdecl.} =
   ## Fake DMA transfer for internal TX frames (52 bytes in blob, 17 instrs).
@@ -3411,6 +3536,15 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
   let fcFull = frame.frameControl
   inc nimFwDbgMgtSeen
   nimFwDbgMgtLastFc = fcFull.uint32 or (rx.hwFlags and 0xFFFF0000'u32)
+  let subtypeIndex = ((fcFull shr 4) and 0x0F'u16).int
+  if subtypeIndex >= 0 and subtypeIndex < nimFwDbgMgtSubtypeCounts.len:
+    inc nimFwDbgMgtSubtypeCounts[subtypeIndex]
+  if (fcFull and 0x00FC'u16) == 0x00B0'u16:
+    nimFwDbgMgtAuthLastFc = fcFull.uint32 or (rx.hwFlags and 0xFFFF0000'u32)
+  elif (fcFull and 0x00FC'u16) == 0x0010'u16 or
+      (fcFull and 0x00FC'u16) == 0x0030'u16:
+    inc nimFwDbgMgtAssocRspSeen
+    nimFwDbgMgtAssocLastFc = fcFull.uint32 or (rx.hwFlags and 0xFFFF0000'u32)
 
   # Reject if bit 10 set (protected frame bit — wrong context for mgmt)
   if (fcFull and 0x0400'u16) != 0:

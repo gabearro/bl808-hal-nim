@@ -223,6 +223,13 @@ const
   Ox64D0BootOffset*     = 0x10_0000'u       # D0 low-load bootloader
   Ox64MainImageOffset*  = 0x80_0000'u       # Main image
 
+  # Flash-resident WASM executable cache. Keep this below the LittleFS region
+  # while the top-of-flash protection state is still being characterized.
+  Ox64WasmStoreSize*    = 1 * 1024 * 1024
+  Ox64WasmStoreOffset*  = 0x70_0000'u
+  Ox64WasmSlotSize*     = 64 * 1024
+  Ox64WasmSlotCount*    = Ox64WasmStoreSize div Ox64WasmSlotSize
+
 # =============================================================================
 # IPC synchronization addresses (in XRAM)
 # =============================================================================

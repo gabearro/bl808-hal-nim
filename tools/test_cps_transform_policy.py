@@ -422,7 +422,7 @@ def test_wifi_scan_connect_uses_vendor_style_cache_hint():
     )[0]
 
     for expected in [
-        "var scanCache: array[VendorScanDiagMax, ScanCacheItem]",
+        "var scanCache {.allcoreHttpPsramBss.}: array[VendorScanDiagMax, ScanCacheItem]",
         "proc scannedBssidIsSpecific",
         "let supportedChannelCount = bl_msg_get_channel_nums()",
         "supportedChannelCount <= 0 or scannedChannel.cint > supportedChannelCount",
@@ -441,7 +441,7 @@ def test_wifi_scan_connect_uses_vendor_style_cache_hint():
         "ScanActive, 0)",
         "var connectBssid: ptr uint8 = nil",
         "connectBssid = if scannedBssidIsSpecific(mac): mac else: nil",
-        "if scanCacheFind(ssid, ssidLen, mac, addr selectedBssid,",
+        "if scanCacheFind(ssid, ssidLen, mac, chanId, addr selectedBssid,",
         "connectBssid = addr selectedBssid[0]",
         "freq = wifiChannelToFreq(selectedChannel)",
         "connectBssid, band, freq, flags",
@@ -450,6 +450,7 @@ def test_wifi_scan_connect_uses_vendor_style_cache_hint():
 
     for expected in [
         "let requireRequestedBssid = scannedBssidIsSpecific(requestedBssid)",
+        "scanCache[scanCacheSlotIndex].channel != requestedChannel",
         "if scanCache[scanCacheSlotIndex].rssi.int > bestScanCacheRssi:",
         "selectedChannelOut[] = scanCache[bestScanCacheSlot].channel",
     ]:
@@ -8340,6 +8341,29 @@ def test_wifi_firmware_is_pure_nim_without_sdk_vendor_links():
         "bl808WifiVendor",
     ]:
         assert forbidden not in wifi_fw
+
+
+def test_wifi_firmware_does_not_link_sdk_ccmp_fallback():
+    crypto_sources = (
+        ROOT
+        / "src/bl808/wifi/facade_parts/sdk_build_config_parts/crypto_sources.nim"
+    ).read_text()
+
+    for forbidden in [
+        "aes-ccm.c",
+        "aes-internal.c",
+        "aes-internal-enc.c",
+        "ccmp.c",
+        "ccmp_decrypt",
+    ]:
+        assert forbidden not in crypto_sources
+
+    rx_upper = (
+        ROOT / "src/bl808/wifi/fw/rx_upper.nim"
+    ).read_text()
+    assert "nim_ccmp_decrypt(" in rx_upper
+    assert "proc ccmp_decrypt" not in rx_upper
+    assert " ccmp_decrypt(" not in rx_upper
 
 
 def test_wifi_tpc_channel_power_offsets_use_semantic_locals():
@@ -19691,6 +19715,20 @@ def test_wifi_scan_ssid_selection_has_typed_cache_fallback():
         "reserved4*: uint16",
     ]:
         assert forbidden not in scanu_layout_block
+
+
+def test_wifi_transition_mode_prefers_psk_over_sae():
+    wifi_fw = wifi_fw_policy_source()
+    frame_body = wifi_fw.split("proc scanu_frame_handler*", 1)[1].split(
+        "proc scanu_search_by_bssid*", 1
+    )[0]
+
+    assert "if (keyMgmtMask and 2) != 0: selectedAuth = 2" in frame_body
+    assert "elif (keyMgmtMask and 0x400) != 0: selectedAuth = 1024" in frame_body
+    assert (
+        "if (keyMgmtMask and 0x400) != 0: selectedAuth = 1024\n"
+        "          elif (keyMgmtMask and 0x100) != 0"
+    ) not in frame_body
 
 
 def test_wifi_scan_start_payload_alignment_fields_are_semantic():

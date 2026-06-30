@@ -708,11 +708,11 @@ static void bl808_wifi_vendor_power_on_xtal_wifipll(void)
     reg_write32(mm_glb + 0x000UL, reg_read32(mm_glb + 0x000UL) | (1UL << 0));
 }
 
-static void bl808_wifi_vendor_prepare_wireless_domain(void)
+static void bl808_wifi_vendor_prepare_wireless_domain(int force_reset)
 {
     static int prepared;
 
-    if (prepared) {
+    if (prepared && !force_reset) {
         bl808_wifi_vendor_enable_wireless_clocks();
         return;
     }
@@ -1201,6 +1201,7 @@ static void bl808_wifi_vendor_fw_start(void)
         return;
     }
 
+    bl808_wifi_vendor_prepare_wireless_domain(1);
     bl_wifi_clock_enable();
 
     irq_state = os_enter_critical();
@@ -2146,7 +2147,7 @@ int bl_wifi_clock_enable(void)
 {
     volatile uint32_t *wifi_cfg0 = (volatile uint32_t *)(0x20000000UL + 0x3B0UL);
     uint32_t reg = *wifi_cfg0;
-    bl808_wifi_vendor_prepare_wireless_domain();
+    bl808_wifi_vendor_prepare_wireless_domain(0);
     reg = (reg & ~0xFUL) | 0x1UL;
     *wifi_cfg0 = reg;
     return 0;
@@ -2163,8 +2164,46 @@ int bl_wifi_enable_irq(void)
 
 int bl_wifi_mac_addr_get(uint8_t mac[6])
 {
-    static const uint8_t fallback[6] = {0x18, 0xB9, 0x05, 0x00, 0x00, 0x01};
-    memcpy(mac, fallback, 6);
+#ifdef bl808WifiForceLegacyMac
+    static const uint8_t legacy_fallback[6] = {0x18, 0xB9, 0x05, 0x00, 0x00, 0x01};
+    memcpy(mac, legacy_fallback, 6);
+    return 0;
+#endif
+    volatile uint32_t *efuse_read_cmd = (volatile uint32_t *)0x2005680Cu;
+    volatile uint32_t *efuse_data = (volatile uint32_t *)0x20056000u;
+    *efuse_read_cmd = 1u;
+    for (uint32_t timeout = 10000u; (*efuse_read_cmd & 1u) != 0u && timeout != 0u; timeout--) {
+    }
+    uint32_t low = efuse_data[0x2Cu];
+    uint32_t high = efuse_data[0x2Du];
+
+    mac[0] = (uint8_t)((low >> 0) & 0xffu);
+    mac[1] = (uint8_t)((low >> 8) & 0xffu);
+    mac[2] = (uint8_t)((low >> 16) & 0xffu);
+    mac[3] = (uint8_t)((low >> 24) & 0xffu);
+    mac[4] = (uint8_t)((high >> 0) & 0xffu);
+    mac[5] = (uint8_t)((high >> 8) & 0xffu);
+
+    int all_zero = 1;
+    int all_one_sentinel = 1;
+    for (int i = 0; i < 6; i++) {
+        all_zero &= mac[i] == 0;
+        all_one_sentinel &= mac[i] == 1;
+    }
+    if (all_zero || all_one_sentinel || (mac[0] & 1u)) {
+        uint32_t id0 = efuse_data[0x28u];
+        uint32_t id1 = efuse_data[0x29u];
+        uint32_t mix = id0 ^ id1 ^ 0xB1808001u;
+        mix ^= mix >> 16;
+        mix *= 0x7FEB352Du;
+        mix ^= mix >> 15;
+        mac[0] = 0x02u;
+        mac[1] = 0xB8u;
+        mac[2] = (uint8_t)((mix >> 0) & 0xffu);
+        mac[3] = (uint8_t)((mix >> 8) & 0xffu);
+        mac[4] = (uint8_t)((mix >> 16) & 0xffu);
+        mac[5] = (uint8_t)((mix >> 24) & 0xffu);
+    }
     return 0;
 }
 

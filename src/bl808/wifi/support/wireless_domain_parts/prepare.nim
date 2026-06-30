@@ -1,6 +1,7 @@
-proc bl808WifiBackendPrepareWirelessDomain() =
-  var prepared {.global.}: bool
-  if prepared:
+var bl808WifiBackendWirelessPrepared {.global.}: bool
+
+proc bl808WifiBackendPrepareWirelessDomain*(forceReset = false) =
+  if bl808WifiBackendWirelessPrepared and not forceReset:
     bl808WifiBackendEnableWirelessClocks()
     return
   regUpdate32(GlbBase + 0x60c'u32, 0xff, 0)
@@ -13,4 +14,4 @@ proc bl808WifiBackendPrepareWirelessDomain() =
   bl808WifiBackendSwResetCfg0(4)
   bl808WifiBackendConfigureDigClock()
   bl808WifiBackendEnableWirelessClocks()
-  prepared = true
+  bl808WifiBackendWirelessPrepared = true

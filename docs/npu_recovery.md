@@ -32,7 +32,8 @@ python3 tools/validate_npu_objdump.py \
 The tool reports:
 
 - candidate SDK/toolchain archives and objects containing NPU/BLAI keywords
-- globally defined symbols from `riscv64-unknown-elf-nm`
+- globally defined symbols from `llvm-nm` when available, falling back to
+  `riscv64-unknown-elf-nm`
 - call relocations and direct call targets from `llvm-objdump -dr`
 - immediate constants that land in MM_GLB, MM_MISC, CODEC_MISC, or BLAI windows
 - store instructions near recovered functions for manual type recovery
@@ -88,6 +89,187 @@ symbols. When the local SDK cache is present,
 boundary still match the vendor archive, keeping the archive as an oracle for
 instruction/data memory behavior rather than a live implementation path.
 
+Verified M1s BLAI toolchain input:
+
+```sh
+curl -L \
+  'https://api.dl.sipeed.com/file/download?verify_code=<captcha>&file_url=MAIX/M1s/M1s_Dock/8_Toolchain/blai_npu/blai_toolchain_for_m1s.zip' \
+  -o build/vendor-cache/blai_npu_toolchain_fetch/blai_toolchain_for_m1s.zip
+unzip -q build/vendor-cache/blai_npu_toolchain_fetch/blai_toolchain_for_m1s.zip \
+  -d build/vendor-cache/blai_npu_toolchain
+
+BLAI_NPU_TOOLCHAIN=build/vendor-cache/blai_npu_toolchain \
+  python3 tools/validate_npu_objdump.py \
+  --json-out build/npu-recovery/blai_toolchain_for_m1s-summary.json
+```
+
+The fetched `blai_toolchain_for_m1s.zip` archive has SHA-256
+`bc4407e0d5dfa7f2dfe99b6945031c2254aed7d4676f26d2706037e0eb5b1039`.
+Its main `blai_toolchain` payload is an x86-64 converter, not a BL808 RISC-V
+firmware object. It is still a useful oracle for how TFLite inputs become BLAI
+instruction/weight/data artifacts: the converter exports symbols such as
+`check_BLAI_NPU_RUN`, `instruction_encode`, `DSP_header_encode`,
+`write_blai_binaries`, `PSRAM_allocate`, `search_set_patch`,
+`tflite_search_set_patch`, `forward_CONV_tflite_8`,
+`fetch_tflite_weight_CONV_F`, and `CONV_WEI_DUMP_3x3`. The package also ships
+`models/tflite/mnist.tflite` with SHA-256
+`2420ffd37b5d436231e6a0e19c7c1b6125af9f809ae8daad6a893d149d1edc69`,
+which is now the obvious small legit model candidate for converter-output and
+eventual hardware-output validation. `tools/inspect_tflite_model.py` verifies
+that this model is a `TFL3` FlatBuffer, version 3, with one `main` subgraph,
+INT8 input tensor `serving_default_ftr0_input:0` shaped `[1, 28, 28, 1]`,
+INT8 output tensor `StatefulPartitionedCall:0` shaped `[1, 10]`, and six
+operators: four `CONV_2D` layers, `RESHAPE`, and `FULLY_CONNECTED`. This is a
+stronger oracle than the current synthetic one-layer fixture, but it is not yet
+proof that BL808 hardware completed the graph. The inspector also records the
+graph's operator tensor wiring, input quantization `(scale ~= 1/255,
+zero_point = -128)`, output quantization `(scale ~= 0.29911464,
+zero_point = 4)`, and 36,300 bytes of persistent reshape/weight/bias buffers.
+Those constants are now tracked in the manifest, including per-buffer SHA-256
+identities for every persistent reshape/weight/bias tensor, so the next
+converter-backed fixture can validate pure Nim materialization against the
+actual MNIST model rather than a shape-compatible graph with different
+contents. The toolchain's sample `image/a.bmp` is also tracked as a known-answer
+input oracle: it is a 28x28 8-bit BMP with SHA-256
+`8d6369947f5291c9294feb0b59c13550cb914202c1c013360d58134fbf55193e`, pixel sum
+13,635, and quantized INT8 input range `[-128, 64]`. The dependency-free
+inspector can now run the shipped MNIST graph over that BMP as a host CPU int8
+oracle and reports output tensor 17 as
+`[-19, 7, -1, -4, -18, -41, -50, 43, -22, -4]`, with top class `7`. This is
+the concrete expected vector for the live device test once the generated NPU
+output buffer path is exposed. The same oracle is projected into the raw byte
+form used by workspace/NPU readback as
+`[237, 7, 255, 252, 238, 215, 206, 43, 234, 252]`; the typed
+`blaiValidateMnistTfliteSampleRawOutput` helper now compares live raw bytes
+against that target while preserving projection and first-mismatch evidence.
+The generated MNIST package is also bound to the recovered toolchain SRAM/cfg
+geometry through `BlaiMnistToolchainSramReadinessEvidence`: the converter global
+`PATCH_SIZE` is 262,144 bytes, `MAX_PSRAM_PATCH` contributes 40 active planner
+slots, the shipped cfg memory exposes 45 slots, and the extra five slots are
+tracked as spare capacity. The readiness evidence now carries the derived byte
+budgets too: 10,485,760 active planner bytes, 11,796,480 cfg bytes, and
+1,310,720 spare cfg bytes. It preserves the nested package first-block reason
+and adds `BlaiMnistToolchainSramReadinessBlock`, separating package, SRAM
+globals, cfg memory, patch-size, cfg capacity, spare-slot, local planner,
+persistent-buffer, converter-artifact, and output-oracle failures. The MNIST
+persistent tensor buffers total 36,300 bytes, which fits within one recovered
+patch-sized window with 225,844 bytes spare, and the evidence requires
+converter artifacts plus the known-answer output oracle to be present.
+This proves the real MNIST package is planner-ready for the recovered SRAM
+geometry; it still deliberately reports output validation as blocked until the
+live completion route is resolved.
+`BlaiMnistConverterGenerationEvidence` now carries the host converter side of
+that same boundary. It requires the generated-package and SRAM evidence, records
+the 14 missing Linux shared libraries from the fetched converter probe, and
+keeps `canGenerateArtifacts` false while preserving the static model/sample
+oracle as usable. `BlaiToolchainConverterDependencyPlan` now keeps that startup
+block typed as five framework libraries, three NNAPI helpers, TensorFlow Lite,
+Darknet, and four OpenCV libraries, with the first missing dependency preserved
+as `blaiToolchainConverterDependencyBuiltinOps`. The evidence also preserves the
+nested package/SRAM first-block reasons and reports
+`blaiMnistConverterGenerationExecution` as the current top-level block, making
+the missing shared-library state explicit rather than conflating it with a bad
+model package or a successful artifact generation run. This
+prevents the package contract from being mistaken for freshly regenerated
+`*_b.bin` artifacts or for successful live model validation.
+`BlaiToolchainConverterArtifactRegenerationPlan` now separates that state again:
+the static converter output contract is usable as an oracle, but artifact
+availability remains false and the first regeneration block is the typed
+dependency gate until the missing host libraries are supplied.
+The same metadata is also
+projected into firmware-visible pure Nim as `BlaiMnistTfliteModelPlan`,
+`BlaiMnistTfliteTensor`, `BlaiMnistTfliteOperator`,
+`BlaiMnistTfliteBufferDigest`, and `blaiMnistTfliteModelPlan`, using enums and
+integer/IEEE-754 bit-pattern fields instead of strings, heap allocation,
+floating-point parsing, or byte-pointer arithmetic. Firmware now also
+classifies the same graph with `BlaiMnistTfliteSupportPlan` and
+`blaiMnistTfliteSupportPlan`: the recovered pure-Nim path now accepts the four
+convolution operators, reshape metadata, persistent buffer identities, and the
+final FullyConnected/MATMUL reference operation. The fetched converter exposes
+`forward_MATMUL_tflite_8` and `fetch_tflite_weight_FC` symbols; these are
+tracked as toolchain oracle evidence and projected into Nim as
+`BlaiReferenceTfliteFullyConnected2d` plus bounded first-block diagnostics. The
+current remaining MNIST frontier is reported as
+`blaiMnistTfliteNpuOutputValidationPending`, not as successful hardware
+inference: live NPU completion and output-vector equivalence still need to be
+recovered and proven on device. `BlaiMnistTfliteActiveOutputValidationEvidence`
+now ties that MNIST status to the active configured-live output-equivalence
+readiness evidence, so the real-model pending state is backed by the same
+hardware-observed completion blocker used by the focused active fixture.
+`BlaiMnistTfliteLiveCompletionRouteEvidence` then binds the exact MNIST
+metadata and persistent-buffer identities to the live MM aggregate wait-exit
+sample: the active run has no raw, unmasked, or masked-only aggregate pending
+bits, no named NPU subroute, preserved polling, and a deferred route target.
+That makes the next required work explicit: resolve the completion route, then
+run the already-planned primary-output readback/compare against the MNIST
+reference vector. `BlaiMnistTfliteLiveValidationNextStepEvidence` keeps that
+ordering machine-checkable: while completion is still missing it selects
+`blaiMnistLiveValidationResolveCompletionRoute`, records that readback/compare
+are ready after the route is fixed, and asserts that no premature output
+readback should be treated as validated. It now also carries the nested active
+output-validation and live-route first-block reasons, so the next-action
+summary does not hide whether the model frontier or the live route evidence was
+the source of a deferred readback.
+`BlaiParsedForwardConfiguredWorkspaceCompletionRouteControlReadinessEvidence`
+now narrows that route work to the concrete deferred controls recovered from
+the SDK path: register the handler, clear pending state, set priority, and
+enable the IRQ while preserving M0 polling and the unresolved MM aggregate
+subroute. Its readback gate stays false-to-validated until those controls are
+bound, so this is still route recovery evidence rather than a claimed MNIST
+output match.
+`NpuInterruptBindingApplyPreflight` and the target-gated
+`npuApplyInterruptBindingOperationPlan` now provide the matching execution API:
+the pure preflight reports the active M0 route as deferred by policy, while a
+verified active-core plan applies the recovered sequence only through the HAL
+IRQ functions (`registerTrapHandler`, `irqClearPending`, `irqSetLevel`,
+`irqEnable`) instead of raw interrupt-controller writes.
+`NpuCompletionPreStartClearPlan` now mirrors the SDK semaphore precondition for
+the pure polling route: before a new start/resume wait, stale
+`BLAI_INT_CFG[9]` completion status is classified and acknowledged through the
+typed `NpuInterruptAckRegisterPlan` rather than allowing an old completion bit
+to masquerade as a fresh model result.
+`NpuMmAggregateSdkOffsetCandidateEvidence` adds the matching MM aggregate
+candidate check for the recovered SDK offset: `CNN_IRQn` source offset 39 maps
+through the typed raw-index cursor to bank 1 bit 7, but the active wait-exit
+snapshot does not show that candidate raw, unmasked, or masked-only pending.
+That keeps the subroute unresolved while ruling out a hidden pending bit at the
+only SDK-offset-backed candidate currently available.
+
+Converter execution is now a tracked prerequisite rather than an assumption.
+On this macOS host the Linux `blai_toolchain` ELF fails with `exec format
+error`; inside a Linux/amd64 Docker container it starts far enough for the
+dynamic loader to report missing shared libraries:
+`libbuiltin_ops.so`, `libframework_lib.so`, `libkernel_util.so`,
+`libminimal_logging.so`, the `libnnapi_*` helpers, `libquantization_util.so`,
+`libtensorflowlite.so`, `libdarknet.so`, and OpenCV 4.2 `dnn`, `imgcodecs`,
+`imgproc`, and `core` libraries. `tools/ref/npu_recovery_manifest.json` records
+that probe and `tools/validate_npu_objdump.py` now has a small parser for this
+missing-library report. Until those `.so` files are supplied, the converter can
+be used for symbols and bundled MNIST metadata, but not for regenerating
+`instruction_b.bin`/weight/bias artifacts.
+Static recovery still exposes the converter's file-level ABI. The fetched ELF
+exports `write_blai_binaries` and its strings name the six generated binary
+artifacts: `dspinstruction_b.bin`, `all_dspbias_b.bin`,
+`all_dspweight_b.bin`, `instruction_b.bin`, `all_bias_b.bin`, and
+`all_weight_b.bin`. `BlaiToolchainConverterOutputContract` now maps those files
+to the final generated-model payload order consumed by `gen_array.py`: CPU
+instruction, CPU bias, CPU weight, NPU instruction, NPU bias, and NPU weight.
+It now also records valid-artifact count and
+`BlaiToolchainConverterOutputContractBlock`, keeping artifact-count,
+CPU/NPU-count, binary-suffix, payload-order, producer, consumer, and per-artifact
+failures distinct. This closes the typed contract between the non-runnable
+converter binary and the firmware-side generated-model parser, while still
+leaving actual MNIST payload generation blocked on the missing Linux shared
+libraries above.
+The Nim `BlaiMnistConverterGenerationEvidence` type makes that block executable
+as a first-class planning state: the converter artifact order and MNIST oracle
+are valid static references, but generated artifacts are explicitly marked as
+not regenerated until the shared-library set is supplied. The nested
+`BlaiToolchainConverterArtifactRegenerationPlan` records that the six-artifact
+output ABI is valid while the converter is not runnable, so later host-side
+toolchain fixes can flip regeneration state without weakening the firmware
+package contract.
+
 ## Current Recovered Surface
 
 The implemented Nim surface covers only SDK-documented integration registers:
@@ -105,12 +287,15 @@ The implemented Nim surface covers only SDK-documented integration registers:
 - BLAI SRAM ownership in MM_MISC, including typed `NpuSramStatusResult`
   decoding, typed `NpuSramReleasePlan` two-write release/latch planning, and
   pure `MM_MISC_VRAM_CTRL` composition helpers for release and SYSRAM_SET latch
-  state
+  state plus recovered `BLAI_SRAM_SEL` readback from the E907 MM_MISC view
 - Codec bus QoS and BLAI read/write limiters, including typed
-  `NpuCodecQosPlan` and `NpuBusLimiterPlan` planning, typed apply helpers, and
-  pure register-word composition helpers for QoS bits and limiter count/mode
-  words
-- BLAI instruction stream, weight, bias, image buffer, segment count, net
+  `NpuCodecQosPlan`, `NpuCodecQosStatus`,
+  `NpuCodecQosReadbackEvidence`, `NpuCodecBusStatus`, and
+  `NpuBusLimiterPlan` planning, typed apply helpers, and pure register-word
+  composition helpers for QoS bits, CODEC PCLK force-on readback, BLAI
+  bus-threshold fields, and limiter count/mode words
+- BLAI instruction stream, weight, bias, image buffer, SDK patch-size
+  (`APU_DM1_ADDR` / `IMG_MEM_SEG`) value, net
   parameter, interrupt, start/resume/stop, and activation-table aperture words,
   including typed `NpuIntCfgDecode` decoding for command, pending/clear, and
   ReLU-N state plus typed `NpuGeneralCfgDecode` decoding for input mode,
@@ -190,13 +375,18 @@ Recovered bit fields:
 - `generalCfg[0]`: unsigned image/input flag
 - `generalCfg[9:8]`: image input mode (`sound`, `YUV400`, `YUV422`)
 - `generalCfg[21:16]` / `[29:24]`: activation-table index/data base fields
-  with `NpuActivationTableBaseRegisterPlan` preserving unrelated
-  `BALI_GENERAL_CFG` state
+  with SDK reset defaults `0x05` and `0x07`;
+  `NpuActivationTableBaseRegisterPlan` preserves unrelated
+  `BALI_GENERAL_CFG` state, and `NpuGeneralCfgDefaultEvidence` checks the
+  default FTABLE bases plus reserved-bit cleanliness in captured snapshots
 - `generalCfg[30]` / `[31]`: AXI write/read idle status
 - `actTable[n][7:0]` / `[15:8]` / `[23:16]` / `[31:24]`: four packed
   8-bit activation-table entries per `BLAI_ACT_TABLE*` word, with typed
   `NpuActivationTableEntryCursor` byte-lane projection and
-  `NpuActivationTableWordCursor` register-offset/address projection
+  `NpuActivationTableWordCursor` register-offset/address projection; SDK reset
+  defaults recover `BLAI_ACT_TABLE00 = 0xF2F7_FB00`, decoded as first-word
+  entries `0x00`, `0xFB`, `0xF7`, `0xF2`, and
+  `NpuActivationTableDefaultEvidence` checks the live first-word readback
 - `NpuRegisterSnapshot` decodes image-input mode validity plus the
   activation-table index/data base fields from `BALI_GENERAL_CFG`, and exposes
   typed `BALI_GENERAL_CFG` fields through `NpuGeneralCfgDecode` and typed
@@ -219,7 +409,9 @@ The SDK runtime sequence is:
 2. `bl_npu_layer_setup(inst, weight, bias)` writes `BLAI_INST_ADDR`,
    `BLAI_WEIGHT_ADDR`, and `BLAI_BIAS_ADDR` only for non-null arguments.
 3. `bl_npu_set_input_buffer(buffer, patch_size)` writes `APU_DM0_ADDR` and
-   `APU_DM1_ADDR`.
+   writes `patch_size` unchanged to `APU_DM1_ADDR` (`IMG_MEM_SEG` in the
+   register header). `NpuLayerConfigPatchSizeRegisterEvidence` keeps this ABI
+   explicit so the field name is not mistaken for a layer count.
 4. `bl_npu_set_net_param(unsigned_input, relu_n, is_tflite)` updates
    `BALI_GENERAL_CFG`, `BLAI_INT_CFG`, and `BLAI_TF_CFG0`.
 5. `bl_npu_reset_unsign()` clears `BALI_GENERAL_CFG.imgi_unsign`.
@@ -245,7 +437,11 @@ The Nim recovery mirrors this as:
 - `npuConfigureLayerBuffers` / `npuSetInputBuffer`
 - `NpuInstructionStreamRegisterPlan` /
   `npuPlanInstructionStreamRegisters` /
-  `npuApplyInstructionStreamRegisterPlan`
+  `npuApplyInstructionStreamRegisterPlan`, with
+  `NpuInstructionStreamConfiguredApplyPlan` and
+  `NpuInstructionStreamConfiguredState` owning the SDK-compatible wrapper
+  `instructionStreamConfigured` flag projection before the local flag is
+  mutated
 - `NpuLaunchRegisterPlan` / `npuPlanLaunchRegisters` /
   `npuApplyLaunchRegisterPlan`
 - `NpuLayerConfig`, `NpuLayerConfigRegisterPlan`, `npuPlanLayerConfig`,
@@ -253,13 +449,16 @@ The Nim recovery mirrors this as:
 - `NpuInitConfig`, `NpuInitConfigRegisterPlan`, `NpuInterruptConfig`,
   `npuPlanInitConfig`, `npuPlanInitConfigRegisters`, and
   `npuApplyInitConfigRegisters`
+- `NpuWrapperResetApplyPlan` and `NpuWrapperResetState` own the wrapper
+  started/configured/snapshot-captured clears caused by a valid recovered reset
+  pulse before the SDK-compatible globals are mutated
 - `NpuNetParams` / `npuConfigureNetParams`, backed by pure register-word
   composition helpers for unsigned input, image mode, ReLU-N, and TF_CFG0
 - `npuResetUnsignedInput`
 - `NpuRuntimeInitRegisterPlan`, `npuRuntimeInitRegisterPlan`, and
-  `npuApplyRuntimeInitRegisterPlan` compose the recovered `bl_npu_init`
-  source-only clock-select, reset-pulse, SRAM-release, and final clock-gate
-  sequence.
+  `npuApplyRuntimeInitRegisterPlan` compose the recovered SDK `bl_npu_init`
+  source-only clock-select with the local reset-pulse, SRAM-release, and final
+  clock-gate ownership sequence.
 - `NpuInitClockSelectRegisterPlan`, `npuInitClockSelectRegisterPlan`, and
   `npuApplyInitClockSelectRegisterPlan` mirror `CLKRST_NPU_CLK_Sel(2)` by
   selecting source `2` while preserving the existing clock gate and divider.
@@ -277,7 +476,14 @@ The Nim recovery mirrors this as:
   `npuIntCfgWithInterruptClear` model the SDK command-bit read-modify-write
   behavior, `bl_npu_ack_irq` / `NPU_Clr_Int`, first-start/later-resume wrapper
   transition, and stop-state clear without clobbering ReLU-N or interrupt status
-  fields.
+  fields. `NpuWrapperStartedApplyPlan` and `NpuWrapperStartedState` own the
+  wrapper `started` flag projection after those transitions before the
+  SDK-compatible global flag is mutated. `NpuIntCfgSdkCommandEvidence` now
+  groups the SDK `bl80x_npu.c` `NPU_Start`, `NPU_Resume`, `NPU_Stop`,
+  `NPU_Clr_Int`, and `NPU_Get_Int` helper contracts into one typed check:
+  each command is a read-modify-write OR of one named command bit, command masks
+  are distinct, ReLU-N and interrupt-status fields are preserved, and
+  `NPU_Get_Int` is exactly the `BLAI_INT_CFG[9]` status bit.
   The active configured smoke checks the start, resume, stop, and interrupt-clear
   command transforms independently.
   Active runtime-init evidence also splits clock disabled/source/divider,
@@ -413,8 +619,9 @@ would index beyond `total`; `BlaiCpuYoloInfoEntryCursor` localizes the packed
 `biases[mask * 2 + 1]` pair layout. `BlaiYoloBiasPairCursor`,
 `blaiYoloBiasPairCursor`, and `blaiStoreYoloBiasPair` then localize that pair
 layout plus the active-mask sidecar slot behind typed bounded storage writes,
-with each recovered `uint32` slot projected through `blaiU32ArrayIndexCursor`
-before indexing Nim arrays.
+with each recovered active-mask and bias slot projected through
+`blaiYoloActiveMaskCursor` or `blaiYoloBiasStorageCursor` before indexing Nim
+arrays.
 `BlaiCpuYoloInfoFieldAbi` checks decoded YOLO classes, total, mask, and bias
 scalars before they cross into SDK `int32` layer and sidecar storage fields.
 `BlaiCpuSsdInfoFieldAbi` checks decoded SSD class-limit and anchor-offset
@@ -478,7 +685,12 @@ bounded `uint32` space.
 `BlaiCpuExtraLayerEntryCursor` localizes the recovered low/high-bank
 `EXTRA_LAYER*` per-input bitfield bases for memory slot, channels, route
 fractional bits, and TFLite offset/shift fields, projecting the recovered
-packed input slot through `blaiU32ArrayIndexCursor` before computing the bases.
+packed input slot through `blaiCpuExtraPackedInputCursor` before computing the
+bases. `blaiCpuExtraDecodedInputCursor` separately names the fixed
+logical-input-indexed decoded `EXTRA_LAYER*` and `EXTRA_MULTIPLIER*` arrays, so
+packed instruction fields, decoded sidecar staging, and caller-owned
+`mlayer_input_info_t` storage are no longer conflated behind a raw
+`BlaiMaxInputNum` cursor.
 `BlaiCpuExtraLayerFieldAbi` checks the decoded unsigned memory-slot, channel,
 route-fraction, and TFLite-offset scalars before they are written into the SDK
 `int32` layer and sidecar storage fields.
@@ -495,7 +707,12 @@ the aligned layer/extra-input sidecar pair. `BlaiCpuParsedLayerState` /
 including YOLO mask/bias storage. A parser overload can now fill caller-owned
 `BlaiCpuParsedLayerState` entries directly, keeping each layer and its sidecars
 in one typed value instead of forcing downstream code to maintain parallel
-arrays. Focused parser-smoke coverage now exercises both the low extra-input
+arrays. `blaiCpuParsedLayerStorageCursor`,
+`blaiCpuParsedExtraStorageCursor`, `blaiCpuParsedYoloStorageCursor`, and
+`blaiCpuParsedStateStorageCursor` name the recovered parser row projection for
+parallel caller-owned storage, separating layer-row storage from logical input
+slots and fetch SRAM slot planning. Focused parser-smoke coverage now exercises
+both the low extra-input
 bank and the recovered TFLite high-bank `EXTRA_LAYER_6_8` /
 `EXTRA_MULTIPLIER_6_8` records for inputs 5-7, including route source and
 per-input quantization projection without SDK pointer fields.
@@ -519,12 +736,18 @@ fields such as `dramPatchSize` and `instCnt`, and until caller-owned layer
 storage covers every parsed layer record. The readiness result captures the
 first unencoded layer's `BlaiForwardEncodedLayerReadiness`, so callers can
 distinguish missing patch planning from missing instruction-stream emission
-without rewalking the layer table.
+without rewalking the layer table. `BlaiParsedForwardReadinessLayerWindow` /
+`BlaiParsedForwardReadinessLayerCursor` preserve the SDK-style available-prefix
+scan when storage is short while checking every inspected layer row before the
+raw or parsed-state readiness overload reads it.
 `BlaiParsedForwardModelPlan` / `blaiPlanParsedForwardModelWorkspace` then bridge
 encoded parsed layers into the existing reusable `forward_NPU` resource and
 workspace planners without allocating, copying weights, or executing hardware.
 `blaiPlanParsedForwardModelWorkspaceInto` provides the same bridge with
-caller-owned result storage for embedded callers.
+caller-owned result storage for embedded callers. `BlaiParsedForwardLayerWindow`
+now owns the bounded parsed-layer table slice passed into resource planning and
+plan/resource comparison, so those paths no longer compute a local
+`layerCount - 1` stop index before calling the model resource planner.
 `BlaiParsedForwardModelExecuteReadiness`,
 `blaiParsedForwardModelExecuteReadinessInto`, and
 `blaiParsedForwardModelExecuteReadiness` split parsed-model execution readiness
@@ -539,7 +762,10 @@ attempting materialization.
 composition: it verifies the parsed plan and caller-owned workspace backing
 storage, refuses truncated caller-owned layer tables even when a reusable plan
 was produced from a fuller table, then delegates to the per-layer
-materialize-and-execute sequence.
+materialize-and-execute sequence through `BlaiParsedForwardLayerWindow` instead
+of an open-coded `layerCount - 1` layer-table slice. The parsed-state execution
+loop also uses `BlaiParsedForwardLayerCursor` before reading each caller-owned
+parsed layer row.
 `blaiMaterializeAndExecuteParsedForwardModelWorkspaceInto` provides the same
 execution composition with caller-owned result storage.
 The focused M0 parser smoke now exercises this parsed-model
@@ -571,9 +797,17 @@ for combined layers whose intermediate graph output has a later consumer, and
 reports graph-map or release-list overflow explicitly with a typed first-block
 reason. `BlaiReleaseSlotCursor` checks the fixed release-list counters before
 array writes, `BlaiGraphLayerMapCursor` checks signed graph-layer ids before
-writing caller-owned graph maps, and `BlaiLayerIndexAbi` checks recovered
+writing caller-owned graph maps, `BlaiReleaseLayerTableWindow` /
+`BlaiReleaseLayerTableCursor` check every caller-owned layer row before the
+release analysis reads or mutates it, and `BlaiLayerIndexAbi` checks recovered
 layer-table indexes before storing them in SDK `int32` graph/release fields or
-parsed/model-forward diagnostic layer fields.
+parsed/model-forward diagnostic layer fields. Release-list appends now pass the
+checked Nim table cursor to that ABI projection instead of first coercing it
+through an unsigned temporary. Parsed fixed/TFLite reference-model dispatch uses
+`BlaiLayerCursorIndexAbi` for the separate recovered uint32 layer cursor passed
+into the per-layer oracle, keeping that ABI boundary out of the loop body's raw
+casts. The CPU-layer forward-resource fold uses the same cursor ABI before
+calling the recovered single-layer resource planner.
 A parsed-layer state overload applies the same
 analysis without
 splitting typed extra-input and YOLO sidecar ownership back into parallel raw
@@ -614,6 +848,27 @@ size, dilation, stride, or the BL808 B0 odd stride-2 workaround.
 
 This is not yet an execution guarantee; the later SDK steps still allocate NPU
 buffers and emit instruction/data streams via the encoder archive.
+
+The fetched toolchain binary also carries a scalar overload,
+`check_BLAI_NPU_RUN(int, int, int, int, int, int, int, int, int, int)`, used by
+the converter before emission. `BlaiToolchainNpuRunScalars` and
+`blaiToolchainNpuRunGate` encode that decompiled jump-table gate without raw
+offsets:
+
+- the kernel dimensions must be square before any layer type can pass
+- raw layer types 9, 14, 32, 38, and 50 pass directly after the square-kernel
+  precheck
+- raw convolution type 0 requires kernel <= 7, dilation <= 2, stride X/Y <= 2,
+  rejects a recovered depthwise pressure case above the 8192 threshold, rejects
+  stride-2 X/Y with non-2 kernels, and keeps the odd width/height stride-2
+  parity workaround
+- raw maxpool type 3 requires kernel <= 3 and stride X <= 2, and rejects the
+  stride-2/kernel-2 corner case recovered from the branch target
+
+The active hardware smoke now records this gate for both the decoded
+instruction layer and the CPU-layer projection. Passing this gate only proves
+the converter would consider the layer NPU-runnable; live completion and output
+equivalence remain separate validation stages.
 
 The SDK utility predicates in `blai_inst_util.c` are also recovered as pure Nim
 helpers. These are used by the CPU/NPU scheduler and encoder preparation paths:
@@ -678,8 +933,13 @@ planning helpers around the recovered bounded allocator and emitters:
   `ROUTE_bit`, `MAC_bit`, input/output/mid SRAM slots, mid-output flags,
   `halt`, `upsample_bit`, `MAC_bit_ext`, and `inst_end_bit`.
 - `blaiCommonControlDescriptor` and `blaiCommonDescriptor` derive those common
-  control and SRAM slot fields from typed layer data plus the recovered fetch
-  memory plan.
+  control fields from typed layer data plus the recovered fetch memory plan.
+  `BlaiNpuCommonMemorySlots`, `blaiNpuCommonMemorySlots`, and
+  `blaiApplyCommonMemorySlots` keep the SRAM slot projection from
+  `BlaiFetchMemoryPlan` into descriptor fields typed and localized instead of
+  copying planner arrays directly inside descriptor construction.
+  `blaiNpuCommonInputSlotCursor` now bounds the first and second input-slot
+  reads before they are projected into `in_layer1_mem` and `in_layer2_mem`.
 - `blaiNormalInstructionBundle` and `blaiTfliteInstructionBundle` assemble the
   recovered side/main descriptors into the SDK `blai_instruction_t` append
   shape consumed by `blaiEncodeInstructions`.
@@ -697,6 +957,9 @@ planning helpers around the recovered bounded allocator and emitters:
   descriptor for each additional route input, starting from `c` and carrying
   cumulative channel counts through each `cn[]` input. The `Into` form feeds
   route emission through caller-owned loop-plan storage.
+  `BlaiRouteDescriptorLoopCount` owns the recovered route input-count clamp,
+  descriptor-count derivation, and last-step index so route planning and route
+  emission no longer duplicate the `inputCount - 1` loop arithmetic.
   `BlaiRouteDescriptorNextInputCursor` and
   `blaiRouteDescriptorNextInputCursor` localize the recovered next logical
   input to `cn[]` slot projection before the channel plan is staged.
@@ -705,7 +968,14 @@ planning helpers around the recovered bounded allocator and emitters:
   the fixed step table and carry the terminal-step flag used by descriptor-halt
   emission. `BlaiRouteDescriptorStepCursor` continues to bound matching `cn[]`
   entries. `BlaiRouteDescriptorChannelAbi` checks recovered descriptor channel
-  counts before staging them in the SDK signed `c` field.
+  counts before staging them in the SDK signed `c` field, while
+  `BlaiRouteDescriptorLayerApplyPlan` and `BlaiRouteDescriptorLayerState` own
+  that per-descriptor layer projection before any typed layer object is mutated.
+  `BlaiRouteInstructionStepCoreEvidence` owns checked step position and
+  descriptor layer projection before the two route fetch-plan variants diverge;
+  `BlaiRouteInstructionStepEvidence` then owns the selected per-step fetch plan
+  and descriptor bundle construction before either emitted-count planning or
+  stream encoding consumes the bundle.
 - `blaiEmitRouteLayerInstructionsInto` and
   `blaiEmitRouteLayerInstructions` emit that recovered multi-descriptor route
   loop with the existing typed descriptor encoder, recovered route `SRAM_out[]`
@@ -718,18 +988,35 @@ planning helpers around the recovered bounded allocator and emitters:
   intermediate route outputs, `line_w0` is refreshed from `line_patch_w[0]`,
   and `groups` is clamped to at least one. The `Into` form keeps route fetch
   emission on caller-owned plan storage. `BlaiRouteSlotCursor`,
-  `BlaiRouteNextSlotIndex`, `BlaiRoutePreviousOutputSlotCursor`,
-  `BlaiRouteOutputSlotCursor`, `blaiRouteSlotCursor`,
-  `blaiRouteNextSlotIndex`, `blaiRouteNextSlotCursor`,
+  `BlaiRouteNextSlotIndex`, `BlaiRoutePreviousOutputSlotIndex`,
+  `BlaiRoutePreviousOutputSlotCursor`, `BlaiRouteOutputSlotCursor`,
+  `blaiRouteSlotCursor`, `blaiRouteNextSlotIndex`,
+  `blaiRouteNextSlotCursor`, `blaiRoutePreviousOutputSlotIndex`,
   `blaiRoutePreviousOutputSlotCursor`, and `blaiRouteOutputSlotCursor`
-  localize the recovered route slot, `slot + 1`, previous-output, and
-  output-patch cursor conventions behind bounded typed array indexes.
+  localize the recovered route slot, `slot + 1`, previous-output
+  `stepIndex - 1`, and output-patch cursor conventions behind bounded typed
+  array indexes.
+  `blaiRouteSramSlotCursor` names the fixed route SRAM slot storage capacity
+  before those higher-level route cursors project slot numbers into Nim arrays.
+  `blaiFetchMemoryInputSlotCursor` now also owns the first/second input-slot
+  projection used when each route descriptor step builds its temporary
+  two-input fetch plan.
 - `blaiEmitLayerInstructionsInto` and `blaiEmitLayerInstructions` compose the
   recovered CPU-layer bundle, append it with the recovered
   `instruction_encode` order, and update `instCnt` only after the complete
-  append fits in the destination stream. `blaiInstructionStreamStartCursor`
-  resolves the recovered append start count before the encoder writes
-  caller-owned instruction records.
+  append fits in the destination stream. `BlaiInstructionAppendEvidence` owns
+  required-count calculation, append-fit checking, and checked end-count
+  projection before the general emitter mutates either the stream or `instCnt`.
+  `BlaiInstructionEmittedCountEvidence` owns overflow-checked per-descriptor
+  emitted-count accumulation in route loops.
+  `BlaiInstructionStreamCommitEvidence` owns the final stream-fit and
+  start/end-count projections shared by the route multi-append emitters, so
+  route rollback and final `instCnt` commit use typed states instead of
+  duplicating count-apply setup in each overload.
+  `BlaiInstructionCountApplyPlan` and `BlaiInstructionCountState` own checked
+  `instCnt` projection for general and route emitters.
+  `blaiInstructionStreamStartCursor` resolves the recovered append start count
+  before the encoder writes caller-owned instruction records.
 - `blaiInstructionEncodeRequiredInto` and `blaiInstructionEncodeRequired`
   recover the normal/tflite/extra instruction counts appended by
   `instruction_encode`; route descriptor emission accumulates those counts
@@ -738,12 +1025,25 @@ planning helpers around the recovered bounded allocator and emitters:
   `blaiEmitFetchLayerInstructions` stage the recovered fetch memory plan,
   dispatch general or route instruction emission, and commit `PSRAM_ctrl`,
   `DRAM_patch_num`, and `instCnt` only when both planning and append bounds
-  succeed. `BlaiFetchInputSlotApplyPlan` owns bounded application of planned
-  fetch input slots to `SRAM_in[]`, `BlaiFetchOutputSlotApplyPlan` owns
-  general fetch application of `SRAM_mid_out` and `SRAM_out[0]`, and
-  `BlaiFetchPatchSizeApplyPlan` owns general and route application of
-  `PSRAM_patch_size`. `BlaiFetchLayerApplyPlan` owns the general fetch layer-side
-  `DRAM_patch_num` projection. The route path uses the recovered route-specific `SRAM_out[]`
+  succeed. `BlaiFetchInputSlotApplyPlan` owns one checked planned fetch input
+  slot projection, while `BlaiFetchInputSlotsApplyEvidence` owns the aggregate
+  `SRAM_in[]` projection before `BlaiFetchInputSlotsApplyPlan` copies it and
+  `BlaiFetchInputSlotsState` carries it to caller-owned `PSRAM_ctrl`.
+  `BlaiFetchEmitCommitEvidence` owns the successful append check and final
+  staged layer/control projection before `BlaiFetchEmitCommitApplyPlan` copies
+  it into the SDK-compatible apply shape. `BlaiFetchEmitCommitState` carries
+  that commit to caller-owned objects, so the wrapper keeps them unchanged on
+  short instruction streams.
+  `BlaiFetchSramSlotsClearApplyPlan` and `BlaiFetchSramSlotsClearState` own the
+  recovered fetch-visible `SRAM_in[]`/`SRAM_out[]` zeroing step as whole typed
+  arrays instead of open-coded caller loops. `BlaiFetchOutputSlotApplyEvidence`
+  owns the checked projection of `SRAM_mid_out` and `SRAM_out[0]` before
+  `BlaiFetchOutputSlotApplyPlan` copies it and `BlaiFetchOutputSlotState`
+  applies it, while `BlaiFetchPatchSizeApplyEvidence` owns checked
+  `PSRAM_patch_size` projection before `BlaiFetchPatchSizeApplyPlan` copies it
+  and `BlaiFetchPatchSizeState` applies it. `BlaiFetchLayerApplyEvidence` owns
+  the general fetch layer-side `DRAM_patch_num` projection before
+  `BlaiFetchLayerApplyPlan` copies it and `BlaiFetchLayerState` applies it. The route path uses the recovered route-specific `SRAM_out[]`
   cursor plan before emitting the descriptor loop; `BlaiRouteInputPatchTotalCursor`
   owns the route input patch-count accumulation that seeds the first route
   output slot, and `BlaiRouteFirstOutputSlotPlan` owns that first `SRAM_out[0]`
@@ -752,10 +1052,22 @@ planning helpers around the recovered bounded allocator and emitters:
   channel advance from bounded `cn[]` entries before the corresponding output
   slot is sized, and `BlaiRouteIntermediateOutputSlotPlan` owns the matching
   `SRAM_out[]` commit, output-slot count advance, and next patch cursor.
-  `BlaiRouteOutputSlotApplyPlan` owns bounded application of planned route
-  output slots to `SRAM_out[]`.
-  `BlaiRouteSramLayerApplyPlan` owns the layer-side route application of
-  `lineW0`, recovered group normalization, and `DRAM_patch_num`.
+  `BlaiRouteIntermediateOutputSlotsPlan` owns the full intermediate route
+  output walk, copying the first output slot, then applying those per-step
+  channel and output-slot cursors until the final patch cursor is known.
+  `BlaiRouteOutputSlotApplyEvidence` owns the single-slot route output cursor
+  and allocator-field projection before `BlaiRouteOutputSlotApplyPlan` copies it
+  and `BlaiRouteOutputSlotState` applies it to `SRAM_out[]`.
+  `BlaiRouteOutputSlotsApplyPlan` and `BlaiRouteOutputSlotsState` now own the
+  aggregate checked projection of all planned route output slots before the
+  caller-owned `PSRAM_ctrl` state is mutated.
+  `BlaiRouteSramLayerApplyEvidence` owns the layer-side route `lineW0`,
+  recovered group normalization, and `DRAM_patch_num` projection before
+  `BlaiRouteSramLayerApplyPlan` copies it and `BlaiRouteSramLayerState` applies
+  it.
+  `BlaiRouteInputPatchTotalPlan` now owns the full route input patch-count
+  accumulation before the first output slot is placed, using the existing
+  per-input `BlaiRouteInputPatchTotalCursor` as its checked step.
 - `blaiEncodeCpuLayerInto` and `blaiEncodeCpuLayer` compose the recovered
   `BLAI_encode` wrapper shape: eligibility/allocation gate, instruction scratch
   clear, dispatch selection, staged fetch emission, and failure-state marking.
@@ -771,13 +1083,1111 @@ planning helpers around the recovered bounded allocator and emitters:
   exercises the result-returning wrapper on device for a successful single-patch
   route-conv encode and an allocator-failure path that preserves the stream and
   instruction count while clearing `NPU_on`.
-- `BlaiMemAllocPatchSegmentCursor` and `blaiMemAllocPatchSegmentCursor` bound
-  the recovered 64-entry allocator patch arrays and carry the terminal-patch
-  decision for `line_patch_w[]` during line-split planning and
+- `BlaiMemAllocPatchSegmentPosition` and
+  `blaiMemAllocPatchSegmentPosition` own the recovered allocator patch segment
+  position and terminal-patch decision. `BlaiMemAllocPatchSegmentCursor` and
+  `blaiMemAllocPatchSegmentCursor` then bound the recovered 64-entry allocator
+  patch arrays for `line_patch_w[]` during line-split planning and
   `wei_patch_out_c[]` during weight/PSRAM patch planning.
-  `BlaiMemAllocRouteInputCursor` and `blaiMemAllocRouteInputCursor` localize
-  allocator route-channel accumulation from extra input order to bounded `cn[]`
-  slots.
+  `BlaiMemAllocRouteInputPosition` owns the recovered extra-input to logical
+  input mapping. `BlaiMemAllocRouteInputCursor` and
+  `blaiMemAllocRouteInputCursor` then localize allocator route-channel
+  accumulation from that logical input to bounded `cn[]` slots.
+- The fetched converter's `search_set_patch` and `tflite_search_set_patch`
+  symbols expose the toolchain-side global patch allocator primitive:
+  scan the `MAX_PSRAM_PATCH` bitmap for the first contiguous free run, mark
+  each selected slot, write per-slot ownership, and reject assignments whose
+  starting patch slot exceeds 31. `BlaiToolchainPatchSearchPlan`,
+  `BlaiToolchainPatchApplyPlan`, `blaiToolchainPatchSearchPlanInto`, and
+  `blaiApplyToolchainPatchAssignment` recover that behavior as typed
+  caller-owned bitmap/owner-array operations. The free-run bitmap scan itself
+  uses `blaiToolchainPatchOccupiedCursor`, keeping the recovered
+  `MAX_PSRAM_PATCH` search bounded through the same named patch-table API as
+  the later writes. `BlaiToolchainPatchAssignmentState`
+  and `BlaiToolchainPatchAssignmentApplyPlan` now project each selected run into
+  fixed-size typed state before the compatibility helper mutates caller storage.
+  `BlaiToolchainPatchSearchHelperEvidence` ties the disassembled helper pair
+  together: the normal helper records both selected start slot and patch count,
+  while the TFLite helper records only the selected start slot and uses owner
+  `1` unless the caller-provided alternate owner is selected.
+  `blaiApplyToolchainPatchAssignmentTableState` owns the checked table update,
+  while `blaiApplyToolchainPatchAssignmentScalarState` owns the metadata-only
+  projection for start slot, assigned patch count, owner, and applied write
+  count. `blaiToolchainPatchOccupiedCursor`,
+  `blaiToolchainPatchOwnerCursor`, and `blaiToolchainPatchStateCursor` keep
+  recovered patch-slot indexing explicit for caller-owned bitmap storage,
+  caller-owned owner storage, and fixed typed patch-state storage instead of
+  rebuilding anonymous array cursors at each write. The apply-plan wrapper is
+  preserved as a compatibility layer over those typed state APIs.
+  This is separate from the per-layer `BLAI_MEM_alloc` branch planner and gives
+  the pure Nim path a concrete hook for the converter's cross-layer SRAM/PSRAM
+  scheduling state.
+  The converter `.data` globals at `PATCH_SIZE` and `MAX_PSRAM_PATCH` have
+  also been recovered as little-endian values: `PATCH_SIZE = 262144` bytes and
+  `MAX_PSRAM_PATCH = 40` slots. The shipped `BLAI.cfg` files express the same
+  patch size as `patch_size = 65536` fixed-point elements; the typed
+  `BlaiToolchainCfgMemoryEvidence` records that `65536 * sizeof(int32)` equals
+  the recovered byte global and that the config's `patch_num = 45` covers the
+  40 active planner slots. It also records the full configured backing capacity
+  as `262144 * 45 = 11796480` bytes, the active planner window as
+  `262144 * 40 = 10485760` bytes, and the five spare configured patch slots
+  (`1310720` bytes) instead of leaving that relationship as an implicit magic
+  constant. `BlaiToolchainSramGlobalsEvidence` records the
+  recovered globals and checks that the local typed planner's 64-entry patch
+  storage can represent the toolchain bitmap without falling back to
+  pointer-indexed state. `BlaiToolchainPatchInitialPlan` recovers the initial reservation path
+  that marks patch slots starting at zero as occupied and assigns owner layer
+  `0` when the first-layer request count is positive. The Nim representation
+  keeps that as a checked bitmap/owner plan, and
+  `BlaiToolchainPatchInitialState` plus
+  `BlaiToolchainPatchInitialApplyPlan` now project those slot writes into a
+  fixed-size typed state before caller-owned arrays are mutated, using the same
+  named patch occupied/owner/state cursors as the later search assignment path.
+  `blaiApplyToolchainPatchInitialReservationTableState` owns the checked
+  bitmap/owner table writes, while
+  `blaiApplyToolchainPatchInitialReservationScalarState` owns the metadata-only
+  projection for requested patch count, owner, and applied write count. The
+  older apply-plan helper is preserved as a compatibility wrapper over those
+  typed state APIs. Oversized or short-storage requests report typed block
+  reasons instead of writing past the 40-slot converter arrays.
+  `BlaiToolchainPatchInitialRequestPlan` recovers the first-layer request count
+  that feeds that reservation: multiply first-layer height and width by the
+  recovered channel selector, floor-divide by `PATCH_SIZE`, and preserve the
+  converter quirk that channel counts `2` and `3` are forced to `4` while other
+  non-negative counts pass through unchanged. `BlaiToolchainPatchInitialStorePlan`
+  captures the adjacent metadata write at `PSRAM_allocate+0x45f`: the request
+  count is stored at recovered control-block offset `0xcb70` before the branch
+  that skips or enters the zero-based patch reservation loop.
+  `BlaiToolchainPatchRequestCountAbi` owns the non-negative request-count to
+  SDK `int32` metadata projection before `storedRequestCount` is populated.
+  `BlaiToolchainPatchInitialStoreState` and
+  `BlaiToolchainPatchInitialStoreApplyPlan` now make that metadata write a
+  checked state projection; the scalar compatibility helper now consumes that
+  typed state through `blaiApplyToolchainPatchInitialStoreMetadataState`, while
+  `blaiApplyToolchainPatchInitialStoreScalarState` owns the full metadata-only
+  projection for store offset, requested patch count, stored request count, and
+  applied write count. Invalid request evidence leaves caller state unchanged.
+  `BlaiToolchainPatchPreviousOwnerPlan` recovers the flag prepared immediately
+  before `search_set_patch`: `PSRAM_allocate` ORs the inherited previous-owner
+  flag with a raw layer-type check for `0x1b`, now named
+  `BlaiToolchainPatchPreviousOwnerType`, and passes the selected boolean into
+  the patch owner helper.
+  `BlaiToolchainPatchOwnerPlan` recovers the owner value selected by
+  `search_set_patch`, `search_set_dsp_patch`, and `tflite_search_set_patch`
+  before bitmap/owner writes:
+  the general helper uses `current - 1` when its previous-owner flag is active,
+  otherwise the future relation consumer when present, otherwise `current + 1`;
+  the DSP helper uses the same previous/future gates but falls back to
+  `current`; the TFLite helper uses the future relation consumer when present
+  and owner `1` otherwise. The existing patch-apply helper now consumes that
+  typed owner result instead of requiring callers to pass a magic owner literal.
+  `BlaiToolchainPatchSearchCallPreparePlan` recovers the repeated scalar setup
+  immediately before `search_set_patch`: `PSRAM_allocate` scans future
+  relation rows for the current layer, keeps the last matching consumer layer
+  index, and ORs the inherited previous-owner flag with the raw next-layer
+  type check for `0x1b`. The plan exposes those three call inputs as typed
+  fields before the existing dispatch/owner-selection helpers consume them.
+  `BlaiToolchainPatchDispatchPlan` recovers the caller-side handoff from
+  `PSRAM_allocate` into those helpers: the general path calls
+  `search_set_patch`, the DSP path calls `search_set_patch` followed by
+  `search_set_dsp_patch`, and the TFLite path calls `tflite_search_set_patch`.
+  The plan ties each path to its recovered owner selection and metadata bank
+  without exposing stack slots or function-call pointer arguments.
+  `BlaiToolchainPatchMetadataPlan` recovers the trailing metadata stores:
+  `search_set_patch` records the selected start slot and patch count, while
+  `search_set_dsp_patch` and `tflite_search_set_patch` record only the
+  selected start slot in their DSP and TFLite metadata banks. The Nim plan keeps
+  those as typed fields and names the recovered banks explicitly: general start
+  `0x8cdc`, general count `0x9c90`, DSP start `0x94ac`, and TFLite start
+  `0x9c7c`. `BlaiToolchainPatchStartSlotAbi` and
+  `BlaiToolchainPatchCountAbi` own the checked projection from recovered
+  unsigned search results into the SDK `int32` metadata fields.
+  `BlaiToolchainPatchMetadataState` and
+  `BlaiToolchainPatchMetadataApplyPlan` now project the selected store into
+  caller-owned state before mutation. `blaiApplyToolchainPatchMetadataBankState`
+  owns the checked metadata-bank update, while
+  `blaiApplyToolchainPatchMetadataScalarState` owns the metadata-only projection
+  of mode, layer index, bank offsets, selected start/count values, and the
+  count-store discriminator. The bank updater requires a count bank only for
+  the general helper path and avoids partial mutation on short storage; the
+  compatibility wrapper now only builds the apply plan before delegating to
+  typed state APIs. Bank indexing uses
+  `BlaiToolchainPsramMetadataBankIndexAbi`, so the recovered signed layer index
+  is validated before addressing start/count metadata arrays.
+  `blaiToolchainPsramMetadataBankCursor` now owns the following bounded bank
+  array projection for patch-search metadata, discard, unassigned fallback, and
+  fallback-selector metadata writers.
+  `BlaiToolchainPatchDebugMetadataSnapshotPlan` captures the adjacent
+  post-dispatch debug reload at `PSRAM_allocate+0x5d2`: request-table count,
+  general patch start/count, two additional start-slot metadata banks, and the
+  copied-layer scalar sent to the converter print. The `auxiliary` and
+  `secondary` bank names are intentionally neutral placeholders until the exact
+  C++ field names behind those globals are recovered. The recovered per-layer
+  metadata bank offsets are now named as constants:
+  request table `0x8c284`, general start `0x8cdc`, general count `0x9c90`,
+  auxiliary start `0xd344`, secondary start `0x4d2b4`, plus the 16-byte stack
+  push used for the two extra debug-print arguments.
+  `BlaiToolchainPatchDebugMetadataSnapshotState` and
+  `BlaiToolchainPatchDebugMetadataSnapshotApplyPlan` now give those reloads a
+  typed caller-owned application surface: requested debug snapshots copy all six
+  recovered scalars as one object, quiet snapshots leave prior state untouched,
+  and invalid snapshot evidence is rejected without mutation.
+  `blaiApplyToolchainPatchDebugMetadataSnapshotScalarState` owns the same
+  six-scalar projection for metadata-only consumers while preserving the
+  quiet/invalid no-mutation behavior through the apply-plan wrapper.
+  `BlaiToolchainPatchDebugStartSlotLookupPlan` captures the later debug-only
+  lookup at `PSRAM_allocate+0x1432`, where the converter indexes a caller-owned
+  slot table by the general start patch slot before printing. The Nim surface
+  keeps this as a bounds-checked `slotTableValue` projection and deliberately
+  does not require a valid start slot when the recovered debug flag is disabled.
+  Requested lookup indexes now pass through
+  `BlaiToolchainPatchDebugStartSlotIndexAbi` before the slot table cursor is
+  formed, keeping the signed start-slot recovery separate from quiet debug
+  snapshots.
+  `BlaiToolchainPatchDebugStartSlotLookupState` and
+  `BlaiToolchainPatchDebugStartSlotLookupApplyPlan` are the checked
+  application surface for that projection: requested lookups copy the recovered
+  table value into caller-owned debug state, quiet lookups leave scalar
+  compatibility callers untouched, and invalid lookup evidence is blocked
+  without mutation. The scalar wrapper now delegates through
+  `blaiApplyToolchainPatchDebugStartSlotLookupScalarState`, keeping requested
+  and quiet debug lookup updates behind the typed state object.
+  `BlaiToolchainPatchDebugSearchSnapshotPlan` captures the repeated
+  post-`search_set_patch` debug scalar reload first visible at
+  `PSRAM_allocate+0x5a3` and again in the later general branches: the converter
+  reloads two caller scalars, masks the previous-owner flag to one bit, and only
+  prints them when the debug flag is active. `BlaiToolchainPatchDebugSearchSnapshotState`
+  and `BlaiToolchainPatchDebugSearchSnapshotApplyPlan` now wrap those reloads in
+  a checked caller-owned state transition: requested snapshots copy the two
+  scalars and masked previous-owner bit, quiet snapshots preserve prior state,
+  and invalid layer evidence is rejected without mutation.
+  `blaiApplyToolchainPatchDebugSearchSnapshotScalarState` owns the matching
+  metadata-only projection for the patch-count scalar, layer-cursor scalar, and
+  previous-owner flag. The scalar names are intentionally neutral until the
+  exact print-format field names are recovered.
+- A first `PSRAM_allocate` slice is now represented by
+  `BlaiToolchainPsramAllocateScratchPlan` and
+  `BlaiToolchainPsramLayerRequestPlan`. The toolchain initializes a 500-layer
+  by 5-relation scratch table to `-1`, carries a 500-entry request table, and
+  allocates 40-entry bitmap/owner tables from `MAX_PSRAM_PATCH`. For each
+  non-skipped layer (`0x1a` is skipped before request calculation), the
+  recovered request count is `h * w * align4(c) div PATCH_SIZE`; the disassembly
+  performs the integer divide before converting to double and adding `0.5`, so
+  the pure Nim representation deliberately keeps the floor-divided integer
+  behavior rather than silently upgrading it to a ceiling calculation.
+  The scratch capacities are now named as recovered constants:
+  `BlaiToolchainPsramAllocateRelationEntryCount`,
+  `BlaiToolchainPsramAllocateRequestTableCount`,
+  `BlaiToolchainPsramAllocateBitmapSlotCount`, and
+  `BlaiToolchainPsramAllocateOwnerSlotCount`; the relation-table fill value is
+  named separately as `BlaiToolchainPsramAllocateRelationInitValue`. The planner
+  evidence derives from those constants rather than embedding raw
+  `2500`/`500`/`40`/`-1` checks in the implementation, keeping later
+  graph-planner recovery tied to typed table contracts.
+  `BlaiToolchainPsramLayerLoopPlan` now exposes the loop-head gates separately:
+  non-positive layer counts stop planning, layer indexes must be in
+  `0 ..< layerCount`, and raw layer type `0x1a` is reported as a valid skipped
+  layer before request calculation starts.
+  `BlaiToolchainPsramLayerTransitionPlan` captures the post-cleanup transition
+  around `PSRAM_allocate+0x19d7`: the converter increments the layer cursor,
+  advances by a recovered `0x978` byte layer stride, copies `0x12f` qwords into
+  stack scratch, skips raw type `0x1a`, and aligns a copied signed scalar from
+  the next layer to four before request planning resumes. The scalar remains
+  neutrally named until its `darknet::layer` member is identified.
+  `BlaiToolchainPsramLayerProcessDecision` owns the shared raw `0x1a`
+  skip/process predicate before either the loop-head or transition planner
+  copies that decision into its public result, and before the layer request
+  planner reports the same skipped-layer block.
+  `BlaiToolchainPsramSignedAlign4Abi` owns the checked signed align-to-4
+  projection and reports overflow before `alignedScalar` is stored in the
+  transition plan.
+  `BlaiToolchainPsramDspRequestPlan` covers the later DSP patch branch that
+  feeds both `search_set_patch` and `search_set_dsp_patch`: the converter
+  aligns a recovered copied-layer count to four, multiplies it by a recovered
+  area pair, then floor-divides the result by `PATCH_SIZE`. The Nim API keeps
+  those recovered scalars explicit while the broader C++ `darknet::layer`
+  member names remain under recovery, and it converts negative or overflowing
+  inputs into typed block reasons instead of unchecked arithmetic.
+  `BlaiToolchainPsramDspRequestScalarAbi` owns the checked projection of those
+  non-negative copied DSP scalars into the unsigned planner fields used by both
+  DSP request branches.
+  `BlaiToolchainPsramDspVolumeRequestPlan` covers the nearby DSP branch at
+  `PSRAM_allocate+0x859` that multiplies three copied scalar fields directly
+  before floor-dividing by `PATCH_SIZE`; unlike the DSP-area request above,
+  this branch does not align the third factor first. The public field names stay
+  as neutral `factorA`/`factorB`/`factorC` until the corresponding
+  `darknet::layer` members are recovered.
+  `BlaiToolchainPsramDspVolumePatchPairPlan` composes that volume request with
+  the following paired `search_set_patch` and `search_set_dsp_patch` calls,
+  preserving the same future-consumer, previous-owner, DSP metadata mode, and
+  debug start-bank behavior as the aligned-count DSP branch.
+  `BlaiToolchainPsramDspVolumePatchPairState` and
+  `BlaiToolchainPsramDspVolumePatchPairApplyPlan` now project that branch into
+  caller-owned state after the request, relation scan, and dispatch evidence is
+  valid; invalid volume requests or invalid prepare evidence are rejected
+  without mutating the previously selected DSP-volume handoff state.
+  `blaiApplyToolchainPsramDspVolumePatchPairScalarState` owns the full metadata
+  projection for current layer, request count, future-consumer state,
+  previous-owner flag, debug flag, paired dispatch booleans, metadata mode,
+  owner, DSP debug bank, and debug print flag. Scalar dispatch consumers use
+  `blaiApplyToolchainPsramDspVolumePatchPairDispatchState` for the general/DSP
+  search-call booleans, metadata-mode, and owner outputs, matching the aligned
+  DSP branch's typed projection for the paired helper-call decision.
+  `BlaiToolchainPsramGeneralPatchPlan` covers the repeated single-helper
+  branches around `PSRAM_allocate+0x9ba`, `+0xb29`, and `+0xc22`: after the
+  same future relation and previous-owner preparation, the converter calls only
+  `search_set_patch` with the general owner/metadata mode before returning to
+  the shared debug/metadata reload path. `BlaiToolchainPsramGeneralPatchState`
+  and `BlaiToolchainPsramGeneralPatchApplyPlan` now project that selected
+  owner, metadata mode, previous-owner flag, future-consumer state, and debug
+  flag into caller-owned state only after the composed prepare/dispatch evidence
+  is valid; invalid handoffs are rejected without mutation.
+  `blaiApplyToolchainPsramGeneralPatchScalarState` owns the full metadata
+  projection for current layer, request count, future-consumer state,
+  previous-owner flag, debug flag, dispatch flag, metadata mode, and owner.
+  Scalar dispatch consumers use
+  `blaiApplyToolchainPsramGeneralPatchDispatchState` for the `generalSearchCall`,
+  metadata-mode, and owner outputs, keeping the repeated `search_set_patch` call
+  decision behind a typed state projection.
+  `BlaiToolchainPsramDspPatchPairPlan` recovers the following DSP handoff:
+  `PSRAM_allocate` calls `search_set_patch` and then `search_set_dsp_patch`
+  with the same relation-consumer and previous-owner scalars. The plan
+  composes the recovered DSP request, search-call preparation, and dispatch
+  helpers so the paired call shape is explicit without exposing stack
+  arguments. The adjacent debug path reloads a DSP start-slot bank at
+  `0x94ac`, pushes the saved previous-owner flag, and uses a 16-byte temporary
+  stack area before returning to the shared metadata snapshot.
+  `BlaiToolchainPsramDspPatchPairState` and
+  `BlaiToolchainPsramDspPatchPairApplyPlan` now make that paired handoff
+  mutable only through a checked caller-owned state transition, carrying the
+  selected owner, DSP metadata mode, paired call booleans, recovered debug
+  bank, and saved previous-owner debug flag while rejecting invalid request or
+  prepare evidence without mutation.
+  `blaiApplyToolchainPsramDspPatchPairScalarState` owns the full metadata
+  projection for current layer, request count, future-consumer state,
+  previous-owner flag, debug flag, paired dispatch booleans, metadata mode,
+  owner, DSP debug bank, stack scratch size, debug print flag, and pushed
+  previous-owner flag. Scalar dispatch consumers use
+  `blaiApplyToolchainPsramDspPatchPairDispatchState` for the general/DSP
+  search-call booleans, metadata-mode, and owner outputs, so the paired
+  `search_set_patch`/`search_set_dsp_patch` call decision is projected through
+  typed state rather than read from the apply plan.
+  `BlaiToolchainPsramTfliteRequestPlan` covers the adjacent TFLite-only request
+  branch feeding `tflite_search_set_patch`: two copied geometry scalars are
+  multiplied by a selected count, with the recovered converter quirk that count
+  values `2` and `3` are forced to `4`, then the result is floor-divided by
+  `PATCH_SIZE`. The exact C++ member names are still intentionally not baked
+  into the public Nim API; callers pass the recovered scalars and receive
+  checked arithmetic plus explicit block reasons.
+  `BlaiToolchainPsramTfliteRequestScalarAbi` owns the non-negative signed to
+  unsigned projection for those copied fields before the selected-count quirk is
+  applied.
+  `BlaiToolchainPsramTflitePatchPlan` recovers the following single-helper
+  handoff into `tflite_search_set_patch`, composing the request, search-call
+  preparation, and TFLite dispatch helpers so owner selection and metadata-bank
+  choice stay typed. `BlaiToolchainPsramTflitePatchState` and
+  `BlaiToolchainPsramTflitePatchApplyPlan` now expose the selected TFLite
+  handoff as a checked caller-owned state transition: valid request, prepare,
+  and dispatch evidence copies the selected owner, TFLite metadata mode, debug
+  flag, and relation-consumer state, while invalid evidence is rejected without
+  mutating prior state. `blaiApplyToolchainPsramTflitePatchScalarState` owns
+  the full metadata projection for current layer, request count,
+  future-consumer state, previous-owner flag, debug flag, TFLite dispatch flag,
+  metadata mode, and owner. Scalar dispatch consumers use
+  `blaiApplyToolchainPsramTflitePatchDispatchState` for the
+  `tfliteSearchCall`, metadata-mode, and owner outputs, keeping the
+  `tflite_search_set_patch` call decision on a typed state boundary instead of
+  reading those fields directly from the apply plan.
+  `BlaiToolchainPsramLayerRequestStorePlan` recovers the following
+  request-table metadata write (`0x8c284 + layer * 4`) as a checked store into a
+  caller-owned typed request table and exposes the recovered request-table bank
+  offset as `BlaiToolchainPatchDebugRequestTableOffset`.
+  `BlaiToolchainPsramRequestTableIndexAbi` owns the recovered layer-index to
+  request-table-index projection before the value is used for cursor bounds or
+  stored in apply state. `blaiToolchainPsramRequestTableCursor` then owns the
+  bounded request-table storage lookup in both the planning check and the
+  caller-owned table mutation path.
+  `BlaiToolchainPsramLayerRequestStoreState` and
+  `BlaiToolchainPsramLayerRequestStoreApplyPlan` now project the same write as
+  caller-owned state before mutation, recording the target layer/table index,
+  recovered bank offset, table count, request count, and write count while
+  invalid request or storage evidence is rejected without changing prior state.
+  `blaiApplyToolchainPsramLayerRequestStoreTableState` owns the checked
+  caller-owned table update. Scalar metadata consumers use
+  `blaiApplyToolchainPsramLayerRequestStoreScalarState` for the selected layer,
+  request-table index, and requested patch count, and the compatibility helper
+  now only builds the apply plan before delegating to the typed state APIs.
+  `BlaiToolchainSetWeiPatchCallPlan` then
+  records the recovered scalar handoff into `set_wei_patch`: the same computed
+  request count is forwarded as the call argument, the layer index and debug/log
+  flag are carried through, and the by-reference patch-count result is
+  initialized to zero before the call. The surrounding C++ network/layer value
+  copies remain intentionally opaque until those toolchain object layouts are
+  recovered. `BlaiToolchainSetWeiPatchCallFramePlan` now records the visible
+  by-value call-frame ABI: the layer copy uses the recovered `0x12f` qwords
+  (`0x978` bytes), the network copy uses `0x47` qwords (`0x238` bytes), the
+  combined frame unwind is `0xbb0` bytes, and the by-reference patch-count slot
+  is prepared as zero before the call. `BlaiToolchainSetWeiPatchReturnPlan`
+  captures the immediate post-call reload of that by-reference result.
+  `BlaiToolchainSetWeiPatchReturnState` and
+  `BlaiToolchainSetWeiPatchReturnApplyPlan` apply it to caller-owned layer
+  scratch as a typed store. Scalar metadata consumers use
+  `blaiApplyToolchainSetWeiPatchReturnScalarState` for the scratch value,
+  by-reference before/after values, and changed flag, while the scratch-only
+  compatibility helper still consumes the same typed state through
+  `blaiApplyToolchainSetWeiPatchReturnScratchState`, matching the caller
+  sequence without exposing the recovered stack slot.
+  `BlaiToolchainSetWeiPatchReturnFramePlan` ties that store back to the
+  surrounding caller frame at `PSRAM_allocate+0x1b3b`: the post-call result is
+  loaded from the by-reference result frame offset `0xc7c`, copied to the
+  caller-frame return slot at `0xbb0`, and the caller frame is unwound by the
+  same recovered `0xbb0` byte call-frame size before branch recovery resumes.
+  `BlaiToolchainPsramRelationAppendPlan` recovers the relation-table append
+  rule before those requests are consumed: TFLite mode appends non-predecessor
+  inputs for every layer, while the Darknet path appends them only for raw
+  toolchain layer types `0x09` and `0x0e`; inputs equal to the direct predecessor
+  are skipped. The Nim representation keeps the five-entry row as a typed fixed
+  array and turns row overflow into a typed capacity block instead of reproducing
+  the converter's unchecked stack-table write. `BlaiToolchainPsramRelationAppendState`
+  and `BlaiToolchainPsramRelationAppendApplyPlan` now project the selected
+  five-entry relation row plus the updated relation count into caller-owned
+  state before mutation. `blaiApplyToolchainPsramRelationAppendRowState` owns
+  the checked row/count storage update, while
+  `blaiApplyToolchainPsramRelationAppendScalarState` owns the metadata-only
+  projection for layer index, final relation count, appended count, and skipped
+  direct-predecessor count. `BlaiToolchainPsramRelationAppendInputDecision`
+  owns the per-input direct-predecessor skip rule before the append loop touches
+  relation-row capacity or storage.
+  `BlaiToolchainPsramRelationAppendEligibility` owns the TFLite-or-route-family
+  layer-type gate before the append planner decides whether the relation row is
+  active. Relation row copies and append slots now use
+  `blaiToolchainPsramRelationEntryCursor`, and copied graph input-list scans use
+  `blaiToolchainPsramInputListCursor`, keeping both recovered table roles
+  explicit instead of rebuilding generic open-array cursors in the loop body.
+  The compatibility helper now only builds the apply plan before delegating to
+  that typed state API.
+  `BlaiToolchainPsramRelationConsumerPlan` recovers the later future-row scan:
+  for a current layer, the converter scans relation rows for later layers and
+  records a downstream layer when that row contains the current layer index. The
+  scan continues after a match, so the pure Nim plan preserves the last matching
+  consumer layer plus match/scan counters for typed diagnostics before the patch
+  search helper consumes that value.
+  `BlaiToolchainPsramRelationConsumerScanStart` owns the checked
+  current-layer-to-first-future-row projection before the relation tables are
+  read. The same named relation-table cursors used by the initial sentinel scan
+  bound its relation-count, relation-row, and row-entry reads.
+  `BlaiToolchainPsramRelationConsumerState`
+  and `BlaiToolchainPsramRelationConsumerApplyPlan` now project the recovered
+  found/index pair into caller-owned state: valid missing scans explicitly clear
+  the found flag and set `-1`, while invalid scan evidence is blocked without
+  mutation. Scalar compatibility callers consume the same typed state through
+  `blaiApplyToolchainPsramRelationConsumerScalarState`, so future-consumer
+  `found` and `consumerLayerIndex` updates do not read directly from apply-plan
+  internals. `BlaiToolchainPsramRelationConsumerSummaryState` now carries the
+  full typed diagnostic summary for source layer, layer count, scanned
+  rows/entries, match count, final consumer layer, and found flag, and
+  `blaiApplyToolchainPsramRelationConsumerSummaryScalarState` owns that scalar
+  projection for consumers that need the recovered scan evidence.
+  `BlaiToolchainPsramScanStartLayerAbi` owns the checked projection
+  of the current signed layer index before the unsigned future-row scan cursor is
+  derived. `BlaiToolchainPsramRelationLayerIndexAbi` owns the checked
+  projection of relation-scan `uint32` layer cursors into SDK `int32` fields
+  for both the future-consumer scan and the initial relation sentinel scan.
+  `BlaiToolchainPsramInputMembershipPlan` recovers the adjacent counted input
+  list scan that checks whether the current layer index appears in the copied
+  graph input list before the TFLite patch-search branch. The recovered loop
+  continues walking the counted list after finding a match; the Nim helper keeps
+  that behavior visible through `scannedEntries` while bounding the caller-owned
+  input array through `blaiToolchainPsramInputListCursor`.
+  `BlaiToolchainPsramInputCountAbi` owns the recovered positive signed
+  input-count projection before the count is compared with storage, used as a
+  loop bound, or matched against the resume byte-offset cursor.
+  `BlaiToolchainPsramInputMembershipState` and
+  `BlaiToolchainPsramInputMembershipApplyPlan` now expose the scan result as a
+  checked caller-owned state transition before any later resume path consumes
+  the found flag. `blaiApplyToolchainPsramInputMembershipScalarState` owns the
+  metadata projection for layer index, input count, scanned entry count, and
+  found flag. `BlaiToolchainPsramInputMembershipResumePlan` captures the
+  post-`set_wei_patch` resume path at `PSRAM_allocate+0x1b50`: after the
+  `0xbb0` frame unwind, the converter gates on the copied input count, reloads
+  the input-list base from caller-frame offset `0x3988`, reloads a byte offset
+  from caller-frame offset `0x88`, forms the loop end as `base + offset + 4`,
+  clears the membership-found flag, and resumes at the shared scan loop. The
+  Nim representation keeps this as a checked 4-byte input-entry range and then
+  delegates the actual membership scan to the existing typed helper.
+  `BlaiToolchainPsramInputMembershipResumeSpan` owns the byte-offset alignment,
+  scanned-entry count, and scanned-byte-count projection before the resumed
+  membership loop consumes the typed input-count evidence.
+  `BlaiToolchainPsramInputMembershipResumeState`,
+  `BlaiToolchainPsramInputMembershipResumeApplyPlan`, and
+  `blaiApplyToolchainPsramInputMembershipResumeState` then project the recovered
+  resumed membership result into caller-owned state only after that resume plan
+  has passed validation; the older bool apply helper remains as a compatibility
+  wrapper for callers that only need the found flag. The bool wrapper now
+  delegates through `blaiApplyToolchainPsramInputMembershipResumeScalarState`,
+  so even that scalar mutation consumes the typed resume state rather than
+  reaching directly into an apply plan.
+  `blaiApplyToolchainPsramInputMembershipResumeSummaryScalarState` owns the
+  full scalar summary projection for the resumed layer index, membership-found
+  flag, found-flag clear marker, shared-loop jump marker, and scanned-entry
+  count. The plan-level summary wrapper delegates through that typed state, so
+  diagnostics can observe the recovered resume evidence without reading
+  `plan.stateAfter` fields directly.
+  `BlaiToolchainPsramInitialInputGatePlan` captures the next branch gate at
+  `PSRAM_allocate+0x260`: the converter reloads a recovered input flag at
+  offset `0x90180` and count at `0x90184`, sends layer zero without that flag
+  to the separate first-layer path, sends other layers or zero counts to the
+  main layer-type switch, and only initializes the special input relation scan
+  when layer zero has the flag set and the copied count is positive. The Nim
+  API reports this as an enum action and keeps the previous membership-found
+  flag as a typed saved field instead of exposing the stack scratch stores.
+  `BlaiToolchainPsramInitialInputGateState` and
+  `BlaiToolchainPsramInitialInputGateApplyPlan` now project that branch decision
+  into caller-owned state, including the recovered relation-scan sentinel reset
+  only for the scan-input path; scalar saved-membership and sentinel side
+  effects are applied through
+  `blaiApplyToolchainPsramInitialInputGateScalarState`, and invalid gate
+  evidence is blocked without mutation.
+  `blaiApplyToolchainPsramInitialInputGateSummaryScalarState` now owns the full
+  scalar summary projection for action, saved previous-membership flag,
+  relation-scan initialization flag, and selected sentinel without exposing
+  apply-plan internals to scalar consumers.
+  `BlaiToolchainPsramInitialRelationScanPlan` covers the following setup and
+  loop at `PSRAM_allocate+0x29f`: the converter initializes the selected layer
+  to `-1`, walks relation-count entries as 4-byte values, steps relation rows
+  by five entries (`0x14` bytes), scans each row's bounded count for the `-1`
+  sentinel, and keeps the last matching layer index. The Nim plan keeps the
+  count table and relation rows as typed arrays, checks the five-entry row
+  capacity, and exposes the selected layer plus scan/match counters.
+  `blaiToolchainPsramRelationCountCursor`,
+  `blaiToolchainPsramRelationRowCursor`, and
+  `blaiToolchainPsramRelationEntryCursor` own the recovered relation-table
+  layer and five-entry row projections before either this initial sentinel scan
+  or the later future-consumer scan indexes caller-owned tables.
+  `blaiApplyToolchainPsramInitialRelationScanScalarState` owns the scalar
+  selected-layer/found projection that feeds the selected TFLite request path.
+  `BlaiToolchainPsramScanStartLayerAbi` owns the recovered non-negative layer
+  index projection before the value becomes the unsigned relation-scan cursor.
+  `BlaiToolchainPsramInitialRelationScanState` and
+  `BlaiToolchainPsramInitialRelationScanApplyPlan` now project those selected
+  layer, sentinel, row/entry scan, match-count, and found values into
+  caller-owned state before the selected-layer TFLite setup consumes them.
+  `blaiApplyToolchainPsramInitialRelationScanSummaryScalarState` owns the full
+  scalar summary projection for source layer, selected layer, sentinel,
+  scanned row/entry counts, match count, and found flag, keeping scalar
+  diagnostics behind the same typed state boundary.
+  `BlaiToolchainPsramInitialTfliteRequestPlan` captures the selected-layer
+  request setup immediately after that scan at `PSRAM_allocate+0x36d`: the
+  converter addresses the selected layer with the recovered `0x978` stride,
+  reads three scalar fields at offsets `0x94`, `0x90`, and `0x98`, uses the
+  existing TFLite request rule that forces counts `2` and `3` to `4`, and
+  prepares the previous-owner flag from the next layer's raw type check against
+  `0x1b`. The Nim plan composes the recovered relation scan, TFLite request,
+  and previous-owner helper rather than exposing the call-frame pushes used for
+  `tflite_search_set_patch`. `BlaiToolchainPsramInitialTfliteRequestState` and
+  `BlaiToolchainPsramInitialTfliteRequestApplyPlan` now project the selected
+  layer, recovered scalar offsets, raw scalar values, forced selected count,
+  request count, and previous-owner flag into caller-owned state before the
+  initial TFLite loop consumes that request.
+  `blaiApplyToolchainPsramInitialTfliteRequestScalarState` owns the scalar
+  selected-layer/request-count/previous-owner projection used by that handoff;
+  invalid request evidence is blocked without mutating prior state.
+  `blaiApplyToolchainPsramInitialTfliteRequestSummaryScalarState` owns the full
+  scalar summary projection for selected layer, recovered factor/count offsets,
+  raw factors, forced selected count, next-layer type, requested patch count,
+  and previous-owner flag before the initial TFLite loop consumes the request.
+  `BlaiToolchainPsramInitialTflitePatchPlan` now bridges that selected-layer
+  request into the existing `tflite_search_set_patch` dispatch planner: the
+  selected relation-scan layer becomes the patch current layer and
+  relation-consumer owner source, while the reusable TFLite patch handoff owns
+  metadata-mode and owner selection. `BlaiToolchainPsramInitialTflitePatchState`
+  and its apply plan project selected layer, patch count, relation-owner state,
+  debug flag, metadata mode, and owner into caller-owned storage before loop
+  control resumes.
+  `BlaiToolchainPsramInitialTfliteLoopPlan` captures the loop-control
+  immediately after that helper returns at `PSRAM_allocate+0x3f2`: the
+  converter negates the current `-1`, `-2`, ... sentinel to get the comparison
+  ordinal, decrements the sentinel, unwinds the two pushed call arguments
+  (`0x10` bytes), loops back to the scan setup while the copied input count is
+  greater than the ordinal, and otherwise restores the saved membership-found
+  flag before entering the main layer-type switch.
+  `BlaiToolchainPsramInitialTfliteLoopEvidence` now owns the request-valid,
+  input-count, signed-sentinel, ordinal, decrement, loop-again, and restore
+  gates before the public plan copies those values.
+  `BlaiToolchainPsramInitialTfliteLoopState` and
+  `BlaiToolchainPsramInitialTfliteLoopApplyPlan` project that state transition
+  into caller-owned storage only after loop evidence is valid. The scalar
+  compatibility helper now delegates through
+  `blaiApplyToolchainPsramInitialTfliteLoopScalarState`, so sentinel and
+  membership-found updates consume the typed loop state rather than reaching
+  into an apply plan.
+  `blaiApplyToolchainPsramInitialTfliteLoopSummaryScalarState` owns the full
+  scalar summary projection for the decremented sentinel, restored membership
+  value, membership-update flag, loop-again decision, and recovered call-aux
+  stack unwind size.
+  `BlaiToolchainPsramInitialTfliteJoinPlan` captures the no-match/no-scan join
+  at `PSRAM_allocate+0x417`: the converter clears the relation-consumer scalar
+  and found flag, derives the selected layer from the current negative sentinel
+  as `-sentinel - 1`, and jumps to the same selected-layer request path.
+  `BlaiToolchainPsramInitialTfliteSentinelLayerAbi` owns that recovered
+  negative-sentinel to SDK `int32` layer-index projection before the join plan
+  applies the layer-count guard.
+  `BlaiToolchainPsramInitialTfliteJoinEvidence` groups the gate/action,
+  sentinel, ABI projection, layer-count, relation-consumer clear, and request
+  path flags before the public join plan copies those values.
+  `BlaiToolchainPsramInitialTfliteJoinState`,
+  `BlaiToolchainPsramInitialTfliteJoinApplyPlan`, and
+  `blaiApplyToolchainPsramInitialTfliteJoinState` project those selected-layer
+  and relation-consumer updates into typed caller-owned state without exposing
+  the converter stack slots. The control side effects from that same join
+  (`clearsRelationScalars` and `joinsRequestPath`) are applied through
+  `blaiApplyToolchainPsramInitialTfliteJoinControlState`, keeping those booleans
+  on the same typed handoff path instead of reaching back into the apply plan.
+  The older scalar apply helper remains as a narrow compatibility wrapper over
+  the typed state projection by delegating through
+  `blaiApplyToolchainPsramInitialTfliteJoinScalarState`.
+  `blaiApplyToolchainPsramInitialTfliteJoinSummaryScalarState` now owns the
+  combined scalar/control summary for selected layer, cleared relation-consumer
+  fields, and request-path join flag.
+  `BlaiToolchainPsramInitialTfliteJoinRequestPlan` bridges that no-match join
+  back into the selected-layer TFLite request planner by synthesizing the same
+  typed relation-scan shape consumed by
+  `BlaiToolchainPsramInitialTfliteRequestPlan`. This keeps the relation-match
+  and no-match paths on one request calculation for patch counts and previous
+  owner flags instead of duplicating converter stack-slot updates.
+  `BlaiToolchainPsramInitialTfliteJoinRequestEvidence` owns that synthetic
+  scan, nested request-valid gate, requested patch count, and previous-owner
+  projection before the public join-request plan copies the fields.
+  `BlaiToolchainPsramInitialTfliteJoinRequestState` and
+  `BlaiToolchainPsramInitialTfliteJoinRequestApplyPlan` then project the
+  selected layer, cleared relation-consumer fields, requested patch count,
+  previous-owner flag, and join-path flag into caller-owned typed state. That
+  state now also carries the recovered TFLite request offsets, raw factor/count
+  values, forced selected count, and next-layer type, matching the relation-hit
+  request path. `blaiApplyToolchainPsramInitialTfliteJoinRequestSummaryScalarState`
+  now consumes
+  `BlaiToolchainPsramInitialTfliteJoinRequestSummaryState`, which the apply
+  plan projects separately from the compact compatibility state through
+  `BlaiToolchainPsramInitialTfliteJoinRequestApplyEvidence`. This exposes
+  the full no-match summary without scalar consumers reaching back into the
+  compact apply-plan state.
+  The post-search owner scan is represented by
+  `BlaiToolchainPsramOwnerTransitionPlan`: patch slots whose owner is not the
+  current layer are ignored; matching slots are transferred to the next layer
+  when the recovered start slot equals `BlaiToolchainPatchInvalidStartSlot`,
+  when a convolution feeds a route layer, or when the debug ConvMax path is
+  active; otherwise the occupied bitmap slot is cleared while the owner table
+  value is left untouched, matching the converter's separate bitmap/owner
+  arrays.
+  `BlaiToolchainPsramOwnerTransitionState` and
+  `BlaiToolchainPsramOwnerTransitionApplyPlan` now project that single-slot
+  owner/bitmap mutation into caller-owned state before touching the arrays.
+  `BlaiToolchainPsramOwnerTransitionApplyEvidence` owns the transition-valid
+  gate, named occupied/owner cursors, storage-count diagnostics, write flags,
+  and resulting state before the public apply plan copies those fields.
+  `blaiApplyToolchainPsramOwnerTransitionTablesState` owns the checked table
+  mutation, while `blaiApplyToolchainPsramOwnerTransitionScalarState` owns the
+  scalar metadata projection for slot, action, owner values, occupied state, and
+  write flags. The transition read and write paths use the named patch
+  owner/occupied cursors shared with patch assignment, so the recovered
+  post-search scan cannot silently drift back to anonymous table indexing.
+  The older direct transition apply helper is a compatibility wrapper over that
+  typed state API.
+  `BlaiToolchainPsramOwnerCleanupPlan` refines the raw toolchain post-search
+  cleanup branch without reusing the firmware layer enum: raw current type `0`
+  retains a slot for raw next type `3` or
+  `BlaiToolchainPatchInvalidStartSlot`; other raw current types retain only for
+  that invalid start-slot sentinel or the route debug flag with raw type
+  `0x09`. Non-owned slots are ignored, retained slots transfer owner to the next
+  layer, and released slots clear only the occupied bitmap.
+  `BlaiToolchainPsramOwnerCleanupState` and
+  `BlaiToolchainPsramOwnerCleanupApplyPlan` now make that raw cleanup mutation
+  a checked typed projection before owner/bitmap arrays are touched.
+  `BlaiToolchainPsramOwnerCleanupApplyEvidence` owns the cleanup-valid gate,
+  named occupied/owner cursors, storage-count diagnostics, write flags, and
+  resulting cleanup state before the public apply plan copies those fields.
+  `blaiApplyToolchainPsramOwnerCleanupTablesState` owns the checked table
+  mutation, while `blaiApplyToolchainPsramOwnerCleanupScalarState` owns the raw
+  cleanup scalar projection for slot, action, owner values, occupied state, and
+  write flags. Cleanup owner lookups and occupied/owner table writes now also
+  flow through the named patch cursors, matching the converter's shared
+  40-slot patch bitmap/owner table contract. The older cleanup apply helper is
+  preserved as a compatibility wrapper around that typed state API.
+  `BlaiToolchainPsramCleanupRetainPlan` owns the shared retain/release
+  predicate used by both raw owner cleanup and later post-search slot cleanup:
+  convolution-to-route retention, invalid start-slot retention, and route-debug
+  retention are exposed as named boolean evidence before either caller selects
+  transfer/retain or release.
+  `BlaiToolchainPsramOwnerCleanupSweepPlan` composes that single-slot decision
+  across the recovered `MAX_PSRAM_PATCH` loop, requiring a 40-entry owner table
+  and reporting scanned, ignored, transferred, and released slot counts before
+  the apply helper mutates caller-owned bitmap/owner arrays.
+  `BlaiToolchainPsramOwnerCleanupSweepState` and
+  `BlaiToolchainPsramOwnerCleanupSweepApplyPlan` now make the sweep summary and
+  storage requirements explicit before mutation.
+  `BlaiToolchainPsramOwnerCleanupSweepApplyEvidence` owns the sweep-valid gate,
+  occupied/owner storage counts, capacity check, and aggregate state projection
+  before the public apply plan copies those fields.
+  `BlaiToolchainPsramOwnerCleanupSweepTally` owns the per-slot
+  action-to-counter projection inside that 40-slot walk, keeping scanned,
+  ignored, transferred, and released counters out of the loop body's raw
+  `case` updates.
+  `blaiApplyToolchainPsramOwnerCleanupSweepScalarState` owns the aggregate
+  metadata projection for slot count, storage counts, and scanned/ignored/
+  transferred/released counters. `blaiApplyToolchainPsramOwnerCleanupSweepState`
+  applies that typed aggregate state, while individual slot writes still go
+  through the typed single-slot cleanup state helper.
+  `BlaiToolchainPsramCleanupEntryPlan` captures the entry gate after
+  `search_set_patch` at `PSRAM_allocate+0x56e`: the converter stores the
+  debug flag, only takes the debug snapshot path when that flag is nonzero,
+  checks `MAX_PSRAM_PATCH`, initializes the cleanup sweep at slot zero with
+  next layer `current + 1`, or jumps directly to the layer transition when the
+  recovered slot count is not positive. `BlaiToolchainMaxPsramPatchSlotsI32`
+  is the SDK-scalar form of the recovered 40-slot constant used by this entry
+  wrapper, while the existing `uint32` and `int` forms remain for cursor math
+  and fixed array dimensions.
+  `BlaiToolchainPsramCleanupEntryState`,
+  `BlaiToolchainPsramCleanupEntryApplyPlan`, and
+  `blaiApplyToolchainPsramCleanupEntryState` project the recovered next-layer,
+  cleanup-slot, saved-debug, debug-path, sweep-entry, and transition-jump state
+  into caller-owned storage only after the cleanup-entry evidence has passed
+  validation. `BlaiToolchainPsramCleanupEntryApplyEvidence` owns that checked
+  state projection before the public apply plan copies the scalar fields.
+  `blaiApplyToolchainPsramCleanupEntryScalarState` owns the scalar
+  next-layer/slot/debug handoff, and the older scalar apply helper remains as a
+  compatibility wrapper around that typed state API.
+  `blaiApplyToolchainPsramCleanupEntrySummaryScalarState` now owns the full
+  scalar summary projection for next-layer, cleanup-slot, saved-debug,
+  debug-snapshot, cleanup-sweep, and layer-transition branch state without
+  exposing apply-plan internals to scalar consumers.
+  `BlaiToolchainPsramPostSearchSlotPlan` recovers the more precise slot-table
+  cleanup at `PSRAM_allocate+0x193a`: slots whose table value does not match
+  the current layer are ignored; retained slots store the recovered retained
+  scalar from the split/search path; released slots clear only the occupied
+  bitmap. This keeps the retained-value store explicit and typed instead of
+  treating it as a layer-owner transfer.
+  `BlaiToolchainPsramPostSearchSlotState` and
+  `BlaiToolchainPsramPostSearchSlotApplyPlan` now expose that retain/release
+  decision as caller-owned state before mutating the occupied bitmap or slot
+  table. `blaiApplyToolchainPsramPostSearchSlotTablesState` owns the checked
+  table mutation, while
+  `blaiApplyToolchainPsramPostSearchSlotScalarState` owns the metadata-only
+  projection of selected slot, action, before/after values, occupancy, and
+  retained scalar. `blaiToolchainPatchSlotValueCursor` names the recovered
+  slot-table lookup separately from the occupied bitmap cursor, so retained
+  metadata writes and bitmap releases are both bounded through typed patch-slot
+  APIs. `BlaiToolchainPsramPostSearchSlotApplyEvidence` owns the checked
+  validity gate and state projection before the public apply plan copies the
+  caller-visible fields. The older array-mutation helper only builds the apply
+  plan before delegating to typed state APIs.
+  `BlaiToolchainPsramCleanupDebugSlotApplyEvidence` now does the same for the
+  optional debug bitmap reload: it separates a valid quiet path from a valid
+  print/reload path, projects both the summary state and the slot state behind a
+  typed validity gate, and leaves the public apply plan as a simple carrier for
+  caller-owned state.
+  `BlaiToolchainPsramCleanupDebugSlotPlan` captures the debug-only occupied
+  bitmap reload at `PSRAM_allocate+0x19aa`: after the retain/release decision
+  for one patch slot, the converter reads the bitmap value for that slot only
+  when debug logging is active. The Nim plan exposes that as a checked boolean
+  table read through `blaiToolchainPatchOccupiedCursor` and lets quiet mode
+  succeed without requiring the slot index to be in range.
+  `BlaiToolchainPsramCleanupDebugSlotState` and
+  `BlaiToolchainPsramCleanupDebugSlotApplyPlan` apply the recovered slot/value
+  pair to caller-owned debug state only for requested prints; quiet plans leave
+  prior state untouched and invalid slot evidence is rejected without mutation.
+  `blaiApplyToolchainPsramCleanupDebugSlotScalarState` owns the matching
+  metadata-only projection for requested debug prints, while
+  `BlaiToolchainPsramCleanupDebugSlotSummaryState` and
+  `blaiApplyToolchainPsramCleanupDebugSlotSummaryScalarState` now expose the
+  print-requested flag, slot, and occupied value as a single checked typed
+  summary for requested and quiet debug reloads. Its apply-plan
+  wrapper preserves quiet-mode no-mutation behavior.
+  `BlaiToolchainPsramMetadataDiscardPlan` recovers the adjacent special
+  metadata invalidation path: when a one-input layer feeds raw next type `3`,
+  two recovered layer fields are both `2`, and no future relation consumer was
+  found, the converter stores the recovered invalid start/count sentinels
+  (`BlaiToolchainPatchInvalidStartSlot` and `BlaiToolchainPatchInvalidCount`)
+  into the general patch start/count metadata. The two gating fields are now
+  named at offsets `0xa40` and `0xa30`, and the cleared metadata banks reuse the
+  recovered general start/count offsets `0x8cdc` and `0x9c90`. The semantic
+  order is pinned to
+  `search_set_patch`: it stores the selected start slot to `0x8cdc` and the
+  requested patch count to `0x9c90`.
+  The Nim plan reports that as `clearGeneralMetadata`.
+  `BlaiToolchainPsramMetadataDiscardGate` owns that recovered clear predicate
+  as named evidence for one-input, route-next-layer, matching field-A/field-B,
+  and no-future-consumer gates before the metadata planner selects the invalid
+  start/count sentinels.
+  `BlaiToolchainPsramMetadataDiscardState` and
+  `BlaiToolchainPsramMetadataDiscardApplyPlan` now project the selected
+  start/count metadata values into caller-owned state before mutation; direct
+  field and checked per-layer bank apply helpers remain available and now
+  consume that typed state through
+  `blaiApplyToolchainPsramMetadataDiscardScalarState` and
+  `blaiApplyToolchainPsramMetadataDiscardBankState` without exposing converter
+  metadata offsets to callers.
+  `blaiApplyToolchainPsramMetadataDiscardSummaryScalarState` owns the matching
+  summary projection for the recovered layer cursor, general metadata-bank
+  offsets, clear flag, and final start/count values, so scalar consumers no
+  longer reload those fields directly from the apply plan.
+  `BlaiToolchainPsramMetadataBankIndexAbi` owns
+  the recovered signed layer-index projection before the metadata discard state
+  addresses the start/count banks.
+  `BlaiToolchainPsramFallbackGatePlan` recovers the gate immediately before
+  the unassigned-metadata fallback: raw layer types `0x03`, `0x09`, and `0x26`
+  are excluded, while other layer types with input count at or below
+  `BlaiToolchainPsramFallbackMaxInputCount` arm the fallback path.
+  `BlaiToolchainPsramFallbackTypeExclusion` owns those raw layer-type
+  comparisons before the gate combines them with the bounded input-count check.
+  `BlaiToolchainPsramUnassignedMetadataPlan` recovers the following fallback
+  metadata store after the relation-consumer scan: when no future consumer was
+  found, the fallback path is armed, and the recovered gate value is zero,
+  `PSRAM_allocate` stores `MAX_PSRAM_PATCH + 1` into the general start-slot
+  metadata and stores the current scratch patch count into the general
+  patch-count metadata. The pure Nim path names that sentinel as
+  `BlaiToolchainPsramUnassignedStartSlot`; the
+  `BlaiToolchainPsramUnassignedStartSlotAbi` helper owns its checked projection
+  into SDK `int32` metadata before either the unassigned or fallback metadata
+  planner stores it. `BlaiToolchainPsramUnassignedMetadataGate` owns the
+  recovered no-future-consumer, fallback-active, and zero-gate predicate before
+  that metadata write is selected. The update is then applied through typed caller-owned
+  fields or, with `blaiApplyToolchainPsramUnassignedMetadataBanks`, checked
+  per-layer metadata arrays. Those compatibility apply helpers now
+  consume typed state through
+  `blaiApplyToolchainPsramUnassignedMetadataScalarState` and
+  `blaiApplyToolchainPsramUnassignedMetadataBankState`, built by
+  `BlaiToolchainPsramUnassignedMetadataState` and
+  `BlaiToolchainPsramUnassignedMetadataApplyPlan`. The additional
+  `blaiApplyToolchainPsramUnassignedMetadataSummaryScalarState` owns the full
+  scalar summary projection for layer index, general metadata offsets,
+  unassigned sentinel, write flag, final start/count, and applied write count
+  before scalar consumers mutate their caller-owned fields. This matches the
+  recovered
+  `PSRAM_allocate+0x119a` sequence that stores `MAX_PSRAM_PATCH + 1` to
+  general start metadata `0x8cdc` and the scratch patch count to general count
+  metadata `0x9c90`. The bank helper shares
+  `BlaiToolchainPsramMetadataBankIndexAbi` with the other metadata-bank
+  writers, rejecting negative recovered layer indexes before cursor use, and
+  shares `blaiToolchainPsramMetadataBankCursor` for the bounded start/count
+  bank access.
+  `BlaiToolchainPsramFallbackMetadataPlan` captures the later selector around
+  `PSRAM_allocate+0x115e`: a found future relation consumer or inactive
+  fallback gate preserves existing metadata, an armed raw type `0` fallback
+  writes the unassigned sentinel plus the scratch patch count, and armed
+  non-zero raw types clear the general start/count metadata to the recovered
+  invalid start/count sentinels. `BlaiToolchainPsramFallbackMetadataSelection`
+  owns that preserve/unassigned/clear-invalid mode decision as named
+  relation-consumer, inactive-fallback, and raw type-0 evidence before the
+  metadata planner writes final start/count fields.
+  `BlaiToolchainPsramFallbackMetadataRawType` owns the raw type-0 versus
+  clear-invalid branch before it is combined with the preserve gates.
+  `blaiApplyToolchainPsramFallbackMetadata` performs the resulting typed field
+  update, while `blaiApplyToolchainPsramFallbackMetadataBanks` applies the same
+  update to caller-owned per-layer metadata arrays only after both banks are
+  bounds-checked. Both compatibility apply helpers now consume typed state
+  through `blaiApplyToolchainPsramFallbackMetadataScalarState` and
+  `blaiApplyToolchainPsramFallbackMetadataBankState`, so the selected mode and
+  final start/count metadata are exposed as a checked state transition before
+  caller-owned fields or banks are mutated.
+  `blaiApplyToolchainPsramFallbackMetadataSummaryScalarState` now owns the full
+  scalar summary projection for layer index, metadata offsets, fallback mode,
+  unassigned sentinel, final start/count, and applied write count without
+  exposing apply-plan internals to scalar consumers. The bank helper also uses
+  `BlaiToolchainPsramMetadataBankIndexAbi` and
+  `blaiToolchainPsramMetadataBankCursor` before addressing the general
+  start/count banks. This covers both recovered
+  store shapes: `PSRAM_allocate+0x119a` writes the
+  unassigned sentinel/count pair, while the clear-invalid path at
+  `PSRAM_allocate+0x1b8e` writes `BlaiToolchainPatchInvalidStartSlot` to
+  `0x8cdc`, loads `BlaiToolchainPatchInvalidCount`, and rejoins the shared
+  `0x9c90` count-store instruction.
+  `BlaiToolchainPsramSplitMetadataPlan` covers the following split metadata
+  loop: the converter clamps a recovered raw split count to at least
+  `BlaiToolchainPsramSplitMinCount`,
+  computes `scratchPatchCount div (selectedSplitCount - 1)`, then writes split
+  start-slot entries for indexes `1 ..< selectedSplitCount` while decrementing
+  the remaining patch count by that quotient. The apply helper writes into a
+  caller-owned typed array by first projecting `BlaiToolchainPsramSplitMetadataState`,
+  checking capacity before mutation, and using the typed split cursor for each
+  write so diagnostics and mutation share one recovered start-slot calculation.
+  `BlaiToolchainPsramSplitMetadataState` and
+  `BlaiToolchainPsramSplitMetadataApplyPlan` now project the aggregate split
+  write sequence into caller-owned state before mutation: selected split count,
+  divisor, quotient, initial remaining patch count, first and last derived
+  start slots, and write count are all checked as one state object.
+  `blaiApplyToolchainPsramSplitMetadataScalarState` owns the matching
+  metadata-only projection for those aggregate split counters and start slots.
+  `BlaiToolchainPsramSplitCountAbi` owns the recovered raw split-count
+  clamp-to-minimum rule before the selected count is used as an unsigned
+  denominator and loop bound.
+  `BlaiToolchainPsramSplitDenominatorAbi` owns the recovered
+  `selectedSplitCount - 1` divisor projection before it is used by the signed
+  scratch patch-count division, rejecting zero and values outside the SDK
+  `int32` domain rather than relying on a raw cast.
+  `BlaiToolchainPsramSplitMetadataDerivedStart` owns the aggregate quotient,
+  initial remaining patch count, and first derived start-slot arithmetic before
+  the per-split cursor loop begins.
+  `BlaiToolchainPsramSplitMetadataScalarAbi` owns the checked `int64` to SDK
+  `int32` projection for those derived remaining/start-slot scalars.
+  `BlaiToolchainPsramSplitMetadataCursor` exposes one checked loop iteration
+  from the write sequence around `PSRAM_allocate+0x12e0`, giving callers the
+  split index, derived start slot, and terminal-entry flag without duplicating
+  the loop arithmetic or converter metadata-bank offsets.
+  `BlaiToolchainPsramSplitMetadataPosition` owns the recovered cursor position
+  rule for that loop, including the `splitIndex - 1` quotient offset and the
+  final-entry predicate, so both plan-backed and state-backed cursors share the
+  same checked loop-position object.
+  `BlaiToolchainPsramSplitMetadataCursorStart` owns the recovered per-cursor
+  quotient decrement and checked start-slot projection, so both cursor paths use
+  the same typed arithmetic before populating the public cursor result.
+  `blaiToolchainPsramSplitStartSlotCursor` owns the bounded caller-storage
+  lookup for each derived split start-slot write.
+- A first `set_wei_patch` slice is represented by
+  `BlaiToolchainSetWeiPatchPagePlan`. The toolchain aligns a recovered count to
+  a 4-byte boundary, multiplies it by primary and auxiliary geometry counts,
+  doubles the primary byte pressure for `ROUTE_W` (`0x0e` / `blaiRouteW`),
+  rounds each pressure up to 4 KiB pages, and selects the smaller page count as
+  the starting weight-patch divisor. The pure Nim plan uses checked integer
+  intermediates so overflow becomes a typed block instead of a silent C-style
+  wrap. `BlaiToolchainSetWeiPatchRouteGatePlan` recovers the prologue gate for
+  raw route type `0x03`: the route-family path is taken when a previous raw
+  conv layer has more than
+  `BlaiToolchainSetWeiPatchRouteGateMultiInputThreshold` inputs, when the
+  current recovered field pair is not both
+  `BlaiToolchainSetWeiPatchRouteGateFieldValue`, or when the copied source
+  layer is also raw route `0x03`.
+  `BlaiToolchainSetWeiPatchRouteGateEvidence` owns those raw prologue
+  predicates before the public gate plan copies them into its result.
+  `BlaiToolchainSetWeiPatchRouteSourcePlan` recovers the adjacent
+  route-family scalar selector: raw route type `0x09` uses the copied route
+  count, while recovered raw type `0x37` uses that route count only when the
+  selected source layer is also raw route `0x09`; otherwise it keeps the copied
+  main count. `BlaiToolchainSetWeiPatchRouteSourceSelection` owns that
+  route-family and count-source decision before scalar fields are projected.
+  `BlaiToolchainSetWeiPatchRouteSourceScalarAbi` owns the checked
+  projection of those copied non-negative route-source scalars into unsigned
+  selected-count and selected-numerator planner fields.
+  `BlaiToolchainSetWeiPatchBaseOffsetPlan` recovers the immediate
+  divisor-search base offset selector: raw types in mask `0x4000004200` up to
+  `0x26` use offset `0`; otherwise recovered count above
+  `BlaiToolchainSetWeiPatchBaseOffsetCountThreshold` or recovered field above
+  `BlaiToolchainSetWeiPatchBaseOffsetFieldThreshold` selects offset `6`, with
+  offset `2` as the fall-through.
+  `BlaiToolchainSetWeiPatchBaseOffsetEvidence` owns the raw mask and threshold
+  predicates before the public base-offset plan copies the typed selector
+  fields into its result.
+  `BlaiToolchainSetWeiPatchDivisorPlan` then recovers the bounded
+  divisor search: try the selected page count through 127 larger candidates,
+  compute ceiling splits, round odd split sizes up to even, and accept the
+  first candidate whose primary and auxiliary local-buffer products fit within
+  4096 bytes. The converter has a raw layer-type special case at `0x20` that
+  doubles the primary split for the auxiliary check; the Nim side keeps this as
+  `BlaiToolchainSetWeiPatchSpecialDoubleAuxType` until that toolchain-only
+  value is reconciled with a named SDK layer type. The accepted primary and
+  auxiliary local-byte products use `BlaiToolchainSetWeiPatchU32ScalarAbi`
+  before they are stored in the divisor plan.
+  `BlaiToolchainSetWeiPatchStorePlan` recovers the next metadata write without
+  pretending the converter's large `SRAM_ctrl` is the firmware `PSRAM_ctrl`
+  overlay: the one-patch path records a single split equal to the full primary
+  numerator, the divisor path records the selected divisor and rounded-even
+  split entries with the final entry taking the remainder, and the
+  auxiliary-pressure path records `auxiliaryPages` and floor-divided split
+  entries with the final entry taking the remainder. All three forms write into
+  fixed typed Nim arrays instead of offset-indexed toolchain memory, using
+  `BlaiMemAllocPatchSegmentPosition` for the shared terminal-patch decision.
+  `BlaiToolchainSetWeiPatchStoreApplyPlan` and
+  `BlaiToolchainSetWeiPatchStoreState` now project that earlier store result
+  into caller-owned state only after capacity is checked.
+  `blaiApplyToolchainSetWeiPatchStoreSplitState` owns the checked patch-count
+  and split-table mutation, mirroring the recovered patch-count write followed
+  by split-table writes around `set_wei_patch+0x3db` without exposing the
+  converter's `SRAM_ctrl` offsets. `blaiToolchainSetWeiPatchSplitCursor` now
+  owns each bounded split-table slot used by store, commit, and final branch
+  result application. Scalar metadata consumers use
+  `blaiApplyToolchainSetWeiPatchStoreScalarState` for the selected store mode,
+  patch count, and split count so compatibility code does not read those fields
+  directly from an apply plan.
+  `BlaiToolchainSetWeiPatchStoreSelectPlan` recovers the branch selector just
+  before those stores: a recovered layer flag forces the one-patch path before
+  pressure checks, otherwise primary pressure over 4096 bytes or a divisor
+  greater than one selects the divisor split, and only then does auxiliary
+  pressure over 4096 bytes select the auxiliary split.
+  `BlaiToolchainSetWeiPatchStoreSelectEvidence` owns those raw branch
+  predicates and selected store mode before the public selector plan copies
+  them into its result.
+  `BlaiToolchainSetWeiPatchStoreCommitPlan` composes that selector with the
+  recovered store metadata and checked apply plan, rejecting invalid evidence,
+  selector/store mode mismatches, and short split storage before mutation. This
+  keeps the pure Nim planner's store path as one typed decision instead of
+  allowing the selector and metadata writer to drift apart.
+  `BlaiToolchainSetWeiPatchStoreCommitState` and
+  `BlaiToolchainSetWeiPatchStoreCommitApplyPlan` now project the composed
+  decision into caller-owned state before the scalar compatibility helper writes
+  patch counts or split values. `blaiApplyToolchainSetWeiPatchStoreCommitSplitState`
+  owns that checked compatibility mutation, while scalar metadata consumers use
+  `blaiApplyToolchainSetWeiPatchStoreCommitScalarState` for the selected mode,
+  patch count, split count, and applied-write count. The commit split writes
+  use the same named split cursor as the earlier store path. This keeps the
+  commit wrapper as validation plus typed-state delegation.
+  `BlaiToolchainSetWeiPatchStoreCommitSummaryState` now carries the selector
+  mode, store mode, final mode, caller split-storage count, patch count, split
+  count, write count, and split values separately from the compact mutation
+  state. `blaiApplyToolchainSetWeiPatchStoreCommitSummaryScalarState` exposes
+  those recovered diagnostics without consumers reading the compact apply-plan
+  state.
+  `BlaiToolchainSetWeiPatchPressurePlan` recovers the byte-pressure scalar that
+  feeds the large/lower/no-patch branch gates: two copied counts are aligned to
+  four, the multiplier becomes
+  `BlaiToolchainSetWeiPatchPressureMatchedMultiplier` when either recovered
+  multiplier field matches the comparison field and
+  `BlaiToolchainSetWeiPatchPressureDefaultMultiplier` otherwise, group count
+  is clamped to `BlaiToolchainSetWeiPatchPressureDefaultGroupCount`, and the
+  denominator uses the recovered 1x1 or spatial group factor. The spatial
+  numerator uses `kernel^2`, except the large-kernel/auxiliary path forces
+  `BlaiToolchainSetWeiPatchPressureLargeSpatialFactor`.
+  `BlaiToolchainSetWeiPatchI32U32Abi` owns the checked projection of copied
+  non-negative signed pressure inputs into unsigned planner fields.
+  `BlaiToolchainSetWeiPatchU32ScalarAbi` owns the checked `uint64` to
+  `uint32` projection used by recovered set-weight byte-pressure and
+  patch-total scalar stores.
+  `BlaiToolchainSetWeiPatchLayerMaskShiftAbi` owns the raw signed layer-type to
+  mask-shift projection reused by the base-offset, byte-pressure, large-flag,
+  and lower-flag gates before any `uint64` layer mask is shifted.
+  The Nim plan keeps the raw layer-type mask check and checked arithmetic as
+  named fields so branch inputs can be validated without reproducing converter
+  stack offsets.
+  `BlaiToolchainSetWeiPatchLargeFlagPlan` recovers the next large-pressure
+  gate: `set_wei_patch` compares the recovered byte pressure against 8192 bytes
+  and only sets the toolchain-side flag when the raw layer type is selected by
+  mask `0x0080004000000001` within the unsigned `<= 0x37` range. The known set
+  bits are raw layer-type values `0`, `38`, and `55`; values outside the range,
+  including negative `int32` values observed through the unsigned compare, do
+  not shift the mask and do not set the flag.
+  `BlaiToolchainSetWeiPatchLargeFlagEvidence` owns that mask/range/threshold
+  predicate cluster before the public large-flag plan copies the typed flag
+  fields into its result.
+  `BlaiToolchainSetWeiPatchLargeSplitPlan` recovers the following large-path
+  split metadata: `BlaiToolchainSetWeiPatchPressurePagePlan` divides the byte
+  pressure by 8192-byte pages, but a non-divisible pressure applies the
+  recovered `BlaiToolchainSetWeiPatchPressurePageRoundingBias` through
+  `BlaiToolchainSetWeiPatchU32ScalarAbi` and then adds
+  `BlaiToolchainSetWeiPatchPressureNonDivisibleExtraPages` after the rounded-up
+  division. The rounded pressure itself is also projected through
+  `BlaiToolchainSetWeiPatchU32ScalarAbi` before division, so the overflow check
+  and `uint32` use share the same recovered ABI boundary. The converter then
+  divides the split numerator by that page count, takes
+  `pow(2, int(log2(...)))` as a floor power-of-two split size, stores
+  `ceil(numerator / split)` as the patch count, writes fixed split entries, and
+  leaves the final entry as the remainder. The final-entry decision uses the
+  same `BlaiMemAllocPatchSegmentPosition` projection as the earlier split-store
+  helper. The Nim implementation keeps this behavior in integer form and
+  reports zero numerator, inactive flag, overflow, and fixed-array capacity
+  failures as typed blocks.
+  `BlaiToolchainSetWeiPatchLargeSplitEvidence` owns the large split page-count,
+  power-of-two selector, and patch-count projection before the public large
+  split plan performs bounded split-table writes.
+  `BlaiToolchainSetWeiPatchLargeTotalPlan` recovers the shared post-loop patch
+  total calculation used by both large-path branches: multiply the two recovered
+  geometry terms into a unit factor, compute local bytes for the selected split
+  and the final remainder, take the larger local pressure, floor-divide that by
+  `PATCH_SIZE`, multiply by the split patch count, then add the floor-divided
+  full-numerator contribution. `blaiMemAllocFinalPatchSegmentPosition` selects
+  the final split entry through the same checked segment projection as the split
+  loops. The converter converts those integer quotients to double and adds
+  `0.5`, then truncates; because the division already happened in integer form,
+  the pure Nim plan preserves the effective floor behavior instead of converting
+  it to rounded division. `BlaiToolchainSetWeiPatchLargeTotalEvidence` owns the
+  final split lookup, local-byte projections, and total patch-count arithmetic
+  before the public large-total plan copies the resulting metadata fields.
+  `BlaiToolchainSetWeiPatchLowerFlagPlan` recovers the following lower-pressure
+  gate at `0x69d0e`: after the large branch is skipped, the converter computes
+  `multiplier * (numerator div divisor)`, compares the result against 4096
+  bytes, and sets the same toolchain-side flag storage to value `2` only when
+  the recovered layer mask bit is also set. This pressure value is not the same
+  value as the earlier large-pressure branch input, so the Nim plan represents
+  the lower gate directly and leaves the surrounding branch ordering to the
+  higher-level `set_wei_patch` reconstruction.
+  `BlaiToolchainSetWeiPatchLowerFlagEvidence` owns the lower gate's mask,
+  divisor, overflow, threshold, and flag-value predicates before the public
+  lower-flag plan copies them into its result.
+  `BlaiToolchainSetWeiPatchLowerSplitPlan` recovers the split loop after that
+  flag value `2` store: it uses the lower gate's byte pressure, a 4096-byte
+  page basis, the same typed `BlaiToolchainSetWeiPatchPressurePagePlan`
+  non-divisible extra-page quirk, the same floor power-of-two split selection,
+  and fixed split entries with the final entry holding the remainder through the
+  shared allocator patch segment position.
+  `BlaiToolchainSetWeiPatchLowerSplitEvidence` owns the lower split page-count,
+  power-of-two selector, and patch-count projection before the public lower
+  split plan performs bounded split-table writes.
+  The lower split type is separate
+  from the large split type so callers cannot
+  accidentally feed the 8192-byte large-path evidence into the 4096-byte
+  lower-path loop.
+  `BlaiToolchainSetWeiPatchLowerTotalPlan` then recovers the same post-loop
+  PSRAM patch-total calculation for the lower branch, but typed over
+  `BlaiToolchainSetWeiPatchLowerSplitPlan`: select the larger of the fixed
+  split and final remainder local byte pressures, floor-divide by `PATCH_SIZE`,
+  multiply by patch count, and add the full-numerator floor contribution.
+  `blaiMemAllocFinalPatchSegmentPosition` owns the final split lookup for this
+  path as well. This keeps the shared formula explicit while preserving the
+  path-specific evidence boundary. `BlaiToolchainSetWeiPatchLowerTotalEvidence`
+  owns the final split lookup, local-byte projections, and total patch-count
+  arithmetic before the public lower-total plan copies the resulting metadata
+  fields.
+  `BlaiToolchainSetWeiPatchNoPatchPlan` recovers the final fall-through at
+  `0x69fc9`: when neither patch split branch is selected, the converter stores
+  `BlaiToolchainSetWeiPatchNoPatchPatchCount`, writes the full split numerator
+  into the first split slot, stores
+  `BlaiToolchainSetWeiPatchNoPatchSplitCount`, clears the PSRAM patch-total
+  field with `BlaiToolchainSetWeiPatchNoPatchPsramPatchTotal`, clears the
+  toolchain flag to `BlaiToolchainSetWeiPatchNoPatchFlagValue`, and returns
+  the caller-provided patch count value. The Nim plan exposes those as typed
+  fields rather than treating the converter's `SRAM_ctrl` offsets as a firmware
+  overlay. `BlaiToolchainSetWeiPatchNoPatchEvidence` owns that fixed
+  fall-through metadata before the public no-patch plan copies it into its
+  result.
+  `BlaiToolchainSetWeiPatchBranchPlan` now records the recovered branch order:
+  an active large gate must use the large total path, an active lower gate is
+  considered only when the large gate is inactive, and the no-patch stores are
+  used only when neither patch gate is active. Active but invalid branch
+  evidence becomes a branch-specific typed block instead of silently falling
+  through to another metadata shape. The branch plan also carries the selected
+  split-count and fixed split-value array from the chosen path, so downstream
+  pure Nim planner code can consume one typed metadata result instead of
+  re-reading branch-specific storage.
+  `BlaiToolchainSetWeiPatchBranchSelectionEvidence` owns the active-branch
+  predicates and selected metadata before the public branch plan copies them
+  into its result. `BlaiToolchainSetWeiPatchBranchApplyEvidence` owns the
+  branch-valid and split-storage gates, selected scalar projection, and
+  resulting caller-owned state before the public apply plan copies it into its
+  result. `BlaiToolchainSetWeiPatchBranchApplyPlan` and
+  `BlaiToolchainSetWeiPatchBranchState` then commit that selected result to
+  caller-owned state only after the split array is proven large enough.
+  `BlaiToolchainSetWeiPatchBranchSummaryState` now preserves the large/lower
+  active flags, selected branch mode, split storage count, patch count, split
+  count, write count, split values, PSRAM total, flag value, and returned patch
+  count as a diagnostic state alongside the compact mutation state.
+  `blaiApplyToolchainSetWeiPatchBranchSummaryScalarState` exposes that
+  recovered branch summary without consumers reading the compact apply-plan
+  state.
+  `blaiApplyToolchainSetWeiPatchBranchResultState` owns the compatibility
+  mutation for the converter's final patch-count, split-table, PSRAM-total,
+  flag, and return-count stores without offset arithmetic, again routing
+  split-table slots through `blaiToolchainSetWeiPatchSplitCursor`.
+  Scalar consumers use
+  `blaiApplyToolchainSetWeiPatchBranchScalarState` for the selected branch mode,
+  patch count, split count, PSRAM total, flag value, and returned patch count
+  before any compatibility storage is mutated.
+  `BlaiToolchainSetWeiPatchBranchReturnPlan` now ties that selected branch
+  result back to the recovered `PSRAM_allocate` by-ref return path: the branch
+  returned patch count is checked through `BlaiToolchainPatchCountAbi`, then
+  fed into `BlaiToolchainSetWeiPatchReturnPlan` so the scratch patch-count
+  state and by-ref result use one typed ABI boundary rather than a raw unsigned
+  to signed assignment.
+  `BlaiToolchainSetWeiPatchBranchReturnEvidence` owns the call-valid,
+  branch-valid, returned-count, and return-plan gates before the public branch
+  return plan copies those fields. This keeps the recovered ABI checks
+  inspectable without duplicating the branch-return control flow.
 - `blaiEncodeDispatch` selects `fetch_BLAI_data_route` only for `ROUTE` or
   `ROUTE_MAX` layers with more than two inputs; all other runnable layers use
   the general emitter path.
@@ -800,17 +2210,28 @@ planning helpers around the recovered bounded allocator and emitters:
   `BlaiFetchPatchBudgetPlan` and `blaiFetchPatchBudgetPlan` localize the
   recovered general-vs-route patch budget, including the route descriptor count
   used with `PSRAM_patch_num`. Fixed input patch-count and input-slot arrays
-  are indexed through `BlaiU32ArrayIndexCursor`; `BlaiFetchInputPatchCursor`
-  owns per-input element counting, patch counting, and total-patch advancement,
-  while `BlaiFetchInputSlotCursor` owns the recovered input-slot assignment and
-  next-slot advance. `BlaiFetchOutputSlotPlan` owns the final `SRAM_mid_out`,
+  are indexed through `blaiFetchMemoryInputSlotCursor`, while caller-owned
+  input patch-count and `SRAM_in[]` storage use `blaiFetchInputStorageCursor`.
+  `BlaiFetchInputPatchCursor` owns per-input element counting, patch counting,
+  and total-patch advancement, while `BlaiFetchInputSlotCursor` owns the
+  recovered input-slot assignment and next-slot advance.
+  `BlaiFetchOutputSlotPlan` owns the final `SRAM_mid_out`,
   `SRAM_out[0]`, and `DRAM_patch_num` cursor layout after input slots have
   been assigned.
-- `blaiApplyMemoryPlan` mirrors `gen_npu_inst_layer` after successful encoding:
-  it marks `NPU_on`, computes `buf_size` from the layer's allocator-owned
-  `DRAM_patch_num` and `PSRAM_patch_size`, then copies input/output slots,
-  mid-output slot, patch size, weight slot, and bias slot from `BlaiPsramCtrl`.
-- `blaiMarkEncodeFailed` mirrors the wrapper failure state by clearing `NPU_on`.
+- `BlaiMemoryPlanApplyEvidence` owns post-encode scalar projection for checked
+  `PSRAM_patch_size` and computed `buf_size`; `BlaiMemoryPlanApplyPlan` and
+  `BlaiMemoryPlanState` then mirror `gen_npu_inst_layer` after successful
+  encoding by marking `NPU_on` and carrying input/output slots, mid-output slot,
+  patch size, weight slot, and bias slot from `BlaiPsramCtrl` as caller-owned
+  typed state. `BlaiMemoryPlanBufSizeAbi` owns the checked `int64` to SDK
+  `int32` projection for that computed buffer size. `blaiApplyMemoryPlan`
+  remains as a compatibility wrapper over that checked state projection.
+- `BlaiEncodeStartApplyPlan` and `BlaiEncodeStartState` mirror the wrapper
+  start state after the instruction scratch clear by carrying the cleared
+  `instCnt` and `scratchCleared` result flag before fetch emission starts.
+- `BlaiEncodeFailureApplyPlan` and `BlaiEncodeFailureState` mirror the wrapper
+  failure state by projecting cleared `NPU_on`; `blaiMarkEncodeFailed` remains
+  a compatibility wrapper over that typed failure state.
 
 The functions above recover route-loop emission and bounded wrapper
 composition. Remaining control-flow validation is focused on broader
@@ -1008,8 +2429,8 @@ recovered as sizing helpers over `BlaiCpuInstLayer64`:
   `blaiCpuBiasStreamPlanInto` / `blaiCpuBiasStreamPlan`: package the selected
   layer index, layer type, recovered sizing inputs, storage width, and final
   byte count into caller-owned plan storage before stream reads or stores. The
-  recovered signed layer cursor is checked with `blaiI32ArrayIndexCursor` before
-  indexing caller-owned raw or parsed layer tables.
+  recovered signed layer cursor is checked with `blaiCpuStreamLayerCursor`
+  before indexing caller-owned raw or parsed layer tables.
 - `blaiCpuStreamCursor`, `BlaiCpuStreamCursorStep`,
   `blaiCpuStreamCursorStepInto`, `blaiCpuStreamCursorStep`,
   `blaiCpuWeightStreamSegmentInto` / `blaiCpuWeightStreamSegment`, and
@@ -1047,6 +2468,8 @@ recovered as sizing helpers over `BlaiCpuInstLayer64`:
   caller-owned result storage. `blaiCpuBiasElementWidth` owns the exact
   recovered `bytesPerElement` projection and the 32-bit little-endian lane
   limit before the store loop indexes the stream window.
+  `BlaiCpuBiasElementByteCursor` then owns the per-element/lane byte projection,
+  replacing the previous `base + lane` index in the compact CPU bias stream.
 - `blaiStoreFixedCpuBiasesInto` / `blaiStoreFixedCpuBiases`: copies the
   fixed-point one-byte bias stream form into caller-owned `int8` buffers for
   recovered fixed-reference execution, reporting storage width, bounds, and
@@ -1136,6 +2559,40 @@ forms let higher-level planners fill caller-owned nested plan storage directly:
   focused M0 model smoke also validates that an overflowing pre-start clean
   range returns a non-started `npuBusy` cache-fit failure instead of entering
   the live wait path.
+- The SDK `blai_npu_inference` runtime sequence in
+  `components/stage/blai/blai_nn/src/inst/blai_inst_npu.c` is now represented
+  by `BlaiNpuInferenceSdkSequenceEvidence` and
+  `blaiNpuInferenceSdkSequenceEvidenceInto`: `bl_npu_clk_en(1)`, `bl_npu_start`,
+  wait on the CNN IRQ counting semaphore, IRQ-side `bl_npu_ack_irq`, clock
+  disable, and CPU-process return. The active M0 path maps the semaphore wait
+  to the recovered polling wait against `BLAI_INT_CFG[9]`; current hardware
+  evidence shows this order is represented and the IRQ ack is correctly
+  deferred on timeout, while the interrupt/semaphore signal itself remains the
+  unresolved condition before output invalidation/readback can run.
+- The SDK `blai_npu_initCfg` boundary is now also composed as
+  `NpuBlaiInitCfgSdkSequenceEvidence`: layer-buffer setup, input buffer and
+  patch-size programming, net-parameter programming, `CNN_IRQn` handler
+  registration, priority tuple `7,1`, and IRQ enable are represented together.
+  On active M0 this evidence stays valid while proving the IRQ side effects are
+  deferred by the current binding policy, polling is preserved, and the HAL net
+  parameters do not hide a completion-enable bit.
+- The SDK source wrapper in
+  `components/stage/blai/blai_nn/src/inst/blai_inst_npu_ops.c` confirms the
+  high-level `forward_NPU` order: materialize temporary weights for weight
+  layers, stage DATA input and clean those cache ranges, call
+  `blai_npu_layer_config`, enter the inference wait, stop the engine, then
+  invalidate/read back output. `BlaiForwardNpuSdkSequenceEvidence` and
+  `blaiForwardNpuSdkSequenceEvidenceInto` encode that order as typed evidence
+  over the existing run-plan, execution, stop, and post-completion cache
+  records. On the current live smoke path this evidence is valid, but the
+  output invalidate/readback step remains deliberately deferred on timeout
+  until the active completion signal is recovered.
+  `BlaiForwardNpuSdkTailEvidence` now captures the tail after that wait:
+  `blai_npu_stop`, execution-lock release, `Load_NPU_data_to_tensor`, optional
+  temporary weight-buffer free, and the wrapper's final `return true`. The tail
+  evidence deliberately records `timeoutDoesNotValidateOutput`, so a recovered
+  SDK-compatible return path cannot be mistaken for successful model inference
+  before the completion route and output comparison are proven.
 - `npuRunLayer` is retained as a compatibility wrapper over
   `npuRunConfigured`; it no longer returns `npuUnsupported` unconditionally, but
   it still requires callers to provide a validated encoded instruction stream.
@@ -1161,6 +2618,10 @@ forms let higher-level planners fill caller-owned nested plan storage directly:
   `npuConvCompatibilityEvidence`, and `npuInstructionStreamGuardEvidence`
   expose the register-backed side effects from that facade, including whether
   layer buffers, the input buffer, and stream-state clearing were applied. The
+  stream-state clear now reuses `NpuInstructionStreamConfiguredApplyPlan` and
+  `NpuInstructionStreamConfiguredState` instead of directly mutating the wrapper
+  flag.
+  The
   plan, apply result, and evidence also separate input/weight/bias as
   register-backed addresses from the legacy output address that remains
   plan-only until encoded stream generation owns DATA layout. The focused model
@@ -1366,14 +2827,21 @@ fixed-point helpers:
   `blaiReferenceTfliteParsedSingleLayer2d` provides the same bounded stream and
   sidecar boundary for one known layer without requiring an array of full
   parsed-layer states, keeping small firmware validation paths inside the M0
-  stack budget.
+  stack budget. `BlaiReferenceTfliteParsedWeightWindow` and
+  `BlaiReferenceTfliteParsedBiasWindow` now own the full and low-footprint
+  dispatchers' started CPU weight byte slices and decoded int32 bias slices,
+  replacing local `weightStop`/`biasStop` stop-index arithmetic in those paths.
 - `BlaiReferenceFixedParsedLayerResult` and
   `blaiReferenceFixedParsedLayer2d` provide the matching parsed-state bridge for
-  fixed-point fixtures that use recovered byte-weight CPU streams. It decodes
-  fixed weights and one-byte biases into caller-owned buffers, advances the same
-  typed stream cursors, dispatches route and route-max records through recovered
-  typed sidecar storage, and reports unsupported non-byte fixed weight storage
-  separately from missing stream data instead of fabricating SDK pointers.
+fixed-point fixtures that use recovered byte-weight CPU streams. It decodes
+fixed weights and one-byte biases into caller-owned buffers, advances the same
+typed stream cursors, dispatches route and route-max records through recovered
+typed sidecar storage, and reports unsupported non-byte fixed weight storage
+separately from missing stream data instead of fabricating SDK pointers.
+`BlaiReferenceFixedParsedDecodedWindow` now owns the decoded fixed
+weight/bias slice passed by the full and low-footprint parsed-layer
+dispatchers, replacing local `weightStop`/`biasStop` stop-index arithmetic at
+those boundaries.
   `blaiReferenceFixedParsedSingleLayer2d` exposes the same low-footprint
   single-layer boundary for firmware smoke tests and other stack-constrained
   validation code.
@@ -1721,7 +3189,10 @@ fixed-point helpers:
   SDK `forward_ROUTE_W_tflite` path, including the axis-0 raw-copy fast path
   and the general axis-selected TFLite requantization path. The axis-selected
   input and output element addresses are projected through `blaiHwcIndex` and
-  `blaiHwcIndexWithBase`. The fixture reports
+  `blaiHwcIndexWithBase`; the raw-copy fast path now uses
+  `BlaiReferenceTfliteRouteWEasyCopyCursor` so source and destination bytes are
+  resolved through checked typed indexes instead of `(base + offset)` array
+  expressions. The fixture reports
   typed first-block diagnostics for input shape, input count, axis, positive
   output/input shifts, invalid activation range, inactive/zero-channel inputs,
   caller-owned input buffers, axis extent mismatch, and caller-owned output
@@ -1808,7 +3279,9 @@ partially recovered as byte-count and padding plans:
   required compact tensor bytes separately from a short caller buffer. Tensor
   transfer windows reuse `blaiCheckedByteWindow`, and tensor movement converts
   host `openArray` lengths through the same bounded `uint32` helper before
-  applying recovered DATA-buffer fit checks. Cache-maintenance fit checks share
+  applying recovered DATA-buffer fit checks. `BlaiPatchSlotIndexAbi` now owns
+  signed SDK memory-slot projection before `blaiPatchSlotOffset` performs
+  slot-times-patch-size offset arithmetic. Cache-maintenance fit checks share
   the same typed DATA-buffer
   range helper once recovered slot arithmetic has produced a relative offset;
   that range helper uses `BlaiUint32AppendFitResult` for both uint32 range
@@ -1837,7 +3310,10 @@ partially recovered as byte-count and padding plans:
 - `blaiPlanForwardModelResources` folds a CPU layer table into reusable NPU
   buffer maxima plus total CPU weight/bias stream sizes. This is the first
   graph-level ownership boundary for simple model validation without SDK heap
-  allocation or pointer fields.
+  allocation or pointer fields. `BlaiForwardModelLayerWindow` /
+  `BlaiForwardModelLayerCursor` check each raw or parsed-state layer row before
+  the resource fold reads it or projects the row index through
+  `BlaiLayerCursorIndexAbi`.
 - `blaiForwardModelResourcesFitInto` and `blaiForwardModelResourcesFit` check
   caller-owned model buffers against that graph-level plan. The `Into` form
   reports the first failing instruction, DATA, weight, bias, temporary, or CPU
@@ -1957,7 +3433,7 @@ partially recovered as byte-count and padding plans:
   layer, extra-input, YOLO, and parsed-layer state reads/writes, and
   parsed-forward readiness uses the same typed conversion before comparing
   recovered `storedLayerCount` cursors. CPU weight/bias stream-plan layer
-  selection uses `blaiI32ArrayIndexCursor` for recovered signed layer cursors
+  selection uses `blaiCpuStreamLayerCursor` for recovered signed layer cursors
   before reading caller-owned layer tables, and stream segments use
   `blaiCpuStreamStartLayerCursor` before starting the next plan scan.
   Fetch memory planning uses the same checked cursor before indexing fixed input
@@ -2014,7 +3490,10 @@ partially recovered as byte-count and padding plans:
   routed through the checked segment-window helper plus
   `BlaiCheckedByteIndex`, `BlaiFixedRowByteCursor`, and
   `BlaiInstructionByteCursor`, which record the recovered fixed 16-byte
-  instruction row layout before bytes are copied or compared. Fixture evidence
+  instruction row layout before bytes are copied or compared.
+  `BlaiInstructionWordCursor` now owns the 32-bit little-endian word projection
+  used by instruction-word diagnostics, reusing `blaiLoadLe32` instead of
+  open-coded `base + lane` byte indexing. Fixture evidence
   checks stored and trailing bytes through `blaiForwardWorkspaceSegmentByteEquals`,
   keeping those checks relative to the typed instruction segment. The public
   storage gate and static stored-byte assertions both use
@@ -2140,6 +3619,10 @@ partially recovered as byte-count and padding plans:
   only after the layer's reordered weight/bias data has reached workspace. Both
   raw `BlaiCpuInstLayer64` arrays and `BlaiCpuParsedLayerState` arrays are
   supported, so parser sidecars can stay in typed state through weight staging.
+  Both model loops use `BlaiForwardModelLayerCursor` before reading raw or
+  parsed-state layer rows, then project that checked Nim table cursor with
+  `BlaiLayerCursorIndexAbi` before calling the recovered per-layer
+  weight-workspace materializer.
   The model summary now derives expected CPU weight/bias end cursors with
   `blaiCpuStreamEndCursorsInto`, compares them with the actual cursors returned
   by the materializer, and treats mismatched stream consumption as its own
@@ -2158,7 +3641,13 @@ partially recovered as byte-count and padding plans:
   `blaiPrepareForwardModelInWorkspaceInto`, and
   `blaiPrepareForwardModelInWorkspace` also accept `BlaiCpuParsedLayerState`
   arrays, preserving typed parser sidecars through model-wide workspace
-  materialization and preparation.
+  materialization and preparation. The raw and parsed materialization loops use
+  `BlaiForwardModelLayerCursor` before reading model rows, then project that
+  checked Nim table cursor with `BlaiLayerCursorIndexAbi` before calling the
+  recovered per-layer workspace materializer. The raw and parsed preparation
+  loops use the same checked model-layer cursor before reading rows and before
+  projecting the Nim table cursor with `BlaiLayerCursorIndexAbi` for the
+  recovered per-layer workspace preparation helper.
 - `blaiPrepareForwardNpuLayerInto` and `blaiPrepareForwardNpuLayer` compose
   recovered allocator-backed instruction encoding, resource sizing, and run
   configuration into one readiness result without taking ownership of caller
@@ -2194,7 +3683,11 @@ partially recovered as byte-count and padding plans:
   resource plan's expected layer count, so truncated prepared tables cannot be
   treated as fully configurable. `blaiPlanForwardModelRunSequenceInto` exposes
   the same planner with caller-owned result storage for embedded callers that
-  cannot safely return larger aggregate objects. The result embeds
+  cannot safely return larger aggregate objects. Both overloads use
+  `BlaiForwardModelLayerCursor` before reading prepared model rows; the raw
+  CPU-layer overload then projects the checked Nim table cursor with
+  `BlaiLayerCursorIndexAbi`, while the parsed-state overload preserves each
+  row's recovered parsed index. The result embeds
   `BlaiForwardModelRunSequenceConfigurability`, and
   `blaiForwardModelRunSequenceConfigurabilityInto` /
   `blaiForwardModelRunSequenceConfigurability` recompute the same terminal
@@ -2206,6 +3699,10 @@ partially recovered as byte-count and padding plans:
   also accept `BlaiCpuParsedLayerState` arrays and preserve first blocked
   run-config readiness through both the aggregate plan and configurability view,
   keeping typed parser sidecars through callback-driven execution planning.
+  Both callback execution loops use `BlaiForwardModelLayerCursor` before
+  reading prepared model rows, then project the checked Nim table cursor with
+  `BlaiLayerCursorIndexAbi` before passing it to the recovered executor
+  callback.
   `blaiExecuteForwardModelRunSequenceInto` provides the caller-owned result
   form for the same reason. The shared `BlaiForwardModelExecuteResult` embeds
   `BlaiForwardModelExecuteCompletion`, and
@@ -2239,11 +3736,22 @@ partially recovered as byte-count and padding plans:
   rejection, and the parsed-state reusable-workspace execution path with a
   callback executor, including instruction workspace storage, packed weight
   workspace sizing, skipped non-NPU layers, missing layer storage, first-block
-  reasons, and failing-executor completion.
+  reasons, and failing-executor completion. The reusable-workspace
+  materialize-and-execute loops resolve model rows through
+  `BlaiForwardModelLayerCursor`, then project the checked Nim table cursor with
+  `BlaiLayerCursorIndexAbi` before per-layer materialization and executor
+  callback dispatch. CPU weight/bias stream discovery, parsed CPU-stream
+  totals, fixed/TFLite parsed reference buffer plans, sequential parsed
+  reference-model runners, the shared last-active-layer helper, and the
+  recovered `blai_npu_release` ownership scan now also resolve layer rows
+  through typed cursors before reading the caller-owned layer tables or sidecar
+  allocation tables.
 - `blaiMaterializeForwardModelWorkspace` preserves a compact readiness snapshot
   for the first layer that blocks standalone workspace materialization. This
   keeps the blocked-layer reason available without copying the full per-layer
-  materialization result into the aggregate result.
+  materialization result into the aggregate result. Its raw and parsed model
+  loops project the Nim table cursor with `BlaiLayerCursorIndexAbi` before
+  calling the recovered per-layer workspace materializer.
 - `blaiMaterializeAndExecuteForwardModelWorkspace` embeds
   `BlaiForwardModelWorkspaceExecuteCompletion`, with
   `blaiForwardModelWorkspaceExecuteCompletionInto` and
@@ -2268,8 +3776,12 @@ partially recovered as byte-count and padding plans:
   `BlaiForwardNpuExecuteResult` preserves the wait plan it was asked to run
   with, so aggregate first-failure evidence can be tied to the timeout,
   clear-on-complete, and clock-disable policy used for that layer. The live
-  bridge also records the recovered runtime ownership plan and stops a started
-  stream after inference, matching the SDK `forward_NPU` wrapper.
+  bridge reads raw and parsed-state rows through `BlaiForwardModelLayerCursor`;
+  the raw overload projects that checked Nim layer cursor through
+  `BlaiLayerCursorIndexAbi`, while the parsed-state overload preserves the
+  row's recovered parsed index before live run-plan construction. The live
+  runner records the recovered runtime ownership plan and stops a started stream
+  after inference, matching the SDK `forward_NPU` wrapper.
 - `BlaiParsedForwardConfiguredWorkspaceFixtureResult`,
   `BlaiParsedForwardConfiguredWorkspaceFixtureReadiness`,
   `blaiValidateParsedForwardConfiguredWorkspaceFixtureInto`, and
@@ -2306,9 +3818,11 @@ partially recovered as byte-count and padding plans:
   `NpuMmAggregateRawIndexClearEvidence`,
   `NpuMmAggregatePendingIndexScanEvidence`,
   `NpuMmAggregateInterruptRouteEvidence`,
+  `NpuMmAggregateSdkOffsetCandidateEvidence`,
   `NpuInterruptCoreBindingPolicy`, `NpuInterruptBindingOperationPlan`,
   `NpuInterruptBindingOperationReadiness`,
-  `NpuInterruptBindingApiContract`,
+  `NpuInterruptBindingApplyPreflight`, `NpuInterruptBindingApplyResult`,
+  `NpuInterruptBindingApiContract`, `NpuSdkInterruptApiEvidence`,
   `BlaiNpuStopAfterInferencePath`, `BlaiNpuStopAfterInferenceEvidence`,
   `BlaiNpuPostCompletionCachePath`,
   `BlaiNpuPostCompletionCacheEvidence`,
@@ -2327,6 +3841,8 @@ partially recovered as byte-count and padding plans:
   `BlaiParsedForwardConfiguredWorkspaceOutputEquivalenceReadinessBlock`,
   `BlaiParsedForwardConfiguredWorkspaceActiveRecoveryRouteFrontierBlock`,
   `BlaiParsedForwardConfiguredWorkspaceActiveCompletionRouteResolutionBlock`,
+  `BlaiParsedForwardConfiguredWorkspaceCompletionRouteControlReadinessBlock`,
+  `BlaiParsedForwardConfiguredWorkspaceCompletionRouteControlReadinessEvidence`,
   `BlaiParsedForwardConfiguredWorkspaceOutputEquivalenceReadinessEvidence`,
   `NpuInterruptBindingReadiness`,
   `blaiNpuRuntimeOwnershipPlan`, `blaiNpuStopAfterInferenceEvidence`,
@@ -2337,6 +3853,24 @@ partially recovered as byte-count and padding plans:
   SDK runtime boundary as pure data: `blai_npu_init` creates a counting
   interrupt semaphore and execution mutex, while `forward_NPU` takes/releases
   the mutex around layer config, inference, and stop. The recovered SDK
+  `g_bInited` lifecycle is now represented by
+  `BlaiNpuRuntimeLifecycleEvidence` and
+  `blaiNpuRuntimeLifecycleEvidenceInto`: cold init creates both RTOS
+  primitives, disables the NPU clock, and marks the runtime initialized;
+  repeated init is a no-op; initialized destroy deletes both primitives and
+  clears the initialized flag; cold destroy is a no-op. This keeps the SDK
+  lifecycle contract available to pure Nim callers without retaining the
+  FreeRTOS semaphore objects as implementation state. The SDK `blai_npu_stop`
+  wrapper is now explicit as `BlaiNpuStopWrapperEvidence`: it reuses the typed
+  STOP transition plan, proves the wrapper start flag is cleared, and records
+  the unconditional no-error return. The SDK
+  `blai_npu_release` ownership tail is now represented by
+  `BlaiNpuReleasePlan` / `blaiNpuReleasePlanInto`: callers provide typed layer
+  storage and per-layer CN allocation evidence, and the plan records the exact
+  SDK order of freeing each allocated `cn` side allocation, then freeing the
+  layer table when present, and returning no error. The Nim side does not
+  perform heap operations or pointer arithmetic; storage mismatches surface as
+  typed `BlaiNpuReleaseBlock` values. The recovered SDK
   `CNN_IRQn` request and priority 7,1 are now checked separately from local IRQ
   line ownership, SDK-header GLB route-map facts, MM_MISC aggregate interrupt
   status/mask/clear bitmap evidence, core-specific binding policy,
@@ -2359,7 +3893,14 @@ partially recovered as byte-count and padding plans:
   indexes 32..63 select bank 1, and the low five bits select the status/mask
   bit. `NpuMmAggregateRawIndexPlan` copies that typed cursor into the public
   planning API, keeping raw aggregate experiments typed without naming an
-  unverified NPU subroute. `NpuMmAggregateRawIndexSnapshotEvidence` projects one such raw
+  unverified NPU subroute. `NpuMmAggregateSdkHelperEvidence` now ties that raw
+  index plan to the SDK helper register contract: status reads use
+  `MM_INT_STA0/1`, mask writes use `MM_INT_MASK0/1`, `UNMASK` clears the
+  selected mask bit, and status clear is write-one through `MM_INT_CLR_0/1`.
+  The model smoke test now exercises this helper both for the static recovered
+  CNN offset and for the live wait-exit SDK-offset candidate, using the decoded
+  bank-1 mask word rather than open-coded bit manipulation.
+  `NpuMmAggregateRawIndexSnapshotEvidence` projects one such raw
   index through a decoded snapshot, reporting raw pending, mask state,
   unmasked-pending, masked-only, and clear-write evidence without open-coded
   bank or bit arithmetic. `NpuMmAggregateRawIndexClearEvidence` then projects a
@@ -2390,8 +3931,10 @@ partially recovered as byte-count and padding plans:
   separates no-start/no-cache, timeout with deferred output invalidation, and
   completed output-invalidate application. Active output/cache gate evidence
   ties deferred workspace output readback to deferred output-cache invalidation;
-  active output-readback plan evidence ties the primary output transfer byte
-  count, DATA slot offset, and invalidate range to that same deferred gate;
+  active output-readback planning now lives in typed
+  `BlaiParsedForwardConfiguredWorkspaceActiveOutputReadbackPlan` state, and the
+  public evidence projection ties the primary output transfer byte count, DATA
+  slot offset, and invalidate range to that same deferred gate;
   active output-transfer scope evidence proves the current simple fixture is a
   primary-output-only equivalence target, with no mid-output readback or
   invalidate range pending;
@@ -2410,12 +3953,21 @@ partially recovered as byte-count and padding plans:
   resolved. Completion-to-output handoff
   evidence composes those facts so the active path has one explicit contract:
   resolve the deferred completion route, then validate the primary output
-  readback/compare plan. Active completion-wait-budget evidence separately
+  readback/compare plan. Completion-route-control readiness now expands that
+  deferred route into the first concrete operation sequence: handler
+  registration, pending clear, priority setup, and IRQ enable, all behind the
+  preserved SDK/D0 route and M0 polling gate. Active completion-wait-budget evidence separately
   composes the recovered completion policy, polling-wait terminal, timeout
   registers, and wait-exit classification to prove the observed terminal is the
   deterministic exhausted polling budget, not an output stall or an unconfigured
-  wait. Active post-budget output-gate evidence then ties that exhausted budget
-  to the live-route-backed handoff and deferred primary-output readback/compare
+  wait. `BlaiNpuPollingBudgetScaleEvidence` now compares the focused 11-poll
+  active diagnostic run with a second 101-poll run over the same prepared
+  workspace, requiring both runs to start, exhaust their own budgets, observe no
+  interrupt, and keep the timeout terminal/status stable. That rules out the
+  short diagnostic budget itself as the only observed blocker while still
+  keeping output readback gated until a real completion signal is recovered.
+  Active post-budget output-gate evidence then ties that exhausted budget to
+  the live-route-backed handoff and deferred primary-output readback/compare
   plan, proving output equivalence is the next stage after completion recovery
   rather than the current active failure. Active gap output-route evidence then
   binds the earlier completion-gap reason to that live-route-backed output gate,
@@ -2442,10 +3994,12 @@ partially recovered as byte-count and padding plans:
   `BlaiNpuCompletionStatusResult`,
   `BlaiNpuCompletionStartPlan`, `BlaiNpuCompletionExitPlan`,
   `BlaiNpuPollingWaitTerminal`, `BlaiNpuPollingWaitEvidencePlan`,
-  `BlaiNpuPollingWaitEvidence`,
+  `BlaiNpuPollingWaitEvidence`, `BlaiNpuPollingBudgetScaleEvidence`,
   `BlaiNpuCompletionSideEffectPath`,
   `BlaiNpuCompletionSideEffectPlan`, `BlaiNpuCompletionSideEffectEvidence`,
-  `BlaiNpuClockExitPath`, `BlaiNpuClockExitEvidence`,
+  `BlaiNpuClockExitPath`, `BlaiNpuClockExitPlan`,
+  `BlaiNpuClockExitEvidence`,
+  `BlaiParsedForwardConfiguredWorkspaceActiveOutputReadbackPlan`,
   `BlaiParsedForwardConfiguredWorkspaceActivePollingSignalEvidence`,
   `BlaiParsedForwardConfiguredWorkspaceActiveMmAggregateWaitExitBlock`,
   `BlaiParsedForwardConfiguredWorkspaceActiveMmAggregateWaitExitEvidence`,
@@ -2454,7 +4008,10 @@ partially recovered as byte-count and padding plans:
   `blaiNpuPollingWaitEvidencePlan`, `blaiNpuPollingWaitEvidence`,
   `blaiNpuCompletionSideEffectPlanInto`,
   `blaiNpuCompletionSideEffectPlan`, `blaiNpuCompletionSideEffectEvidence`,
+  `blaiNpuClockExitPlanInto`, `blaiNpuClockExitPlan`,
   `blaiNpuClockExitEvidence`,
+  `blaiParsedForwardConfiguredWorkspaceActiveOutputReadbackPlanInto`,
+  `blaiParsedForwardConfiguredWorkspaceActiveOutputReadbackPlan`,
   `npuPlanCompletionWait`, `blaiNpuCompletionStartPlanInto`,
   `blaiNpuCompletionStartPlan`, `blaiNpuCompletionExitPlanInto`,
   `blaiNpuCompletionExitPlan`, `blaiPlanForwardNpuCompletionWaitInto`,
@@ -2468,7 +4025,11 @@ partially recovered as byte-count and padding plans:
   decision before clock/start/poll side effects, the poll terminal and polling
   evidence plans own exhausted-vs-completed budget classification, the exit
   plan owns the post-poll interrupt-clear and clock-gate decisions, and the
-  side-effect plan owns public evidence for those side effects. The wait result echoes the configured timeout,
+  side-effect and clock-exit plans own public evidence for those side effects.
+  `NpuRegisterSnapshotCaptureApplyPlan` and `NpuRegisterSnapshotCaptureState`
+  own launch and post-start BLAI register snapshot commits before the wrapper
+  snapshot globals and captured flags are mutated.
+  The wait result echoes the configured timeout,
   clear-on-complete, and clock-disable policy; the poll result records the
   configured budget, polls consumed, final interrupt sample, and budget
   exhaustion so callers can audit the live wait boundary after an unsupported,
@@ -2479,7 +4040,11 @@ partially recovered as byte-count and padding plans:
   terminal reason matches the status projection. Side-effect evidence separately
   classifies unsupported no-start, timeout no-clear/clock-exit, and completed
   interrupt-clear/clock-exit paths. Clock-exit evidence ties the retained
-  320 MHz wait-exit clock snapshot to the post-wait clock gate. `BlaiParsedForwardConfiguredWorkspaceCompletionSignalEvidence`
+  320 MHz wait-exit clock snapshot to the post-wait clock gate.
+  `BlaiNpuStartClockEvidence` now captures the clock snapshot immediately after
+  the recovered `bl_npu_clk_en(1)` boundary and before `NPU_Start`, then checks
+  that the start-boundary 320 MHz source/divider state matches the later
+  wait-exit clock sample. `BlaiParsedForwardConfiguredWorkspaceCompletionSignalEvidence`
   ties the SDK CNN IRQ semaphore expectation, recovered interrupt request,
   unverified local binding, active polling wait, and missing live interrupt bit
   into one typed result. Active polling-signal evidence ties that result to the
@@ -2495,7 +4060,10 @@ partially recovered as byte-count and padding plans:
 - `blaiExecuteForwardModelConfiguredInto` and
   `blaiExecuteForwardModelConfigured` also accept `BlaiCpuParsedLayerState`
   arrays, so parsed model sidecars can flow through live configured execution
-  without being flattened back into parallel raw layer tables.
+  without being flattened back into parallel raw layer tables. The explicit
+  layer-buffer configured variant also reads parsed rows through
+  `BlaiForwardModelLayerCursor` before preserving each row's recovered parsed
+  index for live run-plan construction.
 - `blaiCacheRangeInto`, `blaiNpuInputCleanRangeInto`, and
   `blaiNpuOutputInvalidateRangeInto` recover the SDK cache-maintenance ranges
   as caller-owned DATA-buffer offsets and lengths; the result-returning forms
@@ -2675,7 +4243,18 @@ partially recovered as byte-count and padding plans:
   recovered output transfer/compare plan is ready, but readback and comparison
   remain blocked until the active completion route is resolved. The readiness
   evidence carries a typed first-block reason for route-resolution, handoff,
-  post-budget, output-frontier, and completion gates.
+  post-budget, output-frontier, and completion gates. The fetched MNIST model
+  status is bridged to this active evidence by
+  `BlaiMnistTfliteActiveOutputValidationEvidence`, which confirms that MNIST's
+  pure-Nim parsed reference is runnable and output validation remains pending
+  specifically because the active completion route is still unresolved. It
+  carries the active output-equivalence readiness first-block reason separately
+  from the MNIST bridge first-block reason, so completion-gated readiness is
+  observable without marking the MNIST model invalid.
+  `BlaiMnistTfliteLiveValidationNextStepEvidence` preserves the nested active
+  output-validation and live completion-route first-block diagnostics while it
+  selects the ordered next action, keeping readback deferral explainable without
+  flattening everything to a single generic blocked state.
   `blaiMaterializeAndValidateParsedForwardConfiguredWorkspaceAddressFixtureInto`
   adds the generated-fixture composition boundary: it binds an explicit
   hardware-visible workspace base, materializes parsed instruction/weight/bias
@@ -2766,8 +4345,51 @@ partially recovered as byte-count and padding plans:
   configured wait plan, 11-poll timeout, clear-on-complete/clock-disable policy,
   no-interrupt timeout decision, suppressed interrupt clear, and clock-disabled
   exit together; active polling-wait terminal evidence classifies the live
-  terminal as timeout with exhausted poll budget and no interrupt; active
-  completion-boundary evidence groups completion policy,
+  terminal as timeout with exhausted poll budget and no interrupt;
+  `BlaiParsedForwardConfiguredWorkspaceActiveLocalAggregateInterruptEvidence`
+  now bridges the SDK local poll source (`BLAI_INT_CFG[9]`, matching
+  `NPU_Get_Int`) to the live MM aggregate wait-exit scan: the local poll sample
+  and wait-exit sample are both clear, the aggregate has no raw, unmasked, or
+  masked-only pending candidate, the aggregate route remains unnamed, and M0
+  polling is preserved. This keeps completion classified as a missing signal
+  rather than a hidden aggregate interrupt or a stale local status bit.
+  `BlaiParsedForwardConfiguredWorkspaceActiveLaunchGapEvidence` now ties that
+  completion gap back to the retained launch/start register state: workspace
+  addresses, segment/net parameters, clean launch commands, observed start,
+  one execution attempt, and the timeout wait-exit all remain coherent before
+  the missing local/aggregate completion signal is classified. This makes bad
+  retained launch state an explicit non-candidate for the current blocker.
+  `BlaiParsedForwardConfiguredWorkspaceActiveStartEdgeEvidence` now narrows the
+  immediate launch/start transition: the pre-start and post-start BLAI snapshots
+  are captured, retained register fields are stable, the start command
+  self-clears, and the post-start/wait-exit samples remain idle with no local
+  interrupt. The active blocker is therefore not currently classified as lost
+  register programming; it is the absence of an observable busy or interrupt
+  edge after the recovered start command.
+  `BlaiParsedForwardConfiguredWorkspaceActiveCommandIdleEvidence` also ties the
+  SDK-exposed MM/CODEC BLAI command diagnostics to the same terminal: all
+  command counters and limiter mode bits are clear while the wait-exit sample
+  is AXI-idle and the local/aggregate completion signal remains missing. This
+  separates "no outstanding command activity" from "completion interrupt did
+  not arrive" in the pure Nim recovery state.
+  `NpuBlaiTzmidStatus` now adds the SDK TZC non-secure MM-domain master-ID
+  surface to that diagnostic set. The recovered header fields are
+  `TZC_NSEC_TZC_MM_BMX_TZMID` at `TzcNsecBase+0x300`, BLAI group bit 1,
+  BLAI write-select bit 17, and BLAI lock bit 1 in the adjacent
+  `TzcNsecBase+0x304` lock register. The Nim implementation exposes those two
+  words through a typed `TzcNsecMmBmxTzmidRegs` overlay and decodes/encodes the
+  BLAI fields with `NpuBlaiTzmidStatus` and `NpuBlaiTzmidPlan`; it does not yet
+  apply the plan in the runtime path. This keeps the remaining completion gap
+  able to classify "BLAI master-ID write-select was never latched" as a concrete
+  candidate precondition without silently changing TZC policy. The focused M0
+  model smoke now also samples the live `tzc_mm_bmx_tzmid`/lock words through
+  that overlay at the active timeout boundary, logs the raw words, and verifies
+  the live decode is readable, group-bounded, and consistently classified. The
+  first hardware run with this diagnostic read `tzmid=0x003F0000` and
+  `lock=0x00000000`: the BLAI select bit is latched, the decoded BLAI group is
+  0, and the BLAI lock bit is clear, so a missing BLAI TZMID select latch is
+  ruled out for that observed completion-gap run.
+  Active completion-boundary evidence groups completion policy,
   engine progress, timeout evidence, deferred output, no completion interrupt,
   and busy/idle state into one contract; active wait-exit evidence groups the
   raw no-interrupt state, clean command bits, AXI activity classification,
@@ -2776,7 +4398,20 @@ partially recovered as byte-count and padding plans:
   `BlaiParsedForwardConfiguredWorkspaceWaitExitMode`; the active tiny fixture now
   records a dedicated wait-exit mode evidence object proving the measured timeout
   terminal has a coherent AXI-mode classification with no completion interrupt
-  and retained clock. Active output-blocked
+  and retained clock. `BlaiParsedForwardConfiguredWorkspaceActiveIdleCompletionEvidence`
+  now names the current live terminal more precisely: the engine started, the
+  wait-exit sample is AXI-idle with clean command bits and retained clock, but
+  no SDK completion interrupt was observed, so output readback/compare remain
+  gated instead of being silently promoted to success.
+  `BlaiParsedForwardConfiguredWorkspaceIdleOutputReadbackGateEvidence` now
+  bridges that idle terminal to the recovered primary-output readback plan as a
+  diagnostic-only gate: output invalidation/readback is coherent enough to
+  probe after idle/no-interrupt.
+  `BlaiParsedForwardConfiguredWorkspaceIdleOutputReadbackDiagnostic` now
+  consumes that gate through the bound-workspace output loader and uint8 compare
+  helper, proving that the typed primary-output readback path can observe and
+  compare the DATA bytes while model validation remains blocked by the missing
+  completion signal. Active output-blocked
   evidence now proves the fixture/readiness gates stop at execution before
   workspace-output movement or compare logic; active completion-gap evidence ties the boundary,
   wait-exit, and output-blocked contracts together, so the remaining active
@@ -2798,12 +4433,39 @@ partially recovered as byte-count and padding plans:
   aggregate evidence now ties
   that live aggregate sample to the completion route target, proving the route
   remains deferred through the unknown MM_MISC subroute while the active M0 path
-  stays on polling. The completion-to-output handoff now requires that live
+  stays on polling. `BlaiParsedForwardConfiguredWorkspaceActiveLiveRouteEvidence`
+  now consumes the live MM_MISC wait-exit snapshot directly through the route
+  evidence helper, proving that the active route has no raw, unmasked, or
+  masked-only completion candidate before preserving polling behind the unknown
+  subroute. The completion-to-output handoff now requires that live
   aggregate-backed route evidence before declaring output readback/compare the
   next stage after completion recovery, and active recovery route-frontier
   evidence carries that live route requirement back to the active recovery
   frontier. Active completion-route resolution evidence now binds the concrete
-  route target to that live frontier.
+  route target to that live frontier. `M0ClicIrqSnapshot` and
+  `NpuCnnIrqControllerSnapshotEvidence` now add a read-only typed CLIC/GLB mux
+  readback for the recovered SDK `CNN_IRQn` line. The 2026-06-19 M0 hardware
+  run sampled IRQ `0x37` / source `0x27` with `intip=0x00`, `intie=0x00`,
+  `intattr=0xC1`, `intctl=0x0F`, GLB status `0x00000000`, GLB mask
+  `0xFFFFFFFF`, and source bit `0x80`. That proves the SDK CNN line is the M0
+  I2C1 alias, is pending-clear, CLIC-disabled, GLB-masked, and still in vector
+  mode; the upper CLIC attribute bits are implementation state and are not a
+  route blocker by themselves. The completion route therefore remains blocked
+  by the unresolved MM aggregate subroute rather than by a locally enabled CNN
+  line accidentally consuming the edge.
+  `BlaiParsedForwardConfiguredWorkspaceCompletionRouteBindingSafetyEvidence`
+  now ties that controller readback to the deferred route-control plan: the SDK
+  route and D0/APU candidate are preserved, but the active M0 source is the
+  I2C1 alias, the local controller is pending-clear/disabled/masked, route
+  operations are suppressed, polling is preserved, and output readback remains
+  gated. This makes the safe next step explicit: verify the MM aggregate
+  subroute or bind the preserved D0 route before enabling the recovered
+  `CNN_IRQn` controls; the M0 smoke path must not promote the local alias to an
+  active completion route. `BlaiParsedForwardConfiguredWorkspaceCompletionRouteProbePlan`
+  now turns that policy into a typed next-action surface: with the live aggregate
+  sample showing no raw, unmasked, or masked-only pending candidate, the plan
+  selects `blaiParsedConfiguredCompletionRouteProbeVerifyMmSubroute` and keeps
+  output readback behind route verification.
   The
   current active hardware terminal is the missing completion signal path, not
   instruction copy, stream termination, packed weight copy, bias copy,
@@ -2823,17 +4485,23 @@ partially recovered as byte-count and padding plans:
   large typed fixture records can be exercised on device without overflowing
   the 64 KiB M0 RAM stack window used by normal firmware.
   The same active probe now proves the SDK raw NPU clock source (`2`) is
-  selected with divider zero and the gate enabled, CNN reset is released, and
-  BLAI SRAM ownership is released before the live start; the `SYSRAM_SET`
-  request bit reads back clear on hardware, matching pulse/self-clearing
-  behavior rather than a persistent latch. Wait-exit evidence also proves the
+  selected with divider zero and the gate enabled during local ownership setup,
+  CNN reset is released, and BLAI SRAM ownership is released and selected before
+  the live start; the `SYSRAM_SET` request bit reads back clear on hardware,
+  matching pulse/self-clearing behavior rather than a persistent latch.
+  `NpuRuntimeInitSdkBoundaryEvidence` now separates the SDK surface
+  (`CLKRST_NPU_CLK_Sel(2)`, preserving gate/divider) from the local pure-Nim
+  runtime wrapper (temporary clock enable, reset pulse, SRAM release/select,
+  and final clock disable policy), so the remaining idle-start blocker is not
+  hidden behind an overclaimed SDK init sequence. Wait-exit
+  evidence also proves the
   NPU clock gate remains enabled at the timeout, so the active block is not
   caused by clock disable, reset assertion, or unreleased BLAI SRAM ownership.
   A typed launch/start register evidence helper, built from typed register
   snapshot evidence and fed by the launch and post-start captures mirrored
   through the terminal gate snapshot, now exposes split launch/start capture
   predicates and the started-state mirror while proving the BLAI instruction,
-  weight, bias, DATA address, segment count, and split unsigned-input,
+  weight, bias, DATA address, SDK patch-size register value, and split unsigned-input,
   TensorFlow-mode, and relu-N net-parameter bits match the projected workspace
   before start, and that
   `BLAI_INT_CFG` has split clean predicates for stale start, resume, stop,
@@ -2876,36 +4544,56 @@ partially recovered as byte-count and padding plans:
   busy/AXI idle, interrupt-pending, and clock state, so active hardware runs can
   distinguish a bad launch register, lost post-start state, and a
   started-but-no-completion wait terminal. The current live run captures a valid
-  launch snapshot with `BALI_GENERAL_CFG = 0xC7050000`, matching instruction,
-  weight, bias, DATA, and segment addresses, then a post-start and wait-exit
-  `BALI_GENERAL_CFG = 0x47050000`: the start transition clears the idle state,
-  leaves the engine busy with AXI write idle and AXI read active, retains the
-  320 MHz clock, and still has no `BLAI_INT_CFG` completion bit. The active
+  launch, post-start, and wait-exit snapshots with
+  `BALI_GENERAL_CFG = 0xC7050001`, matching instruction, weight, bias, DATA,
+  segment addresses, and the SDK first-layer unsigned-input bit. The launch and
+  post-start snapshots now also pass `NpuGeneralCfgDefaultEvidence`: image mode
+  is the SDK default sound mode, FTABLE index/data bases are the recovered
+  reset defaults `0x05`/`0x07`, reserved bits are clear, and both AXI idle bits
+  are set. The recovered
+  SDK `NPU_Start` surface is now represented explicitly by
+  `BlaiParsedForwardConfiguredWorkspaceActiveStartCommandSurfaceEvidence`: the
+  active run proves `GENERAL_CFG` is stable across launch/post-start/wait-exit,
+  the transient `BLAI_INT_CFG.start` command self-clears, resume/stop/clear
+  command bits stay clear, and no post-start busy or completion-interrupt edge
+  appears. This narrows the current live blocker away from a hidden HAL
+  `GENERAL_CFG` start-side write and back toward the still-unrecovered engine
+  execution/consumption condition. `BlaiNpuStartTransitionEvidence` now also
+  records the SDK wrapper state-machine choice at the live boundary: the active
+  smoke proves the wrapper was not already started, selected the first-run
+  START command rather than RESUME, and updated the wrapper started flag after
+  the command write. The active
   smoke now also snapshots the MM_MISC `codec_misc_1` BLAI command counter and
   the CODEC_MISC BLAI read/write limiter command counters at the same execution
-  gate, so the next hardware run can separate descriptor/command consumption
-  from a bus-read stall before completion. Current UART/JTAG evidence reports
+  gate, so hardware runs can separate descriptor/command consumption from a
+  bus-read stall before completion. Current UART/JTAG evidence reports
   `mmRaw=0x00000000`, read limiter `0x00000000`, and write limiter
   `0x00000000` at that boundary, so the active timeout now has a zero-command
-  counter snapshot alongside busy/read-active AXI state. The focused active
-  fixture now applies the SDK demo's `CODEC_MISC_BLAI_Limit_RD/WR(0x10f)`
-  limiter value through the typed Nim bus-limiter plan before launch, with
-  pre-launch readback evidence, to test whether the zero limiter state was part
-  of the live stall. Current hardware evidence shows those limiter registers
-  latch as `0x8000010F`; with the limiter enabled, launch, post-start, and
-  wait-exit all read `BALI_GENERAL_CFG = 0xC7050000` (both AXI channels idle)
-  and still no `BLAI_INT_CFG` completion bit. That separates the prior
-  read-active stall from a limiter-enabled idle/no-completion terminal. A
-  timeout-only diagnostic now applies the planned primary output invalidate
-  after the failed wait and reads back the active output slot: current hardware
+  counter snapshot alongside idle AXI state. The same live gate now decodes the
+  MM_MISC `MM_BUS_DEC_ERR` and `MCU_BUS_DEC_ERR` windows with
+  `NpuBusDecodeStatusResult`, proving no MM or MCU decode-error latch is set
+  while the engine remains idle. The focused active
+  fixture also validates the SDK demo's `CODEC_MISC_BLAI_Limit_RD/WR(0x10f)`
+  encoding through the typed Nim bus-limiter plan and readback evidence. That
+  pre-launch diagnostic proves the registers latch as `0x8000010F`, then
+  clears them back to zero before the current active execution path so the live
+  terminal remains comparable with the existing no-limiter evidence. A
+  timeout-only diagnostic applies the planned primary output invalidate after
+  the failed wait and reads back the active output slot: current hardware
   evidence reports `invAddr=0x22047584`, `invBytes=0x00000004`,
-  `invApplied=1`, and `outputByte=0x00000000`, so the limiter-enabled terminal
-  is not hiding a stale cached primary-output write. The active fixture now runs
+  `invApplied=1`, and `outputByte=0x00000000`, so the current terminal is not
+  hiding a stale cached primary-output write. The active fixture now runs
   this one-layer model as SDK layer index 0 and parameterizes register-snapshot
   evidence for the expected first-layer unsigned-input state; current hardware
   reads `BALI_GENERAL_CFG = 0xC7050001` at launch, post-start, and wait-exit,
   confirming the SDK first-layer unsigned bit is preserved while completion and
-  primary-output movement are still absent. The active smoke now also proves the
+  primary-output movement are still absent. The execution result now captures a
+  post-`blai_npu_stop` register snapshot as run-local state, and
+  `BlaiNpuPostStopSnapshotEvidence` checks that the stop-after-timeout cleanup
+  happened, launch addresses and SDK patch-size register value remain decodable, command bits
+  are in a known terminal state, the interrupt bit is still clear, and the
+  engine is idle. This closes the SDK stop boundary without treating a stopped
+  idle terminal as successful completion. The active smoke now also proves the
   recovered `Load_NPU_weights` plan for this tiny TFLite 1x1 convolution:
   typed split packed-byte and tile evidence plus active supported 3x3-helper dispatch, one effective input
   channel, one output channel, no temporary grouped buffer, a single 16-byte
@@ -2930,7 +4618,40 @@ partially recovered as byte-count and padding plans:
   split fit/apply evidence for the grouped workspace clean and split active, fit,
   apply, clean-operation, address, and byte evidence for the instruction,
   weight, and bias cache spans, plus split first-DATA cache range count, active,
-  fit, apply, operation, address, and byte evidence.
+  fit, apply, operation, address, and byte evidence. `BlaiForwardLaunchCacheRegisterEvidence`
+  ties those cache-clean proofs to the actual launch-register fetch addresses:
+  instruction and DATA come from the workspace surfaces, while weight and bias
+  come from the SDK-style temporary buffer surfaces, with address and byte
+  coverage checked before the live start.
+  `BlaiForwardLaunchSramAddressEvidence` now closes the adjacent SRAM/address
+  gap by checking the captured live launch registers themselves: instruction,
+  DATA, temporary weight, and temporary bias addresses must all be WRAM-visible,
+  while the runtime SRAM evidence must show BLAI SRAM released, selected, and
+  the SYSRAM_SET latch self-cleared. This keeps the no-completion frontier from
+  depending on a planned workspace address when the actual launch used
+  SDK-style temporary weight/bias storage.
+  `BlaiForwardLaunchWramSpanEvidence` extends that check from base addresses
+  to complete byte spans: the captured instruction, DATA, temporary weight, and
+  temporary bias launch-register ranges must fit the 32-bit bus and remain
+  fully inside WRAM. The active smoke now logs separate span evidence for bus,
+  instruction, DATA, weight, and bias ranges before the launch sequencing
+  diagnosis continues.
+  `BlaiForwardLaunchInstructionFetchEvidence` then ties the instruction launch
+  register back to the materialized decoded stream: the captured `instAddr`
+  must equal the workspace instruction segment, the byte span must match the
+  two 16-byte records, both records must match the rebuilt encoder output, the
+  recovered SDK stream walk must allocate one terminal layer, and the split
+  terminal-control bits must stay coherent. This rules out a live no-run cause
+  where the launch address points at a different or non-executable instruction
+  surface than the one decoded by the pure Nim stream evidence.
+  `BlaiForwardLaunchOperandFetchEvidence` adds the matching operand-side
+  surface proof: DATA, temporary weight, and temporary bias launch registers
+  must match the recovered run plan and temporary buffer, the DATA segment must
+  match the layer patch size, decoded descriptor input/output slots must match
+  the staged DATA slots, the active single-input C2 convention must hold, and
+  the launch weight/bias byte spans must match the packed/staged temporary
+  bytes. This keeps the remaining idle-start blocker from being attributed to a
+  mismatched operand register or descriptor slot.
   Snapshot coherence evidence now exposes split state, first-block, and execution mirror groups,
   including individual materialized/bound/address/input/run/execution/output state mirrors.
   First-block mirror evidence is split across materialization, execution, run-sequence, and output
@@ -2958,7 +4679,24 @@ partially recovered as byte-count and padding plans:
   descriptor and a zero C2 operand for the single-input 1x1 case. The same
   active smoke now independently rebuilds the TFLite descriptor bundle from the
   recovered fetch-memory plan and verifies the two emitted 16-byte instructions
-  match the live stream byte-for-byte; local vendor DWARF/objdump evidence keeps
+  match the live stream byte-for-byte. `BlaiForwardWorkspaceInstructionRawWordEvidence`
+  also records the little-endian four-word view of the TFLite side instruction
+  and halted layer instruction, proving the raw control words seen in the live
+  fetch-surface log match the recovered encoder output and instruction-class
+  split. `BlaiNpuSdkStreamWalkEvidence` mirrors the SDK
+  `blai_npu_get_header` / `blai_npu_inst_decode_layer` record walk for the
+  active stream: the first 16-byte record is an odd non-terminal side/TFLite
+  instruction, the second is an even terminal layer instruction, the SDK layer
+  count is one, and the scan stops at the second record. This rules out an
+  active no-completion cause where the vendor parser would allocate zero layers
+  or continue past the materialized stream. `BlaiDecodedLayer` now exposes the
+  common descriptor-halt bit at 124
+  separately from the stream end bit at 127; the active terminal-control
+  evidence proves the live one-layer bundle has bit 124 and bit 127 represented
+  separately; the active live run keeps descriptor-halt bit 124 clear while
+  stream-end bit 127 is set, and the evidence also names the alternate
+  SDK-style terminal pattern for isolated comparison instead of conflating both
+  controls as one halt field. Local vendor DWARF/objdump evidence keeps
   the raw `conv_size`, `act_type`, and common control bitfield convention tied
   to the encoder ABI. A typed active-stream semantic evidence helper owns the
   focused smoke's split stream decode/rebuild readiness and bundle match details,
@@ -3127,13 +4865,25 @@ The first bounded allocator search is recovered as
 - `blaiPlanMemAllocStartPatchInto` and `blaiPlanMemAllocStartPatch` expose that
   pressure through the stable allocator plan API used by the line search.
 - `blaiMemAllocLinePatchProbe` owns each candidate line-patch pressure check:
-  even input-line rounding, upsample output-line scaling, routed mid-output
-  kernel padding, and the input/output 4 KiB fit decision.
-- `blaiPlanLinePatchMemAllocInto` fills caller-owned line-patch plan storage.
-  `BlaiMemAllocLinePatchApplyPlan` owns the checked int32 ABI projection for
-  `line_patch_num` and `line_patch_w[]`, and `blaiApplyLinePatchMemAlloc`
-  writes those typed values into the exact `PSRAM_ctrl` fields used by the SDK
-  branch.
+  even input-line rounding, `BlaiMemAllocLinePatchUpsampleScale` output-line
+  scaling, routed mid-output kernel padding through
+  `blaiMemAllocRouteKernelPadding`, and the input/output 4 KiB fit decision.
+  That helper preserves the recovered small-kernel padding
+  `BlaiMemAllocRouteKernelSmallPadding` and the dilated/large-kernel padding
+  `BlaiMemAllocRouteKernelExpandedPadding` behind typed constants.
+- `BlaiMemAllocLinePatchSelectionEvidence` owns the single-patch shortcut,
+  bounded candidate search, terminal segment width, and selected line-width
+  array before `blaiPlanLinePatchMemAllocInto` copies the metadata into
+  caller-owned line-patch plan storage.
+  `BlaiMemAllocLinePatchApplyEvidence` owns the checked int32 ABI projection
+  for `line_patch_num` and `line_patch_w[]` before
+  `BlaiMemAllocLinePatchApplyPlan` copies it into the public apply result.
+  `BlaiMemAllocLinePatchState` now projects those typed values before
+  `blaiApplyLinePatchMemAlloc` writes the exact `PSRAM_ctrl` fields used by the
+  SDK branch. The fixed `line_patch_w[]` overlay writes now use
+  `blaiWeightPatchCursor` instead of raw integer loop indexing.
+  `blaiApplyLinePatchMemAllocScalarState` owns the scalar `line_patch_num`
+  projection for callers that only need the recovered patch-count metadata.
 
 The high-weight branch after line splitting is recovered as
 `BlaiMemAllocWeightPatchPressure` and `BlaiMemAllocWeightPatchPlan`:
@@ -3141,28 +4891,56 @@ The high-weight branch after line splitting is recovered as
 - `blaiMemAllocWeightPatchPressure` mirrors the SDK's size/group/dilation
   pressure expression used before weight patching and records which recovered
   formula branch was selected: 1x1, dilated/large-kernel, or normal small
-  kernel.
+  kernel. The recovered 1x1 kernel size, 1x1 group divisor factor,
+  dilation/large-kernel thresholds, and shared spatial factor are named as
+  `BlaiMemAllocWeightPressure*` constants so the formula is explicit without
+  raw arithmetic literals.
 - `blaiEstimateWeightPatchBytes` remains as the stable byte-returning wrapper
   around that typed pressure estimate.
 - Layers with recovered weight pressure above
   `BlaiMemAllocWeightPatchThresholdBytes` (8192 bytes) choose a power-of-two
-  output-channel patch width.
+  output-channel patch width. `blaiMemAllocOutputChannelPatchWidth` owns the
+  recovered floor-power-of-two selection and minimum width clamp.
 - `blaiMemAllocWeightPatchStoreEntry` owns each recovered patch-store
   iteration: bounded `wei_patch_out_c[]` slot selection, final-patch channel
   count, output/mid-output byte pressure, PSRAM patch-size contribution, and
-  emitted-channel cursor advance.
+  emitted-channel cursor advance. `blaiMemAllocPatchStoreSize` keeps the
+  recovered max-selection across output, full-patch, and optional mid-output
+  byte pressures in one typed helper.
 - `blaiMemAllocPatchCountPlan` owns the final `PSRAM_patch_num` and optional
   `PSRAM_mid_patch_num` calculation after patch-size selection, including the
   recovered `CONV_MAX` extra `wei_patch_num` adjustment.
+  `blaiMemAllocPsramPatchCount` keeps the final `PSRAM_patch_num` formula
+  explicit: floor-divide output-channel elements by `PSRAM_patch_size`, then
+  add `wei_patch_num`.
+  `blaiMemAllocMidPatchElements` keeps the recovered mid-output element basis
+  explicit: `CONV_MAX` uses input elements times output channels, while other
+  mid-output paths use input elements times routed channels.
+  `blaiMemAllocPsramMidPatchCount` keeps the optional `PSRAM_mid_patch_num`
+  formula explicit: floor-divide those mid elements by `PSRAM_patch_size`, then
+  add `wei_patch_num` only for the recovered `CONV_MAX` extra mid-patch path.
 - `blaiPlanHighWeightPatchMemAllocInto` writes caller-owned `wei_patch_num`,
   `wei_patch_out_c[]`, final `PSRAM_patch_size`, `PSRAM_patch_num`, and
   optional `PSRAM_mid_patch_num` plan values.
-- `BlaiMemAllocWeightPatchApplyPlan` owns the checked int32 ABI projection for
-  those high-weight/PSRAM patch stores before `blaiApplyHighWeightPatchMemAlloc`
-  writes the typed values into `PSRAM_ctrl`.
+- `BlaiMemAllocWeightPatchApplyEvidence` owns the checked int32 ABI projection
+  for those high-weight/PSRAM patch stores before
+  `BlaiMemAllocWeightPatchApplyPlan` copies it into the public apply result.
+  `BlaiMemAllocWeightPatchState` now carries the caller-owned typed state before
+  `blaiApplyHighWeightPatchMemAlloc` writes the exact `PSRAM_ctrl` fields used
+  by the SDK branch. The fixed `wei_patch_out_c[]` overlay writes use the same
+  typed patch cursor as the recovered store-entry planner.
+  `blaiApplyWeightPatchMemAllocScalarState` owns the scalar `wei_patch_num`,
+  `PSRAM_patch_size`, `PSRAM_patch_num`, and `PSRAM_mid_patch_num` projection
+  for metadata-only consumers.
 - `BlaiMemAllocPatchBranchPlan` owns the recovered high-weight versus
   lower-threshold PSRAM branch choice after line splitting, before the composed
   allocator plan falls back to the one-patch path.
+  `BlaiMemAllocPatchBranchEvidence` owns the recovered branch ordering:
+  high-weight patch planning is attempted first, and lower-threshold PSRAM
+  patch planning is considered only if the high-weight branch does not fit.
+  `blaiMemAllocHighWeightBranchActive` and
+  `blaiMemAllocPsramPatchBranchActive` keep the recovered strict/non-strict
+  threshold boundaries explicit.
 
 The lower-threshold PSRAM patch branch is recovered as
 `BlaiMemAllocPsramPatchPressure`, `blaiPlanPsramPatchMemAllocInto`, and
@@ -3172,8 +4950,10 @@ The lower-threshold PSRAM patch branch is recovered as
   `BlaiMemAllocWeightPatchThresholdBytes` (8192 bytes) but line-split PSRAM
   pressure still exceeds `BlaiMemAllocPsramPatchThresholdBytes` (4096 bytes).
 - `blaiMemAllocPsramPatchPressure` mirrors the SDK per-line output pressure and
-  the SDK type-9 (`CONV_MAX`) special case, exposing both the base output-line
-  pressure and the recovered route-floor pressure.
+  the SDK type-9 (`CONV_MAX`) special case. Both the base output-line pressure
+  and the recovered route-floor pressure are projected through
+  `blaiMemAllocLineFloorBytes`, preserving the converter's floor division by
+  line-patch count before multiplication.
 - `blaiEstimatePsramPatchBytes` remains as the stable byte-returning wrapper
   around that typed PSRAM pressure estimate.
 - The branch reuses the recovered patch-store loop, so `wei_patch_num`,
@@ -3185,10 +4965,17 @@ The small-layer one-patch fallback stores from `BLAI_MEM_alloc` are exposed as
 `blaiPlanSinglePatchMemAllocInto`, and `blaiPlanSinglePatchMemAlloc`:
 
 - `weightPatchCount` is fixed to one and `firstWeightPatchOutC` mirrors
-  `out_c`.
+  `out_c`. The recovered fixed count is named
+  `BlaiMemAllocSinglePatchWeightPatchCount` to keep the firmware allocator
+  fallback distinct from the converter-side no-patch planner constants.
 - `blaiMemAllocSinglePatchShape` owns `out_w * out_h * align4(out_c)`, aligned
   output-channel diagnostics, and the optional mid-output source calculation.
-- `psramPatchCount` is fixed to one.
+- `psramPatchCount` is fixed to one through
+  `BlaiMemAllocSinglePatchPsramPatchCount`.
+- `blaiMemAllocSinglePatchMidPlan` owns the optional mid-output source and
+  count formula before shape projection. Normal one-patch fallback mid-output
+  uses `w * h * c`; softmax uses `w * h * out_c`; disabled mid-output or a zero
+  `PSRAM_patch_size` leaves the source as `blaiMemAllocSinglePatchMidNone`.
 - `psramMidPatchCount` is zero unless `mid_out == 1`; when active it is
   `ceil(w * h * c / psramPatchSize)`, except softmax uses `out_c` instead of
   `c`.
@@ -3196,8 +4983,14 @@ The small-layer one-patch fallback stores from `BLAI_MEM_alloc` are exposed as
   split used the normal `w * h * c` source or the softmax `w * h * out_c`
   source.
 - `BlaiMemAllocSinglePatchApplyPlan` owns the checked int32 ABI projection for
-  those stores, and `blaiApplySinglePatchMemAlloc` writes the typed values into
-  the exact `PSRAM_ctrl` fields used by the SDK fallback path.
+  those stores. `BlaiMemAllocSinglePatchState` now projects those values into
+  caller-owned state, and `blaiApplySinglePatchMemAlloc` writes the exact
+  `PSRAM_ctrl` fields used by the SDK fallback path from that state. The fixed
+  first `wei_patch_out_c[]` slot is also addressed through
+  `blaiWeightPatchCursor`, matching the high-weight and PSRAM patch branches.
+  `blaiApplySinglePatchMemAllocScalarState` owns the scalar fallback metadata
+  projection for `wei_patch_num`, first `wei_patch_out_c`, `PSRAM_patch_size`,
+  `PSRAM_patch_num`, and `PSRAM_mid_patch_num`.
 
 The recovered branch selection is now represented by `BlaiMemAllocPlan`:
 
@@ -3206,8 +4999,14 @@ The recovered branch selection is now represented by `BlaiMemAllocPlan`:
   one-patch fallback. The `Into` form now composes only caller-owned allocator
   subplans, keeping allocator-backed encoding on caller-owned plan storage.
 - `BlaiMemAllocControlApplyPlan` owns the checked composed `PSRAM_ctrl`
-  projection for the selected allocator branch, and `blaiApplyMemAllocPlan`
-  applies only that pre-validated store plan without offset arithmetic.
+  projection for the selected allocator branch.
+  `BlaiMemAllocControlApplyEvidence` owns the branch-specific sub-apply
+  validation before the public control apply plan copies it into its result.
+  `BlaiMemAllocControlState` then carries the selected branch's caller-owned
+  typed state, and `blaiApplyMemAllocPlan` applies only that pre-validated
+  state without offset arithmetic. `blaiApplyMemAllocControlBranchState`
+  exposes the selected allocator branch through the same typed state for
+  callers that only need the branch decision.
 - `blaiEncodeCpuLayerWithAllocatorInto` and `blaiEncodeCpuLayerWithAllocator`
   wire that bounded planner into the
   recovered `BLAI_encode` wrapper while preserving explicit allocator-gate
@@ -3230,6 +5029,20 @@ diagnostics in `BlaiFetchMemoryPlan`: `patchBudget`, `totalInputPatches`,
 from the route descriptor-loop count and `PSRAM_patch_num`. Both paths expose
 the recovered bounded `BlaiFetchPatchGrowTries` (five attempts) behavior before
 the descriptor bundle is emitted or caller-visible state is committed.
+`BlaiFetchPatchGrowDecision` owns each loop iteration's recovered fit test,
+diagnostic attempt count, and patch-size doubling step, including a checked
+overflow guard before producing the next patch size.
+`BlaiFetchPatchGrowEvidence` owns one complete grow attempt: per-input patch
+counts, total input patch cursor, recovered budget selection, and the grow
+decision before `blaiPlanFetchMemoryInto` copies that evidence into the public
+fetch memory plan.
+`BlaiFetchInputSlotsPlan` owns the post-growth input-slot walk: each bounded
+`input_patch_num[]` entry becomes an `SRAM_in[]` slot through the named fetch
+input storage cursor, and the final cursor feeds the recovered mid/output/DRAM
+slot planner. The route input patch-total pass uses the same cursor family.
+`BlaiFetchSlotLayoutEvidence` owns that post-growth input-slot and
+mid/output/DRAM slot composition before the public fetch memory plan copies the
+final SRAM layout.
 
 ## Open Recovery Items
 
@@ -3239,6 +5052,11 @@ the descriptor bundle is emitted or caller-visible state is committed.
 - Use a known SDK sample or generated tiny model as a live output-equivalence
   reference, then feed the configured run result through the shared output
   validation gate.
+- Run `d0_npu_start_probe` after the UART anchor probe to distinguish an
+  M0-route/local-interrupt blocker from D0/APU-side launch behavior. This probe
+  uses the same typed launch APIs and recovered two-record BLAI stream as the
+  active M0 fixture, but reports D0-side configuration, start, command-counter,
+  bus-decode, busy, and interrupt diagnostics through XRAM.
 - Keep the legacy dimension-based convolution facade fail-closed until encoded
   instruction-stream generation for those arguments is validated model by
   model.
@@ -3261,6 +5079,45 @@ After the anchor is live, flash focused NPU smoke builds with:
   --jtag-memory-log --uart "$UART_PORT" --uart-baud "${UART_BAUD:-230400}"
 ```
 
+Current hardware note: `/dev/cu.usbserial-TGKWL2RS` is still the UART used by
+successful RAM-anchor validation, while `/dev/cu.usbserial-21340` returned only
+`0xff` bytes during the existing-anchor probe. A persistent-anchor install
+attempt on `TGKWL2RS` wrote JEDEC `0x1860EF` flash segments, but the reset
+capture timed out waiting for `BL808-UART-FLASH-ANCHOR v1`; JTAG then showed
+the persistent image at `pc=0x60000000` with `mcause=0x30000002`. Existing-anchor
+flashing therefore remains unavailable until that persistent-anchor boot issue
+is resolved. The RAM-loaded UART anchor path still reports the banner and JEDEC
+ID and remains the current hardware validation path.
+
+Follow-up anchor recovery on 2026-06-19 fixed one concrete Nim-anchor protocol
+gap: `examples/m0_uart_flash_anchor.nim` now implements command 4 (`REBOOT`)
+with the same `GLB_SWRST_CFG2` bit-5 reset sequence used by the working C RAM
+anchor. The RAM and Nim anchor reboot paths now clean/invalidate D-cache,
+invalidate I-cache, and issue `fence.i` through raw T-Head/RISC-V instruction
+encodings so the existing `rv32imafc` build flags still assemble. The FW wrapper
+builder also now rewrites the BL808 bootinfo `img_len_cnt`, SHA-256 image hash,
+and bootheader CRC instead of leaving stale template metadata.
+
+Those fixes improved the wrapper correctness but did not make the persistent
+anchor boot. Hardware flashing via the RAM anchor still accepts JEDEC `0x1860EF`
+writes and the reboot command, and the generated FW wrapper now verifies
+internally (`img_len=0x1AA0`, hash matches the padded payload, CRC matches the
+header). The post-reset persistent anchor still times out and does not answer an
+existing-anchor ping on `/dev/cu.usbserial-TGKWL2RS`; `/dev/cu.usbserial-21340`
+still only returns `0xff` bytes. JTAG capture after the corrected image shows
+`pc=mepc=0x60000000`, `mcause=0x30000002`, `mtval=0`, and an empty
+`bl808_trap_frame`, so the failure is currently before the Nim anchor entry
+point rather than inside the recovered Nim trap handler. Persistent
+existing-anchor flashing therefore remains unresolved.
+
+Live anchor check on 2026-06-19 found two serial devices:
+`/dev/cu.usbserial-TGKWL2RS` is the Silicon Labs CP2102 UART and
+`/dev/cu.usbserial-1340` is the FTDI/JTAG adapter's serial interface. Existing
+anchor probes on both ports timed out without a response. A JTAG-loaded anchor
+probe against `/dev/cu.usbserial-TGKWL2RS` then failed before UART traffic with
+OpenOCD `JTAG scan chain interrogation failed: all ones`, so no model firmware
+was flashed and no live MNIST/NPU run was attempted in that state.
+
 The M0 NPU smoke now also runs parsed-layer CPU oracles on-device: full
 parsed-layer fixed/TFLite conv fixtures plus tiny low-footprint parsed
 single-layer fixed-point conv+maxpool and TFLite conv+avgpool fixtures. These
@@ -3274,6 +5131,562 @@ from the recovered layer implementation that rejected execution.
 Weight and bias stream cursor advancement is checked as separate on-device
 markers using `blaiCompareCpuStreamCursor`, so stream regressions are separated
 from layer math failures.
+The D0 NPU start probe is a separate two-image validation step
+(`examples/m0_d0_npu_start_probe.nim` plus `examples/d0_npu_start_probe.nim`).
+It does not claim model output correctness; it proves that the D0 payload can
+configure the typed BLAI launch registers, issue the recovered start path, and
+return decoded command/bus diagnostics over XRAM. Busy, interrupt, and command
+activity are reported as optional diagnostics until a live output-equivalence
+model completes.
+The first live D0 run reports status `0x800001CF`: started, buffers-ready,
+configured, start-attempted, command-status sampled, bus-decode clean, done, and
+command activity observed. The decoded command counters moved (`read=3`,
+`write=4`) with no MM/MCU bus decode error, but the probe still did not observe
+BLAI busy or a completion interrupt, so OCR/MNIST-style output equivalence
+remains unvalidated.
+The follow-up probe models the DATA area as a typed two-slot object instead of a
+flat byte array, initializes the primary output slot with a sentinel, invalidates
+that typed DATA object after the wait, and requires the output-moved status bit
+before the hardware validation entry can pass. This proves D0-side DATA writes
+are observable without reclassifying the fixture as a validated ML model. The
+current typed-slot live runs report input `0x07`, output sentinel `0xA5`,
+observed output bytes including `0x40` and `0x48`, and moved flag `1`.
+That is live output-movement evidence for the typed D0 NPU start path, not
+yet a CPU-oracle-backed model-output validation. `NpuD0ProbeStatusEvidence`
+now consumes the M0-observed D0 status word plus
+`NpuD0ProbeOutputMovementEvidence` so the helper reports typed pass markers for
+status completion, output movement, model-output-still-unvalidated, and movement
+without an oracle through dedicated `StatusTyped*` bits instead of relying on
+the high diagnostic words that overlap less stable shared-memory space during
+larger M0 helper builds. A live run reported `d0_npu_status=0x80003FCF`, which
+contains the base done/required bits and the typed evidence bits; the M0 helper
+therefore treats the status word, not diagnostic slots, as the authoritative
+D0 probe result.
+The next route-recovery slice keeps the M0 alias conflict intact but lets the
+same typed interrupt-binding plan become active on D0, where SDK `CNN_IRQn`
+matches the D0 APU line. The D0 probe now applies the recovered
+register-handler, clear-pending, priority, and enable sequence through
+`npuApplyInterruptBindingOperationPlan`, records binding-ready/applied bits, and
+captures whether the D0 IRQ handler observed the BLAI pending bit. This is route
+validation evidence for the SDK/D0 side of the completion path; M0 still must
+preserve polling until the MM aggregate subroute is recovered.
+The first live run after this change reported `d0_npu_status=0x8000FFCF` and
+printed `[PASS] D0 NPU IRQ binding ready` plus `[PASS] D0 NPU IRQ binding
+applied`, proving the typed route controls were executed through HAL APIs on D0.
+It still printed `D0 NPU IRQ handler not observed` and `pending bit not
+observed`, so the remaining blocker is not the D0 binding sequence itself; it is
+the missing BLAI completion/pending edge after the recovered start/configuration
+surface.
+The next probe revision converts the synthetic D0 instruction window from raw
+`uint32` words into a typed `array[2, BlaiInstruction]` with explicit
+little-endian bytes, then decodes the terminal instruction through
+`npuD0ProbeInstructionStreamEvidence`. `NpuD0ProbeCompletionEdgeEvidence`
+combines that terminal-control decode, DATA movement evidence, the recovered
+completion wait result, and the D0 IRQ-handler observation bits. A live run
+reported `d0_npu_status=0x801CFFCF` and printed `[PASS] D0 NPU typed probe
+stream decoded`, `[PASS] D0 NPU probe terminal end bit decoded`, and `[PASS] D0
+NPU output moved without completion edge`. This proves that the current
+synthetic stream has a typed terminal end bit and can move DATA, while the BLAI
+completion/pending edge still does not fire. The next recovery target is
+therefore the precise generated-model terminal/control sequence or completion
+enable condition, not UART/JTAG transport, D0 IRQ binding, or register-start
+plumbing.
+`BlaiMnistTfliteD0SyntheticContrastEvidence` now makes that boundary explicit
+in code: the D0 synthetic path is accepted only as DATA-movement evidence
+without completion, while the MNIST/generated-model path remains ordered behind
+completion-route recovery before primary-output readback and raw-vector compare.
+It carries the nested MNIST active-output and live-route first-block reasons
+plus the selected next action, preventing the live D0 probe from being mistaken
+for a real-model validation and keeping the next concrete work item focused on
+the generated-model completion route/engine-consumption condition.
+`BlaiForwardD0TerminalControlContrastEvidence` then compares the active
+generated one-layer terminal-control evidence with the D0 synthetic stream
+evidence. Both paths use the same split terminal pattern: descriptor-halt bit
+124 clear and stream-end bit 127 set. Because the D0 path moves DATA under that
+same terminal-control pattern while still missing completion, bit 124/127
+selection is no longer a sufficient explanation for the generated-model output
+blocker by itself. The remaining frontier is the surrounding launch/engine
+consumption context: core path, operand buffers, weight/bias contents, and any
+completion-enable condition not represented by the terminal bits alone.
+`BlaiForwardD0EngineContextGapEvidence` now ties that conclusion to the active
+launch surfaces: the active generated stream has coherent instruction fetch,
+coherent DATA/weight/bias operand fetch, and an idle/no-command wait terminal,
+while D0 moves DATA without completion under the same terminal-control pattern.
+This keeps the next recovery target out of generic "start failed" territory and
+inside operand/engine semantics: which buffer contents, slot interpretation,
+core path, or completion-enable condition makes the generated one-layer context
+idle while the synthetic D0 context writes DATA.
+`NpuD0ProbeInstructionStreamEvidence` also records the D0 stream's typed
+little-endian word view, and `BlaiForwardD0BufferContextContrastEvidence`
+compares that against the active raw-word evidence. The active and D0 paths have
+the same two instruction records and the same staged input byte, and both use a
+zero first bias, but the first weight byte differs (`0x02` in the active
+fixture versus `0x04` from the D0 synthetic `0x01020304` word). The remaining
+frontier is therefore not instruction materialization; it is the
+weight/DATA/engine semantic difference that makes one context write the output
+slot while the other reaches an idle, no-command, no-output terminal.
+`NpuD0WeightByteExperimentEvidence` and the D0 probe now add a second launch
+that keeps the same typed instruction stream and input byte but changes only
+the first weight byte to the active generated path's `0x02`. The live marker
+`[PASS] D0 NPU active-weight experiment classified` means that rerun reached a
+coherent input/command/bus classification; the following moved/gated log line
+then decides whether the first weight byte alone explains D0 DATA movement or
+whether the active M0 blocker must be elsewhere in core/runtime semantics.
+The live D0 run reported `[PASS] D0 NPU active-weight experiment moved DATA`,
+so the active path's `0x02` first weight byte is not sufficient by itself to
+explain the generated M0 path's no-output terminal. This remains a
+hardware-recovery experiment, not a real model-output correctness proof.
+`NpuM0D0SyntheticRouteContrastEvidence` and `m0_npu_start_probe` now run the
+same typed synthetic instruction stream directly from M0 with the active
+`0x02` first weight byte. D0 has already proven that exact stream/weight
+context can move DATA, so the M0 result separates a core/route-access issue
+from a generated-model materialization/runtime-context issue. A moved M0 result
+would shift the next recovery target to the materialized generated context; a
+gated M0 result would point below the generated model and toward M0 access,
+interrupt/start routing, or a core-specific NPU launch precondition.
+The live `m0_npu_start_probe` result was gated: output stayed at the sentinel
+`0xA5`, the poll budget was consumed, command counters decoded as read `3` and
+write `4`, and bus decode stayed clean. This means D0 can move DATA with the
+active weight byte while M0 cannot move DATA with the same typed synthetic
+stream, so the next recovery target is core/route/start semantics rather than
+the first weight byte or generated instruction materialization alone.
+The linked-image evidence sharpened that split: D0's moving probe buffers are
+in direct MM DRAM (`0x3EF85840` and nearby), while the first M0 synthetic probe
+passed cached OCRAM aliases (`0x62020020` and nearby). The next M0 probe now
+uses `blaiProjectHardwareAddress` for the same typed buffers and records
+`NpuM0SyntheticAddressAliasContrastEvidence`, separating a CPU-alias DMA
+address bug from a deeper M0 core/route/start blocker.
+The live projected-address run also stayed gated: the NPU registers held
+uncached OCRAM addresses (`0x22020030`, `0x22020020`, `0x220227E0`,
+`0x22020060`), output remained `0xA5`, command counters again decoded as read
+`3` and write `4`, and bus decode stayed clean. Cached CPU aliases are
+therefore not the blocker by themselves. The next split should test whether
+M0-launched BLAI can fetch from MM DRAM like the D0 probe, or whether a D0-only
+start/route precondition is still missing.
+`NpuM0SyntheticDramContrastEvidence` and the M0 start probe now perform that
+split with a typed `NpuProbeDramSlots` overlay in MM DRAM. The overlay contains
+the same two `BlaiInstruction` records, the active `0x02` first weight byte,
+zero bias, and input/output DATA slots. The only unsafe operation is the fixed
+DRAM overlay cast; the launch itself uses field addresses from the typed object
+and the normal NPU register helpers.
+Live DRAM-buffer behavior is now classified as a completion-surface signal
+rather than a stable DATA-movement result. One run with instruction
+`0x3EF87010`, weight `0x3EF87000`, bias `0x3EF87038`, and DATA `0x3EF87030`
+changed the output from sentinel `0xA5` to `0x3A`, but later runs with the same
+typed MM-DRAM overlay kept the output at `0xA5`. In both branches the poll
+budget was consumed, local `BLAI_INT_CFG[9]` stayed clear, command counters
+decoded as read `3` and write `4`, AXI write/read idle bits were set at wait
+exit, busy decoded false, and bus decode stayed clean. The current invariant is
+therefore "idle/no-interrupt after a coherent launch"; the remaining frontier is
+the completion/IRQ route plus output-equivalence/readback, not a guaranteed M0
+synthetic DATA write.
+`NpuM0InterruptBoundDramContrastEvidence` now adds one deliberately forced M0
+experiment for that frontier. The normal recovered policy still preserves M0
+polling because the CNN/APU line aliases an M0 peripheral interrupt route, but
+the probe can force a typed `NpuInterruptBindingOperationPlan` through the HAL
+IRQ API before rerunning the same MM-DRAM synthetic stream. If this forced run
+moves DATA, the missing precondition is likely interrupt-route/control binding;
+if it remains gated, the blocker is still deeper in M0 start routing or another
+vendor runtime operation. This is only recovery evidence and must not be treated
+as the default runtime policy until the aliasing and ownership are resolved.
+The live forced-binding run did not prove an interrupt-binding precondition.
+Forced binding can be applied through the typed HAL plan, but the wait still
+exhausts with no local interrupt and the probe IRQ counter stays `0`; depending
+on the baseline branch, DATA may already have moved or may remain gated. That
+makes interrupt binding alone insufficient for completion. The next recovery
+step should look for the BLAI completion/IRQ route or a missing vendor-side
+acknowledge/status operation before model output readback.
+The SDK interrupt wrapper semantics are now separated from that forced apply
+plan. `blai_npu_initCfg` performs three interrupt-controller calls: register
+the `CNN_IRQn` handler, call `System_NVIC_SetPriority(CNN_IRQn, 7, 1)`, and
+enable the IRQ. The BL808 RISC-V startup wrappers guard handler registration
+and enable/clear operations with `irq < IRQn_LAST`; `CPU_Interrupt_Enable`
+raises a zero priority to `1` before enabling, while
+`System_NVIC_SetPriority` applies only the preempt priority to `csi_vic` and
+ignores the subpriority argument. `CPU_Interrupt_Pending_Clear` is recovered as
+a separate API, not part of `blai_npu_initCfg`; the current typed HAL apply
+preflight may still clear pending as a conservative local binding step, but
+that is intentionally distinct from the exact SDK init sequence captured by
+`NpuSdkInterruptApiEvidence`.
+One concrete D0-side setup candidate is now tracked explicitly. Sipeed's
+`m1s_boot_d0/src/l2_sram.c` calls `l2_sram_vram_config()` before releasing the
+C906 and writes `MM_MISC_VRAM_CTRL` fields for L2, PFH, APU, and DSP2 SRAM
+routing, with `APU_SRAM_REL` programmed as `0` for
+`MMSYS_REL_VRAM_0_APU_128`. The local NPU init path had only modeled the same
+bit 7 as `BLAI_SRAM_REL` and sets it during `npuReleaseSram`. The new
+`NpuD0BootVramRouteEvidence` keeps both names visible, decodes the full
+SDK-boot route from the typed `MM_MISC_VRAM_CTRL` overlay, and logs the live M0
+probe readback before launch. The first live readback after local `npuInit` was
+`0x0000D7D6`, decoding as L2 `1`, PFH `3`, APU `1`, and DSP2 `1`, which differs
+from the Sipeed D0 boot route. `NpuD0BootVramRoutePlan` now composes the
+matching two-write route/latch update without manual offset arithmetic, and
+`m0_npu_start_probe` reruns the MM-DRAM synthetic stream after applying that
+route. A moved result would identify the D0 boot VRAM route as the missing
+precondition; a gated result would rule out this concrete D0 setup difference.
+The first controlled run did not reach a valid NPU launch after that route
+change: the applied route read back as all zeros for L2/PFH/APU/DSP2, matching
+the D0 boot helper, and the NPU layer-config registers still retained the
+expected DRAM instruction/weight/bias/DATA addresses. The typed DRAM staging
+check failed, however (`m0_probe_d0_route_ready=0`), so the probe records this
+as `M0 NPU D0 boot VRAM route DRAM configuration blocked` instead of treating
+it as a DATA-movement trial. This proves that blindly applying the D0 boot SRAM
+route inside the M0 NPU runtime is not a safe final policy; the next step is to
+recover the surrounding D0 boot ownership/clock/reset ordering that makes that
+route usable before C906 launch.
+The surrounding ordering now has a second typed readback: Sipeed
+`m1s_boot_d0/src/boot_cpu0.c` calls `mm_clk_config()` before
+`l2_sram_vram_config()`, and that function writes the `MM_GLB_MM_CLK_CTRL_CPU`
+fields for XCLK, BCLK1X, CPU root, CPU PLL mux, UART, and I2C. The recovered
+targets are XCLK=XTAL, BCLK1X=MUXPLL_160M, CPU root=PLL, CPU=MUXPLL_400M,
+UART=XCLK, and I2C=XCLK. `NpuD0BootClockControlEvidence` decodes those fields
+from the typed `MM_GLB+0x00` overlay and the M0 start probe now logs the live
+clock-control word before launch. `NpuD0BootClockControlPlan` then composes the
+same read-modify-write candidate as the SDK helper while preserving unrelated
+bits. The latest live readback (`0x45104D0F`) already matched the XCLK, BCLK1X,
+and CPU-root fields, but did not match CPU=MUXPLL_400M, UART=XCLK, or I2C=XCLK;
+the probe now logs the planned target word and whether that mismatch is still a
+candidate precondition. A controlled live apply then wrote `0x45104E6F` and
+read back CPU=MUXPLL_400M, UART=XCLK, and I2C=XCLK, matching the recovered D0
+boot clock-control fields. That did not create a new DATA-movement edge because
+the MM-DRAM synthetic stream had already started moving DATA on M0
+(`m0_probe_dram_output=0x3A`), and the clock experiment records this as
+`M0 NPU D0 boot clock DRAM baseline already moved DATA`. The remaining blocker
+is therefore no longer basic DRAM DATA movement; it is the completion/IRQ edge
+and final output-equivalence path. The same live run still exhausted the polling
+budget (`0x000186A0`) and observed no forced IRQ (`m0_probe_forced_irq_count=0`).
+Applying the D0 boot VRAM route still read back the all-zero route but made the
+DRAM readiness gate false, so VRAM route application remains an unsafe final
+policy for the M0 runtime.
+`BlaiForwardCompletionEdgeRecoveryFrontierEvidence` now composes the active/D0
+terminal-control contrast, engine-context gap, buffer-context contrast, D0
+active-weight experiment, M0 route/address/DRAM contrasts, forced M0 binding,
+D0 boot VRAM routing, D0 boot clock control, and active output-readiness gate
+into one typed frontier. The checked summary records that terminal-control bits,
+instruction materialization, first weight byte, cached CPU aliases, forced M0
+interrupt binding, D0 boot VRAM routing, and D0 boot clock control are not
+sufficient explanations by themselves. It keeps the remaining target focused on
+core/start-route or completion-enable semantics, and keeps output validation
+blocked until the completion edge is recovered.
+The SDK-generated `blai_model_bin[]` front directory is now parsed through a
+typed Nim view (`BlaiGeneratedModelDirectory` and
+`BlaiGeneratedModelDirectoryEntry`). The parser decodes the recovered
+little-endian directory words from byte-indexed buffers through
+`BlaiGeneratedModelDirectoryWordCursor`, and
+`BlaiGeneratedModelDirectoryEntryBlock` records whether entry recovery first
+failed at the entry range, a specific directory word, inactivity, alignment, or
+blob bounds. `BlaiGeneratedModelDirectoryBlock` then records whether aggregate
+directory recovery first failed at the selected CPU entry or the first payload
+boundary. The directory parser distinguishes the additional generated prefix
+directory used by bundled `npu_api` fixtures, and separates directory-shape
+detection from full-blob bounds validation. This is the next model-blob recovery
+step needed before a bundled real model can be
+materialized and launched without the model-runner blob. `tools/gen_array.py`
+shows that the front matter is a size table, not absolute section boundaries:
+three CPU/DSP file sizes plus a zero word, then three NPU file sizes plus a zero
+word, followed by CPU instruction, CPU bias, CPU weight, NPU instruction, NPU
+bias, and NPU weight payloads in that order. `BlaiGeneratedModelSectionWindow`
+and `BlaiGeneratedModelSectionPlan` now derive checked windows from that table,
+including explicit `cpuInstructionWindow`, `npuInstructionWindow`,
+`npuBiasWindow`, and `npuWeightWindow` fields. `BlaiGeneratedModelSectionWindowBlock`
+keeps inactive, ordering, uint32 range-fit, and blob-bound failures distinct
+before any section is copied; the size-table helper now preserves attempted
+offset/byte counts when a recovered section size would overflow the uint32 byte
+cursor. The plan also keeps per-section
+fit booleans plus `BlaiGeneratedModelSectionPlanBlock`, and now carries the
+nested directory/window first-block reasons that caused that broad plan failure.
+Malformed generated packages therefore report whether recovery first failed at
+the directory, header, or a specific CPU/NPU payload window, plus the lower-level
+reason. The legacy `cpuRecordWindow`
+aliases the CPU/DSP instruction window so the existing pure Nim CPU parser
+receives the correct generated stream. `BlaiGeneratedNpuPayloadSections` and
+`blaiCopyGeneratedNpuPayloadsInto` now project and copy the generated hardware
+instruction, bias, and weight payloads as one checked aggregate, with separate
+caller-owned buffers and explicit short-buffer failure reporting. The projection
+keeps per-section fit flags, aggregate byte-count fit, payload-presence evidence,
+and `BlaiGeneratedNpuPayloadSectionsBlock`, so staging can report whether it
+first failed at the section plan, instruction, bias, weight, total byte count,
+or empty payload before any copy is attempted. `BlaiGeneratedNpuPayloadCopyBlock`
+records whether staging first failed at the section projection, instruction
+copy, bias copy, or weight copy, while the nested section-copy results still
+preserve source/destination fit evidence and section-window first-block reasons.
+The aggregate payload copy also carries the first nested section-copy block and
+window block for the failed instruction/bias/weight copy.
+`BlaiGeneratedNpuPayloadAddressPlan` then bridges a successful generated payload
+copy to `NpuInstructionStreamRegisterPlan`, checking that each non-empty staged
+section has a non-zero hardware-visible address and preserving the BLAI register
+order (`inst`, `weight`, `bias`) even though generated payload staging is
+presented as instruction, bias, then weight. `BlaiGeneratedNpuStagedPayloadResult`
+and `blaiStageGeneratedNpuPayloadsInto` combine those two steps: copy generated
+hardware payloads into caller-owned buffers, bind their hardware-visible
+addresses, and return the exact register plan only when the staged model is
+ready to configure. `BlaiGeneratedNpuPayloadAddressBlock` makes that address
+gate explicit: invalid payload copies, missing instruction/bias/weight
+addresses, and a missing instruction-stream address are reported as named block
+reasons before any register-write helper can run. `BlaiGeneratedNpuStagedPayloadResult`
+now adds its own first-block reason plus the nested payload-copy and address-plan
+blocks, separating copy failures from hardware-visible address binding failures.
+`BlaiGeneratedNpuPreparedPayloadResult` and
+`blaiPrepareGeneratedNpuPayloadsInto` add the pure one-call preparation
+boundary for generated blobs: recover the section plan, stage the NPU payloads,
+bind hardware-visible addresses, and report configure readiness without writing
+NPU registers or the SDK-compatible configured-state flag. The prepared result
+keeps the package first-block, staged first-block, payload-copy block, and
+address block so callers can distinguish bad generated headers from staging
+failures without inspecting raw offsets or buffer lengths.
+`BlaiGeneratedNpuConfigurePlan` and `blaiGeneratedNpuConfigurePlanInto` then
+derive the exact stream register plan and configured-state evidence that would
+be applied, still without mutating hardware. `BlaiGeneratedNpuConfigureBlock`
+keeps not-ready prepared payloads, configured-state projection failures, and
+success distinct for both the pure plan and the guarded register-apply path.
+`BlaiGeneratedNpuConfigureResult` and
+`blaiConfigureStagedGeneratedNpuPayloadInto` add the guarded register-apply
+boundary: invalid staged payloads do not touch hardware, while valid payloads
+flow through the existing typed `npuApplyInstructionStreamRegisterPlan` path.
+`BlaiGeneratedNpuRunPlan` and `blaiGeneratedNpuRunPlanInto` then derive the
+existing `NpuLayerRunPlan` from that guarded configuration result, so run
+readiness is based on typed configuration evidence rather than a raw global flag.
+`BlaiGeneratedNpuRunPreflightPlan` and
+`blaiGeneratedNpuRunPreflightPlanInto` provide the non-mutating counterpart:
+they derive the same layer-run block reason and wait policy from the pure
+configure plan, reporting whether a later guarded configure would make the
+stream runnable without claiming that registers have already been applied. Both
+generated run plans now carry the configure first-block reason alongside the
+legacy layer-run guard, keeping missing payload/address prerequisites distinct
+from the final instruction-stream runnable check.
+`BlaiGeneratedNpuPipelinePreflightResult` and
+`blaiGeneratedNpuPipelinePreflightInto` compose the full pure generated-blob
+preflight in one caller-facing step: section recovery, payload staging,
+configure evidence, and run readiness. `BlaiGeneratedNpuPipelineBlock` records
+which of those gates failed first, including a distinct package-preflight block
+for bad generated headers or load plans before payload staging is attempted,
+payload-stage blocks for short caller-owned instruction/bias/weight buffers,
+while preserving the nested address-plan and legacy layer-run block reasons for
+more detailed diagnostics. The pipeline result now also carries the
+prepared-package, package-preflight,
+staged-payload, payload-copy, and configure first-block reasons directly, so
+callers can diagnose bad generated headers, short staging buffers, missing
+hardware-visible addresses, configure readiness failures, and run-guard failures
+without unpacking raw nested structures. Zero-sized generated bias/weight
+sections are explicitly treated as present and staged, so instruction-only
+fixtures still report `NoBlock` through preparation, staging, configure, and run
+preflight. This is the
+boundary a real generated MNIST/OCR blob should pass before any
+UART-anchor-flashed firmware attempts the hardware configure/run path.
+The SDK cache also provides real generated `blai_model_bin[]` headers under
+`components/stage/dsp2_cli_demo/include/models`. `tools/inspect_blai_header.py`
+now parses those C byte arrays without compiling C and mirrors the recovered
+size-table layout. The smallest cached generated header, `meetkai_asr.h`,
+contains a 26,304-byte `blai_model_bin[]` with a 32-byte two-row size table,
+18,176 bytes of CPU/DSP instructions, 8,096 bytes of NPU instructions, and zero
+generated bias/weight bytes. That instruction-only shape exposed and fixed the
+zero-section copy boundary in `blaiCopyGeneratedModelSectionInto`, so empty
+generated bias/weight sections are treated as successfully staged when their
+checked zero-length windows are ordered and within the blob.
+`tools/ref/npu_recovery_manifest.json` now pins the same `meetkai_asr.h` byte
+counts, section windows, and SHA-256 as a generated-header oracle; the inspector
+test compares the live parser result to that manifest entry when the cached SDK
+header is present.
+The same inspector can now emit the parsed C byte array as a Nim `const` via
+`--emit-nim-const`, giving generated fixtures a reproducible path from SDK
+`blai_model_bin[]` headers to pure Nim byte arrays without hand-transcribing the
+model blob.
+The M0 model smoke can consume that generated include through the opt-in
+`blaiMeetkaiAsrFixture` define:
+
+```sh
+mkdir -p build/generated-fixtures
+python3 tools/inspect_blai_header.py \
+  build/vendor-cache/M1s_BL808_SDK/components/stage/dsp2_cli_demo/include/models/meetkai_asr.h \
+  --emit-nim-const MeetkaiAsrNpuInstructionPayload \
+  --emit-nim-section npu_instruction \
+  > build/generated-fixtures/meetkai_asr_npu_instruction_payload.nim
+nim check -d:bl808kernel -d:bl808m0 -d:blaiMeetkaiAsrFixture \
+  --nimcache:build/nimcache_check_npu_model_smoke_meetkai \
+  examples/m0_npu_model_smoke_test.nim
+```
+
+That optional smoke path validates the real 8,096-byte generated NPU instruction
+payload as a staged payload descriptor, verifies the zero-byte generated
+bias/weight sections remain accepted, and proves the pure configure/run
+preflight is ready without making the normal smoke build depend on the local SDK
+cache.
+On hardware, the anchor must still be probed before every flash. Recent probes
+on `/dev/cu.usbserial-TGKWL2RS` timed out, so the validation runs used
+`--uart-anchor-flash` and reported JEDEC `0x1860EF` before loading the active
+firmware. The fixture-enabled model smoke validates the real 8,096-byte
+generated NPU instruction payload as staged payload evidence, register-address
+preflight, first byte, and timeout. This is still generated-payload preflight,
+not a known-answer OCR/MNIST output-equivalence run.
+
+After the MNIST sample oracle was added, the normal `m0_npu_model_smoke_test`
+was run on hardware with
+`--uart-anchor-flash --uart-anchor-runtime-jtag --jtag-memory-log` and passed in
+114.5 seconds. That pass proves the MNIST TFLite host oracle, generated package
+contract, configured-live launch/register/cache evidence, active completion
+route diagnostics, and the recovered MM aggregate SDK-helper markers all execute
+on device. It does **not** prove successful NPU inference: the UART/JTAG logs
+still record timeout/no-completion evidence, no raw or unmasked MM aggregate
+completion pending bit (`status0/status1/mask0/mask1 == 0` at wait exit), a
+deferred route target, blocked primary-output readback, and output-equivalence
+frontier markers. The legitimate small-model run remains pending until the
+completion route is recovered and the live raw output can be compared against
+`[237, 7, 255, 252, 238, 215, 206, 43, 234, 252]`.
+`BlaiGeneratedNpuRunResult` and `blaiRunGeneratedNpuPlanInto` add the execution
+boundary for that plan: blocked generated runs return `npuUnsupported` with the
+same first-block reason as the underlying layer runner, while runnable plans
+delegate to the recovered completion-wait path.
+`blaiGeneratedModelSectionByte` and `blaiCopyGeneratedModelSectionInto` provide
+the first bounded extraction boundary for those windows, so generated model
+bytes can be moved into caller-owned buffers without raw offset arithmetic.
+`BlaiGeneratedModelSectionCopyBlock` keeps invalid-section, source-window,
+destination-window, and cursor failures distinct while retaining the detailed
+source/destination fit booleans and the source section-window first-block.
+`BlaiGeneratedModelSectionCopyByteCursor` now owns the per-byte copy position
+and first/last-byte evidence reads, keeping the section copier on checked typed
+cursor state instead of direct source/destination indexes.
+`BlaiGeneratedModelFixtureByteCursor` and
+`blaiStoreGeneratedModelFixtureByte` apply the same rule to generated-model
+oracle construction: fixture payload bytes are written by checked section
+offset plus relative byte position rather than open-coded `base + index`
+array writes.
+`blaiCopyGeneratedCpuRecordStreamInto` then projects the generated CPU-record
+window into typed `BlaiInstruction` rows only when the byte count is aligned and
+the caller-provided stream fits. `BlaiGeneratedCpuRecordStreamCopyBlock` keeps
+invalid section, alignment, stream-capacity, byte-cursor, section-byte, and
+record-cursor failures distinct before parser handoff, while the copy result
+retains the nested generated section-window first-block reason.
+`BlaiGeneratedCpuRecordStreamCursor` owns the
+copied-record row used for first/last record-kind evidence, avoiding direct
+`count - 1` stream indexing in the generated parser boundary.
+`BlaiGeneratedCpuRecordStreamWindow` then carries the non-empty copied-record
+range passed to the CPU/DSP parser, so parse handoff uses a checked generated
+record window rather than a loose `stopIndex` local.
+`blaiParseGeneratedCpuRecordSectionInto` hands that typed stream to the existing
+CPU/DSP instruction parser. `BlaiGeneratedCpuRecordParseBlock` keeps copy,
+record-window, and parser-completion failures distinct after the stream copy
+has succeeded, and the parse result carries both the stream-copy and
+section-window first-block reasons. The current static fixture validates this
+handoff
+with a minimal generated directory plus DSP header, layer-info, general-form,
+and DSP-status records; it is still parser/materialization coverage, not an
+end-to-end validated model result.
+The recovered `tools/gen_array.py` packaging contract is now represented as
+typed Nim as well. `BlaiGeneratedModelHeaderContract` names the fixed
+`blai_model_bin[]` front table as three CPU section sizes, one zero word, three
+NPU section sizes, and one zero word, for a 32-byte header.
+`BlaiGeneratedModelHeaderContractBlock` keeps generated-array kind, CPU/NPU
+section counts, terminator count, size-table word count, header byte count, and
+payload-order failures distinct. The generated-header validator checks that a
+parsed `BlaiGeneratedModelSectionPlan` matches that
+table and preserves the script's payload order: CPU instruction, CPU bias, CPU
+weight, NPU instruction, NPU bias, NPU weight. It now also exposes the decoded
+CPU and NPU terminator words and rejects a generated header unless both are
+zero, so a corrupted second terminator cannot be treated as a valid loadable
+model package. `BlaiGeneratedModelHeaderValidationBlock` keeps plan validity,
+contract validity, header-size, payload-order, section-table, and terminator
+failures distinct. For the fetched MNIST sample,
+`BlaiGeneratedImageSidecarOracle` binds the optional `img_bin[]` emitted by
+`gen_array.py --image` to the recovered BMP metadata and SHA-256 digest
+`8d6369947f5291c9294feb0b59c13550cb914202c1c013360d58134fbf55193e`.
+`BlaiGeneratedImageSidecarOracleBlock` keeps sample readiness, generated-array
+kind, byte count, dimensions, pixel format, pixel offset, pixel sum, and digest
+failures distinct before the image sidecar can feed the generated MNIST package
+contract.
+`BlaiMnistGeneratedPackageContract` composes that header contract, the
+`BLAI.cfg` patch-size evidence, the MNIST TFLite metadata, and the sample
+known-answer output vector. It now carries `modelReady`, `sampleReady`,
+`headerReady`, and `BlaiMnistGeneratedPackageContractBlock`, so package recovery
+reports whether conversion is first blocked by the model metadata, sample
+oracle, model/sample mismatch, converter-output contract, cfg memory contract,
+header contract, image sidecar, or output oracle. The normal M0 model smoke now
+requires pass markers for this generated-package contract, but this still proves
+package readiness only; it is not yet a live generated MNIST/OCR inference
+equivalence run.
+`BlaiGeneratedModelPackagePreflight` now composes the parsed section plan, the
+generated-header validation, and the SDK load-plan projection before any NPU
+payload staging occurs. The raw section parser can still expose a corrupt
+second size-table row for diagnostics, but the blob-to-hardware preparation path
+requires the zero terminators and a valid load plan before copying payload bytes
+or producing register addresses. Its `BlaiGeneratedModelPackagePreflightBlock`
+first-block enum keeps section-plan failures, header-contract failures, and
+load-plan failures distinct, while the preflight result also preserves nested
+section-plan, directory, window, header-validation, and load-plan first-block
+values for direct diagnostics. `BlaiGeneratedNpuPreparedPayloadResult` carries
+that same package first-block reason when preparation stops before staging.
+The SDK `blai_load_model_from_buffer` path is now represented by
+`BlaiGeneratedModelLoadPlan`. It takes the parsed generated-model section
+windows and produces six typed copy decisions for CPU instruction, CPU bias,
+CPU weight, NPU instruction, NPU bias, and NPU weight. The plan also records
+which sections require cache clean before NPU use: only the three NPU sections.
+`BlaiGeneratedModelLoadPlanBlock` now records whether load projection first
+failed at the section plan or at a specific generated CPU/NPU section decision,
+so invalid load packages are not reduced to one aggregate `valid` bit. Each
+load section and the aggregate load plan also preserve the underlying
+`BlaiGeneratedModelSectionWindowBlock`, keeping byte-window failures visible at
+the SDK load-projection boundary.
+The recovered C source guards the CPU-weight allocation with
+`cpu.inst_buf_size > 0`; the Nim plan records that as
+`sdkCpuWeightGuardUsesInstructionSize` while making the robust condition
+`robustCpuWeightGuardUsesWeightSize` explicit. Normal generated blobs have both
+guards active, and the M0 smoke now checks the typed load-plan markers. This
+replaces another pointer-walk in the SDK loader with named section windows and
+checked copy/cache-clean evidence.
+The SDK `blai_getInputBuffer` accessor is now represented by
+`BlaiSdkInputBufferPlan`. The recovered C simply returns `model->buffer`; the
+Nim projection keeps that as a typed caller-owned token plus known DATA-buffer
+capacity, so pure-Nim callers can reject a null buffer or zero-capacity buffer
+without doing pointer arithmetic.
+`BlaiSdkNetInfoPlan` similarly projects `blai_getNetInfo` as a typed model/net
+token pair instead of exposing `model->net` as a raw handle. The unsupported
+`blai_load_model_from_file` API is represented by
+`BlaiSdkLoadModelFromFilePlan`: the SDK always returns
+`BLAI_STATUS_INVALID_INPUT`, so the Nim plan records `blaiSdkInvalidInput` while
+still tracking whether the caller supplied model/name tokens for diagnostics.
+`BlaiSdkCreatePlan` now captures the matching `blai_create` lifecycle boundary.
+The SDK calls `bl_npu_init` only while the global NPU-initialized flag is clear,
+sets that flag before allocation returns, allocates the model and net objects,
+frees the model if net allocation fails, zeroes the net object on success,
+links `net->parent` back to the model, clears `share_buffer`, calls
+`blai_npu_init`, and returns the model handle. The Nim plan represents those
+steps as typed allocation/initialization decisions instead of allocator or
+pointer-side effects.
+`BlaiSdkStartComputePlan` recovers the `blai_startCompute` ABI boundary: a null
+model handle returns `BLAI_STATUS_UNAVAILABLE_DEVICE`, while a present model
+delegates to `blai_inst_inference` and returns that inference status unchanged.
+The pure-Nim plan keeps the delegated status explicit instead of hiding it
+behind an untyped call-through.
+`BlaiSdkFreePlan` now captures the top-level `blai_free` ownership sequence:
+call `blai_inst_release`, free and clear `model->buffer`, free and clear
+`model->net`, free each allocated CPU/NPU instruction, bias, and weight buffer
+from the generated model package, then free the model handle. The plan records
+the SDK's intentional runtime behavior too: `blai_npu_destroy` is not called, so
+the NPU interrupt semaphore/runtime objects are preserved across model frees.
+The SDK `blai_getOutputBuffer` accessor is now represented by
+`BlaiSdkOutputBufferPlan`. The C API returns `model->net->patch_size` through
+the size pointer and computes the returned address as
+`model->buffer + last_layer.out_layer_mem * patch_size`. The Nim plan keeps
+that as typed slot arithmetic: it validates `layer_cnt`, rejects zero patch
+size, projects the signed `out_layer_mem` through `blaiPatchSlotOffset`, and
+checks the final `[offset, offset + patch_size)` range against the caller-owned
+DATA buffer. The normal M0 smoke covers the valid path and the layer-count,
+zero-patch, range, and negative-slot failure gates.
+The adjacent resolution accessors are now value plans too.
+`BlaiSdkInputResolutionPlan` projects `blai_getInputResolution` from `net.w/h`
+and preserves the SDK no-error return while making zero dimensions invalid for
+pure-Nim callers. `BlaiSdkSourceResolutionPlan` projects
+`blai_setSourceResolution` as caller-owned `BlaiSdkSourceResolutionState`
+instead of mutating a raw model pointer; it records the requested width/height,
+the state after the SDK-style assignment, and the same zero-dimension
+diagnostic.
+The callback registration setters are now typed state transitions as well.
+`BlaiSdkCallbackState` is the caller-owned projection of the model callback
+slots, while `BlaiSdkResultCallbackPlan` and
+`BlaiSdkCustomPostprocessCallbackPlan` recover the SDK `blai_setResultCB` and
+`blai_setCustom_Postproc_CB` behavior. The result-callback path records the
+callback token and the SDK no-error return. The custom-postprocess path records
+the callback token and the SDK side effect of setting `custom_postprocess = 1`.
+Zero callback tokens remain invalid for pure-Nim diagnostics, but the recovered
+plans still preserve the SDK's unconditional no-error return shape.
 The smoke checks each intermediate/final oracle tensor through
 `blaiCompareInt8Outputs` or `blaiCompareUint8Outputs`, so a failed run reports
 lengths, compared/trailing element counts, mismatch count, and the first
@@ -3324,6 +5737,59 @@ rejection and TFLite unsupported-layer classification.
 Larger parsed-state model coverage remains in compile-time tests until each
 remaining fixture is split into a small enough focused M0 smoke image.
 
+The active configured-workspace smoke now also checks the recovered
+`BLAI_INT_CFG` known-field map as a typed Nim invariant. The SDK header names
+only START, STOP, RESUME, INT_CLR, INT status, and RELU_N on this register, so
+`BlaiIntCfgKnownMask` and `NpuIntCfgKnownFieldEvidence` reject unknown/reserved
+bits while confirming the command, interrupt, and ReLU fields are idle at
+launch, post-start, and wait-exit. This keeps the live no-completion evidence
+on a typed register decode instead of relying on ad hoc raw-bit inspection.
+
+The E907 SDK `cnn_reg.h` also exposes an alternate `CNN_BL_CNN_CFG` view at the
+same offset as `BALI_GENERAL_CFG`. That view names bits 24, 25, 27, and 31 as
+INT_CLR, INT, BUS_RST, and AXI_IDLE, but the standard NPU header used by the
+SDK HAL names bits 24..29 as the FTABLE data-base field and bit 31 as AXI read
+idle. Nim now decodes this alternate header surface with
+`NpuCnnWrapperCfgDecode` and
+`NpuCnnWrapperCompletionSurfaceEvidence`, but it is deliberately read-only:
+live `generalCfg = 0xC7050001` makes the alternate bit 25 look pending while
+also matching the recovered standard FTABLE data-base reset value of `7`. The
+runtime wait/ack policy therefore remains on `BLAI_INT_CFG[9]` until objdump or
+stronger live evidence proves the alternate wrapper surface is the correct
+completion route.
+
+That first objdump check now exists for the cached SDK HAL accessor itself. A
+minimal recovery-only compile of `bl80x_npu.c` followed by THEAD-aware
+`llvm-objdump -dr` produced:
+
+```text
+NPU_Get_Int:  lui a5,0x30024; lw a0,0x4(a5); andi a0,a0,0x200
+NPU_Clr_Int:  lui a5,0x30024; lw a4,0x4(a5); ori a4,a4,0x100; sw a4,0x4(a5)
+NPU_Start:    lui a5,0x30024; lw a4,0x4(a5); ori a4,a4,0x1;   sw a4,0x4(a5)
+NPU_Resume:   lui a5,0x30024; lw a4,0x4(a5); ori a4,a4,0x4;   sw a4,0x4(a5)
+NPU_Stop:     lui a5,0x30024; lw a4,0x4(a5); ori a4,a4,0x2;   sw a4,0x4(a5)
+```
+
+`NpuHalCompletionObjdumpEvidence` captures those object-level facts in pure
+Nim: base `0x30024000`, offset `0x04`, status mask `0x200`, clear mask
+`0x100`, and the start/stop/resume command bits. This proves the SDK HAL
+completion helpers use the standard `BLAI_INT_CFG` surface and not the
+offset-zero E907 wrapper header view.
+
+The same object also rules out the nearby HAL network-parameter helpers as a
+hidden completion-enable source. `NPU_Set_Relu_Val` reads and writes
+`BLAI_INT_CFG` at offset `0x04`, but only clears/replaces bits 16..20
+(`REG_RELU_N`); it preserves the start, stop, resume, interrupt-clear, and
+interrupt-status bits. `NPU_Set_TF_En` reads and writes `BLAI_TF_CFG0` at
+offset `0x24`, clears bit 31, and ORs in the shifted argument. Nim captures
+this as `NpuHalNetParamObjdumpEvidence`: ReLU-N and TensorFlow mode are typed
+network parameters, not a second completion gate.
+
+The remaining hardware problem is therefore not "which surface does the SDK HAL
+poll" or "does a HAL net parameter secretly enable completion"; it is why the
+live active fixture reaches idle/output-gated state without observing the SDK
+HAL completion bit or a named MM aggregate subroute.
+
 The Makefile wraps the same discipline:
 
 ```sh
@@ -3333,4 +5799,8 @@ make hw-npu-smoke-anchor UART_PORT=/dev/ttyUSB0
 That target probes the existing anchor first, installs the persistent
 `m0_uart_flash_anchor` firmware if the probe fails, then flashes
 `m0_npu_smoke_test` with `--uart-anchor-existing` and validates the mirrored
-JTAG memory log so dense UART output cannot hide late markers.
+JTAG memory log so dense UART output cannot hide late markers. On 2026-06-19,
+the focused M0 NPU model smoke followed that protocol: the stale/non-answering
+anchor was reinstalled once through the RAM/JTAG anchor path, the refreshed
+anchor probed with JEDEC `0x1860EF`, and the active NPU image was then flashed
+with `--uart-anchor-existing`.

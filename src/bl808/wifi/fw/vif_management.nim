@@ -164,6 +164,8 @@ proc vif_mgmt_register*(macAddr: pointer, vifType: uint8, p2p: bool, vifIdxOut: 
     mm_bcn_init_vif(vifEntry)
   # Common: call td_start, push to active VIF list, write vifIdx output
   td_start(vifIdx)
+  if vifType == VIF_TYPE_STA:
+    vif.vifType = VIF_TYPE_STA
   vifIdxOut[] = vifIdx
   co_list_push_back(addr env.activeList, cast[ptr CoListHdr](vifEntry))
   return 0
@@ -262,7 +264,7 @@ proc vif_mgmt_add_key*(param: pointer, hwKeyIdx: uint8) {.exportc, cdecl.} =
   ##   [8..23]  key material
   ##   [24..39] RX PN / TKIP MIC key (6 x 32-bit words at [24..47])
   ##   [44..51] TX/RX sequence counters (2 x 32-bit words)
-  ##   [52]  u8: cipherType (0=WEP40, 1=TKIP, 3=WEP104, 5=CCMP)
+  ##   [52]  u8: cipherType (0=WEP40, 1=TKIP, 2/5=CCMP, 3=WEP104)
   ##   [53]  u8: keyIdx / VIF slot selector
   ##   [54]  u8: spp
   ##   [55]  u8: has_rx_pn flag
@@ -282,11 +284,16 @@ proc vif_mgmt_add_key*(param: pointer, hwKeyIdx: uint8) {.exportc, cdecl.} =
   ##   +1496 (0x5D8): VIF flags
 
   let req = vifMgmtAddKeyParamView(param)
-  let keySlot = req.keySlot  # s7 in blob = keyIdx field from param
+  let keySlot = req.keySlot  # s7 in blob = VIF index field from param
   let staIdx = req.staIdx    # s9
 
   let vif = vifChannelForIdx(keySlot)
-  let keyView = vifKeySlot(vif, 0)
+  let rxKeySlot =
+    if staIdx < 4'u8:
+      staIdx.uint
+    else:
+      0'u
+  let keyView = vifKeySlot(vif, rxKeySlot)
 
   # Zero the per-key context area at vif+528, 128 bytes before populating the
   # metadata fields. Clearing after these stores erases cipher/key identity and
@@ -326,7 +333,7 @@ proc vif_mgmt_add_key*(param: pointer, hwKeyIdx: uint8) {.exportc, cdecl.} =
     discard c_memcpy(addr keyView.keyMaterial[0],
                      vifMgmtAddKeyTkipMaterialPtr(req), 16.csize_t)
 
-  of 5:
+  of 2, 5:
     # CCMP: copy 16 bytes of key material from param[8..23] to vif+664
     discard c_memcpy(addr keyView.keyMaterial[0],
                      addr req.ccmpKeyMaterial[0], 16.csize_t)
@@ -347,7 +354,11 @@ proc vif_mgmt_add_key*(param: pointer, hwKeyIdx: uint8) {.exportc, cdecl.} =
     # Host provided a non-zero PN; check if has_rx_pn and cipher != CCMP
     let curCipher = keyView.cipherType
     let curHasRxPn = keyView.hasRxPn
-    if curHasRxPn == 0 or curCipher == 5:
+    let seedLooksLikePointer =
+      (pnLo and 0xFF000000'u32) == 0x22000000'u32 or
+      (pnLo and 0xFF000000'u32) == 0x62000000'u32
+    if wifiCipherUsesGroupReplayPn(curCipher, curHasRxPn) and
+        not (wifiCipherIsCcmpGroup(curCipher) and seedLooksLikePointer):
       # Broadcast PN: replicate to all 8 key context slots
       # Clear installed flag (will set below)
       keyView.installed = 0
@@ -366,22 +377,21 @@ proc vif_mgmt_add_key*(param: pointer, hwKeyIdx: uint8) {.exportc, cdecl.} =
         staReplay.replayCounters[replayCounterIndex].pnHigh = pnHi
         inc replayCounterIndex
 
-  # Validate replay counter before marking key installed
-  # Blob calls replay_counter_validate at reloc 0x214 with key PN context
-  let pnCtx = cast[pointer](keyView)
-  if replay_counter_validate(pnCtx):
-    # Mark key as installed only if replay counter validates
-    keyView.installed = 1
+  # Vendor marks the VIF key installed after populating its replay/key state.
+  # Do not call replay_counter_validate here: that helper reads candidate PN
+  # from a1/a2, and a normal Nim one-argument call leaves those registers stale.
+  keyView.installed = 1
 
-  # If cipher type is CCMP, update the CCMP key material pointer
+  # If cipher type is CCMP, update the CCMP key material pointer.
   let installedCipher = keyView.cipherType
   let keyPtrs = vifKeyPointers(vif)
-  if installedCipher == 5:
-    # Store pointer to key context base in vif+1492
-    keyPtrs.groupKeyPtr = vifKeySlotPtr(vif, 0)
+  if wifiCipherIsCcmpGroup(installedCipher):
+    # Store pointer to the active GTK context. RX protected data frames select
+    # the same VIF slot from the CCMP key-id bits.
+    keyPtrs.groupKeyPtr = vifKeySlotPtr(vif, rxKeySlot)
   else:
     # Store to vif+1480 (default key pointer)
-    keyPtrs.defaultKeyPtr = vifKeySlotPtr(vif, 0)
+    keyPtrs.defaultKeyPtr = vifKeySlotPtr(vif, rxKeySlot)
 
 proc vif_mgmt_del_key*(vifEntry: pointer, keySlot: uint8) {.exportc, cdecl, noinline.} =
   ## Delete encryption key for a VIF (35 instrs).

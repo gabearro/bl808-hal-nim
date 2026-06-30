@@ -25,6 +25,7 @@ var
   passed = 0
   failed = 0
   scratch {.align: 16.}: array[512, uint8]
+  umodeAeadKey: KeyHandle
 
 proc buf(): ptr UncheckedArray[uint8] = cast[ptr UncheckedArray[uint8]](addr scratch[0])
 
@@ -37,29 +38,22 @@ proc onEcall(f: ptr EcallFrame) {.nimcall.} = discard
 
 proc testSha256() =
   buf()[0] = 0x61; buf()[1] = 0x62; buf()[2] = 0x63   # "abc"
-  let (st, n) = enclaveDispatch(svcSha256, 3, buf(), scratch.len)
+  let (st, n) = enclaveDispatch(callerUmodeAppCtx(), svcSha256, 3, buf(), scratch.len)
   # SHA-256("abc") = ba7816bf...
   check("sha256 status", st == svcOk and n == 32)
   check("sha256 digest[0]=0xba", buf()[0] == 0xba and buf()[1] == 0x78)
 
 proc testRandom() =
   wrU32(buf(), 0, 16)
-  let (st, n) = enclaveDispatch(svcGetRandom, 4, buf(), scratch.len)
+  let (st, n) = enclaveDispatch(callerUmodeAppCtx(), svcGetRandom, 4, buf(), scratch.len)
   var nonZero = false
   for i in 0 ..< n:
     if buf()[i] != 0: nonZero = true
   check("getRandom status+nonzero", st == svcOk and n == 16 and nonZero)
 
 proc testDeriveAndAead() =
-  # derive a child key from root: parent | outLen=32 | labLen=3 | ctxLen=1 | "key" "1"
-  wrU32(buf(), 0, vaultRoot().uint32)
-  wrU32(buf(), 4, 32)
-  wrU32(buf(), 8, 3)
-  wrU32(buf(), 12, 1)
-  buf()[16] = byte 'k'; buf()[17] = byte 'e'; buf()[18] = byte 'y'; buf()[19] = byte '1'
-  let (st, n) = enclaveDispatch(svcDeriveKey, 20, buf(), scratch.len)
-  check("deriveKey status", st == svcOk and n == 4)
-  let child = rdU32(buf(), 0)
+  check("trusted setup made U-mode AEAD key", umodeAeadKey != InvalidHandle)
+  let child = umodeAeadKey.uint32
 
   # AEAD seal "hello" (5 bytes) under child, nonce=16 zeros, no aad
   let mkReq = proc(): int =
@@ -72,7 +66,7 @@ proc testDeriveAndAead() =
     for i in 0 ..< 5: buf()[32 + i] = msg[i].uint8
     32 + 5
   let reqLen = mkReq()
-  let (st2, sealedLen) = enclaveDispatch(svcAeadSeal, reqLen, buf(), scratch.len)
+  let (st2, sealedLen) = enclaveDispatch(callerUmodeAppCtx(), svcAeadSeal, reqLen, buf(), scratch.len)
   check("aeadSeal status", st2 == svcOk and sealedLen == 5 + 32)
 
   # capture ciphertext+tag, then open
@@ -84,7 +78,7 @@ proc testDeriveAndAead() =
   wrU32(buf(), 12, 5)            # ctLen
   for i in 0 ..< 16: buf()[16 + i] = 0
   for i in 0 ..< sealedLen: buf()[32 + i] = sealed[i]
-  let (st3, ptLen) = enclaveDispatch(svcAeadOpen, 32 + sealedLen, buf(), scratch.len)
+  let (st3, ptLen) = enclaveDispatch(callerUmodeAppCtx(), svcAeadOpen, 32 + sealedLen, buf(), scratch.len)
   var ok = st3 == svcOk and ptLen == 5
   let exp = "hello"
   for i in 0 ..< 5:
@@ -96,28 +90,47 @@ proc testDeriveAndAead() =
   for i in 0 ..< sealedLen: buf()[32 + i] = sealed[i]
   buf()[32 + 5] = buf()[32 + 5] xor 0xFF   # flip first tag byte
   wrU32(buf(), 0, child); wrU32(buf(), 4, 16); wrU32(buf(), 8, 0); wrU32(buf(), 12, 5)
-  let (st4, _) = enclaveDispatch(svcAeadOpen, 32 + sealedLen, buf(), scratch.len)
+  let (st4, _) = enclaveDispatch(callerUmodeAppCtx(), svcAeadOpen, 32 + sealedLen, buf(), scratch.len)
   check("aeadOpen rejects tampered tag", st4 == svcCryptoFail)
 
 proc testSeal() =
   let msg = "secret-data"
-  for i in 0 ..< 16: buf()[i] = 0
-  for i in 0 ..< msg.len: buf()[16 + i] = msg[i].uint8
-  let (st, sealedLen) = enclaveDispatch(svcSealBlob, 16 + msg.len, buf(), scratch.len)
-  check("sealBlob status", st == svcOk and sealedLen == msg.len + 32)
-  var sealed: array[64, uint8]
+  for i in 0 ..< msg.len: buf()[i] = msg[i].uint8
+  let (st, sealedLen) = enclaveDispatch(callerUmodeAppCtx(), svcSealBlob, msg.len, buf(), scratch.len)
+  check("sealBlob status", st == svcOk and sealedLen == 16 + msg.len + 32)
+  var sealed, sealed2: array[80, uint8]
   for i in 0 ..< sealedLen: sealed[i] = buf()[i]
-  for i in 0 ..< 16: buf()[i] = 0
-  for i in 0 ..< sealedLen: buf()[16 + i] = sealed[i]
-  let (st2, ptLen) = enclaveDispatch(svcUnsealBlob, 16 + sealedLen, buf(), scratch.len)
+
+  for i in 0 ..< msg.len: buf()[i] = msg[i].uint8
+  let (stAgain, sealedLen2) = enclaveDispatch(callerUmodeAppCtx(), svcSealBlob, msg.len, buf(), scratch.len)
+  for i in 0 ..< sealedLen2: sealed2[i] = buf()[i]
+  var nonceDiff = false
+  for i in 0 ..< 16:
+    if sealed[i] != sealed2[i]: nonceDiff = true
+  check("sealBlob fresh nonce", stAgain == svcOk and sealedLen2 == sealedLen and nonceDiff)
+
+  for i in 0 ..< sealedLen: buf()[i] = sealed[i]
+  let (st2, ptLen) = enclaveDispatch(callerUmodeAppCtx(), svcUnsealBlob, sealedLen, buf(), scratch.len)
   var ok = st2 == svcOk and ptLen == msg.len
   for i in 0 ..< msg.len:
     if buf()[i] != msg[i].uint8: ok = false
   check("unsealBlob round-trip", ok)
 
+  for i in 0 ..< sealedLen2: buf()[i] = sealed2[i]
+  let (st3, ptLen2) = enclaveDispatch(callerUmodeAppCtx(), svcUnsealBlob, sealedLen2, buf(), scratch.len)
+  var ok2 = st3 == svcOk and ptLen2 == msg.len
+  for i in 0 ..< msg.len:
+    if buf()[i] != msg[i].uint8: ok2 = false
+  check("unsealBlob second round-trip", ok2)
+
+  let (stZero, sealedZeroLen) = enclaveDispatch(callerUmodeAppCtx(), svcSealBlob, 0, buf(), scratch.len)
+  check("sealBlob zero-length status", stZero == svcOk and sealedZeroLen == 16 + 32)
+  let (stZeroOpen, zeroLen) = enclaveDispatch(callerUmodeAppCtx(), svcUnsealBlob, sealedZeroLen, buf(), scratch.len)
+  check("unsealBlob zero-length round-trip", stZeroOpen == svcOk and zeroLen == 0)
+
 proc testAttestation() =
   for i in 0 ..< 32: buf()[i] = i.uint8   # nonce
-  let (st, n) = enclaveDispatch(svcGetAttestation, 32, buf(), scratch.len)
+  let (st, n) = enclaveDispatch(callerUmodeAppCtx(), svcGetAttestation, 32, buf(), scratch.len)
   # id(8)+meas(32)+sig(64) = 104; PKA ECDSA exercised here
   check("getAttestation status+len", st == svcOk and n == 104)
 
@@ -138,6 +151,9 @@ proc main() {.exportc, cdecl.} =
   enclaveSetEcallDispatch(onEcall)
   let ok = enclaveInit(defaultPartition(lock = false), rkSoftDev)
   check("enclaveInit", ok)
+  umodeAeadKey = vaultDeriveKeyForOwner(callerUmodeAppCtx(), vaultRoot(),
+    [0x6b'u8, 0x65, 0x79], [0x31'u8], 32,
+    KeyPolicy(usage: {kuEncrypt, kuDecrypt, kuDerive}))
 
   testSha256()
   testRandom()

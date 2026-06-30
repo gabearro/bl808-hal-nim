@@ -125,7 +125,27 @@ static inline void write32(uint32_t addr, uint32_t value)
 
 static inline void dcache_flush_all(void)
 {
-    __asm__ volatile("" ::: "memory");
+    __asm__ volatile(".long 0x0010000b" ::: "memory");
+    __asm__ volatile("fence" ::: "memory");
+}
+
+static inline void dcache_invalidate_all(void)
+{
+    __asm__ volatile(".long 0x0020000b" ::: "memory");
+    __asm__ volatile("fence" ::: "memory");
+}
+
+static inline void icache_invalidate_all(void)
+{
+    __asm__ volatile(".long 0x0100000b" ::: "memory");
+    __asm__ volatile(".long 0x0000100f" ::: "memory");
+}
+
+static void cache_sync_before_reboot(void)
+{
+    dcache_flush_all();
+    dcache_invalidate_all();
+    icache_invalidate_all();
 }
 
 static inline volatile uint8_t *data_buf(void)
@@ -329,6 +349,7 @@ static void delay_cycles(uint32_t count)
 static void reboot_chip(void)
 {
     uint32_t value = read32(GLB_SWRST_CFG2);
+    cache_sync_before_reboot();
     value &= ~(1u << 5);
     write32(GLB_SWRST_CFG2, value);
     delay_cycles(1000u);

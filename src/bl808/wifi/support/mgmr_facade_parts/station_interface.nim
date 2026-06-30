@@ -1,3 +1,28 @@
+proc wifi_mgmr_sta_readd_firmware_if*(): bool =
+  if not wifiStarted or not staEnabled:
+    return false
+  let iface = staIface()
+  let nif = ifaceNetif(iface)
+  var addIfCfm: array[MmAddIfCfmSize.int, uint8]
+  for _ in 0 ..< 20:
+    zero(addr addIfCfm[0], MmAddIfCfmSize)
+    let addIfRequestStatus =
+      bl_send_add_if(cast[ptr BlHw](addr wifi_hw), netifHwaddr(nif),
+                     Nl80211IftypeStation, false, addr addIfCfm[0])
+    let addIfConfirmStatus = loadU8(addr addIfCfm[0], MmAddIfStatusOff)
+    if addIfRequestStatus == 0 and addIfConfirmStatus == CoOk.uint8:
+      let vif = vifAt(BlVifSta)
+      let inst = loadU8(addr addIfCfm[0], MmAddIfInstNbrOff)
+      storeU8(vif, BlVifVifIdxOff, inst)
+      storePtr(vif, BlVifDevOff, nif)
+      storeU8(vif, BlVifUpOff, 1)
+      storeU8(vif, BlVifLinksNumOff, 0)
+      storeU8(iface, WifiIfaceVifIndexOff, BlVifSta.uint8)
+      vendorPollFor(2000)
+      return true
+    vendorPollFor(4000)
+  false
+
 proc wifi_mgmr_sta_enable*(): pointer {.exportc, cdecl.} =
   if not wifiStarted: return nil
   if staEnabled: return staIface()
@@ -20,25 +45,10 @@ proc wifi_mgmr_sta_enable*(): pointer {.exportc, cdecl.} =
     storeU8(nif, NetifNameOff + 1, 't'.uint8)
   netif_set_default(cast[ptr Netif](nif))
   netif_set_up(cast[ptr Netif](nif))
-  var addIfCfm: array[MmAddIfCfmSize.int, uint8]
-  for _ in 0 ..< 20:
-    zero(addr addIfCfm[0], MmAddIfCfmSize)
-    let addIfRequestStatus =
-      bl_send_add_if(cast[ptr BlHw](addr wifi_hw), netifHwaddr(nif),
-                     Nl80211IftypeStation, false, addr addIfCfm[0])
-    let addIfConfirmStatus = loadU8(addr addIfCfm[0], MmAddIfStatusOff)
-    if addIfRequestStatus == 0 and addIfConfirmStatus == CoOk.uint8:
-      let vif = vifAt(BlVifSta)
-      let inst = loadU8(addr addIfCfm[0], MmAddIfInstNbrOff)
-      storeU8(vif, BlVifVifIdxOff, inst)
-      storePtr(vif, BlVifDevOff, nif)
-      storeU8(vif, BlVifUpOff, 1)
-      storeU8(vif, BlVifLinksNumOff, 0)
-      storeU8(iface, WifiIfaceVifIndexOff, BlVifSta.uint8)
-      staEnabled = true
-      vendorPollFor(2000)
-      return iface
-    vendorPollFor(4000)
+  staEnabled = true
+  if wifi_mgmr_sta_readd_firmware_if():
+    return iface
+  staEnabled = false
   nil
 
 proc wifi_mgmr_sta_netif_get*(): ptr Netif {.exportc, cdecl.} =

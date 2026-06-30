@@ -71,8 +71,11 @@ proc aeadSeal*(key: AeadKey, nonce: array[16, uint8],
   ## Encrypt-then-MAC. `ciphertext` must be at least plaintext.len bytes.
   if ciphertext.len < plaintext.len: return false
   for i in 0 ..< plaintext.len: ciphertext[i] = plaintext[i]
-  ctrCrypt(key.enc, nonce, toOpenArray(ciphertext, 0, plaintext.len - 1))
-  tag = macTag(key, nonce, aad, toOpenArray(ciphertext, 0, plaintext.len - 1))
+  if plaintext.len > 0:
+    ctrCrypt(key.enc, nonce, toOpenArray(ciphertext, 0, plaintext.len - 1))
+    tag = macTag(key, nonce, aad, toOpenArray(ciphertext, 0, plaintext.len - 1))
+  else:
+    tag = macTag(key, nonce, aad, [])
   true
 
 proc ctEq(a, b: openArray[uint8]): bool =
@@ -91,5 +94,6 @@ proc aeadOpen*(key: AeadKey, nonce: array[16, uint8],
   let expect = macTag(key, nonce, aad, ciphertext)
   if not ctEq(expect, tag): return false
   for i in 0 ..< ciphertext.len: plaintext[i] = ciphertext[i]
-  ctrCrypt(key.enc, nonce, toOpenArray(plaintext, 0, ciphertext.len - 1))
+  if ciphertext.len > 0:
+    ctrCrypt(key.enc, nonce, toOpenArray(plaintext, 0, ciphertext.len - 1))
   true

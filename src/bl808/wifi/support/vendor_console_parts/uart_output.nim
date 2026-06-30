@@ -1,4 +1,8 @@
 proc vendorPrintChar(c: char) =
+  when defined(bl808AllcoreWasmHttp) and not defined(bl808WifiUartTrace):
+    when defined(bl808WifiValidationLog):
+      hw_validation_log_byte(c.uint8)
+    return
   let fifo = cast[ptr uint32](UartFifoCfg1.uint)
   let data = cast[ptr uint32](UartWdata.uint)
   var timeout: uint32

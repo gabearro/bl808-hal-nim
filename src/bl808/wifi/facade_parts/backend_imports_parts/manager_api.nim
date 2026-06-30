@@ -8,6 +8,8 @@ proc wifi_mgmr_sta_connect*(iface: ptr WifiInterface,
 
 proc wifi_mgmr_sta_disconnect*(): cint {.importc, cdecl.}
 
+proc wifi_mgmr_sta_connect_abort*(): cint {.importc, cdecl.}
+
 proc wifi_mgmr_scan*(iface: ptr WifiInterface, cb: pointer): cint
   {.importc, cdecl.}
 

@@ -2,6 +2,7 @@ var sm_state {.importc.}: uint16
 
 proc txl_transmit_trigger*() {.importc, cdecl.}
 proc txl_frame_evt*() {.importc, cdecl.}
+proc wifi_nimfw_service_sta_postponed*(limit: uint32): uint32 {.importc, cdecl.}
 proc wifi_nimfw_prune_scan_raw_cache_for_ssid*(ssid: cstring,
                                                ssidLen: uint32)
   {.importc, cdecl.}
@@ -15,3 +16,4 @@ proc wifi_nimfw_set_keepalive_qosnull_enabled*(enabled: uint32)
 proc rwip_wlcoex_set*(enabled: bool) {.importc, cdecl.}
 
 proc bl_main_disconnect*(): cint {.importc, cdecl.}
+proc sm_delete_resources*(param: pointer = nil) {.importc, cdecl.}

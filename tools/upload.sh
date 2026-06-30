@@ -41,7 +41,7 @@ if [ -z "$CORE" ] || [ -z "$FIRMWARE" ]; then
     echo "Flash offsets:"
     echo "  m0 -> Boot2 + partition table + FW partition"
     echo "  d0 -> 0x100000 (D0 lowload bootloader)"
-    echo "  lp -> 0x091000 (LP firmware; maps to XIP 0x58080000 with boot2 image offset 0x11000)"
+    echo "  lp -> 0x0A0000 (LP firmware; maps to XIP 0x58080000 with boot2 image offset 0x20000)"
     exit 1
 fi
 
@@ -92,7 +92,7 @@ case "$CORE" in
         echo "Flashing D0 firmware at offset $ADDR..."
         ;;
     lp)
-        ADDR="0x091000"
+        ADDR="0x0A0000"
         echo "Flashing LP firmware at offset $ADDR..."
         ;;
     *)

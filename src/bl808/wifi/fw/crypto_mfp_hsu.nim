@@ -438,6 +438,203 @@ proc aes_encrypt_block*(roundKeys: pointer, state: pointer) {.exportc, cdecl.} =
     stateBytes[finalStateByteIndex] = shifted[finalStateByteIndex]
   add_round_key(roundKeys, state, 10)
 
+proc aes128_expand_key*(key: pointer; roundKeys: pointer) {.exportc, cdecl.} =
+  let rk = cast[ptr UncheckedArray[uint8]](roundKeys)
+  let keyBytes = cast[ptr UncheckedArray[uint8]](key)
+  for keyByteIndex in 0 ..< 16:
+    rk[keyByteIndex] = keyBytes[keyByteIndex]
+  for roundKeyWordIndex in 4'u32 ..< 44:
+    var scheduleWord: array[4, uint8]
+    let previousWordByteOffset = (roundKeyWordIndex - 1) * 4
+    for wordByteIndex in 0 ..< 4:
+      scheduleWord[wordByteIndex] =
+        rk[previousWordByteOffset.int + wordByteIndex]
+    if (roundKeyWordIndex mod 4) == 0:
+      let rotatedFirstByte = scheduleWord[0]
+      scheduleWord[0] =
+        AES_SBOX[scheduleWord[1].int] xor
+          cast[uint8](AES_RCON[(roundKeyWordIndex div 4 - 1).int])
+      scheduleWord[1] = AES_SBOX[scheduleWord[2].int]
+      scheduleWord[2] = AES_SBOX[scheduleWord[3].int]
+      scheduleWord[3] = AES_SBOX[rotatedFirstByte.int]
+    let roundKeyWordByteOffset = roundKeyWordIndex * 4
+    let previousRoundKeyWordByteOffset = (roundKeyWordIndex - 4) * 4
+    for wordByteIndex in 0 ..< 4:
+      rk[roundKeyWordByteOffset.int + wordByteIndex] =
+        rk[previousRoundKeyWordByteOffset.int + wordByteIndex] xor
+          scheduleWord[wordByteIndex]
+
+proc aes128_encrypt_copy(roundKeys: pointer; input: ptr array[16, uint8];
+                         output: ptr array[16, uint8]) {.inline.} =
+  for aesCopyByteIndex in 0 ..< 16:
+    output[aesCopyByteIndex] = input[aesCopyByteIndex]
+  aes_encrypt_block(roundKeys, output)
+
+proc ccmpLoadLe16(bytes: ptr UncheckedArray[uint8]; off: int): uint16 {.inline.} =
+  bytes[off].uint16 or (bytes[off + 1].uint16 shl 8)
+
+proc ccmpPutLe16(dst: var array[30, uint8]; off: int; value: uint16) {.inline.} =
+  dst[off] = (value and 0xFF'u16).uint8
+  dst[off + 1] = (value shr 8).uint8
+
+proc ccmpBuildAadNonce(hdr: pointer; data: pointer;
+                       aad: var array[30, uint8]; aadLen: var uint32;
+                       nonce: var array[13, uint8]) =
+  let h = cast[ptr UncheckedArray[uint8]](hdr)
+  let d = cast[ptr UncheckedArray[uint8]](data)
+  var fc = ccmpLoadLe16(h, 0)
+  let stype = (fc shr 4) and 0x0F'u16
+  let ftype = (fc shr 2) and 0x03'u16
+  let addr4 = (fc and 0x0300'u16) == 0x0300'u16
+  var qos = false
+  for i in 0 ..< 30:
+    aad[i] = 0
+  for i in 0 ..< 13:
+    nonce[i] = 0
+
+  if ftype == 2'u16:
+    fc = fc and not 0x0070'u16
+    if (stype and 0x08'u16) != 0:
+      qos = true
+      fc = fc and not 0x8000'u16
+      let qosOff = 24 + (if addr4: 6 else: 0)
+      nonce[0] = h[qosOff] and 0x0F'u8
+  elif ftype == 0'u16:
+    nonce[0] = nonce[0] or 0x10'u8
+
+  fc = fc and not (0x0800'u16 or 0x1000'u16 or 0x2000'u16)
+  fc = fc or 0x4000'u16
+  ccmpPutLe16(aad, 0, fc)
+  var pos = 2
+  for i in 0 ..< 18:
+    aad[pos + i] = h[4 + i]
+  pos += 18
+  let seq = ccmpLoadLe16(h, 22) and not 0xFFF0'u16
+  ccmpPutLe16(aad, pos, seq)
+  pos += 2
+  if addr4:
+    for i in 0 ..< 6:
+      aad[pos + i] = h[24 + i]
+    pos += 6
+  if qos:
+    let qosOff = 24 + (if addr4: 6 else: 0)
+    aad[pos] = h[qosOff] and not (0x70'u8 or 0x80'u8)
+    aad[pos + 1] = 0
+    pos += 2
+  aadLen = pos.uint32
+
+  for i in 0 ..< 6:
+    nonce[1 + i] = h[10 + i]
+  nonce[7] = d[7]
+  nonce[8] = d[6]
+  nonce[9] = d[5]
+  nonce[10] = d[4]
+  nonce[11] = d[1]
+  nonce[12] = d[0]
+
+proc ccmpXorEncryptBlock(roundKeys: pointer; x: var array[16, uint8];
+                         macBlock: var array[16, uint8]) {.inline.} =
+  for i in 0 ..< 16:
+    x[i] = x[i] xor macBlock[i]
+  aes_encrypt_block(roundKeys, addr x[0])
+
+proc ccmpCtrBlock(nonce: var array[13, uint8]; counter: uint16;
+                  outBlock: var array[16, uint8]) {.inline.} =
+  outBlock[0] = 0x01'u8
+  for i in 0 ..< 13:
+    outBlock[1 + i] = nonce[i]
+  outBlock[14] = (counter shr 8).uint8
+  outBlock[15] = (counter and 0xFF'u16).uint8
+
+proc nim_ccmp_decrypt*(tk: pointer; hdr: pointer; data: pointer;
+                       dataLen: uint32; outPlain: pointer;
+                       outLen: ptr uint32): bool =
+  if tk == nil or hdr == nil or data == nil or outPlain == nil or
+      outLen == nil:
+    return false
+  if dataLen < 16'u32:
+    return false
+  let mlen = dataLen - 16'u32
+  let d = cast[ptr UncheckedArray[uint8]](data)
+  let plain = cast[ptr UncheckedArray[uint8]](outPlain)
+  var roundKeys {.noinit.}: array[176, uint8]
+  aes128_expand_key(tk, addr roundKeys[0])
+
+  var aad {.noinit.}: array[30, uint8]
+  var nonce {.noinit.}: array[13, uint8]
+  var aadLen: uint32 = 0
+  ccmpBuildAadNonce(hdr, data, aad, aadLen, nonce)
+
+  var ctr {.noinit.}: array[16, uint8]
+  var stream {.noinit.}: array[16, uint8]
+  var pos = 0'u32
+  var counter = 1'u16
+  while pos < mlen:
+    ccmpCtrBlock(nonce, counter, ctr)
+    aes128_encrypt_copy(addr roundKeys[0], addr ctr, addr stream)
+    let chunk =
+      if mlen - pos >= 16'u32: 16'u32
+      else: mlen - pos
+    for i in 0 ..< chunk.int:
+      plain[pos + i.uint32] = d[8 + pos + i.uint32] xor stream[i]
+    pos += chunk
+    inc counter
+
+  var x {.noinit.}: array[16, uint8]
+  var macBlock {.noinit.}: array[16, uint8]
+  for i in 0 ..< 16:
+    x[i] = 0
+    macBlock[i] = 0
+  macBlock[0] = 0x59'u8
+  for i in 0 ..< 13:
+    macBlock[1 + i] = nonce[i]
+  macBlock[14] = (mlen shr 8).uint8
+  macBlock[15] = (mlen and 0xFF'u32).uint8
+  ccmpXorEncryptBlock(addr roundKeys[0], x, macBlock)
+
+  if aadLen != 0:
+    for i in 0 ..< 16:
+      macBlock[i] = 0
+    macBlock[0] = (aadLen shr 8).uint8
+    macBlock[1] = (aadLen and 0xFF'u32).uint8
+    var aadPos = 0'u32
+    var blockPos = 2
+    while aadPos < aadLen:
+      macBlock[blockPos] = aad[aadPos.int]
+      inc aadPos
+      inc blockPos
+      if blockPos == 16:
+        ccmpXorEncryptBlock(addr roundKeys[0], x, macBlock)
+        for i in 0 ..< 16:
+          macBlock[i] = 0
+        blockPos = 0
+    if blockPos != 0:
+      ccmpXorEncryptBlock(addr roundKeys[0], x, macBlock)
+
+  pos = 0
+  while pos < mlen:
+    for i in 0 ..< 16:
+      macBlock[i] = 0
+    let chunk =
+      if mlen - pos >= 16'u32: 16'u32
+      else: mlen - pos
+    for i in 0 ..< chunk.int:
+      macBlock[i] = plain[pos + i.uint32]
+    ccmpXorEncryptBlock(addr roundKeys[0], x, macBlock)
+    pos += chunk
+
+  ccmpCtrBlock(nonce, 0'u16, ctr)
+  aes128_encrypt_copy(addr roundKeys[0], addr ctr, addr stream)
+  var micOk = true
+  for i in 0 ..< 8:
+    let expected = x[i] xor stream[i]
+    if expected != d[8 + mlen + i.uint32]:
+      micOk = false
+  if not micOk:
+    return false
+  outLen[] = mlen
+  true
+
 # ###########################################################################
 #                  HSU: Hardware Security Unit
 # ###########################################################################
@@ -453,25 +650,7 @@ proc hsu_aes_cmac*(key: pointer, msg: pointer, msgLen: uint32, mac: pointer) {.e
   ## Steps: expand key, derive K1/K2, process blocks with CBC-MAC, output 16-byte MAC.
   # 1. AES key expansion (10 rounds -> 176 bytes of round keys)
   var roundKeys: array[176, uint8]
-  discard c_memcpy(addr roundKeys[0], key, 16.csize_t)
-  # Expand key schedule
-  for roundKeyWordIndex in 4'u32 ..< 44:
-    var scheduleWord: array[4, uint8]
-    let previousWordByteOffset = (roundKeyWordIndex - 1) * 4
-    for wordByteIndex in 0 ..< 4:
-      scheduleWord[wordByteIndex] = roundKeys[previousWordByteOffset.int + wordByteIndex]
-    if (roundKeyWordIndex mod 4) == 0:
-      # RotWord + SubWord + Rcon
-      let rotatedFirstByte = scheduleWord[0]
-      scheduleWord[0] = AES_SBOX[scheduleWord[1].int] xor cast[uint8](AES_RCON[(roundKeyWordIndex div 4 - 1).int])
-      scheduleWord[1] = AES_SBOX[scheduleWord[2].int]
-      scheduleWord[2] = AES_SBOX[scheduleWord[3].int]
-      scheduleWord[3] = AES_SBOX[rotatedFirstByte.int]
-    let roundKeyWordByteOffset = roundKeyWordIndex * 4
-    let previousRoundKeyWordByteOffset = (roundKeyWordIndex - 4) * 4
-    for wordByteIndex in 0 ..< 4:
-      roundKeys[roundKeyWordByteOffset.int + wordByteIndex] =
-        roundKeys[previousRoundKeyWordByteOffset.int + wordByteIndex] xor scheduleWord[wordByteIndex]
+  aes128_expand_key(key, addr roundKeys[0])
   # 2. Generate subkeys K1, K2
   var k1: array[16, uint8]
   var k2: array[16, uint8]

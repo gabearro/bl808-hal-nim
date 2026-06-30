@@ -2347,6 +2347,9 @@ proc mm_hw_info_set*(macAddr: pointer) {.exportc, cdecl.} =
   regWrite(0x24B080A8'u, 0)
   # Write MAC addr to HW regs.
   let addrView = macAddrAt(macAddr)
+  regWrite(0x24B00010'u32, addrView.lowLe)
+  regWrite(0x24B00014'u32, addrView.highLe)
+  regWrite(0x24B0001C'u32, 0x100'u32)
   regWrite(machwBase + 0x10'u, addrView.lowLe)
   regWrite(machwBase + 0x14'u, addrView.highLe)
   # Clear bits [10:8] (0x700) in status register
@@ -2421,8 +2424,17 @@ proc mm_sta_add*(param: pointer, staIdxOut: ptr uint8, hwStaIdxOut: ptr uint8): 
   ##   quickConn is copied into key buffer offset 125
 
   # ---- Step 1: Register station via sta_mgmt_register ----
+  inc nimFwDbgPreauthStaAddEntry
+  if param != nil:
+    let reqDbg = mmStaAddReqView(param)
+    let vifDbg = vifChannelForIdx(reqDbg.vifIdx)
+    nimFwDbgPreauthStaAddMeta =
+      reqDbg.vifIdx.uint32 or (vifDbg.staIdx.uint32 shl 8) or
+      (vifDbg.vifType.uint32 shl 16) or (vifSecurity(vifDbg).connected.uint32 shl 24)
   let regStatus = sta_mgmt_register(param, staIdxOut)
   if regStatus != 0:
+    nimFwDbgPreauthStaAddResult =
+      regStatus.uint32 or (staIdxOut[].uint32 shl 8) or 0x80000000'u32
     return regStatus
 
   # ---- Step 2: Read request fields ----
@@ -2590,10 +2602,17 @@ proc mm_sta_add*(param: pointer, staIdxOut: ptr uint8, hwStaIdxOut: ptr uint8): 
 
   # ---- Step 5: Final -- store sta_idx in VIF entry if STA type ----
   if vif.vifType != VIF_TYPE_STA:
+    nimFwDbgPreauthStaAddResult =
+      regStatus.uint32 or (staIdxOut[].uint32 shl 8) or
+      (hwStaIdxOut[].uint32 shl 16) or (vif.staIdx.uint32 shl 24)
     return regStatus  # not STA type, return original status (which was 0)
 
   # Store sta_idx at vif_entry offset 96
   vif.staIdx = staIdxOut[]
+  inc nimFwDbgPreauthStaAddExit
+  nimFwDbgPreauthStaAddResult =
+    staIdxOut[].uint32 or (hwStaIdxOut[].uint32 shl 8) or
+    (vif.staIdx.uint32 shl 16) or 0x01000000'u32
   return 0  # success
 
 proc mm_sta_del*(staIdx: uint8) {.exportc, cdecl.} =
@@ -3237,16 +3256,21 @@ proc mm_sec_machwkey_wr*(param: pointer) {.exportc, cdecl.} =
   if keyType == 0xFF:
     inc nimFwDbgMachwKeyWrGroup
     # Default WEP / group-key path
-    if cipherType == 5:
-      # CCMP: derive HW index from key count register top byte
+    if cipherType == 5'u8 and req.keyFlags == 0'u8:
+      # IGTK/management key path. Vendor firmware registers this in VIF
+      # management and returns without programming the normal data key RAM.
+      # Normal STA group CCMP also arrives as cipher 5 from set_key, but byte
+      # 55 carries the requested WPA algorithm there; that path must program
+      # the data key RAM.
       let keyCount = machwSecurityKeyCount()
       let baseIdx = cast[uint8](keyCount shr 24)
       hwIdx = cast[uint8]((hwIdx.uint32 + baseIdx.uint32 - 3) and 0xFF)
-      # Blob 0x48: vif_mgmt_add_key(param, hwIdx)
       vif_mgmt_add_key(param, hwIdx)
       return
     else:
-      # WEP40/WEP104: set key data low/high to all-ones (wildcard)
+      # WEP/default-key and CCMP GTK data keys use a wildcard MAC address.
+      # CCMP group data (cipher 2) must come through here; treating it like
+      # cipher 5 leaves broadcast/multicast data undecryptable.
       machwSecurityWriteAddress(0xFFFFFFFF'u32, 0xFFFFFFFF'u32)
       # Blob 0x7c: vif_mgmt_add_key(param, hwIdx)
       vif_mgmt_add_key(param, hwIdx)
@@ -3280,7 +3304,7 @@ proc mm_sec_machwkey_wr*(param: pointer) {.exportc, cdecl.} =
     machwSecurityWriteAddress(mac.lo, mac.hi)
 
     # Check cipher type for dispatch (0..3 only for key RAM write)
-  let validCipherType = cipherType <= 3
+  let validCipherType = cipherType <= 3 or cipherType == 5
   if not validCipherType:
     # Vendor asserts, then continues with cipher 0 and key type 1.
     assert_err("mm_sec.c", "mm_sec.c", 1212)
@@ -3294,6 +3318,7 @@ proc mm_sec_machwkey_wr*(param: pointer) {.exportc, cdecl.} =
       of 1: 1'u32
       of 2: 0'u32
       of 3: 1'u32
+      of 5: 0'u32
       else: keyTypeForCtrl
 
   let hwCipherType =
@@ -3302,9 +3327,14 @@ proc mm_sec_machwkey_wr*(param: pointer) {.exportc, cdecl.} =
     of 1: 2'u32
     of 2: 3'u32
     of 3: 1'u32
+    of 5: 3'u32
     else: 0'u32
 
   machwSecurityWriteKeyMaterial(req.keyWords)
+  nimFwDbgMachwKeyWrPre0 = volatileLoad(addr machwSecurityRegs().keyMaterial[0])
+  nimFwDbgMachwKeyWrPre1 = volatileLoad(addr machwSecurityRegs().keyMaterial[1])
+  nimFwDbgMachwKeyWrPre2 = volatileLoad(addr machwSecurityRegs().keyMaterial[2])
+  nimFwDbgMachwKeyWrPre3 = volatileLoad(addr machwSecurityRegs().keyMaterial[3])
 
   # Validate keyIdx field (shifted left 4, low nibble must be 0)
   let keyIdxField = keyIdx.uint32 shl 4
@@ -3326,18 +3356,38 @@ proc mm_sec_machwkey_wr*(param: pointer) {.exportc, cdecl.} =
                  0x40000000'u32
   if keyType != 0xFF'u8:
     nimFwDbgMachwKeyWrPairCtrl = ctrlWord
+  else:
+    nimFwDbgMachwKeyWrGroup0 = req.keyWords[0]
+    nimFwDbgMachwKeyWrGroup1 = req.keyWords[1]
+    nimFwDbgMachwKeyWrGroup2 = req.keyWords[2]
+    nimFwDbgMachwKeyWrGroup3 = req.keyWords[3]
+    nimFwDbgMachwKeyWrGroupCtrl =
+      ctrlWord or (machwSecurityKeyCount() and 0xFF000000'u32)
+  nimFwDbgMachwKeyWrCtrlBefore = machwSecurityControl()
   machwSecurityWriteControl(ctrlWord)
+  nimFwDbgMachwKeyWrCtrlAfterWrite = machwSecurityControl()
 
   # Poll until bit 30 (trigger) clears
-  discard waitMachwSecurityControlClear(0x40000000'u32)
+  nimFwDbgMachwKeyWrWriteWait =
+    if waitMachwSecurityControlClear(0x40000000'u32): 1'u32 else: 0'u32
   if keyType != 0xFF'u8:
     machwSecurityWriteControl((hwIdx.uint32 shl 16) or 0x80000000'u32)
-    discard waitMachwSecurityControlClear(0x80000000'u32)
+    nimFwDbgMachwKeyWrReadWait =
+      if waitMachwSecurityControlClear(0x80000000'u32): 1'u32 else: 0'u32
     nimFwDbgMachwKeyWrRead0 = volatileLoad(addr machwSecurityRegs().keyMaterial[0])
     nimFwDbgMachwKeyWrRead1 = volatileLoad(addr machwSecurityRegs().keyMaterial[1])
     nimFwDbgMachwKeyWrRead2 = volatileLoad(addr machwSecurityRegs().keyMaterial[2])
     nimFwDbgMachwKeyWrRead3 = volatileLoad(addr machwSecurityRegs().keyMaterial[3])
     nimFwDbgMachwKeyWrReadCtrl = machwSecurityControl()
+  else:
+    machwSecurityWriteControl((hwIdx.uint32 shl 16) or 0x80000000'u32)
+    nimFwDbgMachwKeyWrReadWait =
+      if waitMachwSecurityControlClear(0x80000000'u32): 1'u32 else: 0'u32
+    nimFwDbgMachwKeyWrGroupRead0 = volatileLoad(addr machwSecurityRegs().keyMaterial[0])
+    nimFwDbgMachwKeyWrGroupRead1 = volatileLoad(addr machwSecurityRegs().keyMaterial[1])
+    nimFwDbgMachwKeyWrGroupRead2 = volatileLoad(addr machwSecurityRegs().keyMaterial[2])
+    nimFwDbgMachwKeyWrGroupRead3 = volatileLoad(addr machwSecurityRegs().keyMaterial[3])
+    nimFwDbgMachwKeyWrGroupReadCtrl = machwSecurityControl()
 
 proc mm_sec_machwkey_del*(keyIdx: uint8) {.exportc, cdecl.} =
   ## Delete encryption key from MAC HW key table (76 instrs in blob).
@@ -4134,9 +4184,9 @@ proc mm_timer_schedule*() {.exportc, cdecl.} =
     let mmTimerCallback = headTimer.callback
     let mmTimerEnv = cast[pointer](headTimer.env)
     if mmTimerCallback == nil:
-      # No callback: assert (blob: assert_err "mm_timer.c" line 223)
-      assert_err("mm_timer.c", "mm_timer.c", 223)
-    # Call callback(env) -- blob reloads and calls unconditionally after assert
+      inc drained
+      continue
+    # Call callback(env).
     let invokeMmTimerCallback = cast[proc(env: pointer) {.cdecl.}](mmTimerCallback)
     invokeMmTimerCallback(mmTimerEnv)
     inc drained
@@ -4817,7 +4867,10 @@ proc chan_pre_switch_channel*(ctxt: pointer) {.exportc, cdecl.} =
   var targetCtxt: pointer = nil
   chanFlags = env.flags
   let schedCtxt = env.scheduledCtxt
-  if (chanFlags and 0x08) != 0:
+  if ctxt != nil and ctxt != cast[pointer](env):
+    targetCtxt = ctxt
+    env.scheduledCtxt = targetCtxt
+  elif (chanFlags and 0x08) != 0:
     targetCtxt = cast[pointer](chanCtxtForIdx(3))
     # Mark scheduled context status=1 if it exists
     if schedCtxt != nil:
@@ -5568,5 +5621,5 @@ proc phy_freq_to_channel*(band: uint8, freq: uint16): uint8 {.weakExport, cdecl.
 proc find_wpa_rsn_ie*(ieBuf: pointer, ieLen: uint32,
                        wpaOut: ptr pointer, rsnOut: ptr pointer) {.exportc, cdecl.} =
   let wpaOuiPtr = unsafeAddr WPA_OUI[0]
-  wpaOut[] = mac_vsie_find(ieBuf, ieLen, cast[pointer](wpaOuiPtr), 4)
-  rsnOut[] = mac_ie_find(ieBuf, ieLen, IE_ID_RSN)
+  wpaOut[] = wifiVendorIeFindBounded(ieBuf, ieLen, cast[pointer](wpaOuiPtr), 4)
+  rsnOut[] = wifiIeFindBounded(ieBuf, ieLen, IE_ID_RSN)

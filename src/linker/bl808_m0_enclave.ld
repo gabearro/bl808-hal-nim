@@ -17,13 +17,14 @@ ENTRY(_start)
 
 MEMORY
 {
-    FLASH  (rx)  : ORIGIN = 0x58000000, LENGTH = 1M
-    RAM    (rwx) : ORIGIN = 0x62020000, LENGTH = 56K
-    URAM   (rwx) : ORIGIN = 0x6202E000, LENGTH = 4K
-    SHARED (rw)  : ORIGIN = 0x6202F000, LENGTH = 4K
+    FLASH   (rx)  : ORIGIN = 0x58000000, LENGTH = 1M
+    RAMFUNC (rwx) : ORIGIN = 0x22020000, LENGTH = 8K
+    RAM     (rwx) : ORIGIN = 0x62022000, LENGTH = 48K
+    URAM    (rwx) : ORIGIN = 0x6202E000, LENGTH = 4K
+    SHARED  (rw)  : ORIGIN = 0x6202F000, LENGTH = 4K
 }
 
-_stack_size = 8K;
+_stack_size = 16K;
 _stack_top_reserve = 512;
 
 SECTIONS
@@ -40,6 +41,16 @@ SECTIONS
         *(.srodata .srodata.*)
         . = ALIGN(4);
     } > FLASH
+
+    _siramfunc = LOADADDR(.ramfunc);
+
+    .ramfunc : ALIGN(4)
+    {
+        _sramfunc = .;
+        *(.ramfunc .ramfunc.*)
+        . = ALIGN(4);
+        _eramfunc = .;
+    } > RAMFUNC AT > FLASH
 
     _sidata = LOADADDR(.data);
 
@@ -105,8 +116,8 @@ SECTIONS
 }
 
 /* Region boundaries for partition.nim (TZC windows + PMP grants). */
-PROVIDE(__secure_ram_start = ORIGIN(RAM));
-PROVIDE(__secure_ram_end   = ORIGIN(RAM) + LENGTH(RAM));
+__secure_ram_start = 0x62020000;
+__secure_ram_end   = ORIGIN(RAM) + LENGTH(RAM);
 PROVIDE(__umode_ram_start  = ORIGIN(URAM));
 PROVIDE(__umode_ram_end    = ORIGIN(URAM) + LENGTH(URAM));
 PROVIDE(__umode_sp         = ORIGIN(URAM) + LENGTH(URAM));

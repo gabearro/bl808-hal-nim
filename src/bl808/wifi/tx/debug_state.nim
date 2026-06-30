@@ -58,3 +58,10 @@ var nimFwDbgTxUdpIp* {.exportc: "nimfw_dbg_tx_udp_ip".}: uint32
 var nimFwDbgTxTcp* {.exportc: "nimfw_dbg_tx_tcp".}: uint32
 var nimFwDbgTxTcp80* {.exportc: "nimfw_dbg_tx_tcp80".}: uint32
 var nimFwDbgTxTcpFlags* {.exportc: "nimfw_dbg_tx_tcp_flags".}: uint32
+var nimFwDbgTxTcp80Len* {.exportc: "nimfw_dbg_tx_tcp80_len".}: uint32
+var nimFwDbgTxTcp80ChecksumRepair* {.exportc: "nimfw_dbg_tx_tcp80_csum_repair".}: uint32
+var nimFwDbgTxTcp80ChecksumBefore* {.exportc: "nimfw_dbg_tx_tcp80_csum_before".}: uint32
+var nimFwDbgTxTcp80ChecksumCalc* {.exportc: "nimfw_dbg_tx_tcp80_csum_calc".}: uint32
+var nimFwDbgTxTcp80ChecksumAfter* {.exportc: "nimfw_dbg_tx_tcp80_csum_after".}: uint32
+var nimFwDbgTxTcp80ChecksumVerifyBefore* {.exportc: "nimfw_dbg_tx_tcp80_csum_vbefore".}: uint32
+var nimFwDbgTxTcp80ChecksumVerifyAfter* {.exportc: "nimfw_dbg_tx_tcp80_csum_vafter".}: uint32

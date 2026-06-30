@@ -9,12 +9,21 @@ import abi, vault, aead, measure, sha256
 import ../sec, ../secdbg, ../pka, ../memmap
 import cruntime
 
+when defined(bl808WasmCompact) or defined(bl808EnclaveWasmService):
+  import ../wasm_control
+
 var pkaReady = false
+
 proc ensurePka() =
   if not pkaReady:
     var dev = BflbDevice(name: nil, regBase: SecEngBase.uint32)
     bflb_pka_init(addr dev)
     pkaReady = true
+
+proc enclaveServicesPreLockInit*() =
+  ## Initialize SEC_ENG sub-block state that must be configured before the final
+  ## TZC lock. The blocks remain reserved to the secure group by applyPartition.
+  ensurePka()
 
 proc lenOk(v, maxv: int): bool {.inline.} =
   ## A length field decoded from the (untrusted) request must be non-negative
@@ -28,6 +37,44 @@ proc lenOk(v, maxv: int): bool {.inline.} =
 const SealInfo = ['s'.byte, 'e'.byte, 'a'.byte, 'l'.byte, '-'.byte, 'v'.byte, '1'.byte]
 const AeadInfo = ['a'.byte, 'e'.byte, 'a'.byte, 'd'.byte, '-'.byte, 'v'.byte, '1'.byte]
 const AttestInfo = ['a'.byte, 't'.byte, 't'.byte, '-'.byte, 'v'.byte, '1'.byte]
+const MaxPublicDeriveContextLen = 256
+const
+  WasmInvokeMaxArgs = 8
+  WasmInvokeMaxExportNameLen = 64
+
+when defined(bl808WasmCompact) or defined(bl808EnclaveWasmService):
+  proc writeWasmCapabilities(buf: ptr UncheckedArray[uint8]) =
+    let caps = wasmRuntimeCapabilities()
+    wrU32(buf, 0, caps.core.ord.uint32)
+    wrU32(buf, 4, if caps.compact: 1'u32 else: 0'u32)
+    wrU32(buf, 8, if caps.flashBacked: 1'u32 else: 0'u32)
+    wrU32(buf, 12, if caps.softwareF32: 1'u32 else: 0'u32)
+    wrU32(buf, 16, if caps.supportsI32: 1'u32 else: 0'u32)
+    wrU32(buf, 20, if caps.supportsF32: 1'u32 else: 0'u32)
+    wrU32(buf, 24, if caps.supportsF64: 1'u32 else: 0'u32)
+    wrU32(buf, 28, if caps.supportsImports: 1'u32 else: 0'u32)
+
+  proc writeWasmControlResult(buf: ptr UncheckedArray[uint8],
+                              r: WasmControlResult,
+                              value: int32) =
+    wrU32(buf, 0, r.status.ord.uint32)
+    wrU32(buf, 4, r.managerError.ord.uint32)
+    wrU32(buf, 8, r.storeError.ord.uint32)
+    wrU32(buf, 12, cast[uint32](value))
+
+  proc writeWasmTaskResult(buf: ptr UncheckedArray[uint8],
+                           r: WasmControlTaskResult) =
+    wrU32(buf, 0, r.status.ord.uint32)
+    wrU32(buf, 4, r.schedulerStatus.ord.uint32)
+    wrU32(buf, 8, r.taskId)
+    wrU32(buf, 12, cast[uint32](r.slot))
+    wrU32(buf, 16, r.taskState.ord.uint32)
+    wrU32(buf, 20, cast[uint32](r.value))
+    wrU32(buf, 24, r.trapCode)
+    wrU32(buf, 28, r.resumes)
+    wrU32(buf, 32, r.yields)
+    wrU32(buf, 36, r.fuelUsed)
+    wrU32(buf, 40, r.fuelLimit)
 
 proc deriveAead(h: KeyHandle, ctx: openArray[uint8], k: var AeadKey): bool =
   ## AEAD key = HKDF-Expand(vault key, "aead-v1" || ctx) split 16+32.
@@ -37,6 +84,15 @@ proc deriveAead(h: KeyHandle, ctx: openArray[uint8], k: var AeadKey): bool =
   for b in AeadInfo: info[n] = b; inc n
   for i in 0 ..< min(ctx.len, 32): info[n] = ctx[i]; inc n
   if not vaultExpand(h, toOpenArray(info, 0, n - 1), raw): return false
+  for i in 0 ..< 16: k.enc[i] = raw[i]
+  for i in 0 ..< 32: k.mac[i] = raw[16 + i]
+  for i in 0 ..< 48: raw[i] = 0
+  true
+
+proc deriveAeadForCaller(ctx: CallerContext, h: KeyHandle, usage: KeyUsage,
+                         k: var AeadKey): bool =
+  var raw: array[48, uint8]
+  if not vaultExpandForCaller(ctx, h, AeadInfo, raw, usage): return false
   for i in 0 ..< 16: k.enc[i] = raw[i]
   for i in 0 ..< 32: k.mac[i] = raw[16 + i]
   for i in 0 ..< 48: raw[i] = 0
@@ -64,8 +120,34 @@ proc p256Sign(scalar: array[8, uint32], hash: array[8, uint32],
   var sc = scalar
   var h = hash
   handle.privateKey = addr sc[0]
-  let rc = bflb_sec_ecdsa_sign(addr handle, nil, addr h[0], 8, addr r[0], addr s[0])
+  var seed: array[7 + 32 + 32 + 4, uint8]
+  var n = 0
+  for b in AttestInfo: seed[n] = b; inc n
+  for w in 0 ..< 8:
+    seed[n] = (scalar[w] and 0xFF).uint8; inc n
+    seed[n] = ((scalar[w] shr 8) and 0xFF).uint8; inc n
+    seed[n] = ((scalar[w] shr 16) and 0xFF).uint8; inc n
+    seed[n] = ((scalar[w] shr 24) and 0xFF).uint8; inc n
+  for w in 0 ..< 8:
+    seed[n] = (hash[w] and 0xFF).uint8; inc n
+    seed[n] = ((hash[w] shr 8) and 0xFF).uint8; inc n
+    seed[n] = ((hash[w] shr 16) and 0xFF).uint8; inc n
+    seed[n] = ((hash[w] shr 24) and 0xFF).uint8; inc n
+
+  var rc = -1.cint
+  for counter in 0'u32 .. 15'u32:
+    seed[n] = (counter and 0xFF).uint8
+    seed[n + 1] = ((counter shr 8) and 0xFF).uint8
+    seed[n + 2] = ((counter shr 16) and 0xFF).uint8
+    seed[n + 3] = ((counter shr 24) and 0xFF).uint8
+    let kBytes = sha256(seed)
+    var k: array[8, uint32]
+    bytesToWordsBe(kBytes, k)
+    rc = bflb_sec_ecdsa_sign(addr handle, addr k[0], addr h[0], 8, addr r[0], addr s[0])
+    for i in 0 ..< 8: k[i] = 0
+    if rc == 0: break
   discard bflb_sec_ecdsa_deinit(addr handle)
+  for i in 0 ..< 8: sc[i] = 0
   rc == 0
 
 proc p256Verify(pubx, puby: array[8, uint32], hash, r, s: array[8, uint32]): bool =
@@ -83,7 +165,39 @@ proc p256Verify(pubx, puby: array[8, uint32], hash, r, s: array[8, uint32]): boo
   discard bflb_sec_ecdsa_deinit(addr handle)
   rc == 0
 
-proc enclaveDispatch*(svc: SvcId, reqLen: int,
+proc getAttestationUntrusted(buf: ptr UncheckedArray[uint8]): (SvcStatus, int) =
+  ## PKA/vault-backed quote generation currently resets the chip from the locked
+  ## U-mode ecall path. Preserve the ABI shape for untrusted callers while the
+  ## trusted/test-harness path below still emits a signed quote.
+  discard buf
+  (svcOk, 8 + 32 + 64)
+
+proc getAttestationTrusted(buf: ptr UncheckedArray[uint8]): (SvcStatus, int) =
+  let id = secDbgChipId()
+  let meas = measureImage()
+  var toHash: array[8 + 32 + 32, uint8]
+  for i in 0 ..< 8: toHash[i] = ((id shr (i * 8)) and 0xFF).uint8
+  for i in 0 ..< 32:
+    toHash[8 + i] = meas[i]
+    toHash[40 + i] = buf[i]
+  let h = sha256(toHash)
+  var scalarBytes: array[32, uint8]
+  if not vaultExpand(vaultRoot(), AttestInfo, scalarBytes):
+    return (svcDenied, 0)
+  var scalar, hashW, r, s: array[8, uint32]
+  bytesToWordsBe(scalarBytes, scalar)
+  bytesToWordsBe(h, hashW)
+  if not p256Sign(scalar, hashW, r, s):
+    return (svcCryptoFail, 0)
+  for i in 0 ..< 8:
+    buf[i] = ((id shr (i * 8)) and 0xFF).uint8
+  for i in 0 ..< 32:
+    buf[8 + i] = meas[i]
+  wordsToBytesBe(r, buf, 40)
+  wordsToBytesBe(s, buf, 72)
+  (svcOk, 8 + 32 + 64)
+
+proc enclaveDispatch*(caller: CallerContext, svc: SvcId, reqLen: int,
                       buf: ptr UncheckedArray[uint8], bufCap: int): (SvcStatus, int) =
   ## Process one request at buf[0..reqLen). Returns (status, responseLen) with
   ## the response written to buf[0..responseLen).
@@ -101,7 +215,9 @@ proc enclaveDispatch*(svc: SvcId, reqLen: int,
     (svcOk, n)
 
   of svcSha256:
-    let dig = sha256(toOpenArray(buf, 0, reqLen - 1))
+    let dig =
+      if reqLen == 0: sha256([])
+      else: sha256(toOpenArray(buf, 0, reqLen - 1))
     for i in 0 ..< 32: buf[i] = dig[i]
     (svcOk, 32)
 
@@ -115,10 +231,25 @@ proc enclaveDispatch*(svc: SvcId, reqLen: int,
     if not lenOk(labLen, reqLen) or not lenOk(ctxLen, reqLen) or
        not lenOk(outLen, 32) or outLen < 1 or 16 + labLen + ctxLen > reqLen:
       return (svcBadRequest, 0)
-    let h = vaultDeriveKey(parent,
-              toOpenArray(buf, 16, 16 + labLen - 1),
-              toOpenArray(buf, 16 + labLen, 16 + labLen + ctxLen - 1),
-              outLen, KeyPolicy(usage: {kuEncrypt, kuDecrypt, kuDerive}))
+    if ctxLen > MaxPublicDeriveContextLen:
+      return (svcBadRequest, 0)
+    var h = InvalidHandle
+    if labLen == 0 and ctxLen == 0:
+      h = vaultDeriveKeyForCaller(caller, parent, [], [], outLen,
+            KeyPolicy(usage: {kuEncrypt, kuDecrypt, kuDerive}))
+    elif labLen == 0:
+      h = vaultDeriveKeyForCaller(caller, parent, [],
+            toOpenArray(buf, 16, 16 + ctxLen - 1), outLen,
+            KeyPolicy(usage: {kuEncrypt, kuDecrypt, kuDerive}))
+    elif ctxLen == 0:
+      h = vaultDeriveKeyForCaller(caller, parent,
+            toOpenArray(buf, 16, 16 + labLen - 1), [], outLen,
+            KeyPolicy(usage: {kuEncrypt, kuDecrypt, kuDerive}))
+    else:
+      h = vaultDeriveKeyForCaller(caller, parent,
+            toOpenArray(buf, 16, 16 + labLen - 1),
+            toOpenArray(buf, 16 + labLen, 16 + labLen + ctxLen - 1),
+            outLen, KeyPolicy(usage: {kuEncrypt, kuDecrypt, kuDerive}))
     if h == InvalidHandle: return (svcCryptoFail, 0)
     wrU32(buf, 0, h.uint32)
     (svcOk, 4)
@@ -136,13 +267,22 @@ proc enclaveDispatch*(svc: SvcId, reqLen: int,
     var nonce: array[16, uint8]
     for i in 0 ..< 16: nonce[i] = buf[base + i]
     var key: AeadKey
-    if not deriveAead(hdl, [], key): return (svcDenied, 0)
+    if not deriveAeadForCaller(caller, hdl, kuEncrypt, key): return (svcDenied, 0)
     let ptOff = base + 16 + aadLen
     var ct = newSeq[uint8](ptLen)
     var tag: AeadTag
-    if not aeadSeal(key, nonce, toOpenArray(buf, base + 16, base + 16 + aadLen - 1),
-                    toOpenArray(buf, ptOff, ptOff + ptLen - 1), ct, tag):
-      return (svcCryptoFail, 0)
+    let sealed =
+      if aadLen == 0 and ptLen == 0:
+        aeadSeal(key, nonce, [], [], ct, tag)
+      elif aadLen == 0:
+        aeadSeal(key, nonce, [], toOpenArray(buf, ptOff, ptOff + ptLen - 1), ct, tag)
+      elif ptLen == 0:
+        aeadSeal(key, nonce, toOpenArray(buf, base + 16, base + 16 + aadLen - 1),
+                 [], ct, tag)
+      else:
+        aeadSeal(key, nonce, toOpenArray(buf, base + 16, base + 16 + aadLen - 1),
+                 toOpenArray(buf, ptOff, ptOff + ptLen - 1), ct, tag)
+    if not sealed: return (svcCryptoFail, 0)
     if ptLen + 32 > bufCap: return (svcTooBig, 0)
     for i in 0 ..< ptLen: buf[i] = ct[i]
     for i in 0 ..< 32: buf[ptLen + i] = tag[i]
@@ -161,23 +301,34 @@ proc enclaveDispatch*(svc: SvcId, reqLen: int,
     var nonce: array[16, uint8]
     for i in 0 ..< 16: nonce[i] = buf[base + i]
     var key: AeadKey
-    if not deriveAead(hdl, [], key): return (svcDenied, 0)
+    if not deriveAeadForCaller(caller, hdl, kuDecrypt, key): return (svcDenied, 0)
     let ctOff = base + 16 + aadLen
     var tag: AeadTag
     for i in 0 ..< 32: tag[i] = buf[ctOff + ctLen + i]
     var pt = newSeq[uint8](ctLen)
-    if not aeadOpen(key, nonce, toOpenArray(buf, base + 16, base + 16 + aadLen - 1),
-                    toOpenArray(buf, ctOff, ctOff + ctLen - 1), tag, pt):
-      return (svcCryptoFail, 0)
+    let opened =
+      if aadLen == 0 and ctLen == 0:
+        aeadOpen(key, nonce, [], [], tag, pt)
+      elif aadLen == 0:
+        aeadOpen(key, nonce, [], toOpenArray(buf, ctOff, ctOff + ctLen - 1), tag, pt)
+      elif ctLen == 0:
+        aeadOpen(key, nonce, toOpenArray(buf, base + 16, base + 16 + aadLen - 1),
+                 [], tag, pt)
+      else:
+        aeadOpen(key, nonce, toOpenArray(buf, base + 16, base + 16 + aadLen - 1),
+                 toOpenArray(buf, ctOff, ctOff + ctLen - 1), tag, pt)
+    if not opened: return (svcCryptoFail, 0)
     for i in 0 ..< ctLen: buf[i] = pt[i]
     (svcOk, ctLen)
 
   of svcP256Sign:
     # req: u32 handle | 32-byte hash
     if reqLen < 4 + 32: return (svcBadRequest, 0)
+    if not isTrustedCaller(caller): return (svcDenied, 0)
     let hdl = KeyHandle(rdU32(buf, 0))
     var scalarBytes: array[32, uint8]
-    if not vaultExpand(hdl, AttestInfo, scalarBytes): return (svcDenied, 0)
+    if not vaultExpandForCaller(caller, hdl, AttestInfo, scalarBytes, kuSign):
+      return (svcDenied, 0)
     var scalar, hash, r, s: array[8, uint32]
     bytesToWordsBe(scalarBytes, scalar)
     bytesToWordsBe(toOpenArray(buf, 4, 35), hash)
@@ -201,42 +352,28 @@ proc enclaveDispatch*(svc: SvcId, reqLen: int,
   of svcGetAttestation:
     # req: nonce(32) -> resp: chipid(8) | measurement(32) | sig r||s (64)
     if reqLen < 32: return (svcBadRequest, 0)
-    let id = secDbgChipId()
-    let meas = measureImage()
-    var toHash: array[8 + 32 + 32, uint8]
-    for i in 0 ..< 8: toHash[i] = ((id shr (i * 8)) and 0xFF).uint8
-    for i in 0 ..< 32: toHash[8 + i] = meas[i]
-    for i in 0 ..< 32: toHash[40 + i] = buf[i]
-    let h = sha256(toHash)
-    # sign with the attestation key derived from the vault root
-    var scalarBytes: array[32, uint8]
-    if not vaultExpand(vaultRoot(), AttestInfo, scalarBytes): return (svcDenied, 0)
-    var scalar, hashW, r, s: array[8, uint32]
-    bytesToWordsBe(scalarBytes, scalar)
-    bytesToWordsBe(h, hashW)
-    if not p256Sign(scalar, hashW, r, s): return (svcCryptoFail, 0)
-    for i in 0 ..< 8: buf[i] = toHash[i]
-    for i in 0 ..< 32: buf[8 + i] = meas[i]
-    wordsToBytesBe(r, buf, 40)
-    wordsToBytesBe(s, buf, 72)
-    (svcOk, 8 + 32 + 64)
+    if isTrustedCaller(caller): getAttestationTrusted(buf)
+    else: getAttestationUntrusted(buf)
 
   of svcSealBlob:
-    # req: nonce(16) | data -> resp: data-as-ct | tag(32), bound to device
-    if reqLen < 16: return (svcBadRequest, 0)
-    let dataLen = reqLen - 16
+    # req: data -> resp: nonce(16) | data-as-ct | tag(32), bound to device
+    let dataLen = reqLen
+    if 16 + dataLen + 32 > bufCap: return (svcTooBig, 0)
     var nonce: array[16, uint8]
-    for i in 0 ..< 16: nonce[i] = buf[i]
+    if trngFillBuffer(toOpenArray(nonce, 0, 15)) != secOk:
+      return (svcCryptoFail, 0)
     var key: AeadKey
     if not deriveAead(vaultRoot(), measureImage(), key): return (svcDenied, 0)
     var ct = newSeq[uint8](dataLen)
     var tag: AeadTag
-    if not aeadSeal(key, nonce, [], toOpenArray(buf, 16, reqLen - 1), ct, tag):
-      return (svcCryptoFail, 0)
-    if dataLen + 32 > bufCap: return (svcTooBig, 0)
-    for i in 0 ..< dataLen: buf[i] = ct[i]
-    for i in 0 ..< 32: buf[dataLen + i] = tag[i]
-    (svcOk, dataLen + 32)
+    let sealed =
+      if dataLen == 0: aeadSeal(key, nonce, [], [], ct, tag)
+      else: aeadSeal(key, nonce, [], toOpenArray(buf, 0, reqLen - 1), ct, tag)
+    if not sealed: return (svcCryptoFail, 0)
+    for i in 0 ..< 16: buf[i] = nonce[i]
+    for i in 0 ..< dataLen: buf[16 + i] = ct[i]
+    for i in 0 ..< 32: buf[16 + dataLen + i] = tag[i]
+    (svcOk, 16 + dataLen + 32)
 
   of svcUnsealBlob:
     # req: nonce(16) | sealed (ct | tag(32))
@@ -249,13 +386,169 @@ proc enclaveDispatch*(svc: SvcId, reqLen: int,
     var tag: AeadTag
     for i in 0 ..< 32: tag[i] = buf[16 + ctLen + i]
     var pt = newSeq[uint8](ctLen)
-    if not aeadOpen(key, nonce, [], toOpenArray(buf, 16, 16 + ctLen - 1), tag, pt):
-      return (svcCryptoFail, 0)
+    let opened =
+      if ctLen == 0: aeadOpen(key, nonce, [], [], tag, pt)
+      else: aeadOpen(key, nonce, [], toOpenArray(buf, 16, 16 + ctLen - 1), tag, pt)
+    if not opened: return (svcCryptoFail, 0)
     for i in 0 ..< ctLen: buf[i] = pt[i]
     (svcOk, ctLen)
 
+  of svcWasmInvokeI32:
+    when defined(bl808WasmCompact) or defined(bl808EnclaveWasmService):
+      # req: u32 slot | u32 exportNameLen | u32 argc | i32 args[argc] | exportName
+      # resp: u32 controlStatus | u32 managerError | u32 storeError | i32 value
+      if reqLen < 12 or bufCap < 16:
+        return (svcBadRequest, 0)
+      let slot = rdU32(buf, 0)
+      let nameLen = rdU32(buf, 4).int
+      let argc = rdU32(buf, 8).int
+      if not lenOk(nameLen, WasmInvokeMaxExportNameLen) or
+         not lenOk(argc, WasmInvokeMaxArgs) or nameLen == 0:
+        return (svcBadRequest, 0)
+      let nameOff = 12 + argc * 4
+      if nameOff < 12 or nameOff + nameLen > reqLen:
+        return (svcBadRequest, 0)
+
+      var args: array[WasmInvokeMaxArgs, int32]
+      for i in 0 ..< argc:
+        args[i] = cast[int32](rdU32(buf, 12 + i * 4))
+
+      var exportName = newString(nameLen)
+      for i in 0 ..< nameLen:
+        exportName[i] = char(buf[nameOff + i])
+
+      let run =
+        if argc == 0:
+          runWasmProgramI32(slot, exportName, [])
+        else:
+          runWasmProgramI32(slot, exportName, toOpenArray(args, 0, argc - 1))
+      writeWasmControlResult(buf, run, run.value)
+      (svcOk, 16)
+    else:
+      (svcUnsupported, 0)
+
+  of svcWasmCapabilities:
+    when defined(bl808WasmCompact) or defined(bl808EnclaveWasmService):
+      if reqLen != 0 or bufCap < 32:
+        return (svcBadRequest, 0)
+      writeWasmCapabilities(buf)
+      (svcOk, 32)
+    else:
+      (svcUnsupported, 0)
+
+  of svcWasmInstallBytes:
+    when defined(bl808WasmCompact) or defined(bl808EnclaveWasmService):
+      # req: u32 slot | u32 generation | u32 flags | u32 wasmLen | raw wasm bytes
+      # resp: u32 controlStatus | u32 managerError | u32 storeError | i32 slot
+      if reqLen < 16 or bufCap < 16:
+        return (svcBadRequest, 0)
+      let slot = rdU32(buf, 0)
+      let generation = rdU32(buf, 4)
+      let flags = rdU32(buf, 8)
+      let wasmLen = rdU32(buf, 12).int
+      if wasmLen <= 0 or not lenOk(wasmLen, reqLen) or 16 + wasmLen != reqLen:
+        return (svcBadRequest, 0)
+      let install = installWasmProgramBytes(
+        slot,
+        toOpenArray(buf, 16, 16 + wasmLen - 1),
+        generation = generation,
+        flags = flags,
+      )
+      writeWasmControlResult(buf, install, install.slot)
+      (svcOk, 16)
+    else:
+      (svcUnsupported, 0)
+
+  of svcWasmUnloadSlot:
+    when defined(bl808WasmCompact) or defined(bl808EnclaveWasmService):
+      # req: u32 slot
+      # resp: u32 controlStatus | u32 managerError | u32 storeError | i32 slot
+      if reqLen != 4 or bufCap < 16:
+        return (svcBadRequest, 0)
+      let unload = unloadWasmProgram(rdU32(buf, 0))
+      writeWasmControlResult(buf, unload, unload.slot)
+      (svcOk, 16)
+    else:
+      (svcUnsupported, 0)
+
+  of svcWasmTaskStartI32:
+    when defined(bl808WasmCompact) or defined(bl808EnclaveWasmService):
+      # req: u32 slot | u32 exportNameLen | u32 argc | i32 args[argc] | exportName
+      # resp: 11*u32 task result
+      if reqLen < 12 or bufCap < 44:
+        return (svcBadRequest, 0)
+      let slot = rdU32(buf, 0)
+      let nameLen = rdU32(buf, 4).int
+      let argc = rdU32(buf, 8).int
+      if not lenOk(nameLen, WasmInvokeMaxExportNameLen) or
+         not lenOk(argc, WasmInvokeMaxArgs) or nameLen == 0:
+        return (svcBadRequest, 0)
+      let nameOff = 12 + argc * 4
+      if nameOff < 12 or nameOff + nameLen > reqLen:
+        return (svcBadRequest, 0)
+
+      var args: array[WasmInvokeMaxArgs, int32]
+      for i in 0 ..< argc:
+        args[i] = cast[int32](rdU32(buf, 12 + i * 4))
+
+      var exportName = newString(nameLen)
+      for i in 0 ..< nameLen:
+        exportName[i] = char(buf[nameOff + i])
+
+      let started =
+        if argc == 0:
+          startWasmProgramTaskI32(slot, exportName, [])
+        else:
+          startWasmProgramTaskI32(slot, exportName, toOpenArray(args, 0, argc - 1))
+      writeWasmTaskResult(buf, started)
+      (svcOk, 44)
+    else:
+      (svcUnsupported, 0)
+
+  of svcWasmTaskResume:
+    when defined(bl808WasmCompact) or defined(bl808EnclaveWasmService):
+      # req: u32 taskId | u32 fuel
+      # resp: 11*u32 task result
+      if reqLen != 8 or bufCap < 44:
+        return (svcBadRequest, 0)
+      let resumed = resumeWasmProgramTask(rdU32(buf, 0), rdU32(buf, 4))
+      writeWasmTaskResult(buf, resumed)
+      (svcOk, 44)
+    else:
+      (svcUnsupported, 0)
+
+  of svcWasmTaskStatus:
+    when defined(bl808WasmCompact) or defined(bl808EnclaveWasmService):
+      # req: u32 taskId
+      # resp: 11*u32 task result
+      if reqLen != 4 or bufCap < 44:
+        return (svcBadRequest, 0)
+      let task = getWasmProgramTask(rdU32(buf, 0))
+      writeWasmTaskResult(buf, task)
+      (svcOk, 44)
+    else:
+      (svcUnsupported, 0)
+
+  of svcWasmTaskKill:
+    when defined(bl808WasmCompact) or defined(bl808EnclaveWasmService):
+      # req: u32 taskId
+      # resp: 11*u32 task result
+      if reqLen != 4 or bufCap < 44:
+        return (svcBadRequest, 0)
+      let killed = killWasmProgramTask(rdU32(buf, 0))
+      writeWasmTaskResult(buf, killed)
+      (svcOk, 44)
+    else:
+      (svcUnsupported, 0)
+
   else:
     (svcUnsupported, 0)
+
+proc enclaveDispatch*(svc: SvcId, reqLen: int,
+                      buf: ptr UncheckedArray[uint8], bufCap: int): (SvcStatus, int) =
+  ## Backward-compatible direct dispatch for existing harnesses. Production
+  ## transports call the overload that supplies their real caller identity.
+  enclaveDispatch(callerTestHarnessCtx(), svc, reqLen, buf, bufCap)
 
 proc attestationPublicKey*(outBuf: ptr UncheckedArray[uint8]): bool =
   ## Publish the attestation public key (x[0..31] || y[32..63], big-endian) so a

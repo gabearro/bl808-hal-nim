@@ -38,6 +38,18 @@ var nimFwDbgProbePayHwAckPolicyControl* {.wifiCtrl, exportc: "nimfw_dbg_probe_pa
 var nimFwDbgProbePayHwCompatRetryLimitControl* {.wifiCtrl, exportc: "nimfw_dbg_probe_pay_hw_word36".}: uint32
 var nimFwDbgProbePayHwCompatAckPolicyControl* {.wifiCtrl, exportc: "nimfw_dbg_probe_pay_hw_word56".}: uint32
 var nimFwDbgProbePayRaw* {.wifiCtrl, exportc: "nimfw_dbg_probe_pay_raw".}: array[96, uint8]
+var nimFwDbgAuthPayMeta* {.wifiCtrl, exportc: "nimfw_dbg_auth_pay_meta".}: uint32
+var nimFwDbgAuthPayLen* {.wifiCtrl, exportc: "nimfw_dbg_auth_pay_len".}: uint32
+var nimFwDbgAuthPayHw0* {.wifiCtrl, exportc: "nimfw_dbg_auth_pay_hw0".}: uint32
+var nimFwDbgAuthPayHw1* {.wifiCtrl, exportc: "nimfw_dbg_auth_pay_hw1".}: uint32
+var nimFwDbgAuthPayHw2* {.wifiCtrl, exportc: "nimfw_dbg_auth_pay_hw2".}: uint32
+var nimFwDbgAuthPayHw3* {.wifiCtrl, exportc: "nimfw_dbg_auth_pay_hw3".}: uint32
+var nimFwDbgAssocPayMeta* {.wifiCtrl, exportc: "nimfw_dbg_assoc_pay_meta".}: uint32
+var nimFwDbgAssocPayLen* {.wifiCtrl, exportc: "nimfw_dbg_assoc_pay_len".}: uint32
+var nimFwDbgAssocPayHw0* {.wifiCtrl, exportc: "nimfw_dbg_assoc_pay_hw0".}: uint32
+var nimFwDbgAssocPayHw1* {.wifiCtrl, exportc: "nimfw_dbg_assoc_pay_hw1".}: uint32
+var nimFwDbgAssocPayHw2* {.wifiCtrl, exportc: "nimfw_dbg_assoc_pay_hw2".}: uint32
+var nimFwDbgAssocPayHw3* {.wifiCtrl, exportc: "nimfw_dbg_assoc_pay_hw3".}: uint32
 var nimFwDbgProbeIeLen* {.wifiCtrl, exportc: "nimfw_dbg_probe_ie_len".}: uint32
 var nimFwDbgProbeIeRaw* {.wifiCtrl, exportc: "nimfw_dbg_probe_ie_raw".}: array[64, uint8]
 var nimFwDbgTxTrigEntry*    {.wifiCtrl, exportc: "nimfw_dbg_txtrig_entry".}: uint32
@@ -100,6 +112,14 @@ var nimFwDbgRxlTimerHead* {.wifiCtrl, exportc: "nimfw_dbg_rxl_timer_head".}: uin
 var nimFwDbgRxlCntrlEvt* {.wifiCtrl, exportc: "nimfw_dbg_rxl_cntrl_evt".}: uint32
 var nimFwDbgRxlCntrlHead* {.wifiCtrl, exportc: "nimfw_dbg_rxl_cntrl_head".}: uint32
 var nimFwDbgRxlDmaEvt* {.wifiCtrl, exportc: "nimfw_dbg_rxl_dma_evt".}: uint32
+var nimFwDbgRxlFrameSeen* {.wifiCtrl, exportc: "nimfw_dbg_rxl_frame_seen".}: uint32
+var nimFwDbgRxlLastHwFlags* {.wifiCtrl, exportc: "nimfw_dbg_rxl_last_hwflags".}: uint32
+var nimFwDbgRxlLastFc* {.wifiCtrl, exportc: "nimfw_dbg_rxl_last_fc".}: uint32
+var nimFwDbgRxlMgmtSeen* {.wifiCtrl, exportc: "nimfw_dbg_rxl_mgmt_seen".}: uint32
+var nimFwDbgRxlMgmtLast* {.wifiCtrl, exportc: "nimfw_dbg_rxl_mgmt_last".}: uint32
+var nimFwDbgRxlAuthLikeSeen* {.wifiCtrl, exportc: "nimfw_dbg_rxl_auth_like_seen".}: uint32
+var nimFwDbgRxlAuthLikeHwFlags* {.wifiCtrl, exportc: "nimfw_dbg_rxl_auth_like_hwflags".}: uint32
+var nimFwDbgRxlAuthLikeFc* {.wifiCtrl, exportc: "nimfw_dbg_rxl_auth_like_fc".}: uint32
 var nimFwDbgRxlSnapHd* {.wifiCtrl, exportc: "nimfw_dbg_rxl_snap_hd".}: uint32
 var nimFwDbgRxlSnapPd* {.wifiCtrl, exportc: "nimfw_dbg_rxl_snap_pd".}: uint32
 var nimFwDbgRxlSnapHwHd* {.wifiCtrl, exportc: "nimfw_dbg_rxl_snap_hw_hd".}: uint32
@@ -220,6 +240,15 @@ var nimFwDbgRxuDropDup* {.wifiCtrl, exportc: "nimfw_dbg_rxu_drop_dup".}: uint32
 var nimFwDbgRxuDropPn* {.wifiCtrl, exportc: "nimfw_dbg_rxu_drop_pn".}: uint32
 var nimFwDbgRxuProtType* {.wifiCtrl, exportc: "nimfw_dbg_rxu_prot_type".}: uint32
 var nimFwDbgRxuProtKey* {.wifiCtrl, exportc: "nimfw_dbg_rxu_prot_key".}: uint32
+var nimFwDbgRxuProtSlotMeta* {.wifiCtrl, exportc: "nimfw_dbg_rxu_prot_slot_meta".}: uint32
+var nimFwDbgRxuProtSlotKey0* {.wifiCtrl, exportc: "nimfw_dbg_rxu_prot_slot_key0".}: uint32
+var nimFwDbgRxuProtSlotKey1* {.wifiCtrl, exportc: "nimfw_dbg_rxu_prot_slot_key1".}: uint32
+var nimFwDbgRxuProtSlotKey2* {.wifiCtrl, exportc: "nimfw_dbg_rxu_prot_slot_key2".}: uint32
+var nimFwDbgRxuProtSlotKey3* {.wifiCtrl, exportc: "nimfw_dbg_rxu_prot_slot_key3".}: uint32
+var nimFwDbgRxuSwCcmpAttempt* {.wifiCtrl, exportc: "nimfw_dbg_rxu_sw_ccmp_attempt".}: uint32
+var nimFwDbgRxuSwCcmpOk* {.wifiCtrl, exportc: "nimfw_dbg_rxu_sw_ccmp_ok".}: uint32
+var nimFwDbgRxuSwCcmpFail* {.wifiCtrl, exportc: "nimfw_dbg_rxu_sw_ccmp_fail".}: uint32
+var nimFwDbgRxuSwCcmpLen* {.wifiCtrl, exportc: "nimfw_dbg_rxu_sw_ccmp_len".}: uint32
 var nimFwDbgRxuProtPnLo* {.wifiCtrl, exportc: "nimfw_dbg_rxu_prot_pn_lo".}: uint32
 var nimFwDbgRxuProtPnHi* {.wifiCtrl, exportc: "nimfw_dbg_rxu_prot_pn_hi".}: uint32
 var nimFwDbgRxuPnMeta* {.wifiCtrl, exportc: "nimfw_dbg_rxu_pn_meta".}: uint32
@@ -232,6 +261,9 @@ var nimFwDbgRxuDataSeq* {.wifiCtrl, exportc: "nimfw_dbg_rxu_data_seq".}: uint32
 var nimFwDbgRxuLastHwFlags* {.wifiCtrl, exportc: "nimfw_dbg_rxu_last_hwflags".}: uint32
 var nimFwDbgRxuLastStatus* {.wifiCtrl, exportc: "nimfw_dbg_rxu_last_status".}: uint32
 var nimFwDbgRxuLastLen* {.wifiCtrl, exportc: "nimfw_dbg_rxu_last_len".}: uint32
+var nimFwDbgRxuAuthSeen* {.wifiCtrl, exportc: "nimfw_dbg_rxu_auth_seen".}: uint32
+var nimFwDbgRxuAuthLast0* {.wifiCtrl, exportc: "nimfw_dbg_rxu_auth_last0".}: uint32
+var nimFwDbgRxuAuthLast1* {.wifiCtrl, exportc: "nimfw_dbg_rxu_auth_last1".}: uint32
 var nimFwDbgRxuSnapLo* {.wifiCtrl, exportc: "nimfw_dbg_rxu_snap_lo".}: uint32
 var nimFwDbgRxuSnapHi* {.wifiCtrl, exportc: "nimfw_dbg_rxu_snap_hi".}: uint32
 var nimFwDbgRxuAssocSnap* {.wifiCtrl, exportc: "nimfw_dbg_rxu_assoc_snap".}: uint32
@@ -314,6 +346,24 @@ var nimFwDbgMachwKeyWrPair3* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_pair3".
 var nimFwDbgMachwKeyWrPair4* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_pair4".}: uint32
 var nimFwDbgMachwKeyWrPair5* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_pair5".}: uint32
 var nimFwDbgMachwKeyWrPairCtrl* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_pair_ctrl".}: uint32
+var nimFwDbgMachwKeyWrPre0* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_pre0".}: uint32
+var nimFwDbgMachwKeyWrPre1* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_pre1".}: uint32
+var nimFwDbgMachwKeyWrPre2* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_pre2".}: uint32
+var nimFwDbgMachwKeyWrPre3* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_pre3".}: uint32
+var nimFwDbgMachwKeyWrCtrlBefore* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_ctrl_before".}: uint32
+var nimFwDbgMachwKeyWrCtrlAfterWrite* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_ctrl_after_write".}: uint32
+var nimFwDbgMachwKeyWrWriteWait* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_write_wait".}: uint32
+var nimFwDbgMachwKeyWrReadWait* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_read_wait".}: uint32
+var nimFwDbgMachwKeyWrGroup0* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_group0".}: uint32
+var nimFwDbgMachwKeyWrGroup1* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_group1".}: uint32
+var nimFwDbgMachwKeyWrGroup2* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_group2".}: uint32
+var nimFwDbgMachwKeyWrGroup3* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_group3".}: uint32
+var nimFwDbgMachwKeyWrGroupCtrl* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_group_ctrl".}: uint32
+var nimFwDbgMachwKeyWrGroupRead0* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_group_read0".}: uint32
+var nimFwDbgMachwKeyWrGroupRead1* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_group_read1".}: uint32
+var nimFwDbgMachwKeyWrGroupRead2* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_group_read2".}: uint32
+var nimFwDbgMachwKeyWrGroupRead3* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_group_read3".}: uint32
+var nimFwDbgMachwKeyWrGroupReadCtrl* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_group_read_ctrl".}: uint32
 var nimFwDbgMachwKeyWrRead0* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_read0".}: uint32
 var nimFwDbgMachwKeyWrRead1* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_read1".}: uint32
 var nimFwDbgMachwKeyWrRead2* {.wifiCtrl, exportc: "nimfw_dbg_machwkey_wr_read2".}: uint32
@@ -480,14 +530,26 @@ var nimFwDbgSetVifState*      {.wifiCtrl, exportc: "nimfw_dbg_set_vif_state".}: 
 var nimFwDbgSetVifStateNew*   {.wifiCtrl, exportc: "nimfw_dbg_set_vif_state_new".}: uint32  # last newState
 var nimFwDbgSetVifStateAct*   {.wifiCtrl, exportc: "nimfw_dbg_set_vif_state_act".}: uint32  # activating=true count
 var nimFwDbgAssocDone*        {.wifiCtrl, exportc: "nimfw_dbg_assoc_done".}: uint32
+var nimFwDbgSmRspTimeout*     {.wifiCtrl, exportc: "nimfw_dbg_sm_rsp_timeout".}: uint32
+var nimFwDbgSmRspTimeoutState* {.wifiCtrl, exportc: "nimfw_dbg_sm_rsp_timeout_state".}: uint32
+var nimFwDbgSmRspTimeoutRxCtrl* {.wifiCtrl, exportc: "nimfw_dbg_sm_rsp_timeout_rxctrl".}: uint32
+var nimFwDbgAckFallbackAuth*  {.wifiCtrl, exportc: "nimfw_dbg_ack_fallback_auth".}: uint32
+var nimFwDbgAckFallbackAssoc* {.wifiCtrl, exportc: "nimfw_dbg_ack_fallback_assoc".}: uint32
+var nimFwDbgAckFallbackLast*  {.wifiCtrl, exportc: "nimfw_dbg_ack_fallback_last".}: uint32
 var nimFwDbgAuthOpenSuccess*  {.wifiCtrl, exportc: "nimfw_dbg_auth_open_success".}: uint32
 var nimFwDbgAssocReqSend*     {.wifiCtrl, exportc: "nimfw_dbg_assoc_req_send".}: uint32
 var nimFwDbgAssocReqMeta*     {.wifiCtrl, exportc: "nimfw_dbg_assoc_req_meta".}: uint32
+var nimFwDbgAssocReqDesc*     {.wifiCtrl, exportc: "nimfw_dbg_assoc_req_desc".}: uint32
+var nimFwDbgAssocReqRaw*      {.wifiCtrl, exportc: "nimfw_dbg_assoc_req_raw".}: array[128, uint8]
 var nimFwDbgAssocCfmPush*     {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_push".}: uint32
 var nimFwDbgAssocCfmFrame*    {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_frame".}: uint32
 var nimFwDbgAssocCfmEvt*      {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_evt".}: uint32
 var nimFwDbgAssocCfmStatus*   {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_status".}: uint32
 var nimFwDbgAssocCfmHwStatus* {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_hw_status".}: uint32
+var nimFwDbgAssocCfmThdFlags* {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_thd_flags".}: uint32
+var nimFwDbgAssocCfmAckOk16*  {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_ack_ok16".}: uint32
+var nimFwDbgAssocCfmAckOk23*  {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_ack_ok23".}: uint32
+var nimFwDbgAssocCfmAckFail*  {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_ack_fail".}: uint32
 var nimFwDbgAssocCfmDesc*     {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_desc".}: uint32
 var nimFwDbgAssocCfmMeta*     {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_meta".}: uint32
 var nimFwDbgAssocCfmFc*       {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_fc".}: uint32
@@ -637,6 +699,8 @@ var nimFwDbgSelftestRan*     {.wifiCtrl, exportc: "nimfw_dbg_selftest_ran".}: ui
 var nimFwDbgVifMac*          {.wifiCtrl, exportc: "nimfw_dbg_vif_mac".}: array[6, uint8]
 var nimFwDbgMacHwLo*         {.wifiCtrl, exportc: "nimfw_dbg_mac_hw_lo".}: uint32
 var nimFwDbgMacHwHi*         {.wifiCtrl, exportc: "nimfw_dbg_mac_hw_hi".}: uint32
+var nimFwDbgBssidHwLo*       {.wifiCtrl, exportc: "nimfw_dbg_bssid_hw_lo".}: uint32
+var nimFwDbgBssidHwHi*       {.wifiCtrl, exportc: "nimfw_dbg_bssid_hw_hi".}: uint32
 # M2 EAPOL frame snapshot — Ethernet + EAPOL key bytes as sent by supplicant.
 var nimFwDbgM2Len*           {.wifiCtrl, exportc: "nimfw_dbg_m2_len".}: uint32
 var nimFwDbgM2Buf*           {.wifiCtrl, exportc: "nimfw_dbg_m2_buf".}: array[160, uint8]
@@ -663,14 +727,31 @@ var nimFwDbgMgtLastFc*       {.wifiCtrl, exportc: "nimfw_dbg_mgt_last_fc".}: uin
 var nimFwDbgMgtLast0*        {.wifiCtrl, exportc: "nimfw_dbg_mgt_last0".}: uint32
 var nimFwDbgMgtLast1*        {.wifiCtrl, exportc: "nimfw_dbg_mgt_last1".}: uint32
 var nimFwDbgMgtDropReason*   {.wifiCtrl, exportc: "nimfw_dbg_mgt_drop_reason".}: uint32
+var nimFwDbgMgtSubtypeCounts* {.wifiCtrl, exportc: "nimfw_dbg_mgt_subtype_counts".}: array[16, uint32]
+var nimFwDbgMgtAuthLastFc*   {.wifiCtrl, exportc: "nimfw_dbg_mgt_auth_last_fc".}: uint32
+var nimFwDbgMgtAssocLastFc*  {.wifiCtrl, exportc: "nimfw_dbg_mgt_assoc_last_fc".}: uint32
+var nimFwDbgMgtAssocRspSeen* {.wifiCtrl, exportc: "nimfw_dbg_mgt_assoc_rsp_seen".}: uint32
+var nimFwDbgTxSeqLast*       {.wifiCtrl, exportc: "nimfw_dbg_tx_seq_last".}: uint32
+var nimFwDbgTxSeqCounter*    {.wifiCtrl, exportc: "nimfw_dbg_tx_seq_counter".}: uint32
 var nimFwDbgAuthSmDispatch*  {.wifiCtrl, exportc: "nimfw_dbg_auth_sm_dispatch".}: uint32
 var nimFwDbgAuthSmState*     {.wifiCtrl, exportc: "nimfw_dbg_auth_sm_state".}: uint32
 var nimFwDbgAuthHandler*     {.wifiCtrl, exportc: "nimfw_dbg_auth_handler".}: uint32
 var nimFwDbgAuthHandlerLast* {.wifiCtrl, exportc: "nimfw_dbg_auth_handler_last".}: uint32
+var nimFwDbgPreauthStaReq*   {.wifiCtrl, exportc: "nimfw_dbg_preauth_sta_req".}: uint32
+var nimFwDbgPreauthStaReqMeta* {.wifiCtrl, exportc: "nimfw_dbg_preauth_sta_req_meta".}: uint32
+var nimFwDbgPreauthStaReqBssid0* {.wifiCtrl, exportc: "nimfw_dbg_preauth_sta_req_bssid0".}: uint32
+var nimFwDbgPreauthStaReqBssid1* {.wifiCtrl, exportc: "nimfw_dbg_preauth_sta_req_bssid1".}: uint32
+var nimFwDbgPreauthStaAddEntry* {.wifiCtrl, exportc: "nimfw_dbg_preauth_sta_add_entry".}: uint32
+var nimFwDbgPreauthStaAddMeta* {.wifiCtrl, exportc: "nimfw_dbg_preauth_sta_add_meta".}: uint32
+var nimFwDbgPreauthStaAddExit* {.wifiCtrl, exportc: "nimfw_dbg_preauth_sta_add_exit".}: uint32
+var nimFwDbgPreauthStaAddResult* {.wifiCtrl, exportc: "nimfw_dbg_preauth_sta_add_result".}: uint32
+var nimFwDbgPreauthStaCfm*   {.wifiCtrl, exportc: "nimfw_dbg_preauth_sta_cfm".}: uint32
+var nimFwDbgPreauthStaCfmMeta* {.wifiCtrl, exportc: "nimfw_dbg_preauth_sta_cfm_meta".}: uint32
 var nimFwDbgAuthTxLen*       {.wifiCtrl, exportc: "nimfw_dbg_auth_tx_len".}: uint32
 var nimFwDbgAuthTxMeta*      {.wifiCtrl, exportc: "nimfw_dbg_auth_tx_meta".}: uint32
 var nimFwDbgAuthTxDesc*      {.wifiCtrl, exportc: "nimfw_dbg_auth_tx_desc".}: uint32
 var nimFwDbgAuthTxRaw*       {.wifiCtrl, exportc: "nimfw_dbg_auth_tx_raw".}: array[96, uint8]
+var nimFwDbgAuthRxCtrl*      {.wifiCtrl, exportc: "nimfw_dbg_auth_rxctrl".}: uint32
 var nimFwDbgAuthRfPrePush*   {.wifiCtrl, exportc: "nimfw_dbg_auth_rf_pre_push".}: array[8, uint32]
 var nimFwDbgAuthHwPrePush*   {.wifiCtrl, exportc: "nimfw_dbg_auth_hw_pre_push".}: array[32, uint32]
 var nimFwDbgAuthCfmPush*     {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_push".}: uint32
@@ -678,6 +759,10 @@ var nimFwDbgAuthCfmFrame*    {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_frame".}: 
 var nimFwDbgAuthCfmEvt*      {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_evt".}: uint32
 var nimFwDbgAuthCfmStatus*   {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_status".}: uint32
 var nimFwDbgAuthCfmHwStatus* {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_hw_status".}: uint32
+var nimFwDbgAuthCfmThdFlags* {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_thd_flags".}: uint32
+var nimFwDbgAuthCfmAckOk16*  {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_ack_ok16".}: uint32
+var nimFwDbgAuthCfmAckOk23*  {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_ack_ok23".}: uint32
+var nimFwDbgAuthCfmAckFail*  {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_ack_fail".}: uint32
 var nimFwDbgAuthCfmDesc*     {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_desc".}: uint32
 var nimFwDbgAuthCfmMeta*     {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_meta".}: uint32
 var nimFwDbgAuthCfmFc*       {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_fc".}: uint32

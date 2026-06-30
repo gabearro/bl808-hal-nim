@@ -4901,7 +4901,10 @@ template keMsgHandlerDescAt(table: pointer, state: uint16): ptr KeMsgHandlerDesc
 {.pragma: wifiRxDmaHd, codegenDecl: "$# $# __attribute__((section(\".wifibss.rx_dma.0_hd\"), aligned(16), used))".}
 {.pragma: wifiRxDmaPd, codegenDecl: "$# $# __attribute__((section(\".wifibss.rx_dma.1_pd\"), aligned(16), used))".}
 {.pragma: wifiRxDmaSw, codegenDecl: "$# $# __attribute__((section(\".wifibss.rx_dma.2_sw\"), aligned(16), used))".}
-{.pragma: wifiRxDmaBuf, codegenDecl: "$# $# __attribute__((section(\".wifibss.rx_dma.3_buf\"), aligned(16), used))".}
+when defined(bl808AllcoreWasmHttp):
+  {.pragma: wifiRxDmaBuf, codegenDecl: "$# $# __attribute__((section(\".wifirxram\"), aligned(16), used))".}
+else:
+  {.pragma: wifiRxDmaBuf, codegenDecl: "$# $# __attribute__((section(\".wifibss.rx_dma.3_buf\"), aligned(16), used))".}
 
 # TX DMA descriptor (from disassembly analysis of txl_buffer_init)
 type

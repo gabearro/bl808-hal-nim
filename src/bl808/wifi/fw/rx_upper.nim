@@ -66,6 +66,13 @@ var rxu_mgmt_dup_addr* {.exportc.}: array[6, uint8]
 ## Flag byte cleared per new management frame; used for duplicate detection.
 var rxu_cntrl_duplicate_flag {.exportc: "rxu_cntrl_duplicate_detect".}: uint8
 
+const RxuCcmpHeaderScratchLen = 64
+const RxuCcmpDataScratchLen = 2352
+
+var rxuCcmpHeaderScratch {.align: 16.}: array[RxuCcmpHeaderScratchLen, uint8]
+var rxuCcmpDataScratch {.align: 16.}: array[RxuCcmpDataScratchLen, uint8]
+var rxuCcmpPlainScratch {.align: 16.}: array[RxuCcmpDataScratchLen, uint8]
+
 proc rxu_cntrl_machdr_len_get*(frameCtrl: uint16): uint8 {.exportc, cdecl, noinline.} =
   ## Compute MAC header length from Frame Control.
   ## 24 (3-addr) or 30 (4-addr if ToDS+FromDS), +2 QoS, +4 HT Control.
@@ -92,6 +99,46 @@ proc rxuProtectedKey(env: ptr RxuCntrlEnvView, keyIdx: uint8,
   let sta = staInfoForIdx(env.staIdx)
   cast[ptr VifKeySlotView](addr sta.keyArea[0])
 
+proc rxuCipherFrameTypeFromKey(key: ptr VifKeySlotView;
+                               flagged: bool): uint32 {.inline.} =
+  if key == nil:
+    return 0
+  case key.cipherType
+  of 0:
+    return if flagged: 28'u32 else: 20'u32 # flagged WPA group frames can omit cipher metadata
+  of 3:
+    return 20'u32 # WEP
+  of 1:
+    return if flagged: 24'u32 else: 28'u32 # group TKIP, pairwise CCMP
+  of 2, 5:
+    return 28'u32 # CCMP
+  else:
+    return 0
+
+proc rxuCipherIsCcmp(key: ptr VifKeySlotView): bool {.inline.} =
+  key != nil and (key.cipherType == 2'u8 or key.cipherType == 5'u8)
+
+proc rxuTraceProtectedSlot(key: ptr VifKeySlotView; keyIdx: uint8;
+                           flagged: bool) {.inline.} =
+  if key == nil:
+    nimFwDbgRxuProtSlotMeta = keyIdx.uint32 or
+      (if flagged: 0x00000100'u32 else: 0'u32)
+    nimFwDbgRxuProtSlotKey0 = 0
+    nimFwDbgRxuProtSlotKey1 = 0
+    nimFwDbgRxuProtSlotKey2 = 0
+    nimFwDbgRxuProtSlotKey3 = 0
+    return
+  nimFwDbgRxuProtSlotMeta =
+    keyIdx.uint32 or
+    (if flagged: 0x00000100'u32 else: 0'u32) or
+    (key.cipherType.uint32 shl 16) or
+    (key.staIdx.uint32 shl 20) or
+    (key.keyIdx.uint32 shl 24)
+  nimFwDbgRxuProtSlotKey0 = cast[ptr uint32](addr key.keyMaterial[0])[]
+  nimFwDbgRxuProtSlotKey1 = cast[ptr uint32](addr key.keyMaterial[4])[]
+  nimFwDbgRxuProtSlotKey2 = cast[ptr uint32](addr key.keyMaterial[8])[]
+  nimFwDbgRxuProtSlotKey3 = cast[ptr uint32](addr key.keyMaterial[12])[]
+
 proc rxu_cntrl_protected_handle*(rxuCtx: pointer, hwRxhdrFlags: uint32): cint {.exportc, cdecl.} =
   ## Handle protected frame: parse CCMP/TKIP header, set up security context (94 instrs).
   ## a0 = RX upload context pointer, a1 = HW RX header flags.
@@ -102,9 +149,20 @@ proc rxu_cntrl_protected_handle*(rxuCtx: pointer, hwRxhdrFlags: uint32): cint {.
   ## Returns 1 on success, 0 on unrecognized frame type.
   let env = rxuCntrlEnvView()
   let hdrOffset = env.machdrLen
-  let frameType = hwRxhdrFlags and 0x1C  # bits 4:2 (cipher type * 4)
+  let rawFrameType = hwRxhdrFlags and 0x1C  # bits 4:2 (cipher type * 4)
   let flaggedKeyTable = (hwRxhdrFlags and 0x400) != 0
-  nimFwDbgRxuProtType = frameType or (hwRxhdrFlags and 0x400'u32)
+  let keyIdxProbe =
+    (rxSecurityHeaderAt[CcmpSecurityHeaderView](rxuCtx, hdrOffset).keyId shr 6) and 0x03
+  let keyProbe = rxuProtectedKey(env, keyIdxProbe, flaggedKeyTable)
+  let inferredFrameType =
+    if rawFrameType == 0'u32:
+      rxuCipherFrameTypeFromKey(keyProbe, flaggedKeyTable)
+    else:
+      rawFrameType
+  let frameType = inferredFrameType
+  nimFwDbgRxuProtType =
+    frameType or ((rawFrameType and 0x1C'u32) shl 8) or
+      (hwRxhdrFlags and 0x400'u32)
   case frameType
   of 24:  # TKIP (8 byte header)
     let hdr = rxSecurityHeaderAt[TkipSecurityHeaderView](rxuCtx, hdrOffset)
@@ -115,6 +173,8 @@ proc rxu_cntrl_protected_handle*(rxuCtx: pointer, hwRxhdrFlags: uint32): cint {.
     env.secInfo1 = hdr.tsc4.uint32 or (hdr.tsc5.uint32 shl 8)
     env.secFlags = env.secFlags or 0x03'u8
     env.secKeyPtr = cast[pointer](rxuProtectedKey(env, keyIdx, flaggedKeyTable))
+    rxuTraceProtectedSlot(cast[ptr VifKeySlotView](env.secKeyPtr), keyIdx,
+                          flaggedKeyTable)
     nimFwDbgRxuProtKey = pointerAddrU32(env.secKeyPtr)
     nimFwDbgRxuProtPnLo = env.secInfo0
     nimFwDbgRxuProtPnHi = env.secInfo1
@@ -128,6 +188,8 @@ proc rxu_cntrl_protected_handle*(rxuCtx: pointer, hwRxhdrFlags: uint32): cint {.
     env.secInfo1 = hdr.pn4.uint32 or (hdr.pn5.uint32 shl 8)
     env.secFlags = env.secFlags or 0x02'u8
     env.secKeyPtr = cast[pointer](rxuProtectedKey(env, keyIdx, flaggedKeyTable))
+    rxuTraceProtectedSlot(cast[ptr VifKeySlotView](env.secKeyPtr), keyIdx,
+                          flaggedKeyTable)
     nimFwDbgRxuProtKey = pointerAddrU32(env.secKeyPtr)
     nimFwDbgRxuProtPnLo = env.secInfo0
     nimFwDbgRxuProtPnHi = env.secInfo1
@@ -178,8 +240,8 @@ proc rxu_cntrl_check_pn*(secKeyPtr: pointer, tid: uint8): cint {.exportc, cdecl.
     if not accept:
       return 0  # replay detected
     # Update stored PN
-      replayCounter.pnLow = nextLo
-      replayCounter.pnHigh = nextHi
+    replayCounter.pnLow = nextLo
+    replayCounter.pnHigh = nextHi
     return 1
   else:
     # Group key / TID map: if tid==8, remap to 0 (TID 8 used for non-QoS group).
@@ -213,6 +275,71 @@ proc rxu_cntrl_check_pn*(secKeyPtr: pointer, tid: uint8): cint {.exportc, cdecl.
     }
     """].}
     return replayValidationStatus
+
+proc rxuFindSnapOffset(frame: ptr MacDataFrameHeaderView; frameLen: uint16;
+                       preferredOffset: uint8): uint8 {.inline.} =
+  if frameLen.uint32 >= preferredOffset.uint32 + sizeof(LlcSnapHeaderView).uint32:
+    let preferredSnap = rxMsdu(frame, preferredOffset)
+    if rxSnapIsRfc1042(preferredSnap) or rxSnapIsBridgeTunnel(preferredSnap):
+      return preferredOffset
+  var offset = 24'u8
+  while offset.uint32 + sizeof(LlcSnapHeaderView).uint32 <= frameLen.uint32 and
+      offset <= 48'u8:
+    let snap = rxMsdu(frame, offset)
+    if rxSnapIsRfc1042(snap) or rxSnapIsBridgeTunnel(snap):
+      return offset
+    inc offset
+  preferredOffset
+
+proc rxuTrySoftwareCcmpDecrypt(frame: ptr MacDataFrameHeaderView;
+                               swdesc: ptr RxSwDescView): bool {.inline.} =
+  let env = rxuCntrlEnvView()
+  let key = cast[ptr VifKeySlotView](env.secKeyPtr)
+  if not rxuCipherIsCcmp(key):
+    return false
+  if env.machdrLen < 8'u8:
+    return false
+
+  let currentSnap = rxMsdu(frame, env.machdrLen)
+  if rxSnapIsRfc1042(currentSnap) or rxSnapIsBridgeTunnel(currentSnap):
+    return false
+
+  let origHdrLen = env.machdrLen - 8'u8
+  let frameLen = swdesc.mpduLengthBytes.uint32
+  if frameLen <= origHdrLen.uint32 + 16'u32:
+    return false
+  let encryptedLen = frameLen - origHdrLen.uint32
+  if origHdrLen.uint32 > RxuCcmpHeaderScratchLen.uint32 or
+      encryptedLen > RxuCcmpDataScratchLen.uint32:
+    inc nimFwDbgRxuSwCcmpFail
+    return false
+
+  inc nimFwDbgRxuSwCcmpAttempt
+  discard c_memcpy(addr rxuCcmpHeaderScratch[0],
+                   cast[pointer](frame),
+                   origHdrLen.csize_t)
+  discard c_memcpy(addr rxuCcmpDataScratch[0],
+                   rxFrameCursor(frame, origHdrLen.uint),
+                   encryptedLen.csize_t)
+  var decryptedLen: uint32 = 0
+  if not nim_ccmp_decrypt(
+    cast[pointer](addr key.keyMaterial[0]),
+    addr rxuCcmpHeaderScratch[0],
+    addr rxuCcmpDataScratch[0],
+    encryptedLen,
+    addr rxuCcmpPlainScratch[0],
+    addr decryptedLen,
+  ) or decryptedLen == 0:
+    inc nimFwDbgRxuSwCcmpFail
+    return false
+
+  discard c_memcpy(rxFrameCursor(frame, origHdrLen.uint),
+                   addr rxuCcmpPlainScratch[0], decryptedLen.csize_t)
+  env.machdrLen = origHdrLen
+  swdesc.mpduLengthBytes = (origHdrLen.uint32 + decryptedLen.uint32).uint16
+  nimFwDbgRxuSwCcmpLen = decryptedLen.uint32
+  inc nimFwDbgRxuSwCcmpOk
+  true
 
 proc rxu_cntrl_desc_prepare*(swdesc: pointer) {.exportc, cdecl, noinline.} =
   ## Set descriptor status=3, push to rxu_cntrl_env upload list under IRQ lock.
@@ -334,6 +461,11 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
     # .L137: Frame valid -- begin classification
     let frame = macDataFrameAt(rxFramePayload(swdesc))
     let frameControl = frame.frameControl
+    if (frameControl and 0x00FC'u16) == 0x00B0'u16:
+      inc nimFwDbgRxuAuthSeen
+      nimFwDbgRxuAuthLast0 = hwFlags
+      nimFwDbgRxuAuthLast1 =
+        frameControl.uint32 or (swdesc.mpduLengthBytes.uint32 shl 16)
     nimFwTrace2U32("[WIFI-NIMFW] rxu_fc ", hwFlags, frameControl.uint32)
 
     # NOTE: The blob does NOT call tcpip_stack_input from rxu_cntrl_frame_handle.
@@ -531,6 +663,7 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
                                 swdesc.mpduLengthBytes) != 0:
             nimFwDbgRecordRxuPnAccept(1'u32, frame, hwFlags, envSeq, env.tid,
                                       env.machdrLen, swdesc.mpduLengthBytes)
+          discard rxuTrySoftwareCcmpDecrypt(frame, swdesc)
 
         # .L171: EAPOL detection requires RFC1042 SNAP then EtherType 0x888E.
         let msdu = rxMsduView(frame, env.machdrLen)
@@ -713,8 +846,10 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
         # .L185: LLC/SNAP header check for proper strip length computation.
         # Blob uses two memcmp calls against 6-byte RFC1042 + bridge-tunnel
         # headers at .LANCHOR0 and .LANCHOR1.
-        var stripLen = machdrLen and 0xFE
-        let msduSnap = rxMsdu(finalFrame, stripLen)
+        let uploadMacHdrLen =
+          rxuFindSnapOffset(finalFrame, swdesc.mpduLengthBytes, env.machdrLen)
+        var stripLen = uploadMacHdrLen and 0xFE
+        let msduSnap = rxMsdu(finalFrame, uploadMacHdrLen)
 
         let isRfc1042 = rxSnapIsRfc1042(msduSnap)
         let isIpx = isRfc1042 and msduSnap.ethertype == 0x3781'u16 # 0x8137 LE
@@ -722,14 +857,17 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
           (not isRfc1042 or isIpx) and rxSnapIsBridgeTunnel(msduSnap)
 
         if (isRfc1042 and not isIpx) or isBridgeTunnel:
-          # .L192: Standard RFC1042/bridge SNAP: strip 6 bytes, keep ethertype.
-          stripLen = (stripLen.int - 6).uint8
+          # Standard RFC1042/bridge SNAP: expose an Ethernet-II frame. The
+          # synthetic Ethernet header is written 14 bytes before the IP/ARP
+          # payload, and the TCP/IP wrapper starts copying there.
+          stripLen = (uploadMacHdrLen.uint32 + sizeof(LlcSnapHeaderView).uint32).uint8
         else:
           # .L190: A-MSDU sub-frame: strip 14 bytes and write the sub-frame length.
           stripLen = (stripLen.int - 14).uint8
           let adjustedLen2 = swdesc.mpduLengthBytes
-          let lenVal = adjustedLen2 - (machdrLen and 0xFE).uint16
-          let lenPtr = cast[ptr uint16](addr rxFrameBytes(finalFrame)[(machdrLen and 0xFE).int - 2])
+          let lenVal = adjustedLen2 - (uploadMacHdrLen and 0xFE).uint16
+          let lenPtr = cast[ptr uint16](
+            addr rxFrameBytes(finalFrame)[(uploadMacHdrLen and 0xFE).int - 2])
           lenPtr[] = lenVal
           env.meshFlag = 1
 
@@ -741,6 +879,8 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
         let ethHdr = rxEthernetRewriteHeader(finalFrame, stripLen)
         rxCopyAddr(addr ethHdr.da, addr env.da)
         rxCopyAddr(addr ethHdr.sa, addr env.sa)
+        if (isRfc1042 and not isIpx) or isBridgeTunnel:
+          ethHdr.ethertype = msduSnap.ethertype
 
         # Adjust length, set strip info
         swdesc.mpduLengthBytes = swdesc.mpduLengthBytes - stripLen.uint16

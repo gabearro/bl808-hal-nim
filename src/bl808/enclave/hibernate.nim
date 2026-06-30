@@ -115,6 +115,8 @@ proc enclaveHbnResumeArmed*(): bool =
   hbnWarmBootMagicArmed() and resumeSlot().magic == HbnResumeMagic and
     resumeSlot().version == HbnResumeVersion
 
+proc enclaveClearHbnResume*()
+
 proc enclaveValidateHbnResume*(appResumePc: var uint32): bool =
   ## On wake (after re-deriving the vault root and re-applying the partition):
   ## recompute the descriptor MAC and accept the resume ONLY if it matches. On
@@ -123,13 +125,17 @@ proc enclaveValidateHbnResume*(appResumePc: var uint32): bool =
     return false
   var key: array[32, uint8]
   if not deriveResumeKey(key):
+    enclaveClearHbnResume()
     return false
   let d = resumeSlot()[]
   let expect = hbnResumeTag(key, d)
   wipeKey(key)
-  if not ctEqual(expect, d.tag):
+  if not ctEqual(expect, d.tag) or d.bootMeas != measureImage() or
+     regRead(HbnRsv1) != d.resumeEntry:
+    enclaveClearHbnResume()
     return false
   appResumePc = d.appResumePc
+  enclaveClearHbnResume()
   true
 
 proc enclaveClearHbnResume*() =

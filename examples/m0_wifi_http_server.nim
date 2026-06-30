@@ -20,6 +20,7 @@ import bl808/kernel/alloc
 import bl808/kernel/clock
 import bl808/kernel/e2e_marker
 import bl808/kernel/lwipcore
+import bl808/wasm_http
 
 {.emit: "#include \"lwip/tcp.h\"\n#include \"lwip/pbuf.h\"".}
 {.emit: """
@@ -64,6 +65,7 @@ const
   UdpProbePort {.intdefine.} = 65001
   DhcpTimeoutMs = 30_000'u32
   UdpProbeIntervalMs = 1_000'u32
+  HttpRequestBufferLen = 2048
 
 const
   HttpGreeting = "Hello World! from Nim on BL808"
@@ -96,6 +98,7 @@ var
   httpRecvCount* {.exportc: "nim_http_recv_count".}: uint32
   httpRecvNilPbuf* {.exportc: "nim_http_recv_nil_pbuf".}: uint32
   httpRecvErrCount* {.exportc: "nim_http_recv_err_count".}: uint32
+  httpWasmRequests* {.exportc: "nim_http_wasm_requests".}: uint32
   udpRecvCount* {.exportc: "nim_udp_recv_count".}: uint32
   udpSendCount* {.exportc: "nim_udp_send_count".}: uint32
   udpRecvBytes* {.exportc: "nim_udp_recv_bytes".}: uint32
@@ -108,6 +111,8 @@ type
   ResponseBuffer = object
     data: array[768, char]
     len: uint16
+
+var httpRequestBuffer: array[HttpRequestBufferLen, byte]
 
 proc appendChar(buf: var ResponseBuffer; ch: char) =
   if buf.len.uint32 < buf.data.len.uint32:
@@ -255,6 +260,30 @@ proc buildHttpHeader(bodyLen: uint16): ResponseBuffer =
   appendUInt(result, bodyLen.uint32)
   appendText(result, "\r\n\r\n")
 
+proc requestStartsWith(data: openArray[byte], prefix: string): bool =
+  if data.len < prefix.len:
+    return false
+  for i in 0 ..< prefix.len:
+    if data[i] != byte(prefix[i]):
+      return false
+  true
+
+proc requestTargetsWasm(data: openArray[byte]): bool =
+  data.requestStartsWith("GET /wasm/") or
+    data.requestStartsWith("POST /wasm/") or
+    data.requestStartsWith("DELETE /wasm/")
+
+proc writeStringResponse(tcp: ptr TcpPcb, response: string): ErrT =
+  if response.len == 0:
+    return ErrOk
+  if response.len > uint16.high.int:
+    return ErrMem
+  tcpWrite(
+    tcp,
+    cast[pointer](unsafeAddr response[0]),
+    response.len.uint16,
+    TcpWriteFlagCopy)
+
 proc tcpRecvShim(pcb: pointer) {.importc: "nim_http_tcp_recv", cdecl.}
 proc tcpAcceptShim(pcb: pointer) {.importc: "nim_http_tcp_accept", cdecl.}
 proc bl_wifi_mac_addr_get(mac: ptr uint8): cint {.importc, cdecl.}
@@ -370,21 +399,40 @@ proc nimHttpRecv(arg, pcb, p: pointer; err: ErrT): ErrT
   let rxLen = pbufTotLen(pbuf)
   httpRxBytes += rxLen.uint32
   tcpRecved(tcp, rxLen)
+  let copyLen =
+    if rxLen.uint32 > httpRequestBuffer.len.uint32:
+      httpRequestBuffer.len.uint16
+    else:
+      rxLen
+  let copied = pbufCopyPartial(
+    pbuf,
+    cast[pointer](addr httpRequestBuffer[0]),
+    copyLen,
+    0)
   discard pbufFree(pbuf)
 
-  let body = buildHttpBody(rxLen)
-  let header = buildHttpHeader(body.len)
-  let headerRc = tcpWrite(
-    tcp,
-    cast[pointer](unsafeAddr header.data[0]),
-    header.len,
-    TcpWriteFlagCopy)
-  let bodyRc =
-    if headerRc == ErrOk:
-      tcpWrite(tcp, cast[pointer](unsafeAddr body.data[0]), body.len,
-               TcpWriteFlagCopy)
-    else:
-      headerRc
+  var bodyRc: ErrT
+  if copied == copyLen and
+      httpRequestBuffer.toOpenArray(0, copyLen.int - 1).requestTargetsWasm():
+    inc httpWasmRequests
+    let wasmResponse = handleWasmHttpBytes(
+      httpRequestBuffer.toOpenArray(0, copyLen.int - 1))
+    let serialized = formatWasmHttpResponse(wasmResponse)
+    bodyRc = writeStringResponse(tcp, serialized)
+  else:
+    let body = buildHttpBody(rxLen)
+    let header = buildHttpHeader(body.len)
+    let headerRc = tcpWrite(
+      tcp,
+      cast[pointer](unsafeAddr header.data[0]),
+      header.len,
+      TcpWriteFlagCopy)
+    bodyRc =
+      if headerRc == ErrOk:
+        tcpWrite(tcp, cast[pointer](unsafeAddr body.data[0]), body.len,
+                 TcpWriteFlagCopy)
+      else:
+        headerRc
   if bodyRc == ErrOk:
     discard tcpOutput(tcp)
     inc httpRequests

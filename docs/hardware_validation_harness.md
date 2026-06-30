@@ -462,6 +462,30 @@ wired pin route:
 
 On the tested J6 route, the LP program ran and read back function-25 GPIO config
 on GPIO6/7/12/13, but direct LP OpenOCD attach still saw all-ones scan data.
+Use the tap-only DTMCS probe when separating scan-chain visibility from RISC-V
+DM attach:
+
+```sh
+.venv/bin/python tools/hw_validate.py --lp-dtmcs-probe \
+  --uart /dev/cu.usbserial-XXXX
+```
+
+This path generates `build/hw-validation/lp-dtmcs-probe.cfg`, switches the JTAG
+mux through the normal harness bootstrap when possible, then scans IDCODE,
+DTMCS, DMI, and all 5-bit IR values without creating an OpenOCD `riscv` target.
+That is deliberate: the normal target config immediately examines DTMCS and
+exits before we can capture the raw sweep. The result classifications are:
+
+- `LP TAP visible as 0x18005b31, but DTMCS is all ones`: the TAP is visible, but
+  the RISC-V DTM is not selected or not driving TDO. This is the likely
+  CKLink/XuanTie port-detect gap.
+- `LP tap-only scan returned all ones before IDCODE`: the selected chain is not
+  driving TDO at all, usually stale mux/adapter/target-reset state.
+
+On the June 24, 2026 live run, an FTDI nSRST pulse and adapter USB reset both
+succeeded without sudo, but M0 preflight still could not recover the default M0
+TAP from the post-LP state; the next scan returned all ones. Treat that as a
+board reset/power-state boundary before continuing LP DTMCS work.
 
 To confirm LP-visible register state without switching the JTAG mux, use the
 IPC register probe. M0 stays as the OpenOCD debug anchor, releases a small LP
