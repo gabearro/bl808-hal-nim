@@ -131,8 +131,10 @@ proc writeWasmSlotInvokeRequest*(base: uint, slot: uint32, exportName: string,
 
 proc runWasmSlotRequest*(base: uint): uint32 =
   ## Execute the shared-memory invocation request written by M0.
+  ## l1cInvalidateAll is already a lossless clean+invalidate; the previous
+  ## extra bare dcacheInvalidateAll here could destroy dirty lines created
+  ## after the clean (heap writes, stack frames).
   discard l1cInvalidateAll()
-  dcacheInvalidateAll()
   core.fence()
   if regRead(base + 0'u) != WasmSlotRequestMagic:
     return WasmSlotBadRequest

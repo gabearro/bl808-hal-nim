@@ -8,6 +8,20 @@ const
   RwnxCmdFlagDone = 1'u16 shl 5
   RwnxCmdMgrStateCrashed = 2'u32
 
+  # Bounded wait (in os-event "ticks") for a blocking command's CFM. The blob
+  # waited FOREVER (BlOsWaitingForever) here; when the RF/MAC is dead after a
+  # reconnect's bl_send_reset the CFM never arrives and the whole cooperative
+  # scheduler hangs (JTAG-confirmed: rawDelay<-osEventGroupWait<-cmd-mgr wait,
+  # blocking a reconnect permanently). osEventGroupWait spins loops =
+  # blockTimeTick*64 iterations of vendorPollOnce()+rawDelay(128), reading NO
+  # mtime, so this bound is immune to the reconnect mtime-clock freeze. A
+  # healthy CFM sets the event bit and returns immediately, so this only bounds
+  # the DEAD case and never false-times-out a live command. On expiry the
+  # cmd-mgr marks itself Crashed + returns Etimedout (enqueue.nim), so the
+  # recovery returns to the scheduler instead of wedging. Calibrated so one
+  # dead wait stays a few seconds and 3x is well under the WDT window.
+  WifiCmdWaitTicks {.intdefine.} = 200'u32
+
   Eintr = 4'i32
   Enomem = 12'i32
   Epipe = 32'i32

@@ -812,3 +812,21 @@ var nimFwDbgDisconnectReqState* {.wifiCtrl, exportc: "nimfw_dbg_disconnect_req_s
 var nimFwDbgDisconnectProcess* {.wifiCtrl, exportc: "nimfw_dbg_disconnect_process".}: uint32
 var nimFwDbgDisconnectInd*   {.wifiCtrl, exportc: "nimfw_dbg_disconnect_ind".}: uint32
 var nimFwDbgSmStateFinal*    {.wifiCtrl, exportc: "nimfw_dbg_sm_state_final".}: uint32
+
+# Heap-guard bisector (bl808HeapGuardMsgs): the message id (with bit31 set as a
+# "populated" flag) and handler address of the first dispatched message that
+# leaves the TLSF heap inconsistent.
+var nimFwDbgHeapGuardMsg* {.wifiCtrl, exportc: "nimfw_dbg_heap_guard_msg".}: uint32
+var nimFwDbgHeapGuardHandler* {.wifiCtrl, exportc: "nimfw_dbg_heap_guard_handler".}: uint32
+var nimFwDbgHeapGuardStage* {.wifiCtrl, exportc: "nimfw_dbg_heap_guard_stage".}: uint32
+
+# WiFi reconnect robustness (workflow wf_bdc33177): stale ME_SET_ACTIVE_CFM
+# dropped instead of assert_err (which raised the bit-31 reset event that
+# bus-stalled the MAC under a reconnect storm).
+var nimFwDbgActiveCfmBadState* {.wifiCtrl, exportc: "nimfw_dbg_active_cfm_bad_state".}: uint32
+var nimFwDbgActiveCfmLastState* {.wifiCtrl, exportc: "nimfw_dbg_active_cfm_last_state".}: uint32
+var nimFwDbgSmOrphanDrained* {.wifiCtrl, exportc: "nimfw_dbg_sm_orphan_drained".}: uint32
+
+# Overlap tripwire: a new SCANU req arrived while paramPtr was still live (the
+# UAF the idle guard now prevents). MUST stay 0 in the field.
+var nimFwDbgScanuParamOverwrite* {.wifiCtrl, exportc: "nimfw_dbg_scanu_param_overwrite".}: uint32

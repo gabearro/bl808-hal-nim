@@ -8,6 +8,7 @@ import bl808/kernel/cps
 import bl808/wasm_cps
 import bl808/wasm_store
 import bl808/wasm_task_smoke
+import cps/wasm/types
 
 const
   ConsoleUartTxPin = 14'u32
@@ -78,7 +79,7 @@ proc wasmCpsTask(): CpsVoidFuture {.cps.} =
   if quota.status == wasmControlRunError and
       quota.schedulerStatus == wasmSchedQuotaExceeded and
       quota.taskState == wasmTaskTrapped and
-      quota.trapCode == wasmSchedQuotaExceeded.ord.uint32:
+      quota.trapCode == WasmTrapReason.wtQuota.ord.uint32:
     pass("CPS WASM quota trap surfaced")
   else:
     fail("CPS WASM quota trap", quota.trapCode)

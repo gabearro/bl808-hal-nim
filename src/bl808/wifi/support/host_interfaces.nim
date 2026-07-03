@@ -29,6 +29,7 @@ proc bl_main_connect_abort(status: ptr uint8): cint {.importc, cdecl.}
 proc bl_main_disconnect(): cint {.importc, cdecl.}
 proc bl_main_phy_up(): cint {.importc, cdecl.}
 proc bl_send_reset(blHw: ptr BlHw): cint {.importc, cdecl.}
+proc wifiCmdMgrRecoverIfCrashed(cmdMgr: pointer): bool {.importc, cdecl.}
 proc bl_main_apm_start(ssid, password: cstring; channel: cint; hiddenSsid: uint8;
                        bcnInt: uint16): cint {.importc, cdecl.}
 proc bl_main_apm_stop(): cint {.importc, cdecl.}

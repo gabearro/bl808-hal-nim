@@ -290,7 +290,14 @@ proc scanu_confirm*(status: uint8) {.exportc, cdecl.} =
     statusCfmView(primaryCfm).status = status
   let scanParam = scanu_env.paramPtr
   if scanParam != nil:
-    ke_msg_free(scanParam)
+    # ke_msg_free expects the HEADER; scanu_env.paramPtr is the PAYLOAD ptr, so
+    # convert it (as the sibling free at task_handlers.nim:1125 does). The raw
+    # payload free was a bad-magic no-op -> the 336B SCANU_START_REQ ke_msg
+    # leaked once per scan/reconnect, starving the ke_msg heap until connect
+    # stalled at WPA (rc=-1) after ~70 reconnects. (A/B-proven NOT the cause of
+    # the nimIncRef connect-retry-storm crash, which is a separate pre-existing
+    # bug; this fix is correct and validated: heap_top_count flat.)
+    ke_msg_free(keMsgHdrFromPayload(scanParam))
   scanu_env.paramPtr = nil
   if primaryCfm != nil:
     ke_msg_send(primaryCfm)
@@ -1272,12 +1279,22 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
       scanResultEntry.cachedRxuMgtInd = nil
 
   let cachedRxuMgtIndLen = totalLen.uint32 + 32
-  let msg = ke_msg_try_alloc(0x1C00'u16, 2, 2, cachedRxuMgtIndLen)
+  # Floor the allocation at the RxuMgtIndView fixed-header extent (ieData
+  # starts at offset 68; beaconPeriod/capInfo end there). SHORT mgmt frames
+  # (auth/deauth/action are ~30 bytes) otherwise produce allocations smaller
+  # than the view's fixed fields, and any fixed-field access past the block
+  # smashed the heap (TLSF canary forensics: 0x1C00 msgs, paramLen 65,
+  # corrupted during every connect).
+  const RxuMgtIndFixedHeaderLen = 68'u32
+  let cachedAllocLen = max(cachedRxuMgtIndLen, RxuMgtIndFixedHeaderLen)
+  let msg = ke_msg_try_alloc(0x1C00'u16, 2, 2, cachedAllocLen)
   scanResultEntry.cachedRxuMgtInd = msg
   if bfOn != 0:
     scanu_env.pendingJoinRxuMgtInd = msg
   if msg != nil:
     # Single memcpy of entire frame (blob uses 1 call, not header+body split).
+    # Copy only the bytes the source frame actually has; the floor padding
+    # stays zero from the allocator memset.
     discard c_memcpy(msg, frame, cachedRxuMgtIndLen.csize_t)
   ke_msg_forward_and_change_id(frame, 0x804'u16, 9, 2)
 
@@ -1478,6 +1495,19 @@ proc scanu_rm_exist_ssid*(ssid: pointer, ssidLen: uint8) {.exportc, cdecl.} =
   # Clear the cached result entry.
   scanuClearCachedSsid(ssidIndexResultEntry)
   scanuClearCachedChannel(ssidIndexResultEntry)
+  # Free the cached RXU_MGT_IND (beacon/probe-rsp) frame BEFORE zeroing the
+  # entry. The memset below overwrites cachedRxuMgtInd (offset 24) in place, so
+  # omitting this orphans the ~300-450B ke_msg (id 0x1C00, alloc'd at :1283) on
+  # the heap on EVERY failed connect (this path runs from the sm_connect_ind
+  # failure branch). Under reconnect churn that is one leaked beacon frame per
+  # reconnect (HW census: 336B x1/reconnect at the ke_msg allocator) until the
+  # small ke_msg heap can no longer assemble the join frames and WPA stalls ->
+  # 30s connect timeout -> rc=-1 (a reboot "fixes" it only by resetting the
+  # heap). Every sibling entry-clear frees this field (see :1271, :1517, etc.);
+  # this was the sole omission.
+  if ssidIndexResultEntry.cachedRxuMgtInd != nil:
+    ke_msg_free_payload(ssidIndexResultEntry.cachedRxuMgtInd)
+    ssidIndexResultEntry.cachedRxuMgtInd = nil
   discard c_memset(ssidIndexResultEntry, 0, sizeof(ScanuResultEntry).csize_t)
 
   # Log exit

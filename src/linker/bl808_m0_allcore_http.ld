@@ -4,9 +4,14 @@
  * This combines the expanded WRAM enclave profile with the native WiFi stack.
  * The important split is physical:
  *   - PSRAM: M0 allocator heap and large HTTP/SD scratch buffers.
- *   - WRAM 0x22030000..0x2204efff: uncached WiFi DMA/shared descriptors,
+ *   - WRAM 0x22030000..0x2204cbff: uncached WiFi DMA/shared descriptors,
  *     RX payload pool, and small WiFi state. The MAC/RX path is sensitive to
  *     the descriptor base used by the validated standalone WiFi image.
+ *   - WRAM 0x2204cc00..0x2204ebff: D0 SDH ADMA bounce window (desc + 4K data).
+ *     D0 SDH cannot DMA into D0 DRAM/XRAM on Ox64, so it bounces through this
+ *     MCU WRAM region. The D0 linkers (bl808_d0.ld / bl808_d0_ram.ld) PROVIDE
+ *     __d0_sdh_adma_desc at ORIGIN(D0_SDH_DMA); the ASSERT below pins them
+ *     together so M0's WiFi allocator never reclaims D0's live DMA target.
  *   - WRAM 0x2204f000..0x2204ffff: ramfunc.
  *   - OCRAM low 56 KB: secure M-mode runtime and stack.
  *   - OCRAM top 8 KB: enclave U-mode and shared service buffers.
@@ -23,9 +28,19 @@ ENTRY(_start)
 MEMORY
 {
     FLASH    (rx)  : ORIGIN = 0x58000000, LENGTH = 1M
-    HEAP_RAM (rw)  : ORIGIN = 0x50000000, LENGTH = 64K
+    /* Heap + psram bss RELOCATED to +1MB with a 64K guard hole between them,
+     * away from the D0 WASM-image stage (0x50010000) and anything else that
+     * touches the bottom of PSRAM. The M0 heap previously lived at
+     * 0x50000000..0x50010000 and its objects were intermittently corrupted
+     * (JTAG-confirmed: a Table entry's string pointer read back 0xA ->
+     * misaligned-load fault in =destroy during HTTP dispatch). Separating the
+     * regions discriminates adjacent-overrun corruption from PSRAM
+     * instability and keeps a red zone below the heap either way. */
+    PSRAM_BSS (rw) : ORIGIN = 0x50100000, LENGTH = 64K
+    HEAP_RAM (rw)  : ORIGIN = 0x50120000, LENGTH = 64K
     WASM_STAGE (rw): ORIGIN = 0x50010000, LENGTH = 64K
-    WIFI_RAM (rw)  : ORIGIN = 0x22030000, LENGTH = 124K
+    WIFI_RAM (rw)  : ORIGIN = 0x22030000, LENGTH = 115K
+    D0_SDH_DMA (rw): ORIGIN = 0x2204CC00, LENGTH = 8K
     URAM     (rwx) : ORIGIN = 0x6202E000, LENGTH = 4K
     SHARED   (rw)  : ORIGIN = 0x6202F000, LENGTH = 4K
     RAMFUNC  (rwx) : ORIGIN = 0x2204F000, LENGTH = 4K
@@ -137,7 +152,7 @@ SECTIONS
         KEEP(*(.jtaglog .jtaglog.*))
         . = ALIGN(16);
         PROVIDE(__psram_bss_end = .);
-    } > HEAP_RAM
+    } > PSRAM_BSS
 
     .heap (NOLOAD) : ALIGN(4)
     {
@@ -191,10 +206,27 @@ PROVIDE(__enclave_flash_start = ORIGIN(FLASH));
 PROVIDE(__enclave_flash_len   = LENGTH(FLASH));
 
 ASSERT(_eheap >= _sheap, "M0 all-core HTTP secure WRAM overflow: no space left for heap")
-ASSERT(ORIGIN(HEAP_RAM) + LENGTH(HEAP_RAM) <= ORIGIN(WASM_STAGE),
-       "M0 all-core HTTP heap overlaps WASM staging RAM")
+/* Heap and psram bss now live ABOVE the WASM stage with a 64K guard hole
+ * between psrambss and heap; keep all three regions disjoint. */
+ASSERT(ORIGIN(WASM_STAGE) + LENGTH(WASM_STAGE) <= ORIGIN(PSRAM_BSS),
+       "M0 all-core HTTP WASM staging RAM overlaps psram bss")
+ASSERT(ORIGIN(PSRAM_BSS) + LENGTH(PSRAM_BSS) <= ORIGIN(HEAP_RAM),
+       "M0 all-core HTTP psram bss overlaps heap")
 ASSERT(__wifi_bss_end <= ORIGIN(WIFI_RAM) + LENGTH(WIFI_RAM),
        "M0 all-core HTTP WiFi WRAM overflow")
+ASSERT(ORIGIN(WIFI_RAM) + LENGTH(WIFI_RAM) <= ORIGIN(D0_SDH_DMA),
+       "M0 all-core HTTP WiFi RAM overlaps D0 SDH DMA window")
+ASSERT(ORIGIN(D0_SDH_DMA) + LENGTH(D0_SDH_DMA) <= ORIGIN(RAMFUNC),
+       "D0 SDH DMA window overlaps M0 ramfunc")
+/* Contract: D0 (bl808_d0.ld / bl808_d0_ram.ld) PROVIDEs
+ *   __d0_sdh_adma_desc = ORIGIN(D0_SDH_DMA)            (0x2204CC00)
+ *   __d0_sdh_adma_data = ORIGIN(D0_SDH_DMA) + 0x20
+ *   __d0_sdh_adma_data_len = 0x1000
+ * so D0's SDH ADMA bounce target (0x20 desc + 0x1000 data = 0x1020 bytes) must
+ * fit inside this reserved window. If you move the window, move D0's PROVIDEs to
+ * match — both must name the same base or D0 DMA corrupts M0 WiFi RAM. */
+ASSERT(LENGTH(D0_SDH_DMA) >= 0x1020,
+       "D0 SDH DMA window too small for D0 ADMA desc + 4K data")
 ASSERT(__wifi_rx_ram_end <= __wifi_bss_end,
        "M0 all-core HTTP WiFi RX pool escaped WiFi WRAM")
 ASSERT(_eramfunc <= ORIGIN(RAMFUNC) + LENGTH(RAMFUNC),

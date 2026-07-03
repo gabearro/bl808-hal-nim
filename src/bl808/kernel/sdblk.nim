@@ -87,6 +87,30 @@ var
   sdDataErrors*: uint32 = 0
   sdTimeouts*: uint32 = 0
 
+when defined(bl808d0):
+  {.emit: """
+  extern unsigned char __d0_sdh_adma_desc[];
+  extern unsigned char __d0_sdh_adma_data[];
+  """.}
+
+  proc d0AdmaDescAddr(): uint {.inline.} =
+    {.emit: "`result` = (NI)((unsigned long)__d0_sdh_adma_desc);".}
+
+  proc d0AdmaSectorAddr(): uint {.inline.} =
+    {.emit: "`result` = (NI)((unsigned long)__d0_sdh_adma_data);".}
+
+proc sdInvalidateState*() =
+  ## Forget the software view of the selected card.
+  ##
+  ## Use this before reclaiming SDH after another core, boot stage, or debugger
+  ## has owned the controller. The next sdInit() must run the full host/card
+  ## setup instead of trusting the ready fast path.
+  sdReady = false
+  sdRca = 0
+  sdBus4Bit = false
+  sdHighSpeed = false
+  sdHighSpeedClockDiv = 128'u32
+
 type
   SdhAdma2Desc {.packed.} = object
     attr: uint16
@@ -100,6 +124,24 @@ var
   sdAdmaDesc {.sdDmaMem.}: array[1, SdhAdma2Desc]
   sdAdmaSector {.sdDmaMem.}: array[128, uint32]
   sdAdmaWriteScratch {.sdDmaMem.}: array[AdmaWriteScratchSectors.int * 128, uint32]
+
+proc admaDescPtr(): ptr UncheckedArray[SdhAdma2Desc] {.inline.} =
+  when defined(bl808d0):
+    cast[ptr UncheckedArray[SdhAdma2Desc]](d0AdmaDescAddr())
+  else:
+    cast[ptr UncheckedArray[SdhAdma2Desc]](addr sdAdmaDesc[0])
+
+proc admaSectorPtr(): ptr UncheckedArray[uint32] {.inline.} =
+  when defined(bl808d0):
+    cast[ptr UncheckedArray[uint32]](d0AdmaSectorAddr())
+  else:
+    cast[ptr UncheckedArray[uint32]](addr sdAdmaSector[0])
+
+proc admaWriteScratchPtr(): ptr UncheckedArray[uint32] {.inline.} =
+  when defined(bl808d0):
+    nil
+  else:
+    cast[ptr UncheckedArray[uint32]](addr sdAdmaWriteScratch[0])
 
 type
   SdHealth* = object
@@ -347,6 +389,10 @@ proc waitTransferComplete(command, phase: uint32): SdhError =
       regWrite(SdhIntStatus, 0xFFFF_0000'u32)
       return sdhDataError
     if (sts and (1'u32 shl IntXferComplete)) != 0:
+      sdLastIntStatus = sts
+      sdLastPresentState = regRead(SdhPresentState)
+      sdLastAdmaError = regRead(SdhAdmaErr)
+      sdLastAdmaAddress = regRead(SdhAdmaAddr)
       regWrite(SdhIntStatus, 1'u32 shl IntXferComplete)
       return sdhOk
     countdown.dec
@@ -393,16 +439,36 @@ proc sdWriteSectorAdma(sector: uint32,
   ## SDK-style ADMA2 path for single-sector writes. This is required after
   ## CMD6 SDR25 on BL808/OX64: PIO reads continue to work, but PIO CMD24 writes
   ## can timeout with command-timeout status.
-  for i in 0 ..< sdAdmaSector.len:
-    sdAdmaSector[i] = buf[i]
-
-  sdAdmaDesc[0].attr = AdmaAttrValid or AdmaAttrEnd or AdmaAttrActTran
-  sdAdmaDesc[0].length = SectorSize.uint16
-  sdAdmaDesc[0].address = dmaAddr(addr sdAdmaSector[0])
-  dcacheFlushAll()
+  let admaDesc = admaDescPtr()
+  let admaSector = admaSectorPtr()
+  when defined(bl808d0):
+    for i in 0 ..< 128:
+      regWrite(d0AdmaSectorAddr() + i.uint * 4'u, buf[i])
+    let attr = AdmaAttrValid or AdmaAttrEnd or AdmaAttrActTran
+    let dataAddr = dmaAddr(cast[pointer](admaSector))
+    regWrite(d0AdmaDescAddr(), (SectorSize shl 16) or attr.uint32)
+    regWrite(d0AdmaDescAddr() + 4'u, dataAddr)
+    sdLastAdmaDescAttr = attr.uint32
+    sdLastAdmaDescLen = SectorSize
+    sdLastAdmaDescData = dataAddr
+    sdLastAdmaData0 = regRead(d0AdmaSectorAddr())
+    sdLastAdmaData1 = regRead(d0AdmaSectorAddr() + 4'u)
+  else:
+    for i in 0 ..< 128:
+      admaSector[i] = buf[i]
+    admaDesc[0].attr = AdmaAttrValid or AdmaAttrEnd or AdmaAttrActTran
+    admaDesc[0].length = SectorSize.uint16
+    admaDesc[0].address = dmaAddr(cast[pointer](admaSector))
+    sdLastAdmaDescAttr = admaDesc[0].attr.uint32
+    sdLastAdmaDescLen = admaDesc[0].length.uint32
+    sdLastAdmaDescData = admaDesc[0].address
+    sdLastAdmaData0 = admaSector[0]
+    sdLastAdmaData1 = admaSector[1]
+  dcacheCleanRange(cast[uint](admaDesc), sizeof(SdhAdma2Desc).uint)
+  dcacheCleanRange(cast[uint](admaSector), SectorSize.uint)
   fenceIo()
 
-  regWrite(SdhAdmaAddr, dmaAddr(addr sdAdmaDesc[0]))
+  regWrite(SdhAdmaAddr, dmaAddr(cast[pointer](admaDesc)))
   regWrite(SdhBlockSize, (1'u32 shl 16) or SectorSize)
 
   result = sdhSendCommand(CMD24, sdCardAddress(sector), resp48bit,
@@ -445,24 +511,40 @@ proc sdWriteSectorsAdma(sector: uint32, count: uint32,
 
   let byteCount = count * SectorSize
   sdLastBlockCount = count
-  let srcBytes = cast[ptr UncheckedArray[uint8]](buf)
-  let dstBytes = cast[ptr UncheckedArray[uint8]](addr sdAdmaWriteScratch[0])
-  for i in 0 ..< byteCount.int:
-    dstBytes[i] = srcBytes[i]
-  sdLastAdmaData0 = sdAdmaWriteScratch[0]
-  sdLastAdmaData1 = sdAdmaWriteScratch[1]
+  let admaDesc = admaDescPtr()
+  when defined(bl808d0):
+    for i in 0 ..< (byteCount div 4'u32).int:
+      regWrite(d0AdmaSectorAddr() + i.uint * 4'u, buf[i])
+    let attr = AdmaAttrValid or AdmaAttrEnd or AdmaAttrActTran
+    let dataAddr = d0AdmaSectorAddr().uint32
+    regWrite(d0AdmaDescAddr(), (byteCount shl 16) or attr.uint32)
+    regWrite(d0AdmaDescAddr() + 4'u, dataAddr)
+    sdLastAdmaDescAttr = attr.uint32
+    sdLastAdmaDescLen = byteCount
+    sdLastAdmaDescData = dataAddr
+    sdLastAdmaData0 = regRead(d0AdmaSectorAddr())
+    sdLastAdmaData1 = regRead(d0AdmaSectorAddr() + 4'u)
+    dcacheCleanRange(d0AdmaSectorAddr(), byteCount.uint)
+  else:
+    let scratch = admaWriteScratchPtr()
+    let srcBytes = cast[ptr UncheckedArray[uint8]](buf)
+    let dstBytes = cast[ptr UncheckedArray[uint8]](scratch)
+    for i in 0 ..< byteCount.int:
+      dstBytes[i] = srcBytes[i]
+    sdLastAdmaData0 = scratch[0]
+    sdLastAdmaData1 = scratch[1]
 
-  sdAdmaDesc[0].attr = AdmaAttrValid or AdmaAttrEnd or AdmaAttrActTran
-  sdAdmaDesc[0].length = byteCount.uint16
-  sdAdmaDesc[0].address = dmaAddr(addr sdAdmaWriteScratch[0])
-  sdLastAdmaDescAttr = sdAdmaDesc[0].attr.uint32
-  sdLastAdmaDescLen = sdAdmaDesc[0].length.uint32
-  sdLastAdmaDescData = sdAdmaDesc[0].address
-  dcacheCleanRange(cast[uint](addr sdAdmaWriteScratch[0]), byteCount.uint)
-  dcacheCleanRange(cast[uint](addr sdAdmaDesc[0]), sizeof(sdAdmaDesc).uint)
+    admaDesc[0].attr = AdmaAttrValid or AdmaAttrEnd or AdmaAttrActTran
+    admaDesc[0].length = byteCount.uint16
+    admaDesc[0].address = dmaAddr(cast[pointer](scratch))
+    sdLastAdmaDescAttr = admaDesc[0].attr.uint32
+    sdLastAdmaDescLen = admaDesc[0].length.uint32
+    sdLastAdmaDescData = admaDesc[0].address
+    dcacheCleanRange(cast[uint](scratch), byteCount.uint)
+  dcacheCleanRange(cast[uint](admaDesc), sizeof(SdhAdma2Desc).uint)
   fenceIo()
 
-  regWrite(SdhAdmaAddr, dmaAddr(addr sdAdmaDesc[0]))
+  regWrite(SdhAdmaAddr, dmaAddr(cast[pointer](admaDesc)))
   regWrite16(SdhBlockSize, SectorSize.uint16)
   regWrite16(SdhBlockSize + 2'u, count.uint16)
 
@@ -488,6 +570,16 @@ proc sdWriteSectorsAdma(sector: uint32, count: uint32,
 
 proc sdInit*(): SdhError =
   ## Initialize the SDHCI controller and perform the SD card init sequence.
+  if sdReady and sdRca != 0:
+    result = sdhSendCommand(CMD13, sdRca, resp48bit)
+    if result == sdhOk:
+      let state = r1CurrentState(sdhReadResponse32())
+      if state >= 3'u32 and state <= 5'u32:
+        sdLastError = sdhOk
+        sdLastPhase = 0
+        return sdhOk
+    sdhResetData()
+
   sdReady = false
   sdBus4Bit = false
   sdHighSpeed = false
@@ -528,28 +620,51 @@ proc sdInit*(): SdhError =
   # CMD2 — get CID (136-bit response)
   result = sdhSendCommand(CMD2, 0, resp136bit)
   if result != sdhOk: return
-  sdhReadResponse(sdCidRaw)
-  sdCidValid = true
+  when defined(bl808d0):
+    var cidDiscard: array[4, uint32]
+    sdhReadResponse(cidDiscard)
+  else:
+    sdhReadResponse(sdCidRaw)
+    sdCidValid = true
 
   # CMD3 — get relative card address
   result = sdhSendCommand(CMD3, 0, resp48bit)
   if result != sdhOk: return
-  sdRca = sdhReadResponse32() and 0xFFFF0000'u32
+  let selectedRca = sdhReadResponse32() and 0xFFFF0000'u32
 
-  # CMD9/CMD10 — addressed card metadata while still in standby.
-  result = sdhSendCommand(CMD9, sdRca, resp136bit)
-  if result != sdhOk: return
-  sdhReadResponse(sdCsdRaw)
-  sdCsdValid = true
+  # CMD9 — addressed card metadata while still in standby. On D0 this 136-bit
+  # command currently leaves the SDH data path returning bogus sector data, so
+  # defer CSD collection there until the controller quirk is understood.
+  when not defined(bl808d0):
+    result = sdhSendCommand(CMD9, selectedRca, resp136bit)
+    if result != sdhOk: return
+    sdhReadResponse(sdCsdRaw)
+    sdCsdValid = true
 
   # CMD7 — select card
-  result = sdhSendCommand(CMD7, sdRca, resp48busy)
+  result = sdhSendCommand(CMD7, selectedRca, resp48busy)
   if result != sdhOk: return
+  sdRca = selectedRca
+
+  when defined(bl808d0):
+    var settle = 100_000'u32
+    while settle > 0:
+      result = sdhSendCommand(CMD13, sdRca, resp48bit)
+      if result != sdhOk:
+        return
+      if r1CurrentState(sdhReadResponse32()) == 4'u32:
+        break
+      dec settle
+    if settle == 0:
+      return sdhTimeout
 
   # CMD16 — set block length (SDSC only; SDHC always uses 512)
-  if not sdSdhc:
-    result = sdhSendCommand(CMD16, SectorSize, resp48bit)
-    if result != sdhOk: return
+  when defined(bl808d0):
+    discard
+  else:
+    if not sdSdhc:
+      result = sdhSendCommand(CMD16, SectorSize, resp48bit)
+      if result != sdhOk: return
 
   sdReady = true
   result = sdhOk
@@ -652,39 +767,171 @@ proc sdEraseBlockSectors*(): uint32 =
 
 proc sdDisableHighSpeed*(): SdhError
 
-proc sdReadSector*(sector: uint32, buf: ptr UncheckedArray[uint32]): SdhError =
-  ## Read one 512-byte sector into buf (128 x uint32).
+proc sdReadSectorPio(sector: uint32,
+                     buf: ptr UncheckedArray[uint32],
+                     phaseBase: uint32): SdhError =
   let blockAddr = if sdSdhc: sector else: sector * SectorSize
 
-  # Set block size = 512, count = 1
   regWrite(SdhBlockSize, (1'u32 shl 16) or SectorSize)
-
-  # CMD17 — read single block (with transfer mode bits)
   result = sdhSendCommand(CMD17, blockAddr, resp48bit,
                           dataPresent = true, transferMode = TmRead)
   if result != sdhOk:
     inc sdReadErrors
-    noteSdDiag(0x1701'u32, CMD17, sector, result)
+    noteSdDiag(phaseBase, CMD17, sector, result)
     return
 
-  # Wait for data ready then read via PIO
   var words: array[128, uint32]
-  result = sdhReadBlock(words)
-  if result != sdhOk:
-    inc sdReadErrors
-    noteSdDiag(0x1702'u32, CMD17, sector, result)
-    return
+  when defined(bl808d0):
+    var countdown = 1_000_000'u32
+    while true:
+      let sts = regRead(SdhIntStatus)
+      if (sts and (1'u32 shl IntErrInt)) != 0:
+        regWrite(SdhIntStatus, 0xFFFF_0000'u32)
+        inc sdReadErrors
+        noteSdDiag(phaseBase + 1'u32, CMD17, sector, sdhDataError)
+        return sdhDataError
+      if (regRead(SdhPresentState) and (1'u32 shl PsBufReadEn)) != 0 or
+          (sts and (1'u32 shl IntBufReadRdy)) != 0:
+        break
+      countdown.dec
+      if countdown == 0:
+        inc sdReadErrors
+        noteSdDiag(phaseBase + 1'u32, CMD17, sector, sdhTimeout)
+        return sdhTimeout
+
+    for i in 0 ..< words.len:
+      words[i] = regRead(SdhBufferData)
+    regWrite(SdhIntStatus, (1'u32 shl IntBufReadRdy) or (1'u32 shl IntXferComplete))
+    result = sdhOk
+  else:
+    result = sdhReadBlock(words)
+    if result != sdhOk:
+      inc sdReadErrors
+      noteSdDiag(phaseBase + 1'u32, CMD17, sector, result)
+      return
 
   for i in 0 ..< 128:
     buf[i] = words[i]
 
-  # On BL808's SDH block, single-block PIO reads can expose BUF_READ_RDY and
-  # allow the full FIFO drain without subsequently raising XFER_COMPLETE. Once
-  # all 512 bytes have been read, the sector is usable by FatFs. Reset DAT so
-  # the next data command does not see stale DAT active/inhibit state.
+  # BL808 single-block PIO reads may not raise XFER_COMPLETE after FIFO drain.
   sdhResetData()
   inc sdReadOps
-  return sdhOk
+  result = sdhOk
+
+proc sdReadSectorAdma(sector: uint32,
+                      buf: ptr UncheckedArray[uint32]): SdhError =
+  ## D0-safe ADMA2 single-sector read. BL808 SDH ADMA does not reliably
+  ## populate D0 DRAM or XRAM targets; bounce through MCU WRAM and copy out.
+  let admaDesc = admaDescPtr()
+  let admaSector = admaSectorPtr()
+
+  when defined(bl808d0):
+    for i in 0 ..< 128:
+      admaSector[i] = 0xA5A5_A5A5'u32
+  else:
+    for i in 0 ..< 128:
+      admaSector[i] = 0xA5A5_A5A5'u32
+  when defined(bl808d0):
+    let attr = AdmaAttrValid or AdmaAttrEnd or AdmaAttrActTran
+    let dataAddr = dmaAddr(cast[pointer](admaSector))
+    regWrite(d0AdmaDescAddr(), (SectorSize shl 16) or attr.uint32)
+    regWrite(d0AdmaDescAddr() + 4'u, dataAddr)
+    sdLastAdmaDescAttr = attr.uint32
+    sdLastAdmaDescLen = SectorSize
+    sdLastAdmaDescData = dataAddr
+  else:
+    admaDesc[0].attr = AdmaAttrValid or AdmaAttrEnd or AdmaAttrActTran
+    admaDesc[0].length = SectorSize.uint16
+    admaDesc[0].address = dmaAddr(cast[pointer](admaSector))
+    sdLastAdmaDescAttr = admaDesc[0].attr.uint32
+    sdLastAdmaDescLen = admaDesc[0].length.uint32
+    sdLastAdmaDescData = admaDesc[0].address
+  dcacheCleanRange(cast[uint](admaDesc), sizeof(SdhAdma2Desc).uint)
+  dcacheCleanRange(cast[uint](admaSector), SectorSize.uint)
+  fenceIo()
+
+  regWrite(SdhAdmaAddr, dmaAddr(cast[pointer](admaDesc)))
+  regWrite(SdhBlockSize, (1'u32 shl 16) or SectorSize)
+
+  result = sdhSendCommand(CMD17, sdCardAddress(sector), resp48bit,
+                          dataPresent = true,
+                          transferMode = TmRead or (1'u16 shl TmDmaEn))
+  if result != sdhOk:
+    inc sdReadErrors
+    noteSdDiag(0x17A1'u32, CMD17, sector, result)
+    return
+
+  result = waitTransferComplete(CMD17, 0x17A2'u32)
+  dcacheInvalidateRange(cast[uint](admaSector), SectorSize.uint)
+  if result != sdhOk:
+    inc sdReadErrors
+    noteSdDiag(0x17A2'u32, CMD17, sector, result)
+    sdhResetData()
+    return
+
+  when defined(bl808d0):
+    if regRead(d0AdmaSectorAddr()) == 0xA5A5_A5A5'u32 and
+        regRead(d0AdmaSectorAddr() + SectorSize.uint - 4'u) == 0xA5A5_A5A5'u32:
+      sdhResetData()
+      for i in 0 ..< 128:
+        regWrite(d0AdmaSectorAddr() + i.uint * 4'u, 0xA5A5_A5A5'u32)
+      regWrite(d0AdmaDescAddr(), (SectorSize shl 16) or
+               (AdmaAttrValid or AdmaAttrEnd or AdmaAttrActTran).uint32)
+      regWrite(d0AdmaDescAddr() + 4'u, d0AdmaSectorAddr().uint32)
+      dcacheCleanRange(d0AdmaDescAddr(), sizeof(SdhAdma2Desc).uint)
+      dcacheCleanRange(d0AdmaSectorAddr(), SectorSize.uint)
+      fenceIo()
+
+      regWrite(SdhAdmaAddr, d0AdmaDescAddr().uint32)
+      regWrite(SdhBlockSize, (1'u32 shl 16) or SectorSize)
+      result = sdhSendCommand(CMD17, sdCardAddress(sector), resp48bit,
+                              dataPresent = true,
+                              transferMode = TmRead or (1'u16 shl TmDmaEn))
+      if result == sdhOk:
+        result = waitTransferComplete(CMD17, 0x17C2'u32)
+      dcacheInvalidateRange(d0AdmaSectorAddr(), SectorSize.uint)
+      if result == sdhOk and
+          (regRead(d0AdmaSectorAddr()) != 0xA5A5_A5A5'u32 or
+           regRead(d0AdmaSectorAddr() + SectorSize.uint - 4'u) != 0xA5A5_A5A5'u32):
+        sdLastAdmaData0 = regRead(d0AdmaSectorAddr())
+        sdLastAdmaData1 = regRead(d0AdmaSectorAddr() + 4'u)
+        for i in 0 ..< 128:
+          buf[i] = regRead(d0AdmaSectorAddr() + i.uint * 4'u)
+        sdhResetData()
+        inc sdReadOps
+        result = sdhOk
+        return
+
+      sdhResetData()
+      result = sdReadSectorPio(sector, buf, 0x17B0'u32)
+      if result == sdhOk:
+        sdLastPhase = 0x17B2'u32
+        sdLastError = sdhOk
+        sdLastSector = sector
+        sdLastAdmaData0 = buf[0]
+        sdLastAdmaData1 = buf[1]
+      return
+
+  when defined(bl808d0):
+    sdLastAdmaData0 = regRead(d0AdmaSectorAddr())
+    sdLastAdmaData1 = regRead(d0AdmaSectorAddr() + 4'u)
+    for i in 0 ..< 128:
+      buf[i] = regRead(d0AdmaSectorAddr() + i.uint * 4'u)
+  else:
+    sdLastAdmaData0 = admaSector[0]
+    sdLastAdmaData1 = admaSector[1]
+    for i in 0 ..< 128:
+      buf[i] = admaSector[i]
+  sdhResetData()
+  inc sdReadOps
+  result = sdhOk
+
+proc sdReadSector*(sector: uint32, buf: ptr UncheckedArray[uint32]): SdhError =
+  ## Read one 512-byte sector into buf (128 x uint32).
+  when defined(bl808d0):
+    return sdReadSectorAdma(sector, buf)
+
+  result = sdReadSectorPio(sector, buf, 0x1701'u32)
 
 proc sdWriteSector*(sector: uint32, buf: ptr UncheckedArray[uint32]): SdhError =
   ## Write one 512-byte sector from buf (128 x uint32).
@@ -873,6 +1120,14 @@ proc sdReadSectors*(sector: uint32, count: uint32,
     return sdhOk
   if count == 1:
     return sdReadSector(sector, buf)
+  when defined(bl808d0):
+    for blk in 0'u32 ..< count:
+      let base = blk * (SectorSize div 4)
+      result = sdReadSector(sector + blk,
+                            cast[ptr UncheckedArray[uint32]](addr buf[base.int]))
+      if result != sdhOk:
+        return
+    return sdhOk
 
   regWrite(SdhBlockSize, (count shl 16) or SectorSize)
   result = sdhSendCommand(CMD18, sdCardAddress(sector), resp48bit,
@@ -926,6 +1181,10 @@ const
 
 var diskStat: uint8 = StaNoinit
 
+proc sdRetryDelay() =
+  for _ in 0 ..< 1000:
+    {.emit: """asm volatile("");""".}
+
 proc disk_initialize*(pdrv: uint8): uint8 {.exportc, cdecl.} =
   if pdrv != 0: return StaNoinit or StaNodisk
   if sdInit() != sdhOk:
@@ -943,13 +1202,27 @@ proc disk_read*(pdrv: uint8, buff: pointer, sector: uint32,
   ## Returns 0 (RES_OK) on success, 1 (RES_ERROR) on failure.
   if pdrv != 0 or (diskStat and StaNoinit) != 0: return 1
   let p = cast[ptr UncheckedArray[uint32]](buff)
-  if sdReadSectors(sector, count, p) == sdhOk: 0 else: 1
+  for attempt in 0 ..< 4:
+    if sdReadSectors(sector, count, p) == sdhOk:
+      return 0
+    sdhResetData()
+    if attempt != 3:
+      sdRetryDelay()
+  1
 
 proc disk_write*(pdrv: uint8, buff: pointer, sector: uint32,
                  count: uint32): uint8 {.exportc, cdecl.} =
+  ## Returns 0 (RES_OK) on success, 1 (RES_ERROR) on failure. Mirrors disk_read's
+  ## retry/reset/delay loop so dirty-write recovery is symmetric with reads.
   if pdrv != 0 or (diskStat and StaNoinit) != 0: return 1
   let p = cast[ptr UncheckedArray[uint32]](buff)
-  if sdWriteSectors(sector, count, p) == sdhOk: 0 else: 1
+  for attempt in 0 ..< 4:
+    if sdWriteSectors(sector, count, p) == sdhOk:
+      return 0
+    sdhResetData()
+    if attempt != 3:
+      sdRetryDelay()
+  1
 
 proc disk_ioctl*(pdrv: uint8, cmd: uint8, buff: pointer): uint8 {.exportc, cdecl.} =
   if pdrv != 0 or (diskStat and StaNoinit) != 0: return 1

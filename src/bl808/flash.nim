@@ -254,30 +254,50 @@ proc flashReadRawByte*(offset: uint32): uint8 {.flashRam.} =
   sfCtrlRestoreXip()
   flashIrqRestore(irqState)
 
+var
+  flashVerifyFailIndex*: uint32   # diagnostics for the first flashRawMatches mismatch
+  flashVerifyExpected*: uint8
+  flashVerifyGot*: uint8
+  flashVerifyOffset*: uint32
+
 proc flashRawMatches*(offset: uint32, data: openArray[uint8]): bool {.flashRam.} =
   ## Compare flash contents by issuing raw SPI READ commands, bypassing XIP remap.
-  let irqState = flashIrqSave()
+  ##
+  ## IMPORTANT: `data` is frequently an XIP-flash-resident const (e.g. a WASM
+  ## module baked into the image), and this is usually called right after an
+  ## erase+program of a nearby slot + an L1 cache invalidate. Dereferencing an
+  ## XIP-resident `data` in that state re-fetches it over XIP while the flash
+  ## controller has just been toggled, and the E907 returns wrong bytes for some
+  ## `data` addresses (the failure was sensitive to `data`'s exact flash offset).
+  ## To be robust regardless of where `data` lives: capture the raw-SPI bytes
+  ## into a RAM buffer, FULLY restore XIP and let the controller go idle, and
+  ## only THEN read `data` for the comparison.
   result = true
   var base = 0
   while base < data.len:
     var n = data.len - base
     if n > FlashPageSize.int:
       n = FlashPageSize.int
-    var expected: array[FlashPageSize.int, uint8]
-    for i in 0 ..< n:
-      expected[i] = data[base + i]
+    var actual {.noinit.}: array[FlashPageSize.int, uint8]
+    let irqState = flashIrqSave()
     sfCtrlSendCmd(FlashCmdRead, offset + base.uint32, hasAddr = true, dataLen = n.uint32)
-    sfCtrlRestoreXip()
     for i in 0 ..< n:
       let word = regRead(SfCtrlBufBase + ((i and not 3).uint))
-      let got = ((word shr ((i and 3) * 8)) and 0xFF).uint8
-      if got != expected[i]:
+      actual[i] = ((word shr ((i and 3) * 8)) and 0xFF).uint8
+    sfCtrlRestoreXip()
+    flashIrqRestore(irqState)
+    # XIP is fully live and the controller is idle again: safe to read `data`.
+    for i in 0 ..< n:
+      if actual[i] != data[base + i]:
+        flashVerifyFailIndex = (base + i).uint32
+        flashVerifyExpected = data[base + i]
+        flashVerifyGot = actual[i]
+        flashVerifyOffset = offset
         result = false
         break
     if not result:
       break
     base += n
-  flashIrqRestore(irqState)
 
 proc flashEraseSector*(address: uint32): FlashError {.flashRam.} =
   ## Erase a 4 KB sector. Address must be sector-aligned.

@@ -20,10 +20,17 @@ proc watchdogInit*(id: timer.TimerId = timer0, timeoutMs: uint32 = 5000) =
   ## Installs a scheduler poll hook that kicks the WDT every iteration.
   ## Chains with any existing poll hook.
   wdtTimer = initTimer(id)
-  # Use 1kHz clock so match value is directly in milliseconds
-  setWdtClockSource(wdtTimer, wdtClk1k)
-  setWdtClockDiv(wdtTimer, 0)
-  wdtEnable(wdtTimer, timeoutMs, resetOnTimeout = true)
+  # WDT clock source = f32k, the always-on 32 kHz AON oscillator. The previous
+  # choice (wdtClk1k = "1K from the 32K divider") is documented in the SDK as
+  # "Only for Timer not for Watchdog" and — critically — it shares the clock
+  # domain that the WiFi RF/PLL reconnect GATES, which freezes the WDT counter
+  # exactly when we need it (JTAG: WVR stuck at 0x4E27 just past match, WdtEn
+  # self-cleared, no reset). f32k is the HW default for cs_wdt and is not gated
+  # by the WiFi reconnect. /32 -> ~1.024 kHz so the 16-bit match value stays
+  # ~1 tick/ms. WMR is 16-bit (max 65535 ticks -> ~64 s), so clamp the timeout.
+  setWdtClockSource(wdtTimer, wdtClk32k)
+  setWdtClockDiv(wdtTimer, 31)
+  wdtEnable(wdtTimer, min(timeoutMs, 60_000'u32), resetOnTimeout = true)
   wdtActive = true
 
   addSchedulerPollHook(proc() =

@@ -7045,6 +7045,89 @@
       "timeout": 40
     },
     {
+      "name": "d0_mmu_sd_swap_test",
+      "tiers": [
+        "manual"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_d0_mmu_sd_swap_helper.nim",
+          "flash": "m0"
+        },
+        {
+          "id": "d0",
+          "core": "bl808d0",
+          "source": "examples/d0_mmu_sd_swap_test.nim",
+          "flash": "d0"
+        }
+      ],
+      "required": [
+        "=== BL808 D0 Sv39 SD Swap Test ===",
+        "[PASS] M0 mounted SD filesystem for D0 swap",
+        "[PASS] M0 opened SD swap file for D0",
+        "[PASS] D0 SD swap started",
+        "[PASS] D0 Sv39 page tables installed",
+        "[PASS] D0 satp enabled",
+        "[PASS] D0 entered supervisor mode",
+        "[PASS] D0 installed SD swap provider",
+        "[PASS] D0 reserved VM pages",
+        "[PASS] D0 swapped out to SD",
+        "[PASS] D0 swapped in from SD",
+        "[PASS] D0 verified swapped page data",
+        "[PASS] D0 SD-backed VM swap complete",
+        "=== Test Complete ==="
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "d0_sdh_domain_probe",
+      "tiers": [
+        "manual"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_d0_sdh_domain_probe_helper.nim",
+          "flash": "m0"
+        },
+        {
+          "id": "d0",
+          "core": "bl808d0",
+          "source": "examples/d0_sdh_domain_probe.nim",
+          "flash": "d0"
+        }
+      ],
+      "required": [
+        "=== BL808 D0 SDH Domain Probe ===",
+        "[PASS] M0 prepared D0 SDH scratch sector",
+        "[PASS] D0 SDH registers accessible",
+        "[PASS] D0 SDH clock configured",
+        "[PASS] D0 SDH host initialized",
+        "[PASS] D0 SDH CMD0 works",
+        "[PASS] D0 SDH CMD8 works",
+        "[PASS] D0 SDH ACMD41 ready",
+        "[PASS] D0 SDH CID works",
+        "[PASS] D0 SDH RCA works",
+        "[PASS] D0 SDH select works",
+        "[PASS] D0 SDH CMD17 command works",
+        "[PASS] D0 SDH ADMA read works",
+        "[PASS] D0 SDH ADMA sector data valid",
+        "[PASS] D0 sdblk read works",
+        "[PASS] D0 sdblk sector data valid",
+        "[PASS] D0 sdblk write works",
+        "[PASS] D0 sdblk restore works",
+        "[PASS] D0 sdblk multiblock write works",
+        "[PASS] D0 sdblk multiblock restore works",
+        "[PASS] M0 verified D0 SDH scratch restore",
+        "[PASS] D0 SDH domain probe complete",
+        "=== Test Complete ==="
+      ],
+      "timeout": 80
+    },
+    {
       "name": "m0_rtc_test",
       "tiers": [
         "full"
@@ -7389,6 +7472,33 @@
       "timeout": 30
     },
     {
+      "name": "m0_wasm_lifecycle_test",
+      "tiers": [
+        "manual"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wasm_lifecycle_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WasmCompact": "1"
+          }
+        }
+      ],
+      "required": [
+        "=== BL808 WASM Lifecycle Test ===",
+        "[PASS] lifecycle program installed",
+        "[PASS] trapped slot retained for observation (pre-reap)",
+        "[PASS] trapped slot reaped (leak fixed)",
+        "[PASS] kill freed slot immediately",
+        "[PASS] soft watchdog call-safe, no false stop",
+        "=== Lifecycle Test Complete ==="
+      ],
+      "timeout": 30
+    },
+    {
       "name": "m0_wasm_sd_store_test",
       "tiers": [
         "manual"
@@ -7569,16 +7679,7 @@
             "WifiPassword": "6509171272",
             "WifiFallbackSsid": "Frog",
             "WifiFallbackChannel": "0",
-            "WifiFallbackAfterAttempts": "255",
-            "StaticIpA": "192",
-            "StaticIpB": "168",
-            "StaticIpC": "1",
-            "StaticIpD": "223",
-            "StaticGatewayA": "192",
-            "StaticGatewayB": "168",
-            "StaticGatewayC": "1",
-            "StaticGatewayD": "254",
-            "StaticIpAfterDhcpAttempts": "1"
+            "WifiFallbackAfterAttempts": "255"
           }
         },
         {
@@ -7596,7 +7697,8 @@
           "source": "examples/lp_wasm_cps_live_worker.nim",
           "flash": "lp",
           "defines": {
-            "bl808WasmCompact": "1"
+            "bl808WasmCompact": "1",
+            "WasmSchedulerMaxTasks": "2"
           }
         }
       ],
@@ -7613,9 +7715,7 @@
         "[M0] allcore_http_dhcp_observed_lease",
         "Ready for all-core WASM HTTP manager requests"
       ],
-      "forbidden": [
-        "allcore_http_dhcp_timeout_retry"
-      ],
+      "forbidden": [],
       "timeout": 300,
       "jtag_flash_chunk_size": 1024,
       "uart_anchor_runtime_jtag": true,

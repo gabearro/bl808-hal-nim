@@ -12,6 +12,9 @@
 #include <stdint.h>
 #include <string.h>
 
+/* Use-after-free detection: poison freed payloads with 0xDEAD1EEF. OFF by
+   default (bus-stalls on a wild deref; diagnostic only). -DTLSF_POISON_FREED. */
+
 /* ========================================================================= */
 /* Configuration                                                              */
 /* ========================================================================= */
@@ -51,6 +54,9 @@ typedef struct block_header {
     struct block_header *prev_free;
     /* Requested user size, excluding allocator guard bytes. */
     size_t requested_size;
+    /* Call site that allocated this block (from the malloc/calloc/realloc
+       wrappers) — lets canary/invalid-free forensics name the owner. */
+    uintptr_t alloc_site;
     uint32_t magic;
 } block_header_t;
 
@@ -125,9 +131,36 @@ typedef struct {
     size_t alloc_fail_count;
     size_t invalid_free_count;
     size_t canary_fail_count;
+    /* Forensics: fingerprint WHO damages blocks. The caller of the failing
+       free and the damaged block's requested size identify the owning
+       subsystem without a debugger attached. */
+    uintptr_t last_invalid_free_ptr;
+    uintptr_t last_invalid_free_caller;
+    size_t last_canary_fail_size;
+    uintptr_t last_canary_fail_caller;
+    uintptr_t last_canary_fail_alloc_site;
+    /* First 3 words of the damaged block's payload: for WiFi ke_msg blocks
+       this is the message header (next, id|dst|src, paramLen) — names the
+       message type without symbols. */
+    uint32_t last_canary_fail_data[3];
+    /* The 4 bytes found where the tail canary should be = the value the
+       overrunning writer stored. Usually names the writer directly. */
+    uint32_t last_canary_fail_overwrite;
+    uintptr_t last_canary_fail_ptr;
+    uintptr_t last_double_free_alloc_site;
+    size_t double_free_count;
 } tlsf_t;
 
 static tlsf_t tlsf_pool;
+
+/* Recent-frees ring: names the ke_msg type on a later double-free. */
+#define RECENT_FREE_RING 64
+static struct { uintptr_t ptr; uint32_t hdr_id; } recent_free_ring[RECENT_FREE_RING];
+static unsigned recent_free_idx;
+static uint32_t last_double_free_msg;
+
+extern uintptr_t tlsf_last_free_site;   /* set by the free()/realloc() wrappers */
+extern uintptr_t tlsf_last_alloc_site;  /* set by the malloc/calloc/realloc wrappers */
 
 static inline int ptr_in_pool(const void *p) {
     return p >= tlsf_pool.pool_start && p < tlsf_pool.pool_end;
@@ -445,6 +478,7 @@ void *tlsf_malloc(size_t size) {
     block->requested_size = requested;
     block->magic = BLOCK_MAGIC_USED;
     write_tail_canary(block);
+    block->alloc_site = tlsf_last_alloc_site;
 
     /* Mark next block's prev as used */
     block_header_t *next = block_next(block);
@@ -466,14 +500,67 @@ void tlsf_free(void *ptr) {
     if (!block_header_valid(block) || block->magic != BLOCK_MAGIC_USED ||
         block_is_free(block)) {
         tlsf_pool.invalid_free_count++;
+        tlsf_pool.last_invalid_free_ptr = (uintptr_t)ptr;
+        tlsf_pool.last_invalid_free_caller = tlsf_last_free_site;
+        /* Double-free forensics: if this is a free of an in-pool block that is
+           already FREE (a genuine double-free, not a wild pointer), the header
+           still holds the ORIGINAL alloc_site — records WHAT object type is
+           being double-freed even though the freeing caller is tail-obscured. */
+        if (ptr_in_pool(block) && block->magic == BLOCK_MAGIC_FREE) {
+            tlsf_pool.last_double_free_alloc_site = block->alloc_site;
+            tlsf_pool.double_free_count++;
+            for (unsigned i = 0; i < RECENT_FREE_RING; i++) {
+                if (recent_free_ring[i].ptr == (uintptr_t)ptr) {
+                    last_double_free_msg = recent_free_ring[i].hdr_id;
+                    break;
+                }
+            }
+        }
         return;
     }
     if (!tail_canary_ok(block)) {
         tlsf_pool.canary_fail_count++;
+        tlsf_pool.last_canary_fail_size = block->requested_size;
+        tlsf_pool.last_canary_fail_caller = tlsf_last_free_site;
+        tlsf_pool.last_canary_fail_alloc_site = block->alloc_site;
+        {
+            const uint32_t *w = (const uint32_t *)ptr;
+            tlsf_pool.last_canary_fail_data[0] = w[0];
+            tlsf_pool.last_canary_fail_data[1] = w[1];
+            tlsf_pool.last_canary_fail_data[2] = w[2];
+            const uint8_t *c = (const uint8_t *)ptr + block->requested_size;
+            tlsf_pool.last_canary_fail_overwrite =
+                ((uint32_t)c[0]) | ((uint32_t)c[1] << 8) |
+                ((uint32_t)c[2] << 16) | ((uint32_t)c[3] << 24);
+            tlsf_pool.last_canary_fail_ptr = (uintptr_t)ptr;
+        }
+    }
+
+    /* Record this (about-to-be-freed) block's second payload word — for a
+       WiFi ke_msg that's the {id|dst<<16|src<<24} header — in a small ring
+       keyed by pointer. A later double-free of the same pointer looks it up to
+       name the message type, even though the freed block's contents are gone. */
+    {
+        recent_free_ring[recent_free_idx].ptr = (uintptr_t)ptr;
+        recent_free_ring[recent_free_idx].hdr_id = ((const uint32_t *)ptr)[1];
+        recent_free_idx = (recent_free_idx + 1) & (RECENT_FREE_RING - 1);
     }
 
     tlsf_pool.used_bytes -= accounted_block_size(block);
     tlsf_pool.free_count++;
+
+#ifdef TLSF_POISON_FREED
+    /* Poison the freed payload so a use-after-free reads an obviously-bad,
+       word-aligned pointer (0xDEAD1EEF) rather than stale/plausible data. A
+       stale reader then faults immediately AT the read (mepc = the reader)
+       instead of much later, and a poisoned string pointer is unmistakable in
+       a crash dump. Skip the block header words we still need. */
+    {
+        size_t payload_words = block_size(block) / 4;
+        uint32_t *pw = (uint32_t *)block_to_ptr(block);
+        for (size_t i = 0; i + 1 < payload_words; i++) pw[i] = 0xDEAD1EEFu;
+    }
+#endif
 
     block_set_free(block);
     block->requested_size = 0;
@@ -536,6 +623,7 @@ void *tlsf_realloc(void *ptr, size_t new_size) {
         block->requested_size = requested;
         block->magic = BLOCK_MAGIC_USED;
         write_tail_canary(block);
+    block->alloc_site = tlsf_last_alloc_site;
         size_t new_accounted = accounted_block_size(block);
         if (old_accounted >= new_accounted) {
             tlsf_pool.used_bytes -= old_accounted - new_accounted;
@@ -562,6 +650,7 @@ void *tlsf_realloc(void *ptr, size_t new_size) {
             block->requested_size = requested;
             block->magic = BLOCK_MAGIC_USED;
             write_tail_canary(block);
+    block->alloc_site = tlsf_last_alloc_site;
             size_t new_accounted = accounted_block_size(block);
             tlsf_pool.used_bytes += new_accounted - old_accounted;
             update_watermarks();
@@ -598,6 +687,17 @@ size_t tlsf_get_min_free(void) { return tlsf_pool.min_free_bytes; }
 size_t tlsf_get_alloc_fail_count(void) { return tlsf_pool.alloc_fail_count; }
 size_t tlsf_get_invalid_free_count(void) { return tlsf_pool.invalid_free_count; }
 size_t tlsf_get_canary_fail_count(void) { return tlsf_pool.canary_fail_count; }
+size_t tlsf_get_last_invalid_free_ptr(void) { return tlsf_pool.last_invalid_free_ptr; }
+size_t tlsf_get_last_invalid_free_caller(void) { return tlsf_pool.last_invalid_free_caller; }
+size_t tlsf_get_last_canary_fail_size(void) { return tlsf_pool.last_canary_fail_size; }
+size_t tlsf_get_last_canary_fail_caller(void) { return tlsf_pool.last_canary_fail_caller; }
+size_t tlsf_get_last_canary_fail_alloc_site(void) { return tlsf_pool.last_canary_fail_alloc_site; }
+size_t tlsf_get_last_canary_fail_data(int i) { return (i >= 0 && i < 3) ? tlsf_pool.last_canary_fail_data[i] : 0; }
+size_t tlsf_get_last_canary_fail_overwrite(void) { return tlsf_pool.last_canary_fail_overwrite; }
+size_t tlsf_get_last_canary_fail_ptr(void) { return tlsf_pool.last_canary_fail_ptr; }
+size_t tlsf_get_last_double_free_alloc_site(void) { return tlsf_pool.last_double_free_alloc_site; }
+size_t tlsf_get_double_free_count(void) { return tlsf_pool.double_free_count; }
+size_t tlsf_get_last_double_free_msg(void) { return last_double_free_msg; }
 
 size_t tlsf_get_largest_free(void) {
     size_t largest = 0;
@@ -614,6 +714,57 @@ size_t tlsf_get_largest_free(void) {
     }
     return largest;
 }
+
+/* Leak census: walk USED blocks, return the requested_size accounting for the
+   most total bytes, and its block count. The dominant bucket names the leaked
+   object type when the heap balloons. */
+static size_t census_top_size, census_top_count;
+static uintptr_t census_top_alloc_site;
+void tlsf_used_census(void) {
+    census_top_size = 0; census_top_count = 0;
+    if (tlsf_pool.pool_start == NULL) return;
+    /* two-pass over a small fixed table of the 16 largest buckets */
+    size_t sizes[16] = {0}, counts[16] = {0};
+    uint8_t *p = (uint8_t *)tlsf_pool.pool_start;
+    while (p + BLOCK_OVERHEAD <= (uint8_t *)tlsf_pool.pool_end) {
+        block_header_t *b = (block_header_t *)p;
+        if (!block_header_valid(b)) break;
+        if (b->magic == BLOCK_MAGIC_USED) {
+            size_t rs = b->requested_size;
+            int slot = -1;
+            for (int i = 0; i < 16; i++) {
+                if (sizes[i] == rs) { slot = i; break; }
+                if (sizes[i] == 0 && slot < 0) slot = i;
+            }
+            if (slot >= 0) { sizes[slot] = rs; counts[slot]++; }
+        }
+        p += BLOCK_OVERHEAD + block_size(b);
+    }
+    size_t best = 0;
+    for (int i = 0; i < 16; i++) {
+        if (sizes[i] * counts[i] > best) {
+            best = sizes[i] * counts[i];
+            census_top_size = sizes[i];
+            census_top_count = counts[i];
+        }
+    }
+    /* Second pass: record the alloc_site of the FIRST live block whose size
+       matches the dominant bucket — names the leaking allocation site. */
+    census_top_alloc_site = 0;
+    p = (uint8_t *)tlsf_pool.pool_start;
+    while (p + BLOCK_OVERHEAD <= (uint8_t *)tlsf_pool.pool_end) {
+        block_header_t *b = (block_header_t *)p;
+        if (!block_header_valid(b)) break;
+        if (b->magic == BLOCK_MAGIC_USED && b->requested_size == census_top_size) {
+            census_top_alloc_site = b->alloc_site;
+            break;
+        }
+        p += BLOCK_OVERHEAD + block_size(b);
+    }
+}
+size_t tlsf_get_census_top_size(void) { return census_top_size; }
+size_t tlsf_get_census_top_count(void) { return census_top_count; }
+size_t tlsf_get_census_top_alloc_site(void) { return census_top_alloc_site; }
 
 int tlsf_check_heap(void) {
     if (tlsf_pool.pool_start == NULL || tlsf_pool.pool_end == NULL) {
@@ -651,19 +802,30 @@ int tlsf_check_heap(void) {
 /* C standard library hooks (for -d:useMalloc)                                */
 /* ========================================================================= */
 
+/* Real caller of free()/realloc() for forensics: __builtin_return_address(0)
+   inside tlsf_free only ever names these wrappers, so the wrappers record
+   their own caller before delegating. */
+uintptr_t tlsf_last_free_site;
+uintptr_t tlsf_last_alloc_site;
+
 void *malloc(size_t size) {
+    tlsf_last_alloc_site = (uintptr_t)__builtin_return_address(0);
     return tlsf_malloc(size);
 }
 
 void free(void *ptr) {
+    tlsf_last_free_site = (uintptr_t)__builtin_return_address(0);
     tlsf_free(ptr);
 }
 
 void *realloc(void *ptr, size_t size) {
+    tlsf_last_alloc_site = (uintptr_t)__builtin_return_address(0);
+    tlsf_last_free_site = (uintptr_t)__builtin_return_address(0);
     return tlsf_realloc(ptr, size);
 }
 
 void *calloc(size_t count, size_t size) {
+    tlsf_last_alloc_site = (uintptr_t)__builtin_return_address(0);
     return tlsf_calloc(count, size);
 }
 

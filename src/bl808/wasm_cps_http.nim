@@ -212,17 +212,30 @@ proc allcoreWasmManagerApp(rootBody: string): HttpHandler =
       wasmManagerCpsHandler(req)
     notFound:
       discard req
-      # Keep the legacy embedded manager behavior: unknown paths show the
-      # manager root instead of an HTML 404.
+      # Unknown paths get an honest 404 (GET / still serves the manager index
+      # via its own handler). Previously this returned 200 + the root body,
+      # which masked routing errors as success during debugging.
       newResponse(
-        200,
-        rootBody,
+        404,
+        "404 not found: GET / for the WASM manager index\n",
         @[("Content-Type", "text/plain"), ("Connection", "close")],
       )
 
+var
+  cachedManagerApp: HttpHandler
+  cachedManagerRootBody: string
+
 proc dispatchCpsHttpRequest(req: HttpRequest, rootBody: string):
                             HttpResponseBuilder =
-  allcoreWasmManagerApp(rootBody)(req)
+  # Build the router ONCE and reuse it. Rebuilding per request allocated the
+  # whole route table + handler closures every time; the closure graph holds
+  # reference cycles that mm:arc cannot collect, so each request leaked the
+  # entire router (~4-6 KB) until the heap exhausted (measured: 2.2KB->55KB
+  # used in ~35s of probing on HW, death on exhaustion).
+  if cachedManagerApp == nil or cachedManagerRootBody != rootBody:
+    cachedManagerApp = allcoreWasmManagerApp(rootBody)
+    cachedManagerRootBody = rootBody
+  cachedManagerApp(req)
 
 proc handleWasmCpsHttpTransport*(request: openArray[byte], rootBody: string,
                                  write: proc(data: string): bool {.closure.},

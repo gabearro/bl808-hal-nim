@@ -281,8 +281,10 @@ proc sharedWriteBarrier() {.inline.} =
 
 proc sharedReadBarrier() {.inline.} =
   ## Refresh cached XRAM lines before consuming data from another core.
-  core.dcacheFlushAll()
-  core.dcacheInvalidateAll()
+  ## Single clean+invalidate (dcache.ciall): atomic per line, so no window
+  ## where fresh dirty lines can be created between a flush and a bare
+  ## invalidate and then destroyed.
+  core.dcacheCleanInvalidateAll()
   core.fence()
 
 proc timeoutPendingCall(token: uint32) =

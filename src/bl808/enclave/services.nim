@@ -167,10 +167,12 @@ proc p256Verify(pubx, puby: array[8, uint32], hash, r, s: array[8, uint32]): boo
 
 proc getAttestationUntrusted(buf: ptr UncheckedArray[uint8]): (SvcStatus, int) =
   ## PKA/vault-backed quote generation currently resets the chip from the locked
-  ## U-mode ecall path. Preserve the ABI shape for untrusted callers while the
+  ## U-mode ecall path, so the untrusted ecall cannot actually produce a quote.
+  ## Return svcUnsupported (do NOT claim success with an empty payload, which
+  ## previously misled callers into trusting a non-existent signature). The
   ## trusted/test-harness path below still emits a signed quote.
   discard buf
-  (svcOk, 8 + 32 + 64)
+  (svcUnsupported, 0)
 
 proc getAttestationTrusted(buf: ptr UncheckedArray[uint8]): (SvcStatus, int) =
   let id = secDbgChipId()

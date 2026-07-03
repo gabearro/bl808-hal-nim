@@ -29,6 +29,21 @@ extern unsigned long tlsf_get_largest_free(void);
 extern unsigned long tlsf_get_alloc_fail_count(void);
 extern unsigned long tlsf_get_invalid_free_count(void);
 extern unsigned long tlsf_get_canary_fail_count(void);
+extern unsigned long tlsf_get_last_invalid_free_ptr(void);
+extern unsigned long tlsf_get_last_invalid_free_caller(void);
+extern unsigned long tlsf_get_last_canary_fail_size(void);
+extern unsigned long tlsf_get_last_canary_fail_caller(void);
+extern unsigned long tlsf_get_last_canary_fail_alloc_site(void);
+extern unsigned long tlsf_get_last_canary_fail_data(int i);
+extern unsigned long tlsf_get_last_double_free_alloc_site(void);
+extern unsigned long tlsf_get_double_free_count(void);
+extern unsigned long tlsf_get_last_double_free_msg(void);
+extern unsigned long tlsf_get_last_canary_fail_overwrite(void);
+extern unsigned long tlsf_get_last_canary_fail_ptr(void);
+extern void tlsf_used_census(void);
+extern unsigned long tlsf_get_census_top_size(void);
+extern unsigned long tlsf_get_census_top_count(void);
+extern unsigned long tlsf_get_census_top_alloc_site(void);
 extern int tlsf_check_heap(void);
 """.}
 
@@ -47,6 +62,21 @@ proc tlsfGetAllocFailCount*(): csize_t {.importc: "tlsf_get_alloc_fail_count", n
 proc tlsfGetInvalidFreeCount*(): csize_t {.importc: "tlsf_get_invalid_free_count", nodecl.}
 proc tlsfGetCanaryFailCount*(): csize_t {.importc: "tlsf_get_canary_fail_count", nodecl.}
 proc tlsfCheckHeapRaw(): cint {.importc: "tlsf_check_heap", nodecl.}
+proc tlsfLastInvalidFreePtr*(): csize_t {.importc: "tlsf_get_last_invalid_free_ptr", nodecl.}
+proc tlsfLastInvalidFreeCaller*(): csize_t {.importc: "tlsf_get_last_invalid_free_caller", nodecl.}
+proc tlsfLastCanaryFailSize*(): csize_t {.importc: "tlsf_get_last_canary_fail_size", nodecl.}
+proc tlsfLastCanaryFailCaller*(): csize_t {.importc: "tlsf_get_last_canary_fail_caller", nodecl.}
+proc tlsfLastCanaryFailAllocSite*(): csize_t {.importc: "tlsf_get_last_canary_fail_alloc_site", nodecl.}
+proc tlsfLastCanaryFailData*(i: cint): csize_t {.importc: "tlsf_get_last_canary_fail_data", nodecl.}
+proc tlsfLastCanaryFailOverwrite*(): csize_t {.importc: "tlsf_get_last_canary_fail_overwrite", nodecl.}
+proc tlsfLastDoubleFreeAllocSite*(): csize_t {.importc: "tlsf_get_last_double_free_alloc_site", nodecl.}
+proc tlsfDoubleFreeCount*(): csize_t {.importc: "tlsf_get_double_free_count", nodecl.}
+proc tlsfLastDoubleFreeMsg*(): csize_t {.importc: "tlsf_get_last_double_free_msg", nodecl.}
+proc tlsfLastCanaryFailPtr*(): csize_t {.importc: "tlsf_get_last_canary_fail_ptr", nodecl.}
+proc tlsfUsedCensus*() {.importc: "tlsf_used_census", nodecl.}
+proc tlsfCensusTopSize*(): csize_t {.importc: "tlsf_get_census_top_size", nodecl.}
+proc tlsfCensusTopCount*(): csize_t {.importc: "tlsf_get_census_top_count", nodecl.}
+proc tlsfCensusTopAllocSite*(): csize_t {.importc: "tlsf_get_census_top_alloc_site", nodecl.}
 
 # =============================================================================
 # Initialization

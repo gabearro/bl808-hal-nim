@@ -6,6 +6,7 @@
 
 import ./wasm_runtime
 import ./wasm_scheduler
+import cps/wasm/types
 
 type
   WasmOsCore* = enum
@@ -116,6 +117,7 @@ type
     taskId*: uint32
     slot*: int32
     trapCode*: uint32
+    reason*: WasmTrapReason
     fuelUsed*: uint32
     state*: WasmSchedulerTaskState
 
@@ -277,6 +279,15 @@ proc collectWasmOsEvents*(outEvents: var openArray[WasmOsEvent]): uint32 =
       break
   copied
 
+proc decodeTrapReason*(trapCode: uint32): WasmTrapReason =
+  ## Coerce a trapCode (a WasmTrapReason ordinal, see runtime_int.classifyTrap
+  ## and the scheduler's watchdog/quota paths) into the typed enum, clamping
+  ## out-of-range values to wtUnknown so the trap ring never carries garbage.
+  if trapCode <= uint32(high(WasmTrapReason)):
+    WasmTrapReason(trapCode)
+  else:
+    wtUnknown
+
 proc appendWasmOsTrap*(core: WasmOsCore, taskId: uint32, slot: int32,
                        trapCode, fuelUsed: uint32,
                        state: WasmSchedulerTaskState): uint32 =
@@ -286,7 +297,8 @@ proc appendWasmOsTrap*(core: WasmOsCore, taskId: uint32, slot: int32,
     nextTrapId = 1
   trapLog[trapWrite.int mod trapLog.len] = WasmOsTrapRecord(
     valid: true, id: id, core: core, taskId: taskId, slot: slot,
-    trapCode: trapCode, fuelUsed: fuelUsed, state: state)
+    trapCode: trapCode, reason: decodeTrapReason(trapCode),
+    fuelUsed: fuelUsed, state: state)
   trapWrite = (trapWrite + 1'u32) mod trapLog.len.uint32
   discard appendWasmOsEvent(wasmEventTrap, core, taskId, slot, 0, trapCode)
   id

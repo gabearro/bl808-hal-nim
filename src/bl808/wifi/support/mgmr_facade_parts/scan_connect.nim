@@ -2,10 +2,20 @@ proc wifi_mgmr_recover_terminal_connect_failure(): bool =
   let staleFailure = connectDone > 0
   let staleStaState = sm_state != 0'u16
   if staleFailure or staleStaState:
+    # If a previous dead-RF reconnect timed out a blocking command, the host
+    # command manager latched Crashed and every command below would fast-fail
+    # -Epipe (never re-associating without a reboot). Re-init it first so this
+    # attempt's abort/reset/phy_up can actually run. No-op when not crashed.
+    discard wifiCmdMgrRecoverIfCrashed(cast[pointer](addr wifi_hw))
     var abortStatus: uint8
     discard bl_main_connect_abort(addr abortStatus)
     vendorPollFor(4000)
     sm_delete_resources(nil)
+    # SM is now force-reset to Idle. Drain any SM-destined confirmation orphaned
+    # in the sent queue by the aborted attempt, so the next connect starts from
+    # a truly clean SM state (otherwise a stale ME_SET_ACTIVE_CFM desyncs it and
+    # the connect times out at 30 s -> reconnect_connect_rc = -1).
+    smDrainStaleSentMessages()
     vendorPollFor(1000)
     discard bl_send_reset(addr wifi_hw)
     vendorPollFor(4000)

@@ -15,7 +15,11 @@ MEMORY
 {
     FLASH    (rx)  : ORIGIN = 0x58000000, LENGTH = 1M
     RAM      (rwx) : ORIGIN = 0x62020000, LENGTH = 64K
-    WIFI_RAM (rw)  : ORIGIN = 0x22030000, LENGTH = 144K
+    WIFI_RAM (rw)  : ORIGIN = 0x22030000, LENGTH = 115K
+    /* D0 SDH ADMA bounce window. Must match ORIGIN(D0_SDH_DMA) in
+     * bl808_m0_allcore_http.ld and __d0_sdh_adma_desc in bl808_d0*.ld
+     * (0x2204CC00); sized for D0's desc + 4K data (0x1020 bytes). */
+    D0_SDH_DMA (rw): ORIGIN = 0x2204CC00, LENGTH = 8K
 }
 
 _stack_size = 8K;
@@ -130,5 +134,7 @@ SECTIONS
 ASSERT(_eheap >= _sheap, "M0 WiFi RAM overflow: no space left for heap")
 ASSERT(__wifi_bss_end <= ORIGIN(WIFI_RAM) + LENGTH(WIFI_RAM),
        "M0 WiFi shared RAM overflow")
+ASSERT(ORIGIN(WIFI_RAM) + LENGTH(WIFI_RAM) <= ORIGIN(D0_SDH_DMA),
+       "M0 WiFi shared RAM overlaps D0 SDH DMA window")
 ASSERT(_sstack == ORIGIN(RAM) + LENGTH(RAM) - _stack_size,
        "M0 WiFi stack is not placed at top of RAM")

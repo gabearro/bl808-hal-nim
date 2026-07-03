@@ -2188,6 +2188,13 @@ type
     addIeLen*: uint32
 
 const KeMsgHdrSize* = sizeof(KeMsgHdr).uint
+const KeMsgTailSlack* = 4'u32
+  ## Tail slack past the ke_msg payload. The reimplemented firmware writes one
+  ## byte past `paramLen` for some messages (a null terminator on the connect
+  ## request, JTAG-confirmed via TLSF canary forensics: SM_CONNECT_REQ payload
+  ## [paramLen]=0). The vendor blob's allocator rounded sizes up, absorbing
+  ## this; our TLSF is byte-exact with a tail canary, so it needs explicit
+  ## slack to keep that legal-by-contract write off the canary.
 const
   MmVersionCfmPayloadSize = sizeof(MmVersionCfmPayload).uint32
   MmStartReqPayloadSize = sizeof(MmStartReqPayload).uint32

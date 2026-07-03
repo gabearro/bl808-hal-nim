@@ -11,8 +11,13 @@ proc storeU32(base: pointer; byteOffset: uint; value: uint32) {.inline.} = cast[
 proc loadU32(base: pointer; byteOffset: uint): uint32 {.inline.} = cast[ptr uint32](ptrAt(base, byteOffset))[]
 proc loadI32(base: pointer; byteOffset: uint): int32 {.inline.} = cast[ptr int32](ptrAt(base, byteOffset))[]
 proc storeI32(base: pointer; byteOffset: uint; value: int32) {.inline.} = cast[ptr int32](ptrAt(base, byteOffset))[] = value
-proc regRead32(reg: uint32): uint32 {.inline.} = cast[ptr uint32](reg.uint)[]
-proc regWrite32(reg, value: uint32) {.inline.} = cast[ptr uint32](reg.uint)[] = value
+proc regRead32(reg: uint32): uint32 {.inline.} =
+  ## VOLATILE MMIO read. A plain `cast[ptr uint32][]` deref is non-volatile, so
+  ## the optimizer may hoist/cache it across a loop — which froze readMtimeUs and
+  ## caused the WiFi delay path to spin forever (JTAG-confirmed all-core hang).
+  {.emit: "`result` = *(volatile uint32_t*)(uintptr_t)`reg`;".}
+proc regWrite32(reg, value: uint32) {.inline.} =
+  {.emit: "*(volatile uint32_t*)(uintptr_t)`reg` = `value`;".}
 proc regUpdate32(reg, mask, value: uint32) {.inline.} =
   let registerValue = regRead32(reg)
   regWrite32(reg, (registerValue and not mask) or (value and mask))

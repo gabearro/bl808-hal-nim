@@ -7,11 +7,21 @@
 
 import ./wasm_manager
 import cps/wasm/runtime_int
+import cps/wasm/types
 
 const
   WasmSchedulerMaxTasks* {.intdefine.} = 8
   WasmSchedulerDefaultFuel* {.intdefine.} = 64'u32
   WasmSchedulerDefaultMaxTotalFuel* {.intdefine.} = 4096'u32
+  ## Trapped-task reaping. A task that traps stays in the table long enough for
+  ## callers of resumeWasmTask to observe wasmTaskTrapped; reapTrappedSlots
+  ## (a scheduler poll hook) then reclaims the slot after this many reaper
+  ## passes, closing the previous "trapped slot leaks forever" leak.
+  WasmTaskTrapReapPolls* {.intdefine.} = 3
+  ## Soft watchdog: a yielded task whose interpreter pc did not advance for this
+  ## many resume slices is making no forward progress and is force-stopped (the
+  ## TASK, never the core). Override per build with -d:WasmCpsWatchdogMaxStall=N.
+  WasmCpsWatchdogMaxStall* {.intdefine.} = 64
 
 type
   WasmSchedulerStatus* = enum
@@ -24,6 +34,7 @@ type
     wasmSchedInitFailed
     wasmSchedTrap
     wasmSchedQuotaExceeded
+    wasmSchedWatchdog
 
   WasmSchedulerTaskState* = enum
     wasmTaskEmpty
@@ -66,6 +77,9 @@ type
   WasmSchedulerTask = object
     used: bool
     id: uint32
+    programId*: uint32     # installed-program slot this instance runs
+    ownerCore*: uint8      # WasmOsCore ordinal (decoded by callers); 0 = unknown
+    priority*: uint8       # reserved for future priority dispatch
     slot: int32
     state: WasmSchedulerTaskState
     handle: WasmProgramHandle
@@ -74,6 +88,11 @@ type
     yields: uint32
     fuelUsed: uint32
     fuelLimit: uint32
+    maxMemoryPages*: uint16  # per-instance memory quota (0 = use module default)
+    lastTrapCode*: uint32    # reason of the most recent terminal transition
+    trapReapCountdown*: uint8 # reaper passes until a trapped slot is reclaimed
+    lastPc*: int             # interpreter pc at previous resume (watchdog)
+    stalledSlices*: uint8    # resume slices with no pc advance (watchdog)
 
 var
   tasks: array[WasmSchedulerMaxTasks, WasmSchedulerTask]
@@ -95,8 +114,15 @@ proc toSchedulerState(state: IntWasmTaskState): WasmSchedulerTaskState =
   of intTaskExited: wasmTaskExited
   of intTaskTrapped: wasmTaskTrapped
 
-proc clearSlot(index: int) =
+proc clearSlotTeardown(index: int) =
+  ## Deterministic, idempotent teardown of one task slot: close the loaded
+  ## program view (which also drops the compact linear-memory seq) and zero the
+  ## record. Safe to call on an already-empty slot — this is the single
+  ## contract invoked from every terminal transition (exit/trap/kill/quota/
+  ## watchdog) and from reapTrappedSlots, so trapped slots never leak.
   if index < 0 or index >= tasks.len:
+    return
+  if not tasks[index].used:
     return
   tasks[index].handle.close()
   tasks[index] = WasmSchedulerTask()
@@ -129,12 +155,14 @@ proc snapshot(t: WasmSchedulerTask, status = wasmSchedOk): WasmSchedulerResult =
 
 proc resetWasmScheduler*() =
   for i in 0 ..< tasks.len:
-    clearSlot(i)
+    clearSlotTeardown(i)
   nextTaskId = 1'u32
 
 proc startWasmTaskI32*(slot: uint32, exportName: string,
                        args: openArray[int32],
-                       maxTotalFuel = WasmSchedulerDefaultMaxTotalFuel): WasmSchedulerResult =
+                       maxTotalFuel = WasmSchedulerDefaultMaxTotalFuel,
+                       priority = 0'u8, ownerCore = 0'u8,
+                       maxMemoryPages = 0'u16): WasmSchedulerResult =
   schedulerDebugStage(0xD0D0_0001'u32)
   let index = findFreeTaskIndex()
   schedulerDebugStage(0xD0D0_0002'u32)
@@ -143,7 +171,7 @@ proc startWasmTaskI32*(slot: uint32, exportName: string,
 
   var handle: WasmProgramHandle
   schedulerDebugStage(0xD0D0_0003'u32)
-  let openErr = handle.openWasmProgramSlot(slot)
+  let openErr = handle.openWasmProgramSlot(slot, maxMemoryPages = maxMemoryPages)
   schedulerDebugStage(0xD0D0_0004'u32)
   if openErr != wasmManagerOk:
     return WasmSchedulerResult(
@@ -170,11 +198,15 @@ proc startWasmTaskI32*(slot: uint32, exportName: string,
   tasks[index] = WasmSchedulerTask(
     used: true,
     id: id,
+    programId: slot,
+    ownerCore: ownerCore,
+    priority: priority,
     slot: slot.int32,
     state: wasmTaskReady,
     handle: handle,
     task: task,
     fuelLimit: maxTotalFuel,
+    maxMemoryPages: maxMemoryPages,
   )
   schedulerDebugStage(0xD0D0_0008'u32)
   snapshot(tasks[index])
@@ -182,7 +214,9 @@ proc startWasmTaskI32*(slot: uint32, exportName: string,
 proc startWasmImageTaskI32*(base: ptr UncheckedArray[byte], len: uint32,
                             exportName: string, args: openArray[int32],
                             maxTotalFuel = WasmSchedulerDefaultMaxTotalFuel,
-                            slotLabel = -1'i32): WasmSchedulerResult =
+                            slotLabel = -1'i32,
+                            priority = 0'u8, ownerCore = 0'u8,
+                            maxMemoryPages = 0'u16): WasmSchedulerResult =
   schedulerDebugStage(0xD0D1_0001'u32)
   let index = findFreeTaskIndex()
   schedulerDebugStage(0xD0D1_0002'u32)
@@ -191,7 +225,7 @@ proc startWasmImageTaskI32*(base: ptr UncheckedArray[byte], len: uint32,
 
   var handle: WasmProgramHandle
   schedulerDebugStage(0xD0D1_0003'u32)
-  let openErr = handle.openWasmProgramImage(base, len)
+  let openErr = handle.openWasmProgramImage(base, len, maxMemoryPages = maxMemoryPages)
   schedulerDebugStage(0xD0D1_0004'u32)
   if openErr != wasmManagerOk:
     return WasmSchedulerResult(
@@ -218,11 +252,15 @@ proc startWasmImageTaskI32*(base: ptr UncheckedArray[byte], len: uint32,
   tasks[index] = WasmSchedulerTask(
     used: true,
     id: id,
+    programId: slotLabel.uint32,
+    ownerCore: ownerCore,
+    priority: priority,
     slot: slotLabel,
     state: wasmTaskReady,
     handle: handle,
     task: task,
     fuelLimit: maxTotalFuel,
+    maxMemoryPages: maxMemoryPages,
   )
   schedulerDebugStage(0xD0D1_0008'u32)
   snapshot(tasks[index])
@@ -242,16 +280,31 @@ proc resumeWasmTask*(id: uint32,
        tasks[index].fuelUsed > tasks[index].fuelLimit - fuel):
     tasks[index].state = wasmTaskTrapped
     tasks[index].task.state = intTaskTrapped
-    tasks[index].task.trapCode = wasmSchedQuotaExceeded.ord.uint32
+    tasks[index].task.trapCode = wtQuota.ord.uint32
+    tasks[index].lastTrapCode = tasks[index].task.trapCode
+    tasks[index].trapReapCountdown = WasmTaskTrapReapPolls
     return snapshot(tasks[index], wasmSchedQuotaExceeded)
 
+  tasks[index].lastPc = tasks[index].task.pc
   let state = tasks[index].handle.vm.resumeIntWasmTask(tasks[index].task, fuel)
   inc tasks[index].resumes
   tasks[index].fuelUsed += fuel
   tasks[index].state = state.toSchedulerState()
   if tasks[index].state == wasmTaskYielded:
     inc tasks[index].yields
+    # No-forward-progress watchdog: a yielded task whose interpreter pc did not
+    # advance is spinning in place. reapStuckTasks force-stops it once this
+    # counter reaches WasmCpsWatchdogMaxStall.
+    if tasks[index].task.pc == tasks[index].lastPc:
+      if tasks[index].stalledSlices < 255'u8:
+        inc tasks[index].stalledSlices
+    else:
+      tasks[index].stalledSlices = 0
+  else:
+    tasks[index].stalledSlices = 0
   if tasks[index].state == wasmTaskTrapped:
+    tasks[index].lastTrapCode = tasks[index].task.trapCode
+    tasks[index].trapReapCountdown = WasmTaskTrapReapPolls
     return snapshot(tasks[index], wasmSchedTrap)
   snapshot(tasks[index])
 
@@ -272,14 +325,53 @@ proc runWasmScheduler*(fuelPerTask = WasmSchedulerDefaultFuel,
       break
   count
 
-proc killWasmTask*(id: uint32): WasmSchedulerResult =
+proc stopWasmTask*(id: uint32, reason: WasmSchedulerStatus = wasmSchedOk):
+    WasmSchedulerResult =
+  ## Unified terminal teardown. Sets the terminal state, records the reason as a
+  ## tombstone, snapshots the task for the caller, then deterministically tears
+  ## the slot down via clearSlotTeardown. Idempotent: an unknown id is a no-op.
   let index = findTaskIndex(id)
   if index < 0:
     return WasmSchedulerResult(status: wasmSchedNoTask, id: id)
+  if reason == wasmSchedWatchdog:
+    tasks[index].task.trapCode = wtWatchdog.ord.uint32
+    tasks[index].lastTrapCode = wtWatchdog.ord.uint32
+  elif reason == wasmSchedQuotaExceeded:
+    tasks[index].task.trapCode = wtQuota.ord.uint32
+    tasks[index].lastTrapCode = wtQuota.ord.uint32
+  elif reason != wasmSchedOk:
+    tasks[index].lastTrapCode = reason.ord.uint32
   tasks[index].state = wasmTaskKilled
-  result = snapshot(tasks[index])
-  clearSlot(index)
+  tasks[index].task.state = intTaskTrapped
+  result = snapshot(tasks[index], reason)
+  clearSlotTeardown(index)
   result.state = wasmTaskKilled
+
+proc killWasmTask*(id: uint32): WasmSchedulerResult =
+  stopWasmTask(id, wasmSchedOk)
+
+proc reapTrappedSlots*(): uint32 =
+  ## Reclaim task slots that have been wasmTaskTrapped long enough for callers
+  ## to observe the trap. Invoked as a scheduler timed poll hook so the previous
+  ## "trapped slot leaks forever" behavior is closed without dropping trap
+  ## visibility on the resuming call. Returns the number of slots reaped.
+  for i in 0 ..< tasks.len:
+    if tasks[i].used and tasks[i].state == wasmTaskTrapped:
+      if tasks[i].trapReapCountdown == 0:
+        clearSlotTeardown(i)
+        inc result
+      else:
+        dec tasks[i].trapReapCountdown
+
+proc reapStuckTasks*(): uint32 =
+  ## Soft watchdog: force-stop tasks that are resumed but make no forward
+  ## progress (interpreter pc unchanged across WasmCpsWatchdogMaxStall slices).
+  ## Stops the TASK only — never touches the core. Returns the number stopped.
+  for i in 0 ..< tasks.len:
+    if tasks[i].used and tasks[i].state in {wasmTaskReady, wasmTaskYielded}:
+      if tasks[i].stalledSlices >= WasmCpsWatchdogMaxStall:
+        discard stopWasmTask(tasks[i].id, wasmSchedWatchdog)
+        inc result
 
 proc blockWasmTask*(id: uint32, blockedState: WasmSchedulerTaskState): WasmSchedulerResult =
   let index = findTaskIndex(id)

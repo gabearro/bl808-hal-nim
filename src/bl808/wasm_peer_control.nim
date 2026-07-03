@@ -34,6 +34,8 @@ else:
 
   proc dcacheFlushAll() = discard
   proc dcacheInvalidateAll() = discard
+  proc dcacheCleanInvalidateAll() = discard
+  proc dcacheInvalidateRange(address, size: uint) = discard
   proc fenceIo() = discard
   template peerFence() =
     discard
@@ -160,9 +162,21 @@ proc publishBarrier() {.inline.} =
     dcacheFlushAll()
     fenceIo()
 
-proc consumeBarrier() {.inline.} =
+const PeerMailboxSpan =
+  PeerOffTaskRecords + WasmPeerControlMaxTaskRecords.uint * PeerTaskRecordBytes
+
+proc consumeBarrier(base: uint) {.inline.} =
   when defined(bl808m0) or defined(bl808d0) or defined(bl808lp):
-    dcacheInvalidateAll()
+    # Invalidate ONLY the peer mailbox range before reading it. History:
+    # this was a bare dcacheInvalidateAll (dcache.iall, invalidate WITHOUT
+    # writeback) running up to 200k times per dispatch poll loop — every
+    # execution destroyed all dirty write-back lines, including live PSRAM
+    # heap objects (JTAG-confirmed: heap reverted to stale contents, =destroy
+    # faulted on ghost pointers). A whole-cache dcache.ciall is lossless but
+    # far too slow for the poll loop (seconds per dispatch). The mailbox is
+    # only ever written by the peer (M0's own request writes are cleaned by
+    # publishBarrier first), so a ranged invalidate is both safe and fast.
+    dcacheInvalidateRange(base, PeerMailboxSpan)
     peerFence()
 
 when not (defined(bl808d0) or defined(bl808lp)):
@@ -192,7 +206,7 @@ when not (defined(bl808d0) or defined(bl808lp)):
     let base = peerMailboxBase(core)
     if base == 0 or index < 0 or index >= WasmPeerControlMaxTaskRecords:
       return false
-    consumeBarrier()
+    consumeBarrier(base)
     if regRead(base + PeerOffMagic) != WasmPeerControlMagic:
       return false
     record.id = regRead(peerTaskRecordAddr(base, index, 0))
@@ -352,7 +366,7 @@ when not (defined(bl808d0) or defined(bl808lp)):
                        staged.address, staged.len, exportName, args)
     var polls = 0'u32
     while polls < timeoutPolls:
-      consumeBarrier()
+      consumeBarrier(base)
       if regRead(base + PeerOffMagic) == WasmPeerControlMagic and
           regRead(base + PeerOffSeq) == seq:
         let state = regRead(base + PeerOffState)
@@ -365,7 +379,7 @@ when not (defined(bl808d0) or defined(bl808lp)):
                           slot: slot.int32, taskId: taskId)
 
 proc servicePeerWasmControlCommand*(base: uint) =
-  consumeBarrier()
+  consumeBarrier(base)
   if regRead(base + PeerOffMagic) != WasmPeerControlMagic:
     return
   if regRead(base + PeerOffState) != wasmPeerPending.ord.uint32:
