@@ -3,22 +3,24 @@ proc wifiWaitStaIdleAsync(timeoutMs: uint32 = 2_000): CpsFuture[WifiError] =
     return completedLocalFuture(wifiOk)
   if wifiStaIdleFuture != nil and not wifiStaIdleFuture.finished:
     return wifiStaIdleFuture
-  wifiStaIdleFuture = newLocalCpsFuture[WifiError]()
+  let fut = newLocalCpsFuture[WifiError]()
+  wifiStaIdleFuture = fut
   if timeoutMs != 0'u32:
     wifiStaIdleTimer = addTimerMs(timeoutMs.uint64, proc() =
       completeWifiStaIdle(wifiFail)
     )
   wifiCompletePendingEvents()
-  return wifiStaIdleFuture
+  return fut
 
 proc wifiIssueDisconnectAsync(timeoutMs: uint32 = 10_000): CpsFuture[WifiError] =
   if not wifiBackendUsesEventFutures():
     let disconnectIssueStatus = wifiNimFirmwareIssueDisconnect()
     return completedLocalFuture(if disconnectIssueStatus == 0: wifiOk else: wifiFail)
-  wifiDisconnectFuture = newLocalCpsFuture[WifiError]()
+  let fut = newLocalCpsFuture[WifiError]()
+  wifiDisconnectFuture = fut
   wifiDisconnectIssuePending = true
   wifiDisconnectIssueTimeoutMs = timeoutMs
-  return wifiDisconnectFuture
+  return fut
 
 proc wifiDisconnect*(): WifiError =
   wifiBackendPoll(8)

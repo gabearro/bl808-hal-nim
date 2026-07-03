@@ -405,7 +405,7 @@ proc ke_msg_alloc*(id: uint16, destId: uint8, srcId: uint8, paramLen: uint32): p
   ## never populated, so the call crashed at runtime.
   let allocFn = cast[proc(sz: uint32): pointer {.cdecl.}](
     blOpsFunc(0xB8))
-  let totalSize = paramLen + KeMsgHdrSize.uint32
+  let totalSize = paramLen + KeMsgHdrSize.uint32 + KeMsgTailSlack
   let hdr = cast[ptr KeMsgHdr](allocFn(totalSize))
   if hdr == nil:
     assert_err("ke_msg.c", "ke_msg.c", 48)
@@ -424,7 +424,7 @@ proc ke_msg_try_alloc(id: uint16, destId: uint8, srcId: uint8,
   ## returns nil on heap pressure instead of asserting.
   let allocFn = cast[proc(sz: uint32): pointer {.cdecl.}](
     blOpsFunc(0xB8))
-  let totalSize = paramLen + KeMsgHdrSize.uint32
+  let totalSize = paramLen + KeMsgHdrSize.uint32 + KeMsgTailSlack
   let hdr = cast[ptr KeMsgHdr](allocFn(totalSize))
   if hdr == nil:
     return nil
@@ -580,6 +580,24 @@ proc cmp_dest_id(elem: ptr CoListHdr, param: pointer): bool {.exportc, cdecl.} =
   ## Compare callback for ke_queue_extract: match by destId.
   let hdr = cast[ptr KeMsgHdr](elem)
   return hdr.destId == encodedArgU8(param)
+
+proc smDrainStaleSentMessages*() {.exportc: "sm_drain_stale_sent_messages", cdecl.} =
+  ## Free every TASK_SM-destined message parked in the SENT queue. Call this
+  ## ONLY right after SM has been force-reset to Idle (the connect-recover
+  ## path): SM then has no outstanding transaction, so any SM-destined
+  ## confirmation still in the queue is a stale ORPHAN from an aborted connect
+  ## attempt. Left in place, that orphan reaches me_set_active_cfm_handler_sm in
+  ## a non-allowed state and (pre-fix) fired assert_err(690) / (post-fix) is
+  ## dropped but still desyncs the next connect -> 30 s timeout -> rc=-1. Runs
+  ## in host context (single-threaded, nothing mid-dispatch); non-SM message
+  ## ordering is preserved because ke_queue_extract only pulls the SM matches.
+  while true:
+    let node = ke_queue_extract(addr keMsgQueueSent, cmp_dest_id,
+                                cast[pointer](cast[uint](TASK_SM)))
+    if node == nil:
+      break
+    inc nimFwDbgSmOrphanDrained
+    platformFree(node)
 
 proc ke_saved_queue_has_dest(taskId: uint8): bool =
   var currentNode = keMsgQueueSaved.first
@@ -766,6 +784,16 @@ proc ke_task_schedule*() {.exportc, cdecl.} =
     let handler = cast[proc(param: pointer): cint {.cdecl.}](handlerFn)
     nimFwTrace("[WIFI-NIMFW] task_sched call")
     let rawHandlerResult = handler(param)
+    when defined(bl808HeapGuardMsgs):
+      # Heap-corruption bisector: walk the TLSF heap after EVERY dispatched
+      # message; the FIRST message whose handler leaves the heap inconsistent
+      # records its id + handler into exported globals (dumped by the entry's
+      # diag). Debug-only (define-gated).
+      block heapGuard:
+        proc tlsfCheckHeapRaw(): cint {.importc: "tlsf_check_heap", cdecl.}
+        if nimFwDbgHeapGuardMsg == 0'u32 and tlsfCheckHeapRaw() == 0:
+          nimFwDbgHeapGuardMsg = msgId.uint32 or 0x8000_0000'u32
+          nimFwDbgHeapGuardHandler = cast[uint32](cast[uint](handlerFn))
     let normalizedHandlerResult =
       if rawHandlerResult >= KeMsgConsumed and rawHandlerResult <= KeMsgSaved:
         rawHandlerResult

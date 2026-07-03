@@ -8,6 +8,8 @@ import bl808/flash
 import bl808/kernel/alloc
 import bl808/kernel/cps
 import bl808/kernel/fault
+import bl808/kernel/watchdog
+import bl808/timer
 import bl808/enclave/abi, bl808/enclave/enclave, bl808/enclave/partition
 import bl808/enclave/services, bl808/enclave/vault
 import bl808/pds
@@ -42,19 +44,6 @@ const
   WifiFallbackChannel {.intdefine.} = 0
   WifiFallbackAfterAttempts {.intdefine.} = 2
   WpaCompletedState = 10'u32
-  StaticIpA {.intdefine.} = 0
-  StaticIpB {.intdefine.} = 0
-  StaticIpC {.intdefine.} = 0
-  StaticIpD {.intdefine.} = 0
-  StaticNetmaskA {.intdefine.} = 255
-  StaticNetmaskB {.intdefine.} = 255
-  StaticNetmaskC {.intdefine.} = 255
-  StaticNetmaskD {.intdefine.} = 0
-  StaticGatewayA {.intdefine.} = 0
-  StaticGatewayB {.intdefine.} = 0
-  StaticGatewayC {.intdefine.} = 0
-  StaticGatewayD {.intdefine.} = 0
-  StaticIpAfterDhcpAttempts {.intdefine.} = 3
   HttpPort {.intdefine.} = 80
   AllcoreHttpHoldPeerCoresBeforeWifi {.intdefine.} = 0
   AllcoreHttpWifiResetSettleUs {.intdefine.} = 250_000'u64
@@ -63,6 +52,27 @@ const
   HttpListenRetryDelayUs = 1_000_000'u64
   DhcpTimeoutMs = 30_000'u32
   HttpRequestBufferLen = 2048
+  # Steady-state reconnect: if the STA loses its association (AP deauth, beacon
+  # loss, etc.) the serving loop must recover WITHOUT rebooting. These bound how
+  # quickly a drop is declared and how the recovery paces itself.
+  WifiLinkLostConfirmMs {.intdefine.} = 3_000'u32     # sustained-down before reconnect
+  WifiReconnectWpaTimeoutMs {.intdefine.} = 15_000'u32
+  WifiReconnectDhcpTimeoutMs {.intdefine.} = 20_000'u32
+  WifiReconnectBackoffUs {.intdefine.} = 5_000_000'u64
+  # No 802.11 RX frame (not even a beacon) for this long => the RF link is dead,
+  # even if the supplicant/backend still claim "connected" (silent deauth).
+  WifiRxStallMs {.intdefine.} = 8_000'u32
+  # Hardware watchdog timeout (ms). A genuine wedge holds the scheduler for
+  # longer than this and forces a clean reboot; normal serving + async
+  # reconnects keep the scheduler looping well under it.
+  WifiWedgeWdtMs {.intdefine.} = 20_000'u32
+  # During initial bring-up, tear down and re-join the association after this
+  # many consecutive failed DHCP attempts (bad link is the usual cause).
+  DhcpRelinkEveryAttempts {.intdefine.} = 3'u32
+  # LP publishes this to WasmLiveLpAddValueAddr right before runScheduler(),
+  # i.e. past its heavy heapInit/schedulerInit boot. M0 waits for it before
+  # touching its own CPS scheduler (WRAM->OCRAM alias race guard).
+  LpBootSettledMarker = 0x1A00_00F4'u32
   MachwStatusReg = 0x24B0004C'u
   MachwRxControlReg = 0x24B00060'u
   LpWramBootGateAddr = WramBase + 0x21000'u
@@ -332,6 +342,13 @@ static unsigned long __psram_bss_end_addr(void){return (unsigned long)__psram_bs
     nimfw_dbg_tx_seq_last {.importc.}: uint32
     nimfw_dbg_tx_seq_counter {.importc.}: uint32
     nimfw_dbg_rxl_frame_seen {.importc.}: uint32
+    nimfw_dbg_heap_guard_msg {.importc.}: uint32
+    nimfw_dbg_heap_guard_handler {.importc.}: uint32
+    nimfw_dbg_heap_guard_stage {.importc.}: uint32
+    nimfw_dbg_active_cfm_bad_state {.importc.}: uint32
+    nimfw_dbg_active_cfm_last_state {.importc.}: uint32
+    nimfw_dbg_sm_orphan_drained {.importc.}: uint32
+    nimfw_dbg_cmd_mgr_recovered {.importc.}: uint32
     nimfw_dbg_rxl_last_hwflags {.importc.}: uint32
     nimfw_dbg_rxl_last_fc {.importc.}: uint32
     nimfw_dbg_rxl_mgmt_seen {.importc.}: uint32
@@ -590,6 +607,32 @@ proc fail(msg: string, code: uint32 = 0) =
 proc printHex(label: string, value: uint32) =
   discard console.sendString(label)
   console.sendHex32(value)
+  discard console.sendLine("")
+
+template irqSaveMstatus(): uint32 =
+  block:
+    var prev {.gensym.}: uint32
+    {.emit: ["asm volatile(\"csrrci %0, mstatus, 8\" : \"=r\"(", prev, ") );"].}
+    prev
+
+template irqRestoreMstatus(prev: uint32) =
+  if (prev and 8) != 0:
+    {.emit: ["asm volatile(\"csrsi mstatus, 8\");"].}
+
+proc dumpHeapMilestone(tag: string) =
+  ## Compact TLSF damage counters at a boot milestone. Bisects WHEN the
+  ## boot-time canary/invalid-free damage happens (smoke vs WiFi phase).
+  let hs = heapStats()
+  discard console.sendString("[M0] heap_milestone_")
+  discard console.sendString(tag)
+  discard console.sendString("=")
+  console.sendHex32(hs.usedBytes.uint32)
+  discard console.sendString(" if=")
+  console.sendHex32(hs.invalidFreeCount.uint32)
+  discard console.sendString(" cf=")
+  console.sendHex32(hs.canaryFailCount.uint32)
+  discard console.sendString(" ok=")
+  console.sendHex32(if heapCheck(): 1'u32 else: 0'u32)
   discard console.sendLine("")
 
 when defined(bl808AllcoreWasmHttp):
@@ -1036,9 +1079,14 @@ when defined(bl808AllcoreWasmHttp):
   proc pollNetwork() {.inline.} =
     bl808_wifi_backend_poll(64)
     discard wifi_nimfw_service_sta_postponed(8)
+    # txl_* are ISR-table handlers that mutate MAC TX descriptor lists; the
+    # real WiFi CLIC trap runs the same machinery. Mask interrupts around the
+    # thread-context calls so the two contexts never interleave mid-update.
     for _ in 0 ..< 8:
+      let savedIrq = irqSaveMstatus()
       txl_transmit_trigger()
       txl_frame_evt()
+      irqRestoreMstatus(savedIrq)
     sysCheckTimeouts()
 
   proc announceHttpIp(netif: ptr Netif) =
@@ -1059,21 +1107,56 @@ when defined(bl808AllcoreWasmHttp):
       return false
     var observedIp = observedDhcpIp()
     var observedMask = ip4Addr(255'u8, 255'u8, 255'u8, 0'u8)
+    # Derive the gateway from the observed lease (x.y.z.1). Everything comes
+    # from DHCP now — no static-config override.
     var observedGw =
-      when StaticGatewayA != 0:
-        ip4Addr(StaticGatewayA.uint8, StaticGatewayB.uint8,
-                StaticGatewayC.uint8, StaticGatewayD.uint8)
-      else:
-        ip4Addr(((yiaddr shr 24) and 0xFF'u32).uint8,
-                ((yiaddr shr 16) and 0xFF'u32).uint8,
-                ((yiaddr shr 8) and 0xFF'u32).uint8,
-                1'u8)
+      ip4Addr(((yiaddr shr 24) and 0xFF'u32).uint8,
+              ((yiaddr shr 16) and 0xFF'u32).uint8,
+              ((yiaddr shr 8) and 0xFF'u32).uint8,
+              1'u8)
     netifSetAddr(netif, addr observedIp, addr observedMask, addr observedGw)
     printHex("[M0] allcore_http_dhcp_observed_lease=", netifIp4(netif))
     announceHttpIp(netif)
     true
 
   proc dumpAllcoreHttpRuntimeDiag() =
+    # Heap-corruption telemetry: the TLSF allocator detects double/wild frees
+    # (magic check -> invalid_free) and per-block overruns (tail canary), and
+    # heapCheck() walks all metadata. A counter moving here, correlated with
+    # the last dump before a death, identifies the corrupting subsystem.
+    let hs = heapStats()
+    printHex("[M0] allcore_http_heap_used=", hs.usedBytes.uint32)
+    printHex("[M0] allcore_http_heap_allocs=", hs.allocCount.uint32)
+    printHex("[M0] allcore_http_heap_frees=", hs.freeCount.uint32)
+    printHex("[M0] allcore_http_heap_invalid_free=", hs.invalidFreeCount.uint32)
+    printHex("[M0] allcore_http_heap_canary_fail=", hs.canaryFailCount.uint32)
+    printHex("[M0] allcore_http_heap_alloc_fail=", hs.allocFailCount.uint32)
+    printHex("[M0] allcore_http_heap_check_ok=", (if heapCheck(): 1'u32 else: 0'u32))
+    # Forensics: the block size and the CALLER of the last failing free
+    # identify which subsystem damages/double-frees heap blocks (map the
+    # caller address with nm/addr2line on kernel.elf).
+    printHex("[M0] allcore_http_heap_cf_size=", tlsfLastCanaryFailSize().uint32)
+    printHex("[M0] allcore_http_heap_cf_caller=", tlsfLastCanaryFailCaller().uint32)
+    printHex("[M0] allcore_http_heap_cf_alloc=", tlsfLastCanaryFailAllocSite().uint32)
+    # ke_msg fingerprint of the damaged block: w1 = id|dst<<16|src<<24, w2 = paramLen
+    printHex("[M0] allcore_http_heap_cf_w1=", tlsfLastCanaryFailData(1).uint32)
+    printHex("[M0] allcore_http_heap_cf_w2=", tlsfLastCanaryFailData(2).uint32)
+    printHex("[M0] allcore_http_heap_cf_over=", tlsfLastCanaryFailOverwrite().uint32)
+    printHex("[M0] allcore_http_heap_cf_ptr=", tlsfLastCanaryFailPtr().uint32)
+    printHex("[M0] allcore_http_heap_guard_msg=", nimfw_dbg_heap_guard_msg)
+    printHex("[M0] allcore_http_heap_guard_handler=", nimfw_dbg_heap_guard_handler)
+    printHex("[M0] allcore_http_heap_guard_stage=", nimfw_dbg_heap_guard_stage)
+    printHex("[M0] allcore_http_heap_if_ptr=", tlsfLastInvalidFreePtr().uint32)
+    printHex("[M0] allcore_http_heap_if_caller=", tlsfLastInvalidFreeCaller().uint32)
+    printHex("[M0] allcore_http_heap_df_count=", tlsfDoubleFreeCount().uint32)
+    printHex("[M0] allcore_http_heap_df_alloc=", tlsfLastDoubleFreeAllocSite().uint32)
+    printHex("[M0] allcore_http_heap_df_msg=", tlsfLastDoubleFreeMsg().uint32)
+    # Leak census: dominant live-block size (by total bytes) + its count.
+    # When the heap balloons, this bucket names the leaked object type.
+    tlsfUsedCensus()
+    printHex("[M0] allcore_http_heap_top_size=", tlsfCensusTopSize().uint32)
+    printHex("[M0] allcore_http_heap_top_count=", tlsfCensusTopCount().uint32)
+    printHex("[M0] allcore_http_heap_top_alloc=", tlsfCensusTopAllocSite().uint32)
     printHex("[M0] allcore_http_runtime_http=", httpRequests)
     printHex("[M0] allcore_http_runtime_wasm=", httpWasmRequests)
     printHex("[M0] allcore_http_runtime_close_fail=", httpCloseFailures)
@@ -1089,6 +1172,10 @@ when defined(bl808AllcoreWasmHttp):
     printHex("[M0] allcore_http_runtime_hw_rxctrl=", regRead(MachwRxControlReg))
     printHex("[M0] allcore_http_runtime_hw_status=", regRead(MachwStatusReg))
     printHex("[M0] allcore_http_runtime_rxl_seen=", nimfw_dbg_rxl_frame_seen)
+    printHex("[M0] allcore_http_active_cfm_bad=", nimfw_dbg_active_cfm_bad_state)
+    printHex("[M0] allcore_http_active_cfm_state=", nimfw_dbg_active_cfm_last_state)
+    printHex("[M0] allcore_http_sm_orphan_drained=", nimfw_dbg_sm_orphan_drained)
+    printHex("[M0] allcore_http_cmd_mgr_recovered=", nimfw_dbg_cmd_mgr_recovered)
     printHex("[M0] allcore_http_runtime_rxu_valid=", nimfw_dbg_rxu_frame_valid)
     printHex("[M0] allcore_http_runtime_rxu_data=", nimfw_dbg_rxu_assoc_data)
     printHex("[M0] allcore_http_runtime_rxu_ip=", nimfw_dbg_rxu_assoc_ip)
@@ -1633,8 +1720,10 @@ proc installLpWramBootGate() =
   fenceIo()
 
 proc sharedRead32(address: uint): uint32 =
-  dcacheFlushAll()
-  dcacheInvalidateAll()
+  # Atomic-per-line clean+invalidate (dcache.ciall): the previous
+  # flush-then-bare-invalidate pair left a window where lines dirtied between
+  # the two ops (e.g. by an interrupt) were destroyed without writeback.
+  dcacheCleanInvalidateAll()
   core.fence()
   regRead(address)
 
@@ -1863,6 +1952,9 @@ when defined(bl808AllcoreWasmHttp):
     dst.appendJsonI32(task.result)
     dst.add(",\"trap\":")
     dst.appendJsonU32(task.trapCode)
+    dst.add(",\"trapReason\":\"")
+    dst.add($decodeTrapReason(task.trapCode))
+    dst.add("\"")
     dst.add(",\"resumes\":")
     dst.appendJsonU32(task.resumes)
     dst.add(",\"yields\":")
@@ -2285,7 +2377,6 @@ when defined(bl808AllcoreWasmHttp):
     let netif = cast[ptr Netif](netifRaw)
 
     var dhcpAttempts = 0'u32
-    var usingStaticIp = false
     while netifIp4(netif) == 0'u32:
       discard console.sendLine("[M0] allcore_http_dhcp_start_begin")
       if dhcpStart(netif) != ErrOk:
@@ -2325,21 +2416,27 @@ when defined(bl808AllcoreWasmHttp):
         dumpAllcoreHttpRuntimeDiag()
         inc dhcpAttempts
         if applyObservedDhcpLease(netif):
-          usingStaticIp = false
           break
         dhcpStop(netif)
-        if StaticIpA != 0 and dhcpAttempts >= StaticIpAfterDhcpAttempts.uint32:
-          var staticIp = ip4Addr(StaticIpA.uint8, StaticIpB.uint8,
-                                 StaticIpC.uint8, StaticIpD.uint8)
-          var staticMask = ip4Addr(StaticNetmaskA.uint8, StaticNetmaskB.uint8,
-                                   StaticNetmaskC.uint8, StaticNetmaskD.uint8)
-          var staticGw = ip4Addr(StaticGatewayA.uint8, StaticGatewayB.uint8,
-                                 StaticGatewayC.uint8, StaticGatewayD.uint8)
-          netifSetAddr(netif, addr staticIp, addr staticMask, addr staticGw)
-          usingStaticIp = true
-          discard console.sendLine("[M0] allcore_http_static_ip_fallback")
-          announceHttpIp(netif)
-          break
+        # No static-IP fallback: keep re-running DHCP until it succeeds. A
+        # persistently failing DHCP usually means the ASSOCIATION is broken
+        # (silent deauth, stale keys), not lwIP — so every few failed attempts
+        # tear the link down and re-join before trying DHCP again. This is the
+        # same recovery the steady-state supervision uses.
+        if dhcpAttempts mod DhcpRelinkEveryAttempts == 0'u32:
+          printHex("[M0] allcore_http_dhcp_relink=", dhcpAttempts)
+          discard await wifiDisconnectAsync(10_000'u32)
+          discard await wifiScanAsync(30_000'u32)
+          let relinkRc = await wifiConnectAsync(WifiSsid, WifiPassword,
+                                                WifiChannel.uint8, 30_000'u32)
+          printHex("[M0] allcore_http_dhcp_relink_rc=", relinkRc.uint32)
+          if relinkRc == wifiOk:
+            let wpaDeadline = nowMs() + WifiReconnectWpaTimeoutMs
+            while bl808WpaCurrentState() != WpaCompletedState and
+                nowMs() < wpaDeadline:
+              pollNetwork()
+              await yieldNow()
+            printHex("[M0] allcore_http_dhcp_relink_wpa=", bl808WpaCurrentState())
         discard console.sendLine("[M0] allcore_http_dhcp_timeout_retry")
         await sleepUs(WifiConnectRetryDelayUs)
     discard console.sendLine("[M0] allcore_http_dhcp_done")
@@ -2358,19 +2455,101 @@ when defined(bl808AllcoreWasmHttp):
     writeIp4(httpIp)
     discard console.sendString("/")
     discard console.sendLine("")
-    if usingStaticIp:
-      discard console.sendLine("[M0] allcore_http_static_arp_announce")
-      announceHttpIp(netif)
     dumpAllcoreHttpRuntimeDiag()
+    dumpHeapMilestone("post_wifi")
+    # Start the hardware watchdog HERE — after the long, known-slow boot (smoke
+    # + WiFi bring-up + first DHCP) so those phases never trip it. From here on
+    # the serving loop feeds the WDT every iteration via the scheduler poll hook;
+    # a genuine wedge (e.g. an MMIO read that bus-stalls the AHB on a clock-gated
+    # MAC mid-reconnect — the CPU freezes and the scheduler stops advancing)
+    # leaves the WDT unfed and the hardware reboots cleanly instead of bricking.
+    watchdogInit(timer0, WifiWedgeWdtMs)
     discard console.sendLine("Ready for all-core WASM HTTP manager requests")
     var lastArpMs = nowMs()
     var lastDiagMs = lastArpMs
+    var linkDownSinceMs = 0'u32     # first tick we observed the STA disassociated (0 = up)
+    var reconnects = 0'u32
+    var lastRxSeen = nimfw_dbg_rxl_frame_seen  # RX-liveness baseline
+    var lastRxAdvanceMs = nowMs()
     while true:
       pollNetwork()
       bumpHeartbeat(heartbeat)
       if httpEnclaveWasmStatus == WasmLiveOk:
         bumpHeartbeat(httpEnclaveHeartbeat)
       let currentMs = nowMs()
+
+
+      # Steady-state link supervision. The AP can deauth us (Frog does) or the
+      # beacon can be lost; the firmware keeps spinning otherwise, so without
+      # this the HTTP manager stays bound to a dead association forever. Detect a
+      # SUSTAINED disassociation (debounced so a transient blip does not trigger
+      # a needless reconnect) and recover in place — never reboot.
+      # A drop is real if the driver reports disassociated, OR WPA has fallen out
+      # of the completed state, OR the MAC has stopped receiving ANY 802.11
+      # frames. The first two are not sufficient alone: on a silent AP deauth
+      # both the backend flag and the WPA state can stay "connected" while the RF
+      # link is actually dead. The reliable ground truth is RX liveness — the MAC
+      # frame counter (rxl_frame_seen) ticks continuously from beacons while
+      # associated and FREEZES when off-air. Track how long it has been stalled.
+      let rxSeen = nimfw_dbg_rxl_frame_seen
+      if rxSeen != lastRxSeen:
+        lastRxSeen = rxSeen
+        lastRxAdvanceMs = currentMs
+      let rxStalled = currentMs - lastRxAdvanceMs >= WifiRxStallMs
+      let linkUp = bl808_wifi_backend_connected() != 0 and
+                   bl808WpaCurrentState() == WpaCompletedState and
+                   not rxStalled
+      if linkUp:
+        linkDownSinceMs = 0'u32
+      else:
+        if linkDownSinceMs == 0'u32:
+          linkDownSinceMs = currentMs
+          printHex("[M0] allcore_http_link_down_detected=", bl808WpaCurrentState())
+        elif currentMs - linkDownSinceMs >= WifiLinkLostConfirmMs:
+          inc reconnects
+          printHex("[M0] allcore_http_reconnect_begin=", reconnects)
+          # Tear down the stale association before re-joining.
+          discard await wifiDisconnectAsync(10_000'u32)
+          # Re-scan then re-join the same network.
+          discard await wifiScanAsync(30_000'u32)
+          let rc = await wifiConnectAsync(WifiSsid, WifiPassword,
+                                          WifiChannel.uint8, 30_000'u32)
+          printHex("[M0] allcore_http_reconnect_connect_rc=", rc.uint32)
+          if rc == wifiOk:
+            let wpaDeadline = currentMs + WifiReconnectWpaTimeoutMs
+            while bl808WpaCurrentState() != WpaCompletedState and nowMs() < wpaDeadline:
+              pollNetwork()
+              await yieldNow()
+            printHex("[M0] allcore_http_reconnect_wpa_state=", bl808WpaCurrentState())
+            # Re-acquire an address. Keep the existing lease if the netif still
+            # holds one; otherwise run DHCP again.
+            if netifIp4(netif) == 0'u32:
+              discard dhcpStart(netif)
+              let dhcpDeadline = nowMs() + WifiReconnectDhcpTimeoutMs
+              while netifIp4(netif) == 0'u32 and nowMs() < dhcpDeadline:
+                pollNetwork()
+                await yieldNow()
+              if netifIp4(netif) == 0'u32:
+                discard applyObservedDhcpLease(netif)
+            httpIp = netifIp4(netif)
+            printHex("[M0] allcore_http_reconnect_ip=", httpIp)
+            if httpIp != 0'u32:
+              announceHttpIp(netif)
+              linkDownSinceMs = 0'u32
+              lastArpMs = nowMs()
+              # Reset the RX-liveness baseline so the fresh association is not
+              # immediately re-flagged as stalled.
+              lastRxSeen = nimfw_dbg_rxl_frame_seen
+              lastRxAdvanceMs = nowMs()
+              discard console.sendLine("[M0] allcore_http_reconnect_done")
+          if bl808_wifi_backend_connected() == 0 or
+              bl808WpaCurrentState() != WpaCompletedState:
+            # Still down — back off before the next attempt so a persistent
+            # outage does not busy-spin the reconnect path.
+            printHex("[M0] allcore_http_reconnect_retry_wait=", reconnects)
+            await sleepUs(WifiReconnectBackoffUs)
+            linkDownSinceMs = nowMs()  # restart the debounce window
+
       if httpIp != 0'u32 and currentMs - lastArpMs >= 1000'u32:
         discard etharpGratuitous(netif)
         lastArpMs = currentMs
@@ -2385,11 +2564,13 @@ else:
 proc mainWorkflow(): CpsVoidFuture {.cps.} =
   discard heartbeatTask()
 
+  dumpHeapMilestone("smoke_start")
   let addInstall = installWasmSlotSmoke(WasmLiveAddSlot)
   if addInstall != WasmSlotSmokeOk:
     fail("install live add WASM slot", addInstall)
     return
   pass("installed live add WASM program")
+  dumpHeapMilestone("post_install")
 
   discard unloadWasmProgram(WasmLiveSumSlot)
   let sumInstall = installWasmProgramBytes(WasmLiveSumSlot, SumModule, generation = 9'u32)
@@ -2460,6 +2641,20 @@ proc mainWorkflow(): CpsVoidFuture {.cps.} =
   dcacheFlushAll()
   fenceIo()
 
+  # M0<->LP boot handshake. The primary fix for the boot-handoff corruption is
+  # placing LP RAM in the NON-CACHED WRAM window (bl808_lp.ld, 0x22054000) so it
+  # no longer cache-aliases M0 OCRAM. This handshake is kept as cheap defense in
+  # depth: wait for LP to publish its "reached runScheduler" marker (0x1A00_00F4)
+  # before M0 proceeds to releaseD0 and the CPS scheduler, so peer bring-up is
+  # ordered. Bounded so a wedged LP cannot hang the master; the later waitPeer
+  # still validates LP liveness.
+  var lpSettleWaited = 0'u32
+  while sharedRead32(WasmLiveLpAddValueAddr) != LpBootSettledMarker and
+      lpSettleWaited < 2000'u32:
+    await sleepUs(1_000'u64)
+    inc lpSettleWaited
+  printHex("[M0] lp_boot_settle_ms=", lpSettleWaited)
+
   discard console.sendLine("[M0] Releasing live D0 WASM CPS worker")
   releaseD0()
 
@@ -2487,6 +2682,7 @@ proc mainWorkflow(): CpsVoidFuture {.cps.} =
     discard console.sendLine("=== Test Complete ===")
   else:
     discard console.sendLine("=== Test Failed ===")
+  dumpHeapMilestone("post_smoke")
 
   await runAllcoreHttpManagerAfterSmoke()
 

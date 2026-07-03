@@ -1050,6 +1050,13 @@ proc cacheScanuStartRequest*(
     req: ptr ScanuStartReqPayload,
     requester: uint8
 ) {.inline.} =
+  # Invariant (post idle-guard): paramPtr is nil here because scanu_confirm nil'd
+  # it at the previous op's completion. A non-nil, different value means an
+  # overlap slipped past the guard -> free the abandoned block so it can never
+  # dangle, and flag it (nimFwDbgScanuParamOverwrite MUST stay 0 after the fix).
+  if scanu_env.paramPtr != nil and scanu_env.paramPtr != param:
+    inc nimFwDbgScanuParamOverwrite
+    ke_msg_free(keMsgHdrFromPayload(scanu_env.paramPtr))
   scanu_env.paramPtr = param
   scanu_env.bssidFilterEnabled = 0
   scanu_env.scanBand = 0
@@ -1195,6 +1202,17 @@ proc scanu_start_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ##   5. Copy 6 bytes from param+286 (BSSID filter) into scanu_env+182
   ##   6. Tail-call scanu_start(), returns KeMsgNoFree
   if param == nil: return KeMsgConsumed
+  # Upper scanu owns a SINGLE scanu_env.paramPtr slot. If a new SCANU_START_REQ
+  # arrives while a scan/join is still in flight (state != idle), overwriting
+  # paramPtr abandons the in-flight ke_msg and makes scanu_confirm's real free
+  # (scan_station_ap_me.nim:300) target the wrong/still-live block -> a
+  # use-after-free on the shared TLSF heap (the freed ke_msg is reused by Nim
+  # ARC, then a stale scanu access corrupts the Nim object -> nimIncRef fault).
+  # The lower scan_start_req_handler already busy-rejects (:1074); the upper task
+  # lost that guard. Reject the overlap; the dispatcher frees the req (:809), so
+  # no leak. The host re-issues the scan once scanu returns to idle.
+  if ke_state_get(TASK_SCANU) != ScanuIdleState:
+    return KeMsgConsumed
   let req = scanuStartReqView(param)
   let reqHdr = keMsgHdrFromPayload(param)
   cacheScanuStartRequest(param, req, reqHdr.srcId)
@@ -1264,6 +1282,12 @@ proc scanu_join_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ##  10. If scan_start succeeds: ke_state_set(TASK_SCANU, ScanuJoiningState), store scan result,
   ##      call scanu_confirm, clear link, send SCANU_JOIN_CFM
   ##  11. If fails: call scanu_confirm(fail)
+  if param == nil: return KeMsgConsumed
+  # Same single-paramPtr-slot hazard as scanu_start_req_handler: reject an
+  # overlapping join rather than clobbering scanu_env.paramPtr (which would make
+  # scanu_confirm free a still-live ke_msg -> shared-heap UAF -> nimIncRef).
+  if ke_state_get(TASK_SCANU) != ScanuIdleState:
+    return KeMsgConsumed
   let req = scanuStartReqView(param)
   let vifIdx = req.vifIdx
   let vif = vifChannelForIdx(vifIdx)
@@ -1485,6 +1509,12 @@ proc smConnectReqHasSpecificBssid(req: ptr ConnectInfoView): bool {.inline.} =
       allFf = false
   not allZero and not allFf
 
+const SmConnectEnvLen = 860'u32
+  ## Retained connect-env size: matches the blob's large connect message
+  ## (SM_CONNECT_IND is allocated at 860 below) and covers every connect-info
+  ## overlay access, including ConnectInfoChannelContextOverlay.chanType at
+  ## offset 479 — far past the ~192-byte host SM_CONNECT_REQ param.
+
 proc sm_connect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle SM_CONNECT_REQ: initiate STA connection (173 instrs in blob).
   ## From blob (sm_task.o): validates SM state, loads VIF info, checks
@@ -1554,6 +1584,13 @@ proc sm_connect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
     # Check no existing connection in sm_connect_env
     if sm.connectInfo != nil:
       assert_err("sm_task.c", "sm_task.c", 94)
+    # Retain the request param itself as the connection env (blob design), and
+    # return KeMsgNoFree below so the dispatcher does NOT free it while SM holds
+    # it; SM frees it in sm_connect_ind / sm_delete_resources. Writes to the
+    # connect-info are all within ConnectInfoView (<= offset 62, in-bounds of
+    # the 192-byte param); overlay READS past the param are non-corrupting and
+    # match the blob. The one legal-by-contract write past paramLen (the
+    # null terminator) is kept off the tail canary by KeMsgTailSlack.
     sm.connectInfo = param
     sm.connectFlags = (req.channelDuration and 0xFF).uint8
     if sm.connectIndMsg != nil:
@@ -1573,6 +1610,8 @@ proc sm_connect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
 
   # Post-CFM success steps (blob: direct join when a target BSSID/channel is
   # already known, otherwise start a scan using the VIF MAC as the source).
+  # BSS/channel pointers come from the retained param (sm.connectInfo == param);
+  # KeMsgNoFree below keeps it alive past this handler.
   var selectedBssResult: pointer = nil
   var selectedBssChannel: pointer = nil
   if connectInfoHasChannelHint(req) and smConnectReqHasSpecificBssid(req):
@@ -1603,6 +1642,9 @@ proc sm_connect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
     sm_join_bss(vifMacAddr, selectedBssResult, selectedBssChannel, 0)
   else:
     sm_scan_bss(vifMacAddr, selectedBssResult, selectedBssChannel)
+  # SM retains the request as sm.connectInfo; do NOT let the dispatcher free it
+  # (SM frees it later in sm_connect_ind / sm_delete_resources). This is the
+  # blob's balanced ownership.
   return KeMsgNoFree
 
 proc sm_disconnect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
@@ -1894,6 +1936,14 @@ proc sm_delete_resources*(param: pointer = nil) {.exportc, cdecl.} =
   if sm.connectIndMsg != nil:
     ke_msg_free(keMsgHdrFromPayload(sm.connectIndMsg))
     sm.connectIndMsg = nil
+  # Free the retained SM_CONNECT_REQ param (sm.connectInfo). It is retained via
+  # KeMsgNoFree in sm_connect_req_handler (the dispatcher does NOT free it), so
+  # SM owns it. sm_connect_ind frees+nils it before it calls sm_delete_resources
+  # (so this is a guarded no-op on that path); the disconnect path reaches
+  # sm_delete_resources with it still set, so freeing here is what prevents a
+  # per-disconnect leak. Guard+nil keeps it exactly-once (no double-free).
+  if sm.connectInfo != nil:
+    ke_msg_free(keMsgHdrFromPayload(sm.connectInfo))
   sm.connectInfo = nil
   sm.cancelRequested = 0
   sm.joinBssFlag = 0
@@ -2471,6 +2521,9 @@ proc me_config_req_handler*(param: pointer) {.exportc, cdecl.} =
   ## via ke_msg_send_basic. If HT: queries NSS, stores caps.
   ## Copies def_key(req[44]) to me_env(128), ps_on(req[48]) to me_env(133).
   ## If ps_on: sets ps_mode=0xFF, sets cfm status=2, sends cfm, sets ME state to 1.
+  when defined(bl808HeapGuardMsgs):
+    proc tlsfCheckHeapRaw(): cint {.importc: "tlsf_check_heap", cdecl.}
+    if tlsfCheckHeapRaw() == 0: nimFwDbgHeapGuardStage = 1  # broken on ENTRY
   let me = meEnvView()
   let req = meConfigReqView(param)
   # Store HT support flag
@@ -2478,8 +2531,14 @@ proc me_config_req_handler*(param: pointer) {.exportc, cdecl.} =
   me.htSupp = htSupp
   # Copy 32 bytes of HT capabilities to me_env+8
   discard c_memcpy(addr me.htCaps[0], addr req.htCaps[0], 32.csize_t)
+  when defined(bl808HeapGuardMsgs):
+    if nimFwDbgHeapGuardStage == 0 and tlsfCheckHeapRaw() == 0:
+      nimFwDbgHeapGuardStage = 2  # broken after HT-caps memcpy
   # Send basic ME_CONFIG_CFM
   ke_msg_send_basic(ME_CONFIG_CFM, TASK_API, TASK_ME)
+  when defined(bl808HeapGuardMsgs):
+    if nimFwDbgHeapGuardStage == 0 and tlsfCheckHeapRaw() == 0:
+      nimFwDbgHeapGuardStage = 3  # broken after ke_msg_send_basic(CFM)
   # Process HT capabilities
   if htSupp != 0:
     # Get NSS from PHY (blob: phy_get_nss at 0x64)
@@ -2687,7 +2746,21 @@ proc me_set_active_cfm_handler_sm*(param: pointer) {.exportc: "me_set_active_cfm
   ##   .L33: if sm_env[17] != 0 → sm_deauth_send; sm_env[17] = 0
   ##         sm_auth_start(NULL)
   if not smSetActiveCfmStateAllowed():
-    assert_err("me_task.c", "me_task.c", 690)
+    # A stale / misordered ME_SET_ACTIVE_CFM — an orphan left in keMsgQueueSent
+    # by a torn-down connect attempt (recover path force-resets SM to Idle
+    # without draining SM-destined confirmations). The blob calls assert_err
+    # here, but assert_err raises the bit-31 firmware-reset event ->
+    # bl_reset_evt -> hal_machw_reset, which under a reconnect STORM fires many
+    # times and programs MAC MMIO on a possibly clock-gated MAC -> unhaltable
+    # AHB bus-stall (the observed wedge). The only legitimate states for this
+    # CFM are SettingBss(4) and Disconnecting(10); any other state is provably
+    # a stale orphan. Record it for telemetry and DROP it — do NOT assert, and
+    # do NOT fall through to sm_auth_start (connectInfo is already gone, so the
+    # auth send would silently no-op and leave SM stalled until the connect
+    # times out). This turns "assert+reset+stall" into a clean drop.
+    inc nimFwDbgActiveCfmBadState
+    nimFwDbgActiveCfmLastState = ke_state_get(TASK_SM).uint32
+    return
   if ke_state_get(TASK_SM) == SmDisconnectingState:
     ke_state_set(TASK_SM, SmIdleState)
     return
@@ -3820,7 +3893,14 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
     phy_get_channel_raw(cast[pointer](addr chanInfo[0]), 0)
 
     # Allocate ke_msg: ke_msg_alloc(RXU_MGT_IND, msgSubtype, TASK_RXU, bodyLen+32)
-    let msgSize = bodyLen.uint32 + 32
+    # Floored at the RxuMgtIndView fixed-header extent (beaconPeriod/capInfo
+    # end at offset 68): consumers read AND zero-write those fixed fields on
+    # every mgt ind, and short auth/deauth/action frames (~30 byte bodies)
+    # otherwise allocate less than the fixed header — the field writes then
+    # land past the block (TLSF canary forensics: 65-byte 0x1C00 msgs, canary
+    # bytes zeroed up to exactly offset 68, during every connect).
+    const RxuMgtIndFixedHeaderLen = 68'u32
+    let msgSize = max(bodyLen.uint32 + 32, RxuMgtIndFixedHeaderLen)
     let msg = ke_msg_alloc(RXU_MGT_IND, msgSubtype, TASK_RXU, msgSize)
     if msg == nil:
       # Debug log: ke_msg_alloc failure (blob 0x308, line 1482)
@@ -3908,10 +3988,19 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
     mfpAcceptedFlag = 0
   return mfpAcceptedFlag.uint32
 
-proc rxu_mgt_ind_handler_scanu(param: pointer) {.exportc: "rxu_mgt_ind_handler_scanu", cdecl.} =
+proc rxu_mgt_ind_handler_scanu(param: pointer): cint {.exportc: "rxu_mgt_ind_handler_scanu", cdecl.} =
   ## Handle management frame indication for SCANU task (10 bytes in blob, scanu_task.o).
   ## Tail-calls scanu_frame_handler with the message body.
   scanu_frame_handler(param, 0)
+  # scanu_frame_handler ALWAYS re-queues the frame via
+  # ke_msg_forward_and_change_id -> ke_msg_send (as SCANU_RESULT_IND 0x804), so
+  # the frame is now owned by that forwarded dispatch. Return KeMsgNoFree so the
+  # message dispatcher does NOT also free it. Previously this proc returned void
+  # -> the dispatcher read a garbage return, normalized it to KeMsgConsumed, and
+  # freed the already-re-queued frame: a double-free (JTAG/TLSF-confirmed:
+  # df_msg = 0x02090804 = SCANU_RESULT_IND) that later surfaced as a
+  # use-after-free fault in an unrelated HTTP Table destroy.
+  return KeMsgNoFree
 
 proc rxu_mgt_ind_handler_sm(param: pointer) {.exportc: "rxu_mgt_ind_handler_sm", cdecl.} =
   ## Handle management frame indication for SM task (256 bytes in blob, sm_task.o).

@@ -35,7 +35,7 @@ RV32_SIZE := $(shell command -v $(SIZE_RV32) 2>/dev/null || command -v $(SIZE_RV
 RV64_OBJCOPY := $(shell command -v $(OBJCOPY_RV64) 2>/dev/null || echo "")
 RV64_SIZE := $(shell command -v $(SIZE_RV64) 2>/dev/null || echo "")
 
-.PHONY: m0 d0 lp ipc examples-check flash-m0 flash-d0 flash-lp venv hw-list hw-preflight hw-smoke hw-smoke-uart hw-smoke-anchor hw-smoke-jtag hw-allcore-jtag hw-npu-anchor-probe hw-npu-anchor-install hw-npu-smoke-anchor hw-e2e-quick hw-e2e-lwip-smoke hw-full hw-full-uart hw-full-anchor clean help
+.PHONY: m0 d0 lp ipc examples-check flash-m0 flash-d0 flash-lp venv test test-all hw-list hw-preflight hw-smoke hw-smoke-uart hw-smoke-anchor hw-smoke-jtag hw-allcore-jtag hw-npu-anchor-probe hw-npu-anchor-install hw-npu-smoke-anchor hw-e2e-quick hw-e2e-lwip-smoke hw-full hw-full-uart hw-full-anchor clean help
 
 help:
 	@echo "BL808 HAL build system"
@@ -46,6 +46,8 @@ help:
 	@echo "  make lp FILE=<source.nim>   Build firmware for LP (E902, RV32E)"
 	@echo "  make ipc                    Build IPC demo for both cores"
 	@echo "  make examples-check         Compile-check all example programs"
+	@echo "  make test                   Host pytest gate (no hardware needed)"
+	@echo "  make test-all               Full host pytest (informational)"
 	@echo ""
 	@echo "Flash targets:"
 	@echo "  make flash-m0 FILE=<source> Build and flash M0 firmware"
@@ -162,6 +164,37 @@ venv:
 	python3 -m venv $(VENV)
 	$(PYTHON) -m pip install --upgrade pip
 	$(PYTHON) -m pip install -r requirements-hw.txt
+
+# Host test gate. Green on a clean tree; runs the self-contained pytest suite
+# that does not need built artifacts or hardware. Excluded categories and why:
+#   test_efuse_provision / test_secureboot_chain / test_sbtool_container:
+#     standalone CLI check scripts (top-level sys.exit / __main__), not pytest
+#     cases — they abort collection. Run them directly as scripts instead.
+#   test_*_policy.py: assert source-tree text patterns (WiFi/BLE/CPS). They are
+#     coupled to the in-flight WiFi/BLE firmware rewrite and are pre-existing
+#     red on the dirty tree; tracked for M6 once that work settles.
+#   test_validate_*.py: require built ELF artifacts (objdump etc.); run them
+#     after a hardware build, not in the fast host gate.
+# Fuzzer compilation belongs to M6 (the fuzzers need the bare-metal
+# memory-manager config and are not host-compilable with plain `nim c`).
+PYTEST_TEST_IGNORE := \
+	--ignore=tools/test_efuse_provision.py \
+	--ignore=tools/test_secureboot_chain.py \
+	--ignore=tools/test_sbtool_container.py \
+	--ignore-glob=tools/test_*_policy.py \
+	--ignore-glob=tools/test_validate_*.py
+
+test: venv
+	@echo "=== Host pytest gate ==="
+	$(PYTHON) -m pytest tools/ $(PYTEST_TEST_IGNORE) -q -p no:cacheprovider
+	@echo "=== test: PASS ==="
+
+test-all: venv
+	@echo "=== Full host pytest (informational; surfaces pre-existing failures) ==="
+	$(PYTHON) -m pytest tools/ \
+		--ignore=tools/test_efuse_provision.py \
+		--ignore=tools/test_secureboot_chain.py \
+		--ignore=tools/test_sbtool_container.py -q -p no:cacheprovider
 
 hw-list: venv
 	$(HW_VALIDATE) --list

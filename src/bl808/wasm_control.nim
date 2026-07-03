@@ -9,9 +9,7 @@ import ./wasm_runtime
 import ./wasm_manager
 import ./wasm_scheduler
 import ./wasm_store
-
-when not (defined(bl808d0) or defined(bl808lp)):
-  import ./wasm_os
+import ./wasm_os
 
 export wasm_runtime
 export wasm_scheduler
@@ -155,13 +153,38 @@ proc startWasmProgramTaskI32*(slot: uint32, exportName: string,
   if slot >= Ox64WasmSlotCount.uint32:
     return WasmControlTaskResult(status: wasmControlBadSlot, slot: slot.int32)
   result = controlFromTask(startWasmTaskI32(slot, exportName, args, maxTotalFuel))
-  when not (defined(bl808d0) or defined(bl808lp)):
-    if result.status == wasmControlOk:
-      discard appendWasmOsEvent(wasmEventTaskStarted, taskId = result.taskId,
-                                slot = result.slot, code = result.fuelLimit)
-    elif result.status == wasmControlRunError:
-      discard appendWasmOsTrap(currentWasmOsCore(), result.taskId, result.slot,
-                               result.trapCode, result.fuelUsed, result.taskState)
+  if result.status == wasmControlOk:
+    discard appendWasmOsEvent(wasmEventTaskStarted, taskId = result.taskId,
+                              slot = result.slot, code = result.fuelLimit)
+  elif result.status == wasmControlRunError:
+    discard appendWasmOsTrap(currentWasmOsCore(), result.taskId, result.slot,
+                             result.trapCode, result.fuelUsed, result.taskState)
+
+proc startWasmProgramTaskWithManifest*(slot: uint32, exportName: string,
+                                       args: openArray[int32],
+                                       manifest: WasmOsProgramManifest,
+                                       priority = 0'u8): WasmControlTaskResult =
+  ## Manifest-aware start: seeds the task identity (programId/ownerCore/priority)
+  ## and enforces the manifest's memory quota + fuel budget at instantiation.
+  if slot >= Ox64WasmSlotCount.uint32:
+    return WasmControlTaskResult(status: wasmControlBadSlot, slot: slot.int32)
+  let ownerCore =
+    if manifest.preferredCore != wasmOsCoreUnknown:
+      manifest.preferredCore.ord.uint8
+    else:
+      currentWasmOsCore().ord.uint8
+  result = controlFromTask(startWasmTaskI32(
+    slot, exportName, args,
+    maxTotalFuel = manifest.limits.maxFuel,
+    priority = priority,
+    ownerCore = ownerCore,
+    maxMemoryPages = manifest.limits.maxMemoryPages.uint16))
+  if result.status == wasmControlOk:
+    discard appendWasmOsEvent(wasmEventTaskStarted, taskId = result.taskId,
+                              slot = result.slot, code = result.fuelLimit)
+  elif result.status == wasmControlRunError:
+    discard appendWasmOsTrap(currentWasmOsCore(), result.taskId, result.slot,
+                             result.trapCode, result.fuelUsed, result.taskState)
 
 proc startWasmProgramImageTaskI32*(base: ptr UncheckedArray[byte], len: uint32,
                                    slotLabel: uint32, exportName: string,
@@ -176,25 +199,24 @@ proc startWasmProgramImageTaskI32*(base: ptr UncheckedArray[byte], len: uint32,
 proc resumeWasmProgramTask*(taskId: uint32,
                             fuel = WasmSchedulerDefaultFuel): WasmControlTaskResult =
   result = controlFromTask(resumeWasmTask(taskId, fuel))
-  when not (defined(bl808d0) or defined(bl808lp)):
-    if result.status == wasmControlOk:
-      case result.taskState
-      of wasmTaskYielded:
-        discard appendWasmOsEvent(wasmEventTaskYielded, taskId = result.taskId,
-                                  slot = result.slot, code = result.fuelUsed)
-      of wasmTaskExited:
-        discard appendWasmOsEvent(wasmEventTaskExited, taskId = result.taskId,
-                                  slot = result.slot, value = result.value,
-                                  code = result.fuelUsed)
-      of wasmTaskBlockedHttp, wasmTaskBlockedSd, wasmTaskBlockedIpc,
-          wasmTaskBlockedTimer, wasmTaskBlockedEnclave:
-        discard appendWasmOsEvent(wasmEventTaskBlocked, taskId = result.taskId,
-                                  slot = result.slot, code = result.taskState.ord.uint32)
-      else:
-        discard
-    elif result.schedulerStatus in {wasmSchedTrap, wasmSchedQuotaExceeded}:
-      discard appendWasmOsTrap(currentWasmOsCore(), result.taskId, result.slot,
-                               result.trapCode, result.fuelUsed, result.taskState)
+  if result.status == wasmControlOk:
+    case result.taskState
+    of wasmTaskYielded:
+      discard appendWasmOsEvent(wasmEventTaskYielded, taskId = result.taskId,
+                                slot = result.slot, code = result.fuelUsed)
+    of wasmTaskExited:
+      discard appendWasmOsEvent(wasmEventTaskExited, taskId = result.taskId,
+                                slot = result.slot, value = result.value,
+                                code = result.fuelUsed)
+    of wasmTaskBlockedHttp, wasmTaskBlockedSd, wasmTaskBlockedIpc,
+        wasmTaskBlockedTimer, wasmTaskBlockedEnclave:
+      discard appendWasmOsEvent(wasmEventTaskBlocked, taskId = result.taskId,
+                                slot = result.slot, code = result.taskState.ord.uint32)
+    else:
+      discard
+  elif result.schedulerStatus in {wasmSchedTrap, wasmSchedQuotaExceeded}:
+    discard appendWasmOsTrap(currentWasmOsCore(), result.taskId, result.slot,
+                             result.trapCode, result.fuelUsed, result.taskState)
 
 proc runWasmProgramScheduler*(fuelPerTask = WasmSchedulerDefaultFuel,
                               maxResumes = 32'u32): uint32 =
@@ -202,10 +224,9 @@ proc runWasmProgramScheduler*(fuelPerTask = WasmSchedulerDefaultFuel,
 
 proc killWasmProgramTask*(taskId: uint32): WasmControlTaskResult =
   result = controlFromTask(killWasmTask(taskId))
-  when not (defined(bl808d0) or defined(bl808lp)):
-    if result.status == wasmControlOk:
-      discard appendWasmOsEvent(wasmEventTaskKilled, taskId = result.taskId,
-                                slot = result.slot)
+  if result.status == wasmControlOk:
+    discard appendWasmOsEvent(wasmEventTaskKilled, taskId = result.taskId,
+                              slot = result.slot)
 
 proc getWasmProgramTask*(taskId: uint32): WasmControlTaskResult =
   controlFromTask(getWasmTask(taskId))

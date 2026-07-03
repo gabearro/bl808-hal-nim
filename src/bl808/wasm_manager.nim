@@ -72,8 +72,10 @@ proc close*(handle: var WasmProgramHandle) =
   handle = WasmProgramHandle(slot: -1, moduleIdx: -1, vm: initIntWasmVM())
 
 proc openWasmProgramSlot*(handle: var WasmProgramHandle,
-                          slot: uint32): WasmProgramManagerError =
+                          slot: uint32,
+                          maxMemoryPages = 0'u32): WasmProgramManagerError =
   ## Load one flash-backed slot and instantiate it in a fresh compact VM.
+  ## ``maxMemoryPages`` (when nonzero) enforces a per-program memory quota.
   handle.close()
   var program: LoadedWasmProgram
   let loadErr = loadWasmProgramSlot(slot, program)
@@ -83,7 +85,7 @@ proc openWasmProgramSlot*(handle: var WasmProgramHandle,
   var vm = initIntWasmVM()
   var moduleIdx: int
   try:
-    moduleIdx = vm.instantiateFlashIntOnly(program.module)
+    moduleIdx = vm.instantiateFlashIntOnly(program.module, maxMemoryPages)
   except CatchableError:
     program.unload()
     return wasmManagerInstantiateFailed
@@ -97,7 +99,8 @@ proc openWasmProgramSlot*(handle: var WasmProgramHandle,
 
 proc openWasmProgramImage*(handle: var WasmProgramHandle,
                            base: ptr UncheckedArray[byte],
-                           len: uint32): WasmProgramManagerError =
+                           len: uint32,
+                           maxMemoryPages = 0'u32): WasmProgramManagerError =
   ## Host/test and staging-buffer variant that opens a header+payload image.
   handle.close()
   var program: LoadedWasmProgram
@@ -108,7 +111,7 @@ proc openWasmProgramImage*(handle: var WasmProgramHandle,
   var vm = initIntWasmVM()
   var moduleIdx: int
   try:
-    moduleIdx = vm.instantiateFlashIntOnly(program.module)
+    moduleIdx = vm.instantiateFlashIntOnly(program.module, maxMemoryPages)
   except CatchableError:
     program.unload()
     return wasmManagerInstantiateFailed

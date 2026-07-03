@@ -19,13 +19,31 @@ proc bl808WifiBackendDriveRfStatus() =
     rfCtrl = rfCtrl and not 0x01'u32
   regWrite32(RfStatusCtrl, rfCtrl)
 
+template macServiceIrqSave(): uint32 =
+  block:
+    var prev {.gensym.}: uint32
+    {.emit: ["asm volatile(\"csrrci %0, mstatus, 8\" : \"=r\"(", prev, ") );"].}
+    prev
+
+template macServiceIrqRestore(prev: uint32) =
+  if (prev and 8) != 0:
+    {.emit: ["asm volatile(\"csrsi mstatus, 8\");"].}
+
 proc bl808WifiBackendPollMacIrq() =
+  ## Thread-context MAC servicing. mac_irq()/hal_machw_gen_handler() mutate
+  ## MAC descriptor lists with plain multi-word stores, and the SAME handlers
+  ## also run from the real CLIC trap (bl808WifiBackendMacIrqTrampoline).
+  ## Mask interrupts around the thread-side servicing so trap-context and
+  ## thread-context invocations can never interleave inside the handlers
+  ## (unsynchronized overlap tears co_list/descriptor state).
   var guard = 32
   while guard > 0:
     dec guard
+    let saved = macServiceIrqSave()
     let platformPending = regRead32(MacIrqStatus0) or regRead32(MacIrqStatus1)
     let machwPending = regRead32(MachwIrqRaw) and regRead32(MachwIrqUnmask)
     if platformPending == 0 and machwPending == 0:
+      macServiceIrqRestore(saved)
       break
     inc macIrqCount
     inc macPollIrqCount
@@ -33,6 +51,7 @@ proc bl808WifiBackendPollMacIrq() =
       mac_irq()
     else:
       hal_machw_gen_handler()
+    macServiceIrqRestore(saved)
 
 proc bl808WifiBackendMacIrqTrampoline() {.cdecl.} =
   inc macIrqCount

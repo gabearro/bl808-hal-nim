@@ -36,6 +36,16 @@
 #define MEMP_NUM_TCP_PCB               2
 #define MEMP_NUM_TCP_PCB_LISTEN        1
 #define MEMP_NUM_TCP_SEG               8
+
+/* TIME_WAIT lifetime = 2*TCP_MSL. The default MSL (60000 ms) keeps a ~176-byte
+ * tcp_pcb alive for 120 s after every Connection:close request. Because this
+ * build uses MEMP_MEM_MALLOC=1, the MEMP_NUM_TCP_PCB pool cap is NOT enforced
+ * (pcbs come from the shared TLSF heap, not a fixed pool), so TIME_WAIT pcbs
+ * accumulate on the heap under request load faster than they expire and
+ * eventually exhaust it (measured: ~208 pcbs, ~36 KB, wedge at ~430 s). On a
+ * LAN embedded server a short MSL is safe and standard; 500 ms -> 1 s TIME_WAIT
+ * so closed-connection pcbs are reclaimed promptly. */
+#define TCP_MSL                        500
 #define MEMP_NUM_SYS_TIMEOUT           LWIP_NUM_SYS_TIMEOUT_INTERNAL
 #define MEMP_NUM_NETBUF                0
 #define MEMP_NUM_NETCONN               0

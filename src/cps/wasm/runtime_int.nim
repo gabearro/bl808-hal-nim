@@ -75,6 +75,46 @@ const CompactLabelStackMax = 32
 template trap(msg: string) =
   raise newException(IntWasmTrap, msg)
 
+const
+  ## Native-stack safety for synchronous recursion. ``executeInt`` recurses on
+  ## every ``opCall`` (see L646 and the resumable path at L1287); without a
+  ## bound a hostile recursive module overflows the native stack and hard-faults
+  ## the core outside Nim's try/except. ``WasmIntMaxCallDepth`` bounds the frame
+  ## COUNT — pick it conservatively for the target core's stack and override per
+  ## build with -d:WasmIntMaxCallDepth=N. ``WasmIntMaxStepsPerFrame`` bounds work
+  ## per single executeInt invocation so a runaway callee (reached synchronously
+  ## via opCall from the resumable interpreter, which otherwise defeats the slice
+  ## fuel budget) traps wtQuota instead of hanging the core.
+  WasmIntMaxCallDepth* {.intdefine.} = 64
+  WasmIntMaxStepsPerFrame* {.intdefine.} = 131072'u32
+
+proc msgHas(msg, needle: string): bool {.inline.} =
+  if needle.len == 0: return true
+  if msg.len < needle.len: return false
+  for i in 0 .. msg.len - needle.len:
+    var match = true
+    for j in 0 ..< needle.len:
+      if msg[i + j] != needle[j]:
+        match = false
+        break
+    if match: return true
+  false
+
+proc classifyTrap*(msg: string): WasmTrapReason {.inline.} =
+  ## Map an IntWasmTrap message to a structured reason so the trap ring and
+  ## crash reports carry actionable codes without restructuring every trap() site.
+  if msgHas(msg, "call depth"): wtCallDepth
+  elif msgHas(msg, "step") or msgHas(msg, "quota"): wtQuota
+  elif msgHas(msg, "out of bounds"): wtOobMem
+  elif msgHas(msg, "divisor") or msgHas(msg, "divide"): wtDivZero
+  elif msgHas(msg, "unreachable"): wtUnreachable
+  elif msgHas(msg, "underflow"): wtStackUnderflow
+  elif msgHas(msg, "watchdog"): wtWatchdog
+  elif msgHas(msg, "host call") or msgHas(msg, "host timeout"): wtHostTimeout
+  elif msgHas(msg, "import"): wtImport
+  elif msgHas(msg, "denied"): wtHostCapDenied
+  else: wtUnknown
+
 proc intRuntimeStage(code: uint32) {.inline.} =
   when defined(bl808lp) and defined(bl808WasmTrace):
     regWrite(0x40002E84'u, code)
@@ -337,7 +377,11 @@ proc instantiateIntOnly*(vm: var IntWasmVM, module: WasmModule): int =
   vm.modules.add(inst)
   intRuntimeStage(0x57536060'u32)
 
-proc instantiateFlashIntOnly*(vm: var IntWasmVM, module: FlashWasmModule): int =
+proc instantiateFlashIntOnly*(vm: var IntWasmVM, module: FlashWasmModule,
+                              maxMemoryPages: uint32 = 0): int =
+  ## Instantiate a flash-backed compact module. When ``maxMemoryPages`` is
+  ## nonzero it overrides the module's declared maximum, enforcing a per-program
+  ## memory quota at instantiation (used by the manifest-aware start path).
   intRuntimeStage(0x5753A000'u32)
   if module.imports.len != 0:
     trap("imports are not supported by integer-only runtime")
@@ -360,6 +404,13 @@ proc instantiateFlashIntOnly*(vm: var IntWasmVM, module: FlashWasmModule): int =
     inst.memoryPages = module.memories[0].limits.min
     inst.memoryHasMax = module.memories[0].limits.hasMax
     inst.memoryMax = module.memories[0].limits.max
+    if maxMemoryPages != 0:
+      # Enforce the per-program memory quota: clamp declared pages to the cap.
+      if inst.memoryPages > maxMemoryPages:
+        trap("manifest memory quota below declared minimum pages")
+      if not inst.memoryHasMax or inst.memoryMax > maxMemoryPages:
+        inst.memoryHasMax = true
+        inst.memoryMax = maxMemoryPages
 
   intRuntimeStage(0x5753A020'u32)
   for ft in module.types:
@@ -454,7 +505,10 @@ proc compactBranchTo(labels: var array[CompactLabelStackMax, CompactLabel],
   target.continuation
 
 proc executeInt(vm: var IntWasmVM, moduleIdx: int, funcIdx: int,
-                args: openArray[int32]): int32 =
+                args: openArray[int32], depth = 0,
+                maxSteps = WasmIntMaxStepsPerFrame): int32 =
+  if depth > WasmIntMaxCallDepth:
+    trap("call depth exhausted")
   if moduleIdx < 0 or moduleIdx >= vm.modules.len:
     trap("module index out of range")
   let inst = addr vm.modules[moduleIdx]
@@ -475,6 +529,7 @@ proc executeInt(vm: var IntWasmVM, moduleIdx: int, funcIdx: int,
 
   var sp = 0
   var pc = 0
+  var steps = 0'u32
   let expr =
     if fn.codeIsFlash:
       decodeFlashExpr(inst.image, fn.flashCodeOffset, fn.flashCodeLen)
@@ -484,6 +539,9 @@ proc executeInt(vm: var IntWasmVM, moduleIdx: int, funcIdx: int,
   var labelCount = 0
 
   while pc < expr.code.len:
+    inc steps
+    if steps >= maxSteps:
+      trap("instruction step budget exhausted")
     intRuntimeStage(0x57537000'u32 or (uint32(funcIdx and 0xF) shl 8) or uint32(pc and 0xFF))
     let instr = expr.code[pc]
     case instr.op
@@ -643,7 +701,8 @@ proc executeInt(vm: var IntWasmVM, moduleIdx: int, funcIdx: int,
       for i in 0 ..< sp:
         savedStack[i] = vm.stack[i]
 
-      let callResult = vm.executeInt(moduleIdx, calleeIdx, callArgs)
+      let callResult = vm.executeInt(moduleIdx, calleeIdx, callArgs,
+                                     depth + 1, maxSteps)
 
       while callerLocalCount > vm.locals.len:
         vm.locals.setLen(vm.locals.len * 2)
@@ -1436,5 +1495,5 @@ proc resumeIntWasmTask*(vm: var IntWasmVM, task: var IntWasmTask,
     result = vm.resumeTaskCore(task, fuel)
   except CatchableError:
     task.state = intTaskTrapped
-    task.trapCode = 1
+    task.trapCode = classifyTrap(getCurrentExceptionMsg()).uint32
     result = task.state

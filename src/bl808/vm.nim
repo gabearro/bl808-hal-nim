@@ -314,7 +314,10 @@ proc d0VmInit*() =
   setD0PageFaultHandler(vmFaultHandler)
 
 proc d0VmSetSwapProvider*(provider: D0VmSwapProvider) =
-  vmSwap = provider
+  vmSwap.ctx = provider.ctx
+  vmSwap.slots = provider.slots
+  vmSwap.readPage = provider.readPage
+  vmSwap.writePage = provider.writePage
   for i in 0 ..< vmSwapSlotUsed.len:
     vmSwapSlotUsed[i] = false
 

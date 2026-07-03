@@ -159,6 +159,14 @@ static inline void __dcache_flush_all(void) {
 static inline void __dcache_invalidate_all(void) {
   asm volatile(".long 0x0020000b" ::: "memory");
 }
+/* dcache.ciall: clean (write back dirty lines) THEN invalidate, atomically per
+ * line. Use this instead of dcache.iall whenever the goal is "observe fresh
+ * data written by another master": bare iall DESTROYS dirty write-back data
+ * (e.g. the PSRAM heap), which corrupted live heap objects when peer-control
+ * poll loops invalidated the whole dcache per iteration. */
+static inline void __dcache_clean_invalidate_all(void) {
+  asm volatile(".long 0x0030000b" ::: "memory");
+}
 static inline void __icache_invalidate_all(void) {
   asm volatile(".long 0x0100000b" ::: "memory");
 }

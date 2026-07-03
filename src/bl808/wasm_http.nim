@@ -11,6 +11,7 @@ import ./wasm_peer_control
 when defined(bl808m0) or defined(bl808d0) or defined(bl808lp):
   import ./os_storage
   import ./wasm_sd_store
+  import ./kernel/alloc
 
 type
   WasmHttpMethod* = enum
@@ -38,7 +39,13 @@ const
   NetStatusPath = "/wasm/net/status"
   MaxInvokeArgs = 8
   WasmHttpSdScratchSize {.intdefine.} = 4096
-  WasmHttpPeerTimeoutPolls {.intdefine.} = 200_000'u32
+  # HTTP-path peer queries must be CHEAP: a live peer answers a status/list
+  # request within a few hundred mailbox polls; a dead or held-in-reset core
+  # (D0 is held during all-core HTTP serving) never answers at all. The old
+  # 200k-poll timeout blocked the serving loop for seconds per absent core,
+  # during which RX pbufs/TCP segments accumulated on the heap until it
+  # exhausted (death under /wasm/tasks/all load).
+  WasmHttpPeerTimeoutPolls {.intdefine.} = 2_000'u32
 
 type
   WasmHttpCoreStatusProvider* = proc(): string {.nimcall.}
@@ -424,6 +431,10 @@ when not (defined(bl808d0) or defined(bl808lp)):
     var appended = 0
     let r = dispatchPeerRequest(core, wasmPeerListTasks,
                                 timeoutPolls = WasmHttpPeerTimeoutPolls)
+    if r.timedOut or r.badCore:
+      # Core absent (timed out / held in reset): do NOT fall through to the
+      # per-task status probes below — that multiplied one timeout into nine.
+      return
     if not r.timedOut and not r.badCore and r.controlStatus == wasmControlOk:
       let count = min(r.taskCount.int, WasmPeerControlMaxTaskRecords)
       for i in 0 ..< count:
@@ -690,6 +701,28 @@ proc systemResponse(): WasmHttpResponse =
     body.add(",\"writeOps\":")
     body.appendU32(storage.health.writeOps)
     body.add("}}")
+  when defined(bl808m0) or defined(bl808d0) or defined(bl808lp):
+    # Surface the kernel heap stats (tlsf-backed) so memory pressure is visible
+    # over /wasm/system. Per-core pager/swap stats arrive with the M3 cross-core
+    # transport; for now the HTTP manager reports its local heap.
+    let heap = heapStats()
+    body.add(",\"heap\":{\"usedBytes\":")
+    body.appendU32(heap.usedBytes.uint32)
+    body.add(",\"totalBytes\":")
+    body.appendU32(heap.totalBytes.uint32)
+    body.add(",\"freeBytes\":")
+    body.appendU32(heap.freeBytes.uint32)
+    body.add(",\"highWaterBytes\":")
+    body.appendU32(heap.highWaterBytes.uint32)
+    body.add(",\"minFreeBytes\":")
+    body.appendU32(heap.minFreeBytes.uint32)
+    body.add(",\"largestFreeBytes\":")
+    body.appendU32(heap.largestFreeBytes.uint32)
+    body.add(",\"allocCount\":")
+    body.appendU32(heap.allocCount.uint32)
+    body.add(",\"freeCount\":")
+    body.appendU32(heap.freeCount.uint32)
+    body.add("}")
   body.add(",\"defaultLimits\":")
   body.appendLimitsJson(limits)
   body.add(",\"routes\":[")

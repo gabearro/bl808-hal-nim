@@ -2157,6 +2157,34 @@ macro cps*(prc: untyped): untyped =
         result.inline = contractFailReturn(envId)
         result.callback = contractFailInCallback(envId)
 
+  proc substCapture(n, oldAf, newAf, oldEnv, newEnv: NimNode): NimNode =
+    ## Rewrite references to the step-local await future (oldAf) and env ref
+    ## (oldEnv) to the callback factory's PARAMETER symbols, so the escaping
+    ## await-callback closure captures the params (independent, incref'd
+    ## lifetime) instead of aliasing the step frame under --mm:arc. Without this
+    ## the closure aliases `af`/`env` locals whose frame unwinds at `return env`
+    ## before the (stored) callback runs -> the freed-then-reused block is read
+    ## through the dangling ref -> nimIncRef fault on a garbage ref (TLSF-clean).
+    ## Matches ident by name and genSym by identity (covers both the linear
+    ## `ident"awaitFut"` and the branch-path genSym `af`). Skips the name-position
+    ## child of dot / colon / named-arg nodes so a field named `env`/`awaitFut`
+    ## is never clobbered.
+    if n == oldAf: return newAf
+    if n == oldEnv: return newEnv
+    case n.kind
+    of nnkDotExpr:
+      result = n.copyNimNode()
+      result.add substCapture(n[0], oldAf, newAf, oldEnv, newEnv)  # object
+      result.add n[1].copyNimTree()                                # field name
+    of nnkExprColonExpr, nnkExprEqExpr:
+      result = n.copyNimNode()
+      result.add n[0].copyNimTree()                                # field/arg name
+      result.add substCapture(n[1], oldAf, newAf, oldEnv, newEnv)  # value
+    else:
+      result = n.copyNimNode()
+      for child in n:
+        result.add substCapture(child, oldAf, newAf, oldEnv, newEnv)
+
   proc genSimpleAwaitDispatch(envId, af: NimNode,
                               awaitTarget: string,
                               inlineAfterRead: NimNode,
@@ -2183,16 +2211,28 @@ macro cps*(prc: untyped): untyped =
         `envId`.`tf` = `readSym`(`af`)
     callbackElse.add callbackAfterRead
 
+    # Build the escaping-callback body against the ORIGINAL af/envId, then
+    # rebind every af/envId reference to the factory params so the closure owns
+    # independent-lifetime copies (breaks the --mm:arc step-frame aliasing UAF).
+    let cbBody = quote do:
+      if `hasErrorSym`(`af`):
+        `failSym`(`envId`.fut, `getErrorSym`(`af`))
+      else:
+        `callbackElse`
+    let afP = genSym(nskParam, "afP")
+    let envP = genSym(nskParam, "envP")
+    let mkCb = genSym(nskProc, "mkCb")
+    let cbBodyP = substCapture(cbBody, af, afP, envId, envP)
+
     quote do:
       if `af`.finished:
         `inlineBody`
       else:
-        `addCallbackSym`(`af`, proc() =
-          if `hasErrorSym`(`af`):
-            `failSym`(`envId`.fut, `getErrorSym`(`af`))
-          else:
-            `callbackElse`
-        )
+        proc `mkCb`(`afP`: typeof(`af`), `envP`: typeof(`envId`)):
+            proc() {.closure.} =
+          result = proc() =
+            `cbBodyP`
+        `addCallbackSym`(`af`, `mkCb`(`af`, `envId`))
         `envId`.fn = nil
         `envId`.state = csSuspended
         return `envId`
@@ -2232,16 +2272,30 @@ macro cps*(prc: untyped): untyped =
         `envId`.`tf` = `readSym`(`af`)
     callbackElse.add callbackAfterRead
 
+    # Route the escaping callback (incl. the try/except reraise tree, which
+    # `rewrite` emits as `env.<field>`) through the factory param boundary so it
+    # captures params, not the step-frame af/env. substCapture rewrites the whole
+    # callbackTry subtree's env/af references too (dot-aware: object rebinds,
+    # field name kept).
+    let cbBody = quote do:
+      if `hasErrorSym`(`af`):
+        `callbackTry`
+      else:
+        `callbackElse`
+    let afP = genSym(nskParam, "afP")
+    let envP = genSym(nskParam, "envP")
+    let mkCb = genSym(nskProc, "mkCb")
+    let cbBodyP = substCapture(cbBody, af, afP, envId, envP)
+
     quote do:
       if `af`.finished:
         `inlineBody`
       else:
-        `addCallbackSym`(`af`, proc() =
-          if `hasErrorSym`(`af`):
-            `callbackTry`
-          else:
-            `callbackElse`
-        )
+        proc `mkCb`(`afP`: typeof(`af`), `envP`: typeof(`envId`)):
+            proc() {.closure.} =
+          result = proc() =
+            `cbBodyP`
+        `addCallbackSym`(`af`, `mkCb`(`af`, `envId`))
         `envId`.fn = nil
         `envId`.state = csSuspended
         return `envId`

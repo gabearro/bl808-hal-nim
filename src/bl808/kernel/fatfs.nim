@@ -198,6 +198,48 @@ proc f_size_helper(fp: ptr Fil): uint64 {.importc: "f_size", header: "ff.h".}
 proc size*(f: var Fil): uint64 =
   f_size_helper(addr f)
 
+{.emit: """
+#include "ff.h"
+
+static LBA_t bl808_fatfs_file_sector(FIL *fp, FSIZE_t ofs) {
+  FATFS *fs;
+  DWORD clst;
+  DWORD sector_in_cluster;
+
+  if (fp == 0) return 0;
+  if (f_lseek(fp, ofs) != FR_OK) return 0;
+  if (fp->obj.sclust < 2) return 0;
+  fs = fp->obj.fs;
+  if (fs == 0 || fs->csize == 0) return 0;
+  clst = fp->clust;
+  if (clst < 2) clst = fp->obj.sclust;
+  sector_in_cluster = (DWORD)((ofs / 512) & (fs->csize - 1));
+  return fs->database + (LBA_t)fs->csize * (clst - 2) + sector_in_cluster;
+}
+
+static LBA_t bl808_fatfs_current_file_sector(FIL *fp) {
+  if (fp == 0) return 0;
+  return fp->sect;
+}
+""".}
+
+proc f_physical_sector_helper(fp: ptr Fil, offset: uint64): uint32
+  {.importc: "bl808_fatfs_file_sector", header: "ff.h".}
+
+proc f_current_physical_sector_helper(fp: ptr Fil): uint32
+  {.importc: "bl808_fatfs_current_file_sector", header: "ff.h".}
+
+proc physicalSector*(f: var Fil, offset: uint64 = 0): uint32 =
+  ## Return the physical 512-byte sector backing an open file offset.
+  ##
+  ## This is intended for hardware validation of direct block-device paths. It
+  ## only works with this build's fixed 512-byte FatFs sector configuration.
+  f_physical_sector_helper(addr f, offset)
+
+proc currentPhysicalSector*(f: var Fil): uint32 =
+  ## Return the physical sector currently cached in the FatFs file object.
+  f_current_physical_sector_helper(addr f)
+
 proc remove*(fs: var SdFs, path: string): FResult =
   f_unlink(path.cstring)
 

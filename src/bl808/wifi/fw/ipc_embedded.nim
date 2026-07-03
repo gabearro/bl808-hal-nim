@@ -311,7 +311,7 @@ proc ipc_emb_msg_evt*() {.exportc, cdecl.} =
     # Blob: `lw a5, 184(s6); addi a0, a0, 12; jalr a5` with a0 = paramLen.
     let allocFn = cast[proc(sz: uint32): pointer {.cdecl.}](
       blOpsFunc(184))
-    let hdrRaw = allocFn(msgParamLen + KeMsgHdrSize.uint32)
+    let hdrRaw = allocFn(msgParamLen + KeMsgHdrSize.uint32 + KeMsgTailSlack)
     if hdrRaw == nil:
       assert_err("ipc_emb.c", "ipc_emb.c", 0x1E3)
     let hdr = cast[ptr KeMsgHdr](hdrRaw)

@@ -155,6 +155,10 @@ type
     resp48bit  = 2  # R1, R3, R6, R7
     resp48busy = 3  # R1b
 
+var
+  sdhLastCommandIntStatus*: uint32 = 0
+  sdhLastCommandPresentState*: uint32 = 0
+
 # =============================================================================
 # SDH initialization
 # =============================================================================
@@ -274,6 +278,8 @@ proc sdhSendCommand*(cmdIndex: uint32, argument: uint32,
   countdown = timeout
   while countdown > 0:
     let sts = regRead(SdhIntStatus)
+    sdhLastCommandIntStatus = sts
+    sdhLastCommandPresentState = regRead(SdhPresentState)
     if dataPresent and (transferMode and (1'u16 shl TmDmaEn)) == 0:
       if (transferMode and (1'u16 shl TmDataDir)) != 0:
         if (sts and (1'u32 shl IntBufReadRdy)) != 0:
@@ -286,7 +292,8 @@ proc sdhSendCommand*(cmdIndex: uint32, argument: uint32,
     if (sts and (1'u32 shl IntErrInt)) != 0:
       regWrite(SdhIntStatus, 0xFFFF_0000'u32)
       return sdhCmdError
-    if (sts and (1'u32 shl IntCmdComplete)) != 0:
+    if (sts and (1'u32 shl IntCmdComplete)) != 0 and
+        (not dataPresent or (transferMode and (1'u16 shl TmDmaEn)) != 0):
       regWrite(SdhIntStatus, 1'u32 shl IntCmdComplete)
       return sdhOk
     countdown.dec

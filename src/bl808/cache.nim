@@ -45,9 +45,11 @@ proc l1cInvalidateAll*(): bool =
   ## not memory-mapped registers. See core.nim dcacheInvalidateAll().
   when defined(bl808m0) or defined(bl808d0):
     # A public whole-cache call can be reached with live call frames on the
-    # cached stack. Clean first so invalidation does not discard return state.
-    dcacheFlushAll()
-    dcacheInvalidateAll()
+    # cached stack and dirty heap lines. dcache.ciall cleans+invalidates
+    # atomically per line, so nothing dirty is ever discarded (a separate
+    # flush-then-invalidate pair leaves a window where new dirty lines are
+    # created and then destroyed).
+    dcacheCleanInvalidateAll()
     icacheInvalidateAll()
   true
 

@@ -507,6 +507,22 @@ type
     opThrow = 0x08       # throw tagIdx
     opThrowRef = 0x0A    # throw_ref
 
+  ## Canonical trap reason packed into ``IntWasmTask.trapCode`` and
+  ## ``WasmOsTrapRecord`` so crash reports are actionable. Lives at the
+  ## cps/wasm layer so both the interpreter and the OS surface share it.
+  WasmTrapReason* = enum
+    wtUnknown
+    wtUnreachable
+    wtOobMem
+    wtDivZero
+    wtStackUnderflow
+    wtCallDepth
+    wtQuota
+    wtWatchdog
+    wtHostTimeout
+    wtImport
+    wtHostCapDenied
+
   # Memory argument for load/store instructions
   MemArg* = object
     align*: uint32

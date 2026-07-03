@@ -345,6 +345,13 @@ proc writeWasmProgramSlot*(index: uint32, wasm: openArray[byte],
                            flags = 0'u32): WasmProgramError =
   ## Erase a physical flash slot and write one program image. The header is
   ## programmed last so an interrupted upload is not visible as a valid slot.
+  ##
+  ## `wasm` may be XIP-flash-resident (e.g. a const module baked into the image).
+  ## flashWrite/flashRawMatches toggle XIP and invalidate the cache, so reading
+  ## an XIP-resident operand across those ops returns wrong bytes for some flash
+  ## addresses (address-sensitive verify failures). To be safe regardless of
+  ## where `wasm` lives, stage every payload page through a RAM scratch buffer;
+  ## the flash functions then only ever see a RAM operand.
   let slot = wasmProgramSlot(index)
   if not slot.valid:
     return wasmProgramBadSlot
@@ -360,8 +367,26 @@ proc writeWasmProgramSlot*(index: uint32, wasm: openArray[byte],
   if result != wasmProgramOk:
     return
 
-  if flashWrite(slot.flashOffset + WasmProgramHeaderLen, wasm) != flashOk:
-    return wasmProgramFlashError
+  # Stage every payload page through a small RAM buffer. `flashWrite`/
+  # `flashRawMatches` toggle XIP and invalidate the cache; a page is snapshotted
+  # to RAM here (with XIP live and the controller idle between ops) and only the
+  # RAM copy is handed to flash, so an XIP-resident `wasm` operand is never read
+  # across a flash op. Page-at-a-time keeps this bounded for large uploads too.
+  var page {.noinit.}: array[FlashPageSize.int, byte]
+  var offset = 0
+  var crc = wasmPayloadCrc32Init()
+  while offset < wasm.len:
+    let n = min(FlashPageSize.int, wasm.len - offset)
+    for i in 0 ..< n:
+      page[i] = wasm[offset + i]
+    crc = wasmPayloadCrc32Update(crc, page.toOpenArray(0, n - 1))
+    if flashWrite(slot.flashOffset + WasmProgramHeaderLen + offset.uint32,
+                  page.toOpenArray(0, n - 1)) != flashOk:
+      return wasmProgramFlashError
+    if not flashRawMatches(slot.flashOffset + WasmProgramHeaderLen + offset.uint32,
+                           page.toOpenArray(0, n - 1)):
+      return wasmProgramVerifyFailed
+    offset += n
 
   var headerBytes: array[WasmProgramHeaderLen.int, byte]
   result = writeWasmProgramHeader(
@@ -370,7 +395,7 @@ proc writeWasmProgramSlot*(index: uint32, wasm: openArray[byte],
     wasm.len.uint32,
     generation,
     flags,
-    checksum = wasmPayloadCrc32(wasm),
+    checksum = wasmPayloadCrc32Finish(crc),
   )
   if result != wasmProgramOk:
     return
@@ -378,8 +403,6 @@ proc writeWasmProgramSlot*(index: uint32, wasm: openArray[byte],
     return wasmProgramFlashError
 
   syncWasmProgramXip()
-  if not flashRawMatches(slot.flashOffset + WasmProgramHeaderLen, wasm):
-    return wasmProgramVerifyFailed
   let header = readWasmProgramHeader(cast[ptr UncheckedArray[byte]](addr headerBytes[0]))
   if not flashMatchesHeader(slot, header):
     return wasmProgramVerifyFailed

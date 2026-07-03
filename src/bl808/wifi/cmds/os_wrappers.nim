@@ -31,7 +31,7 @@ proc osEventWait(event: pointer; bits: uint32): uint32 {.inline.} =
   if eventGroupWait == nil:
     0'u32
   else:
-    eventGroupWait(event, bits, 1, 0, 0xffff_ffff'u32)
+    eventGroupWait(event, bits, 1, 0, WifiCmdWaitTicks)
 
 proc osFree(p: pointer) {.inline.} =
   let freeFn = cast[FreeProc](opPtr(OpFreeOff))

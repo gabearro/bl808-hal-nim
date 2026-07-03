@@ -414,6 +414,24 @@ proc chainMiddleware*(middlewares: seq[EmbeddedMiddleware], finalHandler: HttpHa
     current = wrap(middlewares[i], current)
   current
 
+proc makeRouteFinalHandler(handler: EmbeddedRouteHandler,
+                           pathParams, queryParams: Table[string, string]): HttpHandler =
+  ## Build the per-route final handler so it captures ITS OWN parameter tables,
+  ## not dispatch()'s loop-local `var pathParams`/`qp`.
+  ##
+  ## dispatch() declares `pathParams`/`qp` inside the `for route` loop. Capturing
+  ## a loop-local directly in a `{.closure.}` under --mm:arc aliases the closure
+  ## environment slot with the loop-body variable slot, giving TWO owners of one
+  ## Table[string,string] backing seq. One owner frees it (loop iteration / return
+  ## teardown) while the other survives; the stale =destroy then walks reused heap
+  ## — a use-after-free read that faults in the Table destructor with a garbage
+  ## string pointer (JTAG: mepc = embedded_router Table =destroy, tval = small
+  ## ASCII bytes), while TLSF metadata stays intact (no free() reached, no canary
+  ## crossed). Passing the tables through a proc parameter boundary breaks the
+  ## alias: the returned closure owns copies with independent lifetimes.
+  result = proc(r: HttpRequest): HttpResponseBuilder {.closure.} =
+    handler(r, pathParams, queryParams)
+
 proc defaultErrorResponse(err: ref CatchableError): HttpResponseBuilder =
   if err of RequestExtractionError:
     let rex = cast[ref RequestExtractionError](err)
@@ -470,9 +488,9 @@ proc dispatch*(router: EmbeddedRouter, request: HttpRequest): HttpResponseBuilde
       if methodMatches(route.meth, req.meth):
         let matchedRoute = route
         let qp = parseQueryString(req.path)
-        let finalHandler: HttpHandler =
-          proc(r: HttpRequest): HttpResponseBuilder {.closure.} =
-            matchedRoute.handler(r, pathParams, qp)
+        # By-value hand-off to the factory: the closure captures its own copies,
+        # never dispatch()'s loop-local pathParams/qp (see makeRouteFinalHandler).
+        let finalHandler = makeRouteFinalHandler(matchedRoute.handler, pathParams, qp)
         let allMw = router.beforeMiddlewares & router.globalMiddlewares &
           matchedRoute.middlewares & router.afterMiddlewares
         let chained = chainMiddleware(allMw, finalHandler)
