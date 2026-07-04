@@ -345,6 +345,10 @@ template keEnvEventField(): ptr uint32 =
 template keEnvPsFlags(): ptr KeEnvPsFlagsView =
   cast[ptr KeEnvPsFlagsView](addr ke_env[28])
 
+proc ke_evt_field_get*(): uint32 {.exportc: "nimfw_ke_evt_field_get", cdecl.} =
+  ## Live ke-event field snapshot for the host diag (TX-dead wedge forensics).
+  keEvtField
+
 proc ke_evt_set*(evtBit: uint32) {.exportc, cdecl.} =
   ## Set event bit(s) in the kernel event field (interrupt-safe).
   let savedIrqState = irqSave()

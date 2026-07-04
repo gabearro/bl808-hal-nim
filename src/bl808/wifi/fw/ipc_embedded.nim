@@ -144,11 +144,13 @@ proc ipc_emb_tx_flow_off*(ac: uint8) {.exportc, cdecl.} =
   ##   *(u32*)(0x24800000+0x110) = 0x1F00   ; IPC_EMB_UNMASK_CLR = TX mask
   ##   tail-call ke_evt_clear(0x3E00)       ; flow-off event
   ## Prior Nim bug: called ke_evt_set (would fire the event continuously).
+  inc nimFwDbgIpcTxFlowOff
   regWrite(IPC_EMB_UNMASK_CLR, IPC_IRQ_TX_MASK)
   ke_evt_clear(0x3E00'u32)
 
 proc ipc_emb_tx_flow_on*(ac: uint8) {.exportc, cdecl.} =
   ## Resume TX flow for an AC.
+  inc nimFwDbgIpcTxFlowOn
   regWrite(IPC_EMB_UNMASK_SET, IPC_IRQ_TX_MASK)
 
 proc ipc_emb_tx_irq*() {.exportc, cdecl.} =
@@ -183,6 +185,7 @@ proc ipc_emb_tx_evt*(ac: uint32) {.exportc, cdecl.} =
         2, 0, nil, 290, nil, ac)
   # Event bits for host TX AC0..AC4 are 0x200..0x2000. The handler table passes
   # the AC number; blob expands it to the event mask before clearing/re-arming.
+  inc nimFwDbgIpcTxEvtEnter
   let eventMask = 0x200'u32 shl ac
   ke_evt_clear(eventMask)
   # Load descriptor list and BCN flag
@@ -212,7 +215,12 @@ proc ipc_emb_tx_evt*(ac: uint32) {.exportc, cdecl.} =
     if not isBcn:
       let keEvtFld = cast[ptr uint32](cast[uint](addr keEvtField))[]
       if (keEvtFld and 0x02102000'u32) != 0:
-        # Flow control active: re-arm event and return (blob: tail-call ke_evt_set)
+        # Flow control active: re-arm event and return (blob: tail-call ke_evt_set).
+        # If this gate parks persistently (park ~ enter rate, park_field showing
+        # which of bits 13/20/25 is stuck), THIS is the TX-dead wedge: nothing
+        # is ever consumed from the host TX ring -> MACHW never programmed.
+        inc nimFwDbgIpcTxEvtPark
+        nimFwDbgIpcTxParkField = keEvtFld
         ke_evt_set(eventMask)
         return
     # Write IPC TX status acknowledgement (blob: sw s7,264(s6) at 0xd0)

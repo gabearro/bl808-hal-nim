@@ -62,6 +62,10 @@ const
   # No 802.11 RX frame (not even a beacon) for this long => the RF link is dead,
   # even if the supplicant/backend still claim "connected" (silent deauth).
   WifiRxStallMs {.intdefine.} = 8_000'u32
+  # TX-completion liveness: host TX demand advancing while host TX completions
+  # (cfm_push) are frozen for this long => TX-dead wedge; drive the reconnect.
+  WifiTxDeadConfirmMs {.intdefine.} = 6_000'u32
+  WifiTxDeadDemandRecentMs {.intdefine.} = 2_000'u32
   # Hardware watchdog timeout (ms). A genuine wedge holds the scheduler for
   # longer than this and forces a clean reboot; normal serving + async
   # reconnects keep the scheduler looping well under it.
@@ -249,6 +253,24 @@ static unsigned long __psram_bss_end_addr(void){return (unsigned long)__psram_bs
     nimfw_dbg_txtrig_status {.importc.}: uint32
     nimfw_dbg_txtrig_notready {.importc.}: uint32
     nimfw_dbg_txtrig_nodesc {.importc.}: uint32
+    nimfw_dbg_txtrig_sec_notready {.importc.}: uint32
+    nimfw_dbg_txtrig_sec_ctrl {.importc.}: uint32
+    nimfw_dbg_txtrig_sec_cfm {.importc.}: uint32
+    nimfw_dbg_tx_flush_enter {.importc.}: uint32
+    nimfw_dbg_tx_push_calls {.importc.}: uint32
+    nimfw_dbg_tx_nodesc {.importc.}: uint32
+    nimfw_dbg_tx_nobuf {.importc.}: uint32
+    nimfw_dbg_ipc_host_txdesc_push {.importc.}: uint32
+    nimfw_dbg_ipc_tx_evt_enter {.importc.}: uint32
+    nimfw_dbg_ipc_tx_evt_park {.importc.}: uint32
+    nimfw_dbg_ipc_tx_park_field {.importc.}: uint32
+    nimfw_dbg_ipc_tx_flow_off {.importc.}: uint32
+    nimfw_dbg_ipc_tx_flow_on {.importc.}: uint32
+    nimfw_dbg_ipc_txpush_enter {.importc.}: uint32
+    nimfw_dbg_ipc_txpush_env_nil {.importc.}: uint32
+    nimfw_dbg_ipc_txpush_pop_nil {.importc.}: uint32
+    nimfw_dbg_ipc_free_head {.importc.}: uint32
+    nimfw_dbg_tx_flush_push {.importc.}: uint32
     nimfw_dbg_txint_enter {.importc.}: uint32
     nimfw_dbg_txint_last_cb {.importc.}: uint32
     nimfw_dbg_txint_last_fc {.importc.}: uint32
@@ -349,6 +371,13 @@ static unsigned long __psram_bss_end_addr(void){return (unsigned long)__psram_bs
     nimfw_dbg_active_cfm_last_state {.importc.}: uint32
     nimfw_dbg_sm_orphan_drained {.importc.}: uint32
     nimfw_dbg_cmd_mgr_recovered {.importc.}: uint32
+    nimfw_dbg_tx_arp {.importc.}: uint32
+    nimfw_dbg_tx_tcp80 {.importc.}: uint32
+    nimfw_dbg_bl_output_drop {.importc.}: uint32
+    nimfw_dbg_tx_thd_nobuf {.importc.}: uint32
+    nimfw_dbg_cfm_push {.importc.}: uint32
+    nimfw_dbg_frame_cfm {.importc.}: uint32
+    nimfw_dbg_tx_fc_state {.importc.}: uint32
     nimfw_dbg_rxl_last_hwflags {.importc.}: uint32
     nimfw_dbg_rxl_last_fc {.importc.}: uint32
     nimfw_dbg_rxl_mgmt_seen {.importc.}: uint32
@@ -574,6 +603,7 @@ static unsigned long __psram_bss_end_addr(void){return (unsigned long)__psram_bs
     nimfw_dbg_crypto_captured {.importc.}: uint32
     nimfw_dbg_crypto_bssid {.importc.}: array[6, uint8]
   proc bl808WpaCurrentState(): uint32 {.importc: "bl808_wpa_current_state", cdecl.}
+  proc nimfw_ke_evt_field_get(): uint32 {.importc, cdecl.}
   when defined(bl808AllcoreWasmHttpJtagGate):
     var allcoreHttpWifiJtagGate* {.exportc: "allcore_http_wifi_jtag_gate".}: uint32
 
@@ -1207,6 +1237,39 @@ when defined(bl808AllcoreWasmHttp):
     printHex("[M0] allcore_http_runtime_rxu_sw_ccmp_ok=", nimfw_dbg_rxu_sw_ccmp_ok)
     printHex("[M0] allcore_http_runtime_rxu_sw_ccmp_fail=", nimfw_dbg_rxu_sw_ccmp_fail)
     printHex("[M0] allcore_http_runtime_rxu_sw_ccmp_len=", nimfw_dbg_rxu_sw_ccmp_len)
+    # TX-side discriminator: lwIP output (tx_arp/tcp80) vs enqueue drops vs
+    # descriptor exhaustion (nodesc/nobuf) vs MAC confirm flow (cfm) vs the
+    # flow-control gate (fc_state nonzero low bytes = TX paused => the freeze).
+    printHex("[M0] allcore_http_runtime_tx_arp=", nimfw_dbg_tx_arp)
+    printHex("[M0] allcore_http_runtime_tx_tcp80=", nimfw_dbg_tx_tcp80)
+    printHex("[M0] allcore_http_runtime_tx_drop=", nimfw_dbg_bl_output_drop)
+    printHex("[M0] allcore_http_runtime_txtrig_entry=", nimfw_dbg_txtrig_entry)
+    printHex("[M0] allcore_http_runtime_txtrig_notready=", nimfw_dbg_txtrig_notready)
+    printHex("[M0] allcore_http_runtime_txtrig_nodesc=", nimfw_dbg_txtrig_nodesc)
+    printHex("[M0] allcore_http_runtime_tx_nobuf=", nimfw_dbg_tx_thd_nobuf)
+    printHex("[M0] allcore_http_runtime_tx_cfm_push=", nimfw_dbg_cfm_push)
+    printHex("[M0] allcore_http_runtime_tx_frame_cfm=", nimfw_dbg_frame_cfm)
+    printHex("[M0] allcore_http_runtime_tx_fc_state=", nimfw_dbg_tx_fc_state)
+    printHex("[M0] allcore_http_runtime_txtrig_zero=", nimfw_dbg_txtrig_zero)
+    printHex("[M0] allcore_http_runtime_txtrig_sec_notready=", nimfw_dbg_txtrig_sec_notready)
+    printHex("[M0] allcore_http_runtime_txtrig_sec_ctrl=", nimfw_dbg_txtrig_sec_ctrl)
+    printHex("[M0] allcore_http_runtime_txtrig_sec_cfm=", nimfw_dbg_txtrig_sec_cfm)
+    printHex("[M0] allcore_http_runtime_tx_flush_enter=", nimfw_dbg_tx_flush_enter)
+    printHex("[M0] allcore_http_runtime_tx_push_calls=", nimfw_dbg_tx_push_calls)
+    printHex("[M0] allcore_http_runtime_tx_flush_nodesc=", nimfw_dbg_tx_nodesc)
+    printHex("[M0] allcore_http_runtime_tx_flush_nobuf=", nimfw_dbg_tx_nobuf)
+    printHex("[M0] allcore_http_runtime_ipc_txdesc_push=", nimfw_dbg_ipc_host_txdesc_push)
+    printHex("[M0] allcore_http_runtime_ipc_tx_evt_enter=", nimfw_dbg_ipc_tx_evt_enter)
+    printHex("[M0] allcore_http_runtime_ipc_tx_evt_park=", nimfw_dbg_ipc_tx_evt_park)
+    printHex("[M0] allcore_http_runtime_ipc_tx_park_field=", nimfw_dbg_ipc_tx_park_field)
+    printHex("[M0] allcore_http_runtime_ipc_tx_flow_off=", nimfw_dbg_ipc_tx_flow_off)
+    printHex("[M0] allcore_http_runtime_ipc_tx_flow_on=", nimfw_dbg_ipc_tx_flow_on)
+    printHex("[M0] allcore_http_runtime_ke_evt_field=", nimfw_ke_evt_field_get())
+    printHex("[M0] allcore_http_runtime_txpush_enter=", nimfw_dbg_ipc_txpush_enter)
+    printHex("[M0] allcore_http_runtime_txpush_env_nil=", nimfw_dbg_ipc_txpush_env_nil)
+    printHex("[M0] allcore_http_runtime_txpush_pop_nil=", nimfw_dbg_ipc_txpush_pop_nil)
+    printHex("[M0] allcore_http_runtime_ipc_free_head=", nimfw_dbg_ipc_free_head)
+    printHex("[M0] allcore_http_runtime_tx_flush_push=", nimfw_dbg_tx_flush_push)
     printHex("[M0] allcore_http_runtime_rxu_prot_pn_lo=", nimfw_dbg_rxu_prot_pn_lo)
     printHex("[M0] allcore_http_runtime_rxu_prot_pn_hi=", nimfw_dbg_rxu_prot_pn_hi)
     printHex("[M0] allcore_http_runtime_rxu_pn_meta=", nimfw_dbg_rxu_pn_meta)
@@ -1358,6 +1421,17 @@ when defined(bl808AllcoreWasmHttp):
     printHex("[M0] allcore_http_txtrig_desc=", nimfw_dbg_txtrig_desc)
     printHex("[M0] allcore_http_txtrig_status=", nimfw_dbg_txtrig_status)
     printHex("[M0] allcore_http_txtrig_notready=", nimfw_dbg_txtrig_notready)
+    printHex("[M0] allcore_http_connect_tx_arp=", nimfw_dbg_tx_arp)
+    printHex("[M0] allcore_http_connect_tx_drop=", nimfw_dbg_bl_output_drop)
+    printHex("[M0] allcore_http_connect_tx_fc_state=", nimfw_dbg_tx_fc_state)
+    printHex("[M0] allcore_http_connect_tx_frame_cfm=", nimfw_dbg_frame_cfm)
+    printHex("[M0] allcore_http_connect_txpush_enter=", nimfw_dbg_ipc_txpush_enter)
+    printHex("[M0] allcore_http_connect_txpush_env_nil=", nimfw_dbg_ipc_txpush_env_nil)
+    printHex("[M0] allcore_http_connect_txpush_pop_nil=", nimfw_dbg_ipc_txpush_pop_nil)
+    printHex("[M0] allcore_http_connect_ipc_free_head=", nimfw_dbg_ipc_free_head)
+    printHex("[M0] allcore_http_connect_tx_flush_push=", nimfw_dbg_tx_flush_push)
+    printHex("[M0] allcore_http_connect_ipc_txdesc_push=", nimfw_dbg_ipc_host_txdesc_push)
+    printHex("[M0] allcore_http_connect_tx_push_calls=", nimfw_dbg_tx_push_calls)
     printHex("[M0] allcore_http_txtrig_nodesc=", nimfw_dbg_txtrig_nodesc)
     printHex("[M0] allcore_http_txint_enter=", nimfw_dbg_txint_enter)
     printHex("[M0] allcore_http_txint_last_cb=", nimfw_dbg_txint_last_cb)
@@ -2471,6 +2545,14 @@ when defined(bl808AllcoreWasmHttp):
     var reconnects = 0'u32
     var lastRxSeen = nimfw_dbg_rxl_frame_seen  # RX-liveness baseline
     var lastRxAdvanceMs = nowMs()
+    # TX-completion-liveness baselines. Witness = cfm_push ONLY (host-data
+    # completions; frame_cfm creeps from other-AC internal frames and would
+    # false-negative the window). Demand = tx_arp+tx_tcp80 (host frames,
+    # counted in bl_output before enqueue - same population as the witness).
+    var lastTxCfm = nimfw_dbg_cfm_push
+    var lastTxEnq = nimfw_dbg_tx_arp + nimfw_dbg_tx_tcp80
+    var txStuckSinceMs = 0'u32                  # 0 = no open freeze window
+    var lastEnqAdvanceMs = nowMs()
     while true:
       pollNetwork()
       bumpHeartbeat(heartbeat)
@@ -2496,9 +2578,33 @@ when defined(bl808AllcoreWasmHttp):
         lastRxSeen = rxSeen
         lastRxAdvanceMs = currentMs
       let rxStalled = currentMs - lastRxAdvanceMs >= WifiRxStallMs
+      # TX-completion liveness. The RX test above is blind to a TX-only wedge:
+      # beacons keep rxl_frame_seen ticking while the MAC never confirms the
+      # head TX descriptor (HW-correlated: txtrig spinning ~1.1k/s, cfm_push
+      # frozen, device unreachable for 11+ min with RX perfect). Host demand
+      # (tx_arp/tx_tcp80) advancing while host completions (cfm_push) stay
+      # frozen for WifiTxDeadConfirmMs = TX-dead. Demand-gated: an idle link
+      # never opens the window, so no false positives.
+      let txCfm = nimfw_dbg_cfm_push
+      let txEnq = nimfw_dbg_tx_arp + nimfw_dbg_tx_tcp80
+      let enqAdvanced = txEnq != lastTxEnq
+      if txCfm != lastTxCfm:
+        lastTxCfm = txCfm
+        txStuckSinceMs = 0'u32
+      elif enqAdvanced and txStuckSinceMs == 0'u32:
+        txStuckSinceMs = currentMs
+      if enqAdvanced:
+        lastTxEnq = txEnq
+        lastEnqAdvanceMs = currentMs
+      let txDead = txStuckSinceMs != 0'u32 and
+                   currentMs - txStuckSinceMs >= WifiTxDeadConfirmMs and
+                   currentMs - lastEnqAdvanceMs < WifiTxDeadDemandRecentMs
+      if txDead and linkDownSinceMs == 0'u32:
+        printHex("[M0] allcore_http_txdead_detected=", nimfw_dbg_txtrig_entry)
       let linkUp = bl808_wifi_backend_connected() != 0 and
                    bl808WpaCurrentState() == WpaCompletedState and
-                   not rxStalled
+                   not rxStalled and
+                   not txDead
       if linkUp:
         linkDownSinceMs = 0'u32
       else:
@@ -2541,6 +2647,12 @@ when defined(bl808AllcoreWasmHttp):
               # immediately re-flagged as stalled.
               lastRxSeen = nimfw_dbg_rxl_frame_seen
               lastRxAdvanceMs = nowMs()
+              # Reset TX-liveness baselines too, or the stale freeze window
+              # instantly re-flags the fresh association as TX-dead.
+              lastTxCfm = nimfw_dbg_cfm_push
+              lastTxEnq = nimfw_dbg_tx_arp + nimfw_dbg_tx_tcp80
+              txStuckSinceMs = 0'u32
+              lastEnqAdvanceMs = nowMs()
               discard console.sendLine("[M0] allcore_http_reconnect_done")
           if bl808_wifi_backend_connected() == 0 or
               bl808WpaCurrentState() != WpaCompletedState:

@@ -46,5 +46,8 @@ proc bl_tx_try_flush*(param: cint; txFcField: ptr KeTxFc) {.exportc, cdecl.} =
       if txhdr == nil:
         ipc_host_txbuf_free(txbuf)
         break
+      # NOTE nimfw_dbg_tx_push_calls is SHARED with txl_frame_push (mgmt) — use
+      # the dedicated flush counter to observe host-data pushes unambiguously.
       {.emit: "{ extern volatile unsigned int nimfw_dbg_tx_push_calls; nimfw_dbg_tx_push_calls++; }".}
+      {.emit: "{ extern volatile unsigned int nimfw_dbg_tx_flush_push; nimfw_dbg_tx_flush_push++; }".}
       txPush(sta, txdescHost, txbuf, txhdr)
