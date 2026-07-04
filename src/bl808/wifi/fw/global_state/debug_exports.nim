@@ -392,6 +392,15 @@ var nimFwDbgFrameRelease*   {.wifiCtrl, exportc: "nimfw_dbg_frame_release".}: ui
 var nimFwDbgTxTrigAcReady*  {.wifiCtrl, exportc: "nimfw_dbg_txtrig_acready".}: uint32  # last acReady seen
 var nimFwDbgTxTrigZeroExit* {.wifiCtrl, exportc: "nimfw_dbg_txtrig_zero".}: uint32     # entered & acReady==0
 var nimFwDbgTxTrigLoops*    {.wifiCtrl, exportc: "nimfw_dbg_txtrig_loops".}: uint32    # inner loop iters
+# TX head-of-line wedge forensics: the secondary-descriptor readiness gate is
+# the ONLY silent exit past the head gate in txl_transmit_trigger; when it spins
+# (sec_notready ~ entry rate) the head never pops -> no cfm -> TX-dead. The two
+# snapshot words decide the sub-cause: sec_cfm bit31 set while sec_ctrl bit31
+# clear => the gate reads the WRONG done-word (root-fixable); both clear =>
+# MACHW never completed the secondary (detector+reconnect is the fix).
+var nimFwDbgTxTrigSecNotReady* {.wifiCtrl, exportc: "nimfw_dbg_txtrig_sec_notready".}: uint32
+var nimFwDbgTxTrigSecCtrl*     {.wifiCtrl, exportc: "nimfw_dbg_txtrig_sec_ctrl".}: uint32
+var nimFwDbgTxTrigSecCfm*      {.wifiCtrl, exportc: "nimfw_dbg_txtrig_sec_cfm".}: uint32
 var nimFwDbgFrameEvtEnter*  {.wifiCtrl, exportc: "nimfw_dbg_frame_evt_enter".}: uint32
 var nimFwDbgFrameEvtPop*    {.wifiCtrl, exportc: "nimfw_dbg_frame_evt_pop".}: uint32
 var nimFwDbgFrameEvtFreeRet* {.wifiCtrl, exportc: "nimfw_dbg_frame_evt_free".}: uint32
@@ -830,3 +839,14 @@ var nimFwDbgSmOrphanDrained* {.wifiCtrl, exportc: "nimfw_dbg_sm_orphan_drained".
 # Overlap tripwire: a new SCANU req arrived while paramPtr was still live (the
 # UAF the idle guard now prevents). MUST stay 0 in the field.
 var nimFwDbgScanuParamOverwrite* {.wifiCtrl, exportc: "nimfw_dbg_scanu_param_overwrite".}: uint32
+
+# TX pipeline bracket forensics (TX-dead wedge): where do frames stop?
+# host: bl_output(tx_arp) -> bl_tx_try_flush(flush_enter) -> txPush(push_calls)
+#   -> ipc_host_txdesc_push -> [emb] ipc_emb_tx_evt(enter) -> txu_cntrl_push -> MACHW
+# ipc_tx_evt_park counts the flow-control gate exits (keEvtField & 0x02102000
+# nonzero -> re-arm + return WITHOUT consuming); park_field snapshots the field.
+var nimFwDbgIpcTxEvtEnter* {.wifiCtrl, exportc: "nimfw_dbg_ipc_tx_evt_enter".}: uint32
+var nimFwDbgIpcTxEvtPark* {.wifiCtrl, exportc: "nimfw_dbg_ipc_tx_evt_park".}: uint32
+var nimFwDbgIpcTxParkField* {.wifiCtrl, exportc: "nimfw_dbg_ipc_tx_park_field".}: uint32
+var nimFwDbgIpcTxFlowOff* {.wifiCtrl, exportc: "nimfw_dbg_ipc_tx_flow_off".}: uint32
+var nimFwDbgIpcTxFlowOn* {.wifiCtrl, exportc: "nimfw_dbg_ipc_tx_flow_on".}: uint32

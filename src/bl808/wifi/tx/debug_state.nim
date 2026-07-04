@@ -65,3 +65,9 @@ var nimFwDbgTxTcp80ChecksumCalc* {.exportc: "nimfw_dbg_tx_tcp80_csum_calc".}: ui
 var nimFwDbgTxTcp80ChecksumAfter* {.exportc: "nimfw_dbg_tx_tcp80_csum_after".}: uint32
 var nimFwDbgTxTcp80ChecksumVerifyBefore* {.exportc: "nimfw_dbg_tx_tcp80_csum_vbefore".}: uint32
 var nimFwDbgTxTcp80ChecksumVerifyAfter* {.exportc: "nimfw_dbg_tx_tcp80_csum_vafter".}: uint32
+
+# TX flow-control gate state, recorded at every bl_output enqueue:
+# bits [7:0]=sta.fcPs, [15:8]=vif.fcChan, [31:16]=txCntrlStaTrigger low bits.
+# A persistent nonzero fcPs/fcChan while TX output counters advance but nothing
+# goes over the air = the stuck-gate TX freeze (fc-clear event lost).
+var nimFwDbgTxFcState* {.exportc: "nimfw_dbg_tx_fc_state".}: uint32

@@ -2047,9 +2047,19 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
       machwTxAggActiveSet(intcStat and clearMask)
       # Fall through to .L134 path
     else:
-      let secStatus = cast[int32](hostTxHwDescAt(secondaryTxHwDesc).controlFlags)
+      let secView = hostTxHwDescAt(secondaryTxHwDesc)
+      let secStatus = cast[int32](secView.controlFlags)
       if secStatus >= 0:
         # Secondary TX hardware descriptor not ready to pop: vendor rearms the AC timeout only.
+        # This is the ONLY silent exit past the head gate in this loop — the
+        # HW-correlated TX-dead wedge spins here (txtrig_entry ~1.1k/s with zero
+        # cfm while the head THD stays queued). Count it and snapshot BOTH
+        # candidate done-words so the sub-cause is decidable from the diag dump
+        # (sec_cfm bit31 set + sec_ctrl clear => wrong-word read; both clear =>
+        # MACHW never completed the secondary).
+        inc nimFwDbgTxTrigSecNotReady
+        nimFwDbgTxTrigSecCtrl = secView.controlFlags
+        nimFwDbgTxTrigSecCfm = secView.confirmStatus
         let ipcBase = regRead(IPC_SHARED_TX_BASE)
         blmac_abs_timer_set(ac, ipcBase + TX_TIMEOUT_LOCAL[ac])
         return

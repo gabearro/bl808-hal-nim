@@ -39,6 +39,12 @@ proc enqueueTxPacket(isSta: cint; txPbuf: ptr Pbuf; txPbufView: ptr PbufView;
   bl_os_enter_critical()
   listPushBack(cast[pointer](addr staView(sta).waitingList), txhdr)
   txCntrlStaTrigger = txCntrlStaTrigger or bitSta(staId)
+  # Record the flow-control gate state at every enqueue (diag): a persistent
+  # nonzero fcPs/fcChan here while TX output counters advance but nothing goes
+  # over the air = the stuck-gate TX freeze (fc-clear event from the FW lost).
+  nimFwDbgTxFcState = staView(sta).fcPs.uint32 or
+                      (vifView(staVif(sta)).fcChan.uint32 shl 8) or
+                      (txCntrlStaTrigger shl 16)
   if txCntrlCheckFc(sta):
     bl_irq_handler()
   bl_os_exit_critical()

@@ -32,11 +32,15 @@ proc ipc_host_txdesc_left*(env: pointer; queueIdx, userPos: cint): cint {.export
   cint(NxTxDescCnt - (freeIdx - usedIdx))
 
 proc ipc_host_txdesc_push*(env, hostId: pointer) {.exportc, cdecl.} =
+  inc nimFwDbgIpcTxPushEnter
   if env == nil:
+    inc nimFwDbgIpcTxPushEnvNil
     return
   let freeList = loadPtr(env, EnvListFreeOff)
+  nimFwDbgIpcFreeHead = cast[uint32](cast[uint](listPick(freeList)))
   let txdesc = listPopFront(freeList)
   if txdesc == nil:
+    inc nimFwDbgIpcTxPushPopNil
     return
   inc nimFwDbgIpcHostTxDescPush
   storeU32(txdesc, TxdescHostReadyOff, 0xffff_ffff'u32)
