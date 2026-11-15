@@ -121,14 +121,21 @@ def prepare_graph(symbols, r2_functions, r2_graph, usage, disassembly, overrides
                 caller.callees.add(callee.address)
 
     for line in disassembly.splitlines():
-        instruction = re.match(r"^\s*([0-9a-f]+):\s+(\S+)\s*(.*)$", line)
+        instruction = re.match(r"^\s*([0-9a-f]+):\s+(.+)$", line)
         if instruction is None:
             continue
-        address, opcode, operands = int(instruction[1], 16), instruction[2], instruction[3]
+        address = int(instruction[1], 16)
         caller = containing(address)
         if caller is None:
             continue
         caller.instructions.add(address)
+        fields = instruction[2].split()
+        while fields and re.fullmatch(r"(?:[0-9a-fA-F]{2}|[0-9a-fA-F]{4}|[0-9a-fA-F]{8})", fields[0]):
+            fields.pop(0)
+        if not fields:
+            caller.issues.add(f"missing instruction mnemonic at 0x{address:x}")
+            continue
+        opcode, operands = fields[0], " ".join(fields[1:])
         if opcode in ("jalr", "jr"):
             if address in local_bindings:
                 if opcode != "jr" or operands.strip() == "ra":

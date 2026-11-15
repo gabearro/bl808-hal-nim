@@ -20,9 +20,7 @@ proc wifiRfCoreInitMode(xtalfreqHz: uint32, mode: RadioPhyMode) {.noinline.} =
   nimFwConnectTrace2U32(
     "[WIFI-CT] bl808_rf_modem ", xtalfreqHz, restoreExistingCalibration)
   nimFwDbgRfPhase = 4
-  nim_wifi_rf_latch_service_enable(1'u32)
   discard wl_init()
-  nim_wifi_rf_latch_service_enable(0'u32)
   snapshotWifiRfCalibData()
   nimFwDbgRfPhase = 5
   wifiBl808RfInited = 1'u32

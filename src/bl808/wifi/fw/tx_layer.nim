@@ -1866,13 +1866,6 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
                 forceRate.retryTxPowerControl2 = NimFwForcedMgmtTxPower
           if hasPayload != nil:
             inc nimFwDbgPayHasPayload
-            when declared(rfPriApplyWb03AuthTxLatches):
-              let fcForRfLatch = cast[ptr uint16](addr backupDesc.macHeader[0])[]
-              let typeForRfLatch = (fcForRfLatch.uint32 shr 2) and 3'u32
-              if ac < 4'u32 and typeForRfLatch == 2'u32:
-                inc nimFwDbgStaTxRfLatch
-                rfPriApplyWb03AuthTxLatches()
-                checkDmaOwner()
             # For AC==4 (BCN), special beacon handling
             if ac == 4:
               let vif = vifChannelForIdx(actual.vifIdx)  # blob: lbu a3,47(s0)

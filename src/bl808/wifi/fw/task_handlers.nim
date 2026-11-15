@@ -1032,7 +1032,6 @@ proc applyScanChannelRxFilter*(passiveFlag: uint8) {.inline.} =
   let rxFlags = mm.rxFilterExtra or scanChannelRxFilterBits(passiveFlag)
   mm.rxFilterExtra = rxFlags
   regWrite(MACHW_RX_CNTRL_REG, rxFlags or mm.rxFilterBase)
-  rfPriApplyWb03ScanRxLatches()
   rfPhyTraceCheckpoint(0x4F'u32)
   nimFwScanRxFilterProbe()
 

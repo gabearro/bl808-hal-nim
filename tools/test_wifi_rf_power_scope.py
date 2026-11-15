@@ -17,22 +17,6 @@ proc seedHardware() =
 proc fillCalibration() =
   for word in calibration.mitems: word = randomWord() or 0x01010101
   rfCalibDataGlobal = addr calibration[0]
-proc expectedFallback(initial: array[43, uint32]; wlan: bool;
-    includeCalibration: bool): array[43, uint32] =
-  result = initial
-  let baseline = RfPriWb03TxPowerRegisterBaseline
-  if wlan:
-    for i in 0 ..< 3:
-      field(result[i], 0, if i == 2: 30 else: 24, cast[int32](baseline[i]))
-  else:
-    field(result[34], 0, 24, cast[int32](baseline[34]))
-  for slot in 0 ..< (if wlan: 13 else: 4):
-    let a = (if wlan: 3 else: 35) + slot * 2
-    field(result[a], 11, if wlan: 21 else: 19, cast[int32](baseline[a] shr 11))
-    field(result[a + 1], 24, 4, cast[int32](baseline[a + 1] shr 24))
-    if includeCalibration:
-      field(result[a], 0, 11, cast[int32](baseline[a]))
-      field(result[a + 1], 2, 22, cast[int32](baseline[a + 1] shr 2))
 proc checkTrace(power, final: array[43, uint32]; wlan, cal: bool) =
   var expected: seq[tuple[index: int, value: uint32]]
   if wlan:
@@ -108,7 +92,7 @@ for vector in 0 ..< 300:
 
 
 @pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
-def test_scoped_wb03_gate_and_fallback(tmp_path: Path, mode: str) -> None:
+def test_scoped_wb03_replays_records_without_fixed_fallback(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, source(real_io=True) + CHECKS + r'''
 for wlan in [true, false]:
   for variant in 0 ..< 5:
@@ -117,8 +101,7 @@ for wlan in [true, false]:
     wb03 = true
     bl808WifiRfWb03ReplayCompleteTxPowerCal = variant != 1
     if variant != 0: fillCalibration()
-    # Complete selected-domain records are sufficient; the other domain
-    # must not force this runtime operation onto its fixed fallback.
+    # Neither an empty record nor the other domain changes replay ownership.
     if variant == 3:
       let offset = if wlan: 0xF8 + 6 * 8 else: 0x68
       calibration[offset div 4] = 0
@@ -130,21 +113,15 @@ for wlan in [true, false]:
     let initial = hardware.txPowerCompWords700
     if wlan: rfPriApplyLowPowerRuntimeDelta(0)
     else: rf_pri_input_bz_target_power(5)
-    let useRecords = variant in [2, 3]
-    let power = if useRecords: expectedPower(initial, wlan, not wlan)
-                else: expectedFallback(initial, wlan, false)
-    let final = if useRecords: expectedReplay(initial, wlan, not wlan)
-                else: expectedFallback(initial, wlan, true)
+    let useRecords = variant != 0
+    let power = expectedPower(initial, wlan, not wlan)
+    let final = expectedReplay(initial, wlan, not wlan)
     doAssert hardware.txPowerCompWords700 == final,
-      "scoped WB03 gate or fallback changed another domain or unowned fields"
-    doAssert nim_wifi_rf_tx_power_replay_mode == (if useRecords: 3'u32 else: 2'u32)
-    let reason = case variant
-      of 0: 1'u32
-      of 1: 4'u32
-      of 4: (if wlan: 2'u32 else: 3'u32)
-      else: 0'u32
+      "scoped WB03 record replay changed another domain or unowned fields"
+    doAssert nim_wifi_rf_tx_power_replay_mode == (if useRecords: 1'u32 else: 0'u32)
+    let reason = if variant == 0: 1'u32 else: 0'u32
     doAssert nim_wifi_rf_tx_power_replay_skip_reason == reason
-    checkTrace(power, final, wlan, true)
+    checkTrace(power, final, wlan, useRecords)
 ''')
 
 
@@ -173,7 +150,7 @@ for wlan in [true, false]:
 
 
 @pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
-def test_empty_selected_calibration_preserves_live_fields(tmp_path: Path, mode: str) -> None:
+def test_zero_selected_calibration_clears_only_its_owned_fields(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, source(real_io=True) + CHECKS + r'''
 for wlan in [true, false]:
   setup()
@@ -188,7 +165,7 @@ for wlan in [true, false]:
   let power = expectedPower(initial, wlan, not wlan)
   let final = expectedReplay(initial, wlan, not wlan)
   doAssert hardware.txPowerCompWords700 == final,
-    "empty record replaced live calibration fields with fixed-base values"
+    "zero record changed unowned calibration fields"
   checkTrace(power, final, wlan, true)
 ''')
 

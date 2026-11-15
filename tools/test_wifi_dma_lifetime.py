@@ -247,7 +247,7 @@ def test_dma_lifetime(tmp_path: Path, mode: str, mutation: str | None) -> None:
     ]) + procedure((FW / "tx_upper.nim").read_text(), "txu_cntrl_cfm")
     if mutation == "checkpoints":
         functions, count = re.subn(r"(?m)^\s+checkDmaOwner\(\)\n", "\n", functions)
-        assert count == 84
+        assert count == 83
     elif mutation == "notification":
         old = procedure(functions, "txlInvalidateDmaFrame")
         functions = functions.replace(old, "proc txlInvalidateDmaFrame(desc: pointer) = discard\n")

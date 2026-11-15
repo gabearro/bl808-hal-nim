@@ -45,7 +45,7 @@ static:
   doAssert offsetof(WifiModemBlock, intAckB420) == 0xB420
   doAssert offsetof(WifiModemBlock, phyChannelPulse888) == 0x888
 '''
-    for name in ["pulsePhyChannelRfWindow", "phy_mdm_isr", "phy_rc_isr"]:
+    for name in ["phy_mdm_isr", "phy_rc_isr"]:
         code += procedure(rf, name)
     code += r'''
 proc rxl_timer_int_handler() {.cdecl.} = discard
@@ -120,16 +120,6 @@ for status in [0'u32, 0x100, 0xFFFFFFFF'u32]:
   expected.intAckB420 = status
   doAssert notifications == 2 and modem == expected
   doAssert reads == @[0xB41C] and writes == @[(0xB420, status)]
-''',
-    "channel_programming_retains_its_pulse": r'''
-setup(0x100)
-var expected = modem
-expected.phyChannelPulse888 = 0
-pulsePhyChannelRfWindow()
-doAssert mappings == 1 and reads.len == 10
-for address in reads: doAssert address == 0x888
-doAssert writes == @[(0x888, 0x111'u32), (0x888, 0'u32)]
-doAssert modem == expected
 ''',
 }
 

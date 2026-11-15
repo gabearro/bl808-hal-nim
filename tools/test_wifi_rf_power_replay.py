@@ -26,6 +26,17 @@ def array_constant(code: str, name: str) -> str:
     return "const\n  " + name + code.split("  " + name, 1)[1].split("\n  ]", 1)[0] + "\n  ]\n"
 
 
+def object_type(code: str, name: str) -> str:
+    start = code.index("  " + name + " {.packed.} = object\n")
+    lines = code[start:].splitlines(keepends=True)
+    body = [lines[0]]
+    for line in lines[1:]:
+        if line.strip() and not line.startswith("    "):
+            break
+        body.append(line)
+    return "type\n" + "".join(body)
+
+
 def source(*, real_io: bool = False) -> str:
     rf = RF.read_text()
     code = """type
@@ -33,12 +44,16 @@ def source(*, real_io: bool = False) -> str:
   RfPriPowerTableScope = enum rfPowerAll, rfPowerWlan, rfPowerBz
   RfPriPowerTablePhase = enum rfPowerFields, rfPowerCalibration
 """
+    code += object_type(rf, "RfRegBlock")
+    code += object_type(rf, "RfTxPowerCompTableBlock")
     for name in (
         "RfPriTxPowerTableDefault", "RfPriTxPowerTableIndexDefault",
-        "RfPriTxPowerRegisterBase", "RfPriWb03TxPowerRegisterBaseline",
+        "RfPriWb03TxPowerRegisterBaseline",
         "RfPriTxcalReplayRecordIds", "RfPriBzTxcalTableStarts",
     ):
         code += array_constant(rf, name)
+    if "  RfPriTxPowerRegisterBase:" in rf:
+        code += array_constant(rf, "RfPriTxPowerRegisterBase")
     if "  RfPriBzTxPowerTableDefault:" in rf:
         code += array_constant(rf, "RfPriBzTxPowerTableDefault")
     for name in (
@@ -76,73 +91,68 @@ var
   bl808WifiRfWb03ReplayCompleteTxPowerCal, wb03: bool
   nim_wifi_rf_tx_power_txcal_complete, nim_wifi_rf_tx_power_bz_txcal_complete: uint32
   nim_wifi_rf_tx_power_replay_mode, nim_wifi_rf_tx_power_replay_skip_reason: uint32
-  written: array[43, uint32]
   writes, snapshots: int
 proc rfPriIsWb03(): bool = wb03
 proc xtalIndex(hz: uint32): uint32 = 4
 proc rfPriSnapshotBzTxcalState(tag: uint32) =
-  doAssert tag in [0xB1'u32, 0xB5]
+  doAssert tag in [0xB1'u32, 0xB2, 0xB5]
   inc snapshots
-'''
-    if real_io:
-        code += r'''
-type
-  RfTxPowerCompTableBlock = object
-    txPowerCompWords700: array[43, uint32]
-  FakeRfRegs = object
-    txcalParam70: uint32
 var
-  hardware: RfTxPowerCompTableBlock
-  rf70: FakeRfRegs
+  registerStorage: array[(sizeof(RfRegBlock) + 3) div 4, uint32]
   registerWrites: seq[tuple[index: int, value: uint32]]
+  mmioWrites: seq[tuple[address: uint, value: uint32]]
+  mmioReads: seq[uint]
   channelCompCalls: int
+  recordWrites: bool
+template hardware: untyped = cast[ptr RfTxPowerCompTableBlock](addr registerStorage[0])[]
+template rf70: untyped = cast[ptr RfRegBlock](addr registerStorage[0])[]
+template written: untyped = hardware.txPowerCompWords700
 proc rfTxPowerCompTableRegs(): ptr RfTxPowerCompTableBlock = addr hardware
-proc rfRegs(): ptr FakeRfRegs = addr rf70
-proc volatileLoad(p: ptr uint32): uint32 = p[]
+proc rfRegs(): ptr RfRegBlock = addr rf70
+proc volatileLoad(p: ptr uint32): uint32 =
+  if recordWrites: mmioReads.add(cast[uint](p))
+  p[]
 proc volatileStore(p: ptr uint32; value: uint32) =
   let base = cast[uint](addr hardware.txPowerCompWords700[0])
   let address = cast[uint](p)
-  if address >= base and address < base + sizeof(hardware).uint:
-    registerWrites.add(((address - base).int div 4, value))
+  if recordWrites: mmioWrites.add((address, value))
+  if address >= base and address < base + sizeof(written).uint:
+    inc writes
+    if recordWrites: registerWrites.add(((address - base).int div 4, value))
   p[] = value
 proc updateReg32(p: ptr uint32; keep, value: uint32) =
   volatileStore(p, (volatileLoad(p) and keep) or value)
 proc rf_pri_set_bz_channel_pwr_comp() = inc channelCompCalls
 proc rfPriRf70ReplayWindow0Nibble(): uint32 = 9
 '''
-        for name in (
-            "writeRfTxPowerCompTable", "rfPriReadTxPowerTable",
-            "rfPriPublishTxPowerTable",
-        ):
-            if f"proc {name}(" in rf:
-                code += procedure(rf, name)
-    else:
-        code += r'''
-proc writeRfTxPowerCompTable(words: openArray[uint32]) =
-  doAssert words.len == written.len
-  for i, word in words: written[i] = word
-  inc writes
-proc rfPriReadTxPowerTable(scope: RfPriPowerTableScope): array[43, uint32] = written
-proc rfPriPublishTxPowerTable(words: array[43, uint32];
-    scope: RfPriPowerTableScope; phase: RfPriPowerTablePhase) =
-  written = words
-  if phase == rfPowerFields: inc writes
-'''
+    for name in (
+        "writeRfTxPowerCompTable", "rfPriReadTxPowerTable",
+        "rfPriPublishTxPowerTable",
+    ):
+        if f"proc {name}(" in rf:
+            code += procedure(rf, name)
     for name in (
         "rfSignExtend16", "rfCalibWord", "rfCalibHalf", "rfCalibByte",
         "rfCalibBzTxcalRecordByteOffset", "rfCalibBzTxcalRecordWord0",
         "rfCalibBzTxcalRecordWord1", "rfPriDivTowardZeroBy10",
-        "rfPriApplyPowerRowToTable", "rfPriApplyRuntimePowerTables",
+        "rfPriApplyPowerRowToTable", "rfPriPowerTableIndicesValid",
+        "rfPriApplyRuntimePowerTables",
         "rfPriApplyTxcalRecordToTable", "rfPriApplyBzTxcalRecordToTable",
         "rfPriTxcalReplayRecordsComplete", "rfPriBzTxcalReplayRecordsComplete",
         "rfPriWriteTxPowerTable", "rfPriResetTxPowerRuntimeTables",
         "rfPriApplyLowPowerRuntimeDelta",
     ):
         if f"proc {name}(" in rf:
-            code += procedure(rf, name)
+            if name == "rfPriWriteTxPowerTable":
+                if rf.count("\nproc rfPriWriteTxPowerTable(") > 1:
+                    code += procedure(rf, name)
+                code += rf[rf.rindex("\nproc rfPriWriteTxPowerTable(") + 1:].split("\nproc ", 1)[0] + "\n"
+            else:
+                code += procedure(rf, name)
     if real_io:
         code += procedure(rf, "rfPriSelectBzTargetPowerRecords")
         code += procedure(rf, "rf_pri_input_bz_target_power")
+    code += "const RecordWriteTrace = " + ("true" if real_io else "false") + "\n"
     return code + r'''
 proc setup() =
   rfPriResetTxPowerRuntimeTables()
@@ -152,7 +162,11 @@ proc setup() =
   wb03 = false
   bl808RfXtalIndex = 4
   bl808WifiRfWb03ReplayCompleteTxPowerCal = false
-  written = default(typeof(written))
+  registerStorage = default(typeof(registerStorage))
+  registerWrites.setLen(0)
+  mmioWrites.setLen(0)
+  mmioReads.setLen(0)
+  recordWrites = RecordWriteTrace
   writes = 0
   snapshots = 0
 proc field(word: var uint32; start, width: int; value: int32) =
@@ -162,7 +176,7 @@ proc field(word: var uint32; start, width: int; value: int32) =
       word = word or mask
     else:
       word = word and not mask
-proc expectedPower(initial = RfPriTxPowerRegisterBase;
+proc expectedPower(initial = default(array[43, uint32]);
     wlan = true; bz = true): array[43, uint32] =
   result = initial
   for slot in 0 ..< (if wlan: 13 else: 0):
@@ -194,12 +208,11 @@ proc applyExpectedCal(words: var array[43, uint32]; start, offset: int) =
   let p1 = bytes[offset + 1].int32
   let p2 = bytes[offset + 2].int32 or (bytes[offset + 3].int32 shl 8)
   let p3 = bytes[offset + 4].int32 or (bytes[offset + 5].int32 shl 8)
-  if (p0 or p1 or p2 or p3) == 0: return
   field(words[start], 0, 11, p2)
   field(words[start + 1], 2, 6, p1)
   field(words[start + 1], 8, 6, p0)
   field(words[start + 1], 14, 10, p3)
-proc expectedReplay(initial = RfPriTxPowerRegisterBase;
+proc expectedReplay(initial = default(array[43, uint32]);
     wlan = true; bz = true): array[43, uint32] =
   result = expectedPower(initial, wlan, bz)
   if rfCalibDataGlobal != nil:
@@ -209,6 +222,16 @@ proc expectedReplay(initial = RfPriTxPowerRegisterBase;
     for slot in 0 ..< (if bz: 4 else: 0):
       let index = bl808RfBzTargetPowerRecords[slot]
       applyExpectedCal(result, 35 + slot * 2, 0xF8 + index * 8)
+proc expectedCalBaseline(initial: array[43, uint32];
+    wlan = true; bz = true): array[43, uint32] =
+  result = initial
+  for domain in 0 ..< 2:
+    if (domain == 0 and not wlan) or (domain == 1 and not bz): continue
+    for slot in 0 ..< (if domain == 0: 13 else: 4):
+      let a = (if domain == 0: 3 else: 35) + slot * 2
+      field(result[a], 0, 11, cast[int32](RfPriWb03TxPowerRegisterBaseline[a]))
+      field(result[a + 1], 2, 22,
+            cast[int32](RfPriWb03TxPowerRegisterBaseline[a + 1] shr 2))
 proc expectedDelta(delta: int16;
     rows: var array[18, RfPriTxPowerTableRow]; indices: var array[13, int16]) =
   rows = RfPriTxPowerTableDefault
@@ -251,7 +274,7 @@ for value in low(int16).int .. high(int16).int:
   doAssert bl808RfTxPowerTable == rows, "wrong LP row update for " & $value
   doAssert bl808RfTxPowerTableIndex == indices, "wrong LP selection for " & $value
   doAssert bl808RfLowPowerTableDelta == value.int16
-doAssert writes == 65536 and snapshots == writes
+doAssert writes == 65536 * 29 and snapshots == 65536
 ''')
 
 
@@ -271,12 +294,12 @@ for vector in 0 ..< 2000:
   let expected = expectedReplay()
   rfPriWriteTxPowerTable()
   doAssert written == expected, "incorrect RF register fields at vector " & $vector
-  doAssert writes == 1 and snapshots == 1
+  doAssert writes == (if rfCalibDataGlobal == nil: 38 else: 72) and snapshots == 1
 ''')
 
 
 @pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
-def test_wb03_gate_and_selected_calibration_records(tmp_path: Path, mode: str) -> None:
+def test_wb03_replays_selected_calibration_records_including_zero(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, source() + r'''
 for variant in 0 ..< 5:
   setup()
@@ -287,16 +310,11 @@ for variant in 0 ..< 5:
   for slot in 7 ..< 13: bl808RfTxPowerTableIndex[slot] = (slot + 5).int16
   if variant == 3: calibration[26 + 17 * 2] = 0; calibration[27 + 17 * 2] = 0
   if variant == 4: calibration[(0xF8 + 6 * 8) div 4] = 0; calibration[(0xFC + 6 * 8) div 4] = 0
-  let expected = if variant == 2: expectedReplay() else: RfPriWb03TxPowerRegisterBaseline
+  let expected = expectedReplay()
   rfPriWriteTxPowerTable()
-  doAssert written == expected and writes == 1
-  doAssert nim_wifi_rf_tx_power_replay_mode == (if variant == 2: 3'u32 else: 2'u32)
-  let reason = case variant
-    of 0: 1'u32
-    of 1: 4'u32
-    of 3: 2'u32
-    of 4: 3'u32
-    else: 0'u32
+  doAssert written == expected and writes == (if variant == 0: 38 else: 72)
+  doAssert nim_wifi_rf_tx_power_replay_mode == (if variant == 0: 0'u32 else: 1'u32)
+  let reason = if variant == 0: 1'u32 else: 0'u32
   doAssert nim_wifi_rf_tx_power_replay_skip_reason == reason
 ''')
 
@@ -333,9 +351,9 @@ for variant in 0 ..< 4:
   of 1: bl808RfTxPowerTableIndex[12] = 18
   of 2: bl808RfBzTargetPowerRecords[0] = -1
   else: bl808RfBzTargetPowerRecords[3] = 9
-  var words = RfPriTxPowerRegisterBase
+  var words: array[43, uint32]
   doAssert not rfPriApplyRuntimePowerTables(words)
-  doAssert words == RfPriTxPowerRegisterBase
+  doAssert words == default(typeof(words))
   rfCalibDataGlobal = addr calibration[0]
   for word in calibration.mitems: word = 0x03212010
   rfPriWriteTxPowerTable()

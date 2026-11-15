@@ -5933,7 +5933,6 @@ proc chan_pre_switch_channel*() {.exportc, cdecl.} =
     let ccaBusy = regRead(MACHW_BASE + 0x4C'u)
     env.surveySnapshot = (ccaBusy and 0xFF).uint8
     rfPhyTraceCheckpoint(0x45'u32)
-    rfPriPrepareWb03MacActiveScanState()
     rfPhyTraceCheckpoint(0x46'u32)
     blmac_pwr_mgt_setf(0)
     rfPhyTraceCheckpoint(0x47'u32)
