@@ -138,11 +138,12 @@ proc releaseTimerEntry(entry: TimerEntry) =
     return
   for i in 0 ..< MaxSchedulerTimers:
     if entry == addr timerPool[i]:
-      entry.callback = nil
+      var retiredCallback = move entry.callback
       entry.deadline = 0
       entry.id = 0
       entry.cancelled = false
       timerPoolUsed[i] = false
+      retiredCallback = nil
       return
 
 proc heapPush(s: var Scheduler, entry: TimerEntry) =
@@ -160,14 +161,24 @@ proc heapPush(s: var Scheduler, entry: TimerEntry) =
 proc heapPeekDeadline(s: Scheduler): uint64 {.inline.} =
   s.timers[0].deadline
 
-proc heapPop(s: var Scheduler): TimerEntry =
-  result = s.timers[0]
+proc heapRemove(s: var Scheduler, index: int): TimerEntry =
+  result = s.timers[index]
   let last = s.timers.len - 1
-  s.timers[0] = s.timers[last]
+  if index == last:
+    s.timers.setLen(last)
+    return
+  s.timers[index] = s.timers[last]
   s.timers.setLen(last)
-  if s.timers.len == 0: return
+  var i = index
+  if i > 0 and s.timers[i].deadline < s.timers[(i - 1) shr 1].deadline:
+    while i > 0:
+      let parent = (i - 1) shr 1
+      if s.timers[i].deadline >= s.timers[parent].deadline:
+        break
+      swap(s.timers[i], s.timers[parent])
+      i = parent
+    return
   # Sift down
-  var i = 0
   while true:
     let left = 2 * i + 1
     let right = 2 * i + 2
@@ -181,6 +192,9 @@ proc heapPop(s: var Scheduler): TimerEntry =
     if smallest == i: break
     swap(s.timers[i], s.timers[smallest])
     i = smallest
+
+proc heapPop(s: var Scheduler): TimerEntry =
+  s.heapRemove(0)
 
 # =============================================================================
 # Timer interrupt handler
@@ -284,12 +298,17 @@ proc addTimerMs*(ms: uint64, callback: proc() {.closure.}): TimerId =
 proc addTimerUs*(us: uint64, callback: proc() {.closure.}): TimerId =
   addTimer(deadlineFromNow(us), callback)
 
+proc reprogramNextDeadline(s: Scheduler) {.inline.}
+
 proc cancelTimer*(id: TimerId) =
-  ## Cancel a pending timer. The callback will not fire.
+  ## Cancel a pending timer and release its slot. The callback will not fire.
   ## O(n) scan — acceptable for typical timer counts.
   for i in 0 ..< scheduler.timers.len:
     if scheduler.timers[i].id == id:
-      scheduler.timers[i].cancelled = true
+      let entry = scheduler.heapRemove(i)
+      reprogramNextDeadline(scheduler)
+      # Closure cleanup may schedule work; retire the heap entry first.
+      releaseTimerEntry(entry)
       return
 
 # =============================================================================
@@ -323,10 +342,14 @@ proc fireExpiredTimers(s: var Scheduler) =
     if s.heapPeekDeadline > now:
       break
     let entry = s.heapPop()
-    if not entry.cancelled:
-      entry.callback()
-      s.totalTimersFired += 1
+    let shouldFire = not entry.cancelled
+    var callback = move entry.callback
+    # A callback may replace its own timer while every pool slot is occupied.
     releaseTimerEntry(entry)
+    if shouldFire:
+      callback()
+      s.totalTimersFired += 1
+    callback = nil
     now = readTick()
     if interruptDeadline > now:
       now = interruptDeadline

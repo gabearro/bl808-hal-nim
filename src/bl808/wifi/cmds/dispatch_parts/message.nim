@@ -1,19 +1,47 @@
+type CmdMessageScope = object
+  previous: ptr CmdMessageScope
+  manager, message: pointer
+
+var activeCmdMessage: ptr CmdMessageScope
+
 proc cmdMgrMsgind(cmdMgr, msg, cbPtr: pointer): cint {.cdecl.} =
   let msgConfirmCallback = cast[MsgCbProc](cbPtr)
   let blHw = cmdMgr
   var found = false
+  cmdMgrLock(cmdMgr)
+  var frame = activeCmdMessage
+  while frame != nil:
+    if frame.manager == cmdMgr and frame.message == msg:
+      cmdMgrUnlock(cmdMgr)
+      return 0
+    frame = frame.previous
+  var scope = CmdMessageScope(previous: activeCmdMessage, manager: cmdMgr, message: msg)
+  activeCmdMessage = addr scope
+  defer:
+    cmdMgrLock(cmdMgr)
+    activeCmdMessage = scope.previous
+    cmdMgrUnlock(cmdMgr)
   when defined(bl808WifiCmdTrace):
     c_printf("[WIFI-CMD] msg enter msg=%p id=0x%x len=%u cb=%p\r\n",
              msg, loadU16(msg, IpcE2aMsgIdOff).cuint,
              loadU32(msg, IpcE2aMsgParamLenOff).cuint, cbPtr)
 
-  cmdMgrLock(cmdMgr)
   let head = ptrAt(cmdMgr, MgrCmdsOff)
   var cmd = listNext(head)
   while cmd != head:
     if loadU16(cmd, CmdReqidOff) == loadU16(msg, IpcE2aMsgIdOff) and
-        (loadU16(cmd, CmdFlagsOff) and RwnxCmdFlagWaitCfm) != 0'u16:
-      if msgConfirmCallback == nil or msgConfirmCallback(blHw, cmd, msg) == 0:
+        (loadU16(cmd, CmdFlagsOff) and
+          (RwnxCmdFlagWaitCfm or RwnxCmdFlagCallback)) == RwnxCmdFlagWaitCfm:
+      storeU16(cmd, CmdFlagsOff, loadU16(cmd, CmdFlagsOff) or RwnxCmdFlagCallback)
+      let handled = msgConfirmCallback == nil or msgConfirmCallback(blHw, cmd, msg) == 0
+      let afterCallback = loadU16(cmd, CmdFlagsOff) and not RwnxCmdFlagCallback
+      storeU16(cmd, CmdFlagsOff, afterCallback)
+      if (afterCallback and RwnxCmdFlagDone) != 0:
+        found = true
+        if (afterCallback and RwnxCmdFlagNonblock) != 0 and not cmdIsQueued(cmdMgr, cmd):
+          osFree(cmd)
+        break
+      if handled:
         found = true
         when defined(bl808WifiCmdTrace):
           c_printf("[WIFI-CMD] msg found cmd=%p msgid=0x%x flags=0x%x\r\n",

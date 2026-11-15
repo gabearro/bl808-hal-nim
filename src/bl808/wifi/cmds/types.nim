@@ -1,4 +1,5 @@
 type
+  # Private host callback: consumes the command and source, even on rejection.
   CmdQueueProc = proc(cmdMgr, cmd: pointer): cint {.cdecl.}
   CmdLlindProc = proc(cmdMgr, cmd: pointer): cint {.cdecl.}
   MsgCbProc = proc(blHw, cmd, msg: pointer): cint {.cdecl.}

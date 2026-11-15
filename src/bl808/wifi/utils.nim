@@ -1,12 +1,14 @@
 ## Nim replacement for the BL808 WiFi host utility glue in bl_utils.c.
 ##
 ## This removes the SDK utility translation unit from Nim firmware builds. The
-## TCP/IP RX upload defaults to the conservative BL808 mempool path: the lower
-## layer keeps ownership of WiFi descriptors and buffers. The experimental lwIP
-## pbuf delivery path can be enabled with -d:bl808WifiRxPbufInput.
+## Raw RX uploads are copied for the monitor callbacks. Ethernet delivery to
+## lwIP is enabled with -d:bl808WifiRxPbufInput; lower-layer DMA descriptors
+## remain separate from both kinds of copied packet.
 
 when defined(bl808m0) and defined(bl808WifiNimFw):
   import sdk_headers
+  import ../wifi_fw as firmware
+  from ../core import csrReadMstatus, disableInterrupts, enableInterrupts
 
   include utils/layout
   include utils/types
@@ -19,6 +21,11 @@ when defined(bl808m0) and defined(bl808WifiNimFw):
     include utils/tcpip_pbuf_diag
 
   include utils/tcpip_diag
+  include utils/monitor_input
+
+  when defined(bl808WifiRxPbufInput):
+    include utils/rx_delivery
+    include utils/tcpip_pbuf_alloc_parts/amsdu_input
 
   include utils/ipc_init
 

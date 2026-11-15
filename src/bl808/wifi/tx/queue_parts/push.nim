@@ -1,4 +1,5 @@
 proc txPush(station, hostTxDescStorage, txBuffer, txHeaderPtr: pointer) =
+  # The caller owns the descriptor and buffer until publication with IRQs masked.
   zero(txdescHostPad(hostTxDescStorage), 208)
   let txPayloadStorage = txbufHostBuf(txBuffer)
   var sourcePbuf: pointer = nil
@@ -47,7 +48,6 @@ proc txPush(station, hostTxDescStorage, txBuffer, txHeaderPtr: pointer) =
       chainedPbuf = chainedPbufView.next
     copyMem(pushedTxHeaderPtr, txHeaderPtr, TxHdrSize)
     txHdrView(pushedTxHeaderPtr).pbuf = txBuffer
-    discard pbuf_free(cast[ptr Pbuf](sourcePbuf))
   else:
     totalLen = txHdrLen(pushedTxHeaderPtr)
 

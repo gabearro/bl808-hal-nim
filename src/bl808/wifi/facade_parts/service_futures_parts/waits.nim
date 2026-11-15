@@ -1,6 +1,7 @@
 proc wifiBeginScanWait(timeoutMs: uint32): CpsFuture[uint32] =
   if not wifiBackendUsesEventFutures():
     return completedLocalFuture(0'u32)
+  cancelWifiTimer(wifiScanTimer)
   let fut = newLocalCpsFuture[uint32]()
   wifiScanFuture = fut
   if timeoutMs != 0'u32:
@@ -15,6 +16,7 @@ proc wifiBeginScanWait(timeoutMs: uint32): CpsFuture[uint32] =
 proc wifiBeginConnectWait(timeoutMs: uint32): CpsFuture[WifiError] =
   if not wifiBackendUsesEventFutures():
     return completedLocalFuture(if wifiBackendConnected(): wifiOk else: wifiFail)
+  cancelWifiTimer(wifiConnectTimer)
   let fut = newLocalCpsFuture[WifiError]()
   wifiConnectFuture = fut
   if timeoutMs != 0'u32:

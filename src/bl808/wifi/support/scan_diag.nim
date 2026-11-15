@@ -76,6 +76,7 @@ proc scanCacheFailureRecord(bssid: ptr array[6, uint8]; success: bool): uint8 =
   if selectedFailureSlot < 0:
     selectedFailureSlot = if emptyFailureSlot >= 0: emptyFailureSlot else: weakestFailureSlot
     scanCacheFailureUsed[selectedFailureSlot] = 1
+    scanCacheFailureCount[selectedFailureSlot] = 0
     copyMem(addr scanCacheFailureBssid[selectedFailureSlot][0], addr bssid[][0], 6)
 
   if success:
@@ -166,7 +167,7 @@ proc scanCacheFind(ssid: cstring; ssidLen: csize_t; requestedBssid: ptr uint8;
   inc nimfwDbgScanCacheFind
   let requireRequestedBssid = scannedBssidIsSpecific(requestedBssid)
   var bestScanCacheSlot = -1
-  var bestScanCacheScore = -1000
+  var bestScanCacheScore = low(int)
   var candidateCount = 0'u32
   for scanCacheSlotIndex in 0 ..< scanCache.len:
     if scanCache[scanCacheSlotIndex].used == 0:

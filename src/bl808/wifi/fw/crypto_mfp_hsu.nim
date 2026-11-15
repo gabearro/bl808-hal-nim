@@ -2,192 +2,125 @@
 #                  MFP: Management Frame Protection
 # ###########################################################################
 
-proc mfp_ignore_mgmt_frame*(param: pointer): bool {.exportc, cdecl.} =
-  ## Check if a management frame should be ignored (MFP/PMF policy).
-  ##
-  ## From blob disassembly (172 instructions):
-  ## ABI: a0=rxu_mgt_ind payload, a1=frame_body_ptr, a2=frame_total_len, a3=out_flag_ptr
-  ## Hidden args: a1=frame body pointer, a2=frame total length, a3=output flag pointer
-  ##
-  ## param layout:
-  ##   offset 0:  uint16 - frame_ctrl (FC field)
-  ##   offset 8:  uint8  - body_offset (IE start within frame)
-  ##   offset 9:  uint8  - sta_idx (0xFF = unknown)
-  ##   offset 10: uint8  - vif_idx (0xFF = unknown)
-  ##   offset 36: uint8  - flags (bit 0 = protected)
-  ##
-  ## Returns: true if frame should be processed, false if should be ignored.
+proc mfpIgnoreRxMgmtFrame(desc, param, frameBodyPtr: pointer,
+    frameTotalLen: uint16, upload: ptr uint8, flags: ptr uint8): bool =
+  ## True means ignored. Upload and indication flags are separate outputs.
+  template reject(): untyped =
+    if upload != nil: upload[] = 0
+    return true
+  if param == nil or frameBodyPtr == nil:
+    reject()
   let mgmt = mfpMgmtFramePolicyView(param)
   let frameCtrl = mgmt.frameCtrl
   let staIdx = mgmt.staIdx
   let bodyOff = mgmt.bodyOffset
-
-  # Capture hidden ABI args (a1=frame_body, a2=frame_len, a3=out_flag)
-  var frameBodyPtr {.noinit.}: pointer
-  var frameTotalLen {.noinit.}: uint32
-  var outFlagPtr {.noinit.}: ptr uint8
-  {.emit: ["""
-  register void* _fb __asm__("a1");
-  register unsigned int _fl __asm__("a2");
-  register unsigned char* _of __asm__("a3");
-  """, frameBodyPtr, " = _fb; ", frameTotalLen, " = _fl; ", outFlagPtr, " = _of;"].}
-
-  # Blob: pre-validate with mfp_is_robust_frame(frameCtrl, subtype)
-  # T-Head custom insn extracts subtype field; we use standard shift/mask
-  let subtypeField = (frameCtrl shr 4) and 0x0F'u16
-  let isRobust = mfp_is_robust_frame(frameCtrl.uint32, subtypeField.uint32)
-  if not isRobust:
-    # Blob returns immediately for ordinary management frames without
-    # touching the caller's acceptance byte.
+  if bodyOff.uint16 >= frameTotalLen:
+    reject()
+  let frameBytes = cast[ptr UncheckedArray[uint8]](frameBodyPtr)
+  let action = frameBytes[bodyOff.int]
+  if not mfp_is_robust_frame(frameCtrl.uint32, action.uint32):
     return false
-
-  # Check valid STA and VIF indices
   let vifIdx = mgmt.vifIdx
-  if staIdx == 0xFF'u8:
-    if outFlagPtr != nil:
-      outFlagPtr[] = 0
-    return false
-  if vifIdx == 0xFF'u8:
-    if outFlagPtr != nil:
-      outFlagPtr[] = 0
-    return false
-
-  # Check VIF security context.
+  if staIdx.int >= STA_INFO_TAB_ENTRIES or vifIdx.int >= MAX_VIFS:
+    reject()
   let vif = vifChannelForIdx(vifIdx)
   let keyPtrs = vifKeyPointers(vif)
-  let secCtxPtr = keyPtrs.groupKeyPtr
-  if secCtxPtr == 0:
-    if outFlagPtr != nil:
-      outFlagPtr[] = 0
-    return false
-
-  let flags36 = mgmt.flags
-
-  if (flags36 and 1) != 0:
-    # Protected frame: validate MMIE replay counter (BIP)
-    # Check minimum frame length: bodyOff + 19 bytes minimum
-    if (bodyOff.int + 19) >= frameTotalLen.int:
-      if outFlagPtr != nil:
-        outFlagPtr[] = 0
+  if cast[pointer](keyPtrs.groupKeyPtr) == nil:
+    # A missing IGTK must not disable group protection for a PMF peer.
+    if (mgmt.flags and 1) == 0 or
+        (staInfoForIdx(staIdx).capabilityFlags and 8) == 0:
       return false
-
-    # Compute IE search region: body starts at frame_body + bodyOff + 2, length = frameTotalLen - bodyOff - 2
+  # Offset 36 aliases the first destination-address byte in RX status.
+  if (mgmt.flags and 1) != 0:
+    if (bodyOff.int + 19) >= frameTotalLen.int:
+      reject()
     let ieSearchLen = frameTotalLen.int - bodyOff.int - 2
     let ieSearchStart = ieCursorAfter(frameBodyPtr, bodyOff.uint + 2)
-
-    # Find MMIE (IE_ID=76) in the frame
     let mmiePtr = mac_ie_find(ieSearchStart, ieSearchLen.uint32, 76)
     if mmiePtr == nil:
-      if outFlagPtr != nil:
-        outFlagPtr[] = 0
-      return false
-
+      reject()
+    # BIP's MMIE terminates the frame and has an eight-byte MIC.
+    if cast[uint](mmiePtr) + sizeof(MmIeView).uint !=
+        cast[uint](frameBodyPtr) + frameTotalLen.uint:
+      reject()
     let mmie = mmieAt(mmiePtr)
-    # MMIE structure: [0]=IE_ID(76), [1]=len(16), [2..3]=keyID, [4..9]=IPN, [10..17]=MIC
-    # Blob: reads keyID from MMIE[2..3] as LE16, checks (keyID - 4) <= 1
-    # Valid MMIE keyIDs are 4 and 5 (IGTK key slots)
+    if mmie.ie.len != 16:
+      reject()
     let keyId = mmie.keyId
-    if (keyId - 4) > 1:
-      if outFlagPtr != nil:
-        outFlagPtr[] = 0
-      return false
-
-    # Look up IGTK key in VIF entry: offset 160 * keyIdAdj + sec base + 683
-    # Blob: li a5,160; madd a5,s8,s3,a5 -> offset = keyIdAdj * 160 + vifBase + 683
-    let keyIdAdj = keyId - 4  # 0 or 1
-    if vifKeySlot(vif, keyIdAdj.uint).installed == 0:
-      if outFlagPtr != nil:
-        outFlagPtr[] = 0
-      return false
-
-    # Extract IPN (6 bytes) from MMIE[4..9]
-    let ipnLo = mmie.ipn[1].uint16 or (mmie.ipn[0].uint16 shl 8)
-    let ipnMid = mmie.ipn[3].uint16 or (mmie.ipn[2].uint16 shl 8)
-    let ipnByte4 = mmie.ipn[4].uint32
-    let ipnByte5 = mmie.ipn[5].uint32
-
-    # Build 48-bit IPN as two 32-bit words
-    let ipnW0 = ipnLo.uint32 or (ipnMid.uint32 shl 16)
-    let ipnW1 = ipnByte4 or (ipnByte5 shl 8)
-
-    # Compare against stored IPN at VIF secCtx offsets 528/532
-    let bipKey = vifKeySlot(vif, 0)
-    let storedIpnLo = bipKey.replayCounters[0].pnLow
-    let storedIpnHi = bipKey.replayCounters[0].pnHigh
-
-    # 48-bit comparison: new IPN must be > stored IPN
-    if ipnW1 < storedIpnHi:
-      if outFlagPtr != nil:
-        outFlagPtr[] = 0
-      return false
-    if ipnW1 == storedIpnHi and ipnW0 <= storedIpnLo:
-      if outFlagPtr != nil:
-        outFlagPtr[] = 0
-      return false
-
-    # IPN is fresh: update stored IPN
-    bipKey.replayCounters[0].pnLow = ipnW0
-    bipKey.replayCounters[0].pnHigh = ipnW1
-
-    # Compute and verify BIP MIC
-    # Blob: addi a0,a0,528 -> key is at vifEntry+528 (IGTK key in sec context)
-    let micResult = mfp_compute_bip(
-      cast[pointer](bipKey),  # IGTK key at vif+528
-      frameBodyPtr, frameTotalLen, bodyOff.uint32)
-    # Compare 8-byte MIC at MMIE[10..17]
-    let expectedMic = mmieMicWords(mmie)
-    let expectedMicLo = expectedMic[0]
-    let expectedMicHi = expectedMic[1]
-    let resultLo = (micResult and 0xFFFFFFFF'u64).uint32
-    let resultHi = (micResult shr 32).uint32
-    if resultLo != expectedMicLo or resultHi != expectedMicHi:
-      if outFlagPtr != nil:
-        outFlagPtr[] = 0
-      return false
-
-    return true
+    if keyId < 4 or keyId > 5:
+      reject()
+    let bipKey = vifKeySlot(vif, keyId.uint)
+    let keyIndex = rxMgtKeyIndex(cast[pointer](bipKey))
+    if keyIndex < 0:
+      reject()
+    var receivedIpn = 0'u64
+    for i in 0 ..< 6:
+      receivedIpn = receivedIpn or (mmie.ipn[i].uint64 shl (8 * i))
+    let nextIpn = receivedIpn + 1'u64
+    let replay = addr bipKey.replayCounters[0]
+    var keyRevision, keyClock: uint64
+    block:
+      let saved = irqSave()
+      defer: irqRestore(saved)
+      if bipKey.installed == 0:
+        reject()
+      if desc != nil and not rxKeyCurrent(desc, cast[pointer](bipKey)):
+        reject()
+      keyRevision = rxKeyLastChanged[keyIndex]
+      keyClock = rxKeyRevision
+      let storedNext = replay.pnLow.uint64 or (replay.pnHigh.uint64 shl 32)
+      if nextIpn <= storedNext:
+        reject()
+    let expectedMic = mmie.mic
+    mmie.mic = default(typeof(mmie.mic))
+    let actualMic = mfp_compute_bip(cast[pointer](bipKey), frameBodyPtr,
+                                    frameTotalLen.uint32, bodyOff.uint32)
+    mmie.mic = expectedMic
+    var difference = 0'u8
+    for i in 0 ..< 8:
+      difference = difference or (expectedMic[i] xor
+        ((actualMic shr (8 * i)) and 0xFF'u64).uint8)
+    if difference != 0:
+      reject()
+    # MIC work may overlap key replacement or another accepted frame.
+    block:
+      let saved = irqSave()
+      defer: irqRestore(saved)
+      if bipKey.installed == 0 or rxKeyRevision < keyClock or
+          rxKeyLastChanged[keyIndex] != keyRevision:
+        reject()
+      if desc != nil and not rxKeyCurrent(desc, cast[pointer](bipKey)):
+        reject()
+      let storedNext = replay.pnLow.uint64 or (replay.pnHigh.uint64 shl 32)
+      if nextIpn <= storedNext:
+        reject()
+      replay.pnLow = (nextIpn and 0xFFFFFFFF'u64).uint32
+      replay.pnHigh = (nextIpn shr 32).uint32
+    return false
   else:
-    # Unprotected frame: check if PMF requires protection
     let sta = staInfoForIdx(staIdx)
-    if (sta.capabilityFlags and 0x08) == 0:
-      if outFlagPtr != nil:
-        outFlagPtr[] = 0
+    if (sta.capabilityFlags and 0x08) == 0 or (frameCtrl and 0x4000) != 0:
       return false
+    let subtypeBits = frameCtrl and 0xFC'u16
+    if subtypeBits notin [0xA0'u16, 0xC0'u16] or
+        bodyOff.int + 2 > frameTotalLen.int:
+      reject()
+    let reason = action.uint16 or (frameBytes[bodyOff.int + 1].uint16 shl 8)
+    if reason notin [6'u16, 7'u16]:
+      reject()
+    if flags != nil: flags[] = flags[] or 1'u8
+    return false
 
-    # PMF enabled: check if group-addressed (bit 14 of FC)
-    if (frameCtrl and 0x4000'u16) != 0:
-      if outFlagPtr != nil:
-        outFlagPtr[] = 0
-      return false
-
-    # Check frame subtype: deauth=0xC0, disassoc=0xA0 are robust mgmt
-    let subtypeBits = (frameCtrl and 0xFC'u16).uint8
-    # Blob: (subtypeBits - 0xA0) with bit 5 masked -> check both 0xA0 and 0xC0
-    let adjusted = (subtypeBits.int - 160) and (not 0x20)
-    if adjusted != 0:
-      if outFlagPtr != nil:
-        outFlagPtr[] = 0
-      return false
-
-    # Unprotected robust mgmt frame when PMF required -> accept with SA query flag
-    if outFlagPtr != nil:
-      outFlagPtr[] = 1  # signal SA query needed
-    return true
+proc mfp_ignore_mgmt_frame*(param: pointer, frameBodyPtr: pointer,
+    frameTotalLen: uint16, upload: ptr uint8, flags: ptr uint8): bool {.exportc, cdecl.} =
+  mfpIgnoreRxMgmtFrame(nil, param, frameBodyPtr, frameTotalLen, upload, flags)
 
 proc mfp_protect_mgmt_frame*(frameDesc: pointer, fc: uint32, action: uint32 = 0): uint32 {.exportc, cdecl, noinline.} =
-  ## Blob (110 bytes, 41 instrs, mfp.c.o):
-  ##   a0 = frameDesc, a1 = fc, a2 = action category
-  ##   vifIdx = frameDesc[47]
-  ##   secCtx = vif_info_tab[vifIdx].secCtx (at +1484)
-  ##   if secCtx == NULL: return 0
-  ##   if !mfp_is_robust_frame(fc, action): return 0
-  ##   staIdx = frameDesc[49]
-  ##   if staIdx == 0xFF: return 2                     # broadcast → BIP
-  ##   if (sta_info_tab[staIdx].flags308 & 1) == 0: return 2  # no PMF cap → BIP
-  ##   return CCMP_from_vif_crypto (via T-Head bit extract on sta[308])
-  {.emit: ["asm volatile(\"\" ::: \"memory\");"].}
+  ## Return 0 for no protection, 1 for pairwise CCMP, or 2 for group BIP.
   let desc = hostTxDescAt(frameDesc)
   let vifIdx = desc.vifIdx
+  if vifIdx.int >= MAX_VIFS:
+    return 0
   let vif = vifChannelForIdx(vifIdx)
   let secCtx = cast[pointer](vifKeyPointers(vif).groupKeyPtr)
   if secCtx == nil:
@@ -195,167 +128,91 @@ proc mfp_protect_mgmt_frame*(frameDesc: pointer, fc: uint32, action: uint32 = 0)
   if not mfp_is_robust_frame(fc, action):
     return 0
   let staIdx = desc.staInfoIdx
-  if staIdx == 0xFF:
-    return 2
+  if staIdx.int >= STA_INFO_TAB_ENTRIES:
+    return 0
   let sta = staInfoForIdx(staIdx)
-  if (sta.capabilityFlags and 1) == 0:
+  if (sta.macAddr[0] and 1) != 0:
     return 2
-  return 1
+  return (sta.capabilityFlags shr 3) and 1
 
-proc mfp_add_mgmt_mic*(frameDesc: pointer, bodyLen: uint32, totalLen: uint32): uint32 {.exportc, cdecl.} =
-  ## Add Management MIC IE (MMIE) to a management frame for PMF (802.11w).
-  ## From blob (86 instrs): builds MMIE with IE_ID=76, length=16.
-  ## Contains key ID, IPN (packet number), and 8-byte MIC via AES-CMAC.
-  ## Returns 18 (MMIE size) or 0 if no security context.
+proc mfp_add_mgmt_mic*(frameDesc: pointer, frame: pointer, frameLen: uint32): uint32 {.exportc, cdecl.} =
+  ## Append an 18-byte MMIE. The caller supplies a frame buffer with tailroom.
+  ## Return zero without changing the frame if no IPN can be reserved.
+  ## Key/lease changes during MIC work also fail; a reserved IPN is not reused.
+  if frameDesc == nil or frame == nil or frameLen < 24 or frameLen > 65517:
+    return 0
   let desc = hostTxDescAt(frameDesc)
   let vifIdx = desc.vifIdx
-  # Check security context at VIF+1484
-  let vif = vifChannelForIdx(vifIdx)
-  let secCtx = cast[pointer](vifKeyPointers(vif).groupKeyPtr)
-  if secCtx == nil:
+  if vifIdx.int >= MAX_VIFS:
     return 0
-  let sec = cast[ptr VifKeySlotView](secCtx)
-  # Compute MMIE write position: frameDesc body + bodyLen
-  let mmie = mmieAt(ieCursorAfter(frameDesc, bodyLen.uint))
-  # Write MMIE header
-  mmie.ie.id = 76   # MMIE IE ID
-  mmie.ie.len = 16  # length
-  # Key ID from sec_ctx+153
-  mmie.keyId = sec.staIdx.uint16
-  # Copy and increment IPN (6 bytes from sec_ctx+128..133)
-  let ipnLo = sec.pnLow
-  let ipnHi = sec.pnHigh
-  # Increment IPN by 1
-  let newIpnLo = ipnLo + 1
-  let newIpnHi = if newIpnLo < ipnLo: ipnHi + 1 else: ipnHi
-  sec.pnLow = newIpnLo
-  sec.pnHigh = newIpnHi
-  # Store IPN in MMIE[4..9] (6 bytes, little-endian)
-  var ipnByteIndex = 0'u32
-  while ipnByteIndex < 6:
-    let ipnByte = if ipnByteIndex < 4:
-        ((newIpnLo shr (ipnByteIndex * 8)) and 0xFF).uint8
-      else:
-        ((newIpnHi shr ((ipnByteIndex - 4) * 8)) and 0xFF).uint8
-    mmie.ipn[ipnByteIndex.int] = ipnByte
-    inc ipnByteIndex
-  # Clear MIC area and nonce — blob inlines two zero-word stores.
-  let micWords = mmieMicWords(mmie)
-  micWords[0] = 0
-  micWords[1] = 0
-  # Compute BIP MIC using mfp_compute_bip
-  # Blob passes secCtx directly as key (IGTK at start of sec context)
-  let mic = mfp_compute_bip(secCtx, frameDesc, bodyLen + 18, 24)
-  # Store 8-byte MIC. Blob splits lo/hi halves into two 4-byte loops —
-  # each emits a runtime 64-bit shift (__lshrdi3 call). Volatile barrier
-  # keeps GCC from merging them back into one.
-  var micV {.volatile.}: uint64 = mic
-  var micLowByteIndex = 0'u32
-  while micLowByteIndex < 4:
-    mmie.mic[micLowByteIndex.int] = ((micV shr (micLowByteIndex * 8)) and 0xFF'u64).uint8
-    inc micLowByteIndex
-  {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
-  var micV2 {.volatile.}: uint64 = mic
-  var micHighByteIndex = 4'u32
-  while micHighByteIndex < 8:
-    mmie.mic[micHighByteIndex.int] = ((micV2 shr (micHighByteIndex * 8)) and 0xFF'u64).uint8
-    inc micHighByteIndex
+  let vif = vifChannelForIdx(vifIdx)
+  let staIdx = desc.staInfoIdx
+  let mmie = mmieAt(ieCursorAfter(frame, frameLen.uint))
+  var secCtx: pointer
+  var keySnapshot: VifKeySlotView
+  var keyId: uint16
+  var keyIndex = -1
+  var keyRevision, keyClock: uint64
+  var frameLease: uint32
+  var nextPn: uint64
+  template frameCurrent(): bool =
+    txlFrameLeaseMatches(desc, frameLease) and txlFrameSessionCurrent(desc) and
+      desc.vifIdx == vifIdx and desc.staInfoIdx == staIdx
+  block:
+    let saved = irqSave()
+    {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
+    defer:
+      {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
+      irqRestore(saved)
+    frameLease = txlFrameLeaseToken(desc)
+    if not frameCurrent():
+      return 0
+    secCtx = cast[pointer](vifKeyPointers(vif).groupKeyPtr)
+    if secCtx == nil:
+      return 0
+    let sec = cast[ptr VifKeySlotView](secCtx)
+    keyId = sec.staIdx.uint16
+    if sec.installed == 0 or sec.cipherType != 5 or keyId notin [4'u16, 5'u16]:
+      return 0
+    if secCtx != cast[pointer](vifKeySlot(vif, keyId.uint)):
+      return 0
+    keyIndex = rxMgtKeyIndex(secCtx)
+    if keyIndex < 0:
+      return 0
+    let currentPn = sec.pnLow.uint64 or (sec.pnHigh.uint64 shl 32)
+    # The on-wire IPN is six bytes, even though storage is eight bytes.
+    if currentPn >= 0xFFFFFFFFFFFF'u64:
+      return 0
+    if not txSecurityBind(desc, sec, true):
+      return 0
+    nextPn = currentPn + 1'u64
+    sec.pnLow = (nextPn and 0xFFFFFFFF'u64).uint32
+    sec.pnHigh = (nextPn shr 32).uint32
+    keySnapshot.keyMaterial = sec.keyMaterial
+    keyRevision = rxKeyLastChanged[keyIndex]
+    keyClock = rxKeyRevision
+    mmie.ie.id = 76
+    mmie.ie.len = 16
+    mmie.keyId = keyId
+    for ipnByteIndex in 0 ..< 6:
+      mmie.ipn[ipnByteIndex] = ((nextPn shr (ipnByteIndex * 8)) and 255).uint8
+    mmie.mic = default(typeof(mmie.mic))
+  let mic = mfp_compute_bip(addr keySnapshot, frame, frameLen + 18, 24)
+  block:
+    let saved = irqSave()
+    {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
+    defer:
+      {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
+      irqRestore(saved)
+    if not frameCurrent() or cast[pointer](vifKeyPointers(vif).groupKeyPtr) != secCtx:
+      return 0
+    let sec = cast[ptr VifKeySlotView](secCtx)
+    if sec.installed == 0 or sec.cipherType != 5 or sec.staIdx.uint16 != keyId or
+        rxKeyRevision < keyClock or rxKeyLastChanged[keyIndex] != keyRevision:
+      return 0
+    for micByteIndex in 0 ..< 8:
+      mmie.mic[micByteIndex] = ((mic shr (micByteIndex * 8)) and 255).uint8
   return 18
-
-# Forward declaration for aes_encrypt_block (defined later in AES section)
-proc aes_encrypt_block*(roundKeys: pointer, state: pointer) {.exportc, cdecl.}
-
-proc mfp_compute_bip*(key: pointer, frame: pointer, frameLen: uint32,
-    extraParam: uint32): uint64 {.exportc, cdecl.} =
-  ## Compute BIP (Broadcast Integrity Protocol) MIC for PMF (558 bytes in blob).
-  ## AES-CMAC-128 per IEEE 802.11w. Blob does inline CBC-MAC on stack.
-  ## a0=key (with expanded schedule at +128), a1=frame, a2=frameLen,
-  ## a3=extraParam (halved for MMIE offset). Returns 64-bit MIC in (a0,a1).
-
-  if frameLen <= 41:
-    assert_warn("mfp.c", "mfp.c", 428)
-    return 0'u64
-
-  let keyU = cast[uint](key)
-  let frameU = cast[uint](frame)
-
-  # Mask frame control: clear Protected/MoreData/PwrMgmt/Retry bits
-  # Blob: 0xFFFFC7FF mask (lhu from frame+2, custom extract, mask)
-  let origFc = cast[ptr uint16](frameU + 2)[]
-  let maskedFc = origFc and 0xC7FF'u16
-
-  # Build AAD header on stack: masked FC (2 bytes) + addresses from frame+4 (18 bytes)
-  var aadHdr {.noinit.}: array[20, uint8]
-  cast[ptr uint16](addr aadHdr[0])[] = maskedFc
-  discard c_memcpy(addr aadHdr[2], cast[pointer](frameU + 4), 18.csize_t)
-
-  # AES key expansion is at key+128 in blob
-  # Blob runs 10-round AES encrypt inline using T-Head custom instructions.
-  # We delegate to aes_encrypt_block instead (same logical result).
-
-  # Compute data offset: extraParam >> 1 gives MMIE half-offset
-  let halfParam = extraParam shr 1
-  let dataStart = frameU + halfParam.uint + (halfParam.uint * 0)  # blob: s2 = frame + mul(halfParam, ???)
-  # Blob: s0 = frameLen - 12 - extraParam = data length (excluding MMIE)
-  var dataLen = cast[int32](frameLen) - 12 - cast[int32](extraParam)
-
-  # Initialize CBC-MAC state and subkey buffer
-  var cbcState {.noinit.}: array[16, uint8]
-  var subKey {.noinit.}: array[16, uint8]
-  discard c_memset(addr cbcState[0], 0, 16.csize_t)
-  discard c_memset(addr subKey[0], 0, 16.csize_t)
-
-  # XOR first 8 bytes of AAD into CBC-MAC state (blob: xor at 0x130, len=8)
-  xor_bytes(addr cbcState[0], addr aadHdr[0], 8)
-  # Encrypt state block
-  aes_encrypt_block(key, addr cbcState[0])
-
-  # XOR next 2 bytes of AAD (bytes 8-9) (blob: xor at 0x14a, len=2)
-  xor_bytes(addr cbcState[0], cast[pointer](cast[uint](addr aadHdr[0]) + 8), 2)
-  # XOR 6 more bytes (bytes 10-15) into state+4 (blob: xor at 0x158, len=6)
-  xor_bytes(cast[pointer](cast[uint](addr cbcState[0]) + 4),
-           cast[pointer](frameU + halfParam.uint), 6)
-  # Encrypt
-  aes_encrypt_block(key, addr cbcState[0])
-
-  # Advance data pointer past initial 6 bytes consumed, adjust remaining
-  var dataPtr = frameU + halfParam.uint + 12  # blob: s2 += 12
-  dataLen = dataLen + cast[int32](extraParam) - 12  # adjust for consumed bytes
-
-  # Main loop: process 16-byte blocks
-  while dataLen > 16:
-    xor_bytes(addr cbcState[0], cast[pointer](dataPtr), 8)
-    aes_encrypt_block(key, addr cbcState[0])
-    dataLen -= 16
-    dataPtr += 16
-
-  # Final block: generate CMAC subkey(s)
-  aes_encrypt_block(key, addr subKey[0])
-  aes_cmac_shift_sub_key(addr subKey[0])  # K1
-
-  if dataLen.uint32 == 16:
-    # Exact last block: XOR with K1, then encrypt
-    xor_bytes(addr subKey[0], cast[pointer](dataPtr), 8)
-  else:
-    # Partial last block: generate K2, XOR partial data + padding
-    aes_cmac_shift_sub_key(addr subKey[0])  # K2
-    let halfLen = dataLen.uint32 shr 1
-    xor_bytes(addr subKey[0], cast[pointer](dataPtr), halfLen)
-  # Padding: set 0x80 byte after data (if odd length, adjust)
-    let isOdd = (dataLen and 1) != 0
-    if isOdd:
-      let padByte = 0x80'u8 or 0x80'u8  # blob builds padding value
-      let byteIdx = halfLen
-      subKey[byteIdx.int] = subKey[byteIdx.int] xor padByte
-
-  # Final: XOR subkey into CBC-MAC state and encrypt
-  xor_bytes(addr cbcState[0], addr subKey[0], 8)
-  aes_encrypt_block(key, addr cbcState[0])
-
-  # Return first 8 bytes of CBC-MAC as (lo, hi) uint64
-  let micLo = cast[ptr uint32](addr cbcState[0])[]
-  let micHi = cast[ptr uint32](addr cbcState[4])[]
-  return cast[uint64](micLo) or (cast[uint64](micHi) shl 32)
 
 # ###########################################################################
 #                  AES Encryption (mfp_bip.o)
@@ -463,6 +320,70 @@ proc aes128_expand_key*(key: pointer; roundKeys: pointer) {.exportc, cdecl.} =
       rk[roundKeyWordByteOffset.int + wordByteIndex] =
         rk[previousRoundKeyWordByteOffset.int + wordByteIndex] xor
           scheduleWord[wordByteIndex]
+
+type AesCmacContext = object
+  roundKeys: array[176, uint8]
+  subkey, state, pending: array[16, uint8]
+  pendingLen: int
+
+proc aesCmacInit(ctx: var AesCmacContext; key: pointer) =
+  ctx = default(AesCmacContext)
+  aes128_expand_key(key, addr ctx.roundKeys[0])
+  aes_encrypt_block(addr ctx.roundKeys[0], addr ctx.subkey[0])
+  aes_cmac_shift_sub_key(addr ctx.subkey[0])
+
+proc aesCmacUpdate(ctx: var AesCmacContext; data: pointer; length: uint32) =
+  let bytes = cast[ptr UncheckedArray[uint8]](data)
+  var offset = 0'u32
+  while offset < length:
+    # A full pending block may be the final block, so encrypt it only when
+    # another input byte arrives, even across separate update calls.
+    if ctx.pendingLen == 16:
+      for i in 0 ..< 16:
+        ctx.state[i] = ctx.state[i] xor ctx.pending[i]
+      aes_encrypt_block(addr ctx.roundKeys[0], addr ctx.state[0])
+      ctx.pendingLen = 0
+    let count = min((16 - ctx.pendingLen).uint32, length - offset).int
+    for i in 0 ..< count:
+      ctx.pending[ctx.pendingLen + i] = bytes[offset + i.uint32]
+    ctx.pendingLen += count
+    offset += count.uint32
+
+proc aesCmacFinish(ctx: var AesCmacContext; mac: pointer) =
+  if ctx.pendingLen != 16:
+    aes_cmac_shift_sub_key(addr ctx.subkey[0])
+  for i in 0 ..< 16:
+    let finalByte =
+      if i < ctx.pendingLen: ctx.pending[i]
+      elif i == ctx.pendingLen: 0x80'u8
+      else: 0'u8
+    ctx.state[i] = ctx.state[i] xor finalByte xor ctx.subkey[i]
+  aes_encrypt_block(addr ctx.roundKeys[0], addr ctx.state[0])
+  discard c_memcpy(mac, addr ctx.state[0], 16.csize_t)
+
+proc mfp_compute_bip*(key: pointer, frame: pointer, frameLen: uint32,
+    headerLen: uint32): uint64 {.exportc, cdecl.} =
+  ## BIP-CMAC-128: masked FC || A1 || A2 || A3 || body, with MIC zeroed.
+  if key == nil or frame == nil or headerLen < 24 or headerLen > frameLen or
+      frameLen - headerLen < 18:
+    return 0
+  let bytes = cast[ptr UncheckedArray[uint8]](frame)
+  let slot = cast[ptr VifKeySlotView](key)
+  var aad: array[20, uint8]
+  aad[0] = bytes[0]
+  aad[1] = bytes[1] and 0xC7'u8
+  for i in 0 ..< 18:
+    aad[i + 2] = bytes[i + 4]
+  var ctx: AesCmacContext
+  aesCmacInit(ctx, addr slot.keyMaterial[0])
+  aesCmacUpdate(ctx, addr aad[0], aad.len.uint32)
+  aesCmacUpdate(ctx, addr bytes[headerLen], frameLen - headerLen - 8)
+  var zeroMic: array[8, uint8]
+  aesCmacUpdate(ctx, addr zeroMic[0], zeroMic.len.uint32)
+  var mac: array[16, uint8]
+  aesCmacFinish(ctx, addr mac[0])
+  for i in 0 ..< 8:
+    result = result or (mac[i].uint64 shl (8 * i))
 
 proc aes128_encrypt_copy(roundKeys: pointer; input: ptr array[16, uint8];
                          output: ptr array[16, uint8]) {.inline.} =
@@ -646,58 +567,11 @@ proc hsu_init*() {.exportc, cdecl.} =
   discard c_memset(addr hsuMichaelCtx[0], 0, hsuMichaelCtx.len.csize_t)
 
 proc hsu_aes_cmac*(key: pointer, msg: pointer, msgLen: uint32, mac: pointer) {.exportc, cdecl.} =
-  ## Compute AES-CMAC-128 per RFC 4493.
-  ## Steps: expand key, derive K1/K2, process blocks with CBC-MAC, output 16-byte MAC.
-  # 1. AES key expansion (10 rounds -> 176 bytes of round keys)
-  var roundKeys: array[176, uint8]
-  aes128_expand_key(key, addr roundKeys[0])
-  # 2. Generate subkeys K1, K2
-  var k1: array[16, uint8]
-  var k2: array[16, uint8]
-  # Encrypt zero block to get L
-  discard c_memset(addr k1[0], 0, 16.csize_t)
-  aes_encrypt_block(addr roundKeys[0], addr k1[0])
-  # K1 = shift(L), K2 = shift(K1)
-  aes_cmac_shift_sub_key(addr k1[0])
-  discard c_memcpy(addr k2[0], addr k1[0], 16.csize_t)
-  aes_cmac_shift_sub_key(addr k2[0])
-  # 3. CBC-MAC: process complete 16-byte blocks
-  var state: array[16, uint8]
-  discard c_memset(addr state[0], 0, 16.csize_t)
-  var pos = 0'u32
-  let nBlocks = if msgLen > 0: ((msgLen - 1) div 16) + 1 else: 1'u32
-  let lastBlockComplete = (msgLen > 0) and ((msgLen mod 16) == 0)
-  # Process all but last block
-  if nBlocks > 1:
-    for blk in 0'u32 ..< (nBlocks - 1):
-      let src = cast[ptr UncheckedArray[uint8]](msg)
-      for cmacBlockByteIndex in 0 ..< 16:
-        state[cmacBlockByteIndex] = state[cmacBlockByteIndex] xor src[pos + cmacBlockByteIndex.uint32]
-      aes_encrypt_block(addr roundKeys[0], addr state[0])
-      pos += 16
-  # Process last block with K1 or K2
-  var lastBlock: array[16, uint8]
-  let remaining = msgLen - pos
-  if lastBlockComplete and remaining == 16:
-    # Complete last block: XOR with K1
-    let src = cast[ptr UncheckedArray[uint8]](msg)
-    for lastBlockByteIndex in 0 ..< 16:
-      lastBlock[lastBlockByteIndex] = src[pos + lastBlockByteIndex.uint32] xor k1[lastBlockByteIndex]
-  else:
-    # Incomplete last block: pad with 0x80 then zeros, XOR with K2
-    discard c_memset(addr lastBlock[0], 0, 16.csize_t)
-    if remaining > 0:
-      let src = cast[ptr UncheckedArray[uint8]](msg)
-      discard c_memcpy(addr lastBlock[0], cast[pointer](cast[uint](msg) + pos), remaining.csize_t)
-    lastBlock[remaining.int] = 0x80'u8
-    for lastBlockByteIndex in 0 ..< 16:
-      lastBlock[lastBlockByteIndex] = lastBlock[lastBlockByteIndex] xor k2[lastBlockByteIndex]
-  # XOR last block with state and encrypt
-  for finalCmacByteIndex in 0 ..< 16:
-    state[finalCmacByteIndex] = state[finalCmacByteIndex] xor lastBlock[finalCmacByteIndex]
-  aes_encrypt_block(addr roundKeys[0], addr state[0])
-  # 4. Output MAC
-  discard c_memcpy(mac, addr state[0], 16.csize_t)
+  ## One-shot wrapper over the same streaming core used by BIP.
+  var ctx: AesCmacContext
+  aesCmacInit(ctx, key)
+  aesCmacUpdate(ctx, msg, msgLen)
+  aesCmacFinish(ctx, mac)
 
 proc hsu_michael_init*(key: pointer) {.exportc, cdecl.} =
   ## Initialize the HSU Michael MIC streaming context with an 8-byte key.

@@ -3,6 +3,8 @@ import shutil
 import re
 from pathlib import Path
 
+from test_wifi_disconnect_tx import procedure as nim_procedure
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -404,14 +406,8 @@ def test_wifi_scan_connect_uses_vendor_style_cache_hint():
         ROOT / "src/bl808/wifi/support/mgmr_facade_parts/scan_connect.nim"
     ).read_text()
 
-    cache_store_body = scan_diag.split("proc scanCacheStore", 1)[1].split(
-        "proc scanCacheFind",
-        1,
-    )[0]
-    cache_find_body = scan_diag.split("proc scanCacheFind", 1)[1].split(
-        "proc scanDiagStore",
-        1,
-    )[0]
+    cache_store_body = nim_procedure(scan_diag, "scanCacheStore")
+    cache_find_body = nim_procedure(scan_diag, "scanCacheFind")
     scan_body = scan_connect.split("proc wifi_mgmr_scan*", 1)[1].split(
         "proc wifi_mgmr_sta_connect*",
         1,
@@ -451,7 +447,9 @@ def test_wifi_scan_connect_uses_vendor_style_cache_hint():
     for expected in [
         "let requireRequestedBssid = scannedBssidIsSpecific(requestedBssid)",
         "scanCache[scanCacheSlotIndex].channel != requestedChannel",
-        "if scanCache[scanCacheSlotIndex].rssi.int > bestScanCacheRssi:",
+        "let failurePenalty = scanCache[scanCacheSlotIndex].failCount.int * 24",
+        "let score = scanCache[scanCacheSlotIndex].rssi.int - failurePenalty",
+        "if score > bestScanCacheScore:",
         "selectedChannelOut[] = scanCache[bestScanCacheSlot].channel",
     ]:
         assert expected in cache_find_body
@@ -580,9 +578,17 @@ def test_wifi_async_lifecycle_uses_event_futures_not_poll_loops():
     assert "proc wifiSetBleCoexistenceMode*" in wifi
     assert "proc wifiStaKeepaliveAckOkCount*" in wifi
     assert "addSchedulerTimedPollHook(wifiServicePollHook, readTick())" in wifi
-    assert "wifiScanFuture = newLocalCpsFuture[uint32]()" in wifi
-    assert "wifiConnectFuture = newLocalCpsFuture[WifiError]()" in wifi
-    assert "wifiDisconnectFuture = newLocalCpsFuture[WifiError]()" in wifi
+    for relative_path, name, value_type, slot in [
+        ("service_futures_parts/waits.nim", "wifiBeginScanWait", "uint32", "wifiScanFuture"),
+        ("service_futures_parts/waits.nim", "wifiBeginConnectWait", "WifiError", "wifiConnectFuture"),
+        ("station_api_parts/disconnect.nim", "wifiIssueDisconnectAsync", "WifiError", "wifiDisconnectFuture"),
+    ]:
+        body = nim_procedure(
+            (ROOT / "src/bl808/wifi/facade_parts" / relative_path).read_text(), name
+        )
+        constructor = f"let fut = newLocalCpsFuture[{value_type}]()"
+        assignment = f"{slot} = fut"
+        assert body.index(constructor) < body.index(assignment) < body.index("return fut")
     assert "proc wifi_main_service_step*" in wifi_fw
     assert "proc wifi_main_poll_once*" in wifi_fw
     assert "WifiMainServiceMode = enum" not in wifi_fw
@@ -827,12 +833,12 @@ def test_wifi_firmware_hardware_waits_are_bounded_for_cps_runtime():
     assert "proc waitRegLowNibbleClear" in wifi_fw
     assert "proc waitRegLowNibbleEquals" in wifi_fw
     assert "proc waitMacSoftResetClear" in wifi_fw
-    assert "PsDozeEnvView {.packed.} = object" in wifi_fw
+    assert "BlDozeEnvView {.packed.} = object" in wifi_fw
     assert "dozeInProgress*: uint32" in wifi_fw
     assert "preState*: uint8" in wifi_fw
-    assert "doAssert offsetof(PsDozeEnvView, dozeInProgress) == 56" in wifi_fw
-    assert "doAssert offsetof(PsDozeEnvView, preState) == 60" in wifi_fw
-    assert "template psDozeEnvView(): ptr PsDozeEnvView" in wifi_fw
+    assert "doAssert offsetof(BlDozeEnvView, dozeInProgress) == 4" in wifi_fw
+    assert "doAssert offsetof(BlDozeEnvView, preState) == 0" in wifi_fw
+    assert "template blDozeEnvView(): ptr BlDozeEnvView" in wifi_fw
 
     hal_body = wifi_fw.split("proc hal_machw_init*", 1)[1].split(
         "proc hal_machw_idle_req*", 1
@@ -871,7 +877,18 @@ def test_wifi_firmware_hardware_waits_are_bounded_for_cps_runtime():
     halt_ac_body = wifi_fw.split(
         "proc txl_cntrl_halt_ac*(ac: uint8) {.exportc, cdecl.} =",
         1,
+    )[1].split("proc txlDetachAc", 1)[0]
+    detach_ac_body = wifi_fw.split(
+        "proc txlDetachAc(ac: uint8; flushMask: uint32; batch: var TxFlushBatch) =",
+        1,
     )[1].split("proc txl_cntrl_flush_ac*", 1)[0]
+    flush_ac_body = wifi_fw.split(
+        "proc txl_cntrl_flush_ac*(ac: uint8, flushMask: uint32) {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc txl_cntrl_clear_ac*", 1)[0]
+    clear_ac_body = wifi_fw.split("proc txl_cntrl_clear_ac*", 1)[1].split(
+        "proc txl_cntrl_inc_pck_cnt*", 1
+    )[0]
     machw_security_layout = wifi_fw.split(
         "MachwSecurityRegsView {.packed.} = object", 1
     )[1].split("WlanCoexRegsView {.packed.} = object", 1)[0]
@@ -962,10 +979,23 @@ def test_wifi_firmware_hardware_waits_are_bounded_for_cps_runtime():
     assert "# Compute HW station index: (staIdx + 8) & 0xFF" in sec_body
     assert "cast[uint32](addr_ptr)" not in sec_body
     assert "staInfoForIdx(vifIdx)" not in sec_body
-    assert "waitMachwSecurityControlClear(0x80000000'u32)" in key_get_body
+    key_read_body = wifi_fw.split("proc mmReadSecurityEntry(", 1)[1].split(
+        "proc mm_sec_machwkey_get*", 1
+    )[0]
+    assert "waitMachwSecurityControlClear(0x80000000'u32)" in key_read_body
+    assert "waitMachwSecurityControlClear(0xE0000000'u32)" in key_read_body
+    assert "let maxIdx = ((keyCount shr 8) and 0xFF).uint8" in key_read_body
+    assert "if keyIdx > maxIdx:" in key_read_body
+    assert "let saved = irqSave()" in key_read_body
+    assert "mmReadSecurityEntry(keyIdx, entry)" in key_get_body
+    assert "keySize.csize_t" in key_get_body
+    assert "addr machwSecurityRegs().keyMaterial[0], 16.csize_t" not in key_get_body
     assert "var keyTableIndex: int32 = 0" in keydump_body
     assert "while keyTableIndex <= keyCount:" in keydump_body
-    assert "(keyTableIndex.uint32 shl 16) or READ_TRIGGER" in keydump_body
+    assert "mmReadSecurityEntry(keyTableIndex.uint8, entry)" in keydump_body
+    assert "let keyCount = ((volatileLoad(addr regs.keyCount) shr 8) and 0xFF).int32" in keydump_body
+    assert "let kw0 = entry.words[0]" in keydump_body
+    assert "let logFunc = getLogFunc(204)" in keydump_body
     assert "assert_err(\"mm_sec.c\", \"mm_sec.c\", keyTableIndex.cint)" in keydump_body
     assert "var idx: int32 = 0" not in keydump_body
     assert "idx.uint32 shl 16" not in keydump_body
@@ -990,11 +1020,11 @@ def test_wifi_firmware_hardware_waits_are_bounded_for_cps_runtime():
             assert forbidden not in sec_body
             assert forbidden not in key_get_body
             assert forbidden not in keydump_body
-    assert "waitRegLowNibbleEquals(MACHW_STATE_CNTRL_REG" in ps_body
-    assert "waitRegLowNibbleClear(MACHW_STATE_CNTRL_REG)" in ps_body
-    assert "psDozeEnvView().preState" in ps_body
-    assert "psDozeEnvView().dozeInProgress = 1" in doze_body
-    assert "psDozeEnvView().dozeInProgress = 0" in wakeup_body
+    assert "waitMacPmState(preState)" in ps_body
+    assert "waitMacPmState(0)" in ps_body
+    assert "blDozeEnvView().preState" in ps_body
+    assert "blDozeEnvView().dozeInProgress = 1" in doze_body
+    assert "blDozeEnvView().dozeInProgress = 0" in wakeup_body
     for forbidden in [
         "cast[ptr uint32](cast[uint](addr ps_env[0]) + 56)",
         "cast[ptr uint8](cast[uint](addr ps_env[0]) + 60)",
@@ -1002,35 +1032,59 @@ def test_wifi_firmware_hardware_waits_are_bounded_for_cps_runtime():
         assert forbidden not in doze_body
         assert forbidden not in ps_body
         assert forbidden not in wakeup_body
-    assert "while (status and 0x04'u32) == 0 and macTimeNow() - startTime < timeout:" in idle_body
+    assert "waitMacPmInterrupt(startTime)" in idle_body
     assert "while true:" not in idle_body
-    assert "while (status and 0x04'u32) == 0 and macTimeNow() - startTime < timeout:" in wakeup_body
+    assert "waitMacPmInterrupt(startTime)" in wakeup_body
     assert "while true:" not in wakeup_body
     assert "proc hal_machw_search_addr*(macAddrPtr: pointer, unusedCompatArg: uint32)" in wifi_fw
     assert "proc hal_machw_search_addr*(addr_ptr: pointer, idx: uint32)" not in wifi_fw
     assert "discard unusedCompatArg" in search_body
     assert "let addrView = macAddrAt(macAddrPtr)" in search_body
-    assert "waitRegMaskClear(MACHW_BASE + 0x0C4'u, 0x20000000'u32)" in search_body
+    assert "waitMachwSecurityControlClear(0xE0000000'u32)" in search_body
+    assert "waitMachwSecurityControlClear(0x20000000'u32)" in search_body
     assert "return 0xFF'u32" in search_body
     assert "waitRegMaskSet(MACHW_INTC_BASE + 0x168'u, 0x40000'u32)" in duration_body
     assert "return 500" in duration_body
     assert "while (regRead(MACHW_INTC_BASE + 0x168'u)" not in duration_body
-    for mask in [
-        "0x10000'u32",
-        "0x20000'u32",
-        "0x40000'u32",
-        "0x80000'u32",
-        "0x03'u32",
-    ]:
-        assert f"waitRegMaskClear(MACHW_TX_TRIG_STAT, {mask})" in halt_ac_body
-    assert "while true:" not in halt_ac_body
+    assert "triggerMasks = [0x10000'u32, 0x20000, 0x40000, 0x80000, 0x8000]" in halt_ac_body
+    assert "statusMasks = [0x30'u32, 0x300, 0x3000, 0x30000, 0x03]" in halt_ac_body
+    assert "while (regRead(MACHW_TX_TRIG_STAT) and statusMasks[ac]) != 0:" in halt_ac_body
+    assert "waitRegMaskClear" not in halt_ac_body
+    assert "regWrite(MACHW_TX_TRIG_CLR, triggerMasks[ac])" in halt_ac_body
+    assert "let curActive = regRead(activeAcReg)" in detach_ac_body
+    assert "let acHwMask = 1'u32 shl ac" in detach_ac_body
+    assert "batch = TxFlushBatch(previous: txActiveFlush, ac: ac, status: flushMask," in detach_ac_body
+    assert "pending: control.pending, confirmations: confirmations[])" in detach_ac_body
+    assert "txActiveFlush = addr batch" in detach_ac_body
+    assert "txlDetachAc(ac, flushMask, batch)" in flush_ac_body
+    assert "defer: txActiveFlush = batch.previous" in flush_ac_body
+    assert "txl_cfm_flush(ac, addr batch.confirmations, flushMask)" in flush_ac_body
+    assert "txl_cfm_flush(ac, addr batch.pending, flushMask)" in flush_ac_body
+    assert "control.current = nil" in detach_ac_body
+    assert "txlBufferEnvView().backupQueues[ac].first = nil" in detach_ac_body
+    assert "txlBufferEnvView().backupQueues[ac].last = nil" in detach_ac_body
+    assert "txl_buffer_reset()" not in flush_ac_body
+    assert "txl_buffer_reset()" not in detach_ac_body
+    assert flush_ac_body.index("txlDetachAc(ac, flushMask, batch)") < flush_ac_body.index(
+        "txl_cfm_flush(ac, addr batch.confirmations, flushMask)"
+    )
+    assert "__asm__" not in flush_ac_body
+    assert "__asm__" not in detach_ac_body
+    assert "regWrite(activeAcReg, curActive and (not acHwMask))" in detach_ac_body
+    assert "regWrite(setAcReg, acHwMask)" in detach_ac_body
+    assert "let saved = irqSave()" not in flush_ac_body
+    assert "let acMask = 1'u32 shl ac" not in flush_ac_body
+    assert "txl_cntrl_flush_ac(ac, 0x40000000'u32)" in clear_ac_body
+    assert "txl_cntrl_flush_ac(4, 0x40000000'u32)" in clear_ac_body
+    for ac in range(4):
+        assert f"txl_cntrl_flush_ac({ac}, 0x40000000'u32)" in clear_ac_body
 
 
 def test_wifi_machwkey_delete_uses_vif_overlay_lookup():
     wifi_fw = wifi_fw_policy_source()
 
-    body = wifi_fw.split("proc mm_sec_machwkey_del*", 1)[1].split(
-        "proc mm_sec_machwkey_get*", 1
+    body = wifi_fw.rsplit("proc mmDeleteSecurityKey(", 1)[1].split(
+        "proc mm_sec_machwkey_del*", 1
     )[0]
 
     assert "let vif = vifChannelForIdx(hwIdx.uint8)" in body
@@ -1183,7 +1237,7 @@ def test_wifi_machw_sleep_and_crypto_helpers_use_semantic_loop_indexes():
         "{.emit: \"__attribute__((optimize(\\\"crossjumping\\\"))) void hal_machw_gen_handler",
         1,
     )[0]
-    xor_body = wifi_fw.split("proc xor_bytes*", 1)[1].split(
+    xor_body = wifi_fw.split("proc xor_halfwords*", 1)[1].split(
         "proc add_round_key*", 1
     )[0]
     round_key_body = wifi_fw.split("proc add_round_key*", 1)[1].split(
@@ -1194,22 +1248,23 @@ def test_wifi_machw_sleep_and_crypto_helpers_use_semantic_loop_indexes():
     )[0]
 
     for expected in [
-        "for accessCategoryIndex in 0'u32 ..< 10:",
+        "for accessCategoryIndex in 0'u32 ..< 9:",
         "let acBit = 1'u32 shl accessCategoryIndex",
         "MACHW_CHAN_STAT_BASE + accessCategoryIndex * 4",
     ]:
         assert expected in sleep_body
     for forbidden in [
-        "for i in 0'u32 ..< 10:",
+        "for i in 0'u32 ..< 9:",
         "let acBit = 1'u32 shl i",
         "MACHW_CHAN_STAT_BASE + i * 4",
     ]:
         assert forbidden not in sleep_body
 
     for expected in [
-        "for xorByteOffset in 0'u32 ..< count:",
-        "cast[uint](src) + xorByteOffset",
-        "cast[uint](dst) + xorByteOffset",
+        "for xorHalfwordIndex in 0'u32 ..< count:",
+        "sourceWords[xorHalfwordIndex]",
+        "destinationWords[xorHalfwordIndex]",
+        "cast[ptr UncheckedArray[uint16]](src)",
     ]:
         assert expected in xor_body
     for forbidden in [
@@ -1293,7 +1348,7 @@ def test_wifi_apm_sta_add_confirm_does_not_trap_scheduler():
     wifi_fw = wifi_fw_policy_source()
 
     apm_body = wifi_fw.split("proc apm_sta_add_cfm_handler*", 1)[1].split(
-        "{.emit: \"__attribute__((optimize(\\\"crossjumping\\\"))) void apm_sta_del_req_handler",
+        "proc apm_sta_del_req_handler*",
         1,
     )[0]
 
@@ -1302,10 +1357,11 @@ def test_wifi_apm_sta_add_confirm_does_not_trap_scheduler():
     assert "sb zero" not in apm_body
     assert "ebreak" not in apm_body
     assert "assert_err" not in apm_body
-    assert "for apmStaAddSlotIndex in 0'u ..< 5'u:" in apm_body
-    assert "let apmStaAddSlot = apmStaSlot(apmStaAddSlotIndex)" in apm_body
-    assert "apmStaAddSlot.staIdx = staIdx" in apm_body
-    assert "let stored = cast[uint32](apmStaAddSlot.staHandle)" in apm_body
+    assert "let pendingSlot = apmPendingConfirmationSlot(param)" in apm_body
+    assert "let slot = apmStaSlot(pendingSlot.uint)" in apm_body
+    assert "slot.staIdx = staIdx" in apm_body
+    assert "sta.apmWpaContext = context" in apm_body
+    assert "apmPendingAssociations[pendingSlot].generation != generation" in apm_body
     assert "for slotIdx in 0'u ..< 5'u:" not in apm_body
     assert "let slot = apmStaSlot(slotIdx)" not in apm_body
     assert "inc nimFwDbgApmStaAddNoSlot" in apm_body
@@ -1348,28 +1404,27 @@ def test_wifi_scan_result_prefers_valid_ds_channel_over_stale_rx_frequency():
     assert "scanuCacheChannel(scanResultEntry, rx.band, selectedFreq)" in scan_body
 
 
-def test_wifi_tx_confirm_event_yields_under_backlog():
+def test_wifi_tx_confirm_event_drains_per_ac_queue_like_vendor():
     wifi_fw = wifi_fw_policy_source()
 
     cfm_body = wifi_fw.split(
-        "proc txl_cfm_evt*() {.exportc, cdecl.} =",
+        "proc txl_cfm_evt*(ac: uint8) {.exportc, cdecl.} =",
         1,
     )[1].split(
         "proc txl_cfm_flush*", 1
     )[0]
 
-    assert "WifiTxCfmDrainLimit = 16'u32" in wifi_fw
-    assert "nimfw_dbg_cfm_evt_yield" in wifi_fw
-    assert "nimfw_dbg_cfm_evt_yield_ac" in wifi_fw
     assert "proc txlCfmPending(acList: ptr CoList): bool" in wifi_fw
-    assert "var drained = 0'u32" in cfm_body
-    assert "while drained < WifiTxCfmDrainLimit and txlCfmPending(acList):" in cfm_body
+    assert "while txlCfmPending(acList):" in cfm_body
+    assert "let acIdx = ac.uint32" in cfm_body
+    assert 'asm "mv' not in cfm_body
     assert "while true:" not in cfm_body
-    assert "inc drained" in cfm_body
-    assert "if txlCfmPending(acList):" in cfm_body
-    assert "inc nimFwDbgCfmEvtYield" in cfm_body
-    assert "nimFwDbgCfmEvtYieldAc = acIdx" in cfm_body
-    assert "ke_evt_set(evtField)" in cfm_body
+    assert "WifiTxCfmDrainLimit" not in wifi_fw
+    assert "var drained = 0'u32" not in cfm_body
+    assert "inc drained" not in cfm_body
+    assert "inc nimFwDbgCfmEvtYield" not in cfm_body
+    assert "nimFwDbgCfmEvtYieldAc = acIdx" not in cfm_body
+    assert "ke_evt_set(evtField)" not in cfm_body
 
 
 def test_wifi_tx_confirm_dump_uses_semantic_queue_count_name():
@@ -1401,23 +1456,38 @@ def test_wifi_tx_confirm_flush_uses_explicit_list_drain_condition():
     wifi_fw = wifi_fw_policy_source()
 
     flush_body = wifi_fw.split(
-        "proc txl_cfm_flush*() {.exportc, cdecl, noinline.} =",
+        "proc txl_cfm_flush*(ac: uint8; cfmList: ptr CoList;\n"
+        "                    status: uint32) {.exportc, cdecl, noinline.} =",
         1,
     )[1].split(
         "proc txl_cfm_flush_desc*",
         1,
     )[0]
+    flush_desc_body = wifi_fw.split(
+        "proc txl_cfm_flush_desc*(ac: uint8; desc: pointer; status: uint32) {.exportc, cdecl.} =",
+        1,
+    )[1].split(
+        "proc txl_cfm_dump*",
+        1,
+    )[0]
 
     assert "while cfmList.first != nil:" in flush_body
+    assert "let thd = hostTxHeadThd(hostTxHwDescAt(thdChainPtr))" in flush_body
     assert "var flushedHostConfirmCount: uint32 = 0" in flush_body
     assert "flushedHostConfirmCount += 1" in flush_body
     assert "while true:" not in flush_body
+    assert "if thdChainPtr != nil:" not in flush_body
     assert "txl_frame_evt()" in flush_body
     assert "if flushedHostConfirmCount > 0:" in flush_body
     assert "ipc_emb_txcfm_ind(1'u32 shl acIdx)" in flush_body
     assert "var count: uint32 = 0" not in flush_body
     assert "count += 1" not in flush_body
     assert "if count > 0:" not in flush_body
+    assert "let thd = hostTxHeadThd(hostTxHwDescAt(thdChainPtr))" in flush_desc_body
+    assert "if thdChainPtr != nil:" not in flush_desc_body
+    assert "txl_frame_evt()" in flush_desc_body.split("ipc_emb_txcfm_ind", 1)[1]
+    assert 'asm "mv' not in flush_body
+    assert 'asm "mv' not in flush_desc_body
 
 
 def test_wifi_tx_control_ps_check_uses_positive_queueing_guard():
@@ -1432,8 +1502,11 @@ def test_wifi_tx_control_ps_check_uses_positive_queueing_guard():
 
     assert "let psOk = apm_tx_int_ps_check(param)" in push_body
     assert "if psOk:" in push_body
+    assert "let rcStats = hostTxHwDescAt(rcStatsPtr)" in push_body
+    assert "rcStats.controlFlags = rcStats.controlFlags or 0x100" in push_body
     assert "return 1'u8" in push_body
     assert "PS check failed: fall through to the not-ready/postpone path." in push_body
+    assert "if rcStatsPtr != nil:" not in push_body
     assert "if not psOk:" not in push_body
     assert "PS check failed: fall through to not-ready path\n      discard" not in push_body
 
@@ -1595,7 +1668,7 @@ def test_wifi_tx_frame_init_uses_typed_mac_header_address():
     wifi_fw = wifi_fw_policy_source()
 
     frame_init = wifi_fw.split(
-        "proc txl_frame_init*() {.exportc, cdecl.} =",
+        "proc txl_frame_init*(preservePostponed: uint32) {.exportc, cdecl.} =",
         1,
     )[1].split(
         "proc txl_frame_init_desc*", 1
@@ -1630,15 +1703,15 @@ def test_wifi_tx_frame_private_pools_use_typed_slot_tables():
         "HostTxDescView {.packed.} = object", 1
     )[1].split("HostTxHwDescView {.packed.} = object", 1)[0]
     frame_init = wifi_fw.split(
-        "proc txl_frame_init*() {.exportc, cdecl.} =",
+        "proc txl_frame_init*(preservePostponed: uint32) {.exportc, cdecl.} =",
         1,
     )[1].split(
         "proc txl_frame_init_desc*", 1
     )[0]
-    rebuild_body = wifi_fw.split(
-        "proc txl_frame_rebuild_free_list()", 1,
-    )[1].split(
+    free_pop_body = wifi_fw.split(
         "proc txl_frame_free_list_pop", 1,
+    )[1].split(
+        "proc txl_frame_free_list_push", 1,
     )[0]
 
     for expected in [
@@ -1684,14 +1757,13 @@ def test_wifi_tx_frame_private_pools_use_typed_slot_tables():
         assert expected in wifi_fw
 
     for expected in [
-        "for frameDescIndex in 0'u32 ..< TxlFrameDescCount:",
-        "let descPtr = cast[pointer](txlFrameDescAt(frameDescIndex))",
         "for frameDescSlotIndex in 0'u32 ..< TxlFrameDescCount:",
         "let frameDesc = txlFrameDescAt(frameDescSlotIndex)",
         "let link = txlFrameLinkDescAt(frameDescSlotIndex)",
         "let hw = txlFrameHwDescAt(frameDescSlotIndex)",
         "let hwCfm = txlFrameHwCfmAt(frameDescSlotIndex)",
         "let payload = txlFramePayloadDescAt(frameDescSlotIndex)",
+        "if preservePostponed != 0 and frameDesc.postponeFlag != 0:",
         "discard c_memset(cast[pointer](frameDesc), 0, sizeof(TxlFrameDescSlotView).csize_t)",
         "frameDesc.bufDesc = cast[pointer](link)",
         "frameDesc.policy = cast[pointer](payload)",
@@ -1699,7 +1771,7 @@ def test_wifi_tx_frame_private_pools_use_typed_slot_tables():
         "hw.txConfirmDescPtr = cast[uint32](cast[uint](hwCfm))",
         "txl_frame_free_list_push(cast[pointer](frameDesc))",
     ]:
-        assert expected in frame_init + rebuild_body
+        assert expected in frame_init
 
     for forbidden in [
         "let descArrayBase = cast[uint](addr txl_frame_desc_storage[0])",
@@ -1724,9 +1796,10 @@ def test_wifi_tx_frame_private_pools_use_typed_slot_tables():
         "let hw = txlFrameHwDescAt(i)",
         "let hwCfm = txlFrameHwCfmAt(i)",
         "let payload = txlFramePayloadDescAt(i)",
+        "if frameDesc.postponeFlag != 0:",
     ]:
         assert forbidden not in frame_init
-        assert forbidden not in rebuild_body
+        assert forbidden not in free_pop_body
 
     for forbidden in [
         "reserved14*",
@@ -1749,8 +1822,6 @@ def test_wifi_layout_slot_helpers_use_semantic_index_parameters():
         "cast[uint](addr apm_env[0]) + 80'u + apmStaSlotIndex * 16'u",
         "template scanSsidSlot(req: typed, ssidSlotIndex: int): ptr ScanSsidSlotView",
         "ssidSlotIndex.uint * ScanSsidSlotViewSize.uint",
-        "template mmBcnTemplateByte(templateByteOffset: static[int]): untyped",
-        "addr bcnEnvView().templatePtr)[templateByteOffset]",
         "template chanCtxtForIdx(channelContextIndex: uint8): ptr ChanCtxtView",
         "channelContextIndex.uint * sizeof(ChanCtxtView).uint",
         "template vifEntryAddr(vifIndex: uint8): uint",
@@ -1776,7 +1847,7 @@ def test_wifi_layout_slot_helpers_use_semantic_index_parameters():
     for forbidden in [
         "template apmStaSlot(idx: uint): ptr ApmStaSlotOverlay",
         "template scanSsidSlot(req: typed, idx: int): ptr ScanSsidSlotView",
-        "template mmBcnTemplateByte(idx: static[int]): untyped",
+        "mmBcnTemplateByte",
         "template chanCtxtForIdx(idx: uint8): ptr ChanCtxtView",
         "template vifEntryAddr(idx: uint8): uint",
         "template vifChannelForIdx(idx: uint8): ptr VifChannelView",
@@ -1819,8 +1890,8 @@ def test_wifi_tx_payload_debug_and_dump_loops_use_semantic_indexes():
         assert forbidden not in payload_backup_body
 
     for expected in [
-        "for frameDescSlotIndex in 0 ..< 4:",
-        "let descAddr = descStorageBase + frameDescSlotIndex.uint * 220'u",
+        "for frameDescSlotIndex in 0 ..< TxlFrameDescCount.int:",
+        "let descAddr = descStorageBase + frameDescSlotIndex.uint * TxlFrameDescSize",
     ]:
         assert expected in frame_dump_body
 
@@ -1831,11 +1902,26 @@ def test_wifi_tx_payload_debug_and_dump_loops_use_semantic_indexes():
         assert forbidden not in frame_dump_body
 
 
+def test_wifi_lower_tx_preparation_is_private_until_commit():
+    source = wifi_fw_policy_source()
+    prepared = source.split("proc txlPrepareBuffer(", 1)[1].split("proc txl_buffer_alloc*", 1)[0]
+    commit = source.split("proc txlEnqueuePrepared(", 1)[1].split("proc txlPrepareBuffer(", 1)[0]
+    push = source.split("proc txl_cntrl_push*(", 1)[1].split("proc txl_cntrl_push_int*", 1)[0]
+    assert "txBackupQueueHeadPtr" not in prepared
+    assert "txlEnqueuePrepared(" not in prepared
+    assert "nimFwTrace" not in commit and "nimFwConnectTrace" not in commit
+    assert "txl_payload_handle_backup" not in commit
+    assert push.index("txlPrepareBuffer(param") < push.index("txlEnqueuePrepared(param")
+    assert push.index("txlEnqueuePrepared(param") < push.index("co_list_push_back(addr txControlAc")
+    assert push.index("co_list_push_back(addr txControlAc") < push.index("txCtrl.packetCounter =")
+    assert push.index("txCtrl.packetCounter =") < push.index("txl_payload_handle_backup(nil)")
+
+
 def test_wifi_tx_buffer_alloc_uses_typed_mac_header_body_pointer():
     wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
-        "proc txl_buffer_alloc*(param: pointer, queueIdx: uint32, flags: uint32): pointer {.exportc, cdecl.} =",
+        "proc txlPrepareBuffer(param: pointer; queueIdx, flags: uint32): pointer =",
         1,
     )[1].split(
         "proc txl_buffer_update_thd*", 1
@@ -1852,7 +1938,7 @@ def test_wifi_tx_buffer_alloc_copies_policy_with_typed_overlay():
     wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
-        "proc txl_buffer_alloc*(param: pointer, queueIdx: uint32, flags: uint32): pointer {.exportc, cdecl.} =",
+        "proc txlPrepareBuffer(param: pointer; queueIdx, flags: uint32): pointer =",
         1,
     )[1].split(
         "proc txl_buffer_update_thd*", 1
@@ -1881,10 +1967,10 @@ def test_wifi_eapol_retry_policy_uses_typed_rate_template():
     policy_body = wifi_fw.split(
         "proc txlApplyEapolRetryPolicy", 1
     )[1].split(
-        "proc txl_buffer_alloc*", 1
+        "proc txlEnqueuePrepared", 1
     )[0]
     alloc_body = wifi_fw.split(
-        "proc txl_buffer_alloc*(param: pointer, queueIdx: uint32, flags: uint32): pointer {.exportc, cdecl.} =",
+        "proc txlPrepareBuffer(param: pointer; queueIdx, flags: uint32): pointer =",
         1,
     )[1].split(
         "proc txl_buffer_update_thd*", 1
@@ -1893,6 +1979,9 @@ def test_wifi_eapol_retry_policy_uses_typed_rate_template():
     assert "proc txlApplyEapolRetryPolicy(rate: ptr HostTxRateTemplateView)" in wifi_fw
     assert "proc txlApplyBootstrapDataRetryPolicy(rate: ptr HostTxRateTemplateView)" in wifi_fw
     assert "txlApplyEapolRetryPolicy(rate)" in policy_body
+    assert "when defined(bl808WifiBootstrapRetryWorkaround):\n    let isBootstrapData =" in alloc_body
+    assert ("if isEapol:\n    when defined(bl808WifiBootstrapRetryWorkaround):\n"
+            "      txlApplyEapolRetryPolicy(rateTemplate)") in alloc_body
 
     for expected in [
         "retryRateControl0*: uint32",
@@ -1957,7 +2046,7 @@ def test_wifi_eapol_retry_policy_uses_typed_rate_template():
         assert forbidden not in alloc_body
 
 
-def test_wifi_apm_tx_ps_check_uses_typed_sta_overlay():
+def test_wifi_apm_tx_ps_check_uses_descriptor_and_sta_overlays():
     wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
@@ -1970,30 +2059,36 @@ def test_wifi_apm_tx_ps_check_uses_typed_sta_overlay():
         "ApmTxDescPsView {.packed.} = object", 1
     )[1].split("HostTxDescView {.packed.} = object", 1)[0]
 
-    assert "doAssert offsetof(StaInfoView, rateSet) == 32" in wifi_fw
-    assert "descBaseToStaPeerPadding*: array[4, uint8]" in wifi_fw
-    assert "staPeerToStaInstPadding*: array[31, uint8]" in wifi_fw
-    assert "staInstToTidPadding*: array[6, uint8]" in wifi_fw
-    assert "deliveryPolicyToSubtypePadding*: uint8" in wifi_fw
+    assert "descBaseToPbufPadding*: array[4, uint8]" in wifi_fw
+    assert "pbufAddr*: uint32" in tx_ps_layout
+    assert "pbufToEtherTypePadding*: array[24, uint8]" in wifi_fw
+    assert "etherTypeToAcPadding*: array[12, uint8]" in wifi_fw
     assert "postponeFlagsToPendingCountPadding*: array[16, uint8]" in wifi_fw
-    assert "pendingCountToStaDescPadding*: array[38, uint8]" in wifi_fw
-    assert "doAssert offsetof(ApmTxDescPsView, descBaseToStaPeerPadding) == 0" in wifi_fw
-    assert "doAssert offsetof(ApmTxDescPsView, staPeerToStaInstPadding) == 8" in wifi_fw
-    assert "doAssert offsetof(ApmTxDescPsView, staInstToTidPadding) == 40" in wifi_fw
-    assert "doAssert offsetof(ApmTxDescPsView, deliveryPolicyToSubtypePadding) == 48" in wifi_fw
+    assert "pendingCountToLinkDescPadding*: array[38, uint8]" in wifi_fw
+    for field, offset in [
+        ("descBaseToPbufPadding", 0), ("pbufAddr", 4),
+        ("pbufToEtherTypePadding", 8), ("etherType", 32),
+        ("etherTypeToAcPadding", 34), ("accessCategory", 46),
+        ("vifIdx", 47), ("vifType", 48), ("staIdx", 49), ("linkDesc", 108),
+    ]:
+        assert f"doAssert offsetof(ApmTxDescPsView, {field}) == {offset}" in wifi_fw
     assert "doAssert offsetof(ApmTxDescPsView, postponeFlagsToPendingCountPadding) == 52" in wifi_fw
-    assert "doAssert offsetof(ApmTxDescPsView, pendingCountToStaDescPadding) == 70" in wifi_fw
+    assert "doAssert offsetof(ApmTxDescPsView, pendingCountToLinkDescPadding) == 70" in wifi_fw
     assert "let tx = apmTxDescPsAt(txDesc)" in body
-    assert "let staRateInfo = staInfoAt(staPeerPtr).rateSet" in body
-    assert "let linkDesc = hostTxLinkDescAt(staDescPtr)" in body
-    assert "let vifType = vifChannelForIdx(0).vifType" in body
-    assert "let psState = staInfoForIdx(staInstNbr).psMode" in body
+    assert "chan_ctxt_cnt() > 1 and (tx.pbufAddr == 0 or tx.etherType == 0)" in body
+    assert "let link = hostTxLinkDescAt(tx.linkDesc)" in body
+    assert "vifChannelForIdx(tx.vifIdx).vifType != VIF_TYPE_AP" in body
+    assert "let sta = staInfoForIdx(tx.staIdx)" in body
+    assert "sta.psMode != 1 or (sta.psStatus and 3) != 0" in body
 
     for forbidden in [
         "let staPeerU = cast[uint](staPeerPtr)",
         "cast[ptr uint16](staPeerU + 32)",
         "let vifBase = cast[uint](addr vif_info_tab[0])",
         "vifChannelAt(vifBase).vifType",
+        "vifChannelForIdx(0)",
+        "staInfoAt(staPeerPtr)",
+        "ctxtCount <= 1",
     ]:
         assert forbidden not in body
 
@@ -2008,7 +2103,7 @@ def test_wifi_apm_tx_ps_check_uses_typed_sta_overlay():
         assert forbidden not in tx_ps_layout
 
 
-def test_wifi_tx_trigger_yields_under_descriptor_backlog():
+def test_wifi_tx_trigger_drains_until_vendor_exit_condition():
     wifi_fw = wifi_fw_policy_source()
 
     tx_control_env_layout = wifi_fw.split(
@@ -2021,24 +2116,23 @@ def test_wifi_tx_trigger_yields_under_descriptor_backlog():
         "proc txl_current_desc_get*", 1
     )[0]
 
-    assert "WifiTxTriggerDrainLimit = 16'u32" in wifi_fw
     assert "nimfw_dbg_txtrig_yield" in wifi_fw
     assert "nimfw_dbg_txtrig_yield_ac" in wifi_fw
     assert "nimfw_dbg_txtrig_yield_head" in wifi_fw
-    assert "proc txlTriggerPending(acCtrl: ptr TxControlAcView): bool" in wifi_fw
+    assert "proc txlTriggerPending(acCtrl: ptr TxControlAcView): bool" not in wifi_fw
     assert "seqCounterToResetPadding*: array[2, uint8]" in wifi_fw
     assert "resetTailPadding*: array[3, uint8]" in wifi_fw
     assert "doAssert offsetof(TxControlEnvView, seqCounterToResetPadding) == 86" in wifi_fw
     assert "doAssert offsetof(TxControlEnvView, resetTailPadding) == 89" in wifi_fw
     assert "let acReady = txStatus and 0x7C0'u32" in trigger_body
-    assert "let acReadyHigh = txStatus and 0x000F8000'u32" in trigger_body
-    assert "if acReady == 0 and acReadyHigh == 0:" in trigger_body
-    assert "var drained = 0'u32" in trigger_body
-    assert "while drained < WifiTxTriggerDrainLimit:" in trigger_body
-    assert "while true:" not in trigger_body
-    assert "inc drained" in trigger_body
-    assert "if txlTriggerPending(acCtrl):" in trigger_body
-    assert "inc nimFwDbgTxTrigYield" in trigger_body
+    assert "let acReadyHigh = txStatus and 0x000F8000'u32" not in trigger_body
+    assert "if acReady == 0:" in trigger_body
+    assert "var drained = 0'u32" not in trigger_body
+    assert "while drained < WifiTxTriggerDrainLimit:" not in trigger_body
+    assert "while true:" in trigger_body
+    assert "inc drained" not in trigger_body
+    assert "if txlTriggerPending(acCtrl):" not in trigger_body
+    assert "inc nimFwDbgTxTrigYield" not in trigger_body
     assert "reserved86*" not in tx_control_env_layout
     assert "reserved89*" not in tx_control_env_layout
 
@@ -2058,34 +2152,21 @@ def test_wifi_tx_trigger_uses_typed_link_overlay_for_frame_control():
     assert "linkTrace.macHeader[1]" in trigger_body
     assert "linkUTrace + 348" not in trigger_body
     assert "linkUTrace + 349" not in trigger_body
-    assert "nimFwDbgTxTrigYieldAc = ac" in trigger_body
-    assert "nimFwDbgTxTrigYieldHead = pointerAddrU32(cast[pointer](acCtrl.pending.first))" in trigger_body
+    assert "nimFwDbgTxTrigYieldAc = ac" not in trigger_body
+    assert "nimFwDbgTxTrigYieldHead = pointerAddrU32(cast[pointer](acCtrl.pending.first))" not in trigger_body
     assert "proc blmac_abs_timer_set*(timerIndex: uint32, timerValue: uint32)" in wifi_fw
     assert "proc blmac_abs_timer_set*(idx: uint32, value: uint32)" not in wifi_fw
-    assert "let timerAddr = MACHW_INTC_BASE + 0x128'u + timerIndex * 4" in wifi_fw
+    assert "let timerAddr = MACHW_BASE + 0x128'u + timerIndex * 4" in wifi_fw
     assert "regWrite(timerAddr, timerValue)" in wifi_fw
     assert "blmac_abs_timer_set(ac, ipcBase + TX_TIMEOUT_LOCAL[ac])" in trigger_body
-    yield_body = trigger_body.split("if txlTriggerPending(acCtrl):", 1)[1]
-    assert "regWrite(MACHW_TX_TRIG_STAT" not in yield_body
+    assert "regWrite(MACHW_TX_TRIG_STAT" not in trigger_body
 
 
 def test_wifi_machw_tx_queue_regs_use_typed_overlay():
     wifi_fw = wifi_fw_policy_source()
-
-    payload_body = wifi_fw.split(
-        "proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =",
-        1,
-    )[1].split(
-        "proc txlTriggerPending",
-        1,
-    )[0]
-    trigger_body = wifi_fw.split(
-        "proc txl_transmit_trigger*() {.exportc, cdecl.} =",
-        1,
-    )[1].split(
-        "proc txl_current_desc_get*",
-        1,
-    )[0]
+    tx_source = (ROOT / "src/bl808/wifi/fw/tx_layer.nim").read_text()
+    payload_body = nim_procedure(tx_source, "txl_payload_handle_backup")
+    trigger_body = nim_procedure(tx_source, "txl_transmit_trigger")
     tx_queue_layout = wifi_fw.split(
         "MachwTxQueueRegsView {.packed.} = object", 1
     )[1].split("MachwRxDmaRegsView {.packed.} = object", 1)[0]
@@ -2160,7 +2241,7 @@ def test_wifi_tx_buffer_eapol_trace_uses_typed_rate_template_overlay():
     wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
-        "proc txl_buffer_alloc*(param: pointer, queueIdx: uint32, flags: uint32): pointer {.exportc, cdecl.} =",
+        "proc txlPrepareBuffer(param: pointer; queueIdx, flags: uint32): pointer =",
         1,
     )[1].split(
         "proc txl_buffer_update_thd*",
@@ -2184,15 +2265,37 @@ def test_wifi_txl_current_desc_get_uses_typed_hwdesc_overlay():
     wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
-        "proc txl_current_desc_get*(ac: uint8): pointer {.exportc, cdecl.} =",
+        "proc txl_current_desc_get*(ac: uint8, outDesc: ptr pointer) {.exportc, cdecl.} =",
         1,
     )[1].split(
         "proc txl_reset*", 1
     )[0]
 
     assert "doAssert offsetof(HostTxHwDescView, magic) == 4" in wifi_fw
-    assert "return cast[pointer](addr hostTxHwDescAt(txDesc).magic)" in body
+    assert "var currentDesc: pointer = nil" in body
+    assert "if firstElem != nil:" in body
+    assert "currentDesc = cast[pointer](addr hostTxHwDescAt(txDesc).magic)" in body
+    assert "outDesc[] = currentDesc" in body
     assert "return cast[pointer](cast[uint](txDesc) + 4)" not in body
+    assert "if txDesc == nil:" not in body
+    assert "return nil" not in body
+
+
+def test_wifi_rxl_current_desc_get_uses_vendor_output_abi():
+    wifi_fw = wifi_fw_policy_source()
+
+    body = wifi_fw.split(
+        "proc rxl_current_desc_get*(outCurrent: ptr pointer, outLast: ptr pointer) {.exportc, cdecl.} =",
+        1,
+    )[1].split(
+        "proc nim_ccmp_decrypt*", 1
+    )[0]
+
+    assert "outCurrent[] = rxlCntrlEnvView().currentHd" in body
+    assert "outLast[] = rxHwDescEnvView().pdCurrent" in body
+    assert "var outLast {.noinit.}: ptr pointer" not in body
+    assert "asm volatile(\"mv %0, a1\"" not in body
+    assert "return currentDesc" not in body
 
 
 def test_wifi_tx_frame_event_drains_pending_confirmations():
@@ -2212,6 +2315,8 @@ def test_wifi_tx_frame_event_drains_pending_confirmations():
     assert "if txlFrameConfirmPending(frameEnv):" not in frame_body
     assert "inc nimFwDbgFrameEvtYield" not in frame_body
     assert "nimFwDbgFrameEvtYieldHead =" not in frame_body
+    assert "txCtrl.packetCounter = txCtrl.packetCounter - 1" in frame_body
+    assert "if txCtrl.packetCounter > 0:" not in frame_body
     retry_body = frame_body.split("if desc.retryFlag != 0:", 1)[1].split(
         "continue  # re-process", 1
     )[0]
@@ -2259,10 +2364,10 @@ def test_wifi_tx_frame_push_uses_typed_mac_header_overlay():
         "proc txl_frame_push_force*", 1
     )[0]
     force_body = wifi_fw.split(
-        "proc txl_frame_push_force*(param: pointer, ac: uint8) {.exportc, cdecl.} =",
+        "proc txl_frame_try_push_force(param: pointer, ac: uint8): uint8 =",
         1,
     )[1].split(
-        "proc txl_frame_cfm*", 1
+        "proc txl_frame_push_force*", 1
     )[0]
 
     for body in [push_body, force_body]:
@@ -2272,11 +2377,80 @@ def test_wifi_tx_frame_push_uses_typed_mac_header_overlay():
         assert "let thdPtr = thdField" not in body
 
     assert "let typeBits = cast[uint8](hdr.frameControl and 0x000C'u16)" in push_body
+    assert "if typeBits != 4 and (hdr.addr1[0] and 1) == 0:" in push_body
+    assert "hwDesc.ackPolicyControl = 512  # 0x200" in push_body
+    assert "else:\n    hwDesc.ackPolicyControl = 0" in push_body
+    assert "if typeBits == 4 and (hdr.addr1[0] and 1) == 0:" not in push_body
+    assert "elif typeBits == 0 or typeBits == 8:" not in push_body
     assert "cast[ptr uint8](cast[uint](thdPtr))[]" not in push_body
     assert "let thdByte4 =" not in force_body
 
 
-def test_wifi_rx_timer_handler_yields_under_descriptor_backlog():
+def test_wifi_tx_frame_confirm_always_posts_frame_event_like_vendor():
+    wifi_fw = wifi_fw_policy_source()
+
+    cfm_body = wifi_fw.split(
+        "proc txl_frame_cfm*(param: pointer) {.exportc, cdecl.} =",
+        1,
+    )[1].split(
+        "proc txl_frame_release*", 1
+    )[0]
+
+    assert "co_list_push_back(addr frameEnv.usedList, cast[ptr CoListHdr](param))" in cfm_body
+    assert "ke_evt_set(0x00080000'u32)" in cfm_body
+    assert "if txl_frame_desc_valid(param):" not in cfm_body
+    assert "nimFwDbgFrameFreePushInvalid" not in cfm_body
+    assert "nimFwDbgFrameGetInvalidPtr" not in cfm_body
+
+
+def test_wifi_tx_frame_release_returns_internal_descriptors_directly_like_vendor():
+    wifi_fw = wifi_fw_policy_source()
+
+    release_body = wifi_fw.split(
+        "proc txl_frame_release*(param: pointer; doCallback: bool) {.exportc, cdecl.} =",
+        1,
+    )[1].split(
+        "proc txlFrameConfirmPending", 1
+    )[0]
+
+    assert "if param == nil: return" not in release_body
+    assert "if desc.usedFlag == 0:" in release_body
+    assert "let frameEnv = txFrameEnv()" in release_body
+    assert "co_list_push_back(addr frameEnv.freeList, cast[ptr CoListHdr](param))" in release_body
+    assert "txl_frame_free_list_push(param)" not in release_body
+    assert "let frameDoneCallbackPtr = if doCallback: desc.callback else: nil" in release_body
+    assert "if completion.callback != nil:" in release_body
+    assert "txlInvokeFrameCallback(completion.callback, completion.argument, 0," in release_body
+    assert "defer: irqRestore(saved)" in release_body
+    assert release_body.index("irqSave()") < release_body.index("txlCaptureFrameCallback(desc)")
+    assert release_body.index("let frameDoneCallbackPtr =") < release_body.index("co_list_push_back(addr frameEnv.freeList")
+    assert release_body.index("let frameDoneCallbackArg =") < release_body.index("co_list_push_back(addr frameEnv.freeList")
+    assert release_body.index("txlCaptureFrameCallback(desc)") < release_body.index("txlFrameEndLease(desc)")
+
+
+def test_wifi_tx_frame_event_returns_internal_descriptors_directly_like_vendor():
+    wifi_fw = wifi_fw_policy_source()
+
+    evt_body = wifi_fw.split(
+        "proc txl_frame_evt*() {.exportc, cdecl.} =",
+        1,
+    )[1].split(
+        "proc txl_frame_send_null_frame*", 1
+    )[0]
+
+    assert "if desc.usedFlag == 0:" in evt_body
+    assert "co_list_push_back(addr frameEnv.freeList, cast[ptr CoListHdr](node))" in evt_body
+    assert "txl_frame_free_list_push(cast[pointer](node))" not in evt_body
+    assert "txCtrl.packetCounter = txCtrl.packetCounter - 1" in evt_body
+    assert "txlInvokeFrameCallback(callbackPtr, frameCallbackArg, thdStatus," in evt_body
+    assert "scope.previous = txActiveFrameCallback" in wifi_fw
+    assert "defer: txActiveFrameCallback = scope.previous" in wifi_fw
+    assert "if desc.retryFlag != 0:" in evt_body
+    assert "desc.retryFlag = 0" in evt_body
+    assert "continue  # re-process (loop back)" in evt_body
+
+
+def test_wifi_rx_timer_handler_drains_until_vendor_exit_condition():
     wifi_fw = wifi_fw_policy_source()
 
     rx_body = wifi_fw.split(
@@ -2286,21 +2460,24 @@ def test_wifi_rx_timer_handler_yields_under_descriptor_backlog():
         "proc rxl_timeout_int_handler*", 1
     )[0]
 
-    assert "WifiRxTimerDrainLimit = 16'u32" in wifi_fw
     assert "nimfw_dbg_rx_timer_yield" in wifi_fw
     assert "nimfw_dbg_rx_timer_yield_head" in wifi_fw
     assert "proc submittedRxReady(desc: pointer): bool" in wifi_fw
     assert "proc rxlScheduleQueuedRx(env: ptr RxlCntrlEnvView)" in wifi_fw
-    assert "var drained = 0'u32" in rx_body
+    assert "var drained = 0'u32" not in rx_body
     assert "template scheduleQueuedRx()" not in rx_body
-    assert "while drained < WifiRxTimerDrainLimit and submittedRxReady(env.submittedHead):" in rx_body
+    assert "while drained < WifiRxTimerDrainLimit and submittedRxReady(env.submittedHead):" not in rx_body
+    assert "while env.submittedHead != nil:" in rx_body
+    assert "if not submittedRxReady(descPtr):" in rx_body
+    assert "let index = rxHeaderDescIndex(descPtr)" in rx_body
+    assert "var visited = 0'u64" in rx_body
     assert "while true:" not in rx_body
-    assert "if submittedRxReady(env.submittedHead):" in rx_body
-    assert "inc nimFwDbgRxTimerYield" in rx_body
-    assert "nimFwDbgRxTimerYieldHead = pointerAddrU32(env.submittedHead)" in rx_body
+    assert "if submittedRxReady(env.submittedHead):" not in rx_body
+    assert "inc nimFwDbgRxTimerYield" not in rx_body
+    assert "nimFwDbgRxTimerYieldHead = pointerAddrU32(env.submittedHead)" not in rx_body
     assert "rxlScheduleQueuedRx(env)" in rx_body
     assert "regWrite(0x24B0807C'u, 0x000A0000'u32)" in rx_body
-    assert "inc drained" in rx_body
+    assert "inc drained" not in rx_body
 
 
 def test_wifi_rx_control_event_uses_explicit_frame_batch_limit():
@@ -2324,15 +2501,62 @@ def test_wifi_rx_control_event_uses_explicit_frame_batch_limit():
     assert "if loopCount <= 0:" in rx_body
     assert "ke_evt_set(0x00100000'u32)" in rx_body
     assert "let queuedRxMpduDesc = cast[pointer](cntrlEnv.queue.first)" in rx_body
+    assert "    ke_evt_clear(0x00100000'u32)" in rx_body
+    assert rx_body.index(
+        "let queuedRxMpduDesc = cast[pointer](cntrlEnv.queue.first)"
+    ) < rx_body.index("    ke_evt_clear(0x00100000'u32)") < rx_body.index(
+        "if cntrlEnv.processingFlag != 0 or queuedRxMpduDesc == nil:"
+    )
     assert "if cntrlEnv.processingFlag != 0 or queuedRxMpduDesc == nil:" in rx_body
-    assert "let swDesc = rxMpduDescView(queuedRxMpduDesc).swDesc" in rx_body
+    assert "let admission = rxAdmitMpdu(queuedRxMpduDesc, sw)" in rx_body
+    assert "if admission == rxFrameCorrupt:" in rx_body
+    assert "if admission == rxFrameDrop:" in rx_body
+    assert "let swDesc = cast[pointer](sw)" in rx_body
+    assert rx_body.index("let admission = rxAdmitMpdu") < rx_body.index("co_list_pop_front")
+    assert "let hwStaIdx = (hwFlags shr 15) and 0x3FF'u32" in rx_body
+    assert "if (hwStaIdx and 0x3F8'u32) == 0:" in rx_body
+    assert 'assert_rec("rxl_cntrl.c", "rxl_cntrl.c", 495)' in rx_body
+    assert "staIdx = (hwStaIdx - 8).uint8" in rx_body
+    assert "template staConnectionStartWord(sta: ptr StaInfoView): ptr uint32" in wifi_fw
+    assert (
+        "cast[ptr uint32](cast[uint](sta) + offsetof(StaInfoView, connectionStart).uint)"
+        in wifi_fw
+    )
+    assert "staConnectionStartWord(sta)[] =" in rx_body
+    assert "cast[proc(): uint32 {.cdecl.}](blOpsFunc(200))()" in rx_body
+    assert rx_body.index("if sta.valid == 0:") < rx_body.index(
+        "staConnectionStartWord(sta)[] ="
+    ) < rx_body.index("let vifIdx = sta.instNbr")
+    assert "proc mm_check_beacon*(param, vifEntry, staEntry: pointer;" in wifi_fw
+    assert "timIeAddrOut: ptr uint32): uint32" in wifi_fw
+    assert "result = if vif.beaconCrc != prevBcnTime: 1'u32 else: 0'u32" in wifi_fw
+    assert "if pendingCrypto != 0:" in rx_body
+    assert "let pBuf = swDesc" in rx_body
+    assert "let beaconChanged = mm_check_beacon(pBuf, pVif, pSta, pResult)" in rx_body
+    assert "if beaconChanged == 0:" in rx_body
+    assert "dispatchFrame = false" in rx_body
+    assert "elif (frameCtrl and 4) == 0:" in rx_body
+    assert "ps_check_frame(cast[pointer](rxHdrPtr), hwFlags, postVifEntry)" in rx_body
+    assert "rxlHandleApPowerSave(vifChannelForIdx(vifHwIdx), sta, staIdx, rxHdrPtr)" in rx_body
+    assert "var dispatchFrame = true" in rx_body
+    rxu_tail = rx_body.rindex("rxu_cntrl_frame_handle(queuedRxMpduDesc)")
+    assert rx_body.index("let postVif = vifChannelForIdx(sta.instNbr)") < rxu_tail
+    assert rx_body.index("let beaconChanged = mm_check_beacon(pBuf, pVif, pSta, pResult)") < rxu_tail
+    assert rx_body.index("rxlHandleApPowerSave(") < rxu_tail
+    assert rxu_tail < rx_body.index("# L52: Free RX descriptor")
     assert "rxu_cntrl_frame_handle(queuedRxMpduDesc)" in rx_body
-    assert "rxl_mpdu_free(queuedRxMpduDesc)" in rx_body
+    assert "rxReleaseUpload(queuedRxMpduDesc, frameGeneration)" in rx_body
     assert "processingFlagTailPadding*: array[3, uint8]" in rxl_env_layout
     assert "doAssert offsetof(RxlCntrlEnvView, processingFlagTailPadding) == 25" in wifi_fw
     assert "statusTailPadding*: uint16" in wifi_fw
     assert "doAssert offsetof(RxHwDesc, statusTailPadding) == 14" in wifi_fw
     assert "cast[ptr pointer](cast[uint](queuedRxMpduDesc) + 4)" not in rx_body
+    assert "cast[ptr uint32](cast[uint](sta) + 20)" not in rx_body
+    assert "sta.connectionStart =" not in rx_body
+    assert "ps_check_frame(cast[pointer](rxHdrPtr), hwFlags, pVif)" not in rx_body
+    assert "(frameCtrl and 0x1400) == 0x1400" not in rx_body
+    assert "if (maskedFC and 0x8C) == 0x88:\n        let postVif2" not in rx_body
+    assert "(((hwFlags shr 15) and 0x3FF) - 8).uint8" not in rx_body
     assert "curHwDesc" not in rx_body
     assert "reserved25*" not in rxl_env_layout
     assert "padding*: uint16" not in wifi_fw
@@ -2344,8 +2568,8 @@ def test_wifi_scheduler_scan_and_bam_alignment_fields_are_semantic():
     tbtt_layout = wifi_fw.split(
         "ChanTbttNodeView {.packed.} = object", 1
     )[1].split("VifChannelView {.packed.} = object", 1)[0]
-    bam_status_layout = wifi_fw.split(
-        "BamTrafficStatusPayload {.packed.} = object", 1
+    traffic_layout = wifi_fw.split(
+        "MmTrafficReqIndPayload {.packed.} = object", 1
     )[1].split("IpcEmbMsgDescView {.packed.} = object", 1)[0]
     scan_env_layout = wifi_fw.split(
         "ScanEnvObj* {.packed.} = object", 1
@@ -2354,20 +2578,28 @@ def test_wifi_scheduler_scan_and_bam_alignment_fields_are_semantic():
     for expected in [
         "stateTailPadding*: uint8",
         "doAssert offsetof(ChanTbttNodeView, stateTailPadding) == 11",
-        "trafficStatusTailPadding*: array[53, uint8]",
-        "doAssert offsetof(BamTrafficStatusPayload, trafficStatusTailPadding) == 3",
+        "doAssert MmTrafficReqIndPayloadSize == 3'u32",
+        "doAssert offsetof(MmTrafficReqIndPayload, staIdx) == 0",
+        "doAssert offsetof(MmTrafficReqIndPayload, packetCount) == 1",
+        "doAssert offsetof(MmTrafficReqIndPayload, uapsd) == 2",
         "abortFlagDurationPadding*: uint8",
         "doAssert offsetof(ScanEnvObj, abortFlagDurationPadding) == 11",
     ]:
         assert expected in wifi_fw
 
     assert "reserved*: uint8" not in tbtt_layout
-    assert "reserved*: array[53, uint8]" not in bam_status_layout
+    assert "packetCount*: uint8" in traffic_layout
+    assert "uapsd*: uint8" in traffic_layout
+    assert "trafficStatusTailPadding" not in traffic_layout
     assert "reserved*: uint8" not in scan_env_layout
 
 
 def test_wifi_rx_control_event_uses_typed_vif_overlays():
     wifi_fw = wifi_fw_policy_source()
+
+    ap_body = wifi_fw.split("proc rxlHandleApPowerSave", 1)[1].split(
+        "proc rxl_cntrl_evt*", 1
+    )[0]
 
     rx_body = wifi_fw.split(
         "proc rxl_cntrl_evt*() {.exportc, cdecl.} =",
@@ -2379,19 +2611,29 @@ def test_wifi_rx_control_event_uses_typed_vif_overlays():
 
     for expected in [
         "let vif = vifChannelForIdx(vifIdx)",
-        "let vifEntry = cast[pointer](vif)",
-        "apm_tx_int_ps_clear(vifEntry, staIdx)",
-        "discard sta_mgmt_send_postponed_frame(vifEntry,",
         "let postVif = vifChannelForIdx(sta.instNbr)",
         "let postVifEntry = cast[pointer](postVif)",
-        "td_pck_ind(postVif.vifIdx, 1)",
+        "td_pck_ind(postVif.vifIdx, staIdx, 1)",
         "let pVif = postVifEntry",
         "if postVif.chanCtxt != nil:",
         "chan_tbtt_switch_update(pVif, postVif.tbttTimer.expiry)",
-        "let postVif2 = vifChannelForIdx(sta.instNbr)",
-        "postVif2.psBaCounter = postVif2.psBaCounter + 1",
     ]:
         assert expected in rx_body
+
+    for expected in [
+        "if vif.vifType != VIF_TYPE_AP:",
+        "let vifEntry = cast[pointer](vif)",
+        "apm_tx_int_ps_clear(vifEntry, staIdx)",
+        "vif.psBaCounter = vif.psBaCounter - 1",
+        "let countVif = vifChannelForIdx(vif.vifIdx)",
+        "countVif.psBaCounter = countVif.psBaCounter + 1",
+        "let ac = mac_tid2ac[tid]",
+        "mac_ac2uapsd[ac] and sta.psState",
+        "let sent = sta_mgmt_send_postponed_frame(vifEntry, staEntry, packetBudget.uint32)",
+        "sent >= packetBudget.uint32",
+        "tid.uint16 or 0x10'u16",
+    ]:
+        assert expected in ap_body
 
     for forbidden in [
         "let vifBase = cast[uint](addr vif_info_tab[0])",
@@ -2415,16 +2657,28 @@ def test_wifi_rx_mpdu_free_uses_explicit_descriptor_chain_condition():
         1,
     )[0]
 
-    assert "var dmaProgressDesc = rxDmaProgressDescAt(sw.bufferChain)" in free_body
-    assert "var previousDmaProgressDesc: ptr RxDmaProgressDescView = nil" in free_body
-    assert "while dmaProgressDesc != nil:" in free_body
+    assert "var payload = rxDmaProgressDescAt(bufferChain)" in free_body
+    assert "let savedStatus = enterFn()" in free_body
+    assert "let count = rxPayloadChainBounds(bufferChain, previous, last)" in free_body
+    assert "for _ in 0 ..< count.int:" in free_body
     assert "while true:" not in free_body
-    assert "let dmaDescriptorStatus = dmaProgressDesc.status" in free_body
-    assert "dmaProgressDesc.usedFlag = 0" in free_body
-    assert "rx.curDesc = cast[pointer](dmaProgressDesc)" in free_body
-    assert "rx.prevDesc = cast[pointer](previousDmaProgressDesc)" in free_body
-    assert "dmaProgressDesc = rxDmaProgressDescAt(dmaProgressDesc.next)" in free_body
+    assert "payload.usedFlag = 0" in free_body
+    assert "rx.curDesc = last" in free_body
+    assert "rx.prevDesc = previous" in free_body
+    assert "leaveFn(savedStatus)" in free_body
+    assert "rxUploadCurrent(desc, generation)" in free_body
+    assert "rxMpduHeader(desc) == sw" in free_body
+    assert "payload = rxDmaProgressDescAt(payload.next)" in free_body
     assert 'assert_rec("rxl_hwdesc.c", "rxl_hwdesc.c", 872)' in free_body
+    assert "RxlHwdescCallbackEnvView" not in free_body
+    assert "rxl_hwdesc_env" not in free_body
+    assert "if getStatusFn != nil:" not in free_body
+    assert "if cleanFn != nil:" not in free_body
+    assert "corruptChain = true" in free_body
+    assert free_body.index("let leaveFn =") < free_body.index("let savedStatus = enterFn()")
+    assert free_body.index("finally:\n    leaveFn(savedStatus)") < free_body.index(
+        "if corruptChain and current():"
+    ) < free_body.rindex("assert_rec(")
     for forbidden in [
         "curHw",
         "prevHw",
@@ -2433,11 +2687,45 @@ def test_wifi_rx_mpdu_free_uses_explicit_descriptor_chain_condition():
         assert forbidden not in free_body
 
 
-def test_wifi_rxl_reset_uses_rxu_upload_list_overlay():
+def test_wifi_rx_mpdu_transfer_uses_vendor_required_descriptor_path():
+    wifi_fw = wifi_fw_policy_source()
+
+    transfer_body = wifi_fw.split(
+        "proc rxTransferFrame(desc: pointer): bool =",
+        1,
+    )[1].split(
+        "proc rxl_mpdu_transfer*",
+        1,
+    )[0]
+
+    for expected in [
+        "let rx = rxMpduDescView(desc)",
+        "let sw = rxMpduHeader(desc)",
+        "phy_get_channel_raw(addr channel[0], 0)",
+        "if not rxFrameCurrent(identity): return false",
+        "copyMem(addr sw.channelInfo[0], addr channel[0], sizeof(channel))",
+        "rx.descCount = 0",
+        "var count = rxPayloadChainBounds(sw.bufferChain, previous, last)",
+        "rx.descCount = count - 1",
+        "rx.prevDesc = previous",
+        "rx.curDesc = last",
+        'assert_rec("rxl_cntrl.c", "rxl_cntrl.c", 160)',
+    ]:
+        assert expected in transfer_body
+    for forbidden in [
+        "if desc == nil: return",
+        "if swDescPtr == nil: return",
+        "rxl_mpdu_free(desc)",
+        "tail-call rxl_mpdu_free",
+    ]:
+        assert forbidden not in transfer_body
+
+
+def test_wifi_rxl_reset_uses_rxu_cntrl_upload_list_overlay():
     wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
-        "proc rxl_reset*() {.exportc, cdecl.} =",
+        "proc rxl_reset*(): bool {.exportc, cdecl, discardable.} =",
         1,
     )[1].split(
         "proc rxl_hwdesc_dump*",
@@ -2467,6 +2755,7 @@ def test_wifi_rxl_reset_uses_rxu_upload_list_overlay():
     ]:
         assert forbidden not in rxu_env_block
     assert "co_list_init(addr rxuCntrlEnvView().uploadList)" in body
+    assert "if not rxl_hwdesc_init(0): return false" in body
     assert "rxu_cntrl_env + 0x40" not in body
     assert "{.emit:" not in body
 
@@ -2516,7 +2805,7 @@ def test_wifi_smoke_dumps_auth_tx_raw_frame_snapshot():
     smoke = (ROOT / "examples/m0_wifi_lwip_smoke.nim").read_text()
 
     body = wifi_fw.split(
-        "proc sm_auth_send*(authSeqNum: uint16, statusCode: uint32) {.exportc, cdecl.} =",
+        "proc sm_auth_send*(authSeqNum: uint16, challenge: pointer) {.exportc, cdecl.} =",
         1,
     )[1].split(
         "proc sm_auth_send_pre*",
@@ -2540,7 +2829,7 @@ def test_wifi_smoke_dumps_auth_tx_raw_frame_snapshot():
     assert "kvWrite(\"auth_tx28\", loadLe32(nimfw_dbg_auth_tx_raw, 28))" in smoke
 
 
-def test_wifi_rate_retry_scan_uses_typed_rate_reset_overlay():
+def test_wifi_rate_retry_scan_uses_typed_rate_and_step_overlays():
     wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
@@ -2550,36 +2839,27 @@ def test_wifi_rate_retry_scan_uses_typed_rate_reset_overlay():
         "proc rc_update_stats*",
         1,
     )[0]
-    max_prob_body = body.split(
-        "# Step 4: Build retry chain entry 3 (max_prob) by walking rate table",
-        1,
-    )[1].split("# Store final retry chain results", 1)[0]
-
-    assert "template rcRateResetFields(stats: pointer, rateEntryIndex: uint16): ptr RcRateResetFieldsView" in wifi_fw
-    assert "rcRateResetFields(stats, scanIdx.uint16).initialized = 0" in body
     for expected in [
-        "for rateEntryIndex in 0 ..< nRates.int:",
-        "let entryProb = rcRateEntryProb(stats, rateEntryIndex)",
-        "let entryTp = rcRateEntryTp(stats, rateEntryIndex)",
-        "let entryRetry = rcRateEntryRetry(stats, rateEntryIndex)",
-        "if rateEntryIndex.uint16 == maxTpIdx:",
-        "let entryRateU16 = rcRateConfig(stats, rateEntryIndex)",
-        "bestProbIdx = rateEntryIndex.uint16",
+        "let tp = rcThroughputArray(param)",
+        "tp[nRates - 1] >= tp[0]",
+        "rateStats.rateAllowed = 0",
+        "rcRateStats(stats, bestIdx).rateAllowed = 1",
+        "for rateEntryIndex in 0 ..< secondIdx:",
+        "let probability = rateStats.probability",
+        "probability > 0xF332'u16",
+        "rcRetryStep(stats, 2).throughput = tp[bestProbIdx]",
+        "rcRetryStep(stats, 3).rateIdx = 0",
     ]:
-        assert expected in max_prob_body
+        assert expected in body
     for forbidden in [
-        "for i in 0 ..< nRates.int:",
-        "rcRateEntryProb(stats, i)",
-        "rcRateEntryTp(stats, i)",
-        "rcRateEntryRetry(stats, i)",
-        "if i.uint16 == maxTpIdx:",
-        "rcRateConfig(stats, i)",
-        "bestProbIdx = i.uint16",
-        "template rcRateResetFields(stats: pointer, idx: uint16): ptr RcRateResetFieldsView",
+        "rcRetryChainParamOrZero",
+        "RcRetryChainParamPayload",
+        "rcRateEntryProb",
+        "rcRateEntryTp",
+        "rcRateEntryRetry",
+        "RcRateResetFieldsView",
     ]:
-        assert forbidden not in max_prob_body
         assert forbidden not in wifi_fw
-    assert "scanEntryBase + 15" not in body
 
 
 def test_wifi_rx_hwdesc_init_uses_typed_descriptor_overlays():
@@ -2592,7 +2872,7 @@ def test_wifi_rx_hwdesc_init_uses_typed_descriptor_overlays():
         "proc rxl_hwdesc_init*", 1
     )[0]
     init_body = wifi_fw.split(
-        "proc rxl_hwdesc_init*(resetAll: uint32) {.exportc, cdecl.} =",
+        "proc rxInitializeHwDescriptors(resetAll: uint32): bool =",
         1,
     )[1].split(
         "proc rxl_init*", 1
@@ -2634,6 +2914,8 @@ def test_wifi_rx_hwdesc_init_uses_typed_descriptor_overlays():
         "proc machwRxHwPdHead(): uint32",
         "proc machwRxSetHdSubmittedHead(value: uint32)",
         "proc machwRxSetPdSubmittedHead(value: uint32)",
+        "let enterFn = cast[proc(): uint32 {.cdecl.}](blOpsFunc(20))",
+        "let leaveFn = cast[proc(level: uint32) {.cdecl.}](blOpsFunc(24))",
         "RxHeaderHwDescView {.packed.} = object",
         "rxHeaderTailPadding*: array[28, uint8]",
         "RxSwTableDescView {.packed.} = object",
@@ -2664,6 +2946,12 @@ def test_wifi_rx_hwdesc_init_uses_typed_descriptor_overlays():
         "template rxPayloadBufferAt(rxDescRingIndex: int): ptr RxPayloadBufferView",
     ]:
         assert expected in wifi_fw
+    assert "RxlHwdescCallbackEnvView" not in init_body
+    assert "rxl_hwdesc_env" not in init_body
+    assert "let allocFnPtr = blOpsFunc(20)" not in init_body
+    assert "if allocFnPtr == nil:" not in init_body
+    assert "let freeFnPtr = blOpsFunc(24)" not in init_body
+    assert "if freeFnPtr != nil:" not in init_body
     for forbidden in [
         "reserved000*",
         "reserved184*",
@@ -2696,7 +2984,7 @@ def test_wifi_rx_hwdesc_init_uses_typed_descriptor_overlays():
         "let payloadBuffer = rxPayloadBufferAt(payloadDescIndex)",
         "pd.magic = C0DEDBAD",
         "rxPayloadHwDescAt(payloadDescIndex + 1)",
-        "pd.status = 0",
+        "rxDmaProgressDescAt(cast[pointer](pd)).status = 0",
         "pd.bufferAddr = cast[uint32](addr payloadBuffer.payloadBytes[0])",
         "pd.bufferEnd = cast[uint32](addr payloadBuffer.payloadBytes[1735])",
         "pd.bufferStart = cast[uint32](addr payloadBuffer.payloadBytes[0])",
@@ -2712,18 +3000,52 @@ def test_wifi_rx_hwdesc_init_uses_typed_descriptor_overlays():
             "hd.next = nil",
             "hd.bufferAddr = 0",
             "hd.flags = 0",
-            "hd.tsfLow = 0",
+            "cast[ptr uint16](addr hd.tsfLow)[] = 0'u16",
             "rxHeaderHwDescView(lastPtr).next = appendDesc",
             "let hwHead = machwRxHwHdHead()",
-            "machwRxDmaTrigger(0x10000000'u32)",
+            "machwRxDmaTrigger(0x01000000'u32)",
     ]:
         assert expected in append_body
 
+    for forbidden in [
+        "hd.tsfLow = 0",
+        "if lastPtr != nil:",
+    ]:
+        assert forbidden not in append_body
+
     for expected in [
         "let hwPdHead = machwRxHwPdHead()",
-        "machwRxDmaTrigger(0x20000000'u32)",
+        "let currentDesc = env.pdCurrent",
+        "var submittedHead = swdesc",
+        "var statusDesc = pddesc",
+        "var submittedTail = pddesc",
+        "if cast[uint32](currentDesc) == hwPdHead:",
+        "if prevDesc == nil:",
+        "submittedHead = pddesc",
+        "env.pdCurrent = pddesc",
+        "statusDesc = currentDesc",
+        "submittedHead = currentDesc",
+        "rxDmaProgressDescAt(currentDesc).next = swdesc",
+        "submittedTail = prevDesc",
+        "submittedTail = currentDesc",
+        "rxDmaProgressDescAt(statusDesc).status = 0",
+        "rxDmaProgressDescAt(submittedTail).next = nil",
+        "rxDmaProgressDescAt(env.pdTail).next = submittedHead",
+        "machwRxDmaTrigger(0x02000000'u32)",
+        "env.pdTail = submittedTail",
     ]:
         assert expected in pd_append_body
+
+    for forbidden in [
+        "let pd = rxDmaProgressDescAt(pddesc)",
+        "let envTail = cast[uint32](env.pdCurrent)",
+        "rxFrameBufferChainAt(swdesc).next = pddesc",
+        "pd.status = 0",
+        "pd.next = nil",
+        "if oldLast != nil:",
+        "env.pdTail = pddesc",
+    ]:
+        assert forbidden not in pd_append_body
 
     for forbidden in [
         "cast[ptr pointer](swBase + i * 24'u + 4'u)",
@@ -2777,27 +3099,41 @@ def test_wifi_rx_hwdesc_init_uses_typed_descriptor_overlays():
 
 def test_wifi_rxl_hwdesc_dump_uses_typed_overlays():
     wifi_fw = wifi_fw_policy_source()
-    dump_body = wifi_fw.split("proc rxl_hwdesc_dump*", 1)[1].split(
+    dump_body = wifi_fw.split("proc rxl_hwdesc_dump*() {.exportc, cdecl, noinline.} =", 1)[1].split(
         "proc rxl_hd_append*", 1
     )[0]
 
     for expected in [
         "for headerDescDumpIndex in 0'u32 ..< 41:",
-        "let hd = rxHeaderHwDescAt(headerDescDumpIndex.int)",
-        "headerDescDumpIndex, cast[pointer](hd)",
+        "let hd = rxHeaderDumpView(rxHeaderHwDescAt(headerDescDumpIndex.int))",
+        "headerDescDumpIndex.cint, cast[uint](hd).culong",
         "hd.magic",
-        "pointerAddrU32(hd.next)",
-        "hd.tsfLow",
+        "cast[uint](hd.next).culong",
+        "hd.frameLength.cuint",
+        "hd.ampduStatus.cuint",
+        "hd.timestampLow.culong",
         "hd.rxVector1c",
         "for payloadDescDumpIndex in 0'u32 ..< 41:",
         "let pd = rxPayloadHwDescAt(payloadDescDumpIndex.int)",
-        "payloadDescDumpIndex, cast[pointer](pd)",
-        "pd.bufferEnd + 1 - pd.bufferStart",
-        "pointerAddrU32(pd.next)",
+        "payloadDescDumpIndex.cint, cast[uint](pd).culong",
+        "pd.bufferEnd + 1'u32 - pd.bufferAddr",
+        "cast[uint](pd.next).culong",
+        "if entered: leaveFn(level)",
     ]:
         assert expected in dump_body
 
+    for expected in [
+        "doAssert sizeof(RxHeaderDumpView) == 100",
+        "doAssert offsetof(RxHeaderDumpView, frameLength) == 28",
+        "doAssert offsetof(RxHeaderDumpView, ampduStatus) == 30",
+        "doAssert offsetof(RxHeaderDumpView, timestampLow) == 32",
+        "doAssert offsetof(RxHeaderDumpView, rxVector1b) == 44",
+    ]:
+        assert expected in wifi_fw
+
     for forbidden in [
+        "snapResult",
+        "pd.bufferStart",
         "let hdBase = cast[uint](addr rx_dma_hdrdesc[0])",
         "let hdAddr = hdBase + i * 100",
         "let pdAddr = hdBase + 41'u * 100 + i * 52",
@@ -2855,7 +3191,7 @@ def test_wifi_channel_tbtt_conflict_uses_semantic_clear_countdown_name():
     assert "cnt - 1" not in body
 
 
-def test_wifi_chan_get_next_uses_typed_vif_overlay_for_roc_lookup():
+def test_wifi_chan_get_next_uses_typed_vif_overlay_for_tbtt_lookup():
     wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
@@ -2865,10 +3201,10 @@ def test_wifi_chan_get_next_uses_typed_vif_overlay_for_roc_lookup():
         "proc chan_switch_start*", 1
     )[0]
 
-    assert "let rocNode = chanTbttNodeAt(rocChan)" in body
-    assert "if rocNode.state == 2:" in body
-    assert "let rocDeadline = rocNode.targetTime" in body
-    assert "best = vifChannelForIdx(rocNode.vifIdx).chanCtxt" in body
+    assert "let tbttNode = chanTbttNodeAt(tbttEntry)" in body
+    assert "if tbttNode.state == 2:" in body
+    assert "let tbttDeadline = tbttNode.targetTime" in body
+    assert "best = vifChannelForIdx(tbttNode.vifIdx).chanCtxt" in body
     assert "for channelContextPoolIndex in 0'u8 .. 2'u8:" in body
     assert "let cand = chanCtxtForIdx(channelContextPoolIndex)" in body
     assert "if cand.status != 0:" in body
@@ -2968,7 +3304,7 @@ def test_wifi_channel_scan_roc_slots_use_typed_context_pool_helpers():
     wifi_fw = wifi_fw_policy_source()
 
     pre_body = wifi_fw.split(
-        "proc chan_pre_switch_channel*(ctxt: pointer) {.exportc, cdecl.} =",
+        "proc chan_pre_switch_channel*() {.exportc, cdecl.} =",
         1,
     )[1].split(
         "proc chan_conn_less_delay_evt*",
@@ -3048,13 +3384,12 @@ def test_wifi_ipc_message_payload_copy_uses_typed_word_overlay():
         "IpcEmbMsgEnvelopeView {.packed.} = object",
         "desc*: IpcEmbMsgDescView",
         "payload*: UncheckedArray[uint8]",
-        "IpcPayloadWordStreamView {.packed.} = object",
-        "payloadWords*: UncheckedArray[uint32]",
+        "IpcPayloadWordStreamView = UncheckedArray[uint32]",
         "doAssert offsetof(IpcEmbMsgEnvelopeView, desc) == 0",
         "doAssert offsetof(IpcEmbMsgEnvelopeView, payload) == 8",
         "template ipcPayloadWordStreamAt(payload: pointer): ptr IpcPayloadWordStreamView",
         "proc copyIpcPayloadWords(destPayload: pointer; sourcePayload: pointer; byteLen: uint32)",
-        "destWords.payloadWords[payloadWordIndex] = sourceWords.payloadWords[payloadWordIndex]",
+        "destWords[payloadWordIndex] = sourceWords[payloadWordIndex]",
     ]:
         assert expected in wifi_fw
 
@@ -3119,7 +3454,7 @@ def test_wifi_saved_messages_reschedule_in_bounded_batches():
     payload_body = wifi_fw.split("template keMsgPayload*", 1)[1].split(
         "template keMsgExternalPayload*", 1
     )[0]
-    resched_body = wifi_fw.split("proc ke_reschedule_saved_messages", 1)[1].split(
+    resched_body = wifi_fw.split("proc keDrainSavedMessages", 1)[1].split(
         "proc ke_task_local*", 1
     )[0]
     state_body = wifi_fw.split("proc ke_state_set*", 1)[1].split(
@@ -3146,9 +3481,10 @@ def test_wifi_saved_messages_reschedule_in_bounded_batches():
     assert "cast[uint](param) - KeMsgHdrSize" not in hdr_body
     assert "cast[uint](hdr) + KeMsgHdrSize" not in payload_body
     assert "keSavedReschedTask* {.wifiCtrl.}: uint8 = TASK_NONE" in wifi_fw
+    assert "keSavedReschedMask* {.wifiCtrl.}: uint16" in wifi_fw
     assert "nimfw_dbg_saved_msg_yield" in wifi_fw
     assert "nimfw_dbg_saved_msg_yield_task" in wifi_fw
-    assert "proc ke_saved_queue_has_dest" in wifi_fw
+    assert "proc ke_saved_queue_count_dest" in wifi_fw
     assert "KeMsgHandlerEntry* {.packed.} = object" in wifi_fw
     assert "handlerCountTailPadding*: uint16" in wifi_fw
     assert "doAssert offsetof(KeMsgHandlerDesc, handlerCountTailPadding) == 6" in wifi_fw
@@ -3167,8 +3503,8 @@ def test_wifi_saved_messages_reschedule_in_bounded_batches():
     assert "keMsgHandlerEntryAt(table: pointer, idx: uint16)" not in wifi_fw
     assert "cast[uint](desc.stateTable)" not in schedule_body
     assert "padding*: uint16        # offset 6" not in wifi_fw
-    assert "while moved < limit:" in resched_body
-    assert "keSavedReschedTask = taskId" in resched_body
+    assert "while moved < limit and keSavedReschedRemaining[taskId] != 0:" in resched_body
+    assert "keUpdateSavedReschedule(taskId, result)" in resched_body
     assert "inc nimFwDbgSavedMsgYield" in resched_body
     assert "nimFwDbgSavedMsgYieldTask = taskId.uint32" in resched_body
     assert "ke_evt_set(KE_EVT_KE_MESSAGE)" in resched_body
@@ -3231,7 +3567,7 @@ def test_wifi_task_handlers_use_named_ke_message_statuses():
     )
     scanu_start = body(
         "proc scanu_start_req_handler*",
-        "{.emit: \"__attribute__((optimize(\\\"crossjumping\\\"))) void scanu_start_cfm_handler",
+        "proc scanu_start_cfm_handler*",
     )
     sm_connect = body(
         "proc sm_connect_req_handler*",
@@ -3254,8 +3590,8 @@ def test_wifi_task_handlers_use_named_ke_message_statuses():
     assert "return KeMsgConsumed" in mm_hw
     assert "return KeMsgSaved" in mm_set_idle
     assert "return KeMsgConsumed" in mm_set_idle
-    assert "let connIdx = meEnvView().psMode" in mm_set_idle_cfm
-    assert "let marker = meEnvView().psMode" in mm_set_ps_mode_cfm
+    assert "meCompleteControl(param, MM_SET_IDLE_CFM)" in mm_set_idle_cfm
+    assert "meCompleteControl(param, MM_SET_PS_MODE_CFM)" in mm_set_ps_mode_cfm
     assert "return KeMsgSaved" in mm_force_idle
     assert "return KeMsgConsumed" in mm_force_idle
 
@@ -3302,16 +3638,12 @@ def test_wifi_connect_info_channel_hint_uses_typed_frequency_helper():
     channel_context_layout = wifi_fw.split(
         "ConnectInfoChannelContextOverlay {.packed.} = object", 1
     )[1].split("ApmStartInfoView {.packed.} = object", 1)[0]
-    bss_body = wifi_fw.rsplit(
-        "proc sm_get_bss_params*", 1
-    )[1].split(
-        "proc sm_scan_bss*", 1
-    )[0]
-    connect_body = wifi_fw.split(
-        "proc sm_connect_req_handler*", 1
-    )[1].split(
-        "proc sm_disconnect_req_handler*", 1
-    )[0]
+    bss_body = nim_procedure(
+        (ROOT / "src/bl808/wifi/fw/scan_station_ap_me.nim").read_text(), "sm_get_bss_params"
+    )
+    connect_body = nim_procedure(
+        (ROOT / "src/bl808/wifi/fw/task_handlers.nim").read_text(), "sm_connect_req_handler"
+    )
 
     for expected in [
         "proc connectInfoChannelFrequency(ci: ptr ConnectInfoView): uint16",
@@ -3325,8 +3657,13 @@ def test_wifi_connect_info_channel_hint_uses_typed_frequency_helper():
     ]:
         assert expected in wifi_fw
 
-    assert bss_body.count("connectInfoHasChannelHint(ci)") == 3
-    assert "if connectInfoHasChannelHint(req):" in connect_body
+    assert (
+        "let hintedFreq = if connectInfoHasChannelHint(ci): connectInfoChannelFrequency(ci)"
+    ) in " ".join(bss_body.split())
+    assert (
+        "if selectedBssChannel == nil: if connectInfoHasChannelHint(ci):"
+    ) in " ".join(bss_body.split())
+    assert "if connectInfoHasChannelHint(req) and smConnectReqHasSpecificBssid(req):" in connect_body
 
     for forbidden in [
         "let freqHint = connectInfoChannelFrequency(ci)",
@@ -3347,17 +3684,10 @@ def test_wifi_connect_info_channel_hint_uses_typed_frequency_helper():
 
 def test_wifi_bss_params_falls_back_to_typed_directed_scan_result():
     wifi_fw = wifi_fw_policy_source()
+    scan_source = (ROOT / "src/bl808/wifi/fw/scan_station_ap_me.nim").read_text()
 
-    helper_body = wifi_fw.split(
-        "proc bestDirectedScanuResult(searchData: pointer; searchLen: uint8)", 1
-    )[1].split(
-        "# ###########################################################################", 1
-    )[0]
-    bss_body = wifi_fw.rsplit(
-        "proc sm_get_bss_params*", 1
-    )[1].split(
-        "proc sm_scan_bss*", 1
-    )[0]
+    helper_body = nim_procedure(scan_source, "bestDirectedScanuResult")
+    bss_body = nim_procedure(scan_source, "sm_get_bss_params")
 
     for expected in [
         "proc bestDirectedScanuResult(searchData: pointer; searchLen: uint8)",
@@ -3371,12 +3701,16 @@ def test_wifi_bss_params_falls_back_to_typed_directed_scan_result():
         "selectedBssResultOut[] = nil",
         "selectedBssChannelOut[] = nil",
         "let scanResultChannel = scanResultChannelPtr(bssidResultEntry)",
-        "selectedBssChannelOut[] = scanResultChannel",
+        "selectedBssChannel = scanResultChannel",
         "let ssidResultChannel = scanResultChannelPtr(ssidResultEntry)",
-        "selectedBssChannelOut[] = ssidResultChannel",
-        "let directed = bestDirectedScanuResult(cast[pointer](addr searchSlot.ssidBytes[0]),",
-        "selectedBssResultOut[] = cast[pointer](directed)",
-        "selectedBssChannelOut[] = scanResultChannelPtr(directed)",
+        "selectedBssChannel = ssidResultChannel",
+        "bestDirectedScanuResult(cast[pointer](addr searchSlot.ssidBytes[0]),",
+        "selectedBssResult = cast[pointer](directed)",
+        "selectedBssChannel = scanResultChannelPtr(directed)",
+        "let owner = smTxCapture(sm.connectInfo)",
+        "scanuResultCurrent(selectedEntrySnapshot)",
+        "selectedBssResultOut[] = selectedBssResult",
+        "selectedBssChannelOut[] = selectedBssChannel",
     ]:
         assert expected in wifi_fw
 
@@ -3390,17 +3724,20 @@ def test_wifi_bss_params_falls_back_to_typed_directed_scan_result():
         "let chanPtr = scanuResultAt(ssidResult).chanPtr",
     ]:
         assert forbidden not in bss_body
-    assert bss_body.index(
-        "let directed = bestDirectedScanuResult(cast[pointer](addr searchSlot.ssidBytes[0]),"
-    ) < \
-        bss_body.index("elif connectInfoHasChannelHint(ci):")
+    assert "let directed = if hintedFreq == 0'u16:" in " ".join(bss_body.split())
+    assert bss_body.index("bestDirectedScanuResult(") < \
+        bss_body.index("if directed == nil and connectInfoHasChannelHint(ci):")
+    assert bss_body.index("scanuCaptureResult(ssidResultEntry)") < \
+        bss_body.index('logFn("result ssid index = %d')
+    assert bss_body.index("scanuCaptureResult(directed)") < \
+        bss_body.index('"[WIFI-CT] bss_directed "')
 
 
 def test_wifi_sta_join_channel_context_uses_typed_center_frequency_helpers():
     wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
-        "proc sm_add_chan_ctx*", 1
+        "proc smPrepareChannelContext", 1
     )[1].split(
         "proc sm_send_next_bss_param*", 1
     )[0]
@@ -3411,6 +3748,7 @@ def test_wifi_sta_join_channel_context_uses_typed_center_frequency_helpers():
         "proc vifChannelCenterFreq2(vif: ptr VifChannelView): uint16",
         "chanReq.centerFreq1 = vifChannelCenterFreq1(vif, chan.prim20Freq)",
         "chanReq.centerFreq2 = vifChannelCenterFreq2(vif)",
+        "chanReq.chanType = vifBssStatus(vif).phyBandwidth",
     ]:
         assert expected in wifi_fw
 
@@ -3538,12 +3876,12 @@ def test_wifi_channel_context_scheduler_uses_semantic_scan_credit_slot_name():
     wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
-        "proc chan_ctxt_op_evt*() {.exportc, cdecl.} =",
+        "proc chan_ctxt_op_evt*(ctxtPtr: pointer) {.exportc, cdecl.} =",
         1,
     )[1].split("proc chan_get_next_tbtt", 1)[0]
 
-    assert "let scanCreditSlotDuration = env.ctxtCount.uint16 * 50" in body
-    assert "ctxt.schedSlot = scanCreditSlotDuration" in body
+    assert "hasLongListenInterval" in body
+    assert "ctxt.schedSlot = env.ctxtCount.uint16 * 50" in body
     assert "let slot = env.ctxtCount.uint16 * 50" not in body
     assert "ctxt.schedSlot = slot\n" not in body
 
@@ -3824,6 +4162,9 @@ def test_wifi_list_and_postpone_helpers_use_explicit_loop_conditions():
     )[1].split(
         "proc sta_mgmt_add_key*", 1
     )[0]
+    sta_retire_body = wifi_fw.split(
+        "proc staMgmtBeginRemoval(staIdx: uint8; owner: var StaQueueIdentity): pointer =", 1
+    )[1].split("proc sta_mgmt_unregister*", 1)[0]
     sta_add_key_body = wifi_fw.split(
         "proc sta_mgmt_add_key*(param: pointer, hwKeyIdx: uint8) {.exportc, cdecl.} =",
         1,
@@ -3859,26 +4200,30 @@ def test_wifi_list_and_postpone_helpers_use_explicit_loop_conditions():
     assert "doAssert offsetof(StaMgmtRegisterParamView, extFlagToAssocInfoPadding) == 15" in wifi_fw
     assert "var staIdx = 0'u8" in sta_register_body
     assert "while staIdx < STA_MGMT_FREE_STAS.uint8 and staInfoForIdx(staIdx) != sta:" in sta_register_body
-    assert "var postponedDescTimerAddr = staEntry + 338" in sta_register_body
-    assert "for postponedDescSlotIndex in 0 ..< 9:" in sta_register_body
-    assert "cast[ptr uint16](postponedDescTimerAddr)[] = 0xFFFF'u16" in sta_register_body
-    assert "postponedDescTimerAddr += 4" in sta_register_body
+    assert "let rxSeq = staRxSequence(sta)" in sta_register_body
+    assert "rxSeq.nonQosSeqCtrl = 0xFFFF'u16" in sta_register_body
+    assert "for seqCtrl in rxSeq.qosSeqCtrl.mitems:" in sta_register_body
+    assert "seqCtrl = 0xFFFF'u16" in sta_register_body
     assert "sta.txPolicy = cast[pointer](txBufferControlDescAt(staIdx.int))" in sta_register_body
     assert "sta.keyMat = cast[pointer](addr sta.keyHolder)" in sta_register_body
     assert "co_list_push_back(vifPostponedStaList(vif), cast[ptr CoListHdr](staEntry))" in sta_register_body
 
-    assert "let vif = vifChannelForIdx(instNbr)" in sta_unregister_body
-    assert "co_list_extract(vifPostponedStaList(vif), cast[ptr CoListHdr](sta))" in sta_unregister_body
-    assert "of 1, 2:" in sta_add_key_body
-    assert "let temporalKeySrcU = cast[uint](machwKeyWriteKeyTailPtr(req))" in sta_add_key_body
-    assert "let temporalKeyDstU = cast[uint](addr sta.keyTail[0])" in sta_add_key_body
-    assert "for temporalKeyWordIndex in 0 ..< 4:" in sta_add_key_body
-    assert "temporalKeyDstU + (temporalKeyWordIndex * 4).uint" in sta_add_key_body
-    assert "temporalKeySrcU + (temporalKeyWordIndex * 4).uint" in sta_add_key_body
+    assert "let vif = vifChannelForIdx(instNbr)" in sta_retire_body
+    assert "co_list_extract(vifPostponedStaList(vif), cast[ptr CoListHdr](sta))" in sta_retire_body
+    assert "sta.valid = 0" in sta_retire_body
+    assert "let staEntry = staMgmtBeginRemoval(staIdx, owner)" in sta_unregister_body
+    assert "staMgmtFinishRemoval(owner)" in sta_unregister_body
+    assert "of 1:" in sta_add_key_body
+    assert "of 0, 3:" in sta_add_key_body
+    assert "sta.keyTail = req.temporalKeyTail" in sta_add_key_body
+    assert "staKeyPrngState = staKeyPrngState * RC_PRNG_MULT + RC_PRNG_INCR" in sta_add_key_body
+    assert "rcPrngNext()" not in sta_add_key_body
     assert "let keySrcU = cast[uint](machwKeyWriteKeyTailPtr(req))" not in sta_add_key_body
     assert "for i in 0 ..< 4:" not in sta_add_key_body
     assert "for i in 0 ..< 8:" not in sta_add_key_body
     assert "if vif.postponedStaHead != nil:" in chan_idle_body
+    assert "let sent = txl_frame_send_selfcts_frame(" in chan_idle_body
+    assert "vifNode, selfctsDurationMs, cast[pointer](chan_ap_tx_cfm), 0)" in chan_idle_body
     for forbidden in [
         "let vifStaListAddr = vifOffset + 340 + vifTabBase",
         "let vifStaListAddr = vifBase + instNbr.uint * VIF_ENTRY_SIZE.uint + 340",
@@ -3902,15 +4247,23 @@ def test_wifi_list_and_postpone_helpers_use_explicit_loop_conditions():
         "let postponedListAddr = staEntry + 240",
         "sta.keyMat = cast[pointer](postponedListAddr)",
         "reserved15*",
+        "cast[proc(a0: pointer, a1: uint16, a2: uint32, a3: uint32)",
     ]:
         assert forbidden not in sta_register_body
         assert forbidden not in sta_unregister_body
         assert forbidden not in chan_idle_body
     assert "while postponedTxDesc != nil:" in postpone_body
     assert "let postponedDesc = apmTxDescPsAt(postponedTxDesc)" in postpone_body
-    assert "let frameTid = postponedDesc.tid" in postpone_body
-    assert "postponedDesc.tid = cast[uint8]((psStatus and 3) + 3)" in postpone_body
-    assert "let remainingTid = apmTxDescPsAt(remainingPostponedTxDesc).tid" in postpone_body
+    assert "let ac = postponedDesc.accessCategory" in postpone_body
+    assert "mac_ac2uapsd[ac] and delivMask" in postpone_body
+    assert "postponedDesc.accessCategory = 3'u8 + ((sta.psStatus shr 3) and 1).uint8" in postpone_body
+    more_body = wifi_fw.split("proc apmPsHasMore", 1)[1].split(
+        "proc apm_tx_int_ps_get_postpone*", 1
+    )[0]
+    assert "let ac = apmTxDescPsAt(cast[pointer](node)).accessCategory" in more_body
+    assert "ac < 4 and ((mac_ac2uapsd[ac] and deliveryMask) != 0) == uapsdService" in more_body
+    assert postpone_body.count("apmPsHasMore(addr sta.postponedList, delivMask, uapsdService)") == 2
+    assert "link.macHeader[1] = link.macHeader[1] or 0x20'u8" in postpone_body
     assert "cast[ptr CoListHdr](postponedTxDesc).next" in postpone_body
     assert "assert_warn(\"apm.c\", \"apm.c\", 377)" in postpone_body
     assert "reserved15*" not in sta_register_param_layout
@@ -3930,7 +4283,7 @@ def test_wifi_vif_unregister_uses_typed_vif_overlays():
     wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
-        "proc vif_mgmt_unregister*(vifIdx: uint8) {.exportc, cdecl.} =",
+        "proc vif_mgmt_unregister*(vifIdx: uint8): bool {.exportc, cdecl, discardable.} =",
         1,
     )[1].split(
         "proc vif_mgmt_add_key*", 1
@@ -3939,9 +4292,10 @@ def test_wifi_vif_unregister_uses_typed_vif_overlays():
     for expected in [
         "let vif = vifChannelForIdx(vifIdx)",
         "let vifEntry = cast[pointer](vif)",
+        "let vifType = vif.vifType",
         "let otherVif = vifChannelForIdx(otherVifIdx)",
-        "let scanType = vifChannelForIdx(scanIdx).vifType",
-        "let otherVifType = vifChannelForIdx(if vifIdx == 0: 1'u8 else: 0'u8).vifType",
+        "co_list_find(addr env.activeList, cast[ptr CoListHdr](vifEntry))",
+        "if vifType == VIF_TYPE_AP:\n    mm_bcn_stop(vifEntry)",
         "discard c_memset(vifEntry, 0, VIF_ENTRY_SIZE.csize_t)",
         "vif.beaconTimeoutTimer.env = pointerAddrU32(vifEntry)",
     ]:
@@ -3954,8 +4308,14 @@ def test_wifi_vif_unregister_uses_typed_vif_overlays():
         "let scanVif = vifTabBase + scanIdx.uint * VIF_ENTRY_SIZE.uint",
         "vifChannelAt(scanVif)",
         "vifTabBase + (if vifIdx == 0: VIF_ENTRY_SIZE.uint else: 0)",
+        "let scanType =",
+        "let otherVifType =",
     ]:
         assert forbidden not in body
+
+    assert body.index("co_list_extract(addr env.activeList") < body.index(
+        "mm_bcn_stop(vifEntry)"
+    ) < body.index("discard c_memset(vifEntry")
 
 
 def test_wifi_send_postponed_frames_uses_explicit_budget_condition():
@@ -3968,11 +4328,11 @@ def test_wifi_send_postponed_frames_uses_explicit_budget_condition():
         "proc sta_mgmt_entry_init*",
         1,
     )[0]
-    release_body = wifi_fw.split(
-        "proc sta_mgmt_postponed_desc_release*(staEntry: pointer, flag: uint32): uint32 {.exportc, cdecl.} =",
+    release_body = wifi_fw.rsplit(
+        "proc staReleasePostponed(identity: StaQueueIdentity;",
         1,
     )[1].split(
-        "proc sta_mgmt_aging_postponed_desc*", 1
+        "proc sta_mgmt_postponed_desc_release*", 1
     )[0]
     aging_body = wifi_fw.split(
         "proc sta_mgmt_aging_postponed_desc*(staEntry: pointer, maxCount: uint32): uint32 {.exportc, cdecl.} =",
@@ -3983,23 +4343,30 @@ def test_wifi_send_postponed_frames_uses_explicit_budget_condition():
     )[0]
 
     assert "var postponedFramesSent: uint32 = 0" in service_body
-    assert (
-        "while sta.postponedList.first != nil and\n"
-        "      (maxCount == 0 or postponedFramesSent < maxCount):"
-    ) in service_body
+    assert "while maxCount == 0 or postponedFramesSent < maxCount:" in service_body
+    assert service_body.index("if not staPostponedOwnerCurrent(identity):") < service_body.index("if sta.postponedList.first == nil:")
+    assert "if not staPostponedListValid(addr sta.postponedList):" in service_body
+    assert service_body.index("frameEnv.postponedCount = frameEnv.postponedCount - 1") < service_body.index("discard txl_cntrl_push_int(frameDesc, ac)")
     assert "while true:" not in service_body
     assert "discard sta_mgmt_postponed_desc_release(staEntry, 0)" in service_body
     assert "postponedFramesSent += 1" in service_body
     assert "return postponedFramesSent" in service_body
     assert "let txDesc = hostTxDescAt(postponedTxDesc)" in release_body
-    assert "let nextPostponedTxDesc = cast[pointer](cast[ptr CoListHdr](postponedTxDesc).next)" in release_body
-    assert "let txTime = txDesc.pendingMacTime" in release_body
+    assert "TxFlushBatch(previous: txActiveFlush, postponed: sta.postponedList)" in release_body
+    assert "txActiveFlush = addr retained" in release_body
+    assert "while pending.postponed.first != nil:" in release_body
+    assert "(regRead(MACHW_TIMLO_REG) - txDesc.pendingMacTime) > maxAge" in release_body
+    assert "nextPostponedTxDesc" not in release_body
+    assert release_body.index("dec frameEnv.postponedCount") < release_body.index("txl_frame_release(postponedTxDesc, true)")
     assert "while true:" not in release_body
     assert "for postponedStaIndex in 0'u8 ..< STA_INFO_TAB_ENTRIES.uint8:" in aging_body
     assert "let sta = staInfoForIdx(postponedStaIndex)" in aging_body
     assert "for i in 0'u8 ..< STA_INFO_TAB_ENTRIES.uint8:" not in aging_body
     assert "let sta = staInfoForIdx(i)" not in aging_body
-    assert "sta_mgmt_postponed_desc_release(cast[pointer](sta), 0)" in aging_body
+    assert "owners[postponedStaIndex] = staPostponedOwner(cast[pointer](sta))" in aging_body
+    assert "if txResetEpoch != resetEpoch: break" in aging_body
+    assert "if staPostponedOwnerCurrent(owner):" in aging_body
+    assert "total += staReleasePostponed(owner, 0, saved)" in aging_body
     for forbidden in [
         "var count: uint32 = 0",
         "count += 1",
@@ -4094,22 +4461,19 @@ def test_wifi_ke_env_ps_flags_use_typed_overlay():
 
 def test_wifi_sta_ht_vht_param_uses_sta_info_overlay():
     wifi_fw = wifi_fw_policy_source()
-
-    body = wifi_fw.split(
-        "proc me_set_sta_ht_vht_param*(staEntry: pointer, param: pointer) {.exportc, cdecl.} =",
-        1,
-    )[1].split(
-        "{.emit: \"__attribute__((optimize(\\\"crossjumping\\\"))) void* me_update_buffer_control(void*);\".}",
-        1,
-    )[0]
+    body = nim_procedure(
+        (ROOT / "src/bl808/wifi/fw/scan_station_ap_me.nim").read_text(),
+        "me_set_sta_ht_vht_param")
 
     for expected in [
         "bwConfigState*: uint8",
         "doAssert offsetof(StaInfoView, bwConfigState) == 312",
+        "let stbcNss = meEnvView().nss",
         "let sta = staInfoAt(staEntry)",
         "sta.bwConfigState = 0'u8",
         "sta.nssBwMax = 0'u8",
-        "sta.htVhtConfig = configByte",
+        "sta.htVhtConfig = stbcNss",
+        "param: pointer): bool",
     ]:
         assert expected in wifi_fw if expected.startswith(("bwConfigState", "doAssert")) else expected in body
 
@@ -4117,6 +4481,7 @@ def test_wifi_sta_ht_vht_param_uses_sta_info_overlay():
         "let sta = cast[uint](staEntry)",
         "cast[ptr uint16](sta + 312)",
         "cast[ptr uint8](sta + 316)",
+        "addr me_env[0]",
     ]:
         assert forbidden not in body
 
@@ -4151,10 +4516,10 @@ def test_wifi_beacon_transmit_uses_typed_frame_overlays():
         "doAssert offsetof(TxlThdProbeView, payloadPtrPadding) == 20",
         "doAssert offsetof(TxlThdProbeView, bufLen) == 24",
         "doAssert offsetof(HostTxHwDescView, frameLen) == 28",
-        "hostTxHwDescAt(txDescPtr).frameLen = totalLen",
-        "for entryVifIdx in 0'u8 ..< 2'u8:",
-        "let vif = vifChannelForIdx(entryVifIdx)",
-        "tpc_update_frame_tx_power(cast[pointer](vif), descForTpc)",
+        "hwDesc.frameLen = vif.beaconBodyLength.uint32 + vif.timLength.uint32 + 4",
+        "var vifEntry = cast[pointer](vifMgmtEnvView().activeList.first)",
+        "let vif = vifChannelAt(vifEntry)",
+        "tpc_update_frame_tx_power(cast[pointer](vif), bcnFrame)",
         "chan_is_on_operational_channel(cast[pointer](vif))",
         "let bcnDesc = vifApBeaconFrameDesc(vif)",
         "bcnDesc.vifIdx = staHwIdx",
@@ -4171,7 +4536,6 @@ def test_wifi_beacon_transmit_uses_typed_frame_overlays():
         "var vifPtr = cast[ptr pointer](vifBase)[]",
         "let vifBase = cast[uint](addr vif_info_tab[0])",
         "let vifEntry = vifBase + vifIdx.uint * VIF_ENTRY_SIZE",
-        "let vif = vifChannelAt(vifEntry)",
         "tpc_update_frame_tx_power(cast[pointer](vifEntry), descForTpc)",
         "chan_is_on_operational_channel(cast[pointer](vifEntry))",
         "sta_mgmt_send_postponed_frame(cast[pointer](vifEntry)",
@@ -4189,8 +4553,12 @@ def test_wifi_wpa_rsn_ie_and_beacon_update_use_typed_vif_overlays():
     rsn_body = wifi_fw.rsplit("proc mm_set_wpa_rsn_ie*", 1)[1].split(
         "proc mm_force_idle_req*", 1
     )[0]
-    bcn_body = wifi_fw.rsplit("proc mm_bcn_update*", 1)[1].split(
+    bcn_entry = wifi_fw.rsplit("proc mm_bcn_update*", 1)[1].split(
         "proc mm_bcn_transmit*", 1
+    )[0]
+    assert "mmBcnApplyUpdate(vifEntry, saved)" in bcn_entry
+    bcn_body = wifi_fw.rsplit("proc mmBcnApplyUpdate(", 1)[1].split(
+        "proc mm_bcn_update*", 1
     )[0]
 
     for expected in [
@@ -4254,14 +4622,13 @@ def test_wifi_beacon_probe_builders_use_vif_overlay_directly():
         "frame.capabilityInfo = capInfo",
         "let sec = vifSecurity(vif)",
         "me_add_ie_ht_oper(addr ieBuf, cast[pointer](vif))",
-        "let cipherType = vifWpaCipher(vif)",
-        "let chanCtxPtr = vif.chanCtxt",
+        "ieBuf = writeWmmParameterIe(ieBuf, vif)",
     ]:
         assert expected in beacon_body
 
     for expected in [
         "me_add_ie_ht_oper(addr ieBuf, cast[pointer](vif))",
-        "let chanCtxPtr = vif.chanCtxt",
+        "ieBuf = writeWmmParameterIe(ieBuf, vif)",
     ]:
         assert expected in probe_body
 
@@ -4289,9 +4656,9 @@ def test_wifi_beacon_probe_builders_use_vif_overlay_directly():
 
     for expected in [
         "MeEnvView {.packed.} = object",
-        "psModeToDefaultKeyPadding*: uint8",
+        "requesterIdToDefaultKeyPadding*: uint8",
         "htCapabilityTailPadding*: array[2, uint8]",
-        "doAssert offsetof(MeEnvView, psModeToDefaultKeyPadding) == 127",
+        "doAssert offsetof(MeEnvView, requesterIdToDefaultKeyPadding) == 127",
         "doAssert offsetof(MeEnvView, htCapabilityTailPadding) == 134",
         "MeChannelConfigEntry {.packed.} = object",
         "freq*: uint16",
@@ -4330,24 +4697,30 @@ def test_wifi_sae_and_assoc_rsp_builders_use_typed_vif_overlays():
         "MmWmmParameterSourceView {.packed.} = object", 1
     )[1].split("MmBcnEnvView {.packed.} = object", 1)[0]
 
-    sae_body = wifi_fw.rsplit("proc me_build_sae_authenticate*", 1)[1].split(
-        "proc me_build_associate_req_impl", 1
-    )[0]
-    rsp_body = wifi_fw.rsplit("proc me_build_associate_rsp_impl", 1)[1].split(
-        "proc me_build_beacon*", 1
-    )[0]
+    builders = (ROOT / "src/bl808/wifi/fw/scan_station_ap_me.nim").read_text()
+    sae_body = nim_procedure(builders, "meBuildSaeAuthenticate")
+    sae_wrapper = nim_procedure(builders, "me_build_sae_authenticate")
+    rsp_body = nim_procedure(builders, "me_build_associate_rsp_impl")
+    assert "meBuildSaeAuthenticate(buf, authAlgo, authSeq, statusCode, vifIdx, nil)" in sae_wrapper
 
     for expected in [
         "let vif = vifChannelForIdx(vifIdx.uint8)",
-        "let saeCtx = cast[pointer](addr vif.macAddr[0])",
+        "var own = vif.macAddr",
+        "var bssid = vif.bssid",
+        "if empty: bssid = vif.currentBssid",
         "let body = cast[ptr AuthBodyDataView](buf)",
-        "body.fixed.authAlgo = authAlgo",
-        "body.fixed.authSeq = authSeq",
-        "body.fixed.statusCode = statusCode",
+        "body.fixed = AuthFixedBodyView(authAlgo: authAlgo, authSeq: authSeq,",
+        "statusCode: statusCode)",
+        "addr bssid[0], addr own[0], passphrasePtr, authSeq.uint32, addr saeLen)",
+        "let total = sizeof(AuthFixedBodyView).uint32 + saeLen",
+        "if not smTxFits(build, buf, total): return 0",
         "discard c_memcpy(addr body.variablePayload[0], saeData, saeLen.csize_t)",
-        "return saeLen + sizeof(AuthFixedBodyView).uint32",
     ]:
         assert expected in sae_body
+    assert sae_body.index("let saeData =") < sae_body.index(
+        "if not smTxFits(build, buf, sizeof(AuthFixedBodyView).uint32) or"
+    ) < sae_body.index("discard c_memcpy(addr body.variablePayload[0]")
+    assert sae_body.rstrip().endswith("\n  total")
 
     for expected in [
         "AuthBodyDataView {.packed.} = object",
@@ -4378,20 +4751,20 @@ def test_wifi_sae_and_assoc_rsp_builders_use_typed_vif_overlays():
     assert "reserved00*" not in wmm_source_layout
 
     for expected in [
-        "let vif = vifChannelForIdx(vifIdx.uint8)",
+        "let vif = vifChannelForIdx(vifIdx)",
         "let apCfg = vifApConfig(vif)",
         "let privacy = apCfg.privacyFlag",
         "let fixedRsp = cast[ptr AssocRspFixedBodyView](cast[pointer](writePtr))",
         "fixedRsp.capabilityInfo = capInfo",
         "fixedRsp.statusCode = statusCode",
-        "let staAdd = cast[ptr ApmAssocStaAddIndPayload](cast[uint](aid))",
+        "let staAdd = cast[ptr ApmAssocStaAddIndPayload](staRequest)",
         "let aidVal = staAdd.aid",
         "fixedRsp.aid = aidField",
         "let ratesPtr = cast[pointer](addr staAdd.rateCount)",
         "let rateCount = staAdd.rateCount",
         "let staCap = staAdd.flags",
-        "me_add_ie_ht_oper(buf, cast[pointer](vif))",
-        "let bufPtrPtr = cast[ptr pointer](buf)",
+        "me_add_ie_ht_oper(addr cursor, cast[pointer](vif))",
+        "let bufPtrPtr = addr cursor",
         "let wmm = wmmParameterIeAt(bufPtrPtr[])",
         "let wmmSrc = mmWmmParameterSource()",
         "wmm.qosInfo = vif.wmmQosInfo",
@@ -4542,7 +4915,10 @@ def test_wifi_supported_rate_ies_use_typed_rate_set_overlay():
     for expected in [
         "let rateSet = rateSetAt(rates)",
         "let rateCount = rateSet.count.int",
-        "let rateByte = rateSet.rates[rateIndex] and 0x7F",
+        "var rateBytes: array[12, uint8]",
+        "rateBytes[rateIndex] = rateSet.rates[rateIndex]",
+        "let rateByte = rateBytes[rateIndex]",
+        "if basicOnly != 0 and (rateByte and 0x80'u8) == 0:",
     ]:
         assert expected in bitfield_body
 
@@ -4569,7 +4945,7 @@ def test_wifi_supported_rate_ies_use_typed_rate_set_overlay():
         assert expected in freq_body
 
     for expected in [
-        "let rateSet = rateSetAt(cast[pointer](vifIdx))",
+        "let rateSet = rateSetAt(rates)",
         "let output = rateSetAt(outputBuf)",
         "output.count = 0",
         "let rateCount = rateSet.count",
@@ -4904,8 +5280,9 @@ def test_wifi_wpa_ie_builder_uses_typed_overlay():
         "pairwiseCipher*: array[2, RsnSuiteView]",
         "doAssert offsetof(WpaVendorIeView, vendorType) == 2",
         "doAssert offsetof(WpaVendorIeView, akmCount) == 22",
-        "doAssert sizeof(WpaVendorIeView) == 28",
-        "doAssert offsetof(WpaVendorIeView, next) == 28",
+        "doAssert sizeof(WpaVendorIeView) == 30",
+        "doAssert offsetof(WpaVendorIeView, capabilities) == 28",
+        "doAssert offsetof(WpaVendorIeView, next) == 30",
         "template wpaVendorIeAt(p: pointer): ptr WpaVendorIeView",
     ]:
         assert expected in wifi_fw
@@ -4922,7 +5299,8 @@ def test_wifi_wpa_ie_builder_uses_typed_overlay():
         "wpa.pairwiseCipher[1] = RsnSuiteView(oui: [0x00'u8, 0x50'u8, 0xF2'u8], suiteType: 4'u8)",
         "wpa.akmCount = 1'u16",
         "wpa.akmSuite = RsnSuiteView(oui: [0x00'u8, 0x50'u8, 0xF2'u8], suiteType: 2'u8)",
-        "bufPtrPtr[] = addr wpa.next[2]",
+        "wpa.capabilities = 0",
+        "bufPtrPtr[] = addr wpa.next[0]",
     ]:
         assert expected in body
 
@@ -4939,52 +5317,29 @@ def test_wifi_wpa_ie_builder_uses_typed_overlay():
         assert forbidden not in body
 
 
-def test_wifi_inline_wpa_psk_vendor_ie_uses_typed_overlay():
+def test_wifi_inline_wmm_parameter_ie_uses_typed_overlay():
     wifi_fw = wifi_fw_policy_source()
-
-    helper_body = wifi_fw.rsplit("proc writeWpaPskVendorIe", 1)[1].split(
+    helper = wifi_fw.rsplit("proc writeWmmParameterIe", 1)[1].split(
         "proc me_add_ie_tim*", 1
     )[0]
-    beacon_body = wifi_fw.rsplit("proc me_build_beacon*", 1)[1].split(
-        "proc me_build_probe_rsp*", 1
-    )[0]
-    probe_body = wifi_fw.rsplit("proc me_build_probe_rsp*", 1)[1].split(
-        "proc me_build_add_ba_req*", 1
-    )[0]
-
     for expected in [
-        "WpaPskVendorIeView {.packed.} = object",
-        "pairwiseCipher*: RsnSuiteView",
-        "doAssert offsetof(WpaPskVendorIeView, akmCount) == 18",
-        "doAssert sizeof(WpaPskVendorIeView) == 24",
-        "doAssert offsetof(WpaPskVendorIeView, next) == 24",
-        "template wpaPskVendorIeAt(p: pointer): ptr WpaPskVendorIeView",
+        "let wmm = wmmParameterIeAt(ieBuf)",
+        "wmm.ie.id = 221",
+        "wmm.ie.len = 24",
+        "wmm.ouiType = 2",
+        "wmm.ouiSubtype = 1",
+        "wmm.qosInfo = vif.wmmQosInfo",
+        "wmm.parameterReserved = 0",
+        "const hardwareOrder = [1, 0, 2, 3]",
+        "wmm.ac[ac].setLe32",
+        "addr wmm.next[0]",
     ]:
-        assert expected in wifi_fw
-
-    for expected in [
-        "let wpa = wpaPskVendorIeAt(ieBuf)",
-        "wpa.ie.id = 0xDD'u8",
-        "wpa.ie.len = 22'u8",
-        "wpa.vendorType = [0x00'u8, 0x50'u8, 0xF2'u8, 0x01'u8]",
-        "wpa.groupCipher = RsnSuiteView(oui: [0x00'u8, 0x50'u8, 0xF2'u8], suiteType: cipherType)",
-        "wpa.pairwiseCipher = RsnSuiteView(oui: [0x00'u8, 0x50'u8, 0xF2'u8], suiteType: cipherType)",
-        "wpa.akmSuite = RsnSuiteView(oui: [0x00'u8, 0x50'u8, 0xF2'u8], suiteType: 2'u8)",
-        "addr wpa.next[0]",
-    ]:
-        assert expected in helper_body
-
-    for body in [beacon_body, probe_body]:
-        assert "ieBuf = writeWpaPskVendorIe(ieBuf, cipherType)" in body
-        for forbidden in [
-            "let wpaBase = cast[uint](ieBuf)",
-            "let wpaIeBase = cast[uint](ieBuf)",
-            "cast[ptr uint8](wpaBase +",
-            "cast[ptr uint8](wpaIeBase +",
-            "cast[pointer](wpaBase + 24)",
-            "cast[pointer](wpaIeBase + 24)",
-        ]:
-            assert forbidden not in body
+        assert expected in helper
+    for name, next_name in [("me_build_beacon*", "me_build_probe_rsp*"),
+                            ("me_build_probe_rsp*", "me_build_add_ba_req*")]:
+        body = wifi_fw.rsplit("proc " + name, 1)[1].split("proc " + next_name, 1)[0]
+        assert "ieBuf = writeWmmParameterIe(ieBuf, vif)" in body
+        assert "writeWpaPskVendorIe" not in body
 
 
 def test_wifi_power_constraint_extractor_uses_typed_output_overlay():
@@ -4992,7 +5347,7 @@ def test_wifi_power_constraint_extractor_uses_typed_output_overlay():
 
     output_layout = wifi_fw.split(
         "PowerConstraintOutputOverlay {.packed.} = object", 1
-    )[1].split("CountryRegOutputOverlay {.packed.} = object", 1)[0]
+    )[1].split("BssChannelOverlay {.packed.} = object", 1)[0]
     body = wifi_fw.rsplit("proc me_extract_power_constraint*", 1)[1].split(
         "proc me_11n_nss_max*", 1
     )[0]
@@ -5020,48 +5375,35 @@ def test_wifi_country_reg_extractor_uses_typed_overlays():
     wifi_fw = wifi_fw_policy_source()
 
     output_layout = wifi_fw.split(
-        "CountryRegOutputOverlay {.packed.} = object", 1
-    )[1].split("CountryRegView {.packed.} = object", 1)[0]
-    country_reg_layout = wifi_fw.split(
-        "CountryRegView {.packed.} = object", 1
+        "BssChannelOverlay {.packed.} = object", 1
     )[1].split("CountryTripletView {.packed.} = object", 1)[0]
     body = wifi_fw.rsplit("proc me_extract_country_reg*", 1)[1].split(
         "proc me_extract_csa*", 1
     )[0]
 
     for expected in [
-        "CountryRegOutputOverlay {.packed.} = object",
-        "outputBaseToChannelRegPadding*: array[76, uint8]",
-        "channelReg*: pointer",
-        "CountryRegView {.packed.} = object",
-        "environment*: uint8",
-        "environmentToMaxPowerPadding*: uint8",
-        "maxPower*: uint8",
+        "BssChannelOverlay {.packed.} = object",
+        "bssBaseToChannelPadding*: array[76, uint8]",
+        "channel*: pointer",
         "CountryTripletView {.packed.} = object",
         "firstChan*: uint8",
         "numChan*: uint8",
-        "doAssert offsetof(CountryRegOutputOverlay, outputBaseToChannelRegPadding) == 0",
-        "doAssert offsetof(CountryRegOutputOverlay, channelReg) == 76",
-        "doAssert offsetof(CountryRegView, environment) == 2",
-        "doAssert offsetof(CountryRegView, environmentToMaxPowerPadding) == 3",
-        "doAssert offsetof(CountryRegView, maxPower) == 4",
+        "doAssert offsetof(BssChannelOverlay, channel) == 76",
         "doAssert sizeof(CountryTripletView) == 3",
-        "template countryRegOutputAt(p: pointer): ptr CountryRegOutputOverlay",
-        "template countryRegAt(p: pointer): ptr CountryRegView",
+        "template bssChannelAt(p: pointer): ptr BssChannelOverlay",
         "template countryTripletAt(p: pointer): ptr CountryTripletView",
     ]:
         assert expected in wifi_fw
 
     for expected in [
-        "let chanReg = countryRegAt(countryRegOutputAt(out_ptr).channelReg)",
-        "let envByte = chanReg.environment",
-        "phy_freq_to_channel(chanReg.countryHalf.uint8, envStep.uint16)",
-        "let countryIe = cast[ptr MacIeView](ie)",
-        "let ieLength = countryIe.len",
-        "let triplet = countryTripletAt(addr countryIe.macIePayload[payloadOff])",
-        "var firstChan = triplet.firstChan",
-        "while chanIdx != triplet.numChan:",
-        "chanReg.maxPower = triplet.maxPower",
+        "let channel = cast[ptr ScanChannelEntry](bssChannelAt(out_ptr).channel)",
+        "phy_freq_to_channel(channel.band, channel.prim20Freq)",
+        "countryIe == nil or countryIe.len < 6",
+        "while payloadOffset + sizeof(CountryTripletView) <= countryIe.len.int:",
+        "let triplet = countryTripletAt(addr countryIe.macIePayload[payloadOffset])",
+        "var channelNumber = triplet.firstChan.int",
+        "for channelIndex in 0 ..< triplet.numChan.int:",
+        "channel.txPower = cast[int8](triplet.maxPower)",
     ]:
         assert expected in body
 
@@ -5077,18 +5419,16 @@ def test_wifi_country_reg_extractor_uses_typed_overlays():
         "cast[ptr uint8](tripletBase + 1)",
         "cast[ptr uint8](tripletBase + 2)",
         "cast[ptr uint8](chanRegU + 4)",
+        "phy_freq_to_channel(chanReg.countryHalf.uint8, envStep.uint16)",
+        "var pos: uint8",
     ]:
         assert forbidden not in body
     assert "reserved00*" not in output_layout
-    assert "reserved03*" not in country_reg_layout
 
 
-def test_wifi_csa_ie_builder_uses_typed_overlay():
+def test_wifi_beacon_builders_do_not_invent_csa_from_context_marker():
     wifi_fw = wifi_fw_policy_source()
 
-    helper_body = wifi_fw.rsplit("proc writeCsaIe", 1)[1].split(
-        "proc me_add_ie_tim*", 1
-    )[0]
     beacon_body = wifi_fw.rsplit("proc me_build_beacon*", 1)[1].split(
         "proc me_build_probe_rsp*", 1
     )[0]
@@ -5113,20 +5453,9 @@ def test_wifi_csa_ie_builder_uses_typed_overlay():
     ]:
         assert expected in wifi_fw
 
-    for expected in [
-        "let csa = csaIeAt(ieBuf)",
-        "csa.ie.id = 37'u8",
-        "csa.ie.len = 3'u8",
-        "csa.switchMode = switchMode",
-        "csa.newChannel = newChannel",
-        "csa.switchCount = switchCount",
-        "addr csa.next[0]",
-    ]:
-        assert expected in helper_body
-
     for body in [beacon_body, probe_body]:
-        assert "let csaChannel = ((csaFreq.int - 2412) div 5 + 1).uint8" in body
-        assert "ieBuf = writeCsaIe(ieBuf, chanCtx.channel.txPower, csaChannel, csaCount)" in body
+        assert "invalidMarker" not in body
+        assert "writeCsaIe" not in body
         for forbidden in [
             "var csaIe",
             "csaIe[0]",
@@ -5213,7 +5542,7 @@ def test_wifi_assoc_rsp_handler_uses_scan_channel_overlay_for_tpc():
         "macHeaderAssocBodyPadding*: array[30, uint8]",
         "doAssert offsetof(SmAssocRspFrameView, macHeaderAssocBodyPadding) == 2",
         "let chan = cast[ptr ScanChannelEntry](chanPtr)",
-        "var tpcPower: uint8 = cast[ptr uint8](addr chan.txPower)[]",
+        "var tpcPower = cast[uint8](chan.txPower) - vifBssStatus(vif).powerConstraint",
         "TimeoutIntervalIeView {.packed.} = object",
         "intervalType*: uint8",
         "intervalValue*: array[4, uint8]",
@@ -5225,6 +5554,8 @@ def test_wifi_assoc_rsp_handler_uses_scan_channel_overlay_for_tpc():
         "if timeoutIe.intervalType == 3:",
         "let retry = timeoutIe.intervalValue",
         "(retry[2].uint32 shl 16)",
+        "(retry[3].uint32 shl 24)",
+        "smRspTimerSetComeback(build, intervalTu)",
     ]:
         assert expected in wifi_fw if (
             "SmAssocRspFrameView" in expected or
@@ -5271,14 +5602,14 @@ def test_wifi_beacon_channel_reads_use_scan_channel_overlay():
         "template staPowerConstraintOut(sta: ptr StaInfoView): pointer",
         "cast[pointer](addr sta.powerConstraintOutputStorage[10])",
         "let chan = if chanPtr != nil: cast[ptr ScanChannelEntry](chanPtr) else: nil",
-        "let chanBand = if chan != nil: chan.band else: 0'u8",
-        "let chanBw = cast[ptr uint8](addr chan.txPower)[]",
+        "if chan.band == 0:",
+        "var power = cast[int8](cast[uint8](chan.txPower) - bss.powerConstraint)",
     ]:
         assert expected in wifi_fw if expected.startswith(("doAssert", "template", "cast[pointer](addr sta.")) else expected in check_body
 
     for expected in [
-        "let staPowerConstraint = staPowerConstraintOut(staInfoForIdx(vifIdx))",
-        "me_extract_power_constraint(cast[pointer](iesBuf), 0, staPowerConstraint)",
+        "let bss = vifBssStatus(vif)",
+        "me_extract_power_constraint(iesBuf, iesLength, vifBssInfoBase(vif))",
     ]:
         assert expected in check_body
 
@@ -5387,12 +5718,14 @@ def test_wifi_auth_handler_uses_semantic_auth_frame_overlay():
 
     for expected in [
         "let frame = smAuthFrameView(param)",
-        "let statusCode = frame.statusCode",
-        "frame.authAlgo.uint32 or (frame.authSeq.uint32 shl 16)",
-        "let authAlgo = frame.authAlgo",
-        "let saeSeq = frame.authSeq",
-        "saeAuthFrameHandler(smAuthSaeBodyPtr(frame), frameLen - 6, saeSeq, nil)",
+        "let status = frame.statusCode",
+        "let algorithm = frame.authAlgo",
+        "let sequence = frame.authSeq",
+        "handleSae(smAuthSaeBodyPtr(frame), frameLen - 6, sequence, nil)",
         "smAuthSharedChallengePtr(frame)",
+        "if frameLen < 6 or frameLen.uint32 > payloadLength - 32: return",
+        "smTxOwnerCurrent(owner) and smEnvView().connectIndMsg == indication",
+        "sm_connect_ind(WLAN_FW_AUTHENTICATION_FAIILURE.uint16, status)",
     ]:
         assert expected in body
 
@@ -5436,8 +5769,8 @@ def test_wifi_deauth_builder_uses_typed_reason_overlay():
 def test_wifi_assoc_req_builder_uses_typed_assoc_info_overlay():
     wifi_fw = wifi_fw_policy_source()
 
-    body = wifi_fw.rsplit("proc me_build_associate_req_impl", 1)[1].split(
-        "proc me_build_associate_rsp_impl", 1
+    body = wifi_fw.rsplit("proc meBuildAssociateReq", 1)[1].split(
+        "proc me_build_associate_req_impl", 1
     )[0]
     assoc_layout = wifi_fw.split(
         "VifAssocInfoOverlay {.packed.} = object", 1
@@ -5483,20 +5816,20 @@ def test_wifi_assoc_req_builder_uses_typed_assoc_info_overlay():
         "let fixedReq = cast[ptr AssocReqFixedBodyView](buf)",
         "fixedReq.capabilityInfo = capInfo",
         "fixedReq.listenInterval = listenInt",
-        "c_memcpy(addr fixedReq.reassocBssid[0], reassocBssid, 6.csize_t)",
-        "cast[pointer](addr assoc.ssidData[0]), assoc.ssidLen)",
+        "c_memcpy(addr fixedReq.reassocBssid[0], reassocBssid, 6)",
+        "me_add_ie_ssid(addr cursor, addr assoc.ssidData[0], assoc.ssidLen)",
         "let ratesPtr = cast[pointer](addr assoc.basicRates[0])",
         "let rateCount = assoc.basicRates[0]",
         "let assocIeSrc = cast[pointer](assoc.rsnIePtr)",
         "let assocIeLen = assoc.rsnIeLen.uint32",
         "else: assoc.wmmQosInfo",
         "let wmm = wmmInfoIeAt(cursor)",
-        "wmm.ie.id = 0xDD'u8",
+        "wmm.ie.id = 0xDD",
         "wmm.oui = [0x00'u8, 0x50, 0xF2]",
         "wmm.qosInfo = qosInfo",
         "cursor = addr wmm.next[0]",
         "totalLen += sizeof(WmmInfoIeView).uint32",
-        "if meEnvView().htSupp != 0:",
+        "and meEnvView().htSupp != 0:",
     ]:
         assert expected in body
 
@@ -5598,9 +5931,9 @@ def test_wifi_notifier_chain_uses_shared_explicit_list_helpers():
     assert "notifierNodeView(notifier).next" in remove_body
     assert "linkSlot = addr notifierNodeView(currentNotifier).next" in remove_body
     assert "let notifierNode = notifierNodeView(currentNotifier)" in call_body
-    assert "let nextNotifier = cast[ptr CoListHdr](notifierNode.next)" in call_body
+    assert "let nextNotifier = cast[ptr CoListHdr](notifierNode.next)" not in call_body
     assert "notifierNode.callback" in call_body
-    assert "currentNotifier = nextNotifier" in call_body
+    assert "currentNotifier = cast[ptr CoListHdr](notifierNode.next)" in call_body
     assert "let notifierNode = notifierNodeView(currentNotifier)" in call_critical_body
     assert "notifierNode.callback" in call_critical_body
     assert "currentNotifier = cast[ptr CoListHdr](notifierNode.next)" in call_critical_body
@@ -5651,22 +5984,12 @@ def test_wifi_rate_control_random_sample_selection_is_bounded():
         1,
     )[0]
     helper_body = wifi_fw.split("proc rc_pick_non_duplicate_rate", 1)[1].split(
-        "proc rcRateEntryTp", 1
+        "proc rcRateTp", 1
     )[0]
-    init_body = wifi_fw.split(
-        "proc rc_init*(staEntry: pointer) {.exportc, cdecl.} =",
-        1,
-    )[1].split(
-        "proc rc_check*(staIdx: uint8) {.exportc, cdecl.} =",
-        1,
-    )[0]
-    update_body = wifi_fw.split(
-        "proc rc_update_bw_nss_max*(staIdx: uint8, nss: uint8, groupCnt: uint8) {.exportc, cdecl.} =",
-        1,
-    )[1].split(
-        "proc rc_update_preamble_type*",
-        1,
-    )[0]
+    init_body = nim_procedure(
+        (ROOT / "src/bl808/wifi/fw/rate_control.nim").read_text(), "rcTryInitStation")
+    update_body = nim_procedure(
+        (ROOT / "src/bl808/wifi/fw/rate_control.nim").read_text(), "rc_update_bw_nss_max")
 
     assert "RcRandomRateAttemptLimit = 64" in wifi_fw
     assert "while tries < RcRandomRateAttemptLimit:" in helper_body
@@ -5674,8 +5997,11 @@ def test_wifi_rate_control_random_sample_selection_is_bounded():
     assert "rc_check_rate_duplicated(stats, randomRate) == 0" in helper_body
     assert "return candidate" in helper_body
     assert "0xFFFF'u16" in helper_body
-    assert "let randomRate = rc_pick_non_duplicate_rate(stats)" in init_body
-    assert "let randomRate = rc_pick_non_duplicate_rate(rcStats)" in update_body
+    seed_body = nim_procedure(
+        (ROOT / "src/bl808/wifi/fw/rate_control.nim").read_text(), "rc_seed_rate_table")
+    assert "let randomRate = rc_pick_non_duplicate_rate(stats)" in seed_body
+    assert "not rc_seed_rate_table(stats)" in init_body
+    assert "not rc_seed_rate_table(rcStats)" in update_body
     assert "while true:" not in update_body
     assert "var delayLoopBudget = us * 10'u32" in delay_body
     assert "while delayLoopBudget > 0:" in delay_body
@@ -5683,7 +6009,7 @@ def test_wifi_rate_control_random_sample_selection_is_bounded():
     assert "var cnt = us * 10'u32" not in delay_body
     assert "var fallbackRateIndex = lo" in helper_body
     assert "while fallbackRateIndex <= hi:" in helper_body
-    assert "rateMap shr fallbackRateIndex" in helper_body
+    assert "caps.legacyRateMap shr fallbackRateIndex" in helper_body
     assert "inc fallbackRateIndex" in helper_body
     assert "var idx = lo" not in helper_body
 
@@ -5727,9 +6053,12 @@ def test_wifi_rate_control_helpers_use_semantic_rate_field_names():
         1,
     )[0]
 
+    assert "let nssEncodingOffset =" in mcs_body
+    assert "if nssEncodingOffset > 1:" in mcs_body
+    assert "let formatMod = (rateConfig shr 11) and 7" in nss_body
+    assert "if formatMod notin [2'u16, 3'u16]:" in nss_body
+    assert "return ((rateConfig shr 3) and 3).uint8" in nss_body
     for body in [mcs_body, nss_body]:
-        assert "let nssEncodingOffset =" in body
-        assert "if nssEncodingOffset > 1:" in body
         assert "let idx =" not in body
         assert "if idx > 1:" not in body
 
@@ -5742,10 +6071,14 @@ def test_wifi_rate_control_helpers_use_semantic_rate_field_names():
     assert "for i in 0 ..< nRates.int:" not in duplicate_body
     assert "rcRateConfig(stats, i) == rateConfig" not in duplicate_body
 
-    assert random_body.count("let randomRateOffset =") == 2
-    assert random_body.count("let candidateRateIndex =") == 2
-    assert "rateMap shr candidateRateIndex" in random_body
-    assert "var mcsIdx = candidateRateIndex.uint16" in random_body
+    assert "let caps = rcRateCapabilities(stats)" in random_body
+    assert "caps.legacyRateMap shr rateIndex" in random_body
+    assert "let bitmap = caps.mcsBitmaps[nss.int]" in random_body
+    assert "(caps.maxNss.uint32 + 1)" in random_body
+    assert "(caps.maxMcs.uint32 + 1)" in random_body
+    assert "(caps.shortGi.uint32 + 1)" in random_body
+    assert "let minBandwidth =" in random_body
+    assert "RCS_RATE_MAP_L" not in random_body
     assert "let rndIdx =" not in random_body
     assert "let idx = lowest +" not in random_body
     assert "rateMap shr idx" not in random_body
@@ -5788,7 +6121,9 @@ def test_wifi_kernel_timer_scheduler_yields_under_expired_backlog():
     assert "var drained = 0'u32" in timer_body
     assert "while drained < WifiTimerDrainLimit:" in timer_body
     assert "while true:" not in timer_body
-    assert "let expiredTimerEntry = cast[ptr KeTimerEntry](popped)" in timer_body
+    assert "let expiredTimerEntry = block:" in timer_body
+    assert "cast[ptr KeTimerEntry](popped)" in timer_body
+    assert "if keTimerScheduling: return" in timer_body
     assert "ke_msg_send_basic(expiredTimerEntry.id, expiredTimerEntry.taskId, 0xFF)" in timer_body
     assert "platformFree(cast[pointer](expiredTimerEntry))" in timer_body
     assert "let entry = cast[ptr KeTimerEntry](popped)" not in timer_body
@@ -8361,7 +8696,9 @@ def test_wifi_firmware_does_not_link_sdk_ccmp_fallback():
     rx_upper = (
         ROOT / "src/bl808/wifi/fw/rx_upper.nim"
     ).read_text()
-    assert "nim_ccmp_decrypt(" in rx_upper
+    assert "nim_ccmp_decrypt(" not in rx_upper
+    assert "rxuTrySoftwareCcmpDecrypt" not in rx_upper
+    assert "rxuFindSnapOffset" not in rx_upper
     assert "proc ccmp_decrypt" not in rx_upper
     assert " ccmp_decrypt(" not in rx_upper
 
@@ -8554,7 +8891,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "channelBandType: uint16",
         "primaryFreq: uint16",
         "centerFreq1: uint16",
-        "centerFreq2OrTxPower: uint16",
+        "centerFreq2: uint16",
         "txPowerAndFlags: uint16",
         "txPowerFlagsTailPadding: array[2, uint8]",
         "RfcLpXtalConfig {.packed.} = object",
@@ -8580,7 +8917,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "doAssert offsetof(PhyEnvView, channelBandType) == 36",
         "doAssert offsetof(PhyEnvView, primaryFreq) == 38",
         "doAssert offsetof(PhyEnvView, centerFreq1) == 40",
-        "doAssert offsetof(PhyEnvView, centerFreq2OrTxPower) == 42",
+        "doAssert offsetof(PhyEnvView, centerFreq2) == 42",
         "doAssert offsetof(PhyEnvView, txPowerAndFlags) == 44",
         "doAssert offsetof(PhyEnvView, txPowerFlagsTailPadding) == 46",
         "doAssert sizeof(BbaRxVectorView) == 24",
@@ -10369,20 +10706,24 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     assert "addr rf.rxcalReplay[rxcalReplayRecordIndex]" in rxcal_replay_body
     assert "addr rf.rxcalReplay[i]" not in rxcal_replay_body
     assert "RfBase + 0x170'u" not in rxcal_replay_body
-    sta_tx_prepare = wifi_fw.split(
-        "proc wifi_nimfw_prepare_sta_tx_channel*() {.exportc, cdecl.} =",
-        1,
-    )[1].split("proc wifi_nimfw_coex_force_wifi_role*", 1)[0]
+    sta_tx_prepare = nim_procedure(
+        (ROOT / "src/bl808/wifi/fw/tx_layer.nim").read_text(),
+        "wifi_nimfw_prepare_sta_tx_channel",
+    )
     assert "for staTxChannelVifIndex in 0'u8 ..< MAX_VIFS.uint8:" in sta_tx_prepare
     assert "let vif = vifChannelForIdx(staTxChannelVifIndex)" in sta_tx_prepare
     assert "for i in 0'u8 ..< MAX_VIFS.uint8:" not in sta_tx_prepare
     assert "let vif = vifChannelForIdx(i)" not in sta_tx_prepare
-    assert "let reclaimNeeded = nim_ble_coex_wifi_rf_reclaim_needed() != 0'u32" in sta_tx_prepare
+    assert (
+        "let reclaimNeeded = nimFwBleWifiRoleWindowEnabled != 0'u32 and "
+        "nim_ble_coex_wifi_rf_reclaim_needed() != 0'u32"
+    ) in " ".join(sta_tx_prepare.split())
+    assert "let channelChanged = not phyChannelMatches(addr channel)" in sta_tx_prepare
     assert "wifiRfCoreInitMode(40000000'u32, wifiBleCoex)" in sta_tx_prepare
     tx_payload_body = wifi_fw.split(
         "proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =",
         1,
-    )[1].split("proc txlTriggerPending", 1)[0]
+    )[1].split("proc txl_transmit_trigger", 1)[0]
     assert 'exportc: "nimfw_dbg_sta_tx_rf_latch"' in wifi_fw
     assert "when declared(rfPriApplyWb03AuthTxLatches):" in tx_payload_body
     assert "typeForRfLatch == 2'u32" in tx_payload_body
@@ -10414,9 +10755,9 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "bl808MdmSetChannel(initial.primFreq.uint32, initial.centerFreq1.uint32,",
         "rfc_config_bandwidth(0'u32)",
         "rfc_config_channel(initial.centerFreq1.uint32)",
-        "volatileStore(addr env.channelBandType",
     ]:
         assert expected in initial_channel_body
+    assert "phyEnvViewPtr()" not in initial_channel_body
     crm_init_body = wifi_fw.split(
         "proc crm_init() {.exportc, cdecl.} =",
         1,
@@ -10649,12 +10990,16 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "proc phy_rc_isr*() {.exportc, cdecl.} =",
         1,
     )[1].split("proc phy_get_version*", 1)[0]
-    for body in [phy_mdm_isr_body, phy_rc_isr_body]:
-        assert "let mdm = wifiModemRegs()" in body
-        assert "addr mdm.intStatusB41c" in body
-        assert "addr mdm.intAckB420" in body
-        assert "WifiModemBase + 0xB41C'u" not in body
-        assert "WifiModemBase + 0xB420'u" not in body
+    assert "discard" in phy_mdm_isr_body
+    assert "wifiModemRegs()" not in phy_mdm_isr_body
+    assert "volatileLoad" not in phy_mdm_isr_body
+    assert "volatileStore" not in phy_mdm_isr_body
+    assert "pulsePhyChannelRfWindow()" not in phy_mdm_isr_body
+    assert "let mdm = wifiModemRegs()" in phy_rc_isr_body
+    assert "addr mdm.intStatusB41c" in phy_rc_isr_body
+    assert "addr mdm.intAckB420" in phy_rc_isr_body
+    assert "WifiModemBase + 0xB41C'u" not in phy_rc_isr_body
+    assert "WifiModemBase + 0xB420'u" not in phy_rc_isr_body
     phy_get_version_body = wifi_fw.split(
         "proc phy_get_version*(versionOut: pointer, buf: pointer) {.exportc, cdecl.} =",
         1,
@@ -10671,7 +11016,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "addr env.channelBandType",
         "addr env.primaryFreq",
         "addr env.centerFreq1",
-        "addr env.centerFreq2OrTxPower",
+        "addr env.centerFreq2",
     ]:
         assert expected in phy_get_channel_body
     for forbidden in [
@@ -10685,7 +11030,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     )[1].split("proc phy_he_supported*", 1)[0]
     for expected in [
         "let version = modemVersionReg()",
-        "((version shr 21) and 1'u32) != 0'u32",
+        "((version shr 22) and 1'u32) != 0'u32",
         "((version shr 24) and 0x3'u32) != 0'u32",
     ]:
         assert expected in phy_vht_body
@@ -10716,7 +11061,10 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     assert "addr mdm.groupMembership1" in phy_group_body
     assert "for groupUserPositionWordIndex in 0 ..< 4:" in phy_group_body
     assert "addr mdm.userPosition[groupUserPositionWordIndex]" in phy_group_body
-    assert "src[groupUserPositionWordIndex]" in phy_group_body
+    assert "le32(addr src[groupUserPositionWordIndex])" in phy_group_body
+    assert "le32(addr src[0])" in phy_group_body
+    assert "le32(addr src[1])" in phy_group_body
+    assert "cast[ptr UncheckedArray[uint32]]" not in phy_group_body
     assert "addr mdm.userPosition[i]" not in phy_group_body
     assert "for i in 0 ..< 4:" not in phy_group_body
     for forbidden in [
@@ -10902,8 +11250,8 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         1,
     )[1].split("proc phy_switch_antenna_paths*", 1)[0]
     for expected in [
-        "let rxChainCount = modemVersionReg() and 0xF'u32",
-        "uint8((1'u32 shl rxChainCount) - 1'u32)",
+        "let txChainCount = (modemVersionReg() shr 4) and 0xF'u32",
+        "uint8((1'u32 shl txChainCount) - 1'u32)",
     ]:
         assert expected in phy_get_antenna_body
     assert "proc phy_get_antenna_set*(): uint8 {.exportc, cdecl.} =\n    1'u8" not in wifi_fw
@@ -10917,7 +11265,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "addr env.channelBandType",
         "addr env.primaryFreq",
         "addr env.centerFreq1",
-        "addr env.centerFreq2OrTxPower",
+        "addr env.centerFreq2",
     ]:
         assert expected in copy_phy_cfg_body
     for forbidden in [
@@ -10930,7 +11278,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     phy_update_power_body = wifi_fw.split(
         "proc phy_update_power_table*() {.exportc, cdecl.} =",
         1,
-    )[1].split("proc phyEnvCenter2Word", 1)[0]
+    )[1].split("proc phyChannelMatches", 1)[0]
     assert "addr phyEnvViewPtr().channelBandType" in phy_update_power_body
     assert "phyEnvByte(37'u)" not in phy_update_power_body
     phy_set_channel_body = wifi_fw.split(
@@ -10942,7 +11290,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "addr env.channelBandType",
         "addr env.primaryFreq",
         "addr env.centerFreq1",
-        "addr env.centerFreq2OrTxPower",
+        "addr env.centerFreq2",
         "addr env.txPowerAndFlags",
     ]:
         assert expected in phy_set_channel_body
@@ -11165,9 +11513,9 @@ def test_wifi_state_environment_padding_names_are_semantic():
     )[1].split("VifMgmtHostapdOpsEnvView {.packed.} = object", 1)[0]
     ps_env_layout = wifi_fw.split(
         "PsEnvView {.packed.} = object", 1
-    )[1].split("PsDozeEnvView {.packed.} = object", 1)[0]
+    )[1].split("BlDozeEnvView {.packed.} = object", 1)[0]
     ps_doze_layout = wifi_fw.split(
-        "PsDozeEnvView {.packed.} = object", 1
+        "BlDozeEnvView {.packed.} = object", 1
     )[1].split("SmEnvView {.packed.} = object", 1)[0]
     sm_env_layout = wifi_fw.split(
         "SmEnvView {.packed.} = object", 1
@@ -11199,7 +11547,7 @@ def test_wifi_state_environment_padding_names_are_semantic():
         "doAssert offsetof(PsEnvView, psActivityToPeriodPadding) == 30",
         "doAssert offsetof(PsEnvView, uapsdStateToFlagsPadding) == 49",
         "doAssert offsetof(PsEnvView, deferredModeTailPadding) == 54",
-        "doAssert offsetof(PsDozeEnvView, preStateTailPadding) == 61",
+        "doAssert offsetof(BlDozeEnvView, preStateTailPadding) == 1",
         "doAssert offsetof(SmEnvView, connectModeToAuthRetryPadding) == 21",
         "doAssert offsetof(SmEnvView, stateToVendorIePadding) == 45",
         "doAssert offsetof(SmEnvView, vendorIeLenTailPadding) == 54",
@@ -11938,9 +12286,9 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
     bz_txcal_replay_complete_body = wifi_fw.split(
         "proc rfPriBzTxcalReplayRecordsComplete(): bool =",
         1,
-    )[1].split("proc rfPriWriteTxPowerTable()", 1)[0]
+    )[1].split("proc rfPriWriteTxPowerTable(", 1)[0]
     write_tx_power_table_body = wifi_fw.split(
-        "proc rfPriWriteTxPowerTable() =",
+        "proc rfPriWriteTxPowerTable(scope: RfPriPowerTableScope = rfPowerAll) =",
         1,
     )[1].split("proc writeRfPriGainInit()", 1)[0]
     prepare_roscal_body = wifi_fw.split(
@@ -11966,7 +12314,7 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
     write_roscal_candidate_body = wifi_fw.split(
         "proc writeRfRoscalCandidate(iBranch: bool, code: uint32) =",
         1,
-    )[1].split("type\n    RfRoscalSample", 1)[0]
+    )[1].split("type\n  RfRoscalSample", 1)[0]
     sample_roscal_measure_body = wifi_fw.split(
         "proc sampleRfRoscalMeasurement(iBranch: bool): RfRoscalSample =",
         1,
@@ -12254,7 +12602,7 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
         assert forbidden not in run_rxcal_body
     for expected in [
         "Vendor rf_pri_txcal_w2reg always writes these fields",
-        "preserves base-table words for empty records until TXCAL is bit-for-bit",
+        "preserves existing fields for empty records until TXCAL is bit-for-bit",
         "txPowerTableWordIndex,",
         "txcalRecordIndex: int",
         "RfCalibTxcalRecordBaseWord + txcalRecordIndex * 2",
@@ -12274,7 +12622,7 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
         assert forbidden not in apply_txcal_record_body
     for expected in [
         "Vendor rf_pri_bz_txcal_w2reg always writes these fields",
-        "preserves base-table words for empty records until BZ TXCAL is validated",
+        "preserves existing fields for empty records until BZ TXCAL is validated",
         "txPowerTableStartWordIndex,",
         "bzTxcalRecordIndex: int",
         "let bzTxcalRecordWord0 = rfCalibBzTxcalRecordWord0(bzTxcalRecordIndex)",
@@ -12331,7 +12679,8 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
     for expected in [
         "rf_calib_data+0x68",
         "indexed by .data.tx_pwr_table_idx",
-        "for txcalReplayRecordIndex in RfPriTxcalReplayRecordIds:",
+        "for selectedRecord in bl808RfTxPowerTableIndex:",
+        "let txcalReplayRecordIndex = selectedRecord.int",
         "let txcalRecordWord0 =",
         "let txcalRecordWord1 =",
         "RfCalibTxcalRecordBaseWord + txcalReplayRecordIndex * 2",
@@ -12379,16 +12728,26 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
         "RfPriTxPowerRegisterBase",
         "if useCalReplay:",
         "var txPowerTableWords =",
-        "for txPowerReplaySlotIndex, txcalRecordId in RfPriTxcalReplayRecordIds:",
-        "rfPriApplyTxcalRecordToTable(\n        txPowerTableWords, 3 + txPowerReplaySlotIndex * 2, txcalRecordId)",
+        "not rfPriApplyRuntimePowerTables(txPowerTableWords, scope)",
+        "for txPowerReplaySlotIndex, selectedRecord in bl808RfTxPowerTableIndex:",
+        "let txcalRecordId = selectedRecord.int",
+        "rfPriApplyTxcalRecordToTable(\n          txPowerTableWords, 3 + txPowerReplaySlotIndex * 2, txcalRecordId)",
         "rfPriApplyBzTxcalRecordToTable(txPowerTableWords,",
         "writeRfTxPowerCompTable(txPowerTableWords)",
+        "(scope == rfPowerBz or txcalRecordsComplete)",
+        "(scope == rfPowerWlan or bzTxcalRecordsComplete)",
+        "txPowerTableWords = rfPriReadTxPowerTable(scope)",
+        "rfPriPublishTxPowerTable(txPowerTableWords, scope, rfPowerFields)",
+        "rfPriPublishTxPowerTable(txPowerTableWords, scope, rfPowerCalibration)",
+        "rfPriWriteTxPowerTable(rfPowerWlan)",
         "for bzTxcalTargetPowerSlotIndex in 0 ..< bl808RfBzTargetPowerRecords.len:",
         "RfPriBzTxcalTableStarts[bzTxcalTargetPowerSlotIndex]",
         "bl808RfBzTargetPowerRecords[bzTxcalTargetPowerSlotIndex]",
         "for txPowerIndexSlot in 7 ..< bl808RfTxPowerTableIndex.len:",
         "bl808RfTxPowerTableIndex[txPowerIndexSlot].int32",
-        "bl808RfTxPowerTableIndex[txPowerIndexSlot] = shifted.int16",
+        "bl808RfTxPowerTableIndex[txPowerIndexSlot].int32 - coarse",
+        "bl808RfTxPowerTable[row][7].int32 + residual",
+        "coarse * 30",
     ]:
         assert expected in write_tx_power_table_body
     assert "for idx in 7 ..< bl808RfTxPowerTableIndex.len:" not in write_tx_power_table_body
@@ -13807,8 +14166,8 @@ def test_wifi_rx_tx_dhcp_path_uses_typed_overlays():
         "# ###########################################################################",
         1,
     )[0]
-    frame_build = wifi_fw.rsplit("proc txu_cntrl_frame_build*", 1)[1].split(
-        "proc txu_cntrl_push*", 1
+    frame_build = wifi_fw.rsplit("proc txuBuildFrame(", 1)[1].split(
+        "proc txu_cntrl_frame_build*", 1
     )[0]
     tx_push = wifi_tx.split("proc txPush(", 1)[1].split(
         "proc bl_tx_cfm*", 1
@@ -13851,8 +14210,10 @@ def test_wifi_rx_tx_dhcp_path_uses_typed_overlays():
         "let vif = vifChannelForIdx(desc.vifIdx)",
         "if (vifKeyPointers(vif).flags and 0x02) != 0:",
         "let msdu = rxMsduView(frame, env.machdrLen)",
-        "let hasRfc1042Snap = rxSnapIsRfc1042(addr msdu.snap)",
-        "if hasRfc1042Snap and msdu.snap.ethertype == 0x8E88'u16:",
+        "let hasRfc1042Snap = not isAmsdu and hasSnapHeader and",
+        "let isEapol = hasRfc1042Snap and etherType == 0x8E88'u16",
+        "if not isEapol and not isConfiguredControlPort and (frameControl and 0x4000) == 0 and",
+        "let uploadMacHdrLen = env.machdrLen",
         "let msduSnap = rxMsdu(finalFrame, stripLen)",
         "let ethHdr = rxEthernetRewriteHeader(finalFrame, stripLen)",
         "stripLen = (stripLen.int - 6).uint8",
@@ -13867,20 +14228,17 @@ def test_wifi_rx_tx_dhcp_path_uses_typed_overlays():
         "let frameTypeBits = frameControl and 0x000C",
         "if frameTypeBits != 0 and frameTypeBits != 8:",
         "let currentFrameControlFlags = swdesc.frameControlFlags",
-        "currentFrameControlFlags or 2",
+        "(env.dstIdx.uint32 shl 24) or",
         "let frameControlFlagByte = (frameControl shr 8).uint8",
         "let retryFrame = (frameControlFlagByte and 0x08'u8) != 0",
-        "RxuUploadEnvView {.packed.} = object",
-        "uploadEnvBaseToCountPadding*: array[20, uint8]",
-        "uploadCountTailPadding*: uint32",
-        "RxlHwdescCallbackEnvView {.packed.} = object",
-        "callbackEnvBaseToGetStatusPadding*: array[20, uint8]",
+        "RxlCntrlEnvView {.packed.} = object",
+        "uploadCount*: uint32",
+        "frameLenFieldAddrs*: array[4, uint32]",
         "RxlSubmittedDescView {.packed.} = object",
         "submittedDescBasePadding*: uint32",
         "swDescToStatusPadding*: array[48, uint8]",
-        "doAssert offsetof(RxuUploadEnvView, uploadEnvBaseToCountPadding) == 0",
-        "doAssert offsetof(RxuUploadEnvView, uploadCountTailPadding) == 24",
-        "doAssert offsetof(RxlHwdescCallbackEnvView, callbackEnvBaseToGetStatusPadding) == 0",
+        "doAssert offsetof(RxlCntrlEnvView, uploadCount) == 20",
+        "doAssert offsetof(RxUploadDmaArrayView, frameLenFieldAddrs) == 16",
         "doAssert offsetof(RxlSubmittedDescView, submittedDescBasePadding) == 0",
         "doAssert offsetof(RxlSubmittedDescView, swDescToStatusPadding) == 16",
     ]:
@@ -13890,6 +14248,7 @@ def test_wifi_rx_tx_dhcp_path_uses_typed_overlays():
         "if fType",
         "let curStat =",
         "let fcByte1 =",
+        "currentFrameControlFlags or 2",
     ]:
         assert forbidden not in rx_body
     for expected in [
@@ -13904,35 +14263,48 @@ def test_wifi_rx_tx_dhcp_path_uses_typed_overlays():
 
     for expected in [
         "when defined(bl808WifiRxPbufInput):",
-        "var uploadListNode = co_list_pop_front(addr env.uploadList)",
-        "while uploadListNode != nil:",
-        "tcpip_stack_input(",
-        "rxl_mpdu_free(uploadListNode)",
+        "let lowerEnv = rxlCntrlEnvView()",
+        "let uploadListNode = co_list_pop_front(addr env.uploadList)",
+        "while true:",
+        "if uploadListNode == nil:",
+        "let swDesc = rxMpduHeader(uploadListNode)",
+        "let uploadCount = lowerEnv.uploadCount",
+        "let uploadHeadroom = cast[int32](41'u32 - uploadCount)",
+        "if uploadCount > 41 or uploadHeadroom <= 2:",
+        "rxHostForward(",
+        "rxReleaseUpload(uploadListNode, uploadGeneration)",
         "var uploadPayloadHwDesc = cast[ptr RxPayloadHwDescView](swDesc.bufferChain)",
         "while remaining > 0 and uploadPayloadHwDesc != nil:",
         "dmaArray.bufferAddrs[dmaIdx] = uploadPayloadHwDesc.bufferAddr",
-        "if uploadPayloadHwDesc.usedFlag != 0:",
+        "dmaArray.frameLenFieldAddrs[dmaIdx] =",
+        "cast[uint32](cast[uint](addr uploadPayloadHwDesc.frameLen))",
+        "if checkedPayload.usedFlag != 0 or",
         "uploadPayloadHwDesc.usedFlag = 1",
         "uploadPayloadHwDesc = cast[ptr RxPayloadHwDescView](uploadPayloadHwDesc.next)",
-        "uploadEnv.uploadCount = uploadEnv.uploadCount + desc.descCount.uint32",
+        "let enterFn = cast[proc(): uint32 {.cdecl.}](blOpsFunc(20))",
+        "let leaveFn = cast[proc(level: uint32) {.cdecl.}](blOpsFunc(24))",
+        "let savedStatus = enterFn()",
+        "lowerEnv.uploadCount = lowerEnv.uploadCount + deliveredCount",
+        "leaveFn(savedStatus)",
     ]:
         assert expected in rx_upload_body
+    assert rx_upload_body.index("let saved = irqSave()") < rx_upload_body.index(
+        "let uploadListNode = co_list_pop_front"
+    ) < rx_upload_body.index("let uploadGeneration = rxUploadGeneration")
+    assert "swDesc.mpduLengthBytes == frameLength" in rx_upload_body
+    assert "swDesc.bufferOffset == frameOffset" in rx_upload_body
     assert "curHwDesc" not in rx_upload_body
     assert "rxl_mpdu_free(entry)" not in rx_upload_body
+    assert "if (41 - uploadCount) <= 2:" not in rx_upload_body
+    assert "rxuUploadEnv" not in wifi_fw
+    assert "RxuUploadEnvView" not in wifi_fw
+    assert "RxlHwdescCallbackEnvView" not in wifi_fw
+    assert "rxl_hwdesc_env" not in rx_upload_body
+    assert "hwdescCallbacks" not in rx_upload_body
+    assert "uploadEnv.uploadCount" not in rx_upload_body
+    assert "if hwdescCallbacks.getStatus != nil:" not in rx_upload_body
+    assert "if hwdescCallbacks.clean != nil:" not in rx_upload_body
     for overlay_name, next_overlay, forbidden_fields in [
-        (
-            "RxuUploadEnvView {.packed.} = object",
-            "RxlHwdescCallbackEnvView {.packed.} = object",
-            [
-                "reserved00*: array[20, uint8]",
-                "reserved24*: uint32",
-            ],
-        ),
-        (
-            "RxlHwdescCallbackEnvView {.packed.} = object",
-            "RxlSubmittedDescView {.packed.} = object",
-            ["reserved00*: array[20, uint8]"],
-        ),
         (
             "RxlSubmittedDescView {.packed.} = object",
             "BeaconRxDescView {.packed.} = object",
@@ -14009,6 +14381,87 @@ def test_wifi_rx_tx_dhcp_path_uses_typed_overlays():
     assert "if isSta != 0'u8:" not in tx_check_ret
 
 
+def test_wifi_rx_upload_strip_uses_payload_chain_descriptor():
+    wifi_fw = wifi_fw_policy_source()
+    rx_upload_indicate_body = wifi_fw.rsplit(
+        "proc rxu_mpdu_upload_and_indicate*", 1
+    )[1].split(
+        "proc rxu_cntrl_frame_handle*", 1
+    )[0]
+    strip_helper_body = wifi_fw.rsplit("proc rxuStripPayloadPrefix", 1)[1].split(
+        "proc rxu_cntrl_desc_prepare", 1
+    )[0]
+
+    for expected in [
+        "proc rxuStripPayloadPrefix(swdesc: ptr RxSwDescView; stripLen: uint32;\n                           headerLen: uint8)",
+        "let payloadDesc = cast[ptr RxPayloadHwDescView](swdesc.bufferChain)",
+        "cast[pointer](payloadDesc.bufferStart)).frameControl",
+        "env.stripLen = 0",
+        "rxuStripPayloadPrefix(swdesc, adjustment.uint32, macHdrLen)",
+        "swdesc.mpduLengthBytes = swdesc.mpduLengthBytes - adjustment.uint16",
+        "env.machdrLen = macHdrLen",
+    ]:
+        assert expected in wifi_fw
+    for expected in [
+        "let frameStart = cast[pointer](payloadDesc.bufferStart)",
+        "let uploadStart = cast[pointer](payloadDesc.bufferStart + stripLen)",
+        "discard c_memmove(uploadStart, frameStart, headerLen.csize_t)",
+    ]:
+        assert expected in strip_helper_body
+    for forbidden in [
+        "swdesc.firstDmaDesc",
+        "discard halfAdj",
+        "let newHdrOff",
+        "env.frameCtrl = env.frameCtrl and 0xFF00'u16",
+    ]:
+        assert forbidden not in rx_upload_indicate_body
+    assert "payloadDesc.bufferAddr =" not in strip_helper_body
+
+
+def test_wifi_rx_rewrite_upload_preserves_existing_mpdu_flag():
+    wifi_fw = wifi_fw_policy_source()
+    rx_upload_indicate_body = wifi_fw.rsplit(
+        "proc rxu_mpdu_upload_and_indicate*", 1
+    )[1].split(
+        "proc rxu_cntrl_frame_handle*", 1
+    )[0]
+    rx_frame_handle_body = wifi_fw.rsplit(
+        "proc rxu_cntrl_frame_handle*", 1
+    )[1].split(
+        "proc rxu_swdesc_upload_evt*", 1
+    )[0]
+
+    assert "swdesc.frameControlFlags = swdesc.frameControlFlags or flagsHi or flagsMid or 2'u32" in rx_upload_indicate_body
+    assert "currentFrameControlFlags or 2" not in rx_frame_handle_body
+    for expected in [
+        "let currentFrameControlFlags = swdesc.frameControlFlags",
+        "(env.dstIdx.uint32 shl 24) or",
+        "currentFrameControlFlags",
+        "swdesc.frameControlFlags = swdesc.frameControlFlags and 0xFFFFFF8F'u32",
+    ]:
+        assert expected in rx_frame_handle_body
+
+
+def test_wifi_rx_ethernet_rewrite_upload_offset_starts_at_synthetic_header():
+    wifi_fw = wifi_fw_policy_source()
+    rx_rewrite_helper = wifi_fw.rsplit(
+        "proc rxEthernetRewriteHeader(", 1
+    )[1].split(
+        "proc rxFrameBodyByte", 1
+    )[0]
+    rx_frame_handle_body = wifi_fw.rsplit(
+        "proc rxu_cntrl_frame_handle*", 1
+    )[1].split(
+        "proc rxu_swdesc_upload_evt*", 1
+    )[0]
+
+    assert "addr rxFrameBytes(frame)[stripLen.int]" in rx_rewrite_helper
+    assert "stripLen = (stripLen.int - 6).uint8" in rx_frame_handle_body
+    assert "stripLen = (stripLen.int - 14).uint8" in rx_frame_handle_body
+    assert "stripLen.int - 14" not in rx_rewrite_helper
+    assert "uploadMacHdrLen.uint32 + sizeof(LlcSnapHeaderView).uint32" not in rx_frame_handle_body
+
+
 def test_wifi_security_rx_indication_uses_typed_overlay():
     wifi_fw = wifi_fw_policy_source()
 
@@ -14047,10 +14500,9 @@ def test_wifi_machw_key_control_word_uses_reference_switch_tables():
     )[0]
 
     for expected in [
-        "let validCipherType = cipherType <= 3",
-        "if not validCipherType:",
-        "keyTypeForCtrl = 1",
-        "if validCipherType:",
+        "let expectedLength =",
+        "if expectedLength == 0 or req.keyLen != expectedLength:",
+        "let keyTypeForCtrl =",
         "of 0: 0'u32",
         "of 1: 1'u32",
         "of 2: 0'u32",
@@ -14063,6 +14515,11 @@ def test_wifi_machw_key_control_word_uses_reference_switch_tables():
         "(hwCipherType shl 8)",
     ]:
         assert expected in body
+    assert "assert_err(" not in body
+    assert body.index("if expectedLength == 0") < body.index("machwSecurityWriteAddress(")
+    assert body.index("let completed = waitMachwSecurityControlClear") < body.rindex(
+        "sta_mgmt_add_key(req, hwIdx)"
+    )
 
 
 def test_wifi_utils_index_lookup_uses_semantic_remote_sta_index():
@@ -14099,7 +14556,7 @@ def test_wifi_utils_index_lookup_uses_semantic_remote_sta_index():
         assert forbidden not in body
 
 
-def test_wifi_tcpip_input_converts_80211_mpdu_for_lwip():
+def test_wifi_tcpip_input_routes_monitor_away_from_lwip():
     wifi_utils = nim_source_with_includes(ROOT / "src/bl808/wifi/utils.nim")
 
     body = wifi_utils.rsplit("proc tcpip_stack_input*", 1)[1].split(
@@ -14113,31 +14570,26 @@ def test_wifi_tcpip_input_converts_80211_mpdu_for_lwip():
     )[0]
 
     for expected in [
-        "proc allocMpduEthernetPbuf(msduOffset: uint32; pkt: pointer): ptr Pbuf",
-        "let macLen = macDataHeaderLen(fc)",
-        "if (fc and 0x4000'u16) != 0:",
-        "loadU8(snap, 0) != 0xAA'u8",
-        "discard c_memcpy(addr ethHdr[0], da, 6.csize_t)",
-        "discard c_memcpy(addr ethHdr[6], sa, 6.csize_t)",
-        "ethHdr[12] = loadU8(snap, 6)",
-        "ethHdr[13] = loadU8(snap, 7)",
+        "proc allocMonitorPbuf(hwhdr, pkt: pointer; msduOffset: uint32;",
+        "proc inputMonitorFrame(hwhdr, pkt: pointer; msduOffset: uint32;",
+        "let length = loadU16(hwhdr, 0)",
+        "if length.uint32 > available:",
+        "info.rssi = cast[int8](loadU8(hwhdr, 23))",
+        "info.legRate = ((loadU16(hwhdr, 12) shr 12) and 15).uint8",
+        "info.formatMod = (loadU8(hwhdr, 18) and 7).uint8",
         "proc pbuf_take_at(p: ptr Pbuf; dataptr: pointer; length, offset: uint16): ErrT",
-        "let payloadStart = macLen + 8",
-        "var totalLen = 14'u32 + firstPayloadLen",
         "PbufRam = 0x0280.cint",
-        "result = pbuf_alloc(PbufRaw, totalLen.uint16, PbufRam)",
-        "pbuf_take_at(result, addr ethHdr[0], 14'u16, 0'u16)",
-        "let frame = cast[pointer](loadU32(pkt, WifiPktPktOff).uint + msduOffset)",
-        "let frameAvail = firstLen - msduOffset",
-        'exportc: "nimfw_dbg_tcpip_input_mpdu_fail_counts"',
-        "allocMpduEthernetPbuf(msduOffset, pkt)",
-        "for wifiPacketFragmentIndex in 1 ..< WifiPktFragCount:",
-        "WifiPktLenOff + uint(wifiPacketFragmentIndex * 2)",
-        "WifiPktPktOff + uint(wifiPacketFragmentIndex * 4)",
-        "(flags and RxFlagIs80211Mpdu) != 0'u32 and msduOffset == 0'u32",
-        "let usedMpduInput = (flags and RxFlagIs80211Mpdu) != 0'u32 and msduOffset == 0'u32",
-        "if msduOffset >= 14'u32: msduOffset - 14'u32",
-        "allocFramePbuf(resolvedOffset, pkt)",
+        "result = pbuf_alloc(PbufRaw, length, PbufRam)",
+        "pbuf_take_at(result, fragment.data, count, copied)",
+        "if (flags and RxFlagIs80211Mpdu) != 0'u32:",
+        "return inputMonitorFrame(hwhdr, pkt, msduOffset, addr lease)",
+        "defer: discard pbuf_free(packet)",
+        "bl_rx_pkt_cb(cast[ptr uint8](packet.payload), packet.tot_len.cint,",
+        "for index in 0 ..< WifiPktFragCount:",
+        "WifiPktLenOff + (index * 2).uint",
+        "WifiPktPktOff + (index * 4).uint",
+        "if ended or fragmentLength > WifiPktFragmentSize:",
+        "allocFramePbuf(msduOffset, pkt)",
         'exportc: "nimfw_dbg_tcpip_input_mpdu_conv"',
         'exportc: "nimfw_dbg_tcpip_input_mpdu_fail"',
         'exportc: "nimfw_dbg_tcpip_input_mpdu_fail_detail_lo"',
@@ -14151,7 +14603,7 @@ def test_wifi_tcpip_input_converts_80211_mpdu_for_lwip():
         'exportc: "nimfw_dbg_tcpip_input_frame_src0"',
         'exportc: "nimfw_dbg_tcpip_input_frame_pbuf0"',
         'exportc: "nimfw_dbg_tcpip_input_frame_ethertype"',
-        "nimFwDbgTcpipInputFrameLast0 = resolvedOffset or (msduOffset shl 16)",
+        "nimFwDbgTcpipInputFrameLast0 = msduOffset or (msduOffset shl 16)",
         "nimFwDbgTcpipInputFrameSrc0 = loadLe32Bytes(firstPayload, 0)",
         "nimFwDbgTcpipInputFramePbuf0 = loadLe32Bytes(ethernetFrame, 0)",
         "nimFwDbgTcpipInputFrameEthType = etherType.uint32 or (inputPbuf.len.uint32 shl 16)",
@@ -14159,40 +14611,39 @@ def test_wifi_tcpip_input_converts_80211_mpdu_for_lwip():
         'importc: "nimfw_dbg_pbuf_take_fail"',
         "inc nimFwDbgPbufAllocFail",
         "inc nimFwDbgPbufTakeFail",
-            "proc dhcpMessageType(ethernetFrame: pointer; ethernetFrameLength: uint16): uint8",
-            "var dhcpOptionOffset = 282'u",
-            "let dhcpOptionCode = loadU8(ethernetFrame, dhcpOptionOffset)",
-            "let dhcpOptionLength = loadU8(ethernetFrame, dhcpOptionOffset + 1)",
-            "dhcpOptionOffset += 2'u + dhcpOptionLength.uint",
+        "proc dhcpMessageType(ethernetFrame: pointer; ethernetFrameLength: uint16): uint8",
+        "var dhcpOptionOffset = 282'u",
+        "let dhcpOptionCode = loadU8(ethernetFrame, dhcpOptionOffset)",
+        "let dhcpOptionLength = loadU8(ethernetFrame, dhcpOptionOffset + 1)",
+        "dhcpOptionOffset += 2'u + dhcpOptionLength.uint",
         "var ipHeaderSearchOffset = 0'u32",
         "let l4 = ipHeaderSearchOffset + ihl",
         "ipHeaderSearchOffset or (ihl shl 8)",
-        "proc validEthernetAt(uploadFrameData: pointer; firstLen, ethernetHeaderOffset: uint32): bool",
-        "let etherType = loadBe16(uploadFrameData, ethernetHeaderOffset.uint + 12'u)",
-        "var ethernetHeaderSearchOffset = 0'u32",
-        "if validEthernetAt(uploadFrameData, firstLen, ethernetHeaderSearchOffset):",
         "for scanRawByteIndex in 0 ..< nimFwDbgTcpipInputScanRaw.len:",
         "let scanRawByteOffset = ipHeaderSearchOffset + scanRawByteIndex.uint32",
         "nimFwDbgTcpipInputScanRaw[scanRawByteIndex] =",
         "loadU8(uploadFrameData, scanRawByteOffset.uint)",
         "proc noteEthernetInput(inputPbuf: ptr Pbuf): bool",
-        "if not noteEthernetInput(inputPbuf) and",
-        "not usedMpduInput and pkt != nil",
-        "if msduOffset >= 4'u32: msduOffset - 4'u32",
-        "inputPbuf = allocMpduEthernetPbuf(mpduOffset, pkt)",
     ]:
         assert expected in wifi_utils
     for expected in [
         "for noPbufRawByteIndex in 0 ..< nimFwDbgTcpipInputNoPbufRaw.len:",
         "nimFwDbgTcpipInputNoPbufRaw[noPbufRawByteIndex] = 0",
-        "let uploadFrameData = cast[pointer](loadU32(pkt, WifiPktPktOff).uint)",
+        "let saved = csrReadMstatus()",
+        "disableInterrupts()",
+        "if firstLen == 0 or firstLen > WifiPktFragmentSize:",
+        "if address == 0 or address > high(uint32) - (firstLen - 1):",
+        "let uploadFrameData = cast[pointer](address.uint)",
         "let noPbufRawCopyLimit =",
         "for noPbufRawByteIndex in 0 ..< noPbufRawCopyLimit:",
         "loadU8(uploadFrameData, noPbufRawByteIndex.uint)",
     ]:
         assert expected in no_pbuf_body
 
-    assert "inc nimFwDbgTcpipInputMpdu\n        return -1" not in body
+    assert body.index("return inputMonitorFrame(") < body.index("when defined(bl808WifiRxPbufInput):")
+    assert body.index("return inputMonitorFrame(") < body.index("let vif = rxVif(")
+    assert "allocMpduEthernetPbuf" not in wifi_utils
+    assert "findUploadSnapOffset" not in wifi_utils
     for forbidden in [
         "for i in 1 ..< WifiPktFragCount:",
         "WifiPktLenOff + uint(i * 2)",
@@ -14433,36 +14884,193 @@ def test_wifi_rx_debug_traces_use_semantic_ring_slot_names():
         assert "let idx = int(nimFwDbgRxu" not in body
 
 
-def test_wifi_assoc_data_duplicate_filter_requires_retry_bit():
+def test_wifi_assoc_data_duplicate_filter_matches_vendor_seq_cache_gate():
     fw = wifi_fw_policy_source()
-    body = fw.split("proc rxu_cntrl_frame_handle*", 1)[1].split(
+    body = fw.rsplit("proc rxu_cntrl_frame_handle*", 1)[1].split(
         "# .L171: EAPOL detection requires RFC1042 SNAP", 1
     )[0]
     duplicate_block = body.split("# Duplicate sequence check", 1)[1].split(
         "seqCachePtr[] = envSeq", 1
     )[0]
-    assert "let retryFrame = (frameControl and 0x0800'u16) != 0" in duplicate_block
-    assert "let protectedReplayChecked = (env.secFlags and 2) != 0" in duplicate_block
-    assert "if retryFrame and not protectedReplayChecked and" in duplicate_block
-    assert "seqCachePtr[] == envSeq and nimFwDbgRxuAssocUploadReady != 0" in duplicate_block
+    assert "if (frameControl and 0x0800'u16) != 0:" in duplicate_block
+    assert "if seqCachePtr[] == envSeq:" in duplicate_block
+    assert "if frameControl != 0:" not in duplicate_block
+    assert "let protectedReplayChecked = (env.secFlags and 2) != 0" not in duplicate_block
+    assert "nimFwDbgRxuAssocUploadReady != 0" not in duplicate_block
     assert "nimFwDbgRecordRxuDupDrop(frame, hwFlags, envSeq, env.tid" in duplicate_block
     assert "rawFC" not in body
-    assert "seqCtrlEntryTailPadding*: array[182, uint8]" in fw
-    assert "doAssert offsetof(RxuQosSeqCacheEntryView, seqCtrlEntryTailPadding) == 2" in fw
-    assert "staTableToQosSeqCachePadding*: array[169 * 184, uint8]" in fw
-    assert (
-        "doAssert offsetof(RxuQosSeqCacheTableOverlay, staTableToQosSeqCachePadding) == 0"
-        in fw
+    assert "seqCachePtr = rxuQosSeqCachePtr(sta, env.tid)" in body
+    assert "seqCachePtr = addr staRxSequence(sta).nonQosSeqCtrl" in body
+    assert "doAssert offsetof(StaRxSequenceOverlay, nonQosSeqCtrl) == 336" in fw
+    assert "doAssert offsetof(StaRxSequenceOverlay, qosSeqCtrl) == 338" in fw
+    assert "doAssert sizeof(StaRxSequenceOverlay) == 356" in fw
+    assert "RxuQosSeqCacheTableOverlay" not in fw
+    assert "sta.supportedRatesBitmap" not in body
+
+
+def test_wifi_assoc_mgmt_duplicate_filter_uses_retry_and_nonqos_cache():
+    fw = wifi_fw_policy_source()
+    body = fw.rsplit("proc rxu_cntrl_frame_handle*", 1)[1].split(
+        "proc rxu_swdesc_upload_evt*", 1
+    )[0]
+    mgmt = body.split("# frameTypeBits == 0: Management in associated path", 1)[1].split(
+        "# Blob's associated mgmt path", 1
+    )[0]
+    assert "if (frameControl and 0x0800'u16) != 0:" in mgmt
+    assert "let rxSeq = staRxSequence(sta)" in mgmt
+    assert "let cachedSeq = rxSeq.nonQosSeqCtrl" in mgmt
+    assert "rxSeq.nonQosSeqCtrl = envSeq" not in mgmt
+    assert "sta.supportedRatesBitmap" not in mgmt
+    producer = fw.rsplit("proc rxu_mgt_frame_check*", 1)[1].split(
+        "proc rxu_mgt_ind_handler_scanu", 1
+    )[0]
+    policy = producer.index("let ignored = mfpIgnoreRxMgmtFrame(param,")
+    commit = producer.index("rxSeq.nonQosSeqCtrl = envSeq")
+    assert producer.index("let envSeq = env.seqCtrl") < policy < commit
+    guarded_commit = producer[policy:commit]
+    assert "return rxuMgtUpload(param, mfpAcceptedFlag)" in guarded_commit
+    assert "let savedIrq = irqSave()" in guarded_commit
+    assert "defer: irqRestore(savedIrq)" in guarded_commit
+    assert "if not currentFrame(): return 0" in guarded_commit
+    assert "rxUploadCurrent(param, generation) and rxStationCurrent(param)" in producer
+    assert "if mfpAcceptedFlag != 0 and staIdx < STA_INFO_TAB_ENTRIES.uint8:" in guarded_commit
+
+
+def test_wifi_sta_registration_initializes_only_its_own_sequence_caches():
+    fw = wifi_fw_policy_source()
+    body = fw.rsplit("proc sta_mgmt_register*", 1)[1].split(
+        "proc sta_mgmt_unregister*", 1
+    )[0]
+    assert "let rxSeq = staRxSequence(sta)" in body
+    assert "rxSeq.nonQosSeqCtrl = 0xFFFF'u16" in body
+    assert "for seqCtrl in rxSeq.qosSeqCtrl.mitems:" in body
+    assert "seqCtrl = 0xFFFF'u16" in body
+    assert "postponedDescTimerAddr" not in body
+    assert "sta.supportedRatesBitmap =" not in body
+
+
+def test_wifi_rxu_eapol_routes_only_sta_and_ap_vif_types():
+    fw = wifi_fw_policy_source()
+    body = fw.rsplit("proc rxu_cntrl_frame_handle*", 1)[1].split(
+        "proc rxu_swdesc_upload_evt*", 1
+    )[0]
+    eapol_block = body.split("inc nimFwDbgRxuAssocEapol", 1)[1].split(
+        "# .L174: Build status word for host upload", 1
+    )[0]
+
+    for expected in [
+        "let vifType = vif.vifType",
+        "if vifType == 2:",
+        "apm_handle_eapol_input(staIdx, eapolData, eapolLength)",
+        "if vifType notin [0'u8, 2'u8]:",
+        "sm_handle_eapol_input(staIdx, unsafeAddr sourceAddr[0], eapolData, eapolLength)",
+    ]:
+        assert expected in eapol_block
+    assert "else:\n            # STA mode: route EAPOL to SM handler" not in eapol_block
+
+
+def test_wifi_rxu_eapol_requires_complete_authenticated_msdu():
+    fw = wifi_fw_policy_source()
+    body = fw.rsplit("proc rxu_cntrl_frame_handle*", 1)[1].split(
+        "proc rxu_swdesc_upload_evt*", 1
+    )[0]
+    fragment = body.index("if (env.frameCtrl and 0x0400) != 0 or env.fragNum != 0:")
+    preview = body.index("if not rxuPnFresh(env.secKeyPtr, env.tid):")
+    mic = body.index("me_mic_end(addr micCtx[0])")
+    replay = body.index("if rxu_cntrl_check_pn(env.secKeyPtr, env.tid) == 0:")
+    sequence = body.index("seqCachePtr[] = envSeq")
+    delivery = body.index("inc nimFwDbgRxuAssocEapol")
+    assert fragment < preview < mic < replay < sequence < delivery
+    for expected in [
+        "if available < sizeof(RxEapolHeaderView).uint32:",
+        "if eapolLength > available:",
+        "swdesc.mpduLengthBytes -= 8'u16",
+        "if eapolLength > 1736'u32 - offset:",
+        "storage = allocFn(eapolLength)",
+        "not rxuCopyFrameBytes(swdesc, offset, eapolLength, storage)",
+        "defer:\n            if storage != nil:\n              freeFn(storage)",
+    ]:
+        assert expected in body
+    preview_body = fw.split("proc rxuPnFresh", 1)[1].split("proc rxuStripPayloadPrefix", 1)[0]
+    assert "var candidate = key.replayCounters[tid.int]" in preview_body
+    assert "replay_counter_validate(addr candidate, received)" in preview_body
+    assert "key.replayCounters[tid.int] =" not in preview_body
+
+
+def test_wifi_rxu_amsdu_policy_precedes_replay_and_upload():
+    fw = wifi_fw_policy_source()
+    body = fw.rsplit("proc rxu_cntrl_frame_handle*", 1)[1].split(
+        "proc rxu_swdesc_upload_evt*", 1
+    )[0]
+    gate = body.index("not rxuAmsduValid(swdesc, frame, env, vif.vifType,")
+    assert gate < body.index("seqCachePtr[] = envSeq")
+    assert gate < body.index("if rxu_cntrl_check_pn(env.secKeyPtr, env.tid) == 0:")
+    validator = fw.split("proc rxuAmsduValid", 1)[1].split(
+        "proc rxu_cntrl_frame_handle*", 1
+    )[0]
+    for expected in [
+        "(frame.addr1[0] and 1) != 0",
+        "(env.hwRxhdr and 0x1C) != 28",
+        "not rxuCopyFrameBytes(swdesc, offset, sizeof(header).uint32, addr header)",
+        "header.da == SnapDestination or (header.sa[0] and 1) != 0",
+        "header.da != env.da",
+        "header.sa != env.sa",
+        "length > 2304",
+    ]:
+        assert expected in validator
+    assert "doAssert sizeof(RxAmsduSubframeHeaderView) == 14" in fw
+
+
+def test_wifi_rx_control_port_and_pending_wpa_are_enforced():
+    fw = wifi_fw_policy_source()
+    gate = fw.split("proc rxuPortAllows", 1)[1].split("proc rxuAmsduValid", 1)[0]
+    for expected in [
+        "sta.rateWord == lmacGateHalfword(protocol)",
+        "sta.controlPortState != 2",
+        "sta.controlPortState != 1 or not configuredProtocol",
+        "destination[] == localAddress[] or destination[] == PaeGroup",
+    ]:
+        assert expected in gate
+    aggregate = fw.split("proc rxuAmsduValid", 1)[1].split(
+        "proc rxu_cntrl_frame_handle*", 1
+    )[0]
+    assert "rxuPortAllows(sta, snap.ethertype, hasProtocol" in aggregate
+    body = fw.rsplit("proc rxu_cntrl_frame_handle*", 1)[1].split(
+        "proc rxu_swdesc_upload_evt*", 1
+    )[0]
+    assert body.index("not rxuPortAllows(sta, etherType, hasProtocol") < body.index(
+        "seqCachePtr[] = envSeq"
     )
-    assert "doAssert offsetof(RxuQosSeqCacheTableOverlay, entries) == 169 * 184" in fw
-    cache_entry_layout = fw.split(
-        "RxuQosSeqCacheEntryView {.packed.} = object", 1
-    )[1].split("RxuQosSeqCacheTableOverlay {.packed.} = object", 1)[0]
-    cache_table_layout = fw.split(
-        "RxuQosSeqCacheTableOverlay {.packed.} = object", 1
-    )[1].split("ApSelfStaStartOverlay {.packed.} = object", 1)[0]
-    assert "reserved02*" not in cache_entry_layout
-    assert "reservedBefore*" not in cache_table_layout
+    activate = fw.rsplit("proc smActivationApply(", 1)[1].split(
+        "proc smActivationConfirm", 1
+    )[0]
+    owner = fw.rsplit("proc smActivationOwnerCurrent(", 1)[1].split("\nproc ", 1)[0]
+    assert "staInfoForIdx(station).valid != 0" in owner
+    assert "staInfoForIdx(station).instNbr == owner.identity.vif" in owner
+    for expected in [
+        "nimFwWpaPendingMask and (1'u32 shl vifIdx)",
+        "let controlPortState = if wpaPending: 1'u8 else: configuredControlPortState",
+        "smActivation.skipPsDisable = configuredControlPortState != 2",
+    ]:
+        assert expected in activate
+
+
+def test_wifi_rxu_assoc_mgmt_pn_uses_vendor_management_tid():
+    fw = wifi_fw_policy_source()
+    body = fw.rsplit("proc rxu_cntrl_frame_handle*", 1)[1].split(
+        "proc rxu_swdesc_upload_evt*", 1
+    )[0]
+    data_block = body.split("# ---- Data frame (type 2) in associated path ----", 1)[
+        1
+    ].split("# .L170/.L173: Protected + A-MSDU/fragment checks", 1)[0]
+    assoc_mgmt_block = body.split("# frameTypeBits == 0: Management in associated path", 1)[
+        1
+    ].split("# Blob's associated mgmt path", 1)[0]
+
+    assert "const RxuMgmtPnTid = 8'u8" in fw
+    assert "rxu_cntrl_check_pn(env.secKeyPtr, env.tid) == 0:" in data_block
+    assert "env.secKeyPtr,\n               RxuMgmtPnTid) == 0:" in assoc_mgmt_block
+    assert "env.secKeyPtr,\n               env.tid) == 0:" not in assoc_mgmt_block
 
 
 def test_wifi_igtk_install_uses_typed_machw_key_request():
@@ -14473,9 +15081,6 @@ def test_wifi_igtk_install_uses_typed_machw_key_request():
     )[0]
     machw_layout = wifi_fw.split(
         "MachwKeyWriteParamView {.packed.} = object", 1
-    )[1].split("IgtkKeyWriteStackView {.packed.} = object", 1)[0]
-    igtk_stack_layout = wifi_fw.split(
-        "IgtkKeyWriteStackView {.packed.} = object", 1
     )[1].split("SupplicantKeyParamView {.packed.} = object", 1)[0]
 
     for expected in [
@@ -14494,33 +15099,25 @@ def test_wifi_igtk_install_uses_typed_machw_key_request():
         "doAssert offsetof(MachwKeyWriteParamView, macAddr) == 44",
         "doAssert offsetof(MachwKeyWriteParamView, macAddrCipherPadding) == 50",
         "doAssert offsetof(MachwKeyWriteParamView, cipherType) == 52",
-        "IgtkKeyWriteStackView {.packed.} = object",
-        "stackBaseToResultPadding*: array[39, uint8]",
-        "resultByte*: uint8",
-        "req*: MachwKeyWriteParamView",
-        "doAssert sizeof(IgtkKeyWriteStackView) == 96",
-        "doAssert offsetof(IgtkKeyWriteStackView, stackBaseToResultPadding) == 0",
-        "doAssert offsetof(IgtkKeyWriteStackView, resultByte) == 39",
-        "doAssert offsetof(IgtkKeyWriteStackView, req) == 40",
         "template machwKeyWriteParamView(param: pointer): ptr MachwKeyWriteParamView",
     ]:
         assert expected in wifi_fw
 
     for expected in [
-        "let stack = cast[ptr IgtkKeyWriteStackView](addr keyBuf[0])",
-        "let req = addr stack.req",
-        "discard c_memset(cast[pointer](req), 0, sizeof(MachwKeyWriteParamView).csize_t)",
-        "req.keyType = 0xFF'u8",
+        "var request: MachwKeyWriteParamView",
+        "let req = addr request",
+        "req.keyType = 0xFF",
         "req.cipherType = 5",
         "req.keyIdx = vifIdx",
-        "req.addrIdx = keyIdx",
+        "req.addrIdx = keyIdx.uint8",
         "req.keyLen = 16",
         "discard c_memcpy(addr req.keyWords[0], keyData, 16.csize_t)",
         "req.macLen = 6",
-        "discard c_memcpy(addr req.macAddr[0], macAddr, 6.csize_t)",
-        "mm_sec_machwkey_wr(cast[pointer](req))",
-        "let resultByte = stack.resultByte",
-        "discard sm_get_set_machwkey_index(0, vifIdx.uint32, cast[pointer](req), 5)",
+        "discard c_memcpy(addr req.macAddr[0], pn, 6.csize_t)",
+        "var hardwareIndex = mm_sec_machwkey_wr(req)",
+        "sm_get_set_machwkey_index(0, vifIdx.uint32, addr hardwareIndex, 2)",
+        "keyIdx notin [4'u16, 5'u16]",
+        "hardwareIndex == 0xFF",
     ]:
         assert expected in body
 
@@ -14544,7 +15141,7 @@ def test_wifi_igtk_install_uses_typed_machw_key_request():
         "cast[pointer](bufAddr + 84)",
     ]:
         assert forbidden not in body
-    assert "reserved00*" not in igtk_stack_layout
+    assert "IgtkKeyWriteStackView" not in wifi_fw
 
     for forbidden in [
         "reserved02*",
@@ -14571,7 +15168,8 @@ def test_wifi_set_key_tkip_mic_swap_uses_typed_key_data_overlay():
         "keyTypeLenPadding*: array[2, uint8]",
         "keyLenMaterialPadding*: array[3, uint8]",
         "macLenAddrPadding*: array[3, uint8]",
-        "requestedCipher*: uint8",
+        "pairwise*: uint8",
+        "doAssert offsetof(SupplicantKeyParamView, pairwise) == 55",
         "doAssert offsetof(SupplicantKeyParamView, keyTypeLenPadding) == 2",
         "doAssert offsetof(SupplicantKeyParamView, keyLenMaterialPadding) == 5",
         "doAssert offsetof(SupplicantKeyParamView, macLenAddrPadding) == 41",
@@ -14675,15 +15273,25 @@ def test_wifi_cfg_api_element_set_uses_typed_entry_overlay():
         assert expected in set_body
 
     for expected in [
-        "var timerQueueEntry = keTimerQueue.first",
-        "while timerQueueEntry != nil:",
-        "let timerQueueEntryAddr = cast[uint](timerQueueEntry)",
-        "cast[ptr uint16](timerQueueEntryAddr + 4)[]",
-        "cast[ptr uint8](timerQueueEntryAddr + 6)[]",
-        "cast[ptr uint32](timerQueueEntryAddr + 8)[]",
-        "cast[ptr CoListHdr](cast[ptr pointer](cast[uint](timerQueueEntry))[])",
+        "var timerQueueEntry: ptr CoListHdr",
+        "timerQueueEntry = keTimerQueue.first",
+        "remaining = co_list_cnt(addr keTimerQueue)",
+        "while timerQueueEntry != nil and remaining != 0:",
+        "var entry: KeTimerEntry",
+        "if co_list_find(addr keTimerQueue, timerQueueEntry):",
+        "entry = cast[ptr KeTimerEntry](timerQueueEntry)[]",
+        'c_sprintf(columnCursor, "%d", entry.id.cint)',
+        'c_sprintf(columnCursor, "%d", entry.taskId.cint)',
+        'c_sprintf(columnCursor, "%ld", cast[int32](entry.time).clong)',
+        "timerQueueEntry = cast[ptr CoListHdr](entry.next)",
     ]:
         assert expected in timer_dump_body
+
+    for forbidden in [
+        "timerQueueEntryAddr",
+        "cast[ptr pointer](cast[uint](timerQueueEntry))[]",
+    ]:
+        assert forbidden not in timer_dump_body
 
     for expected in [
         "for cfgElementIndex in 0'u32 ..< cfgCount:",
@@ -14725,8 +15333,8 @@ def test_wifi_cfg_api_element_set_uses_typed_entry_overlay():
 def test_wifi_mfp_uses_typed_vif_key_overlays():
     wifi_fw = wifi_fw_policy_source()
 
-    ignore_body = wifi_fw.rsplit("proc mfp_ignore_mgmt_frame*", 1)[1].split(
-        "proc mfp_protect_mgmt_frame*", 1
+    ignore_body = wifi_fw.rsplit("proc mfpIgnoreRxMgmtFrame(", 1)[1].split(
+        "proc mfp_ignore_mgmt_frame*", 1
     )[0]
     protect_body = wifi_fw.rsplit("proc mfp_protect_mgmt_frame*", 1)[1].split(
         "proc mfp_add_mgmt_mic*", 1
@@ -14768,28 +15376,37 @@ def test_wifi_mfp_uses_typed_vif_key_overlays():
     for expected in [
         "let vif = vifChannelForIdx(vifIdx)",
         "let keyPtrs = vifKeyPointers(vif)",
-        "let secCtxPtr = keyPtrs.groupKeyPtr",
+        "if cast[pointer](keyPtrs.groupKeyPtr) == nil:",
         "let ieSearchStart = ieCursorAfter(frameBodyPtr, bodyOff.uint + 2)",
         "let mmie = mmieAt(mmiePtr)",
         "let keyId = mmie.keyId",
-        "if vifKeySlot(vif, keyIdAdj.uint).installed == 0:",
-        "let ipnLo = mmie.ipn[1].uint16 or (mmie.ipn[0].uint16 shl 8)",
-        "let expectedMic = mmieMicWords(mmie)",
-        "let bipKey = vifKeySlot(vif, 0)",
+        "let bipKey = vifKeySlot(vif, keyId.uint)",
+        "if bipKey.installed == 0:",
+        "receivedIpn = receivedIpn or (mmie.ipn[i].uint64 shl (8 * i))",
+        "let expectedMic = mmie.mic",
+        "mmie.mic = expectedMic",
     ]:
         assert expected in ignore_body
 
     for expected in [
-        "let mmie = mmieAt(ieCursorAfter(frameDesc, bodyLen.uint))",
+        "let mmie = mmieAt(ieCursorAfter(frame, frameLen.uint))",
         "mmie.ie.id = 76",
         "mmie.ie.len = 16",
-        "mmie.keyId = sec.staIdx.uint16",
-        "mmie.ipn[ipnByteIndex.int] = ipnByte",
-        "let micWords = mmieMicWords(mmie)",
-        "mmie.mic[micLowByteIndex.int] = ((micV shr (micLowByteIndex * 8)) and 0xFF'u64).uint8",
-        "mmie.mic[micHighByteIndex.int] = ((micV2 shr (micHighByteIndex * 8)) and 0xFF'u64).uint8",
+        "keyId = sec.staIdx.uint16",
+        "mmie.keyId = keyId",
+        "let saved = irqSave()",
+        "irqRestore(saved)",
+        "if currentPn >= 0xFFFFFFFFFFFF'u64:",
+        "mmie.ipn[ipnByteIndex] = ((nextPn shr (ipnByteIndex * 8)) and 255).uint8",
+        "mmie.mic = default(typeof(mmie.mic))",
+        "mmie.mic[micByteIndex] = ((mic shr (micByteIndex * 8)) and 255).uint8",
     ]:
         assert expected in mic_body
+    assert "keySnapshot.keyMaterial = sec.keyMaterial" in mic_body
+    assert "mfp_compute_bip(addr keySnapshot, frame, frameLen + 18, 24)" in mic_body
+    assert "txlFrameLeaseMatches(desc, frameLease)" in mic_body
+    assert "rxKeyLastChanged[keyIndex] != keyRevision" in mic_body
+    assert mic_body.count('{.emit: "__asm__ volatile(\\\"\\\" ::: \\\"memory\\\");".}') == 4
 
     assert "var idx = 0'u32" not in mic_body
     assert "idx = 0" not in mic_body
@@ -14829,14 +15446,11 @@ def test_wifi_tx_policy_writers_use_typed_overlay():
     update_body = wifi_fw.split("proc me_update_buffer_control*", 1)[1].split(
         "proc me_tx_cfm_singleton*", 1
     )[0]
-    init_body = wifi_fw.split("proc rc_init*(staEntry: pointer)", 1)[1].split(
-        "{.emit: \"__attribute__((optimize(\\\"crossjumping\\\"))) void rc_check",
-        1,
-    )[0]
+    init_body = nim_procedure(
+        (ROOT / "src/bl808/wifi/fw/rate_control.nim").read_text(), "rcTryInitStation")
     init_retry_policy_body = init_body.split(
-        "let retryIndexOffsets = [RCS_MAX_TP_IDX, RCS_MAX_TP2_IDX, RCS_MAX_PROB_IDX, RCS_RESERVED_U16]",
-        1,
-    )[1].split("# Read MACHW timestamp low for TX descriptor", 1)[0]
+        "for retryPolicySlotIndex in 0 ..< 4:", 1
+    )[1].split("rcU32(stats, 0) = regRead(MACHW_TIMLO_REG)", 1)[0]
     bcmc_body = wifi_fw.split("proc rc_init_bcmc_rate*", 1)[1].split(
         "proc rc_check_fixed_rate_config*", 1
     )[0]
@@ -14881,14 +15495,15 @@ def test_wifi_tx_policy_writers_use_typed_overlay():
 
     for expected in [
         "for retryPolicySlotIndex in 0 ..< 4:",
-        "let retryIdx = rcU8(stats, retryIndexOffsets[retryPolicySlotIndex]).uint16",
-        "policy.retryRate[retryPolicySlotIndex] = packed",
+        "let retryIdx = rcRetryStep(stats, retryPolicySlotIndex).rateIdx",
+        "policy.retryRate[retryPolicySlotIndex] =",
+        "rcRateStats(stats, retryIdx.int).rateConfig.uint32 or 0x80000000'u32",
         "policy.status = 0xBADCAB1E'u32",
         "policy.bufferAddr = bufAddr",
-        "policy.bufferMask = (1'u32 shl (ntx2.uint32 + 1'u32)) - 1'u32",
-        "policy.packetType = pktType",
+        "(1'u32 shl (ntx2.uint32 + 1)) - 1",
+        "policy.packetType = ((infoIdx.uint32 + 8) and 0xFF) shl 10",
         "policy.controlInfo = 0xFFFF0704'u32",
-        "policy.edcaParam0 = 0x2200'u32",
+        "policy.edcaParam0 = 0x2200",
         "policy.edcaParam1 = cast[uint32](cast[uint](sta.vif))",
     ]:
         assert expected in init_body
@@ -14996,15 +15611,26 @@ def test_wifi_tx_security_header_uses_packet_number_word_names():
     for expected in [
         "securityHeader.packetNumberLowWord = packetNumber.lo",
         "securityHeader.keyIdAndPacketNumberMidWord =",
-        "(keyIdByte.uint16 shl 14) or packetNumber.mid",
-        "securityHeader.tkipPacketNumberMidWord = packetNumber.mid",
-        "securityHeader.tkipPacketNumberHighWord = packetNumber.hi",
+        "let keyIdByte = txKey.staIdx and 0x03'u8",
+        "(keyIdByte.uint16 shl 14) or (packetNumber.mid and 0x00FF'u16)",
+        "writeTxTkipHeader(headerStart, hostTxDesc, txKey)",
+        "let headerStart = cast[pointer](cast[uint](secHdr) - headerLen)",
+        "return headerStart",
         "secWords.packetNumberLowWord.uint32 or",
         "(secWords.keyIdAndPacketNumberMidWord.uint32 shl 16)",
         "secWords.tkipPacketNumberMidWord.uint32 or",
         "(secWords.tkipPacketNumberHighWord.uint32 shl 16)",
     ]:
         assert expected in body
+    assert "(keyIdByte.uint16 shl 14) or packetNumber.mid" not in body
+
+    tkip = wifi_fw.split("proc writeTxTkipHeader", 1)[1].split(
+        "proc txSecControlTemplate", 1
+    )[0]
+    assert "tkipHeader.tsc1 = txDesc.pnScratch[1]" in tkip
+    assert "tkipHeader.wepSeed = (tkipHeader.tsc1 or 0x20'u8) and 0x7F'u8" in tkip
+    assert "tkipHeader.tsc0 = txDesc.pnScratch[0]" in tkip
+    assert "tkipHeader.keyId = ((txKey.staIdx and 0x03'u8) shl 6) or 0x20'u8" in tkip
 
     for forbidden in [
         "w0*: uint16",
@@ -15054,14 +15680,14 @@ def test_wifi_rate_control_counters_use_typed_overlays():
         "MeRcSetRateReqPayload {.packed.} = object", 1
     )[1].split("MeTrafficIndReqPayload {.packed.} = object", 1)[0]
     rc_reset_layout = wifi_fw.split(
-        "RcRateResetFieldsView {.packed.} = object", 1
+        "RcRateStatsView {.packed.} = object", 1
     )[1].split("RcRetrySlotView {.packed.} = object", 1)[0]
     rc_retry_slot_layout = wifi_fw.split(
         "RcRetrySlotView {.packed.} = object", 1
     )[1].split("RcStatsCounterView {.packed.} = object", 1)[0]
     rc_rate_entry_layout = wifi_fw.split(
         "RcRateEntryView {.packed.} = object", 1
-    )[1].split("RcRateResetFieldsView {.packed.} = object", 1)[0]
+    )[1].split("RcRateStatsView {.packed.} = object", 1)[0]
     rc_stats_layout = wifi_fw.split(
         "RcStatsCounterView {.packed.} = object", 1
     )[1].split("TxFrameEnvView {.packed.} = object", 1)[0]
@@ -15074,23 +15700,25 @@ def test_wifi_rate_control_counters_use_typed_overlays():
     sort_body = wifi_fw.rsplit("proc rc_sort_samples_tp*", 1)[1].split(
         "proc rc_calc_prob_ewma*", 1
     )[0]
-    init_body = wifi_fw.rsplit("proc rc_init*", 1)[1].split(
-        "proc rc_check*", 1
-    )[0]
+    init_body = nim_procedure(
+        (ROOT / "src/bl808/wifi/fw/rate_control.nim").read_text(), "rcTryInitStation")
+    count_body = wifi_fw.split("proc rc_count_samples", 1)[1].split("proc rc_seed_rate_table", 1)[0]
 
     for expected in [
         "RcRateEntryView {.packed.} = object",
         "rateEntryBaseToAttemptCountersPadding*: array[4, uint8]",
         "attempts*: uint16",
-        "failures*: uint16",
+        "successes*: uint16",
         "probEwma*: uint16",
         "rateConfig*: uint16",
-        "RcRateResetFieldsView {.packed.} = object",
-        "attempts0*: uint16",
-        "successesProbEwmaPadding*: array[3, uint8]",
-        "oldProb*: uint8",
+        "RcRateStatsView {.packed.} = object",
+        "probability*: uint16",
+        "oldProbAvailable*: uint8",
+        "retryCount*: uint8",
+        "rateAllowed*: uint8",
         "sampleSkipped*: uint8",
-        "initialized*: uint8",
+        "RcRetryStepView {.packed.} = object",
+        "throughput*: uint32",
         "RcRetrySlotView {.packed.} = object",
         "rateIdx*: uint16",
         "retrySlotTailPadding*: array[6, uint8]",
@@ -15109,7 +15737,7 @@ def test_wifi_rate_control_counters_use_typed_overlays():
         "bwMax*: uint8",
         "bwToLegacyRateMapPadding*: array[5, uint8]",
         "legacyRateMap*: uint16",
-        "legacyRateMapToFixedRatePadding*: array[2, uint8]",
+        "currentAmsduLen*: uint16",
         "fixedRate*: uint16",
         "MeRcSetRateReqPayload {.packed.} = object",
         "staIdxRatePadding*: uint8",
@@ -15118,10 +15746,13 @@ def test_wifi_rate_control_counters_use_typed_overlays():
         "doAssert offsetof(MeRcSetRateReqPayload, mcsRate) == 4",
         "doAssert sizeof(RcRateEntryView) == RC_RATE_ENTRY_SIZE",
         "doAssert offsetof(RcRateEntryView, rateEntryBaseToAttemptCountersPadding) == 0",
-        "doAssert offsetof(RcRateResetFieldsView, successesProbEwmaPadding) == 2",
-        "doAssert offsetof(RcRateResetFieldsView, oldProb) == 5",
-        "doAssert offsetof(RcRateResetFieldsView, sampleSkipped) == 6",
-        "doAssert offsetof(RcRateResetFieldsView, initialized) == 7",
+        "doAssert sizeof(RcRateStatsView) == RC_RATE_ENTRY_SIZE",
+        "doAssert offsetof(RcRateStatsView, probability) == 4",
+        "doAssert offsetof(RcRateStatsView, oldProbAvailable) == 9",
+        "doAssert offsetof(RcRateStatsView, retryCount) == 10",
+        "doAssert offsetof(RcRateStatsView, rateAllowed) == 11",
+        "doAssert sizeof(RcRetryStepView) == 8",
+        "doAssert offsetof(RcRetryStepView, rateIdx) == 4",
         "doAssert offsetof(RcRetrySlotView, retrySlotTailPadding) == 2",
         "doAssert offsetof(RcStatsCounterView, rateTableToRetrySlotsPadding) == 0",
         "doAssert offsetof(RcStatsCounterView, retrySlots) == 128",
@@ -15133,20 +15764,21 @@ def test_wifi_rate_control_counters_use_typed_overlays():
         "doAssert offsetof(RcStatsCounterView, bwMax) == 188",
         "doAssert offsetof(RcStatsCounterView, bwToLegacyRateMapPadding) == 189",
         "doAssert offsetof(RcStatsCounterView, legacyRateMap) == RCS_RATE_MAP_L",
-        "doAssert offsetof(RcStatsCounterView, legacyRateMapToFixedRatePadding) == 196",
+        "doAssert offsetof(RcStatsCounterView, currentAmsduLen) == 196",
         "doAssert offsetof(RcStatsCounterView, fixedRate) == 198",
         "doAssert sizeof(RcStatsCounterView) == RC_STATS_SIZE",
         "template rcRateEntryAt(p: pointer): ptr RcRateEntryView",
         "template rcRateEntry(stats: pointer, rateEntryIndex: uint16): ptr RcRateEntryView",
-        "template rcRateResetFields(stats: pointer, rateEntryIndex: uint16): ptr RcRateResetFieldsView",
+        "template rcRateStats(stats: pointer, rateEntryIndex: int): ptr RcRateStatsView",
+        "template rcRetryStep(stats: pointer, stepIndex: int): ptr RcRetryStepView",
         "template rcThroughputArray(tpArray: pointer): ptr UncheckedArray[uint32]",
         "template rcStatsCounters(stats: pointer): ptr RcStatsCounterView",
         "proc rcClearRateEntryTransientStats(stats: pointer; rateEntryIndex: uint16) {.inline.}",
-        "let resetFields = rcRateResetFields(stats, rateEntryIndex)",
-        "resetFields.sampleSkipped = 0",
-        "resetFields.initialized = 1",
-        "resetFields.attempts0 = 0",
-        "resetFields.oldProb = 0",
+        "let rateStats = rcRateStats(stats, rateEntryIndex.int)",
+        "rateStats.probability = 0",
+        "rateStats.oldProbAvailable = 0",
+        "rateStats.retryCount = 0",
+        "rateStats.rateAllowed = 1",
     ]:
         assert expected in wifi_fw
 
@@ -15170,8 +15802,8 @@ def test_wifi_rate_control_counters_use_typed_overlays():
         assert forbidden not in rc_stats_layout
 
     for expected in [
-        "let rateEntry = rcRateEntryAt(entry)",
-        "let statsView = if stats != nil: rcStatsCounters(stats) else: nil",
+        "let rateEntry = rcRateEntry(stats, sampleIdx.uint16)",
+        "let statsView = rcStatsCounters(stats)",
         "let probEwma = rateEntry.probEwma",
         "let rateConfig = rateEntry.rateConfig",
         "let ampduLen = statsView.avgAmpduLen",
@@ -15186,57 +15818,66 @@ def test_wifi_rate_control_counters_use_typed_overlays():
         "let retryRateIndex = counters.retrySlots[retrySlotIndex].rateIdx",
         "let retryRateEntry = rcRateEntry(stats, retryRateIndex)",
         "retryRateEntry.attempts = entryAttempts",
-        "retryRateEntry.failures = entryFailures",
-        "if retryRateEntry.attempts < retryRateEntry.failures:",
+        "retryRateEntry.successes = entrySuccesses",
+        "if retryRateEntry.attempts < retryRateEntry.successes:",
         "let stage = counters.updateStage",
         "let retryLimit = counters.retryLimit",
     ]:
         assert expected in update_body
 
     for expected in [
-        "for rateEntryIndex in 0'u32 ..< nRates.uint32:",
-        "let entryPtr = rcRateEntryPtr(stats, rateEntryIndex.int)",
-        "for rateEntryIndex in 0'u32 ..< nR.uint32:",
-        "let statsResetRateEntry = rcRateEntry(stats, rateEntryIndex.uint16)",
-        "statsResetRateEntry.attempts = 0",
-        "statsResetRateEntry.failures = 0",
-        "var leadingZeroCount: cint",
-        "hiMcs = (31 - leadingZeroCount).uint8",
-        "for sortedThroughputSlotIndex in 0'u32 ..< 4:",
-        "let sortedThroughputByteOffset = sortedThroughputSlotIndex * 8",
-        "let storedSortedThroughput = cast[ptr uint16](destBase + sortedThroughputByteOffset + 4)[]",
-        "if tpVal != storedSortedThroughput:",
+        "for rateEntryIndex in 0 ..< nRates:",
+        "rc_calc_prob_ewma(rcRateStats(stats, rateEntryIndex))",
+        "let rateStats = rcRateStats(stats, rateEntryIndex)",
+        "rateStats.attempts = 0",
+        "rateStats.successes = 0",
+        "let ampdu = rcAmpduStats(stats)",
+        "ampdu.ampduPackets = 0",
+        "ampdu.averageLengthQ16 * 96'u32",
+        "var previousIndexes: array[4, uint16]",
+        "if previousIndexes[step] != rcRetryStep(stats, step).rateIdx:",
     ]:
-        assert expected in highest_rate_body if "leadingZeroCount" in expected else expected in stats_body
+        assert expected in stats_body
+
+    assert "rcHighestBit(bitmap).uint16" in highest_rate_body
+    assert "__builtin_clz" not in highest_rate_body
+
+    assert "sortParam" not in stats_body
+    assert "tempEntries" not in stats_body
+    assert "let destBase" not in stats_body
+    assert "if init == 0:" in stats_body
+    assert "if nRates == RC_MAX_RATE_ENTRIES:" in stats_body
+    assert "counters.flags = (counters.flags and not 0x60'u8) or 0x40'u8" in stats_body
 
     for expected in [
-        "for cckRateBitIndex in 0 ..< 4:",
-        "rMap and (1'u16 shl cckRateBitIndex)",
-        "for ofdmRateBitIndex in 4 ..< 12:",
-        "rMap shr ofdmRateBitIndex.uint16",
+        "for cckRateBitIndex in 1 .. 3:",
+        "caps.legacyRateMap and (1'u16 shl cckRateBitIndex)",
+        "for ofdmRateBitIndex in 4 .. 11:",
+        "caps.legacyRateMap shr ofdmRateBitIndex",
     ]:
-        assert expected in init_body
+        assert expected in count_body
 
-    assert "let amsduLen = rcStatsCounters(rcStats).legacyRateMap" in amsdu_body
+    assert "rcStatsCounters(rcStats).currentAmsduLen" in amsdu_body
+    assert "let staIdx = desc.staInfoIdx" in amsdu_body
+    assert 'asm volatile' not in amsdu_body
     assert "cast[ptr uint16](cast[uint](rcStats) + RCS_RATE_MAP_L)" not in amsdu_body
 
     for expected in [
-        "let rateControlStats = rcStatsCounters(rcPtr)",
-        "rateControlStats.fixedRate = 0xFFFF'u16",
-        "var flags = rateControlStats.flags",
-        "rateControlStats.flags = flags",
-        "let rateControlStaInfoIdx = sta.infoIdx",
-        "rc_update_bw_nss_max(\n      rateControlStaInfoIdx, rateControlStats.nssMax, rateControlStats.bwMax)",
-        "rateControlStats.fixedRate = fixedRate",
+        "let caps = rcRateCapabilities(rcPtr)",
+        "let control = rcTrialControl(rcPtr)",
+        "caps.fixedRate = 0xFFFF'u16",
+        "control.info = control.info and not 0x60'u8",
+        "rc_update_bw_nss_max(\n      sta.infoIdx, caps.maxBandwidth, caps.maxNss)",
+        "elif rc_check_fixed_rate_config(rcPtr, fixedRate):",
+        "caps.fixedRate = fixedRate",
     ]:
         assert expected in set_rate_body
 
     assert "staField40" not in set_rate_body
+    assert ".emit:" not in set_rate_body
 
     for expected in [
-        "var sampleRateEntryIndex: int = 1",
-        "while sampleRateEntryIndex < nRates.int - 1:",
-        "rcSetRateConfig(rcStats, sampleRateEntryIndex, randomRate)",
+        "if not rc_seed_rate_table(rcStats):",
         "for rateEntryIndex in 0 ..< nRates.int:",
         "rcClearRateEntryTransientStats(rcStats, rateEntryIndex.uint16)",
     ]:
@@ -15249,26 +15890,27 @@ def test_wifi_rate_control_counters_use_typed_overlays():
         assert forbidden not in wifi_fw
 
     for expected in [
-        "var rateEntryIndex: uint16 = 0",
-        "while rateEntryIndex < rcU16(stats, RCS_N_RATES):",
-        "let preambleRateEntry = rcRateEntry(stats, rateEntryIndex)",
+        "for rateEntryIndex in 0 ..< nRates:",
+        "let preambleRateEntry = rcRateStats(stats, rateEntryIndex)",
         "var rateConfig = preambleRateEntry.rateConfig",
-        "rcClearRateEntryTransientStats(stats, rateEntryIndex)",
+        "rcClearRateEntryTransientStats(stats, rateEntryIndex.uint16)",
         "preambleRateEntry.rateConfig = rateConfig",
+        "rcRateStats(stats, retained)[] = entry[]",
+        "caps.sampleCount = retained.uint16",
     ]:
         assert expected in preamble_body
+    assert "rcRateEntry(stats, rateEntryIndex)" not in preamble_body
 
     for expected in [
         "let tp = rcThroughputArray(tpArray)",
         "for throughputSortIndex in 1 ..< sortPassLimit:",
         "let currentThroughput = tp[throughputSortIndex]",
-        "let previousThroughput = tp[throughputSortIndex - 1]",
-        "var swapEntry {.noinit.}: RcRateEntryView",
-        "let currentRateEntry = rcRateEntryPtr(stats, throughputSortIndex)",
-        "let previousRateEntry = rcRateEntryPtr(stats, throughputSortIndex - 1)",
-        "sizeof(RcRateEntryView).csize_t",
-        "tp[throughputSortIndex] = previousThroughput",
-        "tp[throughputSortIndex - 1] = currentThroughput",
+        "let nextThroughput = tp[throughputSortIndex + 1]",
+        "let currentRateEntry = rcRateStats(stats, throughputSortIndex)",
+        "let nextRateEntry = rcRateStats(stats, throughputSortIndex + 1)",
+        "swap(currentRateEntry[], nextRateEntry[])",
+        "swap(tp[throughputSortIndex], tp[throughputSortIndex + 1])",
+        "sortPassLimit = lastSwap",
     ]:
         assert expected in sort_body
 
@@ -15400,14 +16042,15 @@ def test_wifi_vif_add_key_uses_typed_key_overlays():
         "template vifKeySlot(vif: ptr VifChannelView, slot: uint): ptr VifKeySlotView",
         "template vifKeySlotPtr(vif: ptr VifChannelView, slot: uint): uint32",
         "let req = vifMgmtAddKeyParamView(param)",
-        "let vif = vifChannelForIdx(keySlot)",
-        "let keyView = vifKeySlot(vif, 0)",
-        "let staReplay = vifKeySlot(vif, staIdx.uint)",
-        "staReplay.replayCounters[replayCounterIndex].pnLow = pnLo",
-        "staReplay.replayCounters[replayCounterIndex].pnHigh = pnHi",
+        "let vif = vifChannelForIdx(req.keySlot)",
+        "let keyId = req.staIdx.uint",
+        "let keyView = vifKeySlot(vif, keyId)",
+        "counter.pnLow = (nextPn and 0xFFFFFFFF'u64).uint32",
+        "counter.pnHigh = (nextPn shr 32).uint32",
+        "discard replay_counter_validate(addr counter, received)",
         "let keyPtrs = vifKeyPointers(vif)",
-        "keyPtrs.groupKeyPtr = vifKeySlotPtr(vif, 0)",
-        "keyPtrs.defaultKeyPtr = vifKeySlotPtr(vif, 0)",
+        "keyPtrs.groupKeyPtr = vifKeySlotPtr(vif, keyId)",
+        "keyPtrs.defaultKeyPtr = vifKeySlotPtr(vif, keyId)",
     ]:
         assert expected in wifi_fw if "template " in expected or "Overlay" in expected or "Padding" in expected or "doAssert" in expected else expected in body
 
@@ -15415,7 +16058,6 @@ def test_wifi_vif_add_key_uses_typed_key_overlays():
         "keyTypeLenPadding*: array[2, uint8]",
         "keyLenMaterialPadding*: array[3, uint8]",
         "macLenPnPadding*: array[3, uint8]",
-        "rxPnTailPadding*: array[4, uint8]",
         "doAssert offsetof(VifMgmtAddKeyParamView, keyTypeLenPadding) == 2",
         "doAssert offsetof(VifMgmtAddKeyParamView, keyLenMaterialPadding) == 5",
         "doAssert offsetof(VifMgmtAddKeyParamView, tkipKeyMaterial) == 24",
@@ -15426,7 +16068,7 @@ def test_wifi_vif_add_key_uses_typed_key_overlays():
         "doAssert offsetof(VifMgmtAddKeyParamView, keySlot) == 53",
         "doAssert offsetof(VifMgmtAddKeyParamView, spp) == 54",
         "doAssert offsetof(VifMgmtAddKeyParamView, hasRxPn) == 55",
-        "doAssert offsetof(VifMgmtAddKeyParamView, rxPnTailPadding) == 56",
+        "doAssert sizeof(VifMgmtAddKeyParamView) == 56",
         "proc vif_mgmt_add_key*(param: pointer, hwKeyIdx: uint8)",
     ]:
         assert expected in wifi_fw
@@ -15440,11 +16082,12 @@ def test_wifi_vif_add_key_uses_typed_key_overlays():
         "let vif = vifChannelAt(vifEntry)",
         "let keyView = vifKeySlot(vif, keySlotU)",
         "let keyPtrs = vifKeyPointers(vif)",
-        "let thisKeyBase = vifKeySlotPtr(vif, keySlotU)",
+        "var candidate = vifKeySlotPtr(vif, keySlotU)",
         "for replacementKeySlotIndex in 0'u .. 3'u:",
         "let slotValid = vifKeySlot(vif, replacementKeySlotIndex).installed",
-        "keyPtrs.defaultKeyPtr = vifKeySlotPtr(vif, replacementKeySlotIndex)",
-        "let validFlag = vifKeySlot(vif, keySlotU + 4'u).installed",
+        "keyPtrs.defaultKeyPtr = candidate",
+        "for replacementKeySlotIndex in 4'u .. 5'u:",
+        "keyPtrs.groupKeyPtr = vifKeySlotPtr(vif, replacementKeySlotIndex)",
     ]:
         assert expected in del_body
 
@@ -15581,9 +16224,9 @@ def test_wifi_vif_overlay_helpers_use_field_anchors():
     wifi_fw = wifi_fw_policy_source()
     ht_caps_layout = wifi_fw.split(
         "VifHtCapabilitiesOverlay {.packed.} = object", 1
-    )[1].split("VifHtOperationOverlay {.packed.} = object", 1)[0]
+    )[1].split("VifBssStatusOverlay {.packed.} = object", 1)[0]
     ht_operation_layout = wifi_fw.split(
-        "VifHtOperationOverlay {.packed.} = object", 1
+        "VifBssStatusOverlay {.packed.} = object", 1
     )[1].split("VifApConfigOverlay {.packed.} = object", 1)[0]
     ap_config_layout = wifi_fw.split(
         "VifApConfigOverlay {.packed.} = object", 1
@@ -15599,16 +16242,16 @@ def test_wifi_vif_overlay_helpers_use_field_anchors():
         "extCapToTxBfCapsPadding*: array[2, uint8]",
         "doAssert offsetof(VifHtCapabilitiesOverlay, mcsSetToExtCapPadding) == 19",
         "doAssert offsetof(VifHtCapabilitiesOverlay, extCapToTxBfCapsPadding) == 22",
-        "doAssert offsetof(VifHtOperationOverlay, flags) == 0",
-        "flagsToSecChanPadding*: uint8",
-        "doAssert offsetof(VifHtOperationOverlay, flagsToSecChanPadding) == 2",
+        "doAssert offsetof(VifBssStatusOverlay, protectionFlags) == 0",
+        "phyBandwidth*: uint8",
+        "doAssert offsetof(VifBssStatusOverlay, phyBandwidth) == 3",
         "highestRateToAuthTypePadding*: array[2, uint8]",
         "securityFlagsToBeaconIntervalPadding*: array[26, uint8]",
         "doAssert offsetof(VifApConfigOverlay, highestRateToAuthTypePadding) == 20",
         "doAssert offsetof(VifApConfigOverlay, securityFlagsToBeaconIntervalPadding) == 32",
         "template vifSecurity(vif: ptr VifChannelView): ptr VifSecurityOverlay =\n  cast[ptr VifSecurityOverlay](addr vif.edcaParams[32])",
         "template vifHtCapabilities(vif: ptr VifChannelView): ptr VifHtCapabilitiesOverlay =\n  cast[ptr VifHtCapabilitiesOverlay](addr vif.htCapabilitiesStorage[4])",
-        "template vifHtOperation(vif: ptr VifChannelView): ptr VifHtOperationOverlay =\n  cast[ptr VifHtOperationOverlay](addr vif.edcaParams[20])",
+        "template vifBssStatus(vif: ptr VifChannelView): ptr VifBssStatusOverlay =\n  cast[ptr VifBssStatusOverlay](addr vif.edcaParams[20])",
     ]:
         assert expected in wifi_fw
 
@@ -15635,22 +16278,28 @@ def test_wifi_vif_overlay_helpers_use_field_anchors():
         assert forbidden not in ap_config_layout
 
 
-def test_wifi_sta_bandwidth_overlay_uses_field_anchor():
+def test_wifi_bss_bandwidth_overlay_uses_channel_layout():
     wifi_fw = wifi_fw_policy_source()
+    body = nim_procedure(
+        (ROOT / "src/bl808/wifi/fw/scan_station_ap_me.nim").read_text(), "me_bw_check")
 
     for expected in [
-        "doAssert offsetof(StaInfoView, bandwidthCheckPrefix) == 74",
-        "doAssert sizeof(StaBandwidthOverlay) == 56",
-        "doAssert offsetof(StaBandwidthOverlay, rateInfoPtr) == 0",
-        "doAssert offsetof(StaBandwidthOverlay, bandwidthCheckPadding) == 8",
-        "bandwidthCheckPadding*: array[46, uint8]",
-        "template staBandwidthOverlay(sta: ptr StaInfoView): ptr StaBandwidthOverlay =\n  cast[ptr StaBandwidthOverlay](addr sta.bandwidthCheckPrefix[2])",
+        "doAssert sizeof(BssChannelOverlay) == 132",
+        "doAssert offsetof(BssChannelOverlay, centerFreq1) == 80",
+        "doAssert offsetof(BssChannelOverlay, centerFreq2) == 82",
+        "doAssert offsetof(BssChannelOverlay, bandwidth) == 130",
+        "doAssert offsetof(BssChannelOverlay, phyBandwidth) == 131",
+        "channelToBandwidthPadding*: array[46, uint8]",
+        "template bssChannelAt(p: pointer): ptr BssChannelOverlay =\n  cast[ptr BssChannelOverlay](p)",
     ]:
         assert expected in wifi_fw
 
-    assert "cast[ptr StaBandwidthOverlay](cast[uint](sta) + 76'u)" not in wifi_fw
-    assert "reserved84*: array[46, uint8]" not in wifi_fw
-    assert "addr sta.reserved74[2]" not in wifi_fw
+    for expected in ["let bss = bssChannelAt(param)", "channel.prim20Freq",
+                     "bss.bandwidth = 0", "bss.phyBandwidth = 0",
+                     "bss.centerFreq1 = primaryFreq", "bss.centerFreq2 = 0"]:
+        assert expected in body
+    assert "staInfoAt" not in body
+    assert "StaBandwidthOverlay" not in wifi_fw
 
 
 def test_wifi_vif_channel_view_padding_is_semantic():
@@ -15756,7 +16405,7 @@ def test_wifi_sta_info_padding_uses_contextual_names():
         assert expected in wifi_fw
 
     sta_info_block = wifi_fw.split("StaInfoView {.packed.} = object", 1)[1].split(
-        "StaBandwidthOverlay {.packed.} = object", 1
+        "ApSelfStaStartOverlay {.packed.} = object", 1
     )[0]
     ap_self_sta_start_block = wifi_fw.split(
         "ApSelfStaStartOverlay {.packed.} = object", 1
@@ -15796,8 +16445,8 @@ def test_wifi_sta_control_port_state_uses_semantic_field_name():
     tx_push_body = wifi_fw.split("proc txu_cntrl_push*", 1)[1].split(
         "proc txu_cntrl_reset*", 1
     )[0]
-    vif_state_body = wifi_fw.split("proc mm_set_vif_state_cfm_handler*", 1)[1].split(
-        "proc sm_auth_send*", 1
+    vif_state_body = wifi_fw.rsplit("proc smActivationApply(", 1)[1].split(
+        "proc smActivationConfirm", 1
     )[0]
     sta_add_body = wifi_fw.split("proc me_sta_add_req_handler*", 1)[1].split(
         "proc me_sta_del_req_handler*", 1
@@ -15817,14 +16466,20 @@ def test_wifi_sta_control_port_state_uses_semantic_field_name():
         assert expected in sa_query_body
 
     for expected in [
+        "let sta: ptr StaInfoView =",
+        "if staInfoIdx < STA_INFO_TAB_ENTRIES.uint8:",
+        "if sta == nil:",
+        "if staInfoIdx != 0xFF'u8:",
         "let stationControlPortState = sta.controlPortState",
         "if stationControlPortState == 2:",
         "elif stationControlPortState == 1:",
     ]:
         assert expected in tx_push_body
+    assert "if staInfoIdx != 0xFF:\n    let sta = staInfoForIdx(staInfoIdx)" not in tx_push_body
 
     for expected in [
-        "let controlPortState = 2'u8 - (keyPointerFlags and 1).uint8",
+        "let configuredControlPortState = 2'u8 - (keyPointerFlags and 1).uint8",
+        "let controlPortState = if wpaPending: 1'u8 else: configuredControlPortState",
         "sta.controlPortState = controlPortState",
     ]:
         assert expected in vif_state_body
@@ -15858,10 +16513,12 @@ def test_wifi_mm_sta_delete_uses_vif_overlay_pointer():
     )[0]
 
     assert "let vif = vifChannelForIdx(vifIdx)" in body
-    assert "apm_tx_int_ps_clear(cast[pointer](vif), cast[uint8](psIdx))" in body
-    assert "template mmEnvClearKeepAliveTimestampByte1()" in wifi_fw
-    assert "mm.keepAliveTimestamp = mm.keepAliveTimestamp and not 0x0000FF00'u32" in wifi_fw
-    assert "mmEnvClearKeepAliveTimestampByte1()  # clear byte at mm_env+41" in body
+    assert "apm_tx_int_ps_clear(cast[pointer](vif), bcmcStaIdx)" in body
+    assert "staInfoForIdx(bcmcStaIdx).psMode = 0" in body
+    assert "ke_msg_alloc(MM_PS_CHANGE_IND, TASK_API, TASK_MM," in body
+    assert "cast[ptr MmPsChangeIndPayload]" in body
+    assert "if msg != nil:" in body
+    assert "mmEnvClearKeepAliveTimestampByte1" not in wifi_fw
     assert "let vifEntry = cast[uint](vif)" not in body
     assert "apm_tx_int_ps_clear(cast[pointer](vifEntry), cast[uint8](psIdx))" not in body
     assert "cast[ptr UncheckedArray[uint8]](addr mmEnvView().keepAliveTimestamp)[1]" not in wifi_fw
@@ -15880,7 +16537,7 @@ def test_wifi_ps_check_frame_uses_typed_mac_header():
         "let frameCtrl = hdr.frameControl",
         "let addr1Group = hdr.addr1[0] and 1'u8",
         "if addr1Group != 0:",
-        "Group-addressed frame: check if protected frame",
+        "Blob clears bit 1 for unprotected group frames",
     ]:
         assert expected in body
 
@@ -15892,22 +16549,109 @@ def test_wifi_ps_check_frame_uses_typed_mac_header():
         assert forbidden not in body
 
 
+def test_wifi_ps_check_frame_matches_vendor_fallthroughs():
+    wifi_fw = wifi_fw_policy_source()
+
+    body = wifi_fw.rsplit("proc ps_check_frame*", 1)[1].split(
+        "proc ps_check_tx_frame*", 1
+    )[0]
+
+    for expected in [
+        "if protectedFrame and vif.psOptions == 0:",
+        "vif.flags = vif.flags and not 2'u32",
+        "var psActive = ps.psActive",
+        "let ac = psTxTidToAc(tid)",
+        "vif.flags = vif.flags and not 8'u32",
+        "td_pck_ps_ind(vif.vifIdx, 1)",
+        "if psActive != 0:",
+        "if ps_send_pspoll(vifEntry) == 0:",
+        "vif.flags = vif.flags and not 4'u32",
+    ]:
+        assert expected in body
+
+    for forbidden in [
+        "if ps.psActive == 0:\n    return",
+        "let acBit = (acMap.uint32 shr tid.uint32)",
+        "discard ps_send_pspoll(vifEntry)  # send PS-Poll frame",
+    ]:
+        assert forbidden not in body
+
+
+def test_wifi_ps_check_tx_frame_uses_vendor_sta_tid_abi():
+    wifi_fw = wifi_fw_policy_source()
+
+    push_body = wifi_fw.split(
+        "proc txl_cntrl_push*(param: pointer, ac: uint8): uint8 {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc txl_cntrl_push_int*", 1)[0]
+    ps_body = wifi_fw.split(
+        "proc ps_check_tx_frame*(staIdx: uint8, txTid: uint8): bool {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc ps_polling_frame*", 1)[0]
+
+    assert "let txTid = desc.staIdx" in push_body
+    assert "discard ps_check_tx_frame(staIdx, txTid)" in push_body
+    assert "let sta = staInfoForIdx(staIdx)" in ps_body
+    assert "let ac = psTxTidToAc(txTid)" in ps_body
+    assert "td_pck_ps_ind(vif.vifIdx, 0)" in ps_body
+    assert "staInfoForIdx(txTid)" not in ps_body
+    assert "let ac = sta.infoIdx" not in ps_body
+
+
+def test_wifi_ps_polling_frame_forwards_vif_arg_and_status():
+    wifi_fw = wifi_fw_policy_source()
+
+    polling_body = wifi_fw.split(
+        "proc ps_polling_frame*(vifEntry: pointer): uint8 {.exportc, cdecl, discardable,\n"
+        "    noinline.} =",
+        1,
+    )[1].split("proc ps_traffic_null_1_recovery*", 1)[0]
+    mm_body = wifi_fw.split(
+        "proc mm_set_ps_mode_req_handler*(param: pointer): cint {.exportc, cdecl.} =",
+        1,
+    )[1].split("proc mm_set_ps_mode_cfm_handler*", 1)[0]
+
+    assert "return ps_send_pspoll(vifEntry)" in polling_body
+    assert "discard ps_polling_frame(vifNode)" in mm_body
+
+    for forbidden in [
+        "proc ps_polling_frame*()",
+        "asm volatile(\"mv %0, a0\"",
+        "discard ps_send_pspoll(vifEntry)",
+        "discard ps_polling_frame()",
+    ]:
+        assert forbidden not in polling_body
+        assert forbidden not in mm_body
+
+
 def test_wifi_txu_push_uses_typed_vif_overlay():
     wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.split(
-        "proc txu_cntrl_push*(param: pointer) {.exportc, cdecl.} =",
+        "proc txu_cntrl_push*(param: pointer; ac: uint8): bool {.exportc, cdecl.} =",
         1,
     )[1].split(
         "proc txu_cntrl_cfm*", 1
     )[0]
 
     for expected in [
+        "TxuDropStatusOrdinary = 0x00020000'u32",
+        "TxuDropStatusCryptoPending = 0x00080000'u32",
+        "TxuDropStatusTxNotReady = 0x00100000'u32",
+    ]:
+        assert expected in wifi_fw
+
+    for expected in [
         "let vif = vifChannelForIdx(vifIdx)",
         "let vifEntry = cast[pointer](vif)",
+        "var dropStatus = TxuDropStatusOrdinary",
+        "dropStatus = TxuDropStatusCryptoPending",
+        "dropStatus = TxuDropStatusTxNotReady",
         "vif.psFlags = 1",
+        "let dropErrFlags = 0xC0000000'u32 or dropStatus",
         "if not doDrop and not txl_cntrl_tx_check(vifEntry):",
         "vif.psFlags = 0",
+        "return txl_cntrl_push(param, ac) != 0",
     ]:
         assert expected in body
 
@@ -15916,8 +16660,20 @@ def test_wifi_txu_push_uses_typed_vif_overlay():
         "let vifEntryU = vifBase + vifIdx.uint * VIF_ENTRY_SIZE.uint",
         "vifChannelAt(vifEntryU).psFlags",
         "txl_cntrl_tx_check(cast[pointer](vifEntryU))",
+        "dropErrFlags = 0xC0000000'u32 or vifIdx.uint32",
+        "var dropReason: uint8 = 0",
+        "dropReason = 1",
+        "if dropReason != 0:",
+        "acFromCaller",
+        "dropErrFlags = 0xC0000000'u32 or dropReason.uint32",
     ]:
         assert forbidden not in body
+
+    ipc_tx = wifi_fw.rsplit("proc ipc_emb_tx_evt*", 1)[1].split(
+        "proc ipc_emb_msg_evt*", 1
+    )[0]
+    assert "discard txu_cntrl_push(txParam, 0'u8)" in ipc_tx
+    assert 'asm volatile(\\"mv a1, zero' not in ipc_tx
 
 
 def test_wifi_null_frame_callbacks_use_pointer_addr_helper():
@@ -15934,12 +16690,16 @@ def test_wifi_null_frame_callbacks_use_pointer_addr_helper():
     assert "let csaChan = addr chanCtxtAt(csaCtxPtr).channel" in beacon_body
     assert "let csaCtxFreq = csaChan.primFreq" in beacon_body
     assert "dsParamFreq(csaChan.band, dsParamSetIeAt(dsIe))" in beacon_body
-    assert "var timIeAddrOut {.noinit.}: ptr uint32" in beacon_body
+    assert "timIeAddrOut: ptr uint32): uint32" in beacon_body
+    assert "var timIeAddrOut {.noinit.}" not in beacon_body
     assert "timIeAddrOut[] = 0  # no TIM IE found yet" in beacon_body
     assert "var currentIeAddr = cast[uint](ieBody)" in beacon_body
     assert "let ie = macIeAt(currentIeAddr)" in beacon_body
     assert "timIeAddrOut[] = cast[uint32](currentIeAddr)" in beacon_body
-    assert "cast[pointer](currentIeAddr)" in beacon_body
+    assert "cast[pointer](currentIeAddr + 2)" in beacon_body
+    assert "while remaining >= 2:" in beacon_body
+    assert "if ieLen >= 4:" in beacon_body
+    assert "vif.beaconCrc = crcState" in beacon_body
     assert "currentIeAddr += totalLen" in beacon_body
     assert "let vifU = cast[uint](vif)" not in beacon_body
     assert "cast[uint32](vifU)" not in beacon_body
@@ -15962,21 +16722,65 @@ def test_wifi_ps_set_mode_uses_typed_vif_confirmation_overlays():
     ps_body = wifi_fw.rsplit("proc ps_set_mode*", 1)[1].split(
         "proc ps_check_beacon*", 1
     )[0]
+    mm_body = wifi_fw.split(
+        "proc mm_set_ps_mode_req_handler*(param: pointer): cint {.exportc, cdecl.} =",
+        1,
+    )[1].split(
+        "proc mm_set_ps_mode_cfm_handler*", 1
+    )[0]
+    disable_handle_body = wifi_fw.split(
+        "proc ps_disable_cfm_handle*(vifEntry: pointer): uint32 {.exportc, cdecl.} =",
+        1,
+    )[1].split(
+        "proc ps_enable_cfm*", 1
+    )[0]
+    enable_handle_body = wifi_fw.split(
+        "proc ps_enable_cfm_handle*(vifEntry: pointer) {.exportc, cdecl, noinline.} =",
+        1,
+    )[1].split(
+        "proc ps_dpsm_update*", 1
+    )[0]
 
+    assert "proc ps_set_mode*(mode: uint8, requesterTask: uint8 = TASK_API.uint8)" in wifi_fw
     for expected in [
-        "let vifEntryDisable = cast[pointer](vifChannelForIdx(vifIdxForDisable))",
-        "discard ps_disable_cfm_handle(vifEntryDisable)",
-        "let vifEntryForPs = cast[pointer](vifChannelForIdx(vifIdxForPs))",
-        "ps_enable_cfm_handle(vifEntryForPs)",
+        "ps.mode = requesterTask",
+        "cfmCallback = cast[pointer](ps_enable_cfm)",
+        "var lastVisitedVifEntry: pointer = nil",
+        "let nullFrameStatus = txl_frame_send_null_frame(",
+        "if nullFrameStatus == 1'u8:",
+        "ps.pendingCount = ps.pendingCount - 1",
+        "discard ps_disable_cfm_handle(lastVisitedVifEntry)",
+        "ps_enable_cfm_handle(lastVisitedVifEntry)",
     ]:
         assert expected in ps_body
+    assert "requesterTask" in ps_body
+    assert "ps_set_mode(mode, keMsgHdrFromPayload(param).srcId)" in mm_body
+    assert 'asm volatile(\\"mv %0, a3\\"' not in mm_body
+    assert "ke_msg_send_basic_reply(param, MM_SET_PS_MODE_CFM)" in mm_body
+    assert "ke_msg_send_basic(MM_SET_PS_MODE_CFM, TASK_API, TASK_MM)" not in mm_body
+    assert "mmPsModeComplete()" in disable_handle_body
+    assert "mmPsModeComplete()" in enable_handle_body
+    assert "ps_set_mode(ps.deferredMode, ps.mode)" in disable_handle_body
+    assert "if ps.psActive != 0 and vifEntry != nil:" in enable_handle_body
+    assert "ps.uapsdTimerActive = 1" in enable_handle_body
+    assert "let newFlags = flags and not 0x0C'u8" in enable_handle_body
+    assert "ps_set_mode(ps.deferredMode, ps.mode)" in enable_handle_body
 
     for forbidden in [
         "cast[uint](addr vif_info_tab[0]) +",
+        "cfmCallback = cast[pointer](ps_enable_cfm_handle)",
+        "let vifIdxForDisable = cast[uint8](ps.statusFlags and 0xFF)",
+        "let vifEntryDisable = cast[pointer](vifChannelForIdx(vifIdxForDisable))",
+        "let vifIdxForPs = cast[uint8](ps.statusFlags and 0xFF)",
+        "let vifEntryForPs = cast[pointer](vifChannelForIdx(vifIdxForPs))",
         "vifIdxForDisable.uint * VIF_ENTRY_SIZE.uint",
         "vifIdxForPs.uint * VIF_ENTRY_SIZE.uint",
     ]:
         assert forbidden not in ps_body
+    assert "ps.mode = 0" not in disable_handle_body
+    assert "ps.modeStatusPadding = [0'u8, 0'u8]" not in disable_handle_body
+    assert "let newFlags = flags and not 0x0D'u8" not in enable_handle_body
+    assert "if vifEntry == nil: return" not in enable_handle_body
 
 
 def test_wifi_power_save_null_confirm_count_uses_semantic_names():
@@ -16000,8 +16804,14 @@ def test_wifi_power_save_null_confirm_count_uses_semantic_names():
     )[1].split(
         "proc ps_enable_cfm_handle*", 1
     )[0]
+    check_body = wifi_fw.split(
+        "proc ps_check_tx_status_part0_nim*(vifEntry: pointer, completionFn: pointer): uint32",
+        1,
+    )[1].split(
+        "# Export an alias", 1
+    )[0]
     dpsm_body = wifi_fw.split(
-        "proc ps_dpsm_update*(enable: uint32) {.exportc, cdecl.} =",
+        "proc ps_dpsm_update*(enable: uint32): uint32 {.exportc, cdecl, discardable.} =",
         1,
     )[1].split(
         "proc mm_ap_traffic_probe_cfm*", 1
@@ -16012,17 +16822,44 @@ def test_wifi_power_save_null_confirm_count_uses_semantic_names():
         assert "if pendingNullConfirmCount == 0:" in body
         assert "let cnt = ps.pendingCount" not in body
 
-    for body in [disable_body, timer_body]:
+    for body in [disable_body]:
         assert "let remainingNullConfirmCount = pendingNullConfirmCount - 1" in body
         assert "ps.pendingCount = remainingNullConfirmCount" in body
         assert "if remainingNullConfirmCount != 0:" in body
 
+    assert "ps.pendingCount = 0" in timer_body
+    assert "let remainingNullConfirmCount = pendingNullConfirmCount - 1" not in timer_body
+    assert "ps.pendingCount = remainingNullConfirmCount" not in timer_body
+    assert "if remainingNullConfirmCount != 0:" not in timer_body
     assert "ps.pendingCount = pendingNullConfirmCount - 1" in enable_body
+    assert "let threshold = blPsParamsView().nullRetryLimit" in check_body
 
     for expected in [
+        "BlPsParamsView {.packed.} = object",
+        "nullRetryLimit*: uint32",
+        "txNullTimeout*: uint32",
+        "doAssert sizeof(BlPsParamsView) == 20",
+        "doAssert offsetof(BlPsParamsView, nullRetryLimit) == 12",
+        "doAssert offsetof(BlPsParamsView, txNullTimeout) == 16",
+        "template blPsParamsView(): ptr BlPsParamsView",
+    ]:
+        assert expected in wifi_fw
+
+    for expected in [
+        "var cfmCallback: pointer",
+        "cfmCallback = cast[pointer](ps_disable_cfm)",
+        "cfmCallback = cast[pointer](ps_enable_cfm)",
         "let pendingNullConfirmSnapshot = ps.pendingCount",
         "ps.pendingCount = pendingNullConfirmSnapshot + 1",
-        "if ps.pendingCount == pendingNullConfirmSnapshot + 1:",
+        "chan_is_on_channel(vifPtr)",
+        "discard txl_frame_send_null_frame(staIdx, nil, 0)",
+        "let nullFrameStatus = txl_frame_send_null_frame(",
+        "staIdx, cfmCallback, pointerAddrU32(vifPtr))",
+        "if nullFrameStatus == 1'u8:",
+        "ps.currentVif = vifPtr",
+        "mm_timer_set(psTxNullTimer(), macTimeNow() + blPsParamsView().txNullTimeout)",
+        "return ps_disable_cfm_handle(lastVisitedVifEntry)",
+        "ps_enable_cfm_handle(lastVisitedVifEntry)",
     ]:
         assert expected in dpsm_body
 
@@ -16030,6 +16867,14 @@ def test_wifi_power_save_null_confirm_count_uses_semantic_names():
         "let c = ps.pendingCount",
         "ps.pendingCount = c + 1",
         "if ps.pendingCount == c + 1:",
+        "if ps.pendingCount == pendingNullConfirmSnapshot + 1:",
+        "ps.deferredMode = 0",
+        "let vifAddr = cast[uint](vif)",
+        "chan_is_on_channel(cast[pointer](vifAddr))",
+        "cast[pointer](ps_enable_cfm), cast[uint32]",
+        "cast[pointer](ps_disable_cfm), cast[uint32]",
+        "let timeout = cast[uint32](ps.uapsdTimerCallback)",
+        "mm_timer_set(psUapsdTimer(), macTime + timeout)",
     ]:
         assert forbidden not in dpsm_body
 
@@ -16048,7 +16893,7 @@ def test_wifi_ap_traffic_probe_uses_semantic_keepalive_budget_name():
         "let keepAliveMissBudget = mm.keepAliveLimit",
         "if keepAliveMissBudget == 0:",
         "mm.keepAliveLimit = keepAliveMissBudget - 1",
-        "mm_send_connection_loss_ind(vifIdx, 22)",
+        "mm_send_connection_loss_ind(vifEntry, 22)",
     ]:
         assert expected in body
 
@@ -16079,7 +16924,9 @@ def test_wifi_null_frame_and_postponed_service_use_typed_overlays():
         "proc txl_frame_send_selfcts_frame*", 1
     )[0]
     selfcts_body = wifi_fw.split(
-        "proc txl_frame_send_selfcts_frame*(vifInfo: pointer, duration: uint16, rateConfig: uint32, navValue: uint32) {.exportc, cdecl.} =",
+        "proc txl_frame_send_selfcts_frame*(vifInfo: pointer, duration: uint16,\n"
+        "    cfmCallback: pointer, cfmArg: uint32): uint8 {.exportc, cdecl,\n"
+        "    discardable.} =",
         1,
     )[1].split(
         "const WifiTxFrameSuccessfulBit", 1
@@ -16118,9 +16965,15 @@ def test_wifi_null_frame_and_postponed_service_use_typed_overlays():
         "hdr.header.frameControl",
         "hdr.header.seqCtrl",
         "hdr.header.addr1",
-        "pushedHdr.header.frameControl",
     ]:
         assert expected in wifi_fw
+
+    for body in [null_body, qosnull_body]:
+        after_handoff = body.split("let pushRc = txl_frame_push(frame, 3)", 1)[1]
+        assert "desc." not in after_handoff
+        assert "hostTxDataHeader" not in after_handoff
+        assert "hostTxQosDataHeader" not in after_handoff
+        assert "txlFramePreparationCurrent(desc, identity, generation)" in body
 
     for forbidden in [
         "data*: MacDataFrameHeaderView",
@@ -16131,22 +16984,41 @@ def test_wifi_null_frame_and_postponed_service_use_typed_overlays():
         assert forbidden not in qosnull_body
 
     for expected in [
-        "let aux = hostTxAuxWords(desc)",
-        "aux.rateConfig = rateConfig",
-        "aux.navValue = navValue",
+        "if frame == nil:\n    return 1'u8",
+        "tpc_update_frame_tx_power(vifInfo, frame)",
+        "desc.callback = cfmCallback",
+        "desc.callbackArg = cast[pointer](cfmArg.uint)",
+        "let pushRc = txl_frame_push(frame, 3)",
+        "return (pushRc xor 1'u8) and 0xFF'u8",
     ]:
         assert expected in selfcts_body
+    assert selfcts_body.index("tpc_update_frame_tx_power(vifInfo, frame)") < selfcts_body.index(
+        "let hdr = hostTxCtsHeader(desc)"
+    )
+    for forbidden in [
+        "let aux = hostTxAuxWords(desc)",
+        "aux.rateConfig",
+        "aux.navValue",
+        "rateConfig",
+        "navValue",
+    ]:
+        assert forbidden not in selfcts_body
 
     for expected in [
         "for staPostponedVifIndex in 0'u8 ..< MAX_VIFS.uint8:",
         "let vif = vifChannelForIdx(staPostponedVifIndex)",
-        "let vifEntry = cast[pointer](vif)",
-        "let staEntry = cast[pointer](staInfoForIdx(vif.staIdx))",
-        "if txl_cntrl_tx_check(vifEntry):",
+        "let sta = staInfoForIdx(vif.staIdx)",
+        "owners[staPostponedVifIndex] = staPostponedOwner(cast[pointer](sta))",
+        "let vif = vifChannelForIdx(owner.vif)",
+        "let txReady = txl_cntrl_tx_check(cast[pointer](vif))",
+        "if not txReady or not current(): continue",
         "let postponedFramesSent =",
-        "sta_mgmt_send_postponed_frame(vifEntry, staEntry, remaining)",
+        "sta_mgmt_send_postponed_frame(cast[pointer](vif), owner.entry, maxFrames - sent)",
     ]:
         assert expected in service_body
+    assert service_body.index("vif.staIdx >= STA_INFO_TAB_ENTRIES.uint8") < service_body.index(
+        "let sta = staInfoForIdx(vif.staIdx)"
+    )
 
     assert "for postponedCountStaIndex in 0'u8 ..< STA_INFO_TAB_ENTRIES.uint8:" in count_body
     assert "let sta = staInfoForIdx(postponedCountStaIndex)" in count_body
@@ -16173,25 +17045,19 @@ def test_wifi_null_frame_and_postponed_service_use_typed_overlays():
         assert forbidden not in count_body
 
 
-def test_wifi_frame_active_scan_uses_typed_sta_overlays():
+def test_wifi_frame_recovery_does_not_infer_free_slots_from_queues():
     wifi_fw = wifi_fw_policy_source()
 
-    body = wifi_fw.split("proc txl_frame_desc_active", 1)[1].split(
-        "proc txl_frame_rebuild_free_list", 1
+    body = wifi_fw.split("proc txl_frame_free_list_pop", 1)[1].split(
+        "proc txl_frame_free_list_push", 1
     )[0]
 
-    assert "for postponedStaIndex in 0 ..< STA_INFO_TAB_ENTRIES:" in body
-    assert "let sta = staInfoForIdx(postponedStaIndex.uint8)" in body
-    assert "txl_frame_list_contains(addr sta.postponedList, frameDescPointer)" in body
-    for forbidden in [
-        "txl_frame_list_contains(addr sta.postponedList, p)",
-        "for i in 0 ..< STA_INFO_TAB_ENTRIES:",
-        "let sta = staInfoForIdx(i.uint8)",
-        "let staBase = cast[uint](addr sta_info_tab[0])",
-        "staInfoAt(staBase + i.uint * STA_ENTRY_SIZE.uint)",
-        "cast[uint](addr sta_info_tab[0]) +",
-    ]:
-        assert forbidden not in body
+    assert "txl_frame_rebuild_free_list" not in wifi_fw
+    assert "txl_frame_desc_active" not in wifi_fw
+    assert "let index = txl_frame_desc_index(cast[pointer](node))" in body
+    assert "(seen and (1'u32 shl index)) != 0" in body
+    assert "freeList.last != last" in body
+    assert "co_list_pop_front(freeList)" in body
 
 
 def test_wifi_tpc_update_vif_tx_power_uses_typed_sta_list_overlay():
@@ -16260,14 +17126,13 @@ def test_wifi_ap_start_uses_vif_overlay_for_channel_and_security():
     )[1].split("ScanStartReqPayload {.packed.} = object", 1)[0]
 
     assert "template vifChannelTypeByte(vif: ptr VifChannelView): ptr uint8 =\n  cast[ptr uint8](addr vif.flags)" in wifi_fw
-    assert "vifChannelTypeByte(vif)[] = req.channel.chanType" in body
-    assert "let embedded = apm_embedded_enabled(cast[pointer](vif))" in body
+    assert "chan_ctxt_link(contextIndex, vifIdx)" in body
+    assert "if req.embedded != 0:" in body
     assert "let apConfig = vifApConfig(vif)" in body
     assert "let securityState = vifSecurity(vif)" in body
-    assert "let txPowerChannel = vif.operChan" in body
-    assert "let channel = cast[ptr ScanChannelEntry](txPowerChannel)" in body
-    assert "txPowerByte = cast[ptr uint8](addr channel.txPower)[]" in body
-    assert "tpc_update_vif_tx_power(\n     cast[pointer](vif)," in body
+    assert "cast[ptr ScanChannelEntry](apChannel).txPower = req.channel.txPower" in body
+    assert "var txPowerByte = req.channel.txPower.uint8" in body
+    assert "tpc_update_vif_tx_power(cast[pointer](vif), addr txPowerByte, addr txPowerRateParam)" in body
     assert "let vifBase = cast[uint](vif)" not in body
     assert "cast[ptr uint8](vifBase + 4)" not in body
     assert "cast[ptr uint8](cast[uint](txPowerChannel) + 4)" not in body
@@ -16296,8 +17161,8 @@ def test_wifi_ap_start_uses_vif_overlay_for_channel_and_security():
     assert "c_memcpy(addr req.bssid[0], cast[pointer](addr vif.macAddr[0]), 6)" in bss_body
     assert "let vif = vifChannelForIdx(instNbr)" in bcn_body
 
-    assert "for duplicateStaSlotIndex in 0'u ..< 5'u:" in assoc_body
-    assert "let duplicateStaSlot = apmStaSlot(duplicateStaSlotIndex)" in assoc_body
+    assert "for slotIndex in 0'u ..< 5'u:" in assoc_body
+    assert "let slot = apmStaSlot(slotIndex)" in assoc_body
     assert "for i in 0'u ..< 5'u:" not in assoc_body
     assert "let slot = apmStaSlot(i)" not in assoc_body
 
@@ -16305,36 +17170,34 @@ def test_wifi_ap_start_uses_vif_overlay_for_channel_and_security():
         "ApmStartInfoView {.packed.} = object",
         "staRateSeedToBeaconTemplatePadding*: array[19, uint8]",
         "beaconIntervalToRateInfoPadding*: array[2, uint8]",
-        "vifIdxToBasicRatesPadding*: array[196, uint8]",
+        "doAssert sizeof(ApmStartInfoView) == 52",
         "doAssert offsetof(ApmStartInfoView, staRateSeedToBeaconTemplatePadding) == 13",
         "doAssert offsetof(ApmStartInfoView, beaconIntervalToRateInfoPadding) == 42",
-        "doAssert offsetof(ApmStartInfoView, vifIdxToBasicRatesPadding) == 52",
         "ApmStartChannelView {.packed.} = object",
-        "bandToChanTypePadding*: uint8",
-        "chanTypeToPrimaryFreqPadding*: uint8",
-        "primaryToCenterFreqPadding*: array[2, uint8]",
-        "centerFreqToAuthTypePadding*: array[2, uint8]",
-        "doAssert offsetof(ApmStartChannelView, bandToChanTypePadding) == 3",
-        "doAssert offsetof(ApmStartChannelView, chanTypeToPrimaryFreqPadding) == 5",
-        "doAssert offsetof(ApmStartChannelView, primaryToCenterFreqPadding) == 8",
-        "doAssert offsetof(ApmStartChannelView, centerFreqToAuthTypePadding) == 12",
+        "doAssert sizeof(ApmStartChannelView) == 6",
+        "doAssert offsetof(ApmStartChannelView, flags) == 3",
+        "doAssert offsetof(ApmStartChannelView, txPower) == 4",
         "ApmStartReqView {.packed.} = object",
         "staRateSeedToChannelPadding*: uint8",
-        "flagsToBeaconLengthsPadding*: array[6, uint8]",
-        "beaconIntervalToBeaconFlagsPadding*: array[8, uint8]",
-        "dtimPeriodToSupportedRatesPadding*: uint8",
+        "doAssert sizeof(ApmStartReqView) == 236",
+        "hiddenToBeaconPadding*: array[2, uint8]",
+        "beaconIntervalToFlagsPadding*: array[2, uint8]",
         "doAssert offsetof(ApmStartReqView, staRateSeedToChannelPadding) == 13",
-        "doAssert offsetof(ApmStartReqView, flagsToBeaconLengthsPadding) == 30",
-        "doAssert offsetof(ApmStartReqView, beaconIntervalToBeaconFlagsPadding) == 42",
-        "doAssert offsetof(ApmStartReqView, dtimPeriodToSupportedRatesPadding) == 67",
+        "doAssert offsetof(ApmStartReqView, hiddenToBeaconPadding) == 30",
+        "doAssert offsetof(ApmStartReqView, beaconIntervalToFlagsPadding) == 42",
+        "doAssert offsetof(ApmStartReqView, qosSupported) == 67",
+        "doAssert offsetof(ApmStartReqView, ssidLength) == 68",
+        "doAssert offsetof(ApmStartReqView, passphrase) == 103",
+        "doAssert offsetof(ApmStartReqView, extraIeLength) == 168",
         "ApmStaDelCfmPayload {.packed.} = object",
-        "statusTailPadding*: array[3, uint8]",
+        "statusTailPadding*: array[2, uint8]",
+        "doAssert ApmStaDelCfmPayloadSize == 3'u32",
         "doAssert offsetof(ApmStaDelCfmPayload, status) == 0",
         "doAssert offsetof(ApmStaDelCfmPayload, statusTailPadding) == 1",
         "ApmStaDelIndPayload {.packed.} = object",
         "staIdxTailPadding*: uint8",
-        "doAssert offsetof(ApmStaDelIndPayload, reason) == 0",
-        "doAssert offsetof(ApmStaDelIndPayload, extra) == 2",
+        "doAssert offsetof(ApmStaDelIndPayload, statusCode) == 0",
+        "doAssert offsetof(ApmStaDelIndPayload, reasonCode) == 2",
         "doAssert offsetof(ApmStaDelIndPayload, staIdx) == 4",
         "doAssert offsetof(ApmStaDelIndPayload, staIdxTailPadding) == 5",
         "ApmStaAddIndPayload {.packed.} = object",
@@ -16382,14 +17245,14 @@ def test_wifi_ap_start_uses_vif_overlay_for_channel_and_security():
 
     for expected in [
         "let msg2 = cast[ptr ApmStaDelIndPayload](",
-        "msg2.reason = reasonCode",
-        "msg2.extra = extra",
+        "msg2.statusCode = statusCode",
+        "msg2.reasonCode = reasonCode",
         "msg2.staIdx = staIdx",
     ]:
         assert expected in sta_delete_body
     assert "for apmStaSlotIndex in 0'u32 ..< 5'u32:" in aid_list_delete_body
     assert "let aidListStaSlot = apmStaSlot(apmStaSlotIndex.uint)" in aid_list_delete_body
-    assert "cast[PlatformLogFunc](logFn)(2, 0, nil, 487, apmStaSlotIndex.uint32)" in aid_list_delete_body
+    assert aid_list_delete_body.index("aidListStaSlot.active = 0") < aid_list_delete_body.index("(remove)(context)")
     assert "for i in 0'u32 ..< 5'u32:" not in aid_list_delete_body
     assert "let slot = apmStaSlot(i.uint)" not in aid_list_delete_body
     assert "let slot = apmStaSlot(apmStaSlotIndex.uint)" not in aid_list_delete_body
@@ -16433,18 +17296,19 @@ def test_wifi_ap_management_prefix_padding_is_semantic():
     )[1].split("ApmAssocStaAddIndPayload {.packed.} = object", 1)[0]
 
     for expected in [
-        "let beaconChangeReq = beaconChangeReqAt(templatePtr)",
-        "let entryFrameLen = beaconChangeReq.frameLen",
-        "let entryFlagByte = beaconChangeReq.flagByte",
-        "let entryHdrLen = beaconChangeReq.headerLen",
-        "csaOffsetsToBeaconDataPadding*: array[2, uint8]",
-        "doAssert offsetof(MmBcnChangeReqPayload, csaOffsetsToBeaconDataPadding) == 10",
-        "rxuHeaderToStaIdxPadding*: array[7, uint8]",
+        "let bcnReq = beaconChangeReqAt(request)",
+        "let frameLength = bcnReq.frameLen",
+        "let timLength = bcnReq.timLength.uint32",
+        "let timOffset = bcnReq.timOffset.uint32",
+        "vifToBeaconDataPadding*: array[2, uint8]",
+        "doAssert offsetof(MmBcnChangeReqPayload, vifToBeaconDataPadding) == 10",
+        "rxuHeaderToStaIdxPadding*: array[5, uint8]",
         "vifIdxToAssocFieldsPadding*: array[7, uint8]",
         "assocByte24ToAssocByte28Padding*: array[3, uint8]",
         "assocFieldsToStaMacPadding*: array[13, uint8]",
         "staMacToReasonPadding*: array[8, uint8]",
-        "doAssert offsetof(ApmRxMgmtPrefixView, rxuHeaderToStaIdxPadding) == 0",
+        "doAssert offsetof(ApmRxMgmtPrefixView, frameLen) == 0",
+        "doAssert offsetof(ApmRxMgmtPrefixView, rxuHeaderToStaIdxPadding) == 2",
         "doAssert offsetof(ApmRxMgmtPrefixView, vifIdxToAssocFieldsPadding) == 9",
         "doAssert offsetof(ApmRxMgmtPrefixView, assocByte24ToAssocByte28Padding) == 25",
         "doAssert offsetof(ApmRxMgmtPrefixView, assocFieldsToStaMacPadding) == 29",
@@ -16498,10 +17362,12 @@ def test_wifi_ap_assoc_ind_payload_padding_is_semantic():
     )[1].split("ApmAssocStaAddIndHtOverlay {.packed.} = object", 1)[0]
 
     for expected in [
-        "aidToStatusPadding*: array[2, uint8]",
+        "uapsdQueues*: uint8",
+        "maxServicePeriod*: uint8",
         "vifIdxToAssocFieldsPadding*: array[2, uint8]",
         "assocFieldsTailPadding*: array[2, uint8]",
-        "doAssert offsetof(ApmAssocStaAddIndPayload, aidToStatusPadding) == 70",
+        "doAssert offsetof(ApmAssocStaAddIndPayload, uapsdQueues) == 70",
+        "doAssert offsetof(ApmAssocStaAddIndPayload, maxServicePeriod) == 71",
         "doAssert offsetof(ApmAssocStaAddIndPayload, vifIdxToAssocFieldsPadding) == 74",
         "doAssert offsetof(ApmAssocStaAddIndPayload, assocFieldsTailPadding) == 86",
     ]:
@@ -16547,8 +17413,8 @@ def test_wifi_mm_state_handlers_use_vif_overlays():
     ps_options_body = wifi_fw.rsplit("proc mm_set_ps_options_req_handler*", 1)[1].split(
         "proc mm_set_vif_state_cfm_handler*", 1
     )[0]
-    vif_state_body = wifi_fw.rsplit("proc mm_set_vif_state_cfm_handler*", 1)[1].split(
-        "proc mm_bcn_change_req_handler*", 1
+    vif_state_body = wifi_fw.rsplit("proc smActivationApply(", 1)[1].split(
+        "proc smActivationConfirm", 1
     )[0]
 
     for expected in [
@@ -16560,7 +17426,7 @@ def test_wifi_mm_state_handlers_use_vif_overlays():
 
     for expected in [
         "let vif = vifChannelForIdx(vifIdx)",
-        "let staIdx = vif.staIdx",
+        "let staIdx = owner.identity.station",
         "let keyPointerFlags = vifKeyPointers(vif).flags",
         "let securityState = vifSecurity(vif)",
     ]:
@@ -16635,9 +17501,12 @@ def test_wifi_mm_payload_padding_fields_are_semantic():
         "doAssert offsetof(MmSetChannelCfmPayload, statusTailPadding) == 1",
         "doAssert offsetof(MmSetPsOptionsReqPayload, vifIdxListenIntervalPadding) == 1",
         "doAssert offsetof(MmSetPsOptionsReqPayload, optionsTailPadding) == 5",
-        "vifQuickConnPadding*: array[11, uint8]",
+        "rssiToTimingPadding*: uint8",
         "quickConnTailPadding*: uint16",
-        "doAssert offsetof(MmStaAddReqPayload, vifQuickConnPadding) == 14",
+        "doAssert offsetof(MmStaAddReqPayload, rssi) == 14",
+        "doAssert offsetof(MmStaAddReqPayload, tsfLow) == 16",
+        "doAssert offsetof(MmStaAddReqPayload, tsfHigh) == 20",
+        "doAssert offsetof(MmStaAddReqPayload, dataRate) == 24",
         "doAssert offsetof(MmStaAddReqPayload, quickConnTailPadding) == 26",
         "staIdxTbttPadding0*: uint8",
         "staIdxTbttPadding1*: uint8",
@@ -16767,8 +17636,9 @@ def test_wifi_txl_buffer_env_uses_typed_backup_queue_overlay():
     ]:
         assert expected in wifi_fw
 
-    assert "txlBufferEnvView().backupQueues[0].first = nil" in reinit_body
-    assert "txlBufferEnvView().backupQueues[0].last = nil" in reinit_body
+    assert "for queue in txlBufferEnvView().backupQueues.mitems:" in reinit_body
+    assert "queue.first = nil" in reinit_body
+    assert "queue.last = nil" in reinit_body
     assert "txlBufferEnvView().backupQueues[0].first = nil" in reset_body
     assert "txlBufferEnvView().backupQueues[0].last = nil" in reset_body
 
@@ -16862,9 +17732,10 @@ def test_wifi_txl_payload_backup_uses_typed_link_rate_fields():
         "forceRate.retryTxPowerControl1 = NimFwForcedMgmtTxPower",
         "forceRate.retryTxPowerControl2 = NimFwForcedMgmtTxPower",
         "let vif = vifChannelForIdx(actual.vifIdx)",
-        "let protFlags = vif.timFlags",
-        "vif.timFlags = protFlags or 2",
-        "vif.timFlags = protFlags and not 2'u8",
+        "let timFlags = vif.timFlags",
+        "let moreData = (backupDesc.macHeader[1] and 0x20'u8) != 0",
+        "vif.timFlags = timFlags or 2",
+        "vif.timFlags = timFlags and not 2'u8",
         "thd.ackPolicyControl = linkDesc.ackPolicyControl",
         "thd.retryLimitControl = linkDesc.retryLimitControl",
         "nimFwDbgProbePayLinkHeaderLen = probeLink.headerLen",
@@ -16879,10 +17750,12 @@ def test_wifi_txl_payload_backup_uses_typed_link_rate_fields():
         "hostTxThdAt(listFirst).next = thdLink",
         "nimFwTrace2U32(\"[WIFI-NIMFW] pay_rate \",\n                         linkDesc.ackPolicyControl,\n                         linkDesc.retryLimitControl)",
     ]:
-        assert expected in wifi_fw if expected.startswith("template ") else expected in body
+        haystack = wifi_fw if expected.startswith("template ") else body
+        assert " ".join(expected.split()) in " ".join(haystack.split())
 
     assert "let secondaryTxHwDesc = cast[pointer](hwDesc.secondaryTxHwDescPtr.uint)" in tx_trigger_body
-    assert "let secStatus = cast[int32](hostTxHwDescAt(secondaryTxHwDesc).controlFlags)" in tx_trigger_body
+    assert "let secView = hostTxHwDescAt(secondaryTxHwDesc)" in tx_trigger_body
+    assert "let secStatus = cast[int32](secView.controlFlags)" in tx_trigger_body
 
     for forbidden in [
         "template hostTxLinkWord(",
@@ -16956,6 +17829,38 @@ def test_wifi_txl_payload_backup_uses_typed_link_rate_fields():
         assert forbidden not in body
 
 
+def test_wifi_txl_payload_backup_keeps_vendor_payload_gate():
+    wifi_fw = wifi_fw_policy_source()
+
+    body = wifi_fw.split(
+        "proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =",
+        1,
+    )[1].split(
+        "proc txl_transmit_trigger*", 1
+    )[0]
+    gate = re.search(r"(?m)^( +)if hasPayload != nil:\n\1  inc nimFwDbgPayHasPayload", body)
+    assert gate is not None
+    indentation = len(gate.group(1))
+    gated_lines = []
+    for line in body[gate.end():].splitlines():
+        if line.strip() and len(line) - len(line.lstrip()) <= indentation:
+            break
+        gated_lines.append(line)
+    gated_block = "\n".join(gated_lines)
+
+    assert "let hasPayload = actual.queueFirst" in body
+    assert "isHeaderOnlyMgmt" not in body
+    assert "hasPayload != nil or" not in body
+    for expected in [
+        "txl_machdr_format(cast[pointer](addr backupDesc.macHeader[0]))",
+        "txu_cntrl_tkip_mic_append(actualDesc)",
+        "thd.ackPolicyControl = linkDesc.ackPolicyControl",
+        "thd.chainedThd = cast[pointer](hostTxRateTemplate(linkDesc))",
+        "thd.retryLimitControl = linkDesc.retryLimitControl",
+    ]:
+        assert expected in gated_block
+
+
 def test_wifi_txl_env_dump_uses_typed_descriptor_overlays():
     wifi_fw = wifi_fw_policy_source()
 
@@ -16982,11 +17887,18 @@ def test_wifi_txl_env_dump_uses_typed_descriptor_overlays():
         "rateDumpHeader1*: uint32",
         "rateDumpHeader2*: uint32",
         "rateDumpHeader3*: uint32",
+        "macControl2*: uint32",
         "primaryPolicyWords*: array[4, uint32]",
         "secondaryPolicyWords*: array[4, uint32]",
         "TxDumpBufferDescView {.packed.} = object",
         "bufferDumpHeader*: uint32",
-        "bufferDumpTail*: uint32",
+        "dataStart*: uint32",
+        "dataEnd*: uint32",
+        "control*: uint32",
+        "TxDumpHwDescView {.packed.} = object",
+        "mediumTimeUsed*: uint32",
+        "doAssert offsetof(TxDumpHwDescView, mediumTimeUsed) == 68",
+        "doAssert sizeof(TxDumpBufferDescView) == 20",
         "template txDumpRateDescAt(p: pointer): ptr TxDumpRateDescView",
         "template txDumpBufferDescAt(p: pointer): ptr TxDumpBufferDescView",
     ]:
@@ -17002,14 +17914,12 @@ def test_wifi_txl_env_dump_uses_typed_descriptor_overlays():
 
     for expected in [
         "let desc = hostTxDescAt(curDesc)",
-        "let thd = desc.hwDesc",
-        "let hw = hostTxHwDescAt(thd)",
-        "let thdStatus = hw.confirmStatus",
+        "hostTxHwDescAt(desc.hwDesc).confirmStatus",
         "curDesc = desc.link.next",
-        "let descriptorStatus = desc.descriptorStatus",
-        "let thdDataLen = hw.frameLen",
-        "let ackPolicyControl = hw.ackPolicyControl",
-        "let thdControlFlags = hw.controlFlags",
+        "let dumpHw = txDumpHwDescAt(desc.hwDesc)",
+        "let hw = addr dumpHw.hardware",
+        "addr hw.magic",
+        "dumpHw.mediumTimeUsed.culong",
         "let rateThdPtr = hw.chainedThd",
         "let rateDumpDesc = txDumpRateDescAt(rateThdPtr)",
         "rateDumpDesc.rateDumpHeader0",
@@ -17018,9 +17928,10 @@ def test_wifi_txl_env_dump_uses_typed_descriptor_overlays():
         "rateDumpDesc.rateDumpHeader3",
         "for primaryPolicyWord in rateDumpDesc.primaryPolicyWords:",
         "for secondaryPolicyWord in rateDumpDesc.secondaryPolicyWords:",
-        "nextRateThd = txDumpRateDescAt(nextRateThd).next",
+        "rateDumpDesc.macControl2.culong",
         "let bufferDumpDesc = txDumpBufferDescAt(bufferDumpDescPtr)",
         "bufferDumpDesc.bufferDumpHeader",
+        "bufferDumpDesc.dataEnd + 1'u32 - bufferDumpDesc.dataStart",
         "bufferDumpDescPtr = bufferDumpDesc.next",
     ]:
         assert expected in dump_body
@@ -17037,6 +17948,8 @@ def test_wifi_txl_env_dump_uses_typed_descriptor_overlays():
         assert forbidden not in push_int_body
 
     for forbidden in [
+        "rateDumpDesc.next",
+        "nextRateThd",
         "let curU = cast[uint](curDesc)",
         "cast[ptr pointer](curU + 112)",
         "cast[ptr pointer](curU)",
@@ -17067,27 +17980,23 @@ def test_wifi_txl_env_dump_uses_typed_descriptor_overlays():
 def test_wifi_disconnect_deauth_uses_typed_frame_overlays():
     wifi_fw = wifi_fw_policy_source()
 
-    body = wifi_fw.rsplit("proc sm_disconnect*(param: pointer)", 1)[1].split(
+    body = wifi_fw.rsplit("proc sm_disconnect*(vifIdx: uint8)", 1)[1].split(
         "proc sm_delete_resources*", 1
     )[0]
 
     for expected in [
-        "let connectInfo = connectInfoView(connectInfoPtr)",
-        "let txDesc = hostTxDescAt(txFrame)",
-        "let deauthHeader = hostTxDataHeader(txDesc)",
-        "let frameBodyPtr = cast[pointer](deauthHeader)",
-        "deauthHeader.seqCtrl = seqCtrl",
-        "c_memcpy(addr deauthHeader.addr1[0], addr connectInfo.bssid[0], 6.csize_t)",
-        "c_memcpy(addr deauthHeader.addr2[0],",
-        "c_memcpy(addr deauthHeader.addr3[0], addr connectInfo.bssid[0], 6.csize_t)",
-        "txDesc.vifIdx = staIdx",
-        "txDesc.staInfoIdx = vif.staIdx",
-        "txDesc.callback = cast[pointer](sm_disconnect_deauth_cfm)",
-        "let deauthFrameControl = deauthHeader.frameControl.uint32",
+        "if vifIdx.int >= MAX_VIFS:",
+        "let vif = vifChannelForIdx(vifIdx)",
+        "if vif.vifType != 0 or vif.state == 0:",
+        "sm_handle_connection(vifIdx, 20'u16, cast[pointer](sm_disconnect_deauth_cfm)",
+        "cast[pointer](sm_disconnect_process)",
     ]:
         assert expected in body
 
     for forbidden in [
+        "connectInfo",
+        "txl_frame_get",
+        "smDisconnectReasonOrDefault",
         "cast[pointer](cast[uint](txFrame) + 348)",
         "cast[uint](smConnInfo) + 4",
         "cast[pointer](cast[uint](txFrame) + 352)",
@@ -17130,17 +18039,24 @@ def test_wifi_sm_delete_resources_does_not_emit_host_indications():
         "vifIdxTailPadding*: array[11, uint8]",
         "doAssert SmDisconnectProcessIndPayloadSize == 16'u32",
         "doAssert offsetof(SmDisconnectProcessIndPayload, vifIdxTailPadding) == 5",
-        "Host indications are sent by sm_connect_ind or",
     ]:
         assert expected in wifi_fw
 
     for expected in [
-        "let msg = cast[ptr SmDisconnectProcessIndPayload](",
-        "msg.status = statusCode",
-        "msg.reason = reasonCode",
-        "msg.vifIdx = vifChannelAt(param).vifIdx",
+        "discard smCleanupBegin(param, disconnected = true, status = statusCode, reason = reasonCode)",
+        "smEnvView().saQueryActive = 0",
+        "ke_timer_clear(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM)",
     ]:
         assert expected in disconnect_body
+    assert "discard smCleanupBegin(param)" in body
+    assert "disconnected = true" not in body
+    for expected in [
+        "if smCleanup.disconnectIndication and smCleanup.indication == nil:",
+        "indication.status = smCleanup.status",
+        "indication.reason = smCleanup.reason",
+        "indication.vifIdx = smCleanup.vifIndex",
+    ]:
+        assert expected in wifi_fw
 
     assert "reserved*" not in disconnect_ind_layout
     assert "reserved*" not in disconnect_process_layout
@@ -17157,8 +18073,8 @@ def test_wifi_sm_delete_resources_does_not_emit_host_indications():
 def test_wifi_sm_deauth_send_uses_typed_frame_overlays():
     wifi_fw = wifi_fw_policy_source()
 
-    body = wifi_fw.rsplit("proc sm_deauth_send*", 1)[1].split(
-        "proc sm_auth_send*", 1
+    body = wifi_fw.rsplit("proc smDeauthSend", 1)[1].split(
+        "proc sm_deauth_send*", 1
     )[0]
 
     for expected in [
@@ -17172,7 +18088,7 @@ def test_wifi_sm_deauth_send_uses_typed_frame_overlays():
         "c_memcpy(addr hdr.addr1[0], bssidPtr, 6.csize_t)",
         "c_memcpy(addr hdr.addr2[0],",
         "c_memcpy(addr hdr.addr3[0], bssidPtr, 6.csize_t)",
-        "hdr.seqCtrl = txl_get_seq_ctrl()",
+        "hdr.seqCtrl = sequence",
         "desc.callbackArg = cast[pointer](vif)",
         "let bodyPtr = cast[pointer](addr link.macHeader[sizeof(MacDataFrameHeaderView)])",
         "let txDesc = hostTxHwDescAt(desc.hwDesc)",
@@ -17219,6 +18135,10 @@ def test_wifi_sm_handle_connection_uses_typed_frame_overlays():
         "txDesc.payloadEnd = payloadLen - 1 + totalLen.uint32",
         "txDesc.frameLen = totalLen.uint32 + 4",
         "desc.callbackArg = cast[pointer](vif)",
+        "if desc.hdrLen != 8 or desc.secTailLen != 8:",
+        "if micLen != 18:",
+        "cast[proc(a: pointer; b, c: uint16) {.cdecl.}](failureFn)",
+        "if smTxSubmit(build, false):\n    return",
     ]:
         assert expected in body
 
@@ -17254,6 +18174,7 @@ def test_wifi_supplicant_deauth_uses_typed_frame_overlays():
     )[0]
 
     for expected in [
+        "reason: uint16",
         "let desc = hostTxDescAt(frame)",
         "let vif = vifChannelForIdx(vifIdx)",
         "tpc_update_frame_tx_power(cast[pointer](vif), frame)",
@@ -17274,6 +18195,8 @@ def test_wifi_supplicant_deauth_uses_typed_frame_overlays():
         "let thd = hostTxHwDescAt(desc.hwDesc)",
         "thd.payloadEnd = payloadStart + 23 + bodyLen",
         "thd.frameLen = bodyLen + 28",
+        "if txl_frame_push(frame, 3) == 0:",
+        "sm_connect_ind(9, reason)",
     ]:
         assert expected in body
 
@@ -17309,19 +18232,9 @@ def test_wifi_supplicant_deauth_uses_typed_frame_overlays():
 
 def test_wifi_auth_assoc_tx_builders_use_typed_overlays():
     wifi_fw = wifi_fw_policy_source()
-
-    auth_body = wifi_fw.rsplit(
-        "proc sm_auth_send*(authSeqNum: uint16, statusCode: uint32) {.exportc, cdecl.} =",
-        1,
-    )[1].split(
-        "proc sm_auth_send_pre*", 1
-    )[0]
-    assoc_body = wifi_fw.rsplit(
-        "proc sm_assoc_req_send*(param: pointer) {.exportc, cdecl.} =",
-        1,
-    )[1].split(
-        "proc sm_assoc_req_send_pre*", 1
-    )[0]
+    builders = (ROOT / "src/bl808/wifi/fw/scan_station_ap_me.nim").read_text()
+    auth_body = nim_procedure(builders, "sm_auth_send")
+    assoc_body = nim_procedure(builders, "sm_assoc_req_send")
 
     assert "doAssert offsetof(VifChannelView, macAddr) == 80" in wifi_fw
     assert "doAssert offsetof(VifChannelView, bssid) == 380" in wifi_fw
@@ -17367,7 +18280,7 @@ def test_wifi_auth_assoc_tx_builders_use_typed_overlays():
         "ssid0",
         "bssid0",
     ]:
-        assert forbidden not in wifi_fw
+        assert re.search(rf"\b{re.escape(forbidden)}\b", wifi_fw) is None
 
     for body, fc_value in [
         (auth_body, "0x00B0'u16"),
@@ -17502,7 +18415,7 @@ def test_wifi_connect_ind_uses_typed_payload_overlay():
     assert "pointerAddrU32(cast[pointer](vif))" in assoc_rsp_body
     assert "let staEntry = cast[pointer](staInfoForIdx(staIdx))" in assoc_rsp_body
     assert "pointerAddrU32(staEntry)" in assoc_rsp_body
-    assert "me_init_rate(staEntry)" in assoc_rsp_body
+    assert "if not meTryInitRate(staEntry):" in assoc_rsp_body
 
     for forbidden in [
         "cast[ptr uint8](m + 11)",
@@ -17552,8 +18465,8 @@ def test_wifi_connect_ind_uses_typed_payload_overlay():
 def test_wifi_sta_add_ind_uses_typed_vif_security_overlays():
     wifi_fw = wifi_fw_policy_source()
 
-    body = wifi_fw.rsplit("proc sm_connection_sta_add_ind*", 1)[1].split(
-        "proc sm_connect_auth_assoc_req", 1
+    body = wifi_fw.rsplit("proc smActivationSendReady(", 1)[1].split(
+        "proc smActivationNotifyCurrent", 1
     )[0]
 
     for expected in [
@@ -17743,6 +18656,63 @@ def test_wifi_rxu_protected_key_uses_typed_key_table_overlay():
         assert forbidden not in body
 
 
+def test_wifi_rxu_protected_handle_uses_vendor_hw_cipher_type_gate():
+    wifi_fw = wifi_fw_policy_source()
+
+    body = wifi_fw.rsplit("proc rxu_cntrl_protected_handle*", 1)[1].split(
+        "proc rxu_cntrl_check_pn*", 1
+    )[0]
+
+    assert "let frameType = hwRxhdrFlags and 0x1C" in body
+    assert "case frameType" in body
+
+    for forbidden in [
+        "proc rxuCipherFrameTypeFromKey",
+        "rawFrameType == 0",
+        "let keyIdxProbe",
+        "let keyProbe",
+        "let inferredFrameType",
+        "rxuCipherFrameTypeFromKey(",
+    ]:
+        assert forbidden not in wifi_fw
+
+
+def test_wifi_rxu_tkip_protected_pn_uses_vendor_tsc_order():
+    wifi_fw = wifi_fw_policy_source()
+
+    body = wifi_fw.rsplit("proc rxu_cntrl_protected_handle*", 1)[1].split(
+        "proc rxu_cntrl_check_pn*", 1
+    )[0]
+
+    assert "TKIP header order is TSC1, WEP seed, TSC0, key id, TSC2..TSC5." in body
+    assert "The replay PN is TSC0,TSC1,TSC2,TSC3,TSC4,TSC5." in body
+    assert "env.secInfo0 = hdr.tsc0.uint32 or (hdr.tsc1.uint32 shl 8) or" in body
+    assert "(hdr.tsc2.uint32 shl 16) or (hdr.tsc3.uint32 shl 24)" in body
+    assert "env.secInfo1 = hdr.tsc4.uint32 or (hdr.tsc5.uint32 shl 8)" in body
+    assert "env.secInfo0 = hdr.tsc1.uint32 or (hdr.tsc0.uint32 shl 8)" not in body
+
+
+def test_wifi_nonassoc_protected_mgmt_accepts_successful_protected_handle():
+    wifi_fw = wifi_fw_policy_source()
+
+    body = wifi_fw.rsplit("proc rxu_cntrl_frame_handle*", 1)[1].split(
+        "proc rxu_swdesc_upload_evt*", 1
+    )[0]
+    nonassoc_mgmt = body.split("# ---- Management frame (type 0) ----", 1)[1].split(
+        "# Management frame filter check", 1
+    )[0]
+
+    assert "if (hwFlags and 0x1C) != 20: doReturn()" in nonassoc_mgmt
+    assert (
+        "if rxu_cntrl_protected_handle(cast[ptr uint8](frame), hwFlags) == 0:"
+        in nonassoc_mgmt
+    )
+    assert (
+        "if rxu_cntrl_protected_handle(cast[ptr uint8](frame), hwFlags) != 0:"
+        not in nonassoc_mgmt
+    )
+
+
 def test_wifi_sta_mgmt_init_uses_typed_sta_and_vif_overlays():
     wifi_fw = wifi_fw_policy_source()
 
@@ -17754,7 +18724,7 @@ def test_wifi_sta_mgmt_init_uses_typed_sta_and_vif_overlays():
         "var freeStaIndex = 0'u8",
         "while freeStaIndex < STA_MGMT_FREE_STAS.uint8:",
         "let sta = staInfoForIdx(freeStaIndex)",
-        "sta_mgmt_entry_init(cast[pointer](sta))",
+        "if not staMgmtResetEntry(staPostponedOwner(cast[pointer](sta)), false):",
         "co_list_push_back(addr sta_info_env, cast[ptr CoListHdr](sta))",
         "let bcStaVif0 = staInfoForIdx(STA_MGMT_FREE_STAS.uint8)",
         "bcStaVif0.instNbr = 0",
@@ -17922,7 +18892,9 @@ def test_wifi_mm_sta_add_confirm_uses_vif_overlays():
         "let vifFlags = vifApConfig(vif).securityFlags",
         "c_memcpy(cast[pointer](addr sta.supportedRates[0]),\n                   addr vif.basicRates[0], 13.csize_t)",
         "c_memcpy(cast[pointer](addr sta.vhtCaps[0]),\n                     cast[pointer](vifHtCapabilities(vif)), 32.csize_t)",
-        "me_set_sta_ht_vht_param(cast[pointer](sta), cast[pointer](vif))",
+        "me_set_sta_ht_vht_param(cast[pointer](sta), cast[pointer](vifHtCapabilities(vif)))",
+        "if not smRegistrationClaim(param, owner, indication): return KeMsgConsumed",
+        "not smRegistrationHandoff(param)",
     ]:
         assert expected in wifi_fw if expected.startswith("doAssert") else expected in body
 
@@ -17937,7 +18909,7 @@ def test_wifi_mm_sta_add_confirm_uses_vif_overlays():
         assert forbidden not in body
 
 
-def test_wifi_me_sta_add_request_uses_vif_ht_overlay():
+def test_wifi_me_sta_add_request_translates_vendor_wire_layout():
     wifi_fw = wifi_fw_policy_source()
 
     body = wifi_fw.rsplit("proc me_sta_add_req_handler*", 1)[1].split(
@@ -17952,33 +18924,50 @@ def test_wifi_me_sta_add_request_uses_vif_ht_overlay():
 
     for expected in [
         "MeStaAddCfmPayload {.packed.} = object",
-        "statusTailPadding*: array[6, uint8]",
+        "doAssert MeStaAddCfmPayloadSize == 2'u32",
         "doAssert offsetof(MeStaAddCfmPayload, staIdx) == 0",
         "doAssert offsetof(MeStaAddCfmPayload, status) == 1",
-        "doAssert offsetof(MeStaAddCfmPayload, statusTailPadding) == 2",
         "MeStaAddReqPayload {.packed.} = object",
+        "doAssert MeStaAddReqPayloadSize == 88'u32",
         "supportedRatesCapBlockPadding*: uint8",
-        "capBlockFlagsPadding*: array[12, uint8]",
-        "capFlagsBeaconIntervalPadding*: array[3, uint8]",
-        "uapsdStaIndexPadding*: uint8",
+        "htCapabilities*: array[32, uint8]",
+        "vhtCapabilities*: array[12, uint8]",
+        "capFlags*: uint32",
         "doAssert offsetof(MeStaAddReqPayload, supportedRatesCapBlockPadding) == 19",
-        "doAssert offsetof(MeStaAddReqPayload, capBlockFlagsPadding) == 52",
-        "doAssert offsetof(MeStaAddReqPayload, capFlagsBeaconIntervalPadding) == 65",
-        "doAssert offsetof(MeStaAddReqPayload, uapsdStaIndexPadding) == 72",
+        "doAssert offsetof(MeStaAddReqPayload, htCapabilities) == 20",
+        "doAssert offsetof(MeStaAddReqPayload, vhtCapabilities) == 52",
+        "doAssert offsetof(MeStaAddReqPayload, capFlags) == 64",
+        "doAssert offsetof(MeStaAddReqPayload, aid) == 68",
+        "doAssert offsetof(MeStaAddReqPayload, vifIdx) == 73",
+        "doAssert offsetof(MeStaAddReqPayload, tsfLow) == 76",
+        "doAssert offsetof(MeStaAddReqPayload, tsfHigh) == 80",
+        "doAssert offsetof(MeStaAddReqPayload, rssi) == 84",
+        "doAssert offsetof(MeStaAddReqPayload, dataRate) == 85",
         "doAssert offsetof(VifHtCapabilitiesOverlay, capInfo) == 0",
     ]:
         assert expected in wifi_fw
 
     for expected in [
         "let cfm = cast[ptr MeStaAddCfmPayload](",
-        "cfm.status = addResult",
-        "let assignedStaIdx = cfm.staIdx",
-        "let vif = vifChannelForIdx(staIdx)",
-        "me_set_sta_ht_vht_param(cast[pointer](sta),\n                            cast[pointer](vifHtCapabilities(vif)))",
+        "ke_msg_alloc(ME_STA_ADD_CFM, requestHeader.srcId, requestHeader.destId,",
+        "if requestHeader.paramLen < 86:",
+        "let vif = vifChannelForIdx(req.vifIdx)",
+        "var registration: MmStaAddReqPayload",
+        "registration.vifIdx = req.vifIdx",
+        "registration.tsfLow = req.tsfLow",
+        "registration.tsfHigh = req.tsfHigh",
+        "registration.rssi = req.rssi",
+        "registration.dataRate = req.dataRate",
+        "cfm.status = mm_sta_add(addr registration, addr cfm.staIdx, addr hardwareIndex)",
+        "let sta = staInfoForIdx(cfm.staIdx)",
+        "me_set_sta_ht_vht_param(cast[pointer](sta), cast[pointer](vifHtCapabilities(vif)))",
+        "sta.aid = req.aid",
+        "sta.psState = req.uapsdQueues",
+        "sta.uapsdBitmap = req.maxServicePeriod",
         "let keyFlagByte = (vifKeyPointers(vif).flags and 0xFF).uint8",
         "let controlPortState = 2'u8 - (keyFlagByte and 1)",
         "sta.controlPortState = controlPortState",
-        "sta.rateWord = vif.apStartBeaconInterval",
+        "sta.rateWord = lmacGateHalfword(vif.apStartBeaconInterval)",
     ]:
         assert expected in body
 
@@ -17991,6 +18980,8 @@ def test_wifi_me_sta_add_request_uses_vif_ht_overlay():
         assert forbidden not in sta_add_req_layout
 
     assert "reserved*" not in sta_add_cfm_layout
+    assert "statusTailPadding*" not in sta_add_cfm_layout
+    assert body.index("sta.aid = req.aid") < body.index("meTryInitRate(cast[pointer](sta))")
 
     for forbidden in [
         "let vifEntryBase = cast[uint](addr vif_info_tab[0]) + staIdx.uint * 1512'u",
@@ -17998,6 +18989,7 @@ def test_wifi_me_sta_add_request_uses_vif_ht_overlay():
         "cast[pointer](vifEntryBase + 348)",
         "cast[ptr uint8](vifEntryBase + 0x5D8)",
         "cast[ptr uint16](vifEntryBase + 0x150)",
+        "mm_sta_add(param,",
     ]:
         assert forbidden not in body
 
@@ -18057,31 +19049,26 @@ def test_wifi_rxu_pn_check_uses_typed_replay_counters():
     )[0]
     key_slot_layout = wifi_fw.split(
         "VifKeySlotView {.packed.} = object", 1
-    )[1].split("TkipMicKeyAreaView {.packed.} = object", 1)[0]
+    )[1].split("RxMicWordsView {.packed.} = object", 1)[0]
     key_replay_layout = wifi_fw.split(
         "KeyReplayCounterView {.packed.} = object", 1
-    )[1].split("ReplayCounterWindowSlot {.packed.} = object", 1)[0]
-    replay_window_slot_layout = wifi_fw.split(
-        "ReplayCounterWindowSlot {.packed.} = object", 1
-    )[1].split("ReplayCounterStateView {.packed.} = object", 1)[0]
+    )[1].split("ReplayCounterStateView = KeyReplayCounterView", 1)[0]
     rx_protected_key_table_layout = wifi_fw.split(
         "VifRxProtectedKeyTableOverlay {.packed.} = object", 1
     )[1].split("VifKeySlotTableOverlay {.packed.} = object", 1)[0]
 
     for expected in [
         "KeyReplayCounterView {.packed.} = object",
-        "replayWindowSlotBytes*: array[8, uint8]",
-        "ReplayCounterWindowSlot {.packed.} = object",
-        "pnSnapshot*: array[8, uint8]",
+        "bitmap*: array[2, uint32]",
+        "ReplayCounterStateView = KeyReplayCounterView",
         "VifKeySlotView {.packed.} = object",
         "replayCounters*: array[8, KeyReplayCounterView]",
         "cipherType*: uint8",
         "hasRxPn*: uint8",
         "hasRxPnTailPadding*: array[3, uint8]",
         "vifBaseToProtectedKeySlotsPadding*: array[528, uint8]",
-        "doAssert offsetof(KeyReplayCounterView, replayWindowSlotBytes) == 8",
-        "doAssert offsetof(ReplayCounterWindowSlot, pnSnapshot) == 0",
-        "doAssert offsetof(ReplayCounterWindowSlot, valid) == 8",
+        "doAssert offsetof(KeyReplayCounterView, bitmap) == 8",
+        "doAssert sizeof(ReplayCounterStateView) == 16",
         "doAssert offsetof(VifRxProtectedKeyTableOverlay, vifBaseToProtectedKeySlotsPadding) == 0",
         "doAssert offsetof(VifKeySlotView, replayCounters) == 0",
         "doAssert offsetof(VifKeySlotView, cipherType) == 152",
@@ -18101,7 +19088,8 @@ def test_wifi_rxu_pn_check_uses_typed_replay_counters():
         "replayCounter.pnLow = nextLo",
         "replayCounter.pnHigh = nextHi",
         "let replayCounterEntry = addr key.replayCounters[adjTid.int]",
-        "let replayCounterEntryAddr = cast[uint](replayCounterEntry)",
+        "let receivedPn = (pnHi.uint64 shl 32) or pnLo.uint64",
+        "return replay_counter_validate(replayCounterEntry, receivedPn).cint",
         "nimFwDbgRxuPnStoredLo = replayCounterEntry.pnLow",
         "nimFwDbgRxuPnStoredHi = replayCounterEntry.pnHigh",
     ]:
@@ -18119,6 +19107,7 @@ def test_wifi_rxu_pn_check_uses_typed_replay_counters():
         "entry.pnHigh = nextHi",
         "let keyType = key.cipherType",
         "if keyType == 0:",
+        '"call replay_counter_validate"',
         "cast[ptr uint32](entryAddr)[]",
         "cast[ptr uint32](entryAddr + 4)[]",
         "nimFwDbgRxuPnStoredLo = cast[ptr uint32](entryAddr)[]",
@@ -18128,7 +19117,6 @@ def test_wifi_rxu_pn_check_uses_typed_replay_counters():
 
     assert "reserved157*" not in key_slot_layout
     assert "reserved8*" not in key_replay_layout
-    assert "reserved00*" not in replay_window_slot_layout
     assert "reserved00*" not in rx_protected_key_table_layout
 
 
@@ -18150,15 +19138,22 @@ def test_wifi_rx_michael_mic_read_uses_typed_word_overlay():
         assert expected in wifi_fw
 
     for expected in [
+        "cast[pointer](secKeyBase + 144),\n                      addr env.da[0],\n                      addr env.sa[0],",
         "var micPayloadBuffer = rxFrameBufferChainAt(swdesc.bufferChain)",
         "while dataLen > 0 and micPayloadBuffer != nil:",
         "let micPayloadBase = cast[uint](micPayloadBuffer.frameData)",
         "var micSegmentStart = micPayloadBase + skipBytes.uint",
         "var micSegmentLen = dataLen + skipBytes",
         "micPayloadBuffer = rxFrameBufferChainAt(micPayloadBuffer.next)",
-        "let micWords = rxMicWordsAt(micPtr)",
-        "rxMic[0] = micWords.lo",
-        "rxMic[1] = micWords.hi",
+        "let rxMicBytes = cast[ptr UncheckedArray[uint8]](addr rxMic[0])",
+        "while micBytesRead < 8:",
+        "if micOff >= MAX_DMA_SEG:",
+        "let bytesToCopy = min(8 - micBytesRead, MAX_DMA_SEG - micOff)",
+        "rxMicBytes[micBytesRead + micByteIndex] = segmentBytes[micOff + micByteIndex]",
+        "micBytesRead += bytesToCopy",
+        "msg.isGroup = ((env.hwRxhdr shr 10) and 1).uint8",
+        "msg.keyId = secKey.staIdx",
+        "ke_msg_alloc(0xC04'u16, TASK_API, TASK_ME, 24)",
     ]:
         assert expected in body
 
@@ -18173,6 +19168,11 @@ def test_wifi_rx_michael_mic_read_uses_typed_word_overlay():
     for forbidden in [
         "cast[ptr uint32](micPtr)[]",
         "cast[ptr uint32](micPtr + 4)[]",
+        "let micWords = rxMicWordsAt(micPtr)",
+        "while micOff > 0 and micBuf != nil:",
+        "msg.tid = tidVal",
+        "msg.hwRxhdrHigh =",
+        "ke_msg_alloc(0xC04'u16, TASK_CFG, TASK_ME, 24)",
     ]:
         assert forbidden not in body
 
@@ -18186,18 +19186,21 @@ def test_wifi_tx_sequence_assignment_uses_typed_sta_overlay():
 
     for expected in [
         "StaTxSequenceOverlay {.packed.} = object",
-        "staBaseToSeqCounterPadding*: array[28, uint8]",
-        "seqCounter*: uint16",
+        "staBaseToSeqCounterPadding*: array[52, uint8]",
+        "seqCounters*: array[9, uint16]",
         "doAssert offsetof(StaTxSequenceOverlay, staBaseToSeqCounterPadding) == 0",
-        "doAssert offsetof(StaTxSequenceOverlay, seqCounter) == 28",
+        "doAssert offsetof(StaTxSequenceOverlay, seqCounters) == 52",
+        "doAssert sizeof(StaTxSequenceOverlay) == 70",
         "template staTxSequence(sta: ptr StaInfoView): ptr StaTxSequenceOverlay",
     ]:
         assert expected in wifi_fw
 
     for expected in [
         "let staSeq = staTxSequence(staInfoForIdx(staInfoForSeq))",
-        "let seqNum = staSeq.seqCounter",
-        "staSeq.seqCounter = nextSeq",
+        "let tid = desc.staIdx",
+        "let seqNum = staSeq.seqCounters[tid.int]",
+        "staSeq.seqCounters[tid.int] = nextSeq",
+        "let nextSeq = (seqNum + 1) and 0xFFF'u16",
         "desc.seqAssigned = seqNum",
     ]:
         assert expected in body
@@ -18211,7 +19214,7 @@ def test_wifi_tx_sequence_assignment_uses_typed_sta_overlay():
 
     seq_layout = wifi_fw.split(
         "StaTxSequenceOverlay {.packed.} = object", 1
-    )[1].split("RxuQosSeqCacheEntryView {.packed.} = object", 1)[0]
+    )[1].split("StaRxSequenceOverlay {.packed.} = object", 1)[0]
     assert "reserved00*" not in seq_layout
 
 
@@ -18236,6 +19239,29 @@ def test_wifi_tx_trigger_dma_status_write_uses_typed_thd_overlay():
     assert "cast[ptr uint32](dmaHead + 16)[]" not in body
 
 
+def test_wifi_tx_trigger_confirm_route_uses_vendor_desc8_gate():
+    wifi_fw = wifi_fw_policy_source()
+
+    body = wifi_fw.split(
+        "proc txl_transmit_trigger*() {.exportc, cdecl.} =",
+        1,
+    )[1].split(
+        "proc txl_current_desc_get*",
+        1,
+    )[0]
+
+    assert "let hostCfm = desc.queueFirst" in body
+    assert "if hostCfm == nil:" in body
+    assert "txl_frame_cfm(descPtr)" in body
+    assert "txl_cfm_push(descPtr, thdStatus.uint32, ac.uint32)" in body
+
+    for forbidden in [
+        "let hostCfm = if desc.usedFlag != 0: desc.queueFirst else: nil",
+        "if desc.usedFlag != 0: desc.queueFirst",
+    ]:
+        assert forbidden not in body
+
+
 def test_wifi_rxu_mgt_ie_start_uses_typed_tail_overlay():
     wifi_fw = wifi_fw_policy_source()
 
@@ -18249,22 +19275,29 @@ def test_wifi_rxu_mgt_ie_start_uses_typed_tail_overlay():
         "channelSignalMetadataPadding*: array[17, uint8]",
         "signalBssidMetadataPadding*: array[21, uint8]",
         "bssidPnPadding*: array[2, uint8]",
-        "hwRxhdrTailPadding*: uint32",
+        "vifIndexTailPadding*: array[5, uint8]",
         "vifTimestampPadding*: array[7, uint8]",
         "phyVectorBodyPadding*: array[3, uint8]",
-        "bufferAddrLengthPadding*: array[16, uint8]",
+        "frameLenFieldAddrs*: array[4, uint32]",
         "rxDescBaseToPayloadDescPadding*: array[8, uint8]",
         "payloadDescToFrameLenPadding*: array[16, uint8]",
-        "frameLenRssiPadding*: array[21, uint8]",
+        "frameLenTimestampPadding*: array[2, uint8]",
+        "timestampRssiPadding*: array[11, uint8]",
         "payloadDescBaseToFrameDataPadding*: array[8, uint8]",
         "doAssert offsetof(RxMicFailureIndView, bssidPnPadding) == 6",
-        "doAssert offsetof(RxMicFailureIndView, hwRxhdrTailPadding) == 20",
+        "doAssert offsetof(RxMicFailureIndView, isGroup) == 16",
+        "doAssert offsetof(RxMicFailureIndView, keyId) == 17",
+        "doAssert offsetof(RxMicFailureIndView, vifIdx) == 18",
+        "doAssert offsetof(RxMicFailureIndView, vifIndexTailPadding) == 19",
         "doAssert offsetof(RxuMgtIndMsgView, vifTimestampPadding) == 9",
         "doAssert offsetof(RxuMgtIndMsgView, phyVectorBodyPadding) == 29",
-        "doAssert offsetof(RxUploadDmaArrayView, bufferAddrLengthPadding) == 16",
+        "doAssert offsetof(RxUploadDmaArrayView, frameLenFieldAddrs) == 16",
         "doAssert offsetof(BeaconRxDescView, rxDescBaseToPayloadDescPadding) == 0",
         "doAssert offsetof(BeaconRxDescView, payloadDescToFrameLenPadding) == 12",
-        "doAssert offsetof(BeaconRxDescView, frameLenRssiPadding) == 30",
+        "doAssert offsetof(BeaconRxDescView, frameLenTimestampPadding) == 30",
+        "doAssert offsetof(BeaconRxDescView, timestampLow) == 32",
+        "doAssert offsetof(BeaconRxDescView, timestampHigh) == 36",
+        "doAssert offsetof(BeaconRxDescView, timestampRssiPadding) == 40",
         "doAssert offsetof(BeaconPayloadDescView, payloadDescBaseToFrameDataPadding) == 0",
         "doAssert offsetof(RxuMgtIndView, frameLenChannelPadding) == 2",
         "doAssert offsetof(RxuMgtIndView, channelSignalMetadataPadding) == 7",
@@ -18308,8 +19341,8 @@ def test_wifi_rxu_mgt_ie_start_uses_typed_tail_overlay():
         ),
         (
             "RxUploadDmaArrayView {.packed.} = object",
-            "RxuUploadEnvView {.packed.} = object",
-            ["reserved16*: array[16, uint8]"],
+            "RxlSubmittedDescView {.packed.} = object",
+            ["reserved16*: array[16, uint8]", "bufferAddrLengthPadding*"],
         ),
         (
             "BeaconRxDescView {.packed.} = object",
@@ -18391,10 +19424,10 @@ def test_wifi_scanu_directed_result_uses_vif_ht_overlay():
     for expected in [
         "doAssert offsetof(VifHtCapabilitiesOverlay, capInfo) == 0",
         "let htCaps = vifHtCapabilities(vifView)",
-        "let htCapabilityOut = cast[pointer](htCaps)",
-        "me_bw_check(htCapabilityOut)",
-        "me_extract_power_constraint(ieStart, ieLen, htCapabilityOut)",
-        "me_extract_country_reg(ieStart, ieLen, htCapabilityOut)",
+        "let bssInfoOut = vifBssInfoBase(vifView)",
+        "me_bw_check(bssInfoOut)",
+        "me_extract_power_constraint(ieStart, ieLen, bssInfoOut)",
+        "me_extract_country_reg(ieStart, ieLen, bssInfoOut)",
     ]:
         assert expected in wifi_fw if expected.startswith("doAssert") else expected in body
 
@@ -18429,12 +19462,14 @@ def test_wifi_sa_query_tx_uses_typed_overlays():
         "c_memcpy(addr hdr.addr1[0], addr sta.macAddr[0], 6.csize_t)",
         "c_memcpy(addr hdr.addr2[0], addr vif.macAddr[0], 6.csize_t)",
         "c_memcpy(addr hdr.addr3[0], addr sta.macAddr[0], 6.csize_t)",
-        "hdr.seqCtrl = seqCtrl",
+        "hdr.seqCtrl = txl_get_seq_ctrl()",
         "let body = saQueryActionBodyAt(addr link.macHeader[bodyOff])",
         "body.category = 8",
-        "body.action = isTx",
+        "body.action = action",
         "body.transId = transId",
-        "txu_cntrl_protect_mgmt_frame(frame, cast[pointer](hdr), 0)",
+        "txu_cntrl_protect_mgmt_frame(frame, cast[pointer](hdr), 24)",
+        "let bodyOff = 24 + desc.hdrLen.int",
+        "if desc.hdrLen != 8 or desc.secTailLen != 8:",
         "tpc_update_frame_tx_power(cast[pointer](vif), frame)",
     ]:
         assert expected in wifi_fw if expected.startswith(("SaQuery", "doAssert", "template")) else expected in tx_body
@@ -18485,13 +19520,13 @@ def test_wifi_sa_query_timeout_uses_sta_vif_overlays():
     )[1].split("ApmEnvView {.packed.} = object", 1)[0]
 
     for expected in [
-        "saQueryVifIdxTransIdPadding*: uint8",
-        "doAssert offsetof(SmEnvView, saQueryVifIdxTransIdPadding) == 39",
+        "saQueryStaIdxTransIdPadding*: uint8",
+        "doAssert offsetof(SmEnvView, saQueryStaIdxTransIdPadding) == 39",
         "let sta = staInfoForIdx(staIdx)",
-        "let vif = vifChannelForIdx(vifIdx.uint8)",
-        "let saQueryVifIdxTransIdPadding = sm.saQueryVifIdxTransIdPadding",
-        "cast[pointer](sta), vifIdx)",
-        "sm_disconnect_process(cast[pointer](vif), 20, 0xFFFF'u16)",
+        "let vif = vifChannelForIdx(vifIdx)",
+        "let vifIdx = sta.instNbr",
+        "let reason = sm.saQueryReason",
+        "sm_disconnect_process(cast[pointer](vif), 7, reason)",
     ]:
         assert expected in wifi_fw if expected.startswith(("saQuery", "doAssert")) else expected in body
 
@@ -18518,7 +19553,8 @@ def test_wifi_ap_sta_fw_delete_uses_sta_mac_overlay():
 
     assert "let sta = staInfoForIdx(staIdx)" in body
     assert "let staMacAddr = cast[pointer](addr sta.macAddr[0])" in body
-    assert "apm_sta_delete(cast[pointer](staIdx.uint))" in body
+    assert "discard apm_sta_delete(staIdx, staMacAddr, statusCode, reasonCode)" in body
+    assert "asm volatile" not in body
     for forbidden in [
         "let staBase = cast[uint](addr sta_info_tab[0])",
         "staBase + 4 + staIdx.uint * STA_ENTRY_SIZE.uint",
@@ -18538,10 +19574,11 @@ def test_wifi_ap_timeout_and_mgmt_vif_resolution_use_semantic_indexes():
     )[0]
 
     for expected in [
-        "for apStaSlotIndex in 0'u8 ..< maxStaCount:",
+        "for apStaSlotIndex in 0'u8 ..< STA_INFO_TAB_ENTRIES.uint8:",
         "let sta = staInfoForIdx(apStaSlotIndex)",
-        "logFn(1, 0, nil, 530, apStaSlotIndex.uint32, elapsed)",
-        "apm_sta_fw_delete(apStaSlotIndex, vifIdx, WLAN_FW_APM_DELETECONNECTION_TIMEOUT.uint16)",
+        "cast[int32](now - connTime) > 30000",
+        "apm_sta_fw_delete(apStaSlotIndex,\n          WLAN_FW_APM_DELETECONNECTION_TIMEOUT.uint16, 0xFFFF'u16)",
+        "ke_timer_set(KE_FIRST_MSG(TASK_APM.uint16) + 6, TASK_APM, 5000000'u32)",
     ]:
         assert expected in timeout_body
 
@@ -18550,6 +19587,8 @@ def test_wifi_ap_timeout_and_mgmt_vif_resolution_use_semantic_indexes():
         "let sta = staInfoForIdx(i)",
         "logFn(1, 0, nil, 530, i.uint32, elapsed)",
         "apm_sta_fw_delete(i, vifIdx, WLAN_FW_APM_DELETECONNECTION_TIMEOUT.uint16)",
+        "sta.keyArea[7]",
+        "apmBase + 4",
     ]:
         assert forbidden not in timeout_body
 
@@ -18774,7 +19813,7 @@ def test_wifi_ap_auth_disassoc_handlers_use_typed_vif_overlays():
 
     for expected in [
         "let vif = vifChannelForIdx(vifIdx)",
-        "apm_send_mlme(cast[pointer](vif), 0xC0, staMac, nil, nil, nil)",
+        "apm_send_mlme(cast[pointer](vif), 0xC0, staMac, nil, nil, cast[pointer](2'u))",
     ]:
         assert expected in disassoc_body
 
@@ -18792,71 +19831,27 @@ def test_wifi_ap_auth_disassoc_handlers_use_typed_vif_overlays():
 
 def test_wifi_ap_assoc_handler_uses_typed_vif_ap_config_overlay():
     wifi_fw = wifi_fw_policy_source()
-
-    body = wifi_fw.rsplit("proc apm_assoc_req_handler*", 1)[1].split(
-        "proc apm_deauth_handler*", 1
-    )[0]
-    start_body = wifi_fw.rsplit("proc apm_start_req_handler*", 1)[1].split(
-        "proc apm_stop_req_handler*", 1
-    )[0]
-
+    body = wifi_fw.rsplit("proc apm_assoc_req_handler*", 1)[1].split("proc apm_deauth_handler*", 1)[0]
     for expected in [
-        "maxAssocRate*: uint16",
-        "ssidData*: UncheckedArray[uint8]",
-        "doAssert offsetof(VifApConfigOverlay, aidBitmapFeatureLow) == 60",
-        "doAssert offsetof(VifApConfigOverlay, maxAssocRate) == 62",
-        "doAssert offsetof(VifApConfigOverlay, privacyFlag) == 64",
-    ]:
-        assert expected in wifi_fw
-
-    for expected in [
-        "let vifView = vifChannelForIdx(vifIdx)",
-        "let apCfg = vifApConfig(vifView)",
-        "let vifMaxRate = apCfg.maxAssocRate",
-        "let vifSsidLen = apCfg.privacyFlag",
-        "cast[pointer](addr apCfg.ssidData[0])",
-        "if vifView.securityTimer.link.next != nil:",
-        "let vifPtr = cast[pointer](vifView)",
-        "let matchedRateCount = msg.rateCount",
-        "msg.rateBytes[matchedRateCount] = vifRate",
-        "msg.rateCount = matchedRateCount + 1",
-        "for existingStaSlotIndex in 0 ..< 5:",
-        "let existingStaSlot = apmStaSlot(existingStaSlotIndex.uint)",
-        'logFn204(2, 0, cast[pointer](cstring"apm.c"), 536, existingStaSlotIndex.uint32)',
-        "aidIdx = existingStaSlotIndex",
-        "for freeStaSlotIndex in 0 ..< 5:",
-        "let freeStaSlot = apmStaSlot(freeStaSlotIndex.uint)",
-        'logFn204(2, 0, cast[pointer](cstring"apm.c"), 560, freeStaSlotIndex.uint32)',
-        "aidIdx = freeStaSlotIndex",
+        "let vif = vifChannelForIdx(vifIdx)",
+        "let apSsid = vifApProbeSsid(vif)",
+        "rx.listenInterval > vifApConfig(vif).maxAssocRate",
+        "header.paramLen < 60",
+        "rx.frameLen.uint32 + 32 > header.paramLen",
+        "total > ieLength - offset",
+        "ke_msg_alloc(ME_STA_ADD_REQ, TASK_ME, TASK_APM,",
+        "vif.basicRates[0] > 12",
+        "slot.staHandle = securityContext",
+        "slot.staIdx = 0xFF",
+        "wpaCallbacks().apJoin",
+        "securityIe.len > 253",
     ]:
         assert expected in body
-
-    assert "apConfig.aidBitmapFeatureLow = 0" in start_body
-    assert "apConfig.maxAssocRate = 0xFFFF'u16" in start_body
-
     for forbidden in [
-        "let vifBase = cast[uint](addr vif_info_tab[0])",
-        "let vifOff = vifIdx.uint * VIF_ENTRY_SIZE",
-        "let vif = vifBase + vifOff",
-        "let vifView = vifChannelAt(vif)",
-        "let vifMaxRate = cast[ptr uint16](vif + 518)[]",
-        "let vifSsidLen = cast[ptr uint8](vif + 520)[]",
-        "cast[pointer](vif + 521)",
-        "vifChannelAt(vif).securityTimer.link.next",
-        "let vifPtr = cast[pointer](vif)",
-        "apCfg.aidBitmapFeature = 0xFFFF0000'u32",
-        "let cnt = msg.rateCount",
-        "msg.rateBytes[cnt]",
-        "for i in 0 ..< 5:",
-        "let slot = apmStaSlot(i.uint)",
-        "let slot = apmStaSlot(existingStaSlotIndex.uint)",
-        "let slot = apmStaSlot(freeStaSlotIndex.uint)",
-        "aidIdx = i",
-        "536, i.uint32",
-        "560, i.uint32",
+        "rateBuf", "ke_msg_alloc(APM_STA_ADD_IND", "rx.bodyLen",
+        "vifView.securityTimer.link.next", "slot.staHandle = cast[pointer](msg)",
     ]:
         assert forbidden not in body
-        assert forbidden not in start_body
 
 
 def test_wifi_ap_probe_req_handler_uses_typed_ie_and_channel_overlays():
@@ -18939,66 +19934,19 @@ def test_wifi_ap_probe_req_handler_uses_typed_ie_and_channel_overlays():
         assert forbidden not in body
 
 
-def test_wifi_ap_eapol_dispatch_uses_typed_hostapd_overlays():
+def test_wifi_ap_eapol_dispatch_uses_station_wpa_context():
     wifi_fw = wifi_fw_policy_source()
-    hostapd_ops_env_layout = wifi_fw.split(
-        "VifMgmtHostapdOpsEnvView {.packed.} = object", 1
-    )[1].split("VifHostapdPrivView {.packed.} = object", 1)[0]
-    hostapd_priv_layout = wifi_fw.split(
-        "VifHostapdPrivView {.packed.} = object", 1
-    )[1].split("VifApProbeSsidOverlay {.packed.} = object", 1)[0]
-    hostapd_ops_layout = wifi_fw.split(
-        "HostapdOpsView {.packed.} = object", 1
-    )[1].split("PsEnvView {.packed.} = object", 1)[0]
-
-    body = wifi_fw.rsplit("proc apm_handle_eapol_input*", 1)[1].split(
-        "proc apm_handle_auth_done*", 1
-    )[0]
-
+    body = wifi_fw.rsplit("proc apm_handle_eapol_input*", 1)[1].split("proc apm_handle_auth_done*", 1)[0]
     for expected in [
-        "VifMgmtHostapdOpsEnvView {.packed.} = object",
-        "vifMgmtBaseToHostapdOpsPadding*: array[12, uint8]",
-        "hostapdOps*: pointer",
-        "VifHostapdPrivView {.packed.} = object",
-        "vifBaseToHostapdPrivPadding*: array[364, uint8]",
-        "hostapdPriv*: pointer",
-        "HostapdOpsView {.packed.} = object",
-        "opsBaseToEapolRxPadding*: array[44, uint8]",
-        "eapolRx*: pointer",
-        "doAssert offsetof(VifMgmtHostapdOpsEnvView, vifMgmtBaseToHostapdOpsPadding) == 0",
-        "doAssert offsetof(VifMgmtHostapdOpsEnvView, hostapdOps) == 12",
-        "doAssert offsetof(VifHostapdPrivView, vifBaseToHostapdPrivPadding) == 0",
-        "doAssert offsetof(VifHostapdPrivView, hostapdPriv) == 364",
-        "doAssert offsetof(HostapdOpsView, opsBaseToEapolRxPadding) == 0",
-        "doAssert offsetof(HostapdOpsView, eapolRx) == 44",
-        "template vifMgmtHostapdOpsEnv(): ptr VifMgmtHostapdOpsEnvView",
-        "template vifHostapdPrivAt(p: uint): ptr VifHostapdPrivView",
-        "template vifHostapdPriv(vif: ptr VifChannelView): ptr VifHostapdPrivView",
-        "template hostapdOpsAt(p: pointer): ptr HostapdOpsView",
-    ]:
-        assert expected in wifi_fw
-
-    for expected in [
-        "let vif = vifChannelForIdx(instNbr)",
-        "let opsPtr = vifMgmtHostapdOpsEnv().hostapdOps",
-        "let eapolHandler = hostapdOpsAt(opsPtr).eapolRx",
-        "let vifPriv = vifHostapdPriv(vif).hostapdPriv",
+        "staIdx.int >= STA_INFO_TAB_ENTRIES",
+        "let sta = staInfoForIdx(staIdx)",
+        "let eapolHandler = wpaCallbacks().apEapolRx",
+        "sta.apmWpaContext == nil",
+        "(hostapdCtx, sta.apmWpaContext, rxBuf, rxLen.csize_t)",
     ]:
         assert expected in body
-
-    for forbidden in [
-        "cast[ptr pointer](cast[uint](addr vif_mgmt_env[0]) + 12)",
-        "cast[ptr pointer](cast[uint](opsPtr) + 44)",
-        "cast[ptr pointer](vifEntry + 364)",
-        "let vifBase = cast[uint](addr vif_info_tab[0])",
-        "let vifEntry = vifBase + instNbr.uint * VIF_ENTRY_SIZE.uint",
-        "let vifPriv = vifHostapdPrivAt(vifEntry).hostapdPriv",
-    ]:
-        assert forbidden not in body
-
-    assert "reserved00*" not in hostapd_ops_env_layout
-    assert "reserved00*" not in hostapd_priv_layout
-    assert "reserved00*" not in hostapd_ops_layout
+    assert "vifHostapdPriv" not in body
+    assert "vifMgmtHostapdOpsEnv" not in body
 
 
 def test_wifi_bam_air_action_uses_typed_frame_overlays():
@@ -19030,7 +19978,10 @@ def test_wifi_bam_air_action_uses_typed_frame_overlays():
         "txDesc.payloadEnd = oldPayLen + hdrLen - 1",
         "txDesc.frameLen = totalLen",
         "desc.callback = txCallback",
-        "desc.callbackArg = cast[pointer](cast[uint](tid))",
+        "desc.callbackArg = baEnv",
+        "staIdx: uint8, baEnv: pointer, action: uint8",
+        "dialogToken: uint8, baParams: uint16, statusCode: uint16",
+        "if vif.vifType == VIF_TYPE_AP:",
     ]:
         assert expected in body
 
@@ -19057,6 +20008,8 @@ def test_wifi_bam_air_action_uses_typed_frame_overlays():
         "cast[ptr uint32](txDescPtr + 28)",
         "cast[ptr pointer](frameAddr + 208)",
         "cast[ptr pointer](frameAddr + 212)",
+        "cast[ptr uint8](staEntry + 86)",
+        "me_build_add_ba_req(bodyPtr, nil)",
     ]:
         assert forbidden not in body
 
@@ -19083,7 +20036,8 @@ def test_wifi_block_ack_action_builders_use_typed_overlays():
     for expected in [
         "MeAddBaReqParamView {.packed.} = object",
         "addBaReqBaseToSsnPadding*: array[8, uint8]",
-        "timeoutToAmsduPadding*: array[2, uint8]",
+        "timeoutToPolicyPadding*: array[2, uint8]",
+        "baPolicy*: uint8",
         "AddBaReqActionBodyView {.packed.} = object",
         "AddBaRspActionBodyView {.packed.} = object",
         "DelBaActionBodyView {.packed.} = object",
@@ -19095,7 +20049,11 @@ def test_wifi_block_ack_action_builders_use_typed_overlays():
         "template delBaActionBodyAt(param: pointer): ptr DelBaActionBodyView",
         "template delBaInfoView(param: pointer): ptr DelBaInfoView",
         "doAssert offsetof(MeAddBaReqParamView, addBaReqBaseToSsnPadding) == 0",
-        "doAssert offsetof(MeAddBaReqParamView, timeoutToAmsduPadding) == 12",
+        "doAssert offsetof(MeAddBaReqParamView, timeoutToPolicyPadding) == 12",
+        "doAssert offsetof(MeAddBaReqParamView, baPolicy) == 14",
+        "doAssert sizeof(BamEnvView) == 96",
+        "doAssert offsetof(BamEnvView, staIdx) == 12",
+        "bamEnvView().staIdx = 0xFF'u8",
         "doAssert sizeof(AddBaReqActionBodyView) == 9",
         "doAssert offsetof(AddBaReqActionBodyView, baParams) == 3",
         "doAssert offsetof(AddBaReqActionBodyView, timeout) == 5",
@@ -19119,7 +20077,8 @@ def test_wifi_block_ack_action_builders_use_typed_overlays():
         "body.category = 3",
         "body.action = 0",
         "body.dialogToken = req.dialogToken",
-        "body.baParams = amsdu or tid or bufSize",
+        "let policy = req.baPolicy.uint16 shl 1",
+        "body.baParams = policy or tid or bufSize",
         "body.timeout = req.timeout",
         "body.startSeq = req.ssn shl 4",
     ]:
@@ -19178,7 +20137,7 @@ def test_wifi_ipc_host_tx_queue_uses_typed_overlays():
     ).read_text()
     shared_msg_layout = wifi_fw.split(
         "IpcSharedMsgView {.packed.} = object", 1
-    )[1].split("IpcPayloadWordStreamView {.packed.} = object", 1)[0]
+    )[1].split("IpcPayloadWordStreamView = UncheckedArray[uint32]", 1)[0]
     shared_env_layout = wifi_fw.split(
         "IpcSharedEnvView {.packed.} = object", 1
     )[1].split("IpcEmbEnvView {.packed.} = object", 1)[0]
@@ -19312,6 +20271,25 @@ def test_wifi_ipc_host_tx_queue_uses_typed_overlays():
     assert "reserved4*" not in wrapper_layout
 
 
+def test_wifi_tx_sequence_helper_uses_vendor_halfword_counter():
+    wifi_fw = wifi_fw_policy_source()
+    helper_body = wifi_fw.split(
+        "template nextTxSeqNumber(): uint16 =", 1
+    )[1].split("template nextTxSeqCtrl(): uint16 =", 1)[0]
+    next_ctrl_body = wifi_fw.split(
+        "template nextTxSeqCtrl(): uint16 =", 1
+    )[1].split("template chanCtxtAt", 1)[0]
+    get_seq_body = wifi_fw.split(
+        "proc txl_get_seq_ctrl*(): uint16 {.exportc, cdecl.} =", 1
+    )[1].split("proc txl_int_fake_transfer*", 1)[0]
+
+    assert "txCtrl.seqCounter = txCtrl.seqCounter + 1'u16" in helper_body
+    assert "and 0x0FFF'u16" not in helper_body
+    assert "nextTxSeqNumber() shl 4" in next_ctrl_body
+    assert "sequence counter halfword" in get_seq_body
+    assert "wraps to 12 bits" not in get_seq_body
+
+
 def test_wifi_ipc_tx_ac_reset_uses_typed_overlay():
     wifi_fw = wifi_fw_policy_source()
     ipc_tx_ac_layout = wifi_fw.split(
@@ -19322,7 +20300,7 @@ def test_wifi_ipc_tx_ac_reset_uses_typed_overlay():
         "template hostTxLinkMacHdrAddr", 1
     )[0]
     reset_body = wifi_fw.split(
-        "proc txl_reset*() {.exportc, cdecl.} =", 1
+        "proc txl_reset*(): bool {.exportc, cdecl, discardable.} =", 1
     )[1].split(
         "proc txl_machdr_format*", 1
     )[0]
@@ -19357,7 +20335,23 @@ def test_wifi_ipc_tx_ac_reset_uses_typed_overlay():
     ]:
         assert expected in helper_body
 
-    assert "ipcTxAcDescClear(ac)" in reset_body
+    assert "proc ipcTxAcDescClear(ac: uint32)" in wifi_fw
+    assert "ke_free(0x7C000)" not in reset_body
+    assert reset_body.count("ke_evt_clear(0x7C000'u32)") == 1
+    assert reset_body.index("ke_evt_clear(0x7C000'u32)") < reset_body.index(
+        "const IPC_TX_STATUS_REG = 0x24A00010'u"
+    )
+    assert "while true:" in reset_body
+    assert "var pollsRemaining = WifiHwPollLimit" in reset_body
+    assert "if pollsRemaining == 0:" in reset_body
+    assert "waitCount" not in reset_body
+    assert "ipcTxAcDescClear(ac)" not in reset_body
+    assert "co_list_init(addr acCtrl.pending)" in reset_body
+    assert "acCtrl.current = nil" in reset_body
+    assert "acCtrl.packetCount = ipcTxHwDescWordHalfword(ac)" in reset_body
+    assert "acCtrl.busyFlag = 0" in reset_body
+    assert "co_list_init(cfmList)" not in reset_body
+    assert "let cfmList = txCfmList(ac)" not in reset_body
 
     for forbidden in [
         "let ipcBase = 0x24A00080'u",
@@ -19538,33 +20532,25 @@ def test_wifi_tx_flow_control_uses_semantic_vif_role_index_name():
 
 def test_wifi_scan_ssid_selection_has_typed_cache_fallback():
     wifi_fw = wifi_fw_policy_source()
+    scan_source = (ROOT / "src/bl808/wifi/fw/scan_station_ap_me.nim").read_text()
 
-    helper_body = wifi_fw.split("proc scanuCachedSsidFor", 1)[1].split(
-        '{.emit: "__attribute__((optimize(\\"crossjumping\\"))) void scanu_frame_handler',
-        1,
-    )[0]
-    probe_body = wifi_fw.split("proc scan_probe_req_tx*", 1)[1].split(
-        "# ###########################################################################\n#                      SCANU (Upper MAC Scan)",
-        1,
-    )[0]
-    frame_body = wifi_fw.split("proc scanu_frame_handler*", 1)[1].split(
-        "proc scanu_search_by_bssid*", 1
-    )[0]
-    scan_done_body = wifi_fw.split("proc scan_done_ind_handler*", 1)[1].split(
-        "proc scan_cancel_req_handler*", 1
-    )[0]
-    bss_body = wifi_fw.rsplit("proc sm_get_bss_params*", 1)[1].split(
-        "proc sm_scan_bss*", 1
-    )[0]
-    search_body = wifi_fw.split("proc scanu_search_by_ssid*", 1)[1].split(
-        "proc scanu_rm_exist_ssid*", 1
-    )[0]
-    clear_body = wifi_fw.split("proc scanu_cached_scanresult_clear*", 1)[1].split(
-        "proc scanu_prune_scanresult_raw_frames", 1
-    )[0]
-    prune_body = wifi_fw.split("proc wifi_nimfw_prune_scan_raw_cache_for_ssid*", 1)[1].split(
-        "proc scanu_dump_scanresult*", 1
-    )[0]
+    helper_body = "\n".join(
+        nim_procedure(scan_source, name)
+        for name in ["scanuCachedSsidFor", "scanuCacheSsid",
+                     "scanuCachedSsidMatches", "scanuCachedSsidMeta"]
+    )
+    probe_body = nim_procedure(scan_source, "scan_probe_req_tx")
+    frame_body = nim_procedure(scan_source, "scanu_frame_handler")
+    publish_body = nim_procedure(scan_source, "scanuPublishFrameResult")
+    bssid_filter_body = nim_procedure(scan_source, "scanuFrameMatchesBssid")
+    scan_done_body = nim_procedure(
+        (ROOT / "src/bl808/wifi/fw/task_handlers.nim").read_text(), "scan_done_ind_handler"
+    )
+    bss_body = nim_procedure(scan_source, "sm_get_bss_params")
+    search_body = nim_procedure(scan_source, "scanu_search_by_ssid")
+    clear_body = nim_procedure(scan_source, "scanu_cached_scanresult_clear")
+    detach_body = nim_procedure(scan_source, "scanuDetachCachedScanResults")
+    prune_body = nim_procedure(scan_source, "wifi_nimfw_prune_scan_raw_cache_for_ssid")
     scanu_layout_block = wifi_fw.split("ScanuResultEntry* = object", 1)[1].split(
         "ScanuChannelConfigOverlay", 1
     )[0]
@@ -19615,31 +20601,46 @@ def test_wifi_scan_ssid_selection_has_typed_cache_fallback():
     assert "ssidScratch.ssidBytes[ssidScratchByteIndex] = ssid.ssidBytes[ssidScratchByteIndex]" in frame_body
     assert "for i in 0 ..< ssidScratch.length.int:" not in frame_body
     assert "ssidScratch.ssidBytes[i] = ssid.ssidBytes[i]" not in frame_body
-    assert "for ssidProbeSlotIndex in 0 ..< numSsids.int:" in probe_body
-    assert "let ssidSlot = scanSsidSlot(scanReq, ssidProbeSlotIndex)" in probe_body
+    assert "if numSsids != 1 or scan_env.abortFlag != 0:" in probe_body
+    assert "let ssid = scanSsidSlot(scanReq, 0)[]" in probe_body
+    assert "ssid.length > 32" in probe_body
+    assert "ieLen > scan_probe_req_ie.ieData.len.uint32" in probe_body
+    assert "let ieBytes = scan_probe_req_ie.ieData" in probe_body
+    assert "unsafeAddr ieBytes[0]" in probe_body
+    assert "scanProbeReqIePayloadPtr(" not in probe_body
+    assert "scanRequestEpoch != requestEpoch" in probe_body
+    assert "scan_env.channelIndex != channelIndex" in probe_body
+    assert "txlFramePreparationCurrent(frameDesc, identity, generation)" in probe_body
     assert "for i in 0 ..< numSsids.int:" not in probe_body
     assert "let ssidSlot = scanSsidSlot(scanReq, i)" not in probe_body
-    assert "for probeIeRawByteIndex in 0 ..< nimFwDbgProbeIeRaw.len:" in probe_body
-    assert "nimFwDbgProbeIeRaw[probeIeRawByteIndex] = 0" in probe_body
+    assert "for i in 0 ..< nimFwDbgProbeIeRaw.len:" in probe_body
+    assert "nimFwDbgProbeIeRaw[i] = if i.uint32 < ieLen: ieBytes[i] else: 0" in probe_body
     assert "for k in 0 ..< nimFwDbgProbeIeRaw.len:" not in probe_body
     assert "nimFwDbgProbeIeRaw[k] = 0" not in probe_body
     assert "proc scan_get_chan*(channelIndex: uint32): pointer" in wifi_fw
     assert "scanReq.channelList[channelIndex.int]" in wifi_fw
     assert "proc scan_get_chan*(idx: uint32): pointer" not in wifi_fw
     assert "scanReq.channelList[idx.int]" not in wifi_fw
-    assert "for filterBssidByteIndex in 0 ..< 6:" in frame_body
+    assert "not scanuFrameMatchesBssid(rx)" in frame_body
+    assert "for filterBssidByteIndex in 0 ..< 6:" in bssid_filter_body
     assert (
         "if rx.bssid[filterBssidByteIndex] != scanu_env.filterBssid[filterBssidByteIndex]:"
-        in frame_body
+        in bssid_filter_body
     )
     assert "var ssidFilterIndex = 0" in frame_body
     assert "while ssidFilterIndex < numSsids.int:" in frame_body
     assert "let filterSlot = scanSsidSlot(scanReq, ssidFilterIndex)" in frame_body
-    assert "let cachedRxuMgtIndLen = totalLen.uint32 + 32" in frame_body
-    assert "scanu_env.pendingJoinRxuMgtInd = msg" in frame_body
+    assert "scanuPublishFrameResult(frame, scanResultEntry, scanParam, scanEpoch," in frame_body
+    assert "let cachedRxuMgtIndLen = totalLen.uint32 + 32" in publish_body
+    assert "scanu_env.pendingJoinRxuMgtInd = msg" in publish_body
+    assert publish_body.index("scanResultEntry.cachedRxuMgtInd = nil") < \
+        publish_body.index("ke_msg_free_payload(retired)")
+    assert publish_body.index("c_memcpy(msg, frame, cachedRxuMgtIndLen.csize_t)") < \
+        publish_body.index("scanResultEntry.cachedRxuMgtInd = msg")
     assert "let cachedRxuMgtIndView = rxuMgtIndAt(cachedRxuMgtInd)" in search_body
     assert "for bssidPairLogIndex in 0'u32 ..< 3'u32:" in bss_body
-    assert "let bssidPairFirstByte = ci.bssid[bssidPairLogIndex.uint * 2]" in bss_body
+    assert "let index = bssidPairLogIndex.int * 2" in bss_body
+    assert "let pair = ci.bssid[index].uint32 or (ci.bssid[index + 1].uint32 shl 8)" in bss_body
     assert "for i in 0'u32 ..< 3'u32:" not in bss_body
     assert "let bssidByte = ci.bssid[i.uint * 2]" not in bss_body
     assert "var bssidAllZero = true" in bss_body
@@ -19647,20 +20648,27 @@ def test_wifi_scan_ssid_selection_has_typed_cache_fallback():
     assert "if ci.bssid[bssidByteIndex] != 0:" in bss_body
     assert "bssidAllZero = false" in bss_body
     assert "if bssidAllZero:" in bss_body
-    assert "let pendingJoinRxuMgtInd = scanu_env.pendingJoinRxuMgtInd" in scan_done_body
+    assert "completedRequest = scanu_env.paramPtr" in scan_done_body
+    assert "retired = scanuDetachCachedScanResults()" in scan_done_body
     assert "scanu_env.pendingJoinRxuMgtInd = nil" in scan_done_body
-    assert (
-        "if not scanuCachedSsidMatches(ssidSearchResultEntry,\n"
-        "                                      searchData, searchLen):"
-        in search_body
-    )
+    assert scan_done_body.index("scanu_env.paramPtr = nil") < scan_done_body.index("ke_msg_free_payload(frame)")
+    assert "let retainedMatch = scanuCachedSsidMatches(ssidSearchResultEntry," in search_body
+    assert "if not retainedMatch:" in search_body
+    assert "let matches = cmpResult == 0 or retainedMatch" in search_body
     assert "for ssidSearchResultSlotIndex in 0'u8 ..< SCANU_MAX_RESULT_ENTRIES.uint8:" in search_body
     assert "let ssidSearchResultEntry =" in search_body
     assert "addr scanu_env.entries[ssidSearchResultSlotIndex]" in search_body
     assert "var bestScanResultEntry: ptr ScanuResultEntry = nil" in search_body
     assert "bestScanResultEntry = ssidSearchResultEntry" in search_body
     assert "return bestScanResultEntry" in search_body
-    assert "cast[ptr uint32](entryIndexOut)[] = ssidSearchResultSlotIndex.uint32" in search_body
+    assert "cast[ptr uint32](entryIndexOut)[] = bestIndex" in search_body
+    assert search_body.index("scanuResultCurrent(bestSnapshot, bestAllowsRawRelease)") < \
+        search_body.index("cast[ptr uint32](entryIndexOut)[] = bestIndex")
+    snapshot_body = nim_procedure(scan_source, "scanuResultCurrent")
+    assert "snapshot.epoch != scanuRequestEpoch" in snapshot_body
+    assert "value != snapshot.value" in snapshot_body
+    assert "cached[] != snapshot.ssid" in snapshot_body
+    assert "cast[ptr ScanChannelEntry](value.chanPtr)[] == snapshot.channel" in snapshot_body
     assert "for i in 0'u8 ..< SCANU_MAX_RESULT_ENTRIES.uint8:" not in search_body
     assert "let entry = addr scanu_env.entries[i]" not in search_body
     assert "let entry = addr scanu_env.entries[ssidSearchResultSlotIndex]" not in search_body
@@ -19668,20 +20676,25 @@ def test_wifi_scan_ssid_selection_has_typed_cache_fallback():
     assert "cast[ptr uint32](entryIndexOut)[] = i.uint32" not in search_body
     assert "let ssidResultEntryIndex = cast[int8](ssidLen)" in wifi_fw
     assert "let ssidIndexResultEntry = addr scanu_env.entries[ssidResultEntryIndex.int]" in wifi_fw
-    assert "for scanResultSlotIndex in 0 ..< SCANU_MAX_RESULT_ENTRIES:" in clear_body
+    assert "for scanResultSlotIndex in 0 ..< SCANU_MAX_RESULT_ENTRIES:" in detach_body
     assert (
         "let scanResultEntry = addr scanu_env.entries[scanResultSlotIndex]"
-        in clear_body
+        in detach_body
     )
-    assert "scanuClearCachedSsid(scanResultEntry)" in clear_body
-    assert "scanResultEntry.valid = 0" in clear_body
-    assert "scanResultEntry.rssi = -128'i8" in clear_body
+    assert "scanuClearCachedSsid(scanResultEntry)" in detach_body
+    assert "scanResultEntry.valid = 0" in detach_body
+    assert "scanResultEntry.rssi = -128'i8" in detach_body
+    assert "scanResultEntry.cachedRxuMgtInd = nil" in detach_body
+    assert "ke_msg_free" not in detach_body
+    assert "let retired = scanuDetachCachedScanResults()" in clear_body
+    assert "ke_msg_free_payload(frame)" in clear_body
     assert "scanuClearCachedSsid(e)" not in clear_body
     assert "let e = addr scanu_env.entries[i]" not in clear_body
     assert "for i in 0 ..< SCANU_MAX_RESULT_ENTRIES:" not in clear_body
     assert "var bestScanResultEntry: ptr ScanuResultEntry = nil" in prune_body
     assert "bestScanResultEntry = scanResultEntry" in prune_body
-    assert "scanResultEntry != bestScanResultEntry" in prune_body
+    assert "scanuDetachRawScanFrames(bestScanResultEntry)" in prune_body
+    assert "if scanResultEntry != keep:" in nim_procedure(scan_source, "scanuDetachRawScanFrames")
     assert "var bestEntry: ptr ScanuResultEntry = nil" not in prune_body
 
     for forbidden in [
@@ -19718,17 +20731,16 @@ def test_wifi_scan_ssid_selection_has_typed_cache_fallback():
 
 
 def test_wifi_transition_mode_prefers_psk_over_sae():
-    wifi_fw = wifi_fw_policy_source()
-    frame_body = wifi_fw.split("proc scanu_frame_handler*", 1)[1].split(
-        "proc scanu_search_by_bssid*", 1
-    )[0]
-
-    assert "if (keyMgmtMask and 2) != 0: selectedAuth = 2" in frame_body
-    assert "elif (keyMgmtMask and 0x400) != 0: selectedAuth = 1024" in frame_body
-    assert (
-        "if (keyMgmtMask and 0x400) != 0: selectedAuth = 1024\n"
-        "          elif (keyMgmtMask and 0x100) != 0"
-    ) not in frame_body
+    frame_body = nim_procedure(
+        (ROOT / "src/bl808/wifi/fw/scan_station_ap_me.nim").read_text(), "scanu_frame_handler"
+    )
+    selection_body = nim_procedure(
+        (ROOT / "src/bl808/wifi/fw/rsn_parse.nim").read_text(), "wifiPreferredKeyMgmtFromMask"
+    )
+    assert "selectedAuth = wifiPreferredKeyMgmtFromMask(" in frame_body
+    assert selection_body.index("return WifiKeyMgmtPsk") < selection_body.index(
+        "return WifiKeyMgmtPskSha256"
+    ) < selection_body.index("return WifiKeyMgmtSae")
 
 
 def test_wifi_scan_start_payload_alignment_fields_are_semantic():
@@ -19781,12 +20793,16 @@ def test_wifi_tx_control_init_uses_ipc_descriptor_word_overlay():
         "doAssert sizeof(IpcTxHwDescWordTableView) == NUM_TX_QUEUES * sizeof(uint32)",
         "doAssert offsetof(IpcTxHwDescWordTableView, descriptorWords) == 0",
         "template ipcTxHwDescWordTable(): ptr IpcTxHwDescWordTableView",
-        "proc ipcTxHwDescWordAddrHalfword(ac: uint32): uint16",
+        "proc ipcTxHwDescWordHalfword(ac: uint32): uint16",
     ]:
         assert expected in wifi_fw
 
-    assert "addr ipcTxHwDescWordTable().descriptorWords[ac.int]" in helper_body
-    assert "acCtrl.packetCount = ipcTxHwDescWordAddrHalfword(ac)" in init_body
+    assert "volatileLoad(addr ipcTxHwDescWordTable().descriptorWords[ac.int])" in helper_body
+    assert "and 0xFFFF'u32" in helper_body
+    assert "cast[uint](addr ipcTxHwDescWordTable()" not in helper_body
+    assert "txl_frame_init(0)" in init_body
+    assert "acCtrl.packetCount = ipcTxHwDescWordHalfword(ac)" in init_body
+    assert "txCtrl.seqCounter = 0" in init_body
     assert "for accessCategoryIndex in 0 ..< NUM_TX_QUEUES:" in init_body
     assert "txlAcPending[accessCategoryIndex] = 0" in init_body
     assert "txlAcBusy[accessCategoryIndex] = false" in init_body
@@ -19798,6 +20814,11 @@ def test_wifi_tx_control_init_uses_ipc_descriptor_word_overlay():
         "for i in 0 ..< NUM_TX_QUEUES:",
         "txlAcPending[i] = 0",
         "txlAcBusy[i] = false",
+        "var seqSeed = txlSeqRetained",
+        "seqSeed = uint16(regRead(MACHW_RNG_REG) and 0x0FFF'u32)",
+        "txlSeqRetained = seqSeed",
+        "txCtrl.seqCounter = seqSeed",
+        "txl_frame_init()",
     ]:
         assert forbidden not in init_body
 
@@ -19859,6 +20880,9 @@ def test_wifi_pspoll_tx_uses_typed_frame_overlays():
         assert expected in wifi_fw
 
     for expected in [
+        "let txdesc = txl_frame_get(16)",
+        "if txdesc == nil:\n    return 1",
+        "tpc_update_frame_tx_power(vifEntry, txdesc)",
         "let desc = hostTxDescAt(txdesc)",
         "let hdr = hostTxPsPollHeader(desc)",
         "hdr.frameControl = 0x00A4'u16",
@@ -19869,10 +20893,17 @@ def test_wifi_pspoll_tx_uses_typed_frame_overlays():
         "hwDesc.controlFlags = hwDesc.controlFlags or 0x10000053'u32",
         "desc.vifIdx = sta.instNbr",
         "desc.staInfoIdx = sta.infoIdx",
+        "let pushRc = txl_frame_push(txdesc, 3)",
+        "return (pushRc xor 1'u8) and 0xFF'u8",
     ]:
         assert expected in body
+    assert body.index("tpc_update_frame_tx_power(vifEntry, txdesc)") < body.index(
+        "let hdr = hostTxPsPollHeader(desc)"
+    )
 
     for forbidden in [
+        "txl_frame_push(txdesc, 3)  # AC_VO = 3\n  return 0",
+        "discard txl_frame_push(txdesc, 3)",
         "let txAddr = cast[uint](txdesc)",
         "cast[ptr pointer](txAddr + 0x6C)",
         "let hdrAddr = cast[uint](macHdr)",
@@ -19910,21 +20941,21 @@ def test_wifi_wpa_wps_callbacks_use_typed_overlays():
         "eapolHandler*: pointer",
         "beaconRegister*: pointer",
         "apStopped*: pointer",
-        "keyWriteCallbackPadding*: pointer",
-        "apStoppedCallbackPadding*: pointer",
-        "disconnectCallbackPadding*: pointer",
+        "stationDisconnected*: pointer",
+        "apJoin*: pointer",
+        "apEapolRx*: pointer",
         "parseSecurityCallbackPadding*: pointer",
         "saeFrameCallbackPadding*: pointer",
         "staAdd*: pointer",
         "authTimeout*: pointer",
         "doAssert offsetof(WpaCallbacksView, deinit) == 4",
-        "doAssert offsetof(WpaCallbacksView, keyWriteCallbackPadding) == 16",
+        "doAssert offsetof(WpaCallbacksView, stationDisconnected) == 16",
         "doAssert offsetof(WpaCallbacksView, eapolHandler) == 20",
         "doAssert offsetof(WpaCallbacksView, beaconRegister) == 24",
         "doAssert offsetof(WpaCallbacksView, apStopped) == 28",
-        "doAssert offsetof(WpaCallbacksView, apStoppedCallbackPadding) == 32",
+        "doAssert offsetof(WpaCallbacksView, apJoin) == 32",
         "doAssert offsetof(WpaCallbacksView, staAdd) == 36",
-        "doAssert offsetof(WpaCallbacksView, disconnectCallbackPadding) == 44",
+        "doAssert offsetof(WpaCallbacksView, apEapolRx) == 44",
         "doAssert offsetof(WpaCallbacksView, parseSecurityCallbackPadding) == 52",
         "doAssert offsetof(WpaCallbacksView, saeFrameCallbackPadding) == 60",
         "doAssert offsetof(WpaCallbacksView, authTimeout) == 64",
@@ -19953,6 +20984,7 @@ def test_wifi_wpa_wps_callbacks_use_typed_overlays():
     for expected in [
         "wpsCallbacks().staConnected",
         "wpaCallbacks().keyWrite",
+        "wpaCallbacks().stationDisconnected",
         "wpsCallbacks().staAddConfirm",
         "wpsCallbacks().eapolHandler",
         "wpaCallbacks().eapolHandler",
@@ -19991,35 +21023,33 @@ def test_wifi_wpa_beacon_register_param_uses_typed_overlay():
         "WpaBeaconRegisterParamView {.packed.} = object",
         "vifIdx*: uint8",
         "bssid*: array[6, uint8]",
-        "bssidTailPadding*: array[33, uint8]",
-        "rateCount*: uint32",
-        "rates*: array[32, uint8]",
-        "marker*: uint16",
-        "ssid*: array[64, uint8]",
-        "terminator*: uint8",
-        "terminatorPadding*: uint8",
-        "doAssert sizeof(WpaBeaconRegisterParamView) == 144",
+        "bssidTailPadding*: uint8",
+        "ssidLength*: uint32",
+        "ssid*: array[32, uint8]",
+        "authMode*: uint8",
+        "pairwiseCipher*: uint8",
+        "passphrase*: array[65, uint8]",
+        "doAssert sizeof(WpaBeaconRegisterParamView) == 112",
         "doAssert offsetof(WpaBeaconRegisterParamView, bssid) == 1",
-        "doAssert offsetof(WpaBeaconRegisterParamView, rateCount) == 40",
-        "doAssert offsetof(WpaBeaconRegisterParamView, rates) == 44",
-        "doAssert offsetof(WpaBeaconRegisterParamView, marker) == 76",
-        "doAssert offsetof(WpaBeaconRegisterParamView, ssid) == 78",
-        "doAssert offsetof(WpaBeaconRegisterParamView, terminator) == 142",
+        "doAssert offsetof(WpaBeaconRegisterParamView, ssidLength) == 8",
+        "doAssert offsetof(WpaBeaconRegisterParamView, ssid) == 12",
+        "doAssert offsetof(WpaBeaconRegisterParamView, authMode) == 44",
+        "doAssert offsetof(WpaBeaconRegisterParamView, pairwiseCipher) == 45",
+        "doAssert offsetof(WpaBeaconRegisterParamView, passphrase) == 46",
     ]:
         assert expected in wifi_fw
 
     for expected in [
-        "let beaconRegister = cast[ptr WpaBeaconRegisterParamView](addr beaconRegisterBuffer[0])",
-        "beaconRegister.vifIdx = req.vifIdx",
-        "beaconRegister.bssid = vif.bssid",
-        "beaconRegister.rateCount = rateCount.uint32",
-        "c_memcpy(addr beaconRegister.rates[0], addr vif.supportedRatesLong[1],",
-        "beaconRegister.marker = 0x0403'u16",
-        "c_memcpy(addr beaconRegister.ssid[0], ssidPtr, ssidLen)",
-        "beaconRegister.terminator = 0",
-        "let beaconRegisterCallback = wpaCallbacks().beaconRegister",
-        "cast[proc(buf: pointer) {.cdecl.}](beaconRegisterCallback)(",
-        "addr beaconRegisterBuffer[0]",
+        "var parameters = default(WpaBeaconRegisterParamView)",
+        "parameters.vifIdx = vifIdx",
+        "parameters.bssid = vif.macAddr",
+        "parameters.ssidLength = req.ssidLength.uint32",
+        "c_memcpy(addr parameters.ssid[0], addr req.ssid[0], req.ssidLength.csize_t)",
+        "parameters.authMode = 3",
+        "parameters.pairwiseCipher = 4",
+        "c_memcpy(addr parameters.passphrase[0], addr req.passphrase[0],",
+        "let initialize = wpaCallbacks().beaconRegister",
+        "apm.hostapdCtx = cast[proc(p: pointer): pointer {.cdecl.}](initialize)(addr parameters)",
     ]:
         assert expected in body
 
@@ -20039,7 +21069,7 @@ def test_wifi_wpa_beacon_register_param_uses_typed_overlay():
 def test_wifi_wpa_key_write_param_uses_typed_overlay():
     wifi_fw = wifi_fw_policy_source()
 
-    body = wifi_fw.rsplit("proc mm_sta_add*", 1)[1].split(
+    body = wifi_fw.rsplit("proc mmPrepareStaKeys", 1)[1].split(
         "proc mm_sta_del*", 1
     )[0]
 
@@ -20067,15 +21097,15 @@ def test_wifi_wpa_key_write_param_uses_typed_overlay():
         assert expected in wifi_fw
 
     for expected in [
-        "let keyReq = cast[ptr WpaKeyWriteParamView](addr keyBuf[0])",
-        "keyReq.vifIdx = vif.vifIdx",
-        "keyReq.staIdx = staIdxOut[]",
-        "keyReq.keyDataLen = keyDataLen.uint32",
-        "keyReq.quickConn = req.quickConn",
-        "c_memcpy(addr keyReq.keyMaterial[0],",
-        "addr vif.supportedRatesLong[1],",
-        "c_memcpy(addr keyReq.ssid[0], ssidSrc, ssidLen)",
-        "discard kwCb(addr keyBuf[0])",
+        "plan.wpa.vifIdx = vif.vifIdx",
+        "keys.wpa.staIdx = staIdx",
+        "plan.wpa.keyDataLen = ssidLength.uint32",
+        "plan.wpa.quickConn = quickConn",
+        "if ssidLength > 32:",
+        "plan.wpa.keyMaterial[i] = vif.supportedRatesLong[i + 1]",
+        "plan.wpa.ssid[i] = credentials.keyString[i]",
+        "payloadLength - pmkOffset < plan.wpa.ssid.len.uint32",
+        "cast[proc(param: pointer) {.cdecl.}](keys.callback)(addr keys.wpa)",
     ]:
         assert expected in body
 
@@ -20086,6 +21116,7 @@ def test_wifi_wpa_key_write_param_uses_typed_overlay():
         "keyBuf[125] = req.quickConn",
         "c_memcpy(addr keyBuf[20]",
         "c_memcpy(addr keyBuf[58]",
+        "c_strlen(",
     ]:
         assert forbidden not in body
 
@@ -20093,7 +21124,7 @@ def test_wifi_wpa_key_write_param_uses_typed_overlay():
 def test_wifi_wep_key_write_param_uses_typed_overlay():
     wifi_fw = wifi_fw_policy_source()
 
-    body = wifi_fw.rsplit("proc mm_sta_add*", 1)[1].split(
+    body = wifi_fw.rsplit("proc mmPrepareStaKeys", 1)[1].split(
         "proc mm_sta_del*", 1
     )[0]
 
@@ -20119,19 +21150,17 @@ def test_wifi_wep_key_write_param_uses_typed_overlay():
         assert expected in wifi_fw
 
     for expected in [
-        "let wepReq = cast[ptr WepKeyWriteParamView](addr wepBuf[0])",
-        "wepReq.instNbr = instNbr",
-        "wepReq.selector = 0xFF00'u16",
-        "wepReq.keyLen = keyLen",
-        "wepReq.cipherMode = (if keyLen == 5: 0'u8 else: 3'u8)",
-        "c_memcpy(addr wepReq.keyData[0], wepKeyStr, keyLen.csize_t)",
-        "wepReq.cipherMode = (if keyLen == 26: 3'u8 else: 0'u8)",
-        "let hexChars = cast[ptr UncheckedArray[uint8]](wepKeyStr)",
-        "let hi = ascii_to_hex(hexChars[hexIndex])",
-        "let lo = ascii_to_hex(hexChars[hexIndex + 1])",
-        "wepReq.keyData[hexIndex div 2] = (hi shl 4) or lo",
-        "wepReq.keyLen = keyLen shr 1",
-        "mm_sec_machwkey_wr(addr wepBuf[0])",
+        "plan.wep.instNbr = vif.vifIdx",
+        "plan.wep.selector = 0xFF00",
+        "keyLength notin [5, 10, 13, 26]",
+        "plan.wep.cipherMode = if keyLength in [13, 26]: 3 else: 0",
+        "plan.wep.keyData[i] = credentials.keyString[i]",
+        "let hi = mmKeyHexDigit(credentials.keyString[i * 2])",
+        "let lo = mmKeyHexDigit(credentials.keyString[i * 2 + 1])",
+        "if hi < 0 or lo < 0:",
+        "plan.wep.keyData[i] = ((hi shl 4) or lo).uint8",
+        "plan.wep.keyLen = (keyLength div 2).uint8",
+        "mm_sec_machwkey_wr(addr keys.wep)",
     ]:
         assert expected in body
 
@@ -20146,6 +21175,7 @@ def test_wifi_wep_key_write_param_uses_typed_overlay():
         "cast[ptr uint8](srcBase + i.uint + 1)[]",
         "wepBuf[8 + (i div 2)]",
         "wepBuf[4] = keyLen shr 1",
+        "c_strlen(",
     ]:
         assert forbidden not in body
 
@@ -20222,9 +21252,8 @@ def test_wifi_firmware_task_state_transitions_use_named_constants():
         "ke_state_set(TASK_BAM, BamIdleState)",
         "ke_state_set(TASK_ME, MeIdleState)",
         "ke_state_set(TASK_ME, MeBusyState)",
-        "ke_state_set(TASK_ME, MeGoingIdleState)",
+        "ke_state_set(TASK_MM, TaskGoingIdleState)",
         "ke_state_set(srcId, TaskGoingIdleState)",
-        "ke_state_set(srcTask, TaskIdleState)",
     ]:
         assert expected in wifi_fw
 
@@ -20266,8 +21295,17 @@ def test_wifi_hsu_michael_exports_are_real_pure_nim_wrappers():
         "# ###########################################################################\n#                  HSU: Hardware Security Unit",
         1,
     )[0]
-    cmac_body = wifi_fw.split("proc hsu_aes_cmac*", 1)[1].split(
+    cmac_body = wifi_fw.rsplit("proc hsu_aes_cmac*", 1)[1].split(
         "proc hsu_michael_init*", 1
+    )[0]
+    key_expansion_body = wifi_fw.rsplit("proc aes128_expand_key*", 1)[1].split(
+        "type AesCmacContext", 1
+    )[0]
+    cmac_update_body = wifi_fw.rsplit("proc aesCmacUpdate", 1)[1].split(
+        "proc aesCmacFinish", 1
+    )[0]
+    cmac_finish_body = wifi_fw.rsplit("proc aesCmacFinish", 1)[1].split(
+        "proc mfp_compute_bip", 1
     )[0]
 
     assert "MichaelMicContextView {.packed.} = object" in wifi_fw
@@ -20287,8 +21325,12 @@ def test_wifi_hsu_michael_exports_are_real_pure_nim_wrappers():
     assert "var L = mic.left" in block_body
     assert "var R = mic.right" in block_body
     assert "L = L xor messageWord" in block_body
-    assert "mic.left = R" in block_body
-    assert "mic.right = L" in block_body
+    assert "R = R xor swapped" in block_body
+    assert "mic.left = L" in block_body
+    assert "mic.right = R" in block_body
+    assert "L = swapped xor R" not in block_body
+    assert "mic.left = R" not in block_body
+    assert "mic.right = L" not in block_body
     assert "let michaelMicContextPtr = micCtx" in mic_init_body
     assert "let mic = michaelMicContextAt(michaelMicContextPtr)" in mic_init_body
     assert "mic.left = cast[ptr uint32](key)[]" in mic_init_body
@@ -20334,15 +21376,17 @@ def test_wifi_hsu_michael_exports_are_real_pure_nim_wrappers():
     assert "discard\n" not in init_body
     assert "discard\n" not in calc_body
     assert "discard\n" not in end_body
-    assert "for roundKeyWordIndex in 4'u32 ..< 44:" in cmac_body
-    assert "let previousWordByteOffset = (roundKeyWordIndex - 1) * 4" in cmac_body
-    assert "roundKeys[previousWordByteOffset.int + wordByteIndex]" in cmac_body
-    assert "let roundKeyWordByteOffset = roundKeyWordIndex * 4" in cmac_body
-    assert "let previousRoundKeyWordByteOffset = (roundKeyWordIndex - 4) * 4" in cmac_body
-    assert "roundKeys[roundKeyWordByteOffset.int + wordByteIndex] =" in cmac_body
-    assert "for cmacBlockByteIndex in 0 ..< 16:" in cmac_body
-    assert "for lastBlockByteIndex in 0 ..< 16:" in cmac_body
-    assert "for finalCmacByteIndex in 0 ..< 16:" in cmac_body
+    assert "for roundKeyWordIndex in 4'u32 ..< 44:" in key_expansion_body
+    assert "let previousWordByteOffset = (roundKeyWordIndex - 1) * 4" in key_expansion_body
+    assert "rk[previousWordByteOffset.int + wordByteIndex]" in key_expansion_body
+    assert "let roundKeyWordByteOffset = roundKeyWordIndex * 4" in key_expansion_body
+    assert "let previousRoundKeyWordByteOffset = (roundKeyWordIndex - 4) * 4" in key_expansion_body
+    assert "rk[roundKeyWordByteOffset.int + wordByteIndex] =" in key_expansion_body
+    assert "aesCmacInit(ctx, key)" in cmac_body
+    assert "aesCmacUpdate(ctx, msg, msgLen)" in cmac_body
+    assert "aesCmacFinish(ctx, mac)" in cmac_body
+    assert "if ctx.pendingLen == 16:" in cmac_update_body
+    assert "if ctx.pendingLen != 16:" in cmac_finish_body
     assert "let stateBytes = cast[ptr array[16, uint8]](state)" in aes_encrypt_body
     assert "substituted[substitutionByteIndex] = AES_SBOX[stateBytes[substitutionByteIndex].int]" in aes_encrypt_body
     assert "for finalStateByteIndex in 0 ..< 16:" in aes_encrypt_body
@@ -20376,11 +21420,8 @@ def test_wifi_hsu_michael_exports_are_real_pure_nim_wrappers():
         assert forbidden not in cmac_shift_body
 
 
-def test_wifi_tkip_group_mic_path_is_explicit_reference_return():
+def test_wifi_tkip_mic_append_matches_vendor_link_scratch_thd_path():
     wifi_fw = wifi_fw_policy_source()
-    mic_area_layout = wifi_fw.split(
-        "TkipMicKeyAreaView {.packed.} = object", 1
-    )[1].split("RxMicWordsView {.packed.} = object", 1)[0]
     mic_scratch_layout = wifi_fw.split(
         "HostTxMicScratchView {.packed.} = object", 1
     )[1].split("CfgApiElementEntryView {.packed.} = object", 1)[0]
@@ -20389,17 +21430,6 @@ def test_wifi_tkip_group_mic_path_is_explicit_reference_return():
     )[0]
 
     for expected in [
-        "TkipMicKeyAreaView {.packed.} = object",
-        "micAreaBaseToScratchPadding*: uint32",
-        "scratch*: pointer",
-        "scratchToKeyMaterialPadding*: array[16, uint8]",
-        "keyMaterial*: array[8, uint8]",
-        "doAssert sizeof(TkipMicKeyAreaView) == 32",
-        "doAssert offsetof(TkipMicKeyAreaView, micAreaBaseToScratchPadding) == 0",
-        "doAssert offsetof(TkipMicKeyAreaView, scratch) == 4",
-        "doAssert offsetof(TkipMicKeyAreaView, scratchToKeyMaterialPadding) == 8",
-        "doAssert offsetof(TkipMicKeyAreaView, keyMaterial) == 24",
-        "template tkipMicKeyArea(key: ptr VifKeySlotView;",
         "HostTxMicScratchView {.packed.} = object",
         "initialLeftWord*: uint32",
         "micInputCursor*: pointer",
@@ -20414,19 +21444,36 @@ def test_wifi_tkip_group_mic_path_is_explicit_reference_return():
     ]:
         assert expected in wifi_fw
 
-    assert "Group-key/other TKIP modes follow the reference path" in body
-    assert "no immediate software MIC is appended" in body
-    assert "let micArea = tkipMicKeyArea(key, micKeyOff)" in body
-    assert "if micArea.scratch != nil:" in body
-    assert "micArea.scratch = cast[pointer](scratch)" in body
+    for expected in [
+        "let scratchPayloadEndIndex =",
+        "elif keyType == 0 or keyType == 3:",
+        "let scratchThd = cast[ptr HostTxThdEntryView](scratch)",
+        "var terminalThd = addr link.headerThd",
+        "while terminalThd.next != nil:",
+        "terminalThd = hostTxThdAt(terminalThd.next)",
+        "terminalThd.next = cast[pointer](scratchThd)",
+        "scratch.initialLeftWord = 0",
+        "scratch.micInputCursor = cast[pointer](addr scratch.micInputScratch[0])",
+        "scratch.micInputEnd =",
+        "addr scratch.micInputScratch[scratchPayloadEndIndex]",
+        "scratch.pendingWord = 0",
+        "let keyMaterial = cast[pointer](cast[uint](keySlot) + 136'u)",
+        "cast[pointer](addr desc.da[0])",
+        "cast[pointer](addr desc.sa[0])",
+        "hostTxLinkMacHdrAddr(link) + desc.hdrLen.uint - desc.qosExtLen.uint",
+        "me_mic_calc(micCtxPtr, cast[pointer](firstMicStart), desc.qosExtLen.uint32)",
+        "var payloadThd = hostTxThdAt(link.headerThd.next)",
+        "let nextPayloadThd = payloadThd.next",
+        "if nextPayloadThd == nil:",
+        "let micDst = cast[ptr UncheckedArray[uint8]](payloadThd.payloadStart.uint)",
+        "let segmentLen = payloadThd.payloadEnd - segmentStart + 1",
+        "me_mic_calc(micCtxPtr, cast[pointer](segmentStart.uint), segmentLen)",
+        "payloadThd = hostTxThdAt(nextPayloadThd)",
+        "lw a5, 8(zero); ebreak",
+    ]:
+        assert expected in body
+
     assert "scratch.micInputCursor = cast[pointer](addr scratch.micInputScratch[0])" in body
-    assert "scratch.micInputEnd = cast[pointer](addr scratch.micInputScratch[3])" in body
-    assert "scratch.micInputEnd = cast[pointer](addr scratch.micInputScratch[11])" in body
-    assert "scratch.pendingWord = 0" in body
-    assert "scratch.initialLeftWord = 0" in body
-    assert "let keyMaterial = cast[pointer](addr micArea.keyMaterial[0])" in body
-    assert "let bodyStart = hostTxLinkMacHdrPtr(link, 26'u)" in body
-    assert "me_mic_calc(micCtxPtr, bodyStart, bodyLen.uint32)" in body
     assert "for micByteIndex in 0 ..< 8:" in body
     assert "micDst[micByteIndex] = micResult[micByteIndex]" in body
     assert "# Group key MIC: similar but with different addresses" not in body
@@ -20436,16 +21483,26 @@ def test_wifi_tkip_group_mic_path_is_explicit_reference_return():
     assert "let endOff = cast[ptr uint32](linkAddr + 76)[]" not in body
     assert "let keyAddr = cast[uint](keySlot)" not in body
     assert "let micAreaBase = keyAddr + micKeyOff - 24" not in body
-    assert "reserved0*" not in mic_area_layout
-    assert "reserved8*" not in mic_area_layout
     for forbidden in [
+        "TkipMicKeyAreaView",
+        "tkipMicKeyArea",
+        "let micArea",
+        "micArea.scratch",
+        "let micKeyOff",
+        "let keyMaterial = cast[pointer](addr micArea.keyMaterial[0])",
+        "let bodyStart = hostTxLinkMacHdrPtr(link, 26'u)",
+        "me_mic_calc(micCtxPtr, bodyStart, bodyLen.uint32)",
+        "if link.headerThd.next != nil:\n    return",
+        "link.headerThd.next = cast[pointer](scratchThd)",
+        "scratch.micInputEnd = cast[pointer](addr scratch.micInputScratch[3])",
+        "scratch.micInputEnd = cast[pointer](addr scratch.micInputScratch[11])",
         "micLInit*",
         "dataPtr*",
         "endPtr*",
         "pending*: uint32",
         "data*: array[12, uint8]",
     ]:
-        assert forbidden not in mic_scratch_layout
+        assert forbidden not in wifi_fw if forbidden.endswith("*") else forbidden not in body
     assert "cast[ptr pointer](micAreaBase + 4)[]" not in body
     assert "cast[ptr pointer](micAreaBase + 4)[] = cast[pointer](scratch)" not in body
     assert "let keyMaterial = cast[pointer](keyAddr + micKeyOff)" not in body
@@ -20545,7 +21602,7 @@ def test_wifi_rxu_management_dispatch_overlay_has_semantic_padding():
         "let msg = rxuMgtDispatchView(param)",
         "let frameType = msg.frameCtrl and 0xFC'u16",
         "if msg.category == 8'u8:",
-        "if msg.actionCode != 0'u8:",
+        "msg.category != 3 or msg.actionCode != 0:",
         "let baParam = msg.baParam",
         "let dialogToken = msg.dialogToken",
         "let staIdx = msg.staIdx",
@@ -20554,7 +21611,10 @@ def test_wifi_rxu_management_dispatch_overlay_has_semantic_padding():
 
     assert "let frameType = msg.frameCtrl and 0xFC'u16" in sm_body
     assert "if msg.category == 8'u8:" in sm_body
-    assert "if msg.actionCode != 0'u8:" in bam_body
+    assert "msg.category != 3 or msg.actionCode != 0:" in bam_body
+    assert "bodyLength > payloadLength - bodyOffset" in bam_body
+    assert "let acceptedWindow = min(bufferSize, 12'u16)" in bam_body
+    assert "(baParam and 0x003E'u16) or 2'u16" in bam_body
 
     for forbidden in [
         "reserved00*",
@@ -20576,6 +21636,9 @@ def test_wifi_mm_rx_upload_flags_are_named_by_effect():
         "# ###########################################################################\n#                  SCAN TASK",
         1,
     )[0]
+    upload_body = wifi_fw.rsplit("proc rxuMgtUpload(", 1)[1].split(
+        "proc rxu_mgt_frame_check*", 1
+    )[0]
     mm_env_layout = wifi_fw.split(
         "MmEnvView {.packed.} = object", 1
     )[1].split("MmWmmParameterSourceView {.packed.} = object", 1)[0]
@@ -20588,13 +21651,15 @@ def test_wifi_mm_rx_upload_flags_are_named_by_effect():
 
     for expected in [
         "hardwareModeToListenWindowPadding*: array[4, uint8]",
-        "maxAmpduDurationTailPadding*: array[12, uint8]",
+        "tbttPreDuration*: uint32",
+        "tbttPreDurationTailPadding*: array[12, uint8]",
         "doAssert offsetof(MmEnvView, hardwareModeToListenWindowPadding) == 20",
         "rxPromiscUploadFlag*: uint32",
         "apPromiscUploadFlag*: uint32",
         "doAssert offsetof(MmEnvView, rxPromiscUploadFlag) == 44",
         "doAssert offsetof(MmEnvView, apPromiscUploadFlag) == 48",
-        "doAssert offsetof(MmEnvView, maxAmpduDurationTailPadding) == 56",
+        "doAssert offsetof(MmEnvView, tbttPreDuration) == 52",
+        "doAssert offsetof(MmEnvView, tbttPreDurationTailPadding) == 56",
         "deferredChangeQueuePadding*: uint8",
         "doAssert offsetof(MmBcnEnvView, deferredChangeQueuePadding) == 11",
         "beaconChangeBaseToLengthsPadding*: array[4, uint8]",
@@ -20616,7 +21681,10 @@ def test_wifi_mm_rx_upload_flags_are_named_by_effect():
 
     assert "if mm.rxPromiscUploadFlag != 0:" in hw_info_body
     assert "if mm.apPromiscUploadFlag != 0:" in hw_ap_body
-    assert "(mm.rxPromiscUploadFlag or mm.apPromiscUploadFlag) != 0" in mgt_body
+    assert "return rxuMgtUpload(param, mfpAcceptedFlag)" in mgt_body
+    assert "(mm.rxPromiscUploadFlag or mm.apPromiscUploadFlag) != 0" in upload_body
+    assert "if mm.rxPromiscUploadFlag != 0:" in upload_body
+    assert "if mm.apPromiscUploadFlag != 0:" in upload_body
 
     for forbidden in [
         "uploadWord44",
@@ -20654,9 +21722,8 @@ def test_wifi_set_active_confirm_handlers_use_state_predicates():
     wifi_fw = wifi_fw_policy_source()
 
     assert "proc smSetActiveCfmStateAllowed(): bool {.inline.}" in wifi_fw
-    assert "proc apmSetActiveCfmStateAllowed(): bool {.inline.}" in wifi_fw
     assert "if not smSetActiveCfmStateAllowed():" in wifi_fw
-    assert "if not apmSetActiveCfmStateAllowed():" in wifi_fw
+    assert "proc apmSetActiveCfmStateAllowed(): bool {.inline.}" not in wifi_fw
 
     sm_handler = wifi_fw.split("proc me_set_active_cfm_handler_sm*", 1)[1].split(
         "proc me_set_active_cfm_handler_apm*", 1
@@ -20666,6 +21733,26 @@ def test_wifi_set_active_confirm_handlers_use_state_predicates():
     )[0]
     assert "\n    discard\n" not in sm_handler
     assert "\n    discard\n" not in apm_handler
+    assert "if apmConsumeStartReply(param):" in apm_handler
+    assert "if ke_state_get(TASK_APM) == ApmActiveState:" in apm_handler
+    for name in ["me_set_ps_disable_cfm_handler_apm", "mm_bss_param_setting_handler_apm",
+                 "mm_bcn_change_cfm_handler"]:
+        body = wifi_fw.rsplit(f"proc {name}*", 1)[1].split("\nproc ", 1)[0]
+        assert "apmConsumeStartReply(param)" in body
+
+    for name in ["me_set_active_req_handler", "me_set_ps_disable_req_handler"]:
+        body = wifi_fw.rsplit(f"proc {name}*", 1)[1].split("\nproc ", 1)[0]
+        assert "meBeginControl(param," in body
+        assert "ke_msg_send_basic_reply(param," in body
+    begin = wifi_fw.split("proc meBeginControl(", 1)[1].split("proc meCompleteControl", 1)[0]
+    assert "ke_msg_alloc_reply(request, replyId, 0)" in begin
+    assert "requestHeader.destId = TASK_MM" in begin
+    assert "requestHeader.paramLen = 1" in begin
+    assert "apmStartReplyPool: array[6, pointer]" in wifi_fw
+    assert "apmRollbackCommands: array[3, pointer]" in wifi_fw
+    assert "apmRollbackReplies: array[3, pointer]" in wifi_fw
+    assert "apmBeginStartRollback(status)" in wifi_fw
+    assert "handler: keMsgHandlerAddress(mm_set_vif_state_cfm_handler_apm)" in wifi_fw
 
 
 def test_ble_peripheral_waits_are_completed_by_notifications():

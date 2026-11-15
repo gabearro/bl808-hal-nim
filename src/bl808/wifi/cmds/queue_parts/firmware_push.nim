@@ -1,15 +1,28 @@
-proc pushCmdToFirmware(cmdMgr, cmd: pointer) =
-  let blHw = cmdMgr
-  let a2e = loadPtr(cmd, CmdA2eMsgOff)
-  if a2e == nil:
-    return
-  let firmwareMsgLength = LmacMsgHeaderLen + loadU32(a2e, LmacMsgParamLenOff).uint16
+proc pushCmdToFirmware(cmdMgr, cmd: pointer): cint =
+  let error = cmdMessageError(cmd)
+  if error != 0:
+    cmdMgrAbort(cmdMgr, cmd, error)
+    return -error
+  let source = loadPtr(cmd, CmdA2eMsgOff)
+  let length = LmacMsgHeaderLen + loadU32(source, LmacMsgParamLenOff).uint16
+  let status = ipc_host_msg_push(loadPtr(cmdMgr, BlHwIpcEnvOff), cmd, length)
   when defined(bl808WifiCmdTrace):
-    c_printf("[WIFI-CMD] push cmd=%p id=0x%x req=0x%x tkn=%u flags=0x%x len=%u env=%p\r\n",
-             cmd, loadU16(cmd, CmdReqidOff - 2'u).cuint, loadU16(cmd, CmdReqidOff).cuint,
-             loadU32(cmd, CmdTknOff).cuint, loadU16(cmd, CmdFlagsOff).cuint,
-             firmwareMsgLength.cuint, loadPtr(blHw, BlHwIpcEnvOff))
-  let pushStatus = ipc_host_msg_push(loadPtr(blHw, BlHwIpcEnvOff), cmd, firmwareMsgLength)
-  when defined(bl808WifiCmdTrace):
-    c_printf("[WIFI-CMD] push rc=%d cmd=%p\r\n", pushStatus.cint, cmd)
-  osFree(a2e)
+    c_printf("[WIFI-CMD] push cmd=%p len=%u status=%d\r\n", cmd, length.cuint, status)
+  if status != 0:
+    cmdMgrAbort(cmdMgr, cmd, Eio)
+    return -Eio
+  discard takeCmdSource(cmd)
+  osFree(source)
+  0
+
+proc pushNextCommand(cmdMgr: pointer) =
+  if not cmdMgrAccepting(cmdMgr) or cmdMailboxOwner(cmdMgr) != nil: return
+  let head = ptrAt(cmdMgr, MgrCmdsOff)
+  var node = listNext(head)
+  while node != head:
+    let flags = loadU16(node, CmdFlagsOff)
+    if (flags and RwnxCmdFlagWaitPush) != 0:
+      storeU16(node, CmdFlagsOff, flags and not RwnxCmdFlagWaitPush)
+      discard pushCmdToFirmware(cmdMgr, node)
+      return
+    node = listNext(node)

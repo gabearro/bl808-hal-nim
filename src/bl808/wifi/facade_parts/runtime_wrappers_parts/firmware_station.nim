@@ -1,15 +1,13 @@
 proc wifiNimFirmwareStaIdle(): bool {.inline.} =
   sm_state == 0'u16
 
+proc wifiNimFirmwareStaDisconnected(): bool {.inline.} =
+  not wifiBackendConnected() and wifiNimFirmwareStaIdle()
+
 proc wifiNimFirmwareIssueDisconnect(): cint {.inline.} =
   if not wifiBackendConnected() and not wifiNimFirmwareStaIdle():
-    var status: uint8
-    return bl_main_connect_abort(addr status)
-  bl_main_disconnect()
-
-proc wifiNimFirmwareForceStaIdle() {.inline.} =
-  if not wifiBackendConnected() and not wifiNimFirmwareStaIdle():
-    sm_delete_resources(nil)
+    return wifiBackendStaConnectAbort()
+  wifiBackendStaDisconnect()
 
 proc wifiNimFirmwareDisconnectNeedsDrain(): bool {.inline.} =
   true

@@ -15,7 +15,9 @@ proc bl808_wifi_backend_init*(conf: ptr WifiConf): cint {.exportc, cdecl.} =
     local[0] = loadU8(conf, WifiConfCountryOff)
     local[1] = if loadU8(conf, WifiConfCountryOff + 1) != 0: loadU8(conf, WifiConfCountryOff + 1) else: 'S'.uint8
   bl808WifiBackendTrace("backend_init fw_start")
-  bl808WifiBackendFwStart()
+  if not bl808WifiBackendFwStart():
+    hostPollEnabled = false
+    return -1
   bl808WifiBackendTrace("backend_init bl606a0_wifi_init")
   hostPollEnabled = true
   result = bl606a0_wifi_init(cast[ptr WifiConf](addr local[0]))

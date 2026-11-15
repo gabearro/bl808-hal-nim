@@ -15,8 +15,21 @@ include cmds/dispatch
 proc bl_cmd_mgr_init*(cmdMgr: pointer) {.exportc, cdecl.} =
   if cmdMgr == nil:
     return
+  if loadPtr(cmdMgr, MgrLockOff) == nil:
+    storePtr(cmdMgr, MgrLockOff, osMutexCreate())
+  cmdMgrLock(cmdMgr)
+  defer: cmdMgrUnlock(cmdMgr)
+  if loadU32(cmdMgr, MgrStateOff) == RwnxCmdMgrStateDraining: return
+  let head = ptrAt(cmdMgr, MgrCmdsOff)
+  if listNext(head) != nil and not listEmpty(head):
+    cmdMgrAbort(cmdMgr, nil, Epipe)
+    if not listEmpty(head): return
+  if cmdMailboxOwner(cmdMgr) != nil:
+    storeU32(cmdMgr, MgrStateOff, RwnxCmdMgrStateCrashed)
+    return
   listInit(ptrAt(cmdMgr, MgrCmdsOff))
-  storePtr(cmdMgr, MgrLockOff, osMutexCreate())
+  storeU32(cmdMgr, MgrStateOff, 0)
+  storeU32(cmdMgr, MgrQueueSzOff, 0)
   storeU32(cmdMgr, MgrMaxQueueSzOff, RwnxCmdMaxQueued)
   storePtr(cmdMgr, MgrQueueOff, cast[pointer](cmdMgrQueue))
   storePtr(cmdMgr, MgrPrintOff, cast[pointer](cmdMgrPrint))
@@ -26,16 +39,23 @@ proc bl_cmd_mgr_init*(cmdMgr: pointer) {.exportc, cdecl.} =
 
 var nimFwDbgCmdMgrRecovered* {.exportc: "nimfw_dbg_cmd_mgr_recovered".}: uint32
 
-proc wifiCmdMgrRecoverIfCrashed*(cmdMgr: pointer): bool {.exportc, cdecl.} =
-  ## If the host command manager latched Crashed — a blocking CFM wait timed out
-  ## (WifiCmdWaitTicks) because the RF/MAC was dead after a reconnect's
-  ## bl_send_reset — re-initialise it so the NEXT reconnect attempt can queue
-  ## commands again. Without this, every command after the first dead-RF timeout
-  ## fast-fails -Epipe forever (enqueue.nim Crashed gate) and the device can only
-  ## recover via a full reboot. Re-init is leak-free here (osMutexCreate is a
-  ## stub returning a fixed handle). Returns true if a recovery re-init happened.
+proc wifiCmdMgrReady*(cmdMgr: pointer): bool {.exportc, cdecl.} =
   if cmdMgr == nil: return false
-  if loadU32(cmdMgr, MgrStateOff) != RwnxCmdMgrStateCrashed: return false
-  bl_cmd_mgr_init(cmdMgr)
+  cmdMgrLock(cmdMgr)
+  defer: cmdMgrUnlock(cmdMgr)
+  let env = loadPtr(cmdMgr, BlHwIpcEnvOff)
+  cmdMgrAccepting(cmdMgr) and env != nil and loadPtr(env, CmdIpcSharedOff) != nil
+
+proc wifiCmdMgrRecoverIfCrashed*(cmdMgr: pointer): bool {.exportc, cdecl.} =
+  ## Recovery preserves the mailbox sequence and waits for outstanding ACKs.
+  if cmdMgr == nil: return false
+  cmdMgrLock(cmdMgr)
+  defer: cmdMgrUnlock(cmdMgr)
+  if loadU32(cmdMgr, MgrStateOff) != RwnxCmdMgrStateCrashed or
+      not listEmpty(ptrAt(cmdMgr, MgrCmdsOff)): return false
+  let env = loadPtr(cmdMgr, BlHwIpcEnvOff)
+  if env == nil or loadPtr(env, CmdIpcSharedOff) == nil or
+      cmdMailboxOwner(cmdMgr) != nil: return false
+  storeU32(cmdMgr, MgrStateOff, 0)
   inc nimFwDbgCmdMgrRecovered
   true

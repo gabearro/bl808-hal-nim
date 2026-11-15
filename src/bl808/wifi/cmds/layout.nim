@@ -6,28 +6,27 @@ const
   RwnxCmdFlagWaitAck = 1'u16 shl 3
   RwnxCmdFlagWaitCfm = 1'u16 shl 4
   RwnxCmdFlagDone = 1'u16 shl 5
+  RwnxCmdFlagCallback = 1'u16 shl 6
   RwnxCmdMgrStateCrashed = 2'u32
+  RwnxCmdMgrStateDraining = 3'u32
 
-  # Bounded wait (in os-event "ticks") for a blocking command's CFM. The blob
-  # waited FOREVER (BlOsWaitingForever) here; when the RF/MAC is dead after a
-  # reconnect's bl_send_reset the CFM never arrives and the whole cooperative
-  # scheduler hangs (JTAG-confirmed: rawDelay<-osEventGroupWait<-cmd-mgr wait,
-  # blocking a reconnect permanently). osEventGroupWait spins loops =
-  # blockTimeTick*64 iterations of vendorPollOnce()+rawDelay(128), reading NO
-  # mtime, so this bound is immune to the reconnect mtime-clock freeze. A
-  # healthy CFM sets the event bit and returns immediately, so this only bounds
-  # the DEAD case and never false-times-out a live command. On expiry the
-  # cmd-mgr marks itself Crashed + returns Etimedout (enqueue.nim), so the
-  # recovery returns to the scheduler instead of wedging. Calibrated so one
-  # dead wait stays a few seconds and 3x is well under the WDT window.
+  # The bare-metal adapter counts polling iterations, not wall-clock ticks.
+  # Expiry returns ETIMEDOUT; a still-published command survives until ACK.
+  # Recovery cannot reuse its slot while that ACK remains outstanding.
   WifiCmdWaitTicks {.intdefine.} = 200'u32
 
   Eintr = 4'i32
+  Eio = 5'i32
   Enomem = 12'i32
+  Einval = 22'i32
   Epipe = 32'i32
+  Emsgsize = 90'i32
   Etimedout = 110'i32
+  CmdMaxParamLen = 500'u32
 
   BlHwIpcEnvOff = 0x30'u
+  CmdIpcSharedOff = 32'u
+  CmdIpcOwnerOff = 88'u
 
   MgrStateOff = 0'u
   MgrNextTknOff = 4'u

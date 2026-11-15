@@ -18,6 +18,7 @@ type
 
   MallocProc = proc(size: csize_t): pointer {.cdecl.}
   FreeProc = proc(p: pointer) {.cdecl.}
+  # The Nim command manager owns both allocations once this is called.
   CmdQueueProc = proc(cmdMgr, cmd: pointer): cint {.cdecl.}
 
 var g_bl_ops_funcs {.importc, header: "bl_os_adapter.h".}: BlOpsFuncs

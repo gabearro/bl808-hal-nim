@@ -18,6 +18,7 @@ const
   RxFlagStaIdxShift = 16
   RxFlagStaIdxMask = 0xff'u32
   WifiPktFragCount = 4
+  WifiPktFragmentSize = 1736'u32
   WifiPktPktOff = 0'u
   WifiPktLenOff = 32'u
   PbufRaw = 0.cint

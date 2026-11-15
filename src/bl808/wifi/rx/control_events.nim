@@ -6,9 +6,12 @@ proc blCommonInd(blHw, cmd, msg: pointer): cint {.cdecl.} =
   0
 
 proc blRxRssiStatusInd(blHw, cmd, msg: pointer): cint {.cdecl.} =
+  let callback = snapshotCallback(cbRssi)
   let ind = msgParam(msg)
-  if cbRssi != nil:
-    cbRssi(cbRssiEnv, loadI8(ind, MmRssiRssiOff))
+  if callback.handler != nil:
+    let rssi = loadI8(ind, MmRssiRssiOff)
+    if claimCallback(cbRssi, callback):
+      callback.handler(callback.context, rssi)
   0
 
 proc blRxScanuStartCfm(blHw, cmd, msg: pointer): cint {.cdecl.} =

@@ -12,6 +12,7 @@ include ipc_host/debug_state
 
 include ipc_host/host_interfaces
 include ipc_host/accessors
+include ipc_host/runtime
 include ipc_host/list_helpers
 include ipc_host/callbacks
 

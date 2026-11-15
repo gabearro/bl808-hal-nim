@@ -9,11 +9,23 @@
 
 import ../timer
 import ./sched
+import ./clock          # readTick() — the scheduler's own timebase (CLINT mtime)
+
+const
+  WdtLivenessGracePolls* {.intdefine.} = 4096'u32
+    ## Consecutive scheduler polls the WDT may keep feeding while readTick()
+    ## shows NO advance. mtime runs at ~1 MHz, so any real progress bumps it
+    ## within a handful of polls; 4096 static polls of a truly frozen clock is
+    ## far below one WDT timeout (~5 s), so we then STOP feeding and let the
+    ## independent f32k WDT reboot. This is >> the sub-microsecond poll-aliasing
+    ## window, so normal operation never trips it.
 
 var
   wdtTimer: Timer
   wdtActive: bool = false
   wdtFeeds: uint64 = 0
+  wdtLastTick: uint64 = 0     ## last readTick() the feed saw advance
+  wdtStuckPolls: uint32 = 0   ## consecutive polls with no readTick() advance
 
 proc watchdogInit*(id: timer.TimerId = timer0, timeoutMs: uint32 = 5000) =
   ## Enable the hardware watchdog with the given timeout.
@@ -33,10 +45,29 @@ proc watchdogInit*(id: timer.TimerId = timer0, timeoutMs: uint32 = 5000) =
   wdtEnable(wdtTimer, min(timeoutMs, 60_000'u32), resetOnTimeout = true)
   wdtActive = true
 
+  wdtLastTick = readTick()
   addSchedulerPollHook(proc() =
-    if wdtActive:
+    if not wdtActive:
+      return
+    # LIVENESS-GATED FEED. The scheduler keeps looping during an mtime-clock
+    # freeze (WiFi reconnect gates the CPU-side CLINT read path), so an
+    # UNCONDITIONAL feed pets the dog forever and the device hangs SILENTLY
+    # while time is frozen. Feed only while the scheduler's timebase (readTick
+    # == CLINT mtime on M0) is actually ADVANCING. If it stalls for
+    # WdtLivenessGracePolls consecutive polls, STOP feeding so the independent
+    # f32k WDT reaches its match and reboots — bounded recovery instead of a
+    # permanent silent hang.
+    let t = readTick()
+    if t != wdtLastTick:
+      wdtLastTick = t
+      wdtStuckPolls = 0
       wdtFeed(wdtTimer)
       wdtFeeds.inc
+    elif wdtStuckPolls < WdtLivenessGracePolls:
+      inc wdtStuckPolls
+      wdtFeed(wdtTimer)
+      wdtFeeds.inc
+    # else: timebase frozen past the grace window -> do NOT feed -> WDT reboots.
   )
 
 proc watchdogDisable*() =

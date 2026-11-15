@@ -13,7 +13,8 @@ const
   MACHW_RNG_REG        = MACHW_BASE + 0x0A0'u  # TRNG register
   MACHW_TX_POWER_REG   = MACHW_BASE + 0x0A0'u  # TX power control (shared with RNG reg)
   MACHW_TIMLO_REG      = MACHW_BASE + 0x120'u  # MAC timestamp low
-  MACHW_ABS_TIMER_REG  = MACHW_BASE + 0x144'u  # Absolute timer target
+  MACHW_IDLE_TIMER_REG = MACHW_BASE + 0x13C'u  # Idle transition deadline
+  MACHW_ABS_TIMER_REG  = MACHW_BASE + 0x144'u  # MM absolute timer target
   MACHW_BCN_STATUS_REG = MACHW_BASE + 0x400'u  # Beacon status
   MACHW_BCN_INT_REG    = MACHW_BASE + 0x064'u  # Beacon interval register (lower 16 bits)
   MACHW_EDCA_AC_BK_REG = MACHW_BASE + 0x200'u  # EDCA AC_BK params register
@@ -33,12 +34,14 @@ const
   # Match the BL808 vendor WiFi firmware register map.  The 0x44800000 alias
   # does not expose the IPC magic register on the tested M0 hardware.
   IPC_EMB_MAGIC_REG    = IPC_REG_BASE + 0x140'u  # Must read 0x49504332
-  IPC_EMB_STATUS_REG   = IPC_REG_BASE + 0x100'u  # IPC config register
+  IPC_EMB_STATUS_REG   = IPC_REG_BASE + 0x100'u  # app interrupt trigger
+  IPC_EMB_RAW_STATUS   = IPC_REG_BASE + 0x104'u
+  IPC_EMB_ACK          = IPC_REG_BASE + 0x108'u
   IPC_EMB_UNMASK_SET   = IPC_REG_BASE + 0x10C'u  # unmask set
   IPC_EMB_UNMASK_CLR   = IPC_REG_BASE + 0x110'u  # unmask clear
-  IPC_EMB_RAW_STATUS   = IPC_REG_BASE + 0x114'u
-  IPC_EMB_ACK          = IPC_REG_BASE + 0x118'u
-  IPC_EMB_STATUS2      = IPC_REG_BASE + 0x11C'u  # TX status
+  IPC_EMB_LINE_SEL_LOW = IPC_REG_BASE + 0x114'u
+  IPC_EMB_LINE_SEL_HIGH = IPC_REG_BASE + 0x118'u
+  IPC_EMB_STATUS2      = IPC_REG_BASE + 0x11C'u  # masked app-to-embedded status
 
   INTC_BASE            = 0x40000000'u
   INTC_PEND_REG        = INTC_BASE + 0x010'u
@@ -61,15 +64,14 @@ const
   SCAN_EDCA_RX_FILTER_CLEAR_MASK = 0xFFFFDDFF'u32
   SCAN_DEFAULT_DURATION_US = 0x35B60'u32
   SCAN_STATUS_OK = 0'u8
+  SCAN_STATUS_FAIL = 1'u8
+  SCAN_STATUS_BAD_PARAM = 4'u8
   SCAN_STATUS_BUSY = 8'u8
   WifiTimerDrainLimit = 8'u32
   WifiIpcMsgDrainLimit = 8'u32
   WifiIpcTxDrainLimit = 16'u32
   WifiSavedMsgDrainLimit = 8'u32
-  WifiTxCfmDrainLimit = 16'u32
-  WifiTxTriggerDrainLimit = 16'u32
   WifiTxFrameDrainLimit = 16'u32
-  WifiRxTimerDrainLimit = 16'u32
   KeMsgConsumed = 0.cint
   KeMsgNoFree = 1.cint
   KeMsgSaved = 2.cint
@@ -80,4 +82,3 @@ elif defined(bl808WifiForceTxPwr30):
   const NimFwForcedMgmtTxPower = 0x30'u32
 elif defined(bl808WifiForceTxPwr20):
   const NimFwForcedMgmtTxPower = 0x20'u32
-

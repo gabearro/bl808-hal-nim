@@ -29,12 +29,10 @@ proc bl_main_connect*(ssid: ptr uint8; ssidLen: cint; psk: ptr uint8; pskLen: ci
     storeU16(chan, ChanFreqOff, freq)
     storeU32(chan, ChanFlagsOff, 0'u32)
 
-  discard bl_cfg80211_connect(hwPtr(), cast[ptr Cfg80211ConnectParams](addr sme[0]))
-  0
+  bl_cfg80211_connect(hwPtr(), cast[ptr Cfg80211ConnectParams](addr sme[0]))
 
 proc bl_main_disconnect*(): cint {.exportc, cdecl.} =
-  discard bl_send_sm_disconnect_req(hwPtr())
-  0
+  bl_send_sm_disconnect_req(hwPtr())
 
 proc bl_main_powersaving*(mode: cint): cint {.exportc, cdecl.} =
   result = bl_send_mm_powersaving_req(hwPtr(), mode)

@@ -1,7 +1,9 @@
+import ../fw_constants/states
+
 const
-  ReplaySmAuthStartingState* = 5'u16
-  ReplaySmAuthenticatingState* = 6'u16
-  ReplaySmActivatingState* = 9'u16
+  ReplaySmAuthWaitState* = SmAuthenticatingState
+  ReplaySmAssocWaitState* = SmAssocRspState
+  ReplaySmActivatingState* = SM_ACTIVATING_STATE
 
 type
   WifiReplayKind* = enum
@@ -19,6 +21,7 @@ type
   WifiReplayTimeoutAction* = enum
     wrTimeoutIgnored,
     wrTimeoutRetryAuth,
+    wrTimeoutRetryAssoc,
     wrTimeoutFail
 
   WifiReplayEvent* = object
@@ -44,7 +47,7 @@ proc replayClassifyRxuMgtInd*(buf: openArray[uint8]; smState: uint16):
     if buf.len < 38:
       result.kind = wrTooShort
       return
-    if smState != ReplaySmAuthStartingState:
+    if smState != ReplaySmAuthWaitState:
       result.kind = wrAuthDroppedWrongState
       return
     let authAlgo = replayLe16(buf, 32)
@@ -58,7 +61,7 @@ proc replayClassifyRxuMgtInd*(buf: openArray[uint8]; smState: uint16):
     if buf.len < 38:
       result.kind = wrTooShort
       return
-    if smState != ReplaySmAuthenticatingState:
+    if smState != ReplaySmAssocWaitState:
       result.kind = wrAssocDroppedWrongState
       return
     result.status = replayLe16(buf, 34)
@@ -107,9 +110,10 @@ proc replayMgmtTimeoutAction*(smState: uint16; retryCount, maxRetries: uint32):
   ## A management TX ACK only proves the AP received the frame at MAC level.
   ## It must not advance auth/assoc state without a matching management
   ## response, otherwise local tests hide the exact failure seen on hardware.
-  if smState != ReplaySmAuthStartingState and
-      smState != ReplaySmAuthenticatingState:
+  if smState != ReplaySmAuthWaitState and
+      smState != ReplaySmAssocWaitState:
     return wrTimeoutIgnored
   if retryCount >= maxRetries:
     return wrTimeoutFail
-  wrTimeoutRetryAuth
+  if smState == ReplaySmAuthWaitState: wrTimeoutRetryAuth
+  else: wrTimeoutRetryAssoc

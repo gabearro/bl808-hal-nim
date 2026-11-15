@@ -1,6 +1,8 @@
 var nimFwDbgTcpipInputCalls* {.exportc: "nimfw_dbg_tcpip_input_calls".}: uint32
 var nimFwDbgTcpipInputNoForward* {.exportc: "nimfw_dbg_tcpip_input_no_forward".}: uint32
 var nimFwDbgTcpipInputMpdu* {.exportc: "nimfw_dbg_tcpip_input_mpdu".}: uint32
+var nimFwDbgMonitorInputOk* {.exportc: "nimfw_dbg_monitor_input_ok".}: uint32
+var nimFwDbgMonitorInputFail* {.exportc: "nimfw_dbg_monitor_input_fail".}: uint32
 var nimFwDbgTcpipInputNoVif* {.exportc: "nimfw_dbg_tcpip_input_no_vif".}: uint32
 var nimFwDbgTcpipInputNoNetif* {.exportc: "nimfw_dbg_tcpip_input_no_netif".}: uint32
 var nimFwDbgTcpipInputNoPbuf* {.exportc: "nimfw_dbg_tcpip_input_no_pbuf".}: uint32
@@ -15,6 +17,13 @@ var nimFwDbgTcpipInputNoPbufRaw* {.exportc: "nimfw_dbg_tcpip_input_no_pbuf_raw".
 
 proc noteTcpipNoPbuf(stage, status, flags, msduOffset: uint32;
                      usedMpduInput: bool; pkt: pointer) =
+  let saved = csrReadMstatus()
+  disableInterrupts()
+  {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
+  defer:
+    {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
+    if (saved and 8) != 0:
+      enableInterrupts()
   inc nimFwDbgTcpipInputNoPbuf
   nimFwDbgTcpipInputNoPbufStage = stage
   nimFwDbgTcpipInputNoPbufStatus = status
@@ -26,11 +35,17 @@ proc noteTcpipNoPbuf(stage, status, flags, msduOffset: uint32;
   nimFwDbgTcpipInputNoPbufPkt = cast[uint](pkt).uint32
   for noPbufRawByteIndex in 0 ..< nimFwDbgTcpipInputNoPbufRaw.len:
     nimFwDbgTcpipInputNoPbufRaw[noPbufRawByteIndex] = 0
-  if pkt != nil and loadU16(pkt, WifiPktLenOff) != 0'u16:
-    let uploadFrameData = cast[pointer](loadU32(pkt, WifiPktPktOff).uint)
+  if pkt != nil:
+    let firstLen = loadU16(pkt, WifiPktLenOff).uint32
+    if firstLen == 0 or firstLen > WifiPktFragmentSize:
+      return
+    let address = loadU32(pkt, WifiPktPktOff)
+    if address == 0 or address > high(uint32) - (firstLen - 1):
+      return
+    let uploadFrameData = cast[pointer](address.uint)
     let noPbufRawCopyLimit =
-      if loadU16(pkt, WifiPktLenOff).int < nimFwDbgTcpipInputNoPbufRaw.len:
-        loadU16(pkt, WifiPktLenOff).int
+      if firstLen.int < nimFwDbgTcpipInputNoPbufRaw.len:
+        firstLen.int
       else:
         nimFwDbgTcpipInputNoPbufRaw.len
     for noPbufRawByteIndex in 0 ..< noPbufRawCopyLimit:
@@ -45,7 +60,7 @@ proc wifi_nimfw_tcpip_input_fail*(): uint32 {.exportc, cdecl.} =
   nimFwDbgTcpipInputFail
 proc wifi_nimfw_tcpip_input_drop_flags*(): uint32 {.exportc, cdecl.} =
   (nimFwDbgTcpipInputNoForward and 0xff'u32) or
-    ((nimFwDbgTcpipInputMpdu and 0xff'u32) shl 8) or
+    ((nimFwDbgMonitorInputFail and 0xff'u32) shl 8) or
     ((nimFwDbgTcpipInputNoVif and 0xff'u32) shl 16) or
     ((nimFwDbgTcpipInputNoNetif and 0xff'u32) shl 24)
 proc wifi_nimfw_tcpip_input_no_pbuf*(): uint32 {.exportc, cdecl.} =

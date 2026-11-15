@@ -2,178 +2,149 @@
 #                  Coexistence (coex_*)
 # ###########################################################################
 
+type CoexDumpLogFn = proc(level: uint32; tag, file: cstring; line: cint;
+                           format: cstring) {.cdecl, varargs.}
+
+proc coexDumpHeader(line: cint; message: cstring) {.noinline.} =
+  let logFn = cast[CoexDumpLogFn](blOpsFunc(204))
+  if logFn != nil:
+    logFn(2, nil, "arch_main.c", line, message)
+
+proc coexDumpRegister(line: cint; value: uint32) {.noinline.} =
+  let logFn = cast[CoexDumpLogFn](blOpsFunc(204))
+  if logFn != nil:
+    logFn(2, nil, "arch_main.c", line, "value is %08lx\r\n", value.culong)
+
+proc coexDumpField(line: cint; format: cstring; value: uint32) {.noinline.} =
+  let logFn = cast[CoexDumpLogFn](blOpsFunc(204))
+  if logFn != nil:
+    logFn(2, nil, "arch_main.c", line, format, value.cuint)
+
 proc coex_dump_pta*() {.exportc, cdecl.} =
-  ## Dump PTA coexistence state (566 bytes in blob, 171 instrs).
-  ## From blob: reads PTA register, extracts 16 bitfields via T-Head bexti,
-  ## logs each via g_bl_ops_funcs[76] with line numbers 363..395.
-  ## Blob reloads logFunc before each call.
-  type LogV = proc(a0, a1: uint32, fmt: pointer, line: uint32, val: uint32) {.cdecl, varargs.}
-  # Log header
-  let lf0 = cast[LogV](getLogFunc(76)); if lf0 != nil: lf0(2, 0, nil, 400, 0)
-  # Read PTA register, log full value
-  var reg = ptaCoexControl()
-  let lf1 = cast[LogV](getLogFunc(76)); if lf1 != nil: lf1(2, 0, nil, 363, reg)
-  # Re-read and extract bitfields
-  reg = ptaCoexControl()
-  let lf2 = cast[LogV](getLogFunc(76)); if lf2 != nil: lf2(2, 0, nil, 382, reg shr 28)
-  let lf3 = cast[LogV](getLogFunc(76)); if lf3 != nil: lf3(2, 0, nil, 383, (reg shr 24) and 0xF)
-  let lf4 = cast[LogV](getLogFunc(76)); if lf4 != nil: lf4(2, 0, nil, 384, (reg shr 20) and 0xF)
-  let lf5 = cast[LogV](getLogFunc(76)); if lf5 != nil: lf5(2, 0, nil, 385, (reg shr 16) and 0xF)
-  let lf6 = cast[LogV](getLogFunc(76)); if lf6 != nil: lf6(2, 0, nil, 386, (reg shr 12) and 0xF)
-  let lf7 = cast[LogV](getLogFunc(76)); if lf7 != nil: lf7(2, 0, nil, 387, (reg shr 8) and 0xF)
-  let lf8 = cast[LogV](getLogFunc(76)); if lf8 != nil: lf8(2, 0, nil, 388, (reg shr 4) and 0xF)
-  let lf9 = cast[LogV](getLogFunc(76)); if lf9 != nil: lf9(2, 0, nil, 389, (reg shr 3) and 0x1)
-  let lf10 = cast[LogV](getLogFunc(76)); if lf10 != nil: lf10(2, 0, nil, 390, (reg shr 2) and 0x1)
-  let lf11 = cast[LogV](getLogFunc(76)); if lf11 != nil: lf11(2, 0, nil, 391, (reg shr 1) and 0x1)
-  let lf12 = cast[LogV](getLogFunc(76)); if lf12 != nil: lf12(2, 0, nil, 392, reg and 0x1)
-  let lf13 = cast[LogV](getLogFunc(76)); if lf13 != nil: lf13(2, 0, nil, 393, reg and 0x3)
-  let lf14 = cast[LogV](getLogFunc(76)); if lf14 != nil: lf14(2, 0, nil, 394, reg and 0x1)
-  # Final: re-read register for bit 0
-  let reg2 = ptaCoexControl()
-  let lf15 = cast[LogV](getLogFunc(76)); if lf15 != nil: lf15(2, 0, nil, 395, reg2 and 0x1)
+  coexDumpHeader(400, "=============    Coex PTA: enable==================\r\n")
+  coexDumpRegister(363, ptaCoexControl())
+  let reg = ptaCoexControl()
+  coexDumpField(382, "abortrxwhentx is %u\r\n", (reg shr 20) and 1)
+  coexDumpField(383, "swwlanrxabort is %u\r\n", (reg shr 19) and 1)
+  coexDumpField(384, "swwlantxabort is %u\r\n", (reg shr 18) and 1)
+  coexDumpField(385, "swbtrxabort is %u\r\n", (reg shr 17) and 1)
+  coexDumpField(386, "swbttxabort is %u\r\n", (reg shr 16) and 1)
+  coexDumpField(387, "chanmargin is %u\r\n", (reg shr 8) and 0x3F)
+  coexDumpField(388, "wlanptimode is %u\r\n", (reg shr 7) and 1)
+  coexDumpField(389, "bteventmask is %u\r\n", (reg shr 6) and 1)
+  coexDumpField(390, "chanenable is %u\r\n", (reg shr 5) and 1)
+  coexDumpField(391, "ptienable is %u\r\n", (reg shr 4) and 1)
+  coexDumpField(392, "nosimrx is %u\r\n", (reg shr 3) and 1)
+  coexDumpField(393, "nosimtx is %u\r\n", (reg shr 2) and 1)
+  coexDumpField(394, "basicpriority is %u\r\n", (reg shr 1) and 1)
+  coexDumpField(395, "ptaenable is %u\r\n", reg and 1)
 
 proc coex_dump_wifi*() {.exportc, cdecl.} =
-  ## Dump WiFi coexistence state (1216 bytes in blob).
-  ## Reads MAC HW registers at 0x24B00400/404/408, extracts bitfields,
-  ## logs each via g_bl_ops_funcs[76]. Blob reloads logFunc before each call.
-  type LogV = proc(a0, a1: uint32, fmt: pointer, line: uint32, val: uint32) {.cdecl, varargs.}
-  # Header
-  var lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 513, 0)
-  # Reg0 full
-  var reg0 = wlanCoexControl()
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 421, reg0)
-  # Reg0 bitfields
-  reg0 = wlanCoexControl()
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 439, reg0 shr 28)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 440, (reg0 shr 22) and 0x3F)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 441, (reg0 shr 18) and 0xF)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 442, (reg0 shr 14) and 0xF)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 443, (reg0 shr 10) and 0xF)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 444, (reg0 shr 6) and 0xF)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 445, (reg0 shr 4) and 0x3)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 446, (reg0 shr 3) and 0x1)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 447, (reg0 shr 2) and 0x1)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 448, (reg0 shr 1) and 0x1)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 449, reg0 and 0x1)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 450, reg0 and 0x1)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 451, reg0 and 0x1)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 452, reg0 and 0x1)
-  # Header 2
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 515, 0)
-  # Reg1 full
-  var reg1 = wlanCoexPti()
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 466, reg1)
-  # Reg1 bitfields
-  reg1 = wlanCoexPti()
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 470, reg1 shr 28)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 471, (reg1 shr 22) and 0x3F)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 472, (reg1 shr 16) and 0x3F)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 473, (reg1 shr 12) and 0xF)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 474, (reg1 shr 8) and 0xF)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 475, (reg1 shr 4) and 0xF)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 476, (reg1 shr 3) and 0x1)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 477, reg1 and 0xF)
-  # Header 3
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 517, 0)
-  # Reg2 full
-  var reg2 = wlanCoexStatus()
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 490, reg2)
-  # Reg2 bitfields
-  reg2 = wlanCoexStatus()
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 502, (reg2 shr 4) and 0xF)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 503, (reg2 shr 2) and 0x1)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 504, (reg2 shr 1) and 0x1)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 505, reg2 and 0x1)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 506, reg2 and 0x1)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 507, reg2 and 0x1)
-  lf = cast[LogV](getLogFunc(76)); if lf != nil: lf(2, 0, nil, 508, reg2 and 0x1)
+  coexDumpHeader(513, "=============    Coex WiFi: cntl==================\r\n")
+  coexDumpRegister(421, wlanCoexControl())
+  let control = wlanCoexControl()
+  coexDumpField(439, "coexforcewlanpti is %u\r\n", control shr 28)
+  coexDumpField(440, "coexforcewlanptitoggle is %u\r\n", (control shr 27) and 1)
+  coexDumpField(441, "coexforcewlanchanbw is %u\r\n", (control shr 26) and 1)
+  coexDumpField(442, "coexforcewlanrx is %u\r\n", (control shr 25) and 1)
+  coexDumpField(443, "coexforcewlantx is %u\r\n", (control shr 24) and 1)
+  coexDumpField(444, "coexwlanchanfreq is %u\r\n", (control shr 16) and 0x7F)
+  coexDumpField(445, "coexwlanchanoffset is %u\r\n", (control shr 12) and 1)
+  coexDumpField(446, "coexautoptiadjincr is %u\r\n", (control shr 6) and 3)
+  coexDumpField(447, "coexautoptiadjenable is %u\r\n", (control shr 5) and 1)
+  coexDumpField(448, "coexforceenable is %u\r\n", (control shr 4) and 1)
+  coexDumpField(449, "coexpostponetxenable is %u\r\n", (control shr 3) and 1)
+  coexDumpField(450, "coexphyrxabortenable is %u\r\n", (control shr 2) and 1)
+  coexDumpField(451, "coexphytxabortenable is %u\r\n", (control shr 1) and 1)
+  coexDumpField(452, "coexenable is %u\r\n", control and 1)
+
+  coexDumpHeader(515, "=============    Coex WiFi: pti==================\r\n")
+  coexDumpRegister(466, wlanCoexPti())
+  let pti = wlanCoexPti()
+  coexDumpField(470, "coexptibcndata is %u\r\n", pti shr 28)
+  coexDumpField(471, "coexptibkdata is %u\r\n", (pti shr 24) and 0xF)
+  coexDumpField(472, "coexptibedata is %u\r\n", (pti shr 20) and 0xF)
+  coexDumpField(473, "coexptividata is %u\r\n", (pti shr 16) and 0xF)
+  coexDumpField(474, "coexptivodata is %u\r\n", (pti shr 12) and 0xF)
+  coexDumpField(475, "coexptimgt is %u\r\n", (pti shr 8) and 0xF)
+  coexDumpField(476, "coexpticntl is %u\r\n", (pti shr 4) and 0xF)
+  coexDumpField(477, "coexptiack is %u\r\n", pti and 0xF)
+
+  coexDumpHeader(517, "=============    Coex WiFi: status==================\r\n")
+  coexDumpRegister(490, wlanCoexStatus())
+  let status = wlanCoexStatus()
+  coexDumpField(502, "coexwlanptistate is %u\r\n", (status shr 8) and 0xF)
+  coexDumpField(503, "coexwlanptitogglestate is %u\r\n", (status shr 5) and 1)
+  coexDumpField(504, "coexwlanchanbwstate is %u\r\n", (status shr 4) and 1)
+  coexDumpField(505, "coexwlanrxstate is %u\r\n", (status shr 3) and 1)
+  coexDumpField(506, "coexwlantxstate is %u\r\n", (status shr 2) and 1)
+  coexDumpField(507, "coexwlanrxabortstate is %u\r\n", (status shr 1) and 1)
+  coexDumpField(508, "coexwlantxabortstate is %u\r\n", status and 1)
 
 proc coex_wifi_rf_forece_enable*(enable: bool) {.exportc, cdecl.} =
   ## Force enable/disable WiFi RF.
   discard
 
 proc coex_wifi_pti_forece_enable*(enable: bool) {.exportc, cdecl.} =
-  ## Force enable/disable WiFi PTI (Priority Traffic Indication) (30 instrs).
-  ## From blob: if enable (a0 != 0):
-  ##   Reads MACHW_BASE+0x400, clears bits [27:24], sets bits [27:24] to 0xF0000000,
-  ##   sets bit 4 (0x10). Then reads MACHW_BASE+0x400 again.
-  ## Common path (both enable/disable):
-  ##   Reads MACHW_BASE+0x400, masks with 0xFBFFFFFF (clear bit 26),
-  ##   shifts and ORs based on enable flag, writes back.
+  ## Preserve the vendor's separate priority, force, and request writes.
   if enable:
-    var coexControl = wlanCoexControl()
-    # Clear bits [27:24], set to 0xF (max priority)
-    coexControl = coexControl and 0x0FFFFFFF'u32
-    coexControl = coexControl or 0xF0000000'u32
-    # Set bit 4 (force enable)
-    coexControl = coexControl or 0x10'u32
-    wlanCoexWriteControl(coexControl)
-    # Re-read and set additional enable bits
-    coexControl = wlanCoexControl()
-    coexControl = coexControl or 0x10'u32
-    wlanCoexWriteControl(coexControl)
-  # Common: update auto-control bits
-  var coexControl = wlanCoexControl()
-  coexControl = coexControl and 0xFBFFFFFF'u32  # clear bit 26
-  if not enable:
-    # Clearing: restore auto-control
-    coexControl = coexControl and (not 0x10'u32)  # clear force bit
+    wlanCoexWriteControl((wlanCoexControl() and 0x0FFFFFFF'u32) or 0xF0000000'u32)
+    wlanCoexWriteControl(wlanCoexControl() or 0x10'u32)
+  else:
+    wlanCoexWriteControl(wlanCoexControl() and not 0x10'u32)
+
+  let requestState = wlanCoexControl()
+  var coexControl = wlanCoexControl() and not 0x04000000'u32
+  if (requestState and 0x08000000'u32) == 0:
+    coexControl = coexControl or 0x04000000'u32
   wlanCoexWriteControl(coexControl)
 
 proc coex_wifi_pta_forece_enable*(enable: bool) {.exportc, cdecl.} =
-  ## Force enable/disable WiFi PTA (Packet Traffic Arbitration).
-  ## From blob (103 instrs): 3-way state dispatch on curState (0/1/-1).
-  ## State 0->new: measure elapsed in accumulator, log line 588.
-  ## State 1->new: measure elapsed, irq-save, call coex fn, if >1000 ticks
-  ##   yield+log ms, log line 610.
-  ## State -1->new: log line 614.
-  ## Then unconditionally: store newState, save new timestamp.
+  ## Account for the previous state before recording the new state and time.
+  type
+    GetTickFn = proc(): uint32 {.cdecl.}
+    SleepFn = proc(milliseconds: clong): cint {.cdecl.}
+    LogFn = proc(level: uint32; tag, file: cstring; line: cint;
+                 format: cstring) {.cdecl, varargs.}
   let curState = coexPtaAutoControl
-  let newVal = cast[uint32](enable)
+  let newVal = enable.uint32
   if curState == newVal:
     return
-  let getTimeFn = cast[proc(): uint32 {.cdecl.}](blOpsFunc(200))
-  let logFn = cast[proc(a0, a1: uint32, file: pointer, line: uint32,
-                        val: uint32) {.cdecl, varargs.}](blOpsFunc(204))
   if curState == 0:
-    # Transition from disabled: accumulate elapsed time, log
-    let now = getTimeFn()
-    coexPtaAccum = coexPtaAccum - coexPtaTimestamp + now
-    let now2 = getTimeFn()
-    let elapsed = now2 - coexPtaTimestamp
-    logFn(2, 0, nil, 588, elapsed)
+    let now = cast[GetTickFn](blOpsFunc(200))()
+    let elapsed = now - coexPtaTimestamp
+    pds_slept_time += elapsed
+    coexPtaAccum += elapsed
+    let logFn = cast[LogFn](blOpsFunc(204))
+    let reportTime = cast[GetTickFn](blOpsFunc(200))()
+    if logFn != nil:
+      logFn(2, nil, "arch_main.c", 588, "[COEX] BLE Usage %ldms\r\n",
+            cast[int32](reportTime - coexPtaTimestamp).clong)
   elif curState == 1:
-    # Transition from enabled: measure elapsed, irq-save, call coex fn
-    let now = getTimeFn()
-    coexPtaAccum = coexPtaAccum - coexPtaTimestamp + now
-    # Critical section: disable interrupts, call timing function
+    let now = cast[GetTickFn](blOpsFunc(200))()
+    let elapsed = now - coexPtaTimestamp
+    pds_woken_time += elapsed
+    coexPtaAccum += elapsed
     let savedMstatus = irqSave()
-    let ticks = getTimeFn()  # measure ticks in critical section
+    let napDuration = bl_nap_calculate()
     irqRestore(savedMstatus)
-    # If elapsed > 1000 ticks, yield and log duration in ms
-    if ticks > 1000:
-      let yieldFn = cast[proc(v: uint32) {.cdecl.}](blOpsFunc(28))
-      yieldFn(0)
-      let callFn = blOpsFunc(28)
-      cast[proc(ms: uint32) {.cdecl.}](callFn)(ticks div 1000)
-      let yieldFn2 = cast[proc(v: uint32) {.cdecl.}](blOpsFunc(28))
-      yieldFn2(0)
-    let now2 = getTimeFn()
-    let elapsed2 = now2 - coexPtaTimestamp
-    logFn(2, 0, nil, 610, elapsed2)
-  elif cast[int32](curState) == -1:
-    # Forced state: just log
-    logFn(2, 0, nil, 614, 0)
-  # Update state and save timestamp
+    if napDuration > 1000:
+      wifi_hosal_rf_turn_on(nil)
+      let sleepFn = cast[SleepFn](blOpsFunc(28))
+      discard sleepFn((napDuration div 1000).clong)
+      wifi_hosal_rf_turn_off(nil)
+    let logFn = cast[LogFn](blOpsFunc(204))
+    let reportTime = cast[GetTickFn](blOpsFunc(200))()
+    if logFn != nil:
+      logFn(2, nil, "arch_main.c", 610, "[COEX] Wi-Fi Usage %ldms\r\n",
+            cast[int32](reportTime - coexPtaTimestamp).clong)
+  elif curState == high(uint32):
+    let logFn = cast[LogFn](blOpsFunc(204))
+    if logFn != nil:
+      logFn(2, nil, "arch_main.c", 614,
+            "[COEX] Skip report for the first time\r\n")
   coexPtaAutoControl = newVal
-  coexPtaTimestamp = getTimeFn()
-  # Coexistence RF control (blob: bl_nap_calculate, wifi_hosal_rf_turn_on/off)
-  # Call coex RF control functions directly (blob: bl_nap_calculate + rf_turn_on/off)
-  {.emit: ["bl_nap_calculate();"].}
-  if enable:
-    {.emit: ["wifi_hosal_rf_turn_on();"].}
-  else:
-    {.emit: ["wifi_hosal_rf_turn_off();"].}
+  coexPtaTimestamp = cast[GetTickFn](blOpsFunc(200))()
 
 proc coex_pta_force_autocontrol_set*(mode: uint32) {.exportc, cdecl.} =
   ## Set PTA auto-control mode (254 bytes in blob, 104 instrs).

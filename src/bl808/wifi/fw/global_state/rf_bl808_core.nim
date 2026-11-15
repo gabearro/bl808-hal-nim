@@ -361,6 +361,8 @@ type
     xtalControlCode: uint32
 
   RfPriTxPowerTableRow = array[9, int16]
+  RfPriPowerTableScope = enum rfPowerAll, rfPowerWlan, rfPowerBz
+  RfPriPowerTablePhase = enum rfPowerFields, rfPowerCalibration
 
   WlRfConfig {.packed.} = object
     status: uint32
@@ -411,7 +413,7 @@ type
     channelBandType: uint16
     primaryFreq: uint16
     centerFreq1: uint16
-    centerFreq2OrTxPower: uint16
+    centerFreq2: uint16
     txPowerAndFlags: uint16
     txPowerFlagsTailPadding: array[2, uint8]
 
@@ -686,7 +688,7 @@ static:
   doAssert offsetof(PhyEnvView, channelBandType) == 36
   doAssert offsetof(PhyEnvView, primaryFreq) == 38
   doAssert offsetof(PhyEnvView, centerFreq1) == 40
-  doAssert offsetof(PhyEnvView, centerFreq2OrTxPower) == 42
+  doAssert offsetof(PhyEnvView, centerFreq2) == 42
   doAssert offsetof(PhyEnvView, txPowerAndFlags) == 44
   doAssert offsetof(PhyEnvView, txPowerFlagsTailPadding) == 46
   doAssert sizeof(WifiAgcMemoryRam) == 2048
@@ -1032,6 +1034,17 @@ const
     0'i16, 1'i16, 2'i16, 3'i16, 4'i16, 5'i16, 6'i16,
     9'i16, 10'i16, 11'i16, 12'i16, 13'i16, 14'i16
   ]
+  RfPriBzTxPowerTableDefault: array[9, RfPriTxPowerTableRow] = [
+    [0'i16, 1'i16, 7'i16, 27'i16, 0'i16, 5'i16, 0'i16, -2'i16, 230'i16],
+    [0'i16, 1'i16, 7'i16, 15'i16, 0'i16, 5'i16, 0'i16, 2'i16, 200'i16],
+    [0'i16, 1'i16, 7'i16, 9'i16, 0'i16, 5'i16, 0'i16, -2'i16, 150'i16],
+    [0'i16, 1'i16, 5'i16, 7'i16, 0'i16, 5'i16, 0'i16, -4'i16, 100'i16],
+    [0'i16, 1'i16, 2'i16, 6'i16, 0'i16, 5'i16, 0'i16, 4'i16, 50'i16],
+    [0'i16, 1'i16, 7'i16, 16'i16, 0'i16, 5'i16, 1'i16, 2'i16, 90'i16],
+    [0'i16, 1'i16, 7'i16, 10'i16, 0'i16, 5'i16, 1'i16, 0'i16, 50'i16],
+    [0'i16, 1'i16, 6'i16, 7'i16, 0'i16, 5'i16, 1'i16, 0'i16, 10'i16],
+    [0'i16, 1'i16, 3'i16, 8'i16, 0'i16, 5'i16, 1'i16, 0'i16, -30'i16]
+  ]
 
   RfPriTxPowerRegisterBase: array[43, uint32] = [
     0x004524D4'u32, 0x0028E3D0'u32, 0x135FC000'u32, 0x00000000'u32,
@@ -1182,6 +1195,50 @@ proc writeRfTxPowerCompTable(words: openArray[uint32]) =
     volatileStore(addr txPowerCompTable.txPowerCompWords700[txPowerCompWordIndex],
                   txPowerCompWordValue)
 
+proc rfPriReadTxPowerTable(scope: RfPriPowerTableScope): array[43, uint32] =
+  let table = rfTxPowerCompTableRegs()
+  if scope != rfPowerBz:
+    for index in 0 .. 28:
+      result[index] = volatileLoad(addr table.txPowerCompWords700[index])
+  if scope != rfPowerWlan:
+    for index in 34 .. 42:
+      result[index] = volatileLoad(addr table.txPowerCompWords700[index])
+
+proc rfPriPublishTxPowerTable(words: array[43, uint32];
+                             scope: RfPriPowerTableScope;
+                             phase: RfPriPowerTablePhase) =
+  ## Runtime power and TXCAL writers own separate fields of the same words.
+  ## Preserve live unowned bits and the vendor's per-domain store order.
+  let table = rfTxPowerCompTableRegs()
+  template publish(index: int; mask: uint32) =
+    updateReg32(addr table.txPowerCompWords700[index], not mask,
+                words[index] and mask)
+  if scope != rfPowerBz:
+    if phase == rfPowerFields:
+      publish(2, 0x3FFFFFFF'u32)
+      publish(1, 0x00FFFFFF'u32)
+      publish(0, 0x00FFFFFF'u32)
+      for slot in countdown(12, 0):
+        let start = 3 + slot * 2
+        publish(start + 1, 0x0F000000'u32)
+        publish(start, 0xFFFFF800'u32)
+    else:
+      for slot in 0 ..< 13:
+        let start = 3 + slot * 2
+        publish(start, 0x000007FF'u32)
+        publish(start + 1, 0x00FFFFFC'u32)
+  if scope != rfPowerWlan:
+    if phase == rfPowerFields:
+      publish(34, 0x00FFFFFF'u32)
+    for slot in 0 ..< 4:
+      let start = 35 + slot * 2
+      if phase == rfPowerFields:
+        publish(start, 0x3FFFF800'u32)
+        publish(start + 1, 0x0F000000'u32)
+      else:
+        publish(start, 0x000007FF'u32)
+        publish(start + 1, 0x00FFFFFC'u32)
+
 proc waitRfUs(us: uint32) {.inline.} =
   arch_delay_us(us)
 
@@ -1295,12 +1352,12 @@ template phyEnvViewPtr(): ptr PhyEnvView =
 template bbaIrqSave(): uint32 =
   block:
     var irqPrev {.gensym.}: uint32
-    {.emit: ["asm volatile(\"csrrci %0, mstatus, 8\" : \"=r\"(", irqPrev, ") );"].}
+    {.emit: ["asm volatile(\"csrrci %0, mstatus, 8\" : \"=r\"(", irqPrev, ") :: \"memory\");"].}
     irqPrev
 
 template bbaIrqRestore(prev: uint32) =
   if (prev and 8'u32) != 0'u32:
-    {.emit: ["asm volatile(\"csrsi mstatus, 8\");"].}
+    {.emit: ["asm volatile(\"csrsi mstatus, 8\" ::: \"memory\");"].}
 
 proc crm_get_mac_freq(): uint32 {.exportc, cdecl.} =
   ## crm_bl616.c.o crm_get_mac_freq returns 60 MHz.
@@ -1633,8 +1690,11 @@ proc bbaRunPowerDetectLoop(rssi: int32) =
   ## Port of librf_bl808.a:bba.c.o bba_pd_loop+0x0..0x21a.
   let state = volatileLoad(addr bbaState().pdRssiState)
   var nextState = state
-  var targetComp = volatileLoad(addr bbaState().pdCompLatch)
+  var targetComp = 0'u8
   var changeGain = false
+  let targetLatch =
+    if (state == 2'u8 or state == 3'u8) and rssi >= -14'i32: 1'u8
+    else: 0'u8
 
   case state
   of 0'u8:
@@ -1656,40 +1716,48 @@ proc bbaRunPowerDetectLoop(rssi: int32) =
     else:
       targetComp = 0'u8
   of 2'u8:
-    if rssi < -14'i32:
-      nextState = 0'u8
-      targetComp = 0'u8
-    else:
-      targetComp = 0'u8
+    if rssi < -14'i32 and rssi <= BbaPdThresholdAttack[3].int32:
+      if rssi < BbaPdThresholdRelease[1].int32:
+        nextState = 0'u8
+        targetComp = if rssi < -90'i32: 1'u8 else: 0'u8
+        changeGain = true
+      elif rssi < BbaPdThresholdRelease[2].int32:
+        nextState = 1'u8
+        changeGain = true
   of 3'u8:
     if rssi < -14'i32:
       if rssi < BbaPdThresholdRelease[1].int32:
         nextState = 0'u8
-        targetComp = 1'u8
+        targetComp = if rssi < -90'i32: 1'u8 else: 0'u8
         changeGain = true
       elif rssi < BbaPdThresholdRelease[2].int32:
         nextState = 1'u8
         targetComp = 0'u8
         changeGain = true
       elif rssi < BbaPdThresholdRelease[3].int32:
-        targetComp = 0'u8
-      else:
-        targetComp = volatileLoad(addr bbaState().pdCompLatch)
-    else:
-      if volatileLoad(addr bbaState().pdCompLatch) != 1'u8:
-        bbaSetPdLatch(true)
-      targetComp = 0'u8
+        nextState = 2'u8
+        changeGain = true
   else:
-    discard
+    if rssi > BbaPdThresholdAttack[1].int32:
+      nextState = 1'u8
+      changeGain = true
 
+  # The vendor protects gain/state, latch, and compensation as separate updates.
   if changeGain:
+    let saved = bbaIrqSave()
     bbaProgramPdGain(nextState.uint32)
     volatileStore(addr bbaState().pdRssiState, nextState)
+    bbaIrqRestore(saved)
 
-  if volatileLoad(addr bbaState().pdCompLatch) != 0'u8 and targetComp == 0'u8:
-    bbaSetPdLatch(false)
+  if volatileLoad(addr bbaState().pdCompLatch) != targetLatch:
+    let saved = bbaIrqSave()
+    bbaSetPdLatch(targetLatch != 0'u8)
+    bbaIrqRestore(saved)
 
-  bbaUpdatePdComp(targetComp)
+  if volatileLoad(addr bbaState().pdCompCurrent) != targetComp:
+    let saved = bbaIrqSave()
+    bbaUpdatePdComp(targetComp)
+    bbaIrqRestore(saved)
 
 proc bba_loop(rxVector: pointer, frameType: uint32) {.exportc, cdecl.} =
   ## Port of librf_bl808.a:bba.c.o bba_loop+0x0..0x74 with decoded CE/PD
@@ -1700,7 +1768,8 @@ proc bba_loop(rxVector: pointer, frameType: uint32) {.exportc, cdecl.} =
   let rssi = signExtend(volatileLoad(addr rxv.rssiDbm).uint32, 8'u32)
   let ppm = calc_ppm(rxVector).int32
   bbaRunCarrierErrorLoop(rssi, ppm)
-  bbaRunPowerDetectLoop(rssi)
+  let detectorRssi = signExtend(volatileLoad(addr rxv.rssiDbm).uint32, 8'u32)
+  bbaRunPowerDetectLoop(detectorRssi)
 
 proc bba_rssi_correction(rxVector: pointer) {.exportc, cdecl.} =
   ## Port of librf_bl808.a:bba.c.o bba_rssi_correction+0x0..0x18.
@@ -1725,7 +1794,8 @@ proc calc_ppm(rxVector: pointer): int8 {.exportc, cdecl.} =
   if (volatileLoad(addr rxv.rxFormatModeWord0) and 0xF'u32) == 0'u32 and
       bbaExtractBits(bbaRxFormatWord1(rxv), 7'u32, 4'u32) <= 3'u32:
     let ppm = signExtend(carrierOffset, 8'u32)
-    return cast[int8](signExtend(uint32((ppm * 3'i32) shr 6), 8'u32))
+    # Vendor forms 3 * ppm, then (value << 4) - value before scaling.
+    return cast[int8](signExtend(uint32((ppm * 45'i32) shr 6), 8'u32))
   else:
     let ppm = signExtend(carrierOffset, 16'u32)
     let rounded = (ppm and not 0xF'i32) + (ppm shr 4)
@@ -1764,8 +1834,8 @@ proc copyPhyInitCfg(cfg: pointer) =
       volatileStore(addr env.initCfgWords[phyInitConfigWordIndex], 0'u32)
   volatileStore(addr env.channelBandType, 0x0501'u16)
   volatileStore(addr env.primaryFreq, 0x00FF'u16)
-  volatileStore(addr env.centerFreq1, 0x0FFF'u16)
-  volatileStore(addr env.centerFreq2OrTxPower, 0x00FF'u16)
+  volatileStore(addr env.centerFreq1, 0x00FF'u16)
+  volatileStore(addr env.centerFreq2, 0x00FF'u16)
 
 proc copyAgcMemory() =
   ## LLVM objdump provenance: librf_bl808.a:phy.c.o phy_init+0x452..0x470
@@ -2036,11 +2106,9 @@ proc pulsePhyChannelRfWindow() =
   volatileStore(reg, 0'u32)
 
 proc phy_mdm_isr*() {.exportc, cdecl.} =
-  let mdm = wifiModemRegs()
-  let status = volatileLoad(addr mdm.intStatusB41c)
-  volatileStore(addr mdm.intAckB420, status)
-  if (status and 0x00000100'u32) != 0'u32:
-    pulsePhyChannelRfWindow()
+  ## The selected RF archive has no modem-IRQ register work. RC completion
+  ## acknowledgement and channel-change pulses belong to their own paths.
+  discard
 
 proc phy_rc_isr*() {.exportc, cdecl.} =
   let mdm = wifiModemRegs()
@@ -2063,7 +2131,7 @@ proc phy_get_channel_raw*(info: pointer, index: uint8)
   dst[0] = volatileLoad(addr env.channelBandType).uint32 or
     (volatileLoad(addr env.primaryFreq).uint32 shl 16)
   dst[1] = volatileLoad(addr env.centerFreq1).uint32 or
-    (volatileLoad(addr env.centerFreq2OrTxPower).uint32 shl 16)
+    (volatileLoad(addr env.centerFreq2).uint32 shl 16)
 
 proc phy_get_ntx*(): uint8 {.exportc, cdecl.} =
   (((modemVersionReg() shr 4) and 0xF'u32) - 1'u32).uint8
@@ -2079,14 +2147,14 @@ proc phy_get_bw*(): uint8 {.exportc, cdecl.} =
 
 proc phy_vht_supported*(): bool {.exportc, cdecl.} =
   ## Port of librf_bl808.a:phy.c.o phy_vht_supported+0x0..0x1a.
-  ## Vendor returns true when modem-version bit 21 is set, or when the
+  ## Vendor returns true when modem-version bit 22 is set, or when the
   ## modem bandwidth capability field at bits [25:24] is nonzero.
   let version = modemVersionReg()
-  ((version shr 21) and 1'u32) != 0'u32 or
+  ((version shr 22) and 1'u32) != 0'u32 or
     ((version shr 24) and 0x3'u32) != 0'u32
 
 proc phy_he_supported*(): bool {.exportc, cdecl.} =
-  (modemVersionReg() and (1'u32 shl 20)) != 0
+  (modemVersionReg() and (1'u32 shl 21)) != 0
 
 proc phy_uf_supported*(): bool {.exportc, cdecl.} =
   false
@@ -2097,19 +2165,19 @@ proc phy_uf_enable*() {.exportc, cdecl.} =
 proc phy_ldpc_tx_supported*(): bool {.exportc, cdecl.} =
   ## librf_bl808.a:phy.c.o exports LDPC support predicates only; no WiFi
   ## LDPC memory image is present in the BL808 RF archive.
-  (modemVersionReg() and (1'u32 shl 24)) != 0
-
-proc phy_ldpc_rx_supported*(): bool {.exportc, cdecl.} =
-  (modemVersionReg() and (1'u32 shl 25)) != 0
-
-proc phy_bfmee_supported*(): bool {.exportc, cdecl.} =
   (modemVersionReg() and (1'u32 shl 26)) != 0
 
-proc phy_bfmer_supported*(): bool {.exportc, cdecl.} =
+proc phy_ldpc_rx_supported*(): bool {.exportc, cdecl.} =
   (modemVersionReg() and (1'u32 shl 27)) != 0
 
-proc phy_mu_mimo_rx_supported*(): bool {.exportc, cdecl.} =
+proc phy_bfmee_supported*(): bool {.exportc, cdecl.} =
   (modemVersionReg() and (1'u32 shl 28)) != 0
+
+proc phy_bfmer_supported*(): bool {.exportc, cdecl.} =
+  (modemVersionReg() and (1'u32 shl 29)) != 0
+
+proc phy_mu_mimo_rx_supported*(): bool {.exportc, cdecl.} =
+  (modemVersionReg() and (1'u32 shl 30)) != 0
 
 proc phy_mu_mimo_tx_supported*(): bool {.exportc, cdecl.} =
   (modemVersionReg() and (1'u32 shl 31)) != 0
@@ -2135,12 +2203,9 @@ proc phy_get_rf_gain_capab*(maxGain: pointer, minGain: pointer)
 
 proc phy_get_antenna_set*(): uint8 {.exportc, cdecl.} =
   ## Port of librf_bl808.a:phy.c.o phy_get_antenna_set+0x0..0x20.
-  ## Vendor returns a bitmask with one bit per configured RX chain.
-  let rxChainCount = modemVersionReg() and 0xF'u32
-  if rxChainCount == 0'u32:
-    0'u8
-  else:
-    uint8((1'u32 shl rxChainCount) - 1'u32)
+  ## Vendor returns the low byte of a mask of the configured TX chains.
+  let txChainCount = (modemVersionReg() shr 4) and 0xF'u32
+  uint8((1'u32 shl txChainCount) - 1'u32)
 
 proc phy_switch_antenna_paths*(): uint32 {.exportc, cdecl.} =
   0'u32
@@ -2171,24 +2236,28 @@ proc phy_set_group_id_info*(membership: pointer, userPosition: pointer)
     {.exportc, cdecl.} =
   let mdm = wifiModemRegs()
   if membership != nil:
-    let src = cast[ptr UncheckedArray[uint32]](membership)
-    volatileStore(addr mdm.groupMembership0, src[0])
-    volatileStore(addr mdm.groupMembership1, src[1])
+    let src = cast[ptr UncheckedArray[array[4, uint8]]](membership)
+    volatileStore(addr mdm.groupMembership0, le32(addr src[0]))
+    volatileStore(addr mdm.groupMembership1, le32(addr src[1]))
   if userPosition != nil:
-    let src = cast[ptr UncheckedArray[uint32]](userPosition)
+    let src = cast[ptr UncheckedArray[array[4, uint8]]](userPosition)
     for groupUserPositionWordIndex in 0 ..< 4:
       volatileStore(addr mdm.userPosition[groupUserPositionWordIndex],
-                    src[groupUserPositionWordIndex])
+                    le32(addr src[groupUserPositionWordIndex]))
 
 proc phy_update_power_table*() {.exportc, cdecl.} =
   let channelType = (volatileLoad(addr phyEnvViewPtr().channelBandType) shr 8).uint8
-  trpc_update_power(cast[pointer](channelType.uint))
+  trpcLoadPowerFromConfig(channelType)
 
-proc phyEnvCenter2Word(channel: ptr ChanCtxtDefView): uint16 {.inline.} =
-  if channel != nil and channel.centerFreq2 == 0'u16:
-    channel.txPower.uint16
-  else:
-    channel.centerFreq2
+proc phyChannelMatches(channel: ptr ChanCtxtDefView): bool =
+  if channel == nil:
+    return false
+  let env = phyEnvViewPtr()
+  volatileLoad(addr env.channelBandType) == cast[ptr uint16](channel)[] and
+    volatileLoad(addr env.primaryFreq) == channel.primFreq and
+    volatileLoad(addr env.centerFreq1) == channel.centerFreq1 and
+    volatileLoad(addr env.centerFreq2) == channel.centerFreq2 and
+    (volatileLoad(addr env.txPowerAndFlags) shr 8).uint8 == channel.phyEnvFlags
 
 proc rfPriApplyWb03RfcEntryBaseline()
 proc rfPhyTraceCheckpoint(phase: uint32)
@@ -2197,19 +2266,10 @@ proc phy_set_channel*(channel: ptr ChanCtxtDefView, force: uint32)
     {.exportc, cdecl.} =
   if channel == nil or force != 0'u32:
     return
-  let env = phyEnvViewPtr()
-  let bandAndType = volatileLoad(addr env.channelBandType)
-  let currentType = (bandAndType shr 8).uint8
-  let currentPrim = volatileLoad(addr env.primaryFreq)
-  let currentCenter = volatileLoad(addr env.centerFreq1)
-  let currentCenter2 = volatileLoad(addr env.centerFreq2OrTxPower)
-  let nextCenter2 = phyEnvCenter2Word(channel)
-  if bandAndType == cast[ptr uint16](channel)[] and
-      currentType == channel.chanType and
-      currentPrim == channel.primFreq and
-      currentCenter == channel.centerFreq1 and
-      currentCenter2 == nextCenter2:
+  if phyChannelMatches(channel):
     return
+  let env = phyEnvViewPtr()
+  let currentType = (volatileLoad(addr env.channelBandType) shr 8).uint8
   crm_clk_set(channel.chanType.uint32)
   bl808MdmSetChannel(channel.primFreq.uint32, channel.centerFreq1.uint32,
                      channel.chanType.uint32)
@@ -2221,13 +2281,13 @@ proc phy_set_channel*(channel: ptr ChanCtxtDefView, force: uint32)
   volatileStore(addr env.channelBandType, cast[ptr uint16](channel)[])
   volatileStore(addr env.primaryFreq, channel.primFreq)
   volatileStore(addr env.centerFreq1, channel.centerFreq1)
-  volatileStore(addr env.centerFreq2OrTxPower, nextCenter2)
+  volatileStore(addr env.centerFreq2, channel.centerFreq2)
   volatileStore(addr env.txPowerAndFlags,
                 channel.txPower.uint16 or (channel.phyEnvFlags.uint16 shl 8))
   rfPhyTraceCheckpoint(0x42'u32)
   if currentType != channel.chanType:
     rfPhyTraceCheckpoint(0x43'u32)
-    trpc_update_power(cast[pointer](channel.chanType.uint))
+    trpcLoadPowerFromConfig(channel.chanType)
     rfPhyTraceCheckpoint(0x44'u32)
 
 proc phyInitValidateClock() =
@@ -2265,7 +2325,7 @@ proc phyInitProgramInitialChannel() =
   ## phy_init+0x976..0x9a2 initializes 20 MHz channel-1 modem/RF state:
   ## crm_clk_set(0), mdm_set_channel.constprop.0(2412, 2412, 0),
   ## rfc_config_bandwidth(0), rfc_config_channel(2412). The following
-  ## phy_init+0x9a6..0x9fc block mirrors cfg/env words into phy_env.
+  ## phy_init+0x9a6..0x9fc block is handled separately by copyPhyInitCfg.
   nimFwDbgPhyInitPhase = 5'u32
   crm_clk_set(0'u32)
   var initial = ChanCtxtDefView(
@@ -2282,14 +2342,7 @@ proc phyInitProgramInitialChannel() =
   rfPriApplyWb03RfcEntryBaseline()
   pulsePhyChannelRfWindow()
   rfc_config_channel(initial.centerFreq1.uint32)
-  trpc_update_power(nil)
-  let env = phyEnvViewPtr()
-  volatileStore(addr env.channelBandType, cast[ptr uint16](addr initial)[])
-  volatileStore(addr env.primaryFreq, initial.primFreq)
-  volatileStore(addr env.centerFreq1, initial.centerFreq1)
-  volatileStore(addr env.centerFreq2OrTxPower, phyEnvCenter2Word(addr initial))
-  volatileStore(addr env.txPowerAndFlags,
-                initial.txPower.uint16 or (initial.phyEnvFlags.uint16 shl 8))
+  trpcLoadPowerFromConfig(0'u8)
 
 proc phy_init*(cfg: pointer) {.exportc, cdecl.} =
   phyInitValidateClock()
@@ -2338,9 +2391,12 @@ proc trpcCopyTableOut(dst: pointer, srcOffset: int, count: int) =
       trpcTxpwrVsRateTable[srcOffset + txPowerRateTableByteIndex]
 
 proc trpc_power_get*(powerTable: pointer) {.exportc, cdecl.} =
-  ## Local replacement for the missing archive symbol used by bl_tpc_power_table_get.
-  ## phy_trpc.c.o keeps 50 rate bytes; callers request the rate-power prefix.
-  trpcCopyTableOut(powerTable, 0, 38)
+  ## The WiFi ABI packs three 8-byte groups; RF storage uses 10-byte rows.
+  if powerTable == nil:
+    return
+  let bytes = cast[ptr UncheckedArray[uint8]](powerTable)
+  for rateGroup in 0 ..< 3:
+    trpcCopyTableOut(addr bytes[rateGroup * 8], rateGroup * 10, 8)
 
 proc trpc_update_power_11b*(powerTable: pointer) {.exportc, cdecl.} =
   ## librf_bl808.a:phy_trpc.c.o trpc_update_power_11b+0x0..0x1a.
@@ -2363,12 +2419,19 @@ proc trpc_update_power_11ax*(powerTable: pointer) {.exportc, cdecl.} =
   trpcCopyTable(40, powerTable, 10)
 
 proc trpc_update_power*(powerTable: pointer) {.exportc, cdecl.} =
+  ## Preserve the WiFi table-pointer ABI independently of RF config reloads.
+  if powerTable == nil:
+    return
+  let bytes = cast[ptr UncheckedArray[uint8]](powerTable)
+  for rateGroup in 0 ..< 3:
+    trpcCopyTable(rateGroup * 10, addr bytes[rateGroup * 8], 8)
+
+proc trpcLoadPowerFromConfig(channelType: uint8) =
   ## librf_bl808.a:phy_trpc.c.o trpc_update_power+0x0..0xe4.
-  ## The argument is a channel-type selector: nil uses the 20 MHz WL config
-  ## rows; non-nil uses the alternate rows at 0x46 and 0x78.
+  ## This RF-side interface selects configuration rows, not a table pointer.
   trpcCopyFromWlCfg(0, 0x32'u, 4)
   trpcCopyFromWlCfg(10, 0x36'u, 8)
-  if powerTable == nil:
+  if channelType == 0'u8:
     trpcCopyFromWlCfg(20, 0x3E'u, 8)
     trpcCopyFromWlCfg(30, 0x6C'u, 10)
     trpcCopyFromWlCfg(40, 0x6C'u, 10)
@@ -2414,7 +2477,7 @@ proc wlCfgSetBytes(offset: int, value: uint8, count: int) =
     bytes[offset + cfgByteOffset] = value
 
 proc seedWlCfgTxPowerDefaults() =
-  ## These rows are the vendor wl_cfg backing store that trpc_update_power()
+  ## These rows are the vendor wl_cfg backing store that trpcLoadPowerFromConfig()
   ## copies into txpwr_vs_rate_table. A zeroed wl_cfg makes internal auth
   ## frames inherit TX power 0, while the vendor backend seeds 0x1c -> 0x70.
   wlCfgSetBytes(WlRfCfgPower11bOffset, WlRfCfgDefaultRatePower, 4)
@@ -5932,11 +5995,56 @@ proc runRfPriRxcal() =
     updateReg32(addr rf.calMode14, not RfRxcalModeMask, RfRxcalDoneMode)
   rfPhyTraceCheckpoint(0x32'u32)
 
+proc rfPriApplyPowerRowToTable(words: var array[43, uint32]; start: int;
+                               row: RfPriTxPowerTableRow; wlan: bool) =
+  ## RF power fields share these words with the TXCAL fields replayed below.
+  var first = (words[start] and 0xC00007FF'u32) or
+    ((cast[uint32](row[0].int32) and 3) shl 26) or
+    ((cast[uint32](row[1].int32) and 3) shl 28) or
+    ((cast[uint32](row[2].int32) and 7) shl 18) or
+    ((cast[uint32](row[3].int32) and 31) shl 21) or
+    ((cast[uint32](row[7].int32) and 127) shl 11)
+  if wlan:
+    first = (first and 0x3FFFFFFF'u32) or
+      ((cast[uint32](row[4].int32) and 3) shl 30)
+  words[start] = first
+  words[start + 1] = (words[start + 1] and 0xF0FFFFFF'u32) or
+    ((cast[uint32](row[5].int32) and 7) shl 24) or
+    ((cast[uint32](row[6].int32) and 1) shl 27)
+
+proc rfPriApplyRuntimePowerTables(words: var array[43, uint32];
+    scope: RfPriPowerTableScope = rfPowerAll): bool =
+  if scope != rfPowerBz:
+    for index in bl808RfTxPowerTableIndex:
+      if index < 0 or index.int >= bl808RfTxPowerTable.len: return false
+  if scope != rfPowerWlan:
+    for index in bl808RfBzTargetPowerRecords:
+      if index < 0 or index >= RfPriBzTxPowerTableDefault.len: return false
+  if scope != rfPowerBz:
+    for slot, index in bl808RfTxPowerTableIndex:
+      let row = bl808RfTxPowerTable[index.int]
+      let gainWord = if slot < 8: slot div 4 else: 2
+      let shift = if slot < 8: (slot mod 4) * 6 else: (slot - 8) * 6
+      let gain = cast[uint32](rfPriDivTowardZeroBy10(
+        row[RfPriTxPowerRowPowerThresholdTenthsIndex].int32)) and 63
+      words[gainWord] = (words[gainWord] and not (63'u32 shl shift)) or
+        (gain shl shift)
+      rfPriApplyPowerRowToTable(words, 3 + slot * 2, row, true)
+  if scope != rfPowerWlan:
+    for slot, index in bl808RfBzTargetPowerRecords:
+      let row = RfPriBzTxPowerTableDefault[index]
+      let shift = slot * 6
+      let gain = cast[uint32](rfPriDivTowardZeroBy10(
+        row[RfPriTxPowerRowPowerThresholdTenthsIndex].int32)) and 63
+      words[34] = (words[34] and not (63'u32 shl shift)) or (gain shl shift)
+      rfPriApplyPowerRowToTable(words, RfPriBzTxcalTableStarts[slot], row, false)
+  true
+
 proc rfPriApplyTxcalRecordToTable(txPowerTableWords: var array[43, uint32],
                                   txPowerTableWordIndex,
                                   txcalRecordIndex: int) =
   ## Vendor rf_pri_txcal_w2reg always writes these fields. The pure path
-  ## preserves base-table words for empty records until TXCAL is bit-for-bit.
+  ## preserves existing fields for empty records until TXCAL is bit-for-bit.
   let txcalRecordWord0 =
     rfCalibWord(RfCalibTxcalRecordBaseWord + txcalRecordIndex * 2)
   let txcalRecordWord1 =
@@ -5958,7 +6066,7 @@ proc rfPriApplyBzTxcalRecordToTable(txPowerTableWords: var array[43, uint32],
                                     txPowerTableStartWordIndex,
                                     bzTxcalRecordIndex: int) =
   ## Vendor rf_pri_bz_txcal_w2reg always writes these fields. The pure path
-  ## preserves base-table words for empty records until BZ TXCAL is validated.
+  ## preserves existing fields for empty records until BZ TXCAL is validated.
   let bzTxcalRecordWord0 = rfCalibBzTxcalRecordWord0(bzTxcalRecordIndex)
   let bzTxcalRecordWord1 = rfCalibBzTxcalRecordWord1(bzTxcalRecordIndex)
   let txcalParam0 = bzTxcalRecordWord0 and 0x3F'u32
@@ -5999,7 +6107,11 @@ proc rfPriTxcalReplayRecordsComplete(): bool =
   ## rf_calib_data+0x68, indexed by .data.tx_pwr_table_idx.
   if rfCalibDataGlobal == nil:
     return false
-  for txcalReplayRecordIndex in RfPriTxcalReplayRecordIds:
+  for selectedRecord in bl808RfTxPowerTableIndex:
+    let txcalReplayRecordIndex = selectedRecord.int
+    if txcalReplayRecordIndex < 0 or
+        txcalReplayRecordIndex >= bl808RfTxPowerTable.len:
+      return false
     let txcalRecordWord0 =
       rfCalibWord(RfCalibTxcalRecordBaseWord + txcalReplayRecordIndex * 2)
     let txcalRecordWord1 =
@@ -6014,6 +6126,9 @@ proc rfPriBzTxcalReplayRecordsComplete(): bool =
   if rfCalibDataGlobal == nil:
     return false
   for bzTxcalReplayRecordIndex in bl808RfBzTargetPowerRecords:
+    if bzTxcalReplayRecordIndex < 0 or
+        bzTxcalReplayRecordIndex >= RfPriBzTxPowerTableDefault.len:
+      return false
     let bzTxcalRecordWord0 =
       rfCalibBzTxcalRecordWord0(bzTxcalReplayRecordIndex)
     let bzTxcalRecordWord1 =
@@ -6026,10 +6141,9 @@ proc rfPriBzTxcalReplayRecordsComplete(): bool =
       return false
   true
 
-proc rfPriWriteTxPowerTable() =
-  ## BL808 rf_pri_txcal_w2reg/rf_pri_bz_txcal_w2reg apply live TXCAL words
-  ## into the fixed power-table layout. Empty calibration records preserve
-  ## the base table, matching a fresh zeroed wl_cal restore.
+proc rfPriWriteTxPowerTable(scope: RfPriPowerTableScope = rfPowerAll) =
+  ## Pack the selected runtime power rows before replaying their calibration.
+  ## The WB03/40 MHz fallback remains until calibration itself is validated.
   let wb03Xtal40 = rfPriIsWb03() and
     bl808RfXtalIndex == xtalIndex(WlXtal40M)
   let txcalRecordsComplete = rfPriTxcalReplayRecordsComplete()
@@ -6038,7 +6152,8 @@ proc rfPriWriteTxPowerTable() =
   nim_wifi_rf_tx_power_bz_txcal_complete = uint32(bzTxcalRecordsComplete)
   let wb03CompleteCalReplayAllowed = wb03Xtal40 and
     bl808WifiRfWb03ReplayCompleteTxPowerCal and
-    txcalRecordsComplete and bzTxcalRecordsComplete
+    (scope == rfPowerBz or txcalRecordsComplete) and
+    (scope == rfPowerWlan or bzTxcalRecordsComplete)
   let useCalReplay = rfCalibDataGlobal != nil and
     ((not wb03Xtal40) or wb03CompleteCalReplayAllowed)
   let useWb03RestoreBaseline = wb03Xtal40 and
@@ -6050,10 +6165,10 @@ proc rfPriWriteTxPowerTable() =
     if rfCalibDataGlobal == nil:
       nim_wifi_rf_tx_power_replay_skip_reason =
         RfPriTxPowerSkipNoCalData
-    elif not txcalRecordsComplete:
+    elif scope != rfPowerBz and not txcalRecordsComplete:
       nim_wifi_rf_tx_power_replay_skip_reason =
         RfPriTxPowerSkipWb03TxcalIncomplete
-    elif not bzTxcalRecordsComplete:
+    elif scope != rfPowerWlan and not bzTxcalRecordsComplete:
       nim_wifi_rf_tx_power_replay_skip_reason =
         RfPriTxPowerSkipWb03BzTxcalIncomplete
     else:
@@ -6073,49 +6188,62 @@ proc rfPriWriteTxPowerTable() =
       RfPriWb03TxPowerRegisterBaseline
     else:
       RfPriTxPowerRegisterBase
+  if not useWb03RestoreBaseline:
+    if scope != rfPowerAll:
+      txPowerTableWords = rfPriReadTxPowerTable(scope)
+    if not rfPriApplyRuntimePowerTables(txPowerTableWords, scope):
+      return
   if useCalReplay:
-    for txPowerReplaySlotIndex, txcalRecordId in RfPriTxcalReplayRecordIds:
-      rfPriApplyTxcalRecordToTable(
-        txPowerTableWords, 3 + txPowerReplaySlotIndex * 2, txcalRecordId)
-    for bzTxcalTargetPowerSlotIndex in 0 ..< bl808RfBzTargetPowerRecords.len:
-      rfPriApplyBzTxcalRecordToTable(txPowerTableWords,
-        RfPriBzTxcalTableStarts[bzTxcalTargetPowerSlotIndex],
-        bl808RfBzTargetPowerRecords[bzTxcalTargetPowerSlotIndex])
+    if scope != rfPowerBz:
+      for txPowerReplaySlotIndex, selectedRecord in bl808RfTxPowerTableIndex:
+        let txcalRecordId = selectedRecord.int
+        rfPriApplyTxcalRecordToTable(
+          txPowerTableWords, 3 + txPowerReplaySlotIndex * 2, txcalRecordId)
+    if scope != rfPowerWlan:
+      for bzTxcalTargetPowerSlotIndex in 0 ..< bl808RfBzTargetPowerRecords.len:
+        rfPriApplyBzTxcalRecordToTable(txPowerTableWords,
+          RfPriBzTxcalTableStarts[bzTxcalTargetPowerSlotIndex],
+          bl808RfBzTargetPowerRecords[bzTxcalTargetPowerSlotIndex])
   rfPriSnapshotBzTxcalState(0xB1'u32)
-  writeRfTxPowerCompTable(txPowerTableWords)
+  if scope == rfPowerAll:
+    writeRfTxPowerCompTable(txPowerTableWords)
+  else:
+    rfPriPublishTxPowerTable(txPowerTableWords, scope, rfPowerFields)
+    if useCalReplay or useWb03RestoreBaseline:
+      rfPriPublishTxPowerTable(txPowerTableWords, scope, rfPowerCalibration)
 
 proc rfPriResetTxPowerRuntimeTables() =
   bl808RfTxPowerTable = RfPriTxPowerTableDefault
   bl808RfTxPowerTableIndex = RfPriTxPowerTableIndexDefault
 
 proc rfPriApplyLowPowerRuntimeDelta(delta: int16) =
-  ## Porting boundary for librf_bl808.a:rf_pri.c.o
-  ## rf_pri_set_channel_lp_pwr_comp+0x68..0xde/+0x11e..0x172.
-  ## Recovered behavior: after restoring the default WLAN power table/index,
-  ## the vendor perturbs higher power-table rows and the upper index entries
-  ## from the selected channel's LP-normal compensation delta before replaying
-  ## pwr_table_w2reg/txcal_w2reg. The exact row-to-register packer is already
-  ## represented by rfPriWriteTxPowerTable; keep the semantic table state here
-  ## and preserve the validated WB03/40M register baseline in the replay helper.
+  ## Vendor splits compensation into a coarse row selection and a residual.
+  ## Residuals outside [-6, 8] move one row; positive inputs above 24 saturate.
   bl808RfLowPowerTableDelta = delta
-  var bounded = delta
-  if bounded < -36'i16:
-    bounded = -36'i16
+  var coarse, residual: int32
+  if delta > 24:
+    coarse = 2
+  else:
+    let bounded = max(delta.int32, -36'i32)
+    coarse = bounded div 12
+    residual = bounded mod 12
+    if residual > 8:
+      inc coarse
+      residual -= 12
+    elif residual < -6:
+      dec coarse
+      residual += 12
   rfPriResetTxPowerRuntimeTables()
   for row in 7 ..< bl808RfTxPowerTable.len:
-    bl808RfTxPowerTable[row][RfPriTxPowerRowTxGainTenthsIndex] =
-      rfSignExtend16(
-        bl808RfTxPowerTable[row][RfPriTxPowerRowTxGainTenthsIndex].int32 +
-        bounded.int32 * 10'i32)
+    bl808RfTxPowerTable[row][7] =
+      rfSignExtend16(bl808RfTxPowerTable[row][7].int32 + residual)
+    bl808RfTxPowerTable[row][RfPriTxPowerRowPowerThresholdTenthsIndex] =
+      rfSignExtend16(bl808RfTxPowerTable[row][RfPriTxPowerRowPowerThresholdTenthsIndex].int32 -
+        coarse * 30)
   for txPowerIndexSlot in 7 ..< bl808RfTxPowerTableIndex.len:
-    var shifted =
-      bl808RfTxPowerTableIndex[txPowerIndexSlot].int32 - bounded.int32 div 12
-    if shifted < 0:
-      shifted = 0
-    elif shifted >= bl808RfTxPowerTable.len:
-      shifted = bl808RfTxPowerTable.len - 1
-    bl808RfTxPowerTableIndex[txPowerIndexSlot] = shifted.int16
-  rfPriWriteTxPowerTable()
+    bl808RfTxPowerTableIndex[txPowerIndexSlot] =
+      (bl808RfTxPowerTableIndex[txPowerIndexSlot].int32 - coarse).int16
+  rfPriWriteTxPowerTable(rfPowerWlan)
 
 proc writeRfPriGainInit() =
   ## Typed port of librf_bl808.a:rf_pri.c.o rf_pri_gain_table_WR2REG.
@@ -6999,7 +7127,7 @@ proc rf_pri_input_bz_target_power(targetPowerDbm: int32) {.exportc, cdecl.} =
   if bl808RfBzTargetPowerRecords == nextRecords:
     return
   bl808RfBzTargetPowerRecords = nextRecords
-  rfPriWriteTxPowerTable()
+  rfPriWriteTxPowerTable(rfPowerBz)
   rfPriSnapshotBzTxcalState(0xB5'u32)
 
 proc rf_pri_set_channel_pwr_comp(channelIndex: uint32) {.exportc, cdecl.} =

@@ -16,8 +16,8 @@ proc bl808WifiBackendTrace(step: cstring) =
   vendorPutsRaw(step)
   vendorPutsRaw("\r\n")
 
-proc bl808WifiBackendFwStart() =
-  if fwStarted: return
+proc bl808WifiBackendFwStart(): bool {.discardable.} =
+  if fwStarted: return true
   bl808WifiBackendTrace("fw_start setup_bl_ops")
   setupBlOps()
   bl808WifiBackendTrace("fw_start setup_hosal")
@@ -40,6 +40,8 @@ proc bl808WifiBackendFwStart() =
   bl808WifiBackendTrace("wifi_rf_core_init begin")
   wifiRfCoreInit(40_000_000)
   bl808WifiBackendTrace("wifi_rf_core_init done")
+  # Match the firmware entry point before MPIF/MAC/IPC initialization.
+  regWrite32(BcnStatus, regRead32(BcnStatus) or 0x01'u32)
   bl808WifiBackendTrace("high_power_profile begin")
   bl808WifiBackendApplyHighPowerProfile()
   bl808WifiBackendTrace("high_power_profile done")
@@ -58,7 +60,9 @@ proc bl808WifiBackendFwStart() =
   bl808WifiBackendClearEmbIpc()
   bl808WifiBackendClearHostIpc()
   bl808WifiBackendTrace("bl_init begin")
-  bl_init()
+  if not bl_init():
+    bl808WifiBackendTrace("bl_init failed")
+    return false
   bl808WifiBackendTrace("bl_init done")
   bl808WifiBackendTrace("bl_pm_ops_register begin")
   bl_pm_ops_register()
@@ -71,3 +75,4 @@ proc bl808WifiBackendFwStart() =
   regWrite32(BcnStatus, regRead32(BcnStatus) and not 0x20'u32)
   regWrite32(CoexCtrl, 0x5010_001f'u32)
   fwStarted = true
+  true

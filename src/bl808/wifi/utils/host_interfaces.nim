@@ -12,32 +12,29 @@ proc bl_cmd_mgr_init(cmdMgr: pointer)
   {.importc, cdecl, header: "bl_cmds.h".}
 proc bl_tx_cfm(pthis, hostid: pointer): cint
   {.importc, cdecl, header: "bl_tx.h".}
+proc pbuf_alloc(layer: cint; length: uint16; ptype: cint): ptr Pbuf
+  {.importc, cdecl, header: "<lwip/pbuf.h>".}
+proc pbuf_take_at(p: ptr Pbuf; dataptr: pointer; length, offset: uint16): ErrT
+  {.importc, cdecl, header: "<lwip/pbuf.h>".}
+proc pbuf_free(p: ptr Pbuf): uint8
+  {.importc, cdecl, header: "<lwip/pbuf.h>".}
+proc bl_rx_pkt_cb(pkt: ptr uint8; length: cint; wrapper: pointer; info: ptr BlRxInfo)
+  {.importc, cdecl, header: "bl_rx.h".}
+
+{.emit: """
+_Static_assert(sizeof(bl_rx_info_t) == 3, "monitor RX info ABI");
+_Static_assert(sizeof(struct hw_vect) == 40, "monitor RX vector ABI");
+_Static_assert(offsetof(struct hw_rxhdr, pattern) == 52, "monitor RX flags ABI");
+""".}
 
 when defined(bl808WifiRxPbufInput):
-  proc pbuf_alloc(layer: cint; length: uint16; ptype: cint): ptr Pbuf
-    {.importc, cdecl, header: "<lwip/pbuf.h>".}
   proc pbuf_take(p: ptr Pbuf; dataptr: pointer; length: uint16): ErrT
-    {.importc, cdecl, header: "<lwip/pbuf.h>".}
-  proc pbuf_take_at(p: ptr Pbuf; dataptr: pointer; length, offset: uint16): ErrT
     {.importc, cdecl, header: "<lwip/pbuf.h>".}
   proc pbuf_cat(head, tail: ptr Pbuf)
     {.importc, cdecl, header: "<lwip/pbuf.h>".}
-  proc pbuf_free(p: ptr Pbuf): uint8
-    {.importc, cdecl, header: "<lwip/pbuf.h>".}
 
   {.emit: "extern struct bl_hw wifi_hw;".}
-  {.emit: """
-static err_t bl808_nim_netif_input_call(struct pbuf *p, struct netif *netif)
-{
-    if (netif == NULL || netif->input == NULL) {
-        return (err_t)-1;
-    }
-    return netif->input(p, netif);
-}
-""".}
   var wifi_hw {.importc, header: "bl_defs.h".}: BlHw
-  proc bl808_nim_netif_input_call(p: ptr Pbuf; netif: ptr Netif): ErrT
-    {.importc, cdecl.}
 
 {.emit: """
 extern void cfg_trace(char *s);

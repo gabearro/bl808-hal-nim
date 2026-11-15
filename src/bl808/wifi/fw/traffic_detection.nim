@@ -15,6 +15,9 @@ proc td_init*() {.exportc, cdecl.} =
   ##   tail-call td_reset(1)  ; resets VIF 1 (and clears the full env)
   ## Previous Nim emitted a separate memset(td_env, 0, 88) that is not in
   ## blob's call graph — td_reset itself writes the fields it cares about.
+  let printFn = cast[proc(format: cstring) {.cdecl, varargs.}](blOpsFunc(4))
+  if printFn != nil:
+    printFn("td_init\r\n")
   td_reset(0)
   td_reset(1)
 
@@ -22,26 +25,18 @@ proc td_start*(vifIdx: uint8) {.exportc, cdecl.} =
   ## Start traffic detection for a VIF (106 bytes in blob, ~35 instrs).
   ## From blob: computes per-VIF block = td_env + vifIdx * 44.
   ## If active flag already set, returns. Otherwise reads MAC time,
-  ## logs via platform ops, stores vifIdx, sets active flag, clears counters,
-  ## and tail-calls mm_timer_set.
+  ## logs via platform ops, sets active, clears the TIM override, and arms
+  ## the configured sampling interval without resetting traffic history.
   let td = tdEntryForVif(vifIdx)
   if td.active != 0:
     return  # already started
   let macTime = regRead(MACHW_TIMLO_REG)
-  # Log traffic detection start via platform ops
-  let logFnPtr = getLogFunc(204)
-  if logFnPtr != nil:
-    let logFn = cast[PlatformLogFunc](logFnPtr)
-    logFn(1, 0, nil, 190, vifIdx.uint32, macTime)
-  # Store VIF index and set active
-  td.vifIdx = vifIdx
-  td.prevFlags = 0
+  let printFn = cast[proc(format: cstring) {.cdecl, varargs.}](blOpsFunc(4))
+  if printFn != nil:
+    printFn("td_start idx=%d\r\n", vifIdx.cint)
   td.active = 1
   td.timTime = 0
-  # Clear traffic counters
-  td.clearTrafficCounters()
-  # Start timer
-  mm_timer_set(cast[pointer](td), macTime + td.period)
+  mm_timer_set(cast[pointer](td), macTime + blPsParamsView().trafficPeriod)
 
 proc td_timer_end*(tdEntry: pointer) {.exportc, cdecl.}  # forward decl
 proc td_timer_evt*(env: pointer) {.exportc, cdecl.} =
@@ -56,6 +51,9 @@ proc td_reset*(vifIdx: uint8) {.exportc, cdecl.} =
   ## the 44-byte block to zero. Finally sets up: td[4]=td_timer_evt callback,
   ## td[8]=self pointer (env), td[40]=vifIdx.
   let td = tdEntryForVif(vifIdx)
+  let printFn = cast[proc(format: cstring) {.cdecl, varargs.}](blOpsFunc(4))
+  if printFn != nil:
+    printFn("td_reset idx=%d\r\n", vifIdx.cint)
   # If timer is active, clear it
   if td.active != 0:
     mm_timer_clear(cast[pointer](td))
@@ -68,11 +66,12 @@ proc td_reset*(vifIdx: uint8) {.exportc, cdecl.} =
   td.env = cast[uint32](cast[uint](td))
   td.vifIdx = vifIdx
 
-proc td_pck_ind*(vifIdx: uint8, direction: uint32) {.exportc, cdecl.} =
+proc td_pck_ind*(vifIdx: uint8, staIdx: uint8, direction: uint32) {.exportc, cdecl.} =
   ## Packet indication for traffic detection.
   ## From blob (14 instrs): computes per-VIF block = td_env + vifIdx * 44.
-  ## If direction (a2 mapped to second arg after MUL) != 0, increments td[28] (tx count).
-  ## Otherwise increments td[24] (rx count).
+  ## a1 carries STA index for the ABI but the blob callee ignores it.
+  ## If a2 != 0, increments the counter at td[28]; otherwise td[24].
+  discard staIdx
   let td = tdEntryForVif(vifIdx)
   if direction != 0:
     td.txCount = td.txCount + 1
@@ -97,10 +96,8 @@ proc td_recovery_ind*() {.exportc, cdecl.} =
 proc td_pack_tim_ind*(vifIdx: uint8) {.exportc, cdecl, noinline.} =
   ## Pack TIM indication for traffic detection.
   ## From blob (26 instrs): computes per-VIF block = td_env + vifIdx * 44.
-  ## If td[42] (active) is set, reads MAC time, calls mm_timer_set with
-  ## target = macTime + td[16] (the last recorded time). Then checks td[20]
-  ## (tim_time): if non-zero stores to td[16], otherwise loads default from
-  ## GOT-referenced global and stores that.
+  ## If active, schedule processing at the current MAC time. Then store the
+  ## explicit TIM period, or the configured default, for confirmation use.
   ## noinline: blob calls this from ps_check_tbtt.
   {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
   let td = tdEntryForVif(vifIdx)
@@ -108,14 +105,12 @@ proc td_pack_tim_ind*(vifIdx: uint8) {.exportc, cdecl, noinline.} =
     return
   # Read MAC time and set timer
   let macTime = regRead(MACHW_TIMLO_REG)
-  mm_timer_set(cast[pointer](td), macTime + td.period)
+  mm_timer_set(cast[pointer](td), macTime)
   # Update the period: if tim_time (offset 20) is set, use it
   if td.timTime != 0:
     td.period = td.timTime
   else:
-    # Use default timer period (from blob: loaded via GOT relocation)
-    # Default is the existing value at offset 16, leave unchanged
-    discard
+    td.period = blPsParamsView().timPeriod
 
 proc td_set_tim_time*(vifIdx: uint8, timTime: uint32) {.exportc, cdecl.} =
   ## Set TIM update time for traffic detection.
@@ -135,4 +130,3 @@ proc td_cfm_set_timer*(vifIdx: uint8, flag: uint32) {.exportc, cdecl.} =
     mm_timer_set(cast[pointer](td), macTime + td.period)
   # Always clear the period field (consumed)
   td.period = 0
-

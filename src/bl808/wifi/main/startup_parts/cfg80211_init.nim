@@ -24,5 +24,7 @@ proc cfg80211_init(blHw: ptr BlHw): cint =
   result = bl_handle_dynparams(blHw)
   if result != 0:
     return result
-  discard bl_send_me_config_req(blHw)
-  discard bl_send_me_chan_config_req(blHw)
+  result = bl_send_me_config_req(blHw)
+  if result != 0:
+    return result
+  result = bl_send_me_chan_config_req(blHw)

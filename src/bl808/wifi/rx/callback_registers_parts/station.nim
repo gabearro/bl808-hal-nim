@@ -1,19 +1,15 @@
 proc bl_rx_sm_connect_ind_cb_register*(env: pointer; cb: ConnectCb): cint {.exportc, cdecl.} =
-  cbSmConnect = cb
-  cbSmConnectEnv = env
+  setCallback(cbSmConnect, cb, env)
   0
 
 proc bl_rx_sm_connect_ind_cb_unregister*(env: pointer; cb: ConnectCb): cint {.exportc, cdecl.} =
-  cbSmConnect = nil
-  cbSmConnectEnv = nil
+  clearCallback(cbSmConnect)
   0
 
 proc bl_rx_sm_disconnect_ind_cb_register*(env: pointer; cb: DisconnectCb): cint {.exportc, cdecl.} =
-  cbSmDisconnect = cb
-  cbSmDisconnectEnv = env
+  setCallback(cbSmDisconnect, cb, env)
   0
 
 proc bl_rx_sm_disconnect_ind_cb_unregister*(env: pointer; cb: DisconnectCb): cint {.exportc, cdecl.} =
-  cbSmDisconnect = nil
-  cbSmDisconnectEnv = nil
+  clearCallback(cbSmDisconnect)
   0

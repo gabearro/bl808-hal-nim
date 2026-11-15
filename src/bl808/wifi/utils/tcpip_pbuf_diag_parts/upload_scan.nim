@@ -9,13 +9,17 @@ proc macDataHeaderLen(fc: uint16): uint32 {.inline.} =
   if (fc and 0x4000'u16) != 0:
     result += 8
 
-proc noteUploadScan(pkt: pointer; msduOffset, flags: uint32) =
+proc noteUploadScan(pkt: pointer; msduOffset: uint32) =
+  # Called by the RX copier with validated fragments and interrupts masked.
   if pkt == nil:
     return
   let firstLen = loadU16(pkt, WifiPktLenOff).uint32
-  if firstLen < 24'u32:
+  if firstLen < 24'u32 or firstLen > WifiPktFragmentSize:
     return
-  let uploadFrameData = cast[pointer](loadU32(pkt, WifiPktPktOff).uint)
+  let address = loadU32(pkt, WifiPktPktOff)
+  if address == 0 or address > high(uint32) - (firstLen - 1):
+    return
+  let uploadFrameData = cast[pointer](address.uint)
   var ipHeaderSearchOffset = 0'u32
   while ipHeaderSearchOffset + 28'u32 <= firstLen and ipHeaderSearchOffset < 128'u32:
     let vihl = loadU8(uploadFrameData, ipHeaderSearchOffset.uint)
@@ -46,38 +50,3 @@ proc noteUploadScan(pkt: pointer; msduOffset, flags: uint32) =
                 0'u8
           return
     inc ipHeaderSearchOffset
-
-proc validEthernetAt(uploadFrameData: pointer; firstLen, ethernetHeaderOffset: uint32): bool =
-  if ethernetHeaderOffset + 14'u32 > firstLen:
-    return false
-  let etherType = loadBe16(uploadFrameData, ethernetHeaderOffset.uint + 12'u)
-  if etherType == 0x0806'u16:
-    return ethernetHeaderOffset + 42'u32 <= firstLen and
-      loadBe16(uploadFrameData, ethernetHeaderOffset.uint + 14'u) == 1'u16 and
-      loadBe16(uploadFrameData, ethernetHeaderOffset.uint + 16'u) == 0x0800'u16
-  if etherType == 0x0800'u16:
-    if ethernetHeaderOffset + 34'u32 > firstLen:
-      return false
-    let ip = ethernetHeaderOffset + 14'u32
-    let vihl = loadU8(uploadFrameData, ip.uint)
-    let ihl = ((vihl and 0x0F'u8).uint32) * 4'u32
-    let totalLen = loadBe16(uploadFrameData, ip.uint + 2'u).uint32
-    return (vihl and 0xF0'u8) == 0x40'u8 and ihl >= 20'u32 and
-      totalLen >= ihl and ip + totalLen <= firstLen
-  false
-
-proc ethernetOffsetForUpload(pkt: pointer; defaultOffset: uint32): uint32 =
-  result = defaultOffset
-  if pkt == nil:
-    return
-  let firstLen = loadU16(pkt, WifiPktLenOff).uint32
-  if firstLen < 14'u32:
-    return
-  let uploadFrameData = cast[pointer](loadU32(pkt, WifiPktPktOff).uint)
-  if validEthernetAt(uploadFrameData, firstLen, defaultOffset):
-    return
-  var ethernetHeaderSearchOffset = 0'u32
-  while ethernetHeaderSearchOffset + 14'u32 <= firstLen and ethernetHeaderSearchOffset < 128'u32:
-    if validEthernetAt(uploadFrameData, firstLen, ethernetHeaderSearchOffset):
-      return ethernetHeaderSearchOffset
-    inc ethernetHeaderSearchOffset

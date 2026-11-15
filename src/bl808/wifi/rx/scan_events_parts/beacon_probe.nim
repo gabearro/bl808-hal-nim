@@ -1,4 +1,5 @@
 proc rxHandleBeacon(ind, mgmt: pointer) =
+  let callback = snapshotCallback(cbBeacon)
   var indNew: array[WifiBeaconEventSize.int, uint8]
   var ssidLen: cint
   var channel: uint8
@@ -51,8 +52,8 @@ proc rxHandleBeacon(ind, mgmt: pointer) =
   storeI8(addr indNew[0], WifiBeaconPpmAbsOff, loadI8(ind, ScanuPpmAbsOff))
   storeI8(addr indNew[0], WifiBeaconPpmRelOff, loadI8(ind, ScanuPpmRelOff))
   copyMem(ptrAt(addr indNew[0], WifiBeaconBssidOff), ptrAt(mgmt, MgmtBssidOff), 6)
-  if cbBeacon != nil:
-    cbBeacon(cbBeaconEnv, cast[ptr WifiEventBeacon](addr indNew[0]))
+  if claimCallback(cbBeacon, callback):
+    callback.handler(callback.context, cast[ptr WifiEventBeacon](addr indNew[0]))
 
 proc rxHandleProbeResp(ind, mgmt: pointer) =
   rxHandleBeacon(ind, mgmt)

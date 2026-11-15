@@ -1,10 +1,14 @@
 proc listInit(list: pointer) {.inline.} =
+  let saved = ipcHostIrqSave()
+  defer: ipcHostIrqRestore(saved)
   storePtr(list, 0, nil)
   storePtr(list, 4, nil)
 
 proc listPushBack(list, hdr: pointer) {.inline.} =
   if hdr == nil:
     return
+  let saved = ipcHostIrqSave()
+  defer: ipcHostIrqRestore(saved)
   storePtr(hdr, 0, nil)
   let last = loadPtr(list, 4)
   if last != nil:
@@ -14,6 +18,8 @@ proc listPushBack(list, hdr: pointer) {.inline.} =
   storePtr(list, 4, hdr)
 
 proc listPopFront(list: pointer): pointer {.inline.} =
+  let saved = ipcHostIrqSave()
+  defer: ipcHostIrqRestore(saved)
   result = loadPtr(list, 0)
   if result != nil:
     let nextHeader = loadPtr(result, 0)
