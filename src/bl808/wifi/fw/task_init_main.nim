@@ -8,7 +8,7 @@
 proc ke_task_init*() {.exportc, cdecl.} =
   ## Initialize the kernel task descriptor table.
   ## Blob equivalent: static TASK_DESC rodata in ke_task.o (0xa0 bytes, 10 entries).
-  ## Each entry: {stateTable, defaultHandler, statePtr, reserved:u16, stateCount:u16}
+  ## Each entry: {stateTable, defaultHandler, statePtr, stateCount:u16, instanceCount:u16}
   let taskSpecs = [
     KeTaskInitSpec(taskId: TASK_MM,
                    stateTable: cast[pointer](addr mm_state_handler),
@@ -69,7 +69,7 @@ proc wifiMmTimerPendingWork(): bool {.inline.} =
   mmTimerExpired(mm_timer_list.first)
 
 proc wifiMessagePendingWork(): bool {.inline.} =
-  keMsgQueueSent.first != nil or keSavedReschedTask != TASK_NONE
+  keMsgQueueSent.first != nil or keSavedReschedMask != 0
 
 proc wifiMessageEventPending(): bool {.inline.} =
   (keEvtField and KE_EVT_KE_MESSAGE) != 0
@@ -79,7 +79,9 @@ proc wifiHiddenMessagePendingWork(): bool {.inline.} =
 
 proc wifiMainHasPendingWork(): bool =
   wifiEventPendingWork() or wifiKernelTimerPendingWork() or
-    wifiMmTimerPendingWork() or wifiMessagePendingWork()
+    wifiMmTimerPendingWork() or wifiMessagePendingWork() or
+    smBssNeedsService() or smCleanupNeedsService() or smActivationNeedsService() or
+    smScanNeedsService() or smRegistrationNeedsService()
 
 proc wifiUpdateMacPlCtrl() {.inline.} =
   let tslo = macTimeNow()
@@ -97,6 +99,21 @@ proc wifiWaitForWorkIfIdle(blockWhenIdle, hasWork: bool): bool =
     result = wifiMainHasPendingWork()
 
 proc wifiDrainScheduledWork(): bool =
+  if smRegistrationNeedsService():
+    smRegistrationService()
+    result = true
+  if smScanNeedsService():
+    smScanService()
+    result = true
+  if smActivationNeedsService():
+    smActivationService()
+    result = true
+  if smBssNeedsService():
+    smBssService()
+    result = true
+  if smCleanupNeedsService():
+    smCleanupService()
+    result = true
   if wifiKernelTimerPendingWork():
     result = true
     ke_timer_schedule()
@@ -137,6 +154,12 @@ proc wifi_main_service_step*(blockWhenIdle: uint8 = 0'u8) {.exportc, cdecl.} =
 proc wifi_main_poll_once*() {.exportc, cdecl.} =
   discard wifiMainServiceNonblocking()
 
+proc wifiMainLog(sourceLine: cint; message: cstring) {.noinline.} =
+  let logFn = cast[proc(level: uint32; tag, file: cstring; line: cint;
+                        format: cstring) {.cdecl, varargs.}](blOpsFunc(204))
+  if logFn != nil:
+    logFn(2, nil, "arch_main.c", sourceLine, message)
+
 proc wifi_main*(param: pointer) {.exportc, cdecl.} =
   ## WiFi firmware main entry point (157 instructions in blob).
   ## Blob call sequence (from relocations):
@@ -153,6 +176,8 @@ proc wifi_main*(param: pointer) {.exportc, cdecl.} =
   ##  11. ipc_emb_wait — IPC sync barrier (wait for host ready)
   ##  12. ke_evt_schedule — main event loop
 
+  wifiMainLog(268, "[WF] Running Wi-Fi FW thread...\r\n")
+
   # Toggle INTC clock enable with delays (blob: arch_delay_us x2)
   let saved = irqSave()
   var pend = regRead(INTC_PEND_REG)
@@ -168,13 +193,13 @@ proc wifi_main*(param: pointer) {.exportc, cdecl.} =
   # RF initialization (external platform functions)
   wifi_hosal_rf_turn_on()
   wifiRfCoreInit(40000000'u32)
+  wifiMainLog(286, "Done\r\n")
 
-  # Keep the init sequence linear so GCC doesn't clone the function around
-  # per-call logFn==nil checks (previously produced two bl_init /
-  # ipc_emb_init call sites in the output). The log calls are guarded by
-  # a single logFn != nil block that wraps them all, so both paths are
-  # exit-only rather than interleaved with real init calls.
-  let logFn = getLogFunc(4)
+  # The vendor enables this control bit before initializing MPIF/MAC/IPC.
+  let bcsReg = MACHW_BCN_STATUS_REG
+  var bcs = regRead(bcsReg)
+  bcs = bcs or 0x01'u32
+  regWrite(bcsReg, bcs)
 
   # MPIF clock + system controller init
   mpif_clk_init()
@@ -183,24 +208,21 @@ proc wifi_main*(param: pointer) {.exportc, cdecl.} =
   # Interrupt and IPC init
   intc_init()
 
+  wifiMainLog(295, "Configure IPC...\r\n")
   ipc_emb_init()
+  wifiMainLog(297, "Done\r\n")
 
   # Platform init — bl_init calls mm_init which initializes all subsystems
-  bl_init()
+  wifiMainLog(299, "Configure MAC...\r\n")
+  if not bl_init():
+    wifiMainLog(301, "MAC initialization failed\r\n")
+    return
+  wifiMainLog(301, "Done\r\n")
 
-  if logFn != nil:
-    logFn(2, 0, nil, 286)
-    logFn(2, 0, nil, 295)
-    logFn(2, 0, nil, 297)
-    logFn(2, 0, nil, 299)
-    logFn(2, 0, nil, 301)
-    logFn(2, 0, nil, 315)
+  bl_pm_ops_register(nil)
+  wifiMainLog(315, "Starting loop...\r\n")
 
   # Configure BCN registers (blob: BCN_STATUS_REG sequence)
-  let bcsReg = MACHW_BCN_STATUS_REG
-  var bcs = regRead(bcsReg)
-  bcs = bcs or 0x01'u32
-  regWrite(bcsReg, bcs)
   regWrite(bcsReg + 4, 0x0024F037'u32)
   bcs = regRead(bcsReg)
   bcs = bcs or 0x01'u32
@@ -218,12 +240,6 @@ proc wifi_main*(param: pointer) {.exportc, cdecl.} =
 
   # COEX PTA control
   regWrite(COEX_CTRL_REG, 0x5010001F'u32)
-
-  # Register PM ops. Blob registers PM ops once and then drops straight
-  # into the event loop; the previous Nim code duplicated bl_sleep_schedule
-  # and ipc_emb_wait both before and inside the loop, which doubled the
-  # pre-steady-state work (and also doubled the wake-from-IPC window).
-  bl_pm_ops_register(nil)
 
   # Main event loop (blob .L23 at offset 0x1BC)
   # .L23: read MACHW_TIMLO; and 0x80000;

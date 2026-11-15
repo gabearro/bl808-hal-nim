@@ -456,6 +456,22 @@ proc hbnPowerOnRc32k*() =
   core.fenceIo()
   core.delayUs(900)
 
+proc hbnStartWallClock*() =
+  ## Start the free-running f32k HBN RTC as an always-on ms time source.
+  ## AON/HBN domain only — no mcu_clk, no RF, no PLL — so it cannot affect WiFi
+  ## connect/serve, and (unlike the CLINT mtime, which rides mcu_clk) it does NOT
+  ## freeze when a WiFi reconnect de-syncs the CPU-side mtime read path. Call
+  ## once at boot before using monotonicMsF32k().
+  hbnPowerOnRc32k()        # power RC32K (>800us settle inside)
+  hbnEnableRtcCounter()    # HBN_RTC_CTL[0] = 1
+
+proc monotonicMsF32k*(): uint64 =
+  ## Monotonic milliseconds off the 40-bit f32k HBN RTC. ~30.5us resolution —
+  ## ample for the ms-scale link/diag/timeout logic, and it never freezes on a
+  ## WiFi reconnect. Requires hbnStartWallClock() once at boot. Not {.inline.}:
+  ## it is assigned to the {.nimcall.} wallClockMsHook.
+  (hbnReadRtc() * 1000'u64) div Rc32kHz
+
 proc hbnTrimRc32k*() =
   ## Apply the efuse-calibrated RC32K trim (vendor HBN_Trim_RC32K): write the tuned
   ## oscillator code into HBN_RC32K_CTRL0 (CODE_FR_EXT[31:22], EXT_CODE_EN bit 19).

@@ -1,3 +1,4 @@
+include output_parts/admission
 include output_parts/protocol_diag
 include output_parts/dhcp_tx
 include output_parts/enqueue
@@ -9,6 +10,8 @@ proc bl_output*(blHw: ptr BlHw; isSta: cint; txPbuf: ptr Pbuf; customCfm: ptr Bl
     return ErrConn
 
   let txPbufView = pbufView(cast[pointer](txPbuf))
+  if not txPbufAdmissible(cast[pointer](txPbuf)):
+    return ErrBuf
   let ethernetHeaderPtr = txPbufView.payload
   let ethernetHeader = ethernetHeaderAt(ethernetHeaderPtr)
   let etherType = ethernetHeader.ethertype

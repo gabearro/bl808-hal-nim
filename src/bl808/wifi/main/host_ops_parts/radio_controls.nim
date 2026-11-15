@@ -14,7 +14,7 @@ proc bl_main_monitor_disable*(): cint {.exportc, cdecl.} =
   0
 
 proc bl_main_phy_up*(): cint {.exportc, cdecl.} =
-  if bl_send_start(hwPtr()) != 0: -1 else: 0
+  bl_send_start(hwPtr())
 
 proc bl_main_channel_set*(channel: cint): cint {.exportc, cdecl.} =
   discard bl_send_channel_set_req(hwPtr(), channel)

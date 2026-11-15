@@ -4,32 +4,29 @@
 
 proc bam_init*() {.exportc, cdecl.} =
   ## Initialize block ACK management.
-  ## From disassembly: stores 0xFF to bamStaIdx (no active BA session),
+  ## From disassembly: stores 0xFF at bam_env+12 (no active BA session),
   ## then tail-calls ke_state_set(TASK_BAM, 0).
-  bamStaIdx = 0xFF'u8
+  bamEnvView().staIdx = 0xFF'u8
   ke_state_set(TASK_BAM, BamIdleState)
 
-{.emit: "__attribute__((optimize(\"crossjumping\"))) void bam_send_air_action_frame(unsigned char,unsigned char,unsigned char,unsigned char,unsigned short,unsigned char,void*);".}
-proc bam_send_air_action_frame*(staIdx: uint8, tid: uint8, isAddba: uint8,
-    dialogToken: uint8, statusCode: uint16, extraFlags: uint8,
+{.emit: "__attribute__((optimize(\"crossjumping\"))) void bam_send_air_action_frame(unsigned char,void*,unsigned char,unsigned char,unsigned short,unsigned short,void*);".}
+proc bam_send_air_action_frame*(staIdx: uint8, baEnv: pointer, action: uint8,
+    dialogToken: uint8, baParams: uint16, statusCode: uint16,
     txCallback: pointer) {.exportc, cdecl.} =
-  ## Send ADDBA/DELBA action frame over the air (177 instructions).
-  ##
-  ## From disassembly register mapping:
-  ##   a0 = staIdx (s4), a1 = tid (s1), a2 = isAddba (s9),
-  ##   a3 = dialogToken (s7), a4 = statusCode (saved to sp+8),
-  ##   a5 = extraFlags (s8), a6 = txCallback (s2)
-  ##
-  ## Allocates a 512-byte frame, fills in action frame header
-  ## (ADDBA req/rsp or DELBA), builds frame body via me_build_add_ba_req/del_ba,
-  ## then pushes to TX with AC=3.
-
-  # Get VIF index from sta_info_tab[staIdx]+39
+  ## The pinned vendor supports only ADDBA responses here. Its second argument
+  ## is the BA environment pointer, also passed intact to the TX callback.
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if action != 1 or staIdx >= STA_INFO_TAB_ENTRIES.uint8:
+    return
   let sta = staInfoForIdx(staIdx)
-  let staEntry = cast[uint](sta)
   let vifIdx = sta.instNbr
-
+  if sta.valid == 0 or vifIdx >= MAX_VIFS.uint8:
+    return
   let vif = vifChannelForIdx(vifIdx)
+  let identity = TxSessionIdentity(captured: true, vif: vifIdx, station: staIdx,
+    vifEpoch: rxVifEpochs[vifIdx], stationEpoch: staDeleteEpoch(staIdx),
+    resetEpoch: txResetEpoch)
 
   # Allocate TX frame from frame pool (blob: txl_frame_get at 0x46)
   let frame = txl_frame_get(512)
@@ -37,9 +34,16 @@ proc bam_send_air_action_frame*(staIdx: uint8, tid: uint8, isAddba: uint8,
     return
 
   let desc = hostTxDescAt(frame)
+  let generation = txlFrameLeaseToken(desc)
+  desc.staInfoIdx = staIdx
+  desc.vifIdx = vifIdx
+  if not txlFramePreparationCurrent(desc, identity, generation):
+    return
 
   # Update TX power (blob: tpc_update_frame_tx_power at 0x6E)
   tpc_update_frame_tx_power(cast[pointer](vif), frame)
+  if not txlFramePreparationCurrent(desc, identity, generation):
+    return
 
   # The MAC header lives in the link descriptor, not inline in the frame
   # descriptor. Writing at frame+348 corrupts the frame pool metadata.
@@ -58,8 +62,7 @@ proc bam_send_air_action_frame*(staIdx: uint8, tid: uint8, isAddba: uint8,
   # 32-bit aligned on BL808, so use byte-safe copies instead of word stores.
   discard c_memcpy(addr hdr.addr1[0], addr sta.macAddr[0], 6.csize_t)
   discard c_memcpy(addr hdr.addr2[0], addr vif.macAddr[0], 6.csize_t)
-  let staType = cast[ptr uint8](staEntry + 86)[]
-  if staType == 2:
+  if vif.vifType == VIF_TYPE_AP:
     discard c_memcpy(addr hdr.addr3[0], addr vif.macAddr[0], 6.csize_t)
   else:
     discard c_memcpy(addr hdr.addr3[0], addr sta.macAddr[0], 6.csize_t)
@@ -82,28 +85,34 @@ proc bam_send_air_action_frame*(staIdx: uint8, tid: uint8, isAddba: uint8,
   # The blob only inserts a security header when MFP returns CCMP (1); in that
   # case the BA body starts after the protected-management header extension.
   let mfpResult = mfp_protect_mgmt_frame(frame, hdr.frameControl.uint32, 3'u32)
+  if not txlFramePreparationCurrent(desc, identity, generation):
+    return
   if mfpResult == 1:
     txu_cntrl_protect_mgmt_frame(frame, cast[pointer](hdr), 24)
+    if not txlFramePreparationCurrent(desc, identity, generation):
+      return
+    if desc.hdrLen != 8 or desc.secTailLen != 8:
+      txl_frame_release(frame, false)
+      return
     let secHdrLen = desc.hdrLen
     hdrLen += secHdrLen.uint32
 
-  # Call appropriate build function based on isAddba
-  var bodyLen: uint32 = 0
-  if isAddba == 1:
-    # Build ADDBA response (blob: me_build_add_ba_rsp at 0x172)
-    let bodyPtr = cast[pointer](addr link.macHeader[hdrLen])
-    bodyLen = me_build_add_ba_rsp(bodyPtr, cast[pointer](tid.uint),
-                                  statusCode, dialogToken, extraFlags.uint16)
-  elif isAddba == 0:
-    # Build ADDBA request
-    let bodyPtr = cast[pointer](addr link.macHeader[hdrLen])
-    bodyLen = me_build_add_ba_req(bodyPtr, nil)
-  else:
-    assert_err("bam.c", "bam.c", 589)
+  if hdrLen > TxlFramePayloadSize - 9'u32:
+    txl_frame_release(frame, false)
+    return
+  let bodyPtr = cast[pointer](addr link.macHeader[hdrLen])
+  let bodyLen = me_build_add_ba_rsp(bodyPtr, baEnv, baParams,
+                                   dialogToken, statusCode)
+  if not txlFramePreparationCurrent(desc, identity, generation):
+    return
 
   # Compute total payload length
+  let extraPad = desc.secTailLen.uint32
+  if bodyLen > TxlFramePayloadSize - hdrLen or
+      extraPad > TxlFramePayloadSize - hdrLen - bodyLen:
+    txl_frame_release(frame, false)
+    return
   hdrLen += bodyLen
-  let extraPad = desc.secTailLen
   hdrLen += extraPad.uint32
 
   # Update TX descriptor lengths
@@ -116,7 +125,7 @@ proc bam_send_air_action_frame*(staIdx: uint8, tid: uint8, isAddba: uint8,
   # Store TX callback if provided
   if txCallback != nil:
     desc.callback = txCallback
-    desc.callbackArg = cast[pointer](cast[uint](tid))
+    desc.callbackArg = baEnv
 
   # Push frame to TX with AC=3 (voice), tail call
   txl_frame_push(frame, 3)

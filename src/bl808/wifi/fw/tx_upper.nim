@@ -2,11 +2,16 @@
 #                   TX Upper (txu_*)
 # ###########################################################################
 
+const
+  TxuDropStatusOrdinary = 0x00020000'u32
+  TxuDropStatusCryptoPending = 0x00080000'u32
+  TxuDropStatusTxNotReady = 0x00100000'u32
+
 proc txu_cntrl_init*() {.exportc, cdecl.} =
   ## Initialize TX upper control.
   discard
 
-proc txu_cntrl_frame_build*(desc: pointer, bufPtr: pointer) {.exportc, cdecl.} =
+proc txuBuildFrame(desc: pointer, bufPtr: pointer): bool =
   ## Build a TX upper control frame (163 instrs).
   ## From disassembly: constructs the MAC header and HW descriptor fields for
   ## a host-originated TX frame. Blob ABI: a0=txdesc, a1=bufPtr (MAC header
@@ -23,7 +28,7 @@ proc txu_cntrl_frame_build*(desc: pointer, bufPtr: pointer) {.exportc, cdecl.} =
   ##   [30..31] = addr6 part
   ##   [32..33] = uint16 frame_len (host payload length)
   ##   [42..43] = uint16 seq_ctrl / TID related
-  ##   [46]     = uint8 sta_idx
+  ##   [46]     = uint8 TID (0xFF = non-QoS; named staIdx in HostTxDescView)
   ##   [47]     = uint8 vif_idx
   ##   [49]     = uint8 sta_info_idx (for rate table lookup)
   ##   [12..13] = uint16 ethertype
@@ -48,15 +53,27 @@ proc txu_cntrl_frame_build*(desc: pointer, bufPtr: pointer) {.exportc, cdecl.} =
   ##
   ## This is a critical TX path function that formats 802.11 headers.
   let txDesc = hostTxDescAt(desc)
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  let identity = txlCaptureSession(txDesc)
+  template ensureCurrentBuild() =
+    if not txlSessionCurrent(identity, txDesc):
+      return false
+  if not txlSessionCurrent(identity, txDesc) or txDesc.staInfoIdx >= STA_INFO_TAB_ENTRIES.uint8:
+    return false
   let bufPtrU = cast[uint](bufPtr)
   if bufPtrU == 0:
-    return
+    return false
   let frameLen = txDesc.frameLen
   let frameType = lmacGateHalfword(frameLen)
   let layout = txFrameBuildLayout(txDesc, bufPtr, frameType)
 
   txFrameWriteSnap(layout, frameLen)
-  discard txu_cntrl_sec_hdr_append(desc, cast[pointer](layout.sec), 1'u32)
+  let securityEnd = cast[pointer](cast[uint](layout.sec) + layout.secLen.uint)
+  if txu_cntrl_sec_hdr_append(desc, securityEnd, 1'u32) != layout.sec:
+    return false
+  if not txlSessionCurrent(identity, txDesc):
+    return false
 
   let vifIdx = txDesc.vifIdx
   let staInfoIdx = txDesc.staInfoIdx
@@ -165,19 +182,26 @@ proc txu_cntrl_frame_build*(desc: pointer, bufPtr: pointer) {.exportc, cdecl.} =
       nimFwConnectTrace2U32("[WIFI-CT] tx_eapol_fc ",
                             fullFc.uint32 or (vifMode.uint32 shl 16),
                             cast[uint32](hdrBufBase))
+      ensureCurrentBuild()
       let addr1Trace = macAddrLo32(addr hdr.header.addr1)
       let addr2Trace = macAddrLo32(addr hdr.header.addr2)
       let addr3Trace = macAddrLo32(addr hdr.header.addr3)
       nimFwConnectTrace2U32("[WIFI-CT] tx_eapol_a12 ", addr1Trace, addr2Trace)
+      ensureCurrentBuild()
       nimFwConnectTrace2U32("[WIFI-CT] tx_eapol_a3 ", addr3Trace, frameLen.uint32)
+      ensureCurrentBuild()
       let addrHi12Trace = macAddrHi16(addr hdr.header.addr1) or
         (macAddrHi16(addr hdr.header.addr2) shl 16)
       let addrHi3Trace = macAddrHi16(addr hdr.header.addr3)
       nimFwConnectTrace2U32("[WIFI-CT] tx_eapol_ahi ", addrHi12Trace, addrHi3Trace)
+      ensureCurrentBuild()
       nimFwConnectTrace2U32("[WIFI-CT] tx_eapol_snap ",
                             snapTraceLo(layout),
                             snapTraceHi(layout))
+      ensureCurrentBuild()
 
+  if not txlSessionCurrent(identity, txDesc):
+    return false
   # Protected data frames need the Protected bit when a pairwise key is active.
   # The reference skips only the control-port EtherType gate; other Ethernet-II
   # data frames (DHCP/ARP/IP) are encrypted and must advertise that in FC.
@@ -220,10 +244,24 @@ proc txu_cntrl_frame_build*(desc: pointer, bufPtr: pointer) {.exportc, cdecl.} =
     if macRawLen != 0'u32:
       discard c_memcpy(addr nimFwDbgDhcpMacRaw[0], cast[pointer](layout.mac),
                        macRawLen.csize_t)
+  true
 
-{.emit: "__attribute__((optimize(\"crossjumping\"))) void txu_cntrl_push(void*);".}
-{.emit: "__attribute__((optimize(\"crossjumping\"))) void txu_cntrl_push(void*);".}
-proc txu_cntrl_push*(param: pointer) {.exportc, cdecl.} =
+proc txu_cntrl_frame_build*(desc: pointer, bufPtr: pointer) {.exportc, cdecl.} =
+  ## Preserve the vendor's void ABI; the in-tree allocator checks the result.
+  discard txuBuildFrame(desc, bufPtr)
+
+proc txuCancelFrame(param: pointer; ac: uint8) =
+  # A retired peer must not receive rate-control feedback from this drop.
+  hostTxDescAt(param).staInfoIdx = 0xFF
+  if txlResetting():
+    # Reset will clear firmware queues; return this unqueued host frame now.
+    txlConfirmUnqueuedHost(param, 0xC0000000'u32 or TxuDropStatusOrdinary, ac)
+    return
+  txl_cntrl_inc_pck_cnt(ac)
+  txl_cfm_push(param, 0xC0000000'u32 or TxuDropStatusOrdinary, ac.uint32)
+
+{.emit: "__attribute__((optimize(\"crossjumping\"))) NIM_BOOL txu_cntrl_push(void*, unsigned char);".}
+proc txu_cntrl_push*(param: pointer; ac: uint8): bool {.exportc, cdecl.} =
   ## Push a TX frame from upper MAC to lower TX layer (154 instrs).
   ## From disassembly: this is the main TX data path entry point from the host.
   ## param is a txdesc (TX descriptor from host via IPC).
@@ -231,7 +269,7 @@ proc txu_cntrl_push*(param: pointer) {.exportc, cdecl.} =
   ## Layout of txdesc (param) key fields:
   ##   [32..33] = uint16 frame_len
   ##   [42..43] = uint16 seq_num
-  ##   [46]     = uint8 sta_idx
+  ##   [46]     = uint8 TID (0xFF = non-QoS; named staIdx in HostTxDescView)
   ##   [47]     = uint8 vif_idx
   ##   [49]     = uint8 sta_info_idx
   ##   [88]     = pointer to upper desc / TX policy
@@ -242,18 +280,19 @@ proc txu_cntrl_push*(param: pointer) {.exportc, cdecl.} =
   ##   [100]    = uint8 security tail length
   ##
   ## Function flow:
-  ##   1. Check if sta_info_idx != 0xFF; if so, look up STA entry and check
-  ##      if STA is active (sta_entry[42] != 0). If not active, go to L69 (drop).
-  ##   2. Check the STA gate at sta_info_tab[72/70]. Type 2 skips the gate;
-  ##      type 1 compares the byte-swapped descriptor halfword with sta+70.
+  ##   1. Resolve sta_info_idx to the STA table. The blob skips only the active
+  ##      flag check for sta_info_idx == 0xFF; the control-port gate and later
+  ##      rate-control lookup still require a valid STA table entry.
+  ##   2. Check the STA gate at sta_info_tab[72/70]. State 2 skips the gate;
+  ##      state 1 compares the byte-swapped descriptor halfword with sta+70.
   ##   3. Allocate TX buffer: calls txl_buffer_alloc for the frame
   ##   4. If allocation fails, go to L69 (drop path with error counters)
-  ##   5. For sta_idx != 0xFF: compute sequence number from STA entry,
-  ##      increment STA's per-TID sequence counter (offset varies by 4-addr)
+  ##   5. For TID != 0xFF: assign and increment the STA's per-TID sequence
+  ##      counter at sta+52+2*TID, wrapping at 4096.
   ##   6. Call txu_cntrl_frame_build to format the 802.11 header
   ##   7. Set up HW descriptor: compute frame length including header,
   ##      determine if frame needs encryption (FC ToDS/FromDS check for
-  ##      frames > 1536 needing QoS), and set ht_flag
+  ##      Ethernet-II frames needing SNAP), and set ht_flag
   ##   8. Call txl_machdr_format(txdesc, 0) for MAC header formatting
   ##   9. Call txl_cntrl_push_int(txdesc, ac) to push into lower MAC TX queue
   ##  10. Set txdesc[91] = 0 to clear TX flags
@@ -262,11 +301,18 @@ proc txu_cntrl_push*(param: pointer) {.exportc, cdecl.} =
   ## Drop path (L69): sets up error counters in stack (0x20000, 0x80000,
   ## 0x100000) and returns without transmitting.
   let desc = hostTxDescAt(param)
+  txSecurityForget(param)
+  let savedIrq = irqSave()
+  defer: irqRestore(savedIrq)
 
-  # Blob ABI: a0=txdesc (param), a1=ac. Capture a1 since Nim only sees a0.
-  var acFromCaller: pointer
-  {.emit: ["asm volatile(\"mv %0, a1\" : \"=r\"(", acFromCaller, ") );"].}
-  let ac = cast[uint8](cast[uint](acFromCaller))
+  if desc.vifIdx >= MAX_VIFS.uint8 or txlVifIsRetiring(desc.vifIdx):
+    txuCancelFrame(param, ac)
+    return false
+  let identity = txlCaptureSession(desc)
+  template ensureCurrentSession() =
+    if not txlSessionCurrent(identity, desc):
+      txuCancelFrame(param, ac)
+      return false
 
   when defined(bl808WifiConnectTrace):
     let protoTrace = desc.frameLen
@@ -276,21 +322,31 @@ proc txu_cntrl_push*(param: pointer) {.exportc, cdecl.} =
                                       (desc.vifIdx.uint32 shl 16) or
                                       (desc.staInfoIdx.uint32 shl 24),
                                     cast[uint32](cast[uint](desc.queueFirst)))
+  ensureCurrentSession()
 
   let staInfoIdx = desc.staInfoIdx
   var dropFrame = false
+  let sta: ptr StaInfoView =
+    if staInfoIdx < STA_INFO_TAB_ENTRIES.uint8:
+      staInfoForIdx(staInfoIdx)
+    else:
+      nil
 
-  # Step 1: Check STA validity
-  if staInfoIdx != 0xFF:
-    let sta = staInfoForIdx(staInfoIdx)
-    if sta.valid == 0:
-      dropFrame = true
+  # Step 1: Check STA validity. The vendor uses sta_info_idx after the 0xFF
+  # branch for the control-port gate; keep that drop behavior without reading
+  # outside sta_info_tab.
+  if sta == nil:
+    dropFrame = true
+  else:
+    if staInfoIdx != 0xFF'u8:
+      if sta.valid == 0:
+        dropFrame = true
 
     if not dropFrame:
       # Step 2: Check STA type and gate halfword (blob uses sta_info_tab, NOT vif).
       let stationControlPortState = sta.controlPortState
       if stationControlPortState == 2:
-        discard  # Type 2 (AP): skip the STA control-port gate.
+        discard  # State 2 (ready/AP): skip the STA control-port gate.
       elif stationControlPortState == 1:
         if sta.rateWord != lmacGateHalfword(desc.frameLen):
           dropFrame = true
@@ -302,43 +358,41 @@ proc txu_cntrl_push*(param: pointer) {.exportc, cdecl.} =
   let vif = vifChannelForIdx(vifIdx)
   let vifEntry = cast[pointer](vif)
 
-  # Blob funnels the 3 drop paths (dropFrame / crypto-pending /
-  # tx-not-ready) through a shared tail with one txl_cntrl_inc_pck_cnt
-  # and one txl_cfm_push. Use a drop flag + computed errFlags.
+  # Blob funnels the 3 drop paths through a shared tail, then uses th.lrw to
+  # map reasons 0/1/2 to the status masks below before txl_cfm_push.
   var doDrop = false
-  var dropErrFlags: uint32 = 0
+  var dropStatus = TxuDropStatusOrdinary
   if dropFrame:
-    if vifIdx != 0:
-      vif.psFlags = 1
     doDrop = true
-    dropErrFlags = 0xC0000000'u32 or vifIdx.uint32
   else:
     if vif.vifType == 0:
       if vif.keyPsState != 0:
-        vif.psFlags = 1
         doDrop = true
-        dropErrFlags = 0xC0000001'u32
+        dropStatus = TxuDropStatusCryptoPending
     if not doDrop and not txl_cntrl_tx_check(vifEntry):
-      vif.psFlags = 1
       doDrop = true
-      dropErrFlags = 0xC0000000'u32 or vifIdx.uint32
+      dropStatus = TxuDropStatusTxNotReady
+  ensureCurrentSession()
   if doDrop:
+    vif.psFlags = 1
     txl_cntrl_inc_pck_cnt(ac)
-    let irqState = irqSave()
+    let dropErrFlags = 0xC0000000'u32 or dropStatus
     txl_cfm_push(param, dropErrFlags, ac.uint32)
-    irqRestore(irqState)
-    return
+    return false
 
   # Step 4: Handle sequence number for data frames
-  let staIdx = desc.staIdx
+  let tid = desc.staIdx  # Host descriptor byte 46 is the TID, not the STA index.
   var hdrLen: uint16 = 24
-  if staIdx != 0xFF:
+  if tid != 0xFF:
     let staInfoForSeq = desc.staInfoIdx
     let staSeq = staTxSequence(staInfoForIdx(staInfoForSeq))
+    if tid >= staSeq.seqCounters.len.uint8:
+      txuCancelFrame(param, ac)
+      return false
     hdrLen = 26
-    let seqNum = staSeq.seqCounter
+    let seqNum = staSeq.seqCounters[tid.int]
     let nextSeq = (seqNum + 1) and 0xFFF'u16
-    staSeq.seqCounter = nextSeq
+    staSeq.seqCounters[tid.int] = nextSeq
     desc.seqAssigned = seqNum
 
   # Step 5: Compute security header length.
@@ -348,22 +402,26 @@ proc txu_cntrl_push*(param: pointer) {.exportc, cdecl.} =
   #   return value = sec HEADER length (IV) — added to frame hdr total
   #   *lenOut      = sec TAIL length (MIC/ICV) — written to desc[100]
   var secTailLenOut: uint32 = 0
-  let secHdrLen = cast[uint8](txu_cntrl_sechdr_len_compute(param, addr secTailLenOut))
+  let securityHeaderLen = txu_cntrl_sechdr_len_compute(param, addr secTailLenOut)
+  ensureCurrentSession()
+  if securityHeaderLen notin [0'u32, 4'u32, 8'u32]:
+    txuCancelFrame(param, ac)
+    return false
+  let secHdrLen = securityHeaderLen.uint8
   let secTailLen = cast[uint8](secTailLenOut)
 
   # Step 6-8: Inline MAC header and descriptor setup (blob does NOT call
   # txu_cntrl_frame_build or txl_machdr_format — handles inline).
   # Blob at 0xe6-0x11e:
   #   desc[96]   = desc[12]                       ; seq_ctrl passthrough
-  #   desc[98]   = sechdr_len + mac_hdr_base + (8 if frame_len > 1536 else 0)
-  #   desc[99]   = 8 if frame_len > 1536 else 0   ; QoS/SNAP extension length
+  #   desc[98]   = sechdr_len + mac_hdr_base + SNAP length
+  #   desc[99]   = SNAP length
   #   desc[100]  = secTailLen                     ; MIC/ICV byte count
   let frameLen = desc.frameLen
   let frameType = lmacGateHalfword(frameLen)
-  var qosExt: uint8 = 0
-  if frameType > 1536:
-    qosExt = 8
-    hdrLen += 8
+  # The vendor uses >1536 here but >=1536 in the frame builder.
+  let qosExt = txFrameSnapLen(frameType)
+  hdrLen += qosExt.uint16
 
   desc.seqOut = desc.seqPassthrough
   desc.hdrLen = (hdrLen + secHdrLen.uint16).uint8
@@ -382,10 +440,12 @@ proc txu_cntrl_push*(param: pointer) {.exportc, cdecl.} =
                             secHdrLen.uint32 or (secTailLen.uint32 shl 8) or
                               (hdrLen.uint32 shl 16) or (qosExt.uint32 shl 24),
                             cast[uint32](desc.policy))
+  ensureCurrentSession()
 
   # Step 9: Rate control check (blob: call me_check_rc at 0x122)
   let staInfoForRate = desc.staInfoIdx
   me_check_rc(staInfoForRate)
+  ensureCurrentSession()
 
   # Step 10: Update buffer control.
   # Blob ABI at 0x12a-0x138:
@@ -396,6 +456,7 @@ proc txu_cntrl_push*(param: pointer) {.exportc, cdecl.} =
   #   call me_update_buffer_control
   #   sw  a0, 88(s0)             ; desc[88] = returned tx_policy pointer
   let txPolicyForPush = me_update_buffer_control(cast[pointer](staInfoForIdx(staInfoForRate)))
+  ensureCurrentSession()
 
   # Step 11: Store result, clear flags, tail-call txl_cntrl_push
   desc.policy = txPolicyForPush
@@ -406,7 +467,7 @@ proc txu_cntrl_push*(param: pointer) {.exportc, cdecl.} =
   vif.psFlags = 0
 
   # Tail-call to txl_cntrl_push (blob: a0=desc, a1=ac; jr t1 at 0x162)
-  discard txl_cntrl_push(param, ac)
+  return txl_cntrl_push(param, ac) != 0
 
 proc txu_cntrl_cfm*(param: pointer) {.exportc, cdecl.} =
   ## Handle TX upper confirmation (11 instrs in blob).
@@ -414,6 +475,7 @@ proc txu_cntrl_cfm*(param: pointer) {.exportc, cdecl.} =
   ## sets the confirm-done bit (bit 0) in THD[16], writes 0x0101 to THD[12]
   ## (confirm type), clears the ke_msg linkage word at param[-4], then
   ## copies THD[16] to the confirm pointer at param[16].
+  txlInvalidateDmaFrame(param)
   let desc = hostTxDescAt(param)
   # a5 = lw 0(hwDescPtr) -> THD base (first word of HW desc is THD addr)
   let thd = hostTxHeadThd(hostTxHwDescAt(desc.hwDesc))
@@ -432,11 +494,15 @@ proc txu_cntrl_tkip_mic_append*(txdesc: pointer) {.exportc, cdecl.} =
   ## Looks up STA entry from txdesc[49] (STA index), finds the key-holder at
   ## sta[244], then loads the actual key slot from holder[0]. If no key slot is
   ## installed, returns immediately.
-  ## Checks key type at key[152]: type 1 = pairwise, type 3 = group.
-  ## Sets up MIC context from key material (key+72 or key+48 area), computes
-  ## MIC over frame header fields (SA, DA, priority) then frame body.
-  ## Writes final 8-byte MIC at end of frame data.
+  ## Checks key type at key[152]: type 1 = TKIP, type 0/3 = WEP
+  ## scratch descriptor path. For TKIP, appends the link-local scratch
+  ## THD as the final payload descriptor, computes Michael across the header
+  ## extension and payload THDs, then writes the final 8-byte MIC into that
+  ## scratch THD payload.
   let desc = hostTxDescAt(txdesc)
+  # Control-port bypass reserves no MIC/ICV even when a key is installed.
+  if desc == nil or desc.secTailLen == 0:
+    return
   let staIdx = desc.staInfoIdx
   let sta = staInfoForIdx(staIdx)
   # Blob ABI: sta+244 points at a key-holder; holder[0] is the key slot.
@@ -450,78 +516,89 @@ proc txu_cntrl_tkip_mic_append*(txdesc: pointer) {.exportc, cdecl.} =
   let keyType = key.cipherType
   let linkDesc = desc.bufDesc
   let link = hostTxLinkDescAt(linkDesc)
-  # Determine MIC key offset based on key type
-  var micKeyOff: uint
-  if keyType == 1:
-    # Pairwise TKIP: MIC TX key at key+48+24 = key+72
-    micKeyOff = 72
-  elif keyType == 3:
-    # Group TKIP: MIC TX key at key+48
-    micKeyOff = 48
-  else:
+  let scratchPayloadEndIndex =
+    if keyType == 1:
+      11
+    elif keyType == 0 or keyType == 3:
+      3
+    else:
+      -1
+  if scratchPayloadEndIndex < 0:
     return
-  # Check if MIC calculation context already set up.
-  let micArea = tkipMicKeyArea(key, micKeyOff)
-  if micArea.scratch != nil:
-    return  # MIC already in progress
-  # Set up MIC context at linkDesc+316..348 area
-  # Layout: [316]=magic, [320]=initial L, [324]=input cursor,
-  # [328]=input end, [332]=pending MIC word.
+
   let scratch = addr link.micScratch
-  micArea.scratch = cast[pointer](scratch)
-  scratch.micInputCursor = cast[pointer](addr scratch.micInputScratch[0])
-  if keyType == 1:
-    scratch.micInputEnd = cast[pointer](addr scratch.micInputScratch[3])
-  else:
-    scratch.micInputEnd = cast[pointer](addr scratch.micInputScratch[11])
+  let scratchThd = cast[ptr HostTxThdEntryView](scratch)
+  var terminalThd = addr link.headerThd
+  while terminalThd.next != nil:
+    terminalThd = hostTxThdAt(terminalThd.next)
+  terminalThd.next = cast[pointer](scratchThd)
+
+  # The link-local MIC scratch doubles as the terminal THD. These field names
+  # describe the Michael workspace, but the first 20 bytes are the THD header.
   scratch.magic = 0xCAFEFADE'u32
-  scratch.pendingWord = 0
   scratch.initialLeftWord = 0
+  scratch.micInputCursor = cast[pointer](addr scratch.micInputScratch[0])
+  scratch.micInputEnd =
+    cast[pointer](addr scratch.micInputScratch[scratchPayloadEndIndex])
+  scratch.pendingWord = 0
+
   if keyType == 1:
-    # For pairwise: build MIC header from frame header addresses
-    # Extract header fields for MIC init
     let priority = desc.staIdx
-    let payloadLen = desc.qosExtLen
-    # Get payload pointer from link descriptor
-    # Initialize MIC: da (link+352), sa (link+358)
     var micCtx {.noinit.}: array[16, uint8]
     let micCtxPtr = cast[pointer](addr micCtx[0])
-    let keyMaterial = cast[pointer](addr micArea.keyMaterial[0])
+    let keyMaterial = cast[pointer](cast[uint](keySlot) + 136'u)
     me_mic_init(micCtxPtr, keyMaterial,
-                cast[pointer](addr desc.sa[0]),
                 cast[pointer](addr desc.da[0]),
+                cast[pointer](addr desc.sa[0]),
                 priority)
-    # Pass 1: MIC over the pseudo-header fields (blob: me_mic_calc at 0xe0,
-    # me_mic_end at 0xf4). TKIP MIC spec requires hashing DA||SA||priority||pad
-    # as a separate stream so the end marker flushes the partial block.
-    let hdrStart = cast[pointer](addr desc.da[0])
-    me_mic_calc(micCtxPtr, hdrStart, 14.uint32)  # DA(6)+SA(6)+prio(1)+pad(1)
+
+    let firstMicStart =
+      hostTxLinkMacHdrAddr(link) + desc.hdrLen.uint - desc.qosExtLen.uint
+    me_mic_calc(micCtxPtr, cast[pointer](firstMicStart), desc.qosExtLen.uint32)
+
+    var payloadThd = hostTxThdAt(link.headerThd.next)
+    while payloadThd != nil:
+      let nextPayloadThd = payloadThd.next
+      if nextPayloadThd == nil:
+        me_mic_end(micCtxPtr)
+        let micDst = cast[ptr UncheckedArray[uint8]](payloadThd.payloadStart.uint)
+        let micResult = cast[ptr UncheckedArray[uint8]](micCtxPtr)
+        for micByteIndex in 0 ..< 8:
+          micDst[micByteIndex] = micResult[micByteIndex]
+        return
+      let segmentStart = payloadThd.payloadStart
+      let segmentLen = payloadThd.payloadEnd - segmentStart + 1
+      me_mic_calc(micCtxPtr, cast[pointer](segmentStart.uint), segmentLen)
+      payloadThd = hostTxThdAt(nextPayloadThd)
+
     me_mic_end(micCtxPtr)
-    # Pass 2: MIC over frame body (blob: me_mic_calc at 0x12c, me_mic_end at 0x13e)
-    let bodyStart = hostTxLinkMacHdrPtr(link, 26'u)  # skip MAC header
-    let bodyLen = payloadLen
-    me_mic_calc(micCtxPtr, bodyStart, bodyLen.uint32)
-    # Finalize and write MIC
-    me_mic_end(micCtxPtr)
-    let micDst = cast[ptr UncheckedArray[uint8]](scratch)
-    let micResult = cast[ptr UncheckedArray[uint8]](micCtxPtr)
-    for micByteIndex in 0 ..< 8:
-      micDst[micByteIndex] = micResult[micByteIndex]
-  # Group-key/other TKIP modes follow the reference path that only arms the
-  # link descriptor scratch state above; no immediate software MIC is appended.
+    {.emit: "asm volatile(\"lw a5, 8(zero); ebreak\");".}
+
   return
 
 proc txu_cntrl_protect_mgmt_frame*(param: pointer, hdrPtr: pointer, extraLen: uint32) {.exportc, cdecl.} =
   ## Apply management frame protection (108 bytes in blob).
   ## Blob: checks cached sechdr_len at param[98], computes if needed,
   ## sets Protected Frame bit (0x4000) in frame header, then appends security header.
+  let saved = irqSave()
+  {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
+  defer:
+    {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
+    irqRestore(saved)
   let desc = hostTxDescAt(param)
+  if desc == nil or hdrPtr == nil:
+    return
   var secHdrLen: uint8
   var secTailLen: uint8
   if desc.hdrLen == 0:
     # Not cached: compute security header length
     var tailLen: uint32 = 0
-    secHdrLen = cast[uint8](txu_cntrl_sechdr_len_compute(param, addr tailLen))
+    let securityHeaderLen = txu_cntrl_sechdr_len_compute(param, addr tailLen)
+    if securityHeaderLen notin [4'u32, 8'u32] or tailLen > high(uint8).uint32:
+      desc.hdrLen = 0
+      desc.secTailLen = 0
+      return
+    secHdrLen = securityHeaderLen.uint8
     secTailLen = cast[uint8](tailLen)
     # Cache the results in descriptor
     desc.hdrLen = secHdrLen
@@ -530,11 +607,20 @@ proc txu_cntrl_protect_mgmt_frame*(param: pointer, hdrPtr: pointer, extraLen: ui
     # Use cached values
     secHdrLen = desc.hdrLen
     secTailLen = desc.secTailLen
-  # Set Protected Frame bit (0x4000) in the frame-control field.
-  let fc = macFrameControlAt(hdrPtr)
-  fc.frameControl = fc.frameControl or 0x4000'u16
+  if not ((secHdrLen == 4 and secTailLen == 4) or
+          (secHdrLen == 8 and secTailLen in [8'u8, 12'u8])):
+    desc.hdrLen = 0
+    desc.secTailLen = 0
+    return
   let hdrAddr = cast[uint](hdrPtr)
   # Compute position for security header: hdrPtr + extraLen + secHdrLen
   let secHdrPos = cast[pointer](hdrAddr + extraLen.uint + secHdrLen.uint)
   # Append security header (blob: txu_cntrl_sec_hdr_append(param, secHdrPos))
-  discard txu_cntrl_sec_hdr_append(param, secHdrPos, 0'u32)
+  let secHdrStart = cast[pointer](hdrAddr + extraLen.uint)
+  if txu_cntrl_sec_hdr_append(param, secHdrPos, 0'u32) != secHdrStart:
+    desc.hdrLen = 0
+    desc.secTailLen = 0
+    return
+  # Set Protected only after a usable key has supplied the security header.
+  let fc = macFrameControlAt(hdrPtr)
+  fc.frameControl = fc.frameControl or 0x4000'u16

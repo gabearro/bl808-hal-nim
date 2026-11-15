@@ -121,8 +121,8 @@ proc randomDataFrame(): seq[uint8] =
 
 proc smReplayState(state: ModelState): uint16 =
   case state
-  of msAuthStarting: ReplaySmAuthStartingState
-  of msAuthenticating: ReplaySmAuthenticatingState
+  of msAuthStarting: ReplaySmAuthWaitState
+  of msAuthenticating: ReplaySmAssocWaitState
   of msActivating, msConnected: ReplaySmActivatingState
   else: 0'u16
 
@@ -151,15 +151,15 @@ proc step(state: var ModelState; ev: WifiReplayEvent) =
 
 proc checkStructuredBreaks() =
   doAssert replayClassifyRxuMgtInd(
-    mgtInd(0x00B0'u16, 0, 1, 0), ReplaySmAuthStartingState).kind == wrAuthFailure
+    mgtInd(0x00B0'u16, 0, 1, 0), ReplaySmAuthWaitState).kind == wrAuthFailure
   doAssert replayClassifyRxuMgtInd(
-    mgtInd(0x0010'u16, 0, 0, 0), ReplaySmAuthenticatingState).kind == wrAssocFailure
+    mgtInd(0x0010'u16, 0, 0, 0), ReplaySmAssocWaitState).kind == wrAssocFailure
   doAssert replayMgmtTimeoutAction(
-    ReplaySmAuthStartingState, retryCount = 0, maxRetries = 3) == wrTimeoutRetryAuth
+    ReplaySmAuthWaitState, retryCount = 0, maxRetries = 3) == wrTimeoutRetryAuth
   doAssert replayMgmtTimeoutAction(
-    ReplaySmAuthenticatingState, retryCount = 0, maxRetries = 3) == wrTimeoutRetryAuth
+    ReplaySmAssocWaitState, retryCount = 0, maxRetries = 3) == wrTimeoutRetryAssoc
   doAssert replayMgmtTimeoutAction(
-    ReplaySmAuthStartingState, retryCount = 3, maxRetries = 3) == wrTimeoutFail
+    ReplaySmAuthWaitState, retryCount = 3, maxRetries = 3) == wrTimeoutFail
   doAssert replayMgmtTimeoutAction(
     ReplaySmActivatingState, retryCount = 0, maxRetries = 3) == wrTimeoutIgnored
   var fakeMgmtWithSnap = randomDataFrame()
@@ -196,7 +196,9 @@ proc main() =
       doAssert timeoutAction != wrTimeoutIgnored or
         (state != msAuthStarting and state != msAuthenticating)
       doAssert timeoutAction != wrTimeoutRetryAuth or
-        (state == msAuthStarting or state == msAuthenticating)
+        state == msAuthStarting
+      doAssert timeoutAction != wrTimeoutRetryAssoc or
+        state == msAuthenticating
       inc frames
       if state == msFailed:
         break

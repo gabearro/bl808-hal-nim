@@ -1,3 +1,4 @@
+include queue_parts/lifecycle
 include queue_parts/complete
 include queue_parts/firmware_push
 include queue_parts/enqueue

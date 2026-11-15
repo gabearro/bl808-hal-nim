@@ -175,22 +175,68 @@ __attribute__((weak)) int __popcountsi2(unsigned int x) {
     return n;
 }
 
+/* Compiler 64-bit shift helpers. */
+typedef union {
+    uint64_t unsigned_value;
+    int64_t signed_value;
+    struct {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        uint32_t low, high;
+#else
+        uint32_t high, low;
+#endif
+    } words;
+} ShiftWords64;
+
+/* Variable 64-bit shifts here can lower to recursive calls on RV32. */
 __attribute__((weak)) uint64_t __ashldi3(uint64_t value, int shift) {
     if (shift <= 0) return value;
     if (shift >= 64) return 0;
-    return value << shift;
+    ShiftWords64 input = {.unsigned_value = value}, output;
+    if (shift >= 32) {
+        output.words.low = 0;
+        output.words.high = input.words.low << (shift - 32);
+    } else {
+        output.words.low = input.words.low << shift;
+        output.words.high = (input.words.high << shift) |
+                            (input.words.low >> (32 - shift));
+    }
+    return output.unsigned_value;
 }
 
 __attribute__((weak)) uint64_t __lshrdi3(uint64_t value, int shift) {
     if (shift <= 0) return value;
     if (shift >= 64) return 0;
-    return value >> shift;
+    ShiftWords64 input = {.unsigned_value = value}, output;
+    if (shift >= 32) {
+        output.words.low = input.words.high >> (shift - 32);
+        output.words.high = 0;
+    } else {
+        output.words.low = (input.words.low >> shift) |
+                           (input.words.high << (32 - shift));
+        output.words.high = input.words.high >> shift;
+    }
+    return output.unsigned_value;
 }
 
 __attribute__((weak)) int64_t __ashrdi3(int64_t value, int shift) {
     if (shift <= 0) return value;
-    if (shift >= 64) return value < 0 ? -1 : 0;
-    return value >> shift;
+    ShiftWords64 input = {.signed_value = value}, output;
+    uint32_t fill = 0u - (input.words.high >> 31);
+    if (shift >= 64) {
+        output.words.low = fill;
+        output.words.high = fill;
+    } else if (shift >= 32) {
+        unsigned int high_shift = (unsigned int)shift - 32;
+        output.words.low = high_shift == 0 ? input.words.high :
+            (input.words.high >> high_shift) | (fill << (32 - high_shift));
+        output.words.high = fill;
+    } else {
+        output.words.low = (input.words.low >> shift) |
+                           (input.words.high << (32 - shift));
+        output.words.high = (input.words.high >> shift) | (fill << (32 - shift));
+    }
+    return output.signed_value;
 }
 
 /* Network byte-order conversion (RISC-V is little-endian) */

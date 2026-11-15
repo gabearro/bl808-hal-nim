@@ -1,53 +1,212 @@
+proc meControlMessageMatches(node: ptr CoListHdr, payload: pointer): bool {.cdecl.} =
+  keMsgPayload(cast[ptr KeMsgHdr](node)) == payload
+
+proc meCancelQueuedPayload(payload: pointer) =
+  if payload == nil:
+    return
+  for queue in [addr keMsgQueueSent, addr keMsgQueueSaved]:
+    let saved = irqSave()
+    let node = ke_queue_extract(queue, meControlMessageMatches, payload)
+    irqRestore(saved)
+    if node != nil:
+      ke_msg_free(node)
+      # A free callback may reuse this address in the other queue.
+      return
+
+proc mmPsModeCancel() =
+  let request = mmPsModeRequest
+  mmPsModeRequest = nil
+  if request != nil:
+    if meControlCommand == request:
+      meControlCommand = nil
+    ke_msg_free(keMsgHdrFromPayload(request))
+
+proc meControlReset() =
+  let command = meControlCommand
+  let reply = meControlReply
+  let ready = meControlReplyReady
+  meControlCommand = nil
+  meControlReply = nil
+  meControlReplyReady = false
+  if reply != nil and apmStartReply == reply:
+    apmStartReply = nil
+    apmStartReplyPublished = false
+  meEnvView().requesterId = TASK_NONE
+  if command == mmPsModeRequest:
+    mmPsModeCancel()
+  else:
+    meCancelQueuedPayload(command)
+  if ready:
+    meCancelQueuedPayload(reply)
+  elif reply != nil:
+    ke_msg_free(keMsgHdrFromPayload(reply))
+
+proc meTakeControlReply(request: pointer, id: uint16, length: uint32): pointer =
+  if not smBssAdmitRequest(request) or not smActivationAdmitRequest(request): return nil
+  if request == nil or request != meControlCommand or
+     id != meControlExpectedId or length != 0 or meControlReply == nil:
+    return nil
+  let header = keMsgHdrFromPayload(meControlReply)
+  header.id = id
+  header.destId = TASK_ME
+  header.srcId = TASK_MM
+  header.paramLen = 0
+  meControlCommand = nil
+  meControlReplyReady = true
+  meControlReply
+
+proc smBssCancelControl(request, reply: pointer; vifIndex: uint8): bool =
+  if (request == nil or request != meControlCommand) and
+      (reply == nil or reply != meControlReply):
+    return false
+  # BSS enables reach this path only when the previous mask was zero. Undo
+  # this VIF's provisional bit without disturbing a concurrent VIF's state.
+  let bit = 1'u32 shl vifIndex
+  let me = meEnvView()
+  if meControlFinalId == ME_SET_PS_DISABLE_CFM:
+    me.psDisableMask = me.psDisableMask and not bit
+  elif meControlFinalId == ME_SET_ACTIVE_CFM:
+    me.activeMask = me.activeMask and not bit
+  meControlReset()
+  if meControlCommand == nil and meControlReply == nil and mmPsModeRequest == nil:
+    ke_state_set(TASK_ME, MeIdleState)
+  true
+
+proc smActivationCancelControl(request, reply: pointer; owner: SmTxBuildContext): bool =
+  if (request == nil or request != meControlCommand) and
+      (reply == nil or reply != meControlReply): return false
+  let identity = owner.identity
+  if identity.resetEpoch == txResetEpoch and identity.vif < MAX_VIFS.uint8 and
+      rxVifEpochs[identity.vif] == identity.vifEpoch and
+      staDeleteEpoch(identity.station) == identity.stationEpoch and
+      meControlFinalId == ME_SET_PS_DISABLE_CFM:
+    meEnvView().psDisableMask = meEnvView().psDisableMask and not (1'u32 shl identity.vif)
+  meControlReset()
+  if meControlCommand == nil and meControlReply == nil and mmPsModeRequest == nil:
+    ke_state_set(TASK_ME, MeIdleState)
+  true
+
+proc meBeginControl(request: pointer, commandId: uint16, value: uint8,
+                    replyId: uint16, mask: uint32): cint =
+  if not smActivationAdmitRequest(request): return KeMsgConsumed
+  if meControlCommand != nil or meControlReply != nil:
+    return KeMsgSaved
+  let requestHeader = keMsgHdrFromPayload(request)
+  let requester = requestHeader.srcId
+  let reply = if replyId == 0:
+      ke_msg_alloc(commandId + 1, TASK_ME, TASK_MM, 0)
+    else:
+      ke_msg_alloc_reply(request, replyId, 0)
+  if reply == nil:
+    return KeMsgSaved
+  if not smActivationAdmitRequest(request):
+    ke_msg_free(keMsgHdrFromPayload(reply))
+    return KeMsgConsumed
+  meControlCommand = request
+  meControlReply = reply
+  meControlReplyReady = false
+  meControlExpectedId = commandId + 1
+  meControlFinalId = replyId
+  meControlRequester = requester
+  let me = meEnvView()
+  me.requesterId = if replyId == 0: TASK_NONE else: requester
+  if replyId != 0:
+    if commandId == MM_SET_IDLE_REQ: me.activeMask = mask
+    else: me.psDisableMask = mask
+  # The two-byte ME request has room for the one-byte MM command. Forward its
+  # allocation; the MM worker owns it until the hardware transition completes.
+  requestHeader.id = commandId
+  requestHeader.destId = TASK_MM
+  requestHeader.srcId = TASK_ME
+  requestHeader.paramLen = 1
+  cast[ptr uint8](request)[] = value
+  ke_state_set(TASK_ME, MeBusyState)
+  if not smActivationAdmitRequest(request): return KeMsgConsumed
+  ke_msg_send(request)
+  KeMsgNoFree
+
+proc meCompleteControl(reply: pointer, expectedId: uint16): cint =
+  if not smBssAdmitControlReply(reply) or
+      not smActivationAdmitControlReply(reply): return KeMsgConsumed
+  if reply == nil or reply != meControlReply or not meControlReplyReady:
+    return KeMsgConsumed
+  let header = keMsgHdrFromPayload(reply)
+  if header.id != expectedId or expectedId != meControlExpectedId or
+     header.srcId != TASK_MM or header.destId != TASK_ME:
+    return KeMsgConsumed
+  let finalId = meControlFinalId
+  let requester = meControlRequester
+  meControlReply = nil
+  meControlReplyReady = false
+  meControlCommand = nil
+  meEnvView().requesterId = TASK_NONE
+  ke_state_set(TASK_ME, MeIdleState)
+  if not smActivationAdmitControlReply(reply): return KeMsgConsumed
+  if finalId == 0:
+    return KeMsgConsumed
+  header.id = finalId
+  header.destId = requester
+  header.srcId = TASK_ME
+  ke_msg_send(reply)
+  KeMsgNoFree
+
+proc mmPsModeComplete() =
+  let request = mmPsModeRequest
+  if request == nil:
+    ke_msg_send_basic(MM_SET_PS_MODE_CFM, psEnvView().mode, TASK_MM)
+    return
+  mmPsModeRequest = nil
+  ke_msg_send_basic_reply(request, MM_SET_PS_MODE_CFM)
+  ke_msg_free(keMsgHdrFromPayload(request))
+  discard ke_reschedule_saved_messages(TASK_MM)
+
 # --- MM Task Handlers (mm_task.o) ---
 
 proc mm_reset_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle MM_RESET_REQ: reset MAC state (92 bytes in blob).
-  ## Blob: hal_machw_stop → phy_stop → mm_init → me_init
+  ## Stop MAC/PHY and initialize ME/MM with interrupts disabled; restore
+  ## the incoming interrupt state before confirming the request.
+  if param == nil: return KeMsgConsumed
+  let hdr = keMsgHdrFromPayload(param)
+  let requesterTask = hdr.srcId
+  let destinationTask = hdr.destId
   nimFwTrace("[WIFI-NIMFW] mm_reset_req begin")
-  {.emit: ["extern void hal_machw_stop(void); extern void phy_stop(void); extern void me_init(void);"].}
-  {.emit: ["hal_machw_stop(); phy_stop();"].}
-  mm_init()
-  {.emit: ["me_init();"].}
+  block:
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    if not hal_machw_stop(): return KeMsgSaved
+    phy_stop()
+    me_init()
+    if not mm_init(): return KeMsgSaved
   # Send reset confirmation and set state (blob: ke_msg_send_basic + ke_state_set)
   nimFwTrace("[WIFI-NIMFW] mm_reset_req cfm")
-  ke_msg_send_basic(MM_RESET_CFM, TASK_API, TASK_MM)
+  ke_msg_send_basic(MM_RESET_CFM, requesterTask, destinationTask)
   ke_state_set(TASK_MM, MM_IDLE)
   nimFwTrace("[WIFI-NIMFW] mm_reset_req done")
   return KeMsgConsumed
 
 proc mm_start_req_handler*(param: pointer): cint {.exportc, cdecl.} =
-  ## Handle MM_START_REQ: start MAC management after reset (186 bytes in blob).
-  ## From blob (mm_task.o, 46 instrs):
-  ##   1. Assert state is idle (ke_state_get(TASK_MM) == 0)
-  ##   2. Call mm_init() to re-initialize all subsystems
-  ##   3. Call hal_machw_init() for MAC HW default setup
-  ##   4. ke_evt_set(16) to trigger event processing
-  ##   5. Read beacon interval from param[16] (word), multiply by 1000 to get MAC ticks
-  ##   6. Store beacon interval ticks to mm_env word 7 (offset 0x1C)
-  ##   7. Read max AMPDU config from param[17] (halfword at offset 68)
-  ##   8. Store to mm_env halfword 13 (offset 0x1A)
-  ##   9. Call mm_env_max_ampdu_duration_set(max_ampdu_duration)
-  ##  10. Call ipc_emb_init(), mm_active()
-  ##  11. Send MM_START_CFM with status 0 (success)
-  let state = ke_state_get(TASK_MM)
+  ## Apply the PHY configuration and timing fields from the 72-byte start
+  ## request, then activate MM on the vendor's initial 2.4 GHz channel.
+  if param == nil: return KeMsgConsumed
+  let hdr = keMsgHdrFromPayload(param)
+  if hdr.paramLen < MmStartReqPayloadSize: return KeMsgConsumed
+  let destinationTask = hdr.destId
+  let requesterTask = hdr.srcId
+  let state = ke_state_get(destinationTask)
   if state != MM_IDLE.uint16:
-    assert_err("mm_task.c", "mm_task.c", 308)
-  # Initialize PHY (blob: phy_init at 0x3a)
-  phy_init(nil)
-  # Set channel from param (blob: phy_set_channel at 0x52)
+    assert_err("ke_state_get(dest_id) == MM_IDLE", "mm_task.c", 308)
+    return KeMsgConsumed
   let req = mmStartReqView(param)
-  phySetChannel(req.band, req.chanType, req.prim20Freq, req.center1Freq,
-                req.center2Freq, req.txPower)
-  # Update TX power (blob: tpc_update_tx_power at 0x5c)
-  tpc_update_tx_power(0)
-  # Send start confirmation (blob: ke_msg_send_basic at 0x88)
-  ke_msg_send_basic(MM_START_CFM, TASK_API, TASK_MM)
-  # Activate MM (blob: mm_active at 0x90)
+  phy_init(cast[pointer](addr req.phyConfig[0]))
+  phySetChannel(0'u8, 0'u8, 2412'u16, 2412'u16, 0'u16, 0'u8)
+  tpc_update_tx_power(16'u8)
+  psEnvView().uapsdPeriod = req.uapsdTimeoutMs * 1000'u32
+  mmEnvView().listenWindow = req.lpClockAccuracy
+  ke_msg_send_basic(MM_START_CFM, requesterTask, destinationTask)
   mm_active()
-  # Request idle (blob: hal_machw_idle_req at 0x98)
   hal_machw_idle_req()
-  # Set state (blob: ke_state_set at 0xa4)
-  ke_state_set(TASK_MM, MM_ACTIVE_STATE.uint16)
+  ke_state_set(destinationTask, MM_GOING_TO_IDLE.uint16)
   return KeMsgConsumed
 
 proc mm_version_req_handler*(param: pointer): cint {.exportc, cdecl.} =
@@ -58,6 +217,8 @@ proc mm_version_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   let srcId = keMsgHdrFromPayload(param).srcId
   let cfm = cast[ptr MmVersionCfmPayload](
     ke_msg_alloc(MM_VERSION_CFM, srcId, TASK_MM, MmVersionCfmPayloadSize))
+  if cfm == nil:
+    return KeMsgConsumed
   # FW version word
   cfm.fwVersion = 0x05040000'u32
   # HW version registers from MACHW_BASE
@@ -75,23 +236,38 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Blob ABI: a0=msgId, a1=msgBody, a2=srcId, a3=destId.
   ## Dispatches on msgId to configure MAC HW for various operations.
   ## Called via ke_task_schedule for msg IDs: 6,8,14,16,18,20,22,24,41.
+  if param == nil or not smBssAdmitRequest(param) or not smActivationAdmitRequest(param) or
+      not smCleanupAdmitRequest(param) or not chanUpdateAdmit(param): return KeMsgConsumed
   let hdr = keMsgHdrFromPayload(param)
   let msgId = hdr.id
   let msgBody = param
   let srcId = hdr.destId
   let destId = hdr.srcId
 
+  if msgId == MM_CHAN_CTXT_UPDATE_REQ and hdr.paramLen < MmChanCtxtUpdatePayloadSize:
+    return KeMsgConsumed
+  if msgId == MM_REMOVE_IF_REQ:
+    if hdr.paramLen < sizeof(MmRemoveIfReqPayload).uint32:
+      return KeMsgConsumed
+    if not apmPrepareVifRemoval(cast[ptr MmRemoveIfReqPayload](param).vifIdx):
+      return KeMsgSaved
+
   let mm = mmEnvView()
 
-  # Preamble: check state, save pre-state if non-idle
+  # Do not replace the saved resume state while a transition is pending.
   let curState = ke_state_get(srcId)
+  if curState == TaskGoingIdleState or curState == MM_HOST_BYPASSED.uint16:
+    return KeMsgSaved
   if curState != TaskIdleState:
     # Non-idle: save HW mode and task state, force idle
     let hwMode = regRead(MACHW_STATE_CNTRL_REG) and 0x0F'u32
+    if not smActivationAdmitRequest(param): return KeMsgConsumed
     mm.hardwareMode = hwMode.uint8
     mm.previousState = ke_state_get(srcId).uint8
     hal_machw_idle_req()
+    if not smActivationAdmitRequest(param): return KeMsgConsumed
     ke_state_set(srcId, TaskGoingIdleState)
+    if not smActivationAdmitRequest(param): return KeMsgConsumed
     # Fast path: if SET_VIF_STATE with state=0, enable monitor RX
     if msgId == MM_SET_VIF_STATE_REQ and
         cast[ptr MmSetVifStateReqPayload](msgBody).state == 0:
@@ -100,8 +276,10 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
 
   # Assert HW is truly idle
   let hwState = regRead(MACHW_STATE_CNTRL_REG) and 0x0F'u32
+  if not smActivationAdmitRequest(param): return KeMsgConsumed
   if hwState != 0:
     assert_err("mm_task.c", "mm_task.c", 1527)
+    return KeMsgConsumed
 
   # Blob tail-merges all ke_msg_send_basic error/ack paths into a
   # single shared call site. Collect the CFM msg ID here; branches
@@ -116,6 +294,8 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
     let req = cast[ptr MmAddIfReqPayload](msgBody)
     let cfm = cast[ptr MmAddIfCfmPayload](
       ke_msg_alloc(MM_ADD_IF_CFM, destId, srcId, MmAddIfCfmPayloadSize))
+    if cfm == nil:
+      return KeMsgConsumed
     let p2p = req.p2p != 0
     cfm.status =
       vif_mgmt_register(cast[pointer](addr req.macAddr[0]), req.ifType, p2p,
@@ -126,7 +306,8 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
     let req = cast[ptr MmRemoveIfReqPayload](msgBody)
     let vifIdx = req.vifIdx
     if vifIdx <= 1:
-      vif_mgmt_unregister(vifIdx)
+      if not vif_mgmt_unregister(vifIdx):
+        return KeMsgSaved
     # Check if no VIFs remain
     let vifMgmt = vifMgmtEnvView()
     if vifMgmt.activeList.first == nil:
@@ -138,6 +319,8 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
     let cfm = cast[ptr MmSetChannelCfmPayload](
       ke_msg_alloc(MM_SET_CHANNEL_CFM, destId, srcId,
                    MmSetChannelCfmPayloadSize))
+    if cfm == nil:
+      return KeMsgConsumed
     if req.index != 0:
       phySetChannel(req.band, req.chanType, req.prim20Freq,
                     req.center1Freq, req.center2Freq, 0)
@@ -195,26 +378,25 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
     cfmBasicId = MM_SET_BSSID_CFM
 
   of 22:  # MM_SET_EDCA_REQ -> write EDCA params + ps_uapsd_set
+    if hdr.paramLen < MmSetEdcaReqPayloadSize: return KeMsgConsumed
     let req = cast[ptr MmSetEdcaReqPayload](msgBody)
-    let hwQueue = req.vifIdx
+    let hwQueue = req.acmFlag
+    let vifIdx = req.vifIdx
+    if vifIdx >= MAX_VIFS.uint8 or hwQueue >= 4: return KeMsgConsumed
     let edcaParam = req.edcaParam
-    # Preserve the blob/Nim overlay: the handler reads byte +2, inside the
-    # EDCA word, as the VIF index.
-    let vifIdx = uint8((req.edcaParam shr 16) and 0xFF'u32)
     let vifU = vifEntryAddr(vifIdx)
     let vif = vifChannelAt(vifU)
-    let acmFlag = req.acmFlag
+    vif.edcaRegs[hwQueue] = edcaParam
     let assocFlag = vif.state
     if assocFlag != 0:
       # Write EDCA register based on AC index
       let edcaBase = MACHW_BASE + 0x200'u
-      if hwQueue < 4:
-        regWrite(edcaBase + hwQueue.uint * 4, edcaParam)
+      regWrite(edcaBase + hwQueue.uint * 4, edcaParam)
       mm_env_max_ampdu_duration_set(0)
     # U-APSD setup for STA mode
     let apFlag = vif.vifType
     if apFlag == 0:
-      ps_uapsd_set(cast[pointer](vifU), req.uapsdAc, acmFlag.uint32)
+      ps_uapsd_set(cast[pointer](vifU), hwQueue, req.uapsdAc.uint32)
     cfmBasicId = MM_SET_EDCA_CFM
 
   of 24:  # MM_SET_VIF_STATE_REQ -> full VIF state transition
@@ -242,8 +424,10 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
           let staIdx = vif.staIdx
           let sta = staInfoForIdx(staIdx)
           let tsf = macTimeNow()
+          if not smActivationAdmitRequest(param): return KeMsgConsumed
           let bcnInt = sta.initialRateConfig
           mm_timer_set(addr vif.tbttTimer, tsf + bcnInt)
+          if not smActivationAdmitRequest(param): return KeMsgConsumed
           # Store AID and vendor beacon timing helper.
           sta.aid = req.aid
           let listenWindow = mm.listenWindow.uint32 + 20'u32
@@ -257,6 +441,7 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
           vif.psLastTime = tsf
           vif.flags = vif.flags or 1'u32
           let tsf2 = macTimeNow()
+          if not smActivationAdmitRequest(param): return KeMsgConsumed
           vif.tbttCount = 0
           vif.beaconLossCount = 0
           vif.beaconTimeoutBase = tsf2
@@ -264,6 +449,7 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
           vif.beaconLossWindow = 0
           vif.lastBeaconMacTime = 0
           chan_bcn_detect_start(cast[pointer](vifU))
+          if not smActivationAdmitRequest(param): return KeMsgConsumed
       elif newState != 0:
         runCommonVifStateUpdate = false
       else:
@@ -281,47 +467,49 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
           for ac in 0'u ..< 4'u:
             let edcaVal = vif.edcaRegs[ac.int]
             regWrite(MACHW_BASE + 0x200'u + ac * 4, edcaVal)
+            if not smActivationAdmitRequest(param): return KeMsgConsumed
         else:  # STA/other modes: write VO EDCA to all ACs
           let voEdca = vif.edcaRegs[3]
           for ac in 0'u ..< 4'u:
             regWrite(MACHW_BASE + 0x200'u + ac * 4, voEdca)
+            if not smActivationAdmitRequest(param): return KeMsgConsumed
         mm_env_max_ampdu_duration_set(0)
+        if not smActivationAdmitRequest(param): return KeMsgConsumed
       cfmBasicId = MM_SET_VIF_STATE_CFM
 
-  of 41:  # MM_CHAN_CTXT_UNLINK_CFM -> chan_ctxt_update + send CFM
-    chan_ctxt_update(msgBody)
-    cfmBasicId = MM_CHAN_CTXT_UPDATE_CFM
+  of 41:  # MM_CHAN_CTXT_UPDATE_REQ
+    if chanUpdateAdmit(msgBody):
+      chan_ctxt_update(msgBody)
+      if chanUpdateAdmit(msgBody):
+        cfmBasicId = MM_CHAN_CTXT_UPDATE_CFM
 
   else:
     assert_err("mm_task.c", "mm_task.c", 1563)
 
-  # Shared tail for basic-send CFM paths (blob tail-merge pattern).
-  if cfmBasicId != 0:
-    ke_msg_send_basic(cfmBasicId, destId, srcId)
-  # Shared tail for non-basic ke_msg_send (add-if / set-channel CFMs).
-  if cfmPtr != nil:
-    ke_msg_send(cfmPtr)
-
-  # Epilogue: restore HW state if it was saved
+  # Restore local MM state before a confirmation can synchronously reenter.
   let savedHwMode = mm.hardwareMode
   let shiftedMode = savedHwMode.uint32 shl 4
   if (shiftedMode and not 0xF0'u32) != 0:
     assert_err("mm_task.c", "mm_task.c", 1580)
   regWrite(MACHW_STATE_CNTRL_REG, shiftedMode)
+  if not smActivationAdmitRequest(param): return KeMsgConsumed
   let savedState = mm.previousState
   ke_state_set(srcId, savedState.uint16)
+  if not smActivationAdmitRequest(param): return KeMsgConsumed
+  if cfmBasicId != 0:
+    ke_msg_send_basic_reply(param, cfmBasicId)
+  if cfmPtr != nil:
+    ke_msg_send(cfmPtr)
   return KeMsgConsumed
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) int mm_set_idle_req_handler(void*);".}
 proc mm_set_idle_req_handler*(param: pointer): cint {.exportc, cdecl.} =
-  ## Handle MM_SET_IDLE_REQ (188 bytes in blob, 47 instrs).
-  ## From blob (me_task.o): Complex state machine handler.
-  ## If state==3 (CONNECTED): return KeMsgSaved.
-  ## Stores idle flag from req[0] to mm_env(0x1a).
-  ## If going idle: checks state, requests HW idle, sets state to 2.
-  ## If going active: calls mm_active.
-  ## Sends MM_SET_IDLE_CFM (id=27) via basic send.
-  let state = ke_state_get(TASK_ME)
+  ## The request belongs to TASK_MM and remains saved until hardware is idle.
+  if param == nil or keMsgHdrFromPayload(param).paramLen < MmSetIdleReqPayloadSize:
+    return KeMsgConsumed
+  if not smBssAdmitRequest(param) or not smCleanupAdmitRequest(param):
+    return KeMsgConsumed
+  let state = ke_state_get(TASK_MM)
   if state == HW_ACTIVE.uint16:
     return KeMsgSaved
   let idle = mmSetIdleReqView(param).idle
@@ -329,66 +517,62 @@ proc mm_set_idle_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   mm.idleFlag = idle
   if idle != 0:
     # Going idle
-    let curState = ke_state_get(TASK_ME)
-    if curState == MeIdleState:
+    if state == MM_IDLE.uint16:
       # Already idle - verify HW idle, then send cfm
-      let hwState = regRead(MACHW_STATE_CNTRL_REG) and 0x3F'u32
+      let hwState = regRead(MACHW_STATE_CNTRL_REG) and 0x0F'u32
       if hwState != 0:
         assert_err("mm_task.c", "mm_task.c", 946)
+        return KeMsgConsumed
       mm.previousState = 0
       mm.hardwareMode = 0
-      ke_msg_send_basic(MM_SET_IDLE_CFM, TASK_API, TASK_ME)
+      ke_msg_send_basic_reply(param, MM_SET_IDLE_CFM)
       return KeMsgConsumed
-    if curState == MeGoingIdleState:
-      return KeMsgConsumed
+    if state == TaskGoingIdleState:
+      return KeMsgSaved
     hal_machw_idle_req()
-    ke_state_set(TASK_ME, MeGoingIdleState)
+    ke_state_set(TASK_MM, TaskGoingIdleState)
+    return KeMsgSaved
   else:
     # Going active
-    let curState = ke_state_get(TASK_ME)
-    if curState == MeGoingIdleState:
-      return KeMsgConsumed
+    if state == TaskGoingIdleState:
+      return KeMsgSaved
     mm_active()
-    ke_msg_send_basic(MM_SET_IDLE_CFM, TASK_API, TASK_ME)
+    ke_msg_send_basic_reply(param, MM_SET_IDLE_CFM)
   return KeMsgConsumed
 
 proc mm_set_idle_cfm_handler*(param: pointer): cint {.exportc, cdecl.} =
-  ## Handle MM_SET_IDLE_CFM (106 bytes in blob, me_task.o).
-  ## From blob (34 instrs): ke_state_get(dest_id) assert == 1.
-  ## If me_env[0x7e] != 0xFF, sends ME_SET_ACTIVE_REQ via ke_msg_send_basic.
-  ## Then ke_state_set(dest_id, 0) to transition to IDLE.
-  let state = ke_state_get(TASK_ME)
-  if state != MeBusyState:
-    assert_err("me_task.c", "me_task.c", 504)
-  # Check if ME has a connection (me_env byte at offset 0x7e)
-  let connIdx = meEnvView().psMode
-  if connIdx != 0xFF:
-    ke_msg_send_basic(ME_SET_ACTIVE_REQ, TASK_ME, TASK_ME)
-  ke_state_set(TASK_ME, MeIdleState)
-  return 0
+  meCompleteControl(param, MM_SET_IDLE_CFM)
 
-proc mm_sta_add_req_handler*(param: pointer) {.exportc, cdecl.} =
+proc mm_sta_add_req_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
   ## Handle MM_STA_ADD_REQ (70 bytes in blob, 22 instrs).
   ## From blob: allocates 3-byte CFM message (id=11=MM_STA_ADD_CFM),
   ## calls mm_sta_add(param, &msg[1], &msg[2]), stores status at msg[0],
   ## sends via ke_msg_send, returns 0.
+  if param == nil or keMsgHdrFromPayload(param).paramLen < MmStaAddReqPayloadSize or
+      not smRegistrationAdmitRequest(param): return KeMsgConsumed
+  let saved = irqSave()
+  defer: irqRestore(saved)
   let requester = keMsgHdrFromPayload(param).srcId
-  let cfm = cast[ptr MmStaAddCfmPayload](
-    ke_msg_alloc(MM_STA_ADD_CFM, requester, TASK_MM,
-                 MmStaAddCfmPayloadSize))
+  var cfm = cast[ptr MmStaAddCfmPayload](smRegistrationTakeReply(param))
+  defer:
+    if cfm != nil: ke_msg_free(keMsgHdrFromPayload(cfm))
   if cfm != nil:
-    var staIdx: uint8
-    var hwStaIdx: uint8
+    var staIdx = 0xFF'u8
+    var hwStaIdx = 0xFF'u8
     cfm.status = mm_sta_add(param, addr staIdx, addr hwStaIdx)
     cfm.staIdx = staIdx
     cfm.hwStaIdx = hwStaIdx
+    if not smRegistrationComplete(param, cfm): return KeMsgConsumed
     inc nimFwDbgPreauthStaCfm
     nimFwDbgPreauthStaCfmMeta =
       cfm.status.uint32 or (cfm.staIdx.uint32 shl 8) or
       (cfm.hwStaIdx.uint32 shl 16) or (requester.uint32 shl 24)
-    ke_msg_send(cfm)
+    let outgoing = cfm
+    cfm = nil
+    ke_msg_send(outgoing)
+  return 0
 
-proc mm_sta_add_cfm_handler*(param: pointer) {.exportc, cdecl.} =
+proc mm_sta_add_cfm_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
   ## Handle MM_STA_ADD_CFM (288 bytes in blob, 72 instrs).
   ## From blob (me_task.o): asserts state==3 (CONNECTED). If cfm->status!=0:
   ## calls sm_connect_ind(15, 0xFFFF) to signal failure. If status==0:
@@ -397,14 +581,12 @@ proc mm_sta_add_cfm_handler*(param: pointer) {.exportc, cdecl.} =
   ## on vif.flags(484). If VHT: copies 32 bytes of HT cap from vif(348) to
   ## sta(264), calls me_set_sta_ht_vht_param. Invokes WPA callback, then
   ## calls sm_set_bss_param.
-  let state = ke_state_get(TASK_SM)
-  if state != 3:
-    assert_err("me_task.c", "me_task.c", 564)
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  var owner: SmTxBuildContext
+  var indication: pointer
+  if not smRegistrationClaim(param, owner, indication): return KeMsgConsumed
   let cfm = cast[ptr MmStaAddCfmPayload](param)
-  if cfm.status != 0:
-    # Connection failed
-    sm_connect_ind(15, 0xFFFF'u16)
-    return
   # Success path: set up station entry
   let staIdx = cfm.staIdx
   let sta = staInfoForIdx(staIdx)
@@ -422,28 +604,49 @@ proc mm_sta_add_cfm_handler*(param: pointer) {.exportc, cdecl.} =
     # Copy 32 bytes of HT/VHT caps from vif(348) to sta(264)
     discard c_memcpy(cast[pointer](addr sta.vhtCaps[0]),
                      cast[pointer](vifHtCapabilities(vif)), 32.csize_t)
-    me_set_sta_ht_vht_param(cast[pointer](sta), cast[pointer](vif))
+    me_set_sta_ht_vht_param(cast[pointer](sta), cast[pointer](vifHtCapabilities(vif)))
+  if not smScanOwnerCurrent(owner, indication) or not smRegistrationHandoff(param):
+    return KeMsgConsumed
   sm_set_bss_param(param)
+  return 0
 
-proc mm_sta_del_req_handler*(param: pointer) {.exportc, cdecl.} =
-  ## Handle MM_STA_DEL_REQ (44 bytes in blob, 13 instrs).
-  ## From blob: reads sta_idx from req[0], calls mm_sta_del, then sends
-  ## MM_STA_DEL_CFM (id=13) via ke_msg_send_basic.
+proc mm_sta_del_req_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
+  ## The vendor confirms to the incoming source, not unconditionally to API.
+  if param == nil or keMsgHdrFromPayload(param).paramLen < MmStaDelReqPayloadSize:
+    return KeMsgConsumed
+  if txlResetting(): return KeMsgSaved
+  if not smBssAdmitRequest(param) or not smCleanupAdmitRequest(param):
+    return KeMsgConsumed
+  let header = keMsgHdrFromPayload(param)
+  let destination = header.srcId
+  let source = header.destId
   let req = mmStaDelReqView(param)
   mm_sta_del(req.staIdx)
-  ke_msg_send_basic(MM_STA_DEL_CFM, TASK_API, TASK_MM)
+  if txlResetting(): return KeMsgSaved
+  # Reuse the consumed request so completion cannot fail to allocate.
+  header.paramLen = 0
+  ke_msg_forward_and_change_id(param, MM_STA_DEL_CFM, destination, source)
+  KeMsgNoFree
 
-proc mm_set_ps_mode_req_handler*(param: pointer) {.exportc, cdecl.} =
+proc mm_set_ps_mode_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle MM_SET_PS_MODE_REQ (96 bytes in blob, 30 instrs).
   ## From blob (mm_task.o): reads req[0] = ps_mode. If ps_mode == 3
   ## (PS_MODE_ON_DYN): iterates linked list of VIFs from vif_mgmt_env+8.
   ## For each non-AP (vif[86]!=0) and PS-capable (vif[88]!=0) VIF,
-  ## calls mm_ps_enable_vif. When list exhausted, sends MM_SET_PS_OFF_INTERNAL_REQ.
+  ## calls mm_ps_enable_vif. When list exhausted, sends MM_SET_PS_MODE_CFM.
   ## If ps_mode != 3: forwards to ps_set_mode.
+  if param == nil or keMsgHdrFromPayload(param).paramLen < MmSetPsModeReqPayloadSize:
+    return KeMsgConsumed
+  if not smBssAdmitRequest(param) or not smCleanupAdmitRequest(param) or
+      not smActivationAdmitRequest(param):
+    return KeMsgConsumed
+  if mmPsModeRequest != nil:
+    return KeMsgSaved
   let mode = mmSetPsModeReqView(param).mode
   if mode != 3:
-    ps_set_mode(mode)
-    return
+    mmPsModeRequest = param
+    ps_set_mode(mode, keMsgHdrFromPayload(param).srcId)
+    return KeMsgNoFree
   # PS_MODE_ON_DYN: iterate active VIF linked list from vif_mgmt_env.
   let env = vifMgmtEnvView()
   var vifNode = cast[pointer](env.activeList.first)
@@ -453,163 +656,108 @@ proc mm_set_ps_mode_req_handler*(param: pointer) {.exportc, cdecl.} =
     let psCap = vif.state
     if vifType == 0 and psCap != 0:
       # STA VIF that supports PS - poll for PS frame (blob: ps_polling_frame)
-      ps_polling_frame()
+      discard ps_polling_frame(vifNode)
     vifNode = vif.next  # Follow linked list
-  # After iteration, call ps_set_mode with original mode
-  ke_msg_send_basic(MM_SET_PS_MODE_CFM, TASK_API, TASK_MM)
+  # Dynamic PS confirm goes back to the requester stored in ps_env[1].
+  ke_msg_send_basic_reply(param, MM_SET_PS_MODE_CFM)
+  KeMsgConsumed
 
-proc mm_set_ps_mode_cfm_handler*(param: pointer) {.exportc, cdecl.} =
-  ## Blob mm_task.o::mm_set_ps_mode_cfm_handler (106 bytes, single symbol).
-  ##
-  ## ABI (from disassembly):
-  ##   a1 = msg body   (unused here)
-  ##   a2 = src_task   ← determines which task's state to inspect
-  ##   a3 = dest_task  (unused)
-  ##
-  ## Flow:
-  ##   state = ke_state_get(src_task)
-  ##   if state != 1: assert_err(line 609)
-  ##   marker = me_env[126]              # 0xFF ⇒ no pending disable
-  ##   if marker != 0xFF:
-  ##     ke_msg_send_basic(ME_SET_PS_DISABLE_CFM=0xC10, src=src_task, ?)
-  ##   ke_state_set(src_task, 0)
-  ##
-  ## Previous Nim invented a two-task dispatch (checking SM then APM state)
-  ## with wrong msg IDs and wrong next-state values. Blob is single-symbol,
-  ## parameterised by caller task via a2.
-  let srcTask = keMsgHdrFromPayload(param).destId
-  if ke_state_get(srcTask) != TaskActiveState:
-    assert_err("mm_task.c", "mm_task.c", 609)
-  let marker = meEnvView().psMode
-  if marker != 0xFF'u8:
-    ke_msg_send_basic(ME_SET_PS_DISABLE_CFM, srcTask, 0'u8)
-  ke_state_set(srcTask, TaskIdleState)
+proc mm_set_ps_mode_cfm_handler*(param: pointer): cint {.exportc, cdecl.} =
+  meCompleteControl(param, MM_SET_PS_MODE_CFM)
 
-proc mm_set_ps_options_req_handler*(param: pointer) {.exportc, cdecl.} =
+proc mm_set_ps_options_req_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
   ## Handle MM_SET_PS_OPTIONS_REQ (132 bytes in blob, 44 instrs).
   ## From blob: a1=msg body, a2=src_id, a3=dest_id. Reads vif_idx from msg[0],
   ## computes VIF entry, asserts type==0 (STA), stores listen_interval(msg[2])
   ## and ps_options(msg[4]) to VIF, sends CFM with src/dest from original msg.
-  let hdr = keMsgHdrFromPayload(param)
+  if param == nil or keMsgHdrFromPayload(param).paramLen < MmSetPsOptionsReqPayloadSize or
+      not smActivationAdmitRequest(param): return KeMsgConsumed
   let msgBody = param
-  let srcId = hdr.destId
-  let destId = hdr.srcId
   let req = cast[ptr MmSetPsOptionsReqPayload](msgBody)
   let vifIdx = req.vifIdx
+  if vifIdx >= MAX_VIFS.uint8: return KeMsgConsumed
   let vif = vifChannelForIdx(vifIdx)
   # Assert VIF type is STA (0)
   let vifType = vif.vifType
   if vifType != 0:
     assert_err("mm_task.c", "mm_task.c", 1680)
+    return KeMsgConsumed
   # Store listen interval and PS options from msg body
   vif.listenInterval = req.listenInterval
   vif.psOptions = req.options
   # Send confirmation with original src/dest routing
-  ke_msg_send_basic(MM_SET_PS_OPTIONS_CFM, destId, srcId)
+  ke_msg_send_basic_reply(param, MM_SET_PS_OPTIONS_CFM)
+  KeMsgConsumed
 
-proc mm_set_vif_state_cfm_handler*(param: pointer) {.exportc, cdecl.} =
-  ## Handle MM_SET_VIF_STATE_CFM (258 bytes in blob, 65 instrs).
-  ## From blob (me_task.o): checks ke_state_get(TASK_SM) == 9 (activating).
-  ## Reads sm_env[0]->vif_idx (offset 59), computes vif_info_tab[idx].
-  ## Allocs MM_SET_IDLE_REQ msg (id=57, 6 bytes), fills from mm_env fields
-  ## (offsets 54, 56, 59), sends it. Computes ps_mode = 2 - (vif.flags[1496] & 1),
-  ## stores to sta.ps_mode(offset 72), stores the control-port gate at sta+70.
-  ## If ps_mode == 2: allocs ME_SET_PS_DISABLE_REQ (0xC0F) msg, sends it.
-  ## Sends SM_STA_ADD_IND. If vif[0x1F1] <= 1, completes connect immediately.
-  let state = ke_state_get(TASK_SM)
-  if state != SM_ACTIVATING_STATE:
-    return
-  let connectInfoPtr = smEnvView().connectInfo
-  if connectInfoPtr == nil:
-    return
-  let connectInfo = connectInfoView(connectInfoPtr)
-  let vifIdx = connectInfo.vifIdx
-  let vif = vifChannelForIdx(vifIdx)
-  # Allocate and send MM_SET_PS_OPTIONS_REQ (vendor blob msg id 0x39).
-  let powerSaveOptionsReq = cast[ptr MmSetPsOptionsReqPayload](
-    ke_msg_alloc(MM_SET_PS_OPTIONS_REQ, TASK_MM, TASK_SM,
-                 MmSetPsOptionsReqPayloadSize))
-  if powerSaveOptionsReq != nil:
-    powerSaveOptionsReq.vifIdx = vifIdx
-    powerSaveOptionsReq.listenInterval = connectInfo.listenInterval
-    powerSaveOptionsReq.options = connectInfo.psOptions
-    ke_msg_send(powerSaveOptionsReq)
-  # Compute control-port state and store it in the STA entry.
-  let staIdx = vif.staIdx
-  let sta = staInfoForIdx(staIdx)
-  let keyPointerFlags = vifKeyPointers(vif).flags
-  let controlPortState = 2'u8 - (keyPointerFlags and 1).uint8
-  sta.controlPortState = controlPortState
-  sta.rateWord = lmacGateHalfword(connectInfo.ctrlPortEthertype)
-  let mm = mmEnvView()
-  if mm.rxPromiscUploadFlag != 0:
-    mm.rxFilterBase = 0x3503A58C'u32
-  else:
-    mm.rxFilterBase = 0x3503858C'u32
-  mm_rx_filter_set()
-  when defined(bl808WifiConnectTrace):
-    nimFwConnectTrace2U32("[WIFI-CT] vif_state_cfm ", vifIdx.uint32 or (staIdx.uint32 shl 8), controlPortState.uint32)
-  # If control-port state == 2, send the vendor PS-disable request to ME from SM.
-  if controlPortState == 2:
-    let psDisableReq = cast[ptr MeSetPsDisableReqPayload](
-      ke_msg_alloc(ME_SET_PS_DISABLE_REQ, TASK_ME, TASK_SM,
-                   MeSetPsDisableReqPayloadSize))
-    if psDisableReq != nil:
-      psDisableReq.disable = 0
-      psDisableReq.vifIdx = vifIdx
-      ke_msg_send(psDisableReq)
-  # Blob sends SM_STA_ADD_IND here so the host TX table is ready for EAPOL 2/4.
-  # WPA completion later calls sm_connect_ind via bl_wifi_auth_done_internal.
-  sm_connection_sta_add_ind(nil)
-  let securityState = vifSecurity(vif)
-  nimFwDbgVifSecType = securityState.cipher.uint32
-  if securityState.cipher <= 1'u8:
-    inc nimFwDbgConnectIndPrePath
-    sm_connect_ind(0, 0)
+proc mm_set_vif_state_cfm_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
+  if smCleanupConsumeReply(param): return KeMsgConsumed
+  discard smActivationConfirm(param, 0)
+  KeMsgConsumed
 
-proc mm_bcn_change_req_handler*(param: pointer) {.exportc, cdecl.} =
+proc smActivationOptionsCfmHandler(param: pointer): cint {.cdecl.} =
+  discard smActivationConfirm(param, 1)
+  KeMsgConsumed
+
+proc mm_bcn_change_req_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
   ## Handle MM_BCN_CHANGE_REQ (22 bytes in blob).
   ## From blob: moves a1 (message body) into a0, calls mm_bcn_change, returns 1.
   let msgBody = param
   mm_bcn_change(msgBody)
+  KeMsgNoFree
 
-proc mm_bcn_change_cfm_handler*(param: pointer) {.exportc, cdecl.} =
+proc mm_bcn_change_cfm_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
   ## Handle MM_BCN_CHANGE_CFM: beacon change confirmed.
   ## Blob (mm_bcn.o, 66b): assert APM starting, then apm_start_cfm(0).
   let state = ke_state_get(TASK_APM)
+  if not apmConsumeStartReply(param):
+    return KeMsgConsumed
   if state != ApmStartingState:
-    assert_err("mm_bcn.c", "mm_bcn.c", 353)
-  apm_start_cfm(nil)
+    apm_start_cfm(cast[pointer](1'u))
+    return KeMsgConsumed
+  let failed = param != nil and keMsgHdrFromPayload(param).paramLen >=
+    sizeof(MmBcnChangeCfmPayload).uint32 and
+    cast[ptr MmBcnChangeCfmPayload](param).status != 0
+  apm_start_cfm(if failed: cast[pointer](1'u) else: nil)
+  KeMsgConsumed
 
-proc mm_tim_update_req_handler*(param: pointer) {.exportc, cdecl.} =
-  ## Handle MM_TIM_UPDATE_REQ (22 bytes in blob).
-  ## From blob: moves a1 (message body) into a0, calls mm_tim_update, returns 1.
-  ## (mm_tim_update internally dispatches between co_list_push_back queue path
-  ## and mm_tim_update_proceed immediate path.)
-  let msgBody = param
-  mm_tim_update(msgBody)
+proc mm_set_vif_state_cfm_handler_apm*(param: pointer): cint {.exportc, cdecl.} =
+  if apmConsumeStartReply(param) and apmRollbackActive:
+    apmContinueStartRollback()
+  KeMsgConsumed
+
+proc mm_tim_update_req_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
+  ## The TIM worker owns the message, whether it applies or queues it.
+  mm_tim_update(param)
+  KeMsgNoFree
 
 proc mm_tim_update_proceed*(param: pointer) {.exportc, cdecl, noinline.} =
-  ## Proceed with TIM update (578 bytes in blob, 257 instrs).
-  ## noinline: blob calls this from mm_tim_update (gap target).
-  ## From blob (mm_bcn.o): reads aid(u16 @0), set(@2, u8), vif_idx(@3, u8).
-  ## AID==0: sets/clears DTIM bit at vif+330 (0x14a). Sends MM_TIM_UPDATE_DONE(0x30).
-  ## AID!=0: computes byte_idx=aid>>3, bit_idx=aid&7, mask=1<<bit_idx.
-  ##   Set: OR mask into txl_tim_bitmap_pool[byte_idx], increment tim_count(vif+320),
-  ##     update min(vif+328)/max(vif+329), recompute TIM IE length(vif+318),
-  ##     update txl_tim_ie_pool and txl_tim_desc pointers.
-  ##   Clear: AND ~mask, decrement tim_count. If count==0: reset all TIM fields.
-  ##     Otherwise adjust min/max by scanning bitmap.
-  ## Finally: ke_msg_send_basic(0x30, src_id, 0), ke_msg_free(msg).
+  ## Update the partial virtual bitmap and its two hardware descriptors.
+  ## AID 0 controls multicast delivery; AIDs 1..2007 occupy the bitmap.
+  if param == nil:
+    return
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  let msgHdr = keMsgHdrFromPayload(param)
+  let sender = msgHdr.srcId
+  defer:
+    ke_msg_free(msgHdr)
+    ke_msg_send_basic(0x30, sender, TASK_MM)
+  if not mmTimMessageCurrent(msgHdr):
+    return
+  if msgHdr.paramLen < MmTimUpdatePayloadSize:
+    return
   let req = cast[ptr MmTimUpdatePayload](param)
   let aid = req.aid
   let setFlag = req.setFlag
   let vifIdx = req.vifIdx
+  if vifIdx >= MAX_VIFS.uint8 or aid > MAX_AID.uint16:
+    return
   let vif = vifChannelForIdx(vifIdx)
+  if vif.vifType != VIF_TYPE_AP or vif.beaconEnabled == 0:
+    return
   let bitmapBase = cast[uint](addr txl_tim_bitmap_pool[0])
   let timDesc = timDescView()
   let timIe = timIeAt(addr txl_tim_ie_pool[0])
-  let timIeBase = cast[uint](addr txl_tim_ie_pool[0])
   if aid == 0:
     # DTIM (multicast) bit at vif+330 (0x14a)
     if setFlag != 0:
@@ -650,7 +798,7 @@ proc mm_tim_update_proceed*(param: pointer) {.exportc, cdecl, noinline.} =
         timIe.ie.len = (timLen - 2).uint8
         timIe.bitmapControl = newMin
         timDesc.payloadEnd = cast[pointer](addr timIe.bitmapControl)
-        timDesc.next = cast[pointer](timIeBase)
+        timDesc.next = cast[pointer](addr timDesc.bitmapMagic)
     else:
       # Clear bit
       if wasSet:
@@ -662,18 +810,20 @@ proc mm_tim_update_proceed*(param: pointer) {.exportc, cdecl, noinline.} =
           # All clear: reset TIM fields
           vif.timLength = 6  # tim_len = 6
           vif.timMin = 0xFF'u8
-          vif.timMax = 0xFF'u8
+          vif.timMax = 0
           timIe.ie.len = 4  # partial bitmap len
           timIe.bitmapControl = 0
+          timIe.partialBitmap[0] = 0
           timDesc.payloadEnd = cast[pointer](addr timIe.partialBitmap[0])
-          timDesc.next = cast[pointer](addr txl_bcn_end_desc[0])
+          timDesc.next = timDesc.bitmapNext
+          timDesc.bitmapStart = cast[pointer](bitmapBase)
           timDesc.bitmapEnd = cast[pointer](bitmapBase)
-      else:
+        else:
           # Adjust min: scan upward for first non-zero byte
           var curMin = vif.timMin
           let alignedByte = (timBitmapByteOffset and 0xFE'u).uint8
           if curMin == alignedByte:
-            while curMin < 251:
+            while curMin < (MAX_AID shr 3).uint8:
               if cast[ptr uint8](bitmapBase + curMin.uint)[] != 0:
                 break
               curMin = curMin + 1
@@ -696,13 +846,8 @@ proc mm_tim_update_proceed*(param: pointer) {.exportc, cdecl, noinline.} =
           vif.timLength = timLen
           timIe.ie.len = (timLen - 2).uint8
           timIe.bitmapControl = finalMin
-  # Send MM_TIM_UPDATE_DONE basic message
-  let srcId = keMsgHdrFromPayload(param).srcId
-  ke_msg_send_basic(0x30, srcId, 0)
-  # Free the original message
-  ke_msg_free(keMsgHdrFromPayload(param))
 
-proc mm_connection_loss_ind_handler*(param: pointer) {.exportc, cdecl.} =
+proc mm_connection_loss_ind_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
   ## Handle connection loss indication (116 bytes in blob, sm_task.o).
   ## Blob: ke_state_get(SM), check VIF type/active, ke_state_set(SM,10),
   ## sm_connection_tlv_set, sm_disconnect_process(vif, reason, 0xFFFF).
@@ -711,13 +856,13 @@ proc mm_connection_loss_ind_handler*(param: pointer) {.exportc, cdecl.} =
   # Check SM state (blob: ke_state_get(TASK_SM))
   let smState = ke_state_get(TASK_SM)
   if smState != SmIdleState:
-    return  # SM not idle, can't process disconnect
+    return KeMsgSaved
 
   let vif = vifChannelForIdx(ind.vifIdx)
   if vif.vifType != 0:
-    return  # not STA type
+    return 0  # not STA type
   if vif.state == 0:
-    return  # not active
+    return 0  # not active
 
   # Set SM state to disconnecting.
   ke_state_set(TASK_SM, SmDisconnectingState)
@@ -727,37 +872,24 @@ proc mm_connection_loss_ind_handler*(param: pointer) {.exportc, cdecl.} =
 
   # Process disconnect (blob: sm_disconnect_process(vifEntry, reason, 0xFFFF))
   sm_disconnect_process(cast[pointer](vif), ind.reason, 0xFFFF'u16)
+  return 0
 
-proc mm_bss_param_setting_handler*(param: pointer) {.exportc, cdecl.} =
+proc mm_bss_param_setting_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
   ## Handle STA BSS parameter-setting confirmations.
-  let smListPtr = addr smEnvView().pendingBssParams
-  let smState = ke_state_get(TASK_SM)
-  let hdr = keMsgHdrFromPayload(param)
-  nimFwTrace2U32("[WIFI-NIMFW] bss_cfm_sm ",
-                 smState.uint32 or (hdr.id.uint32 shl 16),
-                 cast[uint32](cast[uint](smListPtr.first)))
-  if smState == SmSettingBssState:
+  if smBssConsumeReply(param):
     sm_send_next_bss_param(param)
-    return
-  if smState == SmIdleState and smListPtr.first != nil:
-    ke_state_set(TASK_SM, SmSettingBssState)
-    sm_send_next_bss_param(param)
-    return
-  if smState != SmIdleState and smState != SmDisconnectingState:
-    # SM-copy invariant guard (blob sm_task.o line 265 assert_err).
-    assert_err("sm_task.c", "sm_task.c", 265)
-  return
+  return 0
 
-proc mm_bss_param_setting_handler_apm*(param: pointer) {.exportc, cdecl.} =
+proc mm_bss_param_setting_handler_apm*(param: pointer): cint {.exportc, cdecl, discardable.} =
   ## Handle AP BSS parameter-setting confirmations.
-  let apmState = ke_state_get(TASK_APM)
-  if apmState == 1:
-    apm_send_next_bss_param(param)
-    return
-  if apmState != 0:
-    # APM-copy invariant guard (blob apm_task.o line 265 assert_err).
-    assert_err("apm_task.c", "apm_task.c", 265)
-  return
+  if apmConsumeStartReply(param):
+    if apmRollbackActive:
+      apmContinueStartRollback()
+    elif ke_state_get(TASK_APM) == ApmActiveState:
+      apm_send_next_bss_param(param)
+    else:
+      apm_start_cfm(cast[pointer](1'u))
+  return KeMsgConsumed
 
 proc mm_force_idle_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle force-idle request — 120 bytes / 30 instrs in blob mm_task.o.
@@ -776,12 +908,20 @@ proc mm_force_idle_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Previous Nim inserted a ke_msg_alloc + ke_msg_send MM_FORCE_IDLE_CFM
   ## at the state==0 path that the blob never issues. The blob's "status"
   ## is returned only via the callback (s0 return value is 0 on success).
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if param == nil or keMsgHdrFromPayload(param).paramLen < 4 or
+      not chanSwitchAdmit(param): return KeMsgConsumed
   let state = ke_state_get(TASK_MM)
   if state == MM_IDLE.uint16:
     let hwState = regRead(MACHW_STATE_CNTRL_REG) and 0xF'u32
+    if not chanSwitchAdmit(param): return KeMsgConsumed
     if hwState != 0:
       assert_err("mm_task.c", "mm_task.c", 1013)
+      return KeMsgConsumed
     ke_state_set(TASK_MM, HW_ACTIVE.uint16)
+    if not chanSwitchAdmit(param): return KeMsgConsumed
+    if chanSwitchInvoke(param): return KeMsgConsumed
     let callbackPtr = cast[ptr pointer](param)[]
     if callbackPtr != nil:
       cast[proc() {.cdecl.}](callbackPtr)()
@@ -790,40 +930,34 @@ proc mm_force_idle_req_handler*(param: pointer): cint {.exportc, cdecl.} =
     return KeMsgSaved
   else:
     hal_machw_idle_req()
+    if not chanSwitchAdmit(param): return KeMsgConsumed
     ke_state_set(TASK_MM, MM_GOING_TO_IDLE)
+    if not chanSwitchAdmit(param): return KeMsgConsumed
     return KeMsgSaved
 
-proc mm_remain_on_channel_req_handler*(param: pointer) {.exportc, cdecl.} =
-  ## Handle MM_REMAIN_ON_CHANNEL_REQ.
-  ## Blob ABI: (a0=msgId, a1=dest, a2=param, a3=src).
-  ## Blob algorithm:
-  ##   ret = chan_roc_req(param, src)         ; a0=param, a1=src
-  ##   if src != 0:
-  ##     cfm = ke_msg_alloc(MM_REMAIN_ON_CHANNEL_CFM=53, dest=3, src=src, 3)
-  ##     *(u8*)cfm       = param[0]           ; vifIdx from request
-  ##     *(u8*)(cfm+1)   = ret                ; chan_roc_req status
-  ##     *(u8*)(cfm+2)   = 4                  ; type tag
-  ##     ke_msg_send(cfm)
-  ##   return 0
-  ## Prior Nim bug: called phy_set_channel and mm_timer_set directly,
-  ## bypassing chan_roc_req's validation and slot bookkeeping — the blob
-  ## never touches the PHY here, it just posts a channel-manager request.
+proc mm_remain_on_channel_req_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
+  ## Return the ROC status to the original sender with operation and slot ID.
+  if param == nil: return KeMsgConsumed
+  if not chanBcnRequestAdmit(param): return KeMsgConsumed
   let hdr = keMsgHdrFromPayload(param)
-  let src = hdr.srcId.uint32
-  chan_roc_req(param)
+  if hdr.paramLen < MmRemainOnChannelReqPayloadSize: return KeMsgConsumed
+  let src = hdr.srcId
+  let dest = hdr.destId
+  let operation = mmRemainOnChannelReqView(param).opCode
+  let status = chan_roc_req(param, src)
   if src == 0:
-    return
-  # Blob message layout is 3 bytes: [vif_idx, roc_status, type=4].
+    return KeMsgConsumed
   let cfm = cast[ptr MmRemainOnChannelCfmPayload](
-    ke_msg_alloc(MM_REMAIN_ON_CHANNEL_CFM, 3'u8, src.uint8,
+    ke_msg_alloc(MM_REMAIN_ON_CHANNEL_CFM, src, dest,
                  MmRemainOnChannelCfmPayloadSize))
   if cfm != nil:
-    cfm.vifIdx = mmRemainOnChannelReqView(param).vifIdx
-    cfm.status = 0'u8  # chan_roc_req return
-    cfm.reqType = 4'u8
+    cfm.opCode = operation
+    cfm.status = status
+    cfm.ctxtIdx = 4
     ke_msg_send(cfm)
+  return KeMsgConsumed
 
-proc mm_monitor_enable_req_handler*(param: pointer) {.exportc, cdecl.} =
+proc mm_monitor_enable_req_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
   ## Handle monitor mode enable request (198 bytes in blob, 48 instrs).
   ## From blob: allocates MM_MONITOR_CFM (id=71, 40 bytes). Fills payload with
   ## debug magic values (0x11111111..0x77777777). Copies channel band from req.
@@ -854,8 +988,9 @@ proc mm_monitor_enable_req_handler*(param: pointer) {.exportc, cdecl.} =
     # Mark success and send
     cfm.status = 0'u32
     ke_msg_send(cfm)
+  return 0
 
-proc mm_monitor_channel_req_handler*(param: pointer) {.exportc, cdecl.} =
+proc mm_monitor_channel_req_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
   ## Handle monitor channel request (162 bytes in blob, ~42 instrs).
   ## From blob (mm_task.o): Nearly identical to mm_monitor_enable_req_handler.
   ## Allocs MM_MONITOR_CHANNEL_CFM (id=73, 40 bytes). Fills payload with
@@ -884,6 +1019,7 @@ proc mm_monitor_channel_req_handler*(param: pointer) {.exportc, cdecl.} =
     # Mark success and send
     cfm.status = 0'u32
     ke_msg_send(cfm)
+  return 0
 
 proc scanChannelRxFilterBits*(passiveFlag: uint8): uint32 {.inline.} =
   if (passiveFlag and 1) == 0:
@@ -956,8 +1092,14 @@ proc scanChannelSequenceDone*(chanIdx, totalChans, abortFlag: uint8): bool {.inl
   chanIdx >= totalChans or abortFlag != 0
 
 proc releaseCompletedScanRequest*(scanParam: pointer) {.inline.} =
-  ke_msg_free(keMsgHdrFromPayload(scanParam))
+  let saved = irqSave()
+  if scan_env.paramPtr != scanParam:
+    irqRestore(saved)
+    return
+  inc scanRequestEpoch
   scan_env.paramPtr = nil
+  irqRestore(saved)
+  ke_msg_free(keMsgHdrFromPayload(scanParam))
 
 proc sendScanDoneIndication*() {.inline.} =
   ke_msg_send_basic(SCAN_DONE_IND, scan_env.requester, TASK_SCAN)
@@ -1028,6 +1170,9 @@ proc cacheScanStartDurations*(scanReq: ptr ScanStartReqPayload) {.inline.} =
   scan_env.activeDuration = duration
 
 proc cacheScanStartContext*(param: pointer, requester: uint8) {.inline.} =
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  inc scanRequestEpoch
   scan_env.channelIndex = 0
   scan_env.requester = requester
   scan_env.paramPtr = param
@@ -1049,21 +1194,37 @@ proc cacheScanuStartRequest*(
     param: pointer,
     req: ptr ScanuStartReqPayload,
     requester: uint8
-) {.inline.} =
+): uint32 {.inline.} =
   # Invariant (post idle-guard): paramPtr is nil here because scanu_confirm nil'd
   # it at the previous op's completion. A non-nil, different value means an
   # overlap slipped past the guard -> free the abandoned block so it can never
   # dangle, and flag it (nimFwDbgScanuParamOverwrite MUST stay 0 after the fix).
-  if scanu_env.paramPtr != nil and scanu_env.paramPtr != param:
+  let previousProducer = scanuProducerRequest
+  let previousProducerEpoch = scanuProducerEpoch
+  defer:
+    scanuProducerRequest = previousProducer
+    scanuProducerEpoch = previousProducerEpoch
+  var abandoned: pointer
+  block:
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    if scanu_env.paramPtr != param:
+      abandoned = scanu_env.paramPtr
+    inc scanuRequestEpoch
+    result = scanuRequestEpoch
+    scanuProducerRequest = param
+    scanuProducerEpoch = result
+    scanu_env.paramPtr = param
+    scanu_env.bssidFilterEnabled = 0
+    scanu_env.scanBand = 0
+    scanu_env.resultState = 0
+    scanu_env.directedFound = 0
+    scanu_env.requester = requester
+    scanu_env.filterBssid = req.bssid
+    ke_state_set(TASK_SCANU, ScanuScanningState)
+  if abandoned != nil:
     inc nimFwDbgScanuParamOverwrite
-    ke_msg_free(keMsgHdrFromPayload(scanu_env.paramPtr))
-  scanu_env.paramPtr = param
-  scanu_env.bssidFilterEnabled = 0
-  scanu_env.scanBand = 0
-  scanu_env.resultState = 0
-  scanu_env.directedFound = 0
-  scanu_env.requester = requester
-  scanu_env.filterBssid = req.bssid
+    ke_msg_free(keMsgHdrFromPayload(abandoned))
 
 proc scan_start_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle SCAN_START_REQ (170 bytes in blob, 45 instrs).
@@ -1075,6 +1236,8 @@ proc scan_start_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   let reqHdr = keMsgHdrFromPayload(param)
   let cfm = ke_msg_alloc(SCAN_START_CFM, reqHdr.srcId, TASK_SCAN,
                          StatusCfmPayloadSize)
+  if cfm == nil:
+    return KeMsgConsumed
   let scanState = ke_state_get(TASK_SCAN)
   var cfmStatus = SCAN_STATUS_OK
   var doDownload = true
@@ -1114,27 +1277,36 @@ proc scan_done_ind_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## scanu_env+0xac, sends SCANU_JOIN_CFM and clears cached scan results.
   ## Otherwise it advances the band/phase byte at +0xb5 and lets
   ## scanu_scan_next either start the next phase or issue SCANU_START_CFM.
-  let joinFlag = scanu_env.bssidFilterEnabled
-  let pendingJoinRxuMgtInd = scanu_env.pendingJoinRxuMgtInd
-  if joinFlag == 0 or pendingJoinRxuMgtInd == nil:
+  var completedJoin = false
+  var completedRequest: pointer
+  var reqSrcId: uint8
+  var retired: array[SCANU_MAX_RESULT_ENTRIES, pointer]
+  # Request and cache ownership move together before the task becomes idle.
+  block:
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    if scanu_env.bssidFilterEnabled != 0 and scanu_env.pendingJoinRxuMgtInd != nil:
+      completedJoin = true
+      completedRequest = scanu_env.paramPtr
+      reqSrcId = scanu_env.requester
+      retired = scanuDetachCachedScanResults()
+      inc scanuRequestEpoch
+      scanu_env.paramPtr = nil
+      scanu_env.pendingJoinRxuMgtInd = nil
+      ke_state_set(TASK_SCANU, ScanuIdleState)
+  if not completedJoin:
     advanceScanuScanBand()
     return KeMsgConsumed
-
-  scanu_env.pendingJoinRxuMgtInd = nil
-  let reqSrcId = scanu_env.requester
+  for frame in retired:
+    ke_msg_free_payload(frame)
   let msg = cast[ptr StatusCfmPayload](
-    ke_msg_alloc(SCANU_JOIN_CFM, reqSrcId, TASK_SCANU,
-                 StatusCfmPayloadSize))
+    smScanCompletionAlloc(completedRequest, SCANU_JOIN_CFM, reqSrcId))
   if msg != nil:
     msg.status = 0
-  let scanParams = scanu_env.paramPtr
-  if scanParams != nil:
-    ke_msg_free(keMsgHdrFromPayload(scanParams))
-    scanu_env.paramPtr = nil
-  scanu_cached_scanresult_clear()
+  if completedRequest != nil:
+    ke_msg_free(keMsgHdrFromPayload(completedRequest))
   if msg != nil:
     ke_msg_send(msg)
-  ke_state_set(TASK_SCANU, ScanuIdleState)
   return KeMsgConsumed
 
 proc scan_cancel_req_handler*(param: pointer): cint {.exportc, cdecl.} =
@@ -1185,9 +1357,7 @@ proc scan_probe_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   if not scanTaskInChannelRunningState():
     return KeMsgConsumed
   sendPeriodicScanProbeRequest()
-  # Blob's final log call is only on ret!=0 path; since our scan_probe_req_tx
-  # returns void we skip the conditional log. Semantically equivalent: the
-  # absent log does not affect RF state or pending scan bookkeeping.
+  # The periodic path does not use the vendor's diagnostic status byte.
   return KeMsgConsumed
 
 # --- SCANU Task Handlers (scanu_task.o) ---
@@ -1202,6 +1372,9 @@ proc scanu_start_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ##   5. Copy 6 bytes from param+286 (BSSID filter) into scanu_env+182
   ##   6. Tail-call scanu_start(), returns KeMsgNoFree
   if param == nil: return KeMsgConsumed
+  if not smScanAdmitRequest(param): return KeMsgConsumed
+  let saved = irqSave()
+  defer: irqRestore(saved)
   # Upper scanu owns a SINGLE scanu_env.paramPtr slot. If a new SCANU_START_REQ
   # arrives while a scan/join is still in flight (state != idle), overwriting
   # paramPtr abandons the in-flight ke_msg and makes scanu_confirm's real free
@@ -1212,15 +1385,20 @@ proc scanu_start_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   # lost that guard. Reject the overlap; the dispatcher frees the req (:809), so
   # no leak. The host re-issues the scan once scanu returns to idle.
   if ke_state_get(TASK_SCANU) != ScanuIdleState:
+    if smScanOwnsRequest(param): return KeMsgSaved
     return KeMsgConsumed
   let req = scanuStartReqView(param)
   let reqHdr = keMsgHdrFromPayload(param)
-  cacheScanuStartRequest(param, req, reqHdr.srcId)
-  scanu_start(param)
+  let epoch = cacheScanuStartRequest(param, req, reqHdr.srcId)
+  if scanuRequestCurrent(param, epoch):
+    scanu_start(param)
   return KeMsgNoFree
 
-{.emit: "__attribute__((optimize(\"crossjumping\"))) void scanu_start_cfm_handler(void*);".}
-proc scanu_start_cfm_handler*(param: pointer) {.exportc, cdecl.} =
+{.emit: "__attribute__((optimize(\"crossjumping\"))) int scanu_start_cfm_handler(void*);".}
+proc scanu_start_cfm_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if not smScanAcceptReply(param, SCANU_START_CFM): return KeMsgConsumed
   ## Handle SCANU_START_CFM: upper scan complete (164 bytes in blob, 42 instrs).
   ## From blob (scanu_task.o):
   ##   1. Load sm_env[0] (connect info ptr) into s1
@@ -1234,6 +1412,10 @@ proc scanu_start_cfm_handler*(param: pointer) {.exportc, cdecl.} =
   ##      - If either null: sm_connect_ind(12, 0xFFFF) (no BSS found)
   let stationManager = smEnvView()
   let connectInfoPtr = stationManager.connectInfo
+  let owner = smTxCapture(connectInfoPtr)
+  let indication = stationManager.connectIndMsg
+  template current(): bool = smScanOwnerCurrent(owner, indication)
+  if not current(): return KeMsgConsumed
   let connectInfo = connectInfoView(connectInfoPtr)
 
   # Assert SM state is 1 (scanning)
@@ -1245,6 +1427,7 @@ proc scanu_start_cfm_handler*(param: pointer) {.exportc, cdecl.} =
   # Get VIF entry (blob: vif_mgmt_get_vif at 0x46, not scanu_confirm)
   let vifIdx = connectInfo.vifIdx
   let vifEntry = vif_mgmt_get_vif(vifIdx)
+  if not current(): return KeMsgConsumed
   # Prevent the compiler from eliding the call when the result is unused.
   {.emit: ["""__asm__ volatile("" : : "r"(""", vifEntry, """));"""].}
 
@@ -1252,6 +1435,7 @@ proc scanu_start_cfm_handler*(param: pointer) {.exportc, cdecl.} =
   var selectedBssResult: pointer = nil
   var selectedBssChannel: pointer = nil
   discard sm_get_bss_params(addr selectedBssResult, addr selectedBssChannel)
+  if not current(): return KeMsgConsumed
 
   # Check cancel flag
   if stationManager.cancelRequested != 0:
@@ -1266,6 +1450,7 @@ proc scanu_start_cfm_handler*(param: pointer) {.exportc, cdecl.} =
   else:
     # No BSS found
     sm_connect_ind(WLAN_FW_SCAN_NO_BSSID_AND_CHANNEL.uint16, 0xFFFF'u16)
+  return 0
 
 proc scanu_join_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle SCANU_JOIN_REQ: scan for specific BSS to join (228 bytes in blob).
@@ -1283,24 +1468,40 @@ proc scanu_join_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ##      call scanu_confirm, clear link, send SCANU_JOIN_CFM
   ##  11. If fails: call scanu_confirm(fail)
   if param == nil: return KeMsgConsumed
+  if not smScanAdmitRequest(param): return KeMsgConsumed
+  let saved = irqSave()
+  defer: irqRestore(saved)
   # Same single-paramPtr-slot hazard as scanu_start_req_handler: reject an
   # overlapping join rather than clobbering scanu_env.paramPtr (which would make
   # scanu_confirm free a still-live ke_msg -> shared-heap UAF -> nimIncRef).
   if ke_state_get(TASK_SCANU) != ScanuIdleState:
+    if smScanOwnsRequest(param): return KeMsgSaved
     return KeMsgConsumed
   let req = scanuStartReqView(param)
   let vifIdx = req.vifIdx
+  if vifIdx >= MAX_VIFS.uint8:
+    return KeMsgConsumed
   let vif = vifChannelForIdx(vifIdx)
   let reqHdr = keMsgHdrFromPayload(param)
 
   # Store param pointer in scanu_env
+  let previousProducer = scanuProducerRequest
+  let previousProducerEpoch = scanuProducerEpoch
+  defer:
+    scanuProducerRequest = previousProducer
+    scanuProducerEpoch = previousProducerEpoch
+  inc scanuRequestEpoch
+  let epoch = scanuRequestEpoch
   scanu_env.paramPtr = param
+  scanuProducerRequest = param
+  scanuProducerEpoch = epoch
 
   # Store requester source task and set flags
   scanu_env.requester = reqHdr.srcId
   vifApConfig(vif).securityFlags = 0
   scanu_env.bssidFilterEnabled = 1
   scanu_env.scanBand = 0
+  ke_state_set(TASK_SCANU, ScanuJoiningState)
 
   # Copy BSSID from param+286 (6 bytes) to scanu_env filter area. Blob has
   # a single memcpy here — previous Nim had it duplicated (once before and
@@ -1313,13 +1514,15 @@ proc scanu_join_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   scanu_env.directedFound = 0
   scanu_env.joinRetryCount = 0x0A'u8
 
-  # Check scan type bit
+  # A join target must be unicast; the Nim assertion path is not fatal.
   if (req.bssid[0] and 1) != 0:
-    # Blob uses assert_err (not assert_rec) here.
-    assert_err(cast[cstring](0), cast[cstring](0), 191)
+    scanu_confirm(SCAN_STATUS_BAD_PARAM)
+    return KeMsgNoFree
 
   # Search for BSSID in existing scan results (blob: scanu_search_by_bssid)
   let existing = scanu_search_by_bssid(addr req.bssid[0])
+  if not scanuRequestCurrent(param, epoch):
+    return KeMsgNoFree
 
   # If found existing result, build message and forward via ke_msg_send
   if existing != nil:
@@ -1328,21 +1531,28 @@ proc scanu_join_req_handler*(param: pointer): cint {.exportc, cdecl.} =
     if cachedRxuMgtInd != nil:
       ke_state_set(TASK_SCANU, ScanuScanningState)
       scanu_env.pendingJoinRxuMgtInd = cachedRxuMgtInd
-      ke_msg_send(cachedRxuMgtInd)
       existingEntry.cachedRxuMgtInd = nil
       req.flags = 0
-      ke_msg_send_basic(SCAN_DONE_IND, TASK_SCANU, TASK_SCANU)
+      ke_msg_send(cachedRxuMgtInd)
+      if scanuRequestCurrent(param, epoch):
+        ke_msg_send_basic(SCAN_DONE_IND, TASK_SCANU, TASK_SCANU)
       return 1
 
   # Start scan (blob: scanu_start → ke_msg_send_basic + scanu_scan_next)
+  scanuProducerRequest = previousProducer
+  scanuProducerEpoch = previousProducerEpoch
   scanu_start(param)
 
   # Scan started, set state
-  ke_state_set(TASK_SCANU, ScanuJoiningState)
+  if scanuRequestCurrent(param, epoch):
+    ke_state_set(TASK_SCANU, ScanuJoiningState)
   return 1
 
-{.emit: "__attribute__((optimize(\"crossjumping\"))) void scanu_join_cfm_handler(void*);".}
-proc scanu_join_cfm_handler*(param: pointer) {.exportc, cdecl.} =
+{.emit: "__attribute__((optimize(\"crossjumping\"))) int scanu_join_cfm_handler(void*);".}
+proc scanu_join_cfm_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if not smScanAcceptReply(param, SCANU_JOIN_CFM): return KeMsgConsumed
   ## Handle SCANU_JOIN_CFM (434 bytes in blob, 106 instrs).
   ## From blob (scanu_task.o): Assert state==2 (SM_JOINING). If sm_env.canceled(18):
   ## clear flag, sm_connect_ind(25, 0xFFFF). Else: get vif_idx from sm_env_ptr[59].
@@ -1351,15 +1561,16 @@ proc scanu_join_cfm_handler*(param: pointer) {.exportc, cdecl.} =
   ## ke_msg_send, ke_state_set(SM,3). Copy connection flags to vif[1496].
   ## If bit31 not set: check sm_env[16] flag for sm_join_bss path, else
   ## sm_connect_ind with various error codes (13,14,17,18).
-  let state = ke_state_get(TASK_SM)
-  if state != SmWaitingState:
-    assert_err("sm_task.c", "sm_task.c", 445)
   let sm = smEnvView()
+  var owner = smTxCapture(sm.connectInfo)
+  let indication = sm.connectIndMsg
+  template current(): bool = smScanOwnerCurrent(owner, indication)
+  if not current() or owner.state != SmWaitingState: return KeMsgConsumed
   # Check cancelled flag
   if sm.cancelRequested != 0:
     sm.cancelRequested = 0
     sm_connect_ind(25, 0xFFFF'u16)
-    return
+    return 0
   # Get VIF info
   let connectInfoPtr = sm.connectInfo
   let connectInfo = connectInfoView(connectInfoPtr)
@@ -1368,52 +1579,57 @@ proc scanu_join_cfm_handler*(param: pointer) {.exportc, cdecl.} =
   let apConfig = vifApConfig(vif)
   let securityFlagsSigned = cast[int32](apConfig.securityFlags)
   if securityFlagsSigned < 0:  # bit31 set (has channel context to add)
-    # Add channel context — blob: non-zero return means failure
-    var chanIdx: uint8
-    let addStatus = sm_add_chan_ctx(cast[pointer](addr chanIdx))
-    if addStatus != 0:
-      # Blob emits a distinct sm_connect_ind(13,0xFFFF) here that falls
-      # through to the flag-copy path.
+    # Snapshot the registration fields before allocation or channel callbacks.
+    var prepared = MmStaAddReqPayload(vifIdx: vifIdx, bssid: vif.bssid)
+    var preparedChannel: ChanCtxtDefView
+    if not smPrepareChannelContext(owner.connection, preparedChannel):
       sm_connect_ind(13, 0xFFFF'u16)
-    else:
-      let msg = cast[ptr MmStaAddReqPayload](
-        ke_msg_alloc(MM_STA_ADD_REQ, TASK_MM, TASK_SM,
-                     MmStaAddReqPayloadSize))
-      if msg != nil:
-        # Link channel context
-        chan_ctxt_link(chanIdx, vifIdx)
-        # Copy BSSID (6 bytes from vif+380)
-        msg.vifIdx = vifIdx
-        discard c_memcpy(addr msg.bssid[0], addr vif.bssid[0],
-                         msg.bssid.len.csize_t)
-        inc nimFwDbgPreauthStaReq
-        nimFwDbgPreauthStaReqMeta =
-          vifIdx.uint32 or (vif.staIdx.uint32 shl 8) or
-          (chanIdx.uint32 shl 16) or (ke_state_get(TASK_SM).uint32 shl 24)
-        nimFwDbgPreauthStaReqBssid0 = cast[ptr uint32](addr msg.bssid[0])[]
-        nimFwDbgPreauthStaReqBssid1 = cast[ptr uint16](addr msg.bssid[4])[].uint32
-        # Set HT rate mask from vif flags
-        let apSecurityFlags = apConfig.securityFlags
-        if (apSecurityFlags and 2) != 0:
-          let htCap = vifHtCapabilities(vif).ampduParams
-          let nss = htCap and 3
-          let rateMask = (1'u16 shl (nss + 13)) - 1
-          msg.rateMask = rateMask
-          let bwEncode = if htCap <= 2: 1'u8 else: (1'u8 shl (htCap - 3)) and 0xFF
-          msg.bw = bwEncode
-        msg.compatWord0 = 0
-        # This byte is later copied into wifi_connect_parm_t.quick_conn.
-        # sm_env+19 holds connection flags, not the quick-connect setting.
-        msg.quickConn = 0
-        ke_msg_send(msg)
-      ke_state_set(TASK_SM, SmAddingChanState)
-    # Copy connection flags to vif[1496]
+      return KeMsgConsumed
+    let apSecurityFlags = apConfig.securityFlags
+    if (apSecurityFlags and 2) != 0:
+      let htCap = vifHtCapabilities(vif).ampduParams
+      mmStaFillAggregation(prepared, htCap)
     let connectFlags = connectInfo.channelDuration
+    var msg = cast[ptr MmStaAddReqPayload](
+      smRegistrationAllocate(owner, indication))
+    var channel: ChanCtxtLease
+    defer:
+      if msg != nil: ke_msg_free(keMsgHdrFromPayload(msg))
+      chanLeaseRelease(channel)
+    if not current(): return KeMsgConsumed
+    if msg == nil:
+      sm_connect_ind(WLAN_FW_JOIN_NETWORK_FAILURE.uint16, 0xFFFF)
+      return KeMsgConsumed
+    var chanIdx = 0xFF'u8
+    let addStatus = smAddPreparedChannelContext(preparedChannel, addr chanIdx, addr channel)
+    if not current(): return KeMsgConsumed
+    if addStatus != 0:
+      sm_connect_ind(13, 0xFFFF'u16)
+      return KeMsgConsumed
+    msg[] = prepared
+    if not chanLeaseLink(channel, vifIdx):
+      if current(): sm_connect_ind(13, 0xFFFF'u16)
+      return KeMsgConsumed
+    if not current(): return KeMsgConsumed
+    if not smRegistrationOwnChannel(msg, channel): return KeMsgConsumed
+
+    inc nimFwDbgPreauthStaReq
+    nimFwDbgPreauthStaReqMeta =
+      vifIdx.uint32 or (vif.staIdx.uint32 shl 8) or
+      (chanIdx.uint32 shl 16) or (owner.state.uint32 shl 24)
+    nimFwDbgPreauthStaReqBssid0 = cast[ptr uint32](addr msg.bssid[0])[]
+    nimFwDbgPreauthStaReqBssid1 = cast[ptr uint16](addr msg.bssid[4])[].uint32
     vifKeyPointers(vif).flags = connectFlags
     if (connectFlags and 4) != 0:
       var clearedSecurityFlags = apConfig.securityFlags
       clearedSecurityFlags = clearedSecurityFlags and (not 7'u32)  # Clear bits 0-2
       apConfig.securityFlags = clearedSecurityFlags
+    if not smTxSetOwnerState(owner, SmAddingChanState) or not current():
+      return KeMsgConsumed
+    if not smRegistrationPublish(msg): return KeMsgConsumed
+    let outgoing = msg
+    msg = nil
+    ke_msg_send(outgoing)
   else:
     # No channel context to add
     if sm.joinBssFlag != 0:
@@ -1428,44 +1644,33 @@ proc scanu_join_cfm_handler*(param: pointer) {.exportc, cdecl.} =
         sm_connect_ind(18, 0xFFFF'u16)
       else:
         sm_connect_ind(14, 0xFFFF'u16)
+  return 0
 
-proc scanu_raw_send_req_handler*(param: pointer) {.exportc, cdecl.} =
-  ## Handle SCANU_RAW_SEND_REQ: send raw management frame (71 instrs in blob).
-  ## From blob (scanu_task.o): loads scanu_env function pointer, calls platform
-  ## log with frame data. Allocates 512-byte TX buffer via ke_msg_alloc.
-  ## If alloc succeeds and frame length <= 511, copies frame data to TX buffer
-  ## descriptor payload area (offset 348=0x15C), clears TX descriptor fields
-  ## (bytes 47, 49, 98, 100), sets up HW descriptor (offsets 80, 84), programs
-  ## frame length into HW desc (offsets 24, 28), calls txl_frame_push(desc, 3).
-  ## If frame too large, logs error. Returns 0.
-  if param == nil: return
+proc scanu_raw_send_req_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
+  ## Acknowledge the raw-send request, copy it into an internal TX frame,
+  ## and force-push on AC 3, as in scanu_task.o. Reject invalid lengths before
+  ## allocation: an unqueued descriptor has no later completion to release it.
+  if param == nil: return 0
   let srcId = keMsgHdrFromPayload(param).srcId
   let req = cast[ptr ScanuRawSendReqPayload](param)
   let framePtr = req.framePtr
   let frameLen = req.frameLen
-  # Log the raw send request via g_bl_ops_funcs[1] (NOT scanu_env[4]).
   let logFnPtr = blOpsFunc(4)
   if logFnPtr != nil:
-    let logFn = cast[proc(s: pointer, a: pointer, b: uint32, c: uint32) {.cdecl.}](logFnPtr)
-    logFn(nil, framePtr, frameLen, srcId.uint32)
+    cast[proc(fmt: cstring) {.cdecl, varargs.}](logFnPtr)(
+      "[FW] pkt address is %p, len is %lu\r\n", framePtr, frameLen.culong)
   # Synchronously acknowledge with a NULL-result CFM back to the requester.
   # Blob: `li a0, 0; mv a1, saved_a3; call scanu_raw_send_cfm` immediately
   # after the log call — before frame allocation.
   scanu_raw_send_cfm(nil, srcId)
-  # Allocate TX frame buffer (blob: txl_frame_get, NOT ke_msg_alloc)
+  if framePtr == nil or frameLen == 0 or frameLen > 511:
+    if logFnPtr != nil:
+      cast[proc(fmt: cstring) {.cdecl, varargs.}](logFnPtr)(
+        "[FW] invalid raw frame %p, len is %lu\r\n", framePtr, frameLen.culong)
+    return 0
   let txBuf = txl_frame_get(512)
   if txBuf == nil:
-    return
-  # Check frame length — blob .L34 simply logs the error and jumps to .L33
-  # (common cleanup, which is just register-restore + ret). It does NOT
-  # call txl_frame_release here — the allocated frame is left for the
-  # normal TX-pool recycler. Previous Nim added a txl_frame_release call
-  # that does not match blob behaviour and risks a double-free if the
-  # recycler later walks the abandoned frame.
-  if frameLen > 511:
-    if logFnPtr != nil:
-      cast[proc(a: pointer, b: uint32, c: uint32) {.cdecl.}](logFnPtr)(nil, frameLen, 512)
-    return
+    return 0
   let frameDesc = cast[ptr TxlFrameDescView](txBuf)
   # Copy frame data to the TX descriptor payload area.
   let linkDescPtr = frameDesc.linkDesc
@@ -1489,8 +1694,8 @@ proc scanu_raw_send_req_handler*(param: pointer) {.exportc, cdecl.} =
     hwDesc.payloadEnd = hwDesc.payloadStart + lenMinusOne
   # Push for TX (blob: txl_frame_push_force, not txl_frame_push)
   txl_frame_push_force(txBuf, 3)
-  # NB: blob does NOT call scanu_raw_send_cfm synchronously — the callback
-  # stored at desc+208 is invoked on TX completion.
+  # Request acknowledgement is synchronous; this callback only logs TX status.
+  return 0
 
 # --- SM Task Handlers (sm_task.o) ---
 
@@ -1550,55 +1755,32 @@ proc sm_connect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
     cfmStatus = 8
     earlyExit = true
 
-  let vif = vifChannelForIdx(vifIdx)
+  let vif = if vifIdx < MAX_VIFS.uint8: vifChannelForIdx(vifIdx) else: nil
   if not earlyExit:
-    if vif.vifType != 0:
-      if vif.state != 0:
-        if req.authType != 2:
-          cfmStatus = 9
-          earlyExit = true
+    if vif == nil:
+      cfmStatus = 9
+      earlyExit = true
+    elif (vif.vifType != 0 or vif.state != 0) and req.authType != 2:
+      cfmStatus = 9
+      earlyExit = true
 
   if not earlyExit:
     let sm = smEnvView()
-    # Check STA index is unassigned (0xFF)
-    let staIdx = vif.staIdx
-    if staIdx != 0xFF:
-      if state2 == SmIdleState and sm.connectInfo == nil:
-        let staleChanCtx = vif.chanCtxt
-        if staleChanCtx != nil:
-          chan_ctxt_unlink(vifIdx)
-          vif.chanCtxt = nil
-        vif.staIdx = 0xFF'u8
-        vif.state = 0
-        if vifIdx < 8'u8:
-          nimFwWpaPendingMask = nimFwWpaPendingMask and
-            (not (1'u32 shl vifIdx))
-      else:
-        assert_err("sm_task.c", "sm_task.c", 90)
-
-    # Check no existing channel context
-    let chanCtx = vif.chanCtxt
-    if chanCtx != nil:
-      assert_err("sm_task.c", "sm_task.c", 91)
-
-    # Check no existing connection in sm_connect_env
-    if sm.connectInfo != nil:
-      assert_err("sm_task.c", "sm_task.c", 94)
-    # Retain the request param itself as the connection env (blob design), and
-    # return KeMsgNoFree below so the dispatcher does NOT free it while SM holds
-    # it; SM frees it in sm_connect_ind / sm_delete_resources. Writes to the
-    # connect-info are all within ConnectInfoView (<= offset 62, in-bounds of
-    # the 192-byte param); overlay READS past the param are non-corrupting and
-    # match the blob. The one legal-by-contract write past paramLen (the
-    # null terminator) is kept off the tail canary by KeMsgTailSlack.
-    sm.connectInfo = param
-    sm.connectFlags = (req.channelDuration and 0xFF).uint8
-    if sm.connectIndMsg != nil:
-      assert_err("sm_task.c", "sm_task.c", 99)
-    sm.scanResultIndex = 0xFFFFFFFF'u32
-    sm.vendorIeLen = sm.vendorIeLen and 0x00FF'u16
-
-    sm_connection_tlv_set(vifIdx, param, 0)
+    if sm.connectInfo != nil or sm.connectIndMsg != nil:
+      cfmStatus = 8
+      earlyExit = true
+    elif vif.staIdx != 0xFF or vif.chanCtxt != nil:
+      # Retain the request in the saved queue until normal cleanup finishes.
+      let started = smCleanupBegin(cast[pointer](vif))
+      if started and ke_state_get(TASK_SM) != SmIdleState:
+        return KeMsgSaved
+      if not started or sm.connectInfo != nil or sm.connectIndMsg != nil or
+          vif.staIdx != 0xFF or vif.chanCtxt != nil:
+        cfmStatus = 8
+        earlyExit = true
+      elif (vif.vifType != 0 or vif.state != 0) and req.authType != 2:
+        cfmStatus = 9
+        earlyExit = true
 
   if earlyExit:
     let cfm = cast[ptr StatusCfmPayload](
@@ -1608,43 +1790,111 @@ proc sm_connect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
       ke_msg_send(cfm)
     return KeMsgConsumed
 
-  # Post-CFM success steps (blob: direct join when a target BSSID/channel is
-  # already known, otherwise start a scan using the VIF MAC as the source).
-  # BSS/channel pointers come from the retained param (sm.connectInfo == param);
-  # KeMsgNoFree below keeps it alive past this handler.
-  var selectedBssResult: pointer = nil
-  var selectedBssChannel: pointer = nil
-  if connectInfoHasChannelHint(req) and smConnectReqHasSpecificBssid(req):
-    selectedBssResult = cast[pointer](addr req.bssid[0])
-    selectedBssChannel = connectInfoChannelHint(param)
-  else:
-    discard sm_get_bss_params(addr selectedBssResult, addr selectedBssChannel)
+  let sm = smEnvView()
+  let previousEpoch = rxVifEpochs[vifIdx]
+  let vifType = vif.vifType
+  let vifState = vif.state
+  let connectFlags = (req.channelDuration and 0xFF).uint8
+  template unclaimed(epoch: uint32): bool =
+    rxVifEpochs[vifIdx] == epoch and vif.vifType == vifType and
+      vif.state == vifState and vif.staIdx == 0xFF and vif.chanCtxt == nil and
+      sm.connectInfo == nil and sm.connectIndMsg == nil and
+      ke_state_get(TASK_SM) == SmIdleState
 
-  if selectedBssResult != nil:
-    scanu_prune_scanresult_raw_frames_except_bssid(selectedBssResult)
+  var confirmation = ke_msg_alloc(SM_CONNECT_CFM, TASK_API, TASK_SM, StatusCfmPayloadSize)
+  var indication: pointer
+  defer:
+    if confirmation != nil: ke_msg_free(keMsgHdrFromPayload(confirmation))
+    if indication != nil: ke_msg_free(keMsgHdrFromPayload(indication))
+  template confirm(statusValue: uint8) =
+    let outgoing = confirmation
+    confirmation = nil
+    cast[ptr StatusCfmPayload](outgoing).status = statusValue
+    ke_msg_send(outgoing)
+  if confirmation == nil: return KeMsgConsumed
+  if not unclaimed(previousEpoch):
+    confirm(8'u8)
+    return KeMsgConsumed
+  indication = ke_msg_alloc(SM_CONNECT_IND_MSG, TASK_API, TASK_SM, 860)
+  if indication == nil or not unclaimed(previousEpoch):
+    confirm(8'u8)
+    return KeMsgConsumed
+  discard c_memset(indication, 0, 64.csize_t)
+
+  # Both messages remain private until the VIF has survived allocation and TX retirement.
+  if not rxInvalidateVif(vifIdx):
+    confirm(8'u8)
+    return KeMsgConsumed
+  let epoch = previousEpoch + 1'u32
+  let publishedIndication = indication
+  var published = false
+  block:
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    if unclaimed(epoch):
+      sm.connectInfo = param
+      sm.connectIndMsg = indication
+      indication = nil
+      sm.connectFlags = connectFlags
+      sm.connectModeFlags = 0
+      sm.cancelRequested = 0
+      sm.scanResultIndex = 0xFFFFFFFF'u32
+      sm.vendorIeLen = sm.vendorIeLen and 0x00FF'u16
+      published = true
+  if not published:
+    confirm(8'u8)
+    return KeMsgConsumed
+
+  template current(): bool =
+    rxVifEpochs[vifIdx] == epoch and vif.vifType == vifType and
+      vif.state == vifState and sm.connectInfo == param and
+      sm.connectIndMsg == publishedIndication and ke_state_get(TASK_SM) == SmIdleState
+  sm_connection_tlv_set(vifIdx, param, 0)
+  if not current():
+    confirm(8'u8)
+    return KeMsgNoFree
+
+  var hasBssid, hasChannel, selected: bool
+  var selectedBssid: array[6, uint8]
+  var selectedChannel: ScanChannelEntry
+  var localMac: array[6, uint8]
+  block:
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    if current():
+      var selectedBssResult, selectedBssChannel: pointer
+      if connectInfoHasChannelHint(req) and smConnectReqHasSpecificBssid(req):
+        selectedBssResult = cast[pointer](addr req.bssid[0])
+        selectedBssChannel = connectInfoChannelHint(param)
+      else:
+        discard sm_get_bss_params(addr selectedBssResult, addr selectedBssChannel)
+      if current():
+        hasBssid = selectedBssResult != nil
+        hasChannel = selectedBssChannel != nil
+        if hasBssid: selectedBssid = cast[ptr array[6, uint8]](selectedBssResult)[]
+        if hasChannel: selectedChannel = cast[ptr ScanChannelEntry](selectedBssChannel)[]
+        localMac = vif.macAddr
+        selected = true
+  if not selected:
+    confirm(8'u8)
+    return KeMsgNoFree
+  if hasBssid:
+    scanu_prune_scanresult_raw_frames_except_bssid(addr selectedBssid[0])
   else:
     scanu_prune_scanresult_raw_frames()
-  let connectConfirm = cast[ptr StatusCfmPayload](
-    ke_msg_alloc(SM_CONNECT_CFM, TASK_API, TASK_SM, StatusCfmPayloadSize))
-  if connectConfirm != nil:
-    connectConfirm.status = cfmStatus
-    ke_msg_send(connectConfirm)
+  if not current():
+    confirm(8'u8)
+    return KeMsgNoFree
+  confirm(0'u8)
+  if not current(): return KeMsgNoFree
 
-  let sm = smEnvView()
-  let connectMsg = ke_msg_alloc(SM_CONNECT_IND_MSG, TASK_API, TASK_SM, 860)
-  sm.connectIndMsg = connectMsg
-  if connectMsg != nil:
-    discard c_memset(connectMsg, 0, 64.csize_t)
-
-  let vifMacAddr = cast[pointer](addr vif.macAddr[0])
-  if selectedBssResult != nil and selectedBssChannel != nil and
-      (cast[ptr uint8](selectedBssResult)[] and 1'u8) == 0:
-    sm_join_bss(vifMacAddr, selectedBssResult, selectedBssChannel, 0)
+  let targetBssid = if hasBssid: cast[pointer](addr selectedBssid[0]) else: nil
+  let targetChannel = if hasChannel: cast[pointer](addr selectedChannel) else: nil
+  if hasBssid and hasChannel and (selectedBssid[0] and 1'u8) == 0:
+    sm_join_bss(unsafeAddr localMac[0], targetBssid, targetChannel, 0)
   else:
-    sm_scan_bss(vifMacAddr, selectedBssResult, selectedBssChannel)
-  # SM retains the request as sm.connectInfo; do NOT let the dispatcher free it
-  # (SM frees it later in sm_connect_ind / sm_delete_resources). This is the
-  # blob's balanced ownership.
+    sm_scan_bss(unsafeAddr localMac[0], targetBssid, targetChannel)
+  # The request and indication have transferred to SM, even if a callback retired them.
   return KeMsgNoFree
 
 proc sm_disconnect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
@@ -1661,76 +1911,79 @@ proc sm_disconnect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
     return KeMsgSaved
   sm_connection_tlv_set(0, nil, 0)  # stub (just ret in blob)
   let vifIdx = smReqVifIdxOrZero(param)
-  sm_handle_connection(vifIdx.uint32, 19'u32,
+  sm_handle_connection(vifIdx, 19'u16,
     cast[pointer](sm_disconnect_deauth_cfm),
     cast[pointer](sm_disconnect_process))
   ke_msg_send_basic(SM_DISCONNECT_CFM, TASK_API, TASK_SM)
   return KeMsgConsumed
 
 proc sm_connect_abort_req_handler*(param: pointer): cint {.exportc, cdecl.} =
-  ## Handle SM_CONNECT_ABORT_REQ: abort ongoing connection (198 bytes in blob).
-  ## Blob dispatches on SM state:
-  ##   idle:    send cfm with status=0
-  ##   scan:    set sm_env abort flag, send SCAN_ABORT_REQ, clear scan cache, send cfm
-  ##   waiting: set sm_env abort flag, send cfm
-  ##   3,4:     return 2 (msg requeued)
-  ##   6,8,9:   call sm_handle_connection(abort), clear cfm status, send cfm
-  ##   other:   send cfm with status=state
-  let state = ke_state_get(TASK_SM)
-  let cfm = cast[ptr StatusCfmPayload](
-    ke_msg_alloc(SM_CONNECT_ABORT_CFM, TASK_API, TASK_SM,
-                 StatusCfmPayloadSize))
-  let sm = smEnvView()
-  if state > SmWaitingState and state <= SmSettingBssState:
-    # States 3,4: message will be requeued (return 2)
+  ## Keep saved aborts tied to their first connection, including states 3/4.
+  ## In states 5/7 no frame has been submitted by an owned parked/queued command.
+  let identity = smAbortCapture(param)
+  let initialState = ke_state_get(TASK_SM)
+  if smAbortCurrent(identity) and initialState > SmWaitingState and
+      initialState <= SmSettingBssState:
     return KeMsgSaved
-  elif state == SmScanningState:
-    # Scanning: mark abort, cancel scan, clear cache
-    sm.cancelRequested = state.uint8
-    ke_msg_send_basic(SCAN_ABORT_REQ, TASK_SCAN, TASK_SM)
-    scanu_cached_scanresult_clear()
-    if cfm != nil:
-      cfm.status = state.uint8
-  elif state == SmWaitingState:
-    # Waiting: mark abort flag
-    sm.cancelRequested = 1
-  elif state == SmAuthenticatingState or state == SmAssocRspState or
-      state == SM_ACTIVATING_STATE:
-    # Connected/active: call sm_handle_connection with abort
-    let vifIdx = smReqVifIdxOrZero(param)
-    sm_handle_connection(vifIdx.uint32, 24,
-      cast[pointer](sm_connect_abort_deauth_cfm),
-      cast[pointer](sm_connect_abort_process))
-    if cfm != nil:
-      cfm.status = 0
-  # Send CFM and return 0
-  if cfm != nil:
-    ke_msg_send(cfm)
-  return KeMsgConsumed
+  let cfm = cast[ptr StatusCfmPayload](
+    ke_msg_try_alloc(SM_CONNECT_ABORT_CFM, TASK_API, TASK_SM, StatusCfmPayloadSize))
+  if cfm == nil: return KeMsgSaved
+  cfm.status = if identity.valid: 0'u8 else: 1'u8
+  if smAbortCurrent(identity):
+    let state = ke_state_get(TASK_SM)
+    if state > SmWaitingState and state <= SmSettingBssState:
+      ke_msg_free(keMsgHdrFromPayload(cfm))
+      return KeMsgSaved
+    if state == SmScanningState:
+      smEnvView().cancelRequested = 1
+      cfm.status = 1
+      ke_msg_send_basic(SCAN_ABORT_REQ, TASK_SCAN, TASK_SM)
+      if smAbortCurrent(identity): scanu_cached_scanresult_clear()
+    elif state == SmWaitingState:
+      smEnvView().cancelRequested = 1
+    elif state in [SmAuthStartingState, SmAssociatingState]:
+      let abortable = smDeferredAbortable(identity.vifIndex, state)
+      if smAbortCurrent(identity):
+        if not abortable or ke_state_get(TASK_SM) != state:
+          ke_msg_free(keMsgHdrFromPayload(cfm))
+          return KeMsgSaved
+        sm_connect_ind(WLAN_FW_CONNECT_ABORT_BY_USER_NO_DEAUTH, 3)
+    elif state in [SmAuthenticatingState, SmAssocRspState, SM_ACTIVATING_STATE]:
+      sm_handle_connection(identity.vifIndex, WLAN_FW_CONNECT_ABORT_BY_USER_NO_DEAUTH,
+        cast[pointer](sm_connect_abort_deauth_cfm), cast[pointer](sm_connect_abort_process))
+  ke_msg_send(cfm)
+  KeMsgConsumed
 
-proc sm_rsp_timeout_ind_handler*(param: pointer) {.exportc, cdecl.} =
+proc sm_rsp_timeout_ind_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
   ## Handle SM_RSP_TIMEOUT_IND: auth/assoc response timeout (126 bytes in blob).
   ## Blob: loads sm_env[0] (connection env), ke_state_get(SM), then:
   ##   - If no connection env: return 0
   ##   - State must be in the auth/assoc response window after channel grant
   ##   - Check retry count (conn_env[60]) vs max retries (sm_env word at byte 24)
-  ##   - If retries available: increment, state 5/6 -> wpa_cbs[64]() + sm_auth_send(1,0)
+  ##   - If retries available: increment, retry auth in state 6 or assoc in state 8
   ##   - If retries exhausted: sm_connect_ind(11, 0xFFFF)
+  let timeout = smRspTimeoutCapture(param)
+  if not timeout.captured: return KeMsgConsumed
+  template current(): bool = smRspTimeoutCurrent(timeout)
   let sm = smEnvView()
-  let connEnv = sm.connectInfo
-  let state = ke_state_get(TASK_SM)
+  let connEnv = timeout.owner.connection
+  let state = timeout.owner.state
   inc nimFwDbgSmRspTimeout
   nimFwDbgSmRspTimeoutState = state.uint32
-  nimFwDbgSmRspTimeoutRxCtrl = regRead(MACHW_RX_CNTRL_REG)
+  let rxControl = regRead(MACHW_RX_CNTRL_REG)
+  if not current(): return KeMsgConsumed
+  nimFwDbgSmRspTimeoutRxCtrl = rxControl
   when defined(bl808WifiConnectTrace):
     nimFwTrace2U32("[WIFI-NIMFW] sm_rsp_timeout ",
                    state.uint32, cast[uint32](cast[uint](connEnv)))
+    if not current(): return KeMsgConsumed
     nimFwConnectTrace2U32("[WIFI-CT] sm_rsp_timeout ",
                           state.uint32, cast[uint32](cast[uint](connEnv)))
+    if not current(): return KeMsgConsumed
   if connEnv == nil:
-    return
-  if state != SmAuthStartingState and state != SmAuthenticatingState:
-    return
+    return KeMsgConsumed
+  if state != SmAuthenticatingState and state != SmAssocRspState:
+    return KeMsgConsumed
   when defined(bl808WifiAckDrivenMgmtFallback):
     if nimFwDbgAssocReqSend != 0 and
         (nimFwDbgAssocCfmAckOk16 != 0 or nimFwDbgAssocCfmAckOk23 != 0) and
@@ -1741,271 +1994,142 @@ proc sm_rsp_timeout_ind_handler*(param: pointer) {.exportc, cdecl.} =
         0xB0000000'u32 or (state.uint32 shl 16) or
         ((nimFwDbgAssocCfmAckOk16 + nimFwDbgAssocCfmAckOk23) and 0xFFFF'u32)
       sm_assoc_done(1'u16)
-      return
+      return KeMsgConsumed
   when defined(bl808WifiAckDrivenMgmtFallback):
-    if state == SmAuthStartingState and
+    if state == SmAuthenticatingState and
         (nimFwDbgAuthCfmAckOk16 != 0 or nimFwDbgAuthCfmAckOk23 != 0) and
         nimFwDbgAuthOpenSuccess == 0:
       inc nimFwDbgAckFallbackAuth
       nimFwDbgAckFallbackLast =
         0xA0000000'u32 or (state.uint32 shl 16) or
         ((nimFwDbgAuthCfmAckOk16 + nimFwDbgAuthCfmAckOk23) and 0xFFFF'u32)
-      var fallbackAuth {.noinit.}: SmAuthFrameView
-      discard c_memset(addr fallbackAuth, 0, sizeof(SmAuthFrameView).csize_t)
-      fallbackAuth.frameLen = 38'u16
-      fallbackAuth.authAlgo = 0'u16
-      fallbackAuth.authSeq = 2'u16
-      fallbackAuth.statusCode = 0'u16
-      sm_auth_handler(addr fallbackAuth)
-      return
+      var fallbackAuth: tuple[header: KeMsgHdr, frame: SmAuthFrameView]
+      fallbackAuth.header.paramLen = sizeof(SmAuthFrameView).uint32
+      fallbackAuth.frame.frameLen = 6
+      fallbackAuth.frame.authSeq = 2
+      let dispatch = rxuMgtDispatchView(addr fallbackAuth.frame)
+      dispatch.frameCtrl = 0xB0
+      dispatch.vifIdx = timeout.owner.identity.vif
+      dispatch.staIdx = timeout.owner.identity.station
+      sm_auth_handler(addr fallbackAuth.frame)
+      return KeMsgConsumed
   let retryCount = connectInfoAuthRetry(connEnv)[]
   let maxRetries = sm.authRetryLimit
   when defined(bl808WifiConnectTrace):
     nimFwTrace2U32("[WIFI-NIMFW] sm_rsp_retry ",
                    retryCount.uint32, maxRetries)
+    if not current(): return KeMsgConsumed
     nimFwConnectTrace2U32("[WIFI-CT] sm_rsp_retry ",
                           retryCount.uint32, maxRetries)
+    if not current(): return KeMsgConsumed
   if retryCount.uint32 >= maxRetries:
     # Retries exhausted: report timeout failure
     sm_connect_ind(WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE, 0xFFFF'u16)
-    return
+    return KeMsgConsumed
   # Increment retry count
   connectInfoAuthRetry(connEnv)[] = retryCount + 1
-  # Vendor retries authentication for both response-wait states.
-  if wpa_cbs != nil:
-    let wpaCbFn = wpaCallbacks().authTimeout
-    if wpaCbFn != nil:
-      cast[proc() {.cdecl.}](wpaCbFn)()
-  sm_deauth_send(nil, 3)
-  sm_auth_send(1'u16, 0)
+  if state == SmAuthenticatingState:
+    if wpa_cbs != nil:
+      let wpaCbFn = wpaCallbacks().authTimeout
+      if wpaCbFn != nil:
+        cast[proc() {.cdecl.}](wpaCbFn)()
+        if not current(): return KeMsgConsumed
+    sm_auth_send_pre(1'u16, nil)
+  else:
+    sm_assoc_req_send_pre()
+  return KeMsgConsumed
 
-proc sm_sa_query_timeout_ind_handler*(param: pointer) {.exportc, cdecl.} =
-  ## Handle SM_SA_QUERY_TIMEOUT_IND (158b in blob, sm.o).
-  ## Blob: checks sm_env[36] (sa_query_active), sm_env[37] (retry_count).
-  ## If retries left: call sm_send_sa_query, decrement, return 0.
-  ## If exhausted: compute STA entry (staIdx*368), VIF entry (vifIdx*1512),
-  ## clear flag, call sm_disconnect(4, 10), log, ke_msg_send_basic.
+proc sm_sa_query_timeout_ind_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
+  ## Retry twice, then report the original AP disconnect reason on the peer's
+  ## VIF. Kernel handlers return zero (message consumed), as in sm_task.o.
   let sm = smEnvView()
   if sm.saQueryActive == 0:
-    return
+    return 0
   let retryCount = sm.saQueryRetryCount
   if retryCount != 0:
     # Send SA query and decrement retry count
     sm_issue_sa_query_request()  # blob: sm_issue_sa_query_request (not sm_send_sa_query)
-    sm.saQueryRetryCount = retryCount - 1
-    return
+    sm.saQueryRetryCount = sm.saQueryRetryCount - 1
+    return 0
   # Retry count exhausted: disconnect
-  let staIdx = sm.saQueryVifIdx
-  let sta = staInfoForIdx(staIdx)
-  # Read VIF idx from sm_env halfword at offset 42
-  let vifIdx = sm.saQueryReason
-  let saQueryVifIdxTransIdPadding = sm.saQueryVifIdxTransIdPadding
-  let vif = vifChannelForIdx(vifIdx.uint8)
-  # Clear SA query flag
+  let staIdx = sm.saQueryStaIdx
   sm.saQueryActive = 0
+  if staIdx.int >= STA_INFO_TAB_ENTRIES:
+    return 0
+  let sta = staInfoForIdx(staIdx)
+  let vifIdx = sta.instNbr
+  if vifIdx.int >= MAX_VIFS:
+    return 0
+  let reason = sm.saQueryReason
+  let vif = vifChannelForIdx(vifIdx)
   ke_state_set(TASK_SM, SmDisconnectingState)
   # Log via g_bl_ops_funcs
-  let logFn = blOpsFunc(204)
+  let logFn = blOpsFunc(4)
   if logFn != nil:
-    cast[proc(a0: pointer, a1: uint16) {.cdecl.}](logFn)(
-      cast[pointer](sta), vifIdx)
+    cast[proc(fmt: cstring) {.cdecl, varargs.}](logFn)(
+      "Deauth/Disassociate by AP, Wlan802.11 reason code = %d\r\n", reason.cint)
   # Disconnect (blob: sm_disconnect_process, not sm_disconnect)
-  sm_disconnect_process(cast[pointer](vif), 20, 0xFFFF'u16)
+  sm_disconnect_process(cast[pointer](vif), 7, reason)
+  return 0
 
-{.emit: "__attribute__((optimize(\"crossjumping\"))) void sm_disconnect(void*);".}
-proc sm_disconnect*(param: pointer) {.exportc, cdecl.} =
-  ## Disconnect from current BSS (143 instrs in blob).
-  ## From blob (sm.o): reads VIF idx from sm_env connection info. Checks
-  ## VIF[86]==0 (STA type) and VIF[88]!=0 (active). Sets ke_state(SM, 10).
-  ## Allocates TX buffer (512 bytes) via ke_evt_set(0x200). Calls
-  ## me_build_deauth to build deauthentication frame (writes DA, SA, BSSID
-  ## from VIF and STA entries). Sets frame subtype, reason code, length.
-  ## Calls txl_frame_push(frame, 3) to queue for TX.
-  ## Finally tail-calls sm_send_deauth_ind(vif, 3, 20) to notify host.
-  let connectInfoPtr = smEnvView().connectInfo
-  if connectInfoPtr == nil:
+proc sm_disconnect*(vifIdx: uint8) {.exportc, cdecl.} =
+  ## Request deauthentication for this active STA VIF; complete it after TX.
+  if vifIdx.int >= MAX_VIFS:
     return
-  let connectInfo = connectInfoView(connectInfoPtr)
-  let vifIdx = connectInfo.vifIdx
   let vif = vifChannelForIdx(vifIdx)
-  if vif.vifType != 0:
-    return  # not a STA VIF
-  if vif.state == 0:
-    return  # VIF not active
-  ke_state_set(TASK_SM, SmDisconnectingState)
-  let staIdx = vif.staIdx
-  let reason = smDisconnectReasonOrDefault(param)
-  # Allocate TX frame for deauth (blob: txl_frame_get with 512 byte payload)
-  let txFrame = txl_frame_get(512)
-  if txFrame == nil:
-    # Blob: tail-call sm_disconnect_process(vif, 20, 3) on frame alloc failure
-    sm_disconnect_process(cast[pointer](vif), 20, reason)
+  if vif.vifType != 0 or vif.state == 0:
     return
-  let txDesc = hostTxDescAt(txFrame)
-  let deauthHeader = hostTxDataHeader(txDesc)
-  # Build deauth frame body using me_build_deauthenticate
-  let frameBodyPtr = cast[pointer](deauthHeader)
-  let bodyLen = me_build_deauthenticate(frameBodyPtr, reason)
-  # Set sequence control
-  let seqCtrl = txl_get_seq_ctrl()
-  deauthHeader.seqCtrl = seqCtrl
-  # Copy DA, SA, BSSID from VIF/STA entries
-  discard c_memcpy(addr deauthHeader.addr1[0], addr connectInfo.bssid[0], 6.csize_t)  # DA
-  discard c_memcpy(addr deauthHeader.addr2[0],
-                   cast[pointer](addr vif.macAddr[0]), 6.csize_t)  # SA
-  discard c_memcpy(addr deauthHeader.addr3[0], addr connectInfo.bssid[0], 6.csize_t)  # BSSID
-  # Set STA/VIF info in frame descriptor
-  txDesc.vifIdx = staIdx
-  txDesc.staInfoIdx = vif.staIdx
-  # Register deauth TX-completion callback (blob: sw &sm_disconnect_deauth_cfm
-  # at descriptor+208). Fires when the HW actually sends the deauth frame.
-  txDesc.callback = cast[pointer](sm_disconnect_deauth_cfm)
-  # MFP protection. Blob reads fc from frame body header (bytes 0/1 of the
-  # MAC header living at txFrame+348, i.e. frameBodyPtr[0..1]).
-  let deauthFrameControl = deauthHeader.frameControl.uint32
-  discard mfp_protect_mgmt_frame(txFrame, deauthFrameControl, 0'u32)
-  # Apply MFP protection and MIC
-  txu_cntrl_protect_mgmt_frame(txFrame, frameBodyPtr, bodyLen)
-  discard mfp_add_mgmt_mic(txFrame, bodyLen, bodyLen + 24)
-  # Apply TX power control
-  tpc_update_frame_tx_power(cast[pointer](vif), txFrame)
-  # Push frame for TX
-  txl_frame_push(txFrame, 3)
-  # Blob: tail-call sm_disconnect_process — this sends SM_DISCONNECT_IND internally
-  # Do NOT send another SM_DISCONNECT_IND here (would be duplicate)
-  sm_disconnect_process(cast[pointer](vif), 0, reason)
+  sm_handle_connection(vifIdx, 20'u16, cast[pointer](sm_disconnect_deauth_cfm),
+                       cast[pointer](sm_disconnect_process))
 
 proc sm_delete_resources*(param: pointer = nil) {.exportc, cdecl.} =
-  ## Clean up SM resources after disconnect (76 instrs in blob).
-  ## From blob (sm.o): clears VIF linkage, calls ke_state_set(4,0), clears STA
-  ## entry if assigned (sta_idx != 0xFF), clears channel context if assigned
-  ## (vif[64] != nil). Host indications are sent by sm_connect_ind or
-  ## sm_disconnect_process; cleanup itself must not emit them.
-  inc nimFwDbgDisconnectInd
-  let sm = smEnvView()
-  let smConnInfo = sm.connectInfo
-  var vif: ptr VifChannelView = nil
-  var vifIdx: uint8 = 0
-  if param != nil:
-    vif = vifChannelAt(param)
-    vifIdx = vif.vifIdx
-  elif smConnInfo != nil:
-    vifIdx = connectInfoView(smConnInfo).vifIdx
-    vif = vifChannelForIdx(vifIdx)
-  else:
-    for candidateIdx in 0'u8 ..< MAX_VIFS.uint8:
-      let candidate = vifChannelForIdx(candidateIdx)
-      if candidate.vifType == VIF_TYPE_STA and
-          (candidate.staIdx != 0xFF'u8 or candidate.chanCtxt != nil or
-           candidate.state != 0):
-        vif = candidate
-        vifIdx = candidateIdx
-        break
-  # Clear station entry if assigned
-  let staIdx = if vif != nil: vif.staIdx else: 0xFF'u8
-  if staIdx != 0xFF'u8:
-    # Send STA del message
-    let staDel = cast[ptr MeStaDelReqPayload](
-      ke_msg_alloc(MM_STA_DEL_REQ, TASK_MM, TASK_SM,
-                   MeStaDelReqPayloadSize))
-    if staDel != nil:
-      staDel.staIdx = staIdx
-      ke_msg_send(staDel)
-    vif.staIdx = 0xFF'u8
-  # Clear VIF active flag
-  if vif != nil and vif.state != 0:
-    let vifStateMsg = cast[ptr MmSetVifStateReqPayload](
-      ke_msg_alloc(MM_SET_VIF_STATE_REQ, TASK_MM, TASK_SM,
-                   MmSetVifStateReqPayloadSize))
-    if vifStateMsg != nil:
-      vifStateMsg.aid = 0
-      vifStateMsg.state = 0
-      vifStateMsg.vifIdx = vifIdx
-      ke_msg_send(vifStateMsg)
-    vif.state = 0
-  # Clear channel context link
-  let chanCtxt = if vif != nil: vif.chanCtxt else: nil
-  if chanCtxt != nil:
-    chan_ctxt_unlink(vifIdx)  # blob: chan_ctxt_unlink (not mm_sta_del)
-    vif.chanCtxt = nil
-  if vif != nil and vifIdx < 8'u8:
-    nimFwWpaPendingMask = nimFwWpaPendingMask and (not (1'u32 shl vifIdx))
-  # Clear sm_env[484] (status word)
-  if vif != nil:
-    vifApConfig(vif).securityFlags = 0
-  if sm.connectIndMsg != nil:
-    ke_msg_free(keMsgHdrFromPayload(sm.connectIndMsg))
-    sm.connectIndMsg = nil
-  # Free the retained SM_CONNECT_REQ param (sm.connectInfo). It is retained via
-  # KeMsgNoFree in sm_connect_req_handler (the dispatcher does NOT free it), so
-  # SM owns it. sm_connect_ind frees+nils it before it calls sm_delete_resources
-  # (so this is a guarded no-op on that path); the disconnect path reaches
-  # sm_delete_resources with it still set, so freeing here is what prevents a
-  # per-disconnect leak. Guard+nil keeps it exactly-once (no double-free).
-  if sm.connectInfo != nil:
-    ke_msg_free(keMsgHdrFromPayload(sm.connectInfo))
-  sm.connectInfo = nil
-  sm.cancelRequested = 0
-  sm.joinBssFlag = 0
-  sm.deauthPending = 0
-  sm.scanResultIndex = 0xFFFFFFFF'u32
-  ke_state_set(TASK_SM, SmIdleState)
+  ## Retire STA state through the vendor's ME/MM cleanup exchange.
+  discard smCleanupBegin(param)
 
-proc sm_auth_assoc_send_according_chan*(nextState: uint16 = 0, param1: uint16 = 0, param2: uint32 = 0) {.exportc, cdecl.} =
+proc sm_auth_assoc_send_according_chan*(nextState: uint16 = 0, authSequence: uint16 = 0, challenge: pointer = nil) {.exportc, cdecl.} =
   ## Send auth/assoc on appropriate channel (226 bytes in blob, 57 instrs).
-  ## From blob (sm.o): reads the active connection's vif_idx(59). If
-  ## chan_ctxt_cnt() <= 1 or chan_ctxt_use_dominant_chan() or remaining time
-  ## < 200ms: direct send.
-  ## Otherwise: allocs channel-switch msg (0x100B, 8 bytes), fills {nextState,
-  ## param1, param2}, calls chan_ctxt_set_auth_assoc_req, sets SM state.
-  ## Direct send: if nextState==5: sm_auth_send(param1, param2).
-  ##              if nextState==7: sm_assoc_req_send().
+  ## From blob (sm.o): reads the active connection's vif_idx(59).
+  ## Direct for one channel, a dominant channel, or remaining time 0/41..199ms.
+  ## Otherwise retain a command until the channel scheduler activates the VIF.
+  ## The first eight bytes match the vendor command; any challenge is owned
+  ## by the command because the RX indication can be freed before activation.
   let connInfo = smEnvView().connectInfo
   if connInfo == nil:
     return
   let vifIdx = connectInfoView(connInfo).vifIdx
+  if vifIdx >= MAX_VIFS.uint8 or
+      nextState notin [SmAuthStartingState, SmAssociatingState]:
+    return
+  var challengeCopy: array[128, uint8]
+  if challenge != nil:
+    discard c_memcpy(addr challengeCopy[0], challenge, challengeCopy.len.csize_t)
+  let ownedChallenge = if challenge != nil: addr challengeCopy[0] else: nil
+  let owner = smDeferredCapture(connInfo, vifIdx)
+  if not smDeferredCurrent(owner): return
   let vif = vifChannelForIdx(vifIdx)
   # Check if we can send directly (single channel or dominant)
   let chanCnt = chan_ctxt_cnt()
   when defined(bl808WifiConnectTrace):
     nimFwTrace2U32("[WIFI-NIMFW] auth_sched ",
-                   nextState.uint32 or (param1.uint32 shl 16),
+                   nextState.uint32 or (authSequence.uint32 shl 16),
                    vifIdx.uint32 or (chanCnt.uint32 shl 8) or
                      (ke_state_get(TASK_SM).uint32 shl 16))
     nimFwConnectTrace2U32("[WIFI-CT] auth_sched ",
-                          nextState.uint32 or (param1.uint32 shl 16),
+                          nextState.uint32 or (authSequence.uint32 shl 16),
                           vifIdx.uint32 or (chanCnt.uint32 shl 8) or
                             (ke_state_get(TASK_SM).uint32 shl 16))
   if chanCnt <= 1 or chan_ctxt_use_dominant_chan():
-    if vif.chanCtxt != nil and vif.channelFreqPair != 0'u32:
-      let ctxt = cast[ptr ChanCtxtView](vif.chanCtxt)
-      let selectedPrimary = uint16(vif.channelFreqPair and 0xFFFF'u32)
-      var selectedCenter = uint16((vif.channelFreqPair shr 16) and 0xFFFF'u32)
-      if selectedCenter == 0'u16:
-        selectedCenter = selectedPrimary
-      if selectedPrimary != 0'u16 and
-          (ctxt.channel.primFreq != selectedPrimary or
-           ctxt.channel.centerFreq1 != selectedCenter):
-        ctxt.channel.primFreq = selectedPrimary
-        ctxt.channel.centerFreq1 = selectedCenter
-        ctxt.channel.centerFreq2 = 0'u16
-      let chanEnv = chanEnvView()
-      chanEnv.flags = chanEnv.flags and not 0x0C'u8
-      chanEnv.scheduledCtxt = vif.chanCtxt
-      chanEnv.currentCtxt = vif.chanCtxt
-      chan_upd_ctxt_status(vif.chanCtxt, 4)
-    if vif.chanCtxt != nil:
-      chan_pre_switch_channel(vif.chanCtxt)
     # Direct send path
     when defined(bl808WifiConnectTrace):
       nimFwTrace2U32("[WIFI-NIMFW] auth_sched_direct ",
                      nextState.uint32, chanCnt.uint32)
       nimFwConnectTrace2U32("[WIFI-CT] auth_direct ",
                             nextState.uint32, chanCnt.uint32)
+    if not smDeferredCurrent(owner): return
     if nextState == SmAuthStartingState:
-      sm_auth_send(param1, param2)
+      sm_auth_send(authSequence, ownedChallenge)
     elif nextState == SmAssociatingState:
-      sm_assoc_req_send(nil)
+      sm_assoc_req_send()
     return
   # Check remaining channel time
   let remaining = chan_ctxt_get_remaining_time_ms(cast[pointer](vif))
@@ -2014,513 +2138,468 @@ proc sm_auth_assoc_send_according_chan*(nextState: uint16 = 0, param1: uint16 = 
                    remaining, pointerAddrU32(cast[pointer](vif)))
     nimFwConnectTrace2U32("[WIFI-CT] auth_rem ",
                           remaining, pointerAddrU32(cast[pointer](vif)))
-  if remaining == 0 or (remaining - 41) <= 158:
-    # Not enough time, send directly
+  if remaining == 0 or (remaining - 41'u32) <= 158'u32:
     when defined(bl808WifiConnectTrace):
       nimFwTrace2U32("[WIFI-NIMFW] auth_sched_short ",
                      nextState.uint32, remaining)
       nimFwConnectTrace2U32("[WIFI-CT] auth_short ",
                             nextState.uint32, remaining)
+    if not smDeferredCurrent(owner): return
     if nextState == SmAuthStartingState:
-      sm_auth_send(param1, param2)
+      sm_auth_send(authSequence, ownedChallenge)
     elif nextState == SmAssociatingState:
-      sm_assoc_req_send(nil)
+      sm_assoc_req_send()
     return
-  # Multi-channel path: allocate channel-switch message
-  let msg = cast[ptr SmConnectAuthAssocReqPayload](
-    ke_msg_alloc(SM_CONNECT_AUTH_ASSOC_REQ_MSG, TASK_SM, 0xFF,
-                 SmConnectAuthAssocReqPayloadSize))
+  # Keep the vendor payload layout, with private connection ownership metadata.
+  if not smDeferredCurrent(owner): return
+  let msg = smDeferredCreate(owner, nextState, authSequence, ownedChallenge)
   if msg != nil:
-    msg.nextState = nextState
-    msg.param1 = param1
-    msg.param2 = param2
     when defined(bl808WifiConnectTrace):
       nimFwTrace2U32("[WIFI-NIMFW] auth_sched_queue ",
                      nextState.uint32, cast[uint32](cast[uint](msg)))
       nimFwConnectTrace2U32("[WIFI-CT] auth_queue ",
                             nextState.uint32, cast[uint32](cast[uint](msg)))
     chan_ctxt_set_auth_assoc_req(msg)
-    ke_state_set(TASK_SM, nextState.uint16)
 
-{.emit: "__attribute__((optimize(\"crossjumping\"))) void sm_supplicant_deauth_cfm(void*);".}
-proc sm_supplicant_deauth_cfm*(param: pointer) {.exportc, cdecl.} =
-  ## Handle deauth confirmation from supplicant (23 instrs in blob).
-  ## From blob (sm.o): checks status bit 11 (0x800). If not set, loads
-  ## a function pointer, calls debug log (level 3, line 1717), then
-  ## tail-calls sm_connect_ind(8, 15). If bit 11 set, directly
-  ## tail-calls sm_connect_ind(8, 15). Status 8 = WLAN_FW_CONNECT_ABORT,
-  ## reason 15 = WLAN_FW_DEAUTH.
-  var status: uint32
-  {.emit: ["asm volatile(\"mv %0, a1\" : \"=r\"(", status, ") );"].}
-  if (status and 0x800'u32) == 0:
-    # Not DTIM status: log first
-    let logFn = getLogFunc(4)
+{.emit: "__attribute__((optimize(\"crossjumping\"))) void sm_supplicant_deauth_cfm(void*,unsigned long);".}
+proc sm_supplicant_deauth_cfm*(param: pointer; status: uint32) {.exportc, cdecl.} =
+  ## Report supplicant deauth completion; bit 23 records the MAC ACK.
+  if not txlFrameCallbackCurrent(): return
+  if (status and 0x00800000'u32) == 0:
+    let logFn = getLogFunc(204)
     if logFn != nil:
-      logFn(2, 0, nil, 1717)
-  # Tail-call sm_connect_ind with (status=8, reason=15)
+      logFn(3, nil, "sm.c", 1717,
+            cstring("sm deauth frame transmit failure\r\n"))
+  if not txlFrameCallbackCurrent(): return
   sm_connect_ind(8, 15)
 
 # --- APM Task Handlers (apm_task.o) ---
 
-{.emit: "__attribute__((optimize(\"crossjumping\"))) void apm_start_req_handler(void*);".}
-proc apm_start_req_handler*(param: pointer) {.exportc, cdecl.} =
-  ## Handle APM_START_REQ (1034 bytes in blob, 427 instrs).
-  ## From blob (apm_task.o): Full AP startup procedure:
-  ## 1. Validates VIF type == AP (2), state == IDLE (0), not already active
-  ## 2. Adds channel context via me_add_chan_ctx
-  ## 3. Links channel to VIF, sets freq/bandwidth
-  ## 4. Calls apm_embedded_enabled, copies rates/SSID/IEs
-  ## 5. Reads MAC address from HW register (0x24B00200)
-  ## 6. Builds beacon via me_build_beacon, adds customer IEs
-  ## 7. Sets BSS params and TX power
-  ## 8. On error: sends APM_START_CFM with error code
-  let req = apmStartReqView(param)
-  var errorCode: uint8 = 4  # Default: wrong VIF type
-  # Log entry
-  let logFn = blOpsFunc(4)
-  if logFn != nil:
-    discard  # blob calls printf with file/line
-  # Validate VIF. Blob tail-merges all error paths + the success-path
-  # CFM into a single ke_msg_alloc / ke_msg_send site at the function
-  # tail. Mirror that by tracking errorCode + an earlyExit flag and
-  # letting every branch fall through to the shared send at the bottom.
-  let vifIdx = req.vifIdx
-  let vif = vifChannelForIdx(vifIdx)
-  let apm = apmEnvView()
-  var earlyExit = false
-
-  if vif.vifType != 2:
-    # errorCode already defaulted to 4 (wrong VIF type)
-    earlyExit = true
-
-  if not earlyExit:
-    let state = ke_state_get(TASK_APM)
-    if state != ApmIdleState:
-      errorCode = 8  # BUSY
-      earlyExit = true
-
-  if not earlyExit:
-    if vif.state != 0:
-      errorCode = 9  # Already active
-      earlyExit = true
-
-  # Blob tail-merges all 3 CFM alloc+send paths (earlyExit / chan-add-fail /
-  # success) into one shared ke_msg_alloc + ke_msg_send site at the end.
-  # Wrap the body in a block and break out with errorCode set; common tail
-  # below does the single alloc+send.
-  block apmStart:
-   if earlyExit: break apmStart
-   # Assert chan_ctxt is NULL
-   let existingChanCtxt = vif.chanCtxt
-   if existingChanCtxt != nil:
-     assert_err("apm_task.c", "apm_task.c", 101)
-   # Store request pointer in apm_env
-   apm.connectInfo = param
-   # Add channel context
-   # Blob: me_add_chan_ctx(a0=&stackLocal, a1=req+14, a2=req[20], a3=req[24], a4=req[28])
-   var chanCtxtResult: uint8
-   let chanResult = me_add_chan_ctx(
-     chanCtxtResult,
-     cast[pointer](addr req.channel),
-     req.channel.primFreq,
-     req.channel.centerFreq,
-     req.channel.authType)
-   if chanResult:
-     errorCode = 1  # Channel add failed
-     break apmStart
-   # Get channel pointer from frequency
-   let apChannel = me_freq_to_chan_ptr(req.channel.band, req.channel.freq)
-   # Store channel pointer in VIF
-   vif.operChan = apChannel
-   let apConfig = vifApConfig(vif)
-   # Set bandwidth type
-   vifChannelTypeByte(vif)[] = req.channel.chanType  # via chan_ptr
-   # Store center frequencies
-   vif.channelFreqPair =
-     req.channel.primFreq.uint32 or (req.channel.centerFreq.uint32 shl 16)
-   # Set auth type (clamp 4 -> 3)
-   var authType = req.channel.authType
-   if authType == 4: authType = 3
-   apConfig.authType = authType
-   apConfig.requestedAuthType = req.channel.authType
-   apConfig.authConfigPadding[0] = 0
-   # Link channel context to VIF
-   chan_ctxt_link(vifIdx, vifIdx)
-   # Store beacon/DTIM params in apm_env
-   apm.beaconIntervalIndex = req.beaconIntervalIndex
-   apm.flags = req.flags
-   # Check if AP embedded mode is enabled
-   let embedded = apm_embedded_enabled(cast[pointer](vif))
-   if not embedded:
-     discard  # Skip embedded-only setup, jump to beacon build
-   else:
-     # Blob: me_get_basic_rates(a0=req+53, a1=req) → populates basic rate info
-     # me_get_basic_rates declared as (vifIdx: uint8) but blob ABI is (a0=ptr, a1=ptr)
-     let meGetBasicFn = cast[proc(a0: pointer, a1: pointer) {.cdecl.}](me_get_basic_rates)
-     meGetBasicFn(cast[pointer](addr req.basicRates[0]), param)
-     # Blob at 0x16c: reads `me_env[0x82]` (the ME task's HT supp flag),
-     # and if non-zero, OR's bit 1 (0x2) into vif+484. Previous Nim read
-     # from the request buffer and OR'd bit 0 — wrong source AND wrong bit.
-     if meEnvView().htSupp != 0:
-       apConfig.securityFlags = apConfig.securityFlags or 2'u32
-     # Copy beacon interval
-     apConfig.beaconInterval = req.beaconInterval
-     # Copy DTIM period
-     vif.beaconIntervalTu = req.dtimPeriod.uint16
-     # Copy SSID length
-     apConfig.privacyFlag = req.htCapSsidLen
-     # Copy supported rates (34 bytes)
-     discard c_memcpy(addr vif.supportedRatesLong[0],
-                      cast[pointer](addr req.supportedRatesLong[0]), 34.csize_t)
-     # Copy basic rates (13 bytes)
-     discard c_memcpy(addr vif.basicRates[0],
-                      cast[pointer](addr req.basicRates[0]), 13.csize_t)
-     # Copy HT capability from request (blob: lbu a5, 102(s0); sb a5, 520(s1))
-     apConfig.privacyFlag = req.htCapSsidLen
-     # Read AMPDU durations from MAC HW (blob: lui a5,0x24b00; lw a4,512(a5)...)
-     let ampduBase = 0x24B00200'u
-     vif.edcaRegs[0] = volatileLoad(cast[ptr uint32](ampduBase))
-     vif.edcaRegs[1] = volatileLoad(cast[ptr uint32](ampduBase + 4))
-     vif.edcaRegs[2] = volatileLoad(cast[ptr uint32](ampduBase + 8))
-     vif.edcaRegs[3] = volatileLoad(cast[ptr uint32](ampduBase + 12))
-     # Clear probe response length
-     vif.wmmQosInfo = 0
-     # Set AID bitmap and feature flag
-     apConfig.aidBitmapFeatureLow = 0
-     apConfig.maxAssocRate = 0xFFFF'u16
-   # Allocate the transient beacon buffer. Blob calls g_bl_ops_funcs[184] with
-   # 333 bytes and stores the returned pointer at apm_env+16; apm_bcn_set copies
-   # from this buffer, frees it through g_bl_ops_funcs[188], then clears it.
-   let allocFn = blOpsFunc(0xB8)
-   if allocFn != nil:
-     apm.pendingBeaconBuffer =
-       cast[proc(size: uint32): pointer {.cdecl.}](allocFn)(333)
-   # Store crypto type
-   let cryptoType = req.cryptoType
-   apm.cryptoType = cryptoType
-   # Copy IE data if present
-   if cryptoType != 0:
-     discard c_memcpy(addr apm.securityIe[0],
-                      cast[pointer](addr req.securityIe[0]),
-                      cryptoType.csize_t)
-   # Store VIF index
-   apm.vifIdx = vifIdx
-   # Clear WPA type
-   let securityState = vifSecurity(vif)
-   securityState.cipher = 0
-   # HT capability check. Blob builds a 112-byte stack descriptor then
-   # invokes wpa_cbs[24] (register-beacon callback):
-   #   stack[0]      = req[51] (inst_nbr)
-   #   stack[1..7]   = BSSID from vif+380 (6 bytes)
-   #   stack[40]     = vif[386] (basic rate count, re-stored as word)
-   #   stack[44..]   = vif+387 supported rates (count bytes)
-   #   stack[76..77] = 0x0403 halfword marker
-   #   stack[78..]   = SSID from req+103 (strlen bytes)
-   #   stack[142]    = null terminator
-   if req.htCapSsidLen != 0:
-     var beaconRegisterBuffer {.noinit.}: array[144, uint8]
-     discard c_memset(addr beaconRegisterBuffer[0], 0, 112.csize_t)
-     let beaconRegister = cast[ptr WpaBeaconRegisterParamView](addr beaconRegisterBuffer[0])
-     beaconRegister.vifIdx = req.vifIdx
-     beaconRegister.bssid = vif.bssid
-     let rateCount = vif.supportedRatesLong[0]
-     beaconRegister.rateCount = rateCount.uint32
-     discard c_memcpy(addr beaconRegister.rates[0], addr vif.supportedRatesLong[1],
-                     rateCount.csize_t)
-     beaconRegister.marker = 0x0403'u16
-     let ssidPtr = cast[pointer](addr req.ssid[0])
-     let ssidLen = c_strlen(ssidPtr)
-     discard c_memcpy(addr beaconRegister.ssid[0], ssidPtr, ssidLen)
-     beaconRegister.terminator = 0
-     securityState.cipher = 3
-     if wpa_cbs != nil:
-       let beaconRegisterCallback = wpaCallbacks().beaconRegister
-       if beaconRegisterCallback != nil:
-         cast[proc(buf: pointer) {.cdecl.}](beaconRegisterCallback)(
-           addr beaconRegisterBuffer[0])
-   # Build beacon into the transient AP buffer and store the generated length
-   # back into the request payload at offset 36, matching blob `sh a0,36(s0)`.
-   var bcnLen: uint16 = 0
-   let beaconBuf = apm.pendingBeaconBuffer
-   if beaconBuf != nil:
-     let builtLen = me_build_beacon(
-       beaconBuf, vifIdx, addr req.beaconLenOut,
-       addr req.beaconFlags, apm.flags)
-     bcnLen = builtLen.uint16
-     req.beaconLength = bcnLen
-     let extra = me_add_ie_customer(
-       cast[pointer](cast[uint](beaconBuf) + builtLen.uint),
-       cast[pointer](addr req.securityIe[0]),
-       cryptoType.uint32)
-     bcnLen = bcnLen + extra.uint16
-     req.beaconLength = bcnLen
-   # Check if rate bitfield needs building (blob: if req[16]==0)
-   if req.channel.band == 0:
-     # Build legacy rate bitfield from VIF supported rates
-     let rateResult = me_legacy_rate_bitfield_build(
-       cast[pointer](addr vif.basicRates[0]), 1)
-     # Store highest-set-bit index at vif[475] via __clzsi2 (blob: 31 - clz)
-     if (rateResult and 0xF) != 0:
-       var basicRateNibble: cuint = (rateResult and 0xF).cuint
-       var highestBasicRateBit: cint
-       {.emit: [highestBasicRateBit, " = 31 - __builtin_clz(", basicRateNibble, ");"].}
-       apConfig.highestRateBit = highestBasicRateBit.uint8
-   # Set BSS params and rates
-   apm_set_bss_param(param)
-   # Update VIF TX power
-   # Blob: a0=vifEntry, a1=&txPowerByte(from chan_ptr[4] bandwidth), a2=&rateParam(from stack)
-   let txPowerChannel = vif.operChan
-   var txPowerByte: uint8
-   var txPowerRateParam: uint8
-   if txPowerChannel != nil:
-     let channel = cast[ptr ScanChannelEntry](txPowerChannel)
-     txPowerByte = cast[ptr uint8](addr channel.txPower)[]
-   tpc_update_vif_tx_power(
-     cast[pointer](vif),
-     cast[pointer](addr txPowerByte),
-     cast[pointer](addr txPowerRateParam))
-   # Success path: errorCode = 0 for the shared tail CFM send below. Blob
-   # does NOT call ke_state_set here (state transition happens elsewhere).
-   errorCode = 0
-
-  # Shared tail: single ke_msg_alloc + ke_msg_send (matches blob's
-  # 1 alloc / 1 send site pattern).
+{.emit: "__attribute__((optimize(\"crossjumping\"))) int apm_start_req_handler(void*);".}
+proc apm_start_req_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
+  ## Retain the request until the beacon confirmation, as in apm_task.o.
+  if param == nil:
+    return KeMsgConsumed
+  let header = keMsgHdrFromPayload(param)
   let cfm = cast[ptr ApmStartCfmPayload](
-    ke_msg_alloc(APM_START_CFM, TASK_API, TASK_APM,
-                 ApmStartCfmPayloadSize))
-  if cfm != nil:
-    cfm.status = errorCode
+    ke_msg_alloc(APM_START_CFM, header.srcId, header.destId, ApmStartCfmPayloadSize))
+  if cfm == nil:
+    return KeMsgConsumed
+  cfm[] = default(ApmStartCfmPayload)
+  cfm.vifIdx = 0xFF
+  var status = 1'u8
+  var entered = false
+  var channelAdded = false
+  var contextIndex = 0xFF'u8
+  let apm = apmEnvView()
+  var vif: ptr VifChannelView
+  block startAp:
+    if header.paramLen < (sizeof(ApmStartReqView) - 3).uint32:
+      break startAp
+    let req = apmStartReqView(param)
+    let vifIdx = req.vifIdx
     cfm.vifIdx = vifIdx
-    ke_msg_send(cfm)
+    if vifIdx.int >= MAX_VIFS:
+      break startAp
+    vif = vifChannelForIdx(vifIdx)
+    status = 4
+    if vif.vifType != VIF_TYPE_AP:
+      break startAp
+    status = 8
+    if ke_state_get(TASK_APM) != ApmIdleState or apm.connectInfo != nil or
+       apm.hostapdCtx != nil or not mmBeaconPoolIdle():
+      break startAp
+    # The firmware owns one shared beacon/TIM pool, including for open APs.
+    var otherApActive = false
+    for otherIdx in 0'u8 ..< MAX_VIFS.uint8:
+      if otherIdx != vifIdx:
+        let other = vifChannelForIdx(otherIdx)
+        if other.vifType == VIF_TYPE_AP and other.state != 0:
+          otherApActive = true
+          break
+    if otherApActive:
+      break startAp
+    status = 9
+    if vif.state != 0 or vif.chanCtxt != nil:
+      break startAp
+    status = 1
+    if req.channel.band != 0 or req.channelWidth > 4 or
+       req.centerFreq1 > 65535 or req.centerFreq2 > 65535 or
+       req.hiddenSsid > 2 or req.extraIeLength > 64:
+      break startAp
+    var ieOffset = 0
+    while ieOffset < req.extraIeLength.int:
+      if req.extraIeLength.int - ieOffset < 2 or
+         req.extraIes[ieOffset + 1].int + 2 > req.extraIeLength.int - ieOffset:
+        break startAp
+      ieOffset += req.extraIes[ieOffset + 1].int + 2
+    if req.embedded != 0:
+      if req.ssidLength == 0 or req.ssidLength > 32 or
+         req.rates[0] == 0 or req.rates[0] > 12 or req.dtimPeriod == 0:
+        break startAp
+      me_get_basic_rates(addr req.rates[0], addr req.staRateSeed[0])
+    if req.staRateSeed[0] == 0 or req.staRateSeed[0] > 12:
+      break startAp
+    for rateIndex in 1 .. req.staRateSeed[0].int:
+      if me_rate_translate(req.staRateSeed[rateIndex].uint32) >= 12:
+        break startAp
+    var passphraseLength = 0
+    if req.securityType != 0:
+      while passphraseLength < req.passphrase.len and req.passphrase[passphraseLength] != 0:
+        inc passphraseLength
+      if passphraseLength < 8 or passphraseLength > 64 or wpa_cbs == nil or
+         wpaCallbacks().beaconRegister == nil or wpaCallbacks().apStopped == nil:
+        break startAp
+    block:
+      let saved = irqSave()
+      defer: irqRestore(saved)
+      var selected: uint8
+      if not txlHaltVifQueues(vifIdx, selected):
+        break startAp
+      apm.connectInfo = param
+      apmStartConfirmation = cfm
+      apmStartSideEffects = false
+      apmRollbackActive = false
+      apmRollbackHaltPending = false
+      entered = true
+      apmPendingCancelMask = apmPendingCancelMask or (1'u8 shl vifIdx)
+      rxInvalidateQuiescentVif(vifIdx, selected)
+    ke_state_set(TASK_APM, ApmActiveState)
+    mm_bcn_init_vif(vif)
+    if not apmPrepareStartReplies():
+      break startAp
+    if me_add_chan_ctx(addr contextIndex, addr req.channel,
+                       req.centerFreq1, req.centerFreq2, req.channelWidth) != 0:
+      break startAp
+    channelAdded = true
+    let apChannel = me_freq_to_chan_ptr(req.channel.band, req.channel.freq)
+    if apChannel == nil:
+      break startAp
+    vif.operChan = apChannel
+    cast[ptr ScanChannelEntry](apChannel).txPower = req.channel.txPower
+    vif.channelFreqPair = req.centerFreq1.uint16.uint32 or
+      (req.centerFreq2.uint16.uint32 shl 16)
+    let apConfig = vifApConfig(vif)
+    apConfig.authType = if req.channelWidth == 4: 3'u8 else: req.channelWidth
+    apConfig.requestedAuthType = req.channelWidth
+    apConfig.authConfigPadding[0] = 0
+    chan_ctxt_link(vifIdx, contextIndex)
+    apm.beaconIntervalIndex = req.embedded
+    apm.flags = req.hiddenSsid
+    apm.vifIdx = vifIdx
+    apm.cryptoType = req.extraIeLength
+    apm.securityIe = default(typeof(apm.securityIe))
+    discard c_memcpy(addr apm.securityIe[0], addr req.extraIes[0], req.extraIeLength.csize_t)
+    let securityState = vifSecurity(vif)
+    securityState.cipher = 0
+    if req.embedded != 0:
+      apConfig.securityFlags = apConfig.securityFlags and not 3'u32
+      if req.qosSupported != 0: apConfig.securityFlags = apConfig.securityFlags or 1
+      if meEnvView().htSupp != 0: apConfig.securityFlags = apConfig.securityFlags or 2
+      apConfig.beaconInterval = req.beaconInterval
+      vif.beaconIntervalTu = req.dtimPeriod.uint16
+      apConfig.privacyFlag = req.securityType
+      discard c_memcpy(addr vif.supportedRatesLong[0], addr req.ssidLength, 34.csize_t)
+      vif.supportedRatesLong[req.ssidLength.int + 1] = 0
+      discard c_memcpy(addr vif.basicRates[0], addr req.rates[0], 13.csize_t)
+      vif.bssid = vif.macAddr
+      for ac in 0 ..< 4:
+        vif.edcaRegs[ac] = regRead(0x24B00200'u + ac.uint * 4)
+      vif.wmmQosInfo = 0
+      apConfig.aidBitmapFeatureLow = 0
+      apConfig.maxAssocRate = 0xFFFF
+      if req.securityType != 0:
+        var parameters = default(WpaBeaconRegisterParamView)
+        parameters.vifIdx = vifIdx
+        parameters.bssid = vif.macAddr
+        parameters.ssidLength = req.ssidLength.uint32
+        discard c_memcpy(addr parameters.ssid[0], addr req.ssid[0], req.ssidLength.csize_t)
+        parameters.authMode = 3
+        parameters.pairwiseCipher = 4
+        discard c_memcpy(addr parameters.passphrase[0], addr req.passphrase[0],
+                         passphraseLength.csize_t)
+        let initialize = wpaCallbacks().beaconRegister
+        apm.hostapdCtx = cast[proc(p: pointer): pointer {.cdecl.}](initialize)(addr parameters)
+        if apm.hostapdCtx == nil:
+          break startAp
+        securityState.cipher = 3
+      # The hardware beacon pool has 512 bytes. Bound every variable append
+      # before calling the existing builder, including callback-installed IEs.
+      if meBeaconFrameLength(vifIdx, req.hiddenSsid) + req.extraIeLength.uint64 > 512:
+        break startAp
+      let allocate = blOpsFunc(184)
+      if allocate == nil or blOpsFunc(188) == nil:
+        break startAp
+      apm.pendingBeaconBuffer = cast[proc(size: uint32): pointer {.cdecl.}](allocate)(512)
+      if apm.pendingBeaconBuffer == nil:
+        break startAp
+      let built = me_build_beacon(apm.pendingBeaconBuffer, vifIdx,
+        addr req.timOffset, addr req.timLength, req.hiddenSsid)
+      if built > 512'u32 - req.extraIeLength.uint32:
+        break startAp
+      discard me_add_ie_customer(cast[pointer](cast[uint](apm.pendingBeaconBuffer) + built.uint),
+                                 addr req.extraIes[0], req.extraIeLength.uint32)
+      req.beaconLength = (built + req.extraIeLength.uint32).uint16
+    elif req.beaconTemplate == nil or req.beaconLength == 0 or req.beaconLength > 512:
+      break startAp
+    apmStartBeaconMessage = ke_msg_alloc(MM_BCN_CHANGE_REQ, TASK_MM, TASK_APM,
+      req.beaconLength.uint32 + offsetof(MmBcnChangeReqPayload, beaconData).uint32)
+    apmStartVifMessage = ke_msg_alloc(MM_SET_VIF_STATE_REQ, TASK_MM, TASK_APM,
+                                      MmSetVifStateReqPayloadSize)
+    if apmStartBeaconMessage == nil or apmStartVifMessage == nil:
+      break startAp
+    let rateBits = me_legacy_rate_bitfield_build(addr vif.basicRates[0], 1) and 0xF
+    apConfig.highestRateBit = 1
+    for rateIndex in 0'u8 .. 3'u8:
+      if (rateBits and (1'u32 shl rateIndex)) != 0:
+        apConfig.highestRateBit = rateIndex
+    if not apm_set_bss_param(param):
+      break startAp
+    var txPowerByte = req.channel.txPower.uint8
+    var txPowerRateParam: uint8
+    tpc_update_vif_tx_power(cast[pointer](vif), addr txPowerByte, addr txPowerRateParam)
+    return KeMsgNoFree
+  if entered:
+    apm.connectInfo = nil
+    apmStartConfirmation = nil
+    apmFreeStartBuffers()
+    apmStartSideEffects = false
+    if channelAdded:
+      if vif.chanCtxt != nil: chan_ctxt_unlink(cfm.vifIdx)
+      else: chan_ctxt_del(contextIndex)
+    let context = apm.hostapdCtx
+    apm.hostapdCtx = nil
+    if context != nil and wpa_cbs != nil and wpaCallbacks().apStopped != nil:
+      discard cast[proc(p: pointer): bool {.cdecl.}](wpaCallbacks().apStopped)(context)
+    ke_state_set(TASK_APM, ApmIdleState)
+  cfm.status = status
+  ke_msg_send(cfm)
+  KeMsgConsumed
 
-proc apm_stop_req_handler*(param: pointer) {.exportc, cdecl.} =
-  ## Handle APM_STOP_REQ: stop AP mode (202 bytes in blob, 50 instrs).
-  ## From blob (apm_task.o):
-  ##   1. Read vifIdx from param[0]
-  ##   2. Compute vif_entry = vif_info_tab + vifIdx * 1512
-  ##   3. Check vif.type (offset 86) == 2 (AP) AND vif.active (offset 88) != 0
-  ##   4. If valid: call ke_state_get(TASK_APM), check state
-  ##      - If state is 0: set fail status
-  ##      - Else: clear hostapd_enabled, memset apm_env to 0 (64 bytes),
-  ##        clear vif.active, do mm_remove_if(vifIdx), call g_bl_ops_funcs[28]
-  ##        callback with apm_env.timer, clear apm timer pointer
-  ##   5. Send APM_STOP_CFM with status
-  let req = apmStopReqView(param)
-  let vifIdx = req.vifIdx
-  let vif = vifChannelForIdx(vifIdx)
-  let apm = apmEnvView()
+proc apm_stop_req_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
+  ## The vendor saves stop requests during startup and stops a live, idle AP.
+  if param == nil:
+    return KeMsgConsumed
+  let header = keMsgHdrFromPayload(param)
+  if header.paramLen >= sizeof(ApmStopReqPayload).uint32:
+    let vifIdx = apmStopReqView(param).vifIdx
+    if vifIdx.int < MAX_VIFS:
+      let vif = vifChannelForIdx(vifIdx)
+      if apmStartPendingForVif(vifIdx) or (apmStopActive and apmStopVifIdx == vifIdx):
+        return KeMsgSaved
+      if vif.vifType == VIF_TYPE_AP and apmVifNeedsStop(vifIdx):
+        let vifMask = 1'u8 shl vifIdx
+        if ke_state_get(TASK_APM) != ApmIdleState or
+           (apmStoppingVifs and vifMask) != 0:
+          return KeMsgSaved
+        if not apmBeginStop(cast[pointer](vif), param):
+          return KeMsgSaved
+        return KeMsgNoFree
+  ke_msg_send_basic(APM_STOP_CFM, header.srcId, header.destId)
+  KeMsgConsumed
 
-  if vif.vifType == VIF_TYPE_AP and vif.state != 0:
-    let state = ke_state_get(TASK_APM)
-    if state != ApmIdleState:
-      # Check and clear hostapd_enabled flag at apm_env+0x55
-      if apm.beaconIntervalIndex != 0:
-        apm.beaconIntervalIndex = 0
-      # Clear APM env (blob: memset(apm_env+0x14, 0, 64))
-      discard c_memset(addr apm.securityIe[0], 0, apm.securityIe.len.csize_t)
-      # Clear apm_env[0x54]
-      apm.cryptoType = 0
-      # Call apm_stop (blob: apm_stop at 0x88)
-      apm_stop(cast[pointer](vif))
-      # Call wpa_cbs[7] (offset 28) with apm_env[0xac] as arg (blob: no null checks)
-      if wpa_cbs != nil:
-        let wpaCbFn = wpaCallbacks().apStopped
-        if wpaCbFn != nil:
-          let timerArg = cast[uint32](cast[uint](apm.hostapdCtx))
-          cast[proc(a0: uint32) {.cdecl.}](wpaCbFn)(timerArg)
-      # Clear apm timer pointer at apm_env[0xac]
-      apm.hostapdCtx = nil
-
-  # Send APM_STOP_CFM (blob: ke_msg_send_basic)
-  ke_msg_send_basic(APM_STOP_CFM, TASK_API, TASK_APM)
-
-proc apm_sta_add_cfm_handler*(param: pointer) {.exportc, cdecl.} =
-  ## Blob apm_task.o::apm_sta_add_cfm_handler (178 bytes, 44 instrs).
-  ## Does NOT send APM_STA_ADD_IND — the previous Nim implementation invented
-  ## that indication and also inserted a spurious rc_init_bcmc_rate call.
-  ##
-  ## Blob flow (a1 = MM_STA_ADD_CFM param):
-  ##   staIdx = msg[0]  (only byte read from the msg)
-  ##   staEntry = &sta_info_tab[0] + staIdx * 368
-  ##   for slot in apm_env[0..5] (stride 16, max apm_env + 0x50):
-  ##     if slot[104] != 0:
-  ##       if memcmp(slot + 92, staEntry + 4, 6) == 0:
-  ##         slot[105] = msg[0]    # record staIdx on this slot
-  ##         apm_sta_add(param)
-  ##         if apm_env[172] != 0:
-  ##           cb = wpa_cbs[36]
-  ##           cb(param, sta_info_tab[staIdx + 1 ...]) via T-Head custom insn
-  ##         return
-  ##   # fall-through: no slot matched. The blob emits a hard fault marker here;
-  ##   # the pure Nim path records the mismatch and returns so the scheduler
-  ##   # remains serviceable.
+proc apm_sta_add_cfm_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
+  ## A two-byte vendor confirmation is correlated privately, not by MAC alone.
+  if param == nil:
+    return 0
+  let pendingSlot = apmPendingConfirmationSlot(param)
+  if pendingSlot < 0:
+    inc nimFwDbgApmStaAddNoSlot
+    return 0
   let cfm = apmStaAddCfmParamView(param)
+  let slot = apmStaSlot(pendingSlot.uint)
   let staIdx = cfm.staIdx
+  if cfm.status != 0 or staIdx.int >= STA_INFO_TAB_ENTRIES:
+    inc nimFwDbgApmStaAddNoSlot
+    nimFwDbgApmStaAddNoSlotSta = staIdx.uint32 or (cfm.status.uint32 shl 8)
+    aidListDelete(addr slot.macAddr[0])
+    return 0
   let sta = staInfoForIdx(staIdx)
-  let staMacPtr = cast[pointer](addr sta.macAddr[0])
-  let apm = apmEnvView()
-  for apmStaAddSlotIndex in 0'u ..< 5'u:
-    let apmStaAddSlot = apmStaSlot(apmStaAddSlotIndex)
-    if apmStaAddSlot.active != 0:
-      if c_memcmp(cast[pointer](addr apmStaAddSlot.macAddr[0]), staMacPtr, 6.csize_t) == 0:
-        apmStaAddSlot.staIdx = staIdx
-        discard apm_sta_add(param)
-        # Optional WPA callback at apm_env[172]=enable / wpa_cbs[36]=fn.
-        if apm.hostapdCtx != nil:
-          let wpaCbsPtr = wpa_cbs
-          if wpaCbsPtr != nil:
-            let cbFn = wpaCallbacks().staAdd
-            if cbFn != nil:
-              let stored = cast[uint32](apmStaAddSlot.staHandle)
-              cast[proc(p: pointer, v: uint32) {.cdecl.}](cbFn)(param, stored)
-        return
-  inc nimFwDbgApmStaAddNoSlot
-  nimFwDbgApmStaAddNoSlotSta = staIdx.uint32
+  if slot.active == 0 or sta.valid == 0 or
+     sta.instNbr != apmPendingAssociations[pendingSlot].vifIdx or
+     c_memcmp(addr slot.macAddr[0], addr sta.macAddr[0], 6.csize_t) != 0:
+    aidListDelete(addr slot.macAddr[0])
+    return 0
+  let context = slot.staHandle
+  apmPendingClear(pendingSlot)
+  let generation = apmPendingAssociations[pendingSlot].generation
+  slot.staIdx = staIdx
+  sta.apmWpaContext = context
+  if apm_sta_add(staIdx) != 0:
+    # Nothing was published to the host, so no asynchronous delete is needed.
+    mm_sta_del(staIdx)
+    aidListDelete(addr slot.macAddr[0])
+    return 0
+  # Host publication can synchronously reenter AP management.
+  if apmPendingAssociations[pendingSlot].generation != generation or
+     slot.active == 0 or slot.staIdx != staIdx or slot.staHandle != context:
+    return 0
+  if apmEnvView().hostapdCtx != nil and context != nil and wpa_cbs != nil:
+    let callback = wpaCallbacks().staAdd
+    if callback != nil:
+      cast[proc(context: pointer, index: uint8) {.cdecl.}](callback)(context, staIdx)
+  0
 
-{.emit: "__attribute__((optimize(\"crossjumping\"))) void apm_sta_del_req_handler(void*);".}
-proc apm_sta_del_req_handler*(param: pointer) {.exportc, cdecl.} =
-  ## Handle APM_STA_DEL_REQ (116 bytes in blob, 32 instrs).
-  ## From blob (apm_task.o): Allocs APM_STA_DEL_CFM msg first.
-  ## Reads req[0] as vif_lookup idx, validates vif.type(86)==2 (AP) and
-  ## req[1] (sta_idx_in_vif) <= 7. On success: calls apm_sta_delete(sta_idx, 2, 1),
-  ## sets cfm[0]=0. On error: cfm[0]=0xFF. Sends cfm.
-  # Allocate CFM message first
+{.emit: "__attribute__((optimize(\"crossjumping\"))) int apm_sta_del_req_handler(void*);".}
+proc apm_sta_del_req_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
+  ## The vendor replies with three bytes and calls remove(vif, sta, 1, 2).
+  if param == nil:
+    return 0
+  let header = keMsgHdrFromPayload(param)
+  let requestedSta = if header.paramLen >= sizeof(ApmStaDelReqPayload).uint32:
+      apmStaDelReqView(param).staIdxInVif else: 0xFF'u8
+  let epoch = staDeleteEpoch(requestedSta)
   let cfm = cast[ptr ApmStaDelCfmPayload](
-    ke_msg_alloc(APM_STA_DEL_CFM, TASK_API, TASK_APM,
+    ke_msg_alloc(APM_STA_DEL_CFM, header.srcId, header.destId,
                  ApmStaDelCfmPayloadSize))
-  # Validate VIF type
+  if cfm == nil:
+    return 0
+  cfm[] = default(ApmStaDelCfmPayload)
+  cfm.status = 0xFF
+  if header.paramLen < sizeof(ApmStaDelReqPayload).uint32:
+    ke_msg_send(cfm)
+    return 0
   let req = apmStaDelReqView(param)
   let vifLookupIdx = req.vifLookupIdx
-  let vif = vifChannelForIdx(vifLookupIdx)
-  if vif.vifType != 2:  # Not VIF_AP
-    if cfm != nil: cfm.status = 0xFF
-    ke_msg_send(cfm)
-    return
-  # Validate sta_idx_in_vif
   let staIdxInVif = req.staIdxInVif
-  if staIdxInVif > 7:
-    if cfm != nil: cfm.status = 0xFF
+  if vifLookupIdx.int >= MAX_VIFS or staIdxInVif >= STA_MGMT_FREE_STAS.uint8:
     ke_msg_send(cfm)
-    return
-  # Perform deletion (blob: apm_sta_remove, not apm_sta_fw_delete)
-  let staMac = cast[pointer](addr staInfoForIdx(staIdxInVif).macAddr[0])
-  apm_sta_remove(cast[pointer](vif), staIdxInVif, staMac, 1)
-  if cfm != nil: cfm.status = 0
+    return 0
+  let vif = vifChannelForIdx(vifLookupIdx)
+  let sta = staInfoForIdx(staIdxInVif)
+  if vif.vifType == 2 and staDeleteIsCurrent(staIdxInVif, epoch) and
+     sta.instNbr == vifLookupIdx:
+    if apm_sta_remove(vifLookupIdx, staIdxInVif,
+                      WLAN_FW_APM_DELETESTA_BY_USER.uint16, 2'u16):
+      cfm.status = 0
   ke_msg_send(cfm)
+  return 0
 
-proc apm_sta_delete*(param: pointer) {.exportc, cdecl.} =
-  ## Delete a station from AP mode (240 bytes in blob, 58 instrs).
-  ## From blob (apm.o): a0=sta_idx, a1=mac_addr_ptr, a2=reason_code, a3=extra.
-  ## 1. Alloc ME_STA_DEL_REQ (0xC07, dest=TASK_ME, src=TASK_APM, len=1)
-  ## 2. Alloc APM_STA_DEL_IND (0x1405, dest=TASK_API, src=TASK_APM, len=6)
-  ## 3. Call _aid_list_delete(mac_addr_ptr)
-  ## 4. If apm_env[0xAC] != 0: mm_sec_machwkey_del((sta_idx+8) & 0xFF)
-  ## 5. Compute STA entry, get time, log elapsed, populate and send both msgs.
-  let staIdx = encodedArgU8(param)
-  var macAddrPtr: pointer
-  var reasonCode: uint16
-  var extra: uint16
-  {.emit: ["asm volatile(\"mv %0, a1\" : \"=r\"(", macAddrPtr, ") );"].}
-  {.emit: ["asm volatile(\"mv %0, a2\" : \"=r\"(", reasonCode, ") );"].}
-  {.emit: ["asm volatile(\"mv %0, a3\" : \"=r\"(", extra, ") );"].}
-  # Allocate ME_STA_DEL_REQ message (1-byte param: sta_idx)
+proc apm_sta_delete*(staIdx: uint8, macAddr: pointer,
+                     statusCode, reasonCode: uint16): bool {.exportc, cdecl.} =
+  ## apm.o uses four ordinary C arguments. The boolean result is Nim-side
+  ## failure reporting; no deletion is started unless both messages exist.
+  if staIdx >= STA_MGMT_FREE_STAS.uint8 or macAddr == nil:
+    return false
+  let sta = staInfoForIdx(staIdx)
+  if sta.valid == 0 or c_memcmp(addr sta.macAddr[0], macAddr, 6.csize_t) != 0:
+    return false
+  let epoch = staDeleteEpoch(staIdx)
   let msg1 = cast[ptr MeStaDelReqPayload](
     ke_msg_alloc(ME_STA_DEL_REQ, TASK_ME, TASK_APM,
                  MeStaDelReqPayloadSize))
-  # Allocate APM_STA_DEL_IND message (6-byte param: reason_code(2) + extra(2) + sta_idx(1) + pad)
+  if msg1 == nil:
+    return false
   let msg2 = cast[ptr ApmStaDelIndPayload](
     ke_msg_alloc(APM_STA_DEL_IND, TASK_API, TASK_APM,
                  ApmStaDelIndPayloadSize))
-  # Delete from AID list using MAC address
-  aidListDelete(macAddrPtr)
-  # Conditionally delete HW key if the AP hostapd context is active.
+  if msg2 == nil:
+    ke_msg_free(keMsgHdrFromPayload(msg1))
+    return false
+  if not staDeleteIsCurrent(staIdx, epoch):
+    ke_msg_free(keMsgHdrFromPayload(msg1))
+    ke_msg_free(keMsgHdrFromPayload(msg2))
+    return false
+  aidListDelete(macAddr)
+  if not staDeleteIsCurrent(staIdx, epoch):
+    ke_msg_free(keMsgHdrFromPayload(msg1))
+    ke_msg_free(keMsgHdrFromPayload(msg2))
+    return false
   if apmEnvView().hostapdCtx != nil:
-    mm_sec_machwkey_del(((staIdx.uint32 + 8) and 0xFF).uint8)
-  let sta = staInfoForIdx(staIdx)
-  let vifIdx = uint8(sta.aid and 0x00FF'u16)
-  sta.apmConnectTime = 0
-  # Get current time and compute elapsed
+    mm_sec_machwkey_del(staIdx + 8'u8)
+  if not staDeleteIsCurrent(staIdx, epoch):
+    ke_msg_free(keMsgHdrFromPayload(msg1))
+    ke_msg_free(keMsgHdrFromPayload(msg2))
+    return false
+  sta.apmWpaContext = nil
   let logFn = getLogFunc(204)
   let getTimeFn = cast[proc(): uint32 {.cdecl.}](blOpsFunc(200))
-  let now = getTimeFn()
-  let connStart = sta.connectionStart
-  let elapsed = now - connStart
-  # Log disconnect with elapsed time (line 583)
-  if logFn != nil:
-    logFn(2, 0, nil, 583, staIdx.uint32, elapsed, vifIdx.uint32)
-  # Populate and send APM_STA_DEL_IND (msg2)
-  msg2.reason = reasonCode
-  msg2.extra = extra
+  if logFn != nil and getTimeFn != nil:
+    let elapsed = getTimeFn() - sta.connectionStart
+    cast[proc(level: uint32; tag, file: cstring; line: cint;
+              format: cstring) {.cdecl, varargs.}](logFn)(
+      2, nil, "apm.c", 583,
+      "apm_sta_delete:%d, aid:%d, last seen %ld\r\n",
+      staIdx.cint, sta.aid.cint, cast[int32](elapsed).clong)
+  if not staDeleteIsCurrent(staIdx, epoch):
+    ke_msg_free(keMsgHdrFromPayload(msg1))
+    ke_msg_free(keMsgHdrFromPayload(msg2))
+    return false
+  msg2[] = default(ApmStaDelIndPayload)
+  msg2.statusCode = statusCode
+  msg2.reasonCode = reasonCode
   msg2.staIdx = staIdx
-  ke_msg_send(msg2)
-  # Populate and send ME_STA_DEL_REQ (msg1)
   msg1.staIdx = staIdx
+  ke_msg_send(msg2)
+  if not staDeleteIsCurrent(staIdx, epoch):
+    msg1.staIdx = 0xFF
   ke_msg_send(msg1)
+  true
 
-proc apm_sta_connect_timeout_ind_handler*(param: pointer) {.exportc, cdecl.} =
-  ## Handle station connect timeout in AP mode (222 bytes in blob, 56 instrs).
-  ## From blob (apm_task.o): gets current time via g_bl_ops_funcs[200].
-  ## Loops over 7 STAs (stride 368). For each STA with non-zero conn_time
-  ## (offset 0x14), checks if (now - conn_time) > 30000. If timed out,
-  ## reads vif_idx from STA[87], calls apm_sta_fw_delete with the
-  ## DELETECONNECTION_TIMEOUT status. After loop, re-arms the 5-second timer.
+proc apmVifRunning(vifIdx: uint8): bool =
+  if vifIdx.int >= MAX_VIFS or
+     ((apmPendingCancelMask or apmStoppingVifs) and (1'u8 shl vifIdx)) != 0 or
+     apmStartPendingForVif(vifIdx):
+    return false
+  let vif = vifChannelForIdx(vifIdx)
+  vif.vifType == VIF_TYPE_AP and vif.state != 0
+
+proc apm_sta_connect_timeout_ind_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
+  ## Vendor scans all seven stations and reports status 4, reason 0xffff.
+  var running = false
+  for vifIdx in 0'u8 ..< MAX_VIFS.uint8:
+    if apmVifRunning(vifIdx): running = true
+  if not running:
+    return KeMsgConsumed
   let getTimeFnPtr = blOpsFunc(200)
-  if getTimeFnPtr == nil:
-    return
-  let getTimeFn = cast[proc(): uint32 {.cdecl.}](getTimeFnPtr)
-  let now = getTimeFn()
-  let apmBase = cast[uint](addr apm_env[0])
-  let maxSta = cast[ptr uint8](apmBase + 4)[]
-  let maxStaCount = if maxSta == 0: 7'u8 else: maxSta
-  # Iterate connected STAs
-  for apStaSlotIndex in 0'u8 ..< maxStaCount:
-    let sta = staInfoForIdx(apStaSlotIndex)
-    let connTime = sta.connectionStart
-    if connTime == 0:
-      continue
-    let elapsed = now - connTime
-    if elapsed > 30000:
-      # Timed out: get VIF index from STA entry, delete the connection
-      let vifIdx = sta.keyArea[7]
-      # Log the timeout via platform ops
-      let logFnPtr = blOpsFunc(204)
-      if logFnPtr != nil:
-        let logFn = cast[PlatformLogFunc](logFnPtr)
-        logFn(1, 0, nil, 530, apStaSlotIndex.uint32, elapsed)
-      apm_sta_fw_delete(apStaSlotIndex, vifIdx, WLAN_FW_APM_DELETECONNECTION_TIMEOUT.uint16)
-  # Re-arm the 5-second timeout timer (blob: ke_timer_set)
-  let timerMsgId = KE_FIRST_MSG(TASK_APM.uint16) + 6  # APM_STA_CONNECT_TIMEOUT_IND
-  let apmInstNbr = cast[ptr uint8](apmBase + 2)[]
-  ke_timer_set(timerMsgId, apmInstNbr, 5000000'u32)
+  if getTimeFnPtr != nil:
+    let now = cast[proc(): uint32 {.cdecl.}](getTimeFnPtr)()
+    for apStaSlotIndex in 0'u8 ..< STA_INFO_TAB_ENTRIES.uint8:
+      let sta = staInfoForIdx(apStaSlotIndex)
+      let connTime = sta.connectionStart
+      if sta.valid != 0 and apmVifRunning(sta.instNbr) and connTime != 0 and
+         cast[int32](now - connTime) > 30000:
+        apm_sta_fw_delete(apStaSlotIndex,
+          WLAN_FW_APM_DELETECONNECTION_TIMEOUT.uint16, 0xFFFF'u16)
+  for vifIdx in 0'u8 ..< MAX_VIFS.uint8:
+    if apmVifRunning(vifIdx):
+      ke_timer_set(KE_FIRST_MSG(TASK_APM.uint16) + 6, TASK_APM, 5000000'u32)
+      break
+  KeMsgConsumed
 
-proc apm_conf_max_sta_req_handler*(param: pointer) {.exportc, cdecl.} =
-  ## Handle APM_CONF_MAX_STA_REQ (104b in blob, apm_task.o).
-  ## Blob ABI: a0=msgId, a1=body, a2=srcId, a3=destId.
-  ## Reads body[0] for max_sta, clamps to 5, stores in apm_env, logs, sends CFM.
+proc apm_conf_max_sta_req_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
+  ## Clamp the requested station limit, then log and confirm to the sender.
+  if param == nil:
+    return KeMsgConsumed
   let hdr = keMsgHdrFromPayload(param)
-  let srcId = hdr.destId
-  let destId = hdr.srcId
-  var maxSta = apmConfMaxStaReqView(param).maxSta
-  if maxSta > 5:
-    maxSta = 5
-  let logFn = blOpsFunc(204)
+  if hdr.paramLen < ApmConfMaxStaReqPayloadSize:
+    return KeMsgConsumed
+  let replyDest = hdr.srcId
+  let replySource = hdr.destId
+  let maxSta = min(apmConfMaxStaReqView(param).maxSta, STA_MGMT_FREE_STAS.uint8)
+  let logFn = getLogFunc(204)
   apmEnvView().maxSta = maxSta
-  # Log max STA setting
   if logFn != nil:
-    cast[proc(a0: uint32, a1: uint32, fmtStr: pointer, line: uint32, val: uint32) {.cdecl.}](logFn)(
-      2, 0, nil, 447, maxSta.uint32)
-  # Send APM_CONF_MAX_STA_CFM (0x140A) via ke_msg_send_basic (blob uses basic form)
-  ke_msg_send_basic(APM_CONF_MAX_STA_CFM, destId, srcId)
+    cast[proc(level: uint32; tag, file: cstring; line: cint;
+              format: cstring) {.cdecl, varargs.}](logFn)(
+      2, nil, "apm_task.c", 447, "Adjust max_sta_supported to %u\r\n", maxSta.cuint)
+  ke_msg_send_basic(APM_CONF_MAX_STA_CFM, replyDest, replySource)
+  KeMsgConsumed
 
 # --- ME Task Handlers (me_task.o) ---
 
-proc me_config_req_handler*(param: pointer) {.exportc, cdecl.} =
+proc me_config_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle ME_CONFIG_REQ (216 bytes in blob, 56 instrs).
   ## From blob (me_task.o): copies 32 bytes of HT cap from req to me_env(+8).
   ## Stores req[46] (ht_supp) at me_env.ht_supp(130). Sends ME_CONFIG_CFM (0xc01)
   ## via ke_msg_send_basic. If HT: queries NSS, stores caps.
   ## Copies def_key(req[44]) to me_env(128), ps_on(req[48]) to me_env(133).
-  ## If ps_on: sets ps_mode=0xFF, sets cfm status=2, sends cfm, sets ME state to 1.
+  ## If ps_on: starts MM_SET_PS_MODE_REQ(mode=2) with no second host reply.
+  if param == nil or keMsgHdrFromPayload(param).paramLen < 49:
+    return KeMsgConsumed
+  if ke_state_get(TASK_ME) == MeBusyState:
+    return KeMsgSaved
+  let requester = keMsgHdrFromPayload(param).srcId
   when defined(bl808HeapGuardMsgs):
     proc tlsfCheckHeapRaw(): cint {.importc: "tlsf_check_heap", cdecl.}
     if tlsfCheckHeapRaw() == 0: nimFwDbgHeapGuardStage = 1  # broken on ENTRY
@@ -2534,18 +2613,13 @@ proc me_config_req_handler*(param: pointer) {.exportc, cdecl.} =
   when defined(bl808HeapGuardMsgs):
     if nimFwDbgHeapGuardStage == 0 and tlsfCheckHeapRaw() == 0:
       nimFwDbgHeapGuardStage = 2  # broken after HT-caps memcpy
-  # Send basic ME_CONFIG_CFM
-  ke_msg_send_basic(ME_CONFIG_CFM, TASK_API, TASK_ME)
-  when defined(bl808HeapGuardMsgs):
-    if nimFwDbgHeapGuardStage == 0 and tlsfCheckHeapRaw() == 0:
-      nimFwDbgHeapGuardStage = 3  # broken after ke_msg_send_basic(CFM)
   # Process HT capabilities
   if htSupp != 0:
     # Get NSS from PHY (blob: phy_get_nss at 0x64)
     let nss = phy_get_nss()
-    me.nss = nss
+    me.nss = ((nss.uint16 + 1) shr 1).uint8
     let htCapInfo = cast[ptr uint16](addr me.htCaps[0])[]
-    me.htCapByte = cast[uint8](htCapInfo and 0xFF)
+    me.htCapByte = ((htCapInfo shr 1) and 1).uint8
   else:
     me.nss = 0
     me.htCapByte = 0
@@ -2554,17 +2628,17 @@ proc me_config_req_handler*(param: pointer) {.exportc, cdecl.} =
   let psOn = req.psOn
   me.psOn = psOn
   if psOn != 0:
-    me.psMode = 0xFF
-    # Alloc and send cfm with status=2
-    let cfm = cast[ptr Status4CfmPayload](
-      ke_msg_alloc(ME_CONFIG_CFM, TASK_API, TASK_ME,
-                   Status4CfmPayloadSize))
-    if cfm != nil:
-      cfm.status = 2
-      ke_msg_send(cfm)
-    ke_state_set(TASK_ME, MeBusyState)
+    result = meBeginControl(param, MM_SET_PS_MODE_REQ, 2, 0, 0)
+    if result == KeMsgSaved:
+      return
+  else:
+    result = KeMsgConsumed
+  ke_msg_send_basic(ME_CONFIG_CFM, requester, TASK_ME)
+  when defined(bl808HeapGuardMsgs):
+    if nimFwDbgHeapGuardStage == 0 and tlsfCheckHeapRaw() == 0:
+      nimFwDbgHeapGuardStage = 3  # broken after ke_msg_send_basic(CFM)
 
-proc me_chan_config_req_handler*(param: pointer) {.exportc, cdecl.} =
+proc me_chan_config_req_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
   ## Handle ME_CHAN_CONFIG_REQ: configure channel parameters.
   ## From blob (me_task.o, 0x3c bytes): memcpy(me_env+0x28, param, 86);
   ##   ke_msg_send_basic(ME_CHAN_CONFIG_CFM, destId=srcId_in, srcId=destId_in).
@@ -2573,150 +2647,154 @@ proc me_chan_config_req_handler*(param: pointer) {.exportc, cdecl.} =
   let destId = hdr.srcId
   discard c_memcpy(addr meEnvView().chanConfig[0], param, 86.csize_t)
   ke_msg_send_basic(ME_CHAN_CONFIG_CFM, destId, srcId)
+  return 0
 
-{.emit: "__attribute__((optimize(\"crossjumping\"))) void me_sta_add_req_handler(void*);".}
-proc me_sta_add_req_handler*(param: pointer) {.exportc, cdecl.} =
-  ## Handle ME_STA_ADD_REQ (480 bytes in blob, 153 instrs).
-  ## From blob (me_task.o): allocs ME_STA_ADD_CFM. Reads sta_idx from req[73].
-  ## Checks req[64] bit 1 (HT cap): computes rate mask from spatial streams.
-  ## Copies MAC addr (6 bytes) from req+0 to stack buffer. Reads bandwidth,
-  ## VHT/HE caps. Calls mm_sta_add(). On success: copies supported rates from
-  ## req[6..18] (13 bytes) to sta[248], sets HT/VHT/HE capability flags in
-  ## sta[308], copies VHT caps if present (32 bytes to sta[264]),
-  ## calls me_set_sta_ht_vht_param, me_init_rate, sets sta[334] |= 0x10.
-  ## Copies beacon interval and UAPSD info to sta entries.
+{.emit: "__attribute__((optimize(\"crossjumping\"))) int me_sta_add_req_handler(void*);".}
+proc me_sta_add_req_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
+  ## Translate the ME station request to the distinct MM registration layout.
+  ## me_task.o passes the CFM station byte as the logical-index output; the
+  ## hardware index has separate scratch storage and is not a station index.
+  if param == nil:
+    return 0
+  let requestHeader = keMsgHdrFromPayload(param)
+  let fromApm = requestHeader.srcId == TASK_APM
+  let pendingSlot = if fromApm: apmPendingRequestSlot(param, true) else: -1
+  if fromApm and pendingSlot < 0:
+    return 0
   let cfm = cast[ptr MeStaAddCfmPayload](
-    ke_msg_alloc(ME_STA_ADD_CFM, TASK_API, TASK_ME,
+    ke_msg_alloc(ME_STA_ADD_CFM, requestHeader.srcId, requestHeader.destId,
                  MeStaAddCfmPayloadSize))
-  let req = meStaAddReqView(param)
-  let staIdx = req.staIdx
-  # Check HT capability
-  var htRateMask: uint32 = 0
-  var spatialStreamBits: uint32 = 0
-  let htCapBit = req.capFlags
-  if (htCapBit and 1) != 0:
-    # HT capable: compute rate config from HT cap info
-    let htCapInfo = req.htCapInfo
-    spatialStreamBits = (htCapInfo and 3).uint32
-    htRateMask = (1'u32 shl (spatialStreamBits + 13)) - 1
-  # Copy MAC addr to stack buffer, call mm_sta_add
-  var macBuf {.noinit.}: array[6, uint8]
-  discard c_memcpy(addr macBuf[0], addr req.macAddr[0], 6.csize_t)
-  var hwStaIdx: uint8
-  let addResult = mm_sta_add(param, addr hwStaIdx, cast[ptr uint8](cfm))
-  # Store result in CFM
-  if cfm != nil:
-    cfm.status = addResult
-    if addResult != 0:
-      # Failed
-      ke_msg_send(cfm)
-      return
-    # Success: setup station
-    let assignedStaIdx = cfm.staIdx
-    let sta = staInfoForIdx(assignedStaIdx)
-    # Copy supported rates (13 bytes)
-    discard c_memcpy(addr sta.supportedRates[0], addr req.supportedRates[0],
-                     13.csize_t)
-    # Set capability flags
-    var capaFlags = sta.capabilityFlags
-    if (htCapBit and 1) != 0:
-      capaFlags = capaFlags or 1  # HT
-    # Check VHT (me_env+0x82)
-    if meEnvView().htSupp != 0:
-      capaFlags = capaFlags or 2  # VHT
-      # Copy VHT caps (32 bytes)
-      discard c_memcpy(addr sta.vhtCaps[0], meStaAddReqCapBlock(req),
-                       32.csize_t)
-    sta.capabilityFlags = capaFlags
-    # Set HT/VHT params
-    let vif = vifChannelForIdx(staIdx)
-    # Cast to match blob ABI: first arg is sta entry pointer
-    me_set_sta_ht_vht_param(cast[pointer](sta),
-                            cast[pointer](vifHtCapabilities(vif)))
-    # Check HE flag (bit 3 of req[64])
-    if (htCapBit and 8) != 0:
-      var capa2 = sta.capabilityFlags
-      capa2 = capa2 or 8  # HE flag (blob: ori a5, a5, 8)
-      sta.capabilityFlags = capa2
-    # Initialize rate control
-    me_init_rate(cast[pointer](sta))
-    # Mark the STA TX-power policy stale.
-    sta.txPolicyUpdateFlags[0] = sta.txPolicyUpdateFlags[0] or StaTxPolicyUpdateTxPower
-    # Compute control-port state from VIF key flags and write to sta[72].
-    let keyFlagByte = (vifKeyPointers(vif).flags and 0xFF).uint8
-    let controlPortState = 2'u8 - (keyFlagByte and 1)
-    sta.controlPortState = controlPortState
-    sta.rateWord = vif.apStartBeaconInterval
-    # Copy UAPSD info from req[70,71] to sta[314,315]
-    sta.psState = req.uapsd0
-    sta.uapsdBitmap = req.uapsd1
-    # Copy beacon interval from req[68] to sta[36]
-    sta.aid = req.beaconInterval
+  if cfm == nil:
+    if fromApm:
+      aidListDelete(addr apmStaSlot(pendingSlot.uint).macAddr[0])
+    return 0
+  cfm.staIdx = 0xFF
+  cfm.status = 1
+  if fromApm:
+    apmPendingAssociations[pendingSlot].request = nil
+    apmPendingAssociations[pendingSlot].confirmation = cfm
+    apmPendingAssociations[pendingSlot].meQueued = false
+  # The final meaningful field is dataRate at byte 85; the C structure has
+  # two trailing alignment bytes which are not required to parse the request.
+  if requestHeader.paramLen < 86:
     ke_msg_send(cfm)
+    return 0
+  let req = meStaAddReqView(param)
+  if req.vifIdx.int >= MAX_VIFS or req.supportedRates[0] > 12:
+    ke_msg_send(cfm)
+    return 0
+  let vif = vifChannelForIdx(req.vifIdx)
+  var registration: MmStaAddReqPayload
+  discard c_memcpy(addr registration.bssid[0], addr req.macAddr[0], 6.csize_t)
+  registration.vifIdx = req.vifIdx
+  registration.rssi = req.rssi
+  registration.tsfLow = req.tsfLow
+  registration.tsfHigh = req.tsfHigh
+  registration.dataRate = req.dataRate
+  let flags = req.capFlags
+  if (flags and 2) != 0:
+    let ampdu = meStaAddReqHtCaps(req).ampduParams
+    mmStaFillAggregation(registration, ampdu)
+  var hardwareIndex = 0xFF'u8
+  cfm.status = mm_sta_add(addr registration, addr cfm.staIdx, addr hardwareIndex)
+  if fromApm and apmPendingAssociations[pendingSlot].confirmation != cfm:
+    if cfm.status == 0 and cfm.staIdx.int < STA_INFO_TAB_ENTRIES:
+      mm_sta_del(cfm.staIdx)
+    cfm.staIdx = 0xFF
+    cfm.status = 1
+    ke_msg_send(cfm)
+    return 0
+  if cfm.status != 0 or cfm.staIdx.int >= STA_INFO_TAB_ENTRIES:
+    if cfm.status == 0:
+      cfm.status = 1
+    cfm.staIdx = 0xFF
+    ke_msg_send(cfm)
+    return 0
+  let sta = staInfoForIdx(cfm.staIdx)
+  discard c_memcpy(addr sta.supportedRates[0], addr req.supportedRates[0], 13.csize_t)
+  if (flags and 1) != 0:
+    sta.capabilityFlags = sta.capabilityFlags or 1
+    if (flags and 2) != 0 and meEnvView().htSupp != 0:
+      sta.capabilityFlags = sta.capabilityFlags or 2
+      discard c_memcpy(addr sta.vhtCaps[0], meStaAddReqCapBlock(req), 32.csize_t)
+      me_set_sta_ht_vht_param(cast[pointer](sta), cast[pointer](vifHtCapabilities(vif)))
+  if (flags and 8) != 0:
+    sta.capabilityFlags = sta.capabilityFlags or 8
+  sta.psState = req.uapsdQueues
+  sta.uapsdBitmap = req.maxServicePeriod
+  sta.aid = req.aid
+  let rateStationIdx = cfm.staIdx
+  let rateStationEpoch = staDeleteEpoch(rateStationIdx)
+  let rateInitialized = meTryInitRate(cast[pointer](sta))
+  if not rateInitialized or not staDeleteIsCurrent(rateStationIdx, rateStationEpoch) or
+      (fromApm and apmPendingAssociations[pendingSlot].confirmation != cfm):
+    if staDeleteIsCurrent(rateStationIdx, rateStationEpoch):
+      mm_sta_del(rateStationIdx)
+    cfm.staIdx = 0xFF
+    cfm.status = 1
+    ke_msg_send(cfm)
+    return 0
+  sta.txPolicyUpdateFlags[0] = sta.txPolicyUpdateFlags[0] or StaTxPolicyUpdateTxPower
+  let keyFlagByte = (vifKeyPointers(vif).flags and 0xFF).uint8
+  let controlPortState = 2'u8 - (keyFlagByte and 1)
+  sta.controlPortState = controlPortState
+  sta.rateWord = lmacGateHalfword(vif.apStartBeaconInterval)
+  ke_msg_send(cfm)
+  0
 
-proc me_sta_del_req_handler*(param: pointer) {.exportc, cdecl.} =
-  ## Handle ME_STA_DEL_REQ (80b in blob, me_task.o).
-  ## Blob ABI: a0=msgId, a1=body, a2=srcId, a3=destId.
-  ## Forwards MM_STA_DEL_REQ to MM (with staIdx from body[0]),
-  ## then sends ME_STA_DEL_CFM back to caller.
-  let hdr = keMsgHdrFromPayload(param)
-  let body = param
-  let srcId = hdr.destId
-  let destId = hdr.srcId
-  # Forward MM_STA_DEL_REQ to MM task
-  let fwd = cast[ptr MeStaDelReqPayload](
-    ke_msg_alloc(MM_STA_DEL_REQ, TASK_MM, TASK_ME,
-                 MeStaDelReqPayloadSize))
-  let staIdx = cast[ptr MeStaDelReqPayload](body).staIdx
-  fwd.staIdx = staIdx
-  ke_msg_send(fwd)
-  # Send ME_STA_DEL_CFM back to caller
-  ke_msg_send_basic(ME_STA_DEL_CFM, destId, srcId)
+proc me_sta_del_req_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
+  ## Preserve the vendor's acceptance ACK, distinct from MM completion.
+  if param == nil or keMsgHdrFromPayload(param).paramLen < MeStaDelReqPayloadSize:
+    return KeMsgConsumed
+  let header = keMsgHdrFromPayload(param)
+  let staIdx = cast[ptr MeStaDelReqPayload](param).staIdx
+  let epoch = staDeleteEpoch(staIdx)
+  let reply = ke_msg_try_alloc(ME_STA_DEL_CFM, header.srcId, header.destId, 0)
+  if reply == nil:
+    return KeMsgSaved
+  # Both requests carry one station-index byte; transfer the original allocation.
+  if not staDeleteIsCurrent(staIdx, epoch):
+    cast[ptr MeStaDelReqPayload](param).staIdx = 0xFF
+  header.paramLen = MmStaDelReqPayloadSize
+  ke_msg_forward_and_change_id(param, MM_STA_DEL_REQ, TASK_MM, TASK_ME)
+  ke_msg_send(reply)
+  KeMsgNoFree
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) int me_set_active_req_handler(void*);".}
 proc me_set_active_req_handler*(param: pointer): cint {.exportc, cdecl.} =
-  ## Handle ME_SET_ACTIVE_REQ (196 bytes in blob, 52 instrs).
-  ## From blob (me_task.o): manages per-VIF bitmask me_env.active_mask(offset 0).
-  ## If ME is busy: returns KeMsgSaved. Reads req[0]=active(bool), req[1]=vif_idx.
-  ## If active: set bit; else clear bit. Allocates ME_SET_ACTIVE_CFM (id=26),
-  ## sets status=seqz(mask), sends cfm, transitions to BUSY.
-  ## Fast path: if mask already 0 and deactivating, just send basic cfm.
+  ## Complete locally only when no MM transition is needed. Otherwise confirm
+  ## the requester after MM_SET_IDLE_CFM, not before MAC state has changed.
+  if param == nil or keMsgHdrFromPayload(param).paramLen < MeSetActiveReqPayloadSize:
+    return KeMsgConsumed
+  if not smBssAdmitRequest(param) or not smCleanupAdmitRequest(param):
+    return KeMsgConsumed
   let state = ke_state_get(TASK_ME)
   if state == MeBusyState:
     return KeMsgSaved
   let me = meEnvView()
-  let hdr = keMsgHdrFromPayload(param)
-  let reqSrc = hdr.srcId
-  let reqDst = hdr.destId
   let oldMask = me.activeMask
   let req = cast[ptr MeSetActiveReqPayload](param)
   let active = req.active
   let vifIdx = req.vifIdx
+  if vifIdx >= MAX_VIFS.uint8:
+    return KeMsgConsumed
   let activeVifMaskBit = 1'u32 shl vifIdx
   if oldMask == 0 and active == 0:
     # Already all inactive, just send basic cfm
-    ke_msg_send_basic(ME_SET_ACTIVE_CFM, reqSrc, reqDst)
+    ke_msg_send_basic_reply(param, ME_SET_ACTIVE_CFM)
     return KeMsgConsumed
   if oldMask != 0 and active != 0:
     # Set bit and send basic (already active path)
     me.activeMask = oldMask or activeVifMaskBit
-    ke_msg_send_basic(ME_SET_ACTIVE_CFM, reqSrc, reqDst)
+    ke_msg_send_basic_reply(param, ME_SET_ACTIVE_CFM)
     return KeMsgConsumed
-  # Main path: alloc full cfm
   var newMask: uint32
   if active != 0:
     newMask = oldMask or activeVifMaskBit
   else:
     newMask = oldMask and (not activeVifMaskBit)
-  me.activeMask = newMask
-  let cfm = cast[ptr StatusCfmPayload](
-    ke_msg_alloc(ME_SET_ACTIVE_CFM, reqSrc, reqDst,
-                 StatusCfmPayloadSize))
-  if cfm != nil:
-    cfm.status = if newMask == 0: 1'u8 else: 0'u8
-    ke_msg_send(cfm)
-  ke_state_set(TASK_ME, MeBusyState)
-  return KeMsgConsumed
+  meBeginControl(param, MM_SET_IDLE_REQ, uint8(newMask == 0),
+                 ME_SET_ACTIVE_CFM, newMask)
 
 proc smSetActiveCfmStateAllowed(): bool {.inline.} =
   ## Preserve the blob's two independent TASK_SM state reads while making the
@@ -2727,16 +2805,9 @@ proc smSetActiveCfmStateAllowed(): bool {.inline.} =
     return true
   return false
 
-proc apmSetActiveCfmStateAllowed(): bool {.inline.} =
-  ## Preserve the blob's two independent TASK_APM state reads while making the
-  ## allowed confirmation states explicit.
-  if ke_state_get(TASK_APM) == ApmActiveState:
-    return true
-  if ke_state_get(TASK_APM) == ApmIdleState:
-    return true
-  return false
-
-proc me_set_active_cfm_handler_sm*(param: pointer) {.exportc: "me_set_active_cfm_handler_sm", cdecl.} =
+proc me_set_active_cfm_handler_sm*(param: pointer): cint {.exportc: "me_set_active_cfm_handler_sm", cdecl, discardable.} =
+  if smCleanupConsumeReply(param): return 0
+  if not smBssConsumeReply(param): return 0
   ## Blob sm_task.o::me_set_active_cfm_handler (136 bytes).
   ## Only touches TASK_SM state. Blob flow (three ke_state_get reads):
   ##   1. if state == setting-BSS → .L31
@@ -2746,65 +2817,60 @@ proc me_set_active_cfm_handler_sm*(param: pointer) {.exportc: "me_set_active_cfm
   ##   .L33: if sm_env[17] != 0 → sm_deauth_send; sm_env[17] = 0
   ##         sm_auth_start(NULL)
   if not smSetActiveCfmStateAllowed():
-    # A stale / misordered ME_SET_ACTIVE_CFM — an orphan left in keMsgQueueSent
-    # by a torn-down connect attempt (recover path force-resets SM to Idle
-    # without draining SM-destined confirmations). The blob calls assert_err
-    # here, but assert_err raises the bit-31 firmware-reset event ->
-    # bl_reset_evt -> hal_machw_reset, which under a reconnect STORM fires many
-    # times and programs MAC MMIO on a possibly clock-gated MAC -> unhaltable
-    # AHB bus-stall (the observed wedge). The only legitimate states for this
-    # CFM are SettingBss(4) and Disconnecting(10); any other state is provably
-    # a stale orphan. Record it for telemetry and DROP it — do NOT assert, and
-    # do NOT fall through to sm_auth_start (connectInfo is already gone, so the
-    # auth send would silently no-op and leave SM stalled until the connect
-    # times out). This turns "assert+reset+stall" into a clean drop.
+    # Unexpected legacy confirmations are diagnostic-only. They must not
+    # restart authentication or reset MAC state for another connection.
     inc nimFwDbgActiveCfmBadState
     nimFwDbgActiveCfmLastState = ke_state_get(TASK_SM).uint32
-    return
+    return 0
   if ke_state_get(TASK_SM) == SmDisconnectingState:
     ke_state_set(TASK_SM, SmIdleState)
-    return
+    return 0
   let sm = smEnvView()
+  let connection = sm.connectInfo
+  if connection == nil: return 0
+  var build = smTxBegin(connection)
+  if not build.identity.captured or build.state != SmSettingBssState: return 0
+  defer: smTxEnd(build)
   let deauthFlag = sm.deauthPending
   when defined(bl808WifiConnectTrace):
     nimFwConnectTrace2U32("[WIFI-CT] active_flag ",
                           deauthFlag.uint32,
                           ke_state_get(TASK_SM).uint32)
+    if not smTxOwnerCurrent(build): return 0
   if deauthFlag != 0:
     when defined(bl808WifiConnectTrace):
       nimFwConnectTrace2U32("[WIFI-CT] deauth_pre ",
                             ke_state_get(TASK_SM).uint32,
                             cast[uint32](cast[uint](sm.connectInfo)))
-    sm_deauth_send(nil, 0)
+      if not smTxOwnerCurrent(build): return 0
+    smDeauthSend(build)
+    if not smTxOwnerCurrent(build): return 0
     sm.deauthPending = 0
   when defined(bl808WifiConnectTrace):
     nimFwTrace2U32("[WIFI-NIMFW] active_cfm_auth ",
                    ke_state_get(TASK_SM).uint32,
                    cast[uint32](cast[uint](sm.connectInfo)))
+    if not smTxOwnerCurrent(build): return 0
     nimFwConnectTrace2U32("[WIFI-CT] active_cfm ",
                           ke_state_get(TASK_SM).uint32,
                           cast[uint32](cast[uint](sm.connectInfo)))
+    if not smTxOwnerCurrent(build): return 0
     nimFwConnectTraceHw("[WIFI-CT] active_hw ")
-  sm_auth_start(nil)
+    if not smTxOwnerCurrent(build): return 0
+  sm_auth_start()
+  return 0
 
-proc me_set_active_cfm_handler_apm*(param: pointer) {.exportc: "me_set_active_cfm_handler_apm", cdecl.} =
-  ## Blob apm_task.o::me_set_active_cfm_handler (130 bytes).
-  ## Only touches TASK_APM state. Blob re-reads state three times rather than
-  ## caching, so we mirror that explicitly to preserve assert-then-retry
-  ## semantics (the state could in theory change between calls if another
-  ## task pre-empts — the blob's redundancy protects against that).
-  ##   1. if ke_state_get(APM) == active → jump to .L69 (skip assert)
-  ##   2. else if ke_state_get(APM) == idle → jump to .L69
-  ##   3. else → assert_err(313)
-  ##   .L69: if ke_state_get(APM) == active:
-  ##     if apm_env[4] != NULL → assert_err(320)
-  ##     apm_bcn_set(NULL)
-  if not apmSetActiveCfmStateAllowed():
-    assert_err("apm_task.c", "apm_task.c", 313)
-  if ke_state_get(TASK_APM) == ApmActiveState:
-    if apmEnvView().pendingBssParams.first != nil:
-      assert_err("apm_task.c", "apm_task.c", 320)
-    apm_bcn_set(nil)
+proc me_set_active_cfm_handler_apm*(param: pointer): cint {.exportc: "me_set_active_cfm_handler_apm", cdecl, discardable.} =
+  ## Only the reply to this startup's final BSS request may publish its beacon.
+  if apmConsumeStartReply(param):
+    if apmRollbackActive:
+      apmContinueStartRollback()
+    elif ke_state_get(TASK_APM) == ApmActiveState:
+      assert apmEnvView().pendingBssParams.first == nil
+      apm_bcn_set(nil)
+    else:
+      apm_start_cfm(cast[pointer](1'u))
+  KeMsgConsumed
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) int me_set_ps_disable_req_handler(void*);".}
 proc me_set_ps_disable_req_handler*(param: pointer): cint {.exportc, cdecl.} =
@@ -2812,28 +2878,32 @@ proc me_set_ps_disable_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## From blob (me_task.o): Nearly identical to me_set_active_req_handler but
   ## operates on me_env.ps_disable_mask (offset 4). Early exit if ps_on==0.
   ## Same bitmask set/clear pattern. Status = seqz * 2 (0 or 2).
+  if param == nil or keMsgHdrFromPayload(param).paramLen < MeSetPsDisableReqPayloadSize:
+    return KeMsgConsumed
+  if not smBssAdmitRequest(param) or not smCleanupAdmitRequest(param) or
+      not smActivationAdmitRequest(param):
+    return KeMsgConsumed
+  let req = cast[ptr MeSetPsDisableReqPayload](param)
+  if req.vifIdx >= MAX_VIFS.uint8:
+    return KeMsgConsumed
   let me = meEnvView()
-  let hdr = keMsgHdrFromPayload(param)
-  let reqSrc = hdr.srcId
-  let reqDst = hdr.destId
   if me.psOn == 0:
     # PS not configured, just send basic cfm
-    ke_msg_send_basic(ME_SET_PS_DISABLE_CFM, reqSrc, reqDst)
+    ke_msg_send_basic_reply(param, ME_SET_PS_DISABLE_CFM)
     return KeMsgConsumed
   let state = ke_state_get(TASK_ME)
   if state == MeBusyState:
     return KeMsgSaved
   let oldMask = me.psDisableMask
-  let req = cast[ptr MeSetPsDisableReqPayload](param)
   let psDisable = req.disable
   let vifIdx = req.vifIdx
   let psDisableVifMaskBit = 1'u32 shl vifIdx
   if oldMask == 0 and psDisable == 0:
-    ke_msg_send_basic(ME_SET_PS_DISABLE_CFM, reqSrc, reqDst)
+    ke_msg_send_basic_reply(param, ME_SET_PS_DISABLE_CFM)
     return KeMsgConsumed
   if oldMask != 0 and psDisable != 0:
     me.psDisableMask = oldMask or psDisableVifMaskBit
-    ke_msg_send_basic(ME_SET_PS_DISABLE_CFM, reqSrc, reqDst)
+    ke_msg_send_basic_reply(param, ME_SET_PS_DISABLE_CFM)
     return KeMsgConsumed
   # Main path
   var newMask: uint32
@@ -2841,17 +2911,13 @@ proc me_set_ps_disable_req_handler*(param: pointer): cint {.exportc, cdecl.} =
     newMask = oldMask or psDisableVifMaskBit
   else:
     newMask = oldMask and (not psDisableVifMaskBit)
-  me.psDisableMask = newMask
-  let cfm = cast[ptr StatusCfmPayload](
-    ke_msg_alloc(ME_SET_PS_DISABLE_CFM, reqSrc, reqDst,
-                 StatusCfmPayloadSize))
-  if cfm != nil:
-    cfm.status = if newMask == 0: 2'u8 else: 0'u8
-    ke_msg_send(cfm)
-  ke_state_set(TASK_ME, MeBusyState)
-  return KeMsgConsumed
+  meBeginControl(param, MM_SET_PS_MODE_REQ, (if newMask == 0: 2'u8 else: 0'u8),
+                 ME_SET_PS_DISABLE_CFM, newMask)
 
-proc me_set_ps_disable_cfm_handler_sm*(param: pointer) {.exportc: "me_set_ps_disable_cfm_handler_sm", cdecl.} =
+proc me_set_ps_disable_cfm_handler_sm*(param: pointer): cint {.exportc: "me_set_ps_disable_cfm_handler_sm", cdecl, discardable.} =
+  if smCleanupConsumeReply(param): return KeMsgConsumed
+  if smActivationConfirm(param, 2): return KeMsgConsumed
+  if not smBssConsumeReply(param): return KeMsgConsumed
   ## Blob sm_task.o (108 bytes). Linear structure: 4 ke_state_get calls
   ## matching setting-BSS, idle, disconnecting; assert_err on miss; then shared
   ## tail that re-reads state and tail-calls sm_send_next_bss_param if setting-BSS.
@@ -2862,72 +2928,51 @@ proc me_set_ps_disable_cfm_handler_sm*(param: pointer) {.exportc: "me_set_ps_dis
     assert_err("me_task.c", "me_task.c", 630)
   if ke_state_get(TASK_SM) == SmSettingBssState:
     sm_send_next_bss_param(param)
+  KeMsgConsumed
 
-proc me_set_ps_disable_cfm_handler_apm*(param: pointer) {.exportc: "me_set_ps_disable_cfm_handler_apm", cdecl.} =
-  ## Blob apm_task.o (92 bytes). Same linear structure as _sm but with
-  ## TASK_APM and states {active, idle}; assert at line 248; shared tail call.
-  block sendTail:
-    if ke_state_get(TASK_APM) == ApmActiveState: break sendTail
-    if ke_state_get(TASK_APM) == ApmIdleState: break sendTail
-    assert_err("apm_task.c", "apm_task.c", 248)
-  if ke_state_get(TASK_APM) == ApmActiveState:
-    apm_send_next_bss_param(param)
+proc me_set_ps_disable_cfm_handler_apm*(param: pointer): cint {.exportc: "me_set_ps_disable_cfm_handler_apm", cdecl, discardable.} =
+  ## A stop reply or a duplicate cannot consume the next startup BSS request.
+  if apmConsumeStartReply(param):
+    if apmRollbackActive:
+      apmContinueStartRollback()
+    elif ke_state_get(TASK_APM) == ApmActiveState:
+      apm_send_next_bss_param(param)
+    else:
+      apm_start_cfm(cast[pointer](1'u))
+  KeMsgConsumed
 
 
-proc me_rc_set_rate_req_handler*(param: pointer) {.exportc, cdecl.} =
-  ## Handle ME_RC_SET_RATE_REQ (218 bytes in blob, 56 instrs).
-  ## From blob (me_task.o): reads sta_idx from req[0], fixed_rate from req[2].
-  ## Validates sta.valid(42)!=0, asserts rc_ptr(324)!=nil.
-  ## If fixed_rate==0xFFFF: auto rate mode - clears bits 5,6 of
-  ##   rate-control flags(175), stores -1 to fixed_rate(198), calls rate reinit.
-  ## If fixed_rate!=0xFFFF: calls me_rc_set_rate, if success sets bit 5 of
-  ##   rate-control flags, clears bit 6, stores rate to fixed_rate(198).
-  ## Then checks req[4] (mcs_rate): if non-zero sets sta.mm_flags(334) |= 0x10.
+proc me_rc_set_rate_req_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
+  ## Select fixed or automatic rates using the vendor's RC-state ABI.
+  if param == nil:
+    return 0
   let req = meRcSetRateReqView(param)
   let staIdx = req.staIdx
+  if staIdx.int >= STA_INFO_TAB_ENTRIES:
+    return 0
   let sta = staInfoForIdx(staIdx)
-  # Validate STA is valid
   if sta.valid == 0:
-    return
-  # Get RC pointer and assert non-nil
+    return 0
   let rcPtr = sta.rcStats
   if rcPtr == nil:
     assert_err("me_task.c", "me_task.c", 653)
-  let rcBase = cast[uint](rcPtr)
-  let rateControlStats = rcStatsCounters(rcPtr)
+    return 0
+  let caps = rcRateCapabilities(rcPtr)
+  let control = rcTrialControl(rcPtr)
   let fixedRate = req.fixedRate
   if fixedRate == 0xFFFF:
-    # Auto rate: clear fixed_rate, clear fixed/forced rate-control flags,
-    # then refresh max bandwidth/NSS from the stats view.
-    rateControlStats.fixedRate = 0xFFFF'u16
-    var flags = rateControlStats.flags
-    flags = flags and not 0x60'u8  # Clear bits 5,6
-    rateControlStats.flags = flags
-    let rateControlStaInfoIdx = sta.infoIdx
+    caps.fixedRate = 0xFFFF'u16
+    control.info = control.info and not 0x60'u8
     rc_update_bw_nss_max(
-      rateControlStaInfoIdx, rateControlStats.nssMax, rateControlStats.bwMax)
-  else:
-    # Fixed rate mode: call rc_check_fixed_rate_config(rcPtr, fixedRate)
-    # Blob ABI: a0=rcPtr, a1=fixedRate. Nim's signature takes (staIdx: uint8)
-    # so we pass via emit to set both regs properly.
-    var configOk: bool
-    {.emit: ["""
-    register void* _a0 __asm__("a0") = (void*)""", rcBase, """;
-    register unsigned int _a1 __asm__("a1") = (unsigned int)""", fixedRate, """;
-    __asm__ volatile("" : : "r"(_a0), "r"(_a1));
-    """, configOk, """ = rc_check_fixed_rate_config((NU8)(NI)_a0);
-    """].}
-    if configOk:
-      rateControlStats.fixedRate = fixedRate
-      var flags = rateControlStats.flags
-      flags = flags and not 0x60'u8  # Clear bits 5,6
-      flags = flags or 0x20'u8  # Set bit 5 (fixed rate flag)
-      rateControlStats.flags = flags
-  # Check mcs_rate field at req[4]
+      sta.infoIdx, caps.maxBandwidth, caps.maxNss)
+  elif rc_check_fixed_rate_config(rcPtr, fixedRate):
+    caps.fixedRate = fixedRate
+    control.info = (control.info and not 0x60'u8) or 0x20'u8
   if req.mcsRate != 0:
     sta.txPolicyUpdateFlags[0] = sta.txPolicyUpdateFlags[0] or StaTxPolicyUpdateTxPower
+  return 0
 
-proc me_traffic_ind_req_handler*(param: pointer) {.exportc, cdecl.} =
+proc me_traffic_ind_req_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
   ## Handle ME_TRAFFIC_IND_REQ (200 bytes in blob, 51 instrs).
   ## From blob (me_task.o): reads sta_idx from req[0], tx_avail from req[2],
   ## uapsd from req[1]. Updates sta.traffic_flags(offset 73) bits:
@@ -2961,13 +3006,14 @@ proc me_traffic_ind_req_handler*(param: pointer) {.exportc, cdecl.} =
       ke_msg_send(cfm)
   # Always send basic confirmation
   ke_msg_send_basic(ME_TRAFFIC_IND_CFM, TASK_API, TASK_ME)
+  return 0
 
 # me_build_associate_req is already implemented at line ~11115 via
 # me_build_associate_req_impl with the correct 7-argument blob ABI.
 
 # --- CFG Task Handler (cfg_task.o) ---
 
-proc cfg_start_req_handler*(param: pointer) {.exportc, cdecl.} =
+proc cfg_start_req_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
   ## Handle CFG_START_REQ (142b in blob, cfg_task.o).
   ## Blob ABI: a0=msgId, a1=msgBody, a2=srcId, a3=destId.
   ## If body[0]==0: call cfg_api_element_set(body+20, body[16], body[12], &result),
@@ -3005,72 +3051,62 @@ proc cfg_start_req_handler*(param: pointer) {.exportc, cdecl.} =
   # Send CFG_START_CFM (0x2001) with status=0
   let cfm = cast[ptr StatusCfmPayload](
     ke_msg_alloc(CFG_START_CFM, destId, srcId, StatusCfmPayloadSize))
-  cfm.status = 0
-  ke_msg_send(cfm)
+  if cfm != nil:
+    cfm.status = 0
+    ke_msg_send(cfm)
+  return 0
 
 # --- Channel Management (chan.o) missing functions ---
 
 proc chan_get_dominant_chan*(): pointer {.exportc, cdecl, noinline.} =
   ## Get the dominant channel context (highest priority active channel).
-  ## From blob (chan.o, 5 instrs): loads chanCurrentCtxt global, if nil returns nil.
-  ## Otherwise loads the channel context entry pointer from it.
+  ## The reconnect flag enables the dominant context stored in chan_env+0x28.
   ## noinline: blob calls this as a real function from chan_ctxt_use_dominant_chan.
-  if chanCurrentCtxt == nil:
+  if sm_reconn_dominant_flag == 0:
     return nil
-  return chanCurrentCtxt
+  return chanEnvView().dominantCtxt
 
 proc chan_get_next_chan*(): pointer {.exportc, cdecl.} =
-  ## Get next scheduled channel (302 bytes in blob, 76 instrs).
-  ## From blob (chan.o): 4-stage decision algorithm using TSF timing.
-  ## Stage 1: If current_chan exists and (ROC type==2 or timestamp not overdue
-  ##   or state==4): return current. Overdue = (TSF+5120) < timestamp.
-  ## Stage 2: If ROC chan exists and deadline not passed, skip to candidates.
-  ##   Otherwise index into chan table by ROC->index, check duty cycle.
-  ## Stage 3: Scan 3 candidate channel entries, pick highest priority active one.
-  ## Stage 4: Return best or ASSERT if none found.
+  ## Preserve imminent/current operations, fit an earlier TBTT when possible,
+  ## otherwise select the active context with the largest remaining budget.
   let env = chanEnvView()
   let curChan = env.currentCtxt
-  let rocChan = cast[pointer](env.tbttSwitchList.first)
+  let tbttEntry = cast[pointer](env.tbttSwitchList.first)
   let macTime = regRead(MACHW_TIMLO_REG)
   let timestamp = env.nextChanTimestamp
-  var best: pointer = nil
-  # Stage 1: Check current channel
+  var best = curChan
   if curChan != nil:
-    if rocChan != nil:
-      let rocNode = chanTbttNodeAt(rocChan)
-      if rocNode.state == 2:
+    if tbttEntry != nil:
+      let tbttNode = chanTbttNodeAt(tbttEntry)
+      if tbttNode.state == 2:
         return curChan
-    # Check if timestamp is not overdue (TSF + 5120 >= timestamp)
     let margin = macTime + 5120'u32
     if cast[int32](margin - timestamp) >= 0:
       return curChan
-    # Check current channel state
     if chanCtxtAt(curChan).status == 4:
       return curChan
-  # Stage 2: Check ROC channel
-  if rocChan != nil:
-    let rocNode = chanTbttNodeAt(rocChan)
-    let rocDeadline = rocNode.targetTime
-    if cast[int32](rocDeadline - timestamp) >= 0:
-      # ROC not expired, skip to candidates
-      discard
-    else:
-      # ROC expired: look up channel entry
-      best = vifChannelForIdx(rocNode.vifIdx).chanCtxt
+  if tbttEntry != nil:
+    let tbttNode = chanTbttNodeAt(tbttEntry)
+    let tbttDeadline = tbttNode.targetTime
+    if cast[int32](tbttDeadline - timestamp) < 0:
+      if tbttNode.vifIdx >= MAX_VIFS.uint8:
+        assert_err("chan.c", "chan.c", 338)
+        return nil
+      best = vifChannelForIdx(tbttNode.vifIdx).chanCtxt
       if best == nil:
         assert_err("chan.c", "chan.c", 338)
-      # Check if (TSF + 5120) - deadline is within acceptable range
+        return nil
       let margin2 = macTime + 5120'u32
-      if cast[int32](margin2 - rocDeadline) >= 0:
+      if cast[int32](margin2 - tbttDeadline) >= 0:
         return best
-      # Additional duty cycle check from fields 18/20
       let bestCtxt = chanCtxtAt(best)
-      let slotDur = bestCtxt.opSlot
-      let delta = cast[int32](rocDeadline - macTime)
-      if delta > 0 and delta.uint32 <= slotDur.uint32:
+      let availableSlots = if bestCtxt.opSlot > bestCtxt.tbttSlot:
+        bestCtxt.opSlot - bestCtxt.tbttSlot
+      else:
+        0'u16
+      let requiredSlots = ((tbttDeadline - macTime) shr 10) and 0xFFFF'u32
+      if availableSlots.uint32 >= requiredSlots:
         return best
-  # Stage 3: Scan the three channel-context pool entries for best priority.
-  best = nil
   var bestPrio: uint16 = 0
   for channelContextPoolIndex in 0'u8 .. 2'u8:
     let cand = chanCtxtForIdx(channelContextPoolIndex)
@@ -3091,7 +3127,11 @@ proc chan_switch_start*(chanCtxt: pointer) {.exportc, cdecl.} =
   ## checks pending(36) not nil -> return. Stores chanCtxt to pending,
   ## calls chan_upd_ctxt_status(chanCtxt, 2), allocs msg (id=74, 4 bytes),
   ## stores callback pointer, sets chan_env[123]=1, tail-calls ke_msg_send.
+  let saved = irqSave()
+  defer: irqRestore(saved)
   let env = chanEnvView()
+  if chanCtxt == nil:
+    return
   let curCtxt = env.currentCtxt
   if curCtxt == chanCtxt:
     # Same channel: check context conditions
@@ -3106,38 +3146,51 @@ proc chan_switch_start*(chanCtxt: pointer) {.exportc, cdecl.} =
   let pendCtxt = env.scheduledCtxt
   if pendCtxt != nil:
     return
-  # Store as pending and initiate switch
+  # Do not publish a pending switch unless its idle request can be queued.
+  var msg = chanSwitchAllocate(chanCtxt)
+  defer:
+    if msg != nil: ke_msg_free(keMsgHdrFromPayload(msg))
+  if msg == nil:
+    return
+  if env.scheduledCtxt != nil: return
   env.scheduledCtxt = chanCtxt
+  env.switchPending = 1
+  if not chanSwitchPublish(msg):
+    if env.scheduledCtxt == chanCtxt: env.scheduledCtxt = nil
+    env.switchPending = 0
+    return
   chan_upd_ctxt_status(chanCtxt, 2)
-  # Allocate channel switch message (id=74)
-  let msg = ke_msg_alloc(74, TASK_MM, 0xFF, 4)
-  if msg != nil:
-    # Store &chan_goto_idle_cb in the first word of the msg body (blob:
-    # `auipc a5, ...; sw a5, 0(a0)` with reloc to chan_goto_idle_cb).
-    cast[ptr pointer](msg)[] = cast[pointer](chan_goto_idle_cb)
-    env.switchPending = 1
-    ke_msg_send(msg)
+  if not chanSwitchAdmit(msg): return
+  let outgoing = msg
+  msg = nil
+  ke_msg_send(outgoing)
 
 proc chan_tbtt_schedule*(tbttEntry: pointer) {.exportc, cdecl.} =
-  ## Schedule TBTT events (270 bytes in blob, 61 instrs).
-  ## From blob (chan.o): If tbttEntry != NULL: calls chan_tbtt_insert(entry),
-  ## then enters processing loop. Loop: while tbtt_list non-empty, pop front
-  ## entry, look up vif_info for entry's vif_idx. If AP: use beacon_int*1024.
-  ## If STA: use sta_info.beacon_interval. Update next_tbtt_time += interval.
-  ## Increment miss_count (cap at 5), re-insert. If tbttEntry == NULL: check
-  ## chan_env.tbtt_switch (offset 16). If time_until_tbtt < 2ms: tailcall
-  ## chan_tbtt_switch_evt. Else: mark processed, set timer.
+  ## Insert/update a TBTT, advance displaced nodes by their beacon periods,
+  ## and arm the head or process it immediately within the two-ms window.
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  var operation: ChanTbttSnapshot
+  chanTbttBegin(operation)
+  template outside(body: untyped) =
+    irqRestore(saved)
+    try: body
+    finally: discard irqSave()
   if tbttEntry != nil:
     # Insert the new TBTT entry
-    chan_tbtt_insert(tbttEntry)
+    if not chanTbttInsert(tbttEntry, operation, saved): return
     # Process all entries in the TBTT list
     let tbttList = chanTbttReschedList()
     while tbttList.first != nil:
+      if not chanTbttCurrent(operation): return
       let poppedTbttListNode = co_list_pop_front(tbttList)
       if poppedTbttListNode == nil:
         break
       let tbttNode = chanTbttNodeAt(cast[pointer](poppedTbttListNode))
       let tbttVifIdx = tbttNode.vifIdx
+      if tbttVifIdx >= MAX_VIFS.uint8:
+        outside: assert_warn("chan.c", "chan.c", 2033)
+        continue
       let vif = vifChannelForIdx(tbttVifIdx)
       # Check if AP with beacon (vif.ap_bcn_present at offset 86)
       var interval: uint32
@@ -3146,7 +3199,12 @@ proc chan_tbtt_schedule*(tbttEntry: pointer) {.exportc, cdecl.} =
         interval = vif.apBeaconInterval.uint32 shl 10
       else:
         # STA: get beacon interval from sta_info
-        interval = staInfoForIdx(vif.staIdx).initialRateConfig
+        if vif.staIdx < STA_INFO_TAB_ENTRIES.uint8:
+          interval = staInfoForIdx(vif.staIdx).initialRateConfig
+      if interval == 0:
+        # An invalid beacon period must not keep requeueing the same event.
+        outside: assert_warn("chan.c", "chan.c", 2033)
+        continue
       # Update next_tbtt_time
       let previousTargetTime = tbttNode.targetTime
       tbttNode.targetTime = previousTargetTime + interval
@@ -3155,28 +3213,46 @@ proc chan_tbtt_schedule*(tbttEntry: pointer) {.exportc, cdecl.} =
       if missedTbttCount <= 4:
         tbttNode.priority = missedTbttCount + 1
       # Re-insert into sorted list
-      chan_tbtt_insert(cast[pointer](poppedTbttListNode))
-    return
-  # tbttEntry == NULL: check pending TBTT switch
+      if not chanTbttInsert(cast[pointer](poppedTbttListNode), operation, saved): return
+  if not chanTbttCurrent(operation): return
+  # The single timer belongs to the head, never to a node overtaken or removed.
   let tbttSwitch = cast[pointer](chanTbttPrimaryList().first)
+  let timerOwner = chanTbttDeferredSlot()[]
+  if timerOwner != nil and timerOwner != tbttSwitch:
+    let previous = chanTbttNodeAt(timerOwner)
+    if previous.state == 1:
+      previous.state = 0
+    chanTbttDeferredSlot()[] = nil
+    outside: mm_timer_clear(chanTbttTimer())
+    if not chanTbttCurrent(operation): return
   if tbttSwitch == nil:
     return
   let switchNode = chanTbttNodeAt(tbttSwitch)
+  if switchNode.state == 1 and chanTbttDeferredSlot()[] != tbttSwitch:
+    switchNode.state = 0
   let processed = switchNode.state
   if processed != 0:
     return
   # Check time until TBTT
   let tbttTime = switchNode.targetTime
   let macTime = regRead(MACHW_TIMLO_REG)
-  let timeUntil = cast[int32](tbttTime - macTime) - 2000
+  if not chanTbttCurrent(operation) or
+      cast[pointer](chanTbttPrimaryList().first) != tbttSwitch or
+      switchNode.targetTime != tbttTime or switchNode.state != 0:
+    return
+  let timeUntil = cast[int32](tbttTime - macTime - 2000'u32)
   if timeUntil < 0:
     # Time is past, switch immediately
-    chan_tbtt_switch_evt()
+    if chanTbttDeferredSlot()[] != nil:
+      chanTbttDeferredSlot()[] = nil
+      outside: mm_timer_clear(chanTbttTimer())
+      if not chanTbttCurrent(operation): return
+    outside: chan_tbtt_switch_evt(tbttSwitch)
     return
   # Schedule deferred switch: mark processed, set timer
   chanTbttDeferredSlot()[] = tbttSwitch
   switchNode.state = 1  # processed = true
-  mm_timer_set(chanTbttTimer(), tbttTime)
+  outside: mm_timer_set(chanTbttTimer(), tbttTime)
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void chan_goto_idle_cb(void);".}
 proc chan_goto_idle_cb*() {.exportc, cdecl.} =
@@ -3190,6 +3266,7 @@ proc chan_goto_idle_cb*() {.exportc, cdecl.} =
   ##   sends self-CTS via txl_frame_send_selfcts_frame.
   ## If any frames sent: chan_upd_ctxt_status(chan_ctxt, 3) then tail-call mm_active().
   ## Otherwise: tail-call chan_pre_switch_channel().
+  if not chanSwitchCallbackCurrent(): return
   let env = chanEnvView()
   # Clear CCA busy flag
   env.switchPending = 0
@@ -3198,19 +3275,21 @@ proc chan_goto_idle_cb*() {.exportc, cdecl.} =
   if chanCtxt == nil:
     return
   # Force idle
-  mm_force_idle_req()
+  if not mm_force_idle_req(): return
+  if not chanSwitchCallbackCurrent(): return
   # Check current channel and flags
   let curChan = env.currentCtxt
   if curChan == nil or (env.flags and 0x20) != 0:
     # No current channel or busy: skip to pre-switch
-    chan_pre_switch_channel(chanCtxt)
+    chan_pre_switch_channel()
     return
   let curChanAddr = cast[uint](curChan)
   # Set power management flag
   blmac_pwr_mgt_setf(1)
-  # Initialize counters
-  var nullCount: uint8 = 0
-  var selfctsCount: uint8 = 0
+  if not chanSwitchCallbackCurrent(): return
+  let protection = chanProtectionBegin()
+  if protection == 0: return
+  var selfctsDurationMs = 0'u16
   let ps = psEnvView()
   # Loop 1: iterate STA VIFs and send null frames
   let vifMgmt = vifMgmtEnvView()
@@ -3219,19 +3298,39 @@ proc chan_goto_idle_cb*() {.exportc, cdecl.} =
     let vif = vifChannelAt(cast[pointer](vifNode))
     let vifType = vif.vifType
     let vifChanCtxt = vif.chanCtxt
-    if vifType == 0 and vifChanCtxt != nil:
+    if vifType == VIF_TYPE_STA and vifChanCtxt != nil:
+      let durationMs = (chanCtxtAt(vifChanCtxt).schedSlot.uint32 shl 10) div 1000
+      selfctsDurationMs = (durationMs and 0xFFFF'u32).uint16
       # STA VIF with channel context
       if cast[uint](vifChanCtxt) == curChanAddr:
         let active = vif.state
         let staIdx = vif.staIdx
-        if active != 0 and staIdx != 0xFF:
-          # Check PS state
-          if ps.enabled == 0 or (ps.statusFlags and 8) != 0:
-            # Blob: txl_frame_send_null_frame(staIdx, chan_sta_tx_cfm, 0)
-            # a1 is the TX completion callback function pointer (not staIdx)
-            let sendNullFn = cast[proc(a0: uint8, a1: pointer, a2: uint32) {.cdecl.}](txl_frame_send_null_frame)
-            sendNullFn(staIdx, cast[pointer](chan_sta_tx_cfm), 0)
-            nullCount = nullCount + 1
+        if active != 0 and staIdx < STA_INFO_TAB_ENTRIES.uint8:
+          if ps.enabled != 0 and (ps.statusFlags and 8) == 0:
+            let outcome = chanProtectionFinishBuild(protection)
+            if outcome == 1:
+              chan_upd_ctxt_status(chanCtxt, 3)
+              if not chanSwitchCallbackCurrent() or not chanProtectionCurrent(protection):
+                chanProtectionCancelSerial(protection)
+                return
+              mm_active()
+            if outcome == 2 and not mm_force_idle_req(): return
+            if outcome in [0, 2]:
+              if not chanSwitchCallbackCurrent() or not chanProtectionCurrent(protection):
+                chanProtectionCancelSerial(protection)
+                return
+              chanProtectionResume(protection)
+            return
+          # The old channel must admit these frames before the new one starts.
+          let current = chanCtxtAt(curChan)
+          let oldStatus = current.status
+          let ticket = chanProtectionReserve(protection, false)
+          if ticket == 0: return
+          current.status = 6
+          let sent = txl_frame_send_null_frame(staIdx, cast[pointer](chan_sta_tx_cfm), ticket)
+          if not chanProtectionSubmitted(protection, ticket, sent == 0): return
+          if not chanSwitchCallbackCurrent() or not chanProtectionCurrent(protection): return
+          current.status = oldStatus
     vifNode = vif.next
   # Loop 2: iterate AP VIFs and send self-CTS
   vifNode = cast[pointer](vifMgmt.activeList.first)
@@ -3239,32 +3338,41 @@ proc chan_goto_idle_cb*() {.exportc, cdecl.} =
     let vif = vifChannelAt(cast[pointer](vifNode))
     let vifType = vif.vifType
     let vifChanCtxt = vif.chanCtxt
-    if vifType == 2 and vifChanCtxt != nil:
-      if cast[uint](vifChanCtxt) == curChanAddr:
+    if vifType == VIF_TYPE_AP and vifChanCtxt != nil:
+      if cast[uint](vifChanCtxt) == curChanAddr and env.ctxtCount == 2 and
+          selfctsDurationMs != 0:
         let active = vif.state
         if active != 0:
           if vif.postponedStaHead != nil:
-            # Compute beacon interval in TU
-            let bcnInt = cast[ptr uint16](curChanAddr + 16)[]
-            let intervalUs = (bcnInt.uint32 shl 10) div 1000
-            # Blob: txl_frame_send_selfcts_frame(vif, interval, chan_ap_tx_cfm, 0)
-            # a2 is the TX completion callback (not 0)
-            let sendCtsFn = cast[proc(a0: pointer, a1: uint16, a2: pointer, a3: uint32) {.cdecl.}](txl_frame_send_selfcts_frame)
-            sendCtsFn(vifNode, intervalUs.uint16, cast[pointer](chan_ap_tx_cfm), 0)
-            selfctsCount = selfctsCount + 1
+            let current = chanCtxtAt(curChan)
+            let oldStatus = current.status
+            let ticket = chanProtectionReserve(protection, true)
+            if ticket == 0: return
+            current.status = 6
+            let sent = txl_frame_send_selfcts_frame(
+              vifNode, selfctsDurationMs, cast[pointer](chan_ap_tx_cfm), ticket)
+            if not chanProtectionSubmitted(protection, ticket, sent == 0): return
+            if not chanSwitchCallbackCurrent() or not chanProtectionCurrent(protection): return
+            current.status = oldStatus
     vifNode = vif.next
-  # Store counts
-  env.connlessDelayCount = selfctsCount
-  env.scanDelayCount = nullCount
-  if (nullCount or selfctsCount) != 0:
+  let outcome = chanProtectionFinishBuild(protection)
+  if outcome < 0: return
+  if outcome == 1:
     # Frames sent: mark context as PAUSED and reactivate
     chan_upd_ctxt_status(chanCtxt, 3)
+    if not chanSwitchCallbackCurrent() or not chanProtectionCurrent(protection):
+      chanProtectionCancelSerial(protection)
+      return
     mm_active()
   else:
-    # No frames needed: proceed with channel switch
-    chan_pre_switch_channel(chanCtxt)
+    if outcome == 2:
+      if not mm_force_idle_req(): return
+      if not chanSwitchCallbackCurrent() or not chanProtectionCurrent(protection):
+        chanProtectionCancelSerial(protection)
+        return
+    chanProtectionResume(protection)
 
-proc chanConnLessDelay(flags: uint8, ctxtCount: uint8): uint32 {.inline.} =
+proc chanConnLessDelay(flags, ctxtCount, scanChannel: uint8; hasAp: bool): uint32 {.inline.} =
   const DelayUnit = 0x7530'u32
   if ctxtCount == 0:
     return 0
@@ -3272,77 +3380,133 @@ proc chanConnLessDelay(flags: uint8, ctxtCount: uint8): uint32 {.inline.} =
     return DelayUnit
   if (flags and 0x02) == 0:
     return DelayUnit
-  if scan_env.channelIndex == 0:
+  if scanChannel == 0:
     return DelayUnit
 
-  # Blob does not call chan_get_dominant_chan here. It uses the scan cursor and
-  # channel-context count to pick the next connectionless delay window.
-  let nextCnt = (scan_env.channelIndex + 1) and 3
-  if nextCnt != 0:
+  let nextCnt = (scanChannel.uint32 + 1) and 3
+  if not hasAp and nextCnt != 0:
     return DelayUnit
   if ctxtCount <= 1:
-    return DelayUnit * 4
+    return DelayUnit * (if hasAp: 8'u32 else: 4'u32)
   if cast[int8](flags) < 0:
-    DelayUnit * 8
-  else:
     DelayUnit * 16
+  else:
+    DelayUnit * 8
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void chan_conn_less_delay_prog(void);".}
 proc chan_conn_less_delay_prog*() {.exportc, cdecl.} =
   ## Program connectionless delay timer (67 instrs, 190 bytes in blob).
   ## From blob (chan.o): checks chan_env flags bit 4 (0x10). If set, returns.
   ## Otherwise sets bit 4, reads MAC timestamp, reads chan_env[124] count.
-  ## If count==0: delay = 0. If count>0: checks flags bits 0-1
-  ## for connection type, walks scan_env entries to find active scans,
-  ## computes delay factor (1/4/8/16) * 0x7530.
+  ## AP presence, scan cursor, and conflict flags select 1/4/8/16 * 30000 us.
+  let saved = irqSave()
+  defer: irqRestore(saved)
   let env = chanEnvView()
   let flags = env.flags
-  nimFwTrace2U32("[WIFI-NIMFW] cld_prog flags ", flags.uint32, env.ctxtCount.uint32)
   if (flags and 0x10) != 0:
-    return  # already programmed
-  env.flags = flags or 0x10  # set bit 4
+    return
+  var mutation: MmTimerMutation
+  mmTimerBeginMutation(mutation, chanConnLessDelayTimer())
+  defer: mmTimerEndMutation(mutation)
+  inc chanConnlessGeneration
+  let generation = chanConnlessGeneration
+  let resetEpoch = txResetEpoch
   let ctxtCount = env.ctxtCount
-  # Read current MAC timestamp for timer base
-  let macTime = regRead(MACHW_BASE + 0x120)
-  let delay = chanConnLessDelay(flags, ctxtCount)
-  # Program timer with computed timeout
-  nimFwTrace2U32("[WIFI-NIMFW] cld_prog delay ", macTime, delay)
-  mm_timer_set(chanConnLessDelayTimer(), macTime + delay)
-  # Check for AP VIF (blob: vif_mgmt_get_first_ap_inf tail-call at 0x76)
-  discard vif_mgmt_get_first_ap_inf()
+  let scanChannel = scan_env.channelIndex
+  let scanEpoch = chanCtxtEpochs[3]
+  let rocEpoch = chanCtxtEpochs[4]
+  let vifs = rxVifEpochs
+  let reservedFlags = flags or 0x10'u8
+  env.flags = reservedFlags
+  defer:
+    if chanConnlessGeneration == generation and txResetEpoch == resetEpoch and
+        not chanConnlessTimerPending(generation):
+      env.flags = env.flags and not 0x10'u8
+  template current(): bool =
+    not mutation.cancelled and chanConnlessGeneration == generation and
+      txResetEpoch == resetEpoch and env.flags == reservedFlags and
+      env.ctxtCount == ctxtCount and scan_env.channelIndex == scanChannel and
+      chanCtxtEpochs[3] == scanEpoch and chanCtxtEpochs[4] == rocEpoch and
+      equalMem(addr rxVifEpochs, unsafeAddr vifs, sizeof(vifs))
+  template outside(body: untyped) =
+    irqRestore(saved)
+    try: body
+    finally: discard irqSave()
+  outside:
+    nimFwTrace2U32("[WIFI-NIMFW] cld_prog flags ", flags.uint32, ctxtCount.uint32)
+  if not current(): return
+  let macTime = regRead(MACHW_TIMLO_REG)
+  if not current(): return
+  var hasAp = false
+  if ctxtCount != 0 and (flags and 1) == 0 and (flags and 2) != 0 and scanChannel != 0:
+    outside: hasAp = vif_mgmt_get_first_ap_inf() != nil
+    if not current(): return
+  let delay = chanConnLessDelay(flags, ctxtCount, scanChannel, hasAp)
+  outside: nimFwTrace2U32("[WIFI-NIMFW] cld_prog delay ", macTime, delay)
+  if not current(): return
+  mmTimerSetLocked(chanConnLessDelayTimer(), macTime + delay, saved)
 
-proc chan_ap_tx_cfm*(param: pointer) {.exportc, cdecl.} =
+proc chan_ap_tx_cfm*(param: pointer, status: uint32) {.exportc, cdecl.} =
   ## TX confirmation for AP mode channel management (17 instrs).
-  ## Blob: decrement chan_env[122]; if 0 → mm_force_idle_req() then
-  ##   tail-call chan_pre_switch_channel(chan_env).
+  ## Retune only after all AP and STA protection completions have arrived.
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if not txlFrameCallbackCurrent():
+    chanProtectionAbandon(param)
+    return
+  if chanProtectionTagged(param) or chanProtectionActive():
+    var serial: uint32
+    if chanProtectionComplete(param, true, serial):
+      if not mm_force_idle_req(): return
+      if not txlFrameCallbackCurrent() or not chanProtectionCurrent(serial):
+        chanProtectionCancelSerial(serial)
+        return
+      chanProtectionResume(serial)
+    return
   let env = chanEnvView()
   let pending = env.connlessDelayCount
   if pending == 0: return
   let newPending = pending - 1
   env.connlessDelayCount = newPending
-  if newPending == 0:
-    mm_force_idle_req()
-    chan_pre_switch_channel(cast[pointer](env))
+  if newPending == 0 and env.scanDelayCount == 0:
+    if not mm_force_idle_req(): return
+    if not txlFrameCallbackCurrent(): return
+    chan_pre_switch_channel()
 
-proc chan_sta_tx_cfm*(param: pointer) {.exportc, cdecl.} =
+proc chan_sta_tx_cfm*(param: pointer, status: uint32) {.exportc, cdecl.} =
   ## TX confirmation for STA mode channel management (17 instrs).
-  ## Blob: decrement chan_env[121]; if 0 → mm_force_idle_req() then
-  ##   tail-call chan_pre_switch_channel(chan_env).
+  ## Retune only after all STA and AP protection completions have arrived.
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if not txlFrameCallbackCurrent():
+    chanProtectionAbandon(param)
+    return
+  if chanProtectionTagged(param) or chanProtectionActive():
+    var serial: uint32
+    if chanProtectionComplete(param, false, serial):
+      if not mm_force_idle_req(): return
+      if not txlFrameCallbackCurrent() or not chanProtectionCurrent(serial):
+        chanProtectionCancelSerial(serial)
+        return
+      chanProtectionResume(serial)
+    return
   let env = chanEnvView()
   let pending = env.scanDelayCount
   if pending == 0: return
   let newPending = pending - 1
   env.scanDelayCount = newPending
-  if newPending == 0:
-    mm_force_idle_req()
-    chan_pre_switch_channel(cast[pointer](env))
+  if newPending == 0 and env.connlessDelayCount == 0:
+    if not mm_force_idle_req(): return
+    if not txlFrameCallbackCurrent(): return
+    chan_pre_switch_channel()
 
 # --- TX/RX Functions ---
 
 proc txl_get_seq_ctrl*(): uint16 {.exportc, cdecl.} =
   ## Get next TX sequence control number.
-  ## From blob (txl_frame.o, 7 instrs): reads global seq counter,
-  ## increments, wraps to 12 bits, shifts left 4 (sequence number field).
+  ## From blob (sm.o local txl_get_seq_ctrl, 8 instrs): reads the global
+  ## sequence counter halfword, increments/stores it as a halfword, then returns
+  ## the low 16 bits of (counter << 4) for the Sequence Control field.
   let seqCtrl = nextTxSeqCtrl()
   txlSeqRetained = txControlEnv().seqCounter
   nimFwDbgTxSeqLast = seqCtrl.uint32
@@ -3356,14 +3520,7 @@ proc txl_int_fake_transfer*(txDesc: pointer, queueIdx: uint32) {.exportc, cdecl.
   ## index computed from a1+22, clears THD+16 (next pointer).
   let desc = hostTxDescAt(txDesc)
   let link = hostTxInternalLinkNodeAt(desc.bufDesc)
-  if link != nil and nimFwMgmtFcTrace(link.macHeader[0]):
-    nimFwTrace2U32("[WIFI-NIMFW] fake_tx ",
-                   queueIdx,
-                   cast[uint32](cast[uint](link)))
-    when defined(bl808WifiConnectTrace):
-      nimFwConnectTrace2U32("[WIFI-CT] fake_tx ",
-                            queueIdx,
-                            cast[uint32](cast[uint](link)))
+  # Publication must stay callback-free, as in the vendor's 52-byte helper.
   let isNullDataFrame =
     link != nil and link.macHeader[0] == 0x48'u8 and link.macHeader[1] == 0x01'u8
   let isTrackedByCallback =
@@ -3395,14 +3552,13 @@ proc txl_int_fake_transfer*(txDesc: pointer, queueIdx: uint32) {.exportc, cdecl.
     nimFwDbgNullFrameFakeHeadAfter = pointerAddrU32(head[])
     nimFwDbgNullFrameFakeTailAfter = pointerAddrU32(tailPtr[])
 
-proc cfm_raw_send*(param: pointer) {.exportc, cdecl.} =
-  ## Send raw TX confirmation (5 instrs in blob).
-  ## From blob (txl_cfm.o): loads function pointer from GOT relocation,
-  ## loads a string pointer via auipc+addi, then tail-calls via jr a5.
-  ## This is a thin trampoline that calls the platform CFM handler.
-  let cfmFn = blOpsFunc(200)
-  if cfmFn != nil:
-    cast[proc(p: pointer) {.cdecl.}](cfmFn)(param)
+proc cfm_raw_send*(param: pointer; status: uint32) {.exportc, cdecl.} =
+  ## scanu_task.o replaces a0 with its format string and preserves a1 (status).
+  ## The relocation selects g_bl_ops_funcs+4, the printf hook, not a TX owner.
+  let logFn = blOpsFunc(4)
+  if logFn != nil:
+    cast[proc(fmt: cstring) {.cdecl, varargs.}](logFn)(
+      "send complete, status is %08lX\r\n", status.culong)
 
 proc txSecKeyFor(desc: ptr HostTxDescView): ptr VifKeySlotView {.inline.} =
   let sta = staInfoForIdx(desc.staInfoIdx)
@@ -3435,12 +3591,20 @@ proc txSecKeyFor(desc: ptr HostTxDescView): ptr VifKeySlotView {.inline.} =
   result = cast[ptr VifKeySlotView](keySlot)
   nimFwDbgTxSecHdrCipher = result.cipherType.uint32
 
-proc txSecBumpPn(key: ptr VifKeySlotView, dst: pointer, bytes: csize_t) {.inline.} =
+proc txSecKeyUsable(key: ptr VifKeySlotView): bool {.inline.} =
+  key != nil and key.installed != 0 and key.cipherType <= 3 and key.staIdx <= 3
+
+proc txSecBumpPn(key: ptr VifKeySlotView, dst: pointer, bytes: csize_t): bool {.inline.} =
+  # TKIP/CCMP serialize only six bytes. Never reserve a wrapped wire PN.
+  let currentPn = key.pnLow.uint64 or (key.pnHigh.uint64 shl 32)
+  if bytes == 6 and currentPn >= 0xFFFFFFFFFFFF'u64:
+    return false
   let oldLo = key.pnLow
   let carry = if oldLo == 0xFFFFFFFF'u32: 1'u32 else: 0'u32
   key.pnLow = oldLo + 1
   key.pnHigh = key.pnHigh + carry
   discard c_memcpy(dst, addr key.pnLow, bytes)
+  true
 
 proc writeTxCcmpHeader(secHdr: pointer; txDesc: ptr HostTxDescView;
                        txKey: ptr VifKeySlotView) {.inline.} =
@@ -3457,6 +3621,18 @@ proc writeTxCcmpHeader(secHdr: pointer; txDesc: ptr HostTxDescView;
   ccmpHeader.pn3 = txDesc.pnScratch[3]
   ccmpHeader.pn4 = txDesc.pnScratch[4]
   ccmpHeader.pn5 = txDesc.pnScratch[5]
+
+proc writeTxTkipHeader(secHdr: pointer; txDesc: ptr HostTxDescView;
+                       txKey: ptr VifKeySlotView) {.inline.} =
+  let tkipHeader = cast[ptr TkipSecurityHeaderView](secHdr)
+  tkipHeader.tsc1 = txDesc.pnScratch[1]
+  tkipHeader.wepSeed = (tkipHeader.tsc1 or 0x20'u8) and 0x7F'u8
+  tkipHeader.tsc0 = txDesc.pnScratch[0]
+  tkipHeader.keyId = ((txKey.staIdx and 0x03'u8) shl 6) or 0x20'u8
+  tkipHeader.tsc2 = txDesc.pnScratch[2]
+  tkipHeader.tsc3 = txDesc.pnScratch[3]
+  tkipHeader.tsc4 = txDesc.pnScratch[4]
+  tkipHeader.tsc5 = txDesc.pnScratch[5]
 
 proc txSecControlTemplate(desc: ptr HostTxDescView;
                           updateCurrentDesc: uint32): ptr HostTxRateTemplateView {.inline.} =
@@ -3479,57 +3655,69 @@ proc patchTxSecControlWord(ctrl: ptr HostTxRateTemplateView;
 
 proc txu_cntrl_sec_hdr_append*(txDesc: pointer, secHdr: pointer,
                                updateCurrentDesc: uint32): pointer {.exportc, cdecl.} =
-  ## Append security header to TX frame (77 instrs in blob).
-  ## From blob (txu_cntrl.o): reads STA index from txDesc[49], resolves STA entry
-  ## via sta_info_tab with stride 368. Reads key material from sta_info_tab+244.
-  ## Checks VIF's security type (via VIF entry linked from STA). Cipher 2 uses
-  ## the 8-byte CCMP-style header required for protected data accepted by the AP.
-  ## Then patches HW descriptor control field.
+  ## Prepend an IV immediately before secHdr and return its start, as in the
+  ## vendor ABI. secHdr is the end of the reserved security-header space.
+  let saved = irqSave()
+  {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
+  defer:
+    {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
+    irqRestore(saved)
   let hostTxDesc = hostTxDescAt(txDesc)
+  if hostTxDesc == nil or secHdr == nil or
+      hostTxDesc.staInfoIdx >= STA_INFO_TAB_ENTRIES.uint8 or
+      hostTxDesc.vifIdx >= MAX_VIFS.uint8:
+    return nil
   inc nimFwDbgTxSecHdrAppend
+  if not txSecurityCurrent(hostTxDesc):
+    return nil
   let txKey = txSecKeyFor(hostTxDesc)
   if txKey == nil:
     return secHdr
+  if not txSecKeyUsable(txKey):
+    return nil
+  let headerLen =
+    case txKey.cipherType
+    of 0, 3: 4'u
+    of 1, 2: 8'u
+    else: 0'u
+  let headerStart = cast[pointer](cast[uint](secHdr) - headerLen)
   let packetNumber = hostTxPnScratch(hostTxDesc)
   case txKey.cipherType
-  of 0:  # Open or WEP-40
-    let securityHeader = cast[ptr TxSecurityHeaderView](secHdr)
+  of 0:  # WEP-40
+    let securityHeader = cast[ptr TxSecurityHeaderView](headerStart)
     securityHeader.packetNumberLowWord = packetNumber.lo
-    let keyIdByte = txKey.staIdx
+    let keyIdByte = txKey.staIdx and 0x03'u8
+    # The fourth byte is the key selector, not part of the 24-bit IV.
     securityHeader.keyIdAndPacketNumberMidWord =
-      (keyIdByte.uint16 shl 14) or packetNumber.mid
+      (keyIdByte.uint16 shl 14) or (packetNumber.mid and 0x00FF'u16)
   of 1:  # TKIP
-    let securityHeader = cast[ptr TxSecurityHeaderView](secHdr)
-    securityHeader.packetNumberLowWord = packetNumber.lo
-    let keyIdByte = txKey.staIdx
-    securityHeader.keyIdAndPacketNumberMidWord =
-      (keyIdByte.uint16 shl 14) or packetNumber.mid
-    securityHeader.tkipPacketNumberMidWord = packetNumber.mid
-    securityHeader.tkipPacketNumberHighWord = packetNumber.hi
+    writeTxTkipHeader(headerStart, hostTxDesc, txKey)
   of 2:  # CCMP (AES)
-    writeTxCcmpHeader(secHdr, hostTxDesc, txKey)
+    writeTxCcmpHeader(headerStart, hostTxDesc, txKey)
   of 3:  # WEP-104
-    let securityHeader = cast[ptr TxSecurityHeaderView](secHdr)
+    let securityHeader = cast[ptr TxSecurityHeaderView](headerStart)
     securityHeader.packetNumberLowWord = packetNumber.lo
-    let keyIdByte = txKey.staIdx
+    let keyIdByte = txKey.staIdx and 0x03'u8
     securityHeader.keyIdAndPacketNumberMidWord =
-      (keyIdByte.uint16 shl 14) or packetNumber.mid
+      (keyIdByte.uint16 shl 14) or (packetNumber.mid and 0x00FF'u16)
   else:
     discard
-  let secWords = cast[ptr TxSecurityHeaderView](secHdr)
+  let secWords = cast[ptr TxSecurityHeaderView](headerStart)
   nimFwDbgDhcpTxSecHdr0 =
     secWords.packetNumberLowWord.uint32 or
       (secWords.keyIdAndPacketNumberMidWord.uint32 shl 16)
-  nimFwDbgDhcpTxSecHdr1 =
-    secWords.tkipPacketNumberMidWord.uint32 or
-      (secWords.tkipPacketNumberHighWord.uint32 shl 16)
+  nimFwDbgDhcpTxSecHdr1 = 0
+  if headerLen == 8:
+    nimFwDbgDhcpTxSecHdr1 =
+      secWords.tkipPacketNumberMidWord.uint32 or
+        (secWords.tkipPacketNumberHighWord.uint32 shl 16)
   nimFwDbgDhcpTxSecKey =
     txKey.cipherType.uint32 or
     (txKey.staIdx.uint32 shl 8) or
     (txKey.keyIdx.uint32 shl 16) or
     (txKey.installed.uint32 shl 24)
   patchTxSecControlWord(txSecControlTemplate(hostTxDesc, updateCurrentDesc), txKey)
-  return secHdr
+  return headerStart
 
 proc txu_cntrl_sechdr_len_compute*(txDesc: pointer, lenOut: ptr uint32): uint32 {.exportc, cdecl.} =
   ## Compute security header length for a TX descriptor (76 instrs in blob).
@@ -3539,48 +3727,95 @@ proc txu_cntrl_sechdr_len_compute*(txDesc: pointer, lenOut: ptr uint32): uint32 
   ##   cipher 0 (WEP40): len=4; cipher 2 (CCMP): len=8
   ##   cipher 1 (TKIP): len=8, tail=12; cipher 3 (WEP104): len=4
   ## Increments 64-bit PN counter at key_slot+128. Returns header length.
+  ## high(uint32) means an unusable key/counter/descriptor, not plaintext.
+  let saved = irqSave()
+  {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
+  defer:
+    {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
+    irqRestore(saved)
   if lenOut != nil:
     lenOut[] = 0
   inc nimFwDbgTxSecHdrCalls
   let hostTxDesc = hostTxDescAt(txDesc)
+  if hostTxDesc == nil or hostTxDesc.staInfoIdx >= STA_INFO_TAB_ENTRIES.uint8 or
+      hostTxDesc.vifIdx >= MAX_VIFS.uint8:
+    return high(uint32)
   let txKey = txSecKeyFor(hostTxDesc)
   if txKey == nil:
+    if not txSecurityBind(hostTxDesc, nil, false):
+      return high(uint32)
     return 0
+  if not txSecKeyUsable(txKey):
+    nimFwDbgTxSecHdrLen = 0
+    return high(uint32)
+  if not txSecurityBind(hostTxDesc, txKey, false):
+    return high(uint32)
   var securityHeaderLen: uint32 = 0
+  var securityTailLen: uint32 = 0
+  var pnBytes: csize_t
   case txKey.cipherType
-  of 0:  # WEP-40
+  of 0, 3:  # WEP-40/WEP-104
     securityHeaderLen = 4
-    if lenOut != nil:
-      lenOut[] = 4
-    txSecBumpPn(txKey, addr hostTxDesc.pnScratch[0], 4.csize_t)
+    securityTailLen = 4
+    pnBytes = 4
   of 1:  # TKIP
     securityHeaderLen = 8
-    if lenOut != nil:
-      lenOut[] = 12
-    txSecBumpPn(txKey, addr hostTxDesc.pnScratch[0], 6.csize_t)
+    securityTailLen = 12
+    pnBytes = 6
   of 2:  # CCMP
     securityHeaderLen = 8
-    if lenOut != nil:
-      lenOut[] = 8
-    txSecBumpPn(txKey, addr hostTxDesc.pnScratch[0], 6.csize_t)
-  of 3:  # WEP-104
-    securityHeaderLen = 4
-    if lenOut != nil:
-      lenOut[] = 4
-    txSecBumpPn(txKey, addr hostTxDesc.pnScratch[0], 4.csize_t)
+    securityTailLen = 8
+    pnBytes = 6
   else:
-    discard
+    nimFwDbgTxSecHdrLen = 0
+    return 0
+  if not txSecBumpPn(txKey, addr hostTxDesc.pnScratch[0], pnBytes):
+    nimFwDbgTxSecHdrLen = 0
+    return high(uint32)
+  if lenOut != nil:
+    lenOut[] = securityTailLen
   nimFwDbgTxSecHdrLen = securityHeaderLen
   return securityHeaderLen
 
+proc rxuMgtUpload(param: pointer; upload: uint8): uint32 =
+  # The vendor's shared tail returns whether RX-upper took the descriptor.
+  if upload == 0 or not rxStationCurrent(param):
+    return 0
+  let generation = rxUploadGeneration(param)
+  let header = rxMpduHeader(param)
+  if header == nil: return 0
+  let mm = mmEnvView()
+  let vif = vif_mgmt_get_vif(rxuCntrlEnvView().vifIdx)
+  var enabled = false
+  if vif == nil:
+    enabled = (mm.rxPromiscUploadFlag or mm.apPromiscUploadFlag) != 0
+  else:
+    case vifChannelAt(vif).vifType
+    of 0:
+      if mm.rxPromiscUploadFlag != 0:
+        enabled = true
+    of 2:
+      if mm.apPromiscUploadFlag != 0:
+        enabled = true
+    of 1, 3:  # IBSS and mesh use the vendor's unconditional upload path.
+      enabled = true
+    else:
+      discard
+  if enabled:
+    rxu_mpdu_upload_and_indicate(param)
+    if rxUploadCurrent(param, generation) and rxStationCurrent(param) and
+        rxMpduHeader(param) == header and rxMpduDescView(param).curDesc != nil:
+      return 1
+  0
+
 {.emit: "__attribute__((optimize(\"crossjumping\"))) unsigned long rxu_mgt_frame_check(void*, unsigned char);".}
-proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, cdecl.} =
+proc rxu_mgt_frame_check*(param: pointer, staIdxArg: uint8): uint32 {.exportc, cdecl.} =
   ## Check management frame validity and generate RXU_MGT_IND message.
-  ## From blob (rxl_cntrl.o, 1350 bytes, 15 function calls).
+  ## From blob (rxu_cntrl.o, 1350 bytes, 15 function calls).
   ##
   ## Blob register map:
   ##   s0=frameHdr  s1=vifIter/vifIdxByte  s2=bodyLen  s3=frameAccepted  s4=rxDesc
-  ##   s5=vifIdx(param a1)  s6=skipSecHdr  s7=rxu_cntrl_env  s8=machdrLen
+  ##   s5=staIdx(param a1)  s6=skipSecHdr  s7=rxu_cntrl_env  s8=machdrLen
   ##   s9=vifEntry  s10=msgSubtype  s11=ke_msg ptr
   ##
   ## Call graph (from relocations):
@@ -3589,12 +3824,14 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
   ##   ke_state_get (x2), me_beacon_check, phy_get_channel,
   ##   rxu_mpdu_upload_and_indicate, assert_warn, vif_mgmt_get_first_ap_inf
   ##
-  ## Returns: 1 = frame accepted (msg sent), 0 = rejected/filtered
-  var vifIdx = vifIdxArg
+  ## Returns: 1 = RX descriptor transferred to upload, 0 = caller may recycle.
+  let staIdx = staIdxArg
+  if not rxStationCurrent(param):
+    return 0
 
-  let rxDesc = rxMpduDescView(param).swDesc  # s4 = param[4]
-  if rxDesc == nil: return 0
-  let rx = rxSwDescView(rxDesc)
+  let generation = rxUploadGeneration(param)
+  let rx = rxMpduHeader(param)
+  if rx == nil: return 0
 
   # Stack-local outputs for mfp_ignore_mgmt_frame
   var mfpAcceptedFlag: uint8 = 1      # sp+22 in blob: accepted flag
@@ -3603,8 +3840,15 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
 
   # Traverse: rxDesc[8] -> bufDesc -> bufDesc[24] -> frameHdr (s0)
   let bufDesc = rx.bufferChain
+  if bufDesc == nil: return 0
   let frame = rxFrameAtRef(bufDesc)
+  let bodyLen = rx.mpduLengthBytes
+  if frame == nil or bodyLen < 24: return 0
   let frameHdr = cast[pointer](frame)
+  template currentFrame(): bool =
+    rxUploadCurrent(param, generation) and rxStationCurrent(param) and
+      rxMpduHeader(param) == rx and rx.bufferChain == bufDesc and
+      rx.mpduLengthBytes == bodyLen and rxFrameAtRef(bufDesc) == frame
 
   let fcFull = frame.frameControl
   inc nimFwDbgMgtSeen
@@ -3619,7 +3863,7 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
     inc nimFwDbgMgtAssocRspSeen
     nimFwDbgMgtAssocLastFc = fcFull.uint32 or (rx.hwFlags and 0xFFFF0000'u32)
 
-  # Reject if bit 10 set (protected frame bit — wrong context for mgmt)
+  # Management fragmentation is not supported (More Fragments or nonzero frag).
   if (fcFull and 0x0400'u16) != 0:
     inc nimFwDbgMgtRejected
     nimFwDbgMgtDropReason = 1'u32 or (fcFull.uint32 shl 8)
@@ -3632,23 +3876,24 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
       (frame.seqCtrl.uint32 shl 24)
     return 0
 
-  # --- VIF index resolution (blob 0x54-0x6a, 0x120-0x258) ---
-  # If vifIdx == 0xFF: look up from rxDesc flags or vif_mgmt_env linked list
-  if vifIdx == 0xFF:
+  let env = rxuCntrlEnvView()
+  # Only unbound frames resolve a VIF here. Associated RX already supplied it;
+  # the station argument is a separate index, retained at indication offset 7.
+  if staIdx == 0xFF:
+    var vifIdx = 0xFF'u8
     let rxFlags = rx.hwFlags
     if (rxFlags and 0x600'u32) == 0:
       # Blob path .L55/.L64: resolve the VIF by matching Addr1 against
-      # vif.mac_addr (vif+80). Authentication frames addressed to an AP VIF
-      # have Addr1 == BSSID and select AP VIFs; all other management frames
-      # select STA VIFs.
+      # vif.mac_addr (vif+80). Association/authentication requests addressed
+      # to an AP have Addr1 == BSSID. Retry and other flags do not change type.
       var vifEntry = cast[pointer](vifMgmtEnvView().activeList.first)
       var foundVifIdx: uint8 = 0xFF
-      var authToApVif = false
-      if fcFull == 0x00B0'u16:
-        authToApVif = true
+      var requestToApVif = false
+      if (fcFull and 0x00FC'u16) in [0x0000'u16, 0x00B0'u16]:
+        requestToApVif = true
         for authBssidByteIndex in 0'u ..< 6:
           if frame.addr1[authBssidByteIndex] != frame.addr3[authBssidByteIndex]:
-            authToApVif = false
+            requestToApVif = false
             break
       while vifEntry != nil:
         let vif = vifChannelAt(vifEntry)
@@ -3659,60 +3904,61 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
             break
         if macMatch:
           let vifType = vif.vifType
-          if (vifType == 0 and not authToApVif) or (vifType == 2 and authToApVif):
+          if (vifType == 0 and not requestToApVif) or (vifType == 2 and requestToApVif):
             foundVifIdx = vif.vifIdx
             break
         vifEntry = vif.next
       vifIdx = foundVifIdx
 
-  # Store vifIdx to rxu_cntrl_env[10]
-  let env = rxuCntrlEnvView()
-  env.vifIdx = vifIdx
+    env.vifIdx = vifIdx
 
-  # --- Call mfp_ignore_mgmt_frame (blob 0x72-0x92) ---
-  # Blob ABI: a0=rxu_cntrl_env, a1=frameHdr, a2=bodyLen, a3=&mfpAcceptedFlag, a4=&mfpSecondaryFlags
-  # The Nim-declared mfp_ignore_mgmt_frame(param: pointer) reads a1-a3 via inline asm.
-  # So we call it with a0=envPtr and set a1-a4 via asm before the call.
-  let bodyLen = rx.mpduLengthBytes
+  if not rxBindVif(param, env.vifIdx):
+    return 0
   let envPtr = cast[pointer](env)
-  var mfpResult: bool
-  {.emit: ["""
-  {
-    register void* _a1 __asm__("a1") = """, frameHdr, """;
-    register unsigned int _a2 __asm__("a2") = (unsigned int)""", bodyLen, """;
-    register unsigned char* _a3 __asm__("a3") = &""", mfpAcceptedFlag, """;
-    register unsigned char* _a4 __asm__("a4") = &""", mfpSecondaryFlags, """;
-    __asm__ volatile("" : : "r"(_a1), "r"(_a2), "r"(_a3), "r"(_a4));
-    """, mfpResult, """ = mfp_ignore_mgmt_frame(""", envPtr, """);
-  }
-  """].}
-  # The blob keeps mfpAcceptedFlag unchanged when mfp_ignore_mgmt_frame returns 0
-  # and continues through the normal management-frame classification path.
+  let envSeq = env.seqCtrl
+  let ignored = mfpIgnoreRxMgmtFrame(param, envPtr, frameHdr, bodyLen,
+                                    addr mfpAcceptedFlag, addr mfpSecondaryFlags)
+  if not currentFrame(): return 0
+  if ignored:
+    return rxuMgtUpload(param, mfpAcceptedFlag)
+  # Commit management sequence only after MFP acceptance.
+  block:
+    let savedIrq = irqSave()
+    defer: irqRestore(savedIrq)
+    if not currentFrame(): return 0
+    if mfpAcceptedFlag != 0 and staIdx < STA_INFO_TAB_ENTRIES.uint8:
+      let rxSeq = staRxSequence(staInfoForIdx(staIdx))
+      rxSeq.nonQosSeqCtrl = envSeq
   var frameAccepted: uint8 = mfpAcceptedFlag
 
   # --- Call phyif_utils_decode (blob 0x96-0xa2) ---
   # a0 = rxDesc+40 (RX vector), a1 = &phyDecodeStatusByte (sp+21 in blob)
   var rssiResult: int8 = 0
   discard phyif_utils_decode(cast[pointer](addr rx.phyVector[0]), addr rssiResult)
+  if not currentFrame():
+    return 0
   phyDecodeStatusByte = cast[uint8](rssiResult)
 
   # --- Read rxu_cntrl_env fields ---
-  let rxuEnvVifIdx = env.vifIdx
   let machdrLen = env.machdrLen
 
   # --- VIF lookup via vif_mgmt_get_vif (blob 0xde) ---
   var vifEntry: pointer = nil  # s9
-  if rxuEnvVifIdx != 0xFF:
-    vifEntry = vif_mgmt_get_vif(rxuEnvVifIdx)
-  elif vifIdx != 0xFF:
-    let staVifIdx = staInfoForIdx(vifIdx).instNbr
+  if env.vifIdx != 0xFF:
+    vifEntry = vif_mgmt_get_vif(env.vifIdx)
+  elif staIdx < STA_INFO_TAB_ENTRIES.uint8:
+    let staVifIdx = staInfoForIdx(staIdx).instNbr
     env.vifIdx = staVifIdx
     vifEntry = vif_mgmt_get_vif(staVifIdx)
+  let rxuEnvVifIdx = env.vifIdx
+  if not rxBindVif(param, rxuEnvVifIdx):
+    return 0
 
   # --- Subtype dispatch (blob 0xec-0x452) ---
   let subtypeBits = fcFull and 0x00FC'u16  # FC & 0xFC = type+subtype field
   var msgSubtype: uint8 = 0xFF  # s10: message subtype for ke_msg_alloc
   var skipSecHdr: bool = true   # s6: true = don't adjust for sec header in copy
+  var uploadAfterCopy = true
   var sendStaIdx: uint8 = 0    # s1: additional STA tracking
 
   if frameAccepted != 0:
@@ -3727,14 +3973,15 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
         skipSecHdr = false
         msgSubtype = 0xFF
       # Shared beacon path (blob .L81 at 0x3d2)
-      if vifIdx != 0xFF:
+      if staIdx != 0xFF:
         if vifEntry != nil:
           let vifBeaconFlag = vifChannelAt(vifEntry).state
           if vifBeaconFlag != 0:
             # Call me_beacon_check (blob 0x3e8)
-            me_beacon_check(rxuEnvVifIdx, frameHdr, cast[pointer](bodyLen.uint))
+            me_beacon_check(rxuEnvVifIdx, bodyLen, frameHdr)
+            if not currentFrame(): return 0
       else:
-        # vifIdx == 0xFF path (blob .L82 at 0x404)
+        # Unbound station path (blob .L82 at 0x404)
         # Blob calls ke_state_get(TASK_SCAN) a second time and apm_embedded_enabled
         let state2 = ke_state_get(TASK_SCAN)
         if state2 != 2 and state2 != 3:
@@ -3743,7 +3990,7 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
       if msgSubtype == 0xFF:
         frameAccepted = 0
 
-    of 0x00, 0x10:  # Assoc Req (0x00), Assoc Resp (0x10) (blob .L72 at 0x3b6)
+    of 0x10:  # Assoc Resp (blob .L72 at 0x3b6)
       if vifEntry == nil or cast[uint](vifEntry) == 0:
         frameAccepted = 0
       else:
@@ -3765,13 +4012,13 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
           skipSecHdr = false
           msgSubtype = 4
 
-    of 0x40:  # Probe Req (blob .L73 at 0x27e)
-      # Blob: check if 0x40, if yes -> .L85 (apm_embedded_enabled)
+    of 0x00, 0x20, 0x40:  # Assoc/Reassoc/Probe Req -> AP management (.L85)
       if vifEntry != nil:
         let apmEnabled = apm_embedded_enabled(vifEntry)
         if apmEnabled:
           skipSecHdr = true
           msgSubtype = 5
+          uploadAfterCopy = false
         else:
           frameAccepted = 0
       else:
@@ -3794,6 +4041,7 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
           if apmEnabled:
             skipSecHdr = true
             msgSubtype = 5
+            uploadAfterCopy = false
           else:
             frameAccepted = 0
         else:
@@ -3803,7 +4051,8 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
             # vifType == 0: debug log (blob 0x444, line 1399), then accept as mgmt
             let subtypeLogFn = getLogFunc(204)
             if subtypeLogFn != nil:
-              subtypeLogFn(2, 0, cast[pointer](cstring"rxl_cntrl.c"), 1399)
+              subtypeLogFn(2, nil, "rxu_cntrl.c", 1399,
+                "[FW] got unexpected DISASSOC/DEAUTHENT\r\n")
             skipSecHdr = true
           msgSubtype = 4
       else:
@@ -3812,18 +4061,20 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
         if apmEnabled:
           skipSecHdr = true
           msgSubtype = 5
+          uploadAfterCopy = false
         else:
           frameAccepted = 0
 
     of 0xD0:  # Action frame (blob .L78 at 0x366)
-      if vifIdx == 0xFF:
+      if staIdx == 0xFF:
         frameAccepted = 0
       else:
         # Read action category using machdrLen offset (blob: th.lrbu a3,s0,s8,0)
         let catByte = rxFrameBodyByte(frame, machdrLen)
         if catByte == 3:  # Block Ack (BA)
           msgSubtype = 6
-          skipSecHdr = true
+          skipSecHdr = false
+          uploadAfterCopy = false
           sendStaIdx = 0
         elif catByte == 8:  # SA Query
           # Blob validates: rxu_cntrl_env[10] must not be 0xFF
@@ -3834,11 +4085,12 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
             if (bodyLen.int - machdrLen.int) > 3:
               # Check vif_info_tab[vifIdx][86] (VIF type) for SA Query acceptance
               let saQueryVif = vif_mgmt_get_vif(rxuEnvVifIdx)
-              if saQueryVif == nil or vifChannelAt(saQueryVif).vifType == 0xFF:
+              if saQueryVif == nil or vifChannelAt(saQueryVif).vifType != 0:
                 frameAccepted = 0
               else:
                 # Look up STA via sta_info_tab using vif_info_tab approach
                 skipSecHdr = false
+                uploadAfterCopy = false
                 sendStaIdx = 0
                 msgSubtype = 4
             else:
@@ -3860,7 +4112,7 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
   # --- Message allocation and population (blob 0x2c8-0x518) ---
   let dbgState = ke_state_get(TASK_SCAN).uint32
   let dbgMgt0 = (frameAccepted.uint32 shl 24) or
-    (msgSubtype.uint32 shl 16) or (vifIdx.uint32 shl 8) or rxuEnvVifIdx.uint32
+    (msgSubtype.uint32 shl 16) or (staIdx.uint32 shl 8) or rxuEnvVifIdx.uint32
   let dbgMgt1 = (dbgState shl 24) or
     (bodyLen.uint32 shl 8) or machdrLen.uint32
   nimFwDbgMgtLast0 = dbgMgt0
@@ -3883,14 +4135,17 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
   when defined(bl808WifiConnectTrace):
     if subtypeBits == 0xB0'u16 or subtypeBits == 0x10'u16 or subtypeBits == 0x30'u16:
       nimFwConnectTrace2U32("[WIFI-CT] mgt_pre ", dbgMgt0, dbgMgt1)
+  if not currentFrame(): return 0
   if frameAccepted == 0 or msgSubtype == 0xFF:
     # Set frameAccepted to result byte for return
     frameAccepted = mfpAcceptedFlag
     # Fall through to epilogue
   else:
-    # Call phy_get_channel(&chanInfo, 0) for current PHY channel info.
+    # A queued frame may outlive a radio channel change.
     var chanInfo {.noinit.}: array[2, uint32]
-    phy_get_channel_raw(cast[pointer](addr chanInfo[0]), 0)
+    if not rxReadCapturedChannel(param, chanInfo):
+      phy_get_channel_raw(cast[pointer](addr chanInfo[0]), 0)
+    if not currentFrame(): return 0
 
     # Allocate ke_msg: ke_msg_alloc(RXU_MGT_IND, msgSubtype, TASK_RXU, bodyLen+32)
     # Floored at the RxuMgtIndView fixed-header extent (beaconPeriod/capInfo
@@ -3901,14 +4156,21 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
     # bytes zeroed up to exactly offset 68, during every connect).
     const RxuMgtIndFixedHeaderLen = 68'u32
     let msgSize = max(bodyLen.uint32 + 32, RxuMgtIndFixedHeaderLen)
-    let msg = ke_msg_alloc(RXU_MGT_IND, msgSubtype, TASK_RXU, msgSize)
+    # Keep the captured session outside the vendor-visible payload.
+    let msg = rxMgtAllocMessage(param, msgSubtype, msgSize)
     if msg == nil:
       # Debug log: ke_msg_alloc failure (blob 0x308, line 1482)
       let allocLogFn = getLogFunc(204)
       if allocLogFn != nil:
-        allocLogFn(2, 0, cast[pointer](cstring"rxl_cntrl.c"), 1482)
+        allocLogFn(2, nil, "rxu_cntrl.c", 1482, "rxu msg alloc failure\r\n")
       frameAccepted = 0
+      mfpAcceptedFlag = 0
     else:
+      var ownedMsg = msg
+      defer:
+        if ownedMsg != nil:
+          ke_msg_free_payload(ownedMsg)
+      if not currentFrame(): return 0
       let ind = rxuMgtIndMsgAt(msg)
 
       # --- Adjust source pointer for security header (blob 0x460-0x48e) ---
@@ -3918,6 +4180,7 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
         # Check machdrLen parity: blob calls assert_warn if odd
         if (machdrLen and 1) != 0:
           assert_warn("rxl_cntrl.c", "rxl_cntrl.c", 1491)
+          if not currentFrame(): return 0
         # Adjust: subtract machdrLen from bodyLen, advance frameHdr past MAC header
         copyLen = copyLen - machdrLen.uint16
         copySrc = rxFrameCursor(copySrc, machdrLen.uint)
@@ -3928,7 +4191,7 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
       # MAC-header adjustment via th.shia before copying to msg+32).
       ind.frameLen = copyLen
       ind.frameCtrl = fcFull
-      ind.vifIdx = vifIdx
+      ind.staIdx = staIdx
       ind.rxuVifIdx = rxuEnvVifIdx
       ind.freq = (chanInfo[0] shr 16).uint16
       ind.band = (chanInfo[0] and 0xFF).uint8
@@ -3944,6 +4207,7 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
         nimFwTrace2U32("[WIFI-NIMFW] assoc_copy2 ",
                        rxFrameWords(copySrc)[1],
                        rxFrameWords(copySrc)[2])
+        if not currentFrame(): return 0
 
       # Probe Req special fields: if msgSubtype==5 and sendStaIdx==0
       if msgSubtype == 5 and sendStaIdx == 0:
@@ -3955,43 +4219,26 @@ proc rxu_mgt_frame_check*(param: pointer, vifIdxArg: uint8): uint32 {.exportc, c
       copyRoundedRxWords(addr ind.body[0], copySrc, copyLen)
 
       # Send message via ke_msg_send (blob 0x504)
+      ownedMsg = nil
       ke_msg_send(msg)
+      if not currentFrame(): return 0
       inc nimFwDbgMgtMsgSent
       if subtypeBits == 0xB0'u16:
         inc nimFwDbgAuthMgtMsgSent
-      frameAccepted = mfpAcceptedFlag
+      mfpAcceptedFlag = uploadAfterCopy.uint8
 
-  # --- Epilogue (blob 0x30e-0x544): post-send check ---
-  # Check if accepted flag (sp+22) is set
-  if mfpAcceptedFlag != 0:
-    # Read rxu_cntrl_env[10] for VIF check
-    let postVifIdx = env.vifIdx
-    if postVifIdx != 0xFF:
-      # Call vif_mgmt_get_vif again (blob 0x324)
-      let postVif = vif_mgmt_get_vif(postVifIdx)
-      if postVif != nil:
-        let postVifType = vifChannelAt(postVif).vifType
-        if postVifType == 2:
-          # AP VIF: check mm_env[0x2c] (word at offset 44) for upload condition
-          let mm = mmEnvView()
-          if mm.rxPromiscUploadFlag != 0:
-            # Need to upload frame: call rxu_mpdu_upload_and_indicate (blob 0x53c)
-            rxu_mpdu_upload_and_indicate(param)
-            return 0  # Frame handled by upload path
-      else:
-        # No VIF found: check mm_env combined flags (blob .L94 at 0x52a)
-        let mm = mmEnvView()
-        if (mm.rxPromiscUploadFlag or mm.apPromiscUploadFlag) != 0:
-          rxu_mpdu_upload_and_indicate(param)
-          return 0
-    # Set accepted byte to return value
-    mfpAcceptedFlag = 0
-  return mfpAcceptedFlag.uint32
+  if not currentFrame(): return 0
+  return rxuMgtUpload(param, mfpAcceptedFlag)
 
 proc rxu_mgt_ind_handler_scanu(param: pointer): cint {.exportc: "rxu_mgt_ind_handler_scanu", cdecl.} =
   ## Handle management frame indication for SCANU task (10 bytes in blob, scanu_task.o).
   ## Tail-calls scanu_frame_handler with the message body.
-  scanu_frame_handler(param, 0)
+  if param == nil:
+    return KeMsgConsumed
+  let payloadLength = keMsgHdrFromPayload(param).paramLen
+  if not scanuRxFrameValid(param, payloadLength):
+    return KeMsgConsumed
+  scanu_frame_handler(param, payloadLength)
   # scanu_frame_handler ALWAYS re-queues the frame via
   # ke_msg_forward_and_change_id -> ke_msg_send (as SCANU_RESULT_IND 0x804), so
   # the frame is now owned by that forwarded dispatch. Return KeMsgNoFree so the
@@ -4002,10 +4249,14 @@ proc rxu_mgt_ind_handler_scanu(param: pointer): cint {.exportc: "rxu_mgt_ind_han
   # use-after-free fault in an unrelated HTTP Table destroy.
   return KeMsgNoFree
 
-proc rxu_mgt_ind_handler_sm(param: pointer) {.exportc: "rxu_mgt_ind_handler_sm", cdecl.} =
+proc rxu_mgt_ind_handler_sm(param: pointer): cint {.exportc: "rxu_mgt_ind_handler_sm", cdecl, discardable.} =
   ## Handle management frame indication for SM task (256 bytes in blob, sm_task.o).
   ## Dispatches on 802.11 frame subtype to appropriate SM handler.
   ## Checks ke_state_get(TASK_SM) before calling certain handlers.
+  if param == nil:
+    return KeMsgConsumed
+  if keMsgHdrFromPayload(param).paramLen < 9:
+    return KeMsgConsumed
   let msg = rxuMgtDispatchView(param)
   # Frame control at msg body offset 2-3 (LE uint16); mask with 0xFC to get type+subtype
   let frameType = msg.frameCtrl and 0xFC'u16
@@ -4013,12 +4264,7 @@ proc rxu_mgt_ind_handler_sm(param: pointer) {.exportc: "rxu_mgt_ind_handler_sm",
   of 0xB0: # Authentication
     inc nimFwDbgAuthSmDispatch
     nimFwDbgAuthSmState = ke_state_get(TASK_SM).uint32
-    when defined(bl808WifiConnectTrace):
-      let staVifPair = msg.staIdx.uint32 or (msg.vifIdx.uint32 shl 8)
-      nimFwConnectTrace2U32("[WIFI-CT] sm_mgt_auth ",
-                            nimFwDbgAuthSmState,
-                            staVifPair)
-    if nimFwDbgAuthSmState != SmAuthStartingState: return
+    if nimFwDbgAuthSmState != SmAuthenticatingState: return KeMsgConsumed
     sm_auth_handler(param)
   of 0x10: # Association Response
     when defined(bl808WifiConnectTrace):
@@ -4026,7 +4272,7 @@ proc rxu_mgt_ind_handler_sm(param: pointer) {.exportc: "rxu_mgt_ind_handler_sm",
       nimFwConnectTrace2U32("[WIFI-CT] sm_mgt_assoc ",
                             ke_state_get(TASK_SM).uint32,
                             staVifPair)
-    if ke_state_get(TASK_SM) != SmAuthenticatingState: return
+    if ke_state_get(TASK_SM) != SmAssocRspState: return KeMsgConsumed
     sm_assoc_rsp_handler(param)
   of 0x30: # Reassociation Response
     when defined(bl808WifiConnectTrace):
@@ -4034,39 +4280,41 @@ proc rxu_mgt_ind_handler_sm(param: pointer) {.exportc: "rxu_mgt_ind_handler_sm",
       nimFwConnectTrace2U32("[WIFI-CT] sm_mgt_reassoc ",
                             ke_state_get(TASK_SM).uint32,
                             staVifPair)
-    if ke_state_get(TASK_SM) != SmAuthenticatingState: return
+    if ke_state_get(TASK_SM) != SmAssocRspState: return KeMsgConsumed
     sm_assoc_rsp_handler(param)
   of 0xC0: # Deauthentication
-    let state = ke_state_get(TASK_SM)
-    if state == SmIdleState or state == SM_ACTIVATING_STATE:
-      sm_deauth_handler(param)
-      return
+    if ke_state_get(TASK_SM) == SmIdleState or ke_state_get(TASK_SM) == SM_ACTIVATING_STATE:
+      return sm_deauth_handler(param)
     # For deauth while authenticating, try sm_auth_start.
     let state2 = ke_state_get(TASK_SM)
     if state2 == SmAuthenticatingState:
-      sm_auth_start(param)
+      sm_auth_start()
   of 0xA0: # Disassociation
-    let state = ke_state_get(TASK_SM)
-    if state == SmIdleState or state == SM_ACTIVATING_STATE:
-      sm_deauth_handler(param)
-      return
+    if ke_state_get(TASK_SM) == SmIdleState or ke_state_get(TASK_SM) == SM_ACTIVATING_STATE:
+      return sm_deauth_handler(param)
     # For disassoc while authenticating, try sm_auth_start.
     let state2 = ke_state_get(TASK_SM)
     if state2 == SmAuthenticatingState:
-      sm_auth_start(param)
+      sm_auth_start()
   of 0xD0: # Action
     # Only handle SA Query (category == 8)
     if msg.category == 8'u8:
       sm_sa_query_handler(param)
   else:
     discard
+  return KeMsgConsumed
 
-proc rxu_mgt_ind_handler_apm(param: pointer) {.exportc: "rxu_mgt_ind_handler_apm", cdecl.} =
+proc rxu_mgt_ind_handler_apm(param: pointer): cint {.exportc: "rxu_mgt_ind_handler_apm", cdecl, discardable.} =
   ## Handle management frame indication for APM task (134 bytes in blob, apm_task.o).
   ## Dispatches on 802.11 frame subtype to appropriate AP-mode handler.
+  if param == nil:
+    return KeMsgConsumed
   let msg = rxuMgtDispatchView(param)
   # Frame control at msg body offset 2-3 (LE uint16); mask with 0xFC to get type+subtype
   let frameType = msg.frameCtrl and 0xFC'u16
+  # Probe requests may use the wildcard VIF; their handler resolves it first.
+  if frameType != 0x40 and not apmVifRunning(msg.vifIdx):
+    return KeMsgConsumed
   case frameType
   of 0x40: # Probe Request
     apm_probe_req_handler(param)
@@ -4085,64 +4333,95 @@ proc rxu_mgt_ind_handler_apm(param: pointer) {.exportc: "rxu_mgt_ind_handler_apm
     apm_beacon_handler(param)
   else:
     discard
+  0
 
-proc rxu_mgt_ind_handler_bam*(param: pointer): uint32
+proc rxu_mgt_ind_handler_bam*(param: pointer): cint
     {.exportc: "rxu_mgt_ind_handler_bam", cdecl.} =
-  ## Handle management frame indication for BAM task (276 bytes in blob, bam_task.o).
-  ## Matches blob `bam_task.o`::rxu_mgt_ind_handler exactly.
-  ##
-  ## Blob flow:
-  ##   if (msg[33] != 0) return 0;           # action code: only ADDBA Request (0) handled
-  ##   baParam = msg[35] | (msg[36]<<8);      # 16-bit BA parameter set
-  ##   amsduOK = baParam & 1                   # A-MSDU supported bit
-  ##   baPolicy = baParam & 2                  # Immediate (1) / Delayed (0) BA
-  ##   bufferSize = baParam >> 6               # 10-bit buffer size
-  ##   dialogToken = msg[34]
-  ##   staIdx = msg[7]
-  ##   (log "AABA Request" via g_bl_ops_funcs[1])
-  ##   (log "AABA Response" via g_bl_ops_funcs[1])
-  ##   *(u32*)0x24B00054 |= 0x80              # set MACHW BAM ACK bit
-  ##   bam_send_air_action_frame(staIdx, 0, 1, dialogToken, bufferSize, 0, 0);
-  ##   return 0;
-  let msg = rxuMgtDispatchView(param)
-  # Only respond to ADDBA Request (action code 0). ADDBA Response (1) and
-  # DELBA (2) are not handled here — RXU layer routes them differently.
-  if msg.actionCode != 0'u8:
+  ## Negotiate the vendor's immediate-BA receive window: at most 12 MPDUs,
+  ## the requested TID, no A-MSDU, and no inactivity timeout.
+  if param == nil:
     return 0
+  let saved = irqSave()
+  var irqHeld = true
+  defer:
+    if irqHeld: irqRestore(saved)
+  const bodyOffset = offsetof(RxuMgtIndMsgView, body).uint32
+  let payloadLength = keMsgHdrFromPayload(param).paramLen
+  if payloadLength < bodyOffset + sizeof(AddBaReqActionBodyView).uint32:
+    return 0
+  let bodyLength = rxuMgtIndMsgAt(param).frameLen.uint32
+  if bodyLength < sizeof(AddBaReqActionBodyView).uint32 or
+      bodyLength > payloadLength - bodyOffset:
+    return 0
+  let msg = rxuMgtDispatchView(param)
+  # This vendor has no originator agreement state machine or DELBA handling.
+  if (msg.frameCtrl and 0xFC'u16) != 0xD0'u16 or
+      msg.category != 3 or msg.actionCode != 0:
+    return 0
+  let staIdx = msg.staIdx
+  if staIdx >= STA_INFO_TAB_ENTRIES.uint8:
+    return 0
+  let sta = staInfoForIdx(staIdx)
+  if sta.valid == 0 or sta.instNbr >= MAX_VIFS.uint8 or
+      sta.instNbr != msg.vifIdx:
+    return 0
+  let vifIdx = sta.instNbr
+  let vifEpoch = rxVifEpochs[vifIdx]
+  let stationEpoch = staDeleteEpoch(staIdx)
+  let resetEpoch = txResetEpoch
+  template requireResponseOwner() =
+    if txlResetting() or txlVifIsRetiring(vifIdx) or
+        txResetEpoch != resetEpoch or rxVifEpochs[vifIdx] != vifEpoch or
+        staDeleteEpoch(staIdx) != stationEpoch or
+        sta.valid == 0 or sta.instNbr != vifIdx:
+      return 0
+  requireResponseOwner()
   let baParam = msg.baParam
   let amsduOK = (baParam and 1'u16) != 0
   let baPolicy = (baParam and 2'u16) != 0
   let tid = ((baParam shr 2) and 0x0F'u16).uint32
   let bufferSize = (baParam shr 6) and 0x3FF'u16
+  let acceptedWindow = min(bufferSize, 12'u16)
+  let responseParams = (baParam and 0x003E'u16) or 2'u16 or
+                       (acceptedWindow shl 6)
   let dialogToken = msg.dialogToken
-  let staIdx = msg.staIdx
-  # Log AABA Request and AABA Response via g_bl_ops_funcs[1] (printf-like).
-  # Non-functional for WiFi operation but matches blob behavior when the
-  # hook is installed.
-  let logPtr = blOpsFunc(4)
-  if logPtr != nil:
-    const reqFmt: cstring =
+  # Snapshot the body before diagnostics can retire its station or message.
+  let body = addBaReqActionBodyAt(addr rxuMgtIndMsgAt(param).body[0])
+  let startingSequence = body.startSeq.uint32 shr 4
+  let timeout = body.timeout.uint32
+  const
+    reqFmt: cstring =
       "-----------------> AABA Request:\r\n    A-MSDU: %s\r\n    Block Ack Policy: %s\r\n    TID: %u\r\n    Number of Buffers: %u\r\n"
-    const rspFmt: cstring =
-      "-----------------> AABA Response:\r\n    A-MSDU: %s\r\n    Block Ack Policy: %s\r\n    TID: %u\r\n    Number of Buffers: %u\r\n"
-    const permitted: cstring = "Permitted"
-    const notPermitted: cstring = "Not Permitted"
-    const immediate: cstring = "Immediate Block Ack"
-    const delayed: cstring = "Delayed Block Ack"
+    rspFmt: cstring =
+      "-----------------> AABA Response:\r\n    A-MSDU: %s\r\n    Block Ack Policy: %s\r\n    TID: %u\r\n    Number of Buffers: %u\r\n    ssn: %u\r\n    timeout: %u\r\n    tid %u\r\n"
+    permitted: cstring = "Permitted"
+    notPermitted: cstring = "Not Permitted"
+    immediate: cstring = "Immediate Block Ack"
+    delayed: cstring = "Delayed Block Ack"
+  type PrintFn = proc(format: cstring) {.cdecl, varargs, raises: [Exception].}
+  let requestPrint = cast[PrintFn](blOpsFunc(4))
+  if requestPrint != nil:
     let amsduStr = if amsduOK: permitted else: notPermitted
     let policyStr = if baPolicy: immediate else: delayed
-    # Clamp buffer count for log (blob: `if (12 >= buf) buf = 12;` clamps min
-    # display — but passes raw buffer_size to bam_send_air_action_frame).
-    let logBuf = if bufferSize > 12'u16: bufferSize.uint32 else: 12'u32
-    let printFn = cast[proc(fmt: cstring, a: cstring, b: cstring, t: uint32,
-                           n: uint32){.cdecl, varargs.}](logPtr)
-    printFn(reqFmt, amsduStr, policyStr, tid, logBuf)
-    printFn(rspFmt, amsduStr, policyStr, tid, logBuf)
+    irqHeld = false
+    irqRestore(saved)
+    requestPrint(reqFmt, amsduStr, policyStr, tid.cuint, bufferSize.cuint)
+    discard irqSave()
+    irqHeld = true
+    requireResponseOwner()
+  let responsePrint = cast[PrintFn](blOpsFunc(4))
+  if responsePrint != nil:
+    irqHeld = false
+    irqRestore(saved)
+    # The vendor's diagnostic labels swap these two protocol fields.
+    responsePrint(rspFmt, notPermitted, immediate, tid.cuint,
+                  acceptedWindow.cuint, startingSequence.cuint, timeout.cuint,
+                  tid.cuint)
+    discard irqSave()
+    irqHeld = true
+    requireResponseOwner()
   # Set MACHW BAM ACK bit (reg 0x24B00054 bit 7).
-  let machwReg = cast[ptr uint32](MACHW_DOZE_CNTRL2_REG)
-  machwReg[] = machwReg[] or 0x80'u32
-  # Send ADDBA Response: isAddba=1 selects response-build path in callee.
-  # statusCode param actually carries bufferSize here (the ADDBA reqs bufsize
-  # is reflected back to peer via me_build_add_ba_rsp).
-  bam_send_air_action_frame(staIdx, 0'u8, 1'u8, dialogToken, bufferSize, 0'u8, nil)
+  regWrite(MACHW_DOZE_CNTRL2_REG, regRead(MACHW_DOZE_CNTRL2_REG) or 0x80'u32)
+  bam_send_air_action_frame(staIdx, nil, 1'u8, dialogToken,
+                           responseParams, 0'u16, nil)
   return 0

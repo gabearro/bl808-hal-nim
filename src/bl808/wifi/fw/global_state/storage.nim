@@ -1,6 +1,14 @@
 # =============================================================================
 # Global firmware state
 # =============================================================================
+# MAC AC to U-APSD bit mapping from mac.o: BK, BE, VI, VO.
+var mac_ac2uapsd* {.exportc.}: array[4, uint8] = [
+  0x04'u8, 0x08, 0x02, 0x01
+]
+var mac_tid2ac* {.exportc.}: array[9, uint8] = [
+  1'u8, 0, 0, 1, 2, 2, 3, 3, 3
+]
+
 var
   # Kernel event bitmap and handlers
   keEvtField* {.wifiCtrl.}: uint32
@@ -9,7 +17,11 @@ var
   keMsgQueueSent* {.wifiCtrl.}: CoList
   keMsgQueueSaved* {.wifiCtrl.}: CoList
   keTimerQueue* {.wifiCtrl.}: CoList
+  keTimerMutationTop {.wifiCtrl.}: ptr KeTimerMutation
+  keTimerScheduling {.wifiCtrl.}: bool
   keSavedReschedTask* {.wifiCtrl.}: uint8 = TASK_NONE
+  keSavedReschedMask* {.wifiCtrl.}: uint16
+  keSavedReschedRemaining {.wifiCtrl.}: array[TASK_API.int, uint32]
 
   # Task state array (per task)
   keTaskStates* {.wifiCtrl.}: array[TASK_MAX.int, uint16]
@@ -41,16 +53,24 @@ var
   mm_env* {.exportc.}: array[17, uint32]  # 68 bytes = 17 words
   mmState*: uint8
   mmBcnInitDone*: bool
+  mmBcnStopping*: bool
+  mmBcnGeneration: uint32
+  mmBcnActiveUpdate: ptr MmBcnUpdateScope
   mmActiveVifCount*: uint8
   mmMonitorEnabled*: bool
   mmRxFilterMask*: uint32
   mmKeepAliveEnabled*: bool
   mmKeepAliveTimestamp*: uint32
   mmKeepAliveCounter*: uint32
+  mmLastBeaconLogTime {.wifiCtrl.}: uint32
+  mmTbttActive {.wifiCtrl.}: bool
 
   # MM timer list (sorted CoList of mm_timer entries)
   # Each entry layout: [0]=next ptr, [4]=callback ptr, [8]=env ptr, [12]=time
   mm_timer_list* {.exportc: "mm_timer_list".}: CoList
+  mmTimerRevision {.wifiCtrl.}: uint32
+  mmTimerMutationTop {.wifiCtrl.}: ptr MmTimerMutation
+  mmTimerScheduling {.wifiCtrl.}: bool
 
   # TX buffer management
   txBufferEnv*: TxBufferDesc
@@ -68,6 +88,16 @@ var
   txlCntrlBusy*: uint16  # Global TX busy flag (from blob)
   txlAcPending*: array[NUM_TX_QUEUES, uint32]
   txlAcBusy*: array[NUM_TX_QUEUES, bool]
+  txActiveFlush {.wifiCtrl.}: ptr TxFlushBatch
+  txRecoveryPostponed {.wifiCtrl.}: CoList
+  txResetActive {.wifiCtrl.}: bool
+  txResetEpoch {.wifiCtrl.}: uint32
+  txRetiringVifMask {.wifiCtrl.}: uint32
+  txRetiringVifEpochs {.wifiCtrl.}: array[MAX_VIFS, uint32]
+  ipcTxDispatchActive {.wifiCtrl.}: bool
+  txActiveDmaOwner {.wifiCtrl.}: ptr TxDmaOwner
+  txActiveTriggerOwner {.wifiCtrl.}: ptr TxDmaOwner
+  txDmaRescan {.wifiCtrl.}: bool
 
   # TX confirm environment (40-byte struct = 5 CoLists)
   txl_cfm_env* {.exportc.}: array[10, uint32]  # 40 bytes = 10 words (5 CoLists of 8 bytes)
@@ -80,6 +110,18 @@ var
 
   # RX environment
   rxSwDescs*: array[RX_BUFFER_POOL_SIZE, RxSwDesc]
+  # Session identity for the 41 vendor DMA slots; not part of their wire layout.
+  rxStationIdentities: array[41, RxStationIdentity]
+  rxUploadEpochs: array[41, uint32]
+  rxVifEpochs {.wifiCtrl.}: array[MAX_VIFS, uint32]
+  rxMgtIdentities {.wifiCtrl.}: ptr RxMgtIdentityNode
+  rxlControlActive {.wifiCtrl.}: bool
+  rxInitializationEpoch {.wifiCtrl.}: uint32
+  # Management receive state is separate from the eight data-TID counters.
+  rxMgtReplayStates {.wifiCtrl.}: array[STA_INFO_TAB_ENTRIES + MAX_VIFS * 6, KeyReplayCounterView]
+  rxMgtReplayValid {.wifiCtrl.}: array[STA_INFO_TAB_ENTRIES + MAX_VIFS * 6, bool]
+  rxKeyRevision {.wifiCtrl.}: uint64 = 1
+  rxKeyLastChanged {.wifiCtrl.}: array[STA_INFO_TAB_ENTRIES + MAX_VIFS * 6, uint64]
 
   # Blob RX DMA globals — these are what the MAC DMA engine actually reads
   # from. Sizes from `nm`: rx_dma_hdrdesc=0x1004 (41 × 100), rx_swdesc_tab
@@ -91,15 +133,9 @@ var
   rx_swdesc_tab* {.exportc, wifiRxDmaSw.}: array[984, uint8]
   rx_payload_desc_buffer* {.exportc, wifiRxDmaBuf.}: array[71176, uint8]
 
-  # RX HW descriptor environment (from rxl_hwdesc.c)
-  # Layout (28 bytes):
-  #   [0]  ptr   - current RX HW descriptor (first in chain)
-  #   [4]  ptr   - last RX HW descriptor
-  #   [8]  ptr   - free descriptor head
-  #   [12] uint32 - descriptor count
-  #   [16] uint32 - flags
-  #   [20] uint32 - reserved
-  #   [24] uint8  - processing flag (set when ISR is active)
+  # RX HW descriptor callback environment (from rxl_hwdesc.c).
+  # The blob calls the function pointers at +20 and +24 directly in
+  # rxl_hwdesc_init, rxl_mpdu_free, and rxu_swdesc_upload_evt.
   rxl_hwdesc_env* {.exportc.}: array[7, uint32]  # 28 bytes = 7 words
   # rxl_cntrl_env: RX lower control environment (28 bytes)
   rxl_cntrl_env* {.exportc.}: array[7, uint32]
@@ -113,12 +149,16 @@ var
   chanCurrentCtxt*: pointer
   chanPendingCtxt*: pointer
   chanConflictCount*: uint32
+  chanSlotConfigCycles: uint8  # Vendor config_lasting_cycle.1, separate from flags.
   chanConflictDetected*: bool
   chanScanPending*: bool
+  cde_evt_tmr_msg* {.exportc.}: uint8
+  sm_reconn_dominant_flag* {.exportc.}: uint32
 
   # Scan lower-MAC environment (exported as "scan_env", 24 bytes)
   # offset 10 (0x0A): abort request flag byte
   scan_env* {.exportc.}: ScanEnvObj
+  scanRequestEpoch: uint32
   scanDurationActive*: uint32
   scanDurationPassive*: uint32
   scanDurationJoinActive*: uint32
@@ -130,6 +170,9 @@ var
 
   # Scan-upper environment (exported as "scanu_env")
   scanu_env* {.exportc.}: ScanuEnvObj
+  scanuRequestEpoch: uint32
+  scanuProducerRequest: pointer
+  scanuProducerEpoch: uint32
   scanuCachedSsids: array[SCANU_MAX_RESULT_ENTRIES, ScanuCachedSsid]
   scanuCachedChannels: array[SCANU_MAX_RESULT_ENTRIES, ScanChannelEntry]
   scanuJoinHandler*: pointer  # Function pointer stored during scanu_init
@@ -156,6 +199,16 @@ var
   #   ...up to offset 0x34 (word 13)
   ps_env* {.exportc.}: array[14, uint32]
 
+  # Platform PS params (ps.o): 5 uint32 entries.
+  # Blob hex: 40420f00 409c0000 02000000 06000000 10270000
+  bl_ps_params* {.exportc.}: array[5, uint32] = [
+    1000000'u32,  # 0x000F4240: traffic detection period
+    40000'u32,    # 0x00009C40: default TIM activity period
+    2'u32,        # traffic detection threshold
+    6'u32,        # null-frame retry limit
+    10000'u32,    # 0x00002710: TX-null timeout
+  ]
+
   # Time domain environment (per-VIF: 44 bytes each, 2 VIFs)
   # td_env is the base; td_reset uses stride=44 to index per-VIF.
   td_env* {.exportc.}: array[22, uint32]  # 88 bytes = 22 words (2 * 44 bytes)
@@ -181,8 +234,12 @@ var
   # Rate control PRNG state (LCG: next = state * RC_PRNG_MULT + RC_PRNG_INCR)
   rcPrngState* {.exportc: "rc_prng".}: uint32
 
-  # BAM environment
-  bamStaIdx*: uint8  # Current BA station index, 0xFF = none
+  # Private WEP IV seed from sta_mgmt.o's initialized `next` variable.
+  staKeyPrngState: uint32 = 1
+  # vif_mgmt.o has a distinct copy, also initialized to 1.
+  vifKeyPrngState: uint32 = 1
+  # sm.o owns a separate initialized stream for SA Query transaction IDs.
+  smQueryPrngState: uint32 = 1
 
   # IPC environment (20-byte struct from ipc_emb_init memset)
   # Layout:
@@ -205,14 +262,12 @@ var
   # Total size is 0x24dc = 9436 bytes in blob.
   ipcSharedEnv* {.exportc: "ipc_shared_env".}: array[2359, uint32]  # 9436 bytes
 
-  # HAL MACHW environment (two-word struct from blob)
-  halMachwRxCntrlBackup*: uint32   # RX filter mask backup (offset 0 in blob struct)
-  halMachwStatusFlags*: uint32     # Status flags: bit 2 = idle req pending (offset 4 in blob struct)
-
   # Coexistence
-  coexPtaAutoControl*: uint32       # PTA state: 0=disabled, 1=enabled, -1=forced
+  coexPtaAutoControl*: uint32 = high(uint32) # No previous state on first call
   coexPtaTimestamp*: uint32          # Timestamp of last state change
-  coexPtaAccum*: uint32              # Accumulated time in current state
+  coexPtaAccum*: uint32              # Legacy aggregate across both states
+  pds_slept_time* {.exportc.}: uint32 # Time attributed to BLE
+  pds_woken_time* {.exportc.}: uint32 # Time attributed to WiFi
 
   # SM state
   smConnecting*: bool
@@ -227,6 +282,39 @@ var
   #   offset 90: APM task instance number (set by apm_start_cfm)
   # Sized at 96 bytes to cover all accessed offsets (incl. apm_start_cfm offset 90).
   apm_env* {.exportc.}: array[176, uint8]
+  apmPendingAssociations: array[5, ApmPendingAssociation]
+  apmPendingCancelMask: uint8
+  apmStoppingVifs: uint8
+  apmStartConfirmation: pointer
+  apmStartBeaconMessage: pointer
+  apmStartVifMessage: pointer
+  apmStartReplyPool: array[6, pointer]
+  apmStartReplyIndex: int
+  apmStartRequest: pointer
+  apmStartReply: pointer
+  apmStartReplyId: uint16
+  apmStartReplySource: uint8
+  apmStartReplyPublished: bool
+  apmRollbackCommands: array[3, pointer]
+  apmRollbackReplies: array[3, pointer]
+  apmStartSideEffects: bool
+  apmRollbackActive: bool
+  apmRollbackHaltPending: bool
+  apmRollbackStatus: uint8
+  apmStopActive: bool
+  apmStopVifIdx: uint8
+  apmStopRequest: pointer
+  meControlCommand: pointer
+  meControlReply: pointer
+  meControlReplyReady: bool
+  meControlExpectedId: uint16
+  meControlFinalId: uint16
+  meControlRequester: uint8
+  mmPsModeRequest: pointer
+  mmTimIdentities {.wifiCtrl.}: ptr MmTimIdentityNode
+  staDeleteEpochs: array[STA_MGMT_FREE_STAS, uint32]
+  mmStaAddInProgress: array[MAX_VIFS, bool]
+  mmStaAddVifEpoch: array[MAX_VIFS, uint32]
 
   # Hostapd context pointer and enabled flag for embedded AP.
   hostapd_ctx* {.exportc.}: pointer
@@ -335,6 +423,9 @@ var
   # Private txl_frame.o descriptor array (.LANCHOR0 in the vendor object):
   # 4 descriptors * 220 bytes. These list nodes are what txl_frame_env holds.
   txl_frame_desc_storage: array[4 * 220, uint8]
+  txFrameIdentities {.wifiCtrl.}: array[4, TxFrameIdentity]
+  txFrameGeneration {.wifiCtrl.}: uint32
+  txActiveFrameCallback {.wifiCtrl.}: ptr TxFrameCallbackScope
   txl_buffer_control_desc* {.exportc.}: array[300, uint8]
   txl_buffer_env* {.exportc.}: array[220, uint8]
   fw_nap_chain* {.exportc.}: array[3, uint32]  # 12 bytes
@@ -363,8 +454,8 @@ var
   txl_tim_desc* {.exportc.}: array[40, uint8]
   # txl_tim_ie_pool: TIM IE data pool (contains TIM IE bytes)
   txl_tim_ie_pool* {.exportc.}: array[6, uint8]
-  # txl_tim_bitmap_pool: TIM bitmap buffer (252 bytes for TIM bitmap)
-  txl_tim_bitmap_pool* {.exportc.}: array[251, uint8]
+  # 251 bitmap bytes plus the vendor's padding byte for initialization.
+  txl_tim_bitmap_pool* {.exportc.}: array[252, uint8]
   # txl_buffer_control_desc_bcmc: broadcast/multicast TX buffer control descriptor
   txl_buffer_control_desc_bcmc* {.exportc.}: array[120, uint8]
   # txl_buffer_control_24G: 2.4GHz TX buffer control (60 bytes = 0x3C)

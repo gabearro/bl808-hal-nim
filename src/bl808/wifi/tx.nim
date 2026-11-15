@@ -2,6 +2,7 @@
 
 when defined(bl808m0) and defined(bl808WifiNimFw):
   import sdk_headers
+  import ipc_host as hostIpc
 
   include tx/layout
   include tx/types

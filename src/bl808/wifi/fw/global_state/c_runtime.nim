@@ -1,14 +1,15 @@
 # Type alias for the platform log function used throughout the firmware.
-# Calling convention: log(level, severity, file_str, line_num, ...)
+# SDK log-write ABI; printf and puts have separate operation slots.
 type
-  PlatformLogFunc* = proc(level: uint32, sev: uint32, file: pointer,
-                           line: uint32) {.cdecl, varargs.}
+  PlatformLogFunc* = proc(level: uint32; tag, file: cstring; line: cint;
+                         format: cstring) {.cdecl, varargs, raises: [Exception].}
 
 # Helper: get a platform operation function pointer from g_bl_ops_funcs.
 proc blOpsFunc(operationSlotByteOffset: int): pointer {.inline.} =
   cast[ptr pointer](cast[uint](addr g_bl_ops_funcs) + operationSlotByteOffset.uint)[]
 
-proc getLogFunc(logFunctionSlotByteOffset: int): PlatformLogFunc {.inline.} =
+proc getLogFunc(logFunctionSlotByteOffset: static[int]): PlatformLogFunc {.inline.} =
+  static: doAssert logFunctionSlotByteOffset == 204, "use blOpsFunc for non-log operations"
   cast[PlatformLogFunc](blOpsFunc(logFunctionSlotByteOffset))
 
 # Forward declare memset for zero-init

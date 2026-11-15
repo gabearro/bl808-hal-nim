@@ -1,11 +1,9 @@
 ## Pure key-install policy helpers shared by firmware and host fuzzers.
 
-proc wifiCipherIsCcmpGroup*(cipherType: uint8): bool {.inline.} =
-  ## The supplicant set_key path translates 16-byte CCMP keys to cipher 2.
-  ## Some recovered vendor comments/paths label the same group-key role as 5.
-  cipherType == 2'u8 or cipherType == 5'u8
+proc wifiCipherIsBip*(cipherType: uint8): bool {.inline.} =
+  ## BIP is software-managed and uses the VIF's separate management-key pointer.
+  cipherType == 5'u8
 
-proc wifiCipherUsesGroupReplayPn*(cipherType, hasRxPn: uint8): bool {.inline.} =
-  ## When the host supplies a PN, CCMP group keys must seed the shared group
-  ## replay counters even when has_rx_pn is set.
-  hasRxPn == 0'u8 or wifiCipherIsCcmpGroup(cipherType)
+proc wifiKeyUsesDirectReplayPn*(cipherType, pairwise: uint8): bool {.inline.} =
+  ## Pairwise data keys use the replay window; group data and BIP store next PN.
+  pairwise == 0'u8 or wifiCipherIsBip(cipherType)

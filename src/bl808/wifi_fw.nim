@@ -56,11 +56,26 @@ include wifi/fw/global_state
 include wifi/fw/runtime_helpers
 include wifi/fw/rsn_parse
 include wifi/fw/kernel_mac_channel
+include wifi/fw/channel_timer
+include wifi/fw/channel_beacon_request
+include wifi/fw/channel_update
+include wifi/fw/channel_switch
+include wifi/fw/channel_protection
 include wifi/fw/scan_station_ap_me
 include wifi/fw/rate_control
 include wifi/fw/tx_layer
+include wifi/fw/station_tx_build
+include wifi/fw/station_scan
+include wifi/fw/station_registration
+include wifi/fw/station_response_timeout
+include wifi/fw/station_bss
+include wifi/fw/station_activation
 include wifi/fw/tx_upper
 include wifi/fw/rx_layer
+include wifi/fw/rx_host_delivery
+include wifi/fw/deferred_auth
+include wifi/fw/station_abort
+include wifi/fw/station_cleanup
 proc nim_ccmp_decrypt*(tk: pointer; hdr: pointer; data: pointer;
                        dataLen: uint32; outPlain: pointer;
                        outLen: ptr uint32): bool
@@ -78,5 +93,7 @@ include wifi/fw/crypto_mfp_hsu
 include wifi/fw/mac_config_debug
 include wifi/fw/coex_intc_sysctrl
 include wifi/fw/task_handlers
+include wifi/fw/tx_security
+include wifi/fw/tx_security_update
 include wifi/fw/dispatch_tables
 include wifi/fw/task_init_main

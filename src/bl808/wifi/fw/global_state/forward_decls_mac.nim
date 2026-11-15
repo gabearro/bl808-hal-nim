@@ -1,38 +1,42 @@
-proc sm_assoc_req_send_pre*(param: pointer) {.exportc, cdecl.}
+proc sm_assoc_req_send_pre*() {.exportc, cdecl.}
 proc sm_send_next_bss_param*(param: pointer) {.exportc, cdecl.}
 proc me_build_capability*(param: pointer): uint16 {.exportc, cdecl.}
 proc txl_frame_push_force*(param: pointer, ac: uint8) {.exportc, cdecl.}
 proc txl_transmit_trigger*() {.exportc, cdecl.}
-proc txl_cntrl_clear_ac*(ac: uint8) {.exportc, cdecl.}
+proc txl_cntrl_clear_ac*(ac: uint8): bool {.exportc, cdecl.}
 proc apm_send_next_bss_param*(param: pointer) {.exportc, cdecl.}
 proc apm_embedded_enabled*(vifEntry: pointer): bool {.exportc, cdecl, noinline.}
 proc me_add_ie_customer*(buf: pointer, ieData: pointer = nil,
                          length: uint32 = 0): uint32 {.exportc, cdecl.}
 proc apm_bcn_set*(param: pointer) {.exportc, cdecl.}
 proc vif_mgmt_get_first_ap_inf*(): pointer {.exportc, cdecl.}
-proc sm_handle_connection*(vifIdxOrFlag: uint32, status: uint32, callbackCtx: pointer, failureFn: pointer) {.exportc, cdecl.}
+proc sm_handle_connection*(vifIdx: uint8, status: uint16, callbackCtx: pointer, failureFn: pointer) {.exportc, cdecl.}
 proc sm_connect_ind*(statusCode: uint16, reasonCode: uint16) {.exportc, cdecl, noinline.}
-proc sm_deauth_send*(param: pointer, reason: uint16) {.exportc, cdecl.}
+proc sm_deauth_send*() {.exportc, cdecl.}
 proc sm_get_bss_params*(selectedBssResultOut: ptr pointer, selectedBssChannelOut: ptr pointer): bool {.exportc, cdecl.}
 proc sm_scan_bss*(bssid: pointer, ssid: pointer, chanInfo: pointer) {.exportc, cdecl.}
 proc sm_join_bss*(bssid: pointer, ssid: pointer, joinInfo: pointer, flag: uint32) {.exportc, cdecl.}
 proc sm_auth_handler*(param: pointer) {.exportc, cdecl.}
-proc me_beacon_check*(vifIdx: uint8, frameDesc: pointer, iesBase: pointer) {.exportc, cdecl.}
-proc rc_update_bw_nss_max*(staIdx: uint8, nss: uint8, groupCnt: uint8) {.exportc, cdecl.}
+proc me_beacon_check*(vifIdx: uint8, frameLength: uint16, frame: pointer) {.exportc, cdecl.}
+proc mmBcnApplyUpdate(request: pointer; callbackIrq: uint32): pointer
+proc rc_update_bw_nss_max*(staIdx: uint8, maxBandwidth: uint8, maxNss: uint8) {.exportc, cdecl.}
 proc me_build_deauthenticate*(buf: pointer, reason: uint16): uint32 {.exportc, cdecl, noinline.}
 proc me_build_beacon*(buf: pointer, vifIdx: uint8, lenOut: ptr uint16,
                      flagsOut: ptr uint8, hiddenSsid: uint8): uint32 {.exportc, cdecl.}
 proc me_build_authenticate*(buf: pointer, authAlgo: uint16, authSeq: uint16,
     statusCode: uint16, challengeText: pointer): uint32 {.exportc, cdecl, noinline.}
-proc me_build_associate_rsp_impl(buf: pointer, staEntry: pointer,
-    statusCode: uint16, aid: uint16): uint32 {.exportc: "me_build_associate_rsp", cdecl.}
-# Nim-side proc alias so existing callers that cast the function pointer still work:
-proc me_build_associate_rsp*(buf: pointer, p1: pointer = nil, p2: uint16 = 0, p3: uint16 = 0): uint32 {.inline.} =
-  me_build_associate_rsp_impl(buf, p1, p2, p3)
+proc me_build_associate_rsp_impl(buf: pointer, vifIdx: uint8,
+    statusCode: uint16, staRequest: pointer): uint32 {.exportc: "me_build_associate_rsp", cdecl.}
+proc me_build_associate_rsp*(buf: pointer, vifIdx: uint8,
+    statusCode: uint16, staRequest: pointer): uint32 {.inline.} =
+  me_build_associate_rsp_impl(buf, vifIdx, statusCode, staRequest)
 proc me_build_sae_authenticate*(buf: pointer, authAlgo: uint16, authSeq: uint16, statusCode: uint16, vifIdx: uint32): uint32 {.exportc, cdecl.}
 proc me_build_probe_rsp*(buf: pointer, vifIdx: uint8,
     lenOut: ptr uint16): uint32 {.exportc, cdecl.}
-proc vif_mgmt_entry_init*(vifEntry: pointer) {.exportc, cdecl.}
+proc meBuildProbeResponse(buf: pointer; vifIdx: uint8; capacity: uint32;
+                          lenOut: ptr uint16): uint32
+proc writeWmmParameterIe(ieBuf: pointer; vif: ptr VifChannelView): pointer
+proc vif_mgmt_entry_init*(vifEntry: pointer): bool {.exportc, cdecl.}
 proc vif_mgmt_add_to_list*(vifEntry: pointer) {.exportc, cdecl.}
 proc vif_mgmt_bcn_to_prog*(vifEntry: pointer) {.exportc, cdecl.}
 proc vif_mgmt_bcn_to_evt*(vifEntry: pointer) {.exportc, cdecl.}
@@ -47,30 +51,227 @@ proc rxl_timer_int_handler*() {.exportc, cdecl.}
 proc rxl_cntrl_evt*() {.exportc, cdecl.}
 proc scanu_scan_next*() {.exportc, cdecl.}
 proc chan_tbtt_schedule*(tbttEntry: pointer) {.exportc, cdecl.}
+proc chanTimerInvalidate(timer: pointer = nil)
+proc chanTimerArming(timer: pointer)
+proc chanTimerPublished(timer: pointer)
+proc chanTimerCapture(timer: pointer): uint32
+proc chanTimerDispatch(timer, callback, argument: pointer; serial: uint32): bool
 proc chan_send_scanning_stop*(chanEnvPtr: pointer) {.exportc, cdecl.}
 proc chan_upd_ctxt_status*(chanCtxtPtr: pointer, newStatus: uint8) {.exportc, cdecl.}
 proc scan_send_cancel_cfm*(status: uint8) {.exportc, cdecl, noinline.}
 proc chan_goto_idle_cb*() {.exportc, cdecl.}
-proc chan_sta_tx_cfm*(param: pointer) {.exportc, cdecl.}
-proc chan_ap_tx_cfm*(param: pointer) {.exportc, cdecl.}
+proc chan_sta_tx_cfm*(param: pointer, status: uint32) {.exportc, cdecl.}
+proc chan_ap_tx_cfm*(param: pointer, status: uint32) {.exportc, cdecl.}
 proc chan_switch_start*(chanCtxt: pointer) {.exportc, cdecl.}
+proc chanSwitchForget(header: pointer)
+proc chanSwitchCancel(target: pointer = nil)
+proc chanSwitchRetire(target: pointer)
+proc chanSwitchAllocate(target: pointer): pointer
+proc chanSwitchPublish(request: pointer): bool
+proc chanSwitchAdmit(request: pointer): bool
+proc chanSwitchInvoke(request: pointer): bool
+proc chanSwitchCallbackCurrent(): bool
+proc chanSwitchSelectTarget(target: pointer): bool
+proc chanUpdateStorageLength(id: uint16; destination: uint8; length: uint32): uint32
+proc chanUpdateRegister(header: ptr KeMsgHdr)
+proc chanUpdateCaptureMessage(header: ptr KeMsgHdr)
+proc chanUpdateForget(header: pointer)
+proc chanUpdateAdmit(request: pointer): bool
+proc chanBcnRequestAllocate(identity: MmVifIdentity; lease: ChanCtxtLease;
+                           channel: ChanCtxtDefView; interval, resetEpoch: uint32): pointer
+proc chanBcnRequestPublish(p: pointer): bool
+proc chanBcnRequestPrune()
+proc chanBcnRequestAdmit(p: pointer): bool
+proc chanBcnRequestClaim(p: pointer; taskId: uint8): bool
+proc chanBcnRequestFinish(p: pointer; status: uint8)
+proc chanBcnRequestForget(header: pointer)
+proc chanBcnRequestReset()
+proc chanProtectionInvalidate()
+proc chanProtectionCancel(target: pointer = nil): pointer {.discardable.}
+proc chanProtectionCallbackCurrent(): bool
+proc chanProtectionSelectTarget(target: pointer): bool
 proc chan_get_next_chan*(): pointer {.exportc, cdecl.}
 proc chan_conn_less_delay_prog*() {.exportc, cdecl.}
-proc mm_force_idle_req*() {.exportc, cdecl.}
+proc mm_force_idle_req*(): bool {.exportc, cdecl, discardable.}
 proc mm_back_to_host_idle*() {.exportc, cdecl.}
 proc phy_mdm_isr*() {.exportc, cdecl.}
 proc phy_rc_isr*() {.exportc, cdecl.}
 proc intc_spurious*() {.exportc, cdecl.}
 
 # Forward declarations for security/station management helpers called before definition
+proc mmDeleteSecurityKey(keyIdx: uint8): bool
+proc mmDeleteSecurityAddress(staIdx: uint8): bool
 proc mm_sec_machwkey_del*(keyIdx: uint8) {.exportc, cdecl.}
 proc mm_sec_machwaddr_del*(staIdx: uint8) {.exportc, cdecl.}
 proc apm_tx_int_ps_clear*(vifEntry: pointer, staIdx: uint8) {.exportc, cdecl.}
 proc vif_mgmt_del_key*(vifEntry: pointer, keySlot: uint8) {.exportc, cdecl, noinline.}
-proc sta_mgmt_del_key*(staIdx: uint8, keyIdx: uint8) {.exportc, cdecl.}
+proc sta_mgmt_del_key*(staEntry: pointer) {.exportc, cdecl.}
 proc apm_send_mlme*(vifEntry: pointer, frameType: uint16, destAddr: pointer, callback: pointer, callbackArg: pointer, extraParam: pointer) {.exportc, cdecl.}
-proc apm_sta_add*(param: pointer): uint8 {.exportc, cdecl.}
-proc apm_sta_fw_delete*(staIdx: uint8, vifIdx: uint8, reason: uint16) {.exportc, cdecl.}
+proc apm_sta_add*(staIdx: uint8): uint8 {.exportc, cdecl.}
+proc aidListDelete(macAddr: pointer) {.exportc: "aid_list_delete", cdecl, noinline.}
+proc apmCancelPendingForVif(vifIdx: uint8)
+proc apmPrepareStartReplies(): bool
+proc apmSendStartRequest(request: pointer)
+proc apmTakeStartReply(request: pointer, id: uint16, length: uint32): pointer
+proc apmConsumeStartReply(reply: pointer): bool
+proc apmStartPendingForVif(vifIdx: uint8): bool
+proc apmVifRunning(vifIdx: uint8): bool
+proc apmContinueStartRollback()
+proc apmResumeHaltRollback()
+proc apm_start_cfm*(param: pointer) {.exportc, cdecl.}
+proc apmPrepareVifRemoval(vifIdx: uint8): bool
+proc meTakeControlReply(request: pointer, id: uint16, length: uint32): pointer
+proc meControlReset()
+proc meCancelQueuedPayload(payload: pointer)
+proc smBssForget(header: pointer)
+proc smActivationForget(header: pointer)
+proc smActivationPrepare(owner: SmTxBuildContext; indication: pointer;
+                         aid: uint16; prepared: var SmActivationPrepared): bool
+proc smActivationReleasePrepared(prepared: var SmActivationPrepared)
+proc smActivationStart(owner: SmTxBuildContext; indication: pointer;
+                       prepared: var SmActivationPrepared): bool
+proc smActivationOwnsRequest(request: pointer): bool
+proc smActivationAdmitRequest(request: pointer): bool
+proc smActivationAdmitControlReply(reply: pointer): bool
+proc smActivationTakeReply(request: pointer; id: uint16; length: uint32): pointer
+proc smActivationConfirm(reply: pointer; index: int): bool
+proc smActivationCancel()
+proc smActivationCancelConnection(connection: pointer)
+proc smActivationCancelControl(request, reply: pointer; owner: SmTxBuildContext): bool
+proc smActivationNeedsService(): bool
+proc smActivationService()
+proc smActivationNotifyCurrent(): bool
+proc smActivationConsumeSuccess(station: uint8): bool
+proc smRspTimerReset()
+proc smRspTimerBegin(id: uint16; task: uint8; continuationUs: uint64): uint32
+proc smRspTimerSetComeback(owner: SmTxBuildContext; intervalTu: uint32): bool
+proc smRspTimerAbort(serial: uint32)
+proc smRspTimerPublish(id: uint16; task: uint8; serial: uint32;
+                       entry: ptr KeTimerEntry): bool
+proc smRspTimerClear(id: uint16; task: uint8)
+proc smRspTimerDispatch(entry: ptr KeTimerEntry): bool
+proc smRspTimerForget(header: pointer)
+proc smBssCanBegin(): bool
+proc smBssNewSerial(): uint32
+proc smBssAlloc(index: int; serial: uint32; reply: bool): pointer
+proc smBssStart(owner: SmTxBuildContext; serial: uint32;
+                replies: array[9, pointer]): bool
+proc smBssOwnsRequest(request: pointer): bool
+proc smBssAdmitRequest(request: pointer): bool
+proc smBssAdmitControlReply(reply: pointer): bool
+proc smBssTakeReply(request: pointer; id: uint16; length: uint32): pointer
+proc smBssConsumeReply(reply: pointer): bool
+proc smBssSendNext()
+proc smBssCancel()
+proc smBssCancelControl(request, reply: pointer; vifIndex: uint8): bool
+proc smBssNeedsService(): bool
+proc smBssService()
+proc smCleanupForget(header: pointer)
+proc smDeferredForget(header: pointer)
+proc smDeferredCancel()
+proc smDeferredPark(payload: pointer)
+proc smDeferredPublish(vifEntry: pointer)
+proc smDeferredDispatch(payload: pointer): cint
+proc smAbortStorageLength(id: uint16; destination: uint8; length: uint32): uint32
+proc smAbortRegister(header: ptr KeMsgHdr)
+proc smAbortForget(header: pointer)
+proc smAbortCaptureMessage(header: ptr KeMsgHdr)
+proc keTimerCancelMutations(id = 0'u16; task = 0'u8; all = false)
+proc smTxBegin(connection: pointer): SmTxBuildContext
+proc smTxCapture(connection: pointer): SmTxBuildContext
+proc smScanAlloc(owner: SmTxBuildContext; indication: pointer; id, nextState: uint16): pointer
+proc smScanPublish(request: pointer): bool
+proc smScanOwnsRequest(request: pointer): bool
+proc smScanAdmitRequest(request: pointer): bool
+proc smScanCompletionAlloc(request: pointer; id: uint16; destination: uint8): pointer
+proc smScanAcceptReply(reply: pointer; id: uint16): bool
+proc smScanForget(header: pointer)
+proc smScanNeedsService(): bool
+proc smScanService()
+proc smRegistrationAllocate(owner: SmTxBuildContext; indication: pointer): pointer
+proc smRegistrationPublish(request: pointer): bool
+proc smRegistrationAdmitRequest(request: pointer): bool
+proc smRegistrationTakeReply(request: pointer): pointer
+proc smRegistrationComplete(request, reply: pointer): bool
+proc smRegistrationClaim(reply: pointer; owner: var SmTxBuildContext; indication: var pointer): bool
+proc smRegistrationHandoff(reply: pointer): bool
+proc smRegistrationOwnChannel(request: pointer; lease: var ChanCtxtLease): bool
+proc smRegistrationForget(header: pointer)
+proc smRegistrationNeedsService(): bool
+proc smRegistrationService()
+proc smTxBeginForVif(vifIndex: uint8): SmTxBuildContext
+proc smTxOwnerCurrent(build: SmTxBuildContext): bool
+proc smTxBindStation(build: var SmTxBuildContext; station: uint8): bool
+proc smTxAdopt(build: var SmTxBuildContext; frame: pointer): bool
+proc smTxFrameCurrent(build: var SmTxBuildContext): bool
+proc smTxEnd(build: var SmTxBuildContext)
+proc smTxFail(build: var SmTxBuildContext; status: uint16)
+proc smTxSetState(build: var SmTxBuildContext; state: uint16): bool
+proc smTxSetOwnerState(build: var SmTxBuildContext; state: uint16): bool
+proc smTxCallbackCurrent(): bool
+proc smDeauthSend(build: var SmTxBuildContext)
+proc txlFrameBindSmOwner(desc: ptr HostTxDescView; connection: pointer;
+                         serial: uint32; state: uint16): bool
+proc smTxArmResponse(build: var SmTxBuildContext; delay: uint32): bool
+proc smTxSubmit(build: var SmTxBuildContext; forced: bool): bool
+proc smTxFits(build: ptr SmTxBuildContext; buffer: pointer; length: uint32): bool
+proc meBuildSaeAuthenticate(buf: pointer; authAlgo, authSeq, statusCode: uint16;
+                            vifIdx: uint32; build: ptr SmTxBuildContext): uint32
+proc meBuildAssociateReq(buf, assocInfo, reassocBssid, capParam, cursorOut,
+                        bodyLenOut, connInfo: pointer; build: ptr SmTxBuildContext): uint32
+proc txl_frame_try_push_force(param: pointer; ac: uint8): uint8
+proc smCleanupOwnsRequest(request: pointer): bool
+proc smCleanupAdmitRequest(request: pointer): bool
+proc smCleanupTakeReply(request: pointer; id: uint16; length: uint32): pointer
+proc smCleanupConsumeReply(reply: pointer): bool
+proc smCleanupCancel()
+proc smCleanupNeedsService(): bool
+proc smCleanupService()
+proc smCleanupBegin(vifEntry: pointer; indication: pointer = nil;
+                    disconnected = false; status = 0'u16; reason = 0'u16): bool
+proc mmPsModeCancel()
+proc mmPsModeComplete()
+proc mm_sta_del*(staIdx: uint8) {.exportc, cdecl.}
+proc staMgmtBeginRemoval(staIdx: uint8; owner: var StaQueueIdentity): pointer
+proc staMgmtFinishRemoval(owner: StaQueueIdentity)
+proc staRemovalCurrent(owner: StaQueueIdentity): bool
+proc staMgmtResetEntry(owner: StaQueueIdentity; requireRetired: bool): bool
+proc staReleasePostponed(identity: StaQueueIdentity;
+                        flag, callbackIrqState: uint32): uint32
+proc txlHaltStationQueues(staIdx: uint8; selected: var uint8): bool
+proc txlHaltVifQueues(vifIdx: uint8; selected: var uint8): bool
+proc txl_retire_station(staIdx: uint8; selected: uint8)
+proc txl_retire_vif(vifIdx: uint8; selected: uint8)
+proc txuCancelFrame(param: pointer; ac: uint8)
+proc txlInvalidateDmaFrame(desc: pointer)
+proc txlInvalidateDmaAc(ac: uint8)
+proc txlInvalidateDmaVif(vif: uint8)
+proc txlInvalidateDmaStation(station: uint8)
+proc txlInvalidateDmaAll()
+proc txlInvalidateDmaPool()
+proc txlResetting(): bool {.inline.}
+proc txlVifIsRetiring(vifIdx: uint8): bool
+proc txlFrameSessionCurrent(desc: ptr HostTxDescView): bool
+proc txlFrameLeaseToken(desc: ptr HostTxDescView): uint32
+proc txlFrameLeaseMatches(desc: ptr HostTxDescView; generation: uint32): bool
+proc txlFramePreparationCurrent(desc: ptr HostTxDescView;
+    identity: TxSessionIdentity; generation: uint32): bool
+proc txlFrameCallbackCurrent(): bool
+proc staDeleteEpoch(staIdx: uint8): uint32
+proc staDeleteIsCurrent(staIdx: uint8, epoch: uint32): bool
+proc staPostponedOwner(staEntry: pointer): StaQueueIdentity
+proc staPostponedOwnerCurrent(identity: StaQueueIdentity): bool
+proc staPostponedListValid(queue: ptr CoList): bool
+proc txlDrainRetiredPostponed(queue: ptr CoList)
+proc txlFlushScopeExit(previous: ptr TxFlushBatch)
+proc rxForgetStation(header: pointer)
+proc rxInvalidateVif(vifIdx: uint8): bool
+proc rxInvalidateQuiescentVif(vifIdx: uint8; selected: uint8)
+proc rxMgtMessageCurrent(header: pointer): bool
+proc rxMgtForget(header: pointer)
+proc rxCaptureFrameHeader(header, vifEntry, staEntry: pointer): RxFrameIdentity
+proc rxFrameCurrent(identity: RxFrameIdentity): bool
+proc apm_sta_fw_delete*(staIdx: uint8, statusCode, reasonCode: uint16) {.exportc, cdecl.}
 proc bl_wifi_set_sta_key_internal*(vifIdx: uint8, staIdx: uint8, alg: uint32,
     keyIdx: int32, setTx: int32, seqData: pointer, seqLen: csize_t,
     keyData: pointer, keyLen: csize_t, pairwise: bool): cint {.exportc, cdecl.}
@@ -85,17 +286,22 @@ proc mm_bcn_transmitted*(vifEntry: pointer) {.exportc, cdecl.}
 proc mm_active*() {.exportc, cdecl.}
 proc td_start*(vifIdx: uint8) {.exportc, cdecl.}
 proc mm_bcn_init_vif*(vifEntry: pointer) {.exportc, cdecl.}
+proc mm_bcn_stop*(vifEntry: pointer): bool {.exportc, cdecl.}
+proc mm_bcn_flush_updates*(notify: bool) {.exportc, cdecl.}
+proc mmBeaconPoolIdle(): bool
+proc mmBeaconChangeConfirm(header: ptr KeMsgHdr, status: uint8)
 proc mm_hw_ap_info_set*(vifIdx: uint8) {.exportc, cdecl.}
 proc mm_hw_info_set*(macAddr: pointer) {.exportc, cdecl.}
-proc txl_cntrl_halt_ac*(ac: uint8) {.exportc, cdecl.}
-proc txl_cntrl_flush_ac*(ac: uint8) {.exportc, cdecl.}
+proc txl_cntrl_halt_ac*(ac: uint8): bool {.exportc, cdecl.}
+proc txl_cntrl_flush_ac*(ac: uint8, flushMask: uint32) {.exportc, cdecl.}
+proc txl_cntrl_clear_bcn_ac*(): bool {.exportc, cdecl.}
 proc txl_cntrl_tx_check*(vifEntry: pointer): bool {.exportc, cdecl.}
-proc rxl_reset*() {.exportc, cdecl.}
-proc txl_reset*() {.exportc, cdecl.}
+proc rxl_reset*(): bool {.exportc, cdecl, discardable.}
+proc txl_reset*(): bool {.exportc, cdecl, discardable.}
 proc chan_tbtt_switch_update*(vifEntry: pointer, tbttTime: uint32) {.exportc, cdecl.}
 proc chan_is_on_channel*(vifEntry: pointer): bool {.exportc, cdecl, noinline.}
 proc chan_get_dominant_chan*(): pointer {.exportc, cdecl, noinline.}
-proc chan_pre_switch_channel*(ctxt: pointer) {.exportc, cdecl.}
+proc chan_pre_switch_channel*() {.exportc, cdecl.}
 proc ps_check_tbtt*(vifEntry: pointer) {.exportc, cdecl.}
 proc mm_bcn_transmit*(vifIdx: uint8) {.exportc, cdecl.}
 proc chan_is_on_operational_channel*(vifEntry: pointer): bool {.exportc, cdecl, noinline.}
@@ -107,7 +313,7 @@ proc apm_tx_int_ps_get_postpone*(vifEntry: pointer, staEntry: pointer, postponeF
 proc txl_frame_send_null_frame*(staIdx: uint8, cfmCallback: pointer, cfmArg: uint32): uint8 {.exportc, cdecl, discardable.}
 proc txl_frame_send_qosnull_frame*(staIdx: uint8, qosCtrl: uint16,
   cfmCallback: pointer, cfmArg: uint32): uint8 {.exportc, cdecl, discardable.}
-proc txl_frame_release*(param: pointer) {.exportc, cdecl.}
+proc txl_frame_release*(param: pointer; doCallback: bool) {.exportc, cdecl.}
 proc txl_int_fake_transfer*(txDesc: pointer, queueIdx: uint32) {.exportc, cdecl.}
 proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.}
 proc txl_machdr_format*(param: pointer) {.exportc, cdecl.}
@@ -115,13 +321,13 @@ proc txu_cntrl_tkip_mic_append*(txdesc: pointer) {.exportc, cdecl.}
 proc txl_frame_init_desc*(desc: pointer, linkDesc: pointer, hwDesc: pointer, payloadDesc: pointer) {.exportc, cdecl.}
 proc txl_frame_cfm*(param: pointer) {.exportc, cdecl.}
 proc txl_frame_evt*() {.exportc, cdecl.}
-proc ps_check_tx_frame*(vifIdx: uint8, staIdx: uint8): bool {.exportc, cdecl.}
+proc ps_check_tx_frame*(staIdx: uint8, txTid: uint8): bool {.exportc, cdecl.}
 
 # Forward declarations for init sub-functions called from mm_init and others
 proc ke_task_init*() {.exportc, cdecl.}
 proc mm_env_init*() {.exportc, cdecl.}
 proc mm_env_max_ampdu_duration_set*(duration: uint32) {.exportc, cdecl.}
-proc vif_mgmt_init*() {.exportc, cdecl.}
+proc vif_mgmt_init*(): bool {.exportc, cdecl.}
 proc td_init*() {.exportc, cdecl.}
 proc ps_init*() {.exportc, cdecl.}
 proc chan_init*() {.exportc, cdecl.}
@@ -132,7 +338,7 @@ proc mm_timer_init*() {.exportc, cdecl.}
 proc mm_timer_set*(timer: pointer, targetTime: uint32) {.exportc, cdecl.}
 proc mm_timer_clear*(timer: pointer) {.exportc, cdecl.}
 proc mm_timer_schedule*() {.exportc, cdecl.}
-proc txl_frame_init*() {.exportc, cdecl.}
+proc txl_frame_init*(preservePostponed: uint32) {.exportc, cdecl.}
 proc txu_cntrl_cfm*(param: pointer) {.exportc, cdecl.}
 proc ipc_emb_txcfm*(desc: pointer) {.exportc, cdecl.}
 proc ipc_emb_txcfm_ind*(acBit: uint32 = 0) {.exportc, cdecl, noinline.}
@@ -152,10 +358,11 @@ proc txl_buffer_reinit*() {.exportc, cdecl.}
 proc txl_hwdesc_reset*() {.exportc, cdecl, noinline.}
 proc txl_buffer_init*() {.exportc, cdecl.}
 proc txl_hwdesc_init*() {.exportc, cdecl, noinline.}
-proc rxl_init*() {.exportc, cdecl.}
+proc rxl_init*(): bool {.exportc, cdecl, discardable.}
 proc rxu_cntrl_init*() {.exportc, cdecl.}
-proc hal_machw_init*() {.exportc, cdecl.}
-proc hal_machw_reset*() {.exportc, cdecl.}
+proc hal_machw_init*(): bool {.exportc, cdecl, discardable.}
+proc hal_machw_reset*(): bool {.exportc, cdecl, discardable.}
+proc hal_machw_disable_int*() {.exportc, cdecl.}
 proc td_reset*(vifIdx: uint8) {.exportc, cdecl.}
 # CRC utility functions (external, used by mm_check_beacon for beacon change detection)
 proc utils_crc32_stream_init*(state: pointer) {.importc, cdecl.}
@@ -180,6 +387,7 @@ proc trpc_update_power*(powerTable: pointer) {.exportc, cdecl.}
 proc trpc_update_power_11b*(powerTable: pointer) {.exportc, cdecl.}
 proc trpc_update_power_11g*(powerTable: pointer) {.exportc, cdecl.}
 proc trpc_update_power_11n*(powerTable: pointer) {.exportc, cdecl.}
+proc trpcLoadPowerFromConfig(channelType: uint8)
 proc phy_get_ntx*(): uint8 {.exportc, cdecl.}
 proc phy_get_nss*(): uint8 {.exportc, cdecl.}
 proc phy_ldpc_tx_supported*(): bool {.exportc, cdecl.}
@@ -251,6 +459,8 @@ proc td_timer_evt*(env: pointer) {.exportc, cdecl.}
 proc ps_uapsd_timer_handle*() {.exportc, cdecl.}
 proc ps_tx_null_timer_handle*() {.exportc, cdecl.}
 proc mm_ps_change_ind*(staIdx: uint8, psState: uint8) {.exportc, cdecl.}
+proc apmPsCapture(staEntry: pointer): ApmPsSession
+proc apmPsSessionCurrent(identity: ApmPsSession): bool
 proc ps_disable_cfm*(vifEntry: pointer, statusFlags: uint32) {.exportc, cdecl.}
   ## PS disable confirmation (sends MM_SET_PS_MODE_CFM).
   ## Forward declaration - implementation at PS section.
@@ -260,17 +470,17 @@ proc ps_enable_cfm_handle*(vifEntry: pointer) {.exportc, cdecl, noinline.}
 proc ps_disable_cfm_handle*(vifEntry: pointer): uint32 {.exportc, cdecl.}
 proc sta_mgmt_add_key*(param: pointer, hwKeyIdx: uint8) {.exportc, cdecl.}
 proc vif_mgmt_add_key*(param: pointer, hwKeyIdx: uint8) {.exportc, cdecl.}
-proc replay_counter_validate*(param: pointer): bool {.exportc, cdecl.}
+proc replay_counter_validate*(param: pointer; received: uint64): bool {.exportc, cdecl.}
 proc mm_tim_update_proceed*(param: pointer) {.exportc, cdecl, noinline.}
-proc sm_disconnect*(param: pointer) {.exportc, cdecl.}
+proc sm_disconnect*(vifIdx: uint8) {.exportc, cdecl.}
 proc sm_issue_sa_query_request*() {.exportc, cdecl.}
 proc coex_pta_force_autocontrol_set*(mode: uint32) {.exportc, cdecl.}
 proc sm_delete_resources*(param: pointer = nil) {.exportc, cdecl.}
-proc sm_auth_assoc_send_according_chan*(nextState: uint16 = 0, param1: uint16 = 0, param2: uint32 = 0) {.exportc, cdecl.}
-proc apm_sta_delete*(param: pointer) {.exportc, cdecl.}
-proc apm_tx_cfm_handler*(param: pointer) {.exportc, cdecl.}
-proc cfm_raw_send*(param: pointer) {.exportc, cdecl.}
-proc sm_supplicant_deauth_cfm*(param: pointer) {.exportc, cdecl.}
+proc sm_auth_assoc_send_according_chan*(nextState: uint16 = 0, authSequence: uint16 = 0, challenge: pointer = nil) {.exportc, cdecl.}
+proc apm_sta_delete*(staIdx: uint8, macAddr: pointer, statusCode, reasonCode: uint16): bool {.exportc, cdecl.}
+proc apm_tx_cfm_handler*(param: pointer; txStatus: uint32) {.exportc, cdecl.}
+proc cfm_raw_send*(param: pointer; status: uint32) {.exportc, cdecl.}
+proc sm_supplicant_deauth_cfm*(param: pointer; status: uint32) {.exportc, cdecl.}
 proc ps_check_frame*(rxHdr: pointer, frameFlags: uint32, vifEntry: pointer) {.exportc, cdecl.}
 proc ps_send_pspoll*(vifEntry: pointer): uint8 {.exportc, cdecl, noinline.}
 proc phy_set_channel*(channel: ptr ChanCtxtDefView, force: uint32)
@@ -307,4 +517,5 @@ proc snapshotPhyChannel(dst: var array[4, uint32]) {.inline.} =
 # External RF/PHY functions called from wifi_main (platform-provided)
 proc phy_init*(cfg: pointer) {.exportc, cdecl.}
 proc phy_get_version*(versionOut: pointer, buf: pointer) {.exportc, cdecl.}
-proc wifi_hosal_rf_turn_on*() {.importc, cdecl.}
+proc wifi_hosal_rf_turn_on*(arg: pointer = nil): cint {.importc, cdecl, discardable.}
+proc wifi_hosal_rf_turn_off*(arg: pointer = nil): cint {.importc, cdecl, discardable.}

@@ -1,4 +1,7 @@
 proc ipc_host_init*(env, cb, sharedEnv, pthis: pointer) {.exportc, cdecl.} =
+  let saved = ipcHostIrqSave()
+  defer: ipcHostIrqRestore(saved)
+  ipcHostInvalidate(env, sharedEnv)
   discard c_memset(sharedEnv, 0, SharedEnvSize.csize_t)
   discard c_memset(env, 0, IpcHostEnvSize.csize_t)
   discard c_memcpy(env, cb, IpcHostCbSize.csize_t)

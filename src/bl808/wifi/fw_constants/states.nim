@@ -31,10 +31,10 @@ const
   SmWaitingState* = 2'u16
   SmAddingChanState* = 3'u16
   SmSettingBssState* = 4'u16
-  SmAuthStartingState* = 5'u16
-  SmAuthenticatingState* = 6'u16
-  SmAssociatingState* = 7'u16
-  SmAssocRspState* = 8'u16
+  SmAuthStartingState* = 5'u16   # Auth TX awaiting channel access.
+  SmAuthenticatingState* = 6'u16 # Auth response wait.
+  SmAssociatingState* = 7'u16    # Assoc TX awaiting channel access.
+  SmAssocRspState* = 8'u16       # Assoc response wait.
   SM_ACTIVATING_STATE* = 9'u16
   SmDisconnectingState* = 10'u16
   ApmIdleState* = 0'u16

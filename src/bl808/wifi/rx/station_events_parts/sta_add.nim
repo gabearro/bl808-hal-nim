@@ -1,6 +1,11 @@
 proc blRxSmStaAddInd(blHw, cmd, msg: pointer): cint {.cdecl.} =
+  let saved = callbackIrqSave()
+  defer: callbackIrqRestore(saved)
+  if blHw == nil or msg == nil: return -1
   let ind = msgParam(msg)
   let vif = vifAt(blHw, BlVifSta)
+  let station = loadU8(ind, SmStaAddApIdxOff)
+  if station >= NxRemoteStaStoreMax: return -1
   inc nimFwDbgRxSmStaAdd
   inc nimFwDbgRxSmSeq
   nimFwDbgRxSmStaAddSeq = nimFwDbgRxSmSeq
@@ -12,11 +17,14 @@ proc blRxSmStaAddInd(blHw, cmd, msg: pointer): cint {.cdecl.} =
     inc nimFwDbgRxSmStaAddError
     bl_os_printf("[WF] Error: illegal sm_sta_add, sta_idx: %d\r\n", loadU8(ind, SmStaAddApIdxOff).cint)
     return -1
+  var transition = beginStationRxTransition(blHw, station)
+  if not transition.valid: return -1
   storeU8(vif, BlVifLinksNumOff, loadU8(vif, BlVifLinksNumOff) + 1)
   storeU8(vif, BlVifFcChanOff, 0)
-  storeU8(vif, BlVifFixedStaIdxOff, loadU8(ind, SmStaAddApIdxOff))
-  let sta = staAt(blHw, loadU8(ind, SmStaAddApIdxOff).uint)
-  storeU8(sta, BlStaStaIdxOff, loadU8(ind, SmStaAddApIdxOff))
+  storeU8(vif, BlVifFixedStaIdxOff, station)
+  transition.fixedStation = station
+  let sta = staAt(blHw, station.uint)
+  storeU8(sta, BlStaStaIdxOff, station)
   storeU8(sta, BlStaVifIdxOff, BlVifSta.uint8)
   storeU8(sta, BlStaQosOff, loadU8(ind, SmStaAddQosOff))
   storeU8(sta, BlStaFcPsOff, 0)

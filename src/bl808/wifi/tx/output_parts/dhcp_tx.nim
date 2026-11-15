@@ -1,4 +1,9 @@
 proc noteDhcpTx(txPbufView: ptr PbufView; ethernetHeader: ptr EthernetHeaderView; etherType: uint16) =
+  if etherType != 0x0008'u16 or txPbufView.len.uint32 < EthHdrSize.uint32 + 20'u32:
+    return
+  let headerLen = (ipv4HeaderAt(ethernetHeader).versionIhl and 0x0F'u8).uint32 * 4'u32
+  if headerLen < 20'u32 or txPbufView.len.uint32 < EthHdrSize.uint32 + headerLen + 8'u32:
+    return
   if isDhcpUdp(ethernetHeader):
     let ipv4Header = ipv4HeaderAt(ethernetHeader)
     let udpHeader = udpHeaderAt(ipv4Header)

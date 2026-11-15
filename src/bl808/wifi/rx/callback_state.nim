@@ -1,20 +1,13 @@
 var wifi_hw {.importc, header: "bl_defs.h".}: BlHw
 
-var cbSmConnect: ConnectCb
-var cbSmConnectEnv: pointer
-var cbSmDisconnect: DisconnectCb
-var cbSmDisconnectEnv: pointer
-var cbBeacon: BeaconCb
-var cbBeaconEnv: pointer
-var cbProbeResp: ProbeRespCb
-var cbProbeRespEnv: pointer
-var cbPkt: PktCb
-var cbPktAdv: PktAdvCb
-var cbPktEnv: pointer
-var cbRssi: RssiCb
-var cbRssiEnv: pointer
-var cbEvent: EventCb
-var cbEventEnv: pointer
+var cbSmConnect: CallbackBinding[ConnectCb]
+var cbSmDisconnect: CallbackBinding[DisconnectCb]
+var cbBeacon: CallbackBinding[BeaconCb]
+var cbProbeResp: CallbackBinding[ProbeRespCb]
+var cbPkt: CallbackBinding[PktCb]
+var cbPktAdv: CallbackBinding[PktAdvCb]
+var cbRssi: CallbackBinding[RssiCb]
+var cbEvent: CallbackBinding[EventCb]
 var nimFwDbgRxSmStaAdd* {.exportc: "nimfw_dbg_rx_sm_sta_add".}: uint32
 var nimFwDbgRxSmStaAddMeta* {.exportc: "nimfw_dbg_rx_sm_sta_add_meta".}: uint32
 var nimFwDbgRxSmStaAddVif* {.exportc: "nimfw_dbg_rx_sm_sta_add_vif".}: uint32

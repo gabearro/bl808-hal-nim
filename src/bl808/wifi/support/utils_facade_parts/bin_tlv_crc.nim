@@ -15,13 +15,27 @@ proc utils_tlv_bl_unpack_auto*(buf: ptr uint32; bufSz: cint; typ: uint16; arg1: 
 proc utils_tlv_bl_pack_auto*(buf: ptr uint32; bufSz: cint; typ: uint16; arg1: pointer): cint {.exportc, cdecl.} =
   discard buf; discard bufSz; discard typ; discard arg1; 0
 
-proc utils_crc32_stream_init*(ctx: pointer) {.exportc, cdecl.} = zero(ctx, 4)
+const WifiCrc32Table = block:
+  var table: array[256, uint32]
+  for index in 0 ..< table.len:
+    var value = index.uint32
+    for bit in 0 ..< 8:
+      value = if (value and 1) != 0:
+        (value shr 1) xor 0xEDB88320'u32
+      else:
+        value shr 1
+    table[index] = value
+  table
+
+proc utils_crc32_stream_init*(ctx: pointer) {.exportc, cdecl.} =
+  cast[ptr uint32](ctx)[] = high(uint32)
 
 proc utils_crc32_stream_feed_block*(ctx: pointer; data: ptr uint8; length: uint32) {.exportc, cdecl.} =
   var crc = cast[ptr uint32](ctx)
   for crcInputByteIndex in 0'u32 ..< length:
-    crc[] = (crc[] shl 5) xor (crc[] shr 27) xor
-      cast[ptr uint8](ptrAt(data, crcInputByteIndex.uint))[]
+    let value = cast[ptr uint8](ptrAt(data, crcInputByteIndex.uint))[]
+    let tableIndex = ((crc[] xor value.uint32) and 0xFF'u32).int
+    crc[] = WifiCrc32Table[tableIndex] xor (crc[] shr 8)
 
 proc utils_crc32_stream_results*(ctx: pointer): uint32 {.exportc, cdecl.} =
-  cast[ptr uint32](ctx)[]
+  cast[ptr uint32](ctx)[] xor high(uint32)

@@ -6,6 +6,7 @@ var nimFwDbgIpcHostTxCfmDrained* {.exportc: "nimfw_dbg_ipc_host_txcfm_drained".}
 var nimFwDbgIpcHostTxCfmLastHost* {.exportc: "nimfw_dbg_ipc_host_txcfm_host".}: uint32
 var nimFwDbgIpcHostTxDescGetNil* {.exportc: "nimfw_dbg_ipc_host_txdesc_nil".}: uint32
 var nimFwDbgIpcHostTxDescPush* {.exportc: "nimfw_dbg_ipc_host_txdesc_push".}: uint32
+var nimFwDbgIpcMsgAckMismatch* {.exportc: "nimfw_dbg_ipc_msgack_mismatch".}: uint32
 
 # Silent-exit forensics for ipc_host_txdesc_push (the TX-dead break stage:
 # tx_push_calls advances while txdesc_push freezes -> one of these exits eats

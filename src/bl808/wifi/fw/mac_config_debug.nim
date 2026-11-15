@@ -9,13 +9,19 @@ proc mac_ie_find*(buf: pointer, bufLen: uint32, ieId: uint8): pointer {.exportc,
   ##   lbu a5, 0(a0) => id; beq a5, a2 => return pos if match
   ##   lbu a5, 1(a0); addi a5, 2; add a0, a5 => advance past IE
   ## Returns pointer to matching IE header, or nil if not found.
+  if buf == nil:
+    return nil
   var pos = cast[uint](buf)
-  let endPos = pos + bufLen.uint
-  while pos < endPos:
+  var remaining = bufLen.uint
+  while remaining >= 2:
     let ie = macIeAt(pos)
+    let length = ie.totalLen
+    if length > remaining:
+      return nil
     if ie.id == ieId:
       return cast[pointer](pos)
-    pos += ie.totalLen
+    pos += length
+    remaining -= length
   return nil
 
 proc mac_vsie_find*(buf: pointer, bufLen: uint32, oui: pointer, ouiLen: uint8): pointer {.exportc, cdecl.} =
@@ -27,12 +33,17 @@ proc mac_vsie_find*(buf: pointer, bufLen: uint32, oui: pointer, ouiLen: uint8): 
   ## .L11: lbu id; bne id, 0xDD => skip to .L7. Else a6 = pos+2 (IE body),
   ##   compare ouiLen bytes using indexed loads. Match => return pos.
   ## .L7: lbu len, 1(pos); pos += len + 2; loop back.
+  if buf == nil or (oui == nil and ouiLen != 0):
+    return nil
   var pos = cast[uint](buf)
-  let endPos = pos + bufLen.uint
+  var remaining = bufLen.uint
   let targetOuiBytes = cast[ptr UncheckedArray[uint8]](oui)
-  while pos < endPos:
+  while remaining >= 2:
     let ie = macIeAt(pos)
-    if ie.id == 0xDD'u8:
+    let size = ie.totalLen
+    if size > remaining:
+      return nil
+    if ie.id == 0xDD'u8 and ie.len >= ouiLen:
       # Vendor-specific IE found, compare OUI bytes
       let vendorIePayload = ie.macIePayload
       var match = true
@@ -42,7 +53,8 @@ proc mac_vsie_find*(buf: pointer, bufLen: uint32, oui: pointer, ouiLen: uint8): 
           break
       if match:
         return cast[pointer](pos)
-    pos += ie.totalLen
+    pos += size
+    remaining -= size
   # Blob never calls assert on overrun here (0 asserts in its call graph);
   # returning nil is the only outcome for "not found / past end".
   return nil
@@ -152,22 +164,43 @@ proc bl60x_edca_get*(ac: cint, aifs: ptr uint8, cwmin: ptr uint8, cwmax: ptr uin
   return 0
 
 proc bl60x_firmwre_mpdu_free*(param: pointer) {.exportc, cdecl.} =
-  ## Free an MPDU buffer (24 instrs in blob).
-  ## Blob ABI: a0=param. Reads callbacks from g_bl_ops_funcs+20 / +24 (not
-  ## bl60x_fw_env!). Decrements rxl_cntrl_env+20 (pending MPDU count) by
-  ## param[21] (descriptor count). Tail-calls rxl_mpdu_free(param).
-  # Call pre-free callback (g_bl_ops_funcs[5] = byte offset 20)
-  let preFree = cast[proc() {.cdecl.}](blOpsFunc(20))
-  preFree()
-  # Decrement pending MPDU count at rxl_cntrl_env+20
-  let rx = rxlCntrlEnvView()
+  ## Debit the host-retained descriptor count, then recycle that same frame.
+  let captureIrq = irqSave()
+  let header = rxMpduHeader(param)
+  if header == nil or header.uploadDone == 0:
+    irqRestore(captureIrq)
+    return
+  let generation = rxUploadGeneration(param)
   let descCount = rxMpduDescView(param).descCount
-  rx.pendingMpduCount = rx.pendingMpduCount - descCount.uint32
-  # Call post-free callback (g_bl_ops_funcs[6] = byte offset 24)
-  let postFree = cast[proc() {.cdecl.}](blOpsFunc(24))
-  postFree()
-  # Tail-call rxl_mpdu_free(param)
-  rxl_mpdu_free(param)
+  let enterFn = cast[proc(): uint32 {.cdecl.}](blOpsFunc(20))
+  let leaveFn = cast[proc(level: uint32) {.cdecl.}](blOpsFunc(24))
+  irqRestore(captureIrq)
+  if enterFn == nil or leaveFn == nil:
+    assert_rec("rxl_cntrl.c", "RX release callbacks", 0)
+    return
+  template current(): bool =
+    rxUploadCurrent(param, generation) and rxMpduHeader(param) == header and
+      rxMpduDescView(param).descCount == descCount
+  let savedStatus = enterFn()
+  var invalidCount = false
+  try:
+    if not current() or header.uploadDone == 0: return
+    let rx = rxlCntrlEnvView()
+    if descCount == 0 or rx.uploadCount < descCount.uint32:
+      invalidCount = true
+    else:
+      rx.uploadCount -= descCount.uint32
+      # Claim the release before the exit callback can reenter this API.
+      header.uploadDone = 0
+  finally:
+    leaveFn(savedStatus)
+  if invalidCount:
+    if current(): assert_rec("rxl_cntrl.c", "RX release count", 0)
+    return
+  let releaseIrq = irqSave()
+  defer: irqRestore(releaseIrq)
+  if current() and header.uploadDone == 0:
+    rxReleaseUpload(param, generation)
 
 # ###########################################################################
 #                  Notifier Chain
@@ -242,21 +275,19 @@ proc notifier_chain_call*(chain: ptr CoList, event: uint32, data: pointer) {.exp
   ## Call all notifiers in the chain.
   ## From blob (36 instrs): irqSave, s0 = chain.first, for each node:
   ##   lw a5, 0(s0) => callback at offset 0
-  ##   save next from offset 4 before call
   ##   jalr a5(s0, s3=event, s4=data) => callback(node, event, data)
-  ##   s0 = s0[4] => advance to next
+  ##   s0 = s0[4] => observe the next link after the callback
   ## irqRestore, return 0.
   let saved = irqSave()
   var currentNotifier = chain.first
   while currentNotifier != nil:
     let notifierNode = notifierNodeView(currentNotifier)
-    let nextNotifier = cast[ptr CoListHdr](notifierNode.next)
     let callback = cast[proc(node: ptr CoListHdr, event: uint32, data: pointer): cint {.cdecl.}](
       notifierNode.callback
     )
     if callback != nil:
       discard callback(currentNotifier, event, data)
-    currentNotifier = nextNotifier
+    currentNotifier = cast[ptr CoListHdr](notifierNode.next)
   irqRestore(saved)
 
 proc notifier_chain_call_fromeCritical*(chain: ptr CoList, event: uint32, data: pointer) {.exportc, cdecl.} =
@@ -278,47 +309,49 @@ proc notifier_chain_call_fromeCritical*(chain: ptr CoList, event: uint32, data: 
 #                  Replay Counter
 # ###########################################################################
 
-proc replay_counter_validate*(param: pointer): bool {.exportc, cdecl.} =
-  ## Validate replay counter in received frame (44 instrs).
-  ## From blob: a0=replay_counter_state (8 bytes: lo32, hi32), a1=new_lo, a2=new_hi.
-  ## Compares {state.hi, state.lo} against {new_hi, new_lo} as 64-bit unsigned.
-  ## If new < state+1 (i.e., new <= state), returns false (replay detected).
-  ## Otherwise: updates state = new, and clears any pending replay slots.
-  ## The state has additional slots at offset 8+ for multi-key replay tracking.
-  ## Returns true if counter is valid (not replayed).
-  var newLo, newHi: uint32
-  {.emit: ["asm volatile(\"mv %0, a1\" : \"=r\"(", newLo, ") );"].}
-  {.emit: ["asm volatile(\"mv %0, a2\" : \"=r\"(", newHi, ") );"].}
+proc replay_counter_validate*(param: pointer; received: uint64): bool {.exportc, cdecl.} =
+  ## Vendor replay window: a next-PN counter and two rotating 32-bit bitmaps.
+  ## Accept unseen PNs up to 32 behind the highest received PN.
   let state = replayCounterStateView(param)
-  let stateLo = state.pnLow
-  let stateHi = state.pnHigh
-  # Compare as 64-bit: if new > state, accept; if new <= state, reject
-  # Need unsigned 64-bit compare: compare hi first, then lo
-  if newHi < stateHi:
-    return false  # new is older
-  if newHi == stateHi and newLo <= stateLo + 33:
-    # Check within window (blob checks state+33 as threshold for lo)
-    if newHi == stateHi and newLo <= stateLo:
-      return false  # replay
-  # Valid: update state
-  # Also handle replay window slots at offset 8+ (blob clears slots)
-  let slotIdx = (stateLo + 1) and 1  # alternating slot
-  let slotOff = slotIdx * 12 + 8
-  # Clear slot if counter changed significantly
-  if newLo != stateLo + 1:
-    let nextSlot = (newLo + 1) and 1
-    state.slots[nextSlot].valid = 0
-    let prevSlot = newLo and 1
-    if prevSlot != slotIdx:
-      state.slots[prevSlot].valid = 0
-  # Store new counter
-  state.pnLow = newLo
-  state.pnHigh = newHi
+  let last = (state.pnHigh.uint64 shl 32) or state.pnLow.uint64
+  if received + 33'u64 < last:
+    return false
+
+  let nextPn = received + 1'u64
+  # WEXTI in the vendor returns the low 32 bits of each shifted counter.
+  let index = ((nextPn shr 5) and 0xFFFFFFFF'u64).uint32
+  if nextPn > last:
+    let currentIndex = ((last shr 5) and 0xFFFFFFFF'u64).uint32
+    if index != currentIndex:
+      state.bitmap[((currentIndex + 1'u32) and 1'u32).int] = 0
+      if currentIndex != index - 1'u32:
+        state.bitmap[(currentIndex and 1'u32).int] = 0
+    state.pnLow = (nextPn and 0xFFFFFFFF'u64).uint32
+    state.pnHigh = (nextPn shr 32).uint32
+
+  let slot = (index and 1'u32).int
+  let bit = 1'u32 shl (nextPn and 31'u64).int
+  if (state.bitmap[slot] and bit) != 0:
+    return false
+  state.bitmap[slot] = state.bitmap[slot] or bit
   return true
 
 # ###########################################################################
 #                  Assert Handlers
 # ###########################################################################
+
+type ArchAssertLogFn = proc(level: uint32; tag, file: cstring; line: cint;
+                            format: cstring) {.cdecl, varargs.}
+
+proc logAssertMacStatus(sourceLine: cint; address: uint; format: cstring) =
+  let first = regRead(address)
+  let second = regRead(address + 4)
+  let third = regRead(address + 8)
+  let fourth = regRead(address + 12)
+  let logFn = cast[ArchAssertLogFn](blOpsFunc(204))
+  if logFn != nil:
+    logFn(2, nil, "arch_main.c", sourceLine, format,
+          first.culong, second.culong, third.culong, fourth.culong)
 
 proc assert_err*(cond: cstring, file: cstring, line: cint) {.exportc, cdecl.} =
   ## Fatal assertion handler (244 bytes in blob, 75 instrs).
@@ -349,34 +382,29 @@ proc assert_err*(cond: cstring, file: cstring, line: cint) {.exportc, cdecl.} =
                        "[WIFI-NIMFW] assert line %d", line)
   nimFwTrace(cast[cstring](addr traceBuf[0]))
   nimFwTraceU32("[WIFI-NIMFW] assert line ", cast[uint32](line))
+  let condition = if cond != nil: cond else: cstring("(null)")
+  let sourceFile = if file != nil: file else: cstring("(null)")
   # Call 1: condition/function name
-  let logFn1 = getLogFunc(76)
+  let logFn1 = cast[ArchAssertLogFn](blOpsFunc(204))
   if logFn1 != nil:
-    logFn1(2, 0, cast[pointer](cond), 148, cast[uint32](cond))
-  # Call 2: line
-  let logFn2 = getLogFunc(76)
+    logFn1(2, nil, "arch_main.c", 148, "[CON Err] %s\r\n", condition)
+  # Call 2: source file
+  let logFn2 = cast[ArchAssertLogFn](blOpsFunc(204))
   if logFn2 != nil:
-    logFn2(2, 0, cast[pointer](file), 149, cast[uint32](line))
-  # Call 3: extra (line number as uint32)
-  let logFn3 = getLogFunc(76)
+    logFn2(2, nil, "arch_main.c", 149, "[file] %s\r\n", sourceFile)
+  # Call 3: source line number
+  let logFn3 = cast[ArchAssertLogFn](blOpsFunc(204))
   if logFn3 != nil:
-    logFn3(2, 0, cast[pointer](file), 150, cast[uint32](line))
+    logFn3(2, nil, "arch_main.c", 150, "[line] %d\r\n", line)
   # Call 4: status
-  let logFn4 = getLogFunc(76)
+  let logFn4 = cast[ArchAssertLogFn](blOpsFunc(204))
   if logFn4 != nil:
-    logFn4(2, 0, cast[pointer](file), 151)
-  # Call 5: dump register context words [2..5]
-  let logFn5 = getLogFunc(76)
-  if logFn5 != nil:
-    logFn5(2, 0, nil, 152,
-          dbg_assert_block[2], dbg_assert_block[3],
-          dbg_assert_block[4], dbg_assert_block[5])
-  # Call 6: dump register context words [6..9]
-  let logFn6 = getLogFunc(76)
-  if logFn6 != nil:
-    logFn6(2, 0, nil, 158,
-          dbg_assert_block[6], dbg_assert_block[7],
-          dbg_assert_block[8], dbg_assert_block[9])
+    logFn4(2, nil, "arch_main.c", 151, "[MAC] [STATUS] [DUMP]\r\n")
+  # The reference labels retain the legacy alias; reads use the BL808 bank.
+  logAssertMacStatus(152, MACHW_INTC_BASE + 0x188,
+                     "    0x44B08188 %08lX %08lx %08lx %08lx\r\n")
+  logAssertMacStatus(158, MACHW_INTC_BASE + 0x198,
+                     "    0x44B08198 %08lX %08lx %08lx %08lx\r\n")
   let saved = irqSave()
   hal_machw_disable_int()
   ke_evt_set(0x80000000'u32)
@@ -385,26 +413,27 @@ proc assert_err*(cond: cstring, file: cstring, line: cint) {.exportc, cdecl.} =
 proc assert_rec*(cond: cstring, file: cstring, line: cint) {.exportc, cdecl.} =
   ## Recoverable assertion handler (248 bytes in blob, 79 instrs).
   ## Blob ABI: (a0=cond_or_func_name, a1=source_file, a2=line_number).
-  ## From blob: log function at g_bl_ops_funcs[76]. Calls log with file/line
-  ## (lines 86-87), dumps dbg_assert_block (lines 88, 94), calls notification
-  ## function, irqSave, checks keEvtField bit 31, triggers reset if needed.
-  let logFn = getLogFunc(76)
-  if logFn != nil:
-    logFn(2, 0, cast[pointer](cond), 86)
-    logFn(2, 0, cast[pointer](file), 87, cast[uint32](line))
-    logFn(2, 0, nil, 88,
-          dbg_assert_block[2], dbg_assert_block[3],
-          dbg_assert_block[4], dbg_assert_block[5])
-    logFn(2, 0, nil, 94,
-          dbg_assert_block[6], dbg_assert_block[7],
-          dbg_assert_block[8], dbg_assert_block[9])
+  ## The vendor's relocated table base + 0x80 and load + 0x4C select slot 204.
+  ## It logs the MAC status, prints recovery text, then requests one reset.
+  let condition = if cond != nil: cond else: cstring("(null)")
+  let sourceFile = if file != nil: file else: cstring("(null)")
+  let logFn1 = cast[ArchAssertLogFn](blOpsFunc(204))
+  if logFn1 != nil:
+    logFn1(2, nil, "arch_main.c", 86, "[CON REC] %s,%s,%d\r\n",
+           condition, sourceFile, line)
+  let logFn2 = cast[ArchAssertLogFn](blOpsFunc(204))
+  if logFn2 != nil:
+    logFn2(2, nil, "arch_main.c", 87, "[MAC] [STATUS] [DUMP]\r\n")
+  logAssertMacStatus(88, MACHW_INTC_BASE + 0x188,
+                     "    0x44B08188 %08lX %08lx %08lx %08lx\r\n")
+  logAssertMacStatus(94, MACHW_INTC_BASE + 0x198,
+                     "    0x44B08198 %08lX %08lx %08lx %08lx\r\n")
   nimFwTrace2U32("[WIFI-NIMFW] assert_rec ",
                  cast[uint32](line),
                  cast[uint32](cast[uint](file)))
-  # Call notification function from g_bl_ops_funcs[1] (byte offset 4, NOT 80)
-  let notifyFn = blOpsFunc(4)
-  if notifyFn != nil:
-    cast[proc(arg: pointer) {.cdecl.}](notifyFn)(nil)
+  let printFn = blOpsFunc(4)
+  if printFn != nil:
+    cast[proc(format: cstring) {.cdecl, varargs.}](printFn)("Recovery MAC...\r\n")
   # Check if reset already pending; if not, trigger reset
   let saved = irqSave()
   if (cast[int32](keEvtField) >= 0):  # bit 31 not set
@@ -416,15 +445,17 @@ proc assert_rec*(cond: cstring, file: cstring, line: cint) {.exportc, cdecl.} =
 proc assert_warn*(cond: cstring, file: cstring, line: cint) {.exportc, cdecl.} =
   ## Warning assertion handler (128 bytes in blob, ~38 instrs).
   ## Blob ABI: (a0=cond_or_func, a1=source_file, a2=line_number).
-  let logFn = getLogFunc(204)
+  let condition = if cond != nil: cond else: cstring("(null)")
+  let sourceFile = if file != nil: file else: cstring("(null)")
+  let logFn = cast[ArchAssertLogFn](blOpsFunc(204))
   if logFn != nil:
-    logFn(2, 0, cast[pointer](cond), 179, cast[uint32](cond))
-  let logFn2 = getLogFunc(204)
+    logFn(2, nil, "arch_main.c", 179, "[CON WRN] %s\r\n", condition)
+  let logFn2 = cast[ArchAssertLogFn](blOpsFunc(204))
   if logFn2 != nil:
-    logFn2(2, 0, cast[pointer](file), 180, cast[uint32](line))
-  let logFn3 = getLogFunc(204)
+    logFn2(2, nil, "arch_main.c", 180, "[file] %s\r\n", sourceFile)
+  let logFn3 = cast[ArchAssertLogFn](blOpsFunc(204))
   if logFn3 != nil:
-    logFn3(2, 0, cast[pointer](file), 181, cast[uint32](line))
+    logFn3(2, nil, "arch_main.c", 181, "[line] %d\r\n", line)
 
 proc force_trigger*() {.exportc, cdecl.} =
   ## Force trigger a diagnostic dump (9 instructions in blob).
@@ -439,19 +470,21 @@ proc force_trigger*() {.exportc, cdecl.} =
 #                  Bugkiller (Debug Dump)
 # ###########################################################################
 
+proc bugkillerPutLine(text: cstring) {.inline.} =
+  let output = cast[proc(text: cstring) {.cdecl, raises: [Exception].}](blOpsFunc(8))
+  if output != nil:
+    output(text)
+
 proc bugkiller_fw_queue_dump(queue: ptr CoList) {.exportc: "fw_queue_dumpp", cdecl, noinline.} =
   ## Blob's static helper `fw_queue_dumpp.isra.0`. Per-entry: sprintfs
   ## id/destId/srcId/paramLen/&param into an advancing column cursor
   ## (sprintf + strlen + strlen + _puts_space quintet per field, 5 fields
   ## = 20 calls/iter). puts_space return is the next sprintf cursor.
-  {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
-  let putsFn = blOpsFunc(8)
-  let allocFnPtr = blOpsFunc(184)
-  let freeFnPtr = blOpsFunc(188)
-  type PutsFnType = proc(s: pointer) {.cdecl.}
-  type AllocFnType = proc(sz: uint32): pointer {.cdecl.}
-  type FreeFnType = proc(p: pointer) {.cdecl.}
-  let puts = cast[PutsFnType](putsFn)
+  if queue == nil or blOpsFunc(8) == nil:
+    return
+  bugkillerPutLine("msg_id    dest_id   src_id    param_len param     \r\n")
+  let allocFn = cast[proc(size: uint32): pointer {.cdecl, raises: [Exception].}](blOpsFunc(184))
+  let freeFn = cast[proc(p: pointer) {.cdecl, raises: [Exception].}](blOpsFunc(188))
 
   template formatCol(cursor: var pointer) =
     let n1 = c_strlen(cursor).int32
@@ -459,78 +492,78 @@ proc bugkiller_fw_queue_dump(queue: ptr CoList) {.exportc: "fw_queue_dumpp", cde
     let n2 = c_strlen(cursor).int32
     cursor = puts_space(padPtr, 10'i32 - n2)
 
-  var queueNode = queue.first
-  while queueNode != nil:
-    let msg = cast[ptr KeMsgHdr](queueNode)
-    if allocFnPtr != nil:
-      let allocFn = cast[AllocFnType](allocFnPtr)
+  var queueNode: ptr CoListHdr
+  var remaining: uint32
+  # Limit the walk before allocation/output callbacks can change the queue.
+  block:
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    queueNode = queue.first
+    remaining = co_list_cnt(queue)
+  while queueNode != nil and remaining != 0:
+    var entry: KeMsgHdr
+    var payload: pointer
+    var captured = false
+    block:
+      let saved = irqSave()
+      defer: irqRestore(saved)
+      if co_list_find(queue, queueNode):
+        let msg = cast[ptr KeMsgHdr](queueNode)
+        entry = msg[]
+        payload = keMsgPayload(msg)
+        captured = true
+    if not captured:
+      break
+    dec remaining
+    if allocFn != nil and freeFn != nil:
       let lineBuffer = allocFn(256)
       if lineBuffer != nil:
+        defer: freeFn(lineBuffer)
         var columnCursor: pointer = lineBuffer
-        c_sprintf(columnCursor, "%d", msg.id.cint);        formatCol(columnCursor)
-        c_sprintf(columnCursor, "%d", msg.destId.cint);    formatCol(columnCursor)
-        c_sprintf(columnCursor, "%d", msg.srcId.cint);     formatCol(columnCursor)
-        c_sprintf(columnCursor, "%d", msg.paramLen.cint);  formatCol(columnCursor)
-        c_sprintf(columnCursor, "0x%08x",
-                  cast[uint32](cast[uint](msg) + 12)); formatCol(columnCursor)
-        if putsFn != nil:
-          puts(lineBuffer)
-          puts(nil)
-        if freeFnPtr != nil:
-          cast[FreeFnType](freeFnPtr)(lineBuffer)
-    queueNode = queueNode.next
-  if putsFn != nil:
-    puts(nil)
+        c_sprintf(columnCursor, "%d", entry.id.cint);        formatCol(columnCursor)
+        c_sprintf(columnCursor, "%d", entry.destId.cint);    formatCol(columnCursor)
+        c_sprintf(columnCursor, "%d", entry.srcId.cint);     formatCol(columnCursor)
+        c_sprintf(columnCursor, "%ld", cast[int32](entry.paramLen).clong); formatCol(columnCursor)
+        c_sprintf(columnCursor, "%p", payload); formatCol(columnCursor)
+        bugkillerPutLine(cast[cstring](lineBuffer))
+        bugkillerPutLine("\r\n")
+    queueNode = cast[ptr CoListHdr](entry.next)
+  bugkillerPutLine("\r\n")
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void bugkiller_fw_queue_sent_dump(void);".}
 proc bugkiller_fw_queue_sent_dump*() {.exportc, cdecl.} =
   ## Dump sent message queue for debugging (13 instrs).
-  let logFn = getLogFunc(4)
-  if logFn != nil:
-    logFn(2, 0, nil, 0)
+  let printFn = cast[proc(format: cstring) {.cdecl, varargs, raises: [Exception].}](blOpsFunc(4))
+  if printFn != nil:
+    printFn("[BugKiller] WIFI QUEUE SENT\r\n")
   bugkiller_fw_queue_dump(addr keMsgQueueSent)
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void bugkiller_fw_queue_saved_dump(void);".}
 proc bugkiller_fw_queue_saved_dump*() {.exportc, cdecl.} =
   ## Dump saved message queue.
-  let logFn = getLogFunc(4)
-  if logFn != nil:
-    logFn(2, 0, nil, 0)
+  let printFn = cast[proc(format: cstring) {.cdecl, varargs, raises: [Exception].}](blOpsFunc(4))
+  if printFn != nil:
+    printFn("[BugKiller] WIFI QUEUE SAVED\r\n")
   bugkiller_fw_queue_dump(addr keMsgQueueSaved)
 
 proc bugkiller_fw_queue_timer_dump*() {.exportc, cdecl.} =
-  ## Dump timer queue for debugging (109 instrs).
-  ## From blob: loads g_bl_ops_funcs (s0), calls puts(header_string1),
-  ## then puts(header_string2). Loads keTimerQueue.first (s1).
-  ## For each timer entry in the queue:
-  ##   1. Allocates 128-byte buffer via g_bl_ops_funcs[184] (alloc)
-  ##   2. If alloc fails, skip to next entry
-  ##   3. snprintf(buf, "%d", entry.id) (timer msg ID at offset 4, half-word)
-  ##   4. strlen(buf), _puts_space(buf+len, 10-len)
-  ##   5. snprintf(buf, "%d", entry.taskId) (task ID at offset 6, byte)
-  ##   6. strlen(buf), _puts_space(buf+len, 10-len)
-  ##   7. snprintf(buf, "0x%08x", entry.time) (expiry at offset 8, word)
-  ##   8. strlen(buf), _puts_space(buf+len, 10-len)
-  ##   9. calls puts(buf) to print, then puts("\r\n")
-  ##  10. calls free(buf) via g_bl_ops_funcs[188]
-  ##  11. next = entry[0] (linked list next pointer)
-  ## After loop: calls puts(footer_string).
-  let putsFn = blOpsFunc(8)
-  let printFn = blOpsFunc(4)
-  if putsFn == nil:
+  ## Dump timer ID, task ID, and signed 32-bit expiry in vendor columns.
+  ## Each row uses a 128-byte temporary buffer, also released on errors.
+  if blOpsFunc(8) == nil:
     return
-  type PutsFnType = proc(s: pointer) {.cdecl.}
-  type PrintFnType = proc(fmt: pointer, args: uint32) {.cdecl, varargs.}
-  let puts = cast[PutsFnType](putsFn)
-  # Print two header lines
-  puts(nil)  # header 1 (blob uses string literals via auipc)
-  puts(nil)  # header 2
+  bugkillerPutLine("[BugKiller] WIFI QUEUE TIMER\r\n")
+  bugkillerPutLine("msg_id    task_id   time      \r\n")
 
   # Walk the timer queue
-  var timerQueueEntry = keTimerQueue.first
-  let allocFnPtr = blOpsFunc(184)
-  let freeFnPtr = blOpsFunc(188)
-  let snprintfPtr = blOpsFunc(4)
+  var timerQueueEntry: ptr CoListHdr
+  var remaining: uint32
+  block:
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    timerQueueEntry = keTimerQueue.first
+    remaining = co_list_cnt(addr keTimerQueue)
+  let allocFn = cast[proc(size: uint32): pointer {.cdecl, raises: [Exception].}](blOpsFunc(184))
+  let freeFn = cast[proc(p: pointer) {.cdecl, raises: [Exception].}](blOpsFunc(188))
 
   template formatCol(cursor: var pointer) =
     let n1 = c_strlen(cursor).int32
@@ -538,44 +571,43 @@ proc bugkiller_fw_queue_timer_dump*() {.exportc, cdecl.} =
     let n2 = c_strlen(cursor).int32
     cursor = puts_space(padPtr, 10'i32 - n2)
 
-  while timerQueueEntry != nil:
+  while timerQueueEntry != nil and remaining != 0:
+    var entry: KeTimerEntry
+    var captured = false
+    block:
+      let saved = irqSave()
+      defer: irqRestore(saved)
+      if co_list_find(addr keTimerQueue, timerQueueEntry):
+        entry = cast[ptr KeTimerEntry](timerQueueEntry)[]
+        captured = true
+    if not captured:
+      break
+    dec remaining
     # Allocate 128-byte formatting buffer
-    if allocFnPtr != nil:
-      let allocFn = cast[proc(size: uint32): pointer {.cdecl.}](allocFnPtr)
+    if allocFn != nil and freeFn != nil:
       let timerLineBuffer = allocFn(128)
       if timerLineBuffer != nil:
-        let timerQueueEntryAddr = cast[uint](timerQueueEntry)
+        defer: freeFn(timerLineBuffer)
         var columnCursor: pointer = timerLineBuffer
 
-        # Format timer ID (half-word at offset 4)
-        let timerId = cast[ptr uint16](timerQueueEntryAddr + 4)[]
-        c_sprintf(columnCursor, "%d", timerId.cint);   formatCol(columnCursor)
+        # Format the captured fields; callbacks may have removed the node.
+        c_sprintf(columnCursor, "%d", entry.id.cint);   formatCol(columnCursor)
 
-        # Format task ID (byte at offset 6)
-        let taskId = cast[ptr uint8](timerQueueEntryAddr + 6)[]
-        c_sprintf(columnCursor, "%d", taskId.cint);    formatCol(columnCursor)
+        c_sprintf(columnCursor, "%d", entry.taskId.cint);    formatCol(columnCursor)
 
-        # Format expiry time (word at offset 8)
-        let expiryTime = cast[ptr uint32](timerQueueEntryAddr + 8)[]
-        c_sprintf(columnCursor, "0x%08x", expiryTime); formatCol(columnCursor)
+        c_sprintf(columnCursor, "%ld", cast[int32](entry.time).clong); formatCol(columnCursor)
 
         # Print the formatted line
-        puts(timerLineBuffer)
-        puts(nil)  # newline ("\r\n" in blob)
-
-        # Free buffer
-        if freeFnPtr != nil:
-          let freeFn = cast[proc(p: pointer) {.cdecl.}](freeFnPtr)
-          freeFn(timerLineBuffer)
+        bugkillerPutLine(cast[cstring](timerLineBuffer))
+        bugkillerPutLine("\r\n")
 
     # Next entry (linked list next at offset 0)
-    timerQueueEntry =
-      cast[ptr CoListHdr](cast[ptr pointer](cast[uint](timerQueueEntry))[])
+    timerQueueEntry = cast[ptr CoListHdr](entry.next)
 
   # Print footer
-  puts(nil)
+  bugkillerPutLine("\r\n")
 
-proc dump_ke_task*() {.exportc: "_dump_ke_task", cdecl.}
+proc dump_ke_task*(taskId, state: uint32) {.exportc: "_dump_ke_task", cdecl.}
   ## Forward declaration: body defined below.
 
 proc bugkiller_fw_task_dump*() {.exportc, cdecl.} =
@@ -584,45 +616,41 @@ proc bugkiller_fw_task_dump*() {.exportc, cdecl.} =
   ## then loops taskId 0..8 (s1=9), skipping taskId 7 (s2=7, TASK_RXU):
   ##   a0 = taskId & 0xFF, call ke_state_get(a0) => state,
   ##   a1=state, a0=taskId, call _dump_ke_task(taskId, state).
-  let logFn = getLogFunc(4)
-  if logFn != nil:
-    logFn(2, 0, nil, 0)  # header line 1
-    logFn(2, 0, nil, 0)  # header line 2
+  let putsFn = cast[proc(text: cstring) {.cdecl, raises: [Exception].}](blOpsFunc(8))
+  if putsFn != nil:
+    putsFn("[BugKiller] WIFI TASK\r\n")
+  let headerFn = cast[proc(text: cstring) {.cdecl, raises: [Exception].}](blOpsFunc(8))
+  if headerFn != nil:
+    headerFn("task_id   state     \r\n")
   var taskId = 0'u8
   while taskId <= TASK_LAST_EMB:
     if taskId != TASK_RXU:  # blob skips task 7 (bne s0, s2=7)
       let state = ke_state_get(taskId)
-      # Call _dump_ke_task via asm ABI (a0=taskId, a1=state)
-      {.emit: ["asm volatile(\"mv a1, %0\" : : \"r\"(", state, ") );"].}
-      {.emit: ["asm volatile(\"mv a0, %0\" : : \"r\"(", taskId, ") );"].}
-      dump_ke_task()
+      dump_ke_task(taskId.uint32, state.uint32)
     inc taskId
 
-proc dump_ke_task*() {.exportc: "_dump_ke_task", cdecl.} =
+proc dump_ke_task*(taskId, state: uint32) {.exportc: "_dump_ke_task", cdecl.} =
   ## Internal: dump kernel task info (78 instrs). a0=taskId, a1=state.
-  ## Alloc 128-byte buf, format two columns ("Task %d" / "State %d")
+  ## Alloc 128-byte buf, format two decimal columns
   ## padded to width 10 via sprintf + 2*strlen + puts_space, print+free.
-  var taskId, state: uint32
-  {.emit: ["asm volatile(\"mv %0, a0\" : \"=r\"(", taskId, ") );"].}
-  {.emit: ["asm volatile(\"mv %0, a1\" : \"=r\"(", state, ") );"].}
-  let allocFn = cast[proc(sz: uint32): pointer {.cdecl.}](
-    blOpsFunc(0xB8))
+  let allocFn = cast[proc(size: uint32): pointer {.cdecl, raises: [Exception].}](blOpsFunc(184))
+  let freeFn = cast[proc(p: pointer) {.cdecl, raises: [Exception].}](blOpsFunc(188))
+  if allocFn == nil or freeFn == nil or blOpsFunc(8) == nil:
+    return
   let taskLineBuffer = allocFn(128)
   if taskLineBuffer == nil:
     return
+  defer: freeFn(taskLineBuffer)
   var columnCursor: pointer = taskLineBuffer
   template formatCol(cursor: var pointer) =
     let n1 = c_strlen(cursor).int32
     let padPtr = cast[pointer](cast[uint](cursor) + n1.uint)
     let n2 = c_strlen(cursor).int32
     cursor = puts_space(padPtr, 10'i32 - n2)
-  c_sprintf(columnCursor, "Task %d", taskId.cint);   formatCol(columnCursor)
-  c_sprintf(columnCursor, "State %d", state.cint);   formatCol(columnCursor)
-  let putsFn = blOpsFunc(8)
-  if putsFn != nil:
-    cast[proc(s: pointer) {.cdecl.}](putsFn)(taskLineBuffer)
-    cast[proc(s: cstring) {.cdecl.}](putsFn)("\r\n")
-  platformFree(taskLineBuffer)
+  c_sprintf(columnCursor, "%d", taskId.cint);   formatCol(columnCursor)
+  c_sprintf(columnCursor, "%d", state.cint);    formatCol(columnCursor)
+  bugkillerPutLine(cast[cstring](taskLineBuffer))
+  bugkillerPutLine("\r\n")
 
 proc puts_space*(buf: pointer, count: cint): pointer {.exportc: "_puts_space", cdecl, discardable.} =
   ## Internal: pad-column helper (a0=buf, a1=count). Fills buf[0..count)
@@ -700,7 +728,7 @@ proc cfg_api_element_general_set*(entry: pointer, value: pointer) {.exportc, cde
   ## Set a general config element value (52 instrs in blob).
   ## Actual blob ABI: a0=config table entry ptr, a1=value ptr.
   ## Called as the set handler from cfg_api_element_set for each config table entry.
-  ## Flow: calls a log function with entry[8] (name string), then reads entry[6]
+  ## Flow: calls printf with entry[8] (name string), then reads entry[6]
   ## (typeId halfword), entry[12] (value storage pointer), and dispatches by type:
   ##   typeId 1,3: sb (store unsigned byte from value[0] to data[0])
   ##   typeId 2:   sb (store signed byte from value[0] to data[0])
@@ -710,12 +738,11 @@ proc cfg_api_element_general_set*(entry: pointer, value: pointer) {.exportc, cde
   ## Returns 0 always.
   if entry == nil or value == nil: return
   let cfg = cfgApiElementEntryAt(entry)
-  # Log: blob calls g_bl_ops_funcs[204] with entry[8] (name string)
+  # The relocation selects the printf hook at byte offset 4.
   let nameStr = cfg.name
-  let logFnPtr = getLogFunc(204)
-  if logFnPtr != nil and nameStr != nil:
-    let logFn = cast[PlatformLogFunc](logFnPtr)
-    logFn(1, 0, nameStr, 188)
+  let printFn = cast[proc(format: cstring) {.cdecl, varargs, raises: [Exception].}](blOpsFunc(4))
+  if printFn != nil and nameStr != nil:
+    printFn("  updating element: %s\r\n", nameStr)
   let typeId = cfg.typeId
   let valueStorage = cfg.valueStorage
   if valueStorage == nil: return

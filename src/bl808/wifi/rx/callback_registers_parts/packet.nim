@@ -1,25 +1,25 @@
 proc bl_rx_pkt_cb*(pkt: ptr uint8; len: cint; pktWrap: pointer; info: ptr BlRxInfo) {.exportc, cdecl.} =
-  if cbPkt != nil:
-    cbPkt(cbPktEnv, pkt, len, info)
-  if cbPktAdv != nil:
-    cbPktAdv(cbPktEnv, pktWrap, info)
+  let callbacks = block:
+    let saved = callbackIrqSave()
+    defer: callbackIrqRestore(saved)
+    (basic: snapshotCallback(cbPkt), advanced: snapshotCallback(cbPktAdv))
+  if claimCallback(cbPkt, callbacks.basic):
+    callbacks.basic.handler(callbacks.basic.context, pkt, len, info)
+  if claimCallback(cbPktAdv, callbacks.advanced):
+    callbacks.advanced.handler(callbacks.advanced.context, pktWrap, info)
 
 proc bl_rx_pkt_cb_register*(env: pointer; cb: PktCb): cint {.exportc, cdecl.} =
-  cbPkt = cb
-  cbPktEnv = env
+  setCallback(cbPkt, cb, env)
   0
 
 proc bl_rx_pkt_cb_unregister*(env: pointer): cint {.exportc, cdecl.} =
-  cbPkt = nil
-  cbPktEnv = nil
+  clearCallback(cbPkt)
   0
 
 proc bl_rx_pkt_adv_cb_register*(env: pointer; cb: PktAdvCb): cint {.exportc, cdecl.} =
-  cbPktAdv = cb
-  cbPktEnv = env
+  setCallback(cbPktAdv, cb, env)
   0
 
 proc bl_rx_pkt_adv_cb_unregister*(env: pointer): cint {.exportc, cdecl.} =
-  cbPktAdv = nil
-  cbPktEnv = nil
+  clearCallback(cbPktAdv)
   0

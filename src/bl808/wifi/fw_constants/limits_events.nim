@@ -2,6 +2,7 @@
 
 const
   MAX_VIFS* = 2
+  MAX_AID* = 2007
   MAX_STAS* = 10
   STA_INFO_TAB_ENTRIES* = 7
   STA_MGMT_FREE_STAS* = 5

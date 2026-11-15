@@ -2,9 +2,12 @@
 
 when defined(bl808m0) and defined(bl808WifiNimFw):
   import sdk_headers
+  import ../wifi_fw as firmware
+  from ../core import csrReadMstatus, disableInterrupts, enableInterrupts
 
   include rx/layout
   include rx/types
+  include rx/callback_runtime
 
   {.emit: "extern struct bl_hw wifi_hw;".}
   include rx/callback_state
@@ -12,6 +15,7 @@ when defined(bl808m0) and defined(bl808WifiNimFw):
   include rx/host_interfaces
 
   include rx/accessors
+  include rx/station_lifecycle
 
   include rx/scan_events
 

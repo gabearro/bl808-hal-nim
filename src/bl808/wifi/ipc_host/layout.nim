@@ -54,6 +54,8 @@ const
 
   BlCmdA2eMsgOff = 12'u
   LmacMsgSrcIdOff = 3'u
+  LmacMsgParamLenOff = 4'u
+  LmacMsgHeaderSize = 8'u32
 
   TxdescHostHostIdOff = 4'u
   TxdescHostReadyOff = 8'u

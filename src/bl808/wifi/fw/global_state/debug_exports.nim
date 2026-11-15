@@ -77,8 +77,6 @@ var nimFwDbgIpcTxYieldAc* {.wifiCtrl, exportc: "nimfw_dbg_ipc_tx_yield_ac".}: ui
 var nimFwDbgIpcTxYieldHead* {.wifiCtrl, exportc: "nimfw_dbg_ipc_tx_yield_head".}: uint32
 var nimFwDbgSavedMsgYield* {.wifiCtrl, exportc: "nimfw_dbg_saved_msg_yield".}: uint32
 var nimFwDbgSavedMsgYieldTask* {.wifiCtrl, exportc: "nimfw_dbg_saved_msg_yield_task".}: uint32
-var nimFwDbgCfmEvtYield* {.wifiCtrl, exportc: "nimfw_dbg_cfm_evt_yield".}: uint32
-var nimFwDbgCfmEvtYieldAc* {.wifiCtrl, exportc: "nimfw_dbg_cfm_evt_yield_ac".}: uint32
 var nimFwDbgTxTrigYield* {.wifiCtrl, exportc: "nimfw_dbg_txtrig_yield".}: uint32
 var nimFwDbgTxTrigYieldAc* {.wifiCtrl, exportc: "nimfw_dbg_txtrig_yield_ac".}: uint32
 var nimFwDbgTxTrigYieldHead* {.wifiCtrl, exportc: "nimfw_dbg_txtrig_yield_head".}: uint32
@@ -504,6 +502,7 @@ var nimFwDbgSmChanCtxReq1* {.wifiCtrl, exportc: "nimfw_dbg_sm_chan_ctx_req1".}: 
 var nimFwDbgSmChanCtxPtrs* {.wifiCtrl, exportc: "nimfw_dbg_sm_chan_ctx_ptrs".}: uint32
 var nimFwDbgSmChanCtxResult* {.wifiCtrl, exportc: "nimfw_dbg_sm_chan_ctx_result".}: uint32
 var nimFwKeepaliveInFlight* {.wifiCtrl, exportc: "nimfw_keepalive_inflight".}: uint32
+var nimFwKeepaliveGeneration {.wifiCtrl.}: uint32
 var nimFwKeepaliveTargetCfm* {.wifiCtrl, exportc: "nimfw_keepalive_target_cfm".}: uint32
 var nimFwKeepaliveStartedAt* {.wifiCtrl, exportc: "nimfw_keepalive_started_at".}: uint32
 var nimFwDbgKeepaliveRc* {.wifiCtrl, exportc: "nimfw_dbg_keepalive_rc".}: uint32
@@ -583,9 +582,8 @@ var nimFwDbgKeyDataDecryptOk* {.wifiCtrl, exportc: "nimfw_dbg_keydata_decrypt_ok
 var nimFwDbgKeyDataDecryptFail* {.wifiCtrl, exportc: "nimfw_dbg_keydata_decrypt_fail".}: uint32
 # Per-VIF WPA-handshake-pending tracking. Set when sm_assoc_done runs on a
 # WPA-protected VIF (sectype>=2); cleared on PTK-init-done or disconnect.
-# mm_sta_tbtt uses this to suppress the null-frame keep-alive loop while
-# waiting for WPA, and to time out the wait into a connection_loss_ind.
 var nimFwWpaPendingMask* {.wifiCtrl, exportc: "nimfw_wpa_pending_mask".}: uint32
+# Retained debug-export slots for the removed non-vendor TBTT timeout path.
 var nimFwDbgStaTbttSkip* {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_skip".}: uint32
 var nimFwDbgStaTbttGiveup* {.wifiCtrl, exportc: "nimfw_dbg_sta_tbtt_giveup".}: uint32
 var nimFwDbgEapolIn*       {.wifiCtrl, exportc: "nimfw_dbg_eapol_in".}: uint32

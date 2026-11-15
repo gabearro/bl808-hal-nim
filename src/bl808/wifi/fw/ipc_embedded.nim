@@ -7,6 +7,9 @@ proc ipc_emb_msg_push*(msgDescPtr: pointer) {.exportc, cdecl.} =
     return
   let msg = cast[ptr IpcEmbMsgEnvelopeView](msgDescPtr)
   let msgDesc = addr msg.desc
+  if msgDesc.paramLen > sizeof(ipcSharedEnvView().payloadArea).uint32:
+    assert_err("ipc_emb.c", "ipc_emb.c", 0x1E3)
+    return
   let shared = cast[ptr IpcSharedMsgView](addr ipcSharedEnv[0])
   # Mirror layout used by ipc_emb_msg_evt on the receive (host→emb) side:
   #   ipc_shared_env[4..5] = id, [6] = dst, [7] = src, [8..11] = paramLen,
@@ -53,14 +56,14 @@ proc ipc_emb_init*() {.exportc, cdecl.} =
   if magic != IPC_MAGIC_VALUE:
     assert_err("ipc_emb.c", "ipc_emb.c", 183)
 
-  # Clear raw status and ack registers (0x24800114, 0x24800118)
-  regWrite(IPC_EMB_RAW_STATUS, 0)
-  regWrite(IPC_EMB_ACK, 0)
+  # Clear both interrupt line-selection registers before configuring fields.
+  regWrite(IPC_EMB_LINE_SEL_LOW, 0)
+  regWrite(IPC_EMB_LINE_SEL_HIGH, 0)
 
   # Configure IPC control register at 0x24800114 with read-modify-write
   # sequence matching blob ipc_emb_init (10 separate RMW writes, each
   # targeting a distinct 2-bit field).
-  let cfgReg = IPC_EMB_RAW_STATUS  # 0x24800114
+  let cfgReg = IPC_EMB_LINE_SEL_LOW  # 0x24800114
   var cfg: uint32
 
   # [1:0] clear
@@ -175,18 +178,32 @@ proc ipc_emb_tx_evt*(ac: uint32) {.exportc, cdecl.} =
   ## from ipc_emb_env[12], for each: checks BCN flag (bit 13) and flow control.
   ## Sets up DMA pointers, clears status fields, inits confirm list, marks active.
   ## Advances list. On empty: acks IPC. On flow control: tail-calls backup handler.
+  if ac >= NUM_TX_QUEUES.uint32:
+    return
+  let eventMask = 0x200'u32 shl ac
+  let entryIrq = irqSave()
+  if ipcTxDispatchActive:
+    ke_evt_set(eventMask)
+    irqRestore(entryIrq)
+    return
+  ipcTxDispatchActive = true
+  irqRestore(entryIrq)
+  defer:
+    let exitIrq = irqSave()
+    ipcTxDispatchActive = false
+    irqRestore(exitIrq)
   let env = ipcEmbEnvView()
-  # Blob: custom insn extracts AC index, then log if non-zero
+  # The vendor logs nonzero queue indices before clearing the event.
   if ac != 0:
     let logFn = getLogFunc(0xCC)
     if logFn != nil:
-      cast[proc(a0, a1: uint32, file: pointer, line: uint32,
-                file2: pointer, val: uint32) {.cdecl.}](logFn)(
-        2, 0, nil, 290, nil, ac)
+      cast[proc(level: uint32; tag, file: cstring; line: cint;
+                format: cstring) {.cdecl, varargs.}](logFn)(
+        2'u32, nil, cstring("ipc_emb.c"), 290.cint,
+        cstring("queue_idx is %d\r\n"), ac.cint)
   # Event bits for host TX AC0..AC4 are 0x200..0x2000. The handler table passes
   # the AC number; blob expands it to the event mask before clearing/re-arming.
   inc nimFwDbgIpcTxEvtEnter
-  let eventMask = 0x200'u32 shl ac
   ke_evt_clear(eventMask)
   # Load descriptor list and BCN flag
   let isBcn = (eventMask and 0x2000'u32) != 0
@@ -235,16 +252,16 @@ proc ipc_emb_tx_evt*(ac: uint32) {.exportc, cdecl.} =
     txDesc.retryCount = 0
     txDesc.lifetime = 0
     txDesc.txFlags = 0
-    # CRITICAL: Push descriptor to TX queue via txu_cntrl_push (blob at 0x100).
-    # The blob explicitly loads a1=0 before this call; txu_cntrl_push reads a1
-    # as the access-category argument even though the C ABI only exposes a0.
+    # Transfer host-list ownership before submission can complete or reenter.
+    # Nothing after the call may touch this wrapper: the host may recycle it.
     let txParam = cast[pointer](txDesc)
-    {.emit: ["asm volatile(\"mv a1, zero\" ::: \"a1\", \"memory\");"].}
-    txu_cntrl_push(txParam)
-    # Mark descriptor as active (blob: sw s8,8(s0) where s8=1)
-    wrapper.active = 1
-    # Pop from IPC list (blob: utils_list_pop_front at 0x110)
-    discard utils_list_pop_front(env.hostTxList)
+    block:
+      let submitIrq = irqSave()
+      defer: irqRestore(submitIrq)
+      wrapper.active = 1
+      discard utils_list_pop_front(env.hostTxList)
+      # The vendor IPC path passes access category zero at this call site.
+      discard txu_cntrl_push(txParam, 0'u8)
     # Reload and loop
     wrapper = ipcHostTxHead(env)
     inc drained
@@ -314,22 +331,17 @@ proc ipc_emb_msg_evt*() {.exportc, cdecl.} =
     let msgId = shared.id
     let msgDst = shared.dstId
     let msgParamLen = shared.paramLen
-    # Platform allocator at g_bl_ops_funcs[184]: takes total byte count
-    # (paramLen + sizeof(KeMsgHdr) for the ke_msg_hdr prefix), returns the new header.
-    # Blob: `lw a5, 184(s6); addi a0, a0, 12; jalr a5` with a0 = paramLen.
-    let allocFn = cast[proc(sz: uint32): pointer {.cdecl.}](
-      blOpsFunc(184))
-    let hdrRaw = allocFn(msgParamLen + KeMsgHdrSize.uint32 + KeMsgTailSlack)
-    if hdrRaw == nil:
+    if msgDst > 8:
+      assert_err("ipc_emb.c", "ipc_emb.c", 0x1F7)
+      return
+    if msgParamLen > sizeof(ipcSharedEnvView().payloadArea).uint32:
       assert_err("ipc_emb.c", "ipc_emb.c", 0x1E3)
-    let hdr = cast[ptr KeMsgHdr](hdrRaw)
-    # Fill the newly-allocated header fields: link ptr = 0, msgId, msgDst,
-    # srcId = 9 (TASK_API), paramLen.
-    hdr.next = nil
-    hdr.id = msgId
-    hdr.destId = msgDst
-    hdr.srcId = 9
-    hdr.paramLen = msgParamLen
+      return
+    let payload = ke_msg_try_alloc(msgId, msgDst, TASK_API, msgParamLen)
+    if payload == nil:
+      assert_err("ipc_emb.c", "ipc_emb.c", 0x1E3)
+      return
+    let hdr = keMsgHdrFromPayload(payload)
     # Copy payload word-by-word from ipc_shared_env+12 into the typed ke_msg
     # payload area, matching the vendor IPC word-copy behavior.
     copyIpcPayloadWords(keMsgPayload(hdr), addr shared.payload[0], msgParamLen)
@@ -338,13 +350,6 @@ proc ipc_emb_msg_evt*() {.exportc, cdecl.} =
     let counter = env.counter
     shared.srcId = counter
     env.counter = counter + 1
-    # Validate destination task id (blob: two chained assertions; msgDst
-    # must be in [0, 8]; > 10 asserts at line 127, > 8 asserts at line 503).
-    let dstCheck = hdr.destId
-    if dstCheck > 10:
-      assert_err("ipc_emb.c", "ipc_emb.c", 0x7F)
-    if dstCheck > 8:
-      assert_err("ipc_emb.c", "ipc_emb.c", 0x1F7)
     # Signal the MACHW event (write 4 to 0x24800100) then dispatch.
     regWrite(0x24800100'u, 4'u32)
     ke_msg_send(keMsgPayload(hdr))
@@ -373,6 +378,12 @@ proc ipc_emb_txcfm*(desc: pointer) {.exportc, cdecl.} =
   ## From blob (5 instrs): a1 = desc - 12, loads ipc_emb_env[16] into a0,
   ## tail-calls utils_list_push_back(host_tx_cfm_list, desc-12). The element is
   ## the host wrapper node, not a lower-MAC txl_cfm_env descriptor.
+  let saved = irqSave()
+  {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
+  defer:
+    {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
+    irqRestore(saved)
+  txSecurityForget(desc)
   let wrapper = ipcHostTxWrapperFromDesc(hostTxDescAt(desc))
   let env = ipcEmbEnvView()
   utils_list_push_back(env.hostTxCfmList, addr wrapper.link)

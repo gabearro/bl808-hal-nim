@@ -9,12 +9,13 @@ template irqSave(): uint32 =
   ## isn't in the blob.
   block:
     var irqPrev {.gensym.}: uint32
-    {.emit: ["asm volatile(\"csrrci %0, mstatus, 8\" : \"=r\"(", irqPrev, ") );"].}
+    # Keep shared-memory accesses inside the interrupt-protected region.
+    {.emit: ["asm volatile(\"csrrci %0, mstatus, 8\" : \"=r\"(", irqPrev, ") :: \"memory\");"].}
     irqPrev
 
 template irqRestore(prev: uint32) =
   if (prev and 8) != 0:
-    {.emit: ["asm volatile(\"csrsi mstatus, 8\");"].}
+    {.emit: ["asm volatile(\"csrsi mstatus, 8\" ::: \"memory\");"].}
 
 proc macTimeNow(): uint32 {.inline.} =
   ## Read current MAC HW timestamp.
@@ -51,8 +52,7 @@ template rcPrngNext(): uint32 =
   rcPrngState
 
 proc rcRateEntryPtr(stats: pointer, rateEntryIndex: int): pointer {.inline.} =
-  ## Get pointer to a rate entry within rc_sta_stats.
-  ## Rate entries start at offset 0, each 12 bytes.
+  ## Legacy counter overlay base, four bytes before the actual rate record.
   cast[pointer](cast[uint](stats) + (rateEntryIndex * RC_RATE_ENTRY_SIZE).uint)
 
 template rcRateEntryAt(p: pointer): ptr RcRateEntryView =
@@ -61,8 +61,23 @@ template rcRateEntryAt(p: pointer): ptr RcRateEntryView =
 template rcRateEntry(stats: pointer, rateEntryIndex: uint16): ptr RcRateEntryView =
   cast[ptr RcRateEntryView](cast[uint](stats) + rateEntryIndex.uint * RC_RATE_ENTRY_SIZE.uint)
 
-template rcRateResetFields(stats: pointer, rateEntryIndex: uint16): ptr RcRateResetFieldsView =
-  cast[ptr RcRateResetFieldsView](cast[uint](stats) + rateEntryIndex.uint * RC_RATE_ENTRY_SIZE.uint)
+template rcRateStats(stats: pointer, rateEntryIndex: int): ptr RcRateStatsView =
+  cast[ptr RcRateStatsView](cast[uint](stats) + 4 + rateEntryIndex.uint * RC_RATE_ENTRY_SIZE.uint)
+
+template rcRetryStep(stats: pointer, stepIndex: int): ptr RcRetryStepView =
+  cast[ptr RcRetryStepView](cast[uint](stats) + 124 + stepIndex.uint * sizeof(RcRetryStepView).uint)
+
+template rcTrialBackup(stats: pointer): ptr RcRetryStepView =
+  cast[ptr RcRetryStepView](cast[uint](stats) + 156)
+
+template rcTrialControl(stats: pointer): ptr RcTrialControlView =
+  cast[ptr RcTrialControlView](cast[uint](stats) + 172)
+
+template rcAmpduStats(stats: pointer): ptr RcAmpduStatsView =
+  cast[ptr RcAmpduStatsView](cast[uint](stats) + 164)
+
+template rcRateCapabilities(stats: pointer): ptr RcRateCapabilitiesView =
+  cast[ptr RcRateCapabilitiesView](cast[uint](stats) + 177)
 
 template rcThroughputArray(tpArray: pointer): ptr UncheckedArray[uint32] =
   cast[ptr UncheckedArray[uint32]](tpArray)
@@ -71,11 +86,11 @@ template rcStatsCounters(stats: pointer): ptr RcStatsCounterView =
   cast[ptr RcStatsCounterView](stats)
 
 proc rcClearRateEntryTransientStats(stats: pointer; rateEntryIndex: uint16) {.inline.} =
-  let resetFields = rcRateResetFields(stats, rateEntryIndex)
-  resetFields.sampleSkipped = 0
-  resetFields.initialized = 1
-  resetFields.attempts0 = 0
-  resetFields.oldProb = 0
+  let rateStats = rcRateStats(stats, rateEntryIndex.int)
+  rateStats.probability = 0
+  rateStats.oldProbAvailable = 0
+  rateStats.retryCount = 0
+  rateStats.rateAllowed = 1
 
 proc rcRateConfig(stats: pointer, rateEntryIndex: int): uint16 {.inline.} =
   ## Read rate_config from rate entry base + 10.
@@ -91,74 +106,62 @@ proc rc_pick_non_duplicate_rate(stats: pointer): uint16 =
   ## Pick a non-duplicate sample rate with a deterministic fallback.
   ## rc_new_random_rate can keep returning existing entries, so production
   ## firmware must not rely on RNG convergence for scheduler progress.
-  var randomRate: uint16 = 0xFFFF'u16
+  if stats == nil or rcU16(stats, RCS_N_RATES) > RC_MAX_RATE_ENTRIES.uint16:
+    return 0xFFFF'u16
+  let caps = rcRateCapabilities(stats)
+  if caps.formatMod > 3:
+    return 0xFFFF'u16
   var tries = 0
   while tries < RcRandomRateAttemptLimit:
-    randomRate = rc_new_random_rate(stats)
-    if rc_check_rate_duplicated(stats, randomRate) == 0:
+    let randomRate = rc_new_random_rate(stats)
+    if randomRate != 0xFFFF'u16 and rc_check_rate_duplicated(stats, randomRate) == 0:
       return randomRate
     inc tries
 
-  let fmtForFill = rcU8(stats, RCS_FORMAT_MOD)
-  if fmtForFill <= 1:
-    let rateMap = rcU16(stats, RCS_RATE_MAP)
-    let lo = rcU8(stats, RCS_LOWEST_IDX)
-    let hi = rcU8(stats, RCS_HIGHEST_IDX)
-    let bw = rcU8(stats, RCS_BW_MAX).uint16 shl 10
-    var fallbackRateIndex = lo
-    while fallbackRateIndex <= hi:
-      if ((rateMap shr fallbackRateIndex) and 1'u16) != 0:
-        var candidate = (fmtForFill.uint16 shl 11) or fallbackRateIndex.uint16
-        if fallbackRateIndex == 0:
-          candidate = candidate or 0x400'u16
-        elif fallbackRateIndex - 1 <= 2:
-          candidate = candidate or bw
+  if caps.formatMod > 1:
+    if caps.maxNss.int >= caps.mcsBitmaps.len or caps.maxBandwidth > 3 or caps.shortGi > 1:
+      return 0xFFFF'u16
+    let minBandwidth = if caps.maxBandwidth == 0: 0 else: caps.maxBandwidth.int - 1
+    for group in 0 .. caps.maxNss.int:
+      let bitmap = caps.mcsBitmaps[group]
+      for bandwidth in minBandwidth .. caps.maxBandwidth.int:
+        for gi in countdown(caps.shortGi.int, 0):
+          for mcs in 0 .. min(caps.maxMcs.int, 7):
+            if ((bitmap shr mcs) and 1'u8) != 0:
+              let candidate = (caps.formatMod.uint16 shl 11) or
+                (group.uint16 shl 3) or mcs.uint16 or
+                (bandwidth.uint16 shl 7) or (gi.uint16 shl 9)
+              if rc_check_rate_duplicated(stats, candidate) == 0:
+                return candidate
+    if caps.lowestLegacyRate > 3:
+      return 0xFFFF'u16
+
+  let lo = caps.lowestLegacyRate
+  let hi = caps.highestLegacyRate
+  if lo > hi or hi >= 16 or caps.preambleType > 1:
+    return 0xFFFF'u16
+  let legacyFormat = if caps.formatMod <= 1: caps.formatMod.uint16 shl 11 else: 0'u16
+  var fallbackRateIndex = lo
+  while fallbackRateIndex <= hi:
+    if ((caps.legacyRateMap shr fallbackRateIndex) and 1'u16) != 0:
+      let baseRate = legacyFormat or fallbackRateIndex.uint16
+      if fallbackRateIndex == 0:
+        let candidate = baseRate or 0x400'u16
         if rc_check_rate_duplicated(stats, candidate) == 0:
           return candidate
-      if fallbackRateIndex == 0xFF'u8:
-        break
-      inc fallbackRateIndex
-  else:
-    let groupCnt = rcU8(stats, RCS_GROUP_CNT)
-    let maxMcs = rcU8(stats, RCS_MAX_NSS_MCS)
-    let sgi = rcU8(stats, RCS_SHORT_GI)
-    var group: uint8 = 0
-    while group <= groupCnt:
-      let bitmap = rcU8(stats, RCS_RATE_BITMAP + group.int)
-      var mcs: uint8 = 0
-      while mcs <= maxMcs and mcs < 8:
-        if ((bitmap shr mcs) and 1'u8) != 0:
-          var candidate = (fmtForFill.uint16 shl 11) or
-                          (group.uint16 shl 3) or mcs.uint16
-          if sgi != 0:
-            candidate = candidate or 0x200'u16
+      elif caps.formatMod > 1 or fallbackRateIndex <= 3:
+        for preamble in caps.preambleType.int .. 1:
+          let candidate = baseRate or (preamble.uint16 shl 10)
           if rc_check_rate_duplicated(stats, candidate) == 0:
             return candidate
-        inc mcs
-      if group == 0xFF'u8:
-        break
-      inc group
+      elif rc_check_rate_duplicated(stats, baseRate) == 0:
+        return baseRate
+    inc fallbackRateIndex
   0xFFFF'u16
-
-proc rcRateEntryTp(stats: pointer, rateEntryIndex: int): uint16 {.inline.} =
-  ## Read throughput estimate from rate entry base + 8.
-  rcU16(stats, rateEntryIndex * RC_RATE_ENTRY_SIZE + 8)
-
-proc rcRateEntryProb(stats: pointer, rateEntryIndex: int): uint16 {.inline.} =
-  ## Read probability EWMA from rate entry base + 4.
-  rcU16(stats, rateEntryIndex * RC_RATE_ENTRY_SIZE + 4)
 
 proc rcRateTp(stats: pointer, rateEntryIndex: int): uint16 {.inline.} =
   ## Read throughput value from rate entry base + 8.
   rcU16(stats, rateEntryIndex * RC_RATE_ENTRY_SIZE + 8)
-
-proc rcRateEntryRetry(stats: pointer, rateEntryIndex: int): uint8 {.inline.} =
-  ## Read retry count from rate entry base + 12.
-  rcU8(stats, rateEntryIndex * RC_RATE_ENTRY_SIZE + 12)
-
-proc rcRateEntryFlags(stats: pointer, rateEntryIndex: int): uint8 {.inline.} =
-  ## Read flags byte from rate entry base + 13.
-  rcU8(stats, rateEntryIndex * RC_RATE_ENTRY_SIZE + 13)
 
 proc rcCountBitsInMap(rateMap: uint16, fromBit: int, toBit: int): uint16 =
   ## Count set bits in rateMap from fromBit to toBit (inclusive).

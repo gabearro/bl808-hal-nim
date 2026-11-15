@@ -8,24 +8,25 @@ proc ps_init*() {.exportc, cdecl.} =
   ## function pointers:
   ##   ps_env[4] (byte offset 16) = ptr to ps_uapsd_timer_handle
   ##   ps_env[10] (byte offset 40) = ptr to ps_tx_null_timer_handle
+  mmPsModeCancel()
   let ps = psEnvView()
   discard c_memset(ps, 0, sizeof(PsEnvView).csize_t)
   # Store timer callback function pointers (blob: ps_env[16] and ps_env[40])
   ps.uapsdTimerCallback = cast[pointer](ps_uapsd_timer_handle)
   ps.txNullTimerCallback = cast[pointer](ps_tx_null_timer_handle)
 
-proc ps_set_mode*(mode: uint8) {.exportc, cdecl.} =
+proc ps_set_mode*(mode: uint8, requesterTask: uint8 = TASK_API.uint8) {.exportc, cdecl.} =
   ## Set power save mode (115 instructions in blob).
   ##
   ## Register map: s0=ps_env s1=VIF list (from chan_env) s2=mode s3=chan_env s4=1
-  ## Stores mode at ps_env+1. Checks ps_env+52 (flags):
+  ## Stores requester task at ps_env+1. Checks ps_env+52 (flags):
   ##   if (flags & 1) && (flags & 6): deferred -- set bit 4, store at +53, return.
   ## mode==0: clear ps flag, clear MACHW CCA bit 2, walk VIFs
   ## mode==2: log line 702, set bit 0 in ps_env+52
   ## mode!=0: set MACHW CCA bit 2, walk VIFs
   ## VIF walk: for each STA VIF with connless!=0: call ps_check and update counter.
   let ps = psEnvView()
-  ps.mode = mode
+  ps.mode = requesterTask
 
   # Check deferred flags at ps_env+52
   let flags52 = ps.flags
@@ -36,22 +37,18 @@ proc ps_set_mode*(mode: uint8) {.exportc, cdecl.} =
       return
 
   if mode == 0:
-    # Disable PS: clear enable byte, clear MACHW bit
-    # (blob: ps_disable_cfm_handle at 0x9A)
-    ps.enabled = 0
+    # Disable PS: clear transition flags and clear MACHW bit.
+    ps.flags = 0
     let machwPowerControl = volatileLoad(cast[ptr uint32](0x24B0004C'u32))
     volatileStore(cast[ptr uint32](0x24B0004C'u32), machwPowerControl and not 4'u32)
-    # PS disable confirm (blob: ps_disable_cfm_handle at 0x9A)
-    let vifIdxForDisable = cast[uint8](ps.statusFlags and 0xFF)
-    let vifEntryDisable = cast[pointer](vifChannelForIdx(vifIdxForDisable))
-    discard ps_disable_cfm_handle(vifEntryDisable)
   else:
     if mode == 2:
       # Deep sleep: log at line 702, set enable flag bit 0
       let logFn = getLogFunc(204)
       if logFn != nil:
-        type LP = proc(a: uint32, b: uint32, c: cstring, d: uint32) {.cdecl, varargs.}
-        cast[LP](logFn)(1, 0, "ps.c", 702)
+        type LP = proc(level: uint32, tag, file: cstring, line: cint,
+                       format: cstring) {.cdecl, varargs.}
+        cast[LP](logFn)(1, nil, "ps.c", 702, "Enable DPSM on\r\n")
       ps.flags = ps.flags or 1
     # Enable PS: set MACHW bit
     let machwPowerControl = volatileLoad(cast[ptr uint32](0x24B0004C'u32))
@@ -62,14 +59,14 @@ proc ps_set_mode*(mode: uint8) {.exportc, cdecl.} =
   # Clear ps_env flag bytes at offsets 8 and 29
   ps.pendingCount = 0
   ps.psActive = 0
+  var lastVisitedVifEntry: pointer = nil
   var cfmCallback: pointer  # s3: ps_disable_cfm or ps_enable_cfm fn ptr
   if mode == 0:
     cfmCallback = cast[pointer](ps_disable_cfm)
   else:
-    cfmCallback = cast[pointer](ps_enable_cfm_handle)
+    cfmCallback = cast[pointer](ps_enable_cfm)
 
   # .L42: Walk VIF linked list (blob: VIF walk with chan_is_on_channel + txl_frame_send_null_frame)
-  var nullFrameQueued: bool = false
   while vifNode != nil:
     let vif = vifChannelAt(vifNode)
     # .L47: Check VIF type at offset 86; skip non-STA VIFs.
@@ -85,20 +82,24 @@ proc ps_set_mode*(mode: uint8) {.exportc, cdecl.} =
           if vif.uapsdBitmap != 0:
             ps.psActive = 1
           # Blob: txl_frame_send_null_frame(vif[96], s3=cfmCallback, vifNode)
-          discard txl_frame_send_null_frame(vif.staIdx, cfmCallback,
-                                            pointerAddrU32(vifNode))
+          let nullFrameStatus = txl_frame_send_null_frame(
+            vif.staIdx, cfmCallback, pointerAddrU32(vifNode))
+          if nullFrameStatus == 1'u8:
+            ps.pendingCount = ps.pendingCount - 1
     # Next VIF: offset 0 is next pointer
+    lastVisitedVifEntry = vifNode
     vifNode = vif.next
 
   # .L42 exit: check ps_env+8 counter
-  if ps.pendingCount == 0:
-    return  # No VIFs accepted PS change
+  if ps.pendingCount != 0:
+    return
 
-  # PS enable/disable completion (blob: ps_enable_cfm_handle at 0x14E or via s3 callback)
-  if mode != 0:
-    let vifIdxForPs = cast[uint8](ps.statusFlags and 0xFF)
-    let vifEntryForPs = cast[pointer](vifChannelForIdx(vifIdxForPs))
-    ps_enable_cfm_handle(vifEntryForPs)
+  # No null-frame confirmations are pending; finish synchronously through the
+  # same tails as the vendor object.
+  if mode == 0:
+    discard ps_disable_cfm_handle(lastVisitedVifEntry)
+  else:
+    ps_enable_cfm_handle(lastVisitedVifEntry)
 
 proc ps_check_beacon*(rxHdr: pointer, unused: uint32, vifEntry: pointer) {.exportc, cdecl.} =
   ## Check beacon for PS-related information (TIM, DTIM).
@@ -237,12 +238,23 @@ proc ps_check_tbtt*(vifEntry: pointer) {.exportc, cdecl.} =
   td_pack_tim_ind(vif.vifIdx)
   vif.flags = vif.flags or 64'u32
 
+proc psTxTidToAc(tid: uint8): uint8 {.inline.} =
+  ## Blob uses mac_tid2ac[tid]: 01 00 00 01 02 02 03 03 03.
+  case tid
+  of 0'u8: 1'u8
+  of 1'u8, 2'u8: 0'u8
+  of 3'u8: 1'u8
+  of 4'u8, 5'u8: 2'u8
+  else: 3'u8
+
 proc ps_check_frame*(rxHdr: pointer, frameFlags: uint32, vifEntry: pointer) {.exportc, cdecl.} =
   ## Check received frame for PS state change.
-  ## From blob (114 instrs): checks ps_env enabled. Parses frame control from
-  ## rxHdr to determine frame type. For data frames, checks UAPSD trigger/delivery.
-  ## For non-PS-Poll QoS null frames with matching BSSID, may trigger sleep transition.
-  ## Sets/clears bits in vif[4] based on frame analysis.
+  ## Blob flow:
+  ##   - group addr: clear vif[4] bit 1 unless protected && vif[94] == 0.
+  ##   - A-MSDU flag in frameFlags bit 9 returns.
+  ##   - ps_env[29] gates UAPSD timestamp work, but ps_env[29] == 0 still
+  ##     falls through to td_pck_ps_ind(vif[87], 1) and PS-Poll/bit-2 handling.
+  ##   - QoS UAPSD MoreData clears vif[4] bit 3 and returns.
   let ps = psEnvView()
   let vif = vifChannelAt(vifEntry)
 
@@ -256,111 +268,78 @@ proc ps_check_frame*(rxHdr: pointer, frameFlags: uint32, vifEntry: pointer) {.ex
   # Check Addr1 group bit (bit 0 of rxHdr[4])
   let addr1Group = hdr.addr1[0] and 1'u8
   if addr1Group != 0:
-    # Group-addressed frame: check if protected frame
-    let protectedBit = frameCtrl and 0x2000'u16
-    if protectedBit != 0:
-      if vif.psOptions != 0:
-        # Clear bit 1 in vif[4]
-        var flags = vif.flags
-        flags = flags and not 2'u32
-        vif.flags = flags
+    # Blob clears bit 1 for unprotected group frames, and for protected group
+    # frames only when vif[94] is non-zero.
+    let protectedFrame = (frameCtrl and 0x2000'u16) != 0
+    if protectedFrame and vif.psOptions == 0:
+      return
+    vif.flags = vif.flags and not 2'u32
     return
 
   # Check A-MSDU flag (bit 9 of frameFlags)
   if (frameFlags and 0x200'u32) != 0:
     return
 
-  # PS mode active check (ps_env byte 29). Blob simply returns here when
-  # psMode29 == 0; previous Nim inserted a vif_mgmt_bcn_to_prog(vif) call
-  # that reprograms the next-beacon timer — an action blob never performs
-  # from ps_check_frame.
-  if ps.psActive == 0:
+  var psActive = ps.psActive
+  if psActive != 0:
+    if (frameCtrl and 0x0088'u16) == 0x0088'u16:
+      let qosTid =
+        if (frameCtrl and 0x0300'u16) == 0x0300'u16:
+          macQos4AddrFrameAt(rxHdr).qosCtrl
+        else:
+          macQosDataFrameAt(rxHdr).qosCtrl
+      let tid = (qosTid and 7).uint8
+      let ac = psTxTidToAc(tid)
+      let acBit = (vif.uapsdBitmap.uint32 shr ac.uint32) and 1
+      if acBit != 0:
+        vif.psLastTime = regRead(MACHW_TIMLO_REG)
+        if (qosTid and 0x10'u16) == 0:
+          return
+        let logFn = getLogFunc(204)
+        if logFn != nil:
+          type LP = proc(level: uint32, tag, file: cstring, line: cint,
+                         format: cstring) {.cdecl, varargs.}
+          cast[LP](logFn)(1, nil, "ps.c", 1005, "rx frame: UAPSD CLR\r\n")
+        vif.flags = vif.flags and not 8'u32
+        return
+      psActive = 0
+    else:
+      if (frameCtrl and 0x000C'u16) == 0 and (vif.uapsdBitmap and 8'u8) != 0:
+        vif.psLastTime = regRead(MACHW_TIMLO_REG)
+      else:
+        psActive = 0
+
+  td_pck_ps_ind(vif.vifIdx, 1)
+  if psActive != 0:
     return
 
-  # Check frame subtype (bits [7:4] of frame control)
-  let subtypeBits = frameCtrl and 0x00F0'u16
-  let typeBits = frameCtrl and 0x000C'u16
-
-  # Check if frame is QoS data (subtype bits 3,0 = 1,0,0,0 = 0x88)
-  if (frameCtrl and 0x88) != 0x88:
-    # Not QoS data: check for UAPSD trigger
-    if (frameCtrl and 0x0C) != 0:
-      return  # not data type
-    # Check UAPSD bitmap for trigger
-    let uapsdBitmap = vif.uapsdBitmap
-    if (uapsdBitmap and 8) == 0:
+  if (frameCtrl and 0x2000'u16) != 0:
+    if (ps.flags and 8'u8) != 0:
+      return
+    if ps_send_pspoll(vifEntry) == 0:
       return
 
-    # UAPSD triggered: read MAC time and store at vif[100]
-    let macTime = regRead(MACHW_TIMLO_REG)
-    vif.psLastTime = macTime
-    return
+  vif.flags = vif.flags and not 4'u32
 
-  # QoS data frame: parse priority and check UAPSD
-  # Load QoS TID from frame header (offset depends on addr4 presence)
-  let has4Addr = (frameCtrl and 0x0300'u16) == 0x0300'u16
-  let qosTid =
-    if has4Addr:
-      macQos4AddrFrameAt(rxHdr).qosCtrl
-    else:
-      macQosDataFrameAt(rxHdr).qosCtrl
-
-  # Extract TID (bits 0-2) and map to AC
-  let tid = qosTid and 7
-  # Load AC mapping from per-VIF UAPSD config
-  let acMap = vif.uapsdBitmap
-
-  # Shift UAPSD bitmap by TID's AC to check trigger
-  let acBit = (acMap.uint32 shr tid.uint32) and 1
-  if acBit == 0:
-    return
-
-  # UAPSD delivery enabled for this AC: store MAC time
-  let macTime = regRead(MACHW_TIMLO_REG)
-  vif.psLastTime = macTime
-
-  # Check MoreData bit (bit 4 of QoS field)
-  if (qosTid and 0x10) == 0:
-    return
-
-  # MoreData set: check if we should suppress UAPSD trigger
-  if (ps.flags and 8) != 0:
-    return  # scanning, don't trigger
-
-  # Trigger traffic request
-  let vifIdx2 = vif.vifIdx
-
-  # Clear bit 2 in vif[4]
-  var flags2 = vif.flags
-  flags2 = flags2 and not 4'u32
-  vif.flags = flags2
-
-  # Check if FromDS+ToDS match BSSID
-  let fc16Check = frameCtrl and 0x2000'u16
-  if fc16Check != 0:
-    return
-
-  # Trigger traffic detection and PS-Poll (blob calls at 0xfe and 0x11a)
-  td_pck_ps_ind(vif.vifIdx, 1)  # traffic detection: vifIdx, direction=RX
-  discard ps_send_pspoll(vifEntry)  # send PS-Poll frame
-
-proc ps_check_tx_frame*(vifIdx: uint8, staIdx: uint8): bool {.exportc, cdecl.} =
+proc ps_check_tx_frame*(staIdx: uint8, txTid: uint8): bool {.exportc, cdecl.} =
   ## Check if TX frame needs PS handling.
-  ## From blob (60 instrs): checks ps_env enabled, validates vif/sta indices.
-  ## Computes STA entry = sta_info_tab + staIdx * 368. Checks vif[86] (type),
-  ## vif[88] (PS capable), vif[104] (UAPSD bitmap). If UAPSD trigger AC matches,
-  ## logs and sets bit 3 in vif[4], reads MAC time to vif[100].
-  ## Otherwise calls vif_mgmt_bcn_to_prog and returns false.
-  if psEnvView().enabled == 0:
+  ## Blob ABI: a0=STA index (desc[49]), a1=TX TID/AC selector (desc[46]).
+  ## It computes STA entry from a0, resolves the VIF from sta[39], checks
+  ## vif[86]/vif[88], then tests (vif[104] >> mac_tid2ac[a1]) & 1. If UAPSD
+  ## matches, logs, sets bit 3 in vif[4], and stores MAC time to vif[100].
+  ## Otherwise it tail-calls td_pck_ps_ind(vif[87], 0).
+  if psEnvView().enabled == 0 or txlResetting():
     return false
 
-  if vifIdx == 0xFF or staIdx == 0xFF:
+  if staIdx >= STA_INFO_TAB_ENTRIES.uint8 or txTid > 8:
     return false
 
   let sta = staInfoForIdx(staIdx)
 
   # Get VIF entry from STA's VIF pointer or compute from staEntry[39]
   let staVifIdx = sta.instNbr
+  if staVifIdx >= MAX_VIFS.uint8:
+    return false
   let vif = vifChannelForIdx(staVifIdx)
 
   # Check VIF type (offset 86): must not be monitor (type != monitor)
@@ -371,11 +350,24 @@ proc ps_check_tx_frame*(vifIdx: uint8, staIdx: uint8): bool {.exportc, cdecl.} =
   if vif.state == 0:
     return false
 
-  # Check UAPSD bitmap (vif[104]): shift by STA's AC
-  # Get AC from STA TX descriptor
-  let ac = sta.infoIdx
+  # Check UAPSD bitmap (vif[104]): shift by mac_tid2ac[txTid].
+  let ac = psTxTidToAc(txTid)
   let acBit = (vif.uapsdBitmap.uint32 shr ac.uint32) and 1
   if acBit != 0:
+    let resetEpoch = txResetEpoch
+    let stationEpoch = staDeleteEpoch(staIdx)
+    let vifEpoch = rxVifEpochs[staVifIdx]
+    let logFn = getLogFunc(204)
+    if logFn != nil:
+      type LP = proc(level: uint32, tag, file: cstring, line: cint,
+                     format: cstring) {.cdecl, varargs.}
+      cast[LP](logFn)(1, nil, "ps.c", 1097, "tx frame: UAPSD\r\n")
+    # Diagnostics can synchronously replace the station or its VIF.
+    if txlResetting() or txResetEpoch != resetEpoch or
+        staDeleteEpoch(staIdx) != stationEpoch or rxVifEpochs[staVifIdx] != vifEpoch or
+        sta.instNbr != staVifIdx or vif.vifType != VIF_TYPE_STA or vif.state == 0 or
+        psEnvView().enabled == 0:
+      return false
     # UAPSD active for this AC: set bit 3 in vif[4]
     var flags = vif.flags
     flags = flags or 8'u32
@@ -390,14 +382,12 @@ proc ps_check_tx_frame*(vifIdx: uint8, staIdx: uint8): bool {.exportc, cdecl.} =
   td_pck_ps_ind(vif.vifIdx, 0)  # direction=TX
   return false
 
-proc ps_polling_frame*() {.exportc, cdecl.} =
+proc ps_polling_frame*(vifEntry: pointer): uint8 {.exportc, cdecl, discardable,
+    noinline.} =
   ## Send PS-Poll frame. Blob (2 instrs): auipc t1, R_RISCV_CALL ps_send_pspoll;
-  ## jr t1 — a pure tail-call that passes the caller's a0 through untouched.
-  ## We preserve that ABI by capturing a0 via inline asm so Nim doesn't
-  ## overwrite it with `nil`.
-  var vifEntry {.noinit.}: pointer
-  {.emit: ["asm volatile(\"mv %0, a0\" : \"=r\"(", vifEntry, ") );"].}
-  discard ps_send_pspoll(vifEntry)
+  ## jr t1 — a pure tail-call that forwards the VIF pointer in a0 and returns
+  ## ps_send_pspoll's status.
+  return ps_send_pspoll(vifEntry)
 
 proc ps_traffic_null_1_recovery*() {.exportc, cdecl.} =
   ## Recovery after null frame 1 failure.
@@ -408,10 +398,10 @@ proc ps_check_tx_status_part0_nim*(vifEntry: pointer, completionFn: pointer): ui
   ## Nim-side implementation. Matches blob `ps_check_tx_status.part.0`.
   ## Blob flow:
   ##   retry = ++vif[95] (u8, zext)
-  ##   threshold = *(u32*)(ps_env + 12)     // WORD, not byte
+  ##   threshold = *(u32*)(bl_ps_params + 12) // WORD, not byte
   ##   if retry == threshold:
   ##       ps_env[0] = 0
-  ##       mm_send_connection_loss_ind(vif /*truncated to vifIdx*/, 21)
+  ##       mm_send_connection_loss_ind(vifEntry, 21)
   ##       return 1
   ##   if retry == threshold >> 1:
   ##       wifi_hosal_pm_post_event(4, 1, 0)
@@ -420,50 +410,27 @@ proc ps_check_tx_status_part0_nim*(vifEntry: pointer, completionFn: pointer): ui
   ##       return 1
   ##   rc = txl_frame_send_null_frame(staIdx=vif[96], completionFn, vifEntry)
   ##   if rc == 0: return 0
-  ##   (log via g_bl_ops_funcs[1] if non-null; ignored for correctness)
-  ##   return 0
+  ##   log failed queueing via g_bl_ops_funcs[1], then return 1
   if vifEntry == nil: return 0'u32
-  let vifU = cast[uint](vifEntry)
   let ps = psEnvView()
   let vif = vifChannelAt(vifEntry)
   let retry = vif.psNullRetry + 1'u8
   vif.psNullRetry = retry
-  # Blob loads a WORD (lw) at ps_env+12. Compare retry (u8) against low byte.
-  let threshold = ps.nullRetryLimit
-  let thresholdLo = cast[uint8](threshold and 0xFF)
-  if retry == thresholdLo:
+  # The byte-sized counter is widened before comparing with the full word.
+  let threshold = blPsParamsView().nullRetryLimit
+  if retry.uint32 == threshold:
     ps.enabled = 0
-    mm_send_connection_loss_ind(cast[uint8](vifU and 0xFF), 21'u16)
+    mm_send_connection_loss_ind(vifEntry, 21'u16)
     return 1'u32
   # Second branch: retry == threshold >> 1
-  let halfThreshold = cast[uint8]((threshold shr 1) and 0xFF)
-  if retry == halfThreshold:
+  let halfThreshold = threshold shr 1
+  if retry.uint32 == halfThreshold:
     wifi_hosal_pm_post_event(4'u32, 1'u32, nil)
     return 1'u32
   # If ps_env[8] == 0 -> no outstanding enable count, return 1
   if ps.pendingCount == 0:
     return 1'u32
-  # Send null frame: blob passes (a0=staIdx, a1=completionFn, a2=vifEntry).
-  # Our Nim `txl_frame_send_null_frame` has signature (uint8, uint8, bool) but
-  # the blob calls it with (staIdx, completionFn, vifEntry). Emit a raw call
-  # that pins a0/a1/a2 to the exact values the callee expects — the function
-  # stores a2 at desc[212] (completion arg) verbatim, which matches blob.
-  let staIdx = vif.staIdx
-  var rc: uint32
-  {.emit: ["""
-  {
-    register unsigned long _a0 __asm__("a0") = (unsigned long)""", staIdx, """;
-    register unsigned long _a1 __asm__("a1") = (unsigned long)""", completionFn, """;
-    register unsigned long _a2 __asm__("a2") = (unsigned long)""", vifEntry, """;
-    __asm__ volatile (
-      "call txl_frame_send_null_frame"
-      : "+r"(_a0), "+r"(_a1), "+r"(_a2)
-      :
-      : "ra","memory","a3","a4","a5","a6","a7",
-        "t0","t1","t2","t3","t4","t5","t6");
-    """, rc, """ = (unsigned int)_a0;
-  }
-  """].}
+  let rc = txl_frame_send_null_frame(vif.staIdx, completionFn, pointerAddrU32(vifEntry))
   # Blob semantics:
   #   if rc == 0 (null-frame queued successfully): return 0 (retry in progress)
   #   else (failed to send): log via g_bl_ops_funcs[1] (printf-like fn pointer),
@@ -502,6 +469,7 @@ proc ps_disable_cfm*(vifEntry: pointer, statusFlags: uint32) {.exportc, cdecl.} 
   ## If statusFlags bit 23 (0x800000) set: decrement ps_env[8] count,
   ##   clear timer at ps_env+0x24, if count reaches 0 call ps_disable_cfm_handle.
   ## If bit 23 not set: call ps_check_tx_status (inline), loop back if non-zero.
+  if not txlFrameCallbackCurrent(): return
   let ps = psEnvView()
   # Check scanning flag: ps_env byte 52, bit 2
   if (ps.flags and 4) != 0:
@@ -510,11 +478,8 @@ proc ps_disable_cfm*(vifEntry: pointer, statusFlags: uint32) {.exportc, cdecl.} 
   if not hasTxCfm:
     # No HW confirmation bit: check TX status via ps_check_tx_status.part.0
     # (GCC-generated partial function name, need asm label to reference it)
-    var checkResult: uint32
-    {.emit: """
-extern unsigned int ps_check_tx_status_part0(void*, void*) __asm__("ps_check_tx_status.part.0");
-""".}
-    {.emit: [checkResult, " = ps_check_tx_status_part0(", vifEntry, ", (void*)", ps_disable_cfm, ");"].}
+    let checkResult = ps_check_tx_status_part0_nim(vifEntry, cast[pointer](ps_disable_cfm))
+    if not txlFrameCallbackCurrent(): return
     if checkResult == 0:
       return
     # Non-zero means TX confirm arrived, fall through to decrement path
@@ -530,55 +495,39 @@ extern unsigned int ps_check_tx_status_part0(void*, void*) __asm__("ps_check_tx_
   # All confirms received: finalize disable
   discard ps_disable_cfm_handle(vifEntry)
 
-proc ps_traffic_status_update*(vifIdx: uint8, status: uint32) {.exportc, cdecl.} =
-  ## Update traffic status for PS decisions.
-  ## From blob (70 instrs): checks ps_env enabled and PS mode flags.
-  ## If status == 0 (idle): walks the registered VIF list looking for VIF with
-  ## matching vif_idx. Checks VIF type (offset 86), PS capable (offset 88), and
-  ## traffic-detection flags for U-APSD delivery activity.
-  ## Then checks ps_env scanning flag (byte 52, bit 3): if s0 (found flag) is set
-  ## and not scanning, tail-calls ps wakeup function.
+proc ps_traffic_status_update*(vifIdx: uint8, status: uint32): uint32 {.exportc, cdecl, discardable.} =
+  ## Apply a traffic change to dynamic PS, considering the other STA VIFs.
+  ## The notifying VIF's stored flags still describe its previous interval.
   let ps = psEnvView()
-
-  # Check PS enabled
-  if ps.enabled == 0: return
-
-  # Check PS mode flags at ps_env[52]
+  if ps.enabled == 0: return 0
   let psFlags = ps.flags
-  if (psFlags and 1) == 0: return   # PS not in correct mode
-  if (psFlags and 6) != 0: return   # mode bits 1-2 set: skip
+  if (psFlags and 1) == 0 or (psFlags and 6) != 0: return 0
 
-  var foundVif = false
-  if status == 0:
-    # Traffic idle: walk the registered VIF list looking for matching vif_idx.
+  var trafficPresent = status != 0
+  if not trafficPresent:
     var vifCur = cast[pointer](vifMgmtEnvView().activeList.first)
     while vifCur != nil:
       let vif = vifChannelAt(vifCur)
-      if vif.vifIdx == vifIdx:
-        # Found matching VIF: check PS capable, type, UAPSD
-        if vif.state != 0:
-          if vif.vifType == VIF_TYPE_STA:
-            let trafficFlags = tdEntryForVif(vif.vifIdx).prevFlags
-            if (trafficFlags and 0x0C) != 0:
-              # Log via debug function (blob: dbg_snp_write at line 1187)
-              let logFn = getLogFunc(0)
-              if logFn != nil:
-                logFn(1, 0, nil, 1187)
-              foundVif = true
-        break  # only check first matching VIF
+      if vif.vifIdx != vifIdx and vif.state != 0 and vif.vifType == VIF_TYPE_STA:
+        let trafficFlags = tdEntryForVif(vif.vifIdx).prevFlags
+        if (trafficFlags and 0x0C) != 0:
+          let logFn = getLogFunc(204)
+          if logFn != nil:
+            type LP = proc(level: uint32, tag, file: cstring, line: cint,
+                           format: cstring) {.cdecl, varargs.}
+            cast[LP](logFn)(1, nil, "ps.c", 1187, "%s:%d\r\n",
+                           cstring("ps_traffic_status_update"), 1187.cint)
+          trafficPresent = true
+          break
       vifCur = vif.next
 
-  # Check scanning flag at ps_env[52] bit 3
-  let scanning = (ps.flags and 8) != 0
-
-  if not foundVif:
-    if scanning:
-      return
-    return  # no VIF matched, not scanning
-
-  # Found matching VIF: if not scanning, trigger DPSM update (blob: ps_dpsm_update)
-  if not scanning:
-    ps_dpsm_update(1)  # enable=1: enter dynamic PS mode
+  let awake = (ps.flags and 8) != 0
+  if trafficPresent:
+    if not awake:
+      return ps_dpsm_update(1)
+  elif awake:
+    return ps_dpsm_update(0)
+  return 0
 
 proc ps_uapsd_set*(vifEntry: pointer, ac: uint8, enabled: uint32) {.exportc, cdecl.} =
   ## Enable/disable U-APSD for an AC.
@@ -616,32 +565,12 @@ proc ps_uapsd_set*(vifEntry: pointer, ac: uint8, enabled: uint32) {.exportc, cde
     vif.uapsdBitmap = newBitmap
 
 proc ps_uapsd_timer_handle*() {.exportc, cdecl.} =
-  ## U-APSD timer callback (91 instrs, stored in ps_env[4] during ps_init).
-  ## Walks the VIF info list looking for active STA VIFs in power save.
-  ## For each eligible VIF, checks if UAPSD trigger timeout expired.
-  ## If expired, logs a warning and sends a QoS null frame to trigger delivery.
-  ## Finally schedules the next timer or clears the UAPSD timer state.
-  ##
-  ## Assembly trace:
-  ##   s0 = vif_info_tab linked list head (from vif_mgmt_env)
-  ##   s6 = found_any flag (0 initially)
-  ##   s1 = 0x24B00 base (for MACHW_TIMLO_REG)
-  ##   s2 = ps_env base
-  ##   Loops: while s0 != nil:
-  ##     check vif.type(+86) != 0 -> skip
-  ##     check vif.active(+88) == 0 -> skip
-  ##     check vif.ps_flag(+104) == 0 -> skip
-  ##     call ps_check_tbtt(vif) -> if 0 -> skip
-  ##     check ps_env[32] timer offset: if (now - vif[100]) expired -> trigger
-  ##       log warning, set vif[4] |= 8, send ke_msg(7=RXU_NULL_DATA, ...)
-  ##       update vif[100] = now
-  ##     s0 = vif.next (follow linked list)
-  ##   If s6==0 (nothing found): clear timer state, return
-  ##   Else: schedule next UAPSD timer with mm_timer_set
+  ## Trigger eligible STA VIFs after half a U-APSD period without activity.
+  ## Vendor uses a signed, wrapped deadline comparison and samples MAC time
+  ## separately for each VIF, after each submission, and before rearming.
   var vifPtr = cast[pointer](vifMgmtEnvView().activeList.first)
   var foundAny = false
   let ps = psEnvView()
-  let macTime = macTimeNow()
   while vifPtr != nil:
     let vif = vifChannelAt(vifPtr)
     # Check VIF type == STA (offset 86)
@@ -661,29 +590,25 @@ proc ps_uapsd_timer_handle*() {.exportc, cdecl.} =
       vifPtr = vif.next
       continue
     foundAny = true
-    # Check timer expiry: ps_env[32] has half-period, compare with vif[100] timestamp
-    let halfPeriod = ps.uapsdPeriod
-    let lastTime = vif.psLastTime
-    let elapsed = macTime - (halfPeriod shr 1) - lastTime
-    if cast[int32](elapsed) < 0:
-      # Timer expired: log and trigger
+    let halfPeriod = ps.uapsdPeriod shr 1
+    let macTime = macTimeNow()
+    let remaining = vif.psLastTime + halfPeriod - macTime
+    if cast[int32](remaining) < 0:
       let logFn = getLogFunc(204)
       if logFn != nil:
-        let log = cast[PlatformLogFunc](logFn)
-        log(1, 0, nil, 567)
+        type LP = proc(level: uint32, tag, file: cstring, line: cint,
+                       format: cstring) {.cdecl, varargs.}
+        cast[LP](logFn)(1, nil, "ps.c", 567, "apsd timer: UAPSD\r\n")
       # Set UAPSD trigger flag
       vif.flags = vif.flags or 0x08
-      # Send QoS null frame (blob: txl_frame_send_qosnull_frame)
-      discard txl_frame_send_qosnull_frame(vif.staIdx, 3'u16, nil, 0)
-      # Update timestamp
-      vif.psLastTime = macTime
+      discard txl_frame_send_qosnull_frame(vif.staIdx, 7'u16, nil, 0)
+      vif.psLastTime = macTimeNow()
     vifPtr = vif.next
   if not foundAny:
-    # No active UAPSD VIFs: clear timer state
-    ps.uapsdTimerState = 0
+    # Clear the same activity byte that ps_uapsd_set checks before rearming.
+    ps.uapsdTimerActive = 0
     return
-  # Schedule next timer: tail-call mm_timer_set with UAPSD timer offset
-  let timerTarget = macTime + ps.uapsdPeriod
+  let timerTarget = macTimeNow() + ps.uapsdPeriod
   mm_timer_set(psUapsdTimer(), timerTarget)
 
 proc ps_tx_null_timer_handle*() {.exportc, cdecl.} =
@@ -697,79 +622,74 @@ proc ps_tx_null_timer_handle*() {.exportc, cdecl.} =
   let pendingNullConfirmCount = ps.pendingCount
   if pendingNullConfirmCount == 0:
     return
-  let remainingNullConfirmCount = pendingNullConfirmCount - 1
-  ps.pendingCount = remainingNullConfirmCount
-  if remainingNullConfirmCount != 0:
-    return
-  # All null frames confirmed: dispatch based on PS mode
+  if not txl_cntrl_halt_ac(3): return
+  ps.pendingCount = 0
+  # The timeout aborts all outstanding null-frame confirmations, then
+  # finalizes through the same handler selected by ps_env flags.
   if (flags and 2) != 0:
     discard ps_disable_cfm_handle(nil)
   elif (flags and 4) != 0:
     ps_enable_cfm_handle(nil)
   # Clear any pending TX on AC3 (blob: txl_cntrl_clear_ac)
-  txl_cntrl_clear_ac(3)
+  if not txl_cntrl_clear_ac(3): return
 
 proc pm_force_sleep_check*(): bool {.exportc, cdecl.} =
   ## Check if forced sleep is allowed.
   ## From blob (ps.o, 2 instrs): always returns 1 (true) - stub.
   return true
 
+proc waitMacPmInterrupt(startTime: uint32): bool =
+  var remaining = WifiHwPollLimit
+  while (regRead(MACHW_INTC_BASE + 0x06C'u) and 4'u32) == 0:
+    if macTimeNow() - startTime > 0x4C4B3F'u32 or remaining == 0:
+      noteHwWaitTimeout((MACHW_INTC_BASE + 0x06C'u).uint32, 4)
+      return false
+    dec remaining
+  true
+
+proc waitMacPmState(expected: uint8): bool =
+  var remaining = WifiHwPollLimit
+  while (regRead(MACHW_STATE_CNTRL_REG) and 0xF'u32) != expected.uint32:
+    if remaining == 0:
+      noteHwWaitTimeout(MACHW_STATE_CNTRL_REG.uint32,
+                        0xF'u32 or (expected.uint32 shl 8))
+      return false
+    dec remaining
+  true
+
 proc set_mac_to_doze*(): uint32 {.exportc, cdecl.} =
-  ## Transition MAC HW to doze (low-power) state (148 bytes in blob, 40 instrs).
-  ## From blob: sets bit 6 (0x40) in MAC_CTRL reg (0x24B0004C), then reads
-  ## MAC_STATUS (0x24B00038). If low nibble != 0 (MAC still active), calls
-  ## assert fn ptr and diagnostic fn ptr from mm_env before proceeding.
-  ## Sets doze_flag global = 1, writes 0x20 (DOZE) to MAC_STATUS.
-  # Set bit 6 (doze request) in MAC control register
+  ## Request doze only after the MAC's current-state nibble reaches IDLE.
   var ctrlReg = regRead(MACHW_STATUS_REG)
   ctrlReg = ctrlReg or 0x40'u32
   regWrite(MACHW_STATUS_REG, ctrlReg)
-  # Read current state from MAC state/control register
-  let curState = regRead(MACHW_STATE_CNTRL_REG) and 0x3F'u32
+  let curState = regRead(MACHW_STATE_CNTRL_REG) and 0xF'u32
   if curState != 0:
-    # MAC not idle - call assert and diagnostic function pointers
-    let mmBase = cast[uint](addr mm_env[0])
-    let assertFn = cast[ptr pointer](mmBase + 204)[]
-    if assertFn != nil:
-      cast[proc(a0: uint32, a1: uint32, file: pointer, line: uint32, rec: pointer) {.cdecl.}](assertFn)(
-        TASK_MM.uint32, 0, nil, 286, nil)
-    let diagFn = cast[ptr pointer](mmBase + 12)[]
-    if diagFn != nil:
-      cast[proc(a0: pointer, line: uint32, file: pointer, param: pointer) {.cdecl.}](diagFn)(
-        nil, 287, nil, nil)
-  # Set doze-in-progress flag
-  psDozeEnvView().dozeInProgress = 1
-  # Write DOZE command (0x20) to MAC state register
+    let logFn = cast[proc(level: uint32; tag, file: cstring; line: cint;
+                          format: cstring) {.cdecl, varargs.}](blOpsFunc(204))
+    if logFn != nil:
+      logFn(4, nil, "bl.c", 286, "mac state not idle, assert.\r\n")
+    # The port's assertion recovery returns, so do not continue into doze.
+    assert_rec("0", "bl.c", 287)
+    return 1
+  blDozeEnvView().dozeInProgress = 1
   regWrite(MACHW_STATE_CNTRL_REG, 0x20'u32)
   return 0
 
 proc wait_mac_goto_idle*(): uint32 {.exportc, cdecl.} =
-  ## Wait for MAC to reach IDLE state.
-  ## From blob (ps.o, 33 instrs): reads state register, stores pre-state byte,
-  ## clears bit 31 in INTC unmask, sets bit 2 (IDLE command), writes 0 to
-  ## state register. Polls INTC status bit 2 with timeout (0x4C4B3F iterations).
-  ## After poll: reads final state, writes 4 to INTC ack, clears bit 2,
-  ## sets bit 31 back. Returns 0 if idle reached, 1 if state non-zero.
-  let curState = regRead(MACHW_STATE_CNTRL_REG) and 0x3F'u32
-  if curState == 0:
-    return 0  # Already idle
-  # Clear bit 31 of INTC unmask (offset 0x074)
+  ## Save the original state before the vendor's second current-state read.
+  blDozeEnvView().preState = (regRead(MACHW_STATE_CNTRL_REG) and 0xF'u32).uint8
+  if (regRead(MACHW_STATE_CNTRL_REG) and 0xF'u32) == 0:
+    return 0
+  let startTime = macTimeNow()
   let intcCtrl = MACHW_INTC_BASE + 0x074'u
   var unmask = regRead(intcCtrl)
   unmask = unmask and 0x7FFFFFFF'u32
   regWrite(intcCtrl, unmask)
-  # Set bit 2 (idle command) and clear current state
-  regWrite(intcCtrl, unmask or 0x04'u32)
+  regWrite(intcCtrl, regRead(intcCtrl) or 0x04'u32)
   regWrite(MACHW_STATE_CNTRL_REG, 0'u32)
-  # Poll for completion: read timestamp for timeout
-  let startTime = macTimeNow()
-  let timeout = 0x4C4B3F'u32
-  var status = regRead(MACHW_INTC_BASE + 0x06C'u)
-  while (status and 0x04'u32) == 0 and macTimeNow() - startTime < timeout:
-    status = regRead(MACHW_INTC_BASE + 0x06C'u)
-  # Read final state
-  let finalState = regRead(MACHW_STATE_CNTRL_REG) and 0x3F'u32
-  # Ack: write 4 to ack register, clear bit 2
+  discard waitMacPmInterrupt(startTime)
+  discard macTimeNow()
+  let finalState = regRead(MACHW_STATE_CNTRL_REG) and 0xF'u32
   regWrite(MACHW_INTC_BASE + 0x070'u, 0x04'u32)
   unmask = regRead(intcCtrl)
   unmask = unmask and not 0x04'u32
@@ -781,20 +701,17 @@ proc wait_mac_goto_idle*(): uint32 {.exportc, cdecl.} =
   return if finalState != 0: 1'u32 else: 0'u32
 
 proc wait_mac_goto_prestate*(): uint32 {.exportc, cdecl.} =
-  ## Wait for MAC to return to its saved pre-state.
-  ## From blob (ps.o, 23 instrs): reads saved pre-state byte,
-  ## if 0 returns immediately. Shifts left by 4 (into bits [7:4]),
-  ## writes to state register, then polls until state[3:0] matches.
-  let preState = psDozeEnvView().preState
+  ## Restore the state saved in bl_env, with a bounded completion wait.
+  let preState = blDozeEnvView().preState
   if preState == 0:
     return 0
   let targetBits = preState.uint32 shl 4
   if (targetBits and 0xFFFFFF0F'u32) != 0:
-    assert_err("ps.c", "ps.c", 1465)
+    assert_err("(((uint32_t)nextstate << 4) & ~((uint32_t)0x000000F0)) == 0",
+               "module", 1465)
+    return 1
   regWrite(MACHW_STATE_CNTRL_REG, targetBits)
-  # Poll until state matches pre-state
-  discard waitRegLowNibbleEquals(MACHW_STATE_CNTRL_REG, preState.uint32)
-  return 0
+  return if waitMacPmState(preState): 0'u32 else: 1'u32
 
 proc wakeup_from_doze_done*(): uint32 {.exportc, cdecl.} =
   ## Complete doze wakeup: clear doze flag in INTC.
@@ -806,13 +723,7 @@ proc wakeup_from_doze_done*(): uint32 {.exportc, cdecl.} =
   return 0
 
 proc wakeup_from_doze_pre*(): uint32 {.exportc, cdecl.} =
-  ## Prepare wakeup from doze state.
-  ## From blob (ps.o, 38 instrs): clears bit 31 of INTC+0x074, writes 4 to INTC+0x070,
-  ## sets bit 2 of INTC+0x074, sets bit 31 of INTC+0x048. Clears doze flag.
-  ## Polls INTC+0x06C bit 2 with short spin (501 iterations).
-  ## Then polls with timestamp timeout (0x4C4B3F). When done, waits for
-  ## state register [3:0] to reach 0 (idle), then writes 4 to INTC+0x070,
-  ## clears bit 2, sets bit 31 of INTC+0x074.
+  ## Prepare wakeup and restore IRQ controls even if the MAC remains busy.
   let intcCtrl = MACHW_INTC_BASE + 0x074'u
   var unmask = regRead(intcCtrl)
   unmask = unmask and 0x7FFFFFFF'u32
@@ -828,7 +739,7 @@ proc wakeup_from_doze_pre*(): uint32 {.exportc, cdecl.} =
   dozeReg = dozeReg or 0x80000000'u32
   regWrite(MACHW_INTC_BASE + 0x048'u, dozeReg)
   # Clear doze-in-progress
-  psDozeEnvView().dozeInProgress = 0
+  blDozeEnvView().dozeInProgress = 0
   # Short spin waiting for INTC bit 2
   var spins = 501'u32
   while spins > 0:
@@ -836,14 +747,10 @@ proc wakeup_from_doze_pre*(): uint32 {.exportc, cdecl.} =
     if (status and 0x04'u32) != 0:
       break
     dec spins
-  # Timestamp-based timeout poll
   let startTime = macTimeNow()
-  let timeout = 0x4C4B3F'u32
-  var status = regRead(MACHW_INTC_BASE + 0x06C'u)
-  while (status and 0x04'u32) == 0 and macTimeNow() - startTime < timeout:
-    status = regRead(MACHW_INTC_BASE + 0x06C'u)
-  # Wait for state to go idle
-  discard waitRegLowNibbleClear(MACHW_STATE_CNTRL_REG)
+  discard waitMacPmInterrupt(startTime)
+  discard macTimeNow()
+  let idle = waitMacPmState(0)
   # Final: ack, clear, set
   regWrite(MACHW_INTC_BASE + 0x070'u, 0x04'u32)
   unmask = regRead(intcCtrl)
@@ -852,7 +759,7 @@ proc wakeup_from_doze_pre*(): uint32 {.exportc, cdecl.} =
   unmask = regRead(intcCtrl)
   unmask = unmask or 0x80000000'u32
   regWrite(intcCtrl, unmask)
-  return 0
+  return if idle: 0'u32 else: 1'u32
 
 proc ps_disable_cfm_handle*(vifEntry: pointer): uint32 {.exportc, cdecl.} =
   ## Handle PS disable confirmation from MAC (232 bytes in blob, 59 instrs).
@@ -866,7 +773,7 @@ proc ps_disable_cfm_handle*(vifEntry: pointer): uint32 {.exportc, cdecl.} =
   ##     flags = (flags & ~2) | 8
   ##     ps_env[52] = flags
   ##     wifi_hosal_pm_post_event(4, 0, &localStatus)
-  ##     td_cfm_set_timer(s1[87], localStatus)
+  ##     td_cfm_set_timer(s1[87], localStatus & 0xff)
   ##     s2 = 1
   ##     goto L65
   ##   else:                                            ; .L64
@@ -886,7 +793,7 @@ proc ps_disable_cfm_handle*(vifEntry: pointer): uint32 {.exportc, cdecl.} =
   ##       ps_set_mode(ps_env[53], ps_env[1])
   ##   return s2
   let ps = psEnvView()
-  var localStatus: uint8 = 0  # sp+12 in blob
+  var localStatus: uint32 = 0  # PM writes a word at sp+12 in the blob.
   # Blob: mm_timer_clear(&ps_env + 12)
   mm_timer_clear(psUapsdTimer())
   # ps_env[0x1c] (offset 28) = 0
@@ -903,17 +810,14 @@ proc ps_disable_cfm_handle*(vifEntry: pointer): uint32 {.exportc, cdecl.} =
     wifi_hosal_pm_post_event(4, 0, cast[pointer](addr localStatus))
     # td_cfm_set_timer(s1[87], localStatus)
     let vifIdxLocal = vifChannelAt(vifEntry).vifIdx
-    td_cfm_set_timer(vifIdxLocal, localStatus)
+    td_cfm_set_timer(vifIdxLocal, localStatus and 0xFF'u32)
     result2 = 1
     # fall through to .L65
   else:
     # .L64: send basic message
     ps.enabled = 0
-    ps.mode = 0
-    ps.modeStatusPadding = [0'u8, 0'u8]
-    let destTask = ps.mode
     # ke_msg_send_basic(32, ps_env[1], 0)
-    ke_msg_send_basic(32'u16, destTask, 0)
+    mmPsModeComplete()
     # Blob does not short-circuit the vifEntry==nil case with its own
     # ps_set_mode call — .L64 falls through to .L65 (which is a no-op
     # when vifEntry is NULL) and then reaches the single .L66 ps_set_mode
@@ -937,7 +841,7 @@ proc ps_disable_cfm_handle*(vifEntry: pointer): uint32 {.exportc, cdecl.} =
   let flagsL66 = ps.flags
   if (flagsL66 and 0x10) != 0:
     ps.flags = flagsL66 and (not 0x10'u8)
-    ps_set_mode(ps.deferredMode)
+    ps_set_mode(ps.deferredMode, ps.mode)
   return result2
 
 proc ps_enable_cfm*(vifEntry: pointer, status: uint32) {.exportc, cdecl.} =
@@ -952,6 +856,7 @@ proc ps_enable_cfm*(vifEntry: pointer, status: uint32) {.exportc, cdecl.} =
   ##   mm_timer_clear(ps_env + 0x24);                     ; byte offset 36, NOT 12
   ##   if (ps_env[8] != 0) return;
   ##   ps_enable_cfm_handle(vif);                         ; tail call
+  if not txlFrameCallbackCurrent(): return
   let ps = psEnvView()
   # State guard: if ps_env[52] & 2 set, abort (PS disable already pending)
   if (ps.flags and 2'u8) != 0:
@@ -959,11 +864,8 @@ proc ps_enable_cfm*(vifEntry: pointer, status: uint32) {.exportc, cdecl.} =
   # hw_cfm branch: if caller already confirmed TX (status bit 23 set), skip TX poll
   if (status and 0x00800000'u32) == 0:
     # Poll TX status via part.0 clone. Returns 1 when TX has settled, 0 to retry.
-    var checkResult: uint32
-    {.emit: """
-extern unsigned int ps_check_tx_status_part0(void*, void*) __asm__("ps_check_tx_status.part.0");
-""".}
-    {.emit: [checkResult, " = ps_check_tx_status_part0(", vifEntry, ", (void*)", ps_enable_cfm, ");"].}
+    let checkResult = ps_check_tx_status_part0_nim(vifEntry, cast[pointer](ps_enable_cfm))
+    if not txlFrameCallbackCurrent(): return
     if checkResult == 0:
       return
   # finalize path
@@ -980,67 +882,69 @@ extern unsigned int ps_check_tx_status_part0(void*, void*) __asm__("ps_check_tx_
 
 proc ps_enable_cfm_handle*(vifEntry: pointer) {.exportc, cdecl, noinline.} =
   ## Finalize PS enable: update state, start timers.
-  ## From blob (ps.o, 57 instrs): sets ps_env[29]=1 (PS active). If VIF has
-  ## DTIM tracking and UAPSD enabled, starts UAPSD timer. Then checks
+  ## From blob (ps.o, 57 instrs): if ps_env[29] is nonzero and a VIF is
+  ## supplied, starts the UAPSD timer. Then checks
   ## ps_env[52] bits [2:0] for 5 (enable+confirm), clears bits, updates VIF.
   ## noinline: blob calls this from ps_dpsm_update, ps_tx_null_timer_handle,
   ## and ps_check_tx_status.
   {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
   let ps = psEnvView()
-  # Set PS-active flag
-  ps.psActive = 1
-  if vifEntry == nil: return
-  let vif = vifChannelAt(vifEntry)
-  # Check VIF DTIM tracking (offset 88) and UAPSD (offset 104)
-  let dtim = vif.state
-  if dtim != 0:
-    let uapsd = vif.uapsdBitmap
-    if uapsd != 0:
-      # Start UAPSD timer
-      let macTime = macTimeNow()
-      mm_timer_set(psUapsdTimer(), macTime + ps.uapsdPeriod)
-      # Clear VIF PS-transition flag
-      vif.flags = vif.flags and not 0x08'u32
+  if ps.psActive != 0 and vifEntry != nil:
+    let macTime = macTimeNow()
+    mm_timer_set(psUapsdTimer(), macTime + ps.uapsdPeriod)
+    ps.uapsdTimerActive = 1
+    let vifForTimer = vifChannelAt(vifEntry)
+    if vifForTimer.state != 0 and vifForTimer.uapsdBitmap != 0:
+      let logFn = getLogFunc(204)
+      if logFn != nil:
+        type LP = proc(level: uint32, tag, file: cstring, line: cint,
+                       format: cstring) {.cdecl, varargs.}
+        cast[LP](logFn)(1, nil, "ps.c", 208, "enable cfm: UAPSD CLR\r\n")
+      vifForTimer.flags = vifForTimer.flags and not 0x08'u32
   # Check and finalize ps_env flags
   let flags = ps.flags
   if (flags and 0x05) == 5 and vifEntry != nil:
     # Clear enable bits, update VIF
-    let newFlags = flags and not 0x0D'u8
+    let newFlags = flags and not 0x0C'u8
     ps.flags = newFlags
+    let vif = vifChannelAt(vifEntry)
     vif.flags = vif.flags and not 0x42'u32
     # Set PS confirmed in VIF[196]
     vif.keyPsState = 1
   else:
     # Send PS mode confirmation
     ps.enabled = 1
-    ke_msg_send_basic(0x20'u16, ps.mode, 0)
+    mmPsModeComplete()
     if vifEntry != nil:
-      vif.keyPsState = 1
+      vifChannelAt(vifEntry).keyPsState = 1
 
   # Blob .L94: check bit 4 of ps_env[52] for pending ps_set_mode
   let finalFlags = ps.flags
   if (finalFlags and 0x10) != 0:
     let clearedFlags = finalFlags and not 0x10'u8
     ps.flags = clearedFlags
-    ps_set_mode(ps.deferredMode)
+    ps_set_mode(ps.deferredMode, ps.mode)
 
-proc ps_dpsm_update*(enable: uint32) {.exportc, cdecl.} =
+proc ps_dpsm_update*(enable: uint32): uint32 {.exportc, cdecl, discardable.} =
   ## Update DPSM state (334b in blob, ps.o).
-  ## Blob: check active count, set flags/state, update MAC HW power ctrl,
-  ## iterate VIF list calling ps_check_vif/ps_set_vif_mode (enable) or
-  ## ps_set_mode_with_callback (disable), tail-call ps_do_sleep on enable done.
+  ## Blob: nonzero starts the disable-confirm path and sends null frames
+  ## without callbacks; zero starts the enable-confirm path with ps_enable_cfm
+  ## callbacks and the TX-null retry timer.
   let ps = psEnvView()
   if ps.pendingCount != 0:
-    return  # transition in progress
+    return 0  # transition in progress
   # Update flags and state bits
   let flags = ps.flags
   let envWord = ps.statusFlags
+  var cfmCallback: pointer
   if enable != 0:
-    ps.flags = flags or 0x02  # enable pending
+    ps.flags = flags or 0x02
     ps.statusFlags = envWord or 0x08
+    cfmCallback = cast[pointer](ps_disable_cfm)
   else:
-    ps.flags = flags or 0x04  # disable pending
+    ps.flags = flags or 0x04
     ps.statusFlags = envWord and not 0x08'u32
+    cfmCallback = cast[pointer](ps_enable_cfm)
   # Update MAC HW power ctrl register at 0x24B0004C
   # Blob: read reg, clear bit 2, set ((enable^1)<<2)
   let hwBase = 0x24B00000'u
@@ -1048,13 +952,13 @@ proc ps_dpsm_update*(enable: uint32) {.exportc, cdecl.} =
   pmReg = pmReg and not 0x04'u32  # clear bit 2
   pmReg = pmReg or (((enable xor 1) and 1) shl 2)  # set bit 2 if disabling
   volatileStore(cast[ptr uint32](hwBase + 0x4C), pmReg)
-  # Clear prevent-sleep flag
-  ps.deferredMode = 0
+  ps.pendingCount = 0
   # Walk VIF linked list
   var vifPtr = cast[pointer](vifMgmtEnvView().activeList.first)
+  var lastVisitedVifEntry: pointer = nil
   while vifPtr != nil:
     let vif = vifChannelAt(vifPtr)
-    let vifAddr = cast[uint](vif)
+    lastVisitedVifEntry = vifPtr
     if vif.vifType != VIF_TYPE_STA:
       vifPtr = vif.next
       continue
@@ -1063,7 +967,7 @@ proc ps_dpsm_update*(enable: uint32) {.exportc, cdecl.} =
       vifPtr = vif.next
       continue
     # Call chan_is_on_channel to validate VIF is on channel
-    let checkResult = chan_is_on_channel(cast[pointer](vifAddr))
+    let checkResult = chan_is_on_channel(vifPtr)
     if not checkResult:
       vifPtr = vif.next
       continue
@@ -1071,34 +975,28 @@ proc ps_dpsm_update*(enable: uint32) {.exportc, cdecl.} =
     let pendingNullConfirmSnapshot = ps.pendingCount
     ps.pendingCount = pendingNullConfirmSnapshot + 1
     vif.psNullRetry = 0
+    let staIdx = vif.staIdx
     if enable != 0:
-      # Enable path: send null frame PM=1 (blob: txl_frame_send_null_frame)
-      let staIdx = vif.staIdx
-      discard txl_frame_send_null_frame(staIdx, cast[pointer](ps_enable_cfm), cast[uint32](vifAddr))
+      discard txl_frame_send_null_frame(staIdx, nil, 0)
       ps.pendingCount = ps.pendingCount - 1
     else:
-      # Disable path: send null frame PM=0 (blob: txl_frame_send_null_frame)
-      let staIdx = vif.staIdx
-      discard txl_frame_send_null_frame(staIdx, cast[pointer](ps_disable_cfm), cast[uint32](vifAddr))
-      if ps.pendingCount == pendingNullConfirmSnapshot + 1:
+      let nullFrameStatus = txl_frame_send_null_frame(
+        staIdx, cfmCallback, pointerAddrU32(vifPtr))
+      if nullFrameStatus == 1'u8:
         ps.pendingCount = ps.pendingCount - 1
       else:
         # Store current VIF for async completion
         ps.currentVif = vifPtr
-        # Set timer: MAC_TIMER + timeout offset
-        let macTime = volatileLoad(cast[ptr uint32](hwBase + 0x120))
-        let timeout = cast[uint32](ps.uapsdTimerCallback)
-        mm_timer_set(psUapsdTimer(), macTime + timeout)
+        mm_timer_set(psTxNullTimer(), macTimeNow() + blPsParamsView().txNullTimeout)
     vifPtr = vif.next
   # Post-loop: check if all done
   if ps.pendingCount != 0:
-    return  # still pending
+    return 0  # still pending
   if enable != 0:
-    # Enable done: tail-call to sleep function
-    ps_enable_cfm_handle(nil)
+    return ps_disable_cfm_handle(lastVisitedVifEntry)
   else:
-    # Disable done: notify
-    discard ps_disable_cfm_handle(nil)
+    ps_enable_cfm_handle(lastVisitedVifEntry)
+  return 0
 
 proc ps_send_pspoll*(vifEntry: pointer): uint8 {.exportc, cdecl, noinline.} =
   ## Send PS-Poll frame (206 bytes in blob, 84 instrs).
@@ -1108,16 +1006,36 @@ proc ps_send_pspoll*(vifEntry: pointer): uint8 {.exportc, cdecl, noinline.} =
   ## Builds PS-Poll 802.11 header: FC=0x00A4, Duration=AID|0xC000,
   ## Addr1=BSSID (from sta[4]), Addr2=own MAC (from vif[0x50]).
   ## Sets TX control flags (0x10000053), copies rate info from sta,
-  ## calls txl_frame_push(txdesc, AC_VO=3). Returns 0 on success, 1 on fail.
+  ## calls txl_frame_push(txdesc, AC_VO=3). Returns 0 on push success, 1 on
+  ## allocation/push failure.
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if vifEntry == nil:
+    return 1
   let vif = vifChannelAt(vifEntry)
+  let vifIdx = vif.vifIdx
+  if vifIdx >= MAX_VIFS.uint8 or vifChannelForIdx(vifIdx) != vif:
+    return 1
   let staIdx = vif.staIdx
+  if staIdx >= STA_INFO_TAB_ENTRIES.uint8:
+    return 1
+  let identity = TxSessionIdentity(captured: true, vif: vifIdx, station: staIdx,
+    vifEpoch: rxVifEpochs[vifIdx], stationEpoch: staDeleteEpoch(staIdx),
+    resetEpoch: txResetEpoch)
   # Allocate frame descriptor for 16-byte PS-Poll
   let txdesc = txl_frame_get(16)
   if txdesc == nil:
     return 1  # Allocation failed
+  let desc = hostTxDescAt(txdesc)
+  let generation = txlFrameLeaseToken(desc)
+  desc.vifIdx = vifIdx
+  desc.staInfoIdx = staIdx
+  if not txlFramePreparationCurrent(desc, identity, generation):
+    return 1
   # Update TX power
   tpc_update_frame_tx_power(vifEntry, txdesc)
-  let desc = hostTxDescAt(txdesc)
+  if not txlFramePreparationCurrent(desc, identity, generation):
+    return 1
   let hdr = hostTxPsPollHeader(desc)
   # Build PS-Poll frame control (0x00A4)
   hdr.frameControl = 0x00A4'u16
@@ -1136,9 +1054,11 @@ proc ps_send_pspoll*(vifEntry: pointer): uint8 {.exportc, cdecl, noinline.} =
   # Copy rate info from STA
   desc.vifIdx = sta.instNbr
   desc.staInfoIdx = sta.infoIdx
+  if not txlFramePreparationCurrent(desc, identity, generation):
+    return 1
   # Push frame for transmission
-  txl_frame_push(txdesc, 3)  # AC_VO = 3
-  return 0
+  let pushRc = txl_frame_push(txdesc, 3)  # AC_VO = 3
+  return (pushRc xor 1'u8) and 0xFF'u8
 
 proc mac_recovery*(): uint32 {.exportc, cdecl.} =
   ## MAC recovery handler — blob arch_main.o (10 instrs):
@@ -1151,32 +1071,21 @@ proc mac_recovery*(): uint32 {.exportc, cdecl.} =
 {.emit: "__attribute__((noipa)) unsigned long bl_pwr_find(void*,unsigned long);".}
 proc bl_pwr_find*(levels: pointer, count: uint32): uint32 {.exportc, cdecl.} =
   ## Find the index of the maximum value in a signed byte array.
-  ## From blob (bl.o, 13 instrs): linear scan tracking running maximum.
-  ## Returns index of the entry with the highest value (0 if count==0 or
-  ## levels[0] is already the max).
-  if count == 0:
+  ## Keep the first maximum. Unlike the vendor's byte-sized cursor, the
+  ## exported uint32 count must not wrap at 256 and leave the scan running.
+  if levels == nil or count == 0:
     return 0
-  let powerLevelBytes = cast[ptr UncheckedArray[uint8]](levels)
-  var highestLevel = powerLevelBytes[0]  # running max (unsigned byte)
+  let powerLevels = cast[ptr UncheckedArray[int8]](levels)
   var bestIndex = 0'u32
-  let lastScanIndex = count - 1
-  var scanIndex = 0'u32
-  while scanIndex < lastScanIndex:
-    let candidateLevel = cast[int8](powerLevelBytes[scanIndex + 1])  # blob uses lb (signed load)
-    scanIndex += 1
-    scanIndex = scanIndex and 0xFF  # blob: zext.b
-    if cast[int8](highestLevel) >= candidateLevel:  # blob: bge (signed compare)
-      continue
-    highestLevel = cast[uint8](candidateLevel) and 0xFF  # blob: zext.b on new max
-    bestIndex = scanIndex
+  for scanIndex in 1'u32 ..< count:
+    if powerLevels[scanIndex] > powerLevels[bestIndex]:
+      bestIndex = scanIndex
   return bestIndex
 
 proc ble_rf_ops*(enable: uint32) {.exportc, cdecl.} =
   ## BLE RF operations toggle (34 bytes in blob, 9 instrs).
   ## From blob: if enable == 0, calls wifi_hosal_rf_turn_off();
   ## else calls wifi_hosal_rf_turn_on(). Returns 0.
-  proc wifi_hosal_rf_turn_on() {.importc, cdecl.}
-  proc wifi_hosal_rf_turn_off() {.importc, cdecl.}
   if enable == 0:
     wifi_hosal_rf_turn_off()
   else:
@@ -1202,8 +1111,9 @@ proc mm_ap_traffic_probe_cfm*(vifEntry: pointer, status: uint32) {.exportc, cdec
   ## AP traffic probe confirmation handler.
   ## From blob (mm.o, 14 instrs): checks status bit 23 (0x00800000). If set,
   ## resets probe counter to 10 and stores current MAC time at vifEntry+108.
-  ## If not set, decrements probe counter (mm_env[8]); when it reaches 0,
-  ## resets to 10 and tail-calls mm_send_connection_loss_ind(vifEntry, 22).
+  ## If not set, decrements a nonzero probe counter (mm_env[8]). If already
+  ## zero, resets to 10 and calls mm_send_connection_loss_ind(vifEntry, 22).
+  if not txlFrameCallbackCurrent(): return
   let mm = mmEnvView()
   if (status and 0x00800000'u32) != 0:
     mm.keepAliveLimit = 10  # reset counter at mm_env offset 32
@@ -1213,8 +1123,7 @@ proc mm_ap_traffic_probe_cfm*(vifEntry: pointer, status: uint32) {.exportc, cdec
     if keepAliveMissBudget == 0:
       mm.keepAliveLimit = 10
       # Tail-call connection loss: blob passes vifEntry as a0, reason=22 as a1
-      let vifIdx = vifChannelAt(vifEntry).vifIdx
-      mm_send_connection_loss_ind(vifIdx, 22)
+      mm_send_connection_loss_ind(vifEntry, 22)
     else:
       mm.keepAliveLimit = keepAliveMissBudget - 1
 
@@ -1230,10 +1139,10 @@ proc td_timer_end*(tdEntry: pointer) {.exportc, cdecl.} =
   let td = tdEntryAt(tdEntry)
   let macTime = regRead(MACHW_TIMLO_REG)
   var schedResult: uint32 = 0
+  var transitionResult: uint32 = 0
 
   if td.endActive != 0:
-    let config = tdConfig()
-    let threshold = config.threshold
+    let threshold = blPsParamsView().trafficThreshold
 
     # Compute direction flags using sltu comparison against threshold
     var dirFlags: uint32 = 0
@@ -1259,7 +1168,9 @@ proc td_timer_end*(tdEntry: pointer) {.exportc, cdecl.} =
     # Call wifi_hosal_pm_post_event (blob: direct call at 0x60)
     wifi_hosal_pm_post_event(4, 0, addr schedResult)
 
-    if schedResult == 0:
+    if schedResult != 0:
+      transitionResult = ps_traffic_status_update(td.vifIdx, bidir)
+    else:
       # Check for direction change
       let changed = (td.prevFlags.uint32 xor dirFlags) and 0x0C
       if changed != 0:
@@ -1268,10 +1179,14 @@ proc td_timer_end*(tdEntry: pointer) {.exportc, cdecl.} =
         # Log via platform ops
         let logFnPtr = blOpsFunc(204)
         if logFnPtr != nil:
-          let logFn = cast[PlatformLogFunc](logFnPtr)
-          logFn(1, 0, nil, 200)
+          type LP = proc(level: uint32, tag, file: cstring, line: cint,
+                         format: cstring) {.cdecl, varargs.}
+          let txStatus: cstring = if (dirFlags and 4) != 0: "TX" else: "nul"
+          let rxStatus: cstring = if (dirFlags and 8) != 0: "RX" else: "nul"
+          cast[LP](logFnPtr)(1, nil, "td.c", 200, "Power Status %s:%s\r\n",
+                            txStatus, rxStatus)
         # Notify traffic status change
-        ps_traffic_status_update(td.vifIdx, dirBits.uint32)
+        transitionResult = ps_traffic_status_update(td.vifIdx, dirBits.uint32)
 
     # Store new flags
     td.prevFlags = dirFlags.uint8
@@ -1283,46 +1198,23 @@ proc td_timer_end*(tdEntry: pointer) {.exportc, cdecl.} =
   # Compute VIF active status and reschedule timer
   let vif = vifChannelForIdx(vifIdx)
   let vifConnected = vif.chanCtxt
-  # Check if connection is active (blob: compares vif[64] with a global)
-  let isActive = (vifConnected != nil).uint8
+  let isActive = (vifConnected == chanEnvView().currentCtxt).uint8
   td.endActive = isActive
-  if isActive == 0:
+  if transitionResult != 0:
     return
-  # Reschedule: timer target = macTime + td_period (from config)
-  let timerTarget = macTime + tdConfig().period
+  let timerTarget = macTime + blPsParamsView().trafficPeriod
   mm_timer_set(tdEntry, timerTarget)
 
 proc phyif_utils_decode*(rxvec: pointer, rssi: ptr int8): uint32 {.exportc, cdecl.} =
-  ## Decode PHY RSSI from RX vector (128 bytes in blob, 36 instrs).
-  ## From blob: reads rx-vector word at a0[4] and byte19(a0[19]). Extracts format bits.
-  ## Fast path (fmtVal > 1): combines bytes 19+20 as (byte20<<8)|byte19,
-  ##   applies custom PHY insn, divides by 122, converts int→float→int.
-  ## Slow path (fmtVal <= 1): reads rx-vector word at a0[0], extracts MCS field, checks > 3,
-  ##   calls 3 external functions (__floatsisf, __divsf3, __fixsfsi) for
-  ##   float-based RSSI computation.
-  ## Returns 0 on success, stores result byte via rssi ptr.
+  ## Decode RSSI with the vendor RX-vector bit fields and signed arithmetic.
   let rxv = phyRxVectorAt(rxvec)
-  let mcsBitsWord = rxv.mcsBitsWord
-  let formatBitsWord = rxv.formatBitsWord
-  # Extract format field from the second RX-vector word via custom PHY insn (approximated)
-  let fmtVal = formatBitsWord and 0x03'u32
-  if fmtVal > 1:
-    # Fast path: RSSI from combined bytes 19-20, divide by 122
-    let scaled = rxv.rssiRaw.int32 div 122
-    rssi[] = cast[int8](scaled and 0xFF)
+  let format = (rxv.formatBitsWord shr 16) and 7'u32
+  let rate = (rxv.mcsBitsWord shr 12) and 15'u32
+  let decoded = if format > 1 or rate > 3:
+    # The wide sample is signed; integer division truncates toward zero.
+    cast[int16](rxv.rssiRaw.uint16).int32 div 122
   else:
-    # Slow path: MCS-bit word computation with float math.
-    let mcsField = (mcsBitsWord shr 2) and 0x3F'u32  # extract from custom insn
-    if mcsField > 3:
-      # Use bytes 19-20 path anyway (fallback)
-      let scaled = rxv.rssiRaw.int32 div 122
-      rssi[] = cast[int8](scaled and 0xFF)
-    else:
-      # Float-based RSSI computation from MCS field.
-      # Blob: __floatsidf(-mcsField) → __muldf3(*, 0.7) → __fixdfsi
-      # Use cint (int32) so GCC picks __fixdfsi, matching the blob.
-      let negVal: cint = -(mcsField.cint and 0xFF)
-      var scaledC: cint = 0
-      {.emit: [scaledC, " = (int)((double)", negVal, " * 0.7);"].}
-      rssi[] = cast[int8](scaledC and 0xFF)
+    # CCK uses only the signed low byte. Keep the vendor's binary64 scaling.
+    ((-cast[int8](rxv.rssiLo).int32).float64 * 0.7).int32
+  rssi[] = cast[int8](decoded)
   return 0

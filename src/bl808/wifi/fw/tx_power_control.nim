@@ -74,12 +74,11 @@ proc tpc_update_tx_power*(vifIdx: uint8) {.exportc, cdecl.} =
   regVal = (regVal and 0xFFFF00FF'u32) or 0x4800'u32
   regWrite(MACHW_TX_POWER_REG, regVal)
 
-proc tpc_get_vif_tx_power*(vifIdx: uint8): int8 {.exportc, cdecl.} =
-  ## Get TX power for a VIF.
-  ## From blob (4 instrs): reads MACHW_TX_POWER_REG, returns low byte.
-  ## The low byte of this register holds the current TX power level.
+proc tpc_get_vif_tx_power*(vifEntry: pointer): uint8 {.exportc, cdecl.} =
+  ## The vendor accepts an unused VIF pointer and returns an unsigned index,
+  ## not signed dBm. Preserve the register byte, including its high bit.
   let txPowerReg = regRead(MACHW_TX_POWER_REG)
-  return cast[int8](txPowerReg and 0xFF)
+  (txPowerReg and 0xFF).uint8
 
 proc tpc_update_vif_tx_power*(vifEntry: pointer, txPowerElem: pointer, rateParam: pointer) {.exportc, cdecl.} =
   ## Update VIF TX power (168 bytes in blob, 58 instrs).
@@ -88,8 +87,9 @@ proc tpc_update_vif_tx_power*(vifEntry: pointer, txPowerElem: pointer, rateParam
   ## Flow:
   ##   1. lb a4, 0(a1). If == 127, return (sentinel: no update).
   ##   2. Save old power from vif[89]. Call phy_get_rf_gain_idx(a1, a2).
-  ##   3. Read new power from a1[0], clamp to vif[90] (max_power).
-  ##   4. Store new to vif[89]. If changed: walk STA list at vif[340],
+  ##   3. Store PHY-limited power to vif[89], then clamp a1[0] to the
+  ##      user limit at vif[90]. Channel power applies both limits separately.
+  ##   4. If the returned power changed: walk STA list at vif[340],
   ##      set bit 4 in STA[334] (RC flags).
   ##   5. If chanCtxt at vif[64] exists: call chan_update_tx_power,
   ##      chan_is_on_channel, tail-call tpc_update_tx_power.
@@ -146,32 +146,18 @@ proc tpc_update_vif_tx_power*(vifEntry: pointer, txPowerElem: pointer, rateParam
   let chanCtxt2 = vif.chanCtxt  # reload
   tpc_update_tx_power(chanCtxtAt(chanCtxt2).channel.txPower)
 
-proc tpc_get_vif_tx_power_vs_rate*(vifIdx: uint8, rate: uint32): int8 {.exportc, cdecl.} =
-  ## Get TX power for a specific rate on a VIF (40 bytes in blob, 14 instrs).
-  ## From blob:
-  ##   1. zext.b a5, a0; andi a1, a0, 0x7F  -> extract rate byte and rate index
-  ##   2. Custom .insn divides rate by 128 to get rateGroup
-  ##   3. If rateGroup != 0 (HT/VHT rate): a0=2, tail-call trpc_get_default_power_idx
-  ##   4. If (a5 & 0x7C) != 0 (11g rate): a1 -= 4, zext.b, a0=1
-  ##   5. Tail-call trpc_get_default_power_idx(rateType, adjustedRateIdx)
-  ##
-  ## This classifies the rate into legacy-11b (type 0), legacy-11g (type 1),
-  ## or HT/VHT (type 2) and dispatches to trpc_get_default_power_idx.
-  let rateByte = (rate and 0xFF).uint8
-  let rateIdx = (rate and 0x7F).uint8  # 7-bit rate index
-  let rateGroup = rateByte div 128     # custom insn divides by group size
-
-  # Blob tail-calls trpc_get_default_power_idx from a single site.
-  var rateType: uint8
-  var adjIdx: uint8 = rateIdx
-  if rateGroup != 0:
-    rateType = 2                       # HT/VHT
-  elif (rateByte and 0x7C) != 0:
-    rateType = 1                       # 11g
-    adjIdx = ((rateIdx - 4) and 0xFF).uint8
-  else:
-    rateType = 0                       # 11b
-  return trpc_get_default_power_idx(rateType, adjIdx)
+proc tpc_get_vif_tx_power_vs_rate*(rate: uint32): uint8 {.exportc, cdecl.} =
+  ## The vendor ABI accepts one packed rate word and returns an unsigned index.
+  let formatMod = (rate shr 11) and 7
+  var rateIndex = (rate and 0x7F).uint8
+  var rateType = 0'u32
+  if formatMod != 0:
+    rateType = 2
+  elif (rateIndex and 0x7C) != 0:
+    rateType = 1
+    rateIndex -= 4
+  # The RF helper stores this encoded byte in an int8, not a signed dBm value.
+  cast[uint8](trpc_get_default_power_idx(rateType, rateIndex))
 
 proc tpc_update_frame_tx_power*(env: pointer, frameDesc: pointer) {.exportc, cdecl.} =
   ## Update TX power for a specific frame.
@@ -188,7 +174,7 @@ proc tpc_update_frame_tx_power*(env: pointer, frameDesc: pointer) {.exportc, cde
   if rateCtrl == nil: return
   let rateCtrlView = hostTxRateTemplateAt(rateCtrl)
   let rate = rateCtrlView.rateWord
-  let txPower = tpc_get_vif_tx_power_vs_rate(0, rate)
+  let txPower = tpc_get_vif_tx_power_vs_rate(rate)
   rateCtrlView.txPower = txPower.int32
 
   ## bl_tpc_power_table_get forward declaration already at line 1209

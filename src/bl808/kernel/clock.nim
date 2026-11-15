@@ -162,5 +162,14 @@ proc deadlineFromNowMs*(ms: uint64): uint64 {.inline.} =
 # C-callable export for lwIP sys_arch.c
 # =============================================================================
 
+var wallClockMsHook*: proc(): uint64 {.nimcall.} = nil
+  ## Optional boot-installed always-on ms source. When set (to the f32k HBN RTC
+  ## via monotonicMsF32k), the ms wall clock stops depending on the CLINT mtime,
+  ## which a WiFi reconnect can transiently freeze from the CPU's side. Installed
+  ## by a hook (not a direct import) to avoid a clock->pds import cycle.
+
 proc kernel_read_tick_ms*(): uint64 {.exportc, cdecl.} =
-  ticksToMs(readTick())
+  ## ms wall clock for nowMs() and lwIP sys_now(). Uses the always-on f32k source
+  ## when installed (freeze-proof); otherwise the CLINT-mtime tick.
+  if wallClockMsHook != nil: wallClockMsHook()
+  else: ticksToMs(readTick())

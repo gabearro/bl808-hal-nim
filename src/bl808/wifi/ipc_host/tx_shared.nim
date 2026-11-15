@@ -1,6 +1,8 @@
 proc ipc_host_txbuf_get*(env: pointer): pointer {.exportc, cdecl.} =
   if env == nil:
     return nil
+  let saved = ipcHostIrqSave()
+  defer: ipcHostIrqRestore(saved)
   let txbuf = loadPtr(env, EnvTxbufOff)
   if txbuf == nil:
     return nil
@@ -27,15 +29,27 @@ proc ipc_host_txdesc_left*(env: pointer; queueIdx, userPos: cint): cint {.export
   discard userPos
   if env == nil:
     return 0
-  let usedIdx = loadU32(env, EnvTxdescUsedIdxOff)
-  let freeIdx = loadU32(env, EnvTxdescFreeIdxOff)
-  cint(NxTxDescCnt - (freeIdx - usedIdx))
+  let saved = ipcHostIrqSave()
+  defer: ipcHostIrqRestore(saved)
+  let freeList = loadPtr(env, EnvListFreeOff)
+  if freeList == nil:
+    return 0
+  var current = loadPtr(freeList, 0)
+  var last: pointer
+  while current != nil and result < NxTxDescCnt.cint:
+    inc result
+    last = current
+    current = loadPtr(current, 0)
+  if current != nil or loadPtr(freeList, 4) != last:
+    return 0
 
 proc ipc_host_txdesc_push*(env, hostId: pointer) {.exportc, cdecl.} =
   inc nimFwDbgIpcTxPushEnter
   if env == nil:
     inc nimFwDbgIpcTxPushEnvNil
     return
+  let saved = ipcHostIrqSave()
+  defer: ipcHostIrqRestore(saved)
   let freeList = loadPtr(env, EnvListFreeOff)
   nimFwDbgIpcFreeHead = cast[uint32](cast[uint](listPick(freeList)))
   let txdesc = listPopFront(freeList)

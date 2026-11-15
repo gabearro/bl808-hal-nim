@@ -9,6 +9,7 @@ const
   BlVifAp = 1
   NxRemoteStaStoreMax = 3
   PbufLinkEncapsulationHlen = 48'u16
+  TxBufferPayloadSize = 1600'u16
   EthAlen = 6'u
   EthHdrSize = 14'u16
   LinkOffsetLen = PbufLinkEncapsulationHlen + EthHdrSize

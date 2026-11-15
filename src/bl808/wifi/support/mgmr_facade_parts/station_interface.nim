@@ -26,6 +26,8 @@ proc wifi_mgmr_sta_readd_firmware_if*(): bool =
 proc wifi_mgmr_sta_enable*(): pointer {.exportc, cdecl.} =
   if not wifiStarted: return nil
   if staEnabled: return staIface()
+  if not beginStationControl(): return nil
+  defer: endStationControl()
   let iface = staIface()
   let nif = ifaceNetif(iface)
   var zeroIp: uint32

@@ -2,27 +2,34 @@
 #                  VIF Management (vif_mgmt_*)
 # ###########################################################################
 
-proc vif_mgmt_entry_init*(vifEntry: pointer) {.exportc, cdecl.} =
+proc vif_mgmt_entry_init*(vifEntry: pointer): bool {.exportc, cdecl.} =
   ## Initialize a VIF entry to default state.
   ## Sets vifType=4 (free), vifIdx/instNbr=127, clears chan_ctxt and lists.
   let vif = vifChannelAt(vifEntry)
+  for vifIdx in 0'u8 ..< MAX_VIFS.uint8:
+    if vifChannelForIdx(vifIdx) == vif:
+      if not rxInvalidateVif(vifIdx): return false
+      break
   vif.vifType = 4
   vif.txPower = 127
   vif.maxTxPower = 127
   vif.chanCtxt = nil
+  true
 
 proc vif_mgmt_add_to_list*(vifEntry: pointer) {.exportc, cdecl.} =
   ## Add VIF entry to the active VIF list and notify platform.
   ## Placeholder: sends notification to platform layer.
   discard
 
-proc vif_mgmt_init*() {.exportc, cdecl.} =
+proc vif_mgmt_init*(): bool {.exportc, cdecl.} =
   ## Initialize VIF management.
   ## From blob (67 instrs): zeroes vif_mgmt_env, inits two CoLists (free + active),
   ## zeroes both VIF entries (1512 bytes each), sets default fields, pushes both
   ## entries onto the free list, then tail-calls co_list_push_back for the second.
   let env = vifMgmtEnvView()
   let vifTabBase = cast[uint](addr vif_info_tab[0])
+  for vifIdx in 0'u8 ..< MAX_VIFS.uint8:
+    if not rxInvalidateVif(vifIdx): return false
 
   # Zero vif_mgmt_env (20 bytes)
   discard c_memset(env, 0, sizeof(VifMgmtEnvView).csize_t)
@@ -67,6 +74,7 @@ proc vif_mgmt_init*() {.exportc, cdecl.} =
 
   # Push VIF entry 1 onto the free list (tail call in blob)
   co_list_push_back(addr env.freeList, cast[ptr CoListHdr](vif1Entry))
+  true
 
 proc vif_mgmt_register*(macAddr: pointer, vifType: uint8, p2p: bool, vifIdxOut: ptr uint8): uint8 {.exportc, cdecl.} =
   ## Register a new VIF (143 instrs).
@@ -78,8 +86,16 @@ proc vif_mgmt_register*(macAddr: pointer, vifType: uint8, p2p: bool, vifIdxOut: 
   ## wpa_cbs[0]->init callback. For AP type: calls mm_hw_ap_info_set on first AP,
   ## increments AP count, calls mm_bcn_init_vif. Then calls td_start and
   ## co_list_push_back to add to active VIF list.
+  if txlResetting(): return 1
   let env = vifMgmtEnvView()
   # Check if VIF management is initialized (vif_mgmt_env[0] = list head)
+  if vifType == VIF_TYPE_AP and (env.apCount != 0 or not mmBeaconPoolIdle()):
+    return 1
+  if vifType == VIF_TYPE_AP:
+    # A detached AP still owns the shared beacon resources until reset.
+    for index in 0'u8 ..< MAX_VIFS.uint8:
+      if vifChannelForIdx(index).vifType == VIF_TYPE_AP:
+        return 1
   let listHead = env.freeList.first
   if listHead == nil:
     return 1
@@ -111,16 +127,17 @@ proc vif_mgmt_register*(macAddr: pointer, vifType: uint8, p2p: bool, vifIdxOut: 
     return 1
   let vifEntry = cast[pointer](freeVifListNode)
   let vif = vifChannelAt(vifEntry)
-  # Set VIF type
-  vif.vifType = vifType
-  # Copy MAC address (6 bytes) to vif+80
-  discard c_memcpy(cast[pointer](addr vif.macAddr[0]), macAddr, 6.csize_t)
   # Find the popped VIF in the typed table.
   var vifIdx = 0'u8
   while vifIdx < MAX_VIFS.uint8 and vifChannelForIdx(vifIdx) != vif:
     inc vifIdx
   if vifIdx >= MAX_VIFS.uint8:
     return 1
+  if not rxInvalidateVif(vifIdx):
+    co_list_push_front(addr env.freeList, freeVifListNode)
+    return 1
+  vif.vifType = vifType
+  discard c_memcpy(cast[pointer](addr vif.macAddr[0]), macAddr, 6.csize_t)
   vif.vifIdx = vifIdx
   # Set default EDCA register constants (matching blob values)
   vif.edcaRegs[0] = 0x0A47'u32
@@ -170,30 +187,66 @@ proc vif_mgmt_register*(macAddr: pointer, vifType: uint8, p2p: bool, vifIdxOut: 
   co_list_push_back(addr env.activeList, cast[ptr CoListHdr](vifEntry))
   return 0
 
-proc vif_mgmt_unregister*(vifIdx: uint8) {.exportc, cdecl.} =
+proc vif_mgmt_unregister*(vifIdx: uint8): bool {.exportc, cdecl, discardable.} =
   ## Unregister a VIF (111 instrs).
   ## From blob: removes VIF from active list, decrements STA/AP count,
   ## clears timers, resets TD, zeroes the VIF entry, reinitializes to free
   ## state, pushes back onto free list, then tail-calls co_list_push_back.
+  if vifIdx >= MAX_VIFS.uint8:
+    return true
+  let saved = irqSave()
+  defer: irqRestore(saved)
   let env = vifMgmtEnvView()
   let vif = vifChannelForIdx(vifIdx)
   let vifEntry = cast[pointer](vif)
-
-  # Remove VIF from active list
-  co_list_extract(addr env.activeList, cast[ptr CoListHdr](vifEntry))
-
-  # Check VIF type and decrement appropriate counter
   let vifType = vif.vifType
+  let entryEpoch = rxVifEpochs[vifIdx]
+  if vifType != VIF_TYPE_STA and vifType != VIF_TYPE_AP:
+    return true
+  if not co_list_find(addr env.activeList, cast[ptr CoListHdr](vifEntry)):
+    return true
+  if vifType == VIF_TYPE_AP:
+    let prepared = apmPrepareVifRemoval(vifIdx)
+    # Starting an asynchronous AP stop can itself advance the RX epoch.
+    if not prepared:
+      return false
+    if rxVifEpochs[vifIdx] != entryEpoch or vif.vifType != vifType or
+        not co_list_find(addr env.activeList, cast[ptr CoListHdr](vifEntry)):
+      return true
+
+  var selected: uint8
+  if not txlHaltVifQueues(vifIdx, selected): return false
+  if vifType == VIF_TYPE_AP and (selected and 0x10'u8) == 0:
+    if not txl_cntrl_halt_ac(4): return false
+    selected = selected or 0x10'u8
+  # Commit removal before any TX completion can reset/register another VIF.
+  co_list_extract(addr env.activeList, cast[ptr CoListHdr](vifEntry))
   if vifType == VIF_TYPE_STA:
-    # Decrement STA count
-    env.staCount = env.staCount - 1
-  elif vifType == VIF_TYPE_AP:
-    # Decrement AP count
-    let newApCnt = env.apCount - 1
-    env.apCount = newApCnt
-    if newApCnt == 0:
-      # Last AP removed: reset HW AP info
-      mm_hw_ap_info_reset(0)
+    dec env.staCount
+  else:
+    dec env.apCount
+  let retiredEpoch = entryEpoch + 1'u32
+  template current(): bool =
+    rxVifEpochs[vifIdx] == retiredEpoch and vif.vifType == vifType and
+      not co_list_find(addr env.activeList, cast[ptr CoListHdr](vifEntry)) and
+      not co_list_find(addr env.freeList, cast[ptr CoListHdr](vifEntry))
+  rxInvalidateQuiescentVif(vifIdx, selected)
+  if not current():
+    return true
+  if vifType == VIF_TYPE_AP:
+    if not mm_bcn_stop(vifEntry):
+      # Keep an incomplete removal visible for the saved request's retry.
+      if current():
+        co_list_push_back(addr env.activeList, cast[ptr CoListHdr](vifEntry))
+        inc env.apCount
+      return false
+    if not current():
+      return true
+
+  if vifType == VIF_TYPE_AP and env.apCount == 0:
+    mm_hw_ap_info_reset(0)
+    if not current():
+      return true
 
   # Check if this was the last VIF (STA+AP count == 1)
   if env.staCount.uint + env.apCount.uint == 1:
@@ -205,40 +258,40 @@ proc vif_mgmt_unregister*(vifIdx: uint8) {.exportc, cdecl.} =
     # Update beacon control from remaining VIF's channel context
     let otherVifIdx = if vifIdx == 0: 1'u8 else: 0'u8
     let otherVif = vifChannelForIdx(otherVifIdx)
-    let bssidLow = otherVif.currentBssid[0].uint32 or
-      (otherVif.currentBssid[1].uint32 shl 8) or
-      (otherVif.currentBssid[2].uint32 shl 16) or
-      (otherVif.currentBssid[3].uint32 shl 24)
-    let bssidHigh = otherVif.currentBssid[4].uint32 or
-      (otherVif.currentBssid[5].uint32 shl 8)
-    regWrite(MACHW_BASE + 0x020'u, bssidLow)
-    regWrite(MACHW_BASE + 0x024'u, bssidHigh)
+    if co_list_find(addr env.activeList, cast[ptr CoListHdr](otherVif)):
+      let bssidLow = otherVif.currentBssid[0].uint32 or
+        (otherVif.currentBssid[1].uint32 shl 8) or
+        (otherVif.currentBssid[2].uint32 shl 16) or
+        (otherVif.currentBssid[3].uint32 shl 24)
+      let bssidHigh = otherVif.currentBssid[4].uint32 or
+        (otherVif.currentBssid[5].uint32 shl 8)
+      regWrite(MACHW_BASE + 0x020'u, bssidLow)
+      regWrite(MACHW_BASE + 0x024'u, bssidHigh)
 
-  # Check if WPA deinit callback should be called (for STA type)
-  var scanIdx: uint8 = 0
-  while scanIdx < MAX_VIFS.uint8:
-    let scanType = vifChannelForIdx(scanIdx).vifType
-    if scanType == VIF_TYPE_STA:
-      break
-    scanIdx += 1
-
-  if scanIdx >= MAX_VIFS.uint8:
-    # No STA VIFs left: call WPA deinit
+  # The vendor dispatches teardown by the VIF being removed.
+  if vifType == VIF_TYPE_STA:
     if wpa_cbs != nil:
       let deinitFn = wpaCallbacks().deinit
       if deinitFn != nil:
-        cast[proc(){.cdecl.}](deinitFn)()
-
-  # Check for AP beacon clear
-  let otherVifType = vifChannelForIdx(if vifIdx == 0: 1'u8 else: 0'u8).vifType
-  if otherVifType == VIF_TYPE_AP:
-    txl_cntrl_clear_bcn_ac()
+        irqRestore(saved)
+        try:
+          cast[proc(){.cdecl.}](deinitFn)()
+        finally:
+          discard irqSave()
+        if not current():
+          return true
 
   mm_timer_clear(addr vif.tbttTimer)
+  if not current():
+    return true
   mm_timer_clear(addr vif.beaconTimeoutTimer)
+  if not current():
+    return true
 
   # Reset traffic detection for this VIF
   td_reset(vifIdx)
+  if not current():
+    return true
 
   # Zero the entire VIF entry (1512 bytes)
   discard c_memset(vifEntry, 0, VIF_ENTRY_SIZE.csize_t)
@@ -253,181 +306,103 @@ proc vif_mgmt_unregister*(vifIdx: uint8) {.exportc, cdecl.} =
 
   # Push entry back onto free list
   co_list_push_back(addr env.freeList, cast[ptr CoListHdr](vifEntry))
+  true
+
+proc vifReuseBipKey(param: pointer; hwKeyIdx: uint8): bool =
+  let req = vifMgmtAddKeyParamView(param)
+  if req == nil or req.keySlot >= MAX_VIFS.uint8 or req.cipherType != 5 or
+      req.staIdx notin [4'u8, 5'u8]:
+    return false
+  let vif = vifChannelForIdx(req.keySlot)
+  let key = vifKeySlot(vif, req.staIdx.uint)
+  if key.installed == 0 or key.cipherType != 5 or key.staIdx != req.staIdx or
+      key.keyIdx != hwKeyIdx or key.keyMaterial != req.ccmpKeyMaterial:
+    return false
+  # Re-selecting an installed key must not reset either direction's counter.
+  vifKeyPointers(vif).groupKeyPtr = vifKeySlotPtr(vif, req.staIdx.uint)
+  true
 
 proc vif_mgmt_add_key*(param: pointer, hwKeyIdx: uint8) {.exportc, cdecl.} =
-  ## Add encryption key for a VIF (185 instructions).
-  ##
-  ## Blob ABI: a0=56-byte key parameter, a1=hardware key index.
-  ##
-  ## param layout (byte offsets from disassembly -- same as mm_sec_machwkey_wr param):
-  ##   [0]   u8: staIndex / MAC address index
-  ##   [8..23]  key material
-  ##   [24..39] RX PN / TKIP MIC key (6 x 32-bit words at [24..47])
-  ##   [44..51] TX/RX sequence counters (2 x 32-bit words)
-  ##   [52]  u8: cipherType (0=WEP40, 1=TKIP, 2/5=CCMP, 3=WEP104)
-  ##   [53]  u8: keyIdx / VIF slot selector
-  ##   [54]  u8: spp
-  ##   [55]  u8: has_rx_pn flag
-  ##
-  ## VIF entry layout (stride = 1512 = 0x5E8 bytes):
-  ##   +528 (0x210): start of per-key entries (8 entries, 16 bytes each = 128 bytes)
-  ##   +656 (0x290): per-key PN low
-  ##   +660 (0x294): per-key PN high
-  ##   +664 (0x298): key material (4 x 32-bit words)
-  ##   +680 (0x2A8): cipher type
-  ##   +681 (0x2A9): sta index
-  ##   +682 (0x2AA): keyIdx (key slot HW index written by mm_sec_machwaddr_wr)
-  ##   +683 (0x2AB): key installed flag
-  ##   +684 (0x2AC): has_rx_pn flag
-  ##   +1488 (0x5D0): default key material pointer
-  ##   +1492 (0x5D4): group key material pointer
-  ##   +1496 (0x5D8): VIF flags
-
+  ## Install one of the VIF's six keys: data slots 0..3 or BIP slots 4..5.
+  ## The historical view names staIdx/keySlot hold key ID/VIF index here.
+  if vifReuseBipKey(param, hwKeyIdx):
+    return
   let req = vifMgmtAddKeyParamView(param)
-  let keySlot = req.keySlot  # s7 in blob = VIF index field from param
-  let staIdx = req.staIdx    # s9
-
-  let vif = vifChannelForIdx(keySlot)
-  let rxKeySlot =
-    if staIdx < 4'u8:
-      staIdx.uint
-    else:
-      0'u
-  let keyView = vifKeySlot(vif, rxKeySlot)
-
-  # Zero the per-key context area at vif+528, 128 bytes before populating the
-  # metadata fields. Clearing after these stores erases cipher/key identity and
-  # leaves group-key RX unable to resolve protected broadcast frames.
+  let vif = vifChannelForIdx(req.keySlot)
+  let keyId = req.staIdx.uint
+  let keyView = vifKeySlot(vif, keyId)
+  # Only the eight replay counters are cleared, not the key metadata/union.
   discard c_memset(cast[pointer](keyView), 0, 128.csize_t)
-
-  # Store hardware key index from a1 to vif+682.
   keyView.keyIdx = hwKeyIdx
-
-  # Copy cipher type from param[34] to vif+680
   let cipherType = req.cipherType
   keyView.cipherType = cipherType
-
-  # Copy sta index from param[0] to vif+681
   keyView.staIdx = req.staIdx
-
-  # Copy has_rx_pn from param[37] to vif+684
-  let hasRxPn = req.hasRxPn
-  keyView.hasRxPn = hasRxPn
-
-  # Dispatch on cipher type
+  keyView.hasRxPn = req.hasRxPn
+  keyView.pnLow = 0
+  keyView.pnHigh = 0
   case cipherType
   of 0, 3:
-    # WEP40 / WEP104: generate random PN, store to vif+656/660
-    # Uses LCG PRNG: next = state * 0x41C64E6D + 0x3039
-    let oldState = rcPrngState
-    rcPrngState = oldState * RC_PRNG_MULT + RC_PRNG_INCR
-    let newState = rcPrngState
-    let pnLo = (newState shr 16).uint32  # top 16 bits as low PN
-    keyView.pnLow = pnLo
-    keyView.pnHigh = 0
-
+    vifKeyPrngState = vifKeyPrngState * RC_PRNG_MULT + RC_PRNG_INCR
+    keyView.pnLow = vifKeyPrngState shr 16
   of 1:
-    # TKIP: zero PN, copy 6 key material words from param[24..47]
-    keyView.pnLow = 0
-    keyView.pnHigh = 0
-    discard c_memcpy(addr keyView.keyMaterial[0],
-                     vifMgmtAddKeyTkipMaterialPtr(req), 16.csize_t)
+    keyView.keyMaterial = req.tkipKeyMaterial
+  of 5:
+    keyView.keyMaterial = req.ccmpKeyMaterial
+  else: discard
 
-  of 2, 5:
-    # CCMP: copy 16 bytes of key material from param[8..23] to vif+664
-    discard c_memcpy(addr keyView.keyMaterial[0],
-                     addr req.ccmpKeyMaterial[0], 16.csize_t)
-    # Zero PN
-    keyView.pnLow = 0
-    keyView.pnHigh = 0
-
-  else:
-    # Unknown cipher: zero PN and clear key context
-    keyView.pnLow = 0
-    keyView.pnHigh = 0
-
-  # Read TX/RX sequence counters from param[44..51] (PN from host)
-  let pnLo = le32(addr req.pnLowBytes)
-  let pnHi = le32(addr req.pnHighBytes)
-
-  if (pnLo or pnHi) != 0:
-    # Host provided a non-zero PN; check if has_rx_pn and cipher != CCMP
-    let curCipher = keyView.cipherType
-    let curHasRxPn = keyView.hasRxPn
-    let seedLooksLikePointer =
-      (pnLo and 0xFF000000'u32) == 0x22000000'u32 or
-      (pnLo and 0xFF000000'u32) == 0x62000000'u32
-    if wifiCipherUsesGroupReplayPn(curCipher, curHasRxPn) and
-        not (wifiCipherIsCcmpGroup(curCipher) and seedLooksLikePointer):
-      # Broadcast PN: replicate to all 8 key context slots
-      # Clear installed flag (will set below)
-      keyView.installed = 0
-      var replayCounterIndex = 0
-      while replayCounterIndex < 8:
-        keyView.replayCounters[replayCounterIndex].pnLow = pnLo
-        keyView.replayCounters[replayCounterIndex].pnHigh = pnHi
-        inc replayCounterIndex
-    else:
-      # Unicast PN: write to per-STA rx reorder context
-      # staIdx * 10 + 33, shifted left 4, offset from the VIF entry.
-      let staReplay = vifKeySlot(vif, staIdx.uint)
-      var replayCounterIndex = 0
-      while replayCounterIndex < 8:
-        staReplay.replayCounters[replayCounterIndex].pnLow = pnLo
-        staReplay.replayCounters[replayCounterIndex].pnHigh = pnHi
-        inc replayCounterIndex
-
-  # Vendor marks the VIF key installed after populating its replay/key state.
-  # Do not call replay_counter_validate here: that helper reads candidate PN
-  # from a1/a2, and a normal Nim one-argument call leaves those registers stale.
+  # WEP ignores the supplied receive PN. Other ciphers store the next PN or
+  # pass the received PN through the window validator, as vif_mgmt.o does.
+  if cipherType notin [0'u8, 3'u8]:
+    let received = le32(addr req.pnLowBytes).uint64 or
+      (le32(addr req.pnHighBytes).uint64 shl 32)
+    if received != 0:
+      if wifiKeyUsesDirectReplayPn(cipherType, req.hasRxPn):
+        let nextPn = received + 1'u64
+        for counter in keyView.replayCounters.mitems:
+          counter.pnLow = (nextPn and 0xFFFFFFFF'u64).uint32
+          counter.pnHigh = (nextPn shr 32).uint32
+      else:
+        for counter in keyView.replayCounters.mitems:
+          discard replay_counter_validate(addr counter, received)
   keyView.installed = 1
-
-  # If cipher type is CCMP, update the CCMP key material pointer.
-  let installedCipher = keyView.cipherType
+  rxMgtReplayReset(cast[pointer](keyView))
   let keyPtrs = vifKeyPointers(vif)
-  if wifiCipherIsCcmpGroup(installedCipher):
-    # Store pointer to the active GTK context. RX protected data frames select
-    # the same VIF slot from the CCMP key-id bits.
-    keyPtrs.groupKeyPtr = vifKeySlotPtr(vif, rxKeySlot)
+  if wifiCipherIsBip(cipherType):
+    keyPtrs.groupKeyPtr = vifKeySlotPtr(vif, keyId)
   else:
-    # Store to vif+1480 (default key pointer)
-    keyPtrs.defaultKeyPtr = vifKeySlotPtr(vif, rxKeySlot)
+    keyPtrs.defaultKeyPtr = vifKeySlotPtr(vif, keyId)
 
 proc vif_mgmt_del_key*(vifEntry: pointer, keySlot: uint8) {.exportc, cdecl, noinline.} =
-  ## Delete encryption key for a VIF (35 instrs).
-  ## noinline: blob calls this from mm_sec_machwkey_del.
-  ## From blob: a0=vifEntry pointer, a1=keySlot index.
-  ## Computes key context offset = keySlot * 160 + 528 within VIF entry.
-  ## Clears the key valid flag at vif[keyOffset + 675-520] = vif[keySlot*160+675].
-  ## Then checks if vif+1488 (default TX key ptr) points to this key context.
-  ## If so, scans other key slots (0..3) for a valid key to replace it.
-  ## If no valid key found, clears vif+1488. Similarly checks vif+1492 (group key).
+  ## Invalidate the key and select the first remaining data/BIP replacement.
   {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
   let vif = vifChannelAt(vifEntry)
   let keySlotU = keySlot.uint
   let keyView = vifKeySlot(vif, keySlotU)
   let keyPtrs = vifKeyPointers(vif)
+  rxMgtReplayForget(cast[pointer](keyView))
   # Clear key valid flag
   keyView.installed = 0
   # Check if this was the default TX key (vif+1488)
   let defaultKeyPtr = keyPtrs.defaultKeyPtr
-  let thisKeyBase = vifKeySlotPtr(vif, keySlotU)
-  if defaultKeyPtr == thisKeyBase:
+  var candidate = vifKeySlotPtr(vif, keySlotU)
+  if defaultKeyPtr == candidate:
     # This key was the default; find replacement
     keyPtrs.defaultKeyPtr = 0
     # Scan slots 0..3 for a valid key
     for replacementKeySlotIndex in 0'u .. 3'u:
+      candidate = vifKeySlotPtr(vif, replacementKeySlotIndex)
       let slotValid = vifKeySlot(vif, replacementKeySlotIndex).installed
       if slotValid != 0:
-        keyPtrs.defaultKeyPtr = vifKeySlotPtr(vif, replacementKeySlotIndex)
-        break
-  # Check group key pointer (vif+1484)
+        keyPtrs.defaultKeyPtr = candidate
+        return
+  # Vendor retains the last data candidate if no replacement was found.
   let groupKeyPtr = keyPtrs.groupKeyPtr
-  if groupKeyPtr == thisKeyBase:
-    # Scan for replacement group key
-    let validFlag = vifKeySlot(vif, keySlotU + 4'u).installed
-    if validFlag == 0:
-      keyPtrs.groupKeyPtr = 0
+  if groupKeyPtr == candidate:
+    keyPtrs.groupKeyPtr = 0
+    for replacementKeySlotIndex in 4'u .. 5'u:
+      if vifKeySlot(vif, replacementKeySlotIndex).installed != 0:
+        keyPtrs.groupKeyPtr = vifKeySlotPtr(vif, replacementKeySlotIndex)
+        break
 
 proc vif_mgmt_send_postponed_frame*(vifEntry: pointer) {.exportc, cdecl.} =
   ## Flush the per-VIF postponed-STA list by calling
@@ -440,12 +415,41 @@ proc vif_mgmt_send_postponed_frame*(vifEntry: pointer) {.exportc, cdecl.} =
   ##     s0 = *(u32*)s0                          ; next
   ## Prior Nim bug: called txl_cntrl_push_int(0, cur) — completely wrong:
   ## it would try to push STA list nodes as TX frames.
-  let vif = vifChannelAt(vifEntry)
-  var postponedStaNode = vif.postponedStaHead
-  while postponedStaNode != nil:
-    let nextPostponedStaNode = cast[pointer](cast[ptr CoListHdr](postponedStaNode).next)
-    discard sta_mgmt_send_postponed_frame(vifEntry, postponedStaNode, 0'u32)
-    postponedStaNode = nextPostponedStaNode
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  var vifIndex = 0'u8
+  while vifIndex < MAX_VIFS.uint8 and
+      cast[pointer](vifChannelForIdx(vifIndex)) != vifEntry:
+    inc vifIndex
+  if vifIndex >= MAX_VIFS.uint8: return
+  let vif = vifChannelForIdx(vifIndex)
+  let vifEpoch = rxVifEpochs[vifIndex]
+  let resetEpoch = txResetEpoch
+  # Snapshot identities before a completion can unlink or replace another STA.
+  var owners: array[STA_INFO_TAB_ENTRIES, StaQueueIdentity]
+  var count = 0
+  var seen = 0'u32
+  var node = vif.postponedStaHead
+  while node != nil:
+    var station = 0'u8
+    while station < STA_INFO_TAB_ENTRIES.uint8 and
+        cast[pointer](staInfoForIdx(station)) != node:
+      inc station
+    if station >= STA_INFO_TAB_ENTRIES.uint8 or
+        (seen and (1'u32 shl station)) != 0:
+      return
+    seen = seen or (1'u32 shl station)
+    let owner = staPostponedOwner(node)
+    if not owner.vifTracked or owner.vif != vifIndex: return
+    owners[count] = owner
+    inc count
+    node = cast[pointer](cast[ptr CoListHdr](node).next)
+  for index in 0 ..< count:
+    if rxVifEpochs[vifIndex] != vifEpoch or txResetEpoch != resetEpoch: return
+    let owner = owners[index]
+    if staPostponedOwnerCurrent(owner) and
+        co_list_find(vifPostponedStaList(vif), cast[ptr CoListHdr](owner.entry)):
+      discard sta_mgmt_send_postponed_frame(vifEntry, owner.entry, 0'u32)
 
 proc vif_mgmt_reset*() {.exportc, cdecl.} =
   ## "Reset" step in the VIF-management path.
@@ -457,11 +461,31 @@ proc vif_mgmt_reset*() {.exportc, cdecl.} =
   ## Prior Nim bug: walked the active-vif list but called
   ## vif_mgmt_entry_init (reinit fields) instead of flushing postponed frames.
   ## That would corrupt live VIF state on every reset-trigger path.
-  var activeVifNode = cast[pointer](vifMgmtEnvView().activeList.first)
-  while activeVifNode != nil:
-    let nextActiveVifNode = vifChannelAt(activeVifNode).next
-    vif_mgmt_send_postponed_frame(activeVifNode)
-    activeVifNode = nextActiveVifNode
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  let resetEpoch = txResetEpoch
+  let active = addr vifMgmtEnvView().activeList
+  var owners: array[MAX_VIFS, tuple[index: uint8, epoch: uint32]]
+  var count = 0
+  var seen = 0'u32
+  var node = cast[pointer](active.first)
+  while node != nil:
+    var index = 0'u8
+    while index < MAX_VIFS.uint8 and
+        cast[pointer](vifChannelForIdx(index)) != node:
+      inc index
+    if index >= MAX_VIFS.uint8 or (seen and (1'u32 shl index)) != 0: return
+    seen = seen or (1'u32 shl index)
+    owners[count] = (index, rxVifEpochs[index])
+    inc count
+    node = vifChannelForIdx(index).next
+  for index in 0 ..< count:
+    if txResetEpoch != resetEpoch: return
+    let owner = owners[index]
+    let vif = vifChannelForIdx(owner.index)
+    if rxVifEpochs[owner.index] == owner.epoch and
+        co_list_find(active, cast[ptr CoListHdr](vif)):
+      vif_mgmt_send_postponed_frame(cast[pointer](vif))
 
 proc vif_mgmt_bcn_recv*(vifEntry: pointer) {.exportc, cdecl.} =
   ## Beacon received for a VIF.
@@ -544,6 +568,18 @@ proc vif_mgmt_set_ap_bcn_int*(vifEntry: pointer, interval: uint16) {.exportc, cd
 proc vif_mgmt_switch_channel*(vifIdx: uint8, param: pointer) {.exportc, cdecl.} =
   ## Switch channel for a VIF.
   discard
+
+proc vif_mgmt_sta_status*(vifIdx: uint8; mac: pointer): cint {.exportc, cdecl.} =
+  ## -1: no matching STA interface; 0: inactive; 1: station resources in use.
+  if vifIdx >= MAX_VIFS.uint8 or mac == nil: return -1
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  let vif = vifChannelForIdx(vifIdx)
+  if vif.vifType != VIF_TYPE_STA or vif.vifIdx != vifIdx or
+      not co_list_find(addr vifMgmtEnvView().activeList, cast[ptr CoListHdr](vif)) or
+      c_memcmp(addr vif.macAddr[0], mac, 6) != 0:
+    return -1
+  if vif.state == 0 and vif.staIdx == 0xFF and vif.chanCtxt == nil: 0 else: 1
 
 proc vif_mgmt_get_vif*(vifIdx: uint8): pointer {.exportc, cdecl, noinline.} =
   ## Get VIF info pointer by index.

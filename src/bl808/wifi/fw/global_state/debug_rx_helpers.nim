@@ -6,16 +6,21 @@ proc nimFwDbgRxuDupDropBreakpoint*() {.exportc: "nimfw_dbg_rxu_dup_drop_breakpoi
     cdecl, noinline.} =
   inc nimFwDbgRxuDupBreakHits
 
+proc rxDebugMsduLength(machdrLen: uint8; frameLen: uint16): uint32 {.inline.} =
+  # Diagnostics borrow only the first DMA buffer, not the complete chain.
+  let available = min(frameLen.uint32, sizeof(RxPayloadBufferView).uint32)
+  if available > machdrLen.uint32: available - machdrLen.uint32 else: 0'u32
+
 proc nimFwDbgRxuIpv4Preupload(frame: ptr MacDataFrameHeaderView;
                               machdrLen, tid: uint8;
                               frameLen: uint16) {.noinline.} =
-  if frameLen.uint32 < machdrLen.uint32 + sizeof(LlcSnapHeaderView).uint32 + 20'u32:
+  let msduLen = rxDebugMsduLength(machdrLen, frameLen)
+  if msduLen < sizeof(LlcSnapHeaderView).uint32 + 20'u32:
     return
   let msduView = rxMsduView(frame, machdrLen)
   let msdu = addr msduView.snap
   if not rxSnapIsRfc1042(msdu) or msdu.ethertype != 0x0008'u16:
     return
-  let msduLen = frameLen.uint32 - machdrLen.uint32
   let ipPayload = cast[ptr UncheckedArray[uint8]](rxMsduPayload(msduView))
   let version = ipPayload[0] shr 4
   let ihl = (ipPayload[0].uint32 and 0x0F'u32) shl 2
@@ -53,11 +58,11 @@ proc nimFwDbgRxuIpv4Preupload(frame: ptr MacDataFrameHeaderView;
 
 proc nimFwDbgRxuDhcpMsg(frame: ptr MacDataFrameHeaderView; machdrLen: uint8;
                         frameLen: uint16): uint32 {.noinline.} =
-  if frameLen.uint32 < machdrLen.uint32 + sizeof(LlcSnapHeaderView).uint32:
+  let msduLen = rxDebugMsduLength(machdrLen, frameLen)
+  if msduLen < sizeof(LlcSnapHeaderView).uint32:
     return 0
   let msduView = rxMsduView(frame, machdrLen)
   let msdu = addr msduView.snap
-  let msduLen = frameLen.uint32 - machdrLen.uint32
   let ipPayload = cast[ptr UncheckedArray[uint8]](rxMsduPayload(msduView))
   if not rxSnapIsRfc1042(msdu) or msdu.ethertype != 0x0008'u16 or
       msduLen < 28'u32:
@@ -72,7 +77,7 @@ proc nimFwDbgRxuDhcpMsg(frame: ptr MacDataFrameHeaderView; machdrLen: uint8;
     return 0
   let bootp = cast[pointer](cast[uint](udp) + 8'u)
   var optOff = cast[uint](bootp) + 240'u
-  let optEnd = cast[uint](ipPayload) + msduLen.uint
+  let optEnd = cast[uint](ipPayload) + msduLen.uint - sizeof(LlcSnapHeaderView).uint
   var guard = 0
   while optOff < optEnd and guard < 64:
     inc guard
@@ -96,6 +101,7 @@ proc nimFwDbgRecordRxuDupDrop(frame: ptr MacDataFrameHeaderView; hwFlags: uint32
                               cachedSeq: uint16; frameLen: uint16) {.noinline.} =
   let dupTraceSlot = int(nimFwDbgRxuDupTraceCount mod RxuDupTraceEntries.uint32)
   inc nimFwDbgRxuDupTraceCount
+  let msduLen = rxDebugMsduLength(machdrLen, frameLen)
   let msduView = rxMsduView(frame, machdrLen)
   let msdu = addr msduView.snap
   nimFwDbgRxuDupTraceFc[dupTraceSlot] = frame.frameControl.uint32 or
@@ -103,8 +109,10 @@ proc nimFwDbgRecordRxuDupDrop(frame: ptr MacDataFrameHeaderView; hwFlags: uint32
   nimFwDbgRxuDupTraceSeq[dupTraceSlot] = envSeq.uint32 or
     (tid.uint32 shl 16) or (machdrLen.uint32 shl 24)
   nimFwDbgRxuDupTraceCache[dupTraceSlot] = cachedSeq.uint32
-  nimFwDbgRxuDupTraceSnapLo[dupTraceSlot] = rxSnapTraceLo(msdu)
-  nimFwDbgRxuDupTraceSnapHi[dupTraceSlot] = rxSnapTraceHi(msdu)
+  nimFwDbgRxuDupTraceSnapLo[dupTraceSlot] =
+    if msduLen >= sizeof(LlcSnapHeaderView).uint32: rxSnapTraceLo(msdu) else: 0'u32
+  nimFwDbgRxuDupTraceSnapHi[dupTraceSlot] =
+    if msduLen >= sizeof(LlcSnapHeaderView).uint32: rxSnapTraceHi(msdu) else: 0'u32
   nimFwDbgRxuDupTraceAddr0[dupTraceSlot] = debugLoadLe32(addr frame.addr1[0])
   nimFwDbgRxuDupTraceAddr1[dupTraceSlot] = debugLoadLe32(addr frame.addr2[0])
   nimFwDbgRxuDupTraceIp0[dupTraceSlot] = 0
@@ -114,8 +122,7 @@ proc nimFwDbgRecordRxuDupDrop(frame: ptr MacDataFrameHeaderView; hwFlags: uint32
   nimFwDbgRxuDupTraceBootpYiaddr[dupTraceSlot] = 0
   nimFwDbgRxuDupTraceDhcpMsg[dupTraceSlot] = 0
   nimFwDbgRxuDupTraceDhcpServer[dupTraceSlot] = 0
-  if frameLen.uint32 >= machdrLen.uint32 + sizeof(LlcSnapHeaderView).uint32:
-    let msduLen = frameLen.uint32 - machdrLen.uint32
+  if msduLen >= sizeof(LlcSnapHeaderView).uint32:
     let ipPayload = cast[ptr UncheckedArray[uint8]](rxMsduPayload(msduView))
     if rxSnapIsRfc1042(msdu) and msdu.ethertype == 0x0008'u16 and msduLen >= 28'u32:
       nimFwDbgRxuDupTraceIp0[dupTraceSlot] = debugLoadLe32(cast[pointer](ipPayload))
@@ -133,7 +140,7 @@ proc nimFwDbgRecordRxuDupDrop(frame: ptr MacDataFrameHeaderView; hwFlags: uint32
               debugLoadLe32(cast[pointer](cast[uint](bootp) + 16'u))
           if msduLen >= sizeof(LlcSnapHeaderView).uint32 + ihl + 8'u32 + 240'u32:
             var optOff = cast[uint](bootp) + 240'u
-            let optEnd = cast[uint](ipPayload) + msduLen.uint
+            let optEnd = cast[uint](ipPayload) + msduLen.uint - sizeof(LlcSnapHeaderView).uint
             var guard = 0
             while optOff < optEnd and guard < 64:
               inc guard
@@ -161,6 +168,7 @@ proc nimFwDbgRecordRxuPnDrop(frame: ptr MacDataFrameHeaderView; hwFlags: uint32;
                              frameLen: uint16) {.noinline.} =
   let pnDropTraceSlot = int(nimFwDbgRxuPnDropTraceCount mod RxuPnDropTraceEntries.uint32)
   inc nimFwDbgRxuPnDropTraceCount
+  let msduLen = rxDebugMsduLength(machdrLen, frameLen)
   let env = rxuCntrlEnvView()
   let msduView = rxMsduView(frame, machdrLen)
   let msdu = addr msduView.snap
@@ -172,14 +180,15 @@ proc nimFwDbgRecordRxuPnDrop(frame: ptr MacDataFrameHeaderView; hwFlags: uint32;
   nimFwDbgRxuPnDropTracePnHi[pnDropTraceSlot] = env.secInfo1
   nimFwDbgRxuPnDropTraceStoredLo[pnDropTraceSlot] = nimFwDbgRxuPnStoredLo
   nimFwDbgRxuPnDropTraceStoredHi[pnDropTraceSlot] = nimFwDbgRxuPnStoredHi
-  nimFwDbgRxuPnDropTraceSnapLo[pnDropTraceSlot] = rxSnapTraceLo(msdu)
-  nimFwDbgRxuPnDropTraceSnapHi[pnDropTraceSlot] = rxSnapTraceHi(msdu)
+  nimFwDbgRxuPnDropTraceSnapLo[pnDropTraceSlot] =
+    if msduLen >= sizeof(LlcSnapHeaderView).uint32: rxSnapTraceLo(msdu) else: 0'u32
+  nimFwDbgRxuPnDropTraceSnapHi[pnDropTraceSlot] =
+    if msduLen >= sizeof(LlcSnapHeaderView).uint32: rxSnapTraceHi(msdu) else: 0'u32
   nimFwDbgRxuPnDropTraceUdp0[pnDropTraceSlot] = 0
   nimFwDbgRxuPnDropTraceBootpYiaddr[pnDropTraceSlot] = 0
   nimFwDbgRxuPnDropTraceDhcpMsg[pnDropTraceSlot] = 0
   nimFwDbgRxuPnDropTraceDhcpServer[pnDropTraceSlot] = 0
-  if frameLen.uint32 >= machdrLen.uint32 + sizeof(LlcSnapHeaderView).uint32:
-    let msduLen = frameLen.uint32 - machdrLen.uint32
+  if msduLen >= sizeof(LlcSnapHeaderView).uint32:
     let ipPayload = cast[ptr UncheckedArray[uint8]](rxMsduPayload(msduView))
     if rxSnapIsRfc1042(msdu) and msdu.ethertype == 0x0008'u16 and msduLen >= 28'u32:
       let ihl = (ipPayload[0].uint32 and 0x0F'u32) shl 2
@@ -192,7 +201,7 @@ proc nimFwDbgRecordRxuPnDrop(frame: ptr MacDataFrameHeaderView; hwFlags: uint32;
             debugLoadLe32(cast[pointer](cast[uint](bootp) + 16'u))
           if msduLen >= sizeof(LlcSnapHeaderView).uint32 + ihl + 8'u32 + 240'u32:
             var optOff = cast[uint](bootp) + 240'u
-            let optEnd = cast[uint](ipPayload) + msduLen.uint
+            let optEnd = cast[uint](ipPayload) + msduLen.uint - sizeof(LlcSnapHeaderView).uint
             var guard = 0
             while optOff < optEnd and guard < 64:
               inc guard
@@ -219,6 +228,7 @@ proc nimFwDbgRecordRxuPnAccept(stage: uint32; frame: ptr MacDataFrameHeaderView;
                                tid, machdrLen: uint8; frameLen: uint16) {.noinline.} =
   let pnAcceptTraceSlot = int(nimFwDbgRxuPnAcceptTraceCount mod RxuPnAcceptTraceEntries.uint32)
   inc nimFwDbgRxuPnAcceptTraceCount
+  let msduLen = rxDebugMsduLength(machdrLen, frameLen)
   let env = rxuCntrlEnvView()
   let msduView = rxMsduView(frame, machdrLen)
   let msdu = addr msduView.snap
@@ -233,14 +243,15 @@ proc nimFwDbgRecordRxuPnAccept(stage: uint32; frame: ptr MacDataFrameHeaderView;
   nimFwDbgRxuPnAcceptTraceStoredHi[pnAcceptTraceSlot] = nimFwDbgRxuPnStoredHi
   nimFwDbgRxuPnAcceptTraceNextLo[pnAcceptTraceSlot] = nimFwDbgRxuPnNextLo
   nimFwDbgRxuPnAcceptTraceNextHi[pnAcceptTraceSlot] = nimFwDbgRxuPnNextHi
-  nimFwDbgRxuPnAcceptTraceSnapLo[pnAcceptTraceSlot] = rxSnapTraceLo(msdu)
-  nimFwDbgRxuPnAcceptTraceSnapHi[pnAcceptTraceSlot] = rxSnapTraceHi(msdu)
+  nimFwDbgRxuPnAcceptTraceSnapLo[pnAcceptTraceSlot] =
+    if msduLen >= sizeof(LlcSnapHeaderView).uint32: rxSnapTraceLo(msdu) else: 0'u32
+  nimFwDbgRxuPnAcceptTraceSnapHi[pnAcceptTraceSlot] =
+    if msduLen >= sizeof(LlcSnapHeaderView).uint32: rxSnapTraceHi(msdu) else: 0'u32
   nimFwDbgRxuPnAcceptTraceUdp0[pnAcceptTraceSlot] = 0
   nimFwDbgRxuPnAcceptTraceBootpYiaddr[pnAcceptTraceSlot] = 0
   nimFwDbgRxuPnAcceptTraceDhcpMsg[pnAcceptTraceSlot] = 0
   nimFwDbgRxuPnAcceptTraceDhcpServer[pnAcceptTraceSlot] = 0
-  if frameLen.uint32 >= machdrLen.uint32 + sizeof(LlcSnapHeaderView).uint32:
-    let msduLen = frameLen.uint32 - machdrLen.uint32
+  if msduLen >= sizeof(LlcSnapHeaderView).uint32:
     let ipPayload = cast[ptr UncheckedArray[uint8]](rxMsduPayload(msduView))
     if rxSnapIsRfc1042(msdu) and msdu.ethertype == 0x0008'u16 and msduLen >= 28'u32:
       let ihl = (ipPayload[0].uint32 and 0x0F'u32) shl 2
@@ -253,7 +264,7 @@ proc nimFwDbgRecordRxuPnAccept(stage: uint32; frame: ptr MacDataFrameHeaderView;
             debugLoadLe32(cast[pointer](cast[uint](bootp) + 16'u))
           if msduLen >= sizeof(LlcSnapHeaderView).uint32 + ihl + 8'u32 + 240'u32:
             var optOff = cast[uint](bootp) + 240'u
-            let optEnd = cast[uint](ipPayload) + msduLen.uint
+            let optEnd = cast[uint](ipPayload) + msduLen.uint - sizeof(LlcSnapHeaderView).uint
             var guard = 0
             while optOff < optEnd and guard < 64:
               inc guard

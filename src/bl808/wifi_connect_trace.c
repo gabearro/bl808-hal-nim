@@ -6,6 +6,7 @@
  * during station connect and intentionally avoids printing key material.
  */
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include <bl_os_adapter/bl_os_system.h>
@@ -31,7 +32,7 @@ void __real_txl_frame_push(void *frame, uint8_t ac);
 void __real_txl_frame_push_force(void *frame, uint8_t ac);
 void __real_txl_frame_cfm(void *frame);
 void __real_txl_cfm_push(void *desc, uint32_t status, uint32_t ac);
-void __real_txu_cntrl_push(void *desc, uint8_t ac);
+bool __real_txu_cntrl_push(void *desc, uint8_t ac);
 uint8_t __real_txl_cntrl_push(void *desc, uint8_t ac);
 unsigned long __real_rxu_cntrl_frame_handle(void *param);
 void __real_sm_handle_eapol_input(uint8_t sta_idx, void *src_addr,
@@ -672,10 +673,10 @@ void __wrap_txl_cfm_push(void *desc, uint32_t status, uint32_t ac)
     __real_txl_cfm_push(desc, status, ac);
 }
 
-void __wrap_txu_cntrl_push(void *desc, uint8_t ac)
+bool __wrap_txu_cntrl_push(void *desc, uint8_t ac)
 {
     trace_tx_eapol_desc("txu-pre", desc, ac, 0, 0);
-    __real_txu_cntrl_push(desc, ac);
+    return __real_txu_cntrl_push(desc, ac);
 }
 
 uint8_t __wrap_txl_cntrl_push(void *desc, uint8_t ac)

@@ -1,18 +1,25 @@
 proc ipc_host_msg_push*(env, msgBuf: pointer; len: uint16): cint {.exportc, cdecl.} =
   if env == nil or msgBuf == nil:
     return -1
+  let copyLen = len.uint32
+  if copyLen < LmacMsgHeaderSize or roundUp4(copyLen) > SharedMsgBodySize:
+    return -1
+  let saved = ipcHostIrqSave()
+  defer: ipcHostIrqRestore(saved)
   let sharedEnv = loadPtr(env, EnvSharedOff)
   let msg = loadPtr(msgBuf, BlCmdA2eMsgOff)
-  let copyLen = len.uint32
   if sharedEnv == nil or msg == nil:
     return -1
   if loadPtr(env, EnvMsgA2eHostidOff) != nil:
     return -1
-  if roundUp4(copyLen) > SharedMsgBodySize:
+  if loadU32(msg, LmacMsgParamLenOff) != copyLen - LmacMsgHeaderSize:
     return -1
 
-  storeU8(msg, LmacMsgSrcIdOff, loadU8(env, EnvMsgA2eCntOff))
-  discard c_memcpy(ptrAt(sharedEnv, SharedMsgBodyOff), msg, roundUp4(copyLen).csize_t)
+  discard c_memcpy(ptrAt(sharedEnv, SharedMsgBodyOff), msg, copyLen.csize_t)
+  # Alignment padding belongs to shared storage, not the caller's allocation.
+  let padding = roundUp4(copyLen) - copyLen
+  if padding != 0:
+    discard c_memset(ptrAt(sharedEnv, SharedMsgBodyOff + copyLen.uint), 0, padding.csize_t)
   storePtr(env, EnvMsgA2eHostidOff, msgBuf)
   regWrite(IpcApp2EmbTrigger, IpcIrqA2eMsg)
   0

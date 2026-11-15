@@ -49,23 +49,23 @@ proc eapolDataFrame(payloadLen: int): seq[uint8] =
   putLe16(result, snap + 6, 0x8E88'u16)
 
 proc checkStructured() =
-  let authOk = replayClassifyRxuMgtInd(authInd(), ReplaySmAuthStartingState)
+  let authOk = replayClassifyRxuMgtInd(authInd(), ReplaySmAuthWaitState)
   doAssert authOk.kind == wrAuthOpenSuccess
   doAssert authOk.seq == 2
-  doAssert replayClassifyRxuMgtInd(authInd(), ReplaySmAuthenticatingState).kind ==
+  doAssert replayClassifyRxuMgtInd(authInd(), ReplaySmAssocWaitState).kind ==
     wrAuthDroppedWrongState
 
-  let assocOk = replayClassifyRxuMgtInd(assocInd(), ReplaySmAuthenticatingState)
+  let assocOk = replayClassifyRxuMgtInd(assocInd(), ReplaySmAssocWaitState)
   doAssert assocOk.kind == wrAssocSuccess
   doAssert assocOk.aid == 7
-  doAssert replayClassifyRxuMgtInd(assocInd(), ReplaySmAuthStartingState).kind ==
+  doAssert replayClassifyRxuMgtInd(assocInd(), ReplaySmAuthWaitState).kind ==
     wrAssocDroppedWrongState
 
   let eap = replayClassifyDataFrame(eapolDataFrame(99))
   doAssert eap.kind == wrEapol
   doAssert eap.eapolLen == 99
   doAssert replayClassifyDataFrameForState(
-    eapolDataFrame(99), ReplaySmAuthStartingState).kind == wrIgnored
+    eapolDataFrame(99), ReplaySmAuthWaitState).kind == wrIgnored
   doAssert replayClassifyDataFrameForState(
     eapolDataFrame(99), ReplaySmActivatingState).kind == wrEapol
 

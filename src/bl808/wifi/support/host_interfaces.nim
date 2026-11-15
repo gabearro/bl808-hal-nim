@@ -30,6 +30,7 @@ proc bl_main_disconnect(): cint {.importc, cdecl.}
 proc bl_main_phy_up(): cint {.importc, cdecl.}
 proc bl_send_reset(blHw: ptr BlHw): cint {.importc, cdecl.}
 proc wifiCmdMgrRecoverIfCrashed(cmdMgr: pointer): bool {.importc, cdecl.}
+proc wifiCmdMgrReady(cmdMgr: pointer): bool {.importc, cdecl.}
 proc bl_main_apm_start(ssid, password: cstring; channel: cint; hiddenSsid: uint8;
                        bcnInt: uint16): cint {.importc, cdecl.}
 proc bl_main_apm_stop(): cint {.importc, cdecl.}
@@ -38,7 +39,7 @@ proc mpif_clk_init() {.importc, cdecl.}
 proc sysctrl_init() {.importc, cdecl.}
 proc intc_init() {.importc, cdecl.}
 proc ipc_emb_init() {.importc, cdecl.}
-proc bl_init() {.importc, cdecl.}
+proc bl_init(): bool {.importc, cdecl.}
 proc bl_pm_ops_register() {.importc, cdecl.}
 proc ke_evt_set(events: uint32) {.importc, cdecl.}
 proc wifi_main_poll_once() {.importc, cdecl.}

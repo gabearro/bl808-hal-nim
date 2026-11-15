@@ -22,12 +22,13 @@ proc bl808WifiBackendDriveRfStatus() =
 template macServiceIrqSave(): uint32 =
   block:
     var prev {.gensym.}: uint32
-    {.emit: ["asm volatile(\"csrrci %0, mstatus, 8\" : \"=r\"(", prev, ") );"].}
+    # Keep shared-memory accesses inside the interrupt-protected region.
+    {.emit: ["asm volatile(\"csrrci %0, mstatus, 8\" : \"=r\"(", prev, ") :: \"memory\");"].}
     prev
 
 template macServiceIrqRestore(prev: uint32) =
   if (prev and 8) != 0:
-    {.emit: ["asm volatile(\"csrsi mstatus, 8\");"].}
+    {.emit: ["asm volatile(\"csrsi mstatus, 8\" ::: \"memory\");"].}
 
 proc bl808WifiBackendPollMacIrq() =
   ## Thread-context MAC servicing. mac_irq()/hal_machw_gen_handler() mutate

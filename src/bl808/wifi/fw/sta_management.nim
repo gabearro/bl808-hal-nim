@@ -2,6 +2,32 @@
 #                  STA Management (sta_mgmt_*)
 # ###########################################################################
 
+proc staDeleteEpoch(staIdx: uint8): uint32 =
+  if staIdx < STA_MGMT_FREE_STAS.uint8: staDeleteEpochs[staIdx] else: 0
+
+proc staDeleteIsCurrent(staIdx: uint8, epoch: uint32): bool =
+  staIdx < STA_MGMT_FREE_STAS.uint8 and staDeleteEpochs[staIdx] == epoch and
+    staInfoForIdx(staIdx).valid != 0
+
+proc staDeleteInvalidate(staIdx: uint8) =
+  if staIdx >= STA_MGMT_FREE_STAS.uint8:
+    return
+  # Keep request ownership and reply routing, but cancel its obsolete target.
+  let saved = irqSave()
+  inc staDeleteEpochs[staIdx]
+  for queue in [addr keMsgQueueSent, addr keMsgQueueSaved]:
+    var node = queue.first
+    while node != nil:
+      let header = cast[ptr KeMsgHdr](node)
+      if ((header.id == MM_STA_DEL_REQ and header.destId == TASK_MM) or
+          (header.id == ME_STA_DEL_REQ and header.destId == TASK_ME)) and
+         header.paramLen >= MeStaDelReqPayloadSize:
+        let request = cast[ptr MeStaDelReqPayload](keMsgPayload(header))
+        if request.staIdx == staIdx:
+          request.staIdx = 0xFF
+      node = node.next
+  irqRestore(saved)
+
 proc sta_mgmt_init*() {.exportc, cdecl.} =
   ## Initialize station management (84 instrs).
   ## From blob: calls co_list_init(&sta_info_env). Loops over the five normal
@@ -16,54 +42,106 @@ proc sta_mgmt_init*() {.exportc, cdecl.} =
   var freeStaIndex = 0'u8
   while freeStaIndex < STA_MGMT_FREE_STAS.uint8:
     let sta = staInfoForIdx(freeStaIndex)
-    sta_mgmt_entry_init(cast[pointer](sta))
+    if not staMgmtResetEntry(staPostponedOwner(cast[pointer](sta)), false):
+      return
     co_list_push_back(addr sta_info_env, cast[ptr CoListHdr](sta))
     inc freeStaIndex
 
   # Initialize broadcast STA entry for VIF 0.
   let bcStaVif0 = staInfoForIdx(STA_MGMT_FREE_STAS.uint8)
-  sta_mgmt_entry_init(cast[pointer](bcStaVif0))
+  if not staMgmtResetEntry(staPostponedOwner(cast[pointer](bcStaVif0)), false):
+    return
   bcStaVif0.instNbr = 0
   bcStaVif0.controlPortState = 0
   bcStaVif0.txPolicy = cast[pointer](txBufferControlBcmcDescAt(0))
-  bcStaVif0.keyMat = cast[pointer](vifKeyPointers(vifChannelForIdx(0)))
+  let keysVif0 = vifKeyPointers(vifChannelForIdx(0))
+  bcStaVif0.keyMat = cast[pointer](keysVif0)
   # Log
   let logFn = getLogFunc(204)
   if logFn != nil:
-    cast[proc(a0: uint32, a1: uint32, a2: pointer, a3: uint32, a4: uint32){.cdecl.}](logFn)(
-      2, 0, nil, 157, 157)
+    cast[proc(level: uint32; tag, file: cstring; line: cint;
+              format: cstring) {.cdecl, varargs.}](logFn)(
+      2, nil, "sta_mgmt.c", 157, "------ set default key %p, key ptr %p\r\n",
+      cast[pointer](keysVif0), cast[pointer](keysVif0.defaultKeyPtr.uint))
 
   # Initialize broadcast STA entry for VIF 1.
   let bcStaVif1 = staInfoForIdx(STA_MGMT_FREE_STAS.uint8 + 1'u8)
-  sta_mgmt_entry_init(cast[pointer](bcStaVif1))
+  if not staMgmtResetEntry(staPostponedOwner(cast[pointer](bcStaVif1)), false):
+    return
   bcStaVif1.instNbr = 1
   bcStaVif1.controlPortState = 0
   bcStaVif1.txPolicy = cast[pointer](txBufferControlBcmcDescAt(1))
-  bcStaVif1.keyMat = cast[pointer](vifKeyPointers(vifChannelForIdx(1)))
+  let keysVif1 = vifKeyPointers(vifChannelForIdx(1))
+  bcStaVif1.keyMat = cast[pointer](keysVif1)
   # Final log via g_bl_ops_funcs
   let logFn2 = getLogFunc(204)
   if logFn2 != nil:
-    cast[proc(a0: uint32, a1: uint32, a2: pointer, a3: uint32, a4: uint32){.cdecl.}](logFn2)(
-      2, 0, nil, 157, 157)
+    cast[proc(level: uint32; tag, file: cstring; line: cint;
+              format: cstring) {.cdecl, varargs.}](logFn2)(
+      2, nil, "sta_mgmt.c", 157, "------ set default key %p, key ptr %p\r\n",
+      cast[pointer](keysVif1), cast[pointer](keysVif1.defaultKeyPtr.uint))
 
 proc sta_mgmt_register*(param: pointer, staIdxOut: ptr uint8): uint8 {.exportc, cdecl.} =
-  ## Register a station (126 instrs).
-  ## From blob: pops free STA entry from sta_info_env list via co_list_pop_front,
-  ## copies MAC addr/rates/caps from param, computes staIdx via pointer arithmetic,
-  ## initializes postponed descriptor halfwords to 0xFFFF, links RC stats pointer,
-  ## clears postponed flag, checks VIF HT flags, logs, links STA to VIF list.
-  let req = staMgmtRegisterParamView(param)
+  ## Configure a free station before publishing it to the VIF's active list.
+  if param == nil or staIdxOut == nil:
+    return 1
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  let req = staMgmtRegisterParamView(param)[]
+  staIdxOut[] = 0xFF
   let instNbr = req.instNbr
-  # Pop free STA entry from sta_info_env free list
+  if instNbr >= MAX_VIFS.uint8 or sta_info_env.first == nil:
+    return 1
+  let vif = vifChannelForIdx(instNbr)
+  let vifEpoch = rxVifEpochs[instNbr]
+  let keyPtrs = vifKeyPointers(vif)
+  let vifFlags = keyPtrs.flags
+  var stationEpochs: array[STA_MGMT_FREE_STAS, uint32]
+  for index in 0'u8 ..< STA_MGMT_FREE_STAS.uint8:
+    stationEpochs[index] = staDeleteEpoch(index)
+
+  # No station is reserved while the diagnostic callback can reenter.
+  let logFn = getLogFunc(204)
+  if logFn != nil:
+    let stationKey = (vifFlags and 8) != 0
+    let line = if stationKey: 282.cint else: 293.cint
+    let format = if stationKey:
+      cstring("------ %d set default key %p, key ptr %p\r\n")
+    else:
+      cstring("------ %d set default key %p, ptr %p\r\n")
+    var holder = cast[pointer](keyPtrs)
+    var key = cast[pointer](keyPtrs.defaultKeyPtr.uint)
+    if stationKey:
+      holder = nil
+      key = nil
+      # Inspect only pool members; the head is not reserved until after logging.
+      for index in 0'u8 ..< STA_MGMT_FREE_STAS.uint8:
+        let candidate = staInfoForIdx(index)
+        if cast[ptr CoListHdr](candidate) == sta_info_env.first:
+          holder = cast[pointer](addr candidate.keyHolder)
+          key = candidate.keyHolder
+          break
+    cast[proc(level: uint32; tag, file: cstring; line: cint;
+              format: cstring) {.cdecl, varargs.}](logFn)(
+      2, nil, "sta_mgmt.c", line, format, line, holder, key)
+  if rxVifEpochs[instNbr] != vifEpoch or sta_info_env.first == nil:
+    return 1
+
+  let sta = staInfoAt(cast[uint](sta_info_env.first))
+  var staIdx = 0'u8
+  while staIdx < STA_MGMT_FREE_STAS.uint8 and staInfoForIdx(staIdx) != sta:
+    inc staIdx
+  if staIdx >= STA_MGMT_FREE_STAS.uint8:
+    return 1
+  if sta.valid != 0 or sta.instNbr != 0xFF or
+      staDeleteEpoch(staIdx) != stationEpochs[staIdx]:
+    return 1
+
   let freeStaInfoListNode = co_list_pop_front(addr sta_info_env)
   if freeStaInfoListNode == nil:
     return 1
   let staEntry = cast[uint](freeStaInfoListNode)
-  let sta = staInfoAt(staEntry)
-  # Copy MAC address (6 bytes) from param+6 to staEntry+4
-  discard c_memcpy(cast[pointer](addr sta.macAddr[0]),
-                   cast[pointer](addr req.macAddr[0]), 6.csize_t)
-  # Set phy_bw_max (clamped to >= 16)
+  sta.macAddr = req.macAddr
   var phyBwMax = req.phyBwMax
   if phyBwMax < 16: phyBwMax = 16
   sta.phyBwMax = phyBwMax
@@ -75,90 +153,89 @@ proc sta_mgmt_register*(param: pointer, staIdxOut: ptr uint8): uint8 {.exportc, 
   sta.assocInfoWord0 = req.assocInfoWord0
   sta.assocInfoWord1 = req.assocInfoWord1
   sta.paramFlag = req.paramFlag
-  # Find the popped STA in the typed table.
-  var staIdx = 0'u8
-  while staIdx < STA_MGMT_FREE_STAS.uint8 and staInfoForIdx(staIdx) != sta:
-    inc staIdx
-  if staIdx >= STA_MGMT_FREE_STAS.uint8:
-    return 1
-  staIdxOut[] = staIdx
   sta.infoIdx = staIdx
   # Initial rate config
   sta.initialRateConfig = 0x19000'u32
-  sta.supportedRatesBitmap = 0xFFFF'u16
-  # Initialize postponed frame descriptors: 9 halfwords at sta+338 stride 4, set to 0xFFFF
-  var postponedDescTimerAddr = staEntry + 338
-  for postponedDescSlotIndex in 0 ..< 9:
-    cast[ptr uint16](postponedDescTimerAddr)[] = 0xFFFF'u16
-    postponedDescTimerAddr += 4
-  for tid in 0'u8 .. 8'u8:
-    rxuQosSeqCachePtr(tid)[] = 0xFFFF'u16
+  # Vendor initializes sta+336 and nine contiguous halfwords at sta+338.
+  let rxSeq = staRxSequence(sta)
+  rxSeq.nonQosSeqCtrl = 0xFFFF'u16
+  for seqCtrl in rxSeq.qosSeqCtrl.mitems:
+    seqCtrl = 0xFFFF'u16
   # Store TX policy descriptor pointer at sta+320.
   # Vendor uses one 60-byte txl_buffer_control_desc entry per STA; rc_init
   # later writes the RC stats pointer at sta+324.
   sta.txPolicy = cast[pointer](txBufferControlDescAt(staIdx.int))
-  # Clear postponed flag at sta+72
-  sta.trafficFlags = 0
-  let vif = vifChannelForIdx(instNbr)
-  let keyPtrs = vifKeyPointers(vif)
-  # Check VIF HT flags at vif+1496
-  let vifFlags = keyPtrs.flags
-  let logFn = getLogFunc(204)
+  # Vendor clears the controlled-port state at byte 72, not traffic byte 73.
+  sta.controlPortState = 0
   if (vifFlags and 8) != 0:
-    # HT-capable VIF: postponed list self-pointer at sta+240
     sta.keyMat = cast[pointer](addr sta.keyHolder)
-    if logFn != nil:
-      cast[proc(a0, a1: uint32, c: pointer, d, e: uint32){.cdecl.}](logFn)(2, 0, nil, 282, 282)
   else:
-    # Non-HT VIF: point to VIF key material area at vif+1488
     sta.keyMat = cast[pointer](keyPtrs)
-    if logFn != nil:
-      cast[proc(a0, a1: uint32, c: pointer, d, e: uint32){.cdecl.}](logFn)(2, 0, nil, 293, 293)
-  # Check HT extended flags (bit 4 at vif+1496)
-  let vifFlags2 = keyPtrs.flags
-  if (vifFlags2 and 16) != 0:
+  if (vifFlags and 16) != 0:
     sta.capabilityFlags = sta.capabilityFlags or 8
   # Push STA onto the VIF's postponed-STA list.
   co_list_push_back(vifPostponedStaList(vif), cast[ptr CoListHdr](staEntry))
   # Mark station as active
   sta.valid = 1
+  staIdxOut[] = staIdx
   return 0
 
-proc sta_mgmt_unregister*(staIdx: uint8) {.exportc, cdecl.} =
-  ## Unregister a station (29 instrs).
-  ## From blob: computes STA entry = sta_info_tab + staIdx*368 (using custom mul insn),
-  ## looks up VIF entry from STA's instNbr (offset 39) * 1512,
-  ## calls co_list_extract to remove STA from VIF's STA list (at vif+340),
-  ## calls sta_mgmt_entry_init to reset the STA entry,
-  ## then pushes back to sta_info_env free list via co_list_push_back.
+proc staRemovalCurrent(owner: StaQueueIdentity): bool =
+  staPostponedOwnerCurrent(owner) and staInfoAt(owner.entry).valid == 0
+
+proc staMgmtBeginRemoval(staIdx: uint8; owner: var StaQueueIdentity): pointer =
+  # A retiring station must not be admitted by RX/TX or removed by callbacks.
+  if staIdx >= STA_MGMT_FREE_STAS.uint8:
+    return nil
+  let saved = irqSave()
+  defer: irqRestore(saved)
   let sta = staInfoForIdx(staIdx)
+  if sta.valid == 0 or sta.instNbr >= MAX_VIFS.uint8:
+    return nil
   let instNbr = sta.instNbr
-  # Extract STA from VIF's STA list
   let vif = vifChannelForIdx(instNbr)
+  if not co_list_find(vifPostponedStaList(vif), cast[ptr CoListHdr](sta)):
+    return nil
+  var selected: uint8
+  if not txlHaltStationQueues(staIdx, selected): return nil
+  owner = staPostponedOwner(cast[pointer](sta))
+  sta.valid = 0
+  staDeleteInvalidate(staIdx)
+  owner.stationEpoch = staDeleteEpoch(staIdx)
   co_list_extract(vifPostponedStaList(vif), cast[ptr CoListHdr](sta))
-  # Re-initialize the STA entry (clears all fields)
-  sta_mgmt_entry_init(cast[pointer](sta))
-  # Push back to free list
-  co_list_push_back(addr sta_info_env, cast[ptr CoListHdr](sta))
+  txl_retire_station(staIdx, selected)
+  if not staRemovalCurrent(owner):
+    return nil
+  cast[pointer](sta)
+
+proc staMgmtFinishRemoval(owner: StaQueueIdentity) =
+  # Keep the slot out of the free list until postponed TX callbacks finish.
+  if not owner.stationTracked or owner.station >= STA_MGMT_FREE_STAS.uint8:
+    return
+  if not staMgmtResetEntry(owner, true):
+    return
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  let sta = staInfoAt(owner.entry)
+  # Reset advances the station epoch once. A later reset or allocation must
+  # not let this continuation publish the same storage to the free pool.
+  if (owner.stationTracked and
+      staDeleteEpoch(owner.station) != owner.stationEpoch + 1'u32) or
+      sta.valid != 0 or sta.instNbr != 0xFF or
+      co_list_find(addr sta_info_env, cast[ptr CoListHdr](owner.entry)):
+    return
+  co_list_push_back(addr sta_info_env, cast[ptr CoListHdr](owner.entry))
+
+proc sta_mgmt_unregister*(staIdx: uint8) {.exportc, cdecl.} =
+  ## Vendor order: detach, drain/reset, then return the station to the free list.
+  var owner: StaQueueIdentity
+  let staEntry = staMgmtBeginRemoval(staIdx, owner)
+  if staEntry != nil:
+    staMgmtFinishRemoval(owner)
 
 proc sta_mgmt_add_key*(param: pointer, hwKeyIdx: uint8) {.exportc, cdecl.} =
-  ## Add encryption key for a station (81 instrs).
-  ## Blob ABI: a0 = key parameter struct, a1 = hardware key index.
-  ##
-  ## Assembly trace:
-  ##   s4 = param[1] (STA index from param)
-  ##   s0 = STA_ENTRY_SIZE(368) * s4 (offset into sta_info_tab)
-  ##   s1 = param pointer
-  ##   s2 = sta_info_tab base
-  ##   Stores a1 at sta[234] (key HW index)
-  ##   Stores param[52] at sta[232] (key type: 0=none, 1=CCMP, 3=TKIP)
-  ##   Stores param[0] at sta[233] (key cipher suite)
-  ##   Stores param[55] at sta[236] (key flags)
-  ##   memset(sta+80, 0, 128) -- clear key material area
-  ##   Dispatches on key type:
-  ##     type 1 (CCMP): clear PN (sta+208..215), copy 16-byte key from param+24..39 to sta+208
-  ##     type 3 (TKIP): generate PRNG-based IV, store at sta+208..215
-  ##   Sets sta[235] = 1 (key installed), sta[240] = ptr to sta+80 (key material)
+  ## Install station key metadata and reset replay/packet-number state.
+  ## Cipher 1 carries the two TKIP MIC keys; ciphers 0/3 seed a WEP IV.
   let req = machwKeyWriteParamView(param)
   let staIdx = req.keyType
   let sta = staInfoForIdx(staIdx)
@@ -176,25 +253,17 @@ proc sta_mgmt_add_key*(param: pointer, hwKeyIdx: uint8) {.exportc, cdecl.} =
   sta.cipherSuite = cipherSuite
   let keyFlags = req.keyFlags
   sta.keyFlags = keyFlags
-  # Clear key material area (sta+80, 128 bytes)
+  # Eight replay counters precede the TX packet number and MIC-key union.
   discard c_memset(cast[pointer](addr sta.keyArea[0]), 0, 128.csize_t)
-  # Dispatch on key type
   case keyType
-  of 1, 2:
-    # CCMP: clear PN and install the pairwise temporal key. The supplicant
-    # set_key path passes translated cipher 2, while the vendor branch also
-    # accepts the CCMP table value 1.
+  of 1:
     sta.pnLow = 0
     sta.pnHigh = 0
-    let temporalKeySrcU = cast[uint](machwKeyWriteKeyTailPtr(req))
-    let temporalKeyDstU = cast[uint](addr sta.keyTail[0])
-    for temporalKeyWordIndex in 0 ..< 4:
-      cast[ptr uint32](temporalKeyDstU + (temporalKeyWordIndex * 4).uint)[] =
-        cast[ptr uint32](temporalKeySrcU + (temporalKeyWordIndex * 4).uint)[]
-  of 3:
-    # TKIP: generate random IV using PRNG
-    let rng = rcPrngNext()
-    sta.pnLow = (rng shr 16).uint32
+    sta.keyTail = req.temporalKeyTail
+  of 0, 3:
+    # sta_mgmt.o owns its own LCG, independent of rate-control sampling.
+    staKeyPrngState = staKeyPrngState * RC_PRNG_MULT + RC_PRNG_INCR
+    sta.pnLow = staKeyPrngState shr 16
     sta.pnHigh = 0
   else:
     # Unknown type: clear PN
@@ -204,22 +273,14 @@ proc sta_mgmt_add_key*(param: pointer, hwKeyIdx: uint8) {.exportc, cdecl.} =
   sta.keyInstalled = 1
   # Store pointer to key material
   sta.keyHolder = cast[pointer](addr sta.keyArea[0])
+  rxMgtReplayReset(sta.keyHolder)
   nimFwDbgStaAddKeyPtrs1 = pointerAddrU32(sta.keyMat)
   nimFwDbgStaAddKeyPtrs2 = pointerAddrU32(sta.keyHolder)
 
-proc sta_mgmt_del_key*(staIdx: uint8, keyIdx: uint8) {.exportc, cdecl.} =
-  ## Delete encryption key for a station.
-  ## From blob (4 instrs): a0 is treated as a sta_info_tag POINTER (not index).
-  ## Clears key state: sta[235]=0, sta[240]=0, sta[72]=1.
-  ## NOTE: blob takes pointer in a0; Nim signature has staIdx but callers may
-  ## pass either. We handle both by checking if a0 looks like a pointer vs index.
-  let staPtr = if staIdx.uint32 > MAX_STAS.uint32:
-    # Likely a pointer was passed (C ABI caller)
-    cast[uint](staIdx)
-  else:
-    # Index: compute pointer
-    cast[uint](addr sta_info_tab[0]) + staIdx.uint * STA_ENTRY_SIZE.uint
-  let sta = staInfoAt(staPtr)
+proc sta_mgmt_del_key*(staEntry: pointer) {.exportc, cdecl.} =
+  ## Invalidate the station key and close its controlled port.
+  let sta = staInfoAt(staEntry)
+  rxMgtReplayForget(cast[pointer](addr sta.keyArea[0]))
   sta.keyInstalled = 0
   sta.keyHolder = nil
   sta.controlPortState = 1
@@ -233,6 +294,14 @@ proc sta_mgmt_send_postponed_frame*(vifEntry: pointer, staEntry: pointer, maxCou
   ## dequeue. Clears desc+217, pushes via txl_cntrl_push_int, decrements
   ## txl_frame_env+16 counter. Loops until maxCount or list empty. Finally
   ## calls sta_mgmt_postponed_desc_release.
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if vifEntry == nil or staEntry == nil:
+    return 0
+  let identity = staPostponedOwner(staEntry)
+  if not staPostponedOwnerCurrent(identity) or not identity.vifTracked or
+      cast[pointer](vifChannelForIdx(identity.vif)) != vifEntry:
+    return 0
   let vifView = vifChannelAt(vifEntry)
   let sta = staInfoAt(staEntry)
   let psFlags = vifView.psFlags
@@ -243,29 +312,49 @@ proc sta_mgmt_send_postponed_frame*(vifEntry: pointer, staEntry: pointer, maxCou
       # AP mode: set bit 1 in ke_env+28 and set ke_env+29 = 1
       ps.flags = ps.flags or 2
       ps.apPending = 1
-    elif vifType != VIF_TYPE_STA:
+    elif vifType == VIF_TYPE_STA:
       # Other mode: set bit 0 in ke_env+28 and set ke_env+31 = 1
       ps.flags = ps.flags or 1
       ps.otherPending = 1
-  # Signal TX event
-  ke_evt_set(256)
+    # Signal PS work only when the VIF has pending power-save activity.
+    ke_evt_set(256)
+    if not staPostponedOwnerCurrent(identity):
+      return 0
   # Walk postponed descriptor list
   var postponedFramesSent: uint32 = 0
   let frameEnv = txFrameEnv()
-  while sta.postponedList.first != nil and
-      (maxCount == 0 or postponedFramesSent < maxCount):
+  while maxCount == 0 or postponedFramesSent < maxCount:
+    if not staPostponedOwnerCurrent(identity):
+      return postponedFramesSent
+    if sta.postponedList.first == nil:
+      break
+    if not staPostponedListValid(addr sta.postponedList):
+      break
     let head = sta.postponedList.first
+    let generation = txlFrameLeaseToken(hostTxDescAt(cast[pointer](head)))
     # Check TX allowed
     let txOk = txl_cntrl_tx_check(vifEntry)
+    if not staPostponedOwnerCurrent(identity):
+      return postponedFramesSent
+    if sta.postponedList.first != head or
+        not txlFrameLeaseMatches(hostTxDescAt(cast[pointer](head)), generation):
+      continue
     if not txOk:
       break
     # Check PS state for this frame
     let psOk = apm_tx_int_ps_check(cast[pointer](head))
+    if not staPostponedOwnerCurrent(identity):
+      return postponedFramesSent
+    if sta.postponedList.first != head or
+        not txlFrameLeaseMatches(hostTxDescAt(cast[pointer](head)), generation):
+      continue
     if not psOk:
       break
     # Get postpone info
     var postponeFlag: uint32 = 0
     let desc = apm_tx_int_ps_get_postpone(vifEntry, staEntry, addr postponeFlag)
+    if not staPostponedOwnerCurrent(identity):
+      return postponedFramesSent
     if postponeFlag != 0:
       break
     var frameDesc: pointer
@@ -274,19 +363,42 @@ proc sta_mgmt_send_postponed_frame*(vifEntry: pointer, staEntry: pointer, maxCou
     else:
       # Pop from the list
       frameDesc = cast[pointer](co_list_pop_front(addr sta.postponedList))
+    if frameDesc == nil:
+      break
     # Process the frame
     let txDesc = hostTxDescAt(frameDesc)
-    let tid = txDesc.staIdx
+    let ac = apmTxDescPsAt(frameDesc).accessCategory
     txDesc.postponeFlag = 0
     postponedFramesSent += 1
-    # Push to TX control
-    discard txl_cntrl_push_int(frameDesc, tid)
-    # Decrement global postponed count in txl_frame_env+16
+    # Transfer accounting before TX can complete, requeue, or retire the station.
     if frameEnv.postponedCount > 0:
       frameEnv.postponedCount = frameEnv.postponedCount - 1
+    discard txl_cntrl_push_int(frameDesc, ac)
   # Release remaining postponed descriptors
-  discard sta_mgmt_postponed_desc_release(staEntry, 0)
+  if staPostponedOwnerCurrent(identity):
+    discard sta_mgmt_postponed_desc_release(staEntry, 0)
   return postponedFramesSent
+
+proc staMgmtResetEntry(owner: StaQueueIdentity; requireRetired: bool): bool =
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if not staPostponedOwnerCurrent(owner):
+    return false
+  let staEntry = owner.entry
+  let sta = staInfoAt(staEntry)
+  if requireRetired and sta.valid != 0:
+    return false
+  var resetOwner = owner
+  if owner.stationTracked and owner.station < STA_MGMT_FREE_STAS.uint8:
+    staDeleteInvalidate(owner.station)
+    resetOwner.stationEpoch = staDeleteEpoch(owner.station)
+  discard staReleasePostponed(resetOwner, 1'u32, saved)
+  if not staPostponedOwnerCurrent(resetOwner) or
+      (requireRetired and sta.valid != 0) or sta.postponedList.first != nil:
+    return false
+  discard c_memset(staEntry, 0, 368.csize_t)
+  sta.instNbr = 0xFF'u8
+  true
 
 proc sta_mgmt_entry_init*(staEntry: pointer) {.exportc, cdecl.} =
   ## Reset a STA entry to default/free state.
@@ -298,92 +410,159 @@ proc sta_mgmt_entry_init*(staEntry: pointer) {.exportc, cdecl.} =
   ## (which in an active entry is a QoS field, not a key index) — that both
   ## skipped the TX-desc cleanup the blob does and risked deleting an unrelated
   ## HW key.
-  discard sta_mgmt_postponed_desc_release(staEntry, 1'u32)
-  discard c_memset(staEntry, 0, 368.csize_t)
-  staInfoAt(staEntry).instNbr = 0xFF'u8
+  let saved = irqSave()
+  let owner = staPostponedOwner(staEntry)
+  irqRestore(saved)
+  discard staMgmtResetEntry(owner, false)
 
-proc sta_mgmt_postponed_desc_release*(staEntry: pointer, flag: uint32): uint32 {.exportc, cdecl.} =
+proc staPostponedOwner(staEntry: pointer): StaQueueIdentity =
+  result.entry = staEntry
+  if staEntry == nil:
+    return
+  result.vif = staInfoAt(staEntry).instNbr
+  if result.vif < MAX_VIFS.uint8:
+    result.vifTracked = true
+    result.vifEpoch = rxVifEpochs[result.vif]
+  for index in 0'u8 ..< STA_INFO_TAB_ENTRIES.uint8:
+    if cast[pointer](staInfoForIdx(index)) == staEntry:
+      result.stationTracked = true
+      result.station = index
+      result.stationEpoch = staDeleteEpoch(index)
+      break
+
+proc staPostponedOwnerCurrent(identity: StaQueueIdentity): bool =
+  identity.entry != nil and staInfoAt(identity.entry).instNbr == identity.vif and
+    (not identity.stationTracked or
+     staDeleteEpoch(identity.station) == identity.stationEpoch) and
+    (not identity.vifTracked or rxVifEpochs[identity.vif] == identity.vifEpoch)
+
+proc staPostponedListValid(queue: ptr CoList): bool =
+  # The vendor pop operation leaves last stale when first becomes nil.
+  if queue.first == nil:
+    return true
+  var slow = queue.first
+  var fast = queue.first
+  while fast != nil:
+    if not wifiRamPointer(cast[pointer](fast)):
+      return false
+    fast = fast.next
+    if fast != nil:
+      if not wifiRamPointer(cast[pointer](fast)):
+        return false
+      fast = fast.next
+      slow = slow.next
+      if fast != nil and fast == slow:
+        return false
+  var node = queue.first
+  var last: ptr CoListHdr
+  while node != nil:
+    last = node
+    node = node.next
+  last == queue.last
+
+proc staReleasePostponed(identity: StaQueueIdentity;
+                        flag, callbackIrqState: uint32): uint32 =
   ## Release postponed descriptors for a station entry (58 instrs).
   ## From blob: walks the postponed frame list at sta+356. For each frame:
   ##   - If flag != 0: releases all frames unconditionally.
   ##   - If flag == 0: checks MAC timestamp against frame[84] (TX time).
   ##     If (macTime - txTime) > 0x1D4C0 (~120000 ticks = 120ms), releases frame.
   ##     Otherwise keeps it.
-  ## Released frames are freed via keFreeFunc. Returns count of released frames.
+  ## Released internal frames return to their pool and notify their callback.
+  let staEntry = identity.entry
+  if staEntry == nil:
+    return 0
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if not staPostponedOwnerCurrent(identity):
+    return 0
   let sta = staInfoAt(staEntry)
+  if sta.postponedList.first == nil:
+    return 0
+  if not staPostponedListValid(addr sta.postponedList):
+    inc nimFwDbgPostponedRelease
+    nimFwDbgPostponedReleaseDesc = pointerAddrU32(cast[pointer](sta.postponedList.first))
+    nimFwDbgPostponedReleaseCb = 0xFFFFFFFF'u32
+    nimFwDbgPostponedReleaseFc = 0xFFFFFFFF'u32
+    nimFwDbgPostponedReleaseFlags = flag or 0x80000000'u32
+    return 0
+  var pending = TxFlushBatch(previous: txActiveFlush, postponed: sta.postponedList)
+  var retained = TxFlushBatch(previous: addr pending)
+  sta.postponedList = default(CoList)
+  txActiveFlush = addr retained
+  defer: txlFlushScopeExit(pending.previous)
   var released: uint32 = 0
-  var previousPostponedTxDesc: pointer = nil
-  let macTime = regRead(MACHW_TIMLO_REG)
   let maxAge = 0x1D4C0'u32  # ~120ms in MAC ticks
   let frameEnv = txFrameEnv()
-  var postponedTxDesc = cast[pointer](sta.postponedList.first)
-  while postponedTxDesc != nil:
-    if not wifiRamPointer(postponedTxDesc):
-      inc nimFwDbgPostponedRelease
-      nimFwDbgPostponedReleaseDesc = pointerAddrU32(postponedTxDesc)
-      nimFwDbgPostponedReleaseCb = 0xFFFFFFFF'u32
-      nimFwDbgPostponedReleaseFc = 0xFFFFFFFF'u32
-      nimFwDbgPostponedReleaseFlags = flag or 0x80000000'u32
-      if previousPostponedTxDesc == nil:
-        sta.postponedList.first = nil
-      else:
-        cast[ptr CoListHdr](previousPostponedTxDesc).next = nil
-      sta.postponedList.last = cast[ptr CoListHdr](previousPostponedTxDesc)
-      frameEnv.postponedCount = 0
-      break
+  template releaseFrame(postponedTxDesc: pointer) =
     let txDesc = hostTxDescAt(postponedTxDesc)
-    let nextPostponedTxDesc = cast[pointer](cast[ptr CoListHdr](postponedTxDesc).next)
-    var doRelease = false
-    if flag != 0:
-      doRelease = true
+    inc nimFwDbgPostponedRelease
+    nimFwDbgPostponedReleaseDesc = pointerAddrU32(postponedTxDesc)
+    nimFwDbgPostponedReleaseCb = pointerAddrU32(txDesc.callback)
+    nimFwDbgPostponedReleaseFlags =
+      flag or (txDesc.usedFlag.uint32 shl 8) or
+      (txDesc.postponeFlag.uint32 shl 16) or (txDesc.retryFlag.uint32 shl 24)
+    if txDesc.bufDesc != nil:
+      let link = hostTxLinkDescAt(txDesc.bufDesc)
+      nimFwDbgPostponedReleaseFc =
+        link.macHeader[0].uint32 or (link.macHeader[1].uint32 shl 8)
     else:
-      # Check age: frame TX timestamp at offset 84
-      let txTime = txDesc.pendingMacTime
-      let age = macTime - txTime
-      if age > maxAge:
-        doRelease = true
+      nimFwDbgPostponedReleaseFc = 0xFFFFFFFF'u32
+    txDesc.postponeFlag = 0
+    if frameEnv.postponedCount > 0:
+      dec frameEnv.postponedCount
+    inc released
+    # Keep the caller's callback IRQ contract, then reacquire queue ownership.
+    irqRestore(callbackIrqState)
+    try:
+      txl_frame_release(postponedTxDesc, true)
+    finally:
+      discard irqSave()
+  while pending.postponed.first != nil:
+    let node = pending.postponed.first
+    co_list_remove(addr pending.postponed, nil, node)
+    let txDesc = hostTxDescAt(cast[pointer](node))
+    let doRelease = flag != 0 or not staPostponedOwnerCurrent(identity) or
+      (regRead(MACHW_TIMLO_REG) - txDesc.pendingMacTime) > maxAge
     if doRelease:
-      # Remove from postponed list (blob: co_list_remove)
-      co_list_remove(
-        addr sta.postponedList,
-        cast[ptr CoListHdr](previousPostponedTxDesc),
-        cast[ptr CoListHdr](postponedTxDesc))
-      inc nimFwDbgPostponedRelease
-      nimFwDbgPostponedReleaseDesc = pointerAddrU32(postponedTxDesc)
-      nimFwDbgPostponedReleaseCb = pointerAddrU32(txDesc.callback)
-      nimFwDbgPostponedReleaseFlags =
-        flag or (txDesc.usedFlag.uint32 shl 8) or
-        (txDesc.postponeFlag.uint32 shl 16) or (txDesc.retryFlag.uint32 shl 24)
-      if txDesc.bufDesc != nil:
-        let link = hostTxLinkDescAt(txDesc.bufDesc)
-        nimFwDbgPostponedReleaseFc =
-          link.macHeader[0].uint32 or (link.macHeader[1].uint32 shl 8)
-      else:
-        nimFwDbgPostponedReleaseFc = 0xFFFFFFFF'u32
-      # Release expired/off-channel descriptors without invoking upper-layer
-      # completion. The SDK passes doCallback=1 here, but our pure-Nim path can
-      # age descriptors whose callback storage was already invalidated by prior
-      # host/firmware recycling. Keeping callback dispatch out of the scavenger
-      # preserves the descriptor-pool invariant while normal TX confirmations
-      # still use txl_frame_evt for valid callbacks.
-      {.emit: ["asm volatile(\"mv a1, zero\" ::: \"a1\");"].}
-      txl_frame_release(postponedTxDesc)
-      if frameEnv.postponedCount > 0:
-        frameEnv.postponedCount = frameEnv.postponedCount - 1
-      released += 1
+      releaseFrame(cast[pointer](node))
     else:
-      previousPostponedTxDesc = postponedTxDesc
-    postponedTxDesc = nextPostponedTxDesc
+      co_list_push_back(addr retained.postponed, node)
+  if not staPostponedOwnerCurrent(identity):
+    while retained.postponed.first != nil:
+      let node = retained.postponed.first
+      co_list_remove(addr retained.postponed, nil, node)
+      releaseFrame(cast[pointer](node))
+  elif retained.postponed.first != nil:
+    # Original survivors precede work appended by callbacks.
+    retained.postponed.last.next = sta.postponedList.first
+    if sta.postponedList.first == nil:
+      sta.postponedList.last = retained.postponed.last
+    sta.postponedList.first = retained.postponed.first
+    retained.postponed = default(CoList)
   return released
+
+proc sta_mgmt_postponed_desc_release*(staEntry: pointer, flag: uint32): uint32 {.exportc, cdecl.} =
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  staReleasePostponed(staPostponedOwner(staEntry), flag, saved)
 
 proc sta_mgmt_aging_postponed_desc*(staEntry: pointer, maxCount: uint32): uint32 {.exportc, cdecl.} =
   ## Age postponed frame descriptors (25 instrs).
   ## From blob: iterates all entries physically present in sta_info_tab
   ## (7 entries, 368 bytes each), calling sta_mgmt_postponed_desc_release(staEntry, 0).
   ## Accumulates total released count. Returns total.
-  var total: uint32 = 0
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  let resetEpoch = txResetEpoch
+  var owners: array[STA_INFO_TAB_ENTRIES, StaQueueIdentity]
   for postponedStaIndex in 0'u8 ..< STA_INFO_TAB_ENTRIES.uint8:
     let sta = staInfoForIdx(postponedStaIndex)
-    let released = sta_mgmt_postponed_desc_release(cast[pointer](sta), 0)
-    total += released
+    owners[postponedStaIndex] = staPostponedOwner(cast[pointer](sta))
+  var total: uint32 = 0
+  for owner in owners:
+    if txResetEpoch != resetEpoch: break
+    if staPostponedOwnerCurrent(owner):
+      # Preserve the caller's callback IRQ state while retaining the snapshot.
+      total += staReleasePostponed(owner, 0, saved)
   return total
