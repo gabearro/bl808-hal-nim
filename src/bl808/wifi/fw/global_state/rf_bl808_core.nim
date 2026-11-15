@@ -164,27 +164,32 @@ type
     basebandDfeEnable414: uint32
     dfeEnableToFeatureCtrlPadding: array[250, uint32]
     versionFeatureCtrl800: uint32
-    featureCtrlToBandwidthGuardPadding: array[4, uint32]
+    channelTiming804: uint32
+    channelSync808: uint32
+    featureCtrlToBandwidthGuardPadding: array[2, uint32]
     bandwidth20MGuard814: uint32
-    bandwidthGuardToProfile820Padding: array[2, uint32]
+    bandwidthGuardToChannelProfilePadding: uint32
+    channelProfile81c: uint32
     bandwidth20MProfile820: uint32
     channelTypeCtrl824: uint32
     channelTypeToProfile830Padding: array[2, uint32]
     bandwidth20MProfile830: uint32
     bandwidth20MEnable834: uint32
-    bandwidthEnableToSignalPadding: uint32
+    channelTiming838: uint32
     bandwidth20MSignal83c: uint32
     bandwidth20MSignal840: uint32
     preAgcSignal844: uint32
     preAgcSignal848: uint32
-    channelCenterRatio84c: uint32
+    channelClockDivider84c: uint32
     channelCenterRatioToFilterPadding: array[4, uint32]
     bandwidth20MFilter860: uint32
-    bandwidthFilterToGatePadding: array[4, uint32]
+    bandwidthFilterToChannelProfilePadding: array[3, uint32]
+    channelProfile870: uint32
     bandwidth20MGate874: uint32
     bandwidthGateToPhyPulsePadding: array[4, uint32]
     phyChannelPulse888: uint32
-    phyPulseToPreAgcDetectPadding: array[2, uint32]
+    channelFilter88c: uint32
+    channelFeature890: uint32
     preAgcDetect894: uint32
     preAgcDetectToHeMembershipPadding: array[4, uint32]
     groupMembership0: uint32
@@ -199,7 +204,9 @@ type
     preAgcTiming8d8To8e0Padding: uint32
     preAgcTiming8e0: uint32
     preAgcTiming8e4: uint32
-    preAgcTimingToChannelModePadding: array[18, uint32]
+    preAgcTimingToChannelRatioPadding: uint32
+    channelCenterRatio8ec: uint32
+    channelRatioToChannelModePadding: array[16, uint32]
     channelModeCtrl930: uint32
     channelModeToBasebandRxPathPadding: array[195, uint32]
     basebandRxPathCtrlC40: uint32
@@ -270,19 +277,24 @@ type
   BbaAgcBlock {.packed.} = object
     bbaBaseToAgcEnablePadding: uint32
     agcCoreEnable004: uint32
-    agcEnableToCoreCtrlPadding: array[62, uint32]
+    agcEnableToChannelSidebandPadding: array[30, uint32]
+    channelSideband080: uint32
+    channelSidebandToCoreCtrlPadding: array[31, uint32]
     agcCoreCtrl100: uint32
     agcCoreCtrlToLowPowerThresholdPadding: array[128, uint32]
     agcCoreLowPowerThreshold304: uint32
     lowPowerThresholdToMacActivePadding: array[14, uint32]
     macActiveB340: uint32
     macActiveB344: uint32
-    macActiveToAgcProfilePadding: array[7, uint32]
+    channelProfile348: uint32
+    macActiveToAgcProfilePadding: array[6, uint32]
     agcCoreProfile364: uint32
     macActiveB368: uint32
     pdComp36c: uint32
     agcCoreProfile370: uint32
-    agcProfileToStagePadding: array[3, uint32]
+    channelBandwidth374: uint32
+    channelBandwidth378: uint32
+    channelBandwidthToStagePadding: uint32
     agcCoreStage0B380: uint32
     macActiveB384: uint32
     agcCoreStage2B388: uint32
@@ -548,7 +560,19 @@ static:
   doAssert offsetof(WifiModemBlock, bandwidth20MSignal840) == 0x840
   doAssert offsetof(WifiModemBlock, preAgcSignal844) == 0x844
   doAssert offsetof(WifiModemBlock, preAgcSignal848) == 0x848
-  doAssert offsetof(WifiModemBlock, channelCenterRatio84c) == 0x84C
+  doAssert offsetof(WifiModemBlock, channelClockDivider84c) == 0x84C
+  doAssert offsetof(WifiModemBlock, channelTiming804) == 0x804
+  doAssert offsetof(WifiModemBlock, channelSync808) == 0x808
+  doAssert offsetof(WifiModemBlock, channelProfile81c) == 0x81C
+  doAssert offsetof(WifiModemBlock, channelTiming838) == 0x838
+  doAssert offsetof(WifiModemBlock, channelFilter88c) == 0x88C
+  doAssert offsetof(WifiModemBlock, channelFeature890) == 0x890
+  doAssert offsetof(WifiModemBlock, channelCenterRatio8ec) == 0x8EC
+  doAssert offsetof(WifiModemBlock, channelProfile870) == 0x870
+  doAssert offsetof(BbaAgcBlock, channelSideband080) == 0x80
+  doAssert offsetof(BbaAgcBlock, channelProfile348) == 0x348
+  doAssert offsetof(BbaAgcBlock, channelBandwidth374) == 0x374
+  doAssert offsetof(BbaAgcBlock, channelBandwidth378) == 0x378
   doAssert offsetof(WifiModemBlock, bandwidth20MFilter860) == 0x860
   doAssert offsetof(WifiModemBlock, bandwidth20MGate874) == 0x874
   doAssert offsetof(WifiModemBlock, phyChannelPulse888) == 0x888
@@ -713,9 +737,6 @@ const
   WlRfCfgPower11ac20Offset = 0x6C
   WlRfCfgPower11acAltOffset = 0x78
   WlRfCfgDefaultRatePower = 0x1C'u8
-  RfPriWb03Rf70ColdSeed = 0x25181222'u32
-  RfPriWb03Rf70ScanSeed = 0x24181222'u32
-  RfPriWb03MacActiveRf70Seed = 0x23171222'u32
   RfPriTxcalRf70InitialSearchSeedNibble = 0xB'u32
   RfPriRf70ReplayNotApplicable = 0xFFFF_FFFF'u32
   RfPriRf70ReplayFieldsSeededAtReplay = 0x00000001'u32
@@ -732,49 +753,20 @@ const
   RfPriTxPowerSkipWb03TxcalIncomplete = 0x00000002'u32
   RfPriTxPowerSkipWb03BzTxcalIncomplete = 0x00000003'u32
   RfPriTxPowerSkipWb03OptInDisabled = 0x00000004'u32
-  RfPriWb03MacActiveRf7cSeed = 0x24222422'u32
-  RfPriWb03RccalRf80Seed = 0x1B1B1B1B'u32
-  RfPriWb03RccalRf84Seed = 0x02324020'u32
-  RfPriWb03ScanRf88Seed = 0x00011005'u32
-  RfPriWb03ScanRf8cSeed = 0x12202112'u32
-  RfPriWb03ScanRfb4Seed = 0x0002A222'u32
-  RfPriWb03RfcEntryRfb4Seed = 0x0102A222'u32
-  RfPriWb03ScanRfbcSeed = 0x10911100'u32
-  RfPriWb03ScanRf80ListenSeed = 0x1C1C1C1C'u32
-  RfPriWb03ScanRf80ActiveSeed = 0x1B1B1B1B'u32
-  RfPriWb03MacActiveRf80Seed = 0x1A1A1A1A'u32
-  RfPriWb03ScanRf40Seed = 0x01F00B00'u32
-  RfPriWb03ScanRf4cSeed = 0x00763237'u32
-  RfPriWb03RfcEntryRfa0Seed = 0x0D0CA296'u32
-  RfPriWb03MacActiveRfa0Seed = 0x0C0C9F96'u32
-  RfPriWb03ScanRf1600Seed = 0x00BF27F7'u32
-  RfPriWb03ScanRf1600ListenSeed = 0x00BF37F6'u32
-  RfPriWb03ScanRf1600ActiveSeed = 0x00BEC7F6'u32
-  RfPriWb03ScanRf1600BaselineSeed = 0x00BE87F4'u32
-  RfPriWb03RfcEntryRf1600Seed = 0x00BEF7F7'u32
-  RfPriWb03MacActiveRf1600Seed = 0x00BF27F3'u32
-  RfPriWb03ScanRf1608Seed = 0x10000000'u32
-  RfPriWb03ScanRf1618Seed = 0x80000000'u32
-  RfPriWb03ScanRf162cSeed = 0x000F0002'u32
   WifiAgcMemoryBase = 0x24C0A000'u
   WifiAgcMemoryWords = 512
   Bl808RfDeviceInfoBl616 = 0'u32
   Bl808RfDeviceInfoWb03 = 1'u32
   Bl808RfDeviceInfoBl618m = 2'u32
   Bl808WifiRfDeviceInfo {.intdefine.}: int = 1
-  ## WB03/40M needs the scan/MAC-active RF latch replay before auth/assoc TX.
-  ## Hardware evidence: without this pulse, m0_wifi_nimfw_hal_test times out
-  ## at connect with RF88 falling back to 0x00010005; with it, connect passes.
+  ## Compatibility options for old bench commands; scan and TX no longer
+  ## replace calibration state or pulse RF latches through these options.
   bl808WifiRfWb03ForceAuthTxLatches* {.booldefine.}: bool = true
   bl808WifiRfWb03AuthTxSettleUs* {.intdefine.}: int = 0
   bl808WifiRfWb03AuthTxPulseLatch* {.booldefine.}: bool = true
-  ## Keep the recovered RF70 strongest-candidate search as diagnostics by
-  ## default. A 2026-06-06 hardware run showed measured replay windows
-  ## w0=A,w1=E,w2=9 regressed auth/connect, so applying them remains opt-in
-  ## until the full vendor TXCAL measurement setup is recovered.
+  ## Compatibility defines retained for existing build commands. Calibration
+  ## now publishes measured records independently of these former replay gates.
   bl808WifiRfWb03ApplyMeasuredRf70Replay* {.booldefine.}: bool = false
-  ## Keep WB03/40M TX power table replay on the hardware-validated restore
-  ## baseline unless a run explicitly opts into complete calibration records.
   bl808WifiRfWb03ReplayCompleteTxPowerCal* {.booldefine.}: bool = false
   WlXtal24M = 24_000_000'u32
   WlXtal26M = 26_000_000'u32
@@ -826,15 +818,11 @@ const
   RfRccalDoneMode = 0x000C0000'u32
   RfRccalFailMode = 0x00080000'u32
   RfRccalCodeMask = 0x0000003F'u32
-  RfRccalRegisterKeepMask = 0xC0C0C0C0'u32
-  RfRccalBaselineCode = 0x20'u32
-  RfRccalTargetNumerator = 81'u64
-  RfRccalTargetDenominator = 100'u64
-  RfRccalFallbackTargetNumerator = 5'u64
-  RfRccalFallbackTargetDenominator = 3'u64
-  RfRccalMinReferencePower = 64'u32
-  RfRccalReferenceMeasureCtrl = 0x00001000'u32
-  RfRccalToneMeasureCtrl = 0x0002D400'u32
+  RfRccalInitialStep = 0x20'i32
+  RfRccalTargetNumerator = 81'u32
+  RfRccalTargetDenominator = 100'u32
+  RfRccalReferenceMeasureCtrl = 0x00000600'u32
+  RfRccalToneMeasureCtrl = 0x00016A00'u32
   RfTxcalModeMask = 0x00F00000'u32
   RfTxcalStartMode = 0x00500000'u32
   RfTxcalDoneMode = 0x00F00000'u32
@@ -852,24 +840,16 @@ const
   RfTxcalParam2EnableBit = 0x00800000'u32
   RfTxcalParam3Mask = 0x000003FF'u32
   RfTxcalParam3SignBit = 0x00000400'u32
-  RfPriWb03RxcalTosdacReplayMask =
-    RfTxcalParam2Mask or RfTxcalParam2EnableBit or
-    RfTxcalParam3Mask or RfTxcalParam3SignBit
-  RfPriWb03RxcalTosdacSeed = 0x00BEC7F7'u32
   RfTxcalSingenAmplitudeMask = 0x000007FF'u32
-  RfTxcalMixerCsMask = 0x00000007'u32
   RfTxcalAverageMeasureMode = 0x04000000'u32
-  RfTxcalInitialAmp = 128'u32
+  RfTxcalInitialAmp = 256'u32
   RfTxcalInitialAdcMax = 128'i32
   RfTxcalInitialAdcMin = 96'i32
-  RfTxcalGainAmp = 192'u32
-  RfTxcalGainAdcMax = 256'i32
-  RfTxcalGainAdcMin = 128'i32
-  RfTxcalSearchFreqIq = 0x3D'u32
-  RfTxcalSearchFreqOsdac = 0x7A'u32
+  RfTxcalSearchFreqIq = 0x49'u32
+  RfTxcalSearchFreqOsdac = 0x92'u32
   RfBzTxcalSearchFreqIq = 0x49'u32
   RfBzTxcalSearchFreqOsdac = 0x92'u32
-  RfTxcalMixerCsCount = 8
+  RfTxcalOsdacTraceEntries = 8
   RfTxcalSampleTraceEntries = 48
   RfLoChannelCount = 21
   RfFcalWaitLimit = 5000
@@ -878,10 +858,6 @@ const
   RfTxcalWaitLimit = 10000
   RfRxcalWaitLimit = 10000
   RfConfigChannelWaitLimit = 5000
-  RfLoFcalLowCount = 0xA6A0'u16
-  RfLoFcalHighCount = 0xA6E0'u16
-  RfLoFcalStopCount = 0xACE0'u16
-  RfLoFcalDiv = 0x0855'u16
   RfCalibRccalReplayWordIndex = 2
   RfCalibRf70ReplayLowBandWordIndex = 3
   RfCalibRf70ReplayHighBandWordIndex = 4
@@ -890,16 +866,6 @@ const
   RfCalibBzTxcalRecordBaseByte = 0xF8
   RfCalibBzTxcalRecordStrideBytes = 8
 
-  RfPriDefaultVcoCal40M: array[21, uint16] = [
-    ## Fallback for zeroed wl_cal VCO halfwords, recovered from passing
-    ## BL808 40 MHz RF logs (`lo_vco_freq_cw`, `vco_idac_cw`). Vendor
-    ## full-cal data overwrites this range when available.
-    0xA20D'u16, 0xA10D'u16, 0x9F0C'u16, 0x9E0C'u16, 0x9D0C'u16,
-    0x9B0C'u16, 0x9A0C'u16, 0x990C'u16, 0x970C'u16, 0x960C'u16,
-    0x950C'u16, 0x930C'u16, 0x920C'u16, 0x910C'u16, 0x8F0B'u16,
-    0x8E0B'u16, 0x8D0B'u16, 0x8C0C'u16, 0x8A0C'u16, 0x890C'u16,
-    0x880C'u16
-  ]
   RfPriTxcalSearchRecords = 18
   RfPriBzTxcalSearchRecords = 9
   RfPriTxcalReplayRecordIds: array[13, int] = [
@@ -908,21 +874,153 @@ const
     0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14
   ]
 
-  RfChannelDivTable40M: array[RfLoChannelCount, uint32] = [
-    0x14088889'u32, 0x14111111'u32, 0x1419999A'u32, 0x14222222'u32,
-    0x142AAAAB'u32, 0x14333333'u32, 0x143BBBBC'u32, 0x14444444'u32,
-    0x144CCCCD'u32, 0x14555555'u32, 0x145DDDDE'u32, 0x14666666'u32,
-    0x146EEEEF'u32, 0x14777777'u32, 0x14800000'u32, 0x14888889'u32,
-    0x14911111'u32, 0x1499999A'u32, 0x14A22222'u32, 0x14AAAAAB'u32,
-    0x14B33333'u32
+  # Vendor crystal order: 24, 26, 32, 38.4, 40, 52 MHz.
+  RfChannelDivTables: array[6, array[RfLoChannelCount, uint32]] = [
+    [
+      0x21638E39'u32, 0x2171C71C'u32, 0x21800000'u32, 0x218E38E4'u32,
+      0x219C71C7'u32, 0x21AAAAAB'u32, 0x21B8E38E'u32, 0x21C71C72'u32,
+      0x21D55555'u32, 0x21E38E39'u32, 0x21F1C71C'u32, 0x22000000'u32,
+      0x220E38E4'u32, 0x221C71C7'u32, 0x222AAAAB'u32, 0x2238E38E'u32,
+      0x22471C72'u32, 0x22555555'u32, 0x22638E39'u32, 0x2271C71C'u32,
+      0x22800000'u32
+    ],
+    [
+      0x1ED20D21'u32, 0x1EDF2DF3'u32, 0x1EEC4EC5'u32, 0x1EF96F97'u32,
+      0x1F069069'u32, 0x1F13B13B'u32, 0x1F20D20D'u32, 0x1F2DF2DF'u32,
+      0x1F3B13B1'u32, 0x1F483483'u32, 0x1F555555'u32, 0x1F627627'u32,
+      0x1F6F96F9'u32, 0x1F7CB7CB'u32, 0x1F89D89E'u32, 0x1F96F970'u32,
+      0x1FA41A42'u32, 0x1FB13B14'u32, 0x1FBE5BE6'u32, 0x1FCB7CB8'u32,
+      0x1FD89D8A'u32
+    ],
+    [
+      0x190AAAAB'u32, 0x19155555'u32, 0x19200000'u32, 0x192AAAAB'u32,
+      0x19355555'u32, 0x19400000'u32, 0x194AAAAB'u32, 0x19555555'u32,
+      0x19600000'u32, 0x196AAAAB'u32, 0x19755555'u32, 0x19800000'u32,
+      0x198AAAAB'u32, 0x19955555'u32, 0x19A00000'u32, 0x19AAAAAB'u32,
+      0x19B55555'u32, 0x19C00000'u32, 0x19CAAAAB'u32, 0x19D55555'u32,
+      0x19E00000'u32
+    ],
+    [
+      0x14DE38E4'u32, 0x14E71C72'u32, 0x14F00000'u32, 0x14F8E38E'u32,
+      0x1501C71C'u32, 0x150AAAAB'u32, 0x15138E39'u32, 0x151C71C7'u32,
+      0x15255555'u32, 0x152E38E4'u32, 0x15371C72'u32, 0x15400000'u32,
+      0x1548E38E'u32, 0x1551C71C'u32, 0x155AAAAB'u32, 0x15638E39'u32,
+      0x156C71C7'u32, 0x15755555'u32, 0x157E38E4'u32, 0x15871C72'u32,
+      0x15900000'u32
+    ],
+    [
+      0x14088889'u32, 0x14111111'u32, 0x1419999A'u32, 0x14222222'u32,
+      0x142AAAAB'u32, 0x14333333'u32, 0x143BBBBC'u32, 0x14444444'u32,
+      0x144CCCCD'u32, 0x14555555'u32, 0x145DDDDE'u32, 0x14666666'u32,
+      0x146EEEEF'u32, 0x14777777'u32, 0x14800000'u32, 0x14888889'u32,
+      0x14911111'u32, 0x1499999A'u32, 0x14A22222'u32, 0x14AAAAAB'u32,
+      0x14B33333'u32
+    ],
+    [
+      0x0F690690'u32, 0x0F6F96F9'u32, 0x0F762762'u32, 0x0F7CB7CB'u32,
+      0x0F834835'u32, 0x0F89D89E'u32, 0x0F906907'u32, 0x0F96F970'u32,
+      0x0F9D89D9'u32, 0x0FA41A42'u32, 0x0FAAAAAB'u32, 0x0FB13B14'u32,
+      0x0FB7CB7D'u32, 0x0FBE5BE6'u32, 0x0FC4EC4F'u32, 0x0FCB7CB8'u32,
+      0x0FD20D21'u32, 0x0FD89D8A'u32, 0x0FDF2DF3'u32, 0x0FE5BE5C'u32,
+      0x0FEC4EC5'u32
+    ]
   ]
-
-  RfChannelCntTable40M: array[RfLoChannelCount, uint16] = [
-    0xA6EB'u16, 0xA732'u16, 0xA779'u16, 0xA7C0'u16, 0xA808'u16,
-    0xA84F'u16, 0xA896'u16, 0xA8DD'u16, 0xA924'u16, 0xA96B'u16,
-    0xA9B2'u16, 0xA9F9'u16, 0xAA40'u16, 0xAA87'u16, 0xAACF'u16,
-    0xAB16'u16, 0xAB5D'u16, 0xABA4'u16, 0xABEB'u16, 0xAC32'u16,
-    0xAC79'u16
+  RfChannelCntTables: array[6, array[RfLoChannelCount, uint16]] = [
+    [
+      0xA6F2'u16, 0xA739'u16, 0xA780'u16, 0xA7C7'u16,
+      0xA80E'u16, 0xA855'u16, 0xA89C'u16, 0xA8E4'u16,
+      0xA92B'u16, 0xA972'u16, 0xA9B9'u16, 0xAA00'u16,
+      0xAA47'u16, 0xAA8E'u16, 0xAAD5'u16, 0xAB1C'u16,
+      0xAB64'u16, 0xABAB'u16, 0xABF2'u16, 0xAC39'u16,
+      0xAC80'u16
+    ],
+    [
+      0xA6FC'u16, 0xA743'u16, 0xA78A'u16, 0xA7D1'u16,
+      0xA819'u16, 0xA860'u16, 0xA8A7'u16, 0xA8EE'u16,
+      0xA935'u16, 0xA97C'u16, 0xA9C3'u16, 0xAA0A'u16,
+      0xAA52'u16, 0xAA99'u16, 0xAAE0'u16, 0xAB27'u16,
+      0xAB6E'u16, 0xABB5'u16, 0xABFC'u16, 0xAC43'u16,
+      0xAC8B'u16
+    ],
+    [
+      0xA6FA'u16, 0xA741'u16, 0xA788'u16, 0xA7D0'u16,
+      0xA817'u16, 0xA85E'u16, 0xA8A5'u16, 0xA8EC'u16,
+      0xA933'u16, 0xA97A'u16, 0xA9C1'u16, 0xAA09'u16,
+      0xAA50'u16, 0xAA97'u16, 0xAADE'u16, 0xAB25'u16,
+      0xAB6C'u16, 0xABB3'u16, 0xABFA'u16, 0xAC42'u16,
+      0xAC89'u16
+    ],
+    [
+      0xA6F2'u16, 0xA739'u16, 0xA780'u16, 0xA7C7'u16,
+      0xA80E'u16, 0xA855'u16, 0xA89C'u16, 0xA8E4'u16,
+      0xA92B'u16, 0xA972'u16, 0xA9B9'u16, 0xAA00'u16,
+      0xAA47'u16, 0xAA8E'u16, 0xAAD5'u16, 0xAB1C'u16,
+      0xAB64'u16, 0xABAB'u16, 0xABF2'u16, 0xAC39'u16,
+      0xAC80'u16
+    ],
+    [
+      0xA6EB'u16, 0xA732'u16, 0xA779'u16, 0xA7C0'u16,
+      0xA808'u16, 0xA84F'u16, 0xA896'u16, 0xA8DD'u16,
+      0xA924'u16, 0xA96B'u16, 0xA9B2'u16, 0xA9F9'u16,
+      0xAA40'u16, 0xAA87'u16, 0xAACF'u16, 0xAB16'u16,
+      0xAB5D'u16, 0xABA4'u16, 0xABEB'u16, 0xAC32'u16,
+      0xAC79'u16
+    ],
+    [
+      0xA6ED'u16, 0xA734'u16, 0xA77B'u16, 0xA7C2'u16,
+      0xA809'u16, 0xA850'u16, 0xA897'u16, 0xA8DE'u16,
+      0xA925'u16, 0xA96D'u16, 0xA9B4'u16, 0xA9FB'u16,
+      0xAA42'u16, 0xAA89'u16, 0xAAD0'u16, 0xAB17'u16,
+      0xAB5E'u16, 0xABA5'u16, 0xABEC'u16, 0xAC34'u16,
+      0xAC7B'u16
+    ]
+  ]
+  RfChannelCntRanges: array[6, array[3, uint16]] = [
+    [
+      0xA6A7'u16, 0xA6E7'u16, 0xACE7'u16
+    ],
+    [
+      0xA6B1'u16, 0xA6F1'u16, 0xACF2'u16
+    ],
+    [
+      0xA6AF'u16, 0xA6EF'u16, 0xACF0'u16
+    ],
+    [
+      0xA6A7'u16, 0xA6E7'u16, 0xACE7'u16
+    ],
+    [
+      0xA6A0'u16, 0xA6E0'u16, 0xACE0'u16
+    ],
+    [
+      0xA6A2'u16, 0xA6E2'u16, 0xACE2'u16
+    ]
+  ]
+  # Float32 round-to-nearest then truncation for reference ratios 0..2.
+  RfPriPllFractionWords: array[6, array[3, uint32]] = [
+    [
+      0x00000000'u32, 0x01400000'u32, 0x02800000'u32
+    ],
+    [
+      0x00000000'u32, 0x01276276'u32, 0x024EC4EC'u32
+    ],
+    [
+      0x00000000'u32, 0x00F00000'u32, 0x01E00000'u32
+    ],
+    [
+      0x00000000'u32, 0x00C7FFFF'u32, 0x018FFFFE'u32
+    ],
+    [
+      0x00000000'u32, 0x00C00000'u32, 0x01800000'u32
+    ],
+    [
+      0x00000000'u32, 0x0093B13B'u32, 0x01276276'u32
+    ]
+  ]
+  RfPriFcalDivByXtal: array[6, uint16] = [
+    0x0500'u16, 0x056B'u16, 0x06AB'u16, 0x0800'u16, 0x0855'u16, 0x0AD5'u16
+  ]
+  RfPriPllRefdivByXtal: array[6, uint16] = [
+    1'u16, 1'u16, 2'u16, 2'u16, 2'u16, 0'u16
   ]
   RfPriCwPowerAmplitudeTable: array[31, uint16] = [
     ## librf_bl808.a:rf_pri.c.o .rodata.cw_pwr_table, used by
@@ -1046,19 +1144,6 @@ const
     [0'i16, 1'i16, 3'i16, 8'i16, 0'i16, 5'i16, 1'i16, 0'i16, -30'i16]
   ]
 
-  RfPriTxPowerRegisterBase: array[43, uint32] = [
-    0x004524D4'u32, 0x0028E3D0'u32, 0x135FC000'u32, 0x00000000'u32,
-    0x12DFC000'u32, 0x00000000'u32, 0x123FE000'u32, 0x00000000'u32,
-    0x123FC000'u32, 0x00000000'u32, 0x119FF000'u32, 0x00000000'u32,
-    0x119FD000'u32, 0x00000000'u32, 0x113FF000'u32, 0x00000000'u32,
-    0x10FBD000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32,
-    0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x0030F495'u32,
-    0x00003189'u32, 0x11FC0000'u32, 0x00000000'u32, 0x115C0000'u32,
-    0x00000000'u32, 0x11180000'u32, 0x00000000'u32, 0x109C0000'u32,
-    0x00000000'u32, 0x10940000'u32, 0x0014A3D4'u32, 0x1077E000'u32,
-    0x00000000'u32, 0x106FF000'u32, 0x00000000'u32, 0x1037D000'u32,
-    0x00000000'u32, 0x000420FC'u32, 0x04030201'u32
-  ]
   RfPriWb03TxPowerRegisterBaseline: array[43, uint32] = [
     ## Vendor WB03/40M restore output at nimFwScanRxFilterProbe.
     ## librf_bl808.a:rf_pri_restore_cal_reg calls rf_pri_txcal_w2reg and
@@ -1088,69 +1173,36 @@ const
   ]
 
   RfPriBzTxcalParams: array[RfPriBzTxcalSearchRecords, array[7, uint32]] = [
-    [2'u32, 4'u32, 7'u32, 3'u32, 0x00010000'u32, 7'u32, 3'u32],
-    [2'u32, 4'u32, 7'u32, 3'u32, 0x00015000'u32, 7'u32, 5'u32],
-    [2'u32, 4'u32, 7'u32, 3'u32, 0x00019000'u32, 7'u32, 7'u32],
-    [0'u32, 4'u32, 7'u32, 3'u32, 0x0001A000'u32, 6'u32, 7'u32],
-    [0'u32, 4'u32, 7'u32, 3'u32, 0x00020000'u32, 5'u32, 7'u32],
-    [2'u32, 4'u32, 7'u32, 3'u32, 0x00015000'u32, 7'u32, 5'u32],
-    [2'u32, 4'u32, 7'u32, 3'u32, 0x00018000'u32, 7'u32, 7'u32],
-    [0'u32, 4'u32, 7'u32, 3'u32, 0x0001A000'u32, 6'u32, 7'u32],
-    [0'u32, 4'u32, 7'u32, 3'u32, 0x0001B000'u32, 5'u32, 7'u32]
+    [2'u32, 4'u32, 7'u32, 3'u32, 0x00000100'u32, 7'u32, 3'u32],
+    [2'u32, 4'u32, 7'u32, 3'u32, 0x00000150'u32, 7'u32, 5'u32],
+    [2'u32, 4'u32, 7'u32, 3'u32, 0x00000190'u32, 7'u32, 7'u32],
+    [0'u32, 4'u32, 7'u32, 3'u32, 0x000001A0'u32, 6'u32, 7'u32],
+    [0'u32, 4'u32, 7'u32, 3'u32, 0x00000200'u32, 5'u32, 7'u32],
+    [2'u32, 4'u32, 7'u32, 3'u32, 0x00000150'u32, 7'u32, 5'u32],
+    [2'u32, 4'u32, 7'u32, 3'u32, 0x00000180'u32, 7'u32, 7'u32],
+    [0'u32, 4'u32, 7'u32, 3'u32, 0x000001A0'u32, 6'u32, 7'u32],
+    [0'u32, 4'u32, 7'u32, 3'u32, 0x000001B0'u32, 5'u32, 7'u32]
   ]
 
   RfPriTxcalParams: array[RfPriTxcalSearchRecords, array[7, uint32]] = [
-    [2'u32, 4'u32, 7'u32, 3'u32, 0x00010000'u32, 7'u32, 2'u32],
-    [2'u32, 4'u32, 7'u32, 3'u32, 0x00010000'u32, 7'u32, 4'u32],
-    [2'u32, 4'u32, 7'u32, 3'u32, 0x00010100'u32, 7'u32, 5'u32],
-    [2'u32, 4'u32, 7'u32, 3'u32, 0x00017000'u32, 7'u32, 6'u32],
-    [2'u32, 4'u32, 7'u32, 3'u32, 0x0001B000'u32, 7'u32, 7'u32],
-    [0'u32, 4'u32, 7'u32, 3'u32, 0x00019000'u32, 5'u32, 7'u32],
-    [0'u32, 4'u32, 7'u32, 3'u32, 0x00020000'u32, 4'u32, 7'u32],
-    [2'u32, 4'u32, 7'u32, 3'u32, 0x00010000'u32, 7'u32, 4'u32],
-    [2'u32, 4'u32, 7'u32, 3'u32, 0x00010100'u32, 7'u32, 5'u32],
-    [2'u32, 4'u32, 7'u32, 3'u32, 0x00017000'u32, 7'u32, 5'u32],
-    [2'u32, 4'u32, 7'u32, 3'u32, 0x00018000'u32, 7'u32, 7'u32],
-    [0'u32, 4'u32, 7'u32, 3'u32, 0x00016000'u32, 6'u32, 7'u32],
-    [0'u32, 4'u32, 7'u32, 3'u32, 0x0001C000'u32, 4'u32, 7'u32],
-    [0'u32, 4'u32, 7'u32, 3'u32, 0x0001D000'u32, 5'u32, 7'u32],
-    [0'u32, 4'u32, 7'u32, 3'u32, 0x0001D000'u32, 4'u32, 7'u32],
-    [0'u32, 4'u32, 7'u32, 3'u32, 0x0001D000'u32, 5'u32, 7'u32],
-    [0'u32, 4'u32, 7'u32, 3'u32, 0x0001D000'u32, 3'u32, 7'u32],
-    [0'u32, 4'u32, 7'u32, 3'u32, 0x0001D000'u32, 5'u32, 7'u32]
-  ]
-
-  RfPriTxcalPowerSetup: array[RfPriTxcalSearchRecords, array[9, uint16]] = [
-    [0x0003'u16, 0x0001'u16, 0x0007'u16, 0x0017'u16, 0x0000'u16, 0x0007'u16, 0x0000'u16, 0xFFFF'u16, 0x00F0'u16],
-    [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x0019'u16, 0x0000'u16, 0x0007'u16, 0x0000'u16, 0x0000'u16, 0x00D2'u16],
-    [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x0011'u16, 0x0000'u16, 0x0007'u16, 0x0000'u16, 0x0000'u16, 0x00B4'u16],
-    [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x000C'u16, 0x0000'u16, 0x0007'u16, 0x0000'u16, 0xFFFF'u16, 0x0096'u16],
-    [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x0008'u16, 0x0000'u16, 0x0007'u16, 0x0000'u16, 0xFFFF'u16, 0x0078'u16],
-    [0x0000'u16, 0x0001'u16, 0x0005'u16, 0x0008'u16, 0x0000'u16, 0x0007'u16, 0x0000'u16, 0xFFFE'u16, 0x005A'u16],
-    [0x0000'u16, 0x0001'u16, 0x0004'u16, 0x0006'u16, 0x0000'u16, 0x0007'u16, 0x0000'u16, 0x0000'u16, 0x003C'u16],
-    [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x001B'u16, 0x0003'u16, 0x0007'u16, 0x0001'u16, 0x0000'u16, 0x005A'u16],
-    [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x0012'u16, 0x0003'u16, 0x0007'u16, 0x0001'u16, 0x0000'u16, 0x003C'u16],
-    [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x000C'u16, 0x0003'u16, 0x0007'u16, 0x0001'u16, 0x0001'u16, 0x001E'u16],
-    [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x0009'u16, 0x0003'u16, 0x0007'u16, 0x0001'u16, 0xFFFE'u16, 0x0000'u16],
-    [0x0000'u16, 0x0001'u16, 0x0006'u16, 0x0007'u16, 0x0003'u16, 0x0007'u16, 0x0001'u16, 0xFFFF'u16, 0xFFE2'u16],
-    [0x0000'u16, 0x0001'u16, 0x0004'u16, 0x0007'u16, 0x0003'u16, 0x0007'u16, 0x0001'u16, 0xFFFF'u16, 0xFFC4'u16],
-    [0x0000'u16, 0x0001'u16, 0x0003'u16, 0x0006'u16, 0x0003'u16, 0x0007'u16, 0x0001'u16, 0xFFFF'u16, 0xFFA6'u16],
-    [0x0000'u16, 0x0001'u16, 0x0001'u16, 0x0009'u16, 0x0003'u16, 0x0007'u16, 0x0001'u16, 0xFFFF'u16, 0xFF88'u16],
-    [0x0000'u16, 0x0001'u16, 0x0001'u16, 0x0007'u16, 0x0003'u16, 0x0007'u16, 0x0001'u16, 0xFFFD'u16, 0xFF6A'u16],
-    [0x0000'u16, 0x0001'u16, 0x0000'u16, 0x0009'u16, 0x0003'u16, 0x0007'u16, 0x0001'u16, 0x0000'u16, 0xFF4C'u16],
-    [0x0000'u16, 0x0001'u16, 0x0000'u16, 0x0006'u16, 0x0003'u16, 0x0007'u16, 0x0001'u16, 0x0000'u16, 0xFF2E'u16]
-  ]
-
-  RfPriBzTxcalPowerSetup: array[RfPriBzTxcalSearchRecords, array[9, uint16]] = [
-    [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x001B'u16, 0x0000'u16, 0x0005'u16, 0x0000'u16, 0xFFFE'u16, 0x00E6'u16],
-    [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x000F'u16, 0x0000'u16, 0x0005'u16, 0x0000'u16, 0x0002'u16, 0x00C8'u16],
-    [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x0009'u16, 0x0000'u16, 0x0005'u16, 0x0000'u16, 0xFFFE'u16, 0x0096'u16],
-    [0x0000'u16, 0x0001'u16, 0x0005'u16, 0x0007'u16, 0x0000'u16, 0x0005'u16, 0x0000'u16, 0xFFFC'u16, 0x0064'u16],
-    [0x0000'u16, 0x0001'u16, 0x0002'u16, 0x0006'u16, 0x0000'u16, 0x0005'u16, 0x0000'u16, 0x0004'u16, 0x0032'u16],
-    [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x0010'u16, 0x0000'u16, 0x0005'u16, 0x0001'u16, 0x0002'u16, 0x005A'u16],
-    [0x0000'u16, 0x0001'u16, 0x0007'u16, 0x000A'u16, 0x0000'u16, 0x0005'u16, 0x0001'u16, 0x0000'u16, 0x0032'u16],
-    [0x0000'u16, 0x0001'u16, 0x0006'u16, 0x0007'u16, 0x0000'u16, 0x0005'u16, 0x0001'u16, 0x0000'u16, 0x000A'u16],
-    [0x0000'u16, 0x0001'u16, 0x0003'u16, 0x0008'u16, 0x0000'u16, 0x0005'u16, 0x0001'u16, 0x0000'u16, 0xFFE2'u16]
+    [2'u32, 4'u32, 7'u32, 3'u32, 0x00000100'u32, 7'u32, 2'u32],
+    [2'u32, 4'u32, 7'u32, 3'u32, 0x00000100'u32, 7'u32, 4'u32],
+    [2'u32, 4'u32, 7'u32, 3'u32, 0x00000110'u32, 7'u32, 5'u32],
+    [2'u32, 4'u32, 7'u32, 3'u32, 0x00000170'u32, 7'u32, 6'u32],
+    [2'u32, 4'u32, 7'u32, 3'u32, 0x000001B0'u32, 7'u32, 7'u32],
+    [0'u32, 4'u32, 7'u32, 3'u32, 0x00000190'u32, 5'u32, 7'u32],
+    [0'u32, 4'u32, 7'u32, 3'u32, 0x00000200'u32, 4'u32, 7'u32],
+    [2'u32, 4'u32, 7'u32, 3'u32, 0x00000100'u32, 7'u32, 4'u32],
+    [2'u32, 4'u32, 7'u32, 3'u32, 0x00000110'u32, 7'u32, 5'u32],
+    [2'u32, 4'u32, 7'u32, 3'u32, 0x00000170'u32, 7'u32, 5'u32],
+    [2'u32, 4'u32, 7'u32, 3'u32, 0x00000180'u32, 7'u32, 7'u32],
+    [0'u32, 4'u32, 7'u32, 3'u32, 0x00000160'u32, 6'u32, 7'u32],
+    [0'u32, 4'u32, 7'u32, 3'u32, 0x000001C0'u32, 4'u32, 7'u32],
+    [0'u32, 4'u32, 7'u32, 3'u32, 0x000001D0'u32, 5'u32, 7'u32],
+    [0'u32, 4'u32, 7'u32, 3'u32, 0x000001D0'u32, 4'u32, 7'u32],
+    [0'u32, 4'u32, 7'u32, 3'u32, 0x000001D0'u32, 5'u32, 7'u32],
+    [0'u32, 4'u32, 7'u32, 3'u32, 0x000001D0'u32, 3'u32, 7'u32],
+    [0'u32, 4'u32, 7'u32, 3'u32, 0x000001D0'u32, 5'u32, 7'u32]
   ]
 
 template rfRegs(): ptr RfRegBlock =
@@ -1188,12 +1240,6 @@ template rfTxPowerCompTableRegs(): ptr RfTxPowerCompTableBlock =
 
 template wifiAgcMemoryRegs(): ptr WifiAgcMemoryRam =
   cast[ptr WifiAgcMemoryRam](WifiAgcMemoryBase)
-
-proc writeRfTxPowerCompTable(words: openArray[uint32]) =
-  let txPowerCompTable = rfTxPowerCompTableRegs()
-  for txPowerCompWordIndex, txPowerCompWordValue in words:
-    volatileStore(addr txPowerCompTable.txPowerCompWords700[txPowerCompWordIndex],
-                  txPowerCompWordValue)
 
 proc rfPriReadTxPowerTable(scope: RfPriPowerTableScope): array[43, uint32] =
   let table = rfTxPowerCompTableRegs()
@@ -2076,34 +2122,76 @@ proc bl808PhyProgramRxTailRegs() =
   updateReg32(addr mdm.rxGainTailCtrlC018, 0xFFFFFC00'u32, 0x00000050'u32)
 
 proc bl808MdmSetChannel(primFreq, centerFreq1, chanType: uint32) =
+  ## librf_bl808.a:phy.c.o mdm_set_channel.constprop.0.
+  crm_mdm_reset()
   let mdm = wifiModemRegs()
   let macPhy = macPhyCtrlRegs()
-  crm_mdm_reset()
-  if primFreq != 0'u32 and centerFreq1 != 0'u32:
-    let ratio = ((centerFreq1 shl 15) div primFreq) and 0x7FFF'u32
-    updateReg32(addr mdm.channelCenterRatio84c, 0xFFFF8000'u32, ratio)
+  let bba = bbaAgcRegs()
+  let divider = cast[uint32](
+    if centerFreq1 == 0'u32: -1'i32
+    else: 0x04000000'i32 div cast[int32](centerFreq1)) and 0xFFFF'u32
+  if (divider and not 0x7FFF'u32) != 0'u32:
+    wrapPhyAssertErr("(((uint32_t)invcarrierfreq << 0) & ~((uint32_t)0x00007FFF)) == 0",
+                     "module", 0x2A60.cint)
+  let ratio =
+    if primFreq == 0'u32: 0xFFFF'u32
+    else: ((centerFreq1 shl 15) div primFreq) and 0xFFFF'u32
+  updateReg32(addr mdm.channelClockDivider84c, 0xFFFF8000'u32, divider)
+  volatileStore(addr mdm.channelCenterRatio8ec, ratio)
+  let txBandwidthBits = chanType shl 24
+  if chanType == 1'u32:
+    let sideband = uint32(primFreq >= centerFreq1)
+    volatileStore(addr bba.channelSideband080, sideband + 1'u32)
+    volatileStore(addr mdm.preAgcSignal848, sideband)
+  else:
+    volatileStore(addr bba.channelSideband080, 0'u32)
+    volatileStore(addr mdm.preAgcSignal848, 0'u32)
+    if (txBandwidthBits and not 0x03000000'u32) != 0'u32:
+      wrapPhyAssertErr("(((uint32_t)txcbwmax << 24) & ~((uint32_t)0x03000000)) == 0",
+                       "module", 0x20FA.cint)
   updateReg32(addr mdm.channelTypeCtrl824, 0xFCFFFFFF'u32, chanType shl 24)
+  if ((chanType shl 16) and not 0x00030000'u32) != 0'u32:
+    wrapPhyAssertErr("(((uint32_t)maxsupportedbw << 16) & ~((uint32_t)0x00030000)) == 0",
+                     "module", 0x307B.cint)
   updateReg32(addr macPhy.channelBandwidthCtrl310,
               0xFFFCFFFF'u32, chanType shl 16)
+  volatileStore(addr mdm.channelSync808, 0xF7C0FBFF'u32)
+  if (chanType and not 0xF'u32) != 0'u32:
+    wrapPhyAssertErr("(((uint32_t)confbw << 0) & ~((uint32_t)0x0000000F)) == 0",
+                     "module", 0x16BA.cint)
+  updateReg32(addr mdm.versionFeatureCtrl800, 0xFFFFFFF0'u32, chanType)
+  if (txBandwidthBits and not 0x03000000'u32) != 0'u32:
+    wrapPhyAssertErr("(((uint32_t)rxcbwmax << 24) & ~((uint32_t)0x03000000)) == 0",
+                     "module", 0x1EEA.cint)
+  updateReg32(addr mdm.bandwidth20MProfile820, 0xFCFFFFFF'u32, txBandwidthBits)
+  updateReg32(addr mdm.channelFeature890, not 2'u32, 0'u32)
+  updateReg32(addr mdm.preAgcDetect894, 0x00FFFFFF'u32, 0'u32)
   if chanType == 0'u32:
-    volatileStore(addr mdm.bandwidth20MProfile820, 0x0000130D'u32)
-    volatileStore(addr mdm.channelTypeCtrl824, 0x0000010D'u32)
-    volatileStore(addr mdm.bandwidth20MProfile830, 0x00001B0F'u32)
-    volatileStore(addr mdm.bandwidth20MSignal83c, 0x04920492'u32)
-    volatileStore(addr mdm.bandwidth20MSignal840, 0x03310000'u32)
-    volatileStore(addr mdm.bandwidth20MFilter860, 0x00007F03'u32)
-    volatileStore(addr mdm.bandwidth20MGate874, 0x08000000'u32)
-    updateReg32(addr mdm.bandwidth20MEnable834, 0xFFFFFFFE'u32, 0x00000001'u32)
-    updateReg32(addr mdm.bandwidth20MGuard814, not 0x0000A000'u32, 0'u32)
-
-proc pulsePhyChannelRfWindow() =
-  ## Vendor phy_set_channel pulses this modem register immediately before
-  ## rf_set_channel/rfc_config_channel.
-  let reg = addr wifiModemRegs().phyChannelPulse888
-  volatileStore(reg, 0x00000111'u32)
-  for _ in 0 ..< 10:
-    discard volatileLoad(reg)
-  volatileStore(reg, 0'u32)
+    volatileStore(addr mdm.channelTiming838, 0x180'u32)
+    volatileStore(addr mdm.channelProfile81c, 0x02000F0A'u32)
+    updateReg32(addr mdm.channelTiming804, 0x00FFFFFF'u32, 0x19000000'u32)
+    updateReg32(addr mdm.bandwidth20MEnable834, 0x00FFFFFF'u32, 0x01000000'u32)
+    updateReg32(addr bba.channelBandwidth374, 0xFCFFFFFF'u32, 0x03000000'u32)
+    updateReg32(addr mdm.channelProfile870, 0x00FFFFFF'u32, 0x01000000'u32)
+    updateReg32(addr mdm.channelClockDivider84c, 0xFDFFFFFF'u32, 0'u32)
+    updateReg32(addr mdm.channelFilter88c, 0xFFFF00FF'u32, 0x2100'u32)
+    volatileStore(addr bba.macActiveB340, 0'u32)
+    volatileStore(addr bba.macActiveB344, 0'u32)
+    volatileStore(addr bba.channelProfile348, 0'u32)
+  else:
+    if chanType == 1'u32:
+      volatileStore(addr mdm.channelTiming838, 0x180'u32)
+      volatileStore(addr mdm.channelProfile81c, 0x03001E1F'u32)
+      updateReg32(addr mdm.channelTiming804, 0x00FFFFFF'u32, 0x18000000'u32)
+      updateReg32(addr mdm.channelTiming804, 0xFFFFFF00'u32, 0xB'u32)
+      updateReg32(addr mdm.channelFilter88c, 0xFFFF00FF'u32, 0x1100'u32)
+      updateReg32(addr mdm.channelFeature890, not 0'u32, 2'u32)
+    volatileStore(addr bba.macActiveB340, 0x02040507'u32)
+    volatileStore(addr bba.macActiveB344, 1'u32)
+    volatileStore(addr bba.channelProfile348, 0'u32)
+    updateReg32(addr bba.channelBandwidth378, 0x80FFFFFF'u32, 0x08000000'u32)
+    updateReg32(addr bba.channelBandwidth374, 0xFCFFFFFF'u32, 0'u32)
+  volatileStore(addr mdm.preAgcDetect894, 7'u32)
 
 proc phy_mdm_isr*() {.exportc, cdecl.} =
   ## The selected RF archive has no modem-IRQ register work. RC completion
@@ -2259,7 +2347,6 @@ proc phyChannelMatches(channel: ptr ChanCtxtDefView): bool =
     volatileLoad(addr env.centerFreq2) == channel.centerFreq2 and
     (volatileLoad(addr env.txPowerAndFlags) shr 8).uint8 == channel.phyEnvFlags
 
-proc rfPriApplyWb03RfcEntryBaseline()
 proc rfPhyTraceCheckpoint(phase: uint32)
 
 proc phy_set_channel*(channel: ptr ChanCtxtDefView, force: uint32)
@@ -2274,8 +2361,6 @@ proc phy_set_channel*(channel: ptr ChanCtxtDefView, force: uint32)
   bl808MdmSetChannel(channel.primFreq.uint32, channel.centerFreq1.uint32,
                      channel.chanType.uint32)
   rfc_config_bandwidth(channel.chanType.uint32)
-  rfPriApplyWb03RfcEntryBaseline()
-  pulsePhyChannelRfWindow()
   rfc_config_channel(channel.centerFreq1.uint32)
   rfPhyTraceCheckpoint(0x41'u32)
   volatileStore(addr env.channelBandType, cast[ptr uint16](channel)[])
@@ -2339,10 +2424,7 @@ proc phyInitProgramInitialChannel() =
   bl808MdmSetChannel(initial.primFreq.uint32, initial.centerFreq1.uint32,
                      initial.chanType.uint32)
   rfc_config_bandwidth(0'u32)
-  rfPriApplyWb03RfcEntryBaseline()
-  pulsePhyChannelRfWindow()
   rfc_config_channel(initial.centerFreq1.uint32)
-  trpcLoadPowerFromConfig(0'u8)
 
 proc phy_init*(cfg: pointer) {.exportc, cdecl.} =
   phyInitValidateClock()
@@ -2964,7 +3046,7 @@ type
     sdmDivC4: uint32
     hbnCtrl30: uint32
     txcalDfe88: uint32
-    calPathConfig8c: uint32
+    calPathCtrl90: uint32
     txcalTosdac600: uint32
     calMeasurePrep60c: uint32
     measureCtrl618: uint32
@@ -3013,18 +3095,21 @@ type
     acalCtrlA4: uint32
 
 var
-  bl808RfXtalIndex: uint32
+  bl808RfXtalIndex: uint32 = 4
   bl808RfPriXtal24mFlag: uint8
   bl808RfPriXtal26mFlag: uint8
   bl808RfPriXtal32mFlag: uint8
   bl808RfPriXtal38p4mFlag: uint8
   bl808RfPriXtal40mFlag: uint8 = 1
   bl808RfPriXtal52mFlag: uint8
+  bl808RfPriXtalTableIndex: int8 = -1
+  bl808RfPriPllRefdivRatio: uint16 = 1
+  bl808RfPriFcalDiv: uint16 = 0x0085
   bl808RfMode: RadioPhyMode
   bl808RfColdInit: uint32
   bl808RfChannelMhz: uint32
   bl808RfBandwidthMhz: uint32
-  bl808RfChannelPowerIndex: uint32
+  bl808RfChannelPowerIndex: uint8 = 1'u8
   bl808RfLowPowerTableDelta: int16
   bl808RfChannelPowerComp: array[14, int16]
   bl808RfChannelLpPowerComp: array[14, int16]
@@ -3476,35 +3561,6 @@ proc writeRfPriFixedPowerCompTailDefaults() =
   updateReg32(addr rf.txPowerCompTail7d4, 0xFFC00000'u32, 0x00191064'u32)
   updateReg32(addr rf.txPowerCompTail7d8, 0xFFC00000'u32, 0x00177064'u32)
 
-proc writeRfPriStaticInit() =
-  ## Typed port of librf_bl808.a:rf_pri.c.o rf_pri_init static register phase.
-  let rf = rfRegs()
-  let pll = rfPllRegs()
-  let dfe = rfDfeInitRegs()
-  updateReg32(addr pll.enableCtrl30, 0xFFFFF9FF'u32, 0x000001FC'u32)
-  updateReg32(addr pll.enableCtrl30, 0xFFFFFFFF'u32, 0x00000002'u32)
-  updateReg32(addr pll.enableCtrl30, 0xFFFFFFFF'u32, 0x00000001'u32)
-  updateReg32(addr rf.rxMode220, 0xFFFFE67D'u32, 0'u32)
-  updateReg32(addr rf.rxMode220, 0xFFFFFF9E'u32, 0'u32)
-  updateReg32(addr dfe.dfeStaticCtrl820, 0xFF0FFFFF'u32, 0x00300000'u32)
-  updateReg32(addr dfe.hbnCtrl30, 0xF0FFFFFF'u32, 0x08000000'u32)
-  updateReg32(addr rf.priModeCtrl30, 0xFFFFFFFF'u32, 0x00001003'u32)
-  updateReg32(addr dfe.dfeRfFixedDefault884, 0xF000FFFF'u32, 0x082000F4'u32)
-  updateReg32(addr rf.rfPriBiasTrimCc, 0xFFFFFFFF'u32, 0x10000000'u32)
-  updateReg32(addr rf.synthDfePathControl63c, 0x00000000'u32, 0'u32)
-  updateReg32(addr rf.txcalGain64, 0xFFFE0008'u32, 0x00004C2C'u32)
-  updateReg32(addr rf.txcalDefaultProfile128, 0xFF800800'u32, 0x004C2491'u32)
-  updateReg32(addr rf.txcalDefaultProfile12c, 0xFF800800'u32, 0x004C24C2'u32)
-  updateReg32(addr rf.txcalDefaultProfile130, 0xFF800FFF'u32, 0x00491000'u32)
-  updateReg32(addr rf.rfBiasTrimD4, 0xFFF0F00F'u32, 0x00F013C1'u32)
-  updateReg32(addr rf.calPathCtrl90, 0xFFFFFFFF'u32, 0x00010000'u32)
-  updateReg32(addr rf.txcalCtrlB8, 0xFFFFFFFF'u32, 0x00000010'u32)
-  updateReg32(addr rf.calModeDefault138, 0xFFFFFFFF'u32, 0x00000003'u32)
-  updateReg32(addr rf.txcalDefaultProfile130, 0xFFFFFE92'u32, 0x00000092'u32)
-  updateReg32(addr rf.calPathConfig8c, 0xFFFFFFF8'u32, 0x00000002'u32)
-  updateReg32(addr rf.measureCtrl618, 0x3FFFFFFF'u32, 0'u32)
-  updateReg32(addr rf.rxMode220, 0xFFFFFFEF'u32, 0'u32)
-
 proc writeRfPriFixedValueRegs() =
   ## Port of librf_bl808.a:rf_pri.c.o rf_pri_fixed_val_regs.
   nim_wifi_rf_fixed_val_breakpoint()
@@ -3535,13 +3591,6 @@ proc writeRfPriFixedValueRegs() =
   nim_wifi_rf_fixed_val_rfa0 = volatileLoad(addr rf.acalCtrlA4)
   rfPhyTraceCheckpoint(0x1F'u32)
   rfPhyTraceCheckpoint(0x20'u32)
-
-proc rfPriApplyWb03RuntimeLatches() =
-  if rfPriIsWb03():
-    let rf = rfRegs()
-    updateReg32(addr rf.calPathCtrl90, 0xFFFFFFFF'u32, 0x00010000'u32)
-    updateReg32(addr rf.txcalDfe88, 0xFFFFFFFF'u32, 0x00010000'u32)
-    updateReg32(addr rf.acalCtrlA4, 0xFFFFFFFF'u32, 0x00000100'u32)
 
 var nim_wifi_rf_pri_txcal_count* {.exportc.}: uint32
 var nim_wifi_rf_pri_lo_fcal_count* {.exportc.}: uint32
@@ -3605,7 +3654,8 @@ var wifiRfTxcalRecordWord0Log* {.exportc: "nim_wifi_rf_txcal_word0_log".}: array
 var wifiRfTxcalRecordWord1Log* {.exportc: "nim_wifi_rf_txcal_word1_log".}: array[RfPriTxcalSearchRecords, uint32]
 var nim_wifi_rf_txcal_power_log* {.exportc.}: array[RfPriTxcalSearchRecords, uint32]
 var nim_wifi_rf_txcal_amp_log* {.exportc.}: array[RfPriTxcalSearchRecords, uint32]
-var nim_wifi_rf_txcal_tmxcs_power_log* {.exportc.}: array[RfTxcalMixerCsCount, uint32]
+var nim_wifi_rf_txcal_tmxcs_power_log* {.exportc.}: array[RfTxcalOsdacTraceEntries, uint32]
+var rfTxcalOsdacCode: uint32
 var nim_wifi_rf_txcal_sample_count* {.exportc.}: uint32
 var nim_wifi_rf_txcal_sample_param_log* {.exportc.}: array[RfTxcalSampleTraceEntries, uint32]
 var nim_wifi_rf_txcal_sample_candidate_log* {.exportc.}: array[RfTxcalSampleTraceEntries, uint32]
@@ -3634,21 +3684,14 @@ var nim_wifi_rf_tx_power_replay_skip_reason* {.exportc.}: uint32
 var nim_wifi_rf_tx_power_txcal_complete* {.exportc.}: uint32
 var nim_wifi_rf_tx_power_bz_txcal_complete* {.exportc.}: uint32
 
-proc sampleRfTxcalAverage(): tuple[ok: bool, value: int32]
+proc sampleRfTxcalAverage(): tuple[ok: bool, value: int32, ctrl, mode, iRaw: uint32]
+proc rfPriWriteTxPowerTable(scope: RfPriPowerTableScope = rfPowerAll;
+    phases: set[RfPriPowerTablePhase] = {rfPowerFields, rfPowerCalibration})
 proc rfPriConfigChannelForCal(loChannelIndex: int)
 var nim_wifi_rf_roscal_search_log* {.exportc.}: array[16, uint32]
 var nim_wifi_rf_fcal_search_log* {.exportc.}: array[16, uint32]
 var nim_wifi_rf_rccal_search_log* {.exportc.}: array[32, uint32]
 var nim_wifi_rf_rccal_power_log* {.exportc.}: array[32, uint32]
-
-proc rfPriApplyWb03RxcalTosdacLatch() =
-  if not rfPriIsWb03() or
-      bl808RfXtalIndex != xtalIndex(WlXtal40M):
-    return
-  let rf = rfRegs()
-  updateReg32(addr rf.txcalTosdac600, not RfPriWb03RxcalTosdacReplayMask,
-              RfPriWb03RxcalTosdacSeed and
-              RfPriWb03RxcalTosdacReplayMask)
 
 proc rfSignedByte(value: uint8): int16 {.inline.} =
   cast[int8](value).int16
@@ -3757,19 +3800,22 @@ proc rfPriRefreshRf70ReplayWindowDiagnostics() =
   rf70ReplayWindow0SourceNibble = (lowBandReplayWord shr 24) and 0xF'u32
   rf70ReplayWindow1SourceNibble = (highBandReplayWord shr 8) and 0xF'u32
   rf70ReplayWindow2SourceNibble = (highBandReplayWord shr 4) and 0xF'u32
-  rf70ReplayWindowValidMask =
-    (if lowBandReplayWord != 0'u32: 0x1'u32 else: 0'u32) or
-    (if (highBandReplayWord and 0x00000F00'u32) != 0'u32: 0x2'u32 else: 0'u32) or
-    (if (highBandReplayWord and 0x000000F0'u32) != 0'u32: 0x4'u32 else: 0'u32)
+  rf70ReplayWindowValidMask = 0x7'u32
 
-proc rfPriStoreRf70ReplayWindowNibbles(window0, window1, window2: uint32) =
-  rfCalibSetRf70ReplayLowBandWord(
-    (rfCalibRf70ReplayLowBandWord() and 0x00FF_FFFF'u32) or
-    ((window0 and 0xF'u32) shl 24))
-  rfCalibSetRf70ReplayHighBandWord(
-    (rfCalibRf70ReplayHighBandWord() and 0xFFFF_F00F'u32) or
-    ((window1 and 0xF'u32) shl 8) or
-    ((window2 and 0xF'u32) shl 4))
+proc rfPriStoreRf70ReplayWindowNibble(window: int; nibble: uint32) =
+  if rfCalibDataGlobal == nil or window < 0 or window >= 3:
+    return
+  let code = nibble and 0xF'u32
+  case window
+  of 0:
+    rfCalibSetRf70ReplayLowBandWord(
+      (rfCalibRf70ReplayLowBandWord() and 0xF0FF_FFFF'u32) or (code shl 24))
+  of 1:
+    rfCalibSetRf70ReplayHighBandWord(
+      (rfCalibRf70ReplayHighBandWord() and 0xFFFF_F0FF'u32) or (code shl 8))
+  else:
+    rfCalibSetRf70ReplayHighBandWord(
+      (rfCalibRf70ReplayHighBandWord() and 0xFFFF_FF0F'u32) or (code shl 4))
   rfPriRefreshRf70ReplayWindowDiagnostics()
 
 proc rfPriApplyTxcalLowBandRf70ReplayNibble() =
@@ -3806,66 +3852,50 @@ proc rfPriSearchRf70ReplayWindow(window: int): tuple[ok: bool, nibble: uint32] =
   ##   +0x3da..0x466 -> rf_calib_data+0x10 bits 11:8
   ##   +0x49e..0x52a -> rf_calib_data+0x10 bits 7:4
   ##
-  ## Each window writes candidate RF70 low nibbles 0..15 and tracks the two
-  ## strongest signed measurements. LLVM objdump shows the vendor path stores
-  ## the strongest nibble, except when the top two candidates are adjacent; in
-  ## that case it stores the lower adjacent nibble.
+  ## Scores start at -2048, with both candidate indices at 5. Adjacent
+  ## indices select the lower one, including an unchanged floor index.
+  if window < 0 or window >= 3:
+    return (false, 0'u32)
   inc nim_wifi_rf_rf70_txcal_search_count
   var bestNibble = 5'u32
   var runnerUpNibble = 5'u32
-  var bestSample = low(int32)
-  var runnerUpSample = low(int32)
+  var bestSample = -2048'i32
+  var runnerUpSample = -2048'i32
   var lastMeasureCtrl = 0'u32
   var lastMeasureMode = 0'u32
   var lastMeasureIRaw = 0'u32
   let rf = rfRegs()
-  let originalRf70 = volatileLoad(addr rf.txcalParam70)
   for candidate in 0'u32 .. 15'u32:
     updateReg32(addr rf.txcalParam70, 0xFFFF_FFF0'u32, candidate)
     let sample = sampleRfTxcalAverage()
     let candidateTraceIndex = window * 16 + int(candidate)
-    if candidateTraceIndex >= 0 and candidateTraceIndex < 48:
-      rf70ReplayCandidateAverageSample[candidateTraceIndex] =
-        if sample.ok: cast[uint32](sample.value) else: 0x8000_0000'u32
-    if sample.ok:
-      rf70ReplayCandidateValidMask[window] =
-        rf70ReplayCandidateValidMask[window] or
-        (1'u32 shl candidate)
-    lastMeasureCtrl = volatileLoad(addr rf.measureCtrl618)
-    lastMeasureMode = volatileLoad(addr rf.measureMode61c)
-    lastMeasureIRaw = volatileLoad(addr rf.measureI620)
-    if sample.ok:
-      if sample.value > bestSample:
-        runnerUpSample = bestSample
-        runnerUpNibble = bestNibble
-        bestSample = sample.value
-        bestNibble = candidate
-      elif sample.value > runnerUpSample:
-        runnerUpSample = sample.value
-        runnerUpNibble = candidate
-  volatileStore(addr rf.txcalParam70, originalRf70)
+    rf70ReplayCandidateAverageSample[candidateTraceIndex] = cast[uint32](sample.value)
+    rf70ReplayCandidateValidMask[window] =
+      rf70ReplayCandidateValidMask[window] or (1'u32 shl candidate)
+    lastMeasureCtrl = sample.ctrl
+    lastMeasureMode = sample.mode
+    lastMeasureIRaw = sample.iRaw
+    if sample.value > bestSample:
+      runnerUpSample = bestSample
+      runnerUpNibble = bestNibble
+      bestSample = sample.value
+      bestNibble = candidate
+    elif sample.value > runnerUpSample:
+      runnerUpSample = sample.value
+      runnerUpNibble = candidate
 
   let adjacent =
     (int32(bestNibble) - int32(runnerUpNibble) == 1'i32) or
     (int32(runnerUpNibble) - int32(bestNibble) == 1'i32)
-  let ok = bestSample != low(int32)
-  let selected =
-    if ok and adjacent and runnerUpSample != low(int32):
-      min(bestNibble, runnerUpNibble)
-    elif ok:
-      bestNibble
-    else:
-      RfPriWb03Rf70ColdSeed and 0xF'u32
+  let selected = if adjacent: min(bestNibble, runnerUpNibble) else: bestNibble
   rfPriRecordRf70SearchWindow(
-    window, ok, bestNibble, runnerUpNibble, bestSample, runnerUpSample,
+    window, true, bestNibble, runnerUpNibble, bestSample, runnerUpSample,
     lastMeasureCtrl, lastMeasureMode, lastMeasureIRaw)
-  (ok, selected)
+  (true, selected)
 
-proc rfPriPopulateWb03TxcalRf70ReplayFieldsFromSearch(): bool =
-  if not rfPriIsWb03() or
-      bl808RfXtalIndex != xtalIndex(WlXtal40M) or
-      rfCalibDataGlobal == nil:
-    return false
+proc rfPriPopulateTxcalRf70ReplayFields() =
+  if rfCalibDataGlobal == nil:
+    return
   nim_wifi_rf_rf70_txcal_search_ok_mask = 0'u32
   for rf70ReplayWindowIndex in 0 ..< 3:
     rf70ReplaySearchBestNibble[rf70ReplayWindowIndex] = 0'u32
@@ -3880,202 +3910,16 @@ proc rfPriPopulateWb03TxcalRf70ReplayFieldsFromSearch(): bool =
       rf70ReplayCandidateAverageSample[rf70ReplayWindowIndex * 16 + candidate] =
         0'u32
   let window0 = rfPriSearchRf70ReplayWindow(0)
+  rfPriStoreRf70ReplayWindowNibble(0, window0.nibble)
   rfPriConfigChannelForCal(2)
   let window1 = rfPriSearchRf70ReplayWindow(1)
+  rfPriStoreRf70ReplayWindowNibble(1, window1.nibble)
   rfPriConfigChannelForCal(0x11)
   let window2 = rfPriSearchRf70ReplayWindow(2)
+  rfPriStoreRf70ReplayWindowNibble(2, window2.nibble)
   rfPriConfigChannelForCal(9)
-  if window0.ok and window1.ok and window2.ok:
-    if bl808WifiRfWb03ApplyMeasuredRf70Replay:
-      rfPriStoreRf70ReplayWindowNibbles(
-        window0.nibble, window1.nibble, window2.nibble)
-      return true
-    return false
-  false
+  nim_wifi_rf_rf70_replay_reason = RfPriRf70ReplayFieldsMeasuredByTxcal
 
-proc rfPriReplayWb03Rf70FromTxcalCalWords() =
-  ## WB03/40M vendor cold init enters the MAC-active scan transition with
-  ## RF70=0x25181222. Vendor rf_pri_restore_cal_reg rebuilds RF70 from
-  ## rf_calib_data word 3 bits 27:24; the matching word-4 nibble is consumed
-  ## later by rf_pri_optimize. Keep this replay explicit so logs distinguish
-  ## a true TXCAL-produced source field from a late fallback.
-  if not rfPriIsWb03() or
-      bl808RfXtalIndex != xtalIndex(WlXtal40M) or
-      rfCalibDataGlobal == nil:
-    nim_wifi_rf_rf70_replay_reason = RfPriRf70ReplayNotApplicable
-    rfPriRefreshRf70ReplayWindowDiagnostics()
-    return
-  let lowBandReplayWordBefore = rfCalibRf70ReplayLowBandWord()
-  let highBandReplayWordBefore = rfCalibRf70ReplayHighBandWord()
-  let rf = rfRegs()
-  if lowBandReplayWordBefore != 0'u32 or highBandReplayWordBefore != 0'u32:
-    rfPriRefreshRf70ReplayWindowDiagnostics()
-    let hasVendorSource = rf70ReplayWindowValidMask == 0x7'u32
-    if nim_wifi_rf_rf70_replay_reason != RfPriRf70ReplayFieldsMeasuredByTxcal and
-        nim_wifi_rf_rf70_replay_reason != RfPriRf70ReplayFieldsMeasuredFallback:
-      nim_wifi_rf_rf70_replay_reason =
-        if hasVendorSource:
-          RfPriRf70ReplayFieldsPopulatedByTxcal
-        else:
-          RfPriRf70ReplayFieldsUnexpected
-    nim_wifi_rf_rf70_replay_cal_word3_before = lowBandReplayWordBefore
-    nim_wifi_rf_rf70_replay_cal_word4_before = highBandReplayWordBefore
-    nim_wifi_rf_rf70_replay_reg_before = volatileLoad(addr rf.txcalParam70)
-    if hasVendorSource:
-      inc nim_wifi_rf_rf70_replay_apply_count
-      volatileStore(addr rf.txcalParam70,
-                    (RfPriWb03Rf70ColdSeed and 0xFFFF_FFF0'u32) or
-                    rfPriRf70ReplayWindow0Nibble())
-      nim_wifi_rf_rf70_replay_cal_word3_after =
-        rfCalibRf70ReplayLowBandWord()
-      nim_wifi_rf_rf70_replay_cal_word4_after =
-        rfCalibRf70ReplayHighBandWord()
-      nim_wifi_rf_rf70_replay_reg_after = volatileLoad(addr rf.txcalParam70)
-    rfPriRefreshRf70ReplayWindowDiagnostics()
-    return
-  inc nim_wifi_rf_rf70_replay_apply_count
-  nim_wifi_rf_rf70_replay_reason = RfPriRf70ReplayFieldsSeededAtReplay
-  nim_wifi_rf_rf70_replay_reg_before = volatileLoad(addr rf.txcalParam70)
-  nim_wifi_rf_rf70_replay_cal_word3_before = lowBandReplayWordBefore
-  nim_wifi_rf_rf70_replay_cal_word4_before = highBandReplayWordBefore
-  let nibble = RfPriWb03Rf70ColdSeed and 0xF'u32
-  rfPriStoreRf70ReplayWindowNibbles(nibble, nibble, nibble)
-  volatileStore(addr rf.txcalParam70, RfPriWb03Rf70ColdSeed)
-  nim_wifi_rf_rf70_replay_cal_word3_after =
-    rfCalibRf70ReplayLowBandWord()
-  nim_wifi_rf_rf70_replay_cal_word4_after =
-    rfCalibRf70ReplayHighBandWord()
-  nim_wifi_rf_rf70_replay_reg_after = volatileLoad(addr rf.txcalParam70)
-
-proc rfPriPopulateWb03TxcalRf70ReplayFields() =
-  ## LLVM objdump provenance: librf_bl808.a:rf_pri.c.o rf_pri_txcal writes
-  ## RF70's replay source words before the per-record rf_pri_txcal_w2reg
-  ## table path:
-  ##   rf_pri_txcal+0x388..0x3a2 -> rf_calib_data+0x0c bits 27:24
-  ##   rf_pri_txcal+0x450..0x466 -> rf_calib_data+0x10 bits 11:8
-  ##   rf_pri_txcal+0x512..0x52a -> rf_calib_data+0x10 bits 7:4
-  ## Run the recovered strongest-candidate search for UART/JTAG visibility.
-  ## Applying those measured replay windows is default-off because the
-  ## remaining vendor TXCAL setup is not fully recovered yet; the known
-  ## WB03/40M fallback keeps scan/auth behavior stable.
-  if not rfPriIsWb03() or
-      bl808RfXtalIndex != xtalIndex(WlXtal40M) or
-      rfCalibDataGlobal == nil:
-    return
-  if rfCalibRf70ReplayLowBandWord() != 0'u32 or
-      rfCalibRf70ReplayHighBandWord() != 0'u32:
-    return
-  if rfPriPopulateWb03TxcalRf70ReplayFieldsFromSearch():
-    nim_wifi_rf_rf70_replay_reason = RfPriRf70ReplayFieldsMeasuredByTxcal
-    return
-  nim_wifi_rf_rf70_replay_reason = RfPriRf70ReplayFieldsMeasuredFallback
-  let nibble = RfPriWb03Rf70ColdSeed and 0xF'u32
-  rfPriStoreRf70ReplayWindowNibbles(nibble, nibble, nibble)
-
-proc rfPriApplyWb03RccalSeed() =
-  if not rfPriIsWb03() or
-      bl808RfXtalIndex != xtalIndex(WlXtal40M):
-    return
-  let rf = rfRegs()
-  volatileStore(addr rf.rbbRccalCtrl80, RfPriWb03RccalRf80Seed)
-  volatileStore(addr rf.rccalReplay84, RfPriWb03RccalRf84Seed)
-  if rfCalibDataGlobal != nil:
-    let wb03RccalReplayCode = RfPriWb03RccalRf80Seed and RfRccalCodeMask
-    rfCalibSetWord(RfCalibRccalReplayWordIndex,
-      (rfCalibWord(RfCalibRccalReplayWordIndex) and not 0x00FF_FFFF'u32) or
-      wb03RccalReplayCode or (wb03RccalReplayCode shl 6) or
-      (wb03RccalReplayCode shl 12) or (wb03RccalReplayCode shl 18))
-
-proc rfPriApplyWb03ScanRxLatches() =
-  if not rfPriIsWb03() or
-      bl808RfXtalIndex != xtalIndex(WlXtal40M):
-    return
-  ## Hardware evidence: the scan RX latch phase is where the pure path brings
-  ## RF4C/RF88 to the vendor-observed 0x01A76237/0x00011005 state. Keep this
-  ## explicit until the preceding calibration/latch source is fully recovered.
-  rfPriSnapshotBzTxcalState(0x4A'u32)
-  rfPhyTraceCheckpoint(0x4A'u32)
-  let rf = rfRegs()
-  updateReg32(addr rf.calMode14, not 0'u32, 0x00040000'u32)
-  updateReg32(addr rf.calCtrl1c, not 0'u32, 0x00000080'u32)
-  volatileStore(addr rf.txcalParam70, RfPriWb03Rf70ScanSeed)
-  volatileStore(addr rf.txcalTosdac600, RfPriWb03ScanRf1600ActiveSeed)
-  volatileStore(addr rf.scanSynthControl608, RfPriWb03ScanRf1608Seed)
-  volatileStore(addr rf.measureCtrl618, RfPriWb03ScanRf1618Seed)
-  volatileStore(addr rf.scanTxMeasureControl62c, RfPriWb03ScanRf162cSeed)
-  volatileStore(addr rf.rbbRccalCtrl80, RfPriWb03ScanRf80ActiveSeed)
-  volatileStore(addr rf.fcalCtrlA0, 0x0C0C9F96'u32)
-  volatileStore(addr rf.channelCalStatusB4, RfPriWb03ScanRfb4Seed)
-  volatileStore(addr rf.channelFcalConfigBc, RfPriWb03ScanRfbcSeed)
-  volatileStore(addr rf.scanRxLatch4c, RfPriWb03ScanRf4cSeed)
-  volatileStore(addr rf.txcalDfe88, RfPriWb03ScanRf88Seed)
-  volatileStore(addr rf.calPathConfig8c, RfPriWb03ScanRf8cSeed)
-  rfPhyTraceCheckpoint(0x4B'u32)
-  nim_wifi_rf_latch_service_enable(1'u32)
-  waitRfUs(1'u32)
-  rfPhyTraceCheckpoint(0x4C'u32)
-  nim_wifi_rf_latch_service_enable(0'u32)
-  rfPhyTraceCheckpoint(0x4D'u32)
-
-proc rfPriPrepareWb03MacActiveScanState() =
-  ## Vendor reaches chan_pre_switch_channel's mm_active edge with these
-  ## RF and modem latch inputs already set; applying them at the late scan
-  ## RX filter point is too late for the MAC-active RF latch transition.
-  if not rfPriIsWb03() or
-      bl808RfXtalIndex != xtalIndex(WlXtal40M):
-    return
-  rfPriSnapshotBzTxcalState(0x45'u32)
-  let rf = rfRegs()
-  let bba = bbaAgcRegs()
-  volatileStore(addr bba.macActiveB340, 0x00000000'u32)
-  volatileStore(addr bba.macActiveB344, 0x00000000'u32)
-  volatileStore(addr bba.macActiveB368, 0x00070070'u32)
-  volatileStore(addr bba.pdComp36c, 0x07280510'u32)
-  volatileStore(addr bba.macActiveB384, 0xE7750805'u32)
-  volatileStore(addr bba.macActiveB38c, 0x6403880B'u32)
-  volatileStore(addr bba.pdGain390, 0x00000001'u32)
-  volatileStore(addr bba.macActiveB3a0, 0x0BF3009E'u32)
-  volatileStore(addr bba.macActiveB3bc, 0x003D0900'u32)
-  volatileStore(addr bba.macActiveB3c4, 0xDDDBBFCE'u32)
-  volatileStore(addr bba.macActiveC01c, 0x00050050'u32)
-  volatileStore(addr bba.macActiveC020, 0x00050050'u32)
-  volatileStore(addr bba.macActiveC02c, 0x00000008'u32)
-  volatileStore(addr rf.txcalDc6c, 0x00000644'u32)
-  volatileStore(addr rf.txcalParam70, RfPriWb03MacActiveRf70Seed)
-  volatileStore(addr rf.roscalCtrl7c, RfPriWb03MacActiveRf7cSeed)
-  volatileStore(addr rf.fcalCtrlA0, RfPriWb03MacActiveRfa0Seed)
-  volatileStore(addr rf.txcalTosdac600, RfPriWb03MacActiveRf1600Seed)
-  volatileStore(addr rf.scanTxMeasureControl62c, 0x00070007'u32)
-  volatileStore(addr rf.rbbRccalCtrl80, RfPriWb03MacActiveRf80Seed)
-  updateReg32(addr rf.calMode14, not 0'u32, 0x00040000'u32)
-  updateReg32(addr rf.calCtrl1c, not 0'u32, 0x00000080'u32)
-  rfPriSnapshotBzTxcalState(0x46'u32)
-
-proc rfPriApplyWb03AuthTxLatches() =
-  if not bl808WifiRfWb03ForceAuthTxLatches:
-    return
-  if not rfPriIsWb03() or
-      bl808RfXtalIndex != xtalIndex(WlXtal40M):
-    return
-  let rf = rfRegs()
-  volatileStore(addr rf.txcalParam70, RfPriWb03MacActiveRf70Seed)
-  volatileStore(addr rf.roscalCtrl7c, RfPriWb03MacActiveRf7cSeed)
-  volatileStore(addr rf.fcalCtrlA0, RfPriWb03MacActiveRfa0Seed)
-  when bl808WifiRfWb03AuthTxPulseLatch:
-    volatileStore(addr rf.txcalDfe88, RfPriWb03ScanRf88Seed)
-  volatileStore(addr rf.txcalTosdac600, RfPriWb03MacActiveRf1600Seed)
-  volatileStore(addr rf.scanTxMeasureControl62c, 0x00070007'u32)
-  volatileStore(addr rf.rbbRccalCtrl80, RfPriWb03MacActiveRf80Seed)
-  when bl808WifiRfWb03AuthTxPulseLatch:
-    nim_wifi_rf_latch_service_enable(1'u32)
-    waitRfUs(1'u32)
-    nim_wifi_rf_latch_service_enable(0'u32)
-    # The latch pulse can drop RF88 bit 12 on fast scan->auth transitions.
-    # Auth TX matches the vendor/passing path with RF88 held at 0x00011005.
-    volatileStore(addr rf.txcalDfe88, RfPriWb03ScanRf88Seed)
-  rfPriSnapshotBzTxcalState(0x4B'u32)
-  when bl808WifiRfWb03AuthTxSettleUs > 0:
-    waitRfUs(uint32(bl808WifiRfWb03AuthTxSettleUs))
 
 proc rfPriCaptureWb03AuthTxPrePush() =
   let rf = rfRegs()
@@ -4138,63 +3982,6 @@ proc applyForcedInternalMgmtTxPower(thd: ptr HostTxHwDescView) {.inline.} =
       rate.retryTxPowerControl1 = NimFwForcedMgmtTxPower
       rate.retryTxPowerControl2 = NimFwForcedMgmtTxPower
 
-proc rfPriWaitConfigIdleForWb03RfcEntry() =
-  ## Vendor rf_pri_config_channel tolerates RF[0x10B4] bit 24 at channel
-  ## entry, but bit 20 must clear after paired TXCAL/PRI strobes. The pure
-  ## restore path can otherwise
-  ## enter rfc_config_channel with stale busy/status bits set.
-  if not rfPriIsWb03() or
-      bl808RfXtalIndex != xtalIndex(WlXtal40M):
-    return
-  let rf = rfRegs()
-  var status = volatileLoad(addr rf.channelCalStatusB4)
-  if (status and 0x00100000'u32) == 0'u32:
-    return
-  for _ in 0 ..< RfConfigChannelWaitLimit:
-    updateReg32(addr rf.txcalCtrlB8, not 0'u32, 0x00010000'u32)
-    waitRfUs(10'u32)
-    updateReg32(addr rf.txcalCtrlB8, not 0x00010000'u32, 0'u32)
-    waitRfUs(50'u32)
-    updateReg32(addr rf.channelCalStrobeB0, 0xFFFFFFFF'u32, 0x10000000'u32)
-    waitRfUs(10'u32)
-    updateReg32(addr rf.channelCalStrobeB0, not 0x10000000'u32, 0'u32)
-    waitRfUs(50'u32)
-    status = volatileLoad(addr rf.channelCalStatusB4)
-    if (status and 0x00100000'u32) == 0'u32:
-      return
-  inc nim_wifi_rf_config_channel_wait_timeout_count
-  nim_wifi_rf_last_config_channel_status = status
-
-proc rfPriApplyWb03RfcEntryBaseline() =
-  ## Keep the scan/RFC latch inputs that are not yet naturally reproduced by
-  ## pure calibration. Do not force RF70/RFA0/RFB4 here: JTAG at
-  ## rfc_config_channel shows those are calibration-derived in the vendor path.
-  if not rfPriIsWb03() or
-      bl808RfXtalIndex != xtalIndex(WlXtal40M):
-    return
-  let rf = rfRegs()
-  volatileStore(addr rf.txcalTosdac600, RfPriWb03RfcEntryRf1600Seed)
-  volatileStore(addr rf.rbbRccalCtrl80, RfPriWb03ScanRf80ListenSeed)
-  volatileStore(addr rf.channelFcalConfigBc, RfPriWb03ScanRfbcSeed)
-  volatileStore(addr rf.scanSynthControl608, RfPriWb03ScanRf1608Seed)
-  volatileStore(addr rf.measureCtrl618, RfPriWb03ScanRf1618Seed)
-  volatileStore(addr rf.calPathConfig8c, RfPriWb03ScanRf8cSeed)
-  rfPriWaitConfigIdleForWb03RfcEntry()
-
-proc rfPriApplyWb03ScanBaseline() =
-  if not rfPriIsWb03() or
-      bl808RfXtalIndex != xtalIndex(WlXtal40M):
-    return
-  let rf = rfRegs()
-  volatileStore(addr rf.txcalTosdac600, RfPriWb03ScanRf1600BaselineSeed)
-  volatileStore(addr rf.scanSynthControl608, RfPriWb03ScanRf1608Seed)
-  volatileStore(addr rf.measureCtrl618, RfPriWb03ScanRf1618Seed)
-  volatileStore(addr rf.rbbRccalCtrl80, RfPriWb03RccalRf80Seed)
-  volatileStore(addr rf.channelCalStatusB4, RfPriWb03ScanRfb4Seed)
-  volatileStore(addr rf.channelFcalConfigBc, RfPriWb03ScanRfbcSeed)
-  volatileStore(addr rf.txcalDfe88, RfPriWb03ScanRf88Seed)
-  volatileStore(addr rf.calPathConfig8c, RfPriWb03ScanRf8cSeed)
-
 proc wlCfgU32(offset: int): uint32 =
   if wlCfgGlobal == nil:
     return 0'u32
@@ -4203,12 +3990,6 @@ proc wlCfgU32(offset: int): uint32 =
     (bytes[offset + 1].uint32 shl 8) or
     (bytes[offset + 2].uint32 shl 16) or
     (bytes[offset + 3].uint32 shl 24)
-
-proc wlCfgWb03RxcalReplayA8Word(): uint32 {.inline.} =
-  wlCfgU32(WlRfCfgRxcalA8Offset)
-
-proc wlCfgWb03RxcalReplayAcWord(): uint32 {.inline.} =
-  wlCfgU32(WlRfCfgRxcalAcOffset)
 
 proc rfLoFcal(loChannelIndex: int): uint16 {.inline.} =
   (rfCalibHalf(RfCalibLoVcoHalfwordBase + loChannelIndex) shr 8) and 0x00FF'u16
@@ -4230,37 +4011,37 @@ proc setRfLoAcal(loChannelIndex: int, acal: uint16) =
     (acal and 0x003F'u16)
   rfCalibSetHalf(loCalibrationHalfwordIndex, packedLoCalibrationHalfword)
 
-proc rfCalibHasRestoreData(): bool =
-  if rfCalibDataGlobal == nil:
-    return false
-  for restoreDataWordIndex in [2, 3, 18, 19, 20, 21, 22, 23, 24, 25]:
-    if rfCalibWord(restoreDataWordIndex) != 0'u32:
-      return true
-  false
+proc rfPriXtalTablesReady(): bool {.inline.} =
+  bl808RfPriXtalTableIndex >= 0 and
+    bl808RfPriXtalTableIndex.int < RfChannelDivTables.len
 
-proc rfCalibHasTxcalData(): bool =
-  if rfCalibDataGlobal == nil:
-    return false
-  for txcalReplayRecordWordIndex in 0 ..< RfPriTxcalSearchRecords * 2:
-    if rfCalibWord(RfCalibTxcalRecordBaseWord + txcalReplayRecordWordIndex) != 0'u32:
-      return true
-  false
+proc rfPriChannelDivValue(channel: int): uint32 {.inline.} =
+  RfChannelDivTables[bl808RfPriXtalTableIndex.int][channel]
+
+proc rfPriChannelCntValue(channel: int): uint16 {.inline.} =
+  RfChannelCntTables[bl808RfPriXtalTableIndex.int][channel]
+
+proc rfPriLoFcalCountBound(bound: int): uint16 {.inline.} =
+  RfChannelCntRanges[bl808RfPriXtalTableIndex.int][bound]
 
 proc saveRfPriCalState(): RfPriCalState
 proc restoreRfPriCalState(state: RfPriCalState)
 
 proc waitRfFcalReady(): bool =
   let rf = rfRegs()
-  for _ in 0 ..< RfFcalWaitLimit:
+  # The vendor polls until READY. This interval only records stalls; it must
+  # not let the caller consume an unfinished measurement.
+  var stalledPolls = 0
+  while true:
     if (volatileLoad(addr rf.fcalAc) and RfFcalReadyMask) != 0'u32:
       return true
-    waitRfUs(1'u32)
-  inc nim_wifi_rf_fcal_wait_timeout_count
-  false
+    inc stalledPolls
+    if stalledPolls == RfFcalWaitLimit:
+      inc nim_wifi_rf_fcal_wait_timeout_count
+      stalledPolls = 0
 
 proc sampleRfFcalCount(): uint16 =
   let rf = rfRegs()
-  updateReg32(addr rf.fcalAc, not RfFcalReadyMask, 0'u32)
   updateReg32(addr rf.fcalAc, not 0'u32, RfFcalStartMask)
   discard waitRfFcalReady()
   result = uint16((volatileLoad(addr rf.calResultA8) shr 16) and 0xFFFF'u32)
@@ -4276,25 +4057,16 @@ proc writeRfAcalCode(code: uint16) =
   updateReg32(addr rf.fcalCtrlA0, not RfAcalCodeMask,
               uint32(code and 0x003F'u16) shl 16)
 
-proc vendorLikeRfAcalForFcal(fcal: uint16): uint16 {.inline.} =
-  if fcal >= 0x00A1'u16:
-    0x000C'u16
-  elif fcal >= 0x0090'u16:
-    0x000B'u16
-  else:
-    0x000A'u16
-
 proc prepareRfPriLoFcal() =
   let rf = rfRegs()
-  updateReg32(addr rf.calMode14, not 0x00000030'u32, 0x00000010'u32)
   updateReg32(addr rf.baseCtrl1, not RfCtrlTuneEnableMask, 0'u32)
   volatileStore(addr rf.synthCtrl2c, 0'u32)
   updateReg32(addr rf.priModeCtrl30, not 0'u32, 0x00000002'u32)
   updateReg32(addr rf.priModeCtrl30, 0x0CF090FF'u32, 0x0CF00000'u32)
-  updateReg32(addr rf.calCtrl1c, not 0'u32, 0x00000008'u32)
   writeRfFcalCode(0x80'u16)
   updateReg32(addr rf.txcalCtrlB8, not 0x00003000'u32, 0'u32)
-  updateReg32(addr rf.calResultA8, 0xFFFF0000'u32, uint32(RfLoFcalDiv))
+  updateReg32(addr rf.txcalCtrlB8, not 0x00000010'u32, 0'u32)
+  updateReg32(addr rf.calResultA8, 0xFFFF0000'u32, bl808RfPriFcalDiv.uint32)
   volatileStore(addr rf.sdmDivC4, 0x01000000'u32)
   updateReg32(addr rf.sdmCtrlC0, not 0'u32, 0x00001000'u32)
   updateReg32(addr rf.sdmCtrlC0, not 0x00010000'u32, 0'u32)
@@ -4303,13 +4075,13 @@ proc prepareRfPriLoFcal() =
   updateReg32(addr rf.sdmCtrlC0, not 0'u32, 0x00010000'u32)
   updateReg32(addr rf.txcalCtrlB8, not 0x00010000'u32, 0'u32)
   waitRfUs(50'u32)
-  updateReg32(addr rf.acalCtrlA4, 0xFFFFFFFC'u32, 0x00000002'u32)
-  waitRfUs(50'u32)
+  updateReg32(addr rf.calCtrl1c, not 0'u32, 0x00000008'u32)
+  waitRfUs(200'u32)
 
 proc chooseRfBaseFcalCode(): uint16 =
   var code = 0x80'u16
   var logIndex = 0
-  for _ in 0 ..< 4:
+  while true:
     var fcalSearchStep = 0x40'u16
     while fcalSearchStep != 0'u16:
       writeRfFcalCode(code)
@@ -4319,9 +4091,9 @@ proc chooseRfBaseFcalCode(): uint16 =
         nim_wifi_rf_fcal_search_log[logIndex] =
           (uint32(code) shl 24) or (uint32(fcalSearchStep) shl 16) or uint32(count)
         inc logIndex
-      if count < RfLoFcalLowCount:
+      if count < rfPriLoFcalCountBound(0):
         code = uint16((uint32(code) - uint32(fcalSearchStep)) and 0x00FF'u32)
-      elif count > RfLoFcalHighCount:
+      elif count > rfPriLoFcalCountBound(1):
         code = uint16((uint32(code) + uint32(fcalSearchStep)) and 0x00FF'u32)
       else:
         fcalSearchStep = 0'u16
@@ -4337,12 +4109,9 @@ proc chooseRfBaseFcalCode(): uint16 =
     updateReg32(addr rf.txcalCtrlB8, not 0x00010000'u32, 0'u32)
     waitRfUs(50'u32)
     code = 0x80'u16
-  if logIndex < nim_wifi_rf_fcal_search_log.len:
-    nim_wifi_rf_fcal_search_log[logIndex] = (0xFF'u32 shl 24) or uint32(code)
-  code
 
 proc runRfPriLoFcal() =
-  if rfCalibDataGlobal == nil:
+  if rfCalibDataGlobal == nil or not rfPriXtalTablesReady():
     return
   let rf = rfRegs()
   inc nim_wifi_rf_pri_lo_fcal_count
@@ -4351,10 +4120,10 @@ proc runRfPriLoFcal() =
   prepareRfPriLoFcal()
 
   let baseCode = chooseRfBaseFcalCode()
-  var measured: array[42, uint16]
+  var measured: array[40, uint16]
   var measuredLen = 0
   var code = uint16(uint32(baseCode + 1'u16) and 0x00FF'u32)
-  while measuredLen < measured.len and code != 0'u16:
+  while measuredLen < measured.len:
     writeRfFcalCode(code)
     waitRfUs(100'u32)
     measured[measuredLen] = sampleRfFcalCount()
@@ -4362,9 +4131,9 @@ proc runRfPriLoFcal() =
       nim_wifi_rf_fcal_search_log[8 + measuredLen] =
         (uint32(code) shl 16) or uint32(measured[measuredLen])
     inc measuredLen
-    if measured[measuredLen - 1] > RfLoFcalStopCount:
+    if measuredLen > 1 and measured[measuredLen - 1] > rfPriLoFcalCountBound(2):
       break
-    dec code
+    code = uint16((uint32(code) + 0xFF'u32) and 0x00FF'u32)
 
   nim_wifi_rf_fcal_search_log[15] =
     if measuredLen == 0:
@@ -4373,33 +4142,38 @@ proc runRfPriLoFcal() =
       (uint32(baseCode) shl 24) or (uint32(measuredLen) shl 16) or
         uint32(measured[measuredLen - 1])
 
+  var fcalCodes: array[RfLoChannelCount, uint16]
   for loChannelCalIndex in 0 ..< RfLoChannelCount:
+    let targetCount = rfPriChannelCntValue(loChannelCalIndex)
     var channelCountCrossingIndex = 0
     while channelCountCrossingIndex < measuredLen and
-        measured[channelCountCrossingIndex] < RfChannelCntTable40M[loChannelCalIndex]:
+        measured[channelCountCrossingIndex] < targetCount:
       inc channelCountCrossingIndex
     var fcal: int
     if measuredLen == 0:
-      fcal = int(baseCode) + 1
+      fcal = int(baseCode) + 2
     elif channelCountCrossingIndex == 0:
-      fcal = int(baseCode) + 1
+      fcal = int(baseCode) + 2
     elif channelCountCrossingIndex >= measuredLen:
-      fcal = int(baseCode) + 1 - (measuredLen - 1)
+      fcal = int(baseCode) + 2 - (measuredLen - 1)
     else:
-      fcal = int(baseCode) + 1 - channelCountCrossingIndex
-    if fcal < 0:
-      fcal = 0
-    elif fcal > 255:
-      fcal = 255
-    setRfLoFcal(loChannelCalIndex, uint16(fcal))
+      # Vendor publication adds one to the nearest measured code. Ties keep
+      # the crossing (higher-count) sample rather than the preceding sample.
+      fcal = int(baseCode) + 2 - channelCountCrossingIndex
+      let belowDistance = targetCount.int - measured[channelCountCrossingIndex - 1].int
+      let aboveDistance = measured[channelCountCrossingIndex].int - targetCount.int
+      if belowDistance < aboveDistance:
+        inc fcal
+    fcalCodes[loChannelCalIndex] = uint16((fcal + 256) and 0xFF)
 
   restoreRfPriCalState(saved)
+  for loChannelCalIndex in 0 ..< RfLoChannelCount:
+    setRfLoFcal(loChannelCalIndex, fcalCodes[loChannelCalIndex])
   updateReg32(addr rf.calMode14, not 0'u32, 0x00000030'u32)
   nim_wifi_rf_last_lo_fcal = uint32(rfLoFcal(RfLoChannelCount - 1))
 
 proc prepareRfPriLoAcal() =
   let rf = rfRegs()
-  updateReg32(addr rf.calMode14, not 0x000000C0'u32, 0x00000040'u32)
   updateReg32(addr rf.baseCtrl1, not RfCtrlTuneEnableMask, 0'u32)
   volatileStore(addr rf.synthCtrl2c, 0'u32)
   updateReg32(addr rf.priModeCtrl30, not 0'u32, 0x00000002'u32)
@@ -4407,7 +4181,7 @@ proc prepareRfPriLoAcal() =
   updateReg32(addr rf.calCtrl1c, not 0'u32, 0x00000010'u32)
 
 proc runRfPriLoAcal() =
-  if rfCalibDataGlobal == nil:
+  if rfCalibDataGlobal == nil or not rfPriXtalTablesReady():
     return
   let rf = rfRegs()
   inc nim_wifi_rf_pri_lo_acal_count
@@ -4416,15 +4190,14 @@ proc runRfPriLoAcal() =
   prepareRfPriLoAcal()
 
   for loChannelCalIndex in 0 ..< RfLoChannelCount:
-    updateReg32(addr rf.acalCtrlA4, 0xFFFFF8FF'u32, 0x00000400'u32)
     updateReg32(addr rf.fcalCtrlA0, not RfAcalCodeMask, 0x00100000'u32)
     updateReg32(addr rf.fcalCtrlA0, not RfFcalCodeMask,
                 uint32(rfLoFcal(loChannelCalIndex)))
-    volatileStore(addr rf.sdmDivC4, RfChannelDivTable40M[loChannelCalIndex])
+    volatileStore(addr rf.sdmDivC4, rfPriChannelDivValue(loChannelCalIndex))
     waitRfUs(1'u32)
 
-    var acal = 0x10'u16
-    var acalSearchStep = 0x08'u16
+    var acal = 0x20'u16
+    var acalSearchStep = 0x10'u16
     while acalSearchStep != 0'u16:
       writeRfAcalCode(acal)
       waitRfUs(1'u32)
@@ -4439,8 +4212,7 @@ proc runRfPriLoAcal() =
     if (volatileLoad(addr rf.acalCtrlA4) and RfAcalComparatorMask) == 0'u32 and
         acal <= 30'u16:
       inc acal
-    acal = vendorLikeRfAcalForFcal(rfLoFcal(loChannelCalIndex))
-    setRfLoAcal(loChannelCalIndex, acal and 0x001F'u16)
+    setRfLoAcal(loChannelCalIndex, acal)
 
   restoreRfPriCalState(saved)
   updateReg32(addr rf.calMode14, not 0'u32, 0x000000C0'u32)
@@ -4459,7 +4231,7 @@ proc saveRfPriCalState(): RfPriCalState =
   result.sdmDivC4 = volatileLoad(addr rf.sdmDivC4)
   result.hbnCtrl30 = volatileLoad(addr dfe.hbnCtrl30)
   result.txcalDfe88 = volatileLoad(addr rf.txcalDfe88)
-  result.calPathConfig8c = volatileLoad(addr rf.calPathConfig8c)
+  result.calPathCtrl90 = volatileLoad(addr rf.calPathCtrl90)
   result.txcalTosdac600 = volatileLoad(addr rf.txcalTosdac600)
   result.calMeasurePrep60c = volatileLoad(addr rf.calMeasurePrep60c)
   result.measureCtrl618 = volatileLoad(addr rf.measureCtrl618)
@@ -4495,7 +4267,7 @@ proc restoreRfPriCalState(state: RfPriCalState) =
   volatileStore(addr rf.sdmDivC4, state.sdmDivC4)
   volatileStore(addr dfe.hbnCtrl30, state.hbnCtrl30)
   volatileStore(addr rf.txcalDfe88, state.txcalDfe88)
-  volatileStore(addr rf.calPathConfig8c, state.calPathConfig8c)
+  volatileStore(addr rf.calPathCtrl90, state.calPathCtrl90)
   volatileStore(addr rf.txcalTosdac600, state.txcalTosdac600)
   volatileStore(addr rf.calMeasurePrep60c, state.calMeasurePrep60c)
   volatileStore(addr rf.measureCtrl618, state.measureCtrl618)
@@ -4520,8 +4292,8 @@ proc restoreRfPriCalState(state: RfPriCalState) =
 proc rf_pri_save_state_before_cal() {.exportc, cdecl.} =
   ## Port of librf_bl808.a:rf_pri.c.o
   ## rf_pri_save_state_before_cal+0x0..0x13a.
-  ## Vendor saves RF[0x90], not RF[0x8C]; keep this public ABI snapshot
-  ## separate from the local calibration snapshot above.
+  ## The public ABI uses global snapshot storage; local calibrations keep
+  ## independent stack snapshots of the same vendor-owned registers.
   inc nimFwDbgRfCalSaveCount
   let rf = rfRegs()
   let dfe = rfDfeInitRegs()
@@ -4603,7 +4375,7 @@ proc rf_pri_cw_stop() {.exportc, cdecl.} =
   rf_pri_restore_state_after_cal()
 
 proc rfPriConfigChannelForCal(loChannelIndex: int) =
-  if rfCalibDataGlobal == nil or loChannelIndex < 0 or
+  if rfCalibDataGlobal == nil or not rfPriXtalTablesReady() or loChannelIndex < 0 or
       loChannelIndex >= RfLoChannelCount:
     return
   let rf = rfRegs()
@@ -4614,20 +4386,20 @@ proc rfPriConfigChannelForCal(loChannelIndex: int) =
   let acalByte = uint32(rfLoAcal(loChannelIndex))
   nim_wifi_rf_last_config_channel_fcal = fcalByte
   nim_wifi_rf_last_config_channel_acal = acalByte
-  nim_wifi_rf_last_config_channel_sdm2 = RfChannelDivTable40M[loChannelIndex]
+  nim_wifi_rf_last_config_channel_sdm2 = rfPriChannelDivValue(loChannelIndex)
   volatileStore(addr rf.fcalCtrlA0,
                 (volatileLoad(addr rf.fcalCtrlA0) and 0xFFC0FF00'u32) or
                 fcalByte or ((acalByte shl 16) and 0x003F0000'u32))
   volatileStore(addr rf.channelFcalConfigBc,
-                (volatileLoad(addr rf.channelFcalConfigBc) and 0xFF100FFF'u32) or
+                (volatileLoad(addr rf.channelFcalConfigBc) and 0xFF0FFFFF'u32) or
                 (((fcalByte shr 4) shl 20) and 0x00F00000'u32))
   volatileStore(addr rf.sdmDivC4,
                 (volatileLoad(addr rf.sdmDivC4) and 0xC0000000'u32) or
-                (RfChannelDivTable40M[loChannelIndex] and 0x3FFFFFFF'u32))
+                (rfPriChannelDivValue(loChannelIndex) and 0x3FFFFFFF'u32))
   updateReg32(addr rf.sdmCtrlC0, not 0x00001000'u32, 0'u32)
 
-  var status = 0'u32
-  for _ in 0 ..< RfConfigChannelWaitLimit:
+  var stalledAttempts = 0
+  while true:
     updateReg32(addr rf.txcalCtrlB8, not 0'u32, 0x00010000'u32)
     waitRfUs(10'u32)
     updateReg32(addr rf.txcalCtrlB8, not 0x00010000'u32, 0'u32)
@@ -4636,17 +4408,17 @@ proc rfPriConfigChannelForCal(loChannelIndex: int) =
     waitRfUs(10'u32)
     updateReg32(addr rf.channelCalStrobeB0, not 0x10000000'u32, 0'u32)
     waitRfUs(50'u32)
-    status = volatileLoad(addr rf.channelCalStatusB4)
+    let status = volatileLoad(addr rf.channelCalStatusB4)
     if (status and 0x01100000'u32) == 0'u32:
       nim_wifi_rf_last_config_channel_b8 = volatileLoad(addr rf.txcalCtrlB8)
       nim_wifi_rf_last_config_channel_b0 = volatileLoad(addr rf.channelCalStrobeB0)
       nim_wifi_rf_last_config_channel_status = status
       return
-
-  inc nim_wifi_rf_config_channel_wait_timeout_count
-  nim_wifi_rf_last_config_channel_b8 = volatileLoad(addr rf.txcalCtrlB8)
-  nim_wifi_rf_last_config_channel_b0 = volatileLoad(addr rf.channelCalStrobeB0)
-  nim_wifi_rf_last_config_channel_status = status
+    inc stalledAttempts
+    if stalledAttempts == RfConfigChannelWaitLimit:
+      inc nim_wifi_rf_config_channel_wait_timeout_count
+      nim_wifi_rf_last_config_channel_status = status
+      stalledAttempts = 0
 
 proc startRfPriTxDfeForCal() =
   let rf = rfRegs()
@@ -4659,12 +4431,14 @@ proc startRfPriRxDfeForCal() =
   updateReg32(addr rf.rxMode220, not 0x00000060'u32, 0x00000061'u32)
 
 proc rfPriCwChannelIndex(channelMhz: uint32): int {.inline.} =
-  ## rf_pri_cw_start+0x36..0x5e maps ordinary 2.4 GHz WiFi channels to
-  ## 0..12 and uses 13 for the out-of-grid CW validation channels.
-  if channelMhz >= 2412'u32 and channelMhz <= 2472'u32:
-    int((channelMhz - 2412'u32) div 5'u32)
-  else:
+  ## rf_pri_cw_start+0x36..0x5e uses slot 0 below channel 1 and
+  ## slot 13 above channel 13, including the CW validation frequencies.
+  if channelMhz > 2472'u32:
     13
+  elif channelMhz < 2412'u32:
+    0
+  else:
+    int((channelMhz - 2412'u32) div 5'u32)
 
 proc rfPriCwLoCalIndex(channelMhz: uint32): int {.inline.} =
   var loCalHalfwordIndex =
@@ -4674,18 +4448,27 @@ proc rfPriCwLoCalIndex(channelMhz: uint32): int {.inline.} =
     loCalHalfwordIndex = RfLoChannelCount.uint32 - 1'u32
   int(loCalHalfwordIndex)
 
-proc rfPriCwPowerTableIndex(targetPowerDbm: int32;
-                            channelIndex: int): uint32 =
-  var compensated = targetPowerDbm
+proc rfPriCwCompensatedTarget(targetPowerDbm: int32;
+                             channelIndex: int): int32 =
+  var channelTemperatureDelta = 0'i32
   if channelIndex >= 0 and channelIndex < bl808RfChannelPowerComp.len:
-    compensated += int32(
-      (bl808RfChannelPowerComp[channelIndex] + bl808RfTxGainComp) div 4)
-  if compensated < 0'i32:
+    channelTemperatureDelta =
+      (bl808RfChannelPowerComp[channelIndex].int32 +
+       bl808RfTempPowerComp.int32) div 4
+  let compensated = rfSignExtend16(
+    rfSignExtend16(targetPowerDbm).int32 + channelTemperatureDelta).int32
+  max(compensated, 0'i32)
+
+proc rfPriCwPowerTableIndex(compensatedTarget: int32): uint32 =
+  # Gain is sampled after calibration, separately from the early target.
+  # Retain local bounds for the vendor's unchecked table reads.
+  let powerIndex = compensatedTarget + bl808RfTxGainComp.int32 div 4 + 2
+  if powerIndex < 0'i32:
     0'u32
-  elif compensated >= RfPriCwPowerAmplitudeTable.len.int32:
+  elif powerIndex >= RfPriCwPowerAmplitudeTable.len.int32:
     uint32(RfPriCwPowerAmplitudeTable.len - 1)
   else:
-    uint32(compensated)
+    uint32(powerIndex)
 
 proc rfPriCwXtalDivisorTenths(): uint32 {.inline.} =
   ## rf_pri_cw_start+0xe6..0x172 selects the divisor used by
@@ -4693,6 +4476,7 @@ proc rfPriCwXtalDivisorTenths(): uint32 {.inline.} =
   if bl808RfPriXtal24mFlag != 0: 720'u32
   elif bl808RfPriXtal26mFlag != 0: 780'u32
   elif bl808RfPriXtal32mFlag != 0: 960'u32
+  elif bl808RfPriXtal40mFlag != 0: 1200'u32
   elif bl808RfPriXtal38p4mFlag != 0: 1152'u32
   elif bl808RfPriXtal52mFlag != 0: 1560'u32
   else: 1200'u32
@@ -4720,7 +4504,7 @@ proc rfPriProgramCwChannel(channelMhz: uint32) =
                 fcalByte or ((acalByte shl 16) and 0x003F0000'u32))
   volatileStore(addr rf.channelFcalConfigBc,
                 (volatileLoad(addr rf.channelFcalConfigBc) and
-                 0xFF100FFF'u32) or
+                 0xFF0FFFFF'u32) or
                 (((fcalByte shr 4) shl 20) and 0x00F00000'u32))
   let sdmDivWord = rfPriCwSdmDivWord(channelMhz)
   nim_wifi_rf_cw_start_sdm_div = sdmDivWord
@@ -4734,7 +4518,8 @@ proc rfPriStartCwDfeStrobes() =
   ## Port of rf_pri_cw_start+0x272..0x2d6: pulse TXCAL and channel
   ## calibration strobes until RF[0xB4] clears the busy/error bits.
   let rf = rfRegs()
-  for _ in 0 ..< RfConfigChannelWaitLimit:
+  var stalledAttempts = 0
+  while true:
     updateReg32(addr rf.txcalCtrlB8, not 0'u32, 0x00010000'u32)
     waitRfUs(10'u32)
     updateReg32(addr rf.txcalCtrlB8, not 0x00010000'u32, 0'u32)
@@ -4745,29 +4530,28 @@ proc rfPriStartCwDfeStrobes() =
     waitRfUs(50'u32)
     if (volatileLoad(addr rf.channelCalStatusB4) and 0x01100000'u32) == 0'u32:
       return
-  inc nim_wifi_rf_config_channel_wait_timeout_count
+    inc stalledAttempts
+    if stalledAttempts == RfConfigChannelWaitLimit:
+      inc nim_wifi_rf_config_channel_wait_timeout_count
+      stalledAttempts = 0
 
 proc rf_pri_cw_start(targetPowerDbm: int32; channelMhz: uint32)
     {.exportc, cdecl.} =
   ## Semantic port of librf_bl808.a:rf_pri.c.o rf_pri_cw_start.
-  ## Recovered exact effects: channel range gate, RF[0x2C/0x48/0x68/0x63C]
+  ## Recovered effects: channel range gate, RF[0x2C/0x48/0x68/0x63C]
   ## CW staging, LO calibration table replay, RF[0xB8]/RF[0xB0] strobe loop,
   ## signal-generator path setup, RF[0x214]/RF[0x218] amplitude programming,
   ## and RF[0x220]/RF[0x20C]/RF[0x23C] CW output enable.
   ## The vendor double `pow` region at rf_pri_cw_start+0x136..0x24c is
   ## represented as fixed-point RF[0xC4] synthesis in rfPriProgramCwChannel.
-  if channelMhz < 2402'u32 or channelMhz > 2484'u32:
+  if rfCalibDataGlobal == nil or channelMhz < 2402'u32 or channelMhz > 2484'u32:
     return
 
   inc nim_wifi_rf_cw_start_count
   nim_wifi_rf_cw_start_channel = channelMhz
   let cwChannelIndex = rfPriCwChannelIndex(channelMhz)
   nim_wifi_rf_cw_start_channel_index = uint32(cwChannelIndex)
-  let powerIndex = rfPriCwPowerTableIndex(targetPowerDbm, cwChannelIndex)
-  nim_wifi_rf_cw_start_power_index = powerIndex
-  let amplitude =
-    uint32(RfPriCwPowerAmplitudeTable[int(powerIndex)]) and
-    RfTxcalSingenAmplitudeMask
+  let compensatedTarget = rfPriCwCompensatedTarget(targetPowerDbm, cwChannelIndex)
 
   let rf = rfRegs()
   updateReg32(addr rf.synthCtrl2c, not 0x00000004'u32, 0'u32)
@@ -4789,7 +4573,12 @@ proc rf_pri_cw_start(targetPowerDbm: int32; channelMhz: uint32)
   updateReg32(addr rf.calSingenCtrl20c, 0xFC00FFFF'u32, 0'u32)
   updateReg32(addr rf.calSingenAmpLo214, 0x003FFFFF'u32, 0'u32)
   updateReg32(addr rf.calSingenAmpHi218, 0x003FFFFF'u32, 0xC0000000'u32)
-  updateReg32(addr rf.calSingenMeasurePrep21c, 0xEFFFFFFF'u32, 0'u32)
+  updateReg32(addr rf.calSingenMeasurePrep21c, 0xEFFFEFFF'u32, 0'u32)
+  let powerIndex = rfPriCwPowerTableIndex(compensatedTarget)
+  nim_wifi_rf_cw_start_power_index = powerIndex
+  let amplitude =
+    uint32(RfPriCwPowerAmplitudeTable[int(powerIndex)]) and
+    RfTxcalSingenAmplitudeMask
   updateReg32(addr rf.calSingenAmpLo214, not RfTxcalSingenAmplitudeMask,
               amplitude)
   updateReg32(addr rf.calSingenAmpHi218, not RfTxcalSingenAmplitudeMask,
@@ -4798,9 +4587,6 @@ proc rf_pri_cw_start(targetPowerDbm: int32; channelMhz: uint32)
 
   updateReg32(addr rf.calDfeGate23c, not 0x00040000'u32, 0x00040000'u32)
   startRfPriTxDfeForCal()
-  updateReg32(addr rf.rxMode220, not 0x00000180'u32, 0'u32)
-  updateReg32(addr rf.rxMode220, 0xFFFFE7FF'u32, 0x00001082'u32)
-  updateReg32(addr rf.rxMode220, not 0x00000010'u32, 0x00000100'u32)
   updateReg32(addr rf.calSingenCtrl20c, not 0x80000000'u32, 0'u32)
   updateReg32(addr rf.calSingenCtrl20c, not 0x80000000'u32, 0x80000000'u32)
 
@@ -4842,21 +4628,23 @@ proc saturatingRfUint32(value: uint64): uint32 {.inline.} =
 
 proc waitRfRoscalMeasurementReady(): bool =
   let rf = rfRegs()
-  for _ in 0 ..< RfRoscalWaitLimit:
+  var stalledPolls = 0
+  while true:
     if (volatileLoad(addr rf.measureCtrl618) and RfMeasureReadyMask) != 0'u32:
       return true
-    waitRfUs(1'u32)
-  inc nim_wifi_rf_roscal_wait_timeout_count
-  false
+    inc stalledPolls
+    if stalledPolls == RfRoscalWaitLimit:
+      inc nim_wifi_rf_roscal_wait_timeout_count
+      stalledPolls = 0
 
 proc writeRfRoscalCandidate(iBranch: bool, code: uint32) =
   let maskedRoscalCode = code and RfRoscalCodeMask
   let rf = rfRegs()
   if iBranch:
-    updateReg32(addr rf.roscalCtrl7c, not RfRoscalIRegMask,
+    updateReg32(addr rf.rbbRccalCtrl80, not RfRoscalIRegMask,
                 maskedRoscalCode shl 8)
   else:
-    updateReg32(addr rf.roscalCtrl7c, not RfRoscalQRegMask, maskedRoscalCode)
+    updateReg32(addr rf.rbbRccalCtrl80, not RfRoscalQRegMask, maskedRoscalCode)
 
 type
   RfRoscalSample = object
@@ -4890,58 +4678,56 @@ proc logRfRoscalSearch(roscalSearchLogSlotIndex: var int, iBranch: bool,
     inc roscalSearchLogSlotIndex
 
 proc chooseRfRoscalCode(iBranch: bool): uint8 =
-  var code = 0'u32
-  var roscalSearchStep = 32'u32
+  var code = 0'i32
+  var roscalSearchStep = 32'i32
   var logIndex =
     if iBranch: 0 else: 8
 
   for _ in 0 ..< 6:
-    let candidate = (code + roscalSearchStep) and RfRoscalCodeMask
-    writeRfRoscalCandidate(iBranch, candidate)
+    let candidate = code + roscalSearchStep
+    writeRfRoscalCandidate(iBranch, cast[uint32](candidate))
     let sample = sampleRfRoscalMeasurement(iBranch)
-    logRfRoscalSearch(logIndex, iBranch, candidate, sample)
-    if sample.signed > 0:
+    logRfRoscalSearch(logIndex, iBranch, cast[uint32](candidate), sample)
+    if sample.signed <= 0:
       code = candidate
     roscalSearchStep = roscalSearchStep shr 1
 
   var history = 0'u32
   for attempt in 0 ..< 63:
-    writeRfRoscalCandidate(iBranch, code)
+    writeRfRoscalCandidate(iBranch, cast[uint32](code))
     let sample = sampleRfRoscalMeasurement(iBranch)
     if attempt < 2:
-      logRfRoscalSearch(logIndex, iBranch, code, sample)
+      logRfRoscalSearch(logIndex, iBranch, cast[uint32](code), sample)
     history = (history shl 1) and 0x0F'u32
     if sample.signed > 0:
       history = (history + 1'u32) and 0x0F'u32
-      code = (code - 1'u32) and RfRoscalCodeMask
+      dec code
       if history == 5'u32:
         break
     else:
-      code = (code + 1'u32) and RfRoscalCodeMask
+      inc code
       if history == 10'u32:
         break
 
-  uint8(code and RfRoscalCodeMask)
+  uint8(cast[uint32](code) and 0xFF'u32)
 
-proc applyRfRoscalCodes(iCode, qCode: uint32) =
-  let iBits = iCode and RfRoscalCodeMask
-  let qBits = qCode and RfRoscalCodeMask
-  if rfCalibDataGlobal != nil:
-    var rccalReplayWord = rfCalibWord(RfCalibRccalReplayWordIndex)
-    rccalReplayWord = (rccalReplayWord and not 0x00FF_FFFF'u32) or
-      iBits or (qBits shl 6) or (iBits shl 12) or (qBits shl 18)
-    rfCalibSetWord(RfCalibRccalReplayWordIndex, rccalReplayWord)
-
-  let packed = iBits or (qBits shl 8) or (iBits shl 16) or (qBits shl 24)
+proc applyRfRoscalCode(iBranch: bool; code: uint32) =
+  let codeByte = code and 0xFF'u32
+  let codeBits = code and RfRoscalCodeMask
+  let byteShift = if iBranch: 0 else: 8
   let rf = rfRegs()
-  volatileStore(addr rf.roscalCal0,
-                (volatileLoad(addr rf.roscalCal0) and
-                 RfRoscalRegisterKeepMask) or packed)
-  volatileStore(addr rf.roscalCal1,
-                (volatileLoad(addr rf.roscalCal1) and
-                 RfRoscalRegisterKeepMask) or packed)
-  nim_wifi_rf_last_roscal_i = iBits
-  nim_wifi_rf_last_roscal_q = qBits
+  for slot, calibrationWordIndex in [24, 22, 20, 18]:
+    if rfCalibDataGlobal != nil:
+      rfCalibSetWord(calibrationWordIndex,
+        (rfCalibWord(calibrationWordIndex) and not (0xFF'u32 shl byteShift)) or
+        (codeByte shl byteShift))
+    let targetReg = if slot < 2: addr rf.roscalCal1 else: addr rf.roscalCal0
+    let laneShift = (if (slot and 1) == 0: 16 else: 0) + byteShift
+    updateReg32(targetReg, not (RfRoscalCodeMask shl laneShift), codeBits shl laneShift)
+  if iBranch:
+    nim_wifi_rf_last_roscal_i = codeBits
+  else:
+    nim_wifi_rf_last_roscal_q = codeBits
 
 proc prepareRfPriRoscal() =
   let rf = rfRegs()
@@ -4949,15 +4735,21 @@ proc prepareRfPriRoscal() =
   volatileStore(addr rf.synthCtrl2c, 0'u32)
   updateReg32(addr rf.priModeCtrl30, not 0'u32, 0x00000002'u32)
   updateReg32(addr rf.priModeCtrl30, 0x21F0FEFF'u32, 0x21F06E00'u32)
+  updateReg32(addr rf.channelFcalConfigBc, not 0'u32, 0x20000000'u32)
+  updateReg32(addr rf.txcalCtrlB8, not 0'u32, 0x01000000'u32)
   waitRfUs(1'u32)
 
+  updateReg32(addr rf.calDfeGate23c, not 0'u32, 0x00040000'u32)
   updateReg32(addr rf.rxMode220, not 0x00000180'u32, 0'u32)
   updateReg32(addr rf.rxMode220, 0xFFFFE7FF'u32, 0x00001082'u32)
   updateReg32(addr rf.rxMode220, not 0x00000010'u32, 0x00000100'u32)
-  updateReg32(addr rf.rxMode220, not 0x00000060'u32, 0x00000061'u32)
+  updateReg32(addr rf.calDfeGate23c, not 0'u32, 0x00040000'u32)
+  updateReg32(addr rf.rxMode220, not 0x00000060'u32, 0'u32)
+  updateReg32(addr rf.rxMode220, not 0'u32, 0x00000021'u32)
+  updateReg32(addr rf.rxMode220, not 0'u32, 0x00000040'u32)
   updateReg32(addr rf.calCtrl1c, not 0'u32, 0x00000200'u32)
-  updateReg32(addr rf.rccalTone48, 0xFFFF8CFF'u32, 0x00003137'u32)
-  updateReg32(addr rf.roscalCtrl7c, not 0x80000000'u32, 0'u32)
+  updateReg32(addr rf.rccalTone48, 0xFFFF8CFF'u32, 0x0000311F'u32)
+  updateReg32(addr rf.rbbRccalCtrl80, not 0x80000000'u32, 0'u32)
 
 proc runRfPriRoscal() =
   let rf = rfRegs()
@@ -4970,8 +4762,9 @@ proc runRfPriRoscal() =
   let saved = saveRfPriCalState()
   prepareRfPriRoscal()
   let iCode = uint32(chooseRfRoscalCode(true))
+  applyRfRoscalCode(true, iCode)
   let qCode = uint32(chooseRfRoscalCode(false))
-  applyRfRoscalCodes(iCode, qCode)
+  applyRfRoscalCode(false, qCode)
   restoreRfPriCalState(saved)
   updateReg32(addr rf.calMode14, not 0'u32, RfRoscalDoneMode)
 
@@ -4982,22 +4775,21 @@ proc rf_pri_roscal() {.exportc, cdecl.} =
 
 proc waitRfRccalMeasurementReady(): bool =
   let rf = rfRegs()
-  for _ in 0 ..< RfRccalWaitLimit:
+  var stalledPolls = 0
+  while true:
     if (volatileLoad(addr rf.measureCtrl618) and RfMeasureReadyMask) != 0'u32:
       return true
-    waitRfUs(1'u32)
-  inc nim_wifi_rf_rccal_wait_timeout_count
-  false
+    inc stalledPolls
+    if stalledPolls == RfRccalWaitLimit:
+      inc nim_wifi_rf_rccal_wait_timeout_count
+      stalledPolls = 0
 
 proc sampleRfRccalPower(): uint32 =
   let rf = rfRegs()
   updateReg32(addr rf.measureCtrl618, not RfMeasureRccalTriggerMask, 0'u32)
   updateReg32(addr rf.measureCtrl618, not RfMeasureRccalTriggerMask,
               RfMeasureRccalTriggerMask)
-  waitRfUs(1'u32)
-  if not waitRfRccalMeasurementReady():
-    updateReg32(addr rf.measureCtrl618, not RfMeasureRccalTriggerMask, 0'u32)
-    return 0'u32
+  discard waitRfRccalMeasurementReady()
 
   let iSample = signedRfPowerMeasurement(volatileLoad(addr rf.measureI620))
   let qSample = signedRfPowerMeasurement(volatileLoad(addr rf.measureQ624))
@@ -5008,40 +4800,45 @@ proc primeRfRccalPowerMeasurement() =
   let rf = rfRegs()
   updateReg32(addr rf.measureCtrl618, 0xFFF00000'u32,
               RfRccalReferenceMeasureCtrl)
+  updateReg32(addr rf.measureCtrl618, not RfMeasureRccalTriggerMask, 0'u32)
   updateReg32(addr rf.measureMode61c, RfMeasureModeKeepMask,
               RfMeasureRoscalMode)
-  updateReg32(addr rf.measureCtrl618, not RfMeasureRccalTriggerMask, 0'u32)
   updateReg32(addr rf.measureCtrl618, not RfMeasureStartMask,
               RfMeasureStartMask)
-  waitRfUs(1'u32)
   discard waitRfRccalMeasurementReady()
   discard volatileLoad(addr rf.measureI620)
   updateReg32(addr rf.measureCtrl618, not RfMeasureRccalTriggerMask, 0'u32)
 
-proc writeRfRccalCode(code: uint32) =
-  let maskedRccalCode = code and RfRccalCodeMask
-  let packedRccalLaneWord = maskedRccalCode or (maskedRccalCode shl 8) or
-    (maskedRccalCode shl 16) or (maskedRccalCode shl 24)
+proc publishRfRccalResults() =
+  if rfCalibDataGlobal == nil:
+    return
   let rf = rfRegs()
-  volatileStore(addr rf.rbbRccalCtrl80,
-                (volatileLoad(addr rf.rbbRccalCtrl80) and
-                 RfRccalRegisterKeepMask) or packedRccalLaneWord)
-  if rfCalibDataGlobal != nil:
-    rfCalibSetWord(RfCalibRccalReplayWordIndex,
-      (rfCalibWord(RfCalibRccalReplayWordIndex) and
-        not 0x00FF_FFFF'u32) or
-        maskedRccalCode or (maskedRccalCode shl 6) or
-        (maskedRccalCode shl 12) or (maskedRccalCode shl 18))
+  let searchLanes = volatileLoad(addr rf.rccalReplay84)
+  rfCalibSetWord(RfCalibRccalReplayWordIndex,
+    (rfCalibWord(RfCalibRccalReplayWordIndex) and 0xFFFFFFC0'u32) or
+    ((searchLanes shr 24) and RfRccalCodeMask))
+  rfCalibSetWord(RfCalibRccalReplayWordIndex,
+    (rfCalibWord(RfCalibRccalReplayWordIndex) and 0xFFFC0FFF'u32) or
+    (((searchLanes shr 8) and RfRccalCodeMask) shl 12))
+  rfCalibSetWord(RfCalibRccalReplayWordIndex,
+    (rfCalibWord(RfCalibRccalReplayWordIndex) and 0xFFFFF03F'u32) or
+    ((rfCalibWord(RfCalibRccalReplayWordIndex) and RfRccalCodeMask) shl 6))
+  rfCalibSetWord(RfCalibRccalReplayWordIndex,
+    (rfCalibWord(RfCalibRccalReplayWordIndex) and 0xFF03FFFF'u32) or
+    (((rfCalibWord(RfCalibRccalReplayWordIndex) shr 12) and RfRccalCodeMask) shl 18))
+  # Vendor RF84 publication uses saved fields 0 and 6.
+  let upperCode = rfCalibWord(RfCalibRccalReplayWordIndex) and RfRccalCodeMask
+  updateReg32(addr rf.rccalReplay84, 0xC0FFC0FF'u32,
+              (upperCode shl 24) or (upperCode shl 8))
+  let lowerCode = (rfCalibWord(RfCalibRccalReplayWordIndex) shr 6) and RfRccalCodeMask
+  updateReg32(addr rf.rccalReplay84, 0xFFC0FFC0'u32,
+              (lowerCode shl 16) or lowerCode)
 
 proc writeRfRccalSearchCode(code: uint32) =
   let maskedRccalSearchCode = code and RfRccalCodeMask
   let rf = rfRegs()
-  var rbbRccalControl = volatileLoad(addr rf.rbbRccalCtrl80)
-  rbbRccalControl =
-    (rbbRccalControl and 0xC0FF_FFFF'u32) or (maskedRccalSearchCode shl 24)
-  rbbRccalControl =
-    (rbbRccalControl and 0xFFFF_C0FF'u32) or (maskedRccalSearchCode shl 8)
-  volatileStore(addr rf.rbbRccalCtrl80, rbbRccalControl)
+  updateReg32(addr rf.rccalReplay84, 0xC0FFC0FF'u32,
+              (maskedRccalSearchCode shl 24) or (maskedRccalSearchCode shl 8))
 
 proc prepareRfPriRccal() =
   let rf = rfRegs()
@@ -5051,30 +4848,30 @@ proc prepareRfPriRccal() =
   updateReg32(addr rf.priModeCtrl30, 0x2DF8F8FF'u32, 0x2DF87800'u32)
   waitRfUs(1'u32)
 
+  updateReg32(addr rf.calDfeGate23c, not 0'u32, 0x00040000'u32)
   startRfPriTxDfeForCal()
-  startRfPriRxDfeForCal()
-  updateReg32(addr rf.rccalReplay84, not 0x00030000'u32, 0'u32)
-  volatileStore(addr rf.rccalReplay84,
-                (volatileLoad(addr rf.rccalReplay84) and 0xFCFF_FFFF'u32) or
-                0x0200_0000'u32)
-  updateReg32(addr rf.calPathConfig8c, not 0x00001000'u32, 0x00001000'u32)
+  updateReg32(addr rf.calDfeGate23c, not 0'u32, 0x00040000'u32)
+  updateReg32(addr rf.rxMode220, not 0x00000060'u32, 0'u32)
+  updateReg32(addr rf.rxMode220, not 0'u32, 0x00000021'u32)
+  updateReg32(addr rf.rxMode220, not 0'u32, 0x00000040'u32)
+  updateReg32(addr rf.rbbRccalCtrl80, not 0'u32, 0x40000000'u32)
+  updateReg32(addr rf.txcalDfe88, not 0x00030000'u32, 0'u32)
+  updateReg32(addr rf.txcalDfe88, 0xFCFFFFFF'u32, 0x02000000'u32)
+  updateReg32(addr rf.calPathCtrl90, not 0'u32, 0x00001000'u32)
   updateReg32(addr rf.calCtrl1c, not 0'u32, 0x00000800'u32)
-  updateReg32(addr rf.calMeasurePrep60c, not 0x00000400'u32, 0'u32)
-  updateReg32(addr rf.calMeasurePrep60c, not 0x04000000'u32, 0x04000000'u32)
+  updateReg32(addr rf.calMeasurePrep60c, not 0x00000800'u32, 0'u32)
+  updateReg32(addr rf.calMeasurePrep60c, not 0'u32, 0x08000000'u32)
   updateReg32(addr rf.rccalTone48, 0xFFFF8CFF'u32, 0x00003100'u32)
-  updateReg32(addr rf.calSingenCtrl20c, 0xFC00FFFF'u32, 0x00300000'u32)
+  updateReg32(addr rf.calSingenCtrl20c, 0xFC00FFFF'u32, 0x00030000'u32)
   updateReg32(addr rf.calSingenAmpLo214, 0x003FFFFF'u32, 0'u32)
   updateReg32(addr rf.calSingenAmpHi218, 0x003FFFFF'u32, 0xC0000000'u32)
+  updateReg32(addr rf.calSingenMeasurePrep21c, 0xEFFFEFFF'u32, 0'u32)
   updateReg32(addr rf.calSingenAmpLo214, 0xFFFFF800'u32, 0x000000FF'u32)
   updateReg32(addr rf.calSingenAmpHi218, 0xFFFFF800'u32, 0x000000FF'u32)
-  updateReg32(addr rf.calSingenCtrl20c, not 0x80000000'u32, 0'u32)
-  updateReg32(addr rf.calSingenCtrl20c, not 0x80000000'u32, 0x80000000'u32)
+  updateReg32(addr rf.calDfeGate23c, not 0'u32, 0x00040000'u32)
   startRfPriTxDfeForCal()
-  updateReg32(addr rf.measureCtrl618, 0xFFF00000'u32,
-              RfRccalReferenceMeasureCtrl)
-  updateReg32(addr rf.measureCtrl618, not RfMeasureRccalTriggerMask, 0'u32)
-  updateReg32(addr rf.measureMode61c, RfMeasureModeKeepMask,
-              RfMeasureRoscalMode)
+  updateReg32(addr rf.calSingenCtrl20c, not 0x80000000'u32, 0'u32)
+  updateReg32(addr rf.calSingenCtrl20c, not 0'u32, 0x80000000'u32)
 
 proc prepareRfPriRccalTone() =
   let rf = rfRegs()
@@ -5082,9 +4879,10 @@ proc prepareRfPriRccalTone() =
   updateReg32(addr rf.calSingenCtrl20c, 0xFC00FFFF'u32, 0x00B50000'u32)
   updateReg32(addr rf.calSingenAmpLo214, 0x003FFFFF'u32, 0'u32)
   updateReg32(addr rf.calSingenAmpHi218, 0x003FFFFF'u32, 0xC0000000'u32)
-  updateReg32(addr rf.calSingenCtrl20c, not 0x80000000'u32, 0'u32)
-  updateReg32(addr rf.calSingenCtrl20c, not 0x80000000'u32, 0x80000000'u32)
+  updateReg32(addr rf.calDfeGate23c, not 0'u32, 0x00040000'u32)
   startRfPriTxDfeForCal()
+  updateReg32(addr rf.calSingenCtrl20c, not 0x80000000'u32, 0'u32)
+  updateReg32(addr rf.calSingenCtrl20c, not 0'u32, 0x80000000'u32)
   updateReg32(addr rf.measureCtrl618, 0xFFF00000'u32, RfRccalToneMeasureCtrl)
 
 proc logRfRccalSearch(rccalSearchLogSlotIndex: var int, code, power: uint32) =
@@ -5102,69 +4900,50 @@ proc chooseRfRccalCode(): tuple[ok: bool, code: uint32] =
   primeRfRccalPowerMeasurement()
   let baseline = sampleRfRccalPower()
   nim_wifi_rf_last_rccal_baseline = baseline
-  if baseline == 0'u32:
-    nim_wifi_rf_last_rccal_target = 0
-    nim_wifi_rf_last_rccal_power = 0
-    nim_wifi_rf_last_rccal_code = RfRccalBaselineCode
-    writeRfRccalCode(RfRccalBaselineCode)
-    return (false, RfRccalBaselineCode)
-
-  var target = (uint64(baseline) * RfRccalTargetNumerator) div
+  let target = (baseline * RfRccalTargetNumerator) div
     RfRccalTargetDenominator
-  nim_wifi_rf_last_rccal_target = saturatingRfUint32(target)
+  nim_wifi_rf_last_rccal_target = target
 
   var logIndex = 0
-  var code = 0'u32
-  var rccalSearchStep = 0x20'u32
-  var lastMeasuredCode = RfRccalBaselineCode
+  var code = 0'i32
+  var rccalSearchStep = RfRccalInitialStep
+  var lastMeasuredCode = 0'u32
   var lastMeasuredPower = baseline
   prepareRfPriRccalTone()
 
   for _ in 0 ..< 6:
-    let candidate = (code + rccalSearchStep) and RfRccalCodeMask
-    writeRfRccalSearchCode(candidate)
-    waitRfUs(1'u32)
+    let candidate = code + rccalSearchStep
+    writeRfRccalSearchCode(candidate.uint32)
     let power = sampleRfRccalPower()
-    lastMeasuredCode = candidate
+    lastMeasuredCode = candidate.uint32
     lastMeasuredPower = power
-    logRfRccalSearch(logIndex, candidate, power)
-    if rccalSearchStep == RfRccalBaselineCode and
-        baseline < RfRccalMinReferencePower and
-        power > RfRccalMinReferencePower:
-      target = (uint64(power) * RfRccalFallbackTargetNumerator) div
-        RfRccalFallbackTargetDenominator
-      nim_wifi_rf_last_rccal_target = saturatingRfUint32(target)
-    if power != 0'u32 and uint64(power) > target:
+    logRfRccalSearch(logIndex, candidate.uint32, power)
+    if power > target:
       code = candidate
     rccalSearchStep = rccalSearchStep shr 1
 
   var history = 0'u32
   var ok = false
   for _ in 0 ..< 63:
-    let candidate = code and RfRccalCodeMask
+    let candidate = cast[uint32](code) and RfRccalCodeMask
     writeRfRccalSearchCode(candidate)
-    waitRfUs(1'u32)
     let power = sampleRfRccalPower()
     lastMeasuredCode = candidate
     lastMeasuredPower = power
     logRfRccalSearch(logIndex, candidate, power)
 
     history = (history shl 1) and 0x0F'u32
-    if power != 0'u32 and uint64(power) > target:
+    if power > target:
       history = (history + 1'u32) and 0x0F'u32
+      inc code
       if history == 0x05'u32:
         ok = true
         break
-      if code < RfRccalCodeMask:
-        inc code
     else:
+      dec code
       if history == 0x0A'u32:
         ok = true
         break
-      if code > 0'u32:
-        dec code
-
-  writeRfRccalCode(lastMeasuredCode)
   nim_wifi_rf_last_rccal_code = lastMeasuredCode
   nim_wifi_rf_last_rccal_power = lastMeasuredPower
   (ok, lastMeasuredCode)
@@ -5180,9 +4959,9 @@ proc runRfPriRccal() =
   let saved = saveRfPriCalState()
   prepareRfPriRccal()
   let result = chooseRfRccalCode()
+  publishRfRccalResults()
   restoreRfPriCalState(saved)
-  writeRfRccalCode(result.code)
-  rfPriApplyWb03RccalSeed()
+  updateReg32(addr rf.calPathCtrl90, not 0x00001000'u32, 0'u32)
   if result.ok:
     updateReg32(addr rf.calMode14, not 0'u32, RfRccalDoneMode)
   else:
@@ -5193,92 +4972,66 @@ proc rf_pri_rccal() {.exportc, cdecl.} =
   ## field in RF[0x14] when unsupported, otherwise enters rf_pri_rccal.part.0.
   runRfPriRccal()
 
-proc clampRfTxcalParam(paramInd: uint32, value: int32): int32 {.inline.} =
-  case paramInd
-  of 0'u32, 1'u32:
-    if value < 0'i32: 0'i32
-    elif value > 63'i32: 63'i32
-    else: value
-  of 2'u32:
-    if value < 0'i32: 0'i32
-    elif value > 2047'i32: 2047'i32
-    else: value
-  of 3'u32:
-    if value < -512'i32: -512'i32
-    elif value > 511'i32: 511'i32
-    else: value
-  else:
-    0'i32
-
 proc encodeRfTxcalParam3(value: int32): uint32 {.inline.} =
-  let clamped = clampRfTxcalParam(3'u32, value)
-  if clamped < 0'i32:
-    uint32(clamped + 1024'i32) and RfTxcalParam3Mask
-  else:
-    uint32(clamped) and RfTxcalParam3Mask
+  cast[uint32](value) and RfTxcalParam3Mask
 
 proc writeRfTxcalParam(paramInd: uint32, value: int32) =
   let rf = rfRegs()
-  let clamped = clampRfTxcalParam(paramInd, value)
+  let rawCode = cast[uint32](value)
   case paramInd
   of 0'u32:
     updateReg32(addr rf.txcalParam74, not RfTxcalParam0Mask,
-                (uint32(clamped) and 0x3F'u32) shl 24)
+                (rawCode shl 24) and RfTxcalParam0Mask)
   of 1'u32:
     updateReg32(addr rf.txcalParam74, not RfTxcalParam1Mask,
-                (uint32(clamped) and 0x3F'u32) shl 16)
+                (rawCode shl 16) and RfTxcalParam1Mask)
   of 2'u32:
     updateReg32(addr rf.txcalTosdac600, not RfTxcalParam2Mask,
-                ((uint32(clamped) and 0x7FF'u32) shl 12) or
+                ((rawCode shl 12) and RfTxcalParam2Mask) or
                 RfTxcalParam2EnableBit)
   of 3'u32:
     updateReg32(addr rf.txcalTosdac600, not RfTxcalParam3Mask,
-                encodeRfTxcalParam3(clamped) or RfTxcalParam3SignBit)
+                encodeRfTxcalParam3(value) or RfTxcalParam3SignBit)
   else:
     discard
 
 proc waitRfTxcalMeasurementReady(): bool =
   let rf = rfRegs()
-  for _ in 0 ..< RfTxcalWaitLimit:
+  var stalledPolls = 0
+  while true:
     if (volatileLoad(addr rf.measureCtrl618) and RfMeasureReadyMask) != 0'u32:
       return true
-    waitRfUs(1'u32)
-  inc nim_wifi_rf_txcal_wait_timeout_count
-  false
-
-proc clampRfTxcalAmp(value: int32): uint32 {.inline.} =
-  if value < 0'i32:
-    0'u32
-  elif value > int32(RfTxcalSingenAmplitudeMask):
-    RfTxcalSingenAmplitudeMask
-  else:
-    uint32(value)
+    inc stalledPolls
+    if stalledPolls == RfTxcalWaitLimit:
+      inc nim_wifi_rf_txcal_wait_timeout_count
+      stalledPolls = 0
 
 proc writeRfTxcalSingenAmplitude(amp: uint32) =
   let rf = rfRegs()
   let maskedTxcalSingenAmplitude = amp and RfTxcalSingenAmplitudeMask
+  updateReg32(addr rf.calSingenMeasurePrep21c, 0xEFFFEFFF'u32, 0'u32)
   updateReg32(addr rf.calSingenAmpLo214, not RfTxcalSingenAmplitudeMask,
               maskedTxcalSingenAmplitude)
   updateReg32(addr rf.calSingenAmpHi218, not RfTxcalSingenAmplitudeMask,
               maskedTxcalSingenAmplitude)
-  updateReg32(addr rf.calSingenCtrl20c, not 0x80000000'u32, 0'u32)
-  updateReg32(addr rf.calSingenCtrl20c, not 0x80000000'u32, 0x80000000'u32)
+  updateReg32(addr rf.calDfeGate23c, not 0'u32, 0x00040000'u32)
   startRfPriTxDfeForCal()
+  updateReg32(addr rf.calSingenCtrl20c, not 0x80000000'u32, 0'u32)
+  updateReg32(addr rf.calSingenCtrl20c, not 0'u32, 0x80000000'u32)
 
-proc sampleRfTxcalAverage(): tuple[ok: bool, value: int32] =
+proc sampleRfTxcalAverage(): tuple[ok: bool, value: int32, ctrl, mode, iRaw: uint32] =
   let rf = rfRegs()
   updateReg32(addr rf.measureCtrl618, not RfMeasureTriggerClearMask, 0'u32)
-  updateReg32(addr rf.measureMode61c, RfMeasureModeKeepMask,
-              RfTxcalAverageMeasureMode)
+  let mode = (volatileLoad(addr rf.measureMode61c) and RfMeasureModeKeepMask) or
+    RfTxcalAverageMeasureMode
+  volatileStore(addr rf.measureMode61c, mode)
   updateReg32(addr rf.measureCtrl618, not RfMeasureStartMask,
               RfMeasureStartMask)
-  if not waitRfTxcalMeasurementReady():
-    updateReg32(addr rf.measureCtrl618, not RfMeasureTriggerClearMask, 0'u32)
-    return (false, 0'i32)
-
-  let sample = signedRfAverageMeasurement(volatileLoad(addr rf.measureI620))
-  updateReg32(addr rf.measureCtrl618, not RfMeasureTriggerClearMask, 0'u32)
-  (true, sample)
+  discard waitRfTxcalMeasurementReady()
+  let iRaw = volatileLoad(addr rf.measureI620)
+  let ctrl = volatileLoad(addr rf.measureCtrl618)
+  volatileStore(addr rf.measureCtrl618, ctrl and not RfMeasureTriggerClearMask)
+  (true, signedRfAverageMeasurement(iRaw), ctrl, mode, iRaw)
 
 proc sampleRfTxcalAdcMean(): tuple[ok: bool, value: int32] =
   let rf = rfRegs()
@@ -5298,55 +5051,105 @@ proc sampleRfTxcalAdcMean(): tuple[ok: bool, value: int32] =
 proc tuneRfTxcalSingenPower(initialAmp: uint32,
                             adcMeanMax, adcMeanMin: int32): uint32 =
   inc nim_wifi_rf_txcal_amp_search_count
-  var amp = int32(initialAmp and RfTxcalSingenAmplitudeMask)
-  var step = amp div 2'i32
-  var lastMean = 0'i32
+  var amp = initialAmp
+  var step = amp shr 1
 
   while true:
-    let clamped = clampRfTxcalAmp(amp)
-    writeRfTxcalSingenAmplitude(clamped)
+    writeRfTxcalSingenAmplitude(amp)
     waitRfUs(10'u32)
     let sample = sampleRfTxcalAdcMean()
-    if sample.ok:
-      lastMean = sample.value
-    nim_wifi_rf_last_txcal_amp = clamped
-    nim_wifi_rf_last_txcal_amp_mean = cast[uint32](lastMean)
+    nim_wifi_rf_last_txcal_amp = amp
+    nim_wifi_rf_last_txcal_amp_mean = cast[uint32](sample.value)
 
-    if sample.ok and lastMean >= adcMeanMin and lastMean <= adcMeanMax:
-      return clamped
-    if step == 0'i32:
-      return clamped
+    if (sample.value >= adcMeanMin and sample.value <= adcMeanMax) or step == 0'u32:
+      return amp
 
-    if not sample.ok or lastMean < adcMeanMin:
-      amp = int32(clamped) + step
+    if sample.value < adcMeanMin:
+      amp += step
     else:
-      amp = int32(clamped) - step
-    step = step div 2'i32
+      amp -= step
+    step = step shr 1
 
-proc writeRfTxcalMixerCs(value: uint32) =
-  updateReg32(addr rfRegs().txcalDc6c, not RfTxcalMixerCsMask,
-              value and RfTxcalMixerCsMask)
+proc writeRfTxcalOsdacCode(value: uint32) =
+  updateReg32(addr rfRegs().txcalGain64, 0xFF83FFFF'u32,
+              (value shl 18) and 0x007C0000'u32)
 
-proc chooseRfTxcalMixerCs(): uint32 =
-  var best = 0'u32
-  var bestPower = low(int32)
-  for cs in 0'u32 ..< uint32(RfTxcalMixerCsCount):
-    writeRfTxcalMixerCs(cs)
-    let sample = sampleRfTxcalAverage()
-    let power = if sample.ok: sample.value else: low(int32)
-    nim_wifi_rf_txcal_tmxcs_power_log[int(cs)] = cast[uint32](power)
-    if power > bestPower:
-      bestPower = power
-      best = cs
+proc chooseRfTxcalOsdacCode(): uint32 =
+  ## The stage seeds RF64 code 16. Vendor averages use log2(1024) = 10,
+  ## so the signed mean reader has the same arithmetic-shift result.
+  var best = 16'u32
+  waitRfUs(10'u32)
+  var bestMean = sampleRfTxcalAdcMean().value
+  var traceIndex = 0
+  for entry in nim_wifi_rf_txcal_tmxcs_power_log.mitems:
+    entry = 0'u32
+  for step in [8'u32, 4'u32, 2'u32, 1'u32]:
+    var candidate = best - step
+    if candidate == 0'u32:
+      candidate = 1'u32
+    writeRfTxcalOsdacCode(candidate)
+    waitRfUs(10'u32)
+    var mean = sampleRfTxcalAdcMean().value
+    nim_wifi_rf_txcal_tmxcs_power_log[traceIndex] = cast[uint32](mean)
+    inc traceIndex
+    if abs(mean + 250'i32) < abs(bestMean + 250'i32) or mean < -300'i32:
+      best = candidate
+      bestMean = mean
+    else:
+      candidate = min(best + step, 31'u32)
+      writeRfTxcalOsdacCode(candidate)
+      waitRfUs(10'u32)
+      mean = sampleRfTxcalAdcMean().value
+      nim_wifi_rf_txcal_tmxcs_power_log[traceIndex] = cast[uint32](mean)
+      inc traceIndex
+      if abs(mean + 250'i32) < abs(bestMean + 250'i32) or mean >= -199'i32:
+        best = candidate
+        bestMean = mean
 
-  writeRfTxcalMixerCs(best)
-  if rfCalibDataGlobal != nil:
-    rfCalibSetWord(RfCalibRccalReplayWordIndex,
-      (rfCalibWord(RfCalibRccalReplayWordIndex) and 0xF8FF_FFFF'u32) or
-        ((best and RfTxcalMixerCsMask) shl 24))
-  nim_wifi_rf_last_txcal_tmxcs = best
-  nim_wifi_rf_last_txcal_tmxcs_power = cast[uint32](bestPower)
-  best
+  updateReg32(addr rfRegs().priModeCtrl30, not 0'u32, 0x00010000'u32)
+  updateReg32(addr rfRegs().txcalBias58, 0xFFF8FFFF'u32, 0x00040000'u32)
+  result = best
+  if best < 3'u32 or best > 20'u32 or bestMean < -300'i32 or bestMean > -200'i32:
+    result = 10'u32
+  nim_wifi_rf_last_txcal_tmxcs = result
+  nim_wifi_rf_last_txcal_tmxcs_power = cast[uint32](bestMean)
+
+proc tuneRfTxcalRowPower(targetAmp, osdacCode: uint32): uint32 =
+  inc nim_wifi_rf_txcal_amp_search_count
+  let lower = targetAmp shr 2
+  let upper = min(targetAmp shl 1, 1023'u32)
+  let span = upper - lower
+  for attempt in 0 ..< 2:
+    writeRfTxcalOsdacCode(osdacCode shr attempt)
+    var amp = lower + (span shr 1)
+    var step = span shr 2
+    while true:
+      writeRfTxcalSingenAmplitude(amp)
+      waitRfUs(10'u32)
+      let mean = sampleRfTxcalAdcMean().value
+      nim_wifi_rf_last_txcal_amp = amp
+      nim_wifi_rf_last_txcal_amp_mean = cast[uint32](mean)
+      if mean > 128'i32:
+        amp -= step
+      elif mean >= 0'i32:
+        return (if step == 0'u32: 0'u32 else: amp)
+      else:
+        amp += step
+      if step == 0'u32:
+        if mean >= 0'i32:
+          return 0'u32
+        break
+      step = step shr 1
+  0'u32
+
+proc primeRfTxcalSearch() =
+  let rf = rfRegs()
+  updateReg32(addr rf.measureCtrl618, not RfMeasureTriggerClearMask, 0'u32)
+  updateReg32(addr rf.measureMode61c, RfMeasureModeKeepMask, 0x10000000'u32)
+  updateReg32(addr rf.measureCtrl618, not 0'u32, RfMeasureStartMask)
+  discard waitRfTxcalMeasurementReady()
+  discard volatileLoad(addr rf.measureI620)
+  updateReg32(addr rf.measureCtrl618, not RfMeasureTriggerClearMask, 0'u32)
 
 proc prepareRfTxcalSearchStage() =
   ## Vendor rf_pri_txcal+0x54c..0x6a0 prepares the post-RF70 TXCAL search
@@ -5358,10 +5161,10 @@ proc prepareRfTxcalSearchStage() =
   updateReg32(addr rf.calSingenAmpLo214, 0x003F_FFFF'u32, 0'u32)
   updateReg32(addr rf.calSingenAmpHi218, 0x003F_FFFF'u32, 0xC000_0000'u32)
   updateReg32(addr rf.rxcalPrep60, not 0x0000_0003'u32, 0x0000_0003'u32)
-  updateReg32(addr rf.txcalGain64, 0x0FC3_FFFF'u32, 0x9030_0000'u32)
+  updateReg32(addr rf.txcalGain64, 0x0F83_FFFF'u32, 0x9030_0000'u32)
   updateReg32(addr rf.txcalBias58, 0xFFF8_FFFF'u32, 0x0004_0000'u32)
   updateReg32(addr rf.rccalTone48, 0xCE0F_FFFF'u32, 0x0077_0000'u32)
-  updateReg32(addr rf.calPathConfig8c, not 0x0000_0030'u32, 0x0000_0010'u32)
+  updateReg32(addr rf.calPathCtrl90, not 0x0000_0030'u32, 0x0000_0010'u32)
   updateReg32(addr rf.txcalGain64, 0xF8FF_FFFF'u32, 0x0400_0000'u32)
   updateReg32(addr rf.txcalGain64, 0xFF83_FFFF'u32, 0xF040_0000'u32)
   updateReg32(addr rf.rxcalPrep60, not 0x0000_0003'u32, 0x0000_0003'u32)
@@ -5378,16 +5181,16 @@ proc prepareRfTxcalSearchStage() =
   updateReg32(addr rf.calSingenCtrl20c, not 0x8000_0000'u32, 0x8000_0000'u32)
   waitRfUs(10'u32)
 
-proc sampleRfTxcalPower(measFreq: uint32): tuple[ok: bool, power, iRaw, qRaw, ctrl: uint32] =
+proc sampleRfTxcalPower(measFreq: uint32; initializeMeasurement = false):
+    tuple[ok: bool, power, iRaw, qRaw, ctrl: uint32] =
   let rf = rfRegs()
-  updateReg32(addr rf.measureCtrl618, 0xFFF00000'u32,
-              (measFreq and 0x07FF'u32) shl RfMeasureFrequencyShift)
+  if initializeMeasurement:
+    updateReg32(addr rf.measureCtrl618, 0xFFF00000'u32,
+                measFreq shl RfMeasureFrequencyShift)
   updateReg32(addr rf.measureCtrl618, not RfMeasureRccalTriggerMask, 0'u32)
   updateReg32(addr rf.measureCtrl618, not RfMeasureRccalTriggerMask,
               RfMeasureRccalTriggerMask)
-  if not waitRfTxcalMeasurementReady():
-    updateReg32(addr rf.measureCtrl618, not RfMeasureRccalTriggerMask, 0'u32)
-    return (false, 0'u32, 0'u32, 0'u32, volatileLoad(addr rf.measureCtrl618))
+  discard waitRfTxcalMeasurementReady()
 
   let iRaw = volatileLoad(addr rf.measureI620)
   let qRaw = volatileLoad(addr rf.measureQ624)
@@ -5399,10 +5202,11 @@ proc sampleRfTxcalPower(measFreq: uint32): tuple[ok: bool, power, iRaw, qRaw, ct
    iRaw, qRaw, ctrl)
 
 proc measureRfTxcalCandidate(paramInd: uint32, candidate: int32,
-                             measFreq: uint32): tuple[ok: bool, power: uint32] =
+                             measFreq: uint32; initializeMeasurement = false):
+    tuple[ok: bool, power: uint32] =
   writeRfTxcalParam(paramInd, candidate)
   waitRfUs(10'u32)
-  let sample = sampleRfTxcalPower(measFreq)
+  let sample = sampleRfTxcalPower(measFreq, initializeMeasurement)
   let txcalSampleTraceSlot =
     int(nim_wifi_rf_txcal_sample_count mod RfTxcalSampleTraceEntries.uint32)
   inc nim_wifi_rf_txcal_sample_count
@@ -5419,114 +5223,100 @@ proc searchRfTxcalParam(paramInd: uint32, center, delta: int32,
                         measFreq: uint32): tuple[ok: bool, value: int32,
                                                   power: uint32] =
   inc nim_wifi_rf_txcal_search_count
-  var bestValue = clampRfTxcalParam(paramInd, center)
-  var bestPower = high(uint32)
-  var anyOk = false
-
-  let centerSample = measureRfTxcalCandidate(paramInd, bestValue, measFreq)
-  if centerSample.ok:
-    bestPower = centerSample.power
-    anyOk = true
-
+  var bestValue = center
+  var bestPower = measureRfTxcalCandidate(paramInd, center, measFreq, true).power
   var step = delta
-  while step > 0'i32:
-    let baseValue = bestValue
-    let leftValue = clampRfTxcalParam(paramInd, baseValue - step)
+  while true:
+    let lowerBound = if paramInd <= 2'u32: 0'i32 else: -512'i32
+    let upperBound =
+      if paramInd <= 1'u32: 63'i32
+      elif paramInd == 2'u32: 2047'i32
+      else: 511'i32
+    let leftValue = max(lowerBound, bestValue -% step)
+    let rightValue = min(upperBound, bestValue +% step)
+    step = ashr(step, 1)
     let leftSample = measureRfTxcalCandidate(paramInd, leftValue, measFreq)
-    let nextStep = step div 2'i32
-    if leftSample.ok:
-      let leftImproved = not anyOk or leftSample.power < bestPower
-      if leftImproved:
-        bestValue = leftValue
-        bestPower = leftSample.power
-      anyOk = true
-      if leftImproved:
-        step = nextStep
-        continue
-
-    let rightValue = clampRfTxcalParam(paramInd, baseValue + step)
-    let rightSample = measureRfTxcalCandidate(paramInd, rightValue, measFreq)
-    if rightSample.ok:
-      if not anyOk or rightSample.power < bestPower:
+    if leftSample.power < bestPower:
+      bestValue = leftValue
+      bestPower = leftSample.power
+    else:
+      let rightSample = measureRfTxcalCandidate(paramInd, rightValue, measFreq)
+      if rightSample.power < bestPower:
         bestValue = rightValue
         bestPower = rightSample.power
-      anyOk = true
-
-    step = nextStep
-
-  writeRfTxcalParam(paramInd, bestValue)
-  if anyOk:
-    (true, bestValue, bestPower)
-  else:
-    (false, bestValue, 0'u32)
+    if step == 0'i32:
+      break
+  (true, bestValue, bestPower)
 
 proc packRfTxcalCalWord0(txcalParam0, txcalParam1,
                          txcalParam2: int32): uint32 {.inline.} =
   ## Vendor wl_cal TXCAL layout at rf_calib_data+0x68:
   ## TXCAL parameter 0 byte, parameter 1 byte, parameter 2 halfword,
   ## and parameter 3 halfword.
-  (uint32(clampRfTxcalParam(0'u32, txcalParam0)) and 0x3F'u32) or
-    ((uint32(clampRfTxcalParam(1'u32, txcalParam1)) and 0x3F'u32) shl 8) or
-    ((uint32(clampRfTxcalParam(2'u32, txcalParam2)) and 0x7FF'u32) shl 16)
+  (cast[uint32](txcalParam0) and 0xFF'u32) or
+    ((cast[uint32](txcalParam1) and 0xFF'u32) shl 8) or
+    (cast[uint32](txcalParam2) shl 16)
 
 proc packRfTxcalCalWord1(txcalParam3: int32): uint32 {.inline.} =
-  encodeRfTxcalParam3(txcalParam3)
+  cast[uint32](txcalParam3) and 0xFFFF'u32
 
 proc storeRfTxcalRecord(txcalRecordIndex: int;
                         txcalParam0, txcalParam1: int32;
                         txcalParam2, txcalParam3: int32;
                         power: uint32) =
-  if rfCalibDataGlobal == nil:
+  if rfCalibDataGlobal == nil or txcalRecordIndex < 0 or
+      txcalRecordIndex >= RfPriTxcalSearchRecords:
     return
   let txcalRecordWord0 =
     packRfTxcalCalWord0(txcalParam0, txcalParam1, txcalParam2)
   let txcalRecordWord1 = packRfTxcalCalWord1(txcalParam3)
-  let txcalRecordBaseWordIndex = txcalRecordIndex * 2
-  rfCalibSetWord(RfCalibTxcalRecordBaseWord + txcalRecordBaseWordIndex,
-                 txcalRecordWord0)
-  rfCalibSetWord(RfCalibTxcalRecordBaseWord + txcalRecordBaseWordIndex + 1,
-                 txcalRecordWord1)
+  let txcalRecordByteOffset = RfCalibTxcalRecordBaseWord * 4 + txcalRecordIndex * 8
+  rfCalibSetByte(txcalRecordByteOffset, (txcalRecordWord0 and 0xFF'u32).uint8)
+  rfCalibSetByte(txcalRecordByteOffset + 1,
+                 ((txcalRecordWord0 shr 8) and 0xFF'u32).uint8)
+  rfCalibSetHalf((txcalRecordByteOffset + 2) div 2,
+                 (txcalRecordWord0 shr 16).uint16)
+  rfCalibSetHalf((txcalRecordByteOffset + 4) div 2, txcalRecordWord1.uint16)
   lastWifiRfTxcalRecordWord0 = txcalRecordWord0
   lastWifiRfTxcalRecordWord1 = txcalRecordWord1
-  if txcalRecordIndex >= 0 and txcalRecordIndex < RfPriTxcalSearchRecords:
-    wifiRfTxcalRecordWord0Log[txcalRecordIndex] = txcalRecordWord0
-    wifiRfTxcalRecordWord1Log[txcalRecordIndex] = txcalRecordWord1
-    nim_wifi_rf_txcal_power_log[txcalRecordIndex] = power
+  wifiRfTxcalRecordWord0Log[txcalRecordIndex] = txcalRecordWord0
+  wifiRfTxcalRecordWord1Log[txcalRecordIndex] = txcalRecordWord1
+  nim_wifi_rf_txcal_power_log[txcalRecordIndex] = power
 
 proc storeRfPriBzTxcalRecord(bzTxcalRecordIndex: int;
                              txcalParam0, txcalParam1: int32;
                              txcalParam2, txcalParam3: int32) =
-  if rfCalibDataGlobal == nil:
+  if rfCalibDataGlobal == nil or bzTxcalRecordIndex < 0 or
+      bzTxcalRecordIndex >= RfPriBzTxcalSearchRecords:
     return
   let bzTxcalRecordWord0 =
     packRfTxcalCalWord0(txcalParam0, txcalParam1, txcalParam2)
   let bzTxcalRecordWord1 = packRfTxcalCalWord1(txcalParam3)
   rfCalibStoreBzTxcalRecordWords(
     bzTxcalRecordIndex, bzTxcalRecordWord0, bzTxcalRecordWord1)
-  if bzTxcalRecordIndex >= 0 and bzTxcalRecordIndex < RfPriBzTxcalSearchRecords:
-    nim_wifi_rf_bz_txcal_word0_log[bzTxcalRecordIndex] = bzTxcalRecordWord0
-    nim_wifi_rf_bz_txcal_word1_log[bzTxcalRecordIndex] = bzTxcalRecordWord1
+  nim_wifi_rf_bz_txcal_word0_log[bzTxcalRecordIndex] = bzTxcalRecordWord0
+  nim_wifi_rf_bz_txcal_word1_log[bzTxcalRecordIndex] = bzTxcalRecordWord1
 
-proc configureRfPriTxcalGain(txcalPowerSetup: array[9, uint16],
+proc configureRfPriTxcalGain(txcalPowerSetup: RfPriTxPowerTableRow,
                              txcalGainParams: array[7, uint32]) =
   let rf = rfRegs()
-  updateReg32(addr rf.txcalDc6c, not 0x00000003'u32,
+  updateReg32(addr rf.rxcalPrep60, not 0x00000003'u32,
               txcalGainParams[3] and 0x03'u32)
-  updateReg32(addr rf.txcalGain64, 0x0FC3FFFF'u32,
-              ((txcalGainParams[0] and 0x3F'u32) shl 28) or
-              ((txcalGainParams[2] and 0x3F'u32) shl 18))
+  updateReg32(addr rf.txcalGain64, 0x0F83FFFF'u32,
+              (txcalGainParams[0] shl 28) or
+              ((rfTxcalOsdacCode shl 18) and 0x007C0000'u32))
   updateReg32(addr rf.txcalBias58, 0xFFF8FFFF'u32,
               (txcalGainParams[1] and 0x07'u32) shl 16)
   updateReg32(addr rf.rccalTone48, 0xCE08FFFF'u32,
-              ((uint32(txcalPowerSetup[0]) and 0x03'u32) shl 28) or
-              ((uint32(txcalPowerSetup[3]) and 0x1F'u32) shl 20) or
+              ((cast[uint32](txcalPowerSetup[0].int32) and 0x03'u32) shl 28) or
+              ((cast[uint32](txcalPowerSetup[3].int32) and 0x1F'u32) shl 20) or
               ((txcalGainParams[5] and 0x07'u32) shl 16))
-  updateReg32(addr rf.txcalGain68, 0x1FFFFFFF'u32,
+  updateReg32(addr rf.txcalGain68, 0x1DFFFFFF'u32,
               (txcalGainParams[6] and 0x07'u32) shl 29)
 
 proc configureRfPriTxcalGain(txcalPowerSetupIndex: int,
                              txcalGainParams: array[7, uint32]) =
-  configureRfPriTxcalGain(RfPriTxcalPowerSetup[txcalPowerSetupIndex],
+  configureRfPriTxcalGain(bl808RfTxPowerTable[txcalPowerSetupIndex],
                           txcalGainParams)
 
 proc prepareRfPriTxcal() =
@@ -5539,30 +5329,26 @@ proc prepareRfPriTxcal() =
 
   updateReg32(addr rf.calDfeGate23c, not 0x00040000'u32, 0x00040000'u32)
   startRfPriTxDfeForCal()
-  startRfPriRxDfeForCal()
-  rfPriConfigChannelForCal(9)
   updateReg32(addr rf.calDfeGate23c, not 0x00040000'u32, 0x00040000'u32)
+  updateReg32(addr rf.rxMode220, not 0x00000060'u32, 0'u32)
+  updateReg32(addr rf.rxMode220, not 0'u32, 0x00000021'u32)
+  updateReg32(addr rf.rxMode220, not 0'u32, 0x00000040'u32)
+  rfPriConfigChannelForCal(9)
   updateReg32(addr rf.calCtrl1c, not 0'u32, 0x00003000'u32)
   updateReg32(addr rf.txcalDfe88, not 0x80000000'u32, 0x80000000'u32)
   updateReg32(addr rf.txcalGain64, not 0x00800000'u32, 0x00800000'u32)
-  updateReg32(addr rf.txcalDc6c, not 0x00000007'u32, 0x00000004'u32)
-  updateReg32(addr rf.calSingenCtrl20c, 0xFC00FFFF'u32, 0x00B00000'u32)
-  updateReg32(addr rf.calSingenAmpLo214, 0x003FFFFF'u32, 0'u32)
-  updateReg32(addr rf.calSingenAmpHi218, 0x003FFFFF'u32, 0xC0000000'u32)
-  updateReg32(addr rf.calSingenCtrl20c, not 0x80000000'u32, 0'u32)
-  updateReg32(addr rf.calSingenCtrl20c, not 0x80000000'u32, 0x80000000'u32)
-
-  updateReg32(addr rf.priModeCtrl30, not 0'u32, 0x00000003'u32)
-  updateReg32(addr rf.txcalGain64, 0x0FC3FFFF'u32, 0x50000000'u32)
-  updateReg32(addr rf.txcalBias58, 0xFFF8FFFF'u32, 0x00040000'u32)
-  updateReg32(addr rf.rccalTone48, 0xCE08FFFF'u32, 0x00870000'u32)
-  updateReg32(addr rf.txcalGain68, 0x1DFFFFFF'u32, 0xE0000000'u32)
   # rf_pri_txcal+0x148..0x158 seeds RF70 before the initial TXCAL
   # signal-generator amplitude search and later RF70 replay-window scans.
   updateReg32(addr rf.txcalParam70, not 0x0000000F'u32,
               RfPriTxcalRf70InitialSearchSeedNibble)
-  updateReg32(addr rf.measureMode61c, RfMeasureModeKeepMask,
-              RfMeasureRoscalMode)
+  updateReg32(addr rf.calSingenCtrl20c, 0xFC00FFFF'u32, 0x000B0000'u32)
+  updateReg32(addr rf.calSingenAmpLo214, 0x003FFFFF'u32, 0'u32)
+  updateReg32(addr rf.calSingenAmpHi218, 0x003FFFFF'u32, 0xC0000000'u32)
+  updateReg32(addr rf.rxcalPrep60, not 0'u32, 0x00000003'u32)
+  updateReg32(addr rf.txcalGain64, 0x0F83FFFF'u32, 0x50000000'u32)
+  updateReg32(addr rf.txcalBias58, 0xFFF8FFFF'u32, 0x00040000'u32)
+  updateReg32(addr rf.rccalTone48, 0xCE08FFFF'u32, 0x00870000'u32)
+  updateReg32(addr rf.txcalGain68, 0x1DFFFFFF'u32, 0xE0000000'u32)
   preRf70TxcalSingenAmplitude =
     tuneRfTxcalSingenPower(RfTxcalInitialAmp,
                            RfTxcalInitialAdcMax,
@@ -5585,24 +5371,36 @@ proc prepareRfPriBzTxcal() =
   waitRfUs(1'u32)
 
   updateReg32(addr rf.calDfeGate23c, not 0x00040000'u32, 0x00040000'u32)
-  updateReg32(addr rf.rxMode220, not 0x00000180'u32, 0x00000100'u32)
-  updateReg32(addr rf.rxMode220, not 0x00007800'u32, 0x00001080'u32)
-  updateReg32(addr rf.rxMode220, not 0x00000001'u32, 0x00000001'u32)
+  startRfPriTxDfeForCal()
   updateReg32(addr rf.calDfeGate23c, not 0x00040000'u32, 0x00040000'u32)
-  updateReg32(addr rf.rxMode220, not 0x00000060'u32, 0x00000020'u32)
-  updateReg32(addr rf.rxMode220, not 0x00000040'u32, 0x00000040'u32)
+  updateReg32(addr rf.rxMode220, not 0x00000060'u32, 0'u32)
+  updateReg32(addr rf.rxMode220, not 0'u32, 0x00000021'u32)
+  updateReg32(addr rf.rxMode220, not 0'u32, 0x00000040'u32)
+  rfPriConfigChannelForCal(9)
   updateReg32(addr rf.calCtrl1c, not 0'u32, 0x00003000'u32)
   updateReg32(addr rf.txcalDfe88, not 0x80000000'u32, 0x80000000'u32)
   updateReg32(addr rf.txcalGain64, not 0x00800000'u32, 0x00800000'u32)
   updateReg32(addr rf.calSingenCtrl20c, 0xFC00FFFF'u32, 0x00490000'u32)
   updateReg32(addr rf.calSingenAmpLo214, 0x003FFFFF'u32, 0'u32)
   updateReg32(addr rf.calSingenAmpHi218, 0x003FFFFF'u32, 0xC0000000'u32)
-  updateReg32(addr rf.priModeCtrl30, not 0'u32, 0x00000003'u32)
-  updateReg32(addr rf.txcalGain64, 0x0FC3FFFF'u32, 0x90300000'u32)
+  updateReg32(addr rf.rxcalPrep60, not 0'u32, 0x00000003'u32)
+  updateReg32(addr rf.txcalGain64, 0x0F83FFFF'u32, 0x90300000'u32)
   updateReg32(addr rf.txcalBias58, 0xFFF8FFFF'u32, 0x00040000'u32)
   updateReg32(addr rf.rccalTone48, 0xCE0FFFFF'u32, 0x00770000'u32)
-  updateReg32(addr rf.calPathConfig8c, not 0x00000030'u32, 0x00000010'u32)
+  updateReg32(addr rf.calPathCtrl90, not 0x00000030'u32, 0x00000010'u32)
   updateReg32(addr rf.txcalGain64, 0xF8FFFFFF'u32, 0x04000000'u32)
+
+proc publishRfTxcalActiveRecord() =
+  if rfCalibDataGlobal == nil:
+    return
+  let word0 = rfCalibWord(RfCalibTxcalRecordBaseWord + 3 * 2)
+  let word1 = rfCalibWord(RfCalibTxcalRecordBaseWord + 3 * 2 + 1)
+  let rf = rfRegs()
+  updateReg32(addr rf.txcalParam74, 0xC0C0FFFF'u32,
+              ((word0 shl 24) and 0x3F000000'u32) or
+              ((word0 shl 8) and 0x003F0000'u32))
+  updateReg32(addr rf.txcalTosdac600, 0xFF800C00'u32,
+              ((word0 shr 4) and 0x007FF000'u32) or (word1 and 0x3FF'u32))
 
 proc runRfPriTxcal() =
   if rfCalibDataGlobal == nil:
@@ -5612,46 +5410,54 @@ proc runRfPriTxcal() =
   updateReg32(addr rf.calMode14, not RfTxcalModeMask, RfTxcalStartMode)
   let saved = saveRfPriCalState()
   prepareRfPriTxcal()
-  rfPriPopulateWb03TxcalRf70ReplayFields()
+  rfPriPopulateTxcalRf70ReplayFields()
   rfPriApplyTxcalLowBandRf70ReplayNibble()
-  discard chooseRfTxcalMixerCs()
   prepareRfTxcalSearchStage()
+  rfTxcalOsdacCode = chooseRfTxcalOsdacCode()
 
-  var allOk = true
   for txcalSearchRecordIndex in 0 ..< RfPriTxcalSearchRecords:
     configureRfPriTxcalGain(txcalSearchRecordIndex,
                             RfPriTxcalParams[txcalSearchRecordIndex])
-    let amp = tuneRfTxcalSingenPower(RfTxcalGainAmp,
-                                     RfTxcalGainAdcMax,
-                                     RfTxcalGainAdcMin)
+    waitRfUs(10'u32)
+    let amp = tuneRfTxcalRowPower(RfPriTxcalParams[txcalSearchRecordIndex][4],
+                                 rfTxcalOsdacCode)
     nim_wifi_rf_txcal_amp_log[txcalSearchRecordIndex] = amp
+    if amp == 0'u32:
+      storeRfTxcalRecord(txcalSearchRecordIndex, 0x20'i32, 0x20'i32,
+                          0x400'i32, 0'i32, 0'u32)
+      continue
+    primeRfTxcalSearch()
 
     let txcalParam0Coarse =
       searchRfTxcalParam(0'u32, 0x20'i32, 0x10'i32, RfTxcalSearchFreqIq)
+    writeRfTxcalParam(0'u32, txcalParam0Coarse.value)
     let txcalParam1Coarse =
       searchRfTxcalParam(1'u32, 0x20'i32, 0x10'i32, RfTxcalSearchFreqIq)
+    writeRfTxcalParam(1'u32, txcalParam1Coarse.value)
     let txcalParam0Refined =
       searchRfTxcalParam(0'u32, txcalParam0Coarse.value, 0x08'i32,
                          RfTxcalSearchFreqIq)
+    writeRfTxcalParam(0'u32, txcalParam0Refined.value)
     let txcalParam1Refined =
       searchRfTxcalParam(1'u32, txcalParam1Coarse.value, 0x08'i32,
                          RfTxcalSearchFreqIq)
+    writeRfTxcalParam(1'u32, txcalParam1Refined.value)
     let txcalParam2Coarse =
       searchRfTxcalParam(2'u32, 0x400'i32, 0x80'i32,
                          RfTxcalSearchFreqOsdac)
+    writeRfTxcalParam(2'u32, txcalParam2Coarse.value)
     let txcalParam3Coarse =
       searchRfTxcalParam(3'u32, 0'i32, 0x40'i32, RfTxcalSearchFreqOsdac)
+    writeRfTxcalParam(3'u32, txcalParam3Coarse.value)
     let txcalParam2Refined =
       searchRfTxcalParam(2'u32, txcalParam2Coarse.value, 0x40'i32,
                          RfTxcalSearchFreqOsdac)
+    writeRfTxcalParam(2'u32, txcalParam2Refined.value)
     let txcalParam3Refined =
       searchRfTxcalParam(3'u32, txcalParam3Coarse.value, 0x20'i32,
                          RfTxcalSearchFreqOsdac)
+    writeRfTxcalParam(3'u32, txcalParam3Refined.value)
 
-    allOk = allOk and txcalParam0Coarse.ok and txcalParam1Coarse.ok and
-      txcalParam0Refined.ok and txcalParam1Refined.ok and
-      txcalParam2Coarse.ok and txcalParam3Coarse.ok and
-      txcalParam2Refined.ok and txcalParam3Refined.ok
     storeRfTxcalRecord(
       txcalSearchRecordIndex,
       txcalParam0Refined.value,
@@ -5661,9 +5467,12 @@ proc runRfPriTxcal() =
       txcalParam0Refined.power or txcalParam1Refined.power or
         txcalParam2Refined.power or txcalParam3Refined.power)
 
+  rfPriWriteTxPowerTable(rfPowerWlan, {rfPowerCalibration})
+  updateReg32(addr rf.calCtrl1c, not 0x00003000'u32, 0'u32)
+  updateReg32(addr rf.txcalGain64, 0xF8FFFFFF'u32, 0x03000000'u32)
   restoreRfPriCalState(saved)
-  if allOk:
-    updateReg32(addr rf.calMode14, not RfTxcalModeMask, RfTxcalDoneMode)
+  updateReg32(addr rf.calMode14, not 0'u32, RfTxcalDoneMode)
+  publishRfTxcalActiveRecord()
 
 proc runRfPriBzTxcal() =
   if rfCalibDataGlobal == nil:
@@ -5674,36 +5483,50 @@ proc runRfPriBzTxcal() =
   prepareRfPriBzTxcal()
   rfPriSnapshotBzTxcalState(0xB3'u32)
 
-  var allOk = true
   for bzTxcalSearchRecordIndex in 0 ..< RfPriBzTxcalSearchRecords:
-    configureRfPriTxcalGain(RfPriBzTxcalPowerSetup[bzTxcalSearchRecordIndex],
+    configureRfPriTxcalGain(RfPriBzTxPowerTableDefault[bzTxcalSearchRecordIndex],
                             RfPriBzTxcalParams[bzTxcalSearchRecordIndex])
-    discard tuneRfTxcalSingenPower(RfTxcalGainAmp,
-                                   RfTxcalGainAdcMax,
-                                   RfTxcalGainAdcMin)
+    waitRfUs(10'u32)
+    let amp = tuneRfTxcalRowPower(RfPriBzTxcalParams[bzTxcalSearchRecordIndex][4],
+                                 rfTxcalOsdacCode)
+    if amp == 0'u32:
+      storeRfPriBzTxcalRecord(bzTxcalSearchRecordIndex,
+                              0x20'i32, 0x20'i32, 0x400'i32, 0'i32)
+      nim_wifi_rf_bz_txcal_ok_mask_log[bzTxcalSearchRecordIndex] = 0'u32
+      nim_wifi_rf_bz_txcal_power_log[bzTxcalSearchRecordIndex] = 0'u32
+      continue
+    primeRfTxcalSearch()
 
     let txcalParam0Coarse =
       searchRfTxcalParam(0'u32, 0x20'i32, 0x10'i32, RfBzTxcalSearchFreqIq)
+    writeRfTxcalParam(0'u32, txcalParam0Coarse.value)
     let txcalParam1Coarse =
       searchRfTxcalParam(1'u32, 0x20'i32, 0x10'i32, RfBzTxcalSearchFreqIq)
+    writeRfTxcalParam(1'u32, txcalParam1Coarse.value)
     let txcalParam0Refined =
       searchRfTxcalParam(0'u32, txcalParam0Coarse.value, 0x08'i32,
                          RfBzTxcalSearchFreqIq)
+    writeRfTxcalParam(0'u32, txcalParam0Refined.value)
     let txcalParam1Refined =
       searchRfTxcalParam(1'u32, txcalParam1Coarse.value, 0x08'i32,
                          RfBzTxcalSearchFreqIq)
+    writeRfTxcalParam(1'u32, txcalParam1Refined.value)
     let txcalParam2Coarse =
       searchRfTxcalParam(2'u32, 0x400'i32, 0x80'i32,
                          RfBzTxcalSearchFreqOsdac)
+    writeRfTxcalParam(2'u32, txcalParam2Coarse.value)
     let txcalParam3Coarse =
       searchRfTxcalParam(3'u32, 0'i32, 0x40'i32,
                          RfBzTxcalSearchFreqOsdac)
+    writeRfTxcalParam(3'u32, txcalParam3Coarse.value)
     let txcalParam2Refined =
       searchRfTxcalParam(2'u32, txcalParam2Coarse.value, 0x40'i32,
                          RfBzTxcalSearchFreqOsdac)
+    writeRfTxcalParam(2'u32, txcalParam2Refined.value)
     let txcalParam3Refined =
       searchRfTxcalParam(3'u32, txcalParam3Coarse.value, 0x20'i32,
                          RfBzTxcalSearchFreqOsdac)
+    writeRfTxcalParam(3'u32, txcalParam3Refined.value)
 
     let okMask =
       (if txcalParam0Coarse.ok: 0x01'u32 else: 0'u32) or
@@ -5719,133 +5542,96 @@ proc runRfPriBzTxcal() =
       (txcalParam0Refined.power and 0xFFFF'u32) or
       ((txcalParam1Refined.power and 0xFFFF'u32) shl 16)
 
-    let rowOk = txcalParam0Coarse.ok and txcalParam1Coarse.ok and
-      txcalParam0Refined.ok and txcalParam1Refined.ok and
-      txcalParam2Coarse.ok and txcalParam3Coarse.ok and
-      txcalParam2Refined.ok and txcalParam3Refined.ok
-    allOk = allOk and rowOk
-    if rowOk:
-      storeRfPriBzTxcalRecord(
-        bzTxcalSearchRecordIndex,
-        txcalParam0Refined.value,
-        txcalParam1Refined.value,
-        txcalParam2Refined.value,
-        txcalParam3Refined.value)
-    else:
-      storeRfPriBzTxcalRecord(bzTxcalSearchRecordIndex,
-                              0x20'i32, 0x20'i32, 0x400'i32, 0'i32)
+    storeRfPriBzTxcalRecord(
+      bzTxcalSearchRecordIndex,
+      txcalParam0Refined.value,
+      txcalParam1Refined.value,
+      txcalParam2Refined.value,
+      txcalParam3Refined.value)
 
+  rfPriWriteTxPowerTable(rfPowerBz, {rfPowerCalibration})
   rfPriSnapshotBzTxcalState(0xB4'u32)
   updateReg32(addr rf.calCtrl1c, not 0x00003000'u32, 0'u32)
   updateReg32(addr rf.txcalGain64, 0xF8FFFFFF'u32, 0x03000000'u32)
   restoreRfPriCalState(saved)
-  if allOk:
-    updateReg32(addr rf.calMode14, not RfTxcalModeMask, RfTxcalDoneMode)
+  updateReg32(addr rf.calMode14, not 0'u32, RfTxcalDoneMode)
 
 proc waitRfRxcalMeasurementReady(): bool =
   let rf = rfRegs()
-  for _ in 0 ..< RfRxcalWaitLimit:
+  var stalledPolls = 0
+  while true:
     if (volatileLoad(addr rf.measureCtrl618) and RfMeasureReadyMask) != 0'u32:
       return true
-    waitRfUs(1'u32)
-  inc nim_wifi_rf_rxcal_wait_timeout_count
-  false
-
-proc clampRfRxcalParam(paramInd: uint32, value: int32): int32 {.inline.} =
-  if paramInd == 2'u32:
-    if value < 0'i32:
-      0'i32
-    elif value > 0x7FF'i32:
-      0x7FF'i32
-    else:
-      value
-  else:
-    if value < -0x200'i32:
-      -0x200'i32
-    elif value > 0x1FF'i32:
-      0x1FF'i32
-    else:
-      value
+    inc stalledPolls
+    if stalledPolls == RfRxcalWaitLimit:
+      inc nim_wifi_rf_rxcal_wait_timeout_count
+      stalledPolls = 0
 
 proc writeRfRxcalParam(paramInd: uint32, value: int32) =
   let rf = rfRegs()
-  let clamped = clampRfRxcalParam(paramInd, value)
+  let rawCode = cast[uint32](value)
   var rxcalSearchControl = volatileLoad(addr rf.rxcalSearch614)
   if paramInd == 2'u32:
     rxcalSearchControl = (rxcalSearchControl and not RfRxcalSearchHighMask) or
-      ((uint32(clamped) shl 12) and RfRxcalSearchHighMask) or
+      ((rawCode shl 12) and RfRxcalSearchHighMask) or
       RfRxcalSearchHighEnable
   else:
     rxcalSearchControl = (rxcalSearchControl and not RfRxcalSearchLowMask) or
-      (uint32(clamped) and RfRxcalSearchLowMask) or 0x00000400'u32
+      (rawCode and RfRxcalSearchLowMask) or 0x00000400'u32
   volatileStore(addr rf.rxcalSearch614, rxcalSearchControl)
 
-proc sampleRfRxcalPower(): tuple[ok: bool, power: uint32] =
+proc sampleRfRxcalPower(initializeMeasurement = false): tuple[ok: bool, power: uint32] =
   let rf = rfRegs()
-  updateReg32(addr rf.measureCtrl618, 0xFFF00000'u32,
-              RfRxcalMeasureSetupMask)
+  if initializeMeasurement:
+    updateReg32(addr rf.measureCtrl618, 0xFFF00000'u32,
+                RfRxcalMeasureSetupMask)
   updateReg32(addr rf.measureCtrl618, not RfRxcalMeasureClearMask, 0'u32)
   updateReg32(addr rf.measureCtrl618, not RfRxcalMeasureClearMask,
               RfRxcalMeasureClearMask)
-  if not waitRfRxcalMeasurementReady():
-    updateReg32(addr rf.measureCtrl618, not RfRxcalMeasureClearMask, 0'u32)
-    return (false, 0'u32)
+  discard waitRfRxcalMeasurementReady()
 
   let iSample = signedRfPowerMeasurement(volatileLoad(addr rf.measureI620))
   let qSample = signedRfPowerMeasurement(volatileLoad(addr rf.measureQ624))
   updateReg32(addr rf.measureCtrl618, not RfRxcalMeasureClearMask, 0'u32)
   (true, saturatingRfUint32(squareRfSample(iSample) + squareRfSample(qSample)))
 
-proc measureRfRxcalCandidate(paramInd: uint32, candidate: int32):
+proc measureRfRxcalCandidate(paramInd: uint32, candidate: int32;
+                             initializeMeasurement = false):
     tuple[ok: bool, power: uint32] =
   writeRfRxcalParam(paramInd, candidate)
   waitRfUs(10'u32)
-  sampleRfRxcalPower()
+  sampleRfRxcalPower(initializeMeasurement)
 
 proc searchRfRxcalParam(paramInd: uint32, center, delta: int32):
     tuple[ok: bool, value: int32, power: uint32] =
   inc nim_wifi_rf_rxcal_search_count
-  var bestValue = clampRfRxcalParam(paramInd, center)
-  var bestPower = high(uint32)
-  var anyOk = false
-
-  let centerSample = measureRfRxcalCandidate(paramInd, bestValue)
-  if centerSample.ok:
-    bestPower = centerSample.power
-    anyOk = true
-
+  var bestValue = center
+  var bestPower = measureRfRxcalCandidate(paramInd, center, true).power
+  let minimum = if paramInd == 2'u32: 0'i32 else: -0x200'i32
+  let maximum = if paramInd == 2'u32: 0x7FF'i32 else: 0x1FF'i32
   var step = delta
-  while step > 0'i32:
-    let centerValue = bestValue
-    let leftValue = clampRfRxcalParam(paramInd, centerValue - step)
+  while true:
+    let leftValue = max(minimum, bestValue - step)
+    let rightValue = min(maximum, bestValue + step)
+    step = step shr 1
     let leftSample = measureRfRxcalCandidate(paramInd, leftValue)
-    if leftSample.ok:
-      if not anyOk or leftSample.power < bestPower:
-        bestValue = leftValue
-        bestPower = leftSample.power
-      anyOk = true
-
-    let rightValue = clampRfRxcalParam(paramInd, centerValue + step)
-    let rightSample = measureRfRxcalCandidate(paramInd, rightValue)
-    if rightSample.ok:
-      if not anyOk or rightSample.power < bestPower:
+    if leftSample.power < bestPower:
+      bestValue = leftValue
+      bestPower = leftSample.power
+    else:
+      let rightSample = measureRfRxcalCandidate(paramInd, rightValue)
+      if rightSample.power < bestPower:
         bestValue = rightValue
         bestPower = rightSample.power
-      anyOk = true
-
-    step = step div 2'i32
-
-  writeRfRxcalParam(paramInd, bestValue)
-  if anyOk:
-    (true, bestValue, bestPower)
-  else:
-    (false, bestValue, 0'u32)
+    if step == 0'i32:
+      break
+  (true, bestValue, bestPower)
 
 proc packRfRxcalWord0(rxcalParam2: int32): uint32 {.inline.} =
-  (uint32(clampRfRxcalParam(2'u32, rxcalParam2)) and 0x07FF'u32) shl 16
+  cast[uint32](rxcalParam2) shl 16
 
 proc packRfRxcalWord1(rxcalParam3: int32): uint32 {.inline.} =
-  uint32(clampRfRxcalParam(3'u32, rxcalParam3)) and 0x03FF'u32
+  cast[uint32](rxcalParam3) and 0xFFFF'u32
 
 proc storeRfRxcalRecord(rxcalRecordIndex: int, rxcalParam2, rxcalParam3: int32,
                         power: uint32) =
@@ -5864,7 +5650,8 @@ proc storeRfRxcalRecord(rxcalRecordIndex: int, rxcalParam2, rxcalParam3: int32,
       rxcalParam3ReplayWord)
   let rf = rfRegs()
   updateReg32(addr rf.rxcalReplay[rxcalRecordIndex], 0xF800FC00'u32,
-              rxcalParam2ReplayWord or rxcalParam3ReplayWord)
+              (rxcalParam2ReplayWord and 0x07FF0000'u32) or
+              (rxcalParam3ReplayWord and 0x000003FF'u32))
   lastWifiRfRxcalRecordWord0 = rfCalibWord(rxcalRecordBaseWord)
   lastWifiRfRxcalRecordWord1 = rfCalibWord(rxcalRecordBaseWord + 1)
   nim_wifi_rf_last_rxcal_power = power
@@ -5881,22 +5668,6 @@ proc rfPriReplayRxcalRegs() =
     updateReg32(addr rf.rxcalReplay[rxcalReplayRecordIndex], 0xF800FC00'u32,
                 (rfCalibWord(rxcalRecordBaseWord + 1) and 0x3FF'u32) or
                 (rfCalibWord(rxcalRecordBaseWord) and 0x07FF0000'u32))
-
-proc rfPriSeedRxcalRestoreLowHalves() =
-  ## rf_pri_rxcal preserves the low halfword of wl_cal words 18/20/22/24;
-  ## rf_pri_restore_cal_reg later packs those bytes into RF[0x1168/0x116c].
-  ## The vendor WB03/40M restore baseline also leaves the RXCAL replay words
-  ## at the centered 0x400 code, which maps to RF[0x1170..0x117c]=0x04000000.
-  ## Fresh pure-Nim calibration memory reaches RXCAL empty, while vendor-good
-  ## WB03/40M restore has 0x2123 in each of those low halfwords.
-  if rfCalibDataGlobal == nil:
-    return
-  for rxcalRestoreRecordIndex in 0 ..< 4:
-    let rxcalRecordBaseWord = 18 + rxcalRestoreRecordIndex * 2
-    let rxcalParam2ReplayWord = rfCalibWord(rxcalRecordBaseWord)
-    if (rxcalParam2ReplayWord and 0x07FF_FFFF'u32) == 0'u32 or
-        (rxcalParam2ReplayWord and 0x0000FFFF'u32) == 0x2023'u32:
-      rfCalibSetWord(rxcalRecordBaseWord, 0x04002123'u32)
 
 proc prepareRfPriRxcal() =
   rfPhyTraceCheckpoint(0x30'u32)
@@ -5915,41 +5686,47 @@ proc prepareRfPriRxcal() =
   updateReg32(addr rf.rxMode220, 0xFFFFE7FF'u32, 0x00001082'u32)
   updateReg32(addr rf.rxMode220, not 0x00000010'u32, 0x00000100'u32)
   updateReg32(addr rf.calDfeGate23c, not 0x00040000'u32, 0x00040000'u32)
-  updateReg32(addr rf.rxMode220, not 0x00000060'u32, 0x00000021'u32)
-  updateReg32(addr rf.rxMode220, not 0x00000040'u32, 0x00000040'u32)
+  updateReg32(addr rf.rxMode220, not 0x00000060'u32, 0'u32)
+  updateReg32(addr rf.rxMode220, not 0'u32, 0x00000021'u32)
+  updateReg32(addr rf.rxMode220, not 0'u32, 0x00000040'u32)
   updateReg32(addr rf.txcalDfe88, not 0x10000000'u32, 0x10000000'u32)
   updateReg32(addr rf.txcalGain64, not 0x00800000'u32, 0x00800000'u32)
   updateReg32(addr rf.txcalParam70, not 0x0000000F'u32,
               rfPriRf70ReplayWindow0Nibble())
   updateReg32(addr rf.calPathCtrl90, not 0x00000030'u32, 0x00000010'u32)
-  rfPriApplyWb03RuntimeLatches()
   updateReg32(addr rf.txcalDfe88, 0xFCFFFFFF'u32, 0x02000000'u32)
   updateReg32(addr rf.rxcalPrep60, not 0x00000003'u32, 0x00000003'u32)
   updateReg32(addr rf.txcalGain64, 0x0F83FFFF'u32, 0x201C0000'u32)
   updateReg32(addr rf.txcalBias58, 0xFFF8FFFF'u32, 0x00040000'u32)
-  updateReg32(addr rf.rccalTone48, 0xCE08FFFF'u32, 0x00700000'u32)
+  let rxcalToneRow = bl808RfTxPowerTable[bl808RfTxPowerTableIndex[8].int]
+  updateReg32(addr rf.rccalTone48, 0xCFFFFFFF'u32,
+              (cast[uint32](rxcalToneRow[0].int32) shl 28) and 0x30000000'u32)
+  updateReg32(addr rf.rccalTone48, 0xFE08FFFF'u32,
+              ((cast[uint32](rxcalToneRow[3].int32) shl 20) and 0x01F00000'u32) or
+              0x00070000'u32)
   updateReg32(addr rf.txcalGain68, 0x1DFFFFFF'u32, 0xA0000000'u32)
   updateReg32(addr rf.rccalTone48, 0xFFFF8CFF'u32, 0x0000311F'u32)
   waitRfUs(10'u32)
-  let rxcalReplayA8Word = wlCfgWb03RxcalReplayA8Word()
-  let rxcalReplayAcWord = wlCfgWb03RxcalReplayAcWord()
+  # RXCAL replays TXCAL record 8, independently of the active tone-gain row.
+  let rxcalReplayA8Word = rfCalibWord(RfCalibTxcalRecordBaseWord + 8 * 2)
+  let rxcalReplayAcWord = rfCalibWord(RfCalibTxcalRecordBaseWord + 8 * 2 + 1)
   updateReg32(addr rf.txcalTosdac600, not 0x000003FF'u32,
               (rxcalReplayAcWord and 0x000003FF'u32) or 0x00000400'u32)
   updateReg32(addr rf.txcalTosdac600, 0xFF800FFF'u32,
-              (((rxcalReplayA8Word shr 4) shl 12) and 0x007FF000'u32) or
+              ((rxcalReplayA8Word shr 4) and 0x007FF000'u32) or
               0x00800000'u32)
-  updateReg32(addr rf.txcalParam74, 0xC100FFFF'u32,
+  updateReg32(addr rf.txcalParam74, 0xC0FFFFFF'u32,
               (rxcalReplayA8Word shl 24) and 0x3F000000'u32)
-  updateReg32(addr rf.txcalParam74, 0xFFC10FFF'u32,
+  updateReg32(addr rf.txcalParam74, 0xFFC0FFFF'u32,
               (rxcalReplayA8Word shl 8) and 0x003F0000'u32)
   updateReg32(addr rf.measureMode61c, 0x0000FFFF'u32, 0x50000000'u32)
-  updateReg32(addr rf.measureCtrl618, not 0x40000000'u32, 0x40000000'u32)
+  updateReg32(addr rf.measureCtrl618, 0x3FFFFFFF'u32, 0x40000000'u32)
   updateReg32(addr rf.rxcalSearch614, 0xFF800FFF'u32, 0x00C00000'u32)
   updateReg32(addr rf.rxcalSearch614, not 0x000003FF'u32, 0x00000400'u32)
-  updateReg32(addr rf.calSingenCtrl20c, 0xFC010FFF'u32, 0x00400000'u32)
+  updateReg32(addr rf.calSingenCtrl20c, 0xFC00FFFF'u32, 0x00400000'u32)
   updateReg32(addr rf.calSingenAmpLo214, 0x003FFFFF'u32, 0x40000000'u32)
   updateReg32(addr rf.calSingenAmpHi218, 0x003FFFFF'u32, 0'u32)
-  updateReg32(addr rf.calSingenMeasurePrep21c, 0xEFFFFFFF'u32, 0'u32)
+  updateReg32(addr rf.calSingenMeasurePrep21c, 0xEFFFEFFF'u32, 0'u32)
   updateReg32(addr rf.calSingenAmpLo214, not 0x000007FF'u32, 0x00000110'u32)
   updateReg32(addr rf.calSingenAmpHi218, not 0x000007FF'u32, 0x00000110'u32)
   updateReg32(addr rf.calSingenCtrl20c, not 0x80000000'u32, 0'u32)
@@ -5966,33 +5743,26 @@ proc runRfPriRxcal() =
   prepareRfPriRxcal()
 
   let rxcalParam2Coarse = searchRfRxcalParam(2'u32, 0x400'i32, 0x40'i32)
+  writeRfRxcalParam(2'u32, rxcalParam2Coarse.value)
   let rxcalParam3Coarse = searchRfRxcalParam(3'u32, 0'i32, 0x20'i32)
+  writeRfRxcalParam(3'u32, rxcalParam3Coarse.value)
   let rxcalParam2Refined =
     searchRfRxcalParam(2'u32, rxcalParam2Coarse.value, 0x20'i32)
+  writeRfRxcalParam(2'u32, rxcalParam2Refined.value)
   let rxcalParam3Refined =
     searchRfRxcalParam(3'u32, rxcalParam3Coarse.value, 0x10'i32)
+  writeRfRxcalParam(3'u32, rxcalParam3Refined.value)
   let power = rxcalParam2Coarse.power or rxcalParam3Coarse.power or
     rxcalParam2Refined.power or rxcalParam3Refined.power
 
-  rfPriSeedRxcalRestoreLowHalves()
+  restoreRfPriCalState(saved)
+  updateReg32(addr rf.txcalDfe88, not 0x10000000'u32, 0'u32)
+  updateReg32(addr rf.calMode14, not 0'u32, RfRxcalDoneMode)
   for rxcalReplayRecordIndex in 0 ..< 4:
     storeRfRxcalRecord(
       rxcalReplayRecordIndex,
       rxcalParam2Refined.value, rxcalParam3Refined.value, power)
 
-  restoreRfPriCalState(saved)
-  rfPriReplayRxcalRegs()
-  rfPriApplyWb03RxcalTosdacLatch()
-  rfPriApplyWb03RuntimeLatches()
-  # Vendor scan-done state leaves the RXIQ measurement block idle with the
-  # search register armed and measure control ready.  The search loop above
-  # otherwise leaves the last candidate in 0x1614 and clears 0x1618, which
-  # correlates with a silent RX DMA path during active scan.
-  volatileStore(addr rf.rxcalSearch614, 0x00400000'u32)
-  volatileStore(addr rf.measureCtrl618, 0x80000000'u32)
-  if rxcalParam2Coarse.ok and rxcalParam3Coarse.ok and
-      rxcalParam2Refined.ok and rxcalParam3Refined.ok:
-    updateReg32(addr rf.calMode14, not RfRxcalModeMask, RfRxcalDoneMode)
   rfPhyTraceCheckpoint(0x32'u32)
 
 proc rfPriApplyPowerRowToTable(words: var array[43, uint32]; start: int;
@@ -6012,14 +5782,18 @@ proc rfPriApplyPowerRowToTable(words: var array[43, uint32]; start: int;
     ((cast[uint32](row[5].int32) and 7) shl 24) or
     ((cast[uint32](row[6].int32) and 1) shl 27)
 
-proc rfPriApplyRuntimePowerTables(words: var array[43, uint32];
-    scope: RfPriPowerTableScope = rfPowerAll): bool =
+proc rfPriPowerTableIndicesValid(scope: RfPriPowerTableScope): bool =
   if scope != rfPowerBz:
     for index in bl808RfTxPowerTableIndex:
       if index < 0 or index.int >= bl808RfTxPowerTable.len: return false
   if scope != rfPowerWlan:
     for index in bl808RfBzTargetPowerRecords:
       if index < 0 or index >= RfPriBzTxPowerTableDefault.len: return false
+  true
+
+proc rfPriApplyRuntimePowerTables(words: var array[43, uint32];
+    scope: RfPriPowerTableScope = rfPowerAll): bool =
+  if not rfPriPowerTableIndicesValid(scope): return false
   if scope != rfPowerBz:
     for slot, index in bl808RfTxPowerTableIndex:
       let row = bl808RfTxPowerTable[index.int]
@@ -6043,14 +5817,11 @@ proc rfPriApplyRuntimePowerTables(words: var array[43, uint32];
 proc rfPriApplyTxcalRecordToTable(txPowerTableWords: var array[43, uint32],
                                   txPowerTableWordIndex,
                                   txcalRecordIndex: int) =
-  ## Vendor rf_pri_txcal_w2reg always writes these fields. The pure path
-  ## preserves existing fields for empty records until TXCAL is bit-for-bit.
+  ## Zero-valued records still own all calibration fields.
   let txcalRecordWord0 =
     rfCalibWord(RfCalibTxcalRecordBaseWord + txcalRecordIndex * 2)
   let txcalRecordWord1 =
     rfCalibWord(RfCalibTxcalRecordBaseWord + txcalRecordIndex * 2 + 1)
-  if txcalRecordWord0 == 0'u32 and txcalRecordWord1 == 0'u32:
-    return
   let txcalParam0 = txcalRecordWord0 and 0x3F'u32
   let txcalParam1 = (txcalRecordWord0 shr 8) and 0x3F'u32
   let txcalParam2 = (txcalRecordWord0 shr 16) and 0x7FF'u32
@@ -6065,16 +5836,13 @@ proc rfPriApplyTxcalRecordToTable(txPowerTableWords: var array[43, uint32],
 proc rfPriApplyBzTxcalRecordToTable(txPowerTableWords: var array[43, uint32],
                                     txPowerTableStartWordIndex,
                                     bzTxcalRecordIndex: int) =
-  ## Vendor rf_pri_bz_txcal_w2reg always writes these fields. The pure path
-  ## preserves existing fields for empty records until BZ TXCAL is validated.
+  ## Zero-valued records still own all calibration fields.
   let bzTxcalRecordWord0 = rfCalibBzTxcalRecordWord0(bzTxcalRecordIndex)
   let bzTxcalRecordWord1 = rfCalibBzTxcalRecordWord1(bzTxcalRecordIndex)
   let txcalParam0 = bzTxcalRecordWord0 and 0x3F'u32
   let txcalParam1 = (bzTxcalRecordWord0 shr 8) and 0x3F'u32
   let txcalParam2 = (bzTxcalRecordWord0 shr 16) and 0x07FF'u32
   let txcalParam3 = bzTxcalRecordWord1 and 0x03FF'u32
-  if (txcalParam0 or txcalParam1 or txcalParam2 or txcalParam3) == 0'u32:
-    return
   txPowerTableWords[txPowerTableStartWordIndex] =
     (txPowerTableWords[txPowerTableStartWordIndex] and 0xFFFFF800'u32) or
       txcalParam2
@@ -6082,135 +5850,62 @@ proc rfPriApplyBzTxcalRecordToTable(txPowerTableWords: var array[43, uint32],
     (txPowerTableWords[txPowerTableStartWordIndex + 1] and 0xFF000003'u32) or
       (txcalParam3 shl 14) or (txcalParam0 shl 8) or (txcalParam1 shl 2)
 
-proc rfPriSeedBzTxcalFallbackRecords() =
-  ## rf_pri_bz_txcal writes these defaults when the BZ search path fails:
-  ## TXCAL params 0=0x20, 1=0x20, 2=0x400, 3=0 at the BZ TXCAL
-  ## calibration-record block.
-  ## A fresh pure-Nim cold init skips BZ TXCAL, but restore still replays the
-  ## BZ power-table records. Seed only empty records to match vendor fallback.
-  if rfCalibDataGlobal == nil:
-    return
-  for bzTxcalFallbackRecordIndex in 0 ..< 9:
-    let bzTxcalRecordWord0 =
-      rfCalibBzTxcalRecordWord0(bzTxcalFallbackRecordIndex)
-    let bzTxcalRecordWord1 =
-      rfCalibBzTxcalRecordWord1(bzTxcalFallbackRecordIndex)
-    if (bzTxcalRecordWord0 or bzTxcalRecordWord1) == 0'u32:
-      rfCalibStoreBzTxcalRecordWords(
-        bzTxcalFallbackRecordIndex,
-        packRfTxcalCalWord0(0x20'i32, 0x20'i32, 0x400'i32),
-        packRfTxcalCalWord1(0'i32))
-  rfPriSnapshotBzTxcalState(0xB0'u32)
-
 proc rfPriTxcalReplayRecordsComplete(): bool =
-  ## Guard for the vendor rf_pri_txcal_w2reg record block at
-  ## rf_calib_data+0x68, indexed by .data.tx_pwr_table_idx.
+  ## Storage and indices are required; zero calibration values are valid.
   if rfCalibDataGlobal == nil:
     return false
   for selectedRecord in bl808RfTxPowerTableIndex:
-    let txcalReplayRecordIndex = selectedRecord.int
-    if txcalReplayRecordIndex < 0 or
-        txcalReplayRecordIndex >= bl808RfTxPowerTable.len:
-      return false
-    let txcalRecordWord0 =
-      rfCalibWord(RfCalibTxcalRecordBaseWord + txcalReplayRecordIndex * 2)
-    let txcalRecordWord1 =
-      rfCalibWord(RfCalibTxcalRecordBaseWord + txcalReplayRecordIndex * 2 + 1)
-    if (txcalRecordWord0 or txcalRecordWord1) == 0'u32:
+    if selectedRecord < 0 or selectedRecord.int >= bl808RfTxPowerTable.len:
       return false
   true
 
 proc rfPriBzTxcalReplayRecordsComplete(): bool =
-  ## Guard for the vendor rf_pri_bz_txcal_w2reg record block at
-  ## rf_calib_data+0xf8, indexed by .data.bz_tx_pwr_table_idx.
   if rfCalibDataGlobal == nil:
     return false
-  for bzTxcalReplayRecordIndex in bl808RfBzTargetPowerRecords:
-    if bzTxcalReplayRecordIndex < 0 or
-        bzTxcalReplayRecordIndex >= RfPriBzTxPowerTableDefault.len:
-      return false
-    let bzTxcalRecordWord0 =
-      rfCalibBzTxcalRecordWord0(bzTxcalReplayRecordIndex)
-    let bzTxcalRecordWord1 =
-      rfCalibBzTxcalRecordWord1(bzTxcalReplayRecordIndex)
-    let txcalParam0 = bzTxcalRecordWord0 and 0x3F'u32
-    let txcalParam1 = (bzTxcalRecordWord0 shr 8) and 0x3F'u32
-    let txcalParam2 = (bzTxcalRecordWord0 shr 16) and 0x07FF'u32
-    let txcalParam3 = bzTxcalRecordWord1 and 0x03FF'u32
-    if (txcalParam0 or txcalParam1 or txcalParam2 or txcalParam3) == 0'u32:
+  for selectedRecord in bl808RfBzTargetPowerRecords:
+    if selectedRecord < 0 or selectedRecord >= RfPriBzTxPowerTableDefault.len:
       return false
   true
 
-proc rfPriWriteTxPowerTable(scope: RfPriPowerTableScope = rfPowerAll) =
-  ## Pack the selected runtime power rows before replaying their calibration.
-  ## The WB03/40 MHz fallback remains until calibration itself is validated.
-  let wb03Xtal40 = rfPriIsWb03() and
-    bl808RfXtalIndex == xtalIndex(WlXtal40M)
-  let txcalRecordsComplete = rfPriTxcalReplayRecordsComplete()
-  let bzTxcalRecordsComplete = rfPriBzTxcalReplayRecordsComplete()
-  nim_wifi_rf_tx_power_txcal_complete = uint32(txcalRecordsComplete)
-  nim_wifi_rf_tx_power_bz_txcal_complete = uint32(bzTxcalRecordsComplete)
-  let wb03CompleteCalReplayAllowed = wb03Xtal40 and
-    bl808WifiRfWb03ReplayCompleteTxPowerCal and
-    (scope == rfPowerBz or txcalRecordsComplete) and
-    (scope == rfPowerWlan or bzTxcalRecordsComplete)
-  let useCalReplay = rfCalibDataGlobal != nil and
-    ((not wb03Xtal40) or wb03CompleteCalReplayAllowed)
-  let useWb03RestoreBaseline = wb03Xtal40 and
-    not wb03CompleteCalReplayAllowed
-  nim_wifi_rf_tx_power_replay_skip_reason = RfPriTxPowerSkipNone
-  if useWb03RestoreBaseline:
-    nim_wifi_rf_tx_power_replay_mode =
-      RfPriTxPowerReplayWb03RestoreBaseline
-    if rfCalibDataGlobal == nil:
-      nim_wifi_rf_tx_power_replay_skip_reason =
-        RfPriTxPowerSkipNoCalData
-    elif scope != rfPowerBz and not txcalRecordsComplete:
-      nim_wifi_rf_tx_power_replay_skip_reason =
-        RfPriTxPowerSkipWb03TxcalIncomplete
-    elif scope != rfPowerWlan and not bzTxcalRecordsComplete:
-      nim_wifi_rf_tx_power_replay_skip_reason =
-        RfPriTxPowerSkipWb03BzTxcalIncomplete
+proc rfPriWriteTxPowerTable(scope: RfPriPowerTableScope;
+                            phases: set[RfPriPowerTablePhase]) =
+  ## Restore writes calibration only; init writes power only. Zero is a
+  ## valid calibration code on every board and crystal configuration.
+  if phases == {} or not rfPriPowerTableIndicesValid(scope):
+    return
+  let wantsCalibration = rfPowerCalibration in phases
+  let useCalReplay = wantsCalibration and rfCalibDataGlobal != nil
+  nim_wifi_rf_tx_power_txcal_complete = uint32(rfPriTxcalReplayRecordsComplete())
+  nim_wifi_rf_tx_power_bz_txcal_complete = uint32(rfPriBzTxcalReplayRecordsComplete())
+  nim_wifi_rf_tx_power_replay_mode =
+    if useCalReplay: RfPriTxPowerReplayCalRecords else: RfPriTxPowerReplayBaseOnly
+  nim_wifi_rf_tx_power_replay_skip_reason =
+    if wantsCalibration and rfCalibDataGlobal == nil:
+      RfPriTxPowerSkipNoCalData
     else:
-      nim_wifi_rf_tx_power_replay_skip_reason =
-        RfPriTxPowerSkipWb03OptInDisabled
-  elif useCalReplay:
-    nim_wifi_rf_tx_power_replay_mode =
-      if wb03Xtal40:
-        RfPriTxPowerReplayWb03CompleteRecords
-      else:
-        RfPriTxPowerReplayCalRecords
-  else:
-    nim_wifi_rf_tx_power_replay_mode = RfPriTxPowerReplayBaseOnly
-    nim_wifi_rf_tx_power_replay_skip_reason = RfPriTxPowerSkipNoCalData
-  var txPowerTableWords =
-    if useWb03RestoreBaseline:
-      RfPriWb03TxPowerRegisterBaseline
-    else:
-      RfPriTxPowerRegisterBase
-  if not useWb03RestoreBaseline:
-    if scope != rfPowerAll:
-      txPowerTableWords = rfPriReadTxPowerTable(scope)
+      RfPriTxPowerSkipNone
+  var txPowerTableWords = rfPriReadTxPowerTable(scope)
+  if rfPowerFields in phases:
     if not rfPriApplyRuntimePowerTables(txPowerTableWords, scope):
       return
   if useCalReplay:
     if scope != rfPowerBz:
       for txPowerReplaySlotIndex, selectedRecord in bl808RfTxPowerTableIndex:
-        let txcalRecordId = selectedRecord.int
         rfPriApplyTxcalRecordToTable(
-          txPowerTableWords, 3 + txPowerReplaySlotIndex * 2, txcalRecordId)
+          txPowerTableWords, 3 + txPowerReplaySlotIndex * 2, selectedRecord.int)
     if scope != rfPowerWlan:
       for bzTxcalTargetPowerSlotIndex in 0 ..< bl808RfBzTargetPowerRecords.len:
         rfPriApplyBzTxcalRecordToTable(txPowerTableWords,
           RfPriBzTxcalTableStarts[bzTxcalTargetPowerSlotIndex],
           bl808RfBzTargetPowerRecords[bzTxcalTargetPowerSlotIndex])
   rfPriSnapshotBzTxcalState(0xB1'u32)
-  if scope == rfPowerAll:
-    writeRfTxPowerCompTable(txPowerTableWords)
-  else:
-    rfPriPublishTxPowerTable(txPowerTableWords, scope, rfPowerFields)
-    if useCalReplay or useWb03RestoreBaseline:
-      rfPriPublishTxPowerTable(txPowerTableWords, scope, rfPowerCalibration)
+  for domain in [rfPowerWlan, rfPowerBz]:
+    if scope != rfPowerAll and scope != domain:
+      continue
+    if rfPowerFields in phases:
+      rfPriPublishTxPowerTable(txPowerTableWords, domain, rfPowerFields)
+    if useCalReplay:
+      rfPriPublishTxPowerTable(txPowerTableWords, domain, rfPowerCalibration)
 
 proc rfPriResetTxPowerRuntimeTables() =
   bl808RfTxPowerTable = RfPriTxPowerTableDefault
@@ -6245,53 +5940,11 @@ proc rfPriApplyLowPowerRuntimeDelta(delta: int16) =
       (bl808RfTxPowerTableIndex[txPowerIndexSlot].int32 - coarse).int16
   rfPriWriteTxPowerTable(rfPowerWlan)
 
-proc writeRfPriGainInit() =
-  ## Typed port of librf_bl808.a:rf_pri.c.o rf_pri_gain_table_WR2REG.
-  ## Programs the recovered RF gain-table words and then applies the same
-  ## synthesizer/init latches formerly held in RfPriGainInit.
-  let rf = rfRegs()
-  updateReg32(addr rf.rfGainTable760, 0xFF000000'u32, 0x00003189'u32)
-  updateReg32(addr rf.rfGainTable75c, 0xFF000000'u32, 0x0030F495'u32)
-  updateReg32(addr rf.rfGainTable79c, 0xC00007FF'u32, 0xD037D000'u32)
-  updateReg32(addr rf.rfGainTable794, 0xC00007FF'u32, 0xD06FF000'u32)
-  updateReg32(addr rf.rfGainTable78c, 0xC00007FF'u32, 0xD077E000'u32)
-  updateReg32(addr rf.rfGainOrBzTempComp784, 0xC00007FF'u32, 0x10940000'u32)
-  updateReg32(addr rf.rfGainTable77c, 0xC00007FF'u32, 0x109C0000'u32)
-  updateReg32(addr rf.rfGainTable774, 0xC00007FF'u32, 0x11180000'u32)
-  updateReg32(addr rf.rfGainTable76c, 0xC00007FF'u32, 0x115C0000'u32)
-  updateReg32(addr rf.rfGainTable764, 0xC00007FF'u32, 0x11FC0000'u32)
-  updateReg32(addr rf.synthCtrl2c, 0xFFFFFFFF'u32, 0x00004007'u32)
-  updateReg32(addr rf.synthDfePathControl63c, 0xFFFFFFFF'u32, 0x00008080'u32)
-
-proc rfCalibSeedDefaultVcoIfEmpty() =
-  ## The vendor restore path expects wl_cal halfwords 14..34 to contain
-  ## VCO freq/idac words. Fresh pure-Nim RF memory is zeroed, so seed a
-  ## board-log-derived 40 MHz table until rf_pri_full_cal is fully ported.
-  if rfCalibDataGlobal == nil:
-    return
-  let halfwords = cast[ptr UncheckedArray[uint16]](rfCalibDataGlobal)
-  for defaultVcoCalHalfwordIndex in 0 ..< RfPriDefaultVcoCal40M.len:
-    if halfwords[defaultVcoCalHalfwordIndex + RfCalibLoVcoHalfwordBase] != 0'u16:
-      return
-  for defaultVcoCalHalfwordIndex, defaultVcoCalHalfwordValue in RfPriDefaultVcoCal40M:
-    halfwords[defaultVcoCalHalfwordIndex + RfCalibLoVcoHalfwordBase] =
-      defaultVcoCalHalfwordValue
-
-proc rfCalibWriteDefaultVco40M() =
-  ## Cold LO calibration is not bit-for-bit with the vendor firmware yet.
-  ## Keep the passing vendor-derived 40 MHz VCO table for RFC programming.
-  if rfCalibDataGlobal == nil:
-    return
-  let halfwords = cast[ptr UncheckedArray[uint16]](rfCalibDataGlobal)
-  for defaultVcoCalHalfwordIndex, defaultVcoCalHalfwordValue in RfPriDefaultVcoCal40M:
-    halfwords[defaultVcoCalHalfwordIndex + RfCalibLoVcoHalfwordBase] =
-      defaultVcoCalHalfwordValue
-
 proc replayRfPriCalRegisters() =
   ## Port of librf_bl808.a:rf_pri.c.o rf_pri_restore_cal_reg register replay.
   ## Recovered: calibration word packing into RF 0x1168/0x116c/0x1084/
   ## 0x1070 and 0x1170..0x117c, plus WLAN/BZ TX-cal power table replay.
-  if not rfCalibHasRestoreData():
+  if rfCalibDataGlobal == nil:
     return
   let rf = rfRegs()
   let rccalReplayWord = rfCalibWord(RfCalibRccalReplayWordIndex)
@@ -6313,19 +5966,33 @@ proc replayRfPriCalRegisters() =
   updateReg32(addr rf.txcalParam70, 0xFFFFFFF0'u32,
               rfPriRf70ReplayWindow0Nibble())
   rfPriSnapshotStage(0xF200'u32)
-  rfPriWriteTxPowerTable()
+  rfPriWriteTxPowerTable(phases = {rfPowerCalibration})
   rfPriSnapshotStage(0xF201'u32)
   rfPriReplayRxcalRegs()
   rfPriSnapshotStage(0xF202'u32)
   rfPriSnapshotBzTxcalState(0xB2'u32)
 
+proc rfPriApplyTotalPowerRuntimeDelta(delta: int16) =
+  ## Chip_Version 99 uses all WLAN rows and power fields only, not TXCAL.
+  var coarse = delta.int32 div 4
+  var residual = delta.int32 mod 4
+  if residual > 1:
+    inc coarse
+    residual -= 4
+  elif residual < -2:
+    dec coarse
+    residual += 4
+  rfPriResetTxPowerRuntimeTables()
+  for row in bl808RfTxPowerTable.mitems:
+    row[7] = rfSignExtend16(row[7].int32 + residual)
+    row[RfPriTxPowerRowPowerThresholdTenthsIndex] =
+      rfSignExtend16(row[RfPriTxPowerRowPowerThresholdTenthsIndex].int32 - coarse * 10)
+  for index in bl808RfTxPowerTableIndex.mitems:
+    index = rfSignExtend16(index.int32 - coarse)
+  rfPriWriteTxPowerTable(rfPowerWlan, {rfPowerFields})
+
 proc rfPriWriteTotalPowerComp(channelIndex: uint32) =
-  ## Direct path of rf_pri_set_channel_total_pwr_comp for normal mode.
-  if rfPriIsWb03() and bl808RfXtalIndex == xtalIndex(WlXtal40M):
-    ## The WB03 restore baseline already carries the vendor channel-power
-    ## table. The current pure compensation state overwrites RF[0x1704] high
-    ## byte with 0x11, while vendor scan-filter state keeps it zero.
-    return
+  ## rf_pri_set_channel_total_pwr_comp selects only on Chip_Version.
   if channelIndex < 1'u32 or channelIndex > 14'u32:
     return
   let channelCompTableIndex = int(channelIndex - 1'u32)
@@ -6337,6 +6004,9 @@ proc rfPriWriteTotalPowerComp(channelIndex: uint32) =
     clipped = 16'i16
   elif clipped < -16'i16:
     clipped = -16'i16
+  if bl808RfChipVersion == 99'u8:
+    rfPriApplyTotalPowerRuntimeDelta(clipped)
+    return
   let tx = rfSignExtend16(bl808RfTxGainComp.int32 + clipped.int32)
   let rf = rfRegs()
   updateReg32(addr rf.txPowerComp704, 0x00FFFFFF'u32,
@@ -6491,63 +6161,73 @@ proc rf_pri_get_xtalfreq(): uint32 {.exportc, cdecl.} =
   else:
     0'u32
 
+proc rf_pri_xtalfreq() {.exportc, cdecl.} =
+  ## rf_pri.c.o rf_pri_xtalfreq selects private PLL/LO state without MMIO.
+  ## Unknown flags leave the previously selected state unchanged.
+  var selected = -1
+  if bl808RfPriXtal24mFlag != 0: selected = 0
+  elif bl808RfPriXtal26mFlag != 0: selected = 1
+  elif bl808RfPriXtal32mFlag != 0: selected = 2
+  elif bl808RfPriXtal38p4mFlag != 0: selected = 3
+  elif bl808RfPriXtal40mFlag != 0: selected = 4
+  elif bl808RfPriXtal52mFlag != 0: selected = 5
+  if selected < 0:
+    return
+  bl808RfPriXtalTableIndex = selected.int8
+  bl808RfPriFcalDiv = RfPriFcalDivByXtal[selected]
+  bl808RfPriPllRefdivRatio = RfPriPllRefdivByXtal[selected]
+
 proc rfPriXtalRefdivRatio(): uint32 {.inline.} =
-  if bl808RfPriXtal24mFlag != 0 or bl808RfPriXtal26mFlag != 0:
-    1'u32
-  elif bl808RfPriXtal32mFlag != 0 or bl808RfPriXtal38p4mFlag != 0 or
-      bl808RfPriXtal40mFlag != 0:
-    2'u32
-  else:
-    0'u32
+  bl808RfPriPllRefdivRatio.uint32
 
 proc rfPriXtalTenthsMhz(): uint32 {.inline.} =
-  if bl808RfPriXtal24mFlag != 0:
+  if bl808RfPriXtal38p4mFlag != 0:
+    384'u32
+  elif bl808RfPriXtal24mFlag != 0:
     240'u32
   elif bl808RfPriXtal26mFlag != 0:
     260'u32
   elif bl808RfPriXtal32mFlag != 0:
     320'u32
-  elif bl808RfPriXtal38p4mFlag != 0:
-    384'u32
+  elif bl808RfPriXtal40mFlag != 0:
+    400'u32
   elif bl808RfPriXtal52mFlag != 0:
-    800'u32
+    520'u32
   else:
     400'u32
 
+proc rfPriWifiPllFractionWord(): uint32 {.inline.} =
+  let slot = case rfPriXtalTenthsMhz()
+    of 240'u32: 0
+    of 260'u32: 1
+    of 320'u32: 2
+    of 384'u32: 3
+    of 520'u32: 5
+    else: 4
+  RfPriPllFractionWords[slot][bl808RfPriPllRefdivRatio.int]
+
 proc rfPriWifiPllConfig() =
-  ## Port of librf_bl808.a:rf_pri.c.o rf_pri_wifipll_config for BL808's
-  ## default device path. The vendor source uses float arithmetic for the
-  ## fractional PLL word; the integer form below is equivalent for all known
-  ## xtal inputs and keeps this path soft-float free.
+  ## Port of rf_pri.c.o rf_pri_wifipll_config. The finite lookup preserves
+  ## float32 rounding (notably 38.4 MHz) without requiring FPU state here.
   let rf = rfRegs()
   let pll = rfPllRegs()
   let refdiv = rfPriXtalRefdivRatio()
   updateReg32(addr pll.refdivCtrl14, 0xFFFFF0FF'u32,
               (refdiv shl 8) and 0x00000F00'u32)
 
-  let xtalTenths = rfPriXtalTenthsMhz()
-  let fracBase = (uint64(refdiv) * 15'u64) shl 25
-  let frac =
-    if xtalTenths == 0'u32:
-      0'u32
-    elif (xtalTenths mod 10'u32) == 0'u32:
-      uint32(fracBase div uint64(xtalTenths div 10'u32))
-    else:
-      uint32((fracBase * 10'u64) div uint64(xtalTenths))
+  let frac = rfPriWifiPllFractionWord()
   updateReg32(addr pll.fractionalDividerWord28, 0xFC000000'u32,
               frac and 0x03FFFFFF'u32)
 
-  let wb03Xtal40 = rfPriIsWb03() and
-    bl808RfXtalIndex == xtalIndex(WlXtal40M)
-  let wb03Xtal26 = rfPriIsWb03() and
-    bl808RfXtalIndex == xtalIndex(WlXtal26M)
+  let wb03 = rfPriIsWb03()
+  let wb03Xtal26 = wb03 and bl808RfPriXtal26mFlag != 0
   if wb03Xtal26:
     updateReg32(addr pll.fractionalDividerWord28, 0x7BFFFFFF'u32, 0'u32)
     updateReg32(addr pll.modeCtrl2c, 0xFFFFFECF'u32, 0'u32)
     updateReg32(addr rf.optimizeCtrlD0, 0xFFFFFFF0'u32, 0'u32)
     updateReg32(addr pll.loopFilter18, 0xFFFFFE0F'u32, 0x00000020'u32)
     updateReg32(addr pll.fractionalCtrl1c, 0xFFF80FFE'u32, 0x00036100'u32)
-  elif not wb03Xtal40:
+  elif not wb03 or bl808RfPriXtal40mFlag != 0:
     updateReg32(addr pll.fractionalDividerWord28, not 0'u32, 0x84000000'u32)
     updateReg32(addr pll.modeCtrl2c, not 0'u32, 0x00000130'u32)
     updateReg32(addr rf.optimizeCtrlD0, 0xFFFFFFFE'u32, 0x0000000E'u32)
@@ -6559,16 +6239,8 @@ proc rfPriWifiPllConfig() =
   updateReg32(addr pll.pllReset10, not 0'u32, 0x00000001'u32)
   updateReg32(addr pll.pllReset10, not 0'u32, 0x00000004'u32)
   updateReg32(addr pll.enableCtrl30, 0xFFFFFFF3'u32, 0x00001FF3'u32)
-  for _ in 0 ..< 11:
+  for _ in 0 ..< 12:
     discard volatileLoad(addr pll.enableCtrl30)
-
-proc rf_pri_xtalfreq() {.exportc, cdecl.} =
-  ## ABI wrapper for librf_bl808.a:rf_pri.c.o rf_pri_xtalfreq.
-  ## LLVM objdump shows the vendor body selecting xtal-specific private PLL
-  ## parameter anchors from the six xtal flags. The pure-Nim RF path keeps
-  ## that state as named xtal flags and writes the resulting typed PLL/RF
-  ## registers directly in rfPriWifiPllConfig.
-  rfPriWifiPllConfig()
 
 proc rfPriEfuseXtalCapPairValid(cfg: ptr WlRfConfig): bool {.inline.} =
   cfg.efuseXtalCapCode0 != 0x80'u8 and cfg.efuseXtalCapCode1 != 0x80'u8
@@ -6655,27 +6327,19 @@ proc runRfPriFullCalRestoreBaseline() =
   ##   rf_pri_lo_fcal -> rf_pri_lo_acal -> optional rf_pri_roscal.part.0
   ##   -> optional rf_pri_rccal.part.0 -> rf_pri_txcal -> rf_pri_bz_txcal
   ##   -> rf_pri_rxcal.
-  ## WB03/40 MHz runs the recovered rf_pri_bz_txcal path. Other board paths
-  ## retain the fallback records until their BZ branch is validated.
+  let rf = rfRegs()
+  updateReg32(addr rf.rxMode220, 0xFFFFE67D'u32, 0'u32)
+  updateReg32(addr rf.rxMode220, 0xFFFFFF9E'u32, 0'u32)
   runRfPriLoFcal()
   runRfPriLoAcal()
-  rfCalibWriteDefaultVco40M()
   runRfPriRoscal()
   runRfPriRccal()
   runRfPriTxcal()
-  if rfPriIsWb03() and bl808RfXtalIndex == xtalIndex(WlXtal40M):
-    runRfPriBzTxcal()
-  else:
-    rfPriSeedBzTxcalFallbackRecords()
+  runRfPriBzTxcal()
   runRfPriRxcal()
+  updateReg32(addr rf.rxMode220, 0xFFFFE67D'u32, 0'u32)
+  updateReg32(addr rf.rxMode220, 0xFFFFFF9E'u32, 0'u32)
   rfPriSnapshotStage(0xF300'u32)
-  rfPriSeedRxcalRestoreLowHalves()
-  replayRfPriCalRegisters()
-  rfPriSnapshotStage(0xF301'u32)
-  rfPriReplayWb03Rf70FromTxcalCalWords()
-  rfPriApplyWb03RccalSeed()
-  rfPriApplyWb03RxcalTosdacLatch()
-  rfPriSnapshotStage(0xF302'u32)
 
 proc rf_pri_lo_fcal() {.exportc, cdecl.} =
   ## Public ABI wrapper for librf_bl808.a:rf_pri.c.o rf_pri_lo_fcal.
@@ -6707,18 +6371,16 @@ proc rf_pri_restore_cal_reg() {.exportc, cdecl.} =
 
 proc rf_pri_init(coldInit, mode: uint32) {.exportc, cdecl.} =
   ## Local replacement boundary for rf_pri.c.o rf_pri_init.
-  ## Recovered: fixed RF defaults, wifipll/static register phase, full-cal
-  ## order, and the rf_pri_gain_table_WR2REG follow-up.
+  ## Recovered: fixed RF defaults, wifipll programming, full-cal order, and
+  ## the WLAN/BZ power-row follow-up without additional static/gain writes.
+  ## The caller's cold flag alone selects full calibration versus restore;
+  ## saved zero values are valid and are not a recalibration request.
   ##
   ## Remaining calibration deltas, tied to LLVM objdump offsets:
   ## - librf_bl808.a:rf_pri.c.o rf_pri_full_cal+0x36..0x5e gates the
   ##   optional ROSCAL/RCCAL branches from RF capability bits; runRfPriRoscal
   ##   and runRfPriRccal preserve those RF[0x20] gates. Callback-driven
   ##   temperature compensation and low-power variants remain unrecovered.
-  ## - librf_bl808.a:rf_pri.c.o rf_pri_txcal+0x316..0x52a measures RF70
-  ##   replay-source windows. We run that strongest-candidate search for
-  ##   diagnostics, but applying measured windows is default-off until the
-  ##   earlier TXCAL measurement setup is bit-for-bit recovered.
   ## - librf_bl808.a:rf_pri.c.o rf_pri_restore_cal_reg+0x10c..0x1a8 replays
   ##   RF70 and RXCAL words from calibration memory. RF70/RFA0/RFB4 remain
   ##   calibration/channel-state derived; rf_pri_fixed_val_regs' WB03 branch
@@ -6730,49 +6392,38 @@ proc rf_pri_init(coldInit, mode: uint32) {.exportc, cdecl.} =
   bl808RfColdInit = coldInit
   bl808RfMode = radioPhyModeFromApi(uint8(mode and 0xFF'u32))
   rfPriEnsureDeviceInfo()
-  rfCalibDataGlobal = wlCalGlobal
-  let needsFullCal = coldInit != 0'u32 or not rfCalibHasTxcalData()
-  if not needsFullCal:
-    rfCalibSeedDefaultVcoIfEmpty()
+  rf_pri_init_calib_mem()
+  let needsFullCal = coldInit != 0'u32
   updateReg32(addr rfDfeInitRegs().dfeTrim824, 0x9FFFFFFF'u32,
               0x40000000'u32)
   rfPriEfuseInit()
   rfPriSnapshotStage(0xF400'u32)
+  rf_pri_xtalfreq()
   writeRfPriFixedValueRegs()
-  writeRfPriStaticInit()
   rfPriSnapshotStage(0xF401'u32)
   rfPriWifiPllConfig()
   rfPriSnapshotStage(0xF402'u32)
   rfPhyTraceCheckpoint(0x21'u32)
-  rfPriApplyWb03RuntimeLatches()
   rfPriSnapshotStage(0xF403'u32)
   let rf = rfRegs()
-  updateReg32(addr rf.calPathCtrl90, not 0'u32, 0x1'u32)
   updateReg32(addr rf.rxMode220, 0xFFFFE67D'u32, 0'u32)
   updateReg32(addr rf.rxMode220, 0xFFFFFF9E'u32, 0'u32)
   if needsFullCal:
     runRfPriFullCalRestoreBaseline()
     rfPriSnapshotStage(0xF404'u32)
-  elif coldInit == 0'u32:
+  else:
     replayRfPriCalRegisters()
     rfPriSnapshotStage(0xF405'u32)
-    rfPriReplayWb03Rf70FromTxcalCalWords()
-    rfPriApplyWb03RccalSeed()
-    rfPriApplyWb03RxcalTosdacLatch()
     rfPriSnapshotStage(0xF406'u32)
-  writeRfPriGainInit()
   rfPriSnapshotStage(0xF407'u32)
-  rfPriWriteTxPowerTable()
+  rfPriWriteTxPowerTable(phases = {rfPowerFields})
   rfPriSnapshotStage(0xF408'u32)
-  rfPriApplyWb03RccalSeed()
-  rfPriApplyWb03RxcalTosdacLatch()
   rfPriSnapshotStage(0xF409'u32)
   updateReg32(addr rf.synthCtrl2c, not 0'u32, 0x6'u32)
-  updateReg32(addr rf.synthCtrl2c, not 0'u32, 0x4001'u32)
+  updateReg32(addr rf.synthCtrl2c, not 0'u32, 0x4021'u32)
   updateReg32(addr rf.synthDfePathControl63c, not 0'u32, 0x8080'u32)
   updateReg32(addr rf.rxMode220, not 0x600'u32, 0'u32)
   rfPriSnapshotStage(0xF40A'u32)
-  rfPriApplyWb03RfcEntryBaseline()
   rfPriSnapshotStage(0xF40B'u32)
   rfPhyTraceCheckpoint(0x22'u32)
 
@@ -6789,37 +6440,20 @@ proc rf_pri_read(reg: ptr uint32): uint32 {.exportc, cdecl.} =
 
 proc rf_pri_get_notch_param*(channelMhz: uint32, enable: ptr uint8,
                              param: ptr uint32) {.exportc, cdecl.} =
-  ## Vendor BL808 helper currently returns disabled notch parameters, but
-  ## rfc_config_channel still consumes the zero outputs to program RF[0x680].
+  ## The selected RF object returns disabled notch parameters. Its normal
+  ## rfc_config_channel path does not consume them or write RF[0x680].
   discard channelMhz
   if enable != nil:
     enable[] = 0
   if param != nil:
     param[] = 0
 
-proc rfPriApplyNotchParam(channelMhz: uint32) =
-  var notchEnable: uint8
-  var notchParam: uint32
-  rf_pri_get_notch_param(channelMhz, addr notchEnable, addr notchParam)
-  let notchWord =
-    uint32(((uint64(notchParam) * 2048'u64 + 20_000_000'u64) div
-      40_000_000'u64) and 0x07FF'u64)
-  let rf = rfRegs()
-  var notchCtrlWord = volatileLoad(addr rf.notchCtrl680)
-  notchCtrlWord = (notchCtrlWord and 0x87FFFFFF'u32) or 0x08000000'u32
-  notchCtrlWord =
-    (notchCtrlWord and 0xF800FFFF'u32) or
-    ((notchWord shl 16) and 0x07FF0000'u32)
-  notchCtrlWord =
-    (notchCtrlWord and 0x7FFFFFFF'u32) or
-    (uint32(notchEnable and 1'u8) shl 31)
-  volatileStore(addr rf.notchCtrl680, notchCtrlWord)
-
 proc rfPriApplyWb03Non40OptimizePll(channelMhz: uint32) =
   ## LLVM objdump provenance: librf_bl808.a:rf_pri.c.o
-  ## rf_pri_optimize+0x82..0x14e. This is the WB03 branch used when the
-  ## xtal-40 flag is clear; WB03/40M stays on the default RFD0/RF70 path.
-  if not rfPriIsWb03() or bl808RfXtalIndex == xtalIndex(WlXtal40M):
+  ## rf_pri_optimize+0x82..0x14e. Only WB03 with xtal-26 set and xtal-40
+  ## clear takes this PLL branch.
+  if bl808RfDeviceWb03 == 0 or bl808RfPriXtal40mFlag != 0 or
+      bl808RfPriXtal26mFlag == 0:
     return
   let pll = rfPllRegs()
   if channelMhz == RfOptimizeWb03PllEdge0Mhz or
@@ -6827,8 +6461,8 @@ proc rfPriApplyWb03Non40OptimizePll(channelMhz: uint32) =
     updateReg32(addr pll.loopFilter18, not 0x000001F0'u32, 0x00000020'u32)
     updateReg32(addr pll.fractionalCtrl1c, not 0x0007F001'u32, 0x00036100'u32)
   else:
-    updateReg32(addr pll.loopFilter18, not 0x000000F0'u32, 0x00000040'u32)
-    updateReg32(addr pll.fractionalCtrl1c, not 0x0007F100'u32, 0x0005A000'u32)
+    updateReg32(addr pll.loopFilter18, not 0x000000F0'u32, 0x00000140'u32)
+    updateReg32(addr pll.fractionalCtrl1c, not 0x0007F100'u32, 0x0005A001'u32)
 
 proc rf_pri_optimize(channelMhz: uint32) {.exportc, cdecl.} =
   ## Port of the default rf_pri_optimize path in librf_bl808.a:rf_pri.c.o.
@@ -6836,7 +6470,7 @@ proc rf_pri_optimize(channelMhz: uint32) {.exportc, cdecl.} =
   ## 2452..2472 MHz mid-band window, then RF[0x70]'s calibration nibble is
   ## replayed from wl_cal word 4 for 2462..2484 MHz and word 3 otherwise.
   ## Vendor WB03/40M reaches this same branch; the RF[0x818]/RF[0x81c] writes
-  ## are on the WB03/non-40M branch at rf_pri_optimize+0x82..0x14e.
+  ## are on the WB03/26M branch at rf_pri_optimize+0x82..0x14e.
   bl808RfChannelMhz = channelMhz
   let traceIdx = int(nim_wifi_rf_optimize_count mod
     uint32(RfPriStageSnapshotEntries))
@@ -6845,16 +6479,20 @@ proc rf_pri_optimize(channelMhz: uint32) {.exportc, cdecl.} =
   nim_wifi_rf_optimize_device_log[traceIdx] = rfPriDeviceTraceWord()
   let rf = rfRegs()
   var optimizeControl = volatileLoad(addr rf.optimizeCtrlD0)
-  if channelMhz >= RfOptimizeMidBandFirstMhz and
-      channelMhz <= RfOptimizeMidBandLastMhz:
-    optimizeControl = optimizeControl and not RfOptimizeMidBandMask
-  else:
-    optimizeControl = optimizeControl or RfOptimizeMidBandMask
-  volatileStore(addr rf.optimizeCtrlD0, optimizeControl)
+  if bl808RfPriXtal40mFlag != 0 and
+      (bl808RfDeviceBl616 or bl808RfDeviceWb03 or bl808RfDeviceBl618m) != 0:
+    if ((channelMhz - RfOptimizeMidBandFirstMhz) and 0xFFFF'u32) <=
+        RfOptimizeMidBandLastMhz - RfOptimizeMidBandFirstMhz:
+      optimizeControl = optimizeControl and not RfOptimizeMidBandMask
+    else:
+      optimizeControl = optimizeControl or RfOptimizeMidBandMask
+    volatileStore(addr rf.optimizeCtrlD0, optimizeControl)
   nim_wifi_rf_optimize_rfd0_log[traceIdx] = optimizeControl
+  rfPriApplyWb03Non40OptimizePll(channelMhz)
   if rfCalibDataGlobal != nil:
-    let useHighBandTxcalReplayWindow = channelMhz >= RfOptimizeTxcalFirstMhz and
-      channelMhz <= RfOptimizeTxcalLastMhz
+    let useHighBandTxcalReplayWindow =
+      ((channelMhz - RfOptimizeTxcalFirstMhz) and 0xFFFF'u32) <=
+        RfOptimizeTxcalLastMhz - RfOptimizeTxcalFirstMhz
     let txcalNibble =
       if useHighBandTxcalReplayWindow:
         rfPriRf70ReplayWindow2Nibble()
@@ -6866,7 +6504,6 @@ proc rf_pri_optimize(channelMhz: uint32) {.exportc, cdecl.} =
   else:
     nim_wifi_rf_optimize_nibble_log[traceIdx] = 0xFFFF_FFFF'u32
   nim_wifi_rf_optimize_rf70_log[traceIdx] = volatileLoad(addr rf.txcalParam70)
-  rfPriApplyWb03Non40OptimizePll(channelMhz)
 
 proc rfPriBzOptimizeEnabled(): bool {.inline.} =
   ## librf_bl808.a:rf_pri.c.o rf_pri_bz_optimize gates RF[0x10d0] bit 2 on
@@ -6947,7 +6584,7 @@ proc rf_pri_set_temp_comp(sensorTemperatureC: int32) {.exportc, cdecl.} =
   ## Recovered semantics: refresh temperature-comp tables from wl_cfg, compute
   ## temperature_comp for the current channel, and outside the vendor
   ## measurement pass update present_Tsensor before applying total power comp.
-  let channelIndex = bl808RfChannelPowerIndex
+  let channelIndex = bl808RfChannelPowerIndex.uint32
   if channelIndex < 1'u32 or channelIndex > 14'u32:
     return
   let cfg = cast[ptr WlRfConfig](wlCfgGlobal)
@@ -7131,7 +6768,7 @@ proc rf_pri_input_bz_target_power(targetPowerDbm: int32) {.exportc, cdecl.} =
   rfPriSnapshotBzTxcalState(0xB5'u32)
 
 proc rf_pri_set_channel_pwr_comp(channelIndex: uint32) {.exportc, cdecl.} =
-  bl808RfChannelPowerIndex = channelIndex
+  bl808RfChannelPowerIndex = uint8(channelIndex and 0xFF'u32)
   if channelIndex < 1'u32 or channelIndex > 14'u32:
     return
   let cfg = cast[ptr WlRfConfig](wlCfgGlobal)
@@ -7160,9 +6797,7 @@ proc rfPriVcoCalWord(channelMhz: uint32): uint32 =
   ## index = min(((channelMhz - 2402) >> 2), 20).
   if rfCalibDataGlobal == nil:
     return 0'u32
-  var loVcoHalfwordIndex =
-    if channelMhz > 2402'u32: (channelMhz - 2402'u32) shr 2
-    else: 0'u32
+  var loVcoHalfwordIndex = (channelMhz - 2402'u32) shr 2
   if loVcoHalfwordIndex > 20'u32:
     loVcoHalfwordIndex = 20'u32
   let halfwords = cast[ptr UncheckedArray[uint16]](rfCalibDataGlobal)
@@ -7207,7 +6842,7 @@ proc rf_clkpll_isr*() {.exportc, cdecl.} =
 type
   WlParamLoadCb = proc(xtalfreq: ptr uint32): int8 {.cdecl.}
   WlCapcodeSetCb = proc(cap0, cap1: uint8) {.cdecl.}
-  WlCapcodeGetCb = proc(cap: ptr uint8) {.cdecl.}
+  WlCapcodeGetCb = proc(cap0, cap1: ptr uint8) {.cdecl.}
 
 proc modem_init_core*(xtalfreqHz, restore: uint32) {.exportc, cdecl.}
 proc modemInitCoreMode(xtalfreqHz, restoreExistingCalibration: uint32;
@@ -7232,37 +6867,49 @@ proc wl_init*(): int8 {.exportc, cdecl.} =
   ## Recovered behavior: optional parameter callback, optional capcode
   ## callbacks, full-cal vs restore modem path, 0xACDE status, and env status
   ## byte clear. The API mode field is preserved for higher-level RF routing.
-  let cfg = cast[ptr WlRfConfig](wlCfgGlobal)
+  var cfg = cast[ptr WlRfConfig](wlCfgGlobal)
   if cfg == nil:
     return -1'i8
   var cbStatus = 0'i8
   if cfg.enableParamLoadCallback != 0'u8 and cfg.paramLoadCallback != nil:
     cbStatus = cast[WlParamLoadCb](cfg.paramLoadCallback)(addr cfg.xtalfreqHz)
+    cfg = cast[ptr WlRfConfig](wlCfgGlobal)
+    if cfg == nil:
+      return -1'i8
   if cfg.capcodeSetCallback != nil:
     let cap0 = uint8(cfg.xtalCapCodes and 0x00FF'u16)
     let cap1 = uint8((cfg.xtalCapCodes shr 8) and 0x00FF'u16)
     if cap0 <= 63'u8 and cap1 <= 63'u8:
       cast[WlCapcodeSetCb](cfg.capcodeSetCallback)(cap0, cap1)
+      cfg = cast[ptr WlRfConfig](wlCfgGlobal)
+      if cfg == nil:
+        return -1'i8
   if cfg.capcodeGetCallback != nil:
     var cap: uint8
-    cast[WlCapcodeGetCb](cfg.capcodeGetCallback)(addr cap)
+    cast[WlCapcodeGetCb](cfg.capcodeGetCallback)(addr cap, addr cap)
+    cfg = cast[ptr WlRfConfig](wlCfgGlobal)
+    if cfg == nil:
+      return -1'i8
   let restoreExistingCalibration =
     if cfg.requestFullCalibration != 0'u8: 0'u32 else: 1'u32
   modemInitCoreMode(
     cfg.xtalfreqHz,
     restoreExistingCalibration,
     radioPhyModeFromApi(cfg.apiMode))
+  cfg = cast[ptr WlRfConfig](wlCfgGlobal)
+  if cfg == nil:
+    return -1'i8
   cfg.status = WlRfConfigMagic
   if wlEnvGlobal != nil:
     cast[ptr UncheckedArray[uint8]](wlEnvGlobal)[9] = 0'u8
   cbStatus
 
 proc channelPowerIndex(channelMhz: uint32): uint32 {.inline.} =
-  if channelMhz >= 2412'u32 and channelMhz <= 2484'u32:
-    if channelMhz == 2484'u32:
-      return 14'u32
-    return ((channelMhz - 2412'u32) div 5'u32 + 1'u32) and 0xFF'u32
-  0'u32
+  if ((channelMhz - 2412'u32) and 0xFFFF'u32) > 72'u32:
+    return 0'u32
+  if channelMhz == 2484'u32:
+    return 14'u32
+  cast[uint32](cast[int32](channelMhz - 2407'u32) div 5'i32) and 0xFF'u32
 
 proc rfc_config_bandwidth*(bandwidth: uint32) {.exportc, cdecl.} =
   ## Port of librf_bl808.a:rfc_helper.c.o rfc_config_bandwidth.
@@ -7454,9 +7101,7 @@ proc rfc_config_channel*(channelMhz: uint32) {.exportc, cdecl.} =
   updateReg32(addr rf.channelFreqMhz264, 0xFFFFF000'u32,
               channelMhz and 0xFFF'u32)
   updateReg32(addr rf.channelTuneStrobe268, 0xFFFDFFFF'u32, 0x00020000'u32)
-  waitRfUs(1)
   updateReg32(addr rf.channelTuneStrobe268, 0xFFFDFFFF'u32, 0'u32)
-  waitRfUs(1)
   updateReg32(addr rf.baseCtrl1, not 0'u32, 0x2'u32)
   waitRfUs(1)
   updateReg32(addr rf.channelTuneCtrl26c, not 0x7'u32, 0x1'u32)
@@ -7469,7 +7114,6 @@ proc rfc_config_channel*(channelMhz: uint32) {.exportc, cdecl.} =
   waitRfUs(1)
   updateReg32(addr rf.channelTuneGate228, not 0x8'u32, 0'u32)
   rf_pri_update_param(channelMhz)
-  rfPriApplyNotchParam(channelMhz)
   rf_pri_set_channel_pwr_comp(channelPowerIndex(channelMhz))
   rf_pri_optimize(channelMhz)
   rfPhyTraceCheckpoint(0x40'u32)

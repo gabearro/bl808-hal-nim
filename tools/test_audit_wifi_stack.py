@@ -49,6 +49,46 @@ def test_disassembly_fills_missed_edges_and_marks_indirect_calls():
     assert result["roots"][0]["issues"] == ["root: indirect jalr at 0x104"]
 
 
+@pytest.mark.parametrize("encoding", ["word", "bytes", "halfwords"])
+def test_raw_encoding_columns_keep_calls_and_stack_writes_visible(encoding):
+    symbols = fixture({"root": 0x100, "leaf": 0x200})
+    words = {"word": ["fe010113", "000780e7", "000000ef"],
+             "bytes": ["13 01 01 fe", "e7 80 07 00", "ef 00 00 00"],
+             "halfwords": ["fe01 0113", "0007 80e7", "0000 00ef"]}[encoding]
+    code = assembly(symbols, f"100: {words[0]}\taddi sp, sp, -0x20\n"
+                    f"104: {words[1]}\tjalr a5\n108: {words[2]}\tjal 0x200 <leaf>\n")
+    functions, names = prepare_graph(symbols, [], [],
+        {"root": [(16, "static")], "leaf": [(8, "static")]}, code)
+    report = audit_roots(functions, names, ["root"], 1024)
+    assert report["roots"][0]["direct_chain_estimate"] == 40
+    assert report["roots"][0]["issues"] == [
+        "root: assembly stack decrement exceeds recorded frame",
+        "root: indirect jalr at 0x104",
+    ]
+
+
+@pytest.mark.parametrize("raw", ["00000013", "13 00 00 00", "0000 0013"])
+def test_raw_encoding_without_a_mnemonic_is_incomplete(raw):
+    symbols = fixture({"root": 0x100})
+    functions, names = prepare_graph(symbols, [], [], {"root": [(0, "static")]},
+                                     assembly(symbols, f"100: {raw}\n"))
+    report = audit_roots(functions, names, ["root"], 1024)
+    assert not report["complete"]
+    assert report["roots"][0]["issues"] == ["root: missing instruction mnemonic at 0x100"]
+
+
+def test_raw_compressed_indirect_call_uses_declared_targets():
+    symbols = fixture({"root": 0x100, "leaf": 0x200})
+    symbols["symbols"][0]["size"] = 6
+    code = assembly(symbols).replace("100: nop\n104: nop", "100: 0001 nop\n102: 9782 jalr a5\n104: 8082 ret")
+    bindings = [{"caller": "root", "address": 0x102, "targets": ["leaf"],
+                 "evidence": "test callback"}]
+    functions, names = prepare_graph(symbols, [], [],
+        {"root": [(16, "static")], "leaf": [(8, "static")]}, code, indirect_calls=bindings)
+    report = audit_roots(functions, names, ["root"], 1024)
+    assert report["complete"] and report["roots"][0]["direct_chain_estimate"] == 24
+
+
 def test_declared_indirect_targets_keep_other_calls_unresolved():
     symbols = fixture({"root": 0x100, "small": 0x200, "large": 0x300})
     code = assembly(symbols, "100: jalr a5\n104: jr t1\n")

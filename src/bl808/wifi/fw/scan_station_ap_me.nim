@@ -3078,8 +3078,6 @@ proc sm_auth_send*(authSeqNum: uint16, challenge: pointer) {.exportc, cdecl.} =
     mm_rx_filter_set()
     if not smTxFrameCurrent(build): return
   nimFwDbgAuthRxCtrl = regRead(MACHW_RX_CNTRL_REG)
-  rfPriApplyWb03AuthTxLatches()
-  if not smTxFrameCurrent(build): return
   # Keep the allocator/TPC policy unless the bench workaround is requested.
   when defined(bl808WifiMgmtRetryWorkaround):
     applyConservativeMgmtTxRetryPolicy(link)
@@ -3338,8 +3336,6 @@ proc sm_assoc_req_send*() {.exportc, cdecl.} =
     nimFwConnectTraceHw("[WIFI-CT] assoc_hw ")
     if not smTxFrameCurrent(build): return
 
-  rfPriApplyWb03AuthTxLatches()
-  if not smTxFrameCurrent(build): return
   when defined(bl808WifiAuthPromiscRx):
     let mmAssoc = mmEnvView()
     mmAssoc.rxFilterBase = 0x7FFFFFDE'u32
