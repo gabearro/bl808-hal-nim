@@ -27,18 +27,17 @@ proc ipc_emb_msg_push*(msgDescPtr: pointer) {.exportc, cdecl.} =
 
 proc ipc_emb_init*() {.exportc, cdecl.} =
   ## Initialize IPC embedded interface.
-  ## From disassembly: allocates IPC env via keAllocFunc, stores result,
+  ## From disassembly: captures the current task handle, then
   ## memset(ipc_emb_env, 0, 20), stores the host TX pending list pointer at
   ## offset 12 and the host TX confirmation list pointer at offset 16.
   ## Then verifies IPC magic 0x49504332 at IPC_EMB_MAGIC_REG (asserts on mismatch),
   ## clears status registers, and configures IPC control register fields via
   ## read-modify-write sequences. Finally writes 0x1F03 to timeout register.
 
-  # Allocate IPC environment via platform hook at g_bl_ops_funcs[0x44]
-  # (zero-arg function returning a fresh IPC env block).
-  let ipcAllocFn = cast[proc(): pointer {.cdecl.}](
+  # Task notification handle and the 20-byte IPC structure are distinct objects.
+  let currentTaskFn = cast[proc(): pointer {.cdecl.}](
     blOpsFunc(0x44))
-  ipcEmbEnv = ipcAllocFn()
+  ipcEmbEnv = currentTaskFn()
 
   # Clear the 20-byte ipc_emb_env struct
   discard c_memset(addr ipcEmbEnvStruct[0], 0, 20.csize_t)
@@ -134,11 +133,11 @@ proc ipc_emb_notify*(msg: uint32) {.exportc, cdecl.} =
 
 proc ipc_emb_wait*() {.exportc, cdecl.} =
   ## Wait for IPC event from host. Blob: calls g_bl_ops_funcs[0x50] (wait fn)
-  ## with (&ipcEmbEnv, -1), then `ipc_emb_counter++`.
-  let waitFn = cast[proc(env: pointer, timeout: int32): int32 {.cdecl.}](
+  ## with (ipcEmbEnv, UINT32_MAX), then `ipc_emb_counter++`.
+  let waitFn = cast[proc(env: pointer, timeout: uint32) {.cdecl.}](
     blOpsFunc(0x50))
   if waitFn != nil:
-    discard waitFn(ipcEmbEnv, -1)
+    waitFn(ipcEmbEnv, high(uint32))
   inc ipc_emb_counter
 
 proc ipc_emb_tx_flow_off*(ac: uint8) {.exportc, cdecl.} =

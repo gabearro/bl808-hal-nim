@@ -639,7 +639,9 @@ proc rxAdmitMpdu(desc: pointer; header: var ptr RxSwDescView): RxFrameAdmission 
     return rxFrameCorrupt
   let frameControl = macDataFrameAt(frame).frameControl
   let headerLength = rxMacHeaderLen(frameControl)
-  if (frameControl and 3) != 0 or headerLength == 0 or length < headerLength.uint32:
+  if (frameControl and 3) != 0 or
+      ((frameControl and 8) == 0 and (frameControl and 0x0300) != 0) or
+      headerLength == 0 or length < headerLength.uint32:
     return rxFrameDrop
   if (frameControl and 0x00FC) == 0x0080 and length < headerLength.uint32 + 12:
     return rxFrameDrop
@@ -846,6 +848,14 @@ proc rxlHandleApPowerSave(vif: ptr VifChannelView; sta: ptr StaInfoView;
       return
   let hdr = macDataFrameAt(frame)
   let frameCtrl = hdr.frameControl
+  let qos =
+    if (frameCtrl and 0x008C'u16) != 0x0088'u16: 0'u16
+    elif (frameCtrl and 0x0300'u16) == 0x0300'u16:
+      macQos4AddrFrameAt(frame).qosCtrl
+    else:
+      macQosDataFrameAt(frame).qosCtrl
+  if (qos and 0x0F'u16) >= 8:
+    return
   let vifEntry = cast[pointer](vif)
   let staEntry = cast[pointer](sta)
   let bcmcStaIdx = (vif.vifIdx + 5).uint8
@@ -888,12 +898,7 @@ proc rxlHandleApPowerSave(vif: ptr VifChannelView; sta: ptr StaInfoView;
 
   if (frameCtrl and 0x008C'u16) != 0x0088'u16:
     return
-  let qos =
-    if (frameCtrl and 0x0300'u16) == 0x0300'u16:
-      macQos4AddrFrameAt(frame).qosCtrl
-    else:
-      macQosDataFrameAt(frame).qosCtrl
-  let tid = (qos and 7).uint8
+  let tid = (qos and 0x0F).uint8
   let ac = mac_tid2ac[tid]
   if (mac_ac2uapsd[ac] and sta.psState) == 0 or (sta.psStatus and 6) != 0:
     return

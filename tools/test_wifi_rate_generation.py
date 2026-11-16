@@ -143,6 +143,9 @@ rcU16(stats, RCS_N_RATES) = 4
 doAssert rc_pick_non_duplicate_rate(stats) == 0xFFFF
 rcU16(stats, RCS_N_RATES) = 11
 doAssert rc_pick_non_duplicate_rate(stats) == 0xFFFF
+rcU16(stats, 130) = 0xBEEF # Outside the ten-entry rate table.
+doAssert rc_check_rate_duplicated(stats, 0xBEEF) == 0
+doAssert rc_check_rate_duplicated(nil, 0xBEEF) == 0
 """
 
 

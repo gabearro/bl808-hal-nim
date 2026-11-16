@@ -6,9 +6,6 @@ proc tdEntryForVif(vifIdx: uint8): ptr TdEntryView {.inline.} =
   cast[ptr TdEntryView](cast[uint](addr td_env[0]) +
     vifIdx.uint * sizeof(TdEntryView).uint)
 
-template tdConfig(): ptr TdConfigView =
-  cast[ptr TdConfigView](addr cfgElements[0])
-
 proc td_init*() {.exportc, cdecl.} =
   ## Initialize time domain module — blob td.o:
   ##   td_reset(0)        ; resets VIF 0 (zero-clears its slot)

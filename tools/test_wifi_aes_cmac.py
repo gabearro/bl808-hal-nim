@@ -9,7 +9,7 @@ import subprocess
 
 import pytest
 
-from test_wifi_mfp_control import KEY_CONTEXT
+from test_wifi_mfp_control import KEY_CONTEXT, RX_CONTEXT
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -210,7 +210,7 @@ def production() -> str:
     for name in ["KeyReplayCounterView", "VifKeySlotView", "MacIeView", "MmIeView",
                  "MfpMgmtFramePolicyView"]:
         source += re.search(rf"^  {name} .*?(?=\n  \w|\Z)", layout, re.M | re.S)[0] + "\n"
-    source += MFP_PLATFORM + KEY_CONTEXT
+    source += MFP_PLATFORM + KEY_CONTEXT + RX_CONTEXT
     for name in ["xor_halfwords", "add_round_key", "aes_cmac_shift_sub_key"]:
         source += procedure(mac, name)
     aes = "const AES_SBOX" + crypto.split("const AES_SBOX", 1)[1].split(

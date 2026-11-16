@@ -42,6 +42,8 @@ type
     hdrLen, qosExtLen, secTailLen: uint8
     policy, bufDesc, hwDesc, queueFirst: pointer
     da, sa: array[6, uint8]
+    bufferPtrs: array[4, uint32]
+    bufferLens: array[4, uint32]
   KeyList = object
     pairwiseKey: pointer
   Vif = object
@@ -228,14 +230,15 @@ proc checkTx(station: int; tid, vifIndex: uint8; etherType: uint16;
   for i in 0 ..< securityHeaderLen.int:
     doAssert buffer[128 - snapLength - securityHeaderLen.int + i] == 0xD3
   if snapLength != 0:
-    doAssert buffer[120 .. 125] == [0xAA'u8, 0xAA, 3, 0, 0, 0]
+    let ouiEnd = if etherType in [0x80F3'u16, 0x8137]: 0xF8'u8 else: 0'u8
+    doAssert buffer[120 .. 125] == [0xAA'u8, 0xAA, 3, 0, 0, ouiEnd]
     doAssert buffer[126] == (etherType shr 8).uint8
     doAssert buffer[127] == (etherType and 0xFF).uint8
 
 reset()
 # Exercise the wrap boundary of every counter independently.
 for station in 0 ..< STA_INFO_TAB_ENTRIES:
-  for tid in 0'u8 .. 8'u8:
+  for tid in 0'u8 .. 7'u8:
     staTxSequence(staInfoForIdx(station.uint8)).seqCounters[tid] = 4095
     for etherType in [0x0800'u16, 0x0806, 0x888E, 1500]:
       checkTx(station, tid, (station and 1).uint8, etherType)
@@ -250,7 +253,7 @@ for event in 0 ..< 5000:
   random = random xor (random shr 17)
   random = random xor (random shl 5)
   let station = (random mod STA_INFO_TAB_ENTRIES.uint32).int
-  let tid = ((random shr 8) mod 9).uint8
+  let tid = ((random shr 8) mod 8).uint8
   pushResult = (random and 1).uint8
   checkTx(station, tid, (random and 1).uint8, 0x0806)
 
@@ -338,7 +341,7 @@ def program_source() -> str:
     frame_build = procedure(tx, "txuBuildFrame") + procedure(tx, "txu_cntrl_frame_build")
     push = procedure(tx, "txuCancelFrame") + procedure(tx, "txu_cntrl_push")
     debug_types = {"nimFwDbgDhcpTxLayout": "array[8, uint32]",
-                   "nimFwDbgDhcpMacRaw": "array[128, uint8]"}
+                   "nimFwDbgDhcpMacRaw": "array[96, uint8]"}
     debug_vars = "\nvar\n" + "".join(
         f"  {name}: {debug_types.get(name, 'uint32')}\n"
         for name in sorted(set(re.findall(r"\bnimFwDbg\w+", frame_build + push)))

@@ -129,49 +129,55 @@ proc bl_nap_call*() {.exportc, cdecl.} =
   return
 
 # Forward declarations for notifier chain functions (defined later)
-proc notifier_chain_regsiter*(chain: ptr CoList, notifier: ptr CoListHdr) {.exportc, cdecl.}
-proc notifier_chain_regsiter_fromCritical*(chain: ptr CoList, notifier: ptr CoListHdr) {.exportc, cdecl.}
-proc notifier_chain_unregsiter*(chain: ptr CoList, notifier: ptr CoListHdr) {.exportc, cdecl.}
-proc notifier_chain_unregsiter_fromCritical*(chain: ptr CoList, notifier: ptr CoListHdr) {.exportc, cdecl.}
-proc notifier_chain_call*(chain: ptr CoList, event: uint32, data: pointer) {.exportc, cdecl.}
-proc notifier_chain_call_fromeCritical*(chain: ptr CoList, event: uint32, data: pointer) {.exportc, cdecl.}
+proc notifier_chain_regsiter*(chain: ptr CoList, notifier: ptr CoListHdr): cint {.exportc, cdecl, discardable.}
+proc notifier_chain_regsiter_fromCritical*(chain: ptr CoList, notifier: ptr CoListHdr): cint {.exportc, cdecl, discardable.}
+proc notifier_chain_unregsiter*(chain: ptr CoList, notifier: ptr CoListHdr): cint {.exportc, cdecl, discardable.}
+proc notifier_chain_unregsiter_fromCritical*(chain: ptr CoList, notifier: ptr CoListHdr): cint {.exportc, cdecl, discardable.}
+proc notifier_chain_call*(chain: ptr CoList, event: uint32, data: pointer): cint {.exportc, cdecl, discardable.}
+proc notifier_chain_call_fromeCritical*(chain: ptr CoList, event: uint32, data: pointer): cint {.exportc, cdecl, discardable.}
 
-proc bl_nap_hook_register*(hook: pointer) {.exportc, cdecl.} =
+proc bl_nap_hook_register*(hook: pointer): cint {.exportc, cdecl, discardable.} =
   ## Register a nap hook (30 bytes in blob).
   ## Blob: notifier_chain_regsiter(&napHookChain, hook)
   let chain = cast[ptr CoList](addr fw_nap_chain_ptr)
   notifier_chain_regsiter(chain, cast[ptr CoListHdr](hook))
+  0
 
-proc bl_nap_hook_unregister*(hook: pointer) {.exportc, cdecl.} =
+proc bl_nap_hook_unregister*(hook: pointer): cint {.exportc, cdecl, discardable.} =
   ## Unregister a nap hook (30 bytes in blob).
   ## Blob: notifier_chain_unregsiter(&napHookChain, hook)
   let chain = cast[ptr CoList](addr fw_nap_chain_ptr)
   notifier_chain_unregsiter(chain, cast[ptr CoListHdr](hook))
+  0
 
-proc bl_nap_hook_call*(event: uint32, data: pointer) {.exportc, cdecl.} =
+proc bl_nap_hook_call*(event: uint32, data: pointer): cint {.exportc, cdecl, discardable.} =
   ## Call nap hooks (32 bytes in blob).
   ## Blob: notifier_chain_call(&napHookChain, a0, a1)
   let chain = cast[ptr CoList](addr fw_nap_chain_ptr)
   notifier_chain_call(chain, event, data)
+  0
 
-proc bl_nap_hook_register_fromCritical*(hook: pointer) {.exportc, cdecl.} =
+proc bl_nap_hook_register_fromCritical*(hook: pointer): cint {.exportc, cdecl, discardable.} =
   ## Register nap hook from critical section (30 bytes in blob).
   ## Blob: notifier_chain_regsiter_fromCritical(&napHookChain, hook)
   let chain = cast[ptr CoList](addr fw_nap_chain_ptr)
   notifier_chain_regsiter_fromCritical(chain, cast[ptr CoListHdr](hook))
+  0
 
-proc bl_nap_hook_unregister_fromCritical*(hook: pointer) {.exportc, cdecl.} =
+proc bl_nap_hook_unregister_fromCritical*(hook: pointer): cint {.exportc, cdecl, discardable.} =
   ## Unregister nap hook from critical section (30 bytes in blob).
   ## Blob: notifier_chain_unregsiter_fromCritical(&napHookChain, hook)
   let chain = cast[ptr CoList](addr fw_nap_chain_ptr)
   notifier_chain_unregsiter_fromCritical(chain, cast[ptr CoListHdr](hook))
+  0
 
-proc bl_nap_hook_call_fromCritical*(event: uint32, data: pointer) {.exportc, cdecl.} =
+proc bl_nap_hook_call_fromCritical*(event: uint32, data: pointer): cint {.exportc, cdecl, discardable.} =
   ## Call nap hooks from critical section (32 bytes in blob).
   ## Blob: notifier_chain_call_fromeCritical(&napHookChain, a0, a1)
   ## Note: blob shifts args: a0→a1 (event), a1→a2 (data), loads chain→a0
   let chain = cast[ptr CoList](addr fw_nap_chain_ptr)
   notifier_chain_call_fromeCritical(chain, event, data)
+  0
 
 proc pmWaitMacIdle(argument: pointer): cint {.cdecl.} =
   discard argument

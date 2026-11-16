@@ -14,6 +14,7 @@ var staEnabled: bool
 var apEnabled: bool
 var osMutexDepth: uint32
 var osMutexSavedIrq: uint32
+var osTaskNotifications: uint32
 var connectDone = -1'i32
 var disconnectDone: int32
 var scanDoneCount: uint32

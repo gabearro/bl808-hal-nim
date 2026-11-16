@@ -7,6 +7,8 @@ import subprocess
 
 import pytest
 
+from test_wifi_message_allocation import run_program
+
 
 ROOT = Path(__file__).resolve().parents[1]
 FW = ROOT / "src/bl808/wifi/fw"
@@ -83,7 +85,7 @@ proc checkInstall(vifIdx, keyId, cipher, pairwise: uint8; pn: uint64) =
   of 1: slot.keyMaterial = req.tkipKeyMaterial
   of 5: slot.keyMaterial = req.ccmpKeyMaterial
   else: discard
-  if cipher notin [0'u8, 3'u8] and pn != 0:
+  if cipher notin [0'u8, 3'u8] and (pn != 0 or cipher == 5):
     let nextPn = pn + 1'u64
     for counter in slot.replayCounters.mitems:
       counter.pnLow = (nextPn and 0xFFFFFFFF'u64).uint32
@@ -181,6 +183,53 @@ for vifIdx in 0'u8 .. 1'u8:
             doAssert rxu_cntrl_check_pn(key, tid) == 0, "duplicate PN was accepted"
 """
 
+WIDE_RX_CHECKS = r"""
+for vifIdx in 0'u8 .. 1'u8:
+  for keyId in 0'u8 .. 3'u8:
+    for cipher in [1'u8, 2'u8]:
+      for seed in [1'u64, 30, 31, 32, 63, 0xFFFFFFFF'u64, 0x100000000'u64]:
+        for multiple in [1'u64, 2, 1023]:
+          for extra in [0'u64, 32]:
+            discard c_memset(addr vifs, 0xA5, sizeof(vifs).csize_t)
+            var req = VifMgmtAddKeyParamView(staIdx: keyId, keySlot: vifIdx,
+              cipherType: cipher, hasRxPn: 1)
+            for i in 0 ..< 4:
+              req.pnLowBytes[i] = ((seed shr (i * 8)) and 255).uint8
+              req.pnHighBytes[i] = ((seed shr (32 + i * 8)) and 255).uint8
+            let beforeReq = req
+            vif_mgmt_add_key(addr req, keyId)
+            let key = vifKeySlot(addr vifs[vifIdx], keyId.uint)
+            let high = seed + multiple * (1'u64 shl 37) + extra
+            doAssert high < (1'u64 shl 48)
+            for tid in 0'u8 .. 7'u8:
+              var expected = vifs
+              let counter = addr vifKeySlot(addr expected[vifIdx], keyId.uint).replayCounters[tid]
+              counter.pnLow = ((high + 1) and 0xFFFFFFFF'u64).uint32
+              counter.pnHigh = ((high + 1) shr 32).uint32
+              counter.bitmap = default(typeof(counter.bitmap))
+              let bank = (((high + 1) shr 5) and 1).int
+              counter.bitmap[bank] = 1'u32 shl ((high + 1) and 31).int
+              rxEnv.secInfo0 = (high and 0xFFFFFFFF'u64).uint32
+              rxEnv.secInfo1 = (high shr 32).uint32
+              doAssert rxu_cntrl_check_pn(key, tid) == 1,
+                "fresh PN after key installation collided with seeded history"
+              assertBytes(addr vifs, addr expected, sizeof(vifs), "seeded forward jump")
+              if extra != 0:
+                let late = high - 32
+                rxEnv.secInfo0 = (late and 0xFFFFFFFF'u64).uint32
+                rxEnv.secInfo1 = (late shr 32).uint32
+                doAssert rxu_cntrl_check_pn(key, tid) == 1,
+                  "unseen in-window PN collided with installation history"
+                counter.bitmap[bank xor 1] = 1'u32 shl ((late + 1) and 31).int
+                assertBytes(addr vifs, addr expected, sizeof(vifs), "seeded late arrival")
+              for rejected in [high, seed, high - 33]:
+                rxEnv.secInfo0 = (rejected and 0xFFFFFFFF'u64).uint32
+                rxEnv.secInfo1 = (rejected shr 32).uint32
+                doAssert rxu_cntrl_check_pn(key, tid) == 0
+                assertBytes(addr vifs, addr expected, sizeof(vifs), "seeded replay rejection")
+            doAssert req == beforeReq
+"""
+
 
 def procedure(source: str, name: str) -> str:
     start = re.search(rf"^proc {name}\*?\(", source, re.M)
@@ -240,3 +289,9 @@ def test_vif_key_lifecycle(name: str, checks: str, tmp_path: Path) -> None:
         cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
     assert result.returncode == 0, result.stdout
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan", "firmware"])
+def test_installed_key_forward_jumps(tmp_path: Path, mode: str) -> None:
+    body = procedure((FW / "vif_management.nim").read_text(), "vif_mgmt_add_key")
+    run_program(tmp_path, mode, build_source(body, WIDE_RX_CHECKS))

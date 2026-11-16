@@ -42,6 +42,38 @@ for fc in [0x0080'u16, 0x80B0, 0x0008, 0x0088, 0x0388, 0x8388]:
         doAssert transferred == 1 and prepared == 1
         doAssert envState.uploadList.first == cast[pointer](addr mpdu)
         doAssert interrupts == enabled
+for fc in [0x0008'u16, 0x0088, 0x0388]:
+  let headerLength = rxu_cntrl_machdr_len_get(fc).int
+  for envLength in [headerLength - 2, headerLength + 8]:
+    reset(fc, headerLength + 4)
+    let before = bytes
+    let flags = 0x12000004'u32
+    envState.machdrLen = envLength.uint8
+    envState.stripLen = 199
+    sw.frameControlFlags = flags
+    sw.bufferOffset = 71
+    rxu_mpdu_upload_and_indicate(addr mpdu)
+    doAssert bytes == before and sw.mpduLengthBytes == (headerLength + 4).uint16
+    doAssert sw.frameControlFlags == flags and sw.bufferOffset == 71
+    doAssert envState.machdrLen == envLength.uint8 and envState.stripLen == 199
+    doAssert transferred == 0 and prepared == 0 and envState.uploadList.first == nil
+  reset(fc, headerLength + 4)
+  envState.machdrLen = headerLength.uint8
+  chain.frameData = nil
+  rxu_mpdu_upload_and_indicate(addr mpdu)
+  doAssert transferred == 0 and prepared == 0 and sw.frameControlFlags == 0
+  reset(fc, headerLength + 4)
+  envState.machdrLen = (headerLength + 1).uint8
+  envState.stripLen = 199
+  let before = bytes
+  var warned = false
+  try:
+    rxu_mpdu_upload_and_indicate(addr mpdu)
+  except AssertionDefect:
+    warned = true
+  doAssert warned and bytes == before
+  doAssert sw.frameControlFlags == 0 and sw.mpduLengthBytes == (headerLength + 4).uint16
+  doAssert envState.stripLen == 199 and transferred == 0 and prepared == 0
 '''
 
 

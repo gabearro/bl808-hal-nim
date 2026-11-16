@@ -82,15 +82,15 @@ proc keyAt(index: int): ptr VifKeySlotView =
   else:
     let offset = index - STA_INFO_TAB_ENTRIES
     vifKeySlot(addr vifs[offset div 6], (offset mod 6).uint)
-proc install(index: int; windowed: bool; seed = 0'u64) =
+proc install(index: int; windowed: bool; seed = 0'u64; cipher = 2'u8) =
   if index < STA_INFO_TAB_ENTRIES:
     var request = MachwKeyWriteParamView(keyType: index.uint8,
-      cipherType: 2, keyFlags: windowed.uint8)
+      cipherType: cipher, keyFlags: windowed.uint8)
     sta_mgmt_add_key(addr request, (index + 8).uint8)
   else:
     let offset = index - STA_INFO_TAB_ENTRIES
     var request = VifMgmtAddKeyParamView(staIdx: (offset mod 6).uint8,
-      keySlot: (offset div 6).uint8, cipherType: 2, hasRxPn: windowed.uint8)
+      keySlot: (offset div 6).uint8, cipherType: cipher, hasRxPn: windowed.uint8)
     for i in 0 ..< 4:
       request.pnLowBytes[i] = ((seed shr (8 * i)) and 255).uint8
       request.pnHighBytes[i] = ((seed shr (32 + 8 * i)) and 255).uint8
@@ -134,6 +134,21 @@ for index in 0 ..< rxMgtReplayStates.len:
   doAssert receive(key, 70) == 0
   doAssert receive(key, 1) == 0
   doAssert key[] == before
+''',
+    "windowed_wide_jumps": r'''
+for index in 0 ..< rxMgtReplayStates.len:
+  for extra in [0'u64, 32]:
+    install(index, true)
+    let key = keyAt(index)
+    key.replayCounters[0].pnLow = 10000
+    key.pnLow = 12345
+    let before = key[]
+    doAssert receive(key, 1) == 1
+    let high = (1'u64 shl 37) + 1 + extra
+    doAssert receive(key, high) == 1
+    if extra != 0: doAssert receive(key, high - 32) == 1
+    doAssert receive(key, high) == 0
+    doAssert key[] == before, "management jump modified data counters or TX PN"
 ''',
     "lifecycle": r'''
 for index in 0 ..< rxMgtReplayStates.len:

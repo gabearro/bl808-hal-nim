@@ -84,7 +84,7 @@ for incomingIrq in [false, true]:
     for change in 0 .. 8:
       setupOwner(incomingIrq)
       var message: Message
-      let p = requestWithDetails(message, 0x1237)
+      let p = requestWithDetails(message, 0x1217)
       onPrint = proc() =
         if printCalls != stage: return
         case change
@@ -126,7 +126,7 @@ for params in [0'u16, 3, 0x073E, 0xFFFF]:
     doAssert rxu_mgt_ind_handler_bam(p) == 0
     let tid = ((params shr 2) and 15).uint32
     let count = (params shr 6).uint32
-    let accepted = min(count, 12'u32)
+    let accepted = if count == 0: 12'u32 else: min(count, 12'u32)
     let amsdu = if (params and 1) != 0: "Permitted" else: "Not Permitted"
     let policy = if (params and 2) != 0: "Immediate Block Ack" else: "Delayed Block Ack"
     let req = "-----------------> AABA Request:\r\n    A-MSDU: " & amsdu &
@@ -140,7 +140,8 @@ for params in [0'u16, 3, 0x073E, 0xFFFF]:
     doAssert printLookups == 2 and printIrqs == @[true, true]
     doAssert allocations == 1 and pushes == 1 and interrupts
     let body = addBaRspActionBodyAt(addr link.macHeader[24])
-    doAssert body.dialogToken == 0xEF and body.statusCode == 0 and body.timeout == 0
+    doAssert body.dialogToken == 0xEF and body.timeout == 0
+    doAssert body.statusCode == (if tid < 8: 0'u16 else: 37'u16)
     doAssert body.baParams == ((accepted shl 6).uint16 or (params and 0x3E) or 2)
 ''')
 
@@ -152,13 +153,13 @@ for incomingIrq in [false, true]:
   setupOwner(incomingIrq)
   logging = false
   var message: Message
-  let p = requestWithDetails(message, 0x1237)
+  let p = requestWithDetails(message, 0x1217)
   doAssert rxu_mgt_ind_handler_bam(p) == 0
   doAssert printCalls == 0 and printLookups == 2
   doAssert allocations == 1 and pushes == 1 and interrupts == incomingIrq
 
   setupOwner(incomingIrq)
-  discard requestWithDetails(message, 0x1237)
+  discard requestWithDetails(message, 0x1217)
   onPrint = proc() = logging = false
   doAssert rxu_mgt_ind_handler_bam(p) == 0
   doAssert printCalls == 1 and printLookups == 2
@@ -166,7 +167,7 @@ for incomingIrq in [false, true]:
 
   for stage in 1 .. 2:
     setupOwner(incomingIrq)
-    discard requestWithDetails(message, 0x1237)
+    discard requestWithDetails(message, 0x1217)
     failPrint = stage
     var raised = false
     try: discard rxu_mgt_ind_handler_bam(p)
@@ -184,7 +185,7 @@ for incomingIrq in [false, true]:
   for gate in 0 .. 1:
     setupOwner(incomingIrq)
     var message: Message
-    let p = requestWithDetails(message, 0x1237)
+    let p = requestWithDetails(message, 0x1217)
     if gate == 0: resetting = true
     else: retiring = true
     doAssert rxu_mgt_ind_handler_bam(p) == 0

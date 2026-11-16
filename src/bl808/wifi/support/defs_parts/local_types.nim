@@ -20,10 +20,27 @@ type
     rssi: int8
     auth: uint8
     cipher: uint8
+  OsObjectHeader = object
+    users: uint32
+    deleted: bool
+  OsEventWaiter = object
+    next: ptr OsEventWaiter
+    mask: uint32
+    clearOnExit, waitForAll, ready: bool
+    value: uint32
   SimpleEventGroup = object
+    header: OsObjectHeader
     bits: uint32
+    waiters: ptr OsEventWaiter
+  SimpleSemaphore = object
+    header: OsObjectHeader
+    available: bool
+  SimpleTimeout = object
+    lastMilliseconds: uint64
   SimpleQueue = object
+    header: OsObjectHeader
     itemSize: uint32
     depth: uint32
     readIdx: uint32
     writeIdx: uint32
+    count: uint32

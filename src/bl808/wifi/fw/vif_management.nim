@@ -355,7 +355,9 @@ proc vif_mgmt_add_key*(param: pointer, hwKeyIdx: uint8) {.exportc, cdecl.} =
   if cipherType notin [0'u8, 3'u8]:
     let received = le32(addr req.pnLowBytes).uint64 or
       (le32(addr req.pnHighBytes).uint64 shl 32)
-    if received != 0:
+    # BIP's KDE IPN is an initial replay floor, including zero. Store its
+    # successor so reception rejects IPNs at or below that floor.
+    if received != 0 or wifiCipherIsBip(cipherType):
       if wifiKeyUsesDirectReplayPn(cipherType, req.hasRxPn):
         let nextPn = received + 1'u64
         for counter in keyView.replayCounters.mitems:
@@ -606,46 +608,46 @@ proc vif_mgmt_get_first_ap_inf*(): pointer {.exportc, cdecl.} =
   return nil
 
 proc vif_mgmt_statistic_dump*() {.exportc, cdecl.} =
-  ## Dump VIF statistics for debugging (92 instrs).
-  ## Walks the VIF linked list (from vif_mgmt_env), for each VIF:
-  ##   logs VIF type (STA/AP), RX/TX packet counts, beacon counts.
-  ## Uses g_bl_ops_funcs[4] (printf) and g_bl_ops_funcs[8] (puts) for output.
-  ##
-  ## Assembly trace:
-  ##   s0 = vif list head (from vif_mgmt_env)
-  ##   s1 = g_bl_ops_funcs base
-  ##   s4 = 2 (AP type constant for comparison)
-  ##   s5..s9 = format string pointers for each field
-  ##   Loop while s0 != nil:
-  ##     check vif.type(+86): print "AP" or "STA" via printf
-  ##     if STA: print rx_count(+124), tx_count(+128), total, beacon_cnt(+120),
-  ##       beacon_period(+132 >> 10), last_beacon(+136 >> 10)
-  ##     print separator via puts
-  ##     s0 = vif.next(+0)
-  var vifPtr = cast[pointer](vifMgmtEnvView().freeList.first)  # linked list head
-  let printFnPtr = blOpsFunc(4)
-  let putsFnPtr = blOpsFunc(8)
-  if printFnPtr == nil or putsFnPtr == nil:
-    return
-  type PrintfFn = proc(fmt: cstring, args: uint32) {.cdecl, varargs.}
+  ## Report active VIF beacon statistics, with a bounded pre-callback snapshot.
+  type VifStatistics = object
+    entry: pointer
+    kind: uint8
+    lost, received, tbtt, lostWindow, lastBeacon: uint32
+  var entries: array[MAX_VIFS, VifStatistics]
+  var count = 0
+  block:
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    var node = cast[pointer](vifMgmtEnvView().activeList.first)
+    while node != nil and count < entries.len:
+      var repeated = false
+      for index in 0 ..< count:
+        if entries[index].entry == node: repeated = true
+      if repeated: break
+      let vif = vifChannelAt(node)
+      entries[count] = VifStatistics(entry: node, kind: vif.vifType,
+        lost: vif.beaconLossCount, received: vif.beaconRxCount, tbtt: vif.tbttCount,
+        lostWindow: vif.beaconLossWindow, lastBeacon: vif.lastBeaconMacTime)
+      inc count
+      node = vif.next
+  type PrintfFn = proc(fmt: cstring) {.cdecl, varargs.}
   type PutsFn = proc(s: cstring) {.cdecl.}
-  let printf = cast[PrintfFn](printFnPtr)
-  let puts = cast[PutsFn](putsFnPtr)
-  while vifPtr != nil:
-    let vif = vifChannelAt(vifPtr)
-    if vif.vifType == VIF_TYPE_AP:
-      printf("VIF[AP] %p:", cast[uint32](vifPtr))
-    else:
-      printf("VIF[STA] %p:", cast[uint32](vifPtr))
-    if vif.vifType == VIF_TYPE_STA:
-      let rxCount = vif.beaconLossCount
-      printf(" rx=%d", rxCount)
-      let txCount = vif.beaconRxCount
-      printf(" tx=%d", txCount)
-      printf(" total=%d", rxCount + txCount)
-      printf(" bcn=%d", vif.tbttCount)
-      printf(" period=%d", vif.beaconLossWindow shr 10)
-      printf(" last=%d", vif.lastBeaconMacTime shr 10)
-    puts("")
-    # Follow linked list
-    vifPtr = vif.next
+  template print(format: cstring; args: varargs[untyped]) =
+    let output = cast[PrintfFn](blOpsFunc(4))
+    if output != nil: output(format, args)
+  for index in 0 ..< count:
+    let vif = entries[index]
+    let kind = case vif.kind
+      of VIF_TYPE_AP: cstring("AP")
+      of VIF_TYPE_STA: cstring("STA")
+      else: cstring("Unknown")
+    print("======== Vif %p: %s========\r\n", vif.entry, kind)
+    if vif.kind == VIF_TYPE_STA:
+      print("    bcn_timeout:%lu\r\n", vif.lost.culong)
+      print("    bcn_received:%lu\r\n", vif.received.culong)
+      print("    bcn_received && timeout counter:%lu\r\n", (vif.lost + vif.received).culong)
+      print("    bcn_tbtt counter:%lu\r\n", vif.tbtt.culong)
+      print("    bcn_lost_max_interval:%ldms\r\n", (vif.lostWindow shr 10).clong)
+      print("    bcn_last_received:%lums\r\n", (vif.lastBeacon shr 10).culong)
+    let puts = cast[PutsFn](blOpsFunc(8))
+    if puts != nil: puts("------------------------------------\r\n")

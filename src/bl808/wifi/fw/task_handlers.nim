@@ -3013,43 +3013,37 @@ proc me_traffic_ind_req_handler*(param: pointer): cint {.exportc, cdecl, discard
 # --- CFG Task Handler (cfg_task.o) ---
 
 proc cfg_start_req_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
-  ## Handle CFG_START_REQ (142b in blob, cfg_task.o).
-  ## Blob ABI: a0=msgId, a1=msgBody, a2=srcId, a3=destId.
-  ## If body[0]==0: call cfg_api_element_set(body+20, body[16], body[12], &result),
-  ##   log result via g_bl_ops_funcs, then call cfg_api_element_set(body[4], body[8], body[12], 0, &result).
-  ## If body[0] in 1..2: assert_err.
-  ## Always sends CFG_START_CFM (0x2001) with status=0.
+  ## Decode SET into one scalar, dispatch it, then acknowledge the CFG request.
+  if param == nil:
+    return 0
   let hdr = keMsgHdrFromPayload(param)
-  let body = param
-  let srcId = hdr.destId
-  let destId = hdr.srcId
-  let bodyU = cast[uint](body)
-  let cmdWord = cast[ptr uint32](bodyU)[]
-  if cmdWord == 0:
-    # Process config element: cfg_api_element_set(name=body+20, data=body[16], len=body[12], &result)
-    let elemLen = cast[ptr uint16](bodyU + 12)[]
-    let elemData = cast[ptr pointer](bodyU + 16)[]
-    var resultBuf: uint32
-    cfg_api_element_set(0, 0, 0, cast[pointer](bodyU + 20), addr resultBuf)
-    # Log result via g_bl_ops_funcs
-    let logFn = blOpsFunc(204)
-    if logFn != nil:
-      cast[proc(a0: uint32, a1: pointer, a2: pointer) {.cdecl.}](logFn)(
-        resultBuf, cast[pointer](bodyU + 20), body)
-    # Second pass: cfg_api_element_set with id/subId/typeId from body[4..12].
-    let cfgElementId = cast[ptr uint32](bodyU + 4)[]
-    let cfgElementSubId = cast[ptr uint32](bodyU + 8)[]
-    let cfgElementTypeId = cast[ptr uint32](bodyU + 12)[]
-    cfg_api_element_set(cfgElementId, cast[uint16](cfgElementSubId), cast[uint16](cfgElementTypeId), nil, addr resultBuf)
-  elif cmdWord == 1:
-    # Unpack TLV config (blob: utils_tlv_bl_unpack_auto)
-    {.emit: ["extern void utils_tlv_bl_unpack_auto(void*, unsigned int); utils_tlv_bl_unpack_auto((void*)", bodyU + 4, ", ", cast[ptr uint32](bodyU + 8)[], ");"].}
-  elif cmdWord == 2:
-    # Dump config entries (blob: dump_cfg_entries)
-    {.emit: ["extern void dump_cfg_entries(void); dump_cfg_entries();"].}
-  # Send CFG_START_CFM (0x2001) with status=0
+  if hdr.paramLen < 4:
+    return 0
+  let destinationId = hdr.srcId
+  let sourceId = hdr.destId
+  let req = cast[ptr CfgStartReqPayload](param)
+  case req.operation
+  of 0:
+    if hdr.paramLen >= 20 and req.length <= hdr.paramLen - 20:
+      let taskId = req.taskId
+      let element = req.element
+      let valueType = req.valueType
+      let valueLength = req.length
+      # Zero the unused upper bytes of Boolean results before diagnostic output.
+      var decoded: uint32
+      let unpacked = c_utils_tlv_bl_unpack_auto(cast[ptr uint32](addr req.data[0]),
+        cast[cint](valueLength), cast[uint16](valueType), addr decoded)
+      let printFn = cast[proc(format: cstring) {.cdecl, varargs.}](blOpsFunc(4))
+      if printFn != nil:
+        printFn("unpack ret is %d, result is %lu\r\n", unpacked, decoded.culong)
+      if unpacked == 4 and valueLength == 4:
+        discard cfg_api_element_set(taskId, element, valueType, addr decoded, nil)
+  of 1, 2:
+    discard # GET and RESET are no-ops in the pinned handler.
+  else:
+    dump_cfg_entries()
   let cfm = cast[ptr StatusCfmPayload](
-    ke_msg_alloc(CFG_START_CFM, destId, srcId, StatusCfmPayloadSize))
+    ke_msg_alloc(CFG_START_CFM, destinationId, sourceId, StatusCfmPayloadSize))
   if cfm != nil:
     cfm.status = 0
     ke_msg_send(cfm)
@@ -3850,6 +3844,9 @@ proc rxu_mgt_frame_check*(param: pointer, staIdxArg: uint8): uint32 {.exportc, c
       rx.mpduLengthBytes == bodyLen and rxFrameAtRef(bufDesc) == frame
 
   let fcFull = frame.frameControl
+  if not rxMgmtBodyValid(fcFull, frameHdr, rxuCntrlEnvView().machdrLen.uint16,
+      bodyLen):
+    return 0
   inc nimFwDbgMgtSeen
   nimFwDbgMgtLastFc = fcFull.uint32 or (rx.hwFlags and 0xFFFF0000'u32)
   let subtypeIndex = ((fcFull shr 4) and 0x0F'u16).int
@@ -3887,8 +3884,10 @@ proc rxu_mgt_frame_check*(param: pointer, staIdxArg: uint8): uint32 {.exportc, c
       # to an AP have Addr1 == BSSID. Retry and other flags do not change type.
       var vifEntry = cast[pointer](vifMgmtEnvView().activeList.first)
       var foundVifIdx: uint8 = 0xFF
-      var requestToApVif = false
-      if (fcFull and 0x00FC'u16) in [0x0000'u16, 0x00B0'u16]:
+      let directedProbe = (fcFull and 0x00FC'u16) == 0x0040'u16 and
+        (frame.addr1[0] and 1) == 0
+      var requestToApVif = directedProbe
+      if (fcFull and 0x00FC'u16) in [0x0000'u16, 0x0020'u16, 0x00B0'u16]:
         requestToApVif = true
         for authBssidByteIndex in 0'u ..< 6:
           if frame.addr1[authBssidByteIndex] != frame.addr3[authBssidByteIndex]:
@@ -3907,6 +3906,8 @@ proc rxu_mgt_frame_check*(param: pointer, staIdxArg: uint8): uint32 {.exportc, c
             foundVifIdx = vif.vifIdx
             break
         vifEntry = vif.next
+      if directedProbe and foundVifIdx == 0xFF:
+        return 0
       vifIdx = foundVifIdx
 
     env.vifIdx = vifIdx
@@ -3916,7 +3917,8 @@ proc rxu_mgt_frame_check*(param: pointer, staIdxArg: uint8): uint32 {.exportc, c
   let envPtr = cast[pointer](env)
   let envSeq = env.seqCtrl
   let ignored = mfpIgnoreRxMgmtFrame(param, envPtr, frameHdr, bodyLen,
-                                    addr mfpAcceptedFlag, addr mfpSecondaryFlags)
+                                    addr mfpAcceptedFlag, addr mfpSecondaryFlags,
+                                    generation)
   if not currentFrame(): return 0
   if ignored:
     return rxuMgtUpload(param, mfpAcceptedFlag)
@@ -4012,9 +4014,10 @@ proc rxu_mgt_frame_check*(param: pointer, staIdxArg: uint8): uint32 {.exportc, c
           msgSubtype = 4
 
     of 0x00, 0x20, 0x40:  # Assoc/Reassoc/Probe Req -> AP management (.L85)
-      if vifEntry != nil:
-        let apmEnabled = apm_embedded_enabled(vifEntry)
-        if apmEnabled:
+      # Probe requests may use a wildcard BSSID; nil selects the embedded AP.
+      # Association requests still need a resolved target AP VIF.
+      if subtypeBits == 0x40'u16 or vifEntry != nil:
+        if apm_embedded_enabled(vifEntry):
           skipSecHdr = true
           msgSubtype = 5
           uploadAfterCopy = false
@@ -4175,6 +4178,12 @@ proc rxu_mgt_frame_check*(param: pointer, staIdxArg: uint8): uint32 {.exportc, c
       # --- Adjust source pointer for security header (blob 0x460-0x48e) ---
       var copySrc = frameHdr
       var copyLen = bodyLen
+      var copyOffset = 0'u32
+      var copyPrefix = 0'u32
+      let macHeaderLen = rxMacHeaderLen(fcFull)
+      if macHeaderLen == 0 or machdrLen < macHeaderLen or
+          machdrLen.uint16 > bodyLen:
+        return 0
       if not skipSecHdr:
         # Check machdrLen parity: blob calls assert_warn if odd
         if (machdrLen and 1) != 0:
@@ -4182,8 +4191,14 @@ proc rxu_mgt_frame_check*(param: pointer, staIdxArg: uint8): uint32 {.exportc, c
           if not currentFrame(): return 0
         # Adjust: subtract machdrLen from bodyLen, advance frameHdr past MAC header
         copyLen = copyLen - machdrLen.uint16
-        copySrc = rxFrameCursor(copySrc, machdrLen.uint)
-      # else: skip adjustment (s6=1), copy from frameHdr as-is
+        copyOffset = machdrLen.uint32
+      elif machdrLen > macHeaderLen:
+        # Whole-frame consumers need the MAC header followed by plaintext,
+        # not the retained IV between that header and the management body.
+        copyPrefix = macHeaderLen.uint32
+        copyOffset = machdrLen.uint32
+        copyLen -= (machdrLen - macHeaderLen).uint16
+      copySrc = rxFrameCursor(copySrc, copyOffset.uint)
 
       # --- Populate message fields (blob 0x4a2-0x4fa) ---
       # msg[0..1] = copied frame/body length (blob stores s2 after the optional
@@ -4199,13 +4214,15 @@ proc rxu_mgt_frame_check*(param: pointer, staIdxArg: uint8): uint32 {.exportc, c
       ind.phyVector11 = rx.phyVector[11]
       ind.secondary = mfpSecondaryFlags
 
-      if subtypeBits == 0x10'u16 or subtypeBits == 0x30'u16:
+      if (subtypeBits == 0x10'u16 or subtypeBits == 0x30'u16) and
+          copyLen >= 4:
         nimFwTrace2U32("[WIFI-NIMFW] assoc_copy ",
                        copyLen.uint32,
                        rxFrameWords(copySrc)[0])
-        nimFwTrace2U32("[WIFI-NIMFW] assoc_copy2 ",
-                       rxFrameWords(copySrc)[1],
-                       rxFrameWords(copySrc)[2])
+        if copyLen >= 12:
+          nimFwTrace2U32("[WIFI-NIMFW] assoc_copy2 ",
+                         rxFrameWords(copySrc)[1],
+                         rxFrameWords(copySrc)[2])
         if not currentFrame(): return 0
 
       # Probe Req special fields: if msgSubtype==5 and sendStaIdx==0
@@ -4214,8 +4231,14 @@ proc rxu_mgt_frame_check*(param: pointer, staIdxArg: uint8): uint32 {.exportc, c
         ind.timestampHigh = rx.timestampHigh
         ind.phyVector0 = rx.phyVector[0]
 
-      # --- Copy frame body word-by-word (blob .L91/.L92 at 0x49e-0x518) ---
-      copyRoundedRxWords(addr ind.body[0], copySrc, copyLen)
+      # DMA segments are not contiguous; publish only a complete copy.
+      if copyPrefix != 0 and
+          not rxuCopyFrameBytes(rx, 0, copyPrefix, addr ind.body[0]):
+        return 0
+      if not rxuCopyFrameBytes(rx, copyOffset, copyLen.uint32 - copyPrefix,
+          rxFrameCursor(addr ind.body[0], copyPrefix.uint)):
+        return 0
+      if not currentFrame(): return 0
 
       # Send message via ke_msg_send (blob 0x504)
       ownedMsg = nil
@@ -4379,8 +4402,10 @@ proc rxu_mgt_ind_handler_bam*(param: pointer): cint
   let amsduOK = (baParam and 1'u16) != 0
   let baPolicy = (baParam and 2'u16) != 0
   let tid = ((baParam shr 2) and 0x0F'u16).uint32
+  let responseStatus = if tid < 8: 0'u16 else: 37'u16 # Request declined: no TSPEC state.
   let bufferSize = (baParam shr 6) and 0x3FF'u16
-  let acceptedWindow = min(bufferSize, 12'u16)
+  # Zero is an unspecified request, not a valid successful response window.
+  let acceptedWindow = if bufferSize == 0: 12'u16 else: min(bufferSize, 12'u16)
   let responseParams = (baParam and 0x003E'u16) or 2'u16 or
                        (acceptedWindow shl 6)
   let dialogToken = msg.dialogToken
@@ -4419,8 +4444,9 @@ proc rxu_mgt_ind_handler_bam*(param: pointer): cint
     discard irqSave()
     irqHeld = true
     requireResponseOwner()
-  # Set MACHW BAM ACK bit (reg 0x24B00054 bit 7).
-  regWrite(MACHW_DOZE_CNTRL2_REG, regRead(MACHW_DOZE_CNTRL2_REG) or 0x80'u32)
+  # Only an accepted EDCA agreement enables the hardware BAM ACK bit.
+  if responseStatus == 0:
+    regWrite(MACHW_DOZE_CNTRL2_REG, regRead(MACHW_DOZE_CNTRL2_REG) or 0x80'u32)
   bam_send_air_action_frame(staIdx, nil, 1'u8, dialogToken,
-                           responseParams, 0'u16, nil)
+                           responseParams, responseStatus, nil)
   return 0

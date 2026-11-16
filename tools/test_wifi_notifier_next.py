@@ -154,3 +154,52 @@ for critical in [false, true]:
   else: bl_nap_hook_call(0xA5A50001'u32, addr payload)
   doAssert calls == @[0, 2] and not interrupts
 ''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan", "firmware"])
+def test_notifier_and_nap_entry_points_return_zero(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+for incoming in [false, true]:
+  setup(incoming)
+  doAssert notifier_chain_regsiter(addr chain, node(0)) == 0
+  doAssert notifier_chain_unregsiter(addr chain, node(0)) == 0
+  doAssert notifier_chain_regsiter_fromCritical(addr chain, node(0)) == 0
+  callbackIrq = false
+  doAssert notifier_chain_call(addr chain, 0xA5A50001'u32, addr payload) == 0
+  callbackIrq = incoming
+  doAssert notifier_chain_call_fromeCritical(addr chain, 0xA5A50001'u32, addr payload) == 0
+  doAssert calls == @[0, 0] # Callback return bits do not stop traversal.
+  doAssert notifier_chain_unregsiter_fromCritical(addr chain, node(0)) == 0
+  doAssert notifier_chain_unregsiter(addr chain, node(0)) == 0
+  doAssert notifier_chain_call(addr chain, 0xA5A50001'u32, addr payload) == 0
+  fw_nap_chain_ptr = nil
+  doAssert bl_nap_hook_register(node(0)) == 0
+  doAssert bl_nap_hook_unregister(node(0)) == 0
+  doAssert bl_nap_hook_register_fromCritical(node(0)) == 0
+  callbackIrq = false
+  doAssert bl_nap_hook_call(0xA5A50001'u32, addr payload) == 0
+  callbackIrq = incoming
+  doAssert bl_nap_hook_call_fromCritical(0xA5A50001'u32, addr payload) == 0
+  doAssert bl_nap_hook_unregister_fromCritical(node(0)) == 0
+  doAssert interrupts == incoming
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
+def test_callback_exception_preserves_incoming_interrupt_state(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+for critical in [false, true]:
+  for incoming in [true, false]:
+    setup(incoming)
+    callbackIrq = if critical: incoming else: false
+    notifier_chain_regsiter_fromCritical(addr chain, node(0))
+    onCallback = proc(index: int) = raise newException(ValueError, "callback stopped")
+    var raised = false
+    try:
+      if critical: notifier_chain_call_fromeCritical(addr chain, 0xA5A50001'u32, addr payload)
+      else: notifier_chain_call(addr chain, 0xA5A50001'u32, addr payload)
+    except ValueError: raised = true
+    doAssert raised and calls == @[0]
+    doAssert interrupts == incoming
+    doAssert saves == (not critical).int and restores == saves
+''')

@@ -7,7 +7,8 @@ import pytest
 from test_wifi_mgt_receive import test_management_receive as run_receive
 
 
-@pytest.mark.parametrize("frame_type", [0x0000, 0x00B0], ids=["association", "authentication"])
+@pytest.mark.parametrize("frame_type", [0x0000, 0x0020, 0x00B0],
+                         ids=["association", "reassociation", "authentication"])
 @pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
 def test_unbound_request_selects_ap(tmp_path: Path, mode: str, frame_type: int) -> None:
     run_receive(tmp_path, mode, f"const Request = {frame_type}'u16\n" + r'''
@@ -38,7 +39,7 @@ for vif in 0'u8 .. 1:
 @pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
 def test_request_routing_keeps_bssid_check(tmp_path: Path, mode: str) -> None:
     run_receive(tmp_path, mode, r'''
-for request in [0x0000'u16, 0x00B0]:
+for request in [0x0000'u16, 0x0020, 0x00B0]:
   for flags in [0'u16, 0x0800]:
     for vif in 0'u8 .. 1:
       reset(request or flags, vif, 255, 2)
@@ -54,7 +55,7 @@ for request in [0x0000'u16, 0x00B0]:
 @pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
 def test_request_routing_respects_captured_vif_epoch(tmp_path: Path, mode: str) -> None:
     run_receive(tmp_path, mode, r'''
-for request in [0x0000'u16, 0x00B0]:
+for request in [0x0000'u16, 0x0020, 0x00B0]:
   for vif in 0'u8 .. 1:
     reset(request or 0x0800, vif, 255, 2)
     env.vifIdx = 255
@@ -62,4 +63,38 @@ for request in [0x0000'u16, 0x00B0]:
     discard rxInvalidateVif(vif)
     doAssert rxu_mgt_frame_check(addr desc, 255) == 0
     doAssert policyCalls == 0 and sent == 0 and allocationCalls == 0
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
+def test_directed_probe_request_keeps_its_ap_vif(tmp_path: Path, mode: str) -> None:
+    run_receive(tmp_path, mode, r'''
+for incoming in [false, true]:
+  reset(0x40, 1, 255, 2)
+  vifs[0].vifType = 2
+  vifs[0].next = addr vifs[1]
+  mgmt.activeList.first = addr vifs[0]
+  frame.addr3 = frame.addr1
+  wildcardApmEnabled = true
+  interrupts = incoming
+  discard rxu_mgt_frame_check(addr desc, 255)
+  doAssert policyVif == 1 and env.vifIdx == 1
+  doAssert sent == 1 and destination == 5 and message[8] == 1
+  doAssert interrupts == incoming
+
+  reset(0x40, 1, 255, 2)
+  frame.addr1 = [2'u8, 9, 8, 7, 6, 5]
+  frame.addr3 = frame.addr1
+  wildcardApmEnabled = true
+  doAssert rxu_mgt_frame_check(addr desc, 255) == 0
+  doAssert policyCalls == 0 and sent == 0 and allocationCalls == 0
+
+  reset(0x40, 1, 255, 2)
+  frame.addr1 = [255'u8, 255, 255, 255, 255, 255]
+  frame.addr3 = frame.addr1
+  wildcardApmEnabled = true
+  discard rxu_mgt_frame_check(addr desc, 255)
+  doAssert policyVif == 255 and sent == 1 and message[8] == 255,
+    "wildcard probe: policy=" & $policyVif & " calls=" & $policyCalls &
+      " sent=" & $sent & " dest=" & $destination & " vif=" & $message[8]
 ''')

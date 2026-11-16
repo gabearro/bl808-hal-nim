@@ -210,8 +210,8 @@ proc rxu_cntrl_protected_handle*(rxuCtx: pointer, hwRxhdrFlags: uint32): cint {.
     return 0
 
 proc rxu_cntrl_check_pn*(secKeyPtr: pointer, tid: uint8): cint {.exportc, cdecl.} =
-  ## Preserve the vendor's strict/windowed data checks. Management uses its
-  ## own counter, not the TX PN at key+128 or the data-TID-zero counter.
+  ## Keep strict/windowed data checks, with CCMP PNs starting at one.
+  ## Management uses its own counter, not TX PN or the data-TID-zero counter.
   if secKeyPtr == nil or tid > RxuMgmtPnTid:
     return 0
   let key = cast[ptr VifKeySlotView](secKeyPtr)
@@ -225,6 +225,8 @@ proc rxu_cntrl_check_pn*(secKeyPtr: pointer, tid: uint8): cint {.exportc, cdecl.
   let env = rxuCntrlEnvView()
   let pnLo = env.secInfo0
   let pnHi = env.secInfo1
+  if key.cipherType == 2 and pnLo == 0 and pnHi == 0:
+    return 0
 
   if hasRxPn == 0:
     # Strict replay check: compare/update the next expected PN per TID.
@@ -269,6 +271,8 @@ proc rxuPnFresh(secKeyPtr: pointer; tid: uint8): bool =
   let key = cast[ptr VifKeySlotView](secKeyPtr)
   let env = rxuCntrlEnvView()
   let received = (env.secInfo1.uint64 shl 32) or env.secInfo0.uint64
+  if key.cipherType == 2 and received == 0:
+    return false
   var candidate = key.replayCounters[tid.int]
   if key.hasRxPn != 0:
     return replay_counter_validate(addr candidate, received)
@@ -328,18 +332,11 @@ proc rxu_mpdu_upload_and_indicate*(param: pointer) {.exportc, cdecl.} =
   let swdesc = rxMpduHeader(param)
   if swdesc == nil or not rxStationCurrent(param): return
 
-  # Build upload flags from env bytes 9,10, OR into swdesc control word at offset 76
-  let flagsHi = env.staIdx.uint32 shl 16
-  let flagsMid = env.vifIdx.uint32 shl 8
-  swdesc.frameControlFlags = swdesc.frameControlFlags or flagsHi or flagsMid or 2'u32
-
-  # Blob clears rxu_cntrl_env+0x32 (stripLen) before any header adjustment.
-  env.stripLen = 0
-
   # Read payload descriptor chain to get frame control. The blob loads
   # swdesc[8] and then reads the frame at payloadDesc[24].
   let payloadDesc = cast[ptr RxPayloadHwDescView](swdesc.bufferChain)
-  if payloadDesc == nil:
+  if payloadDesc == nil or payloadDesc.bufferStart == 0 or
+      swdesc.mpduLengthBytes < 2:
     return
   let fc = cast[ptr MacDataFrameHeaderView](
     cast[pointer](payloadDesc.bufferStart)).frameControl
@@ -347,14 +344,21 @@ proc rxu_mpdu_upload_and_indicate*(param: pointer) {.exportc, cdecl.} =
   # Compute header size from FC via rxu_cntrl_machdr_len_get (blob 0x5a)
   let macHdrLen = rxu_cntrl_machdr_len_get(fc)
   let envHdrLen = env.machdrLen
-  let adjustment = (envHdrLen.int - macHdrLen.int) and 0xFF
+  if macHdrLen == 0 or envHdrLen < macHdrLen or
+      envHdrLen.uint16 > swdesc.mpduLengthBytes:
+    return
+  let adjustment = envHdrLen.int - macHdrLen.int
+  if (adjustment and 1) != 0:
+    assert_warn(cast[cstring](0), cast[cstring](0), 364)
+    return
+
+  # Admit the complete header before publishing an upload-in-progress flag.
+  let flagsHi = env.staIdx.uint32 shl 16
+  let flagsMid = env.vifIdx.uint32 shl 8
+  swdesc.frameControlFlags = swdesc.frameControlFlags or flagsHi or flagsMid or 2'u32
+  env.stripLen = 0
 
   if adjustment != 0:
-    if (adjustment and 1) != 0:
-      # Blob calls assert_warn at 0x8c (not assert_rec)
-      assert_warn(cast[cstring](0), cast[cstring](0), 364)
-      if not rxUploadCurrent(param, generation) or not rxStationCurrent(param) or
-          rxMpduHeader(param) != swdesc: return
     # Adjust the upload buffer and software length to hide the stripped header
     # bytes from the host-side DMA upload.
     rxuStripPayloadPrefix(swdesc, adjustment.uint32, macHdrLen)
@@ -513,6 +517,12 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
       doReturn()
     let frame = macDataFrameAt(payload)
     let frameControl = frame.frameControl
+    # Management/control frames never carry DS addresses. Validate direct
+    # callers too, before a malformed header can select the Addr4 path.
+    if (frameControl and 3) != 0 or
+        ((frameControl and 8) == 0 and (frameControl and 0x0300) != 0):
+      inc nimFwDbgRxuDropInvalid
+      doReturn()
     if (frameControl and 0x00FC'u16) == 0x00B0'u16:
       inc nimFwDbgRxuAuthSeen
       nimFwDbgRxuAuthLast0 = hwFlags
@@ -585,17 +595,28 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
     # QoS sequence-cache overlay and PN replay index would index wrong entries
     # and reject valid frames. Must clear to 0 on non-QoS path.
     # .L142: Compute MAC header length
-    if (frameControl and 0x4000) != 0:
-      let securityHeaderLen =
+    let securityHeaderLen =
+      if (frameControl and 0x4000) != 0:
         case hwFlags and 0x1C'u32
         of 20: 4'u16
         of 24, 28: 8'u16
         else: 0'u16
+      else:
+        0'u16
+    if (frameControl and 0x4000) != 0:
       if swdesc.mpduLengthBytes < machdrLen.uint16 + securityHeaderLen:
         inc nimFwDbgRxuDropInvalid
         doReturn()
+    if (frameControl and 0x000C'u16) == 0 and not rxMgmtBodyValid(
+        frameControl, payload, machdrLen.uint16 + securityHeaderLen,
+        swdesc.mpduLengthBytes):
+      inc nimFwDbgRxuDropInvalid
+      doReturn()
     if (frameControl.uint8 and 0x88) == 0x88:
-      env.tid = (rxQosControl(frame, machdrLen) and 7).uint8
+      env.tid = (rxQosControl(frame, machdrLen) and 0x0F).uint8
+      # This EDCA implementation has no HCCA/TSPEC state for TIDs 8..15.
+      if (hwFlags and 0x02000000'u32) != 0 and env.tid >= 8:
+        doReturn()
     else:
       env.tid = 0'u8
     when defined(bl808WifiConnectTrace):
@@ -684,11 +705,35 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
 
         # .L156: Protected frame check (FC bit 14)
       if (env.frameCtrl and 0x4000) != 0:
+        if (frameControl and 0x000C'u16) == 0:
+          let protection = env.hwRxhdr and 0x1C'u32
+          if protection == 20:
+            # Shared-key Authentication is the only WEP management format.
+            if (frameControl and 0xFC'u16) != 0xB0'u16: doReturn()
+          elif protection == 28:
+            # This non-mesh implementation uses pairwise CCMP for robust
+            # unicast management, never a data GTK or a non-robust category.
+            let bodyOffset = machdrLen.uint16 + 8'u16
+            if (sta.capabilityFlags and 8) == 0 or (env.da[0] and 1) != 0 or
+                (env.hwRxhdr and 0x400'u32) != 0 or
+                swdesc.mpduLengthBytes <= bodyOffset:
+              doReturn()
+            if not mfp_is_robust_frame(frameControl.uint32,
+                rxFrameBytes(frame)[bodyOffset.int].uint32):
+              doReturn()
+          else:
+            doReturn()
+        # TKIP and CCMP both require ExtIV in bit 5 of security-header byte 3.
+        if ((env.hwRxhdr and 0x1C'u32) == 24 or
+            (env.hwRxhdr and 0x1C'u32) == 28) and
+            (rxFrameBytes(frame)[machdrLen.int + 3] and 0x20) == 0:
+          doReturn()
         if rxu_cntrl_protected_handle(
              cast[ptr uint8](frame), env.hwRxhdr) == 0:
           doReturn()
         if (env.secFlags and 2) != 0 and not rxKeyCurrent(param, env.secKeyPtr):
           doReturn()
+        if not frameCurrent(): doReturn()
 
       # .L160: Frame type dispatch
       let frameTypeBits = frameControl and 0x000C
@@ -786,6 +831,7 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
                                   (env.tid.uint32 shl 24),
                                 swdesc.mpduLengthBytes.uint32 or
                                   (env.machdrLen.uint32 shl 16))
+          if not frameCurrent(): doReturn()
         let isEapol = hasRfc1042Snap and etherType == 0x8E88'u16
         let hasProtocol = not isAmsdu and hasSnapHeader and
           (hasRfc1042Snap or rxSnapIsBridgeTunnel(addr msdu.snap))
@@ -816,7 +862,7 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
         # me_mic_calc/me_mic_end, then compares computed MIC with received MIC.
         # On mismatch sends MIC_FAILURE_IND to the host API task (9).
         if (env.secFlags and 1) != 0:
-          if not rxKeyCurrent(param, env.secKeyPtr):
+          if not rxKeyCurrent(param, env.secKeyPtr) or not frameCurrent():
             doReturn()
           if not rxuPnFresh(env.secKeyPtr, env.tid):
             inc nimFwDbgRxuDropPn
@@ -890,7 +936,7 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
               micBuf = rxFrameBufferChainAt(micBuf.next)
 
           # 4. Compare computed MIC with received MIC
-          if not rxKeyCurrent(param, env.secKeyPtr):
+          if not rxKeyCurrent(param, env.secKeyPtr) or not frameCurrent():
             doReturn()
           if rxMic[0] != micCtx[0] or rxMic[1] != micCtx[1]:
             if not frameCurrent(): doReturn()
@@ -908,7 +954,7 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
             let failureVifIdx = env.vifIdx
             let failMsg = ke_msg_alloc(0xC04'u16, TASK_API, TASK_ME, 24)
             if failMsg != nil:
-              if not frameCurrent() or not rxKeyCurrent(param, secKey):
+              if not rxKeyCurrent(param, secKey) or not frameCurrent():
                 ke_msg_free_payload(failMsg)
                 doReturn()
               let msg = rxMicFailureIndAt(failMsg)
@@ -928,7 +974,7 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
         block:
           let savedIrq = irqSave()
           defer: irqRestore(savedIrq)
-          if not rxStationCurrent(param):
+          if not frameCurrent():
             doReturn()
           if (env.secFlags and 2) != 0:
             if not rxKeyCurrent(param, env.secKeyPtr): doReturn()
@@ -967,16 +1013,17 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
             if allocFn == nil or freeFn == nil:
               doReturn()
             storage = allocFn(eapolLength)
-            if storage == nil or not frameCurrent() or
+            if storage == nil or
                 (receivedKey != nil and not rxKeyCurrent(param, receivedKey)) or
+                not frameCurrent() or
                 not rxuCopyFrameBytes(swdesc, offset, eapolLength, storage):
               doReturn()
             eapolData = storage
           when defined(bl808WifiConnectTrace):
             nimFwConnectTrace2U32("[WIFI-CT] eapol_rx ",
               staIdx.uint32 or (vifType.uint32 shl 8), eapolLength)
-          if not frameCurrent() or
-              (receivedKey != nil and not rxKeyCurrent(param, receivedKey)):
+          if (receivedKey != nil and not rxKeyCurrent(param, receivedKey)) or
+              not frameCurrent():
             doReturn()
           if vifType == 2:
             apm_handle_eapol_input(staIdx, eapolData, eapolLength)
@@ -1064,11 +1111,11 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
           let cachedSeq = rxSeq.nonQosSeqCtrl
           if cachedSeq == envSeq: doReturn()
 
-        # Commit pairwise replay state only for the captured session.
+        # A recycled slot can have a valid new station, but not this generation.
         block:
           let savedIrq = irqSave()
           defer: irqRestore(savedIrq)
-          if not rxStationCurrent(param): doReturn()
+          if not frameCurrent(): doReturn()
           if (env.secFlags and 2) != 0:
             if not rxKeyCurrent(param, env.secKeyPtr): doReturn()
             if rxu_cntrl_check_pn(env.secKeyPtr, RxuMgmtPnTid) == 0:
@@ -1077,7 +1124,7 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
                                       env.machdrLen, swdesc.mpduLengthBytes)
               doReturn()
             if not rxKeyCurrent(param, env.secKeyPtr): doReturn()
-          if not rxStationCurrent(param): doReturn()
+          if not frameCurrent(): doReturn()
 
         # Blob's associated mgmt path (.L158 -> .L163 -> .L234) routes through
         # rxu_mgt_frame_check(param, sta_idx), not the data upload path.
@@ -1092,6 +1139,10 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
 
     if frameTypeBits == 0:
       # ---- Management frame (type 0) ----
+      if (frameControl and 0x4000'u16) != 0 and
+          ((hwFlags and 0x1C'u32) != 20 or
+            (frameControl and 0xFC'u16) != 0xB0'u16):
+        doReturn()
       let addr2Ptr = rxAddrPtr(addr frame.addr2)
       let frameControlFlagByte = (frameControl shr 8).uint8
       let retryFrame = (frameControlFlagByte and 0x08'u8) != 0
@@ -1106,7 +1157,6 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
       discard c_memcpy(cast[pointer](addr rxu_mgmt_dup_addr[0]), addr2Ptr, 6)
 
       if (env.frameCtrl and 0x4000) != 0:
-        if (hwFlags and 0x1C) != 20: doReturn()
         if rxu_cntrl_protected_handle(cast[ptr uint8](frame), hwFlags) == 0:
           doReturn()
 

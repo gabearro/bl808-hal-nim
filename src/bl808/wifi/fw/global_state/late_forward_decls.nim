@@ -115,6 +115,8 @@ proc rcTryInitStation(staEntry: pointer): bool
 proc rc_init_bcmc_rate*(staEntry: pointer, band: uint32) {.exportc, cdecl.}
 proc mfp_compute_bip*(key: pointer, frame: pointer, frameLen: uint32,
     headerLen: uint32): uint64 {.exportc, cdecl.}
+proc mfpComputeRxBip(key, frame: pointer; frameLen, headerLen: uint32;
+    rx: ptr RxSwDescView; mic: var uint64): bool
 proc mfp_protect_mgmt_frame*(frameDesc: pointer, fc: uint32, action: uint32 = 0): uint32 {.exportc, cdecl, noinline.}
 proc mfp_add_mgmt_mic*(frameDesc: pointer, frame: pointer, frameLen: uint32): uint32 {.exportc, cdecl.}
 proc me_extract_power_constraint*(ieBuf: pointer, ieLen: uint32, out_ptr: pointer) {.exportc, cdecl.}

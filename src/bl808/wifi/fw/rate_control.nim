@@ -359,6 +359,22 @@ proc rc_update_counters*(staIdx: uint8; attemptCount, failureCount: uint32;
     assert_err("rc.c", "rc.c", 1998)
     return
   let counters = rcStatsCounters(stats)
+  let sampleCount = rcRateCapabilities(stats).sampleCount
+
+  if sampleCount == 0 or sampleCount > RC_MAX_RATE_ENTRIES.uint16 or
+      failureCount > attemptCount:
+    return
+  var pendingAttempts = attemptCount
+  var pendingFailures = failureCount
+  for retrySlot in counters.retrySlots:
+    if pendingAttempts == 0:
+      break
+    if retrySlot.rateIdx >= sampleCount:
+      return
+    if pendingFailures <= 3:
+      break
+    pendingAttempts -= 4
+    pendingFailures -= 4
 
   var attempts = attemptCount
   var failures = failureCount
@@ -656,7 +672,11 @@ proc rc_check_valid_rate*(stats: pointer, rateConfig: uint16): uint8 {.exportc, 
 proc rc_check_rate_duplicated*(stats: pointer, rateConfig: uint16): uint8 {.exportc, cdecl.} =
   ## Check if rateConfig already exists in the rate table.
   ## Returns 1 if duplicated, 0 if not.
+  if stats == nil:
+    return 0
   let nRates = rcU16(stats, RCS_N_RATES)
+  if nRates > RC_MAX_RATE_ENTRIES.uint16:
+    return 0
   for rateEntryIndex in 0 ..< nRates.int:
     if rcRateConfig(stats, rateEntryIndex) == rateConfig:
       return 1

@@ -1,7 +1,6 @@
 """Check PHY capability fields, TX policy propagation, and byte arithmetic."""
 
 from pathlib import Path
-import re
 
 import pytest
 
@@ -13,9 +12,8 @@ from test_wifi_sta_tx_channel import object_type
 
 def source() -> str:
     rf = (FW / "global_state/rf_bl808_core.nim").read_text()
-    table = re.search(r"(?ms)^  PhyRxGainTable:.*?^  \]", rf)
-    assert table
-    code = object_type(rf, "WifiModemBlock") + "const\n" + table.group(0)
+    table = rf[rf.index("var phyRxGainTable*"):].split("\nvar phyRxGainOffsetVsTemperature", 1)[0]
+    code = object_type(rf, "WifiModemBlock") + table
     code += r'''
 var
   modem: WifiModemBlock
@@ -23,6 +21,8 @@ var
   versionReads: int
   writes: seq[int]
   phyRxGainOffsetVsTemperature = -128'i8
+proc volatileLoad[T](p: ptr T): T = p[]
+proc volatileStore(p: ptr int8; value: int8) = p[] = value
 proc modemVersionReg(): uint32 =
   inc versionReads
   version
@@ -76,7 +76,7 @@ for nibble in 0'u32..15:
     doAssert versionReads == 3
 ''',
     "gain_byte": r'''
-const base = [8, 15, 22, 29, 35, 42, 48, 54, 60]
+const base = [14, 19, 26, 32, 38, 45, 50, 57, 63]
 for offset in -128..127:
   for index in 0..<base.len:
     let expected = ((base[index] + offset + 256) mod 256).uint32
@@ -84,7 +84,7 @@ for offset in -128..127:
       "gain addition did not preserve the low byte"
 ''',
     "gain_registers_and_cache": r'''
-const base = [8, 15, 22, 29, 35, 42, 48, 54, 60]
+const base = [14, 19, 26, 32, 38, 45, 50, 57, 63]
 for offset in -128..127:
   let bytes = cast[ptr UncheckedArray[uint8]](addr modem)
   for i in 0..<sizeof(modem): bytes[i] = (i and 255).uint8
@@ -101,7 +101,8 @@ for offset in -128..127:
   rc2_config_rxgain(offset.int8)
   doAssert modem == expected
   doAssert phyRxGainOffsetVsTemperature == offset.int8
-  doAssert writes == @[0xC080, 0xC084, 0xC088]
+  doAssert writes == @[0xC080, 0xC080, 0xC080, 0xC080,
+                      0xC084, 0xC084, 0xC084, 0xC084, 0xC088]
   writes.setLen(0)
   rc2_config_rxgain(offset.int8)
   doAssert modem == expected and writes.len == 0

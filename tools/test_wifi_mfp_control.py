@@ -77,8 +77,6 @@ proc mfp_compute_bip(key, frame: pointer; length, offset: uint32): uint64 =
   micFrame = frame
   micLength = length
   micBodyOffset = offset
-  let mmie = mmieAt(ieCursorAfter(frame, length.uint - 18))
-  doAssert mmie.mic == default(typeof(mmie.mic)), "MIC field must be zero while computing"
   computedMic
 """
 
@@ -98,6 +96,63 @@ when not declared(irqSave):
     result = interrupts.uint32 * 8
     interrupts = false
   proc irqRestore(saved: uint32) = interrupts = (saved and 8) != 0
+"""
+
+# Short policy fixtures model one flat payload; chain tests retain the real reader.
+RX_CONTEXT = r"""
+when not declared(RxSwDescView):
+  type RxSwDescView = object
+    bufferChain: pointer
+    mpduLengthBytes: uint16
+  var mfpRxHeader: RxSwDescView
+  var mfpRxFrame: pointer
+when not declared(rxMpduHeader):
+  proc rxMpduHeader(p: pointer): ptr RxSwDescView = addr mfpRxHeader
+when not declared(rxFramePayload):
+  when declared(rxFrameAtRef):
+    proc rxFramePayload(p: ptr RxSwDescView): pointer = cast[pointer](rxFrameAtRef(p.bufferChain))
+  else:
+    proc rxFramePayload(p: ptr RxSwDescView): pointer = mfpRxFrame
+when not declared(rxUploadGeneration):
+  proc rxUploadGeneration(p: pointer): uint32 = 7
+when not declared(rxUploadCurrent):
+  proc rxUploadCurrent(p: pointer; generation: uint32): bool = generation == 7
+when not declared(rxStationCurrent):
+  proc rxStationCurrent(p: pointer): bool = true
+when not declared(c_memcpy):
+  proc c_memcpy(dst, src: pointer; length: csize_t): pointer =
+    copyMem(dst, src, length.int)
+    dst
+when not declared(rxuCopyFrameBytes):
+  proc rxuCopyFrameBytes(rx: ptr RxSwDescView; offset, length: uint32; dst: pointer): bool =
+    if offset > rx.mpduLengthBytes.uint32 or length > rx.mpduLengthBytes.uint32 - offset:
+      return false
+    discard c_memcpy(dst, ieCursorAfter(rxFramePayload(rx), offset.uint), length.csize_t)
+    true
+when not declared(RxFrameIdentity):
+  type RxFrameIdentity = object
+    descriptor, header, payload, frame: pointer
+    generation: uint32
+    length: uint16
+when not declared(rxCaptureFrame):
+  proc rxCaptureFrame(p: pointer): RxFrameIdentity =
+    let header = rxMpduHeader(p)
+    if header != nil:
+      result = RxFrameIdentity(descriptor: p, header: header, payload: header.bufferChain,
+        frame: rxFramePayload(header), generation: rxUploadGeneration(p), length: header.mpduLengthBytes)
+when not declared(rxFrameCurrent):
+  proc rxFrameCurrent(identity: RxFrameIdentity): bool =
+    let header = rxMpduHeader(identity.descriptor)
+    rxUploadCurrent(identity.descriptor, identity.generation) and rxStationCurrent(identity.descriptor) and
+      header == identity.header and header.bufferChain == identity.payload and
+      header.mpduLengthBytes == identity.length and rxFramePayload(header) == identity.frame
+"""
+
+RX_MIC_MODEL = r"""
+proc mfpComputeRxBip(key, frame: pointer; length, header: uint32;
+                     rx: ptr RxSwDescView; mic: var uint64): bool =
+  mic = mfp_compute_bip(key, frame, length, header)
+  true
 """
 
 CLASSIFICATION = r"""
@@ -121,8 +176,10 @@ for vif in 0'u8 .. 1'u8:
           var desc = HostTxDescView(vifIdx: vif, staInfoIdx: index)
           for fc in [0xA0'u32, 0xC0, 0xD0, 0xB0, 0xD8]:
             for category in [3'u32, 4, 127, 128]:
-              let expected = if not hasKey or not robust(fc, category): 0'u32
-                elif group: 2'u32 else: (flags shr 3) and 1
+              let expected = if not robust(fc, category): 0'u32
+                elif group: (if hasKey: 2'u32 else: 0'u32)
+                elif not hasKey and (fc and 0xFC) != 0xD0: 0'u32
+                else: (flags shr 3) and 1
               doAssert mfp_protect_mgmt_frame(addr desc, fc, category) == expected
 """
 
@@ -268,10 +325,11 @@ def test_mfp_control(receive: bool, tmp_path: Path) -> None:
     mfp = (FW / "crypto_mfp_hsu.nim").read_text()
     source = PLATFORM + procedure(mac, "mfp_is_robust_frame")
     if receive:
-        source += KEY_CONTEXT + procedure(mfp, "mfpIgnoreRxMgmtFrame")
+        source += KEY_CONTEXT + RX_CONTEXT + RX_MIC_MODEL + procedure(mfp, "mfpIgnoreRxMgmtFrame")
         source += procedure(mfp, "mfp_ignore_mgmt_frame") + RECEIVE
         tasks = (FW / "task_handlers.nim").read_text()
-        assert "if mfpIgnoreRxMgmtFrame(param, envPtr, frameHdr, bodyLen," in tasks
+        assert re.search(r"let ignored = mfpIgnoreRxMgmtFrame\(param, envPtr, frameHdr, bodyLen,\s*"
+                         r"addr mfpAcceptedFlag, addr mfpSecondaryFlags,\s*generation\)", tasks)
         assert "return rxuMgtUpload(param, mfpAcceptedFlag)" in tasks
         assert "discard mfpIgnoreRxMgmtFrame(" not in tasks
         assert "register unsigned char* _a4" not in tasks

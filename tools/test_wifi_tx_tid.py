@@ -21,7 +21,7 @@ CASES = {
     "invalid_tids": r'''
 for enabled in [false, true]:
   for station in 0..<STA_INFO_TAB_ENTRIES:
-    for tid in 9..254:
+    for tid in 8..254:
       reset()
       interrupts = enabled
       var desc = HostTxDescView(staInfoIdx: station.uint8, staIdx: tid.uint8,
@@ -45,7 +45,7 @@ for enabled in [false, true]:
 ''',
     "valid_boundaries": r'''
 for enabled in [false, true]:
-  for tid in [0'u8, 7, 8, 0xFF]:
+  for tid in [0'u8, 7, 0xFF]:
     reset()
     interrupts = enabled
     var desc = HostTxDescView(staInfoIdx: 0, staIdx: tid, vifIdx: 0,

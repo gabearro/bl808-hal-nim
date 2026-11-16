@@ -254,7 +254,7 @@ for vif in [0'u8, 2, 255]:
 
 def build_program() -> str:
     source = "type\n  CoListHdr = object\n    next: ptr CoListHdr\n  CoList = object\n    first, last: ptr CoListHdr\n" + program_source()
-    source = source.replace("  HostTxDescView = object\n", "  HostTxDescView = object\n    link: CoListHdr\n    bufferPtrs, bufferLens: array[4, uint32]\n")
+    source = source.replace("  HostTxDescView = object\n", "  HostTxDescView = object\n    link: CoListHdr\n")
     source = source.replace("var\n  sta_info_tab:", MODELS + "\nvar\n  sta_info_tab:")
     source = source.replace("  retiringVif: int = -1\n", "  retiringVif: int = -1\n" + STORAGE)
     source = source.replace("proc hostTxDescAt", HELPERS + "\nproc hostTxDescAt", 1)
@@ -262,7 +262,14 @@ def build_program() -> str:
         'proc vifChannelForIdx(i: uint8): ptr Vif =\n  doAssert not invalidated, "retired VIF read"\n  addr vifs[i]')
     source = source.replace("proc vifKeyPointers(v: ptr Vif): ptr tuple[flags: uint32] = addr v.keys",
         'proc vifKeyPointers(v: ptr Vif): ptr tuple[flags: uint32] =\n  doAssert not invalidated, "retired VIF key read"\n  addr v.keys')
-    source = source.replace("  copyMem(dst, src, size.int)\n  dst", "  copyMem(dst, src, size.int)\n  if size == 60: visit(\"copy\")\n  dst")
+    # The fixture's DMA address names a modeled 100-byte payload, not host RAM.
+    source = source.replace("  copyMem(dst, src, size.int)\n  dst", """  if cast[uint](src) == 0x20000000'u:
+    doAssert size <= 100
+    zeroMem(dst, size.int)
+  else:
+    copyMem(dst, src, size.int)
+  if size == 60: visit("copy")
+  dst""")
     start = source.index("proc nimFwConnectTrace2U32")
     end = source.index("proc txl_cntrl_tx_check", start)
     source = source[:start] + r'''
@@ -288,7 +295,7 @@ proc nimFwConnectTrace2U32(s: string; a, b: uint32) =
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 @pytest.mark.parametrize("mutation", [None, "lower_trace", "lower_header", "lower_traffic", "lower_ps",
                                       "prepare_after_frame", "prepare_final", "frame_after_append", "frame_after_trace", "eager_queue",
-                                      "lower_header_pair", "prepare_after_frame_pair"])
+                                      "lower_header_pair", "prepare_after_frame_pair", "frame_after_trace_pair"])
 def test_lower_preparation(tmp_path: Path, mode: str, mutation: str | None) -> None:
     nim = shutil.which("nim")
     if nim is None:
@@ -336,6 +343,15 @@ def test_lower_preparation(tmp_path: Path, mode: str, mutation: str | None) -> N
                 guard = "      ensureCurrentThd()\n"
                 assert callee_body.count(guard) == 4
                 changed_callee = callee_body.replace(guard, "")
+            elif fault == "frame_after_trace":
+                guard = "      ensureCurrentBuild()\n"
+                assert callee_body.count(guard) == 5
+                changed_callee = "".join(callee_body.rsplit(guard, 1))
+                # Retire at the last trace to exercise both adjacent guards.
+                first = 'if s == "[WIFI-CT] tx_eapol_fc ": visit("frame_trace")'
+                last = 'if s == "[WIFI-CT] tx_eapol_snap ": visit("frame_trace")'
+                assert program.count(first) == 1
+                program = program.replace(first, last, 1)
             else:
                 guard = "  if not txlSessionCurrent(identity, txDesc):\n    return false\n"
                 assert callee_body.count(guard) == 2
@@ -347,9 +363,9 @@ def test_lower_preparation(tmp_path: Path, mode: str, mutation: str | None) -> N
     result = subprocess.run([nim, "c", "-r", "--skipParentCfg:on", "--skipProjCfg:on", "--skipUserCfg:on",
         "-d:bl808WifiConnectTrace", f"--nimcache:{tmp_path / 'cache'}", f"-o:{tmp_path / 'test'}",
         *options[mode], str(source)], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90)
-    # These caller checks duplicate a callee's final ownership check. Removing
-    # either one alone must still preserve the end-to-end rejection contract.
-    redundant_guards = {"lower_header", "prepare_after_frame"}
+    # Another ownership check covers each of these guards. Paired removals
+    # above must still be detected by the fixture.
+    redundant_guards = {"lower_header", "prepare_after_frame", "frame_after_trace"}
     if mutation is None or mutation in redundant_guards:
         assert result.returncode == 0, result.stdout
     else:

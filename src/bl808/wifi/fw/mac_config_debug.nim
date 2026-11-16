@@ -247,31 +247,35 @@ proc notifier_chain_remove(headPtr: ptr pointer, notifier: ptr CoListHdr) =
     linkSlot = addr notifierNodeView(currentNotifier).next
     currentNotifier = cast[ptr CoListHdr](linkSlot[])
 
-proc notifier_chain_regsiter*(chain: ptr CoList, notifier: ptr CoListHdr) {.exportc, cdecl.} =
+proc notifier_chain_regsiter*(chain: ptr CoList, notifier: ptr CoListHdr): cint {.exportc, cdecl, discardable.} =
   ## Register notifier with irqSave (64 bytes in blob, 30 instrs).
   ## From blob: irqSave, inline priority-ordered insert, irqRestore, return 0.
   let saved = irqSave()
+  defer: irqRestore(saved)
   notifier_chain_insert_ordered(cast[ptr pointer](addr chain.first), notifier)
-  irqRestore(saved)
+  0
 
-proc notifier_chain_regsiter_fromCritical*(chain: ptr CoList, notifier: ptr CoListHdr) {.exportc, cdecl.} =
+proc notifier_chain_regsiter_fromCritical*(chain: ptr CoList, notifier: ptr CoListHdr): cint {.exportc, cdecl, discardable.} =
   ## Register notifier from critical section (26 bytes in blob).
   ## From blob: inline priority-ordered insert into singly-linked list.
   notifier_chain_insert_ordered(cast[ptr pointer](addr chain.first), notifier)
+  0
 
-proc notifier_chain_unregsiter*(chain: ptr CoList, notifier: ptr CoListHdr) {.exportc, cdecl.} =
+proc notifier_chain_unregsiter*(chain: ptr CoList, notifier: ptr CoListHdr): cint {.exportc, cdecl, discardable.} =
   ## Unregister notifier with irqSave (62 bytes in blob, 29 instrs).
   ## From blob: irqSave, inline walk singly-linked list, unlink, irqRestore, return 0.
   let saved = irqSave()
+  defer: irqRestore(saved)
   notifier_chain_remove(cast[ptr pointer](addr chain.first), notifier)
-  irqRestore(saved)
+  0
 
-proc notifier_chain_unregsiter_fromCritical*(chain: ptr CoList, notifier: ptr CoListHdr) {.exportc, cdecl.} =
+proc notifier_chain_unregsiter_fromCritical*(chain: ptr CoList, notifier: ptr CoListHdr): cint {.exportc, cdecl, discardable.} =
   ## Unregister notifier from critical section (22 bytes in blob).
   ## From blob: inline walk singly-linked list, find and unlink matching node.
   notifier_chain_remove(cast[ptr pointer](addr chain.first), notifier)
+  0
 
-proc notifier_chain_call*(chain: ptr CoList, event: uint32, data: pointer) {.exportc, cdecl.} =
+proc notifier_chain_call*(chain: ptr CoList, event: uint32, data: pointer): cint {.exportc, cdecl, discardable.} =
   ## Call all notifiers in the chain.
   ## From blob (36 instrs): irqSave, s0 = chain.first, for each node:
   ##   lw a5, 0(s0) => callback at offset 0
@@ -279,6 +283,7 @@ proc notifier_chain_call*(chain: ptr CoList, event: uint32, data: pointer) {.exp
   ##   s0 = s0[4] => observe the next link after the callback
   ## irqRestore, return 0.
   let saved = irqSave()
+  defer: irqRestore(saved)
   var currentNotifier = chain.first
   while currentNotifier != nil:
     let notifierNode = notifierNodeView(currentNotifier)
@@ -288,9 +293,9 @@ proc notifier_chain_call*(chain: ptr CoList, event: uint32, data: pointer) {.exp
     if callback != nil:
       discard callback(currentNotifier, event, data)
     currentNotifier = cast[ptr CoListHdr](notifierNode.next)
-  irqRestore(saved)
+  0
 
-proc notifier_chain_call_fromeCritical*(chain: ptr CoList, event: uint32, data: pointer) {.exportc, cdecl.} =
+proc notifier_chain_call_fromeCritical*(chain: ptr CoList, event: uint32, data: pointer): cint {.exportc, cdecl, discardable.} =
   ## Call notifiers from critical section (no irqSave/irqRestore).
   ## From blob (23 instrs): s0 = chain.first, for each node:
   ##   lw a5, 0(s0) => callback, call callback(node, event, data),
@@ -304,13 +309,14 @@ proc notifier_chain_call_fromeCritical*(chain: ptr CoList, event: uint32, data: 
     if callback != nil:
       discard callback(currentNotifier, event, data)
     currentNotifier = cast[ptr CoListHdr](notifierNode.next)
+  0
 
 # ###########################################################################
 #                  Replay Counter
 # ###########################################################################
 
 proc replay_counter_validate*(param: pointer; received: uint64): bool {.exportc, cdecl.} =
-  ## Vendor replay window: a next-PN counter and two rotating 32-bit bitmaps.
+  ## A next-PN counter and two rotating 32-bit bitmaps.
   ## Accept unseen PNs up to 32 behind the highest received PN.
   let state = replayCounterStateView(param)
   let last = (state.pnHigh.uint64 shl 32) or state.pnLow.uint64
@@ -318,18 +324,18 @@ proc replay_counter_validate*(param: pointer; received: uint64): bool {.exportc,
     return false
 
   let nextPn = received + 1'u64
-  # WEXTI in the vendor returns the low 32 bits of each shifted counter.
-  let index = ((nextPn shr 5) and 0xFFFFFFFF'u64).uint32
+  # Keep the full block index for eviction; truncation aliases after 2^37 PNs.
+  let index = nextPn shr 5
   if nextPn > last:
-    let currentIndex = ((last shr 5) and 0xFFFFFFFF'u64).uint32
+    let currentIndex = last shr 5
     if index != currentIndex:
-      state.bitmap[((currentIndex + 1'u32) and 1'u32).int] = 0
-      if currentIndex != index - 1'u32:
-        state.bitmap[(currentIndex and 1'u32).int] = 0
+      state.bitmap[((currentIndex + 1'u64) and 1'u64).int] = 0
+      if currentIndex != index - 1'u64:
+        state.bitmap[(currentIndex and 1'u64).int] = 0
     state.pnLow = (nextPn and 0xFFFFFFFF'u64).uint32
     state.pnHigh = (nextPn shr 32).uint32
 
-  let slot = (index and 1'u32).int
+  let slot = (index and 1'u64).int
   let bit = 1'u32 shl (nextPn and 31'u64).int
   if (state.bitmap[slot] and bit) != 0:
     return false
@@ -720,11 +726,12 @@ proc cfg_api_element_dump*(valueStorage: pointer, typeId: uint32,
   else:
     return nil
 
-proc cfg_api_element_general_get*(id: uint32): uint32 {.exportc, cdecl.} =
+proc cfg_api_element_general_get*(entry, value, extra: pointer): cint {.exportc, cdecl, discardable.} =
   ## Get a general config element value (blob: always returns 0, 4 bytes).
   return 0
 
-proc cfg_api_element_general_set*(entry: pointer, value: pointer) {.exportc, cdecl.} =
+proc cfg_api_element_general_set*(entry: pointer, value: pointer;
+                                 extra: pointer = nil): cint {.exportc, cdecl, discardable.} =
   ## Set a general config element value (52 instrs in blob).
   ## Actual blob ABI: a0=config table entry ptr, a1=value ptr.
   ## Called as the set handler from cfg_api_element_set for each config table entry.
@@ -736,16 +743,16 @@ proc cfg_api_element_general_set*(entry: pointer, value: pointer) {.exportc, cde
   ##   typeId 5:   sh (store unsigned halfword from value[0..1] to data[0..1])
   ##   typeId 6,7: sw (store word from value[0..3] to data[0..3])
   ## Returns 0 always.
-  if entry == nil or value == nil: return
+  if entry == nil or value == nil: return 0
   let cfg = cfgApiElementEntryAt(entry)
   # The relocation selects the printf hook at byte offset 4.
-  let nameStr = cfg.name
+  let nameStr = cast[cstring](cfg.name)
   let printFn = cast[proc(format: cstring) {.cdecl, varargs, raises: [Exception].}](blOpsFunc(4))
   if printFn != nil and nameStr != nil:
     printFn("  updating element: %s\r\n", nameStr)
   let typeId = cfg.typeId
   let valueStorage = cfg.valueStorage
-  if valueStorage == nil: return
+  if valueStorage == nil: return 0
   let dst = cast[uint](valueStorage)
   case typeId
   of 1, 3:
@@ -770,122 +777,54 @@ proc cfg_api_element_general_set*(entry: pointer, value: pointer) {.exportc, cde
     cast[ptr uint32](dst)[] = wordValue
   else:
     discard
+  0
 
-proc cfg_api_element_set*(id: uint32, subId: uint16, typeId: uint16,
-    value: pointer, extra: pointer) {.exportc, cdecl.} =
-  ## Set a config element by searching element table (59 instrs).
-  ##
-  ## From disassembly: iterates 28-byte config entries (s0 walks from
-  ## cfg_table_start to cfg_table_end, stride 28). For each entry:
-  ##   - Compare entry[0] (uint32) with id (s2): if mismatch, advance s0+=28
-  ##   - Compare entry[4] (uint16) with subId (s3): if mismatch, advance
-  ##   - Compare entry[6] (uint16) with typeId (s4): if mismatch, call
-  ##     type-conversion handler at s7[4] with (s8, s4, s2, s3) args
-  ##   - On full match: call entry[16] (set handler) with (s0=entry, s5=value, s6=extra)
-  ## The config table boundaries are resolved via auipc relocations.
-  ##
-  ## Since we don't have the exact linker-resolved config table, we search
-  ## a virtual config table. The blob's cfg_api_element_general_set function
-  ## (which is the typical set handler) reads entry[6] for type, entry[12]
-  ## for value storage pointer, and writes the value according to the type width.
-  ## We implement the dispatch logic that the blob uses.
-  ##
-  ## For the reimplementation, we use our cfgElements array as a flat store,
-  ## keyed by the id. The subId and typeId are used for type-safe dispatch.
-
-  # Type-based value writing (matching cfg_api_element_general_set blob logic)
-  # The blob's general_set reads typeId from entry[6] and dispatches:
-  #   typeId 1,3: sb (store byte from value[0])
-  #   typeId 2: sb (signed byte from value[0])
-  #   typeId 4: sh (store halfword from value[0..1])
-  #   typeId 5: sh (unsigned halfword from value[0..1])
-  #   typeId 6,7: sw (store word from value[0..3])
-
-  # The blob iterates a 28-byte-stride config table, comparing id/subId/typeId
-  # for each entry, and calls entry[16] (set handler) on match.
-  # Since we don't have the linked config table, we call cfg_api_element_general_set
-  # directly which handles the type-based dispatch.
-  if value == nil:
-    return
-  # Build a virtual entry struct on stack matching the blob's layout:
-  #   [0..3] = id, [4..5] = subId, [6..7] = typeId,
-  #   [8..11] = name ptr, [12..15] = value storage ptr, [16..19] = set handler
-  var cfgApiEntry {.noinit.}: CfgApiElementEntryView
-  discard c_memset(addr cfgApiEntry, 0, sizeof(CfgApiElementEntryView).csize_t)
-  cfgApiEntry.id = id
-  cfgApiEntry.subId = subId
-  cfgApiEntry.typeId = typeId
-  # Data pointer: for cfgElements, point to the element slot
-  if id < 32:
-    cfgApiEntry.valueStorage = cast[pointer](addr cfgElements[id])
-    # Blob dispatches to the set handler via a function pointer stored in
-    # the config entry — indirect call (not counted as R_RISCV_CALL).
-    # Mirror that by calling through a pointer variable.
-    let setFn {.volatile.}: proc(entry: pointer, value: pointer) {.cdecl.} =
-      cfg_api_element_general_set
-    cfgApiEntry.setHandler = cast[pointer](setFn)
-    setFn(cast[pointer](addr cfgApiEntry), value)
-    if id >= cfgElementCount:
-      cfgElementCount = id + 1
+proc cfg_api_element_set*(id, subId, typeId: uint32;
+    value, extra: pointer): cint {.exportc, cdecl, discardable.} =
+  ## Match task, element and type, then forward both opaque callback arguments.
+  type SetFn = proc(entry, value, extra: pointer): cint {.cdecl.}
+  type PrintFn = proc(format: cstring) {.cdecl, varargs.}
+  for entry in cfgApiEntries.mitems:
+    if entry.id != id or entry.subId.uint32 != subId:
+      continue
+    if entry.typeId.uint32 != typeId:
+      let printFn = cast[PrintFn](blOpsFunc(4))
+      if printFn != nil:
+        printFn("type %lu NOT matched on element: %lu %lu %u\r\n",
+                typeId.culong, id.culong, subId.culong, entry.typeId.cuint)
+      continue
+    let setFn = cast[SetFn](entry.setHandler)
+    if setFn != nil:
+      discard setFn(addr entry, value, extra)
+    break
+  0
 
 proc dump_cfg_entries*() {.exportc, cdecl.} =
-  ## Dump config entries for debugging (92 instrs).
-  ## Iterates over the config element table, for each entry:
-  ##   logs the entry index, name pointer, type, subtype, value pointer,
-  ##   and calls cfg_api_element_dump to format the value into a string buffer.
-  ## Uses g_bl_ops_funcs[4] (printf) and g_bl_ops_funcs[8] (puts) for output.
-  ##
-  ## Assembly trace:
-  ##   s0 = g_bl_ops_funcs base
-  ##   Calls g_bl_ops_funcs[8] with header string
-  ##   s1 = cfg element table start, s2 = cfg element table end
-  ##   s3..s8 = format strings for each field
-  ##   For each entry (stride 28):
-  ##     logs: name(s3), value(s4), type(s5), subtype(s6), raw_word(s7),
-  ##     calls cfg_api_element_dump(entry[12], entry[6], sp_buf) -> formatted string
-  ##     logs formatted value(s8) and separator
-  ##   Calls g_bl_ops_funcs[8] with footer string
-  let logFn = blOpsFunc(8)  # puts-like function
-  let printFn = blOpsFunc(4)  # printf-like function
-  if logFn == nil or printFn == nil:
-    return
+  ## Walk the registered configuration records, not the legacy scalar store.
   type PutsFn = proc(s: cstring) {.cdecl.}
-  type PrintfFn = proc(fmt: cstring, a1: pointer) {.cdecl, varargs.}
-  let puts = cast[PutsFn](logFn)
-  let printf = cast[PrintfFn](printFn)
-  # Print header
-  puts("--- cfg entries ---")
-  # Get config element table: stored at a known location
-  # In the blob, s1 iterates from cfg_table_start to cfg_table_end (stride=28)
-  # The blob references these via auipc relocations. We use our cfgElements array.
-  let cfgBase = cast[uint](addr cfgElements[0])
-  let cfgCount = cfgElementCount
-  var formattedValueBuffer {.noinit.}: array[64, uint8]
-  for cfgElementIndex in 0'u32 ..< cfgCount:
-    let entryAddr = cfgBase + cfgElementIndex * 28
-    # Log entry index
-    printf("entry %d:", cast[pointer](cfgElementIndex))
-    # Log entry name (offset 0 = ptr to name string)
-    let namePtr = cast[ptr pointer](entryAddr)[]
-    printf(" name=%s", namePtr)
-    # Log entry value (offset 4 = value word)
-    let valWord = cast[ptr uint32](entryAddr + 4)[]
-    printf(" val=0x%x", cast[pointer](valWord))
-    # Log type (offset 8 = type half-word)
-    let typeId = cast[ptr uint16](entryAddr + 8)[]
-    printf(" type=%d", cast[pointer](typeId.uint))
-    # Log subtype (offset 10 = subtype half-word)
-    let subType = cast[ptr uint16](entryAddr + 10)[]
-    printf(" sub=%d", cast[pointer](subType.uint))
-    # Dump formatted value
-    let valueStorage = cast[ptr pointer](entryAddr + 16)[]
-    let typeVal = cast[ptr uint8](entryAddr + 10)[]
-    let typeName = cfg_api_element_dump(valueStorage, typeVal.uint32,
-                                       cast[pointer](addr formattedValueBuffer[0]))
-    printf(" [%s]", cast[pointer](addr formattedValueBuffer[0]))
-    if typeName != nil:
-      printf("    type    : %s\r\n", typeName)
-    # Separator
-    puts("")
-  # Print footer
-  puts("--- end cfg ---")
+  type PrintFn = proc(format: cstring) {.cdecl, varargs.}
+  template putLine(text: cstring) =
+    let output = cast[PutsFn](blOpsFunc(8))
+    if output != nil: output(text)
+  template print(format: cstring; args: varargs[untyped]) =
+    let output = cast[PrintFn](blOpsFunc(4))
+    if output != nil: output(format, args)
+  putLine("================= CFG TASK =================\r\n")
+  var formattedValueBuffer: array[16, char]
+  for entry in cfgApiEntries.mitems:
+    print("entry %p\r\n", addr entry)
+    print("    task    : %lu\r\n", entry.id.culong)
+    print("    element : %u\r\n", entry.subId.cuint)
+    print("    type    : %u\r\n", entry.typeId.cuint)
+    print("    name    : %s\r\n", cast[cstring](entry.name))
+    let typeOutput = cast[PrintFn](blOpsFunc(4))
+    formattedValueBuffer[0] = '\0'
+    let typeName = if entry.valueStorage != nil:
+      cast[cstring](cfg_api_element_dump(entry.valueStorage,
+        (entry.typeId and 255).uint32, addr formattedValueBuffer[0]))
+      else: nil
+    if typeOutput != nil:
+      typeOutput("    type    : %s\r\n", if typeName != nil: typeName else: cstring("(null)"))
+    print("    val     : %s\r\n", cast[cstring](addr formattedValueBuffer[0]))
+    putLine("------------------------\r\n")
+  putLine("---------------------------------------------\r\n")

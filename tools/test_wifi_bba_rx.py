@@ -3,6 +3,7 @@
 from pathlib import Path
 import shutil
 import subprocess
+import re
 
 import pytest
 
@@ -93,11 +94,15 @@ proc reset() =
 def source(*, sample_loop: bool = False) -> str:
     rf = (FW / "global_state/rf_bl808_core.nim").read_text()
     code = object_type(rf, "BbaRuntimeState") + object_type(rf, "BbaRxVectorView")
-    code += "const\n" + "\n".join(
-        line for line in rf.splitlines() if line.startswith("  BbaPdThreshold")) + "\n"
+    for name in ("BbaPdThresholdAttack", "BbaPdThresholdRelease"):
+        match = re.search(rf"^  {name}.*?\[[^\n]*?\]\s*$", rf, re.M | re.S)
+        assert match
+        code += ("var\n" if 'exportc: "pd_th_att"' in rf else "const\n") + match[0] + "\n"
     code += PLATFORM
-    for name in ["signExtend", "bbaExtractBits", "bbaSetPdLatch", "bbaUpdatePdComp",
+    for name in ["signExtend", "bbaExtractBits", "bbaProgramPdLatchRegs", "bbaSetPdLatch", "bbaUpdatePdComp",
                  "bbaRxFormatWord1", "calc_ppm", "bba_rssi_correction"]:
+        if name == "bbaProgramPdLatchRegs" and f"proc {name}(" not in rf:
+            continue
         code += implementation(rf, name)
     if sample_loop:
         code += "proc bbaRunPowerDetectLoop(rssi: int32) = detectorSamples.add(rssi)\n"

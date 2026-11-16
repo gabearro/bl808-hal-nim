@@ -357,7 +357,9 @@ def test_tx_backup_drain(tmp_path: Path, trace: bool) -> None:
     )[1].split("\nproc cfm_raw_send*", 1)[0]
     from test_wifi_disconnect_tx import procedure
     enqueue = procedure(tx, "txlEnqueuePrepared")
-    all_procedures = handler + fake_transfer + ALLOCATOR + thd_builder + enqueue + lower_push
+    payload_length = procedure((ROOT / "src/bl808/wifi/fw/layout_types.nim").read_text(),
+                               "txPayloadChainLength")
+    all_procedures = payload_length + handler + fake_transfer + ALLOCATOR + thd_builder + enqueue + lower_push
     debug_types = {"nimFwDbgProbePayRaw": "array[64, uint8]"}
     debug_names = set(re.findall(r"\bnimFwDbg\w+", all_procedures))
     debug_names.remove("nimFwDbgDhcpTxFinalBreakpoint")

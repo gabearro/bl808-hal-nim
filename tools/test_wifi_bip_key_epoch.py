@@ -7,7 +7,7 @@ import pytest
 from test_wifi_auth_frames import layouts
 from test_wifi_disconnect_tx import FW, procedure
 from test_wifi_message_allocation import run_program
-from test_wifi_mfp_control import PLATFORM
+from test_wifi_mfp_control import PLATFORM, RX_CONTEXT, RX_MIC_MODEL
 
 
 def source() -> str:
@@ -51,6 +51,7 @@ proc rxl_timer_int_handler() = discard
     upper = (FW / "rx_upper.nim").read_text()
     code += procedure(upper, "rxKeyChange") + procedure(upper, "rxKeyCurrent")
     code += procedure((FW / "kernel_mac_channel.nim").read_text(), "mfp_is_robust_frame")
+    code += RX_CONTEXT + RX_MIC_MODEL
     policy = (FW / "crypto_mfp_hsu.nim").read_text()
     if "proc mfpIgnoreRxMgmtFrame(" in policy:
         code += procedure(policy, "mfpIgnoreRxMgmtFrame")
@@ -87,6 +88,8 @@ proc setup(vif, slot: int; enabled: bool) =
   computedMic = 0x0123456789ABCDEF'u64
   policyEnv = MfpMgmtFramePolicyView(frameCtrl: 0xC0, bodyOffset: 24,
                                     staIdx: 0, vifIdx: vif.uint8, flags: 1)
+  mfpRxHeader = RxSwDescView(mpduLengthBytes: 44)
+  mfpRxFrame = addr frame[0]
   let mmie = mmieAt(addr frame[26])
   mmie[] = MmIeView(ie: Ie(id: 76, len: 16), keyId: slot.uint16)
   mmie.ipn[0] = 3
@@ -98,7 +101,7 @@ proc receive(legacy = false): bool =
     mfp_ignore_mgmt_frame(addr policyEnv, addr frame[0], 44, addr upload, addr flags)
   else:
     mfpIgnoreRxMgmtFrame(addr descriptor, addr policyEnv, addr frame[0],
-                        44, addr upload, addr flags)
+                        44, addr upload, addr flags, rxUploadGeneration(addr descriptor))
 '''
 
 

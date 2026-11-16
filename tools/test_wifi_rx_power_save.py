@@ -198,6 +198,29 @@ proc expectedTrigger(traffic, mask, tid, budget: uint8; service, sent: uint32;
     result.service = 0
 """
 
+RX_IDENTITY_MODELS = r"""
+# This fixture retains its descriptors without recycling them during callbacks.
+type RxFrameIdentity = object
+  generation: uint32
+
+proc rxUploadGeneration(p: pointer): uint32 = 1
+proc rxUploadCurrent(p: pointer; generation: uint32): bool =
+  p != nil and generation == 1
+proc rxCaptureFrame(p: pointer): RxFrameIdentity =
+  doAssert p != nil
+  RxFrameIdentity(generation: 1)
+proc rxFrameCurrent(identity: RxFrameIdentity): bool = identity.generation == 1
+proc rxReleaseUpload(p: pointer; generation: uint32) =
+  doAssert rxUploadCurrent(p, generation)
+  rxl_mpdu_free(p)
+proc rxReleaseControlFrame(p: pointer; generation: uint32;
+                          header: ptr RxSwDescView; buffer: pointer) =
+  doAssert rxUploadCurrent(p, generation)
+  doAssert header == rxSwDescView(rxMpduDescView(p).swDesc)
+  doAssert header.bufferChain == buffer
+  rxl_mpdu_free(p)
+"""
+
 CHECKS = r"""
 static:
   doAssert MM_PS_CHANGE_IND == 55 and MM_TRAFFIC_REQ_IND == 56
@@ -242,7 +265,7 @@ for vifType in 0'u8 .. 3'u8:
         reset()
         vifs[1] = VifChannelView(vifIdx: 1, vifType: vifType, psBaCounter: count)
         stas[4].psMode = asleep.uint8
-        var header = MacDataFrameHeaderView(frameControl: fc)
+        var header = MacQosDataFrameHeaderView(header: MacDataFrameHeaderView(frameControl: fc))
         rxlHandleApPowerSave(addr vifs[1], addr stas[4], 4, addr header)
         var expected: seq[Action]
         var expectedCount = count
@@ -339,7 +362,7 @@ for changed in [0'u32, 1]:
   beaconResult = changed
   env.queue = CoList(first: addr packet.link, last: addr packet.link)
   rxl_cntrl_evt()
-  var expected: seq[Action] = @[("td", 1'u32, 4'u32, 1'u32), ("beacon", 0'u32, 0'u32, 0'u32),
+  var expected: seq[Action] = @[("td", 0'u32, 4'u32, 1'u32), ("beacon", 0'u32, 0'u32, 0'u32),
     ("beacon-ps", 0'u32, 0'u32, 0'u32), ("beacon-vif", 0'u32, 0'u32, 0'u32), ("tbtt", 0'u32, 0'u32, 0'u32)]
   if changed != 0: expected.add(("upper", 0'u32, 0'u32, 0'u32))
   expected.add(("free", 0'u32, 0'u32, 0'u32))
@@ -444,7 +467,7 @@ def test_rx_power_save_and_ownership(tmp_path: Path) -> None:
     # Types must precede the host helper declarations that reference them.
     platform = PLATFORM.replace("import bl808/wifi/fw_messages", "import bl808/wifi/fw_messages\n" + types + constants)
     source = tmp_path / "rx_power_save_test.nim"
-    source.write_text(platform + tables + debug + ps_helpers + ps_change + procedures + CHECKS)
+    source.write_text(platform + RX_IDENTITY_MODELS + tables + debug + ps_helpers + ps_change + procedures + CHECKS)
     result = subprocess.run(
         [nim, "c", "-r", "--skipParentCfg:on", "--skipProjCfg:on", "--skipUserCfg:on",
          f"--path:{ROOT / 'src'}", "--checks:on", f"--nimcache:{tmp_path / 'nimcache'}",

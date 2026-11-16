@@ -264,6 +264,14 @@ proc ps_check_frame*(rxHdr: pointer, frameFlags: uint32, vifEntry: pointer) {.ex
   # Load frame control from rxHdr
   let hdr = macDataFrameAt(rxHdr)
   let frameCtrl = hdr.frameControl
+  let qosTid =
+    if (frameCtrl and 0x008C'u16) != 0x0088'u16: 0'u16
+    elif (frameCtrl and 0x0300'u16) == 0x0300'u16:
+      macQos4AddrFrameAt(rxHdr).qosCtrl
+    else:
+      macQosDataFrameAt(rxHdr).qosCtrl
+  if (qosTid and 0x0F'u16) >= 8:
+    return
 
   # Check Addr1 group bit (bit 0 of rxHdr[4])
   let addr1Group = hdr.addr1[0] and 1'u8
@@ -282,13 +290,8 @@ proc ps_check_frame*(rxHdr: pointer, frameFlags: uint32, vifEntry: pointer) {.ex
 
   var psActive = ps.psActive
   if psActive != 0:
-    if (frameCtrl and 0x0088'u16) == 0x0088'u16:
-      let qosTid =
-        if (frameCtrl and 0x0300'u16) == 0x0300'u16:
-          macQos4AddrFrameAt(rxHdr).qosCtrl
-        else:
-          macQosDataFrameAt(rxHdr).qosCtrl
-      let tid = (qosTid and 7).uint8
+    if (frameCtrl and 0x008C'u16) == 0x0088'u16:
+      let tid = (qosTid and 0x0F).uint8
       let ac = psTxTidToAc(tid)
       let acBit = (vif.uapsdBitmap.uint32 shr ac.uint32) and 1
       if acBit != 0:

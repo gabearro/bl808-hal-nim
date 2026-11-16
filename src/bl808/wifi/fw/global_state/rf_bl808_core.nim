@@ -398,13 +398,16 @@ type
     temperaturePowerComp: uint8
     temperaturePowerCompPadding: uint16
     efuseTrimControl: uint32
-    efuseTxGainComp: uint8
+    efuseChipVersion: uint8
     efuseXtalCapCode0: uint8
     efuseXtalCapCode1: uint8
     efuseDfeTrim: uint8
     paramLoadCallback: pointer
     capcodeSetCallback: pointer
     capcodeGetCallback: pointer
+
+  WlCapcodeSetCb = proc(cap0, cap1: uint8) {.cdecl.}
+  WlCapcodeGetCb = proc(cap0, cap1: ptr uint8) {.cdecl.}
 
   WlRfMemoryOverlay {.packed.} = object
     config: WlRfConfig
@@ -688,7 +691,7 @@ static:
   doAssert offsetof(WlRfConfig, temperaturePowerComp) == 189
   doAssert offsetof(WlRfConfig, temperaturePowerCompPadding) == 190
   doAssert offsetof(WlRfConfig, efuseTrimControl) == 192
-  doAssert offsetof(WlRfConfig, efuseTxGainComp) == 196
+  doAssert offsetof(WlRfConfig, efuseChipVersion) == 196
   doAssert offsetof(WlRfConfig, efuseXtalCapCode0) == 197
   doAssert offsetof(WlRfConfig, efuseXtalCapCode1) == 198
   doAssert offsetof(WlRfConfig, efuseDfeTrim) == 199
@@ -728,8 +731,6 @@ const
   WlRfConfigMagic = 0x0000ACDE'u32
   WlRfCfgRxcalA8Offset = 0xA8
   WlRfCfgRxcalAcOffset = 0xAC
-  WlRfCfgWb03RxcalA8Default = 0x00001825'u32
-  WlRfCfgWb03RxcalAcDefault = 0x000003F7'u32
   WlRfCfgPower11bOffset = 0x32
   WlRfCfgPower11gOffset = 0x36
   WlRfCfgPower11n20Offset = 0x3E
@@ -1033,11 +1034,6 @@ const
     0x023F'u16, 0x0285'u16, 0x02D4'u16, 0x032C'u16, 0x038F'u16,
     0x03FF'u16
   ]
-  PhyRxGainTable: array[9, int8] = [
-    0x08'i8, 0x0F'i8, 0x16'i8, 0x1D'i8, 0x23'i8,
-    0x2A'i8, 0x30'i8, 0x36'i8, 0x3C'i8
-  ]
-
   RfcXtalConfigTable: array[6, RfcXtalConfig] = [
     ## librf_bl808.a:rfc.c.o .rodata.rfc_xtal_cfg, indexed by xtalIndex().
     RfcXtalConfig(xtalHz: WlXtal24M,
@@ -1379,15 +1375,19 @@ var agcmem* {.exportc: "agcmem".}: array[512, uint32] = [
   0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0x00000000'u32, 0xC0088D03'u32]
 
 var bbaEnv* {.align: 4, exportc: "bba_env".}: BbaRuntimeState
-const
-  BbaPdThresholdAttack: array[4, int8] = [-100'i8, -70'i8, -48'i8, -36'i8]
-  BbaPdThresholdRelease: array[4, int8] = [-100'i8, -75'i8, -53'i8, -41'i8]
+# Bare-metal startup skips NimMain; this address must be present in .data.
+var bbaRuntimeGlobal* {.exportc: "bba", codegenDecl: "$# $# = &bba_env".}: ptr BbaRuntimeState
+var
+  BbaPdThresholdAttack* {.exportc: "pd_th_att".}: array[4, int8] =
+    [-100'i8, -70'i8, -48'i8, -36'i8]
+  BbaPdThresholdRelease* {.exportc: "pd_th_rls".}: array[4, int8] =
+    [-100'i8, -75'i8, -53'i8, -41'i8]
 
 var wlCfgGlobal* {.exportc: "wl_cfg".}: pointer
-var phy_env* {.exportc.}: array[48, uint8]
+var phy_env* {.align: 4, exportc.}: array[48, uint8]
 
 template bbaState(): ptr BbaRuntimeState =
-  addr bbaEnv
+  volatileLoad(addr bbaRuntimeGlobal)
 
 template bbaRxVecPtr(rxVector: pointer): ptr BbaRxVectorView =
   cast[ptr BbaRxVectorView](rxVector)
@@ -1445,8 +1445,10 @@ proc bbaExtractBits(value: uint32, high, low: uint32): uint32 {.inline.} =
   (value shr low) and ((1'u32 shl (high - low + 1'u32)) - 1'u32)
 
 proc bbaSetPdLatch(enable: bool)
+proc bbaProgramPdLatchRegs(enable: bool)
 proc bba_set_pd_ofdm*(enable: uint32) {.exportc, cdecl.}
 proc bba_set_pd_dsss*(enable: uint32) {.exportc, cdecl.}
+proc bba_set_pd_mile*(enable: uint32) {.exportc, cdecl.}
 proc bbaApplyCarrierErrorCapcode()
 proc bbaRunCarrierErrorLoop(rssi: int32, ppm: int32)
 proc bbaRunPowerDetectLoop(rssi: int32)
@@ -1514,23 +1516,24 @@ proc bba_set_pd_state*(state: uint32) {.exportc, cdecl.} =
   ## Vendor masks MSTATUS.MIE while coordinating OFDM/DSSS detect gates,
   ## MILE comparator latch state, and the active PD gain profile.
   let saved = bbaIrqSave()
-  let oldState = volatileLoad(addr bbaState().pdRssiState).uint32
 
   if state == 0'u32:
     bba_set_pd_ofdm(1'u32)
     bba_set_pd_dsss(1'u32)
+    let oldState = volatileLoad(addr bbaState().pdRssiState).uint32
     if oldState == 4'u32:
-      bbaSetPdLatch(false)
+      bba_set_pd_mile(0'u32)
   else:
+    let oldState = volatileLoad(addr bbaState().pdRssiState).uint32
     if oldState == 0'u32:
       bba_set_pd_ofdm(0'u32)
       bba_set_pd_dsss(0'u32)
       if state == 4'u32:
-        bbaSetPdLatch(true)
+        bba_set_pd_mile(1'u32)
     elif state == 4'u32:
-      bbaSetPdLatch(true)
+      bba_set_pd_mile(1'u32)
     elif oldState == 4'u32:
-      bbaSetPdLatch(false)
+      bba_set_pd_mile(0'u32)
 
   case state
   of 2'u32:
@@ -1573,7 +1576,9 @@ proc bba_set_pd_rssi*(rssiThreshold: uint32) {.exportc, cdecl.} =
 
 proc bba_set_pd_mile*(enable: uint32) {.exportc, cdecl.} =
   ## Port of librf_bl808.a:bba.c.o bba_set_pd_mile+0x0..0x4e.
-  bbaSetPdLatch(enable != 0'u32)
+  let active = enable != 0'u32
+  volatileStore(addr bbaState().pdCompLatch, active.uint8)
+  bbaProgramPdLatchRegs(active)
 
 proc bba_get_pd_cfg*(ofdmOut, dsssOut, rssiOut: pointer) {.exportc, cdecl.} =
   ## Port of librf_bl808.a:bba.c.o bba_get_pd_cfg+0x0..0x2a.
@@ -1583,7 +1588,7 @@ proc bba_get_pd_cfg*(ofdmOut, dsssOut, rssiOut: pointer) {.exportc, cdecl.} =
       uint8((volatileLoad(addr bba.pdGain390) shr 4) and 0x0F'u32)
   if dsssOut != nil:
     cast[ptr uint8](dsssOut)[] =
-      uint8((volatileLoad(addr bba.pdCompC830) shr 20) and 0x0F'u32)
+      uint8((volatileLoad(addr bba.pdCompC830) shr 20) and 0x3F'u32)
   if rssiOut != nil:
     cast[ptr uint8](rssiOut)[] =
       uint8((volatileLoad(addr bba.pdSlope3c0) shr 8) and 0xFF'u32)
@@ -1592,11 +1597,16 @@ proc bba_pd_reset*() {.exportc, cdecl.} =
   ## librf_bl808.a:bba.c.o bba_pd_reset is ret-only.
   discard
 
+proc bbaResetCeUpdatePeriod(interval: uint8) {.inline.} =
+  ## The vendor publishes interval/count together with one halfword store.
+  static: doAssert offsetof(BbaRuntimeState, ceUpdateCount) ==
+    offsetof(BbaRuntimeState, ceUpdateInterval) + 1
+  volatileStore(cast[ptr uint16](addr bbaState().ceUpdateInterval), interval.uint16)
+
 proc bba_ce_reset*() {.exportc, cdecl.} =
   ## Port of librf_bl808.a:bba.c.o bba_ce_reset+0x0..0x12.
   volatileStore(addr bbaState().cePpmAccumulator, 0'u16)
-  volatileStore(addr bbaState().ceUpdateInterval, 16'u8)
-  volatileStore(addr bbaState().ceUpdateCount, 0'u8)
+  bbaResetCeUpdatePeriod(16'u8)
 
 proc bba_ce_update_capcode*() {.exportc, cdecl.} =
   ## Public ABI wrapper for librf_bl808.a:bba.c.o
@@ -1616,8 +1626,7 @@ proc bba_init() {.exportc, cdecl.} =
   let bba = bbaAgcRegs()
   let rf = rfRegs()
   volatileStore(addr bbaState().pdCompCurrent, 1'u8)
-  volatileStore(addr bbaState().ceUpdateInterval, 10'u8)
-  volatileStore(addr bbaState().ceUpdateCount, 0'u8)
+  bbaResetCeUpdatePeriod(10'u8)
   volatileStore(addr bbaState().ceLoopScratch0, 0'u32)
   volatileStore(addr bbaState().ceLoopScratch4, 0'u32)
   volatileStore(addr bbaState().pdRssiState, 0'u8)
@@ -1635,12 +1644,9 @@ proc bba_reset() {.exportc, cdecl.} =
   ## Port of librf_bl808.a:bba.c.o bba_reset+0x0..0x8a.
   let bba = bbaAgcRegs()
   let rf = rfRegs()
-  volatileStore(addr bbaState().pdRssiState, 0'u8)
-  volatileStore(addr bbaState().pdGainCode, 0'u8)
-  volatileStore(addr bbaState().pdCompCurrent, 1'u8)
-  volatileStore(addr bbaState().pdCompLatch, 0'u8)
-  volatileStore(addr bbaState().ceUpdateInterval, 10'u8)
-  volatileStore(addr bbaState().ceUpdateCount, 0'u8)
+  # The four adjacent PD state bytes are published atomically by the vendor.
+  volatileStore(cast[ptr uint32](addr bbaState().pdRssiState), 0x00010000'u32)
+  bbaResetCeUpdatePeriod(10'u8)
   volatileStore(addr bbaState().ceLoopScratch0, 0'u32)
   volatileStore(addr bbaState().ceLoopScratch4, 0'u32)
   volatileStore(addr bbaState().pdLoopToCeAccumulatorPadding0, 0'u8)
@@ -1653,16 +1659,19 @@ proc bba_reset() {.exportc, cdecl.} =
   updateReg32(addr rf.pdCompLatchCtrl50c, 0xFFFFFEFF'u32, 0'u32)
   updateReg32(addr rf.pdCompLatchCtrl50c, 0xFFFFFDFF'u32, 0'u32)
 
-proc bbaSetPdLatch(enable: bool) =
+proc bbaProgramPdLatchRegs(enable: bool) =
   let rf = rfRegs()
   if enable:
     updateReg32(addr rf.pdCompLatchCtrl50c, 0xFFFFFFFF'u32, 0x00000100'u32)
     updateReg32(addr rf.pdCompLatchCtrl50c, 0xFFFFFDFF'u32, 0'u32)
-    volatileStore(addr bbaState().pdCompLatch, 1'u8)
   else:
     updateReg32(addr rf.pdCompLatchCtrl50c, 0xFFFFFEFF'u32, 0'u32)
     updateReg32(addr rf.pdCompLatchCtrl50c, 0xFFFFFDFF'u32, 0'u32)
-    volatileStore(addr bbaState().pdCompLatch, 0'u8)
+
+proc bbaSetPdLatch(enable: bool) =
+  ## The detector loop publishes its latch after MMIO; public setters do not.
+  bbaProgramPdLatchRegs(enable)
+  volatileStore(addr bbaState().pdCompLatch, enable.uint8)
 
 proc bbaUpdatePdComp(target: uint8) =
   if volatileLoad(addr bbaState().pdCompCurrent) == target:
@@ -1674,19 +1683,17 @@ proc bbaUpdatePdComp(target: uint8) =
 
 proc bbaApplyCarrierErrorCapcode() =
   ## Port of bba_ce_update_capcode+0x0..0x9e, using wl_cfg capcode callbacks.
-  if wlCfgGlobal == nil:
+  var cfg = cast[ptr WlRfConfig](wlCfgGlobal)
+  if cfg == nil or cfg.capcodeGetCallback == nil:
     return
+  var capcode: uint8
+  var capcodeAux: uint8
+  cast[WlCapcodeGetCb](cfg.capcodeGetCallback)(
+    addr capcode, addr capcodeAux)
   let carrierErrorPpmOffset = signExtend(
     volatileLoad(addr bbaState().cePpmAccumulator).uint32, 16'u32)
   if carrierErrorPpmOffset == 0'i32:
     return
-  let cfg = cast[ptr WlRfConfig](wlCfgGlobal)
-  if cfg.capcodeGetCallback == nil or cfg.capcodeSetCallback == nil:
-    return
-  var capcode: uint8
-  var capcodeAux: uint8
-  cast[proc(a: ptr uint8, b: ptr uint8) {.cdecl.}](cfg.capcodeGetCallback)(
-    addr capcode, addr capcodeAux)
   var adjustedCapcode = capcode
   if carrierErrorPpmOffset > 0'i32:
     if capcode == 0'u8:
@@ -1700,13 +1707,18 @@ proc bbaApplyCarrierErrorCapcode() =
     adjustedCapcode = capcode + 1'u8
     if adjustedCapcode == capcode:
       return
-  cast[proc(a: uint8) {.cdecl.}](cfg.capcodeSetCallback)(adjustedCapcode)
-  volatileStore(addr bbaState().cePpmAccumulator, 0'u16)
-  volatileStore(addr bbaState().ceCapcodeHoldoff, 1'u8)
+  let saved = bbaIrqSave()
+  cfg = cast[ptr WlRfConfig](wlCfgGlobal)
+  if cfg != nil and cfg.capcodeSetCallback != nil:
+    cast[WlCapcodeSetCb](cfg.capcodeSetCallback)(adjustedCapcode, adjustedCapcode)
+    volatileStore(addr bbaState().cePpmAccumulator, 0'u16)
+    volatileStore(addr bbaState().ceCapcodeHoldoff, 1'u8)
+  bbaIrqRestore(saved)
 
 proc bbaRunCarrierErrorLoop(rssi: int32, ppm: int32) =
   ## Port of librf_bl808.a:bba.c.o bba_ce_loop+0x0..0xae.
-  let ppm6 = signExtend(uint32((ppm shl 6) and 0xFFFF'i32), 16'u32)
+  let ppmWord = cast[uint32](ppm) and 0xFFFF'u32
+  let ppm6 = signExtend((ppmWord shl 6) and 0xFFFF'u32, 16'u32)
   if volatileLoad(addr bbaState().ceCapcodeHoldoff) == 1'u8:
     let count = volatileLoad(addr bbaState().ceUpdateCount)
     if count < volatileLoad(addr bbaState().ceUpdateInterval):
@@ -1721,9 +1733,9 @@ proc bbaRunCarrierErrorLoop(rssi: int32, ppm: int32) =
     if rssi < -85'i32:
       accum += ppm6
     elif rssi < -65'i32:
-      accum += ppm shl 7
+      accum += int32(ppmWord shl 7)
     else:
-      accum += ppm shl 8
+      accum += int32(ppmWord shl 8)
     volatileStore(
       addr bbaState().cePpmAccumulator, uint16(accum and 0xFFFF'i32))
 
@@ -2086,32 +2098,43 @@ proc bl808PhyProgramAgcCoreRegs() =
   updateReg32(addr bba.macActiveB3bc, 0x00000000'u32, 0x001E8480'u32)
   updateReg32(addr bba.agcCoreTimeout414, 0xFFFFFFFF'u32, 0x00000100'u32)
 
+var phyRxGainTable* {.exportc: "rxgain".}: array[9, int8] = [
+  ## librf_bl808.a:phy.c.o .data.rxgain is writable, nine signed bytes.
+  14'i8, 19'i8, 26'i8, 32'i8, 38'i8, 45'i8, 50'i8, 57'i8, 63'i8
+]
+
 var phyRxGainOffsetVsTemperature = -128'i8
 
 proc phyRxGainByte(index: int, offset: int8): uint32 {.inline.} =
-  uint8(int16(PhyRxGainTable[index]) + int16(offset)).uint32
+  uint8(int16(volatileLoad(addr phyRxGainTable[index])) + int16(offset)).uint32
 
-proc rc2_config_rxgain*(offset: int8) {.exportc, cdecl.} =
+proc rc2_config_rxgain*(offset: int32) {.exportc, cdecl.} =
   ## Port of librf_bl808.a:phy.c.o rc2_config_rxgain.
-  ## Vendor phy_init calls this with offset 0 after AGC core programming.
-  if phyRxGainOffsetVsTemperature == offset:
+  ## Compare the full ABI word before narrowing the cached signed byte;
+  ## preserve the nine ordered read/modify/write operations.
+  if volatileLoad(addr phyRxGainOffsetVsTemperature).int32 == offset:
     return
-  phyRxGainOffsetVsTemperature = offset
+  let narrowedOffset = cast[int8](offset.uint8)
+  volatileStore(addr phyRxGainOffsetVsTemperature, narrowedOffset)
   let mdm = wifiModemRegs()
-  updateReg32(addr mdm.rxGainTable0C080,
-              0x00000000'u32,
-              phyRxGainByte(0, offset) or
-              (phyRxGainByte(1, offset) shl 8) or
-              (phyRxGainByte(2, offset) shl 16) or
-              (phyRxGainByte(3, offset) shl 24))
-  updateReg32(addr mdm.rxGainTable1C084,
-              0x00000000'u32,
-              phyRxGainByte(4, offset) or
-              (phyRxGainByte(5, offset) shl 8) or
-              (phyRxGainByte(6, offset) shl 16) or
-              (phyRxGainByte(7, offset) shl 24))
+  updateReg32(addr mdm.rxGainTable0C080, 0xFFFFFF00'u32,
+              phyRxGainByte(0, narrowedOffset))
+  updateReg32(addr mdm.rxGainTable0C080, 0xFFFF00FF'u32,
+              phyRxGainByte(1, volatileLoad(addr phyRxGainOffsetVsTemperature)) shl 8)
+  updateReg32(addr mdm.rxGainTable0C080, 0xFF00FFFF'u32,
+              phyRxGainByte(2, volatileLoad(addr phyRxGainOffsetVsTemperature)) shl 16)
+  updateReg32(addr mdm.rxGainTable0C080, 0x00FFFFFF'u32,
+              phyRxGainByte(3, volatileLoad(addr phyRxGainOffsetVsTemperature)) shl 24)
+  updateReg32(addr mdm.rxGainTable1C084, 0xFFFFFF00'u32,
+              phyRxGainByte(4, volatileLoad(addr phyRxGainOffsetVsTemperature)))
+  updateReg32(addr mdm.rxGainTable1C084, 0xFFFF00FF'u32,
+              phyRxGainByte(5, volatileLoad(addr phyRxGainOffsetVsTemperature)) shl 8)
+  updateReg32(addr mdm.rxGainTable1C084, 0xFF00FFFF'u32,
+              phyRxGainByte(6, volatileLoad(addr phyRxGainOffsetVsTemperature)) shl 16)
+  updateReg32(addr mdm.rxGainTable1C084, 0x00FFFFFF'u32,
+              phyRxGainByte(7, volatileLoad(addr phyRxGainOffsetVsTemperature)) shl 24)
   updateReg32(addr mdm.rxGainTable2C088, 0xFFFFFF00'u32,
-              phyRxGainByte(8, offset))
+              phyRxGainByte(8, volatileLoad(addr phyRxGainOffsetVsTemperature)))
 
 proc bl808PhyProgramRxTailRegs() =
   ## phy_init+0x942..0x964: final receive-path RF/AGC writes after
@@ -2216,10 +2239,11 @@ proc phy_get_channel_raw*(info: pointer, index: uint8)
     return
   let dst = cast[ptr UncheckedArray[uint32]](info)
   let env = phyEnvViewPtr()
-  dst[0] = volatileLoad(addr env.channelBandType).uint32 or
-    (volatileLoad(addr env.primaryFreq).uint32 shl 16)
-  dst[1] = volatileLoad(addr env.centerFreq1).uint32 or
-    (volatileLoad(addr env.centerFreq2).uint32 shl 16)
+  # The aligned backing store and asserted field offsets permit word snapshots.
+  let primary = volatileLoad(cast[ptr uint32](addr env.channelBandType))
+  let center = volatileLoad(cast[ptr uint32](addr env.centerFreq1))
+  dst[0] = primary
+  dst[1] = center
 
 proc phy_get_ntx*(): uint8 {.exportc, cdecl.} =
   (((modemVersionReg() shr 4) and 0xF'u32) - 1'u32).uint8
@@ -2236,10 +2260,10 @@ proc phy_get_bw*(): uint8 {.exportc, cdecl.} =
 proc phy_vht_supported*(): bool {.exportc, cdecl.} =
   ## Port of librf_bl808.a:phy.c.o phy_vht_supported+0x0..0x1a.
   ## Vendor returns true when modem-version bit 22 is set, or when the
-  ## modem bandwidth capability field at bits [25:24] is nonzero.
-  let version = modemVersionReg()
-  ((version shr 22) and 1'u32) != 0'u32 or
-    ((version shr 24) and 0x3'u32) != 0'u32
+  ## modem bandwidth capability field at bits [25:24] is nonzero on a
+  ## second read. The second read is skipped when bit 22 is set.
+  ((modemVersionReg() shr 22) and 1'u32) != 0'u32 or
+    ((modemVersionReg() shr 24) and 0x3'u32) != 0'u32
 
 proc phy_he_supported*(): bool {.exportc, cdecl.} =
   (modemVersionReg() and (1'u32 shl 21)) != 0
@@ -2277,9 +2301,10 @@ proc phy_get_rf_gain_idx*(txPowerElem: pointer, rateParam: pointer)
   var power = cast[ptr int8](txPowerElem)[]
   if power > 22'i8:
     power = 22'i8
+    cast[ptr int8](txPowerElem)[] = power
   elif power < -10'i8:
     power = -10'i8
-  cast[ptr int8](txPowerElem)[] = power
+    cast[ptr int8](txPowerElem)[] = power
   cast[ptr uint8](rateParam)[] = cast[uint8](power)
 
 proc phy_get_rf_gain_capab*(maxGain: pointer, minGain: pointer)
@@ -2446,9 +2471,9 @@ template wlLowPowerStatusEnv(): ptr WlLowPowerStatusEnv =
 var trpcTxpwrVsRateTable* {.exportc: "txpwr_vs_rate_table".}: array[50, uint8] = [
   0x15'u8, 0x15'u8, 0x15'u8, 0x15'u8, 0x00'u8, 0x00'u8, 0x00'u8, 0x00'u8, 0x00'u8, 0x00'u8,
   0x14'u8, 0x14'u8, 0x14'u8, 0x14'u8, 0x14'u8, 0x14'u8, 0x12'u8, 0x12'u8, 0x00'u8, 0x00'u8,
-  0x14'u8, 0x14'u8, 0x14'u8, 0x14'u8, 0x13'u8, 0x13'u8, 0x11'u8, 0x11'u8, 0x00'u8, 0x00'u8,
+  0x14'u8, 0x14'u8, 0x14'u8, 0x14'u8, 0x14'u8, 0x13'u8, 0x11'u8, 0x11'u8, 0x00'u8, 0x00'u8,
   0x12'u8, 0x12'u8, 0x12'u8, 0x12'u8, 0x12'u8, 0x10'u8, 0x10'u8, 0x10'u8, 0x10'u8, 0x10'u8,
-  0x14'u8, 0x14'u8, 0x14'u8, 0x14'u8, 0x13'u8, 0x13'u8, 0x11'u8, 0x11'u8, 0x0F'u8, 0x0F'u8]
+  0x14'u8, 0x14'u8, 0x14'u8, 0x14'u8, 0x14'u8, 0x13'u8, 0x11'u8, 0x11'u8, 0x0F'u8, 0x0F'u8]
 var trpcEnv* {.align: 4, exportc: "trpc_env".}: array[2, uint32]
 
 proc trpcCopyTable(dstOffset: int, src: pointer, count: int) =
@@ -2542,32 +2567,22 @@ proc trpc_get_power_idx(powerTable: pointer, rateType: uint32, powerIdx: uint8):
   discard rateType
   cast[int8]((powerIdx shl 2) and 0xFC'u8)
 
-proc wlCfgSetU32(offset: int, value: uint32) =
-  if wlCfgGlobal == nil:
+proc wlCfgSetBytes(cfg: ptr WlRfConfig; offset: int, value: uint8, count: int) =
+  if cfg == nil:
     return
-  let bytes = cast[ptr UncheckedArray[uint8]](wlCfgGlobal)
-  bytes[offset] = uint8(value and 0xFF'u32)
-  bytes[offset + 1] = uint8((value shr 8) and 0xFF'u32)
-  bytes[offset + 2] = uint8((value shr 16) and 0xFF'u32)
-  bytes[offset + 3] = uint8((value shr 24) and 0xFF'u32)
-
-proc wlCfgSetBytes(offset: int, value: uint8, count: int) =
-  if wlCfgGlobal == nil:
-    return
-  let bytes = cast[ptr UncheckedArray[uint8]](wlCfgGlobal)
+  let bytes = cast[ptr UncheckedArray[uint8]](cfg)
   for cfgByteOffset in 0 ..< count:
     bytes[offset + cfgByteOffset] = value
 
-proc seedWlCfgTxPowerDefaults() =
-  ## These rows are the vendor wl_cfg backing store that trpcLoadPowerFromConfig()
-  ## copies into txpwr_vs_rate_table. A zeroed wl_cfg makes internal auth
-  ## frames inherit TX power 0, while the vendor backend seeds 0x1c -> 0x70.
-  wlCfgSetBytes(WlRfCfgPower11bOffset, WlRfCfgDefaultRatePower, 4)
-  wlCfgSetBytes(WlRfCfgPower11gOffset, WlRfCfgDefaultRatePower, 8)
-  wlCfgSetBytes(WlRfCfgPower11n20Offset, WlRfCfgDefaultRatePower, 8)
-  wlCfgSetBytes(WlRfCfgPower11nAltOffset, WlRfCfgDefaultRatePower, 8)
-  wlCfgSetBytes(WlRfCfgPower11ac20Offset, WlRfCfgDefaultRatePower, 10)
-  wlCfgSetBytes(WlRfCfgPower11acAltOffset, WlRfCfgDefaultRatePower, 10)
+proc seedWlCfgTxPowerDefaults(cfg: ptr WlRfConfig) =
+  ## Standalone platform profile. The vendor RF configurator leaves these
+  ## caller-owned rate bytes unchanged; TRPC copies them into its live table.
+  wlCfgSetBytes(cfg, WlRfCfgPower11bOffset, WlRfCfgDefaultRatePower, 4)
+  wlCfgSetBytes(cfg, WlRfCfgPower11gOffset, WlRfCfgDefaultRatePower, 8)
+  wlCfgSetBytes(cfg, WlRfCfgPower11n20Offset, WlRfCfgDefaultRatePower, 8)
+  wlCfgSetBytes(cfg, WlRfCfgPower11nAltOffset, WlRfCfgDefaultRatePower, 8)
+  wlCfgSetBytes(cfg, WlRfCfgPower11ac20Offset, WlRfCfgDefaultRatePower, 10)
+  wlCfgSetBytes(cfg, WlRfCfgPower11acAltOffset, WlRfCfgDefaultRatePower, 10)
 
 proc rf_pri_cfg_init() {.exportc, cdecl.} =
   ## Port of librf_bl808.a:rf_pri.c.o rf_pri_cfg_init+0x0..0x7a.
@@ -2577,7 +2592,7 @@ proc rf_pri_cfg_init() {.exportc, cdecl.} =
   if cfg == nil:
     return
   cfg.efuseTrimControl = 0x02000000'u32
-  cfg.efuseTxGainComp = 0x01'u8
+  cfg.efuseChipVersion = 0x01'u8
   cfg.efuseXtalCapCode0 = 0x80'u8
   cfg.efuseXtalCapCode1 = 0x80'u8
   cfg.efuseDfeTrim = 0x80'u8
@@ -2598,16 +2613,7 @@ proc rf_pri_cfg_init() {.exportc, cdecl.} =
 proc wl_rf_cfg_init*() {.exportc, cdecl.} =
   ## librf_bl808.a:wl_api.c.o wl_rf_cfg_init is a tail-call wrapper for
   ## rf_pri_cfg_init.
-  let cfg = cast[ptr WlRfConfig](wlCfgGlobal)
-  if cfg == nil:
-    return
-  seedWlCfgTxPowerDefaults()
   rf_pri_cfg_init()
-  if Bl808WifiRfDeviceInfo == int(Bl808RfDeviceInfoWb03):
-    # Vendor RF RXCAL reads raw wl_cfg+0xA8/+0xAC and uses them to program
-    # RF70/RF1600. These bytes overlap the channel-comp table at wl_cfg+0xA1.
-    wlCfgSetU32(WlRfCfgRxcalA8Offset, WlRfCfgWb03RxcalA8Default)
-    wlCfgSetU32(WlRfCfgRxcalAcOffset, WlRfCfgWb03RxcalAcDefault)
 
 proc wl_wlan_power_table_update*() {.exportc, cdecl.} =
   ## librf_bl808.a:wl_api.c.o wl_wlan_power_table_update tail-calls
@@ -2735,23 +2741,22 @@ proc wl_rf_set_channel_pwr_comp*(channelIndex: uint32) {.exportc, cdecl.} =
   rf_pri_set_channel_pwr_comp(channelIndex)
 
 proc wl_cfg_get(rmem: ptr WlRfMemoryOverlay): ptr WlRfConfig {.exportc, cdecl.} =
+  ## WL lookup publishes WL storage; RF initialization owns its calibration binding.
   if rmem == nil:
     wlCfgGlobal = nil
     wlCalGlobal = nil
     wlEnvGlobal = nil
-    rfCalibDataGlobal = nil
     return nil
   wlCfgGlobal = cast[pointer](addr rmem.config)
   wlCalGlobal = cast[pointer](addr rmem.calib[0])
   wlEnvGlobal = cast[pointer](addr rmem.env[0])
-  rfCalibDataGlobal = wlCalGlobal
   if rmem.config.status != WlRfConfigMagic:
     rmem.config.xtalfreqHz = 40_000_000'u32
     rmem.config.xtalCapCodes = 0x2020'u16
     rmem.config.capcodeGetCallback = nil
     rmem.config.capcodeSetCallback = nil
   wl_rf_cfg_init()
-  addr rmem.config
+  cast[ptr WlRfConfig](wlCfgGlobal)
 
 proc wl_rmem_size_get*(): uint32 {.exportc, cdecl.} =
   sizeof(WlRfMemoryOverlay).uint32
@@ -2761,12 +2766,10 @@ proc wl_env_get*(rmem: ptr WlRfMemoryOverlay): pointer {.exportc, cdecl.} =
     wlCfgGlobal = nil
     wlCalGlobal = nil
     wlEnvGlobal = nil
-    rfCalibDataGlobal = nil
     return nil
   wlCfgGlobal = cast[pointer](addr rmem.config)
   wlCalGlobal = cast[pointer](addr rmem.calib[0])
   wlEnvGlobal = cast[pointer](addr rmem.env[0])
-  rfCalibDataGlobal = wlCalGlobal
   wlEnvGlobal
 
 template pdsSleepRetainMaskReg(): ptr uint32 =
@@ -2855,11 +2858,8 @@ proc wlLpProgramApiModePhyBranchStart() =
   ## Vendor enters this path when (wl_cfg.apiMode & 0xfd) == 1, then sets
   ## the low-power modem/RF clock-domain controls before programming the
   ## larger modem/AGC body that starts at lp_phy_init+0x236.
-  if not wlLpApiModeActive():
-    return
   let mdm = wifiModemRegs()
   let rf = rfRegs()
-  let crm = crmPhyClockRegs()
   updateReg32(addr mdm.lowPowerRxPathCtrlC814, not 0x00000003'u32,
               0x00000002'u32)
   updateReg32(addr mdm.lowPowerRxPathCtrlC814, not 0x0000003C'u32,
@@ -2872,16 +2872,14 @@ proc wlLpProgramApiModePhyBranchStart() =
   updateReg32(addr mdm.rxGainTimingC044, 0xFFFFFF00'u32, 0'u32)
   rc2_config_rxgain(-5'i8)
   updateReg32(addr rf.channelTuneCtrl26c, 0xC00FFFFF'u32, 0x05000000'u32)
-  updateReg32(addr crm.modemReset18, 0xFFFFFC00'u32, 0x00000050'u32)
+  updateReg32(addr mdm.rxGainTailCtrlC018, 0xFFFFFC00'u32, 0x00000050'u32)
   crm_init()
   crm_mdm_reset()
 
-proc wlLpProgramApiModeTuneAndAgcPrep(phyCfg: pointer) =
+proc wlLpProgramApiModeTuneAndAgcPrep(channelMhz: uint32) =
   ## Port of librf_bl808.a:lp_phy.c.o lp_phy_init+0x236..0x35c.
   ## This low-power-only phase sets pre-AGC, RF tune strobes, and AGC-copy
   ## gates before the vendor copies agcmem at lp_phy_init+0x364..0x380.
-  if not wlLpApiModeActive():
-    return
   let mdm = wifiModemRegs()
   let bba = bbaAgcRegs()
   let rf = rfRegs()
@@ -2895,7 +2893,7 @@ proc wlLpProgramApiModeTuneAndAgcPrep(phyCfg: pointer) =
   updateReg32(addr rf.synthCtrl2c, not 0'u32, 0x00000200'u32)
   updateReg32(addr rf.synthCtrl2c, not 0'u32, 0x00000001'u32)
   updateReg32(addr rf.channelFreqMhz264, 0xFFFFF000'u32,
-              pointerAddrU32(phyCfg) and 0x00000FFF'u32)
+              channelMhz and 0x00000FFF'u32)
   updateReg32(addr rf.channelTuneStrobe268, 0xFFFDFFFF'u32, 0x00020000'u32)
   updateReg32(addr rf.channelTuneStrobe268, 0xFFFDFFFF'u32, 0'u32)
   updateReg32(addr rf.baseCtrl1, not 0'u32, 0x00000002'u32)
@@ -2910,12 +2908,11 @@ proc wlLpProgramApiModeTuneAndAgcPrep(phyCfg: pointer) =
 
 proc wlLpCopyAgcMemoryAndReleaseGate() =
   ## Port of librf_bl808.a:lp_phy.c.o lp_phy_init+0x364..0x3a6.
-  ## The copy loop is the same agcmem -> 0x24C0A000 transfer used by
-  ## phy_init; the low-power tail only clears the AGC-copy clock/gate bits
-  ## that this path set before continuing into the AGC core body.
-  if not wlLpApiModeActive():
-    return
-  copyAgcMemory()
+  ## Low power copies 0x3c0 bytes, not the normal PHY's 0x800-byte window.
+  static: doAssert agcmem.len >= 240
+  let dst = wifiAgcMemoryRegs()
+  for wordIndex in 0 ..< 240:
+    volatileStore(addr dst.memoryWords[wordIndex], agcmem[wordIndex])
   let bba = bbaAgcRegs()
   let crm = crmPhyClockRegs()
   updateReg32(addr crm.rfClockMux10, 0xDFFFFFFF'u32, 0'u32)
@@ -2923,21 +2920,71 @@ proc wlLpCopyAgcMemoryAndReleaseGate() =
 
 proc wlLpProgramAgcCoreRegs() =
   ## Port of librf_bl808.a:lp_phy.c.o lp_phy_init+0x3a6..0x774.
-  ## This block is register-identical to the typed main-PHY AGC core phase.
-  if not wlLpApiModeActive():
-    return
-  bl808PhyProgramAgcCoreRegs()
+  ## Low-power thresholds and stage fields differ from normal phy_init.
+  let bba = bbaAgcRegs()
+  updateReg32(addr bba.agcCoreWindow3a4, 0xFFFFFF00'u32, 0'u32)
+  updateReg32(addr bba.agcCoreWindow3a4, 0xFFFF00FF'u32, 0'u32)
+  updateReg32(addr bba.agcCoreDetect394, 0xFF00FFFF'u32, 0x00F80000'u32)
+  updateReg32(addr bba.agcCoreDetect398, 0xFFFF00FF'u32, 0x00009E00'u32)
+  updateReg32(addr bba.macActiveB3c4, 0xFFFFFF00'u32, 0x000000CE'u32)
+  updateReg32(addr bba.agcCoreProfile364, 0xE0FFFFFF'u32, 0x08000000'u32)
+  updateReg32(addr bba.agcCoreProfile364, 0xFFC0FFFF'u32, 0x003C0000'u32)
+  updateReg32(addr bba.agcCoreProfile364, 0xFFFFC0FF'u32, 0x00003A00'u32)
+  updateReg32(addr bba.agcCoreProfile364, 0xFFFFFFC0'u32, 0x0000003B'u32)
+  updateReg32(addr bba.macActiveB368, 0xFFC00FFF'u32, 0x00270000'u32)
+  updateReg32(addr bba.macActiveB368, 0xFFFFFC00'u32, 0x00000270'u32)
+  updateReg32(addr bba.pdComp36c, 0xFFFFFF00'u32, 0x00000010'u32)
+  updateReg32(addr bba.pdComp36c, 0xFFFFF8FF'u32, 0x00000500'u32)
+  updateReg32(addr bba.pdComp36c, 0xFF00FFFF'u32, 0x00200000'u32)
+  updateReg32(addr bba.pdComp36c, 0xF8FFFFFF'u32, 0x05000000'u32)
+  updateReg32(addr bba.agcCoreProfile370, 0xFF80FFFF'u32, 0x00580000'u32)
+  updateReg32(addr bba.pdSlope3c0, 0x00FFFFFF'u32, 0x18000000'u32)
+  updateReg32(addr bba.macActiveB3c4, 0xFF00FFFF'u32, 0x00E00000'u32)
+  updateReg32(addr bba.macActiveB3c4, 0x00FFFFFF'u32, 0xDC000000'u32)
+  updateReg32(addr bba.macActiveB3a0, 0xFFFFFF00'u32, 0x0000009D'u32)
+  updateReg32(addr bba.pdSlope3c0, 0xFFFFFF00'u32, 0x000000B0'u32)
+  updateReg32(addr bba.pdSlope3c0, 0xFFFF00FF'u32, 0x0000A300'u32)
+  updateReg32(addr bba.agcCoreStage0B380, 0xFFF03FFF'u32, 0x000F8000'u32)
+  updateReg32(addr bba.agcCoreStage0B380, 0xFC0FFFFF'u32, 0x03700000'u32)
+  updateReg32(addr bba.agcCoreStage0B380, 0x03FFFFFF'u32, 0x04000000'u32)
+  updateReg32(addr bba.agcCoreStage0B380, 0xFFFFDFFF'u32, 0'u32)
+  updateReg32(addr bba.agcCoreStage0B380, 0xFFFFE3FF'u32, 0x00000400'u32)
+  updateReg32(addr bba.macActiveB384, 0x03FFFFFF'u32, 0xE4000000'u32)
+  updateReg32(addr bba.macActiveB384, 0xFC0FFFFF'u32, 0x03700000'u32)
+  updateReg32(addr bba.macActiveB384, 0xFFF03FFF'u32, 0x00050000'u32)
+  updateReg32(addr bba.macActiveB384, 0xFFFFDFFF'u32, 0'u32)
+  updateReg32(addr bba.macActiveB384, 0xFFFFE3FF'u32, 0x00000800'u32)
+  updateReg32(addr bba.agcCoreStage2B388, 0x03FFFFFF'u32, 0x3C000000'u32)
+  updateReg32(addr bba.agcCoreStage2B388, 0xFC0FFFFF'u32, 0x01700000'u32)
+  updateReg32(addr bba.agcCoreStage2B388, 0xFFF03FFF'u32, 0x000A8000'u32)
+  updateReg32(addr bba.agcCoreStage2B388, 0xFFFFE3FF'u32, 0x00000400'u32)
+  updateReg32(addr bba.agcCoreStage2B388, 0xFFFFDFFF'u32, 0'u32)
+  updateReg32(addr bba.macActiveB38c, 0x03FFFFFF'u32, 0x64000000'u32)
+  updateReg32(addr bba.macActiveB38c, 0xFC0FFFFF'u32, 0x01800000'u32)
+  updateReg32(addr bba.macActiveB38c, 0xFFF03FFF'u32, 0'u32)
+  updateReg32(addr bba.macActiveB38c, 0xFFFFE3FF'u32, 0x00000800'u32)
+  updateReg32(addr bba.pdCompC830, 0x03FFFFFF'u32, 0xFC000000'u32)
+  updateReg32(addr bba.pdCompC830, 0xFC0FFFFF'u32, 0x00100000'u32)
+  updateReg32(addr bba.pdCompC830, 0xFFF03FFF'u32, 0x000D8000'u32)
+  updateReg32(addr bba.pdCompC830, 0xFFFFE3FF'u32, 0x00001400'u32)
+  updateReg32(addr bba.pdCompRampC838, 0x7FFFFFFF'u32, 0x80000000'u32)
+  updateReg32(addr bba.pdCompRampC838, 0xFFF80000'u32, 0x00000040'u32)
+  updateReg32(addr bba.pdCompRampC83c, 0x7FFFFFFF'u32, 0x80000000'u32)
+  updateReg32(addr bba.pdCompRampC83c, 0xFFF00000'u32, 0x00000020'u32)
+  updateReg32(addr bba.pdCompRampC840, 0x7FFFFFFF'u32, 0'u32)
+  updateReg32(addr bba.pdCompRampC840, 0xFFC00000'u32, 0x00000036'u32)
+  volatileStore(addr bba.agcCoreEnable004, 1'u32)
+  updateReg32(addr bba.pdGain390, 0xFFFFFFFC'u32, 1'u32)
+  volatileStore(addr bba.macActiveB3bc, 0x001E8480'u32)
+  updateReg32(addr bba.agcCoreTimeout414, not 0'u32, 0x00000100'u32)
 
 proc wlLpProgramPostAgcPowerDetectTail() =
   ## Port of librf_bl808.a:lp_phy.c.o lp_phy_init+0x774..0x86c.
   ## Final low-power post-AGC phase: retunes BBA power-detect thresholds,
   ## restores the default PHY clock selection, clears the WL active latch,
   ## and releases the RF low-power tune gates before returning.
-  if not wlLpApiModeActive():
-    return
   let bba = bbaAgcRegs()
   let rf = rfRegs()
-  let env = wlLowPowerStatusEnv()
   volatileStore(addr bba.lowPowerPdCompC864, 0x0000C078'u32)
   updateReg32(addr bba.pdGain390, 0xFFFFFF0F'u32, 0x00000010'u32)
   updateReg32(addr bba.lowPowerPdCompC834, 0xFFFFFFFC'u32, 0x00000001'u32)
@@ -2954,44 +3001,46 @@ proc wlLpProgramPostAgcPowerDetectTail() =
   updateReg32(addr bba.pdComp36c, 0xFFFFF8FF'u32, 0x00000500'u32)
   updateReg32(addr bba.pdComp36c, 0xFFFFFF00'u32, 0x00000014'u32)
   updateReg32(addr bba.pdCompC830, 0xFC0FFFFF'u32, 0'u32)
+  let env = wlLowPowerStatusEnv()
   if env != nil:
     volatileStore(addr env.lowPowerActiveLatch, 0'u8)
   updateReg32(addr rf.channelTuneCtrl26c, 0xFFFFFFF7'u32, 0'u32)
   waitRfUs(1'u32)
   updateReg32(addr rf.channelTuneGate228, 0xFFFFFFF7'u32, 0'u32)
 
-proc wl_lp_init*(rmem: ptr WlRfMemoryOverlay; phyCfg: pointer): int32
+proc lp_phy_init*(xtalIndex, channelMhz: uint32) {.exportc, cdecl.} =
+  ## lp_phy_init samples API mode once, after the common RF register phase.
+  wlLpProgramEarlyPhyRegs(xtalIndex)
+  if not wlLpApiModeActive():
+    return
+  wlLpProgramApiModePhyBranchStart()
+  wlLpProgramApiModeTuneAndAgcPrep(channelMhz)
+  wlLpCopyAgcMemoryAndReleaseGate()
+  wlLpProgramAgcCoreRegs()
+  wlLpProgramPostAgcPowerDetectTail()
+
+proc wl_lp_init*(rmem: ptr WlRfMemoryOverlay; channelMhz: uint32): int32
     {.exportc, cdecl.} =
-  ## Porting boundary for librf_bl808.a:wl_api.c.o wl_lp_init+0x0..0xa6.
-  ## Recovered top-level behavior: bind wl_cfg/wl_cal/wl_env to rmem
-  ## offsets 0/0xd4/0x214, run lp_default_init, restore RF using the WL
-  ## efuse tx-gain byte, map xtal Hz to the low-power table index, and run
-  ## the recovered lp_phy_init register phases. This implementation still
-  ## routes through the existing typed phy_init afterward until low-power
-  ## hardware validation proves whether the fallback can be removed.
+  ## librf_bl808.a:wl_api.c.o wl_lp_init+0x0..0xa6. The second ABI word is
+  ## channel MHz, not a normal-PHY config pointer. Preserve RF calibration
+  ## ownership and reload the WL config after each initializer call.
   if rmem == nil:
     wlCfgGlobal = nil
     wlCalGlobal = nil
     wlEnvGlobal = nil
-    rfCalibDataGlobal = nil
     return -1'i32
   wlCfgGlobal = cast[pointer](addr rmem.config)
   wlCalGlobal = cast[pointer](addr rmem.calib[0])
   wlEnvGlobal = cast[pointer](addr rmem.env[0])
-  rfCalibDataGlobal = wlCalGlobal
   wlLpDefaultInit()
-  let cfg = cast[ptr WlRfConfig](wlCfgGlobal)
-  if cfg != nil:
-    rf_pri_input_xtalfreq(cfg.xtalfreqHz)
-    rf_pri_init(0'u32, uint32(cfg.apiMode))
-    let lpXtalIndex = wlLpXtalIndex(cfg.xtalfreqHz)
-    wlLpProgramEarlyPhyRegs(lpXtalIndex)
-    wlLpProgramApiModePhyBranchStart()
-    wlLpProgramApiModeTuneAndAgcPrep(phyCfg)
-    wlLpCopyAgcMemoryAndReleaseGate()
-    wlLpProgramAgcCoreRegs()
-    wlLpProgramPostAgcPowerDetectTail()
-  phy_init(phyCfg)
+  var cfg = cast[ptr WlRfConfig](wlCfgGlobal)
+  if cfg == nil:
+    return -1'i32
+  lp_rf_pri_init(0'u32, cfg.efuseChipVersion.uint32)
+  cfg = cast[ptr WlRfConfig](wlCfgGlobal)
+  if cfg == nil:
+    return -1'i32
+  lp_phy_init(wlLpXtalIndex(cfg.xtalfreqHz), channelMhz)
   0'i32
 
 proc wl_lp_status_clear*(context: uint32) {.exportc, cdecl.} =
@@ -3008,15 +3057,13 @@ proc wl_lp_status_clear*(context: uint32) {.exportc, cdecl.} =
 proc wl_lp_status_update*(active: uint32; statusCode: int8;
                           context: uint32) {.exportc, cdecl.} =
   ## Port of librf_bl808.a:wl_api.c.o wl_lp_status_update+0x0..0x60.
-  ## The low-power status env keeps the most recent active status and clears
-  ## validity after two inactive updates.
+  ## Active samples use a signed 48/80 filter when valid; the 16-bit inactive
+  ## counter wraps and invalidates only when its incremented value is two.
   let env = wlLowPowerStatusEnv()
   if env == nil:
     return
   if active == 0'u32:
-    let nextInactive =
-      if env.inactiveUpdateCount >= 1'u16: 2'u16
-      else: env.inactiveUpdateCount + 1'u16
+    let nextInactive = uint16((env.inactiveUpdateCount.uint32 + 1'u32) and 0xFFFF'u32)
     if nextInactive == 2'u16:
       env.inactiveUpdateCount = 0'u16
       env.statusValid = 0'u8
@@ -3025,7 +3072,10 @@ proc wl_lp_status_update*(active: uint32; statusCode: int8;
     env.lastUpdateContext = context
     return
 
-  env.lastStatusCode = statusCode
+  let filtered =
+    if env.statusValid == 0'u8: statusCode
+    else: int8((env.lastStatusCode.int32 * 48'i32 + statusCode.int32 * 80'i32) shr 7)
+  env.lastStatusCode = filtered
   env.inactiveUpdateCount = 0'u16
   env.statusValid = 1'u8
   env.lastUpdateContext = context
@@ -3117,6 +3167,7 @@ var
   bl808RfBzTempCorrAvg: int16
   bl808RfBzChCorrAvg: int16
   bl808RfBzTxCorrOffset: int16
+  bl808RfBtTxCorrOffset: int16
   bl808RfBzTargetPowerRecords: array[4, int] =
     RfPriBzTargetPowerDefaultRecords
   bl808RfBzTempPowerComp: array[5, int16]
@@ -3131,17 +3182,15 @@ var
     200'i16, 190'i16, 180'i16, 160'i16, 130'i16]
   bl808RfTempRoomOffset: int16
   bl808RfTempCalEnabled: uint8
+  bl808RfTempInterpolationMode: uint8 = 1
   bl808RfCurrentTemperatureC: int16 = 35'i16
   bl808RfTempMeasurementPass: uint8
   bl808RfAppliedPowerComp: int16
   bl808RfTempPowerComp: int16
   bl808RfTxGainComp: int16
-  bl808RfEfuseCapComp: int16
-  bl808RfEfusePowerComp: int16
-  bl808RfDeviceBl616: uint8
+  bl808RfDeviceBl616: uint8 = 1
   bl808RfDeviceWb03: uint8
   bl808RfDeviceBl618m: uint8
-  bl808RfDeviceInfoSet: uint8
   bl808RfChipVersion: uint8 = 1'u8
   bl808RfTxPowerTable: array[18, RfPriTxPowerTableRow] =
     RfPriTxPowerTableDefault
@@ -3164,13 +3213,13 @@ proc rf_pri_input_device_info(deviceInfo: uint32) {.exportc, cdecl.} =
     bl808RfDeviceBl618m = 1
   else:
     discard
-  bl808RfDeviceInfoSet = 1
 
 proc rf_pri_input_chip_ver(chipVersion: uint32) {.exportc, cdecl.} =
   ## Port of librf_bl808.a:rf_pri.c.o rf_pri_input_chip_ver+0x0..0x12.
-  ## Vendor leaves Chip_Version unchanged when called with zero.
-  if chipVersion != 0'u32:
-    bl808RfChipVersion = uint8(chipVersion and 0xFF'u32)
+  ## Zero selects version 1; other words publish their low byte.
+  bl808RfChipVersion =
+    if chipVersion == 0'u32: 1'u8
+    else: uint8(chipVersion and 0xFF'u32)
 
 proc rfPriManualCalAdjustCoarse(delta: int32) =
   let rf = rfRegs()
@@ -3329,21 +3378,11 @@ proc rfPriLoadConfiguredDeviceInfo() =
 proc rfPriDeviceInfoValid(): bool {.inline.} =
   (bl808RfDeviceBl616 or bl808RfDeviceWb03 or bl808RfDeviceBl618m) != 0
 
-proc rfPriEnsureDeviceInfo() =
-  if bl808RfDeviceInfoSet == 0 or not rfPriDeviceInfoValid():
-    rf_pri_input_device_info(uint32(Bl808WifiRfDeviceInfo))
-
 proc rfPriIsWb03(): bool {.inline.} =
-  if bl808RfDeviceInfoSet != 0:
-    bl808RfDeviceWb03 != 0
-  else:
-    Bl808WifiRfDeviceInfo == int(Bl808RfDeviceInfoWb03)
+  bl808RfDeviceWb03 != 0
 
 proc rfPriAnyKnownDeviceFlag(): bool {.inline.} =
-  if bl808RfDeviceInfoSet != 0:
-    (bl808RfDeviceBl616 or bl808RfDeviceWb03 or bl808RfDeviceBl618m) != 0
-  else:
-    true
+  rfPriDeviceInfoValid()
 
 proc rfPriDeviceTraceWord(): uint32 {.inline.} =
   uint32(rfPriIsWb03()) or
@@ -4477,8 +4516,8 @@ proc rfPriCwXtalDivisorTenths(): uint32 {.inline.} =
   elif bl808RfPriXtal26mFlag != 0: 780'u32
   elif bl808RfPriXtal32mFlag != 0: 960'u32
   elif bl808RfPriXtal40mFlag != 0: 1200'u32
-  elif bl808RfPriXtal38p4mFlag != 0: 1152'u32
   elif bl808RfPriXtal52mFlag != 0: 1560'u32
+  elif bl808RfPriXtal38p4mFlag != 0: 1152'u32
   else: 1200'u32
 
 proc rfPriCwSdmDivWord(channelMhz: uint32): uint32 {.inline.} =
@@ -6051,29 +6090,37 @@ proc rfPriTempChannelTableIndex(channelMhz: uint16): int =
   while result < count and channelMhz >= bl808RfTempChannels[result]:
     inc result
 
+proc rfPriSignedDiv32(numerator, denominator: int32): int32 {.inline.} =
+  ## RV32 DIV does not trap on a zero divisor or signed overflow.
+  if denominator == 0'i32:
+    -1'i32
+  elif numerator == low(int32) and denominator == -1'i32:
+    low(int32)
+  else:
+    numerator div denominator
+
+proc rfPriSensorTemperatureTenths(sensorTemperatureC: int32): int16 {.inline.} =
+  rfSignExtend16(rfSignExtend16(sensorTemperatureC).int32 * 10'i32)
+
 proc rfPriInterpolatedTempOffset(channelMhz: uint16; table: array[5, int16];
-                                 index: int): int16 =
+                                 index: int): int32 =
   let count = min(int(bl808RfTempChannelCount), bl808RfTempChannels.len)
   if count <= 0:
-    return table[0]
+    return table[0].int32
   if index <= 0:
-    return table[0]
+    return table[0].int32
   if index >= count:
-    return table[count - 1]
-  ## Vendor linear_or_follow defaults to 1. The BL808 archive keeps this as a
-  ## private byte; model the active linear interpolation branch directly.
+    return table[count - 1].int32
   let leftChannel = bl808RfTempChannels[index - 1].int32
   let rightChannel = bl808RfTempChannels[index].int32
   let span = rightChannel - leftChannel
-  if span == 0:
-    return table[index - 1]
   let leftOffset = table[index - 1].int32
   let rightOffset = table[index].int32
-  rfSignExtend16(leftOffset +
-    ((rightOffset - leftOffset) * (channelMhz.int32 - leftChannel)) div span)
+  leftOffset +% rfPriSignedDiv32(
+    (rightOffset - leftOffset) *% (channelMhz.int32 - leftChannel), span)
 
 proc rfPriComputeTemperaturePowerCompForMhz(channelMhz: uint16;
-    sensorTemperatureC: int32; previousComp: int16): int16
+    sensorTemperatureC: int32; previousComp: int16): tuple[value: int16, computed: bool]
 
 proc rfPriComputeTemperaturePowerComp(channelIndex: uint32;
                                       sensorTemperatureC: int32): int16 =
@@ -6084,29 +6131,37 @@ proc rfPriComputeTemperaturePowerComp(channelIndex: uint32;
     return bl808RfTempPowerComp
   rfPriComputeTemperaturePowerCompForMhz(
     rfPriChannelCenterMhz(channelIndex), sensorTemperatureC,
-    bl808RfTempPowerComp)
+    0'i16).value
 
 proc rfPriComputeTemperaturePowerCompForMhz(channelMhz: uint16;
-    sensorTemperatureC: int32; previousComp: int16): int16 =
+    sensorTemperatureC: int32; previousComp: int16): tuple[value: int16, computed: bool] =
   ## Shared temperature interpolator for WLAN channel compensation and the
   ## BZ five-slot compensation table in rf_pri_set_bz_temp_comp.
-  let sensorTenths = rfSignExtend16(sensorTemperatureC * 10).int32
+  let sensorTenths = rfPriSensorTemperatureTenths(sensorTemperatureC).int32
   let roomTenths =
     rfSignExtend16(bl808RfTempRoomOffset.int32 * 10 + 350'i32).int32
   if sensorTenths == roomTenths:
-    return 0'i16
+    return (0'i16, true)
   let tempChannelTableIndex = rfPriTempChannelTableIndex(channelMhz)
-  let temperatureOffsetDivisor =
-    if sensorTenths < roomTenths:
-      rfPriInterpolatedTempOffset(channelMhz, bl808RfTempLowOffsets,
-        tempChannelTableIndex)
+  let count = min(int(bl808RfTempChannelCount), bl808RfTempChannels.len)
+  let offsets =
+    if sensorTenths < roomTenths: bl808RfTempLowOffsets
+    else: bl808RfTempHighOffsets
+  var divisor: int32
+  if tempChannelTableIndex > 0 and tempChannelTableIndex < count:
+    case bl808RfTempInterpolationMode
+    of 0'u8:
+      divisor = offsets[tempChannelTableIndex - 1].int32
+    of 1'u8:
+      divisor = rfPriInterpolatedTempOffset(channelMhz, offsets,
+                                            tempChannelTableIndex)
     else:
-      rfPriInterpolatedTempOffset(channelMhz, bl808RfTempHighOffsets,
-        tempChannelTableIndex)
-  if temperatureOffsetDivisor == 0'i16:
-    return previousComp
-  rfSignExtend16(
-    ((sensorTenths - roomTenths) * 2'i32) div temperatureOffsetDivisor.int32)
+      return (previousComp, false)
+  else:
+    divisor = rfPriInterpolatedTempOffset(channelMhz, offsets,
+                                          tempChannelTableIndex)
+  (rfSignExtend16(rfPriSignedDiv32((sensorTenths - roomTenths) * 2'i32,
+                                  divisor)), true)
 
 proc rf_pri_set_channel_total_pwr_comp*(channelIndex: uint32)
     {.exportc, cdecl.} =
@@ -6254,17 +6309,17 @@ proc rfPriApplyEfuseXtalCapTrim(cfg: ptr WlRfConfig;
     updateReg32(addr rf.xtalCapTrim5c, 0xFFE0FC0F'u32,
                 ((efuseXtalCapCode0.uint32 shl 16) and 0x001F0000'u32) or
                 ((efuseXtalCapCode1.uint32 shl 4) and 0x000003F0'u32))
-    bl808RfEfuseCapComp = -7'i16
-    bl808RfEfusePowerComp = -4'i16
-    bl808RfBzTxCorrOffset = bl808RfEfuseCapComp
+    bl808RfBzTxCorrOffset = -7'i16
+    bl808RfBtTxCorrOffset = -7'i16
+    bl808RfTxGainComp = -4'i16
     txCorrRegHigh = 0xFC000000'u32
     txCorrRegLow = 0x000000F8'u32
   else:
     updateReg32(addr rf.xtalCapTrim5c, 0xFFE0FC0F'u32,
                 0x00100200'u32)
-    bl808RfEfuseCapComp = -3'i16
-    bl808RfEfusePowerComp = 0'i16
-    bl808RfBzTxCorrOffset = bl808RfEfuseCapComp
+    bl808RfBzTxCorrOffset = -3'i16
+    bl808RfBtTxCorrOffset = -3'i16
+    bl808RfTxGainComp = 0'i16
     txCorrRegHigh = 0'u32
     txCorrRegLow = 0x000000FC'u32
 
@@ -6272,30 +6327,24 @@ proc rf_pri_set_rcal_code(code0, code1: uint32) {.exportc, cdecl.} =
   ## Port of librf_bl808.a:rf_pri.c.o rf_pri_set_rcal_code.
   ## Recovered: code0/code1 program RF[0x105c] xtal-cap trim fields;
   ## 0x80 is the vendor invalid-efuse sentinel and selects the default trim.
-  ## Vendor also mirrors compensation state into three private halfword
-  ## anchors; the semantic consumers here use bl808RfEfuse*Comp directly.
+  ## Publish the BZ, BT and WLAN correction halfwords to their consumers.
   let rf = rfRegs()
-  if (code0 and 0xFF'u32) != 0x80'u32 and
-      (code1 and 0xFF'u32) != 0x80'u32:
+  if code0 != 0x80'u32 and code1 != 0x80'u32:
     updateReg32(addr rf.xtalCapTrim5c, 0xFFE0FC0F'u32,
                 ((code0 shl 16) and 0x001F0000'u32) or
                 ((code1 shl 4) and 0x000003F0'u32))
-    bl808RfEfuseCapComp = -7'i16
-    bl808RfEfusePowerComp = -4'i16
-    bl808RfBzTxCorrOffset = bl808RfEfuseCapComp
+    bl808RfBzTxCorrOffset = -7'i16
+    bl808RfBtTxCorrOffset = -7'i16
+    bl808RfTxGainComp = -4'i16
   else:
     updateReg32(addr rf.xtalCapTrim5c, 0xFFE0FC0F'u32,
                 0x00100200'u32)
-    bl808RfEfuseCapComp = -3'i16
-    bl808RfEfusePowerComp = 0'i16
-    bl808RfBzTxCorrOffset = bl808RfEfuseCapComp
+    bl808RfBzTxCorrOffset = -3'i16
+    bl808RfBtTxCorrOffset = -3'i16
+    bl808RfTxGainComp = 0'i16
 
-proc rfPriApplyEfuseTxGainTrim(cfg: ptr WlRfConfig) =
-  let efuseTxGainByte = cfg.efuseTxGainComp
-  bl808RfTxGainComp =
-    if efuseTxGainByte == 0'u8: 1'i16
-    else: cast[int8](efuseTxGainByte).int16
-  bl808RfTempPowerComp = rfSignedByte(cfg.temperaturePowerComp)
+proc rfPriApplyEfuseChipVersion(cfg: ptr WlRfConfig) =
+  rf_pri_input_chip_ver(cfg.efuseChipVersion.uint32)
 
 proc rfPriApplyEfuseDfeTrim(cfg: ptr WlRfConfig) =
   let efuseDfeTrimNibble = cfg.efuseDfeTrim
@@ -6309,14 +6358,19 @@ proc rfPriApplyEfuseDfeTrim(cfg: ptr WlRfConfig) =
 proc rfPriEfuseInit() =
   ## Port of librf_bl808.a:rf_pri.c.o rf_pri_efuse_init.part.0 for the
   ## BL808 WLAN RF trim fields at wl_cfg+0xc4..0xc7.
-  let cfg = cast[ptr WlRfConfig](wlCfgGlobal)
+  var cfg = cast[ptr WlRfConfig](wlCfgGlobal)
   if cfg == nil:
     return
   var txCorrRegHigh: uint32
   var txCorrRegLow: uint32
   let rf = rfRegs()
   rfPriApplyEfuseXtalCapTrim(cfg, txCorrRegHigh, txCorrRegLow)
-  rfPriApplyEfuseTxGainTrim(cfg)
+  rfPriApplyEfuseChipVersion(cfg)
+  rf_pri_input_bz_target_power(rfSignedByte(cfg.ratePowerLimitDbm).int32)
+  rf_pri_get_bz_temp_mp_comp()
+  cfg = cast[ptr WlRfConfig](wlCfgGlobal)
+  if cfg == nil:
+    return
   rfPriApplyEfuseDfeTrim(cfg)
   updateReg32(addr rf.txPowerComp704, 0x00FFFFFF'u32, txCorrRegHigh)
   updateReg32(addr rf.txPowerComp7ac, 0xFFFFFF00'u32, txCorrRegLow)
@@ -6391,7 +6445,6 @@ proc rf_pri_init(coldInit, mode: uint32) {.exportc, cdecl.} =
   nim_wifi_rf_pri_init_entry_breakpoint()
   bl808RfColdInit = coldInit
   bl808RfMode = radioPhyModeFromApi(uint8(mode and 0xFF'u32))
-  rfPriEnsureDeviceInfo()
   rf_pri_init_calib_mem()
   let needsFullCal = coldInit != 0'u32
   updateReg32(addr rfDfeInitRegs().dfeTrim824, 0x9FFFFFFF'u32,
@@ -6426,6 +6479,28 @@ proc rf_pri_init(coldInit, mode: uint32) {.exportc, cdecl.} =
   rfPriSnapshotStage(0xF40A'u32)
   rfPriSnapshotStage(0xF40B'u32)
   rfPhyTraceCheckpoint(0x22'u32)
+
+proc lp_rf_pri_init(coldInit, chipVersion: uint32) {.exportc, cdecl.} =
+  ## librf_bl808.a:rf_pri.c.o lp_rf_pri_init+0x0..0xc2. Unlike normal RF
+  ## init, this does not bind rf_calib_data; the second argument is unused.
+  discard chipVersion
+  updateReg32(addr rfDfeInitRegs().dfeTrim824, 0x9FFFFFFF'u32, 0x40000000'u32)
+  rfPriEfuseInit()
+  rf_pri_xtalfreq()
+  writeRfPriFixedValueRegs()
+  rfPriWifiPllConfig()
+  let rf = rfRegs()
+  updateReg32(addr rf.rxMode220, 0xFFFFE67D'u32, 0'u32)
+  updateReg32(addr rf.rxMode220, 0xFFFFFF9E'u32, 0'u32)
+  if coldInit != 0'u32:
+    runRfPriFullCalRestoreBaseline()
+  else:
+    replayRfPriCalRegisters()
+  rfPriWriteTxPowerTable(phases = {rfPowerFields})
+  updateReg32(addr rf.synthCtrl2c, not 0'u32, 0x6'u32)
+  updateReg32(addr rf.synthCtrl2c, not 0'u32, 0x4021'u32)
+  updateReg32(addr rf.synthDfePathControl63c, not 0'u32, 0x8080'u32)
+  updateReg32(addr rf.rxMode220, not 0x600'u32, 0'u32)
 
 proc rf_pri_config_mode(mode: uint32) {.exportc, cdecl.} =
   bl808RfMode = radioPhyModeFromApi(uint8(mode and 0xFF'u32))
@@ -6598,7 +6673,9 @@ proc rf_pri_set_temp_comp(sensorTemperatureC: int32) {.exportc, cdecl.} =
       rfPriComputeTemperaturePowerComp(channelIndex, sensorTemperatureC)
   if bl808RfTempMeasurementPass != 0'u8:
     return
-  bl808RfCurrentTemperatureC = rfSignExtend16(sensorTemperatureC)
+  if bl808RfTempCalEnabled != 0'u8:
+    bl808RfCurrentTemperatureC =
+      int16(rfPriSensorTemperatureTenths(sensorTemperatureC).int32 div 10'i32)
   rf_pri_set_channel_total_pwr_comp(channelIndex)
 
 proc rf_pri_input_bz_channel_pwr_comp(comp: pointer) {.exportc, cdecl.} =
@@ -6641,32 +6718,32 @@ proc rf_pri_set_bz_channel_pwr_comp() {.exportc, cdecl.} =
   ## Port of librf_bl808.a:rf_pri.c.o
   ## rf_pri_set_bz_channel_pwr_comp+0x0..0x1f0. Recovered behavior:
   ## refresh five BZ channel compensation bytes from wl_cfg+0xbe, clamp them
-  ## to signed 6-bit correction range, write packed RF[0x1780]/RF[0x17b4],
+  ## to -16..16, and add BZ/BT offsets for RF[0x1780]/RF[0x17b4],
   ## then update the BZ channel average correction anchor.
   let cfg = cast[ptr WlRfConfig](wlCfgGlobal)
   if cfg == nil:
     return
   rfPriRefreshBzChannelPowerComp(cfg)
-  var tempAdjusted: array[5, int16]
-  var txAdjusted: array[5, int16]
+  var bzAdjusted: array[5, int16]
+  var btAdjusted: array[5, int16]
   var sum: int32
   var minNegative: int16
   var foundNegative = false
   for bzChannelPowerCompIndex, rawComp in bl808RfBzChannelPowerComp:
     let clipped = rfPriClampBzChannelComp(rawComp)
-    tempAdjusted[bzChannelPowerCompIndex] = rfSignExtend16(
-      bl808RfBzTempCorrAvg.int32 + clipped.int32)
-    txAdjusted[bzChannelPowerCompIndex] = rfSignExtend16(
-      clipped.int32 + bl808RfBzTxCorrOffset.int32)
-    sum += rawComp.int32
-    if rawComp < 0'i16 and (not foundNegative or rawComp < minNegative):
-      minNegative = rawComp
+    bzAdjusted[bzChannelPowerCompIndex] = rfSignExtend16(
+      bl808RfBzTxCorrOffset.int32 + clipped.int32)
+    btAdjusted[bzChannelPowerCompIndex] = rfSignExtend16(
+      clipped.int32 + bl808RfBtTxCorrOffset.int32)
+    sum += clipped.int32
+    if clipped < 0'i16 and (not foundNegative or clipped < minNegative):
+      minNegative = clipped
       foundNegative = true
   let rf = rfRegs()
   updateReg32(addr rf.bzChannelPowerComp780, 0xC0000000'u32,
-              rfPriPackFive6BitFields(tempAdjusted))
+              rfPriPackFive6BitFields(bzAdjusted))
   updateReg32(addr rf.bzChannelPowerComp7b4, 0xC0000000'u32,
-              rfPriPackFive6BitFields(txAdjusted))
+              rfPriPackFive6BitFields(btAdjusted))
   if foundNegative and minNegative != 0'i16:
     bl808RfBzChCorrAvg = minNegative
   else:
@@ -6702,26 +6779,32 @@ proc rfPriWriteBzTemperatureCompDeltas() =
 proc rf_pri_set_bz_temp_comp(sensorTemperatureC: int32) {.exportc, cdecl.} =
   ## Port of librf_bl808.a:rf_pri.c.o rf_pri_set_bz_temp_comp.
   ## Recovered behavior: refresh the shared temperature interpolation
-  ## parameters, compute five BZ-band temperature corrections, capture them
-  ## during the measurement pass, and otherwise write current-minus-baseline
-  ## deltas to RF[0x1784]/RF[0x17b8].
+  ## parameters and clear current corrections. Enabled measurement passes
+  ## update baseline slots directly; ordinary passes publish current slots
+  ## and write current-minus-baseline deltas to RF[0x1784]/RF[0x17b8].
   const BzTempCompChannelsMhz = [
     2412'u16, 2434'u16, 2450'u16, 2466'u16, 2478'u16]
   let cfg = cast[ptr WlRfConfig](wlCfgGlobal)
   if cfg == nil:
     return
   rfPriRefreshTempCompParamFromWlCfg()
-  if bl808RfTempCalEnabled == 0'u8:
-    for item in bl808RfBzTempPowerComp.mitems:
-      item = 0'i16
-  else:
+  for item in bl808RfBzTempPowerComp.mitems:
+    item = 0'i16
+  if bl808RfTempCalEnabled != 0'u8:
+    var sharedComp = bl808RfTempPowerComp
+    var publishShared = false
     for bzTempCompChannelIndex, channelMhz in BzTempCompChannelsMhz:
-      bl808RfBzTempPowerComp[bzTempCompChannelIndex] =
-        rfPriComputeTemperaturePowerCompForMhz(
-          channelMhz, sensorTemperatureC,
-          bl808RfBzTempPowerComp[bzTempCompChannelIndex])
+      let sample = rfPriComputeTemperaturePowerCompForMhz(
+        channelMhz, sensorTemperatureC, sharedComp)
+      sharedComp = sample.value
+      publishShared = publishShared or sample.computed
+      if bl808RfBzTemperatureMeasurementPass != 0'u8:
+        bl808RfBzAppliedTempComp[bzTempCompChannelIndex] = sharedComp
+      else:
+        bl808RfBzTempPowerComp[bzTempCompChannelIndex] = sharedComp
+    if publishShared:
+      bl808RfTempPowerComp = sharedComp
   if bl808RfBzTemperatureMeasurementPass != 0'u8:
-    bl808RfBzAppliedTempComp = bl808RfBzTempPowerComp
     return
   rfPriWriteBzTemperatureCompDeltas()
   rfPriUpdateBzTempCorrAverage(bl808RfBzTempPowerComp)
@@ -6751,6 +6834,16 @@ proc rfPriSelectBzTargetPowerRecords(targetPowerDbm: int32): array[4, int] =
   else:
     RfPriBzTargetPowerDefaultRecords
 
+proc rfPriBzTargetPowerWindowActive(targetPowerDbm: int32): bool =
+  if targetPowerDbm <= 5'i32:
+    bl808RfBzTargetPowerRecords[0] == 5
+  elif targetPowerDbm <= 20'i32:
+    bl808RfBzTargetPowerRecords[3] == 4
+  elif targetPowerDbm <= 23'i32:
+    bl808RfBzTargetPowerRecords[0] == 0
+  else:
+    bl808RfBzTargetPowerRecords[3] == 6
+
 proc rf_pri_input_bz_target_power(targetPowerDbm: int32) {.exportc, cdecl.} =
   ## Port of librf_bl808.a:rf_pri.c.o rf_pri_input_bz_target_power.
   ## Recovered behavior: refresh BZ channel-power compensation, mirror the
@@ -6760,10 +6853,9 @@ proc rf_pri_input_bz_target_power(targetPowerDbm: int32) {.exportc, cdecl.} =
   if rfCalibDataGlobal != nil:
     updateReg32(addr rfRegs().txcalParam70, 0xFFFFFFF0'u32,
                 rfPriRf70ReplayWindow0Nibble())
-  let nextRecords = rfPriSelectBzTargetPowerRecords(targetPowerDbm)
-  if bl808RfBzTargetPowerRecords == nextRecords:
+  if rfPriBzTargetPowerWindowActive(targetPowerDbm):
     return
-  bl808RfBzTargetPowerRecords = nextRecords
+  bl808RfBzTargetPowerRecords = rfPriSelectBzTargetPowerRecords(targetPowerDbm)
   rfPriWriteTxPowerTable(rfPowerBz)
   rfPriSnapshotBzTxcalState(0xB5'u32)
 
@@ -6841,8 +6933,6 @@ proc rf_clkpll_isr*() {.exportc, cdecl.} =
 
 type
   WlParamLoadCb = proc(xtalfreq: ptr uint32): int8 {.cdecl.}
-  WlCapcodeSetCb = proc(cap0, cap1: uint8) {.cdecl.}
-  WlCapcodeGetCb = proc(cap0, cap1: ptr uint8) {.cdecl.}
 
 proc modem_init_core*(xtalfreqHz, restore: uint32) {.exportc, cdecl.}
 proc modemInitCoreMode(xtalfreqHz, restoreExistingCalibration: uint32;
@@ -6852,6 +6942,7 @@ proc configureWlRfConfig(cfg: ptr WlRfConfig; xtalfreqHz: uint32;
                          mode: RadioPhyMode; requestFullCalibration: uint8) =
   if cfg == nil:
     return
+  seedWlCfgTxPowerDefaults(cfg)
   cfg.status = 0
   cfg.apiMode = apiFromRadioPhyMode(mode)
   cfg.enableParamLoadCallback = 0'u8

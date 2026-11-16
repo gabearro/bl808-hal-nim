@@ -1,4 +1,4 @@
-"""Differential and boundary tests for the vendor-compatible RX replay window."""
+"""Legacy-vendor boundary vectors for RX replay; wide jumps have separate tests."""
 
 from pathlib import Path
 import random

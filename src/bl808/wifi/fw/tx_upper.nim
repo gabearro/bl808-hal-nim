@@ -12,52 +12,19 @@ proc txu_cntrl_init*() {.exportc, cdecl.} =
   discard
 
 proc txuBuildFrame(desc: pointer, bufPtr: pointer): bool =
-  ## Build a TX upper control frame (163 instrs).
-  ## From disassembly: constructs the MAC header and HW descriptor fields for
-  ## a host-originated TX frame. Blob ABI: a0=txdesc, a1=bufPtr (MAC header
-  ## write point = desc+556+hdrLen). The current Nim body still derives the
-  ## write point from txdesc itself; bufPtr is accepted for ABI compatibility.
-  ##
-  ## Layout of txdesc (param):
-  ##   [14..15] = uint16 addr1 field (from host)
-  ##   [20..25] = addr1 (DA, 3 x uint16)
-  ##   [22..23] = addr2 part
-  ##   [24..25] = addr3 part
-  ##   [26..27] = addr4 part (for 4-addr)
-  ##   [28..29] = addr5 part
-  ##   [30..31] = addr6 part
-  ##   [32..33] = uint16 frame_len (host payload length)
-  ##   [42..43] = uint16 seq_ctrl / TID related
-  ##   [46]     = uint8 TID (0xFF = non-QoS; named staIdx in HostTxDescView)
-  ##   [47]     = uint8 vif_idx
-  ##   [49]     = uint8 sta_info_idx (for rate table lookup)
-  ##   [12..13] = uint16 ethertype
-  ##
-  ## The function:
-  ##   1. Reads frame_len from txdesc[32] and checks if <= 1535 (non-802.11)
-  ##   2. If > 1535: copies AMSDU sub-header from host descriptor
-  ##   3. Calls txl_machdr_format(txdesc, 1) to format MAC header
-  ##   4. Looks up VIF entry (vif_info_tab + vif_idx * 1512) and STA entry
-  ##      (sta_info_tab + sta_info_idx * 368)
-  ##   5. Gets rate/policy table from STA entry
-  ##   6. Builds frame control word in the MAC header buffer:
-  ##      - If sta_idx==0xFF: sets FC=0 (null header), clears addr fields
-  ##      - Else: sets FC with protected bit, power mgmt, from/to DS
-  ##   7. Computes address offsets based on FC To/From DS bits:
-  ##      - 0x100 (256): use STA rate table addr1/2/3
-  ##      - 0x200 (512): use txdesc addr fields for SA
-  ##      - 0x000: use txdesc addr + VIF link for BSSID
-  ##   8. Fills in Duration/ID, Addr1-4 fields in the MAC header
-  ##   9. Checks if frame needs NAV protection (RTS/CTS check) and
-  ##      may set "more data" bit 0x4000 in FC
-  ##
-  ## This is a critical TX path function that formats 802.11 headers.
+  ## Build MAC/security/SNAP headers backwards from the supplied header end.
+  ## HostTxDescView.frameLen holds the Ethernet type/length in wire byte order;
+  ## seqPassthrough holds payload length. Payload buffers need not be adjacent
+  ## to the header. Duration/ID is not rewritten, matching the vendor builder.
   let txDesc = hostTxDescAt(desc)
   let saved = irqSave()
   defer: irqRestore(saved)
+  let staIdx = txDesc.staIdx
+  if staIdx != 0xFF'u8 and staIdx >= 8:
+    return false
   let identity = txlCaptureSession(txDesc)
   template ensureCurrentBuild() =
-    if not txlSessionCurrent(identity, txDesc):
+    if txDesc.staIdx != staIdx or not txlSessionCurrent(identity, txDesc):
       return false
   if not txlSessionCurrent(identity, txDesc) or txDesc.staInfoIdx >= STA_INFO_TAB_ENTRIES.uint8:
     return false
@@ -72,8 +39,7 @@ proc txuBuildFrame(desc: pointer, bufPtr: pointer): bool =
   let securityEnd = cast[pointer](cast[uint](layout.sec) + layout.secLen.uint)
   if txu_cntrl_sec_hdr_append(desc, securityEnd, 1'u32) != layout.sec:
     return false
-  if not txlSessionCurrent(identity, txDesc):
-    return false
+  ensureCurrentBuild()
 
   let vifIdx = txDesc.vifIdx
   let staInfoIdx = txDesc.staInfoIdx
@@ -86,7 +52,6 @@ proc txuBuildFrame(desc: pointer, bufPtr: pointer): bool =
     if rateCtrl == nil: 0'u32
     else: pointerAddrU32(txSecurityKeyListAt(rateCtrl).pairwiseKey)
 
-  let staIdx = txDesc.staIdx
   let hdr = layout.mac
   let hdrBufBase = cast[uint](hdr)
 
@@ -138,7 +103,7 @@ proc txuBuildFrame(desc: pointer, bufPtr: pointer): bool =
     discard c_memcpy(addr hdr.header.addr1[0], addr txDesc.da[0], 6.csize_t)
     discard c_memcpy(addr hdr.header.addr3[0], addr vif.bssid[0], 6.csize_t)
 
-  let headerStaIdx = txDesc.staIdx
+  let headerStaIdx = staIdx
   if headerStaIdx != 0xFF'u8:
     hdr.qosCtrl = headerStaIdx.uint16
 
@@ -200,8 +165,7 @@ proc txuBuildFrame(desc: pointer, bufPtr: pointer): bool =
                             snapTraceHi(layout))
       ensureCurrentBuild()
 
-  if not txlSessionCurrent(identity, txDesc):
-    return false
+  ensureCurrentBuild()
   # Protected data frames need the Protected bit when a pairwise key is active.
   # The reference skips only the control-port EtherType gate; other Ethernet-II
   # data frames (DHCP/ARP/IP) are encrypted and must advertise that in FC.
@@ -213,7 +177,7 @@ proc txuBuildFrame(desc: pointer, bufPtr: pointer): bool =
       hdr.header.frameControl = hdr.header.frameControl or 0x4000'u16
 
   if frameType == 0x0800'u16:
-    let finalStaIdx = txDesc.staIdx
+    let finalStaIdx = staIdx
     if finalStaIdx != 0xFF'u8:
       hdr.qosCtrl = finalStaIdx.uint16
     nimFwDbgDhcpTxLayout[0] = pointerAddrU32(bufPtr)
@@ -226,24 +190,45 @@ proc txuBuildFrame(desc: pointer, bufPtr: pointer): bool =
       (layout.secLen.uint32 shl 16) or
       (layout.snapLen.uint32 shl 24)
     nimFwDbgDhcpTxLayout[5] =
-      debugLoadLe32(cast[pointer](layout.sec))
-    nimFwDbgDhcpTxLayout[6] =
-      debugLoadLe32(cast[pointer](layout.snap))
-    nimFwDbgDhcpTxLayout[7] =
-      debugLoadLe32(bufPtr)
+      if layout.secLen >= 4: debugLoadLe32(cast[pointer](layout.sec))
+      else: 0'u32
+    nimFwDbgDhcpTxLayout[6] = snapTraceLo(layout)
+    nimFwDbgDhcpTxLayout[7] = 0
     nimFwDbgDhcpTxHdr0 =
       hdr.header.frameControl.uint32 or
       (hdr.header.seqCtrl.uint32 shl 16)
     nimFwDbgDhcpTxHdr2 =
       macAddrLo32(addr hdr.header.addr3) or
       (hdr.qosCtrl.uint32 shl 16)
-    var macRawLen = txDesc.hdrLen.uint32 + 32'u32
-    nimFwDbgDhcpMacRawLen = macRawLen
-    if macRawLen > nimFwDbgDhcpMacRaw.len.uint32:
-      macRawLen = nimFwDbgDhcpMacRaw.len.uint32
-    if macRawLen != 0'u32:
+    # The header-end pointer does not own any payload bytes. Gather the prefix
+    # from descriptor spans, stopping at either the frame or snapshot boundary.
+    for value in nimFwDbgDhcpMacRaw.mitems:
+      value = 0
+    let rawCapacity = nimFwDbgDhcpMacRaw.len.uint32
+    let rawHeaderLen = min(txDesc.hdrLen.uint32, rawCapacity)
+    if rawHeaderLen != 0:
       discard c_memcpy(addr nimFwDbgDhcpMacRaw[0], cast[pointer](layout.mac),
-                       macRawLen.csize_t)
+                       rawHeaderLen.csize_t)
+    var macRawLen = rawHeaderLen
+    let payloadBytes = txPayloadChainLength(txDesc)
+    var remainingPayload =
+      if payloadBytes == txDesc.seqPassthrough.int32:
+        min(txDesc.seqPassthrough.uint32, 32'u32)
+      else: 0'u32
+    for i in 0 ..< txDesc.bufferPtrs.len:
+      if remainingPayload == 0 or macRawLen == rawCapacity:
+        break
+      let start = txDesc.bufferPtrs[i]
+      let length = txDesc.bufferLens[i]
+      let copied = min(length, min(remainingPayload, rawCapacity - macRawLen))
+      discard c_memcpy(addr nimFwDbgDhcpMacRaw[macRawLen],
+                       cast[pointer](start.uint), copied.csize_t)
+      macRawLen += copied
+      remainingPayload -= copied
+    for i in 0 ..< min(macRawLen - rawHeaderLen, 4'u32):
+      nimFwDbgDhcpTxLayout[7] = nimFwDbgDhcpTxLayout[7] or
+        (nimFwDbgDhcpMacRaw[rawHeaderLen + i].uint32 shl (8 * i))
+    nimFwDbgDhcpMacRawLen = macRawLen
   true
 
 proc txu_cntrl_frame_build*(desc: pointer, bufPtr: pointer) {.exportc, cdecl.} =
@@ -386,7 +371,7 @@ proc txu_cntrl_push*(param: pointer; ac: uint8): bool {.exportc, cdecl.} =
   if tid != 0xFF:
     let staInfoForSeq = desc.staInfoIdx
     let staSeq = staTxSequence(staInfoForIdx(staInfoForSeq))
-    if tid >= staSeq.seqCounters.len.uint8:
+    if tid >= 8:
       txuCancelFrame(param, ac)
       return false
     hdrLen = 26
