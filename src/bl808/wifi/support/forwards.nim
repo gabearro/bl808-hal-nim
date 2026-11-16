@@ -3,6 +3,8 @@ proc vendorPutsRaw(s: cstring)
 proc vendorPrintU32(value: uint32; base: uint32)
 proc vendorPollOnce()
 proc osMsleep(ms: clong): cint {.cdecl.}
+proc osEnterCritical(): uint32 {.cdecl.}
+proc osExitCritical(level: uint32) {.cdecl.}
 proc bl_wifi_clock_enable*(): cint {.exportc, cdecl.}
 proc bl_wifi_enable_irq*(): cint {.exportc, cdecl.}
 proc bl_wifi_mac_addr_get*(mac: ptr uint8): cint {.exportc, cdecl.}

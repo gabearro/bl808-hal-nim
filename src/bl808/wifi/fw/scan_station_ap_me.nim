@@ -55,9 +55,9 @@ proc scan_set_channel_request*(param: pointer) {.exportc, cdecl.} =
   let scanChan = scanReq.channelList[scanIdx.int]
   if directFreq == 0:
     if (scanChan.flags and 1) != 0:
-      freqWord = scan_env.activeDuration
-    else:
       freqWord = scan_env.passiveDuration
+    else:
+      freqWord = scan_env.activeDuration
   else:
     freqWord = scan_env.joinActiveDuration
   chanCfg.duration = freqWord

@@ -91,6 +91,7 @@ include wifi/fw/ipc_embedded
 include wifi/fw/platform_bl
 include wifi/fw/crypto_mfp_hsu
 include wifi/fw/mac_config_debug
+include wifi/fw/mac_config_entries
 include wifi/fw/coex_intc_sysctrl
 include wifi/fw/task_handlers
 include wifi/fw/tx_security

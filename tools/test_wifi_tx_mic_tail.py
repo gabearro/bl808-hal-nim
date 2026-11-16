@@ -208,6 +208,7 @@ proc hostTxHwDescAt(p: pointer): ptr Hardware = cast[ptr Hardware](p)
     builder = procedure((FW / "tx_layer.nim").read_text(), "txlBuildBufferThd")
     names = sorted(set(re.findall(r"\bnimFwDbg\w+", builder)))
     code += "\nvar\n" + "".join(f"  {name}: uint32\n" for name in names)
+    code += procedure((FW / "layout_types.nim").read_text(), "txPayloadChainLength")
     code += builder + r'''
 for cipher in [0'u8, 1, 3]:
   prepare(cipher, false, 0)

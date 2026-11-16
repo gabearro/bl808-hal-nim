@@ -2,9 +2,9 @@
 __attribute__((weak)) int printf(const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
-  bl808_nim_vendor_vprintf(fmt, ap);
+  int result = bl808_nim_vendor_vprintf(fmt, ap);
   va_end(ap);
-  return 0;
+  return result;
 }
 
 __attribute__((weak)) int puts(const char *s) {

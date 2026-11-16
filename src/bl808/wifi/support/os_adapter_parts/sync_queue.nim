@@ -1,13 +1,39 @@
 ## Semaphore, mutex, and queue adapter callbacks.
 
 proc osSemCreate(init: uint32): pointer {.cdecl.} =
-  result = c_calloc(1, sizeof(SimpleEventGroup).csize_t)
-  if result != nil: cast[ptr SimpleEventGroup](result).bits = init
-proc osSemDelete(sem: pointer) {.cdecl.} = c_free(sem)
+  result = c_calloc(1, sizeof(SimpleSemaphore).csize_t)
+  if result != nil:
+    cast[ptr SimpleSemaphore](result).available = init != 0
+proc osSemDelete(sem: pointer) {.cdecl.} = osObjectDelete(sem)
 proc osSemTake(sem: pointer; tick: uint32): int32 {.cdecl.} =
-  if osEventGroupWait(sem, 1, 1, 1, tick) != 0: 0 else: -1
+  if not osObjectRetain(sem):
+    return 1
+  defer: osObjectRelease(sem)
+  let semaphore = cast[ptr SimpleSemaphore](sem)
+  var state = osWaitState(tick)
+  var waitMore = tick != 0
+  while true:
+    block:
+      let saved = osEnterCritical()
+      defer: osExitCritical(saved)
+      if semaphore.header.deleted:
+        return 1
+      if semaphore.available:
+        semaphore.available = false
+        return 0
+      if not waitMore:
+        return 1
+    waitMore = osWaitAgain(state)
 proc osSemGive(sem: pointer): int32 {.cdecl.} =
-  discard osEventGroupSend(sem, 1)
+  if not osObjectRetain(sem):
+    return 1
+  defer: osObjectRelease(sem)
+  let semaphore = cast[ptr SimpleSemaphore](sem)
+  let saved = osEnterCritical()
+  defer: osExitCritical(saved)
+  if semaphore.header.deleted or semaphore.available:
+    return 1
+  semaphore.available = true
   0
 proc osMutexCreate(): pointer {.cdecl.} = cast[pointer](1)
 proc osMutexDelete(mutex: pointer) {.cdecl.} = discard mutex
@@ -27,42 +53,76 @@ proc osMutexUnlock(mutex: pointer): int32 {.cdecl.} =
   0
 
 proc osQueueCreate(queueLen, itemSize: uint32): pointer {.cdecl.} =
-  let total = sizeof(SimpleQueue).uint + queueLen.uint * itemSize.uint
+  if queueLen == 0:
+    return nil
+  let total = sizeof(SimpleQueue).uint64 + queueLen.uint64 * itemSize.uint64
+  if total > high(uint32).uint64:
+    return nil
   result = c_calloc(1, total.csize_t)
   if result != nil:
     let queueState = cast[ptr SimpleQueue](result)
     queueState.itemSize = itemSize
     queueState.depth = queueLen
-proc osQueueDelete(queue: pointer) {.cdecl.} = c_free(queue)
+proc osQueueDelete(queue: pointer) {.cdecl.} = osObjectDelete(queue)
 proc osQueueSendWait(queue, item: pointer; length, ticks: uint32; prio: cint): cint {.cdecl.} =
-  discard ticks; discard prio
-  if queue == nil: return -1
+  discard length; discard prio
+  if not osObjectRetain(queue):
+    return 1
+  defer: osObjectRelease(queue)
   let queueState = cast[ptr SimpleQueue](queue)
-  if item == nil or length != queueState.itemSize or (queueState.writeIdx - queueState.readIdx) >= queueState.depth:
-    return -1
-  let queueWriteStorageSlot =
-    ptrAt(queue, sizeof(SimpleQueue).uint +
-      (queueState.writeIdx mod queueState.depth).uint * queueState.itemSize.uint)
-  copyMem(queueWriteStorageSlot, item, queueState.itemSize.uint)
-  inc queueState.writeIdx
-  0
+  if item == nil and queueState.itemSize != 0:
+    return 1
+  var state = osWaitState(ticks)
+  var waitMore = ticks != 0
+  while true:
+    block:
+      let saved = osEnterCritical()
+      defer: osExitCritical(saved)
+      if queueState.header.deleted:
+        return 1
+      if queueState.count < queueState.depth:
+        if queueState.itemSize != 0:
+          let slot = ptrAt(queue, sizeof(SimpleQueue).uint +
+            queueState.writeIdx.uint * queueState.itemSize.uint)
+          copyMem(slot, item, queueState.itemSize.uint)
+        if queueState.writeIdx == queueState.depth - 1:
+          queueState.writeIdx = 0
+        else:
+          inc queueState.writeIdx
+        inc queueState.count
+        return 0
+      if not waitMore:
+        return 1
+    waitMore = osWaitAgain(state)
 proc osQueueSend(queue, item: pointer; length: uint32): cint {.cdecl.} =
   osQueueSendWait(queue, item, length, 0, 0)
 proc osQueueRecv(queue, item: pointer; length, tick: uint32): cint {.cdecl.} =
-  if queue == nil or item == nil: return -1
+  discard length
+  if not osObjectRetain(queue):
+    return 1
+  defer: osObjectRelease(queue)
   let queueState = cast[ptr SimpleQueue](queue)
-  if length != queueState.itemSize: return -1
-  var loops = if tick != 0: tick else: 1'u32
-  while tick == BlOsWaitingForever or loops != 0:
-    if queueState.readIdx != queueState.writeIdx:
-      let queueReadStorageSlot =
-        ptrAt(queue, sizeof(SimpleQueue).uint +
-          (queueState.readIdx mod queueState.depth).uint * queueState.itemSize.uint)
-      copyMem(item, queueReadStorageSlot, queueState.itemSize.uint)
-      inc queueState.readIdx
-      return 0
-    if tick != BlOsWaitingForever:
-      dec loops
-    vendorPollOnce()
-    rawDelay(128)
-  -1
+  if item == nil and queueState.itemSize != 0:
+    return 1
+  var state = osWaitState(tick)
+  var waitMore = tick != 0
+  while true:
+    block:
+      let saved = osEnterCritical()
+      defer: osExitCritical(saved)
+      if queueState.header.deleted:
+        return 1
+      if queueState.count != 0:
+        if queueState.itemSize != 0:
+          let slot = ptrAt(queue, sizeof(SimpleQueue).uint +
+            queueState.readIdx.uint * queueState.itemSize.uint)
+          copyMem(item, slot, queueState.itemSize.uint)
+        if queueState.readIdx == queueState.depth - 1:
+          queueState.readIdx = 0
+        else:
+          inc queueState.readIdx
+        dec queueState.count
+        return 0
+      if not waitMore:
+        return 1
+    waitMore = osWaitAgain(state)

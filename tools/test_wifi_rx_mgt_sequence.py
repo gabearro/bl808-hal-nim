@@ -43,6 +43,11 @@ proc rxu_cntrl_check_pn(p: pointer; tid: uint8): cint =
 proc rxu_mgt_frame_check(param: pointer; staIdx: uint8): uint32 =
   doAssert param == (addr mpdu) and staIdx == 0
   if rejectManagement: return 0
+  let generation = rxUploadGeneration(param)
+  let capturedHeader = rxMpduHeader(param)
+  template currentFrame(): bool =
+    rxUploadCurrent(param, generation) and rxStationCurrent(param) and
+      rxMpduHeader(param) == capturedHeader
   let env = addr envState
   let envSeq = env.seqCtrl
   let mfpAcceptedFlag = 1'u8

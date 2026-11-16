@@ -1,26 +1,50 @@
+const MtimeSampleAttempts = 8
+var lastCoherentMtimeUs: uint64
+
+proc sampleMtimeUs(value: var uint64): bool =
+  # One rollover normally needs one retry. Bound incoherent reads too, and
+  # publish the RV32 two-word cache atomically with respect to IRQ readers.
+  let saved = osEnterCritical()
+  defer: osExitCritical(saved)
+  for attempt in 0 ..< MtimeSampleAttempts:
+    let highBefore = regRead32(MtimeBase + 4)
+    let low = regRead32(MtimeBase)
+    let highAfter = regRead32(MtimeBase + 4)
+    if highBefore == highAfter:
+      value = (highBefore.uint64 shl 32) or low.uint64
+      lastCoherentMtimeUs = value
+      return true
+  inc nimWifiDbgMtimeReadFailures
+  value = lastCoherentMtimeUs
+  false
+
 proc readMtimeUs(): uint64 =
-  # The mtime counter MUST be read with VOLATILE loads. A plain
-  # `cast[ptr UncheckedArray[uint32]]` deref is non-volatile, so the optimizer
-  # collapses the hi/lo/hi consistency loop into two loads AND hoists them out
-  # of delayMtimeUs's wait loop — `now` then never advances and the delay spins
-  # forever with interrupts masked (the silent all-core hang, root-caused via
-  # JTAG: PC stuck in rawDelay<-delayMtimeUs while HW mtime kept advancing).
-  # regRead32 uses a volatile load (see accessors.nim), so every iteration
-  # re-reads the live counter instead of a hoisted cached value.
-  var hi1, lo, hi2: uint32
-  while true:
-    hi1 = regRead32(MtimeBase + 4)
-    lo = regRead32(MtimeBase)
-    hi2 = regRead32(MtimeBase + 4)
-    if hi1 == hi2:
-      break
-  (uint64(hi1) shl 32) or uint64(lo)
+  discard sampleMtimeUs(result)
+
+proc delayFallback(us: uint32) =
+  # Preserve the full requested budget when it exceeds one rawDelay call.
+  var remaining = us.uint64 * 96'u64 + 2048'u64
+  while remaining != 0:
+    let chunk = min(remaining, high(uint32).uint64).uint32
+    rawDelay(chunk)
+    remaining -= chunk.uint64
 
 proc delayMtimeUs(us: uint32) =
   inc nimWifiDbgDelayCalls
   nimWifiDbgDelayLastUs = us
-  var now = readMtimeUs()
+  nimWifiDbgDelayLastStale = 0
+  nimWifiDbgDelayLastStartLo = 0
+  nimWifiDbgDelayLastNowLo = 0
+  if us == 0:
+    return
+  var now: uint64
+  let sampled = sampleMtimeUs(now)
   nimWifiDbgDelayLastStartLo = uint32(now and 0xFFFF_FFFF'u64)
+  nimWifiDbgDelayLastNowLo = nimWifiDbgDelayLastStartLo
+  if not sampled:
+    inc nimWifiDbgDelayFallbacks
+    delayFallback(us)
+    return
   var last = now
   let deadline = now + us.uint64
   var staleReads: uint32
@@ -33,25 +57,27 @@ proc delayMtimeUs(us: uint32) =
   # resetting), so it is not a sufficient guard. Bound the TOTAL spin: at ~1
   # rawDelay(32) per iteration, cap so even a fully-frozen clock exits after a
   # bounded, still-generous nop delay instead of hanging the whole M0 forever.
-  # Cap scales with the requested us but is clamped so a huge `us` can't spin
-  # unbounded either.
+  # Widen before scaling so a large request cannot wrap to a small cap.
   var iters: uint32 = 0
-  let iterCap = min(us * 4'u32 + 4096'u32, 262144'u32)
-  while int64(now - deadline) < 0:
+  let iterCap = min(us.uint64 * 4'u64 + 4096'u64, 262144'u64).uint32
+  while cast[int64](now - deadline) < 0:
     rawDelay(32)
     inc iters
     if iters >= iterCap:
       inc nimWifiDbgDelayFallbacks
-      rawDelay(us * 96'u32 + 2048'u32)
+      delayFallback(us)
       return
-    now = readMtimeUs()
+    if not sampleMtimeUs(now):
+      inc nimWifiDbgDelayFallbacks
+      delayFallback(us)
+      return
     nimWifiDbgDelayLastNowLo = uint32(now and 0xFFFF_FFFF'u64)
     if now == last:
       inc staleReads
       nimWifiDbgDelayLastStale = staleReads
       if staleReads > 1024:
         inc nimWifiDbgDelayFallbacks
-        rawDelay(us * 96'u32 + 2048'u32)
+        delayFallback(us)
         return
     else:
       last = now

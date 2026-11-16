@@ -2292,15 +2292,17 @@ proc element_notify_status_enabled*(): uint32 {.exportc, cdecl.} =
   ## From blob (2 instrs): always returns 0 (disabled).
   return 0
 
-proc element_notify*(ctx: pointer, op: uint32, param1: pointer, param2: pointer) {.exportc, cdecl.} =
-  ## Send element notification via platform log function.
-  ## From blob (notifier.o, 13 instrs): loads log function from g_bl_ops_funcs+0xCC,
-  ## reads ctx+8 for state, calls logFn(1, 0, fmtStr, 1826, fileStr, ctxState, param2).
-  let logFn = getLogFunc(0xCC)
+proc element_notify*(entry, arg1, arg2: pointer; operation: uint8): cint {.exportc, cdecl, discardable.} =
+  ## The MM configuration callback logs the entry name and operation byte.
+  ## Both opaque arguments are unused, and the vendor returns zero.
+  if entry == nil:
+    return 0
+  let logFn = getLogFunc(204)
   if logFn != nil:
-    let ctxState = elementNotifyContextAt(ctx).state
-    cast[proc(a0: uint32, a1: uint32, a2: cstring, a3: uint32, a4: cstring, a5: pointer, a6: pointer) {.cdecl.}](logFn)(
-      1, 0, "element_notify", 1826, "notifier.c", ctxState, param2)
+    let name = cast[cstring](cfgApiElementEntryAt(entry).name)
+    logFn(1, nil, "mm.c", 1826, "[MM] %s is notfied, with ops %d\r\n",
+          name, operation.cint)
+  0
 
 proc is_cck_group*(rateConfig: uint32): bool {.exportc, cdecl, noinline.} =
   ## Check if a rate configuration belongs to a CCK (DSSS) rate group.

@@ -175,6 +175,38 @@ def test_protected_header(tmp_path: Path, mode: str, case: str) -> None:
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_real_qos_field_location(tmp_path: Path, mode: str) -> None:
+    layout = (FW / "layout_types.nim").read_text()
+    code = layouts("MacDataFrameHeaderView", "MacQosDataFrameHeaderView",
+                   "MacQos4AddrFrameHeaderView")
+    for name in ["macQosDataFrameAt", "macQos4AddrFrameAt"]:
+        start = layout.index("template " + name + "(")
+        code += layout[start:layout.index("\n\n", start)] + "\n"
+    code += procedure(layout, "rxMacHeaderLen")
+    code += procedure(layout, "rxQosControl")
+    run_program(tmp_path, mode, code + r'''
+var storage: array[48, uint8]
+for subtype in countup(0x88'u16, 0xF8'u16, 0x10'u16):
+  for ds in [0'u16, 0x100, 0x200, 0x300]:
+    for order in [0'u16, 0x8000]:
+      for protectedBit in [0'u16, 0x4000]:
+        let fc = subtype or ds or order or protectedBit
+        let offset = if ds == 0x300: 30 else: 24
+        for alignment in 0..3:
+          for value in [0'u16, 0x80, 0xFF, 0x1234, 0xFFFF]:
+            for index in 0..<storage.len: storage[index] = 0xA5
+            storage[alignment] = fc.uint8
+            storage[alignment + 1] = (fc shr 8).uint8
+            storage[alignment + offset] = (value and 255).uint8
+            storage[alignment + offset + 1] = (value shr 8).uint8
+            let original = storage
+            let frame = cast[ptr MacDataFrameHeaderView](addr storage[alignment])
+            doAssert rxQosControl(frame, rxMacHeaderLen(fc)) == value
+            doAssert storage == original
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 @pytest.mark.parametrize("eapol", [False, True], ids=["data", "eapol"])
 def test_dispatch_with_real_protected_header(tmp_path: Path, mode: str, eapol: bool) -> None:
     run_program(tmp_path, mode, dispatch_source() + f"const testEapol = {str(eapol).lower()}\n" + r'''

@@ -79,6 +79,7 @@ var
   calls: seq[string]
 proc nimFwConnectTrace2U32(text: string; a, b: uint32) = discard
 proc rfPriLoadConfiguredDeviceInfo() = calls.add("device")
+proc seedWlCfgTxPowerDefaults(cfg: ptr WlRfConfig) = discard
 proc wl_cfg_get(rmem: ptr WlRfMemoryOverlay): ptr WlRfConfig =
   calls.add("cfg")
   addr rmem.config
@@ -292,7 +293,9 @@ proc rfPriComputeTemperaturePowerComp(channel: uint32; temperature: int32): int1
 proc rf_pri_set_channel_total_pwr_comp(channel: uint32) = indices.add(channel)
 proc rf_pri_set_channel_lp_pwr_comp(channel: uint32) = indices.add(channel)
 '''
-    return (code + rf_procedure(rf, "rfSignExtend16") + rf_procedure(rf, "rf_pri_set_temp_comp")
+    return (code + rf_procedure(rf, "rfSignExtend16")
+            + rf_procedure(rf, "rfPriSensorTemperatureTenths")
+            + rf_procedure(rf, "rf_pri_set_temp_comp")
             + rf_procedure(rf, "rf_pri_set_channel_pwr_comp"))
 
 

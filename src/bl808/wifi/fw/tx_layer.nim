@@ -354,26 +354,14 @@ proc txlBuildBufferThd(param: pointer): bool =
   hwDesc.status = 0
   hwDesc.controlFlags = 0
   # Validate the complete chain before writing any links or inclusive ranges.
-  var payloadBytes = 0'u32
-  var payloadEnded = false
-  for i in 0 ..< desc.bufferPtrs.len:
-    let start = desc.bufferPtrs[i]
-    let length = desc.bufferLens[i]
-    if start == 0:
-      if length != 0:
-        return false
-      payloadEnded = true
-    else:
-      if payloadEnded or length == 0 or length - 1 > high(uint32) - start:
-        return false
-      if length > desc.seqPassthrough.uint32 - payloadBytes:
-        return false
-      payloadBytes += length
+  let payloadBytes = txPayloadChainLength(desc)
+  if payloadBytes < 0:
+    return false
   if payloadBytes == 0:
     inc nimFwDbgTxThdNoBuffer
     nimFwDbgTxThdNoBufferDesc = pointerAddrU32(param)
     return false
-  if payloadBytes != desc.seqPassthrough.uint32:
+  if payloadBytes.uint32 != desc.seqPassthrough.uint32:
     return false
   let headerBuf = cast[uint32](cast[uint](addr linkDesc.macHeader[0]))
   if linkDesc.headerLen == 0 or linkDesc.headerLen - 1 > high(uint32) - headerBuf:
@@ -3905,7 +3893,7 @@ proc txl_frame_send_qosnull_frame*(staIdx: uint8, qosCtrl: uint16,
   ##   Calls txl_frame_push(desc, 3), returns (result^1)&0xFF
   let saved = irqSave()
   defer: irqRestore(saved)
-  if staIdx >= STA_INFO_TAB_ENTRIES.uint8:
+  if staIdx >= STA_INFO_TAB_ENTRIES.uint8 or (qosCtrl and 0x0F'u16) >= 8:
     return 1
   let sta = staInfoForIdx(staIdx)
   let vifIdx = sta.instNbr

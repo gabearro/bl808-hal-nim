@@ -85,6 +85,19 @@ proc packet(data: seq[uint8]; split = 0): ptr Pbuf =
     doAssert result.next != nil
     copyMem(result.next.payload, unsafeAddr data[first], data.len - first)
     result.tot_len = data.len.uint16
+proc chunkedPacket(data: seq[uint8]; chunkSize: int): ptr Pbuf =
+  var tail: ptr Pbuf
+  var offset = 0
+  while offset < data.len:
+    let count = min(chunkSize, data.len - offset)
+    let node = pbuf_alloc(0, count.uint16, 0)
+    doAssert node != nil
+    copyMem(node.payload, unsafeAddr data[offset], count)
+    node.tot_len = (data.len - offset).uint16
+    if tail == nil: result = node
+    else: tail.next = node
+    tail = node
+    offset += count
 proc bl808_nim_netif_input_call(p: ptr Pbuf; netif: ptr Netif): int8 {.cdecl.} =
   if inputFail != 0: return -1
   var data = newSeq[uint8](p.tot_len.int)
@@ -179,6 +192,21 @@ for payloadLength in [8, 9, 10, 11, 256, 2304]:
         doAssert received == @[expected(a, strip), b]
         doAssert outstanding == 0 and mpduCalls == 0
 
+for firstLength in [1680, 1683, 2304]:
+  let first = subframe(firstLength, 0x86DD)
+  let second = subframe(2304, 0x80F3, bridge = true)
+  let third = subframe(2304, 0, snap = false)
+  var aggregate: seq[uint8]
+  aggregate.appendFrame(first, false)
+  aggregate.appendFrame(second, false)
+  aggregate.appendFrame(third, true)
+  for chunkSize in [257, 1736, 2303]:
+    reset()
+    let p = chunkedPacket(aggregate, chunkSize)
+    doAssert inputAmsdu(p, addr iface) == 0
+    doAssert received == @[expected(first, true), expected(second, true), third]
+    doAssert outstanding == 0
+
 # Validate the entire aggregate before delivering the first subframe.
 let valid = subframe(40, 0x0800)
 var combined: seq[uint8]
@@ -241,7 +269,9 @@ doAssert outstanding == 0 and received.len == 0
 
 
 @pytest.mark.parametrize("release_mode", [False, True])
-def test_amsdu_delivery_and_upload_offset(release_mode: bool, tmp_path: Path) -> None:
+@pytest.mark.parametrize("address_sanitizer", [False, True])
+def test_amsdu_delivery_and_upload_offset(release_mode: bool, address_sanitizer: bool,
+                                         tmp_path: Path) -> None:
     nim = shutil.which("nim")
     if nim is None:
         pytest.skip("nim is not installed")
@@ -263,6 +293,8 @@ proc fixtureDelivery(): RxNetifDelivery =
                "--skipUserCfg:on", "-d:bl808WifiRxPbufInput",
                f"--nimcache:{tmp_path / 'cache'}", f"-o:{tmp_path / 'test'}"]
     command += ["-d:release", "--checks:off"] if release_mode else ["--checks:on"]
+    if address_sanitizer:
+        command += ["--cc:clang", "--passC:-fsanitize=address", "--passL:-fsanitize=address"]
     result = subprocess.run(command + [str(path)], cwd=ROOT, text=True,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     assert result.returncode == 0, result.stdout

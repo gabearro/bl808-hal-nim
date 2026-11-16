@@ -398,6 +398,7 @@ proc rf_pri_get_xtalfreq(): uint32 {.exportc, cdecl.}
 proc rf_pri_xtalfreq() {.exportc, cdecl.}
 proc rf_pri_init_calib_mem() {.exportc, cdecl.}
 proc rf_pri_init(coldInit, mode: uint32) {.exportc, cdecl.}
+proc lp_rf_pri_init(coldInit, chipVersion: uint32) {.exportc, cdecl.}
 proc rf_pri_config_mode(mode: uint32) {.exportc, cdecl.}
 proc rf_pri_cfg_init() {.exportc, cdecl.}
 proc rf_pri_input_device_info(deviceInfo: uint32) {.exportc, cdecl.}

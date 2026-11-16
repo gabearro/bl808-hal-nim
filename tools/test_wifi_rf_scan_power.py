@@ -95,9 +95,9 @@ for delta in -40 .. 40:
       for value in row.mitems: value = signedHalf(randomWord().int64)
     for index in bl808RfTxPowerTableIndex.mitems: index = -123
     bl808RfChipVersion = 1
-    rf_pri_input_chip_ver(99)
     rf_pri_input_chip_ver(0)
-    doAssert bl808RfChipVersion == 99
+    doAssert bl808RfChipVersion == 1
+    rf_pri_input_chip_ver(99)
     bl808RfTempPowerComp = delta.int16
     bl808RfAppliedPowerComp = 0
     bl808RfChannelPowerComp[5] = 0

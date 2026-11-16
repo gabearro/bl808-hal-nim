@@ -220,9 +220,7 @@ var
   tpcPowerRateTable*: array[24, int8]
   tpcChannelOffsetTable*: array[14, int8]
 
-  # Config elements
-  cfgElements*: array[32, uint32]
-  cfgElementCount*: uint32
+  cfgApiEntries {.wifiCtrl.}: array[13, CfgApiElementEntryView]
 
   # ME environment (136-byte struct from me_init memset)
   me_env* {.exportc.}: array[34, uint32]  # 136 bytes = 34 words

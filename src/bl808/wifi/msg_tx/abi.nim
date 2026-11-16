@@ -34,6 +34,6 @@ proc c_strlen(s: cstring): csize_t
 proc bl_os_printf(fmt: cstring)
   {.importc, header: "bl_os_private.h", cdecl, varargs.}
 proc utils_tlv_bl_pack_auto(buf: ptr uint32; bufSz: cint; typ: uint16;
-                            arg1: pointer): uint32
+                            arg1: pointer): cint
   {.importc, header: "utils_tlv_bl.h", cdecl.}
 proc bl808_wifi_backend_poll(iterations: cuint) {.importc, cdecl.}

@@ -13,7 +13,8 @@ from test_wifi_tx_backup import PLATFORM
 
 def source() -> str:
     tx = (FW / "tx_layer.nim").read_text()
-    body = procedure(tx, "txlBuildBufferThd") + procedure(tx, "txl_buffer_update_thd")
+    body = (procedure((FW / "layout_types.nim").read_text(), "txPayloadChainLength")
+            + procedure(tx, "txlBuildBufferThd") + procedure(tx, "txl_buffer_update_thd"))
     debug = "\nvar\n" + "".join(
         f"  {name}: uint32\n" for name in sorted(set(re.findall(r"\bnimFwDbg\w+", body)))
     )

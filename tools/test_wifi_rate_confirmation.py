@@ -16,6 +16,7 @@ PLATFORM = r"""
 const
   MAX_VIFS = 2
   STA_INFO_TAB_ENTRIES = 7
+  RC_MAX_RATE_ENTRIES = 10
   StaTxPolicyUpdateRateControl = 1'u8
 type
   HostTxDescView = object
@@ -25,12 +26,15 @@ type
     flags: uint32
   RateEntry = object
     attempts, successes: uint16
+  RateCapabilities = object
+    sampleCount: uint16
   Stats = object
     retrySlots: array[4, tuple[rateIdx: uint16]]
     entries: array[10, RateEntry]
     totalSuccess, totalAttempts: uint16
     updateStage, retryLimit: uint8
     legacyRateMap, currentAmsduLen: uint16
+    capabilities: RateCapabilities
   Sta = object
     instNbr: uint8
     txPolicyUpdateFlags: array[1, uint8]
@@ -58,6 +62,8 @@ proc staInfoForIdx(index: uint8): ptr Sta =
   stationReads.add(index)
   addr stations[index]
 proc rcStatsCounters(p: pointer): ptr Stats = cast[ptr Stats](p)
+proc rcRateCapabilities(p: pointer): ptr RateCapabilities =
+  addr cast[ptr Stats](p).capabilities
 proc rcRateEntry(p: pointer; index: uint16): ptr RateEntry =
   doAssert index < 10
   addr cast[ptr Stats](p).entries[index]
@@ -72,6 +78,7 @@ proc setup() =
   dumps = 0
   for i in 0 ..< stations.len:
     stations[i].rcStats = addr stats[i]
+    stats[i].capabilities.sampleCount = 4
     stats[i].legacyRateMap = (1000 + i).uint16
     stats[i].currentAmsduLen = (2000 + i).uint16
     for slot in 0 ..< 4: stats[i].retrySlots[slot].rateIdx = slot.uint16
@@ -125,6 +132,40 @@ for aggregate in [false, true]:
     rc_update_counters(0, 7, 5, aggregate, retry)
     doAssert stats[0].entries[0] == RateEntry(attempts: 4, successes: 0)
     doAssert stats[0].entries[1] == RateEntry(attempts: 3, successes: 2)
+
+# Malformed confirmations cannot reach an out-of-table retry index or wrap
+# the attempt count. Unused retry slots do not affect a valid confirmation.
+for badSlot in [0, 1]:
+  setup()
+  stats[0].retrySlots[badSlot].rateIdx = 10
+  let before = stats[0]
+  rc_update_counters(0, 7, 5, false, false)
+  doAssert stats[0] == before
+setup()
+stats[0].capabilities.sampleCount = 1
+stats[0].retrySlots[1].rateIdx = 1
+let beforeStaleSlot = stats[0]
+rc_update_counters(0, 7, 5, false, false)
+doAssert stats[0] == beforeStaleSlot
+for invalidCount in [0'u16, 11'u16]:
+  setup()
+  stats[0].capabilities.sampleCount = invalidCount
+  let beforeInvalidCount = stats[0]
+  rc_update_counters(0, 1, 0, false, false)
+  doAssert stats[0] == beforeInvalidCount
+setup()
+stats[0].retrySlots[2].rateIdx = 10
+rc_update_counters(0, 7, 5, false, false)
+doAssert stats[0].entries[0] == RateEntry(attempts: 4, successes: 0)
+doAssert stats[0].entries[1] == RateEntry(attempts: 3, successes: 2)
+setup()
+let beforeBadFailures = stats[0]
+rc_update_counters(0, 2, 5, false, false)
+doAssert stats[0] == beforeBadFailures
+setup()
+let beforeBadAmpdu = stats[0]
+me_tx_cfm_ampdu(0, 2, 3, false)
+doAssert stats[0] == beforeBadAmpdu
 
 # Every retry count and terminal-status bit combination follows the vendor
 # formula; ACK bit 23 is independent of retry-limit bit 16.

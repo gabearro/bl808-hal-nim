@@ -54,6 +54,7 @@ type
     rateWord: uint16
     macAddr: array[6, uint8]
     sequences: Sequences
+    capabilityFlags: uint32
   Security = object
     cipher: uint8
   Vif = object
@@ -222,7 +223,8 @@ proc setup(fc: uint16; headerLen, payloadLen: int; secure = false) =
   for b in bytes.mitems: b = 0x35
   for sta in stations.mitems:
     sta = StaInfoView(valid: 1, controlPortState: 2, rateWord: 0x888E,
-      sequences: Sequences(nonQosSeqCtrl: 0xFFFF))
+      sequences: Sequences(nonQosSeqCtrl: 0xFFFF),
+      capabilityFlags: (if (fc and 0x400C'u16) == 0x4000'u16: 8'u32 else: 0'u32))
   vifs = default(typeof(vifs))
   vifs[0].security.cipher = secure.uint8
   key = Key(cipherType: 2)
@@ -412,7 +414,10 @@ def dispatch_source() -> str:
             "  " + name, 1
         )[1].split("\n\n  ", 1)[0] + "\n"
     test_source += procedure(layout, "rxMacHeaderLen")
+    test_source += procedure(layout, "rxMgmtBodyValid")
     test_source += procedure(layout, "lmacGateHalfword")
+    test_source += procedure((ROOT / "src/bl808/wifi/fw/kernel_mac_channel.nim").read_text(),
+                             "mfp_is_robust_frame")
     for name in ["rxu_cntrl_machdr_len_get", "rxuQosSeqCachePtr",
                  "rxuCipherIsCcmp", "rxuFindSnapOffset", "rxuTrySoftwareCcmpDecrypt",
                  "rxuCopyFrameBytes", "rxuPortAllows", "rxuAmsduValid"]:

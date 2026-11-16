@@ -18,6 +18,9 @@ proc c_memmove(dst, src: pointer, n: csize_t): pointer {.importc: "memmove", hea
 proc c_strlen(s: pointer): csize_t {.importc: "strlen", header: "<string.h>".}
 proc c_snprintf(buf: pointer, size: csize_t, fmt: cstring): cint {.importc: "snprintf", header: "<stdio.h>", varargs.}
 proc c_sprintf(buf: pointer, fmt: cstring): cint {.importc: "sprintf", header: "<stdio.h>", varargs, discardable.}
+proc c_utils_tlv_bl_unpack_auto(buf: ptr uint32; size: cint; typ: uint16;
+                               output: pointer): cint
+  {.importc: "utils_tlv_bl_unpack_auto", cdecl.}
 
 proc copyIeBytes(ieDestCursor: pointer; ieSourceBytes: pointer; byteCount: uint): pointer {.inline.} =
   if byteCount != 0:

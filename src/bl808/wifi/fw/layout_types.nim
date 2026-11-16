@@ -157,10 +157,6 @@ type
     next*: pointer
     priority*: int32
 
-  ElementNotifyContextView {.packed.} = object
-    notifyBaseToStatePadding*: array[8, uint8]
-    state*: pointer
-
   KeEnvPsFlagsView {.packed.} = object
     flags*: uint8
     apPending*: uint8
@@ -1054,7 +1050,8 @@ type
     name*: pointer
     valueStorage*: pointer
     setHandler*: pointer
-    setHandlerTailPadding*: array[8, uint8]
+    getHandler*: pointer
+    notifyHandler*: pointer
 
   HostTxLinkDescView {.packed.} = object
     linkDescBaseToHeaderLenPadding*: uint32
@@ -2231,6 +2228,10 @@ type
   StatusCfmPayload {.packed.} = object
     status*: uint8
 
+  CfgStartReqPayload {.packed.} = object
+    operation*, taskId*, element*, valueType*, length*: uint32
+    data*: UncheckedArray[uint8]
+
   Status4CfmPayload {.packed.} = object
     status*: uint8
     statusTailPadding*: array[3, uint8]
@@ -2452,9 +2453,6 @@ static:
   doAssert offsetof(NotifierNodeView, next) == 4
   doAssert offsetof(NotifierNodeView, priority) == 8
   doAssert sizeof(NotifierNodeView) == 12
-  doAssert offsetof(ElementNotifyContextView, notifyBaseToStatePadding) == 0
-  doAssert offsetof(ElementNotifyContextView, state) == 8
-  doAssert sizeof(ElementNotifyContextView) == 12
   doAssert sizeof(KeEnvPsFlagsView) == 5
   doAssert offsetof(KeEnvPsFlagsView, flags) == 0
   doAssert offsetof(KeEnvPsFlagsView, apPending) == 1
@@ -3620,13 +3618,21 @@ static:
   doAssert offsetof(HostTxMicScratchView, pendingWord) == 16
   doAssert offsetof(HostTxMicScratchView, micInputScratch) == 20
   doAssert sizeof(CfgApiElementEntryView) == 28
+  doAssert sizeof(CfgStartReqPayload) == 20
+  doAssert offsetof(CfgStartReqPayload, operation) == 0
+  doAssert offsetof(CfgStartReqPayload, taskId) == 4
+  doAssert offsetof(CfgStartReqPayload, element) == 8
+  doAssert offsetof(CfgStartReqPayload, valueType) == 12
+  doAssert offsetof(CfgStartReqPayload, length) == 16
+  doAssert offsetof(CfgStartReqPayload, data) == 20
   doAssert offsetof(CfgApiElementEntryView, id) == 0
   doAssert offsetof(CfgApiElementEntryView, subId) == 4
   doAssert offsetof(CfgApiElementEntryView, typeId) == 6
   doAssert offsetof(CfgApiElementEntryView, name) == 8
   doAssert offsetof(CfgApiElementEntryView, valueStorage) == 12
   doAssert offsetof(CfgApiElementEntryView, setHandler) == 16
-  doAssert offsetof(CfgApiElementEntryView, setHandlerTailPadding) == 20
+  doAssert offsetof(CfgApiElementEntryView, getHandler) == 20
+  doAssert offsetof(CfgApiElementEntryView, notifyHandler) == 24
   doAssert offsetof(HostTxLinkDescView, linkDescBaseToHeaderLenPadding) == 0
   doAssert offsetof(HostTxLinkDescView, headerLen) == 4
   doAssert offsetof(HostTxLinkDescView, headerLenToHeaderThdPadding) == 8
@@ -4075,9 +4081,6 @@ proc copyIpcPayloadWords(destPayload: pointer; sourcePayload: pointer; byteLen: 
 template notifierNodeView(node: ptr CoListHdr): ptr NotifierNodeView =
   cast[ptr NotifierNodeView](node)
 
-template elementNotifyContextAt(ctx: pointer): ptr ElementNotifyContextView =
-  cast[ptr ElementNotifyContextView](ctx)
-
 template keMsgExternalPayload*(param: pointer): pointer =
   cast[pointer](cast[uint](param) - 8'u)
 
@@ -4398,6 +4401,26 @@ proc vifChannelCenterFreq2(vif: ptr VifChannelView): uint16 {.inline.} =
 proc lmacGateHalfword(value: uint16): uint16 {.inline.} =
   ((value and 0x00ff'u16) shl 8) or (value shr 8)
 
+proc txPayloadChainLength(desc: ptr HostTxDescView): int32 =
+  ## Negative means an invalid span or a non-contiguous descriptor chain.
+  var payloadBytes = 0'u32
+  var payloadEnded = false
+  for i in 0 ..< desc.bufferPtrs.len:
+    let start = desc.bufferPtrs[i]
+    let length = desc.bufferLens[i]
+    if start == 0:
+      if length != 0:
+        return -1
+      payloadEnded = true
+    else:
+      if payloadEnded or length == 0 or
+          (length - 1).uint > (high(typeof(start)) - start).uint:
+        return -1
+      if length > desc.seqPassthrough.uint32 - payloadBytes:
+        return -1
+      payloadBytes += length
+  payloadBytes.int32
+
 proc txFrameBaseMacLen(desc: ptr HostTxDescView): uint8 {.inline.} =
   if desc.staIdx == 0xFF'u8: 24'u8
   else: sizeof(MacQosDataFrameHeaderView).uint8
@@ -4432,7 +4455,10 @@ proc txFrameWriteSnap(layout: TxFrameBuildLayout; ethertype: uint16) {.inline.} 
     layout.snap.dsap = 0xAA'u8
     layout.snap.ssap = 0xAA'u8
     layout.snap.control = 0x03'u8
+    # AARP/IPX need bridge-tunnel encapsulation; ethertype is in wire order.
     layout.snap.oui = [0'u8, 0'u8, 0'u8]
+    if ethertype == 0xF380'u16 or ethertype == 0x3781'u16:
+      layout.snap.oui[2] = 0xF8'u8
     layout.snap.ethertype = ethertype
 
 proc macAddrLo32(addrBytes: ptr array[6, uint8]): uint32 {.inline.} =
@@ -5310,8 +5336,8 @@ type
     channelIndex*: uint8
     abortFlag*: uint8
     abortFlagDurationPadding*: uint8
-    activeDuration*: uint32
     passiveDuration*: uint32
+    activeDuration*: uint32
     joinActiveDuration*: uint32
 
   ScanProbeReqIeObj* {.packed.} = object
@@ -5944,6 +5970,38 @@ proc rxQosControl(frame: ptr MacDataFrameHeaderView; machdrLen: uint8): uint16 {
 template rxFrameBytes(frame: pointer): ptr UncheckedArray[uint8] =
   cast[ptr UncheckedArray[uint8]](frame)
 
+proc rxMgmtBodyValid(frameControl: uint16; frame: pointer;
+    bodyOffset, frameLength: uint16): bool {.inline.} =
+  if (frameControl and 0x000C'u16) != 0 or frame == nil or
+      bodyOffset < rxMacHeaderLen(frameControl).uint16 or bodyOffset > frameLength:
+    return false
+  let bodyLength = frameLength - bodyOffset
+  let subtype = frameControl and 0x00FC'u16
+  let minimum =
+    case subtype
+    of 0x00'u16: 4'u16   # Association Request
+    of 0x10'u16, 0x30'u16: 6'u16  # (Re)association Response
+    of 0x20'u16: 10'u16  # Reassociation Request
+    of 0x50'u16, 0x80'u16: 12'u16  # Probe Response / Beacon
+    of 0xA0'u16, 0xC0'u16: 2'u16  # Reason code
+    of 0xB0'u16: 6'u16   # Authentication fixed fields
+    of 0xD0'u16: 2'u16   # Category and Action
+    else: 0'u16
+  if bodyLength < minimum:
+    return false
+  if subtype == 0xD0'u16:
+    let body = cast[ptr UncheckedArray[uint8]](frame)
+    let category = body[bodyOffset.int]
+    let action = body[bodyOffset.int + 1]
+    if category == 3:
+      case action
+      of 0, 1: return bodyLength >= 9  # ADDBA Request / Response
+      of 2: return bodyLength >= 6     # DELBA
+      else: discard
+    elif category == 8:
+      return bodyLength >= 4           # SA Query transaction identifier
+  true
+
 template rxFrameWords(frame: pointer): ptr UncheckedArray[uint32] =
   cast[ptr UncheckedArray[uint32]](frame)
 
@@ -6062,6 +6120,9 @@ static:
   doAssert offsetof(ScanuChannelConfigOverlay, count) == 84
   doAssert sizeof(ScanEnvObj) == 24
   doAssert offsetof(ScanEnvObj, abortFlagDurationPadding) == 11
+  doAssert offsetof(ScanEnvObj, passiveDuration) == 12
+  doAssert offsetof(ScanEnvObj, activeDuration) == 16
+  doAssert offsetof(ScanEnvObj, joinActiveDuration) == 20
   doAssert sizeof(ScanProbeReqIeObj) == 236
   doAssert offsetof(ScanProbeReqIeObj, probeIeStateWord) == 20
   doAssert offsetof(ScanProbeReqIeObj, ieData) == 36

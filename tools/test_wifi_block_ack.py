@@ -261,13 +261,15 @@ for params in 0'u32 .. 65535'u32:
   let p = request(message, station, params.uint16)
   doAssert rxu_mgt_ind_handler_bam(p) == 0
   doAssert allocations == 1 and pushes == 1
-  doAssert mmio == 0xABCD0090'u32
+  let supported = ((params shr 2) and 15) < 8
+  doAssert mmio == (if supported: 0xABCD0090'u32 else: 0xABCD0010'u32)
   let body = addBaRspActionBodyAt(addr link.macHeader[24])
   let requestedWindow = params shr 6
-  let acceptedWindow = min(requestedWindow, 12'u32)
+  let acceptedWindow = if requestedWindow == 0: 12'u32 else: min(requestedWindow, 12'u32)
   let expected = ((acceptedWindow shl 6) or (params and 0x3E) or 2).uint16
   doAssert body.baParams == expected, "ADDBA response loses TID/policy/window"
-  doAssert body.statusCode == 0 and body.timeout == 0 and body.dialogToken == 0xEF
+  doAssert body.statusCode == (if supported: 0'u16 else: 37'u16)
+  doAssert body.timeout == 0 and body.dialogToken == 0xEF
 """,
     "malformed": r"""
 for invalid in 0 .. 8:

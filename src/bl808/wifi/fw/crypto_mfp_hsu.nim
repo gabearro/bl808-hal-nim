@@ -3,7 +3,8 @@
 # ###########################################################################
 
 proc mfpIgnoreRxMgmtFrame(desc, param, frameBodyPtr: pointer,
-    frameTotalLen: uint16, upload: ptr uint8, flags: ptr uint8): bool =
+    frameTotalLen: uint16, upload: ptr uint8, flags: ptr uint8,
+    generation: uint32): bool =
   ## True means ignored. Upload and indication flags are separate outputs.
   template reject(): untyped =
     if upload != nil: upload[] = 0
@@ -27,24 +28,38 @@ proc mfpIgnoreRxMgmtFrame(desc, param, frameBodyPtr: pointer,
   let keyPtrs = vifKeyPointers(vif)
   if cast[pointer](keyPtrs.groupKeyPtr) == nil:
     # A missing IGTK must not disable group protection for a PMF peer.
-    if (mgmt.flags and 1) == 0 or
-        (staInfoForIdx(staIdx).capabilityFlags and 8) == 0:
+    if (mgmt.flags and 1) == 0:
+      # Handshake deauth/disassoc remain usable, but robust Actions must wait
+      # for key establishment, whether or not their Protected bit is set.
+      if (frameCtrl and 0xFC'u16) == 0xD0'u16 and
+          (staInfoForIdx(staIdx).capabilityFlags and 8) != 0:
+        reject()
+      return false
+    if (staInfoForIdx(staIdx).capabilityFlags and 8) == 0:
       return false
   # Offset 36 aliases the first destination-address byte in RX status.
   if (mgmt.flags and 1) != 0:
     if (bodyOff.int + 19) >= frameTotalLen.int:
       reject()
-    let ieSearchLen = frameTotalLen.int - bodyOff.int - 2
-    let ieSearchStart = ieCursorAfter(frameBodyPtr, bodyOff.uint + 2)
-    let mmiePtr = mac_ie_find(ieSearchStart, ieSearchLen.uint32, 76)
-    if mmiePtr == nil:
+    let identity = if desc == nil: default(RxFrameIdentity) else: rxCaptureFrame(desc)
+    let rx = cast[ptr RxSwDescView](identity.header)
+    if desc != nil and (identity.frame != frameBodyPtr or
+        identity.length != frameTotalLen or identity.generation != generation):
       reject()
-    # BIP's MMIE terminates the frame and has an eight-byte MIC.
-    if cast[uint](mmiePtr) + sizeof(MmIeView).uint !=
-        cast[uint](frameBodyPtr) + frameTotalLen.uint:
+    template frameCurrent(): bool =
+      desc == nil or rxFrameCurrent(identity)
+    if not frameCurrent(): reject()
+    # The terminal MMIE follows arbitrary subtype-specific fields, not just IEs.
+    var receivedMmie: MmIeView
+    let mmieOffset = frameTotalLen.uint32 - sizeof(MmIeView).uint32
+    if rx == nil:
+      discard c_memcpy(addr receivedMmie, ieCursorAfter(frameBodyPtr, mmieOffset.uint),
+                        sizeof(receivedMmie).csize_t)
+    elif not rxuCopyFrameBytes(rx, mmieOffset, sizeof(receivedMmie).uint32, addr receivedMmie):
       reject()
-    let mmie = mmieAt(mmiePtr)
-    if mmie.ie.len != 16:
+    if not frameCurrent(): reject()
+    let mmie = addr receivedMmie
+    if mmie.ie.id != 76 or mmie.ie.len != 16:
       reject()
     let keyId = mmie.keyId
     if keyId < 4 or keyId > 5:
@@ -66,16 +81,20 @@ proc mfpIgnoreRxMgmtFrame(desc, param, frameBodyPtr: pointer,
         reject()
       if desc != nil and not rxKeyCurrent(desc, cast[pointer](bipKey)):
         reject()
+      if not frameCurrent(): reject()
       keyRevision = rxKeyLastChanged[keyIndex]
       keyClock = rxKeyRevision
       let storedNext = replay.pnLow.uint64 or (replay.pnHigh.uint64 shl 32)
       if nextIpn <= storedNext:
         reject()
     let expectedMic = mmie.mic
-    mmie.mic = default(typeof(mmie.mic))
-    let actualMic = mfp_compute_bip(cast[pointer](bipKey), frameBodyPtr,
-                                    frameTotalLen.uint32, bodyOff.uint32)
-    mmie.mic = expectedMic
+    var actualMic: uint64
+    if rx == nil:
+      actualMic = mfp_compute_bip(cast[pointer](bipKey), frameBodyPtr,
+                                  frameTotalLen.uint32, bodyOff.uint32)
+    elif not mfpComputeRxBip(cast[pointer](bipKey), frameBodyPtr,
+        frameTotalLen.uint32, bodyOff.uint32, rx, actualMic):
+      reject()
     var difference = 0'u8
     for i in 0 ..< 8:
       difference = difference or (expectedMic[i] xor
@@ -91,6 +110,7 @@ proc mfpIgnoreRxMgmtFrame(desc, param, frameBodyPtr: pointer,
         reject()
       if desc != nil and not rxKeyCurrent(desc, cast[pointer](bipKey)):
         reject()
+      if not frameCurrent(): reject()
       let storedNext = replay.pnLow.uint64 or (replay.pnHigh.uint64 shl 32)
       if nextIpn <= storedNext:
         reject()
@@ -113,7 +133,7 @@ proc mfpIgnoreRxMgmtFrame(desc, param, frameBodyPtr: pointer,
 
 proc mfp_ignore_mgmt_frame*(param: pointer, frameBodyPtr: pointer,
     frameTotalLen: uint16, upload: ptr uint8, flags: ptr uint8): bool {.exportc, cdecl.} =
-  mfpIgnoreRxMgmtFrame(nil, param, frameBodyPtr, frameTotalLen, upload, flags)
+  mfpIgnoreRxMgmtFrame(nil, param, frameBodyPtr, frameTotalLen, upload, flags, 0)
 
 proc mfp_protect_mgmt_frame*(frameDesc: pointer, fc: uint32, action: uint32 = 0): uint32 {.exportc, cdecl, noinline.} =
   ## Return 0 for no protection, 1 for pairwise CCMP, or 2 for group BIP.
@@ -123,8 +143,6 @@ proc mfp_protect_mgmt_frame*(frameDesc: pointer, fc: uint32, action: uint32 = 0)
     return 0
   let vif = vifChannelForIdx(vifIdx)
   let secCtx = cast[pointer](vifKeyPointers(vif).groupKeyPtr)
-  if secCtx == nil:
-    return 0
   if not mfp_is_robust_frame(fc, action):
     return 0
   let staIdx = desc.staInfoIdx
@@ -132,7 +150,11 @@ proc mfp_protect_mgmt_frame*(frameDesc: pointer, fc: uint32, action: uint32 = 0)
     return 0
   let sta = staInfoForIdx(staIdx)
   if (sta.macAddr[0] and 1) != 0:
-    return 2
+    return (if secCtx == nil: 0'u32 else: 2'u32)
+  # Robust Actions require pairwise protection even before an IGTK exists.
+  # The caller cancels the frame if the pairwise header cannot be built.
+  if secCtx == nil and (fc and 0xFC'u32) != 0xD0'u32:
+    return 0
   return (sta.capabilityFlags shr 3) and 1
 
 proc mfp_add_mgmt_mic*(frameDesc: pointer, frame: pointer, frameLen: uint32): uint32 {.exportc, cdecl.} =
@@ -384,6 +406,41 @@ proc mfp_compute_bip*(key: pointer, frame: pointer, frameLen: uint32,
   aesCmacFinish(ctx, addr mac[0])
   for i in 0 ..< 8:
     result = result or (mac[i].uint64 shl (8 * i))
+
+proc mfpComputeRxBip(key, frame: pointer; frameLen, headerLen: uint32;
+    rx: ptr RxSwDescView; mic: var uint64): bool =
+  if key == nil or frame == nil or rx == nil or headerLen < 24 or headerLen > frameLen or
+      frameLen - headerLen < 18:
+    return false
+  var header: array[22, uint8]
+  if not rxuCopyFrameBytes(rx, 0, header.len.uint32, addr header[0]):
+    return false
+  var aad: array[20, uint8]
+  aad[0] = header[0]
+  aad[1] = header[1] and 0xC7'u8
+  for i in 0 ..< 18:
+    aad[i + 2] = header[i + 4]
+  var ctx: AesCmacContext
+  aesCmacInit(ctx, addr cast[ptr VifKeySlotView](key).keyMaterial[0])
+  aesCmacUpdate(ctx, addr aad[0], aad.len.uint32)
+  var chunk: array[64, uint8]
+  var offset = headerLen
+  let bodyEnd = frameLen - 8
+  while offset < bodyEnd:
+    let count = min(chunk.len.uint32, bodyEnd - offset)
+    if not rxuCopyFrameBytes(rx, offset, count, addr chunk[0]):
+      return false
+    aesCmacUpdate(ctx, addr chunk[0], count)
+    offset += count
+  # Mask the MIC in local state; never write into the received frame.
+  var zeroMic: array[8, uint8]
+  aesCmacUpdate(ctx, addr zeroMic[0], zeroMic.len.uint32)
+  var mac: array[16, uint8]
+  aesCmacFinish(ctx, addr mac[0])
+  mic = 0
+  for i in 0 ..< 8:
+    mic = mic or (mac[i].uint64 shl (8 * i))
+  true
 
 proc aes128_encrypt_copy(roundKeys: pointer; input: ptr array[16, uint8];
                          output: ptr array[16, uint8]) {.inline.} =

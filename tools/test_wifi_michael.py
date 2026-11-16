@@ -275,23 +275,50 @@ def test_wifi_rx_mic_failure_indication_wire_fields(tmp_path: Path) -> None:
     if nim is None:
         pytest.skip("nim is not installed")
     rx = (ROOT / "src/bl808/wifi/fw/rx_upper.nim").read_text()
-    body = re.search(r"(?m)^[ \t]+let failMsg = ke_msg_alloc\(0xC04'u16,.*?ke_msg_send\(failMsg\)", rx, re.S)
+    body = re.search(r"(?m)^[ \t]+let failureBssid = .*?ke_msg_send\(failMsg\)", rx, re.S)
     assert body is not None
     layouts = (ROOT / "src/bl808/wifi/fw/layout_types.nim").read_text()
     indication = "  RxMicFailureIndView" + layouts.split("  RxMicFailureIndView", 1)[1].split(
         "  RxEthernetRewriteHeaderView", 1
     )[0]
     prelude = r"""
-type TestSta = object
-  macAddr: array[6, uint8]
-var sta = TestSta(macAddr: [2'u8, 3, 4, 5, 6, 7])
-var sent = 0
+type
+  TestSta = object
+    macAddr: array[6, uint8]
+  TestEnv = object
+    staIdx, vifIdx: uint8
+    secInfo0, secInfo1, hwRxhdr: uint32
+  TestKey = object
+    staIdx: uint8
+const OriginalBssid = [2'u8, 3, 4, 5, 6, 7]
+var sta: TestSta
+var env: TestEnv
+var secKey: TestKey
+var sent, freed, recovery: int
+var currentFrame, currentKey: bool
 var allocationBuffer: pointer
 var allocationDest: uint8
 proc ke_msg_alloc(id: uint16; destId, srcId: uint8; paramLen: uint32): pointer =
   doAssert id == 0xC04 and srcId == TASK_ME and paramLen == 24
   allocationDest = destId
+  case recovery
+  of 1: currentFrame = false
+  of 2: currentKey = false
+  of 3:
+    sta.macAddr = [8'u8, 9, 10, 11, 12, 13]
+    env.secInfo0 = 0xDEADBEEF'u32
+    env.secInfo1 = 0x12345678'u32
+    env.hwRxhdr = not env.hwRxhdr
+    env.vifIdx = 0
+    secKey.staIdx = 5
+  of 4: return nil
+  else: discard
   allocationBuffer
+proc frameCurrent(): bool = currentFrame
+template rxKeyCurrent(param, key: untyped): bool = currentKey
+proc ke_msg_free_payload(p: pointer) =
+  doAssert p == allocationBuffer
+  inc freed
 proc staInfoForIdx(idx: uint8): ptr TestSta =
   doAssert idx == 3
   addr sta
@@ -302,27 +329,40 @@ proc ke_msg_send(p: pointer) = inc sent
 proc makeIndication(flags: uint32; tid: uint8): array[24, uint8] =
   for i in 0 ..< result.len: result[i] = 0xA5
   allocationBuffer = addr result[0]
-  let env = (staIdx: 3'u8, vifIdx: 1'u8, secInfo0: 0x44332211'u32,
-             secInfo1: 0x00006655'u32, hwRxhdr: flags)
-  let secKey = (staIdx: 2'u8,)
+  sta.macAddr = OriginalBssid
+  currentFrame = true
+  currentKey = true
+  env = TestEnv(staIdx: 3'u8, vifIdx: 1'u8, secInfo0: 0x44332211'u32,
+                secInfo1: 0x00006655'u32, hwRxhdr: flags)
+  secKey = TestKey(staIdx: 2'u8)
+  let param = cast[pointer](1)
   let tidVal = tid
+  template doReturn() = return
 """
     checks = r"""
 static: doAssert sizeof(RxMicFailureIndView) == 24
-for flags in [0'u32, 0x400'u32, 0xFF000000'u32, 0xFF000400'u32]:
-  for tid in [0'u8, 1, 3, 7, 8, 255]:
-    let before = sent
-    let wire = makeIndication(flags, tid)
-    doAssert allocationDest == 9, "MIC failure indication must reach host API task"
-    doAssert sent == before + 1
-    for i in 0 ..< 6: doAssert wire[i] == sta.macAddr[i]
-    doAssert wire[6] == 0xA5 and wire[7] == 0xA5
-    doAssert wire[8 .. 15] == @[0x11'u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0, 0]
-    doAssert wire[16] == ((flags shr 10) and 1).uint8,
-      "group flag must come from hardware bit 10, not TID"
-    doAssert wire[17] == 2 and wire[18] == 1
-    for i in 19 ..< 24:
-      doAssert wire[i] == 0xA5, "failure indication padding was written"
+for stage in 0 .. 4:
+  recovery = stage
+  for flags in [0'u32, 0x400'u32, 0xFF000000'u32, 0xFF000400'u32]:
+    for tid in [0'u8, 1, 3, 7, 8, 255]:
+      let before = sent
+      let freedBefore = freed
+      let wire = makeIndication(flags, tid)
+      doAssert allocationDest == 9, "MIC failure indication must reach host API task"
+      if stage in [1, 2, 4]:
+        doAssert sent == before
+        doAssert freed == freedBefore + (if stage == 4: 0 else: 1)
+        for byte in wire: doAssert byte == 0xA5
+        continue
+      doAssert sent == before + 1 and freed == freedBefore
+      for i in 0 ..< 6: doAssert wire[i] == OriginalBssid[i]
+      doAssert wire[6] == 0xA5 and wire[7] == 0xA5
+      doAssert wire[8 .. 15] == @[0x11'u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0, 0]
+      doAssert wire[16] == ((flags shr 10) and 1).uint8,
+        "group flag must come from hardware bit 10, not TID"
+      doAssert wire[17] == 2 and wire[18] == 1
+      for i in 19 ..< 24:
+        doAssert wire[i] == 0xA5, "failure indication padding was written"
 """
     source = tmp_path / "wifi_rx_mic_indication.nim"
     source.write_text("import bl808/wifi/fw_messages/tasks\ntype\n" + indication + prelude + textwrap.indent(

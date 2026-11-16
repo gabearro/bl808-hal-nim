@@ -7,7 +7,7 @@ import pytest
 
 from test_wifi_disconnect_tx import procedure
 from test_wifi_message_allocation import run_program
-from test_wifi_mfp_control import KEY_CONTEXT, PLATFORM as MFP_PLATFORM
+from test_wifi_mfp_control import KEY_CONTEXT, RX_CONTEXT, RX_MIC_MODEL, PLATFORM as MFP_PLATFORM
 
 ROOT = Path(__file__).resolve().parents[1]
 FW = ROOT / "src/bl808/wifi/fw"
@@ -73,6 +73,7 @@ var
   allocationCalls, sent, uploads, decodes, beaconChecks, policyCalls: int
   policyVif, policySta: uint8
   forceIgnore, forceUpload, allocationFailure: bool
+  wildcardApmEnabled: bool
   scanState: uint16
   rxVifEpochs: array[MAX_VIFS, uint32]
   rxKeyRevision = 1'u64
@@ -107,7 +108,8 @@ proc vifChannelAt(p: pointer): ptr Vif = cast[ptr Vif](p)
 proc vif_mgmt_get_vif(i: uint8): pointer =
   if i < MAX_VIFS: addr vifs[i] else: nil
 proc apm_embedded_enabled(p: pointer): bool =
-  p != nil and vifChannelAt(p).vifType == 2
+  if p == nil: wildcardApmEnabled
+  else: vifChannelAt(p).vifType == 2
 proc phyif_utils_decode(p: pointer; rssi: ptr int8): uint32 =
   inc decodes
   rssi[] = -43
@@ -161,9 +163,9 @@ proc assert_warn(a, b: cstring; line: cint) = doAssert false
 template nimFwTrace2U32(args: varargs[untyped]) = discard
 template nimFwConnectTrace2U32(args: varargs[untyped]) = discard
 proc mfpIgnorePolicy(desc, param, frameBodyPtr: pointer; frameTotalLen: uint16;
-                     upload: ptr uint8; flags: ptr uint8): bool
+                     upload: ptr uint8; flags: ptr uint8; generation: uint32): bool
 proc mfpIgnoreRxMgmtFrame(desc, param, frame: pointer; length: uint16;
-                         upload, flags: ptr uint8): bool =
+                         upload, flags: ptr uint8; generation: uint32): bool =
   inc policyCalls
   policyVif = env.vifIdx
   policySta = env.staIdx
@@ -171,7 +173,7 @@ proc mfpIgnoreRxMgmtFrame(desc, param, frame: pointer; length: uint16;
     upload[] = forceUpload.uint8
     result = true
   else:
-    result = mfpIgnorePolicy(desc, param, frame, length, upload, flags)
+    result = mfpIgnorePolicy(desc, param, frame, length, upload, flags, generation)
   if onPolicy != nil: onPolicy()
 proc reset(fc: uint16; vif: uint8; station: uint8 = 4; kind: uint8 = 0) =
   vifs = default(typeof(vifs))
@@ -211,6 +213,7 @@ proc reset(fc: uint16; vif: uint8; station: uint8 = 4; kind: uint8 = 0) =
   forceIgnore = false
   forceUpload = false
   allocationFailure = false
+  wildcardApmEnabled = false
   scanState = ScanChannelRunningState
   onPolicy = nil
   onDecode = nil
@@ -515,9 +518,27 @@ def management_source() -> str:
     code += "\ntype\n  " + name + layout.split("  " + name, 1)[1].split("\n\n  ", 1)[0] + "\n"
     code += "\nproc rxuMgtIndMsgAt(p: pointer): ptr RxuMgtIndMsgView = cast[ptr RxuMgtIndMsgView](p)\n"
     code += procedure(layout, "copyRoundedRxWords")
+    code += procedure(layout, "rxMacHeaderLen")
+    code += procedure(layout, "rxMgmtBodyValid")
+    # The ordinary fixture stores one flat frame where hardware has a chain.
+    code += r'''
+type
+  RxSwDescView = Rx
+  MgtFixtureBuffer = object
+    next, frameData: pointer
+var mgtFixtureBuffer: MgtFixtureBuffer
+proc rxFrameBufferChainAt(p: pointer): ptr MgtFixtureBuffer =
+  if p == nil: return nil
+  mgtFixtureBuffer = MgtFixtureBuffer(frameData: p)
+  addr mgtFixtureBuffer
+proc c_memcpy(dst, src: pointer; length: csize_t): pointer =
+  copyMem(dst, src, length.int)
+  dst
+'''
+    code += procedure((FW / "rx_upper.nim").read_text(), "rxuCopyFrameBytes")
     policy = (FW / "crypto_mfp_hsu.nim").read_text()
     code += procedure((FW / "kernel_mac_channel.nim").read_text(), "mfp_is_robust_frame")
-    code += KEY_CONTEXT + procedure(policy, "mfpIgnoreRxMgmtFrame").replace(
+    code += KEY_CONTEXT + RX_CONTEXT + RX_MIC_MODEL + procedure(policy, "mfpIgnoreRxMgmtFrame").replace(
         "proc mfpIgnoreRxMgmtFrame", "proc mfpIgnorePolicy", 1
     )
     helpers = ""

@@ -209,18 +209,19 @@ proc bl_tpc_update_power_table_channel_offset*(powerTable: ptr array[38, int8]) 
   proc phy_powroffset_set(powerOffset: ptr int8) {.importc, cdecl.}
   type PrintfFn = proc(fmt: cstring) {.cdecl, varargs.}
 
-  let printFn = cast[PrintfFn](blOpsFunc(4))
   var scaled {.noinit.}: array[14, int8]
   for channelOffsetIndex in 0 ..< 14:
+    let printFn = cast[PrintfFn](blOpsFunc(4))
     let channelPowerOffset = powerTable[24 + channelOffsetIndex]
-    let scaledPhyOffset = channelPowerOffset.int32 * 4'i32
+    let scaledPhyOffset = cast[int8](channelPowerOffset.int32 * 4'i32)
     tpcChannelOffsetTable[channelOffsetIndex] = channelPowerOffset
     tpcPowerTable[24 + channelOffsetIndex] = channelPowerOffset
-    scaled[channelOffsetIndex] = cast[int8](scaledPhyOffset)
+    scaled[channelOffsetIndex] = scaledPhyOffset
     if printFn != nil:
-      printFn(cstring"pwr chan[%d] offset:%d\r\n", channelOffsetIndex.cint, scaledPhyOffset.cint)
+      printFn(cstring("pwr chan[%d] offset:%d\r\n"), channelOffsetIndex.cint, scaledPhyOffset.cint)
+  let printFn = cast[PrintfFn](blOpsFunc(4))
   if printFn != nil:
-    printFn(cstring"dynamic update channel offset\r\n")
+    printFn(cstring("dynamic update channel offset\r\n"))
   phy_powroffset_set(addr scaled[0])
 
 proc bl_tpc_update_power_rate_11b*(powerTable: ptr array[4, int8]) {.exportc, cdecl.} =

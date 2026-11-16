@@ -85,8 +85,8 @@ proc vendorDivisor(mask: int): uint32 =
   elif (mask and 2) != 0: 780
   elif (mask and 4) != 0: 960
   elif (mask and 16) != 0: 1200
-  elif (mask and 8) != 0: 1152
-  else: 1560
+  elif (mask and 32) != 0: 1560
+  else: 1152
 proc vendorSdm(f: uint32; mask: int): uint32 =
   ((f.uint64 * 40 * (1'u64 shl 22)) div vendorDivisor(mask).uint64).uint32
 '''

@@ -151,6 +151,8 @@ proc rfPriRf70ReplayWindow0Nibble(): uint32 = 9
                 code += procedure(rf, name)
     if real_io:
         code += procedure(rf, "rfPriSelectBzTargetPowerRecords")
+        if "proc rfPriBzTargetPowerWindowActive(" in rf:
+            code += procedure(rf, "rfPriBzTargetPowerWindowActive")
         code += procedure(rf, "rf_pri_input_bz_target_power")
     code += "const RecordWriteTrace = " + ("true" if real_io else "false") + "\n"
     return code + r'''

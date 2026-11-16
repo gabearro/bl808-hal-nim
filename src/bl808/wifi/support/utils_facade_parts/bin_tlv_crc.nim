@@ -10,10 +10,34 @@ proc utils_bin2hex*(dst: cstring; src: pointer; srcLen: csize_t) {.exportc, cdec
   hexOutputChars[srcLen.int * 2] = '\0'
 
 proc utils_tlv_bl_unpack_auto*(buf: ptr uint32; bufSz: cint; typ: uint16; arg1: pointer): cint {.exportc, cdecl.} =
-  discard buf; discard bufSz; discard typ; discard arg1; 0
+  if typ != 1 and typ != 7:
+    return -2
+  if arg1 == nil or (bufSz >= 4 and buf == nil):
+    return -2
+  # The SDK publishes these defaults even when the input is too short.
+  var value = if typ == 1: 1'u32 else: 0'u32
+  if bufSz >= 4:
+    copyMem(addr value, buf, sizeof(value))
+  if typ == 1:
+    cast[ptr uint8](arg1)[] = (value != 0).uint8
+  else:
+    copyMem(arg1, addr value, sizeof(value))
+  if bufSz < 4: -1 else: 4
 
 proc utils_tlv_bl_pack_auto*(buf: ptr uint32; bufSz: cint; typ: uint16; arg1: pointer): cint {.exportc, cdecl.} =
-  discard buf; discard bufSz; discard typ; discard arg1; 0
+  if typ != 1 and typ != 7:
+    return -2
+  if bufSz < 4:
+    return -1
+  if buf == nil or arg1 == nil:
+    return -2
+  var value: uint32
+  if typ == 1:
+    value = (cast[ptr uint8](arg1)[] != 0).uint32
+  else:
+    copyMem(addr value, arg1, sizeof(value))
+  copyMem(buf, addr value, sizeof(value))
+  4
 
 const WifiCrc32Table = block:
   var table: array[256, uint32]
