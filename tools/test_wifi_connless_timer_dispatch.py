@@ -99,11 +99,10 @@ for reset in [false, true]:
   doAssert switched.len == 0 and env.flags == 1 and queueIds().len == 0
 ''',
     "changed_gate": r'''
-for change in 0 .. 2:
+for change in 1 .. 2:
   setupConnless()
   chan_conn_less_delay_prog()
   case change
-  of 0: inc txResetEpoch
   of 1: inc chanConnlessGeneration
   else: env.flags = env.flags and not 16'u8
   let flags = env.flags
@@ -122,8 +121,9 @@ for outcome in 0 .. 3:
     mm_timer_clear(chanConnLessDelayTimer())
     env.flags = 2
   expireConnless()
-  doAssert switched == (if outcome == 0: @[3'u8] else: @[])
-  doAssert env.flags == [24'u8, 18, 18, 2][outcome]
+  # A failed or repeated TX drain does not close the gate; clearing it does.
+  doAssert switched == (if outcome != 3: @[3'u8] else: @[])
+  doAssert env.flags == [24'u8, 24, 24, 2][outcome]
 ''',
     "clear_during_programming": r'''
 for irq in [false, true]:

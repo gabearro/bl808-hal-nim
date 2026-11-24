@@ -147,11 +147,10 @@ for flags in [1'u8, 3, 5, 7]:
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_timeout_owns_its_arm_and_original_peer(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, source() + r'''
-for retired in 0 .. 3:
+for retired in [0, 2, 3]:
   setup(5, 2, addr vifA, true)
   case retired
   of 0: inc psModeBuildSerial
-  of 1: inc txResetEpoch
   of 2:
     delivering = true
     delivery.cancelled = true
@@ -160,6 +159,14 @@ for retired in 0 .. 3:
   doAssert ps.pendingCount == 2 and ps.flags == 5
   doAssert events.len == 0 and schedules == 0
   doAssert irqSaves == 1 and irqRestores == 1
+
+# A TX reset flushes the null frame, not the transition: the timeout still
+# finishes it.
+setup(5, 2, addr vifA, true)
+inc txResetEpoch
+ps_tx_null_timer_handle()
+doAssert ps.pendingCount == 0 and not psTxNullOwner.armed
+doAssert events.len != 0
 
 for late in [false, true]:
   for transition in [0x13'u8, 0x15]:

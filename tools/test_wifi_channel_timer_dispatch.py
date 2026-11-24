@@ -38,11 +38,18 @@ mm_timer_schedule()
 doAssert operationDelivery.len == 0
 ''',
     "identity_change": r'''
-for change in 0 .. 5:
+# A TX reset alone does not retire the deadline.
+setupTbtt()
+armOperation()
+inc txResetEpoch
+now = timers[2].expiry + 51
+mm_timer_schedule()
+doAssert operationDelivery.len == 1
+
+for change in 1 .. 5:
   setupTbtt()
   armOperation()
   case change
-  of 0: inc txResetEpoch
   of 1: contexts[0].channel.primFreq = 2462
   of 2: contexts[0].status = 1
   of 3: env.currentCtxt = addr contexts[1]
@@ -111,10 +118,14 @@ for change in 0 .. 7:
   failIdle = change == 0
   doAssert chanForceIdleForDeparture(target) == (change notin [0, 1])
   doAssert chanTimerDispatch(addr timers[2], timers[2].callback, target, serial)
-  doAssert operationDelivery.len == 0
+  # A failed or repeated TX drain (0, 1) changes nothing the deadline depends
+  # on, so it is still delivered; every other change retires it.
+  doAssert operationDelivery.len == (change in [0, 1]).int
   now = timers[2].expiry + 51
   mm_timer_schedule()
-  doAssert operationDelivery.len == (change == 6).int
+  # The re-armed deadlines (6, 7) carry a new serial and still describe the
+  # contexts as they are, so they fire on their own schedule.
+  doAssert operationDelivery.len == (change in [0, 1, 6, 7]).int
 ''',
     "rearm_after_pop": r'''
 armOperation()

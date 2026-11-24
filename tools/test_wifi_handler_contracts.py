@@ -254,7 +254,6 @@ for invalidation in 0 .. 3:
   case invalidation
   of 0: inc rxVifEpochs[1]
   of 1: inc stationEpochs[2]
-  of 2: inc txResetEpoch
   else: vifs[1].staIdx = 3
   state = SmIdleState
   doAssert handler(pending) == KeMsgConsumed

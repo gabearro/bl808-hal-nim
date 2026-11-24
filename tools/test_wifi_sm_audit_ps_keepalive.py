@@ -443,10 +443,6 @@ doAssert frames.len == 1 and cfms.len == 0 and interrupts
 
 # --- Reset --------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason=(
-    "PSK-1: a DPSM sleep transition in flight across chanForceIdle/txl_reset is "
-    "never finished; ps_tx_null_timer_handle rejects the timeout on the arm-time "
-    "reset epoch and the station stays at PM=1 with flags 0x0D"))
 @pytest.mark.parametrize("mode", MODES)
 def test_channel_switch_reset_strands_dpsm_sleep_transition(
         tmp_path: Path, mode: str) -> None:
@@ -466,10 +462,6 @@ doAssert (ps.flags and 8) != 0 and (pmRegister and 4) == 0
 ''')
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "PSK-1: after a stranded DPSM transition every explicit MM_SET_PS_MODE_REQ "
-    "(for example ME_SET_PS_DISABLE on disconnect) parks behind it and never "
-    "confirms until another reset happens to call mmPsModeRetryAfterReset"))
 @pytest.mark.parametrize("mode", MODES)
 def test_explicit_request_after_stranded_dpsm_never_confirms(
         tmp_path: Path, mode: str) -> None:

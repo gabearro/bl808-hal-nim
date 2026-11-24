@@ -35,24 +35,6 @@ proc smRegistrationTagFor(header: ptr KeMsgHdr): ptr SmRegistrationTag =
 proc smRegistrationChannelCurrent(tag: ptr SmRegistrationTag): bool =
   not tag.channel.held or chanLeaseCurrent(tag.channel)
 
-proc smRegistrationPreserveAcrossChannelReset(previous: uint32) =
-  # Linking a join channel can queue its idle request before MM_STA_ADD_REQ.
-  # The successful TX drain retires frames, not this pending control exchange.
-  var tag = smRegistrationTags
-  while tag != nil:
-    if tag.published and not tag.processing and not tag.claimed and
-        tag.owner.identity.resetEpoch == previous and tag.channel.linked and
-        chanLeaseCurrent(tag.channel):
-      var owner = tag.owner
-      owner.identity.resetEpoch = txResetEpoch
-      if smScanOwnerCurrent(owner, tag.indication):
-        tag.owner = owner
-        if tag.command and tag.reply != nil:
-          let reply = smRegistrationTagFor(keMsgHdrFromPayload(tag.reply))
-          if reply != nil:
-            reply.owner = owner
-    tag = tag.next
-
 proc smRegistrationRememberLoss(tag: ptr SmRegistrationTag) =
   var owner = tag.owner
   # A failure still belongs to the connection after its station is retired.

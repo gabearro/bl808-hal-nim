@@ -1,20 +1,20 @@
 # Arm, publish, capture, and invalidate run under the MM timer critical section.
 type
   ChanTbttTimerOwner = object
-    serial, resetEpoch, vifEpoch, binding, allocation: uint32
+    serial, vifEpoch, binding, allocation: uint32
     node, channel: pointer
     targetTime: uint32
     definition: ChanCtxtDefView
     vif, index: uint8
     prepared, valid: bool
   ChanCtxtTimerOwner = object
-    serial, resetEpoch, allocation: uint32
+    serial, allocation: uint32
     context, current, scheduled: pointer
     definition: ChanCtxtDefView
     index, phase: uint8
     prepared, valid: bool
   ChanConnlessTimerOwner = object
-    serial, resetEpoch, generation: uint32
+    serial, generation: uint32
     prepared, valid: bool
 
 var
@@ -23,34 +23,12 @@ var
   chanConnlessTimerOwner {.wifiCtrl.}: ChanConnlessTimerOwner
 
 proc chanForceIdle(): bool =
+  ## Drain TX for a channel switch. Queued radio deadlines and SM exchanges
+  ## are not frames and stay owed; only a nested second reset fails the drain.
   let saved = irqSave()
   defer: irqRestore(saved)
   let previous = txResetEpoch
-  if not mm_force_idle_req() or txResetEpoch != previous + 1'u32: return false
-  # A channel switch drains TX but does not cancel these already queued deadlines.
-  if chanTbttTimerOwner.valid and chanTbttTimerOwner.resetEpoch == previous:
-    chanTbttTimerOwner.resetEpoch = txResetEpoch
-  if chanConnlessTimerOwner.valid and chanConnlessTimerOwner.resetEpoch == previous:
-    chanConnlessTimerOwner.resetEpoch = txResetEpoch
-  smScanPreserveAcrossChannelReset(previous)
-  smRegistrationPreserveAcrossChannelReset(previous)
-  true
-
-proc chanPreserveAcrossRecovery(previous: uint32) =
-  ## A full MAC recovery drains TX like a channel switch, but it does not
-  ## change channel: every queued radio deadline and SM exchange stays owed.
-  ## `previous` is the epoch before the first attempt: a recovery whose TX
-  ## drain timed out has already advanced the epoch once per failed attempt.
-  template drained(epoch: uint32): bool =
-    epoch - previous < txResetEpoch - previous
-  if chanTbttTimerOwner.valid and drained(chanTbttTimerOwner.resetEpoch):
-    chanTbttTimerOwner.resetEpoch = txResetEpoch
-  if chanConnlessTimerOwner.valid and drained(chanConnlessTimerOwner.resetEpoch):
-    chanConnlessTimerOwner.resetEpoch = txResetEpoch
-  if chanCtxtTimerOwner.valid and drained(chanCtxtTimerOwner.resetEpoch):
-    chanCtxtTimerOwner.resetEpoch = txResetEpoch
-  smScanPreserveAcrossChannelReset(previous)
-  smRegistrationPreserveAcrossChannelReset(previous)
+  mm_force_idle_req() and txResetEpoch == previous + 1'u32
 
 proc chanTimerInvalidate(timer: pointer = nil) =
   if timer == nil or timer == chanTbttTimer():
@@ -81,7 +59,6 @@ proc chanCtxtTimerArming(timer: pointer) =
     chanCtxtTimerOwner.definition = ctxt.channel
     chanCtxtTimerOwner.index = index
     chanCtxtTimerOwner.phase = if ctxt.status == 4: 4'u8 else: 2'u8
-    chanCtxtTimerOwner.resetEpoch = txResetEpoch
     chanCtxtTimerOwner.allocation = chanCtxtEpochs[index]
     chanCtxtTimerOwner.prepared = true
     return
@@ -93,7 +70,6 @@ proc chanTimerArming(timer: pointer) =
         (chanEnvView().flags and 0x10) == 0:
       return
     # Later scan/ROC requests may join this gate before its deadline.
-    chanConnlessTimerOwner.resetEpoch = txResetEpoch
     chanConnlessTimerOwner.generation = chanConnlessGeneration
     chanConnlessTimerOwner.prepared = true
     return
@@ -120,7 +96,6 @@ proc chanTimerArming(timer: pointer) =
     chanTbttTimerOwner.definition = ctxt.channel
     chanTbttTimerOwner.vif = node.vifIdx
     chanTbttTimerOwner.index = index
-    chanTbttTimerOwner.resetEpoch = txResetEpoch
     chanTbttTimerOwner.vifEpoch = rxVifEpochs[node.vifIdx]
     chanTbttTimerOwner.binding = chanCtxtLinkEpochs[node.vifIdx]
     chanTbttTimerOwner.allocation = chanCtxtEpochs[index]
@@ -150,8 +125,7 @@ proc chanTimerCapture(timer: pointer): uint32 =
 
 proc chanConnlessTimerPending(generation: uint32): bool =
   chanConnlessTimerOwner.valid and
-    chanConnlessTimerOwner.generation == generation and
-    chanConnlessTimerOwner.resetEpoch == txResetEpoch
+    chanConnlessTimerOwner.generation == generation
 
 proc chanConnlessTimerDispatch(callback: pointer; serial: uint32): bool =
   if callback != cast[pointer](chan_conn_less_delay_evt): return false
@@ -165,10 +139,9 @@ proc chanConnlessTimerDispatch(callback: pointer; serial: uint32): bool =
   chanConnlessTimerOwner.valid = false
   chanConnlessDelayEvent()
 
-proc chanCtxtTimerCurrent(resetEpoch: uint32): bool =
+proc chanCtxtTimerCurrent(): bool =
   let owner = addr chanCtxtTimerOwner
-  if not owner.valid or owner.resetEpoch != resetEpoch or
-      chanCtxtEpochs[owner.index] != owner.allocation:
+  if not owner.valid or chanCtxtEpochs[owner.index] != owner.allocation:
     return false
   let ctxt = chanCtxtForIdx(owner.index)
   let env = chanEnvView()
@@ -186,20 +159,11 @@ proc chanCtxtTimerCurrent(resetEpoch: uint32): bool =
     ctxt.channel.centerFreq2 == owner.definition.centerFreq2
 
 proc chanForceIdleForDeparture(target: pointer): bool =
+  ## The switch's own TX drain precedes its protection-frame wait; the wait's
+  ## deadline is checked against the contexts, not against the drain.
   let saved = irqSave()
   defer: irqRestore(saved)
-  if target == nil or chanEnvView().scheduledCtxt != target: return false
-  let owner = addr chanCtxtTimerOwner
-  let previous = txResetEpoch
-  let serial = owner.serial
-  let carryDeadline = owner.phase == 2 and owner.context == target and
-    owner.scheduled == target and chanCtxtTimerCurrent(previous)
-  if not chanForceIdle(): return false
-  # The switch's own TX drain precedes its protection-frame wait. Keep the
-  # original deadline only if the drain did not retire or replace its owner.
-  if carryDeadline and owner.serial == serial and chanCtxtTimerCurrent(previous):
-    owner.resetEpoch = txResetEpoch
-  true
+  target != nil and chanEnvView().scheduledCtxt == target and chanForceIdle()
 
 proc chanCtxtTimerDispatch(callback, argument: pointer; serial: uint32): bool =
   if callback != cast[pointer](chan_ctxt_op_evt): return false
@@ -207,7 +171,7 @@ proc chanCtxtTimerDispatch(callback, argument: pointer; serial: uint32): bool =
   let saved = irqSave()
   defer: irqRestore(saved)
   if chanCtxtTimerOwner.serial != serial or chanCtxtTimerOwner.context != argument or
-      not chanCtxtTimerCurrent(txResetEpoch):
+      not chanCtxtTimerCurrent():
     return
   chanCtxtTimerOwner.valid = false
   chanCtxtOpEvent(argument, saved)
@@ -224,7 +188,6 @@ proc chanTimerDispatch(timer, callback, argument: pointer; serial: uint32): bool
   defer: irqRestore(saved)
   if not chanTbttTimerOwner.valid or serial != chanTbttTimerOwner.serial or
       argument != chanTbttTimerOwner.node or
-      txResetEpoch != chanTbttTimerOwner.resetEpoch or
       rxVifEpochs[chanTbttTimerOwner.vif] != chanTbttTimerOwner.vifEpoch or
       chanCtxtLinkEpochs[chanTbttTimerOwner.vif] != chanTbttTimerOwner.binding or
       chanCtxtEpochs[chanTbttTimerOwner.index] != chanTbttTimerOwner.allocation:

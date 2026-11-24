@@ -95,7 +95,7 @@ def source() -> str:
     platform = (FW / "platform_bl.nim").read_text()
     code = owner_source() + layouts("MmEnvView") + SUPPORT
     code += procedure(kernel, "mm_init") + ("\nwhen not declared(mmConfigCancelIdle):\n  proc mmConfigCancelIdle() = discard\n" + procedure(kernel, "mm_force_idle_req"))
-    code += procedure(platform, "bl_init") + ("\nwhen not declared(txResetEpoch):\n  var txResetEpoch: uint32\nproc chanPreserveAcrossRecovery(previous: uint32) = discard\nvar blRecoveryPending: bool\nvar blRecoveryBase: uint32\n" + procedure(platform, "bl_reset_evt"))
+    code += procedure(platform, "bl_init") + procedure(platform, "bl_reset_evt")
     return code
 
 

@@ -215,7 +215,7 @@ def test_home_wake_ab(tmp_path: Path, defines: tuple[str, ...]) -> None:
         "txl_frame_cfm", "txlFrameConfirmPending", "txl_frame_evt", "txlDrainRetiredPostponed",
     ))
     functions += "".join(procedure(kernel, name) for name in (
-        "mmCaptureVif", "mmVifCurrent", "mmStaTimerCurrent",
+        "mmCaptureVif", "mmVifCurrent", "mmStaOwnerCurrent", "mmStaTimerCurrent",
     ))
     debug = "\nvar\n" + "".join(
         f"  {name}: uint32\n" for name in sorted(set(re.findall(r"\bnimFwDbg\w+", functions)))

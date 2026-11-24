@@ -79,7 +79,7 @@ def source() -> str:
     return (
         polling_source() + layouts("MmEnvView") + SUPPORT
         + ("\nwhen not declared(mmConfigCancelIdle):\n  proc mmConfigCancelIdle() = discard\n" + procedure(kernel, "mm_force_idle_req"))
-        + ("\nwhen not declared(txResetEpoch):\n  var txResetEpoch: uint32\nproc chanPreserveAcrossRecovery(previous: uint32) = discard\nvar blRecoveryPending: bool\nvar blRecoveryBase: uint32\n" + procedure((FW / "platform_bl.nim").read_text(), "bl_reset_evt"))
+        + procedure((FW / "platform_bl.nim").read_text(), "bl_reset_evt")
     )
 
 

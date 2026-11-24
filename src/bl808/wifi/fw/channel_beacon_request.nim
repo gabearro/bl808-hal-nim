@@ -27,7 +27,7 @@ proc chanBcnRequestReleasePending(tag: ptr ChanBcnRequestTag; clearFlag: bool) =
       env.flags = env.flags and not 0x40'u8
 
 proc chanBcnRequestCurrent(tag: ptr ChanBcnRequestTag): bool =
-  if not mmStaTimerCurrent(tag.identity, tag.resetEpoch) or
+  if not mmStaOwnerCurrent(tag.identity) or
       not chanLeaseCurrent(tag.lease) or
       tag.identity.station >= STA_INFO_TAB_ENTRIES.uint8:
     return false

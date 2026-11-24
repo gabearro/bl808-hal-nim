@@ -209,7 +209,7 @@ def source() -> str:
     types = "".join(re.search(rf"(?ms)^  {name}\b.*?(?=^  \w|\Z)", layout).group()
                     for name in ("MmVifIdentity", "MmTimerMutation"))
     code = procedure(tx, "txl_cntrl_clear_bcn_ac")
-    for name in ["mmCaptureVif", "mmVifCurrent", "mmTimerActiveDelivery", "mmStaTimerCurrent",
+    for name in ["mmCaptureVif", "mmVifCurrent", "mmTimerActiveDelivery", "mmStaOwnerCurrent", "mmStaTimerCurrent",
                  "mmStaTbttCurrent"]:
         if re.search(r"^proc " + name + r"\(", kernel, re.M):
             code += procedure(kernel, name)

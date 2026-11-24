@@ -97,7 +97,7 @@ proc smActivationCancelControl(request, reply: pointer; owner: SmTxBuildContext)
   if (request == nil or request != meControlCommand) and
       (reply == nil or reply != meControlReply): return false
   let identity = owner.identity
-  if identity.resetEpoch == txResetEpoch and identity.vif < MAX_VIFS.uint8 and
+  if identity.vif < MAX_VIFS.uint8 and
       rxVifEpochs[identity.vif] == identity.vifEpoch and
       staDeleteEpoch(identity.station) == identity.stationEpoch and
       meControlFinalId == ME_SET_PS_DISABLE_CFM:

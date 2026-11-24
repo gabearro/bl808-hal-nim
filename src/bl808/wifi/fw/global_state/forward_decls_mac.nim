@@ -198,7 +198,6 @@ proc smScanAcceptReply(reply: pointer; id: uint16): bool
 proc smScanForget(header: pointer)
 proc smScanNeedsService(): bool
 proc smScanService()
-proc smScanPreserveAcrossChannelReset(previous: uint32)
 proc chanForceIdle(): bool
 proc smRegistrationAllocate(owner: SmTxBuildContext; indication: pointer): pointer
 proc smRegistrationPublish(request: pointer): bool
@@ -208,7 +207,6 @@ proc smRegistrationComplete(request, reply: pointer): bool
 proc smRegistrationClaim(reply: pointer; owner: var SmTxBuildContext; indication: var pointer): bool
 proc smRegistrationHandoff(reply: pointer): bool
 proc smRegistrationOwnChannel(request: pointer; lease: var ChanCtxtLease): bool
-proc smRegistrationPreserveAcrossChannelReset(previous: uint32)
 proc smRegistrationForget(header: pointer)
 proc smRegistrationNeedsService(): bool
 proc smRegistrationService()

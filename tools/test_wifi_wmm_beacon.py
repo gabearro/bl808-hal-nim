@@ -63,7 +63,7 @@ var
   mm: tuple[hardwareMode, previousState: uint8]
   rx: tuple[processingFlag: uint8]
   mmEdcaRefresh: tuple[message, context: pointer; vif: uint8;
-                       vifEpoch, bindingEpoch, resetEpoch: uint32]
+                       vifEpoch, bindingEpoch: uint32]
   rxVifEpochs, chanCtxtLinkEpochs: array[2, uint32]
   txResetEpoch: uint32
   bank: array[4, uint32]

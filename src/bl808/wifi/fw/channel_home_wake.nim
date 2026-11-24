@@ -5,7 +5,7 @@ const
 type ChanHomeWake = object
   timer: MmTimerView
   peer: MmVifIdentity
-  serial, resetEpoch, channelEpoch: uint32
+  serial, channelEpoch: uint32
   home, remaining: uint8
 
 var chanHomeWakes {.wifiCtrl.}: array[MAX_VIFS, ChanHomeWake]
@@ -36,7 +36,7 @@ proc chanHomeWakeTry(wake: ptr ChanHomeWake; saved: uint32) =
   # Detach the attempt before TX or timer callbacks can reenter this path.
   wake.remaining = 0
   let peer = wake.peer
-  if not mmStaTimerCurrent(peer, wake.resetEpoch) or peer.station >= STA_INFO_TAB_ENTRIES.uint8:
+  if not mmStaOwnerCurrent(peer) or peer.station >= STA_INFO_TAB_ENTRIES.uint8:
     return
   let vif = vifChannelAt(peer.vif)
   let context = chanCtxtForIdx(wake.home)
@@ -61,7 +61,7 @@ proc chanHomeWakeTry(wake: ptr ChanHomeWake; saved: uint32) =
     return
   if remaining <= 1 or wake.serial != serial: return
   let deadline = macTimeNow() + ChanHomeWakeRetryUs
-  if wake.serial != serial or not mmStaTimerCurrent(peer, wake.resetEpoch): return
+  if wake.serial != serial or not mmStaOwnerCurrent(peer): return
   wake.remaining = remaining - 1
   mmTimerSetLocked(addr wake.timer, deadline, saved)
 
@@ -87,7 +87,6 @@ proc chanHomeWakeRequest(vifEntry: pointer; home: uint8) =
   let wake = addr chanHomeWakes[peer.index]
   inc wake.serial
   wake.peer = peer
-  wake.resetEpoch = txResetEpoch
   wake.channelEpoch = chanCtxtEpochs[home]
   wake.home = home
   wake.remaining = ChanHomeWakeAttempts

@@ -231,7 +231,6 @@ RECOVERY = r'''
 proc recoverMac() =
   # bl_reset_evt: txl_reset drains TX, then the recovery carries what is owed.
   inc txResetEpoch
-  chanPreserveAcrossRecovery(txResetEpoch - 1)
 '''
 
 
@@ -246,9 +245,7 @@ def test_scan_radio_deadlines_survive_retried_recovery(tmp_path: Path, case: str
     """txl_reset advances the epoch, times out, and the recovery is retried."""
     fixture, body = RADIO_DEADLINES[case]
     retried = RECOVERY.replace(
-        "  inc txResetEpoch\n  chanPreserveAcrossRecovery(txResetEpoch - 1)\n",
-        "  let base = txResetEpoch\n  inc txResetEpoch # first attempt timed out\n"
-        "  inc txResetEpoch\n  chanPreserveAcrossRecovery(base)\n")
+        "  inc txResetEpoch\n", "  inc txResetEpoch # first attempt timed out\n  inc txResetEpoch\n")
     assert retried != RECOVERY
     run_program(tmp_path, "checked", fixture() + retried + body)
 

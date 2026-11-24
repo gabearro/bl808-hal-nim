@@ -396,7 +396,7 @@ proc fireNextHomeTimer(beforeDelivery: proc() = nil) =
   cast[proc(arg: pointer) {.cdecl.}](callback)(argument)
   homeDelivery = nil
 """ + "".join(procedure(kernel, name) for name in (
-        "mmCaptureVif", "mmVifCurrent", "mmStaTimerCurrent",
+        "mmCaptureVif", "mmVifCurrent", "mmStaOwnerCurrent", "mmStaTimerCurrent",
     )) + (FW / "channel_home_wake.nim").read_text().replace(" {.wifiCtrl.}", "")
 
 
@@ -532,7 +532,7 @@ for replace in 0 .. 6:
   case replace
   of 0: inc stationEpochs[0]
   of 1: inc rxVifEpochs[0]
-  of 2: inc txResetEpoch
+  of 2: inc chanCtxtEpochs[0] # a TX reset alone no longer retires the wake
   of 3: inc chanCtxtEpochs[0]
   of 4: env.currentCtxt = addr contexts[3]
   of 5: env.scheduledCtxt = addr contexts[3]
@@ -609,7 +609,7 @@ proc txl_frame_send_null_frame(sta: uint8; cb: pointer; argument: uint32): uint8
   0
 """
     code += "".join(procedure(kernel, name) for name in (
-        "mmCaptureVif", "mmVifCurrent", "mmTimerActiveDelivery", "mmStaTimerCurrent",
+        "mmCaptureVif", "mmVifCurrent", "mmTimerActiveDelivery", "mmStaOwnerCurrent", "mmStaTimerCurrent",
     ))
     code += (FW / "channel_home_wake.nim").read_text()
     run_program(tmp_path, mode, code + r"""

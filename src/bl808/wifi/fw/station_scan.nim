@@ -27,26 +27,6 @@ proc smScanOwnerCurrent(owner: SmTxBuildContext; indication: pointer): bool =
   indication != nil and smTxSessionCurrent(owner) and
     smEnvView().connectIndMsg == indication
 
-proc smScanPreserveAcrossChannelReset(previous: uint32) =
-  # A channel switch drains TX but keeps the SM's scan command and reply.
-  # Revalidate the rest of the owner before carrying either across the drain.
-  var tag = smScanTags
-  while tag != nil:
-    if tag.published and not tag.claimed and tag.owner.identity.resetEpoch == previous:
-      var owner = tag.owner
-      owner.identity.resetEpoch = txResetEpoch
-      if smScanOwnerCurrent(owner, tag.indication):
-        tag.owner = owner
-        if tag.command and tag.reply != nil:
-          let reply = smScanTagFor(keMsgHdrFromPayload(tag.reply))
-          if reply != nil: reply.owner = owner
-    tag = tag.next
-  if smScanLost.pending and smScanLost.owner.identity.resetEpoch == previous:
-    var owner = smScanLost.owner
-    owner.identity.resetEpoch = txResetEpoch
-    if smScanOwnerCurrent(owner, smScanLost.indication):
-      smScanLost.owner = owner
-
 proc smScanForget(header: pointer) =
   let saved = irqSave()
   defer: irqRestore(saved)

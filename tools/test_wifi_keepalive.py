@@ -343,7 +343,8 @@ def test_keepalive_timers_and_retry_boundaries(tmp_path: Path) -> None:
     procedures = "\n".join([
         procedure(kernel, "mmCaptureVif", "\nproc mmVifCurrent"),
         procedure(kernel, "mmVifCurrent", "\nproc mmConnLossTagAt"),
-        procedure(kernel, "mmTimerActiveDelivery", "\nproc mmStaTimerCurrent"),
+        procedure(kernel, "mmTimerActiveDelivery", "\nproc mmStaOwnerCurrent"),
+        procedure(kernel, "mmStaOwnerCurrent", "\nproc mmStaTimerCurrent"),
         procedure(kernel, "mmResetBeaconProbeCount", "\nproc mmCheckBeaconFrame"),
         procedure(kernel, "mmStaTimerCurrent", "\nproc mm_sta_tbtt"),
         procedure(kernel, "mm_ap_probe_cfm*", "\nproc mm_bcn_transmitted*"),

@@ -137,7 +137,7 @@ def source() -> str:
     )
     code += PLATFORM
     kernel = (FW / "kernel_mac_channel.nim").read_text()
-    for name in ["mmCaptureVif", "mmVifCurrent", "mmStaTimerCurrent", "chanLeaseCurrent",
+    for name in ["mmCaptureVif", "mmVifCurrent", "mmStaOwnerCurrent", "mmStaTimerCurrent", "chanLeaseCurrent",
                  "chan_bcn_detect_start"]:
         code += procedure(kernel, name)
     return code

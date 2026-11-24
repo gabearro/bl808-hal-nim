@@ -186,7 +186,8 @@ for outcome in 0 .. 3:
   if outcome == 3: inc chanCtxtLinkEpochs[0]
   now = 151
   mm_timer_schedule()
-  doAssert deliveredTbtt == (if outcome == 0: @[1'u] else: @[])
+  # Only a changed channel binding retires the deadline; TX resets do not.
+  doAssert deliveredTbtt == (if outcome != 3: @[1'u] else: @[])
 ''',
     "retired_vif": r'''
 arm()
@@ -197,13 +198,12 @@ mm_timer_schedule()
 doAssert deliveredTbtt.len == 0 and nodes[0].state == 0
 ''',
     "changed_identity": r'''
-for change in 0 .. 5:
+for change in [0, 1, 3, 4, 5]:
   setupTbtt()
   arm()
   case change
   of 0: inc chanCtxtLinkEpochs[0]
   of 1: inc chanCtxtEpochs[0]
-  of 2: inc txResetEpoch
   of 3: vifs[0].chanCtxt = addr contexts[1]
   of 4: contexts[0].channel.primFreq = 2462
   else: nodes[0].targetTime = 200

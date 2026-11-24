@@ -439,7 +439,6 @@ proc mm_force_idle_req(): bool =
   doAssert not enabled
   inc txResetEpoch
   not failIdle
-proc smRegistrationPreserveAcrossChannelReset(previous: uint32) = discard
 '''
     code += procedure((FW / "channel_timer.nim").read_text(), "chanForceIdle")
     run_program(tmp_path, mode, code + r'''
@@ -452,7 +451,7 @@ for joining in [false, true]:
     for channel in 0 ..< 3:
       chanConnlessTimerOwner = (true, txResetEpoch)
       doAssert chanForceIdle()
-      doAssert enabled and chanConnlessTimerOwner.resetEpoch == txResetEpoch
+      doAssert enabled
     if not replyQueued: reply = complete(request)
     let id = if joining: SCANU_JOIN_CFM else: SCANU_START_CFM
     doAssert smScanAcceptReply(reply, id)

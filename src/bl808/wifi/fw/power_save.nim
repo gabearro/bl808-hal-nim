@@ -715,8 +715,11 @@ proc ps_tx_null_timer_handle*() {.exportc, cdecl.} =
   let saved = irqSave()
   let owner = psTxNullOwner
   let delivery = mmTimerActiveDelivery(psTxNullTimer())
+  # The armed timer owns the transition until it is finalized. A TX reset
+  # flushes the null frame but not the transition, so the timeout must still
+  # finish it; a retried mode request cancels this timer and zeroes the count.
   template current(): bool =
-    txResetEpoch == owner.resetEpoch and psModeBuildSerial == owner.serial and
+    psModeBuildSerial == owner.serial and
       (delivery == nil or not delivery.cancelled)
   let flags = ps.flags
   let pendingNullConfirmCount = ps.pendingCount

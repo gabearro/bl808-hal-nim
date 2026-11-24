@@ -746,7 +746,7 @@ proc scanDwellForget(header: pointer) =
     discard scanDwellClaim(keMsgPayload(cast[ptr KeMsgHdr](header)))
 
 var mmEdcaRefresh: tuple[message, context: pointer; vif: uint8;
-                         vifEpoch, bindingEpoch, resetEpoch: uint32]
+                         vifEpoch, bindingEpoch: uint32]
 var chanCtxtLinkEpochs {.wifiCtrl.}: array[MAX_VIFS, uint32]
 
 type MmConfigIdlePhase = enum
@@ -2847,7 +2847,7 @@ proc mmReplayEdca() =
 
 proc mmEdcaRefreshCurrent(): bool =
   let i = mmEdcaRefresh.vif
-  i < MAX_VIFS.uint8 and mmEdcaRefresh.resetEpoch == txResetEpoch and
+  i < MAX_VIFS.uint8 and
     rxVifEpochs[i] == mmEdcaRefresh.vifEpoch and
     chanCtxtLinkEpochs[i] == mmEdcaRefresh.bindingEpoch and
     mmEdcaRefresh.context == chanEnvView().currentCtxt and
@@ -2858,8 +2858,7 @@ proc mmRequestStaEdcaRefresh(vif: ptr VifChannelView) =
   ## retry a missed allocation; a channel switch can apply the shadow first.
   let saved = irqSave()
   defer: irqRestore(saved)
-  if mmEdcaRefresh.message != nil and mmEdcaRefresh.resetEpoch == txResetEpoch:
-    return
+  if mmEdcaRefresh.message != nil: return
   if vif == nil or vif.vifIdx >= MAX_VIFS.uint8 or mmEdcaOwner() != vif: return
   var changed = false
   for queue in 0 ..< 4:
@@ -2877,11 +2876,11 @@ proc mmRequestStaEdcaRefresh(vif: ptr VifChannelView) =
   let header = cast[pointer](keMsgHdrFromPayload(request))
   if rxVifEpochs[i] != vifEpoch or chanCtxtLinkEpochs[i] != bindingEpoch or
       context != vif.chanCtxt or txResetEpoch != resetEpoch or
-      (mmEdcaRefresh.message != nil and mmEdcaRefresh.resetEpoch == resetEpoch) or
+      mmEdcaRefresh.message != nil or
       mmEdcaOwner() != vif:
     ke_msg_free(header)
     return
-  mmEdcaRefresh = (header, context, i, vifEpoch, bindingEpoch, resetEpoch)
+  mmEdcaRefresh = (header, context, i, vifEpoch, bindingEpoch)
   ke_msg_send(request)
 
 proc mm_cfg_element_keepalive_timestamp_update*() {.exportc, cdecl.} =
@@ -2955,7 +2954,7 @@ proc mmConnLossTagFor(message: pointer): ptr MmConnLossTag =
   while tag != nil:
     if tag.header == cast[pointer](header):
       let ind = mmConnectionLossIndView(message)
-      if tag.consumed or tag.resetEpoch != txResetEpoch or
+      if tag.consumed or
           ind.vifIdx != tag.identity.index or ind.reason != tag.reason or
           not mmVifCurrent(tag.identity) or
           (tag.tracksProbe and mmConnLossProbeEpoch(tag.reason, tag.identity.index) != tag.probeEpoch):
@@ -3885,9 +3884,14 @@ proc mmTimerActiveDelivery(timer: pointer): ptr MmTimerMutation =
   else:
     nil
 
+proc mmStaOwnerCurrent(identity: MmVifIdentity): bool {.inline.} =
+  ## For an owner that outlives the handler that created it (a queued request
+  ## or an armed wake). A TX reset since then does not end it.
+  mmVifCurrent(identity) and not txlResetting() and not txlVifIsRetiring(identity.index)
+
 proc mmStaTimerCurrent(identity: MmVifIdentity; resetEpoch: uint32): bool {.inline.} =
-  mmVifCurrent(identity) and txResetEpoch == resetEpoch and
-    not txlResetting() and not txlVifIsRetiring(identity.index)
+  ## For re-checks inside one handler: also false once a nested reset ran.
+  mmStaOwnerCurrent(identity) and txResetEpoch == resetEpoch
 
 proc mmStaTbttCurrent(identity: MmVifIdentity; resetEpoch, beaconRxCount: uint32): bool {.noinline.} =
   if not mmStaTimerCurrent(identity, resetEpoch): return false
