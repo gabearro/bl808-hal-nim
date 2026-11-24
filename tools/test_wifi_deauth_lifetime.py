@@ -21,6 +21,7 @@ var
   mfpMode: uint32
   badMic: bool
   disconnects: int
+  txResetActive: bool
   authStarts: int
   nimFwDbgActiveCfmBadState, nimFwDbgActiveCfmLastState: uint32
 proc mm_bcn_transmitted() = discard
@@ -198,6 +199,31 @@ currentState = 9
 complete()
 doAssert disconnects == 0 and currentState == 9
 ''',
+    "completion_reset_retirement": r'''
+for disruption in 0 .. 6:
+  prepare(0)
+  sendDeauth(0)
+  let frame = activeFrame
+  let context = txlCaptureFrameCallback(frame)
+  let callback = frame.callback
+  let argument = if disruption == 6: cast[pointer](addr vifs[0]) else: frame.callbackArg
+  inc txResetEpoch
+  txResetActive = disruption != 1
+  case disruption
+  of 2: inc rxVifEpochs[1]
+  of 3: inc stationEpochs[frame.staInfoIdx]
+  of 4: inc smTxSerials[1]
+  of 5: sm.connectInfo = addr replacementConn
+  else: discard
+  txlInvokeFrameCallback(callback, argument, 0x40000000'u32, context)
+  doAssert disconnects == (if disruption == 0: 1 else: 0)
+  if disruption == 0:
+    sm.connectInfo = addr conn
+    currentState = SmDisconnectingState
+  txlInvokeFrameCallback(callback, argument, 0x40000000'u32, context)
+  doAssert disconnects == (if disruption == 0: 1 else: 0)
+  txResetActive = false
+''',
     "connected_without_attempt": r'''
 prepare(0)
 sm.connectInfo = nil
@@ -315,7 +341,7 @@ def source() -> str:
     extras = rest[extra_start:extra_end]
     rest = rest[:extra_start] + rest[extra_end:]
     code = first + extras + "\n" + marker + rest
-    for name in ["me_build_deauthenticate", "sm_disconnect_deauth_cfm",
+    for name in ["me_build_deauthenticate", "smClaimFlushedDisconnect", "sm_disconnect_deauth_cfm",
                  "sm_connect_abort_deauth_cfm", "sm_handle_connection", "smDeauthSend", "sm_deauth_send"]:
         if not re.search(rf"^proc {name}\*?\(", sm, re.M):
             continue

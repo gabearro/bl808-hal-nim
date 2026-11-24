@@ -2,6 +2,13 @@ var nimFwDbgFrameTraceCount {.wifiCtrl.}: uint32
 var nimFwDbgIpcTxTraceCount {.wifiCtrl.}: uint32
 var nimFwDbgCfmTraceCount {.wifiCtrl.}: uint32
 var nimFwDbgEapolTraceCount {.wifiCtrl.}: uint32
+
+when defined(bl808WifiApHttpSmoke):
+  type ApBeaconDmaTrace = object
+    armed, dmaBusy, ready, done, success, flushed, flushedDone: uint32
+    lastHead, lastReadyStatus, lastDoneStatus, lastFlushStatus, lastFlushCfm: uint32
+  var apBeaconDmaTrace {.wifiCtrl, exportc: "nimfw_ap_beacon_dma_trace".}: ApBeaconDmaTrace
+
 # TX-path investigation counters (iter 261). Read after test via UART dump.
 var nimFwDbgPayBackupEntry* {.wifiCtrl, exportc: "nimfw_dbg_pay_backup".}: uint32
 var nimFwDbgPayDescFound*   {.wifiCtrl, exportc: "nimfw_dbg_pay_desc".}: uint32
@@ -118,6 +125,10 @@ var nimFwDbgRxlMgmtLast* {.wifiCtrl, exportc: "nimfw_dbg_rxl_mgmt_last".}: uint3
 var nimFwDbgRxlAuthLikeSeen* {.wifiCtrl, exportc: "nimfw_dbg_rxl_auth_like_seen".}: uint32
 var nimFwDbgRxlAuthLikeHwFlags* {.wifiCtrl, exportc: "nimfw_dbg_rxl_auth_like_hwflags".}: uint32
 var nimFwDbgRxlAuthLikeFc* {.wifiCtrl, exportc: "nimfw_dbg_rxl_auth_like_fc".}: uint32
+when defined(bl808WifiProbeReplyDiag):
+  var nimFwDbgProbeReplyCount {.wifiCtrl, exportc: "nimfw_dbg_probe_reply_count".}: uint32
+  var nimFwDbgProbeReplySamples {.wifiCtrl, exportc: "nimfw_dbg_probe_reply_samples".}:
+    array[32, array[2, uint32]]
 var nimFwDbgRxlSnapHd* {.wifiCtrl, exportc: "nimfw_dbg_rxl_snap_hd".}: uint32
 var nimFwDbgRxlSnapPd* {.wifiCtrl, exportc: "nimfw_dbg_rxl_snap_pd".}: uint32
 var nimFwDbgRxlSnapHwHd* {.wifiCtrl, exportc: "nimfw_dbg_rxl_snap_hw_hd".}: uint32
@@ -415,6 +426,7 @@ var nimFwDbgNullFrameCfm*     {.wifiCtrl, exportc: "nimfw_dbg_nullframe_cfm".}: 
 var nimFwDbgNullFrameAckOk*   {.wifiCtrl, exportc: "nimfw_dbg_nullframe_ack_ok".}: uint32
 var nimFwDbgNullFrameAckFail* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_ack_fail".}: uint32
 var nimFwDbgNullFrameLastStatus* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_status".}: uint32
+var nimFwDbgNullFrameNoHwResult* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_no_hw_result".}: uint32
 var nimFwDbgNullFrameDescLast* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_desc".}: uint32
 var nimFwDbgNullFrameBufLast* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_buf".}: uint32
 var nimFwDbgNullFrameFcLast* {.wifiCtrl, exportc: "nimfw_dbg_nullframe_fc".}: uint32
@@ -541,9 +553,6 @@ var nimFwDbgAssocDone*        {.wifiCtrl, exportc: "nimfw_dbg_assoc_done".}: uin
 var nimFwDbgSmRspTimeout*     {.wifiCtrl, exportc: "nimfw_dbg_sm_rsp_timeout".}: uint32
 var nimFwDbgSmRspTimeoutState* {.wifiCtrl, exportc: "nimfw_dbg_sm_rsp_timeout_state".}: uint32
 var nimFwDbgSmRspTimeoutRxCtrl* {.wifiCtrl, exportc: "nimfw_dbg_sm_rsp_timeout_rxctrl".}: uint32
-var nimFwDbgAckFallbackAuth*  {.wifiCtrl, exportc: "nimfw_dbg_ack_fallback_auth".}: uint32
-var nimFwDbgAckFallbackAssoc* {.wifiCtrl, exportc: "nimfw_dbg_ack_fallback_assoc".}: uint32
-var nimFwDbgAckFallbackLast*  {.wifiCtrl, exportc: "nimfw_dbg_ack_fallback_last".}: uint32
 var nimFwDbgAuthOpenSuccess*  {.wifiCtrl, exportc: "nimfw_dbg_auth_open_success".}: uint32
 var nimFwDbgAssocReqSend*     {.wifiCtrl, exportc: "nimfw_dbg_assoc_req_send".}: uint32
 var nimFwDbgAssocReqMeta*     {.wifiCtrl, exportc: "nimfw_dbg_assoc_req_meta".}: uint32
@@ -555,7 +564,7 @@ var nimFwDbgAssocCfmEvt*      {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_evt".}: 
 var nimFwDbgAssocCfmStatus*   {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_status".}: uint32
 var nimFwDbgAssocCfmHwStatus* {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_hw_status".}: uint32
 var nimFwDbgAssocCfmThdFlags* {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_thd_flags".}: uint32
-var nimFwDbgAssocCfmAckOk16*  {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_ack_ok16".}: uint32
+var nimFwDbgAssocCfmFinalFail16* {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_final_fail16".}: uint32
 var nimFwDbgAssocCfmAckOk23*  {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_ack_ok23".}: uint32
 var nimFwDbgAssocCfmAckFail*  {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_ack_fail".}: uint32
 var nimFwDbgAssocCfmDesc*     {.wifiCtrl, exportc: "nimfw_dbg_assoc_cfm_desc".}: uint32
@@ -568,6 +577,9 @@ var nimFwDbgAssocRspBody0*    {.wifiCtrl, exportc: "nimfw_dbg_assoc_rsp_b0".}: u
 var nimFwDbgAssocRspBody4*    {.wifiCtrl, exportc: "nimfw_dbg_assoc_rsp_b4".}: uint32  # next 4 bytes
 var nimFwDbgDeauthHandler*    {.wifiCtrl, exportc: "nimfw_dbg_deauth".}: uint32
 var nimFwDbgConnLossInd*      {.wifiCtrl, exportc: "nimfw_dbg_connloss".}: uint32
+when defined(bl808WifiDiagLinkDrop):
+  # Submissions, rejected submissions, ACKs, other confirmations, last status.
+  var nimFwDbgTrafficProbe* {.wifiCtrl, exportc: "nimfw_dbg_traffic_probe".}: array[5, uint32]
 var nimFwDbgWpaRsnIeSet*      {.wifiCtrl, exportc: "nimfw_dbg_wparsn_set".}: uint32
 var nimFwDbgWpaRsnIeLen*      {.wifiCtrl, exportc: "nimfw_dbg_wparsn_len".}: uint32
 var nimFwDbgWpaRsnIePtr*      {.wifiCtrl, exportc: "nimfw_dbg_wparsn_ptr".}: uint32
@@ -767,7 +779,7 @@ var nimFwDbgAuthCfmEvt*      {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_evt".}: ui
 var nimFwDbgAuthCfmStatus*   {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_status".}: uint32
 var nimFwDbgAuthCfmHwStatus* {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_hw_status".}: uint32
 var nimFwDbgAuthCfmThdFlags* {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_thd_flags".}: uint32
-var nimFwDbgAuthCfmAckOk16*  {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_ack_ok16".}: uint32
+var nimFwDbgAuthCfmFinalFail16* {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_final_fail16".}: uint32
 var nimFwDbgAuthCfmAckOk23*  {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_ack_ok23".}: uint32
 var nimFwDbgAuthCfmAckFail*  {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_ack_fail".}: uint32
 var nimFwDbgAuthCfmDesc*     {.wifiCtrl, exportc: "nimfw_dbg_auth_cfm_desc".}: uint32
@@ -813,6 +825,9 @@ var nimFwDbgEapolCfmMetaLog* {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_meta_log"
 var nimFwDbgEapolCfmKeyLog* {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_key_log".}: array[4, uint32]
 var nimFwDbgEapolCfmReplayLog* {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_replay_log".}: array[4, uint32]
 var nimFwDbgEapolCfmCbLog* {.wifiCtrl, exportc: "nimfw_dbg_eapol_cfm_cb_log".}: array[4, uint32]
+when defined(bl808WifiDiagEapolRfGain):
+  var nimFwDbgEapolRfGainCount* {.wifiCtrl, exportc: "nimfw_dbg_eapol_rf_gain_count".}: uint32
+  var nimFwDbgEapolRfGainLog* {.wifiCtrl, exportc: "nimfw_dbg_eapol_rf_gain_log".}: array[8, array[5, uint32]]
 # Disconnect-path counters.
 var nimFwDbgDisconnectReq*   {.wifiCtrl, exportc: "nimfw_dbg_disconnect_req".}: uint32
 var nimFwDbgDisconnectReqState* {.wifiCtrl, exportc: "nimfw_dbg_disconnect_req_state".}: uint32
@@ -837,11 +852,26 @@ var nimFwDbgSmOrphanDrained* {.wifiCtrl, exportc: "nimfw_dbg_sm_orphan_drained".
 # Overlap tripwire: a new SCANU req arrived while paramPtr was still live (the
 # UAF the idle guard now prevents). MUST stay 0 in the field.
 var nimFwDbgScanuParamOverwrite* {.wifiCtrl, exportc: "nimfw_dbg_scanu_param_overwrite".}: uint32
+when defined(bl808WifiDiagColdScan):
+  var nimFwDbgColdScanFlow* {.wifiCtrl, exportc: "nimfw_dbg_cold_scan_flow".}: array[6, uint32]
+when defined(bl808WifiDiagWarmScan):
+  var nimFwDbgWarmScan* {.wifiCtrl, exportc: "nimfw_dbg_warm_scan".}:
+    tuple[upper_admitted, lower_replies, slot_admitted, start_posted,
+          start_handled, end_posted, end_handled, host_replies: uint32]
+  var nimFwDbgWarmScanLowerStatus* {.wifiCtrl.}: uint32
+  var nimFwDbgWarmScanHostStatus* {.wifiCtrl.}: uint32
+  var nimFwDbgWarmScanSubmitStatus* {.wifiCtrl.}: cint
+  type WarmAssocFailureStage = enum
+    warmAssocNoLocalFailure, warmAssocRequestBuild, warmAssocSecurityTail,
+    warmAssocRequestIeCopy, warmAssocAid, warmAssocPrepare, warmAssocStart,
+    warmAssocComeback, warmAssocResponseIeCopy, warmAssocRateInit,
+    warmAssocPeerIndication, warmAssocActivation
+  var nimFwDbgWarmAssocFailure* {.wifiCtrl.}: WarmAssocFailureStage
 
 # TX pipeline bracket forensics (TX-dead wedge): where do frames stop?
 # host: bl_output(tx_arp) -> bl_tx_try_flush(flush_enter) -> txPush(push_calls)
 #   -> ipc_host_txdesc_push -> [emb] ipc_emb_tx_evt(enter) -> txu_cntrl_push -> MACHW
-# ipc_tx_evt_park counts the flow-control gate exits (keEvtField & 0x02102000
+# ipc_tx_evt_park counts the flow-control gate exits (ke_env[0] & 0x02102000
 # nonzero -> re-arm + return WITHOUT consuming); park_field snapshots the field.
 var nimFwDbgIpcTxEvtEnter* {.wifiCtrl, exportc: "nimfw_dbg_ipc_tx_evt_enter".}: uint32
 var nimFwDbgIpcTxEvtPark* {.wifiCtrl, exportc: "nimfw_dbg_ipc_tx_evt_park".}: uint32

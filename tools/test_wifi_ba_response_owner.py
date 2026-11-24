@@ -61,7 +61,7 @@ def source() -> str:
     types = "type\n"
     for name in ["TxSessionIdentity", "RxuMgtDispatchView", "RxuMgtIndMsgView",
                  "BamEnvView", "MeAddBaReqParamView", "AddBaReqActionBodyView",
-                 "AddBaRspActionBodyView"]:
+                 "AddBaRspActionBodyView", "DelBaInfoView", "DelBaActionBodyView"]:
         match = re.search(r"(?ms)^  " + name + r"\b.*?(?=^  \w|\Z)", layout)
         assert match, name
         types += match.group(0)
@@ -141,8 +141,11 @@ for params in [0'u16, 3, 0x073E, 0xFFFF]:
     doAssert allocations == 1 and pushes == 1 and interrupts
     let body = addBaRspActionBodyAt(addr link.macHeader[24])
     doAssert body.dialogToken == 0xEF and body.timeout == 0
-    doAssert body.statusCode == (if tid < 8: 0'u16 else: 37'u16)
+    doAssert body.statusCode == (if tid < 8 and (params and 2) != 0:
+      0'u16 else: 37'u16)
     doAssert body.baParams == ((accepted shl 6).uint16 or (params and 0x3E) or 2)
+    doAssert mmio == (if tid < 8 and (params and 2) != 0:
+      0xABCD0090'u32 else: 0xABCD0010'u32)
 ''')
 
 

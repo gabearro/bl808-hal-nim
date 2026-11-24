@@ -1,0 +1,168 @@
+BL808 SDK lwIP DHCP diagnostic counters for b773b3f4bf6154125304a328c72bf2aa7168a715.
+Apply from the pinned SDK root; the firmware still compiles the SDK DHCP source.
+
+diff --git a/components/network/lwip/src/core/ipv4/dhcp.c b/components/network/lwip/src/core/ipv4/dhcp.c
+index 818ccc1e..7bd0fdc3 100644
+--- a/components/network/lwip/src/core/ipv4/dhcp.c
++++ b/components/network/lwip/src/core/ipv4/dhcp.c
+@@ -202,6 +202,19 @@ static void dhcp_set_state(struct dhcp *dhcp, u8_t new_state);
+ /* receive, unfold, parse and free incoming messages */
+ static void dhcp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr, u16_t port);
+
++volatile u32_t nimfw_dbg_lwip_dhcp_recv_count;
++volatile u32_t nimfw_dbg_lwip_dhcp_recv_code;
++volatile u32_t nimfw_dbg_lwip_dhcp_recv_len;
++volatile u32_t nimfw_dbg_lwip_dhcp_recv_meta;
++volatile u32_t nimfw_dbg_lwip_dhcp_offer_count;
++volatile u32_t nimfw_dbg_lwip_dhcp_offer_code;
++volatile u32_t nimfw_dbg_lwip_dhcp_offer_server;
++volatile u32_t nimfw_dbg_lwip_dhcp_offer_ip;
++volatile u32_t nimfw_dbg_lwip_dhcp_select_count;
++volatile u32_t nimfw_dbg_lwip_dhcp_create_count;
++volatile u32_t nimfw_dbg_lwip_dhcp_create_meta;
++volatile u32_t nimfw_dbg_lwip_dhcp_create_hist;
++
+ /* set the DHCP timers */
+ static void dhcp_timeout(struct netif *netif);
+ static void dhcp_t1_timeout(struct netif *netif);
+@@ -346,6 +359,9 @@ static void
+ dhcp_handle_offer(struct netif *netif, struct dhcp_msg *msg_in)
+ {
+   struct dhcp *dhcp = netif_dhcp_data(netif);
++  nimfw_dbg_lwip_dhcp_offer_count++;
++  nimfw_dbg_lwip_dhcp_offer_code = 0;
++  nimfw_dbg_lwip_dhcp_offer_ip = msg_in->yiaddr.addr;
+
+   LWIP_DEBUGF(DHCP_DEBUG | LWIP_DBG_TRACE, ("dhcp_handle_offer(netif=%p) %c%c%"U16_F"\n",
+               (void *)netif, netif->name[0], netif->name[1], (u16_t)netif->num));
+@@ -354,6 +370,8 @@ dhcp_handle_offer(struct netif *netif, struct dhcp_msg *msg_in)
+     dhcp->request_timeout = 0; /* stop timer */
+
+     ip_addr_set_ip4_u32(&dhcp->server_ip_addr, lwip_htonl(dhcp_get_option_value(dhcp, DHCP_OPTION_IDX_SERVER_ID)));
++    nimfw_dbg_lwip_dhcp_offer_code = 1;
++    nimfw_dbg_lwip_dhcp_offer_server = ip4_addr_get_u32(ip_2_ip4(&dhcp->server_ip_addr));
+     LWIP_DEBUGF(DHCP_DEBUG | LWIP_DBG_STATE, ("dhcp_handle_offer(): server 0x%08"X32_F"\n",
+                 ip4_addr_get_u32(ip_2_ip4(&dhcp->server_ip_addr))));
+     /* remember offered address */
+@@ -363,6 +381,7 @@ dhcp_handle_offer(struct netif *netif, struct dhcp_msg *msg_in)
+
+     dhcp_select(netif);
+   } else {
++    nimfw_dbg_lwip_dhcp_offer_code = 2;
+     LWIP_DEBUGF(DHCP_DEBUG | LWIP_DBG_TRACE | LWIP_DBG_LEVEL_SERIOUS,
+                 ("dhcp_handle_offer(netif=%p) did not get server ID!\n", (void *)netif));
+   }
+@@ -391,6 +410,7 @@ dhcp_select(struct netif *netif)
+   LWIP_ERROR("dhcp_select: dhcp != NULL", (dhcp != NULL), return ERR_VAL;);
+
+   LWIP_DEBUGF(DHCP_DEBUG | LWIP_DBG_TRACE, ("dhcp_select(netif=%p) %c%c%"U16_F"\n", (void *)netif, netif->name[0], netif->name[1], (u16_t)netif->num));
++  nimfw_dbg_lwip_dhcp_select_count++;
+   dhcp_set_state(dhcp, DHCP_STATE_REQUESTING);
+
+   /* create and initialize the DHCP message header */
+@@ -1894,11 +1914,17 @@ dhcp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr,
+   struct dhcp_msg *msg_in;
+
+   LWIP_UNUSED_ARG(arg);
++  nimfw_dbg_lwip_dhcp_recv_count++;
++  nimfw_dbg_lwip_dhcp_recv_code = 0;
++  nimfw_dbg_lwip_dhcp_recv_len = ((u32_t)p->len) | (((u32_t)p->tot_len) << 16);
+
+   /* Caught DHCP message from netif that does not have DHCP enabled? -> not interested */
+   if ((dhcp == NULL) || (dhcp->pcb_allocated == 0)) {
++    nimfw_dbg_lwip_dhcp_recv_meta = 0;
++    nimfw_dbg_lwip_dhcp_recv_code = 1;
+     goto free_pbuf_and_return;
+   }
++  nimfw_dbg_lwip_dhcp_recv_meta = ((u32_t)dhcp->state) | (((u32_t)dhcp->xid) << 8);
+
+   LWIP_ASSERT("invalid server address type", IP_IS_V4(addr));
+
+@@ -1913,11 +1939,13 @@ dhcp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr,
+
+   if (p->len < DHCP_MIN_REPLY_LEN) {
+     LWIP_DEBUGF(DHCP_DEBUG | LWIP_DBG_TRACE | LWIP_DBG_LEVEL_WARNING, ("DHCP reply message or pbuf too short\n"));
++    nimfw_dbg_lwip_dhcp_recv_code = 2;
+     goto free_pbuf_and_return;
+   }
+
+   if (reply_msg->op != DHCP_BOOTREPLY) {
+     LWIP_DEBUGF(DHCP_DEBUG | LWIP_DBG_TRACE | LWIP_DBG_LEVEL_WARNING, ("not a DHCP reply message, but type %"U16_F"\n", (u16_t)reply_msg->op));
++    nimfw_dbg_lwip_dhcp_recv_code = 3;
+     goto free_pbuf_and_return;
+   }
+   /* iterate through hardware address and match against DHCP message */
+@@ -1926,6 +1954,7 @@ dhcp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr,
+       LWIP_DEBUGF(DHCP_DEBUG | LWIP_DBG_TRACE | LWIP_DBG_LEVEL_WARNING,
+                   ("netif->hwaddr[%"U16_F"]==%02"X16_F" != reply_msg->chaddr[%"U16_F"]==%02"X16_F"\n",
+                    (u16_t)i, (u16_t)netif->hwaddr[i], (u16_t)i, (u16_t)reply_msg->chaddr[i]));
++      nimfw_dbg_lwip_dhcp_recv_code = 0x40 | i;
+       goto free_pbuf_and_return;
+     }
+   }
+@@ -1933,12 +1962,14 @@ dhcp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr,
+   if (lwip_ntohl(reply_msg->xid) != dhcp->xid) {
+     LWIP_DEBUGF(DHCP_DEBUG | LWIP_DBG_TRACE | LWIP_DBG_LEVEL_WARNING,
+                 ("transaction id mismatch reply_msg->xid(%"X32_F")!=dhcp->xid(%"X32_F")\n", lwip_ntohl(reply_msg->xid), dhcp->xid));
++    nimfw_dbg_lwip_dhcp_recv_code = 5;
+     goto free_pbuf_and_return;
+   }
+   /* option fields could be unfold? */
+   if (dhcp_parse_reply(p, dhcp) != ERR_OK) {
+     LWIP_DEBUGF(DHCP_DEBUG | LWIP_DBG_TRACE | LWIP_DBG_LEVEL_SERIOUS,
+                 ("problem unfolding DHCP message - too short on memory?\n"));
++    nimfw_dbg_lwip_dhcp_recv_code = 6;
+     goto free_pbuf_and_return;
+   }
+
+@@ -1946,14 +1977,18 @@ dhcp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr,
+   /* obtain pointer to DHCP message type */
+   if (!dhcp_option_given(dhcp, DHCP_OPTION_IDX_MSG_TYPE)) {
+     LWIP_DEBUGF(DHCP_DEBUG | LWIP_DBG_TRACE | LWIP_DBG_LEVEL_WARNING, ("DHCP_OPTION_MESSAGE_TYPE option not found\n"));
++    nimfw_dbg_lwip_dhcp_recv_code = 7;
+     goto free_pbuf_and_return;
+   }
+
+   msg_in = (struct dhcp_msg *)p->payload;
+   /* read DHCP message type */
+   msg_type = (u8_t)dhcp_get_option_value(dhcp, DHCP_OPTION_IDX_MSG_TYPE);
++  nimfw_dbg_lwip_dhcp_recv_meta =
++    ((u32_t)dhcp->state) | (((u32_t)msg_type) << 8) | ((lwip_ntohl(reply_msg->xid) & 0xffff) << 16);
+   /* message type is DHCP ACK? */
+   if (msg_type == DHCP_ACK) {
++    nimfw_dbg_lwip_dhcp_recv_code = 0x80 | msg_type;
+     LWIP_DEBUGF(DHCP_DEBUG | LWIP_DBG_TRACE, ("DHCP_ACK received\n"));
+     /* in requesting state? */
+     if (dhcp->state == DHCP_STATE_REQUESTING) {
+@@ -1982,14 +2017,18 @@ dhcp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr,
+   else if ((msg_type == DHCP_NAK) &&
+            ((dhcp->state == DHCP_STATE_REBOOTING) || (dhcp->state == DHCP_STATE_REQUESTING) ||
+             (dhcp->state == DHCP_STATE_REBINDING) || (dhcp->state == DHCP_STATE_RENEWING  ))) {
++    nimfw_dbg_lwip_dhcp_recv_code = 0x80 | msg_type;
+     LWIP_DEBUGF(DHCP_DEBUG | LWIP_DBG_TRACE, ("DHCP_NAK received\n"));
+     dhcp_handle_nak(netif);
+   }
+   /* received a DHCP_OFFER in DHCP_STATE_SELECTING state? */
+   else if ((msg_type == DHCP_OFFER) && (dhcp->state == DHCP_STATE_SELECTING)) {
+     LWIP_DEBUGF(DHCP_DEBUG | LWIP_DBG_TRACE, ("DHCP_OFFER received in DHCP_STATE_SELECTING state\n"));
++    nimfw_dbg_lwip_dhcp_recv_code = 0x80 | msg_type;
+     /* remember offered lease */
+     dhcp_handle_offer(netif, msg_in);
++  } else {
++    nimfw_dbg_lwip_dhcp_recv_code = 0x20 | msg_type;
+   }
+
+ free_pbuf_and_return:
+@@ -2050,6 +2089,12 @@ dhcp_create_msg(struct netif *netif, struct dhcp *dhcp, u8_t message_type, u16_t
+     }
+     dhcp->xid = xid;
+   }
++  nimfw_dbg_lwip_dhcp_create_count++;
++  if (message_type < 8) {
++    nimfw_dbg_lwip_dhcp_create_hist += 1U << (message_type * 4U);
++  }
++  nimfw_dbg_lwip_dhcp_create_meta =
++    ((u32_t)message_type) | (((u32_t)dhcp->state) << 8) | ((dhcp->xid & 0xffff) << 16);
+   LWIP_DEBUGF(DHCP_DEBUG | LWIP_DBG_TRACE,
+               ("transaction id xid(%"X32_F")\n", xid));
+

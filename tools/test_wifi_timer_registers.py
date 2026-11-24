@@ -188,3 +188,47 @@ for irq in [false, true]:
       expected.add(@["tick:122", "log:610", "tick:130"])
       doAssert steps == expected
 ''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_kernel_timer_unmask_transition_writes(tmp_path: Path, mode: str) -> None:
+    body = procedure((FW / "kernel_mac_channel.nim").read_text(), "ke_timer_hw_set")
+    run_program(tmp_path, mode, r'''
+const
+  MACHW_TIMER_TARGET_REG = 0x24B00148'u
+  MACHW_INTC_IRQ_SET_REG = 0x24B08088'u
+  MACHW_INTC_IRQ_STAT_REG = 0x24B0808C'u
+  MACHW_TIMER_IRQ_BIT = 0x100'u32
+type KeTimerEntry = object
+  time: uint32
+var
+  enabled = true
+  irqStatus: uint32
+  writes: seq[tuple[address: uint, value: uint32]]
+proc irqSave(): uint32 =
+  result = if enabled: 8'u32 else: 0'u32
+  enabled = false
+proc irqRestore(saved: uint32) = enabled = (saved and 8) != 0
+proc regRead(address: uint): uint32 =
+  doAssert address == MACHW_INTC_IRQ_STAT_REG
+  irqStatus
+proc regWrite(address: uint; value: uint32) =
+  writes.add((address, value))
+  if address == MACHW_INTC_IRQ_STAT_REG: irqStatus = value
+''' + body + r'''
+var timer = KeTimerEntry(time: 123)
+irqStatus = 0x20
+ke_timer_hw_set(addr timer)
+doAssert writes == @[(MACHW_TIMER_TARGET_REG, 123'u32),
+  (MACHW_INTC_IRQ_SET_REG, MACHW_TIMER_IRQ_BIT),
+  (MACHW_INTC_IRQ_STAT_REG, 0x120'u32)]
+doAssert enabled and irqStatus == 0x120
+writes.setLen(0)
+ke_timer_hw_set(addr timer)
+doAssert writes == @[(MACHW_TIMER_TARGET_REG, 123'u32)]
+doAssert enabled and irqStatus == 0x120
+writes.setLen(0)
+ke_timer_hw_set(nil)
+doAssert writes == @[(MACHW_INTC_IRQ_STAT_REG, 0x20'u32)]
+doAssert enabled and irqStatus == 0x20
+''')

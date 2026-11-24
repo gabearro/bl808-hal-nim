@@ -37,6 +37,12 @@ type
     stationEpoch, vifEpoch: uint32
     station, vif: uint8
     stationTracked, vifTracked: bool
+  MmStaDeletion = object
+    owner: StaQueueIdentity
+    requestEpoch: uint32
+    keys: array[4, uint8]
+    keyPending: array[4, bool]
+    active, running, staMode, apEffectsDone, addressDeleted, requestOwned: bool
   TxFlushBatch = object
     previous: ptr TxFlushBatch
     ac: uint8
@@ -88,6 +94,11 @@ var
   sta_info_env: CoList
   keMsgQueueSent, keMsgQueueSaved: CoList
   staDeleteEpochs: array[5, uint32]
+  mmStaDeletions: array[STA_MGMT_FREE_STAS, MmStaDeletion]
+  mmStaDelRetryMask: uint8
+  mmStaDelRetryEpochs: array[STA_MGMT_FREE_STAS, uint32]
+  mmStaDelRetryReset: uint32
+  mmStaDelRetryTimer: uint32
   rxVifEpochs: array[2, uint32]
   message: MmPsChangeIndPayload
   events: seq[string]
@@ -98,9 +109,11 @@ var
   allocationFails: bool
   keyFailure: uint8
   addressOk: bool
+  haltCalls: int
   irq: bool
   messagesFreed: int
   extraFrame: Frame
+  extraFrameReleases: int
   bcmcPolicies: array[2, uint32]
   drainUnlockEpoch: uint32
 proc invokeHook(site: string)
@@ -116,7 +129,21 @@ proc irqRestore(saved: uint32) =
     invokeHook("reset-return")
   if irq and hookSite == "drain-unlock" and staDeleteEpochs[2] == drainUnlockEpoch:
     invokeHook("drain-unlock")
+proc txlFlushScopeExit(previous: ptr TxFlushBatch) =
+  var batch = txActiveFlush
+  while batch != previous and batch != nil:
+    doAssert batch.confirmations.first == nil and batch.pending.first == nil and
+      batch.postponed.first == nil
+    batch = batch.previous
+  txActiveFlush = previous
 proc staInfoAt(p: pointer): ptr Sta = cast[ptr Sta](p)
+proc mmStaDelQueueRetryLocked(index: uint8; saved: uint32) =
+  mmStaDelRetryEpochs[index] = staDeleteEpochs[index]
+  mmStaDelRetryMask = mmStaDelRetryMask or (1'u8 shl index)
+proc mmTimerActiveDelivery(timer: pointer): ptr tuple[cancelled: bool] = nil
+proc ke_reschedule_saved_messages(task: uint8): bool =
+  doAssert task == TASK_MM
+  true
 proc vifChannelForIdx(index: uint8): ptr Vif = addr vifs[index]
 proc vifPostponedStaList(vif: ptr Vif): ptr CoList = addr vif.stations
 proc vifSecurity(vif: ptr Vif): ptr Security = addr vif.security
@@ -170,6 +197,11 @@ proc invokeHook(site: string) =
     callback()
 proc txl_frame_release(p: pointer; notify: bool) =
   doAssert notify
+  if p == addr extraFrame:
+    inc extraFrameReleases
+    doAssert extraFrameReleases == 1
+    invokeHook("tx")
+    return
   var index = -1
   for i in 0 ..< frames.len:
     if p == addr frames[i]: index = i
@@ -177,7 +209,10 @@ proc txl_frame_release(p: pointer; notify: bool) =
   inc frameReleases[index]
   doAssert frameReleases[index] == 1, "postponed frame released twice"
   invokeHook("tx")
-proc txlHaltStationQueues(index: uint8; selected: var uint8): bool = true
+proc txlHaltStationQueues(index: uint8; selected: var uint8): bool =
+  inc haltCalls
+  if hookSite == "halt": invokeHook("halt")
+  true
 proc txl_retire_station(index: uint8; selected: uint8) =
   doAssert index == 2
   doAssert stations[index].valid == 0
@@ -244,10 +279,14 @@ proc setup(vif: uint8; ap: bool) =
   allocationFails = false
   keyFailure = 0xFF
   addressOk = true
+  haltCalls = 0
+  mmStaDeletions = default(typeof(mmStaDeletions))
+  mmStaDelRetryMask = 0
   irq = true
   messagesFreed = 0
   rxVifEpochs = [11'u32, 12]
   extraFrame = default(Frame)
+  extraFrameReleases = 0
   drainUnlockEpoch = 0
 '''
 
@@ -259,6 +298,11 @@ proc reenter() =
   doAssert not co_list_find(addr sta_info_env, addr stations[2].link)
   mm_sta_del(2)
   sta_mgmt_unregister(2)
+setup(0, false)
+hookSite = "halt"
+hook = proc() = mm_sta_del(2)
+mm_sta_del(2)
+doAssert haltCalls == 1 and sta_info_env.first == addr stations[2].link
 for vif in 0'u8 .. 1:
   for ap in [false, true]:
     for site in ["drain", "tx", "host", "ps", "key", "address"]:
@@ -362,21 +406,62 @@ doAssert staDeleteEpoch(2) == 0
 # A failed hardware cleanup keeps the retired entry out of the free pool.
 for failed in [8'u8, 9, 10]:
   setup(0, false)
+  let beforeEpoch = staDeleteEpoch(2)
   keyFailure = failed
   mm_sta_del(2)
   doAssert stations[2].valid == 0 and stations[2].marker == 1234
   doAssert not co_list_find(addr sta_info_env, addr stations[2].link)
+  doAssert mmStaDelOwned(2, 0, beforeEpoch)
   doAssert vifs[0].security.staKeySlots[(failed - 8).int] == failed
   doAssert "address" notin events and "zero" notin events
   let after = events
   mm_sta_del(2)
-  doAssert events == after
+  doAssert events == after & @["key"]
+  keyFailure = 0xFF
+  mmStaDelRetryCb(nil)
+  doAssert events.count("address") == 1 and events.count("zero") == 1
+  doAssert not mmStaDelOwned(2, 0, beforeEpoch)
+  doAssert sta_info_env.first == addr stations[2].link
 setup(0, false)
 addressOk = false
 mm_sta_del(2)
 doAssert stations[2].valid == 0 and stations[2].marker == 1234
 doAssert not co_list_find(addr sta_info_env, addr stations[2].link)
 doAssert "address" in events and "zero" notin events
+vifs[0].staIdx = 4
+addressOk = true
+mmStaDelRetryCb(nil)
+doAssert events.count("address") == 2 and events.count("zero") == 1
+doAssert vifs[0].staIdx == 4
+doAssert sta_info_env.first == addr stations[2].link
+
+# AP sleeper and broadcast power-save effects run only once across retries.
+setup(0, true)
+addressOk = false
+mm_sta_del(2)
+doAssert events.count("ps") == 1 and vifs[0].psBaCounter == 0
+addressOk = true
+mmStaDelRetryCb(nil)
+doAssert events.count("ps") == 1 and events.count("address") == 2
+doAssert sta_info_env.first == addr stations[2].link
+
+# An unpublished add with an uncertain address write uses the same retry
+# owner, but must not touch VIF association, keys, or AP sleeper accounting.
+for ap in [false, true]:
+  setup(0, ap)
+  var unpublished: StaQueueIdentity
+  doAssert staMgmtBeginRemoval(2, unpublished) != nil
+  addressOk = false
+  mmStaDelTrackUnpublished(unpublished)
+  doAssert sta_info_env.first == nil and mmStaDeletions[2].active
+  doAssert not mmStaDelOwned(2, 0, unpublished.stationEpoch - 1'u32)
+  doAssert vifs[0].staIdx == 2 and vifs[0].psBaCounter == 1
+  doAssert keys.len == 0 and events.count("ps") == 0
+  addressOk = true
+  mmStaDelRetryCb(nil)
+  doAssert sta_info_env.first == addr stations[2].link
+  doAssert vifs[0].staIdx == 2 and vifs[0].psBaCounter == 1
+  doAssert keys.len == 0 and events.count("address") == 2
 
 # Replacing the VIF during a callout must stop the old teardown before it
 # touches the replacement. Old detached TX frames may still retire.
@@ -432,6 +517,27 @@ for incomingIrq in [false, true]:
   doAssert stations[2].postponedList.first == addr extraFrame.link
   doAssert stations[2].marker == 1234 and "zero" notin events
   doAssert sta_info_env.first == nil
+
+# A failed final TX drain keeps the saved delete request pending through a
+# second station epoch, then releases it only with the free-list publication.
+setup(0, false)
+let drainEpoch = staDeleteEpoch(2)
+hookSite = "tx"
+hook = proc() =
+  co_list_push_back(addr stations[2].postponedList, addr extraFrame.link)
+  inc frameEnv.postponedCount
+mm_sta_del(2)
+doAssert mmStaDelOwned(2, 0, drainEpoch)
+doAssert sta_info_env.first == nil and mmStaDeletions[2].addressDeleted
+var awaiting = QueuedDelete(header: KeMsgHdr(id: MM_STA_DEL_REQ, destId: TASK_MM, paramLen: 1),
+                            body: MeStaDelReqPayload(staIdx: 2))
+co_list_push_back(addr keMsgQueueSaved, addr awaiting.header.link)
+hookSite = "tx"
+hook = proc() = doAssert awaiting.body.staIdx == 2
+mmStaDelRetryCb(nil)
+doAssert extraFrameReleases == 1 and sta_info_env.first == addr stations[2].link
+doAssert awaiting.body.staIdx == 0xFF and not mmStaDelOwned(2, 0, drainEpoch)
+doAssert events.count("address") == 1
 
 
 # An IRQ at the first callback boundary cannot make reset drain a replacement
@@ -544,19 +650,20 @@ def test_station_retirement_is_callback_safe(tmp_path: Path, mode: str, mutation
         pytest.skip("Nim is required")
     sta = (FW / "sta_management.nim").read_text()
     kernel = (FW / "kernel_mac_channel.nim").read_text()
-    names = ["staDeleteEpoch", "staDeleteIsCurrent", "staDeleteInvalidate",
+    names = ["staDeleteEpoch", "staDeleteIsCurrent", "staDeleteCancelQueued", "staDeleteInvalidate",
                  "staPostponedOwner", "staPostponedOwnerCurrent", "staPostponedListValid",
                  "staReleasePostponed", "sta_mgmt_postponed_desc_release", "staMgmtResetEntry", "sta_mgmt_entry_init",
                  "sta_mgmt_init", "staRemovalCurrent",
                  "staMgmtBeginRemoval", "staMgmtFinishRemoval", "sta_mgmt_unregister"]
     parts = {name: procedure(sta, name) for name in names}
     before = dict(parts)
-    deletion = procedure(kernel, "mm_sta_del")
+    deletion = procedure(kernel, "mmStaDelTry")
     original_deletion = deletion
     if mutation == "key_failure":
-        deletion = deletion.replace("if keysRemoved:", "if true:")
+        deletion = deletion.replace("if keysRemoved and", "if true and")
     elif mutation == "address_failure":
-        deletion = deletion.replace("if deleted and current():", "if current():")
+        deletion = deletion.replace("if deleted: deletion.addressDeleted = true",
+                                    "if true: deletion.addressDeleted = true")
     elif mutation == "begin_owner":
         parts["staMgmtBeginRemoval"] = parts["staMgmtBeginRemoval"].replace(
             "if not staRemovalCurrent(owner):", "if false:")
@@ -565,7 +672,7 @@ def test_station_retirement_is_callback_safe(tmp_path: Path, mode: str, mutation
             "if not staMgmtResetEntry(staPostponedOwner(cast[pointer](sta)), false):\n      return",
             "discard staMgmtResetEntry(staPostponedOwner(cast[pointer](sta)), false)")
     elif mutation == "mm_owner":
-        deletion = deletion.replace("template current(): bool = staRemovalCurrent(owner)",
+        deletion = deletion.replace("template current(): bool = sameDeletion() and staRemovalCurrent(owner)",
                                     "template current(): bool = true")
     elif mutation == "reset_owner":
         parts["staMgmtResetEntry"] = parts["staMgmtResetEntry"].replace(
@@ -604,7 +711,10 @@ def test_station_retirement_is_callback_safe(tmp_path: Path, mode: str, mutation
     if mutation is not None:
         assert parts != before or deletion != original_deletion, mutation
     bodies = "".join(parts.values())
-    bodies += deletion
+    bodies += procedure(kernel, "mmStaDelOwned") + deletion
+    bodies += procedure(kernel[kernel.index("proc mmStaDelTry("):], "mmStaDelTrackUnpublished")
+    bodies += procedure(kernel, "mm_sta_del")
+    bodies += procedure(kernel[kernel.index("proc mm_sta_del*"):], "mmStaDelRetryCb")
     debug = "var\n" + "".join(
         f"  {name}: uint32\n" for name in sorted(set(re.findall(r"\bnimFwDbg\w+", bodies)))
     )

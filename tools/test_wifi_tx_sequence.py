@@ -75,6 +75,8 @@ proc staDeleteEpoch(station: uint8): uint32 =
   if station < 5: stationEpochs[station] else: 0
 proc hostTxDescAt(p: pointer): ptr HostTxDescView = cast[ptr HostTxDescView](p)
 proc txSecurityCurrent(d: ptr HostTxDescView): bool = true
+proc txSecurityLengthsCurrent(d: ptr HostTxDescView): tuple[header, tail: int] =
+  (securityHeaderLen.int, securityTailLen.int)
 proc txSecurityForget(d: pointer) = discard
 proc txlVifIsRetiring(vif: uint8): bool = vif.int == retiringVif
 proc txlResetting(): bool = false

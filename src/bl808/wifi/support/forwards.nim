@@ -2,6 +2,9 @@ proc vendorPrintChar(c: char)
 proc vendorPutsRaw(s: cstring)
 proc vendorPrintU32(value: uint32; base: uint32)
 proc vendorPollOnce()
+proc aosPollEvents()
+proc aosPollDelayedActions()
+proc aos_post_event*(`type`, code: uint16; value: culong): cint {.exportc, cdecl.}
 proc osMsleep(ms: clong): cint {.cdecl.}
 proc osEnterCritical(): uint32 {.cdecl.}
 proc osExitCritical(level: uint32) {.cdecl.}
@@ -19,3 +22,4 @@ proc bl_pm_capacity_set*(level: PmLevel): cint {.exportc, cdecl.}
 proc bl_pm_event_register*(event: PmEvent; code, capBit: uint32; priority: uint16; ops: PmCb; arg: pointer; enable: PmEventAble): cint {.exportc, cdecl.}
 proc pm_post_event*(event: PmEvent; code: uint32; retval: ptr uint32): cint {.exportc, cdecl.}
 proc bl_pm_event_switch*(event: PmEvent; code: uint32; enable: PmEventAble): cint {.exportc, cdecl.}
+proc mgmrPmProcessOne(): bool

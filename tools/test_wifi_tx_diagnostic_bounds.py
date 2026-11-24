@@ -28,8 +28,10 @@ proc makeBytes(size: int; value: uint8): ptr UncheckedArray[uint8] =
 proc setup(tid: uint8; security: uint32): HostTxDescView =
   reset()
   securityHeaderLen = security
+  securityTailLen = security
   result = HostTxDescView(staInfoIdx: 0, staIdx: tid, vifIdx: 0,
     frameLen: 0x0008, hdrLen: (if tid == 0xFF: 32 else: 34) + security.uint8,
+    secTailLen: security.uint8, qosExtLen: 8,
     da: [2'u8, 32, 34, 36, 38, 40], sa: [2'u8, 42, 44, 46, 48, 50])
 
 proc checkSnapshot(desc: var HostTxDescView; extra: int; expected: openArray[uint8]) =

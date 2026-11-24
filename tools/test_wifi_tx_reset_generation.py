@@ -24,6 +24,9 @@ def test_host_preparation_stops_after_completed_reset(tmp_path: Path, mode: str)
 for lower in [true, false]:
   let stages = if lower: @["lower", "append", "copy", "buffer_trace", "traffic", "ps"]
                else: @["security", "rate", "policy"]
+  var keyValue: uint32
+  var keys: KeyList
+  keys.pairwiseKey = addr keyValue
   for stage in stages:
     reset()
     resetBlocked = false
@@ -34,11 +37,12 @@ for lower in [true, false]:
     backup = default(typeof(backup))
     txEnv = default(TxEnv)
     frames[0] = HostTxDescView(vifIdx: 1, staInfoIdx: 0, staIdx: 0,
-      hdrLen: 34, frameLen: 0x8E88, seqPassthrough: 100,
+      hdrLen: 34, qosExtLen: 8, frameLen: 0x8E88, seqPassthrough: 100,
       hwDesc: addr hw[0], queueFirst: cast[pointer](1), policy: addr templateBytes,
       cfmDst: addr hostStatuses[0], active: 1)
     frames[0].bufferPtrs[0] = 0x20000000
     frames[0].bufferLens[0] = 100
+    staInfoForIdx(0).keyMat = addr keys
     publications = 0
     invalidated = false
     onPublish = nil
@@ -55,7 +59,8 @@ for lower in [true, false]:
       backup = default(typeof(backup))
     if lower: discard txl_cntrl_push(addr frames[0], 3)
     else: doAssert not txu_cntrl_push(addr frames[0], 3)
-    doAssert fired and publications == 0
+    doAssert fired and publications == 0,
+      "lower=" & $lower & " stage=" & stage & " publications=" & $publications
     doAssert txEnv.packetCounter == 1 and droppedStatus == 0xC0020000'u32
     doAssert hostPublished.len == 0 and interrupts
     for ac in 0 .. 4:

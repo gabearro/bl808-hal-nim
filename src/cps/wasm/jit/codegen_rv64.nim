@@ -125,20 +125,31 @@ const
   rv64GenericTarget* = RvTarget(xlen: rv64, features: {rvExtM})
   rv32CommonTarget* = RvTarget(xlen: rv32, features: rvCommonScalarExts)
   rv64CommonTarget* = RvTarget(xlen: rv64, features: rvCommonScalarExts)
-  rv64BL808D0Target* = RvTarget(xlen: rv64, features: {
+  ## Conservative defaults for native BL808 JIT code. The richer vendor
+  ## profiles below are experimental and must be selected explicitly only
+  ## after their individual instructions have been verified on the board.
+  rv64BL808D0VerifiedTarget* = RvTarget(xlen: rv64, features: {
+    rvExtM, rvExtA, rvExtF, rvExtD, rvExtC
+  })
+  rv32BL808M0VerifiedTarget* = RvTarget(xlen: rv32, features: {
+    rvExtM, rvExtA, rvExtF, rvExtC
+  })
+  rv64BL808D0ExperimentalTarget* = RvTarget(xlen: rv64, features: {
     rvExtM, rvExtA, rvExtF, rvExtC, rvExtV, rvExtZicsr, rvExtZifencei,
     rvXTheadBa, rvXTheadBb, rvXTheadBs, rvXTheadCmo, rvXTheadCondMov,
     rvXTheadFMemIdx, rvXTheadFmv, rvXTheadInt, rvXTheadMac,
     rvXTheadMemIdx, rvXTheadMemPair, rvXTheadSync, rvXTheadVdot,
     rvXTheadVector
   })
-  rv64TheadC906Target* = rv64BL808D0Target
-  rv64BL808Target* = rv64BL808D0Target
-  rv32BL808M0Target* = RvTarget(xlen: rv32, features: {
+  rv64BL808D0Target* = rv64BL808D0VerifiedTarget
+  rv64TheadC906Target* = rv64BL808D0VerifiedTarget
+  rv64BL808Target* = rv64BL808D0VerifiedTarget
+  rv32BL808M0ExperimentalTarget* = RvTarget(xlen: rv32, features: {
     rvExtM, rvExtA, rvExtF, rvExtC, rvExtP, rvExtZicsr, rvExtZifencei,
     rvXTheadCmo, rvXTheadInt
   })
-  rv32TheadE907Target* = rv32BL808M0Target
+  rv32BL808M0Target* = rv32BL808M0VerifiedTarget
+  rv32TheadE907Target* = rv32BL808M0VerifiedTarget
   rv32BL808LPTarget* = RvTarget(xlen: rv32, features: {
     rvExtE, rvExtM, rvExtC, rvExtZicsr, rvExtZifencei
   })

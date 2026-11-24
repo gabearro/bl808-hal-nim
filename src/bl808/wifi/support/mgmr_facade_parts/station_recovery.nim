@@ -66,6 +66,11 @@ proc wifi_mgmr_recover_terminal_connect_failure(forJoin = false): cint =
   let identity = captureStationControl()
   let initialStatus = stationBindingStatus(identity)
   if initialStatus < 0: return -32
+  # SM already owns teardown. Connect-abort cannot advance this state, and
+  # polling here would hold the calling task while that cleanup is pending.
+  if sm_state == SmDisconnectingState:
+    nimfwDbgStaRecoveryStage = 4
+    return -16
   if connectDone <= 0 and sm_state == 0 and (not forJoin or initialStatus == 0):
     nimfwDbgStaRecoveryStage = 5
     return 0

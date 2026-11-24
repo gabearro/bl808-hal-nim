@@ -74,7 +74,9 @@ var
   hwLinks: array[3, HostTxThdEntryView]
   previous: HostTxThdEntryView
   heads: array[5, pointer]
+  onHeadSet: proc(ac: uint32; head: pointer)
   triggers: seq[uint32]
+  txStartAccesses: seq[string]
   timers: seq[tuple[ac, deadline: uint32]]
   micCalls, formatCalls: seq[pointer]
   assertLines: seq[cint]
@@ -89,8 +91,8 @@ var
 proc pointerAddrU32(p: pointer): uint32 = cast[uint32](cast[uint](p))
 proc hostTxDescAt(p: pointer): ptr HostTxDescView = cast[ptr HostTxDescView](p)
 proc txlCaptureSession(d: ptr HostTxDescView): int = 0
-proc txlSessionCurrent(i: int; d: ptr HostTxDescView): bool = true
-proc txSecurityCurrent(d: ptr HostTxDescView): bool = true
+proc txlSessionCurrent(i: int; d: ptr HostTxDescView; checkDescriptor = true): bool = true
+proc txSecurityCurrent(d: ptr HostTxDescView; allowInternalNull = false): bool = true
 proc txuCancelFrame(p: pointer; ac: uint8) = doAssert false
 proc txl_frame_release(p: pointer; callback: bool) = doAssert false
 proc hostTxLinkDescAt(p: pointer): ptr HostTxLinkDescView =
@@ -113,8 +115,8 @@ proc nimFwMgmtFcTrace(fc: uint8): bool = false
 proc nimFwTrace2U32(s: string; a, b: uint32) = discard
 proc nimFwConnectTrace2U32(s: string; a, b: uint32) = discard
 proc nimFwConnectTraceBytes(s: string; p: pointer; length, limit: uint32) = discard
-proc nimFwDbgDhcpTxFinalBreakpoint() = discard
-proc captureDhcpTxRateRaw(p: ptr HostTxRateTemplateView) = discard
+proc nimFwDbgDhcpTxFinalBreakpoint() = txStartAccesses.add("final-breakpoint")
+proc captureDhcpTxRateRaw(p: ptr HostTxRateTemplateView) = txStartAccesses.add("raw-rate")
 proc macAddrWord0(p: ptr array[6, uint8]): uint32 = 0
 proc c_memcpy(dst, src: pointer; n: uint32): pointer =
   copyMem(dst, src, n.int)
@@ -125,14 +127,31 @@ proc regRead(address: uint): uint32 =
   doAssert address == 0x24B00120'u
   timerBase
 proc machwTxDmaStatus(): uint32 = dmaStatus
-proc machwTxStatus(): uint32 = 0
-proc machwTxAggActive(): uint32 = aggActive
-proc machwTxAggSet(mask: uint32) = aggSet = aggSet or mask
-proc machwTxAggActiveSet(mask: uint32) = aggActive = mask
-proc machwTxSetHead(ac: uint32; head: pointer) = heads[ac] = head
-proc machwTxHeadValue(ac: uint32): uint32 = pointerAddrU32(heads[ac])
-proc machwTxTrigger(mask: uint32) = triggers.add(mask)
-proc blmac_abs_timer_set(ac, deadline: uint32) = timers.add((ac, deadline))
+proc machwTxStatus(): uint32 =
+  txStartAccesses.add("status-read")
+  0
+proc machwTxAggActive(): uint32 =
+  txStartAccesses.add("active-read")
+  aggActive
+proc machwTxAggSet(mask: uint32) =
+  txStartAccesses.add("agg-set")
+  aggSet = aggSet or mask
+proc machwTxAggActiveSet(mask: uint32) =
+  txStartAccesses.add("active-set")
+  aggActive = mask
+proc machwTxSetHead(ac: uint32; head: pointer) =
+  if onHeadSet != nil: onHeadSet(ac, head)
+  txStartAccesses.add("head-set")
+  heads[ac] = head
+proc machwTxHeadValue(ac: uint32): uint32 =
+  txStartAccesses.add("head-read")
+  pointerAddrU32(heads[ac])
+proc machwTxTrigger(mask: uint32) =
+  txStartAccesses.add("trigger")
+  triggers.add(mask)
+proc blmac_abs_timer_set(ac, deadline: uint32) =
+  txStartAccesses.add("timer")
+  timers.add((ac, deadline))
 proc assert_rec(file, text: cstring; line: cint) = assertLines.add(line)
 proc txControlEnv(): ptr tuple[packetCounter: uint32] = addr txEnvironment
 proc irqSave(): uint32 =
@@ -177,6 +196,7 @@ proc reset(ac: int; count: int; existing, hasPayload: bool;
   previous = default(HostTxThdEntryView)
   heads = default(typeof(heads))
   triggers.setLen(0)
+  txStartAccesses.setLen(0)
   timers.setLen(0)
   micCalls.setLen(0)
   formatCalls.setLen(0)
@@ -254,6 +274,8 @@ proc checkDrain(ac, count: int; existing, hasPayload: bool;
     doAssert timers == @[(ac.uint32, timerBase + TimerDelays[ac])]
     doAssert aggSet == (1'u32 shl ac)
     doAssert aggActive == (0x80'u32 or (1'u32 shl ac))
+    doAssert txStartAccesses[0..5] == @["head-set", "trigger", "timer",
+        "agg-set", "active-read", "active-set"], "TX start before debug readback"
   else:
     doAssert heads[ac] == nil and timers.len == 0 and aggSet == 0
     doAssert assertLines == @[AssertLineByAc[ac]]
@@ -333,11 +355,49 @@ for ac in 0 ..< 5:
           doAssert thd.next == next
       else:
         doAssert hw[0].controlFlags == 0 and hw[0].status == 0
+
+# Ordinary IPv4 uses the same lower path as an HTTP response. Observe
+# ownership and the finalized THD at the first write to the MAC head.
+reset(0, 1, false, true, 0, 0)
+queues[0] = default(BackupQueue)
+descs[0].frameLen = 0x0008
+descs[0].seqPassthrough = 100
+descs[0].hdrLen = 26
+descs[0].bufferPtrs[0] = 0x20000000
+descs[0].bufferLens[0] = 100
+links[0].macHeader[0] = 0x88
+links[0].headerLen = 26
+nimFwDbgDhcpTxFinalDesc0 = 0xF00D
+let preHead = if expectFinalSnapshot: @["raw-rate", "final-breakpoint"] else: @[]
+onHeadSet = proc(ac: uint32; head: pointer) =
+  doAssert not interruptsEnabled
+  doAssert ac == 0 and head == addr hw[0].magic
+  doAssert controls[0].pending.first == addr descs[0]
+  doAssert controls[0].pending.last == addr descs[0]
+  doAssert txEnvironment.packetCounter == 11
+  doAssert hw[0].ackPolicyControl == links[0].ackPolicyControl
+  doAssert hw[0].retryLimitControl == links[0].retryLimitControl
+  doAssert hw[0].chainedThd == addr links[0].rateTemplate
+  doAssert txStartAccesses == preHead, "unexpected work before MAC head write"
+doAssert txl_cntrl_push(addr descs[0], 0) == 0
+doAssert triggers == @[0x200'u32]
+doAssert txStartAccesses[preHead.len ..< preHead.len + 6] ==
+  @["head-set", "trigger", "timer", "agg-set", "active-read", "active-set"]
+doAssert nimFwDbgDhcpTxFinalDesc0 ==
+  (if expectFinalSnapshot: 0x001A0008'u32 else: 0xF00D'u32)
+doAssert interruptsEnabled
 """
 
 
-@pytest.mark.parametrize("trace", [False, True])
-def test_tx_backup_drain(tmp_path: Path, trace: bool) -> None:
+@pytest.mark.parametrize("defines, expect_final_snapshot", [
+    pytest.param((), False, id="default"),
+    pytest.param(("bl808WifiConnectTrace",), False, id="connect-trace"),
+    pytest.param(("bl808WifiDiagDhcpTxFinalSnapshot",), True, id="final-snapshot"),
+    pytest.param(("bl808WifiDiagDhcpTxFinalSnapshot", "bl808WifiDiagDhcpTxAttempts"),
+                 False, id="attempts-take-precedence"),
+])
+def test_tx_backup_drain(tmp_path: Path, defines: tuple[str, ...],
+                         expect_final_snapshot: bool) -> None:
     nim = shutil.which("nim")
     if nim is None:
         pytest.skip("nim is not installed")
@@ -359,7 +419,9 @@ def test_tx_backup_drain(tmp_path: Path, trace: bool) -> None:
     enqueue = procedure(tx, "txlEnqueuePrepared")
     payload_length = procedure((ROOT / "src/bl808/wifi/fw/layout_types.nim").read_text(),
                                "txPayloadChainLength")
-    all_procedures = payload_length + handler + fake_transfer + ALLOCATOR + thd_builder + enqueue + lower_push
+    dma_store = procedure((ROOT / "src/bl808/wifi/fw/runtime_helpers.nim").read_text(),
+                          "wifiDmaStoreLink")
+    all_procedures = dma_store + payload_length + handler + fake_transfer + ALLOCATOR + thd_builder + enqueue + lower_push
     debug_types = {"nimFwDbgProbePayRaw": "array[64, uint8]"}
     debug_names = set(re.findall(r"\bnimFwDbg\w+", all_procedures))
     debug_names.remove("nimFwDbgDhcpTxFinalBreakpoint")
@@ -368,12 +430,12 @@ def test_tx_backup_drain(tmp_path: Path, trace: bool) -> None:
         for name in sorted(debug_names)
     )
     source = tmp_path / "tx_backup_test.nim"
-    source.write_text(PLATFORM + debug_vars + all_procedures + CHECKS)
+    expectation = f"const expectFinalSnapshot = {str(expect_final_snapshot).lower()}\n"
+    source.write_text(PLATFORM + debug_vars + all_procedures + expectation + CHECKS)
     command = [nim, "c", "-r", "--skipParentCfg:on", "--skipProjCfg:on",
                "--skipUserCfg:on", "--checks:on", f"--nimcache:{tmp_path / 'nimcache'}",
                f"-o:{tmp_path / 'tx_backup_test'}"]
-    if trace:
-        command.append("-d:bl808WifiConnectTrace")
+    command.extend(f"-d:{define}" for define in defines)
     result = subprocess.run(command + [str(source)], cwd=ROOT, text=True,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     assert result.returncode == 0, result.stdout

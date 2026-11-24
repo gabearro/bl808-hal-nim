@@ -29,6 +29,14 @@ var
   writes: seq[tuple[address: uint, value: uint32]]
   powerCalls: seq[tuple[vif: uint, ac: uint8, enabled: uint32]]
   durationCalls: int
+  ownerIndex: uint8
+  mmEdcaRefresh: tuple[vif: uint8]
+proc irqSave(): uint32 = 0
+proc irqRestore(saved: uint32) = discard
+proc mmEdcaRefreshCurrent(): bool = false
+proc mmProgramEdca(vif: ptr Vif) = doAssert false
+proc mmEdcaOwner(): ptr Vif =
+  if vifs[ownerIndex].state != 0: addr vifs[ownerIndex] else: nil
 proc vifEntryAddr(index: uint8): uint =
   doAssert index < 2, "EDCA selected VIF from parameter word"
   cast[uint](addr vifs[index])
@@ -55,6 +63,7 @@ for vif in 0'u8..1:
     for active in 0'u8..1:
       for enabled in 0'u8..1:
         reset()
+        ownerIndex = vif
         vifs[vif].state = active
         request = MmSetEdcaReqPayload(edcaParam: 0xABCD1234'u32, vifIdx: vif,
                                       acmFlag: ac, uapsdAc: enabled)
@@ -71,6 +80,13 @@ reset()
 vifs[1].vifType = 2
 request = MmSetEdcaReqPayload(edcaParam: 0x12345678, vifIdx: 1, acmFlag: 3, uapsdAc: 1)
 doAssert applyEdca(addr request) == 23 and powerCalls.len == 0
+reset()
+ownerIndex = 0
+vifs[0].state = 1
+vifs[1].state = 1
+request = MmSetEdcaReqPayload(edcaParam: 0x11223344, vifIdx: 1, acmFlag: 2)
+doAssert applyEdca(addr request) == 23 and vifs[1].edcaRegs[2] == 0x11223344
+doAssert writes.len == 0 and durationCalls == 0
 for bad in 0..2:
   reset()
   request = MmSetEdcaReqPayload(vifIdx: 1, acmFlag: 0, edcaParam: 0xFFFFFFFF'u32)
@@ -91,6 +107,8 @@ def test_edca_fields(tmp_path: Path, mode: str) -> None:
 proc applyEdca(param: pointer): cint =
   let msgBody = param
   let hdr = addr header
+  if hdr.paramLen < MmSetEdcaReqPayloadSize: return 0
+  let edcaRefresh = false
   var cfmBasicId: uint16
 '''
     run_program(tmp_path, mode, layouts("MmSetEdcaReqPayload") + PLATFORM + wrapper + body

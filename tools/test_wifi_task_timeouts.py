@@ -29,19 +29,24 @@ var
   ipcEmbEnv: pointer
   ipc_emb_counter, pendingEvents: uint32
   assertions, disableCalls, serviceSteps, drains: int
+  missingOperationSlot = -1
 proc blOpsFunc(offset: int): pointer =
+  if offset == missingOperationSlot: return nil
   case offset
   of 0x44: cast[pointer](osTaskGetCurrent)
   of 0x4C: cast[pointer](osTaskNotify)
   of 0x50: cast[pointer](osTaskWait)
   else: raiseAssert "unexpected operation slot"
 proc assert_err(condition, file: cstring; line: cint) = inc assertions
+proc assert_rec(condition, file: cstring; line: cint) = inc assertions
 proc ipc_host_disable_irq_e2a() = inc disableCalls
 proc ke_evt_set(bits: uint32) = pendingEvents = pendingEvents or bits
 '''
     code += procedure(ipc, "ipc_emb_notify") + procedure(ipc, "ipc_emb_wait")
     code += procedure((FW / "platform_bl.nim").read_text(), "bl_irq_handler")
     code += r'''
+const BlNapWaking = 2'u32
+var napScheduleState: uint32
 proc wifiUpdateMacPlCtrl() = inc serviceSteps
 proc bl_sleep_schedule() = discard
 proc wifiMainHasPendingWork(): bool = pendingEvents != 0
@@ -262,6 +267,26 @@ doAssert osTaskNotifications == 2
 ipc_emb_wait()
 doAssert ipc_emb_counter == 2 and osTaskNotifications == 0 and not interrupts
 interrupts = true
+''',
+    "ipc_missing_task_or_callback": r'''
+ipc_emb_counter = 0
+ipcEmbEnv = nil
+ipc_emb_notify(1)
+ipc_emb_wait()
+doAssert assertions == 2 and ipc_emb_counter == 0
+doAssert osTaskNotifications == 0 and polls == 0
+ipcEmbEnv = osTaskNotifyCreate()
+missingOperationSlot = 0x4C
+ipc_emb_notify(1)
+missingOperationSlot = 0x50
+ipc_emb_wait()
+doAssert assertions == 4 and ipc_emb_counter == 0
+doAssert osTaskNotifications == 0 and polls == 0
+missingOperationSlot = -1
+ipc_emb_notify(1)
+ipc_emb_wait()
+doAssert assertions == 4 and ipc_emb_counter == 1
+doAssert osTaskNotifications == 0
 ''',
     "nonblocking_service_preserved": r'''
 ipcEmbEnv = osTaskNotifyCreate()

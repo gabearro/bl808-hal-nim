@@ -36,7 +36,7 @@ doAssert env == replacement and vifs[TestVif] == replacementVif
 doAssert descriptors[TestVif] == replacementHw and pool.bytes == replacementBytes
 doAssert allocated.len == 1 and confirmations == @[0'u8, 1]
 doAssert interruptsEnabled == IncomingIrq and mmBcnActiveUpdate == nil
-mm_bcn_stop(addr vifs[TestVif])
+discard mm_bcn_stop(addr vifs[TestVif])
 doAssert allocated.len == 0
 '''
 
@@ -201,7 +201,7 @@ freeHook = proc() =
 mm_bcn_transmitted(addr vifs[TestVif])
 doAssert env == replacement and txl_tim_bitmap_pool == replacementBitmap
 doAssert allocated.len == 2 and interruptsEnabled == IncomingIrq
-mm_bcn_stop(addr vifs[TestVif])
+discard mm_bcn_stop(addr vifs[TestVif])
 doAssert allocated.len == 0
 ''',
     "admission_irq": r'''
@@ -226,7 +226,7 @@ vifs[TestVif].vifType = 0
 mm_bcn_transmitted(addr vifs[TestVif])
 doAssert env == before and interruptsEnabled == IncomingIrq
 vifs[TestVif].vifType = VIF_TYPE_AP
-mm_bcn_stop(addr vifs[TestVif])
+discard mm_bcn_stop(addr vifs[TestVif])
 doAssert allocated.len == 0
 ''',
 }

@@ -216,6 +216,7 @@ proc ke_msg_alloc(id: uint16; dest, src: uint8; size: uint32): pointer =
   if allocationHook != nil: allocationHook(id)
 proc apmTakeStartReply(request: pointer; id: uint16; length: uint32): pointer = nil
 proc meTakeControlReply(request: pointer; id: uint16; length: uint32): pointer = nil
+let meControlCommand, apmStartRequest: pointer = nil
 proc ke_msg_free(h: pointer) =
   let p = keMsgPayload(cast[ptr Header](h))
   let index = allocated.find(p)
@@ -395,11 +396,16 @@ def source(*, transmit: bool = False) -> str:
     rx = procedure((FW / "task_handlers.nim").read_text(), "rxu_mgt_frame_check")
     beacon = rx.split("    of 0x80:", 1)[1].split("    of 0x10:", 1)[0]
     result += (
-        "proc receiveBeacon(frameHdr: pointer; bodyLen: uint16; staIdx, rxuEnvVifIdx: uint8) =\n"
+        "proc rxuCheckBeaconParams(desc: pointer; vif: uint8; length: uint16; frame: pointer): bool =\n"
+        "  me_beacon_check(vif, length, frame)\n"
+        "  true\n"
+        "proc receiveBeacon(frameHdr: pointer; bodyLen: uint16; staIdx, rxuEnvVifIdx: uint8): uint8 {.discardable.} =\n"
+        "  let param: pointer = nil\n"
         "  let vifEntry = cast[pointer](addr vifs[rxuEnvVifIdx])\n"
         "  var skipSecHdr = false\n"
         "  var msgSubtype = 0xFF'u8\n"
         "  var frameAccepted = 1'u8\n"
+        "  template currentFrame(): bool = true\n"
         "  case 0x80\n"
         "  of 0x80:" + beacon + "  else: discard\n"
     )
@@ -422,7 +428,7 @@ def run(tmp_path: Path, code: str, mode: str, *, transmit: bool = False) -> None
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-def test_ie_search_respects_declared_boundaries(tmp_path: Path, mode: str) -> None:
+def test_ie_search_requires_complete_element(tmp_path: Path, mode: str) -> None:
     run(tmp_path, r'''
 for size in 1 .. 3:
   let p = calloc(1, size.csize_t)
@@ -430,7 +436,8 @@ for size in 1 .. 3:
   bytes[0] = 32
   if size >= 2: bytes[1] = 1
   if size >= 3: bytes[2] = 9
-  doAssert mac_ie_find(p, size.uint32, 32) == (if size == 3: p else: nil)
+  doAssert mac_ie_find(p, size.uint32, 32) ==
+    (if size == 3: p else: nil)
   free(p)
 var random = 0x12345678'u32
 for size in 0 .. 128:
@@ -443,7 +450,8 @@ for size in 0 .. 128:
     for id in [0'u8, 1, 32, 42, 255]:
       var expected: pointer
       var offset = 0
-      while size - offset >= 2:
+      while offset < size:
+        if size - offset < 2: break
         let length = bytes[offset + 1].int + 2
         if length > size - offset: break
         if bytes[offset] == id:
@@ -457,12 +465,29 @@ doAssert mac_ie_find(nil, 100, 0) == nil
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_beacon_parser_rejects_malformed_ies(tmp_path: Path, mode: str) -> None:
+    run(tmp_path, r'''
+for suffix in [@[32'u8, 0], @[42'u8, 0], @[221'u8, 3, 1], @[99'u8]]:
+  reset()
+  let bss = vifBssStatus(addr vifs[0])
+  bss.protectionFlags = 7
+  bss.powerConstraint = 5
+  var frame = newSeq[uint8](36)
+  frame.add([42'u8, 1, 3, 32, 1, 9])
+  frame.add(suffix)
+  me_beacon_check(0, frame.len.uint16, addr frame[0])
+  doAssert bss.protectionFlags == 7 and bss.powerConstraint == 5
+  doAssert powerUpdates.len == 0 and channelUpdates.len == 0
+''', mode)
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_beacon_parser_uses_bss_state_and_full_ie_length(tmp_path: Path, mode: str) -> None:
     run(tmp_path, r'''
 for vif in 0'u8 .. 1:
   for band in 0'u8 .. 1:
     for erp in 0'u8 .. 7:
-      for constraint in [0'u8, 3, 17, 20]:
+      for constraint in [0'u8, 3, 17, 20, 100, 200, 255]:
         reset()
         channels[vif].band = band
         let bss = vifBssStatus(addr vifs[vif])
@@ -476,7 +501,7 @@ for vif in 0'u8 .. 1:
         doAssert bss.protectionFlags == (if band == 0: erp.uint16 else: 0'u16)
         doAssert bss.bandwidth == 2 and bss.phyBandwidth == 1
         doAssert bss.powerConstraint == constraint
-        doAssert powerUpdates == @[(vif, (17 - constraint.int).int8)]
+        doAssert powerUpdates == @[(vif, max(17 - constraint.int, -128).int8)]
         doAssert vifs[vif xor 1].bss == default(typeof(vifs[0].bss))
         doAssert channelUpdates.len == 0
         me_beacon_check(vif, frame.len.uint16, addr frame[0])
@@ -488,16 +513,19 @@ me_beacon_check(0, 40, addr frame[0])
 doAssert vifBssStatus(addr vifs[0]).powerConstraint == 0
 doAssert vifBssStatus(addr vifs[0]).protectionFlags == 0
 doAssert powerUpdates.len == 0, "read an IE beyond the supplied length"
-frame = newSeq[uint8](36)
-frame.add([32'u8, 1, 3])
-newBandwidth = 2
-me_beacon_check(0, frame.len.uint16, addr frame[0])
-doAssert channelUpdates.len == 1
-let channel = channelUpdates[0]
-doAssert channel.ctxtIdx == 1 and channel.band == 0 and channel.secChan == 2
-doAssert channel.primFreq == 2412 and channel.centerFreq1 == 2422
-doAssert channel.centerFreq2 == 2442 and channel.txPower == 13
-doAssert channel.ctxtIdxBandPadding == 0 and channel.txPowerTailPadding == 0
+for vif in 0'u8 .. 1:
+  reset()
+  frame = newSeq[uint8](36)
+  frame.add([32'u8, 1, 3])
+  contexts[vif].channel.txPower = 13'u8 + vif
+  newBandwidth = 2
+  me_beacon_check(vif, frame.len.uint16, addr frame[0])
+  doAssert channelUpdates.len == 1
+  let channel = channelUpdates[0]
+  doAssert channel.ctxtIdx == vif + 1 and channel.band == 0 and channel.secChan == 2
+  doAssert channel.primFreq == 2412 and channel.centerFreq1 == 2422
+  doAssert channel.centerFreq2 == 2442 and channel.txPower == 13'u8 + vif
+  doAssert channel.ctxtIdxBandPadding == 0 and channel.txPowerTailPadding == 0
 reset()
 let before = vifs
 me_beacon_check(2, frame.len.uint16, addr frame[0])
@@ -510,6 +538,7 @@ doAssert powerUpdates.len == 0 and allocated.len == 0
 reset()
 frame = newSeq[uint8](36)
 frame.add([42'u8, 1, 7, 32, 1, 3])
+vifs[1].vifType = 0
 receiveBeacon(addr frame[0], frame.len.uint16, 0, 1)
 doAssert vifBssStatus(addr vifs[1]).protectionFlags == 7
 doAssert vifBssStatus(addr vifs[1]).powerConstraint == 3
@@ -526,12 +555,17 @@ for vif in 0'u8 .. 1:
     for suffix in [-1, 0, 30, 200, 211]:
       for nonempty in [false, true]:
         reset()
-        let bytes = makeFrame(prefix, suffix)
+        var bytes = makeFrame(prefix, suffix)
         if bytes.len > 512: continue
+        bytes[40 + prefix] = 0xA5
+        bytes[42 + prefix] = 0x5A
+        bytes[43 + prefix] = 0xC3
         if nonempty:
           vifs[vif].beaconEnabled = 1
           tim(17, 1, vif)
         let bitmapBefore = txl_tim_bitmap_pool
+        var timBefore = txl_tim_ie_pool
+        timBefore[3] = 3
         expectedCommit = vif.int
         let p = request(bytes, vif, prefix)
         env.transmitRequested = 1
@@ -552,7 +586,8 @@ for vif in 0'u8 .. 1:
         doAssert d.retryLimitControl == 0 and d.controlFlags == 0
         doAssert control.txPower == 0x78
         doAssert vifs[vif].beaconBodyLength == (bytes.len - 6).uint16
-        doAssert txl_tim_ie_pool[3] == 3 and txl_tim_bitmap_pool == bitmapBefore
+        doAssert txl_tim_ie_pool == timBefore
+        doAssert txl_tim_bitmap_pool == bitmapBefore
         for i, value in bytes: doAssert pool.bytes[348 + i] == value
         guard(bytes.len)
         let next = if suffix >= 0: cast[pointer](beaconEndDesc()) else: nil

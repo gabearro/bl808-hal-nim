@@ -5,8 +5,9 @@
  * generic M0 script does not satisfy:
  *   - .wifi.cfg.entry must be retained and exposed through
  *     _ld_bl_static_cfg_entry_start/end.
- *   - the shared WiFi/IPCMAC descriptor BSS must live in the uncached OCRAM
- *     alias so the MAC/DMA side sees coherent buffers.
+ *   - the shared WiFi/IPCMAC descriptor BSS must live in uncached WRAM so
+ *     the MAC/DMA side sees coherent buffers. Cached 0x6203xxxx is an alias
+ *     of this same physical WRAM, not an extension of cached OCRAM.
  */
 
 ENTRY(_start)
@@ -132,9 +133,16 @@ SECTIONS
 }
 
 ASSERT(_eheap >= _sheap, "M0 WiFi RAM overflow: no space left for heap")
+ASSERT(ORIGIN(RAM) == 0x62020000 && LENGTH(RAM) <= 64K,
+       "M0 WiFi cached OCRAM must stay within its physical 64 KB")
+ASSERT(ORIGIN(RAM) - 0x40000000 + LENGTH(RAM) <= ORIGIN(WIFI_RAM),
+       "M0 WiFi cached RAM aliases uncached WiFi WRAM")
 ASSERT(__wifi_bss_end <= ORIGIN(WIFI_RAM) + LENGTH(WIFI_RAM),
        "M0 WiFi shared RAM overflow")
 ASSERT(ORIGIN(WIFI_RAM) + LENGTH(WIFI_RAM) <= ORIGIN(D0_SDH_DMA),
        "M0 WiFi shared RAM overlaps D0 SDH DMA window")
+ASSERT(ORIGIN(D0_SDH_DMA) == 0x2204CC00 && LENGTH(D0_SDH_DMA) == 8K &&
+       ORIGIN(D0_SDH_DMA) + LENGTH(D0_SDH_DMA) <= 0x22050000,
+       "M0 WiFi D0 SDH DMA reservation changed or overlaps LP boot gate")
 ASSERT(_sstack == ORIGIN(RAM) + LENGTH(RAM) - _stack_size,
        "M0 WiFi stack is not placed at top of RAM")

@@ -15,6 +15,7 @@ const
   STA_INFO_TAB_ENTRIES = 7
   MACHW_TIMLO_REG = 0x24B00120'u
   WifiTxFrameSuccessfulBit = 0x00800000'u32
+  MacAckStatus = 0x80800000'u32
 type
   Vif = object
     vifType, state, staIdx: uint8
@@ -60,7 +61,7 @@ proc regRead(address: uint): uint32 =
     0
 proc wlanCoexControl(): uint32 = 0x12345678'u32
 proc wlanCoexPti(): uint32 = 0x87654321'u32
-proc completeOne(status = WifiTxFrameSuccessfulBit) =
+proc completeOne(status = MacAckStatus) =
   doAssert pending.len > 0
   let completion = pending[0]
   pending.delete(0)
@@ -71,7 +72,7 @@ proc submit(station: uint8; callback: pointer; arg: uint32): uint8 =
   case mode
   of 1, 4:
     cast[FrameCallback](callback)(cast[pointer](arg.uint),
-                                 if mode == 1: WifiTxFrameSuccessfulBit else: 0)
+                                 if mode == 1: MacAckStatus else: 0)
   of 2: return 1
   of 3:
     inc frameEnv.postponedCount
@@ -209,6 +210,20 @@ for counter in [0'u32, 1, 0x7FFFFFFF'u32, 0xFFFFFFFE'u32, 0xFFFFFFFF'u32]:
           "completed inline frame was recorded as pending"
         doAssert nimFwDbgNullFrameAckOk == (submitMode == 1).uint32
         doAssert nimFwDbgNullFrameAckFail == (submitMode == 4).uint32
+''',
+    "status_needs_mac_completion": r'''
+for qos in [false, true]:
+  for (status, ack, noHw) in [(MacAckStatus, true, false),
+      (0x80010700'u32, false, false), (WifiTxFrameSuccessfulBit, false, true),
+      (0x40000000'u32, false, true), (0'u32, false, true)]:
+    setup(high(uint32), qos, role = true)
+    doAssert wifi_nimfw_send_sta_null_frame() == 0
+    completeOne(status)
+    doAssert nimFwDbgNullFrameCfm == 0 and nimFwDbgNullFrameLastStatus == status
+    doAssert nimFwDbgNullFrameAckOk == ack.uint32
+    doAssert nimFwDbgNullFrameAckFail == (not ack).uint32
+    doAssert nimFwDbgNullFrameNoHwResult == noHw.uint32
+    doAssert nimFwKeepaliveInFlight == 0 and nimFwBleWifiRoleWindowActive == 0
 ''',
     "trigger_and_timeout": r'''
 for counter in [0'u32, 0xFFFFFFFF'u32]:

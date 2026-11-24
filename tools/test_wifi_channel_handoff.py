@@ -2,13 +2,18 @@
 
 from pathlib import Path
 
+import pytest
+
 from test_wifi_deferred_auth import run_nim
 from test_wifi_disconnect_tx import FW, procedure
+from test_wifi_message_allocation import run_program
+from test_wifi_mm_timer_lifetime import source as mm_timer_source
 
 
 PLATFORM = r"""
 proc smDeferredPublish(vifEntry: pointer) = discard
-proc txlFrameCallbackCurrent(): bool = true
+var txResetEpoch: uint32
+proc txlFrameCallbackCurrent(resetEpoch = txResetEpoch): bool = true
 proc chanSwitchCallbackCurrent(): bool = true
 proc chanSwitchSelectTarget(target: pointer): bool = true
 const
@@ -26,7 +31,7 @@ type
     txPower: uint8
   ChanCtxtView = object
     channel: Channel
-    status, contextIndexOrMarker, altIdx: uint8
+    status, contextIndexOrMarker, altIdx, invalidMarker: uint8
     schedSlot, opSlot: uint16
   Vif = object
     next: pointer
@@ -79,10 +84,15 @@ proc chanCtxtAt(p: pointer): ptr ChanCtxtView = cast[ptr ChanCtxtView](p)
 proc chanCtxtForIdx(i: uint8): ptr ChanCtxtView = addr contexts[i]
 proc vifChannelAt(p: pointer): ptr Vif = cast[ptr Vif](p)
 proc tdEntryAt(p: pointer): ptr TdEntryView = cast[ptr TdEntryView](p)
-proc mm_force_idle_req(): bool =
+proc chanForceIdle(): bool =
   events.add(("idle", 0'u))
+  inc txResetEpoch
   true
+proc chanForceIdleForDeparture(target: pointer): bool =
+  doAssert target == env.scheduledCtxt
+  chanForceIdle()
 proc mm_active() = events.add(("active", 0'u))
+proc mmReplayEdca() = discard
 proc blmac_pwr_mgt_setf(value: uint32) = events.add(("pm", value.uint))
 proc chan_upd_ctxt_status(p: pointer; status: uint8) =
   chanCtxtAt(p).status = status
@@ -117,6 +127,7 @@ proc reset() =
   allocations = 0
   callbackStorage = nil
   checkAdmission = nil
+  tx.freeList.first = cast[ptr CoListHdr](1)
   env.currentCtxt = addr contexts[0]
   env.scheduledCtxt = addr contexts[1]
   env.ctxtCount = 2
@@ -154,7 +165,8 @@ type ChanSwitchContext = object
   captured: bool
 proc chanSwitchCapture(target: pointer): ChanSwitchContext =
   ChanSwitchContext(target: target, captured: target != nil)
-proc chanSwitchContextCurrent(context: ChanSwitchContext): bool = context.captured
+proc chanSwitchContextCurrent(context: ChanSwitchContext; checkDefinition = true): bool =
+  context.captured
 proc chanSwitchCancel(target: pointer = nil)
 '''
     support += (FW / "channel_protection.nim").read_text()
@@ -334,8 +346,58 @@ proc chanSwitchAllocate(target: pointer): pointer =
 proc chanSwitchPublish(request: pointer): bool = true
 proc chanSwitchAdmit(request: pointer): bool = true
 """
-    run_nim(tmp_path, PLATFORM + stubs
-            + procedure((FW / "task_handlers.nim").read_text(), "chan_switch_start") + checks)
+    tasks = (FW / "task_handlers.nim").read_text()
+    run_nim(tmp_path, PLATFORM + stubs + procedure(tasks, "chanStartSwitch")
+            + procedure(tasks, "chan_switch_start") + checks)
+
+
+def home_wake_source() -> str:
+    kernel = (FW / "kernel_mac_channel.nim").read_text()
+    layout = (FW / "layout_types.nim").read_text()
+    types = "type\n  MmVifIdentity" + layout.split("  MmVifIdentity", 1)[1].split("\n\n", 1)[0] + "\n"
+    return types + r"""
+type
+  MmTimerView = object
+    callback: pointer
+    env, expiry: uint32
+  Delivery = object
+    timer: pointer
+    cancelled: bool
+var
+  homeDeadlines: seq[ptr MmTimerView]
+  homeDelivery: ptr Delivery
+  rxVifEpochs: array[MAX_VIFS, uint32]
+  stationEpochs: array[STA_INFO_TAB_ENTRIES, uint32]
+  clock: uint32
+proc vifChannelForIdx(index: uint8): ptr Vif = addr vifs[index]
+proc staDeleteEpoch(index: uint8): uint32 =
+  if index < STA_INFO_TAB_ENTRIES.uint8: stationEpochs[index] else: 0
+proc txlResetting(): bool = false
+proc txlVifIsRetiring(index: uint8): bool = false
+proc macTimeNow(): uint32 = clock
+proc mmTimerActiveDelivery(timer: pointer): ptr Delivery =
+  if homeDelivery != nil and homeDelivery.timer == timer: homeDelivery else: nil
+proc mmTimerSetLocked(timer: pointer; expiry, saved: uint32) =
+  let delivery = mmTimerActiveDelivery(timer)
+  if delivery != nil: delivery.cancelled = true
+  let entry = cast[ptr MmTimerView](timer)
+  entry.expiry = expiry
+  if entry notin homeDeadlines: homeDeadlines.add(entry)
+proc fireNextHomeTimer(beforeDelivery: proc() = nil) =
+  doAssert homeDeadlines.len != 0
+  let entry = homeDeadlines[0]
+  homeDeadlines.delete(0)
+  clock = entry.expiry
+  var delivery = Delivery(timer: entry)
+  homeDelivery = addr delivery
+  let callback = entry.callback
+  let argument = cast[pointer](entry.env.uint)
+  if beforeDelivery != nil: beforeDelivery()
+  cast[proc(arg: pointer) {.cdecl.}](callback)(argument)
+  homeDelivery = nil
+""" + "".join(procedure(kernel, name) for name in (
+        "mmCaptureVif", "mmVifCurrent", "mmStaTimerCurrent",
+    )) + (FW / "channel_home_wake.nim").read_text().replace(" {.wifiCtrl.}", "")
 
 
 PRE_SWITCH_PLATFORM = r"""
@@ -343,26 +405,32 @@ proc chanCtxtOpTimer(): pointer = cast[pointer](76)
 proc mm_timer_clear(p: pointer) = events.add(("timer-clear", cast[uint](p)))
 proc packChannelMeta(p: ptr Channel): uint32 = 0
 proc packChannelFreq(p: ptr Channel): uint32 = 0
-proc rxl_timer_int_handler() = discard
-proc rxl_cntrl_evt() = discard
+proc rxl_timer_int_handler() = events.add(("rx-harvest", 0'u))
+proc rxl_cntrl_evt() = events.add(("rx-drain", 0'u))
 proc phySetChannel(p: ptr Channel) =
   for i in 0 ..< contexts.len:
     if p == addr contexts[i].channel: events.add(("phy", i.uint))
 proc tpc_update_tx_power(value: uint8) = discard
-proc regWrite(address: uint; value: uint32) = discard
-proc regRead(address: uint): uint32 = 0
+var macControl: uint32
+proc regWrite(address: uint; value: uint32) =
+  if address == MACHW_BASE + 0x4C: macControl = value
+proc regRead(address: uint): uint32 =
+  doAssert address == MACHW_BASE + 0x4C
+  macControl
 proc rfPhyTraceCheckpoint(value: uint32) = discard
 proc rfPriPrepareWb03MacActiveScanState() = discard
 proc waitRfUs(value: uint32) = discard
 proc ke_msg_send_basic(id: uint16; dest, src: uint8) = events.add(("basic", id.uint))
-proc co_list_cnt(p: ptr CoList): uint32 = 3
+const MM_SCAN_CHANNEL_START_IND = 75'u16
+var chanCtxtEpochs: array[5, uint32]
+proc scanDwellPublish(id: uint16; slot: uint32) = ke_msg_send_basic(id, 1, 255)
 proc vif_mgmt_send_postponed_frame(p: pointer) = discard
 proc chan_cde_evt(p: pointer) = env.scheduledCtxt = cdeTarget
 proc lastPhy(): int =
   result = -1
   for event in events:
     if event.kind == "phy": result = event.value.int
-"""
+""" + home_wake_source()
 
 
 def test_preswitch_honors_scan_and_roc_priority(tmp_path: Path) -> None:
@@ -390,6 +458,220 @@ for count in 0'u8 .. 3:
     run_nim(tmp_path, PLATFORM + PRE_SWITCH_PLATFORM + CFM_STUBS
             + procedure((FW / "kernel_mac_channel.nim").read_text(), "chan_pre_switch_channel")
             + checks)
+
+
+@pytest.mark.parametrize("mode", ["checked", "firmware", "old-drop"])
+def test_sta_home_wake_uses_last_free_descriptor_or_retries(tmp_path: Path, mode: str) -> None:
+    checks = r"""
+for initiallyFree in [false, true]:
+  reset()
+  homeDeadlines.setLen(0)
+  clock = high(uint32) - 1000
+  env.currentCtxt = nil
+  env.ctxtCount = 1
+  env.scheduledCtxt = addr contexts[0]
+  vifs[0].next = nil
+  if not initiallyFree: tx.freeList.first = nil
+  let skipped = nimFwDbgAutoNullSkipped
+  chan_pre_switch_channel()
+  doAssert lastPhy() == 0 and env.currentCtxt == addr contexts[0]
+  doAssert env.scheduledCtxt == nil and events[^1].kind == "active"
+  doAssert ("pm", 0'u) in events
+  doAssert nimFwDbgAutoNullSkipped == skipped + (not initiallyFree).uint32
+  doAssert sends.len == initiallyFree.int
+  if not initiallyFree:
+    doAssert homeDeadlines.len == 1 and homeDeadlines[0].expiry == 3999
+    tx.freeList.first = cast[ptr CoListHdr](1)
+    fireNextHomeTimer()
+  doAssert homeDeadlines.len == 0 and sends.len == 1
+  doAssert sends[0].kind == "null" and sends[0].index == vifs[0].staIdx
+  doAssert sends[0].callback == nil and sends[0].token == 0
+"""
+    pre_switch = procedure((FW / "kernel_mac_channel.nim").read_text(), "chan_pre_switch_channel")
+    code = PLATFORM + PRE_SWITCH_PLATFORM + CFM_STUBS
+    if mode == "old-drop":
+        # The earlier home path skipped an empty pool without preserving work.
+        pre_switch = pre_switch.replace("chanHomeWakeRequest(vif2, contextIndexOrMarker)",
+            "if txFrameEnv().freeList.first != nil:\n"
+            "                discard txl_frame_send_null_frame(vif.staIdx, nil, 0)\n"
+            "              else: inc nimFwDbgAutoNullSkipped", 1)
+        with pytest.raises(AssertionError, match="homeDeadlines.len == 1"):
+            run_program(tmp_path, "firmware", code + pre_switch + checks)
+    else:
+        run_program(tmp_path, mode, code + pre_switch + checks)
+
+
+@pytest.mark.parametrize("mode", ["checked", "firmware"])
+def test_home_wake_retry_is_bounded_and_session_owned(tmp_path: Path, mode: str) -> None:
+    checks = r"""
+proc beginHome() =
+  reset()
+  homeDeadlines.setLen(0)
+  clock = 0
+  env.scheduledCtxt = addr contexts[0]
+  vifs[0].next = nil
+
+# Rejected submissions retry at bounded intervals, including RC failure with
+# a free descriptor. A permanently full pool never invokes the allocator.
+for slotFree in [false, true]:
+  beginHome()
+  if not slotFree: tx.freeList.first = nil
+  nullResult[0] = 1
+  chan_pre_switch_channel()
+  doAssert events[^1].kind == "active"
+  for step in 1 .. 4:
+    doAssert homeDeadlines.len == 1 and homeDeadlines[0].expiry == (step * 5000).uint32
+    fireNextHomeTimer()
+  doAssert homeDeadlines.len == 0 and sends.len == (if slotFree: 5 else: 0)
+
+for replace in 0 .. 6:
+  beginHome()
+  tx.freeList.first = nil
+  chan_pre_switch_channel()
+  tx.freeList.first = cast[ptr CoListHdr](1)
+  case replace
+  of 0: inc stationEpochs[0]
+  of 1: inc rxVifEpochs[0]
+  of 2: inc txResetEpoch
+  of 3: inc chanCtxtEpochs[0]
+  of 4: env.currentCtxt = addr contexts[3]
+  of 5: env.scheduledCtxt = addr contexts[3]
+  else: ps.enabled = 1
+  fireNextHomeTimer()
+  doAssert sends.len == 0 and homeDeadlines.len == 0
+
+# A new home return can supersede a popped but not-yet-delivered old timer.
+beginHome()
+tx.freeList.first = nil
+chan_pre_switch_channel()
+fireNextHomeTimer(proc() =
+  chanHomeWakeRequest(addr vifs[0], 0)
+  tx.freeList.first = cast[ptr CoListHdr](1))
+doAssert sends.len == 0 and homeDeadlines.len == 1 and homeDeadlines[0].expiry == 10000
+fireNextHomeTimer()
+doAssert sends.len == 1 and homeDeadlines.len == 0
+
+# The second VIF can use its existing descriptor even when the first VIF's
+# immediate submission was rejected and needs a retry.
+beginHome()
+vifs[0].next = addr vifs[1]
+nullResult[0] = 1
+chan_pre_switch_channel()
+doAssert sends.len == 2 and sends[0].index == 0 and sends[1].index == 1
+doAssert homeDeadlines.len == 1
+nullResult[0] = 0
+fireNextHomeTimer()
+doAssert sends.len == 3 and sends[^1].index == 0 and homeDeadlines.len == 0
+"""
+    run_program(tmp_path, mode, PLATFORM + PRE_SWITCH_PLATFORM + CFM_STUBS
+                + procedure((FW / "kernel_mac_channel.nim").read_text(), "chan_pre_switch_channel")
+                + checks)
+
+
+@pytest.mark.parametrize("mode", ["checked", "firmware"])
+def test_home_wake_timer_against_real_mm_dispatch(tmp_path: Path, mode: str) -> None:
+    kernel = (FW / "kernel_mac_channel.nim").read_text()
+    layout = (FW / "layout_types.nim").read_text()
+    identity = "type\n  MmVifIdentity" + layout.split("  MmVifIdentity", 1)[1].split("\n\n", 1)[0] + "\n"
+    code = mm_timer_source() + identity + r"""
+const
+  MAX_VIFS = 2
+  STA_INFO_TAB_ENTRIES = 7
+  VIF_TYPE_STA = 0'u8
+type
+  Vif = object
+    chanCtxt: pointer
+    state, vifType, vifIdx, staIdx: uint8
+var
+  home: uint32
+  vif = Vif(state: 1, chanCtxt: addr home)
+  env = (currentCtxt: cast[pointer](addr home), scheduledCtxt: pointer(nil))
+  tx: tuple[freeList: CoList]
+  ps = (enabled: 0'u8, statusFlags: 0'u32)
+  rxVifEpochs: array[MAX_VIFS, uint32]
+  chanCtxtEpochs: array[5, uint32]
+  txResetEpoch, nimFwDbgAutoNullSkipped: uint32
+  submissions: int
+proc vifChannelForIdx(index: uint8): ptr Vif =
+  if index == 0: addr vif else: nil
+proc vifChannelAt(p: pointer): ptr Vif = cast[ptr Vif](p)
+proc chanCtxtForIdx(index: uint8): pointer = addr home
+proc chanEnvView(): ptr typeof(env) = addr env
+proc psEnvView(): ptr typeof(ps) = addr ps
+proc txFrameEnv(): ptr typeof(tx) = addr tx
+proc staDeleteEpoch(index: uint8): uint32 = 0
+proc txlResetting(): bool = false
+proc txlVifIsRetiring(index: uint8): bool = false
+proc macTimeNow(): uint32 = now
+proc txl_frame_send_null_frame(sta: uint8; cb: pointer; argument: uint32): uint8 =
+  doAssert not enabled and sta == 0 and tx.freeList.first != nil
+  inc submissions
+  0
+"""
+    code += "".join(procedure(kernel, name) for name in (
+        "mmCaptureVif", "mmVifCurrent", "mmTimerActiveDelivery", "mmStaTimerCurrent",
+    ))
+    code += (FW / "channel_home_wake.nim").read_text()
+    run_program(tmp_path, mode, code + r"""
+now = high(uint32) - 1000
+chanHomeWakeRequest(addr vif, 0)
+doAssert mm_timer_list.first != nil and hardware[^1].expiry == 3999
+now = 3999
+onClearEvent = proc() =
+  onRestore = proc() =
+    chanHomeWakeRequest(addr vif, 0)
+    tx.freeList.first = cast[ptr CoListHdr](1)
+mm_timer_schedule()
+doAssert submissions == 0 and mm_timer_list.first != nil and hardware[^1].expiry == 8999
+now = 8999
+mm_timer_schedule()
+doAssert submissions == 1 and nimFwDbgHomeWakeQueued == 1 and mm_timer_list.first == nil
+doAssert mmTimerMutationTop == nil and enabled and not mmTimerScheduling
+""", defines=("bl808WifiBenchConnectedScan",))
+
+
+def test_preswitch_only_drains_receive_on_scan_or_roc_handoff(tmp_path: Path) -> None:
+    checks = r"""
+for prev in [-1, 0, 3, 4]:
+  for next in [1, 3, 4]:
+    reset()
+    mgmt.activeList.first = nil
+    env.currentCtxt = if prev < 0: nil else: addr contexts[prev]
+    env.scheduledCtxt = addr contexts[next]
+    chan_pre_switch_channel()
+    var relevant: seq[string]
+    for event in events:
+      if event.kind in ["rx-harvest", "rx-drain", "phy"]: relevant.add(event.kind)
+    let expected = if prev >= 3 or next >= 3: @["rx-harvest", "rx-drain", "phy"] else: @["phy"]
+    doAssert relevant == expected and lastPhy() == next
+"""
+    run_nim(tmp_path, PLATFORM + PRE_SWITCH_PLATFORM + CFM_STUBS
+            + procedure((FW / "kernel_mac_channel.nim").read_text(), "chan_pre_switch_channel")
+            + checks)
+
+
+def test_scan_and_roc_restore_only_saved_pm_bit(tmp_path: Path) -> None:
+    kernel = (FW / "kernel_mac_channel.nim").read_text()
+    platform = PLATFORM.replace(procedure(PLATFORM, "blmac_pwr_mgt_setf"), "")
+    checks = r"""
+for flags in [8'u8, 4'u8]:
+  for initial in [0'u32, 1, 4, 5, 0xFFFFFFFB'u32, high(uint32)]:
+    reset()
+    env.flags = flags
+    macControl = initial
+    chan_pre_switch_channel()
+    # chan.o:chan_pre_switch_channel+0x128 extracts bit 2 before clearing it.
+    doAssert env.surveySnapshot == ((initial shr 2) and 1).uint8
+    doAssert macControl == (initial and not 4'u32)
+    # The completion at chan_ctxt_op_evt+0x11e uses the live register.
+    macControl = macControl xor 0x80'u32
+    blmac_pwr_mgt_setf(env.surveySnapshot.uint32)
+    doAssert macControl == (initial xor 0x80'u32)
+"""
+    run_nim(tmp_path, platform + PRE_SWITCH_PLATFORM + CFM_STUBS
+            + "proc assert_err(a, b: cstring; line: cint) = doAssert false\n"
+            + procedure(kernel, "blmac_pwr_mgt_setf")
+            + procedure(kernel, "chan_pre_switch_channel") + checks)
 
 
 def test_protection_completion_to_preswitch_integration(tmp_path: Path) -> None:
@@ -432,6 +714,80 @@ doAssert env.scanDelayCount == 0 and lastPhy() == 3
             + checks)
 
 
+def test_protection_timeout_ignores_flushed_and_late_completions(tmp_path: Path) -> None:
+    platform = PLATFORM.replace("var txResetEpoch: uint32", r"""
+var
+  txResetEpoch, frameEpoch: uint32
+  trackedFrame: bool
+  onResetDrain: proc()
+""").replace("proc txlFrameCallbackCurrent(resetEpoch = txResetEpoch): bool = true",
+             "proc txlFrameCallbackCurrent(resetEpoch = txResetEpoch): bool =\n"
+             "  not trackedFrame or frameEpoch == resetEpoch")
+    platform = platform.replace("  inc txResetEpoch\n  true", r"""
+  inc txResetEpoch
+  if onResetDrain != nil:
+    let drain = onResetDrain
+    onResetDrain = nil
+    drain()
+  true""")
+    tasks = (FW / "task_handlers.nim").read_text()
+    kernel = (FW / "kernel_mac_channel.nim").read_text()
+    support = r"""
+const
+  MACHW_TIMLO_REG = MACHW_BASE + 0x120
+  MM_SCAN_CHANNEL_END_IND = 77'u16
+proc chan_get_next_chan(): pointer = nil
+proc chan_get_dominant_chan(): pointer = nil
+proc chan_switch_start(p: pointer) = doAssert false
+proc chanSwitchRetire(p: pointer) = doAssert false
+proc chan_conn_less_delay_prog() = doAssert false
+proc mm_back_to_host_idle() = doAssert false
+proc deliverFrame(index: int; epoch: uint32) =
+  let frame = sends[index]
+  trackedFrame = true
+  frameEpoch = epoch
+  defer: trackedFrame = false
+  cast[proc(p: pointer; status: uint32) {.cdecl.}](frame.callback)(
+    cast[pointer](frame.token.uint), 0x40000000'u32)
+"""
+    checks = r"""
+for flushDuringReset in [false, true]:
+  reset()
+  vifs[1].vifType = VIF_TYPE_AP
+  chan_goto_idle_cb()
+  let departed = txResetEpoch
+  doAssert lastPhy() == -1 and sends.len == 2
+  doAssert chanProtectionActive() and contexts[1].status == 3
+  doAssert env.scanDelayCount == 1 and env.connlessDelayCount == 1
+  if flushDuringReset:
+    onResetDrain = proc() =
+      doAssert txResetEpoch != departed
+      deliverFrame(0, departed)
+      deliverFrame(1, departed)
+  chan_ctxt_op_evt(addr contexts[1])
+  doAssert sends.len == 2 and not chanProtectionActive()
+  doAssert env.currentCtxt == (addr contexts[1]) and env.scheduledCtxt == nil
+  doAssert contexts[1].status == 4
+  let beforeLate = events.len
+  deliverFrame(0, departed)
+  deliverFrame(1, departed)
+  # Even a token replay without its original TX epoch cannot consume a ticket.
+  deliverFrame(0, txResetEpoch)
+  deliverFrame(1, txResetEpoch)
+  doAssert events.len == beforeLate
+  var retunes = 0
+  for event in events:
+    if event.kind == "phy": inc retunes
+  doAssert retunes == 1 and lastPhy() == 1
+"""
+    forward = "proc chan_pre_switch_channel*() {.exportc, cdecl.}\n"
+    code = protection_source(platform + PRE_SWITCH_PLATFORM + forward)
+    code += callback_bodies() + procedure(tasks, "chan_goto_idle_cb")
+    code += procedure(kernel, "chan_pre_switch_channel") + support
+    code += procedure(kernel, "chanCtxtOpEvent") + procedure(kernel, "chan_ctxt_op_evt")
+    run_program(tmp_path, "checked", code + checks)
+
+
 def test_channel_operation_timer_contract(tmp_path: Path) -> None:
     platform = PLATFORM.replace(procedure(PLATFORM, "chan_upd_ctxt_status"), "")
     timer = r"""
@@ -442,7 +798,7 @@ var
   timerStorage: Timer
   timerSets, timerClears: int
   expiry, now: uint32
-  chanStatusGeneration, txResetEpoch: uint32
+  chanStatusGeneration: uint32
   chanCtxtEpochs: array[5, uint32]
 proc chanCtxtOpTimer(): pointer = addr timerStorage
 proc mmTimerAt(p: pointer): ptr Timer = cast[ptr Timer](p)
@@ -488,8 +844,9 @@ for stamp in [0'u32, 1000, 0xFFFFF060'u32, 0xFFFFE4A8'u32, 0xFFFFFFFE'u32]:
           else:
             expectedStatus = 3
           doAssert contexts[marker].status == expectedStatus
-          doAssert timerSets == (expectedExpiry != 0).int
-          doAssert timerClears == (expectedExpiry == 0 and expectedStatus != 3).int
+          let armed = expectedStatus in {2'u8, 4'u8}
+          doAssert timerSets == armed.int
+          doAssert timerClears == (not armed and expectedStatus != 3).int
           if timerSets != 0:
             doAssert expiry == expectedExpiry
             doAssert timerStorage.env == cast[uint32](cast[uint](addr contexts[marker]))

@@ -1,0 +1,6 @@
+package ox64:values@0.2.0;
+
+world variant-invalid-demo {
+  variant choice { empty, small(u32) }
+  export make-invalid: func() -> choice;
+}

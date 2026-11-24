@@ -2,7 +2,14 @@
 
 when defined(bl808m0) and defined(bl808WifiNimFw):
   import sdk_headers
+  import host_table_layout
   import ipc_host as hostIpc
+  when defined(bl808WifiDiagTcpPath):
+    import tcp_path_trace
+  import dhcp_flow_trace
+  when defined(bl808WifiDiagHostTxStatus):
+    from std/volatile import volatileLoad
+    from fw/register_constants import MACHW_TIMLO_REG
 
   include tx/layout
   include tx/types

@@ -1,0 +1,132 @@
+{
+  "defaults": {
+    "uart_baud": 230400,
+    "openocd_interface": "pine64jtag.cfg",
+    "openocd_target": "tgt_e907_v2.cfg",
+    "forbidden": [
+      "[FAIL]",
+      "[FAULT]",
+      "panic",
+      "Unhandled",
+      "fatal:"
+    ]
+  },
+  "tests": [
+    {
+      "name": "m0_wasm_native_proof_test",
+      "tiers": [
+        "zkbuild-native"
+      ],
+      "defines": {
+        "bl808ZkBuild": "1"
+      },
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wasm_native_proof_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "[PASS] ZK native key prepared",
+        "[PASS] ZK native artifact admitted",
+        "[PASS] ZK native code executes",
+        "[PASS] ZK native i32 wraps",
+        "[PASS] ZK native snapshot isolated",
+        "[PASS] ZK changed native rejected",
+        "[PASS] ZK native changed WASM rejected",
+        "[PASS] ZK native changed proof rejected",
+        "[PASS] ZK native wrong key rejected",
+        "=== WASM native proof test complete ==="
+      ],
+      "timeout": 180
+    },
+    {
+      "name": "m0_wasm_byte_native_proof_test",
+      "tiers": [
+        "zkbuild-byte-native"
+      ],
+      "defines": {
+        "bl808ZkBuild": "1",
+        "zkbuildByteNativeTest": "1"
+      },
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wasm_native_proof_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "[PASS] ZK native key prepared",
+        "[PASS] ZK native artifact admitted",
+        "[PASS] ZK native code executes",
+        "[PASS] ZK native i32 wraps",
+        "[PASS] ZK native snapshot isolated",
+        "[PASS] ZK changed native rejected",
+        "[PASS] ZK native changed WASM rejected",
+        "[PASS] ZK native changed proof rejected",
+        "[PASS] ZK native wrong key rejected",
+        "=== WASM native proof test complete ==="
+      ],
+      "timeout": 180
+    },
+    {
+      "name": "m0_wasm_proof_test",
+      "tiers": [
+        "zkbuild"
+      ],
+      "defines": {
+        "bl808ZkBuild": "1"
+      },
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wasm_proof_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "[PASS] ZK key prepared",
+        "[PASS] ZK valid proof",
+        "[PASS] ZK changed module rejected",
+        "[PASS] ZK changed proof rejected",
+        "[PASS] ZK wrong key rejected",
+        "=== WASM proof test complete ==="
+      ],
+      "timeout": 180
+    },
+    {
+      "name": "m0_wasm_verified_loader_test",
+      "tiers": [
+        "zkbuild-loader"
+      ],
+      "defines": {
+        "bl808ZkBuild": "1",
+        "bl808ZkLoaderTest": "1"
+      },
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wasm_proof_test.nim",
+          "flash": "m0"
+        }
+      ],
+      "required": [
+        "[PASS] ZK key prepared",
+        "[PASS] ZK valid proof",
+        "[PASS] ZK changed module rejected",
+        "[PASS] ZK changed proof rejected",
+        "[PASS] ZK wrong key rejected",
+        "[PASS] ZK verified module executes",
+        "[PASS] ZK loaded snapshot isolated",
+        "=== WASM proof test complete ==="
+      ],
+      "timeout": 180
+    }
+  ]
+}

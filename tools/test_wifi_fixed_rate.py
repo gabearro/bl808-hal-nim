@@ -25,10 +25,16 @@ type Sta = object
   rcStats: pointer
   valid, infoIdx: uint8
   txPolicyUpdateFlags: array[1, uint8]
+type MsgHdr = object
+  paramLen: uint32
 var
   stations: array[7, Sta]
+  requestHeader = MsgHdr(paramLen: 6)
   errors, updates: int
   updateArgs: array[3, uint8]
+proc keMsgHdrFromPayload(p: pointer): ptr MsgHdr =
+  doAssert p != nil
+  addr requestHeader
 proc staInfoForIdx(index: uint8): ptr Sta =
   doAssert index < 7
   addr stations[index]
@@ -96,6 +102,11 @@ stations[0].valid = 0
 me_rc_set_rate_req_handler(addr req)
 stations[0].valid = 1
 stations[0].rcStats = nil
+for size in 0'u32 .. 5'u32:
+  requestHeader.paramLen = size
+  doAssert me_rc_set_rate_req_handler(addr req) == 0
+doAssert errors == 0
+requestHeader.paramLen = 6
 me_rc_set_rate_req_handler(addr req)
 doAssert errors == 1
 doAssert me_rc_set_rate_req_handler(nil) == 0
@@ -124,11 +135,13 @@ def valid(stats, rate):
         nss = (rate >> 3) & 3 if fmt in (2, 3) else 0
         if nss > stats[188]:
             return False
-    # rc_check_valid_rate deliberately rejects unsupported VHT/HE formats.
+    # The archive's rc_check_valid_rate accepts formats above HT here.
     if legacy:
         index = rate & 127
         return index < 16 and bool(struct.unpack_from("<H", stats, 182)[0] & (1 << index))
-    return fmt in (2, 3) and bool(stats[178 + ((rate >> 3) & 3)] & (1 << (rate & 7)))
+    if fmt > 3:
+        return True
+    return bool(stats[178 + ((rate >> 3) & 3)] & (1 << (rate & 7)))
 
 
 def profiles():
@@ -163,6 +176,7 @@ def test_fixed_rate(mode, tmp_path):
     source = PLATFORM
     source += "\ntype\n  RcRateEntryView" + layout.split("  RcRateEntryView", 1)[1].split("  TxFrameEnvView", 1)[0]
     source += "\ntype\n  MeRcSetRateReqPayload" + layout.split("  MeRcSetRateReqPayload", 1)[1].split("  MeTrafficIndReqPayload", 1)[0]
+    source += "\nconst MeRcSetRateReqPayloadSize = sizeof(MeRcSetRateReqPayload).uint32\n"
     source += "\ntemplate meRcSetRateReqView(p: pointer): ptr MeRcSetRateReqPayload = cast[ptr MeRcSetRateReqPayload](p)\n"
     source += "\ntemplate rcTrialControl" + helpers.split("template rcTrialControl", 1)[1].split("template rcThroughputArray", 1)[0]
     rate = (FW / "rate_control.nim").read_text()

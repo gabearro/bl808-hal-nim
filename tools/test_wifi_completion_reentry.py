@@ -17,7 +17,6 @@ def host_source() -> str:
     code = code.replace(old, r'''
 var onRate: proc()
 proc me_tx_cfm_singleton(p: pointer) =
-  doAssert not interruptsEnabled
   if onRate != nil: onRate()
 ''', 1)
     tx = (FW / "tx_layer.nim").read_text()
@@ -44,6 +43,7 @@ for incoming in [false, true]:
   var newHardware: HwDesc
   onRate = proc() =
     onRate = nil
+    doAssert interruptsEnabled == incoming
     doAssert txl_reset()
     doAssert txEnv.packetCounter == 0 and hardwareResets == 1
     doAssert hostCompletions.len == 2
@@ -77,6 +77,7 @@ for incoming in [false, true]:
   ke_env[0] = txl_cfm_evt_bit[2]
   onRate = proc() =
     onRate = nil
+    doAssert interruptsEnabled == incoming
     doAssert txActiveFlush != nil and txActiveFlush != (addr ancestor)
     doAssert txActiveFlush.confirmations.first == (addr frames[0].link)
     txl_cfm_flush(2, addr txActiveFlush.confirmations, 0x40000000'u32)
@@ -97,7 +98,8 @@ var assertionHook: proc()
 '''
     code = code.replace("proc assert_err(", support + "proc assert_err(", 1)
     code = code.replace("= assertionLines.add(line)", "=\n  assertionLines.add(line)\n  if assertionHook != nil: assertionHook()", 1)
-    body = procedure((FW / "rate_control.nim").read_text(), "rc_update_counters")
+    source = (FW / "rate_control.nim").read_text()
+    body = procedure(source, "rcAccountCounters") + procedure(source, "rc_update_counters")
     declarations = "\nvar\n" + "".join(
         f"  {name}: uint32\n" for name in sorted(set(re.findall(r"\bnimFwDbg\w+", body)))
     )

@@ -10,7 +10,9 @@ from test_wifi_auth_frames import layouts
 from test_wifi_disconnect_tx import FW, ROOT, procedure
 
 PLATFORM = r'''
-const MAX_VIFS = 2
+const
+  MAX_VIFS = 2
+  STA_MGMT_FREE_STAS = 5
 type
   SmTxBuildContext = object
     current: bool
@@ -32,20 +34,33 @@ type
     keyString: array[64, uint8]
   Vif = object
     bssid, currentBssid, macAddr: array[6, uint8]
+    staIdx: uint8
+  Sta = object
+    macAddr: array[6, uint8]
   Env = object
     connectInfo, vendorIePtr: pointer
     vendorIeLen: uint16
+  ScanEnv = object
+    extraIePtr: pointer
+    extraIeLen: uint16
   Me = object
     htSupp: uint8
     htCaps: array[29, uint8]
+  Ps = object
+    reserved: array[8, uint32]
+    uapsdPeriod: uint32
 var
   buffer: Buffer
   context: SmTxBuildContext
   assoc: Assoc
   conn: Conn
   vif: Vif
+  stas: array[STA_MGMT_FREE_STAS, Sta]
+  expectedPeerMac: array[6, uint8]
   env: Env
+  scanu_env: ScanEnv
   me: Me
+  ps_env: array[14, uint32]
   wpa_cbs: pointer
   callbacks: array[15, pointer]
   payload: array[600, uint8]
@@ -66,11 +81,17 @@ proc replaceAt(stage: int) =
   context.current = false
   for b in buffer.data.mitems: b = 0xAC
   conn = default(Conn)
+  if stage == 3:
+    stas[1].macAddr = [0xAA'u8, 0xBB, 0xCC, 0xDD, 0xEE, 0xF0]
+    vif.macAddr = [0xA2'u8, 0xB2, 0xC2, 0xD2, 0xE2, 0xF2]
 proc vifChannelForIdx(i: uint8): ptr Vif =
   doAssert i == 1
   addr vif
+proc staInfoForIdx(i: uint8): ptr Sta = addr stas[i]
 proc smEnvView(): ptr Env = addr env
+proc mm_set_wpa_rsn_ie(vifIdx: uint8; ie: pointer; ieLen: uint8) = discard
 proc meEnvView(): ptr Me = addr me
+proc psEnvView(): ptr Ps = cast[ptr Ps](addr ps_env[0])
 proc connectInfoView(p: pointer): ptr Conn = cast[ptr Conn](p)
 proc connectInfoCredentials(p: pointer): ptr Conn = cast[ptr Conn](p)
 proc vifAssocInfo(p: pointer): ptr Assoc = cast[ptr Assoc](p)
@@ -95,7 +116,7 @@ proc getSae(bssid, mac, passphrase: pointer; kind: uint32;
   doAssert kind == 1
   let savedBssid = cast[ptr array[6, uint8]](bssid)[]
   let savedMac = cast[ptr array[6, uint8]](mac)[]
-  doAssert savedBssid == vif.bssid or savedBssid == vif.currentBssid
+  doAssert savedBssid == expectedPeerMac
   doAssert savedMac == vif.macAddr
   replaceAt(3)
   if replacementAt == 3:
@@ -119,9 +140,15 @@ proc reset() =
   conn = Conn(listenInterval: 9, qosInfo: 0x65)
   for b in conn.keyString.mitems: b = 0x44
   vif = Vif(bssid: [2'u8, 3, 4, 5, 6, 7], currentBssid: [4'u8, 5, 6, 7, 8, 9],
-            macAddr: [6'u8, 7, 8, 9, 10, 11])
+            macAddr: [6'u8, 7, 8, 9, 10, 11], staIdx: 1)
+  stas = default(typeof(stas))
+  stas[1].macAddr = vif.bssid
+  expectedPeerMac = stas[1].macAddr
   env = Env(connectInfo: addr conn)
   me = Me(htSupp: 1)
+  ps_env = default(typeof(ps_env))
+  ps_env[8] = 1
+  assoc.wmmQosInfo = 0x80
   payloadLength = 8
   payloadMissing = false
   for i in 0..<payload.len: payload[i] = (i mod 256).uint8
@@ -140,7 +167,7 @@ proc encodeAssoc(reassoc: pointer = nil): tuple[length: uint32, cursor: pointer,
   result.cursor = cast[pointer](1)
   result.ies = 0xFFFF
   result.length = meBuildAssociateReq(addr buffer.data[24], addr assoc, reassoc,
-    cast[pointer](1), addr result.cursor, addr result.ies, addr conn, addr context)
+    cast[pointer](1), addr result.cursor, addr result.ies, env.connectInfo, addr context)
 proc encodeSae(): uint32 =
   meBuildSaeAuthenticate(addr buffer.data[24], 3, 1, 0, 1, addr context)
 '''
@@ -180,6 +207,29 @@ reset()
 env.connectInfo = nil
 doAssert encodeSae() == 14
 ''',
+    "sae_peer_address_source": r'''
+reset()
+vif.bssid = default(typeof(vif.bssid))
+doAssert encodeSae() == 14 and callbackCalls == 1
+reset()
+stas[1].macAddr = [8'u8, 9, 10, 11, 12, 13]
+expectedPeerMac = vif.bssid
+doAssert encodeSae() == 14 and callbackCalls == 1
+reset()
+vif.staIdx = 0xFF
+expectedPeerMac = vif.bssid
+doAssert encodeSae() == 14 and callbackCalls == 1
+reset()
+vif.staIdx = 0xFF
+vif.bssid = default(typeof(vif.bssid))
+expectedPeerMac = vif.currentBssid
+doAssert encodeSae() == 14 and callbackCalls == 1
+reset()
+vif.staIdx = 0xFF
+vif.bssid = default(typeof(vif.bssid))
+vif.currentBssid = default(typeof(vif.currentBssid))
+doAssert encodeSae() == 0 and callbackCalls == 0
+''',
     "association_bytes": r'''
 for flags in 0'u32..3:
   for reassoc in [false, true]:
@@ -191,7 +241,7 @@ for flags in 0'u32..3:
     let expected = fixed + 5 + 10 + 6 + (if (flags and 1) != 0: 9 else: 0) +
       (if (flags and 2) != 0: 28 else: 0)
     doAssert built.length == expected.uint32 and built.ies == (expected - fixed).uint16
-    doAssert cast[uint](built.cursor) == cast[uint](addr buffer.data[24]) + expected.uint
+    doAssert cast[uint](built.cursor) == cast[uint](addr buffer.data[24]) + fixed.uint
     doAssert buffer.data[24] == 0x31 and buffer.data[25] == 0x04
     doAssert buffer.data[26] == 9 and buffer.data[27] == 0
     let first = 24 + fixed
@@ -199,11 +249,57 @@ for flags in 0'u32..3:
     doAssert buffer.data[first + 5..first + 6] == @[1'u8, 8]
     doAssert buffer.data[first + 15..first + 16] == @[50'u8, 4]
     if (flags and 1) != 0:
-      doAssert buffer.data[first + 21..first + 29] == @[221'u8, 7, 0, 80, 242, 2, 0, 1, 0x65]
+      let wmmAt = first + 21
+      doAssert buffer.data[wmmAt..wmmAt + 8] ==
+        @[221'u8, 7, 0, 80, 242, 2, 0, 1, 0x65]
+    if (flags and 2) != 0:
+      let htAt = first + 21 + (if (flags and 1) != 0: 9 else: 0)
+      doAssert buffer.data[htAt] == 45 and buffer.data[htAt + 1] == 26
     if reassoc:
       for i in 0..<6: doAssert buffer.data[28 + i] == bssid[i]
     for i in 24 + expected..<512: doAssert buffer.data[i] == 0xCC
     guards()
+''',
+    "association_ie_order": r'''
+reset()
+assoc.securityFlags = 3
+var securityIe = [48'u8, 2, 1, 0]
+var vendorIe = [221'u8, 3, 1, 2, 3]
+assoc.rsnIePtr = addr securityIe[0]
+assoc.rsnIeLen = securityIe.len.uint8
+env.vendorIePtr = addr vendorIe[0]
+env.vendorIeLen = vendorIe.len.uint16
+let built = encodeAssoc()
+doAssert built.length == 25 + securityIe.len.uint32 + 9 + 28 + vendorIe.len.uint32
+let first = 28
+doAssert buffer.data[first + 21 ..< first + 25] == securityIe
+doAssert buffer.data[first + 25 ..< first + 34] ==
+  @[221'u8, 7, 0, 80, 242, 2, 0, 1, 0x65]
+doAssert buffer.data[first + 34] == 45 and buffer.data[first + 35] == 26
+doAssert buffer.data[first + 62 ..< first + 67] == vendorIe
+guards()
+''',
+    "association_wmm_qos_gate": r'''
+for psEnabled in [false, true]:
+  for uapsdConfigured in [false, true]:
+    for vifGate in [false, true]:
+      reset()
+      assoc.securityFlags = 1
+      ps_env[0] = psEnabled.uint32
+      ps_env[8] = uapsdConfigured.uint32
+      assoc.wmmQosInfo = if vifGate: 0x80'u8 else: 0x7F'u8
+      let built = encodeAssoc()
+      doAssert built.length == 34 and built.ies == 30
+      doAssert built.cursor == addr buffer.data[28]
+      doAssert buffer.data[57] ==
+        (if uapsdConfigured and vifGate: 0x65'u8 else: 0'u8)
+      guards()
+reset()
+assoc.securityFlags = 1
+env.connectInfo = nil
+doAssert encodeAssoc().length == 34
+doAssert buffer.data[57] == 0
+guards()
 ''',
     "association_each_capacity": r'''
 for capacity in 24'u32..112:
@@ -226,13 +322,15 @@ for length in [462'u16, 463, 464, 600]:
   guards()
 ''',
     "association_invalid_fields": r'''
-for kind in 0..3:
+for kind in 0..5:
   reset()
   case kind
   of 0: assoc.ssidLen = 33
   of 1: assoc.basicRates[0] = 13
   of 2: assoc.rsnIeLen = 1
-  else: env.vendorIeLen = 1
+  of 3: env.vendorIeLen = 1
+  of 4: assoc.basicRates[0] = 0
+  else: assoc.ssidLen = 0
   doAssert encodeAssoc().length == 0
   guards()
 ''',
@@ -255,7 +353,38 @@ var ies: uint16
 let length = me_build_associate_req_impl(addr buffer.data[24], addr assoc, nil,
   cast[pointer](1), addr cursor, addr ies, addr conn)
 doAssert length == 25 and ies == 21
+doAssert cursor == addr buffer.data[28]
 guards()
+''',
+    "association_setter_alias": r'''
+reset()
+let baseLength = encodeAssoc().length
+reset()
+var vendor = [221'u8, 3, 1, 2, 3]
+doAssert bl_wifi_set_appie_internal(1, 2, addr vendor[0], vendor.len.uint16, true) == 0
+doAssert env.vendorIePtr == (addr vendor[0]) and env.vendorIeLen == vendor.len.uint16
+let built = encodeAssoc()
+doAssert built.length == baseLength + vendor.len.uint32
+doAssert buffer.data[24 + baseLength.int ..< 24 + built.length.int] == vendor
+guards()
+reset()
+doAssert bl_wifi_set_appie_internal(1, 2, addr vendor[0], vendor.len.uint16, true) == 0
+doAssert bl_wifi_unset_appie_internal(1, 2) == 0
+doAssert env.vendorIePtr == nil and env.vendorIeLen == 0
+doAssert encodeAssoc().length == baseLength
+guards()
+''',
+    "association_vif_bounds": r'''
+for rawIndex in [2'u, 255'u, 256'u, 257'u, high(uint)]:
+  reset()
+  var cursor = cast[pointer](0x1234)
+  var ies = 0xABCD'u16
+  let before = buffer
+  let length = meBuildAssociateReq(addr buffer.data[24], addr assoc, nil,
+    cast[pointer](rawIndex), addr cursor, addr ies, env.connectInfo, addr context)
+  doAssert length == 0 and buffer == before
+  doAssert cursor == cast[pointer](0x1234) and ies == 0xABCD'u16
+  guards()
 ''',
 }
 
@@ -263,12 +392,15 @@ guards()
 def source() -> str:
     code = (FW / "scan_station_ap_me.nim").read_text()
     names = ["me_add_ie_ssid", "me_add_ie_supp_rates", "me_add_ie_ext_supp_rates",
-             "me_add_ie_ht_capa", "meBuildSaeAuthenticate", "me_build_sae_authenticate",
+             "me_add_ie_ht_capa", "macPtrIsSpecific", "macPtrEquals",
+             "meBuildSaeAuthenticate", "me_build_sae_authenticate",
              "meBuildAssociateReq", "me_build_associate_req_impl"]
     return layouts("AuthFixedBodyView", "AuthBodyDataView", "AssocReqFixedBodyView",
                    "MacIeView", "SsidIeView", "RateSetView", "MacIeDataView",
                    "WmmInfoIeView", "HtCapIeView") + PLATFORM + "".join(
-        procedure(code, name) for name in names) + CHECKS
+        procedure(code, name) for name in names) + "".join(
+        procedure((FW / "platform_bl.nim").read_text(), name) for name in
+        ["bl_wifi_set_appie_internal", "bl_wifi_unset_appie_internal"]) + CHECKS
 
 
 @pytest.mark.parametrize("case", CASES)

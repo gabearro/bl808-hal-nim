@@ -9,14 +9,13 @@ type
 
   SmCleanupOperation = object
     session: RxHostSession
-    serial, stationEpoch: uint32
+    serial, stationEpoch, channelBinding: uint32
     vifIndex, station: uint8
-    active, prepared, notified, awaiting, unlinkDone: bool
+    active, replyReserved, notified, awaiting: bool
     disconnectIndication: bool
     status, reason: uint16
     step: int
     needed: array[4, bool]
-    requests, replies: array[4, pointer]
     request, reply, connectionInfo, indication, discardedIndication: pointer
     bss: CoList
 
@@ -90,7 +89,8 @@ proc smCleanupAdmitRequest(request: pointer): bool =
   if tag == nil: return true
   if not tag.command or not smCleanupCurrent(tag.serial): return false
   if tag.header.id == MM_STA_DEL_REQ and
-      not smCleanupOwnsStation(smCleanup.station, smCleanup.vifIndex, smCleanup.stationEpoch):
+      not smCleanupOwnsStation(smCleanup.station, smCleanup.vifIndex, smCleanup.stationEpoch) and
+      not mmStaDelOwned(smCleanup.station, smCleanup.vifIndex, smCleanup.stationEpoch):
     cast[ptr MmStaDelReqPayload](request).staIdx = 0xFF
   true
 
@@ -98,11 +98,17 @@ proc smCleanupTakeReply(request: pointer; id: uint16; length: uint32): pointer =
   let saved = irqSave()
   defer: irqRestore(saved)
   if request == nil or request != smCleanup.request or length != 0 or
+      not smCleanup.replyReserved or
       not smCleanupCurrent(smCleanup.serial) or
       id != SmCleanupResponses[smCleanup.step]:
     return nil
-  result = smCleanup.replies[smCleanup.step]
-  smCleanup.replies[smCleanup.step] = nil
+  smCleanup.replyReserved = false
+  smCleanup.reply
+
+proc smCleanupPayloadOwned(payload: pointer; serial: uint32): bool =
+  if payload == nil: return false
+  let tag = smCleanupTagFor(keMsgHdrFromPayload(payload))
+  tag != nil and tag.serial == serial
 
 proc smCleanupCancel() =
   let saved = irqSave()
@@ -110,20 +116,20 @@ proc smCleanupCancel() =
   let retired = smCleanup
   smCleanup = default(SmCleanupOperation)
   inc smCleanupSerial
+  template owns(payload: pointer): bool = smCleanupPayloadOwned(payload, retired.serial)
   if retired.request != nil or retired.reply != nil:
-    if (retired.request != nil and meControlCommand == retired.request) or
-        (retired.reply != nil and meControlReply == retired.reply):
+    if (meControlCommand == retired.request and owns(retired.request)) or
+        (meControlReply == retired.reply and owns(retired.reply)):
       meControlReset()
       if meControlCommand == nil and meControlReply == nil and mmPsModeRequest == nil:
         ke_state_set(TASK_ME, MeIdleState)
     else:
-      meCancelQueuedPayload(retired.request)
-      meCancelQueuedPayload(retired.reply)
-  for index in 0 ..< retired.requests.len:
-    if retired.requests[index] != nil:
-      ke_msg_free(keMsgHdrFromPayload(retired.requests[index]))
-    if retired.replies[index] != nil:
-      ke_msg_free(keMsgHdrFromPayload(retired.replies[index]))
+      if owns(retired.request): meCancelQueuedPayload(retired.request)
+      # Extracting the request can free and recycle another queued allocation.
+      if not retired.replyReserved and retired.reply != retired.request and owns(retired.reply):
+        meCancelQueuedPayload(retired.reply)
+  if retired.replyReserved and owns(retired.reply):
+    ke_msg_free(keMsgHdrFromPayload(retired.reply))
   if retired.connectionInfo != nil:
     ke_msg_free(keMsgHdrFromPayload(retired.connectionInfo))
   if retired.indication != nil:
@@ -137,7 +143,7 @@ proc smCleanupCancel() =
 proc smCleanupNeedsService(): bool =
   let saved = irqSave()
   defer: irqRestore(saved)
-  smCleanup.active and
+  smCleanup.active and not txlResetting() and
     (not smCleanup.awaiting or not smCleanupCurrent(smCleanup.serial))
 
 proc smCleanupService() =
@@ -146,14 +152,29 @@ proc smCleanupService() =
   defer: smCleanupServicing = false
   let saved = irqSave()
   defer: irqRestore(saved)
+  if txlResetting(): return
   let serial = smCleanup.serial
   template current(): bool = smCleanupCurrent(serial)
   template outside(body: untyped) =
     irqRestore(saved)
     try: body
     finally: discard irqSave()
+  template publishIndication(indication, session: untyped) =
+    # The message is no longer in the transaction. The synchronous host
+    # callback may pump replies and finish this cleanup before it returns.
+    smCleanupServicing = false
+    try:
+      outside: rxHostSendStationIndication(indication, session)
+    finally:
+      smCleanupServicing = true
   if not current():
+    let releaseState = ke_state_get(TASK_SM) == SmDisconnectingState
+    let cancelledSerial = smCleanupSerial + 1'u32
     smCleanupCancel()
+    # Free/ME callbacks can install another owner before cancellation returns.
+    if releaseState and smCleanupSerial == cancelledSerial and
+        smEnvView().connectInfo == nil and ke_state_get(TASK_SM) == SmDisconnectingState:
+      ke_state_set(TASK_SM, SmIdleState)
     return
   if smCleanup.connectionInfo != nil:
     let connection = smCleanup.connectionInfo
@@ -169,67 +190,54 @@ proc smCleanupService() =
     let message = co_list_pop_front(addr smCleanup.bss)
     outside: ke_msg_free(message)
     if not current(): return
-  if not smCleanup.prepared:
-    var requests, replies: array[4, pointer]
-    var ready = true
-    for index in 0 ..< requests.len:
-      if not smCleanup.needed[index]: continue
-      requests[index] = smCleanupAlloc(index, false, serial)
-      if index != 2: replies[index] = smCleanupAlloc(index, true, serial)
-      if requests[index] == nil or (index != 2 and replies[index] == nil): ready = false
-      if not current():
-        ready = false
-        break
-    if not ready:
-      for index in 0 ..< requests.len:
-        if requests[index] != nil: ke_msg_free(keMsgHdrFromPayload(requests[index]))
-        if replies[index] != nil: ke_msg_free(keMsgHdrFromPayload(replies[index]))
-      return
-    if smCleanup.disconnectIndication and smCleanup.indication == nil:
-      let message = ke_msg_try_alloc(SM_DISCONNECT_IND, TASK_API, TASK_SM,
-                                     SmDisconnectProcessIndPayloadSize)
-      if message == nil or not current():
-        if message != nil: ke_msg_free(keMsgHdrFromPayload(message))
-        for index in 0 ..< requests.len:
-          if requests[index] != nil: ke_msg_free(keMsgHdrFromPayload(requests[index]))
-          if replies[index] != nil: ke_msg_free(keMsgHdrFromPayload(replies[index]))
-        return
-      smCleanup.indication = message
-      let indication = cast[ptr SmDisconnectProcessIndPayload](smCleanup.indication)
-      indication.status = smCleanup.status
-      indication.reason = smCleanup.reason
-      indication.vifIdx = smCleanup.vifIndex
-    smCleanup.requests = requests
-    smCleanup.replies = replies
-    smCleanup.prepared = true
-  if not smCleanup.notified:
-    smCleanup.notified = true
-    let callback = if wpa_cbs == nil: nil else: wpaCallbacks().stationDisconnected
-    if callback != nil:
-      outside: cast[proc(reason: uint8) {.cdecl.}](callback)(0)
-      if not current(): return
   while current() and not smCleanup.awaiting:
-    if smCleanup.step == 3 and not smCleanup.unlinkDone:
-      smCleanup.unlinkDone = true
-      let vif = vifChannelForIdx(smCleanup.vifIndex)
-      if vif.chanCtxt != nil:
-        outside: chan_ctxt_unlink(smCleanup.vifIndex)
-        if not current(): return
-      vifApConfig(vif).securityFlags = 0
-      nimFwWpaPendingMask = nimFwWpaPendingMask and not (1'u32 shl smCleanup.vifIndex)
     if smCleanup.step == 4:
       let indication = smCleanup.indication
+      let session = smCleanup.session
       smCleanup.indication = nil
       smCleanup.active = false
       ke_state_set(TASK_SM, SmIdleState)
       if indication != nil:
-        outside: ke_msg_send(indication)
+        publishIndication(indication, session)
       return
     let index = smCleanup.step
     if not smCleanup.needed[index]:
       inc smCleanup.step
       continue
-    let request = smCleanup.requests[index]
+
+    # Reserve only this step. A failure leaves earlier completed steps intact
+    # and keeps the unpublished allocations local across reentrant callbacks.
+    var request = smCleanupAlloc(index, false, serial)
+    defer:
+      if request != nil: ke_msg_free(keMsgHdrFromPayload(request))
+    if request == nil or not current(): return
+    var reply: pointer
+    defer:
+      if reply != nil: ke_msg_free(keMsgHdrFromPayload(reply))
+    if index != 2:
+      reply = smCleanupAlloc(index, true, serial)
+      if reply == nil or not current(): return
+    if smCleanup.disconnectIndication and smCleanup.indication == nil:
+      let message = ke_msg_try_alloc(SM_DISCONNECT_IND, TASK_API, TASK_SM,
+                                     SmDisconnectProcessIndPayloadSize)
+      if message == nil: return
+      if not current():
+        ke_msg_free(keMsgHdrFromPayload(message))
+        return
+      smCleanup.indication = message
+      let indication = cast[ptr SmDisconnectProcessIndPayload](message)
+      indication.status = smCleanup.status
+      indication.reason = smCleanup.reason
+      indication.vifIdx = smCleanup.vifIndex
+    if not smCleanup.notified:
+      smCleanup.notified = true
+      let callback = if wpa_cbs == nil: nil else: wpaCallbacks().stationDisconnected
+      if callback != nil:
+        outside: cast[proc(reason: uint8) {.cdecl.}](callback)(0)
+        if not current(): return
+    if index == 3:
+      nimFwWpaPendingMask = nimFwWpaPendingMask and not (1'u32 shl smCleanup.vifIndex)
+    if txlResetting(): return
     case index
     of 0:
       cast[ptr MeSetPsDisableReqPayload](request)[] =
@@ -245,10 +253,29 @@ proc smCleanupService() =
       cast[ptr MeSetActiveReqPayload](request)[] =
         MeSetActiveReqPayload(active: 0, vifIdx: smCleanup.vifIndex)
     smCleanup.request = request
-    smCleanup.reply = if index == 2: request else: smCleanup.replies[index]
-    smCleanup.requests[index] = nil
+    smCleanup.reply = if index == 2: request else: reply
+    smCleanup.replyReserved = reply != nil
     smCleanup.awaiting = true
-    outside: ke_msg_send(request)
+    let published = request
+    request = nil
+    reply = nil
+    outside: ke_msg_send(published)
+    if not current(): return
+    if index == 0:
+      # Retire the original binding and VIF flags before notifying the host.
+      # The remaining confirmation gates still keep reconnect admission busy.
+      let vifIndex = smCleanup.vifIndex
+      if chanCtxtLinkEpochs[vifIndex] == smCleanup.channelBinding and
+          vifChannelForIdx(vifIndex).chanCtxt != nil:
+        chan_ctxt_unlink(vifIndex)
+        if not current(): return
+      vifApConfig(vifChannelForIdx(vifIndex)).securityFlags = 0
+    if smCleanup.disconnectIndication and smCleanup.indication != nil:
+      let indication = smCleanup.indication
+      let session = smCleanup.session
+      smCleanup.indication = nil
+      smCleanup.disconnectIndication = false
+      publishIndication(indication, session)
 
 proc smCleanupConsumeReply(reply: pointer): bool =
   if reply == nil: return smCleanup.active
@@ -260,7 +287,7 @@ proc smCleanupConsumeReply(reply: pointer): bool =
   let header = keMsgHdrFromPayload(reply)
   let tag = smCleanupTagFor(header)
   if tag == nil: return smCleanup.active
-  if not smCleanupCurrent(tag.serial) or not smCleanup.awaiting or
+  if not smCleanupCurrent(tag.serial) or not smCleanup.awaiting or smCleanup.replyReserved or
       reply != smCleanup.reply or header.id != tag.responseId or
       header.srcId != tag.responseSource or header.destId != TASK_SM or
       header.paramLen != 0:
@@ -277,13 +304,15 @@ proc smCleanupCfmHandler(reply: pointer): cint {.cdecl.} =
   KeMsgConsumed
 
 proc smCleanupBegin(vifEntry: pointer; indication: pointer = nil;
-                    disconnected = false; status = 0'u16; reason = 0'u16): bool =
+                    disconnected = false; status = 0'u16; reason = 0'u16;
+                    handoff = default(SmDisconnectHandoff)): bool =
   let saved = irqSave()
   defer:
     irqRestore(saved)
     if result: smCleanupService()
   if smCleanup.active: return false
   let sm = smEnvView()
+  if handoff.peer.captured and not smDisconnectHandoffCurrent(handoff): return false
   var vif: ptr VifChannelView
   for index in 0'u8 ..< MAX_VIFS.uint8:
     let candidate = vifChannelForIdx(index)
@@ -296,6 +325,8 @@ proc smCleanupBegin(vifEntry: pointer; indication: pointer = nil;
       vif = candidate
       break
   if vif == nil: return false
+  if disconnected:
+    sm_reconn_dominant_flag = 0
   let stationEpoch = staDeleteEpoch(vif.staIdx)
   if not smCleanupOwnsStation(vif.staIdx, vif.vifIdx, stationEpoch):
     vif.staIdx = 0xFF
@@ -305,7 +336,7 @@ proc smCleanupBegin(vifEntry: pointer; indication: pointer = nil;
   smCleanup = SmCleanupOperation(active: true, serial: smCleanupSerial,
     vifIndex: vif.vifIdx, station: vif.staIdx,
     session: captureRxHostSession(vif.vifIdx, 0xFF),
-    stationEpoch: stationEpoch,
+    stationEpoch: stationEpoch, channelBinding: chanCtxtLinkEpochs[vif.vifIdx],
     needed: [true, vif.state != 0, vif.staIdx != 0xFF, true],
     connectionInfo: sm.connectInfo, indication: indication,
     disconnectIndication: disconnected, status: status, reason: reason,

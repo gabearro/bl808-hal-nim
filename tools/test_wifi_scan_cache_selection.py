@@ -13,6 +13,7 @@ SUPPORT = ROOT / "src/bl808/wifi/support"
 
 def source() -> str:
     code = "{.pragma: allcoreHttpPsramBss.}\n"
+    code += (SUPPORT.parent / "fw_constants/status_codes.nim").read_text() + "\n"
     for name in ["local_types.nim", "vendor_layout_parts/events.nim",
                  "vendor_layout_parts/vif_table.nim"]:
         code += (SUPPORT / "defs_parts" / name).read_text() + "\n"
@@ -27,7 +28,7 @@ proc loadI32(p: pointer; offset: uint): int32 = copyMem(addr result, ptrAt(p, of
 proc bl_msg_get_channel_nums(): cint = 14
 '''
     scan = (SUPPORT / "scan_diag.nim").read_text()
-    for name in ["scanCacheReset", "scannedBssidIsSpecific", "ssidBytesMatch",
+    for name in ["scanCacheReset", "scanCacheClearSelection", "scannedBssidIsSpecific", "ssidBytesMatch",
                  "packBssidLo", "packBssidHi", "sameBssid", "scanCacheFailureLookup",
                  "scanCacheFailureRecord", "scanCacheStore", "scanCacheFind",
                  "scanCacheRecordConnectResult"]:
@@ -60,11 +61,12 @@ proc select(expected: int; candidates: uint32; bssid: ptr uint8 = nil;
   doAssert scanCache == before, "lookup changed candidate state"
   doAssert nimfwDbgScanCacheFind == oldFinds + 1
   doAssert nimfwDbgScanCacheCandidates == candidates
-  doAssert scanCacheSelectedSlot == expected
+  doAssert scanCacheConnectPending == found
   doAssert nimfwDbgScanCacheHit == oldHits + found.uint32
   if found:
     let entry = scanCache[expected]
     doAssert selectedBssid == entry.bssid and selectedChannel == entry.channel
+    doAssert scanCachePendingBssid == selectedBssid
     doAssert selectedRssi == entry.rssi
     doAssert nimfwDbgScanCacheSelectedSlot == expected.uint32
     doAssert nimfwDbgScanCacheSelectedBssidLo == packBssidLo(addr scanCache[expected].bssid)
@@ -91,6 +93,118 @@ proc storeAgain(entry: ScanCacheItem) =
   beacon[WifiBeaconCipherOff] = entry.cipher
   scanCacheStore(addr beacon[0])
 '''
+
+
+@pytest.mark.parametrize("mode", ["checked", "release"])
+def test_station_join_uses_only_one_successful_scan_hint(tmp_path: Path, mode: str) -> None:
+    manager = (SUPPORT / "mgmr_facade_parts/scan_connect.nim").read_text()
+    manager = manager.split("\nproc wifi_mgmr_sta_disconnect*", 1)[0]
+    run_program(tmp_path, mode, source() + r'''
+type
+  ScanCompleteCb = proc()
+  MacAddr = array[6, uint8]
+  Netif = object
+const ScanActive = 1'u8
+const WifiConnectDefault = 1'u32
+const WifiConnectPmfCapable = 2'u32
+var
+  staEnabled = true
+  busy: bool
+  recoveryStatus, submitStatus: cint
+  scanDoneCount, scanItemCount, scanConfirmationStatus: uint32
+  connectDone, disconnectDone, lastStatusCode, lastReasonCode: int32
+  sm_state: uint16
+  nimfwDbgStaConnectStage, nimfwDbgStaConnectResult, nimfwDbgStaConnectState: uint32
+  nimfwDbgStaConnectFreq, nimfwDbgStaConnectBssidLo, nimfwDbgStaConnectBssidHi: uint32
+  lastBssid: MacAddr
+  lastFreq: uint16
+  hasBssid: bool
+proc beginStationControl(): bool =
+  if busy: return false
+  busy = true
+  true
+proc endStationControl() = busy = false
+proc wifi_mgmr_recover_terminal_connect_failure(joinAfterScan = false): cint = recoveryStatus
+proc staIface(): pointer = nil
+proc ifaceNetif(iface: pointer): pointer = nil
+proc hwPtr(): pointer = nil
+proc scanDiagReset() = discard
+proc vendorPutsRaw(s: cstring) = discard
+proc vendorPrintU32(n, base: uint32) = discard
+proc loadU32(p: pointer; offset: uint): uint32 = copyMem(addr result, ptrAt(p, offset), 4)
+proc loadU16(p: pointer; offset: uint): uint16 = copyMem(addr result, ptrAt(p, offset), 2)
+proc c_strlen(s: cstring): csize_t = s.len.csize_t
+proc wifiChannelToFreq(ch: uint8): uint16 = (2407 + 5 * ch.int).uint16
+proc bl_main_scan(nif: ptr Netif; channels: ptr uint16; count: uint16; bssid: ptr MacAddr;
+                  ssid: pointer; scanMode: uint8; duration: uint32): cint = submitStatus
+proc bl_main_connect(s: ptr uint8; slen: cint; psk: ptr uint8; plen: cint;
+                     pmk: ptr uint8; mlen: cint; bssid: ptr uint8; band: uint8;
+                     freq: uint16; flags: uint32): cint =
+  hasBssid = bssid != nil
+  if hasBssid: lastBssid = cast[ptr MacAddr](bssid)[]
+  lastFreq = freq
+  0
+''' + manager + r'''
+var iface: pointer
+proc join(bssid: ptr uint8 = nil) =
+  doAssert wifi_mgmr_sta_connect(addr iface, "mesh", nil, nil, bssid, 0, 6) == 0
+  doAssert lastFreq == 2437
+proc populate() =
+  doAssert wifi_mgmr_scan(nil, nil) == 0
+  candidate(0, -30, 0)
+  scanConfirmationStatus = 0
+  scanDoneCount = 1
+
+populate()
+let prior = scanCache
+busy = true
+doAssert wifi_mgmr_scan(nil, nil) == -16
+busy = false
+join()
+doAssert not hasBssid and scanCache == prior and not scanCacheConnectPending
+
+populate()
+recoveryStatus = -5
+doAssert wifi_mgmr_scan(nil, nil) == -5
+recoveryStatus = 0
+join()
+doAssert not hasBssid and scanCache == prior
+
+doAssert wifi_mgmr_scan(nil, nil) == 0
+scanConfirmationStatus = 0
+scanDoneCount = 1
+join()
+doAssert not hasBssid
+
+doAssert wifi_mgmr_scan(nil, nil) == 0
+candidate(0, -30, 0)
+scanDoneCount = 1 # Notification without an actual confirmation is insufficient.
+join()
+doAssert not hasBssid and scanCache == prior
+
+populate()
+scanConfirmationStatus = 1
+join()
+doAssert not hasBssid and scanCache == prior
+
+submitStatus = -12
+doAssert wifi_mgmr_scan(nil, nil) == -12
+candidate(0, -30, 0)
+scanConfirmationStatus = 0
+scanDoneCount = 1
+join()
+doAssert not hasBssid
+submitStatus = 0
+
+populate()
+join()
+doAssert hasBssid and lastBssid == prior[0].bssid and scanCacheConnectPending
+join()
+doAssert not hasBssid and not scanCacheConnectPending and scanCache == prior
+var explicit = [2'u8, 5, 6, 7, 8, 9]
+join(addr explicit[0])
+doAssert hasBssid and lastBssid == explicit
+''', defines=("bl808WifiConnectCacheHint",))
 
 
 CASES = {
@@ -142,7 +256,7 @@ setup()
 candidate(0, -70, 0)
 for attempt in 1 .. 300:
   select(0, 1)
-  scanCacheRecordConnectResult(false)
+  scanCacheRecordConnectResult(addr scanCache[0].bssid, WLAN_FW_AUTHENTICATION_FAIILURE)
   let expected = min(attempt, 255).uint8
   doAssert scanCache[0].failCount == expected
   doAssert scanCacheFailureLookup(addr scanCache[0].bssid[0]) == expected
@@ -151,11 +265,11 @@ for attempt in 1 .. 300:
   if attempt mod 25 == 0:
     let entry = scanCache[0]
     scanCacheReset()
-    doAssert scanCacheSelectedSlot == -1
+    doAssert not scanCacheConnectPending
     storeAgain(entry)
     doAssert scanCache[0].failCount == expected
   select(0, 1, addr scanCache[0].bssid[0], 6)
-scanCacheRecordConnectResult(true)
+scanCacheRecordConnectResult(addr scanCache[0].bssid, WLAN_FW_SUCCESSFUL)
 doAssert scanCache[0].failCount == 0
 doAssert scanCacheFailureLookup(addr scanCache[0].bssid[0]) == 0
 let entry = scanCache[0]
@@ -163,6 +277,50 @@ scanCacheReset()
 storeAgain(entry)
 select(0, 1)
 doAssert scanCache[0].failCount == 0
+''',
+    "attempt_identity": r'''
+setup()
+for slot in 0 ..< scanCache.len:
+  candidate(slot, -60, 0, ssid = "other")
+candidate(7, -90, 0)
+select(7, 1)
+var selected = scanCache[7]
+var other = scanCache[0]
+other.bssid[1] = 9
+storeAgain(other) # Reuses the weakest slot before the result arrives.
+doAssert scanCache[7].bssid == other.bssid
+scanCacheRecordConnectResult(addr other.bssid, WLAN_FW_AUTHENTICATION_FAIILURE)
+doAssert scanCacheConnectPending
+scanCacheRecordConnectResult(addr selected.bssid, WLAN_FW_AUTHENTICATION_FAIILURE)
+doAssert not scanCacheConnectPending
+doAssert scanCache[7].failCount == 0
+doAssert scanCacheFailureLookup(addr other.bssid) == 0
+doAssert scanCacheFailureLookup(addr selected.bssid) == 1
+scanCacheRecordConnectResult(addr selected.bssid, WLAN_FW_AUTHENTICATION_FAIILURE)
+doAssert scanCacheFailureLookup(addr selected.bssid) == 1
+scanCacheReset()
+storeAgain(selected)
+doAssert scanCache[0].failCount == 1
+''',
+    "local_failure_does_not_penalize": r'''
+setup()
+candidate(0, -50, 0)
+candidate(1, -60, 0)
+let bssid = addr scanCache[0].bssid
+for status in [WLAN_FW_TX_AUTH_FRAME_ALLOCATE_FAIILURE,
+    WLAN_FW_TX_ASSOC_FRAME_ALLOCATE_FAIILURE,
+    WLAN_FW_CREATE_CHANNEL_CTX_FAILURE_WHEN_JOIN_NETWORK, WLAN_FW_ADD_STA_FAILURE,
+    WLAN_FW_CONNECT_ABORT_WHEN_JOINING_NETWORK]:
+  select(0, 2)
+  scanCacheRecordConnectResult(bssid, status.uint16)
+  doAssert not scanCacheConnectPending
+  doAssert nimfwDbgScanCacheFailureMarks == 0
+  doAssert scanCacheFailureLookup(bssid) == 0
+scanCacheRecordConnectResult(bssid, WLAN_FW_AUTHENTICATION_FAIILURE)
+doAssert scanCacheFailureLookup(bssid) == 0
+select(0, 2)
+scanCacheRecordConnectResult(bssid, WLAN_FW_AUTHENTICATION_FAIILURE)
+select(1, 2)
 ''',
     "history_replacement": r'''
 for success in [false, true]:

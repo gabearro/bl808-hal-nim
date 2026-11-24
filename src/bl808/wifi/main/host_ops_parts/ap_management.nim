@@ -1,10 +1,23 @@
 proc bl_main_apm_start*(ssid, password: cstring; channel: cint; hiddenSsid: uint8;
                         bcnInt: uint16): cint {.exportc, cdecl.} =
   var cfm: array[SizeApmStartCfm, uint8]
-  zero(addr cfm[0], cfm.len)
   let apVif = vifAt(BlVifAp)
+  if loadU8(apVif, BlVifUpOff) == 0: return -Eio
+  let firmwareIndex = loadU8(apVif, BlVifVifIdxOff)
+  cfm[0] = 0xFF
+  when defined(bl808WifiApHttpSmoke):
+    nimfwApHostResult[4] = regRead(ClicMtimeBase)
   result = bl_send_apm_start_req(hwPtr(), cast[ptr ApmStartCfm](addr cfm[0]), ssid, password,
-                                 channel, loadU8(apVif, BlVifVifIdxOff), hiddenSsid, bcnInt)
+                                 channel, firmwareIndex, hiddenSsid, bcnInt)
+  when defined(bl808WifiApHttpSmoke):
+    nimfwApHostResult[5] = regRead(ClicMtimeBase)
+    nimfwApHostResult[2] = cast[uint32](result)
+    nimfwApHostResult[3] = 0x10000'u32 or cfm[0].uint32 or (cfm[1].uint32 shl 8)
+    nimfw_ap_snapshot()
+  if result != 0: return
+  if loadU8(addr cfm[0], ApmStartStatusOff) != CoOk or
+      loadU8(addr cfm[0], ApmStartVifIdxOff) != firmwareIndex:
+    return -Eio
   let bcmcIdx = loadU8(addr cfm[0], ApmStartBcmcIdxOff)
   if bcmcIdx.uint < NxRemoteStaStoreMax:
     storeU8(apVif, BlVifFixedStaIdxOff, bcmcIdx)
@@ -14,7 +27,9 @@ proc bl_main_apm_start*(ssid, password: cstring; channel: cint; hiddenSsid: uint
     storeU8(sta, BlStaQosOff, 1'u8)
 
 proc bl_main_apm_stop*(): cint {.exportc, cdecl.} =
-  bl_send_apm_stop_req(hwPtr(), loadU8(vifAt(BlVifAp), BlVifVifIdxOff))
+  let apVif = vifAt(BlVifAp)
+  if loadU8(apVif, BlVifUpOff) == 0: return -Eio
+  bl_send_apm_stop_req(hwPtr(), loadU8(apVif, BlVifVifIdxOff))
 
 proc bl_main_apm_sta_cnt_get*(staCnt: ptr uint8): cint {.exportc, cdecl.} =
   if staCnt == nil:

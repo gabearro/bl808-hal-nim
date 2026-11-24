@@ -11,7 +11,6 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 PLATFORM = r"""
-proc txlFrameCallbackCurrent(): bool = true
 const MAX_VIFS = 2
 const STA_INFO_TAB_ENTRIES = 7
 type
@@ -19,8 +18,12 @@ type
     expiry: uint32
   Vif = object
     state, vifIdx, staIdx, probeCount, psNullRetry: uint8
-    flags, tbttCount, beaconTimeoutBase: uint32
+    flags, tbttCount, beaconTimeoutBase, beaconRxCount: uint32
     tbttTimer, keepAliveTimer: Timer
+  VifChannelView = Vif
+  ProbeCallbackScope = object
+    tracked: bool
+    vif: uint8
   Sta = object
     initialRateConfig: uint32
     valid, instNbr: uint8
@@ -49,6 +52,10 @@ var
   rxVifEpochs: array[2, uint32]
   stationEpochs: array[7, uint32]
   txResetEpoch: uint32
+  mmTimerMutationTop: ptr MmTimerMutation
+  mmBeaconProbeEpochs, mmTrafficProbeEpochs: array[MAX_VIFS, uint32]
+  txActiveFrameCallback: ptr ProbeCallbackScope
+  callbackCurrent: bool
   interruptsEnabled = true
 const MACHW_TIMLO_REG = 0x24B00120'u
 
@@ -59,6 +66,7 @@ proc staDeleteEpoch(i: uint8): uint32 =
   if i < stationEpochs.len.uint8: stationEpochs[i] else: 0
 proc txlResetting(): bool = false
 proc txlVifIsRetiring(i: uint8): bool = false
+proc txlFrameCallbackCurrent(): bool = callbackCurrent
 proc irqSave(): uint32 =
   result = interruptsEnabled.uint32 * 8
   interruptsEnabled = false
@@ -89,6 +97,11 @@ proc mm_timer_set(timer: ptr Timer; expiry: uint32) =
     doAssert timer == addr currentVif.keepAliveTimer
     actions.add(("keepalive", expiry))
   timer.expiry = expiry
+proc mmTimerSetLocked(timer: pointer; expiry, saved: uint32) =
+  doAssert not interruptsEnabled
+  irqRestore(saved)
+  try: mm_timer_set(cast[ptr Timer](timer), expiry)
+  finally: discard irqSave()
 proc vif_mgmt_bcn_to_prog(vif: pointer) =
   doAssert vif == currentVif
   actions.add(("beacon", 0'u32))
@@ -104,7 +117,6 @@ proc ps_check_tbtt(vif: pointer) =
   actions.add(("ps", 0'u32))
 proc txl_frame_send_null_frame(sta: uint8; callback: pointer; arg: uint32): uint8 =
   doAssert sta == currentVif.staIdx
-  doAssert arg == pointerAddrU32(currentVif)
   actions.add(("null", sta.uint32))
   lastCallback = callback
   lastCallbackArg = arg
@@ -115,12 +127,21 @@ proc wifi_hosal_pm_post_event(event, value: uint32; arg: pointer) =
 proc mm_send_connection_loss_ind(vif: pointer; reason: uint16) =
   doAssert vif == currentVif
   actions.add(("loss", reason.uint32))
+proc mmPublishConnectionLoss(vif: pointer; reason: uint16; epoch: ptr uint32) =
+  let freshness = if reason == 22: mmTrafficProbeEpochs[currentVif.vifIdx]
+                  else: mmBeaconProbeEpochs[currentVif.vifIdx]
+  doAssert epoch != nil and epoch[] == freshness
+  mm_send_connection_loss_ind(vif, reason)
 proc ps_enable_cfm(vif: pointer; status: uint32) {.cdecl.} = discard
 proc ps_disable_cfm(vif: pointer; status: uint32) {.cdecl.} = discard
 proc reset() =
   actions.setLen(0)
   lastCallback = nil
   lastCallbackArg = 0
+  callbackCurrent = true
+  txActiveFrameCallback = nil
+  mmBeaconProbeEpochs = default(typeof(mmBeaconProbeEpochs))
+  mmTrafficProbeEpochs = default(typeof(mmTrafficProbeEpochs))
   mm = default(MmEnv)
   ps = default(PsEnv)
   params = default(PsParams)
@@ -142,6 +163,30 @@ currentVif = addr loggedVif
 loggingEnabled = true
 tbttCallback(addr loggedVif)
 doAssert logCalls == 1 and actions.len == 0
+
+# Queue rejection is not liveness evidence. A long miss streak must still
+# request a probe on the first eligible TBTT after the queue recovers.
+block:
+  reset()
+  var vif = Vif(state: 1, vifIdx: 1, staIdx: 3, probeCount: 100)
+  currentVif = addr vif
+  onChannel = true
+  sendResult = 1
+  for missed in 101 .. 255:
+    actions.setLen(0)
+    tbttCallback(addr vif)
+    doAssert vif.probeCount.int == missed and actions[^1] == ("null", 3'u32)
+  sendResult = 0
+  onChannel = false
+  actions.setLen(0)
+  tbttCallback(addr vif)
+  doAssert vif.probeCount == 255 and actions[^1] == ("channel", 0'u32)
+  onChannel = true
+  actions.setLen(0)
+  tbttCallback(addr vif)
+  doAssert actions[^1] == ("null", 3'u32), "counter wrap suppressed a due probe"
+  doAssert vif.probeCount == 255 and mmBeaconProbeEpochs[1] == 0
+
 for active in [false, true]:
   for onChan in [false, true]:
     for priorProbe in [0'u8, 48, 49, 50, 98, 99, 100, 101, 254, 255]:
@@ -170,11 +215,12 @@ for active in [false, true]:
                 doAssert vif.tbttCount == 0
                 if onChan:
                   expected.add(("ps", 0'u32))
-                  let nextProbe = priorProbe + 1
+                  let nextProbe = min(priorProbe.int + 1, 255).uint8
                   doAssert vif.flags == 0x81 and vif.probeCount == nextProbe
                   if nextProbe > 100:
                     expected.add(("null", 3'u32))
-                    doAssert lastCallback == cast[pointer](mm_ap_probe_cfm)
+                    doAssert lastCallback == cast[pointer](mmStaBeaconProbeCfm)
+                    doAssert lastCallbackArg == mmBeaconProbeEpochs[1]
                   elif nextProbe >= 50:
                     expected.add(("pm", 3'u32 shl 16))
                 else:
@@ -186,26 +232,61 @@ for active in [false, true]:
               doAssert vif.state == active.uint8 and nimFwWpaPendingMask == wpaPending
 
 # Only successful TX confirmation clears the liveness probe count.
-for status in [0'u32, 1, 0x00800000, 0x80800000'u32]:
+for status in [0'u32, 1, 0x00800000, 0x80010700'u32, 0x80800000'u32]:
   reset()
   var vif = Vif(probeCount: 103)
   currentVif = addr vif
   mm_ap_probe_cfm(addr vif, status)
-  if (status and 0x800000) != 0:
+  if (status and 0x80000000'u32) == 0:
+    doAssert vif.probeCount == 103 and actions.len == 0
+  elif (status and 0x800000) != 0:
     doAssert vif.probeCount == 0 and actions.len == 0
   else:
     doAssert vif.probeCount == 103 and actions == @[("loss", 16'u32)]
 
+# Hold a real TBTT callback across a saturated count. A fresh beacon or ACK,
+# an expired TX session, or a software-only retirement invalidates it.
+for event in 0 .. 4:
+  reset()
+  var vif = Vif(state: 1, vifIdx: 1, staIdx: 3, probeCount: 254)
+  currentVif = addr vif
+  onChannel = true
+  mmBeaconProbeEpochs[1] = 0x80000007'u32
+  tbttCallback(addr vif)
+  doAssert vif.probeCount == 255
+  let complete = cast[proc(p: pointer; status: uint32) {.cdecl.}](lastCallback)
+  let arg = cast[pointer](lastCallbackArg.uint)
+  tbttCallback(addr vif)
+  doAssert vif.probeCount == 255 and mmBeaconProbeEpochs[1] == 0x80000007'u32
+  actions.setLen(0)
+  var scope = ProbeCallbackScope(tracked: true, vif: 1)
+  txActiveFrameCallback = addr scope
+  case event
+  of 1: # A real beacon, followed by enough TBTTs to begin a new miss streak.
+    mmResetBeaconProbeCount(addr vif)
+    vif.probeCount = 101
+  of 2:
+    complete(arg, 0x80800000'u32) # Another in-flight probe produced an ACK.
+    doAssert vif.probeCount == 0 and mmBeaconProbeEpochs[1] == 0x80000008'u32
+  of 3: callbackCurrent = false
+  else: discard
+  complete(arg, if event == 4: 0x40000000'u32 else: 0x80010700'u32)
+  doAssert actions == (if event == 0: @[("loss", 16'u32)] else: @[])
+  doAssert interruptsEnabled
+
 # The shared AP probe budget is decremented only when initially nonzero.
 for budget in [0'u32, 1, 2, 10, 0xFFFFFFFF'u32]:
-  for status in [0'u32, 0x00800000]:
+  for status in [0'u32, 0x00800000, 0x40000000, 0x80010700'u32, 0x80800000'u32]:
     reset()
     var vif: Vif
     currentVif = addr vif
     mm.keepAliveLimit = budget
     macNow = 0x12345678
     mm_ap_traffic_probe_cfm(addr vif, status)
-    if status != 0:
+    if (status and 0x80000000'u32) == 0:
+      doAssert mm.keepAliveLimit == budget and actions.len == 0
+      doAssert vif.beaconTimeoutBase == 0
+    elif (status and 0x00800000) != 0:
       doAssert mm.keepAliveLimit == 10 and vif.beaconTimeoutBase == macNow
       doAssert actions.len == 0
     elif budget == 0:
@@ -261,7 +342,9 @@ def test_keepalive_timers_and_retry_boundaries(tmp_path: Path) -> None:
 
     procedures = "\n".join([
         procedure(kernel, "mmCaptureVif", "\nproc mmVifCurrent"),
-        procedure(kernel, "mmVifCurrent", "\nproc mm_send_connection_loss_ind"),
+        procedure(kernel, "mmVifCurrent", "\nproc mmConnLossTagAt"),
+        procedure(kernel, "mmTimerActiveDelivery", "\nproc mmStaTimerCurrent"),
+        procedure(kernel, "mmResetBeaconProbeCount", "\nproc mmCheckBeaconFrame"),
         procedure(kernel, "mmStaTimerCurrent", "\nproc mm_sta_tbtt"),
         procedure(kernel, "mm_ap_probe_cfm*", "\nproc mm_bcn_transmitted*"),
         procedure(kernel, "mm_sta_tbtt*", "\nproc mm_tbtt_evt*"),
@@ -273,9 +356,9 @@ def test_keepalive_timers_and_retry_boundaries(tmp_path: Path) -> None:
     )
     source = tmp_path / "keepalive.nim"
     layout = (base / "layout_types.nim").read_text()
-    identity = re.search(r"(?ms)^  MmVifIdentity\b.*?(?=^  \w|\Z)", layout)
-    assert identity
-    source.write_text("type\n" + identity.group(0) + PLATFORM + debug + procedures + CHECKS)
+    types = "".join(re.search(rf"(?ms)^  {name}\b.*?(?=^  \w|\Z)", layout).group()
+                    for name in ("MmVifIdentity", "MmTimerMutation"))
+    source.write_text("type\n" + types + PLATFORM + debug + procedures + CHECKS)
     result = subprocess.run(
         [nim, "c", "-r", "--skipParentCfg:on", "--skipProjCfg:on", "--skipUserCfg:on",
          "--checks:on", f"--nimcache:{tmp_path / 'nimcache'}", f"-o:{tmp_path / 'test'}", str(source)],

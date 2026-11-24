@@ -89,7 +89,8 @@ for amp in [0'u32, 1, 16, 256, 1023, 2047, 2048, high(uint32)]:
 @pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
 @pytest.mark.parametrize("bz", [False, True])
 def test_initial_setup_preserves_vendor_fields_and_write_order(tmp_path: Path, mode: str, bz: bool) -> None:
-    code = setup_source(("startRfPriTxDfeForCal", "startRfPriRxDfeForCal")) + r'''
+    code = setup_source(("programRfPriModeRegisters", "startRfPriTxDfeForCal",
+                         "startRfPriRxDfeForCal")) + r'''
 var initialArgs: seq[tuple[amp: uint32, hi, lo: int32]]
 proc tuneRfTxcalSingenPower(amp: uint32; hi, lo: int32): uint32 =
   initialArgs.add((amp, hi, lo))
@@ -113,12 +114,13 @@ for vector in 0 ..< 1000:
   put(0x2C, 0, 0)
   put(0x30, 0xFFFFFFFF'u32, 2)
   put(0x30, 0xCEFFF8FF'u32, 0xCEFF7800'u32)
-  trace.add((0'u, 1'u32))
-  put(0x23C, 0xFFFFFFFF'u32, 0x40000)
+  if Bz:
+    trace.add((0'u, 1'u32))
+    put(0x23C, 0xFFFFFFFF'u32, 0x40000)
   put(0x220, 0xFFFFFE7F'u32, 0)
   put(0x220, 0xFFFFE7FF'u32, 0x1082)
   put(0x220, 0xFFFFFFEF'u32, 0x100)
-  put(0x23C, 0xFFFFFFFF'u32, 0x40000)
+  if Bz: put(0x23C, 0xFFFFFFFF'u32, 0x40000)
   put(0x220, 0xFFFFFF9F'u32, 0)
   put(0x220, 0xFFFFFFFF'u32, 0x21)
   put(0x220, 0xFFFFFFFF'u32, 0x40)

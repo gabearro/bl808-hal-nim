@@ -1,0 +1,10 @@
+package ox64:records@0.2.0;
+
+world record-demo {
+  record pair {
+    left: u32,
+    right: u32,
+  }
+  export sum-pair: func(value: pair) -> u32;
+  export make-pair: func(left: u32, right: u32) -> pair;
+}

@@ -4,6 +4,21 @@
 
 include rate_duration_tables
 
+when defined(bl808m0):
+  proc rcInvalidateRateSamples(stats: pointer) =
+    let offset = cast[uint](stats) - cast[uint](addr rcStaStatsPool[0])
+    if offset < rcRateSampleEpoch.len.uint * RC_STATS_SIZE.uint and
+        offset mod RC_STATS_SIZE.uint == 0:
+      let staIdx = offset div RC_STATS_SIZE.uint
+      rcRateSampleEpoch[staIdx] = rcRateSampleEpoch[staIdx] + 1'u16
+
+  proc rcHasDuplicateSampleEncoding(stats: pointer; sampleCount: int): bool =
+    for index in 1 ..< sampleCount:
+      let encoding = rcRateConfig(stats, index) and 0x3FFF'u16
+      for previous in 0 ..< index:
+        if (rcRateConfig(stats, previous) and 0x3FFF'u16) == encoding:
+          return true
+
 proc rc_count_samples(stats: pointer): uint16 =
   if stats == nil:
     return 0
@@ -34,24 +49,21 @@ proc rc_seed_rate_table(stats: pointer): bool =
   let initial = rc_get_initial_rate_config(stats)
   if lowest == 0xFFFF'u16 or initial == 0xFFFF'u16:
     return false
+  when defined(bl808m0):
+    rcInvalidateRateSamples(stats)
   for rateEntryIndex in 0 ..< requested:
     rcSetRateConfig(stats, rateEntryIndex, 0xFFFF'u16)
   rcSetRateConfig(stats, 0, lowest)
-  if requested == 1:
-    rcSetRateConfig(stats, 0, initial)
-    return true
-  let reserveInitial = initial != lowest
-  let fillEnd = if reserveInitial: requested - 1 else: requested
-  if reserveInitial:
-    rcSetRateConfig(stats, requested - 1, initial)
+  # rc.o:rc_init reserves both endpoints even if they name the same rate.
+  let fillEnd = requested - 1
+  rcSetRateConfig(stats, fillEnd, initial)
   var sampleRateEntryIndex = 1
   while sampleRateEntryIndex < fillEnd:
     let randomRate = rc_pick_non_duplicate_rate(stats)
     if randomRate == 0xFFFF'u16:
-      # Keep a valid, compact table if fewer distinct samples are available.
-      let retained = sampleRateEntryIndex + reserveInitial.int
-      if reserveInitial:
-        rcSetRateConfig(stats, sampleRateEntryIndex, initial)
+      # Keep both endpoints when compacting an exhausted random fill.
+      let retained = sampleRateEntryIndex + 1
+      rcSetRateConfig(stats, sampleRateEntryIndex, initial)
       for unused in retained ..< requested:
         rcSetRateConfig(stats, unused, 0xFFFF'u16)
       caps.sampleCount = retained.uint16
@@ -59,6 +71,91 @@ proc rc_seed_rate_table(stats: pointer): bool =
     rcSetRateConfig(stats, sampleRateEntryIndex, randomRate)
     inc sampleRateEntryIndex
   true
+
+proc rcKeepCckFallbackReachable(stats: pointer): bool =
+  let caps = rcRateCapabilities(stats)
+  # The BL808 default budget reaches two four-attempt rate slots. Change
+  # the tracked index, not just the DMA rate word.
+  const cck1Mbps = 0x0400'u16
+  const usableProbability = 0x1999'u16
+  const likelySuccess = 0x8000'u16
+  if caps.fixedRate != 0xFFFF'u16 or caps.formatMod != RC_FORMATMOD_HT_MF or
+      (caps.legacyRateMap and 1) == 0 or
+      (rcU8(stats, RCS_ANOTHER_FLAG) and 3) != 0:
+    return false
+  let primary = rcRetryStep(stats, 0)
+  let second = rcRetryStep(stats, 1)
+  let lowest = rcRetryStep(stats, 3)
+  let count = caps.sampleCount
+  if count > RC_MAX_RATE_ENTRIES.uint16 or
+      primary.rateIdx >= count or second.rateIdx >= count or lowest.rateIdx >= count:
+    return false
+  let bestSample = rcRateStats(stats, primary.rateIdx.int)
+  let secondSample = rcRateStats(stats, second.rateIdx.int)
+  let lowestSample = rcRateStats(stats, lowest.rateIdx.int)
+  if lowestSample.rateConfig != cck1Mbps or bestSample.rateConfig == cck1Mbps or
+      secondSample.rateConfig == cck1Mbps:
+    return false
+  let leadingProbability = max(bestSample.probability, secondSample.probability)
+  let coldNonCck = leadingProbability < usableProbability and
+    not is_cck_group(bestSample.rateConfig.uint32) and
+    not is_cck_group(secondSample.rateConfig.uint32)
+  var fallbackIdx = lowest.rateIdx
+  var fallbackProbability = 0'u16
+  if leadingProbability < likelySuccess:
+    for index in 0 ..< count.int:
+      let sample = rcRateStats(stats, index)
+      if sample.oldProbAvailable != 0 and sample.probability >= likelySuccess and
+          sample.probability > fallbackProbability and
+          is_cck_group(sample.rateConfig.uint32) and
+          rc_check_valid_rate(stats, sample.rateConfig) != 0:
+        fallbackIdx = index.uint16
+        fallbackProbability = sample.probability
+  if not coldNonCck and fallbackProbability == 0:
+    return false
+  second.rateIdx = fallbackIdx
+  second.throughput =
+    if fallbackIdx == lowest.rateIdx: lowest.throughput
+    else: rc_calc_tp(stats, fallbackIdx.uint8)
+  true
+
+when defined(bl808m0):
+  proc rcInvalidateTrialTag(staIdx: uint8) {.inline.} =
+    if staIdx < rcTrialSerial.len.uint8:
+      # Preserve the serial so arming the next trial cannot reuse it.
+      rcTrialSerial[staIdx] = rcTrialSerial[staIdx] or 0x8000_0000'u32
+
+  proc rcArmedRateTrial(staIdx: uint8; stats: pointer; includeCompleted = false):
+      tuple[tag: uint32, config: uint32, sampleIndex: uint16] =
+    if staIdx >= rcTrialSerial.len.uint8 or stats == nil:
+      return
+    let serial = rcTrialSerial[staIdx]
+    if serial == 0 or (serial and 0x8000_0000'u32) != 0:
+      return
+    let control = rcTrialControl(stats)
+    let caps = rcRateCapabilities(stats)
+    if (control.status != 2 and (not includeCompleted or control.status != 3)) or
+        caps.fixedRate != 0xFFFF or
+        caps.sampleCount > RC_MAX_RATE_ENTRIES.uint16:
+      return
+    let logicalSlot = ((control.info shr 1) and 1).int
+    let index = rcRetryStep(stats, logicalSlot).rateIdx
+    if index >= caps.sampleCount:
+      return
+    let physicalSlot = (logicalSlot + 4 - (rcU8(stats, RCS_ANOTHER_FLAG) and 3).int) and 3
+    (serial shl 2 or physicalSlot.uint32,
+     rcRateConfig(stats, index.int).uint32 and 0x3FFF, index)
+
+  proc rcRejectUnprogrammedTrial(staIdx: uint8; stats: pointer;
+                                rateWords: array[4, uint32]) =
+    let trial = rcArmedRateTrial(staIdx, stats)
+    if trial.tag == 0:
+      return
+    let programmed = rateWords[(trial.tag and 3).int] and 0x8000_3FFF'u32
+    if programmed != (0x8000_0000'u32 or trial.config):
+      # Request chain restoration without crediting a trial that cannot run.
+      rcInvalidateTrialTag(staIdx)
+      rcStatsCounters(stats).updateStage = 3
 
 proc rcTryInitStation(staEntry: pointer): bool =
   ## Initialize capabilities, samples, and the station's hardware TX policy.
@@ -84,6 +181,9 @@ proc rcTryInitStation(staEntry: pointer): bool =
 
   let stats = cast[pointer](cast[uint](addr rcStaStatsPool[0]) +
     infoIdx.uint * RC_STATS_SIZE.uint)
+  when defined(bl808m0):
+    rcInvalidateTrialTag(infoIdx)
+    rcInvalidateRateSamples(stats)
   sta.rcStats = stats
   let ntx = phy_get_ntx()
   var bufAddr = ntx.uint32 shl 14
@@ -104,14 +204,24 @@ proc rcTryInitStation(staEntry: pointer): bool =
     let peerMcs = cast[pointer](cast[uint](addr sta.vhtCaps[0]) +
       (STA_HT_MCS_SET_OFF - STA_HT_CAP_INFO_OFF).uint)
     let peerNss = me_11n_nss_max(peerMcs)
-    let localNss = me_11n_nss_max(cast[pointer](addr me_env[11]))
+    let localNss = me_11n_nss_max(addr meEnvView().htCaps[3])
     caps.maxNss = min(peerNss, localNss)
     if caps.maxNss >= caps.mcsBitmaps.len.uint8:
       assert_err("rc.c", "rc.c", 0x89F.cint)
       return false
     discard c_memcpy(addr caps.mcsBitmaps[0], peerMcs, 4.csize_t)
-    caps.mcsBitmaps[0] = 0xFF
-    caps.maxMcs = 7
+    let preserveStationRates = when defined(bl808WifiNativeWlanCalibration):
+      caps.maxNss == 0 and vifChannelForIdx(ownerVifIdx).vifType == VIF_TYPE_STA
+    else:
+      false
+    if preserveStationRates:
+      caps.mcsBitmaps[0] = caps.mcsBitmaps[0] and meEnvView().htCaps[3]
+      if caps.mcsBitmaps[0] == 0:
+        return false
+      caps.maxMcs = rcHighestBit(caps.mcsBitmaps[0])
+    else:
+      caps.mcsBitmaps[0] = 0xFF
+      caps.maxMcs = 7
 
   caps.lowestLegacyRate = me_legacy_ridx_min(caps.legacyRateMap.uint32)
   caps.highestLegacyRate = me_legacy_ridx_max(caps.legacyRateMap.uint32)
@@ -152,6 +262,9 @@ proc rcTryInitStation(staEntry: pointer): bool =
   rcAmpduStats(stats).averageLengthQ16 = 0x10000
   caps.fixedRate = 0xFFFF
   discard rc_update_stats(stats, 1)
+  when defined(bl808WifiNativeWlanCalibration):
+    if vifChannelForIdx(ownerVifIdx).vifType == VIF_TYPE_STA:
+      discard rcKeepCckFallbackReachable(stats)
   rcStatsCounters(stats).retryLimit = 5
 
   let policy = txPolicyAt(txPolicy)
@@ -212,14 +325,28 @@ proc rc_check*(staIdx: uint8) {.exportc, cdecl.} =
   let remaining = RC_UPDATE_INTERVAL + rcU32(stats, 0) - now
   var changed = false
   if cast[int32](remaining) < 0:
+    var previousRates: array[4, uint16]
+    for step in 0 ..< previousRates.len:
+      let index = rcRetryStep(stats, step).rateIdx.int
+      if index < nRates:
+        previousRates[step] = rcRateStats(stats, index).rateConfig
     changed = rc_update_stats(stats, 0) != 0
+    # The vendor result compares indexes, but a sort can change the rates at
+    # those indexes. Refresh the DMA policy when the resolved rates change.
+    if not changed:
+      for step, rate in previousRates:
+        let index = rcRetryStep(stats, step).rateIdx.int
+        if index < nRates and rate != rcRateStats(stats, index).rateConfig:
+          changed = true
+          break
     control.status = 0
     control.softwareRetryStep = 0
     control.info = control.info and not 0x10'u8
     rcU32(stats, 0) = regRead(MACHW_TIMLO_REG)
 
   if control.status in [1'u8, 3'u8]:
-    for step in 0 ..< 4:
+    let consumedSteps = if control.status == 1'u8: 3 else: 2
+    for step in 0 ..< consumedSteps:
       if rcRetryStep(stats, step).rateIdx.int >= nRates:
         control.status = 0
         return
@@ -251,7 +378,7 @@ proc rc_check*(staIdx: uint8) {.exportc, cdecl.} =
         var throughput = 0'u32
         if not ht:
           let bestDuration = rc_get_duration(rcRateStats(stats, bestIndex.int).rateConfig)
-          useFirst = sampleDuration > bestDuration and sampleStats.sampleSkipped >= 20
+          useFirst = sampleDuration <= bestDuration or sampleStats.sampleSkipped >= 20
         else:
           let secondDuration = rc_get_duration(rcRateStats(stats, secondIndex.int).rateConfig)
           let minimumSkipped = if sampleStats.oldProbAvailable == 0:
@@ -276,6 +403,9 @@ proc rc_check*(staIdx: uint8) {.exportc, cdecl.} =
             useFirst = (sampleStats.retryCount and 0xF) > 9 or
               sampleStats.sampleSkipped.uint32 >= minimumSkipped
         if accepted:
+          when defined(bl808m0):
+            let nextSerial = (rcTrialSerial[staIdx] + 1) and 0x3FFF_FFFF'u32
+            rcTrialSerial[staIdx] = max(nextSerial, 1'u32)
           rc_install_trial(stats, sample, throughput, useFirst)
           changed = true
         else:
@@ -298,6 +428,11 @@ proc rc_check*(staIdx: uint8) {.exportc, cdecl.} =
     control.status = 0
     changed = true
 
+  when defined(bl808WifiNativeWlanCalibration):
+    if control.status == 0 and sta.instNbr < MAX_VIFS.uint8 and
+        vifChannelForIdx(sta.instNbr).vifType == VIF_TYPE_STA and
+        rcKeepCckFallbackReachable(stats):
+      changed = true
   if changed:
     sta.txPolicyUpdateFlags[0] = sta.txPolicyUpdateFlags[0] or StaTxPolicyUpdateRateControl
 
@@ -330,16 +465,11 @@ proc rc_calc_tp*(stats: pointer; sampleIdx: uint8): uint32 {.exportc, cdecl.} =
   # Vendor MUL is 32-bit; WEXTI a0,a0,16 then removes the Q16 fraction.
   return (tpStep * 0xF4240'u32) shr 16
 
-proc rc_update_counters*(staIdx: uint8; attemptCount, failureCount: uint32;
-                         txAmpdu, retryRequired: bool) {.exportc, cdecl.} =
-  ## Update rate control counters after TX attempt (112 instrs).
-  ## The vendor ABI takes attempts, failures, and two flags. This blob's
-  ## compiled body ignores both flags and distributes failures over four
-  ## retry stages, crediting successes only to the final stage.
+proc rcAccountCounters(staIdx: uint8; attemptCount, failureCount: uint32;
+                       sentRates: ptr array[4, uint16]; finishTrial: bool;
+                       sentSamples = 0'u16) =
   let saved = irqSave()
   defer: irqRestore(saved)
-  discard txAmpdu
-  discard retryRequired
   inc nimFwDbgRcUpdateCalls
   nimFwDbgRcUpdateMeta = staIdx.uint32
   nimFwDbgRcUpdateArgs =
@@ -364,17 +494,18 @@ proc rc_update_counters*(staIdx: uint8; attemptCount, failureCount: uint32;
   if sampleCount == 0 or sampleCount > RC_MAX_RATE_ENTRIES.uint16 or
       failureCount > attemptCount:
     return
-  var pendingAttempts = attemptCount
-  var pendingFailures = failureCount
-  for retrySlot in counters.retrySlots:
-    if pendingAttempts == 0:
-      break
-    if retrySlot.rateIdx >= sampleCount:
-      return
-    if pendingFailures <= 3:
-      break
-    pendingAttempts -= 4
-    pendingFailures -= 4
+  if sentRates == nil:
+    var pendingAttempts = attemptCount
+    var pendingFailures = failureCount
+    for retrySlot in counters.retrySlots:
+      if pendingAttempts == 0:
+        break
+      if retrySlot.rateIdx >= sampleCount:
+        return
+      if pendingFailures <= 3:
+        break
+      pendingAttempts -= 4
+      pendingFailures -= 4
 
   var attempts = attemptCount
   var failures = failureCount
@@ -383,16 +514,38 @@ proc rc_update_counters*(staIdx: uint8; attemptCount, failureCount: uint32;
   counters.totalSuccess = counters.totalSuccess + 1
   counters.totalAttempts = counters.totalAttempts + 1
 
-  # Iterate retry-chain slots at stats+128..stats+152. Each slot stores a
-  # rate-table index; the counters live in the selected rate entry.
-  var retrySlotIndex = 0
-  while retrySlotIndex < counters.retrySlots.len:
+  for retrySlotIndex in 0 ..< counters.retrySlots.len:
     if attempts == 0:
       break
 
-    let retryRateIndex = counters.retrySlots[retrySlotIndex].rateIdx
+    let slotAttempts = if failures > 3: 4'u32 else: attempts
+    let slotFailures = if failures > 3: 4'u32 else: failures
+    var retryRateIndex = counters.retrySlots[retrySlotIndex].rateIdx
+    if sentRates != nil:
+      let sentRate = sentRates[][retrySlotIndex]
+      let sample = (sentSamples shr (retrySlotIndex * 4)) and 0xF'u16
+      retryRateIndex = sampleCount
+      if sample <= sampleCount:
+        if sample != 0 and
+            (rcRateEntry(stats, sample - 1).rateConfig and 0x3FFF'u16) == sentRate:
+          retryRateIndex = sample - 1
+        else:
+          # Untagged words and unique samples moved by sorting have no usable index.
+          # Replacements and sorts with duplicates invalidate the generation instead.
+          for index in 0'u16 ..< sampleCount:
+            if (rcRateEntry(stats, index).rateConfig and 0x3FFF'u16) == sentRate:
+              if retryRateIndex != sampleCount:
+                retryRateIndex = sampleCount
+                break
+              retryRateIndex = index
+    if retryRateIndex >= sampleCount:
+      # A sample may have been replaced while the descriptor was queued.
+      # Advance to the next physical slot without crediting a different rate.
+      attempts -= slotAttempts
+      failures -= slotFailures
+      continue
+
     let retryRateEntry = rcRateEntry(stats, retryRateIndex)
-    var entryAttempts = retryRateEntry.attempts
     nimFwDbgRcUpdateSlot =
       retrySlotIndex.uint32 or
       (retryRateIndex.uint32 shl 8) or
@@ -402,25 +555,10 @@ proc rc_update_counters*(staIdx: uint8; attemptCount, failureCount: uint32;
     nimFwDbgRcUpdateCounts =
       retryRateEntry.attempts.uint32 or (retryRateEntry.successes.uint32 shl 16)
 
-    if failures > 3:
-      entryAttempts = entryAttempts + 4'u16
-      retryRateEntry.attempts = entryAttempts
-      attempts -= 4
-      failures -= 4
-    else:
-      let addAttempts32 = attempts and 0xFFFF'u32
-      let addAttempts = addAttempts32.uint16
-      entryAttempts = entryAttempts + addAttempts
-      retryRateEntry.attempts = entryAttempts
-
-      let oldSuccesses = retryRateEntry.successes
-      let newSuccesses32 =
-        (oldSuccesses.uint32 + addAttempts32 - (failures and 0xFFFF'u32)) and
-        0xFFFF'u32
-      let entrySuccesses = newSuccesses32.uint16
-      retryRateEntry.successes = entrySuccesses
-      attempts = 0
-      failures = 0
+    retryRateEntry.attempts += (slotAttempts and 0xFFFF'u32).uint16
+    retryRateEntry.successes += ((slotAttempts - slotFailures) and 0xFFFF'u32).uint16
+    attempts -= slotAttempts
+    failures -= slotFailures
 
     # Successful attempts cannot outnumber all attempts.
     if retryRateEntry.attempts < retryRateEntry.successes:
@@ -430,10 +568,7 @@ proc rc_update_counters*(staIdx: uint8; attemptCount, failureCount: uint32;
         ((retryRateIndex.uint32 and 0xFF'u32) shl 24) or
         ((retrySlotIndex.uint32 and 0xFF'u32) shl 28)
       assert_err("rc.c", "rc.c", 2040)
-      # The vendor assertion never returns; stop this update during recovery.
       return
-
-    inc retrySlotIndex
 
   # Check update stage and advance state machine
   let stage = counters.updateStage
@@ -445,10 +580,17 @@ proc rc_update_counters*(staIdx: uint8; attemptCount, failureCount: uint32;
     else:
       let newLimit = retryLimit - 1
       counters.retryLimit = newLimit
-  elif stage == 2:
+  elif stage == 2 and finishTrial:
     # Re-check with sta flags
     if (sta.txPolicyUpdateFlags[0] and StaTxPolicyUpdateRateControl) == 0:
       counters.updateStage = 3
+
+proc rc_update_counters*(staIdx: uint8; attemptCount, failureCount: uint32;
+                         txAmpdu, retryRequired: bool) {.exportc, cdecl.} =
+  ## Vendor ABI for reports that do not carry a submitted rate policy.
+  discard txAmpdu
+  discard retryRequired
+  rcAccountCounters(staIdx, attemptCount, failureCount, nil, not defined(bl808m0))
 
 proc rc_get_duration*(rateConfig: uint16): uint32 {.exportc, cdecl.} =
   ## Return the reference duration in nanoseconds for this packed rate.
@@ -503,6 +645,8 @@ proc rc_update_bw_nss_max*(staIdx: uint8, maxBandwidth: uint8, maxNss: uint8) {.
     rcU8(rcStats, RCS_NO_SS) = previousBandwidth
     rcU8(rcStats, RCS_GROUP_CNT) = previousNss
     return
+  when defined(bl808m0):
+    rcInvalidateTrialTag(staIdx)
   let nRates = rcU16(rcStats, RCS_N_RATES)
 
   # Invalidate probability/retry estimates, preserving packet counters.
@@ -537,23 +681,36 @@ proc rc_update_preamble_type*(staIdx: uint8, preambleType: uint8) {.exportc, cde
       (nRates == 0 or nRates > RC_MAX_RATE_ENTRIES):
     return
   caps.preambleType = preambleType
+  when defined(bl808m0):
+    rcInvalidateTrialTag(staIdx)
   if fixedRate != 0xFFFF'u16 or preambleType == 0:
     return
 
+  when defined(bl808m0):
+    rcInvalidateRateSamples(stats)
   var compactSamples = false
   for rateEntryIndex in 0 ..< nRates:
     let preambleRateEntry = rcRateStats(stats, rateEntryIndex)
     var rateConfig = preambleRateEntry.rateConfig
     if is_cck_group(rateConfig.uint32):
       rateConfig = rateConfig or 0x0400'u16
-      if rc_check_rate_duplicated(stats, rateConfig) != 0:
+      # Keep the lowest-rate fallback and ignore the entry being converted,
+      # but resolve collisions against the entire remaining table.
+      var duplicate = false
+      if rateEntryIndex != 0:
+        for otherIndex in 0 ..< nRates:
+          if otherIndex != rateEntryIndex and
+              rcRateStats(stats, otherIndex).rateConfig == rateConfig:
+            duplicate = true
+            break
+      if duplicate:
         let randomRate = rc_pick_non_duplicate_rate(stats)
         if randomRate == 0xFFFF'u16:
           compactSamples = true
         else:
           rateConfig = randomRate
-    rcClearRateEntryTransientStats(stats, rateEntryIndex.uint16)
-    preambleRateEntry.rateConfig = rateConfig
+      rcClearRateEntryTransientStats(stats, rateEntryIndex.uint16)
+      preambleRateEntry.rateConfig = rateConfig
 
   if compactSamples:
     # Preamble conversion can leave fewer distinct rates than samples.
@@ -587,8 +744,12 @@ proc rc_init_bcmc_rate*(staEntry: pointer, band: uint32) {.exportc, cdecl.} =
   ## Loads TX policy from sta+320, supported rates from sta+332.
   ## Builds rate config: band | (suppRates & 0x400 if band <= 3) | 0x20000000.
   ## Writes to 4 retry slots at txPolicy offsets 20, 24, 28, 32.
+  if staEntry == nil or band > 11:
+    return
   let sta = staInfoAt(staEntry)
   let txPolicy = sta.txPolicy
+  if txPolicy == nil:
+    return
   let policy = txPolicyAt(txPolicy)
   let suppRates = sta.supportedRatesBitmap
   var rateConfig = band
@@ -626,7 +787,7 @@ proc rc_check_fixed_rate_config*(stats: pointer, rateConfig: uint16): bool {.exp
 
   rc_check_valid_rate(stats, rateConfig) != 0
 
-# RC internal helper implementations (stubs for functions called by rc_init/rc_check)
+# RC internal helpers called by initialization and rate validation.
 proc rc_get_mcs_index*(rateConfig: uint16): uint8 {.exportc, cdecl.} =
   ## Extract MCS index from packed rate_config.
   ## Legacy (bits[12:11]==0): return bits[6:0]
@@ -661,9 +822,9 @@ proc rc_check_valid_rate*(stats: pointer, rateConfig: uint16): uint8 {.exportc, 
       return 0
     let rateMap = rcU16(stats, RCS_RATE_MAP)
     return ((rateMap shr legacyRateBitIndex) and 1).uint8
-  # Keep rejecting formats not supported by this BL808 implementation.
+  # The archive treats formats above HT as valid without a bitmap lookup.
   if formatMod notin [2'u16, 3'u16]:
-    return 0
+    return 1
   let nssIdx = rc_get_nss(rateConfig)
   let mcsIdx = rc_get_mcs_index(rateConfig)
   let bitmap = rcU8(stats, RCS_RATE_BITMAP + nssIdx.int)
@@ -704,7 +865,7 @@ proc rc_get_initial_rate_config*(stats: pointer): uint16 {.exportc, cdecl.} =
     rcHighestBit(bitmap).uint16
 
 proc rc_get_lowest_rate_config*(stats: pointer): uint16 {.exportc, cdecl.} =
-  ## HT falls back to CCK rate zero when available, otherwise to HT MCS zero.
+  ## HT falls back to 1 Mbps when available, otherwise to the lowest HT MCS.
   if stats == nil:
     return 0xFFFF'u16
   let caps = rcRateCapabilities(stats)
@@ -716,6 +877,12 @@ proc rc_get_lowest_rate_config*(stats: pointer): uint16 {.exportc, cdecl.} =
     if caps.lowestLegacyRate >= 16:
       return 0xFFFF'u16
     return caps.lowestLegacyRate.uint16
+  when defined(bl808WifiNativeWlanCalibration):
+    if caps.maxNss == 0:
+      for mcs in 0 ..< 8:
+        if (caps.mcsBitmaps[0] and (1'u8 shl mcs)) != 0:
+          return (caps.formatMod.uint16 shl 11) or mcs.uint16
+      return 0xFFFF'u16
   caps.formatMod.uint16 shl 11
 
 proc rc_new_random_rate*(stats: pointer): uint16 {.exportc, cdecl.} =
@@ -743,6 +910,7 @@ proc rc_new_random_rate*(stats: pointer): uint16 {.exportc, cdecl.} =
     var rate = (if legacyFallback: 0'u16 else: formatBits) or rateIndex.uint16
     if rateIndex == 0:
       return rate or 0x400'u16
+    # HT fallback carries bit 10 for every nonzero legacy index.
     if legacyFallback or rateIndex <= 3:
       rate = rate or (caps.preambleType.uint16 shl 10) or
         (randomBits and 0x400).uint16
@@ -828,7 +996,7 @@ proc rc_update_retry_chain*(stats: pointer, param: pointer) {.exportc, cdecl.} =
   rcRetryStep(stats, 3).throughput = tp[0]
 
 proc rc_get_new_sample_rates(stats: pointer): array[6, uint16] =
-  ## Candidate priority: random, other GI, then adjacent best/second-best rates.
+  ## Candidate priority: random, other GI, then neighbors of best and second-best.
   for candidate in result.mitems:
     candidate = 0xFFFF'u16
   let best = rcRateStats(stats, rcRetryStep(stats, 0).rateIdx.int).rateConfig
@@ -854,6 +1022,8 @@ proc rc_get_new_samples(stats: pointer) =
   let nRates = rcU16(stats, RCS_N_RATES).int
   var candidateIndex = 0
   var rateEntryIndex = 1
+  when defined(bl808m0):
+    var invalidated = false
   while rateEntryIndex < nRates:
     let rateStats = rcRateStats(stats, rateEntryIndex)
     let protectedRate = rateEntryIndex == rcRetryStep(stats, 0).rateIdx.int or
@@ -867,6 +1037,10 @@ proc rc_get_new_samples(stats: pointer) =
       let candidate = candidates[candidateIndex]
       inc candidateIndex
       if candidate != 0xFFFF'u16 and rc_check_rate_duplicated(stats, candidate) == 0:
+        when defined(bl808m0):
+          if not invalidated:
+            rcInvalidateRateSamples(stats)
+            invalidated = true
         rateStats.rateConfig = candidate
         rateStats.probability = 0
         rateStats.oldProbAvailable = 0
@@ -929,6 +1103,8 @@ proc rc_update_stats*(stats: pointer, init: uint8): uint8 {.exportc, cdecl.} =
     if fixedIndex == nRates:
       fixedIndex = nRates - 1
       let fixedStats = rcRateStats(stats, fixedIndex)
+      when defined(bl808m0):
+        rcInvalidateRateSamples(stats)
       fixedStats.rateConfig = counters.fixedRate
       fixedStats.probability = 0
     for step in 0 ..< 3:
@@ -941,7 +1117,7 @@ proc rc_update_stats*(stats: pointer, init: uint8): uint8 {.exportc, cdecl.} =
     counters.flags = (counters.flags and not 0x60'u8) or 0x40'u8
     changed = true
   else:
-    let currentIndex = rcRetryStep(stats, 0).rateIdx.int
+    let currentIndex = (rcRetryStep(stats, 0).rateIdx and 0x00FF'u16).int
     if currentIndex >= nRates:
       return 0
     let currentStats = rcRateStats(stats, currentIndex)
@@ -975,7 +1151,7 @@ proc rc_set_previous_mcs_index*(stats: pointer, rateConfig: uint16): uint16 {.ex
   previous
 
 proc rc_set_next_mcs_index*(stats: pointer, rateConfig: uint16): uint16 {.exportc, cdecl.} =
-  ## Produce a supported upper neighbor without changing its NSS encoding.
+  ## Advance to the adjacent supported MCS in the same NSS group.
   if stats == nil:
     return rateConfig
   let formatMod = (rateConfig shr 11) and 7
@@ -991,7 +1167,10 @@ proc rc_set_next_mcs_index*(stats: pointer, rateConfig: uint16): uint16 {.export
     return rateConfig
   if formatMod notin [2'u16, 3'u16] or mcsIdx >= rcU8(stats, RCS_MAX_NSS_MCS):
     return rateConfig
+  # The legacy and HT increments in rc.o are on separate branches.
   let nextMcs = mcsIdx + 1
+  if nextMcs > 7:
+    return rateConfig
   let nssIdx = rc_get_nss(rateConfig)
   let bitmap = rcU8(stats, RCS_RATE_BITMAP + nssIdx.int)
   if ((bitmap shr nextMcs) and 1) == 0:
@@ -1010,12 +1189,20 @@ proc rc_sort_samples_tp*(stats: pointer, tpArray: pointer) {.exportc, cdecl.} =
     return
   let tp = rcThroughputArray(tpArray)
   var sortPassLimit = nRates - 1
+  when defined(bl808m0):
+    var checkedDuplicates = false
   while sortPassLimit > 1:
     var lastSwap = 0
     for throughputSortIndex in 1 ..< sortPassLimit:
       let currentThroughput = tp[throughputSortIndex]
       let nextThroughput = tp[throughputSortIndex + 1]
       if currentThroughput > nextThroughput:
+        when defined(bl808m0):
+          if not checkedDuplicates:
+            # Unique encodings can still identify their samples after a reorder.
+            if rcHasDuplicateSampleEncoding(stats, nRates):
+              rcInvalidateRateSamples(stats)
+            checkedDuplicates = true
         let currentRateEntry = rcRateStats(stats, throughputSortIndex)
         let nextRateEntry = rcRateStats(stats, throughputSortIndex + 1)
         swap(currentRateEntry[], nextRateEntry[])

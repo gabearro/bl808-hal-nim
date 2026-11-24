@@ -25,13 +25,13 @@ def u32_leb(value: int) -> list[int]:
 
 def i32_leb(value: int) -> list[int]:
     out: list[int] = []
-    v = value & 0xFFFFFFFF
+    v = value
     more = True
     while more:
         b = v & 0x7F
         v >>= 7
         sign = (b & 0x40) != 0
-        more = not ((v == 0 and not sign) or (v == 0x01FFFFFF and sign))
+        more = not ((v == 0 and not sign) or (v == -1 and sign))
         if more:
             b |= 0x80
         out.append(b)

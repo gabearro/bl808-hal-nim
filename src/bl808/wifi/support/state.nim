@@ -12,13 +12,16 @@ var hostPollEnabled: bool
 var fwStarted: bool
 var staEnabled: bool
 var apEnabled: bool
+var apRegistered: bool
 var osMutexDepth: uint32
 var osMutexSavedIrq: uint32
 var osTaskNotifications: uint32
+var osTimerHead: ptr SimpleTimer
 var connectDone = -1'i32
 var disconnectDone: int32
 var scanDoneCount: uint32
 var scanItemCount: uint32
+var scanConfirmationStatus: uint32
 var macIrqCount: uint32
 var macPollIrqCount: uint32
 var macTrapIrqCount: uint32
@@ -38,7 +41,10 @@ var scanCache {.allcoreHttpPsramBss.}: array[VendorScanDiagMax, ScanCacheItem]
 var scanCacheFailureUsed {.allcoreHttpPsramBss.}: array[VendorScanDiagMax, uint8]
 var scanCacheFailureCount {.allcoreHttpPsramBss.}: array[VendorScanDiagMax, uint8]
 var scanCacheFailureBssid {.allcoreHttpPsramBss.}: array[VendorScanDiagMax, array[6, uint8]]
-var scanCacheSelectedSlot = -1
+var scanCachePendingBssid: array[6, uint8]
+var scanCacheConnectPending: bool
+when defined(bl808WifiConnectCacheHint):
+  var scanCacheHintArmed: bool
 var nimfwDbgScanCacheFind* {.exportc: "nimfw_dbg_scan_cache_find".}: uint32
 var nimfwDbgScanCacheHit* {.exportc: "nimfw_dbg_scan_cache_hit".}: uint32
 var nimfwDbgScanCacheCandidates* {.exportc: "nimfw_dbg_scan_cache_candidates".}: uint32
@@ -54,4 +60,3 @@ var nimfwDbgStaConnectState* {.exportc: "nimfw_dbg_sta_connect_state".}: uint32
 var nimfwDbgStaConnectFreq* {.exportc: "nimfw_dbg_sta_connect_freq".}: uint32
 var nimfwDbgStaConnectBssidLo* {.exportc: "nimfw_dbg_sta_connect_bssid_lo".}: uint32
 var nimfwDbgStaConnectBssidHi* {.exportc: "nimfw_dbg_sta_connect_bssid_hi".}: uint32
-var vendorRandomState = 0x6d2b_79f5'u32

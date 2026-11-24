@@ -1,0 +1,8 @@
+package ox64:text@0.2.0;
+
+world imported-text {
+  import count: func(value: string) -> u32;
+  export answer: func(value: string) -> u32;
+  export bad-pointer: func() -> u32;
+  export bad-text: func() -> u32;
+}

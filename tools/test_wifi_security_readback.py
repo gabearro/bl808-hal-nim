@@ -104,12 +104,12 @@ proc blOpsData(): ptr Ops = addr ops
 proc beaconTimeoutConfigWord(p: ptr Ops): uint32 = 0
 proc hal_machw_timing_info() = inc timingCalls
 proc assert_err(a, b: cstring; line: cint) = doAssert false, "unexpected assertion"
-proc sm_get_set_machwkey_index(getFlag, vif: uint32; output: pointer;
-                              kind: uint32): uint8 =
-  doAssert not irq and getFlag == 1 and vif < 2 and kind == 1
+proc sm_get_set_machwkey_index(getFlag: bool; vif: uint8; output: ptr uint8;
+                              kind: uint8): cint =
+  doAssert not irq and getFlag and vif < 2 and kind == 1
   inc lookupCalls
-  cast[ptr uint8](output)[] = keyIndex
-  lookupStatus
+  output[] = keyIndex
+  lookupStatus.cint
 proc testObserveLog(line: uint32; data: ptr uint32; count: cint) {.exportc, cdecl.} =
   var record = LogRecord(line: line, count: count.int)
   let values = cast[ptr UncheckedArray[uint32]](data)

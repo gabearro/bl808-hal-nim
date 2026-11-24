@@ -47,7 +47,7 @@ proc prepare(protocol: uint16; kind: int) =
   backup = default(typeof(backup))
   txEnv = default(TxEnv)
   frames[0] = HostTxDescView(vifIdx: 1, staInfoIdx: 0, staIdx: 0,
-    hdrLen: 34, frameLen: protocol, seqPassthrough: 16,
+    hdrLen: 34, qosExtLen: 8, frameLen: protocol, seqPassthrough: 16,
     bufDesc: addr links[0], hwDesc: addr hw[0], policy: addr templateBytes)
   frames[0].bufferPtrs[0] = 0x20000000
   frames[0].bufferLens[0] = 16

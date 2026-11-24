@@ -13,20 +13,28 @@ ROOT = Path(__file__).resolve().parents[1]
 
 PLATFORM = r"""
 import bl808/wifi/fw_messages
-const MAX_VIFS = 2
+proc txlFrameCallbackCurrent(): bool = true
+const
+  MAX_VIFS = 2
+  KeMsgTailSlack = 4'u32
 type
+  Header = object
+    paramLen: uint32
   TxDesc = object
     vifIdx, staInfoIdx: uint8
   Vif = object
     vifIdx, probeCount, staIdx: uint8
     beacon: TxDesc
+  VifChannelView = Vif
   Sta = object
     trafficFlags: uint8
     psStatus: uint32
   BcnEnv = object
     pendingCount: uint32
 var
-  allocation: array[8, uint8]
+  allocation: array[96, uint8]
+  header: Header
+  txResetEpoch: uint32
   messageId: uint16
   destination, source: uint8
   messageLength: uint32
@@ -39,6 +47,7 @@ var
   expectedVif: pointer
   vifs: array[MAX_VIFS, Vif]
   rxVifEpochs: array[MAX_VIFS, uint32]
+  mmBeaconProbeEpochs, mmTrafficProbeEpochs: array[MAX_VIFS, uint32]
   interrupts = true
 proc vifChannelAt(p: pointer): ptr Vif = cast[ptr Vif](p)
 proc vifChannelForIdx(i: uint8): ptr Vif = addr vifs[i]
@@ -47,17 +56,22 @@ proc irqSave(): uint32 =
   result = interrupts.uint32 * 8
   interrupts = false
 proc irqRestore(saved: uint32) = interrupts = (saved and 8) != 0
+proc keMsgHdrFromPayload(p: pointer): ptr Header =
+  doAssert p == addr allocation[0]
+  addr header
 proc vifApBeaconFrameDesc(vif: ptr Vif): ptr TxDesc = addr vif.beacon
 proc staInfoForIdx(i: uint8): ptr Sta = addr stas[i]
 proc ke_msg_alloc(id: uint16; dst, src: uint8; size: uint32): pointer =
   messageId = id
   destination = dst
   source = src
-  messageLength = size
+  doAssert size <= allocation.len.uint32
+  header.paramLen = size
   for value in allocation.mitems: value = 0xA5
   addr allocation[0]
 proc ke_msg_send(p: pointer) =
   doAssert p == addr allocation[0]
+  messageLength = header.paramLen
   inc messageCount
 proc ke_msg_free_payload(p: pointer) = discard
 proc txl_frame_push(p: pointer; ac: uint8): uint8 =
@@ -71,6 +85,7 @@ proc sta_mgmt_send_postponed_frame(vif, sta: pointer; budget: uint32): uint32 =
   inc postponedCalls
   0
 proc reset() =
+  mmConnLossTags = nil
   messageCount = 0
   messageId = 0
   destination = 0
@@ -98,17 +113,20 @@ for index in [5'u8, 255]:
   mm_send_connection_loss_ind(nil, 22)
   doAssert messageCount == 0
 
-for status in [0'u32, 1, 0x800000, 0x80800000'u32]:
-  reset()
-  vifs[1] = Vif(vifIdx: 1, probeCount: 7)
-  let vif = addr vifs[1]
-  mm_ap_probe_cfm(vif, status)
-  if (status and 0x800000) != 0:
-    doAssert messageCount == 0 and vif.probeCount == 0
-  else:
-    doAssert messageCount == 1 and messageId == 49 and destination == 4
-    doAssert allocation[0] == 16 and allocation[2] == 1
-    doAssert vif.probeCount == 7
+for status in [0'u32, 1, 0x800000, 0x40000000, 0x80010700'u32, 0x80800000'u32]:
+  for missed in [0'u8, 7, 100, 101, 255]:
+    reset()
+    vifs[1] = Vif(vifIdx: 1, probeCount: missed)
+    let vif = addr vifs[1]
+    mm_ap_probe_cfm(vif, status)
+    if (status and 0x80800000'u32) == 0x80800000'u32:
+      doAssert messageCount == 0 and vif.probeCount == 0
+    elif (status and 0x80000000'u32) != 0 and missed > 100:
+      doAssert messageCount == 1 and messageId == 49 and destination == 4
+      doAssert allocation[0] == 16 and allocation[2] == 1
+      doAssert vif.probeCount == missed
+    else:
+      doAssert messageCount == 0 and vif.probeCount == missed
 
 """
 
@@ -121,19 +139,23 @@ def test_message_producers_use_vendor_wire_contracts(tmp_path: Path) -> None:
     kernel = (base / "kernel_mac_channel.nim").read_text()
     layout = (base / "layout_types.nim").read_text()
     types = "type\n"
-    for name in ["MmConnectionLossIndPayload", "MmTrafficReqIndPayload", "MmVifIdentity"]:
+    for name in ["MmConnectionLossIndPayload", "MmTrafficReqIndPayload",
+                 "MmVifIdentity", "MmConnLossTag"]:
         types += "  " + name + layout.split("  " + name, 1)[1].split("\n\n  ", 1)[0] + "\n"
     types += "const\n  MmConnectionLossIndPayloadSize = sizeof(MmConnectionLossIndPayload).uint32\n"
     types += "  MmTrafficReqIndPayloadSize = sizeof(MmTrafficReqIndPayload).uint32\n"
-    helpers = procedure(kernel, "mmCaptureVif") + procedure(kernel, "mmVifCurrent")
-    loss = "proc mm_send_connection_loss_ind*" + kernel.split(
-        "proc mm_send_connection_loss_ind*", 1
+    types += "var mmConnLossTags: ptr MmConnLossTag\n"
+    helpers = "".join(procedure(kernel, name) for name in
+                      ["mmCaptureVif", "mmVifCurrent", "mmConnLossTagAt", "mmConnLossProbeEpoch",
+                       "mmResetBeaconProbeCount"])
+    loss = "proc mmPublishConnectionLoss" + kernel.split(
+        "proc mmPublishConnectionLoss", 1
     )[1].split("\nproc mm_ps_change_ind*", 1)[0]
     probe = "proc mm_ap_probe_cfm*" + kernel.split("proc mm_ap_probe_cfm*", 1)[1].split(
         "\nproc mm_bcn_transmitted*", 1
     )[0]
     program = tmp_path / "message_producers.nim"
-    program.write_text(PLATFORM + types + helpers + loss + probe + CHECKS)
+    program.write_text(types + PLATFORM + helpers + loss + probe + CHECKS)
     result = subprocess.run(
         [nim, "c", "-r", "--skipParentCfg:on", "--skipProjCfg:on", "--skipUserCfg:on",
          f"--path:{ROOT / 'src'}", f"--nimcache:{tmp_path / 'nimcache'}", "--checks:on",

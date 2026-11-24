@@ -46,6 +46,7 @@ type
     ctxtCount, flags, schedState: uint8
 var
   chan_ctxt_pool: array[MAX_CHAN_CTXT, ChanCtxtView]
+  chanCtxtLinkEpochs: array[MAX_VIFS, uint32]
   channelEnv: ChanEnvView
   sm_reconn_dominant_flag: uint32
 proc chanEnvView(): ptr ChanEnvView = addr channelEnv
@@ -63,6 +64,7 @@ proc c_memcmp(a, b: pointer; size: csize_t): cint =
   if equalMem(a, b, size.int): 0 else: 1
 proc chan_ctxt_trigger(p: pointer) = discard
 proc chan_update_tx_power(p: pointer) = invoke(onLink)
+proc smDeferredChannelUnlinked(vifIndex: uint8) = discard
 proc chan_tbtt_schedule(p: pointer) = discard
 proc chanCtxtOpTimer(): pointer = nil
 proc mm_timer_clear(p: pointer) = discard
@@ -70,6 +72,7 @@ proc chan_ctxt_op_evt(p: pointer) = channelEnv.currentCtxt = nil
 proc chan_cde_evt(p: pointer) = discard
 '''
     kernel = (FW / "kernel_mac_channel.nim").read_text()
+    code += re.search(r"(?ms)^type\n  ChanTbttSnapshot = object.*?(?=^var\n)", kernel).group()
     code += "var\n  chanCtxtEpochs" + kernel.split("var\n  chanCtxtEpochs", 1)[1].split("\nproc chan_init", 1)[0]
     code += "\n"
     for name in ["co_list_push_back", "co_list_pop_front", "co_list_extract",
@@ -321,3 +324,45 @@ doAssert freeChannels() == 3
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_registration_channel_ownership(tmp_path: Path, case: str, mode: str) -> None:
     run_program(tmp_path, mode, source() + CASES[case])
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_context_pool_rejects_invalid_inputs_and_nodes(tmp_path: Path, mode: str) -> None:
+    code = source().replace(
+        "proc assert_err(a, b: cstring; line: int) = doAssert false",
+        "var assertionLines: seq[int]\n"
+        "proc assert_err(a, b: cstring; line: int) = assertionLines.add(line)")
+    run_program(tmp_path, mode, code + r'''
+resetChannels()
+var definition: ChanCtxtDefView
+definition.primFreq = 2412
+var index = 77'u8
+doAssert chan_ctxt_add(nil, addr index) == 1 and index == 77
+doAssert chan_ctxt_add(addr definition, nil) == 1 and index == 77
+doAssert freeChannels() == MAX_CHAN_CTXT
+
+var outside: ChanCtxtView
+outside.contextIndexOrMarker = 0xFF
+channelEnv.freeList.first = addr outside.hdr
+channelEnv.freeList.last = addr outside.hdr
+doAssert chan_ctxt_add(addr definition, addr index) == 1 and index == 77
+doAssert outside.contextIndexOrMarker == 0xFF and assertionLines.len == 0
+doAssert channelEnv.freeList.first == addr outside.hdr
+
+resetChannels()
+let active = addr chan_ctxt_pool[0]
+active.contextIndexOrMarker = 0
+channelEnv.freeList.first = addr active.hdr
+channelEnv.freeList.last = addr active.hdr
+doAssert chan_ctxt_add(addr definition, addr index) == 1 and index == 77
+doAssert active.contextIndexOrMarker == 0
+doAssert channelEnv.freeList.first == addr active.hdr
+
+resetChannels()
+doAssert chan_ctxt_add(addr definition, addr index) == 0 and index == 0
+let allocated = chanCtxtForIdx(index)
+allocated.contextIndexOrMarker = 1
+chan_ctxt_del(index)
+doAssert assertionLines == @[0xAD0] and allocated.contextIndexOrMarker == 1
+doAssert freeChannels() == MAX_CHAN_CTXT - 1
+''')

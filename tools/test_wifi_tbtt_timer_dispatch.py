@@ -42,7 +42,8 @@ var
   deliveredTbtt: seq[uint]
   onWork: proc()
   operationDelivery: seq[tuple[index: uint8, status: uint8]]
-  onOperation: proc()
+  onOperation, onIdleReset: proc()
+  failIdle: bool
   env: tuple[currentCtxt, scheduledCtxt: pointer, ctxtCount, flags: uint8, lastMacTime: uint32]
 proc chanTbttTimer(): pointer = addr timers[0]
 proc chanCtxtOpTimer(): pointer = addr timers[2]
@@ -55,6 +56,13 @@ proc chanCtxtForIdx(index: uint8): ptr Context = addr contexts[index]
 proc chanCtxtAt(p: pointer): ptr Context = cast[ptr Context](p)
 proc chanEnvView(): ptr typeof(env) = addr env
 proc vifChannelForIdx(index: uint8): ptr Vif = addr vifs[index]
+proc smScanPreserveAcrossChannelReset(previous: uint32) = discard
+proc smRegistrationPreserveAcrossChannelReset(previous: uint32) = discard
+proc mm_force_idle_req(): bool =
+  doAssert not enabled
+  inc txResetEpoch
+  invoke(onIdleReset)
+  not failIdle
 proc chanTbttSwitchEvent(p: pointer; callbackIrq: uint32) =
   doAssert not enabled
   irqRestore(callbackIrq)
@@ -90,6 +98,8 @@ proc setupTbtt() =
   onUnlock = nil
   onWork = nil
   onOperation = nil
+  onIdleReset = nil
+  failIdle = false
   setup()
   deliveredTbtt.setLen(0)
   operationDelivery.setLen(0)
@@ -165,6 +175,18 @@ for irq in [false, true]:
   now = 151
   mm_timer_schedule()
   doAssert deliveredTbtt == @[1'u] and enabled == irq
+''',
+    "switch_owned_idle": r'''
+for outcome in 0 .. 3:
+  setupTbtt()
+  arm()
+  failIdle = outcome == 1
+  if outcome == 2: inc txResetEpoch
+  doAssert chanForceIdle() == (not failIdle)
+  if outcome == 3: inc chanCtxtLinkEpochs[0]
+  now = 151
+  mm_timer_schedule()
+  doAssert deliveredTbtt == (if outcome == 0: @[1'u] else: @[])
 ''',
     "retired_vif": r'''
 arm()

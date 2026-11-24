@@ -1,0 +1,5 @@
+package ox64:math@0.2.0;
+
+world qwords-demo {
+  export echo-qwords: func(value: list<u64>) -> list<u64>;
+}

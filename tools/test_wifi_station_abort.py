@@ -13,7 +13,11 @@ SUPPORT = r'''
 const
   TASK_API = 9'u8
   TASK_SCAN = 1'u8
+  KeMsgNoFree = 1.cint
   KeMsgSaved = 2.cint
+  SmIdleState = 0'u16
+  SM_DISCONNECT_REQ = 0x1003'u16
+  SM_DISCONNECT_CFM = 0x1004'u16
   SM_CONNECT_ABORT_REQ = 0x1007'u16
   SM_CONNECT_ABORT_CFM = 0x1008'u16
   SCAN_ABORT_REQ = 0x405'u16
@@ -21,12 +25,15 @@ const
   WLAN_FW_CONNECT_ABORT_BY_USER_NO_DEAUTH = 24'u16
 type StatusCfmPayload = object
   status: uint8
-proc chanSwitchCallbackCurrent(): bool = true
 var
   replies: seq[uint8]
   outcomes: seq[tuple[status, reason: uint16]]
   deauths, scanAborts, cacheClears: int
   scanHook: proc()
+  tlvHook: proc()
+  disconnects, disconnectReplies: int
+  disconnectRequest: pointer
+  nimFwDbgDisconnectReq, nimFwDbgDisconnectReqState: uint32
 '''
 
 ADAPTERS = r'''
@@ -41,9 +48,18 @@ proc ke_msg_send_basic(id: uint16; dst, src: uint8) =
 proc scanu_cached_scanresult_clear() = inc cacheClears
 proc sm_connect_abort_deauth_cfm() = discard
 proc sm_connect_abort_process() = discard
+proc sm_disconnect_deauth_cfm() = discard
+proc sm_disconnect_process() = discard
+proc sm_connection_tlv_set() = invoke(tlvHook)
 proc sm_handle_connection(vif: uint8; status: uint16; callback, failure: pointer) =
-  doAssert vif == 1 and status == 24
-  inc deauths
+  doAssert vif == 1
+  if status == 19:
+    inc disconnects
+    doAssert callback == cast[pointer](sm_disconnect_deauth_cfm)
+    doAssert failure == cast[pointer](sm_disconnect_process)
+  else:
+    doAssert status == 24
+    inc deauths
   currentState = 10
   env.connectInfo = nil
   smDeferredCancel()
@@ -79,6 +95,15 @@ proc makeAbort(vif = 1'u8): pointer =
 proc deliverAbort(request: pointer): cint =
   result = sm_connect_abort_req_handler(request)
   if result == KeMsgConsumed: ke_msg_free(keMsgHdrFromPayload(request))
+proc makeDisconnect(vif = 1'u8; length = 1'u32): pointer =
+  result = ke_msg_try_alloc(SM_DISCONNECT_REQ, TASK_SM, TASK_API, length)
+  doAssert result != nil
+  if length != 0: cast[ptr uint8](result)[] = vif
+  smAbortCaptureMessage(keMsgHdrFromPayload(result))
+  disconnectRequest = result
+proc deliverDisconnect(request: pointer): cint =
+  result = sm_disconnect_req_handler(request)
+  if result == KeMsgConsumed: ke_msg_free(keMsgHdrFromPayload(request))
 '''
 
 
@@ -95,7 +120,14 @@ proc smDeferredCancel()
     original_allocator = procedure(code, "ke_msg_try_alloc")
     allocator = procedure((FW / "kernel_mac_channel.nim").read_text(), "ke_msg_try_alloc")
     code = code.replace(original_allocator, ALLOCATOR + allocator, 1)
-    code = code.replace("  inc publications\n  queue.add(payload)", """  if keMsgHdrFromPayload(payload).id == SM_CONNECT_ABORT_CFM:
+    code = code.replace("  inc publications\n  queue.add(payload)", """  if keMsgHdrFromPayload(payload).id == SM_DISCONNECT_CFM:
+    let hdr = keMsgHdrFromPayload(payload)
+    doAssert payload == disconnectRequest and hdr.paramLen == 0
+    doAssert hdr.destId == TASK_API and hdr.srcId == TASK_SM
+    inc disconnectReplies
+    ke_msg_free(hdr)
+    return
+  if keMsgHdrFromPayload(payload).id == SM_CONNECT_ABORT_CFM:
     replies.add(cast[ptr StatusCfmPayload](payload).status)
     ke_msg_free(keMsgHdrFromPayload(payload))
     invoke(publicationHook)
@@ -120,11 +152,53 @@ proc smAbortRegister(header: ptr KeMsgHdr) = discard
 proc smAbortForget(header: pointer) = discard
 proc smAbortCaptureMessage(header: ptr KeMsgHdr) = discard
 """
-    return code + ADAPTERS + procedure((FW / "task_handlers.nim").read_text(),
-                                     "sm_connect_abort_req_handler") + HELPERS
+    handlers = (FW / "task_handlers.nim").read_text()
+    return (code + ADAPTERS + procedure((FW / "kernel_mac_channel.nim").read_text(),
+            "ke_msg_forward_and_change_id") + procedure(handlers, "sm_disconnect_req_handler") +
+            procedure(handlers, "sm_connect_abort_req_handler") + HELPERS)
 
 
 CASES = {
+    "disconnect_lifetime": r'''
+# A saved disconnect cannot act on a replacement VIF, even while SM is busy.
+let saved = makeDisconnect()
+doAssert deliverDisconnect(saved) == KeMsgSaved and disconnectReplies == 0
+inc rxVifEpochs[1]
+doAssert deliverDisconnect(saved) == KeMsgNoFree
+doAssert disconnects == 0 and disconnectReplies == 1
+
+# Publication, not first dispatch, determines the original target.
+let queued = makeDisconnect()
+inc rxVifEpochs[1]
+currentState = SmIdleState
+doAssert deliverDisconnect(queued) == KeMsgNoFree
+doAssert disconnects == 0 and disconnectReplies == 2
+
+# A join may retire its connection buffer without retiring the VIF session.
+let current = makeDisconnect()
+currentState = 6
+doAssert deliverDisconnect(current) == KeMsgSaved
+currentState = SmIdleState
+env.connectInfo = nil
+let allocated = allocations
+allocFail = true
+doAssert deliverDisconnect(current) == KeMsgNoFree
+doAssert disconnects == 1 and disconnectReplies == 3 and allocations == allocated
+allocFail = false
+
+# Recheck ownership before the normal disconnect handoff.
+currentState = SmIdleState
+let replaced = makeDisconnect()
+tlvHook = proc() = inc rxVifEpochs[1]
+doAssert deliverDisconnect(replaced) == KeMsgNoFree
+doAssert disconnects == 1 and disconnectReplies == 4
+
+# Malformed or unbound requests still release the command, but do no work.
+for length in [0'u32, 1, 2]:
+  let bad = makeDisconnect(255, length)
+  doAssert deliverDisconnect(bad) == KeMsgNoFree
+doAssert disconnects == 1 and disconnectReplies == 7
+''',
     "parked_auth": """
 schedule(5)
 let request = makeAbort()
@@ -380,7 +454,10 @@ doAssert replies.len == 100 and live.len == 0
 MUTATIONS = {
     "connection": ("smEnvView().connectInfo == identity.connection and", "true and", "saved_replacement"),
     "epoch": ("rxVifEpochs[identity.vifIndex] == identity.vifEpoch and", "true and", "saved_epoch"),
-    "capture": ("  smAbortCaptureMessage(keMsgHdrFromPayload(result))", "  discard", "queued_replacement_before_dispatch"),
+    "disconnect_epoch": ("rxVifEpochs[identity.vifIndex] == identity.vifEpoch and", "true and",
+                         "disconnect_lifetime"),
+    "capture": ("  smAbortCaptureMessage(keMsgHdrFromPayload(result))\nproc deliverAbort",
+                "  discard\nproc deliverAbort", "queued_replacement_before_dispatch"),
     "executing": ("if tag.location == smDeferredExecuting: return false", "if tag.location == smDeferredExecuting: return true", "executing"),
     "release": ("  smAbortForget(header)", "  discard", "recycled_request"),
 }

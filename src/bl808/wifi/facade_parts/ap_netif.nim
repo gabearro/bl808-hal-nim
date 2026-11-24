@@ -26,3 +26,8 @@ proc wifiGetNetif*(): pointer =
   ## Get the lwIP netif for the STA interface.
   ## Cast to `ptr NetIf` in your lwIP bindings.
   wifi_mgmr_sta_netif_get()
+
+when defined(bl808WifiNimFw):
+  proc wifiGetApNetif*(): pointer =
+    ## Returns the AP lwIP network interface while the AP is running.
+    wifi_mgmr_ap_netif_get()

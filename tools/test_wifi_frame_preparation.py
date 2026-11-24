@@ -24,9 +24,12 @@ PLATFORM = ALLOCATION_PLATFORM.replace(
 PLATFORM = PLATFORM.replace(procedure(PLATFORM, "nimFwTrace2U32"), "")
 PLATFORM += r"""
 const NUM_TX_QUEUES = 5
+const VIF_TYPE_STA = 0'u8
+const mac_tid2ac = [1'u8, 0, 0, 1, 2, 2, 3, 3]
 type
   Vif = object
     vifIdx, vifType, state: uint8
+    uapsdBitmap: uint8
     macAddr: array[6, uint8]
 var
   vifs: array[2, Vif]
@@ -39,16 +42,21 @@ var
   replacementLink: LinkDesc
   stage: string
   action, pushes, powers, warnings, kind: int
+  expectedAc = 3'u8
   fired: bool
+  triggerOnChannel = true
   sequence: uint16
   pushed: seq[pointer]
 proc observe(point: string)
+proc ps_enable_cfm(p: pointer; status: uint32) {.cdecl.} = discard
+proc ps_disable_cfm(p: pointer; status: uint32) {.cdecl.} = discard
 proc txlStationAdmits(desc: ptr HostTxDescView): bool
 proc txl_frame_release*(param: pointer; doCallback: bool) {.exportc, cdecl.}
 proc vifChannelForIdx(index: uint8): ptr Vif =
   doAssert index < 2
   addr vifs[index]
 proc vifChannelAt(p: pointer): ptr Vif = cast[ptr Vif](p)
+proc chan_is_on_operational_channel(p: pointer): bool = triggerOnChannel
 proc txlVifIsRetiring(vif: uint8): bool = retired
 proc hostTxDataHeader(d: ptr HostTxDescView): ptr MacDataFrameHeaderView =
   cast[ptr MacDataFrameHeaderView](addr hostTxLinkDescAt(d.bufDesc).macHeader[0])
@@ -78,7 +86,7 @@ proc nimFwTrace2U32(s: string; a, b: uint32) =
     observe("trace")
 proc assert_err(file, condition: cstring; line: int) = inc warnings
 proc submit(p: pointer; ac: uint8): uint8 =
-  doAssert not interruptsEnabled and ac == 3
+  doAssert not interruptsEnabled and ac == expectedAc
   currentFrame = hostTxDescAt(p)
   doAssert txlStationAdmits(currentFrame)
   inc pushes
@@ -119,6 +127,9 @@ proc observe(point: string) =
   of 4: stas[2].valid = 0
   of 5: stas[2].instNbr = 0
   of 6: inc rxVifEpochs[0]
+  of 8: inc psModeBuildSerial
+  of 9: vifs[1].uapsdBitmap = 8
+  of 10: triggerOnChannel = false
   else: retired = true
 
 proc setup(irq: bool; allocatedCount: int) =
@@ -127,12 +138,15 @@ proc setup(irq: bool; allocatedCount: int) =
   fired = false
   stage = ""
   pushes = 0
+  expectedAc = 3
+  triggerOnChannel = true
   powers = 0
   warnings = 0
   pushed.setLen(0)
   replacement = nil
   currentFrame = nil
   sequence = 0x1000
+  psModeBuildSerial = 0
   interruptsEnabled = irq
   for i in 0 .. 1:
     vifs[i] = Vif(vifIdx: i.uint8, vifType: 0, state: 1)
@@ -159,6 +173,31 @@ proc verifyReplacement() =
   doAssert hostTxLinkDescAt(replacement.bufDesc)[] == replacementLink,
     "old preparation changed the replacement frame"
   doAssert co_list_cnt(addr frameEnv.freeList) == 0
+
+for tid in 0'u16 .. 7:
+  setup(true, 0)
+  expectedAc = mac_tid2ac[tid]
+  vifs[1].uapsdBitmap = 1'u8 shl expectedAc
+  doAssert txlSendUapsdTrigger(2, tid, nil) == 0
+  doAssert pushes == 1 and hostTxQosDataHeader(currentFrame).qosCtrl == tid
+
+setup(true, 0)
+vifs[1].uapsdBitmap = 8
+stage = "power"
+action = 10
+doAssert txlSendUapsdTrigger(2, 7, nil) == 1
+doAssert fired and pushes == 0 and co_list_cnt(addr frameEnv.freeList) == 4
+doAssert txl_frame_send_qosnull_frame(2, 7, nil, 0) == 0
+doAssert pushes == 1
+
+for trigger in ["power", "trace"]:
+  setup(true, 0)
+  expectedAc = 2
+  vifs[1].uapsdBitmap = 4
+  stage = trigger
+  action = 9
+  doAssert txlSendUapsdTrigger(2, 4, nil) == 1
+  doAssert fired and pushes == 0 and co_list_cnt(addr frameEnv.freeList) == 4
 
 for irq in [false, true]:
   for frameKind in 0 .. 2:
@@ -222,6 +261,29 @@ for irq in [false, true]:
 
   # Submission wrappers validate before touching malformed descriptor resources.
   for forced in [false, true]:
+    for frameControl in [0x0004'u16, 0x0008'u16]:
+      for groupAddress in [false, true]:
+        setup(irq, 1)
+        currentFrame = held[0]
+        let hdr = hostTxDataHeader(currentFrame)
+        hdr.frameControl = frameControl
+        hdr.addr1[0] = if groupAddress: 1'u8 else: 2'u8
+        let hw = hostTxHwDescAt(currentFrame.hwDesc)
+        hw.controlFlags = high(uint32)
+        hw.secondaryTxHwDescPtr = high(uint32)
+        hw.secondaryDescToStatusPadding = high(uint32)
+        hw.confirmStatus = high(uint32)
+        if forced:
+          txl_frame_push_force(currentFrame, 3)
+        else:
+          doAssert txl_frame_push(currentFrame, 3) == 1
+        doAssert pushes == 1 and interruptsEnabled == irq
+        doAssert hw.ackPolicyControl ==
+          (if not groupAddress and (forced or frameControl != 0x0004'u16): 512'u32 else: 0'u32)
+        doAssert hw.controlFlags == 0xFF87FFFF'u32
+        doAssert hw.secondaryTxHwDescPtr == 0 and
+          hw.secondaryDescToStatusPadding == 0 and hw.confirmStatus == 0
+  for forced in [false, true]:
     for change in [1, 2, 3, 6]:
       setup(irq, 4)
       currentFrame = held[0]
@@ -265,6 +327,33 @@ for irq in [false, true]:
       else: doAssert txl_frame_push(held[0], ac) == 0
       doAssert pushes == 0 and co_list_cnt(addr frameEnv.freeList) == 1
 
+  for callback in [cast[pointer](ps_enable_cfm), cast[pointer](ps_disable_cfm)]:
+    for point in ["recovery", "power", "trace"]:
+      setup(irq, (if point == "recovery": 4 else: 0))
+      stage = point
+      action = 8
+      if point == "recovery":
+        onRecovery = proc() =
+          observe("recovery")
+          txl_frame_release(held[0], false)
+      doAssert txl_frame_send_null_frame(2, callback, 0xDEADBEEF'u32) == 1
+      doAssert fired and pushes == 0 and interruptsEnabled == irq
+      doAssert co_list_cnt(addr frameEnv.freeList) == (if point == "recovery": 1 else: 4)
+    setup(irq, 0)
+    psModeBuildSerial = 42
+    doAssert txl_frame_send_null_frame(2, callback, 0xDEADBEEF'u32) == 0
+    let owner = txFrameIdentities[txl_frame_desc_index(pushed[0])]
+    doAssert owner.psTracked and owner.psSerial == 42
+    doAssert hostTxDescAt(pushed[0]).callback == callback
+    doAssert pointerAddrU32(hostTxDescAt(pushed[0]).callbackArg) == 0xDEADBEEF'u32
+
+  setup(irq, 0)
+  stage = "power"
+  action = 8
+  doAssert txl_frame_send_null_frame(2, cast[pointer](0xFACE), 0) == 0
+  doAssert fired and pushes == 1
+  doAssert not txFrameIdentities[txl_frame_desc_index(pushed[0])].psTracked
+
   setup(irq, 0)
   doAssert txl_frame_send_null_frame(255, nil, 0) == 1
   doAssert txl_frame_send_qosnull_frame(7, 0, nil, 0) == 1
@@ -291,8 +380,10 @@ def test_frame_preparation(tmp_path: Path, mode: str, mutation: str | None) -> N
         "txlCaptureFrameCallback", "txlFrameCallbackCurrent", "txlInvokeFrameCallback",
         "txlCaptureSession", "txlSessionCurrent", "txlStationAdmits", "txlFramePreparationCurrent",
         "txl_frame_free_list_pop", "txl_frame_get", "txl_frame_release",
-        "txl_frame_push", "txl_frame_try_push_force", "txl_frame_push_force", "txl_frame_send_null_frame",
-        "txl_frame_send_qosnull_frame", "txl_frame_send_selfcts_frame",
+        "txlFramePushPrepared", "txl_frame_push", "txl_frame_try_push_force",
+        "txl_frame_push_force", "txl_frame_send_null_frame",
+        "txlSendQosNull", "txl_frame_send_qosnull_frame", "txlSendUapsdTrigger",
+        "txl_frame_send_selfcts_frame",
     ])
     if mutation == "lease":
         functions = functions.replace("desc == nil or not txlFrameLeaseMatches(desc, generation)", "desc == nil")

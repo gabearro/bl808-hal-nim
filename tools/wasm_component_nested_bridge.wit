@@ -1,0 +1,10 @@
+package ox64:values@0.2.0;
+
+world nested-bridge {
+  record message {
+    payload: option<tuple<string, u64>>,
+    code: u8,
+  }
+  import relay: func(value: message) -> message;
+  export echo: func(value: message) -> message;
+}

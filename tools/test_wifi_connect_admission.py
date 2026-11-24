@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from test_wifi_connect_rx_epoch import PLATFORM
-from test_wifi_disconnect_tx import FW, procedure
+from test_wifi_disconnect_tx import FW, ROOT, procedure
 from test_wifi_message_allocation import run_program
 from test_wifi_sm_cleanup import CASES as CLEANUP_CASES, DRIVER, program as cleanup_program
 
@@ -178,13 +178,13 @@ proc sm_connect_req_handler*(param: pointer): cint {.exportc, cdecl.}
 proc reconnectDriveSent() =
   if immediateCleanup:
     while keMsgQueueSent.first != nil: driveOne()
-proc sm_connection_tlv_set(vif: uint8; p: pointer; length: uint16) = discard
+proc sm_connection_tlv_set() = discard
 proc connectInfoHasChannelHint(req: ptr ConnectInfoView): bool = false
 proc connectInfoChannelHint(p: pointer): pointer = nil
-proc sm_get_bss_params(bss, channel: ptr pointer): bool = false
+proc sm_get_bss_params(bss, channel: ptr pointer) = discard
 proc scanu_prune_scanresult_raw_frames_except_bssid(p: pointer) = discard
 proc scanu_prune_scanresult_raw_frames() = discard
-proc sm_join_bss(mac, bss, channel: pointer; flags: uint32) = inc reconnectJoins
+proc sm_join_bss(mac, bss, channel: pointer; flags: bool) = inc reconnectJoins
 proc sm_scan_bss(mac, bss, channel: pointer) =
   doAssert vifs[0].chanCtxt == nil and vifs[0].staIdx == 255
   doAssert not smCleanup.active and smState == 0
@@ -208,6 +208,177 @@ TRANSACTION_CASES = {
     "allocation_retry": (True, True, True, False),
     "immediate_cleanup": (True, True, False, True),
 }
+
+
+def delete_retry_transaction_source() -> str:
+    code = transaction_source()
+    kernel = (FW / "kernel_mac_channel.nim").read_text()
+    retry_platform = r'''
+const STA_MGMT_FREE_STAS = 5
+type
+  RetryTimer = object
+    callback: pointer
+    env, expiry: uint32
+  RetryDelivery = object
+    cancelled: bool
+var
+  mmStaDelRetryTimer: RetryTimer
+  mmStaDelRetryMask: uint8
+  mmStaDelRetryReset: uint32
+  mmStaDelRetryEpochs: array[STA_MGMT_FREE_STAS, uint32]
+  retryNow: uint32
+  retryArmed, failDeletion: bool
+  deleteAttempts, deleteConfirmations: int
+proc macTimeNow(): uint32 = retryNow
+proc mmTimerActiveDelivery(timer: pointer): ptr RetryDelivery = nil
+proc mmTimerSetLocked(timer: pointer; deadline, saved: uint32) =
+  doAssert not interruptsEnabled and timer == (addr mmStaDelRetryTimer)
+  mmStaDelRetryTimer.expiry = deadline
+  retryArmed = true
+proc mmStaDelRetryCb(env: pointer) {.cdecl.}
+'''
+    queue = procedure(kernel, "mmStaDelQueueRetryLocked")
+    callback = procedure(kernel[kernel.index("proc mm_sta_del*"):], "mmStaDelRetryCb")
+    pending = procedure(kernel, "mmStaDelRetryPending")
+    code = code.replace(procedure(code, "mmStaDelTry"), retry_platform + r'''
+proc mmStaDelTry(index: uint8; saved: uint32): bool =
+  if index >= STA_MGMT_FREE_STAS.uint8: return true
+  inc deleteAttempts
+  if failDeletion: return false
+  mm_sta_del(index)
+  inc stationEpochs[index]
+  true
+''')
+    retry_stubs = procedure(code, "mmStaDelRetryPending")
+    code = code.replace(retry_stubs + procedure(code, "mmStaDelQueueRetryLocked"),
+                        pending + queue + callback)
+    code = code.replace(procedure(code, "wifiMmTimerPendingWork"), r'''
+proc wifiMmTimerPendingWork(): bool =
+  retryArmed and cast[int32](retryNow - mmStaDelRetryTimer.expiry) >= 0
+''')
+    code = code.replace(procedure(code, "wifiDispatchScheduledEvent"), r'''
+proc wifiDispatchScheduledEvent(): bool =
+  if wifiMmTimerPendingWork():
+    retryArmed = false
+    cast[proc(env: pointer) {.cdecl.}](mmStaDelRetryTimer.callback)(nil)
+    return true
+  result = wifiEventPendingWork()
+  if result: driveOne()
+''')
+    return code.replace(
+        "    of MM_STA_DEL_CFM: result = smCleanupCfmHandler(p)\n",
+        "    of MM_STA_DEL_CFM:\n"
+        "      inc deleteConfirmations\n"
+        "      result = smCleanupCfmHandler(p)\n",
+    )
+
+
+@pytest.mark.parametrize("mode", ["checked", "asan"])
+def test_saved_reconnect_progresses_after_station_delete_retry(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, delete_retry_transaction_source() + r'''
+failDeletion = true
+retryNow = high(uint32) - 1000
+sm_disconnect_process(addr vifs[0], 19, 3)
+while keMsgQueueSent.first != nil and keMsgQueueSent.first.id != MM_STA_DEL_REQ:
+  driveOne()
+doAssert keMsgQueueSent.first != nil
+let deletion = keMsgQueueSent.first
+driveOne()
+doAssert smCleanup.awaiting and smCleanup.step == 2
+doAssert keMsgQueueSaved.first == deletion and keMsgQueueSaved.last == deletion
+doAssert retryArmed and mmStaDelRetryMask == 4 and deleteAttempts == 1
+doAssert deleteConfirmations == 0
+
+request = newMessage(SM_CONNECT_REQ, TASK_SM, TASK_API, 192)
+connectInfoView(request)[] = ConnectInfoView(vifIdx: 0)
+ke_msg_send(request)
+driveOne()
+doAssert keMsgQueueSaved.last == keMsgHdrFromPayload(request)
+doAssert reconnectScans == 0 and reconnectConfirmations.len == 0
+retryNow = mmStaDelRetryTimer.expiry
+for _ in 0 ..< 10: discard wifiDrainScheduledWork()
+doAssert not wifiMainHasPendingWork()
+doAssert deleteAttempts == 2, "waking the saved command polled a busy MAC twice"
+doAssert retryArmed and deleteConfirmations == 0
+doAssert keMsgQueueSaved.first == keMsgHdrFromPayload(request)
+doAssert keMsgQueueSaved.last == deletion
+
+failDeletion = false
+retryNow = mmStaDelRetryTimer.expiry - 1
+doAssert not wifiMainHasPendingWork() and smState == SmDisconnectingState
+inc retryNow
+drain() # The real retry callback wakes MM; the final SM reply wakes reconnect.
+doAssert deleteAttempts == 3 and deleteConfirmations == 1 and removed == @[2'u8]
+doAssert not retryArmed and mmStaDelRetryMask == 0 and keMsgQueueSaved.first == nil
+doAssert reconnectScans == 1 and reconnectJoins == 0
+doAssert reconnectConfirmations == @[0'u8] and sm.connectInfo == request
+doAssert not requestFreed and sm.connectIndMsg != nil
+doAssert unlinks == 1
+doAssert commands == @[ME_SET_PS_DISABLE_REQ, MM_SET_VIF_STATE_REQ,
+                       MM_STA_DEL_REQ, MM_STA_DEL_REQ, MM_STA_DEL_REQ, ME_SET_ACTIVE_REQ]
+let admitted = smConnectIndPayloadAt(sm.connectIndMsg)
+var connectStatus = 0xFFFF'u16
+indicationHook = proc() = connectStatus = admitted.statusCode
+sm_connect_ind(0, 0) # Model one successful association on a later turn.
+doAssert connectStatus == 0 and controlReplies[^1].id == SM_CONNECT_IND_MSG
+doAssert controlReplies.len == 3 # Disconnect indication, connect CFM, connect IND.
+doAssert sm.connectInfo == nil and sm.connectIndMsg == nil
+doAssert keMsgQueueSent.first == nil and keMsgQueueSaved.first == nil
+doAssert allocated.len == 0 and smCleanupTags == nil
+''')
+
+
+def cleanup_pump_source() -> str:
+    pump = ROOT / "src/bl808/wifi/facade_parts/service_futures_parts/pump.nim"
+    return delete_retry_transaction_source() + r'''
+type PumpFuture = ref object
+  finished: bool
+var
+  wifiApEnabled, wifiDisconnectIssuePending: bool
+  wifiScanFuture, wifiConnectFuture, wifiStaIdleFuture, wifiDisconnectFuture: PumpFuture
+  hostConnected = true
+  polls = 0
+proc wifiBackendConnected(): bool = hostConnected
+proc wifiBackendPoll(count: uint32) =
+  inc polls
+  for i in 0'u32 ..< count:
+    discard wifiDrainScheduledWork()
+proc wifiNimFirmwareServiceTx(count: uint32) = discard
+proc wifiCompletePendingEvents() = discard
+''' + procedure(pump.read_text(), "wifiServicePump")
+
+
+@pytest.mark.parametrize("mode", ["checked", "asan"])
+def test_scheduler_polls_peer_cleanup_without_api_waiter(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, cleanup_pump_source() + r'''
+failDeletion = true
+retryNow = high(uint32) - 1000
+indicationHook = proc() = hostConnected = false
+sm_disconnect_process(addr vifs[0], 7, 7)
+doAssert not hostConnected and notifications.len == 1
+doAssert smState == SmDisconnectingState
+
+wifiServicePump()
+doAssert polls == 1, "link-down stopped firmware polling during cleanup"
+doAssert smCleanup.awaiting and smCleanup.step == 2 and retryArmed
+doAssert mmStaDelRetryMask == 4 and deleteAttempts == 1
+doAssert deleteConfirmations == 0
+
+failDeletion = false
+retryNow = mmStaDelRetryTimer.expiry - 1
+wifiServicePump()
+doAssert deleteAttempts == 1 and smState == SmDisconnectingState
+inc retryNow
+wifiServicePump()
+doAssert deleteAttempts == 2 and deleteConfirmations == 1 and removed == @[2'u8]
+doAssert not retryArmed and not smCleanup.active and smState == 0
+doAssert keMsgQueueSaved.first == nil and allocated.len == 0 and smCleanupTags == nil
+doAssert notifications.len == 1
+
+let finalPolls = polls
+wifiServicePump()
+doAssert polls == finalPolls, "quiescent station did not stop polling"
+''')
 
 
 @pytest.mark.parametrize("case", ADMISSION_CASES)

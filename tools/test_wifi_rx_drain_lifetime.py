@@ -61,7 +61,7 @@ proc setup(count = 6) =
     let payload = rxPayloadHwDescAt(index)
     header.mpduLengthBytes = 24
     header.frameLen = 24
-    header.hwFlags = 0x20026000'u32 or (12'u32 shl 15)
+    header.hwFlags = 0x02006000'u32 or (12'u32 shl 15)
     header.flags = header.hwFlags or 0x4000
     header.bufferChain = payload
     payload.bufferAddr = pointerAddrU32(addr buffers[index].payloadBytes[0])
@@ -110,6 +110,7 @@ setup()
   {hook} = nil
   nested()
 rxl_cntrl_evt()
+doAssert {hook} == nil, "nested RX hook did not run"
 doAssert delivered == @[0, 1, 2, 3] and released == delivered
 doAssert env.queue.first == addr rxSwTableDescAt(4).link
 doAssert (events and 0x100000) != 0 and not rxlControlActive

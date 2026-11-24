@@ -40,7 +40,8 @@ proc txlCaptureSession(desc: ptr HostTxDescView): TxSessionIdentity =
     station: desc.staInfoIdx, vifEpoch: rxVifEpochs[desc.vifIdx],
     stationEpoch: staDeleteEpoch(desc.staInfoIdx), resetEpoch: txResetEpoch)
 
-proc txlSessionCurrent(identity: TxSessionIdentity; desc: ptr HostTxDescView): bool =
+proc txlSessionCurrent(identity: TxSessionIdentity; desc: ptr HostTxDescView;
+                       checkDescriptor = true): bool =
   if txlResetting() or not identity.captured or identity.resetEpoch != txResetEpoch or
       identity.vif >= MAX_VIFS.uint8:
     return false
@@ -48,7 +49,8 @@ proc txlSessionCurrent(identity: TxSessionIdentity; desc: ptr HostTxDescView): b
       staDeleteEpoch(identity.station) != identity.stationEpoch or
       txlVifIsRetiring(identity.vif):
     return false
-  desc != nil and desc.vifIdx == identity.vif and desc.staInfoIdx == identity.station
+  not checkDescriptor or
+    (desc != nil and desc.vifIdx == identity.vif and desc.staInfoIdx == identity.station)
 
 proc txlStationAdmits(desc: ptr HostTxDescView): bool =
   if txlResetting() or desc == nil or desc.vifIdx >= MAX_VIFS.uint8:
@@ -180,6 +182,83 @@ proc txlEnqueuePrepared(param, linkPtr: pointer; queueIdx: uint32) =
   tail[] = linkPtr
   link.next = nil
 
+when defined(bl808m0):
+  const
+    TxFeedbackRateMask = 0x3FFF'u32
+    TxFeedbackSlotAttempts = 4
+
+  proc txlHostSlot(desc: ptr HostTxDescView): int =
+    # Same slot geometry as ipc_host_init. Reject internal descriptors before
+    # looking at the overlapping inline buffer past desc.callback.
+    const wrapperOffset = 6932'u
+    const wrapperSize = 620'u
+    let first = cast[uint](addr ipcSharedEnv[0]) + wrapperOffset +
+      offsetof(IpcHostTxWrapperView, txDesc).uint
+    let offset = cast[uint](desc) - first
+    if offset >= wrapperSize * txRateTrialTag.len.uint or offset mod wrapperSize != 0:
+      return -1
+    (offset div wrapperSize).int
+
+  proc txlPolicyRates(policy: ptr HostTxRateTemplateView): array[4, uint32] {.inline.} =
+    [policy.rateWord, policy.retryRateControl0, policy.retryRateControl1,
+     policy.retryRateControl2]
+
+  proc txlForgetRateTrial(desc: ptr HostTxDescView) {.inline.} =
+    let slot = txlHostSlot(desc)
+    if slot >= 0:
+      txRateTrialTag[slot] = 0
+      txRateSampleTag[slot] = 0
+
+  proc txlCurrentRateTrial(staIdx: uint8):
+      tuple[tag: uint32, config: uint32, sampleIndex: uint16] =
+    if staIdx >= rcTrialSerial.len.uint8:
+      return
+    let sta = staInfoForIdx(staIdx)
+    if (sta.txPolicyUpdateFlags[0] and StaTxPolicyUpdateRateControl) != 0:
+      return
+    rcArmedRateTrial(staIdx, sta.rcStats)
+
+  proc txlTagRateFeedback(desc: ptr HostTxDescView; policy: ptr HostTxRateTemplateView) =
+    let slot = txlHostSlot(desc)
+    if slot < 0:
+      return
+    txRateTrialTag[slot] = 0
+    txRateSampleTag[slot] = 0
+    let staIdx = desc.staInfoIdx
+    if staIdx >= rcRateSampleEpoch.len.uint8:
+      return
+    # High half: sample-table epoch. Low half: index + 1 per physical slot;
+    # zero means the submitted slot did not resolve to a station sample.
+    var sampleTag = rcRateSampleEpoch[staIdx].uint32 shl 16
+    txRateSampleTag[slot] = sampleTag
+    let sta = staInfoForIdx(staIdx)
+    let stats = sta.rcStats
+    if stats == nil or desc.policy != sta.txPolicy or
+        (sta.txPolicyUpdateFlags[0] and StaTxPolicyUpdateRateControl) != 0:
+      return
+    let count = rcRateCapabilities(stats).sampleCount
+    if count == 0 or count > RC_MAX_RATE_ENTRIES.uint16:
+      return
+    static: doAssert RC_MAX_RATE_ENTRIES < 15
+    let rotate = (rcU8(stats, RCS_ANOTHER_FLAG) and 3).int
+    for physicalSlot, word in txlPolicyRates(policy):
+      let index = rcRetryStep(stats, (rotate + physicalSlot) and 3).rateIdx
+      if index < count and (word and (0x8000_0000'u32 or TxFeedbackRateMask)) ==
+          (0x8000_0000'u32 or (rcRateConfig(stats, index.int).uint32 and TxFeedbackRateMask)):
+        sampleTag = sampleTag or ((index.uint32 + 1) shl (physicalSlot * 4))
+    txRateSampleTag[slot] = sampleTag
+    let trial = rcArmedRateTrial(staIdx, stats)
+    if trial.tag != 0 and ((sampleTag shr ((trial.tag and 3).int * 4)) and 0xF) ==
+        trial.sampleIndex.uint32 + 1:
+      txRateTrialTag[slot] = trial.tag
+
+when defined(bl808WifiDiagTcpFallbackAb) or defined(bl808WifiDiagTcpDmaTiming):
+  include tx_tcp_host_packet
+when defined(bl808WifiDiagTcpFallbackAb):
+  include tx_tcp_fallback_ab
+when defined(bl808WifiDiagTcpDmaShape):
+  include tx_tcp_dma_shape
+
 proc txlPrepareBuffer(param: pointer; queueIdx, flags: uint32): pointer =
   ## Prepare the inline buffer without publishing it. The vendor allocator
   ## performs this work and queue insertion in one call.
@@ -238,6 +317,9 @@ proc txlPrepareBuffer(param: pointer; queueIdx, flags: uint32): pointer =
 
   let protoTrace = desc.frameLen
   let protoFrameType = lmacGateHalfword(protoTrace)
+  when defined(bl808WifiDiagTcpFallbackAb):
+    if protoFrameType == 0x0800'u16:
+      txlConfigureTcpFallback(desc, rateTemplate, bufLink.ackPolicyControl)
   when defined(bl808WifiBootstrapRetryWorkaround):
     let isBootstrapData =
       protoFrameType == 0x0800'u16 or protoFrameType == 0x0806'u16
@@ -247,22 +329,62 @@ proc txlPrepareBuffer(param: pointer; queueIdx, flags: uint32): pointer =
     nimFwDbgDhcpTxPolicy = pointerAddrU32(desc.policy)
     nimFwDbgDhcpTxBufDesc = pointerAddrU32(cast[pointer](bufLink))
     nimFwDbgDhcpTxHwDesc = pointerAddrU32(desc.hwDesc)
-    captureDhcpTxRateRaw(rateTemplate)
-    nimFwDbgDhcpTxRate0 =
-      rateTemplate.magic xor (rateTemplate.ntxConfig shl 16)
-    nimFwDbgDhcpTxRate1 =
-      rateTemplate.pendingCount xor (rateTemplate.policyWord shl 16)
-    nimFwDbgDhcpTxRate2 =
-      rateTemplate.rateWord xor (cast[uint32](rateTemplate.txPower) shl 16)
-    nimFwDbgDhcpTxRate3 =
-      rateTemplate.retryTxPowerControl0 xor (rateTemplate.retryTxPowerControl1 shl 16) xor
-      rateTemplate.retryTxPowerControl2
+    when not defined(bl808WifiDiagDhcpTxAttempts):
+      captureDhcpTxRateRaw(rateTemplate)
+      nimFwDbgDhcpTxRate0 =
+        rateTemplate.magic xor (rateTemplate.ntxConfig shl 16)
+      nimFwDbgDhcpTxRate1 =
+        rateTemplate.pendingCount xor (rateTemplate.policyWord shl 16)
+      nimFwDbgDhcpTxRate2 =
+        rateTemplate.rateWord xor (cast[uint32](rateTemplate.txPower) shl 16)
+      nimFwDbgDhcpTxRate3 =
+        rateTemplate.retryTxPowerControl0 xor (rateTemplate.retryTxPowerControl1 shl 16) xor
+        rateTemplate.retryTxPowerControl2
     nimFwDbgDhcpTxLink0 = bufLink.ackPolicyControl
     nimFwDbgDhcpTxLink1 = bufLink.retryLimitControl
   let isEapol = protoTrace == 0x8E88'u16 or protoTrace == 0x888E'u16
   if isEapol:
     when defined(bl808WifiBootstrapRetryWorkaround):
       txlApplyEapolRetryPolicy(rateTemplate)
+    when defined(bl808WifiDiagEapolLongGi):
+      when defined(bl808WifiBootstrapRetryWorkaround):
+        {.error: "EAPOL guard-interval diagnosis requires the normal TX power policy".}
+      # Keep the factory power words and the station policy unchanged.
+      template useLongGi(word: untyped) =
+        if ((word shr 11) and 7'u32) in [2'u32, 3'u32]:
+          word = word and not 0x200'u32
+      useLongGi(rateTemplate.rateWord)
+      useLongGi(rateTemplate.retryRateControl0)
+      useLongGi(rateTemplate.retryRateControl1)
+      useLongGi(rateTemplate.retryRateControl2)
+    when defined(bl808WifiDiagEapolCck):
+      when defined(bl808WifiBootstrapRetryWorkaround) or defined(bl808WifiDiagEapolLongGi):
+        {.error: "The EAPOL CCK diagnostic requires the unmodified station rate policy".}
+      # Promote the existing 1 Mbps retry entry and its own factory power.
+      let cckRate = rateTemplate.retryRateControl2
+      let cckPower = rateTemplate.retryTxPowerControl2
+      if (cckRate and 0x00003C7F'u32) == 0x00000400'u32:
+        rateTemplate.rateWord = cckRate
+        rateTemplate.retryRateControl0 = cckRate
+        rateTemplate.retryRateControl1 = cckRate
+        rateTemplate.txPower = cast[int32](cckPower)
+        rateTemplate.retryTxPowerControl0 = cckPower
+        rateTemplate.retryTxPowerControl1 = cckPower
+    elif not defined(bl808WifiBootstrapRetryWorkaround) and not defined(bl808WifiDiagEapolLongGi):
+      # Eight attempts can exhaust two four-attempt slots without reaching
+      # the last entry. Give control-port frames a reachable CCK fallback
+      # when two slots hold equivalent HT rates or an HT/OFDM pair.
+      const rateIdentity = 0x000039FF'u32 # format, bandwidth and MCS
+      let primary = rateTemplate.rateWord
+      let second = rateTemplate.retryRateControl0
+      let last = rateTemplate.retryRateControl2
+      let secondIsOfdm =
+        ((second shr 11) and 7'u32) <= 1 and (second and 0x7F'u32) in 4'u32 .. 11'u32
+      if ((primary shr 11) and 7'u32) in [2'u32, 3'u32] and
+          (secondIsOfdm or (primary and rateIdentity) == (second and rateIdentity)) and
+          (last and 0x80003FFF'u32) == 0x80000400'u32:
+        rateTemplate.retryRateControl0 = last
+        rateTemplate.retryTxPowerControl0 = rateTemplate.retryTxPowerControl2
     nimFwDbgEapolTxPolicy = pointerAddrU32(desc.policy)
     nimFwDbgEapolTxBufDesc = pointerAddrU32(cast[pointer](bufLink))
     nimFwDbgEapolTxHwDesc = pointerAddrU32(desc.hwDesc)
@@ -277,6 +399,8 @@ proc txlPrepareBuffer(param: pointer; queueIdx, flags: uint32): pointer =
       (rateTemplate.retryRateControl2 shl 2) xor (rateTemplate.retryTxPowerControl2 shl 16)
     nimFwDbgEapolTxLink0 = bufLink.ackPolicyControl
     nimFwDbgEapolTxLink1 = bufLink.retryLimitControl
+  when defined(bl808m0):
+    txlTagRateFeedback(desc, rateTemplate)
   when defined(bl808WifiConnectTrace):
     if protoFrameType == 0x0800'u16 or protoFrameType == 0x0806'u16:
       nimFwConnectTrace2U32("[WIFI-CT] txbuf_data ",
@@ -454,11 +578,18 @@ proc txl_cfm_init*() {.exportc, cdecl.} =
   co_list_init(addr cfmEnv.lists[3])
   co_list_init(addr cfmEnv.lists[4])
 
+const WifiTxFrameSuccessfulBit = 1'u32 shl 23
+
 proc noteMgmtTxConfirm(desc: ptr HostTxDescView; status: uint32; phase: uint32) {.inline.} =
   if desc == nil or desc.bufDesc == nil or desc.hwDesc == nil:
     return
   let link = hostTxLinkDescAt(desc.bufDesc)
   let fc = link.macHeader[0].uint32 or (link.macHeader[1].uint32 shl 8)
+  when defined(bl808WifiApDiscoveryDiag):
+    if phase == 2 and (fc and 0xFC'u32) == 0x50'u32:
+      let thd = hostTxHeadThd(hostTxHwDescAt(desc.hwDesc))
+      let flags = if thd != nil: thd.flags else: 0'u32
+      apProbeNoteCompletion(txlFrameLeaseToken(desc), status, flags)
   if fc != 0x00B0'u32 and fc != 0x0000'u32:
     return
   let hw = hostTxHwDescAt(desc.hwDesc)
@@ -469,6 +600,11 @@ proc noteMgmtTxConfirm(desc: ptr HostTxDescView; status: uint32; phase: uint32) 
     (phase shl 28)
   let thd = hostTxHeadThd(hw)
   let thdFlags = if thd != nil: thd.flags else: 0'u32
+  # me_tx_cfm_singleton adds bit 16 to the failed-attempt count.
+  let finalFailed = (thdFlags and 0x00010000'u32) != 0
+  let acked = not finalFailed and (status and WifiTxFrameSuccessfulBit) != 0
+  # Software flushes retire frames through the same event without a MAC result.
+  let hardwareDone = cast[int32](status) < 0 # Completion bit, as in txl_transmit_trigger.
   if fc == 0x00B0'u32:
     case phase
     of 0'u32:
@@ -482,12 +618,10 @@ proc noteMgmtTxConfirm(desc: ptr HostTxDescView; status: uint32; phase: uint32) 
     nimFwDbgAuthCfmStatus = status
     nimFwDbgAuthCfmHwStatus = hw.confirmStatus or (hw.status shl 16)
     nimFwDbgAuthCfmThdFlags = thdFlags
-    if (thdFlags and 0x00010000'u32) != 0:
-      inc nimFwDbgAuthCfmAckOk16
-    elif (status and 0x00800000'u32) != 0'u32:
-      inc nimFwDbgAuthCfmAckOk23
-    elif phase == 0'u32:
-      inc nimFwDbgAuthCfmAckFail
+    if phase == 2 and hardwareDone:
+      if finalFailed: inc nimFwDbgAuthCfmFinalFail16
+      if acked: inc nimFwDbgAuthCfmAckOk23
+      else: inc nimFwDbgAuthCfmAckFail
     nimFwDbgAuthCfmDesc = pointerAddrU32(cast[pointer](desc))
     nimFwDbgAuthCfmMeta = meta
     nimFwDbgAuthCfmFc = fc
@@ -504,12 +638,10 @@ proc noteMgmtTxConfirm(desc: ptr HostTxDescView; status: uint32; phase: uint32) 
     nimFwDbgAssocCfmStatus = status
     nimFwDbgAssocCfmHwStatus = hw.confirmStatus or (hw.status shl 16)
     nimFwDbgAssocCfmThdFlags = thdFlags
-    if (thdFlags and 0x00010000'u32) != 0:
-      inc nimFwDbgAssocCfmAckOk16
-    elif (status and 0x00800000'u32) != 0'u32:
-      inc nimFwDbgAssocCfmAckOk23
-    elif phase == 0'u32:
-      inc nimFwDbgAssocCfmAckFail
+    if phase == 2 and hardwareDone:
+      if finalFailed: inc nimFwDbgAssocCfmFinalFail16
+      if acked: inc nimFwDbgAssocCfmAckOk23
+      else: inc nimFwDbgAssocCfmAckFail
     nimFwDbgAssocCfmDesc = pointerAddrU32(cast[pointer](desc))
     nimFwDbgAssocCfmMeta = meta
     nimFwDbgAssocCfmFc = fc
@@ -576,6 +708,99 @@ proc txl_cfm_push*(desc: pointer, status: uint32, acIdx: uint32) {.exportc, cdec
       nimFwConnectTrace2U32("[WIFI-CT] cfm_links ",
                             trace.queue, trace.buffer)
 
+when defined(bl808m0):
+  type TxRateFeedback = object
+    session: TxSessionIdentity
+    trial, samples: uint32
+    rates: array[4, uint16]
+    attempts: uint8
+    failed: bool
+
+  proc txlCaptureRateFeedback(desc: ptr HostTxDescView): TxRateFeedback =
+    let slot = txlHostSlot(desc)
+    if slot < 0:
+      return
+    let trial = txRateTrialTag[slot]
+    let samples = txRateSampleTag[slot]
+    txRateTrialTag[slot] = 0
+    txRateSampleTag[slot] = 0
+    if desc.queueFirst == nil or desc.staInfoIdx >= rcTrialSerial.len.uint8 or
+        desc.hwDesc != cast[pointer](addr desc.aggDescPtr):
+      return
+    let hw = hostTxHwDescAt(desc.hwDesc)
+    let thd = hostTxHeadThd(hw)
+    if hw.magic != 0xCAFE_BABE'u32 or
+        cast[pointer](thd) != cast[pointer](addr desc.aggDescStorage[0]):
+      return
+    let status = thd.flags
+    const txDone = 1'u32 shl 31
+    const swDone = 1'u32 shl 30
+    const retryLimit = 1'u32 shl 16
+    const lifetimeExpired = 1'u32 shl 17
+    let failed = (status and retryLimit) != 0
+    let acked = (status and WifiTxFrameSuccessfulBit) != 0
+    const rtsRetries = 0xFF'u32
+    if (status and (txDone or swDone or lifetimeExpired or rtsRetries)) != txDone or
+        failed == acked or hw.ackPolicyControl != 0x2200:
+      return
+    let policy = hostTxRateTemplate(hostTxInlineBufferedLink(desc))
+    if hw.chainedThd != cast[pointer](policy) or policy.magic != 0xBADC_AB1E'u32 or
+        (policy.policyWord and 0xFFFF'u32) != 0x0704'u32:
+      return
+    let attempts = ((status shr 8) and 0xFF'u32) + 1
+    # A retry-limit status supplies failures for every reported attempt,
+    # even when the hardware ended before the programmed eight-attempt cap.
+    if attempts > 8:
+      return
+    let words = txlPolicyRates(policy)
+    for i in 0 ..< (attempts.int + TxFeedbackSlotAttempts - 1) div TxFeedbackSlotAttempts:
+      if (words[i] and 0x8000_0000'u32) == 0:
+        return
+    result = TxRateFeedback(session: txlCaptureSession(desc), trial: trial, samples: samples,
+                            attempts: attempts.uint8, failed: failed)
+    for i, word in words:
+      result.rates[i] = (word and TxFeedbackRateMask).uint16
+
+  proc txlApplyRateFeedback(feedback: TxRateFeedback; owner: ptr TxFlushBatch;
+                            node: ptr CoListHdr) =
+    if feedback.attempts == 0 or not feedback.session.captured:
+      return
+    if feedback.failed:
+      rf_dump_status()
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    let desc = hostTxDescAt(cast[pointer](node))
+    if owner.confirmations.first != node or
+        not txlSessionCurrent(feedback.session, desc):
+      return
+    let staIdx = feedback.session.station
+    let epochCurrent = (feedback.samples shr 16) == rcRateSampleEpoch[staIdx].uint32
+    var samples = if epochCurrent: (feedback.samples and 0xFFFF).uint16 else: high(uint16)
+    let activeTrial = txlCurrentRateTrial(staIdx)
+    let trialSlot = (feedback.trial and 3).int
+    let sampleShift = trialSlot * 4
+    let reachedTrialSlot = trialSlot * TxFeedbackSlotAttempts < feedback.attempts.int
+    var trial = activeTrial
+    if activeTrial.tag == 0 and feedback.trial != 0 and epochCurrent and reachedTrialSlot:
+      # A second completion can credit a finished trial before its chain is restored.
+      let sta = staInfoForIdx(staIdx)
+      let stats = sta.rcStats
+      if stats != nil and rcTrialControl(stats).status == 3 and
+          sta.txPolicy != nil and desc.policy == sta.txPolicy and
+          (sta.txPolicyUpdateFlags[0] and StaTxPolicyUpdateRateControl) == 0:
+        trial = rcArmedRateTrial(staIdx, stats, includeCompleted = true)
+    let creditTrialSlot = epochCurrent and trial.tag != 0 and trial.tag == feedback.trial and
+      reachedTrialSlot and
+      feedback.rates[trialSlot].uint32 == trial.config and
+      ((samples shr sampleShift) and 0xF) == trial.sampleIndex + 1
+    let finishTrial = creditTrialSlot and activeTrial.tag != 0
+    if feedback.trial != 0 and not creditTrialSlot:
+      # Retired trials must not turn into ordinary feedback for the new sample.
+      samples = samples or (0xF'u16 shl sampleShift)
+    rcAccountCounters(staIdx, feedback.attempts.uint32,
+      feedback.attempts.uint32 - (not feedback.failed).uint32,
+      unsafeAddr feedback.rates, finishTrial, samples)
+
 proc txlCfmPending(acList: ptr CoList): bool {.inline.} =
   acList.first != nil
 
@@ -596,7 +821,7 @@ proc txl_cfm_evt*(ac: uint8) {.exportc, cdecl.} =
   # Assert event is pending (blob: ke_env[0] & evtField != 0)
   let keEvtBits = cast[ptr uint32](addr ke_env[0])[]
   if (keEvtBits and evtField) == 0:
-    assert_err("txl_cfm.c", "txl_cfm.c", 346)
+    assert_err("ke_evt_get() & evt_bit", "module", 346)
     return
   let acMask = 1'u32 shl acIdx
 
@@ -615,11 +840,12 @@ proc txl_cfm_evt*(ac: uint8) {.exportc, cdecl.} =
     let trace = block:
       var published = false
       let irqState = irqSave()
+      var irqHeld = true
       {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
       defer:
         {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
         try:
-          irqRestore(irqState)
+          if irqHeld: irqRestore(irqState)
         finally:
           if published:
             ipc_emb_txcfm_ind(acMask)
@@ -651,18 +877,28 @@ proc txl_cfm_evt*(ac: uint8) {.exportc, cdecl.} =
         destination: pointerAddrU32(descTrace.cfmDst), thdStatus: thdStatusTrace)
       if enabled:
         inc nimFwDbgCfmTraceCount
+      when defined(bl808m0):
+        let feedback = txlCaptureRateFeedback(descTrace)
+      irqHeld = false
+      irqRestore(irqState)
       # Finish peer-dependent work before a restart can reuse the station.
-      try:
-        me_tx_cfm_singleton(cast[pointer](node))
-      finally:
-        # Nested retirement may already have delivered this completion.
-        if completing.confirmations.first == node:
-          completing.confirmations = default(CoList)
-          txu_cntrl_cfm(cast[pointer](node))
-          txCtrl.packetCounter = txCtrl.packetCounter - 1
-          # Publish before an interrupt can recycle the completed wrapper.
-          ipc_emb_txcfm(cast[pointer](node))
-          published = true
+      if completing.confirmations.first == node:
+        try:
+          when defined(bl808m0):
+            txlApplyRateFeedback(feedback, addr completing, node)
+          else:
+            me_tx_cfm_singleton(cast[pointer](node))
+        finally:
+          # Nested retirement may already have delivered this completion.
+          let commitIrq = irqSave()
+          defer: irqRestore(commitIrq)
+          if completing.confirmations.first == node:
+            completing.confirmations = default(CoList)
+            txu_cntrl_cfm(cast[pointer](node))
+            txCtrl.packetCounter = txCtrl.packetCounter - 1
+            # Publish before an interrupt can recycle the completed wrapper.
+            ipc_emb_txcfm(cast[pointer](node))
+            published = true
       snapshot
     if trace.enabled:
       nimFwTrace2U32("[WIFI-NIMFW] cfm_evt ",
@@ -714,6 +950,15 @@ proc txl_cfm_flush*(ac: uint8; cfmList: ptr CoList;
     let linkDesc = txDesc.dmaLink
 
     let thd = hostTxHeadThd(hostTxHwDescAt(thdChainPtr))
+    when defined(bl808WifiApHttpSmoke):
+      if ac == 4 and thdChainPtr == cast[pointer](addr txl_bcn_hwdesc_pool[0]):
+        let hwStatus = volatileLoad(cast[ptr uint32](cast[uint](thdChainPtr) +
+          offsetof(HostTxHwDescView, confirmStatus).uint))
+        inc apBeaconDmaTrace.flushed
+        if (hwStatus and 0x80000000'u32) != 0:
+          inc apBeaconDmaTrace.flushedDone
+        apBeaconDmaTrace.lastFlushStatus = hwStatus
+        apBeaconDmaTrace.lastFlushCfm = thd.flags
     if linkDesc != nil:
       # DMA owned: force confirm with 0x3C000000 | status
       thd.flags = forcedStatus
@@ -965,16 +1210,12 @@ proc txl_cntrl_push*(param: pointer, ac: uint8): uint8 {.exportc, cdecl.} =
       txuCancelFrame(param, ac)
       return 0'u8
     ensurePreparedSession()
-  # Complete per-peer work before DMA publication can return the descriptor.
+  # Save the PS arguments before DMA publication can return the descriptor.
   let vifIdx = desc.vifIdx
   let staIdx = desc.staInfoIdx
   td_pck_ind(vifIdx, staIdx, 0)
   ensurePreparedSession()
-  # Power save check (blob: ps_check_tx_frame(desc[49], desc[46]) at 0xb0).
-  # desc[46] carries the TX TID/AC selector for the vendor PS path.
   let txTid = desc.staIdx
-  discard ps_check_tx_frame(staIdx, txTid)
-  ensurePreparedSession()
   # Software ownership and accounting must precede the first hardware trigger.
   txlEnqueuePrepared(param, desc.bufDesc, ac.uint32)
   co_list_push_back(addr txControlAc(ac.uint32).pending, cast[ptr CoListHdr](param))
@@ -982,6 +1223,8 @@ proc txl_cntrl_push*(param: pointer, ac: uint8): uint8 {.exportc, cdecl.} =
   txCtrl.packetCounter = txCtrl.packetCounter + 1
   txl_payload_handle_backup(nil)
   # No descriptor access after this call: completion may have recycled it.
+  if txlSessionCurrent(identity, nil, checkDescriptor = false):
+    discard ps_check_tx_frame(staIdx, txTid)
   return 0'u8
 
 proc txl_cntrl_push_int*(param: pointer, ac: uint8): uint8 {.exportc, cdecl.} =
@@ -990,7 +1233,9 @@ proc txl_cntrl_push_int*(param: pointer, ac: uint8): uint8 {.exportc, cdecl.} =
   ##   txl_int_fake_transfer, co_list_push_back(x2), txl_payload_handle_backup,
   ##   txl_frame_release, apm_tx_int_ps_postpone.
   let saved = irqSave()
-  defer: irqRestore(saved)
+  var irqHeld = true
+  defer:
+    if irqHeld: irqRestore(saved)
   let desc = hostTxDescAt(param)
   if ac >= NUM_TX_QUEUES.uint8:
     if desc != nil:
@@ -1006,7 +1251,7 @@ proc txl_cntrl_push_int*(param: pointer, ac: uint8): uint8 {.exportc, cdecl.} =
     if not txlFrameLeaseMatches(desc, generation):
       return 0'u8
     if not txlSessionCurrent(identity, desc) or not txlStationAdmits(desc) or
-        not txSecurityCurrent(desc):
+        not txSecurityCurrent(desc, allowInternalNull = true):
       txl_frame_release(param, false)
       return 0'u8
   inc nimFwDbgTxIntEnter
@@ -1155,6 +1400,8 @@ proc txl_cntrl_push_int*(param: pointer, ac: uint8): uint8 {.exportc, cdecl.} =
       if isTrackedNullFrame:
         inc nimFwDbgNullFrameQueued
       inc nimFwDbgTxIntPush
+      irqHeld = false
+      irqRestore(saved)
       txl_payload_handle_backup(param)
       # Ownership may have completed or moved to a new lease during the drain.
       return 1'u8
@@ -1211,14 +1458,17 @@ proc txl_cntrl_push_int_force*(param: pointer, ac: uint8): uint8 {.exportc, cdec
   ## Force push an internal frame to TX control (106 bytes in blob).
   ## Blob: set rcStats[60]|=0x100, irqSave, txl_int_fake_transfer,
   ## co_list_push_back, irqRestore, increment pktCnt, txl_payload_handle_backup.
+  ## Nim counts before restoring IRQ state so completion cannot overtake it.
   let saved = irqSave()
-  defer: irqRestore(saved)
+  var irqHeld = true
+  defer:
+    if irqHeld: irqRestore(saved)
   let desc = hostTxDescAt(param)
   if ac >= NUM_TX_QUEUES.uint8:
     if desc != nil:
       txl_frame_release(param, false)
     return 0
-  if not txlStationAdmits(desc) or not txSecurityCurrent(desc):
+  if not txlStationAdmits(desc) or not txSecurityCurrent(desc, allowInternalNull = true):
     if desc != nil:
       txl_frame_release(param, false)
     return 0
@@ -1233,6 +1483,8 @@ proc txl_cntrl_push_int_force*(param: pointer, ac: uint8): uint8 {.exportc, cdec
   let txCtrl = txControlEnv()
   txCtrl.packetCounter = txCtrl.packetCounter + 1
   # Handle TX backup/scheduling (blob: txl_payload_handle_backup at 0x52)
+  irqHeld = false
+  irqRestore(saved)
   txl_payload_handle_backup(param)
   return 1'u8
 
@@ -1249,7 +1501,7 @@ proc txl_cntrl_halt_ac*(ac: uint8): bool {.exportc, cdecl.} =
     triggerMasks = [0x10000'u32, 0x20000, 0x40000, 0x80000, 0x8000]
     statusMasks = [0x30'u32, 0x300, 0x3000, 0x30000, 0x03]
   if ac >= NUM_TX_QUEUES.uint8:
-    assert_err("txl_cntrl.c", "txl_cntrl.c", 0x700)
+    assert_err("0", "module", 0x700)
     return false
   let saved = irqSave()
   defer: irqRestore(saved)
@@ -1891,52 +2143,55 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
               nimFwDbgAssocPayHw2 = thd.retryLimitControl
               nimFwDbgAssocPayHw3 = thd.ackPolicyControl
             if lmacGateHalfword(actual.frameLen) == 0x0800'u16:
-              let rateForDhcp = hostTxRateTemplate(linkDesc)
               nimFwDbgDhcpTxBufDesc = pointerAddrU32(actual.bufDesc)
               nimFwDbgDhcpTxHwDesc = pointerAddrU32(actual.hwDesc)
-              captureDhcpTxRateRaw(rateForDhcp)
-              checkDmaOwner()
-              nimFwDbgDhcpTxRate0 =
-                rateForDhcp.magic xor (rateForDhcp.ntxConfig shl 16)
-              nimFwDbgDhcpTxRate1 =
-                rateForDhcp.pendingCount xor (rateForDhcp.policyWord shl 16)
-              nimFwDbgDhcpTxRate2 =
-                rateForDhcp.rateWord xor (cast[uint32](rateForDhcp.txPower) shl 16)
-              nimFwDbgDhcpTxRate3 =
-                rateForDhcp.retryTxPowerControl0 xor (rateForDhcp.retryTxPowerControl1 shl 16) xor
-                rateForDhcp.retryTxPowerControl2
-              nimFwDbgDhcpTxLink0 = linkDesc.ackPolicyControl
-              nimFwDbgDhcpTxLink1 = linkDesc.retryLimitControl
-              nimFwDbgDhcpTxThd0 =
-                thd.status xor (thd.frameLen shl 16)
-              nimFwDbgDhcpTxThd1 =
-                thd.retryLimitControl xor (pointerAddrU32(thd.chainedThd) shl 16)
-              nimFwDbgDhcpTxThd2 =
-                thd.ackPolicyControl xor (thd.controlFlags shl 16)
-              nimFwDbgDhcpTxFinalDesc0 =
-                actual.frameLen.uint32 or
-                (actual.hdrLen.uint32 shl 16) or
-                (actual.qosExtLen.uint32 shl 24)
-              nimFwDbgDhcpTxFinalDesc1 =
-                actual.secTailLen.uint32 or
-                (actual.staIdx.uint32 shl 8) or
-                (actual.vifIdx.uint32 shl 16) or
-                (actual.staInfoIdx.uint32 shl 24)
-              nimFwDbgDhcpTxFinalBuf0 = actual.bufferPtrs[0]
-              nimFwDbgDhcpTxFinalLen0 = actual.bufferLens[0]
-              nimFwDbgDhcpTxFinalHwStart = thd.payloadStart
-              nimFwDbgDhcpTxFinalHwEnd = thd.payloadEnd
-              nimFwDbgDhcpTxFinalHwLen = thd.frameLen
-              nimFwDbgDhcpTxFinalHwFlags = thd.controlFlags
-              nimFwDbgDhcpTxFinalHthdStart = linkDesc.headerThd.payloadStart
-              nimFwDbgDhcpTxFinalHthdEnd = linkDesc.headerThd.payloadEnd
-              nimFwDbgDhcpTxFinalHthdNext = pointerAddrU32(linkDesc.headerThd.next)
-              nimFwDbgDhcpTxFinalHthdFlags = linkDesc.headerThd.flags
-              nimFwDbgDhcpTxFinalPthdStart = linkDesc.payloadThd[0].payloadStart
-              nimFwDbgDhcpTxFinalPthdEnd = linkDesc.payloadThd[0].payloadEnd
-              nimFwDbgDhcpTxFinalPthdNext = pointerAddrU32(linkDesc.payloadThd[0].next)
-              nimFwDbgDhcpTxFinalPthdFlags = linkDesc.payloadThd[0].flags
-              nimFwDbgDhcpTxFinalBreakpoint()
+              # This legacy pre-head snapshot matches all IPv4, not just DHCP.
+              when defined(bl808WifiDiagDhcpTxFinalSnapshot) and
+                  not defined(bl808WifiDiagDhcpTxAttempts):
+                let rateForDhcp = hostTxRateTemplate(linkDesc)
+                captureDhcpTxRateRaw(rateForDhcp)
+                checkDmaOwner()
+                nimFwDbgDhcpTxRate0 =
+                  rateForDhcp.magic xor (rateForDhcp.ntxConfig shl 16)
+                nimFwDbgDhcpTxRate1 =
+                  rateForDhcp.pendingCount xor (rateForDhcp.policyWord shl 16)
+                nimFwDbgDhcpTxRate2 =
+                  rateForDhcp.rateWord xor (cast[uint32](rateForDhcp.txPower) shl 16)
+                nimFwDbgDhcpTxRate3 =
+                  rateForDhcp.retryTxPowerControl0 xor (rateForDhcp.retryTxPowerControl1 shl 16) xor
+                  rateForDhcp.retryTxPowerControl2
+                nimFwDbgDhcpTxLink0 = linkDesc.ackPolicyControl
+                nimFwDbgDhcpTxLink1 = linkDesc.retryLimitControl
+                nimFwDbgDhcpTxThd0 =
+                  thd.status xor (thd.frameLen shl 16)
+                nimFwDbgDhcpTxThd1 =
+                  thd.retryLimitControl xor (pointerAddrU32(thd.chainedThd) shl 16)
+                nimFwDbgDhcpTxThd2 =
+                  thd.ackPolicyControl xor (thd.controlFlags shl 16)
+                nimFwDbgDhcpTxFinalDesc0 =
+                  actual.frameLen.uint32 or
+                  (actual.hdrLen.uint32 shl 16) or
+                  (actual.qosExtLen.uint32 shl 24)
+                nimFwDbgDhcpTxFinalDesc1 =
+                  actual.secTailLen.uint32 or
+                  (actual.staIdx.uint32 shl 8) or
+                  (actual.vifIdx.uint32 shl 16) or
+                  (actual.staInfoIdx.uint32 shl 24)
+                nimFwDbgDhcpTxFinalBuf0 = actual.bufferPtrs[0]
+                nimFwDbgDhcpTxFinalLen0 = actual.bufferLens[0]
+                nimFwDbgDhcpTxFinalHwStart = thd.payloadStart
+                nimFwDbgDhcpTxFinalHwEnd = thd.payloadEnd
+                nimFwDbgDhcpTxFinalHwLen = thd.frameLen
+                nimFwDbgDhcpTxFinalHwFlags = thd.controlFlags
+                nimFwDbgDhcpTxFinalHthdStart = linkDesc.headerThd.payloadStart
+                nimFwDbgDhcpTxFinalHthdEnd = linkDesc.headerThd.payloadEnd
+                nimFwDbgDhcpTxFinalHthdNext = pointerAddrU32(linkDesc.headerThd.next)
+                nimFwDbgDhcpTxFinalHthdFlags = linkDesc.headerThd.flags
+                nimFwDbgDhcpTxFinalPthdStart = linkDesc.payloadThd[0].payloadStart
+                nimFwDbgDhcpTxFinalPthdEnd = linkDesc.payloadThd[0].payloadEnd
+                nimFwDbgDhcpTxFinalPthdNext = pointerAddrU32(linkDesc.payloadThd[0].next)
+                nimFwDbgDhcpTxFinalPthdFlags = linkDesc.payloadThd[0].flags
+                nimFwDbgDhcpTxFinalBreakpoint()
               checkDmaOwner()
             if traceMgmt or traceEapol:
               nimFwTrace2U32("[WIFI-NIMFW] pay_rate ",
@@ -2140,6 +2395,17 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
                                         cast[uint32](rate.txPower))
                   checkDmaOwner()
                   nimFwDbgEapolTraceCount = nimFwDbgEapolTraceCount + 1
+          when defined(bl808WifiDiagTcpDmaTiming):
+            var doorbellTick: uint32
+            var rangDoorbell = false
+          when defined(bl808WifiDiagTcpDmaShape):
+            var tcpPacket: TcpPathPacket
+            var dmaShape: uint32
+            if hasPayload != nil:
+              tcpPacket = txlObserveTcpHostPacket(actual)
+              if tcpPacket.ports != 0:
+                dmaShape = txlTcpDmaShape(actual, hostTxLinkDescAt(actual.bufDesc),
+                  hostTxHwDescAt(actual.hwDesc), tcpPacket)
           if listFirst == nil:
             inc nimFwDbgPayEmptyList
             if isTrackedNullFrame:
@@ -2186,6 +2452,8 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
                                         dmaStatus)
                   checkDmaOwner()
             if assertLine != 0 and dmaField == 2:
+              when defined(bl808WifiApHttpSmoke):
+                if ac == 4: inc apBeaconDmaTrace.dmaBusy
               assert_rec("txl_payload.c", "txl_payload.c", assertLine)
               checkDmaOwner()
             else:
@@ -2211,10 +2479,25 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
                 machwTxSetHead(ac, thdLink)
                 checkDmaOwner()
                 trigBits = 256
+                when defined(bl808WifiApHttpSmoke):
+                  inc apBeaconDmaTrace.armed
+                  apBeaconDmaTrace.lastHead = pointerAddrU32(thdLink)
               else:
                 discard
               machwTxTrigger(trigBits)
+              when defined(bl808WifiDiagTcpDmaTiming):
+                doorbellTick = tcpPathTick()
+                rangDoorbell = true
               checkDmaOwner()
+              blmac_abs_timer_set(ac, timerVal)
+              checkDmaOwner()
+              machwTxAggSet(acBit)
+              checkDmaOwner()
+              let aggOr = machwTxAggActive()
+              checkDmaOwner()
+              machwTxAggActiveSet(acBit or aggOr)
+              checkDmaOwner()
+              # Finish the start sequence before reading diagnostic registers.
               nimFwDbgPayTriggerLast = trigBits or (ac shl 16) or 0x80000000'u32
               nimFwDbgPayTxStatus = machwTxStatus()
               checkDmaOwner()
@@ -2227,15 +2510,6 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
               checkDmaOwner()
               if isTrackedNullFrame:
                 nimFwDbgNullFramePayTrigger = nimFwDbgPayTriggerLast
-              blmac_abs_timer_set(ac, timerVal)
-              checkDmaOwner()
-              # Set HW aggregation bits
-              machwTxAggSet(acBit)
-              checkDmaOwner()
-              let aggOr = machwTxAggActive()
-              checkDmaOwner()
-              machwTxAggActiveSet(acBit or aggOr)
-              checkDmaOwner()
               if traceMgmt or traceEapol:
                 nimFwTrace2U32("[WIFI-NIMFW] pay_regs ",
                                machwTxStatus(),
@@ -2252,7 +2526,8 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
             if isTrackedNullFrame:
               inc nimFwDbgNullFramePayNonEmpty
             # Non-empty list: link into existing chain and write trigger
-            hostTxThdAt(listFirst).next = thdLink
+            wifiDmaStoreLink(hostTxThdAt(listFirst),
+                             offsetof(HostTxThdEntryView, next).uint, thdLink)
             var triggerVal: uint32
             case ac
             of 3: triggerVal = 16
@@ -2261,6 +2536,9 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
             of 1: triggerVal = 4
             else: triggerVal = 2    # AC0
             machwTxTrigger(triggerVal)
+            when defined(bl808WifiDiagTcpDmaTiming):
+              doorbellTick = tcpPathTick()
+              rangDoorbell = true
             checkDmaOwner()
             nimFwDbgPayTriggerLast = triggerVal or (ac shl 16) or 0x40000000'u32
             nimFwDbgPayTxStatus = machwTxStatus()
@@ -2289,6 +2567,16 @@ proc txl_payload_handle_backup*(param: pointer) {.exportc, cdecl.} =
 
           # Update list head
           acCtrl.current = thdLink
+          when defined(bl808WifiDiagTcpDmaTiming):
+            if rangDoorbell and hasPayload != nil:
+              let packet = when defined(bl808WifiDiagTcpDmaShape): tcpPacket
+                           else: txlObserveTcpHostPacket(actual)
+              if packet.ports != 0:
+                let seqCtrl = cast[ptr MacDataFrameHeaderView](addr backupDesc.macHeader[0]).seqCtrl
+                logTcpPathAt(packet, tcpTxDoorbell, doorbellTick,
+                  tcpDoorbellDetail(seqCtrl, ac.uint8, actual.staIdx, listFirst != nil))
+                when defined(bl808WifiDiagTcpDmaShape):
+                  logTcpPathAt(packet, tcpTxDmaShape, doorbellTick, dmaShape)
         # Reentrant teardown/submission may have replaced the remaining queue.
         descPtr = backupHead[]
     if not txDmaRescan:
@@ -2319,13 +2607,16 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
   ##   6. Tail-call hal_machw_trigger_set(ac, ipc_base + offset) to start TX
   let savedIrq = irqSave()
   defer: irqRestore(savedIrq)
-  if txActiveTriggerOwner != nil:
+  template recoveryPending(): bool =
+    txlResetting() or (keEnvEventField()[] and KE_EVT_RESET) != 0
+  # The host pump can poll even when MAC recovery masks its IRQs.
+  if txActiveTriggerOwner != nil or recoveryPending():
     return
   var owner = TxDmaOwner(vif: 0xFF, station: 0xFF, ac: 0xFF)
   txActiveTriggerOwner = addr owner
   defer: txActiveTriggerOwner = nil
   template requireTrigger() =
-    if owner.cancelled: return
+    if owner.cancelled or recoveryPending(): return
   inc nimFwDbgTxTrigEntry
   const
     IPC_SHARED_TX_BASE  = 0x24B00120'u
@@ -2351,7 +2642,7 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
   let ac = acV
   owner.ac = ac.uint8
   if ac > 4:
-    assert_err("txl_cntrl.c", "txl_cntrl.c", 0x86C)
+    assert_err("access_category < NX_TXQ_CNT", "module", 0x86C)
 
   # Set up masks: acBit = 1 << ac, clearMask = ~(1 << ac)
   let clearMask = not (1'u32 shl ac)
@@ -2413,13 +2704,27 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
     let hardwareTarget = hwDesc.txConfirmDescPtr
     let secondaryTarget = hwDesc.secondaryTxHwDescPtr
     template requireFrame() =
-      if not txlTriggerFrameCurrent(addr owner, desc, hwDesc, addr acCtrl.pending,
-          linkPtrTrace, hostMarker, hardwareTarget, secondaryTarget):
+      if recoveryPending() or not txlTriggerFrameCurrent(addr owner, desc, hwDesc,
+          addr acCtrl.pending, linkPtrTrace, hostMarker, hardwareTarget, secondaryTarget):
         return
     let thdAddr = cast[uint](hwDesc)
-    let thdStatus = cast[int32](hwDesc.confirmStatus)
+    # The layout is packed, but DMA publishes this aligned word as a unit.
+    let statusWord = volatileLoad(cast[ptr uint32](thdAddr +
+      offsetof(HostTxHwDescView, confirmStatus).uint))
+    when defined(bl808WifiDiagTcpDmaTiming):
+      let completionTick = tcpPathTick()
+    when defined(bl808WifiApHttpSmoke):
+      if ac == 4 and hardwarePtr == cast[pointer](addr txl_bcn_hwdesc_pool[0]):
+        inc apBeaconDmaTrace.ready
+        apBeaconDmaTrace.lastReadyStatus = statusWord
+        if (statusWord and 0x80000000'u32) != 0:
+          inc apBeaconDmaTrace.done
+          apBeaconDmaTrace.lastDoneStatus = statusWord
+          if (statusWord and 0x00800000'u32) != 0:
+            inc apBeaconDmaTrace.success
+    let thdStatus = cast[int32](statusWord)
     nimFwDbgTxTrigLastDesc = pointerAddrU32(descPtr)
-    nimFwDbgTxTrigLastStatus = hwDesc.confirmStatus
+    nimFwDbgTxTrigLastStatus = statusWord
     if traceMgmt or traceEapol:
       nimFwTrace2U32("[WIFI-NIMFW] txtrig_desc ",
                      ac.uint32 or (txStatus shl 8),
@@ -2470,23 +2775,33 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
       # Fall through to .L134 path
     else:
       let secView = hostTxHwDescAt(secondaryTxHwDesc)
-      let secStatus = cast[int32](secView.controlFlags)
-      if secStatus >= 0:
-        # Secondary TX hardware descriptor not ready to pop: vendor rearms the AC timeout only.
-        # This is the ONLY silent exit past the head gate in this loop — the
-        # HW-correlated TX-dead wedge spins here (txtrig_entry ~1.1k/s with zero
-        # cfm while the head THD stays queued). Count it and snapshot BOTH
-        # candidate done-words so the sub-cause is decidable from the diag dump
-        # (sec_cfm bit31 set + sec_ctrl clear => wrong-word read; both clear =>
-        # MACHW never completed the secondary).
+      # A successor link points at wrapper+4. Its +60 is wrapper+64 (DONE),
+      # named controlFlags only because the packed view starts four bytes late.
+      let secStatus = volatileLoad(cast[ptr uint32](cast[uint](secView) +
+        offsetof(HostTxHwDescView, controlFlags).uint))
+      if (secStatus and 0x80000000'u32) == 0:
+        # The reference only rearms the AC timer until the successor is done.
         inc nimFwDbgTxTrigSecNotReady
-        nimFwDbgTxTrigSecCtrl = secView.controlFlags
+        nimFwDbgTxTrigSecCtrl = secStatus
         nimFwDbgTxTrigSecCfm = secView.confirmStatus
         let ipcBase = regRead(IPC_SHARED_TX_BASE)
         requireFrame()
         blmac_abs_timer_set(ac, ipcBase + TX_TIMEOUT_LOCAL[ac])
         return
-      # secStatus < 0: fall through to pop path (.L134)
+      # Successor DONE: fall through to pop path (.L134).
+
+    when defined(bl808WifiDiagEapolRfGain):
+      let index = nimFwDbgEapolRfGainCount
+      if traceEapol and hostMarker != nil and index < nimFwDbgEapolRfGainLog.len.uint32:
+        # Same RF status registers as the pinned cli.o:cmd_dump_txgain_register.
+        # These are completion-time samples, not a trace of the individual retries.
+        let pc = regRead(RfBase + 0x7A4'u)
+        let analog = regRead(RfBase + 0x04C'u)
+        let dfe = regRead(RfBase + 0x63C'u)
+        let control = regRead(RfBase + 0x02C'u)
+        requireFrame()
+        nimFwDbgEapolRfGainLog[index] = [thdStatus.uint32, pc, analog, dfe, control]
+        nimFwDbgEapolRfGainCount = index + 1
 
     let hostCfm = desc.queueFirst
     let isNullDataFrame = fcTrace == 0x48'u8 and fcTrace1 == 0x01'u8
@@ -2540,6 +2855,10 @@ proc txl_transmit_trigger*() {.exportc, cdecl.} =
                               cast[uint32](cast[uint](desc.bufDesc)))
         requireFrame()
     # Keep the frame visible to teardown until the diagnostic calls finish.
+    when defined(bl808WifiDiagTcpDmaTiming):
+      if hostCfm != nil:
+        logTcpPathAt(txlObserveTcpHostPacket(desc), tcpTxHardwareDone, completionTick,
+          statusWord)
     discard co_list_pop_front(addr acCtrl.pending)
     # Publication ends frame ownership; AC/session teardown still cancels
     # the remaining timer/queue work in this invocation.
@@ -2771,9 +3090,11 @@ proc txlFrameLeaseMatches(desc: ptr HostTxDescView; generation: uint32): bool =
   txFrameIdentities[index].leased and
     txFrameIdentities[index].generation == generation
 
-proc txlFrameIdentityCurrent(identity: TxFrameIdentity; vif, station: uint8): bool =
-  if not identity.leased or identity.resetEpoch != txResetEpoch or vif >= MAX_VIFS.uint8 or
-      identity.vifEpochs[vif] != rxVifEpochs[vif]:
+proc txlFrameIdentityCurrent(identity: TxFrameIdentity; vif, station: uint8;
+                             resetEpoch = txResetEpoch): bool =
+  if not identity.leased or identity.resetEpoch != resetEpoch or vif >= MAX_VIFS.uint8 or
+      identity.vifEpochs[vif] != rxVifEpochs[vif] or
+      (identity.psTracked and identity.psSerial != psModeBuildSerial):
     return false
   station >= STA_MGMT_FREE_STAS.uint8 or
     identity.stationEpochs[station] == staDeleteEpoch(station)
@@ -2801,10 +3122,10 @@ proc txlCaptureFrameCallback(desc: ptr HostTxDescView): TxFrameCallbackScope =
     result.tracked = true
     result.beacon = true
 
-proc txlFrameCallbackCurrent(): bool =
+proc txlFrameCallbackCurrent(resetEpoch: uint32 = txResetEpoch): bool =
   let scope = txActiveFrameCallback
   scope == nil or not scope.tracked or
-    (txlFrameIdentityCurrent(scope.identity, scope.vif, scope.station) and
+    (txlFrameIdentityCurrent(scope.identity, scope.vif, scope.station, resetEpoch) and
      (not scope.beacon or scope.identity.generation == mmBcnGeneration))
 
 proc txlInvokeFrameCallback(callback, argument: pointer; status: uint32;
@@ -2816,10 +3137,14 @@ proc txlInvokeFrameCallback(callback, argument: pointer; status: uint32;
   cast[proc(arg: pointer; status: uint32) {.cdecl, raises: [Exception].}](callback)(argument, status)
 
 proc txl_tx_desc_pointer_plausible(txDescPointer: pointer): bool =
-  if txDescPointer == nil:
-    return false
-  let txDescAddr = cast[uint32](cast[uint](txDescPointer))
-  txDescAddr >= 0x2200_0000'u32 and txDescAddr < 0x2210_0000'u32
+  # Pending nodes are CPU pointers to linked objects, regardless of the RAM
+  # alias chosen by the linker. This does not validate a DMA bus address.
+  if txl_frame_desc_valid(txDescPointer): return true
+  when defined(bl808m0):
+    if txlHostSlot(cast[ptr HostTxDescView](txDescPointer)) >= 0: return true
+  for index in 0'u8 ..< MAX_VIFS.uint8:
+    if txDescPointer == cast[pointer](vifApBeaconFrameDesc(vifChannelForIdx(index))):
+      return true
 
 proc txl_frame_free_list_pop(freeList: ptr CoList): ptr CoListHdr =
   # Only the free list proves that a slot is available. Queue scans cannot
@@ -3028,6 +3353,9 @@ proc txl_frame_get*(length: uint32): pointer {.exportc, cdecl.} =
     desc.pendingMacTime = 0
     desc.postponeFlag = 0
     desc.retryFlag = 0
+    # Internal management frames supply their own sequence control. A stale
+    # 0xFF selector would make the TX backup path rewrite it.
+    desc.staIdx = 0
     let descAddr = cast[uint](freeNode)
     let hwDesc = hostTxHwDescAt(desc.hwDesc)
 
@@ -3093,7 +3421,8 @@ proc txl_frame_get*(length: uint32): pointer {.exportc, cdecl.} =
     return cast[pointer](freeNode)
   nil
 
-proc txl_frame_push*(param: pointer, ac: uint8): uint8 {.exportc, cdecl, noinline, discardable.} =
+proc txlFramePushPrepared(param: pointer, ac: uint8;
+                          triggerMask: ptr uint8): uint8 {.noinline.} =
   ## Push a frame for transmission.
   ## From disassembly (47 instrs): loads hwDesc from param[112], asserts THD
   ## pointer (hwDesc[20]) bit 0 is clear, masks bits [22:15] of hwDesc[60],
@@ -3123,7 +3452,7 @@ proc txl_frame_push*(param: pointer, ac: uint8): uint8 {.exportc, cdecl, noinlin
       thdField = expectedHdrPtr
       hwDesc.payloadStart = expectedHdrPtr
   if (thdField and 1) != 0:
-    assert_err("txl_frame.c", "txl_frame.c", 316)
+    assert_err("(thd->datastartptr & 0x01) == 0", "module", 316)
     if txlFramePreparationCurrent(desc, identity, generation):
       txl_frame_release(desc, false)
     return 0
@@ -3142,7 +3471,14 @@ proc txl_frame_push*(param: pointer, ac: uint8): uint8 {.exportc, cdecl, noinlin
   else:
     hwDesc.ackPolicyControl = 0
   hwDesc.confirmStatus = 0
+  if triggerMask != nil and (triggerMask[] and (1'u8 shl ac)) == 0:
+    # A preparation callback may clear the selected U-APSD category.
+    txl_frame_release(desc, false)
+    return 0
   return txl_cntrl_push_int(param, ac)  # blob: tail-call txl_cntrl_push_int (not txl_cntrl_push)
+
+proc txl_frame_push*(param: pointer, ac: uint8): uint8 {.exportc, cdecl, noinline, discardable.} =
+  txlFramePushPrepared(param, ac, nil)
 
 proc txl_frame_try_push_force(param: pointer, ac: uint8): uint8 =
   ## Force push a frame for transmission.
@@ -3172,7 +3508,7 @@ proc txl_frame_try_push_force(param: pointer, ac: uint8): uint8 =
       thdField = expectedHdrPtr
       hwDesc.payloadStart = expectedHdrPtr
   if (thdField and 1) != 0:
-    assert_err("txl_frame.c", "txl_frame.c", 367)
+    assert_err("(thd->datastartptr & 0x01) == 0", "module", 367)
     if txlFramePreparationCurrent(desc, identity, generation):
       txl_frame_release(desc, false)
     return 0
@@ -3360,6 +3696,7 @@ proc txl_frame_send_null_frame*(staIdx: uint8, cfmCallback: pointer, cfmArg: uin
   ## are stored verbatim at desc+208/212 for txl_frame_cfm.
   let saved = irqSave()
   defer: irqRestore(saved)
+  let psSerial = psModeBuildSerial
   if staIdx >= STA_INFO_TAB_ENTRIES.uint8:
     return 1
   var nfRA {.noinit.}: uint32
@@ -3385,6 +3722,14 @@ proc txl_frame_send_null_frame*(staIdx: uint8, cfmCallback: pointer, cfmArg: uin
   let generation = txlFrameLeaseToken(desc)
   desc.staInfoIdx = staIdx
   desc.vifIdx = vifIdx
+  if cfmCallback == cast[pointer](ps_enable_cfm) or
+      cfmCallback == cast[pointer](ps_disable_cfm):
+    let slot = txl_frame_desc_index(frame)
+    if slot == InvalidFrameDescIndex: return 1
+    # Allocation recovery and TX power hooks can replace the PS mode.
+    # Stamp the serial from entry, never the one observed after allocation.
+    txFrameIdentities[slot].psTracked = true
+    txFrameIdentities[slot].psSerial = psSerial
   if not txlFramePreparationCurrent(desc, identity, generation):
     return 1
   tpc_update_frame_tx_power(vifEntry, frame)
@@ -3425,8 +3770,6 @@ proc txl_frame_send_null_frame*(staIdx: uint8, cfmCallback: pointer, cfmArg: uin
   nimFwDbgNullFrameReturn = publicRc.uint32
   return publicRc
 
-const WifiTxFrameSuccessfulBit = 1'u32 shl 23
-
 proc wifi_nimfw_coex_force_ble_role*() {.exportc, cdecl.}
 {.emit: """
 __attribute__((weak)) unsigned long nim_ble_coex_wifi_tx_window_enter(void) { return 1; }
@@ -3446,10 +3789,12 @@ proc wifi_nimfw_null_frame_cfm(arg: pointer, status: uint32) {.cdecl.} =
   nimFwDbgNullFrameLastStatus = status
   nimFwDbgBleWifiTxCfmBcn = wlanCoexControl()
   nimFwDbgBleWifiTxCfmPti = wlanCoexPti()
-  if (status and WifiTxFrameSuccessfulBit) != 0'u32:
+  let hardwareDone = cast[int32](status) < 0
+  if hardwareDone and (status and WifiTxFrameSuccessfulBit) != 0'u32:
     inc nimFwDbgNullFrameAckOk
   else:
     inc nimFwDbgNullFrameAckFail
+    if not hardwareDone: inc nimFwDbgNullFrameNoHwResult
   if current and nimFwBleWifiRoleWindowActive != 0'u32:
     wifi_nimfw_coex_force_ble_role()
 
@@ -3560,23 +3905,16 @@ proc wifi_nimfw_service_sta_postponed*(limit: uint32): uint32 {.exportc, cdecl.}
     wifi_nimfw_reconcile_postponed_count()
   sent
 
-proc rfc_channel_ops*(channel: uint32) {.exportc, cdecl.}
+proc rfc_channel_ops*(channel: uint32): uint32 {.exportc, cdecl.}
 
-proc wifi_nimfw_apply_sta_tx_channel(
-    band: uint8,
-    chanType: uint8,
-    primaryFreq: uint16,
-    centerFreq1: uint16,
-    centerFreq2: uint16,
-    txPower: uint8
-  ) {.inline.} =
+proc wifi_nimfw_apply_sta_tx_channel(channel: ptr ChanCtxtDefView) {.inline.} =
   ## Keep the ad-hoc STA retune path aligned with chan_pre_switch_channel:
   ## pending RX descriptors must be drained before the PHY moves, otherwise
   ## the auth response can be missed after a successful auth TX ACK.
   rxl_timer_int_handler()
   rxl_cntrl_evt()
-  phySetChannel(band, chanType, primaryFreq, centerFreq1, centerFreq2, txPower)
-  tpc_update_tx_power(txPower)
+  phySetChannel(channel)
+  tpc_update_tx_power(channel.txPower)
   regWrite(MACHW_BASE + 0x0DC'u, 0x1F0'u32)
 
 proc wifi_nimfw_prepare_sta_tx_channel*() {.exportc, cdecl.} =
@@ -3585,102 +3923,119 @@ proc wifi_nimfw_prepare_sta_tx_channel*() {.exportc, cdecl.} =
   ## rf_init() calls the cold modem init path only on the first process call and
   ## uses restore on later calls. BLE coexistence still needs a real RF reclaim
   ## because BLE writes the shared 0x2000xxxx RF plane between WiFi transmissions.
-  let sm = smEnvView()
-  var band = 0'u8
-  var chanType = 0'u8
-  var primaryFreq = sm.primaryFreq
-  var centerFreq1 = sm.centerFreq
-  var centerFreq2 = 0'u16
-  var txPower = 0'u8
+  var channel: ChanCtxtDefView
   var source = 0'u32
-  var sourceVif = 0xFFFFFFFF'u32
-  if primaryFreq != 0'u16 and centerFreq1 != 0'u16:
-    source = 1'u32
-  if primaryFreq == 0'u16 or centerFreq1 == 0'u16:
+  var sourceVif = high(uint32)
+  template usable(c: ChanCtxtDefView): bool =
+    c.primFreq != 0 and c.centerFreq1 != 0
+  template samePair(a, b: ChanCtxtDefView): bool =
+    a.primFreq == b.primFreq and a.centerFreq1 == b.centerFreq1
+  template activeSta(vif: untyped): bool =
+    vif.vifType == VIF_TYPE_STA and vif.state != 0
+  template vifTag(vif: untyped; index: uint8): uint32 =
+    index.uint32 or (vif.state.uint32 shl 8) or (vif.vifType.uint32 shl 16)
+  template pairFrom(vif: untyped): ChanCtxtDefView =
+    let pair = vif.channelFreqPair
+    let primary = uint16(pair and 0xFFFF'u32)
+    let center = uint16(pair shr 16)
+    ChanCtxtDefView(primFreq: primary, centerFreq1: (if center != 0: center else: primary),
+                    txPower: selectedMgmtTxPower().uint8)
+
+  block:
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    let sm = smEnvView()
     let connInfo = sm.connectInfo
-    if connInfo != nil:
+    let cached = ChanCtxtDefView(primFreq: sm.primaryFreq, centerFreq1: sm.centerFreq)
+    let forced = WifiAuthForceFreq != 0 and cached.primFreq == uint16(WifiAuthForceFreq) and
+      cached.centerFreq1 == cached.primFreq
+    var metadataFromContext = false
+    if connInfo != nil and not forced:
+      # The SM frequency cache belongs to the previous completion. A joining
+      # VIF can own a channel before becoming active, but cannot borrow an
+      # unrelated VIF's context while its own is unlinked.
       let vifIdx = connectInfoView(connInfo).vifIdx
-      let vif = vifChannelForIdx(vifIdx)
-      sourceVif = vifIdx.uint32 or
-        (vif.state.uint32 shl 8) or (vif.vifType.uint32 shl 16)
-      if vif.channelFreqPair != 0'u32:
+      if vifIdx < MAX_VIFS.uint8:
+        let vif = vifChannelForIdx(vifIdx)
+        if vif.vifType == VIF_TYPE_STA and vif.chanCtxt != nil:
+          let context = cast[ptr ChanCtxtView](vif.chanCtxt).channel
+          if usable(context):
+            channel = context
+            metadataFromContext = true
+            source = 4
+            sourceVif = vifTag(vif, vifIdx)
+    elif usable(cached):
+      channel = cached
+      source = 1
+      # A detached STA can move without updating the association-time cache.
+      # Prefer an exact match if several STAs exist; never guess between ties.
+      var best, count: int
+      var selected: ChanCtxtDefView
+      var selectedVif: uint32
+      for vifIdx in 0'u8 ..< MAX_VIFS.uint8:
+        if connInfo != nil and connectInfoView(connInfo).vifIdx != vifIdx: continue
+        let vif = vifChannelForIdx(vifIdx)
+        if not activeSta(vif) or vif.chanCtxt == nil: continue
+        let candidate = cast[ptr ChanCtxtView](vif.chanCtxt).channel
+        if not usable(candidate): continue
+        let exact = samePair(channel, candidate)
+        if not exact and (connInfo != nil or forced): continue
+        let rank = if exact: 2 else: 1
+        if rank < best: continue
+        if rank > best:
+          best = rank
+          count = 0
+        inc count
+        selected = candidate
+        selectedVif = vifTag(vif, vifIdx)
+      if count == 1:
+        if best == 1: source = 2
+        channel = selected
+        metadataFromContext = true
+        sourceVif = selectedVif
+    if connInfo == nil and not usable(channel):
+      for staTxChannelVifIndex in 0'u8 ..< MAX_VIFS.uint8:
+        let vif = vifChannelForIdx(staTxChannelVifIndex)
+        if not activeSta(vif): continue
+        sourceVif = vifTag(vif, staTxChannelVifIndex)
         if vif.chanCtxt != nil:
-          let ctxt = cast[ptr ChanCtxtView](vif.chanCtxt)
-          band = ctxt.channel.band
-          chanType = ctxt.channel.chanType
-          centerFreq2 = ctxt.channel.centerFreq2
-          txPower = ctxt.channel.txPower
-        primaryFreq = uint16(vif.channelFreqPair and 0xFFFF'u32)
-        centerFreq1 = uint16((vif.channelFreqPair shr 16) and 0xFFFF'u32)
-        if centerFreq1 == 0'u16:
-          centerFreq1 = primaryFreq
-        if txPower == 0'u8:
-          txPower = selectedMgmtTxPower().uint8
-        source = 5'u32
-      elif vif.chanCtxt != nil:
-        let ctxt = cast[ptr ChanCtxtView](vif.chanCtxt)
-        band = ctxt.channel.band
-        chanType = ctxt.channel.chanType
-        primaryFreq = ctxt.channel.primFreq
-        centerFreq1 = ctxt.channel.centerFreq1
-        centerFreq2 = ctxt.channel.centerFreq2
-        txPower = ctxt.channel.txPower
-        source = 4'u32
-  if primaryFreq == 0'u16 or centerFreq1 == 0'u16:
-    for staTxChannelVifIndex in 0'u8 ..< MAX_VIFS.uint8:
-      let vif = vifChannelForIdx(staTxChannelVifIndex)
-      if vif.vifType == VIF_TYPE_STA and vif.state != 0'u8:
-        sourceVif = staTxChannelVifIndex.uint32 or
-          (vif.state.uint32 shl 8) or
-          (vif.vifType.uint32 shl 16)
-        if vif.chanCtxt != nil:
-          let ctxt = cast[ptr ChanCtxtView](vif.chanCtxt)
-          band = ctxt.channel.band
-          chanType = ctxt.channel.chanType
-          primaryFreq = ctxt.channel.primFreq
-          centerFreq1 = ctxt.channel.centerFreq1
-          centerFreq2 = ctxt.channel.centerFreq2
-          txPower = ctxt.channel.txPower
-          source = 2'u32
+          let context = cast[ptr ChanCtxtView](vif.chanCtxt).channel
+          if usable(context):
+            channel = context
+            metadataFromContext = true
+            source = 2
+            break
+        let pair = pairFrom(vif)
+        if usable(pair):
+          channel = pair
+          source = 3
           break
-        if vif.channelFreqPair != 0'u32:
-          if vif.chanCtxt != nil:
-            let ctxt = cast[ptr ChanCtxtView](vif.chanCtxt)
-            band = ctxt.channel.band
-            chanType = ctxt.channel.chanType
-            centerFreq2 = ctxt.channel.centerFreq2
-            txPower = ctxt.channel.txPower
-          primaryFreq = uint16(vif.channelFreqPair and 0xFFFF'u32)
-          centerFreq1 = uint16((vif.channelFreqPair shr 16) and 0xFFFF'u32)
-          if centerFreq1 == 0'u16:
-            centerFreq1 = primaryFreq
-          if txPower == 0'u8:
-            txPower = selectedMgmtTxPower().uint8
-          source = 3'u32
-          break
+    if not metadataFromContext and channel.primFreq in 5005'u16 .. 5825'u16:
+      channel.band = 1
+
   nimFwDbgStaTxChannelSource = source
-  nimFwDbgStaTxChannelReq0 = primaryFreq.uint32 or (centerFreq1.uint32 shl 16)
-  nimFwDbgStaTxChannelReq1 = centerFreq2.uint32 or
-    (band.uint32 shl 16) or (chanType.uint32 shl 24) or (txPower.uint32 shl 28)
+  nimFwDbgStaTxChannelReq0 = channel.primFreq.uint32 or (channel.centerFreq1.uint32 shl 16)
+  nimFwDbgStaTxChannelReq1 = channel.centerFreq2.uint32 or
+    (channel.band.uint32 shl 16) or (channel.chanType.uint32 shl 24) or (channel.txPower.uint32 shl 28)
   nimFwDbgStaTxChannelVif = sourceVif
-  if primaryFreq != 0'u16 and centerFreq1 != 0'u16:
+  if usable(channel):
     let reclaimNeeded =
       nimFwBleWifiRoleWindowEnabled != 0'u32 and
       nim_ble_coex_wifi_rf_reclaim_needed() != 0'u32
-    var channel = ChanCtxtDefView(
-      band: band, chanType: chanType, primFreq: primaryFreq,
-      centerFreq1: centerFreq1, centerFreq2: centerFreq2, txPower: txPower)
     # Other channel users update the PHY state between STA transmissions.
     let channelChanged = not phyChannelMatches(addr channel)
     if reclaimNeeded or channelChanged:
       inc nimFwDbgStaTxRfRestore
       if reclaimNeeded:
+        var phyCfg: array[9, uint32]
+        let env = phyEnvViewPtr()
+        for index in 0 ..< phyCfg.len:
+          phyCfg[index] = volatileLoad(addr env.initCfgWords[index])
         wifi_hosal_rf_turn_on()
         inc nimFwDbgStaTxRfFullRestore
         wifiRfCoreInitMode(40000000'u32, wifiBleCoex)
-        phy_init(nil)
-      wifi_nimfw_apply_sta_tx_channel(band, chanType, primaryFreq,
-                                       centerFreq1, centerFreq2, txPower)
+        phy_init(addr phyCfg[0])
+      wifi_nimfw_apply_sta_tx_channel(addr channel)
 
 proc wifi_nimfw_coex_force_wifi_role*(): uint32 {.exportc, cdecl.} =
   ## Grant the shared RF/PTA fabric to WiFi for one active STA TX window.
@@ -3873,10 +4228,8 @@ proc wifi_nimfw_null_frame_cfm_count*(): uint32 {.exportc, cdecl.} =
 proc wifi_nimfw_null_frame_fail_count*(): uint32 {.exportc, cdecl.} =
   nimFwDbgNullFrameAckFail
 
-{.emit: "__attribute__((optimize(\"crossjumping\"))) unsigned char txl_frame_send_qosnull_frame(unsigned char,unsigned short,void *,unsigned long);".}
-proc txl_frame_send_qosnull_frame*(staIdx: uint8, qosCtrl: uint16,
-    cfmCallback: pointer, cfmArg: uint32): uint8 {.exportc, cdecl,
-    discardable.} =
+proc txlSendQosNull(staIdx: uint8; qosCtrl: uint16; cfmCallback: pointer;
+                    cfmArg: uint32; uapsdTrigger: bool): uint8 {.noinline.} =
   ## Build and send a QoS null frame (101 instrs).
   ## Similar to txl_frame_send_null_frame but with QoS header (26 bytes).
   ## Frame Control = 0xC8 (QoS null, subtype 12), with To-DS/From-DS flags
@@ -3893,13 +4246,19 @@ proc txl_frame_send_qosnull_frame*(staIdx: uint8, qosCtrl: uint16,
   ##   Calls txl_frame_push(desc, 3), returns (result^1)&0xFF
   let saved = irqSave()
   defer: irqRestore(saved)
-  if staIdx >= STA_INFO_TAB_ENTRIES.uint8 or (qosCtrl and 0x0F'u16) >= 8:
+  let tid = qosCtrl and 0x0F'u16
+  if staIdx >= STA_INFO_TAB_ENTRIES.uint8 or tid >= 8:
     return 1
   let sta = staInfoForIdx(staIdx)
   let vifIdx = sta.instNbr
   if vifIdx >= MAX_VIFS.uint8:
     return 1
   let vif = vifChannelForIdx(vifIdx)
+  let ac = if uapsdTrigger: mac_tid2ac[tid] else: 3'u8
+  let triggerMask = if uapsdTrigger: addr vif.uapsdBitmap else: nil
+  if uapsdTrigger and (ac >= 4 or vif.vifType != VIF_TYPE_STA or vif.state == 0 or
+      (triggerMask[] and (1'u8 shl ac)) == 0):
+    return 1
   let vifEntry = cast[pointer](vif)
   let staMacAddr = cast[pointer](addr sta.macAddr[0])
   let vifMacAddr = cast[pointer](addr vif.macAddr[0])
@@ -3918,6 +4277,9 @@ proc txl_frame_send_qosnull_frame*(staIdx: uint8, qosCtrl: uint16,
     return 1
   tpc_update_frame_tx_power(vifEntry, frame)
   if not txlFramePreparationCurrent(desc, identity, generation):
+    return 1
+  if uapsdTrigger and not chan_is_on_operational_channel(vifEntry):
+    txl_frame_release(desc, false)
     return 1
   let hdr = hostTxQosDataHeader(desc)
   # Check VIF type (STA or AP) to determine To-DS/From-DS
@@ -3955,12 +4317,19 @@ proc txl_frame_send_qosnull_frame*(staIdx: uint8, qosCtrl: uint16,
   if cfmCallback != nil:
     inc nimFwDbgNullFrameCbSet
     nimFwDbgNullFrameCbSetPtr = cast[uint32](cast[uint](cfmCallback))
-  # Push frame for TX on AC 3 (VO)
-  let pushRc = txl_frame_push(frame, 3)
+  # Keep the blob's VO queue for ordinary QoS Nulls, including AP EOSP.
+  let pushRc = txlFramePushPrepared(frame, ac, triggerMask)
   let publicRc = (pushRc xor 1'u8) and 0xFF'u8
   nimFwDbgNullFramePushRc = pushRc.uint32
   nimFwDbgNullFrameReturn = publicRc.uint32
   return publicRc
+
+proc txl_frame_send_qosnull_frame*(staIdx: uint8, qosCtrl: uint16,
+    cfmCallback: pointer, cfmArg: uint32): uint8 {.exportc, cdecl, discardable.} =
+  txlSendQosNull(staIdx, qosCtrl, cfmCallback, cfmArg, false)
+
+proc txlSendUapsdTrigger(staIdx: uint8; tid: uint16; cfmCallback: pointer): uint8 =
+  txlSendQosNull(staIdx, tid, cfmCallback, 0, true)
 
 proc txl_frame_send_selfcts_frame*(vifInfo: pointer, duration: uint16,
     cfmCallback: pointer, cfmArg: uint32): uint8 {.exportc, cdecl,

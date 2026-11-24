@@ -1,0 +1,5 @@
+package ox64:lists@0.2.0;
+
+world nested-lists {
+  export echo: func(values: list<list<string>>, malformed: u8) -> list<list<string>>;
+}

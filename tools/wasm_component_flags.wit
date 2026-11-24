@@ -1,0 +1,6 @@
+package ox64:values@0.2.0;
+
+world flags-demo {
+  flags perms { read, write, execute }
+  export echo-flags: func(value: perms) -> perms;
+}

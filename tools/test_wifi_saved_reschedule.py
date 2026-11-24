@@ -23,6 +23,7 @@ type
     statePtr: ptr uint16
   RxEnv = object
     processingFlag: uint8
+    queue: CoList
 const
   WifiSavedMsgDrainLimit = 8'u32
   KE_EVT_KE_MESSAGE = 0x08000000'u32
@@ -61,8 +62,11 @@ proc rxlCntrlEnvView(): ptr RxEnv = addr rx
 proc encodedArgU8(p: pointer): uint8 = cast[uint](p).uint8
 proc keTimerCancelMutations(all: bool) = discard
 proc smActivationCancel() = discard
+proc mmConfigCancelIdle() = discard
 proc chanSwitchCancel() = discard
+proc scanDwellReset() = discard
 proc smRspTimerReset() = discard
+template smSaQueryResetScope() = discard
 proc smBssCancel() = discard
 proc smCleanupCancel() = discard
 proc smDeferredCancel() = discard

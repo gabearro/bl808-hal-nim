@@ -16,6 +16,7 @@ type
     wasmManagerNotLoaded
     wasmManagerInstantiateFailed
     wasmManagerInvokeFailed
+    wasmManagerDependencyUnavailable
 
   WasmProgramInstallResult* = object
     status*: WasmProgramManagerError

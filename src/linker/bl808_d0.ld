@@ -26,7 +26,7 @@ PHDRS
     data PT_LOAD FLAGS(6); /* R + W */
 }
 
-_stack_size = 8K;
+_stack_size = DEFINED(__bl808_d0_stack_bytes) ? __bl808_d0_stack_bytes : 8K;
 
 /*
  * D0 SDH ADMA cannot reliably DMA into D0 DRAM/XRAM on current Ox64 hardware.
@@ -107,3 +107,5 @@ SECTIONS
 ASSERT(_eheap >= _sheap, "D0 DRAM overflow: no space left for heap")
 ASSERT(_sstack == ORIGIN(DRAM) + LENGTH(DRAM) - _stack_size,
        "D0 stack is not placed at top of DRAM")
+ASSERT(_stack_size >= 8K && _stack_size <= 64K && (_stack_size & 15) == 0,
+       "D0 stack reservation is invalid")

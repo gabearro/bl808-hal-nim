@@ -1,3 +1,4 @@
+import ../block_types
 ## WASM bytecode to SSA IR lowering pass
 ## Converts WASM's stack machine into SSA form by simulating the value stack
 ## symbolically. Each WASM value stack slot maps to an IrValue (SSA value ID).
@@ -240,23 +241,8 @@ proc emitCallIndirectImpl(ctx: var LowerCtx, typeIdx: int, elemIdx: IrValue): Ir
   inc ctx.f.callIndirectSiteCount
   result = res
 
-proc padToBlockType(pad: uint16): BlockType =
-  ## Decode the Instr.pad field back into a BlockType
-  if pad == 0:
-    BlockType(kind: btkEmpty)
-  elif pad >= 0x100:
-    BlockType(kind: btkTypeIdx, typeIdx: uint32(pad - 0x100))
-  else:
-    let vt = case pad
-      of 1: vtI32
-      of 2: vtI64
-      of 3: vtF32
-      of 4: vtF64
-      of 5: vtV128
-      of 6: vtFuncRef
-      of 7: vtExternRef
-      else: vtI32
-    BlockType(kind: btkValType, valType: vt)
+proc instructionBlockType(ctx: LowerCtx): BlockType =
+  block_types.resolveBlockType(ctx.module[].codes[ctx.funcIdx-ctx.numImportFuncs].code, ctx.instrPc)
 
 proc blockResultType(ctx: LowerCtx, bt: BlockType): (bool, ValType) =
   ## Returns (hasResult, resultType) for a block type
@@ -604,7 +590,7 @@ proc lowerInstr(ctx: var LowerCtx, instr: Instr) =
   of opBlock:
     # Create merge block (branch target for `br`)
     let mergeBb = ctx.newBb()
-    let bt = padToBlockType(instr.pad)
+    let bt = ctx.instructionBlockType()
     let (hasRes, resType) = ctx.blockResultType(bt)
     # Allocate a local slot for the block result (if needed)
     let resSlot = if hasRes: ctx.allocLocal(resType) else: -1
@@ -676,7 +662,7 @@ proc lowerInstr(ctx: var LowerCtx, instr: Instr) =
     ctx.addEdge(ctx.curBb, thenBb)
     ctx.addEdge(ctx.curBb, mergeBb)
     ctx.switchBb(thenBb)
-    let bt = padToBlockType(instr.pad)
+    let bt = ctx.instructionBlockType()
     let (hasRes, resType) = ctx.blockResultType(bt)
     let resSlot = if hasRes: ctx.allocLocal(resType) else: -1
     ctx.blockStack.add(BlockState(
@@ -1428,7 +1414,7 @@ proc lowerInstr(ctx: var LowerCtx, instr: Instr) =
   of opTryTable:
     # Same as block
     let mergeBb = ctx.newBb()
-    let bt = padToBlockType(instr.pad)
+    let bt = ctx.instructionBlockType()
     let (hasRes, resType) = ctx.blockResultType(bt)
     let resSlot = if hasRes: ctx.allocLocal(resType) else: -1
     ctx.blockStack.add(BlockState(

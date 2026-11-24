@@ -17,17 +17,20 @@ template irqRestore(prev: uint32) =
   if (prev and 8) != 0:
     {.emit: ["asm volatile(\"csrsi mstatus, 8\" ::: \"memory\");"].}
 
+proc wifiDmaStoreLink(desc: pointer; offset: uint; successor: pointer) {.inline.} =
+  # Live descriptor links are aligned RV32 words even in packed overlays.
+  # A packed-field assignment can expose a partially written DMA address.
+  let slot = cast[pointer](cast[uint](desc) + offset)
+  when sizeof(pointer) == sizeof(uint32):
+    volatileStore(cast[ptr uint32](slot), cast[uint32](successor))
+  else:
+    # Host fixtures can have pointer-sized fields at unaligned offsets.
+    var value = successor
+    copyMem(slot, addr value, sizeof(value))
+
 proc macTimeNow(): uint32 {.inline.} =
   ## Read current MAC HW timestamp.
   regRead(MACHW_TIMLO_REG)
-
-proc platformDelay(us: uint32) {.inline.} =
-  ## Simple busy-wait delay (approximate microseconds).
-  ## From blob: wifi_main calls delay(100) during INTC clock toggle.
-  var delayLoopBudget = us * 10'u32  # approximate loop count for ~1us per 10 iterations
-  while delayLoopBudget > 0:
-    {.emit: ["asm volatile(\"nop\");"].}
-    dec delayLoopBudget
 
 # =============================================================================
 # RC helper: typed access to rc_sta_stats fields from raw byte pointer

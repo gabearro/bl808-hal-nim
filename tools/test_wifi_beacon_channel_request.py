@@ -160,6 +160,15 @@ for irq in [false, true]:
         doAssert equalMem(addr request.chanDef[0], addr contexts[vifIndex].channel, 10)
         doAssert env.flags == 0xC0 and interrupts == irq and not chanBcnDetectActive
 ''',
+    "short_beacon_interval": r'''
+for irq in [false, true]:
+  for interval in [0'u32, 1'u32, 4999'u32]:
+    setup(irq)
+    stations[4].initialRateConfig = interval
+    chan_bcn_detect_start(addr vifs[0])
+    doAssert sent == 0 and allocations == 0 and live == 0
+    doAssert env.flags == 0x80 and interrupts == irq and not chanBcnDetectActive
+''',
     "allocation_replacement": r'''
 for irq in [false, true]:
   for change in 0 .. 13:
@@ -332,7 +341,7 @@ proc ke_evt_set(bits: uint32) =
   if sendRaises: raise newException(ValueError, "notifier callback")
 '''
     for name in ("mmTimCaptureMessage", "smAbortCaptureMessage", "chanUpdateCaptureMessage",
-                 "mmTimForget", "rxMgtForget", "smCleanupForget", "smBssForget",
+                 "mmTimForget", "mmConnLossForget", "rxMgtForget", "smCleanupForget", "smBssForget",
                  "smActivationForget", "smScanForget", "smRegistrationForget",
                  "chanSwitchForget", "chanUpdateForget", "smRspTimerForget",
                  "smDeferredForget", "smAbortForget", "chanBcnRequestForget"):

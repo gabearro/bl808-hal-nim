@@ -2,7 +2,15 @@ proc scanDiagReset() = zero(addr scanDiag[0], sizeof(scanDiag).uint)
 
 proc scanCacheReset() =
   zero(addr scanCache[0], sizeof(scanCache).uint)
-  scanCacheSelectedSlot = -1
+  scanCacheConnectPending = false
+
+proc scanCacheClearSelection() =
+  nimfwDbgScanCacheCandidates = 0
+  scanCacheConnectPending = false
+  nimfwDbgScanCacheSelectedSlot = high(uint32)
+  nimfwDbgScanCacheSelectedMeta = 0
+  nimfwDbgScanCacheSelectedBssidLo = 0
+  nimfwDbgScanCacheSelectedBssidHi = 0
 
 proc scannedBssidIsSpecific(bssid: pointer): bool =
   if bssid == nil:
@@ -195,16 +203,14 @@ proc scanCacheFind(ssid: cstring; ssidLen: csize_t; requestedBssid: ptr uint8;
       bestScanCacheSlot = scanCacheSlotIndex
 
   nimfwDbgScanCacheCandidates = candidateCount
+  scanCacheConnectPending = false
   if bestScanCacheSlot < 0:
-    scanCacheSelectedSlot = -1
-    nimfwDbgScanCacheSelectedSlot = 0xffffffff'u32
-    nimfwDbgScanCacheSelectedMeta = 0
-    nimfwDbgScanCacheSelectedBssidLo = 0
-    nimfwDbgScanCacheSelectedBssidHi = 0
+    scanCacheClearSelection()
     return false
   inc nimfwDbgScanCacheHit
-  scanCacheSelectedSlot = bestScanCacheSlot
-  copyMem(addr selectedBssidOut[][0], addr scanCache[bestScanCacheSlot].bssid[0], 6)
+  scanCachePendingBssid = scanCache[bestScanCacheSlot].bssid
+  selectedBssidOut[] = scanCachePendingBssid
+  scanCacheConnectPending = true
   selectedChannelOut[] = scanCache[bestScanCacheSlot].channel
   selectedRssiOut[] = scanCache[bestScanCacheSlot].rssi
   nimfwDbgScanCacheSelectedSlot = bestScanCacheSlot.uint32
@@ -219,24 +225,27 @@ proc scanCacheFind(ssid: cstring; ssidLen: csize_t; requestedBssid: ptr uint8;
     packBssidHi(addr scanCache[bestScanCacheSlot].bssid)
   true
 
-proc scanCacheRecordConnectResult(success: bool) =
-  if scanCacheSelectedSlot < 0 or scanCacheSelectedSlot >= scanCache.len:
+proc scanCacheRecordConnectResult(bssid: pointer; status: uint16) =
+  if not scanCacheConnectPending or not sameBssid(addr scanCachePendingBssid, bssid):
     return
-  if scanCache[scanCacheSelectedSlot].used == 0:
+  scanCacheConnectPending = false
+  case status
+  of WLAN_FW_TX_AUTH_FRAME_ALLOCATE_FAIILURE, WLAN_FW_TX_ASSOC_FRAME_ALLOCATE_FAIILURE,
+      WLAN_FW_4WAY_HANDSHAKE_TX_DEAUTH_FRAME_TRANSMIT_FAILURE,
+      WLAN_FW_4WAY_HANDSHAKE_TX_DEAUTH_FRAME_ALLOCATE_FAIILURE,
+      WLAN_FW_CREATE_CHANNEL_CTX_FAILURE_WHEN_JOIN_NETWORK, WLAN_FW_ADD_STA_FAILURE,
+      WLAN_FW_CONNECT_ABORT_BY_USER_WITH_DEAUTH .. WLAN_FW_CONNECT_ABORT_WHEN_SCANNING:
     return
-  if success:
-    scanCache[scanCacheSelectedSlot].failCount = 0
-    discard scanCacheFailureRecord(addr scanCache[scanCacheSelectedSlot].bssid, success)
-    return
-  scanCache[scanCacheSelectedSlot].failCount =
-    scanCacheFailureRecord(addr scanCache[scanCacheSelectedSlot].bssid, success)
-  inc nimfwDbgScanCacheFailureMarks
-  nimfwDbgScanCacheFailureCount = scanCache[scanCacheSelectedSlot].failCount.uint32
-  nimfwDbgScanCacheSelectedMeta =
-    scanCache[scanCacheSelectedSlot].channel.uint32 or
-    (cast[uint8](scanCache[scanCacheSelectedSlot].rssi).uint32 shl 8) or
-    (scanCache[scanCacheSelectedSlot].auth.uint32 shl 16) or
-    (scanCache[scanCacheSelectedSlot].cipher.uint32 shl 24)
+  else:
+    discard
+  let success = status == WLAN_FW_SUCCESSFUL
+  let count = scanCacheFailureRecord(addr scanCachePendingBssid, success)
+  for entry in scanCache.mitems:
+    if entry.used != 0 and entry.bssid == scanCachePendingBssid:
+      entry.failCount = count
+  if not success:
+    inc nimfwDbgScanCacheFailureMarks
+  nimfwDbgScanCacheFailureCount = count.uint32
 
 proc scanDiagStore(ind: pointer) =
   if ind == nil: return
@@ -253,6 +262,7 @@ proc scanDiagStore(ind: pointer) =
   scanDiag[scanDiagRingSlot].rssi = loadI8(ind, WifiBeaconRssiOff)
   scanDiag[scanDiagRingSlot].auth = loadU8(ind, WifiBeaconAuthOff)
   scanDiag[scanDiagRingSlot].cipher = loadU8(ind, WifiBeaconCipherOff)
+  inc scanItemCount
 
 proc bl808_wifi_backend_scan_diag_count*(): uint32 {.exportc, cdecl.} =
   if scanItemCount < VendorScanDiagMax.uint32: scanItemCount else: VendorScanDiagMax.uint32

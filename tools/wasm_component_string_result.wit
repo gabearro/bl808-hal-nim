@@ -1,0 +1,5 @@
+package ox64:math@0.2.0;
+
+world string-result-demo {
+  export greet: func() -> string;
+}

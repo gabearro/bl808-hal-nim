@@ -14,24 +14,25 @@ proc scan_init*() {.exportc, cdecl.} =
   ##   scan_probe_req_ie[20] = 0            (probe IE state word at +0x14)
   ##   scan_probe_req_ie[24] = &scan_probe_req_ie[36]  (IE buffer self-ptr at +0x18)
   ##   scan_probe_req_ie[32] = 0            (at +0x20)
+  let saved = irqSave()
+  var oldDwell = scanDwellBeginReset()
+  defer: scanDwellFinishReset(oldDwell)
   inc scanRequestEpoch
-  discard c_memset(addr scan_env, 0, 24.csize_t)
-  nimFwTrace("[WIFI-NIMFW] scan_init env cleared")
+  discard c_memset(addr scan_env, 0, sizeof(scan_env).csize_t)
   scan_env.activeDuration = 0x35B60'u32
   scan_env.passiveDuration = 0x35B60'u32
   scan_env.joinActiveDuration = 0x35B60'u32
-  nimFwTrace("[WIFI-NIMFW] scan_init durations set")
-  ke_state_set(TASK_SCAN, ScanIdleState)
-  nimFwTrace("[WIFI-NIMFW] scan_init state set")
   scan_probe_req_ie.magic = 0xCAFEFADE'u32
   scan_probe_req_ie.probeIeStateWord = 0
   scan_probe_req_ie.ieDataPtr = addr scan_probe_req_ie.ieData[0]
   scan_probe_req_ie.writeOffset = 0
-  nimFwTrace("[WIFI-NIMFW] scan_init probe ie set")
+  # Rescheduling saved SCAN messages can expose the idle state immediately.
+  ke_state_set(TASK_SCAN, ScanIdleState)
+  irqRestore(saved)
+  nimFwTrace("[WIFI-NIMFW] scan_init complete")
 
-proc scan_get_scan_duration*(passive: bool): uint32 {.exportc, cdecl, noinline.} =
-  ## Get scan duration. Blob ignores the `passive` arg: reads scan_env[0]
-  ## as a pointer, loads +312 off that. If non-zero return it, else 0x35B60.
+proc scan_get_scan_duration*(): uint32 {.exportc, cdecl, noinline.} =
+  ## Return the request duration, or the vendor default when it is zero.
   {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
   let scanReq = activeScanReq()
   if scanReq != nil:
@@ -40,19 +41,38 @@ proc scan_get_scan_duration*(passive: bool): uint32 {.exportc, cdecl, noinline.}
       return custom
   return 0x35B60'u32
 
-proc scan_set_channel_request*(param: pointer) {.exportc, cdecl.} =
+proc scanChannelValid*(band: uint8; frequency: uint16): bool {.inline.} =
+  case band
+  of 0'u8:
+    frequency == 2484'u16 or
+      (frequency >= 2412'u16 and frequency <= 2472'u16 and
+       (frequency - 2412'u16) mod 5'u16 == 0'u16)
+  of 1'u8:
+    frequency >= 5005'u16 and frequency <= 5825'u16 and
+      (frequency - 5000'u16) mod 5'u16 == 0'u16
+  else:
+    false
+
+proc scan_set_channel_request*() {.exportc, cdecl.} =
   ## Set channel for scanning. Builds channel config from scan_env param
   ## pointer and channel index, computes TX power index, sends indication.
   ## From disassembly (84 instrs).
   let scanParamPtr = scan_env.paramPtr
+  if scanParamPtr == nil:
+    return
   let scanReq = scanStartReqView(scanParamPtr)
   let scanIdx = scan_env.channelIndex
-  nimFwTrace2U32("[WIFI-NIMFW] scan_set start ", scanIdx.uint32, cast[uint32](scanParamPtr))
+  if scanIdx >= scanReq.channelCount or
+      scanIdx.int >= scanReq.channelList.len:
+    return
+  let scanChan = addr scanReq.channelList[scanIdx.int]
+  if not scanChannelValid(scanChan.band, scanChan.prim20Freq):
+    return
+  let requestEpoch = scanRequestEpoch
   var chanCfg = default(ChanScanReqPayload)
   chanCfg.vifIdx = scanReq.vifIdx
   var freqWord: uint32
   let directFreq = scanReq.sendProbe
-  let scanChan = scanReq.channelList[scanIdx.int]
   if directFreq == 0:
     if (scanChan.flags and 1) != 0:
       freqWord = scan_env.passiveDuration
@@ -64,31 +84,38 @@ proc scan_set_channel_request*(param: pointer) {.exportc, cdecl.} =
   let chanBand = scanChan.band
   chanCfg.band = chanBand
   let prim20Freq = scanChan.prim20Freq
-  nimFwTrace2U32("[WIFI-NIMFW] scan_set chan ", chanBand.uint32, prim20Freq.uint32)
   chanCfg.prim20Freq = prim20Freq
   chanCfg.center1Freq = prim20Freq
   chanCfg.center2Freq = 0
   chanCfg.txPower = scanChan.txPower
-  if chanCfg.txPower == 0'i8:
-    chanCfg.txPower = -1'i8
+  nimFwTrace2U32("[WIFI-NIMFW] scan_set start ", scanIdx.uint32, cast[uint32](scanParamPtr))
+  if scanRequestEpoch != requestEpoch or scan_env.paramPtr != scanParamPtr or
+      scan_env.channelIndex != scanIdx:
+    return
+  nimFwTrace2U32("[WIFI-NIMFW] scan_set chan ", chanBand.uint32, prim20Freq.uint32)
+  if scanRequestEpoch != requestEpoch or scan_env.paramPtr != scanParamPtr or
+      scan_env.channelIndex != scanIdx:
+    return
   let chanCfgView = chanScanChannel(addr chanCfg)
   nimFwDbgScanReqChanMeta = packChannelMeta(chanCfgView)
   nimFwDbgScanReqChanFreq = packChannelFreq(chanCfgView)
-  var txPowerIdx: uint8 = 0
-  let chanInfoPtr = scan_env.chanInfoPtr
-  if chanBand == 0:
-    let freq32 = prim20Freq.uint32
-    if freq32 >= 2412 and freq32 <= 2484:
-      if freq32 == 2484: txPowerIdx = 14
-      else: txPowerIdx = ((freq32 - 2407) div 5).uint8
-  elif chanBand == 1:
-    let freq32 = prim20Freq.uint32
-    if freq32 >= 5000 and freq32 <= 5825:
-      txPowerIdx = ((freq32 - 5000) div 5).uint8
-  if chanInfoPtr != nil:
-    dsParamSetIeAt(chanInfoPtr).currentChannel = txPowerIdx
   # Blob: call chan_scan_req to submit channel change to HW
   chan_scan_req(addr chanCfg)
+  if scanRequestEpoch != requestEpoch or scan_env.paramPtr != scanParamPtr or
+      scan_env.channelIndex != scanIdx:
+    return
+  let chanInfoPtr = scan_env.chanInfoPtr
+  if chanInfoPtr != nil:
+    var txPowerIdx: uint8 = 0
+    let currentFreq = prim20Freq.uint32
+    if chanBand == 0:
+      if currentFreq >= 2412 and currentFreq <= 2484:
+        if currentFreq == 2484: txPowerIdx = 14
+        else: txPowerIdx = ((currentFreq - 2407) div 5).uint8
+    elif chanBand == 1:
+      if currentFreq >= 5005 and currentFreq <= 5825:
+        txPowerIdx = ((currentFreq - 5000) div 5).uint8
+    dsParamSetIeAt(chanInfoPtr).currentChannel = txPowerIdx
   # Transition scan task to the channel-request pending state.
   ke_state_set(TASK_SCAN, ScanChannelPendingState)
 
@@ -104,23 +131,38 @@ proc scan_terminate_channel_request*() {.exportc, cdecl.} =
 proc scan_ie_download*(param: pointer) {.exportc, cdecl.} =
   ## Download IEs (Information Elements) for probe request (30 instrs in blob).
   ## From blob: loads scan param from scan_env[0], reads IE length (offset 304),
-  ## calls mac_ie_find(scan_probe_req_ie+36, ieLen, 3) to locate DS Parameter Set IE,
-  ## stores result at scan_env+4, calls scan_set_channel_request, then updates
-  ## the scan_probe_req_ie tracking fields (offsets 24, 28, 32).
-  let scanReq = activeScanReq()
+  ## calls mac_ie_find(scan_probe_req_ie+36, ieLen, 3), stores the result at
+  ## scan_env+4, then calls scan_set_channel_request. The final end marker
+  ## uses the stored IE data pointer at +24 and the argument's IE length.
+  let scanParam = scan_env.paramPtr
+  if scanParam == nil or param == nil:
+    return
+  let requestEpoch = scanRequestEpoch
+  let channelIndex = scan_env.channelIndex
+  let scanReq = scanStartReqView(scanParam)
   let ieLen = scanReq.ieBodyLen
+  let argumentIeLen = scanStartReqView(param).ieBodyLen
+  if ieLen.int > scan_probe_req_ie.ieData.len or
+      argumentIeLen.int > scan_probe_req_ie.ieData.len:
+    scan_env.chanInfoPtr = nil
+    return
   # Search for DS Parameter Set IE (id=3) in the IE buffer
   let found = mac_ie_find(scanProbeReqIeDataPtr(scan_probe_req_ie),
                           ieLen.uint32, 3)
-  scan_env.chanInfoPtr = found
+  scan_env.chanInfoPtr =
+    if found != nil and cast[ptr MacIeView](found).len == 1: found else: nil
   # Set up the scan channel
-  scan_set_channel_request(nil)
+  scan_set_channel_request()
+  if scanRequestEpoch != requestEpoch or scan_env.paramPtr != scanParam or
+      scan_env.channelIndex != channelIndex:
+    return
   # Update IE tracking in scan_probe_req_ie: end_offset, write_offset
   scan_probe_req_ie.writeOffset = 0
   scan_probe_req_ie.endOffset =
-    scanProbeReqIeDataBase(scan_probe_req_ie) - 1 + scanReq.ieBodyLen.uint32
+    scanProbeReqIeDataBase(scan_probe_req_ie) - 1 +
+    argumentIeLen.uint32
 
-proc scan_probe_req_tx*(param: pointer): uint8 {.exportc, cdecl.} =
+proc scan_probe_req_tx*(): uint8 {.exportc, cdecl.} =
   ## The vendor supports one SSID slot and initially returns 1, clearing it
   ## on a nonzero push result. Keep that status convention, not a success bool.
   let saved = irqSave()
@@ -198,35 +240,64 @@ proc scan_probe_req_tx*(param: pointer): uint8 {.exportc, cdecl.} =
     ensureProbeCurrent()
     nimFwTrace2U32("[WIFI-SCAN] probe_fc ", 0x40, addressWord)
     ensureProbeCurrent()
-  (txl_frame_push(frame, 3) xor 1'u8) and 0xFF'u8
+  if txl_frame_push(frame, 3) != 0: 0'u8 else: 1'u8
 
-proc scan_send_cancel_cfm*(status: uint8) {.exportc, cdecl, noinline.} =
+proc scan_send_cancel_cfm*(status: uint8, destId: uint8)
+    {.exportc, cdecl, noinline.} =
   ## Send scan cancel confirmation (15 instrs in blob).
   ## Allocates a SCAN_CANCEL_CFM message with 1-byte payload containing
   ## the status code, then sends it.
-  ## SCAN_CANCEL_CFM = 0x404, dest=TASK_SCAN(1), src=TASK_SCAN(1).
+  ## SCAN_CANCEL_CFM = 0x404, dest=requester, src=TASK_SCAN(1).
   let cancelCfmPayload = cast[ptr StatusCfmPayload](
-    ke_msg_alloc(SCAN_CANCEL_CFM, TASK_SCAN, TASK_SCAN,
+    ke_msg_alloc(SCAN_CANCEL_CFM, destId, TASK_SCAN,
                  StatusCfmPayloadSize))
   if cancelCfmPayload == nil:
     return
   cancelCfmPayload.status = status
   ke_msg_send(cancelCfmPayload)
 
-proc scan_get_chan*(channelIndex: uint32): pointer {.exportc, cdecl.} =
-  ## Get channel descriptor by index.
-  ## From blob (6 instrs): loads channel list base from scan_env[0], band from
-  ## scan_env[9], computes entry address = base + channelIndex * 6
-  ## (6-byte channel entries). Returns pointer to the selected channel entry.
+proc scan_get_chan*(): pointer {.exportc, cdecl.} =
+  ## Return the channel selected by scan_env.channelIndex.
   let chanListBase = scan_env.paramPtr
   if chanListBase == nil:
     return nil
   let scanReq = scanStartReqView(chanListBase)
-  return addr scanReq.channelList[channelIndex.int]
+  if scan_env.channelIndex >= scanReq.channelCount or
+      scan_env.channelIndex.int >= scanReq.channelList.len:
+    return nil
+  return addr scanReq.channelList[scan_env.channelIndex.int]
 
 # ###########################################################################
 #                      SCANU (Upper MAC Scan)
 # ###########################################################################
+
+type ScanuLowerExchange = object
+  request, startCfm, done: pointer
+  epoch: uint32
+
+# One lower scan phase at a time. Queue envelopes are identities, not borrowed
+# payloads; the upper generation invalidates the whole exchange on retirement.
+var scanuLower {.wifiCtrl.}: ScanuLowerExchange
+
+proc scanuLowerCurrent(request: pointer): bool {.inline.} =
+  request != nil and scanuLower.request == request and
+    scanu_env.paramPtr != nil and scanuLower.epoch == scanuRequestEpoch
+
+proc scanuTrackLowerReply(request, reply: pointer; done: bool) {.inline.} =
+  if scanuLowerCurrent(request):
+    if done: scanuLower.done = reply
+    else: scanuLower.startCfm = reply
+
+proc scanuClaimLowerReply(reply: pointer; done: bool): bool {.inline.} =
+  # Called under the same IRQ lock as consumption of the claimed reply.
+  if reply == nil or not scanuLowerCurrent(scanuLower.request): return false
+  if done:
+    if scanuLower.done != reply: return false
+    scanuLower = default(ScanuLowerExchange)
+  else:
+    if scanuLower.startCfm != reply: return false
+    scanuLower.startCfm = nil
+  true
 
 proc scanuRequestCurrent(param: pointer; epoch: uint32): bool {.inline.} =
   param != nil and scanu_env.paramPtr == param and scanuRequestEpoch == epoch
@@ -244,44 +315,59 @@ proc scanu_init*() {.exportc, cdecl.} =
   for scanResultPointerIndex in 0 ..< MAX_SCAN_RESULTS:
     scanuResults[scanResultPointerIndex] = nil
 
+proc scanuReleaseCompletedOwner(epoch: uint32) =
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  # Setting IDLE drains saved requests. The confirmation must reach the
+  # queue first, and a reentrant replacement must keep its own state.
+  if scanuRequestEpoch == epoch and scanu_env.paramPtr == nil:
+    ke_state_set(TASK_SCANU, ScanuIdleState)
+
+proc scanuPublishCompletion(request, reply: pointer; id: uint16;
+                            destination, status: uint8; smOwned: bool) =
+  let header = keMsgHdrFromPayload(request)
+  if reply == nil and not smOwned and header.paramLen >= StatusCfmPayloadSize:
+    # SM requests must use their reserved reply with its owner tag.
+    statusCfmView(request).status = status
+    header.paramLen = StatusCfmPayloadSize
+    ke_msg_forward_and_change_id(request, id, destination, TASK_SCANU)
+  else:
+    if reply != nil: statusCfmView(reply).status = status
+    ke_msg_free(header)
+    if reply != nil: ke_msg_send(reply)
+
 proc scanu_confirm*(status: uint8) {.exportc, cdecl.} =
   ## Send scan completion confirmation to host (58 instrs).
   ## Blob flow: allocates SCANU_JOIN_CFM twice in join mode (to requester and
   ## TASK_API), or SCANU_START_CFM in normal scan mode. SCANU_RESULT_IND is not
   ## a status message; it carries real beacon/probe-response frames.
-  # Finish the old state before callouts can install a new scan.
+  # Detach the old request before callouts, but keep the task busy until
+  # this completion is published ahead of any saved scan request.
   let completion = block:
     let saved = irqSave()
     defer: irqRestore(saved)
     let oldRequest = scanu_env.paramPtr
-    if oldRequest == nil:
-      ke_state_set(TASK_SCANU, ScanuIdleState)
-      return
-    let joining = if smScanOwnsRequest(oldRequest):
+    if oldRequest == nil: return
+    let smOwned = smScanOwnsRequest(oldRequest)
+    let joining = if smOwned:
         uint8(keMsgHdrFromPayload(oldRequest).id == SCANU_JOIN_REQ)
       else: scanu_env.bssidFilterEnabled
-    let snapshot = (request: oldRequest, join: joining,
-                    source: scanu_env.requester)
     inc scanuRequestEpoch
     scanu_env.paramPtr = nil
     scanu_env.pendingJoinRxuMgtInd = nil
-    ke_state_set(TASK_SCANU, ScanuIdleState)
-    snapshot
-  var primaryCfm: pointer = nil
+    (request: oldRequest, join: joining, smOwned: smOwned,
+     source: scanu_env.requester, epoch: scanuRequestEpoch)
+  defer: scanuReleaseCompletedOwner(completion.epoch)
+  let primaryId = if completion.join != 0: SCANU_JOIN_CFM else: SCANU_START_CFM
+  let primaryCfm = smScanCompletionAlloc(completion.request, primaryId, completion.source)
   var apiJoinCfm: pointer = nil
   if completion.join != 0:
-    primaryCfm = smScanCompletionAlloc(completion.request, SCANU_JOIN_CFM, completion.source)
-    apiJoinCfm = ke_msg_alloc(SCANU_JOIN_CFM, TASK_API, TASK_SCANU,
-                              StatusCfmPayloadSize)
-  else:
-    primaryCfm = smScanCompletionAlloc(completion.request, SCANU_START_CFM, completion.source)
-  if primaryCfm != nil:
-    statusCfmView(primaryCfm).status = status
+    apiJoinCfm = ke_msg_try_alloc(SCANU_JOIN_CFM, TASK_API, TASK_SCANU,
+                                  StatusCfmPayloadSize)
   if apiJoinCfm != nil:
     statusCfmView(apiJoinCfm).status = status
-  ke_msg_free(keMsgHdrFromPayload(completion.request))
-  if primaryCfm != nil:
-    ke_msg_send(primaryCfm)
+  scanuPublishCompletion(completion.request, primaryCfm, primaryId,
+                         completion.source, status, completion.smOwned)
   if apiJoinCfm != nil:
     ke_msg_send(apiJoinCfm)
 
@@ -347,6 +433,8 @@ proc probeIesValid(data: pointer; length: uint32): bool =
     let size = ie.totalLen.uint32
     if size > remaining:
       return false
+    if ie.id == IE_ID_DS_PARAM and ie.len != IE_LEN_DS_PARAM:
+      return false
     offset += size
   true
 
@@ -379,6 +467,10 @@ proc sendScanStartReq*(msg: ptr ScanStartReqPayload, ies: var ProbeIeWriter) {.i
     if scanuRequestCurrent(owner, epoch):
       scanu_confirm(SCAN_STATUS_BAD_PARAM)
     return
+  if not scanuRequestCurrent(owner, epoch):
+    ke_msg_free(keMsgHdrFromPayload(msg))
+    return
+  scanuLower = ScanuLowerExchange(request: msg, epoch: epoch)
   ke_msg_send(msg)
 
 proc initScanStartReq*(
@@ -448,7 +540,7 @@ proc appendScanHtCapabilities*(
 
 proc allocScanStartReq*(): ptr ScanStartReqPayload {.inline.} =
   cast[ptr ScanStartReqPayload](
-    ke_msg_alloc(SCAN_START_REQ, TASK_SCAN, TASK_SCANU, ScanStartReqPayloadSize))
+    ke_msg_try_alloc(SCAN_START_REQ, TASK_SCAN, TASK_SCANU, ScanStartReqPayloadSize))
 
 proc allocInitializedScanStartReq*(
     req: ptr ScanuStartReqPayload,
@@ -479,7 +571,7 @@ proc resetUndirectedScanuStart*() {.inline.} =
   scanuStartReqView(scanParam).cacheScanuFilterSsid()
   scanu_env.resultCount = 0
 
-proc finishAdvancedScanuScanBand*() {.inline.} =
+proc finishAdvancedScanuScanBand*(): bool {.inline.} =
   let scanParam = scanu_env.paramPtr
   let epoch = scanuRequestEpoch
   let sendProbeFlag = scanu_env.bssidFilterEnabled
@@ -489,15 +581,18 @@ proc finishAdvancedScanuScanBand*() {.inline.} =
       scanu_env.joinRetryCount = retryCount - 1
       let logFunc = getLogFunc(204)
       if logFunc != nil:
-        cast[proc(a0, a1: uint32, c: pointer, d: uint32){.cdecl, varargs.}](logFunc)(2, 0, nil, 1163)
+        cast[proc(level: uint32; tag, file: cstring; line: cint;
+                  format: cstring) {.cdecl, varargs.}](logFunc)(
+          2, nil, "scanu.c", 1163, "rescan:%s %d \r\n", "scanu_scan_next", 1163.cint)
       if not scanuRequestCurrent(scanParam, epoch):
-        return
+        return false
       scanu_env.resultState = 1
-      scanu_env.bssidFilterEnabled = 0
-      return
+      scanu_env.scanBand = 0
+      return true
   scanu_confirm(0)
+  false
 
-proc scanu_start*(param: pointer) {.exportc, cdecl.} =
+proc scanu_start*() {.exportc, cdecl.} =
   ## Start a scan operation (37 instrs).
   ## From blob: loads scanu_env base (s0). Checks scanu_env.joinFlag (offset 180).
   ## If joinFlag != 0, jumps to shared path (ke_state_set + scan_next).
@@ -508,7 +603,7 @@ proc scanu_start*(param: pointer) {.exportc, cdecl.} =
   defer: irqRestore(saved)
   let scanParam = scanu_env.paramPtr
   let epoch = scanuRequestEpoch
-  if not scanuRequestCurrent(scanParam, epoch) or (param != nil and param != scanParam):
+  if not scanuRequestCurrent(scanParam, epoch):
     return
   if scanuProducerRequest == scanParam and scanuProducerEpoch == epoch:
     return
@@ -525,6 +620,8 @@ proc scanu_start*(param: pointer) {.exportc, cdecl.} =
     if not scanuRequestCurrent(scanParam, epoch):
       return
   ke_state_set(TASK_SCANU, ScanuScanningState)
+  if not scanuRequestCurrent(scanParam, epoch):
+    return
   # Blob 0x4c..0x74: if scanParam[300] != 0 (probe data ptr) AND
   # scanParam[304]..[305] (halfword probe length) <= 200, copy the probe
   # data into scanu_env[224] via memcpy, then tail-call scanu_scan_next.
@@ -570,24 +667,31 @@ proc scanu_scan_next*() {.exportc, cdecl.} =
     scanuProducerEpoch = previousProducerEpoch
   let scanReq = activeScanuReq()
   let numChannels = scanReq.channelCount
-  if numChannels == 0 or numChannels.int > scanReq.channelList.len or
+  if numChannels.int > scanReq.channelList.len or
       scanReq.scanType > 1 or
       (scanReq.scanType != 0 and scanSsidSlot(scanReq, 0).length > 32) or
       scanReq.vifIdx >= MAX_VIFS.uint8:
     scanu_confirm(SCAN_STATUS_BAD_PARAM)
     return
-  let scanBand = scanu_env.scanBand
-  if scanBand != 0:
-    finishAdvancedScanuScanBand()
-    return
-  # Find the first channel for the current SCANU band phase. The blob scans
-  # 2.4GHz entries (band byte 0) first, then lets scan_done_ind_handler bump
-  # scanu_env+181 before either retrying or confirming.
-  let chanIdx = scanReq.firstScanBandChannel(scanBand)
-  if chanIdx >= numChannels:
+  for channelIndex in 0 ..< numChannels.int:
+    let channel = scanReq.channelList[channelIndex]
+    if not scanChannelValid(channel.band, channel.prim20Freq):
+      scanu_confirm(SCAN_STATUS_BAD_PARAM)
+      return
+  var scanBand: uint8
+  var chanIdx: uint8
+  while true:
+    scanBand = scanu_env.scanBand
+    if scanBand != 0:
+      if finishAdvancedScanuScanBand() and
+          scanuRequestCurrent(scanParam, epoch):
+        continue
+      return
+    # The vendor scans band 0 first and restarts that phase on a join retry.
+    chanIdx = scanReq.firstScanBandChannel(scanBand)
+    if chanIdx < numChannels:
+      break
     scanu_env.scanBand = 1
-    finishAdvancedScanuScanBand()
-    return
   # Allocate SCAN_START_REQ (paramLen=316)
   let msg = allocInitializedScanStartReq(scanReq, scanu_env.bssidFilterEnabled)
   if not scanuRequestCurrent(scanParam, epoch):
@@ -614,10 +718,9 @@ proc scanu_scan_next*() {.exportc, cdecl.} =
   let hostIeData = cast[pointer](scanuAddIeDataAddr())
   let extraIePtr = scanu_env.extraIePtr
   let extraIeLen = scanu_env.extraIeLen
-  if scanReq.probeReqIeLen > 200 or
-      (totalIeLen != 0 and scanReq.probeReqIe == nil) or
+  if (totalIeLen != 0 and scanReq.probeReqIe == nil) or
       not probeIesValid(hostIeData, totalIeLen.uint32) or
-      not probeIesValid(extraIePtr, extraIeLen.uint32):
+      (extraIePtr != nil and not probeIesValid(extraIePtr, extraIeLen.uint32)):
     ies.failed = true
     msg.sendScanStartReq(ies)
     return
@@ -672,20 +775,21 @@ proc scanuResetCachedSsid(cached: ptr ScanuCachedSsid) {.inline.} =
 
 proc scanu_find_result*(bssid: pointer, allocIfMissing: uint8 = 0): pointer {.exportc, cdecl.} =
   ## Find scan result by BSSID (112b in blob). Unrolled 6-byte MAC compare.
-  ## Blob: linear scan with stride 28, valid flag at offset 16, BSSID at 0-5.
+  ## Scan existing entries before reserving a free slot so one BSSID does not
+  ## acquire two entries when the first free slot precedes its existing entry.
+  if bssid == nil:
+    return nil
   let saved = irqSave()
   defer: irqRestore(saved)
   let ba = macAddrAt(bssid)
+  var firstFree: ptr ScanuResultEntry
+  var firstFreeIndex = -1
   for scanResultSlotIndex in 0 ..< SCANU_MAX_RESULT_ENTRIES:
     let scanResultEntry = addr scanu_env.entries[scanResultSlotIndex]
     if scanResultEntry.valid == 0:
-      if allocIfMissing != 0:
-        discard c_memset(scanResultEntry, 0, sizeof(ScanuResultEntry).csize_t)
-        scanuResetCachedSsid(addr scanuCachedSsids[scanResultSlotIndex])
-        discard c_memset(addr scanuCachedChannels[scanResultSlotIndex], 0,
-                         sizeof(ScanChannelEntry).csize_t)
-        scanResultEntry.rssi = -128'i8
-        return scanResultEntry
+      if firstFree == nil:
+        firstFree = scanResultEntry
+        firstFreeIndex = scanResultSlotIndex
     else:
       # Unrolled 6-byte BSSID comparison (matches blob's lbu+bne pattern)
       if scanResultEntry.bssid[0] == ba.bytes[0] and
@@ -695,6 +799,13 @@ proc scanu_find_result*(bssid: pointer, allocIfMissing: uint8 = 0): pointer {.ex
          scanResultEntry.bssid[4] == ba.bytes[4] and
          scanResultEntry.bssid[5] == ba.bytes[5]:
         return scanResultEntry
+  if allocIfMissing != 0 and firstFree != nil:
+    discard c_memset(firstFree, 0, sizeof(ScanuResultEntry).csize_t)
+    scanuResetCachedSsid(addr scanuCachedSsids[firstFreeIndex])
+    discard c_memset(addr scanuCachedChannels[firstFreeIndex], 0,
+                     sizeof(ScanChannelEntry).csize_t)
+    firstFree.rssi = -128'i8
+    return firstFree
   return nil
 
 proc scanuCachedSsidFor(scanResultEntry: ptr ScanuResultEntry):
@@ -758,6 +869,8 @@ proc scanuClearCachedChannel(scanResultEntry: ptr ScanuResultEntry) {.inline.} =
 proc configuredScanChannelEntryForFreq(freq: uint16):
     ptr ScanChannelEntry {.inline.} =
   let channelConfig = scanuChannelConfig()
+  if channelConfig.count.int > channelConfig.entries.len:
+    return nil
   for channelConfigIndex in 0 ..< channelConfig.count.int:
     let channelConfigEntry = addr channelConfig.entries[channelConfigIndex]
     if channelConfigEntry.prim20Freq == freq:
@@ -771,18 +884,27 @@ proc scanuCacheChannel(scanResultEntry: ptr ScanuResultEntry;
   if cached == nil:
     return nil
   let configured = configuredScanChannelEntryForFreq(freq)
-  if configured != nil:
-    cached[] = configured[]
-  else:
-    cached.prim20Freq = freq
-    cached.band = band
-    cached.flags = 0
-    cached.txPower = 20'i8
-    cached.txPowerTailPadding = 0
+  if configured == nil or configured.band != band:
+    discard c_memset(cached, 0, sizeof(ScanChannelEntry).csize_t)
+    return nil
+  cached[] = configured[]
   cast[pointer](cached)
+
+proc scanuPublishVifChannel(vif: ptr VifChannelView; entry: ptr ScanuResultEntry): bool =
+  if entry.chanPtr == nil: return false
+  let cached = cast[ptr ScanChannelEntry](entry.chanPtr)
+  let configured = configuredScanChannelEntryForFreq(cached.prim20Freq)
+  if configured == nil or configured.band != cached.band: return false
+  # The VIF outlives the scan result and its cached channel copy.
+  vif.operChan = configured
+  let freq = configured.prim20Freq.uint32
+  vif.channelFreqPair = freq or (freq shl 16)
+  true
 
 proc configuredChannelPtrForFreq(freq: uint16): pointer {.inline.} =
   let channelConfig = meChannelConfigView()
+  if channelConfig.count.int > channelConfig.entries.len:
+    return nil
   for channelConfigIndex in 0 ..< channelConfig.count.int:
     let channelConfigEntry = addr channelConfig.entries[channelConfigIndex]
     if channelConfigEntry.freq == freq:
@@ -790,9 +912,12 @@ proc configuredChannelPtrForFreq(freq: uint16): pointer {.inline.} =
   nil
 
 proc rxuMgtChannelPtr(rx: ptr RxuMgtIndView; freq: uint16): pointer {.inline.} =
-  result = me_freq_to_chan_ptr(rx.band, freq)
+  if rx.band == 0:
+    result = me_freq_to_chan_ptr(rx.band, freq)
   if result == nil:
     result = configuredChannelPtrForFreq(freq)
+  if result != nil and cast[ptr MeChannelConfigEntry](result).band != rx.band:
+    result = nil
 
 proc scanResultChannelPtr(scanResultEntry: ptr ScanuResultEntry): pointer =
   if scanResultEntry == nil:
@@ -804,10 +929,22 @@ proc scanResultChannelPtr(scanResultEntry: ptr ScanuResultEntry): pointer =
   nimFwDbgBssChanFixRaw = cast[uint32](cast[uint](scanResultEntry.cachedRxuMgtInd))
   if result == nil and scanResultEntry.cachedRxuMgtInd != nil:
     let rx = rxuMgtIndAt(scanResultEntry.cachedRxuMgtInd)
-    result = rxuMgtChannelPtr(rx, rx.freq)
+    if rx.frameLen < 36'u16:
+      return nil
+    var selectedFreq = rx.freq
+    let dsIe = mac_ie_find(rxuMgtIndIeStart(scanResultEntry.cachedRxuMgtInd),
+                           rx.frameLen.uint32 - 36'u32, IE_ID_DS_PARAM)
+    if dsIe != nil:
+      let ds = dsParamSetIeAt(dsIe)
+      if ds.ie.len != IE_LEN_DS_PARAM:
+        return nil
+      selectedFreq = dsParamFreq(rx.band, ds)
+      if selectedFreq == 0xFFFF'u16:
+        return nil
+    result = rxuMgtChannelPtr(rx, selectedFreq)
     scanResultEntry.chanPtr = result
     nimFwDbgBssChanFixMeta =
-      rx.freq.uint32 or (rx.band.uint32 shl 16) or
+      selectedFreq.uint32 or (rx.band.uint32 shl 16) or
       (scanResultEntry.rssi.uint8.uint32 shl 24)
   nimFwDbgBssChanFixPtr = cast[uint32](cast[uint](result))
 
@@ -897,28 +1034,152 @@ proc applyConservativeMgmtTxRetryPolicy(link: ptr HostTxLinkDescView) {.inline.}
   link.ackPolicyControl = 0x00000200'u32
   link.retryLimitControl = 0x003F0000'u32
 
-proc selectedBssRsnAuthMask(scanResultEntry: ptr ScanuResultEntry): uint32 =
+proc selectedBssRsnAkmInfo(scanResultEntry: ptr ScanuResultEntry): WifiRsnAkmInfo =
   if scanResultEntry == nil or scanResultEntry.cachedRxuMgtInd == nil:
-    return 0
+    return
   let rx = rxuMgtIndAt(scanResultEntry.cachedRxuMgtInd)
   let totalLen = rx.frameLen
   let ieLen = if totalLen > 36'u16: totalLen.uint32 - 36'u32 else: 0'u32
   let ieStart = rxuMgtIndIeStart(scanResultEntry.cachedRxuMgtInd)
-  wifiRsnAuthMaskFromIeBuffer(ieStart, ieLen)
+  wifiRsnAkmInfoFromIeBuffer(ieStart, ieLen)
 
 proc configureSelectedBssAuth(scanResultEntry: ptr ScanuResultEntry;
                               ci: ptr ConnectInfoView) =
   if ci == nil:
     return
-  let authMask = selectedBssRsnAuthMask(scanResultEntry)
+  let rsnInfo = selectedBssRsnAkmInfo(scanResultEntry)
+  let authMask = rsnInfo.authMask
+  let eligibleAuthMask =
+    if rsnInfo.ccmpGroup and rsnInfo.ccmpPairwise and rsnInfo.bipCmac128: authMask
+    else: authMask and not WifiAuthMaskSae
+  var authFlags = ci.channelDuration
+  when defined(bl808WifiForcePmfCapable):
+    authFlags = authFlags or 0x200'u32
+  let localPmfRequired = (authFlags and 0x400'u32) != 0
+  var acceptedSaeForBss = false
+  if ci.authType == 3'u8 and scanResultEntry != nil and
+      ci.vifIdx < MAX_VIFS.uint8 and (eligibleAuthMask and WifiAuthMaskSae) != 0 and
+      rsnInfo.pmfCapable:
+    let vif = vifChannelForIdx(ci.vifIdx)
+    if vif != nil and vif.vifType == VIF_TYPE_STA and
+        vif.bssid == scanResultEntry.bssid:
+      let security = vifSecurity(vif)
+      acceptedSaeForBss = security.keyMgmt == WifiKeyMgmtSae and
+        security.cipher == 4 and security.pmfCapable != 0 and
+        security.pmfRequired != 0
+  let localPmfCapable = (authFlags and 0x600'u32) != 0 or acceptedSaeForBss
+  let candidate =
+    if acceptedSaeForBss:
+      WifiKeyMgmtSae
+    else:
+      wifiPreferredKeyMgmtFromMask(eligibleAuthMask,
+        localPmfCapable and rsnInfo.pmfCapable, localPmfRequired)
+  let pmfCompatible =
+    (candidate != WifiKeyMgmtSae or (localPmfCapable and rsnInfo.pmfCapable)) and
+    (not rsnInfo.pmfRequired or (localPmfCapable and rsnInfo.pmfCapable)) and
+    (not localPmfRequired or rsnInfo.pmfCapable) and
+    (not (localPmfCapable and rsnInfo.pmfCapable) or rsnInfo.bipCmac128)
+  let keyMgmt = if pmfCompatible: candidate else: WifiKeyMgmtNone
   if authMask != 0:
     nimFwDbgScanKeyMgmt = authMask
-    nimFwDbgScanAT = wifiPreferredKeyMgmtFromMask(authMask)
+    nimFwDbgScanAT = keyMgmt
   when defined(bl808WifiForceSaeAuth):
     ci.authType = 3
     nimFwDbgScanAT = 1024'u32
     return
-  ci.authType = wifiDot11AuthTypeFromKeyMgmt(wifiPreferredKeyMgmtFromMask(authMask))
+  ci.authType = wifiDot11AuthTypeFromKeyMgmt(keyMgmt)
+
+proc readLegacyRateIe(ie: ptr MacIeView; start: int;
+                      rates: var array[12, uint8]): int =
+  ## Append one bounded IE to the join rate set; -1 means it will not fit.
+  result = start
+  if ie == nil: return
+  let bytes = ie.macIePayload
+  for i in 0 ..< ie.len.int:
+    let rate = bytes[i]
+    # Basic-marked values 120..127 are BSS membership selectors, not rates.
+    if rate >= 0xF8'u8: continue
+    if result == rates.len: return -1
+    rates[result] = rate
+    inc result
+
+type StaWmmParameters = object
+  edca: array[4, uint32]
+  qosInfo, admissionMask: uint8
+
+proc isWmmParameterIe(ie: ptr MacIeView): bool =
+  if ie == nil or ie.id != 221 or ie.len < WMM_OUI.len.uint8:
+    return false
+  let bytes = ie.macIePayload
+  for i, octet in WMM_OUI:
+    if bytes[i] != octet: return false
+  true
+
+proc decodeStaWmmParameters(ie: ptr MacIeView; params: var StaWmmParameters): bool =
+  if not isWmmParameterIe(ie) or ie.len != 24: return false
+  let wmm = wmmParameterIeAt(ie)
+  if wmm.version != 1: return false
+  var decoded = StaWmmParameters(qosInfo: wmm.qosInfo)
+  var seen = 0'u8
+  for record in wmm.ac:
+    let word = record.le32
+    let aifsn = word and 0xF
+    let cwMin = (word shr 8) and 0xF
+    let cwMax = (word shr 12) and 0xF
+    if aifsn < 2 or cwMin > cwMax: return false
+    let aci = ((word shr 5) and 3).uint8
+    let queue = if aci == 0: API_AC_BE elif aci == 1: API_AC_BK else: aci
+    let bit = 1'u8 shl queue
+    if (seen and bit) != 0: return false
+    seen = seen or bit
+    decoded.edca[queue] = aifsn or ((word shr 8) shl 4)
+    if (word and 0x10) != 0:
+      decoded.admissionMask = decoded.admissionMask or bit
+  params = decoded
+  true
+
+proc updateStaWmmFromBeacon(vif: ptr VifChannelView; sta: ptr StaInfoView;
+                            frame: pointer; length, rxPrimaryFreq: uint16): bool =
+  ## Caller holds the RX owner through the commit; True also permits retrying
+  ## publication when a previous idle request could not be allocated.
+  if frame == nil or length < sizeof(BeaconFrameFixedView).uint16 or
+      vif.state == 0 or vif.vifType != VIF_TYPE_STA or vif.staIdx != sta.infoIdx or
+      sta.instNbr != vif.vifIdx or sta.valid == 0 or vif.chanCtxt == nil or
+      chanCtxtAt(vif.chanCtxt).channel.primFreq != rxPrimaryFreq:
+    return false
+  let config = vifApConfig(vif)
+  if (config.securityFlags and 1) == 0: return false
+  let beacon = beaconFrameFixedView(frame)
+  if (beacon.frameControl and 0x07FF) != 0x0080 or (beacon.seqCtrl and 0xF) != 0 or
+      beacon.addr1 != [0xFF'u8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF] or
+      beacon.addr2 != sta.macAddr or beacon.addr3 != sta.macAddr or
+      vif.currentBssid != sta.macAddr:
+    return false
+  var remaining = length.uint - sizeof(BeaconFrameFixedView).uint
+  var cursor = cast[uint](beaconFrameIeBody(beacon))
+  if remaining > high(uint) - cursor: return false
+  var found = false
+  var params: StaWmmParameters
+  while remaining != 0:
+    if remaining < 2: return false
+    let ie = macIeAt(cursor)
+    let size = ie.len.uint + 2
+    if size > remaining: return false
+    if isWmmParameterIe(ie):
+      if found or not decodeStaWmmParameters(ie, params): return false
+      found = true
+    cursor += size
+    remaining -= size
+  if not found: return false
+  let updateCount = params.qosInfo and 0x0F
+  if updateCount != (vif.wmmQosInfo and 0x0F):
+    # U-APSD negotiation is association state, not the EDCA update count.
+    vif.wmmQosInfo = (vif.wmmQosInfo and 0xF0) or updateCount
+    vif.wmmAcFlags = params.admissionMask
+    vif.edcaRegs = params.edca
+    for queue, word in params.edca:
+      vifApEdcaWord(config, queue)[] = word
+  true
 
 proc scanuRxFrameValid(frame: pointer; payloadLength: uint32): bool =
   const
@@ -933,8 +1194,11 @@ proc scanuRxFrameValid(frame: pointer; payloadLength: uint32): bool =
   let frameControl = rxuMgtIndMsgAt(frame).frameCtrl
   if (frameControl and 0x00FF'u16) notin [0x50'u16, 0x80'u16]:
     return false
-  var supportedRateCount = -1
-  var extendedRateCount = -1
+  var supportedRates, extendedRates: ptr MacIeView
+  var seenSsid = false
+  var seenDsParam = false
+  var seenRsn = false
+  var seenWpa = false
   var cursor = cast[uint](rxuMgtIndIeStart(frame))
   var remaining = frameLength - fixedFrameLength
   while remaining != 0:
@@ -946,28 +1210,52 @@ proc scanuRxFrameValid(frame: pointer; payloadLength: uint32): bool =
       return false
     case ie.id
     of IE_ID_SSID:
-      if ie.len > 32: return false
+      if seenSsid or ie.len > 32: return false
+      seenSsid = true
     of 1:
-      if supportedRateCount < 0: supportedRateCount = ie.len.int
+      if supportedRates == nil: supportedRates = ie
     of 50:
-      if extendedRateCount < 0: extendedRateCount = ie.len.int
+      if extendedRates == nil: extendedRates = ie
     of IE_ID_DS_PARAM:
+      if seenDsParam or ie.len != 1: return false
+      seenDsParam = true
+    of 32, 42:
       if ie.len != 1: return false
+    of IE_ID_RSN:
+      if seenRsn: return false
+      seenRsn = true
     of IE_ID_HT_CAP:
       if ie.len < 26: return false
     of 221:
+      let body = ie.macIePayload
+      if ie.len >= 4 and body[0] == WPA_OUI[0] and
+          body[1] == WPA_OUI[1] and body[2] == WPA_OUI[2] and
+          body[3] == WPA_OUI[3]:
+        if seenWpa: return false
+        seenWpa = true
       # WMM parameter parsing reads four complete AC records.
       if ie.len >= 5:
-        let body = ie.macIePayload
         if body[0] == 0 and body[1] == 0x50 and body[2] == 0xF2 and
             body[3] == 2 and body[4] == 1 and ie.len < 24:
           return false
+        if body[0] == 0 and body[1] == 0x50 and body[2] == 0xF2 and
+            body[3] == 2 and body[4] == 1:
+          var seenAccessCategories = 0'u8
+          for recordIndex in 0 ..< 4:
+            let aci = (body[8 + recordIndex * 4] shr 5) and 3'u8
+            let aciBit = 1'u8 shl aci
+            if (seenAccessCategories and aciBit) != 0:
+              return false
+            seenAccessCategories = seenAccessCategories or aciBit
     else:
       discard
     cursor += size.uint
     remaining -= size
-  # The extractor uses the first matching IE and ignores extended-only sets.
-  supportedRateCount < 0 or supportedRateCount + max(extendedRateCount, 0) <= 12
+  # Discovery forwards the original IEs. Only a join fills the fixed VIF rate set.
+  if scanu_env.bssidFilterEnabled == 0 or supportedRates == nil: return true
+  var rates: array[12, uint8]
+  let count = readLegacyRateIe(supportedRates, 0, rates)
+  count >= 0 and readLegacyRateIe(extendedRates, count, rates) >= 0
 
 proc scanuFrameMatchesBssid(rx: ptr RxuMgtIndView): bool {.inline.} =
   if (scanu_env.filterBssid[0] and 1) != 0:
@@ -1022,11 +1310,18 @@ proc scanuApplyLegacyCredentialPolicy(param: pointer; payloadLength: uint32;
     return false
   true
 
-proc scanuPublishFrameResult(frame: pointer; scanResultEntry: ptr ScanuResultEntry;
+proc scanuPublishFrameResult(frame: pointer; validatedFrameLen: uint16;
+                             payloadLen: uint32;
+                             scanResultEntry: ptr ScanuResultEntry;
                              request: pointer; epoch, generation: uint32;
                              numSsids, bfOn: uint8;
                              connection: ptr SmTxBuildContext = nil) =
+  if frame == nil:
+    return
   defer: ke_msg_forward_and_change_id(frame, 0x804'u16, 9, 2)
+  if payloadLen < 32 or validatedFrameLen < 36 or
+      validatedFrameLen.uint32 > payloadLen - 32:
+    return
   let saved = irqSave()
   defer: irqRestore(saved)
   let cached = scanuCachedSsidFor(scanResultEntry)
@@ -1038,7 +1333,7 @@ proc scanuPublishFrameResult(frame: pointer; scanResultEntry: ptr ScanuResultEnt
 
   if scanResultEntry.valid == 0:
     scanu_env.resultCount += 1
-  if numSsids == 0 and scan_env.abortFlag == 0:
+  if numSsids == 0:
     return
   scanResultEntry.valid = 1
   inc nimFwDbgScanFrameAccepted
@@ -1052,15 +1347,12 @@ proc scanuPublishFrameResult(frame: pointer; scanResultEntry: ptr ScanuResultEnt
     return
   let retired = scanResultEntry.cachedRxuMgtInd
   scanResultEntry.cachedRxuMgtInd = nil
-  if retired != nil and scanu_env.pendingJoinRxuMgtInd == retired:
-    scanu_env.pendingJoinRxuMgtInd = nil
   let expected = scanResultEntry[]
   template current(): bool = ownsSlot() and scanResultEntry[] == expected
   ke_msg_free_payload(retired)
   if not current(): return
 
-  let totalLen = rxuMgtIndAt(frame).frameLen
-  let cachedRxuMgtIndLen = totalLen.uint32 + 32
+  let cachedRxuMgtIndLen = validatedFrameLen.uint32 + 32
   let cachedAllocLen = max(cachedRxuMgtIndLen, sizeof(RxuMgtIndView).uint32)
   let msg = ke_msg_try_alloc(0x1C00'u16, 2, 2, cachedAllocLen)
   if msg == nil: return
@@ -1068,9 +1360,8 @@ proc scanuPublishFrameResult(frame: pointer; scanResultEntry: ptr ScanuResultEnt
     ke_msg_free_payload(msg)
     return
   discard c_memcpy(msg, frame, cachedRxuMgtIndLen.csize_t)
+  rxuMgtIndAt(msg).frameLen = validatedFrameLen
   scanResultEntry.cachedRxuMgtInd = msg
-  if bfOn != 0:
-    scanu_env.pendingJoinRxuMgtInd = msg
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void scanu_frame_handler(void*,unsigned long);".}
 proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
@@ -1102,6 +1393,7 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
   var scanFlags: uint32
   var scanVifIdx, numSsids: uint8
   var filterSsid: ScanSsidSlotView
+  var directedBssid: bool
   let requestCaptured = block:
     let saved = irqSave()
     defer: irqRestore(saved)
@@ -1113,6 +1405,7 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
       scanFlags = request.flags
       scanVifIdx = request.vifIdx
       numSsids = request.scanType
+      directedBssid = (scanu_env.filterBssid[0] and 1) == 0
       if numSsids == 1:
         filterSsid = scanSsidSlot(request, 0)[]
       true
@@ -1140,7 +1433,8 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
         let rsn = cast[ptr MacIeView](rsnIePtr)
         let securityIeParser =
           cast[proc(a:pointer,b:uint8,c:pointer):pointer{.cdecl.}](parseSecurityIeCallback)
-        if securityIeParser(rsnIePtr, rsn.totalLen.uint8, addr secInfo) != nil:
+        if rsn.totalLen > high(uint8).uint or
+            securityIeParser(rsnIePtr, rsn.totalLen.uint8, addr secInfo) != nil:
           ke_msg_forward_and_change_id(frame, 0x804'u16, 9, 2)
           return
   elif wpaIePtr != nil:
@@ -1150,7 +1444,8 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
         let wpa = cast[ptr MacIeView](wpaIePtr)
         let securityIeParser =
           cast[proc(a:pointer,b:uint8,c:pointer):pointer{.cdecl.}](parseSecurityIeCallback)
-        if securityIeParser(wpaIePtr, wpa.totalLen.uint8, addr secInfo) != nil:
+        if wpa.totalLen > high(uint8).uint or
+            securityIeParser(wpaIePtr, wpa.totalLen.uint8, addr secInfo) != nil:
           ke_msg_forward_and_change_id(frame, 0x804'u16, 9, 2)
           return
 
@@ -1161,17 +1456,13 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
   # Security flag filtering for undirected scan
   let bfOn = scanu_env.bssidFilterEnabled
   if bfOn == 0:
-    let fHasWpa = (scanFlags and 0x200) != 0
-    let fHasRsn = (scanFlags and 0x400) != 0
-    if fHasWpa and not fHasRsn:
-      if rsnIePtr == nil and wpaIePtr == nil:
+    let allowUnrestrictedSecurity = (scanFlags and 0x200) != 0
+    let requirePmfCapableRsn = (scanFlags and 0x400) != 0
+    if requirePmfCapableRsn:
+      if rsnIePtr == nil or (secInfo.caps and 0x80) == 0:
         ke_msg_forward_and_change_id(frame, 0x804'u16, 9, 2)
         return
-    elif fHasRsn and not fHasWpa:
-      if rsnIePtr == nil:
-        ke_msg_forward_and_change_id(frame, 0x804'u16, 9, 2)
-        return
-    elif not fHasWpa and not fHasRsn:
+    elif not allowUnrestrictedSecurity:
       if rsnIePtr != nil and (secInfo.caps and 0x40) != 0:
         ke_msg_forward_and_change_id(frame, 0x804'u16, 9, 2)
         return
@@ -1191,14 +1482,16 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
     scanuRequestCurrent(scanParam, scanEpoch) and
       cachedSsid.generation == resultGeneration
 
-  # Send result IND if flag bit 8
-  var sentInd: uint8 = 0
-  if (scanFlags and 0x100) != 0:
-    ke_msg_send_basic(76, 1, 2)
-    sentInd = 1
+  # 0x4C ends the current channel dwell, not the whole scan. A wildcard
+  # BSSID must first match the requested SSID slot below.
+  let earlyEnd = (scanFlags and 0x100) != 0
+  template endDwellEarly() =
+    ke_msg_send_basic(0x4C, 1, 2)
     if not ownsResult():
       ke_msg_forward_and_change_id(frame, 0x804'u16, 9, 2)
       return
+  if directedBssid and earlyEnd:
+    endDwellEarly()
 
   # Security info
   # Keep rejected observations from changing an already published result.
@@ -1230,9 +1523,22 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
     ssidScratch.length = 0
   else:
     let ssid = ssidIeAt(ssidIe)
-    ssidScratch.length = min(ssid.ie.len, 32)
+    if ssid.ie.len > 32:
+      ke_msg_forward_and_change_id(frame, 0x804'u16, 9, 2)
+      return
+    ssidScratch.length = ssid.ie.len
     for ssidScratchByteIndex in 0 ..< ssidScratch.length.int:
       ssidScratch.ssidBytes[ssidScratchByteIndex] = ssid.ssidBytes[ssidScratchByteIndex]
+    if ssidScratch.length == 0 and previousResult.valid != 0 and
+        previousResult.bssid == rx.bssid:
+      block:
+        let saved = irqSave()
+        defer: irqRestore(saved)
+        if ownsResult() and cachedSsid.valid != 0 and
+            cachedSsid.length in 1'u8 .. 32'u8:
+          ssidScratch.length = cachedSsid.length
+          for i in 0 ..< cachedSsid.length.int:
+            ssidScratch.ssidBytes[i] = cachedSsid.ssidBytes[i]
   nimFwDbgScanSsidLast =
     ssidScratch.length.uint32 or
     (ssidScratch.ssidBytes[0].uint32 shl 8) or
@@ -1264,34 +1570,31 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
     observedResult.rssi = rx.rssi
 
   # SSID filter loop
-  var ssidOk = (numSsids == 0)
-  if numSsids > 0:
-    var ssidFilterIndex = 0
-    while ssidFilterIndex < numSsids.int:
-      let filterSlot = addr filterSsid
-      let fL = filterSlot.length
-      if fL != 0:
-        if fL == ssidScratch.length and
-            c_memcmp(addr filterSlot.ssidBytes[0], addr ssidScratch.ssidBytes[0],
-                     fL.csize_t) == 0:
-          ssidOk = true; break
-      else:
-        if (scanFlags and 0x40) != 0: scan_env.abortFlag = 1
-        if sentInd == 0 and (scanFlags and 0x100) != 0:
-          ke_msg_send_basic(76, 1, 2)
-          if not ownsResult():
-            ke_msg_forward_and_change_id(frame, 0x804'u16, 9, 2)
-            return
-        ssidOk = true; break
-      ssidFilterIndex += 1
-    if not ssidOk:
+  if numSsids != 0:
+    let length = filterSsid.length
+    if length != 0 and (length != ssidScratch.length or
+        c_memcmp(addr filterSsid.ssidBytes[0], addr ssidScratch.ssidBytes[0],
+                 length.csize_t) != 0):
       ke_msg_forward_and_change_id(frame, 0x804'u16, 9, 2)
       return
+    if (scanFlags and 0x40) != 0: scan_env.abortFlag = 1
+    if not directedBssid and earlyEnd:
+      endDwellEarly()
 
   block:
     let saved = irqSave()
     defer: irqRestore(saved)
     if not ownsResult() or scanResultEntry[] != previousResult:
+      ke_msg_forward_and_change_id(frame, 0x804'u16, 9, 2)
+      return
+    # Do not publish a result that cannot be used for a join. Check after the
+    # SSID-filter callbacks, before replacing the cached channel or VIF state.
+    if updateChannel:
+      let configured = configuredScanChannelEntryForFreq(selectedFreq)
+      if configured == nil or configured.band != rx.band:
+        ke_msg_forward_and_change_id(frame, 0x804'u16, 9, 2)
+        return
+    elif observedResult.chanPtr == nil:
       ke_msg_forward_and_change_id(frame, 0x804'u16, 9, 2)
       return
     if updateChannel:
@@ -1322,6 +1625,9 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
     requireFrameOwner()
     if vif != nil:
       let vifView = vifChannelAt(vif)
+      if not scanuPublishVifChannel(vifView, scanResultEntry):
+        ke_msg_forward_and_change_id(frame, 0x804'u16, 9, 2)
+        return
       let htCaps = vifHtCapabilities(vifView)
       let apConfig = vifApConfig(vifView)
       let securityState = vifSecurity(vifView)
@@ -1340,11 +1646,6 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
                        sizeof(ScanSsidSlotView).csize_t)
       vifView.capabilityInfo = scanResultEntry.capInfo
       vifView.beaconIntervalTu = scanResultEntry.beaconPeriod
-      vifView.operChan = scanResultEntry.chanPtr
-      if scanResultEntry.chanPtr != nil:
-        let selectedChan = cast[ptr ScanChannelEntry](scanResultEntry.chanPtr)
-        let selectedFreq = selectedChan.prim20Freq.uint32
-        vifView.channelFreqPair = selectedFreq or (selectedFreq shl 16)
       apConfig.securityFlags = 0
       apConfig.noiseFloor1 = scanResultEntry.noiseFloor1
       apConfig.noiseFloor2 = scanResultEntry.noiseFloor2
@@ -1368,24 +1669,17 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
 
       let wmmO = unsafeAddr WMM_OUI[0]
       let wmmIe = mac_vsie_find(ieStart, ieLen, cast[pointer](wmmO), 5)
-      if wmmIe != nil:
-        let wmm = wmmParameterIeAt(wmmIe)
+      var wmm: StaWmmParameters
+      if decodeStaWmmParameters(cast[ptr MacIeView](wmmIe), wmm):
         vifView.wmmQosInfo = wmm.qosInfo
         vifView.capabilityInfo = vifView.capabilityInfo or 0x200'u16
-        # WMM records begin BE, BK; firmware queues begin BK, BE.
-        const wmmQueueOrder = [API_AC_BE, API_AC_BK, API_AC_VI, API_AC_VO]
-        var admissionMask = 0'u8
-        for parameterIndex in 0 ..< wmm.ac.len:
-          let accessCategory = wmmQueueOrder[parameterIndex]
-          let wmmAcParam = wmm.ac[parameterIndex].le32
-          let edcaPackedParam =
-            (wmmAcParam and 0x0F) or ((wmmAcParam shr 8) shl 4)
-          if (wmmAcParam and 0x10'u32) != 0:
-            admissionMask = admissionMask or (1'u8 shl accessCategory)
-          vifApEdcaWord(apConfig, accessCategory.int)[] = edcaPackedParam
-        vifView.wmmAcFlags = admissionMask
+        for queue, word in wmm.edca:
+          vifApEdcaWord(apConfig, queue)[] = word
+        vifView.wmmAcFlags = wmm.admissionMask
         apConfig.securityFlags = apConfig.securityFlags or 1
       else:
+        vifView.wmmQosInfo = 0
+        vifView.wmmAcFlags = 0
         let defaultEdcaParam = 0x0A43'u32
         for accessCategory in 0..3:
           vifApEdcaWord(apConfig, accessCategory)[] = defaultEdcaParam
@@ -1419,6 +1713,12 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
         assocState.rsnIePtr = 0
         assocState.rsnIeLen = 0
         securityState.cipher = 0
+        securityState.groupCipher = 0
+        securityState.pairwiseCipher = 0
+        securityState.keyMgmtMaskLow = 0
+        securityState.keyMgmt = 0
+        securityState.pmfCapable = 0
+        securityState.pmfRequired = 0
         find_wpa_rsn_ie(ieStart, ieLen, addr wpaIe, addr rsnIe)
         var selectedCipher: uint8 = 0
         var securityParsed = false
@@ -1428,18 +1728,20 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
             let rsn = cast[ptr MacIeView](rsnIe)
             let parseSecurityIeCallback = wpaCallbacks().parseSecurityIe
             if parseSecurityIeCallback != nil:
-              securityParsed = cast[proc(a:pointer,b:uint8,c:pointer):pointer{.cdecl.}](
-                parseSecurityIeCallback)(rsnIe, rsn.totalLen.uint8,
-                                         addr parsedSec.view) == nil
+              if rsn.totalLen <= high(uint8).uint:
+                securityParsed = cast[proc(a:pointer,b:uint8,c:pointer):pointer{.cdecl.}](
+                  parseSecurityIeCallback)(rsnIe, rsn.totalLen.uint8,
+                                           addr parsedSec.view) == nil
         elif wpaIe != nil:
           selectedCipher = 2
           if wpa_cbs != nil:
             let wpa = cast[ptr MacIeView](wpaIe)
             let parseSecurityIeCallback = wpaCallbacks().parseSecurityIe
             if parseSecurityIeCallback != nil:
-              securityParsed = cast[proc(a:pointer,b:uint8,c:pointer):pointer{.cdecl.}](
-                parseSecurityIeCallback)(wpaIe, wpa.totalLen.uint8,
-                                         addr parsedSec.view) == nil
+              if wpa.totalLen <= high(uint8).uint:
+                securityParsed = cast[proc(a:pointer,b:uint8,c:pointer):pointer{.cdecl.}](
+                  parseSecurityIeCallback)(wpaIe, wpa.totalLen.uint8,
+                                           addr parsedSec.view) == nil
         requireFrameOwner()
         securityState.cipher = selectedCipher
         # Read key_mgmt as a full 16-bit value (struct wifi_wpa_ie_t has it as
@@ -1449,26 +1751,45 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
         var selectedAuth: uint32 = 2
         let parsedSecurity = addr parsedSec.view
         let keyMgmtMask = parsedSecurity.keyMgmtLe
+        let rsnInfo =
+          if rsnIe != nil:
+            wifiRsnAkmInfoFromIe(rsnIe, cast[ptr MacIeView](rsnIe).totalLen.uint32)
+          else:
+            WifiRsnAkmInfo()
+        let eligibleKeyMgmtMask =
+          if parsedSecurity.groupCipher == 4'u8 and
+              parsedSecurity.pairwiseCipher in [4'u8, 5'u8] and
+              rsnInfo.bipCmac128: keyMgmtMask
+          else: keyMgmtMask and not WifiAuthMaskSae
         nimFwDbgScanKeyMgmt = keyMgmtMask
         nimFwDbgScanSmF = savedChannelDurationFlags
         nimFwDbgScanCaps = parsedSecurity.caps.uint32
         when defined(bl808WifiForcePmfCapable):
-          var effectiveAuthFlags = savedChannelDurationFlags or 0x600'u32
+          let effectiveAuthFlags = savedChannelDurationFlags or 0x200'u32
         else:
-          var effectiveAuthFlags = savedChannelDurationFlags
+          let effectiveAuthFlags = savedChannelDurationFlags
+        let peerPmfCapable = (parsedSecurity.caps and 0x80) != 0
+        let peerPmfRequired = (parsedSecurity.caps and 0x40) != 0
+        let localPmfCapable = (effectiveAuthFlags and 0x600) != 0
+        let localPmfRequired = (effectiveAuthFlags and 0x400) != 0
         selectedAuth = wifiPreferredKeyMgmtFromMask(
-          keyMgmtMask,
-          (effectiveAuthFlags and 0x600) != 0)
+          eligibleKeyMgmtMask, localPmfCapable and peerPmfCapable,
+          localPmfRequired)
         nimFwDbgScanAT = selectedAuth
-        if securityParsed and selectedAuth != 0:
+        let pmfCompatible =
+          (selectedAuth != WifiKeyMgmtSae or (peerPmfCapable and localPmfCapable)) and
+          (not peerPmfRequired or (peerPmfCapable and localPmfCapable)) and
+          (not localPmfRequired or peerPmfCapable) and
+          (not (peerPmfCapable and localPmfCapable) or rsnInfo.bipCmac128)
+        if securityParsed and selectedAuth != 0 and pmfCompatible:
           securityAccepted = true
           securityState.groupCipher = parsedSecurity.groupCipher
           securityState.pairwiseCipher = parsedSecurity.pairwiseCipher
           securityState.keyMgmtMaskLow = parsedSecurity.keyMgmtMaskLow
           securityState.keyMgmt = selectedAuth
-          if (parsedSecurity.caps and 0x80) != 0:
+          if peerPmfCapable and localPmfCapable:
             securityState.pmfCapable = 1
-            if (parsedSecurity.caps and 0x40) != 0 or selectedAuth == 1024:
+            if peerPmfRequired or localPmfRequired or selectedAuth == WifiKeyMgmtSae:
               securityState.pmfRequired = 1
               securityState.keyMgmtMaskLow = 6
           if selectedAuth == 1024: securityState.cipher = 4
@@ -1478,9 +1799,12 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
             if srcSecIe != nil:
               let secIe = cast[ptr MacIeView](srcSecIe)
               let secLenRaw = secIe.totalLen
-              let copyLen = if secLenRaw > 128'u: 128'u else: secLenRaw
               let assocSecurityIeSlot =
                 if vifView.vifIdx.int < MAX_VIFS: vifView.vifIdx.int else: 0
+              if secLenRaw > assocSecIeStore[assocSecurityIeSlot].len.uint:
+                ke_msg_forward_and_change_id(frame, 0x804'u16, 9, 2)
+                return
+              let copyLen = secLenRaw
               discard c_memcpy(addr assocSecIeStore[assocSecurityIeSlot][0], srcSecIe,
                                copyLen.csize_t)
               securityState.rsnIePtr =
@@ -1488,9 +1812,12 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
               securityState.rsnIeLen = copyLen.uint8
               assocState.rsnIePtr = securityState.rsnIePtr
               assocState.rsnIeLen = securityState.rsnIeLen
+              var securityIeTraceWord = 0'u32
+              let traceLen = min(copyLen, sizeof(securityIeTraceWord).uint)
+              discard c_memcpy(addr securityIeTraceWord, srcSecIe, traceLen.csize_t)
               nimFwTrace2U32("[WIFI-NIMFW] scan_sec_ie ",
                              effectiveCipher.uint32 or (copyLen.uint32 shl 8),
-                             cast[ptr uint32](srcSecIe)[])
+                             securityIeTraceWord)
               requireFrameOwner()
             var notify {.noinit.}: WpaScanSecurityNotifyView
             discard c_memset(addr notify, 0, sizeof(WpaScanSecurityNotifyView).csize_t)
@@ -1499,8 +1826,11 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
             notify.bssid = vifView.bssid
             notify.cipher = effectiveCipher
             notify.keyMgmt = selectedAuth.uint16
-            notify.cipherPair = cast[ptr uint16](addr securityState.groupCipher)[]
-            notify.scanNotifyVendorByte = parsedSecurity.scanNotifyVendorByte
+            notify.pairwiseCipher = securityState.pairwiseCipher
+            notify.groupCipher = securityState.groupCipher
+            notify.pmfRequired = securityState.pmfRequired
+            notify.mgmtGroupCipher =
+              if securityState.pmfCapable != 0: 6'u8 else: 0'u8
             if wpa_cbs != nil:
               let scanSecurityNotifyCallback = wpaCallbacks().scanSecurityNotify
               if scanSecurityNotifyCallback != nil:
@@ -1549,7 +1879,8 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
         if cf != nil: cast[proc(b:pointer){.cdecl.}](cf)(addr wb.view)
 
   requireFrameOwner()
-  scanuPublishFrameResult(frame, scanResultEntry, scanParam, scanEpoch,
+  scanuPublishFrameResult(frame, totalLen, len,
+                          scanResultEntry, scanParam, scanEpoch,
                           resultGeneration, numSsids, bfOn,
                           if bfOn == 0: nil else: addr directedOwner)
 
@@ -1594,14 +1925,20 @@ proc scanuResultCurrent(snapshot: ScanuResultSnapshot;
   value.chanPtr == nil or
     cast[ptr ScanChannelEntry](value.chanPtr)[] == snapshot.channel
 
+proc scanuBssSecurityPreferred(entry: ptr ScanuResultEntry): bool {.inline.} =
+  # BL808 scanu_search_by_ssid masks entry bytes 0x14 and 0x16,
+  # the low bytes of the two security fields, not the retained frame pointer.
+  entry.securityAuth != 0 or (entry.securityType and 0xFF'u16) != 0
+
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void* scanu_search_by_ssid(void*,void*);".}
 proc scanu_search_by_ssid*(ssid: pointer, entryIndexOut: pointer): pointer {.exportc, cdecl.} =
   ## Search scan results by SSID.
   ## ssid = pointer to SSID string (first byte = SSID length, rest = SSID data).
   ## entryIndexOut receives the selected result index; blob reads length from ssid[0].
   ## Returns pointer to matching scan result entry, or nil if not found.
-  ## The vendor compares equal-length SSIDs and keeps the strongest result.
-  ## Raw-frame lookup and retained-cache fallback are Nim-side extensions.
+  ## A directed scan compares the query with the request's SSID filter, then
+  ## keeps the strongest valid result. Unfiltered scans also use the Nim-side
+  ## raw-frame and retained-cache lookup.
   if ssid == nil:
     return nil
   let saved = irqSave()
@@ -1610,6 +1947,12 @@ proc scanu_search_by_ssid*(ssid: pointer, entryIndexOut: pointer): pointer {.exp
   let ssidSlot = lengthPrefixedSsidView(ssid)
   let searchLen = ssidSlot.length
   if searchLen == 0 or searchLen > 32:
+    return nil
+  let useRequestFilter = scanu_env.filterSsidLen != 0
+  if useRequestFilter and
+      (searchLen != scanu_env.filterSsidLen or
+       c_memcmp(addr ssidSlot.ssidBytes[0], addr scanu_env.filterSsid[0],
+                searchLen.csize_t) != 0):
     return nil
   # Keep a bounded query snapshot across diagnostic callbacks.
   var searchSsid: ScanSsidSlotView
@@ -1620,22 +1963,33 @@ proc scanu_search_by_ssid*(ssid: pointer, entryIndexOut: pointer): pointer {.exp
     (searchSsid.ssidBytes[1].uint32 shl 8) or
     (searchSsid.ssidBytes[2].uint32 shl 16) or
     (searchSsid.ssidBytes[3].uint32 shl 24)
+  # Bit 9 enables the vendor's security preference. Bit 10 suppresses retry.
+  let connectInfo = smEnvView().connectInfo
+  let searchFlags =
+    if connectInfo != nil: connectInfoView(connectInfo).channelDuration
+    else: 0'u32
+  let preferSecurity = (searchFlags and (1'u32 shl 9)) != 0
+  let strictSecurity = (searchFlags and (1'u32 shl 10)) != 0
+  let passCount = if preferSecurity and not strictSecurity: 2 else: 1
   nimFwDbgSsidSearch = searchLen.uint32 or (searchWord shl 8)
   nimFwDbgSsidEntries = 0
   nimFwDbgSsidHits = 0
   nimFwTrace2U32("[WIFI-NIMFW] ssid_s ", searchLen.uint32, searchWord)
   # Build search key (ssid+1 is the actual SSID data, length = searchLen)
   let searchData = cast[pointer](addr searchSsid.ssidBytes[0])
-  # The blob can apply an optional channel filter here. Keep it disabled for
-  # the normal station-connect scan path; the cached scan entries already
-  # carry the channel pointer used by sm_get_bss_params.
-  let filterState = 0'u32
   var bestScanResultEntry: ptr ScanuResultEntry = nil
   var bestRssi: int8 = -128
   var bestSnapshot: ScanuResultSnapshot
   var bestIndex: uint32
   var bestAllowsRawRelease = false
-  for ssidSearchResultSlotIndex in 0'u8 ..< SCANU_MAX_RESULT_ENTRIES.uint8:
+  for scanIteration in 0'u8 ..< (SCANU_MAX_RESULT_ENTRIES * passCount).uint8:
+    if scanIteration == SCANU_MAX_RESULT_ENTRIES.uint8 and
+        bestScanResultEntry != nil:
+      break
+    let ssidSearchResultSlotIndex =
+      scanIteration mod SCANU_MAX_RESULT_ENTRIES.uint8
+    let filterState = preferSecurity and
+      scanIteration < SCANU_MAX_RESULT_ENTRIES.uint8
     let ssidSearchResultEntry =
       addr scanu_env.entries[ssidSearchResultSlotIndex]
     when defined(bl808WifiConnectTrace):
@@ -1656,27 +2010,27 @@ proc scanu_search_by_ssid*(ssid: pointer, entryIndexOut: pointer): pointer {.exp
     if ssidSearchResultEntry.valid == 0:
       continue
     inc nimFwDbgSsidEntries
-    # If filter active, check channel info pattern
-    if filterState != 0:
-      let chanInfo = cast[uint32](ssidSearchResultEntry.cachedRxuMgtInd)
-      if (chanInfo and 0x00FF00FF'u32) == 0:
-        continue
-    # Check RSSI threshold (offset 17 = rssi, signed byte)
+    if filterState and not scanuBssSecurityPreferred(ssidSearchResultEntry):
+      continue
+    # The vendor skips entries that cannot improve the selected RSSI before
+    # reading their SSID or invoking its match logger.
     let rssi = ssidSearchResultEntry.rssi
-    if rssi < -128'i8:
+    if rssi <= bestRssi:
       continue
     let snapshot = scanuCaptureResult(ssidSearchResultEntry)
-    let retainedMatch = scanuCachedSsidMatches(ssidSearchResultEntry,
-                                              searchData, searchLen)
-    # Prefer the raw beacon/probe SSID when present, then the retained cache.
+    let retainedMatch =
+      if useRequestFilter: false
+      else: scanuCachedSsidMatches(ssidSearchResultEntry, searchData, searchLen)
+    # On unfiltered scans, an advertised SSID is authoritative; the retained
+    # cache only fills in hidden or unavailable raw SSIDs.
     let cachedRxuMgtInd = ssidSearchResultEntry.cachedRxuMgtInd
-    if cachedRxuMgtInd == nil:
+    if not useRequestFilter and cachedRxuMgtInd == nil:
       nimFwTrace2U32("[WIFI-NIMFW] ssid_raw0 ",
                      ssidSearchResultSlotIndex.uint32,
                      cast[uint32](ssidSearchResultEntry))
       if not retainedMatch:
         continue
-    else:
+    elif not useRequestFilter:
       # Find SSID IE in the cached RXU_MGT_IND payload. The RXU header is 32
       # bytes, followed by the MAC header (24) and beacon fixed fields (12).
       let cachedRxuMgtIndView = rxuMgtIndAt(cachedRxuMgtInd)
@@ -1703,7 +2057,10 @@ proc scanu_search_by_ssid*(ssid: pointer, entryIndexOut: pointer): pointer {.exp
             c_memcmp(searchData, addr entrySsid.ssidBytes[0], searchLen.csize_t)
           else:
             1.cint
-        let matches = cmpResult == 0 or retainedMatch
+        let matches =
+          if entrySsidLen == 0: retainedMatch
+          else: entrySsidLen <= 32 and entrySsidLen == searchLen and
+            cmpResult == 0
         nimFwTrace2U32("[WIFI-NIMFW] ssid_e ",
                        entrySsidMeta, entrySsidWord)
         if entrySsidLen == searchLen and cmpResult != 0:
@@ -1722,15 +2079,13 @@ proc scanu_search_by_ssid*(ssid: pointer, entryIndexOut: pointer): pointer {.exp
                 format: cstring) {.cdecl, varargs.}](logFnMatch)(
         2, nil, "scanu.c", 1010, "find existed ssid, idx = %d, rssi %d\r\n",
         ssidSearchResultSlotIndex.cint, rssi.cint)
-    if not scanuResultCurrent(snapshot, retainedMatch):
+    if not scanuResultCurrent(snapshot, useRequestFilter or retainedMatch):
       return nil
-    # Track best RSSI
-    if rssi > bestRssi:
-      bestRssi = rssi
-      bestScanResultEntry = ssidSearchResultEntry
-      bestSnapshot = snapshot
-      bestIndex = ssidSearchResultSlotIndex.uint32
-      bestAllowsRawRelease = retainedMatch
+    bestRssi = rssi
+    bestScanResultEntry = ssidSearchResultEntry
+    bestSnapshot = snapshot
+    bestIndex = ssidSearchResultSlotIndex.uint32
+    bestAllowsRawRelease = useRequestFilter or retainedMatch
   if bestScanResultEntry != nil:
     if scanuRequestEpoch != searchEpoch or
         not scanuResultCurrent(bestSnapshot, bestAllowsRawRelease):
@@ -1765,23 +2120,25 @@ proc scanu_rm_exist_ssid*(ssid: pointer, ssidLen: uint8) {.exportc, cdecl.} =
           scanuClearCachedChannel(ssidIndexResultEntry)
           discard c_memset(ssidIndexResultEntry, 0, sizeof(ScanuResultEntry).csize_t)
 
-  let logFn = getLogFunc(204)
-  if logFn != nil:
+  let startLogFn = getLogFunc(204)
+  if startLogFn != nil:
     cast[proc(level: uint32; tag, file: cstring; line: cint;
-              format: cstring) {.cdecl, varargs.}](logFn)(
+              format: cstring) {.cdecl, varargs.}](startLogFn)(
       2, nil, "scanu.c", 1032, "start scanu_rm_exist_ssid \r\n")
   if not removal.inspected:
     return
   if removal.matched:
-    if logFn != nil:
+    let matchLogFn = getLogFunc(204)
+    if matchLogFn != nil:
       cast[proc(level: uint32; tag, file: cstring; line: cint;
-                format: cstring) {.cdecl, varargs.}](logFn)(
+                format: cstring) {.cdecl, varargs.}](matchLogFn)(
         2, nil, "scanu.c", 1043, "delete the existed ssid %s\r\n",
         cast[cstring](addr removal.ssid[0]))
     ke_msg_free_payload(removal.frame)
-  if logFn != nil:
+  let endLogFn = getLogFunc(204)
+  if endLogFn != nil:
     cast[proc(level: uint32; tag, file: cstring; line: cint;
-              format: cstring) {.cdecl, varargs.}](logFn)(
+              format: cstring) {.cdecl, varargs.}](endLogFn)(
       2, nil, "scanu.c", 1046, "over scanu_rm_exist_ssid \r\n")
 
 proc scanuDetachCachedScanResults(): array[SCANU_MAX_RESULT_ENTRIES, pointer] =
@@ -1864,10 +2221,16 @@ proc wifi_nimfw_prune_scan_raw_cache_for_ssid*(ssid: cstring,
       if ssidIe == nil:
         continue
       let entrySsid = ssidIeAt(ssidIe)
-      if entrySsid.ie.len.uint32 != ssidLen:
-        continue
-      if c_memcmp(cast[pointer](ssid), addr entrySsid.ssidBytes[0],
-                  ssidLen.csize_t) != 0:
+      let matches =
+        if entrySsid.ie.len == 0:
+          scanuCachedSsidMatches(scanResultEntry, cast[pointer](ssid),
+                                 ssidLen.uint8)
+        elif entrySsid.ie.len.uint32 == ssidLen:
+          c_memcmp(cast[pointer](ssid), addr entrySsid.ssidBytes[0],
+                   ssidLen.csize_t) == 0
+        else:
+          false
+      if not matches:
         continue
       if bestScanResultEntry == nil or scanResultEntry.rssi > bestRssi:
         bestScanResultEntry = scanResultEntry
@@ -1875,10 +2238,6 @@ proc wifi_nimfw_prune_scan_raw_cache_for_ssid*(ssid: cstring,
     scanuDetachRawScanFrames(bestScanResultEntry)
   for frame in retired:
     ke_msg_free_payload(frame)
-
-proc scanu_dump_scanresult*() {.exportc, cdecl.} =
-  ## Dump scan results for debugging.
-  discard
 
 proc scanu_raw_send_cfm*(result: pointer, destId: uint8) {.exportc, cdecl.} =
   ## Send raw frame send confirmation (16 instrs in blob).
@@ -1892,29 +2251,12 @@ proc scanu_raw_send_cfm*(result: pointer, destId: uint8) {.exportc, cdecl.} =
     msg.result = cast[uint32](result)
     ke_msg_send(msg)
 
-proc bestDirectedScanuResult(searchData: pointer; searchLen: uint8):
-    ptr ScanuResultEntry {.inline.} =
-  if scanu_env.directedFound == 0:
-    return nil
-  var best: ptr ScanuResultEntry = nil
-  var bestRssi: int8 = -128
-  for scanResultSlotIndex in 0 ..< SCANU_MAX_RESULT_ENTRIES:
-    let scanResultEntry = addr scanu_env.entries[scanResultSlotIndex]
-    if scanResultEntry.valid == 0 or scanResultChannelPtr(scanResultEntry) == nil:
-      continue
-    if not scanuCachedSsidMatches(scanResultEntry, searchData, searchLen):
-      continue
-    if best == nil or scanResultEntry.rssi > bestRssi:
-      best = scanResultEntry
-      bestRssi = scanResultEntry.rssi
-  return best
-
-proc bestScanuResultForSsidAndFreq(searchData: pointer; searchLen: uint8;
-                                   freq: uint16): ptr ScanuResultEntry {.inline.} =
-  if freq == 0'u16 or freq == 0xFFFF'u16:
-    return nil
-  var best: ptr ScanuResultEntry = nil
-  var bestRssi: int8 = -128
+proc bestCachedScanuResult(searchData: pointer; searchLen: uint8;
+                           freq: uint16; searchFlags: uint32): ptr ScanuResultEntry =
+  let preferSecurity = (searchFlags and (1'u32 shl 9)) != 0
+  let strictSecurity = preferSecurity and (searchFlags and (1'u32 shl 10)) != 0
+  var best: ptr ScanuResultEntry
+  var bestPreferred: ptr ScanuResultEntry
   for scanResultSlotIndex in 0 ..< SCANU_MAX_RESULT_ENTRIES:
     let scanResultEntry = addr scanu_env.entries[scanResultSlotIndex]
     if scanResultEntry.valid == 0:
@@ -1924,12 +2266,20 @@ proc bestScanuResultForSsidAndFreq(searchData: pointer; searchLen: uint8;
     let channel = scanResultChannelPtr(scanResultEntry)
     if channel == nil:
       continue
-    if cast[ptr ScanChannelEntry](channel).prim20Freq != freq:
+    if freq != 0 and cast[ptr ScanChannelEntry](channel).prim20Freq != freq:
       continue
-    if best == nil or scanResultEntry.rssi > bestRssi:
+    if preferSecurity and scanuBssSecurityPreferred(scanResultEntry) and
+        (bestPreferred == nil or scanResultEntry.rssi > bestPreferred.rssi):
+      bestPreferred = scanResultEntry
+    if best == nil or scanResultEntry.rssi > best.rssi:
       best = scanResultEntry
-      bestRssi = scanResultEntry.rssi
-  best
+  if bestPreferred != nil or strictSecurity: bestPreferred else: best
+
+proc scanuResultSlotIndex(entry: ptr ScanuResultEntry): uint32 {.inline.} =
+  for index in 0 ..< SCANU_MAX_RESULT_ENTRIES:
+    if entry == addr scanu_env.entries[index]:
+      return index.uint32
+  0xFFFFFFFF'u32
 
 # ###########################################################################
 #                   SM: Station State Machine
@@ -1951,14 +2301,14 @@ proc sm_init*() {.exportc, cdecl.} =
   ke_state_set(TASK_SM, SmIdleState)
   smDeferredCancel()
 
-proc sm_get_bss_params*(selectedBssResultOut: ptr pointer, selectedBssChannelOut: ptr pointer): bool {.exportc, cdecl.} =
+proc sm_get_bss_params*(selectedBssResultOut: ptr pointer, selectedBssChannelOut: ptr pointer) {.exportc, cdecl.} =
   ## Get BSS parameters from scan results.
   ## From blob (111 instrs): loads sm_env[0] connect info, searches scanu results
   ## by BSSID/SSID, fills selectedBssResultOut with scan result ptr and selectedBssChannelOut with
-  ## channel frequency pointer. Returns true if found.
+  ## channel frequency pointer. The archive reports status through those outputs.
   if selectedBssResultOut != nil: selectedBssResultOut[] = nil
   if selectedBssChannelOut != nil: selectedBssChannelOut[] = nil
-  if selectedBssResultOut == nil or selectedBssChannelOut == nil: return false
+  if selectedBssResultOut == nil or selectedBssChannelOut == nil: return
   let saved = irqSave()
   defer: irqRestore(saved)
   let sm = smEnvView()
@@ -1968,7 +2318,7 @@ proc sm_get_bss_params*(selectedBssResultOut: ptr pointer, selectedBssChannelOut
   template current(): bool =
     smTxOwnerCurrent(owner) and sm.connectIndMsg == indication and
       scanuRequestEpoch == scanEpoch
-  if not current(): return false
+  if not current(): return
   let connInfo = owner.connection
   var snapshot = connectInfoView(connInfo)[]
   let ci = addr snapshot
@@ -1988,15 +2338,11 @@ proc sm_get_bss_params*(selectedBssResultOut: ptr pointer, selectedBssChannelOut
         if publishIndex: sm.scanResultIndex = selectedIndex
         selectedBssResultOut[] = selectedBssResult
         selectedBssChannelOut[] = selectedBssChannel
-      else:
-        result = false
-    else:
-      result = false
   let logFn = cast[proc(fmt: cstring) {.cdecl, varargs.}](blOpsFunc(4))
-  if not current(): return false
+  if not current(): return
   if logFn != nil:
     logFn("===start sm_get_bss_params===\r\n")
-    if not current(): return false
+    if not current(): return
 
   let bssidPtr = cast[pointer](addr ci.bssid[0])
   nimFwDbgBssIn =
@@ -2015,10 +2361,10 @@ proc sm_get_bss_params*(selectedBssResultOut: ptr pointer, selectedBssChannelOut
                             (scanu_env.resultCount.uint32 shl 8) or
                             (scanu_env.directedFound.uint32 shl 24),
                           ssidPrefixWord)
-    if not current(): return false
+    if not current(): return
     nimFwConnectTrace2U32("[WIFI-CT] bss_bssid ", bssidPrefixWord,
                           ci.bssid[4].uint32 or (ci.bssid[5].uint32 shl 8))
-    if not current(): return false
+    if not current(): return
 
   # Log the BSSID we're searching for (3 iterations logging pairs)
   if logFn != nil:
@@ -2026,7 +2372,7 @@ proc sm_get_bss_params*(selectedBssResultOut: ptr pointer, selectedBssChannelOut
       let index = bssidPairLogIndex.int * 2
       let pair = ci.bssid[index].uint32 or (ci.bssid[index + 1].uint32 shl 8)
       logFn("bssid[%d] = 0x%x\r\n", bssidPairLogIndex, pair)
-      if not current(): return false
+      if not current(): return
 
   # Check if BSSID is set (not all zeros and not starting with bit 0 set)
   let bssidFirstByte = ci.bssid[0]
@@ -2046,14 +2392,14 @@ proc sm_get_bss_params*(selectedBssResultOut: ptr pointer, selectedBssChannelOut
       # Search by BSSID
       if logFn != nil:
         logFn("search bssid \r\n")
-        if not current(): return false
+        if not current(): return
 
       # Call scanu_search_by_bssid (blob's 2-instr trampoline that
       # tail-calls scanu_find_result(bssid, 0)). Matching the blob call
       # here keeps the call graph parity intact.
       selectedBssResult = cast[pointer](addr connectInfoView(connInfo).bssid[0])
       let scanResult = scanu_search_by_bssid(bssidPtr)
-      if not current(): return false
+      if not current(): return
 
       if scanResult != nil:
         # Get channel pointer from scan result offset 8
@@ -2066,7 +2412,7 @@ proc sm_get_bss_params*(selectedBssResultOut: ptr pointer, selectedBssChannelOut
         # Log and return
         if logFn != nil:
           logFn("===end sm_get_bss_params===\r\n")
-        return true
+        return
 
       if connectInfoHasChannelHint(ci):
         selectedBssChannel = connectInfoChannelHint(connInfo)
@@ -2075,7 +2421,7 @@ proc sm_get_bss_params*(selectedBssResultOut: ptr pointer, selectedBssChannelOut
     # BSSID not specified -- search by SSID.
     if logFn != nil:
       logFn("search ssid = %s\r\n", cast[cstring](addr ci.ssid[0]))
-      if not current(): return false
+      if not current(): return
 
     var resultIndex: int32 = -1
     var searchSlot {.noinit.}: ScanSsidSlotView
@@ -2083,24 +2429,30 @@ proc sm_get_bss_params*(selectedBssResultOut: ptr pointer, selectedBssChannelOut
     let hintedFreq =
       if connectInfoHasChannelHint(ci): connectInfoChannelFrequency(ci)
       else: 0'u16
+    let searchData = cast[pointer](addr searchSlot.ssidBytes[0])
+    let hasHintedFreq = hintedFreq != 0'u16 and hintedFreq != 0xFFFF'u16
     let hintedResult =
-      bestScanuResultForSsidAndFreq(cast[pointer](addr searchSlot.ssidBytes[0]),
-                                    searchSlot.length, hintedFreq)
+      if hasHintedFreq:
+        bestCachedScanuResult(searchData, searchSlot.length, hintedFreq,
+                              ci.channelDuration)
+      else:
+        nil
     let ssidResult =
       if hintedResult != nil:
         hintedResult
-      elif hintedFreq != 0'u16 and hintedFreq != 0xFFFF'u16:
+      elif hasHintedFreq:
         nil
       else:
         cast[ptr ScanuResultEntry](
           scanu_search_by_ssid(addr searchSlot, cast[pointer](addr resultIndex)))
-    if not current(): return false
+    if not current(): return
     if ssidResult != nil:
       if resultIndex >= 0 or hintedResult != nil:
         selectedBssResult = ssidResult
         selectedIndex =
-          if resultIndex >= 0: resultIndex.uint32 else: 0xFFFFFFFF'u32
-        publishIndex = true
+          if hintedResult != nil: scanuResultSlotIndex(hintedResult)
+          else: resultIndex.uint32
+        publishIndex = selectedIndex != 0xFFFFFFFF'u32
       let ssidResultEntry = scanuResultAt(ssidResult)
       selectedAuthEntry = ssidResultEntry
       let ssidResultChannel = scanResultChannelPtr(ssidResultEntry)
@@ -2108,7 +2460,7 @@ proc sm_get_bss_params*(selectedBssResultOut: ptr pointer, selectedBssChannelOut
       selectedEntrySnapshot = scanuCaptureResult(ssidResultEntry)
     if logFn != nil:
       logFn("result ssid index = %d\r\n", resultIndex)
-      if not current(): return false
+      if not current(): return
     nimFwDbgBssSsidResult =
       cast[uint32](cast[uint](ssidResult)) or
         ((resultIndex.uint32 and 0xFF'u32) shl 24)
@@ -2116,12 +2468,11 @@ proc sm_get_bss_params*(selectedBssResultOut: ptr pointer, selectedBssChannelOut
       nimFwConnectTrace2U32("[WIFI-CT] bss_ssid_result ",
                             cast[uint32](cast[uint](ssidResult)),
                             cast[uint32](resultIndex))
-      if not current(): return false
+      if not current(): return
     if ssidResult == nil:
       let directed =
-        if hintedFreq == 0'u16:
-          bestDirectedScanuResult(cast[pointer](addr searchSlot.ssidBytes[0]),
-                                  searchSlot.length)
+        if hintedFreq == 0'u16 and scanu_env.directedFound != 0:
+          bestCachedScanuResult(searchData, searchSlot.length, 0, ci.channelDuration)
         else:
           nil
       if directed != nil:
@@ -2129,6 +2480,8 @@ proc sm_get_bss_params*(selectedBssResultOut: ptr pointer, selectedBssChannelOut
         selectedAuthEntry = directed
         selectedBssChannel = scanResultChannelPtr(directed)
         selectedEntrySnapshot = scanuCaptureResult(directed)
+        selectedIndex = scanuResultSlotIndex(directed)
+        publishIndex = selectedIndex != 0xFFFFFFFF'u32
       nimFwDbgBssDirected =
         cast[uint32](cast[uint](directed)) or
         (scanu_env.directedFound.uint32 shl 24)
@@ -2136,7 +2489,7 @@ proc sm_get_bss_params*(selectedBssResultOut: ptr pointer, selectedBssChannelOut
         nimFwConnectTrace2U32("[WIFI-CT] bss_directed ",
                               cast[uint32](cast[uint](directed)),
                               scanu_env.directedFound.uint32)
-        if not current(): return false
+        if not current(): return
       if directed == nil and connectInfoHasChannelHint(ci):
         selectedBssChannel = connectInfoChannelHint(connInfo)
 
@@ -2152,10 +2505,10 @@ proc sm_get_bss_params*(selectedBssResultOut: ptr pointer, selectedBssChannelOut
     nimFwConnectTrace2U32("[WIFI-CT] bss_out ",
                           cast[uint32](cast[uint](selectedBssResult)),
                           cast[uint32](cast[uint](selectedBssChannel)))
-    if not current(): return false
+    if not current(): return
   if logFn != nil:
     logFn("===end sm_get_bss_params===\r\n")
-  return selectedBssResult != nil
+  return
 
 proc smSubmitScanRequest(localMac, targetBssid, channelInfo: pointer;
                          joining: bool; joinFlag: uint32) =
@@ -2204,6 +2557,11 @@ proc smSubmitScanRequest(localMac, targetBssid, channelInfo: pointer;
     if prepared.channelCount == 0:
       invalidInput()
       return
+  for channelIndex in 0 ..< prepared.channelCount.int:
+    let channel = prepared.channelList[channelIndex]
+    if not scanChannelValid(channel.band, channel.prim20Freq):
+      invalidInput()
+      return
 
   block:
     let saved = irqSave()
@@ -2235,8 +2593,8 @@ proc smSubmitScanRequest(localMac, targetBssid, channelInfo: pointer;
 proc sm_scan_bss*(bssid: pointer, ssid: pointer, chanInfo: pointer) {.exportc, cdecl.} =
   smSubmitScanRequest(bssid, ssid, chanInfo, false, 0)
 
-proc sm_join_bss*(bssid: pointer, ssid: pointer, joinInfo: pointer, flag: uint32) {.exportc, cdecl.} =
-  smSubmitScanRequest(bssid, ssid, joinInfo, true, flag)
+proc sm_join_bss*(bssid: pointer, ssid: pointer, joinInfo: pointer, flag: bool) {.exportc, cdecl.} =
+  smSubmitScanRequest(bssid, ssid, joinInfo, true, flag.uint32)
 
 proc smPrepareChannelContext(connInfo: pointer; chanReq: var ChanCtxtDefView): bool =
   if connInfo == nil: return false
@@ -2272,17 +2630,17 @@ proc smAddPreparedChannelContext(chanReq: var ChanCtxtDefView; output: ptr uint8
   nimFwDbgSmChanCtxResult = result.uint32
   return result
 
-proc sm_add_chan_ctx*(param: pointer): uint8 {.exportc, cdecl, discardable.} =
-  ## Preserve the exported ABI while callers may prepare before allocation.
+proc sm_add_chan_ctx*(chanIndex: ptr uint8): uint8 {.exportc, cdecl, discardable.} =
+  ## Prepare a channel context and return its index through the vendor output.
   var prepared: ChanCtxtDefView
   if not smPrepareChannelContext(smEnvView().connectInfo, prepared): return 1
-  smAddPreparedChannelContext(prepared, cast[ptr uint8](param))
+  smAddPreparedChannelContext(prepared, chanIndex)
 
-proc sm_send_next_bss_param*(param: pointer) {.exportc, cdecl.} =
+proc sm_send_next_bss_param*() {.exportc, cdecl.} =
   ## Dispatch at most one request, retaining its batch identity until reply.
   smBssSendNext()
 
-proc sm_set_bss_param*(param: pointer) {.exportc, cdecl.} =
+proc sm_set_bss_param*() {.exportc, cdecl.} =
   ## Prepare the vendor's nine-message association configuration sequence.
   ## Keep it private until allocation and connection-owner checks succeed.
   if not smBssCanBegin(): return
@@ -2343,7 +2701,7 @@ proc sm_set_bss_param*(param: pointer) {.exportc, cdecl.} =
         edcaParam: cast[ptr uint32](addr vif.edcaParams[ac.uint * 4])[],
         acmFlag: ac, vifIdx: vifIdx,
         uapsdAc: (uapsdEnabled and (mac_ac2uapsd[ac] and qosMask) != 0).uint8)
-  if basicRates[0].int >= basicRates.len:
+  if basicRates[0] == 0 or basicRates[0].int >= basicRates.len:
     preparationFailed = true
     return
 
@@ -2426,7 +2784,7 @@ proc sm_set_bss_param*(param: pointer) {.exportc, cdecl.} =
     if not smBssStart(build, serial, replies): return
     sm.pendingBssParams = pending
     published = true
-    sm_send_next_bss_param(param)
+    sm_send_next_bss_param()
 
 proc sm_handle_connection*(vifIdx: uint8, status: uint16,
     callbackCtx: pointer, failureFn: pointer) {.exportc, cdecl.} =
@@ -2580,31 +2938,67 @@ proc sm_handle_connection*(vifIdx: uint8, status: uint16,
   # it until completion; only that completion may tear down station/key state.
   notifyFailure()
 
-proc sm_disconnect_process*(param: pointer, statusCode: uint16 = 0, reasonCode: uint16 = 0) {.exportc, cdecl.} =
-  ## Process a disconnect request (122 bytes in blob, 39 instrs).
-  ## Blob: ke_msg_alloc, ke_timer_clear, clear smConnecting + sm_env[0],
-  ## sm_delete_resources, populate msg, tail-call ke_msg_send.
+proc smDisconnectHandoffCurrent(handoff: SmDisconnectHandoff): bool =
+  txResetEpoch == handoff.resetEpoch and mmVifCurrent(handoff.peer) and
+    (handoff.saQuerySerial == 0 or handoff.saQuerySerial == smSaQuery.serial) and
+    smEnvView().connectInfo == handoff.connection and
+    ke_state_get(TASK_SM) == handoff.state
+
+proc smDisconnectOwned(handoff: SmDisconnectHandoff; statusCode, reasonCode: uint16) =
   inc nimFwDbgDisconnectProcess
+  let saved = irqSave()
+  if not smDisconnectHandoffCurrent(handoff):
+    irqRestore(saved)
+    return
   smEnvView().saQueryActive = 0
-  ke_timer_clear(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM)
-  discard smCleanupBegin(param, disconnected = true, status = statusCode, reason = reasonCode)
+  # Detach before unlocking so a replacement query cannot lose its timer.
+  keTimerClearLocked(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM, saved)
+  discard smCleanupBegin(handoff.peer.vif, disconnected = true, status = statusCode,
+                         reason = reasonCode, handoff = handoff)
+
+proc sm_disconnect_process*(param: pointer, statusCode: uint16 = 0, reasonCode: uint16 = 0) {.exportc, cdecl.} =
+  ## Keep the vendor callback ABI and order: clear SA Query, then tear down.
+  let handoff = block:
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    let peer = mmCaptureVif(param)
+    if not mmVifCurrent(peer) or vifChannelAt(param).vifType != VIF_TYPE_STA: return
+    SmDisconnectHandoff(peer: peer, connection: smEnvView().connectInfo,
+      resetEpoch: txResetEpoch, state: ke_state_get(TASK_SM))
+  smDisconnectOwned(handoff, statusCode, reasonCode)
+
+proc smClaimFlushedDisconnect(param: pointer): bool =
+  # Reset retires the frame, not the disconnect that owned it. Only accept
+  # retirement from the active reset drain, with the original SM/peer owner.
+  let scope = txActiveFrameCallback
+  if not txResetActive or scope == nil or not scope.tracked or
+      not scope.identity.smTracked or scope.identity.resetEpoch == txResetEpoch or
+      scope.identity.smState != SmDisconnectingState or
+      not txlFrameCallbackCurrent(scope.identity.resetEpoch) or
+      param != vifChannelForIdx(scope.vif):
+    return false
+  smAdvanceTxSerial(scope.vif)
+  true
 
 proc sm_disconnect_deauth_cfm*(param: pointer, txStatus: uint32) {.exportc, cdecl.} =
   ## Confirmation that deauth frame was sent during disconnect.
   ## From blob (5 instrs): li a2,3; li a1,19; jr sm_disconnect_process
   ## Tail-calls sm_disconnect_process(param, WLAN_FW_DISCONNECT_BY_USER_WITH_DEAUTH, 3).
-  if not txlFrameCallbackCurrent(): return
   if not smTxCallbackCurrent(): return
+  if not txlFrameCallbackCurrent() and not smClaimFlushedDisconnect(param): return
   discard txStatus
   sm_disconnect_process(param, 19, 3)
 
-proc sm_connect_ind*(statusCode: uint16, reasonCode: uint16) {.exportc, cdecl, noinline.} =
+proc smConnectIndLocked(statusCode, reasonCode: uint16; saved: uint32) =
   ## Send connect indication to host.
   ## From blob (131 instrs): loads sm_env[0] and vif_info_tab to build a full
   ## SM_CONNECT_IND message with BSSID, aid, channel info, VHT capabilities,
   ## then sends to host. Also notifies the AP via chan_bcn_detect_start if needed.
   ##
   ## a0=statusCode(->s8), a1=reasonCode(->s9)
+  var locked = true
+  defer:
+    if locked: irqRestore(saved)
   let sm = smEnvView()
   let connInfo = sm.connectInfo
   if connInfo == nil: return
@@ -2649,10 +3043,6 @@ proc sm_connect_ind*(statusCode: uint16, reasonCode: uint16) {.exportc, cdecl, n
     ind.chanType = chan.channel.chanType
     ind.chanCenterFreq1 = chan.channel.centerFreq1.uint32
     ind.chanCenterFreq2 = chan.channel.centerFreq2.uint32
-    ind.assocIeBuffer[12] = (chan.channel.primFreq and 0xFF).uint8
-    ind.assocIeBuffer[13] = (chan.channel.primFreq shr 8).uint8
-    ind.assocIeBuffer[14] = (chan.channel.centerFreq1 and 0xFF).uint8
-    ind.assocIeBuffer[15] = (chan.channel.centerFreq1 shr 8).uint8
   else:
     ind.chanBand = 0
     ind.chanPrimFreq = 0
@@ -2675,27 +3065,41 @@ proc sm_connect_ind*(statusCode: uint16, reasonCode: uint16) {.exportc, cdecl, n
   template current(): bool =
     rxVifEpochs[vifIdx] == vifEpoch and sm.connectInfo == connInfo and
       sm.connectIndMsg == msg
-  if not current(): return
+  if chanPtr != nil:
+    sm.primaryFreq = ind.chanPrimFreq
+    sm.centerFreq = ind.chanCenterFreq1.uint16
   if statusCode != 0:
+    let handoff = SmDisconnectHandoff(peer: mmCaptureVif(vif), connection: connInfo,
+      resetEpoch: txResetEpoch, state: SmDisconnectingState)
     ke_state_set(TASK_SM, SmDisconnectingState)
+    if not current() or not smDisconnectHandoffCurrent(handoff): return
     let bssIdx = cast[int32](sm.scanResultIndex)
     if bssIdx >= 0:
       sm.scanResultIndex = 0xFFFFFFFF'u32
+    locked = false
+    irqRestore(saved)
+    if not current() or not smDisconnectHandoffCurrent(handoff): return
+    if bssIdx >= 0:
       scanu_rm_exist_ssid(connInfo, cast[uint8](bssIdx and 0xFF))
-      if not current(): return
-    discard smCleanupBegin(cast[pointer](vif), msg)
+      if not current() or not smDisconnectHandoffCurrent(handoff): return
+    discard smCleanupBegin(vif, msg, handoff = handoff)
     return
 
   # Detach the completed attempt before allocator or host callbacks run.
   sm.connectInfo = nil
   sm.connectIndMsg = nil
   ke_state_set(TASK_SM, SmIdleState)
+  locked = false
+  irqRestore(saved)
   ke_msg_free(keMsgHdrFromPayload(connInfo))
   if rxVifEpochs[vifIdx] != vifEpoch or sm.connectInfo != nil or
       sm.connectIndMsg != nil or ke_state_get(TASK_SM) != SmIdleState:
     ke_msg_free(keMsgHdrFromPayload(msg))
     return
   ke_msg_send(msg)
+
+proc sm_connect_ind*(statusCode: uint16, reasonCode: uint16) {.exportc, cdecl, noinline.} =
+  smConnectIndLocked(statusCode, reasonCode, irqSave())
 
 proc sm_connect_abort_process*(param: pointer, statusCode: uint16 = 0, reasonCode: uint16 = 0) {.exportc, cdecl.} =
   ## Process a connect abort request.
@@ -2802,6 +3206,21 @@ proc sm_deauth_send*() {.exportc, cdecl.} =
   smDeauthSend(build)
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void sm_auth_send(unsigned short, void*);".}
+proc smTxSnapshotJoinPeer(build: var SmTxBuildContext; peer: var MacAddrView): bool =
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if not smTxOwnerCurrent(build): return false
+  let vif = vifChannelForIdx(build.identity.vif)
+  let station = vif.staIdx
+  if station >= STA_MGMT_FREE_STAS.uint8: return false
+  let sta = staInfoForIdx(station)
+  if sta.valid == 0 or sta.instNbr != build.identity.vif or sta.macAddr != vif.bssid:
+    return false
+  if not macPtrIsSpecific(addr sta.macAddr[0]) or not smTxBindStation(build, station):
+    return false
+  peer.bytes = sta.macAddr
+  true
+
 proc sm_auth_send*(authSeqNum: uint16, challenge: pointer) {.exportc, cdecl.} =
   ## Send an authentication frame (166 instructions in blob).
   ##
@@ -2826,49 +3245,31 @@ proc sm_auth_send*(authSeqNum: uint16, challenge: pointer) {.exportc, cdecl.} =
   defer: smTxEnd(build)
   let ci = connectInfoView(connInfo)
 
-  let vifIdx = ci.vifIdx
+  let vifIdx = build.identity.vif
   let vif = vifChannelForIdx(vifIdx)
+  var authBssid: MacAddrView
+  if not smTxSnapshotJoinPeer(build, authBssid):
+    smTxFail(build, WLAN_FW_AUTHENTICATION_FAIILURE.uint16)
+    return
+  if not smTxOwnerCurrent(build): return
+  let staIdx = build.identity.station
+  let bssidPtr = cast[pointer](addr authBssid.bytes[0])
   when defined(bl808WifiPreAuthVifActive):
     if vif != nil:
       vif.state = 1
-  let vifTxSa = ensureVifMgmtMac(vif)
+  let vifTxSaSource = ensureVifMgmtMac(vif)
   if not smTxOwnerCurrent(build): return
+  var authOwn = macAddrAt(vifTxSaSource)[]
+  let vifTxSa = cast[pointer](addr authOwn.bytes[0])
   when defined(bl808WifiAuthHwWorkaround):
-    let authOwn = macAddrAt(vifTxSa)
-    regWrite(MACHW_BASE + 0x010'u, authOwn.lowLe)
-    regWrite(MACHW_BASE + 0x014'u, authOwn.highLe)
+    regWrite(MACHW_BASE + 0x010'u, (addr authOwn).lowLe)
+    regWrite(MACHW_BASE + 0x014'u, (addr authOwn).highLe)
     regWrite(MACHW_BASE + 0x01C'u, 0x100'u32)
   nimFwDbgMacHwLo = regRead(MACHW_BASE + 0x010'u)
   nimFwDbgMacHwHi = regRead(MACHW_BASE + 0x014'u)
-  let rawStaIdx = vif.staIdx
-  let staIdx =
-    if rawStaIdx < STA_MGMT_FREE_STAS.uint8: rawStaIdx
-    else: 0xFF'u8
-  let vifBssidPtr = cast[pointer](addr vif.bssid[0])
-  var staBssidPtr: pointer = nil
-  if staIdx != 0xFF'u8:
-    let sta = staInfoForIdx(staIdx)
-    staBssidPtr = cast[pointer](addr sta.macAddr[0])
-  let vifBssidSpecific = macPtrIsSpecific(vifBssidPtr)
-  let staMatchesVif = vifBssidSpecific and macPtrEquals(staBssidPtr, vifBssidPtr)
-  let effectiveStaIdx =
-    if staIdx != 0xFF'u8 and (not vifBssidSpecific or staMatchesVif):
-      staIdx
-    else:
-      0xFF'u8
-  let bssidPtr =
-    if vifBssidSpecific:
-      # Failed retries can leave vif.staIdx pointing at an old AP entry. The
-      # current join target is the VIF BSSID installed by SCANU_JOIN_CFM.
-      vifBssidPtr
-    elif staBssidPtr != nil:
-      staBssidPtr
-    else:
-      vifBssidPtr
-  let authBssid = macAddrAt(bssidPtr)
   when defined(bl808WifiAuthHwWorkaround):
-    regWrite(MACHW_BASE + 0x020'u, authBssid.lowLe)
-    regWrite(MACHW_BASE + 0x024'u, authBssid.highLe)
+    regWrite(MACHW_BASE + 0x020'u, (addr authBssid).lowLe)
+    regWrite(MACHW_BASE + 0x024'u, (addr authBssid).highLe)
   if vif != nil:
     vif.currentBssid[0] = authBssid.bytes[0]
     vif.currentBssid[1] = authBssid.bytes[1]
@@ -2884,7 +3285,6 @@ proc sm_auth_send*(authSeqNum: uint16, challenge: pointer) {.exportc, cdecl.} =
     ci.authType = 3
   let authAlgo = ci.authType
   nimFwDbgSaeAuthAlgo = authAlgo.uint32
-  if not smTxBindStation(build, effectiveStaIdx): return
   let responseDelay = if sm.connectFlags != 0 and authAlgo != 3:
       0x1E000'u32
     else: 0x7D000'u32
@@ -2896,9 +3296,8 @@ proc sm_auth_send*(authSeqNum: uint16, challenge: pointer) {.exportc, cdecl.} =
   # Allocate frame buffer (512 bytes)
   let frame = txl_frame_get(512)
   if frame == nil:
-    # Allocation failure means the auth exchange never started; do not surface
-    # a successful connect indication to the host.
-    smTxFail(build, WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE)
+    # Vendor sm_auth_send+0x1e4 reports allocation failure, not a timeout.
+    smTxFail(build, WLAN_FW_TX_AUTH_FRAME_ALLOCATE_FAIILURE)
     return
   if not smTxAdopt(build, frame): return
   let desc = hostTxDescAt(frame)
@@ -2930,8 +3329,7 @@ proc sm_auth_send*(authSeqNum: uint16, challenge: pointer) {.exportc, cdecl.} =
   desc.vifIdx = apChanIdx
   desc.hdrLen = 0
   desc.secTailLen = 0
-  desc.staIdx = effectiveStaIdx
-  desc.staInfoIdx = effectiveStaIdx
+  desc.staInfoIdx = staIdx
 
   var bodyLen = 24'u32
   if authAlgo == 1 and authSeqNum == 3:
@@ -2950,7 +3348,8 @@ proc sm_auth_send*(authSeqNum: uint16, challenge: pointer) {.exportc, cdecl.} =
   var builtLen: uint32
   if authAlgo == 3:
     builtLen = meBuildSaeAuthenticate(
-      authBodyPtr, 3'u16, authSeqNum, 0'u16, vifIdx.uint32, addr build)
+      authBodyPtr, 3'u16, authSeqNum, 0'u16, vifIdx.uint32, addr build,
+      bssidPtr, vifTxSa)
     if not smTxFrameCurrent(build): return
     if builtLen == 0:
       smTxFail(build, 2)
@@ -2990,7 +3389,7 @@ proc sm_auth_send*(authSeqNum: uint16, challenge: pointer) {.exportc, cdecl.} =
   nimFwDbgAuthCfmStatus = 0
   nimFwDbgAuthCfmHwStatus = 0
   nimFwDbgAuthCfmThdFlags = 0
-  nimFwDbgAuthCfmAckOk16 = 0
+  nimFwDbgAuthCfmFinalFail16 = 0
   nimFwDbgAuthCfmAckOk23 = 0
   nimFwDbgAuthCfmAckFail = 0
   nimFwDbgAuthCfmDesc = 0
@@ -2998,7 +3397,7 @@ proc sm_auth_send*(authSeqNum: uint16, challenge: pointer) {.exportc, cdecl.} =
   nimFwDbgAuthCfmFc = 0
   nimFwDbgAuthTxLen = totalLen
   nimFwDbgAuthTxMeta = authSeqNum.uint32 or (authAlgo.uint32 shl 16) or
-    (vifIdx.uint32 shl 24) or (effectiveStaIdx.uint32 shl 28)
+    (vifIdx.uint32 shl 24) or (staIdx.uint32 shl 28)
   nimFwDbgAuthTxDesc = thd.frameLen or (authRawLen shl 16)
   discard c_memset(addr nimFwDbgAuthTxRaw[0], 0, nimFwDbgAuthTxRaw.len.csize_t)
   discard c_memcpy(addr nimFwDbgAuthTxRaw[0],
@@ -3069,8 +3468,17 @@ proc sm_auth_send*(authSeqNum: uint16, challenge: pointer) {.exportc, cdecl.} =
       sm.centerFreq = forcedAuthFreq
 
   when not defined(bl808WifiSkipAuthStaTxPrepare):
-    wifi_nimfw_prepare_sta_tx_channel()
-    if not smTxFrameCurrent(build): return
+    # The channel scheduler already selected the join channel. Only reclaim
+    # RF for a shared-radio window, or when the bench override is explicit.
+    when WifiAuthForceFreq != 0:
+      wifi_nimfw_prepare_sta_tx_channel()
+      if not smTxFrameCurrent(build): return
+    else:
+      if nimFwBleWifiRoleWindowEnabled != 0 and
+          chan_is_on_operational_channel(cast[pointer](vif)) and
+          chan_is_tx_allowed(cast[pointer](vif)):
+        wifi_nimfw_prepare_sta_tx_channel()
+        if not smTxFrameCurrent(build): return
   when defined(bl808WifiAuthPromiscRx):
     let mm = mmEnvView()
     mm.rxFilterExtra = mm.rxFilterExtra or SCAN_ACTIVE_RX_FILTER_BITS
@@ -3096,13 +3504,20 @@ proc sm_auth_send*(authSeqNum: uint16, challenge: pointer) {.exportc, cdecl.} =
   if not smTxArmResponse(build, responseDelay):
     smTxFail(build, WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE)
     return
+  if authAlgo in [0'u8, 1'u8, 3'u8] and
+      not smAuthRecordResponse(build, authAlgo, authSeqNum):
+    smTxFail(build, WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE)
+    return
   smConnecting = true
   when defined(bl808WifiForceAuthAssocPush):
     let accepted = smTxSubmit(build, true)
   else:
     let accepted = smTxSubmit(build, false)
   if not accepted:
-    smTxFail(build, WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE)
+    if authAlgo in [0'u8, 1'u8, 3'u8]: smAuthCancelResponse(build)
+    # The vendor does not inspect the TX return value: after handoff, the
+    # published deadline, not this call, drives the bounded retry policy.
+    if build.ownsFrame: smTxFail(build, WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE)
     return
   when defined(bl808WifiInjectAuthSuccess):
     if smTxOwnerCurrent(build):
@@ -3140,25 +3555,31 @@ proc sm_assoc_req_send*() {.exportc, cdecl.} =
   ## synchronous completions cannot be overwritten by the older sender.
   let sm = smEnvView()
   let connInfo = sm.connectInfo
-  if connInfo == nil: return
+  let smEnvSecond = sm.connectIndMsg
+  if connInfo == nil or smEnvSecond == nil: return
   var build = smTxBegin(connInfo)
   if not build.identity.captured: return
   defer: smTxEnd(build)
-  let ci = connectInfoView(connInfo)
-  let vifIdx = ci.vifIdx
+  template fail(status: uint16) =
+    if sm.connectIndMsg == smEnvSecond: smTxFail(build, status)
+  let vifIdx = build.identity.vif
   let vif = vifChannelForIdx(vifIdx)
-  let rawStaIdx = vif.staIdx
-  let staIdx =
-    if rawStaIdx < STA_MGMT_FREE_STAS.uint8: rawStaIdx
-    else: 0xFF'u8
-  if not smTxBindStation(build, staIdx): return
+  var peer: MacAddrView
+  if not smTxSnapshotJoinPeer(build, peer):
+    fail(WLAN_FW_ASSOCIATE_FAIILURE.uint16)
+    return
+  if not smTxOwnerCurrent(build) or sm.connectIndMsg != smEnvSecond: return
+  let staIdx = build.identity.station
+  let staMac = cast[pointer](addr peer.bytes[0])
+  var own = macAddrAt(vifMgmtTxSa(vif))[]
   let responseDelay = if sm.connectFlags != 0: 0x1E000'u32 else: 0x7D000'u32
   inc nimFwDbgAssocReqSend
 
   # Allocate TX frame via txl_frame_get(512) - NOT ke_msg_alloc
   let frame = txl_frame_get(512)
   if frame == nil:
-    smTxFail(build, WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE)
+    # Vendor sm_assoc_req_send+0x19c reports allocation failure, not a timeout.
+    fail(WLAN_FW_TX_ASSOC_FRAME_ALLOCATE_FAIILURE)
     return
   if not smTxAdopt(build, frame): return
   let desc = hostTxDescAt(frame)
@@ -3166,22 +3587,6 @@ proc sm_assoc_req_send*() {.exportc, cdecl.} =
   # TPC update (blob: tpc_update_frame_tx_power at 0x5a)
   tpc_update_frame_tx_power(cast[pointer](vif), frame)
   if not smTxFrameCurrent(build): return
-
-  # Get target AP address. Prefer the VIF BSSID installed by join; failed
-  # retries can leave vif.staIdx pointing at an old AP entry.
-  let vifBssidPtr = cast[pointer](addr vif.bssid[0])
-  var staBssidPtr: pointer = nil
-  if staIdx != 0xFF'u8:
-    let sta = staInfoForIdx(staIdx)
-    staBssidPtr = cast[pointer](addr sta.macAddr[0])
-  let vifBssidSpecific = macPtrIsSpecific(vifBssidPtr)
-  let staMac =
-    if vifBssidSpecific:
-      vifBssidPtr
-    elif staBssidPtr != nil:
-      staBssidPtr
-    else:
-      vifBssidPtr
 
   let link = hostTxLinkDescAt(desc.bufDesc)
   let hdr = hostTxDataHeader(desc)
@@ -3199,7 +3604,7 @@ proc sm_assoc_req_send*() {.exportc, cdecl.} =
   # DA from sta_info_tab+4 (blob: memcpy at 0x8e)
   discard c_memcpy(addr hdr.addr1[0], staMac, 6.csize_t)
   # SA from vifEntry+80 (blob: memcpy at 0xa0)
-  discard c_memcpy(addr hdr.addr2[0], vifMgmtTxSa(vif), 6.csize_t)
+  discard c_memcpy(addr hdr.addr2[0], addr own.bytes[0], 6.csize_t)
   # BSSID from sta_info_tab+4 (blob: memcpy at 0xb0)
   discard c_memcpy(addr hdr.addr3[0], staMac, 6.csize_t)
 
@@ -3210,7 +3615,6 @@ proc sm_assoc_req_send*() {.exportc, cdecl.} =
 
   # Store VIF/STA info
   desc.vifIdx = vifIdx
-  desc.staIdx = staIdx
   desc.staInfoIdx = staIdx
   desc.hdrLen = 0
   desc.secTailLen = 0
@@ -3218,7 +3622,7 @@ proc sm_assoc_req_send*() {.exportc, cdecl.} =
   # Build association request body at the MAC-header body start. Blob passes:
   # a0=macHdr+372, a1=vif+348, a2=nil, a3=vif.inst_nbr, a4=&cursor,
   # a5=&bodyLen, a6=connect info.
-  var assocCursor: pointer
+  var assocIeStart: pointer
   var assocBodyLen: uint16
   let assocBodyPtr = cast[pointer](addr link.macHeader[sizeof(MacDataFrameHeaderView)])
   let assocInfo = cast[pointer](vifHtCapabilities(vif))
@@ -3228,14 +3632,17 @@ proc sm_assoc_req_send*() {.exportc, cdecl.} =
     assocInfo,
     nil,
     cast[pointer](instNbr.uint),
-    cast[pointer](addr assocCursor),
+    cast[pointer](addr assocIeStart),
     cast[pointer](addr assocBodyLen),
     connInfo, addr build)
   if not smTxFrameCurrent(build): return
   if builtLen < 4 or not smTxFits(addr build, assocBodyPtr, builtLen) or
-      cast[uint](assocCursor) != cast[uint](assocBodyPtr) + builtLen.uint:
-    smTxFail(build, 5)
+      cast[uint](assocIeStart) != cast[uint](assocBodyPtr) + 4'u or
+      assocBodyLen.uint32 != builtLen - 4:
+    when defined(bl808WifiDiagWarmScan): nimFwDbgWarmAssocFailure = warmAssocRequestBuild
+    fail(WLAN_FW_ASSOCIATE_FAIILURE)
     return
+  let assocEnd = cast[pointer](cast[uint](assocBodyPtr) + builtLen.uint)
 
   var assocHasSecurityIe = false
   var assocIeOffset = 4'u
@@ -3259,11 +3666,11 @@ proc sm_assoc_req_send*() {.exportc, cdecl.} =
   let secIeSrc = cast[pointer](secState.rsnIePtr)
   let secIeLen = secState.rsnIeLen.uint32
   if not assocHasSecurityIe and secIeSrc != nil and secIeLen != 0'u32:
-    if not smTxFits(addr build, assocCursor, secIeLen):
-      smTxFail(build, 5)
+    if not smTxFits(addr build, assocEnd, secIeLen):
+      when defined(bl808WifiDiagWarmScan): nimFwDbgWarmAssocFailure = warmAssocSecurityTail
+      fail(WLAN_FW_ASSOCIATE_FAIILURE)
       return
-    discard c_memcpy(assocCursor, secIeSrc, secIeLen.csize_t)
-    assocCursor = cast[pointer](cast[uint](assocCursor) + secIeLen.uint)
+    discard c_memcpy(assocEnd, secIeSrc, secIeLen.csize_t)
     builtLen += secIeLen
     assocBodyLen = assocBodyLen + secIeLen.uint16
     nimFwDbgVifIeLenAtAssoc =
@@ -3293,7 +3700,7 @@ proc sm_assoc_req_send*() {.exportc, cdecl.} =
   nimFwDbgAssocCfmStatus = 0
   nimFwDbgAssocCfmHwStatus = 0
   nimFwDbgAssocCfmThdFlags = 0
-  nimFwDbgAssocCfmAckOk16 = 0
+  nimFwDbgAssocCfmFinalFail16 = 0
   nimFwDbgAssocCfmAckOk23 = 0
   nimFwDbgAssocCfmAckFail = 0
   nimFwDbgAssocCfmDesc = 0
@@ -3304,9 +3711,6 @@ proc sm_assoc_req_send*() {.exportc, cdecl.} =
   discard c_memcpy(addr nimFwDbgAssocReqRaw[0],
                    cast[pointer](addr link.macHeader[0]),
                    assocRawLen.csize_t)
-  let smEnvSecond = sm.connectIndMsg
-  if smEnvSecond != nil:
-    smConnectIndPayloadAt(smEnvSecond).assocReqIeLen = assocBodyLen
   let assocFixed = cast[ptr AssocReqFixedBodyView](assocBodyPtr)
   let assocCapabilityListenTraceWord =
     assocFixed.capabilityInfo.uint32 or (assocFixed.listenInterval.uint32 shl 16)
@@ -3351,17 +3755,33 @@ proc sm_assoc_req_send*() {.exportc, cdecl.} =
   applyForcedInternalMgmtTxPower(thd)
   if not smTxFrameCurrent(build): return
 
+  # The response handler appends after this exact transmitted IE prefix.
+  let ind = smConnectIndPayloadAt(smEnvSecond)
+  if assocBodyLen.int > ind.assocIeBuffer.len:
+    when defined(bl808WifiDiagWarmScan): nimFwDbgWarmAssocFailure = warmAssocRequestIeCopy
+    fail(WLAN_FW_ASSOCIATE_FAIILURE)
+    return
+  block:
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    if sm.connectIndMsg != smEnvSecond or not smTxFrameCurrent(build): return
+    if assocBodyLen != 0:
+      discard c_memcpy(addr ind.assocIeBuffer[0], assocIeStart, assocBodyLen.csize_t)
+    smConnectIndPayloadAt(smEnvSecond).assocReqIeLen = assocBodyLen
+
   # Publish response state before handing the frame to the lower layer.
   if not smTxSetState(build, SmAssocRspState): return
+  if sm.connectIndMsg != smEnvSecond: return
   if not smTxArmResponse(build, responseDelay):
-    smTxFail(build, WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE)
+    fail(WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE)
     return
+  if sm.connectIndMsg != smEnvSecond: return
   when defined(bl808WifiForceAuthAssocPush):
     let accepted = smTxSubmit(build, true)
   else:
     let accepted = smTxSubmit(build, false)
-  if not accepted:
-    smTxFail(build, WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE)
+  if not accepted and build.ownsFrame:
+    fail(WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE)
 
 proc sm_assoc_req_send_pre*() {.exportc, cdecl.} =
   ## Pre-send association request.
@@ -3390,13 +3810,25 @@ proc smAssocIePrefix(data: pointer; length, capacity: uint): uint =
     if size > capacity - result: break
     result += size
 
+proc smRxFrameFits(param: pointer; minimumFrameLength: uint32): bool =
+  if param == nil: return false
+  let payloadLength = keMsgHdrFromPayload(param).paramLen
+  if payloadLength < 32'u32 + minimumFrameLength: return false
+  let frameLength = rxuMgtIndMsgAt(param).frameLen.uint32
+  frameLength >= minimumFrameLength and frameLength <= payloadLength - 32'u32
+
 proc smAssocDone(build: var SmTxBuildContext; indication: pointer;
                   aid: uint16; notifyWps: bool): bool =
   if not smAssocOwnerCurrent(build, indication): return false
+  if aid == 0 or aid > 2007'u16:
+    when defined(bl808WifiDiagWarmScan): nimFwDbgWarmAssocFailure = warmAssocAid
+    sm_connect_ind(WLAN_FW_ASSOCIATE_FAIILURE.uint16, 0xFFFF)
+    return false
   var prepared: SmActivationPrepared
   defer: smActivationReleasePrepared(prepared)
   if not smActivationPrepare(build, indication, aid, prepared):
     if smAssocOwnerCurrent(build, indication):
+      when defined(bl808WifiDiagWarmScan): nimFwDbgWarmAssocFailure = warmAssocPrepare
       sm_connect_ind(WLAN_FW_ASSOCIATE_FAIILURE.uint16, 0xFFFF)
     return false
   if not smTxSetOwnerState(build, SM_ACTIVATING_STATE) or
@@ -3410,6 +3842,7 @@ proc smAssocDone(build: var SmTxBuildContext; indication: pointer;
   if not smAssocOwnerCurrent(build, indication): return false
   result = smActivationStart(build, indication, prepared)
   if not result and smAssocOwnerCurrent(build, indication):
+    when defined(bl808WifiDiagWarmScan): nimFwDbgWarmAssocFailure = warmAssocStart
     sm_connect_ind(WLAN_FW_ASSOCIATE_FAIILURE.uint16, 0xFFFF)
 
 proc sm_assoc_done*(aid: uint16) {.exportc, cdecl.} =
@@ -3450,6 +3883,12 @@ proc sm_auth_handler*(param: pointer) {.exportc, cdecl.} =
   let sequence = frame.authSeq
   if status == 0:
     if algorithm != 0 and algorithm != 1 and algorithm != 3: return
+    # The archive accepts any successful open-system sequence and does not
+    # compare the algorithm with the request. Neither may complete our attempt.
+    if algorithm != connectInfoView(connection).authType.uint16 or
+        (algorithm == 0 and sequence != 2): return
+    if (algorithm == 1 and sequence notin [2'u16, 4'u16]) or
+        (algorithm == 3 and sequence notin [1'u16, 2'u16]): return
     if algorithm == 1 and sequence == 2 and
         (frameLen < 136 or frame.saeBodyFirst != 16 or
          frame.sharedChallengeLen != 128): return
@@ -3458,6 +3897,16 @@ proc sm_auth_handler*(param: pointer) {.exportc, cdecl.} =
   template current(): bool =
     smTxOwnerCurrent(owner) and smEnvView().connectIndMsg == indication
   if not current(): return
+  const
+    AuthAlgorithmNotSupported = 13'u16
+    AuthTransactionOutOfSequence = 14'u16
+  # An identified peer can explicitly refuse the only open-system transaction
+  # without echoing transaction 2. Success and multi-step exchanges stay strict.
+  let expectedSequence =
+    if algorithm == 0 and dispatch.staIdx == station and
+        status in {AuthAlgorithmNotSupported, AuthTransactionOutOfSequence}: 2'u16
+    else: sequence
+  if not smAuthResponseMatches(owner, algorithm, expectedSequence): return
 
   var challenge: array[128, uint8]
   if status == 0 and algorithm == 1 and sequence == 2:
@@ -3477,6 +3926,7 @@ proc sm_auth_handler*(param: pointer) {.exportc, cdecl.} =
     if not current(): return
 
   if status != 0:
+    if not smAuthConsumeResponse(owner, algorithm, expectedSequence): return
     ke_timer_clear(SM_RSP_TIMEOUT_IND, TASK_SM)
     if not current(): return
     let info = connectInfoView(connection)
@@ -3497,6 +3947,7 @@ proc sm_auth_handler*(param: pointer) {.exportc, cdecl.} =
         processed = handleSae(smAuthSaeBodyPtr(frame), frameLen - 6, sequence, nil)
         if not current(): return
     if processed == 0:
+      if not smAuthConsumeResponse(owner, algorithm, sequence): return
       ke_timer_clear(SM_RSP_TIMEOUT_IND, TASK_SM)
       if not current(): return
       if sequence == 1:
@@ -3506,20 +3957,27 @@ proc sm_auth_handler*(param: pointer) {.exportc, cdecl.} =
         sm_assoc_req_send_pre()
       return
     if processed != -8:
+      if not smAuthConsumeResponse(owner, algorithm, sequence): return
       ke_timer_clear(SM_RSP_TIMEOUT_IND, TASK_SM)
       if not current(): return
     let logFn = getLogFunc(204)
     if not current(): return
     if logFn != nil:
-      let line = if processed == -8: 1302'u32 else: 1307'u32
-      cast[proc(a, b: uint32; text: pointer; line, value: uint32) {.cdecl.}](logFn)(
-        3, 0, nil, line, sequence.uint32)
+      let line = if processed == -8: 1302.cint else: 1307.cint
+      let format: cstring = if processed == -8:
+        "BL_SAE_INVALID_PACKET, auth seq num= %d\r\n"
+      else:
+        "SAE Authentication parse failure, auth seq num= %d\r\n"
+      cast[proc(level: uint32; tag, file: cstring; line: cint;
+                format: cstring) {.cdecl, varargs.}](logFn)(
+        3, nil, "sm.c", line, format, sequence.cint)
       if not current(): return
     if processed != -8:
       sm_connect_ind(WLAN_FW_AUTHENTICATION_FAIILURE.uint16, 0)
     return
 
   if algorithm != 0 and algorithm != 1: return
+  if not smAuthConsumeResponse(owner, algorithm, sequence): return
   ke_timer_clear(SM_RSP_TIMEOUT_IND, TASK_SM)
   if not current(): return
   if algorithm == 0:
@@ -3549,7 +4007,6 @@ proc sm_assoc_rsp_handler*(param: pointer) {.exportc, cdecl.} =
   if subtype != 0x10 and subtype != 0x30: return
   let assocBody = smAssocRspIePtr(frame)
   let ieLength = frameLen.uint - 6
-  if not smAssocIesValid(assocBody, ieLength): return
   let connection = smEnvView().connectInfo
   if connection == nil or ke_state_get(TASK_SM) != SmAssocRspState: return
   let vifIdx = connectInfoView(connection).vifIdx
@@ -3560,10 +4017,16 @@ proc sm_assoc_rsp_handler*(param: pointer) {.exportc, cdecl.} =
       (dispatch.staIdx != 0xFF and dispatch.staIdx != staIdx): return
   let smEnvSecond = smEnvView().connectIndMsg
   if smEnvSecond == nil: return
+  let statusCode = frame.statusCode
+  let iesValid = smAssocIesValid(assocBody, ieLength)
+  # A valid fixed failure status must still be reported when optional IEs are
+  # malformed. Successful association and comeback timing require valid IEs.
+  if statusCode == 0 and not iesValid: return
+  # Ignore malformed success before advancing the TX serial: the outstanding
+  # response timer still belongs to the request we are waiting to complete.
   var build = smTxBegin(connection)
   if not build.identity.captured or build.state != SmAssocRspState or
       not smTxBindStation(build, staIdx): return
-  let statusCode = frame.statusCode
   let aid = frame.aid and 0x3FFF'u16
   let body0 = frame.capabilityInfo.uint32 or (statusCode.uint32 shl 16)
   var body4 = frame.aid.uint32
@@ -3572,6 +4035,10 @@ proc sm_assoc_rsp_handler*(param: pointer) {.exportc, cdecl.} =
   if ieLength > 1: body4 = body4 or (ieBytes[1].uint32 shl 24)
   ke_timer_clear(SM_RSP_TIMEOUT_IND, TASK_SM)
   if not smAssocOwnerCurrent(build, smEnvSecond): return
+  if statusCode == 0 and (aid == 0 or aid > 2007'u16):
+    when defined(bl808WifiDiagWarmScan): nimFwDbgWarmAssocFailure = warmAssocAid
+    sm_connect_ind(WLAN_FW_ASSOCIATE_FAIILURE.uint16, 0xFFFF)
+    return
   inc nimFwDbgAssocRspCount
   nimFwDbgAssocRspStatus = statusCode.uint32
   nimFwDbgAssocRspLen = frameLen.uint32
@@ -3583,7 +4050,7 @@ proc sm_assoc_rsp_handler*(param: pointer) {.exportc, cdecl.} =
     nimFwConnectTrace2U32("[WIFI-CT] assoc_rsp_body ", body0, body4)
     if not smAssocOwnerCurrent(build, smEnvSecond): return
   if statusCode != 0:
-    if statusCode == 30:
+    if statusCode == 30 and iesValid:
       let iePtr = mac_ie_find(assocBody, ieLength.uint32, 56)
       if iePtr != nil:
         let timeoutIe = timeoutIntervalIeAt(iePtr)
@@ -3595,6 +4062,7 @@ proc sm_assoc_rsp_handler*(param: pointer) {.exportc, cdecl.} =
             connectInfoAuthRetry(build.connection)[] = 0
             if smRspTimerSetComeback(build, intervalTu): return
             if smAssocOwnerCurrent(build, smEnvSecond):
+              when defined(bl808WifiDiagWarmScan): nimFwDbgWarmAssocFailure = warmAssocComeback
               sm_connect_ind(WLAN_FW_ASSOCIATE_FAIILURE.uint16, 0xFFFF)
             return
     let logFn = blOpsFunc(4)
@@ -3607,6 +4075,7 @@ proc sm_assoc_rsp_handler*(param: pointer) {.exportc, cdecl.} =
   let ind = smConnectIndPayloadAt(smEnvSecond)
   let reqIeLen = ind.assocReqIeLen
   if reqIeLen.uint > ind.assocIeBuffer.len.uint:
+    when defined(bl808WifiDiagWarmScan): nimFwDbgWarmAssocFailure = warmAssocResponseIeCopy
     sm_connect_ind(WLAN_FW_ASSOCIATE_FAIILURE.uint16, 0xFFFF)
     return
   let rspIeLen = smAssocIePrefix(assocBody, ieLength,
@@ -3622,13 +4091,18 @@ proc sm_assoc_rsp_handler*(param: pointer) {.exportc, cdecl.} =
     if not smAssocOwnerCurrent(build, smEnvSecond): return
   if not meTryInitRate(staEntry):
     if smAssocOwnerCurrent(build, smEnvSecond):
+      when defined(bl808WifiDiagWarmScan): nimFwDbgWarmAssocFailure = warmAssocRateInit
       sm_connect_ind(WLAN_FW_ASSOCIATE_FAIILURE.uint16, 0xFFFF)
     return
   if not smAssocOwnerCurrent(build, smEnvSecond): return
   let chanPtr = vif.operChan
   if chanPtr != nil:
     let chan = cast[ptr ScanChannelEntry](chanPtr)
-    var tpcPower = cast[uint8](chan.txPower) - vifBssStatus(vif).powerConstraint
+    # Keep the requested power negative when a large constraint exceeds the
+    # signed channel limit; the PHY applies its own lower bound afterward.
+    var tpcPower = cast[uint8](max(
+      chan.txPower.int - vifBssStatus(vif).powerConstraint.int,
+      low(int8).int).int8)
     var tpcRate: uint8
     when defined(bl808WifiConnectTrace):
       nimFwConnectTrace2U32("[WIFI-CT] assoc_rsp_before_tpc ", pointerAddrU32(chanPtr),
@@ -3648,12 +4122,35 @@ proc sm_deauth_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
   ## Returns 0 for consumed messages, 2 to save/retry during a conflicting SM
   ## transition. A saved message must not alter connection ownership.
   inc nimFwDbgDeauthHandler
-  if param == nil:
+  if not smRxFrameFits(param, 26):
     return KeMsgConsumed
+  let frame = rxuMgtIndMsgAt(param)
+  if (frame.frameCtrl and 0x000C) != 0: return KeMsgConsumed
+  let headerLength = rxMacHeaderLen(frame.frameCtrl)
+  if frame.frameLen < headerLength.uint16 + 2: return KeMsgConsumed
   let deauth = smDeauthFrameView(param)
   let vifIdx = deauth.vifIdx
   if vifIdx.int >= MAX_VIFS:
     return KeMsgConsumed
+  let saved = irqSave()
+  var locked = true
+  defer:
+    if locked: irqRestore(saved)
+  # The scheduler may have checked the tag before this slot was reused.
+  when defined(bl808WifiDiagPeerRxAdmission):
+    var protection: RxMgtProtection
+    if not rxMgtMessageCurrent(keMsgHdrFromPayload(param), addr protection):
+      return KeMsgConsumed
+  else:
+    if not rxMgtMessageCurrent(keMsgHdrFromPayload(param)):
+      return KeMsgConsumed
+  when defined(bl808WifiDiagLinkDrop):
+    template peerEvidence(viaQuery: bool): SmPeerDisconnectEvidence =
+      block:
+        var evidence = smCapturePeerDisconnect(frame, viaQuery)
+        when defined(bl808WifiDiagPeerRxAdmission):
+          evidence.protection = protection
+        evidence
   let sm = smEnvView()
   let vif = vifChannelForIdx(vifIdx)
 
@@ -3663,33 +4160,30 @@ proc sm_deauth_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
       # BSSID mismatch - blob logs debug with line 1503 and returns 0
       return KeMsgConsumed
 
-  # Validate SA: if multicast bit (bit 0 of first SA byte) clear, compare SA
+  # This field is the destination address; group-addressed disconnects pass.
   if (deauth.sa[0] and 1) == 0:
-    for sourceAddrByteIndex in 0 ..< 6:
-      if deauth.sa[sourceAddrByteIndex] != vif.macAddr[sourceAddrByteIndex]:
-        # SA mismatch - blob logs debug with line 1507 and returns 0
+    for destAddrByteIndex in 0 ..< 6:
+      if deauth.sa[destAddrByteIndex] != vif.macAddr[destAddrByteIndex]:
+        # Destination mismatch - blob logs debug with line 1507 and returns 0
         return KeMsgConsumed
 
-  # Extract reason code (LE u16 at param+56..57)
-  let reason = deauth.reason
+  # RX retains the management header (including HT Control), but not the IV.
+  let reason = managementReasonBodyAt(addr frame.body[headerLength]).reason
 
   # Load connect-info pointer from sm_env[0]
   let connInfoPtr = sm.connectInfo
 
-  # Check SM state - first call
-  let st = ke_state_get(TASK_SM)
-  if st == SmDisconnectingState:
+  let state = ke_state_get(TASK_SM)
+  if state == SmDisconnectingState:
     return KeMsgSaved
-
-  # Check SM state - second call
-  let st2 = ke_state_get(TASK_SM)
-  if st2 != SmIdleState:
+  if state != SmIdleState:
     # SM in an active state other than disconnecting:
     # Check if connect-info vifIdx matches param vifIdx
     if connInfoPtr == nil or connectInfoView(connInfoPtr).vifIdx != vifIdx:
       return KeMsgSaved
     # VIF matches: send connect indication with status=6 (deauth by AP)
-    sm_connect_ind(6, reason)
+    locked = false
+    smConnectIndLocked(6, reason, saved)
     return KeMsgConsumed
 
   # state == 0 (idle): check VIF connection flag at vif[88]
@@ -3697,47 +4191,42 @@ proc sm_deauth_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
   if vifConn == 0:
     return KeMsgConsumed
 
-  # Check param[27] bit 0 for protected frame
+  let peer = mmCaptureVif(vif)
+  if not mmVifCurrent(peer): return KeMsgConsumed
+  # RX policy requests SA Query for an unprotected PMF disconnect.
   if (deauth.frameFlags and 1) != 0:
-    # Protected frame: check PMF flag at sm_env[36]
-    if sm.saQueryActive != 0:
-      # PMF already active: just ignore (blob returns 0 via .L208)
-      return KeMsgConsumed
-
-    # PMF not active: store deauth info and initiate SA query
-    # blob: sh 0x201 -> sm_env[36], sb param[7] -> sm_env[38], sh reason -> sm_env[42]
+    if smSaQueryResetting or smSaQueryCurrent(smSaQuery.serial): return KeMsgConsumed
     if deauth.staIdx.int >= STA_INFO_TAB_ENTRIES or deauth.staIdx != vif.staIdx:
       return KeMsgConsumed
     if staInfoForIdx(deauth.staIdx).instNbr != vifIdx:
       return KeMsgConsumed
+    inc smSaQuery.serial
+    smSaQuery.peer = peer
+    smSaQuery.armed = false
+    when defined(bl808WifiDiagLinkDrop):
+      smSaQuery.evidence = peerEvidence(true)
     sm.saQueryActive = 1
     sm.saQueryRetryCount = 2
     sm.saQueryStaIdx = deauth.staIdx
     sm.saQueryReason = reason
-    # Initiate SA query (blob: sm_issue_sa_query_request at 0x18E)
     sm_issue_sa_query_request()
+    return KeMsgConsumed
+  locked = false
+  when defined(bl808WifiDiagLinkDrop):
+    smReportApDisconnectLocked(peer, reason, saved, peerEvidence(false))
   else:
-    # Unprotected deauth (.L217):
-    # 1. Set SM state to disconnecting.
-    ke_state_set(TASK_SM, SmDisconnectingState)
-    # 2. Slot 4 is printf-like, not the structured logger.
-    let logFn = blOpsFunc(4)
-    if logFn != nil:
-      cast[proc(fmt: cstring) {.cdecl, varargs.}](logFn)(
-        "Deauth/Disassociate by AP, Wlan802.11 reason code = %d\r\n", reason.cint)
-    # 3. Call sm_disconnect_process(vifEntry, 7, reason)
-    sm_disconnect_process(cast[pointer](vif), 7, reason)
+    smReportApDisconnectLocked(peer, reason, saved)
   return KeMsgConsumed
 
-proc sm_get_set_machwkey_index*(getFlag: uint32, vifIdx: uint32, keyBuf: pointer, keyType: uint32): uint8 {.exportc, cdecl, noinline.} =
+proc sm_get_set_machwkey_index*(getFlag: bool, vifIdx: uint8,
+    keyBuf: ptr uint8, keyType: uint8): cint {.exportc, cdecl, noinline.} =
   ## Get/set MAC HW key index for SM.
   ## From blob (32 instrs): a0=getFlag (0=set, nonzero=get), a1=vifIdx,
   ## a2=keyBuf pointer, a3=keyType (0/1/2 = different key offsets within VIF entry).
   ##
-  ## For each keyType (0, 1, 2), a different offset within vif_info_tab is accessed.
-  ## The exact offsets depend on relocations in the blob; from VIF entry layout they
-  ## correspond to pairwise/group/management key indices.
-  ## If vifIdx > 1, returns 0xFF (-1). If keyType > 2, returns 0xFF.
+  ## The vendor relocations select vif_info_tab + 510/511/512 for keyType
+  ## 0/1/2: pairwise, group, and management key indices respectively.
+  ## If vifIdx > 1 or keyType > 2, returns int -1.
   ## getFlag=0: writes keyBuf[0] to vif[offset]; nonzero: reads vif[offset] into keyBuf[0].
   ## Returns 0 on success.
   ## noinline + asm barrier: blob calls this as a real function from
@@ -3745,29 +4234,29 @@ proc sm_get_set_machwkey_index*(getFlag: uint32, vifIdx: uint32, keyBuf: pointer
   ## inlines the short table lookup.
   {.emit: ["asm volatile(\"\" ::: \"memory\");"].}
   if vifIdx > 1:
-    return 0xFF'u8
+    return -1
 
-  let vif = vifChannelForIdx(vifIdx.uint8)
+  let vif = vifChannelForIdx(vifIdx)
   let indexes = vifMachwKeyIndexes(vif)
 
   var keyAddr: ptr uint8
   case keyType
-  of 0: keyAddr = addr indexes.primaryPairwise
-  of 1: keyAddr = addr indexes.secondaryPairwise
-  of 2: keyAddr = addr indexes.group
-  else: return 0xFF'u8
+  of 0: keyAddr = addr indexes.pairwise
+  of 1: keyAddr = addr indexes.group
+  of 2: keyAddr = addr indexes.management
+  else: return -1
 
-  if getFlag == 0:
+  if not getFlag:
     # SET: write from keyBuf to vif entry
-    keyAddr[] = cast[ptr uint8](keyBuf)[]
+    keyAddr[] = keyBuf[]
   else:
     # GET: read from vif entry to keyBuf
-    cast[ptr uint8](keyBuf)[] = keyAddr[]
+    keyBuf[] = keyAddr[]
 
-  return 0'u8
+  return 0
 
 proc sm_handle_eapol_input*(staIdx: uint8, srcAddr: pointer, eapolBuf: pointer,
-    eapolLen: uint32) {.exportc, cdecl.} =
+    eapolLen: uint16) {.exportc, cdecl.} =
   ## Handle EAPOL frame input (51 instrs).
   ## From blob: a0 = STA idx, a1 = source MAC, a2 = EAPOL buffer, a3 = length.
   ## Computes STA entry = sta_info_tab + staIdx * 368.
@@ -3819,6 +4308,28 @@ proc sm_handle_eapol_input*(staIdx: uint8, srcAddr: pointer, eapolBuf: pointer,
     else:
       inc nimFwDbgEapolCbNull
 
+proc smRetireEstablishedSupplicantLink(staIdx: uint8; reason: uint16) =
+  let handoff = block:
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    if txlResetting() or smEnvView().connectInfo != nil or
+        ke_state_get(TASK_SM) != SmIdleState:
+      return
+    let sta = staInfoForIdx(staIdx)
+    if sta.valid == 0 or sta.instNbr >= MAX_VIFS.uint8: return
+    let vif = vifChannelForIdx(sta.instNbr)
+    let peer = mmCaptureVif(vif)
+    if not mmVifCurrent(peer) or peer.station != staIdx or
+        vif.vifType != VIF_TYPE_STA or vif.state == 0:
+      return
+    let owner = SmDisconnectHandoff(peer: peer, resetEpoch: txResetEpoch,
+      state: SmDisconnectingState)
+    ke_state_set(TASK_SM, SmDisconnectingState)
+    owner
+  # No pending connect indication exists after association. Retire the live
+  # link even if key failure makes another management transmission unreliable.
+  smDisconnectOwned(handoff, WLAN_FW_4WAY_HANDSHAKE_ERROR_PSK_TIMEOUT_FAILURE.uint16, reason)
+
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void sm_handle_supplicant_result(unsigned char,unsigned short);".}
 proc sm_handle_supplicant_result*(result_code: uint8, reason: uint16) {.exportc, cdecl.} =
   ## Handle WPA supplicant result (133 instrs).
@@ -3833,6 +4344,9 @@ proc sm_handle_supplicant_result*(result_code: uint8, reason: uint16) {.exportc,
   if result_code.int >= STA_INFO_TAB_ENTRIES:
     return
   if reason == 0 and smActivationConsumeSuccess(result_code): return
+  if smEnvView().connectInfo == nil:
+    if reason != 0: smRetireEstablishedSupplicantLink(result_code, reason)
+    return
   let sta = staInfoForIdx(result_code)
   let vifIdx = sta.instNbr
   if vifIdx.int >= MAX_VIFS:
@@ -3934,25 +4448,52 @@ proc sm_handle_supplicant_result*(result_code: uint8, reason: uint16) {.exportc,
   if txl_frame_push(frame, 3) == 0:
     sm_connect_ind(9, reason)
 
-proc sm_send_sa_query*(staIdx: uint8, action: uint8, transId: uint16): cint {.exportc, cdecl, discardable.} =
+proc smTrySubmitSaQuery(staIdx: uint8, action: uint8, transId: uint16;
+                        querySerial: ptr uint32 = nil): SmSaQueryTxResult =
   ## Vendor ABI: int(ap_sta_idx, action, transaction_id). SA Query uses the
   ## peer's VIF and unicast protection before appending its four-byte body.
   if staIdx.int >= STA_INFO_TAB_ENTRIES or action > 1:
-    return -1
+    return saQueryBuildRejected
+  let saved = irqSave()
+  defer: irqRestore(saved)
   let sta = staInfoForIdx(staIdx)
   let vifIdx = sta.instNbr
   if vifIdx.int >= MAX_VIFS:
-    return -1
+    return saQueryBuildRejected
   let vif = vifChannelForIdx(vifIdx)
+  let peer = mmCaptureVif(vif)
+  let identity = TxSessionIdentity(captured: true, vif: vifIdx, station: staIdx,
+    vifEpoch: peer.epoch, stationEpoch: peer.stationEpoch, resetEpoch: txResetEpoch)
+  # A response need not belong to our outstanding query, but cannot span a flush.
+  let queryResetEpoch = smSaQueryResetEpoch
+  template currentPeer(): bool =
+    not smSaQueryResetting and queryResetEpoch == smSaQueryResetEpoch and
+      peer.station == staIdx and mmVifCurrent(peer) and
+      identity.resetEpoch == txResetEpoch and not txlResetting() and
+      vif.vifType == VIF_TYPE_STA and vif.state != 0 and
+      (querySerial == nil or smSaQueryCurrent(querySerial[]))
+  if not currentPeer(): return saQueryBuildRejected
   let frame = txl_frame_get(512)
   if frame == nil:
-    return -1
+    return saQueryBuildRejected
   let desc = hostTxDescAt(frame)
-  if desc.bufDesc == nil or desc.hwDesc == nil:
-    txl_frame_release(frame, false)
-    return -1
+  let lease = txlFrameLeaseToken(desc)
+  var owned = true
+  defer:
+    if owned and txlFrameLeaseMatches(desc, lease):
+      txl_frame_release(frame, false)
+  if not currentPeer(): return saQueryBuildRejected
+  let linkPtr = desc.bufDesc
+  let hardware = desc.hwDesc
+  desc.vifIdx = vifIdx
+  desc.staInfoIdx = staIdx
+  template prepared(): bool =
+    currentPeer() and txlFramePreparationCurrent(desc, identity, lease) and
+      desc.bufDesc == linkPtr and desc.hwDesc == hardware
+  if not prepared(): return saQueryBuildRejected
   tpc_update_frame_tx_power(cast[pointer](vif), frame)
-  let link = hostTxLinkDescAt(desc.bufDesc)
+  if not prepared(): return saQueryBuildRejected
+  let link = hostTxLinkDescAt(linkPtr)
   let hdr = hostTxDataHeader(desc)
   hdr.frameControl = 0x00D0'u16
   hdr.duration = 0
@@ -3960,38 +4501,46 @@ proc sm_send_sa_query*(staIdx: uint8, action: uint8, transId: uint16): cint {.ex
   discard c_memcpy(addr hdr.addr2[0], addr vif.macAddr[0], 6.csize_t)
   discard c_memcpy(addr hdr.addr3[0], addr sta.macAddr[0], 6.csize_t)
   hdr.seqCtrl = txl_get_seq_ctrl()
-  desc.vifIdx = vifIdx
-  desc.staInfoIdx = staIdx
   desc.hdrLen = 0
   desc.secTailLen = 0
   desc.callback = nil
   desc.callbackArg = nil
   txu_cntrl_protect_mgmt_frame(frame, cast[pointer](hdr), 24)
+  if not prepared(): return saQueryBuildRejected
   if desc.hdrLen != 8 or desc.secTailLen != 8:
-    txl_frame_release(frame, false)
-    return -1
+    return saQueryBuildRejected
   let bodyOff = 24 + desc.hdrLen.int
   let body = saQueryActionBodyAt(addr link.macHeader[bodyOff])
   body.category = 8
   body.action = action
   body.transId = transId
   let frameLen = bodyOff.uint32 + 4 + desc.secTailLen.uint32
-  let thd = hostTxHwDescAt(desc.hwDesc)
+  let thd = hostTxHwDescAt(hardware)
   thd.payloadEnd = thd.payloadStart + frameLen - 1
   thd.frameLen = frameLen + 4
-  discard txl_frame_push(frame, 3)
-  return 0
+  # The queue consumes the frame even when it rejects the submission.
+  owned = false
+  if txl_frame_push(frame, 3) == 0: saQueryQueueRejected else: saQuerySubmitted
+
+proc sm_send_sa_query*(staIdx: uint8, action: uint8, transId: uint16): cint {.exportc, cdecl, discardable.} =
+  # The vendor ignores local queue rejection in this ABI.
+  if smTrySubmitSaQuery(staIdx, action, transId) == saQueryBuildRejected: -1 else: 0
 
 proc sm_sa_query_handler*(param: pointer) {.exportc, cdecl.} =
   ## Accept SA Query messages only from the connected peer of an active STA
   ## VIF with an open control port. Reply to requests; matching responses
-  ## cancel the pending query's timer before clearing its active flag.
-  if param == nil:
+  ## retire the pending query before cancelling its timer.
+  if not smRxFrameFits(param, 4):
     return
   let frame = smSaQueryFrameView(param)
   let vifIdx = frame.vifIdx
   if vifIdx.int >= MAX_VIFS:
     return
+  let saved = irqSave()
+  var locked = true
+  defer:
+    if locked: irqRestore(saved)
+  if smSaQueryResetting or not rxMgtMessageCurrent(keMsgHdrFromPayload(param)): return
   let vif = vifChannelForIdx(vifIdx)
   # Check VIF active
   let active = vif.state
@@ -4018,13 +4567,14 @@ proc sm_sa_query_handler*(param: pointer) {.exportc, cdecl.} =
   elif action == 1:
     # SA Query Response received: validate against pending query
     let sm = smEnvView()
-    if sm.saQueryActive == 0 or sm.saQueryStaIdx != staIdx:
+    if not smSaQueryCurrent(smSaQuery.serial) or sm.saQueryStaIdx != staIdx:
       return
     let pendingTransId = sm.saQueryTransId
     if transId == pendingTransId:
-      # Match: clear SA query state, cancel timer (blob: ke_timer_clear)
-      ke_timer_clear(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM)
       sm.saQueryActive = 0
+      smSaQuery.armed = false
+      locked = false
+      keTimerClearLocked(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM, saved)
 
 proc sm_issue_sa_query_request*() {.exportc, cdecl.} =
   ## Issue SA Query request to AP (28 instrs).
@@ -4032,48 +4582,61 @@ proc sm_issue_sa_query_request*() {.exportc, cdecl.} =
   ## stores lower 16 bits as pending transId in sm_env+40.
   ## reads the peer STA index from sm_env+38, and sends action 0.
   ## Starts the SA query timeout with ke_timer_set(id, TASK_SM, 100000).
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if not smSaQueryCurrent(smSaQuery.serial): return
   let sm = smEnvView()
-  let staIdx = sm.saQueryStaIdx
-  if staIdx.int >= STA_INFO_TAB_ENTRIES:
-    sm.saQueryActive = 0
-    return
+  inc smSaQuery.serial
+  if smSaQuery.serial == 0: inc smSaQuery.serial
+  var serial = smSaQuery.serial
+  smSaQuery.armed = false
   smQueryPrngState = smQueryPrngState * RC_PRNG_MULT + RC_PRNG_INCR
   let rng = smQueryPrngState
   let transId = (rng shr 16).uint16
   sm.saQueryTransId = transId
-  discard sm_send_sa_query(staIdx, 0, transId)
-  # Start SA query timeout timer via ke_timer_set
-  # From blob: calls ke_timer_set(SM_SA_QUERY_TIMEOUT_IND, TASK_SM, 100000)
-  # which schedules a kernel-task message event ~100ms in the future.
-  ke_timer_set(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM, 100000'u32)
+  let sendStatus = smTrySubmitSaQuery(sm.saQueryStaIdx, 0, transId, addr serial)
+  if not smSaQueryCurrent(serial): return
+  when defined(bl808WifiDiagLinkDrop):
+    if sendStatus == saQuerySubmitted: inc smSaQuery.evidence.submitted
+    else: inc smSaQuery.evidence.rejected
+  const delay = 100_000'u32
+  let deadline = macTimeNow() + delay
+  if not smSaQueryCurrent(serial): return
+  smSaQuery.deadline = deadline
+  smSaQuery.armed = true
+  if not ke_timer_try_set(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM, delay,
+      smSaQueryArmCurrent, addr serial, saQuerySerial = serial) and smSaQueryCurrent(serial):
+    # Timer allocation failure is not evidence that the AP stopped responding.
+    sm.saQueryActive = 0
+    smSaQuery.armed = false
 
-proc sm_set_channel_coex_connected*(channel: uint8) {.exportc, cdecl.} =
+proc sm_set_channel_coex_connected*() {.exportc, cdecl.} =
   ## Set channel coexistence info after connection (10 instrs).
   ## From blob: loads primary freq from sm_env+32, center freq from sm_env+34,
   ## then applies the PHY channel descriptor for the STA channel.
   let sm = smEnvView()
   phySetChannel(0, 0, sm.primaryFreq, sm.centerFreq, 0, 0)
 
-proc sm_connection_tlv_set*(id: uint8, data: pointer, len: uint16) {.exportc, cdecl, noinline.} =
-  ## Set a TLV in the connection data chain.
-  ## noinline: blob calls this from mm_connection_loss_ind_handler; empty body
-  ## would otherwise be elided.
+proc sm_connection_tlv_set*() {.exportc, cdecl, noinline.} =
+  ## The vendor exports a no-argument, ret-only stub.
   {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
-  discard
 
 proc sm_connection_tlv_reset*() {.exportc, cdecl.} =
   ## Reset all connection TLV data.
   discard
 
-proc sm_connection_tlv_pack*(param: pointer) {.exportc, cdecl.} =
-  ## Pack connection TLV data into a buffer (2 instrs).
-  ## From blob: li a0,0; ret -- returns 0 (no TLV data to pack).
-  ## Blob always returns 0; no TLV packing is implemented.
-  {.emit: ["asm volatile(\"li a0, 0\");"].}
+proc sm_connection_tlv_pack*(id, flag: uint8; data: pointer;
+                             len: uint16): cint {.exportc, cdecl.} =
+  ## The vendor accepts a TLV descriptor but does not pack anything.
+  discard id
+  discard flag
+  discard data
+  discard len
+  0
 
-proc sm_connection_tlv_desc_get*(): pointer {.exportc, cdecl.} =
-  ## Get the connection TLV descriptor list.
-  return nil
+proc sm_connection_tlv_desc_get*(list: ptr CoList) {.exportc, cdecl.} =
+  ## The vendor leaves the caller's list unchanged.
+  discard list
 
 proc sm_connect_wap_tlv_pack_cb*(eapolId: uint8; data: pointer;
                                 length: uint16) {.exportc, cdecl.} =
@@ -4082,7 +4645,7 @@ proc sm_connect_wap_tlv_pack_cb*(eapolId: uint8; data: pointer;
   discard data
   discard length
 
-proc sm_connection_sta_add_ind*(param: pointer) {.exportc, cdecl.} =
+proc sm_connection_sta_add_ind*() {.exportc, cdecl.} =
   discard smActivationNotifyCurrent()
 
 proc sm_connect_auth_assoc_req(param: pointer): cint {.exportc, cdecl, discardable.} =
@@ -4172,6 +4735,30 @@ proc apmPrepareStartReplies(): bool =
       return false
   apmPrepareRollbackBuffers()
 
+when defined(bl808WifiApHttpSmoke):
+  # CLIC mtime low words: request entry, WPA callback enter/leave, ME enqueue/entry.
+  var nimfwApTiming {.exportc: "nimfw_ap_timing", wifiCtrl.}: array[5, uint32]
+  var nimfwApQueueSnapshot {.exportc: "nimfw_ap_queue_snapshot", wifiCtrl.}: array[5, uint32]
+
+  proc nimfw_ap_snapshot() {.exportc, cdecl.} =
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    nimfwApQueueSnapshot[0] = ke_evt_field_get()
+    nimfwApQueueSnapshot[1] = apmStartReplyId.uint32 or
+      (apmStartReplyPublished.uint32 shl 16)
+    nimfwApQueueSnapshot[2] = ke_state_get(TASK_APM).uint32 or
+      (ke_state_get(TASK_ME).uint32 shl 8) or (ke_state_get(TASK_MM).uint32 shl 16)
+    if apmStartRequest != nil:
+      let node = cast[ptr CoListHdr](keMsgHdrFromPayload(apmStartRequest))
+      if co_list_find(addr keMsgQueueSent, node):
+        nimfwApQueueSnapshot[3] = 1
+      elif co_list_find(addr keMsgQueueSaved, node):
+        nimfwApQueueSnapshot[3] = 2
+      else:
+        nimfwApQueueSnapshot[3] = 3
+    nimfwApQueueSnapshot[4] = (meControlCommand != nil).uint32 or
+      ((meControlReply != nil).uint32 shl 1)
+
 proc apmSendStartRequest(request: pointer) =
   assert apmStartRequest == nil and apmStartReply == nil
   assert apmStartReplyIndex < apmStartReplyPool.len
@@ -4183,6 +4770,9 @@ proc apmSendStartRequest(request: pointer) =
   apmStartReplyId = header.id + 1
   apmStartReplySource = header.destId
   apmStartReplyPublished = false
+  when defined(bl808WifiApHttpSmoke):
+    if header.id == ME_SET_ACTIVE_REQ and not apmRollbackActive:
+      nimfwApTiming[3] = regRead(ClicMtimeBase)
   ke_msg_send(request)
 
 proc apmTakeStartReply(request: pointer, id: uint16, length: uint32): pointer =
@@ -4305,7 +4895,7 @@ proc apmFinishStop() =
     chan_ctxt_unlink(vifIdx)
   let context = apm.hostapdCtx
   apm.hostapdCtx = nil
-  apm.beaconIntervalIndex = 0
+  apm.embeddedEnabled = 0
   apm.cryptoType = 0
   discard c_memset(addr apm.securityIe[0], 0, apm.securityIe.len.csize_t)
   if context != nil and wpa_cbs != nil and wpaCallbacks().apStopped != nil:
@@ -4477,10 +5067,10 @@ proc apm_start_cfm*(param: pointer) {.exportc, cdecl.} =
     vif.psBaCounter = 0
     vif.apStartBeaconInterval = apInfo.vifBeaconInterval
 
-    # 3. Read band from channel context and store in APM_START_CFM msg
+    # 3. Supply the channel-context index (ch_idx), not the RF band.
     let chanPtr = vif.chanCtxt
     if chanPtr != nil:
-      msg.band = chanCtxtAt(chanPtr).contextIndexOrMarker
+      msg.channelContextIndex = chanCtxtAt(chanPtr).contextIndexOrMarker
 
     # 4. Log via g_bl_ops_funcs[204]
     let logFn = getLogFunc(204)
@@ -4538,7 +5128,7 @@ proc apm_start_cfm*(param: pointer) {.exportc, cdecl.} =
     if vif.chanCtxt != nil: chan_ctxt_unlink(completedVif)
     let context = apm.hostapdCtx
     apm.hostapdCtx = nil
-    apm.beaconIntervalIndex = 0
+    apm.embeddedEnabled = 0
     apm.cryptoType = 0
     discard c_memset(addr apm.securityIe[0], 0, apm.securityIe.len.csize_t)
     if context != nil and wpa_cbs != nil and wpaCallbacks().apStopped != nil:
@@ -4609,6 +5199,7 @@ proc apm_set_bss_param*(param: pointer): bool {.exportc, cdecl, discardable.} =
       cast[pointer](addr apInfo.staRateSeed[0]), 1)
     req.rateBitfield = rateBits
     req.vifIdx = vifIdx
+    req.band = apmStartReqView(connInfo).channel.band
     pushMsg(msgRates)
 
   # 4. MM_SET_BEACON_INT_REQ -> push at 0x12E
@@ -4768,19 +5359,32 @@ proc apm_sta_fw_delete*(staIdx: uint8, statusCode, reasonCode: uint16) {.exportc
   discard apm_sta_delete(staIdx, staMacAddr, statusCode, reasonCode)
 
 proc apm_probe_req_handler*(param: pointer) {.exportc, cdecl.} =
-  ## The RX indication has a 32-byte prefix and a complete 24-byte MAC header.
-  ## Vendor filtering uses the SSID and DS channel, not the Supported Rates IE.
+  ## Infrastructure AP response eligibility (IEEE 802.11-2012 10.1.4.3.2).
   let saved = irqSave()
   defer: irqRestore(saved)
+  when defined(bl808WifiApDiscoveryDiag):
+    var probeKind = apProbeUnknown
+    var outcome = apProbeBadLength
+    defer:
+      inc apProbeTrace[probeKind].apmEntered
+      inc apProbeTrace[probeKind].outcomes[outcome]
+  template probeOutcome(value: untyped) =
+    when defined(bl808WifiApDiscoveryDiag):
+      outcome = value
   if param == nil:
     return
   let header = keMsgHdrFromPayload(param)
   if header.paramLen < ApmProbeReqViewSize:
     return
   let req = apmProbeReqView(param)
+  const macHeaderLength = sizeof(MacDataFrameHeaderView).uint32
+  const indicationPrefixLength = offsetof(ApmProbeReqView, frame).uint32
   let frameLength = req.frameLen.uint32
-  if frameLength < 24 or frameLength + 32 > header.paramLen:
+  if frameLength < macHeaderLength or frameLength + indicationPrefixLength > header.paramLen:
     return
+  when defined(bl808WifiApDiscoveryDiag):
+    probeKind = apProbeClassifyForAp(addr req.ies[0], frameLength - macHeaderLength)
+  probeOutcome(apProbeNoVif)
   let vifIdx = req.vifIdx
   if vifIdx != 0xFF and vifIdx >= MAX_VIFS.uint8:
     return
@@ -4798,11 +5402,23 @@ proc apm_probe_req_handler*(param: pointer) {.exportc, cdecl.} =
       vifChannelForIdx(resolvedVif) != vif or not apmVifRunning(resolvedVif) or
       vif.chanCtxt == nil:
     return
+  probeOutcome(apProbeWrongAddress)
+  const broadcastAddress = [0xFF'u8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+  if (req.frame.addr1 != broadcastAddress and req.frame.addr1 != vif.macAddr) or
+      (req.frame.addr3 != broadcastAddress and req.frame.addr3 != vif.macAddr) or
+      (req.frame.addr2[0] and 1) != 0:
+    return
+  probeOutcome(apProbeBadIes)
   let epoch = rxVifEpochs[resolvedVif]
   let apSsid = vifApProbeSsid(vif)
-  let ieLength = frameLength - 24
+  template namesAp(ie: ptr MacIeView): bool =
+    ie.len != 0 and ie.len == apSsid.ssidLen and
+      c_memcmp(addr ie.macIePayload[0], addr apSsid.ssidData[0], ie.len.csize_t) == 0
+
+  let ieLength = frameLength - macHeaderLength
   var offset = 0'u32
-  var ssid, ds: ptr MacIeView
+  var ssid, rates, ds: ptr MacIeView
+  var listMatches, listWildcard: bool
   while offset < ieLength:
     if ieLength - offset < 2:
       return
@@ -4811,40 +5427,74 @@ proc apm_probe_req_handler*(param: pointer) {.exportc, cdecl.} =
     if size > ieLength - offset:
       return
     case ie.id
-    of 0:
+    of IE_ID_SSID:
       if ssid == nil: ssid = ie
-    of 3:
+    of IE_ID_SUPPORTED_RATES:
+      if rates == nil: rates = ie
+    of IE_ID_DS_PARAM:
       if ds == nil: ds = ie
+    of IE_ID_SSID_LIST:
+      let listLength = ie.len.uint32
+      var listOffset = 0'u32
+      while listOffset < listLength:
+        if listLength - listOffset < 2:
+          return
+        let entry = cast[ptr MacIeView](addr ie.macIePayload[listOffset])
+        let entrySize = 2 + entry.len.uint32
+        if entry.id != IE_ID_SSID or entry.len > 32 or entrySize > listLength - listOffset:
+          return
+        if entry.len == 0:
+          listWildcard = true
+        elif not listMatches:
+          listMatches = namesAp(entry)
+          if not apmSessionCurrent(resolvedVif, epoch):
+            probeOutcome(apProbeRetired)
+            return
+        listOffset += entrySize
     else: discard
     offset += size
 
-  if ssid == nil or ssid.len == 0:
-    if apmEnvView().flags != 0:
-      return
-  else:
-    if ssid.len > 32 or ssid.len != apSsid.ssidLen or
-        c_memcmp(addr ssid.macIePayload[0], addr apSsid.ssidData[0],
-                 ssid.len.csize_t) != 0:
-      return
+  # Table 8-26 requires both IEs. An absent SSID is not a wildcard.
+  if ssid == nil or ssid.len > 32 or rates == nil or rates.len notin 1'u8 .. 8'u8:
+    return
 
+  probeOutcome(apProbeWrongChannel)
+  template noteDsss(reason, requested, configured, opMhz: untyped) =
+    when defined(bl808WifiApDiscoveryDiag):
+      if ds != nil:
+        apProbeNoteDsss(probeKind, reason, ds.len, requested, configured,
+                        rxuMgtIndMsgAt(param).freq, opMhz)
+  if ds != nil and ds.len != IE_LEN_DS_PARAM:
+    noteDsss(apProbeDsssBadLength, 0, 0, 0)
+    return
+  let requested = if ds != nil: ds.macIePayload[0] else: 0'u8
+  if vif.operChan == nil:
+    noteDsss(apProbeDsssNoOperatingChannel, requested, 0, 0)
+    return
+  let chan = cast[ptr ScanChannelEntry](vif.operChan)
+  let freq = chan.prim20Freq
+  let channel = phy_freq_to_channel(chan.band, freq)
+  if channel == 0:
+    noteDsss(apProbeDsssInvalidOperatingChannel, requested, channel, freq)
+    return
   if ds != nil:
-    if ds.len != 1 or vif.operChan == nil:
+    if requested != channel:
+      noteDsss(apProbeDsssMismatch, requested, channel, freq)
       return
-    let chan = cast[ptr ScanChannelEntry](vif.operChan)
-    let freq = chan.prim20Freq
-    var channel = 0'u8
-    # The vendor inlines the firmware conversion here; the linked host helper
-    # intentionally supports only 2.4 GHz, so do not use that exported symbol.
-    if chan.band == 0 and freq >= 2412 and freq <= 2484:
-      channel = if freq == 2484: 14'u8 else: ((freq - 2407) div 5).uint8
-    elif chan.band == 1 and freq >= 5005 and freq <= 5825:
-      channel = ((freq - 5000) div 5).uint8
-    if ds.macIePayload[0] != channel:
-      return
+    noteDsss(apProbeDsssMatched, requested, channel, freq)
 
-  if apmSessionCurrent(resolvedVif, epoch):
+  let exactMatch = listMatches or namesAp(ssid)
+  probeOutcome(apProbeRetired)
+  if not apmSessionCurrent(resolvedVif, epoch):
+    return
+  probeOutcome(apProbeWrongSsid)
+  if exactMatch or ((ssid.len == 0 or listWildcard) and apmEnvView().flags == 0):
+    probeOutcome(apProbeRespond)
+    var extra: pointer = nil
+    when defined(bl808WifiApDiscoveryDiag):
+      extra = cast[pointer](probeKind.uint)
     apm_send_mlme(cast[pointer](vif), 0x50'u16,
-                  cast[pointer](addr req.staMac[0]), nil, nil, nil)
+                  cast[pointer](addr req.frame.addr2[0]), nil, nil, extra)
 
 proc apmRxFrameFits(param: pointer; minimumFrameLength: uint32): bool =
   if param == nil:
@@ -5194,20 +5844,15 @@ proc apm_beacon_handler*(param: pointer) {.exportc, cdecl, noinline.} =
   {.emit: ["asm volatile(\"\" ::: \"memory\");"].}
 
 proc apm_embedded_enabled*(vifEntry: pointer): bool {.exportc, cdecl, noinline.} =
-  ## Check if embedded AP mode is enabled for given VIF entry.
-  ## From blob (12 instrs): if vifEntry is NULL, return hostapd_enabled & 1.
-  ## Otherwise, check if vifType (offset 86) == 2 (AP mode); if so return
-  ## hostapd_enabled & 1, else return 0.
+  ## Read the embedded flag populated by AP start (apm_env offset 85).
   ## noinline + asm barrier: callers use `discard apm_embedded_enabled(...)`
   ## or call with nil in some branches; without the barrier GCC elides the
   ## call because the return value is unused and the body is side-effect-free.
   {.emit: ["asm volatile(\"\" ::: \"memory\");"].}
+  let enabled = apmEnvView().embeddedEnabled
   if vifEntry == nil:
-    return (hostapd_enabled and 1) != 0
-  let vifType = vifChannelAt(vifEntry).vifType
-  if vifType == 2:
-    return (hostapd_enabled and 1) != 0
-  return false
+    return enabled != 0
+  vifChannelAt(vifEntry).vifType == VIF_TYPE_AP and (enabled and 1'u8) != 0
 
 proc apm_get_hostapd_ctx*(): pointer {.exportc, cdecl, noinline.} =
   ## Get hostapd context pointer from apm_env[172] (blob layout; not a
@@ -5236,6 +5881,62 @@ proc apm_handle_auth_done*(param: pointer) {.exportc, cdecl.} =
   ## Computes sta_info_tab[staIdx] (stride 368), stores 2 at sta[72] (control-port ready flag).
   let staIdx = encodedArgU8(param)
   staInfoForIdx(staIdx).controlPortState = 2  # control-port ready state at offset 72
+
+proc readApFrameExtras(data: pointer; length: uint32; extras: var ApFrameExtras): bool =
+  extras = ApFrameExtras(data: data, length: length)
+  if length == 0:
+    return true
+  if data == nil:
+    return false
+  let bytes = cast[ptr UncheckedArray[uint8]](data)
+  var offset = 0'u32
+  while offset < length:
+    if length - offset < 2:
+      return false
+    let size = bytes[offset + 1].uint32 + 2
+    if size > length - offset:
+      return false
+    if bytes[offset] == 7: # Country
+      let payloadSize = size - 2
+      if extras.countrySize != 0 or payloadSize < 6 or (payloadSize and 1) != 0:
+        return false
+      # Country string (3 bytes), whole triplets, and zero padding if needed.
+      case (payloadSize - 3) mod 3
+      of 0: discard
+      of 1:
+        if bytes[offset + size - 1] != 0: return false
+      else: return false
+      extras.countryOffset = offset
+      extras.countrySize = size
+    offset += size
+  true
+
+proc appendApFrameExtras(buf: pointer; built, countryAt, capacity: uint32;
+                         extras: ApFrameExtras): bool =
+  if buf == nil or built > capacity or extras.length > capacity - built or
+      countryAt > built:
+    return false
+  if extras.length == 0:
+    return true
+  var tail = ieCursorAfter(buf, built.uint)
+  if extras.countrySize == 0:
+    discard copyIeBytes(tail, extras.data, extras.length.uint)
+  else:
+    # The TIM and DSSS positions remain stable. Shift only the suffix and
+    # keep non-Country extras in their original relative order.
+    let slot = ieCursorAfter(buf, countryAt.uint)
+    let afterCountry = ieCursorAfter(slot, extras.countrySize.uint)
+    discard c_memmove(afterCountry, slot, (built - countryAt).csize_t)
+    discard copyIeBytes(slot, ieCursorAfter(extras.data, extras.countryOffset.uint),
+                        extras.countrySize.uint)
+    tail = ieCursorAfter(tail, extras.countrySize.uint)
+    if extras.countryOffset != 0:
+      tail = copyIeBytes(tail, extras.data, extras.countryOffset.uint)
+    let afterExtraCountry = extras.countryOffset + extras.countrySize
+    if afterExtraCountry < extras.length:
+      discard copyIeBytes(tail, ieCursorAfter(extras.data, afterExtraCountry.uint),
+                          (extras.length - afterExtraCountry).uint)
+  true
 
 proc apm_send_mlme*(vifEntry: pointer, frameType: uint16, destAddr: pointer,
     callback: pointer, callbackArg: pointer, extraParam: pointer) {.exportc, cdecl.} =
@@ -5318,24 +6019,21 @@ proc apm_send_mlme*(vifEntry: pointer, frameType: uint16, destAddr: pointer,
   elif frameType == 0x50:
     let apm = apmEnvView()
     let customerLength = apm.cryptoType.uint32
+    const capacity = TxlFramePayloadSize - 24'u32
+    var extras: ApFrameExtras
+    var countryAt: uint16
     var bodyLen = 0'u32
-    if customerLength <= apm.securityIe.len.uint32:
+    if customerLength <= apm.securityIe.len.uint32 and
+        readApFrameExtras(addr apm.securityIe[0], customerLength, extras):
       bodyLen = meBuildProbeResponse(bodyBuf, instNbr,
-        TxlFramePayloadSize - 24'u32 - customerLength, nil)
+        capacity - customerLength, nil, addr countryAt)
     if not txlFramePreparationCurrent(desc, identity, generation):
       return
-    if bodyLen == 0:
+    if bodyLen == 0 or not appendApFrameExtras(bodyBuf, bodyLen, countryAt.uint32,
+                                               capacity, extras):
       txl_frame_release(frame, false)
       return
-    totalLen = bodyLen + 24
-
-    # Add customer IEs (blob: me_add_ie_customer at 0x110)
-    if customerLength != 0:
-      totalLen += me_add_ie_customer(
-        cast[pointer](addr link.macHeader[sizeof(MacDataFrameHeaderView) + bodyLen.int]),
-        addr apm.securityIe[0], customerLength)
-    # Blob does NOT append extra probe response IEs here — customer IEs
-    # are the full append path.
+    totalLen = bodyLen + extras.length + 24
 
   elif (frameType and (not 0x20'u16)) == 0x10:
     # Assoc response (0x10) or reassoc response (0x30)
@@ -5365,7 +6063,17 @@ proc apm_send_mlme*(vifEntry: pointer, frameType: uint16, destAddr: pointer,
   desc.callbackArg = callbackArg
 
   # Push frame to TX queue (AC=3, management)
+  when defined(bl808WifiApDiscoveryDiag):
+    var probeKind = apProbeUnknown
+    if frameType == 0x50:
+      let ordinal = cast[uint](extraParam)
+      if ordinal <= high(ApProbeKind).uint:
+        probeKind = ApProbeKind(ordinal)
+      apProbeMarkBuilt(generation, probeKind)
   submitted = txl_frame_push(frame, 3) != 0
+  when defined(bl808WifiApDiscoveryDiag):
+    if frameType == 0x50 and submitted:
+      inc apProbeTrace[probeKind].submitted
 
 proc aidListDelete(macAddr: pointer) {.exportc: "aid_list_delete", cdecl, noinline.} =
   ## Detach the slot before releasing its opaque WPA state: callbacks may reenter.
@@ -5717,11 +6425,14 @@ proc me_init_bcmc_rate*(staEntry: pointer) {.exportc, cdecl.} =
   ## Loops over rates at sta+249, finds max rate (masking bit 7).
   ## Calls me_rate_translate(maxRate), then rc_init_bcmc_rate(sta, rateIdx).
   ## Clears sta+334 (RC flags byte).
+  if staEntry == nil:
+    return
   let sta = staInfoAt(staEntry)
   let start = apSelfStaStart(sta)
   let rateCount = start.rateSeed[0]
-  if rateCount == 0:
+  if rateCount == 0 or rateCount.int >= start.rateSeed.len:
     assert_err("me.c", "me.c", 510)
+    return
   # Loop scanning rates at sta+249, find max rate (masking bit 7)
   var maxRate: uint32 = 0
   var rateIndex: uint32 = 0
@@ -5735,6 +6446,8 @@ proc me_init_bcmc_rate*(staEntry: pointer) {.exportc, cdecl.} =
   # Convert max rate to rate index, then set bcmc rate
   # Blob: mv a1,a0 (rateIdx); mv a0,s0 (sta); call rc_init_bcmc_rate
   let rateIdx = me_rate_translate(maxRate)  # blob: me_rate_translate (not me_legacy_ridx_min)
+  if rateIdx > 11:
+    return
   rc_init_bcmc_rate(staEntry, rateIdx)
   start.txPolicyUpdateFlags = 0
 
@@ -5779,6 +6492,20 @@ proc me_beacon_check*(vifIdx: uint8, frameLength: uint16, frame: pointer) {.expo
       vif.chanCtxt == contextPtr and chanCtxtLinkEpochs[vifIdx] == bindingEpoch
   let iesBuf = cast[pointer](cast[uint](frame) + 36)
   let iesLength = frameLength.uint32 - 36
+  var ieCursor = cast[uint](iesBuf)
+  if iesLength.uint > high(uint) - ieCursor:
+    return
+  var ieRemaining = iesLength
+  while ieRemaining != 0:
+    if ieRemaining < 2:
+      return
+    let ie = macIeAt(ieCursor)
+    let size = ie.len.uint32 + 2'u32
+    if size > ieRemaining or
+        (ie.id in [32'u8, 42'u8] and ie.len != 1):
+      return
+    ieCursor += size.uint
+    ieRemaining -= size
   let bss = vifBssStatus(vif)
   let previousBandwidth = bss.phyBandwidth
   let previousConstraint = bss.powerConstraint
@@ -5789,7 +6516,9 @@ proc me_beacon_check*(vifIdx: uint8, frameLength: uint16, frame: pointer) {.expo
       bss.protectionFlags = (erp.macIePayload[0] and 7).uint16
   me_extract_power_constraint(iesBuf, iesLength, vifBssInfoBase(vif))
   if bss.powerConstraint != previousConstraint:
-    var power = cast[int8](cast[uint8](chan.txPower) - bss.powerConstraint)
+    # A large received constraint must not wrap into a positive TX power.
+    var power = max(chan.txPower.int - bss.powerConstraint.int,
+                    low(int8).int).int8
     var powerIndex: uint8
     {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
     irqRestore(saved)
@@ -5838,7 +6567,6 @@ proc me_bw_check*(param: pointer) {.exportc, cdecl.} =
   let channel = cast[ptr ScanChannelEntry](bss.channel)
   let primaryFreq = if channel != nil: channel.prim20Freq else: 0'u16
   bss.bandwidth = 0
-  bss.phyBandwidth = 0
   bss.centerFreq2 = 0
   bss.centerFreq1 = primaryFreq
 
@@ -5863,11 +6591,25 @@ proc me_update_buffer_control*(sta: pointer): pointer {.exportc, cdecl.} =
   ## Update TX buffer control for a station.
   ## Reads the RC stats and TX policy descriptor, updates the rate control
   ## fields based on current rate entries, then writes the new policy to HW.
+  if sta == nil:
+    return nil
   let staView = staInfoAt(sta)
   let txPolicyUpdateFlags = staView.txPolicyUpdateFlags[0]
   let txPolicy = staView.txPolicy
-  if txPolicyUpdateFlags == 0:
+  if txPolicyUpdateFlags == 0 or txPolicy == nil:
     return txPolicy
+  if (txPolicyUpdateFlags and StaTxPolicyUpdateRateControl) != 0:
+    let stats = staView.rcStats
+    if stats == nil or staView.instNbr >= MAX_VIFS.uint8:
+      return txPolicy
+    let sampleCount = rcU16(stats, RCS_N_RATES)
+    if sampleCount == 0 or sampleCount > RC_MAX_RATE_ENTRIES.uint16:
+      return txPolicy
+    let retryRotate = rcU8(stats, RCS_ANOTHER_FLAG)
+    for acIdx in 0 ..< 4:
+      let retrySlot = (retryRotate.uint32 + acIdx.uint32) and 3'u32
+      if rcU16(stats, 0x80 + retrySlot.int * 8) >= sampleCount:
+        return txPolicy
   let policy = txPolicyAt(txPolicy)
 
   # Mirror the vendor stack copies before updating the descriptor under IRQ.
@@ -5886,6 +6628,11 @@ proc me_update_buffer_control*(sta: pointer): pointer {.exportc, cdecl.} =
     let vifHtCaps = vifHtCapabilities(vif)
     let retryRotate = rcU8(rcStats, RCS_ANOTHER_FLAG) # 0xB0
     let staStbcNss = staView.htVhtConfig
+    let preserveStationRates = when defined(bl808WifiNativeWlanCalibration):
+      vif.vifType == VIF_TYPE_STA and rcU8(rcStats, RCS_GROUP_CNT) == 0 and
+        rcU8(rcStats, RCS_FORMAT_MOD) == RC_FORMATMOD_HT_MF
+    else:
+      false
 
     rcU8(rcStats, 0xBF) = vifHtCaps.mcsSet[12]
 
@@ -5901,25 +6648,28 @@ proc me_update_buffer_control*(sta: pointer): pointer {.exportc, cdecl.} =
 
       if ((rateWord shr 11) and 0x6'u32) != 0:
         var mcsOrGroup = rateWord and 0x7F'u32
-        let vifBitmap = vifHtCaps.mcsSet[acIdx]
-        rcU8(rcStats, RCS_RATE_BITMAP + acIdx) = vifBitmap
+        # Native 1SS station samples already obey the negotiated peer bitmap.
+        # Substituting the VIF's highest MCS here would collapse the retry chain.
+        if not preserveStationRates:
+          let vifBitmap = vifHtCaps.mcsSet[acIdx]
+          rcU8(rcStats, RCS_RATE_BITMAP + acIdx) = vifBitmap
 
-        if acIdx == 0:
-          var search = 7'i32
-          while search >= 0:
-            if (vifBitmap and (1'u8 shl search.uint8)) != 0:
-              selectedGroup = search.uint8
-              break
-            dec search
-          if selectedGroup != 0xFF'u8:
+          if acIdx == 0:
+            var search = 7'i32
+            while search >= 0:
+              if (vifBitmap and (1'u8 shl search.uint8)) != 0:
+                selectedGroup = search.uint8
+                break
+              dec search
+            if selectedGroup != 0xFF'u8:
+              rcU8(rcStats, RCS_MAX_NSS_MCS) = selectedGroup
+              mcsOrGroup = selectedGroup.uint32
+          elif selectedGroup != 0xFF'u8:
             rcU8(rcStats, RCS_MAX_NSS_MCS) = selectedGroup
             mcsOrGroup = selectedGroup.uint32
-        elif selectedGroup != 0xFF'u8:
-          rcU8(rcStats, RCS_MAX_NSS_MCS) = selectedGroup
-          mcsOrGroup = selectedGroup.uint32
 
-        if (rcU8(rcStats, RCS_FLAGS) and 0x40'u8) == 0:
-          rateWord = (rateWord and not 0x7F'u32) or mcsOrGroup
+          if (rcU8(rcStats, RCS_FLAGS) and 0x40'u8) == 0:
+            rateWord = (rateWord and not 0x7F'u32) or mcsOrGroup
 
         # th.extu ...,4,3 extracts the two-bit zero-based NSS for STBC.
         let nssGroup = (mcsOrGroup shr 3) and 0x3'u32
@@ -5961,25 +6711,49 @@ proc me_update_buffer_control*(sta: pointer): pointer {.exportc, cdecl.} =
     policy.retryRate[acIdx] = rateWords[acIdx]
     policy.txPower[acIdx] = txPowerWords[acIdx]
 
-  irqRestore(irqState)
-  # Clear pending TX policy work after writing the descriptor.
+  when defined(bl808m0):
+    if (txPolicyUpdateFlags and StaTxPolicyUpdateRateControl) != 0:
+      rcRejectUnprogrammedTrial(staView.infoIdx, staView.rcStats, rateWords)
+  # Do not erase a new policy request delivered when IRQs are restored.
   staView.txPolicyUpdateFlags[0] = 0
+  irqRestore(irqState)
   return txPolicy
 
 proc me_tx_cfm_singleton*(param: pointer) {.exportc, cdecl.} =
   ## Handle TX confirmation for singleton frames (80 bytes in blob, 25 instrs).
   ## THD bits 15:8 count retries; bit 16 marks a failed final attempt.
-  let desc = hostTxDescAt(param)
-  let thd = hostTxHeadThd(hostTxHwDescAt(desc.hwDesc))
-  let statusWord = thd.flags
+  let observed = block:
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    let desc = hostTxDescAt(param)
+    let thd = hostTxHeadThd(hostTxHwDescAt(desc.hwDesc))
+    let statusWord = thd.flags
+    (status: statusWord, isControlPort: desc.frameLen in [0x8E88'u16, 0x888E'u16],
+     sta: desc.staInfoIdx, vif: desc.vifIdx, resetEpoch: txResetEpoch,
+     stationEpoch: staDeleteEpoch(desc.staInfoIdx),
+     vifEpoch: (if desc.vifIdx < MAX_VIFS.uint8: rxVifEpochs[desc.vifIdx] else: 0'u32))
+  let statusWord = observed.status
+  # A software completion did not use a hardware retry slot.
+  const softwareDoneBit = 1'u32 shl 30
+  if (statusWord and softwareDoneBit) != 0:
+    return
   # Vendor th.extu extracts bits 15:8.
   let retries = (statusWord shr 8) and 0xFF'u32
   let finalFailure = (statusWord and 0x10000'u32) != 0
   let attempts = retries + 1
   let failures = retries + finalFailure.uint32
+  let staIdx = observed.sta
+  let vifIdx = observed.vif
   if finalFailure:
     rf_dump_status()
-  let staIdx = desc.staInfoIdx
+  let desc = hostTxDescAt(param)
+  if txResetEpoch != observed.resetEpoch or
+      staDeleteEpoch(staIdx) != observed.stationEpoch or
+      (vifIdx < MAX_VIFS.uint8 and rxVifEpochs[vifIdx] != observed.vifEpoch) or
+      desc.staInfoIdx != staIdx or desc.vifIdx != vifIdx:
+    return
+  # EAPOL may use a per-frame fallback not represented in the STA retry slots.
+  if observed.isControlPort: return
   rc_update_counters(staIdx, attempts, failures, false, false)
 
 proc me_tx_cfm_ampdu*(staIdx: uint8; transmitted, acknowledged: uint32;
@@ -6007,14 +6781,18 @@ proc me_tx_cfm_amsdu*(param: pointer): uint16 {.exportc, cdecl.} =
   rcStatsCounters(rcStats).currentAmsduLen
 
 # ME IE building functions
-proc me_add_ie_ssid*(buf: pointer, ssid: pointer, ssidLen: uint8): uint32 {.exportc, cdecl.} =
+proc me_add_ie_ssid*(buf: pointer, ssidLen: uint8, ssid: pointer): uint32 {.exportc, cdecl.} =
   ## Add SSID IE to buffer. buf is ptr-to-write-pointer (ptr-ptr pattern).
   ## Writes IE ID=0, length, then SSID data. Advances *buf. Returns total bytes.
+  if buf == nil or ssidLen > 32 or (ssidLen != 0 and ssid == nil):
+    return 0
   let bufPtrPtr = cast[ptr pointer](buf)
+  if bufPtrPtr[] == nil:
+    return 0
   let ie = ssidIeAt(bufPtrPtr[])
   ie.ie.id = 0'u8
   ie.ie.len = ssidLen
-  if ssidLen > 0 and ssid != nil:
+  if ssidLen > 0:
     co_pack8p(addr ie.ssidBytes[0], ssid, ssidLen.uint32)
   let total = ssidLen.uint32 + 2
   bufPtrPtr[] = addr ie.ssidBytes[ssidLen]
@@ -6026,9 +6804,15 @@ proc me_add_ie_supp_rates*(buf: pointer, rateSetPtr: pointer): uint32 {.exportc,
   ## rateSetPtr: rate_set[0] = count, rate_set[1..N] = rate bytes.
   ## Writes IE with ID=1, length=min(count,8), copies min(count,8) rate bytes.
   ## Advances *buf, returns bytes written (count clipped to 8, + 2).
+  if buf == nil or rateSetPtr == nil:
+    return 0
   let bufPtrPtr = cast[ptr pointer](buf)
+  if bufPtrPtr[] == nil:
+    return 0
   let rateSet = rateSetAt(rateSetPtr)
   let rateCount = rateSet.count
+  if rateCount > 12:
+    return 0
   var writeCount = rateCount
   if writeCount > 8:
     writeCount = 8
@@ -6043,14 +6827,21 @@ proc me_add_ie_supp_rates*(buf: pointer, rateSetPtr: pointer): uint32 {.exportc,
   bufPtrPtr[] = addr ie.payload[writeCount]
   return totalLen
 
-proc me_add_ie_ext_supp_rates*(buf: pointer, rateSetPtr: pointer, totalCount: uint32): uint32 {.exportc, cdecl.} =
+proc me_add_ie_ext_supp_rates*(buf: pointer, rateSetPtr: pointer): uint32 {.exportc, cdecl.} =
   ## Add Extended Supported Rates IE (ID=50) (26 instrs).
   ## buf is ptr-to-write-pointer (ptr-ptr pattern).
-  ## rateSetPtr: same rate_set as supp_rates. totalCount: total number of rates.
+  ## rateSetPtr: same rate set as supp_rates; its first byte supplies the count.
   ## Writes IE with ID=50, length=count-8, data=rates[9..count].
   ## Advances *buf. Returns total bytes written (count-8+2 = count-6).
+  if buf == nil or rateSetPtr == nil:
+    return 0
   let bufPtrPtr = cast[ptr pointer](buf)
+  if bufPtrPtr[] == nil:
+    return 0
   let rateSet = rateSetAt(rateSetPtr)
+  let totalCount = rateSet.count.uint32
+  if totalCount <= 8 or totalCount > 12:
+    return 0
   let extCount = totalCount - 8
   let ie = macIeDataAt(bufPtrPtr[])
   # Write IE header: ID=50 (Extended Supported Rates)
@@ -6067,7 +6858,11 @@ proc me_add_ie_ext_supp_rates*(buf: pointer, rateSetPtr: pointer, totalCount: ui
 proc me_add_ie_ds*(buf: pointer, channel: uint8): uint32 {.exportc, cdecl.} =
   ## Add DS Parameter Set IE (ID=3, length=1, total=3 bytes).
   ## buf is ptr-to-write-pointer (ptr-ptr pattern). Advances *buf by 3.
+  if buf == nil:
+    return 0
   let bufPtrPtr = cast[ptr pointer](buf)
+  if bufPtrPtr[] == nil:
+    return 0
   let ds = dsParamSetIeAt(bufPtrPtr[])
   ds.ie.id = 3'u8
   ds.ie.len = 1'u8
@@ -6079,7 +6874,11 @@ proc me_add_ie_erp*(buf: pointer, erpInfo: uint8 = 0): uint32 {.exportc, cdecl.}
   ## Add ERP IE (ID=42, length=1, total=3 bytes).
   ## buf is ptr-to-write-pointer (ptr-ptr pattern). Advances *buf by 3.
   ## erpInfo is the ERP information byte (protection flags etc).
+  if buf == nil:
+    return 0
   let bufPtrPtr = cast[ptr pointer](buf)
+  if bufPtrPtr[] == nil:
+    return 0
   let erp = oneByteMacIeAt(bufPtrPtr[])
   erp.ie.id = 42'u8
   erp.ie.len = 1'u8
@@ -6091,7 +6890,11 @@ proc me_add_ie_ht_capa*(buf: pointer): uint32 {.exportc, cdecl.} =
   ## Add HT Capabilities IE (ID=45, length=26, total=28 bytes).
   ## buf is ptr-to-write-pointer (ptr-ptr pattern). Advances *buf by 28.
   ## Loads HT cap fields from me_env global.
+  if buf == nil:
+    return 0
   let bufPtrPtr = cast[ptr pointer](buf)
+  if bufPtrPtr[] == nil:
+    return 0
   let ht = htCapIeAt(bufPtrPtr[])
   let me = meEnvView()
   ht.ie.id = 45'u8
@@ -6125,7 +6928,11 @@ proc me_add_ie_ht_oper*(buf: pointer, vifEntry: pointer = nil): uint32 {.exportc
   ## Channel context layout: [4]=band(u8), [5]=type(u8), [6]=prim_freq(u16),
   ## [8]=center1_freq(u16). Calls phy_freq_to_channel for primary channel.
   ## Secondary offset is 0 for 20 MHz, 5 above the primary, and 7 below it.
+  if buf == nil:
+    return 0
   let bufPtrPtr = cast[ptr pointer](buf)
+  if bufPtrPtr[] == nil:
+    return 0
   let oper = htOperIeAt(bufPtrPtr[])
   oper.ie.id = 61'u8
   oper.ie.len = 22'u8
@@ -6155,14 +6962,18 @@ proc me_add_ie_rsn*(buf: pointer, secMode: uint8 = 0): uint32 {.exportc, cdecl.}
   ## Add RSN IE (ID=48).
   ## From blob (90 instrs): a0=bufCtx (ptr to write-pointer), a1=secMode.
   ## secMode=1: 22-byte RSN with CCMP + PSK AKM.
-  ## secMode=2: 26-byte RSN with TKIP+CCMP + 802.1X AKM.
+  ## secMode=2: 26-byte RSN with TKIP+CCMP + PSK AKM.
   ## Other secMode: no IE added, returns 0.
   ##
   ## bufCtx layout: [0]=current write pointer. The IE is written at *bufCtx[0]
   ## and bufCtx[0] is advanced by the IE length.
   ## For Nim callers that pass buf directly (not a context struct), secMode
   ## defaults to 0 which returns 0 (no RSN), preserving backward compatibility.
+  if secMode notin [1'u8, 2'u8] or buf == nil:
+    return 0
   let bufPtrPtr = cast[ptr pointer](buf)
+  if bufPtrPtr[] == nil:
+    return 0
   if secMode == 1:
     # RSN IE: CCMP only + PSK AKM (22 bytes total)
     let rsn = rsnCcmpPskIeAt(bufPtrPtr[])
@@ -6178,7 +6989,7 @@ proc me_add_ie_rsn*(buf: pointer, secMode: uint8 = 0): uint32 {.exportc, cdecl.}
     bufPtrPtr[] = addr rsn.next[0]
     return 22
   elif secMode == 2:
-    # RSN IE: TKIP+CCMP + 802.1X AKM (26 bytes total)
+    # RSN IE: TKIP+CCMP + PSK AKM (26 bytes total)
     let rsn = rsnTkipCcmpIeAt(bufPtrPtr[])
     rsn.ie.id = 48'u8
     rsn.ie.len = 24'u8
@@ -6196,8 +7007,8 @@ proc me_add_ie_rsn*(buf: pointer, secMode: uint8 = 0): uint32 {.exportc, cdecl.}
     # Unknown secMode or 0: no RSN IE
     return 0
 
-{.emit: "__attribute__((noipa)) unsigned long me_add_ie_wpa(void*,unsigned long);".}
-proc me_add_ie_wpa*(buf: pointer, secMode: uint32 = 0): uint32 {.exportc, cdecl.} =
+{.emit: "__attribute__((noipa)) unsigned long me_add_ie_wpa(void*,unsigned char);".}
+proc me_add_ie_wpa*(buf: pointer, secMode: uint8 = 0): uint32 {.exportc, cdecl.} =
   ## Add WPA IE (168 bytes in blob, 53 instrs).
   ## buf is ptr-to-write-pointer (ptr-ptr pattern).
   ## secMode: only mixed mode (2) adds this legacy WPA IE.
@@ -6208,7 +7019,11 @@ proc me_add_ie_wpa*(buf: pointer, secMode: uint32 = 0): uint32 {.exportc, cdecl.
   ## The gap is a GCC code factoring optimization difference, not missing logic.
   if secMode != 2:
     return 0
+  if buf == nil:
+    return 0
   let bufPtrPtr = cast[ptr pointer](buf)
+  if bufPtrPtr[] == nil:
+    return 0
   let wpa = wpaVendorIeAt(bufPtrPtr[])
   wpa.ie.id = 221'u8
   wpa.ie.len = 28'u8
@@ -6245,15 +7060,17 @@ proc writeWmmParameterIe(ieBuf: pointer; vif: ptr VifChannelView): pointer =
 proc me_add_ie_tim*(buf: pointer, dtimBitmap: uint8 = 0): uint32 {.exportc, cdecl.} =
   ## Add TIM IE (ID=5, length=4, total=6 bytes).
   ## buf is ptr-to-write-pointer (ptr-ptr pattern). Advances *buf by 6.
-  ## dtimBitmap is stored at offset 3 (DTIM count field in blob).
+  ## The template leaves DTIM count and bitmap bytes unchanged; the live
+  ## beacon path supplies them from its separate TIM descriptor.
+  if buf == nil:
+    return 0
   let bufPtr = cast[ptr pointer](buf)
+  if bufPtr[] == nil:
+    return 0
   let tim = timIeAt(bufPtr[])
   tim.ie.id = 5'u8
   tim.ie.len = 4'u8
-  tim.dtimCount = 0'u8
   tim.dtimPeriod = dtimBitmap
-  tim.bitmapControl = 0'u8
-  tim.partialBitmap[0] = 0'u8
   bufPtr[] = addr tim.partialBitmap[1]
   return 6
 
@@ -6267,8 +7084,11 @@ proc me_add_ie_customer*(buf: pointer, ieData: pointer = nil,
   ## Add customer-defined IE (11 instrs).
   ## Blob ABI: a0=write pointer, a1=IE data, a2=IE byte length.
   ## It calls co_pack8p(a0, a1, a2), then returns a2.
-  if ieData != nil and length != 0:
-    co_pack8p(buf, ieData, length)
+  if length == 0:
+    return 0
+  if buf == nil or ieData == nil:
+    return 0
+  co_pack8p(buf, ieData, length)
   return length
 
 # ME frame building
@@ -6297,19 +7117,34 @@ proc me_build_authenticate*(buf: pointer, authAlgo: uint16, authSeq: uint16,
   return 6
 
 proc meBuildSaeAuthenticate(buf: pointer; authAlgo, authSeq, statusCode: uint16;
-                             vifIdx: uint32; build: ptr SmTxBuildContext): uint32 =
+                             vifIdx: uint32; build: ptr SmTxBuildContext;
+                             peerOverride: pointer = nil;
+                             ownOverride: pointer = nil): uint32 =
   if vifIdx >= MAX_VIFS.uint32 or
       not smTxFits(build, buf, sizeof(AuthFixedBodyView).uint32): return 0
   let body = cast[ptr AuthBodyDataView](buf)
   body.fixed = AuthFixedBodyView(authAlgo: authAlgo, authSeq: authSeq,
                                  statusCode: statusCode)
   let vif = vifChannelForIdx(vifIdx.uint8)
-  var bssid = vif.bssid
-  var empty = true
-  for value in bssid:
-    if value != 0: empty = false
-  if empty: bssid = vif.currentBssid
+  var bssid: array[6, uint8]
+  if peerOverride != nil:
+    bssid = cast[ptr array[6, uint8]](peerOverride)[]
+  else:
+    bssid = vif.bssid
+    let staIdx = vif.staIdx
+    if staIdx < STA_MGMT_FREE_STAS.uint8:
+      let sta = staInfoForIdx(staIdx)
+      # The archive passes sta_info_tab[vif.staIdx].macAddr to the SAE callback.
+      # A stale STA entry must not override a different, specific join target.
+      if not macPtrIsSpecific(addr bssid[0]) or
+          macPtrEquals(addr sta.macAddr[0], addr bssid[0]):
+        bssid = sta.macAddr
+    if not macPtrIsSpecific(addr bssid[0]):
+      bssid = vif.currentBssid
+  if not macPtrIsSpecific(addr bssid[0]): return 0
   var own = vif.macAddr
+  if ownOverride != nil:
+    own = cast[ptr array[6, uint8]](ownOverride)[]
   # Callback arguments must remain valid even if it replaces the connection.
   var passphrase: array[65, uint8]
   let connInfo = smEnvView().connectInfo
@@ -6342,9 +7177,12 @@ proc meBuildAssociateReq(buf, assocInfo, reassocBssid, capParam, cursorOut,
                          bodyLenOut, connInfo: pointer;
                          build: ptr SmTxBuildContext): uint32 =
   let hdrSize = if reassocBssid == nil: 4'u32 else: 10'u32
-  if assocInfo == nil or not smTxFits(build, buf, hdrSize): return 0
+  if cast[uint](capParam) >= MAX_VIFS.uint or assocInfo == nil or
+      not smTxFits(build, buf, hdrSize): return 0
   let assoc = vifAssocInfo(assocInfo)
-  if assoc.ssidLen > 32 or assoc.basicRates[0].int >= assoc.basicRates.len:
+  if assoc.ssidLen == 0 or assoc.ssidLen > 32 or
+      assoc.basicRates[0] == 0 or
+      assoc.basicRates[0].int >= assoc.basicRates.len:
     return 0
   let secFlags = assoc.securityFlags
   var listenInt = 5'u16
@@ -6362,7 +7200,7 @@ proc meBuildAssociateReq(buf, assocInfo, reassocBssid, capParam, cursorOut,
   var totalLen = hdrSize
 
   if not smTxFits(build, cursor, assoc.ssidLen.uint32 + 2): return 0
-  totalLen += me_add_ie_ssid(addr cursor, addr assoc.ssidData[0], assoc.ssidLen)
+  totalLen += me_add_ie_ssid(addr cursor, assoc.ssidLen, addr assoc.ssidData[0])
   if not smTxFits(build, cursor, 0): return 0
 
   let ratesPtr = cast[pointer](addr assoc.basicRates[0])
@@ -6372,7 +7210,7 @@ proc meBuildAssociateReq(buf, assocInfo, reassocBssid, capParam, cursorOut,
   if not smTxFits(build, cursor, 0): return 0
   if rateCount > 8:
     if not smTxFits(build, cursor, rateCount - 6): return 0
-    totalLen += me_add_ie_ext_supp_rates(addr cursor, ratesPtr, rateCount)
+    totalLen += me_add_ie_ext_supp_rates(addr cursor, ratesPtr)
     if not smTxFits(build, cursor, 0): return 0
 
   let assocIeSrc = cast[pointer](assoc.rsnIePtr)
@@ -6388,8 +7226,12 @@ proc meBuildAssociateReq(buf, assocInfo, reassocBssid, capParam, cursorOut,
 
   if (secFlags and 1) != 0:
     if not smTxFits(build, cursor, sizeof(WmmInfoIeView).uint32): return 0
-    let qosInfo = if connInfo != nil: connectInfoView(connInfo).qosInfo
-                  else: assoc.wmmQosInfo
+    let qosInfo =
+      if psEnvView().uapsdPeriod != 0 and
+          cast[int8](assoc.wmmQosInfo) < 0 and connInfo != nil:
+        connectInfoView(connInfo).qosInfo
+      else:
+        0'u8
     let wmm = wmmInfoIeAt(cursor)
     wmm.ie.id = 0xDD
     wmm.ie.len = 7
@@ -6415,7 +7257,7 @@ proc meBuildAssociateReq(buf, assocInfo, reassocBssid, capParam, cursorOut,
     cursor = cast[pointer](cast[uint](cursor) + vendorLen.uint)
     totalLen += vendorLen
     if not smTxFits(build, cursor, 0): return 0
-  if cursorOut != nil: cast[ptr pointer](cursorOut)[] = cursor
+  if cursorOut != nil: cast[ptr pointer](cursorOut)[] = cast[pointer](ieStart)
   if bodyLenOut != nil:
     cast[ptr uint16](bodyLenOut)[] = (cast[uint](cursor) - ieStart).uint16
   totalLen
@@ -6465,7 +7307,7 @@ proc me_build_associate_rsp_impl(buf: pointer, vifIdx: uint8,
   # Blob: lbu a4, 6(s2) -> rate count from staEntry+6 (first byte of rates struct)
   let rateCount = staAdd.rateCount
   if rateCount > 8:
-    totalLen += me_add_ie_ext_supp_rates(addr cursor, ratesPtr, rateCount.uint32)
+    totalLen += me_add_ie_ext_supp_rates(addr cursor, ratesPtr)
 
   # Check STA HT capabilities from staEntry+64 (blob: lw a5, 64(s2))
   let staCap = staAdd.flags
@@ -6504,7 +7346,6 @@ proc meBeaconFrameLength(vifIdx: uint8; hiddenSsid: uint8): uint64 =
   if (flags and 2) != 0: result += 28 + 24
   if vifApConfig(vif).privacyFlag == 2: result += 30
   if (flags and 1) != 0: result += 26
-  if appIeBeaconPtr != nil: result += appIeBeaconLen.uint64
 
 proc me_build_beacon*(buf: pointer, vifIdx: uint8, lenOut: ptr uint16,
                      flagsOut: ptr uint8, hiddenSsid: uint8): uint32 {.exportc, cdecl.} =
@@ -6563,7 +7404,7 @@ proc me_build_beacon*(buf: pointer, vifIdx: uint8, lenOut: ptr uint16,
   if hiddenSsid == 0:
     ssidArgPtr = ssidDataPtr
     ssidArgLen = vif.supportedRatesLong[0]
-  discard me_add_ie_ssid(addr ieBuf, ssidArgPtr, ssidArgLen)
+  discard me_add_ie_ssid(addr ieBuf, ssidArgLen, ssidArgPtr)
 
   # bodyLen tracks total from the IE start (buf) including the 36-byte header
   var bodyLen: uint32 = cast[uint32](cast[uint](ieBuf) - cast[uint](buf))
@@ -6571,11 +7412,6 @@ proc me_build_beacon*(buf: pointer, vifIdx: uint8, lenOut: ptr uint16,
   # Add Supported Rates IE -- pass rates pointer from VIF+436
   let ratesPtr = cast[pointer](addr vif.basicRates[0])
   bodyLen += me_add_ie_supp_rates(addr ieBuf, ratesPtr)
-
-  # Add Extended Supported Rates if > 8 rates
-  let rateCount = vif.basicRates[0]
-  if rateCount > 8:
-    bodyLen += me_add_ie_ext_supp_rates(addr ieBuf, ratesPtr, rateCount.uint32)
 
   # Add DS Parameter Set IE: compute channel from VIF channel frequency
   # Blob computes: channel = ((freq - 2412) / 5) + 1 for 2.4GHz
@@ -6598,6 +7434,11 @@ proc me_build_beacon*(buf: pointer, vifIdx: uint8, lenOut: ptr uint16,
     flagsOut[] = (timLen and 0xFF).uint8
   bodyLen += timLen
 
+  # Table 8-20: the optional Country goes after TIM, ahead of ERP.
+  bodyLen += me_add_ie_erp(addr ieBuf, 0)
+  if vif.basicRates[0] > 8:
+    bodyLen += me_add_ie_ext_supp_rates(addr ieBuf, ratesPtr)
+
   # Add WPA/RSN IE from VIF+492 (pre-built IE pointer) if present
   let sec = vifSecurity(vif)
   let wpaIePtr = cast[pointer](sec.rsnIePtr)
@@ -6605,9 +7446,6 @@ proc me_build_beacon*(buf: pointer, vifIdx: uint8, lenOut: ptr uint16,
     let wpaIeLen = sec.rsnIeLen
     ieBuf = copyIeBytes(ieBuf, wpaIePtr, wpaIeLen.uint)
     bodyLen += wpaIeLen.uint32
-
-  # Add ERP IE (blob: li a1,0 -> no protection)
-  bodyLen += me_add_ie_erp(addr ieBuf, 0)
 
   let flagsWord = apCfg.securityFlags
   if (flagsWord and 2) != 0:
@@ -6619,11 +7457,6 @@ proc me_build_beacon*(buf: pointer, vifIdx: uint8, lenOut: ptr uint16,
   if (flagsWord and 1) != 0:
     ieBuf = writeWmmParameterIe(ieBuf, vif)
     bodyLen += sizeof(WmmParameterIeView).uint32
-
-  # Add application beacon IEs if registered
-  if appIeBeaconLen > 0 and appIeBeaconPtr != nil:
-    ieBuf = copyIeBytes(ieBuf, appIeBeaconPtr, appIeBeaconLen.uint)
-    bodyLen += appIeBeaconLen.uint32
 
   return bodyLen
 
@@ -6647,11 +7480,9 @@ proc meProbeResponseLength(vifIdx: uint8): uint32 =
     result += 28 + 24
   if (config.securityFlags and 1) != 0:
     result += sizeof(WmmParameterIeView).uint32
-  if appIeProbeRespPtr != nil:
-    result += appIeProbeRespLen.uint32
 
 proc meBuildProbeResponse(buf: pointer; vifIdx: uint8; capacity: uint32;
-                          lenOut: ptr uint16): uint32 =
+                          lenOut: ptr uint16; countryAt: ptr uint16 = nil): uint32 =
   ## Build probe response frame IEs.
   ## From blob (202 instrs): builds probe response frame body.
   ## buf points to the probe response body (after MAC header).
@@ -6660,11 +7491,20 @@ proc meBuildProbeResponse(buf: pointer; vifIdx: uint8; capacity: uint32;
   ## The caller holds interrupts from the size check through serialization.
   if lenOut != nil:
     lenOut[] = 0
+  if countryAt != nil:
+    countryAt[] = 0
   let required = meProbeResponseLength(vifIdx)
   if buf == nil or required == 0 or required > capacity or
       required > high(uint16).uint32:
     return 0
   let vif = vifChannelForIdx(vifIdx)
+  let chanPtr = vif.operChan
+  let chan = cast[ptr ScanChannelEntry](chanPtr)
+  let chanFreq = chan.prim20Freq
+  let chanBand = chan.band
+  let chanNum = phy_freq_to_channel(chanBand, chanFreq)
+  if chanNum == 0:
+    return 0
   let apCfg = vifApConfig(vif)
   let privacy = apCfg.privacyFlag
   let frame = probeRspFixedBodyView(buf)
@@ -6687,41 +7527,25 @@ proc meBuildProbeResponse(buf: pointer; vifIdx: uint8; capacity: uint32;
   # Add SSID IE from VIF+386 (length) and VIF+387 (data)
   let ssidLen = vif.supportedRatesLong[0]
   let ssidDataPtr = cast[pointer](addr vif.supportedRatesLong[1])
-  var bodyLen: uint32 = me_add_ie_ssid(addr ieBuf, ssidDataPtr, ssidLen)
+  var bodyLen: uint32 = me_add_ie_ssid(addr ieBuf, ssidLen, ssidDataPtr)
 
   # Add Supported Rates IE -- pass rates pointer from VIF+436
   let ratesPtr = cast[pointer](addr vif.basicRates[0])
   bodyLen += me_add_ie_supp_rates(addr ieBuf, ratesPtr)
 
-  # Add Extended Supported Rates if > 8 rates
-  let rateCount = vif.basicRates[0]
-  if rateCount > 8:
-    bodyLen += me_add_ie_ext_supp_rates(addr ieBuf, ratesPtr, rateCount.uint32)
-
   # Add 12 for the header (timestamp+interval+capability = 12 bytes)
   # Blob: addi s0,s0,12 at this point
   bodyLen += 12
 
-  # Add DS Parameter Set IE: use phy_freq_to_channel (unlike beacon which
-  # computes inline). Blob: lbu a0,2(a5) -> band; lhu a1,0(a5) -> freq;
-  # call phy_freq_to_channel
-  let chanPtr = vif.operChan
-  let chan = cast[ptr ScanChannelEntry](chanPtr)
-  let chanFreq = chan.prim20Freq
-  let chanBand = chan.band
-  let chanNum = phy_freq_to_channel(chanBand, chanFreq)
-  let dsLen = me_add_ie_ds(addr ieBuf, chanNum)
-
-  # Add RSN IE unconditionally (blob: a1=privacy as secMode, at reloc 0xee)
-  # privacy from VIF+520 is passed as secMode; me_add_ie_rsn returns 0 if secMode==0
-  let rsnLen = me_add_ie_rsn(addr ieBuf, privacy)
-
-  # Add ERP IE (blob: a1=0, at reloc 0xfc)
-  let erpLen = me_add_ie_erp(addr ieBuf, 0)
-
-  # Accumulate ds+rsn+erp into bodyLen
+  bodyLen += me_add_ie_ds(addr ieBuf, chanNum)
+  # Table 8-27: Country precedes ERP and Extended Supported Rates.
+  if countryAt != nil:
+    countryAt[] = bodyLen.uint16
+  bodyLen += me_add_ie_erp(addr ieBuf, 0)
+  if vif.basicRates[0] > 8:
+    bodyLen += me_add_ie_ext_supp_rates(addr ieBuf, ratesPtr)
+  bodyLen += me_add_ie_rsn(addr ieBuf, privacy)
   let flagsWord = apCfg.securityFlags
-  bodyLen += dsLen + rsnLen + erpLen
 
   # Add HT Capabilities + HT Operation IEs (conditional on flagsWord bit 1)
   # Blob: beqz flagsWord&2 → skip HT IEs, jump to me_add_ie_wpa
@@ -6736,11 +7560,6 @@ proc meBuildProbeResponse(buf: pointer; vifIdx: uint8; capacity: uint32;
   if (flagsWord and 1) != 0:
     ieBuf = writeWmmParameterIe(ieBuf, vif)
     bodyLen += sizeof(WmmParameterIeView).uint32
-
-  # Add application probe response IEs if registered
-  if appIeProbeRespLen > 0 and appIeProbeRespPtr != nil:
-    ieBuf = copyIeBytes(ieBuf, appIeProbeRespPtr, appIeProbeRespLen.uint)
-    bodyLen += appIeProbeRespLen.uint32
 
   # Write total length output
   if lenOut != nil:
@@ -6762,11 +7581,11 @@ proc me_build_add_ba_req*(buf: pointer, param: pointer): uint32 {.exportc, cdecl
   ## [15]=buffer_size(u8), [16]=TID(u8), [17]=dialog_token(u8).
   ## Frame: [0]=category(3), [1]=action(0=ADDBA_REQ), [2]=dialog_token,
   ## [3..4]=BA_param_set(LE16), [5..6]=BA_timeout(LE16), [7..8]=start_seq(LE16).
+  if buf == nil or param == nil:
+    return 0
   let body = addBaReqActionBodyAt(buf)
   body.category = 3  # Block Ack
   body.action = 0    # ADDBA Request
-  if param == nil:
-    return 9
   let req = meAddBaReqParamView(param)
   body.dialogToken = req.dialogToken
   # The vendor advertises no A-MSDU. Bit 1 is BA policy, bits 2..5 are TID.
@@ -6786,6 +7605,8 @@ proc me_build_add_ba_rsp*(buf: pointer, unused: pointer, baParams: uint16,
   ## From blob (15 instrs): writes category, action, dialog token,
   ## status code, BA parameter set, and zero timeout.
   ## noinline: blob calls this as a real function.
+  if buf == nil:
+    return 0
   let body = addBaRspActionBodyAt(buf)
   body.category = 3  # Block Ack
   body.action = 1    # ADDBA Response
@@ -6799,16 +7620,16 @@ proc me_build_del_ba*(buf: pointer, baInfo: pointer, reasonCode: uint16): uint32
   ## Build DELBA action frame body (6 bytes).
   ## From blob (25 instrs): writes category=3, action=2, DELBA params, reason code.
   ## DELBA params: bit11 = initiator, bits 12-15 = TID.
+  if buf == nil or baInfo == nil:
+    return 0
   let body = delBaActionBodyAt(buf)
   body.category = 3  # Block Ack
   body.action = 2    # DELBA
   # Build DELBA Parameter Set
-  var delbaParams: uint16 = 0
-  if baInfo != nil:
-    let info = delBaInfoView(baInfo)
-    delbaParams = info.tid.uint16 shl 12
-    if info.initiator == 1:
-      delbaParams = delbaParams or 0x0800'u16  # set initiator bit
+  let info = delBaInfoView(baInfo)
+  var delbaParams = info.tid.uint16 shl 12
+  if info.initiator == 1:
+    delbaParams = delbaParams or 0x0800'u16  # set initiator bit
   body.delbaParams = delbaParams
   body.reasonCode = reasonCode
   return 6
@@ -6819,6 +7640,8 @@ proc me_build_capability*(param: pointer): uint16 {.exportc, cdecl.} =
   ## For STA (type 0), preserves Privacy (bit 4) and Short Preamble (bit 5)
   ## from the capability field at vif[434].
   ## Always sets ESS (bit 0) and short-slot-time (bit 10).
+  if cast[uint](param) >= MAX_VIFS.uint:
+    return 0
   let vifIdx = encodedArgU8(param)
   let vif = vifChannelForIdx(vifIdx)
   var cap = 1'u16  # ESS bit
@@ -6890,13 +7713,13 @@ proc me_legacy_ridx_min*(bitfield: uint32): uint8 {.exportc, cdecl.} =
 proc me_legacy_ridx_max*(bitfield: uint32): uint8 {.exportc, cdecl.} =
   ## Get maximum legacy rate index.
   ## From blob (15 instrs): scans bitfield from bit 11 downward, returns index
-  ## of highest set bit. Returns 12 if no bits set.
+  ## of highest set bit. Returns 12 for zero, 255 for nonzero high bits only.
   if bitfield == 0:
     return 12
   for legacyRateReverseBitIndex in countdown(11'i32, 0):
     if ((bitfield shr legacyRateReverseBitIndex.uint32) and 1) != 0:
       return legacyRateReverseBitIndex.uint8
-  return 12
+  return 255
 
 proc me_rate_bitfield_vht_build*(rxMap, txMap: uint32): uint32 {.exportc, cdecl.} =
   ## Intersect the two-bit RX/TX MCS fields until either map ends support.
@@ -6918,9 +7741,9 @@ proc me_get_basic_rates*(rates, outputBuf: pointer) {.exportc, cdecl.} =
     return
   let rateSet = rateSetAt(rates)
   let output = rateSetAt(outputBuf)
-  let rateCount = rateSet.count
   # Clear output count
   output.count = 0
+  let rateCount = rateSet.count
   if rateCount > 12:
     return
   # Iterate rate set
@@ -6936,7 +7759,7 @@ proc me_get_basic_rates*(rates, outputBuf: pointer) {.exportc, cdecl.} =
     rateIndex += 1
 
 proc me_freq_to_chan_ptr*(band: uint8, freq: uint16): pointer {.exportc, cdecl.} =
-  ## Convert band+frequency to channel context pointer — blob me_mgmtframe.o
+  ## Convert band+frequency to channel context pointer — blob me.o
   ## (84 bytes). Blob assertion shape:
   ##   if band != 0: assert_err("me.c", "me.c", 113)
   ##   count = me_env[0x7c]
@@ -6948,7 +7771,10 @@ proc me_freq_to_chan_ptr*(band: uint8, freq: uint16): pointer {.exportc, cdecl.}
   ## enforces that invariant. Matching the blob's shape.
   if band != 0:
     assert_err("me.c", "me.c", 113)
+    return nil
   let chanConfig = meChannelConfigView()
+  if chanConfig.count.int > chanConfig.entries.len:
+    return nil
   for channelConfigIndex in 0 ..< chanConfig.count.int:
     let channelConfigEntry = addr chanConfig.entries[channelConfigIndex]
     if channelConfigEntry.freq == freq:
@@ -6967,32 +7793,24 @@ proc me_extract_rate_set*(ieBuf: pointer, ieLen: uint32, rateOut: pointer) {.exp
   if suppRatesIe == nil:
     return
 
-  let sr = cast[ptr MacIeView](suppRatesIe)
-  let srRates = sr.macIePayload
-  let srCount = sr.len
-  if srCount > 12:
-    return  # malformed: too many rates
-
-  for rateIndex in 0 ..< srCount.int:
-    output.rates[rateIndex] = srRates[rateIndex]
-  output.count = srCount
+  var rates: array[12, uint8]
+  let srCount = readLegacyRateIe(cast[ptr MacIeView](suppRatesIe), 0, rates)
+  if srCount < 0: return
+  for i in 0 ..< srCount: output.rates[i] = rates[i]
+  output.count = srCount.uint8
 
   # Find Extended Supported Rates IE (ID=50)
   let extRatesIe = mac_ie_find(ieBuf, ieLen, 50)
   if extRatesIe == nil:
     return
 
-  let er = cast[ptr MacIeView](extRatesIe)
-  let erRates = er.macIePayload
-  let erCount = er.len
-  let totalCount = srCount.uint + erCount.uint
-  if totalCount > 12:
+  let totalCount = readLegacyRateIe(cast[ptr MacIeView](extRatesIe), srCount, rates)
+  if totalCount < 0:
     assert_err("me_mgmtframe.c", "me_mgmtframe.c", 897)
     # Platform diagnostics may return after replacing input or output storage.
     return
 
-  for extRateIndex in 0 ..< erCount.int:
-    output.rates[srCount.int + extRateIndex] = erRates[extRateIndex]
+  for i in srCount ..< totalCount: output.rates[i] = rates[i]
   output.count = totalCount.uint8
 
 proc me_extract_country_reg*(ieBuf: pointer, ieLen: uint32, out_ptr: pointer) {.exportc, cdecl.} =
@@ -7068,19 +7886,29 @@ proc me_extract_csa*(ieBuf: pointer, ieLen: uint32, switchModeOut: pointer,
     if secondary.ie.len != 1:
       return 0
     secondaryOffset = secondary.mode
+    if secondaryOffset notin [0'u8, 1'u8, 3'u8]:
+      return 0
 
   let band = if newChan < 15: 0'u8 else: 1'u8
   let primaryFreq = phy_channel_to_freq(band, newChan)
+  if primaryFreq == 0xFFFF'u16:
+    return 0
   var parsed = CsaOutputView(band: band, bandwidth: width,
     primaryFreq: primaryFreq, centerFreq1: primaryFreq)
   if wbcsInner != nil:
     parsed.centerFreq1 = phy_channel_to_freq(band, centerChannel1)
+    if parsed.centerFreq1 == 0xFFFF'u16:
+      return 0
     if centerChannel2 != 0:
       parsed.centerFreq2 = phy_channel_to_freq(band, centerChannel2)
+      if parsed.centerFreq2 == 0xFFFF'u16:
+        return 0
   elif secondaryOffset == 1 or secondaryOffset == 3:
     parsed.bandwidth = 1
     parsed.centerFreq1 = if secondaryOffset == 1: primaryFreq + 10'u16
                         else: primaryFreq - 10'u16
+    if not scanChannelValid(band, parsed.centerFreq1):
+      return 0
   cast[ptr uint8](switchModeOut)[] = switchMode
   cast[ptr CsaOutputView](csaOut)[] = parsed
   if switchCount == 0: 2'u8 else: switchCount
@@ -7279,6 +8107,7 @@ proc me_mic_end*(ctx: pointer) {.exportc, cdecl.} =
   if nBytes > 3:
     # Blob uses assert_err, not assert_rec.
     assert_err("me_mic.c", "me_mic.c", 323)
+    return
   # Pad with 0x5A at the current byte position
   let padShift = nBytes.uint32 * 8
   let padded = pending or (0x5A'u32 shl padShift)

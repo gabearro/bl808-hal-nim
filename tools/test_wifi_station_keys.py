@@ -549,7 +549,7 @@ def test_hardware_key_slots_and_return(tmp_path: Path, mode: str, mutation: str 
     elif mutation == "pn_length":
         body = body.replace("req.macLen > 8", "false")
     elif mutation == "idle":
-        body = body.replace("not waitMachwSecurityControlClear(0xE0000000'u32)", "false")
+        body = body.replace("if not idleReady or not current():", "if not current():")
     elif mutation == "done":
         body = body.replace("if not completed:", "if false:")
     elif mutation == "invalidate":
@@ -565,3 +565,68 @@ def test_hardware_key_slots_and_return(tmp_path: Path, mode: str, mutation: str 
     if mutation is not None:
         assert body != before, mutation
     run_nim(tmp_path, harness(WRITE_PLATFORM, body) + WRITE_CHECKS, mode, mutation)
+
+
+def test_key_write_timing_keeps_outcomes_and_handles_wrap(tmp_path: Path) -> None:
+    mm = (FW / "kernel_mac_channel.nim").read_text()
+    body = proc_body(mm, "mm_sec_machwkey_wr")
+    platform = r'''
+const ClicMtimeBase = 0xE000BFF8'u
+var fakeUs: uint32
+var wifiKeyWriteTiming: array[2, array[6, uint32]]
+proc regRead(addrReg: uint): uint32 =
+  doAssert addrReg == ClicMtimeBase and not irq
+  fakeUs
+'''
+    run_nim(tmp_path, "{.define: bl808WifiDiagKeyWriteTiming.}\n" +
+            harness(WRITE_PLATFORM, platform, proc_body(mm, "recordKeyWriteTiming"), body) + r'''
+setup()
+fakeUs = high(uint32) - 2
+hook = proc(phase: string) =
+  fakeUs += (if phase == "idle": 4'u32 else: 7'u32)
+var req = requestFor()
+doAssert mm_sec_machwkey_wr(addr req) == 8 and irq
+doAssert wifiKeyWriteTiming[0] == [1'u32, 4, 7, 11, 0, 0]
+
+setup()
+idleSucceeds = false
+hook = proc(phase: string) =
+  doAssert phase == "idle"
+  fakeUs += 20
+req = requestFor(2, true)
+doAssert mm_sec_machwkey_wr(addr req) == 0xFF and irq
+doAssert wifiKeyWriteTiming[1] == [1'u32, 20, 0, 20, 1, 0]
+
+setup()
+completionSucceeds = false
+hook = proc(phase: string) =
+  fakeUs += (if phase == "idle": 3'u32 else: 18'u32)
+doAssert mm_sec_machwkey_wr(addr req) == 0xFF and irq
+doAssert wifiKeyWriteTiming[1] == [2'u32, 20, 18, 21, 1, 1]
+doAssert wifiKeyWriteTiming[0] == [1'u32, 4, 7, 11, 0, 0]
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_hardware_key_rejects_oversized_receive_pn(tmp_path: Path, mode: str) -> None:
+    mm = (FW / "kernel_mac_channel.nim").read_text()
+    body = proc_body(mm, "mm_sec_machwkey_wr")
+    checks = r'''
+for cipher in [1'u8, 2'u8, 5'u8]:
+  for group in [false, true]:
+    if cipher == 5 and not group: continue
+    for highByte in 0 .. 1:
+      setup()
+      var req = requestFor(cipher, group)
+      req.macAddrCipherPadding[highByte] = 1
+      let original = req
+      doAssert mm_sec_machwkey_wr(addr req) == 0xFF
+      doAssert req == original and events.len == 0 and not installed and irq
+    setup()
+    var req = requestFor(cipher, group)
+    req.macLen = 8
+    req.macAddr[5] = 0xFF
+    doAssert mm_sec_machwkey_wr(addr req) != 0xFF,
+      "eight-byte replay field with zero upper bytes was rejected"
+'''
+    run_nim(tmp_path, harness(WRITE_PLATFORM, body) + checks, mode)

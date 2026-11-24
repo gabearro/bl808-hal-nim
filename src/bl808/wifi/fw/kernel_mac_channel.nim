@@ -85,11 +85,12 @@ proc co_list_extract*(list: ptr CoList, elem: ptr CoListHdr) {.exportc, cdecl.} 
 
 proc co_list_find*(list: ptr CoList, elem: ptr CoListHdr): bool {.exportc, cdecl.} =
   ## Return true if element is in the list.
+  ## The archive compares the terminator too, so find(nil) succeeds.
   var currentNode = list.first
-  while currentNode != nil:
-    if currentNode == elem: return true
+  while currentNode != elem:
+    if currentNode == nil: return false
     currentNode = currentNode.next
-  return false
+  return true
 
 proc co_list_cnt*(list: ptr CoList): uint32 {.exportc, cdecl.} =
   ## Count elements in the list.
@@ -191,11 +192,8 @@ proc co_list_remove*(list: ptr CoList, previousNode: ptr CoListHdr, elem: ptr Co
     # elem is the first element — blob does NOT assert on list.first mismatch
     # here (only 3 asserts at lines 360/361/362); previous Nim added an
     # extra line-363 assert.
-    # Unlink from front
+    # As with co_list_pop_front, removing the final head leaves last stale.
     list.first = elem.next
-    # If elem was the only element, clear list.last too
-    if list.last == elem:
-      list.last = nil
   # Clear removed element's next pointer
   elem.next = nil
 
@@ -359,13 +357,12 @@ template keEnvPsFlags(): ptr KeEnvPsFlagsView =
 
 proc ke_evt_field_get*(): uint32 {.exportc: "nimfw_ke_evt_field_get", cdecl.} =
   ## Live ke-event field snapshot for the host diag (TX-dead wedge forensics).
-  keEvtField
+  keEnvEventField()[]
 
 proc ke_evt_set*(evtBit: uint32) {.exportc, cdecl.} =
   ## Set event bit(s) in the kernel event field (interrupt-safe).
   let savedIrqState = irqSave()
-  let updatedEventField = keEvtField or evtBit
-  keEvtField = updatedEventField
+  let updatedEventField = keEnvEventField()[] or evtBit
   keEnvEventField()[] = updatedEventField
   if (evtBit and 0x98000000'u32) != 0:
     nimFwTrace2U32("[WIFI-NIMFW] evt_set ", evtBit, updatedEventField)
@@ -376,8 +373,7 @@ proc ke_evt_clear*(evtBit: uint32) {.exportc, cdecl, noinline.} =
   ## noinline: blob keeps this as a standalone function.
   {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
   let savedIrqState = irqSave()
-  let updatedEventField = keEvtField and (not evtBit)
-  keEvtField = updatedEventField
+  let updatedEventField = keEnvEventField()[] and (not evtBit)
   keEnvEventField()[] = updatedEventField
   if (evtBit and 0x98000000'u32) != 0:
     nimFwTrace2U32("[WIFI-NIMFW] evt_clear ", evtBit, updatedEventField)
@@ -392,11 +388,7 @@ proc eventIndex32(x: uint32): uint32 {.inline.} =
   {.emit: [clzResult, " = __builtin_clz(", eventField, ");"].}
   return clzResult.uint32
 
-proc ke_evt_schedule*() {.exportc, cdecl.} =
-  ## Process the highest-priority pending event by calling its handler.
-  ## From blob: uses clz to find the highest set bit, asserts bit < KE_EVT_MAX,
-  ## then dispatches through keEvtHandlers[bit] with indirect call.
-  let pendingEventField = keEvtField
+proc keDispatchEvent(pendingEventField: uint32) =
   if pendingEventField == 0: return
   let eventIndex = eventIndex32(pendingEventField)
   nimFwTrace2U32("[WIFI-NIMFW] evt_sched ", pendingEventField, eventIndex)
@@ -410,11 +402,17 @@ proc ke_evt_schedule*() {.exportc, cdecl.} =
   let eventHandler = cast[proc(param: pointer) {.cdecl.}](handler)
   eventHandler(keEvtHandlers[eventIndex].param)
 
+proc ke_evt_schedule*() {.exportc, cdecl.} =
+  ## Vendor dispatch picks the highest posted bit through the handler table.
+  keDispatchEvent(keEnvEventField()[])
+
 # ###########################################################################
 #                      KERNEL: MESSAGES (ke_msg_*)
 # ###########################################################################
 
 # TIM lifetime metadata shares the allocation but stays beyond the wire payload.
+proc mmConnLossForget(header: pointer)
+
 proc mmTimAllocationSize(id: uint16; destination: uint8; length: uint32): uint32 =
   if id != MM_TIM_UPDATE_REQ or destination != TASK_MM:
     return length
@@ -574,6 +572,7 @@ proc ke_msg_send*(param: pointer) {.exportc, cdecl, noinline.} =
     nimFwTrace("[WIFI-NIMFW] ke_msg_send external done")
     # Tail-call through ops function table for message free/schedule
     mmTimForget(cast[pointer](hdr))
+    mmConnLossForget(cast[pointer](hdr))
     rxMgtForget(cast[pointer](hdr))
     smCleanupForget(cast[pointer](hdr))
     smBssForget(cast[pointer](hdr))
@@ -599,18 +598,20 @@ proc ke_msg_send_basic*(id: uint16, destId: uint8, srcId: uint8) {.exportc, cdec
 
 proc ke_msg_alloc_reply*(request: pointer, id: uint16, length: uint32): pointer =
   ## Keep private request ownership outside the wire payloads.
-  result = meTakeControlReply(request, id, length)
-  if result == nil and smBssOwnsRequest(request):
+  if request == nil:
+    return nil
+  if request == meControlCommand:
+    return meTakeControlReply(request, id, length)
+  if smBssOwnsRequest(request):
     return smBssTakeReply(request, id, length)
-  if result == nil and smCleanupOwnsRequest(request):
+  if smCleanupOwnsRequest(request):
     return smCleanupTakeReply(request, id, length)
-  if result == nil and smActivationOwnsRequest(request):
+  if smActivationOwnsRequest(request):
     return smActivationTakeReply(request, id, length)
-  if result == nil:
-    result = apmTakeStartReply(request, id, length)
-  if result == nil:
-    let header = keMsgHdrFromPayload(request)
-    result = ke_msg_alloc(id, header.srcId, header.destId, length)
+  if request == apmStartRequest:
+    return apmTakeStartReply(request, id, length)
+  let header = keMsgHdrFromPayload(request)
+  ke_msg_alloc(id, header.srcId, header.destId, length)
 
 proc ke_msg_send_basic_reply*(request: pointer, id: uint16) =
   let reply = ke_msg_alloc_reply(request, id, 0)
@@ -640,11 +641,166 @@ template platformFree(p: pointer) =
     blOpsFunc(0xBC))
   pfFn(p)
 
+type
+  ScanDwellPair = object
+    start, finish: pointer
+  ScanDwellRetired = object
+    pair: ScanDwellPair
+    retained: pointer
+    queued: ptr ScanDwellPosted
+  ScanDwellPosted = object
+    next: ptr ScanDwellPosted
+    payload: pointer
+    serial: uint32
+    cancelled: bool
+
+var
+  scanDwellHeld {.wifiCtrl.}: ScanDwellPair
+  scanDwellRequest {.wifiCtrl.}: pointer
+  scanDwellOwnsLower {.wifiCtrl.}: bool
+  scanDwellEpoch, scanDwellSerial, scanDwellSlot {.wifiCtrl.}: uint32
+  scanDwellResetEpoch {.wifiCtrl.}: uint32
+  scanDwellChannel {.wifiCtrl.}: uint8
+  scanDwellPostedHead {.wifiCtrl.}: ptr ScanDwellPosted
+
+proc scanDwellDispose(pair: var ScanDwellPair) =
+  let old = pair
+  pair = default(ScanDwellPair)
+  for p in [old.start, old.finish]:
+    if p != nil: ke_msg_free(keMsgHdrFromPayload(p))
+
+proc scanDwellReserve(pair: var ScanDwellPair): bool =
+  # The dispatcher sees basic messages. Only our allocator uses the storage
+  # beyond paramLen, as an intrusive tag while a notification is in flight.
+  for id in [MM_SCAN_CHANNEL_START_IND, MM_SCAN_CHANNEL_END_IND]:
+    const storage = KeMsgTailSlack + (alignof(ScanDwellPosted) - 1 + sizeof(ScanDwellPosted)).uint32
+    let p = ke_msg_try_alloc(id, TASK_SCAN, TASK_NONE, storage)
+    if p == nil: return false
+    keMsgHdrFromPayload(p).paramLen = 0
+    if id == MM_SCAN_CHANNEL_START_IND: pair.start = p
+    else: pair.finish = p
+  true
+
+proc scanDwellInstall(pair: var ScanDwellPair; slot: uint32; admitting = false) =
+  # Caller commits the lower request and the two envelopes under one lock.
+  inc scanDwellSerial
+  swap(scanDwellHeld, pair)
+  scanDwellOwnsLower = admitting or (scanDwellOwnsLower and
+    scanDwellRequest == scan_env.paramPtr and scanDwellEpoch == scanRequestEpoch)
+  scanDwellRequest = scan_env.paramPtr
+  scanDwellEpoch = scanRequestEpoch
+  scanDwellChannel = scan_env.channelIndex
+  scanDwellSlot = slot
+
+proc scanDwellCurrent(): bool =
+  scanDwellRequest != nil and scanDwellRequest == scan_env.paramPtr and
+    scanDwellEpoch == scanRequestEpoch and scanDwellChannel == scan_env.channelIndex
+
+proc scanDwellPublish(id: uint16; slot: uint32) =
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if not scanDwellCurrent() or slot != scanDwellSlot: return
+  if id == MM_SCAN_CHANNEL_END_IND and scanDwellHeld.start != nil:
+    # An inline expiry of the newly armed operating timer is already an
+    # entered dwell. Preserve START-before-END even in that case.
+    let serial = scanDwellSerial
+    scanDwellPublish(MM_SCAN_CHANNEL_START_IND, slot)
+    if serial != scanDwellSerial or not scanDwellCurrent(): return
+  let cell = if id == MM_SCAN_CHANNEL_START_IND: addr scanDwellHeld.start
+             else: addr scanDwellHeld.finish
+  let p = cell[]
+  if p == nil: return
+  cell[] = nil
+  const mask = alignof(ScanDwellPosted).uint - 1
+  let tag = cast[ptr ScanDwellPosted]((cast[uint](p) + KeMsgTailSlack.uint + mask) and not mask)
+  tag[] = ScanDwellPosted(next: scanDwellPostedHead, payload: p, serial: scanDwellSerial)
+  scanDwellPostedHead = tag
+  when defined(bl808WifiDiagWarmScan):
+    if id == MM_SCAN_CHANNEL_START_IND: inc nimFwDbgWarmScan.start_posted
+    else: inc nimFwDbgWarmScan.end_posted
+  ke_msg_send(p)
+
+proc scanDwellClaim(p: pointer): bool =
+  # Untagged direct calls keep the exported handler contract. A queued tag
+  # belongs to its logical dwell even after channel slot 3 has been retired.
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  var link = addr scanDwellPostedHead
+  while link[] != nil:
+    let tag = link[]
+    if tag.payload == p:
+      link[] = tag.next
+      return not tag.cancelled and tag.serial == scanDwellSerial and scanDwellCurrent()
+    link = addr tag.next
+  true
+
+proc scanDwellDetach(): ScanDwellPair =
+  inc scanDwellSerial
+  scanDwellRequest = nil
+  scanDwellOwnsLower = false
+  result = scanDwellHeld
+  scanDwellHeld = default(ScanDwellPair)
+
+proc scanDwellForget(header: pointer) =
+  if scanDwellPostedHead != nil:
+    discard scanDwellClaim(keMsgPayload(cast[ptr KeMsgHdr](header)))
+
+var mmEdcaRefresh: tuple[message, context: pointer; vif: uint8;
+                         vifEpoch, bindingEpoch, resetEpoch: uint32]
+var chanCtxtLinkEpochs {.wifiCtrl.}: array[MAX_VIFS, uint32]
+
+type MmConfigIdlePhase = enum
+  mmConfigNoIdle, mmConfigAwaitIdle, mmConfigIdleReady
+
+type MmIdleRestoreGuard = proc(): bool {.nimcall.}
+
+var mmConfigIdle: tuple[owner: pointer; epoch: uint32; phase: MmConfigIdlePhase;
+                        switchGuard: MmIdleRestoreGuard]
+
+proc mmConfigTrackIdle(owner: pointer; mode, state: uint8;
+                       switchGuard: MmIdleRestoreGuard = nil): uint32 =
+  let mm = mmEnvView()
+  mm.hardwareMode = mode
+  mm.previousState = state
+  inc mmConfigIdle.epoch
+  mmConfigIdle.owner = owner
+  mmConfigIdle.phase = mmConfigAwaitIdle
+  mmConfigIdle.switchGuard = switchGuard
+  mmConfigIdle.epoch
+
+proc mmConfigCancelIdle() =
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if mmConfigIdle.phase != mmConfigNoIdle:
+    let mm = mmEnvView()
+    mm.hardwareMode = 0
+    mm.previousState = 0
+  inc mmConfigIdle.epoch
+  mmConfigIdle.owner = nil
+  mmConfigIdle.phase = mmConfigNoIdle
+  mmConfigIdle.switchGuard = nil
+
+proc mmConfigForgetIdleOwner(header: pointer): bool =
+  if header == nil or mmConfigIdle.owner != header: return false
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if mmConfigIdle.owner != header: return false
+  mmConfigIdle.owner = nil
+  mmConfigIdle.phase == mmConfigIdleReady
+
+proc mmEdcaForget(header: pointer) =
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if header == mmEdcaRefresh.message:
+    mmEdcaRefresh.message = nil
+
 proc ke_msg_free*(param: pointer) {.exportc, cdecl.} =
   ## Free a kernel message. Blob: tail-calls `g_bl_ops_funcs[0xBC](param)`
   ## — param is already the HEADER pointer (callers subtract 12 before
   ## calling).
+  scanDwellForget(param)
   mmTimForget(param)
+  mmConnLossForget(param)
   rxMgtForget(param)
   smCleanupForget(param)
   smBssForget(param)
@@ -657,7 +813,11 @@ proc ke_msg_free*(param: pointer) {.exportc, cdecl.} =
   smRspTimerForget(param)
   smDeferredForget(param)
   smAbortForget(param)
+  mmEdcaForget(param)
+  let resumePending = mmConfigForgetIdleOwner(param)
   platformFree(param)
+  if resumePending:
+    ke_evt_set(KE_EVT_KE_MESSAGE)
 
 proc ke_msg_free_payload(param: pointer) {.inline.} =
   if param != nil:
@@ -681,8 +841,9 @@ proc ke_queue_extract*(queue: ptr CoList, cmpFn: proc(elem: ptr CoListHdr, param
   var previousNode: ptr CoListHdr = nil
   var currentNode = queue.first
   while currentNode != nil:
+    let matches = cmpFn(currentNode, param)
     let nextNode = currentNode.next
-    if cmpFn(currentNode, param):
+    if matches:
       if previousNode == nil:
         queue.first = nextNode
       else:
@@ -699,8 +860,62 @@ proc ke_queue_extract*(queue: ptr CoList, cmpFn: proc(elem: ptr CoListHdr, param
 #                      KERNEL: INIT / FLUSH
 # ###########################################################################
 
+proc scanDwellBeginReset(): ScanDwellRetired =
+  # Under the IRQ lock, take only the lower request committed to KeMsgNoFree.
+  if scanDwellOwnsLower and scanDwellRequest == scan_env.paramPtr and
+      scanDwellEpoch == scanRequestEpoch:
+    inc scanDwellResetEpoch
+    result.retained = scanDwellRequest
+  result.pair = scanDwellDetach()
+  proc matches(node: ptr CoListHdr; header: pointer): bool {.cdecl.} =
+    cast[pointer](node) == header
+  var link = addr scanDwellPostedHead
+  while link[] != nil:
+    let tag = link[]
+    let header = keMsgHdrFromPayload(tag.payload)
+    if not tag.cancelled and (
+        ke_queue_extract(addr keMsgQueueSent, matches, header) != nil or
+        ke_queue_extract(addr keMsgQueueSaved, matches, header) != nil):
+      link[] = tag.next
+      tag.next = result.queued
+      result.queued = tag
+    else:
+      # The dispatcher already popped it. Keep its tombstone until claim/free.
+      tag.cancelled = true
+      link = addr tag.next
+
+proc scanDwellFinishReset(old: var ScanDwellRetired) =
+  while old.queued != nil:
+    let tag = old.queued
+    old.queued = tag.next
+    ke_msg_free(keMsgHdrFromPayload(tag.payload))
+  scanDwellDispose(old.pair)
+  let retained = old.retained
+  old.retained = nil
+  if retained != nil: ke_msg_free(keMsgHdrFromPayload(retained))
+
+template scanDwellReset() =
+  # Detach before queue/slot reset. Defer callbacks until those are usable again.
+  let saved = irqSave()
+  var old = scanDwellBeginReset()
+  if old.retained != nil:
+    inc scanRequestEpoch
+    scan_env.paramPtr = nil
+    scan_env.abortFlag = 0
+  let epoch = scanRequestEpoch
+  irqRestore(saved)
+  defer:
+    let done = irqSave()
+    if old.retained != nil and scanRequestEpoch == epoch and scan_env.paramPtr == nil:
+      ke_state_set(TASK_SCAN, ScanIdleState)
+    irqRestore(done)
+    scanDwellFinishReset(old)
+
 proc ke_init*() {.exportc, cdecl.} =
   ## Initialize the kernel subsystem.
+  smSaQueryResetScope()
+  mmConfigCancelIdle()
+  scanDwellReset()
   smActivationCancel()
   chanSwitchCancel()
   keTimerCancelMutations(all = true)
@@ -719,6 +934,9 @@ proc ke_flush*() {.exportc, cdecl.} =
   ##   while (msg = co_list_pop_front(&ke_env.q_saved)) ke_msg_free(msg)
   ##   while (tmr = co_list_pop_front(&ke_env.tmr_free)) g_bl_ops_funcs.free(tmr)
   ##   ke_evt_clear(0xFFFFFFFF)  # tail call
+  smSaQueryResetScope()
+  mmConfigCancelIdle()
+  scanDwellReset()
   keTimerCancelMutations(all = true)
   chanSwitchCancel()
   smActivationCancel()
@@ -866,8 +1084,14 @@ proc ke_state_set*(taskId: uint8, state: uint16) {.exportc, cdecl.} =
     assert_err("ke_task.c", "ke_task.c", 177)
     return
   if taskId == 0 and state == 0:
-    rxlCntrlEnvView().processingFlag = 0
-    mmState = MM_IDLE
+    block:
+      let saved = irqSave()
+      defer: irqRestore(saved)
+      let rx = rxlCntrlEnvView()
+      rx.processingFlag = 0
+      mmState = MM_IDLE
+      if rx.queue.first != nil:
+        ke_evt_set(0x00100000'u32)
   # Early-out if state unchanged
   if sp[] == state: return
   sp[] = state
@@ -892,6 +1116,39 @@ proc ke_state_get*(taskId: uint8): uint16 {.exportc, cdecl.} =
     assert_err("ke_task.c", "ke_task.c", 206)
     return high(uint16)
   return state
+
+proc mmConfigResumeIdle(epoch: uint32; task: uint8; abandonedOnly = false): bool =
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if mmConfigIdle.epoch != epoch or mmConfigIdle.phase == mmConfigAwaitIdle or
+      (ke_evt_field_get() and 0x80000000'u32) != 0 or
+      ke_state_get(task) != MM_IDLE.uint16:
+    return false
+  if abandonedOnly and (mmConfigIdle.phase != mmConfigIdleReady or
+      mmConfigIdle.owner != nil or
+      (regRead(MACHW_STATE_CNTRL_REG) and 0xFF'u32) != 0):
+    return false
+  if mmConfigIdle.switchGuard != nil:
+    # Configuration can complete while the channel switch still owns idle.
+    if not abandonedOnly: return true
+    if not mmConfigIdle.switchGuard(): return false
+  let mm = mmEnvView()
+  let nextMode = mm.hardwareMode.uint32 shl 4
+  let nextState = mm.previousState.uint16
+  if (nextMode and not 0xF0'u32) != 0:
+    assert_err("(((uint32_t)nextstate << 4) & ~((uint32_t)0x000000F0)) == 0",
+               "module", 1465)
+    return false
+  if mmConfigIdle.phase == mmConfigIdleReady:
+    # Take the restore before publishing state or waking saved work.
+    mmConfigCancelIdle()
+  regWrite(MACHW_STATE_CNTRL_REG, nextMode)
+  ke_state_set(task, nextState)
+  true
+
+proc mmConfigResumeAbandonedIdle() =
+  if mmConfigIdle.phase == mmConfigIdleReady and mmConfigIdle.owner == nil:
+    discard mmConfigResumeIdle(mmConfigIdle.epoch, TASK_MM, abandonedOnly = true)
 
 proc ke_handler_search*(msgId: uint16, desc: ptr KeMsgHandlerDesc): pointer {.exportc, cdecl.} =
   ## Search a message handler descriptor for a matching handler.
@@ -1035,8 +1292,10 @@ proc ke_task_schedule*() {.exportc, cdecl.} =
     else:
       assert_err("ke_task.c", "ke_task.c", 345)
 
-  # Common tail: one IRQ-safe queue-empty check + ke_evt_clear
+  # Clear the drained message event first. If the idle owner retires after
+  # our restore check, its new message wake must survive this dispatch.
   keUpdateMessageEventAfterSchedule()
+  mmConfigResumeAbandonedIdle()
 
 proc ke_task_sm_activating*(): bool {.exportc, cdecl.} =
   ## Check if the SM task is currently in an activating state.
@@ -1127,12 +1386,14 @@ proc ke_timer_hw_set*(timerEntry: ptr KeTimerEntry) {.exportc, cdecl.} =
     if (stat and MACHW_TIMER_IRQ_BIT) == 0:
       regWrite(MACHW_INTC_IRQ_SET_REG, MACHW_TIMER_IRQ_BIT)
       stat = stat or MACHW_TIMER_IRQ_BIT
-    regWrite(MACHW_INTC_IRQ_STAT_REG, stat)
+      regWrite(MACHW_INTC_IRQ_STAT_REG, stat)
   irqRestore(saved)
 
 proc keTimerCancelMutations(id = 0'u16; task = 0'u8; all = false) =
   let saved = irqSave()
   defer: irqRestore(saved)
+  if all or keTimerExpiryKey == (id, task):
+    keTimerExpiryCurrent = false
   var operation = keTimerMutationTop
   while operation != nil:
     if all or (operation.id == id and operation.task == task):
@@ -1149,12 +1410,14 @@ proc keTimerEndMutation(operation: var KeTimerMutation) =
 
 proc ke_timer_try_set(taskId: uint16; instId: uint8; delay: uint32;
                       guard: KeTimerGuard = nil; context: pointer = nil;
-                      continuationUs: uint64 = 0): bool =
+                      continuationUs: uint64 = 0; saQuerySerial: uint32 = 0): bool =
   ## False reports rejection/allocation failure; a newer nested mutation wins
   ## without being treated as an allocation failure by the public wrapper.
   if delay == 0 or delay > KE_TIMER_MAX_DELAY: return false
-  if guard != nil and not guard(context): return false
   let saved = irqSave()
+  if guard != nil and not guard(context):
+    irqRestore(saved)
+    return false
   var operation: KeTimerMutation
   keTimerBeginMutation(operation, taskId, instId)
   let responseSerial = smRspTimerBegin(taskId, instId, continuationUs)
@@ -1199,6 +1462,7 @@ proc ke_timer_try_set(taskId: uint16; instId: uint8; delay: uint32;
   owned.id = taskId
   owned.taskId = instId
   owned.time = expiry
+  owned.saQuerySerial = saQuerySerial
   let entry = owned
   co_list_insert(addr keTimerQueue, cast[ptr CoListHdr](entry), cmp_abs_time)
   owned = nil
@@ -1221,12 +1485,8 @@ proc ke_timer_set*(taskId: uint16, instId: uint8, delay: uint32) {.exportc, cdec
   if not ke_timer_try_set(taskId, instId, delay):
     assert_err("ke_timer.c", "ke_timer.c", 128)
 
-proc ke_timer_clear*(taskId: uint16, instId: uint8) {.exportc, cdecl.} =
-  ## Remove a kernel timer.
-  ## From blob: if target is first entry, pops it and reprograms HW timer.
-  ## If not first, uses ke_queue_extract with cmp_timer_id (no HW reprogram
-  ## needed since first timer didn't change).
-  let saved = irqSave()
+proc keTimerClearLocked(taskId: uint16; instId: uint8; saved: uint32) =
+  ## Detach under the caller's lock and restore its IRQ state for callouts.
   smRspTimerClear(taskId, instId)
   var operation: KeTimerMutation
   keTimerBeginMutation(operation, taskId, instId)
@@ -1251,12 +1511,23 @@ proc ke_timer_clear*(taskId: uint16, instId: uint8) {.exportc, cdecl.} =
   let currentFirst = cast[ptr KeTimerEntry](keTimerQueue.first)
   if not operation.cancelled and currentFirst != nil and
       cast[int32](currentFirst.time - macTimeNow()) < 0:
+    # The diagnostic returns in this firmware; do not strand an overdue head.
+    ke_evt_set(KE_EVT_KE_TIMER)
     irqRestore(saved)
     assert_err("ke_timer.c", "ke_timer.c", 214)
     discard irqSave()
 
-proc keTimerExpired(entry: ptr KeTimerEntry): bool {.inline.} =
-  entry != nil and cast[int32](entry.time - macTimeNow() - 50) < 0
+proc ke_timer_clear*(taskId: uint16, instId: uint8) {.exportc, cdecl.} =
+  ## Remove a kernel timer and reprogram the hardware if the head changed.
+  keTimerClearLocked(taskId, instId, irqSave())
+
+proc keTimerExpired(entry: ptr KeTimerEntry; fromPoll: static bool = false): bool {.inline.} =
+  if entry == nil: return false
+  let remaining = entry.time - macTimeNow()
+  when fromPoll:
+    cast[int32](remaining) <= 0
+  else:
+    cast[int32](remaining - 50'u32) < 0
 
 proc ke_timer_schedule*() {.exportc, cdecl.} =
   ## Process expired timers.
@@ -1270,6 +1541,7 @@ proc ke_timer_schedule*() {.exportc, cdecl.} =
     keTimerScheduling = true
   defer:
     let saved = irqSave()
+    keTimerExpiryCurrent = false
     keTimerScheduling = false
     irqRestore(saved)
   var drained = 0'u32
@@ -1291,10 +1563,31 @@ proc ke_timer_schedule*() {.exportc, cdecl.} =
         let currentHead = cast[ptr KeTimerEntry](keTimerQueue.first)
         let now2 = macTimeNow()
         if cast[int32](currentHead.time - now2) >= 0: return
-      let popped = co_list_pop_front(addr keTimerQueue)
-      cast[ptr KeTimerEntry](popped)
-    if not smRspTimerDispatch(expiredTimerEntry):
-      ke_msg_send_basic(expiredTimerEntry.id, expiredTimerEntry.taskId, 0xFF)
+      # Allocation can reenter after the pop. A matching clear or rearm
+      # must still be able to retire this unpublished expiry.
+      let entry = cast[ptr KeTimerEntry](co_list_pop_front(addr keTimerQueue))
+      keTimerExpiryKey = (entry.id, entry.taskId)
+      keTimerExpiryCurrent = true
+      entry
+    if expiredTimerEntry.id == SM_SA_QUERY_TIMEOUT_IND_MSG and expiredTimerEntry.taskId == TASK_SM:
+      smSaQueryQueueTimeout(expiredTimerEntry.saQuerySerial)
+    elif not smRspTimerDispatch(expiredTimerEntry):
+      let id = expiredTimerEntry.id
+      let dest = expiredTimerEntry.taskId
+      # The repeat probe is optional; the channel timer owns dwell progress.
+      let message =
+        if id == SCAN_PROBE_TIMER and dest == TASK_SCAN:
+          ke_msg_try_alloc(id, dest, 0xFF, 0)
+        else:
+          ke_msg_alloc(id, dest, 0xFF, 0)
+      if message != nil:
+        let saved = irqSave()
+        if keTimerExpiryCurrent:
+          ke_msg_send(message)
+          irqRestore(saved)
+        else:
+          irqRestore(saved)
+          ke_msg_free(keMsgHdrFromPayload(message))
     platformFree(cast[pointer](expiredTimerEntry))
     inc drained
 
@@ -1327,19 +1620,23 @@ proc ke_timer_active*(taskId: uint16, instId: uint8): bool {.exportc, cdecl.} =
 # ###########################################################################
 
 proc bl_event_handle*(evtType: uint32) {.exportc, cdecl.} =
-  ## Handle a platform event (98 bytes in blob).
-  ## Blob: uses evtType as index into [0x80, 0x100] for ke_evt_clear bit,
-  ## then dispatches: evtType==0 -> bl_main_event_handle(0,0);
-  ## evtType!=0 -> bl_main_event_handle(evtType, &ke_env[28]), then memset(&ke_env[28], 0, 5).
+  ## Snapshot flow-control flags before the host callback so reentrant
+  ## publication cannot be erased by the old post-callback clear.
   proc bl_main_event_handle(a0: uint32, a1: pointer) {.importc, cdecl.}
-  let evtBit = if evtType != 0: 0x100'u32 else: 0x80'u32
-  ke_evt_clear(evtBit)
+  if evtType > 1'u32:
+    return
   if evtType == 0:
+    ke_evt_clear(0x80'u32)
     bl_main_event_handle(0, nil)
   else:
-    let keEnvFlags = keEnvPsFlags()
-    bl_main_event_handle(evtType, keEnvFlags)
-    discard c_memset(keEnvFlags, 0, 5.csize_t)
+    var pending: KeEnvPsFlagsView
+    block:
+      let saved = irqSave()
+      defer: irqRestore(saved)
+      ke_evt_clear(0x100'u32)
+      pending = keEnvPsFlags()[]
+      discard c_memset(keEnvPsFlags(), 0, sizeof(KeEnvPsFlagsView).csize_t)
+    bl_main_event_handle(evtType, addr pending)
 
 proc bl_fw_statistic_dump*() {.exportc, cdecl.} =
   ## Consume the statistics event before invoking any diagnostic callback.
@@ -1379,14 +1676,7 @@ proc bl60x_fw_dump_statistic*(forced: cint) {.exportc, cdecl.} =
 proc tcpip_stack_input(entry: pointer, descFlag: uint32, payload: pointer, bufOff: uint32, dmaArray: pointer, fcFlag: uint32): cint {.importc: "tcpip_stack_input", cdecl, raises: [Exception].}
   ## External: fast-path delivery of RX data frames to TCP/IP stack.
 
-proc bl808ApplyPureRfMacTimingBaseline() {.inline.} =
-  ## Match the passing vendor MAC timing state observed at the scan
-  ## mm_active edge. These timing registers directly gate RX/TX PHY delays.
-  regWrite(MACHW_BASE + 0x0E8'u, 0x00016809'u32)
-  regWrite(MACHW_BASE + 0x0F0'u, 0x05414002'u32)
-  regWrite(MACHW_BASE + 0x0F4'u, 0x0001900A'u32)
-  regWrite(MACHW_BASE + 0x0F8'u, 0x00028010'u32)
-  regWrite(MACHW_BASE + 0x104'u, 0x0C814028'u32)
+proc snapshotMacTimingRegisters() {.inline.} =
   nimFwDbgMacTimingE8 = regRead(MACHW_BASE + 0x0E8'u)
   nimFwDbgMacTimingF0 = regRead(MACHW_BASE + 0x0F0'u)
   nimFwDbgMacTimingF4 = regRead(MACHW_BASE + 0x0F4'u)
@@ -1523,7 +1813,7 @@ proc hal_machw_init*(): bool {.exportc, cdecl, discardable.} =
     let sifsTimeField = (sifsTimeControl shr 8) and 0xFFFF'u32  # extract bits[23:8]
     let scaled = ((sifsTimeField * newClk) div divisor) shl 8
     # Merge: keep bits[31:24] and bits[7:0], replace bits[23:8]
-    let preserved = sifsTimeControl and 0xFF0000FF'u32
+    let preserved = regRead(REG_0E8) and 0xFF0000FF'u32
     regWrite(REG_0E8, (scaled and 0x00FFFF00'u32) or preserved)
 
   # --- Set reg[0xEC] bits[27:20] = 0x27 (fixed, OR'd as 0x02700000) ---
@@ -1565,7 +1855,7 @@ proc hal_machw_init*(): bool {.exportc, cdecl, discardable.} =
     let machwTimingF4Control = regRead(REG_0F4)
     let timingF4Field = (machwTimingF4Control shr 8) and 0xFFFF'u32
     let scaled = ((timingF4Field * newClk) div divisor) shl 8
-    let preserved = machwTimingF4Control and 0xFF0000FF'u32
+    let preserved = regRead(REG_0F4) and 0xFF0000FF'u32
     regWrite(REG_0F4, (scaled and 0x00FFFF00'u32) or preserved)
 
   # --- Rescale reg[0xF8] bits[23:8] (16-bit field) ---
@@ -1573,7 +1863,7 @@ proc hal_machw_init*(): bool {.exportc, cdecl, discardable.} =
     let machwTimingF8Control = regRead(REG_0F8)
     let timingF8Field = (machwTimingF8Control shr 8) and 0xFFFF'u32
     let scaled = ((timingF8Field * newClk) div divisor) shl 8
-    let preserved = machwTimingF8Control and 0xFF0000FF'u32
+    let preserved = regRead(REG_0F8) and 0xFF0000FF'u32
     regWrite(REG_0F8, (scaled and 0x00FFFF00'u32) or preserved)
 
   # --- Rescale reg[0x104] bits[29:20] (10-bit field) ---
@@ -1641,11 +1931,14 @@ proc hal_machw_init*(): bool {.exportc, cdecl, discardable.} =
       return false
 
   # -----------------------------------------------------------------------
-  # Block 8: Debug init via function pointer (0x34c - 0x362)
-  # In blob: calls dbg_init(str, 2, 12, 8) through a function pointer.
-  # This is a debug/logging init call; skip in reimplementation.
+  # Block 8: Platform diagnostic before final MAC register configuration.
+  # The vendor calls g_bl_ops_funcs+4 (_printf), not a debug initializer.
   # -----------------------------------------------------------------------
-  # (no-op: debug init not critical for MAC HW operation)
+  let configPrintf = cast[proc(format: cstring; nVap, endIdx, startIdx: cint)
+    {.cdecl.}](blOpsFunc(4))
+  if configPrintf != nil:
+    configPrintf("[WF] [KEY] [CFG] nVAP is %d, endidx %d, startidx %d\r\n",
+                 2.cint, 12.cint, 8.cint)
 
   # -----------------------------------------------------------------------
   # Block 9: Final register configuration (0x364 - 0x45a)
@@ -1725,7 +2018,7 @@ proc hal_machw_init*(): bool {.exportc, cdecl, discardable.} =
   registerWriteback = regRead(REG_04C)
   registerWriteback = (registerWriteback and 0xFDFFFFFF'u32) or 0x02000000'u32
   regWrite(REG_04C, registerWriteback)
-  bl808ApplyPureRfMacTimingBaseline()
+  snapshotMacTimingRegisters()
   true
 
 proc hal_machw_reset*(): bool {.exportc, cdecl, discardable.} =
@@ -1735,6 +2028,7 @@ proc hal_machw_reset*(): bool {.exportc, cdecl, discardable.} =
   ## From blob: 0x44B00038 is STATE_CNTRL, 0x44B0004C is STATUS,
   ## 0x44B00054 is DOZE_CNTRL2, 0x44B08050-0x44B0808C are INTC regs.
 
+  mmConfigCancelIdle()
   # Read state register (touch / prefetch)
   discard regRead(MACHW_STATE_CNTRL_REG)
 
@@ -1803,6 +2097,7 @@ proc hal_machw_stop*(): bool {.exportc, cdecl, discardable.} =
   ## From blob: writes 1 to MACHW_INTC_SOFT_RESET (0x44B08050),
   ## then calls blmac_soft_reset_getf in a loop until it returns 0.
 
+  mmConfigCancelIdle()
   # Trigger soft reset
   regWrite(MACHW_INTC_SOFT_RESET, 1)
 
@@ -1829,6 +2124,8 @@ proc hal_machw_idle_req*() {.exportc, cdecl.} =
 
   # Save and disable interrupts
   let saved = irqSave()
+  # A previous hardware transition may already have posted this event.
+  ke_evt_clear(KE_EVT_IDLE)
 
   # Read current MAC timestamp, add 50000 (0xC350), write to abs timer target
   let tsNow = regRead(MACHW_TIMLO_REG)
@@ -2096,136 +2393,87 @@ proc hal_machw_gen_handler*() {.exportc, cdecl.} =
     assert_rec("hal_machw_gen_handler", "hal_machw.c", 707); return
 
 proc hal_machw_timing_info*() {.exportc, cdecl.} =
-  ## Read and report MAC HW timing register fields.
-  ##
-  ## Reverse-engineered from blob (210 instructions in hal_machw.o).
-  ## The original calls a debug-print module (function pointers at s0[4]/s0[8])
-  ## to dump each extracted field. We replicate the exact register reads and
-  ## bitfield extractions; the print calls are no-ops since the debug print
-  ## infrastructure is not reproduced.
-  ##
-  ## Registers read (all offsets from MACHW_BASE = 0x44B00000):
-  ##   0x0E4  Timing Set 1: txStartDelayOFDM[27:18], slotTime[17:8], macCoreClkFreq[7:0]
-  ##   0x0E8  Timing Set 2: txChainDelay[23:8], txDEDelay[7:0]
-  ##   0x0EC  Timing Set 3: rxRFDelay[29:20], txDelayRFOnOff[19:10], macProcDelay[9:0]
-  ##   0x0F0  Timing Set 4: radioWakeUpTime[31:22], radioChirpTime[21:12], clkDivider[1:0]
-  ##   0x0F4  Timing Set 5: ofdmRxStartDelay[23:8], ofdmRxChainDelay[7:0]
-  ##   0x0F8  Timing Set 6: dsssRxStartDelay[23:8], dsssRxChainDelay[7:0]
-  ##   0x0FC  Timing Set 7: edcaTriggerTimer[11:8], slotCounterAddr[7:0]
-  ##   0x100  Timing Set 8: sifsBDelay[31:24], sifsADelay[23:16], eifsDuration[15:8], slotTime2[7:0]
-  ##   0x104  Timing Set 9: txDMAProcDelay[29:20], rifsToDelay[19:10], rifsTOInMACClk[9:0]
+  ## Report timing fields in the order and bit widths used by hal_machw.o.
+  type
+    HeaderFn = proc(line: cstring) {.cdecl.}
+    FieldFn = proc(fmt: cstring, hexValue, decValue: uint32) {.cdecl, varargs.}
+  template header(line: cstring) =
+    block:
+      let callback = cast[HeaderFn](blOpsFunc(8))
+      if callback != nil: callback(line)
+  template field(fmt: cstring; value: uint32) =
+    block:
+      let callback = cast[FieldFn](blOpsFunc(4))
+      if callback != nil: callback(fmt, value, value)
 
-  const
-    REG_0E4 = MACHW_BASE + 0x0E4'u
-    REG_0E8 = MACHW_BASE + 0x0E8'u
-    REG_0EC = MACHW_BASE + 0x0EC'u
-    REG_0F0 = MACHW_BASE + 0x0F0'u
-    REG_0F4 = MACHW_BASE + 0x0F4'u
-    REG_0F8 = MACHW_BASE + 0x0F8'u
-    REG_0FC = MACHW_BASE + 0x0FC'u
-    REG_100 = MACHW_BASE + 0x100'u
-    REG_104 = MACHW_BASE + 0x104'u
+  header("==========================  Timing Dump =========================\r\n")
+  header("[Register]    [ValueName]            [Value(HEX]    [Value(DEC)]\r\n")
 
-  let printHdrFn = blOpsFunc(8)   # s0[8] = section header print
-  let printFldFn = blOpsFunc(4)   # s0[4] = field value print
-  type PrintFn = proc(fmt: cstring, a1: uint32, a2: uint32) {.cdecl, varargs.}
-  let pHdr = cast[PrintFn](printHdrFn)
-  let pFld = cast[PrintFn](printFldFn)
+  let timing1 = regRead(MACHW_BASE + 0xE4'u)
+  field("[Timing1]     txchaindelayinmacclk     0x%04X          %u\r\n",
+        (timing1 shr 18) and 0x3FF'u32)
+  field("              txrfdelayinmacclk        0x%04X          %u\r\n",
+        (timing1 shr 8) and 0x3FF'u32)
+  field("              maccoreclkfreq           0x%04X          %u\r\n",
+        timing1 and 0xFF'u32)
 
-  # --- REG 0xE4: Timing Set 1 ---
-  block:
-    let timingSet1 = regRead(REG_0E4)
-    let txStartDelayOFDM = (timingSet1 shr 18) and 0x3FF'u32   # bits[27:18]
-    let slotTime         = (timingSet1 shr 8)  and 0xFFFF'u32   # bits[17:8] (blob uses & 0xFFFF)
-    let macCoreClkFreq   = timingSet1 and 0xFF'u32              # bits[7:0]
-    if printHdrFn != nil:
-      pHdr("hal_machw.c", 0, 0)
-    if printFldFn != nil:
-      pFld("txStartDelayOFDM", txStartDelayOFDM, txStartDelayOFDM)
-      pFld("slotTime", slotTime and 0xFFFF, slotTime and 0xFFFF)
-      pFld("macCoreClkFreq", macCoreClkFreq, macCoreClkFreq)
+  let timing2 = regRead(MACHW_BASE + 0xE8'u)
+  field("[Timing2]     slotTimeInMACClk         0x%04X          %u\r\n",
+        (timing2 shr 8) and 0xFFFF'u32)
+  field("              slottime                 0x%04X          %u\r\n",
+        timing2 and 0xFF'u32)
 
-  # --- REG 0xE8: Timing Set 2 ---
-  block:
-    let timingSet2 = regRead(REG_0E8)
-    let txChainDelay = (timingSet2 shr 8) and 0xFFFF'u32       # bits[23:8]
-    let txDEDelay    = timingSet2 and 0xFF'u32                  # bits[7:0]
-    if printFldFn != nil:
-      pFld("txChainDelay", txChainDelay, txChainDelay)
-      pFld("txDEDelay", txDEDelay, txDEDelay)
+  let timing3 = regRead(MACHW_BASE + 0xEC'u)
+  field("[Timing3]     rxrfdelayinmacclk        0x%04X          %u\r\n",
+        (timing3 shr 20) and 0x3FF'u32)
+  field("              txdelayrfoninmacclk      0x%04X          %u\r\n",
+        (timing3 shr 10) and 0x3FF'u32)
+  field("              macprocdelayinmacclk     0x%04X          %u\r\n",
+        timing3 and 0x3FF'u32)
 
-  # --- REG 0xEC: Timing Set 3 ---
-  block:
-    let timingSet3 = regRead(REG_0EC)
-    let rxRFDelay       = (timingSet3 shr 20) and 0x3FF'u32    # bits[29:20]
-    let txDelayRFOnOff  = (timingSet3 shr 10) and 0x3FF'u32    # bits[19:10]
-    let macProcDelay    = timingSet3 and 0x3FF'u32              # bits[9:0]
-    if printFldFn != nil:
-      pFld("rxRFDelay", rxRFDelay, rxRFDelay)
-      pFld("txDelayRFOnOff", txDelayRFOnOff, txDelayRFOnOff)
-      pFld("macProcDelay", macProcDelay, macProcDelay)
+  let timing4 = regRead(MACHW_BASE + 0xF0'u)
+  field("[Timing4]     radiowakeuptime          0x%04X          %u\r\n",
+        timing4 shr 22)
+  field("              radiochirptime           0x%04X          %u\r\n",
+        (timing4 shr 12) and 0x3FF'u32)
+  field("              wt2cryptclkratio         0x%04X          %u\r\n",
+        timing4 and 0x3'u32)
 
-  # --- REG 0xF0: Timing Set 4 ---
-  block:
-    let timingSet4 = regRead(REG_0F0)
-    let radioWakeUpTime = timingSet4 shr 22                     # bits[31:22]
-    let radioChirpTime  = (timingSet4 shr 12) and 0x3FF'u32    # bits[21:12]
-    let clkDivider      = timingSet4 and 0x3'u32                # bits[1:0]
-    if printFldFn != nil:
-      pFld("radioWakeUpTime", radioWakeUpTime, radioWakeUpTime)
-      pFld("radioChirpTime", radioChirpTime, radioChirpTime)
-      pFld("clkDivider", clkDivider, clkDivider)
+  let timing5 = regRead(MACHW_BASE + 0xF4'u)
+  field("[Timing5]     sifsbinmacclk            0x%04X          %u\r\n",
+        (timing5 shr 8) and 0xFFFF'u32)
+  field("              sifsb                    0x%04X          %u\r\n",
+        timing5 and 0xFF'u32)
 
-  # --- REG 0xF4: Timing Set 5 ---
-  block:
-    let timingSet5 = regRead(REG_0F4)
-    let ofdmRxStartDelay = (timingSet5 shr 8) and 0xFFFF'u32   # bits[23:8]
-    let ofdmRxChainDelay = timingSet5 and 0xFF'u32              # bits[7:0]
-    if printFldFn != nil:
-      pFld("ofdmRxStartDelay", ofdmRxStartDelay, ofdmRxStartDelay)
-      pFld("ofdmRxChainDelay", ofdmRxChainDelay, ofdmRxChainDelay)
+  let timing6 = regRead(MACHW_BASE + 0xF8'u)
+  field("[Timing6]     sifsainmacclk            0x%04X          %u\r\n",
+        (timing6 shr 8) and 0xFFFF'u32)
+  field("              sifsa                    0x%04X          %u\r\n",
+        timing6 and 0xFF'u32)
 
-  # --- REG 0xF8: Timing Set 6 ---
-  block:
-    let timingSet6 = regRead(REG_0F8)
-    let dsssRxStartDelay = (timingSet6 shr 8) and 0xFFFF'u32   # bits[23:8]
-    let dsssRxChainDelay = timingSet6 and 0xFF'u32              # bits[7:0]
-    if printFldFn != nil:
-      pFld("dsssRxStartDelay", dsssRxStartDelay, dsssRxStartDelay)
-      pFld("dsssRxChainDelay", dsssRxChainDelay, dsssRxChainDelay)
+  let timing7 = regRead(MACHW_BASE + 0xFC'u)
+  field("[Timing7]     rxccadelay               0x%04X          %u\r\n",
+        (timing7 shr 8) and 0xF'u32)
+  field("              rifs                     0x%04X          %u\r\n",
+        timing7 and 0xFF'u32)
 
-  # --- REG 0xFC: Timing Set 7 ---
-  block:
-    let timingSet7 = regRead(REG_0FC)
-    let edcaTriggerTimer = (timingSet7 shr 8) and 0xF'u32      # bits[11:8]
-    let slotCounterAddr  = timingSet7 and 0xFF'u32              # bits[7:0]
-    if printFldFn != nil:
-      pFld("edcaTriggerTimer", edcaTriggerTimer, edcaTriggerTimer)
-      pFld("slotCounterAddr", slotCounterAddr, slotCounterAddr)
+  let timing8 = regRead(MACHW_BASE + 0x100'u)
+  field("[Timing8]     rxstartdelaymimo         0x%04X          %u\r\n",
+        timing8 shr 24)
+  field("              rxstartdelayshort        0x%04X          %u\r\n",
+        (timing8 shr 16) and 0xFF'u32)
+  field("              rxstartdelaylong         0x%04X          %u\r\n",
+        (timing8 shr 8) and 0xFF'u32)
+  field("              rxstartdelayofdm         0x%04X          %u\r\n",
+        timing8 and 0xFF'u32)
 
-  # --- REG 0x100: Timing Set 8 ---
-  block:
-    let timingSet8 = regRead(REG_100)
-    let sifsBDelay   = (timingSet8 shr 24) and 0xFF'u32        # bits[31:24]
-    let sifsADelay   = (timingSet8 shr 16) and 0xFF'u32        # bits[23:16]
-    let eifsDuration = (timingSet8 shr 8)  and 0xFF'u32        # bits[15:8]
-    let slotTime2    = timingSet8 and 0xFF'u32                  # bits[7:0]
-    if printFldFn != nil:
-      pFld("sifsBDelay", sifsBDelay, sifsBDelay)
-      pFld("sifsADelay", sifsADelay, sifsADelay)
-      pFld("eifsDuration", eifsDuration, eifsDuration)
-      pFld("slotTime2", slotTime2, slotTime2)
-
-  # --- REG 0x104: Timing Set 9 ---
-  block:
-    let timingSet9 = regRead(REG_104)
-    let txDMAProcDelay = (timingSet9 shr 20) and 0x3FF'u32     # bits[29:20]
-    let rifsToDelay    = (timingSet9 shr 10) and 0x3FF'u32     # bits[19:10]
-    let rifsTOInMACClk = timingSet9 and 0x3FF'u32              # bits[9:0]
-    if printFldFn != nil:
-      pFld("txDMAProcDelay", txDMAProcDelay, txDMAProcDelay)
-      pFld("rifsToDelay", rifsToDelay, rifsToDelay)
-      pFld("rifsTOInMACClk", rifsTOInMACClk, rifsTOInMACClk)
+  let timing9 = regRead(MACHW_BASE + 0x104'u)
+  field("[Timing9]     rifstoinmacclk           0x%04X          %u\r\n",
+        (timing9 shr 20) and 0x3FF'u32)
+  field("              rifsinmacclk             0x%04X          %u\r\n",
+        (timing9 shr 10) and 0x3FF'u32)
+  field("              txdmaprocdlyinmacclk     0x%04X          %u\r\n",
+        timing9 and 0x3FF'u32)
 
 proc blmac_abs_timer_set*(timerIndex: uint32, timerValue: uint32) {.exportc, cdecl, noinline.} =
   ## Program timer slots 0..9 at the MAC timer bank, not the interrupt bank.
@@ -2256,9 +2504,11 @@ proc blmac_soft_reset_getf*(): uint8 {.exportc, cdecl, noinline.} =
   ## Read soft reset status field from MACHW_INTC.
   ## From blob (hal_machw.o, 14 instrs): reads MACHW_INTC_BASE+0x050,
   ## asserts only bit 0 is used (andi ~1 must be 0), returns low byte.
+  ## Our recoverable assert keeps an invalid read from ending the reset wait.
   let softResetStatus = regRead(MACHW_INTC_BASE + 0x050'u)
   if (softResetStatus and not 0x01'u32) != 0:
     assert_err("hal_machw.c", "hal_machw.c", 285)
+    return 1'u8
   return (softResetStatus and 0xFF'u32).uint8
 
 proc hal_machw_rx_duration*(rxDesc: pointer, frameLen: uint32): uint32 {.exportc, cdecl.} =
@@ -2281,11 +2531,11 @@ proc hal_machw_rx_duration*(rxDesc: pointer, frameLen: uint32): uint32 {.exportc
   regWrite(MACHW_INTC_BASE + 0x168'u, 0x80000000'u32)
   if not waitRegMaskSet(MACHW_INTC_BASE + 0x168'u, 0x40000000'u32):
     return 500
-  let status = regRead(MACHW_INTC_BASE + 0x168'u)
-  if (status and 0x40000000'u32) == 0:
+  if (regRead(MACHW_INTC_BASE + 0x168'u) and 0x40000000'u32) == 0:
     assert_rec("hal_machw.c", "hal_machw.c", 249)
     return 500
-  return status and 0xFFFF'u32
+  # mm.o:hal_machw_rx_duration+0xac samples the result after the ready check.
+  return regRead(MACHW_INTC_BASE + 0x168'u) and 0xFFFF'u32
 
 proc element_notify_status_enabled*(): uint32 {.exportc, cdecl.} =
   ## Check if element notification is enabled.
@@ -2393,6 +2643,9 @@ proc mm_timer_hw_set*(timer: pointer) {.exportc, cdecl, noinline.} =
   ## to MACHW_ABS_TIMER_REG, then enables timer IRQ bit (0x80) in INTC.
   let saved = irqSave()
   defer: irqRestore(saved)
+  # Callers can release IRQs between choosing a head and programming it.
+  if cast[ptr CoListHdr](timer) != mm_timer_list.first:
+    return
   if timer != nil:
     let revision = mmTimerRevision
     let expiry = mmTimerAt(timer).expiry
@@ -2407,7 +2660,7 @@ proc mm_timer_hw_set*(timer: pointer) {.exportc, cdecl, noinline.} =
     if (unmaskStatus and 0x80'u32) == 0:
       # Write 0x80 to unmask set register
       regWrite(MACHW_INTC_BASE + 0x088'u, 0x80'u32)
-    regWrite(intcUnmask, unmaskStatus or 0x80'u32)
+      regWrite(intcUnmask, unmaskStatus or 0x80'u32)
     nimFwTrace2U32("[WIFI-NIMFW] mm_timer_hw regs ", regRead(MACHW_ABS_TIMER_REG), regRead(MACHW_INTC_BASE + 0x08C'u))
   else:
     # Clear timer IRQ: clear bit 7 (0x80) from INTC unmask
@@ -2502,6 +2755,7 @@ proc mm_active*() {.exportc, cdecl.} =
   ## Transition MM and MAC HW to active state.
   ## From disassembly: writes 0x30 to MACHW_STATE_CNTRL_REG (0x24B00038),
   ## then tail-calls ke_state_set(TASK_MM, MM_ACTIVE_STATE).
+  mmConfigCancelIdle()
   regWrite(MACHW_STATE_CNTRL_REG, 0x30'u32)
   ke_state_set(TASK_MM, MM_ACTIVE_STATE.uint16)
 
@@ -2536,6 +2790,75 @@ proc mm_env_max_ampdu_duration_set*(duration: uint32) {.exportc, cdecl.} =
   let dVO = computeDuration(MACHW_EDCA_AC_VO_REG)
   mm.edcaVoDur = dVO
   mm.edcaBcnDur = dVO
+
+proc mmEdcaOwner(): ptr VifChannelView =
+  ## The four registers belong to the current operating context, not a VIF.
+  let env = chanEnvView()
+  let current = env.currentCtxt
+  if current == nil or env.scheduledCtxt != nil or
+      chanCtxtAt(current).contextIndexOrMarker > 2 or
+      chanCtxtAt(current).status notin {4'u8, 5'u8}:
+    return nil
+  var link = cast[pointer](vifMgmtEnvView().activeList.first)
+  while link != nil:
+    let vif = vifChannelAt(link)
+    if vif.chanCtxt == current and vif.state != 0:
+      if result != nil: return nil
+      result = vif
+    link = vif.next
+
+proc mmEdcaWord(vif: ptr VifChannelView; queue: int): uint32 {.inline.} =
+  vif.edcaRegs[if vif.vifType in [VIF_TYPE_STA, VIF_TYPE_AP]: queue else: 3]
+
+proc mmProgramEdca(vif: ptr VifChannelView) =
+  for queue in 0 ..< 4:
+    regWrite(MACHW_EDCA_AC_BK_REG + 4'u * queue.uint, mmEdcaWord(vif, queue))
+  mm_env_max_ampdu_duration_set(0)
+
+proc mmReplayEdca() =
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  let vif = mmEdcaOwner()
+  if vif != nil: mmProgramEdca(vif)
+
+proc mmEdcaRefreshCurrent(): bool =
+  let i = mmEdcaRefresh.vif
+  i < MAX_VIFS.uint8 and mmEdcaRefresh.resetEpoch == txResetEpoch and
+    rxVifEpochs[i] == mmEdcaRefresh.vifEpoch and
+    chanCtxtLinkEpochs[i] == mmEdcaRefresh.bindingEpoch and
+    mmEdcaRefresh.context == chanEnvView().currentCtxt and
+    mmEdcaOwner() == vifChannelForIdx(i)
+
+proc mmRequestStaEdcaRefresh(vif: ptr VifChannelView) =
+  ## Request one idle transition for all four words. An unchanged beacon can
+  ## retry a missed allocation; a channel switch can apply the shadow first.
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if mmEdcaRefresh.message != nil and mmEdcaRefresh.resetEpoch == txResetEpoch:
+    return
+  if vif == nil or vif.vifIdx >= MAX_VIFS.uint8 or mmEdcaOwner() != vif: return
+  var changed = false
+  for queue in 0 ..< 4:
+    if regRead(MACHW_EDCA_AC_BK_REG + 4'u * queue.uint) != vif.edcaRegs[queue]:
+      changed = true
+      break
+  if not changed: return
+  let i = vif.vifIdx
+  let vifEpoch = rxVifEpochs[i]
+  let bindingEpoch = chanCtxtLinkEpochs[i]
+  let resetEpoch = txResetEpoch
+  let context = vif.chanCtxt
+  let request = ke_msg_try_alloc(MM_SET_EDCA_REQ, TASK_MM, TASK_MM, 0)
+  if request == nil: return
+  let header = cast[pointer](keMsgHdrFromPayload(request))
+  if rxVifEpochs[i] != vifEpoch or chanCtxtLinkEpochs[i] != bindingEpoch or
+      context != vif.chanCtxt or txResetEpoch != resetEpoch or
+      (mmEdcaRefresh.message != nil and mmEdcaRefresh.resetEpoch == resetEpoch) or
+      mmEdcaOwner() != vif:
+    ke_msg_free(header)
+    return
+  mmEdcaRefresh = (header, context, i, vifEpoch, bindingEpoch, resetEpoch)
+  ke_msg_send(request)
 
 proc mm_cfg_element_keepalive_timestamp_update*() {.exportc, cdecl.} =
   ## Update keep-alive timestamp to current time (14 instrs).
@@ -2578,35 +2901,88 @@ proc mmVifCurrent(identity: MmVifIdentity): bool =
     vifChannelForIdx(identity.index).staIdx == identity.station and
     staDeleteEpoch(identity.station) == identity.stationEpoch
 
-proc mm_send_connection_loss_ind*(vifEntry: pointer, reason: uint16) {.exportc, cdecl, noinline.} =
-  ## Report connection loss to the station-management task.
-  ## noinline: blob keeps this as a standalone helper (called from multiple sites).
+proc mmConnLossTagAt(message: pointer): ptr MmConnLossTag =
+  const mask = alignof(MmConnLossTag).uint - 1
+  let start = cast[uint](message) + MmConnectionLossIndPayloadSize.uint +
+    KeMsgTailSlack.uint
+  cast[ptr MmConnLossTag]((start + mask) and not mask)
+
+proc mmConnLossForget(header: pointer) =
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  var link = addr mmConnLossTags
+  while link[] != nil:
+    if link[].header == header:
+      link[] = link[].next
+      return
+    link = addr link[].next
+
+proc mmConnLossProbeEpoch(reason: uint16; vif: uint8): uint32 {.inline.} =
+  # A beacon proves downlink liveness, not that the AP ACKed our traffic.
+  if reason == 22: mmTrafficProbeEpochs[vif] else: mmBeaconProbeEpochs[vif]
+
+proc mmConnLossTagFor(message: pointer): ptr MmConnLossTag =
+  let header = keMsgHdrFromPayload(message)
+  if header.id != MM_CONNECTION_LOSS_IND or header.destId != TASK_SM or
+      header.srcId != TASK_MM or
+      header.paramLen != MmConnectionLossIndPayloadSize:
+    return nil
+  var tag = mmConnLossTags
+  while tag != nil:
+    if tag.header == cast[pointer](header):
+      let ind = mmConnectionLossIndView(message)
+      if tag.consumed or tag.resetEpoch != txResetEpoch or
+          ind.vifIdx != tag.identity.index or ind.reason != tag.reason or
+          not mmVifCurrent(tag.identity) or
+          (tag.tracksProbe and mmConnLossProbeEpoch(tag.reason, tag.identity.index) != tag.probeEpoch):
+        return nil
+      return tag
+    tag = tag.next
+
+proc mmPublishConnectionLoss(vifEntry: pointer; reason: uint16;
+                             probeEpoch: ptr uint32) {.noinline.} =
   inc nimFwDbgConnLossInd
   {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
   let saved = irqSave()
   defer: irqRestore(saved)
   let identity = mmCaptureVif(vifEntry)
-  if not mmVifCurrent(identity): return
+  let resetEpoch = txResetEpoch
+  let tracksProbe = probeEpoch != nil
+  let expectedProbe = if tracksProbe: probeEpoch[] else: 0'u32
+  template current(): bool =
+    mmVifCurrent(identity) and txResetEpoch == resetEpoch and
+      (not tracksProbe or mmConnLossProbeEpoch(reason, identity.index) == expectedProbe)
+  if not current(): return
   template outside(body: untyped) =
     irqRestore(saved)
     try: body
     finally: discard irqSave()
   var ind: ptr MmConnectionLossIndPayload
   outside:
+    const alignment = alignof(MmConnLossTag).uint32
+    const storageLength = MmConnectionLossIndPayloadSize + KeMsgTailSlack +
+      alignment - 1 + sizeof(MmConnLossTag).uint32
     ind = cast[ptr MmConnectionLossIndPayload](
       ke_msg_alloc(MM_CONNECTION_LOSS_IND, TASK_SM, TASK_MM,
-                   MmConnectionLossIndPayloadSize))
+                   storageLength))
   if ind == nil: return
-  if not mmVifCurrent(identity):
+  if not current():
     outside: ke_msg_free_payload(ind)
     return
+  let header = keMsgHdrFromPayload(ind)
+  header.paramLen = MmConnectionLossIndPayloadSize
   ind.reason = reason
   ind.vifIdx = identity.index
+  let tag = mmConnLossTagAt(ind)
+  tag[] = MmConnLossTag(next: mmConnLossTags, header: cast[pointer](header),
+    identity: identity, resetEpoch: resetEpoch, reason: reason,
+    tracksProbe: tracksProbe, probeEpoch: expectedProbe)
+  mmConnLossTags = tag
   outside: ke_msg_send(ind)
 
-proc mm_send_csa_traffic_ind*() {.exportc, cdecl.} =
-  ## Send CSA traffic indication.
-  discard
+proc mm_send_connection_loss_ind*(vifEntry: pointer, reason: uint16) {.exportc, cdecl, noinline.} =
+  ## Report connection loss without a TBTT probe freshness requirement.
+  mmPublishConnectionLoss(vifEntry, reason, nil)
 
 proc mm_ps_change_ind*(staIdx: uint8, psState: uint8) {.exportc, cdecl.} =
   ## Send MM_PS_CHANGE_IND to host and mirror the state in sta_info_tab.
@@ -2643,6 +3019,8 @@ proc mm_set_wpa_rsn_ie*(vifIdx: uint8, ie: pointer, ieLen: uint8) {.exportc, cde
   ## "ie ptr" and vifIdx came from casting the IE pointer. Result: AssocReq
   ## never carried the RSN IE → Frog accepted us as open assoc → no WPA handshake
   ## → mm_sta_tbtt fired forever → null-frame flood.
+  if vifIdx >= MAX_VIFS.uint8 or (ie == nil and ieLen != 0):
+    return
   inc nimFwDbgWpaRsnIeSet
   nimFwDbgWpaRsnIeLen = ieLen.uint32
   nimFwDbgWpaRsnIePtr = cast[uint32](ie)
@@ -2666,6 +3044,7 @@ proc mm_force_idle_req*(): bool {.exportc, cdecl, discardable.} =
   let mm = mmEnvView()
   mm.previousState = 0
   mm.hardwareMode = 0
+  mmPsModeRetryAfterReset()
   true
 
 proc mm_back_to_host_idle*() {.exportc, cdecl.} =
@@ -2689,8 +3068,16 @@ proc mm_hw_idle_evt*() {.exportc, cdecl.} =
   ## Handle HW idle event (11 instrs). Blob:
   ##   ke_evt_clear(0x04000000)
   ##   ke_state_set(TASK_MM=0, 0)    # tail call
+  let saved = irqSave()
+  defer: irqRestore(saved)
   ke_evt_clear(KE_EVT_IDLE)
+  if ke_state_get(TASK_MM) != MM_GOING_TO_IDLE.uint16 or
+      (ke_evt_field_get() and 0x80000000'u32) != 0:
+    return
+  if mmConfigIdle.phase == mmConfigAwaitIdle:
+    mmConfigIdle.phase = mmConfigIdleReady
   ke_state_set(TASK_MM, MM_IDLE.uint16)
+  mmConfigResumeAbandonedIdle()
 
 proc mm_hw_info_set*(macAddr: pointer) {.exportc, cdecl.} =
   ## Set HW info for a VIF (42 instrs).
@@ -2776,6 +3163,22 @@ type
     callback, connection: pointer
     wpa: WpaKeyWriteParamView
     wep: WepKeyWriteParamView
+
+  MmStaDeletion = object
+    owner: StaQueueIdentity
+    requestEpoch: uint32
+    keys: array[4, uint8]
+    keyPending: array[4, bool]
+    active, running, staMode, apEffectsDone, addressDeleted, requestOwned: bool
+
+var
+  mmStaDeletions {.wifiCtrl.}: array[STA_MGMT_FREE_STAS, MmStaDeletion]
+  mmStaDelRetryMask {.wifiCtrl.}: uint8
+  mmStaDelRetryEpochs {.wifiCtrl.}: array[STA_MGMT_FREE_STAS, uint32]
+  mmStaDelRetryReset {.wifiCtrl.}: uint32
+  mmStaDelRetryTimer {.wifiCtrl.}: MmTimerView
+
+proc mmStaDelTrackUnpublished(owner: StaQueueIdentity)
 
 proc mmKeyHexDigit(ch: uint8): int {.inline.} =
   if ch >= 0x30 and ch <= 0x39: ch.int - 0x30
@@ -2924,18 +3327,19 @@ proc mm_sta_add*(param: pointer, staIdxOut: ptr uint8, hwStaIdxOut: ptr uint8): 
       (not keys.boundToConnection or smEnvView().connectInfo == keys.connection)
   template abortOwned(): uint8 =
     if mmStaAddCurrent(instNbr, vifEpoch, staIdx, stationEpoch):
-      mm_sta_del(staIdx)
+      var removal: StaQueueIdentity
+      if staMgmtBeginRemoval(staIdx, removal) != nil:
+        mmStaDelTrackUnpublished(removal)
     1'u8
   if not current():
     return abortOwned()
 
   let hwIdx = mm_sec_machwaddr_wr(staIdx, cast[pointer](instNbr.uint), 0)
   if hwIdx == 0xFF:
-    # No key was installed by this add. Do not issue hardware cleanup while
-    # the address controller may still be processing a timed-out command.
-    if mmStaAddCurrent(instNbr, vifEpoch, staIdx, stationEpoch):
-      sta_mgmt_unregister(staIdx)
-    return 1
+    # The write may have timed out after submission. Keep this slot retired
+    # until its hardware address is confirmed clear, so a late write cannot
+    # bind the next station allocated at the same index.
+    return abortOwned()
   if not current():
     return abortOwned()
   case keys.mode
@@ -2946,16 +3350,16 @@ proc mm_sta_add*(param: pointer, staIdxOut: ptr uint8, hwStaIdxOut: ptr uint8): 
     keys.wpa.staIdx = staIdx
     for i in 0 ..< 3:
       vifSecurity(vif).staKeySlots[i] = 0xFF
-    # The SDK callback is void; reading an invented return value is invalid.
-    cast[proc(param: pointer) {.cdecl.}](keys.callback)(addr keys.wpa)
+    # The shim checks the built-in setup without changing the callback ABI.
+    if bl808WpaStaConnectResult(keys.callback, addr keys.wpa) != 0:
+      return abortOwned()
   of 3:
     vifSecurity(vif).staKeySlots[3] = 0xFF
     let keyIndex = mm_sec_machwkey_wr(addr keys.wep)
     if not current():
       return abortOwned()
     if keyIndex == 0xFF:
-      mm_sta_del(staIdx)
-      return 1
+      return abortOwned()
     vifSecurity(vif).staKeySlots[3] = keyIndex
   else:
     discard
@@ -2970,21 +3374,88 @@ proc mm_sta_add*(param: pointer, staIdxOut: ptr uint8, hwStaIdxOut: ptr uint8): 
     (vif.staIdx.uint32 shl 16) or 0x01000000'u32
   0
 
-proc mm_sta_del*(staIdx: uint8) {.exportc, cdecl.} =
-  ## Delete a station from MAC HW (109 instrs).
-  ## From blob: loads sta_info_tab[staIdx], checks VIF type. For STA-mode VIF,
-  ## stores 0xFF to vif[96], deletes up to 3 HW keys via mm_sec_machwkey_del,
-  ## then calls mm_sec_machwaddr_del and sta_mgmt_unregister. For AP-mode VIF,
-  ## updates the sleeping-client count, sends MM_PS_CHANGE_IND for the
-  ## broadcast station, and calls apm_tx_int_ps_clear.
+proc mmStaDelRetryCb(env: pointer) {.cdecl.}
+
+proc mmStaDelRetryPending(staIdx: uint8): bool {.inline.} =
+  staIdx < STA_MGMT_FREE_STAS.uint8 and
+    (mmStaDelRetryMask and (1'u8 shl staIdx)) != 0 and
+    mmStaDelRetryEpochs[staIdx] == staDeleteEpoch(staIdx)
+
+proc mmStaDelQueueRetryLocked(staIdx: uint8; saved: uint32) =
+  if staIdx >= STA_MGMT_FREE_STAS.uint8: return
+  let hadPending = mmStaDelRetryMask != 0
+  mmStaDelRetryEpochs[staIdx] = staDeleteEpoch(staIdx)
+  mmStaDelRetryMask = mmStaDelRetryMask or (1'u8 shl staIdx)
+  if hadPending: return
+  mmStaDelRetryTimer.callback = cast[pointer](mmStaDelRetryCb)
+  mmStaDelRetryTimer.env = 0
+  mmTimerSetLocked(addr mmStaDelRetryTimer, macTimeNow() + 100_000'u32, saved)
+
+proc mmStaDelOwned(staIdx, vifIdx: uint8; stationEpoch: uint32): bool =
+  if staIdx >= STA_MGMT_FREE_STAS.uint8: return false
   let saved = irqSave()
   defer: irqRestore(saved)
-  var owner: StaQueueIdentity
-  let staEntry = staMgmtBeginRemoval(staIdx, owner)
-  if staEntry == nil:
-    return
-  let sta = staInfoAt(staEntry)
-  template current(): bool = staRemovalCurrent(owner)
+  let deletion = mmStaDeletions[staIdx]
+  deletion.active and deletion.requestOwned and deletion.owner.vif == vifIdx and
+    deletion.requestEpoch == stationEpoch and
+    (staRemovalCurrent(deletion.owner) or
+     (staInfoAt(deletion.owner.entry).valid == 0 and
+      staInfoAt(deletion.owner.entry).instNbr == vifIdx and
+      rxVifEpochs[vifIdx] == deletion.owner.vifEpoch and
+      not co_list_find(addr sta_info_env,
+                       cast[ptr CoListHdr](deletion.owner.entry))))
+
+proc mmStaDelTry(staIdx: uint8; saved: uint32): bool =
+  ## Keep the retired slot and its original VIF/key identity across HW timeouts.
+  ## The caller holds IRQs from identity validation through retry publication.
+  if staIdx >= STA_MGMT_FREE_STAS.uint8: return true
+  let deletion = addr mmStaDeletions[staIdx]
+  if deletion.running: return false
+  deletion.running = true
+  if deletion.active:
+    if not staRemovalCurrent(deletion.owner):
+      let oldOwner = deletion.owner
+      let sta = staInfoAt(oldOwner.entry)
+      if sta.valid == 0 and sta.instNbr == oldOwner.vif and
+          rxVifEpochs[oldOwner.vif] == oldOwner.vifEpoch and
+          not co_list_find(addr sta_info_env, cast[ptr CoListHdr](oldOwner.entry)):
+        deletion.owner.stationEpoch = staDeleteEpoch(staIdx)
+      else:
+        deletion[] = default(MmStaDeletion)
+        mmStaDelRetryMask = mmStaDelRetryMask and not (1'u8 shl staIdx)
+        return true
+  else:
+    var owner: StaQueueIdentity
+    let staEntry = staMgmtBeginRemoval(staIdx, owner)
+    if staEntry == nil:
+      deletion.running = false
+      return staInfoForIdx(staIdx).valid == 0
+    deletion[] = MmStaDeletion(owner: owner, requestEpoch: owner.stationEpoch - 1'u32,
+                               active: true, running: true, requestOwned: true)
+    let vif = vifChannelForIdx(owner.vif)
+    deletion.staMode = vif.vifType == VIF_TYPE_STA
+    if deletion.staMode:
+      let sec = vifSecurity(vif)
+      if sec.connected != 0:
+        let slots = if sec.cipher in 2'u8 .. 4'u8: 3
+                    elif sec.cipher == 1: 4
+                    else: 0
+        for slot in 0 ..< slots:
+          if slots == 4 and slot != 3: continue
+          deletion.keys[slot] = sec.staKeySlots[slot]
+          deletion.keyPending[slot] = sec.staKeySlots[slot] != 0xFF
+  let owner = deletion.owner
+  let sta = staInfoAt(owner.entry)
+  template sameDeletion(): bool =
+    deletion.active and deletion.owner.entry == owner.entry and
+      deletion.owner.stationEpoch == owner.stationEpoch and
+      deletion.owner.vifEpoch == owner.vifEpoch
+  defer:
+    if sameDeletion(): deletion.running = false
+  template current(): bool = sameDeletion() and staRemovalCurrent(owner)
+  template superseded(): bool =
+    if sameDeletion(): deletion[] = default(MmStaDeletion)
+    true
   template outsideLock(call: untyped): untyped =
     block:
       irqRestore(saved)
@@ -2993,20 +3464,18 @@ proc mm_sta_del*(staIdx: uint8) {.exportc, cdecl.} =
       finally:
         discard irqSave()
   if not current():
-    return
+    return superseded()
 
-  # Preserve metadata until hardware and postponed TX cleanup are complete.
   let vifIdx = owner.vif
   let vif = vifChannelForIdx(vifIdx)
   var keysRemoved = true
 
-  if vif.vifType != VIF_TYPE_STA:
-    # AP mode path (.L192): check sta+41 for connection status
+  if not deletion.staMode and not deletion.apEffectsDone:
+    deletion.apEffectsDone = true
     let connStatus = sta.psMode
     if connStatus == 1:
-      # Decrement the VIF's sleeping-client count at vif+334.
       let rcFlags = vif.psBaCounter
-      let newFlags = rcFlags - 1
+      let newFlags = if rcFlags == 0: 0'u8 else: rcFlags - 1
       vif.psBaCounter = newFlags
       if newFlags == 0:
         let bcmcStaIdx = owner.vif + STA_MGMT_FREE_STAS.uint8
@@ -3016,80 +3485,92 @@ proc mm_sta_del*(staIdx: uint8) {.exportc, cdecl.} =
         if not current():
           if msg != nil:
             outsideLock(ke_msg_free(keMsgHdrFromPayload(msg)))
-          return
-        # Vendor +0x13a clears sta_info_tab[vifIdx + 5].psMode, not mm_env.
-        # Release broadcast traffic even if the host indication cannot allocate.
+          return superseded()
         staInfoForIdx(bcmcStaIdx).psMode = 0
         if msg != nil:
           msg.staIdx = bcmcStaIdx
           msg.psState = 0
           outsideLock(ke_msg_send(msg))
           if not current():
-            return
+            return superseded()
         apm_tx_int_ps_clear(cast[pointer](vif), bcmcStaIdx)
         if not current():
-          return
-    # Exit via sta_mgmt_unregister below
+          return superseded()
   else:
-    # STA mode path: store 0xFF at vif[96] (disassociate)
-    vif.staIdx = 0xFF
+    if deletion.staMode:
+      if vif.staIdx == staIdx: vif.staIdx = 0xFF
+      let sec = vifSecurity(vif)
+      for slot in 0 ..< deletion.keyPending.len:
+        if not deletion.keyPending[slot]: continue
+        let keyVal = deletion.keys[slot]
+        let deleted = mmDeleteSecurityKey(keyVal)
+        if not current(): return superseded()
+        if deleted:
+          deletion.keyPending[slot] = false
+          if sec.staKeySlots[slot] == keyVal:
+            sec.staKeySlots[slot] = 0xFF
+        else:
+          keysRemoved = false
 
-    # Get encryption key info from VIF entry and delete HW keys
-    let sec = vifSecurity(vif)
-    if sec.connected != 0:
-      let keyType = sec.cipher
-      if keyType >= 2 and keyType <= 4:
-        # Delete key at vif+510
-        let keyVal = sec.staKeySlots[0]
-        if keyVal != 0xFF:
-          let deleted = mmDeleteSecurityKey(keyVal)
-          if not current(): return
-          if deleted:
-            sec.staKeySlots[0] = 0xFF
-          else:
-            keysRemoved = false
-
-        # Check second VIF for keys
-        let keyVal2 = sec.staKeySlots[1]
-        if keyVal2 != 0xFF:
-          let deleted = mmDeleteSecurityKey(keyVal2)
-          if not current(): return
-          if deleted:
-            sec.staKeySlots[1] = 0xFF
-          else:
-            keysRemoved = false
-
-        # Check third key at vif+512
-        let keyVal3 = sec.staKeySlots[2]
-        if keyVal3 != 0xFF:
-          let deleted = mmDeleteSecurityKey(keyVal3)
-          if not current(): return
-          if deleted:
-            sec.staKeySlots[2] = 0xFF
-          else:
-            keysRemoved = false
-      elif keyType == 1:
-        # Single key at vif+513
-        let keyVal = sec.staKeySlots[3]
-        if keyVal != 0xFF:
-          let deleted = mmDeleteSecurityKey(keyVal)
-          if not current(): return
-          if deleted:
-            sec.staKeySlots[3] = 0xFF
-          else:
-            keysRemoved = false
-
-  # Keep the detached slot unavailable until all hardware cleanup is confirmed.
-  if keysRemoved:
+  if keysRemoved and not deletion.addressDeleted:
     let deleted = mmDeleteSecurityAddress(staIdx)
-    if deleted and current():
-      outsideLock(staMgmtFinishRemoval(owner))
+    if not current(): return superseded()
+    if deleted: deletion.addressDeleted = true
+  if keysRemoved and deletion.addressDeleted:
+    let finished = outsideLock(staMgmtFinishRemoval(owner))
+    if finished:
+      if sameDeletion():
+        deletion[] = default(MmStaDeletion)
+        mmStaDelRetryMask = mmStaDelRetryMask and not (1'u8 shl staIdx)
+      return true
+  false
+
+proc mmStaDelTrackUnpublished(owner: StaQueueIdentity) =
+  if not owner.stationTracked or owner.station >= STA_MGMT_FREE_STAS.uint8:
+    return
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  let deletion = addr mmStaDeletions[owner.station]
+  if not staRemovalCurrent(owner) or deletion.active:
+    return
+  deletion[] = MmStaDeletion(owner: owner, requestEpoch: owner.stationEpoch - 1'u32,
+                             active: true, apEffectsDone: true)
+  if not mmStaDelTry(owner.station, saved):
+    mmStaDelQueueRetryLocked(owner.station, saved)
+
+proc mm_sta_del*(staIdx: uint8) {.exportc, cdecl.} =
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if not mmStaDelTry(staIdx, saved): mmStaDelQueueRetryLocked(staIdx, saved)
+
+proc mmStaDelRetryCb(env: pointer) {.cdecl.} =
+  let (pending, epochs, reset) = block:
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    let delivery = mmTimerActiveDelivery(addr mmStaDelRetryTimer)
+    if delivery != nil and delivery.cancelled: return
+    let mask = mmStaDelRetryMask
+    mmStaDelRetryMask = 0
+    (mask, mmStaDelRetryEpochs, mmStaDelRetryReset)
+  # A retry can rearm this timer; only MM reinitialization cancels the batch.
+  for staIdx in 0'u8 ..< STA_MGMT_FREE_STAS.uint8:
+    if (pending and (1'u8 shl staIdx)) == 0: continue
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    if mmStaDelRetryReset != reset: return
+    if staDeleteEpoch(staIdx) == epochs[staIdx] and not mmStaDelTry(staIdx, saved) and
+        mmStaDelRetryReset == reset:
+      mmStaDelQueueRetryLocked(staIdx, saved)
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if mmStaDelRetryReset == reset: discard ke_reschedule_saved_messages(TASK_MM)
 
 proc mm_check_rssi*(vifEntry: pointer, newRssi: int8) {.exportc, cdecl.} =
   ## Report periodic RSSI samples and hysteretic threshold transitions.
   let saved = irqSave()
   defer: irqRestore(saved)
   let identity = mmCaptureVif(vifEntry)
+  let resetEpoch = txResetEpoch
   if not mmVifCurrent(identity): return
   let vif = vifChannelAt(vifEntry)
   let oldRssi = vif.rssiLast
@@ -3099,10 +3580,10 @@ proc mm_check_rssi*(vifEntry: pointer, newRssi: int8) {.exportc, cdecl.} =
   let hysteresis = vif.rssiHysteresis
   let previousState = vif.rssiState
   var expectedState = previousState
-  let rssiTimer = chanRssiLastReportTime()
+  let rssiTimer = mmRssiLastReportTime()
   let lastReportTime = rssiTimer[]
   template current(): bool =
-    mmVifCurrent(identity) and
+    txResetEpoch == resetEpoch and mmVifCurrent(identity) and
       vif.rssiLast == newRssi and vif.rssiThreshold == threshold and
       vif.rssiHysteresis == hysteresis and vif.rssiState == expectedState
   template outside(body: untyped) =
@@ -3145,21 +3626,34 @@ proc mm_check_rssi*(vifEntry: pointer, newRssi: int8) {.exportc, cdecl.} =
   if newState != previousState:
     report(newState, false)
 
-proc mm_check_beacon*(param, vifEntry, staEntry: pointer;
-                      timIeAddrOut: ptr uint32): uint32 {.exportc, cdecl.} =
+proc mmResetBeaconProbeCount(vif: ptr VifChannelView) =
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  vif.probeCount = 0
+  if vif.vifIdx < MAX_VIFS.uint8:
+    inc mmBeaconProbeEpochs[vif.vifIdx]
+
+proc mmCheckBeaconFrame(param, vifEntry, staEntry, frameData: pointer;
+                        timOut: var pointer): uint32 =
   ## Process a received beacon frame (290 instructions in blob).
   ##
-  ## Blob ABI: a0=param(rxdesc), a1=vifEntry, a2=staEntry, a3=timIeAddrOut
+  ## The exported wrapper below preserves the vendor's TIM-pointer ABI.
   ## 14 function calls: mm_check_rssi, 2x hal_machw_rx_duration,
   ## utils_crc32_stream_init/feed_block/results, __udivdi3,
   ## mm_timer_set, mm_timer_clear, mac_ie_find, mm_send_connection_loss_ind,
   ## txl_frame_send_null_frame, indirect log call.
+  ## Returns high(uint32) when frame admission fails; 0 means an unchanged
+  ## valid beacon, and 1 means its non-TIM fingerprint changed.
 
-  if timIeAddrOut == nil: return
+  template rejectBeacon() = return high(uint32)
+
+  timOut = nil
+  if param == nil or vifEntry == nil or staEntry == nil or frameData == nil:
+    rejectBeacon()
   let frameIdentity = rxCaptureFrameHeader(param, vifEntry, staEntry)
   template requireFrame() =
     if not rxFrameCurrent(frameIdentity):
-      timIeAddrOut[] = 0
+      timOut = nil
       return
   requireFrame()
 
@@ -3167,18 +3661,30 @@ proc mm_check_beacon*(param, vifEntry, staEntry: pointer;
   let vif = vifChannelAt(vifEntry)
   let sta = staInfoAt(staEntry)
 
-  # Step 1: Extract frame data from rxdesc payload chain
-  let payloadDesc = beaconPayloadDescView(rx.payloadDesc)
-  if payloadDesc == nil: return
-  let frame = beaconFrameFixedView(payloadDesc.frameData)
-  if frame == nil: return
+  # Timing metadata still comes from DMA; the caller owns the contiguous bytes.
+  let frame = beaconFrameFixedView(frameData)
 
   let frameLen = rx.frameLen
-  if frameLen.uint32 < sizeof(BeaconFrameFixedView).uint32: return
+  if frameLen.uint32 < sizeof(BeaconFrameFixedView).uint32: rejectBeacon()
   let bcnInterval = frame.beaconInterval
-  if bcnInterval == 0: return
+  if bcnInterval == 0: rejectBeacon()
   let ieBodyLen = frameLen.uint32 - sizeof(BeaconFrameFixedView).uint32
   let ieBody = beaconFrameIeBody(frame)
+
+  # The vendor reads DS and TIM payloads after finding only their IE IDs.
+  # Admit the complete IE stream before callbacks can publish beacon state.
+  var ieCursor = cast[uint](ieBody)
+  if ieBodyLen.uint > high(uint) - ieCursor: rejectBeacon()
+  var ieRemaining = ieBodyLen
+  while ieRemaining != 0:
+    if ieRemaining < 2: rejectBeacon()
+    let ie = macIeAt(ieCursor)
+    let size = ie.len.uint32 + 2'u32
+    if size > ieRemaining: rejectBeacon()
+    if (ie.id == 3 and ie.len != 1) or (ie.id == 5 and ie.len < 4):
+      rejectBeacon()
+    ieCursor += size.uint
+    ieRemaining -= size
 
   # Step 2: CSA check - if vif_entry[64] (CSA ctx ptr) nonzero, parse DS Param IE (id=3)
   let csaCtxPtr = vif.chanCtxt
@@ -3191,25 +3697,21 @@ proc mm_check_beacon*(param, vifEntry, staEntry: pointer;
       let csaCtxFreq = csaChan.primFreq
       let newFreq = dsParamFreq(csaChan.band, dsParamSetIeAt(dsIe))
       if csaCtxFreq != newFreq:
-        return  # Channel mismatch, bail out
+        rejectBeacon()
 
   # Step 3: Increment beacon rx count
   vif.beaconRxCount = vif.beaconRxCount + 1
 
-  # Step 4: Beacon loss timer logic
+  # Compare unsigned MAC-clock gaps; the BL808 resamples on a new maximum.
+  let macClock = cast[ptr uint32](0x24B00120'u32)
   let prevTimestamp = vif.lastBeaconMacTime
   if prevTimestamp != 0:
-    let macTsNow = volatileLoad(cast[ptr uint32](0x24B00120'u32))
-    let threshold = vif.beaconLossWindow
-    let elapsed = macTsNow - prevTimestamp
-    if elapsed >= threshold:
-      # Re-read and update
-      let macTs2 = volatileLoad(cast[ptr uint32](0x24B00120'u32))
-      vif.beaconLossWindow = macTs2 - prevTimestamp
-  else:
-    let macTsNow = volatileLoad(cast[ptr uint32](0x24B00120'u32))
-    vif.probeCount = 0
-    vif.lastBeaconMacTime = macTsNow
+    let elapsed = volatileLoad(macClock) - prevTimestamp
+    if elapsed > vif.beaconLossWindow:
+      vif.beaconLossWindow = volatileLoad(macClock) - prevTimestamp
+  let arrival = volatileLoad(macClock)
+  mmResetBeaconProbeCount(vif)
+  vif.lastBeaconMacTime = arrival
 
   let mm = mmEnvView()
 
@@ -3222,18 +3724,16 @@ proc mm_check_beacon*(param, vifEntry, staEntry: pointer;
     let threshold30s = 0x1C9C380'u32  # 30 seconds in microseconds
     if cast[int32](threshold30s - macTs + vifElapsed) < 0:
       # Beacon loss threshold exceeded - send null frame probe
+      when defined(bl808WifiDiagLinkDrop):
+        inc nimFwDbgTrafficProbe[0]
       let probeStatus = txl_frame_send_null_frame(vif.staIdx,
         cast[pointer](mm_ap_traffic_probe_cfm), pointerAddrU32(vifEntry))
+      when defined(bl808WifiDiagLinkDrop):
+        if probeStatus != 0: inc nimFwDbgTrafficProbe[1]
+      else:
+        discard probeStatus
       requireFrame()
-      if probeStatus != 0:
-        let probeCount = mm.keepAliveLimit
-        if probeCount != 0:
-          mm.keepAliveLimit = probeCount - 1
-        else:
-          # Probe countdown expired: reset to 10, send connection loss.
-          mm.keepAliveLimit = 10
-          mm_send_connection_loss_ind(vifEntry, 22)
-          requireFrame()
+      # A local admission failure is not evidence of a missing AP ACK.
 
   # Step 5: Call mm_check_rssi
   mm_check_rssi(vifEntry, rx.rssi)
@@ -3244,8 +3744,6 @@ proc mm_check_beacon*(param, vifEntry, staEntry: pointer;
   utils_crc32_stream_init(addr crcState)
   # Feed 4-byte beacon interval/capability field
   utils_crc32_stream_feed_block(addr crcState, addr frame.beaconInterval, 4)
-
-  timIeAddrOut[] = 0  # no TIM IE found yet
 
   # IE walk: find TIM IE and feed non-TIM IEs into CRC
   var timIe: ptr MacIeView = nil
@@ -3259,7 +3757,7 @@ proc mm_check_beacon*(param, vifEntry, staEntry: pointer;
     if totalLen > remaining: break
     if ieId == 5:  # TIM IE
       if ieLen >= 4:
-        timIeAddrOut[] = cast[uint32](currentIeAddr)
+        timOut = cast[pointer](currentIeAddr)
         timIe = ie
     else:
       # Feed non-TIM IEs into CRC for beacon change detection
@@ -3339,9 +3837,53 @@ proc mm_check_beacon*(param, vifEntry, staEntry: pointer;
   # Beacon change detection: compare CRC fingerprint
   result = if vif.beaconCrc != prevBcnTime: 1'u32 else: 0'u32
 
+proc mm_check_beacon*(param, vifEntry, staEntry: pointer;
+                      timIeAddrOut: ptr uint32): uint32 {.exportc, cdecl.} =
+  ## The vendor ABI returns a borrowed DMA pointer, so it only accepts a
+  ## contiguous beacon. RXL owns the storage for its split-frame call.
+  if timIeAddrOut == nil: return high(uint32)
+  timIeAddrOut[] = 0
+  if param == nil: return high(uint32)
+  let rx = beaconRxDescView(param)
+  if rx.payloadDesc == nil or rx.frameLen > sizeof(RxPayloadBufferView).uint16:
+    return high(uint32)
+  var tim: pointer
+  result = mmCheckBeaconFrame(param, vifEntry, staEntry,
+    beaconPayloadDescView(rx.payloadDesc).frameData, tim)
+  timIeAddrOut[] = pointerAddrU32(tim)
+
+proc mmTimerActiveDelivery(timer: pointer): ptr MmTimerMutation =
+  let delivery = mmTimerMutationTop
+  if delivery != nil and delivery.delivering and delivery.timer == timer:
+    delivery
+  else:
+    nil
+
 proc mmStaTimerCurrent(identity: MmVifIdentity; resetEpoch: uint32): bool {.inline.} =
   mmVifCurrent(identity) and txResetEpoch == resetEpoch and
     not txlResetting() and not txlVifIsRetiring(identity.index)
+
+proc mmStaTbttCurrent(identity: MmVifIdentity; resetEpoch, beaconRxCount: uint32): bool {.noinline.} =
+  if not mmStaTimerCurrent(identity, resetEpoch): return false
+  let vif = vifChannelAt(identity.vif)
+  let sta = staInfoForIdx(identity.station)
+  vif.state != 0 and vif.beaconRxCount == beaconRxCount and
+    sta.valid != 0 and sta.instNbr == identity.index
+
+proc mmStaBeaconProbeCfm(arg: pointer; txStatus: uint32) {.cdecl.} =
+  if (txStatus and 0x80000000'u32) == 0: return
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  let scope = txActiveFrameCallback
+  if scope == nil or not scope.tracked or not txlFrameCallbackCurrent(): return
+  let vif = vifChannelForIdx(scope.vif)
+  # The callback scope owns the VIF; its opaque argument only carries freshness.
+  var epoch = cast[uint](arg).uint32
+  if mmBeaconProbeEpochs[scope.vif] != epoch: return
+  if (txStatus and 0x00800000'u32) != 0:
+    mmResetBeaconProbeCount(vif)
+  else:
+    mmPublishConnectionLoss(vif, 16'u16, addr epoch)
 
 proc mm_sta_tbtt*(vifEntry: pointer) {.exportc, cdecl.} =
   ## Advance the STA beacon timers and request liveness probes on-channel.
@@ -3358,6 +3900,9 @@ proc mm_sta_tbtt*(vifEntry: pointer) {.exportc, cdecl.} =
     finally: discard irqSave()
   requireOwner()
   let vifView = vifChannelAt(vifEntry)
+  let delivery = mmTimerActiveDelivery(addr vifView.tbttTimer)
+  let beaconRxCount = vifView.beaconRxCount
+  if delivery != nil and delivery.cancelled: return
   inc nimFwDbgStaTbttEnter
   let logFn = getLogFunc(0xCC)
   if logFn != nil:
@@ -3366,30 +3911,27 @@ proc mm_sta_tbtt*(vifEntry: pointer) {.exportc, cdecl.} =
                 format: cstring) {.cdecl, varargs, raises: [Exception].}](logFn)(
         1, nil, "mm.c", 624, "mm_sta_tbtt\r\n")
     requireOwner()
-  # Check association state at vif+88
-  let assocState = vifView.state
-  if assocState == 0:
-    return
+    if delivery != nil and delivery.cancelled: return
   let staIdx = identity.station
   if staIdx >= STA_INFO_TAB_ENTRIES.uint8:
     return
-  let sta = staInfoForIdx(staIdx)
+  # A newer Beacon reanchors TBTT and cancels this listen window's watchdog.
   template requireStation() =
-    requireOwner()
-    if vifView.state == 0 or sta.valid == 0 or sta.instNbr != identity.index:
-      return
+    if not mmStaTbttCurrent(identity, resetEpoch, beaconRxCount): return
   requireStation()
   inc nimFwDbgStaTbttAssoc
   # Advance the prior deadline by the station's beacon interval in MAC ticks.
-  let beaconInterval = sta.initialRateConfig
+  let beaconInterval = staInfoForIdx(staIdx).initialRateConfig
   let vifBcnInterval = vifView.tbttTimer.expiry
   let tbttTime = beaconInterval + vifBcnInterval
-  outside: mm_timer_set(addr vifView.tbttTimer, tbttTime)
+  mmTimerSetLocked(addr vifView.tbttTimer, tbttTime, saved)
   requireStation()
   # Set keep-alive timer: MAC timestamp + mm_env[7]
   let macTime = regRead(MACHW_TIMLO_REG)
+  requireStation()
   let keepAliveInterval = mmEnvView().keepAliveInterval
-  outside: mm_timer_set(addr vifView.keepAliveTimer, macTime + keepAliveInterval)
+  # Keep the freshness check and start of the watchdog arm under one lock.
+  mmTimerSetLocked(addr vifView.keepAliveTimer, macTime + keepAliveInterval, saved)
   requireStation()
   # Increment TBTT count at vif+120
   vifView.tbttCount = vifView.tbttCount + 1
@@ -3411,19 +3953,19 @@ proc mm_sta_tbtt*(vifEntry: pointer) {.exportc, cdecl.} =
   # Check power save TBTT
   outside: ps_check_tbtt(vifEntry)
   requireStation()
-  # Increment probe counter at vif+116
-  var probeCount = vifView.probeCount
-  probeCount = probeCount + 1
-  vifView.probeCount = probeCount
+  # Saturate the vendor's byte counter so wrap cannot suppress due probes.
+  if vifView.probeCount != high(uint8):
+    inc vifView.probeCount
+  let probeCount = vifView.probeCount
   if probeCount > nimFwDbgStaTbttPCMax.uint8:
     nimFwDbgStaTbttPCMax = probeCount.uint32
   if probeCount > 100:
     inc nimFwDbgStaTbttPC100
-    # A queued frame is not proof of liveness; only the ACK callback resets
-    # the counter. The vendor leaves it unchanged on allocation failure too.
+    # A new beacon or ACK can invalidate the probe before its callback.
+    let epoch = mmBeaconProbeEpochs[identity.index]
     outside:
       discard txl_frame_send_null_frame(
-        vifView.staIdx, cast[pointer](mm_ap_probe_cfm), pointerAddrU32(vifEntry))
+        staIdx, cast[pointer](mmStaBeaconProbeCfm), epoch)
   elif probeCount > 49:
     # Send PM post event (blob: wifi_hosal_pm_post_event tail-call)
     outside: wifi_hosal_pm_post_event(3, 0, nil)
@@ -3475,7 +4017,7 @@ proc mm_tbtt_evt*() {.exportc, cdecl.} =
     node = vifChannelAt(node).next
 
   # Read ke_env field (event bitmap) and mask TBTT bits
-  let keEvtVal = keEvtField
+  let keEvtVal = keEnvEventField()[]
   let tbttBits = keEvtVal and 0x03000000'u32  # primary | secondary TBTT
   # Log
   let logFn = getLogFunc(0xCC)
@@ -3553,6 +4095,9 @@ proc mm_sta_timer_bcn_timeout*(param: pointer) {.exportc, cdecl.} =
   let resetEpoch = txResetEpoch
   if not mmStaTimerCurrent(identity, resetEpoch): return
   let vif = vifChannelAt(param)
+  let delivery = mmTimerActiveDelivery(addr vif.keepAliveTimer)
+  let beaconRxCount = vif.beaconRxCount
+  if delivery != nil and delivery.cancelled: return
   let logFn = getLogFunc(0xCC)
   if logFn != nil:
     irqRestore(saved)
@@ -3562,14 +4107,12 @@ proc mm_sta_timer_bcn_timeout*(param: pointer) {.exportc, cdecl.} =
         1, nil, "mm.c", 600, "beacon timeout %p\r\n", param)
     finally: discard irqSave()
     if not mmStaTimerCurrent(identity, resetEpoch): return
+    if (delivery != nil and delivery.cancelled) or vif.beaconRxCount != beaconRxCount:
+      return
   # Increment beacon loss count at vif+124
   vif.beaconLossCount = vif.beaconLossCount + 1
   # Clear bit 0 of vif+4 (link state flags)
   vif.flags = vif.flags and (not 1'u32)
-
-proc mm_sta_timer_bcmc_timeout*(param: pointer) {.exportc, cdecl.} =
-  ## Broadcast/multicast timeout timer handler.
-  discard
 
 proc mm_sta_timer_data_timeout*(param: pointer) {.exportc, cdecl.} =
   ## Data timeout timer handler (11 instrs).
@@ -3685,6 +4228,24 @@ proc mm_sec_macrx_ind*(staIdx: uint8, payload: pointer, length: uint16) {.export
     ipc_emb_msg_push(securityIndicationMsg)
     platformFree(securityIndicationMsg)
 
+when defined(bl808WifiDiagKeyWriteTiming):
+  # Pairwise/group: attempts, max idle/trigger/total us, idle/trigger timeouts.
+  var wifiKeyWriteTiming {.wifiCtrl, exportc: "nimfw_dbg_key_write_timing", volatile.}:
+    array[2, array[6, uint32]]
+
+proc recordKeyWriteTiming(groupKey: bool; enteredAt, idleUs, triggerUs,
+                          timeouts: uint32) {.noinline.} =
+  when defined(bl808WifiDiagKeyWriteTiming):
+    let totalUs = regRead(ClicMtimeBase) - enteredAt
+    let timingRow = groupKey.int
+    template row: untyped = wifiKeyWriteTiming[timingRow]
+    inc row[0]
+    row[1] = max(row[1], idleUs)
+    row[2] = max(row[2], triggerUs)
+    row[3] = max(row[3], totalUs)
+    row[4] += timeouts and 1
+    row[5] += timeouts shr 1
+
 proc mm_sec_machwkey_wr*(param: pointer): uint8 {.exportc, cdecl, discardable.} =
   ## Write encryption key to MAC HW key table (143 instructions).
   ##
@@ -3707,6 +4268,8 @@ proc mm_sec_machwkey_wr*(param: pointer): uint8 {.exportc, cdecl, discardable.} 
 
   let saved = irqSave()
   defer: irqRestore(saved)
+  when defined(bl808WifiDiagKeyWriteTiming):
+    let enteredAt = regRead(ClicMtimeBase)
   if param == nil:
     return 0xFF
   var request = machwKeyWriteParamView(param)[]
@@ -3725,6 +4288,11 @@ proc mm_sec_machwkey_wr*(param: pointer): uint8 {.exportc, cdecl, discardable.} 
     of 3: 13'u8
     else: 0'u8
   if expectedLength == 0 or req.keyLen != expectedLength:
+    return 0xFF
+  # The on-wire TKIP/CCMP PN and BIP IPN are six bytes, even when the host
+  # passes the eight-byte replay-counter field.
+  if cipherType in [1'u8, 2'u8, 5'u8] and
+      req.macAddrCipherPadding != [0'u8, 0'u8]:
     return 0xFF
   let groupKey = keyType == 0xFF
   if groupKey:
@@ -3831,7 +4399,13 @@ proc mm_sec_machwkey_wr*(param: pointer): uint8 {.exportc, cdecl, discardable.} 
     return 0xFF
   defer: txSecurityEndUpdate(updateKey)
   if not current(): return 0xFF
-  if not waitMachwSecurityControlClear(0xE0000000'u32) or not current():
+  when defined(bl808WifiDiagKeyWriteTiming):
+    let idleAt = regRead(ClicMtimeBase)
+  let idleReady = waitMachwSecurityControlClear(0xE0000000'u32)
+  when defined(bl808WifiDiagKeyWriteTiming):
+    let idleUs = regRead(ClicMtimeBase) - idleAt
+    if not idleReady: recordKeyWriteTiming(groupKey, enteredAt, idleUs, 0, 1)
+  if not idleReady or not current():
     return 0xFF
   if groupKey:
     rxKeyChange(cast[pointer](vifKeySlotPtr(vifChannelForIdx(keyIdx), req.addrIdx.uint)))
@@ -3869,11 +4443,16 @@ proc mm_sec_machwkey_wr*(param: pointer): uint8 {.exportc, cdecl, discardable.} 
     nimFwDbgMachwKeyWrGroupCtrl =
       ctrlWord or (machwSecurityKeyCount() and 0xFF000000'u32)
   nimFwDbgMachwKeyWrCtrlBefore = machwSecurityControl()
+  when defined(bl808WifiDiagKeyWriteTiming):
+    let triggerAt = regRead(ClicMtimeBase)
   machwSecurityWriteControl(ctrlWord)
   nimFwDbgMachwKeyWrCtrlAfterWrite = machwSecurityControl()
 
   # Poll until bit 30 (trigger) clears
   let completed = waitMachwSecurityControlClear(0x40000000'u32)
+  when defined(bl808WifiDiagKeyWriteTiming):
+    let triggerUs = regRead(ClicMtimeBase) - triggerAt
+    recordKeyWriteTiming(groupKey, enteredAt, idleUs, triggerUs, (not completed).uint32 shl 1)
   nimFwDbgMachwKeyWrWriteWait = completed.uint32
   if not current():
     return 0xFF
@@ -4439,13 +5018,16 @@ proc mm_ap_probe_cfm*(param: pointer; txStatus: uint32) {.exportc, cdecl.} =
   ##   - wrong decision (used bit 11 of tx_status, not bit 23)
   ##   - no host notification on AP-disappeared (the real purpose)
   ##   - instead it re-transmitted a null-frame, hiding the connection loss.
+  if not txlFrameCallbackCurrent(): return
+  if (txStatus and 0x80000000'u32) == 0: return
   let vif = vifChannelAt(param)
   if (txStatus and 0x00800000'u32) != 0:
     # Probe got ACKed: AP is still reachable.
-    vif.probeCount = 0
+    mmResetBeaconProbeCount(vif)
     return
-  # No ACK -> report connection loss with reason code 16.
-  mm_send_connection_loss_ind(param, 16'u16)
+  # A fresh beacon may have superseded the missed-beacon condition since TX.
+  if vif.probeCount > 100:
+    mm_send_connection_loss_ind(param, 16'u16)
 
 proc mm_bcn_transmitted*(vifEntry: pointer) {.exportc, cdecl.} =
   ## Apply deferred template/TIM updates after the last beacon completes.
@@ -4801,8 +5383,8 @@ proc mm_tim_update*(msgBody: pointer) {.exportc, cdecl, noinline.} =
   if mmBcnStopping or not mmTimMessageCurrent(keMsgHdrFromPayload(msgBody)):
     let header = keMsgHdrFromPayload(msgBody)
     let sender = header.srcId
-    ke_msg_free(header)
     ke_msg_send_basic(0x30, sender, TASK_MM)
+    ke_msg_free(header)
     return
   let env = bcnEnvView()
   if env.pendingCount != 0:
@@ -4856,6 +5438,11 @@ proc mm_timer_init*() {.exportc, cdecl.} =
   chanTimerInvalidate()
   mmTimerCancelMutations(all = true)
   co_list_init(addr mm_timer_list)
+  inc mmStaDelRetryReset
+  mmStaDelRetryMask = 0
+  mmStaDelRetryTimer = default(MmTimerView)
+  for deletion in mmStaDeletions.mitems:
+    deletion = default(MmStaDeletion)
 
 proc mmTimerSetLocked(timer: pointer; targetTime, saved: uint32) =
   ## Caller holds the IRQ lock; saved is the incoming callback IRQ state.
@@ -4914,8 +5501,8 @@ proc mmTimerSetLocked(timer: pointer; targetTime, saved: uint32) =
   let macTime2 = regRead(MACHW_TIMLO_REG)
   if operation.cancelled: return
   let remaining = cast[int32](expiry - macTime2)
-  if remaining < 0:
-    ke_evt_set(KE_EVT_MM_TIMER)  # blob uses lui a0, 0x40000 = 0x40000000
+  if remaining <= 0:
+    ke_evt_set(KE_EVT_MM_TIMER)
 
 proc mm_timer_set*(timer: pointer, targetTime: uint32) {.exportc, cdecl.} =
   if timer == nil: return
@@ -4957,12 +5544,16 @@ proc mm_timer_clear*(timer: pointer) {.exportc, cdecl.} =
   defer: irqRestore(saved)
   mmTimerClearLocked(timer, saved)
 
-proc mmTimerExpired(node: ptr CoListHdr): bool {.inline.} =
+proc mmTimerExpired(node: ptr CoListHdr; fromPoll: static bool = false): bool {.inline.} =
   if node == nil: return false
   let revision = mmTimerRevision
   let expiry = mmTimerAt(node).expiry
   let now = regRead(MACHW_TIMLO_REG)
-  mmTimerRevision == revision and cast[int32](expiry - now - 50'u32) < 0
+  if mmTimerRevision != revision: return false
+  when fromPoll:
+    cast[int32](expiry - now) <= 0
+  else:
+    cast[int32](expiry - now - 50'u32) < 0
 
 proc mm_timer_schedule*() {.exportc, cdecl.} =
   ## Schedule MM timers -- process all expired timers.
@@ -4975,8 +5566,14 @@ proc mm_timer_schedule*() {.exportc, cdecl.} =
     defer: irqRestore(saved)
     if mmTimerScheduling: return
     mmTimerScheduling = true
+  var delivery: MmTimerMutation
+  template retireDelivery() =
+    if delivery.timer != nil:
+      mmTimerEndMutation(delivery)
+      delivery.timer = nil
   defer:
     let saved = irqSave()
+    retireDelivery()
     mmTimerScheduling = false
     irqRestore(saved)
   var attempts = 0'u32
@@ -4985,6 +5582,7 @@ proc mm_timer_schedule*() {.exportc, cdecl.} =
     let expiredTimer = block:
       let saved = irqSave()
       defer: irqRestore(saved)
+      retireDelivery()
       template outside(body: untyped) =
         irqRestore(saved)
         try: body
@@ -5004,12 +5602,14 @@ proc mm_timer_schedule*() {.exportc, cdecl.} =
         if mmTimerRevision != revision or mm_timer_list.first != head: continue
         let macTime2 = regRead(MACHW_TIMLO_REG)
         if mmTimerRevision != revision or mm_timer_list.first != head: continue
-        if cast[int32](expiry - macTime2) >= 0: return
+        if cast[int32](expiry - macTime2) > 0: return
       let callback = headTimer.callback
       let argument = cast[pointer](headTimer.env)
       let serial = chanTimerCapture(cast[pointer](head))
       discard co_list_pop_front(addr mm_timer_list)
-      mmTimerCancelMutations(cast[pointer](head))
+      # A same-address clear/rearm after pop still retires this delivery.
+      mmTimerBeginMutation(delivery, cast[pointer](head))
+      delivery.delivering = true
       (timer: cast[pointer](head), callback: callback, argument: argument, serial: serial)
     if expiredTimer.callback != nil and not chanTimerDispatch(expiredTimer.timer,
         expiredTimer.callback, expiredTimer.argument, expiredTimer.serial):
@@ -5017,6 +5617,7 @@ proc mm_timer_schedule*() {.exportc, cdecl.} =
 
   let saved = irqSave()
   defer: irqRestore(saved)
+  retireDelivery()
   let nextTimerNode = mm_timer_list.first
   if nextTimerNode != nil and mmTimerExpired(nextTimerNode):
     nimFwDbgMmTimerYieldHead = mmTimerAt(nextTimerNode).expiry
@@ -5039,7 +5640,6 @@ type
 
 var
   chanCtxtEpochs {.wifiCtrl.}: array[5, uint32]
-  chanCtxtLinkEpochs {.wifiCtrl.}: array[MAX_VIFS, uint32]
   chanBcnDetectActive {.wifiCtrl.}: bool
   chanCdeGeneration {.wifiCtrl.}: uint32
   chanTbttGeneration {.wifiCtrl.}: uint32
@@ -5075,6 +5675,7 @@ proc chan_init*() {.exportc, cdecl.} =
   ##   offset 68: .LANCHOR2 (the static CDE event byte)
   ##   offset 80: chan_ctxt_op_evt
   ##   offset 96: chan_conn_less_delay_evt
+  scanDwellReset()
   chanBcnRequestReset()
   chanSwitchCancel()
   let env = chanEnvView()
@@ -5112,6 +5713,8 @@ proc chan_init*() {.exportc, cdecl.} =
 proc chan_ctxt_add*(param: pointer, ctxtIdxOut: ptr uint8): uint8 {.exportc, cdecl.} =
   ## Add channel context. Search existing for match, else allocate from free list.
   ## From disassembly (68 instrs).
+  if param == nil or ctxtIdxOut == nil:
+    return 1
   let env = chanEnvView()
   let poolBase = cast[uint](addr chan_ctxt_pool[0])
   for existingChannelContextIndex in 0'u8 ..< 3:
@@ -5120,10 +5723,18 @@ proc chan_ctxt_add*(param: pointer, ctxtIdxOut: ptr uint8): uint8 {.exportc, cde
       if c_memcmp(addr ctxt.channel, param, 8.csize_t) == 0:
         ctxtIdxOut[] = existingChannelContextIndex
         return 0
-  let freeCtxt = co_list_pop_front(addr env.freeList)
+  let freeCtxt = env.freeList.first
   if freeCtxt == nil:
     return 1
+  let freeAddress = cast[uint](freeCtxt)
+  let allocatableBytes = MAX_CHAN_CTXT.uint * sizeof(ChanCtxtView).uint
+  if freeAddress < poolBase or freeAddress - poolBase >= allocatableBytes or
+      (freeAddress - poolBase) mod sizeof(ChanCtxtView).uint != 0:
+    return 1
   let ctxt = chanCtxtAt(cast[pointer](freeCtxt))
+  if ctxt.contextIndexOrMarker != 0xFF'u8:
+    return 1
+  discard co_list_pop_front(addr env.freeList)
   let chanCtxtPoolIndex =
     ((cast[uint](ctxt) - poolBase) div sizeof(ChanCtxtView).uint).uint8
   inc chanCtxtEpochs[chanCtxtPoolIndex]
@@ -5143,8 +5754,8 @@ proc chan_ctxt_del*(ctxtIdx: uint8) {.exportc, cdecl.} =
     return
   let env = chanEnvView()
   let ctxt = chanCtxtForIdx(ctxtIdx)
-  # Validate: context must be in use
-  if ctxt.contextIndexOrMarker == 0xFF:
+  # Only the owner slot may be retired.
+  if ctxt.contextIndexOrMarker != ctxtIdx:
     # Blob uses assert_err for chan_ctxt_del invariants.
     assert_err("chan.c", "chan.c", 0xAD0)
     return
@@ -5176,6 +5787,8 @@ proc chan_ctxt_link*(vifIdx: uint8, ctxtIdx: uint8) {.exportc, cdecl.} =
   ##   sets slot status to 1 (slot+22), increments chan_env context count (base+124),
   ##   appends to the active context list and calls chan_ctxt_trigger.
   ## Every link updates the shared channel's TX power limit.
+  if vifIdx >= MAX_VIFS.uint8 or ctxtIdx >= MAX_CHAN_CTXT.uint8:
+    return
   let env = chanEnvView()
   let ctxt = chanCtxtForIdx(ctxtIdx)
   let vif = vifChannelForIdx(vifIdx)
@@ -5217,6 +5830,8 @@ proc chan_ctxt_unlink*(vifIdx: uint8) {.exportc, cdecl.} =
   ## context count, handles scheduled/pending context state transitions,
   ## calls chan_ctxt_del. Updates chan_env flags and timer state.
   ## Reschedules TBTT and updates TX power after unlinking.
+  if vifIdx >= MAX_VIFS.uint8:
+    return
   let vif = vifChannelForIdx(vifIdx)
   # Load channel context pointer from VIF offset 64
   let chanCtxtPtr = vif.chanCtxt
@@ -5277,6 +5892,7 @@ proc chan_ctxt_unlink*(vifIdx: uint8) {.exportc, cdecl.} =
       env.dominantCtxt = nil
   chan_tbtt_schedule(nil)
   chan_update_tx_power(chanCtxtPtr)
+  smDeferredChannelUnlinked(vifIdx)
 
 proc chanLeaseCurrent(lease: ChanCtxtLease): bool =
   if not lease.held or lease.index >= MAX_CHAN_CTXT.uint8 or
@@ -5407,14 +6023,16 @@ proc chan_ctxt_get_remaining_time_ms*(vifEntry: pointer): uint32 {.exportc, cdec
   ## Get remaining time in ms for the current channel context (30 instrs in blob).
   ## Asserts if vifEntry is NULL. Calls
   ## chan_is_on_operational_channel; if it returns false, returns 0. Otherwise
-  ## reads MACHW_TIMLO timestamp and computes (chan_env[0x58] - mactime) / 1000.
+  ## reads MACHW_TIMLO and divides the unsigned 32-bit deadline delta by 1000.
+  ## Keep the wrapped delta: zero tells the SM to transmit immediately, while
+  ## an expired dwell must defer auth/assoc until the next channel activation.
   if vifEntry == nil:
     assert_err("chan.c", "chan.c", 0xD21)
     return 0
   if not chan_is_on_operational_channel(vifEntry):
     return 0
   let macTime = regRead(MACHW_TIMLO_REG)
-  return (chanEnvView().remainingTimeTarget - macTime) div 1000
+  (chanEnvView().remainingTimeTarget - macTime) div 1000
 
 proc chan_ctxt_use_dominant_chan*(): bool {.exportc, cdecl.} =
   ## Check if we should use the dominant channel (8 instrs in blob).
@@ -5472,7 +6090,11 @@ proc chan_is_tx_allowed*(vifEntry: pointer): bool {.exportc, cdecl.} =
   return chanCtxtAt(curCtxt).status == 6
 
 proc chanScanDurationTicks(req: ptr ChanScanReqPayload): uint16 {.inline.} =
-  (req.duration shr 10).uint16
+  if req.duration == 0:
+    return 0
+  # A nonzero dwell needs at least one 1024 us slot. Raw channel requests
+  # must not wrap the slot count even if they bypass SCAN_START_REQ validation.
+  clamp(req.duration shr 10, 1'u32, high(uint16).uint32).uint16
 
 template chanScanChannel(req: ptr ChanScanReqPayload): ptr ChanCtxtDefView =
   cast[ptr ChanCtxtDefView](addr req.band)
@@ -5539,6 +6161,7 @@ proc chan_scan_req*(param: pointer) {.exportc, cdecl.} =
       nimFwTrace2U32("[WIFI-NIMFW] chan_scan_req flags ", chanFlags.uint32, env.flags.uint32)
     if not current(): return
     chanScanPending = true
+    when defined(bl808WifiDiagWarmScan): inc nimFwDbgWarmScan.slot_admitted
     outside: chan_conn_less_delay_prog()
     return
   outside: mm_timer_clear(chanCtxtOpTimer())
@@ -5563,6 +6186,9 @@ proc chan_roc_req*(param: pointer; taskId: uint8): uint8 {.exportc, cdecl.} =
   let request = mmRemainOnChannelReqView(param)
   if request.opCode != 0:
     return (request.opCode != 1).uint8
+  # Validate in milliseconds before multiplying or narrowing to a dwell slot.
+  const maxDurationMs = ((1'u32 shl 26) - 1) div 1000
+  if request.durationMs > maxDurationMs: return 1
   let roc = chanRocOverlay()
   if roc.slot != 0xFF:
     return 1
@@ -5573,7 +6199,7 @@ proc chan_roc_req*(param: pointer; taskId: uint8): uint8 {.exportc, cdecl.} =
   roc.stateLo = 0x01
   roc.slot = 0x04
   let durationTicks = (req.durationMs * 1000'u32) shr 10
-  roc.durationTicks = durationTicks.uint16
+  roc.durationTicks = max(durationTicks, (req.durationMs != 0).uint32).uint16
   roc.requestVifIdx = req.vifIdx
   roc.channel = req.channel
   result = 0
@@ -5621,6 +6247,7 @@ proc chan_bcn_detect_start*(vifEntry: pointer) {.exportc, cdecl.} =
   if sta.valid == 0 or sta.instNbr != identity.index: return
   let channel = chanCtxtAt(chanCtxtPtr).channel
   let beaconInterval = sta.initialRateConfig
+  if beaconInterval < 5000'u32: return
   let env = chanEnvView()
   chanBcnRequestPrune()
   if (env.flags and 0x40) != 0 or env.ctxtCount < 2: return
@@ -5892,15 +6519,20 @@ proc chan_pre_switch_channel*() {.exportc, cdecl.} =
   if targetCtxt == nil:
     return
   if not chanSwitchSelectTarget(targetCtxt): return
+  let scanSlotEpoch = chanCtxtEpochs[3]
   let ctxt = chanCtxtAt(targetCtxt)
   nimFwDbgChanPreChanMeta = packChannelMeta(addr ctxt.channel)
   nimFwDbgChanPreChanFreq = packChannelFreq(addr ctxt.channel)
-  # Drain pending RX descriptors before retuning the PHY; vendor does this on
-  # scan channel switches so received beacons/probe responses reach RXU.
-  rxl_timer_int_handler()
-  if not chanSwitchCallbackCurrent(): return
-  rxl_cntrl_evt()
-  if not chanSwitchCallbackCurrent(): return
+  # Preserve pending scan/ROC results. An ordinary operating-channel switch
+  # follows the preceding force-idle RX reset directly into the PHY retune.
+  let previousCtxt = env.currentCtxt
+  if ctxt.contextIndexOrMarker in [3'u8, 4'u8] or
+      previousCtxt == cast[pointer](chanCtxtForIdx(3)) or
+      previousCtxt == cast[pointer](chanCtxtForIdx(4)):
+    rxl_timer_int_handler()
+    if not chanSwitchCallbackCurrent(): return
+    rxl_cntrl_evt()
+    if not chanSwitchCallbackCurrent(): return
   # .LBB497/.LBE497: Call phy_set_channel with extracted params
   # a5=0, a0..a4 = band,chanType,primFreq,centerFreq1,centerFreq2
   phySetChannel(addr ctxt.channel)
@@ -5926,14 +6558,14 @@ proc chan_pre_switch_channel*() {.exportc, cdecl.} =
     # scan-channel start indication, disables PM for the connectionless slot,
     # then reactivates the MAC before the queued indication is dispatched.
     regWrite(MACHW_BASE + 0x220'u, 0'u32)
-    ke_msg_send_basic(75, 1, 255)
+    scanDwellPublish(MM_SCAN_CHANNEL_START_IND, scanSlotEpoch)
     if not chanSwitchCallbackCurrent(): return
     let saved = irqSave()
     let ps = psEnvView()
     ps.statusFlags = ps.statusFlags or 0x02'u32
     irqRestore(saved)
-    let ccaBusy = regRead(MACHW_BASE + 0x4C'u)
-    env.surveySnapshot = (ccaBusy and 0xFF).uint8
+    # chan_pre_switch_channel+0x128 saves only the PM field for restoration.
+    env.surveySnapshot = ((regRead(MACHW_BASE + 0x4C'u) shr 2) and 1'u32).uint8
     rfPhyTraceCheckpoint(0x45'u32)
     rfPhyTraceCheckpoint(0x46'u32)
     blmac_pwr_mgt_setf(0)
@@ -5946,14 +6578,14 @@ proc chan_pre_switch_channel*() {.exportc, cdecl.} =
     let ps = psEnvView()
     ps.statusFlags = ps.statusFlags or 0x02'u32
     irqRestore(saved)
-    # Read MACHW CCA busy and store survey snapshot
-    let ccaBusy = regRead(MACHW_BASE + 0x4C'u)
-    env.surveySnapshot = (ccaBusy and 0xFF).uint8
+    env.surveySnapshot = ((regRead(MACHW_BASE + 0x4C'u) shr 2) and 1'u32).uint8
     # Blob 0x130: blmac_pwr_mgt_setf(0) to disable power-save during ROC
     blmac_pwr_mgt_setf(0)
     mm_active()
     waitRfUs(1000'u32)
   elif contextIndexOrMarker <= 2:
+    mmReplayEdca()
+    if not chanSwitchCallbackCurrent(): return
     let ps = psEnvView()
     if ps.enabled == 0 or (ps.statusFlags and 8'u32) != 0:
       # Blob .L221: leave PS mode before notifying associated STA VIFs on the
@@ -5967,11 +6599,8 @@ proc chan_pre_switch_channel*() {.exportc, cdecl.} =
           if vif.vifType == 0:
             let vifAssoc = vif.state
             if vifAssoc != 0:
-              if co_list_cnt(addr txFrameEnv().freeList) > 1'u32:
-                discard txl_frame_send_null_frame(vif.staIdx, nil, 0)
-                if not chanSwitchCallbackCurrent(): return
-              else:
-                inc nimFwDbgAutoNullSkipped
+              chanHomeWakeRequest(vif2, contextIndexOrMarker)
+              if not chanSwitchCallbackCurrent(): return
         vif2 = vif.next
 
     # Blob .L222/.L227: walk active VIFs again, mark TD state, release any
@@ -5993,6 +6622,8 @@ proc chan_pre_switch_channel*() {.exportc, cdecl.} =
         if not chanSwitchCallbackCurrent(): return
       vif3 = vif.next
     mm_active()
+
+proc chanStartConnlessSwitch(target: pointer)
 
 proc chanConnlessDelayEvent() =
   ## Caller holds the IRQ lock through the pending-to-active transition.
@@ -6029,7 +6660,7 @@ proc chanConnlessDelayEvent() =
     if env.scheduledCtxt == nil:
       switchArg = cast[pointer](chanCtxtForIdx(3))
   if switchArg != nil:
-    chan_switch_start(switchArg)
+    chanStartConnlessSwitch(switchArg)
 
 proc chan_conn_less_delay_evt*() {.exportc, cdecl.} =
   let saved = irqSave()
@@ -6145,8 +6776,8 @@ proc chanCtxtOpEvent(ctxtPtr: pointer; saved: uint32) =
   var expectedCurrent = env.currentCtxt
   var expectedScheduled = env.scheduledCtxt
   var retired = false
-  template current(): bool =
-    txResetEpoch == resetEpoch and chanCtxtEpochs[index] == allocation and
+  template current(expectedResetEpoch: uint32 = resetEpoch): bool =
+    txResetEpoch == expectedResetEpoch and chanCtxtEpochs[index] == allocation and
       ctxt.contextIndexOrMarker == (if retired: 0xFF'u8 else: index) and
       ctxt.status == expectedStatus and
       equalMem(addr ctxt.channel, unsafeAddr definition, sizeof(definition)) and
@@ -6170,6 +6801,10 @@ proc chanCtxtOpEvent(ctxtPtr: pointer; saved: uint32) =
       return
     # Set status=2, clear chan_env[121,122], tail-call chan_goto_idle_cb
     ctxt.status = 2
+    # The timeout now owns the switch. The forced idle below flushes old TX
+    # callbacks; they must not cancel the timed-out switch or resume it again.
+    if env.scheduledCtxt == ctxtPtr:
+      discard chanProtectionCancel(ctxtPtr)
     env.scanDelayCount = 0
     env.connlessDelayCount = 0
     outside: chan_goto_idle_cb()
@@ -6187,8 +6822,8 @@ proc chanCtxtOpEvent(ctxtPtr: pointer; saved: uint32) =
     ctxt.status = 1
     expectedStatus = 1
     let ctxtCnt = env.ctxtCount
-    if ctxtCnt == 1:
-      # Single context: tail-call chan_switch_start(chan_env[8])
+    if ctxtCnt <= 1:
+      # Zero or one context: tail-call chan_switch_start(chan_env[8]).
       let firstCtxt = cast[pointer](env.activeList.first)
       outside: chan_switch_start(firstCtxt)
       return
@@ -6228,10 +6863,6 @@ proc chanCtxtOpEvent(ctxtPtr: pointer; saved: uint32) =
         if not current(): return
         outside: chan_switch_start(nextChan)
         return
-    # ctxtCnt == 0: just switch to self
-    outside: chan_switch_start(ctxtPtr)
-    return
-
   if env.currentCtxt != ctxtPtr: return
   let ps = psEnvView()
   ps.statusFlags = ps.statusFlags and not 0x02'u32
@@ -6250,7 +6881,7 @@ proc chanCtxtOpEvent(ctxtPtr: pointer; saved: uint32) =
     env.flags = env.flags and not 0x04'u8
   elif contextIndexOrMarker == 3:
     env.flags = env.flags and not 0x08'u8
-    outside: ke_msg_send_basic(77, 1, 0xFF)
+    outside: scanDwellPublish(MM_SCAN_CHANNEL_END_IND, allocation)
     if not current(): return
   if expectedScheduled == ctxtPtr: expectedScheduled = nil
   outside: chanSwitchRetire(ctxtPtr)
@@ -6272,8 +6903,10 @@ proc chanCtxtOpEvent(ctxtPtr: pointer; saved: uint32) =
     outside: chan_cde_evt(addr cdeParam)
   else:
     var idle: bool
-    outside: idle = mm_force_idle_req()
-    if not idle or not current(): return
+    outside: idle = chanForceIdle()
+    # A successful forced idle runs txl_reset once. A second reset or a
+    # replacement channel operation must not restore the old MAC state.
+    if not idle or not current(resetEpoch + 1'u32) or env.ctxtCount != 0: return
     outside: mm_back_to_host_idle()
 
 proc chan_ctxt_op_evt*(ctxtPtr: pointer) {.exportc, cdecl.} =
@@ -6281,10 +6914,6 @@ proc chan_ctxt_op_evt*(ctxtPtr: pointer) {.exportc, cdecl.} =
   let saved = irqSave()
   defer: irqRestore(saved)
   chanCtxtOpEvent(ctxtPtr, saved)
-
-proc chan_survey_timer_end*() {.exportc, cdecl.} =
-  ## Channel survey timer expiry handler (callback stored in chan_env during chan_init).
-  discard
 
 proc chan_distribute_slots*() {.exportc, cdecl.} =
   ## Recompute per-context airtime from the linked VIFs and traffic credits.
@@ -6445,7 +7074,7 @@ proc chanTbttInsert(tbttNode: pointer; operation: var ChanTbttSnapshot;
     let scheduledTbttTime = scheduledTbtt.targetTime
 
     if scheduledTbttState == 2:
-      if cast[int32](nodeTime - scheduledTbttTime) < 0 or
+      if nodeTime < scheduledTbttTime or
           chan_tbtt_detect_conflict(nodeTime, scheduledTbttTime):
         # An in-progress TBTT cannot be displaced.
         displacedStart = cast[ptr CoListHdr](tbttNode)
@@ -6520,11 +7149,6 @@ proc chan_tbtt_insert*(tbttNode: pointer) {.exportc, cdecl.} =
   chanTbttBegin(operation)
   discard chanTbttInsert(tbttNode, operation, saved)
 
-proc chan_send_scanning_stop*(chanEnvPtr: pointer) {.exportc, cdecl.} =
-  ## Send scanning stop notification.
-  ## (Full implementation in separate batch.)
-  discard
-
 proc chan_upd_ctxt_status*(chanCtxtPtr: pointer, newStatus: uint8) {.exportc, cdecl.} =
   ## Update channel context status (54 instrs).
   ## From blob: a0 = chan ctxt entry pointer, a1 = new status.
@@ -6585,14 +7209,14 @@ proc chan_upd_ctxt_status*(chanCtxtPtr: pointer, newStatus: uint8) {.exportc, cd
       targetTime = macTime + (ctxt.opSlot.uint32 shl 10)
   else:
     status = 3
-  # Write status byte
+  # The state determines whether a deadline exists. Zero is a valid absolute
+  # timestamp after MAC-clock wrap, not a request to cancel the timer.
   ctxt.status = status
-  if targetTime == 0:
-    if status != 3:
-      mmTimerClearLocked(chanCtxtOpTimer(), saved)
-  else:
+  if status in {2'u8, 4'u8}:
     mmTimerAt(chanCtxtOpTimer()).env = cast[uint32](cast[uint](chanCtxtPtr))
     mmTimerSetLocked(chanCtxtOpTimer(), targetTime, saved)
+  elif status != 3:
+    mmTimerClearLocked(chanCtxtOpTimer(), saved)
 
 # ###########################################################################
 #                     PHY / IE Helpers
@@ -6611,18 +7235,19 @@ proc phy_channel_to_freq*(band: uint8, channel: uint8): uint16 {.weakExport, cde
   return 0xFFFF'u16
 
 proc phy_freq_to_channel*(band: uint8, freq: uint16): uint8 {.weakExport, cdecl.} =
-  ## Convert frequency to channel number (from blob phy_freq_to_channel).
-  ## band=0 -> 2.4GHz, band=1 -> 5GHz.
+  ## Reject frequencies that have no exact inverse in phy_channel_to_freq.
   if band == 0:
     # 2.4GHz: special case ch14 = 2484 MHz
     if freq == 2484: return 14
     let freqOffsetFromChannelOneMhz = freq.int - 2412
-    if freqOffsetFromChannelOneMhz < 0 or freqOffsetFromChannelOneMhz > 72: return 0
+    if freqOffsetFromChannelOneMhz < 0 or freqOffsetFromChannelOneMhz > 60 or
+        freqOffsetFromChannelOneMhz mod 5 != 0: return 0
     return ((freq.int - 2407) div 5).uint8
   elif band == 1:
-    # 5GHz: channels start at 5000 MHz
-    let freqOffsetFromFiveGhzBaseMhz = freq.int - 5000
-    if freqOffsetFromFiveGhzBaseMhz < 0 or freqOffsetFromFiveGhzBaseMhz > 820: return 0
+    # The vendor range is 5005..5825 MHz, including channel 165.
+    let freqOffsetFromFiveGhzBaseMhz = freq.int - 5005
+    if freqOffsetFromFiveGhzBaseMhz < 0 or freqOffsetFromFiveGhzBaseMhz > 820 or
+        freqOffsetFromFiveGhzBaseMhz mod 5 != 0: return 0
     return ((freq.int - 5000) div 5).uint8
   return 0
 

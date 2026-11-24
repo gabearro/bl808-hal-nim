@@ -55,12 +55,14 @@ type
     ikTable = 1
     ikMemory = 2
     ikGlobal = 3
+    ikTag = 4
 
   ExportKind* = enum
     ekFunc = 0
     ekTable = 1
     ekMemory = 2
     ekGlobal = 3
+    ekTag = 4
 
   Import* = object
     module*: string
@@ -74,6 +76,8 @@ type
       memType*: MemType
     of ikGlobal:
       globalType*: GlobalType
+    of ikTag:
+      tagTypeIdx*: uint32
 
   Export* = object
     name*: string
@@ -554,11 +558,15 @@ type
   CatchClause* = object
     kind*:        CatchKind
     tagIdx*:      uint32  ## exception tag index (ckCatch and ckCatchRef only; module-relative)
-    labelDepth*:  uint32  ## branch target depth (0 = try_table itself, 1 = enclosing, …)
+    labelDepth*:  uint32  ## outer label depth (0 = immediately enclosing label)
 
   # Expression = sequence of compact instructions + auxiliary data
+  WideBlockType* = object
+    pc*, typeIndex*: uint32
+
   Expr* = object
     code*: seq[Instr]
+    wideBlockTypes*: seq[WideBlockType] # Only indices exceeding compact pad capacity.
     brTables*: seq[BrTableData]        # indexed by imm1 for br_table instructions
     v128Consts*: seq[array[16, byte]]  # indexed by imm1 for opV128Const
     catchTables*: seq[seq[CatchClause]]  # indexed by imm2 for opTryTable
@@ -615,13 +623,23 @@ type
     memories*: seq[MemType]
     globals*: seq[GlobalDef]
     exports*: seq[Export]
-    startFunc*: int32           # -1 if no start
+    startFunc*: int64           # optional u32 index; -1 if no start
     elements*: seq[ElemSegment]
     codes*: seq[FuncBody]
     datas*: seq[DataSegment]
-    dataCount*: int32           # -1 if section absent
+    dataCount*: int64           # optional u32 count; -1 if section absent
     customSections*: seq[tuple[name: string, data: seq[byte]]]
-    tagDefs*: seq[WasmTagDef]   # exception tags (section 13)
+    tagDefs*: seq[WasmTagDef]   # local exception tags (section 13)
+
+func tagTypeIndex*(module: WasmModule, index: uint32): int64 =
+  ## The tag index space starts with imports and continues with local tags.
+  var remaining = index
+  for item in module.imports:
+    if item.kind != ikTag: continue
+    if remaining == 0: return item.tagTypeIdx.int64
+    dec remaining
+  if remaining.uint64 >= module.tagDefs.len.uint64: return -1
+  module.tagDefs[remaining.int].typeIdx.int64
 
 # ---- Runtime value type ----
 # Use a flat union for hot-path performance (no variant object overhead)

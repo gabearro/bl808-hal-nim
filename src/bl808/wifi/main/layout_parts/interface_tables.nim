@@ -1,14 +1,14 @@
 const
   BlVifSta = 0'u
   BlVifAp = 1'u
-  NxVirtDevMax = 2'u
-  NxRemoteStaStoreMax = 3'u
+  NxVirtDevMax = WifiHostVifCount.uint
+  NxRemoteStaStoreMax = WifiHostStaTableCount.uint
 
   BlHwIpcEnvOff = 48'u
   BlHwVifsOff = 52'u
   BlHwVifTableOff = 60'u
-  BlHwStaTableOff = 100'u
-  BlHwModParamsOff = 220'u
+  BlHwStaTableOff = WifiHostStaTableOffset
+  BlHwModParamsOff = WifiHostModParamsOffset
 
   BlVifSize = 20'u
   BlVifDevOff = 8'u
@@ -19,7 +19,7 @@ const
   BlVifFcChanOff = 16'u
   BlVifStaPsOff = 17'u
 
-  BlStaSize = 40'u
+  BlStaSize = WifiHostStaEntrySize
   BlStaAddrOff = 16'u
   BlStaIsUsedOff = 22'u
   BlStaStaIdxOff = 23'u

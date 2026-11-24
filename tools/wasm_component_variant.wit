@@ -1,0 +1,12 @@
+package ox64:values@0.2.0;
+
+world variant-demo {
+  variant choice {
+    empty,
+    small(u32),
+    wide(u64),
+    as-float(f32),
+  }
+  export describe: func(value: choice) -> u64;
+  export make-wide: func(value: u64) -> choice;
+}

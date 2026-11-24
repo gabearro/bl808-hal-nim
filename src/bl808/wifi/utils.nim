@@ -7,8 +7,11 @@
 
 when defined(bl808m0) and defined(bl808WifiNimFw):
   import sdk_headers
+  import host_table_layout
   import ../wifi_fw as firmware
   from ../core import csrReadMstatus, disableInterrupts, enableInterrupts
+  when defined(bl808WifiDiagTcpPath):
+    import tcp_path_trace
 
   include utils/layout
   include utils/types
@@ -24,6 +27,10 @@ when defined(bl808m0) and defined(bl808WifiNimFw):
   include utils/monitor_input
 
   when defined(bl808WifiRxPbufInput):
+    when defined(bl808WifiDiagDhcpTxAttempts):
+      import dhcp_flow_trace
+      from std/volatile import volatileLoad
+      include utils/dhcp_rx_trace
     include utils/rx_delivery
     include utils/tcpip_pbuf_alloc_parts/amsdu_input
 

@@ -18,6 +18,9 @@ def source() -> str:
     wmmQosInfo: uint8
     beaconIntervalTu: uint16
     edcaParams: array[16, uint8]""", 1)
+    code = code.replace("  vif.operChan = addr channel\n  vif.keys.flags",
+                        "  vif.operChan = addr channel\n  vif.basicRates[0] = 1\n"
+                        "  vif.basicRates[1] = 12\n  vif.keys.flags", 1)
     code = code.replace("connectModeFlags: uint8]",
                         "connectModeFlags: uint8, pendingBssParams: CoList]", 1)
     code = code.replace("7'u8, 0'u8, 0'u8)", "7'u8, 0'u8, 0'u8, default(CoList))", 1)
@@ -26,7 +29,7 @@ def source() -> str:
   else:
     doAssert id in [SCANU_START_CFM, SCANU_JOIN_CFM]""", 1)
     code = code.replace(procedure(code, "sm_set_bss_param"),
-                        "proc sm_set_bss_param*(param: pointer) {.exportc, cdecl.}\n", 1)
+                        "proc sm_set_bss_param*() {.exportc, cdecl.}\n", 1)
     code = "proc smBssForget(header: pointer)\n" + code
     code = code.replace("  smRegistrationForget(p)\n",
                         "  smBssForget(p)\n  smRegistrationForget(p)\n", 1)

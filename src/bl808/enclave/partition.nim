@@ -13,6 +13,8 @@
 
 import ../mmio, ../memmap, ../tzc, ../pmp, ../flash_layout
 import cruntime  # provides freestanding memcpy/memset/memmove
+when defined(bl808AllcoreWasmHttp) and defined(bl808WifiMbedTlsSha1Hardware):
+  from ../wifi/mbedtls_sha1_dma import installWifiShaDmaWindow
 
 const EnclavePartitionStageAddr = 0x40002E90'u
 const
@@ -271,6 +273,11 @@ proc applyPartition*(p: SecurePartition) =
     discard tzcConfigureWindowRegion(tzcWinWram, 1,
       wifiRxRamStart.uint32, (wifiRxRamEnd - wifiRxRamStart).uint32,
       {0.TzcAuthGroup, 1.TzcAuthGroup}, lock = p.lock)
+
+  when defined(bl808AllcoreWasmHttp) and defined(bl808WifiMbedTlsSha1Hardware):
+    # The provider verifies both the aperture and the SHA register-group
+    # assignment before touching its DMA buffers.
+    discard installWifiShaDmaWindow(p.lock)
 
   # 5. Now move untrusted masters into group 1. At this point live peers keep
   # access to their runtime apertures immediately after the group transition.

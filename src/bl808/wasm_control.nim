@@ -209,7 +209,7 @@ proc resumeWasmProgramTask*(taskId: uint32,
                                 slot = result.slot, value = result.value,
                                 code = result.fuelUsed)
     of wasmTaskBlockedHttp, wasmTaskBlockedSd, wasmTaskBlockedIpc,
-        wasmTaskBlockedTimer, wasmTaskBlockedEnclave:
+        wasmTaskBlockedTimer, wasmTaskBlockedEnclave, wasmTaskBlockedMemory:
       discard appendWasmOsEvent(wasmEventTaskBlocked, taskId = result.taskId,
                                 slot = result.slot, code = result.taskState.ord.uint32)
     else:

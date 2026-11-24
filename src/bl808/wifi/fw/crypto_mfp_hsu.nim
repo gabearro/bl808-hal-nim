@@ -4,8 +4,9 @@
 
 proc mfpIgnoreRxMgmtFrame(desc, param, frameBodyPtr: pointer,
     frameTotalLen: uint16, upload: ptr uint8, flags: ptr uint8,
-    generation: uint32): bool =
-  ## True means ignored. Upload and indication flags are separate outputs.
+    generation: uint32; verifiedBip: ptr bool = nil): bool =
+  ## True means ignored. The optional verdict reports only a committed BIP check.
+  if verifiedBip != nil: verifiedBip[] = false
   template reject(): untyped =
     if upload != nil: upload[] = 0
     return true
@@ -116,6 +117,7 @@ proc mfpIgnoreRxMgmtFrame(desc, param, frameBodyPtr: pointer,
         reject()
       replay.pnLow = (nextIpn and 0xFFFFFFFF'u64).uint32
       replay.pnHigh = (nextIpn shr 32).uint32
+    if verifiedBip != nil: verifiedBip[] = true
     return false
   else:
     let sta = staInfoForIdx(staIdx)

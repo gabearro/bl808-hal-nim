@@ -104,7 +104,7 @@ static inline unsigned long __csr_read_time(void) {
   unsigned long v; asm volatile("csrr %0, time" : "=r"(v)); return v;
 }
 static inline void __do_wfi(void) {
-  asm volatile("wfi");
+  asm volatile("wfi" ::: "memory");
 }
 static inline void __do_fence(void) {
   asm volatile("fence" ::: "memory");
@@ -128,10 +128,10 @@ static inline void __do_mret(void) {
   asm volatile("mret");
 }
 static inline void __csr_set_mstatus_mie(void) {
-  asm volatile("csrsi mstatus, 0x8");
+  asm volatile("csrsi mstatus, 0x8" ::: "memory");
 }
 static inline void __csr_clear_mstatus_mie(void) {
-  asm volatile("csrci mstatus, 0x8");
+  asm volatile("csrci mstatus, 0x8" ::: "memory");
 }
 
 __attribute__((noreturn))

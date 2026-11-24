@@ -317,12 +317,9 @@ proc desugarAwaitTryExprBinding(s: NimNode): seq[NimNode] =
   result = @[tmpDecl, rewrittenTry, finalBinding]
 
 proc liftAwaitArgs(n: NimNode, lifted: var seq[NimNode]): NimNode =
-  ## Recursively walk an expression and lift any `await` calls that appear
-  ## as arguments to other calls into preceding `let` statements.
-  ## Returns the rewritten expression with awaits replaced by temp idents.
-  ## Does NOT lift top-level awaits (those are handled by splitStmtForAwait).
+  ## Lift awaits in an expression into preceding let statements and return the
+  ## expression with those awaits replaced by temporary identifiers.
   if n.isAwaitCall:
-    # This is an await nested inside something else — lift it
     let tmpName = ident("_cpsAwaitArg_" & $liftAwaitCounter)
     inc liftAwaitCounter
     lifted.add nnkLetSection.newTree(
@@ -345,6 +342,13 @@ proc liftAwaitInStmt(s: NimNode): seq[NimNode] =
   let desugaredTryBinding = desugarAwaitTryExprBinding(s)
   if desugaredTryBinding.len > 0:
     return desugaredTryBinding
+
+  if s.kind == nnkAsgn and s[1].isAwaitCall:
+    # The result temporary belongs to the continuation, not the destination.
+    # Preserve normal name lookup and lvalue evaluation after the await.
+    let value = liftAwaitArgs(s[1], result)
+    result.add nnkAsgn.newTree(s[0].copyNimTree(), value)
+    return
 
   # Top-level patterns already handled by splitStmtForAwait — skip them
   if isDirectAwaitStmt(s) or (s.kind == nnkReturnStmt and s[0].isAwaitCall):

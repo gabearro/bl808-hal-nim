@@ -48,7 +48,7 @@ for point in ["[WIFI-NIMFW] ssid_e ", "[WIFI-NIMFW] ssid_hit ", "vendor_match"]:
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-def test_winner_changes_during_later_entry(tmp_path: Path, mode: str) -> None:
+def test_weaker_entry_does_not_invoke_match_callback(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, source() + r'''
 setup()
 scanu_env.entries[0].rssi = -10
@@ -58,8 +58,8 @@ traceHook = proc(tag: string) =
     inc matches
     if matches == 2: scanu_env.entries[0].valid = 0
 var selected = 0x12345678'u32
-doAssert scanu_search_by_ssid(addr query, addr selected) == nil
-doAssert matches >= 2 and selected == 0x12345678'u32
+doAssert scanu_search_by_ssid(addr query, addr selected) == addr scanu_env.entries[0]
+doAssert matches == 1 and selected == 0'u32
 ''')
 
 

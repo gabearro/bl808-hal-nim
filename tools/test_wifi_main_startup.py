@@ -23,7 +23,11 @@ var
   writes: seq[tuple[address: uint, value: uint32]]
   steps: seq[string]
   messages: seq[tuple[line: cint, message: string]]
-  interrupts, incomingIrq, loggerEnabled, blReady: bool
+  interrupts, incomingIrq, loggerEnabled, blReady, rfReady, ipcReady: bool
+  ipcEmbEnv: pointer
+  ipcTaskToken: uint32
+  rfOnStatus: cint
+  pmInitStatus: cint
   logLookups, serviceCalls: int
   onInit: proc(name: string)
 {.emit: "#include <stdarg.h>\n#include <stdio.h>".}
@@ -73,20 +77,25 @@ proc note(name: string) =
   doAssert interrupts == incomingIrq
   steps.add(name)
   if onInit != nil: onInit(name)
-proc wifi_hosal_rf_turn_on() = note("rf-on")
+proc wifi_hosal_rf_turn_on(): cint =
+  note("rf-on")
+  rfOnStatus
 proc wifiRfCoreInit(frequency: uint32) =
   doAssert frequency == 40000000
   note("rf-init")
+proc wifiRfCoreReady(): bool = rfReady
 proc mpif_clk_init() = note("mpif")
 proc sysctrl_init() = note("sysctrl")
 proc intc_init() = note("intc-init")
-proc ipc_emb_init() = note("ipc")
+proc ipc_emb_init() =
+  note("ipc")
+  ipcEmbEnv = if ipcReady: addr ipcTaskToken else: nil
 proc bl_init(): bool {.discardable.} =
   note("bl")
   blReady
-proc bl_pm_ops_register(argument: pointer) =
-  doAssert argument == nil
+proc bl_pm_ops_register(): uint32 =
   note("pm")
+  0'u32
 proc wifiMainServiceBlockingIdle(): bool =
   doAssert interrupts == incomingIrq
   steps.add("service")
@@ -104,6 +113,11 @@ proc setup(irq, logging: bool; initial: uint32) =
   incomingIrq = irq
   loggerEnabled = logging
   blReady = true
+  rfReady = true
+  ipcReady = true
+  ipcEmbEnv = nil
+  rfOnStatus = 0
+  pmInitStatus = 0
   logLookups = 0
   serviceCalls = 0
   onInit = nil
@@ -211,7 +225,7 @@ const
   IntcPend = INTC_PEND_REG.uint32
   BcnStatus = MACHW_BCN_STATUS_REG.uint32
   CoexCtrl = COEX_CTRL_REG.uint32
-var fwStarted: bool
+var fwStarted, usesNativeWlan: bool
 proc regRead32(address: uint32): uint32 = regRead(address.uint)
 proc regWrite32(address, value: uint32) = regWrite(address.uint, value)
 proc osEnterCritical(): uint32 = irqSave()
@@ -219,6 +233,9 @@ proc osExitCritical(saved: uint32) = irqRestore(saved)
 proc bl808WifiBackendTrace(message: cstring) = discard
 proc setupBlOps() = note("setup-ops")
 proc setupHosal() = note("setup-hosal")
+proc bl_pm_init(): cint =
+  note("pm-init")
+  pmInitStatus
 proc bl808WifiBackendPrepareWirelessDomain(forceReset: bool) =
   doAssert forceReset
   note("domain-reset")
@@ -228,11 +245,10 @@ proc bl_wifi_clock_enable(): cint =
 proc wifi_hosal_rf_turn_on(argument: pointer): cint =
   doAssert argument == nil
   wifi_hosal_rf_turn_on()
-  0
 proc bl808WifiBackendApplyHighPowerProfile() = note("power-profile")
+proc wifiRfCoreUsesNativeWlan(): bool = usesNativeWlan
 proc bl808WifiBackendClearEmbIpc() = note("clear-embedded")
 proc bl808WifiBackendClearHostIpc() = note("clear-host")
-proc bl_pm_ops_register() = bl_pm_ops_register(nil)
 ''' + procedure(path.read_text(), "bl808WifiBackendFwStart")
     return code
 
@@ -251,7 +267,7 @@ for irq in [false, true]:
           "initial MAC control bit was not enabled before MPIF"
     bl808WifiBackendFwStart()
     doAssert steps == @[
-      "setup-ops", "setup-hosal", "domain-reset", "clock-enable",
+      "setup-ops", "setup-hosal", "pm-init", "domain-reset", "clock-enable",
       "lock", "intc", "delay", "intc", "delay", "restore", "rf-on", "rf-init",
       "control", "power-profile", "mpif", "sysctrl", "intc-init", "ipc",
       "clear-embedded", "clear-host", "bl", "pm", "timing", "control",
@@ -263,4 +279,17 @@ for irq in [false, true]:
     bl808WifiBackendFwStart()
     doAssert steps == previousSteps and writes == previousWrites
     doAssert messages.len == 0 and logLookups == 0
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_native_backend_keeps_calibrated_rate_rows(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, backend_source() + r'''
+setup(true, false, 0xA5A50121'u32)
+fwStarted = false
+usesNativeWlan = true
+doAssert bl808WifiBackendFwStart()
+doAssert "rf-init" in steps and "mpif" in steps
+doAssert "power-profile" notin steps
+doAssert writes == expectedWrites(0xA5A50121'u32)
 ''')

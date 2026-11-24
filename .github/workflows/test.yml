@@ -1,0 +1,65 @@
+name: tests
+
+# Host test gate for the BL808 HAL. Runs the self-contained pytest suite on
+# every push/PR so WASM-OS / host-tooling regressions are caught without
+# hardware. The cross-compile job is best-effort (the RISC-V toolchain install
+# is environment-dependent) and does not block the gate. Hardware validation
+# tiers (make hw-*) still run manually per AGENTS.md.
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  host-tests:
+    name: Host pytest gate (make test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Create venv and install deps
+        run: make venv
+      - name: Run host test gate
+        run: make test
+
+  wifi-model-fuzzer:
+    name: BL808 Wi-Fi model fuzzer
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: nim-lang/setup-nim@v2
+        with:
+          nim-version: '2.2.6'
+      - name: Create test environment
+        run: make venv
+      - name: Explore bounded schedules
+        run: .venv/bin/python tools/run_wifi_model_fuzzer.py --seed 808 --steps 256
+
+  cross-compile:
+    name: Cross-compile WASM examples (best-effort)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nim
+        uses: nim-lang/setup-nim@v2
+        with:
+          nim-version: '2.2.6'
+      - name: Install RISC-V toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-unknown-elf
+      - name: Build M0/D0/LP WASM smoke examples
+        run: |
+          make m0 FILE=examples/m0_wasm_smoke_test.nim
+          make d0 FILE=examples/d0_wasm_smoke_test.nim
+          make lp FILE=examples/lp_wasm_smoke_test.nim
+      - name: Build M0 CPS scheduler example
+        run: make m0 FILE=examples/m0_wasm_cps_scheduler_test.nim

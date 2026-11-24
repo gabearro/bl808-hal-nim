@@ -3292,6 +3292,24 @@
       "timeout": 20
     },
     {
+      "name": "m0_usb_uart_flash_anchor",
+      "tiers": ["experimental"],
+      "build": [{
+        "id": "kernel",
+        "core": "bl808m0",
+        "source": "examples/m0_usb_uart_flash_anchor.nim",
+        "flash": "m0",
+        "defines": {
+          "bl808UsbAnchorResident": "1",
+          "bl808directtrap": "1",
+          "bl808jtagram": "1",
+          "bl808TrapFrameDiag": "1"
+        }
+      }],
+      "required": ["BL808-UART-FLASH-ANCHOR v1"],
+      "timeout": 10
+    },
+    {
       "name": "m0_uart_flash_anchor",
       "tiers": [
         "experimental"
@@ -5198,6 +5216,513 @@
       "timeout": 80
     },
     {
+      "name": "m0_agc_combiner_probe",
+      "tiers": [],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_agc_combiner_probe.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "bl808WifiDebugContinuePhyAssert": "1"
+          }
+        }
+      ],
+      "required": [
+        "AGC COMBINER START",
+        "AGC COMBINER RF READY",
+        "AGC COMBINER IMAGE LOADED",
+        "AGC COMBINER IMAGE RESTORED",
+        "AGC COMBINER END"
+      ],
+      "timeout": 90
+    },
+    {
+      "name": "m0_agc_bit10_factorial",
+      "tiers": [],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_agc_bit10_factorial.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "bl808WifiDebugContinuePhyAssert": "1"
+          }
+        }
+      ],
+      "required": [
+        "AGC BIT10 FACTORIAL START",
+        "AGC BIT10 FACTORIAL RF READY",
+        "AGC BIT10 FACTORIAL IMAGE RESTORED",
+        "AGC BIT10 FACTORIAL END"
+      ],
+      "timeout": 90
+    },
+    {
+      "name": "m0_agc_lower_bit_sweep",
+      "tiers": [],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_agc_lower_bit_sweep.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "bl808WifiDebugContinuePhyAssert": "1"
+          }
+        }
+      ],
+      "required": [
+        "AGC LOWER BIT START",
+        "AGC LOWER BIT RF READY",
+        "AGC LOWER BIT IMAGE RESTORED",
+        "AGC LOWER BIT END"
+      ],
+      "timeout": 90
+    },
+    {
+      "name": "m0_agc_predicate03_gain_probe",
+      "tiers": [],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_agc_predicate03_gain_probe.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "bl808WifiDebugContinuePhyAssert": "1"
+          }
+        }
+      ],
+      "required": [
+        "AGC P03 GAIN START",
+        "AGC P03 GAIN RF READY",
+        "AGC P03 GAIN IMAGE RESTORED",
+        "AGC P03 GAIN END"
+      ],
+      "timeout": 90
+    },
+    {
+      "name": "m0_agc_predicate_sweep",
+      "tiers": [],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_agc_predicate_sweep.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "bl808WifiDebugContinuePhyAssert": "1"
+          }
+        }
+      ],
+      "required": [
+        "AGC PREDICATE START",
+        "AGC PREDICATE RF READY",
+        "AGC PREDICATE IMAGE RESTORED",
+        "AGC PREDICATE END"
+      ],
+      "timeout": 90
+    },
+    {
+      "name": "m0_agc_extension29_probe",
+      "tiers": [],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_agc_extension29_probe.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "bl808WifiDebugContinuePhyAssert": "1"
+          }
+        }
+      ],
+      "required": [
+        "AGC EXT29 START",
+        "AGC EXT29 RF READY",
+        "AGC EXT29 IMAGE RESTORED",
+        "AGC EXT29 END"
+      ],
+      "timeout": 90
+    },
+    {
+      "name": "m0_agc_state_diag_probe",
+      "tiers": [],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_agc_state_diag_probe.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "bl808WifiDebugContinuePhyAssert": "1"
+          }
+        }
+      ],
+      "required": [
+        "AGC STATE DIAG START",
+        "AGC STATE DIAG RF READY",
+        "AGC STATE DIAG IMAGE RESTORED",
+        "AGC STATE DIAG END"
+      ],
+      "timeout": 90
+    },
+    {
+      "name": "m0_agc_page_timer_probe",
+      "tiers": [],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_agc_page_timer_probe.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "bl808WifiDebugContinuePhyAssert": "1"
+          }
+        }
+      ],
+      "required": [
+        "AGC PAGE TIMER START",
+        "AGC PAGE TIMER RF READY",
+        "AGC PAGE TIMER IMAGE RESTORED",
+        "AGC PAGE TIMER END"
+      ],
+      "timeout": 90
+    },
+    {
+      "name": "m0_agc_path_page_probe",
+      "tiers": [],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_agc_path_page_probe.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "bl808WifiDebugContinuePhyAssert": "1"
+          }
+        }
+      ],
+      "required": [
+        "AGC PATH PAGE START",
+        "AGC PATH PAGE RF READY",
+        "AGC PATH PAGE IMAGE LOADED",
+        "AGC PATH PAGE IMAGE RESTORED",
+        "AGC PATH PAGE END"
+      ],
+      "timeout": 90
+    },
+    {
+      "name": "m0_agc_timeout_diag_probe",
+      "tiers": [],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_agc_timeout_diag_probe.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "bl808WifiDebugContinuePhyAssert": "1"
+          }
+        }
+      ],
+      "required": [
+        "AGC TIMEOUT DIAG START",
+        "AGC TIMEOUT DIAG RF READY",
+        "AGC TIMEOUT DIAG IMAGE RESTORED",
+        "AGC TIMEOUT DIAG END"
+      ],
+      "timeout": 90
+    },
+    {
+      "name": "m0_agc_timer_probe",
+      "tiers": [],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_agc_timer_probe.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "bl808WifiDebugContinuePhyAssert": "1"
+          }
+        }
+      ],
+      "required": [
+        "AGC TIMER START",
+        "AGC TIMER RF READY",
+        "AGC TIMER IMAGE LOADED",
+        "AGC TIMER IMAGE RESTORED",
+        "AGC TIMER END"
+      ],
+      "timeout": 90
+    },
+    {
+      "name": "m0_agc_priority_probe",
+      "tiers": [],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_agc_priority_probe.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "bl808WifiDebugContinuePhyAssert": "1"
+          }
+        }
+      ],
+      "required": [
+        "AGC PRIORITY START",
+        "AGC PRIORITY RF READY",
+        "AGC PRIORITY IMAGE LOADED",
+        "AGC PRIORITY IMAGE RESTORED",
+        "AGC PRIORITY END"
+      ],
+      "timeout": 90
+    },
+    {
+      "name": "m0_agc_probe",
+      "tiers": [],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_agc_probe.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "bl808WifiDebugContinuePhyAssert": "1"
+          }
+        }
+      ],
+      "required": [
+        "AGC PROBE START",
+        "AGC PROBE RFC READY",
+        "AGC PROBE CHANNEL READY",
+        "AGC PATCH RESTORED",
+        "AGC TRACE END",
+        "AGC PROBE END"
+      ],
+      "timeout": 60
+    },
+    {
+      "name": "m0_wifi_csi_cadence",
+      "tiers": [],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wifi_csi_cadence.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808CsiCapture": "1",
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "bl808WifiDebugContinuePhyAssert": "1"
+          }
+        }
+      ],
+      "required": [
+        "CSI CADENCE START",
+        "CSI CADENCE CONFIG",
+        "CSI CADENCE END"
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "m0_wifi_audio_power_trace",
+      "tiers": [],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wifi_audio_power_trace.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808CsiCapture": "1",
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "bl808WifiDebugContinuePhyAssert": "1"
+          }
+        }
+      ],
+      "required": [
+        "RF AUDIO TRACE START",
+        "RF AUDIO TRACE CONFIG",
+        "RF AUDIO TRACE END"
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "m0_wifi_packet_csi_trace",
+      "tiers": [],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wifi_packet_csi_trace.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808CsiCapture": "1",
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "bl808WifiDebugContinuePhyAssert": "1"
+          }
+        }
+      ],
+      "required": [
+        "RF PACKET TRACE START",
+        "RF PACKET TRACE CONFIG",
+        "RF PACKET TRACE END"
+      ],
+      "timeout": 180
+    },
+    {
+      "name": "m0_wifi_csi_snapshot_ram_probe",
+      "tiers": [],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wifi_csi_snapshot.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808CsiCapture": "1",
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "bl808WifiDebugContinuePhyAssert": "1"
+          }
+        }
+      ],
+      "required": [
+        "CSI1 BEGIN",
+        "CSI1 END"
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "m0_wifi_csi_snapshot",
+      "tiers": [],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wifi_csi_snapshot.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808CsiCapture": "1",
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1"
+          }
+        }
+      ],
+      "required": [
+        "CSI1 BEGIN version=0x00000001 status=0x00000000",
+        "CSI1 END"
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "m0_wifi_direct_csi_scan_probe",
+      "tiers": [],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wifi_hal_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "bl808WifiDirectCsiProbe": "1",
+            "WifiScanOnly": "1"
+          }
+        }
+      ],
+      "required": [
+        "DIRECT CSI PROBE ARMED",
+        "DIRECT CSI PROBE SUMMARY",
+        "DIRECT CSI PROBE RESTORED",
+        "[PASS] wifi scan results",
+        "=== Test Complete ==="
+      ],
+      "jtag_snapshot": [
+        "poll",
+        "reg pc",
+        "reg mepc",
+        "reg mcause",
+        "reg mtvec",
+        "mdw 0x24C00000 1",
+        "mdw 0x24C0003C 1",
+        "mdw 0x24C00064 1",
+        "mdw 0x24C008F8 1",
+        "mdw 0x24C00874 1"
+      ],
+      "timeout": 120
+    },
+    {
+      "name": "m0_wifi_direct_csi_data_probe",
+      "tiers": [],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wifi_hal_test.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "bl808WifiDirectCsiProbe": "1",
+            "WifiKeepaliveFrames": "3",
+            "WifiSsid": {
+              "env": "BL808_WIFI_SSID"
+            },
+            "WifiPassword": {
+              "secret_env": "BL808_WIFI_PASSWORD"
+            }
+          }
+        }
+      ],
+      "required": [
+        "DIRECT CSI PROBE ARMED",
+        "DIRECT CSI PROBE SUMMARY",
+        "DIRECT CSI PROBE RESTORED",
+        "[PASS] wifi connect",
+        "[PASS] wifi keepalive tx ack",
+        "[PASS] direct csi rx data observed",
+        "=== Test Complete ==="
+      ],
+      "timeout": 180
+    },
+    {
       "name": "m0_wifi_nimfw_scan_hal_test",
       "tiers": [
         "smoke"
@@ -5211,6 +5736,7 @@
           "defines": {
             "bl808WifiNimFw": "1",
             "bl808WifiUseBl808Rf": "1",
+            "bl808WifiNativeWlanCalibration": "1",
             "WifiScanOnly": "1"
           }
         }
@@ -5494,19 +6020,9 @@
         "mdw {sym:nimfw_dbg_eapol_tx_cb} 1",
         "mdw {sym:nimfw_dbg_pbuf_alloc_fail} 1",
         "mdw {sym:nimfw_dbg_pbuf_take_fail} 1",
-        "mdw {sym:nimfw_dbg_crypto_pmk} 8",
-        "mdw {sym:nimfw_dbg_crypto_own} 2",
-        "mdw {sym:nimfw_dbg_crypto_bssid} 2",
-        "mdw {sym:nimfw_dbg_crypto_snonce} 8",
-        "mdw {sym:nimfw_dbg_crypto_anonce} 8",
-        "mdw {sym:nimfw_dbg_crypto_kck} 4",
-        "mdw {sym:nimfw_dbg_crypto_prf_data} 19",
-        "mdw {sym:nimfw_dbg_mic_kck} 4",
-        "mdw {sym:nimfw_dbg_mic_computed} 4",
         "mdw {sym:nimfw_dbg_mic_frame_len} 1",
         "mdw {sym:nimfw_dbg_mic_ver} 1",
-        "mdw {sym:nimfw_dbg_m2_len} 1",
-        "mdw {sym:nimfw_dbg_m2_buf} 40"
+        "mdw {sym:nimfw_dbg_m2_len} 1"
       ],
       "timeout": 80
     },
@@ -5524,6 +6040,7 @@
           "defines": {
             "bl808WifiNimFw": "1",
             "bl808WifiUseBl808Rf": "1",
+            "bl808WifiNativeWlanCalibration": "1",
             "bl808WifiForcePmfCapable": "1",
             "WifiSsid": {
               "env": "BL808_WIFI_SSID"
@@ -5644,6 +6161,8 @@
           "defines": {
             "bl808WifiNimFw": "1",
             "bl808WifiUseBl808Rf": "1",
+            "bl808WifiNativeWlanCalibration": "1",
+            "bl808WifiKeepaliveStaOnly": "1",
             "bl808WifiForcePmfCapable": "1",
             "WifiKeepaliveFrames": "3",
             "WifiSsid": {
@@ -5680,6 +6199,7 @@
         "mdw {sym:nimfw_dbg_nullframe_cfm} 1",
         "mdw {sym:nimfw_dbg_nullframe_ack_ok} 1",
         "mdw {sym:nimfw_dbg_nullframe_ack_fail} 1",
+        "mdw {sym:nimfw_dbg_nullframe_no_hw_result} 1",
         "mdw {sym:nimfw_keepalive_qosnull_enabled} 1",
         "mdw {sym:nimfw_ble_wifi_role_window_enabled} 1",
         "mdw {sym:nimfw_ble_wifi_role_window_active} 1",
@@ -5841,6 +6361,8 @@
           "defines": {
             "bl808WifiNimFw": "1",
             "bl808WifiUseBl808Rf": "1",
+            "bl808WifiNativeWlanCalibration": "1",
+            "bl808WifiKeepaliveStaOnly": "1",
             "bl808WifiForcePmfCapable": "1",
             "WifiKeepaliveFrames": "3",
             "WifiKeepaliveQosNull": "1",
@@ -5877,6 +6399,7 @@
         "mdw {sym:nimfw_dbg_nullframe_cfm} 1",
         "mdw {sym:nimfw_dbg_nullframe_ack_ok} 1",
         "mdw {sym:nimfw_dbg_nullframe_ack_fail} 1",
+        "mdw {sym:nimfw_dbg_nullframe_no_hw_result} 1",
         "mdw {sym:nimfw_dbg_nullframe_status} 1",
         "mdw {sym:nimfw_dbg_nullframe_fc} 1",
         "mdw {sym:nimfw_dbg_nullframe_vif_sta} 1",
@@ -7356,6 +7879,77 @@
       ]
     },
     {
+      "name": "m0_allcore_usb_anchor_app",
+      "tiers": ["manual"],
+      "build": [
+        {
+          "id": "app",
+          "core": "bl808m0",
+          "source": "examples/m0_allcore_test.nim",
+          "defines": {"bl808UsbAnchorApp": "1"}
+        },
+        {
+          "id": "d0",
+          "core": "bl808d0",
+          "source": "examples/d0_allcore_test.nim"
+        },
+        {
+          "id": "lp",
+          "core": "bl808lp",
+          "source": "examples/lp_allcore_test.nim",
+          "defines": {"bl808jtagram": "1", "bl808UsbAnchorLpPeer": "1"}
+        }
+      ],
+      "input": "r",
+      "required": [
+        "=== BL808 All-Core Integration Test (M0) ===",
+        "Result: 5 passed, 0 failed",
+        "=== ALL TESTS PASSED ==="
+      ],
+      "forbidden": ["[FAIL]"],
+      "timeout": 45
+    },
+    {
+      "name": "allcore_core_id_probe",
+      "tiers": [
+        "manual"
+      ],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/allcore_core_id_probe.nim",
+          "flash": "m0"
+        },
+        {
+          "id": "d0",
+          "core": "bl808d0",
+          "source": "examples/allcore_core_id_probe.nim",
+          "flash": "d0"
+        },
+        {
+          "id": "lp",
+          "core": "bl808lp",
+          "source": "examples/allcore_core_id_probe.nim",
+          "flash": "lp"
+        }
+      ],
+      "required": [
+        "CORE_ID_M0_E9070000",
+        "CORE_ID_D0_DEAD5500",
+        "CORE_ID_LP_DEADE902",
+        "CORE_IDS_OK"
+      ],
+      "timeout": 45,
+      "jtag_snapshot": [
+        "poll",
+        "reg pc",
+        "reg sp",
+        "mdw 0x40002e40 12",
+        "mdw 0x40003e00 1"
+      ]
+    },
+    {
       "name": "m0_wasm_smoke_test",
       "tiers": [
         "manual"
@@ -7655,6 +8249,7 @@
       "tiers": [
         "manual"
       ],
+      "lp_flash_offset": 917504,
       "build": [
         {
           "id": "kernel",
@@ -7668,6 +8263,7 @@
             "bl808EnclaveWram": "true",
             "bl808WifiNimFw": "1",
             "bl808WifiUseBl808Rf": "1",
+            "bl808WifiNativeWlanCalibration": "1",
             "bl808WifiRealLwip": "1",
             "bl808WifiRealLwipTcp": "1",
             "bl808WifiRxPbufInput": "1",
@@ -7676,7 +8272,9 @@
             "HwValidationLogExternalBuffer": "1",
             "HwValidationLogCapacity": "1024",
             "WifiSsid": "Frog",
-            "WifiPassword": "6509171272",
+            "WifiPassword": {
+              "secret_env": "BL808_WIFI_PASSWORD"
+            },
             "WifiFallbackSsid": "Frog",
             "WifiFallbackChannel": "0",
             "WifiFallbackAfterAttempts": "255"
@@ -7945,6 +8543,211 @@
       ]
     },
     {
+      "name": "lp_jtag_activity_probe_test",
+      "tiers": [
+        "manual"
+      ],
+      "defines": {
+        "LpJtagActivityProbe": "1"
+      },
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_lp_jtag_enable_helper.nim",
+          "flash": "m0"
+        },
+        {
+          "id": "lp",
+          "core": "bl808lp",
+          "source": "examples/lp_jtag_enable.nim",
+          "flash": "lp"
+        }
+      ],
+      "required": [
+        "[OK] LP JTAG helper ran",
+        "LP_ACTIVITY_WINDOW",
+        "BL808_LP_TAP_PROBE done",
+        "[OK] LP JTAG activity probe complete"
+      ],
+      "host_actions": [
+        {
+          "after_marker": "LP_ACTIVITY_WINDOW",
+          "cmd": [
+            "{python}",
+            "tools/lp_tap_only_probe.py"
+          ],
+          "required": [
+            "BL808_LP_TAP_PROBE done"
+          ],
+          "timeout": 25
+        }
+      ],
+      "timeout": 35,
+      "jtag_pre_resume": [
+        "mww 0x40002f60 0x00000000",
+        "mww 0x40002f64 0x00000000",
+        "mww 0x40002f68 0x00000000",
+        "mww 0x40002f6c 0x00000000",
+        "mww 0x40002f70 0x00000000",
+        "mww 0x40002f74 0x00000000",
+        "mww 0x40002f78 0x00000000",
+        "mww 0x40002f7c 0x00000000"
+      ],
+      "close_jtag_after_load": true,
+      "jtag_poll_after_success": false,
+      "jtag_snapshot": [
+        "poll",
+        "reg pc",
+        "reg sp",
+        "mdw 0x40002f60 8",
+        "mdw 0x40002f80 48",
+        "mdw 0x20000510 1",
+        "mdw 0x200008cc 4",
+        "mdw 0x200008dc 2",
+        "mdw 0x200008f4 2"
+      ]
+    },
+    {
+      "name": "lp_jtag_vendor_activity_probe_test",
+      "tiers": [
+        "manual"
+      ],
+      "defines": {
+        "LpJtagActivityProbe": "1",
+        "LpJtagVendorActivityProbe": "1"
+      },
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_lp_jtag_enable_helper.nim",
+          "flash": "m0"
+        },
+        {
+          "id": "lp",
+          "core": "bl808lp",
+          "source": "examples/lp_jtag_enable.nim",
+          "flash": "lp"
+        }
+      ],
+      "required": [
+        "[OK] LP JTAG helper ran",
+        "LP_ACTIVITY_WINDOW",
+        "BL808_LP_VENDOR_PROBE done",
+        "BL808_LP_VENDOR_SNAPSHOT done"
+      ],
+      "host_actions": [
+        {
+          "after_marker": "LP_ACTIVITY_WINDOW",
+          "cmd": [
+            "{python}",
+            "tools/lp_vendor_cklink_probe.py"
+          ],
+          "required": [
+            "BL808_LP_VENDOR_PROBE done",
+            "BL808_LP_VENDOR_SNAPSHOT done"
+          ],
+          "timeout": 220
+        }
+      ],
+      "timeout": 260,
+      "jtag_pre_resume": [
+        "mww 0x40002f60 0x00000000",
+        "mww 0x40002f64 0x00000000",
+        "mww 0x40002f68 0x00000000",
+        "mww 0x40002f6c 0x00000000",
+        "mww 0x40002f70 0x00000000",
+        "mww 0x40002f74 0x00000000",
+        "mww 0x40002f78 0x00000000",
+        "mww 0x40002f7c 0x00000000"
+      ],
+      "close_jtag_after_load": true,
+      "jtag_poll_after_success": false,
+      "jtag_snapshot": [
+        "poll",
+        "reg pc",
+        "reg sp",
+        "mdw 0x40002f60 8",
+        "mdw 0x40002f80 48",
+        "mdw 0x20000510 1",
+        "mdw 0x200008cc 4",
+        "mdw 0x200008dc 2",
+        "mdw 0x200008f4 2"
+      ]
+    },
+    {
+      "name": "lp_jtag_vendor_pullup_activity_probe_test",
+      "tiers": [
+        "manual"
+      ],
+      "defines": {
+        "LpJtagActivityProbe": "1",
+        "LpJtagVendorActivityProbe": "1",
+        "LpJtagShortActivityProbe": "1",
+        "LpKeepM0JtagPins": "1",
+        "LpCjtagPullUpProbe": "1"
+      },
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_lp_jtag_enable_helper.nim",
+          "flash": "m0"
+        },
+        {
+          "id": "lp",
+          "core": "bl808lp",
+          "source": "examples/lp_jtag_enable.nim",
+          "flash": "lp"
+        }
+      ],
+      "required": [
+        "[OK] LP JTAG helper ran",
+        "LP_ACTIVITY_WINDOW",
+        "BL808_LP_VENDOR_PROBE done"
+      ],
+      "host_actions": [
+        {
+          "after_marker": "LP_ACTIVITY_WINDOW",
+          "cmd": [
+            "/usr/bin/env",
+            "BL808_VENDOR_SNAPSHOT_DELAY=-1",
+            "{python}",
+            "tools/lp_vendor_cklink_probe.py"
+          ],
+          "required": [
+            "BL808_LP_VENDOR_PROBE done"
+          ],
+          "timeout": 90
+        }
+      ],
+      "timeout": 120,
+      "jtag_pre_resume": [
+        "mww 0x40002f60 0x00000000",
+        "mww 0x40002f64 0x00000000",
+        "mww 0x40002f68 0x00000000",
+        "mww 0x40002f6c 0x00000000",
+        "mww 0x40002f70 0x00000000",
+        "mww 0x40002f74 0x00000000",
+        "mww 0x40002f78 0x00000000",
+        "mww 0x40002f7c 0x00000000"
+      ],
+      "close_jtag_after_load": true,
+      "jtag_poll_after_success": false,
+      "jtag_snapshot": [
+        "poll",
+        "reg pc",
+        "reg sp",
+        "mdw 0x40002f60 8",
+        "mdw 0x40002f80 48",
+        "mdw 0x20000510 1",
+        "mdw 0x200008cc 4",
+        "mdw 0x200008dc 2",
+        "mdw 0x200008f4 2"
+      ]
+    },
+    {
       "name": "lp_ipc_reg_probe_test",
       "tiers": [
         "manual"
@@ -8060,6 +8863,7 @@
             "bl808WifiUseBl808Rf": "1",
             "bl808WifiRealLwip": "1",
             "bl808WifiRxPbufInput": "1",
+            "bl808WifiDiagDhcpTxFinalSnapshot": "1",
             "WifiSsid": {
               "env": "BL808_WIFI_SSID"
             },
@@ -8301,9 +9105,38 @@
           "defines": {
             "bl808WifiNimFw": "1",
             "bl808WifiUseBl808Rf": "1",
+            "bl808WifiNativeWlanCalibration": "1",
             "bl808WifiNimFwTrace": "1"
           }
         }
+      ],
+      "jtag_snapshot": [
+        "poll",
+        "reg pc",
+        "reg a0",
+        "reg sp",
+        "reg ra",
+        "reg mepc",
+        "reg mcause",
+        "reg mtval",
+        "mdw {sym:nimfw_dbg_rf_phase} 1",
+        "mdw {sym:nim_wifi_rf_last_config_channel_index} 1",
+        "mdw {sym:nim_wifi_rf_last_config_channel_status} 1",
+        "mdw {sym:nim_wifi_rf_config_channel_wait_timeout_count} 1",
+        "mdw {sym:nim_wifi_rf_fcal_wait_timeout_count} 1",
+        "mdw {sym:nim_wifi_rf_stage_snapshot_count} 1",
+        "mdw {sym:nim_wifi_rf_stage_tag_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rfb4_log} 8",
+        "mdw 0x200010A0 4",
+        "mdw 0x200010B8 1",
+        "mdw 0x200010C0 2",
+        "mdw 0x200010B4 1",
+        "mdw 0x20000810 9",
+        "mdw 0x20000540 1",
+        "mdw 0x20000580 3",
+        "mdw 0x20000250 1",
+        "mdw 0x2000F880 1",
+        "mdw 0xE000BFF8 2"
       ],
       "required": [
         "=== BL808 WiFi NimFw Boot Probe ===",
@@ -8325,8 +9158,12 @@
           "source": "examples/m0_wifi_http_server.nim",
           "flash": "m0",
           "defines": {
+            "HwValidationLogExternalBuffer": "1",
+            "HwValidationLogSection": ".psrambss.jtaglog",
+            "bl808WifiHttpServer": "1",
             "bl808WifiNimFw": "1",
             "bl808WifiUseBl808Rf": "1",
+            "bl808WifiNativeWlanCalibration": "1",
             "bl808WifiRealLwip": "1",
             "bl808WifiRealLwipTcp": "1",
             "bl808WifiRxPbufInput": "1",
@@ -8367,6 +9204,35 @@
           }
         }
       ],
+      "jtag_snapshot": [
+        "poll",
+        "reg pc",
+        "reg sp",
+        "reg ra",
+        "reg mepc",
+        "reg mcause",
+        "reg mtval",
+        "mdw {sym:nimfw_dbg_rf_phase} 1",
+        "mdw {sym:nimfw_dbg_rf_assert_count} 1",
+        "mdw {sym:nimfw_dbg_rf_assert_line} 1",
+        "mdw {sym:nim_wifi_dbg_delay_calls} 1",
+        "mdw {sym:nim_wifi_dbg_delay_fallbacks} 1",
+        "mdw {sym:nim_wifi_dbg_delay_last_us} 1",
+        "mdw {sym:nim_wifi_dbg_delay_last_start_lo} 1",
+        "mdw {sym:nim_wifi_dbg_delay_last_now_lo} 1",
+        "mdw {sym:nim_wifi_dbg_delay_last_stale} 1",
+        "mdw {sym:nim_wifi_dbg_delay_caller_ra} 1",
+        "mdw {sym:nim_wifi_rf_last_config_channel_index} 1",
+        "mdw {sym:nim_wifi_rf_last_config_channel_status} 1",
+        "mdw {sym:nim_wifi_rf_config_channel_wait_timeout_count} 1",
+        "mdw {sym:nim_wifi_rf_last_config_channel_fcal} 1",
+        "mdw {sym:nim_wifi_rf_last_config_channel_acal} 1",
+        "mdw {sym:nim_wifi_rf_stage_snapshot_count} 1",
+        "mdw {sym:nim_wifi_rf_stage_tag_log} 8",
+        "mdw {sym:nim_wifi_rf_stage_rfb4_log} 8",
+        "mdw 0x200010B4 1",
+        "mdw 0xE000BFF8 2"
+      ],
       "required": [
         "=== BL808 WiFi HTTP Server ===",
         "@e2e scan:ok",
@@ -8404,6 +9270,126 @@
         }
       ],
       "timeout": 90
+    },
+    {
+      "name": "m0_wifi_connected_scan_ab",
+      "tiers": ["manual"],
+      "lp_flash_offset": 917504,
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wifi_http_server.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiHttpServer": "1",
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "bl808WifiNativeWlanCalibration": "1",
+            "bl808WifiRealLwip": "1",
+            "bl808WifiRealLwipTcp": "1",
+            "bl808WifiRxPbufInput": "1",
+            "bl808WifiBenchConnectedScanAB": "1",
+            "bl808WifiDiagLinkDrop": "1",
+            "bl808WifiDiagPeerRxAdmission": "1",
+            "HwValidationLogExternalBuffer": "1",
+            "HwValidationLogSection": ".psrambss.jtaglog",
+            "HwValidationLogCapacity": "32768",
+            "WifiSsid": {"env": "BL808_WIFI_SSID"},
+            "WifiPassword": {"env": "BL808_WIFI_PASSWORD"}
+          }
+        }
+      ],
+      "required": [
+        "Ready for HTTP/1.1 and UDP echo client requests",
+        "bench=scan_ab event=window_start",
+        "bench=scan_ab event=finished"
+      ],
+      "jtag_snapshot": [
+        "mdw {sym:nimfw_dbg_home_wake_ab} 7",
+        "mdw {sym:nimfw_dbg_peer_disconnect} 6"
+      ],
+      "timeout": 240
+    },
+    {
+      "name": "m0_wifi_ap_http_smoke",
+      "tiers": ["manual"],
+      "lp_flash_offset": 917504,
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wifi_http_server.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiHttpServer": "1",
+            "bl808WifiApHttpSmoke": "1",
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "bl808WifiNativeWlanCalibration": "1",
+            "bl808WifiRealLwip": "1",
+            "bl808WifiRealLwipTcp": "1",
+            "bl808WifiRxPbufInput": "1",
+            "HwValidationLogExternalBuffer": "1",
+            "HwValidationLogCapacity": "1024",
+            "WifiSsid": "Ox64-Setup-Bench",
+            "WifiPassword": {"secret_env": "BL808_WIFI_AP_BENCH_PASSWORD"}
+          }
+        }
+      ],
+      "required": [
+        "=== BL808 WiFi HTTP Server ===",
+        "[PASS] AP startup under 200 ms budget",
+        "[PASS] AP firmware and netif ready",
+        "[PASS] AP DHCP server started",
+        "Ready for AP HTTP client requests at 192.168.11.1",
+        "[PASS] AP HTTP response queued"
+      ],
+      "jtag_snapshot": [
+        "reg pc",
+        "mdw {sym:nimfw_ap_host_result} 6",
+        "mdw {sym:nimfw_ap_register_stage} 1",
+        "mdw {sym:nimfw_ap_firmware_stage} 1",
+        "mdw {sym:nimfw_ap_timing} 5",
+        "mdw {sym:nimfw_ap_queue_snapshot} 5",
+        "mdw {sym:nimfw_ap_beacon_dma_trace} 12",
+        "mdw {sym:txl_bcn_hwdesc_pool} 17",
+        "mdw {sym:txl_bcn_hwdesc_cfms} 5",
+        "mdw 0x24b08188 5"
+      ],
+      "timeout": 180
+    },
+    {
+      "name": "m0_wifi_ap_channel_sweep",
+      "tiers": ["manual"],
+      "lp_flash_offset": 917504,
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_wifi_http_server.nim",
+          "flash": "m0",
+          "defines": {
+            "bl808WifiHttpServer": "1",
+            "bl808WifiApHttpSmoke": "1",
+            "bl808WifiApChannelSweep": "1",
+            "bl808WifiNimFw": "1",
+            "bl808WifiUseBl808Rf": "1",
+            "bl808WifiNativeWlanCalibration": "1",
+            "bl808WifiRealLwip": "1",
+            "bl808WifiRealLwipTcp": "1",
+            "bl808WifiRxPbufInput": "1",
+            "HwValidationLogExternalBuffer": "1",
+            "HwValidationLogSection": ".psrambss.jtaglog",
+            "WifiSsid": "Ox64-Sweep-Bench",
+            "WifiPassword": {"secret_env": "BL808_WIFI_AP_BENCH_PASSWORD"}
+          }
+        }
+      ],
+      "required": [
+        "[PASS] AP channel sweep complete"
+      ],
+      "timeout": 1800
     },
     {
       "name": "m0_puf_capture",

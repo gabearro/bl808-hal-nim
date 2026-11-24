@@ -35,9 +35,9 @@ def source() -> str:
     bss: BssStatus""", 1)
     code = code.replace("    channelDuration: uint32", "    channelDuration: uint32\n    chanType: uint8", 1)
     code = code.replace("joinBssFlag, cancelRequested: uint8]",
-                        "joinBssFlag, cancelRequested, connectModeFlags: uint8]", 1)
+                        "connectFlags, joinBssFlag, cancelRequested, connectModeFlags: uint8]", 1)
     code = code.replace("cast[pointer](addr indication), 7'u8, 0'u8)",
-                        "cast[pointer](addr indication), 7'u8, 0'u8, 0'u8)", 1)
+                        "cast[pointer](addr indication), 0'u8, 7'u8, 0'u8, 0'u8)", 1)
     code = code.replace("  else:\n    doAssert id in [SCANU_START_CFM, SCANU_JOIN_CFM]", """  elif id == 10:
     doAssert dst == 0 and src == TASK_SM and size == sizeof(MmStaAddReqPayload).uint32
   else:
@@ -237,9 +237,12 @@ for index in [3'u8, 255'u8]:
 ''',
     "snapshot_before_allocation": r'''
 let reply = ready()
+sm.connectFlags = 1
+conn.channelDuration = 0x80000204'u32  # live VIF flags, not the latched quick bit
 let expectedFlags = conn.channelDuration
 let expectedChannel = channel
 onAlloc = proc() =
+  sm.connectFlags = 0
   conn.channelDuration = 0
   vifs[conn.vifIdx].bssid = default(typeof(target))
   vifs[conn.vifIdx].ht.ampduParams = 0
@@ -250,7 +253,7 @@ doAssert scanu_join_cfm_handler(reply) == 0
 doAssert queued.len == 1
 let request = cast[ptr MmStaAddReqPayload](queued[0])
 doAssert request.bssid == target and request.rateMask == 65535
-doAssert request.bw == 2
+doAssert request.bw == 2 and request.quickConn == 1
 doAssert vifs[conn.vifIdx].keys.flags == expectedFlags
 doAssert lastChannel.primFreq == expectedChannel.prim20Freq and lastChannel.band == expectedChannel.band
 finishJoin(reply)

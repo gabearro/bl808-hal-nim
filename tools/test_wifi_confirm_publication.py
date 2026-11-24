@@ -78,7 +78,7 @@ proc completed(arg: pointer; status: uint32) {.cdecl.} =
   doAssert interruptsEnabled == incoming
   inc callbacks
 proc me_tx_cfm_singleton(p: pointer) =
-  doAssert p == expectedDesc and not interruptsEnabled
+  doAssert p == expectedDesc and interruptsEnabled == incoming
   doAssert hostTxDescAt(p).active == 1
   inc rateCalls
 proc txl_frame_release*(param: pointer; doCallback: bool) {.exportc, cdecl.}
@@ -281,13 +281,15 @@ def test_confirm_publication(tmp_path: Path, mode: str, mutation: str | None) ->
         "txl_frame_get", "txl_frame_release", "noteMgmtTxConfirm", "txl_frame_cfm",
         "txlFrameConfirmPending", "txl_frame_evt", "txl_cfm_push", "txlCfmPending", "txl_cfm_evt",
     ])
+    ack_bit = next(line for line in tx.splitlines() if line.startswith("const WifiTxFrameSuccessfulBit ="))
+    functions = ack_bit + "\n" + functions
     if mutation and mutation.endswith("_order"):
         name = {"frame_order": "txl_frame_cfm", "push_order": "txl_cfm_push",
                 "event_order": "txl_cfm_evt"}[mutation]
         body = procedure(functions, name)
         if mutation == "event_order":
-            old = "    # IPC TX confirm to host\n"
-            new = '    nimFwTrace2U32("[WIFI-NIMFW] cfm_evt ", 0, 0)\n' + old
+            old = "            ipc_emb_txcfm(cast[pointer](node))\n"
+            new = '            nimFwTrace2U32("[WIFI-NIMFW] cfm_evt ", 0, 0)\n' + old
         else:
             old = "    snapshot\n"
             label = "frame_cfm" if mutation == "frame_order" else "cfm_push"
@@ -303,7 +305,7 @@ def test_confirm_publication(tmp_path: Path, mode: str, mutation: str | None) ->
                            "hostTxHwDescAt(hostTxDescAt(param).hwDesc).confirmStatus, trace.status)"),
             "push_live": ("trace.queue, trace.buffer)", "trace.queue, pointerAddrU32(hostTxDescAt(desc).bufDesc))"),
             "event_live": ("trace.thdStatus, trace.destination)",
-                           "hostTxHeadThd(hostTxHwDescAt(hostTxDescAt(node).hwDesc)).flags, trace.destination)"),
+                           "hostTxHeadThd(hostTxHwDescAt(hostTxDescAt(cast[pointer](trace.node)).hwDesc)).flags, trace.destination)"),
         }[mutation]
         assert old in functions
         functions = functions.replace(old, new, 1)

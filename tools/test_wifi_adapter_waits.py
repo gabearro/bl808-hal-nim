@@ -14,7 +14,8 @@ from test_wifi_message_allocation import run_program
 SUPPORT = FW.parent / "support"
 
 
-def source(events: str | None = None, sync: str | None = None) -> str:
+def source(events: str | None = None, sync: str | None = None,
+           event_post: str | None = None) -> str:
     code = r'''
 const BlOsWaitingForever = high(uint32)
 var
@@ -80,12 +81,74 @@ proc vendorPollOnce() =
 '''
     code += (SUPPORT / "defs_parts/local_types.nim").read_text()
     code += (SUPPORT / "os_adapter_parts/object_waits.nim").read_text()
+    code += event_post if event_post is not None else r'''
+proc aos_post_event(`type`, code: uint16; value: culong): cint = 0
+'''
     code += events if events is not None else (SUPPORT / "os_adapter_parts/events_tasks.nim").read_text()
     code += sync if sync is not None else (SUPPORT / "os_adapter_parts/sync_queue.nim").read_text()
     return code
 
 
 CASES = {
+    "task_create_reports_failure": r'''
+proc taskEntry(arg: pointer) {.cdecl.} =
+  doAssert false, "unsupported task entry must not run"
+var taskHandle = cast[pointer](0x1234'u)
+doAssert osTaskCreate("worker", cast[pointer](taskEntry), 1024, nil, 1,
+                      addr taskHandle) == -1
+doAssert taskHandle == cast[pointer](0x1234'u)
+doAssert polls == 0 and allocations == 0
+''',
+    "mutex_independent_locks": r'''
+let first = osMutexCreate()
+let second = osMutexCreate()
+doAssert first != nil and second != nil and first != second
+doAssert osMutexUnlock(first) == 1 and interrupts
+doAssert osMutexLock(first) == 0 and not interrupts
+doAssert osMutexLock(second) == 0 and not interrupts
+doAssert osMutexLock(first) == 0 and osMutexDepth == 3
+doAssert osMutexUnlock(second) == 0 and not interrupts
+doAssert osMutexUnlock(second) == 1 and not interrupts
+doAssert osMutexUnlock(first) == 0 and not interrupts
+doAssert osMutexUnlock(first) == 0 and interrupts
+doAssert osMutexDepth == 0
+osMutexDelete(first)
+osMutexDelete(second)
+doAssert frees == 2
+''',
+    "mutex_deferred_delete": r'''
+let mutex = osMutexCreate()
+doAssert osMutexLock(mutex) == 0
+osMutexDelete(mutex)
+doAssert frees == 0 and not interrupts
+doAssert osMutexLock(mutex) == 1 and not interrupts
+doAssert osMutexUnlock(mutex) == 0 and interrupts
+doAssert frees == 1 and osMutexDepth == 0
+''',
+    "mutex_invalid_handles": r'''
+failAllocation = true
+doAssert osMutexCreate() == nil
+failAllocation = false
+doAssert osMutexLock(nil) == 1 and osMutexUnlock(nil) == 1
+osMutexDelete(nil)
+let first = osMutexCreate()
+let second = osMutexCreate()
+doAssert osMutexLock(first) == 0
+doAssert osMutexUnlock(second) == 1 and not interrupts
+doAssert osMutexUnlock(first) == 0 and interrupts
+osMutexDelete(first)
+osMutexDelete(second)
+doAssert frees == 2
+''',
+    "mutex_preserves_masked_state": r'''
+let mutex = osMutexCreate()
+interrupts = false
+doAssert osMutexLock(mutex) == 0 and not interrupts
+doAssert osMutexUnlock(mutex) == 0 and not interrupts
+interrupts = true
+osMutexDelete(mutex)
+doAssert frees == 1
+''',
     "event_snapshot_clear": r'''
 let event = osEventGroupCreate()
 doAssert osEventGroupSend(event, 0xA5) == 0xA5

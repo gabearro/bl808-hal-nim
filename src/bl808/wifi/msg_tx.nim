@@ -2,6 +2,7 @@
 
 when defined(bl808m0) and defined(bl808WifiNimFw):
   import sdk_headers
+  from host_table_layout import WifiHostModParamsOffset, WifiHostHtCapOffset
 
   include msg_tx/layout
   include msg_tx/abi

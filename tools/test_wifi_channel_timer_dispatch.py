@@ -65,6 +65,57 @@ for index in 0'u8 .. 4:
     mm_timer_schedule()
     doAssert operationDelivery == @[(index, 3'u8)]
 ''',
+    "departing_switch_survives_its_tx_reset": r'''
+for irq in [false, true]:
+  for epoch in [0'u32, high(uint32)]:
+    for index in 0'u8 .. 4:
+      setupTbtt()
+      enabled = irq
+      txResetEpoch = epoch
+      armOperation(index, 2)
+      let target = addr contexts[index]
+      let deadline = timers[2].expiry
+      let serial = chanTimerCapture(addr timers[2])
+      doAssert chanForceIdleForDeparture(target)
+      doAssert txResetEpoch == epoch + 1'u32 and enabled == irq
+      chan_upd_ctxt_status(target, 3)
+      doAssert timers[2].expiry == deadline and chanTimerCapture(addr timers[2]) == serial
+      now = deadline + 51
+      mm_timer_schedule()
+      doAssert operationDelivery == @[(index, 3'u8)]
+      doAssert chanTimerDispatch(addr timers[2], timers[2].callback, target, serial)
+      doAssert operationDelivery.len == 1 and enabled == irq
+''',
+    "departure_does_not_adopt_stale_or_unrelated_timers": r'''
+for change in 0 .. 7:
+  setupTbtt()
+  armOperation(0, 2)
+  let target = addr contexts[0]
+  let deadline = timers[2].expiry
+  let serial = chanTimerCapture(addr timers[2])
+  if change == 7:
+    armOperation(0, 4)
+    env.scheduledCtxt = target
+    mm_timer_set(addr timers[2], timers[2].expiry)
+  onIdleReset = proc() =
+    case change
+    of 1: inc txResetEpoch
+    of 2: inc chanCtxtEpochs[0]
+    of 3: env.scheduledCtxt = addr contexts[2]
+    of 4: contexts[0].channel.primFreq = 2462
+    of 5: mm_timer_clear(addr timers[2])
+    of 6:
+      now = deadline
+      armOperation(0, 2) # same address, different timer serial and deadline
+    else: discard
+  failIdle = change == 0
+  doAssert chanForceIdleForDeparture(target) == (change notin [0, 1])
+  doAssert chanTimerDispatch(addr timers[2], timers[2].callback, target, serial)
+  doAssert operationDelivery.len == 0
+  now = timers[2].expiry + 51
+  mm_timer_schedule()
+  doAssert operationDelivery.len == (change == 6).int
+''',
     "rearm_after_pop": r'''
 armOperation()
 onUnlock = proc() =

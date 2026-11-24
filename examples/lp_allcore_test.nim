@@ -87,9 +87,9 @@ proc main() {.exportc, cdecl.} =
   markStage(1)
   heapInit()
   markStage(2)
-  schedulerInit()
+  schedulerInit(pollingOnly = defined(bl808UsbAnchorLpPeer))
   markStage(3)
-  ipcBridgeInit()
+  ipcBridgeInit(pollingOnly = defined(bl808UsbAnchorLpPeer))
   markStage(4)
   addSchedulerPollHook(lpDiagPoll)
   lpDiagPoll()
@@ -107,4 +107,8 @@ proc main() {.exportc, cdecl.} =
   discard heartbeat()
   markStage(7)
 
-  runScheduler()
+  when defined(bl808UsbAnchorLpPeer):
+    while true:
+      pollScheduler()
+  else:
+    runScheduler()

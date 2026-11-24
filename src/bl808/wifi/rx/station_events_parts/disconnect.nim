@@ -9,12 +9,16 @@ proc blRxSmDisconnectInd(blHw, cmd, msg: pointer): cint {.cdecl.} =
     defer: callbackIrqRestore(saved)
     if blHw == nil or msg == nil: return -1
     let vif = vifAt(blHw, BlVifSta)
+    let ind = msgParam(msg)
+    if not firmware.rxHostClaimStationIndication(ind, loadU8(vif, BlVifVifIdxOff)):
+      return 0
     if loadU8(vif, BlVifLinksNumOff) == 0: return -1
     let station = loadU8(vif, BlVifFixedStaIdxOff)
-    if station >= NxRemoteStaStoreMax: return -1
-    transition = beginStationRxTransition(blHw, station)
+    if station >= NxRemoteStaMax: return -1
+    # The firmware can finish removing this station during host callbacks.
+    # The host serial and association epoch still guard the netif.
+    transition = beginStationRxTransition(blHw, 0xFF)
     if not transition.valid: return -1
-    let ind = msgParam(msg)
     zero(addr indNew[0], indNew.len.uint)
     storeU16(addr indNew[0], WifiDiscStatusOff, loadU16(ind, SmDiscStatusOff))
     storeU16(addr indNew[0], WifiDiscReasonOff, loadU16(ind, SmDiscReasonOff))
@@ -54,6 +58,8 @@ proc blRxSmDisconnectInd(blHw, cmd, msg: pointer): cint {.cdecl.} =
       storeU8(vif, BlVifStaPsOff, PsModeOff)
       storeU8(sta, BlStaIsUsedOff, 0)
       bl_tx_cntrl_link_down(cast[ptr BlSta](sta))
+  # No old client may follow a reconnect started by the disconnect callback.
+  retireStationDhcp(transition)
   var notify: bool
   block:
     let saved = callbackIrqSave()

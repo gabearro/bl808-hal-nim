@@ -44,7 +44,7 @@ var
   mmBcnStopping: bool
   oldCalls, newCalls, timCalls, updates: int
   timHook: proc()
-proc txlFrameCallbackCurrent(): bool
+proc txlFrameCallbackCurrent(resetEpoch: uint32 = txResetEpoch): bool
 proc bcnEnvView(): ptr Env = addr env
 proc vifChannelAt(p: pointer): ptr Vif = cast[ptr Vif](p)
 proc vifChannelForIdx(i: uint8): ptr Vif = addr vifs[i]

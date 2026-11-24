@@ -30,7 +30,7 @@ const
   SfCtrlCfg1OwnerIahb = 1'u32 shl 28
   SfCtrlCfg1IfEn = 1'u32 shl 29
   SfCtrlCfg1Ahb2SifEn = 1'u32 shl 30
-  WholeChipReset = 1'u32 shl 5
+  PowerOnReset = 1'u32 shl 0 # BL808 GLB_SWRST_CFG2[0] resets M0
 
 type
   Request = object
@@ -167,13 +167,13 @@ proc prepareForSoftReboot() =
 proc rebootChip() =
   prepareForSoftReboot()
   var value = regRead(GlbSwrstCfg2)
-  value = value and not WholeChipReset
+  value = value and not PowerOnReset
   regWrite(GlbSwrstCfg2, value)
   delayCycles(1000)
-  value = value or WholeChipReset
+  value = value or PowerOnReset
   regWrite(GlbSwrstCfg2, value)
   delayCycles(1000)
-  value = value and not WholeChipReset
+  value = value and not PowerOnReset
   regWrite(GlbSwrstCfg2, value)
   while true:
     asm """
@@ -223,5 +223,6 @@ proc main() {.exportc, cdecl.} =
         status = ErrBadCommand
     sendResponse(status, value, req.address + req.length)
     if rebootAfterResponse:
-      delayCycles(100_000_000)
+      while not console.txFifoEmpty() or console.txBusy():
+        spin()
       rebootChip()

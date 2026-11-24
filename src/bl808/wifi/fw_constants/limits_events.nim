@@ -24,6 +24,7 @@ const
   KE_EVT_KE_MESSAGE*   = 0x08000000'u32   # blob: lui a0, 0x8000
   KE_EVT_KE_TIMER*     = 0x20000000'u32   # blob: lui a0, 0x20000
   KE_EVT_MM_TIMER*     = 0x40000000'u32   # blob: lui a0, 0x40000
+  KE_EVT_RESET*        = 0x80000000'u32
   KE_EVT_RXUPLOADED*   = 0x00800000'u32
   KE_EVT_RXDMA*        = 0x00400000'u32
   KE_EVT_RXUREADY*     = 0x00200000'u32

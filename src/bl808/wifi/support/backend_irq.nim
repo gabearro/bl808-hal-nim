@@ -11,14 +11,6 @@ proc bl808WifiBackendClearHostIpc() =
 proc bl808WifiBackendHostIpcStatus(): uint32 =
   regRead32(IpcEmb2AppRawStatus)
 
-proc bl808WifiBackendDriveRfStatus() =
-  var rfCtrl = regRead32(RfStatusCtrl)
-  if (regRead32(MacRfStatus) and MacRfActiveBit) != 0:
-    rfCtrl = rfCtrl or 0x01'u32
-  else:
-    rfCtrl = rfCtrl and not 0x01'u32
-  regWrite32(RfStatusCtrl, rfCtrl)
-
 template macServiceIrqSave(): uint32 =
   block:
     var prev {.gensym.}: uint32

@@ -80,6 +80,12 @@ var
   stas: array[7, StaInfoView]
   vifs: array[2, VifChannelView]
   powerCalls, clockCalls, upperCalls, freed, recovered, appended: int
+  beaconStorage: pointer
+  beaconAllocations, beaconFrees, timChecks, meChecks: int
+  onBeaconAllocate: proc()
+  beaconAllocationFails: bool
+  uploadResult: uint32
+  lastUpperFlags: uint32
   interrupts = true
   events: uint32
   rxStationIdentities: array[41, RxStationIdentity]
@@ -93,7 +99,7 @@ var
   rxlControlActive: bool
 proc staDeleteEpoch(index: uint8): uint32 =
   if index < 5: stationEpochs[index] else: 0
-proc rxCaptureStation(desc: pointer; flags: uint32)
+proc rxCaptureStation(desc: pointer; flags: uint32; statusWord: ptr uint32 = nil)
 proc pointerAddrU32(p: pointer): uint32 = cast[uint32](cast[uint](p))
 proc rxHeaderHwDescAt(i: int): ptr RxHeaderHwDescView =
   cast[ptr RxHeaderHwDescView](addr rx_dma_hdrdesc[i * sizeof(RxHeaderHwDescView)])
@@ -144,24 +150,67 @@ proc tick(): uint32 {.cdecl.} =
   inc clockCalls
   if onTick != nil: onTick()
   0x12345678
+proc allocateBeacon(size: uint32): pointer {.cdecl.} =
+  doAssert interrupts and beaconStorage == nil and size > 1736 and size <= 2328
+  inc beaconAllocations
+  if onBeaconAllocate != nil: onBeaconAllocate()
+  if beaconAllocationFails: return nil
+  beaconStorage = alloc(size.int)
+  beaconStorage
+proc freeBeacon(p: pointer) {.cdecl.} =
+  doAssert interrupts and p == beaconStorage
+  inc beaconFrees
+  beaconStorage = nil
+  dealloc(p)
 proc blOpsFunc(slot: int): pointer =
-  doAssert slot == 200
-  cast[pointer](tick)
+  case slot
+  of 184: cast[pointer](allocateBeacon)
+  of 188: cast[pointer](freeBeacon)
+  of 200: cast[pointer](tick)
+  else: nil
 proc rxlHandleApPowerSave(vif: ptr VifChannelView; sta: ptr StaInfoView;
                           index: uint8; frame: pointer) =
   inc powerCalls
   if onPower != nil: onPower()
 proc rxu_cntrl_frame_handle(p: pointer): uint32 =
+  doAssert beaconStorage == nil, "beacon scratch escaped into RX upper"
   inc upperCalls
-  0
+  lastUpperFlags = rxSwDescView(rxMpduDescView(p).swDesc).hwFlags
+  uploadResult
 proc rxl_mpdu_free(p: pointer) = inc freed
 proc rxl_hd_append(p: pointer) =
   inc appended
   rxHeaderHwDescView(p).flags = 0
   rxHeaderHwDescView(p).status = 0
+var beaconChange: uint32
+var beaconChecks, wmmChecks: int
 proc td_pck_ind(vif, sta, count: uint8) = discard
-proc mm_check_beacon(p, vif, sta: pointer; tim: ptr uint32): uint32 = 1
-proc ps_check_beacon(tim: pointer; length: uint32; vif: pointer) = discard
+proc mm_check_beacon(p, vif, sta: pointer; tim: ptr uint32): uint32 =
+  inc beaconChecks
+  beaconChange
+proc mmCheckBeaconFrame(p, vif, sta, data: pointer; tim: var pointer): uint32 =
+  inc beaconChecks
+  doAssert data != nil and data == beaconStorage
+  let bytes = cast[ptr UncheckedArray[uint8]](data)
+  doAssert bytes[1735] == 5 and bytes[1736] == 4
+  if rxSwDescView(p).mpduLengthBytes >= 1741:
+    tim = addr bytes[1735]
+  beaconChange
+proc rxlObserveStaWmm(p: pointer; vif: ptr VifChannelView; sta: ptr StaInfoView;
+                     data: pointer) =
+  doAssert data == beaconStorage
+  inc wmmChecks
+proc ps_check_beacon(tim: pointer; length: uint32; vif: pointer) =
+  if tim != nil:
+    let bytes = cast[ptr UncheckedArray[uint8]](tim)
+    doAssert beaconStorage != nil and bytes[0] == 5 and bytes[1] == 4
+    doAssert bytes[4] == 0x22 and bytes[5] == 0x33
+    inc timChecks
+proc me_beacon_check(vif: uint8; length: uint16; frame: pointer) =
+  doAssert vif == 0 and length == 1741 and frame == beaconStorage
+  let bytes = cast[ptr UncheckedArray[uint8]](frame)
+  doAssert bytes[1735] == 5 and bytes[1736] == 4 and bytes[1740] == 0x33
+  inc meChecks
 proc vif_mgmt_bcn_recv(vif: pointer) = discard
 proc chan_tbtt_switch_update(vif: pointer; expiry: uint32) = discard
 proc ps_check_frame(p: pointer; flags: uint32; vif: pointer) = discard
@@ -174,7 +223,18 @@ proc reset(fc: uint16; length: uint16; count = 1) =
   upperEnv = default(RxuEnv)
   powerCalls = 0
   clockCalls = 0
+  beaconChange = 1
+  beaconChecks = 0
+  wmmChecks = 0
+  beaconAllocations = 0
+  beaconFrees = 0
+  timChecks = 0
+  meChecks = 0
+  onBeaconAllocate = nil
+  beaconAllocationFails = false
+  uploadResult = 0
   upperCalls = 0
+  lastUpperFlags = 0
   freed = 0
   recovered = 0
   assertIrqs.setLen(0)
@@ -190,7 +250,7 @@ proc reset(fc: uint16; length: uint16; count = 1) =
   let sw = rxHeaderHwDescAt(0)
   sw.mpduLengthBytes = length
   sw.frameLen = length
-  sw.hwFlags = 0x20026000'u32 or (12'u32 shl 15)
+  sw.hwFlags = 0x02006000'u32 or (12'u32 shl 15)
   sw.flags = sw.hwFlags or 0x4000
   sw.status = sw.flags
   if count > 0:
@@ -332,9 +392,9 @@ def admission_source(checks=""):
              "rxForgetStation", "rxUploadGeneration", "rxUploadCurrent", "rxInvalidateQuiescentVif", "rxInvalidateVif",
              "rxCaptureStation", "rxIdentityCurrent", "rxStationCurrent", "rxCaptureChannel",
              "rxCapturedChannelCurrent", "rxReadCapturedChannel",
-             "rxPayloadDescIndex", "rxPayloadBufferValid", "rxPayloadChainBounds", "rxAdmitMpdu",
+             "rxPayloadDescIndex", "rxPayloadBufferValid", "rxPayloadChainBounds", "rxBeaconLengthSupported", "rxAdmitMpdu",
              "rxFrameCurrent", "rxCaptureFrame", "rxCaptureFrameHeader", "rxReleaseUpload",
-             "rxReleaseControlFrame",
+             "rxOpenBeaconView", "rxCloseBeaconView", "rxReleaseControlFrame",
              "rxl_cntrl_evt", "rxlScheduleQueuedRx", "submittedRxReady", "rxl_timer_int_handler"]
     procedures = ""
     for name in names:
@@ -343,11 +403,11 @@ def admission_source(checks=""):
             procedures += procedure(source, name)
     debug = "\nvar\n" + "".join(f"  {name}: uint32\n" for name in sorted(set(re.findall(r"\bnimFwDbg\w+", procedures))))
     platform, setup = PLATFORM.split("proc dispatch()", 1)
-    if "proc rxCaptureStation(" not in procedures:
-        procedures += "\nproc rxCaptureStation(desc: pointer; flags: uint32) = discard\n"
     identity = re.search(r"(?m)^  RxFrameIdentity = object\n(?:    [^\n]*\n)+", layout)
-    identity_source = "type\n" + identity.group(0) if identity else ""
-    return identity_source + platform + debug + procedures + "\nproc dispatch()" + setup + checks
+    beacon_view = re.search(r"(?m)^  RxBeaconView = object\n(?:    [^\n]*\n)+", layout)
+    identity_source = "type\n" + identity.group(0) + beacon_view.group(0)
+    upper = procedure((FW / "task_handlers.nim").read_text(), "rxuCheckBeaconParams")
+    return identity_source + platform + debug + procedures + upper + "\nproc dispatch()" + setup + checks
 
 
 def run_admission(mode, tmp_path, checks):
@@ -357,6 +417,112 @@ def run_admission(mode, tmp_path, checks):
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_rx_admission(mode, tmp_path):
     run_admission(mode, tmp_path, CHECKS)
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_beacon_update_runs_without_crc_change(mode, tmp_path):
+    run_admission(mode, tmp_path, r"""
+for status in [0'u32, 1, high(uint32)]:
+  reset(0x0080, 36)
+  vifs[0].vifType = 0
+  vifs[0].state = 1
+  beaconChange = status
+  dispatch()
+  doAssert beaconChecks == 1 and wmmChecks == int(status != high(uint32))
+  doAssert upperCalls == int(status == 1)
+""")
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_split_beacon_uses_nonadjacent_buffers_and_preserves_rx_ownership(mode, tmp_path):
+    run_admission(mode, tmp_path, r"""
+proc splitBeacon(length: uint16) =
+  reset(0x0080, length, 3)
+  # The intervening physical buffer is not in the MPDU chain.
+  rxPayloadHwDescAt(0).next = rxPayloadHwDescAt(2)
+  buffers[0].payloadBytes[1735] = 5
+  buffers[1].payloadBytes[0] = 0xFF
+  buffers[2].payloadBytes[0 .. 4] = [4'u8, 0, 1, 0x22, 0x33]
+  vifs[0].vifType = 0
+  vifs[0].state = 1
+
+for length in [1737'u16, 1741'u16, 2328'u16]:
+  for transfer in [0'u32, 1'u32]:
+    splitBeacon(length)
+    uploadResult = transfer
+    dispatch()
+    doAssert beaconChecks == 1 and wmmChecks == 1 and upperCalls == 1
+    doAssert timChecks == int(length >= 1741)
+    doAssert beaconAllocations == 1 and beaconFrees == 1 and recovered == 0
+    doAssert freed == int(transfer == 0) and interrupts
+    doAssert rxPayloadHwDescAt(0).next == rxPayloadHwDescAt(2)
+
+splitBeacon(1741)
+let desc = cast[pointer](rxSwTableDescAt(0))
+doAssert rxuCheckBeaconParams(desc, 0, 1741, addr buffers[0].payloadBytes[0])
+doAssert meChecks == 1 and beaconAllocations == 1 and beaconFrees == 1 and freed == 0
+
+for fault in 0 ..< 4:
+  splitBeacon(if fault == 0: 2329'u16 else: 1741'u16)
+  case fault
+  of 1: beaconAllocationFails = true
+  of 2: onBeaconAllocate = proc() = inc rxUploadEpochs[0]
+  of 3: onBeaconAllocate = proc() = rxPayloadHwDescAt(2).bufferStart = 0
+  else: discard
+  dispatch()
+  doAssert beaconChecks == 0 and wmmChecks == 0 and upperCalls == 0
+  doAssert beaconAllocations == int(fault != 0) and beaconFrees == int(fault >= 2)
+  doAssert freed == int(fault != 2) and beaconStorage == nil and interrupts
+
+reset(0x0050, 1737, 2)
+dispatch()
+doAssert upperCalls == 1 and freed == 1 and beaconAllocations == 0
+reset(0x0050, 2353, 2)
+dispatch()
+doAssert upperCalls == 0 and freed == 1 and beaconAllocations == 0
+""")
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_invalid_station_tag_is_cleared_before_rx_queue_publication(mode, tmp_path):
+    run_admission(mode, tmp_path, r"""
+for frameControl in [0x0050'u16, 0x0080'u16]:
+  for reuseSlot in [false, true]:
+    reset(frameControl, 36)
+    let header = rxHeaderHwDescAt(0)
+    let expected = header.hwFlags and not 0x02000000'u32
+    stas[4].valid = 0
+    env.submittedHead = header
+    rxl_timer_int_handler()
+    doAssert header.hwFlags == expected and rxStationCurrent(rxSwTableDescAt(0))
+    if reuseSlot:
+      inc stationEpochs[4]
+      stas[4] = StaInfoView(valid: 1, instNbr: 1, connectionStart: 123)
+    rxl_cntrl_evt()
+    doAssert upperCalls == 1 and lastUpperFlags == expected and freed == 1
+    doAssert clockCalls == 0 and powerCalls == 0
+    if reuseSlot: doAssert stas[4].connectionStart == 123
+
+  reset(frameControl, 36)
+  let header = rxHeaderHwDescAt(0)
+  env.submittedHead = header
+  rxl_timer_int_handler()
+  inc stationEpochs[4]
+  stas[4].valid = 0
+  rxl_cntrl_evt()
+  doAssert upperCalls == 0 and freed == 1
+  doAssert (header.hwFlags and 0x02000000'u32) != 0
+
+for hardwareIndex in [7'u32, 8'u32 + STA_INFO_TAB_ENTRIES.uint32]:
+  reset(0x0080, 36)
+  let header = rxHeaderHwDescAt(0)
+  header.hwFlags = 0x02006000'u32 or (hardwareIndex shl 15)
+  env.submittedHead = header
+  rxl_timer_int_handler()
+  rxl_cntrl_evt()
+  doAssert upperCalls == 0 and freed == 1
+  doAssert (header.hwFlags and 0x02000000'u32) != 0
+""")
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])

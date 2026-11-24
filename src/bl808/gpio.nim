@@ -13,8 +13,6 @@ const
   GlbUartCfg1 = GlbBase + 0x154'u
   GlbUartCfg2 = GlbBase + 0x158'u
   UartSigDisabled = 0x0F'u32
-  Uart0TxSignal = 2'u32
-  Uart0RxSignal = 3'u32
 
   GpioIe*           = 0          # Input enable
   GpioSmt*          = 1          # Schmitt trigger
@@ -243,10 +241,11 @@ proc setUartSignal(pin, uartSignal: uint32) =
   regWrite(GlbUartCfg1, cfg1)
   regWrite(GlbUartCfg2, cfg2)
 
-proc gpioSetupUart*(txPin, rxPin: uint32) =
-  ## Configure a pair of pins for UART (function 7).
-  setUartSignal(txPin, Uart0TxSignal)
-  setUartSignal(rxPin, Uart0RxSignal)
+proc gpioSetupUart*(txPin, rxPin: uint32, uartIndex: range[0..2] = 0) =
+  ## Configure a pair of MCU UART pins (function 7).
+  ## Signal selectors are TX/RX = 2/3, 6/7, 10/11 for UART0/1/2.
+  setUartSignal(txPin, 2'u32 + 4'u32 * uartIndex.uint32)
+  setUartSignal(rxPin, 3'u32 + 4'u32 * uartIndex.uint32)
 
   let txAddr = pinCfgAddr(txPin)
   var txCfg = 0'u32

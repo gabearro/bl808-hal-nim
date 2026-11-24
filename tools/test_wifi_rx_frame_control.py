@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from test_wifi_disconnect_tx import FW, procedure
 from test_wifi_message_allocation import run_program
 from test_wifi_rx_admission import admission_source
 from test_wifi_rx_mgmt_cipher import source as management_source
@@ -153,6 +154,29 @@ for fc in [0x00D0'u16, 0x80D0, 0x00D4, 0x00A4,
   doAssert freed == 1 and recovered == 0 and interrupts
 ''',
 }
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_header_lengths_by_frame_type(tmp_path: Path, mode: str) -> None:
+    layout = (FW / "layout_types.nim").read_text()
+    run_program(tmp_path, mode, procedure(layout, "rxMacHeaderLen") + r'''
+for subtype in 0'u16 .. 15'u16:
+  for ds in [0'u16, 0x0300'u16]:
+    for ordered in [0'u16, 0x8000'u16]:
+      let fc = (subtype shl 4) or 8'u16 or ds or ordered
+      let qos = (subtype and 8) != 0
+      let expected = (if ds == 0: 24 else: 30) +
+        (if qos: 2 else: 0) + (if qos and ordered != 0: 4 else: 0)
+      doAssert rxMacHeaderLen(fc) == expected.uint8
+
+for ordered in [0'u16, 0x8000'u16]:
+  doAssert rxMacHeaderLen(0x00D0'u16 or ordered) ==
+    (if ordered == 0: 24'u8 else: 28'u8)
+  doAssert rxMacHeaderLen(0x00C4'u16 or ordered) == 10'u8
+  doAssert rxMacHeaderLen(0x00D4'u16 or ordered) == 10'u8
+  for fc in [0x0074'u16, 0x0084, 0x00A4, 0x00B4]:
+    doAssert rxMacHeaderLen(fc or ordered) == 16'u8
+''')
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan", "firmware"])

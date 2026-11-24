@@ -173,6 +173,7 @@ for first in [false, true]:
   rcRetryStep(stats, 1).rateIdx = 1
   rcRetryStep(stats, 1).throughput = 80
   rcRetryStep(stats, 2).rateIdx = 2
+  rcRetryStep(stats, 3).rateIdx = 0xFFFF
   rcRateStats(stats, 3).retryCount = if first: 10 else: 0
   durations = [300'u32, 200, 400, 100, 1, 1, 1, 1, 1, 1]
   throughputs[3] = 0x12345678
@@ -193,6 +194,7 @@ for first in [false, true]:
   rc_update_counters(0, 1, 0, false, false)
   doAssert interruptsEnabled
   doAssert rcTrialControl(stats).status == 3
+  rcRetryStep(stats, 2).rateIdx = 0xFFFF
   timeReads = 0
   let beforeRestorePrng = rcPrngState
   rc_check(0)
@@ -202,6 +204,33 @@ for first in [false, true]:
   doAssert rcRetryStep(stats, 1).rateIdx == 1 and rcRetryStep(stats, 1).throughput == 80
   doAssert rcTrialBackup(stats).rateIdx == 255 and rcTrialBackup(stats).throughput == 0
   doAssert sta.txPolicyUpdateFlags[0] == 1 and errors == 0
+
+# A legacy sample no slower than the current best gets the first retry slot;
+# a slower sample needs at least 20 skipped opportunities for that slot.
+for sampleDuration in [99'u32, 100, 101]:
+  for skipped in [0'u8, 19, 20]:
+    state = default(typeof(state))
+    sta.txPolicyUpdateFlags[0] = 0
+    errors = 0
+    timeReads = 0
+    firstTime = 0
+    rcU16(stats, 192) = 4
+    rcU8(stats, 177) = 0
+    rcU8(stats, 174) = 1
+    rcU8(stats, 48) = skipped
+    for i in 0 ..< 4:
+      rcRateStats(stats, i).rateConfig = (4 + i).uint16
+    rcRetryStep(stats, 0).rateIdx = 0
+    rcRetryStep(stats, 1).rateIdx = 1
+    rcRetryStep(stats, 2).rateIdx = 2
+    durations = [100'u32, 200, 300, sampleDuration, 1, 1, 1, 1, 1, 1]
+    rcPrngState = ((3'u32 shl 16) - 0x3039'u32) * prngInverse
+    rc_check(0)
+    let first = sampleDuration <= 100 or skipped >= 20
+    doAssert rcTrialControl(stats).status == 2
+    doAssert rcRetryStep(stats, if first: 0 else: 1).rateIdx == 3
+    doAssert ((rcTrialControl(stats).info and 2) != 0) == (not first)
+    doAssert sta.txPolicyUpdateFlags[0] == 1 and errors == 0
 """
 
 
@@ -273,7 +302,7 @@ def model(state: bytearray, durations: list[int], throughputs: list[int], nss: l
                 score, front, accepted = 0, False, True
                 if fmt <= 1:
                     best_duration = duration(best)
-                    front = sample_duration > best_duration and skipped >= 20
+                    front = sample_duration <= best_duration or skipped >= 20
                 else:
                     second_duration = duration(second)
                     minimum_skips = 32 if state[13 + sample * 12] else u16(170)
@@ -394,7 +423,7 @@ def test_rate_trial(mode: str, scenario: str, tmp_path: Path) -> None:
         vector_path.write_bytes(vectors())
         code += f'\nconst vectorPath = "{vector_path}"\n' + HARNESS
     else:
-        code += procedure(source, "rc_update_counters")
+        code += procedure(source, "rcAccountCounters") + procedure(source, "rc_update_counters")
         code += f"\nconst prngInverse = {pow(0x41C64E6D, -1, 1 << 32)}'u32\n" + SEQUENCE
     path = tmp_path / "rate_trial.nim"
     path.write_text(code)

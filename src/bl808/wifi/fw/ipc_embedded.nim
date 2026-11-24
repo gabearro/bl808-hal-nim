@@ -2,12 +2,16 @@
 #                  IPC Embedded (ipc_emb_*)
 # ###########################################################################
 
+proc ipcMessagePayloadFits(length: uint32): bool {.inline.} =
+  # The host mailbox is 127 words; the rest of ipc_shared_env owns TX storage.
+  length <= 127'u32 * 4 - sizeof(IpcEmbMsgDescView).uint32
+
 proc ipc_emb_msg_push*(msgDescPtr: pointer) {.exportc, cdecl.} =
   if msgDescPtr == nil:
     return
   let msg = cast[ptr IpcEmbMsgEnvelopeView](msgDescPtr)
   let msgDesc = addr msg.desc
-  if msgDesc.paramLen > sizeof(ipcSharedEnvView().payloadArea).uint32:
+  if not ipcMessagePayloadFits(msgDesc.paramLen):
     assert_err("ipc_emb.c", "ipc_emb.c", 0x1E3)
     return
   let shared = cast[ptr IpcSharedMsgView](addr ipcSharedEnv[0])
@@ -35,9 +39,16 @@ proc ipc_emb_init*() {.exportc, cdecl.} =
   ## read-modify-write sequences. Finally writes 0x1F03 to timeout register.
 
   # Task notification handle and the 20-byte IPC structure are distinct objects.
+  ipcEmbEnv = nil
   let currentTaskFn = cast[proc(): pointer {.cdecl.}](
     blOpsFunc(0x44))
+  if currentTaskFn == nil:
+    assert_rec("IPC task callback unavailable", "ipc_emb.c", 0)
+    return
   ipcEmbEnv = currentTaskFn()
+  if ipcEmbEnv == nil:
+    assert_rec("IPC task unavailable", "ipc_emb.c", 0)
+    return
 
   # Clear the 20-byte ipc_emb_env struct
   discard c_memset(addr ipcEmbEnvStruct[0], 0, 20.csize_t)
@@ -53,7 +64,9 @@ proc ipc_emb_init*() {.exportc, cdecl.} =
   # Verify IPC magic value at 0x24800140
   let magic = regRead(IPC_EMB_MAGIC_REG)
   if magic != IPC_MAGIC_VALUE:
+    ipcEmbEnv = nil
     assert_err("ipc_emb.c", "ipc_emb.c", 183)
+    return
 
   # Clear both interrupt line-selection registers before configuring fields.
   regWrite(IPC_EMB_LINE_SEL_LOW, 0)
@@ -129,6 +142,9 @@ proc ipc_emb_notify*(msg: uint32) {.exportc, cdecl.} =
     return
   let notifyFn = cast[proc(envArg: pointer) {.cdecl.}](
     blOpsFunc(0x4C))
+  if notifyFn == nil:
+    assert_rec("IPC notify callback unavailable", "ipc_emb.c", 0)
+    return
   notifyFn(env)
 
 proc ipc_emb_wait*() {.exportc, cdecl.} =
@@ -136,8 +152,10 @@ proc ipc_emb_wait*() {.exportc, cdecl.} =
   ## with (ipcEmbEnv, UINT32_MAX), then `ipc_emb_counter++`.
   let waitFn = cast[proc(env: pointer, timeout: uint32) {.cdecl.}](
     blOpsFunc(0x50))
-  if waitFn != nil:
-    waitFn(ipcEmbEnv, high(uint32))
+  if ipcEmbEnv == nil or waitFn == nil:
+    assert_rec("IPC wait task or callback unavailable", "ipc_emb.c", 0)
+    return
+  waitFn(ipcEmbEnv, high(uint32))
   inc ipc_emb_counter
 
 proc ipc_emb_tx_flow_off*(ac: uint8) {.exportc, cdecl.} =
@@ -164,11 +182,6 @@ proc ipc_emb_tx_irq*() {.exportc, cdecl.} =
     # Acknowledge
     regWrite(IPC_EMB_UNMASK_CLR, txBits)
     regWrite(IPC_EMB_ACK, txBits)
-
-proc ipc_emb_msg_handler*() {.exportc, cdecl.} =
-  ## IPC message handler callback (stored in ipc_emb_env[3] during ipc_emb_init).
-  ## Processes incoming messages from host via IPC shared memory.
-  discard
 
 proc ipc_emb_tx_evt*(ac: uint32) {.exportc, cdecl.} =
   ## Process TX IPC event for a specific AC (288 bytes in blob, 97 instrs).
@@ -229,7 +242,7 @@ proc ipc_emb_tx_evt*(ac: uint32) {.exportc, cdecl.} =
       inc nimFwDbgIpcTxTraceCount
     # Flow control check for non-BCN queues (blob: .L21 at 0xa2)
     if not isBcn:
-      let keEvtFld = cast[ptr uint32](cast[uint](addr keEvtField))[]
+      let keEvtFld = keEnvEventField()[]
       if (keEvtFld and 0x02102000'u32) != 0:
         # Flow control active: re-arm event and return (blob: tail-call ke_evt_set).
         # If this gate parks persistently (park ~ enter rate, park_field showing
@@ -244,19 +257,19 @@ proc ipc_emb_tx_evt*(ac: uint32) {.exportc, cdecl.} =
     # Set up DMA descriptor chain fields (blob at 0xd4-0xe2)
     txDesc.aggDescPtr = cast[uint32](cast[uint](addr txDesc.aggDescStorage[0]))
     txDesc.hwDesc = cast[pointer](addr txDesc.aggDescPtr)
-    # Clear status fields (blob at 0xe2-0xf6)
+    # Clear status and the three THD optional-length words (blob at 0xe2-0xf6).
     txDesc.policy = nil
     txDesc.dmaLink = nil
     txDesc.cfmStatus = 0
-    txDesc.retryCount = 0
-    txDesc.lifetime = 0
-    txDesc.txFlags = 0
+    txDesc.optionalLengths = [0'u32, 0, 0]
     # Transfer host-list ownership before submission can complete or reenter.
     # Nothing after the call may touch this wrapper: the host may recycle it.
     let txParam = cast[pointer](txDesc)
     block:
       let submitIrq = irqSave()
       defer: irqRestore(submitIrq)
+      when defined(bl808m0):
+        txlForgetRateTrial(txDesc)
       wrapper.active = 1
       discard utils_list_pop_front(env.hostTxList)
       # The vendor IPC path passes access category zero at this call site.
@@ -333,7 +346,7 @@ proc ipc_emb_msg_evt*() {.exportc, cdecl.} =
     if msgDst > 8:
       assert_err("ipc_emb.c", "ipc_emb.c", 0x1F7)
       return
-    if msgParamLen > sizeof(ipcSharedEnvView().payloadArea).uint32:
+    if not ipcMessagePayloadFits(msgParamLen):
       assert_err("ipc_emb.c", "ipc_emb.c", 0x1E3)
       return
     let payload = ke_msg_try_alloc(msgId, msgDst, TASK_API, msgParamLen)
@@ -383,7 +396,10 @@ proc ipc_emb_txcfm*(desc: pointer) {.exportc, cdecl.} =
     {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
     irqRestore(saved)
   txSecurityForget(desc)
-  let wrapper = ipcHostTxWrapperFromDesc(hostTxDescAt(desc))
+  let hostDesc = hostTxDescAt(desc)
+  when defined(bl808m0):
+    txlForgetRateTrial(hostDesc)
+  let wrapper = ipcHostTxWrapperFromDesc(hostDesc)
   let env = ipcEmbEnvView()
   utils_list_push_back(env.hostTxCfmList, addr wrapper.link)
 

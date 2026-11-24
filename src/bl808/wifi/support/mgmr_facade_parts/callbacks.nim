@@ -1,28 +1,34 @@
+proc publishStationResult() =
+  let stat = ptrAt(mgmrRaw(), MgmrStatInfoOff)
+  storeU16(stat, StatStatusOff, lastStatusCode.uint16)
+  storeU16(stat, StatReasonOff, lastReasonCode.uint16)
+
 proc connectCb(env, ind: pointer) {.cdecl.} =
   discard env
   lastStatusCode = loadU16(ind, WifiConnStatusOff).int32
   lastReasonCode = loadU16(ind, WifiConnReasonOff).int32
   connectDone = lastStatusCode
   when defined(bl808WifiConnectCacheHint):
-    scanCacheRecordConnectResult(lastStatusCode == 0)
-  let stat = ptrAt(mgmrRaw(), MgmrStatInfoOff)
-  storeU16(stat, StatStatusOff, lastStatusCode.uint16)
-  storeU16(stat, StatReasonOff, lastReasonCode.uint16)
+    scanCacheRecordConnectResult(ptrAt(ind, WifiConnBssidOff), lastStatusCode.uint16)
+  publishStationResult()
 
 proc disconnectCb(env, ind: pointer) {.cdecl.} =
   discard env
   disconnectDone = 1
   connectDone = -1
+  when defined(bl808WifiConnectCacheHint):
+    scanCacheConnectPending = false
   if ind != nil:
     lastStatusCode = loadU16(ind, WifiDiscStatusOff).int32
     lastReasonCode = loadU16(ind, WifiDiscReasonOff).int32
+    publishStationResult()
+  discard wifi_hosal_pm_post_event(cast[PmEvent](0), 1'u32, nil)
 
 proc beaconCb(env, ind: pointer) {.cdecl.} =
   discard env
   scanDiagStore(ind)
   when defined(bl808WifiConnectCacheHint):
     scanCacheStore(ind)
-  inc scanItemCount
   vendorPutsRaw("[WIFI] scan item ch=")
   vendorPrintU32(if ind != nil: loadU8(ind, WifiBeaconChannelOff).uint32 else: 0, 10)
   vendorPutsRaw(" rssi=")

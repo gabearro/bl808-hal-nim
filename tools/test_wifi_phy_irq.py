@@ -1,11 +1,14 @@
 """Keep modem/RC interrupt effects separate from channel programming."""
 
+import json
 from pathlib import Path
 import re
+import shutil
+import subprocess
 
 import pytest
 
-from test_wifi_disconnect_tx import FW, procedure
+from test_wifi_disconnect_tx import FW, ROOT, procedure
 from test_wifi_message_allocation import run_program
 from test_wifi_sta_tx_channel import object_type
 
@@ -17,8 +20,9 @@ var
   modem: WifiModemBlock
   reads: seq[int]
   writes: seq[tuple[offset: int, value: uint32]]
-  mappings, notifications: int
+  mappings, notifications, irqAssertions, status1Reads: int
   slot: uint32
+  platformStatus0, platformStatus1: uint32
   intc_handler_tab: array[64, pointer]
 proc wifiModemRegs(): ptr WifiModemBlock =
   inc mappings
@@ -38,6 +42,10 @@ proc setup(status: uint32) =
   modem.phyChannelPulse888 = 0x87654321'u32
   mappings = 0
   notifications = 0
+  irqAssertions = 0
+  status1Reads = 0
+  platformStatus0 = 1
+  platformStatus1 = 0
   reads.setLen(0)
   writes.setLen(0)
 static:
@@ -64,14 +72,19 @@ const
   MACHW_RX_CNTRL_REG = 0x24B00060'u
 proc regRead(address: uint): uint32 =
   case address
-  of MAC_PL_IRQ_STATUS0: 1'u32
+  of MAC_PL_IRQ_STATUS0: platformStatus0
+  of MAC_PL_IRQ_STATUS1:
+    inc status1Reads
+    platformStatus1
   of MAC_PL_IRQ_HANDLER: slot
-  of MAC_PL_IRQ_STATUS1, MACHW_INTC_STATUS_RAW,
+  of MACHW_INTC_STATUS_RAW,
       MACHW_INTC_GEN_RAW, MACHW_RX_CNTRL_REG: 0'u32
   else: raise newException(ValueError, "unexpected MAC read")
 proc machwRxHdSubmittedHead(): uint32 = 0
 proc machwRxPdSubmittedHead(): uint32 = 0
-proc assert_err(condition, file: cstring; line: cint) = doAssert false
+proc assert_err(condition, file: cstring; line: cint) =
+  doAssert $condition == "intc.c" and $file == "intc.c" and line == 154
+  inc irqAssertions
 proc ipc_emb_notify(status: uint32) =
   doAssert status == 0
   inc notifications
@@ -121,6 +134,42 @@ for status in [0'u32, 0x100, 0xFFFFFFFF'u32]:
   doAssert notifications == 2 and modem == expected
   doAssert reads == @[0xB41C] and writes == @[(0xB420, status)]
 ''',
+    "invalid_handler_index_does_not_alias": r'''
+intc_handlers_init()
+setup(0x100)
+let before = modem
+slot = 74 # Previously wrapped to modem ISR slot 10.
+mac_irq()
+doAssert irqAssertions == 1 and notifications == 0
+doAssert mappings == 0 and reads.len == 0 and writes.len == 0
+doAssert modem == before
+slot = 12 # In range, but no handler is registered.
+mac_irq()
+doAssert irqAssertions == 2 and notifications == 0
+doAssert mappings == 0 and modem == before
+slot = 10
+mac_irq()
+doAssert irqAssertions == 2 and notifications == 1
+doAssert mappings == 0 and modem == before
+''',
+    "mac_irq_reads_platform_status_once": r'''
+intc_handlers_init()
+for firstStatus in [0'u32, 1'u32]:
+  setup(0)
+  platformStatus0 = firstStatus
+  platformStatus1 = 2
+  slot = 10
+  mac_irq()
+  doAssert status1Reads == (if firstStatus == 0: 1 else: 0)
+  doAssert notifications == 1
+  doAssert (nimFwDbgMacIrqLast shr 16) ==
+    (if firstStatus == 0: 2'u32 else: 0'u32)
+setup(0)
+platformStatus0 = 0
+slot = 10
+mac_irq()
+doAssert status1Reads == 1 and notifications == 0
+''',
 }
 
 
@@ -128,3 +177,48 @@ for status in [0'u32, 0x100, 0xFFFFFFFF'u32]:
 @pytest.mark.parametrize("case", CASES)
 def test_phy_irq(tmp_path: Path, mode: str, case: str) -> None:
     run_program(tmp_path, mode, source() + CASES[case])
+
+
+def test_irq_dispatch_table_matches_vendor_relocations(tmp_path: Path) -> None:
+    r2 = shutil.which("r2")
+    ar = shutil.which("llvm-ar") or shutil.which("riscv64-unknown-elf-ar")
+    if not r2 or not ar:
+        pytest.skip("radare2 and a RISC-V archive tool are required")
+
+    archive = ROOT / "tools/ref/libwifi_bl808.a"
+    member = subprocess.run([ar, "p", str(archive), "intc.o"], capture_output=True)
+    assert member.returncode == 0, member.stderr.decode()
+    obj = tmp_path / "intc.o"
+    obj.write_bytes(member.stdout)
+    result = subprocess.run(
+        [r2, "-q", "-c", "iSj;irj;q", str(obj)],
+        text=True, capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    sections, relocations = [json.loads(line) for line in result.stdout.splitlines()]
+    section = next(entry for entry in sections
+                   if entry["name"] == ".rodata.intc_irq_handlers")
+    assert section["size"] == 64 * 4
+    start = section["paddr"]
+    assert not any(member.stdout[start:start + section["size"]])
+
+    vendor = {}
+    for relocation in relocations:
+        offset = relocation["paddr"] - start
+        if 0 <= offset < section["size"]:
+            assert offset % 4 == 0
+            index = offset // 4
+            assert index not in vendor
+            vendor[index] = relocation["name"].removeprefix("imp.")
+    assert len(vendor) == 28
+
+    entries = [f"cast[pointer]({vendor[index]})" if index in vendor else "nil"
+               for index in range(64)]
+    expected = ",\n  ".join(entries)
+    run_program(tmp_path, "checked", source() + f"""
+let expected: array[64, pointer] = [
+  {expected}]
+intc_handlers_init()
+for index in 0 ..< expected.len:
+  doAssert intc_handler_tab[index] == expected[index], "IRQ slot " & $index
+""")

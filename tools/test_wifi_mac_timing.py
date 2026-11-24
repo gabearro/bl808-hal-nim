@@ -1,10 +1,13 @@
 """Check MAC timing initialization and propagation of fatal preconditions."""
 
 from pathlib import Path
+import re
+import shutil
+import subprocess
 
 import pytest
 
-from test_wifi_disconnect_tx import procedure
+from test_wifi_disconnect_tx import FW, procedure
 from test_wifi_init_failure import mac_source
 from test_wifi_message_allocation import run_program
 
@@ -54,6 +57,15 @@ proc prepareFailure(which: int) =
 
 
 CASES = {
+    "config_log_order": r'''
+setupTiming()
+configLogEnabled = true
+doAssert hal_machw_init() and diagnostics == 0
+doAssert configLogCalls == 1 and configLogWrites >= 0
+doAssert configLogWrites < writes.len
+doAssert writes[configLogWrites].address == MACHW_BASE + 0xD8'u
+doAssert calls == @["clock", "config-log", "chains"]
+''',
     "fault_stops": r'''
 var continued: seq[int]
 for which in 0 ..< failureLines.len:
@@ -134,7 +146,12 @@ for oldClock in [20'u32, 40, 80]:
        ((mid * 40 div oldClock) shl 10) or (low * 40 div oldClock))
     doAssert registers[MACHW_BASE + 0x9C] ==
       ((r9c and 0xE3FFFFFF'u32) or ((antennaCount.uint32 + 1) shl 26))
-    doAssert calls == @["clock", "chains", "rf-baseline"]
+    doAssert (nimFwDbgMacTimingE8, nimFwDbgMacTimingF0, nimFwDbgMacTimingF4,
+              nimFwDbgMacTimingF8, nimFwDbgMacTiming104) ==
+      (registers[MACHW_BASE + 0xE8], registers[MACHW_BASE + 0xF0],
+       registers[MACHW_BASE + 0xF4], registers[MACHW_BASE + 0xF8],
+       registers[MACHW_BASE + 0x104])
+    doAssert calls == @["clock", "chains"]
 ''',
 }
 
@@ -143,3 +160,94 @@ for oldClock in [20'u32, 40, 80]:
 @pytest.mark.parametrize("case", CASES)
 def test_mac_timing(tmp_path: Path, mode: str, case: str) -> None:
     run_program(tmp_path, mode, source() + CASES[case])
+
+
+@pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
+def test_mac_timing_uses_paired_phy_clock(tmp_path: Path, mode: str) -> None:
+    code = source()
+    phy_clock = procedure((FW / "global_state/forward_decls_base.nim").read_text(),
+                          "phy_get_mac_freq")
+    code = code.replace(procedure(code, "phy_get_mac_freq"),
+                        "proc crm_get_mac_freq(): uint32 = 60\n" + phy_clock, 1)
+    run_program(tmp_path, mode, code + r'''
+setupTiming()
+registers[MACHW_BASE + 0xE4] = (100'u32 shl 8) or 40
+registers[MACHW_BASE + 0xE8] = (400'u32 shl 8) or 0x12
+registers[MACHW_BASE + 0xEC] = 100'u32 shl 10
+registers[MACHW_BASE + 0xF4] = (500'u32 shl 8) or 0x34
+registers[MACHW_BASE + 0xF8] = (600'u32 shl 8) or 0x56
+registers[MACHW_BASE + 0x104] = (120'u32 shl 20) or (130'u32 shl 10) or 140
+doAssert crm_get_mac_freq() == 60 and phy_get_mac_freq() == 40
+doAssert hal_machw_init() and diagnostics == 0
+doAssert registers[MACHW_BASE + 0xE4] ==
+  (0x02200000'u32 or (100'u32 shl 8) or 40)
+doAssert registers[MACHW_BASE + 0xE8] == ((400'u32 shl 8) or 0x12)
+doAssert registers[MACHW_BASE + 0xEC] ==
+  (0x02700000'u32 or (100'u32 shl 10) or 180)
+doAssert registers[MACHW_BASE + 0xF4] == ((500'u32 shl 8) or 0x34)
+doAssert registers[MACHW_BASE + 0xF8] == ((600'u32 shl 8) or 0x56)
+doAssert registers[MACHW_BASE + 0x104] ==
+  ((120'u32 shl 20) or (130'u32 shl 10) or 140)
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
+def test_mac_timing_merges_from_fresh_register_reads(tmp_path: Path, mode: str) -> None:
+    code = source()
+    code = code.replace(procedure(code, "regRead"), r'''
+var changingTimingReads: Table[uint, int]
+proc regRead(address: uint): uint32 =
+  let value = registers.getOrDefault(address)
+  if address in changingTimingReads:
+    inc changingTimingReads[address]
+    if changingTimingReads[address] == 1:
+      # The scaled field comes from this read; the other bits must come
+      # from the later read that prepares the writeback.
+      registers[address] = 0x5A00649C'u32
+  value
+''', 1)
+    run_program(tmp_path, mode, code + r'''
+setupTiming()
+registers[MACHW_BASE + 0xE4] = 20
+for offset in [0xE8'u, 0xF4'u, 0xF8'u]:
+  let address = MACHW_BASE + offset
+  changingTimingReads[address] = 0
+  registers[address] = 0xA5012381'u32
+doAssert hal_machw_init() and diagnostics == 0
+for address, reads in changingTimingReads:
+  doAssert registers[address] == 0x5A02469C'u32
+  doAssert reads == 3 # scale, merge, and diagnostic snapshot
+''')
+
+
+def test_vendor_support_uses_paired_phy_clock() -> None:
+    support = (FW.parent.parent / "wifi_vendor_support.c").read_text()
+    clock_shim = support.split("uint32_t phy_get_mac_freq(void)", 1)[1].split("}", 1)[0]
+    assert "return 40u;" in clock_shim
+    assert "crm_get_mac_freq" not in clock_shim
+
+
+def test_pinned_bl808_sdk_phy_boundary_contract() -> None:
+    sdk = FW.parents[3] / "build/bl_iot_sdk_b773b3f"
+    archive = sdk / "components/platform/soc/bl606p/bl606p_phyrf/lib/libbl606p_phyrf.a"
+    makefile = sdk / "customer_app/bl808/bl808_demo_event/Makefile"
+    objdump = shutil.which("llvm-objdump")
+    if not archive.is_file() or not makefile.is_file() or objdump is None:
+        pytest.skip("pinned BL808 SDK checkout and llvm-objdump are required")
+    assert re.search(r"^COMPONENTS_NETWORK \+= bl606p_phyrf\b", makefile.read_text(), re.M)
+    disassembly = subprocess.run([objdump, "-d", str(archive)], check=True,
+                                 capture_output=True, text=True).stdout
+    def instruction_lines(symbol: str) -> list[str]:
+        function = re.search(rf"<{symbol}>:\n(.*?)(?=\nDisassembly of section)",
+                             disassembly, re.S)
+        assert function is not None
+        return re.findall(r"^\s*[0-9a-f]+:\s+[0-9a-f]+\s+\S.*$", function[1], re.M)
+
+    clock = instruction_lines("phy_get_mac_freq")
+    assert len(clock) == 2
+    assert re.fullmatch(r"\s*0:\s+02800513\s+li\s+a0,\s+0x28\s*", clock[0])
+    assert re.fullmatch(r"\s*4:\s+8082\s+ret\s*", clock[1])
+    for symbol in ("mpif_clk_init", "phy_powroffset_set"):
+        body = instruction_lines(symbol)
+        assert len(body) == 1
+        assert re.fullmatch(r"\s*0:\s+8082\s+ret\s*", body[0])

@@ -15,9 +15,15 @@ proc bl_output*(blHw: ptr BlHw; isSta: cint; txPbuf: ptr Pbuf; customCfm: ptr Bl
   let ethernetHeaderPtr = txPbufView.payload
   let ethernetHeader = ethernetHeaderAt(ethernetHeaderPtr)
   let etherType = ethernetHeader.ethertype
+  when defined(bl808WifiDiagTcpPath):
+    let tcp = observeTcpPath(ethernetHeaderPtr, txPbufView.len.uint, txPbufView.totLen.uint)
+    logTcpPath(tcp, tcpTxOutput)
   noteTxProtocol(txPbufView, etherType)
   noteDhcpTx(txPbufView, ethernetHeader, etherType)
   if etherType == 0x8e88'u16 or etherType == 0x888e'u16:
     {.emit: """{ extern volatile unsigned int nimfw_dbg_bl_output_eapol;
                  nimfw_dbg_bl_output_eapol++; }""".}
-  enqueueTxPacket(isSta, txPbuf, txPbufView, ethernetHeader, customCfm)
+  let rc = enqueueTxPacket(isSta, txPbuf, txPbufView, ethernetHeader, customCfm)
+  when defined(bl808WifiDiagTcpPath):
+    if rc != 0: logTcpPath(tcp, tcpTxRejected, cast[uint32](rc.int32))
+  rc

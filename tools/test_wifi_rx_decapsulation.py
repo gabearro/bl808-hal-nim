@@ -96,6 +96,8 @@ var
   sw: RxSwDescView
   mpdu: Mpdu
   transferred, prepared, eapolCalls, replayCalls, softwareCalls: int
+  mgmtCalls: int
+  mgmtResult: uint32
   eapolLength: uint32
   eapolBytes: seq[uint8]
   micCalls, micBytes, allocations, frees: int
@@ -164,7 +166,7 @@ proc apm_handle_eapol_input(sta: uint8; data: pointer; length: uint32) =
   eapolLength = length
   eapolBytes = newSeq[uint8](length.int)
   copyMem(addr eapolBytes[0], data, length.int)
-proc sm_handle_eapol_input(sta: uint8; sa, data: pointer; length: uint32) =
+proc sm_handle_eapol_input(sta: uint8; sa, data: pointer; length: uint16) =
   inc eapolCalls
   eapolLength = length
   eapolBytes = newSeq[uint8](length.int)
@@ -200,7 +202,12 @@ proc rxu_cntrl_desc_prepare(p: pointer) = inc prepared
 proc rxu_mpdu_upload_and_indicate(p: pointer) = discard
 proc irqSave(): uint32 = 0
 proc irqRestore(flags: uint32) = discard
-proc rxu_mgt_frame_check(p: pointer; sta: uint8): uint32 = 0
+proc smActivationEapolReady(vif, station: uint8): bool = true
+proc smActivationRetainM1(vif, station: uint8; source: array[6, uint8];
+                          data: pointer; available: uint32): bool = false
+proc rxu_mgt_frame_check(p: pointer; sta: uint8): uint32 =
+  inc mgmtCalls
+  mgmtResult
 proc vif_mgmt_get_first_ap_inf(): pointer = nil
 proc apm_send_mlme(vif: pointer; fc: uint16; dest, callback, arg, extra: pointer) = discard
 proc ke_evt_set(mask: uint32) = discard
@@ -248,6 +255,8 @@ proc setup(fc: uint16; headerLen, payloadLen: int; secure = false) =
   transferred = 0
   prepared = 0
   eapolCalls = 0
+  mgmtCalls = 0
+  mgmtResult = 0
   replayCalls = 0
   softwareCalls = 0
   micCalls = 0
@@ -289,8 +298,10 @@ proc checkFrame(fc: uint16; headerLen: int; ethernetII, bridge: bool;
     else: hdr.addr2
   doAssert rxu_cntrl_frame_handle(addr mpdu) == 1
   doAssert transferred == 1 and prepared == 1 and eapolCalls == 0
-  if (fc and 0x80) != 0:
+  if (fc and 0xFC) == 0x88:
     doAssert (sw.frameControlFlags and 0x70) == 0x30, "lost QoS TID in upload metadata"
+  else:
+    doAssert (sw.frameControlFlags and 0x70) == 0, "unexpected QoS TID in upload metadata"
   doAssert softwareCalls == 0, "hardware RX must not retry software decryption"
   doAssert envState.machdrLen.int == headerLen
   doAssert sw.bufferOffset.int == strip, "payload signature changed header offset"
@@ -352,6 +363,9 @@ for fc in [0x0008'u16, 0x0108, 0x0208, 0x8208, 0x0288, 0x0298, 0x02A8, 0x02B8,
   checkFrame(fc, headerLen, false, true, 0x8137, 40)
   checkFrame(fc, headerLen, false, false, 0x8137, 40, rfcLlc = true)
   checkFrame(fc, headerLen, false, false, 0x80F3, 40, rfcLlc = true)
+  # Byte-swapped values are ordinary RFC1042 Ethernet-II types, not exceptions.
+  checkFrame(fc, headerLen, true, false, 0x3781, 40)
+  checkFrame(fc, headerLen, true, false, 0xF380, 40)
 
 checkFrame(0x4208, 28, true, false, 0x0800, 40, hardwareCipher = 20)
 checkFrame(0x4208, 28, false, false, 0, 40, hardwareCipher = 20)
@@ -449,6 +463,58 @@ def run_dispatch_checks(release_mode: bool, tmp_path: Path, checks: str,
 @pytest.mark.parametrize("release_mode", [False, True])
 def test_rx_dispatch_decapsulation_and_security(release_mode: bool, tmp_path: Path) -> None:
     run_dispatch_checks(release_mode, tmp_path, CHECKS)
+
+
+@pytest.mark.parametrize("release_mode", [False, True])
+def test_rx_edca_tids_keep_distinct_sequence_indices(release_mode: bool, tmp_path: Path) -> None:
+    checks = CHECKS.split("# Unprotected IP")[0] + r"""
+for tid in 0'u8 .. 7:
+  setup(0x0288, 26, 40)
+  bytes[24] = tid
+  snapAt(26, 0x0800)
+  let before = stations[0].sequences.qosSeqCtrl
+  doAssert rxu_cntrl_frame_handle(addr mpdu) == 1
+  doAssert envState.tid == tid
+  for index in 0 ..< before.len:
+    doAssert stations[0].sequences.qosSeqCtrl[index] ==
+      (if index == tid.int: 0x1230'u16 else: before[index])
+  doAssert (sw.frameControlFlags and 0x70) == tid.uint32 shl 4
+  doAssert transferred == 1 and prepared == 1
+"""
+    run_dispatch_checks(release_mode, tmp_path, checks)
+
+
+@pytest.mark.parametrize("release_mode", [False, True])
+def test_rx_qos_cf_subtypes_do_not_claim_amsdu(release_mode: bool, tmp_path: Path) -> None:
+    checks = CHECKS.split("# Unprotected IP")[0] + r"""
+for subtype in [0x88'u16, 0x98, 0xA8, 0xB8]:
+  setup(0x0200'u16 or subtype, 26, 40)
+  bytes[24] = 0x83
+  snapAt(26, 0x0800)
+  let accepted = subtype != 0x88
+  doAssert (rxu_cntrl_frame_handle(addr mpdu) == 1) == accepted
+  doAssert transferred == accepted.int and prepared == accepted.int
+  if accepted:
+    doAssert envState.tid == 3 and stations[0].sequences.qosSeqCtrl[3] == 0x1230
+    doAssert (sw.frameControlFlags and 0x71) == 0
+    doAssert sw.bufferOffset == 20 and sw.mpduLengthBytes == 46
+"""
+    run_dispatch_checks(release_mode, tmp_path, checks)
+
+
+@pytest.mark.parametrize("release_mode", [False, True])
+def test_rx_retained_mgmt_retry_updates_sequence(release_mode: bool, tmp_path: Path) -> None:
+    checks = CHECKS.split("# Unprotected IP")[0] + r"""
+setup(0x00B0, 24, 6)
+mgmtResult = 1
+doAssert rxu_cntrl_frame_handle(addr mpdu) == 1
+doAssert mgmtCalls == 1
+doAssert stations[0].sequences.nonQosSeqCtrl == 0x1230
+macDataFrameAt(addr bytes[0]).frameControl = 0x08B0
+doAssert rxu_cntrl_frame_handle(addr mpdu) == 0
+doAssert mgmtCalls == 1
+"""
+    run_dispatch_checks(release_mode, tmp_path, checks)
 
 
 @pytest.mark.parametrize("release_mode", [False, True])

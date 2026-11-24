@@ -35,6 +35,10 @@ extern unsigned long _sidata;
 extern unsigned long _sramfunc __attribute__((weak));
 extern unsigned long _eramfunc __attribute__((weak));
 extern unsigned long _siramfunc __attribute__((weak));
+#ifdef BL808_WIFI_MBEDTLS_CACHED_WRAM
+extern unsigned long __wifi_cached_hot_exec, __wifi_cached_hot_exec_end;
+extern unsigned long __wifi_cached_hot_src, __wifi_cached_hot_dst;
+#endif
 extern unsigned long _sp;
 extern unsigned long __wifi_bss_start __attribute__((weak));
 extern unsigned long __wifi_bss_end __attribute__((weak));
@@ -83,6 +87,19 @@ void __copy_data(void) {
   while (dst < &_edata) {
     *dst++ = *src++;
   }
+#ifdef BL808_WIFI_MBEDTLS_CACHED_WRAM
+  uintptr_t exec = (uintptr_t)&__wifi_cached_hot_exec;
+  uintptr_t size = (uintptr_t)&__wifi_cached_hot_exec_end - exec;
+  __dcache_clean_invalidate_range(exec, size);
+  const unsigned long *hot_src = &__wifi_cached_hot_src;
+  volatile unsigned long *hot_dst = &__wifi_cached_hot_dst;
+  for (uintptr_t i = 0; i < size / sizeof(*hot_dst); ++i) {
+    hot_dst[i] = hot_src[i];
+  }
+  __do_fence_io();
+  __icache_invalidate_all();
+  __do_fencei();
+#endif
 }
 """.}
 

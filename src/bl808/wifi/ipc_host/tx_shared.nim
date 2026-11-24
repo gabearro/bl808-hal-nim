@@ -13,8 +13,12 @@ proc ipc_host_txbuf_get*(env: pointer): pointer {.exportc, cdecl.} =
       return txBufferSlot
 
 proc ipc_host_txbuf_free*(txBufferSlot: pointer) {.exportc, cdecl.} =
-  if txBufferSlot != nil:
+  if txBufferSlot == nil: return
+  let saved = ipcHostIrqSave()
+  defer: ipcHostIrqRestore(saved)
+  if loadU32(txBufferSlot, 0) != 0'u32:
     storeU32(txBufferSlot, 0, 0'u32)
+    inc ipcHostTxResources.releases
 
 proc ipc_host_txdesc_get*(env: pointer): pointer {.exportc, cdecl.} =
   if env == nil:

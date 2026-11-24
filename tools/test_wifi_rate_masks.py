@@ -42,6 +42,26 @@ proc intersect(rx, tx: uint32): uint32 =
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_legacy_rate_bounds(tmp_path: Path, mode: str) -> None:
+    scan = (FW / "scan_station_ap_me.nim").read_text()
+    code = source() + procedure(scan, "me_legacy_ridx_min") + \
+        procedure(scan, "me_legacy_ridx_max")
+    run_program(tmp_path, mode, code + r'''
+doAssert me_legacy_ridx_min(0) == 12
+doAssert me_legacy_ridx_max(0) == 12
+for bit in 0 .. 11:
+  let value = 1'u32 shl bit
+  doAssert me_legacy_ridx_min(value) == bit.uint8
+  doAssert me_legacy_ridx_max(value) == bit.uint8
+  doAssert me_legacy_ridx_max(value or 0xFFFFF000'u32) == bit.uint8
+for bit in 12 .. 31:
+  let value = 1'u32 shl bit
+  doAssert me_legacy_ridx_min(value) == 12
+  doAssert me_legacy_ridx_max(value) == 255
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_legacy_basic_only_and_all_rates(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, source() + r'''
 let rates = [2'u8, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108]
@@ -167,10 +187,10 @@ def test_bss_request_contains_only_basic_rates(tmp_path: Path, mode: str) -> Non
     run_program(tmp_path, mode, code + LIFETIME + r'''
 setup()
 vif.basicRates = [4'u8, 0x82, 0x04, 0x8C, 0x6C, 0, 0, 0, 0, 0, 0, 0, 0]
-sm_set_bss_param(nil)
+sm_set_bss_param()
 while sm.pendingBssParams.first != nil:
   acknowledgeBss()
-  sm_send_next_bss_param(nil)
+  sm_send_next_bss_param()
 acknowledgeBss()
 doAssert sent.len == 9
 doAssert keMsgHdrFromPayload(sent[2]).id == MM_SET_BASIC_RATES_REQ

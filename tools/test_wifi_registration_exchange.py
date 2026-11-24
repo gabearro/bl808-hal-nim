@@ -18,7 +18,7 @@ def source() -> str:
     code = code.replace("    channelFreqPair: uint32", "    channelFreqPair: uint32\n    basicRates: array[13, uint8]", 1)
     code = code.replace("size == sizeof(MmStaAddReqPayload).uint32", "size >= sizeof(MmStaAddReqPayload).uint32", 1)
     code = code.replace("  else:\n    doAssert id in [SCANU_START_CFM, SCANU_JOIN_CFM]", """  elif id == 11:
-    doAssert dst in [4'u8, 9'u8] and src == 0 and size >= 3
+    doAssert dst in [4'u8, 9'u8] and src in [0'u8, 7'u8] and size >= 3
   else:
     doAssert id in [SCANU_START_CFM, SCANU_JOIN_CFM]""", 1)
     code = code.replace(procedure(code, "staDeleteEpoch"), """
@@ -77,7 +77,7 @@ proc me_set_sta_ht_vht_param(station, caps: pointer) =
   doAssert caps == cast[pointer](addr vifs[index].ht)
   inc htCalls
   invoke(onHt)
-proc sm_set_bss_param(reply: pointer) =
+proc sm_set_bss_param() =
   inc bssCalls
   state = 4
   invoke(onBss)
@@ -97,6 +97,15 @@ proc sm_set_bss_param(reply: pointer) =
         owner = (FW / "station_tx_build.nim").read_text()
         support += procedure(owner, "smTxBindStation")
         support += "\n{.pragma: wifiCtrl.}\n" + module.read_text()
+        support += r'''
+var chanTbttTimerOwner, chanConnlessTimerOwner: tuple[valid: bool, resetEpoch: uint32]
+var failChannelReset: bool
+proc mm_force_idle_req(): bool =
+  doAssert not enabled
+  inc txResetEpoch
+  not failChannelReset
+'''
+        support += procedure((FW / "channel_timer.nim").read_text(), "chanForceIdle")
     tasks = (FW / "task_handlers.nim").read_text()
     code += support + procedure(tasks, "mm_sta_add_req_handler") + procedure(tasks, "mm_sta_add_cfm_handler")
     return code + r'''
@@ -124,6 +133,7 @@ proc resetExchange() =
   bssCalls = 0
   htCalls = 0
   registerStatus = 0
+  failChannelReset = false
   onRegister = nil
   onRegistered = nil
   onHt = nil
@@ -146,6 +156,35 @@ doAssert bssCalls == 0 and state == 3
 
 
 CASES = {
+    "channel_reset_before_request_or_reply": r'''
+for beforeReply in [false, true]:
+  for resetKind in 0..4:
+    resetExchange()
+    let request = issue()
+    var reply = if beforeReply: completeRegistration(request) else: nil
+    if beforeReply: doAssert reply != nil
+    case resetKind
+    of 0:
+      doAssert chanForceIdle()
+    of 1:
+      inc txResetEpoch
+    of 2:
+      inc txResetEpoch
+      doAssert chanForceIdle()
+    of 3:
+      failChannelReset = true
+      doAssert not chanForceIdle()
+    else:
+      replaceOwner()
+      doAssert chanForceIdle()
+    if not beforeReply: reply = completeRegistration(request)
+    if reply != nil:
+      doAssert mm_sta_add_cfm_handler(reply) == 0
+      release(reply)
+    doAssert bssCalls == (if resetKind == 0: 1 else: 0)
+    doAssert registrations == (if beforeReply or resetKind == 0: 1 else: 0)
+    finishExchange()
+''',
     "reserved_completion": r'''
 resetExchange()
 let request = issue()
@@ -221,6 +260,7 @@ resetExchange()
 let request = issue()
 registerStatus = 7
 let reply = completeRegistration(request)
+doAssert mm_sta_add_cfm_handler(reply) == 0
 doAssert mm_sta_add_cfm_handler(reply) == 0
 doAssert failures == @[(15'u16, 0xFFFF'u16)] and bssCalls == 0
 release(reply)
@@ -317,6 +357,22 @@ release(reply)
 doAssert deletions == 0
 finishExchange()
 ''',
+    "untagged_forwarded_request": r'''
+resetExchange()
+setup()
+let request = ke_msg_alloc(MM_STA_ADD_REQ, TASK_MM, TASK_SM, MmStaAddReqPayloadSize)
+cast[ptr MmStaAddReqPayload](request).vifIdx = conn.vifIdx
+let header = keMsgHdrFromPayload(request)
+header.srcId = 9
+header.destId = 7
+let reply = completeRegistration(request)
+doAssert reply != nil and registrations == 1
+doAssert keMsgHdrFromPayload(reply).destId == 9
+doAssert keMsgHdrFromPayload(reply).srcId == 7
+release(reply)
+doAssert deletions == 0
+finishExchange()
+''',
     "request_fields": r'''
 for mutation in 0 .. 4:
   resetExchange()
@@ -365,7 +421,7 @@ stations[0].valid = 0
 inc stationEpochs[0]
 vifs[conn.vifIdx].staIdx = 255
 state = SmWaitingState
-sm_join_bss(addr localMac[0], addr target[0], addr channel, 1)
+sm_join_bss(addr localMac[0], addr target[0], addr channel, true)
 let scanReply = complete(take())
 doAssert scanu_join_cfm_handler(scanReply) == 0
 release(scanReply)
@@ -413,17 +469,14 @@ proc wifiEventPendingWork(): bool = false
 proc wifiKernelTimerPendingWork(): bool = false
 proc wifiMmTimerPendingWork(): bool = false
 proc wifiMessagePendingWork(): bool = false
-proc wifiHiddenMessagePendingWork(): bool = false
+proc wifiResetEventPending(): bool = false
 proc smBssNeedsService(): bool = false
 proc smCleanupNeedsService(): bool = false
 proc smActivationNeedsService(): bool = false
 proc smBssService() = discard
 proc smCleanupService() = discard
 proc smActivationService() = discard
-proc ke_timer_schedule() = discard
-proc mm_timer_schedule() = discard
-proc ke_evt_schedule() = discard
-proc ke_task_schedule() = discard
+proc wifiDispatchScheduledEvent(): bool = false
 '''
     runtime = (FW / "task_init_main.nim").read_text()
     code += procedure(runtime, "wifiMainHasPendingWork") + procedure(runtime, "wifiDrainScheduledWork")

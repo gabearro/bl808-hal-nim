@@ -35,21 +35,42 @@ proc osSemGive(sem: pointer): int32 {.cdecl.} =
     return 1
   semaphore.available = true
   0
-proc osMutexCreate(): pointer {.cdecl.} = cast[pointer](1)
-proc osMutexDelete(mutex: pointer) {.cdecl.} = discard mutex
+proc osMutexCreate(): pointer {.cdecl.} =
+  c_calloc(1, sizeof(SimpleMutex).csize_t)
+proc osMutexDelete(mutex: pointer) {.cdecl.} = osObjectDelete(mutex)
 proc osMutexLock(mutex: pointer): int32 {.cdecl.} =
-  discard mutex
-  # Bare-metal M0 has no competing tasks; the shared state risk is IRQ re-entry.
+  if mutex == nil:
+    return 1
+  let state = cast[ptr SimpleMutex](mutex)
+  let saved = osEnterCritical()
+  if state.header.deleted or state.header.users == high(uint32) or
+      osMutexDepth == high(uint32):
+    osExitCritical(saved)
+    return 1
+  # The global depth keeps IRQs masked until every held mutex is released.
   if osMutexDepth == 0:
-    osMutexSavedIrq = osEnterCritical()
+    osMutexSavedIrq = saved
+  inc state.header.users
   inc osMutexDepth
+  osExitCritical(0)
   0
 proc osMutexUnlock(mutex: pointer): int32 {.cdecl.} =
-  discard mutex
-  if osMutexDepth != 0:
-    dec osMutexDepth
-    if osMutexDepth == 0:
-      osExitCritical(osMutexSavedIrq)
+  if mutex == nil:
+    return 1
+  let state = cast[ptr SimpleMutex](mutex)
+  let saved = osEnterCritical()
+  if state.header.users == 0 or osMutexDepth == 0:
+    osExitCritical(saved)
+    return 1
+  dec state.header.users
+  dec osMutexDepth
+  let dispose = state.header.deleted and state.header.users == 0
+  if osMutexDepth == 0:
+    osExitCritical(osMutexSavedIrq)
+  else:
+    osExitCritical(0)
+  if dispose:
+    c_free(mutex)
   0
 
 proc osQueueCreate(queueLen, itemSize: uint32): pointer {.cdecl.} =

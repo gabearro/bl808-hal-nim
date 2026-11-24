@@ -105,3 +105,38 @@ proc rxHostSessionCurrent*(session: RxHostSession): bool =
   defer: rxHostIrqRestore(saved)
   session.captured and rxVifEpochs[session.vif] == session.vifEpoch and
     (session.station == 0xFF or staDeleteEpoch(session.station) == session.stationEpoch)
+
+type RxHostStationIndication = object
+  previous: ptr RxHostStationIndication
+  payload: pointer
+  session: RxHostSession
+
+var rxHostStationIndicationTop {.wifiCtrl.}: ptr RxHostStationIndication
+
+proc rxHostSendStationIndication(payload: pointer; session: RxHostSession) =
+  # The external ke_msg_send path calls the host and retires the allocation
+  # synchronously. Preserve provenance without modifying its wire payload.
+  let saved = rxHostIrqSave()
+  var scope = RxHostStationIndication(previous: rxHostStationIndicationTop,
+    payload: payload, session: session)
+  rxHostStationIndicationTop = addr scope
+  rxHostIrqRestore(saved)
+  defer:
+    let lock = rxHostIrqSave()
+    rxHostStationIndicationTop = scope.previous
+    rxHostIrqRestore(lock)
+  ke_msg_send(payload)
+
+proc rxHostClaimStationIndication*(payload: pointer; firmwareVif: uint8): bool =
+  let saved = rxHostIrqSave()
+  defer: rxHostIrqRestore(saved)
+  var scope = rxHostStationIndicationTop
+  while scope != nil:
+    if scope.payload == payload:
+      # The command manager rejects duplicate dispatch of the active message.
+      # Do not match a new allocation at this address during send retirement.
+      scope.payload = nil
+      return scope.session.vif == firmwareVif and rxHostSessionCurrent(scope.session)
+    scope = scope.previous
+  # Keep the ordinary host entry points compatible with the vendor producer.
+  true

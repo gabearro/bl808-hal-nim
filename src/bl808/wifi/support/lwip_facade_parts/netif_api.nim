@@ -12,6 +12,14 @@ proc netifapi_netif_add*(netif: ptr Netif; ipaddr, netmask, gw: ptr Ip4Addr;
     storePtr(cast[pointer](netif), NetifInputOff, cast[pointer](input))
     if init != nil: init(netif) else: 0
 
+proc wifiRemoveApNetif(netif: ptr Netif) =
+  when defined(bl808WifiRealLwip):
+    proc removeNetif(netif: ptr Netif) {.importc: "netif_remove", header: "<lwip/netif.h>".}
+    removeNetif(netif)
+  else:
+    storeU8(cast[pointer](netif), NetifFlagsOff, 0)
+    storePtr(cast[pointer](netif), NetifInputOff, nil)
+
 proc netifapi_netif_common*(netif: ptr Netif; voidfunc: NetifVoidFn; errtfunc: NetifErrFn): int8 {.exportc, cdecl.} =
   if voidfunc != nil: voidfunc(netif)
   if errtfunc != nil: errtfunc(netif) else: 0

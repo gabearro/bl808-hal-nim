@@ -112,9 +112,6 @@ for delta in -40 .. 40:
     if remainder >= 2:
       inc quotient
       remainder -= 4
-    elif remainder <= -3:
-      dec quotient
-      remainder += 4
     var rows = RfPriTxPowerTableDefault
     var indices = RfPriTxPowerTableIndexDefault
     for row in rows.mitems:
@@ -175,7 +172,8 @@ for flags in [8'u8, 12, 0x28, 0x2C]:
   env.flags = flags
   chan_pre_switch_channel()
   doAssert env.currentCtxt == (addr contexts[3]) and env.scheduledCtxt == nil
-  doAssert events == @[("timer-clear", 76'u), ("phy", 3'u), ("status", 4'u),
+  doAssert events == @[("timer-clear", 76'u), ("rx-harvest", 0'u), ("rx-drain", 0'u),
+    ("phy", 3'u), ("status", 4'u),
     ("basic", 75'u), ("pm", 0'u), ("active", 0'u)],
     "scan MAC activation inserted an RF replay or changed the channel handoff order"
 ''')

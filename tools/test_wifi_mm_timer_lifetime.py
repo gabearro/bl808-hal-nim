@@ -25,15 +25,23 @@ type
     next: ptr CoListHdr
     callback: pointer
     env, expiry: uint32
+  MmTimerView = MmTimerElemView
+  MmStaDeletion = object
+    active: bool
 var
   mm_timer_list: CoList
   mmTimerRevision: uint32
+  mmStaDelRetryMask: uint8
+  mmStaDelRetryReset: uint32
+  mmStaDelRetryTimer: MmTimerView
+  mmStaDeletions: array[5, MmStaDeletion]
   timers: array[4, MmTimerElemView]
   now, events, hardwareDeadline, unmask: uint32
   enabled = true
   hardware: seq[tuple[index: int, expiry: uint32]]
+  registerWrites: seq[tuple[address: uint, value: uint32]]
   delivered: seq[uint]
-  onRead, onHardware, onClearEvent, onSetEvent, onCallback: proc()
+  onRead, onHardware, onClearEvent, onSetEvent, onCallback, onRestore: proc()
   onTrace: proc(tag: string)
   nimFwDbgMmTimerYield, nimFwDbgMmTimerYieldHead: uint32
 proc invoke(hook: var proc()) =
@@ -44,7 +52,9 @@ proc invoke(hook: var proc()) =
 proc irqSave(): uint32 =
   result = if enabled: 8'u32 else: 0'u32
   enabled = false
-proc irqRestore(saved: uint32) = enabled = (saved and 8) != 0
+proc irqRestore(saved: uint32) =
+  enabled = (saved and 8) != 0
+  if enabled: invoke(onRestore)
 proc regRead(address: uint): uint32 =
   if address == MACHW_TIMLO_REG:
     result = now
@@ -52,6 +62,7 @@ proc regRead(address: uint): uint32 =
   elif address == MACHW_ABS_TIMER_REG: result = hardwareDeadline
   else: result = unmask
 proc regWrite(address: uint; value: uint32) =
+  registerWrites.add((address, value))
   if address == MACHW_ABS_TIMER_REG: hardwareDeadline = value
   else: unmask = value
 proc nimFwTrace2U32(tag: string; a, b: uint32) =
@@ -111,6 +122,7 @@ proc setup() =
   onClearEvent = nil
   onSetEvent = nil
   onCallback = nil
+  onRestore = nil
   onTrace = nil
   enabled = true
   mm_timer_init()
@@ -125,6 +137,7 @@ proc setup() =
   nimFwDbgMmTimerYield = 0
   nimFwDbgMmTimerYieldHead = 0
   hardware.setLen(0)
+  registerWrites.setLen(0)
   delivered.setLen(0)
 proc queueIds(): seq[uint] =
   var node = mm_timer_list.first
@@ -139,12 +152,209 @@ proc finish() =
   onClearEvent = nil
   onSetEvent = nil
   onCallback = nil
+  onRestore = nil
   onTrace = nil
   mm_timer_init()
   when declared(mmTimerMutationTop): doAssert mmTimerMutationTop == nil
   when declared(mmTimerScheduling): doAssert not mmTimerScheduling
 setup()
 '''
+
+SERVICE_PLATFORM = r'''
+const
+  KE_EVT_MAX = 26
+  KE_EVT_RESET = 0x80000000'u32
+  KE_EVT_KE_TIMER = 0x20000000'u32
+  KE_EVT_KE_MESSAGE = 0x08000000'u32
+  KE_EVT_RXREADY = 0x00100000'u32
+type KeTimerEntry = object
+  time: uint32
+var
+  kernelTimer: KeTimerEntry
+  keTimerQueue: CoList
+  keEvtHandlers: array[KE_EVT_MAX, tuple[handler, param: pointer]]
+  beacons, kernelCallbacks, resets: int
+  registrations, scans, taskMessages: int
+  registrationReady, scanReady, messageReady, holdReset, registrationPostsReset: bool
+proc keEnvEventField(): ptr uint32 = addr events
+proc macTimeNow(): uint32 = regRead(MACHW_TIMLO_REG)
+proc smRegistrationNeedsService(): bool = registrationReady
+proc smScanNeedsService(): bool = scanReady
+proc smActivationNeedsService(): bool = false
+proc smBssNeedsService(): bool = false
+proc smCleanupNeedsService(): bool = false
+proc smRegistrationService() =
+  registrationReady = false
+  inc registrations
+  if registrationPostsReset:
+    ke_evt_set(KE_EVT_RESET)
+proc smScanService() =
+  scanReady = false
+  inc scans
+proc smActivationService() = discard
+proc smBssService() = discard
+proc smCleanupService() = discard
+proc wifiMessagePendingWork(): bool = messageReady
+proc ke_task_schedule() =
+  messageReady = false
+  inc taskMessages
+  ke_evt_clear(KE_EVT_KE_MESSAGE)
+'''
+
+SERVICE_CHECKS = r'''
+proc ke_timer_schedule() =
+  ke_evt_clear(KE_EVT_KE_TIMER)
+  if keTimerExpired(cast[ptr KeTimerEntry](keTimerQueue.first)):
+    inc kernelCallbacks
+    keTimerQueue.first = nil
+proc mmEvent(arg: pointer) {.cdecl.} = mm_timer_schedule()
+proc keEvent(arg: pointer) {.cdecl.} = ke_timer_schedule()
+proc taskEvent(arg: pointer) {.cdecl.} = ke_task_schedule()
+proc resetEvent(arg: pointer) {.cdecl.} =
+  inc resets
+  if holdReset: return
+  events = 0
+  mm_timer_init()
+  keTimerQueue.first = nil
+proc beaconRx(arg: pointer) {.cdecl.} =
+  inc beacons
+  ke_evt_clear(KE_EVT_RXREADY)
+  # The admitted Beacon clears its VIF's keep-alive timer.
+  mm_timer_clear(addr timers[0])
+
+proc armServiceTimers(start, deadline: uint32) =
+  setup()
+  now = start
+  mm_timer_set(addr timers[0], deadline)
+  kernelTimer.time = deadline
+  keTimerQueue.first = cast[ptr CoListHdr](addr kernelTimer)
+  beacons = 0
+  kernelCallbacks = 0
+  resets = 0
+  registrations = 0
+  scans = 0
+  taskMessages = 0
+  registrationReady = false
+  scanReady = false
+  messageReady = false
+  holdReset = false
+  registrationPostsReset = false
+
+keEvtHandlers[0].handler = cast[pointer](resetEvent)
+keEvtHandlers[1].handler = cast[pointer](mmEvent)
+keEvtHandlers[2].handler = cast[pointer](keEvent)
+keEvtHandlers[4].handler = cast[pointer](taskEvent)
+keEvtHandlers[11].handler = cast[pointer](beaconRx)
+for deadline in [1000'u32, 20'u32]:
+  armServiceTimers(deadline - 100, deadline)
+  now = deadline - 25
+  let earlyWork = wifiMainHasPendingWork()
+  ke_evt_set(KE_EVT_RXREADY)
+  doAssert wifiDrainScheduledWork()
+  doAssert beacons == 1 and delivered.len == 0 and queueIds().len == 0
+  doAssert not earlyWork, "future fallback timers are not work"
+  doAssert kernelCallbacks == 0 and keTimerQueue.first != nil
+  now = deadline
+  doAssert wifiMainHasPendingWork() and wifiDrainScheduledWork()
+  doAssert kernelCallbacks == 1
+  doAssert not wifiMainHasPendingWork()
+
+  armServiceTimers(deadline - 100, deadline)
+  now = deadline
+  ke_evt_set(KE_EVT_RESET)
+  doAssert wifiDrainScheduledWork()
+  doAssert resets == 1 and delivered.len == 0 and kernelCallbacks == 0
+  doAssert not wifiDrainScheduledWork()
+
+  armServiceTimers(deadline - 100, deadline)
+  now = deadline
+  ke_evt_set(KE_EVT_MM_TIMER or KE_EVT_KE_TIMER)
+  doAssert wifiDrainScheduledWork()
+  doAssert delivered == @[1'u] and kernelCallbacks == 0
+  doAssert events == KE_EVT_KE_TIMER
+  doAssert wifiDrainScheduledWork() and kernelCallbacks == 1
+  doAssert not wifiDrainScheduledWork()
+
+  armServiceTimers(deadline - 100, deadline)
+  now = deadline
+  doAssert wifiDrainScheduledWork()
+  doAssert delivered == @[1'u] and kernelCallbacks == 0
+  doAssert events == 0, "recovery must not leave a synthetic event pending"
+  doAssert wifiDrainScheduledWork() and kernelCallbacks == 1
+  doAssert not wifiDrainScheduledWork()
+
+  armServiceTimers(deadline - 100, deadline)
+  now = deadline
+  onCallback = proc() = kernelTimer.time = now + 25
+  doAssert wifiDrainScheduledWork()
+  doAssert delivered == @[1'u] and kernelCallbacks == 0
+  doAssert not wifiDrainScheduledWork()
+  now += 25
+  doAssert wifiDrainScheduledWork() and kernelCallbacks == 1
+
+  armServiceTimers(deadline - 100, deadline)
+  now = deadline - 25
+  ke_evt_set(KE_EVT_MM_TIMER or KE_EVT_RXREADY)
+  doAssert wifiDrainScheduledWork()
+  doAssert delivered == @[1'u] and beacons == 0 and kernelCallbacks == 0
+  doAssert wifiDrainScheduledWork() and beacons == 1
+
+  armServiceTimers(deadline - 100, deadline)
+  now = deadline - 25
+  ke_evt_set(KE_EVT_KE_TIMER or KE_EVT_RXREADY)
+  doAssert wifiDrainScheduledWork()
+  doAssert delivered.len == 0 and beacons == 0 and kernelCallbacks == 1
+  doAssert wifiDrainScheduledWork() and beacons == 1 and queueIds().len == 0
+
+  armServiceTimers(deadline - 100, deadline)
+  registrationReady = true
+  messageReady = true
+  holdReset = true
+  ke_evt_set(KE_EVT_RESET)
+  doAssert wifiDrainScheduledWork()
+  doAssert resets == 1 and events == KE_EVT_RESET
+  doAssert registrations == 0 and taskMessages == 0
+  holdReset = false
+  doAssert wifiDrainScheduledWork() and resets == 2
+  doAssert registrations == 0 and taskMessages == 0
+  doAssert wifiDrainScheduledWork()
+  doAssert registrations == 1 and taskMessages == 1 and events == 0
+
+  armServiceTimers(deadline - 100, deadline)
+  registrationReady = true
+  scanReady = true
+  registrationPostsReset = true
+  messageReady = true
+  doAssert wifiDrainScheduledWork()
+  doAssert registrations == 1 and resets == 1 and scans == 0 and taskMessages == 0
+  doAssert wifiDrainScheduledWork()
+  doAssert scans == 1 and taskMessages == 1
+
+  armServiceTimers(deadline - 100, deadline)
+  messageReady = true
+  ke_evt_set(KE_EVT_RXREADY)
+  doAssert wifiDrainScheduledWork()
+  doAssert taskMessages == 1 and beacons == 0 and events == KE_EVT_RXREADY
+  doAssert wifiDrainScheduledWork() and beacons == 1 and events == 0
+finish()
+'''
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_timer_poll_services_only_due_fallbacks(tmp_path: Path, mode: str) -> None:
+    kernel = (FW / "kernel_mac_channel.nim").read_text()
+    service = (FW / "task_init_main.nim").read_text()
+    code = source() + SERVICE_PLATFORM
+    for name in ("keTimerExpired", "eventIndex32", "keDispatchEvent"):
+        code += procedure(kernel, name)
+    boundary = SERVICE_CHECKS.index("proc mmEvent")
+    code += SERVICE_CHECKS[:boundary]
+    for name in ("wifiEventPendingWork", "wifiKernelTimerPendingWork",
+                 "wifiMmTimerPendingWork", "wifiResetEventPending", "wifiMainHasPendingWork",
+                 "wifiDispatchScheduledEvent",
+                 "wifiDrainScheduledWork"):
+        code += procedure(service, name)
+    run_program(tmp_path, mode, code + SERVICE_CHECKS[boundary:])
 
 
 CASES = {
@@ -163,10 +373,18 @@ doAssert reprograms == WifiTimerDrainLimit.int + 1
 doAssert delivered.len == 0 and queueIds() == @[1'u]
 ''',
     "expiry_during_programming": r'''
-mm_timer_set(addr timers[0], 100)
-onHardware = proc() = now = 151
-mm_timer_schedule()
-doAssert delivered == @[1'u] and queueIds().len == 0
+for due in [100'u32, 151]:
+  setup()
+  mm_timer_set(addr timers[0], 100)
+  onHardware = proc() = now = due
+  mm_timer_schedule()
+  doAssert delivered == @[1'u] and queueIds().len == 0
+  setup()
+  onHardware = proc() = now = due
+  mm_timer_set(addr timers[0], 100)
+  doAssert events == KE_EVT_MM_TIMER
+  mm_timer_schedule()
+  doAssert delivered == @[1'u] and queueIds().len == 0
 ''',
     "early_expiry_boundary": r'''
 for target in [149'u32, 150, 151]:
@@ -304,6 +522,34 @@ onCallback = proc() = mm_timer_set(addr timers[0], 500)
 mm_timer_schedule()
 doAssert delivered == @[1'u] and queueIds() == @[1'u]
 ''',
+    "retire_popped_delivery": r'''
+for change in 0 .. 3:
+  setup()
+  mm_timer_set(addr timers[0], 100)
+  now = 151
+  onClearEvent = proc() =
+    onRestore = proc() =
+      let claim = mmTimerMutationTop
+      doAssert claim != nil and claim.delivering and claim.timer == addr timers[0]
+      doAssert not claim.cancelled
+      case change
+      of 0: mm_timer_clear(addr timers[0])
+      of 1: mm_timer_set(addr timers[0], 500)
+      of 2: mm_timer_init()
+      else: mm_timer_set(addr timers[1], 500)
+      doAssert mmTimerMutationTop == claim
+      doAssert claim.cancelled == (change != 3)
+  onCallback = proc() =
+    doAssert mmTimerMutationTop != nil and mmTimerMutationTop.delivering
+    doAssert mmTimerMutationTop.cancelled == (change != 3)
+  mm_timer_schedule()
+  doAssert delivered == @[1'u] and mmTimerMutationTop == nil and enabled
+  let remaining = case change
+    of 1: @[1'u]
+    of 3: @[2'u]
+    else: newSeq[uint]()
+  doAssert queueIds() == remaining
+''',
     "recursive_schedule_budget": r'''
 proc repeat() =
   now += 100
@@ -408,3 +654,31 @@ finish()
     }[action]
     checks = checks.replace("BEFORE", before).replace("ACTION", operation).replace("CHECK", check)
     run_program(tmp_path, mode, source(real_hardware=True) + checks)
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_mm_timer_stale_snapshot_does_not_override_new_head(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source(real_hardware=True) + r'''
+onClearEvent = proc() =
+  onRestore = proc() = mm_timer_set(addr timers[0], 100)
+mm_timer_schedule()
+doAssert queueIds() == @[1'u]
+doAssert hardwareDeadline == 100 and (unmask and 0x80) != 0
+mm_timer_set(addr timers[1], 50)
+doAssert queueIds() == @[2'u, 1]
+mm_timer_hw_set(addr timers[0])
+doAssert hardwareDeadline == 50 and (unmask and 0x80) != 0
+finish()
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_mm_timer_already_unmasked_writes_only_deadline(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source(real_hardware=True) + r'''
+mm_timer_set(addr timers[0], 100)
+doAssert (unmask and 0x80) != 0
+registerWrites.setLen(0)
+mm_timer_hw_set(addr timers[0])
+doAssert registerWrites == @[(MACHW_ABS_TIMER_REG, 100'u32)]
+finish()
+''')

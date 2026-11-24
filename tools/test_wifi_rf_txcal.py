@@ -138,6 +138,10 @@ for freq in [0x49'u32, 0x92, 0x8123, 0x40000000]:
       let captured = expected[0x618 div 4]
       put(0x618, 0xDFEFFFFF'u32, 0)
       let sample = measure(freq, initial)
+      # rf_pri_txcal_search_core+0x82..+0xa8: the control snapshot after
+      # I/Q supplies the trigger-clear store, without a second control read.
+      doAssert mmioReads[^3 .. ^1] == @[cast[uint](addr rf70.measureI620),
+        cast[uint](addr rf70.measureQ624), cast[uint](addr rf70.measureCtrl618)]
       let power = (i.int64 * i.int64 + q.int64 * q.int64).uint32
       doAssert sample.ok and sample.power == power and adcIndex == 1 and not pending
       doAssert events == trace, "TXCAL sampling trace differs: " & $freq & " " & $initial & " " & $events & " vs " & $trace
@@ -363,16 +367,21 @@ doAssert calibration == before and events.len == 0
 
 @pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
 @pytest.mark.parametrize("bz", [False, True])
-def test_callers_program_every_result_and_use_vendor_frequencies(tmp_path: Path, mode: str, bz: bool) -> None:
+@pytest.mark.parametrize("zero_amp", [False, True])
+def test_callers_program_results_or_store_default_record(
+    tmp_path: Path, mode: str, bz: bool, zero_amp: bool
+) -> None:
     rf = RF.read_text()
     code = txcal_source(())
     code = code.replace("doAssert tag in [0xB1'u32, 0xB2, 0xB5]", "discard tag")
     for name in ("RfPriTxcalParams", "RfPriBzTxcalParams", "RfPriBzTxcalPowerSetup"):
         if "  " + name + ":" in rf:
             code += array_constant(rf, name)
+    code += f"const ForceZeroAmp = {'true' if zero_amp else 'false'}\n"
     code += r'''
 var
   rfTxcalOsdacCode: uint32
+  storedRows: int
   inputs: seq[tuple[parameter: uint32, center, delta: int32, freq: uint32]]
   programmed: seq[tuple[parameter: uint32, value: int32]]
 const Results = [20'i32, 21, 22, 23, 1000, -32, 1100, -25]
@@ -391,7 +400,8 @@ proc configureRfPriTxcalGain(index: int; params: array[7, uint32]) = discard
 proc configureRfPriTxcalGain(power: array[9, uint16]; params: array[7, uint32]) = discard
 proc configureRfPriTxcalGain(power: RfPriTxPowerTableRow; params: array[7, uint32]) = discard
 proc tuneRfTxcalSingenPower(amp: uint32; hi, lo: int32): uint32 = amp
-proc tuneRfTxcalRowPower(target, code: uint32): uint32 = target
+proc tuneRfTxcalRowPower(target, code: uint32): uint32 =
+  if ForceZeroAmp: 0'u32 else: target
 proc primeRfTxcalSearch() = discard
 proc writeRfTxcalParam(parameter: uint32; value: int32) = programmed.add((parameter, value))
 proc searchRfTxcalParam(parameter: uint32; center, delta: int32; freq: uint32):
@@ -401,15 +411,27 @@ proc searchRfTxcalParam(parameter: uint32; center, delta: int32; freq: uint32):
   inputs.add((parameter, center, delta, freq))
   (true, Results[index], (index + 1).uint32)
 proc storeRfTxcalRecord(row: int; p0, p1, p2, p3: int32; power: uint32) =
-  doAssert [p0, p1, p2, p3] == [22'i32, 23, 1100, -25]
+  doAssert row == storedRows
+  inc storedRows
+  if ForceZeroAmp:
+    doAssert [p0, p1, p2, p3] == [32'i32, 32, 1024, 0] and power == 0
+  else:
+    doAssert [p0, p1, p2, p3] == [22'i32, 23, 1100, -25]
 proc storeRfPriBzTxcalRecord(row: int; p0, p1, p2, p3: int32) =
-  doAssert [p0, p1, p2, p3] == [22'i32, 23, 1100, -25]
+  doAssert row == storedRows
+  inc storedRows
+  if ForceZeroAmp:
+    doAssert [p0, p1, p2, p3] == [32'i32, 32, 1024, 0]
+  else:
+    doAssert [p0, p1, p2, p3] == [22'i32, 23, 1100, -25]
 '''
     name = "runRfPriBzTxcal" if bz else "runRfPriTxcal"
     code += procedure(rf, name)
     code += f"\nconst Rows = {9 if bz else 18}\n"
     run_program(tmp_path, mode, code + f"\nrxcalSetup()\n{name}()\n" + r'''
-doAssert inputs.len == 8 * Rows and programmed.len == inputs.len
+doAssert inputs.len == (if ForceZeroAmp: 0 else: 8 * Rows)
+doAssert programmed.len == inputs.len
+doAssert storedRows == Rows
 let expected = @[(0'u32, 32'i32, 16'i32, 0x49'u32), (1'u32, 32'i32, 16'i32, 0x49'u32),
                  (0'u32, 20'i32, 8'i32, 0x49'u32), (1'u32, 21'i32, 8'i32, 0x49'u32),
                  (2'u32, 1024'i32, 128'i32, 0x92'u32), (3'u32, 0'i32, 64'i32, 0x92'u32),

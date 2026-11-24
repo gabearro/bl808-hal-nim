@@ -23,6 +23,7 @@ type
     txDesc: HostTxDescView
   IpcEnv = object
     hostTxCfmList: ptr CoList
+const MAX_VIFS = 2
 var
   wrappers: array[3, IpcHostTxWrapperView]
   hardware: array[3, HwDesc]
@@ -31,6 +32,9 @@ var
   published: CoList
   ipc: IpcEnv
   stationAttempts: array[7, uint32]
+  txResetEpoch: uint32
+  rxVifEpochs: array[MAX_VIFS, uint32]
+  staDeleteEpochs: array[7, uint32]
   rateIrqs: seq[bool]
   onRestore, onStore: proc()
   consumed: seq[int]
@@ -52,6 +56,7 @@ type
   UtilsList = CoList
   UtilsListHdr = CoListHdr
 proc rf_dump_status() = discard
+proc staDeleteEpoch(index: uint8): uint32 = staDeleteEpochs[index]
 proc rc_update_counters(station: uint8; attempts, failures: uint32;
                         aggregate, retry: bool) =
   doAssert station < 7
@@ -76,6 +81,9 @@ proc setup() =
   ke_env = default(typeof(ke_env))
   txEnv.packetCounter = 0
   stationAttempts = default(typeof(stationAttempts))
+  txResetEpoch = 0
+  rxVifEpochs = default(typeof(rxVifEpochs))
+  staDeleteEpochs = default(typeof(staDeleteEpochs))
   rateIrqs.setLen(0)
   consumed.setLen(0)
   indications.setLen(0)
@@ -101,8 +109,8 @@ proc drainPublished() =
     wrappers[index].txDesc = default(HostTxDescView)
   doAssert published.last == nil, "completion list has an orphan tail"
 
-# A station restart at the first unmasked boundary must happen after the old
-# completion's rate update and accounting, not in the middle of that work.
+# The first unmasked boundary must have an active flush owner. A host observer
+# at publication must see packet accounting already complete.
 for ac in 0'u8 .. 4:
   for station in 0'u8 .. 1:
     for status in [0x80800200'u32, 0x81000100'u32]:
@@ -116,18 +124,18 @@ for ac in 0'u8 .. 4:
       var changed = false
       onRestore = proc() =
         if changed or confirmLists[ac].first != nil: return
+        doAssert txActiveFlush != nil, "unowned completion at IRQ restore"
+        if published.first != addr wrappers[0].link: return
         changed = true
         onRestore = nil
-        stationAttempts[station] = 100
         txEnv.packetCounter = 7
       txl_cfm_evt(ac)
       onRestore = nil
       doAssert changed
-      doAssert stationAttempts[station] == 100,
-        "old completion updated the replacement station"
+      doAssert stationAttempts[station] == ((status shr 8) and 0xFF'u32) + 1
       doAssert txEnv.packetCounter == 7,
-        "old completion consumed replacement packet accounting"
-      doAssert rateIrqs == @[false]
+        "old completion consumed post-publication packet accounting"
+      doAssert rateIrqs == @[true]
       doAssert outputs[0] == (status or 1)
       doAssert heads[0].confirmType == 0x101
       doAssert published.first == addr wrappers[0].link

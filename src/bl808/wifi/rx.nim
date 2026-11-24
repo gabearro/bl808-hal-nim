@@ -2,6 +2,7 @@
 
 when defined(bl808m0) and defined(bl808WifiNimFw):
   import sdk_headers
+  import host_table_layout
   import ../wifi_fw as firmware
   from ../core import csrReadMstatus, disableInterrupts, enableInterrupts
 

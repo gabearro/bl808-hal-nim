@@ -8,6 +8,7 @@ import subprocess
 import pytest
 
 from test_wifi_disconnect_tx import procedure
+from test_wifi_message_allocation import run_program
 
 ROOT = Path(__file__).resolve().parents[1]
 FW = ROOT / "src/bl808/wifi/fw"
@@ -16,10 +17,11 @@ PLATFORM = r"""
 const
   MAX_STAS = 10
   MAX_VIFS = 2
+  VIF_TYPE_STA = 0'u8
   MACHW_TIMLO_REG = 0x24B00120'u
 var
   rcStaStatsPool: array[2000, uint8]
-  me_env: array[64, uint8]
+  me_env: array[34, uint32]
   rcPrngState: uint32
   rxVifEpochs: array[2, uint32]
 proc rcU8(p: pointer; offset: int): var uint8 =
@@ -46,8 +48,11 @@ type MockSta = object
   supportedRatesBitmap: uint16
   nssBwMax: uint8
   txPolicyUpdateFlags: array[4, uint8]
+type MockVif = object
+  vifType: uint8
 var
   sta: MockSta
+  vif: MockVif
   policy: TxPolicyView
   legacyMap: uint16
   peerNss, localNss: uint8
@@ -56,6 +61,9 @@ var
   macTime: uint32
   stationEpochs: array[5, uint32]
 template staInfoAt(p: pointer): ptr MockSta = cast[ptr MockSta](p)
+proc vifChannelForIdx(index: uint8): ptr MockVif =
+  doAssert index == sta.instNbr
+  addr vif
 template txPolicyAt(p: pointer): ptr TxPolicyView = cast[ptr TxPolicyView](p)
 proc staInfoForIdx(index: uint8): ptr MockSta =
   doAssert index == sta.infoIdx
@@ -86,7 +94,7 @@ proc me_legacy_ridx_max(rates: uint32): uint8 =
   12
 proc me_11n_nss_max(p: pointer): uint8 =
   inc nssCalls
-  if p == addr me_env[11]: return localNss
+  if p == addr meEnvView().htCaps[3]: return localNss
   doAssert p == addr sta.vhtCaps[3]
   peerNss
 proc regRead(address: uint): uint32 =
@@ -94,10 +102,11 @@ proc regRead(address: uint): uint32 =
   macTime
 """
 
-CASES = r"""
+SETUP = r"""
 proc setup(ht: bool; rates: uint16; preamble, bandwidth: uint8; htCap: uint16;
            remoteStreams: uint8 = 2; localStreams: uint8 = 1) =
   sta = default(MockSta)
+  vif = default(MockVif)
   stationEpochs = default(typeof(stationEpochs))
   rxVifEpochs = default(typeof(rxVifEpochs))
   for i in 0 ..< rcStaStatsPool.len: rcStaStatsPool[i] = 0xA5
@@ -121,12 +130,15 @@ proc setup(ht: bool; rates: uint16; preamble, bandwidth: uint8; htCap: uint16;
   sta.supportedRatesBitmap = 0x800'u16 or (preamble.uint16 shl 10)
   sta.nssBwMax = bandwidth
   rcU16(addr sta.vhtCaps[0], 0) = htCap
+  meEnvView().htCaps[3] = 0xFF
   sta.vhtCaps[3] = 3
   sta.vhtCaps[4] = 15
   sta.vhtCaps[5] = 1
   sta.vhtCaps[6] = 128
   sta.txPolicyUpdateFlags = [0x80'u8, 0x81, 0x82, 0x83]
+"""
 
+CASES = SETUP + r"""
 proc expectedCount(ht: bool; rates: uint16; preamble, gi: uint8): int =
   result = (rates and 1).int
   for i in 1 .. 3:
@@ -168,10 +180,17 @@ proc verify(ht: bool; rates: uint16; preamble, bw: uint8; htCap: uint16;
   doAssert rcStatsCounters(stats).retryLimit == 5
   doAssert rcStatsCounters(stats).fixedRate == 0xFFFF
   doAssert rcAmpduStats(stats).averageLengthQ16 == 65536
+  let lowest = rc_get_lowest_rate_config(stats)
+  let initial = rc_get_initial_rate_config(stats)
+  var endpointDuplicates = 0
   for i in 0 ..< expected:
     let config = rcRateStats(stats, i).rateConfig
     doAssert config != 0xFFFF and rc_check_valid_rate(stats, config) != 0
-    for j in 0 ..< i: doAssert config != rcRateStats(stats, j).rateConfig
+    for j in 0 ..< i:
+      if config == rcRateStats(stats, j).rateConfig:
+        doAssert j == 0 and config == initial and config == lowest
+        inc endpointDuplicates
+  doAssert endpointDuplicates == int(expected > 1 and initial == lowest)
   for step in 0 ..< 4:
     let index = rcRetryStep(stats, step).rateIdx.int
     doAssert index < expected
@@ -238,7 +257,14 @@ forceNoSample = true
 verify(false, 0xFFF, 0, 0, 0, 2)
 setup(false, 2, 0, 0, 0)
 forceNoSample = true
-verify(false, 2, 0, 0, 0, 1)
+verify(false, 2, 0, 0, 0)
+
+# rc.o:rc_init+0x448..0x470 reserves the equal endpoints before any draw.
+setup(false, 2, 0, 0, 0)
+rcPrngState = 1
+verify(false, 2, 0, 0, 0)
+doAssert rcRateConfig(sta.rcStats, 0) == 1 and rcRateConfig(sta.rcStats, 1) == 1
+doAssert rcPrngState == 1
 
 setup(false, 0, 0, 0, 0)
 rc_init(addr sta)
@@ -285,6 +311,31 @@ for ht in [false, true]:
   for slot in 0 ..< 4:
     doAssert rcRetryStep(stats, slot).rateIdx < rcRateCapabilities(stats).sampleCount
   doAssert errors == 0
+
+# A sort can change what the same four indexes mean to the hardware policy.
+setup(false, 0xFFF, 1, 0, 0)
+rc_init(addr sta)
+let sortedStats = sta.rcStats
+rcRateCapabilities(sortedStats).sampleCount = 4
+for index, rate in [0x0400'u16, 0x0404'u16, 0x0405'u16, 0x0406'u16]:
+  rcRateStats(sortedStats, index)[] = default(RcRateStatsView)
+  rcRateStats(sortedStats, index).rateConfig = rate
+rcRateStats(sortedStats, 1).probability = 0xF000
+let indexes = [3'u16, 2'u16, 1'u16, 0'u16]
+for slot, index in indexes:
+  rcRetryStep(sortedStats, slot).rateIdx = index
+sta.txPolicyUpdateFlags[0] = 0
+macTime += RC_UPDATE_INTERVAL + 1
+rc_check(sta.infoIdx)
+for slot, index in indexes:
+  doAssert rcRetryStep(sortedStats, slot).rateIdx == index
+doAssert rcRateConfig(sortedStats, 3) == 0x0404
+doAssert sta.txPolicyUpdateFlags[0] == StaTxPolicyUpdateRateControl,
+  "a newly sorted rate at an unchanged index must refresh the hardware policy"
+sta.txPolicyUpdateFlags[0] = 0
+macTime += RC_UPDATE_INTERVAL + 1
+rc_check(sta.infoIdx)
+doAssert sta.txPolicyUpdateFlags[0] == 0
 """
 
 
@@ -295,6 +346,8 @@ def source() -> str:
     code = "import std/bitops\n" + (FW.parent / "fw_constants/rate_control.nim").read_text()
     code += layout.split("# Linked list node", 1)[0]
     code += PLATFORM + "\ntype\n  RcRateEntryView" + layout.split("  RcRateEntryView", 1)[1].split("  TxFrameEnvView", 1)[0]
+    code += "\ntype\n  MeEnvView" + layout.split("  MeEnvView", 1)[1].split("\n\n", 1)[0]
+    code += "\ntemplate meEnvView()" + layout.split("template meEnvView()", 1)[1].split("\n\n", 1)[0] + "\n"
     code += "\ntype\n  TxPolicyView" + layout.split("  TxPolicyView", 1)[1].split("  MichaelMicContextView", 1)[0]
     code += DEVICES
     code += "\ntemplate rcPrngNext" + helpers.split("template rcPrngNext", 1)[1].split("proc rcRateEntryPtr", 1)[0]
@@ -311,7 +364,7 @@ def source() -> str:
     code += procedure((FW / "kernel_mac_channel.nim").read_text(), "is_cck_group")
     for name in ["rc_calc_tp", "rc_sort_samples_tp", "rc_update_retry_chain", "rc_get_new_sample_rates",
                  "rc_get_new_samples", "rc_update_stats", "rc_count_samples", "rc_seed_rate_table",
-                 "rcTryInitStation", "rc_init",
+                 "rcKeepCckFallbackReachable", "rcTryInitStation", "rc_init",
                  "rc_install_trial", "rc_check"]:
         if f"proc {name}(" in source or f"proc {name}*(" in source:
             code += procedure(source, name)
@@ -335,3 +388,139 @@ def test_rate_init(mode: str, tmp_path: Path) -> None:
                             env={**os.environ, "ASAN_OPTIONS": "detect_leaks=0"},
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     assert result.returncode == 0, result.stdout
+
+
+@pytest.mark.parametrize("mode", ["checked", "firmware", "asan"])
+def test_native_station_can_reach_negotiated_cck(mode: str, tmp_path: Path) -> None:
+    run_program(tmp_path, mode, source() + SETUP + r'''
+setup(true, 1, 1, 0, 0x20, 0, 0)
+sta.vhtCaps[3] = 0xFF
+rc_init(addr sta)
+doAssert errors == 0
+doAssert policy.retryRate[0] == 0x80001207'u32
+doAssert policy.retryRate[1] == 0x80000400'u32
+doAssert rcRetryStep(sta.rcStats, 1).rateIdx == rcRetryStep(sta.rcStats, 3).rateIdx
+
+for variant in 0 ..< 13:
+  let stats = sta.rcStats
+  let caps = rcRateCapabilities(stats)
+  vif.vifType = if variant == 1: 1'u8 else: VIF_TYPE_STA
+  caps.fixedRate = if variant == 2: 0x1207'u16 else: 0xFFFF'u16
+  caps.legacyRateMap = if variant == 3: 0x10'u16 else: 1'u16
+  caps.sampleCount = 4
+  rcU8(stats, RCS_ANOTHER_FLAG) = if variant == 4: 1'u8 else: 0'u8
+  var rates = [0x0400'u16, 0x1207'u16, 0x1003'u16, 0x1205'u16]
+  if variant == 5: rates[0] = 0x0404
+  if variant in [6, 11]: rates[2] = 0x040A
+  if variant in [10, 11]: rates[1] = 0x0409
+  if variant == 12: rates[2] = 0x0401
+  for i, rate in rates:
+    rcRateStats(stats, i).rateConfig = rate
+    rcRateStats(stats, i).probability = if (variant == 7 and i == 1) or
+        (variant == 8 and i == 2): 0x1999'u16 else: 0'u16
+  rcRetryStep(stats, 0).rateIdx = 1
+  rcRetryStep(stats, 1).rateIdx = 2
+  rcRetryStep(stats, 2).rateIdx = 3
+  rcRetryStep(stats, 3).rateIdx = 0
+  rcRetryStep(stats, 3).throughput = 42
+  rcTrialControl(stats).status = if variant == 9: 2'u8 else: 0'u8
+  sta.txPolicyUpdateFlags[0] = 0
+  rc_check(sta.infoIdx)
+  doAssert rcRetryStep(stats, 0).rateIdx == 1
+  doAssert rcRetryStep(stats, 2).rateIdx == 3 and rcRetryStep(stats, 3).rateIdx == 0
+  if variant in [0, 6, 10, 11]:
+    doAssert rcRetryStep(stats, 1).rateIdx == 0
+    doAssert rcRetryStep(stats, 1).throughput == 42
+    doAssert sta.txPolicyUpdateFlags[0] == StaTxPolicyUpdateRateControl
+  else:
+    doAssert rcRetryStep(stats, 1).rateIdx == 2 and sta.txPolicyUpdateFlags[0] == 0
+
+# Bench state after the steady-state burst: a usable, measured 1 Mbps
+# candidate is stranded even though both reachable rates usually fail.
+vif.vifType = VIF_TYPE_STA
+let warmed = sta.rcStats
+let warmedCaps = rcRateCapabilities(warmed)
+for variant in 0 ..< 8:
+  warmedCaps.formatMod = if variant == 5: 0'u8 else: RC_FORMATMOD_HT_MF
+  rcSetRateConfig(warmed, 0, 0x0400'u16)
+  rcSetRateConfig(warmed, 1, 0x1217'u16)
+  rcSetRateConfig(warmed, 2, 0x0405'u16)
+  rcRateStats(warmed, 0).probability = if variant == 3: 0x7FFF'u16 else: 0xBF8F'u16
+  rcRateStats(warmed, 0).oldProbAvailable = if variant == 4: 0'u8 else: 1'u8
+  rcRateStats(warmed, 1).probability = if variant == 1: 0x8000'u16 else: 0x3FC4'u16
+  rcRateStats(warmed, 2).probability = if variant == 2: 0x8000'u16 else: 0x4709'u16
+  rcRetryStep(warmed, 0).rateIdx = if variant == 6: 0'u16 else: 1'u16
+  rcRetryStep(warmed, 1).rateIdx = if variant == 7: 0'u16 else: 2'u16
+  rcRetryStep(warmed, 2).rateIdx = 3
+  rcRetryStep(warmed, 3).rateIdx = 0
+  rcTrialControl(warmed).status = 0
+  sta.txPolicyUpdateFlags[0] = 0
+  rc_check(sta.infoIdx)
+  doAssert rcRetryStep(warmed, 0).rateIdx == (if variant == 6: 0'u16 else: 1'u16)
+  doAssert rcRetryStep(warmed, 2).rateIdx == 3 and rcRetryStep(warmed, 3).rateIdx == 0
+  doAssert rcRetryStep(warmed, 1).rateIdx == (if variant in [0, 7]: 0'u16 else: 2'u16)
+  doAssert sta.txPolicyUpdateFlags[0] == (if variant == 0: StaTxPolicyUpdateRateControl else: 0'u8)
+
+# Reproduce the Ox64 burst: HT and 48 Mbps OFDM are below 50%, but
+# unmeasured 1 Mbps is not the only CCK choice outside the reachable slots.
+setup(true, 0xFFF, 1, 0, 0x20, 2, 0)
+sta.vhtCaps[3] = 0xFF
+rc_init(addr sta)
+let measured = sta.rcStats
+let measuredCaps = rcRateCapabilities(measured)
+measuredCaps.sampleCount = 6
+for variant in 0 ..< 7:
+  measuredCaps.legacyRateMap = if variant == 4: 0xFFF'u16 and not 8'u16 else: 0xFFF'u16
+  for i, config in [0x0400'u16, 0x1207'u16, 0x040A'u16, 0x0409'u16,
+                     0x0403'u16, 0x0402'u16]:
+    rcRateStats(measured, i)[] = default(RcRateStatsView)
+    rcRateStats(measured, i).rateConfig = config
+  rcRateStats(measured, 1).probability = if variant == 5: 0x8000'u16 else: 0x3CAB'u16
+  rcRateStats(measured, 4).probability = if variant == 3: 0x7FFF'u16 else: 0x851Fu16
+  rcRateStats(measured, 4).oldProbAvailable = if variant == 2: 0'u8 else: 1'u8
+  if variant in [1, 6]:
+    rcRateStats(measured, 5).oldProbAvailable = 1
+    rcRateStats(measured, 5).probability = if variant == 1: 0x9200'u16 else: 0x851Fu16
+  for i, index in [1'u16, 2'u16, 3'u16, 0'u16]:
+    rcRetryStep(measured, i).rateIdx = index
+  sta.txPolicyUpdateFlags[0] = 0
+  rc_check(sta.infoIdx)
+  let expected = case variant
+    of 0, 6: 4'u16
+    of 1: 5'u16
+    else: 2'u16
+  doAssert rcRetryStep(measured, 1).rateIdx == expected, "measured CCK fallback variant " & $variant
+  doAssert rcRetryStep(measured, 0).rateIdx == 1 and rcRetryStep(measured, 2).rateIdx == 3
+  doAssert rcRetryStep(measured, 3).rateIdx == 0
+  if expected == 2:
+    doAssert sta.txPolicyUpdateFlags[0] == 0
+  else:
+    doAssert rcRetryStep(measured, 1).throughput == rc_calc_tp(measured, expected.uint8)
+    doAssert sta.txPolicyUpdateFlags[0] == StaTxPolicyUpdateRateControl
+''', defines=("bl808WifiNativeWlanCalibration",))
+
+
+@pytest.mark.parametrize("mode", ["checked", "firmware", "asan"])
+def test_native_station_seeds_negotiated_ht_rates(mode: str, tmp_path: Path) -> None:
+    run_program(tmp_path, mode, source() + SETUP + r'''
+for legacy in [0x10'u16, 0x11'u16]:
+  setup(true, legacy, 1, 0, 0, 1, 0)
+  sta.vhtCaps[3] = 0xA4
+  meEnvView().htCaps[3] = 0x6C
+  doAssert rcTryInitStation(addr sta)
+  let stats = sta.rcStats
+  let caps = rcRateCapabilities(stats)
+  doAssert caps.maxNss == 0 and caps.maxMcs == 5
+  doAssert caps.mcsBitmaps[0] == 0x24
+  doAssert rc_get_initial_rate_config(stats) == 0x1005
+  doAssert rc_get_lowest_rate_config(stats) == (if legacy == 0x10: 0x1002'u16 else: 0x0400'u16)
+  for i in 0 ..< caps.sampleCount.int:
+    doAssert rcRateConfig(stats, i) in [0x1002'u16, 0x1005'u16, 0x0400'u16, 0x0404'u16]
+    doAssert rc_check_valid_rate(stats, rcRateConfig(stats, i)) == 1
+
+setup(true, 0x11, 1, 0, 0, 1, 0)
+sta.vhtCaps[3] = 0x80
+meEnvView().htCaps[3] = 0x7F
+doAssert not rcTryInitStation(addr sta)
+doAssert policy.status == 0xA5A5A5A5'u32
+''', defines=("bl808WifiNativeWlanCalibration",))

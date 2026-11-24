@@ -8,7 +8,10 @@ proc wifiBackendScanDone(): bool {.inline.} =
   bl808_wifi_backend_scan_done_count() > 0'u32
 
 proc wifiBackendScanCount(): uint32 {.inline.} =
-  bl808_wifi_backend_scan_count()
+  if bl808_wifi_backend_scan_confirmation() == 0:
+    bl808_wifi_backend_scan_count()
+  else:
+    0'u32
 
 proc wifiBackendConnectDone(): bool {.inline.} =
   bl808_wifi_backend_connect_done() != 0

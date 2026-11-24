@@ -17,6 +17,7 @@ proc bl808_disable_peripheral_irq(irq: uint32) {.importc, cdecl.}
 proc bl606a0_wifi_init(conf: ptr WifiConf): cint {.importc, cdecl.}
 proc bl606a0_wifi_netif_init(netif: ptr Netif): int8 {.importc, cdecl.}
 proc bl_main_if_add(isSta: cint; netif: ptr Netif; vifIndex: ptr uint8): cint {.importc, cdecl.}
+proc bl_main_if_remove(vifIndex: uint8): cint {.importc, cdecl.}
 proc bl_send_add_if(blHw: ptr BlHw; mac: ptr uint8; iftype: cint; p2p: bool; cfm: pointer): cint {.importc, cdecl.}
 proc bl_main_scan(netif: ptr Netif; fixedChannels: ptr uint16; channelNum: uint16;
                   bssid: ptr MacAddr; ssid: ptr MacSsid; scanMode: uint8;
@@ -27,6 +28,7 @@ proc bl_main_connect(ssid: ptr uint8; ssidLen: cint; psk: ptr uint8; pskLen: cin
                      freq: uint16; flags: uint32): cint {.importc, cdecl.}
 proc bl_main_connect_abort(status: ptr uint8): cint {.importc, cdecl.}
 proc bl_main_disconnect(): cint {.importc, cdecl.}
+proc bl_main_powersaving(mode: cint): cint {.importc, cdecl.}
 proc bl_main_phy_up(): cint {.importc, cdecl.}
 proc bl_send_reset(blHw: ptr BlHw): cint {.importc, cdecl.}
 proc wifiCmdMgrRecoverIfCrashed(cmdMgr: pointer): bool {.importc, cdecl.}
@@ -35,14 +37,25 @@ proc bl_main_apm_start(ssid, password: cstring; channel: cint; hiddenSsid: uint8
                        bcnInt: uint16): cint {.importc, cdecl.}
 proc bl_main_apm_stop(): cint {.importc, cdecl.}
 proc wifi_hosal_rf_turn_on(arg: pointer): cint {.importc, cdecl.}
+proc wifi_hosal_pm_event_register(event: PmEvent; code, capBit: uint32;
+    priority: uint16; callback: PmCb; argument: pointer;
+    enable: PmEventAble): cint
+    {.importc, cdecl.}
+proc wifi_hosal_pm_event_switch(event: PmEvent; code: uint32;
+    enable: PmEventAble): cint
+    {.importc, cdecl.}
+proc wifi_hosal_pm_capacity_set(level: PmLevel): cint {.importc, cdecl.}
+proc wifi_hosal_pm_post_event(event: PmEvent; code: uint32;
+    retval: ptr uint32): cint {.importc, cdecl.}
 proc mpif_clk_init() {.importc, cdecl.}
 proc sysctrl_init() {.importc, cdecl.}
 proc intc_init() {.importc, cdecl.}
 proc ipc_emb_init() {.importc, cdecl.}
 proc bl_init(): bool {.importc, cdecl.}
-proc bl_pm_ops_register() {.importc, cdecl.}
+proc bl_pm_ops_register(): uint32 {.importc, cdecl.}
 proc ke_evt_set(events: uint32) {.importc, cdecl.}
 proc wifi_main_poll_once() {.importc, cdecl.}
+proc wifi_pm_wake_pending(): bool {.importc, cdecl.}
 proc bl_irq_handler() {.importc, cdecl.}
 proc bl_main_event_handle(param: cint; txFcField: pointer) {.importc, cdecl.}
 proc mac_irq() {.importc, cdecl.}

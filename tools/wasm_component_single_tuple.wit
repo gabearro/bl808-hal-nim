@@ -1,0 +1,5 @@
+package ox64:math@0.2.0;
+
+world single-tuple {
+  export value: func(input: u64) -> tuple<u64>;
+}

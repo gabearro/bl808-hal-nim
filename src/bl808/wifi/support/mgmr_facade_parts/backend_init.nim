@@ -27,8 +27,12 @@ proc bl808_wifi_backend_init*(conf: ptr WifiConf): cint {.exportc, cdecl.} =
     if phy != 0: result = phy
     vendorPollFor(2000)
   bl808WifiBackendTrace("backend_init mgmr_finalize")
+  if result == 0 and (wifi_mgmr_pm_ops_register() != 0 or
+      wifi_mgmr_fw_affair_ops() != 0):
+    hostPollEnabled = false
+    return -1
   wifiStarted = result == 0
-  storeU8(mgmrRaw(), MgmrReadyOff, 1)
+  storeU8(mgmrRaw(), MgmrReadyOff, if wifiStarted: 1'u8 else: 0'u8)
   storeU16(mgmrRaw(), MgmrApBcnIntOff, 100)
   storeI32(mgmrRaw(), MgmrApInfoTtlOff, -1)
   storeI32(mgmrRaw(), MgmrScanItemTimeoutOff, WifiMgmrConfigScanItemTimeout)

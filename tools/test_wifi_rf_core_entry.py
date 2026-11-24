@@ -75,22 +75,36 @@ def core_source() -> str:
 var
   wifiBl808WlRmem: WlRfMemoryOverlay
   wifiBl808RfInited: uint32
+  wlCfgGlobal: pointer
   nimFwDbgRfPhase, nimFwDbgRfApiMode, nimFwDbgRfRestore: uint32
+  failInit, dropConfigOnInit, returnErrorOnSuccess: bool
   calls: seq[string]
 proc nimFwConnectTrace2U32(text: string; a, b: uint32) = discard
 proc rfPriLoadConfiguredDeviceInfo() = calls.add("device")
 proc seedWlCfgTxPowerDefaults(cfg: ptr WlRfConfig) = discard
 proc wl_cfg_get(rmem: ptr WlRfMemoryOverlay): ptr WlRfConfig =
   calls.add("cfg")
+  wlCfgGlobal = addr rmem.config
   addr rmem.config
 proc snapshotWifiRfCalibData() = calls.add("snapshot")
 proc nim_wifi_rf_latch_service_enable(enabled: uint32) = calls.add("latch")
-proc wl_init(): int8 =
+proc wlInitModemAndPublish(requireNoCallbacks: bool): bool =
   calls.add("init")
-  0
+  doAssert requireNoCallbacks
+  let cfg = cast[ptr WlRfConfig](wlCfgGlobal)
+  if cfg != nil:
+    doAssert cfg.enableParamLoadCallback == 0 and cfg.paramLoadCallback == nil
+    doAssert cfg.capcodeSetCallback == nil and cfg.capcodeGetCallback == nil
+  if dropConfigOnInit: wlCfgGlobal = nil
+  if failInit or wlCfgGlobal == nil: return false
+  cast[ptr WlRfConfig](wlCfgGlobal).status = WlRfConfigMagic
+  not returnErrorOnSuccess
+proc phy_init(cfg: pointer) = calls.add("phy")
 '''
     code += rf_procedure(RF.read_text(), "configureWlRfConfig")
-    return code + procedure(CORE.read_text(), "wifiRfCoreInitMode")
+    code += rf_procedure(RF.read_text(), "wlRfConfigInitialized")
+    return (code + procedure(CORE.read_text(), "wifiRfCoreInitMode")
+            + procedure(CORE.read_text(), "wifiRfCoreReady"))
 
 
 @pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
@@ -111,9 +125,53 @@ for inited in [0'u32, 1, 2, high(uint32)]:
       doAssert cfg.requestFullCalibration == (inited == 0).uint8
       doAssert cfg.enableParamLoadCallback == 0 and cfg.paramLoadCallback == nil
       doAssert cfg.capcodeSetCallback == nil and cfg.capcodeGetCallback == nil
-      doAssert cfg.xtalCapCodes == 0x2A2A and cfg.status == 0
+      doAssert cfg.xtalCapCodes == 0x2A2A and cfg.status == WlRfConfigMagic
       doAssert nimFwDbgRfPhase == 5 and wifiBl808RfInited == 1
+      doAssert wifiRfCoreReady()
       doAssert nimFwDbgRfRestore == (inited != 0).uint32
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
+def test_rf_wrappers_do_not_publish_failed_wl_initialization(tmp_path: Path, mode: str) -> None:
+    code = core_source() + rf_procedure(RF.read_text(), "rfc_init")
+    run_program(tmp_path, mode, code + r'''
+for useRfcInit in [false, true]:
+  for previousState in [0'u32, 1'u32]:
+    for dropConfig in [false, true]:
+      calls.setLen(0)
+      wifiBl808WlRmem = default(WlRfMemoryOverlay)
+      wifiBl808RfInited = previousState
+      failInit = true
+      dropConfigOnInit = dropConfig
+      returnErrorOnSuccess = false
+      nimFwDbgRfPhase = 0
+      if useRfcInit:
+        rfc_init(40_000_000'u32)
+        doAssert calls == @["cfg", "init"]
+      else:
+        wifiRfCoreInitMode(40_000_000'u32, wifiOnly)
+        doAssert calls == @["device", "cfg", "snapshot", "init", "snapshot"]
+        doAssert nimFwDbgRfPhase == 4
+      doAssert wifiBl808RfInited == 0
+      doAssert not wifiRfCoreReady()
+      doAssert wifiBl808WlRmem.config.status != WlRfConfigMagic
+    calls.setLen(0)
+    wifiBl808WlRmem = default(WlRfMemoryOverlay)
+    wifiBl808RfInited = previousState
+    failInit = false
+    dropConfigOnInit = false
+    returnErrorOnSuccess = true
+    if useRfcInit:
+      rfc_init(40_000_000'u32)
+      doAssert calls == @["cfg", "init"]
+    else:
+      wifiRfCoreInitMode(40_000_000'u32, wifiOnly)
+      doAssert calls == @["device", "cfg", "snapshot", "init", "snapshot"]
+      doAssert nimFwDbgRfPhase == 4
+    doAssert wifiBl808RfInited == 0
+    doAssert not wifiRfCoreReady()
+    doAssert wifiBl808WlRmem.config.status == WlRfConfigMagic
 ''')
 
 
@@ -166,6 +224,7 @@ proc modemInitCoreMode(frequency, restore: uint32; radioMode: RadioPhyMode) =
   programmedMode = radioMode
   if rebindAt == 4: rebind()
 '''
+    code += rf_procedure(RF.read_text(), "wlInitModemAndPublish")
     code += rf_procedure(RF.read_text(), "wl_init")
     return code + r'''
 proc setup() =
@@ -185,6 +244,33 @@ proc setup() =
   dropConfig = false
   callbackResult = 0
 '''
+
+
+@pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
+def test_configured_wl_init_rejects_callback_slots(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, init_source() + r'''
+for variant in 0 .. 4:
+  setup()
+  let cfg = addr memories[0].config
+  cfg.enableParamLoadCallback = 0
+  cfg.paramLoadCallback = nil
+  cfg.capcodeSetCallback = nil
+  cfg.capcodeGetCallback = nil
+  case variant
+  of 0: cfg.enableParamLoadCallback = 1
+  of 1: cfg.paramLoadCallback = cast[pointer](loadParam)
+  of 2: cfg.capcodeSetCallback = cast[pointer](setFirst)
+  of 3: cfg.capcodeGetCallback = cast[pointer](getFirst)
+  else: discard
+  let permitted = variant == 4
+  doAssert wlInitModemAndPublish(true) == permitted
+  if permitted:
+    doAssert calls == @["modem"]
+    doAssert cfg.status == WlRfConfigMagic and memories[0].env[9] == 0
+  else:
+    doAssert calls.len == 0
+    doAssert cfg.status == 0x1111 and memories[0].env[9] == 0x5A
+''')
 
 
 @pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
@@ -286,7 +372,7 @@ var
   bl808RfTempCalEnabled, bl808RfTempMeasurementPass: uint8
   indices: seq[uint32]
 proc rfSignedByte(value: uint8): int16 = cast[int8](value).int16
-proc rfPriRefreshTempCompParamFromWlCfg() = discard
+proc rfPriRefreshTempCompParamFromWlCfg(cfg: pointer) = discard
 proc rfPriComputeTemperaturePowerComp(channel: uint32; temperature: int32): int16 =
   indices.add(channel)
   0
@@ -311,9 +397,12 @@ doAssert indices == @[1'u32, 1]
 for channel in [0'u32, 1, 6, 14, 15, 255, 256, 257, 65537, high(uint32)]:
   indices.setLen(0)
   rf_pri_set_channel_pwr_comp(channel)
-  doAssert bl808RfChannelPowerIndex.uint32 == (channel and 255)
   if channel >= 1 and channel <= 14:
+    doAssert bl808RfChannelPowerIndex.uint32 == channel
     doAssert indices == @[channel, channel, channel, channel]
   else:
+    doAssert bl808RfChannelPowerIndex == 0
+    doAssert indices.len == 0
+    rf_pri_set_temp_comp(35)
     doAssert indices.len == 0
 ''')

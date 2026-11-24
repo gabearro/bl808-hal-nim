@@ -24,6 +24,11 @@ proc bam_send_air_action_frame*(staIdx: uint8, baEnv: pointer, action: uint8,
   if sta.valid == 0 or vifIdx >= MAX_VIFS.uint8:
     return
   let vif = vifChannelForIdx(vifIdx)
+  if (sta.macAddr[0] and 1'u8) != 0 or
+      sta.macAddr == [0'u8, 0, 0, 0, 0, 0] or
+      (vif.macAddr[0] and 1'u8) != 0 or
+      vif.macAddr == [0'u8, 0, 0, 0, 0, 0]:
+    return
   let identity = TxSessionIdentity(captured: true, vif: vifIdx, station: staIdx,
     vifEpoch: rxVifEpochs[vifIdx], stationEpoch: staDeleteEpoch(staIdx),
     resetEpoch: txResetEpoch)

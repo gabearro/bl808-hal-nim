@@ -26,6 +26,7 @@ type
     paramLen: uint32
   RxEnv = object
     processingFlag: uint8
+    queue: CoList
 const
   MM_IDLE = 0'u8
   KeMsgConsumed = 0.cint
@@ -38,6 +39,7 @@ var
   rx: RxEnv
   assertions, reschedules, handled, tableReads, frees, eventUpdates: int
   interrupts = true
+  rxEvents: uint32
   active: bool
   onAssert: proc()
   message: KeMsgHdr
@@ -51,6 +53,7 @@ proc assert_err(condition, file: cstring; line: cint) =
   inc assertions
   if onAssert != nil: onAssert()
 proc rxlCntrlEnvView(): ptr RxEnv = addr rx
+proc ke_evt_set(bits: uint32) = rxEvents = rxEvents or bits
 proc ke_reschedule_saved_messages(task: uint8): bool =
   inc reschedules
   false
@@ -70,6 +73,7 @@ proc co_list_push_back(queue: ptr CoList; node: ptr CoListHdr) =
   else: queue.last.next = node
   queue.last = node
 proc keResumeSavedMessagesIfIdle() = discard
+proc mmConfigResumeAbandonedIdle() = discard
 proc keUpdateMessageEventAfterSchedule() = inc eventUpdates
 proc keMsgPayload(header: ptr KeMsgHdr): pointer =
   cast[pointer](cast[uint](header) + sizeof(KeMsgHdr).uint)
@@ -126,6 +130,7 @@ proc setup() =
   frees = 0
   eventUpdates = 0
   interrupts = true
+  rxEvents = 0
   onAssert = nil
   active = false
   handlerResult = KeMsgConsumed
@@ -133,6 +138,7 @@ proc setup() =
   keMsgQueueSaved = default(CoList)
   mmState = 7
   rx.processingFlag = 1
+  rx.queue = default(CoList)
   mm_default_handler = KeMsgHandlerDesc(handlers: cast[pointer](handler), numHandlers: 1)
   scanu_default_handler = mm_default_handler
   for entry in mm_state_handler.mitems: entry = default(KeMsgHandlerDesc)
@@ -164,6 +170,31 @@ ke_state_set(TASK_SM, 10)
 doAssert reschedules == previous
 ke_state_set(TASK_MM, 0)
 doAssert mmState == MM_IDLE and rx.processingFlag == 0
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_mm_idle_rearms_pending_rx(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+for previous in [0'u16, 1'u16]:
+  setup()
+  var queued: CoListHdr
+  rx.queue.first = addr queued
+  keTaskDescs[TASK_MM].statePtr[] = previous
+  ke_state_set(TASK_MM, 0)
+  doAssert rx.processingFlag == 0 and mmState == MM_IDLE
+  doAssert (rxEvents and 0x00100000'u32) != 0 and interrupts
+
+setup()
+keTaskDescs[TASK_MM].statePtr[] = 1
+ke_state_set(TASK_MM, 0)
+doAssert rxEvents == 0 and interrupts
+
+setup()
+var queued: CoListHdr
+rx.queue.first = addr queued
+ke_state_set(TASK_SM, 0)
+doAssert rxEvents == 0 and rx.processingFlag == 1 and interrupts
 ''')
 
 

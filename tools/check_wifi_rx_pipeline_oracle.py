@@ -260,14 +260,22 @@ def main() -> int:
         return len(rows)
 
     try:
-        assert sha(qemu) == "4b288a5a52c1eb1878c76487a135e97270c3813836c998896640e5b123bb75f9"
+        expected_qemu_sha = "4b288a5a52c1eb1878c76487a135e97270c3813836c998896640e5b123bb75f9"
+        actual_qemu_sha = sha(qemu)
+        if actual_qemu_sha != expected_qemu_sha:
+            raise ValueError(
+                f"QEMU SHA-256 mismatch for {qemu}: "
+                f"expected {expected_qemu_sha}, got {actual_qemu_sha}")
         report["inputs"] = {str(p): sha(p) for p in [
             Path(__file__), c_source, obj, system, qemu,
             ROOT / "tools/test_wifi_michael.py", ROOT / "tools/wifi_rx_protected_oracle.S",
             ROOT / "tools/check_wifi_tx_confirmation_oracle.py",
             ROOT / "tools/wifi_console_format_probe.ld"]}
         profile_count = vectors()
-        assert 0 <= args.limit <= profile_count
+        if not 0 <= args.limit <= profile_count:
+            raise ValueError(
+                f"profile limit must be 0..{profile_count} for "
+                f"{args.role} {args.corpus}; got {args.limit}")
         tested_profiles = args.limit or profile_count
         data, named, symbols = elf32(obj)
         defined = {name for name, _, s in symbols if s[3] & 15 == 2 and s[5] not in [0,0xfff1,0xfff2]}

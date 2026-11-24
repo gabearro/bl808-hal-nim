@@ -17,7 +17,10 @@ const
   KeMsgConsumed = 0.cint
 type Vif = object
   vifType, state: uint8
+type MessageHeader = object
+  paramLen: uint32
 var
+  header = MessageHeader(paramLen: 64)
   vifs: array[MAX_VIFS, Vif]
   apmPendingCancelMask, apmStoppingVifs, startupMask: uint8
   rxVifEpochs: array[MAX_VIFS, uint32]
@@ -27,6 +30,7 @@ proc vifChannelForIdx(i: uint8): ptr Vif =
   addr vifs[i]
 proc apmStartPendingForVif(i: uint8): bool = (startupMask and (1'u8 shl i)) != 0
 proc rxuMgtDispatchView(p: pointer): ptr RxuMgtDispatchView = cast[ptr RxuMgtDispatchView](p)
+proc keMsgHdrFromPayload(p: pointer): ptr MessageHeader = addr header
 proc apm_probe_req_handler(p: pointer) = calls.add("probe")
 proc apm_auth_handler(p: pointer) = calls.add("auth")
 proc apm_assoc_req_handler(p: pointer; reassoc: uint32) = calls.add("assoc" & $reassoc)
@@ -47,6 +51,7 @@ for vif in 0'u8 .. 1:
       apmPendingCancelMask = 0
       apmStoppingVifs = 0
       startupMask = 0
+      header.paramLen = 64
       case phase
       of 1: vifs[vif].state = 0
       of 2: apmPendingCancelMask = 1'u8 shl vif
@@ -72,6 +77,13 @@ doAssert rxu_mgt_ind_handler_apm(nil) == KeMsgConsumed
 message = RxuMgtDispatchView(frameCtrl: 0x40, vifIdx: 255)
 discard rxu_mgt_ind_handler_apm(addr message)
 doAssert calls == @["probe"]
+
+for length in 0'u32 .. 8'u32:
+  calls.setLen(0)
+  header.paramLen = length
+  message = RxuMgtDispatchView(frameCtrl: 0xB0, vifIdx: 0)
+  doAssert rxu_mgt_ind_handler_apm(addr message) == KeMsgConsumed
+  doAssert calls.len == 0
 """
 
 

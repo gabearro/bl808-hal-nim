@@ -26,9 +26,17 @@ const
   KeMsgTailSlack = 4'u32
 var
   smState = 10'u16
+  sm_reconn_dominant_flag: uint32
   interruptsEnabled = true
   failEveryAllocation: bool
-  allocationHook, disconnectedHook, indicationHook, freeHook, scanRemoveHook: proc()
+  allocationLimit = high(int)
+  txResetInProgress: bool
+  fakeMacState: uint32
+  allocationHook, disconnectedHook, indicationHook, freeHook, scanRemoveHook, timerClearHook: proc()
+  smStateHook: proc()
+  smSaQuery: tuple[serial: uint32]
+  onIrqRestore: proc()
+  recycleOnFree, recycledHeader: pointer
 proc smCleanupForget(header: pointer)
 proc smCleanupOwnsRequest(request: pointer): bool
 proc smCleanupAdmitRequest(request: pointer): bool
@@ -49,6 +57,7 @@ type
   SmEnv = object
     connectInfo, connectIndMsg: pointer
     pendingBssParams: CoList
+    primaryFreq, centerFreq: uint16
     cancelRequested, joinBssFlag, deauthPending, saQueryActive: uint8
     scanResultIndex: uint32
   SmTxBuildContext = object
@@ -71,6 +80,7 @@ const
 var
   sm: SmEnv
   stationEpochs: array[7, uint32]
+  chanCtxtLinkEpochs: array[2, uint32]
   commands: seq[uint16]
   removed: seq[uint8]
   callbackCalls, starts, unlinks: int
@@ -81,6 +91,11 @@ var
   notifications: seq[SmDisconnectProcessIndPayload]
   cleanupChannel: Context
 proc smEnvView(): ptr SmEnv = addr sm
+proc keTimerClearLocked(id: uint16; task: uint8; saved: uint32) =
+  doAssert task == TASK_SM and not interruptsEnabled
+  timerClears.add(id)
+  irqRestore(saved)
+  if timerClearHook != nil: timerClearHook()
 proc connectInfoView(p: pointer): ptr tuple[vifIdx: uint8] = cast[ptr tuple[vifIdx: uint8]](p)
 proc captureRxHostSession(vif, station: uint8): RxHostSession =
   RxHostSession(vif: vif, epoch: rxVifEpochs[vif])
@@ -101,8 +116,15 @@ proc mm_sta_del(index: uint8) =
   removed.add(index)
   for vif in vifs.mitems:
     if vif.vifType == VIF_TYPE_STA and vif.staIdx == index: vif.staIdx = 255
+proc mmStaDelTry(index: uint8; saved: uint32): bool =
+  mm_sta_del(index)
+  true
+proc mmStaDelRetryPending(index: uint8): bool = false
+proc mmStaDelQueueRetryLocked(index: uint8; saved: uint32) = doAssert false
+proc mmStaDelOwned(index, vif: uint8; epoch: uint32): bool = false
 proc chan_ctxt_unlink(index: uint8) =
   inc unlinks
+  inc chanCtxtLinkEpochs[index]
   vifs[index].chanCtxt = nil
 proc smConnectIndPayloadAt(p: pointer): ptr SmConnectIndPayload = cast[ptr SmConnectIndPayload](p)
 proc scanu_rm_exist_ssid(p: pointer; index: uint8) =
@@ -119,7 +141,7 @@ proc smTxOwnerCurrent(build: SmTxBuildContext): bool =
   sm.connectInfo == build.connection and ke_state_get(TASK_SM) == build.state
 proc smTxEnd(build: var SmTxBuildContext) = discard
 proc smDeauthSend(build: var SmTxBuildContext) = sm_deauth_send()
-proc sm_send_next_bss_param(p: pointer) = inc starts
+proc sm_send_next_bss_param() = inc starts
 proc stationDisconnected(reason: uint8) {.cdecl.} =
   doAssert reason == 0
   inc callbackCalls
@@ -132,12 +154,10 @@ proc wifiEventPendingWork(): bool = keMsgQueueSent.first != nil
 proc wifiKernelTimerPendingWork(): bool = false
 proc wifiMmTimerPendingWork(): bool = false
 proc wifiMessagePendingWork(): bool = keMsgQueueSent.first != nil
-proc wifiHiddenMessagePendingWork(): bool = false
-proc ke_timer_schedule() = discard
-proc mm_timer_schedule() = discard
-proc ke_evt_schedule() =
-  if keMsgQueueSent.first != nil: driveOne()
-proc ke_task_schedule() = discard
+proc wifiResetEventPending(): bool = false
+proc wifiDispatchScheduledEvent(): bool =
+  result = wifiEventPendingWork()
+  if result: driveOne()
 '''
 
 DRIVER = r'''
@@ -229,23 +249,151 @@ setup()
 '''
 
 CASES = {
+    "established_supplicant_failure": r'''
+let completedJoin = sm.connectInfo
+sm.connectInfo = nil
+ke_msg_free(keMsgHdrFromPayload(completedJoin))
+smState = SmIdleState
+stations[2].valid = 1
+stations[2].instNbr = 0
+smRetireEstablishedSupplicantLink(2, 15)
+doAssert notifications.len == 1 and notifications[0].status == 8 and notifications[0].reason == 15
+smRetireEstablishedSupplicantLink(2, 15)
+doAssert notifications.len == 1
+drain()
+completed()
+smRetireEstablishedSupplicantLink(2, 15)
+doAssert notifications.len == 1 and smState == SmIdleState
+''',
     "disconnect": r'''
 sm.saQueryActive = 1
+sm_reconn_dominant_flag = 1
+indicationHook = proc() =
+  doAssert rxHostStationIndicationTop != nil
+  doAssert rxHostStationIndicationTop.session.vif == 0
 sm_disconnect_process(addr vifs[0], 19, 3)
 doAssert sm.saQueryActive == 0
+doAssert sm_reconn_dominant_flag == 0
 doAssert timerClears == @[SM_SA_QUERY_TIMEOUT_IND_MSG]
-doAssert smState == 10 and notifications.len == 0 and callbackCalls == 1
+doAssert smState == 10 and notifications.len == 1 and callbackCalls == 1
 doAssert commands.len == 0 and keMsgQueueSent.first.id == ME_SET_PS_DISABLE_REQ
 drain()
 completed()
 doAssert notifications.len == 1 and notifications[0].status == 19 and notifications[0].reason == 3
 ''',
+    "disconnect_callback_can_finish_cleanup": r'''
+var finishedInside = false
+indicationHook = proc() =
+  doAssert smCleanup.step == 0 and smCleanup.awaiting and interruptsEnabled
+  for _ in 0 ..< 24:
+    if not smCleanup.active: break
+    discard wifiDrainScheduledWork()
+  doAssert not smCleanup.active and smState == SmIdleState
+  doAssert keMsgQueueSent.first == nil and keMsgQueueSaved.first == nil
+  finishedInside = true
+sm_disconnect_process(addr vifs[0], 19, 3)
+doAssert finishedInside and notifications.len == 1
+doAssert not smCleanupServicing and rxHostStationIndicationTop == nil
+completed()
+''',
+    "disconnect_timer_replacement": r'''
+let connection = sm.connectInfo
+sm.saQueryActive = 1
+sm_reconn_dominant_flag = 1
+timerClearHook = proc() =
+  doAssert sm.saQueryActive == 0
+  doAssert sm_reconn_dominant_flag == 1
+  inc rxVifEpochs[0]
+  sm.saQueryActive = 1
+sm_disconnect_process(addr vifs[0], 7, 7)
+doAssert timerClears == @[SM_SA_QUERY_TIMEOUT_IND_MSG]
+doAssert sm.saQueryActive == 1 and sm.connectInfo == connection
+doAssert sm_reconn_dominant_flag == 1
+doAssert not smCleanup.active and notifications.len == 0 and callbackCalls == 0
+doAssert vifs[0].state == 1 and vifs[0].staIdx == 2
+doAssert vifs[0].chanCtxt == (addr cleanupChannel) and interruptsEnabled
+timerClearHook = nil
+sm_disconnect_process(addr vifs[0], 7, 7)
+doAssert sm_reconn_dominant_flag == 0
+drain()
+completed()
+doAssert notifications.len == 1 and notifications[0].status == 7 and notifications[0].reason == 7
+''',
+    "disconnect_detaches_timer_before_unlock": r'''
+let owner = SmDisconnectHandoff(peer: mmCaptureVif(addr vifs[0]),
+  connection: sm.connectInfo, resetEpoch: txResetEpoch, state: SmDisconnectingState)
+sm.saQueryActive = 1
+var replacementArmed = false
+onIrqRestore = proc() =
+  doAssert timerClears == @[SM_SA_QUERY_TIMEOUT_IND_MSG]
+  inc rxVifEpochs[0]
+  sm.saQueryActive = 1
+  replacementArmed = true
+smDisconnectOwned(owner, 7, 7)
+doAssert replacementArmed and interruptsEnabled and sm.saQueryActive == 1
+doAssert not smCleanup.active and callbackCalls == 0 and notifications.len == 0
+doAssert sm.connectInfo == owner.connection and vifs[0].state == 1
+ke_msg_free(keMsgHdrFromPayload(sm.connectInfo))
+doAssert allocated.len == 0
+''',
+    "query_serial_owns_cleanup_across_timer_clear": r'''
+smSaQuery.serial = 41
+let stale = SmDisconnectHandoff(peer: mmCaptureVif(addr vifs[0]),
+  connection: sm.connectInfo, resetEpoch: txResetEpoch, state: SmDisconnectingState,
+  saQuerySerial: 40)
+sm.saQueryActive = 1
+smDisconnectOwned(stale, 7, 7)
+doAssert timerClears.len == 0 and sm.saQueryActive == 1 and not smCleanup.active
+
+var current = stale
+current.saQuerySerial = 41
+timerClearHook = proc() =
+  doAssert interruptsEnabled and sm.saQueryActive == 0
+  inc smSaQuery.serial
+  sm.saQueryActive = 1
+smDisconnectOwned(current, 7, 7)
+doAssert timerClears == @[SM_SA_QUERY_TIMEOUT_IND_MSG]
+doAssert sm.saQueryActive == 1 and smSaQuery.serial == 42
+doAssert not smCleanup.active and callbackCalls == 0 and notifications.len == 0
+
+timerClearHook = nil
+current.saQuerySerial = 42
+smDisconnectOwned(current, 7, 7)
+drain()
+completed()
+doAssert notifications.len == 1 and notifications[0].status == 7 and notifications[0].reason == 7
+''',
     "cleanup_only": r'''
+sm_reconn_dominant_flag = 1
 sm_delete_resources(addr vifs[0])
+doAssert sm_reconn_dominant_flag == 1
 doAssert smState == 10
 drain()
 completed()
 doAssert notifications.len == 0
+''',
+    "limited_live_messages": r'''
+allocationLimit = 3
+sm_disconnect_process(addr vifs[0], 19, 3)
+doAssert smCleanup.awaiting and smCleanup.step == 0
+doAssert notifications.len == 1 and callbackCalls == 1
+drain()
+completed()
+doAssert notifications.len == 1
+''',
+    "defer_while_tx_resets": r'''
+txResetInProgress = true
+sm_disconnect_process(addr vifs[0], 19, 3)
+doAssert smCleanup.active and smState == SmDisconnectingState
+doAssert not smCleanupNeedsService() and keMsgQueueSent.first == nil
+smCleanupService()
+doAssert notifications.len == 0 and commands.len == 0 and keMsgQueueSent.first == nil
+txResetInProgress = false
+doAssert smCleanupNeedsService()
+smCleanupService()
+drain()
+completed()
+doAssert notifications.len == 1 and notifications[0].status == 19
 ''',
     "inactive": r'''
 vifs[0].state = 0
@@ -262,14 +410,75 @@ psDeferred = true
 sm_disconnect_process(addr vifs[0], 19, 3)
 driveOne()
 driveOne()
-doAssert mmPsModeRequest != nil and smState == 10 and notifications.len == 0
+doAssert mmPsModeRequest != nil and smState == 10 and notifications.len == 1
 doAssert not smCleanupNeedsService() and callbackCalls == 1
 mmPsModeComplete()
 drain()
 completed()
 ''',
+    "disconnect_pending_station_delete": r'''
+vifApConfig(addr vifs[0]).securityFlags = 3
+vifApConfig(addr vifs[1]).securityFlags = 7
+indicationHook = proc() =
+  doAssert smState == 10 and smCleanup.active and smCleanup.awaiting
+  doAssert smCleanup.indication == nil
+  doAssert keMsgQueueSent.first.id == ME_SET_PS_DISABLE_REQ
+  doAssert callbackCalls == 1
+  doAssert vifs[0].chanCtxt == nil and unlinks == 1,
+    "link loss notified before the old channel detached"
+  doAssert vifApConfig(addr vifs[0]).securityFlags == 0,
+    "link loss notified before the retiring VIF flags cleared"
+  doAssert vifApConfig(addr vifs[1]).securityFlags == 7
+sm_disconnect_process(addr vifs[0], 7, 7)
+while keMsgQueueSent.first.id != MM_STA_DEL_CFM: driveOne()
+let held = co_list_pop_front(addr keMsgQueueSent)
+doAssert smState == 10 and smCleanup.active and smCleanup.awaiting
+doAssert smCleanup.step == 2 and removed == @[2'u8] and unlinks == 1
+doAssert notifications.len == 1 and notifications[0].status == 7 and notifications[0].reason == 7
+doAssert not wifiMainHasPendingWork()
+smCleanupService()
+doAssert notifications.len == 1 and smState == 10
+co_list_push_back(addr keMsgQueueSent, held)
+drain()
+completed()
+doAssert notifications.len == 1
+''',
+    "disconnect_indication_replaces_session": r'''
+indicationHook = proc() =
+  doAssert smState == 10 and smCleanup.indication == nil
+  doAssert unlinks == 1
+  inc rxVifEpochs[0]
+  inc chanCtxtLinkEpochs[0]
+  vifs[0].chanCtxt = addr cleanupChannel
+  vifApConfig(addr vifs[0]).securityFlags = 9
+  smState = 0
+sm_disconnect_process(addr vifs[0], 7, 7)
+doAssert notifications.len == 1 and smCleanupNeedsService()
+smCleanupService()
+while keMsgQueueSent.first != nil: driveOne()
+doAssert not smCleanup.active and smState == 0 and unlinks == 1 and removed.len == 0
+doAssert vifs[0].chanCtxt == addr cleanupChannel
+doAssert vifApConfig(addr vifs[0]).securityFlags == 9
+doAssert allocated.len == 0 and smCleanupTags == nil
+''',
+    "channel_rebound_before_detach": r'''
+# Recycle the same channel pointer during the WPA callback; pointer
+# equality alone cannot distinguish the replacement binding.
+disconnectedHook = proc() =
+  doAssert vifs[0].chanCtxt == (addr cleanupChannel) and unlinks == 0
+  inc chanCtxtLinkEpochs[0]
+sm_disconnect_process(addr vifs[0], 7, 7)
+drain()
+doAssert notifications.len == 1 and removed == @[2'u8]
+doAssert vifs[0].chanCtxt == (addr cleanupChannel) and unlinks == 0,
+  "stale cleanup detached a replacement channel"
+doAssert allocated.len == 0 and smCleanupTags == nil
+''',
     "wrong_reply": r'''
 sm_delete_resources(addr vifs[0])
+doAssert smCleanup.replyReserved
+discard smCleanupConsumeReply(smCleanup.reply)
+doAssert smCleanup.step == 0 and smCleanup.awaiting
 while keMsgQueueSent.first.destId != TASK_SM: driveOne()
 let h = co_list_pop_front(addr keMsgQueueSent)
 let p = keMsgPayload(h)
@@ -288,11 +497,103 @@ doAssert smCleanup.step == 0 and smCleanup.awaiting
 h[] = original
 me_set_ps_disable_cfm_handler_sm(p)
 let nextStep = smCleanup.step
+driveOne()
+doAssert smCleanup.step == nextStep and smCleanup.awaiting and not smCleanup.replyReserved
 me_set_ps_disable_cfm_handler_sm(p)
 doAssert smCleanup.step == nextStep
 ke_msg_free(h)
 drain()
 completed()
+''',
+    "activation_saved_behind_disconnect_reply": r'''
+me.activeMask = 1
+sm_disconnect_process(addr vifs[0], 7, 7)
+while keMsgQueueSent.first.id != ME_SET_ACTIVE_REQ: driveOne()
+mmState = MM_IDLE
+driveOne()
+doAssert meState == MeBusyState and keMsgQueueSent.first.id == MM_SET_IDLE_REQ
+
+let next = newMessage(ME_SET_ACTIVE_REQ, TASK_ME, TASK_API, 2)
+cast[ptr array[2, uint8]](next)[] = [1'u8, 1]
+ke_msg_send(next)
+driveOne() # The fake MAC reports idle, appending MM_SET_IDLE_CFM.
+driveOne() # ME is still busy, so the competing activation is saved.
+doAssert keMsgQueueSaved.first == keMsgHdrFromPayload(next)
+doAssert keMsgQueueSent.first.id == MM_SET_IDLE_CFM
+driveOne()
+doAssert keMsgQueueSent.first.id == ME_SET_ACTIVE_CFM,
+  "saved ME work overtook the final disconnect confirmation"
+doAssert smState == SmDisconnectingState
+driveOne()
+doAssert smState == SmIdleState and not smCleanup.active
+doAssert keMsgQueueSent.first == keMsgHdrFromPayload(next)
+drain()
+doAssert me.activeMask == 2 and allocated.len == 0 and smCleanupTags == nil
+''',
+    "activation_waits_for_mac_idle_event": r'''
+me.activeMask = 1
+sm_disconnect_process(addr vifs[0], 7, 7)
+while keMsgQueueSent.first.id != ME_SET_ACTIVE_REQ: driveOne()
+mmState = 1
+fakeMacState = 1
+driveOne()
+let idleRequest = keMsgQueueSent.first
+doAssert idleRequest.id == MM_SET_IDLE_REQ
+driveOne()
+doAssert mmState == TaskGoingIdleState and idleRequests == 1
+doAssert keMsgQueueSaved.first == idleRequest and smCleanup.awaiting and smCleanup.step == 3
+
+let next = newMessage(ME_SET_ACTIVE_REQ, TASK_ME, TASK_API, 2)
+cast[ptr array[2, uint8]](next)[] = [1'u8, 1]
+ke_msg_send(next)
+driveOne()
+doAssert keMsgQueueSaved.last == keMsgHdrFromPayload(next)
+ke_msg_send(newMessage(MM_SET_IDLE_CFM, TASK_ME, TASK_MM, 0))
+driveOne()
+doAssert meState == MeBusyState and mmState == TaskGoingIdleState
+doAssert smState == SmDisconnectingState and smCleanup.awaiting
+doAssert keMsgQueueSent.first == nil and keMsgQueueSaved.first == idleRequest
+
+fakeMacState = 0
+idleEventBits = KE_EVT_IDLE
+mm_hw_idle_evt()
+doAssert idleEventBits == 0 and mmState == MM_IDLE
+doAssert keMsgQueueSent.first == idleRequest and keMsgQueueSaved.first == keMsgHdrFromPayload(next)
+driveOne()
+doAssert keMsgQueueSent.first.id == MM_SET_IDLE_CFM
+driveOne()
+doAssert keMsgQueueSent.first.id == ME_SET_ACTIVE_CFM
+doAssert smState == SmDisconnectingState
+driveOne()
+doAssert smState == SmIdleState and not smCleanup.active
+doAssert keMsgQueueSent.first == keMsgHdrFromPayload(next)
+drain()
+doAssert me.activeMask == 2 and allocated.len == 0 and smCleanupTags == nil
+doAssert keMsgQueueSent.first == nil and keMsgQueueSaved.first == nil
+''',
+    "external_me_reply_restarts_control": r'''
+ke_msg_free(keMsgHdrFromPayload(sm.connectInfo))
+sm.connectInfo = nil
+smState = SmIdleState
+me.activeMask = 1
+mmState = MM_IDLE
+let dropping = newMessage(ME_SET_ACTIVE_REQ, TASK_ME, TASK_API, 2)
+cast[ptr array[2, uint8]](dropping)[] = [0'u8, 0]
+ke_msg_send(dropping)
+driveOne()
+driveOne()
+var replacement: pointer
+indicationHook = proc() =
+  doAssert meState == MeBusyState and meControlReply == nil
+  meControlReset()
+  ke_state_set(TASK_ME, MeIdleState)
+  replacement = newMessage(ME_SET_ACTIVE_REQ, TASK_ME, TASK_API, 2)
+  cast[ptr array[2, uint8]](replacement)[] = [1'u8, 1]
+  doAssert me_set_active_req_handler(replacement) == KeMsgNoFree
+driveOne()
+doAssert meState == MeBusyState and meControlCommand == replacement
+drain()
+doAssert meState == MeIdleState and me.activeMask == 2 and allocated.len == 0
 ''',
     "queued_cancel": r'''
 sm_delete_resources(addr vifs[0])
@@ -304,6 +605,64 @@ doAssert me_set_ps_disable_req_handler(keMsgPayload(held)) == KeMsgConsumed
 ke_msg_free(held)
 doAssert me.psDisableMask == 3 and me.activeMask == 3
 doAssert allocated.len == 0 and smCleanupTags == nil
+''',
+    "retired_vif_releases_saved_connect": r'''
+psDeferred = true
+sm_disconnect_process(addr vifs[0], 7, 7)
+driveOne()
+driveOne()
+doAssert smCleanup.awaiting and smState == SmDisconnectingState
+doAssert mmPsModeRequest != nil and meState == MeBusyState
+let reconnect = newMessage(0x1000, TASK_SM, TASK_API, 32)
+co_list_push_back(addr keMsgQueueSaved, keMsgHdrFromPayload(reconnect))
+# The quiesced invalidation is the epoch boundary used by VIF unregister.
+rxInvalidateQuiescentVif(0, 0)
+vifs[0].vifType = 4
+doAssert smCleanupNeedsService()
+smCleanupService()
+doAssert smState == SmIdleState and not smCleanup.active and interruptsEnabled
+doAssert mmPsModeRequest == nil and meState == MeIdleState
+doAssert keMsgQueueSaved.first == nil and keMsgQueueSent.first == keMsgHdrFromPayload(reconnect)
+doAssert notifications.len == 1 and callbackCalls == 1
+ke_msg_free(co_list_pop_front(addr keMsgQueueSent))
+doAssert allocated.len == 0 and smCleanupTags == nil
+''',
+    "retired_request_address_reused": r'''
+# The ME no-transition branch queues a separate reply and consumes the request.
+me.psOn = 0
+sm_delete_resources(addr vifs[0])
+let retiredRequest = smCleanup.request
+recycleOnFree = keMsgHdrFromPayload(retiredRequest)
+driveOne()
+doAssert keMsgQueueSent.first.id == ME_SET_PS_DISABLE_CFM
+doAssert smCleanup.awaiting and not smCleanup.replyReserved
+
+let replacement = newMessage(ME_SET_ACTIVE_REQ, TASK_ME, TASK_API, 2)
+doAssert replacement == retiredRequest and recycledHeader == nil
+cast[ptr array[2, uint8]](replacement)[] = [0'u8, 0]
+ke_msg_send(replacement)
+inc rxVifEpochs[0]
+smCleanupService()
+doAssert not smCleanup.active and smState == SmIdleState
+doAssert keMsgQueueSent.first == keMsgHdrFromPayload(replacement),
+  "cleanup cancelled a different request at the released address"
+doAssert allocated == @[replacement] and smCleanupTags == nil
+while keMsgQueueSent.first != nil: driveOne()
+doAssert allocated.len == 0 and meState == MeIdleState and me.activeMask == 2
+''',
+    "retired_vif_does_not_release_replacement": r'''
+sm_delete_resources(addr vifs[0])
+rxInvalidateQuiescentVif(0, 0)
+var replacementSerial: uint32
+freeHook = proc() =
+  doAssert smCleanupBegin(addr vifs[0])
+  replacementSerial = smCleanup.serial
+smCleanupService()
+doAssert replacementSerial != 0 and smCleanup.active and smCleanup.serial == replacementSerial
+doAssert smState == SmDisconnectingState and interruptsEnabled
+callbackCalls = 0
+drain()
+doAssert callbackCalls == 1 and allocated.len == 0 and smCleanupTags == nil
 ''',
     "late_reply": r'''
 sm_delete_resources(addr vifs[0])
@@ -395,6 +754,9 @@ doAssert unlinks == 1 and me.activeMask == 2 and allocated.len == 0
     "connect_failure": r'''
 let indication = newMessage(0x1002, TASK_API, TASK_SM, 860)
 sm.connectIndMsg = indication
+indicationHook = proc() =
+  doAssert rxHostStationIndicationTop != nil
+  doAssert rxHostStationIndicationTop.payload == indication
 doAssert smCleanupBegin(addr vifs[0], indication)
 doAssert sm.connectInfo == nil and sm.connectIndMsg == nil and smState == 10
 drain()
@@ -438,6 +800,36 @@ doAssert allocated.len == 2 and callbackCalls == 0 and smState == 4
 ke_msg_free(keMsgHdrFromPayload(replacementConnection))
 ke_msg_free(keMsgHdrFromPayload(replacementIndication))
 ''',
+    "connect_indication_channel_cache": r'''
+for linked in [true, false]:
+  if not linked:
+    setup()
+    vifs[0].chanCtxt = nil
+  sm.primaryFreq = 2412
+  sm.centerFreq = 2412
+  cleanupChannel.channel.primFreq = 2452
+  cleanupChannel.channel.centerFreq1 = 2462
+  sm.connectIndMsg = newMessage(SM_CONNECT_IND_MSG, TASK_API, TASK_SM, 860)
+  let sent = smConnectIndPayloadAt(sm.connectIndMsg)
+  sent.assocReqIeLen = 12
+  sent.assocRspIeLen = 8
+  for i in 0..<sent.assocIeBuffer.len: sent.assocIeBuffer[i] = (i mod 251).uint8
+  let ies = sent.assocIeBuffer
+  var notified = false
+  indicationHook = proc() =
+    doAssert sm.connectInfo == nil and sm.connectIndMsg == nil
+    doAssert sent.assocReqIeLen == 12 and sent.assocRspIeLen == 8
+    doAssert sent.assocIeBuffer == ies
+    if linked:
+      doAssert (sm.primaryFreq, sm.centerFreq) == (2452'u16, 2462'u16)
+      doAssert sent.chanPrimFreq == 2452 and sent.chanCenterFreq1 == 2462
+    else:
+      doAssert (sm.primaryFreq, sm.centerFreq) == (2412'u16, 2412'u16)
+      doAssert sent.chanPrimFreq == 0 and sent.chanCenterFreq1 == 0
+    notified = true
+  sm_connect_ind(0, 0)
+  doAssert notified and allocated.len == 0
+''',
     "success_free_replacement": r'''
 sm.connectIndMsg = newMessage(SM_CONNECT_IND_MSG, TASK_API, TASK_SM, 860)
 var replacementConnection, replacementIndication: pointer
@@ -474,14 +866,39 @@ doAssert sm.scanResultIndex == 42 and smState == 4 and not smCleanup.active
 ke_msg_free(keMsgHdrFromPayload(replacementConnection))
 ke_msg_free(keMsgHdrFromPayload(replacementIndication))
 ''',
+    "failure_state_replacement": r'''
+smState = SmSettingBssState
+sm.connectIndMsg = newMessage(SM_CONNECT_IND_MSG, TASK_API, TASK_SM, 860)
+var replacementConnection, replacementIndication: pointer
+smStateHook = proc() =
+  doAssert smState == SmDisconnectingState
+  smStateHook = nil
+  ke_msg_free(keMsgHdrFromPayload(sm.connectInfo))
+  ke_msg_free(keMsgHdrFromPayload(sm.connectIndMsg))
+  replacementConnection = newMessage(0x1000, TASK_SM, TASK_API, 32)
+  replacementIndication = newMessage(SM_CONNECT_IND_MSG, TASK_API, TASK_SM, 860)
+  sm.connectInfo = replacementConnection
+  sm.connectIndMsg = replacementIndication
+  sm.scanResultIndex = 42
+  inc rxVifEpochs[0]
+  smState = SmSettingBssState
+sm_connect_ind(8, 15)
+doAssert sm.connectInfo == replacementConnection and sm.connectIndMsg == replacementIndication
+doAssert sm.scanResultIndex == 42 and smState == SmSettingBssState and not smCleanup.active
+doAssert allocated.len == 2 and callbackCalls == 0
+ke_msg_free(keMsgHdrFromPayload(replacementConnection))
+ke_msg_free(keMsgHdrFromPayload(replacementIndication))
+''',
     "reply_callback_replacement": r'''
+sm.connectIndMsg = newMessage(SM_CONNECT_IND_MSG, TASK_API, TASK_SM, 860)
 indicationHook = proc() =
   doAssert smState == 0 and not smCleanup.active
   sm.connectInfo = newMessage(0x1000, TASK_SM, TASK_API, 32)
   doAssert smCleanupBegin(addr vifs[0])
-sm_disconnect_process(addr vifs[0], 19, 3)
+sm_connect_ind(8, 15)
 drain()
-doAssert callbackCalls == 2 and notifications.len == 1 and allocated.len == 0
+doAssert callbackCalls == 2 and notifications.len == 0 and allocated.len == 0
+doAssert controlReplies.len == 1 and controlReplies[0].id == SM_CONNECT_IND_MSG
 ''',
     "callback_irq": r'''
 disconnectedHook = proc() = doAssert interruptsEnabled
@@ -519,6 +936,28 @@ sm_delete_resources(addr vifs[0])
 drain()
 completed(2)
 ''',
+    "replacement_during_later_allocation": r'''
+sm_disconnect_process(addr vifs[0], 19, 3)
+while keMsgQueueSent.first.destId != TASK_SM: driveOne()
+let first = smCleanup.serial
+allocationHook = proc() =
+  doAssert smCleanup.step == 1 and not smCleanup.awaiting
+  smCleanupCancel()
+  inc rxVifEpochs[0]
+  smState = 0
+  sm.connectInfo = newMessage(0x1000, TASK_SM, TASK_API, 32)
+  doAssert smCleanupBegin(addr vifs[0])
+driveOne()
+doAssert smCleanup.active and smCleanup.serial != first and smCleanup.step == 0
+doAssert smCleanup.request == nil and smCleanup.reply == nil and smCleanupTags == nil
+doAssert notifications.len == 1 and callbackCalls == 1
+doAssert commands == @[ME_SET_PS_DISABLE_REQ]
+commands.setLen(0)
+callbackCalls = 0
+drain()
+completed(2)
+doAssert notifications.len == 1
+''',
     "preserve_disabled_irq": r'''
 interruptsEnabled = false
 disconnectedHook = proc() = doAssert not interruptsEnabled
@@ -533,7 +972,7 @@ completed()
 ''',
 }
 
-for allocation in range(1, 9):
+for allocation in range(1, 4):
     CASES[f"allocation_{allocation}"] = f'''
 failAt = kernelAllocations + {allocation}
 sm_disconnect_process(addr vifs[0], 19, 3)
@@ -546,9 +985,32 @@ completed()
 doAssert notifications.len == 1
 '''
 
+for allocation, step in [(4, 1), (5, 1), (6, 2), (7, 3), (8, 3)]:
+    CASES[f"allocation_{allocation}"] = f'''
+failAt = kernelAllocations + {allocation}
+sm_disconnect_process(addr vifs[0], 19, 3)
+let order = @[ME_SET_PS_DISABLE_REQ, MM_SET_VIF_STATE_REQ,
+              MM_STA_DEL_REQ, ME_SET_ACTIVE_REQ]
+for attempt in 0 ..< 20:
+  if kernelAllocations >= failAt: break
+  doAssert keMsgQueueSent.first != nil
+  driveOne()
+doAssert kernelAllocations == failAt and smCleanup.active
+doAssert smState == 10 and smCleanup.step == {step} and not smCleanup.awaiting
+doAssert commands == order[0 ..< {step}] and unlinks == 1
+doAssert allocated.len == 0 and smCleanupTags == nil
+doAssert notifications.len == 1 and callbackCalls == 1
+failAt = 0
+drain()
+completed()
+doAssert notifications.len == 1
+'''
+
 
 def program(case: str, mutation: str | None = None) -> str:
     code = program_source()
+    code = code.replace("proc txlResetting(): bool = false",
+                        "proc txlResetting(): bool = txResetInProgress")
     code = code.replace(procedure(code, "chan_ctxt_unlink"), "")
     code = code.replace("    contextIndexOrMarker, invalidMarker: uint8",
                         "    contextIndexOrMarker, invalidMarker: uint8\n    channel: ChanCtxtDefView")
@@ -564,21 +1026,39 @@ def program(case: str, mutation: str | None = None) -> str:
     code = code.replace("    beaconRegister, apStopped: pointer",
                         "    beaconRegister, apStopped, stationDisconnected: pointer")
     code = code.replace("  if kernelAllocations == failAt: return nil",
-                        "  if failEveryAllocation or kernelAllocations == failAt: return nil")
+                        "  if failEveryAllocation or kernelAllocations == failAt or "
+                        "allocated.len >= allocationLimit: return nil")
     code = code.replace("proc ke_msg_free(h: pointer) =\n",
                         "proc ke_msg_free(h: pointer) =\n  smCleanupForget(h)\n")
-    code = code.replace("  free(h)\n", "  free(h)\n  if freeHook != nil:\n    let action = freeHook\n    freeHook = nil\n    action()\n")
+    code = code.replace("  let h = cast[ptr Header](calloc(1, (sizeof(Header) + n.int).csize_t))",
+                        "  let reused = recycledHeader\n  recycledHeader = nil\n"
+                        "  let h = if reused != nil: cast[ptr Header](reused)\n"
+                        "          else: cast[ptr Header](calloc(1, (sizeof(Header) + n.int).csize_t))")
+    code = code.replace("  free(h)\n", "  if h == recycleOnFree:\n"
+                        "    recycleOnFree = nil\n    recycledHeader = h\n"
+                        "  else: free(h)\n"
+                        "  if freeHook != nil:\n    let action = freeHook\n    freeHook = nil\n    action()\n")
     code = code.replace("  if task == TASK_APM: state = value",
-                        "  if task == TASK_SM: smState = value\n  elif task == TASK_APM: state = value")
+                        "  if task == TASK_SM:\n    smState = value\n"
+                        "    if smStateHook != nil: smStateHook()\n"
+                        "  elif task == TASK_APM: state = value")
     code = code.replace("  if task == TASK_APM: state elif task == TASK_MM: mmState else: meState",
                         "  if task == TASK_SM: smState elif task == TASK_APM: state elif task == TASK_MM: mmState else: meState")
+    code = code.replace("  if address == MACHW_STATE_CNTRL_REG: 0 else: 0x1234",
+                        "  if address == MACHW_STATE_CNTRL_REG: fakeMacState else: 0x1234")
     code = code.replace("proc irqSave(): uint32 = 8", "proc irqSave(): uint32 =\n  result = if interruptsEnabled: 8'u32 else: 0'u32\n  interruptsEnabled = false")
     code = code.replace("proc irqRestore(saved: uint32) = doAssert saved == 8",
-                        "proc irqRestore(saved: uint32) = interruptsEnabled = (saved and 8) != 0")
+                        "proc irqRestore(saved: uint32) =\n  interruptsEnabled = (saved and 8) != 0\n"
+                        "  if interruptsEnabled and onIrqRestore != nil:\n"
+                        "    let action = onIrqRestore\n    onIrqRestore = nil\n    action()")
     code = code.replace("  if h.destId >= TASK_API:\n", "  if h.destId >= TASK_API:\n    captureNotification(p)\n")
     code = code.replace("doAssert task == TASK_APM", "doAssert task in [TASK_APM, TASK_SM]")
+    code = code.replace("  timerClears.add(id)\n",
+                        "  timerClears.add(id)\n  if timerClearHook != nil: timerClearHook()\n")
     layout = (FW / "layout_types.nim").read_text()
     payload = "type\n  SmConnectIndPayload" + layout.split("  SmConnectIndPayload", 1)[1].split("\n\n  ", 1)[0] + "\n"
+    for name in ("MmVifIdentity", "SmDisconnectHandoff"):
+        payload += "  " + name + layout.split("  " + name, 1)[1].split("\n\n  ", 1)[0] + "\n"
     code = PREFIX + "proc captureNotification(p: pointer)\n" + code + payload + PLATFORM
     code += """
 proc captureNotification(p: pointer) =
@@ -591,7 +1071,17 @@ proc captureNotification(p: pointer) =
 """
     code += procedure((FW / "kernel_mac_channel.nim").read_text(), "co_list_init")
     code += procedure((FW / "kernel_mac_channel.nim").read_text(), "ke_msg_forward_and_change_id")
+    delivery = (FW / "rx_host_delivery.nim").read_text()
+    code += """
+template rxHostIrqSave(): uint32 = irqSave()
+template rxHostIrqRestore(saved: uint32) = irqRestore(saved)
+"""
+    code += delivery[delivery.index("type RxHostStationIndication = object"):]
+    for name in ("mmCaptureVif", "mmVifCurrent"):
+        code += procedure((FW / "kernel_mac_channel.nim").read_text(), name)
     cleanup = (FW / "station_cleanup.nim").read_text()
+    station = (FW / "scan_station_ap_me.nim").read_text()
+    code += procedure(station, "smDisconnectHandoffCurrent")
     if mutation:
         before, after = {
             "power_save": ("needed: [true, vif.state != 0,", "needed: [false, vif.state != 0,"),
@@ -599,6 +1089,7 @@ proc captureNotification(p: pointer) =
             "busy": ("    smCleanup.awaiting = true\n", "    smCleanup.awaiting = true\n    ke_state_set(TASK_SM, SmIdleState)\n"),
             "request_owner": ("if not tag.command or not smCleanupCurrent(tag.serial): return false", "if not tag.command: return false"),
             "reply_owner": ("      reply != smCleanup.reply or header.id != tag.responseId or\n", "      header.id != tag.responseId or\n"),
+            "reply_reservation": ("not smCleanup.awaiting or smCleanup.replyReserved or", "not smCleanup.awaiting or"),
             "reply_source": ("header.srcId != tag.responseSource or ", ""),
         }[mutation]
         assert before in cleanup, mutation
@@ -608,11 +1099,26 @@ proc captureNotification(p: pointer) =
     for name in ["smSetActiveCfmStateAllowed", "me_set_active_cfm_handler_sm",
                  "me_set_ps_disable_cfm_handler_sm", "mm_sta_del_req_handler", "sm_delete_resources"]:
         code += procedure(tasks, name)
-    code += procedure((FW / "scan_station_ap_me.nim").read_text(), "sm_disconnect_process")
-    code += procedure((FW / "scan_station_ap_me.nim").read_text(), "sm_connect_ind")
+    for name in ("smDisconnectOwned", "sm_disconnect_process", "smConnectIndLocked", "sm_connect_ind"):
+        code += procedure(station, name)
+    if case == "established_supplicant_failure":
+        code += "\nconst WLAN_FW_4WAY_HANDSHAKE_ERROR_PSK_TIMEOUT_FAILURE = 8\n"
+        code += procedure(station, "smRetireEstablishedSupplicantLink")
     runtime = (FW / "task_init_main.nim").read_text()
     code += procedure(runtime, "wifiMainHasPendingWork")
     code += procedure(runtime, "wifiDrainScheduledWork")
+    if case == "activation_waits_for_mac_idle_event":
+        code += r'''
+const KE_EVT_IDLE = 0x04000000'u32
+const MM_GOING_TO_IDLE = TaskGoingIdleState
+type IdlePhase = enum mmConfigNoIdle, mmConfigAwaitIdle, mmConfigIdleReady
+var mmConfigIdle: tuple[phase: IdlePhase]
+var idleEventBits: uint32
+proc ke_evt_field_get(): uint32 = idleEventBits
+proc ke_evt_clear(bits: uint32) = idleEventBits = idleEventBits and not bits
+proc mmConfigResumeAbandonedIdle() = discard
+'''
+        code += procedure((FW / "kernel_mac_channel.nim").read_text(), "mm_hw_idle_evt")
     return code + DRIVER + CASES[case]
 
 
@@ -643,6 +1149,7 @@ def test_station_cleanup(tmp_path: Path, case: str, mode: str) -> None:
 @pytest.mark.parametrize("mutation,case", [
     ("power_save", "disconnect"), ("callback", "disconnect"), ("busy", "disconnect"),
     ("request_owner", "queued_cancel"), ("reply_owner", "wrong_reply"), ("reply_source", "wrong_reply"),
+    ("reply_reservation", "wrong_reply"),
 ])
 def test_cleanup_guards(tmp_path: Path, mutation: str, case: str) -> None:
     run_native(tmp_path, program(case, mutation), "checked", True)

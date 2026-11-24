@@ -25,7 +25,7 @@
 ##   [rbp-40]    = saved rbx (if used)
 ##   Spill slots: at [rbp + spillSlotBias + slot.offset]  (spillSlotBias = -frameSize)
 
-import ir, regalloc, codegen_x64, memory, compiler, aotcache
+import ir, regalloc, codegen_x64, memory, compiler, relocation
 
 # ---------------------------------------------------------------------------
 # Register constants

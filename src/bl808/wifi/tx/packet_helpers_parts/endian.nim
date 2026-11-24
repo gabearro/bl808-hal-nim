@@ -15,8 +15,3 @@ proc loadBe32(packetBytes: ptr UncheckedArray[uint8]; byteOffset: uint): uint32 
     (packetBytes[byteOffset + 1'u].uint32 shl 16) or
     (packetBytes[byteOffset + 2'u].uint32 shl 8) or
     packetBytes[byteOffset + 3'u].uint32
-
-proc storeBe16(packetBytes: ptr UncheckedArray[uint8]; byteOffset: uint;
-               value: uint16) {.inline.} =
-  packetBytes[byteOffset] = (value shr 8).uint8
-  packetBytes[byteOffset + 1'u] = value.uint8

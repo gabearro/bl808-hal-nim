@@ -30,19 +30,21 @@ type
     idleFlag: uint8
 var
   mm: Mm
+  mmConfigIdle: tuple[epoch: uint32]
   state: uint16
   hardwareState, power: uint32
   stateChanges: seq[uint16]
   writes: seq[tuple[address: uint, value: uint32]]
   assertions: seq[cint]
   completions, idleRequests: int
-  interrupts: bool
+  interrupts, incomingIrq: bool
   assertionHook: proc()
 proc irqSave(): uint32 =
   result = interrupts.uint32 * 8
   interrupts = false
 proc irqRestore(saved: uint32) = interrupts = (saved and 8) != 0
 proc mmEnvView(): ptr Mm = addr mm
+proc mmConfigCancelIdle() = discard
 proc ke_state_get(task: uint8): uint16 = state
 proc ke_state_set(task: uint8; value: uint16) =
   doAssert task == TASK_MM
@@ -54,16 +56,25 @@ proc regWrite(address: uint; value: uint32) =
   writes.add((address, value))
   if address == MACHW_BASE + 0x4C: power = value
 proc assert_err(condition, file: cstring; line: cint) =
+  if line == 1013:
+    doAssert $condition == "blmac_current_state_getf() == HW_IDLE"
+    doAssert $file == "module"
   assertions.add(line)
   if assertionHook != nil: assertionHook()
 proc keMsgHdrFromPayload(p: pointer): ptr Header =
   cast[ptr Header](cast[uint](p) - sizeof(Header).uint)
 proc chanSwitchAdmit(p: pointer): bool = true
+proc chanSwitchTrackIdle(p: pointer; state: uint16): uint32 = mmConfigIdle.epoch
 proc chanSwitchInvoke(p: pointer): bool = false
-proc hal_machw_idle_req() = inc idleRequests
-proc completed() {.cdecl.} = inc completions
+proc hal_machw_idle_req() =
+  doAssert not interrupts
+  inc idleRequests
+proc completed() {.cdecl.} =
+  doAssert interrupts == incomingIrq
+  inc completions
 proc setup(irq = true) =
   mm = default(Mm)
+  mmConfigIdle.epoch = 0
   state = HW_ACTIVE
   hardwareState = 0
   power = 0xABCD1234'u32
@@ -73,6 +84,7 @@ proc setup(irq = true) =
   completions = 0
   idleRequests = 0
   interrupts = irq
+  incomingIrq = irq
   assertionHook = nil
 proc mm_force_idle_req_handler*(param: pointer): cint {.exportc, cdecl.}
 proc request(): cint =

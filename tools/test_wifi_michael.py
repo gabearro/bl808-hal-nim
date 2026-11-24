@@ -15,6 +15,9 @@ import textwrap
 
 import pytest
 
+from test_wifi_disconnect_tx import procedure
+from test_wifi_message_allocation import run_program
+
 
 ROOT = Path(__file__).resolve().parents[1]
 VECTORS = [
@@ -25,6 +28,33 @@ VECTORS = [
     ("90038fc6cf13c1db", b"Mich", "d55e100510128986"),
     ("d55e100510128986", b"Michael", "0a942b124ecaa546"),
 ]
+
+
+@pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
+def test_me_mic_end_stops_after_invalid_pending_count(tmp_path: Path, mode: str) -> None:
+    firmware = (ROOT / "src/bl808/wifi/fw/scan_station_ap_me.nim").read_text()
+    end = procedure(firmware, "me_mic_end")
+    run_program(tmp_path, mode, r'''
+type MichaelMicContextView = object
+  left, right, pending: uint32
+  nBytes: uint8
+  padding: array[3, uint8]
+var assertions, blocks: int
+proc michaelMicContextAt(p: pointer): ptr MichaelMicContextView =
+  cast[ptr MichaelMicContextView](p)
+proc assert_err(condition, file: cstring; line: cint) =
+  doAssert line == 323
+  inc assertions
+proc michael_block(ctx: pointer; word: uint32) = inc blocks
+''' + end + r'''
+var ctx = MichaelMicContextView(nBytes: 4, pending: 0x12345678'u32)
+me_mic_end(addr ctx)
+doAssert assertions == 1 and blocks == 0
+doAssert ctx.pending == 0x12345678'u32
+ctx.nBytes = 3
+me_mic_end(addr ctx)
+doAssert assertions == 1 and blocks == 2
+''')
 
 
 def michael(key: bytes, message: bytes) -> bytes:

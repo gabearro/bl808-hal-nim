@@ -9,6 +9,7 @@ import pytest
 from test_wifi_disconnect_tx import ROOT, procedure
 
 FACADE = ROOT / "src/bl808/wifi/facade_parts"
+RX = ROOT / "src/bl808/wifi/rx"
 PLATFORM = r'''
 type
   WifiError = enum wifiOk, wifiFail
@@ -16,6 +17,10 @@ type
   Timer = object
     callback: proc()
     cancelled: bool
+  ScanConfirmation = object
+    length: uint32
+    status: uint8
+const IpcMsgParamLenOff = 0'u
 var
   timers: seq[Timer]
   wifiScanFuture: CpsFuture[uint32]
@@ -26,6 +31,9 @@ var
   scanDone, connectDone, connected, idle, disconnected: bool
   eventFutures = true
   scanCount = 7'u32
+  scanConfirmationStatus: uint32
+  staIface: pointer
+  scanSubmitStatus: cint
   issueStatus: cint
   issued: int
 proc addTimerMs(ms: uint64; callback: proc()): TimerId =
@@ -40,7 +48,24 @@ proc fire(id: TimerId) =
     timers[id.int - 1].callback()
 proc wifiBackendUsesEventFutures(): bool = eventFutures
 proc wifiBackendScanDone(): bool = scanDone
-proc wifiBackendScanCount(): uint32 = scanCount
+proc bl808_wifi_backend_scan_count(): uint32 = scanCount
+proc bl808_wifi_backend_scan_confirmation(): uint32 = scanConfirmationStatus
+proc bl808_wifi_backend_record_scan_confirmation(status: uint32) =
+  scanConfirmationStatus = status
+proc loadU32(p: pointer; offset: uint): uint32 =
+  doAssert p != nil and offset == IpcMsgParamLenOff
+  cast[ptr ScanConfirmation](p).length
+proc msgParam(p: pointer): pointer =
+  doAssert cast[ptr ScanConfirmation](p).length == 1
+  addr cast[ptr ScanConfirmation](p).status
+proc loadU8(p: pointer; offset: uint): uint8 =
+  doAssert offset == 0
+  cast[ptr uint8](p)[]
+proc wifi_mgmr_scan(data: pointer; callback: pointer): cint =
+  doAssert data == (addr staIface) and callback == nil
+  scanDone = false
+  scanConfirmationStatus = 0
+  scanSubmitStatus
 proc wifiBackendConnectDone(): bool = connectDone
 proc wifiBackendConnected(): bool = connected
 proc wifiNimFirmwareStaIdle(): bool = idle
@@ -49,17 +74,29 @@ proc wifiNimFirmwareIssueDisconnect(): cint =
   inc issued
   issueStatus
 proc wifiCompletePendingEvents()
+proc notifyEventScanDone(joinScan: bool) =
+  if not joinScan:
+    scanDone = true
+    wifiCompletePendingEvents()
 '''
 
 
 def source() -> str:
     code = f'import "{ROOT / "src/bl808/kernel/runtime"}"\n' + PLATFORM
+    state = (FACADE / "runtime_wrappers_parts/state.nim").read_text()
+    code += "when defined(bl808WifiDiagLinkDrop):\n" + state.split(
+        "when defined(bl808WifiDiagLinkDrop):\n", 1
+    )[1]
+    code += procedure((FACADE / "runtime_wrappers_parts/backend_status.nim").read_text(),
+                      "wifiBackendScanCount")
+    code += procedure((RX / "control_events.nim").read_text(), "blRxScanuStartCfm")
     code += (FACADE / "service_futures_parts/completions.nim").read_text()
     code += (FACADE / "service_futures_parts/waits.nim").read_text()
     disconnect = (FACADE / "station_api_parts/disconnect.nim").read_text()
     for name in ["wifiWaitStaIdleAsync", "wifiIssueDisconnectAsync"]:
         code += procedure(disconnect, name)
     code += (FACADE / "service_futures_parts/pending_events.nim").read_text()
+    code += (FACADE / "station_api_parts/scan.nim").read_text()
     return code + r'''
 proc setup() =
   wifiScanFuture = nil
@@ -74,6 +111,10 @@ proc setup() =
   wifiDisconnectIssueTimeoutMs = 0
   timers.setLen(0)
   scanDone = false
+  scanCount = 7
+  scanSubmitStatus = 0
+  scanConfirmationStatus = 0
+  staIface = cast[pointer](1)
   connectDone = false
   connected = false
   idle = false
@@ -85,6 +126,62 @@ proc setup() =
 
 
 CASES = {
+    "scan_rejected_before_wait": r'''
+for failure in [-12.cint, -16.cint, -22.cint, -110.cint]:
+  setup()
+  scanSubmitStatus = failure
+  let scan = wifiScanAsync(30_000)
+  doAssert scan.finished and scan.read() == 0
+  doAssert timers.len == 0 and wifiScanFuture == nil
+''',
+    "scan_confirmation_owns_count": r'''
+for scenario in 0..4:
+  setup()
+  # A canceled or rejected scan can have posted partial results already.
+  var reply = ScanConfirmation(length: 1, status: 0)
+  if scenario == 1: scanCount = 0
+  if scenario == 2: reply.status = 8
+  if scenario == 3: reply.length = 0
+  let scan = wifiScanAsync(30_000)
+  doAssert not scan.finished
+  let timer = wifiScanTimer
+  discard blRxScanuStartCfm(nil, nil, if scenario == 4: nil else: addr reply)
+  doAssert scan.finished and scan.read() == (if scenario == 0: 7'u32 else: 0'u32)
+  doAssert timers[timer.int - 1].cancelled and wifiScanFuture == nil
+''',
+    "scan_observation": r'''
+setup()
+staIface = nil
+doAssert wifiScanAsync(100).read() == 0
+doAssert wifiLastScanObservation() == (wifiScanUnavailable, 0'u32)
+setup()
+scanSubmitStatus = -16
+doAssert wifiScanAsync(100).read() == 0
+doAssert wifiLastScanObservation() == (wifiScanSubmitRejected, cast[uint32](-16'i32))
+setup()
+for phase in 0..3:
+  var replacement: CpsFuture[uint32]
+  var reply = ScanConfirmation(length: 1, status: 0)
+  scanCount = 0
+  if phase == 1: reply.status = 8
+  if phase == 2: reply.length = 0
+  let expected = if phase == 3: (wifiScanTimedOut, 0'u32)
+                 else: (wifiScanConfirmed, if phase == 2: high(uint32) else: reply.status.uint32)
+  let scan = wifiScanAsync(100)
+  let timer = wifiScanTimer
+  doAssert wifiLastScanObservation() == (wifiScanPending, 0'u32)
+  scan.addCallback(proc() =
+    doAssert wifiLastScanObservation() == expected
+    replacement = wifiScanAsync(100))
+  if phase == 3: fire(timer)
+  else: discard blRxScanuStartCfm(nil, nil, addr reply)
+  doAssert scan.finished and scan.read() == 0
+  doAssert replacement != nil and not replacement.finished
+  doAssert wifiLastScanObservation() == (wifiScanPending, 0'u32)
+  fire(timer)
+  doAssert not replacement.finished
+  setup()
+''',
     "immediate_completion": r'''
 for timeout in [0'u32, 100]:
   setup()
@@ -266,6 +363,7 @@ def test_event_futures(tmp_path: Path, mode: str, case: str) -> None:
     result = subprocess.run(
         [nim, "c", "-r", "--mm:arc", "--skipParentCfg:on", "--skipProjCfg:on",
          "--skipUserCfg:on", f"--nimcache:{tmp_path / 'cache'}",
-         f"-o:{tmp_path / 'test'}", *flags[mode], str(path)],
+         f"-o:{tmp_path / 'test'}", *flags[mode],
+         *(["-d:bl808WifiDiagLinkDrop"] if case == "scan_observation" else []), str(path)],
         cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90)
     assert result.returncode == 0, result.stdout

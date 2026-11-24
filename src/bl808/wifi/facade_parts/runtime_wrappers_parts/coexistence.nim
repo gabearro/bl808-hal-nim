@@ -1,5 +1,5 @@
 proc wifiNimFirmwareSetBleCoexMode(mode: uint32) {.inline.} =
-  coex_pta_force_autocontrol_set(mode)
+  discard coex_pta_force_autocontrol_set(mode)
   rwip_wlcoex_set(mode != wifiBleCoexWifiAlwaysOn)
   wifi_nimfw_set_sta_tx_channel_prepare_enabled(
     if mode == wifiBleCoexWifiPriority: 1'u32 else: 0'u32)

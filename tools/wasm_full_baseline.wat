@@ -1,0 +1,10 @@
+(module
+  (type $binary (func (param i32 i32) (result i32)))
+  (func $add (type $binary) local.get 0 local.get 1 i32.add)
+  (func (export "f64bits") (result i64)
+    f64.const 1.5 f64.const 2.25 f64.add i64.reinterpret_f64)
+  (table 1 funcref)
+  (elem (i32.const 0) $add)
+  (func (export "indirect") (type $binary)
+    local.get 0 local.get 1 i32.const 0 call_indirect (type $binary))
+  (export "add" (func $add)))

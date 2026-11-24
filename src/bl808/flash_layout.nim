@@ -15,7 +15,7 @@ const
   WasmRepositoryFlashOffset* = Ox64WasmStoreOffset.uint32
   WasmRepositoryFlashLen* = Ox64WasmStoreSize.uint32
   WasmRepositoryFlashEnd* = (Ox64WasmStoreOffset + Ox64WasmStoreSize).uint32
-  LpRuntimeFlashOffset* = 0x0C_0000'u32
+  LpRuntimeFlashOffset* {.intdefine.} = 0x0C_0000'u32
   LpRuntimeFlashLen* = (Ox64D0BootOffset - LpRuntimeFlashOffset.uint).uint32
 
   McuXipAliasBase* = FlashXipBase
@@ -23,8 +23,15 @@ const
   D0FlashRemapAliasBase* = FlashRemapBase
   LpXipAliasBase* = FlashXipBase
 
+static:
+  doAssert LpRuntimeFlashOffset >= Ox64LPBootOffset.uint32
+  doAssert LpRuntimeFlashOffset < Ox64D0BootOffset.uint32
+  doAssert LpRuntimeFlashOffset mod 0x10000 == 0
+
 proc flashXipBaseForCore*(): uint {.inline.} =
-  when defined(bl808d0):
+  when defined(bl808d0) and defined(bl808D0Xip):
+    D0FlashRemapAliasBase
+  elif defined(bl808d0):
     D0XipAliasBase
   elif defined(bl808lp):
     LpXipAliasBase
@@ -47,8 +54,8 @@ proc lpRuntimeFlashSpan*(): FlashXipSpan {.inline.} =
 
 proc lpRuntimeMappedFlashSpan*(): FlashXipSpan {.inline.} =
   ## Logical LP boot span as seen by SF/XIP policy before the boot2 image-offset
-  ## remap is applied. The Ox64 LP image is stored at 0x0C0000, but executes at
-  ## XIP 0x58080000 via a 0x40000 image offset.
+  ## remap is applied. The LP image executes at XIP 0x58080000 independently
+  ## of the profile's sector-aligned physical storage offset.
   FlashXipSpan(
     base: Ox64LPBootOffset.uint32,
     len: (Ox64D0BootOffset - Ox64LPBootOffset).uint32,

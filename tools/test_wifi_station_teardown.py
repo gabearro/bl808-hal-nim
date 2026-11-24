@@ -19,8 +19,12 @@ const
   STA_MGMT_FREE_STAS = 5
   MmPsChangeIndPayloadSize = 2
 type
+  CoListHdr = object
+    next: ptr CoListHdr
+  CoList = object
+    first, last: ptr CoListHdr
   Sta = object
-    instNbr, psMode: uint8
+    instNbr, psMode, valid: uint8
   Security = object
     connected, cipher: uint8
     staKeySlots: array[4, uint8]
@@ -32,9 +36,20 @@ type
   StaQueueIdentity = object
     entry: pointer
     vif: uint8
+    stationEpoch, vifEpoch: uint32
+  MmStaDeletion = object
+    owner: StaQueueIdentity
+    requestEpoch: uint32
+    keys: array[4, uint8]
+    keyPending: array[4, bool]
+    active, running, staMode, apEffectsDone, addressDeleted, requestOwned: bool
 var
   stations: array[7, Sta]
   vifs: array[2, Vif]
+  sta_info_env: CoList
+  rxVifEpochs: array[2, uint32]
+  mmStaDeletions: array[STA_MGMT_FREE_STAS, MmStaDeletion]
+  mmStaDelRetryMask: uint8
   keepalive: uint32
   message: MmPsChangeIndPayload
   failAllocation: bool
@@ -42,6 +57,8 @@ var
   keys: seq[uint8]
 proc staInfoForIdx(index: uint8): ptr Sta = addr stations[index]
 proc staInfoAt(p: pointer): ptr Sta = cast[ptr Sta](p)
+proc staDeleteEpoch(index: uint8): uint32 = 0
+proc co_list_find(list: ptr CoList; node: ptr CoListHdr): bool = false
 proc vifChannelForIdx(index: uint8): ptr Vif = addr vifs[index]
 proc vifSecurity(p: ptr Vif): ptr Security = addr p.security
 proc ke_msg_alloc(id: uint16; dst, src: uint8; length: int): pointer =
@@ -57,7 +74,9 @@ proc keMsgHdrFromPayload(p: pointer): pointer = p
 proc ke_msg_free(p: pointer) = discard
 proc irqSave(): uint32 = 0
 proc irqRestore(saved: uint32) = discard
-proc staRemovalCurrent(owner: StaQueueIdentity): bool = true
+proc staRemovalCurrent(owner: StaQueueIdentity): bool =
+  let sta = cast[ptr Sta](owner.entry)
+  sta != nil and sta.valid == 0 and sta.instNbr == owner.vif
 proc mmEnvClearKeepAliveTimestampByte1() = keepalive = keepalive and 0xFFFF00FF'u32
 proc apm_tx_int_ps_clear(vif: pointer; index: uint8) =
   doAssert index in [5'u8, 6'u8] and stations[index].psMode == 0
@@ -71,15 +90,24 @@ proc mmDeleteSecurityAddress(index: uint8): bool =
   true
 proc staMgmtBeginRemoval(index: uint8; owner: var StaQueueIdentity): pointer =
   doAssert index == 2
+  if stations[index].valid == 0: return nil
   owner = StaQueueIdentity(entry: addr stations[index], vif: stations[index].instNbr)
+  stations[index].valid = 0
   addr stations[index]
-proc staMgmtFinishRemoval(owner: StaQueueIdentity) =
+proc staMgmtFinishRemoval(owner: StaQueueIdentity): bool =
   doAssert owner.entry == addr stations[2]
   events.add("unregister")
+  stations[2].instNbr = 0xFF
+  true
+proc mmStaDelQueueRetryLocked(index: uint8; saved: uint32) =
+  doAssert index == 2
 proc setup(vifIndex: uint8) =
   stations = default(typeof(stations))
   vifs = default(typeof(vifs))
   stations[2].instNbr = vifIndex
+  stations[2].valid = 1
+  mmStaDeletions = default(typeof(mmStaDeletions))
+  mmStaDelRetryMask = 0
   for index in 0 .. 1:
     vifs[index].vifIdx = index.uint8
     vifs[index].staIdx = 2
@@ -95,7 +123,7 @@ proc setup(vifIndex: uint8) =
 CHECKS = r"""
 for vifIndex in 0'u8 .. 1'u8:
   for sleeping in [false, true]:
-    for count in 1'u8 .. 3'u8:
+    for count in 0'u8 .. 3'u8:
       for allocationFails in [false, true]:
         setup(vifIndex)
         vifs[vifIndex].vifType = 2
@@ -104,10 +132,11 @@ for vifIndex in 0'u8 .. 1'u8:
         failAllocation = allocationFails
         mm_sta_del(2)
         doAssert keepalive == 0x12345678, "station deletion modified keepalive timestamp"
-        let lastSleeper = sleeping and count == 1
+        let lastSleeper = sleeping and count <= 1
         doAssert stations[vifIndex + 5].psMode == (if lastSleeper: 0'u8 else: 1'u8)
         doAssert stations[(1 - vifIndex) + 5].psMode == 1
-        doAssert vifs[vifIndex].psBaCounter == count - sleeping.uint8
+        doAssert vifs[vifIndex].psBaCounter ==
+          (if sleeping and count != 0: count - 1 else: count)
         if lastSleeper:
           doAssert events == (if allocationFails:
             @["allocate", "ps", "address", "unregister"]
@@ -145,7 +174,8 @@ def test_station_teardown(release_mode: bool, tmp_path: Path) -> None:
         pytest.skip("nim is not installed")
     source = (ROOT / "src/bl808/wifi/fw/kernel_mac_channel.nim").read_text()
     path = tmp_path / "station_teardown.nim"
-    path.write_text(PLATFORM + procedure(source, "mm_sta_del") + CHECKS)
+    path.write_text(PLATFORM + procedure(source, "mmStaDelTry") +
+                    procedure(source, "mm_sta_del") + CHECKS)
     command = [nim, "c", "-r", "--skipParentCfg:on", "--skipProjCfg:on",
                "--skipUserCfg:on", f"--nimcache:{tmp_path / 'cache'}", f"-o:{tmp_path / 'test'}"]
     command += ["-d:release", "--checks:off"] if release_mode else ["--checks:on"]

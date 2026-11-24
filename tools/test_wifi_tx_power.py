@@ -94,12 +94,43 @@ def source() -> str:
     return result
 
 
-def run(tmp_path: Path, mode: str, body: str) -> None:
+def table_source() -> str:
+    tpc = (FW / "tx_power_control.nim").read_text()
+    code = r'''
+var
+  rateTable: array[24, int8]
+  tpcChannelOffsetTable: array[14, int8]
+  tpcPowerTable: array[38, int8]
+  phyOffsets: array[14, int8]
+  readbackSuffixAtCall: array[14, int8]
+  rateUpdates, rateReads, phyUpdates: int
+proc trpc_update_power(p: pointer) =
+  inc rateUpdates
+  copyMem(addr rateTable[0], p, rateTable.len)
+proc trpc_power_get(p: pointer) =
+  inc rateReads
+  copyMem(addr readbackSuffixAtCall[0],
+    cast[pointer](cast[uint](p) + 24'u), readbackSuffixAtCall.len)
+  copyMem(p, addr rateTable[0], rateTable.len)
+proc phy_powroffset_set(p: ptr int8) {.cdecl, exportc.} =
+  inc phyUpdates
+  copyMem(addr phyOffsets[0], p, phyOffsets.len)
+proc blOpsFunc(offset: int): pointer =
+  doAssert offset == 4
+  nil
+'''
+    for name in ["bl_tpc_update_power_table", "bl_tpc_update_power_table_channel_offset",
+                 "bl_tpc_power_table_get"]:
+        code += procedure(tpc, name)
+    return code
+
+
+def run(tmp_path: Path, mode: str, body: str, code: str | None = None) -> None:
     nim = shutil.which("nim")
     if nim is None:
         pytest.skip("Nim compiler is unavailable")
     path = tmp_path / "tx_power.nim"
-    path.write_text(source() + body)
+    path.write_text((source() if code is None else code) + body)
     flags = ["--checks:on"] if mode == "checked" else ["-d:release", "--checks:off"]
     if mode == "asan":
         flags += ["--passC:-fsanitize=address", "--passC:-fno-omit-frame-pointer",
@@ -119,6 +150,42 @@ def run(tmp_path: Path, mode: str, body: str) -> None:
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_power_table_channel_offset_lifetime(mode, tmp_path):
+    run(tmp_path, mode, r'''
+var input: array[38, int8]
+for i in 0 ..< input.len: input[i] = cast[int8]((i * 19 + 97) and 255)
+for i in 0 ..< 14:
+  tpcChannelOffsetTable[i] = 42
+  tpcPowerTable[24 + i] = 42
+
+bl_tpc_update_power_table(addr input)
+doAssert rateUpdates == 1 and phyUpdates == 1
+for i in 0 ..< 24: doAssert rateTable[i] == input[i]
+for i in 0 ..< 14:
+  doAssert phyOffsets[i] == cast[int8](input[24 + i].int32 * 4)
+  doAssert tpcChannelOffsetTable[i] == 42
+  doAssert tpcPowerTable[24 + i] == 42
+
+var output: array[38, int8]
+for value in output.mitems: value = -1
+bl_tpc_power_table_get(addr output)
+doAssert rateReads == 1
+for value in readbackSuffixAtCall: doAssert value == -1
+for i in 0 ..< 24: doAssert output[i] == input[i]
+for i in 24 ..< 38: doAssert output[i] == 0
+
+for i in 0 ..< input.len: input[i] = cast[int8]((i * 7 + 11) and 255)
+bl_tpc_update_power_table_channel_offset(addr input)
+doAssert rateUpdates == 1 and phyUpdates == 2
+for i in 0 ..< 24: doAssert rateTable[i] == output[i]
+for i in 0 ..< 14:
+  doAssert phyOffsets[i] == cast[int8](input[24 + i].int32 * 4)
+  doAssert tpcChannelOffsetTable[i] == 42
+  doAssert tpcPowerTable[24 + i] == 42
+''', table_source())
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_power_indices_and_table_scan(mode, tmp_path):
     run(tmp_path, mode, r"""
 # Compile-check the exported ABI, not just the returned low byte.
@@ -134,6 +201,7 @@ var levels: array[513, int8]
 for count in [1, 2, 8, 255, 256, 257, 513]:
   for maximum in 0 ..< count:
     for i in 0 ..< count: levels[i] = -128
+    levels[0] = 0
     levels[maximum] = 127
     doAssert bl_pwr_find(addr levels[0], count.uint32) == maximum.uint32
   for i in 0 ..< count: levels[i] = -1
@@ -142,7 +210,7 @@ for first in -128 .. 127:
   for second in -128 .. 127:
     levels[0] = first.int8
     levels[1] = second.int8
-    let expected = if second > first: 1'u32 else: 0'u32
+    let expected = if first >= 0 and second > first: 1'u32 else: 0'u32
     doAssert bl_pwr_find(addr levels[0], 2) == expected
 
 var rate = Rate(rateWord: 0x80000807'u32, txPower: 0x12345678)
@@ -193,10 +261,19 @@ for i in 0 ..< ratePowers.len: ratePowers[i] = 10
 rfCalls.setLen(0)
 tpc_update_tx_power(0)
 doAssert rfCalls == @[(1'u32, 0'u8), (0'u32, 0'u8)]
+# An unsigned first-byte load prevents later signed candidates from winning.
+for i in 0 ..< ratePowers.len: ratePowers[i] = -128
+ratePowers[6] = 127
+ratePowers[11] = 127
+ratePowers[21] = 127
+rfCalls.setLen(0)
+tpc_update_tx_power(0)
+doAssert rfCalls == @[(0'u32, 0'u8), (0'u32, 0'u8)]
 # The vendor seeds the cross-family winner at zero, even for negative tables.
 for ofdm in [-128, -10, 0, 1, 22, 127]:
   for ht in [-128, -10, 0, 1, 22, 127]:
     for i in 0 ..< ratePowers.len: ratePowers[i] = -128
+    for group in 0 .. 2: ratePowers[group * 8] = 0
     ratePowers[6] = 7
     ratePowers[8 + 3] = ofdm.int8
     ratePowers[16 + 5] = ht.int8

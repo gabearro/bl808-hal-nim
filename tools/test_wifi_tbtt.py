@@ -197,6 +197,26 @@ co_list_push_back(addr env.primary, addr nodes[0].link)
 chan_tbtt_insert(addr nodes[1])
 doAssert listNodes(addr env.primary) ==
   @[cast[pointer](addr nodes[0]), cast[pointer](addr nodes[1])]
+
+# The vendor compares in-progress TBTT times as unsigned words before its
+# wrapping conflict check.
+reset()
+nodes[0].targetTime = 0xFFFF0000'u32
+nodes[0].state = 2
+nodes[1].targetTime = 1000
+co_list_push_back(addr env.primary, addr nodes[0].link)
+chan_tbtt_insert(addr nodes[1])
+doAssert listNodes(addr env.primary) == @[cast[pointer](addr nodes[0])]
+doAssert listNodes(addr env.delayed) == @[cast[pointer](addr nodes[1])]
+reset()
+nodes[0].targetTime = 1000
+nodes[0].state = 2
+nodes[1].targetTime = 0xFFFF0000'u32
+co_list_push_back(addr env.primary, addr nodes[0].link)
+chan_tbtt_insert(addr nodes[1])
+doAssert listNodes(addr env.primary) ==
+  @[cast[pointer](addr nodes[0]), cast[pointer](addr nodes[1])]
+doAssert env.delayed.first == nil
 """
     run_nim(tmp_path, PLATFORM + list_source() + checks)
 

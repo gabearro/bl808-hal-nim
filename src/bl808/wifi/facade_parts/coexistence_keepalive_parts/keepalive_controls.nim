@@ -11,10 +11,12 @@ proc wifiSetStaKeepaliveQosNull*(enabled: bool) =
   wifiNimFirmwareSetKeepaliveQosNull(enabled)
 
 proc wifiStaKeepaliveAckOkCount*(): uint32 =
+  ## Completions for which the MAC reported an ACK.
   wifiNimFirmwareKeepaliveAckOkCount()
 
 proc wifiStaKeepaliveConfirmCount*(): uint32 =
   wifiNimFirmwareKeepaliveConfirmCount()
 
 proc wifiStaKeepaliveFailCount*(): uint32 =
+  ## Callbacks without a reported MAC ACK, including software retirements.
   wifiNimFirmwareKeepaliveFailCount()

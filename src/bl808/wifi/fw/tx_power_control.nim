@@ -39,7 +39,7 @@ proc tpc_update_tx_power*(vifIdx: uint8) {.exportc, cdecl.} =
   discard c_memcpy(addr workBuf[0], addr powerTable[8], 8.csize_t)
   let idx1 = bl_pwr_find(addr workBuf[0], 8)
   let pwr1 = cast[uint8](workBuf[idx1])
-  if cast[int8](pwr1) > cast[int8](resultBuf[3]):  # blob: bge signed
+  if cast[int8](pwr1).int32 > resultBuf[3].int32:
     resultBuf[3] = pwr1          # overall best power
     resultBuf[5] = 1             # type = 11g
     resultBuf[4] = cast[uint8](idx1) # overall best index
@@ -48,7 +48,7 @@ proc tpc_update_tx_power*(vifIdx: uint8) {.exportc, cdecl.} =
   discard c_memcpy(addr workBuf[0], addr powerTable[16], 8.csize_t)
   let idx2 = bl_pwr_find(addr workBuf[0], 8)
   let pwr2 = cast[uint8](workBuf[idx2])
-  if cast[int8](pwr2) > cast[int8](resultBuf[3]):  # blob: bge signed
+  if cast[int8](pwr2).int32 > resultBuf[3].int32:
     resultBuf[3] = pwr2          # overall best power
     resultBuf[5] = 2             # type = 11n
     resultBuf[4] = cast[uint8](idx2) # overall best index
@@ -185,13 +185,13 @@ proc bl_tpc_update_power_table*(powerTable: ptr array[38, int8]) {.exportc, cdec
   ##   1. Calls trpc_update_power to update the first 24 bytes (rate part)
   ##   2. Scales remaining 14 bytes (channel offsets) by 4 into int8_t[14]
   ##   3. Calls phy_powroffset_set(scaledOffsets)
+  if powerTable == nil:
+    return
   proc phy_powroffset_set(powerOffset: ptr int8) {.importc, cdecl.}
   trpc_update_power(powerTable)
   var scaled {.noinit.}: array[14, int8]
   for channelOffsetIndex in 0 ..< 14:
     let channelPowerOffset = powerTable[24 + channelOffsetIndex]
-    tpcChannelOffsetTable[channelOffsetIndex] = channelPowerOffset
-    tpcPowerTable[24 + channelOffsetIndex] = channelPowerOffset
     scaled[channelOffsetIndex] = cast[int8](channelPowerOffset.int32 * 4'i32)
   phy_powroffset_set(addr scaled[0])
 
@@ -206,6 +206,8 @@ proc bl_tpc_update_power_table_channel_offset*(powerTable: ptr array[38, int8]) 
   ## disassembly show the argument is the full int8_t power table and offsets
   ## are read from bytes 24..37. The PHY hook receives those offsets scaled by
   ## four in an int8_t[14] scratch buffer.
+  if powerTable == nil:
+    return
   proc phy_powroffset_set(powerOffset: ptr int8) {.importc, cdecl.}
   type PrintfFn = proc(fmt: cstring) {.cdecl, varargs.}
 
@@ -214,8 +216,6 @@ proc bl_tpc_update_power_table_channel_offset*(powerTable: ptr array[38, int8]) 
     let printFn = cast[PrintfFn](blOpsFunc(4))
     let channelPowerOffset = powerTable[24 + channelOffsetIndex]
     let scaledPhyOffset = cast[int8](channelPowerOffset.int32 * 4'i32)
-    tpcChannelOffsetTable[channelOffsetIndex] = channelPowerOffset
-    tpcPowerTable[24 + channelOffsetIndex] = channelPowerOffset
     scaled[channelOffsetIndex] = scaledPhyOffset
     if printFn != nil:
       printFn(cstring("pwr chan[%d] offset:%d\r\n"), channelOffsetIndex.cint, scaledPhyOffset.cint)
@@ -239,9 +239,11 @@ proc bl_tpc_update_power_rate_11n*(powerTable: ptr array[8, int8]) {.exportc, cd
 proc bl_tpc_power_table_get*(powerTable: ptr array[38, int8]) {.exportc, cdecl.} =
   ## Get the current TX power table (15 instrs in blob).
   ## From blob: calls trpc_power_get to fill the first 24 bytes (rate data),
-  ## then loops from index 24 to 37 copying channel offset bytes.
+  ## then zeroes bytes 24 through 37.
+  if powerTable == nil:
+    return
   # Get rate data from TRPC (fills first 24 bytes)
   trpc_power_get(powerTable)
-  # Copy channel offset table (bytes 24..37)
+  # The WiFi getter does not return the PHY's channel-offset state.
   for channelOffsetIndex in 0 ..< 14:
-    powerTable[24 + channelOffsetIndex] = tpcChannelOffsetTable[channelOffsetIndex]
+    powerTable[24 + channelOffsetIndex] = 0

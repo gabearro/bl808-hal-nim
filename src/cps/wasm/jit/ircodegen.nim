@@ -20,7 +20,7 @@
 ##
 ## Spill slots are accessed via [SP, #offset] from RegAllocResult.spillSlots.
 
-import ir, regalloc, codegen, memory, compiler, optimize, aotcache
+import ir, regalloc, codegen, memory, compiler, optimize, relocation
 
 # ---------------------------------------------------------------------------
 # Sub-word memory encoding helpers (same as compiler.nim, local to this module)
@@ -2881,7 +2881,7 @@ proc emitIrInstr(buf: var AsmBuffer, instr: IrInstr, alloc: RegAllocResult,
         relocSites[].add(Relocation(offset: (buf.pos * 4).uint32,
                                     kind: relocCallCache,
                                     siteIdx: cacheIdx.uint32))
-      buf.loadImm64(x0, cast[uint64](cachePtr))
+      buf.loadImm64Fixed(x0, cast[uint64](cachePtr))
     else:
       buf.movz(x0, 0, 0)  # nil cache — will trap in dispatch
 
@@ -2890,7 +2890,7 @@ proc emitIrInstr(buf: var AsmBuffer, instr: IrInstr, alloc: RegAllocResult,
       relocSites[].add(Relocation(offset: (buf.pos * 4).uint32,
                                   kind: relocDispatch,
                                   siteIdx: 0))
-    buf.loadImm64(Reg(16), cast[uint64](tier2CallIndirectDispatch))
+    buf.loadImm64Fixed(Reg(16), cast[uint64](tier2CallIndirectDispatch))
     buf.blr(Reg(16))
 
     # ---- Step 5: Check return value. Non-zero = trap. ----

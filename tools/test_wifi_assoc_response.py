@@ -246,6 +246,12 @@ def source(trace: bool = False) -> str:
     owner = (FW / "station_tx_build.nim").read_text()
     for name in ["smTxBeginForVif", "smTxBegin", "smTxOwnerCurrent", "smTxBindStation", "smTxSetOwnerState"]:
         code += procedure(owner, name)
+    # Share the real response timer ownership check, including its TX serial.
+    timer = (FW / "station_response_timeout.nim").read_text()
+    code += "type KeTimerEntry = object\n  id: uint16\n"
+    code += timer.split("proc smRspNextSerial", 1)[0].replace(" {.wifiCtrl.}", "")
+    for name in ["smRspNextSerial", "smRspTimeoutCurrent", "smRspTimerBegin", "smRspTimerPublish"]:
+        code += procedure(timer, name)
     # This suite isolates RX preparation; activation's full exchange has its own suite.
     code += r'''
 proc smActivationReleasePrepared(prepared: var SmActivationPrepared) =
@@ -296,6 +302,23 @@ let p = response([])
 sm_assoc_rsp_handler(p)
 doAssert powers == @[17'u8], "association ignored the BSS power constraint"
 doAssert sent.len == 1 and sent[0].aid == 7
+finish(p)
+''',
+    "invalid_success_aid": r'''
+for invalid in [0'u16, 2008'u16, 0x3FFF'u16]:
+  let p = response([])
+  smAssocRspFrameView(p).aid = invalid or 0xC000'u16
+  sm_assoc_rsp_handler(p)
+  doAssert failures == @[(5'u16, 0xFFFF'u16)]
+  doAssert sent.len == 0 and rates == 0 and powers.len == 0
+  finish(p)
+''',
+    "max_valid_aid": r'''
+let p = response([])
+smAssocRspFrameView(p).aid = 0xC000'u16 or 2007'u16
+sm_assoc_rsp_handler(p)
+doAssert sent.len == 1 and sent[0].aid == 2007
+doAssert failures.len == 0
 finish(p)
 ''',
     "clear_replaces_connection": r'''
@@ -351,6 +374,20 @@ let p = response([], 17)
 sm_assoc_rsp_handler(p)
 doAssert failures == @[(5'u16, 17'u16)]
 doAssert sent.len == 0 and rates == 0
+finish(p)
+''',
+    "failure_status_malformed_ie": r'''
+let p = response([1'u8], 17)
+sm_assoc_rsp_handler(p)
+doAssert failures == @[(5'u16, 17'u16)] and clears == @[SM_RSP_TIMEOUT_IND]
+doAssert sent.len == 0 and rates == 0 and delays.len == 0
+finish(p)
+''',
+    "comeback_malformed_ie_tail": r'''
+let p = response([56'u8, 5, 3, 128, 0, 0, 0, 1], 30)
+sm_assoc_rsp_handler(p)
+doAssert failures == @[(5'u16, 30'u16)] and clears == @[SM_RSP_TIMEOUT_IND]
+doAssert sent.len == 0 and rates == 0 and delays.len == 0
 finish(p)
 ''',
     "allocation_failure": r'''
@@ -505,6 +542,16 @@ sm_assoc_rsp_handler(p)
 doAssert powers == @[248'u8] and sent.len == 1
 finish(p)
 ''',
+    "power_constraint_overflow": r'''
+for constraint in [148'u8, 149, 200, 255]:
+  let p = response([])
+  channel.txPower = 20
+  vif.bss.powerConstraint = constraint
+  sm_assoc_rsp_handler(p)
+  doAssert powers == @[cast[uint8](max(20 - constraint.int, -128).int8)]
+  doAssert sent.len == 1
+  finish(p)
+''',
     "nil_channel": r'''
 let p = response([])
 vif.operChan = nil
@@ -518,6 +565,14 @@ sm_assoc_done(1)
 doAssert sent.len == 1 and sent[0].aid == 1 and sentStates == @[9'u16]
 doAssert sm.saQueryActive == 0
 finish(p)
+''',
+    "fallback_invalid_aid": r'''
+for invalid in [0'u16, 2008'u16, 0x3FFF'u16]:
+  let p = response([])
+  sm_assoc_done(invalid)
+  doAssert failures == @[(5'u16, 0xFFFF'u16)]
+  doAssert sent.len == 0 and rates == 0
+  finish(p)
 ''',
     "fallback_ignores_other_state": r'''
 let p = response([])
@@ -564,8 +619,14 @@ finish(p)
 for name, ies in {"short_ie_header": "[1'u8]", "short_ie_body": "[1'u8, 2, 3]"}.items():
     CASES[name] = f'''
 let p = response({ies})
+var timer = KeTimerEntry(id: SM_RSP_TIMEOUT_IND)
+let timerSerial = smRspTimerBegin(SM_RSP_TIMEOUT_IND, TASK_SM, 0)
+doAssert smRspTimerPublish(SM_RSP_TIMEOUT_IND, TASK_SM, timerSerial, addr timer)
+let queuedExpiry = smRspIdentity
 sm_assoc_rsp_handler(p)
 doAssert clears.len == 0 and sent.len == 0
+doAssert smRspEntry == (addr timer) and smRspTimeoutCurrent(queuedExpiry),
+  "an ignored association response invalidated the timeout owner"
 finish(p)
 '''
 

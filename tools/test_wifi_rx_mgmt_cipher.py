@@ -41,6 +41,13 @@ proc rxu_mgt_frame_check(p: pointer; station: uint8): uint32 =
         f"  {name}: uint32\n" for name in sorted(set(re.findall(r"\bnimFwDbg\w+", replay)))
         if not re.search(r"\b" + name + r"\s*:", code))
     extras += r'''
+{.define: bl808WifiDiagPeerRxAdmission.}
+type RxMgtProtection = enum
+  rxMgtProtectionUnknown, rxMgtWithoutProtection, rxMgtVerifiedCcmp, rxMgtVerifiedBip
+var lastProtection: RxMgtProtection
+proc rxMgtNoteProtection(p: pointer; generation: uint32; protection: RxMgtProtection) =
+  doAssert p == addr mpdu
+  lastProtection = protection
 var managementCounter: KeyReplayCounterView
 proc replayCounterStateView(p: pointer): ptr ReplayCounterStateView =
   cast[ptr ReplayCounterStateView](p)
@@ -66,6 +73,7 @@ proc prepare(fc: uint16; cipher: uint32; associated, pmf, groupKey, groupDa, ena
   key.hasRxPn = windowed.uint8
   managementCounter = default(KeyReplayCounterView)
   managementCalls = 0
+  lastProtection = rxMgtProtectionUnknown
   sw.mpduLengthBytes = (macLength + securityLength + bodyLength).uint16
   interrupts = enabled
 proc checkRejected(enabled: bool) =
@@ -80,6 +88,7 @@ proc checkRejected(enabled: bool) =
     "ineligible management protection consumed replay state"
   doAssert managementCalls == 0 and keySelections == 0,
     "ineligible management protection reached key selection/publication"
+  doAssert lastProtection == rxMgtProtectionUnknown
   doAssert stations == beforeSequences and bytes == before
   doAssert envState.bssidSeq == beforeBssidSeq and rxu_mgmt_dup_addr == beforeAddress,
     "ineligible management protection consumed the unassociated duplicate cache"
@@ -156,6 +165,8 @@ for fc in [0x40A0'u16, 0x40C0, 0x40D0, 0xC0D0]:
         let beforeKey = key
         doAssert rxu_cntrl_frame_handle(addr mpdu) == 0
         doAssert managementCalls == 1 and keySelections == 1
+        doAssert lastProtection == (if (fc and 0xFC) in [0xA0'u16, 0xC0'u16]:
+          rxMgtVerifiedCcmp else: rxMgtProtectionUnknown)
         doAssert managementCounter.pnLow != 0 or managementCounter.pnHigh != 0
         doAssert key == beforeKey and bytes == before and interrupts == enabled
 ''',

@@ -1,6 +1,7 @@
 proc wifiCompletePendingEvents() =
   if wifiScanFuture != nil and not wifiScanFuture.finished and
       wifiBackendScanDone():
+    noteWifiScan(wifiScanConfirmed, bl808_wifi_backend_scan_confirmation())
     completeWifiScan(wifiBackendScanCount())
   if wifiConnectFuture != nil and not wifiConnectFuture.finished and
       wifiBackendConnectDone():

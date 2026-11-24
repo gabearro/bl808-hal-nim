@@ -1,0 +1,52 @@
+## RV32E has no floating point unit and the current GCC has no ilp32e libgcc.
+## These compiler-rt helpers let the shared full interpreter lower FP in
+## software without generating instructions outside the E902 ISA.
+
+when defined(bl808lp):
+  {.compile: "../../vendor/compiler_rt_rv32e/fp_env.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/adddf3.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/addsf3.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/clzdi2.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/ctzdi2.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/comparedf2.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/comparesf2.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/divdf3.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/divdi3.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/divsf3.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/extendsfdf2.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/fixdfdi.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/fixsfdi.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/fixsfsi.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/fixunsdfdi.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/fixunsdfsi.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/fixunssfsi.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/fixunssfdi.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/floatdidf.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/floatdisf.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/floatsidf.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/floatsisf.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/floatundidf.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/floatundisf.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/floatunsidf.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/floatunsisf.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/moddi3.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/muldf3.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/mulsf3.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/popcountdi2.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/subdf3.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/subsf3.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/truncdfsf2.c".}
+  {.compile: "../../vendor/compiler_rt_rv32e/udivmoddi4.c".}
+  {.compile: "../../vendor/musl_math_rv32e/floor.c".}
+  {.compile: "../../vendor/musl_math_rv32e/floorf.c".}
+  {.compile: "../../vendor/musl_math_rv32e/ceil.c".}
+  {.compile: "../../vendor/musl_math_rv32e/ceilf.c".}
+  {.compile: "../../vendor/musl_math_rv32e/trunc.c".}
+  {.compile: "../../vendor/musl_math_rv32e/truncf.c".}
+  {.compile: "../../vendor/musl_math_rv32e/round.c".}
+  {.compile: "../../vendor/musl_math_rv32e/roundf.c".}
+  {.compile: "../../vendor/musl_math_rv32e/sqrt.c".}
+  {.compile: "../../vendor/musl_math_rv32e/sqrtf.c".}
+  {.compile: "../../vendor/musl_math_rv32e/sqrt_data.c".}
+  {.compile: "../../vendor/musl_math_rv32e/__math_invalid.c".}
+  {.compile: "../../vendor/musl_math_rv32e/__math_invalidf.c".}

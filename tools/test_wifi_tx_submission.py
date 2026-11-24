@@ -32,6 +32,10 @@ def prelude() -> str:
         "proc recordPublication()\nproc regWrite(address: uint; value: uint32) =\n"
         "  if address == IpcApp2EmbTrigger: recordPublication()",
     )
+    source += (
+        f'from "{TX.parent / "host_table_layout"}" import '
+        "WifiHostStaTableCount, WifiHostStaTableOffset, WifiHostStaEntrySize, WifiHostVifCount\n"
+    )
     layout = (TX / "layout.nim").read_text().replace("  TxHdrSize = 24'u\n", "")
     types = "".join((TX / "types_parts" / name).read_text() for name in [
         "packet_views.nim", "station_views.nim", "tx_descriptor_views.nim"])
@@ -53,12 +57,14 @@ var
   publications: seq[Publication]
   onFree: proc()
   onPublish, onPrint: proc()
+  printCalls: int
   criticalStack: seq[uint32]
 proc bl_os_enter_critical() = criticalStack.add(ipcHostIrqSave())
 proc bl_os_exit_critical() =
   let state = criticalStack.pop()
   ipcHostIrqRestore(state)
 proc bl_os_printf(text: cstring) =
+  inc printCalls
   if onPrint != nil:
     let callback = onPrint
     onPrint = nil
@@ -111,19 +117,24 @@ proc install() =
   onFree = nil
   onPublish = nil
   onPrint = nil
+  printCalls = 0
   criticalStack.setLen(0)
-proc enqueue(index: int) =
+proc enqueue(index: int; stationIndex = 0) =
   let bytes = addr packetBytes[index][0]
   packets[index] = PbufView(payload: bytes, len: 160, totLen: 160)
   let header = txHdrView(bytes)
   header.pbuf = addr packets[index]
   header.len = 160
+  setTxHdrStaId(header, stationIndex.uint8)
   let ethernet = ethernetHeaderAt(bufferAt(bytes, PbufLinkEncapsulationHlen.uint))
   ethernet.dst[5] = (index + 1).uint8
   ethernet.src[5] = (index + 21).uint8
   ethernet.ethertype = 0x0008
-  listPushBack(addr wifi_hw.stas[0].waitingList, header)
-  txCntrlStaTrigger = txCntrlStaTrigger or 1
+  let station = addr wifi_hw.stas[stationIndex]
+  station.isUsed = 1
+  station.staIdx = stationIndex.uint8
+  listPushBack(addr station.waitingList, header)
+  txCntrlStaTrigger = txCntrlStaTrigger or bitSta(stationIndex)
 proc checkPublished(count: int) =
   doAssert publications.len == count
   var used: seq[pointer]
@@ -179,11 +190,18 @@ for state in [false, true]:
     "exhaust_buffer": r"""
 install()
 enqueue(0)
-for i in 0 .. 3: doAssert ipc_host_txbuf_get(E()) != nil
+let returned = ipc_host_txbuf_get(E())
+doAssert returned != nil
+for i in 1 .. 3: doAssert ipc_host_txbuf_get(E()) != nil
 bl_tx_try_flush(0, nil)
 doAssert publications.len == 0 and released[0] == 0
 doAssert length(queue(E(), EnvListFreeOff)) == 4
 doAssert not listEmpty(addr wifi_hw.stas[0].waitingList)
+ipc_host_txbuf_free(returned)
+bl_tx_try_flush(0, nil)
+doAssert publications.len == 1 and publications[0].buffer == returned
+doAssert released[0] == 1
+checkPartition(E(), P())
 """,
     "free_count_completion": r"""
 for state in [false, true]:
@@ -235,6 +253,57 @@ for i in 0 .. 3:
   doAssert loadU32(ptrAt(P(), SharedTxbufOff + i.uint * SharedTxbufSize), 0) == 0
 checkPartition(E(), P())
 """,
+    "other_sta_resource_wait": r"""
+for shortage in ["descriptor", "buffer"]:
+  install()
+  enqueue(0)
+  bl_tx_try_flush(0, nil)
+  let firstBuffer = publications[0].buffer
+  for i in 1 .. 3:
+    if shortage == "descriptor":
+      discard submit(E(), (i + 1).uint)
+    else:
+      doAssert ipc_host_txbuf_get(E()) != nil
+  publications.setLen(0)
+  enqueue(1, 1)
+  bl_tx_try_flush(0, nil)
+  doAssert released[1] == 0 and publications.len == 0
+  let reports = printCalls
+  for _ in 0 .. 2: bl_tx_try_flush(0, nil)
+  doAssert printCalls == reports
+
+  onCfm = proc(context, hostId: pointer) =
+    doAssert hostId == firstBuffer
+    ipc_host_txbuf_free(hostId)
+    txCntrlStaTriggerPending = bitSta(0)
+    if shortage == "descriptor":
+      # The callback runs before its own descriptor is returned.
+      bl_tx_try_flush(0, nil)
+      doAssert released[1] == 0
+  markConfirmed(1)
+  dispatch(E())
+  bl_tx_try_flush(0, nil)
+  doAssert released[1] == 1, "a station lost its only wake while resources were held by another"
+  doAssert publications.len == 1 and publications[0].marker == 2
+  doAssert txdescUpperHost(publications[0].node).staId == 1
+  checkPartition(E(), P())
+""",
+    "resource_wait_reset": r"""
+install()
+for i in 0 .. 3: discard submit(E(), (i + 1).uint)
+enqueue(0, 1)
+bl_tx_try_flush(0, nil)
+doAssert released[0] == 0
+publications.setLen(0)
+resetHost(E(), P())
+bl_tx_try_flush(0, nil)
+doAssert publications.len == 0, "old resource wake leaked into a replacement pool"
+doAssert released[0] == 0 and not listEmpty(addr wifi_hw.stas[1].waitingList)
+txCntrlStaTrigger = bitSta(1)
+bl_tx_try_flush(0, nil)
+doAssert publications.len == 1 and released[0] == 1
+checkPartition(E(), P())
+""",
     "pending_first": r"""
 install()
 let buffer = ipc_host_txbuf_get(E())
@@ -253,6 +322,29 @@ doAssert publications[0].buffer == buffer and publications[0].marker == 9
 doAssert publications[1].marker == 1
 doAssert released == [1, 0, 0, 0]
 doAssert listEmpty(addr wifi_hw.stas[0].pendingList)
+checkPartition(E(), P())
+""",
+    "pending_first_after_resource_return": r"""
+install()
+let buffer = ipc_host_txbuf_get(E())
+let storage = txbufHostBuf(buffer)
+let header = txHdrView(bufferAt(storage, alignPads(storage).uint))
+header.pbuf = buffer
+header.len = 160
+ethernetHeaderAt(bufferAt(storage, PbufLinkEncapsulationHlen.uint)).dst[5] = 9
+listPushBack(addr wifi_hw.stas[0].pendingList, header)
+for i in 0 .. 3: discard submit(E(), (i + 1).uint)
+publications.setLen(0)
+enqueue(0)
+onPrint = proc() =
+  markConfirmed(2)
+  dispatch(E())
+bl_tx_try_flush(0, nil)
+bl_tx_try_flush(0, nil)
+checkPublished(2)
+doAssert publications[0].buffer == buffer and publications[0].marker == 9,
+  "fresh packet passed an older pending retry when a descriptor returned"
+doAssert publications[1].marker == 1 and released[0] == 1
 checkPartition(E(), P())
 """,
     "chained_packet": r"""

@@ -20,13 +20,17 @@ def lo_source() -> str:
     )
     code = code.replace(
         "proc volatileLoad(p: ptr uint32): uint32 =",
-        "var comparatorBits: seq[uint32]\nvar comparatorIndex: int\n"
+        "var comparatorBits: seq[uint32]\nvar comparatorIndex, lastComparatorEventCount: int\n"
         "proc volatileLoad(p: ptr uint32): uint32 =",
     ).replace(
         "  p[]\nproc volatileStore",
-        "  if p == (addr rf70.acalCtrlA4) and comparatorBits.len != 0:\n"
+        "  if p == (addr rf70.acalCtrlA4) and comparatorBits.len != 0 and\n"
+        "      events.len >= 2 and events.len != lastComparatorEventCount and\n"
+        "      events[^1] == (0'u, 1'u32) and\n"
+        "      events[^2].address == cast[uint](addr rf70.fcalCtrlA0):\n"
         "    doAssert comparatorIndex < comparatorBits.len\n"
         "    result = (p[] and not 0x1000'u32) or comparatorBits[comparatorIndex]\n"
+        "    lastComparatorEventCount = events.len\n"
         "    inc comparatorIndex\n"
         "  else: result = p[]\nproc volatileStore",
     )
@@ -51,6 +55,7 @@ proc loSetup(row: int) =
   for word in registerStorage.mitems: word = randomWord()
   comparatorBits.setLen(0)
   comparatorIndex = 0
+  lastComparatorEventCount = 0
   delays.setLen(0)
   mmioWrites.setLen(0)
   mmioReads.setLen(0)
@@ -66,8 +71,12 @@ def packed_lo_source() -> str:
         start = code.index("proc " + name + "(")
         end = code.index("\nproc ", start + 1)
         code = code[:start] + procedure(rf, name).rstrip() + code[end:]
+    tables = "var\n" + "".join(
+        next(line for line in rf.splitlines() if line.startswith("  " + name + " ")) + "\n"
+        for name in ("channelFcalTable", "channelAcalTable")
+    )
     return code.replace(
-        "proc rfLoFcal(", procedure(rf, "rfCalibSetHalf") + "proc rfLoFcal(", 1
+        "proc rfLoFcal(", tables + procedure(rf, "rfCalibSetHalf") + "proc rfLoFcal(", 1
     )
 
 
@@ -75,7 +84,7 @@ def packed_lo_source() -> str:
 def test_acal_all_comparator_histories_and_exact_mmio(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, lo_source() + r'''
 for row in 0 ..< 6:
-  for pattern in 0 ..< 64:
+  for pattern in 0 ..< 32:
     loSetup(row)
     let initial = registerStorage
     var expected = initial
@@ -98,33 +107,35 @@ for row in 0 ..< 6:
     # A plain store, unlike the field updates, does not read first.
     reads.setLen(reads.len - 1)
     put(rf70.priModeCtrl30, 0xFFFFFFFF'u32, 2)
-    put(rf70.priModeCtrl30, 0x0CF090FF'u32, 0x0CF00000)
+    # BL808 demo rf_pri_lo_acal+0x3a,+0x3e,+0x72.
+    put(rf70.priModeCtrl30, (0xCF09'u32 shl 12) + 0xFF, 0xCF00'u32 shl 12)
     put(rf70.calCtrl1c, 0xFFFFFFFF'u32, 0x10)
     var wanted: array[21, uint16]
     for channel in 0 ..< 21:
-      put(rf70.fcalCtrlA0, 0xFFC0FFFF'u32, 0x100000)
+      put(rf70.acalCtrlA4, 0xFFFFF8FF'u32, 0x400)
+      put(rf70.fcalCtrlA0, 0xFFE0FFFF'u32, 0x100000)
       put(rf70.fcalCtrlA0, 0xFFFFFF00'u32, loFcalValues[channel].uint32)
       put(rf70.sdmDivC4, 0, VendorDiv[row][channel])
       reads.setLen(reads.len - 1)
       settle()
-      var value = 32
-      for bit in countdown(4, 0):
-        put(rf70.fcalCtrlA0, 0xFFC0FFFF'u32, value.uint32 shl 16)
+      var value = 16
+      for bit in countdown(3, 0):
+        put(rf70.fcalCtrlA0, 0xFFE0FFFF'u32, value.uint32 shl 16)
         settle()
         reads.add(cast[uint](addr rf70.acalCtrlA4))
-        let comparator = if (pattern and (1 shl (4 - bit))) != 0: 0x1000'u32 else: 0'u32
+        let comparator = if (pattern and (1 shl (3 - bit))) != 0: 0x1000'u32 else: 0'u32
         comparatorBits.add(comparator)
         value += (if comparator == 0: 1 shl bit else: -(1 shl bit))
-      put(rf70.fcalCtrlA0, 0xFFC0FFFF'u32, value.uint32 shl 16)
+      put(rf70.fcalCtrlA0, 0xFFE0FFFF'u32, value.uint32 shl 16)
       settle()
       reads.add(cast[uint](addr rf70.acalCtrlA4))
-      let finalComparator = if (pattern and 32) != 0: 0x1000'u32 else: 0'u32
+      let finalComparator = if (pattern and 16) != 0: 0x1000'u32 else: 0'u32
       comparatorBits.add(finalComparator)
       if finalComparator == 0 and value <= 30: inc value
       wanted[channel] = value.uint16
     put(rf70.calMode14, 0xFFFFFFFF'u32, 0xC0)
     runRfPriLoAcal()
-    doAssert comparatorIndex == 126, "ACAL must consume five search samples and one final sample per channel"
+    doAssert comparatorIndex == 105, "ACAL must consume four search samples and one final sample per channel"
     doAssert loAcalValues == wanted, "ACAL result differs from comparator decisions"
     doAssert registerStorage == expected, "ACAL touched an unrelated field"
     doAssert mmioWrites == trace, "ACAL write ordering differs from vendor"
@@ -154,10 +165,11 @@ for row in 0 ..< 6:
     put(rf70.baseCtrl1, 0xFFFFFFFD'u32, 0)
     put(rf70.synthCtrl2c, 0, 0, false)
     put(rf70.priModeCtrl30, 0xFFFFFFFF'u32, 2)
-    put(rf70.priModeCtrl30, 0x0CF090FF'u32, 0x0CF00000)
+    # BL808 demo libbl606p_phyrf.a:rf_pri.o, rf_pri_lo_fcal+0x4a..0x136.
+    put(rf70.priModeCtrl30, (0xCF09'u32 shl 12) + 0xFF, 0xCF00'u32 shl 12)
+    put(rf70.calCtrl1c, 0xFFFFFFFF'u32, 8)
     put(rf70.fcalCtrlA0, 0xFFFFFF00'u32, 0x80)
     put(rf70.txcalCtrlB8, 0xFFFFCFFF'u32, 0)
-    put(rf70.txcalCtrlB8, 0xFFFFFFEF'u32, 0)
     put(rf70.calResultA8, 0xFFFF0000'u32, FcalDividers[row].uint32)
     put(rf70.sdmDivC4, 0, 0x01000000, false)
     put(rf70.sdmCtrlC0, 0xFFFFFFFF'u32, 0x1000)
@@ -167,22 +179,22 @@ for row in 0 ..< 6:
     put(rf70.sdmCtrlC0, 0xFFFFFFFF'u32, 0x10000)
     put(rf70.txcalCtrlB8, 0xFFFEFFFF'u32, 0)
     expectedEvents.add((0'u, 50'u32))
-    put(rf70.calCtrl1c, 0xFFFFFFFF'u32, 8)
-    expectedEvents.add((0'u, 200'u32))
+    put(rf70.acalCtrlA4, 0xFFFFFFFC'u32, 2)
+    expectedEvents.add((0'u, 50'u32))
     prepareRfPriLoFcal()
     doAssert registerStorage == expected, "FCAL setup fields differ from vendor"
     doAssert mmioWrites == trace, "FCAL setup writes differ in order or value"
     doAssert mmioReads == reads, "FCAL setup reads differ in order"
-    doAssert delays == @[10'u32, 50, 200], "FCAL setup settling intervals differ"
+    doAssert delays == @[10'u32, 50, 50], "FCAL setup settling intervals differ"
     doAssert events == expectedEvents, "FCAL delays occur at a different MMIO boundary"
 ''')
 
 
 @pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
-def test_acal_publishes_six_bit_results_without_replacing_fcal(tmp_path: Path, mode: str) -> None:
+def test_acal_publishes_five_bit_results_without_replacing_fcal(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, packed_lo_source() + r'''
 for row in 0 ..< 6:
-  for pattern in 0 ..< 64:
+  for pattern in 0 ..< 32:
     loSetup(row)
     for word in calibration.mitems: word = randomWord()
     let initial = calibration
@@ -190,13 +202,13 @@ for row in 0 ..< 6:
     var wanted = initial
     let wantedHalves = cast[ptr UncheckedArray[uint16]](addr wanted[0])
     for channel in 0 ..< 21:
-      let history = (pattern + channel) mod 64
-      var value = 32
-      for bit in countdown(4, 0):
-        let comparator = if (history and (1 shl (4 - bit))) != 0: 0x1000'u32 else: 0'u32
+      let history = (pattern + channel) mod 32
+      var value = 16
+      for bit in countdown(3, 0):
+        let comparator = if (history and (1 shl (3 - bit))) != 0: 0x1000'u32 else: 0'u32
         comparatorBits.add(comparator)
         value += (if comparator == 0: 1 shl bit else: -(1 shl bit))
-      let finalComparator = if (history and 32) != 0: 0x1000'u32 else: 0'u32
+      let finalComparator = if (history and 16) != 0: 0x1000'u32 else: 0'u32
       comparatorBits.add(finalComparator)
       if finalComparator == 0 and value <= 30: inc value
       wantedHalves[14 + channel] = (halves[14 + channel] and 0xFF00'u16) or value.uint16
@@ -205,6 +217,82 @@ for row in 0 ..< 6:
     for channel in 0 ..< 21:
       doAssert rfLoAcal(channel) == (wantedHalves[14 + channel] and 0x3F'u16)
       doAssert rfLoFcal(channel) == (wantedHalves[14 + channel] shr 8)
+      doAssert channelAcalTable[channel] == rfLoAcal(channel)
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
+def test_lo_halfword_tables_and_restore_boundary(tmp_path: Path, mode: str) -> None:
+    # rf_pri.c.o: FCAL +34a calls restore before +37e/+382; ACAL
+    # +162/+16a publishes in the channel loop, before the call at +176.
+    code = packed_lo_source().replace(
+        "proc restoreRfPriCalState(state: RfPriCalState) = discard",
+        "proc observeRestore()\nproc restoreRfPriCalState(state: RfPriCalState) = observeRestore()",
+    )
+    store = procedure(RF.read_text(), "rfCalibSetHalf").rstrip()
+    code = code.replace(store, "proc observePacked(index: int)\n" + store + "\n  observePacked(index)", 1)
+    run_program(tmp_path, mode, code + r'''
+const Unwritten = 0xCAFE'u16
+var
+  isAcal, restored: bool
+  published: int
+  before, wanted: typeof(calibration)
+  codes: array[21, uint16]
+template activeTable: untyped = (if isAcal: channelAcalTable else: channelFcalTable)
+proc observePacked(index: int) =
+  doAssert index == 14 + published and restored != isAcal
+  doAssert rfCalibHalf(index) == cast[ptr UncheckedArray[uint16]](addr wanted[0])[index]
+  doAssert activeTable[published] == Unwritten, "packed store must precede table store"
+  if published > 0: doAssert activeTable[published - 1] == codes[published - 1]
+  if isAcal: doAssert comparatorIndex == 5 * (published + 1)
+  let modeBits = if isAcal: (0xC0'u32, 0x40'u32) else: (0x30'u32, 0x10'u32)
+  doAssert (rf70.calMode14 and modeBits[0]) == modeBits[1]
+  inc published
+proc observeRestore() =
+  doAssert not restored
+  if isAcal:
+    doAssert published == 21 and activeTable == codes and calibration == wanted
+  else:
+    doAssert published == 0 and calibration == before
+    for value in activeTable: doAssert value == Unwritten
+  restored = true
+
+for row in 0 ..< 6:
+  loSetup(row)
+  for word in calibration.mitems: word = randomWord()
+  for value in channelFcalTable.mitems: value = Unwritten
+  for value in channelAcalTable.mitems: value = Unwritten
+  let bounds = VendorRange[row]
+  # Reach base 15; put the 21 exact targets at sweep indices 16..36.
+  sampleValues = @[bounds[0]-1, bounds[0]-1, bounds[0]-1, bounds[0]-1,
+                   bounds[1]+1, bounds[1]+1, bounds[1]+1]
+  for i in countdown(16, 1): sampleValues.add(VendorCnt[row][0] - i.uint16)
+  for target in VendorCnt[row]: sampleValues.add(target)
+  sampleValues.add(bounds[2]+1)
+  for acalPhase in [false, true]:
+    isAcal = acalPhase
+    restored = false
+    published = 0
+    before = calibration
+    wanted = before
+    let other = (if isAcal: channelFcalTable else: channelAcalTable)
+    let halves = cast[ptr UncheckedArray[uint16]](addr wanted[0])
+    for i in 0 ..< 21:
+      if isAcal:
+        # Alternating clear/set decisions give 31 or 1, then a clear final sample.
+        for bit in 0 ..< 4: comparatorBits.add(if i mod 2 == 0: 0'u32 else: 0x1000'u32)
+        comparatorBits.add(0)
+        codes[i] = if i mod 2 == 0: 31 else: 2
+        halves[14+i] = (halves[14+i] and 0xFF00) or codes[i]
+      else:
+        codes[i] = uint16((1 - i) and 0xFFFF)
+        halves[14+i] = (halves[14+i] and 255) or ((codes[i] and 255) shl 8)
+    if isAcal: runRfPriLoAcal()
+    else: runRfPriLoFcal()
+    doAssert restored and published == 21 and calibration == wanted
+    doAssert activeTable == codes
+    doAssert other == (if isAcal: channelFcalTable else: channelAcalTable)
+    doAssert sampleIndex == sampleValues.len
 ''')
 
 

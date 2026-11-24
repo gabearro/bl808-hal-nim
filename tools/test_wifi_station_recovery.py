@@ -19,6 +19,7 @@ const
   BlVifUpOff = 12'u
   BlVifVifIdxOff = 13'u
   BlVifLinksNumOff = 14'u
+  SmDisconnectingState = 10'u16
   WifiConnectDefault = 1'u32 shl 31
   WifiConnectPmfCapable = 1'u32 shl 9
   ScanActive = 1'u8
@@ -34,6 +35,7 @@ var
   wifiStarted = true
   staEnabled = true
   apEnabled = true
+  apRegistered = true
   connectDone = 8'i32
   disconnectDone = 0'i32
   sm_state = 6'u16
@@ -111,24 +113,30 @@ proc bl_main_phy_up(): cint =
 proc wifi_mgmr_sta_readd_firmware_if(): bool =
   calls.add("add")
   true
-proc wifiChannelToFreq(channel: uint8): uint16 = 2412
+proc wifiChannelToFreq(channel: uint8): uint16 =
+  if channel != 0: 2407'u16 + 5'u16 * channel.uint16 else: 0'u16
 proc c_strlen(value: cstring): csize_t = value.len.csize_t
 proc vendorPutsRaw(value: cstring) = discard
 proc vendorPrintU32(value, base: uint32) = discard
 proc scanDiagReset() = discard
-var scanDoneCount, scanItemCount: uint32
+var scanDoneCount, scanItemCount, scanConfirmationStatus: uint32
+var lastStaFrequency: uint16
 proc bl_main_connect(ssid: ptr uint8; ssidLen: cint; psk: ptr uint8; pskLen: cint;
                      pmk: ptr uint8; pmkLen: cint; address: ptr uint8; band: uint8;
                      freq: uint16; flags: uint32): cint =
   calls.add("connect")
+  lastStaFrequency = freq
   connectResult
 proc bl_main_scan(nif: ptr Netif; channels: ptr uint16; count: uint16;
                   address: ptr MacAddr; ssid: ptr MacSsid; mode: uint8; duration: uint32): cint =
   calls.add("scan")
   scanResult
 proc mgmrRaw(): pointer = nil
+proc bl_msg_get_channel_nums(): cint = 11
+var lastApChannel: cint
 proc bl_main_apm_start(ssid, password: cstring; channel: cint; hidden: uint8; interval: uint16): cint =
   calls.add("ap_start")
+  lastApChannel = channel
   connectResult
 proc bl_main_apm_stop(): cint =
   calls.add("ap_stop")
@@ -192,6 +200,25 @@ sm_state = 0
 connectDone = 0
 doAssert recover(true) == 0
 doAssert "disconnect" in calls and "abort" notin calls
+""",
+    "disconnect_owns_recovery": """
+sm_state = SmDisconnectingState
+connectDone = 0
+storeU8(vifAt(0), BlVifLinksNumOff, 1)
+var iface: pointer
+doAssert wifi_mgmr_scan(nil, nil) == -16
+doAssert wifi_mgmr_sta_connect(addr iface, "ssid", "password", nil, nil, 0, 1) == -16
+doAssert calls == @["recover", "recover"] and polls == 0
+doAssert connectDone == 0 and disconnectDone == 0
+doAssert loadU8(vifAt(0), BlVifLinksNumOff) == 1 and sm_state == SmDisconnectingState
+sm_state = 0
+fwStatus = 0
+connectDone = -1
+disconnectDone = 1
+storeU8(vifAt(0), BlVifLinksNumOff, 0)
+doAssert wifi_mgmr_scan(nil, nil) == 0
+doAssert wifi_mgmr_sta_connect(addr iface, "ssid", "password", nil, nil, 0, 1) == 0
+doAssert calls == @["recover", "recover", "recover", "scan", "recover", "connect"]
 """,
     "disconnect_failure": """
 sm_state = 0
@@ -297,9 +324,41 @@ doAssert wifi_mgmr_ap_stop(nil) == -5
 doAssert apEnabled
 """,
     "ap_start_failure": """
+apEnabled = false
+apRegistered = false
 connectResult = -5
 doAssert wifi_mgmr_ap_start(nil, "ap", 0, "password", 1) == -5
-doAssert apEnabled
+doAssert not apEnabled and not apRegistered
+""",
+    "ap_channel_plan": """
+apEnabled = false
+apRegistered = false
+for channel in [0.cint, 12, 13, 14, 255]:
+  doAssert wifi_mgmr_ap_start(nil, "ap", 0, nil, channel) == -1
+  doAssert not apEnabled and not apRegistered and calls.len == 0
+for channel in 1.cint .. 11.cint:
+  apEnabled = false
+  apRegistered = false
+  doAssert wifi_mgmr_ap_start(nil, "ap", 0, nil, channel) == 0
+  doAssert apEnabled and apRegistered and lastApChannel == channel
+doAssert calls.len == 11
+for call in calls: doAssert call == "ap_start"
+""",
+    "sta_channel_plan": """
+var iface: pointer
+let before = connectDone
+for channel in [12'u8, 13, 14, 15, 255]:
+  doAssert wifi_mgmr_sta_connect(addr iface, "ssid", nil, nil, nil, 0, channel) == -1
+doAssert wifi_mgmr_sta_connect(addr iface, "ssid", nil, nil, nil, 1, 6) == -1
+doAssert calls.len == 0 and connectDone == before
+sm_state = 0
+fwStatus = 0
+connectDone = -1
+for channel in 0'u8 .. 11'u8:
+  doAssert wifi_mgmr_sta_connect(addr iface, "ssid", nil, nil, nil, 0, channel) == 0
+  doAssert lastStaFrequency == (if channel == 0: 0'u16 else: 2407'u16 + 5'u16 * channel.uint16)
+  doAssert calls == @["recover", "connect"]
+  calls.setLen(0)
 """,
     "disconnect_admission": """
 doAssert wifi_mgmr_sta_disconnect() == 0
@@ -365,7 +424,21 @@ proc endStationControl() = busy = false
     for name in ["wifi_mgmr_prepare_join_after_scan", "wifi_mgmr_scan", "wifi_mgmr_sta_connect",
                  "wifi_mgmr_sta_disconnect", "wifi_mgmr_sta_connect_abort"]:
         source += procedure(scan, name)
-    source += (SUPPORT / "mgmr_facade_parts/ap_control.nim").read_text()
+    source += """
+proc wifiApReleaseInterface(): cint =
+  apRegistered = false
+  0
+proc wifiApRegisterInterface(): cint =
+  apRegistered = true
+  0
+proc apIface(): pointer = staIface()
+proc netif_set_up(netif: ptr Netif) = discard
+proc netif_set_link_up(netif: ptr Netif) = discard
+proc netif_set_link_down(netif: ptr Netif) = discard
+"""
+    ap = (SUPPORT / "mgmr_facade_parts/ap_control.nim").read_text()
+    for name in ["wifi_mgmr_ap_start", "wifi_mgmr_ap_stop"]:
+        source += procedure(ap, name)
     source += """
 storePtr(vifAt(0), BlVifDevOff, addr netif[0])
 storeU8(vifAt(0), BlVifUpOff, 1)

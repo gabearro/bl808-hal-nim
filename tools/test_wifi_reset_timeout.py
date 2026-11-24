@@ -24,6 +24,8 @@ var
   onRx: proc()
 proc mmEnvView(): ptr MmEnvView = addr mm
 proc waitMacSoftResetClear(): bool = true
+template smSaQueryResetScope() = discard
+proc smSaQueryClearResetTimer() = discard
 proc irqSave(): uint32 =
   result = if interrupts: 8'u32 else: 0'u32
   interrupts = false
@@ -51,6 +53,7 @@ proc vif_mgmt_reset() =
 proc apmResumeHaltRollback() =
   doAssert not interrupts
   steps.add("apm")
+proc mmPsModeRetryAfterReset() = doAssert not interrupts
 proc ke_state_set(task: uint8; state: uint16) =
   doAssert not interrupts and task == TASK_MM and state == HW_ACTIVE.uint16
   steps.add("state")
@@ -164,6 +167,7 @@ def test_pending_retry_preempts_other_events(tmp_path: Path, mode: str) -> None:
     event_support = r'''
 const KE_EVT_MAX = 32
 template keEvtField: untyped = eventField
+template keEnvEventField(): ptr uint32 = addr eventField
 var
   keEvtHandlers: array[32, tuple[handler, param: pointer]]
   lowerEvents: int
@@ -175,7 +179,8 @@ proc lowerEvent(p: pointer) {.cdecl.} =
   eventField = 0
 '''
     code = source() + event_support
-    code += procedure(kernel, "eventIndex32") + procedure(kernel, "ke_evt_schedule")
+    code += "".join(procedure(kernel, name) for name in (
+        "eventIndex32", "keDispatchEvent", "ke_evt_schedule"))
     run_program(tmp_path, mode, code + r'''
 resetFixture(true, true)
 keEvtHandlers[0].handler = cast[pointer](resetEvent)
@@ -230,14 +235,8 @@ doAssert txlStationAdmits(addr frame)
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_channel_switch_stops_after_failed_idle(tmp_path: Path, mode: str) -> None:
     code = protection_source()
-    original = procedure(code, "mm_force_idle_req")
-    code = code.replace(original, r'''
-var failForceAt: int
-proc mm_force_idle_req(): bool =
-  inc forced
-  invoke(onIdle)
-  forced != failForceAt
-''', 1)
+    assert code.count("  not forceFailed\n") == 1
+    code = "var failForceAt: int\n" + code.replace("  not forceFailed\n", "  forced != failForceAt\n", 1)
     run_program(tmp_path, mode, code + r'''
 resetProtectionTest()
 failForceAt = 1

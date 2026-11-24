@@ -206,7 +206,7 @@ proc coreCompatibleWithCaps*(core: WasmOsCore,
   of wasmOsCoreD0:
     caps.core == wasmCoreD0
   of wasmOsCoreLP:
-    caps.core == wasmCoreLP and caps.compact and caps.softwareF32 and not caps.supportsF64
+    caps.core == wasmCoreLP and caps.supportsI32
   of wasmOsCoreEnclave:
     caps.compact and caps.flashBacked
   else:

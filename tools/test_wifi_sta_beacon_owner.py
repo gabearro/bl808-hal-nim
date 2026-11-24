@@ -48,8 +48,8 @@ proc ps_check_tbtt(p: pointer) = boundary("ps")
 ''',
         "txl_frame_send_null_frame": r'''
 proc txl_frame_send_null_frame(sta: uint8; callback: pointer; arg: uint32): uint8 =
-  doAssert sta == 3 and callback == cast[pointer](mm_ap_probe_cfm)
-  doAssert arg == pointerAddrU32(addr vifs[0])
+  doAssert sta == 3 and callback == cast[pointer](mmStaBeaconProbeCfm)
+  doAssert arg == mmBeaconProbeEpochs[0]
   boundary("send")
   1
 ''',
@@ -171,7 +171,7 @@ for irq in [false, true]:
   for probe in [0'u8, 49, 100, 255]:
     prepareOwner(irq, probe)
     mm_sta_tbtt(addr vifs[0])
-    let count = probe + 1
+    let count = min(probe.int + 1, 255).uint8
     var expected = order
     if count > 100: expected.add("send")
     elif count > 49: expected.add("pm")

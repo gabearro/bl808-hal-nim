@@ -1,18 +1,27 @@
-proc vendorRandomU32(): uint32 =
-  var randomState = vendorRandomState
-  randomState = randomState xor (randomState shl 13)
-  randomState = randomState xor (randomState shr 17)
-  randomState = randomState xor (randomState shl 5)
-  vendorRandomState = if randomState != 0: randomState else: 0x6d2b_79f5'u32
-  vendorRandomState
-
-proc os_random*(): culong {.exportc, cdecl.} = vendorRandomU32().culong
-
 proc os_get_random*(randomBytes: ptr uint8; length: csize_t): cint {.exportc, cdecl.} =
-  if randomBytes == nil: return -1
-  for randomByteIndex in 0 ..< length.int:
-    if (randomByteIndex and 3) == 0:
-      discard vendorRandomU32()
-    cast[ptr uint8](ptrAt(randomBytes, randomByteIndex.uint))[] =
-      uint8(vendorRandomState shr ((randomByteIndex and 3) * 8))
+  if length == 0: return 0
+  if randomBytes == nil or length > high(int).csize_t: return -1
+  let dst = cast[ptr UncheckedArray[uint8]](randomBytes)
+  let count = length.int
+  var offset = 0
+  while offset < count:
+    var words: array[8, uint32]
+    # Group ownership arbitrates cores; mask local interrupts for one sample.
+    let irqState = osEnterCritical()
+    let status = trngReadAll(words)
+    osExitCritical(irqState)
+    if status != secOk:
+      zero(randomBytes, length.uint)
+      return -1
+    let blockLen = min(sizeof(words), count - offset)
+    for i in 0 ..< blockLen:
+      dst[offset + i] = ((words[i div 4] shr ((i mod 4) * 8)) and 0xff).uint8
+    offset += blockLen
+  0
+
+proc os_random*(): culong {.exportc, cdecl.} =
+  var word: uint32
+  if os_get_random(cast[ptr uint8](addr word), sizeof(word).csize_t) == 0:
+    return word.culong
+  # The scalar SDK ABI cannot report errors; cryptographic callers use the buffer API.
   0

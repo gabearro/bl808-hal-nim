@@ -44,7 +44,10 @@ proc staAt(index: uint): pointer {.inline.} =
   ptrAt(hwRaw(), BlHwStaTableOff + index * BlStaSize)
 
 proc netifHwaddr(netif: ptr Netif): ptr uint8 {.inline.} =
-  cast[ptr uint8](ptrAt(cast[pointer](netif), NetifHwaddrOff))
+  when defined(bl808WifiRealLwip):
+    addr netif.hwaddr[0]
+  else:
+    cast[ptr uint8](ptrAt(cast[pointer](netif), NetifHwaddrOff))
 
 proc initListHead(base: pointer; listHeadByteOffset: uint) =
   let list = ptrAt(base, listHeadByteOffset)

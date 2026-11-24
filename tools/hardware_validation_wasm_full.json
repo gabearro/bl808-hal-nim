@@ -1,0 +1,49 @@
+{
+  "defaults": {
+    "uart_baud": 230400,
+    "openocd_interface": "pine64jtag.cfg",
+    "openocd_target": "tgt_e907_v2.cfg",
+    "forbidden": ["[FAIL]", "[FAULT]", "panic", "Unhandled", "fatal:"],
+    "jtag_snapshot": ["poll", "reg pc", "reg sp", "reg ra", "reg mepc", "reg mcause", "reg mtval"]
+  },
+  "tests": [
+    {
+      "name": "allcore_wasm_full_baseline_test",
+      "tiers": ["manual"],
+      "build": [
+        {
+          "id": "kernel",
+          "core": "bl808m0",
+          "source": "examples/m0_allcore_wasm_full_baseline_test.nim",
+          "flash": "m0",
+          "defines": {"bl808WasmFull": "1"}
+        },
+        {
+          "id": "d0",
+          "core": "bl808d0",
+          "source": "examples/wasm_full_baseline_test.nim",
+          "flash": "d0",
+          "defines": {"bl808WasmFull": "1"}
+        },
+        {
+          "id": "lp",
+          "core": "bl808lp",
+          "source": "examples/wasm_full_baseline_test.nim",
+          "flash": "lp",
+          "defines": {"bl808WasmFull": "1"}
+        }
+      ],
+      "required": [
+        "[PASS] M0 full interpreter corpus",
+        "[PASS] D0 full interpreter corpus",
+        "[PASS] LP full interpreter corpus",
+        "=== Test Complete ==="
+      ],
+      "timeout": 60,
+      "jtag_snapshot": [
+        "poll", "reg pc", "reg sp",
+        "mdw 0x40003F20 4", "mdw 0x40002E90 4"
+      ]
+    }
+  ]
+}

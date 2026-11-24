@@ -21,6 +21,9 @@ def source() -> str:
 var
   freeDepth, peakFreeDepth: int
   freeOrder: seq[pointer]
+const KE_EVT_KE_MESSAGE = 0x08000000'u32
+proc mmConfigForgetIdleOwner(p: pointer): bool = false
+proc ke_evt_set(bits: uint32) = doAssert false, "scan and registration do not own MM idle"
 proc observedFree(p: pointer) =
   let index = live.find(p)
   doAssert index >= 0, "message was freed more than once"

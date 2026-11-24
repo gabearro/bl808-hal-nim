@@ -1,0 +1,18 @@
+package ox64:demo@0.2.0;
+
+interface bias {
+  offset: func(input: s32) -> s32;
+}
+
+interface arithmetic {
+  add: func(lhs: s32, rhs: s32) -> s32;
+}
+
+world demo {
+  import bias;
+  export arithmetic;
+}
+
+world provider {
+  export bias;
+}

@@ -2,6 +2,7 @@
 
 const
   Enomem = 12.cint
+  Einval = 22.cint
   Ebusy = 16.cint
   Eintr = 4'i32
 
@@ -13,8 +14,8 @@ const
 
   BlHwIpcEnvOff = 48'u
   BlHwVifTableOff = 60'u
-  BlHwModParamsOff = 220'u
-  BlHwHtCapOff = 224'u
+  BlHwModParamsOff = WifiHostModParamsOffset
+  BlHwHtCapOff = WifiHostHtCapOffset
   BlVifSize = 20'u
   BlVifVifIdxOff = 13'u
 

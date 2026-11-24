@@ -78,7 +78,10 @@ proc me_build_sae_authenticate(p: pointer; algo, sequence, status: uint16; vif: 
   body[] = AuthFixedBodyView(authAlgo: algo, authSeq: sequence, statusCode: status)
   6
 proc meBuildSaeAuthenticate(p: pointer; algo, sequence, status: uint16; vif: uint32;
-                            build: ptr SmTxBuildContext): uint32 =
+                            build: ptr SmTxBuildContext; peerOverride, ownOverride: pointer): uint32 =
+  let header = cast[ptr Header](addr link.macHeader[0])
+  doAssert cast[ptr array[6, uint8]](peerOverride)[] == header.addr1
+  doAssert cast[ptr array[6, uint8]](ownOverride)[] == header.addr2
   me_build_sae_authenticate(p, algo, sequence, status, vif)
 proc smTxFrameCurrent(build: var SmTxBuildContext): bool = true
 proc smTxFail(build: var SmTxBuildContext; status: uint16) =
@@ -118,6 +121,7 @@ for algo in [0'u8, 1, 3]:
       doAssert hw.payloadEnd == hw.payloadStart + total.uint32 - 1
       doAssert desc.callback == nil and desc.callbackArg == addr desc
       doAssert desc.hdrLen == secLen.uint8 and desc.secTailLen == secLen.uint8
+      doAssert desc.staIdx == 0 and desc.staInfoIdx == 3
       doAssert protections == sharedThird.int
       let header = cast[ptr Header](addr link.macHeader[0])
       doAssert header.frameControl == (if sharedThird: 0x40B0'u16 else: 0x00B0'u16)
@@ -163,7 +167,7 @@ proc build(authAlgo: uint8; authSeqNum: uint16; challenge: pointer) =
   let hdr = cast[ptr Header](addr link.macHeader[0])
   let vifIdx = 1'u8
   var vif = Vif(vifIdx: vifIdx)
-  let effectiveStaIdx = 3'u8
+  let staIdx = 3'u8
   var bssid = [6'u8, 5, 4, 3, 2, 1]
   var own = [2'u8, 3, 4, 5, 6, 7]
   let bssidPtr = cast[pointer](addr bssid[0])

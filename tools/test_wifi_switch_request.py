@@ -5,19 +5,23 @@ from textwrap import indent
 
 import pytest
 
+from test_wifi_auth_frames import layouts
 from test_wifi_channel_ownership import source as ownership_source
+from test_wifi_channel_update import mm_config_idle_source
 from test_wifi_disconnect_tx import FW, procedure
 from test_wifi_message_allocation import run_program
 
 
 def source() -> str:
     code = ("var mmState: uint16\nvar onMmState, onFree: proc()\nproc chanSwitchForget(header: pointer)\n"
+            "proc mmConfigForgetIdleOwner(header: pointer): bool\n"
             "proc chanProtectionInvalidate()\n"
             "proc chanProtectionCancel(target: pointer = nil): pointer {.discardable.}\n"
             "proc chanProtectionCallbackCurrent(): bool\n"
             "proc chanProtectionSelectTarget(target: pointer): bool\n" + ownership_source())
     code = code.replace("  elif id == 11:", "  elif id == 74:\n    discard\n  elif id == 11:", 1)
-    code = code.replace("  smRegistrationForget(p)\n", "  chanSwitchForget(p)\n  smRegistrationForget(p)\n", 1)
+    code = code.replace("  smRegistrationForget(p)\n", "  chanSwitchForget(p)\n"
+                        "  discard mmConfigForgetIdleOwner(p)\n  smRegistrationForget(p)\n", 1)
     code = code.replace("  dealloc(p)\n", "  dealloc(p)\n  invoke(onFree)\n", 1)
     code = code.replace("    macAddr, bssid: array[6, uint8]", """    macAddr, bssid: array[6, uint8]
     next, postponedStaHead: pointer
@@ -32,6 +36,8 @@ def source() -> str:
                         "  for index in 0..<MAX_CHAN_CTXT:\n    let context = addr chan_ctxt_pool[index]\n    markInvalid(context)\n    co_list_push_back(addr channelEnv.freeList, chanCtxtHdr(context))", 1)
     code = code.replace(procedure(code, "chanSwitchRetire"),
                         "proc chanSwitchRetire(target: pointer)\n", 1)
+    code = code.replace(procedure(code, "chanForceIdle"),
+                        "proc chanForceIdle(): bool\n", 1)
     code = code.replace("proc ke_state_get(task: uint8): uint16 =\n",
                         "proc ke_state_get(task: uint8): uint16 =\n  if task == 0: return mmState\n", 1)
     code = code.replace("proc ke_state_set(task: uint8; value: uint16) =\n",
@@ -42,14 +48,20 @@ const
   MM_FORCE_IDLE_REQ_MSG = 74'u16
   TASK_NONE = 255'u8
   MM_IDLE = 0'u16
+  MM_ACTIVE_STATE = 1'u16
   MM_GOING_TO_IDLE = 2'u16
   HW_ACTIVE = 3'u16
+  KE_EVT_IDLE = 0x04000000'u32
   MACHW_STATE_CNTRL_REG = 0x24B00038'u
   VIF_TYPE_AP = 2'u8
 var
   ps: tuple[enabled: uint8, statusFlags: uint32]
+  mm: tuple[hardwareMode, previousState: uint8]
   mgmt: tuple[activeList: CoList]
+  stateRegister, events: uint32
+  modeRequests: seq[uint32]
   callbacks, forced, idleRequests, timerClears: int
+  forceFailed: bool
   onIdle, onHal, onRead, onStatus: proc()
 proc chan_goto_idle_cb*() {.exportc, cdecl.}
 proc keMsgPayload(header: ptr KeMsgHdr): pointer =
@@ -61,18 +73,31 @@ proc meCancelQueuedPayload(payload: pointer) =
       release(payload)
       return
 proc psEnvView(): ptr typeof(ps) = addr ps
+proc mmEnvView(): ptr typeof(mm) = addr mm
+proc ke_evt_field_get(): uint32 = events
+proc ke_evt_clear(bits: uint32) = events = events and not bits
 proc vifMgmtEnvView(): ptr typeof(mgmt) = addr mgmt
-proc mm_force_idle_req(): bool =
+proc chanForceIdle(): bool =
   inc forced
+  inc txResetEpoch
   invoke(onIdle)
-  true
+  not forceFailed
+proc chanForceIdleForDeparture(target: pointer): bool =
+  doAssert target == channelEnv.scheduledCtxt
+  chanForceIdle()
 proc hal_machw_idle_req() =
   inc idleRequests
+  stateRegister = 0
+  modeRequests.add(0)
   invoke(onHal)
 proc regRead(address: uint): uint32 =
   doAssert address == MACHW_STATE_CNTRL_REG
   invoke(onRead)
-  0
+  stateRegister
+proc regWrite(address: uint; value: uint32) =
+  doAssert address == MACHW_STATE_CNTRL_REG
+  stateRegister = value
+  modeRequests.add(value)
 proc mm_active() = discard
 proc blmac_pwr_mgt_setf(value: uint32) = discard
 proc chan_pre_switch_channel() =
@@ -87,10 +112,18 @@ proc chan_upd_ctxt_status(p: pointer; status: uint8) =
   chanCtxtAt(p).status = status
   invoke(onStatus)
 '''
+    code += mm_config_idle_source()
     code += (FW / "channel_switch.nim").read_text()
     code += (FW / "channel_protection.nim").read_text()
+    code += layouts("MmChanCtxtUpdatePayload") + r'''
+proc rxl_timer_int_handler() = doAssert false, "updating a non-current slot drained RX"
+proc rxl_cntrl_evt() = doAssert false
+proc phySetChannel(channel: ptr ChanCtxtDefView) = doAssert false
+proc tpc_update_tx_power(power: uint8) = doAssert false
+'''
+    code += procedure((FW / "kernel_mac_channel.nim").read_text(), "chan_ctxt_update")
     tasks = (FW / "task_handlers.nim").read_text()
-    for name in ["chan_switch_start", "chan_goto_idle_cb", "mm_force_idle_req_handler"]:
+    for name in ["chanStartSwitch", "chan_switch_start", "chan_goto_idle_cb", "mm_force_idle_req_handler"]:
         code += procedure(tasks, name)
     return code + r'''
 proc resetSwitch() =
@@ -98,10 +131,16 @@ proc resetSwitch() =
   setup()
   resetChannels()
   mmState = MM_IDLE
+  mmConfigIdle = default(typeof(mmConfigIdle))
+  mm = default(typeof(mm))
+  stateRegister = 0
+  events = 0
+  modeRequests.setLen(0)
   mgmt = default(typeof(mgmt))
   ps = default(typeof(ps))
   callbacks = 0
   forced = 0
+  forceFailed = false
   idleRequests = 0
   onIdle = nil
   onHal = nil
@@ -114,6 +153,18 @@ proc newTarget(freq = 2412'u16): pointer =
   var index: uint8
   doAssert chan_ctxt_add(addr definition, addr index) == 0
   cast[pointer](chanCtxtForIdx(index))
+proc linkHome(home: pointer; role: uint8; index = 0'u8) =
+  let vif = vifChannelForIdx(index)
+  vif.vifType = role
+  vif.state = 1
+  vif.chanCtxt = nil
+  chan_ctxt_link(index, chanCtxtAt(home).contextIndexOrMarker)
+  doAssert vif.chanCtxt == home
+proc updateHome(home: pointer; center: uint16) =
+  let index = chanCtxtAt(home).contextIndexOrMarker
+  var u = MmChanCtxtUpdatePayload(ctxtIdx: index, band: 0, secChan: 1,
+    primFreq: 2437, centerFreq1: center, txPower: 13, txPowerTailPadding: 3)
+  chan_ctxt_update(addr u)
 proc beginSwitch(target: pointer): pointer =
   chan_switch_start(target)
   doAssert queued.len == 1 and channelEnv.scheduledCtxt == target
@@ -126,6 +177,93 @@ proc finishSwitch() =
 
 
 CASES = {
+    "linked_home_updated_before_claim": r'''
+for role in [VIF_TYPE_STA, VIF_TYPE_AP]:
+  for savedRequest in [false, true]:
+    resetSwitch()
+    let home = newTarget(2437)
+    linkHome(home, role)
+    let index = chanCtxtAt(home).contextIndexOrMarker
+    let epoch = chanCtxtEpochs[index]
+    let request = beginSwitch(home)
+    if savedRequest:
+      mmState = MM_GOING_TO_IDLE
+      doAssert mm_force_idle_req_handler(request) == KeMsgSaved
+      mmState = MM_IDLE
+    updateHome(home, 2447)
+    doAssert chanSwitchAdmit(request)
+    onRead = proc() = updateHome(home, 2427)
+    onIdle = proc() =
+      doAssert chanSwitchActive.claimed and not chanSwitchAdmit(request)
+      doAssert chanSwitchActive.destination.definition == chanCtxtAt(home).channel
+      doAssert chanSwitchActive.destination.definition.centerFreq1 == 2427
+    doAssert mm_force_idle_req_handler(request) == KeMsgConsumed
+    release(request)
+    doAssert callbacks == 1 and forced == 1 and channelEnv.currentCtxt == home
+    doAssert chanCtxtEpochs[index] == epoch and channelEnv.scheduledCtxt == nil
+    doAssert chanSwitchActive == nil and chanSwitchTags == nil
+''',
+    "reject_rebound_home": r'''
+for change in 0..2:
+  resetSwitch()
+  let home = newTarget(2437)
+  linkHome(home, VIF_TYPE_STA)
+  linkHome(home, VIF_TYPE_AP, 1)
+  let index = chanCtxtAt(home).contextIndexOrMarker
+  let epoch = chanCtxtEpochs[index]
+  let request = beginSwitch(home)
+  case change
+  of 0: inc rxVifEpochs[0]
+  of 1: chan_ctxt_unlink(0)
+  else:
+    chan_ctxt_unlink(0)
+    chan_ctxt_link(0, index)
+  doAssert chanCtxtEpochs[index] == epoch
+  if change != 2: updateHome(home, 2447)
+  chanCtxtAt(home).status = 5
+  doAssert mm_force_idle_req_handler(request) == KeMsgConsumed
+  release(request)
+  doAssert forced == 0 and callbacks == 0 and chanCtxtAt(home).status == 5
+  doAssert chanSwitchActive == nil and channelEnv.scheduledCtxt == nil
+''',
+    "reject_unowned_update": r'''
+for index in [0'u8, 3, 4]:
+  resetSwitch()
+  let home = if index == 0: newTarget() else: cast[pointer](chanCtxtForIdx(index))
+  chanCtxtAt(home).contextIndexOrMarker = index
+  let request = beginSwitch(home)
+  chanCtxtAt(home).channel.centerFreq1 = 2447
+  doAssert not chanSwitchAdmit(request)
+  doAssert mm_force_idle_req_handler(request) == KeMsgConsumed
+  release(request)
+  doAssert callbacks == 0 and forced == 0 and chanSwitchActive == nil
+  doAssert channelEnv.scheduledCtxt == nil and channelEnv.switchPending == 0
+''',
+    "claimed_or_abandoned_home": r'''
+for phase in 0..5:
+  resetSwitch()
+  let home = newTarget(2437)
+  linkHome(home, VIF_TYPE_STA)
+  let status = chanCtxtAt(home).status
+  let request = beginSwitch(home)
+  updateHome(home, 2447)
+  case phase
+  of 0: discard # Released before another admission.
+  of 1: keMsgHdrFromPayload(request).srcId = TASK_MM
+  of 2, 3, 4:
+    onIdle = proc() =
+      doAssert chanSwitchCallbackCurrent()
+      if phase == 2: updateHome(home, 2427)
+      elif phase == 3: inc chanCtxtAt(home).channel.txPower
+      else: inc chanCtxtAt(home).channel.phyEnvFlags
+      doAssert not chanSwitchCallbackCurrent() and not chanSwitchSelectTarget(home)
+  else: forceFailed = true
+  if phase != 0: doAssert mm_force_idle_req_handler(request) == KeMsgConsumed
+  release(request)
+  doAssert forced == (phase >= 2).int and callbacks == 0
+  doAssert chanSwitchActive == nil and channelEnv.scheduledCtxt == nil
+  doAssert channelEnv.switchPending == 0 and chanCtxtAt(home).status == status
+''',
     "nested_switch_publication": r'''
 for phase in 0..1:
   resetSwitch()
@@ -237,6 +375,73 @@ for savedRequest in [false, true]:
   chan_ctxt_del(chanCtxtAt(target).contextIndexOrMarker)
   doAssert queued.len == 0 and live.len == 0
   doAssert channelEnv.scheduledCtxt == nil and channelEnv.switchPending == 0
+  finishSwitch()
+''',
+    "abandoned_switch_restores_home_once": r'''
+for irq in [false, true]:
+  for phase in 0 .. 2:
+    resetSwitch()
+    enabled = irq
+    let home = newTarget()
+    linkHome(home, VIF_TYPE_STA)
+    channelEnv.currentCtxt = home
+    let target = newTarget(2462)
+    let request = beginSwitch(target)
+    mmState = MM_ACTIVE_STATE
+    stateRegister = 0x33
+    let cancel = proc() = chanSwitchCancel(target)
+    if phase == 2: onHal = cancel
+    let status = mm_force_idle_req_handler(request)
+    doAssert status == (if phase == 2: KeMsgConsumed else: KeMsgSaved)
+    doAssert enabled == irq and mmState == MM_GOING_TO_IDLE
+    doAssert modeRequests == @[0'u32]
+    if phase == 2: release(request)
+    else: queued.add(request)
+    if phase == 0: cancel()
+    mm_hw_idle_evt()
+    if phase == 1:
+      doAssert modeRequests == @[0'u32] and mmState == MM_IDLE
+      doAssert mmConfigResumeIdle(mmConfigIdle.epoch, TASK_MM)
+      doAssert modeRequests == @[0'u32] and mmConfigIdle.owner == keMsgHdrFromPayload(request)
+      cancel()
+    mmConfigResumeAbandonedIdle()
+    mm_hw_idle_evt()
+    mmConfigResumeAbandonedIdle()
+    doAssert modeRequests == @[0'u32, 0x30] and mmState == MM_ACTIVE_STATE
+    doAssert channelEnv.currentCtxt == home and channelEnv.scheduledCtxt == nil
+    doAssert enabled == irq and forced == 0 and callbacks == 0
+    doAssert mmConfigIdle.phase == mmConfigNoIdle
+    finishSwitch()
+''',
+    "superseded_switch_does_not_restore_home": r'''
+for cause in 0 .. 4:
+  resetSwitch()
+  let home = newTarget()
+  linkHome(home, VIF_TYPE_STA)
+  channelEnv.currentCtxt = home
+  let target = newTarget(2462)
+  let request = beginSwitch(target)
+  mmState = MM_ACTIVE_STATE
+  stateRegister = 0x33
+  doAssert mm_force_idle_req_handler(request) == KeMsgSaved
+  queued.add(request)
+  chanSwitchCancel(target)
+  var replacement: pointer
+  case cause
+  of 0: replacement = beginSwitch(target)
+  of 1: inc chanCtxtLinkEpochs[0]
+  of 2: mmConfigCancelIdle()
+  of 3: events = 0x80000000'u32
+  else: inc chanCtxtEpochs[chanCtxtAt(home).contextIndexOrMarker]
+  mm_hw_idle_evt()
+  mmConfigResumeAbandonedIdle()
+  doAssert modeRequests == @[0'u32] and forced == 0 and callbacks == 0
+  if replacement != nil:
+    doAssert mmState == MM_IDLE
+    doAssert mm_force_idle_req_handler(replacement) == KeMsgConsumed
+    doAssert callbacks == 1 and forced == 1
+    doAssert channelEnv.currentCtxt == target and mmConfigIdle.phase == mmConfigNoIdle
+    release(replacement)
   finishSwitch()
 ''',
     "one_shot_callback": r'''

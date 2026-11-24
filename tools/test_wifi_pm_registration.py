@@ -33,6 +33,8 @@ var
   calls: seq[string]
   values: seq[uint32]
   resultCode: uint32
+  doze = (dozeInProgress: 1'u32, unused: 0)
+proc blDozeEnvView(): ptr typeof(doze) = addr doze
 proc wait_mac_goto_idle(): uint32 {.cdecl.} =
   calls.add("idle")
   resultCode
@@ -54,12 +56,14 @@ proc mac_recovery(): uint32 {.cdecl.} =
 proc pm_force_sleep_check(): bool {.cdecl.} =
   calls.add("check")
   resultCode != 0
-proc coex_pta_force_autocontrol_set(mode: uint32) {.cdecl.} =
+proc coex_pta_force_autocontrol_set(mode: uint32): uint32 {.cdecl.} =
   calls.add("coex")
   values.add(mode)
-proc rfc_channel_ops(channel: uint32) {.cdecl.} =
+  0'u32
+proc rfc_channel_ops(channel: uint32): uint32 {.cdecl.} =
   calls.add("channel")
   values.add(channel)
+  0'u32
 proc wifi_hosal_rf_turn_on(argument: pointer = nil): cint {.cdecl, discardable.} =
   doAssert argument == nil
   calls.add("rf-on")
@@ -68,11 +72,12 @@ proc wifi_hosal_rf_turn_off(argument: pointer = nil): cint {.cdecl, discardable.
   doAssert argument == nil
   calls.add("rf-off")
   -3
-proc ble_rf_ops(enable: uint32) {.cdecl.} =
+proc ble_rf_ops(enable: uint32): uint32 {.cdecl.} =
   calls.add("ble")
   values.add(enable)
   if enable == 0: wifi_hosal_rf_turn_off()
   else: wifi_hosal_rf_turn_on()
+  0'u32
 proc recordRegistration(event: cint; code, capability: uint32; priority: uint16;
                         callback, argument: pointer; enable: cint) =
   doAssert napSleepActive == 1
@@ -157,7 +162,7 @@ proc checkTable() =
 def test_registration_order_callbacks_and_arguments(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, source() + r'''
 reset()
-bl_pm_ops_register(nil)
+doAssert bl_pm_ops_register() == 0'u32
 checkTable()
 ''')
 
@@ -166,12 +171,15 @@ checkTable()
 def test_registered_callbacks_use_pm_abi(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, source() + r'''
 reset()
-bl_pm_ops_register(nil)
+doAssert bl_pm_ops_register() == 0'u32
 checkTable()
 for value in [0'u32, 7'u32, high(uint32)]:
   resultCode = value
   for index in [0, 2, 7, 8, 9, 10]:
     doAssert invoke(index) == cast[cint](value)
+let wakeCalls = calls.len
+doze.dozeInProgress = 0
+doAssert invoke(7) == 0 and calls.len == wakeCalls
 resultCode = 0
 doAssert invoke(11) == 0
 resultCode = 9
@@ -200,10 +208,16 @@ def test_registration_keeps_vendor_sequence_after_provider_error(tmp_path: Path,
     run_program(tmp_path, mode, source() + r'''
 reset()
 registrationResult = -1
-bl_pm_ops_register(cast[pointer](123))
+doAssert bl_pm_ops_register() == 0'u32
 checkTable()
 registrations.setLen(0)
 registrationResult = 3
-bl_pm_ops_register(nil)
+doAssert bl_pm_ops_register() == 0'u32
 checkTable()
 ''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_nap_call_returns_zero(tmp_path: Path, mode: str) -> None:
+    code = procedure((FW / "platform_bl.nim").read_text(), "bl_nap_call")
+    run_program(tmp_path, mode, code + "\ndoAssert bl_nap_call() == 0'u32\n")

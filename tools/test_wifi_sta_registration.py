@@ -203,6 +203,12 @@ for incomingIrq in [false, true]:
   doAssert stations[0].rateSet == original.rateSet
   doAssert stations[0].assocInfoWord1 == original.assocInfoWord1
   doAssert stations[0].keyMat == addr vifs[0].keys
+  doAssert stations[0].capabilityFlags == 0xA5A5A5AD'u32
+
+  setup(flags = 16, incomingIrq = incomingIrq)
+  hook = proc() = vifs[0].keys.flags = 0
+  doAssert invoke() == 0 and irq == incomingIrq
+  doAssert stations[0].keyMat == addr vifs[0].keys
   doAssert stations[0].capabilityFlags == 0xA5A5A5A5'u32
 
   setup(incomingIrq = incomingIrq)
@@ -251,6 +257,14 @@ for invalid in 2'u16 .. 255:
   doAssert sta_mgmt_register(addr request, addr output) != 0
   doAssert output == 0xFF and stations == before and logs == 0 and pops == 0
   doAssert irq
+for first in [0'u8, 1'u8, 0xFF'u8]:
+  setup()
+  request.macAddr = [first, 0, 0, 0, 0, 0]
+  let before = stations
+  let freeHead = sta_info_env.first
+  doAssert sta_mgmt_register(addr request, addr output) != 0
+  doAssert output == 0xFF and stations == before and
+    sta_info_env.first == freeHead and logs == 0 and pops == 0 and irq
 setup()
 doAssert sta_mgmt_register(nil, addr output) != 0
 doAssert sta_mgmt_register(addr request, nil) != 0
@@ -277,7 +291,7 @@ for badHead in 0 .. 3:
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-@pytest.mark.parametrize("mutation", [None, "port", "request", "vif", "epoch", "active", "output", "callback"])
+@pytest.mark.parametrize("mutation", [None, "port", "request", "vif", "epoch", "active", "output", "callback", "flags"])
 def test_sta_registration(tmp_path: Path, mode: str, mutation: str | None) -> None:
     nim = shutil.which("nim")
     if nim is None:
@@ -301,6 +315,8 @@ def test_sta_registration(tmp_path: Path, mode: str, mutation: str | None) -> No
         callback = body[start:end]
         body = body[:start] + body[end:]
         body = body.replace("  sta.macAddr = req.macAddr", callback + "  sta.macAddr = req.macAddr")
+    elif mutation == "flags":
+        body = body.replace("if (keyPtrs.flags and 16) != 0", "if (vifFlags and 16) != 0")
     layout = (FW / "layout_types.nim").read_text()
     types = "type\n  CoListHdr = object\n    next: ptr CoListHdr\n  CoList = object\n    first, last: ptr CoListHdr\n"
     for name in ["StaInfoView", "StaRxSequenceOverlay", "StaMgmtRegisterParamView"]:

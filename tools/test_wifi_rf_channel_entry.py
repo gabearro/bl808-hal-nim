@@ -88,7 +88,7 @@ proc checkModem(primary, center, kind: uint32) =
     put(0x804, 0x00FFFFFF'u32, 0x19000000)
     put(0x834, 0x00FFFFFF'u32, 0x01000000)
     put(0xB374, 0xFCFFFFFF'u32, 0x03000000)
-    put(0x870, 0x00FFFFFF'u32, 0x01000000)
+    put(0x870, 0xFEFFFFFF'u32, 0x01000000)
     put(0x84C, 0xFDFFFFFF'u32, 0)
     put(0x88C, 0xFFFF00FF'u32, 0x2100)
     for offset in [0xB340, 0xB344, 0xB348]: put(offset, 0, 0)
@@ -144,9 +144,12 @@ def test_phy_entrypoints_have_only_vendor_channel_calls(tmp_path: Path, mode: st
     ).replace(
         "proc pulsePhyChannelRfWindow() = discard",
         'proc pulsePhyChannelRfWindow() = calls.add("extra-pulse")',
-    ).replace(
-        "proc rfc_config_channel(center: uint32) = programmed.add(center)",
-        'proc rfc_config_channel(center: uint32) =\n  programmed.add(center)\n  calls.add("rf-channel")',
+    )
+    channel_stub = "  programmed.add(center)\n  if retuneTypeDuringRfc:"
+    assert code.count(channel_stub) == 1
+    code = code.replace(
+        channel_stub,
+        '  programmed.add(center)\n  calls.add("rf-channel")\n  if retuneTypeDuringRfc:',
     )
     code += "var nimFwDbgPhyInitPhase: uint32\n" + rf_procedure(rf, "phyInitProgramInitialChannel")
     code += f"const Initial = {str(initial).lower()}\n"
@@ -180,13 +183,15 @@ def rfc_source() -> str:
     rf = RF.read_text()
     code = eventful(source(real_io=True)) + r'''
 proc waitRfUs(us: uint32) = events.add((0'u, us))
+proc waitBl808RfcUs(us: uint32) = events.add((5'u, us))
 proc rf_pri_update_param(freq: uint32) = events.add((1'u, freq))
 proc rfPriApplyNotchParam(freq: uint32) = events.add((2'u, freq))
 proc rf_pri_set_channel_pwr_comp(index: uint32) = events.add((3'u, index))
 proc rf_pri_optimize(freq: uint32) = events.add((4'u, freq))
 proc rfPhyTraceCheckpoint(tag: uint32) = discard
 '''
-    return code + rf_procedure(rf, "channelPowerIndex") + rf_procedure(rf, "rfc_config_channel")
+    return (code + rf_procedure(rf, "channelPowerIndex")
+            + rf_procedure(rf, "waitRfRfcUs") + rf_procedure(rf, "rfc_config_channel"))
 
 
 @pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
@@ -207,8 +212,11 @@ for freq in [0'u32, 2412, 2422, 2472, 2484, 5210, high(uint32)]:
     put(0x2C, 0xFFFFFFFF'u32, 0x200)
     put(0x2C, 0xFFFFFFFF'u32, 1)
     put(0x264, 0xFFFFF000'u32, freq and 4095)
+    # BL808 demo rfc.o:rfc_config_channel+0x5e and +0x72.
     put(0x268, 0xFFFDFFFF'u32, 0x20000)
+    trace.add((0'u, 1'u32))
     put(0x268, 0xFFFDFFFF'u32, 0)
+    trace.add((0'u, 1'u32))
     put(0x04, 0xFFFFFFFF'u32, 2)
     trace.add((0'u, 1'u32))
     put(0x26C, 0xFFFFFFF8'u32, 1)
@@ -225,7 +233,7 @@ for freq in [0'u32, 2412, 2422, 2472, 2484, 5210, high(uint32)]:
     trace.add((4'u, freq))
     rfc_config_channel(freq)
     doAssert registerStorage == wanted and events == trace,
-      "RFC channel tune inserted a notch write, extra delay, or wrong strobe"
+      "RFC channel tune strobe, settling delay, or follow-up differs"
 ''')
 
 
@@ -284,7 +292,8 @@ for row in 0 ..< 6:
       let acal = loAcalValues[channel].uint32
       var wanted = before
       wanted[0x30 div 4] = wanted[0x30 div 4] or 0xF00000
-      wanted[0xA0 div 4] = (wanted[0xA0 div 4] and 0xFFC0FF00'u32) or fcal.uint32 or (acal shl 16)
+      wanted[0xA0 div 4] = (wanted[0xA0 div 4] and 0xFFE0FF00'u32) or
+        fcal.uint32 or ((acal and 31) shl 16)
       wanted[0xBC div 4] = (wanted[0xBC div 4] and 0xFF0FFFFF'u32) or ((fcal.uint32 shr 4) shl 20)
       wanted[0xC4 div 4] = (wanted[0xC4 div 4] and 0xC0000000'u32) or VendorDiv[row][channel]
       wanted[0xC0 div 4] = wanted[0xC0 div 4] and 0xFFFFEFFF'u32

@@ -1,0 +1,2245 @@
+name = "zkbuild"
+version = "0.1.0"
+defaultTargets = ["ControlLayoutAgreement", "ControlBodySource", "ControlValueBody", "ControlValueTypes", "ControlValueLanguage", "ControlBodySignatures", "ControlSignatureSpan", "ControlListArity", "ControlActionSequence", "ControlActionGuards", "ControlActionLanguage", "ControlMemberSource", "ControlRoutedMembers", "ControlMemberPositions", "ControlMemberRouting", "ControlHeldLists", "ControlHeadTrace", "ControlSignatureSource", "ControlLookupMask", "ControlSignatureSemanticSound", "ControlMemberLists", "ControlSimpleLists", "ControlSignatureLists", "ControlSignatureHeads", "ControlLengthLists", "ControlFrameMetadata", "ControlLookupMutations", "ControlLookupCheck", "ControlLookupSound", "ControlTypeSource", "ControlTypeSemanticSound", "ControlTypeGuards", "ControlTypeTrace", "ControlTypeState", "ControlTypeMasks", "ControlTypeScalar", "ControlTypeModes", "ControlTypeMutations", "ControlTypeCertificate", "ControlTypeRowImages", "ControlTypeRowCheck", "ControlTypeRowSound", "BranchPlanSource", "BranchValuePlan", "BranchCommonOperands", "BranchOperandRuns", "BranchFloorInvariant", "BranchActionSource", "BranchActionCounters", "BranchActionLayout", "BranchConditionTrace", "BranchActionSequence", "BranchActionAlphabet", "BranchActionLanguage", "BranchTypedOperands", "BranchLabelCarry", "BranchOperandOrder", "BranchOperandSource", "BranchHeadOrigin", "BranchListRead", "IndexedMemberRead", "BranchLabelLists", "BranchSimpleLists", "BranchSimpleHeads", "IndexedSingletonList", "BranchFrameSource", "BranchFrameMetadata", "ZkBuild", "ByteStream", "R1CS", "CircuitShape", "BitPacking", "RowSoundness", "InputNormalization", "RowMatrix", "RowCompleteness", "FullMatrix", "BodySoundness", "BodyCompleteness", "PublicBinding", "HeaderSoundness", "ExactLength", "BinarySoundness", "BinaryCompleteness", "CosetQap", "Blinding", "FftStages", "FftLayout", "FftRadix", "FftSplit", "FftPolynomial", "FftForward", "ScalarRoots", "FftInPlace", "FftCounter", "FftSchedule", "Rv32Encoding", "Rv32Compiler", "SlotShape", "SlotRowSchema", "SlotSelection", "SlotRowSemantics", "SlotImmediate", "SlotBytes", "WasmEncoding", "SlotNative", "SlotEmission", "SlotNativeBinding", "SlotWasm", "SlotCompilation", "SlotRowCompleteness", "SlotWitness", "SlotModuleCompleteness", "SlotCheckedTrace", "SlotCompleteness", "SlotRow", "SlotMatrix", "SlotTrace", "SlotProgram", "NativeAdmission", "ByteCompileShape", "ByteCompileComposition", "ByteCompileQueue", "ByteCompileRow", "ByteCompileDecodeRow", "ByteCompileTransition", "ByteCompileScalarStep", "ByteCompileAccumulator", "ByteCompileEvents", "ByteCompileQueueStep", "ByteCompileDecodeTrace", "ByteCompileSlotBinding", "ByteCompileSoundness", "ByteNativeAdmission", "ByteCompileTyping", "ByteCompileRowComplete", "ByteCompileMerge", "ByteCompileAssembly", "ByteCompileConstructionTrace", "ByteCompileCanonicalRow", "ByteCompileSourceWitness", "ByteCompileBridgeWitness", "ByteCompileCompleteness", "ByteCompileCast", "ByteCompileWitness", "ByteCompileWitnessRefinement", "VerifierCore", "ScalarEncoding", "ScalarWords", "ScalarMontgomery", "WordArithmetic", "FipsMontgomery", "FipsSoundness", "CiosMontgomery", "CiosSoundness", "CiosReference", "WasmNumericTyping", "LookupTree", "PermutationNetwork", "RangeConstraints", "MemoryTrace", "MemoryConstraints", "OperandEvents", "ControlMemory", "ControlEvents", "FunctionEvents", "ControlRefinement", "InstructionSchedule", "NumericEvents", "StaticTyping", "LookupFlow", "StaticEvents", "ReadOnlyMemory", "VariableTyping", "VariableEvents", "SignatureLists", "CallEvents", "IndexedSignatures", "SignatureFrames", "ControlPlans", "RangeReuse", "BranchLists", "BranchPlans", "ParametricEvents", "InstructionMetadata", "BulkContext", "ReferenceContext", "ThrowEvents", "TypeReversals", "CatchTyping", "CatchLists", "NameLists", "LocalRanges", "ModuleContext", "BinarySource", "BinaryEnvelope", "BinaryDeclarations", "InstructionSource", "SourceControl", "PayloadSource", "Sha256", "FlatInstructionSource", "DeclarationProfile", "OwnedStream", "ProvingKeyFile", "ProvenAdmission", "GadgetShape", "GadgetAudit", "ShaWordMatrix", "ShaWordFips", "ShaProgram", "ShaCompression", "ShaBoundary", "ShaPadding", "ShaScalar", "ShaHash", "ShaHashLength", "ShaHashPadding", "ShaHashBlock", "ShaHashSound", "ShaEmbedded", "BinarySourceMatrix", "BinarySourceEmbedded", "PermutationMatrix", "MemoryPacking", "PermutationEmbedded", "MemoryPermutation", "MemoryEvidence", "MemoryRows", "MemoryEmbedded", "BinaryReadMemory", "AuditIO", "RangeUse", "BinaryTokenMatrix", "BinaryTokenEmbedded", "TokenAuditIO", "BinaryTokenSchedule", "BinaryTokenSource", "BinaryTokenBits", "BinaryVariantFields", "BinaryVariantBits", "BinaryVariantFormat", "TokenInteger", "BinaryTokenDecoded", "BinaryTokenSound", "LookupMatrix", "LookupEmbedded", "SectionPolicy", "LookupAuditIO", "EnvelopeMatrix", "EnvelopeAuditIO", "EnvelopeRanges", "EnvelopeChain", "EnvelopeSound", "EnvelopeOrder", "EnvelopeDirectory", "EnvelopePayload", "ReadOnlyMatrix", "ReadOnlySound", "ReadOnlyAuditIO", "ModuleAuditIO", "ModuleTables", "PackedFields", "PackedAuditIO", "DeclarationMatrix", "DeclarationAuditIO", "DeclarationType", "TokenApplications", "DeclarationHeader", "DeclarationVector", "DeclarationSound", "DeclarationStreams", "DeclarationBinding", "DeclarationSelection", "DeclarationOrder", "DeclarationCounts", "DeclarationLocations", "DeclarationCompleteness", "DeclarationSourceVectors", "DeclarationFraming", "IndexedMatrix", "IndexedAuditIO", "IndexedSound", "IndexedCell", "IndexedStep", "IndexedBridge", "IndexedBoundary", "IndexedSource", "IndexedOrientation", "ReadOnlyFacts", "IndexedNodeTable", "IndexedGroups", "IndexedLengths", "IndexedTypeLists", "IndexedLookup", "SourceListSelection", "SourceListHeads", "SourceListLookup", "SourceTypeLists", "SignatureMatrix", "SignatureAuditIO", "SignatureSound", "SignatureNamespace", "SignatureRules", "SignatureDense", "SignatureOrigins", "DeclarationPrefix", "SignatureSource", "SignatureFunctionSource", "SignatureNodes", "SignatureBoundary", "SignatureFunctionComplete", "DeclarationFunctionCoverage", "ImportMatrix", "ImportAuditIO", "ImportSound", "ImportRules", "ImportCounts", "ImportMembers", "ImportRead", "ImportSource", "ImportFunctionBounds", "ImportCoverage", "OwnedMatrix", "OwnedAuditIO", "OwnedSound", "OwnedRules", "OwnedDecode", "OwnedOrder", "OwnedMembership", "OwnedComplete", "OwnedLinks", "OwnedBounds", "OwnedSoundness", "OwnedUnit", "NameFrameMatrix", "NameFrameAuditIO", "NameFrameSound", "NameFrameRules", "NameFrameFlat", "NameFrameLegacy", "NameFrameSource", "NameFrameSoundness", "NameFrameBody", "Utf8Suffix", "NameGraphMatrix", "NameGraphAuditIO", "NameGraphSound", "NameBits", "ReadOnlyInactive", "NameGraphRules", "NameGraphLookup", "NameGraphLinks", "NameGraphTable", "NameGraphStrings", "NameGraphRoots", "NameGraphSoundness", "NameSourceMatrix", "NameSourceAuditIO", "NameSourceSound", "NameSourceRules", "NameSourceNodes", "NameSourceShared", "NameSourceLegacy", "NameSourceHeaders", "NameSourceFlatFacts", "NameSourceLineage", "NameSourceCoverage", "NameSourceEnd", "NameSourceSelect", "NameSourceFlat", "NameSourceSoundness", "NameSourceConsumers", "BinaryTokenSyntax", "NameSourceSyntax", "ConstantSourceMatrix", "ConstantSourceAuditIO", "ConstantSourceSound", "ConstantSourceRules", "ConstantSourceSelection", "ConstantSourceValues", "ConstantSourceModes", "ConstantSourceRead", "ConstantSourceTrace", "ConstantSourceSoundness", "ScalarPayloadMatrix", "ScalarPayloadAuditIO", "ScalarPayloadSound", "ScalarPayloadRules", "ScalarPayloadCounts", "ScalarPayloadRead", "ScalarPayloadSoundness", "ScalarPayloadLimits", "SegmentPayloadMatrix", "SegmentPayloadAuditIO", "SegmentPayloadSound", "SegmentPayloadRead", "SegmentPayloadConstants", "SegmentPayloadSpans", "SegmentPayloadRules", "SegmentPayloadSoundness", "ModuleProgram", "ModuleContextMatrix", "ModuleContextAuditIO", "ModuleProgramSound", "ModuleContextSound", "SourceProgram", "SourceProgramIO", "BodySourceMatrix", "LocalDeclarationMatrix", "LocalRangeMatrix", "BodySourceAuditIO", "BodySourceSound", "SourceProgramSound", "BodySourceTheorems", "BodySourceCommitted", "OpcodeCatalog", "InstructionDecodeMatrix", "InstructionStreamMatrix", "InstructionStreamFlat", "InstructionStreamLegacy", "InstructionStreamCheck", "InstructionSourceAuditIO", "OpcodeCatalogSound", "InstructionSourceSound", "LookupReferenceFast", "StaticLookupMatrix", "StaticLookupFast", "StaticLookupEmbedded", "ValidationEventMatrix", "ValidationParametric", "ValidationEventCheck", "ValidationEventAuditIO", "StaticLookupSound", "ValidationEventSound", "ValidationSourceSound", "DynamicTypingMatrix", "DynamicCallMatrix", "DynamicTypingCheck", "DynamicTypingAuditIO", "DynamicTypingSound", "DynamicTypingSource", "DynamicSelectors", "StructuredMatrix", "StructuredFrames", "StructuredTyping", "StructuredBranches", "StructuredMerge", "StructuredCatches", "StructuredExceptions", "StructuredCheck", "StructuredAuditIO", "StructuredSound", "StructuredSource", "StructuredOrigins", "StructuredMergeSound", "RuntimeContextMatrix", "RuntimeContextCheck", "RuntimeContextAuditIO", "RuntimeContextSound", "RuntimeContextSource", "RuntimeContextOrigins", "SourceProgramSemantics", "EventSelectors", "OperandRowCheck", "OperandRowSound", "OperandTraceSound", "OperandMemorySound", "OperandCertificate", "OperandSourceSound", "ControlRowCheck", "ControlRowSound", "ControlCertificate", "ControlTraceSound", "FunctionTraceSound", "ControlSourceSound", "ControlAddressBounds", "ControlMemorySound", "EventSemanticSound", "ControlRefinementBridge", "OperandRepresentationUnique", "ControlLifoTrace", "EventSemanticLifo", "InstructionRowCheck", "InstructionRowSound", "InstructionCounts", "InstructionStaticSound", "InstructionCertificate", "InstructionTraceSound", "StaticTypingBounds", "StaticEventSpec", "InstructionSemanticSound", "InstructionSemanticSource", "OperandStackRefinement", "OperandStackTrace", "OperandStackCertificate", "VariableRowCheck", "VariableRowSound", "VariableRuleFields", "VariableSelectorFields", "VariableRuleImageSound", "VariableCertificate", "VariableCountTrace", "EnvironmentRowCheck", "EnvironmentRowSound", "VariableSelectorCheck", "VariableSemanticCheck", "EnvironmentTraceSound", "VariableEventSpec", "VariableSemanticSound", "EnvironmentAccessSound", "EnvironmentOriginSound", "VariableSignatureTrace", "VariableSemanticSource", "InstructionSpans", "InstructionSpanState", "StaticInstructionBody", "VariableInstructionBody", "InstructionBodies", "InstructionBodySource", "InstructionBodyDecision", "InstructionPartition", "CallRowCheck", "CallRowSound", "CallMode", "CallRowEquations", "CallState", "CallTransition", "CallCertificate", "CallTraceSound", "CallGuardSound", "CallSemanticSound", "CallSemanticSource", "CallNodeSource", "SharedNodeRead", "CallReadSound", "CallBodyRun", "CallReadTrace", "CallInstructionBody", "SignatureTypeSource", "CallHeadSource", "CallBodySource", "CallBodyDecision", "FunctionMetadataOrigin", "FunctionMetadataBytes", "CallRootTrace", "CallEntrySource", "CallRootSource", "CallTableSource", "CallSignatureBody", "CallFunctionSource", "CallRuntimeSource", "CallRuntimeDecision", "ParametricRowCheck", "ParametricRowSound", "ParametricMode", "ParametricCertificate", "ParametricBegin", "ParametricState", "ParametricTransition", "ParametricTraceSound", "ParametricGuardCounts", "ParametricGuardTypes", "ParametricBodyRun", "ParametricSemanticSound", "ParametricInstructionBody", "ParametricSourceSound", "ParametricBodySpec", "BranchRowCheck", "BranchRowSound", "BranchRowImages", "BranchCertificate", "BranchStep", "BranchListCheck", "BranchListSound", "BranchStore", "BranchTraceSound", "BranchHeadSound", "BranchInstructionBody", "BranchComplete", "BranchOrigins", "BranchSourceSound", "BranchLastMarker", "BranchTypeRowCheck", "BranchTypeRowSound", "BranchTypeRowImages", "InactiveAddress", "BranchMergeCheck", "BranchMergeSound", "BranchTypeCertificate", "BranchLookupCheck", "BranchLookupSound", "BranchTypeScalar", "BranchTypeScratch", "MemoryPriorWrite", "BranchScratchTrace", "BranchTypeMutations", "BranchTypeSound", "BranchTypeSource", "BranchMemberTag", "BranchTypePending", "BranchTypeData", "BranchTypeState", "BranchTypeTrace", "BranchTypeGuards", "BranchTypeSemanticSound", "BranchTypeRestoration", "BranchTypeArity", "BranchTypeBehavior", "FrameRowCheck", "FrameRowSound", "FrameRowImages", "FrameDescriptor", "FrameAccessSound", "FrameOpcodes", "FrameCertificate", "FrameMutations", "FrameMemorySound", "FrameSound", "ControlDepthTrace", "FrameSelectors", "FrameDepthCheck", "FrameTokenStack", "FrameTargetSound", "FrameDepthMutations", "FrameTraceMemory", "FrameReadSource", "FrameLifoSound", "FrameBlockEncoding", "FramePadTrace", "FrameWriteValue", "InstructionEventCheck", "InstructionEventSound", "InstructionInfoCheck", "InstructionInfoSound", "FrameInstructionSource", "InstructionEventMutations", "FramePadOrigin", "FrameSignatureSource"]
+
+[[lean_lib]]
+name = "ZkBuild"
+
+[[lean_lib]]
+name = "ByteStream"
+
+[[lean_lib]]
+name = "R1CS"
+
+[[lean_lib]]
+name = "CircuitShape"
+
+[[lean_lib]]
+name = "BitPacking"
+
+[[lean_lib]]
+name = "RowSoundness"
+
+[[lean_lib]]
+name = "InputNormalization"
+
+[[lean_lib]]
+name = "RowMatrix"
+
+[[lean_lib]]
+name = "RowCompleteness"
+
+[[lean_lib]]
+name = "FullMatrix"
+
+[[lean_lib]]
+name = "BodySoundness"
+
+[[lean_lib]]
+name = "BodyCompleteness"
+
+[[lean_lib]]
+name = "PublicBinding"
+
+[[lean_lib]]
+name = "HeaderSoundness"
+
+[[lean_lib]]
+name = "ExactLength"
+
+[[lean_lib]]
+name = "BinarySoundness"
+
+[[lean_lib]]
+name = "BinaryCompleteness"
+
+[[lean_lib]]
+name = "CosetQap"
+
+[[lean_lib]]
+name = "Blinding"
+
+[[lean_lib]]
+name = "FftStages"
+
+[[lean_lib]]
+name = "FftLayout"
+
+[[lean_lib]]
+name = "FftRadix"
+
+[[lean_lib]]
+name = "FftSplit"
+
+[[lean_lib]]
+name = "FftPolynomial"
+
+[[lean_lib]]
+name = "FftForward"
+
+[[lean_lib]]
+name = "ScalarRoots"
+
+[[lean_lib]]
+name = "FftInPlace"
+
+[[lean_lib]]
+name = "FftCounter"
+
+[[lean_lib]]
+name = "FftSchedule"
+
+[[lean_lib]]
+name = "Rv32Encoding"
+
+[[lean_lib]]
+name = "Rv32Compiler"
+
+[[lean_lib]]
+name = "SlotShape"
+
+[[lean_lib]]
+name = "SlotRow"
+
+[[lean_lib]]
+name = "SlotRowSchema"
+
+[[lean_lib]]
+name = "SlotSelection"
+
+[[lean_lib]]
+name = "SlotRowSemantics"
+
+[[lean_lib]]
+name = "SlotImmediate"
+
+[[lean_lib]]
+name = "SlotBytes"
+
+[[lean_lib]]
+name = "WasmEncoding"
+
+[[lean_lib]]
+name = "SlotNative"
+
+[[lean_lib]]
+name = "SlotEmission"
+
+[[lean_lib]]
+name = "SlotNativeBinding"
+
+[[lean_lib]]
+name = "SlotWasm"
+
+[[lean_lib]]
+name = "SlotCompilation"
+
+[[lean_lib]]
+name = "NativeAdmission"
+
+[[lean_lib]]
+name = "ByteCompileShape"
+
+[[lean_lib]]
+name = "ByteCompileComposition"
+
+[[lean_lib]]
+name = "ByteCompileQueue"
+
+[[lean_lib]]
+name = "ByteCompileRow"
+
+[[lean_lib]]
+name = "ByteCompileDecodeRow"
+
+[[lean_lib]]
+name = "ByteCompileTransition"
+
+[[lean_lib]]
+name = "ByteCompileScalarStep"
+
+[[lean_lib]]
+name = "ByteCompileAccumulator"
+
+[[lean_lib]]
+name = "ByteCompileEvents"
+
+[[lean_lib]]
+name = "ByteCompileQueueStep"
+
+[[lean_lib]]
+name = "ByteCompileDecodeTrace"
+
+[[lean_lib]]
+name = "ByteCompileSlotBinding"
+
+[[lean_lib]]
+name = "ByteCompileSoundness"
+
+[[lean_lib]]
+name = "ByteNativeAdmission"
+
+[[lean_lib]]
+name = "ByteCompileTyping"
+
+[[lean_lib]]
+name = "ByteCompileRowComplete"
+
+[[lean_lib]]
+name = "ByteCompileMerge"
+
+[[lean_lib]]
+name = "ByteCompileAssembly"
+
+[[lean_lib]]
+name = "ByteCompileConstructionTrace"
+
+[[lean_lib]]
+name = "ByteCompileCanonicalRow"
+
+[[lean_lib]]
+name = "ByteCompileSourceWitness"
+
+[[lean_lib]]
+name = "ByteCompileBridgeWitness"
+
+[[lean_lib]]
+name = "ByteCompileCompleteness"
+
+[[lean_lib]]
+name = "ByteCompileCast"
+
+[[lean_lib]]
+name = "ByteCompileWitnessRefinement"
+
+[[lean_lib]]
+name = "ByteCompileWitness"
+
+[[lean_lib]]
+name = "SlotRowCompleteness"
+
+[[lean_lib]]
+name = "SlotWitness"
+
+[[lean_lib]]
+name = "SlotModuleCompleteness"
+
+[[lean_lib]]
+name = "SlotCheckedTrace"
+
+[[lean_lib]]
+name = "SlotCompleteness"
+
+[[lean_lib]]
+name = "SlotMatrix"
+
+[[lean_lib]]
+name = "SlotTrace"
+
+[[lean_lib]]
+name = "SlotProgram"
+
+[[lean_exe]]
+name = "export_rows"
+root = "ExportRows"
+
+[[lean_exe]]
+name = "check_circuit"
+root = "CheckCircuit"
+
+[[lean_exe]]
+name = "export_witness"
+root = "ExportWitness"
+
+[[lean_exe]]
+name = "export_fft"
+root = "ExportFft"
+
+[[lean_exe]]
+name = "export_compiler"
+root = "ExportCompiler"
+
+[[lean_exe]]
+name = "export_slot_witness"
+root = "ExportSlotWitness"
+
+[[lean_exe]]
+name = "export_compile_witness"
+root = "ExportCompileWitness"
+
+[[lean_exe]]
+name = "export_byte_decoder"
+root = "ExportByteDecoder"
+
+[[lean_exe]]
+name = "export_byte_compile_witness"
+root = "ExportByteCompileWitness"
+
+[[lean_lib]]
+name = "VerifierCore"
+
+[[lean_exe]]
+name = "export_verifier_core"
+root = "ExportVerifierCore"
+
+[[lean_lib]]
+name = "ScalarEncoding"
+
+[[lean_exe]]
+name = "export_scalar_encoding"
+root = "ExportScalarEncoding"
+
+[[lean_lib]]
+name = "ScalarWords"
+
+[[lean_lib]]
+name = "ScalarMontgomery"
+
+[[lean_lib]]
+name = "WordArithmetic"
+
+[[lean_exe]]
+name = "export_word_arithmetic"
+root = "ExportWordArithmetic"
+
+[[lean_lib]]
+name = "FipsMontgomery"
+
+[[lean_exe]]
+name = "export_fips_montgomery"
+root = "ExportFipsMontgomery"
+
+[[lean_lib]]
+name = "FipsSoundness"
+
+[[lean_lib]]
+name = "CiosMontgomery"
+
+[[lean_lib]]
+name = "CiosSoundness"
+
+[[lean_exe]]
+name = "export_cios_montgomery"
+root = "ExportCiosMontgomery"
+
+[[lean_lib]]
+name = "CiosReference"
+
+[[lean_lib]]
+name = "WasmNumericTyping"
+
+[[lean_exe]]
+name = "export_wasm_numeric_typing"
+root = "ExportWasmNumericTyping"
+
+[[lean_lib]]
+name = "LookupTree"
+
+[[lean_lib]]
+name = "PermutationNetwork"
+
+[[lean_lib]]
+name = "RangeConstraints"
+
+[[lean_lib]]
+name = "MemoryTrace"
+
+[[lean_lib]]
+name = "MemoryConstraints"
+
+[[lean_lib]]
+name = "OperandEvents"
+
+[[lean_lib]]
+name = "ControlMemory"
+
+[[lean_lib]]
+name = "ControlEvents"
+
+[[lean_lib]]
+name = "FunctionEvents"
+
+[[lean_lib]]
+name = "ControlRefinement"
+
+[[lean_lib]]
+name = "InstructionSchedule"
+
+[[lean_lib]]
+name = "NumericEvents"
+
+[[lean_lib]]
+name = "StaticTyping"
+
+[[lean_exe]]
+name = "export_static_typing"
+root = "ExportStaticTyping"
+
+[[lean_lib]]
+name = "LookupFlow"
+
+[[lean_lib]]
+name = "StaticEvents"
+
+[[lean_lib]]
+name = "ReadOnlyMemory"
+
+[[lean_lib]]
+name = "VariableTyping"
+
+[[lean_exe]]
+name = "export_variable_typing"
+root = "ExportVariableTyping"
+
+[[lean_lib]]
+name = "VariableEvents"
+
+[[lean_lib]]
+name = "SignatureLists"
+
+[[lean_lib]]
+name = "CallEvents"
+
+[[lean_exe]]
+name = "export_call_typing"
+root = "ExportCallTyping"
+
+[[lean_lib]]
+name = "IndexedSignatures"
+
+[[lean_lib]]
+name = "SignatureFrames"
+
+[[lean_lib]]
+name = "ControlPlans"
+
+[[lean_exe]]
+name = "check_control_plans"
+root = "CheckControlPlans"
+
+[[lean_lib]]
+name = "RangeReuse"
+
+[[lean_lib]]
+name = "BranchLists"
+
+[[lean_lib]]
+name = "BranchPlans"
+
+[[lean_exe]]
+name = "check_branch_plans"
+root = "CheckBranchPlans"
+
+[[lean_lib]]
+name = "ParametricEvents"
+
+[[lean_exe]]
+name = "check_parametric_plans"
+root = "CheckParametricPlans"
+
+[[lean_lib]]
+name = "InstructionMetadata"
+
+[[lean_exe]]
+name = "export_instruction_metadata"
+root = "ExportInstructionMetadata"
+
+[[lean_lib]]
+name = "BulkContext"
+
+[[lean_exe]]
+name = "export_bulk_context"
+root = "ExportBulkContext"
+
+[[lean_lib]]
+name = "ReferenceContext"
+
+[[lean_exe]]
+name = "export_reference_context"
+root = "ExportReferenceContext"
+
+[[lean_lib]]
+name = "ThrowEvents"
+
+[[lean_exe]]
+name = "export_throw_events"
+root = "ExportThrowEvents"
+
+[[lean_lib]]
+name = "TypeReversals"
+
+[[lean_lib]]
+name = "CatchTyping"
+
+[[lean_lib]]
+name = "CatchLists"
+
+[[lean_exe]]
+name = "export_catch_typing"
+root = "ExportCatchTyping"
+
+[[lean_lib]]
+name = "NameLists"
+
+[[lean_lib]]
+name = "LocalRanges"
+
+[[lean_lib]]
+name = "ModuleContext"
+
+[[lean_lib]]
+name = "BinarySource"
+
+[[lean_lib]]
+name = "BinaryEnvelope"
+
+[[lean_lib]]
+name = "BinaryDeclarations"
+
+[[lean_lib]]
+name = "InstructionSource"
+
+[[lean_lib]]
+name = "SourceControl"
+
+[[lean_lib]]
+name = "PayloadSource"
+
+[[lean_lib]]
+name = "Sha256"
+
+[[lean_lib]]
+name = "FlatInstructionSource"
+
+[[lean_lib]]
+name = "DeclarationProfile"
+
+[[lean_lib]]
+name = "OwnedStream"
+
+[[lean_lib]]
+name = "ProvingKeyFile"
+
+[[lean_lib]]
+name = "ProvenAdmission"
+
+[[lean_lib]]
+name = "GadgetShape"
+
+[[lean_exe]]
+name = "check_gadget_shapes"
+root = "CheckGadgetShapes"
+
+[[lean_lib]]
+name = "GadgetAudit"
+
+[[lean_exe]]
+name = "check_gadget_audit"
+root = "CheckGadgetAudit"
+
+[[lean_lib]]
+name = "ShaWordMatrix"
+
+[[lean_lib]]
+name = "ShaWordFips"
+
+[[lean_exe]]
+name = "check_sha_words"
+root = "CheckShaWords"
+
+[[lean_lib]]
+name = "ShaProgram"
+
+[[lean_lib]]
+name = "ShaCompression"
+
+[[lean_exe]]
+name = "check_sha_compression"
+root = "CheckShaCompression"
+
+[[lean_lib]]
+name = "ShaBoundary"
+
+[[lean_exe]]
+name = "check_sha_boundaries"
+root = "CheckShaBoundaries"
+
+[[lean_lib]]
+name = "ShaPadding"
+
+[[lean_lib]]
+name = "ShaScalar"
+
+[[lean_lib]]
+name = "ShaHash"
+
+[[lean_exe]]
+name = "check_sha_hash"
+root = "CheckShaHash"
+
+[[lean_lib]]
+name = "ShaHashLength"
+
+[[lean_lib]]
+name = "ShaHashPadding"
+
+[[lean_lib]]
+name = "ShaHashBlock"
+
+[[lean_lib]]
+name = "ShaHashSound"
+
+[[lean_lib]]
+name = "ShaEmbedded"
+
+[[lean_exe]]
+name = "check_sha_embedded"
+root = "CheckShaEmbedded"
+
+[[lean_lib]]
+name = "BinarySourceMatrix"
+
+[[lean_lib]]
+name = "BinarySourceEmbedded"
+
+[[lean_exe]]
+name = "check_source_hash"
+root = "CheckSourceHash"
+
+[[lean_lib]]
+name = "PermutationMatrix"
+
+[[lean_lib]]
+name = "MemoryPacking"
+
+[[lean_lib]]
+name = "PermutationEmbedded"
+
+[[lean_exe]]
+name = "check_permutation_audit"
+root = "CheckPermutationAudit"
+
+[[lean_exe]]
+name = "check_memory_layout"
+root = "CheckMemoryLayout"
+
+[[lean_lib]]
+name = "MemoryPermutation"
+
+[[lean_lib]]
+name = "MemoryEvidence"
+
+[[lean_lib]]
+name = "MemoryRows"
+
+[[lean_lib]]
+name = "MemoryEmbedded"
+
+[[lean_exe]]
+name = "check_memory_audit"
+root = "CheckMemoryAudit"
+
+[[lean_lib]]
+name = "BinaryReadMemory"
+
+[[lean_lib]]
+name = "AuditIO"
+
+[[lean_exe]]
+name = "check_byte_memory"
+root = "CheckByteMemory"
+
+[[lean_lib]]
+name = "RangeUse"
+
+[[lean_lib]]
+name = "BinaryTokenMatrix"
+
+[[lean_lib]]
+name = "BinaryTokenEmbedded"
+
+[[lean_lib]]
+name = "TokenAuditIO"
+
+[[lean_exe]]
+name = "check_tokens"
+root = "CheckTokens"
+
+[[lean_lib]]
+name = "BinaryTokenSchedule"
+
+[[lean_lib]]
+name = "BinaryTokenSource"
+
+[[lean_lib]]
+name = "BinaryTokenBits"
+
+[[lean_lib]]
+name = "BinaryVariantFields"
+
+[[lean_lib]]
+name = "BinaryVariantBits"
+
+[[lean_lib]]
+name = "BinaryVariantFormat"
+
+[[lean_lib]]
+name = "TokenInteger"
+
+[[lean_lib]]
+name = "BinaryTokenDecoded"
+
+[[lean_lib]]
+name = "BinaryTokenSound"
+
+[[lean_exe]]
+name = "export_token_decode"
+root = "ExportTokenDecode"
+
+[[lean_lib]]
+name = "LookupMatrix"
+
+[[lean_lib]]
+name = "LookupEmbedded"
+
+[[lean_lib]]
+name = "SectionPolicy"
+
+[[lean_lib]]
+name = "LookupAuditIO"
+
+[[lean_exe]]
+name = "check_lookup"
+root = "CheckLookup"
+
+[[lean_lib]]
+name = "EnvelopeMatrix"
+
+[[lean_lib]]
+name = "EnvelopeAuditIO"
+
+[[lean_exe]]
+name = "check_envelope"
+root = "CheckEnvelope"
+
+[[lean_lib]]
+name = "EnvelopeRanges"
+
+[[lean_lib]]
+name = "EnvelopeChain"
+
+[[lean_lib]]
+name = "EnvelopeSound"
+
+[[lean_lib]]
+name = "EnvelopeOrder"
+
+[[lean_lib]]
+name = "EnvelopeDirectory"
+
+[[lean_lib]]
+name = "EnvelopePayload"
+
+[[lean_lib]]
+name = "ReadOnlyMatrix"
+
+[[lean_lib]]
+name = "ReadOnlySound"
+
+[[lean_lib]]
+name = "ReadOnlyAuditIO"
+
+[[lean_exe]]
+name = "check_readonly"
+root = "CheckReadOnly"
+
+[[lean_lib]]
+name = "ModuleAuditIO"
+
+[[lean_lib]]
+name = "ModuleTables"
+
+[[lean_exe]]
+name = "check_module_tables"
+root = "CheckModuleTables"
+
+[[lean_lib]]
+name = "PackedFields"
+
+[[lean_lib]]
+name = "PackedAuditIO"
+
+[[lean_exe]]
+name = "check_packed"
+root = "CheckPacked"
+
+[[lean_lib]]
+name = "DeclarationMatrix"
+
+[[lean_lib]]
+name = "DeclarationAuditIO"
+
+[[lean_exe]]
+name = "check_declarations"
+root = "CheckDeclarations"
+
+[[lean_lib]]
+name = "DeclarationType"
+
+[[lean_lib]]
+name = "TokenApplications"
+
+[[lean_lib]]
+name = "DeclarationHeader"
+
+[[lean_lib]]
+name = "DeclarationVector"
+
+[[lean_lib]]
+name = "DeclarationSound"
+
+[[lean_lib]]
+name = "DeclarationStreams"
+
+[[lean_lib]]
+name = "DeclarationBinding"
+
+[[lean_lib]]
+name = "DeclarationSelection"
+
+[[lean_lib]]
+name = "DeclarationOrder"
+
+[[lean_lib]]
+name = "DeclarationCounts"
+
+[[lean_lib]]
+name = "DeclarationLocations"
+
+[[lean_lib]]
+name = "DeclarationCompleteness"
+
+[[lean_lib]]
+name = "DeclarationSourceVectors"
+
+[[lean_lib]]
+name = "DeclarationFraming"
+
+[[lean_lib]]
+name = "IndexedMatrix"
+
+[[lean_lib]]
+name = "IndexedAuditIO"
+
+[[lean_lib]]
+name = "IndexedSound"
+
+[[lean_exe]]
+name = "check_indexed"
+root = "CheckIndexed"
+
+[[lean_lib]]
+name = "IndexedCell"
+
+[[lean_lib]]
+name = "IndexedStep"
+
+[[lean_lib]]
+name = "IndexedBridge"
+
+[[lean_lib]]
+name = "IndexedBoundary"
+
+[[lean_lib]]
+name = "IndexedSource"
+
+[[lean_lib]]
+name = "IndexedOrientation"
+
+[[lean_lib]]
+name = "ReadOnlyFacts"
+
+[[lean_lib]]
+name = "IndexedNodeTable"
+
+[[lean_lib]]
+name = "IndexedGroups"
+
+[[lean_lib]]
+name = "IndexedLengths"
+
+[[lean_lib]]
+name = "IndexedTypeLists"
+
+[[lean_lib]]
+name = "IndexedLookup"
+
+[[lean_lib]]
+name = "SourceListSelection"
+
+[[lean_lib]]
+name = "SourceListHeads"
+
+[[lean_lib]]
+name = "SourceListLookup"
+
+[[lean_lib]]
+name = "SourceTypeLists"
+
+[[lean_lib]]
+name = "SignatureMatrix"
+
+[[lean_lib]]
+name = "SignatureAuditIO"
+
+[[lean_lib]]
+name = "SignatureSound"
+
+[[lean_exe]]
+name = "check_signatures"
+root = "CheckSignatures"
+
+[[lean_lib]]
+name = "SignatureNamespace"
+
+[[lean_lib]]
+name = "SignatureRules"
+
+[[lean_lib]]
+name = "SignatureDense"
+
+[[lean_lib]]
+name = "SignatureOrigins"
+
+[[lean_lib]]
+name = "DeclarationPrefix"
+
+[[lean_lib]]
+name = "SignatureSource"
+
+[[lean_lib]]
+name = "SignatureFunctionSource"
+
+[[lean_lib]]
+name = "SignatureNodes"
+
+[[lean_lib]]
+name = "SignatureBoundary"
+
+[[lean_lib]]
+name = "SignatureFunctionComplete"
+
+[[lean_lib]]
+name = "DeclarationFunctionCoverage"
+
+[[lean_lib]]
+name = "ImportMatrix"
+
+[[lean_lib]]
+name = "ImportAuditIO"
+
+[[lean_lib]]
+name = "ImportSound"
+
+[[lean_exe]]
+name = "check_imports"
+root = "CheckImports"
+
+[[lean_lib]]
+name = "ImportRules"
+
+[[lean_lib]]
+name = "ImportCounts"
+
+[[lean_lib]]
+name = "ImportMembers"
+
+[[lean_lib]]
+name = "ImportRead"
+
+[[lean_lib]]
+name = "ImportSource"
+
+[[lean_lib]]
+name = "ImportFunctionBounds"
+
+[[lean_lib]]
+name = "ImportCoverage"
+
+[[lean_lib]]
+name = "OwnedMatrix"
+
+[[lean_lib]]
+name = "OwnedAuditIO"
+
+[[lean_lib]]
+name = "OwnedSound"
+
+[[lean_exe]]
+name = "check_owned"
+root = "CheckOwned"
+
+[[lean_exe]]
+name = "check_owned_fragment"
+root = "CheckOwnedFragment"
+
+[[lean_lib]]
+name = "OwnedRules"
+
+[[lean_lib]]
+name = "OwnedDecode"
+
+[[lean_lib]]
+name = "OwnedOrder"
+
+[[lean_lib]]
+name = "OwnedMembership"
+
+[[lean_lib]]
+name = "OwnedComplete"
+
+[[lean_lib]]
+name = "OwnedLinks"
+
+[[lean_lib]]
+name = "OwnedBounds"
+
+[[lean_lib]]
+name = "OwnedSoundness"
+
+[[lean_lib]]
+name = "OwnedUnit"
+
+[[lean_lib]]
+name = "NameFrameMatrix"
+
+[[lean_lib]]
+name = "NameFrameAuditIO"
+
+[[lean_lib]]
+name = "NameFrameSound"
+
+[[lean_exe]]
+name = "check_name_frames"
+root = "CheckNameFrames"
+
+[[lean_lib]]
+name = "NameFrameRules"
+
+[[lean_lib]]
+name = "NameFrameFlat"
+
+[[lean_lib]]
+name = "NameFrameLegacy"
+
+[[lean_lib]]
+name = "NameFrameSource"
+
+[[lean_lib]]
+name = "NameFrameSoundness"
+
+[[lean_lib]]
+name = "NameFrameBody"
+
+[[lean_lib]]
+name = "Utf8Suffix"
+
+[[lean_lib]]
+name = "NameGraphMatrix"
+
+[[lean_lib]]
+name = "NameGraphAuditIO"
+
+[[lean_lib]]
+name = "NameGraphSound"
+
+[[lean_exe]]
+name = "check_name_graph"
+root = "CheckNameGraph"
+
+[[lean_exe]]
+name = "check_name_graph_fragment"
+root = "CheckNameGraphFragment"
+
+[[lean_lib]]
+name = "NameBits"
+
+[[lean_lib]]
+name = "ReadOnlyInactive"
+
+[[lean_lib]]
+name = "NameGraphRules"
+
+[[lean_lib]]
+name = "NameGraphLookup"
+
+[[lean_lib]]
+name = "NameGraphLinks"
+
+[[lean_lib]]
+name = "NameGraphTable"
+
+[[lean_lib]]
+name = "NameGraphStrings"
+
+[[lean_lib]]
+name = "NameGraphRoots"
+
+[[lean_lib]]
+name = "NameGraphSoundness"
+
+[[lean_lib]]
+name = "NameSourceMatrix"
+
+[[lean_lib]]
+name = "NameSourceAuditIO"
+
+[[lean_lib]]
+name = "NameSourceSound"
+
+[[lean_exe]]
+name = "check_name_source"
+root = "CheckNameSource"
+
+[[lean_lib]]
+name = "NameSourceRules"
+
+[[lean_lib]]
+name = "NameSourceNodes"
+
+[[lean_lib]]
+name = "NameSourceShared"
+
+[[lean_lib]]
+name = "NameSourceLegacy"
+
+[[lean_lib]]
+name = "NameSourceHeaders"
+
+[[lean_lib]]
+name = "NameSourceFlatFacts"
+
+[[lean_lib]]
+name = "NameSourceLineage"
+
+[[lean_lib]]
+name = "NameSourceCoverage"
+
+[[lean_lib]]
+name = "NameSourceEnd"
+
+[[lean_lib]]
+name = "NameSourceSelect"
+
+[[lean_lib]]
+name = "NameSourceFlat"
+
+[[lean_lib]]
+name = "NameSourceSoundness"
+
+[[lean_lib]]
+name = "NameSourceConsumers"
+
+[[lean_lib]]
+name = "BinaryTokenSyntax"
+
+[[lean_lib]]
+name = "NameSourceSyntax"
+
+[[lean_lib]]
+name = "ConstantSourceMatrix"
+
+[[lean_lib]]
+name = "ConstantSourceAuditIO"
+
+[[lean_lib]]
+name = "ConstantSourceSound"
+
+[[lean_exe]]
+name = "check_constant_source"
+root = "CheckConstantSource"
+
+[[lean_lib]]
+name = "ConstantSourceRules"
+
+[[lean_lib]]
+name = "ConstantSourceSelection"
+
+[[lean_lib]]
+name = "ConstantSourceValues"
+
+[[lean_lib]]
+name = "ConstantSourceModes"
+
+[[lean_lib]]
+name = "ConstantSourceRead"
+
+[[lean_lib]]
+name = "ConstantSourceTrace"
+
+[[lean_lib]]
+name = "ConstantSourceSoundness"
+
+[[lean_lib]]
+name = "ScalarPayloadMatrix"
+
+[[lean_lib]]
+name = "ScalarPayloadAuditIO"
+
+[[lean_lib]]
+name = "ScalarPayloadSound"
+
+[[lean_exe]]
+name = "check_scalar_payload"
+root = "CheckScalarPayload"
+
+[[lean_lib]]
+name = "ScalarPayloadRules"
+
+[[lean_lib]]
+name = "ScalarPayloadCounts"
+
+[[lean_lib]]
+name = "ScalarPayloadRead"
+
+[[lean_lib]]
+name = "ScalarPayloadSoundness"
+
+[[lean_lib]]
+name = "ScalarPayloadLimits"
+
+[[lean_lib]]
+name = "SegmentPayloadMatrix"
+
+[[lean_lib]]
+name = "SegmentPayloadAuditIO"
+
+[[lean_lib]]
+name = "SegmentPayloadSound"
+
+[[lean_exe]]
+name = "check_segment_payload"
+root = "CheckSegmentPayload"
+
+[[lean_lib]]
+name = "SegmentPayloadRead"
+
+[[lean_lib]]
+name = "SegmentPayloadConstants"
+
+[[lean_lib]]
+name = "SegmentPayloadSpans"
+
+[[lean_lib]]
+name = "SegmentPayloadRules"
+
+[[lean_lib]]
+name = "SegmentPayloadSoundness"
+
+[[lean_lib]]
+name = "ModuleProgram"
+
+[[lean_lib]]
+name = "ModuleContextMatrix"
+
+[[lean_lib]]
+name = "ModuleContextAuditIO"
+
+[[lean_exe]]
+name = "check_module_context"
+root = "CheckModuleContext"
+
+[[lean_lib]]
+name = "ModuleProgramSound"
+
+[[lean_lib]]
+name = "ModuleContextSound"
+
+[[lean_lib]]
+name = "SourceProgram"
+
+[[lean_lib]]
+name = "SourceProgramIO"
+
+[[lean_lib]]
+name = "BodySourceMatrix"
+
+[[lean_lib]]
+name = "LocalDeclarationMatrix"
+
+[[lean_lib]]
+name = "LocalRangeMatrix"
+
+[[lean_lib]]
+name = "BodySourceAuditIO"
+
+[[lean_lib]]
+name = "BodySourceSound"
+
+[[lean_exe]]
+name = "check_body_source"
+root = "CheckBodySource"
+
+[[lean_lib]]
+name = "SourceProgramSound"
+
+[[lean_lib]]
+name = "BodySourceTheorems"
+
+[[lean_lib]]
+name = "BodySourceCommitted"
+
+[[lean_lib]]
+name = "OpcodeCatalog"
+
+[[lean_lib]]
+name = "InstructionDecodeMatrix"
+
+[[lean_lib]]
+name = "InstructionStreamMatrix"
+
+[[lean_lib]]
+name = "InstructionStreamFlat"
+
+[[lean_lib]]
+name = "InstructionStreamLegacy"
+
+[[lean_lib]]
+name = "InstructionStreamCheck"
+
+[[lean_lib]]
+name = "InstructionSourceAuditIO"
+
+[[lean_exe]]
+name = "check_instruction_source"
+root = "CheckInstructionSource"
+
+[[lean_lib]]
+name = "OpcodeCatalogSound"
+
+[[lean_lib]]
+name = "InstructionSourceSound"
+
+[[lean_lib]]
+name = "LookupReferenceFast"
+
+[[lean_lib]]
+name = "StaticLookupMatrix"
+
+[[lean_lib]]
+name = "StaticLookupFast"
+
+[[lean_lib]]
+name = "StaticLookupEmbedded"
+
+[[lean_lib]]
+name = "ValidationEventMatrix"
+
+[[lean_lib]]
+name = "ValidationParametric"
+
+[[lean_lib]]
+name = "ValidationEventCheck"
+
+[[lean_lib]]
+name = "ValidationEventAuditIO"
+
+[[lean_exe]]
+name = "check_validation_events"
+root = "CheckValidationEvents"
+
+[[lean_lib]]
+name = "StaticLookupSound"
+
+[[lean_lib]]
+name = "ValidationEventSound"
+
+[[lean_lib]]
+name = "ValidationSourceSound"
+
+[[lean_lib]]
+name = "DynamicTypingMatrix"
+
+[[lean_lib]]
+name = "DynamicCallMatrix"
+
+[[lean_lib]]
+name = "DynamicTypingCheck"
+
+[[lean_lib]]
+name = "DynamicTypingAuditIO"
+
+[[lean_exe]]
+name = "check_dynamic_typing"
+root = "CheckDynamicTyping"
+
+[[lean_lib]]
+name = "DynamicTypingSound"
+
+[[lean_lib]]
+name = "DynamicTypingSource"
+
+[[lean_lib]]
+name = "DynamicSelectors"
+
+[[lean_lib]]
+name = "StructuredMatrix"
+
+[[lean_lib]]
+name = "StructuredFrames"
+
+[[lean_lib]]
+name = "StructuredTyping"
+
+[[lean_lib]]
+name = "StructuredBranches"
+
+[[lean_lib]]
+name = "StructuredMerge"
+
+[[lean_lib]]
+name = "StructuredCatches"
+
+[[lean_lib]]
+name = "StructuredCheck"
+
+[[lean_lib]]
+name = "StructuredAuditIO"
+
+[[lean_exe]]
+name = "check_structured_control"
+root = "CheckStructuredControl"
+
+[[lean_lib]]
+name = "StructuredExceptions"
+
+[[lean_lib]]
+name = "StructuredSound"
+
+[[lean_lib]]
+name = "StructuredSource"
+
+[[lean_lib]]
+name = "StructuredOrigins"
+
+[[lean_lib]]
+name = "StructuredMergeSound"
+
+[[lean_lib]]
+name = "RuntimeContextMatrix"
+
+[[lean_lib]]
+name = "RuntimeContextCheck"
+
+[[lean_lib]]
+name = "RuntimeContextAuditIO"
+
+[[lean_exe]]
+name = "check_runtime_context"
+root = "CheckRuntimeContext"
+
+[[lean_lib]]
+name = "RuntimeContextSound"
+
+[[lean_lib]]
+name = "RuntimeContextSource"
+
+[[lean_lib]]
+name = "RuntimeContextOrigins"
+
+[[lean_lib]]
+name = "SourceProgramSemantics"
+
+[[lean_lib]]
+name = "OperandRowCheck"
+
+[[lean_lib]]
+name = "EventSelectors"
+
+[[lean_lib]]
+name = "OperandRowSound"
+
+[[lean_exe]]
+name = "check_operand_semantics"
+root = "CheckOperandSemantics"
+
+[[lean_lib]]
+name = "OperandTraceSound"
+
+[[lean_lib]]
+name = "RuntimeContextCli"
+
+[[lean_lib]]
+name = "OperandMemorySound"
+
+[[lean_lib]]
+name = "OperandCertificate"
+
+[[lean_lib]]
+name = "OperandSourceSound"
+
+[[lean_lib]]
+name = "ControlRowCheck"
+
+[[lean_lib]]
+name = "ControlRowSound"
+
+[[lean_exe]]
+name = "check_control_semantics"
+root = "CheckControlSemantics"
+
+[[lean_lib]]
+name = "ControlCertificate"
+
+[[lean_lib]]
+name = "ControlTraceSound"
+
+[[lean_lib]]
+name = "FunctionTraceSound"
+
+[[lean_exe]]
+name = "check_event_semantics"
+root = "CheckEventSemantics"
+
+[[lean_lib]]
+name = "EventSemanticMutations"
+
+[[lean_lib]]
+name = "ControlSourceSound"
+
+[[lean_lib]]
+name = "ControlAddressBounds"
+
+[[lean_lib]]
+name = "ControlMemorySound"
+
+[[lean_lib]]
+name = "EventSemanticSound"
+
+[[lean_lib]]
+name = "ControlRefinementBridge"
+
+[[lean_lib]]
+name = "OperandRepresentationUnique"
+
+[[lean_lib]]
+name = "ControlLifoTrace"
+
+[[lean_lib]]
+name = "EventSemanticLifo"
+
+[[lean_lib]]
+name = "InstructionRowCheck"
+
+[[lean_exe]]
+name = "check_instruction_semantics"
+root = "CheckInstructionSemantics"
+
+[[lean_lib]]
+name = "InstructionRowSound"
+
+[[lean_lib]]
+name = "InstructionCounts"
+
+[[lean_lib]]
+name = "InstructionStaticSound"
+
+[[lean_lib]]
+name = "InstructionCertificate"
+
+[[lean_lib]]
+name = "InstructionTraceSound"
+
+[[lean_lib]]
+name = "StaticTypingBounds"
+
+[[lean_lib]]
+name = "StaticEventSpec"
+
+[[lean_lib]]
+name = "InstructionSemanticSound"
+
+[[lean_lib]]
+name = "InstructionSemanticSource"
+
+[[lean_lib]]
+name = "InstructionSemanticMutations"
+
+[[lean_lib]]
+name = "OperandStackRefinement"
+
+[[lean_lib]]
+name = "OperandStackTrace"
+
+[[lean_lib]]
+name = "OperandStackCertificate"
+
+[[lean_lib]]
+name = "VariableRowCheck"
+
+[[lean_lib]]
+name = "VariableRowSound"
+
+[[lean_exe]]
+name = "check_variable_semantics"
+root = "CheckVariableSemantics"
+
+[[lean_lib]]
+name = "VariableRuleFields"
+
+[[lean_lib]]
+name = "VariableSelectorFields"
+
+[[lean_lib]]
+name = "VariableRuleImageSound"
+
+[[lean_lib]]
+name = "VariableCertificate"
+
+[[lean_lib]]
+name = "VariableCountTrace"
+
+[[lean_lib]]
+name = "EnvironmentRowCheck"
+
+[[lean_lib]]
+name = "EnvironmentRowSound"
+
+[[lean_lib]]
+name = "VariableSelectorCheck"
+
+[[lean_lib]]
+name = "VariableSemanticCheck"
+
+[[lean_lib]]
+name = "EnvironmentTraceSound"
+
+[[lean_lib]]
+name = "VariableEventSpec"
+
+[[lean_lib]]
+name = "VariableSemanticSound"
+
+[[lean_lib]]
+name = "EnvironmentAccessSound"
+
+[[lean_lib]]
+name = "VariableSemanticSource"
+
+[[lean_lib]]
+name = "EnvironmentOriginSound"
+
+[[lean_lib]]
+name = "VariableSignatureTrace"
+
+[[lean_lib]]
+name = "InstructionSpans"
+
+[[lean_lib]]
+name = "InstructionSpanState"
+
+[[lean_lib]]
+name = "StaticInstructionBody"
+
+[[lean_lib]]
+name = "VariableInstructionBody"
+
+[[lean_lib]]
+name = "InstructionBodySource"
+
+[[lean_lib]]
+name = "InstructionBodies"
+
+[[lean_lib]]
+name = "InstructionBodyDecision"
+
+[[lean_exe]]
+name = "check_instruction_bodies"
+root = "CheckInstructionBodies"
+
+[[lean_lib]]
+name = "InstructionPartition"
+
+[[lean_lib]]
+name = "CallRowCheck"
+
+[[lean_exe]]
+name = "check_call_semantics"
+root = "CheckCallSemantics"
+
+[[lean_lib]]
+name = "CallRowSound"
+
+[[lean_lib]]
+name = "CallMode"
+
+[[lean_lib]]
+name = "CallRowEquations"
+
+[[lean_lib]]
+name = "CallState"
+
+[[lean_lib]]
+name = "CallTransition"
+
+[[lean_lib]]
+name = "CallCertificate"
+
+[[lean_lib]]
+name = "CallTraceSound"
+
+[[lean_lib]]
+name = "CallGuardSound"
+
+[[lean_lib]]
+name = "CallSemanticSound"
+
+[[lean_lib]]
+name = "CallSemanticSource"
+
+[[lean_lib]]
+name = "CallNodeSource"
+
+[[lean_lib]]
+name = "SharedNodeRead"
+
+[[lean_lib]]
+name = "CallReadSound"
+
+[[lean_lib]]
+name = "CallBodyRun"
+
+[[lean_lib]]
+name = "CallReadTrace"
+
+[[lean_lib]]
+name = "CallInstructionBody"
+
+[[lean_lib]]
+name = "SignatureTypeSource"
+
+[[lean_lib]]
+name = "CallHeadSource"
+
+[[lean_lib]]
+name = "CallBodySource"
+
+[[lean_lib]]
+name = "CallBodyDecision"
+
+[[lean_exe]]
+name = "check_call_bodies"
+root = "CheckCallBodies"
+
+[[lean_lib]]
+name = "FunctionMetadataOrigin"
+
+[[lean_lib]]
+name = "FunctionMetadataBytes"
+
+[[lean_lib]]
+name = "CallRootTrace"
+
+[[lean_lib]]
+name = "CallEntrySource"
+
+[[lean_lib]]
+name = "CallRootSource"
+
+[[lean_lib]]
+name = "CallTableSource"
+
+[[lean_lib]]
+name = "CallSignatureBody"
+
+[[lean_lib]]
+name = "CallFunctionSource"
+
+[[lean_lib]]
+name = "CallRuntimeSource"
+
+[[lean_lib]]
+name = "CallRuntimeDecision"
+
+[[lean_exe]]
+name = "check_call_runtime"
+root = "CheckCallRuntime"
+
+[[lean_lib]]
+name = "ParametricRowCheck"
+
+[[lean_lib]]
+name = "ParametricRowSound"
+
+[[lean_lib]]
+name = "ParametricMode"
+
+[[lean_lib]]
+name = "ParametricCertificate"
+
+[[lean_exe]]
+name = "check_parametric_semantics"
+root = "CheckParametricSemantics"
+
+[[lean_lib]]
+name = "ParametricBegin"
+
+[[lean_lib]]
+name = "ParametricState"
+
+[[lean_lib]]
+name = "ParametricTransition"
+
+[[lean_lib]]
+name = "ParametricTraceSound"
+
+[[lean_lib]]
+name = "ParametricGuardCounts"
+
+[[lean_lib]]
+name = "ParametricGuardTypes"
+
+[[lean_lib]]
+name = "ParametricBodyRun"
+
+[[lean_lib]]
+name = "ParametricSemanticSound"
+
+[[lean_lib]]
+name = "ParametricInstructionBody"
+
+[[lean_lib]]
+name = "ParametricSourceSound"
+
+[[lean_lib]]
+name = "ParametricBodySpec"
+
+[[lean_lib]]
+name = "BranchRowCheck"
+
+[[lean_lib]]
+name = "BranchRowSound"
+
+[[lean_exe]]
+name = "check_branch_semantics"
+root = "CheckBranchSemantics"
+
+[[lean_lib]]
+name = "BranchRowImages"
+
+[[lean_lib]]
+name = "BranchCertificate"
+
+[[lean_lib]]
+name = "BranchStep"
+
+[[lean_lib]]
+name = "BranchListCheck"
+
+[[lean_lib]]
+name = "BranchListSound"
+
+[[lean_lib]]
+name = "BranchStore"
+
+[[lean_lib]]
+name = "BranchTraceSound"
+
+[[lean_lib]]
+name = "BranchHeadSound"
+
+[[lean_lib]]
+name = "BranchInstructionBody"
+
+[[lean_lib]]
+name = "BranchComplete"
+
+[[lean_lib]]
+name = "BranchOrigins"
+
+[[lean_lib]]
+name = "BranchSourceSound"
+
+[[lean_lib]]
+name = "BranchLastMarker"
+
+[[lean_lib]]
+name = "BranchTypeRowCheck"
+
+[[lean_lib]]
+name = "BranchTypeRowSound"
+
+[[lean_lib]]
+name = "BranchTypeRowImages"
+
+[[lean_lib]]
+name = "InactiveAddress"
+
+[[lean_lib]]
+name = "BranchMergeCheck"
+
+[[lean_lib]]
+name = "BranchMergeSound"
+
+[[lean_lib]]
+name = "BranchTypeCertificate"
+
+[[lean_lib]]
+name = "BranchLookupCheck"
+
+[[lean_lib]]
+name = "BranchLookupSound"
+
+[[lean_lib]]
+name = "BranchTypeScalar"
+
+[[lean_lib]]
+name = "BranchTypeScratch"
+
+[[lean_lib]]
+name = "MemoryPriorWrite"
+
+[[lean_lib]]
+name = "BranchScratchTrace"
+
+[[lean_lib]]
+name = "BranchTypeMutations"
+
+[[lean_lib]]
+name = "BranchTypeSound"
+
+[[lean_lib]]
+name = "BranchTypeSource"
+
+[[lean_lib]]
+name = "BranchMemberTag"
+
+[[lean_lib]]
+name = "BranchTypePending"
+
+[[lean_lib]]
+name = "BranchTypeData"
+
+[[lean_lib]]
+name = "BranchTypeState"
+
+[[lean_lib]]
+name = "BranchTypeTrace"
+
+[[lean_lib]]
+name = "BranchTypeGuards"
+
+[[lean_lib]]
+name = "BranchTypeSemanticSound"
+
+[[lean_lib]]
+name = "BranchTypeRestoration"
+
+[[lean_lib]]
+name = "BranchTypeArity"
+
+[[lean_lib]]
+name = "BranchTypeBehavior"
+
+[[lean_lib]]
+name = "FrameRowCheck"
+
+[[lean_lib]]
+name = "FrameRowSound"
+
+[[lean_exe]]
+name = "check_signature_frames"
+root = "CheckSignatureFrames"
+
+[[lean_lib]]
+name = "FrameRowImages"
+
+[[lean_lib]]
+name = "FrameDescriptor"
+
+[[lean_lib]]
+name = "FrameAccessSound"
+
+[[lean_lib]]
+name = "FrameOpcodes"
+
+[[lean_lib]]
+name = "FrameCertificate"
+
+[[lean_lib]]
+name = "FrameMutations"
+
+[[lean_lib]]
+name = "FrameMemorySound"
+
+[[lean_lib]]
+name = "FrameSound"
+
+[[lean_lib]]
+name = "ControlDepthTrace"
+
+[[lean_lib]]
+name = "FrameSelectors"
+
+[[lean_lib]]
+name = "FrameDepthCheck"
+
+[[lean_lib]]
+name = "FrameTokenStack"
+
+[[lean_lib]]
+name = "FrameTargetSound"
+
+[[lean_lib]]
+name = "FrameDepthMutations"
+
+[[lean_lib]]
+name = "FrameTraceMemory"
+
+[[lean_lib]]
+name = "FrameReadSource"
+
+[[lean_lib]]
+name = "FrameLifoSound"
+
+[[lean_lib]]
+name = "FrameBlockEncoding"
+
+[[lean_lib]]
+name = "FramePadTrace"
+
+[[lean_lib]]
+name = "FrameWriteValue"
+
+[[lean_lib]]
+name = "InstructionEventCheck"
+
+[[lean_exe]]
+name = "check_instruction_events"
+root = "CheckInstructionEvents"
+
+[[lean_lib]]
+name = "InstructionEventSound"
+
+[[lean_lib]]
+name = "InstructionInfoCheck"
+
+[[lean_lib]]
+name = "InstructionInfoSound"
+
+[[lean_lib]]
+name = "FrameInstructionSource"
+
+[[lean_lib]]
+name = "InstructionEventMutations"
+
+[[lean_lib]]
+name = "FramePadOrigin"
+
+[[lean_lib]]
+name = "FrameSignatureSource"
+
+[[lean_lib]]
+name = "BranchFrameMetadata"
+
+[[lean_lib]]
+name = "BranchFrameSource"
+
+[[lean_lib]]
+name = "IndexedSingletonList"
+
+[[lean_lib]]
+name = "BranchSimpleHeads"
+
+[[lean_lib]]
+name = "BranchSimpleLists"
+
+[[lean_lib]]
+name = "BranchLabelLists"
+
+[[lean_lib]]
+name = "IndexedMemberRead"
+
+[[lean_lib]]
+name = "BranchListRead"
+
+[[lean_lib]]
+name = "BranchHeadOrigin"
+
+[[lean_lib]]
+name = "BranchOperandSource"
+
+[[lean_lib]]
+name = "BranchOperandOrder"
+
+[[lean_lib]]
+name = "BranchLabelCarry"
+
+[[lean_lib]]
+name = "BranchTypedOperands"
+
+[[lean_lib]]
+name = "BranchActionLanguage"
+
+[[lean_lib]]
+name = "BranchActionAlphabet"
+
+[[lean_lib]]
+name = "BranchActionSequence"
+
+[[lean_lib]]
+name = "BranchConditionTrace"
+
+[[lean_lib]]
+name = "BranchActionLayout"
+
+[[lean_lib]]
+name = "BranchActionCounters"
+
+[[lean_lib]]
+name = "BranchActionSource"
+
+[[lean_lib]]
+name = "BranchFloorInvariant"
+
+[[lean_lib]]
+name = "BranchOperandRuns"
+
+[[lean_lib]]
+name = "BranchCommonOperands"
+
+[[lean_lib]]
+name = "BranchValuePlan"
+
+[[lean_lib]]
+name = "BranchPlanSource"
+
+[[lean_lib]]
+name = "ControlTypeRowCheck"
+
+[[lean_lib]]
+name = "ControlTypeRowSound"
+
+[[lean_exe]]
+name = "check_control_typing"
+root = "CheckControlTyping"
+
+[[lean_lib]]
+name = "ControlTypeRowImages"
+
+[[lean_lib]]
+name = "ControlTypeCertificate"
+
+[[lean_lib]]
+name = "ControlTypeMutations"
+
+[[lean_lib]]
+name = "ControlTypeModes"
+
+[[lean_lib]]
+name = "ControlTypeScalar"
+
+[[lean_lib]]
+name = "ControlTypeMasks"
+
+[[lean_lib]]
+name = "ControlTypeState"
+
+[[lean_lib]]
+name = "ControlTypeTrace"
+
+[[lean_lib]]
+name = "ControlTypeGuards"
+
+[[lean_lib]]
+name = "ControlTypeSemanticSound"
+
+[[lean_lib]]
+name = "ControlTypeSource"
+
+[[lean_lib]]
+name = "ControlLookupCheck"
+
+[[lean_lib]]
+name = "ControlLookupSound"
+
+[[lean_lib]]
+name = "ControlLookupMutations"
+
+[[lean_lib]]
+name = "ControlFrameMetadata"
+
+[[lean_lib]]
+name = "ControlSignatureHeads"
+
+[[lean_lib]]
+name = "ControlLengthLists"
+
+[[lean_lib]]
+name = "ControlSimpleLists"
+
+[[lean_lib]]
+name = "ControlSignatureLists"
+
+[[lean_lib]]
+name = "ControlMemberLists"
+
+[[lean_lib]]
+name = "ControlLookupMask"
+
+[[lean_lib]]
+name = "ControlSignatureSemanticSound"
+
+[[lean_lib]]
+name = "ControlSignatureSource"
+
+[[lean_lib]]
+name = "ControlHeadTrace"
+
+[[lean_lib]]
+name = "ControlHeldLists"
+
+[[lean_lib]]
+name = "ControlMemberRouting"
+
+[[lean_lib]]
+name = "ControlMemberPositions"
+
+[[lean_lib]]
+name = "ControlRoutedMembers"
+
+[[lean_lib]]
+name = "ControlMemberSource"
+
+[[lean_lib]]
+name = "ControlActionGuards"
+
+[[lean_lib]]
+name = "ControlActionLanguage"
+
+[[lean_lib]]
+name = "ControlActionSequence"
+
+[[lean_lib]]
+name = "ControlListArity"
+
+[[lean_lib]]
+name = "ControlSignatureSpan"
+
+[[lean_lib]]
+name = "ControlBodySignatures"
+
+[[lean_lib]]
+name = "ControlValueLanguage"
+
+[[lean_lib]]
+name = "ControlValueTypes"
+
+[[lean_lib]]
+name = "ControlValueBody"
+
+[[lean_lib]]
+name = "ControlBodySource"
+
+[[lean_lib]]
+name = "ControlLayoutAgreement"

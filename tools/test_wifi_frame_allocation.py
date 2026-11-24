@@ -18,6 +18,9 @@ PLATFORM = OWNERSHIP_PLATFORM.replace(CALLBACK_STUBS, "").replace(
     "callback, callbackArg, bufDesc: pointer",
     "callback, callbackArg, bufDesc, hwDesc, queueFirst: pointer",
 ).replace(
+    "vifIdx, staInfoIdx: uint8",
+    "vifIdx, staInfoIdx, staIdx: uint8",
+).replace(
     "    macHeader: array[24, uint8]",
     "    rateTemplate: array[52, uint8]\n    macHeader: array[512, uint8]",
 )
@@ -27,8 +30,8 @@ const MAX_VIFS = 2
 const STA_MGMT_FREE_STAS = 5
 type
   TxFrameIdentity = object
-    generation, resetEpoch: uint32
-    leased: bool
+    generation, resetEpoch, psSerial: uint32
+    leased, psTracked: bool
     vifEpochs: array[MAX_VIFS, uint32]
     stationEpochs: array[STA_MGMT_FREE_STAS, uint32]
   TxFrameCallbackScope = object
@@ -57,6 +60,7 @@ var
   stationEpochs: array[STA_MGMT_FREE_STAS, uint32]
   txFrameIdentities: array[4, TxFrameIdentity]
   txFrameGeneration: uint32
+  psModeBuildSerial: uint32
   txResetEpoch: uint32
   mmBcnGeneration: uint32
   txActiveFrameCallback: ptr TxFrameCallbackScope
@@ -161,6 +165,7 @@ for expired in [false, true]:
     reused.pendingMacTime = oldTime
     reused.postponeFlag = 1
     reused.retryFlag = 1
+    reused.staIdx = 0xFF
     hardware[0].payloadStart = 7
     hardware[0].retryLimitControl = 123
     hardware[0].controlFlags = 456
@@ -180,6 +185,7 @@ for expired in [false, true]:
     doAssert reused.pendingMacTime == 0, "recycled frame retains prior TX age"
     doAssert reused.postponeFlag == 0, "free frame retains postponed ownership"
     doAssert reused.retryFlag == 0, "recycled frame retains prior retry ownership"
+    doAssert reused.staIdx == 0, "internal frame retains prior TX header selector"
     checkGeometry(reused, 26)
     doAssert frameEnv.postponedCount == 0
     doAssert frameEnv.freeList.first == nil

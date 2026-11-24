@@ -12,9 +12,70 @@
 #undef aes_unwrap
 #undef wpa_set_bss
 
+#ifndef BL808_WPA_KEY_RESULT_PRESENT
+#error "Apply tools/bl808_wifi_wpa_key_result.patch to the pinned BL808 SDK"
+#endif
+
 uint32_t bl808_wpa_current_state(void)
 {
     return (uint32_t)gWpaSm.wpa_state;
+}
+
+extern void wpa_sta_connect(wifi_connect_parm_t *parm);
+
+static void bl808_wpa_wipe(u8 *buf, size_t len)
+{
+    volatile u8 *dst = buf;
+    while (len-- != 0)
+        *dst++ = 0;
+}
+
+int bl808_wpa_sta_connect_result(void *callback, void *params)
+{
+    void (*start)(wifi_connect_parm_t *) = callback;
+    wifi_connect_parm_t *parm = params;
+    struct wpa_sm *sm = &gWpaSm;
+
+    if (start == NULL || parm == NULL)
+        return -1;
+    if (start != wpa_sta_connect) {
+        start(parm);
+        return 0;
+    }
+
+    /* The SDK's void callback ignores this result. Keep the same inputs and
+     * Mbed TLS call, but publish join state only after key setup succeeds. */
+    if (sm->key_mgmt != WPA_KEY_MGMT_SAE &&
+        sm->key_mgmt != WPA_KEY_MGMT_IEEE8021X) {
+        u8 pmk[PMK_LEN];
+        size_t len = 0;
+        while (len < sizeof parm->passphrase && parm->passphrase[len] != '\0')
+            len++;
+        int rc = -1;
+        if (len < sizeof parm->passphrase && parm->ssid.len <= sizeof parm->ssid.ssid) {
+            if (len == 64)
+                rc = hexstr2bin(parm->passphrase, pmk, sizeof pmk);
+            else
+                rc = pbkdf2_sha1(parm->passphrase, (const char *)parm->ssid.ssid,
+                                 parm->ssid.len, 4096, pmk, sizeof pmk);
+        }
+        if (rc == 0) {
+            memcpy(sm->pmk, pmk, sizeof pmk);
+            sm->pmk_len = sizeof pmk;
+        } else {
+            bl808_wpa_wipe(sm->pmk, sizeof sm->pmk);
+            sm->pmk_len = 0;
+        }
+        bl808_wpa_wipe(pmk, sizeof pmk);
+        if (rc != 0)
+            return rc;
+    }
+
+    sm->vif_idx = parm->vif_idx;
+    sm->sta_idx = parm->sta_idx;
+    wpa_sm_set_state(WPA_AUTHENTICATING);
+    wpa_set_4way_handshake_timer(parm->quick_conn);
+    return 0;
 }
 
 extern volatile uint32_t nimfw_dbg_keydata_decrypt_calls;

@@ -99,9 +99,11 @@ def init_source(*, real_restore: bool = False) -> str:
                 code += "const\n" + "\n".join(block) + "\n"
                 break
     code += r'''
+const wifiOnly = 1'u32
 var
   dfe: RfDfeInitBlock
   bl808RfColdInit, bl808RfMode: uint32
+  bl808RfPriXtal40mFlag: uint8
   wlCalGlobal: pointer
   stages: seq[int]
   fullCalls, restoreCalls: int
@@ -117,6 +119,7 @@ proc rfPriEfuseInit() =
 proc rf_pri_xtalfreq() = stages.add(3)
 proc writeRfPriFixedValueRegs() = stages.add(4)
 proc rfPriWifiPllConfig() = stages.add(5)
+proc prepareBl808RfColdRegisters() = stages.add(9)
 proc runRfPriFullCalRestoreBaseline() =
   stages.add(6)
   inc fullCalls
@@ -144,6 +147,7 @@ proc initSetup(pattern: int) =
   let words = cast[ptr UncheckedArray[uint32]](addr dfe)
   for i in 0 ..< sizeof(dfe) div 4: words[i] = randomWord()
   stages.setLen(0)
+  bl808RfPriXtal40mFlag = 0
   fullCalls = 0
   restoreCalls = 0
   published74 = randomWord()
@@ -178,6 +182,23 @@ for cold in [0'u32, 1, 2, 0x80000000'u32, high(uint32)]:
       doAssert stages == @[2, 3, 4, 5, (if cold != 0: 6 else: 7), 8]
       doAssert calibration == saved and rfCalibDataGlobal == wlCalGlobal
       doAssert bl808RfColdInit == cold and bl808RfMode == 0x34
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
+def test_40mhz_wlan_cold_init_uses_bl808_precalibration_profile(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, init_source() + r'''
+for cold in [0'u32, 1]:
+  for api in [wifiOnly, 2'u32, 3]:
+    for xtal40 in [0'u8, 1]:
+      initSetup(1)
+      bl808RfPriXtal40mFlag = xtal40
+      rf_pri_init(cold, api)
+      let native = cold != 0 and api == wifiOnly and xtal40 != 0
+      if native:
+        doAssert stages == @[3, 9, 6, 8], "40 MHz WLAN boot used the inherited RF profile"
+      else:
+        doAssert stages == @[2, 3, 4, 5, (if cold != 0: 6 else: 7), 8]
 ''')
 
 

@@ -103,6 +103,25 @@ proc prepare(cipher: uint8; bypass: bool; segments = 2; extension = 8'u8) =
 
 
 CASES = {
+    "invalid_metadata": r'''
+for cipher in [0'u8, 1, 3]:
+  for mutation in 0..4:
+    prepare(cipher, false)
+    case mutation
+    of 0: desc.secTailLen = 8
+    of 1: desc.qosExtLen = desc.hdrLen + 1'u8
+    of 2: desc.staInfoIdx = STA_INFO_TAB_ENTRIES.uint8
+    of 3: desc.bufDesc = nil
+    else:
+      inc rxKeyRevision
+      rxKeyLastChanged[0] = rxKeyRevision
+    let before = link
+    let beforeDesc = desc
+    let beforeCounter = counter()
+    txu_cntrl_tkip_mic_append(addr desc)
+    doAssert link == before and desc == beforeDesc and counter() == beforeCounter
+    doAssert initialized == 0 and finalized == 0 and micCalls.len == 0
+''',
     "control_port": r'''
 for cipher in [0'u8, 1, 3]:
   prepare(cipher, true)

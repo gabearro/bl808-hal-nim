@@ -20,21 +20,15 @@ def source() -> str:
     support = r'''
 const
   STA_INFO_TAB_ENTRIES = 7
-  MAX_VIFS = 2
 type Station = object
   instNbr: uint8
 var
   stations: array[STA_INFO_TAB_ENTRIES, Station]
   stationEpochs: array[STA_INFO_TAB_ENTRIES, uint32]
-  rxVifEpochs: array[MAX_VIFS, uint32]
-  txResetEpoch: uint32
   resetting: bool
 proc staInfoForIdx(index: uint8): ptr Station =
   doAssert index < STA_INFO_TAB_ENTRIES
   addr stations[index]
-proc vifChannelForIdx(index: uint8): ptr Vif =
-  doAssert index == vif.vifIdx and index < MAX_VIFS
-  addr vif
 proc staDeleteEpoch(index: uint8): uint32 = stationEpochs[index]
 proc txlResetting(): bool = resetting
 proc prepare() =
@@ -92,7 +86,7 @@ for hasLogger in [false, true]:
               doAssert events == (if eligible: @["traffic"] else: @[])
 ''',
     "diagnostic_reentry": r'''
-for change in 0 .. 7:
+for change in 0 .. 10:
   prepare()
   vif.uapsdBitmap = 2
   var expected: Vif
@@ -105,7 +99,10 @@ for change in 0 .. 7:
     of 4: stations[0].instNbr = 0
     of 5: vif.state = 0
     of 6: vif.vifType = 2
-    else: ps.enabled = 0
+    of 7: ps.enabled = 0
+    of 8: vif.vifIdx = 0
+    of 9: vif.uapsdBitmap = 0
+    else: mappedVif = nil
     vif.flags = 0x12340000
     vif.psLastTime = 0x55667788
     expected = vif
@@ -145,6 +142,14 @@ vif.uapsdBitmap = 2
 let before = vif
 doAssert not ps_check_tx_frame(0, 0)
 doAssert vif == before and events.len == 0 and lookups == 0
+prepare()
+vif.vifIdx = 0
+doAssert not ps_check_tx_frame(0, 0)
+doAssert events.len == 0 and messages.len == 0 and lookups == 0
+prepare()
+mappedVif = nil
+doAssert not ps_check_tx_frame(0, 0)
+doAssert events.len == 0 and messages.len == 0 and lookups == 0
 ''',
 }
 

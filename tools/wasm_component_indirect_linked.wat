@@ -1,0 +1,13 @@
+(module
+  (import "cm32p2" "verify" (func $verify (param i32 i32)))
+  (memory (export "cm32p2_memory") 1)
+  (func (export "cm32p2_realloc") (param i32 i32 i32 i32) (result i32)
+    (if (i32.ne (local.get 2) (i32.const 8)) (then unreachable))
+    (if (i32.ne (local.get 3) (i32.const 80)) (then unreachable))
+    i32.const 504)
+  (func (export "cm32p2||evaluate") (param $args i32) (result i32)
+    (call $verify (local.get $args) (i32.const 32))
+    i32.const 32)
+  (func (export "cm32p2||bad-arguments") (result i32)
+    (call $verify (i32.const 65504) (i32.const 32))
+    i32.const 32))

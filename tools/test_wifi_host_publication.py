@@ -26,7 +26,9 @@ type
     aggDescPtr: uint32
     aggDescStorage: array[32, uint8]
     policy, dmaLink, hwDesc, bufDesc, queueFirst: pointer
-    cfmStatus, retryCount, lifetime, txFlags: uint32
+    cfmStatus: uint32
+    optionalLengths: array[3, uint32]
+    macControlInfo1, macControlInfo2, statusInfo, mediumTimeUsed: uint32
     frameLen, seqPassthrough: uint16
     staIdx, vifIdx, staInfoIdx, hdrLen, secTailLen: uint8
     bufferPtrs, bufferLens: array[4, uint32]
@@ -64,7 +66,11 @@ var
   selectedAc, nestedAc: uint32
   nestedStage: string
   nestedFired, inSubmit, immediate, recycle, requeue: bool
+  retireAtDrain: bool
+  sessionEpoch, macClock: int
   queueReads: int
+
+template keEnvEventField(): ptr uint32 = addr keEvtField
 
 proc ipc_emb_tx_evt*(ac: uint32) {.exportc, cdecl.}
 proc txl_cntrl_push*(param: pointer; ac: uint8): uint8 {.exportc, cdecl.}
@@ -72,8 +78,10 @@ proc ipc_emb_txcfm*(desc: pointer) {.exportc, cdecl.}
 proc hostTxDescAt(p: pointer): ptr HostTxDescView = cast[ptr HostTxDescView](p)
 proc txSecurityCurrent(d: ptr HostTxDescView): bool = true
 proc txSecurityForget(d: pointer) = discard
-proc txlCaptureSession(d: ptr HostTxDescView): int = 0
-proc txlSessionCurrent(i: int; d: ptr HostTxDescView): bool = true
+proc txlCaptureSession(d: ptr HostTxDescView): int = sessionEpoch
+proc txlSessionCurrent(i: int; d: ptr HostTxDescView; checkDescriptor = true): bool =
+  doAssert checkDescriptor == (d != nil)
+  i == sessionEpoch
 proc txuCancelFrame(p: pointer; ac: uint8) = doAssert false
 proc txl_frame_release(p: pointer; callback: bool) = doAssert false
 proc indexOf(p: pointer): int =
@@ -155,9 +163,11 @@ proc txlBuildBufferThd(p: pointer): bool =
 proc td_pck_ind(vif, sta: uint8; direction: uint32) =
   doAssert not interrupts
   doAssert vif == 1 and sta == 3 and direction == 0
+  macClock = 100
   peerWork.add("traffic")
 proc ps_check_tx_frame(sta, tid: uint8): bool =
   doAssert not interrupts and sta == 3 and tid == 5
+  doAssert macClock == 200, "PS timestamp precedes the drain"
   peerWork.add("ps")
 proc txl_payload_handle_backup(p: pointer) =
   doAssert not interrupts and p == nil
@@ -168,7 +178,7 @@ proc txl_payload_handle_backup(p: pointer) =
   doAssert not contains(hostList, addr wrappers[i].link), "wrapper still in host queue"
   doAssert txEnv.packetCounter == submitted.len.uint32 - completed.len.uint32,
     "DMA started before packet accounting"
-  doAssert peerWork.len == submitted.len * 2, "peer work follows DMA publication"
+  doAssert peerWork.len == submitted.len * 2 - 1 and peerWork[^1] == "traffic"
   nest("dma")
   if immediate:
     doAssert utils_list_pop_front(addr txEnv.ac[0].pending) == node
@@ -189,6 +199,8 @@ proc txl_payload_handle_backup(p: pointer) =
         wrappers[i].txDesc.staInfoIdx = 3
         wrappers[i].txDesc.staIdx = 5
         utils_list_push_back(addr hostList, addr wrappers[i].link)
+  macClock = 200
+  if retireAtDrain: inc sessionEpoch
 proc txu_cntrl_push(p: pointer; ac: uint8): bool =
   doAssert not interrupts and ac == 0
   doAssert not inSubmit, "simultaneous host consumer"
@@ -197,6 +209,12 @@ proc txu_cntrl_push(p: pointer; ac: uint8): bool =
   let i = indexOf(p)
   doAssert wrappers[i].active == 1
   doAssert not contains(hostList, addr wrappers[i].link)
+  doAssert wrappers[i].txDesc.optionalLengths == [0'u32, 0, 0]
+  doAssert wrappers[i].txDesc.macControlInfo1 == 0x11111111'u32
+  doAssert wrappers[i].txDesc.macControlInfo2 == 0x22222222'u32
+  doAssert wrappers[i].txDesc.statusInfo == 0x33333333'u32
+  doAssert wrappers[i].txDesc.mediumTimeUsed == 0x44444444'u32
+  doAssert wrappers[i].txDesc.cfmStatus == 0
   submitted.add(i)
   result = txl_cntrl_push(p, ac) != 0
 """
@@ -223,6 +241,8 @@ proc reset(count: int; payload: bool) =
   nestedFired = false
   inSubmit = false
   requeue = false
+  retireAtDrain = false
+  sessionEpoch = 0
   queueReads = 0
   for i in 0 ..< count:
     wrappers[i].txDesc.frameLen = 0x8E88
@@ -232,6 +252,13 @@ proc reset(count: int; payload: bool) =
     wrappers[i].txDesc.hdrLen = 26
     wrappers[i].txDesc.seqPassthrough = 100
     wrappers[i].txDesc.bufDesc = addr buffers[i]
+    wrappers[i].txDesc.optionalLengths = [0xAAAAAAAA'u32, 0xBBBBBBBB'u32,
+                                           0xCCCCCCCC'u32]
+    wrappers[i].txDesc.macControlInfo1 = 0x11111111'u32
+    wrappers[i].txDesc.macControlInfo2 = 0x22222222'u32
+    wrappers[i].txDesc.statusInfo = 0x33333333'u32
+    wrappers[i].txDesc.mediumTimeUsed = 0x44444444'u32
+    wrappers[i].txDesc.cfmStatus = 0x55555555'u32
     if payload: wrappers[i].txDesc.queueFirst = cast[pointer](1)
     utils_list_push_back(addr hostList, addr wrappers[i].link)
 
@@ -320,11 +347,22 @@ for enabled in [false, true]:
   doAssert not ipcTxDispatchActive
   doAssert wrappers[0].active == 0xAABBCCDD'u32
   doAssert wrappers[1].active == 0xAABBCCDD'u32
+
+for retire in [false, true]:
+  reset(1, true)
+  immediate = true
+  recycle = true
+  retireAtDrain = retire
+  nestedStage = ""
+  ipc_emb_tx_evt(0)
+  doAssert completed == @[0] and txEnv.packetCounter == 0
+  doAssert wrappers[0].txDesc.staInfoIdx == 255 and wrappers[0].txDesc.staIdx == 255
+  doAssert peerWork == (if retire: @["traffic"] else: @["traffic", "ps"])
 """
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-@pytest.mark.parametrize("mutation", [None, "late_active", "late_pop", "reentry", "late_count", "late_queue"])
+@pytest.mark.parametrize("mutation", [None, "late_active", "late_pop", "reentry", "late_count", "late_queue", "post_ps_owner"])
 def test_host_publication(tmp_path: Path, mode: str, mutation: str | None) -> None:
     nim = shutil.which("nim")
     if nim is None:
@@ -351,6 +389,10 @@ def test_host_publication(tmp_path: Path, mode: str, mutation: str | None) -> No
         assert body.count(line) == 1
         body = body.replace(line, "").replace(
             "  txl_payload_handle_backup(nil)\n", "  txl_payload_handle_backup(nil)\n" + line)
+    elif mutation == "post_ps_owner":
+        guard = "  if txlSessionCurrent(identity, nil, checkDescriptor = false):"
+        assert guard in body
+        body = body.replace(guard, "  if true:")
     debug = "\nvar\n" + "".join(
         f"  {name}: uint32\n" for name in sorted(set(re.findall(r"\bnimFwDbg\w+", body)))
     )

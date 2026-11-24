@@ -260,7 +260,7 @@ def test_vif_tx_retirement(tmp_path: Path, mode: str, mutation: str | None) -> N
     bodies += procedure((FW / "rx_layer.nim").read_text(), "rxInvalidateQuiescentVif")
     bodies += procedure((FW / "rx_layer.nim").read_text(), "rxInvalidateVif")
     if mutation == "no_retirement":
-        old, new = "  txl_retire_vif(vifIdx)\n", ""
+        old, new = "  txl_retire_vif(vifIdx, selected)\n", ""
     elif mutation == "no_gate":
         old = "  if txlVifIsRetiring(desc.vifIdx) or not txlFrameSessionCurrent(desc):"
         new = "  if not txlFrameSessionCurrent(desc):"

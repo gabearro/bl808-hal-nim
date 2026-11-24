@@ -20,10 +20,13 @@ def source() -> str:
     return types + PLATFORM + "".join(
         procedure(kernel, name) for name in (
             "co_list_init", "co_list_push_back", "co_list_push_front",
-            "co_list_pop_front", "co_list_extract", "co_list_remove",
+            "co_list_pop_front", "co_list_extract", "co_list_find", "co_list_remove",
+            "co_list_insert", "co_list_insert_after", "co_list_insert_before",
+            "co_list_concat",
             "co_dlist_init", "co_dlist_push_back", "co_dlist_push_front",
             "co_dlist_pop_front", "co_dlist_extract",
             "co_pool_init", "co_pool_alloc", "co_pool_free",
+            "ke_queue_extract",
         )
     )
 
@@ -59,6 +62,91 @@ proc setup() =
 
 
 CASES = {
+    "remove_first": r'''
+setup()
+list = CoList(first: addr nodes[0], last: addr nodes[0])
+nodes[0].next = nil
+co_list_remove(addr list, nil, addr nodes[0])
+doAssert list.first == nil and list.last == (addr nodes[0])
+doAssert nodes[0].next == nil and assertions.len == 0
+co_list_push_back(addr list, addr nodes[1])
+doAssert list.first == (addr nodes[1]) and list.last == (addr nodes[1])
+doAssert nodes[1].next == nil
+''',
+    "find": r'''
+setup()
+doAssert co_list_find(addr list, addr nodes[0])
+doAssert co_list_find(addr list, addr nodes[3])
+doAssert not co_list_find(addr list, cast[ptr CoListHdr](1))
+doAssert co_list_find(addr list, nil)
+list.first = nil
+doAssert co_list_find(addr list, nil)
+doAssert not co_list_find(addr list, addr nodes[0])
+''',
+    "insert": r'''
+setup()
+co_list_init(addr list)
+proc before(a, b: ptr CoListHdr): bool {.cdecl.} =
+  doAssert a == (addr nodes[2])
+  b == (addr nodes[1])
+co_list_push_back(addr list, addr nodes[0])
+co_list_push_back(addr list, addr nodes[1])
+co_list_insert(addr list, addr nodes[2], before)
+doAssert list.first == (addr nodes[0]) and list.last == (addr nodes[1])
+doAssert nodes[0].next == (addr nodes[2]) and nodes[2].next == (addr nodes[1])
+co_list_insert_before(addr list, nil, addr nodes[3])
+doAssert list.last == (addr nodes[3]) and nodes[1].next == (addr nodes[3])
+co_list_extract(addr list, addr nodes[2])
+co_list_insert_after(addr list, addr nodes[0], addr nodes[2])
+doAssert nodes[0].next == (addr nodes[2]) and nodes[2].next == (addr nodes[1])
+co_list_extract(addr list, addr nodes[2])
+co_list_insert_before(addr list, addr nodes[1], addr nodes[2])
+doAssert nodes[0].next == (addr nodes[2]) and nodes[2].next == (addr nodes[1])
+doAssert assertions.len == 0
+''',
+    "insert_edges": r'''
+setup()
+co_list_init(addr list)
+proc always(a, b: ptr CoListHdr): bool {.cdecl.} = true
+proc never(a, b: ptr CoListHdr): bool {.cdecl.} = false
+co_list_insert(addr list, addr nodes[0], never)
+doAssert list.first == (addr nodes[0]) and list.last == (addr nodes[0])
+co_list_insert(addr list, addr nodes[1], always)
+doAssert list.first == (addr nodes[1]) and nodes[1].next == (addr nodes[0])
+co_list_insert(addr list, addr nodes[2], never)
+doAssert list.last == (addr nodes[2]) and nodes[0].next == (addr nodes[2])
+co_list_insert_after(addr list, nil, addr nodes[3])
+doAssert list.first == (addr nodes[3]) and nodes[3].next == (addr nodes[1])
+co_list_extract(addr list, addr nodes[3])
+co_list_insert_after(addr list, addr nodes[2], addr nodes[3])
+doAssert list.last == (addr nodes[3]) and nodes[2].next == (addr nodes[3])
+co_list_extract(addr list, addr nodes[3])
+let before = list
+let links = nodes
+co_list_insert_after(addr list, addr nodes[3], addr nodes[3])
+co_list_insert_before(addr list, addr nodes[3], addr nodes[3])
+doAssert list == before and nodes == links
+co_list_insert_before(addr list, addr nodes[1], addr nodes[3])
+doAssert list.first == (addr nodes[3]) and nodes[3].next == (addr nodes[1])
+doAssert assertions.len == 0
+''',
+    "concat": r'''
+setup()
+var src: CoList
+co_list_init(addr list)
+co_list_init(addr src)
+co_list_push_back(addr src, addr nodes[1])
+co_list_push_back(addr src, addr nodes[2])
+co_list_concat(addr list, addr src)
+doAssert list.first == (addr nodes[1]) and list.last == (addr nodes[2])
+doAssert src.first == nil and src.last == (addr nodes[2])
+co_list_push_back(addr list, addr nodes[3])
+co_list_push_back(addr src, addr nodes[0])
+co_list_concat(addr list, addr src)
+doAssert nodes[2].next == (addr nodes[3]) and nodes[3].next == (addr nodes[0])
+doAssert list.last == (addr nodes[0]) and src.first == nil
+doAssert src.last == (addr nodes[0]) and assertions.len == 0
+''',
     "push_back": r'''
 for empty in [false, true]:
   setup()
@@ -245,6 +333,27 @@ for operation in 0 .. 7:
   doAssert dlist.elementCount == 1 and dnodes[3] == default(CoDlistHdr)
   doAssert pool.first == (addr pnodes[3]) and pool.freeNodeCount == 1
   doAssert pnodes[3].next == nil
+''',
+    "queue_extract_callback_links": r'''
+setup()
+proc matchAfterRelink(elem: ptr CoListHdr; param: pointer): bool {.cdecl.} =
+  doAssert elem == addr nodes[0]
+  elem.next = addr nodes[2]
+  true
+doAssert ke_queue_extract(addr list, matchAfterRelink, nil) == addr nodes[0]
+doAssert list.first == (addr nodes[2]) and list.last == (addr nodes[3])
+doAssert nodes[0].next == nil and nodes[2].next == (addr nodes[3])
+
+setup()
+proc skipAfterRelink(elem: ptr CoListHdr; param: pointer): bool {.cdecl.} =
+  if elem == addr nodes[0]:
+    elem.next = addr nodes[2]
+    return false
+  elem == addr nodes[2]
+doAssert ke_queue_extract(addr list, skipAfterRelink, nil) == addr nodes[2]
+doAssert list.first == (addr nodes[0]) and list.last == (addr nodes[3])
+doAssert nodes[0].next == (addr nodes[3]) and nodes[2].next == nil
+doAssert assertions.len == 0
 ''',
 }
 

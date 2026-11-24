@@ -11,7 +11,7 @@ var stationRxSerial: uint32
 proc beginStationRxTransition(hw: pointer; station: uint8): StationRxTransition =
   let saved = callbackIrqSave()
   defer: callbackIrqRestore(saved)
-  if hw == nil or (station != 0xFF and station >= NxRemoteStaStoreMax):
+  if hw == nil or (station != 0xFF and station >= NxRemoteStaMax):
     return
   let vif = vifAt(hw, BlVifSta)
   let firmwareVif = loadU8(vif, BlVifVifIdxOff)
@@ -41,3 +41,8 @@ proc stationRxTransitionCurrent(transition: StationRxTransition): bool =
 proc stationRxNetifCurrent(transition: StationRxTransition): bool =
   # This admits one synchronous call, not all later operations on the netif.
   transition.netif != nil and stationRxTransitionCurrent(transition)
+
+proc retireStationDhcp(transition: StationRxTransition) =
+  when defined(bl808WifiRealLwip):
+    if stationRxNetifCurrent(transition):
+      discard wifi_netif_dhcp_stop(cast[ptr Netif](transition.netif))

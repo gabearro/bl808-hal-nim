@@ -1,4 +1,5 @@
 include mgmr_facade_parts/callbacks
+include mgmr_facade_parts/power_management
 include mgmr_facade_parts/backend_init
 include mgmr_facade_parts/station_recovery
 include mgmr_facade_parts/station_interface

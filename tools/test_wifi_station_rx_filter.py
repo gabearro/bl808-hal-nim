@@ -45,6 +45,8 @@ def source() -> str:
     code = replace_once(code, "proc highLe(p: ptr MacAddress): uint16 = 0",
                         procedure(layout, "highLe"))
     default_mac = next(line for line in sm.splitlines() if line.startswith("const DefaultStaMacAddr ="))
+    if default_mac in code:
+        code = replace_once(code, default_mac + "\n", "")
     code = replace_once(code, "proc ensureVifMgmtMac(p: ptr Vif): pointer = addr p.macAddr[0]",
                         "proc mm_hw_info_set*(macAddr: pointer) {.exportc, cdecl.}\n"
                         "proc mm_rx_filter_set*() {.exportc, cdecl.}\n" + default_mac + "\n"

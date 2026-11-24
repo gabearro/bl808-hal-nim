@@ -8,6 +8,7 @@ import subprocess
 import pytest
 
 from test_wifi_ap_teardown import procedure
+from test_wifi_beacon_frames import AP_EXTRAS_PLATFORM
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,6 +38,7 @@ const
   ME_SET_PS_DISABLE_CFM = 0xC10'u16
   ME_SET_ACTIVE_REQ = 0xC0D'u16
   ME_SET_ACTIVE_CFM = 0xC0E'u16
+  ME_CONFIG_REQ = 0xC00'u16
   ME_CONFIG_CFM = 0xC01'u16
   MeBusyState = 1'u16
   MeIdleState = 0'u16
@@ -86,7 +88,7 @@ type
   Apm = object
     connectInfo, pendingBeaconBuffer, hostapdCtx: pointer
     pendingBssParams: CoList
-    beaconIntervalIndex, flags, vifIdx, cryptoType, selfStaIdx, maxSta, staCount: uint8
+    embeddedEnabled, flags, vifIdx, cryptoType, selfStaIdx, maxSta, staCount: uint8
     securityIe: array[64, uint8]
   Context = object
     contextIndexOrMarker, invalidMarker: uint8
@@ -116,6 +118,7 @@ var
   apmStopVifIdx: uint8
   apmStopRequest: pointer
   meControlCommand, meControlReply, mmPsModeRequest: pointer
+  txResetEpoch, mmPsModeTxResetEpoch, psModeBuildSerial: uint32
   meControlReplyReady: bool
   meControlExpectedId, meControlFinalId: uint16
   meControlRequester: uint8
@@ -123,13 +126,11 @@ var
   apmPendingCancelMask, apmStoppingVifs: uint8
   rxVifEpochs: array[MAX_VIFS, uint32]
   apmPendingAssociations: array[5, int]
-  appIeBeaconLen: uint32
-  appIeBeaconPtr: pointer
   me: tuple[htSupp, psOn, requesterId, nss, htCapByte: uint8,
             activeMask, psDisableMask: uint32, htCaps: array[32, uint8], defKey: uint16]
   mm: tuple[idleFlag, previousState, hardwareMode: uint8]
   vifMgmt: tuple[activeList: CoList]
-  ps: tuple[mode: uint8]
+  ps: tuple[mode, pendingCount, flags: uint8, currentVif: pointer, statusFlags: uint32]
   state, meState, mmState: uint16
   psDeferred: bool
   psModes: seq[uint8]
@@ -138,6 +139,14 @@ var
   allocated: seq[pointer]
   cfms: seq[ApmStartCfmPayload]
   controlReplies: seq[tuple[id: uint16, src, dst: uint8, length: uint32]]
+  configCfmSawCommand: bool
+  configCfmSawOriginalRequest: bool
+  configCfmSeenFields: tuple[htSupp, psOn, nss, htCapByte: uint8, defKey: uint16]
+  configCfmSeenRequester: uint8
+  configCfmSeenCapInfo: uint16
+  configCfmHook: proc()
+  meConfigInProgress: bool
+  meControlEpoch: uint32
   timers: seq[uint16]
   timerClears: seq[uint16]
   cancelled, deleted: seq[uint8]
@@ -150,6 +159,7 @@ var
   beaconAllocationFails, channelMissing, initFails: bool
   hostContext: uint64
   expectedVif: uint8
+  expectedFreq: uint16
   expectedSsid: array[4, uint8]
   expectedPhrase: string
   request: pointer
@@ -181,7 +191,9 @@ proc newMessage(id: uint16; dst, src: uint8; n: uint32): pointer =
 proc ke_msg_alloc(id: uint16; dst, src: uint8; n: uint32): pointer =
   inc kernelAllocations
   if kernelAllocations == failAt: return nil
-  newMessage(id, dst, src, n)
+  result = newMessage(id, dst, src, n)
+  if id == MM_SET_BASIC_RATES_REQ:
+    cast[ptr MmSetBasicRatesReqPayload](result).band = 0xFF
 proc ke_msg_free(h: pointer) =
   let p = keMsgPayload(cast[ptr Header](h))
   let index = allocated.find(p)
@@ -193,6 +205,18 @@ proc co_list_push_back(q: ptr CoList; p: ptr Header)
 proc ke_msg_send(p: pointer) =
   let h = keMsgHdrFromPayload(p)
   if h.destId >= TASK_API:
+    if h.id == ME_CONFIG_CFM:
+      configCfmSawCommand = keMsgQueueSent.first != nil
+      configCfmSeenFields = (me.htSupp, me.psOn, me.nss, me.htCapByte, me.defKey)
+      configCfmSeenRequester = me.requesterId
+      configCfmSeenCapInfo = me.htCaps[0].uint16 or
+        (me.htCaps[1].uint16 shl 8)
+      if meControlCommand != nil:
+        let original = keMsgHdrFromPayload(meControlCommand)
+        configCfmSawOriginalRequest = original.id == ME_CONFIG_REQ and
+          original.destId == TASK_ME and original.srcId == TASK_API and
+          original.paramLen == MeConfigReqPayloadSize
+      if configCfmHook != nil: configCfmHook()
     if h.id != APM_START_CFM:
       controlReplies.add((h.id, h.srcId, h.destId, h.paramLen))
       ke_msg_free(h)
@@ -280,6 +304,7 @@ proc ke_state_get(task: uint8): uint16 =
   if task == TASK_APM: state elif task == TASK_MM: mmState else: meState
 proc mm_active() = ke_state_set(TASK_MM, 1)
 proc hal_machw_idle_req() = inc idleRequests
+proc mmConfigCancelIdle() = discard
 proc mmPsModeComplete()
 proc meTakeControlReply(request: pointer; id: uint16; length: uint32): pointer
 proc smCleanupOwnsRequest(request: pointer): bool = false
@@ -330,7 +355,7 @@ proc apm_sta_fw_delete(index: uint8; status, reason: uint16) =
 proc chan_ctxt_add(p: pointer; index: ptr uint8): uint8 =
   doAssert cast[uint](index) > 65535, "channel output pointer was truncated"
   let d = cast[ptr ChanCtxtDefView](p)
-  doAssert d.primFreq == 2437 and d.centerFreq1 == 2437 and d.centerFreq2 == 0
+  doAssert d.primFreq == expectedFreq and d.centerFreq1 == expectedFreq and d.centerFreq2 == 0
   doAssert d.txPower == 17
   inc channelAdds
   if channelStatus == 0: index[] = 2
@@ -347,7 +372,7 @@ proc chan_ctxt_unlink(vif: uint8) =
   vifs[vif].chanCtxt = nil
   inc channelDeletes
 proc me_freq_to_chan_ptr(band: uint8; freq: uint16): pointer =
-  doAssert band == 0 and freq == 2437
+  doAssert band == 0 and freq == expectedFreq
   if channelMissing: nil else: addr channel
 proc regRead(address: uint): uint32 =
   if address == MACHW_STATE_CNTRL_REG: 0 else: 0x1234
@@ -356,7 +381,6 @@ proc me_legacy_rate_bitfield_build(p: pointer; flag: uint8): uint32 =
   doAssert r[0] > 0 and r[0] <= 12
   15
 proc me_init_bcmc_rate(p: pointer) = inc rateInitialized
-proc apm_embedded_enabled(p: pointer): bool = apm.beaconIntervalIndex != 0
 proc tpc_update_vif_tx_power(v, p, r: pointer) =
   doAssert cast[ptr uint8](p)[] == 17
 proc allocBeacon(n: uint32): pointer {.cdecl.} =
@@ -373,6 +397,16 @@ proc blOpsFunc(n: int): pointer =
   of 188: cast[pointer](freeBeacon)
   of 200: cast[pointer](clockRead)
   else: nil
+when defined(bl808WifiMbedTlsSha1Lease):
+  var keySetupActive, keySetupFails: bool
+  proc beginShaApKeySetup(): bool =
+    if keySetupActive: return false
+    keySetupActive = true
+    true
+  proc finishShaApKeySetup(): bool =
+    doAssert keySetupActive
+    keySetupActive = false
+    not keySetupFails
 proc initialize(p: pointer): pointer {.cdecl.} =
   let a = cast[ptr WpaBeaconRegisterParamView](p)
   doAssert sizeof(WpaBeaconRegisterParamView) == 112
@@ -399,9 +433,6 @@ proc me_build_beacon(buf: pointer; vif: uint8; tim: ptr uint16;
   tim[] = 80
   timLength[] = 6
   200
-proc me_add_ie_customer(buf, ie: pointer; n: uint32): uint32 =
-  copyMem(buf, ie, n.int)
-  n
 proc reset(vif: uint8; secure = true) =
   poolBusy = false
   beaconResets = 0
@@ -444,6 +475,8 @@ proc reset(vif: uint8; secure = true) =
   meControlReply = nil
   meControlReplyReady = false
   mmPsModeRequest = nil
+  psModeBuildSerial = 0
+  ps = default(typeof(ps))
   psDeferred = false
   psModes.setLen(0)
   idleRequests = 0
@@ -453,6 +486,13 @@ proc reset(vif: uint8; secure = true) =
   keMsgQueueSaved = default(CoList)
   cfms.setLen(0)
   controlReplies.setLen(0)
+  configCfmSawCommand = false
+  configCfmSawOriginalRequest = false
+  configCfmSeenFields = default(typeof(configCfmSeenFields))
+  configCfmSeenRequester = 0
+  configCfmSeenCapInfo = 0
+  configCfmHook = nil
+  meConfigInProgress = false
   timers.setLen(0)
   timerClears.setLen(0)
   cancelled.setLen(0)
@@ -475,10 +515,9 @@ proc reset(vif: uint8; secure = true) =
   beaconAllocationFails = false
   channelMissing = false
   initFails = false
-  appIeBeaconLen = 0
-  appIeBeaconPtr = nil
   copiedBeacon.setLen(0)
   expectedVif = vif
+  expectedFreq = 2437
   expectedSsid = [97'u8, 0, 98, 99]
   expectedPhrase = "password"
   channel = default(ScanChannelEntry)
@@ -504,8 +543,8 @@ proc reset(vif: uint8; secure = true) =
   for i, value in expectedSsid: r.ssid[i] = value
   r.securityType = secure.uint8
   for i, value in expectedPhrase: r.passphrase[i] = value.uint8
-  r.extraIeLength = 3
-  r.extraIes[0 .. 2] = [7'u8, 1, 0xAA]
+  r.extraIeLength = 8
+  r.extraIes[0 .. 7] = [7'u8, 6, 85, 83, 32, 1, 11, 20]
   me.htSupp = 1
   me.psOn = 1
 '''
@@ -590,7 +629,7 @@ proc drainStartup(failBeacon = false; limit = high(int)) =
       doAssert mm_bcn_change_req_handler(p) == KeMsgNoFree
       doAssert lastBeacon == p
       let b = cast[ptr MmBcnChangeReqPayload](p)
-      doAssert b.beaconLength == 203 and b.timOffset == 80
+      doAssert b.beaconLength == 208 and b.timOffset == 80
       doAssert b.timLength == 6 and b.vifIdx == expectedVif
       copiedBeacon = newSeq[uint8](b.beaconLength.int)
       copyMem(addr copiedBeacon[0], addr b.beaconData[0], b.beaconLength.int)
@@ -611,6 +650,9 @@ proc drainStartup(failBeacon = false; limit = high(int)) =
       elif id == ME_SET_PS_DISABLE_REQ:
         status = me_set_ps_disable_req_handler(p)
       else:
+        if id == MM_SET_BASIC_RATES_REQ:
+          doAssert cast[ptr MmSetBasicRatesReqPayload](p).band ==
+            apmStartReqView(request).channel.band
         ke_msg_send_basic_reply(p, id + 1)
       if status == KeMsgConsumed: ke_msg_free(header)
       elif status == KeMsgSaved: co_list_push_back(addr keMsgQueueSaved, header)
@@ -618,20 +660,25 @@ proc drainStartup(failBeacon = false; limit = high(int)) =
 for vif in 0'u8 .. 1'u8:
   for secure in [false, true]:
     reset(vif, secure)
+    let edca = [0xA47'u32, 0xA43, 0x5E432, 0x2F322]
+    vifs[vif].edcaRegs = edca
     let startResult = dispatchStart()
     doAssert startResult == KeMsgNoFree, $vif & ":" & $secure & ":" & $cfms & ":" &
       $channelAdds & ":" & $initialized & ":" & $kernelAllocations
     doAssert beaconResets == 1
     doAssert not requestFreed and cfms.len == 0 and apm.connectInfo == request
     doAssert state == ApmActiveState and apm.pendingBssParams.first != nil
+    doAssert vifs[vif].edcaRegs == edca, "AP inherited the live EDCA bank"
     let allocationsBefore = kernelAllocations
     failAt = kernelAllocations + 1
     drainStartup()
     doAssert kernelAllocations == allocationsBefore
     doAssert requestFreed and allocated.len == 6 and cfms.len == 1
-    doAssert cfms[0] == ApmStartCfmPayload(status: 0, vifIdx: vif, band: 2, staIdx: vif + 5)
+    doAssert cfms[0] == ApmStartCfmPayload(status: 0, vifIdx: vif,
+                                          channelContextIndex: 2, staIdx: vif + 5)
     doAssert apm.connectInfo == nil and state == ApmIdleState and vifs[vif].state == 1
-    doAssert copiedBeacon[200 .. 202] == @[7'u8, 1, 0xAA]
+    doAssert copiedBeacon[86 .. 93] == @[7'u8, 6, 85, 83, 32, 1, 11, 20]
+    doAssert copiedBeacon[94] == 86 and copiedBeacon[^1] == 199
     doAssert beaconAllocs == 1 and beaconFrees == 1
     doAssert initialized == secure.int and timers.len == 1
     doAssert mm_bcn_change_cfm_handler(nil) == KeMsgConsumed
@@ -656,6 +703,8 @@ for failure in 1 .. 20:
   doAssert dispatchStart() == KeMsgConsumed
   doAssert requestFreed and allocated.len == 0 and keMsgQueueSent.first == nil
   doAssert apm.connectInfo == nil and apm.hostapdCtx == nil and state == ApmIdleState
+  doAssert apm.embeddedEnabled == 0 and apm.cryptoType == 0
+  doAssert apm.securityIe == default(typeof(apm.securityIe))
   if failure == 1: doAssert cfms.len == 0
   else: doAssert cfms.len == 1 and cfms[0].status != 0
   doAssert beaconFrees <= beaconAllocs and deinitialized <= initialized
@@ -676,7 +725,7 @@ doAssert dispatchStart() == KeMsgConsumed
 doAssert cfms.len == 1 and cfms[0].status == 8
 doAssert channelAdds == 0 and beaconResets == 0 and allocated.len == 0
 
-for malformed in 0 ..< 12:
+for malformed in 0 ..< 17:
   reset(1)
   let r = apmStartReqView(request)
   case malformed
@@ -694,26 +743,40 @@ for malformed in 0 ..< 12:
   of 8: channelStatus = 1
   of 9: channelMissing = true
   of 10: beaconAllocationFails = true
-  else: initFails = true
+  of 11: initFails = true
+  of 12: r.securityType = 3
+  of 13:
+    r.extraIeLength = 16
+    r.extraIes[8 .. 15] = r.extraIes[0 .. 7]
+  of 14: r.centerFreq1 = 2442
+  of 15: r.centerFreq2 = 2452
+  else: r.securityType = 255
   doAssert dispatchStart() == KeMsgConsumed
   doAssert requestFreed and allocated.len == 0 and keMsgQueueSent.first == nil
   doAssert apm.connectInfo == nil and apm.hostapdCtx == nil and state == ApmIdleState
   doAssert cfms.len == 1 and cfms[0].status != 0
+  if malformed in [9, 14, 15]:
+    doAssert channelAdds == 0 and beaconResets == 0 and beaconAllocs == 0,
+      "an invalid channel reached AP setup before rejection"
 
-for extraLength in [371'u32, 372]:
-  reset(0)
-  appIeBeaconPtr = cast[pointer](1)
-  appIeBeaconLen = extraLength
-  let started = dispatchStart()
-  if extraLength == 371:
-    doAssert started == KeMsgNoFree
-    drainStartup()
-    doAssert cfms.len == 1 and cfms[0].status == 0
-    apm.hostapdCtx = nil
-  else:
-    doAssert started == KeMsgConsumed
-    doAssert cfms.len == 1 and cfms[0].status == 1
-  doAssert allocated.len == (if extraLength == 371: 6 else: 0)
+for number in 1 .. 11:
+  reset(0, false)
+  expectedFreq = (2407 + 5 * number).uint16
+  let r = apmStartReqView(request)
+  r.channel.freq = expectedFreq
+  r.centerFreq1 = expectedFreq.uint32
+  doAssert dispatchStart() == KeMsgNoFree
+  drainStartup()
+  doAssert cfms.len == 1 and cfms[0].status == 0 and channelAdds == 1
+  doAssert vifs[0].state == 1 and vifs[0].channelFreqPair == expectedFreq.uint32
+
+reset(1)
+apmStartReqView(request).securityType = 2
+doAssert dispatchStart() == KeMsgNoFree
+drainStartup()
+doAssert cfms.len == 1 and cfms[0].status == 0
+doAssert initialized == 1 and vifs[1].state == 1
+apm.hostapdCtx = nil
 
 reset(1)
 expectedPhrase.setLen(0)
@@ -779,7 +842,7 @@ for stage in 0 ..< 6:
 
 def program_source() -> str:
     layout = (FW / "layout_types.nim").read_text()
-    names = ["ApmStartInfoView", "ApmStartChannelView", "ApmStartReqView",
+    names = ["ApFrameExtras", "ApmStartInfoView", "ApmStartChannelView", "ApmStartReqView",
              "ApmStartCfmPayload", "ApmStopReqPayload", "MmBcnChangeReqPayload", "MmBcnChangeCfmPayload", "MmSetVifStateReqPayload",
              "MeSetPsDisableReqPayload", "MmSetBssidReqPayload", "MmSetBasicRatesReqPayload",
              "MmSetBeaconIntReqPayload", "MeSetActiveReqPayload", "ScanChannelEntry",
@@ -816,14 +879,17 @@ def program_source() -> str:
     for name in ["ke_msg_alloc_reply", "ke_msg_send_basic_reply", "mmBeaconChangeConfirm"]:
         bodies += procedure(kernel, name)
     for name in ["meControlMessageMatches", "meCancelQueuedPayload", "mmPsModeCancel",
-                 "meControlReset", "meTakeControlReply", "meBeginControl", "meCompleteControl",
+                 "meControlReset", "meTakeControlReply", "meReserveControl", "meForwardControl",
+                 "meBeginControl", "meCompleteControl",
                  "mmPsModeComplete"]:
         bodies += procedure(handlers, name)
-    for name in ["me_rate_translate", "me_get_basic_rates", "me_add_chan_ctx",
+    for name in ["apm_embedded_enabled", "me_rate_translate", "me_get_basic_rates", "me_add_chan_ctx",
                  "meBeaconFrameLength", "apmFreeStartBuffers", "apmFinishStop", "apmContinueStartRollback", "apmBeginStartRollback", "apmResumeHaltRollback",
                  "apmVifNeedsStop", "apmBeginStop", "apmPrepareVifRemoval", "apm_stop",
                  "apm_start_cfm", "apm_send_next_bss_param",
                  "apm_set_bss_param", "apm_bcn_set"]:
+        bodies += procedure(scan, name)
+    for name in ["readApFrameExtras", "appendApFrameExtras"]:
         bodies += procedure(scan, name)
     bodies += procedure(handlers, "apm_start_req_handler")
     for name in ["apm_stop_req_handler", "apmVifRunning", "apm_sta_connect_timeout_ind_handler"]:
@@ -834,10 +900,10 @@ def program_source() -> str:
                  "me_set_active_cfm_handler_apm", "me_set_ps_disable_cfm_handler_apm"]:
         bodies += procedure(handlers, name)
     platform, reset = PLATFORM.split("proc reset(", 1)
-    return types + helpers + platform + bodies + "proc reset(" + reset
+    return types + helpers + platform + AP_EXTRAS_PLATFORM + bodies + "proc reset(" + reset
 
 
-def run_program(tmp_path: Path, build: str, checks: str) -> None:
+def run_program(tmp_path: Path, build: str, checks: str, *, lease: bool = False) -> None:
     nim = shutil.which("nim")
     if nim is None:
         pytest.skip("Nim is required")
@@ -845,6 +911,8 @@ def run_program(tmp_path: Path, build: str, checks: str) -> None:
     program.write_text(program_source() + checks)
     command = [nim, "c", "-r", "--skipParentCfg:on", "--skipProjCfg:on", "--skipUserCfg:on",
                f"--nimcache:{tmp_path / 'cache'}", f"-o:{tmp_path / 'test'}"]
+    if lease:
+        command += ["-d:bl808WifiMbedTlsSha1Lease"]
     if build == "release":
         command += ["-d:release", "--assertions:on"]
     elif build == "asan":
@@ -857,3 +925,21 @@ def run_program(tmp_path: Path, build: str, checks: str) -> None:
 @pytest.mark.parametrize("build", ["checked", "release", "asan"])
 def test_ap_start_transaction(tmp_path: Path, build: str) -> None:
     run_program(tmp_path, build, CHECKS)
+
+
+def test_ap_key_setup_failure_rolls_back_even_if_vendor_returns_context(tmp_path: Path) -> None:
+    run_program(tmp_path, "checked", CHECKS + r'''
+reset(1)
+keySetupFails = true
+doAssert dispatchStart() == KeMsgConsumed
+doAssert initialized == 1 and deinitialized == 1 and apm.hostapdCtx == nil
+doAssert not keySetupActive and beaconAllocs == 0 and channelDeletes == 1
+doAssert state == ApmIdleState and requestFreed and allocated.len == 0
+doAssert cfms.len == 1 and cfms[0].status == 1
+
+reset(1)
+keySetupFails = false
+doAssert dispatchStart() == KeMsgNoFree and not keySetupActive
+drainStartup()
+doAssert cfms.len == 1 and cfms[0].status == 0 and requestFreed
+''', lease=True)

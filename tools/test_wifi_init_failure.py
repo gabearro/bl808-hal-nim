@@ -24,6 +24,18 @@ var
   fw_nap_chain: array[8, uint8]
   fw_nap_chain_ptr: pointer
   bl_env: array[2, uint32]
+  configLogEnabled: bool
+  configLogCalls, configLogWrites: int
+  nimFwDbgMacTimingE8, nimFwDbgMacTimingF0, nimFwDbgMacTimingF4: uint32
+  nimFwDbgMacTimingF8, nimFwDbgMacTiming104: uint32
+proc configPrintf(format: cstring; nVap, endIdx, startIdx: cint) {.cdecl.} =
+  doAssert $format == "[WF] [KEY] [CFG] nVAP is %d, endidx %d, startidx %d\r\n"
+  doAssert (nVap, endIdx, startIdx) == (2.cint, 12.cint, 8.cint)
+  inc configLogCalls
+  configLogWrites = writes.len
+  calls.add("config-log")
+proc blOpsFunc(offset: int): pointer =
+  if offset == 4 and configLogEnabled: cast[pointer](configPrintf) else: nil
 proc regRead(address: uint): uint32 = registers.getOrDefault(address)
 proc regWrite(address: uint; value: uint32) =
   registers[address] = value
@@ -39,7 +51,6 @@ proc phy_get_mac_freq(): uint32 =
 proc phy_get_ntx(): uint8 =
   calls.add("chains")
   0
-proc bl808ApplyPureRfMacTimingBaseline() = calls.add("rf-baseline")
 proc me_init() = calls.add("me")
 proc mm_env_init() = calls.add("mm-env")
 proc vif_mgmt_init(): bool =
@@ -74,6 +85,9 @@ proc setupMac(success: bool) =
   pending = 0
   diagnostics = 0
   tx.resetInProgress = 0
+  configLogEnabled = false
+  configLogCalls = 0
+  configLogWrites = -1
 '''
 
 
@@ -83,6 +97,7 @@ def mac_source() -> str:
     interrupt_constants = re.findall(r"^  MACHW_INTC_.*$", kernel, re.M)
     code = registers + "\nconst\n" + "\n".join(interrupt_constants) + "\n"
     code += MAC_PLATFORM + procedure(kernel, "hal_machw_disable_int")
+    code += procedure(kernel, "snapshotMacTimingRegisters")
     code += procedure(kernel, "hal_machw_init") + procedure(kernel, "mm_init")
     return code + procedure((FW / "platform_bl.nim").read_text(), "bl_init")
 
@@ -110,7 +125,7 @@ doAssert calls.len == 0 and tx.resetInProgress == 1
 ready = true
 calls.setLen(0)
 doAssert bl_init()
-doAssert calls == @["me", "clock", "chains", "rf-baseline", "mm-env", "vif",
+doAssert calls == @["me", "clock", "chains", "mm-env", "vif",
   "sta", "td", "ps", "tx", "rx", "timer", "scan", "chan", "beacon", "ke", "supplicant"]
 doAssert diagnostics == 0 and pending == 0 and tx.resetInProgress == 0
 doAssert fw_nap_chain_ptr == cast[pointer](addr fw_nap_chain[0])
@@ -161,6 +176,114 @@ for enabled in [false, true]:
 ''')
 
 
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_firmware_entry_stops_after_rf_failure(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, main_source() + r'''
+for enabled in [false, true]:
+  setup(enabled, true, 0xA5A50121'u32)
+  rfReady = false
+  wifi_main(nil)
+  doAssert serviceCalls == 0 and interrupts == enabled
+  doAssert "mpif" notin steps and "intc-init" notin steps and "bl" notin steps
+  doAssert messages[^1] == (286.cint, "RF initialization failed\r\n")
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_firmware_entry_stops_after_ipc_failure(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, main_source() + r'''
+for enabled in [false, true]:
+  setup(enabled, true, 0xA5A50121'u32)
+  ipcReady = false
+  wifi_main(nil)
+  doAssert serviceCalls == 0 and interrupts == enabled
+  doAssert "bl" notin steps and "pm" notin steps and "timing" notin steps
+  doAssert messages[^1] == (297.cint, "IPC initialization failed\r\n")
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_backend_retries_after_ipc_failure(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, backend_source() + r'''
+for enabled in [false, true]:
+  setup(enabled, false, 0xA5A50121'u32)
+  fwStarted = false
+  ipcReady = false
+  doAssert not bl808WifiBackendFwStart()
+  doAssert not fwStarted and interrupts == enabled
+  doAssert "clear-embedded" notin steps and "bl" notin steps
+  ipcReady = true
+  doAssert bl808WifiBackendFwStart() and fwStarted
+  let before = steps
+  doAssert bl808WifiBackendFwStart()
+  doAssert steps == before
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_backend_retries_after_rf_failure(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, backend_source() + r'''
+for enabled in [false, true]:
+  setup(enabled, false, 0xA5A50121'u32)
+  fwStarted = false
+  rfReady = false
+  doAssert not bl808WifiBackendFwStart()
+  doAssert not fwStarted and interrupts == enabled
+  doAssert "power-profile" notin steps and "mpif" notin steps
+  rfReady = true
+  doAssert bl808WifiBackendFwStart() and fwStarted
+  let before = steps
+  doAssert bl808WifiBackendFwStart()
+  doAssert steps == before
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_firmware_entry_stops_when_rf_power_on_fails(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, main_source() + r'''
+for enabled in [false, true]:
+  setup(enabled, true, 0xA5A50121'u32)
+  rfOnStatus = -1
+  wifi_main(nil)
+  doAssert serviceCalls == 0 and interrupts == enabled
+  doAssert "rf-init" notin steps and "mpif" notin steps and "bl" notin steps
+  doAssert messages[^1] == (286.cint, "RF power-on failed\r\n")
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_backend_retries_after_rf_power_on_failure(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, backend_source() + r'''
+for enabled in [false, true]:
+  setup(enabled, false, 0xA5A50121'u32)
+  fwStarted = false
+  rfOnStatus = -1
+  doAssert not bl808WifiBackendFwStart()
+  doAssert not fwStarted and interrupts == enabled
+  doAssert "rf-init" notin steps and "control" notin steps
+  rfOnStatus = 0
+  doAssert bl808WifiBackendFwStart() and fwStarted
+  let before = steps
+  doAssert bl808WifiBackendFwStart()
+  doAssert steps == before
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_backend_stops_before_hardware_when_pm_init_fails(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, backend_source() + r'''
+for enabled in [false, true]:
+  setup(enabled, false, 0xA5A50121'u32)
+  fwStarted = false
+  pmInitStatus = -1
+  doAssert not bl808WifiBackendFwStart()
+  doAssert not fwStarted and interrupts == enabled
+  doAssert steps == @["setup-ops", "setup-hosal", "pm-init"]
+  pmInitStatus = 0
+  doAssert bl808WifiBackendFwStart() and fwStarted
+''')
+
+
 API_PLATFORM = r'''
 type
   WifiConf = object
@@ -184,6 +307,7 @@ var
   connectCb, disconnectCb, beaconCb, eventCb: pointer
   calls: seq[string]
   readyByte: uint8
+  pmRegisterStatus, pmAffairStatus: cint
 proc mgmrRaw(): pointer = addr manager
 proc zero(p: pointer; size: uint) =
   zeroMem(p, size.int)
@@ -213,6 +337,12 @@ proc bl606a0_wifi_init(conf: ptr WifiConf): cint =
 proc bl_main_phy_up(): cint =
   calls.add("phy")
   0
+proc wifi_mgmr_pm_ops_register(): cint =
+  calls.add("pm-register")
+  pmRegisterStatus
+proc wifi_mgmr_fw_affair_ops(): cint =
+  calls.add("pm-affair")
+  pmAffairStatus
 proc vendorPollFor(ms: uint32) = calls.add("poll")
 proc bl_rx_sm_connect_ind_cb_register(env, callback: pointer): cint =
   calls.add("connect")
@@ -251,8 +381,35 @@ fwReady = true
 calls.setLen(0)
 doAssert wifi_mgmr_init(nil) == 0
 doAssert fwStarted and wifiStarted and hostPollEnabled and readyByte == 1 and wifiInitialized
-doAssert calls == @["firmware", "host", "phy", "poll", "mutex", "mutex",
+doAssert calls == @["firmware", "host", "phy", "poll", "pm-register", "pm-affair", "mutex", "mutex",
                    "mutex", "connect", "disconnect", "beacon", "event"]
 let before = calls
 doAssert wifi_mgmr_init(nil) == 0 and calls == before
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_public_backend_retries_after_pm_registration_failure(tmp_path: Path, mode: str) -> None:
+    implementation = procedure(
+        (FW.parent / "support/mgmr_facade_parts/backend_init.nim").read_text(),
+        "bl808_wifi_backend_init",
+    )
+    facade = procedure(
+        (FW.parent / "facade_parts/backend_imports_parts/backend_core.nim").read_text(),
+        "wifi_mgmr_init",
+    )
+    run_program(tmp_path, mode, API_PLATFORM + implementation + facade + r'''
+fwReady = true
+pmRegisterStatus = -1
+doAssert wifi_mgmr_init(nil) == -1
+doAssert not wifiStarted and not wifiInitialized and not hostPollEnabled
+doAssert readyByte == 0
+doAssert calls == @["firmware", "host", "phy", "poll", "pm-register"]
+pmRegisterStatus = 0
+calls.setLen(0)
+doAssert wifi_mgmr_init(nil) == 0
+doAssert wifiStarted and wifiInitialized and hostPollEnabled and readyByte == 1
+doAssert calls == @["firmware", "host", "phy", "poll", "pm-register",
+  "pm-affair", "mutex", "mutex", "mutex", "connect", "disconnect",
+  "beacon", "event"]
 ''')

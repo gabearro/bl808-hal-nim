@@ -32,6 +32,8 @@ var
   tx: tuple[resetInProgress: uint8]
   registers: array[0x9000 div 4, uint32]
   writes: seq[tuple[address: uint, value: uint32, interrupts: bool]]
+  eventLog: seq[uint32]
+  assertionLines: seq[cint]
   interrupts: bool
   events, assertions, timeoutCalls: uint32
   nimFwDbgMachwGen, nimFwDbgMachwStatus, nimFwDbgMachwGenStatus: uint32
@@ -39,6 +41,7 @@ var
   halMachwRxCntrlBackup, halMachwStatusFlags: uint32
 proc psEnvView(): ptr PsEnvView = addr ps.value
 proc mmEnvView(): ptr MmEnvView = addr mm.value
+proc mmConfigCancelIdle() = discard
 proc txControlEnv(): ptr typeof(tx) = addr tx
 proc regRead(address: uint): uint32 =
   doAssert address >= MACHW_BASE and address < MACHW_BASE + 0x9000
@@ -53,7 +56,9 @@ proc irqSave(): uint32 =
   result = if interrupts: 8'u32 else: 0'u32
   interrupts = false
 proc irqRestore(saved: uint32) = interrupts = (saved and 8) != 0
-proc assert_rec(a, b: cstring; line: cint) = inc assertions
+proc assert_rec(a, b: cstring; line: cint) =
+  inc assertions
+  assertionLines.add(line)
 proc waitRegLowNibbleClear(address: uint): bool =
   doAssert address == MACHW_STATE_CNTRL_REG
   setRegister(address, 0)
@@ -64,6 +69,8 @@ proc ke_evt_set(mask: uint32) =
   if (mask and KE_EVT_IDLE) != 0:
     doAssert (ps.value.statusFlags and 4) == 0
   events = events or mask
+  eventLog.add(mask)
+proc ke_evt_clear(mask: uint32) = events = events and not mask
 proc bytes(p: pointer; size: int): seq[uint8] =
   let data = cast[ptr UncheckedArray[uint8]](p)
   for index in 0..<size: result.add(data[index])
@@ -97,7 +104,9 @@ proc setup(enabled: bool) =
   registers = default(typeof(registers))
   writes.setLen(0)
   events = 0
+  eventLog.setLen(0)
   assertions = 0
+  assertionLines.setLen(0)
   timeoutCalls = 0
   interrupts = enabled
   halMachwRxCntrlBackup = 0x31415926
@@ -179,6 +188,34 @@ setRegister(MACHW_INTC_STATUS_RAW, 4)
 hal_machw_gen_handler()
 doAssert assertions == 1 and events == 0
 doAssert bytes(addr ps, sizeof(ps)) == before
+''',
+    "interrupt_dispatch_order": r'''
+setup(true)
+ps.value.statusFlags = ps.value.statusFlags or 4
+setRegister(MACHW_STATE_CNTRL_REG, 0)
+setRegister(MACHW_INTC_UNMASK_REG, 0x000C008F'u32)
+setRegister(MACHW_INTC_STATUS_RAW, 0x000C000F'u32)
+setRegister(MACHW_INTC_GEN_RAW, 0x1C0'u32)
+hal_machw_gen_handler()
+doAssert eventLog == @[KE_EVT_PRIM_TBTT, KE_EVT_SEC_TBTT, KE_EVT_IDLE,
+                       KE_EVT_KE_TIMER, KE_EVT_MM_TIMER]
+doAssert timeoutCalls == 1 and assertionLines.len == 0
+doAssert ps.value.statusFlags == 0xC000000A'u32
+doAssert writes[0].address == MACHW_INTC_STATUS_ACK
+doAssert writes[0].value == 0x000C000F'u32
+doAssert writes[^1].address == MACHW_INTC_IRQ_SET_REG
+doAssert writes[^1].value == 0x1C0'u32
+
+setup(true)
+setRegister(MACHW_INTC_UNMASK_REG, 0x18F'u32)
+setRegister(MACHW_INTC_STATUS_RAW, 0x188'u32)
+setRegister(MACHW_INTC_GEN_RAW, 3'u32)
+hal_machw_gen_handler()
+doAssert assertionLines == @[634.cint, 637.cint, 695.cint]
+doAssert eventLog.len == 0
+doAssert writes[0].value == 0x188'u32
+doAssert writes[1].address == MACHW_INTC_IRQ_SET_REG
+doAssert writes[1].value == 3'u32
 ''',
     "reset_clears_pending": r'''
 for enabled in [false, true]:

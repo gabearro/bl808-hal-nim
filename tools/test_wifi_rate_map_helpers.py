@@ -64,13 +64,18 @@ def test_rate_init_uses_real_ht_nss(tmp_path: Path, mode: str) -> None:
     code += r'''
 proc checkNss(peerMask, localMask: int; value: uint8) =
   setup(true, 0xFFF, 0, 1, 0x861)
+  # The old word-indexed access read channel 1 power and channel 2 frequency.
+  meEnvView().chanConfig[4] = 20
+  meEnvView().chanConfig[5] = 0
+  meEnvView().chanConfig[6] = 0x71
+  meEnvView().chanConfig[7] = 0x09
   var peerMax, localMax: uint8
   for i in 0..<4:
     sta.vhtCaps[3 + i] = if (peerMask and (1 shl i)) != 0: value else: 0
-    me_env[11 + i] = if (localMask and (1 shl i)) != 0: value else: 0
+    meEnvView().htCaps[3 + i] = if (localMask and (1 shl i)) != 0: value else: 0
     if i > 0:
       if sta.vhtCaps[3 + i] != 0: peerMax = i.uint8
-      if me_env[11 + i] != 0: localMax = i.uint8
+      if meEnvView().htCaps[3 + i] != 0: localMax = i.uint8
   doAssert rcTryInitStation(addr sta),
     "peer=" & $peerMask & " local=" & $localMask & " value=" & $value &
     " errors=" & $errors
@@ -79,6 +84,10 @@ proc checkNss(peerMask, localMask: int; value: uint8) =
   doAssert caps.maxNss == min(peerMax, localMax)
   doAssert caps.mcsBitmaps[0] == 0xFF
   for i in 1..<4: doAssert caps.mcsBitmaps[i] == sta.vhtCaps[3 + i]
+  for i in 0..<caps.sampleCount.int:
+    doAssert rc_get_nss(rcRateConfig(sta.rcStats, i)) <= caps.maxNss
+  for word in policy.retryRate:
+    doAssert rc_get_nss((word and 0x3FFF).uint16) <= caps.maxNss
 for value in [1'u8, 0x80, 0xFF]:
   for peerStreams in 1..4:
     for localStreams in 1..4:

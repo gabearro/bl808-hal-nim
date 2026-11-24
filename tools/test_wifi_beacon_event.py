@@ -24,7 +24,7 @@ type
   Vif = object
     next, chanCtxt: pointer
     vifIdx, vifType, state, staIdx, probeCount, beaconCountdown, beaconDivisor: uint8
-    flags, tbttCount, beaconLossCount: uint32
+    flags, tbttCount, beaconLossCount, beaconRxCount: uint32
     apBeaconInterval: uint16
     tbttTimer, keepAliveTimer: Timer
   Sta = object
@@ -43,6 +43,8 @@ var
   keEvtField: uint32
   mmTbttAgingCount0, mmTbttAgingCount1: uint8
   logging, failLog: bool
+  onLog: proc(line: cint)
+  onTimerArm: proc(timer: ptr Timer)
   logLookups: int
   messages: seq[Message]
   assertions: seq[tuple[condition, file: string, line: cint]]
@@ -59,6 +61,10 @@ var
   resetting: bool
   retiring: array[2, bool]
   mmTbttActive: bool
+  mmBeaconProbeEpochs: array[MAX_VIFS, uint32]
+  mmTimerMutationTop: ptr MmTimerMutation
+
+template keEnvEventField(): ptr uint32 = addr keEvtField
 
 proc vifChannelAt(p: pointer): ptr Vif = cast[ptr Vif](p)
 proc vifChannelForIdx(i: uint8): ptr Vif = addr vifs[i]
@@ -114,9 +120,15 @@ proc sta_mgmt_aging_postponed_desc(p: pointer; status: uint32): uint32 =
 proc mm_timer_set(timer: ptr Timer; expiry: uint32) =
   timer.expiry = expiry
   operations.add("timer")
+  if onTimerArm != nil: onTimerArm(timer)
+proc mmTimerSetLocked(timer: pointer; expiry, saved: uint32) =
+  doAssert not interrupts
+  irqRestore(saved)
+  try: mm_timer_set(cast[ptr Timer](timer), expiry)
+  finally: discard irqSave()
 proc chan_is_on_channel(p: pointer): bool = false
 proc ps_check_tbtt(p: pointer) = raiseAssert "unexpected on-channel operation"
-proc mm_ap_probe_cfm(p: pointer; status: uint32) {.cdecl.} = discard
+proc mmStaBeaconProbeCfm(p: pointer; status: uint32) {.cdecl.} = discard
 proc txl_frame_send_null_frame(sta: uint8; callback: pointer; arg: uint32): uint8 =
   raiseAssert "unexpected on-channel transmission"
 proc wifi_hosal_pm_post_event(event, value: uint32; arg: pointer) =
@@ -149,6 +161,7 @@ proc logMessage(level: uint32; tag, file: cstring; line: cint; format: cstring)
   doAssert length > 0 and length < output.len.cint
   messages.add((line, $cast[cstring](addr output[0])))
   operations.add("log")
+  if onLog != nil: onLog(line)
   if failLog: raise newException(ValueError, "logger stopped")
 proc getLogFunc(slot: int): PlatformLogFunc =
   doAssert slot == 204
@@ -163,6 +176,7 @@ proc setup() =
   resetting = false
   retiring = default(typeof(retiring))
   mmTbttActive = false
+  mmTimerMutationTop = nil
   for i in 0 ..< vifs.len: vifs[i].vifIdx = i.uint8
   for sta in stations.mitems: sta.valid = 1
   mm = default(MmEnv)
@@ -172,6 +186,8 @@ proc setup() =
   mmTbttAgingCount1 = 10
   logging = false
   failLog = false
+  onLog = nil
+  onTimerArm = nil
   logLookups = 0
   messages.setLen(0)
   assertions.setLen(0)
@@ -190,10 +206,11 @@ def source() -> str:
     kernel = (FW / "kernel_mac_channel.nim").read_text()
     tx = (FW / "tx_layer.nim").read_text()
     layout = (FW / "layout_types.nim").read_text()
-    identity = re.search(r"(?ms)^  MmVifIdentity\b.*?(?=^  \w|\Z)", layout)
-    assert identity
+    types = "".join(re.search(rf"(?ms)^  {name}\b.*?(?=^  \w|\Z)", layout).group()
+                    for name in ("MmVifIdentity", "MmTimerMutation"))
     code = procedure(tx, "txl_cntrl_clear_bcn_ac")
-    for name in ["mmCaptureVif", "mmVifCurrent", "mmStaTimerCurrent"]:
+    for name in ["mmCaptureVif", "mmVifCurrent", "mmTimerActiveDelivery", "mmStaTimerCurrent",
+                 "mmStaTbttCurrent"]:
         if re.search(r"^proc " + name + r"\(", kernel, re.M):
             code += procedure(kernel, name)
     for name in ("mm_sta_tbtt", "mm_tbtt_evt", "mm_sta_timer_bcn_timeout",
@@ -203,7 +220,7 @@ def source() -> str:
         f"  {name}: uint32\n"
         for name in sorted(set(re.findall(r"\bnimFwDbg\w+", code)))
     )
-    return "type\n" + identity.group(0) + PLATFORM + debug + code
+    return "type\n" + types + PLATFORM + debug + code
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan", "goto"])
@@ -250,6 +267,74 @@ doAssert vifs[0].tbttCount == 1
 doAssert messages == @[(624.cint, "mm_sta_tbtt\r\n")]
 doAssert operations.filterIt(it notin ["save", "restore"]) == @["log", "timer", "timer", "program", "switch"]
 doAssert interrupts
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "firmware"])
+def test_beacon_received_during_tbtt_rearm_supersedes_watchdog(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+setup()
+let vif = addr vifs[0]
+vif.state = 1
+vif.staIdx = 3
+vif.tbttTimer.expiry = 50
+vif.beaconRxCount = high(uint32)
+stations[3].initialRateConfig = 1024
+mm.keepAliveInterval = 500
+onTimerArm = proc(timer: ptr Timer) =
+  if timer == addr vif.tbttTimer:
+    doAssert interrupts
+    inc vif.beaconRxCount
+    # A valid Beacon advances its own TBTT and cancels the previous watchdog.
+    vif.tbttTimer.expiry = 1200
+    vif.keepAliveTimer.expiry = 0
+mm_sta_tbtt(vif)
+doAssert vif.beaconRxCount == 0 and vif.tbttTimer.expiry == 1200
+doAssert vif.keepAliveTimer.expiry == 0, "old TBTT armed watchdog after Beacon"
+doAssert interrupts
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "firmware"])
+def test_beacon_received_during_timeout_log_prevents_false_miss(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+setup()
+logging = true
+let vif = addr vifs[0]
+vif.state = 1
+vif.flags = 1
+vif.beaconLossCount = 41
+onLog = proc(line: cint) =
+  doAssert line == 600 and interrupts
+  inc vif.beaconRxCount
+mm_sta_timer_bcn_timeout(vif)
+doAssert vif.beaconRxCount == 1
+doAssert vif.beaconLossCount == 41 and vif.flags == 1, "old timeout marked new Beacon missed"
+doAssert interrupts
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "firmware"])
+def test_rearmed_delivery_cannot_mark_replacement_watchdog_expired(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+for cancelBeforeCallback in [false, true]:
+  setup()
+  logging = true
+  let vif = addr vifs[0]
+  vif.state = 1
+  vif.flags = 1
+  vif.beaconLossCount = 41
+  var delivery = MmTimerMutation(timer: addr vif.keepAliveTimer,
+    delivering: true, cancelled: cancelBeforeCallback)
+  mmTimerMutationTop = addr delivery
+  onLog = proc(line: cint) =
+    doAssert line == 600 and interrupts
+    delivery.cancelled = true
+  mm_sta_timer_bcn_timeout(vif)
+  doAssert logLookups == (if cancelBeforeCallback: 0 else: 1)
+  doAssert vif.beaconRxCount == 0 and vif.beaconLossCount == 41 and vif.flags == 1
+  doAssert interrupts
+  mmTimerMutationTop = nil
 ''')
 
 

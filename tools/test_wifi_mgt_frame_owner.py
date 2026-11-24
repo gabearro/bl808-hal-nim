@@ -11,7 +11,7 @@ from test_wifi_mgt_receive import management_source
 
 
 def source() -> str:
-    code = ("var onAllocate, onSend: proc()\nvar onTrace: proc(label: string)\n"
+    code = ("var onAllocate: proc()\nvar onTrace: proc(label: string)\n"
             "var messageFrees: int\nvar transferFails: bool\n" + management_source())
     code = code.replace("template nimFwTrace2U32(args: varargs[untyped]) = discard", r'''
 proc nimFwTrace2U32(label: string; a, b: uint32) =
@@ -21,7 +21,8 @@ proc nimFwTrace2U32(label: string; a, b: uint32) =
     code = code.replace(old, old.replace("  inc allocationCalls\n",
         "  inc allocationCalls\n  if onAllocate != nil: onAllocate()\n", 1), 1)
     old = procedure(code, "ke_msg_send")
-    code = code.replace(old, old.replace("  inc sent\n", "  inc sent\n  if onSend != nil: onSend()\n", 1), 1)
+    code = code.replace(old, old.replace("  if onSend != nil: onSend()\n  inc sent\n",
+                                        "  inc sent\n  if onSend != nil: onSend()\n", 1), 1)
     old = procedure(code, "ke_msg_free_payload")
     code = code.replace(old, old + "  inc messageFrees\n", 1)
     old = procedure(code, "rxu_mpdu_upload_and_indicate")

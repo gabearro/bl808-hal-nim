@@ -84,6 +84,7 @@ def test_cancelled_transfer_is_not_prepared_or_reported_uploaded(tmp_path: Path,
 for direct in [false, true]:
   reset(0x0008, 40)
   if direct:
+    envState.machdrLen = rxu_cntrl_machdr_len_get(0x0008'u16)
     rxu_mpdu_upload_and_indicate(addr mpdu)
   else:
     doAssert rxu_cntrl_frame_handle(addr mpdu) == 0
@@ -121,6 +122,7 @@ for route in 0 .. 2:
       reset(0x0008, 40)
     interrupts = incoming
     if route == 0:
+      envState.machdrLen = rxu_cntrl_machdr_len_get(0x0008'u16)
       rxu_mpdu_upload_and_indicate(addr mpdu)
     else:
       doAssert rxu_cntrl_frame_handle(addr mpdu) == 0

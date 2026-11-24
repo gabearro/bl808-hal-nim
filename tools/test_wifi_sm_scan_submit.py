@@ -16,6 +16,8 @@ const
   SmWaitingState = 2'u16
   WLAN_FW_SCAN_NO_BSSID_AND_CHANNEL = 12
   WLAN_FW_JOIN_NETWORK_FAILURE = 14
+  WLAN_FW_CONNECT_ABORT_WHEN_JOINING_NETWORK = 25
+  WLAN_FW_CONNECT_ABORT_WHEN_SCANNING = 26
   MAX_VIFS = 2
   VIF_TYPE_STA = 0'u8
   TASK_SM = 4'u8
@@ -47,7 +49,7 @@ var
   conn, replacement: ConnectInfoView
   vifs: array[2, Vif]
   state: uint16
-  sm: tuple[connectInfo, connectIndMsg: pointer, joinBssFlag: uint8]
+  sm: tuple[connectInfo, connectIndMsg: pointer, joinBssFlag, cancelRequested: uint8]
   indication, otherIndication: uint32
   smTxSerials: array[2, uint32]
   rxVifEpochs: array[2, uint32]
@@ -130,7 +132,7 @@ proc setup(vifIndex = 1'u8) =
   conn = ConnectInfoView(vifIdx: vifIndex, ssidLen: 4, channelDuration: 0x12345678)
   conn.ssid[0..3] = [65'u8, 0, 66, 67]
   replacement = ConnectInfoView(vifIdx: vifIndex)
-  sm = (cast[pointer](addr conn), cast[pointer](addr indication), 7'u8)
+  sm = (cast[pointer](addr conn), cast[pointer](addr indication), 7'u8, 0'u8)
   state = SmIdleState
   for i in 0 ..< vifs.len: vifs[i] = Vif(vifIdx: i.uint8, staIdx: 0xFF)
   config = default(ScanuChannelConfigOverlay)
@@ -155,7 +157,7 @@ proc replaceOwner() =
   state = 6
 proc submit(joining: bool; allChannels = false) =
   let chan = if allChannels: nil else: cast[pointer](addr channel)
-  if joining: sm_join_bss(addr localMac[0], addr target[0], chan, 1)
+  if joining: sm_join_bss(addr localMac[0], addr target[0], chan, true)
   else: sm_scan_bss(addr localMac[0], addr target[0], chan)
 '''
 
@@ -173,7 +175,7 @@ def source() -> str:
             if line and not line.startswith("    "):
                 break
             code += line + "\n"
-    code += "\nproc sm_join_bss*(bssid, ssid, joinInfo: pointer; flag: uint32) {.exportc, cdecl.}\n"
+    code += "\nproc sm_join_bss*(bssid, ssid, joinInfo: pointer; flag: bool) {.exportc, cdecl.}\n"
     code += "proc sm_scan_bss*(bssid, ssid, chanInfo: pointer) {.exportc, cdecl.}\n" + PLATFORM
     owner = (FW / "station_tx_build.nim").read_text()
     for name in ["smTxCapture", "smTxBeginForVif", "smTxBegin", "smTxOwnerCurrent", "smTxSetOwnerState"]:
@@ -183,6 +185,7 @@ def source() -> str:
     code += "\n{.pragma: wifiCtrl.}\n" + (FW / "station_scan.nim").read_text()
     code += "\nproc resetScanTracking() =\n  doAssert smScanTags == nil\n  smScanLost = default(SmScanLost)\n"
     handlers = (FW / "scan_station_ap_me.nim").read_text()
+    code += procedure(handlers, "scanChannelValid")
     if re.search(r"^proc smSubmitScanRequest\(", handlers, re.M):
         code += procedure(handlers, "smSubmitScanRequest")
     code += procedure(handlers, "sm_scan_bss") + procedure(handlers, "sm_join_bss")
@@ -267,6 +270,24 @@ config.count = 15
 submit(false, true)
 doAssert sent.len == 0 and allocations == 0 and failures == @[(12'u16, 0xFFFF'u16)]
 ''',
+    "invalid_channel_frequency": r'''
+for joining in [false, true]:
+  for invalid in [(0'u8, 2413'u16), (0'u8, 2483'u16),
+                  (1'u8, 5006'u16), (1'u8, 5826'u16),
+                  (2'u8, 2412'u16)]:
+    setup()
+    channel.band = invalid[0]
+    channel.prim20Freq = invalid[1]
+    submit(joining)
+    doAssert sent.len == 0 and allocations == 0
+    doAssert failures == @[(12'u16, 0xFFFF'u16)]
+    doAssert state == SmIdleState
+setup()
+config.entries[0].prim20Freq = 2413
+submit(false, true)
+doAssert sent.len == 0 and allocations == 0
+doAssert failures == @[(12'u16, 0xFFFF'u16)]
+''',
     "no_eligible_channel": r'''
 setup()
 config.entries[0].flags = 2
@@ -290,7 +311,7 @@ for missing in 0 .. 2:
   setup()
   sm_join_bss((if missing == 0: nil else: addr localMac[0]),
               (if missing == 1: nil else: addr target[0]),
-              (if missing == 2: nil else: addr channel), 1)
+              (if missing == 2: nil else: addr channel), true)
   doAssert allocations == 0 and sent.len == 0 and failures == @[(12'u16, 0xFFFF'u16)]
 ''',
     "disabled_interrupts": r'''
@@ -332,7 +353,8 @@ for count in 0 .. 14:
   config.count = count.uint8
   var expected: seq[ScanChannelEntry]
   for index in 0 ..< count:
-    config.entries[index] = ScanChannelEntry(prim20Freq: (2412 + index * 5).uint16,
+    let frequency = if index == 13: 2484'u16 else: (2412 + index * 5).uint16
+    config.entries[index] = ScanChannelEntry(prim20Freq: frequency,
       flags: (if index mod 3 == 0: 2'u8 else: 0'u8), txPower: 17)
     if index mod 3 != 0: expected.add(config.entries[index])
   submit(false, true)
@@ -351,11 +373,11 @@ doAssert sent.len == 1 and sent[0].payload.channelCount == 1
 doAssert sent[0].payload.channelList[0].prim20Freq == 2412
 ''',
     "join_flags_and_scan_wildcard": r'''
-for flags in [0'u32, 1, 255, 256, high(uint32)]:
+for flags in [false, true]:
   setup()
   sm_join_bss(addr localMac[0], addr target[0], addr channel, flags)
-  doAssert sent.len == 1 and sm.joinBssFlag == cast[uint8](flags)
-  doAssert sent[0].payload.channelList[0].flags == (if flags == 0: 4'u8 else: 5'u8)
+  doAssert sent.len == 1 and sm.joinBssFlag == flags.uint8
+  doAssert sent[0].payload.channelList[0].flags == (if flags: 5'u8 else: 4'u8)
 setup()
 sm_scan_bss(addr localMac[0], nil, nil)
 doAssert sent.len == 1

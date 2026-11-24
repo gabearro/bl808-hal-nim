@@ -116,6 +116,24 @@ for irq in [false, true]:
   doAssert contexts[0].status == 2 and timers[2].expiry == 4000
   doAssert queueIds().len == 1 and chanCtxtTimerOwner.valid and enabled == irq
 ''',
+    "wrap_to_zero": r'''
+for (index, phase, contextsInUse, delay) in [
+    (0'u8, 2'u8, 1'u8, 4000'u32), (0'u8, 2'u8, 2'u8, 7000'u32),
+    (0'u8, 4'u8, 2'u8, 51200'u32), (3'u8, 4'u8, 2'u8, 30720'u32),
+    (4'u8, 4'u8, 2'u8, 30720'u32)]:
+  setupTbtt()
+  env.ctxtCount = contextsInUse
+  now = 0'u32 - delay
+  armOperation(index, phase)
+  doAssert timers[2].expiry == 0 and queueIds().len == 1
+  doAssert chanCtxtTimerOwner.valid and contexts[index].status == phase
+  now = high(uint32) - 59
+  mm_timer_schedule()
+  doAssert operationDelivery.len == 0 and queueIds().len == 1
+  now = 0
+  mm_timer_schedule()
+  doAssert operationDelivery == @[(index, phase)] and queueIds().len == 0
+''',
     "exceptions": r'''
 for irq in [false, true]:
   for boundary in 0 .. 2:

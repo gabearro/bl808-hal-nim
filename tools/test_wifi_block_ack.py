@@ -96,8 +96,12 @@ proc addBaRspActionBodyAt(p: pointer): ptr AddBaRspActionBodyView =
   cast[ptr AddBaRspActionBodyView](p)
 proc addBaReqActionBodyAt(p: pointer): ptr AddBaReqActionBodyView =
   cast[ptr AddBaReqActionBodyView](p)
+proc delBaActionBodyAt(p: pointer): ptr DelBaActionBodyView =
+  cast[ptr DelBaActionBodyView](p)
 proc meAddBaReqParamView(p: pointer): ptr MeAddBaReqParamView =
   cast[ptr MeAddBaReqParamView](p)
+proc delBaInfoView(p: pointer): ptr DelBaInfoView =
+  cast[ptr DelBaInfoView](p)
 proc bamEnvView(): ptr BamEnvView = cast[ptr BamEnvView](addr bam_env[0])
 proc ke_state_set(task: uint8; state: uint16) =
   doAssert task == TASK_BAM and state == BamIdleState
@@ -240,13 +244,18 @@ for action in [0'u8, 2, 3, 255]:
   reset()
   sendBa(0, nil, action, 1, 2, 0, nil)
   doAssert allocations == 0 and pushes == 0
-for invalid in 0 .. 2:
+for invalid in 0 .. 6:
   reset()
   var station = 0'u8
   case invalid
   of 0: station = 255
   of 1: stas[0].valid = 0
-  else: stas[0].instNbr = 255
+  of 2: stas[0].instNbr = 255
+  of 3: stas[0].macAddr[0] = 1
+  of 4: stas[0].macAddr = [0'u8, 0, 0, 0, 0, 0]
+  of 5: vifs[0].macAddr[0] = 1
+  else: vifs[0].macAddr = [0'u8, 0, 0, 0, 0, 0]
+  mfp = 2
   sendBa(station, nil, 1, 1, 2, 0, nil)
   doAssert allocations == 0 and pushes == 0
 """,
@@ -261,7 +270,7 @@ for params in 0'u32 .. 65535'u32:
   let p = request(message, station, params.uint16)
   doAssert rxu_mgt_ind_handler_bam(p) == 0
   doAssert allocations == 1 and pushes == 1
-  let supported = ((params shr 2) and 15) < 8
+  let supported = ((params shr 2) and 15) < 8 and (params and 2) != 0
   doAssert mmio == (if supported: 0xABCD0090'u32 else: 0xABCD0010'u32)
   let body = addBaRspActionBodyAt(addr link.macHeader[24])
   let requestedWindow = params shr 6
@@ -272,7 +281,7 @@ for params in 0'u32 .. 65535'u32:
   doAssert body.timeout == 0 and body.dialogToken == 0xEF
 """,
     "malformed": r"""
-for invalid in 0 .. 8:
+for invalid in 0 .. 9:
   reset()
   var message: Message
   var p = request(message, 0, 0xFFFF)
@@ -286,7 +295,8 @@ for invalid in 0 .. 8:
   of 5: view.vifIdx = 1
   of 6: stas[0].instNbr = 255
   of 7: rxuMgtIndMsgAt(p).frameLen = 8
-  else: rxuMgtIndMsgAt(p).frameLen = 37
+  of 8: rxuMgtIndMsgAt(p).frameLen = 37
+  else: view.dialogToken = 0
   doAssert rxu_mgt_ind_handler_bam(p) == 0
   doAssert allocations == 0 and pushes == 0 and mmio == 0xABCD0010'u32
 for size in 0'u32 .. 40'u32:
@@ -329,6 +339,21 @@ for tid in 0'u8 .. 15'u8:
         doAssert body.timeout == 0xABCD and body.startSeq == (ssn shl 4)
         for i in 0 ..< 3: doAssert bytes[i] == 0xA5
         for i in 12 ..< bytes.len: doAssert bytes[i] == 0xA5
+
+var bytes: array[16, uint8]
+for byte in bytes.mitems: byte = 0xA5
+var req = MeAddBaReqParamView(dialogToken: 1)
+var del = DelBaInfoView(initiator: 1, tid: 7)
+doAssert me_build_add_ba_req(addr bytes[3], nil) == 0
+doAssert me_build_add_ba_req(nil, addr req) == 0
+doAssert me_build_add_ba_rsp(nil, nil, 0, 0, 0) == 0
+doAssert me_build_del_ba(addr bytes[3], nil, 37) == 0
+doAssert me_build_del_ba(nil, addr del, 37) == 0
+for byte in bytes: doAssert byte == 0xA5
+doAssert me_build_del_ba(addr bytes[3], addr del, 37) == 6
+doAssert bytes[3..8] == [3'u8, 2, 0, 0x78, 37, 0]
+for i in 0 ..< 3: doAssert bytes[i] == 0xA5
+for i in 9 ..< bytes.len: doAssert bytes[i] == 0xA5
 """,
 }
 
@@ -342,13 +367,14 @@ def test_block_ack_responder(tmp_path: Path, mode: str, release: bool) -> None:
     layout = (FW / "layout_types.nim").read_text()
     types = "type\n"
     for name in ["TxSessionIdentity", "RxuMgtDispatchView", "RxuMgtIndMsgView", "BamEnvView", "MeAddBaReqParamView",
-                 "AddBaReqActionBodyView", "AddBaRspActionBodyView"]:
+                 "AddBaReqActionBodyView", "AddBaRspActionBodyView", "DelBaInfoView", "DelBaActionBodyView"]:
         match = re.search(r"(?ms)^  " + name + r"\b.*?(?=^  \w|\Z)", layout)
         assert match, name
         types += match.group(0)
     management = (FW / "scan_station_ap_me.nim").read_text()
     functions = procedure(management, "me_build_add_ba_req")
     functions += procedure(management, "me_build_add_ba_rsp")
+    functions += procedure(management, "me_build_del_ba")
     functions += procedure((FW / "block_ack.nim").read_text(), "bam_init")
     functions += procedure((FW / "block_ack.nim").read_text(), "bam_send_air_action_frame")
     functions += procedure((FW / "task_handlers.nim").read_text(), "rxu_mgt_ind_handler_bam")

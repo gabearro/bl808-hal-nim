@@ -60,22 +60,20 @@ proc ke_task_init*() {.exportc, cdecl.} =
 # ###########################################################################
 
 proc wifiEventPendingWork(): bool {.inline.} =
-  keEvtField != 0
+  keEnvEventField()[] != 0
 
 proc wifiKernelTimerPendingWork(): bool {.inline.} =
-  keTimerExpired(cast[ptr KeTimerEntry](keTimerQueue.first))
+  # Lookahead is for dispatched timer handlers, not unposted poll fallbacks.
+  keTimerExpired(cast[ptr KeTimerEntry](keTimerQueue.first), fromPoll = true)
 
 proc wifiMmTimerPendingWork(): bool {.inline.} =
-  mmTimerExpired(mm_timer_list.first)
+  mmTimerExpired(mm_timer_list.first, fromPoll = true)
 
 proc wifiMessagePendingWork(): bool {.inline.} =
   keMsgQueueSent.first != nil or keSavedReschedMask != 0
 
-proc wifiMessageEventPending(): bool {.inline.} =
-  (keEvtField and KE_EVT_KE_MESSAGE) != 0
-
-proc wifiHiddenMessagePendingWork(): bool {.inline.} =
-  wifiMessagePendingWork() and not wifiMessageEventPending()
+proc wifiResetEventPending(): bool {.inline.} =
+  (keEnvEventField()[] and KE_EVT_RESET) != 0
 
 proc wifiMainHasPendingWork(): bool =
   wifiEventPendingWork() or wifiKernelTimerPendingWork() or
@@ -84,6 +82,7 @@ proc wifiMainHasPendingWork(): bool =
     smScanNeedsService() or smRegistrationNeedsService()
 
 proc wifiUpdateMacPlCtrl() {.inline.} =
+  ## arch_main.o:wifi_main samples the bit once per step before sleep scheduling.
   let tslo = macTimeNow()
   var ctrl = regRead(MAC_PL_CTRL_REG)
   if (tslo and 0x00080000'u32) != 0:
@@ -98,34 +97,40 @@ proc wifiWaitForWorkIfIdle(blockWhenIdle, hasWork: bool): bool =
     ipc_emb_wait()
     result = wifiMainHasPendingWork()
 
+proc wifiDispatchScheduledEvent(): bool =
+  let pending = block:
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    var events = keEnvEventField()[]
+    # Compare against a single bit to exclude all equal or higher priorities.
+    # A recovered event is local to this dispatch, not a latched IRQ.
+    if events < KE_EVT_MM_TIMER and wifiMmTimerPendingWork():
+      events = events or KE_EVT_MM_TIMER
+    elif events < KE_EVT_KE_TIMER and wifiKernelTimerPendingWork():
+      events = events or KE_EVT_KE_TIMER
+    elif events < KE_EVT_KE_MESSAGE and wifiMessagePendingWork():
+      events = events or KE_EVT_KE_MESSAGE
+    events
+  if pending == 0: return false
+  keDispatchEvent(pending)
+  true
+
 proc wifiDrainScheduledWork(): bool =
-  if smRegistrationNeedsService():
-    smRegistrationService()
-    result = true
-  if smScanNeedsService():
-    smScanService()
-    result = true
-  if smActivationNeedsService():
-    smActivationService()
-    result = true
-  if smBssNeedsService():
-    smBssService()
-    result = true
-  if smCleanupNeedsService():
-    smCleanupService()
-    result = true
-  if wifiKernelTimerPendingWork():
-    result = true
-    ke_timer_schedule()
-  if wifiMmTimerPendingWork():
-    result = true
-    mm_timer_schedule()
-  if wifiEventPendingWork():
-    result = true
-  ke_evt_schedule()
-  if wifiHiddenMessagePendingWork():
-    result = true
-    ke_task_schedule()
+  if wifiResetEventPending(): return wifiDispatchScheduledEvent()
+  template serviceWhen(ready, service: untyped) =
+    if ready:
+      # An earlier service or IRQ can post reset before the next callback.
+      if wifiResetEventPending():
+        if wifiDispatchScheduledEvent(): result = true
+        return
+      service
+      result = true
+  serviceWhen(smRegistrationNeedsService(), smRegistrationService())
+  serviceWhen(smScanNeedsService(), smScanService())
+  serviceWhen(smActivationNeedsService(), smActivationService())
+  serviceWhen(smBssNeedsService(), smBssService())
+  serviceWhen(smCleanupNeedsService(), smCleanupService())
+  if wifiDispatchScheduledEvent(): result = true
 
 proc wifiMainServiceStep(blockWhenIdle = false): bool =
   ## Run one WiFi firmware service iteration.
@@ -136,6 +141,7 @@ proc wifiMainServiceStep(blockWhenIdle = false): bool =
   ## form and let the scheduler decide when to sleep.
   wifiUpdateMacPlCtrl()
   bl_sleep_schedule()
+  if napScheduleState == BlNapWaking: return false
 
   result = wifiWaitForWorkIfIdle(blockWhenIdle, wifiMainHasPendingWork())
 
@@ -153,6 +159,9 @@ proc wifi_main_service_step*(blockWhenIdle: uint8 = 0'u8) {.exportc, cdecl.} =
 
 proc wifi_main_poll_once*() {.exportc, cdecl.} =
   discard wifiMainServiceNonblocking()
+
+proc wifi_pm_wake_pending*(): bool {.exportc, cdecl.} =
+  napScheduleState == BlNapWaking
 
 proc wifiMainLog(sourceLine: cint; message: cstring) {.noinline.} =
   let logFn = cast[proc(level: uint32; tag, file: cstring; line: cint;
@@ -191,8 +200,13 @@ proc wifi_main*(param: pointer) {.exportc, cdecl.} =
   irqRestore(saved)
 
   # RF initialization (external platform functions)
-  wifi_hosal_rf_turn_on()
+  if wifi_hosal_rf_turn_on() != 0:
+    wifiMainLog(286, "RF power-on failed\r\n")
+    return
   wifiRfCoreInit(40000000'u32)
+  if not wifiRfCoreReady():
+    wifiMainLog(286, "RF initialization failed\r\n")
+    return
   wifiMainLog(286, "Done\r\n")
 
   # The vendor enables this control bit before initializing MPIF/MAC/IPC.
@@ -210,6 +224,9 @@ proc wifi_main*(param: pointer) {.exportc, cdecl.} =
 
   wifiMainLog(295, "Configure IPC...\r\n")
   ipc_emb_init()
+  if ipcEmbEnv == nil:
+    wifiMainLog(297, "IPC initialization failed\r\n")
+    return
   wifiMainLog(297, "Done\r\n")
 
   # Platform init — bl_init calls mm_init which initializes all subsystems
@@ -219,7 +236,7 @@ proc wifi_main*(param: pointer) {.exportc, cdecl.} =
     return
   wifiMainLog(301, "Done\r\n")
 
-  bl_pm_ops_register(nil)
+  discard bl_pm_ops_register()
   wifiMainLog(315, "Starting loop...\r\n")
 
   # Configure BCN registers (blob: BCN_STATUS_REG sequence)
@@ -246,7 +263,7 @@ proc wifi_main*(param: pointer) {.exportc, cdecl.} =
   #   if set: read MAC_PL_CTRL; ori 1 (enable clock)
   #   if clear: read MAC_PL_CTRL; andi ~1 (disable clock)
   # .L28: write MAC_PL_CTRL; call bl_sleep_schedule;
-  #   load keEvtField; if == 0: call ipc_emb_wait;
+  #   load ke_env event field; if == 0: call ipc_emb_wait;
   #   call ke_evt_schedule; j .L23
   while true:
     discard wifiMainServiceBlockingIdle()

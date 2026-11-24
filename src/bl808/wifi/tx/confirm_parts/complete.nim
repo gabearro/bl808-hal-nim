@@ -9,12 +9,24 @@ proc bl_tx_cfm*(callbackContext, hostTxBuffer: pointer): cint {.exportc, cdecl.}
   if etherType == 0x8e88'u16 or etherType == 0x888e'u16:
     {.emit: "{ extern volatile unsigned int nimfw_dbg_bl_tx_cfm_eapol; nimfw_dbg_bl_tx_cfm_eapol++; }".}
   let txStatusWord = txHdrView(txHeaderPtr).status
+  when defined(bl808WifiDiagTcpPath):
+    let length = txHdrLen(txHeaderPtr)
+    if length in PbufLinkEncapsulationHlen .. TxBufferPayloadSize:
+      let wireLength = (length - PbufLinkEncapsulationHlen).uint
+      logTcpCompletion(observeTcpPath(ethernetFramePtr, wireLength, wireLength),
+                       txHeaderPtr, hostTxBuffer, txStatusWord)
+  when defined(bl808WifiDiagHostTxStatus):
+    let length = txHdrLen(txHeaderPtr)
+    if length in PbufLinkEncapsulationHlen .. TxBufferPayloadSize:
+      noteHostDataTxConfirm(ethernetFramePtr, (length - PbufLinkEncapsulationHlen).uint,
+                            txStatusWord, txHdrRepush(txHeaderPtr),
+                            volatileLoad(cast[ptr uint32](MACHW_TIMLO_REG)))
   if txStatusWord == 0'u32:
     bl_os_printf("[TX] FW return status is NULL!!!\n\r")
 
   let txConfirmResult = txCheckRet(
     txHdrVifType(txHeaderPtr), if isBcMc(ethernetHeader.dst[0]): 1'u8 else: 0'u8, txStatusWord)
-  logDhcpTxConfirm(ethernetHeader, txHeaderPtr, txConfirmResult, txStatusWord)
+  logDhcpTxConfirm(ethernetHeader, txHeaderPtr, txConfirmResult, txStatusWord, hostTxBuffer)
 
   let station = staAt(txHdrStaId(txHeaderPtr).int)
   let stationState = staView(station)

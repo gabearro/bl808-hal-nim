@@ -11,6 +11,124 @@ from test_wifi_tx_security import program_source
 
 
 CASES = {
+    "unreserved_key": r'''
+setup(2, 41, true)
+let before = frame
+let beforeCounter = counter()
+let beforeScratch = desc.pnScratch
+doAssert not txSecurityCurrent(addr desc),
+  "an encrypted frame without a PN reservation was considered current"
+doAssert txSecurityLengthsCurrent(addr desc) == (-1, -1)
+doAssert txu_cntrl_sec_hdr_append(addr desc, addr frame[48], 1) == nil
+doAssert frame == before and counter() == beforeCounter and
+  desc.pnScratch == beforeScratch
+keys.pairwiseKey = nil
+doAssert txSecurityCurrent(addr desc), "unkeyed frame needs no PN reservation"
+doAssert txSecurityLengthsCurrent(addr desc) == (0, 0)
+doAssert txu_cntrl_sec_hdr_append(addr desc, addr frame[48], 1) == addr frame[48]
+doAssert frame == before
+''',
+    "invalid_unkeyed_station": r'''
+setup(2, 41, true)
+keys.pairwiseKey = nil
+doAssert txSecurityCurrent(addr desc)
+desc.staInfoIdx = STA_INFO_TAB_ENTRIES.uint8
+doAssert not txSecurityCurrent(addr desc)
+doAssert txSecurityLengthsCurrent(addr desc) == (-1, -1)
+desc.staInfoIdx = 255
+doAssert not txSecurityCurrent(addr desc)
+''',
+    "stationless_internal_frame": r'''
+setup(2, 41, true)
+desc.staInfoIdx = 0xFF
+var hw = HostTxHwDescView(frameLen: 30)
+desc.hwDesc = addr hw
+for frameControl in [0x0040'u16, 0x0050, 0x0080, 0x00C4]:
+  let header = macFrameControlAt(addr hostTxLinkDescAt(desc.bufDesc).macHeader[0])
+  header.frameControl = frameControl
+  doAssert txSecurityCurrent(addr desc)
+  doAssert txSecurityLengthsCurrent(addr desc) == (0, 0)
+  header.frameControl = frameControl or 0x4000'u16
+  doAssert not txSecurityCurrent(addr desc)
+  header.frameControl = frameControl
+  desc.queueFirst = addr frame[0]
+  doAssert not txSecurityCurrent(addr desc)
+  desc.queueFirst = nil
+
+let header = macFrameControlAt(addr hostTxLinkDescAt(desc.bufDesc).macHeader[0])
+for frameControl in [0x0008'u16, 0x000C, 0x0041]:
+  header.frameControl = frameControl
+  doAssert not txSecurityCurrent(addr desc)
+header.frameControl = 0x0040
+hw.frameLen = 5
+doAssert not txSecurityCurrent(addr desc)
+hw.frameLen = 30
+desc.vifIdx = MAX_VIFS.uint8
+doAssert not txSecurityCurrent(addr desc)
+desc.vifIdx = 1
+desc.staInfoIdx = 3
+doAssert allocate() == 8
+desc.staInfoIdx = 0xFF
+doAssert not txSecurityCurrent(addr desc), "a stale binding cannot become a stationless frame"
+''',
+    "keyed_internal_null": r'''
+setup(2, 41, true)
+var hw: HostTxHwDescView
+desc.hwDesc = addr hw
+let header = addr hostTxLinkDescAt(desc.bufDesc).macHeader[0]
+let fc = macFrameControlAt(header)
+hw.payloadStart = pointerAddrU32(header)
+for (control, length) in [(0x0148'u16, 24'u32), (0x01C8'u16, 26'u32), (0x02C8'u16, 26'u32)]:
+  fc.frameControl = control
+  hw.frameLen = length + 4
+  hw.payloadEnd = hw.payloadStart + length - 1
+  doAssert txSecurityCurrent(addr desc, allowInternalNull = true)
+  doAssert not txSecurityCurrent(addr desc)
+  doAssert txSecurityLengthsCurrent(addr desc) == (-1, -1)
+  for rejected in [control or 0x4000, control or 1, 0x0108'u16, 0x0188'u16]:
+    fc.frameControl = rejected
+    doAssert not txSecurityCurrent(addr desc, allowInternalNull = true)
+  fc.frameControl = control
+  for n in [length + 3, length + 5]:
+    hw.frameLen = n
+    doAssert not txSecurityCurrent(addr desc, allowInternalNull = true)
+  hw.frameLen = length + 4
+  inc hw.payloadEnd
+  doAssert not txSecurityCurrent(addr desc, allowInternalNull = true)
+  dec hw.payloadEnd
+  inc hw.payloadStart
+  doAssert not txSecurityCurrent(addr desc, allowInternalNull = true)
+  dec hw.payloadStart
+  desc.queueFirst = addr frame[0]
+  doAssert not txSecurityCurrent(addr desc, allowInternalNull = true)
+  desc.queueFirst = nil
+  desc.usedFlag = 1
+  doAssert not txSecurityCurrent(addr desc, allowInternalNull = true)
+  desc.usedFlag = 0
+doAssert counter() == 41
+doAssert allocate() == 8
+inc rxKeyRevision
+rxKeyLastChanged[0] = rxKeyRevision
+doAssert not txSecurityCurrent(addr desc, allowInternalNull = true),
+  "a stale key binding cannot be bypassed by the internal-null check"
+''',
+    "header_length_binding": r'''
+for cipher in 0'u8..3'u8:
+  setup(cipher, 41, true)
+  let expected =
+    case cipher
+    of 0'u8, 3'u8: (4, 4)
+    of 1'u8: (8, 12)
+    else: (8, 8)
+  doAssert txSecurityLengthsCurrent(addr desc) == (-1, -1)
+  doAssert allocate() == expected[0].uint32
+  doAssert txSecurityLengthsCurrent(addr desc) == expected
+  inc rxKeyRevision
+  rxKeyLastChanged[0] = rxKeyRevision
+  doAssert txSecurityLengthsCurrent(addr desc) == (-1, -1)
+  txSecurityForget(addr desc)
+  doAssert txSecurityLengthsCurrent(addr desc) == (-1, -1)
+''',
     "same_slot_replacement": r'''
 setup(2, 41, true)
 doAssert allocate() == 8
@@ -86,6 +204,21 @@ txSecurityForget(addr frames[3])
 doAssert txu_cntrl_sechdr_len_compute(addr frames[^1], addr tail) == 8
 doAssert counter() == reservedPn + 1
 ''',
+    "exhausted_counter_releases_binding": r'''
+setup(2, 0xFFFFFFFFFFFF'u64, true)
+var frames: array[TxSecurityReservationCount + 1, HostTxDescView]
+for i in 0..<TxSecurityReservationCount:
+  frames[i] = desc
+  doAssert txu_cntrl_sechdr_len_compute(addr frames[i], addr tail) == high(uint32)
+  doAssert not txSecurityCurrent(addr frames[i])
+for binding in txSecurityReservations:
+  doAssert binding.descriptor == nil, "exhausted PN retained a TX reservation"
+key.pnLow = 41
+key.pnHigh = 0
+frames[^1] = desc
+doAssert txu_cntrl_sechdr_len_compute(addr frames[^1], addr tail) == 8
+doAssert txSecurityCurrent(addr frames[^1]) and counter() == 42
+''',
     "reuse_after_release": r'''
 setup(2, 41, true)
 doAssert allocate() == 8
@@ -102,10 +235,25 @@ key.staIdx = 4
 vifs[1].groupKeyPtr = addr key
 doAssert txSecurityBind(addr desc, addr key, true)
 doAssert txSecurityCurrent(addr desc)
+doAssert txSecurityLengthsCurrent(addr desc) == (-1, -1)
 keys.pairwiseKey = nil
 doAssert txSecurityCurrent(addr desc)
 inc rxKeyRevision
 rxKeyLastChanged[0] = rxKeyRevision
+doAssert not txSecurityCurrent(addr desc)
+''',
+    "bip_requires_key": r'''
+setup(2, 41, true)
+vifs[1].groupKeyPtr = nil
+doAssert not txSecurityBind(addr desc, nil, true)
+doAssert txSecurityReservations[0].descriptor == nil
+''',
+    "length_snapshot_atomic": r'''
+setup(2, 41, true)
+doAssert allocate() == 8
+onRestore = proc() = keys.pairwiseKey = nil
+doAssert txSecurityLengthsCurrent(addr desc) == (8, 8)
+doAssert keys.pairwiseKey == nil and interrupts
 doAssert not txSecurityCurrent(addr desc)
 ''',
     "descriptor_identity": r'''
@@ -177,7 +325,8 @@ for stage in ["lower", "append", "copy", "buffer_trace", "header", "traffic", "p
   txEnv = default(TxEnv)
   backup = default(typeof(backup))
   frames[0] = HostTxDescView(vifIdx: 1, staInfoIdx: 0, staIdx: 0,
-    hdrLen: 34, frameLen: (if stage == "header": 0x0008'u16 else: 0x8E88'u16),
+    hdrLen: 34, qosExtLen: 8,
+    frameLen: (if stage == "header": 0x0008'u16 else: 0x8E88'u16),
     seqPassthrough: 100, hwDesc: addr hw[0], queueFirst: cast[pointer](1),
     policy: addr templateBytes)
   frames[0].bufferPtrs[0] = 0x20000000
@@ -238,7 +387,7 @@ proc ipcHostTxWrapperFromDesc(d: ptr HostTxDescView): ptr Wrapper = addr wrapper
 proc ipcEmbEnvView(): ptr IpcEnv = addr ipcEnv
 proc utils_list_push_back(list, node: pointer) =
   doAssert not interrupts
-  doAssert txSecurityCurrent(addr desc), "binding survived IPC ownership publication"
+  doAssert not txSecurityCurrent(addr desc), "IPC publication retained a PN reservation"
   published = true
 '''
     tx = (FW / "tx_layer.nim").read_text()
@@ -260,6 +409,6 @@ for enabled in [false, true]:
       published = false
       ipc_emb_txcfm(addr desc)
       doAssert published
-    doAssert txSecurityCurrent(addr desc) and interrupts == enabled
+    doAssert not txSecurityCurrent(addr desc) and interrupts == enabled
 '''
     run_program(tmp_path, mode, code)

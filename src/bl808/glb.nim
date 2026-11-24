@@ -772,6 +772,28 @@ proc releaseD0*(forceLoad: bool = true) =
   regClear(MmSwSysReset, MmCpu0Reset)   # deassert reset
   core.fenceIo()
 
+proc releaseD0Xip*(): bool =
+  ## Opt-in native XIP boot for an image linked at 0xD8100000 and stored at
+  ## the Ox64 D0 flash offset. Leave D0 held in reset if the flash entry does
+  ## not match our startup signature; the DRAM releaseD0 path remains intact.
+  ## This path still needs real Ox64 verification, including concurrent XIP.
+  mmPowerOn()
+  regSet(MmSwSysReset, MmCpu0Reset)
+  core.fenceIo()
+  # The linker fixes D0 at alias + 0x100000. A nonzero SF image remap would
+  # select different physical bytes at that address, so fail closed.
+  if (regRead(SfCtrlImageOffset0) and SfCtrlImageOffsetMask) != 0'u32:
+    return false
+  if not d0FlashImageAvailable():
+    return false
+  regWrite(MmCpu0BootAddr, (FlashRemapBase + Ox64D0BootOffset).uint32)
+  core.fenceIo()
+  regSet(MmClkCtrlCpu, MmCpu0ClkEn)
+  core.fenceIo()
+  regClear(MmSwSysReset, MmCpu0Reset)
+  core.fenceIo()
+  true
+
 proc holdD0Reset*() =
   ## Hold D0 (C906) in reset after a peer-core smoke stage has completed.
   regSet(MmSwSysReset, MmCpu0Reset)

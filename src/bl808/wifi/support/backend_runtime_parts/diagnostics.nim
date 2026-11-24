@@ -4,6 +4,12 @@ proc bl808_wifi_backend_scan_count*(): uint32 {.exportc, cdecl.} =
 proc bl808_wifi_backend_scan_done_count*(): uint32 {.exportc, cdecl.} =
   scanDoneCount
 
+proc bl808_wifi_backend_scan_confirmation*(): uint32 {.exportc, cdecl.} =
+  scanConfirmationStatus
+
+proc bl808_wifi_backend_record_scan_confirmation*(status: uint32) {.exportc, cdecl.} =
+  scanConfirmationStatus = status
+
 proc bl808_wifi_backend_mac_irq_count*(): uint32 {.exportc, cdecl.} =
   macIrqCount
 

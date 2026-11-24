@@ -2,6 +2,7 @@ proc bl808_wifi_backend_scan_count*(): uint32
   {.importc: "bl808_wifi_backend_scan_count", cdecl.}
 proc bl808_wifi_backend_scan_done_count*(): uint32
   {.importc: "bl808_wifi_backend_scan_done_count", cdecl.}
+proc bl808_wifi_backend_scan_confirmation(): uint32 {.importc, cdecl.}
 proc bl808_wifi_backend_scan_diag_count*(): uint32
   {.importc: "bl808_wifi_backend_scan_diag_count", cdecl.}
 proc bl808_wifi_backend_scan_diag_get*(index: uint32,

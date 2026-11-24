@@ -1,0 +1,11 @@
+package ox64:resources@0.2.0;
+
+world resource-demo {
+  export counters: interface {
+    resource counter {
+      constructor(initial: u32);
+      get: func() -> u32;
+    }
+    last-dropped: func() -> u32;
+  }
+}

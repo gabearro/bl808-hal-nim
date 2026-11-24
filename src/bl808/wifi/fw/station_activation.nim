@@ -1,4 +1,21 @@
+const
+  SmM1FixedLength = 99  # 4-byte EAPOL header and 95-byte key descriptor.
+  SmM1PmkidHeader = [0xdd'u8, 20, 0, 0x0f, 0xac, 4]
+  SmM1PmkidLength = SmM1PmkidHeader.len + 16
+
 type
+  SmFirstM1 = object
+    length: uint8
+    source: array[6, uint8]
+    bytes: array[SmM1FixedLength + SmM1PmkidLength, uint8]
+  SmPeerPublication = object
+    payload: pointer
+    serial: uint32
+    linked: bool
+  SmPeerLease = object
+    host: pointer
+    token: uint32
+    check: proc(host: pointer; station: uint8; token: uint32; retire: bool): bool {.nimcall.}
   SmActivationTag = object
     next: ptr SmActivationTag
     header: ptr KeMsgHdr
@@ -11,11 +28,15 @@ type
     prepared: SmActivationPrepared
     request, reply: pointer
     step: int
+    firstM1: SmFirstM1
+    peerLease: SmPeerLease
+    initialKeyRevision: uint64
+    pskPeer, peerPublished: bool
     active, awaiting, replyIssued, skipPsDisable, lost, supplicantReady: bool
 
 const
-  # Confirm hardware setup before publishing station readiness. All tracking
-  # stays outside the vendor wire payloads and survives ME's in-place forwarding.
+  # PSK can publish its TX peer at VIF confirmation; connection completion
+  # still waits for the PS replies. No tracking data goes in the wire payload.
   SmActivationRequests = [MM_SET_VIF_STATE_REQ, MM_SET_PS_OPTIONS_REQ,
                            ME_SET_PS_DISABLE_REQ]
   SmActivationSources = [TASK_MM, TASK_MM, TASK_ME]
@@ -26,6 +47,7 @@ var
   smActivation {.wifiCtrl.}: SmActivationOperation
   smActivationSerial {.wifiCtrl.}: uint32
   smActivationTags {.wifiCtrl.}: ptr SmActivationTag
+  smPublishingPeer {.wifiCtrl.}: ptr SmPeerPublication
 
 proc smActivationOwnerCurrent(owner: SmTxBuildContext; indication: pointer): bool =
   if not smAssocOwnerCurrent(owner, indication) or indication == nil: return false
@@ -37,6 +59,69 @@ proc smActivationCurrent(serial: uint32): bool =
   smActivation.active and not smActivation.lost and
     smActivation.prepared.serial == serial and serial == smActivationSerial and
     smActivationOwnerCurrent(smActivation.owner, smActivation.indication)
+
+proc smActivationOrdinaryPsk(owner: SmTxBuildContext): bool =
+  let security = vifSecurity(vifChannelForIdx(owner.identity.vif))
+  let connection = connectInfoView(owner.connection)
+  security.connected != 0 and security.cipher in [2'u8, 3] and
+    security.keyMgmt in [WifiKeyMgmtPsk, WifiKeyMgmtPskSha256] and
+    smEnvView().state != 2 and connection.authType == 0 and
+    connection.ctrlPortEthertype == 0x8E88'u16
+
+proc smActivationAcceptPeer*(payload: pointer; vif, station: uint8;
+                             linked = false): bool =
+  # External KE messages are dispatched synchronously, with the same payload.
+  # Only the exact station-add currently being sent can acknowledge link-up.
+  let publication = smPublishingPeer
+  if publication == nil or publication.payload != payload: return true
+  if not smActivationCurrent(publication.serial) or
+      smActivation.owner.identity.vif != vif or
+      smActivation.owner.identity.station != station: return false
+  if linked: publication.linked = true
+  true
+
+proc smActivationTrackPeer*(payload, host: pointer; token: uint32;
+    check: proc(host: pointer; station: uint8; token: uint32; retire: bool): bool {.nimcall.}) =
+  let publication = smPublishingPeer
+  if publication != nil and publication.payload == payload and smActivationCurrent(publication.serial):
+    smActivation.peerLease = SmPeerLease(host: host, token: token, check: check)
+
+proc smActivationHostPeer(op: SmActivationOperation; retire = false): bool {.inline.} =
+  let lease = op.peerLease
+  lease.check != nil and lease.check(lease.host, op.owner.identity.station, lease.token, retire)
+
+proc smActivationEapolReady(vif, station: uint8): bool =
+  if not smActivation.pskPeer or smActivation.owner.identity.vif != vif or
+      smActivation.owner.identity.station != station: return true
+  let serial = smActivation.prepared.serial
+  smActivation.peerPublished and smActivationHostPeer(smActivation) and smActivationCurrent(serial)
+
+proc smActivationRetainM1(vif, station: uint8; source: array[6, uint8];
+                          data: pointer; length: uint32): bool =
+  # RXU has validated the EAPOL body length and plaintext FromDS addressing.
+  # Both supported forms fit entirely in the first RX buffer.
+  if not smActivation.pskPeer or smActivation.peerPublished or
+      smActivation.owner.identity.station != station or smActivation.owner.identity.vif != vif or
+      not smActivationCurrent(smActivation.prepared.serial) or
+      not smActivationOrdinaryPsk(smActivation.owner) or
+      rxKeyLastChanged[station] != smActivation.initialKeyRevision or
+      staInfoForIdx(station).keyHolder != nil or staInfoForIdx(station).macAddr != source or
+      data == nil or length notin [SmM1FixedLength.uint32,
+                                  (SmM1FixedLength + SmM1PmkidLength).uint32]: return false
+  let key = cast[ptr UncheckedArray[uint8]](data)
+  # Key Info: pairwise and ACK only, with descriptor version 1, 2 or 3.
+  if key[0] notin [1'u8, 2, 3] or key[1] != 3 or key[4] notin [2'u8, 254] or
+      key[5] != 0 or key[6] notin [0x89'u8, 0x8a, 0x8b] or
+      key[97] != 0 or key[98].uint32 != length - SmM1FixedLength: return false
+  if length != SmM1FixedLength and (key[4] != 2 or not equalMem(
+      addr key[SmM1FixedLength], unsafeAddr SmM1PmkidHeader[0], SmM1PmkidHeader.len)): return false
+  if smActivation.firstM1.length != 0:
+    return smActivation.firstM1.length.uint32 == length and
+      equalMem(addr smActivation.firstM1.bytes[0], data, length.int)
+  smActivation.firstM1.source = source
+  copyMem(addr smActivation.firstM1.bytes[0], data, length.int)
+  smActivation.firstM1.length = length.uint8
+  true
 
 proc smActivationTagFor(header: ptr KeMsgHdr): ptr SmActivationTag =
   var tag = smActivationTags
@@ -86,6 +171,12 @@ proc smActivationCancel() =
   var retired = smActivation
   smActivation = default(SmActivationOperation)
   inc smActivationSerial
+  # Before Finish this is only a TX peer, not a published connection/netif.
+  # Reset/resource-only cleanup need not send any subsequent host indication.
+  if retired.peerLease.check != nil:
+    if smActivationOwnerCurrent(retired.owner, retired.indication):
+      staInfoForIdx(retired.owner.identity.station).controlPortState = 0
+    discard smActivationHostPeer(retired, retire = true)
   if not smActivationCancelControl(retired.request, retired.reply, retired.owner):
     meCancelQueuedPayload(retired.request)
     meCancelQueuedPayload(retired.reply)
@@ -227,11 +318,14 @@ proc smActivationNotifyCurrent(): bool =
   let indication = smEnvView().connectIndMsg
   if owner.state != SM_ACTIVATING_STATE or
       not smActivationOwnerCurrent(owner, indication): return false
+  if smActivation.pskPeer and smActivationCurrent(smActivation.prepared.serial):
+    return smActivation.peerPublished
   var message = ke_msg_try_alloc(SM_STA_ADD_IND, TASK_API, TASK_SM, SmStaAddIndPayloadSize)
   defer:
     if message != nil: ke_msg_free(keMsgHdrFromPayload(message))
   if message == nil:
     if smActivationOwnerCurrent(owner, indication):
+      when defined(bl808WifiDiagWarmScan): nimFwDbgWarmAssocFailure = warmAssocPeerIndication
       sm_connect_ind(WLAN_FW_ASSOCIATE_FAIILURE.uint16, 0xFFFF)
     return false
   smActivationSendReady(owner, indication, message)
@@ -242,6 +336,7 @@ proc smActivationFail(serial: uint32) =
   let indication = smActivation.indication
   smActivationCancel()
   if smActivationOwnerCurrent(owner, indication):
+    when defined(bl808WifiDiagWarmScan): nimFwDbgWarmAssocFailure = warmAssocActivation
     sm_connect_ind(WLAN_FW_ASSOCIATE_FAIILURE.uint16, 0xFFFF)
 
 proc smActivationConsumeSuccess(station: uint8): bool =
@@ -265,7 +360,9 @@ proc smActivationFinish(serial: uint32) =
     if message != nil: ke_msg_free(keMsgHdrFromPayload(message))
   smActivationReleasePrepared(unused)
   if not smActivationCurrent(serial): return
-  if not smActivationSendReady(owner, indication, message):
+  let ready = if smActivation.peerPublished: smActivationHostPeer(smActivation)
+              else: smActivationSendReady(owner, indication, message)
+  if not ready:
     smActivationFail(serial)
     return
   if not smActivationCurrent(serial): return
@@ -320,7 +417,8 @@ proc smActivationStart(owner: SmTxBuildContext; indication: pointer;
   for index in 0 ..< SmActivationRequests.len:
     if prepared.requests[index] == nil or prepared.replies[index] == nil: return false
   smActivation = SmActivationOperation(owner: owner, indication: indication,
-    prepared: prepared, active: true)
+    prepared: prepared, active: true, pskPeer: smActivationOrdinaryPsk(owner),
+    initialKeyRevision: rxKeyLastChanged[owner.identity.station])
   let serial = prepared.serial
   let notifyWps = prepared.notifyWps
   prepared = default(SmActivationPrepared)
@@ -350,43 +448,83 @@ proc smActivationApply(serial: uint32): bool =
   let wpaPending = securityState.cipher >= 2 and
     (nimFwWpaPendingMask and (1'u32 shl vifIdx)) != 0
   let controlPortState = if wpaPending: 1'u8 else: configuredControlPortState
-  sta.controlPortState = controlPortState
+  if not smActivation.pskPeer: sta.controlPortState = controlPortState
   sta.rateWord = lmacGateHalfword(connectInfoView(owner.connection).ctrlPortEthertype)
-  let mm = mmEnvView()
-  mm.rxFilterBase = if mm.rxPromiscUploadFlag != 0: 0x3503A58C'u32 else: 0x3503858C'u32
-  mm_rx_filter_set()
-  if not smActivationCurrent(serial): return false
+  # RX control is shared. The AP filter also admits the frames needed by STA.
+  if vifMgmtEnvView().apCount == 0:
+    let mm = mmEnvView()
+    mm.rxFilterBase = if mm.rxPromiscUploadFlag != 0: 0x3503A58C'u32 else: 0x3503858C'u32
+    mm_rx_filter_set()
+    if not smActivationCurrent(serial): return false
   when defined(bl808WifiConnectTrace):
     nimFwConnectTrace2U32("[WIFI-CT] vif_state_cfm ",
       vifIdx.uint32 or (staIdx.uint32 shl 8), controlPortState.uint32)
     if not smActivationCurrent(serial): return false
   smActivation.skipPsDisable = configuredControlPortState != 2
+  if smActivation.pskPeer:
+    # Publish before sending the next internal request: its confirmation may
+    # run reentrantly, but must never finish an activation with no TX peer.
+    if not smActivationOrdinaryPsk(owner): return false
+    var message = smActivation.prepared.stationInd
+    smActivation.prepared.stationInd = nil
+    defer:
+      if message != nil: ke_msg_free(keMsgHdrFromPayload(message))
+    var publication = SmPeerPublication(payload: message, serial: serial)
+    let previous = smPublishingPeer
+    smPublishingPeer = addr publication
+    block:
+      defer: smPublishingPeer = previous
+      if not smActivationSendReady(owner, smActivation.indication, message):
+        return false
+    if not publication.linked or not smActivationCurrent(serial) or
+        not smActivationHostPeer(smActivation): return false
+    smActivation.peerPublished = true
+    sta.controlPortState = controlPortState
   true
 
 proc smActivationConfirm(reply: pointer; index: int): bool =
   if reply == nil: return false
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  let header = keMsgHdrFromPayload(reply)
-  let tag = smActivationTagFor(header)
-  if tag == nil: return false
-  let serial = tag.serial
-  result = true
-  if tag.command or index < 0 or index >= SmActivationRequests.len or
-      not smActivationCurrent(serial) or not smActivation.awaiting or
-      not smActivation.replyIssued or smActivation.reply != reply or
-      tag.serial != smActivation.prepared.serial or tag.index.int != index or
-      smActivation.step != index or header.id != SmActivationRequests[index] + 1 or
-      header.srcId != SmActivationSources[index] or header.destId != TASK_SM or
-      header.paramLen != 0: return
-  smActivation.request = nil
-  smActivation.reply = nil
-  smActivation.awaiting = false
-  smActivation.replyIssued = false
-  inc smActivation.step
-  if index == 0 and not smActivationApply(serial):
-    smActivationFail(serial)
-    return
+  var serial: uint32
+  var pending: SmFirstM1
+  block:
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    let header = keMsgHdrFromPayload(reply)
+    let tag = smActivationTagFor(header)
+    if tag == nil: return false
+    serial = tag.serial
+    result = true
+    if tag.command or index < 0 or index >= SmActivationRequests.len or
+        not smActivationCurrent(serial) or not smActivation.awaiting or
+        not smActivation.replyIssued or smActivation.reply != reply or
+        tag.serial != smActivation.prepared.serial or tag.index.int != index or
+        smActivation.step != index or header.id != SmActivationRequests[index] + 1 or
+        header.srcId != SmActivationSources[index] or header.destId != TASK_SM or
+        header.paramLen != 0: return
+    smActivation.request = nil
+    smActivation.reply = nil
+    smActivation.awaiting = false
+    smActivation.replyIssued = false
+    inc smActivation.step
+    if index == 0:
+      if not smActivationApply(serial):
+        smActivationFail(serial)
+        return
+      if smActivation.firstM1.length != 0:
+        pending = smActivation.firstM1
+        smActivation.firstM1.length = 0
+  # WPA may synchronously allocate and enqueue M2. Do not hold our IRQ lock.
+  if pending.length != 0 and smActivationCurrent(serial):
+    if not smActivationHostPeer(smActivation) or not smActivationCurrent(serial):
+      smActivationFail(serial)
+      return
+    let owner = smActivation.owner
+    let station = owner.identity.station
+    let sta = staInfoForIdx(station)
+    if rxKeyLastChanged[station] == smActivation.initialKeyRevision and sta.keyHolder == nil and
+        sta.macAddr == pending.source and smActivationOrdinaryPsk(owner):
+      sm_handle_eapol_input(station, addr pending.source[0], addr pending.bytes[0],
+                            pending.length.uint16)
   smActivationSendNext(serial)
 
 proc smActivationNeedsService(): bool =

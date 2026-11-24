@@ -1,0 +1,6 @@
+package ox64:text@0.2.0;
+
+world optional-text {
+  export len: func(value: option<string>) -> u32;
+  export get: func() -> option<string>;
+}

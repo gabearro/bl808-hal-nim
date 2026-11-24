@@ -35,6 +35,7 @@ proc bl_reset_evt*() {.exportc, cdecl.} =
   ## Restore mstatus.MIE only if it was set on entry.
   let saved = irqSave()
   defer: irqRestore(saved)
+  smSaQueryResetScope()
   if not waitMacSoftResetClear(): return
   ke_evt_clear(0x80000000'u32)
   if not hal_machw_reset(): return
@@ -42,8 +43,10 @@ proc bl_reset_evt*() {.exportc, cdecl.} =
   if not txl_reset(): return
   mm_reset()
   vif_mgmt_reset()
+  smSaQueryClearResetTimer()
   apmResumeHaltRollback()
   ke_evt_clear(0x04000000'u32)
+  mmPsModeRetryAfterReset()
   # A timed-out MM reset request may be saved even when MM was already idle.
   discard ke_reschedule_saved_messages(TASK_MM)
 
@@ -58,20 +61,16 @@ proc bl_irq_handler*() {.exportc, cdecl.} =
 
 proc wifiMainHasPendingWork(): bool
 
+const BlNapWaking = 2'u32
+
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void bl_sleep_schedule(void);".}
 proc bl_sleep_schedule*() {.exportc, cdecl.} =
   ## Sleep requires enabled/idle PS state and no on-channel VIF flags.
-  ## Keep the pure-Nim pending-work guard before the vendor PM/VIF decision.
+  ## Keep the pure-Nim pending-work guard before the vendor PS/VIF decision.
   let pmState = wifi_hosal_pm_state_run()
   var newState: uint32
 
-  if wifiMainHasPendingWork():
-    newState = 0
-  elif pmState != 0:
-    napScheduleState = 0
-    newState = 0
-  else:
-    newState = 0
+  if napScheduleState != BlNapWaking and pmState == 0 and not wifiMainHasPendingWork():
     let ps = psEnvView()
     if ps.enabled != 0 and ps.statusFlags == 0:
       var node = cast[pointer](vifMgmtEnvView().activeList.first)
@@ -100,8 +99,12 @@ proc bl_sleep_schedule*() {.exportc, cdecl.} =
       return
   else:
     # Transitioning to awake (.L72): pm_post_event(2, 1, 0) then (2, 2, 0)
-    wifi_hosal_pm_post_event(2, 1, nil)
-    wifi_hosal_pm_post_event(2, 2, nil)
+    if napScheduleState != BlNapWaking:
+      napScheduleState = BlNapWaking
+      wifi_hosal_pm_post_event(2, 1, nil)
+    var wakeFailed = 1'u32
+    wifi_hosal_pm_post_event(2, 2, addr wakeFailed)
+    if wakeFailed != 0: return
 
   napScheduleState = newState
 
@@ -122,11 +125,10 @@ proc bl_nap_calculate*(): uint32 {.exportc, cdecl.} =
 
   return minRemaining
 
-proc bl_nap_call*() {.exportc, cdecl.} =
+proc bl_nap_call*(): uint32 {.exportc, cdecl.} =
   ## Execute nap (light sleep).
   ## From blob (2 instrs): li a0,0; ret -- returns 0 (no-op / nap disabled).
-  ## Intentionally empty: blob is a no-op that returns 0.
-  return
+  0'u32
 
 # Forward declarations for notifier chain functions (defined later)
 proc notifier_chain_regsiter*(chain: ptr CoList, notifier: ptr CoListHdr): cint {.exportc, cdecl, discardable.}
@@ -189,6 +191,7 @@ proc pmSetMacDoze(argument: pointer): cint {.cdecl.} =
 
 proc pmWakePre(argument: pointer): cint {.cdecl.} =
   discard argument
+  if blDozeEnvView().dozeInProgress == 0: return 0
   cast[cint](wakeup_from_doze_pre())
 
 proc pmWaitMacPrestate(argument: pointer): cint {.cdecl.} =
@@ -208,24 +211,23 @@ proc pmCheckForcedSleep(argument: pointer): cint {.cdecl.} =
   pm_force_sleep_check().cint
 
 proc pmSetCoexMode(argument: pointer): cint {.cdecl.} =
-  coex_pta_force_autocontrol_set(cast[uint](argument).uint32)
+  discard coex_pta_force_autocontrol_set(cast[uint](argument).uint32)
   0
 
 proc pmRestoreChannel(argument: pointer): cint {.cdecl.} =
-  rfc_channel_ops(cast[uint](argument).uint32)
+  discard rfc_channel_ops(cast[uint](argument).uint32)
   0
 
 proc pmBleRf(argument: pointer): cint {.cdecl.} =
-  ble_rf_ops(cast[uint](argument).uint32)
+  discard ble_rf_ops(cast[uint](argument).uint32)
   0
 
-proc bl_pm_ops_register*(ops: pointer) {.exportc, cdecl.} =
+proc bl_pm_ops_register*(): uint32 {.exportc, cdecl.} =
   ## Preserve the vendor's event/code/capability/priority order and contexts.
   ## Internal operations use adapters for the PM int(void *) callback ABI.
   proc wifi_hosal_pm_event_register(event: cint; code, capBit: uint32;
       priority: uint16; callback, argument: pointer; enable: cint): cint
       {.importc, cdecl, discardable.}
-  discard ops
   napSleepActive = 1
   wifi_hosal_pm_event_register(1, 0, 2, 13, cast[pointer](pmWaitMacIdle), nil, 1)
   wifi_hosal_pm_event_register(1, 1, 16, 20, cast[pointer](pmSetCoexMode), cast[pointer](2'u), 1)
@@ -246,47 +248,15 @@ proc bl_pm_ops_register*(ops: pointer) {.exportc, cdecl.} =
   wifi_hosal_pm_event_register(0, 3, 16, 35, cast[pointer](pmSetCoexMode), nil, 1)
   wifi_hosal_pm_event_register(5, 0, 8, 10, cast[pointer](pmBleRf), cast[pointer](1'u), 1)
   wifi_hosal_pm_event_register(5, 1, 8, 20, cast[pointer](pmBleRf), nil, 1)
+  0'u32
 
-proc bl_pti_reset*() {.exportc, cdecl.} =
-  ## Reset Priority Traffic Indication (PTA coexistence).
-  ## Not found in objdump (possibly in separate coex object file).
-  ## From 63-instruction description and coex_pta_force_autocontrol_set patterns:
-  ##   Resets all PTA priority registers at COEX_BASE (0x44920000) and
-  ##   MACHW_BCN_STATUS_REG area (0x44B00400) to default coexistence state.
-  ##
-  ## Registers manipulated (from coex module patterns):
-  ##   COEX_BASE + 0x004: PTA control register - clear/set priority bits
-  ##   COEX_BASE + 0x428: PTA force control register - clear to 0
-  ##   MACHW_BASE + 0x400: BCN/PTA status register - clear/set enable bit
-  let coexBase = COEX_BASE
-  let machwPtaReg = MACHW_BASE + 0x400'u
-
-  # Clear PTA force control register
-  regWrite(coexBase + 0x428'u, 0)
-
-  # Reset PTA control bits in COEX_CTRL_REG (offset 0x004):
-  # Clear bits: 0 (enable), 1 (WiFi priority), 4 (force),
-  #             16 (ext priority), 17 (band sel), 18 (override), 19 (alt mode)
-  var ctrlVal = regRead(coexBase + 0x004'u)
-  ctrlVal = ctrlVal and not 0x000F0013'u32  # Clear control bits
-  ctrlVal = ctrlVal or 0x00000012'u32       # Set default: bit1=WiFi priority, bit4=enable
-  regWrite(coexBase + 0x004'u, ctrlVal)
-
-  # Reset MACHW PTA/BCN status register
-  var ptaVal = regRead(machwPtaReg)
-  ptaVal = ptaVal and not 0x00000001'u32    # Clear enable bit
-  regWrite(machwPtaReg, ptaVal)
-
-  # Re-enable with defaults
-  ptaVal = regRead(machwPtaReg)
-  ptaVal = ptaVal or 0x00000001'u32         # Set enable bit
-  regWrite(machwPtaReg, ptaVal)
-
-proc bl_wifi_timer_arm*(timer: pointer, delayMs: uint32) {.exportc, cdecl.} =
+proc bl_wifi_timer_arm*(timer: pointer, delayMs: uint32,
+                        repeatFlag: bool) {.exportc, cdecl.} =
   ## Arm a WiFi timer.
   ## From blob (7 instrs): reads MAC timestamp, converts delay from ms to MAC ticks
   ## (multiply by 1000), adds to timestamp for absolute target time,
   ## tail-calls mm_timer_set(timer, targetTime).
+  discard repeatFlag
   let macTime = macTimeNow()
   let delayTicks = delayMs * 1000'u32  # 1MHz MAC clock: 1000 ticks per ms
   let targetTime = macTime + delayTicks
@@ -297,59 +267,63 @@ proc bl_wifi_timer_disarm*(timer: pointer) {.exportc, cdecl.} =
   ## From blob (2 instrs): tail-call to mm_timer_clear(timer).
   mm_timer_clear(timer)
 
-proc bl_wifi_timer_done*(timer: pointer): bool {.exportc, cdecl.} =
-  ## Check if a WiFi timer has expired.
-  return true
+proc bl_wifi_timer_done*(timer: pointer) {.exportc, cdecl.} =
+  ## The vendor's completion callback has no body.
+  discard timer
 
-proc bl_wifi_timer_setfn*(timer: pointer, fn: pointer) {.exportc, cdecl.} =
+proc bl_wifi_timer_setfn*(timer, fn, cbArg: pointer) {.exportc, cdecl.} =
   ## Set timer callback function (3 instrs).
   ## From blob: sw a1,4(a0); sw a2,8(a0); ret
-  ## Stores fn (a1) at timer+4 and the third C arg (a2, callback context) at timer+8.
+  if timer == nil: return
   let t = cast[uint](timer)
   cast[ptr pointer](t + 4)[] = fn
-  # Capture and store the third C arg (a2) at timer+8
-  var cbArg: pointer
-  {.emit: ["asm volatile(\"mv %0, a2\" : \"=r\"(", cbArg, ") );"].}
   cast[ptr pointer](t + 8)[] = cbArg
 
 # BL WiFi WPA/security callbacks
-proc bl_wifi_register_wpa_cb_internal*(cb: pointer) {.exportc, cdecl.} =
+proc bl_wifi_register_wpa_cb_internal*(cb: pointer): cint {.exportc, cdecl.} =
   ## Register WPA callback.
   ## From blob (4 instrs): stores cb to wpa_cbs global, returns 0.
   wpa_cbs = cb
+  0
 
-proc bl_wifi_unregister_wpa_cb_internal*() {.exportc, cdecl.} =
+proc bl_wifi_unregister_wpa_cb_internal*(): cint {.exportc, cdecl.} =
   ## Unregister WPA callback.
   ## From blob (4 instrs): stores nil to wpa_cbs global, returns 0.
   wpa_cbs = nil
+  0
 
-proc bl_wifi_set_appie_internal*(vifIdx: uint8, ieType: uint8, ie: pointer, ieLen: uint16) {.exportc, cdecl.} =
+proc bl_wifi_set_appie_internal*(vifIdx: uint8, ieType: cint, ie: pointer,
+                                 ieLen: uint16, sta: bool): cint {.exportc, cdecl.} =
   ## Set application IE for frames.
   ## From blob (36 instrs):
   ##   ieType==0: calls internal assoc IE handler(vifIdx, ie, ieLen&0xFF)
-  ##   ieType==1: stores ie/ieLen into beacon extra IE globals (max 170 bytes)
-  ##   ieType==2: stores ie/ieLen into probe response extra IE globals (max 50 bytes)
+  ##   ieType==1: stores scan probe-request IEs in scanu_env (max 170 bytes)
+  ##   ieType==2: stores STA association IEs in sm_env (max 50 bytes)
   ## Returns 0 on success, -1 on invalid length (return in a0).
+  discard sta
   if ieType == 0:
+    let effectiveLen = (ieLen and 0xFF).uint8
+    if vifIdx >= MAX_VIFS.uint8 or (effectiveLen != 0 and ie == nil): return -1
     # Forward to WPA/RSN IE handler (blob: mm_set_wpa_rsn_ie(vifIdx, ie, len)).
-    mm_set_wpa_rsn_ie(vifIdx, ie, (ieLen and 0xFF).uint8)
+    mm_set_wpa_rsn_ie(vifIdx, ie, effectiveLen)
   elif ieType == 1:
-    # Beacon extra IE: max 170 bytes
-    if ieLen > 170:
-      return
-    appIeBeaconPtr = ie
-    appIeBeaconLen = ieLen
+    # Scan probe-request extra IE: max 170 bytes.
+    if ieLen > 170 or (ieLen != 0 and ie == nil):
+      return -1
+    scanu_env.extraIePtr = ie
+    scanu_env.extraIeLen = ieLen
   elif ieType == 2:
-    # Probe response extra IE: max 50 bytes
-    if ieLen > 50:
-      return
-    appIeProbeRespPtr = ie
-    appIeProbeRespLen = ieLen
+    # STA association-request vendor IE: max 50 bytes.
+    if ieLen > 50 or (ieLen != 0 and ie == nil):
+      return -1
+    smEnvView().vendorIePtr = ie
+    smEnvView().vendorIeLen = ieLen
+  0
 
-proc bl_wifi_unset_appie_internal*(vifIdx: uint8, ieType: uint8) {.exportc, cdecl.} =
+proc bl_wifi_unset_appie_internal*(vifIdx: uint8, ieType: cint): cint {.exportc, cdecl.} =
   ## Unset application IE.
   ## From blob (6 instrs): tail-calls bl_wifi_set_appie_internal(vifIdx, ieType, nil, 0).
-  bl_wifi_set_appie_internal(vifIdx, ieType, nil, 0)
+  bl_wifi_set_appie_internal(vifIdx, ieType, nil, 0, false)
 
 type
   SupplicantKeyOwner = object
@@ -489,8 +463,8 @@ proc bl_wifi_set_sta_key_internal*(vifIdx: uint8, staIdx: uint8, alg: uint32,
     seqData, seqLen, keyData, keyLen, pairwise)
   if hardwareIndex == 0xFF or not supplicantKeyOwnerCurrent(owner):
     return -1
-  let keyType = if pairwise: 0'u32 else: 1'u32
-  if sm_get_set_machwkey_index(0, vifIdx.uint32, addr hardwareIndex, keyType) != 0 or
+  let keyType = if pairwise: 0'u8 else: 1'u8
+  if sm_get_set_machwkey_index(false, vifIdx, addr hardwareIndex, keyType) != 0 or
       not supplicantKeyOwnerCurrent(owner):
     return -1
   let logFn = getLogFunc(204)
@@ -532,7 +506,7 @@ proc bl_wifi_set_igtk_internal*(vifIdx, staIdx: uint8, keyIdx: uint16,
   var hardwareIndex = mm_sec_machwkey_wr(req)
   if hardwareIndex == 0xFF or not supplicantKeyOwnerCurrent(owner):
     return -1
-  if sm_get_set_machwkey_index(0, vifIdx.uint32, addr hardwareIndex, 2) != 0 or
+  if sm_get_set_machwkey_index(false, vifIdx, addr hardwareIndex, 2'u8) != 0 or
       not supplicantKeyOwnerCurrent(owner):
     return -1
   let logFn = getLogFunc(204)
@@ -558,8 +532,8 @@ proc bl_wifi_get_sta_gtk*(vifIdx: uint8, keyBuf: pointer, outputBuf: pointer): c
     {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
     irqRestore(saved)
   var keyIdx = 0xFF'u8
-  let rc = sm_get_set_machwkey_index(1'u32, vifIdx.uint32, cast[pointer](addr keyIdx), 1'u32)
-  if rc != 0'u8 or keyIdx >= (MAX_VIFS * 4).uint8 or keyIdx shr 2 != vifIdx:
+  let rc = sm_get_set_machwkey_index(true, vifIdx, addr keyIdx, 1'u8)
+  if rc != 0 or keyIdx >= (MAX_VIFS * 4).uint8 or keyIdx shr 2 != vifIdx:
     return -1
   let vif = vifChannelForIdx(vifIdx)
   let keyId = keyIdx and 3
@@ -596,9 +570,11 @@ proc bl_wifi_get_sta_gtk*(vifIdx: uint8, keyBuf: pointer, outputBuf: pointer): c
     for i in 0 ..< 8:
       bytes[16 + i] = micKeys[8 + i]
       bytes[24 + i] = micKeys[i]
-  discard c_memcpy(keyBuf, addr bytes[0], length.csize_t)
+  var stagedBytes: array[32, uint8]
+  discard c_memcpy(addr stagedBytes[0], addr bytes[0], length.csize_t)
   if not current():
     return -1
+  copyMem(keyBuf, addr stagedBytes[0], length)
   cast[ptr uint8](outputBuf)[] = length.uint8
   return 0
 
@@ -630,7 +606,7 @@ proc bl_wifi_auth_done_internal*(staIdx: uint8; reasonCode: uint16): bool {.expo
     if vifIdx.int < MAX_VIFS:
       nimFwWpaPendingMask = nimFwWpaPendingMask and
         (not (1'u32 shl vifIdx.uint32))
-      vifChannelForIdx(vifIdx).probeCount = 0
+      mmResetBeaconProbeCount(vifChannelForIdx(vifIdx))
   sm_handle_supplicant_result(staIdx, reasonCode)
   return true
 
@@ -640,6 +616,8 @@ proc bl_wifi_get_assoc_bssid_internal*(vifIdx: uint8, output: pointer): cint {.e
   ##   Calls vif_mgmt_get_vif(vifIdx) to get the VIF entry.
   ##   If nil, returns -1. Otherwise, copies 6 bytes (BSSID) from
   ##   vifEntry + 380 (0x17C) to output, returns 0.
+  if output == nil:
+    return -1
   let vifEntry = vif_mgmt_get_vif(vifIdx)
   if vifEntry == nil:
     return -1
@@ -652,20 +630,21 @@ proc bl_wifi_get_hostap_private_internal*(): pointer {.exportc, cdecl.} =
   ## From blob (2 instrs): tail-calls apm_get_hostapd_ctx().
   return apm_get_hostapd_ctx()
 
-proc bl_wifi_get_wps_status_internal*(): uint8 {.exportc, cdecl.} =
+proc bl_wifi_get_wps_status_internal*(): cint {.exportc, cdecl.} =
   ## Get WPS status.
-  ## From blob (3 instrs): loads wpsStatus global byte, returns it.
-  return wpsStatus
+  ## supplicant_api.o reads the WPS mode byte at sm_env+0x2c.
+  return smEnvView().state.cint
 
-proc bl_wifi_set_wps_cb_internal*(cb: pointer) {.exportc, cdecl.} =
+proc bl_wifi_set_wps_cb_internal*(cb: pointer): cint {.exportc, cdecl.} =
   ## Set WPS callback.
   ## From blob (4 instrs): stores cb to wps_cbs global, returns 0.
   wps_cbs = cb
+  0
 
-proc bl_wifi_set_wps_status_internal*(status: uint8) {.exportc, cdecl.} =
+proc bl_wifi_set_wps_status_internal*(status: cint) {.exportc, cdecl.} =
   ## Set WPS status.
-  ## From blob (3 instrs): stores a0 to wpsStatus global byte, returns.
-  wpsStatus = status
+  ## This is the same byte consumed by SM scan, key, and EAPOL paths.
+  smEnvView().state = status.uint8
 
 proc bl_wifi_wpa_ptk_init_done_internal*(staIdx: uint8): bool {.exportc, cdecl.} =
   ## Vendor bool(uint8_t sta_idx): log, then mark that AP station ready.
@@ -694,12 +673,13 @@ proc bl_wifi_sta_is_running_internal*(): bool {.exportc, cdecl.} =
   ## Vendor blob returns constant true.
   return true
 
-proc bl_wifi_sta_set_reset_param_internal*(param: pointer) {.exportc, cdecl.} =
+proc bl_wifi_sta_set_reset_param_internal*(resetFlag: uint8): uint8 {.exportc, cdecl.} =
   ## Set reset parameters for STA.
   ## From blob (2 instrs): li a0,0; ret -- always returns 0 (success).
-  discard  # void return; blob returns 0 in a0 for C ABI
+  discard resetFlag
+  0
 
-proc bl_wifi_sta_update_ap_info_internal*(param: pointer) {.exportc, cdecl.} =
+proc bl_wifi_sta_update_ap_info_internal*(): cint {.exportc, cdecl.} =
   ## Update AP info.
   ## From blob (2 instrs): li a0,1; ret -- always returns 1 (success).
-  discard  # void return; blob returns 1 in a0 for C ABI
+  1

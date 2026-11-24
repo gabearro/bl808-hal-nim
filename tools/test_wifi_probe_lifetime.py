@@ -1,6 +1,7 @@
 """Exercise complete probe construction, request epochs, and private IE DMA."""
 
 from pathlib import Path
+import os
 import re
 import shutil
 import subprocess
@@ -15,13 +16,14 @@ FW = ROOT / "src/bl808/wifi/fw"
 
 
 def platform_source() -> str:
-    source = FRAME_PLATFORM.replace("  retired: bool", "  retired, rejectPush: bool")
+    source = FRAME_PLATFORM.replace("  retired: bool", "  retired, rejectPush: bool\n  pushResultOverride: uint8")
     source = source.replace("proc txl_cntrl_push_int(p: pointer; ac: uint8): uint8 = submit(p, ac)", r"""
 proc txl_cntrl_push_int(p: pointer; ac: uint8): uint8 =
   if rejectPush:
     txl_frame_release(p, false)
     return 0
-  submit(p, ac)
+  let status = submit(p, ac)
+  if pushResultOverride != 0: pushResultOverride else: status
 """)
     source = source.replace(procedure(source, "nimFwTrace2U32"), r"""
 proc nimFwTrace2U32(s: string; a, b: uint32) =
@@ -29,7 +31,12 @@ proc nimFwTrace2U32(s: string; a, b: uint32) =
   elif s == "[WIFI-SCAN] probe_fc ": observe("trace2")
 """)
     return source + r"""
-const IE_ID_SSID = 0'u8
+const
+  IE_ID_SSID = 0'u8
+  TASK_SCAN = 1'u8
+  SCAN_DONE_IND = 0x402'u16
+  ScanIdleState = 0'u16
+  ScanChannelRunningState = 3'u16
 type
   ScanEnv = object
     paramPtr: pointer
@@ -43,18 +50,47 @@ var
   scanRequestEpoch: uint32
   request, otherRequest: ScanStartReqPayload
   freeCalls: int
-  freeHook: proc()
+  doneSends: int
+  doneDest: uint8
+  scanTaskState: uint16
+  freeHook, sendHook: proc()
 proc scanStartReqView(p: pointer): ptr ScanStartReqPayload = cast[ptr ScanStartReqPayload](p)
 proc scanSsidSlot(req: ptr ScanStartReqPayload; index: int): ptr ScanSsidSlotView =
   cast[ptr ScanSsidSlotView](addr req.ssidFilter[index * 34])
 proc hostTxProbeReqFrame(link: ptr LinkDesc): ptr ProbeReqFrameView =
   cast[ptr ProbeReqFrameView](addr link.macHeader[0])
-proc keMsgHdrFromPayload(p: pointer): pointer = p
-proc ke_msg_free(p: pointer) =
+type Header = object
+  paramLen: uint32
+var requestHeader: Header
+var endEnvelope: uint8
+proc keMsgHdrFromPayload(p: pointer): ptr Header =
   doAssert p == addr request
-  doAssert scan_env.paramPtr == nil, "request was not detached before free"
+  addr requestHeader
+proc ke_msg_free(p: pointer) =
+  doAssert p == addr requestHeader
+  doAssert scan_env.paramPtr != addr request, "request was not detached before free"
   inc freeCalls
   if freeHook != nil: freeHook()
+proc ke_msg_forward_and_change_id(p: pointer; id: uint16; dest, source: uint8) =
+  doAssert p == addr endEnvelope
+  doAssert id == SCAN_DONE_IND and source == TASK_SCAN
+  doAssert scan_env.paramPtr == nil
+  inc doneSends
+  doneDest = dest
+  if sendHook != nil: sendHook()
+proc scanuTrackLowerReply(request, reply: pointer; done: bool) = discard
+type ScanDwellPair = object
+var scanDwellRequest: pointer
+var scanDwellEpoch: uint32
+proc scanDwellDetach(): ScanDwellPair = default(ScanDwellPair)
+proc scanDwellDispose(pair: var ScanDwellPair) = discard
+proc forwardFailedScanDwell(request: pointer; requester: uint8) = doAssert false
+proc ke_state_get(task: uint8): uint16 =
+  doAssert task == TASK_SCAN
+  scanTaskState
+proc ke_state_set(task: uint8; state: uint16) =
+  doAssert task == TASK_SCAN
+  scanTaskState = state
 """
 
 
@@ -96,13 +132,18 @@ proc setup(irq: bool; count: int = 3) =
   fired = false
   retired = false
   rejectPush = false
+  pushResultOverride = 0
   onRecovery = nil
   freeHook = nil
+  sendHook = nil
   interruptsEnabled = true
   initPool()
   replacement = nil
   pushes = 0
   freeCalls = 0
+  doneSends = 0
+  doneDest = 0
+  scanTaskState = ScanChannelRunningState
   pushed.setLen(0)
   sequence = 0x120
   request = default(ScanStartReqPayload)
@@ -154,7 +195,7 @@ for irq in [false, true]:
       setup(irq)
       stage = trigger
       action = change
-      let rc = scan_probe_req_tx(nil)
+      let rc = scan_probe_req_tx()
       doAssert fired and interruptsEnabled == irq
       let submitted = trigger == "handoff" or change in [0, 6, 7]
       doAssert pushes == submitted.int
@@ -183,7 +224,7 @@ for irq in [false, true]:
         for byte in scan_probe_req_ie.ieData.mitems: byte = 0xDD
       txl_frame_release(held[0], false)
     currentFrame = held[0]
-    let rc = scan_probe_req_tx(nil)
+    let rc = scan_probe_req_tx()
     doAssert interruptsEnabled == irq
     doAssert pushes == (change == 3).int
     if change == 3:
@@ -198,7 +239,7 @@ for irq in [false, true]:
       setup(irq)
       scanSsidSlot(addr request, 0).length = ssidLen.uint8
       request.ieBodyLen = ieLen.uint16
-      doAssert scan_probe_req_tx(nil) == 0
+      doAssert scan_probe_req_tx() == 0
       doAssert pushes == 1 and interruptsEnabled == irq
       checkFrame(currentFrame, ssidLen, ieLen)
       let original = hostTxLinkDescAt(currentFrame.bufDesc)[]
@@ -218,20 +259,23 @@ for irq in [false, true]:
     of 5: request.vifIdx = 2
     else: scan_env.abortFlag = 1
     let before = frameEnv.freeList.first
-    doAssert scan_probe_req_tx(nil) == 0
+    doAssert scan_probe_req_tx() == 0
     doAssert pushes == 0 and frameEnv.freeList.first == before
     doAssert interruptsEnabled == irq
   setup(irq)
   request.scanType = 0
-  doAssert scan_probe_req_tx(nil) == 1 and pushes == 0
+  doAssert scan_probe_req_tx() == 1 and pushes == 0
   scan_env.paramPtr = nil
-  doAssert scan_probe_req_tx(nil) == 1 and pushes == 0
+  doAssert scan_probe_req_tx() == 1 and pushes == 0
   setup(irq, 4)
-  doAssert scan_probe_req_tx(nil) == 1 and pushes == 0
+  doAssert scan_probe_req_tx() == 1 and pushes == 0
   setup(irq)
   rejectPush = true
-  doAssert scan_probe_req_tx(nil) == 1 and pushes == 0
+  doAssert scan_probe_req_tx() == 1 and pushes == 0
   doAssert co_list_cnt(addr frameEnv.freeList) == 1
+  setup(irq)
+  pushResultOverride = 2
+  doAssert scan_probe_req_tx() == 0 and pushes == 1
 
 # Detach before free; a free hook can install the next request without being
 # overwritten by the old completion. Releasing an unrelated request is inert.
@@ -239,11 +283,35 @@ for irq in [false, true]:
   setup(irq)
   let epoch = scanRequestEpoch
   freeHook = proc() = cacheScanStartContext(addr otherRequest, 8)
-  releaseCompletedScanRequest(addr request)
+  releaseCompletedScanRequest(addr request, endInd = addr endEnvelope)
   doAssert freeCalls == 1 and scan_env.paramPtr == addr otherRequest
+  doAssert doneSends == 1 and doneDest == 2 and scanTaskState == ScanIdleState
   doAssert scanRequestEpoch == epoch + 2 and interruptsEnabled == irq
-  releaseCompletedScanRequest(addr request)
-  doAssert freeCalls == 1 and scan_env.paramPtr == addr otherRequest
+  releaseCompletedScanRequest(addr request, endInd = addr endEnvelope)
+  doAssert freeCalls == 1 and doneSends == 1 and scan_env.paramPtr == addr otherRequest
+  setup(irq)
+  sendHook = proc() =
+    cacheScanStartContext(addr otherRequest, 8)
+    scanTaskState = 2
+  releaseCompletedScanRequest(addr request, endInd = addr endEnvelope)
+  doAssert freeCalls == 1 and doneSends == 1 and doneDest == 2
+  doAssert scan_env.paramPtr == (addr otherRequest) and scanTaskState == 2
+  doAssert interruptsEnabled == irq
+  setup(irq)
+  scan_env.abortFlag = 1
+  doAssert releaseCompletedScanRequest(addr request, endInd = addr endEnvelope)
+  doAssert scan_env.abortFlag == 0 and scanTaskState == ScanIdleState
+  doAssert doneSends == 1 and freeCalls == 1 and interruptsEnabled == irq
+  setup(irq)
+  let staleEpoch = scanRequestEpoch
+  inc scanRequestEpoch
+  doAssert not releaseCompletedScanRequest(addr request, staleEpoch)
+  doAssert scan_env.paramPtr == addr request
+  doAssert doneSends == 0 and freeCalls == 0 and scanTaskState == ScanChannelRunningState
+  doAssert interruptsEnabled == irq
+  scan_env.abortFlag = 1
+  cacheScanStartContext(addr otherRequest, 8)
+  doAssert scan_env.abortFlag == 0 and scan_env.paramPtr == (addr otherRequest)
 """
 
 
@@ -260,7 +328,8 @@ def test_probe_lifetime(tmp_path: Path, mode: str, mutation: str | None) -> None
         "txlFrameLeaseToken", "txlFrameLeaseMatches", "txlFrameIdentityCurrent", "txlFrameSessionCurrent",
         "txlCaptureFrameCallback", "txlFrameCallbackCurrent", "txlInvokeFrameCallback",
         "txlCaptureSession", "txlSessionCurrent", "txlStationAdmits", "txlFramePreparationCurrent",
-        "txl_frame_free_list_pop", "txl_frame_get", "txl_frame_release", "txl_frame_push",
+        "txl_frame_free_list_pop", "txl_frame_get", "txl_frame_release", "txlFramePushPrepared",
+        "txl_frame_push",
     ])
     management = (FW / "scan_station_ap_me.nim").read_text()
     handlers = (FW / "task_handlers.nim").read_text()
@@ -284,8 +353,8 @@ def test_probe_lifetime(tmp_path: Path, mode: str, mutation: str | None) -> None
     elif mutation == "snapshot":
         probe = probe.replace("unsafeAddr ieBytes[0]", "addr scan_probe_req_ie.ieData[0]")
     elif mutation == "handoff":
-        probe = probe.replace("  (txl_frame_push(frame, 3) xor 1'u8) and 0xFF'u8",
-                              "  result = (txl_frame_push(frame, 3) xor 1'u8) and 0xFF'u8\n"
+        probe = probe.replace("  if txl_frame_push(frame, 3) != 0: 0'u8 else: 1'u8",
+                              "  result = (if txl_frame_push(frame, 3) != 0: 0'u8 else: 1'u8)\n"
                               "  frameDesc.pendingMacTime = 0")
     elif mutation == "release":
         release = release.replace("  scan_env.paramPtr = nil\n", "")
@@ -312,7 +381,8 @@ def test_probe_lifetime(tmp_path: Path, mode: str, mutation: str | None) -> None
     result = subprocess.run([nim, "c", "-r", "--skipParentCfg:on", "--skipProjCfg:on", "--skipUserCfg:on",
         "-d:bl808WifiScanTrace", f"--nimcache:{tmp_path / 'cache'}", f"-o:{tmp_path / 'test'}",
         *flags[mode], str(source)], cwd=ROOT, text=True, stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, timeout=120)
+        stderr=subprocess.STDOUT, timeout=120,
+        env={**os.environ, "ASAN_OPTIONS": "symbolize=0"} if mode == "asan" else None)
     if mutation is None:
         assert result.returncode == 0, result.stdout
     else:

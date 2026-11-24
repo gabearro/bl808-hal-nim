@@ -24,13 +24,13 @@ proc osSleepUs(duration: uint64) =
 
 proc osMsleep(ms: clong): cint {.cdecl.} =
   if ms <= 0:
-    return 0
+    return 1
   osSleepUs(ms.uint64 * 1000'u64)
-  0
+  1
 
 proc osSleep(seconds: cuint): cint {.cdecl.} =
   osSleepUs(seconds.uint64 * 1000000'u64)
-  0
+  1
 
 proc osEventGroupCreate(): pointer {.cdecl.} = c_calloc(1, sizeof(SimpleEventGroup).csize_t)
 proc osEventGroupDelete(event: pointer) {.cdecl.} = osObjectDelete(event)
@@ -104,10 +104,13 @@ proc osEventGroupWait(event: pointer; bitsToWaitFor: uint32; clearOnExit, waitFo
 proc osEventRegister(t: cint; cb, arg: pointer): cint {.cdecl.} =
   discard t; discard cb; discard arg; 0
 proc osEventNotify(evt, value: cint): cint {.cdecl.} =
-  discard evt; discard value; 0
+  aos_post_event(2'u16, (evt.uint32 and 0xFFFF'u32).uint16,
+                 cast[uint32](value).culong)
 proc osTaskCreate(name: cstring; entry: pointer; stackDepth: uint32; param: pointer;
                   prio: uint32; taskHandle: pointer): cint {.cdecl.} =
-  discard name; discard entry; discard stackDepth; discard param; discard prio; discard taskHandle; 0
+  discard name; discard entry; discard stackDepth; discard param; discard prio; discard taskHandle
+  # No scheduler exists here; never report a FreeRTOS task as ready.
+  -1
 proc osTaskDelete(taskHandle: pointer) {.cdecl.} = discard taskHandle
 proc osTaskGetCurrent(): pointer {.cdecl.} = addr osTaskNotifications
 proc osTaskNotifyCreate(): pointer {.cdecl.} = osTaskGetCurrent()

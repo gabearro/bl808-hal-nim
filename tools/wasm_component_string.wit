@@ -1,0 +1,5 @@
+package ox64:math@0.2.0;
+
+world string-demo {
+  export first-byte: func(value: string) -> u32;
+}

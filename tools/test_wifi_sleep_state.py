@@ -9,6 +9,7 @@ from test_wifi_message_allocation import run_program
 
 
 PLATFORM = r'''
+const BlNapWaking = 2'u32
 type
   CoList = object
     first, last: pointer
@@ -25,7 +26,7 @@ var
   ps: Ps
   env: Env
   vifs: array[2, Vif]
-  napScheduleState, pmState, veto: uint32
+  napScheduleState, pmState, veto, wakeError: uint32
   queued, interrupts, incomingIrq: bool
   visited: seq[int]
   events: seq[tuple[kind, code: uint32, hasResult: bool]]
@@ -62,6 +63,8 @@ proc wifi_hosal_pm_post_event(kind, code: uint32; resultPtr: pointer) =
       doAssert code == 0 and resultAddress == nil
       resultAddress = resultPtr
       cast[ptr uint32](resultPtr)[] = veto
+    elif kind == 2 and code == 2:
+      cast[ptr uint32](resultPtr)[] = wakeError
     else:
       doAssert kind == 2 and code == 0 and resultPtr == resultAddress
       doAssert cast[ptr uint32](resultPtr)[] == veto
@@ -72,6 +75,7 @@ proc setup(previousState = 0'u32; irq = true) =
   napScheduleState = previousState
   pmState = 0
   veto = 0
+  wakeError = 0
   queued = false
   interrupts = irq
   incomingIrq = irq
@@ -88,7 +92,7 @@ proc oneActive(onChannel: bool; flags: uint32) =
   env.activeList = CoList(first: addr vifs[0], last: addr vifs[0])
 proc runSleep() =
   bl_sleep_schedule()
-  doAssert stateCalls == 1 and pendingChecks == 1
+  doAssert stateCalls == 1 and pendingChecks == (pmState == 0).int
   doAssert interrupts == incomingIrq
 '''
 
@@ -100,7 +104,7 @@ def source() -> str:
 
 
 SLEEP_EVENTS = "@[(1'u32, 0'u32, true), (1'u32, 1'u32, false)]"
-WAKE_EVENTS = "@[(2'u32, 1'u32, false), (2'u32, 2'u32, false)]"
+WAKE_EVENTS = "@[(2'u32, 1'u32, false), (2'u32, 2'u32, true)]"
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
@@ -173,7 +177,9 @@ for irq in [false, true]:
     setup(previousState, irq)
     pmState = high(uint32)
     runSleep()
-    doAssert napScheduleState == 0 and events.len == 0 and visited.len == 0
+    doAssert napScheduleState == 0 and visited.len == 0
+    if previousState == 0: doAssert events.len == 0
+    else: doAssert events == WAKE_EVENTS
 
     setup(previousState, irq)
     ps.enabled = 0
@@ -195,7 +201,7 @@ for irq in [false, true]:
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-def test_pending_work_keeps_existing_wake_guard(tmp_path: Path, mode: str) -> None:
+def test_pm_bypass_precedes_pending_work_wake_guard(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, source() + r'''
 for irq in [false, true]:
   for busyPm in [false, true]:
@@ -239,4 +245,110 @@ queued = true
 doAssert wifiMainServiceStep()
 doAssert events == WAKE_EVENTS and napScheduleState == 0
 doAssert waited == 0 and drained == 2
+
+setup(1)
+queued = true
+wakeError = 1
+doAssert not wifiMainServiceStep(blockWhenIdle = true)
+doAssert napScheduleState == BlNapWaking and waited == 0 and drained == 2 and queued
+doAssert events == WAKE_EVENTS
+wakeError = 0
+doAssert wifiMainServiceStep(blockWhenIdle = true)
+doAssert napScheduleState == 0 and waited == 0 and drained == 3 and not queued
+doAssert events[^1] == (2'u32, 2'u32, true) and events.len == 3
 '''.replace("SLEEP_EVENTS", SLEEP_EVENTS).replace("WAKE_EVENTS", WAKE_EVENTS))
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_backend_poll_latches_mac_clock_once_before_sleep(tmp_path: Path, mode: str) -> None:
+    main = (FW / "task_init_main.nim").read_text()
+    support = FW.parent / "support"
+    poll = (support / "backend_runtime_parts/poll.nim").read_text()
+    backend = (support / "backend_irq.nim").read_text()
+    code = r'''
+const
+  MAC_PL_CTRL_REG = 0x24900084'u
+  RfStatusCtrl = MAC_PL_CTRL_REG.uint32
+  MacRfStatus = 0x24B00120'u32
+  MacRfActiveBit = 0x80000'u32
+  BlNapWaking = 2'u32
+var timestamp, control: uint32
+var napScheduleState: uint32
+var steps: seq[string]
+var fwStarted = true
+var hostPollEnabled = false
+proc macTimeNow(): uint32 =
+  steps.add("timestamp")
+  timestamp
+proc regRead(address: uint): uint32 =
+  doAssert address == MAC_PL_CTRL_REG
+  steps.add("read")
+  control
+proc regWrite(address: uint; value: uint32) =
+  doAssert address == MAC_PL_CTRL_REG
+  steps.add("write")
+  control = value
+proc regRead32(address: uint32): uint32 =
+  if address == MacRfStatus: macTimeNow()
+  else: regRead(address.uint)
+proc regWrite32(address, value: uint32) = regWrite(address.uint, value)
+proc bl808WifiBackendPollEmbEvents() = steps.add("emb")
+proc bl808WifiBackendPollMacIrq() = steps.add("irq")
+proc bl_sleep_schedule() = steps.add("sleep")
+proc wifiMainHasPendingWork(): bool = false
+proc wifiDrainScheduledWork(): bool = false
+proc ipc_emb_wait() = doAssert false
+proc vendorDrainScheduledWork() = steps.add("drain")
+proc mgmrPmProcessOne(): bool = false
+proc wifiHwRaw(): pointer = nil
+proc loadPtr(base: pointer; offset: int): pointer = nil
+proc bl_main_event_handle(event: int; arg: pointer) = doAssert false
+proc osTimerPoll() = discard
+proc aosPollEvents() = discard
+proc aosPollDelayedActions() = discard
+'''
+    for name in ("wifiUpdateMacPlCtrl", "wifiWaitForWorkIfIdle", "wifiMainServiceStep",
+                 "wifiMainServiceNonblocking", "wifi_main_poll_once"):
+        code += procedure(main, name)
+    if "proc bl808WifiBackendDriveRfStatus(" in backend:
+        code += procedure(backend, "bl808WifiBackendDriveRfStatus").split("\ntemplate ", 1)[0] + "\n"
+    code += procedure(poll, "vendorPollOnce")
+    run_program(tmp_path, mode, code + r'''
+for ts in [0x7FFFF'u32, 0x80000, 0xFFFFF, 0x100000]:
+  for previous in [0xA5051234'u32, 0xA5051235'u32]:
+    timestamp = ts
+    control = previous
+    steps.setLen(0)
+    vendorPollOnce()
+    doAssert steps == @["emb", "irq", "timestamp", "read", "write", "sleep", "drain"]
+    doAssert control == ((previous and not 1'u32) or ((ts shr 19) and 1))
+fwStarted = false
+steps.setLen(0)
+vendorPollOnce()
+doAssert steps.len == 0
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "firmware"])
+def test_backend_drain_yields_on_failed_wake(tmp_path: Path, mode: str) -> None:
+    drain = FW.parent / "support/backend_runtime_parts/scheduled_work.nim"
+    run_program(tmp_path, mode, r'''
+var
+  ipcPollIrqCount, polls: int
+  pendingWake, hostPollEnabled: bool
+proc wifi_pm_wake_pending(): bool = pendingWake
+proc bl808WifiBackendHostIpcStatus(): uint32 = 0
+proc ke_evt_field_get(): uint32 = 1
+proc bl_irq_handler() = doAssert false
+proc wifi_main_poll_once() =
+  inc polls
+  pendingWake = true
+proc wifiHwRaw(): pointer = nil
+proc loadPtr(p: pointer; offset: int): pointer = nil
+proc bl_main_event_handle(event: int; arg: pointer) = doAssert false
+''' + drain.read_text() + r'''
+vendorDrainScheduledWork()
+doAssert polls == 1 and pendingWake
+vendorDrainScheduledWork()
+doAssert polls == 1
+''')

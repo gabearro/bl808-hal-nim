@@ -2,8 +2,17 @@ type IpcHostDispatchScope* = object
   previous: ptr IpcHostDispatchScope
   env, shared: pointer
   cancelled, registered: bool
+  when defined(bl808WifiDiagDhcpTxAttempts) or defined(bl808WifiDiagTcpPath):
+    txCompletion: pointer
+
+type IpcHostTxResourceStamp* = tuple[generation, releases: uint32]
 
 var ipcHostActiveDispatch: ptr IpcHostDispatchScope
+var ipcHostTxResources: IpcHostTxResourceStamp
+
+proc ipcHostTxResourceStamp*(): IpcHostTxResourceStamp {.inline.} =
+  ## Caller holds the host IRQ lock.
+  ipcHostTxResources
 
 template ipcHostIrqSave*(): uint32 =
   block:
@@ -52,3 +61,13 @@ proc ipcHostInvalidate(env, shared: pointer) =
     if scope.env == env or scope.shared == shared:
       scope.cancelled = true
     scope = scope.previous
+
+when defined(bl808WifiDiagDhcpTxAttempts) or defined(bl808WifiDiagTcpPath):
+  proc ipcHostTxCompletionWrapper*(hostId: pointer): pointer {.inline.} =
+    ## Caller holds the IRQ lock through use of the returned wrapper.
+    let scope = ipcHostActiveDispatch
+    if scope != nil and not scope.cancelled and scope.txCompletion != nil and
+        hostId != nil and loadPtr(scope.txCompletion, TxdescHostHostIdOff) == hostId:
+      scope.txCompletion
+    else:
+      nil

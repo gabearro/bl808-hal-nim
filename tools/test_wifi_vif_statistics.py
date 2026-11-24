@@ -1,5 +1,6 @@
 """Check active-VIF beacon statistics and bounded callback-independent reads."""
 from pathlib import Path
+from textwrap import dedent
 
 import pytest
 
@@ -169,6 +170,66 @@ vif_mgmt_statistic_dump()
 doAssert records == wanted and reads == @[0]
 ''',
 }
+
+STA_EVIDENCE = r'''
+const STA_MGMT_FREE_STAS = 4
+var
+  peers: array[STA_MGMT_FREE_STAS, tuple[valid, instNbr: uint8]]
+  mmBeaconProbeEpochs: array[MAX_VIFS, uint32]
+  macReads: int
+proc vifChannelForIdx(index: uint8): ptr VifChannelView =
+  doAssert snapshotActive and not interruptsEnabled
+  addr vifs[index]
+proc staInfoForIdx(index: uint8): ptr typeof(peers[0]) =
+  doAssert snapshotActive and not interruptsEnabled
+  addr peers[index]
+proc macTimeNow(): uint32 =
+  doAssert snapshotActive and not interruptsEnabled
+  inc macReads
+  42
+'''
+
+EVIDENCE_CHECKS = r'''
+setup()
+vifs[0].state = 1
+vifs[0].staIdx = 2
+vifs[0].probeCount = 17
+vifs[0].chanCtxt = cast[pointer](1)
+vifs[1].state = 1
+vifs[1].vifIdx = 1
+vifs[1].staIdx = 3
+vifs[1].chanCtxt = cast[pointer](2)
+peers[2] = (valid: 1'u8, instNbr: 0'u8)
+peers[3] = (valid: 1'u8, instNbr: 1'u8)
+mmBeaconProbeEpochs = [14'u32, 99'u32]
+let sample = nimFwSnapshotStaBeaconEvidence()
+doAssert interruptsEnabled and not snapshotActive and macReads == 1
+doAssert sample.valid and sample.vifIndex == 0 and sample.stationIndex == 2
+doAssert sample.received == 9 and sample.lastBeaconUs == high(uint32)
+doAssert sample.sampleUs == 42 and sample.probeEpoch == 14 and sample.missed == 17
+
+vifs[1].vifType = VIF_TYPE_STA
+doAssert not nimFwSnapshotStaBeaconEvidence().valid # ambiguous active peer
+vifs[1].state = 0
+peers[2].instNbr = 1
+doAssert not nimFwSnapshotStaBeaconEvidence().valid # replaced station owner
+peers[2].instNbr = 0
+vifs[0].chanCtxt = nil
+doAssert not nimFwSnapshotStaBeaconEvidence().valid # already detached
+vifs[0].chanCtxt = cast[pointer](1)
+vifs[0].staIdx = 255
+doAssert not nimFwSnapshotStaBeaconEvidence().valid # no station slot
+doAssert interruptsEnabled and not snapshotActive and macReads == 1
+'''
+
+
+@pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
+def test_station_beacon_evidence(tmp_path: Path, mode: str) -> None:
+    vif_source = VIF.read_text()
+    start = vif_source.index("  type NimFwStaBeaconEvidence")
+    end = vif_source.index("\nproc vif_mgmt_statistic_dump", start)
+    run_program(tmp_path, mode, PLATFORM + STA_EVIDENCE +
+                dedent(vif_source[start:end]) + EVIDENCE_CHECKS)
 
 
 @pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])

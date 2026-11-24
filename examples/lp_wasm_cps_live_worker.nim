@@ -14,6 +14,9 @@ import bl808/wasm_store
 
 when defined(bl808lp):
   {.pragma: lpRam, codegenDecl: "$# __attribute__((section(\".ramfunc\"), noinline, used)) $#$#".}
+  when not defined(bl808jtagram):
+    # The compact WASM task-start frame alone can exceed the default 2 KiB.
+    {.passL: "-Wl,--defsym=__bl808_lp_stack_bytes=4096".}
 else:
   {.pragma: lpRam.}
 

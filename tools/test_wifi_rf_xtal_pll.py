@@ -63,7 +63,7 @@ const
   RfConfigChannelWaitLimit = 2
   RfCtrlTuneEnableMask = 2'u32
   RfFcalCodeMask = 255'u32
-  RfAcalCodeMask = 0x003F0000'u32
+  RfAcalCodeMask = 0x001F0000'u32
   RfAcalComparatorMask = 0x00001000'u32
   RfLoFcalLowCount = 0xA6A0'u16
   RfLoFcalHighCount = 0xA6E0'u16
@@ -122,11 +122,12 @@ proc sampleRfFcalCount(): uint16 =
 proc rfPriWifiPllConfig()
 '''
     for name in (
+        "waitRfCalibrationUs",
         "rfPriXtalTablesReady", "rfPriChannelDivValue", "rfPriChannelCntValue",
         "rfPriLoFcalCountBound", "rf_pri_input_xtalfreq", "rf_pri_get_xtalfreq",
         "rf_pri_xtalfreq", "rfPriXtalRefdivRatio", "rfPriXtalTenthsMhz",
         "rfPriWifiPllFractionWord", "rfPriWifiPllConfig",
-        "writeRfFcalCode", "writeRfAcalCode",
+        "writeRfFcalCode", "writeRfAcalCode", "programRfPriModeRegisters",
         "prepareRfPriLoFcal", "chooseRfBaseFcalCode", "runRfPriLoFcal",
         "prepareRfPriLoAcal", "runRfPriLoAcal", "rfPriConfigChannelForCal",
     ):
@@ -275,6 +276,22 @@ for row in 0 ..< 6:
   seedPll()
   checkPll(0, ReferenceDividers[row], false)
 ''')
+
+def test_crystal_getter_follows_vendor_flag_priority(tmp_path: Path) -> None:
+    run_program(tmp_path, "checked", xtal_source() + r'''
+for mask in 0 ..< 64:
+  setFlags(mask)
+  let expected =
+    if (mask and 1) != 0: WlXtal24M
+    elif (mask and 2) != 0: WlXtal26M
+    elif (mask and 4) != 0: WlXtal32M
+    elif (mask and 16) != 0: WlXtal40M
+    elif (mask and 32) != 0: WlXtal52M
+    elif (mask and 8) != 0: WlXtal38P4M
+    else: 0'u32
+  doAssert rf_pri_get_xtalfreq() == expected
+''')
+
 
 @pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
 def test_calibration_channel_uses_selected_divider_bank(tmp_path: Path, mode: str) -> None:

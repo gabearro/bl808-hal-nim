@@ -35,6 +35,14 @@ type
   SimpleSemaphore = object
     header: OsObjectHeader
     available: bool
+  SimpleMutex = object
+    header: OsObjectHeader
+  SimpleTimer = object
+    header: OsObjectHeader
+    next: ptr SimpleTimer
+    callback, arg: pointer
+    deadlineUs, periodUs: uint64
+    active, periodic, running: bool
   SimpleTimeout = object
     lastMilliseconds: uint64
   SimpleQueue = object

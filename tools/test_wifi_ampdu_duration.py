@@ -11,6 +11,7 @@ from test_wifi_message_allocation import run_program
 PLATFORM = r'''
 const
   MAX_VIFS = 2
+  VIF_TYPE_STA = 0'u8
   KeMsgConsumed = 0.cint
   MM_SET_EDCA_CFM = 23'u16
   MmSetEdcaReqPayloadSize = 8'u32
@@ -32,6 +33,14 @@ var
   header: Header
   request: MmSetEdcaReqPayload
   uapsdCalls: int
+  mmEdcaRefresh: tuple[vif: uint8]
+proc irqSave(): uint32 = 0
+proc irqRestore(saved: uint32) = discard
+proc vifChannelForIdx(i: uint8): ptr Vif = addr vifs[i]
+proc mmEdcaRefreshCurrent(): bool = false
+proc mmProgramEdca(vif: ptr Vif) = doAssert false
+proc mmEdcaOwner(): ptr Vif =
+  if vifs[1].state != 0: addr vifs[1] else: nil
 proc mmEnvView(): ptr MmEnvView = addr mm
 proc registerIndex(address: uint): int =
   doAssert address >= MACHW_EDCA_AC_BK_REG and address <= MACHW_EDCA_AC_VO_REG
@@ -101,6 +110,8 @@ def source() -> str:
 proc applyEdca(param: pointer): cint =
   let msgBody = param
   let hdr = addr header
+  if hdr.paramLen < MmSetEdcaReqPayloadSize: return 0
+  let edcaRefresh = false
   var cfmBasicId: uint16
 '''
     return registers + types + PLATFORM + functions + wrapper + edca + "\n  cfmBasicId.cint\n"

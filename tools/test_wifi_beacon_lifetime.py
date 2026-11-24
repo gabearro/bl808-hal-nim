@@ -241,11 +241,19 @@ def test_vif_registration_and_unregister_use_current_owner(tmp_path: Path, mode:
         pytest.skip("Nim is required")
     kernel = (FW / "kernel_mac_channel.nim").read_text()
     vif = (FW / "vif_management.nim").read_text()
-    code = VIF_PLATFORM
+    code = VIF_PLATFORM.replace(
+        "  Timer = object\n", "  Timer = object\n    next: ptr CoListHdr\n"
+    ).replace("proc mm_timer_clear(p: pointer) = inc clearedTimers\n", "")
     code += procedure((FW / "rx_layer.nim").read_text(), "rxInvalidateQuiescentVif")
     code += procedure((FW / "rx_layer.nim").read_text(), "rxInvalidateVif")
     for name in ["co_list_init", "co_list_push_front", "co_list_push_back", "co_list_pop_front", "co_list_extract", "co_list_find"]:
         code += procedure(kernel, name)
+    code += r'''
+var timerQueue: CoList
+proc mm_timer_clear(p: pointer) =
+  inc clearedTimers
+  co_list_extract(addr timerQueue, cast[ptr CoListHdr](p))
+'''
     for name in ["vif_mgmt_entry_init", "vif_mgmt_init", "vif_mgmt_register", "vif_mgmt_unregister"]:
         code += procedure(vif, name)
     code += r'''
@@ -260,6 +268,12 @@ for removed in 0'u8 .. 1:
     let otherEpoch = rxVifEpochs[removed xor 1]
     co_list_push_back(addr env.activeList, cast[ptr CoListHdr](addr vifs[0]))
     co_list_push_back(addr env.activeList, cast[ptr CoListHdr](addr vifs[1]))
+    let watchdog = cast[ptr CoListHdr](addr vifs[removed].keepAliveTimer)
+    let unrelated = cast[ptr CoListHdr](addr vifs[removed xor 1].beaconTimeoutTimer)
+    co_list_init(addr timerQueue)
+    if kind == VIF_TYPE_STA:
+      co_list_push_back(addr timerQueue, watchdog)
+    co_list_push_back(addr timerQueue, unrelated)
     stopHook = proc() =
       doAssert rxVifEpochs[removed] == epoch + 1
       vif_mgmt_unregister(removed)
@@ -292,7 +306,9 @@ for removed in 0'u8 .. 1:
     if kind == VIF_TYPE_AP: doAssert events == @["stop", "zero"]
     else: doAssert events == @["zero"]
     doAssert vifs[removed].vifType == 4
-    doAssert clearedTimers == 2 and resets == 1
+    doAssert timerQueue.first == unrelated and timerQueue.last == unrelated and
+      unrelated.next == nil, "VIF removal did not preserve the unrelated timer"
+    doAssert clearedTimers == (if kind == VIF_TYPE_STA: 3 else: 2) and resets == 1
     doAssert env.activeList.first == cast[ptr CoListHdr](addr vifs[removed xor 1])
     doAssert env.freeList.first == cast[ptr CoListHdr](addr vifs[removed])
     let before = events

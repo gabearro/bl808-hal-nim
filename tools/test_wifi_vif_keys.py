@@ -70,6 +70,12 @@ proc checkInstall(vifIdx, keyId, cipher, pairwise: uint8; pn: uint64) =
     req.pnLowBytes[i] = ((pn shr (i * 8)) and 255).uint8
     req.pnHighBytes[i] = ((pn shr (32 + i * 8)) and 255).uint8
   let originalReq = req
+  if cipher in [1'u8, 2'u8, 5'u8] and pn > 0xFFFFFFFFFFFF'u64:
+    let before = vifs
+    vif_mgmt_add_key(addr req, 17 + keyId)
+    assertBytes(addr vifs, addr before, sizeof(vifs), "out-of-range install PN")
+    doAssert req == originalReq and vifKeyPrngState == expectedPrng
+    return
   let slot = vifKeySlot(addr expected[vifIdx], keyId.uint)
   slot.replayCounters = default(typeof(slot.replayCounters))
   slot.keyIdx = 17 + keyId
@@ -230,6 +236,41 @@ for vifIdx in 0'u8 .. 1'u8:
             doAssert req == beforeReq
 """
 
+INVALID_ADD_CHECKS = r"""
+discard c_memset(addr vifs, 0xA5, sizeof(vifs).csize_t)
+let before = vifs
+vifKeyPrngState = 123'u32
+vif_mgmt_add_key(nil, 7)
+for invalid in [(2'u8, 0'u8), (255'u8, 0'u8),
+                (0'u8, 6'u8), (1'u8, 255'u8)]:
+  let vifIdx = invalid[0]
+  let keyId = invalid[1]
+  var req = VifMgmtAddKeyParamView(staIdx: keyId, keySlot: vifIdx,
+                                   cipherType: 2)
+  vif_mgmt_add_key(addr req, 7)
+  doAssert req.staIdx == keyId and req.keySlot == vifIdx
+assertBytes(addr vifs, addr before, sizeof(vifs), "invalid add request")
+doAssert vifKeyPrngState == 123'u32
+for cipher in [1'u8, 2'u8, 5'u8]:
+  for highByte in 2 .. 3:
+    var req = VifMgmtAddKeyParamView(staIdx: (if cipher == 5: 4'u8 else: 0'u8),
+                                     keySlot: 0, cipherType: cipher)
+    req.pnHighBytes[highByte] = 1
+    let originalReq = req
+    vif_mgmt_add_key(addr req, 7)
+    assertBytes(addr vifs, addr before, sizeof(vifs), "oversized receive PN")
+    doAssert req == originalReq and vifKeyPrngState == 123
+"""
+
+INVALID_DELETE_CHECKS = r"""
+discard c_memset(addr vifs, 0xA5, sizeof(vifs).csize_t)
+let before = vifs
+vif_mgmt_del_key(nil, 0)
+for slot in [6'u8, 255'u8]:
+  vif_mgmt_del_key(addr vifs[0], slot)
+assertBytes(addr vifs, addr before, sizeof(vifs), "invalid delete request")
+"""
+
 
 def procedure(source: str, name: str) -> str:
     start = re.search(rf"^proc {name}\*?\(", source, re.M)
@@ -295,3 +336,15 @@ def test_vif_key_lifecycle(name: str, checks: str, tmp_path: Path) -> None:
 def test_installed_key_forward_jumps(tmp_path: Path, mode: str) -> None:
     body = procedure((FW / "vif_management.nim").read_text(), "vif_mgmt_add_key")
     run_program(tmp_path, mode, build_source(body, WIDE_RX_CHECKS))
+
+
+@pytest.mark.parametrize("name,checks", [
+    ("vif_mgmt_add_key", INVALID_ADD_CHECKS),
+    ("vif_mgmt_del_key", INVALID_DELETE_CHECKS),
+], ids=["add", "delete"])
+@pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
+def test_invalid_vif_key_request_is_ignored(
+    tmp_path: Path, name: str, checks: str, mode: str
+) -> None:
+    body = procedure((FW / "vif_management.nim").read_text(), name)
+    run_program(tmp_path, mode, build_source(body, checks))

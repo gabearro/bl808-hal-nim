@@ -71,11 +71,39 @@ def source() -> str:
     scan = (FW / "scan_station_ap_me.nim").read_text()
     code = layouts("MacIeView", "RateSetView") + PLATFORM
     code += procedure((FW / "mac_config_debug.nim").read_text(), "mac_ie_find")
+    code += procedure(scan, "readLegacyRateIe")
     code += procedure(scan, "me_extract_rate_set")
     return code + r'''
 proc parse() =
   me_extract_rate_set(incoming, incomingLength, addr output.data[0])
 '''
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_basic_rate_selection_preserves_vendor_alias_order(tmp_path: Path, mode: str) -> None:
+    scan = (FW / "scan_station_ap_me.nim").read_text()
+    code = source() + procedure(scan, "me_get_basic_rates")
+    run_program(tmp_path, mode, code + r'''
+var rates: array[13, uint8]
+rates[0] = 5
+rates[1] = 0x82
+rates[2] = 4
+rates[3] = 0x8B
+rates[4] = 22
+rates[5] = 0x8C
+var selected: array[13, uint8]
+for value in selected.mitems: value = 0xA5
+me_get_basic_rates(addr rates[0], addr selected[0])
+doAssert selected[0] == 3 and selected[1] == 0x82
+doAssert selected[2] == 0x8B and selected[3] == 0x8C
+doAssert selected[4] == 0xA5 and rates[0] == 5
+
+# The vendor clears the output count before re-reading the input count.
+me_get_basic_rates(addr rates[0], addr rates[0])
+doAssert rates[0] == 0
+doAssert rates[1] == 0x82 and rates[2] == 4 and rates[3] == 0x8B
+doAssert rates[4] == 22 and rates[5] == 0x8C
+''')
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])

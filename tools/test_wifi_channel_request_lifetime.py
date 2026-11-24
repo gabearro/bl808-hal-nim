@@ -146,6 +146,8 @@ proc prepare(irq: bool) =
   replies = 0
   idleRequests = 0
   mm = default(typeof(mm))
+  mmConfigIdle = default(typeof(mmConfigIdle))
+  mmConfigTestEvents = 0
   mmState = 0
   failAllocation = false
   heapCalls = 0
@@ -168,7 +170,8 @@ proc dispatchOne(): cint =
   ke_task_schedule()
   lastResult
 proc resumeSaved() =
-  mmState = 0
+  if mmState == TaskGoingIdleState: mm_hw_idle_evt()
+  else: ke_state_set(TASK_MM, MM_IDLE)
   while keMsgQueueSaved.first != nil:
     co_list_push_back(addr keMsgQueueSent, co_list_pop_front(addr keMsgQueueSaved))
 proc finish() =
@@ -336,6 +339,7 @@ for irq in [false, true]:
 def source() -> str:
     handler = update.HANDLER_PLATFORM.replace("next: pointer", "next: ptr KeMsgHdr")
     handler = handler.replace(procedure(handler, "ke_msg_send"), "")
+    handler = handler.replace(procedure(handler, "ke_msg_free_payload"), "")
     handler = handler.replace(procedure(handler, "chanUpdateAdmit"), "")
     handler = handler.replace("  doAssert address == MACHW_STATE_CNTRL_REG\n  0\n",
                               "  doAssert address == MACHW_STATE_CNTRL_REG\n"
@@ -346,8 +350,10 @@ def source() -> str:
                            "PowerConstraintOutputOverlay", "MacIeView")
             + update.source() + handler + support + TIM_METADATA_STUBS)
     for name in ["chanUpdateStorageLength", "chanUpdateRegister", "chanUpdateCaptureMessage",
-                 "chanUpdateForget", "chanUpdateAdmit"]:
+                 "chanUpdateForget", "chanUpdateAdmit", "mmConfigForgetIdleOwner",
+                 "mmConfigResumeAbandonedIdle"]:
         code = code.replace(procedure(code, name), "")
+    code += update.mm_config_idle_source()
     code += (FW / "channel_update.nim").read_text()
     code += r'''
 proc assertNoTag(header: pointer) =
@@ -356,7 +362,7 @@ proc assertNoTag(header: pointer) =
 '''
     kernel = (FW / "kernel_mac_channel.nim").read_text()
     for name in ["co_list_push_back", "co_list_pop_front", "ke_msg_try_alloc", "ke_msg_alloc",
-                 "ke_msg_free", "ke_msg_send", "ke_task_schedule"]:
+                 "ke_msg_free", "ke_msg_free_payload", "ke_msg_send", "ke_task_schedule"]:
         code += procedure(kernel, name)
     code += procedure((FW / "layout_types.nim").read_text(), "totalLen").split("\n\ntemplate", 1)[0]
     code += procedure((FW / "mac_config_debug.nim").read_text(), "mac_ie_find")
@@ -375,3 +381,56 @@ proc assertNoTag(header: pointer) =
 @pytest.mark.parametrize("case", CASES)
 def test_channel_request_lifetime(tmp_path: Path, mode: str, case: str) -> None:
     run_program(tmp_path, mode, source() + CASES[case])
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_late_idle_owner_release_keeps_restore_runnable(tmp_path: Path, mode: str) -> None:
+    code = source()
+    stub = "proc keUpdateMessageEventAfterSchedule() = discard"
+    assert stub in code
+    code = code.replace(stub, "proc keUpdateMessageEventAfterSchedule()")
+    event_set = "  doAssert bits == KE_EVT_KE_MESSAGE\n  if onEvent != nil: onEvent()"
+    assert event_set in code
+    code = code.replace(event_set, "  mmConfigTestEvents = mmConfigTestEvents or bits")
+    event_clear = "proc ke_evt_clear(bits: uint32) = doAssert bits == KE_EVT_IDLE"
+    assert event_clear in code
+    code = code.replace(event_clear,
+                        "proc ke_evt_clear(bits: uint32) =\n"
+                        "  mmConfigTestEvents = mmConfigTestEvents and not bits")
+    tail = procedure((FW / "kernel_mac_channel.nim").read_text(),
+                     "keUpdateMessageEventAfterSchedule")
+    tail = tail.replace(" {.inline.} =", " =", 1)
+    # Release the saved owner just before the scheduler masks interrupts to
+    # examine the empty sent queue, not during the locked event update.
+    tail = tail.replace("  let saved = irqSave()", "  if beforeEventUpdate != nil:\n"
+                        "    let action = beforeEventUpdate\n"
+                        "    beforeEventUpdate = nil\n"
+                        "    action()\n"
+                        "  let saved = irqSave()", 1)
+    run_program(tmp_path, mode, code + "\nvar beforeEventUpdate: proc()\n"
+                "var keSavedReschedMask: uint16\n" + tail + r'''
+prepare(true)
+mmState = 1
+let owner = issue()
+ke_msg_send(owner)
+doAssert dispatchOne() == KeMsgSaved
+mm_hw_idle_evt()
+doAssert mmState == MM_IDLE and mmConfigIdle.phase == mmConfigIdleReady
+doAssert mmConfigIdle.owner == keMsgHdrFromPayload(owner)
+doAssert keMsgQueueSent.first == nil
+
+beforeEventUpdate = proc() =
+  doAssert interruptsEnabled
+  let retired = co_list_pop_front(addr keMsgQueueSaved)
+  doAssert retired == keMsgHdrFromPayload(owner)
+  ke_msg_free(retired)
+  doAssert (mmConfigTestEvents and KE_EVT_KE_MESSAGE) != 0
+# Dispatch an empty wake, then model only the wakes the firmware can see.
+ke_task_schedule()
+if (mmConfigTestEvents and KE_EVT_KE_MESSAGE) != 0:
+  ke_task_schedule()
+doAssert mmState == 1 and mmConfigIdle.phase == mmConfigNoIdle,
+  "the radio remained idle after its last request was discarded"
+doAssert mmConfigTestEvents == 0 and replies == 0
+finish()
+''')

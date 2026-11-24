@@ -1,0 +1,40 @@
+(component
+  (type $unused (resource (rep i32)))
+  (type $ticket (resource (rep i32)))
+  (export $Ticket "ticket" (type $ticket))
+  (type $Contract (component
+    (alias outer 1 $Ticket (type $Captured))
+    (import "ticket" (type $In (eq $Captured)))
+    (export "ticket" (type $Out (eq $In)))
+    (export "inspect" (func (param "value" (borrow $Out)) (result u32)))))
+
+  (component $provider
+    (import "ticket" (type $Local (sub resource)))
+    (export $Visible "ticket" (type $Local))
+    (core func $release (canon resource.drop $Local))
+    (core module $code
+      (import "" "release" (func $release (param i32)))
+      (func (export "inspect") (param i32) (result i32)
+        (call $release (local.get 0))
+        (i32.const 42)))
+    (core instance $code (instantiate $code (with "" (instance (export "release" (func $release))))))
+    (func (export "inspect") (param "value" (borrow $Visible)) (result u32)
+      (canon lift (core func $code "inspect"))))
+  (export $Typed "provider" (component $provider) (component (type $Contract)))
+  (instance $worker (instantiate $Typed (with "ticket" (type $Ticket))))
+  (core func $new (canon resource.new $ticket))
+  (core func $drop (canon resource.drop $ticket))
+  (core func $inspect (canon lower (func $worker "inspect")))
+  (core module $entry
+    (import "resource" "new" (func $new (param i32) (result i32)))
+    (import "resource" "drop" (func $drop (param i32)))
+    (import "resource" "inspect" (func $inspect (param i32) (result i32)))
+    (func (export "run") (result i32) (local $handle i32)
+      (local.set $handle (call $new (i32.const 42)))
+      (call $inspect (local.get $handle))
+      (call $drop (local.get $handle))))
+  (core instance $entry (instantiate $entry (with "resource" (instance
+    (export "new" (func $new))
+    (export "drop" (func $drop))
+    (export "inspect" (func $inspect))))))
+  (func (export "run") (result u32) (canon lift (core func $entry "run"))))

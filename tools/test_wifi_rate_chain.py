@@ -121,14 +121,18 @@ proc setup(count: int; fixed: uint16) =
   rcU8(stats, RCS_BW_MAX) = 0
   for i in 0 ..< min(count, 10):
     rcRateStats(stats, i).rateConfig = if i < 2: i.uint16 else: 0x1000'u16 + i.uint16
-proc verifyReset(count: int; before: array[200, uint8]) =
+proc verifyReset(count: int; before: array[200, uint8]; resetAll: bool) =
   doAssert sortCalls == 1 and chainCalls == 1
   doAssert sta.txPolicyUpdateFlags[0] == StaTxPolicyUpdateRateControl
   doAssert rcU32(stats, 0) == 0xBABABABA'u32
   for i in 0 ..< count:
     let rate = rcRateStats(stats, i)
-    doAssert rate.probability == 0 and rate.oldProbAvailable == 0
-    doAssert rate.retryCount == 0 and rate.rateAllowed == 1
+    if resetAll or i < 2:
+      doAssert rate.probability == 0 and rate.oldProbAvailable == 0
+      doAssert rate.retryCount == 0 and rate.rateAllowed == 1
+    else:
+      doAssert rate.probability == 0xBABA and rate.oldProbAvailable == 0xBA
+      doAssert rate.retryCount == 0xBA and rate.rateAllowed == 0xBA
     doAssert rate.attempts == 0xBABA and rate.successes == 0xBABA
     doAssert rate.sampleSkipped == 0xBA
   for i in 4 + count * 12 ..< 124: doAssert data[i] == before[i]
@@ -136,15 +140,15 @@ for count in 1 .. 10:
   setup(count, 0xFFFF)
   let before = data
   rc_update_bw_nss_max(2, 1, 2)
-  verifyReset(count, before)
+  verifyReset(count, before, true)
   doAssert rcRateStats(stats, count - 1).rateConfig == 0x1007
   setup(count, 0xFFFF)
   let beforePreamble = data
   rc_update_preamble_type(2, 1)
-  verifyReset(count, beforePreamble)
+  verifyReset(count, beforePreamble, false)
   for i in 0 ..< min(count, 2): doAssert rcRateStats(stats, i).rateConfig == (0x400 or i).uint16
   for i in 2 ..< count: doAssert rcRateStats(stats, i).rateConfig == 0x1000'u16 + i.uint16
-  doAssert duplicateCalls == min(count, 2) and randomCalls == 0
+  doAssert duplicateCalls == 0 and randomCalls == 0
   rc_update_preamble_type(2, 1)
   doAssert sortCalls == 1
   rc_update_preamble_type(2, 0)
@@ -165,9 +169,21 @@ for invalid in [0, 11, 65535]:
 setup(3, 0xFFFF)
 rcRateStats(stats, 1).rateConfig = 0x400
 rc_update_preamble_type(2, 1)
-doAssert randomCalls == 2
-doAssert rcRateStats(stats, 0).rateConfig == 0x1801
-doAssert rcRateStats(stats, 1).rateConfig == 0x1802
+doAssert randomCalls == 1
+doAssert rcRateStats(stats, 0).rateConfig == 0x400
+doAssert rcRateStats(stats, 1).rateConfig == 0x1801
+setup(3, 0xFFFF)
+rcRateStats(stats, 0).rateConfig = 0x400
+rc_update_preamble_type(2, 1)
+doAssert randomCalls == 0
+doAssert rcRateStats(stats, 0).rateConfig == 0x400
+setup(3, 0xFFFF)
+rcRateStats(stats, 2).rateConfig = 0x401
+rc_update_preamble_type(2, 1)
+doAssert randomCalls == 1
+doAssert rcRateStats(stats, 0).rateConfig == 0x400
+doAssert rcRateStats(stats, 1).rateConfig == 0x1801
+doAssert rcRateStats(stats, 2).rateConfig == 0x401
 setup(3, 0xFFFF)
 rcRateStats(stats, 1).rateConfig = 0x400
 exhaustedRates = true

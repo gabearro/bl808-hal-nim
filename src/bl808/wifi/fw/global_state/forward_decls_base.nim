@@ -2,9 +2,9 @@
 proc ipc_emb_msg_push*(msgDescPtr: pointer) {.exportc, cdecl.}
 proc assert_rec*(cond: cstring, file: cstring, line: cint) {.exportc, cdecl.}
 proc blmac_soft_reset_getf*(): uint8 {.exportc, cdecl, noinline.}
-proc crm_get_mac_freq(): uint32 {.exportc, cdecl.}
 proc phy_get_mac_freq*(): uint32 {.exportc, cdecl.} =
-  crm_get_mac_freq()
+  ## The paired BL808 SDK PHY reports 40 MHz to hal_machw_init.
+  40'u32
 proc rxl_timeout_int_handler*() {.exportc, cdecl.}
 proc mm_sec_machwaddr_wr*(staIdx: uint8, keySlotRaw: pointer,
                           unusedCompatArg: uint8): uint8 {.exportc, cdecl, discardable.}
@@ -29,7 +29,8 @@ proc txl_buffer_alloc*(param: pointer, queueIdx: uint32, flags: uint32): pointer
 proc txu_cntrl_frame_build*(desc: pointer, bufPtr: pointer) {.exportc, cdecl.}
 proc txuBuildFrame(desc: pointer, bufPtr: pointer): bool
 proc txSecurityBind(desc: ptr HostTxDescView; key: ptr VifKeySlotView; bip: bool): bool
-proc txSecurityCurrent(desc: ptr HostTxDescView): bool
+proc txSecurityCurrent(desc: ptr HostTxDescView; allowInternalNull = false): bool
+proc txSecurityLengthsCurrent(desc: ptr HostTxDescView): tuple[header, tail: int]
 proc txSecurityForget(desc: pointer)
 proc txSecurityReset()
 proc txSecurityBeginUpdate(key: pointer): bool

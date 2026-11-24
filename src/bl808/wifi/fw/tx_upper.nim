@@ -16,6 +16,8 @@ proc txuBuildFrame(desc: pointer, bufPtr: pointer): bool =
   ## HostTxDescView.frameLen holds the Ethernet type/length in wire byte order;
   ## seqPassthrough holds payload length. Payload buffers need not be adjacent
   ## to the header. Duration/ID is not rewritten, matching the vendor builder.
+  if desc == nil or bufPtr == nil:
+    return false
   let txDesc = hostTxDescAt(desc)
   let saved = irqSave()
   defer: irqRestore(saved)
@@ -26,13 +28,19 @@ proc txuBuildFrame(desc: pointer, bufPtr: pointer): bool =
   template ensureCurrentBuild() =
     if txDesc.staIdx != staIdx or not txlSessionCurrent(identity, txDesc):
       return false
-  if not txlSessionCurrent(identity, txDesc) or txDesc.staInfoIdx >= STA_INFO_TAB_ENTRIES.uint8:
-    return false
-  let bufPtrU = cast[uint](bufPtr)
-  if bufPtrU == 0:
+  if not txlSessionCurrent(identity, txDesc) or
+      txDesc.staInfoIdx >= STA_INFO_TAB_ENTRIES.uint8 or
+      txDesc.vifIdx >= MAX_VIFS.uint8:
     return false
   let frameLen = txDesc.frameLen
   let frameType = lmacGateHalfword(frameLen)
+  let snapLen = txFrameSnapLen(frameType)
+  let requiredLen = txFrameBaseMacLen(txDesc).uint16 + snapLen.uint16
+  let expectedSec = txSecurityLengthsCurrent(txDesc)
+  if expectedSec.header notin [0, 4, 8] or
+      txDesc.hdrLen.uint16 != requiredLen + expectedSec.header.uint16 or
+      txDesc.secTailLen.int != expectedSec.tail or txDesc.qosExtLen != snapLen:
+    return false
   let layout = txFrameBuildLayout(txDesc, bufPtr, frameType)
 
   txFrameWriteSnap(layout, frameLen)
@@ -404,7 +412,8 @@ proc txu_cntrl_push*(param: pointer; ac: uint8): bool {.exportc, cdecl.} =
   #   desc[100]  = secTailLen                     ; MIC/ICV byte count
   let frameLen = desc.frameLen
   let frameType = lmacGateHalfword(frameLen)
-  # The vendor uses >1536 here but >=1536 in the frame builder.
+  # The vendor push uses >1536, but its builder writes SNAP at 1536 too.
+  # Reserve the bytes the builder actually writes.
   let qosExt = txFrameSnapLen(frameType)
   hdrLen += qosExt.uint16
 
@@ -487,6 +496,10 @@ proc txu_cntrl_tkip_mic_append*(txdesc: pointer) {.exportc, cdecl.} =
   let desc = hostTxDescAt(txdesc)
   # Control-port bypass reserves no MIC/ICV even when a key is installed.
   if desc == nil or desc.secTailLen == 0:
+    return
+  if desc.staInfoIdx >= STA_INFO_TAB_ENTRIES.uint8 or desc.bufDesc == nil or
+      desc.qosExtLen > desc.hdrLen or
+      txSecurityLengthsCurrent(desc).tail != desc.secTailLen.int:
     return
   let staIdx = desc.staInfoIdx
   let sta = staInfoForIdx(staIdx)

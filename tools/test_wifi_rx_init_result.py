@@ -46,6 +46,8 @@ proc ke_init() =
   resetEvents = 0
 proc bl_supplicant_init() = steps.add("supplicant")
 proc waitMacSoftResetClear(): bool = true
+template smSaQueryResetScope() = discard
+proc smSaQueryClearResetTimer() = discard
 proc hal_machw_reset(): bool =
   doAssert irqLevel == 0
   steps.add("mac-reset")
@@ -62,6 +64,7 @@ proc vif_mgmt_reset() =
   doAssert irqLevel == 0
   steps.add("vif-reset")
 proc apmResumeHaltRollback() = doAssert irqLevel == 0
+proc mmPsModeRetryAfterReset() = doAssert irqLevel == 0
 proc ke_evt_clear(mask: uint32) =
   doAssert irqLevel == 0
   steps.add("clear:" & $mask)

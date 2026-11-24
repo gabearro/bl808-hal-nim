@@ -22,6 +22,3 @@ const
   MachwIrqUnmask = 0x24B0_8074'u32
   BcnStatus = 0x24B0_0400'u32
   CoexCtrl = 0x2492_0004'u32
-  RfStatusCtrl = 0x2490_0084'u32
-  MacRfStatus = 0x24B0_0120'u32
-  MacRfActiveBit = 0x0008_0000'u32

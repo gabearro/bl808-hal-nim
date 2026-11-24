@@ -22,7 +22,7 @@ type
   DsParameter = object
     channel: uint8
 var
-  scanu_env: tuple[paramPtr: pointer, bssidFilterEnabled: uint8]
+  scanu_env: tuple[paramPtr: pointer, bssidFilterEnabled: uint8, filterBssid: array[6, uint8]]
   scanuRequestEpoch: uint32
   frame: array[96, uint8]
   ie: array[6, uint8]
@@ -98,6 +98,7 @@ proc setup(family: int) =
   original.ssidFilter[1] = 65
   scanu_env.paramPtr = original
   scanu_env.bssidFilterEnabled = 0
+  scanu_env.filterBssid = [2'u8, 0, 0, 0, 0, 0]
   scanuRequestEpoch = 7
   frame = default(typeof(frame))
   rxuMgtIndAt(addr frame[0]).frameLen = 36

@@ -105,14 +105,16 @@ proc vifChannelForIdx(index: uint8): ptr Vif =
   inc vifReads
   doAssert index < 2
   addr vifs[index]
-''' + callback_types() + SUPPORT + handler() + r'''
+''' + callback_types() + SUPPORT + procedure(
+    (FW / "platform_bl.nim").read_text(), "bl_wifi_set_wps_status_internal"
+) + handler() + r'''
 {.emit: """
-extern void sm_handle_eapol_input(unsigned char, void*, void*, NU32);
-static void call_eapol_input(unsigned char station, void *source, void *data, NU32 length) {
+extern void sm_handle_eapol_input(unsigned char, void*, void*, NU16);
+static void call_eapol_input(unsigned char station, void *source, void *data, NU16 length) {
   sm_handle_eapol_input(station, source, data, length);
 }
 """.}
-proc callInput(station: uint8; source, data: pointer; length: uint32) {.
+proc callInput(station: uint8; source, data: pointer; length: uint16) {.
   importc: "call_eapol_input", cdecl, nodecl.}
 '''
 
@@ -129,12 +131,12 @@ for vif in 0'u8 .. 1:
         resetRouting(state)
         if availability == 0: wpa_cbs = nil
         elif availability == 1: wpa.eapolHandler = nil
-        callInput(station, addr sourceBytes[0], addr dataBytes[0], 0x10001'u32)
+        callInput(station, addr sourceBytes[0], addr dataBytes[0], high(uint16))
         let routed = state in [0'u16, 9] and availability == 2
         doAssert callbackRecords.len == routed.int
         if routed:
           doAssert callbackRecords[0] == (1, cast[pointer](addr sourceBytes[0]),
-            cast[pointer](addr dataBytes[0]), 0x10001'u32)
+            cast[pointer](addr dataBytes[0]), high(uint16).uint32)
         doAssert nimFwDbgEapolCbInv == routed.uint32
         doAssert nimFwDbgEapolCbNull ==
           (state in [0'u16, 9] and availability != 2).uint32
@@ -184,11 +186,28 @@ for vif in [2'u8, 255]:
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_exported_wps_status_controls_eapol_route(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+stations[4].instNbr = 1
+vifs[1].security.connected = 1
+resetRouting(0)
+bl_wifi_set_wps_status_internal(2)
+doAssert sm.state == 2
+callInput(4, addr sourceBytes[0], addr dataBytes[0], 8)
+doAssert callbackRecords.len == 1 and callbackRecords[0].route == 2
+resetRouting(0)
+bl_wifi_set_wps_status_internal(0)
+callInput(4, addr sourceBytes[0], addr dataBytes[0], 8)
+doAssert callbackRecords.len == 1 and callbackRecords[0].route == 1
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_rx_dispatch_reaches_station_callback(tmp_path: Path, mode: str) -> None:
     code = rx.dispatch_source()
     stub = rx.procedure(code, "sm_handle_eapol_input")
     code = code.replace(stub,
-        "proc sm_handle_eapol_input*(staIdx: uint8; srcAddr, eapolBuf: pointer; eapolLen: uint32) {.cdecl, exportc.}\n", 1)
+        "proc sm_handle_eapol_input*(staIdx: uint8; srcAddr, eapolBuf: pointer; eapolLen: uint16) {.cdecl, exportc.}\n", 1)
     assert "    cipher: uint8" in code
     code = code.replace("    cipher: uint8", "    cipher, connected: uint8", 1)
     code += callback_types() + SUPPORT + handler()

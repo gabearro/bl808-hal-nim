@@ -1,6 +1,8 @@
 proc txCheckRet(isSta, isGroupcast: uint8; value: uint32): int =
-  discard isSta
-  if (isGroupcast == 0'u8 and (value and FrameSuccessfulTxBit) != 0'u32) or
-      (isGroupcast != 0'u8 and (value and DescDoneTxBit) != 0'u32):
-    return 1
-  0
+  if (value and DescDoneSwTxBit) != 0:
+    return 0
+  # STA uplink uses the AP as the unicast receiver even for Ethernet groupcast.
+  let successBit =
+    if isSta == 0 and isGroupcast != 0: DescDoneTxBit
+    else: FrameSuccessfulTxBit
+  int((value and successBit) != 0)

@@ -79,6 +79,7 @@ proc countryRegAt(p: pointer): ptr CountryRegView = cast[ptr CountryRegView](p)
                   if host_phy else FW / "kernel_mac_channel.nim")
     if host_phy:
         code += "const PHY_BAND_2G4 = 0'u8\n"
+    code += procedure(phy_source.read_text(), "phy_channel_to_freq").replace("weakExport, ", "")
     phy = procedure(phy_source.read_text(), "phy_freq_to_channel")
     code += phy.replace("{.weakExport, cdecl.}", "{.cdecl.}")
     code += procedure(scan, "me_bw_check")
@@ -87,17 +88,86 @@ proc countryRegAt(p: pointer): ptr CountryRegView = cast[ptr CountryRegView](p)
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_firmware_phy_conversion_boundaries(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+for sample in [(0'u8, 0xffff'u16), (1'u8, 2412'u16),
+               (13'u8, 2472'u16), (14'u8, 2484'u16),
+               (15'u8, 0xffff'u16)]:
+  doAssert phy_channel_to_freq(0'u8, sample[0]) == sample[1]
+for sample in [(0'u8, 0xffff'u16), (1'u8, 5005'u16),
+               (164'u8, 5820'u16), (165'u8, 5825'u16),
+               (166'u8, 0xffff'u16)]:
+  doAssert phy_channel_to_freq(1'u8, sample[0]) == sample[1]
+doAssert phy_channel_to_freq(2'u8, 1'u8) == 0xffff'u16
+for sample in [(5000'u16, 0'u8), (5004'u16, 0'u8),
+               (5005'u16, 1'u8), (5006'u16, 0'u8),
+               (5009'u16, 0'u8), (5010'u16, 2'u8),
+               (5820'u16, 164'u8), (5824'u16, 0'u8),
+               (5825'u16, 165'u8), (5826'u16, 0'u8)]:
+  doAssert phy_freq_to_channel(1'u8, sample[0]) == sample[1]
+for sample in [(2411'u16, 0'u8), (2412'u16, 1'u8),
+               (2413'u16, 0'u8), (2416'u16, 0'u8),
+               (2417'u16, 2'u8), (2472'u16, 13'u8),
+               (2473'u16, 0'u8), (2476'u16, 0'u8),
+               (2477'u16, 0'u8), (2481'u16, 0'u8),
+               (2482'u16, 0'u8), (2483'u16, 0'u8),
+               (2484'u16, 14'u8), (2485'u16, 0'u8)]:
+  doAssert phy_freq_to_channel(0'u8, sample[0]) == sample[1]
+doAssert phy_freq_to_channel(2'u8, 2412'u16) == 0'u8
+for channel in 1'u8 .. 14'u8:
+  doAssert phy_freq_to_channel(0'u8, phy_channel_to_freq(0'u8, channel)) == channel
+for channel in 1'u8 .. 165'u8:
+  doAssert phy_freq_to_channel(1'u8, phy_channel_to_freq(1'u8, channel)) == channel
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_linked_host_five_ghz_conversion(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source(host_phy=True) + r'''
+for sample in [(0.cint, 0xffff'u16), (1.cint, 5005'u16),
+               (164.cint, 5820'u16), (165.cint, 5825'u16),
+               (166.cint, 0xffff'u16)]:
+  doAssert phy_channel_to_freq(1'u8, sample[0]) == sample[1]
+for sample in [(5004'u16, 0'u8), (5005'u16, 1'u8),
+               (5006'u16, 0'u8), (5824'u16, 0'u8),
+               (5820'u16, 164'u8), (5825'u16, 165'u8),
+               (5826'u16, 0'u8)]:
+  doAssert phy_freq_to_channel(1'u8, sample[0]) == sample[1]
+for sample in [(2413'u16, 0'u8), (2477'u16, 0'u8),
+               (2483'u16, 0'u8), (2484'u16, 14'u8)]:
+  doAssert phy_freq_to_channel(0'u8, sample[0]) == sample[1]
+for channel in 1 .. 14:
+  doAssert phy_freq_to_channel(0'u8, phy_channel_to_freq(0'u8, channel.cint)) == channel.uint8
+for channel in 1 .. 165:
+  doAssert phy_freq_to_channel(1'u8, phy_channel_to_freq(1'u8, channel.cint)) == channel.uint8
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_country_power_uses_channel_band_and_frequency(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, source() + r'''
 for test in [(0'u8, 2412'u16, 22'i8), (0'u8, 2437'u16, 22'i8),
              (0'u8, 2484'u16, 22'i8), (1'u8, 5180'u16, 19'i8),
-             (1'u8, 5220'u16, 19'i8), (1'u8, 5805'u16, -5'i8)]:
+             (1'u8, 5220'u16, 19'i8), (1'u8, 5805'u16, -5'i8),
+             (1'u8, 5825'u16, -5'i8)]:
   setup(test[0], test[1])
   let expectedBss = bss
   var expectedChannel = channel
   expectedChannel.txPower = test[2]
   applyCountry([85'u8, 83, 32, 1, 14, 22, 36, 8, 19, 149, 5, 251])
   doAssert channel == expectedChannel and bss == expectedBss
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_country_power_rejects_off_grid_frequency(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+for sample in [(0'u8, 2413'u16), (0'u8, 2477'u16),
+               (1'u8, 5006'u16), (1'u8, 5824'u16)]:
+  setup(sample[0], sample[1])
+  let expected = (bss, channel)
+  applyCountry([85'u8, 83, 32, 1, 14, 22, 149, 5, 19, 164, 1, 19])
+  doAssert (bss, channel) == expected
 ''')
 
 
@@ -113,9 +183,17 @@ for number in 1 .. 14:
   applyCountry([85'u8, 83, 32, 1, 14, 17])
   doAssert channel == expectedChannel and bss == expectedBss
 setup(1, 5180)
-let expected = (bss, channel)
+let expectedBss = bss
+var expectedChannel = channel
+expectedChannel.txPower = 19
 applyCountry([85'u8, 83, 32, 36, 8, 19])
-doAssert (bss, channel) == expected
+doAssert bss == expectedBss and channel == expectedChannel
+setup(1, 5825)
+let upperBss = bss
+var upperChannel = channel
+upperChannel.txPower = -5
+applyCountry([85'u8, 83, 32, 149, 5, 251])
+doAssert bss == upperBss and channel == upperChannel
 ''')
 
 
@@ -192,7 +270,6 @@ for freq in [2412'u16, 5180'u16]:
     expected.value.centerFreq1 = if hasChannel: freq else: 0
     expected.value.centerFreq2 = 0
     expected.value.bandwidth = 0
-    expected.value.phyBandwidth = 0
     me_bw_check(addr bss.value)
     doAssert bss == expected and channel == expectedChannel
 me_bw_check(nil)

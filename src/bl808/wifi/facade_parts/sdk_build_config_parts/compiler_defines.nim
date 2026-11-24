@@ -1,4 +1,5 @@
-{.passC: "-DBL808 -DCPU_M0 -DCFG_CHIP_BL808 -DCFG_TXDESC=4 -DCFG_STA_MAX=1 -DCFG_VIRT_DEV_MAX=2".}
+{.passC: "-DBL808 -DCPU_M0 -DCFG_CHIP_BL808 -DCFG_TXDESC=4 -DCFG_STA_MAX=" &
+  $WifiHostPeerCount & " -DCFG_VIRT_DEV_MAX=" & $WifiHostVifCount.}
 {.passC: "-DBL_CHIP_NAME=\"BL808\" -D__FILENAME__=__FILE__ -DBL808_WIFI_VENDOR_FULL_SUPPLICANT -DUSE_MBEDTLS_CRYPTO -include sys/types.h".}
 when defined(bl808WifiConnectCfg80211Flags):
   {.passC: "-DBL808_WIFI_CONNECT_CRYPTO_PARAMS -DBL808_WIFI_CONNECT_CFG80211_FLAGS".}
@@ -21,10 +22,8 @@ when defined(bl808WifiVerboseScan):
 # force PMF-required or SAE.
 {.passC: "-DCONFIG_IEEE80211W".}
 when defined(bl808WifiForcePmfCapable):
-  # Forces smF |= 0x600 (PMF-cap bits) on every scanned BSS in
-  # wifi_fw.nim's scanu path so APs that advertise PMF-required are
-  # reachable. Also enables the SAE/SHA256 supplicant code for explicit
-  # WPA3 probe builds. Real WPA3-SAE association remains outside this default.
+  # Enables optional PMF in the scan path and compiles the SAE/SHA256 support
+  # used by WPA3 probe builds. This does not set the PMF-required policy bit.
   {.passC: "-DCONFIG_WPA3_SAE -DCONFIG_SHA256".}
 when defined(bl808WifiForceAckMode):
   {.passC: "-DBL808_WIFI_FORCE_ACK_MODE".}

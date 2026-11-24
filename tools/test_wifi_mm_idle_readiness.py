@@ -17,7 +17,8 @@ def source() -> str:
     )
     code = code.replace(procedure(code, "assert_err"), r'''
 proc assert_err(a, b: cstring; line: int) =
-  assertions.add(line)
+  inc assertions
+  assertionDetails.add(($a, $b, line))
   if onAssert != nil: onAssert()
 ''')
     reply_stub = """proc ke_msg_send_basic_reply(p: pointer; id: uint16) =
@@ -36,14 +37,11 @@ proc ke_msg_send_basic_reply(p: pointer; id: uint16) =
                         "    else: mm_hw_config_handler(param)")
     prefix = r'''
 const
-  MM_IDLE = 0'u8
   MM_ACTIVE_STATE = 1'u8
   HW_ACTIVE = 3'u8
   MM_SET_IDLE_CFM = 27'u16
   MmSetIdleReqPayloadSize = 1'u32
-var
-  assertions: seq[int]
-  onAssert: proc()
+var onAssert: proc()
 proc mm_set_idle_req_handler*(param: pointer): cint {.exportc, cdecl.}
 '''
     helpers = r'''
@@ -51,7 +49,6 @@ template mmSetIdleReqView(p: pointer): ptr MmSetIdleReqPayload =
   cast[ptr MmSetIdleReqPayload](p)
 proc prepareReadiness(irq: bool) =
   setup(irq)
-  assertions.setLen(0)
   onAssert = nil
   mm = (hardwareMode: 3'u8, previousState: 1'u8, idleFlag: 9'u8)
 proc idleRequest(idle: uint8): pointer =
@@ -84,7 +81,11 @@ for irq in [false, true]:
             mmState = 3
         ke_msg_send(p)
         doAssert dispatchOne() == KeMsgConsumed
-        doAssert assertions == @[if idle: 946 else: 1527]
+        doAssert assertions == 1
+        doAssert assertionDetails.len == 1
+        doAssert assertionDetails[0] ==
+          ("blmac_current_state_getf() == HW_IDLE", "module",
+           if idle: 946 else: 1527)
         doAssert mm == expectedMm, "continued updating MM after idle failure"
         doAssert mmState == (if reenter: 3'u16 else: 0'u16)
         doAssert contexts == expectedContexts and events.len == 0
@@ -98,6 +99,25 @@ for irq in [false, true]:
 
 
 CASES = {
+    "explicit_idle_supersedes_pending_restore": r'''
+for irq in [false, true]:
+  prepareReadiness(irq)
+  mmState = MM_ACTIVE_STATE
+  let update = issue()
+  ke_msg_send(update)
+  doAssert dispatchOne() == KeMsgSaved
+  doAssert mmConfigIdle.owner == keMsgHdrFromPayload(update)
+  inc chanCtxtEpochs[1]
+  ke_msg_send(idleRequest(1))
+  hardwareMode = 0
+  resumeSaved()
+  doAssert dispatchOne() == KeMsgConsumed
+  doAssert mm.idleFlag == 1 and mmConfigIdle.phase == mmConfigNoIdle
+  doAssert dispatchOne() == KeMsgConsumed
+  doAssert replies == 1 and registerWrites.len == 0 and mmState == MM_IDLE
+  doAssert stateWrites == @[TaskGoingIdleState, MM_IDLE]
+  finish()
+''',
     "accept_idle_hardware": r'''
 for irq in [false, true]:
   for idle in [false, true]:
@@ -108,7 +128,7 @@ for irq in [false, true]:
       let p = if idle: idleRequest(1) else: issue()
       ke_msg_send(p)
       doAssert dispatchOne() == KeMsgConsumed
-      doAssert assertions.len == 0 and replies == 1 and registerReads == 1
+      doAssert assertions == 0 and replies == 1 and registerReads == 1
       doAssert idleRequests == 0 and live.len == 0
       if idle:
         doAssert contexts == before and registerWrites.len == 0
@@ -131,7 +151,7 @@ for irq in [false, true]:
       ke_msg_send(idleRequest(idle))
       let deferred = state == 3 or state == 2 or (state == 1 and idle != 0)
       doAssert dispatchOne() == (if deferred: KeMsgSaved else: KeMsgConsumed)
-      doAssert assertions.len == 0
+      doAssert assertions == 0
       doAssert mm.idleFlag == (if state == 3: 9'u8 else: idle)
       doAssert replies == (not deferred).int
       if state == 3 or state == 2:

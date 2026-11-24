@@ -1,4 +1,4 @@
-"""Exhaustively compare packed-rate neighbor selection with BL808 rc.o."""
+"""Compare packed-rate neighbors with the decoded BL808 rc.o branches."""
 
 from pathlib import Path
 import random
@@ -48,6 +48,12 @@ for raw in 0 .. 65535:
   doAssert rc_set_next_mcs_index(nil, raw.uint16) == raw.uint16
   doAssert rc_set_previous_mcs_index(nil, raw.uint16) == raw.uint16
   doAssert rc_check_valid_rate(nil, raw.uint16) == 0
+state = default(typeof(state))
+rcU8(stats, RCS_MAX_NSS_MCS) = 7
+rcU8(stats, RCS_RATE_BITMAP) = 0b00000010'u8
+doAssert rc_set_next_mcs_index(stats, 0x1000'u16) == 0x1001'u16
+rcU8(stats, RCS_RATE_BITMAP) = 0b00000100'u8
+doAssert rc_set_next_mcs_index(stats, 0x1000'u16) == 0x1000'u16
 """
 
 
@@ -101,6 +107,8 @@ def vectors() -> bytes:
                 valid = (struct.unpack_from("<H", state, 182)[0] >> (rate & 127)) & 1
             elif fmt in (2, 3):
                 valid = (state[178 + ((rate >> 3) & 3)] >> (rate & 7)) & 1
+            elif fmt > 3:
+                valid = 1
             data += struct.pack("<HHH", neighbor(rate, state, True), neighbor(rate, state, False), valid)
     return bytes(data)
 

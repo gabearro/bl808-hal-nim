@@ -1,4 +1,4 @@
-"""Exercise TKIP/CCMP exhaustion and the two security-length consumers."""
+"""Exercise WEP/TKIP/CCMP exhaustion and the security-length consumers."""
 
 from pathlib import Path
 
@@ -11,7 +11,9 @@ from test_wifi_tx_tid import source as tx_source
 
 
 SETUP = r'''
-const MaxPn = 0xFFFFFFFFFFFF'u64
+const
+  MaxPn = 0xFFFFFFFFFFFF'u64
+  MaxWepIv = 0xFFFFFF'u64
 var
   key: VifKeySlotView
   keys: KeyList
@@ -49,6 +51,40 @@ proc allocate(): uint32 = txu_cntrl_sechdr_len_compute(addr desc, addr tail)
 '''
 
 CASES = {
+    "wep_boundaries": r'''
+for cipher in [0'u8, 3'u8]:
+  for enabled in [false, true]:
+    for pn in [0'u64, MaxWepIv - 1, MaxWepIv, MaxWepIv + 1,
+               0x100000000'u64, high(uint64)]:
+      setup(cipher, pn, enabled)
+      let beforeKey = key
+      let beforeDesc = desc
+      if pn < MaxWepIv:
+        doAssert allocate() == 4
+        doAssert counter() == pn + 1
+        doAssert (scratch(desc) and 0xFFFFFFFF'u64) == pn + 1
+        doAssert desc.pnScratch[4] == 0x5A and desc.pnScratch[5] == 0x5A
+        doAssert tail == 4
+      else:
+        doAssert allocate() == high(uint32), "reused WEP IV was accepted"
+        doAssert key == beforeKey and desc == beforeDesc and tail == 0
+      doAssert irqSaves >= 1 and irqSaves == irqRestores and interrupts == enabled
+''',
+    "wep_last_value_once": r'''
+for cipher in [0'u8, 3'u8]:
+  for enabled in [false, true]:
+    setup(cipher, MaxWepIv - 1, enabled)
+    doAssert allocate() == 4
+    doAssert (scratch(desc) and 0xFFFFFFFF'u64) == MaxWepIv
+    doAssert desc.pnScratch[4] == 0x5A and desc.pnScratch[5] == 0x5A
+    let beforeKey = key
+    let beforeDesc = desc
+    for retry in 0..<3:
+      tail = 0xFFFFFFFF'u32
+      doAssert allocate() == high(uint32), "WEP IV wrapped at exhaustion"
+      doAssert key == beforeKey and desc == beforeDesc and tail == 0
+    doAssert irqSaves >= 4 and irqSaves == irqRestores and interrupts == enabled
+''',
     "boundaries": r'''
 for cipher in [1'u8, 2'u8]:
   for enabled in [false, true]:

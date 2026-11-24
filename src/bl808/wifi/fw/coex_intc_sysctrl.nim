@@ -114,7 +114,6 @@ proc coex_wifi_pta_forece_enable*(enable: bool) {.exportc, cdecl.} =
     let now = cast[GetTickFn](blOpsFunc(200))()
     let elapsed = now - coexPtaTimestamp
     pds_slept_time += elapsed
-    coexPtaAccum += elapsed
     let logFn = cast[LogFn](blOpsFunc(204))
     let reportTime = cast[GetTickFn](blOpsFunc(200))()
     if logFn != nil:
@@ -124,7 +123,6 @@ proc coex_wifi_pta_forece_enable*(enable: bool) {.exportc, cdecl.} =
     let now = cast[GetTickFn](blOpsFunc(200))()
     let elapsed = now - coexPtaTimestamp
     pds_woken_time += elapsed
-    coexPtaAccum += elapsed
     let savedMstatus = irqSave()
     let napDuration = bl_nap_calculate()
     irqRestore(savedMstatus)
@@ -146,7 +144,7 @@ proc coex_wifi_pta_forece_enable*(enable: bool) {.exportc, cdecl.} =
   coexPtaAutoControl = newVal
   coexPtaTimestamp = cast[GetTickFn](blOpsFunc(200))()
 
-proc coex_pta_force_autocontrol_set*(mode: uint32) {.exportc, cdecl.} =
+proc coex_pta_force_autocontrol_set*(mode: uint32): uint32 {.exportc, cdecl.} =
   ## Set PTA auto-control mode (254 bytes in blob, 104 instrs).
   ## Dispatches on a0 value (0, 1, 2) to configure PTA coex registers.
   ## Mode 0: Disable PTA - WiFi always on
@@ -186,6 +184,7 @@ proc coex_pta_force_autocontrol_set*(mode: uint32) {.exportc, cdecl.} =
     ptaCoexUpdateControl(not 0'u32, 0x01'u32)
     # Re-enable MAC HW
     wlanCoexWriteControl(wlanCoexControl() or 0x01'u32)
+  0'u32
 
 # ###########################################################################
 #                  Interrupt Controller (intc_*)
@@ -227,25 +226,25 @@ proc intc_init*() {.exportc, cdecl.} =
   ## From blob: calls intc_enable_irq for 19 IRQ numbers covering
   ## WiFi IPC, MAC gen/port/trigger, timer, misc, and other peripherals.
   intc_handlers_init()
-  intc_enable_irq(63)   # IPC public
-  intc_enable_irq(62)   # MAC port trigger
-  intc_enable_irq(61)   # MAC gen
-  intc_enable_irq(24)   # Emac
-  intc_enable_irq(25)   # GPADC DMA
-  intc_enable_irq(26)   # Efuse
-  intc_enable_irq(27)   # SPI0
-  intc_enable_irq(28)   # UART0
-  intc_enable_irq(29)   # UART1
-  intc_enable_irq(30)   # UART2
-  intc_enable_irq(31)   # GPIO DMA
-  intc_enable_irq(32)   # I2C0
-  intc_enable_irq(55)   # BZ PHY
-  intc_enable_irq(53)   # BOR
-  intc_enable_irq(50)   # PDS wakeup
-  intc_enable_irq(52)   # HBN out1
-  intc_enable_irq(54)   # WiFi
-  intc_enable_irq(10)   # SecEng0
-  intc_enable_irq(11)   # (SecEng0+1)
+  intc_enable_irq(63)   # IPC TX
+  intc_enable_irq(62)   # IPC confirmation callback
+  intc_enable_irq(61)   # IPC message
+  intc_enable_irq(24)   # Spurious handler range
+  intc_enable_irq(25)
+  intc_enable_irq(26)
+  intc_enable_irq(27)
+  intc_enable_irq(28)
+  intc_enable_irq(29)
+  intc_enable_irq(30)
+  intc_enable_irq(31)
+  intc_enable_irq(32)
+  intc_enable_irq(55)   # Spurious handler
+  intc_enable_irq(53)   # TX transmit trigger
+  intc_enable_irq(50)   # RX timer
+  intc_enable_irq(52)   # RX timer
+  intc_enable_irq(54)   # MAC hardware general handler
+  intc_enable_irq(10)   # PHY modem ISR
+  intc_enable_irq(11)   # PHY RC ISR
 
 proc intc_spurious*() {.exportc, cdecl.} =
   ## Handle spurious interrupt (7 instrs in blob).
@@ -263,7 +262,6 @@ proc sysctrl_init*() {.exportc, cdecl.} =
   ## Then reads MAC_PL_BASE+0xE0 (clock gate register), ORs with 0x1FF00
   ## (enable clocks for all WiFi submodules), writes back.
   ## Also initializes ke_task descriptor table (blob: static TASK_DESC rodata).
-  wifi_fw_runtime_init()
   let macPlBase = MAC_PL_BASE
   # Write diagnostic control
   regWrite(macPlBase + 0x68'u, 0x8000000C'u32)
@@ -271,6 +269,7 @@ proc sysctrl_init*() {.exportc, cdecl.} =
   var clockGate = regRead(macPlBase + 0xE0'u)
   clockGate = clockGate or 0x1FF00'u32
   regWrite(macPlBase + 0xE0'u, clockGate)
+  wifi_fw_runtime_init()
   # The vendor blob links TASK_DESC as static rodata.  The Nim reimplementation
   # builds the same table in BSS, so populate it during system init.
   ke_task_init()

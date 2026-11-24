@@ -75,11 +75,12 @@ proc mmDeleteSecurityKey(index: uint8): bool =
   deleted.add(index)
   fire("delete")
   hardwareResult != 0xFF
-proc sm_get_set_machwkey_index(mode, vif: uint32; p: pointer; kind: uint32): uint8 =
-  doAssert mode == 0 and vif < 2 and kind < 3
+proc sm_get_set_machwkey_index(mode: bool; vif: uint8; p: ptr uint8;
+                              kind: uint8): cint =
+  doAssert not mode and vif < 2 and kind < 3
   inc maps
-  if mapStatus == 0: mapping[vif][kind] = cast[ptr uint8](p)[]
-  result = mapStatus
+  if mapStatus == 0: mapping[vif][kind] = p[]
+  result = mapStatus.cint
   fire("map")
 proc ingressLog(line: uint32) {.exportc, cdecl.} = fire("log" & $line)
 {.emit: """
@@ -401,7 +402,7 @@ def test_key_ingress(tmp_path: Path, mode: str, mutation: str | None) -> None:
     elif mutation == "igtk_pn":
         parts["bl_wifi_set_igtk_internal"] = parts["bl_wifi_set_igtk_internal"].replace("  discard c_memcpy(addr req.macAddr[0], pn, 6.csize_t)\n", "")
     elif mutation == "igtk_slot":
-        parts["bl_wifi_set_igtk_internal"] = parts["bl_wifi_set_igtk_internal"].replace("addr hardwareIndex, 2)", "addr hardwareIndex, 5)")
+        parts["bl_wifi_set_igtk_internal"] = parts["bl_wifi_set_igtk_internal"].replace("addr hardwareIndex, 2'u8)", "addr hardwareIndex, 5'u8)")
     elif mutation == "owner":
         parts["supplicantKeyOwnerCurrent"] = "proc supplicantKeyOwnerCurrent(owner: SupplicantKeyOwner): bool = true\n"
     elif mutation == "hardware_error":

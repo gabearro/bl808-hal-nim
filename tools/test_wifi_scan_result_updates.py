@@ -13,11 +13,13 @@ from test_wifi_scan_frame_request import source as admission_source
 def source() -> str:
     scan = (FW / "scan_station_ap_me.nim").read_text()
     base = admission_source().split("proc scanu_frame_handler", 1)[0]
+    base = base.replace("frame: array[96, uint8]", "frame: array[128, uint8]")
     base = base.replace(
         "const MAX_VIFS", layouts("SsidIeView", "DsParamSetIeView") + "const MAX_VIFS", 1)
     base = base.replace(
-        "tuple[paramPtr: pointer, bssidFilterEnabled: uint8]",
-        "tuple[paramPtr, pendingJoinRxuMgtInd: pointer, bssidFilterEnabled: uint8, resultCount: uint16]")
+        "tuple[paramPtr: pointer, bssidFilterEnabled: uint8, filterBssid: array[6, uint8]]",
+        "tuple[paramPtr, pendingJoinRxuMgtInd: pointer, bssidFilterEnabled: uint8, "
+        "filterBssid: array[6, uint8], resultCount: uint16]")
     base = base.replace(procedure(base, "mac_ie_find"), "")
     base = base.replace(procedure(base, "dsParamSetIeAt"), """
 proc dsParamSetIeAt(p: pointer): ptr DsParamSetIeView = cast[ptr DsParamSetIeView](p)
@@ -32,6 +34,9 @@ type SmTxBuildContext = object
 var
   scan_env: tuple[abortFlag: uint8]
   channel: ScanChannelEntry
+  configuredChannel: ScanChannelEntry
+  allowConfiguredChannel: bool
+  configuredBand: uint8
   oldFrame, copiedFrame: array[96, uint8]
   allocations, frees: int
   nimFwDbgScanSsidLast, nimFwDbgBssRxFreq: uint32
@@ -41,7 +46,10 @@ proc macIeAt(p: uint): ptr MacIeView = cast[ptr MacIeView](p)
 proc ssidIeAt(p: pointer): ptr SsidIeView = cast[ptr SsidIeView](p)
 proc smTxOwnerCurrent(owner: SmTxBuildContext): bool = true
 proc scanuCachedChannelFor(p: ptr ScanuResultEntry): ptr ScanChannelEntry = addr channel
-proc configuredScanChannelEntryForFreq(freq: uint16): ptr ScanChannelEntry = nil
+proc configuredScanChannelEntryForFreq(freq: uint16): ptr ScanChannelEntry =
+  if not allowConfiguredChannel: return nil
+  configuredChannel = ScanChannelEntry(prim20Freq: freq, band: configuredBand, txPower: 20)
+  addr configuredChannel
 proc c_memcmp(a, b: pointer; size: csize_t): cint =
   if equalMem(a, b, size.int): 0 else: 1
 proc c_memcpy(dest, src: pointer; size: csize_t): pointer =
@@ -66,6 +74,8 @@ proc prepareUpdate(hasDs: bool; strength: int8; ssid = 65'u8) =
   scanu_env.pendingJoinRxuMgtInd = nil
   scan_env.abortFlag = 0
   channel = ScanChannelEntry(prim20Freq: 2412, band: 0, txPower: 20)
+  allowConfiguredChannel = true
+  configuredBand = 0
   entry.chanPtr = addr channel
   entry.beaconPeriod = 100
   entry.capInfo = 1
@@ -106,9 +116,73 @@ proc prepareUpdate(hasDs: bool; strength: int8; ssid = 65'u8) =
     common = procedure(scan, "scanu_frame_handler").split("  var directedOwner:", 1)[0]
     return base + common + r'''
   reachedCommit = true
-  scanuPublishFrameResult(frame, scanResultEntry, scanParam, scanEpoch,
+  scanuPublishFrameResult(frame, totalLen, len,
+    scanResultEntry, scanParam, scanEpoch,
     resultGeneration, numSsids, bfOn)
 '''
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_join_channel_outlives_scan_result(tmp_path: Path, mode: str) -> None:
+    scan = (FW / "scan_station_ap_me.nim").read_text()
+    code = layouts("ScanChannelEntry", "ScanuResultEntry", "ScanuChannelConfigOverlay") + r'''
+type VifChannelView = object
+  operChan: pointer
+  channelFreqPair: uint32
+var
+  cache: ScanChannelEntry
+  channels: ScanuChannelConfigOverlay
+proc scanuCachedChannelFor(entry: ptr ScanuResultEntry): ptr ScanChannelEntry = addr cache
+proc scanuChannelConfig(): ptr ScanuChannelConfigOverlay = addr channels
+proc c_memset(p: pointer; value: cint; size: csize_t): pointer =
+  doAssert value == 0
+  zeroMem(p, size.int)
+  p
+'''
+    code += "".join(procedure(scan, name) for name in ["scanuClearCachedChannel",
+        "configuredScanChannelEntryForFreq", "scanuPublishVifChannel"])
+    run_program(tmp_path, mode, code + r'''
+channels.count = 2
+channels.entries[0] = ScanChannelEntry(prim20Freq: 2412, band: 0, txPower: 20)
+channels.entries[1] = ScanChannelEntry(prim20Freq: 2462, band: 0, txPower: 17)
+cache = channels.entries[1]
+var entry = ScanuResultEntry(chanPtr: addr cache)
+var vif: VifChannelView
+doAssert scanuPublishVifChannel(addr vif, addr entry)
+scanuClearCachedChannel(addr entry)
+doAssert cache.prim20Freq == 0
+doAssert vif.operChan == addr channels.entries[1]
+doAssert cast[ptr ScanChannelEntry](vif.operChan)[] == channels.entries[1]
+doAssert vif.channelFreqPair == 0x099E099E'u32
+let original = vif
+doAssert not scanuPublishVifChannel(addr vif, addr entry)
+doAssert vif == original
+cache = channels.entries[1]
+cache.band = 1
+doAssert not scanuPublishVifChannel(addr vif, addr entry)
+doAssert vif == original
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_early_dwell_end_and_abort_follow_scan_filters(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+for directed in [false, true]:
+  for ssid in ["none", "any", "match", "miss"]:
+    for flags in [0'u32, 0x40, 0x100, 0x140]:
+      prepareUpdate(false, -20)
+      original.flags = flags
+      original.scanType = (ssid != "none").uint8
+      original.ssidFilter[0] = (ssid != "any").uint8
+      original.ssidFilter[1] = if ssid == "miss": 66'u8 else: 65'u8
+      scanu_env.filterBssid[0] = if directed: 2'u8 else: 0xFF'u8
+      scanu_frame_handler(addr frame[0], frame.len.uint32)
+      let match = ssid in ["any", "match"]
+      doAssert indications == ((flags and 0x100) != 0 and (directed or match)).int
+      doAssert scan_env.abortFlag == ((flags and 0x40) != 0 and match).uint8
+      doAssert reachedCommit == (ssid != "miss") and forwards == 1
+      finish()
+''')
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
@@ -163,6 +237,67 @@ for directed in [0'u8, 1'u8]:
         doAssert (entry, cached, channel) == expected
         doAssert allocations == 0 and frees == 0 and scanu_env.resultCount == 1
         finish()
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_unconfigured_channel_does_not_commit_result(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+for hasDs in [false, true]:
+  for directed in [0'u8, 1'u8]:
+    for wrongBand in [false, true]:
+      prepareUpdate(hasDs, -20)
+      scanu_env.bssidFilterEnabled = directed
+      if wrongBand: configuredBand = 1
+      else: allowConfiguredChannel = false
+      let before = (entry, cached, channel)
+      scanu_frame_handler(addr frame[0], frame.len.uint32)
+      doAssert not reachedCommit and forwards == 1
+      doAssert (entry, cached, channel) == before
+      doAssert allocations == 0 and frees == 0
+      finish()
+prepareUpdate(false, -75)
+entry.chanPtr = nil
+let before = (entry, cached, channel)
+scanu_frame_handler(addr frame[0], frame.len.uint32)
+doAssert not reachedCommit and forwards == 1
+doAssert (entry, cached, channel) == before
+finish()
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_hidden_ssid_keeps_known_result_identity(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+for directed in [0'u8, 1'u8]:
+  prepareUpdate(false, -20)
+  original.ssidFilter[1] = 90
+  scanu_env.bssidFilterEnabled = directed
+  frame[69] = 0
+  rxuMgtIndAt(addr frame[0]).frameLen = 38
+  scanu_frame_handler(addr frame[0], frame.len.uint32)
+  doAssert reachedCommit and forwards == 1
+  doAssert cached.valid == 1 and cached.length == 1 and cached.ssidBytes[0] == 90
+  doAssert cached.generation == 10
+  doAssert allocations == (if directed == 0: 1 else: 0)
+  finish()
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_oversized_ssid_is_not_cached(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+prepareUpdate(false, -20)
+original.scanType = 0
+rxuMgtIndAt(addr frame[0]).frameLen = 71
+frame[69] = 33
+for i in 0 ..< 33: frame[70 + i] = 65
+let before = (entry, cached, channel)
+scanu_frame_handler(addr frame[0], frame.len.uint32)
+doAssert not reachedCommit and forwards == 1
+doAssert (entry, cached, channel) == before
+doAssert allocations == 0 and frees == 0
+finish()
 ''')
 
 

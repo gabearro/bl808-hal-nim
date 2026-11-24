@@ -9,7 +9,9 @@ from test_wifi_message_allocation import run_program
 
 
 PLATFORM = r'''
-const MACHW_TIMLO_REG = 0x24B00120'u
+const
+  MACHW_TIMLO_REG = 0x24B00120'u
+  MAX_VIFS = 2
 type
   Vif = object
     flags: uint32
@@ -27,10 +29,19 @@ var
   schedules: seq[tuple[index: int, expiry: uint32]]
   clears: seq[int]
   onSchedule: proc(index: int)
+  onClear: proc(index: int)
   onPrint: proc()
+  rxVifEpochs: array[MAX_VIFS, uint32]
+  tdEpochs: array[MAX_VIFS, uint32]
+  tdCfmCommittedEpochs: array[MAX_VIFS, uint32]
+  tdCfmScheduled: array[MAX_VIFS, bool]
+  txResetEpoch: uint32
 proc blPsParamsView(): ptr BlPsParamsView = cast[ptr BlPsParamsView](addr params[0])
 proc psEnvView(): ptr typeof(ps) = addr ps
 proc vifChannelAt(p: pointer): ptr Vif = cast[ptr Vif](p)
+proc vifChannelForIdx(index: uint8): ptr Vif =
+  doAssert index == 1
+  addr vif
 proc regRead(address: uint): uint32 =
   doAssert address == MACHW_TIMLO_REG
   inc reads
@@ -43,7 +54,10 @@ proc mm_timer_set(timer: pointer; expiry: uint32) =
   let index = timerIndex(timer)
   schedules.add((index, expiry))
   if onSchedule != nil: onSchedule(index)
-proc mm_timer_clear(timer: pointer) = clears.add(timerIndex(timer))
+proc mm_timer_clear(timer: pointer) =
+  let index = timerIndex(timer)
+  clears.add(index)
+  if onClear != nil: onClear(index)
 proc c_memset(p: pointer; value: cint; length: csize_t): pointer =
   doAssert value == 0 and length == sizeof(TdEntryView).csize_t
   zeroMem(p, length.int)
@@ -76,7 +90,13 @@ proc setup() =
   schedules.setLen(0)
   clears.setLen(0)
   onSchedule = nil
+  onClear = nil
   onPrint = nil
+  rxVifEpochs = default(typeof(rxVifEpochs))
+  tdEpochs = default(typeof(tdEpochs))
+  tdCfmCommittedEpochs = default(typeof(tdCfmCommittedEpochs))
+  tdCfmScheduled = default(typeof(tdCfmScheduled))
+  txResetEpoch = 0
   ps = (1'u8, 0'u8)
   vif = Vif(vifIdx: 1, psFlags: 1, flags: 0x80000000'u32)
 '''
@@ -92,8 +112,9 @@ def source() -> str:
     counters = procedure(layout, "clearTrafficCounters").split("\nstatic:", 1)[0]
     return (types + logger_type + PLATFORM + counters
             + "\n".join(procedure(td, name) for name in [
-                "tdEntryForVif", "td_reset", "td_init", "td_start",
-                "td_set_tim_time", "td_pack_tim_ind", "td_cfm_set_timer"])
+                "tdEntryForVif", "tdOperationCurrent", "td_reset", "td_init", "td_start",
+                "td_pck_ind", "td_pck_ps_ind", "td_set_tim_time",
+                "td_pack_tim_ind", "td_cfm_set_timer"])
             + procedure((FW / "power_save.nim").read_text(), "ps_check_tbtt"))
 
 
@@ -199,6 +220,10 @@ for active in [0'u8, 1]:
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_tbtt_uses_real_tim_timer_path(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, source() + r'''
+setup()
+ps_check_tbtt(nil)
+doAssert schedules.len == 0 and vif.flags == 0x80000000'u32
+
 for enabled in [0'u8, 1]:
   for awake in [false, true]:
     for psEnabled in [0'u8, 1]:
@@ -213,4 +238,94 @@ for enabled in [0'u8, 1]:
       doAssert schedules == (if invoked: @[(1, now)] else: @[])
       doAssert td_env[1].period == (if invoked: params[1] else: 999'u32)
       doAssert vif.flags == (if invoked: 0x80000040'u32 else: 0x80000000'u32)
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "firmware"])
+def test_tbtt_does_not_mark_reused_vif_after_timer_callback(
+    tmp_path: Path, mode: str
+) -> None:
+    run_program(tmp_path, mode, source() + r'''
+setup()
+td_env[1].active = 1
+onSchedule = proc(index: int) =
+  doAssert index == 1
+  inc txResetEpoch
+  inc rxVifEpochs[1]
+  vif = Vif(flags: 0xA5'u32, vifIdx: 1, psFlags: 1)
+ps_check_tbtt(addr vif)
+doAssert schedules == @[(1, now)] and vif.flags == 0xA5'u32
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "firmware"])
+def test_td_callbacks_cannot_commit_to_a_new_operation(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+setup()
+logging = true
+onPrint = proc() =
+  onPrint = nil
+  td_start(0)
+td_start(0)
+doAssert td_env[0].active == 1 and schedules == @[(0, now + params[0])]
+doAssert tdEpochs[0] == 2
+
+setup()
+logging = true
+onPrint = proc() =
+  onPrint = nil
+  td_reset(0)
+  td_env[0].period = 77
+td_reset(0)
+doAssert td_env[0].period == 77 and tdEpochs[0] == 2
+
+setup()
+td_env[0].active = 1
+onClear = proc(index: int) =
+  doAssert index == 0
+  onClear = nil
+  inc rxVifEpochs[0]
+  td_env[0] = TdEntryView(active: 1, period: 77, vifIdx: 0)
+td_reset(0)
+doAssert td_env[0].active == 1 and td_env[0].period == 77
+
+setup()
+td_env[0].active = 1
+td_env[0].period = 11
+onSchedule = proc(index: int) =
+  doAssert index == 0
+  onSchedule = nil
+  td_reset(0)
+  td_env[0].period = 77
+td_pack_tim_ind(0)
+doAssert td_env[0].active == 0 and td_env[0].period == 77
+
+setup()
+td_env[0].active = 1
+td_env[0].period = 40
+onSchedule = proc(index: int) =
+  doAssert index == 0
+  onSchedule = nil
+  td_set_tim_time(0, 77)
+  td_pack_tim_ind(0)
+td_cfm_set_timer(0, 1)
+doAssert schedules == @[(0, now + 40), (0, now)]
+doAssert td_env[0].period == 77 and tdEpochs[0] == 2
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "firmware"])
+def test_td_rejects_out_of_range_vif_indices(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+setup()
+let before = td_env
+td_start(255)
+td_reset(255)
+td_pck_ind(255, 0, 0)
+td_pck_ps_ind(255, 1)
+td_pack_tim_ind(255)
+td_set_tim_time(255, 99)
+td_cfm_set_timer(255, 1)
+doAssert td_env == before and schedules.len == 0 and clears.len == 0
+doAssert reads == 0 and tdEpochs == [0'u32, 0'u32]
 ''')

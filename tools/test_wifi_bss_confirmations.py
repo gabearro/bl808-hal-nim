@@ -28,14 +28,18 @@ const
   MM_SET_IDLE_CFM = 27'u16
   MM_SET_PS_MODE_REQ = 31'u16
   MM_SET_PS_MODE_CFM = 32'u16
+  HW_ACTIVE = 3'u16
 var
   keMsgQueueSent, keMsgQueueSaved: CoList
   me: tuple[requesterId, psOn: uint8, activeMask, psDisableMask: uint32]
   meState: uint16
   meControlReplyReady: bool
+  meConfigInProgress: bool
+  meControlEpoch: uint32
   meControlExpectedId, meControlFinalId: uint16
   meControlRequester: uint8
-  apmStartReply, mmPsModeRequest: pointer
+  apmStartRequest, apmStartReply, mmPsModeRequest: pointer
+  mmPsModeTxResetEpoch: uint32
   apmStartReplyPublished: bool
   authStarts: int
   nimFwDbgActiveCfmBadState, nimFwDbgActiveCfmLastState: uint32
@@ -44,14 +48,17 @@ var
   replacement: Connection
 let mac_ac2uapsd = [4'u8, 8, 2, 1]
 proc meEnvView(): ptr typeof(me) = addr me
+proc txlResetting(): bool = false
 proc controlStateGet(task: uint8): uint16 =
   if task == TASK_SM: state else: meState
+proc releaseSavedControl(task: uint8)
 proc controlStateSet(task: uint8; value: uint16) =
   if task == TASK_SM:
     state = value
     inc stateChanges
     if stateHook != nil: stateHook()
   else: meState = value
+  releaseSavedControl(task)
 proc smCleanupOwnsRequest(p: pointer): bool = false
 proc smCleanupAdmitRequest(p: pointer): bool = true
 proc smCleanupConsumeReply(p: pointer): bool = false
@@ -113,12 +120,13 @@ proc begin() =
   meControlCommand = nil
   meControlReply = nil
   meControlReplyReady = false
+  meConfigInProgress = false
   applied.setLen(0)
   confirmations.setLen(0)
   authStarts = 0
   sendHook = proc() =
     co_list_push_back(addr keMsgQueueSent, keMsgHdrFromPayload(sent[^1]))
-  sm_set_bss_param(nil)
+  sm_set_bss_param()
 
 proc takeReply(step: int): pointer =
   var count = 0
@@ -170,8 +178,18 @@ def source() -> str:
     kernel = (FW / "kernel_mac_channel.nim").read_text()
     task = (FW / "task_handlers.nim").read_text()
     code += procedure(kernel, "ke_queue_extract")
+    code += r'''
+proc releaseSavedControl(task: uint8) =
+  proc matches(node: ptr CoListHdr; destination: pointer): bool {.cdecl.} =
+    cast[ptr KeMsgHdr](node).destId == cast[uint](destination).uint8
+  while true:
+    let node = ke_queue_extract(addr keMsgQueueSaved, matches, cast[pointer](task.uint))
+    if node == nil: break
+    co_list_push_back(addr keMsgQueueSent, node)
+'''
     for name in ["meControlMessageMatches", "meCancelQueuedPayload", "mmPsModeCancel",
-                 "meControlReset", "meTakeControlReply", "smBssCancelControl", "meBeginControl", "meCompleteControl"]:
+                 "meControlReset", "meTakeControlReply", "smBssCancelControl",
+                 "meReserveControl", "meForwardControl", "meBeginControl", "meCompleteControl"]:
         code += procedure(task, name)
     code += procedure(kernel, "ke_msg_alloc_reply") + procedure(kernel, "ke_msg_send_basic_reply")
     scan = (FW / "scan_station_ap_me.nim").read_text()
@@ -213,7 +231,7 @@ for step in 0..8:
   let old = takeReply(step)
   changeConnection()
   smBssCancel()
-  sm_set_bss_param(nil)
+  sm_set_bss_param()
   let before = sent.len
   consumeReply(old)
   doAssert smBss.step == 0 and sent.len == before and authStarts == 0
@@ -274,7 +292,7 @@ changeConnection()
 doAssert meCompleteControl(p, MM_SET_PS_MODE_CFM) == KeMsgConsumed
 ke_msg_free(keMsgHdrFromPayload(p))
 doAssert allocated.len == 0 and not smBss.active and authStarts == 0
-sm_set_bss_param(nil)
+sm_set_bss_param()
 drain()
 assertFinished()
 ''',
@@ -285,7 +303,7 @@ doAssert me.psDisableMask == 2
 changeConnection()
 smBssCancel()
 doAssert me.psDisableMask == 0, "cancel retained the unfinished PS mask"
-sm_set_bss_param(nil)
+sm_set_bss_param()
 drain()
 assertFinished()
 begin()
@@ -297,7 +315,7 @@ doAssert me.activeMask == 2
 changeConnection()
 smBssCancel()
 doAssert me.activeMask == 0, "cancel retained the unfinished active mask"
-sm_set_bss_param(nil)
+sm_set_bss_param()
 drain()
 assertFinished()
 ''',
@@ -308,7 +326,7 @@ changeConnection()
 doAssert me_set_ps_disable_req_handler(p) == KeMsgConsumed
 ke_msg_free(keMsgHdrFromPayload(p))
 doAssert applied.len == 0 and allocated.len == 0 and not smBss.active
-sm_set_bss_param(nil)
+sm_set_bss_param()
 drain()
 assertFinished()
 ''',
@@ -334,11 +352,11 @@ for reason in 0..7:
 begin()
 doAssert not smBssConsumeReply(smBss.reply)
 let before = calls
-sm_set_bss_param(nil)
+sm_set_bss_param()
 doAssert calls == before
 let p = takeReply(8)
 doAssert sm.pendingBssParams.first == nil and smBss.active
-sm_set_bss_param(nil)
+sm_set_bss_param()
 doAssert calls == before
 consumeReply(p)
 ke_msg_free(keMsgHdrFromPayload(p))
@@ -378,7 +396,7 @@ begin()
 changeConnection()
 freeHook = proc() =
   freeHook = nil
-  sm_set_bss_param(nil)
+  sm_set_bss_param()
 smBssCancel()
 doAssert smBss.active and allocated.len == 18
 drain()

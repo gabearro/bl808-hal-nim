@@ -1,0 +1,35 @@
+(component
+  (component $provider
+    (import "input" (type $input (sub resource)))
+    (export $ticket "ticket" (type $input))
+    (core module $code (func (export "forward") (param i32) (result i32) (local.get 0)))
+    (core instance $core (instantiate $code))
+    (func (export "forward") (param "token" (own $input)) (result (own $ticket))
+      (canon lift (core func $core "forward"))))
+  (component $consumer
+    (import "factory" (component $factory
+      (import "input" (type $Input (sub resource)))
+      (export "ticket" (type $Ticket (sub resource)))
+      (export "forward" (func (param "token" (own $Input)) (result (own $Ticket))))))
+    (type $r (resource (rep i32)))
+    (instance $api (instantiate $factory (with "input" (type $r))))
+    (alias export $api "ticket" (type $returned))
+    (core func $new (canon resource.new $r))
+    (core func $rep (canon resource.rep $r))
+    (core func $drop (canon resource.drop $returned))
+    (core func $forward (canon lower (func $api "forward")))
+    (core module $code
+      (import "" "new" (func $new (param i32) (result i32)))
+      (import "" "rep" (func $rep (param i32) (result i32)))
+      (import "" "forward" (func $forward (param i32) (result i32)))
+      (import "" "drop" (func $drop (param i32)))
+      (func (export "run") (result i32) (local $token i32)
+        (local.set $token (call $forward (call $new (i32.const 42))))
+        (call $rep (local.get $token))
+        (call $drop (local.get $token))))
+    (core instance $core (instantiate $code (with "" (instance
+      (export "new" (func $new)) (export "rep" (func $rep))
+      (export "forward" (func $forward)) (export "drop" (func $drop))))))
+    (func (export "run") (result u32) (canon lift (core func $core "run"))))
+  (instance $use (instantiate $consumer (with "factory" (component $provider))))
+  (func (export "run") (alias export $use "run")))

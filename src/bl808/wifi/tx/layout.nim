@@ -3,11 +3,12 @@ const
   FrameRepushablePsBit = 1'u32 shl 19
   FrameRepushableChanBit = 1'u32 shl 20
   FrameSuccessfulTxBit = 1'u32 shl 23
+  DescDoneSwTxBit = 1'u32 shl 30
   DescDoneTxBit = 1'u32 shl 31
 
   BlVifSta = 0
   BlVifAp = 1
-  NxRemoteStaStoreMax = 3
+  NxRemoteStaStoreMax = WifiHostStaTableCount
   PbufLinkEncapsulationHlen = 48'u16
   TxBufferPayloadSize = 1600'u16
   EthAlen = 6'u
@@ -21,7 +22,7 @@ const
 
   BlHwIpcEnvOff = 48'u
   BlHwVifTableOff = 60'u
-  BlHwStaTableOff = 100'u
+  BlHwStaTableOff = WifiHostStaTableOffset
   BlVifSize = 20'u
   BlVifDevOff = 8'u
   BlVifUpOff = 12'u
@@ -30,7 +31,7 @@ const
   BlVifFixedStaIdxOff = 15'u
   BlVifFcChanOff = 16'u
   BlVifStaPsOff = 17'u
-  BlStaSize = 40'u
+  BlStaSize = WifiHostStaEntrySize
   BlStaWaitingListOff = 0'u
   BlStaPendingListOff = 8'u
   BlStaAddrOff = 16'u

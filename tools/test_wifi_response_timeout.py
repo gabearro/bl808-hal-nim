@@ -15,15 +15,19 @@ const
   MAX_VIFS = 2
   STA_INFO_TAB_ENTRIES = 7
   VIF_TYPE_STA = 0'u8
+  TASK_SCAN = 1'u8
   TASK_SM = 4'u8
+  SCAN_PROBE_TIMER = 0x407'u16
   SM_RSP_TIMEOUT_IND = 0x1006'u16
+  SM_SA_QUERY_TIMEOUT_IND_MSG = 0x1009'u16
   SmAuthenticatingState = 6'u16
   SmAssocRspState = 8'u16
   WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE = 11'u16
   MACHW_RX_CNTRL_REG = 0'u
   KE_TIMER_MAX_DELAY = 0x11E1A2FF'u32
   WifiTimerDrainLimit = 8'u32
-  KE_EVT_KE_TIMER = 0x40'u32
+  KE_EVT_KE_TIMER = 0x20000000'u32
+  KE_EVT_KE_MESSAGE = 0x08000000'u32
   KeMsgConsumed = 0.cint
   KeMsgTailSlack = 4'u32
 type
@@ -36,6 +40,7 @@ type
     id: uint16
     taskId: uint8
     time: uint32
+    saQuerySerial: uint32
   KeTimerMutation = object
     previous: ptr KeTimerMutation
     id: uint16
@@ -65,7 +70,8 @@ var
   live: seq[pointer]
   keTimerQueue, messages: CoList
   keTimerMutationTop: ptr KeTimerMutation
-  keTimerScheduling: bool
+  keTimerScheduling, keTimerExpiryCurrent: bool
+  keTimerExpiryKey: tuple[id: uint16, task: uint8]
   rxVifEpochs: array[2, uint32]
   txResetEpoch: uint32
   stationEpochs: array[7, uint32]
@@ -128,9 +134,10 @@ proc keMsgHdrFromPayload(p: pointer): ptr KeMsgHdr =
   cast[ptr KeMsgHdr](cast[uint](p) - sizeof(KeMsgHdr).uint)
 proc keMsgPayload(p: ptr KeMsgHdr): pointer = cast[pointer](cast[uint](p) + sizeof(KeMsgHdr).uint)
 proc smRspTimerForget(header: pointer)
+proc smSaQueryQueueTimeout(serial: uint32) = doAssert false
 proc ke_timer_try_set(taskId: uint16; instId: uint8; delay: uint32;
                       guard: KeTimerGuard = nil; context: pointer = nil;
-                      continuationUs: uint64 = 0): bool
+                      continuationUs: uint64 = 0; saQuerySerial: uint32 = 0): bool
 proc ke_msg_free(p: pointer) =
   smRspTimerForget(p)
   heapFree(p)
@@ -148,6 +155,7 @@ proc ke_msg_alloc(id: uint16; destId, srcId: uint8; length: uint32): pointer =
 proc co_list_push_back*(list: ptr CoList; elem: ptr CoListHdr) {.exportc, cdecl, noinline.}
 proc ke_msg_send(p: pointer) =
   co_list_push_back(addr messages, cast[ptr CoListHdr](keMsgHdrFromPayload(p)))
+  ke_evt_set(KE_EVT_KE_MESSAGE)
   invoke(onMessage)
 proc ke_msg_send_basic(id: uint16; destId, srcId: uint8) =
   let p = ke_msg_try_alloc(id, destId, srcId, 0)
@@ -261,7 +269,7 @@ def source(trace: bool = False, fallback: bool = False) -> str:
     kernel = (FW / "kernel_mac_channel.nim").read_text()
     for name in ["co_list_pop_front", "co_list_insert", "co_list_push_back", "ke_queue_extract",
                  "cmp_abs_time", "cmp_timer_id", "keTimerCancelMutations", "keTimerBeginMutation",
-                 "keTimerEndMutation", "ke_timer_try_set", "ke_timer_set", "ke_timer_clear",
+                 "keTimerEndMutation", "ke_timer_try_set", "ke_timer_set", "keTimerClearLocked", "ke_timer_clear",
                  "keTimerExpired", "ke_timer_schedule", "ke_timer_active"]:
         code += procedure(kernel, name).split("\nconst\n", 1)[0] + "\n"
     code += procedure((FW / "task_handlers.nim").read_text(), "sm_rsp_timeout_ind_handler")
@@ -656,6 +664,62 @@ def test_response_timeout(tmp_path: Path, case: str, mode: str) -> None:
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_auth_success_precedes_timeout_enqueued_by_timer_priority(tmp_path: Path, mode: str) -> None:
+    kernel = (FW / "kernel_mac_channel.nim").read_text()
+    code = source() + r'''
+const
+  KE_EVT_MAX = 26
+  AuthSuccessFixture = 0x20'u16
+var keEvtHandlers: array[KE_EVT_MAX, tuple[handler, param: pointer]]
+proc keEnvEventField(): ptr uint32 = addr events
+'''
+    for name in ("eventIndex32", "keDispatchEvent", "ke_evt_schedule"):
+        code += procedure(kernel, name)
+    run_program(tmp_path, mode, code + r'''
+proc timerEvent(arg: pointer) {.cdecl.} = ke_timer_schedule()
+proc messageEvent(arg: pointer) {.cdecl.} =
+  let payload = takeMessage()
+  let header = keMsgHdrFromPayload(payload)
+  if header.id == AuthSuccessFixture:
+    # A successful auth response in the single-channel path starts association.
+    ke_msg_free(header)
+    ke_timer_clear(SM_RSP_TIMEOUT_IND, TASK_SM)
+    state = SmAssocRspState
+    ke_timer_set(SM_RSP_TIMEOUT_IND, TASK_SM, 100)
+  else:
+    deliver(payload)
+  if messages.first == nil: ke_evt_clear(KE_EVT_KE_MESSAGE)
+
+setup()
+keEvtHandlers[2].handler = cast[pointer](timerEvent)
+keEvtHandlers[4].handler = cast[pointer](messageEvent)
+ke_timer_set(SM_RSP_TIMEOUT_IND, TASK_SM, 50)
+let auth = ke_msg_alloc(AuthSuccessFixture, TASK_SM, 0xFF, 0)
+ke_msg_send(auth)
+now = 150
+ke_evt_set(KE_EVT_KE_TIMER)
+ke_evt_schedule()
+doAssert state == SmAuthenticatingState and keTimerQueue.first == nil
+doAssert messages.first == cast[ptr CoListHdr](keMsgHdrFromPayload(auth))
+doAssert messages.first != messages.last
+doAssert cast[ptr KeMsgHdr](messages.last).id == SM_RSP_TIMEOUT_IND
+doAssert events == KE_EVT_KE_MESSAGE
+ke_evt_schedule()
+doAssert state == SmAssocRspState and messages.first == messages.last
+ke_evt_schedule()
+doAssert events == 0 and messages.first == nil
+doAssert assocRetries == 0 and authRetries == 0 and connection.retry == 0
+now = 250
+ke_evt_set(KE_EVT_KE_TIMER)
+ke_evt_schedule()
+ke_evt_schedule()
+doAssert assocRetries == 1 and authRetries == 0 and connection.retry == 1
+doAssert events == 0
+finish()
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_response_timeout_trace_reentry(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, source(trace=True) + r'''
 setup()
@@ -668,22 +732,24 @@ finish()
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-def test_response_timeout_fallback(tmp_path: Path, mode: str) -> None:
+def test_tx_confirmation_cannot_replace_a_management_response(tmp_path: Path, mode: str) -> None:
+    # Exercise the old diagnostic define too: neither the real ACK nor the
+    # status formerly mistaken for an ACK may manufacture a response.
     run_program(tmp_path, mode, source(fallback=True) + r'''
 setup()
 expire()
 nimFwDbgAuthCfmAckOk16 = 1
 deliver(takeMessage())
-doAssert authFallback == 1 and authRetries == 0
+doAssert authFallback == 0 and authRetries == 1
 finish()
 setup()
 state = 8
 expire()
 nimFwDbgAssocReqSend = 1
-nimFwDbgAssocCfmAckOk16 = 1
+nimFwDbgAssocCfmAckOk23 = 1
 nimFwDbgAuthOpenSuccess = 1
 deliver(takeMessage())
-doAssert assocFallback == 1 and assocRetries == 0
+doAssert assocFallback == 0 and assocRetries == 1
 finish()
 setup()
 expire()

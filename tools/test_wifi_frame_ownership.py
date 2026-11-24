@@ -65,7 +65,7 @@ proc txFrameEnv(): ptr TxFrameEnvView = addr frameEnv
 proc txlFrameDescAt(index: uint32): ptr HostTxDescView =
   cast[ptr HostTxDescView](addr txl_frame_desc_storage[index * 220])
 proc hostTxDescAt(p: pointer): ptr HostTxDescView = cast[ptr HostTxDescView](p)
-proc txSecurityCurrent(d: ptr HostTxDescView): bool = true
+proc txSecurityCurrent(d: ptr HostTxDescView; allowInternalNull = false): bool = true
 proc txSecurityForget(d: pointer) = discard
 proc txSecurityReset() = discard
 proc txlFrameEndLease(d: ptr HostTxDescView) = discard

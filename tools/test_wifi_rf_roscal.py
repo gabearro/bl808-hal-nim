@@ -218,6 +218,7 @@ for i in 0 ..< 256:
       let byteShift = if branch: 0 else: 8
       for slot, word in [24, 22, 20, 18]:
         expected[word] = (expected[word] and not (255'u32 shl byteShift)) or (code shl byteShift)
+        trace.add((cast[uint](addr calibration[word]), expected[word]))
         let offset = if slot < 2: 0x16C else: 0x168
         let shift = (if slot mod 2 == 0: 16 else: 0) + byteShift
         rfExpected[offset div 4] = (rfExpected[offset div 4] and not (63'u32 shl shift)) or
@@ -227,6 +228,30 @@ for i in 0 ..< 256:
     doAssert calibration == expected, "ROSCAL overwrote RCCAL or missed its four packed records"
     doAssert registerStorage == rfExpected
     doAssert mmioWrites == trace, "ROSCAL lane writes differ in order or ownership"
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
+def test_publication_binds_calibration_once_per_iq_result(tmp_path: Path, mode: str) -> None:
+    store = "proc volatileStore(p: ptr uint32; value: uint32) ="
+    code = roscal_source().replace(store, "var nextCalibration: pointer\n" + store + r'''
+  if p == addr(rf70.roscalCal1) and nextCalibration != nil:
+    rfCalibDataGlobal = nextCalibration
+    nextCalibration = nil
+''')
+    run_program(tmp_path, mode, code + r'''
+roscalSetup()
+var second = calibration
+var iBank = calibration
+var qBank = second
+for word in [24, 22, 20, 18]:
+  iBank[word] = (iBank[word] and 0xFFFFFF00'u32) or 0xF1
+  qBank[word] = (qBank[word] and 0xFFFF00FF'u32) or 0xC200
+# rf_pri_roscal.part.0+0x124/+0x1a4 load a fresh base after each IQ call,
+# not after each RF16C/RF168 store.
+nextCalibration = addr second[0]
+publishBoth(0xF1, 0xC2)
+doAssert calibration == iBank and second == qBank
 ''')
 
 

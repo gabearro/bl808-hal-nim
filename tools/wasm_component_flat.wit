@@ -1,0 +1,26 @@
+package ox64:flat@0.2.0;
+
+world flat-demo {
+  import verify: func(pair: tuple<u8, f64>, choice: result<f32, u64>,
+    label: option<string>, words: list<u32>) -> u32;
+  export signature: func(pair: tuple<u8, f64>, choice: result<f32, u64>,
+    label: option<string>, words: list<u32>) -> u32;
+  export run: func() -> u32;
+  export bad-tag: func() -> u32;
+}
+
+world flat-lp {
+  import verify: func(pair: tuple<u8, f64>, choice: result<f32, u64>) -> u32;
+  export signature: func(pair: tuple<u8, f64>, choice: result<f32, u64>) -> u32;
+  export run: func() -> u32;
+}
+
+world named-record {
+  export arithmetic: interface {
+    record pair {
+      left: u32,
+      right: u32,
+    }
+    sum: func(input: pair) -> u32;
+  }
+}

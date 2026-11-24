@@ -27,7 +27,7 @@ const
 proc defaultRv64Target(): Rv64Target =
   when defined(bl808) or defined(bl808D0) or defined(theadC906) or
        defined(wasmJitBl808D0) or defined(wasmJitThead):
-    rv64BL808D0Target
+    rv64BL808D0VerifiedTarget
   elif defined(wasmJitRvCommon) or defined(riscvCommonExt):
     rv64CommonTarget
   else:
@@ -39,7 +39,7 @@ proc defaultRv32Target(): RvTarget =
     rv32BL808LPTarget
   elif defined(bl808) or defined(bl808M0) or defined(theadE907) or
        defined(wasmJitBl808M0):
-    rv32BL808M0Target
+    rv32BL808M0VerifiedTarget
   elif defined(wasmJitRvCommon) or defined(riscvCommonExt):
     rv32CommonTarget
   else:
@@ -409,7 +409,10 @@ proc tryLoadFromAotCache*(tvm: var TieredVM): bool =
   ## Attempt to load previously compiled Tier-2 functions from disk.
   ## Returns true if at least one function was installed from cache.
   ## Must be called after instantiate() and setModuleBytes().
-  if tvm.aotCacheDir.len == 0 or tvm.moduleHashVal == 0:
+  if tvm.aotCacheDir.len == 0 or tvm.moduleHashVal == 0 or
+      tvm.pool.used != 0:
+    # Install the cache before any other code occupies this protection
+    # region. A failed seal then cannot expose previously published code.
     return false
   let p = cachePath(tvm.aotCacheDir, tvm.moduleHashVal)
   var cache: AotCache
@@ -419,37 +422,52 @@ proc tryLoadFromAotCache*(tvm: var TieredVM): bool =
     return false  # Cache miss or stale — silent fallback
 
   let dispatchAddr = cast[uint64](tier2CallIndirectDispatch)
-  var installed = 0
-  for cf in cache.funcs:
-    let fa = cf.funcIdx.int
-    if fa >= tvm.tier2Ptrs.len: continue
-    if tvm.tier2Ptrs[fa] != nil: continue  # already compiled in this session
+  let previousUsed = tvm.pool.used
+  let previousSideData = tvm.pool.sideData.len
+  var staged: seq[tuple[funcAddr: int, code: JitCode]]
+  try:
+    for cf in cache.funcs:
+      if cf.funcIdx.uint64 >= tvm.tier2Ptrs.len.uint64: continue
+      let fa = cf.funcIdx.int
+      if tvm.tier2Ptrs[fa] != nil: continue
 
-    # Pre-allocate a fresh CallIndirectCache for each unique call_indirect site
-    var siteMap: seq[pointer]  # siteIdx → new CallIndirectCache*
-    for r in cf.relocs:
-      if r.kind == relocCallCache:
-        let si = r.siteIdx.int
-        while siteMap.len <= si:
-          siteMap.add(nil)
-        if siteMap[si] == nil:
-          let p2 = allocShared0(sizeof(CallIndirectCache))
-          tvm.pool.sideData.add(p2)
-          siteMap[si] = p2
+      # These pointers belong to the staged code and are discarded together
+      # if any function fails to link or the pool cannot be sealed executable.
+      var siteMap: seq[pointer]
+      for r in cf.relocs:
+        if r.kind == relocCallCache:
+          let si = r.siteIdx.int
+          while siteMap.len <= si:
+            siteMap.add(nil)
+          if siteMap[si] == nil:
+            let p2 = allocShared0(sizeof(CallIndirectCache))
+            if p2 == nil:
+              raise newException(OSError, "JIT cache side-data allocation failed")
+            tvm.pool.sideData.add(p2)
+            siteMap[si] = p2
 
-    let jc = linkCachedFunc(tvm.pool, cf, dispatchAddr, siteMap)
-    if jc.address == nil: continue
+      let jc = linkCachedFunc(tvm.pool, cf, dispatchAddr, siteMap)
+      staged.add((fa, jc))
+  except Exception:
+    try:
+      tvm.pool.enableExecute()
+    except Exception:
+      discard
+    tvm.pool.used = previousUsed
+    for i in previousSideData ..< tvm.pool.sideData.len:
+      deallocShared(tvm.pool.sideData[i])
+    tvm.pool.sideData.setLen(previousSideData)
+    return false
 
+  for item in staged:
+    let fa = item.funcAddr
     if fa < tvm.tier2Code.len:
-      tvm.tier2Code[fa] = jc
-    if fa < tvm.tier2Ptrs.len:
-      tvm.tier2Ptrs[fa] = cast[JitFuncPtr](jc.address)
-    # Mark call counters so we don't re-compile
+      tvm.tier2Code[fa] = item.code
+    tvm.tier2Ptrs[fa] = cast[JitFuncPtr](item.code.address)
     if fa < tvm.callCounts.len:
       tvm.callCounts[fa] = tvm.tier2Thresholds[fa]
-    inc installed
 
-  result = installed > 0
+  staged.len > 0
 
 proc instantiate*(tvm: var TieredVM, module: WasmModule,
                   imports: openArray[(string, string, ExternalVal)]): int =

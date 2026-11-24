@@ -5,6 +5,9 @@
 ## execute from XIP flash or lazily decode into a small scratch cache.
 
 import ./types
+import ./binary_order
+import ./utf8_names
+import ./simd_encoding
 
 type
   FlashWasmError* = object of CatchableError
@@ -45,10 +48,10 @@ type
     tables*: seq[TableType]
     memories*: seq[MemType]
     exports*: seq[Export]
-    startFunc*: int32
+    startFunc*: int64
     codes*: seq[FlashFuncBody]
     datas*: seq[FlashDataSegment]
-    dataCount*: int32
+    dataCount*: int64
 
   FlashReader = object
     image: WasmImageView
@@ -90,44 +93,45 @@ proc readByte(r: var FlashReader): byte =
   inc r.pos
 
 proc skip(r: var FlashReader, n: int) =
-  if n < 0 or r.pos + n > r.limit:
+  if n < 0 or n > r.limit-r.pos:
     flashError("WASM skip out of bounds")
   r.pos += n
 
 proc readU32(r: var FlashReader): uint32 =
-  var shift = 0
-  while true:
+  for i in 0..4:
     let b = r.readByte()
-    result = result or (uint32(b and 0x7F) shl shift)
-    if (b and 0x80) == 0:
-      break
-    shift += 7
-    if shift >= 35:
-      flashError("LEB128 u32 overflow")
+    if i == 4 and (b and 0xf0) != 0: flashError("LEB128 u32 overflow")
+    result = result or (uint32(b and 0x7f) shl (7*i))
+    if (b and 0x80) == 0: return
+  flashError("LEB128 u32 overflow")
 
 proc readS32(r: var FlashReader): int32 =
-  var shift = 0
-  var resultU: uint32 = 0
-  var b: byte
-  while true:
-    b = r.readByte()
-    resultU = resultU or (uint32(b and 0x7F) shl shift)
-    shift += 7
-    if (b and 0x80) == 0:
-      break
-    if shift >= 35:
+  var bits = 0'u32
+  for i in 0..4:
+    let b = r.readByte()
+    let payload = b and 0x7f
+    if i == 4 and ((b and 0x80) != 0 or (payload > 7 and payload < 0x78)):
       flashError("LEB128 s32 overflow")
-  if shift < 32 and (b and 0x40) != 0:
-    resultU = resultU or (not uint32(0) shl shift)
-  cast[int32](resultU)
+    bits = bits or (uint32(payload) shl (7*i))
+    if (b and 0x80) == 0:
+      let consumed = 7*(i+1)
+      if consumed < 32 and (b and 0x40) != 0: bits = bits or (not 0'u32 shl consumed)
+      return cast[int32](bits)
+  flashError("LEB128 s32 overflow")
+
+proc readCount(r: var FlashReader): int =
+  let count = r.readU32()
+  if uint64(count) > uint64(r.remaining): flashError("vector exceeds available bytes")
+  int(count)
 
 proc readName(r: var FlashReader): string =
-  let length = r.readU32().int
+  let length = r.readCount()
   if length < 0 or length > r.remaining:
     flashError("WASM name exceeds section bounds")
   result = newString(length)
   for i in 0 ..< length:
     result[i] = char(r.readByte())
+  if not validWasmName(result): flashError("invalid UTF-8 name")
 
 proc readValType(r: var FlashReader): ValType =
   case r.readByte()
@@ -147,7 +151,21 @@ proc skipBlockType(r: var FlashReader) =
   if b in {0x7F'u8, 0x7E'u8, 0x7D'u8, 0x7C'u8, 0x7B'u8, 0x70'u8, 0x6F'u8}:
     return
   dec r.pos
-  discard r.readS32()
+  for i in 0..4:
+    let value = r.readByte()
+    if i == 4 and ((value and 0x7f) > 15 or (value and 0x80) != 0): flashError("block type s33 overflow")
+    if (value and 0x80) == 0:
+      if i < 4 and (value and 0x40) != 0: flashError("negative block type index")
+      return
+  flashError("block type s33 overflow")
+
+proc skipS64(r: var FlashReader) =
+  for i in 0..9:
+    let b = r.readByte()
+    if i == 9 and ((b and 0x80) != 0 or (b and 0x7f) notin [0'u8, 0x7f]):
+      flashError("LEB128 s64 overflow")
+    if (b and 0x80) == 0: return
+  flashError("LEB128 s64 overflow")
 
 proc skipExprRange(r: var FlashReader): FlashExprRange =
   let start = r.offset
@@ -155,84 +173,76 @@ proc skipExprRange(r: var FlashReader): FlashExprRange =
   while depth > 0:
     let op = r.readByte()
     case op
-    of 0x02, 0x03:
+    of 0x02, 0x03, 0x04:
       r.skipBlockType()
       inc depth
-    of 0x04:
+    of 0x1f:
       r.skipBlockType()
+      let count = r.readCount()
+      for _ in 0..<count:
+        let kind = r.readByte()
+        if kind > 3: flashError("invalid catch kind")
+        if kind < 2: discard r.readU32()
+        discard r.readU32()
       inc depth
-    of 0x05:
-      discard
-    of 0x0B:
-      dec depth
-    of 0x0C, 0x0D, 0x10:
+    of 0x0b: dec depth
+    of 0x00, 0x01, 0x05, 0x0a, 0x0f, 0x1a, 0x1b, 0x45..0xc4, 0xd1: discard
+    of 0x08, 0x0c, 0x0d, 0x10, 0x12, 0x20..0x26, 0x3f, 0x40, 0xd2:
       discard r.readU32()
-    of 0x11:
+    of 0x11, 0x13:
       discard r.readU32()
       discard r.readU32()
-    of 0x20, 0x21, 0x22, 0x23, 0x24:
+    of 0x0e:
+      let count = r.readCount()
+      for _ in 0..count: discard r.readU32()
+    of 0x1c:
+      if r.readU32() != 1: flashError("typed select requires one type")
+      discard r.readValType()
+    of 0x28..0x3e:
       discard r.readU32()
-    of 0x28..0x40:
       discard r.readU32()
-      discard r.readU32()
-    of 0x41:
-      discard r.readS32()
-    of 0x42:
-      # Signed LEB64. We only need to skip it.
-      var shift = 0
-      while true:
-        let b = r.readByte()
-        if (b and 0x80) == 0: break
-        shift += 7
-        if shift >= 70: flashError("LEB128 s64 overflow")
-    of 0x43:
-      r.skip(4)
-    of 0x44:
-      r.skip(8)
-    of 0xFC:
+    of 0x41: discard r.readS32()
+    of 0x42: r.skipS64()
+    of 0x43: r.skip(4)
+    of 0x44: r.skip(8)
+    of 0xd0:
+      if r.readValType() notin {vtFuncRef, vtExternRef}: flashError("invalid reference type")
+    of 0xfc:
+      case r.readU32()
+      of 0..7: discard
+      of 8, 10, 12, 14:
+        discard r.readU32()
+        discard r.readU32()
+      of 9, 11, 13, 15, 16, 17: discard r.readU32()
+      else: flashError("unsupported 0xFC opcode")
+    of 0xfd:
       let sub = r.readU32()
-      case sub
-      of 0, 1, 2, 3, 4, 5, 6, 7:
-        discard
-      of 8, 9, 10, 11, 12:
-        discard r.readU32()
-      of 14:
-        discard r.readU32()
-        discard r.readU32()
-      of 15, 16, 17:
-        discard r.readU32()
-      else:
-        flashError("unknown 0xFC sub-opcode in flash expression")
-    of 0xFD:
-      let sub = r.readU32()
+      if simdOpcode(sub) == 0: flashError("unsupported SIMD opcode")
       case sub
       of 0, 11:
         discard r.readU32()
         discard r.readU32()
-      of 12:
-        r.skip(16)
-      of 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34:
-        discard r.readByte()
-      else:
-        discard
-    else:
-      discard
-  FlashExprRange(offset: start, len: r.offset - start)
+      of 12: r.skip(16)
+      of 21..34: discard r.readByte()
+      else: discard
+    else: flashError("unsupported opcode in flash expression")
+  FlashExprRange(offset: start, len: r.offset-start)
 
 proc readFuncType(r: var FlashReader): FuncType =
   if r.readByte() != 0x60:
     flashError("expected WASM function type")
-  let paramCount = r.readU32().int
+  let paramCount = r.readCount()
   result.params = newSeqOfCap[ValType](paramCount)
   for _ in 0 ..< paramCount:
     result.params.add(r.readValType())
-  let resultCount = r.readU32().int
+  let resultCount = r.readCount()
   result.results = newSeqOfCap[ValType](resultCount)
   for _ in 0 ..< resultCount:
     result.results.add(r.readValType())
 
 proc readLimits(r: var FlashReader): Limits =
   let flag = r.readByte()
+  if flag notin [0'u8, 1]: flashError("unsupported limits flags")
   result.min = r.readU32()
   if (flag and 0x01) != 0:
     result.hasMax = true
@@ -252,13 +262,13 @@ proc readGlobalType(r: var FlashReader): GlobalType =
   else: flashError("invalid WASM global mutability")
 
 proc parseTypeSection(r: var FlashReader, m: var FlashWasmModule) =
-  let count = r.readU32().int
+  let count = r.readCount()
   m.types = newSeqOfCap[FuncType](count)
   for _ in 0 ..< count:
     m.types.add(r.readFuncType())
 
 proc parseImportSection(r: var FlashReader, m: var FlashWasmModule) =
-  let count = r.readU32().int
+  let count = r.readCount()
   m.imports = newSeqOfCap[Import](count)
   for _ in 0 ..< count:
     let moduleName = r.readName()
@@ -280,25 +290,25 @@ proc parseImportSection(r: var FlashReader, m: var FlashWasmModule) =
       flashError("unknown WASM import kind")
 
 proc parseFunctionSection(r: var FlashReader, m: var FlashWasmModule) =
-  let count = r.readU32().int
+  let count = r.readCount()
   m.funcTypeIdxs = newSeqOfCap[uint32](count)
   for _ in 0 ..< count:
     m.funcTypeIdxs.add(r.readU32())
 
 proc parseTableSection(r: var FlashReader, m: var FlashWasmModule) =
-  let count = r.readU32().int
+  let count = r.readCount()
   m.tables = newSeqOfCap[TableType](count)
   for _ in 0 ..< count:
     m.tables.add(r.readTableType())
 
 proc parseMemorySection(r: var FlashReader, m: var FlashWasmModule) =
-  let count = r.readU32().int
+  let count = r.readCount()
   m.memories = newSeqOfCap[MemType](count)
   for _ in 0 ..< count:
     m.memories.add(r.readMemType())
 
 proc parseExportSection(r: var FlashReader, m: var FlashWasmModule) =
-  let count = r.readU32().int
+  let count = r.readCount()
   m.exports = newSeqOfCap[Export](count)
   for _ in 0 ..< count:
     var e: Export
@@ -313,13 +323,13 @@ proc parseExportSection(r: var FlashReader, m: var FlashWasmModule) =
     m.exports.add(e)
 
 proc skipGlobalSection(r: var FlashReader) =
-  let count = r.readU32().int
+  let count = r.readCount()
   for _ in 0 ..< count:
     discard r.readGlobalType()
     discard r.skipExprRange()
 
 proc skipElementSection(r: var FlashReader) =
-  let count = r.readU32().int
+  let count = r.readCount()
   for _ in 0 ..< count:
     let flags = r.readU32()
     let isPassiveOrDeclarative = (flags and 0x01) != 0
@@ -339,7 +349,7 @@ proc skipElementSection(r: var FlashReader) =
         if elemKind != 0x00'u8:
           flashError("unknown WASM elemkind")
 
-    let elemCount = r.readU32().int
+    let elemCount = r.readCount()
     for _ in 0 ..< elemCount:
       if usesExpressions:
         discard r.skipExprRange()
@@ -347,7 +357,7 @@ proc skipElementSection(r: var FlashReader) =
         discard r.readU32()
 
 proc parseCodeSection(r: var FlashReader, m: var FlashWasmModule) =
-  let count = r.readU32().int
+  let count = r.readCount()
   m.codes = newSeqOfCap[FlashFuncBody](count)
   for _ in 0 ..< count:
     let bodySize = r.readU32().int
@@ -358,7 +368,7 @@ proc parseCodeSection(r: var FlashReader, m: var FlashWasmModule) =
     var body: FlashFuncBody
     body.bodyOffset = uint32(bodyStart)
     body.bodyLen = uint32(bodySize)
-    let localDeclCount = r.readU32().int
+    let localDeclCount = r.readCount()
     body.locals = newSeqOfCap[LocalDecl](localDeclCount)
     for _ in 0 ..< localDeclCount:
       body.locals.add(LocalDecl(count: r.readU32(), valType: r.readValType()))
@@ -368,7 +378,7 @@ proc parseCodeSection(r: var FlashReader, m: var FlashWasmModule) =
     m.codes.add(body)
 
 proc parseDataSection(r: var FlashReader, m: var FlashWasmModule) =
-  let count = r.readU32().int
+  let count = r.readCount()
   m.datas = newSeqOfCap[FlashDataSegment](count)
   for _ in 0 ..< count:
     var seg: FlashDataSegment
@@ -409,18 +419,21 @@ proc parseFlashWasmModule*(image: WasmImageView): FlashWasmModule =
   result.startFunc = -1
   result.dataCount = -1
 
-  var lastSectionId = -1
+  var lastSectionOrder = 0
   while not r.atEnd:
     let sectionId = r.readByte()
-    let sectionSize = r.readU32().int
-    if sectionSize < 0 or sectionSize > r.remaining:
+    let encodedSize = r.readU32()
+    if uint64(encodedSize) > uint64(r.remaining):
       flashError("WASM section exceeds image bounds")
+    let sectionSize = int(encodedSize)
     let payloadOffset = r.pos
     let sectionEnd = r.pos + sectionSize
+    let order = binarySectionOrder(int(sectionId))
+    if order < 0: flashError("unknown WASM section ID")
     if sectionId != 0:
-      if sectionId.int <= lastSectionId:
+      if order <= lastSectionOrder:
         flashError("WASM sections out of order")
-      lastSectionId = sectionId.int
+      lastSectionOrder = order
     result.sections.add(WasmSectionRange(
       id: sectionId,
       payloadOffset: uint32(payloadOffset),
@@ -446,7 +459,7 @@ proc parseFlashWasmModule*(image: WasmImageView): FlashWasmModule =
     of 7:
       parseExportSection(sr, result)
     of 8:
-      result.startFunc = int32(sr.readU32())
+      result.startFunc = int64(sr.readU32())
     of 9:
       skipElementSection(sr)
     of 10:
@@ -454,7 +467,7 @@ proc parseFlashWasmModule*(image: WasmImageView): FlashWasmModule =
     of 11:
       parseDataSection(sr, result)
     of 12:
-      result.dataCount = int32(sr.readU32())
+      result.dataCount = int64(sr.readU32())
     else:
       sr.skip(sr.remaining)
     if not sr.atEnd:
@@ -463,8 +476,13 @@ proc parseFlashWasmModule*(image: WasmImageView): FlashWasmModule =
 
   if result.codes.len != result.funcTypeIdxs.len:
     flashError("WASM function/code count mismatch")
-  if result.dataCount >= 0 and result.dataCount != result.datas.len.int32:
+  if result.dataCount >= 0 and result.dataCount != int64(result.datas.len):
     flashError("WASM data count mismatch")
+  if result.startFunc >= 0:
+    var functions = uint64(result.funcTypeIdxs.len)
+    for item in result.imports:
+      if item.kind == ikFunc: inc functions
+    if uint64(result.startFunc) >= functions: flashError("WASM start function index out of range")
 
 proc parseFlashWasmModule*(data: openArray[byte]): FlashWasmModule =
   parseFlashWasmModule(initWasmImageView(data))

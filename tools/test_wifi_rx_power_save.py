@@ -178,6 +178,7 @@ proc expectedTrigger(traffic, mask, tid, budget: uint8; service, sent: uint32;
   result.traffic = traffic
   let triggerBit = 1'u8 shl [3, 2, 2, 3, 1, 1, 0, 0][tid]
   if (mask and triggerBit) == 0 or (service and 6) != 0: return
+  var remaining = budget.uint32
   if (traffic and 12) == 0:
     result.actions.add(("null", 4'u32, tid.uint32 or 16, 2'u32))
     result.service = 0
@@ -190,8 +191,10 @@ proc expectedTrigger(traffic, mask, tid, budget: uint8; service, sent: uint32;
       result.actions.add(("null", 4'u32, tid.uint32 or 16, 2'u32))
       result.service = 0
       return
+    if budget > 0:
+      remaining -= sent
   if (result.traffic and 4) != 0:
-    result.actions.add(("traffic", 4'u32, budget.uint32, 1'u32))
+    result.actions.add(("traffic", 4'u32, remaining, 1'u32))
     result.service = 4
   else:
     result.actions.add(("null", 4'u32, tid.uint32 or 16, result.service))
@@ -202,6 +205,15 @@ RX_IDENTITY_MODELS = r"""
 # This fixture retains its descriptors without recycling them during callbacks.
 type RxFrameIdentity = object
   generation: uint32
+  length: uint16
+type RxBeaconView = object
+  data: pointer
+
+proc rxOpenBeaconView(identity: RxFrameIdentity): RxBeaconView = doAssert false
+proc rxCloseBeaconView(view: var RxBeaconView) = discard
+proc mmCheckBeaconFrame(p, vif, sta, data: pointer; tim: var pointer): uint32 = doAssert false
+proc rxlObserveStaWmm(p: pointer; vif: ptr VifChannelView; sta: ptr StaInfoView;
+                      data: pointer) = discard
 
 proc rxUploadGeneration(p: pointer): uint32 = 1
 proc rxUploadCurrent(p: pointer; generation: uint32): bool =
@@ -225,6 +237,24 @@ CHECKS = r"""
 static:
   doAssert MM_PS_CHANGE_IND == 55 and MM_TRAFFIC_REQ_IND == 56
   doAssert sizeof(MmTrafficReqIndPayload) == 3
+
+for budget in [4'u8, 0]:
+  reset()
+  vifs[1].vifType = VIF_TYPE_AP
+  stas[4].psMode = 1
+  stas[4].psState = 15
+  stas[4].trafficFlags = 12
+  stas[4].uapsdBitmap = budget
+  txCount = 1
+  afterTraffic = 4
+  var header = MacQosDataFrameHeaderView(
+    header: MacDataFrameHeaderView(frameControl: 0x1188), qosCtrl: 7)
+  let remaining = if budget == 0: 0'u32 else: 3'u32
+  for attempt in 0 .. 1:
+    rxlHandleApPowerSave(addr vifs[1], addr stas[4], 4, addr header)
+    doAssert actions == @[("send", 4'u32, budget.uint32, 2'u32),
+                          ("traffic", 4'u32, remaining, 1'u32)]
+    doAssert stas[4].psStatus == 4
 
 # Exhaustive U-APSD trigger masks, traffic flags and service-period state.
 for tid in 0'u8 .. 7'u8:
@@ -286,6 +316,28 @@ for vifType in 0'u8 .. 3'u8:
         doAssert actions == expected and vifs[1].psBaCounter == expectedCount
         doAssert stas[4].psMode == expectedSleep.uint8
 
+# Reserved QoS TIDs cannot trigger U-APSD, but their PM bit still updates the
+# AP's station and multicast sleep state before trigger admission.
+for tid in 8'u16 .. 15'u16:
+  for asleep in [false, true]:
+    reset()
+    vifs[1].vifType = 2
+    vifs[1].psBaCounter = if asleep: 1 else: 0
+    stas[4].psMode = asleep.uint8
+    stas[4].psState = 15
+    stas[4].trafficFlags = 12
+    var header = MacQosDataFrameHeaderView(
+      header: MacDataFrameHeaderView(frameControl: if asleep: 0x0088'u16 else: 0x1088'u16),
+      qosCtrl: tid)
+    rxlHandleApPowerSave(addr vifs[1], addr stas[4], 4, addr header)
+    doAssert stas[4].psMode == (not asleep).uint8
+    doAssert vifs[1].psBaCounter == (if asleep: 0'u8 else: 1'u8)
+    doAssert actions == (if asleep:
+      @[("ps", 4'u32, 0'u32, 0'u32), ("clear", 4'u32, 0'u32, 0'u32),
+        ("ps", 6'u32, 0'u32, 0'u32), ("clear", 6'u32, 0'u32, 0'u32)]
+    else:
+      @[("ps", 4'u32, 1'u32, 0'u32), ("ps", 6'u32, 1'u32, 0'u32)])
+
 # PS-Poll notifies the host for one packet, or drains internal traffic while
 # preserving other service-period bits. The frame still goes to RX upper.
 for traffic in 0'u8 .. 15'u8:
@@ -299,7 +351,7 @@ for traffic in 0'u8 .. 15'u8:
       uploadResult = upload
       var header = MacDataFrameHeaderView(frameControl: 0x10A4)
       var chain = BufferChain(frameData: addr header)
-      var sw = SwDesc(bufferChain: addr chain, hwFlags: 0x20020000'u32 or (12'u32 shl 15))
+      var sw = SwDesc(bufferChain: addr chain, hwFlags: 0x02002000'u32 or (12'u32 shl 15))
       var mpdu = RxMpdu(swDesc: addr sw)
       env.queue = CoList(first: addr mpdu.link, last: addr mpdu.link)
       rxl_cntrl_evt()
@@ -321,7 +373,7 @@ stas[4].trafficFlags = 12
 vifs[1].vifType = 0
 var header = MacQosDataFrameHeaderView(header: MacDataFrameHeaderView(frameControl: 0x1188))
 var chain = BufferChain(frameData: addr header)
-var sw = SwDesc(bufferChain: addr chain, hwFlags: 0x20020000'u32 or (12'u32 shl 15))
+var sw = SwDesc(bufferChain: addr chain, hwFlags: 0x02002000'u32 or (12'u32 shl 15))
 var mpdu = RxMpdu(swDesc: addr sw)
 env.queue = CoList(first: addr mpdu.link, last: addr mpdu.link)
 rxl_cntrl_evt()
@@ -338,7 +390,7 @@ for mask in [0'u8, 15]:
     vifs[1].vifType = 2
     var hdr = MacQosDataFrameHeaderView(header: MacDataFrameHeaderView(frameControl: 0x1188))
     var buffer = BufferChain(frameData: addr hdr)
-    var descriptor = SwDesc(bufferChain: addr buffer, hwFlags: 0x20020000'u32 or (12'u32 shl 15))
+    var descriptor = SwDesc(bufferChain: addr buffer, hwFlags: 0x02002000'u32 or (12'u32 shl 15))
     var packet = RxMpdu(swDesc: addr descriptor)
     env.queue = CoList(first: addr packet.link, last: addr packet.link)
     rxl_cntrl_evt()
@@ -346,7 +398,7 @@ for mask in [0'u8, 15]:
     doAssert actions[^1] == ("free", 0'u32, 0'u32, 0'u32)
 
 # Beacon processing gets the RX descriptor and its length, not the payload chain.
-for changed in [0'u32, 1]:
+for changed in [0'u32, 1, high(uint32)]:
   reset()
   stas[4].instNbr = 0
   vifs[0].state = 1
@@ -356,15 +408,19 @@ for changed in [0'u32, 1]:
   var hdr = MacDataFrameHeaderView(frameControl: 0x0080)
   var buffer = BufferChain(frameData: addr hdr)
   var descriptor = SwDesc(bufferChain: addr buffer,
-    hwFlags: 0x20020000'u32 or (12'u32 shl 15), frameLen: 123)
+    hwFlags: 0x02002000'u32 or (12'u32 shl 15), frameLen: 123)
   var packet = RxMpdu(swDesc: addr descriptor)
   beaconInput = addr descriptor
   beaconResult = changed
   env.queue = CoList(first: addr packet.link, last: addr packet.link)
   rxl_cntrl_evt()
   var expected: seq[Action] = @[("td", 0'u32, 4'u32, 1'u32), ("beacon", 0'u32, 0'u32, 0'u32),
-    ("beacon-ps", 0'u32, 0'u32, 0'u32), ("beacon-vif", 0'u32, 0'u32, 0'u32), ("tbtt", 0'u32, 0'u32, 0'u32)]
-  if changed != 0: expected.add(("upper", 0'u32, 0'u32, 0'u32))
+  ]
+  if changed != high(uint32):
+    expected.add(("beacon-ps", 0'u32, 0'u32, 0'u32))
+    expected.add(("beacon-vif", 0'u32, 0'u32, 0'u32))
+    expected.add(("tbtt", 0'u32, 0'u32, 0'u32))
+    if changed != 0: expected.add(("upper", 0'u32, 0'u32, 0'u32))
   expected.add(("free", 0'u32, 0'u32, 0'u32))
   doAssert actions == expected
 
@@ -374,7 +430,7 @@ for invalidIndex in [15'u32, 0x108, 0x3FF]:
   var hdr = MacDataFrameHeaderView(frameControl: 0x0208)
   var buffer = BufferChain(frameData: addr hdr)
   var descriptor = SwDesc(bufferChain: addr buffer,
-    hwFlags: 0x20020000'u32 or (invalidIndex shl 15))
+    hwFlags: 0x02002000'u32 or (invalidIndex shl 15))
   var packet = RxMpdu(swDesc: addr descriptor)
   env.queue = CoList(first: addr packet.link, last: addr packet.link)
   rxl_cntrl_evt()
@@ -387,7 +443,7 @@ for badVif in [false, true]:
   var hdr = MacDataFrameHeaderView(frameControl: 0x0208)
   var buffer = BufferChain(frameData: addr hdr)
   var descriptor = SwDesc(bufferChain: addr buffer,
-    hwFlags: 0x20020000'u32 or (12'u32 shl 15))
+    hwFlags: 0x02002000'u32 or (12'u32 shl 15))
   var packet = RxMpdu(swDesc: addr descriptor)
   env.queue = CoList(first: addr packet.link, last: addr packet.link)
   rxl_cntrl_evt()
@@ -396,7 +452,7 @@ for badVif in [false, true]:
 reset()
 var emptyBuffer: BufferChain
 var emptyDescriptor = SwDesc(bufferChain: addr emptyBuffer,
-  hwFlags: 0x20020000'u32 or (12'u32 shl 15))
+  hwFlags: 0x02002000'u32 or (12'u32 shl 15))
 var emptyPacket = RxMpdu(swDesc: addr emptyDescriptor)
 env.queue = CoList(first: addr emptyPacket.link, last: addr emptyPacket.link)
 rxl_cntrl_evt()
@@ -442,7 +498,7 @@ def test_rx_power_save_and_ownership(tmp_path: Path) -> None:
     types = "type\n" + "\n".join(structure(name) for name in [
         "MacDataFrameHeaderView", "MacQosDataFrameHeaderView", "MacQos4AddrFrameHeaderView",
         "MmTrafficReqIndPayload", "MmPsChangeIndPayload",
-        "ApmPsSession",
+        "ApmPsSession", "RxPayloadBufferView",
     ])
     constants = "\nconst\n  MmTrafficReqIndPayloadSize = sizeof(MmTrafficReqIndPayload).uint32\n  MmPsChangeIndPayloadSize = sizeof(MmPsChangeIndPayload).uint32\n"
     storage = (base / "global_state/storage.nim").read_text()
@@ -453,6 +509,9 @@ def test_rx_power_save_and_ownership(tmp_path: Path) -> None:
     procedures = "proc rxlRequestBufferedTraffic" + rx.split("proc rxlRequestBufferedTraffic", 1)[1].split(
         "\nproc nimfw_dbg_rxl_processing_flag", 1
     )[0]
+    start = procedures.index("proc rxlObserveStaWmm(")
+    end = procedures.index("proc rxl_cntrl_evt*", start)
+    procedures = procedures[:start] + procedures[end:]
     mm = (base / "kernel_mac_channel.nim").read_text()
     ps_change = "proc mm_ps_change_ind*" + mm.split("proc mm_ps_change_ind*", 1)[1].split(
         "\nproc mm_set_wpa_rsn_ie*", 1

@@ -48,12 +48,15 @@ var
   stationEpochs: array[7, uint32]
   deleted: seq[uint8]
   onRateInit: proc()
+  onMmAdd: proc()
+  onAllocation: proc()
   calls, sent, initialized, htCalls: int
   responseLength: uint32
   responseDestination, responseSource: uint8
   aidAtInit: uint16
   deliveryAtInit, serviceAtInit: uint8
-  apmPendingAssociations: array[1, tuple[request, confirmation: pointer, meQueued: bool]]
+  apmPendingAssociations: array[1, tuple[request, confirmation: pointer,
+    meQueued: bool, generation: uint32]]
 
 proc u16(data: openArray[uint8]; offset: int): uint16 =
   data[offset].uint16 or (data[offset + 1].uint16 shl 8)
@@ -70,6 +73,10 @@ proc ke_msg_alloc(id: uint16; dst, src: uint8; size: uint32): pointer =
   responseDestination = dst
   responseSource = src
   if not allocationFails: result = addr response[0]
+  if onAllocation != nil:
+    let callback = onAllocation
+    onAllocation = nil
+    callback()
 proc ke_msg_send(p: pointer) =
   doAssert p == addr response[0]
   inc sent
@@ -92,6 +99,7 @@ proc mm_sta_add(param: pointer; logicalIndex, hardwareIndex: ptr uint8): uint8 =
   inc calls
   doAssert param != addr requestBytes[0], "ME request passed directly as MM request"
   copyMem(addr translated[0], param, 28)
+  if onMmAdd != nil: onMmAdd()
   if mmStatus == 0:
     logicalIndex[] = assigned
     hardwareIndex[] = assigned + 8
@@ -138,6 +146,8 @@ proc reset(vif, index: uint8; flags: uint32; ampdu: uint8; htEnabled: bool) =
   stationEpochs = default(typeof(stationEpochs))
   deleted.setLen(0)
   onRateInit = nil
+  onMmAdd = nil
+  onAllocation = nil
   calls = 0
   sent = 0
   initialized = 0
@@ -192,6 +202,22 @@ for source in [5'u8, 9'u8]:
     doAssert calls == 1 and sent == 1 and initialized == 0 and htCalls == 0
     doAssert response[0] == 255 and response[1] == error
     doAssert responseDestination == source
+
+for phase in 0 .. 1:
+  reset(0, 2, 1, 0, false)
+  let originalRates = requestBytes[6 .. 18]
+  let mutate = proc() =
+    for byte in requestBytes.mitems: byte = 0
+  if phase == 0: onAllocation = mutate
+  else: onMmAdd = mutate
+  me_sta_add_req_handler(addr requestBytes[0])
+  doAssert calls == 1 and sent == 1 and initialized == 1
+  doAssert response[0] == 2 and response[1] == 0
+  for i in 0 ..< originalRates.len:
+    doAssert stations[2].supportedRates[i] == originalRates[i]
+  doAssert stations[2].capabilityFlags == 0x81'u32
+  doAssert aidAtInit == 0x4567 and deliveryAtInit == 9 and serviceAtInit == 6
+  doAssert stations[2].rateWord == 0x888E and stations[2].controlPortState == 1
 
 for shortLength in 0'u32 .. 85'u32:
   reset(0, 0, 0, 0, false)

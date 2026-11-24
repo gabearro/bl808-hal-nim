@@ -1,6 +1,8 @@
 const
   RwnxTxLifetimeMs = 100'i32
   NxTxPayloadMax = 6'i32
+  BenchStaUapsd = defined(bl808WifiBenchStaUapsd) and defined(bl808WifiNimFw)
+  WifiBenchStaUapsdQueues {.intdefine.} = 1'i32
 
 type
   BlModParams {.bycopy.} = object
@@ -25,6 +27,8 @@ type
     uapsd_queues: int32
 
 static:
+  when BenchStaUapsd:
+    doAssert WifiBenchStaUapsdQueues in 1 .. 15
   doAssert offsetof(BlModParams, ht_on) == 0
   doAssert offsetof(BlModParams, vht_on) == 1
   doAssert offsetof(BlModParams, htVhtAlignmentPadding) == 2
@@ -51,8 +55,8 @@ var bl_mod_params* {.exportc.}: BlModParams = BlModParams(
   listen_itv: 1'i32,
   listen_bcmc: 1'u8,
   lp_clk_ppm: 20'i32,
-  ps_on: 0'u8,
+  ps_on: BenchStaUapsd.uint8,
   tx_lft: RwnxTxLifetimeMs,
   amsdu_maxnb: NxTxPayloadMax,
-  uapsd_queues: 0'i32
+  uapsd_queues: (if BenchStaUapsd: WifiBenchStaUapsdQueues else: 0'i32)
 )

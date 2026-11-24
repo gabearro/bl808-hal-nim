@@ -51,8 +51,9 @@ for length in 0 .. 3:
   for value in rawSsid.mitems: value = 120
   let raw = prepareRaw(rawSsid)
   var selected = 0xFFFFFFFF'u32
-  doAssert scanu_search_by_ssid(addr query, addr selected) == addr scanu_env.entries[0]
-  doAssert selected == 0
+  let found = scanu_search_by_ssid(addr query, addr selected)
+  doAssert found == (if length == 0: addr scanu_env.entries[0] else: nil)
+  doAssert selected == (if length == 0: 0'u32 else: 0xFFFFFFFF'u32)
   free(raw)
 ''')
 
@@ -67,8 +68,9 @@ for length in 0 .. 3:
   for value in rawSsid.mitems: value = 120
   let raw = prepareRaw(rawSsid, 4)
   var selected = 0xFFFFFFFF'u32
-  doAssert scanu_search_by_ssid(addr query, addr selected) == addr scanu_env.entries[0]
-  doAssert selected == 0
+  let found = scanu_search_by_ssid(addr query, addr selected)
+  doAssert found == (if length == 0: addr scanu_env.entries[0] else: nil)
+  doAssert selected == (if length == 0: 0'u32 else: 0xFFFFFFFF'u32)
   free(raw)
 ''')
 
@@ -142,6 +144,55 @@ free(raw)
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_complete_raw_ssid_overrides_stale_retained_match(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+for flags in [0'u32, 1'u32 shl 9, (1'u32 shl 9) or (1'u32 shl 10)]:
+  for length in [1, 4, 5, 32]:
+    var advertised = newSeq[uint8](length)
+    for value in advertised.mitems: value = 120
+    let raw = prepareRaw(advertised)
+    scanu_env.entries[0].securityType = 1
+    connectInfo.channelDuration = flags
+    var selected = 0x12345678'u32
+    doAssert scanu_search_by_ssid(addr query, addr selected) == nil,
+      "stale retained SSID overrode an advertised SSID"
+    doAssert selected == 0x12345678'u32
+    free(raw)
+
+  setup()
+  for slot in 2 ..< SCANU_MAX_RESULT_ENTRIES: scanu_env.entries[slot].valid = 0
+  let stale = frame([120'u8, 120, 120, 120])
+  let matching = frame([109'u8, 101, 115, 104])
+  scanu_env.entries[0].cachedRxuMgtInd = stale
+  scanu_env.entries[0].rssi = -10
+  scanu_env.entries[0].securityType = 1
+  scanu_env.entries[1].cachedRxuMgtInd = matching
+  scanu_env.entries[1].rssi = -50
+  scanu_env.entries[1].securityType = 1
+  connectInfo.channelDuration = flags
+  var selected = 0xFFFFFFFF'u32
+  doAssert scanu_search_by_ssid(addr query, addr selected) == addr scanu_env.entries[1]
+  doAssert selected == 1
+  free(stale)
+  free(matching)
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_oversized_raw_ssid_does_not_fall_back_to_retained_match(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+for length in [33, 255]:
+  var advertised = newSeq[uint8](length)
+  for value in advertised.mitems: value = 109
+  let raw = prepareRaw(advertised)
+  var selected = 0x12345678'u32
+  doAssert scanu_search_by_ssid(addr query, addr selected) == nil
+  doAssert selected == 0x12345678'u32
+  free(raw)
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_raw_length_mismatch_without_cached_match(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, source() + r'''
 for length in [0, 1, 3, 5, 33, 255]:
@@ -171,6 +222,46 @@ for frameLen in [0'u16, 35'u16, 36'u16, 37'u16, 38'u16]:
   doAssert scanu_search_by_ssid(addr query, addr selected) == nil
   doAssert selected == 0x12345678'u32
   free(raw)
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_security_preference_and_strict_fallback(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+let raw = prepareRaw([109'u8, 101, 115, 104])
+scanu_env.entries[0].rssi = -10
+scanu_env.entries[1].valid = 1
+scanu_env.entries[1].rssi = -50
+scanu_env.entries[1].securityType = 1
+var selected = 0xFFFFFFFF'u32
+doAssert scanu_search_by_ssid(addr query, addr selected) == addr scanu_env.entries[0]
+doAssert selected == 0
+connectInfo.channelDuration = 1'u32 shl 9
+selected = 0xFFFFFFFF'u32
+doAssert scanu_search_by_ssid(addr query, addr selected) == addr scanu_env.entries[1]
+doAssert selected == 1
+connectInfo.channelDuration = (1'u32 shl 9) or (1'u32 shl 10)
+selected = 0xFFFFFFFF'u32
+doAssert scanu_search_by_ssid(addr query, addr selected) == addr scanu_env.entries[1]
+doAssert selected == 1
+scanu_env.entries[1].securityType = 0
+scanu_env.entries[1].securityAuth = 1
+doAssert scanu_search_by_ssid(addr query, addr selected) == addr scanu_env.entries[1]
+scanu_env.entries[1].securityType = 0x0100
+scanu_env.entries[1].securityAuth = 0
+scanu_env.entries[1].securityAuthPointerPadding = 1
+selected = 0x12345678'u32
+doAssert scanu_search_by_ssid(addr query, addr selected) == nil
+doAssert selected == 0x12345678'u32
+connectInfo.channelDuration = 1'u32 shl 10
+selected = 0xFFFFFFFF'u32
+doAssert scanu_search_by_ssid(addr query, addr selected) == addr scanu_env.entries[0]
+doAssert selected == 0
+connectInfo.channelDuration = 1'u32 shl 9
+selected = 0xFFFFFFFF'u32
+doAssert scanu_search_by_ssid(addr query, addr selected) == addr scanu_env.entries[0]
+doAssert selected == 0
+free(raw)
 ''')
 
 

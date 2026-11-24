@@ -6,16 +6,28 @@ proc phy_channel_to_freq*(band: uint8; channel: cint): uint16 {.exportc, cdecl.}
       2484'u16
     else:
       (2407 + channel * 5).uint16
+  elif band == 1'u8:
+    if channel < 1 or channel > 165:
+      0xffff'u16
+    else:
+      (5000 + channel * 5).uint16
   else:
     0xffff'u16
 
 proc phy_freq_to_channel*(band: uint8; freq: uint16): uint8 {.exportc, cdecl.} =
   if band == PHY_BAND_2G4:
-    if freq < 2412'u16 or freq > 2484'u16:
-      0'u8
-    elif freq == 2484'u16:
+    if freq == 2484'u16:
       14'u8
+    elif freq < 2412'u16 or freq > 2472'u16 or
+        (freq - 2412'u16) mod 5'u16 != 0'u16:
+      0'u8
     else:
       ((freq - 2407'u16) div 5'u16).uint8
+  elif band == 1'u8:
+    if freq < 5005'u16 or freq > 5825'u16 or
+        (freq - 5005'u16) mod 5'u16 != 0'u16:
+      0'u8
+    else:
+      ((freq - 5000'u16) div 5'u16).uint8
   else:
     0'u8

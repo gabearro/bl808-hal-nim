@@ -495,6 +495,9 @@ type
   ScanRequest = object
     vifIdx: uint8
     sendProbe: uint32
+    ieBodyLen: uint16
+    addIeLen: uint32
+    channelCount: uint8
     channelList: array[2, Channel]
   ChanScanReqPayload = object
     vifIdx, band: uint8
@@ -502,27 +505,77 @@ type
     prim20Freq, center1Freq, center2Freq: uint16
     txPower: int8
   DsParam = object
+    id, len: uint8
     currentChannel: uint8
+  MacIeView = object
+    id, len: uint8
+  ScanProbeReqIeObj = object
+    endOffset, writeOffset: uint32
+    ieData: array[200, uint8]
 var
   scanRequest: ScanRequest
+  replacementRequest: ScanRequest
+  scanRequestEpoch: uint32
+  stateSets: int
+  channelRequests: int
   selected: ChanScanReqPayload
+  chanRequestHook: proc()
+  traceHook: proc(text: cstring)
+  scan_probe_req_ie: ScanProbeReqIeObj
+  foundLength: uint32
+  ieResult: pointer
   nimFwDbgScanReqChanMeta, nimFwDbgScanReqChanFreq: uint32
 const TASK_SCAN = 1'u8
-const ScanChannelPendingState = 1'u8
+const ScanChannelPendingState = 2'u8
 proc scanStartReqView(p: pointer): ptr ScanRequest = cast[ptr ScanRequest](p)
-proc nimFwTrace2U32(text: cstring; a, b: uint32) = discard
+proc activeScanReq(): ptr ScanRequest = scanStartReqView(scan_env.paramPtr)
+template scanProbeReqIeDataPtr(ie: var ScanProbeReqIeObj): pointer =
+  cast[pointer](addr ie.ieData[0])
+template scanProbeReqIeDataBase(ie: var ScanProbeReqIeObj): uint32 =
+  cast[uint32](cast[uint](addr ie.ieData[0]))
+proc mac_ie_find(ie: pointer; length, id: uint32): pointer =
+  doAssert ie == scanProbeReqIeDataPtr(scan_probe_req_ie) and id == 3
+  foundLength = length
+  ieResult
+proc nimFwTrace2U32(text: cstring; a, b: uint32) =
+  if traceHook != nil: traceHook(text)
 proc chanScanChannel(p: ptr ChanScanReqPayload): ptr ChanScanReqPayload = p
 proc dsParamSetIeAt(p: pointer): ptr DsParam = cast[ptr DsParam](p)
 proc packChannelMeta(p: ptr ChanScanReqPayload): uint32 = 0
 proc packChannelFreq(p: ptr ChanScanReqPayload): uint32 = 0
-proc chan_scan_req(p: ptr ChanScanReqPayload) = selected = p[]
-proc ke_state_set(task, state: uint8) = doAssert task == TASK_SCAN and state == ScanChannelPendingState
+proc chan_scan_req(p: ptr ChanScanReqPayload) =
+  inc channelRequests
+  selected = p[]
+  if chanRequestHook != nil: chanRequestHook()
+proc ke_state_set(task, state: uint8) =
+  doAssert task == TASK_SCAN and state == ScanChannelPendingState
+  inc stateSets
 '''
-    body = procedure((FW / "scan_station_ap_me.nim").read_text(), "scan_set_channel_request")
+    scan_source = (FW / "scan_station_ap_me.nim").read_text()
+    body = procedure(scan_source, "scanChannelValid")
+    body += procedure(scan_source, "scan_set_channel_request")
+    body += procedure(scan_source, "scan_ie_download")
+    body += procedure(scan_source, "scan_get_chan")
+    body += procedure(scan_source, "scan_get_scan_duration")
     run_program(tmp_path, mode, source() + platform + body + r'''
 setup()
+scanRequest.channelCount = 2
 scanRequest.channelList[0] = Channel(prim20Freq: 2412, txPower: 7)
 scan_env.paramPtr = addr scanRequest
+doAssert scan_get_scan_duration() == 0x35B60'u32
+scanRequest.addIeLen = 12345
+doAssert scan_get_scan_duration() == 12345'u32
+scanRequest.addIeLen = 0
+scan_env.channelIndex = 1
+doAssert scan_get_chan() == addr scanRequest.channelList[1]
+scan_env.channelIndex = 0
+doAssert scan_get_chan() == addr scanRequest.channelList[0]
+scan_env.channelIndex = scanRequest.channelCount
+doAssert scan_get_chan() == nil
+scanRequest.channelCount = 3
+doAssert scan_get_chan() == nil
+scanRequest.channelCount = 2
+scan_env.channelIndex = 0
 var passive = 11000'u32
 var active = 22000'u32
 var join = 33000'u32
@@ -531,9 +584,138 @@ cfg_api_element_set(1, 1, 7, addr active, nil)
 cfg_api_element_set(1, 2, 7, addr join, nil)
 for flags in [0'u8, 1, 2, 3]:
   for probing in [0'u32, 1]:
-    scanRequest.channelList[0].flags = flags
-    scanRequest.sendProbe = probing
-    scan_set_channel_request(nil)
-    let expected = if probing != 0: join elif (flags and 1) != 0: passive else: active
-    doAssert selected.duration == expected and selected.prim20Freq == 2412
+    for power in [-20'i8, -1'i8, 0'i8, 1'i8, 7'i8, 20'i8]:
+      scanRequest.channelList[0].flags = flags
+      scanRequest.channelList[0].txPower = power
+      scanRequest.sendProbe = probing
+      scan_set_channel_request()
+      let expected = if probing != 0: join elif (flags and 1) != 0: passive else: active
+      doAssert selected.duration == expected and selected.prim20Freq == 2412
+      doAssert selected.txPower == power
+
+var oldIe = DsParam(id: 3, len: 1, currentChannel: 91)
+var newIe = DsParam(id: 3, len: 1, currentChannel: 92)
+scanRequest.channelList[0] = Channel(band: 0, prim20Freq: 2412, txPower: 7)
+scan_env.chanInfoPtr = addr oldIe
+chanRequestHook = proc() =
+  doAssert oldIe.currentChannel == 91 and newIe.currentChannel == 92
+  scanRequest.channelList[0].prim20Freq = 2437
+  scan_env.chanInfoPtr = addr newIe
+scan_set_channel_request()
+doAssert selected.prim20Freq == 2412 and selected.txPower == 7
+doAssert oldIe.currentChannel == 91 and newIe.currentChannel == 1
+chanRequestHook = nil
+
+# Diagnostics must not read or submit a retired scan, nor mix channel fields
+# if a callback edits the same request in place.
+for tracePoint in ["[WIFI-NIMFW] scan_set start ", "[WIFI-NIMFW] scan_set chan "]:
+  scan_env.paramPtr = addr scanRequest
+  scan_env.channelIndex = 0
+  scanRequest.channelList[0] = Channel(band: 0, prim20Freq: 2412, txPower: 7)
+  let beforeRequests = channelRequests
+  let beforeStates = stateSets
+  traceHook = proc(text: cstring) =
+    if $text == tracePoint:
+      inc scanRequestEpoch
+      scan_env.paramPtr = addr replacementRequest
+  scan_set_channel_request()
+  doAssert channelRequests == beforeRequests and stateSets == beforeStates
+  traceHook = nil
+
+scan_env.paramPtr = addr scanRequest
+scanRequest.channelList[0] = Channel(band: 0, prim20Freq: 2412, txPower: 7)
+traceHook = proc(text: cstring) =
+  if $text == "[WIFI-NIMFW] scan_set start ":
+    scanRequest.channelList[0].prim20Freq = 2437
+    scanRequest.channelList[0].txPower = 19
+scan_set_channel_request()
+doAssert selected.prim20Freq == 2412 and selected.txPower == 7
+traceHook = nil
+
+scan_env.chanInfoPtr = addr oldIe
+scanRequest.channelList[0].band = 1
+for frequency in [4995'u16, 5000, 5005, 5006, 5825, 5830]:
+  scanRequest.channelList[0].prim20Freq = frequency
+  oldIe.currentChannel = 99
+  let previousRequests = channelRequests
+  let previousStates = stateSets
+  scan_set_channel_request()
+  let expectedChannel =
+    if frequency == 5005: 1'u8
+    elif frequency == 5825: 165'u8
+    else: 0'u8
+  if expectedChannel == 0:
+    doAssert channelRequests == previousRequests and stateSets == previousStates
+    doAssert oldIe.currentChannel == 99
+  else:
+    doAssert channelRequests == previousRequests + 1 and stateSets == previousStates + 1
+    doAssert selected.prim20Freq == frequency
+    doAssert oldIe.currentChannel == expectedChannel
+
+scanRequest.channelList[0] = Channel(band: 0, prim20Freq: 2413, txPower: 7)
+let previousRequests = channelRequests
+let previousStates = stateSets
+scan_set_channel_request()
+doAssert channelRequests == previousRequests and stateSets == previousStates
+scanRequest.channelList[0].prim20Freq = 2484
+scan_set_channel_request()
+doAssert channelRequests == previousRequests + 1 and stateSets == previousStates + 1
+
+scanRequest.channelList[0] = Channel(band: 0, prim20Freq: 2412, txPower: 7)
+scanRequest.ieBodyLen = 7
+scan_env.paramPtr = addr scanRequest
+var messageRequest = ScanRequest(ieBodyLen: 12)
+ieResult = addr oldIe
+scan_probe_req_ie.writeOffset = 77
+chanRequestHook = proc() = messageRequest.ieBodyLen = 19
+scan_ie_download(addr messageRequest)
+doAssert foundLength == 7
+doAssert oldIe.currentChannel == 1
+doAssert scan_probe_req_ie.writeOffset == 0
+doAssert scan_probe_req_ie.endOffset ==
+  scanProbeReqIeDataBase(scan_probe_req_ie) - 1 + 12'u32
+
+messageRequest.ieBodyLen = 12
+scan_probe_req_ie.writeOffset = 77
+scan_probe_req_ie.endOffset = 88
+chanRequestHook = proc() = messageRequest.ieBodyLen = 201
+scan_ie_download(addr messageRequest)
+doAssert scan_probe_req_ie.writeOffset == 0
+doAssert scan_probe_req_ie.endOffset ==
+  scanProbeReqIeDataBase(scan_probe_req_ie) - 1 + 12'u32
+scan_probe_req_ie.writeOffset = 77
+scan_ie_download(nil)
+doAssert scan_probe_req_ie.writeOffset == 77
+
+# A reentrant channel callback can replace the scan before the archive's
+# post-submission IE and state writes. The stale request must stop there.
+scan_env.paramPtr = addr scanRequest
+scan_env.chanInfoPtr = addr oldIe
+oldIe.currentChannel = 91
+newIe.currentChannel = 92
+let stateSetsBefore = stateSets
+chanRequestHook = proc() =
+  inc scanRequestEpoch
+  scan_env.paramPtr = addr replacementRequest
+  scan_env.chanInfoPtr = addr newIe
+scan_set_channel_request()
+doAssert stateSets == stateSetsBefore
+doAssert oldIe.currentChannel == 91 and newIe.currentChannel == 92
+
+scan_env.paramPtr = addr scanRequest
+scan_env.chanInfoPtr = addr oldIe
+scan_probe_req_ie.writeOffset = 77
+scan_probe_req_ie.endOffset = 88
+scan_ie_download(addr scanRequest)
+doAssert scan_probe_req_ie.writeOffset == 77
+doAssert scan_probe_req_ie.endOffset == 88
+
+chanRequestHook = nil
+scan_env.paramPtr = nil
+scan_set_channel_request()
+doAssert stateSets == stateSetsBefore
+scan_env.paramPtr = addr scanRequest
+scan_env.channelIndex = scanRequest.channelCount
+scan_set_channel_request()
+doAssert stateSets == stateSetsBefore
 ''')

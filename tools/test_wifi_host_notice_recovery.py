@@ -11,8 +11,10 @@ from test_wifi_tx_confirmation_handoff import source as handoff_source
 
 
 def source() -> str:
-    helpers = CHECKS.split("# A station restart", 1)[0]
-    code = handoff_source().replace(CHECKS, helpers, 1)
+    helpers = CHECKS.split("# The first unmasked boundary", 1)[0]
+    handoff = handoff_source()
+    assert helpers != CHECKS and CHECKS in handoff
+    code = handoff.replace(CHECKS, helpers, 1)
     code = """
 var failRate = -1
 var failTrace, failDrain: bool
@@ -22,7 +24,8 @@ var rateCalls: array[7, int]
     code = code.replace(old, r'''
 proc rc_update_counters(station: uint8; attempts, failures: uint32;
                         aggregate, retry: bool) {.raises: [Exception].} =
-  doAssert not interruptsEnabled
+  let saved = irqSave()
+  defer: irqRestore(saved)
   inc rateCalls[station]
   stationAttempts[station] += attempts
   if station.int == failRate:

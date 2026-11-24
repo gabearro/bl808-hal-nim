@@ -2,6 +2,7 @@ const
   WifiEventScanDone = 1'u32
   WifiConnStatusOff = 0'u
   WifiConnReasonOff = 2'u
+  WifiConnBssidOff = 4'u
   WifiDiscStatusOff = 0'u
   WifiDiscReasonOff = 2'u
   WifiBeaconSsidOff = 10'u

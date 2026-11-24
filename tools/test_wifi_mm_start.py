@@ -122,7 +122,8 @@ proc blSendMsg(hardware: ptr BlHw; p: pointer; flags: uint32;
 def source() -> str:
     wifi = FW.parent
     wire = wifi / "msg_tx/layout"
-    constants = "\n".join((wire / name).read_text() for name in [
+    constants = f'import "{wifi / "host_table_layout.nim"}"\n'
+    constants += "\n".join((wire / name).read_text() for name in [
         "task_ids.nim", "request_sizes.nim", "host_cmd.nim", "mm_me_payloads.nim", "message_ids.nim"
     ])
     constants += (wifi / "fw_constants/states.nim").read_text()
@@ -214,5 +215,5 @@ for previous in [1'u16, 2, 255]:
   doAssert mm_start_req_handler(addr message.payload[0]) == KeMsgConsumed
   doAssert events == @["state"] and confirmations.len == 0
   doAssert state == previous and ps.uapsdPeriod == 0xABABABAB'u32
-  doAssert assertions == @[("ke_state_get(dest_id) == MM_IDLE", "mm_task.c", 308)]
+  doAssert assertions == @[("ke_state_get(dest_id) == MM_IDLE", "module", 308)]
 ''')

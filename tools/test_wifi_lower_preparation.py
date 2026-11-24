@@ -8,6 +8,7 @@ import subprocess
 import pytest
 
 from test_wifi_disconnect_tx import procedure
+from test_wifi_message_allocation import run_program
 from test_wifi_tx_sequence import CHECKS as SEQUENCE_CHECKS, program_source
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -120,7 +121,7 @@ var
   keys: KeyList
 keys.pairwiseKey = addr keyValue
 for protocol in [0x8E88'u16, 0x0008'u16]:
-  for phase in ["lower", "append", "frame_trace", "copy", "buffer_trace", "header", "traffic", "ps"]:
+  for phase in ["lower", "append", "frame_trace", "copy", "buffer_trace", "header", "traffic"]:
     if protocol == 0x8E88 and phase == "header": continue
     if protocol == 0x0008 and phase in ["lower", "frame_trace"]: continue
     for change in 0 .. 2: # target VIF, target station, unrelated VIF
@@ -134,7 +135,7 @@ for protocol in [0x8E88'u16, 0x0008'u16]:
       txEnv = default(TxEnv)
       backup = default(typeof(backup))
       frames[0] = HostTxDescView(vifIdx: 1, staInfoIdx: 0, staIdx: 0,
-        hdrLen: 34, frameLen: protocol, seqPassthrough: 100,
+        hdrLen: 34, qosExtLen: 8, frameLen: protocol, seqPassthrough: 100,
         hwDesc: addr hw[0], queueFirst: cast[pointer](1), policy: addr templateBytes)
       frames[0].bufferPtrs[0] = 0x20000000
       frames[0].bufferLens[0] = 100
@@ -179,7 +180,7 @@ for protocol in [0x8E88'u16, 0x0008'u16]:
 reset()
 invalidated = false
 frames[0] = HostTxDescView(vifIdx: 1, staInfoIdx: 0, staIdx: 0,
-  hdrLen: 34, frameLen: 0x8E88, policy: addr templateBytes)
+  hdrLen: 34, qosExtLen: 8, frameLen: 0x8E88, policy: addr templateBytes)
 backup = default(typeof(backup))
 let prepared = txl_buffer_alloc(addr frames[0], 2, 0)
 doAssert prepared == addr links[0]
@@ -193,7 +194,7 @@ doAssert txl_buffer_alloc(addr frames[0], 2, 0) == nil
 doAssert backup[2].first == nil and interrupts
 
 # The no-host-marker route returns an internal lease, not a host confirmation.
-for phase in ["lower", "traffic", "ps"]:
+for phase in ["lower", "traffic"]:
   reset()
   invalidated = false
   released = 0
@@ -219,7 +220,8 @@ for scenario in 0 .. 1:
   fired = false
   let phase = if scenario == 0: "buffer_trace" else: "copy"
   frames[0] = HostTxDescView(vifIdx: 1, staInfoIdx: 0, staIdx: 0,
-    hdrLen: 34, frameLen: (if scenario == 0: 0x8E88'u16 else: 0xDD86'u16),
+    hdrLen: 34, qosExtLen: 8,
+    frameLen: (if scenario == 0: 0x8E88'u16 else: 0xDD86'u16),
     policy: addr templateBytes)
   backup = default(typeof(backup))
   onStage = proc(stage: string) =
@@ -252,7 +254,7 @@ for vif in [0'u8, 2, 255]:
 """
 
 
-def build_program() -> str:
+def build_program(checks: str = CHECKS) -> str:
     source = "type\n  CoListHdr = object\n    next: ptr CoListHdr\n  CoList = object\n    first, last: ptr CoListHdr\n" + program_source()
     source = source.replace("  HostTxDescView = object\n", "  HostTxDescView = object\n    link: CoListHdr\n")
     source = source.replace("var\n  sta_info_tab:", MODELS + "\nvar\n  sta_info_tab:")
@@ -289,11 +291,77 @@ proc nimFwConnectTrace2U32(s: string; a, b: uint32) =
         "txl_buffer_update_thd", "txl_cntrl_push"])
     names = set(re.findall(r"\bnimFwDbg\w+", functions))
     debug = "\nvar\n" + "".join(f"  {name}: uint32\n" for name in sorted(names) if f"  {name}:" not in source)
-    return source + debug + functions + SEQUENCE_CHECKS.split("proc checkTx(", 1)[0] + CHECKS
+    return source + debug + functions + SEQUENCE_CHECKS.split("proc checkTx(", 1)[0] + checks
+
+
+@pytest.mark.parametrize("mode", ["checked", "firmware"])
+@pytest.mark.parametrize("diagnostic", [False, True])
+def test_eapol_long_gi_preserves_buffer_policy(tmp_path: Path, mode: str, diagnostic: bool) -> None:
+    program = build_program(r'''
+let policy = [0xBADCAB1E'u32, 0x40, 1, 0x2000, 0xFFFF0704'u32,
+  0x80001207'u32, 0x80001007'u32, 0x80001A06'u32, 0x80000604'u32,
+  0x40, 0x40, 0x40, 0x50, 0x2200, 0x100]
+copyMem(addr templateBytes[0], unsafeAddr policy[0], sizeof(policy))
+for proto in [0x8E88'u16, 0x888E'u16, 0x0008'u16]:
+  reset()
+  links[0] = default(PreparedLink)
+  frames[0] = HostTxDescView(vifIdx: 1, staInfoIdx: 0, staIdx: 0,
+    hdrLen: 34, qosExtLen: 8, frameLen: proto, policy: addr templateBytes)
+  doAssert txlPrepareBuffer(addr frames[0], 0, 0) == addr links[0]
+  var actual, original: typeof(policy)
+  copyMem(addr actual[0], addr links[0].rateTemplate[0], sizeof(actual))
+  copyMem(addr original[0], addr templateBytes[0], sizeof(original))
+  var expected = policy
+  when defined(bl808WifiDiagEapolLongGi):
+    if proto != 0x0008'u16:
+      expected[5] = 0x80001007'u32
+      expected[7] = 0x80001806'u32
+  doAssert actual == expected and original == policy
+''')
+    defines = ("bl808WifiDiagEapolLongGi",) if diagnostic else ()
+    run_program(tmp_path, mode, program, defines=defines)
+
+
+@pytest.mark.parametrize("mode", ["checked", "firmware"])
+@pytest.mark.parametrize("diagnostic", [False, True])
+def test_eapol_cck_uses_existing_retry_pair(tmp_path: Path, mode: str, diagnostic: bool) -> None:
+    program = build_program(r'''
+for (firstRetry, lastRate) in [(0x80001007'u32, 0x80000400'u32),
+    (0x80001007'u32, 0x80000401'u32), (0x80001007'u32, 0x80000404'u32),
+    (0x80001007'u32, 0x80001400'u32), (0x80001007'u32, 0'u32),
+    (0x80001006'u32, 0x80000400'u32), (0x80001087'u32, 0x80000400'u32),
+    (0x8000040A'u32, 0x80000400'u32), (0x80000401'u32, 0x80000400'u32),
+    (0x8000040A'u32, 0x80000401'u32)]:
+  let policy = [0xBADCAB1E'u32, 0x40, 1, 0x2000, 0xFFFF0704'u32,
+    0x80001207'u32, firstRetry, 0x80001207'u32, lastRate,
+    0x40, 0x44, 0x48, 0x50, 0x2200, 0x100]
+  copyMem(addr templateBytes[0], unsafeAddr policy[0], sizeof(policy))
+  for proto in [0x8E88'u16, 0x888E'u16, 0x0008'u16]:
+    reset()
+    links[0] = default(PreparedLink)
+    frames[0] = HostTxDescView(vifIdx: 1, staInfoIdx: 0, staIdx: 0,
+      hdrLen: 34, qosExtLen: 8, frameLen: proto, policy: addr templateBytes)
+    doAssert txlPrepareBuffer(addr frames[0], 0, 0) == addr links[0]
+    var actual, original: typeof(policy)
+    copyMem(addr actual[0], addr links[0].rateTemplate[0], sizeof(actual))
+    copyMem(addr original[0], addr templateBytes[0], sizeof(original))
+    var expected = policy
+    if proto != 0x0008'u16 and lastRate == 0x80000400'u32:
+      when defined(bl808WifiDiagEapolCck):
+        for i in 5 .. 7: expected[i] = lastRate
+        for i in 9 .. 11: expected[i] = 0x50
+      else:
+        if firstRetry in [0x80001007'u32, 0x8000040A'u32]:
+          expected[6] = lastRate
+          expected[10] = 0x50
+    doAssert actual == expected and original == policy
+''')
+    defines = ("bl808WifiDiagEapolCck",) if diagnostic else ()
+    run_program(tmp_path, mode, program, defines=defines)
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-@pytest.mark.parametrize("mutation", [None, "lower_trace", "lower_header", "lower_traffic", "lower_ps",
+@pytest.mark.parametrize("mutation", [None, "lower_trace", "lower_header", "lower_traffic",
                                       "prepare_after_frame", "prepare_final", "frame_after_append", "frame_after_trace", "eager_queue",
                                       "lower_header_pair", "prepare_after_frame_pair", "frame_after_trace_pair"])
 def test_lower_preparation(tmp_path: Path, mode: str, mutation: str | None) -> None:
@@ -312,11 +380,11 @@ def test_lower_preparation(tmp_path: Path, mode: str, mutation: str | None) -> N
         assert program.count(body) == 1
         changed = body
         if fault.startswith("lower_"):
-            index = {"lower_trace": 1, "lower_header": 3, "lower_traffic": 4, "lower_ps": 5}[fault]
-            line = "  ensurePreparedSession()\n" if index in [1, 4, 5] else "    ensurePreparedSession()\n"
+            index = {"lower_trace": 1, "lower_header": 3, "lower_traffic": 4}[fault]
+            line = "  ensurePreparedSession()\n" if index in [1, 4] else "    ensurePreparedSession()\n"
             lines = body.splitlines(keepends=True)
             guards = [i for i, text in enumerate(lines) if text.strip() == "ensurePreparedSession()"]
-            assert len(guards) == 6 and lines[guards[index]] == line
+            assert len(guards) == 5 and lines[guards[index]] == line
             del lines[guards[index]]
             changed = "".join(lines)
         elif fault == "eager_queue":
@@ -325,14 +393,16 @@ def test_lower_preparation(tmp_path: Path, mode: str, mutation: str | None) -> N
             changed = body.replace(line, line + "  txlEnqueuePrepared(param, cast[pointer](bufLink), queueIdx)\n")
         elif fault == "prepare_after_frame":
             changed = body.replace("if not txlSessionCurrent(identity, desc) or desc.policy == nil:", "if desc.policy == nil:")
+        elif fault.startswith("frame_"):
+            lines = body.splitlines(keepends=True)
+            guards = [i for i, line in enumerate(lines) if line == "  ensureCurrentBuild()\n"]
+            assert len(guards) == 2
+            del lines[guards[0 if fault == "frame_after_append" else -1]]
+            changed = "".join(lines)
         else:
-            variable = "desc" if fault == "prepare_final" else "txDesc"
-            result = "nil" if fault == "prepare_final" else "false"
-            condition = f"not txlSessionCurrent(identity, {variable})"
-            if fault == "prepare_final": condition += " or not txSecurityCurrent(desc)"
-            guard = f"  if {condition}:\n    return{(' ' + result) if result else ''}\n"
-            assert body.count(guard) == (1 if fault == "prepare_final" else 2)
-            index = body.rfind(guard) if fault in ["prepare_final", "frame_after_trace"] else body.find(guard)
+            guard = "  if not txlSessionCurrent(identity, desc) or not txSecurityCurrent(desc):\n    return nil\n"
+            assert fault == "prepare_final" and body.count(guard) == 1
+            index = body.find(guard)
             changed = body[:index] + body[index + len(guard):]
         assert changed != body
         program = program.replace(body, changed)
@@ -353,9 +423,12 @@ def test_lower_preparation(tmp_path: Path, mode: str, mutation: str | None) -> N
                 assert program.count(first) == 1
                 program = program.replace(first, last, 1)
             else:
-                guard = "  if not txlSessionCurrent(identity, txDesc):\n    return false\n"
-                assert callee_body.count(guard) == 2
-                changed_callee = callee_body.replace(guard, "", 1)
+                guard = "  ensureCurrentBuild()\n"
+                lines = callee_body.splitlines(keepends=True)
+                guards = [i for i, line in enumerate(lines) if line == guard]
+                assert len(guards) == 2
+                del lines[guards[0]]
+                changed_callee = "".join(lines)
             program = program.replace(callee_body, changed_callee, 1)
     source.write_text(program)
     options = {"checked": [], "release": ["-d:release", "--assertions:on"],

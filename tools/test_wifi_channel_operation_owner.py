@@ -59,6 +59,7 @@ proc chan_switch_start(p: pointer) =
   doAssert interrupts == incomingIrq
   actions.add("switch")
 proc chan_goto_idle_cb() = actions.add("goto")
+proc chanProtectionCancel(p: pointer): pointer = nil
 proc chan_get_dominant_chan(): pointer = env.dominantCtxt
 proc chan_get_next_chan(): pointer = addr contexts[1]
 proc blmac_pwr_mgt_setf(value: uint32) =
@@ -70,8 +71,9 @@ proc regRead(address: uint): uint32 =
   actions.add("clock")
   invoke(onClock)
   10240
-proc ke_msg_send_basic(id: uint16; dest, src: uint8) =
-  doAssert interrupts == incomingIrq and id == 77 and dest == 1 and src == 255
+const MM_SCAN_CHANNEL_END_IND = 77'u16
+proc scanDwellPublish(id: uint16; slot: uint32) =
+  doAssert interrupts == incomingIrq and id == 77 and slot == chanCtxtEpochs[3]
   actions.add("message")
   invoke(onNotify)
 proc chanSwitchRetire(p: pointer) =
@@ -84,8 +86,10 @@ proc chan_cde_evt(p: pointer) = actions.add("cde")
 proc mm_force_idle_req(): bool =
   doAssert interrupts == incomingIrq
   actions.add("force")
+  inc txResetEpoch # mm_force_idle_req calls txl_reset before returning success.
   invoke(onForce)
   true
+proc chanForceIdle(): bool = mm_force_idle_req()
 proc mm_back_to_host_idle() = actions.add("host")
 proc chanBcnRequestClaim(p: pointer; taskId: uint8): bool = true
 proc chanBcnRequestFinish(p: pointer; status: uint8) = discard
@@ -220,6 +224,25 @@ for index in [3, 4]:
       elif count == 1: expected.add("switch")
       else: expected.add("cde")
       doAssert actions == expected and interrupts == irq
+      doAssert txResetEpoch == (count == 0).uint32
+''',
+    "idle_reset_epoch": r'''
+for irq in [false, true]:
+  for change in 0 .. 3:
+    setup(3, irq)
+    env.ctxtCount = 0
+    txResetEpoch = high(uint32)
+    onForce = proc() =
+      doAssert txResetEpoch == 0 # The one expected reset wrapped.
+      case change
+      of 1: inc txResetEpoch # Another reset during the callback.
+      of 2: env.ctxtCount = 1 # A new home channel now needs scheduling.
+      of 3: env.scheduledCtxt = addr contexts[1]
+      else: discard
+    chan_ctxt_op_evt(addr contexts[3])
+    var expected = @["pm", "message", "retire", "force"]
+    if change == 0: expected.add("host")
+    doAssert actions == expected and interrupts == irq
 ''',
     "clock_and_idle_replacement": r'''
 for irq in [false, true]:

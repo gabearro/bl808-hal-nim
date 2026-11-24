@@ -68,7 +68,8 @@ def source() -> str:
     code += layouts("PsEnvView") + PLATFORM
     for name in ["waitRegLowNibbleClear", "waitRegLowNibbleEquals"]:
         code += procedure(polling, name)
-    return code + procedure(kernel, "hal_machw_disable_int") + procedure(kernel, "hal_machw_reset")
+    return (code + "\nproc mmConfigCancelIdle() = discard\n"
+            + procedure(kernel, "hal_machw_disable_int") + procedure(kernel, "hal_machw_reset"))
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])

@@ -1,0 +1,9 @@
+package ox64:text@0.2.0;
+
+world returned-text {
+  import reply: func(value: string) -> string;
+  export message: func(value: string) -> string;
+  export encoded-length: func(value: string) -> u32;
+  export odd-empty: func() -> string;
+  export bad-surrogate: func() -> string;
+}

@@ -13,9 +13,9 @@ from test_wifi_frame_preparation import PLATFORM as FRAME_PLATFORM
 ROOT = Path(__file__).resolve().parents[1]
 FW = ROOT / "src/bl808/wifi/fw"
 
-PLATFORM = FRAME_PLATFORM.replace(
-    "vifIdx, staInfoIdx: uint8", "vifIdx, staInfoIdx, hdrLen, secTailLen: uint8"
-)
+_TX_INDICES = "vifIdx, staInfoIdx, staIdx: uint8"
+assert _TX_INDICES in FRAME_PLATFORM
+PLATFORM = FRAME_PLATFORM.replace(_TX_INDICES, "vifIdx, staInfoIdx, staIdx, hdrLen, secTailLen: uint8")
 PLATFORM = PLATFORM.replace("proc submit(p: pointer; ac: uint8): uint8 =",
     "var rejectSubmission: bool\nproc submit(p: pointer; ac: uint8): uint8 =").replace(
     "proc txl_cntrl_push_int(p: pointer; ac: uint8): uint8 = submit(p, ac)",
@@ -63,18 +63,22 @@ proc me_build_associate_rsp(buf: pointer; vif: uint8; status: uint16;
   if associationLength == 0: return 0
   body(buf, associationLength)
 proc meBuildProbeResponse(buf: pointer; vif: uint8; capacity: uint32;
-                          length: ptr uint16): uint32 =
+                          length, countryAt: ptr uint16): uint32 =
   doAssert expectedType == 0x50 and vif == 1 and length == nil
+  countryAt[] = 10
   probeCapacity = capacity
   if probeLength > capacity: return 0
   body(buf, probeLength)
-proc me_add_ie_customer(buf: pointer; data: pointer; length: uint32): uint32 =
+proc appendApFrameExtras(buf: pointer; built, countryAt, capacity: uint32;
+                         extras: ApFrameExtras): bool =
+  doAssert countryAt == 10 and capacity == 488
+  doAssert extras.data == (addr apm.securityIe[0]) and extras.length == apm.cryptoType.uint32
+  if extras.length == 0: return true
   inc customerCalls
-  doAssert data == (addr apm.securityIe[0]) and length == apm.cryptoType.uint32
-  for i in 0 ..< length.int:
-    cast[ptr UncheckedArray[uint8]](buf)[i] = apm.securityIe[i]
+  for i in 0 ..< extras.length.int:
+    cast[ptr UncheckedArray[uint8]](buf)[built.int + i] = apm.securityIe[i]
   if stage == "customer": observe("customer")
-  length
+  true
 proc failed(arg: pointer; status: uint32) {.cdecl.} =
   doAssert arg == (addr context) and status == 0x40000000'u32
   inc failureCalls
@@ -319,6 +323,7 @@ for irq in [false, true]:
     for extraByte in [0'u32, 1]:
       setup(irq)
       apm.cryptoType = customerLength
+      if customerLength == 64: apm.securityIe[1] = 62
       if customerLength <= 64:
         probeLength = 488 - customerLength.uint32 + extraByte
       build(0x50)
@@ -330,6 +335,11 @@ for irq in [false, true]:
         doAssert hostTxHwDescAt(currentFrame.hwDesc).frameLen == 516
       else:
         doAssert bodyCalls == 0 and co_list_cnt(addr frameEnv.freeList) == 1
+
+  setup(irq)
+  apm.securityIe[1] = 2 # Truncated TLV in a three-byte extras span.
+  build(0x50)
+  doAssert pushes == 0 and bodyCalls == 0 and failureCalls == 1
 
   # Invalid bindings must not allocate, inspect a body, or publish a frame.
   setup(irq, 0)
@@ -355,14 +365,16 @@ def test_ap_mlme_preparation(tmp_path: Path, mode: str) -> None:
         "txlFrameLeaseToken", "txlFrameLeaseMatches", "txlFrameIdentityCurrent", "txlFrameSessionCurrent",
         "txlCaptureFrameCallback", "txlFrameCallbackCurrent", "txlInvokeFrameCallback",
         "txlCaptureSession", "txlSessionCurrent", "txlStationAdmits", "txlFramePreparationCurrent",
-        "txl_frame_free_list_pop", "txl_frame_get", "txl_frame_release", "txl_frame_push",
+        "txl_frame_free_list_pop", "txl_frame_get", "txl_frame_release", "txlFramePushPrepared",
+        "txl_frame_push",
     ])
     management = (FW / "scan_station_ap_me.nim").read_text()
     functions += procedure(management, "apm_tx_cfm_handler")
+    functions += procedure(management, "readApFrameExtras")
     functions += procedure(management, "apm_send_mlme")
     layout = (FW / "layout_types.nim").read_text()
     declarations = "type\n"
-    for name in ["TxSessionIdentity", "MacDataFrameHeaderView", "ApmAssocStaAddIndPayload"]:
+    for name in ["TxSessionIdentity", "MacDataFrameHeaderView", "ApmAssocStaAddIndPayload", "ApFrameExtras"]:
         declarations += "  " + name + layout.split("  " + name, 1)[1].split("\n\n  ", 1)[0] + "\n"
     # The base platform also declares accessors for these headers.
     for name in ["MacQosDataFrameHeaderView", "MacCtsFrameHeaderView"]:

@@ -79,7 +79,10 @@ when not defined(bl808WifiNimFw):
 {.compile: LwipRoot & "/src/core/ipv4/ip4_addr.c".}
 {.compile: LwipRoot & "/src/core/ipv4/ip4_frag.c".}
 {.compile: LwipRoot & "/src/core/ipv4/icmp.c".}
-{.compile: LwipRoot & "/src/core/ipv4/dhcp.c".}
+when defined(bl808m0) and defined(bl808WifiNimFw) and defined(bl808WifiRealLwip):
+  {.compile: "src/bl808/kernel/lwip_wifi_smoke/dhcp_seeded.c".}
+else:
+  {.compile: LwipRoot & "/src/core/ipv4/dhcp.c".}
 
 # Netif
 {.compile: LwipRoot & "/src/netif/ethernet.c".}
@@ -224,6 +227,9 @@ proc netifSetMtu*(netif: ptr Netif, mtu: uint16) =
 proc netifSetFlags*(netif: ptr Netif, flags: uint8) =
   {.emit: "`netif`->flags = `flags`;".}
 
+proc netifFlags*(netif: ptr Netif): uint8 =
+  {.emit: "result = `netif`->flags;".}
+
 proc netifSetLinkOutput*(netif: ptr Netif, fn: NetifLinkOutputFn) =
   {.emit: "`netif`->linkoutput = (netif_linkoutput_fn)`fn`;".}
 
@@ -258,6 +264,9 @@ proc dhcpStart*(netif: ptr Netif): ErrT
 
 proc dhcpStop*(netif: ptr Netif)
   {.importc: "dhcp_stop", header: "lwip/dhcp.h".}
+
+proc dhcpSuppliedAddress*(netif: ptr Netif): uint8
+  {.importc: "dhcp_supplied_address", header: "lwip/dhcp.h", cdecl.}
 
 # =============================================================================
 # Raw API

@@ -18,11 +18,16 @@
 ##     -nographic -serial mon:stdio -serial file:/tmp/d0.txt \
 ##     -serial null -serial null
 
-import bl808/startup
+when defined(bl808UsbAnchorApp):
+  import bl808/flash
+  import bl808/kernel/fault
+  import bl808/kernel/usb_anchor_app_api
+else:
+  import bl808/startup, bl808/gpio, bl808/uart
 import bl808/core
 import bl808/mmio, bl808/memmap
 import bl808/ipc
-import bl808/glb, bl808/gpio, bl808/uart
+import bl808/glb
 import bl808/kernel/cps
 import bl808/kernel/ipcbridge
 
@@ -59,7 +64,58 @@ const
   JtagD0RunMagic   = 0x4430_5255'u32 # "D0RU"
   JtagD0RunPollLimit = 8_000_000
 
-var console: Uart
+when defined(bl808UsbAnchorApp):
+  const
+    AnchorD0TestFlashOffset = 0x000A_0000'u
+    AnchorD0TestCopyBytes = 64'u * 1024'u
+    AnchorLpTestFlashOffset = 0x000C_0000'u32
+    AnchorLpTestCopyBytes = 32'u * 1024'u
+    LpRamEntryFirstInsn = 0x3004_7073'u32 # csrci mstatus, 8
+
+  type AnchorConsole = object
+    api: ptr UsbAnchorAppApi
+    pending: array[4096, uint8]
+    first, count: int
+    overflow: bool
+
+  var console: AnchorConsole
+  var testsStarted: bool
+  proc NimMain() {.importc: "NimMain", cdecl.}
+
+  proc sendByte(c: var AnchorConsole; b: uint8): bool =
+    if c.count == c.pending.len:
+      c.overflow = true
+      return false
+    c.pending[(c.first + c.count) mod c.pending.len] = b
+    inc c.count
+    true
+
+  proc sendString(c: var AnchorConsole; message: string): bool =
+    for ch in message:
+      if not c.sendByte(ch.uint8): return false
+    true
+
+  proc sendLine(c: var AnchorConsole; message: string): bool =
+    c.sendString(message) and c.sendString("\r\n")
+
+  proc sendHex32(c: var AnchorConsole; value: uint32) =
+    const digits = "0123456789ABCDEF"
+    discard c.sendString("0x")
+    for nibble in countdown(7, 0):
+      discard c.sendByte(digits[((value shr (4 * nibble)) and 15).int].uint8)
+
+  proc flushConsole(c: var AnchorConsole) =
+    if c.overflow and c.count == 0:
+      c.overflow = false
+      discard c.sendLine("[FAIL] all-core USB console output overflow")
+    let available = min(c.count, c.pending.len - c.first)
+    if available == 0: return
+    let written = c.api.consoleWrite(addr c.pending[c.first], min(available, 96).uint32)
+    if written > 0:
+      c.first = (c.first + written.int) mod c.pending.len
+      c.count -= written.int
+else:
+  var console: Uart
 var passed = 0
 var failed = 0
 
@@ -205,8 +261,12 @@ proc testAll(): CpsVoidFuture {.cps.} =
   # ---- Phase 2: RPC to D0 (square) ----
   discard console.sendLine("[2/4] RPC to D0: square(3)...")
   await sleepMs(2000)  # give D0 time to initialize
-  let sq: uint32 = await ipcCallU32(RpcTagSquare, 3'u32)
-  check("square(3)", sq, 9)
+  try:
+    let sq: uint32 = await ipcCallU32(RpcTagSquare, 3'u32, timeoutMs = LpRpcTimeoutMs)
+    check("square(3)", sq, 9)
+  except CatchableError:
+    discard console.sendLine("  D0 RPC failed [FAIL]")
+    failed += 1
 
   # ---- Phase 3: RPC to LP (add) ----
   discard console.sendLine("[3/4] RPC to LP: add(7, 8)...")
@@ -269,23 +329,15 @@ proc testAll(): CpsVoidFuture {.cps.} =
     discard console.sendLine("=== ALL TESTS PASSED ===")
   else:
     discard console.sendLine("=== SOME TESTS FAILED ===")
+  when defined(bl808UsbAnchorApp):
+    holdLPReset()
+    holdD0Reset()
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-proc main() {.exportc, cdecl.} =
-  systemInit()
-
-  enablePeriphClock(periphUart0)
-  setMcuXclkSource(mcuXclkXtal)
-  setUartClock(true, uartClkXclk, 0)
-  gpioSetupUart(14, 15)
-  console = initUart(uart0, UartConfig(
-    baudRate: ConsoleBaud, dataBits: data8,
-    stopBits: stop1, parity: parityNone,
-  ), ConsoleClkHz)
-
+proc startTests() =
   discard console.sendLine("")
   discard console.sendLine("=== BL808 All-Core Integration Test (M0) ===")
   discard console.sendLine("")
@@ -293,7 +345,34 @@ proc main() {.exportc, cdecl.} =
   # Power on MM subsystem and release D0/LP cores
   mmPowerOn()
   clearLpDiagnostics()
-  when defined(bl808jtagram):
+  when defined(bl808UsbAnchorApp):
+    holdD0Reset()
+    holdLPReset()
+    # Anchor reboots can retain XRAM, but this test restarts both peers.
+    for mailbox in [XramM0toD0Req, XramM0toD0Resp, XramD0toM0Req, XramD0toM0Resp,
+                    XramM0toLPReq, XramM0toLPResp, XramLPtoM0Req, XramLPtoM0Resp]:
+      regWrite(mailbox, 0)
+    faultClearRecord()
+    fenceIo()
+    if d0FlashImageAvailable(AnchorD0TestFlashOffset):
+      loadD0ImageFromFlash(AnchorD0TestFlashOffset, AnchorD0TestCopyBytes)
+      releaseD0(forceLoad = false)
+    else:
+      discard console.sendLine("[FAIL] resident all-core D0 test image missing")
+      failed += 1
+    # Use the existing LP RAM layout; it is disjoint from app WRAM and
+    # does not need a second XIP mapping while the anchor owns flash.
+    if flashReadXip(AnchorLpTestFlashOffset) == LpRamEntryFirstInsn:
+      var offset = 0'u
+      while offset < AnchorLpTestCopyBytes:
+        regWrite(JtagLPEntryAddr + offset, flashReadXip(AnchorLpTestFlashOffset + offset.uint32))
+        offset += 4
+      fenceIo()
+      releaseLPAt(JtagLPEntryAddr)
+    else:
+      discard console.sendLine("[FAIL] resident all-core LP test image missing")
+      failed += 1
+  elif defined(bl808jtagram):
     releaseLP()
     releaseD0(forceLoad = false)
     discard console.sendLine("[diag] Switching JTAG mux to D0")
@@ -309,15 +388,55 @@ proc main() {.exportc, cdecl.} =
   printHex("  rtc_clock=", regRead(LpRtcClockReg))
   printHex("  reset=", regRead(LpResetReg))
   printHex("  sf_offset=", regRead(SfOffsetReg))
-  printHex("  xip0=", regRead(LpXipEntry))
+  when defined(bl808UsbAnchorApp):
+    printHex("  lp_ram0=", regRead(JtagLPEntryAddr))
+  else:
+    printHex("  xip0=", regRead(LpXipEntry))
   printHex("  status0=", sharedRead32(LpStatusAddr))
   printHex("  heartbeat0=", sharedRead32(LpHeartbeatAddr))
   printHex("  stage0=", sharedRead32(LpStageAddr))
 
-  heapInit()
-  schedulerInit()
-  ipcBridgeInit()
+  when defined(bl808UsbAnchorApp):
+    schedulerInit(pollingOnly = true)
+    ipcBridgeInit(pollingOnly = true)
+  else:
+    heapInit()
+    schedulerInit()
+    ipcBridgeInit()
 
   discard testAll()
 
-  runScheduler()
+when defined(bl808UsbAnchorApp):
+  proc anchorAppInit(api: ptr UsbAnchorAppApi): int32
+      {.exportc: "anchor_app_init", cdecl.} =
+    if api == nil or api.magic != UsbAnchorAppMagic or
+        api.version != UsbAnchorAppVersion or api.size < sizeof(UsbAnchorAppApi).uint16 or
+        api.registerConsole == nil or api.consoleWrite == nil or api.consoleRead == nil:
+      return AnchorStatusInvalid
+    heapInit()
+    NimMain()
+    console.api = api
+    api.registerConsole(UsbAnchorVirtualConsole, 0)
+
+  proc anchorAppPoll() {.exportc: "anchor_app_poll", cdecl.} =
+    if not testsStarted:
+      # Start once the host has opened the registered console and sent 'r'.
+      var command: uint8
+      if console.api.consoleRead(addr command, 1) != 1 or command != uint8('r'): return
+      testsStarted = true
+      startTests()
+    pollScheduler()
+    console.flushConsole()
+else:
+  proc main() {.exportc, cdecl.} =
+    systemInit()
+    enablePeriphClock(periphUart0)
+    setMcuXclkSource(mcuXclkXtal)
+    setUartClock(true, uartClkXclk, 0)
+    gpioSetupUart(14, 15)
+    console = initUart(uart0, UartConfig(
+      baudRate: ConsoleBaud, dataBits: data8,
+      stopBits: stop1, parity: parityNone,
+    ), ConsoleClkHz)
+    startTests()
+    runScheduler()

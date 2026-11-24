@@ -6,13 +6,19 @@
 #include <stddef.h>
 #include <stdint.h>
 
-void *memset(void *s, int c, size_t n) {
+#ifdef BL808_WIFI_MBEDTLS_HOT_OCRAM
+#define BL808_LIBC_RAM(name) __attribute__((section(".ramfunc.libc." #name)))
+#else
+#define BL808_LIBC_RAM(name)
+#endif
+
+BL808_LIBC_RAM(memset) void *memset(void *s, int c, size_t n) {
     unsigned char *p = (unsigned char *)s;
     while (n--) *p++ = (unsigned char)c;
     return s;
 }
 
-void *memcpy(void *dest, const void *src, size_t n) {
+BL808_LIBC_RAM(memcpy) void *memcpy(void *dest, const void *src, size_t n) {
     unsigned char *d = (unsigned char *)dest;
     const unsigned char *s = (const unsigned char *)src;
     while (n--) *d++ = *s++;

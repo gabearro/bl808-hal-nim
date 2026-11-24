@@ -40,6 +40,9 @@ proc macIeAt(p: uint): ptr MacIeView = cast[ptr MacIeView](p)
 proc totalLen(p: ptr MacIeView): uint = p.len.uint + 2
 template macIePayload(p: ptr MacIeView): ptr UncheckedArray[uint8] =
   cast[ptr UncheckedArray[uint8]](cast[uint](p) + 2)
+proc blOpsFunc(offset: int): pointer =
+  doAssert offset == 8
+  nil
 proc wmmParameterIeAt(p: pointer): ptr WmmParameterIeView = cast[ptr WmmParameterIeView](p)
 proc htCapIeAt(p: pointer): ptr HtCapIeView = cast[ptr HtCapIeView](p)
 proc meEnvView(): ptr typeof(management) = addr management
@@ -94,6 +97,8 @@ def source() -> str:
     code += PLATFORM
     mac = (FW / "mac_config_debug.nim").read_text()
     code += procedure(mac, "mac_ie_find") + procedure(mac, "mac_vsie_find")
+    code += scan[scan.index("type StaWmmParameters"):scan.index("proc isWmmParameterIe")]
+    code += procedure(scan, "isWmmParameterIe") + procedure(scan, "decodeStaWmmParameters")
     code += r'''
 proc apply(includeWmm = true; includeHt = true) =
   let vifView = addr vif
@@ -158,6 +163,7 @@ for haveWmm in [false, true]:
       doAssert apConfigView().securityFlags == haveWmm.uint32 + 2 * copiesHt.uint32
       if not haveWmm:
         for ac in 0 .. 3: doAssert vifApEdcaWord(apConfigView(), ac)[] == 0xA43
+        doAssert vif.wmmQosInfo == 0 and vif.wmmAcFlags == 0
       if copiesHt:
         doAssert ht.value.capInfo == 0x1234 and ht.value.ampduParams == 7
         for i in 0 ..< 16: doAssert ht.value.mcsSet[i] == (i + 1).uint8
@@ -167,4 +173,41 @@ for haveWmm in [false, true]:
       else:
         doAssert ht.value == originalHt
       guard()
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_wmm_uses_aci_when_records_are_reordered(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+setup(9)
+let wmm = wmmParameterIeAt(addr ies[0])
+swap(wmm.ac[0], wmm.ac[3])
+swap(wmm.ac[1], wmm.ac[2])
+apply()
+doAssert vifApEdcaWord(apConfigView(), 0)[] == 0xA47
+doAssert vifApEdcaWord(apConfigView(), 1)[] == 0xA43
+doAssert vifApEdcaWord(apConfigView(), 2)[] == 0x5E432
+doAssert vifApEdcaWord(apConfigView(), 3)[] == 0x2F322
+doAssert vif.wmmAcFlags == 10
+guard()
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_wmm_ignores_invalid_parameters_on_scan(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+for invalid in 0 ..< 5:
+  setup(15)
+  let wmm = wmmParameterIeAt(addr ies[0])
+  case invalid
+  of 0: wmm.version = 2
+  of 1: wmm.ie.len = 23
+  of 2: wmm.ac[2] = wmm.ac[0]
+  of 3: wmm.ac[0].setLe32(0xA401'u32)
+  else: wmm.ac[0].setLe32(0x4A03'u32)
+  apply()
+  doAssert vif.wmmQosInfo == 0 and vif.wmmAcFlags == 0
+  doAssert apConfigView().securityFlags == 0
+  for ac in 0 .. 3: doAssert vifApEdcaWord(apConfigView(), ac)[] == 0xA43
+  guard()
 ''')

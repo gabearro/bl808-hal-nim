@@ -13,9 +13,11 @@ var chanCtxtEpochs: array[5, uint32]
 var txResetEpoch: uint32
 var chanCtxtLinkEpochs: array[MAX_VIFS, uint32]
 proc smDeferredCancel() = discard
+proc smDeferredChannelUnlinked(vifIndex: uint8) = discard
 proc chanSwitchCancel(target: pointer = nil) = discard
 proc chanSwitchRetire(target: pointer) = discard
 proc chanBcnRequestReset() = discard
+proc scanDwellReset() = discard
 type
   CoListHdr = object
     next: ptr CoListHdr
@@ -215,6 +217,14 @@ for links in 1'u8 .. 2:
   doAssert env.ctxtCount == 2 and env.slotPeriod == 0x123400
   doAssert deleted[0] == (links == 1)
   doAssert events[^2..^1] == @[("tbtt", 0'u), ("power", cast[uint](addr contexts[0]))]
+
+for invalid in [MAX_VIFS.uint8, 255'u8]:
+  reset()
+  vif.chanCtxt = addr contexts[0]
+  contexts[0].linkCount = 1
+  chan_ctxt_unlink(invalid)
+  doAssert vif.chanCtxt == (addr contexts[0]) and contexts[0].linkCount == 1
+  doAssert events.len == 0 and env.ctxtCount == 0
 """
 
 
@@ -379,13 +389,17 @@ proc irqRestore(mask: uint32) =
   events.add(("unlock", 0'u))
 proc blmac_pwr_mgt_setf(value: uint32) = events.add(("pm", value.uint))
 proc chan_goto_idle_cb() = events.add(("goto-idle", 0'u))
+proc chanProtectionCancel(p: pointer): pointer = nil
 proc chan_conn_less_delay_prog() = events.add(("delay", 0'u))
-proc ke_msg_send_basic(id: uint16; dest, src: uint8) =
-  doAssert dest == 1 and src == 255
+const MM_SCAN_CHANNEL_END_IND = 77'u16
+proc scanDwellPublish(id: uint16; slot: uint32) =
+  doAssert id == MM_SCAN_CHANNEL_END_IND and slot == chanCtxtEpochs[3]
   events.add(("message", id.uint))
 proc mm_force_idle_req(): bool =
   events.add(("force-idle", 0'u))
+  inc txResetEpoch
   true
+proc chanForceIdle(): bool = mm_force_idle_req()
 proc mm_back_to_host_idle() = events.add(("host-idle", 0'u))
 proc chan_cde_evt(p: pointer) = events.add(("cde", cast[ptr uint8](p)[].uint))
 proc filterIrqEvents() =
@@ -430,9 +444,16 @@ for count in 0'u8 .. 1:
   contexts[0].status = 4
   chan_ctxt_op_evt(addr contexts[0])
   filterIrqEvents()
-  let target = if count == 0: addr contexts[0] else: addr contexts[1]
   doAssert contexts[0].status == 1
-  doAssert events == @[("switch", cast[uint](target))]
+  doAssert events == @[("switch", cast[uint](addr contexts[1]))]
+
+reset()
+env.ctxtCount = 0
+contexts[0].status = 4
+chan_ctxt_op_evt(addr contexts[0])
+filterIrqEvents()
+doAssert contexts[0].status == 1
+doAssert events == @[("switch", 0'u)]
 
 for marker in [3'u8, 4, 5, 255]:
   for count in 0'u8 .. 3:

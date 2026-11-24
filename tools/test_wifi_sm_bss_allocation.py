@@ -75,10 +75,10 @@ var
   state: uint16
   failures: seq[tuple[status, reason: uint16]]
   rxVifEpochs: array[2, uint32]
-  txResetEpoch: uint32
+  txResetEpoch, psModeBuildSerial: uint32
   stationEpochs: array[7, uint32]
   smTxSerials: array[2, uint32]
-  ps: tuple[uapsdPeriod: uint32]
+  ps: tuple[uapsdPeriod: uint32, flags, pendingCount: uint8, currentVif: pointer]
   interruptsEnabled = true
   allocationHook, freeHook, rateHook, stateHook, sendHook, failureHook: proc()
   meControlCommand, meControlReply: pointer
@@ -171,6 +171,8 @@ proc setup() =
   channel.band = 1
   vif = Vif(vifIdx: 1, staIdx: 2, wmmQosInfo: 128,
     bssid: [2'u8, 3, 4, 5, 6, 7], operChan: addr channel, beaconIntervalTu: 100)
+  vif.basicRates[0] = 1
+  vif.basicRates[1] = 12
   for ac in 0 ..< 4: cast[ptr uint32](addr vif.edcaParams[ac * 4])[] = 0x11223300'u32 + ac.uint32
   for ac in 1 ..< 4: cast[ptr uint32](addr vif.edcaParams[ac * 32])[] = 0xDEADBEEF'u32
   chan.currentCtxt = addr channel
@@ -195,18 +197,18 @@ CHECKS = r'''
 for failure in 1 .. 18:
   setup()
   failAt = failure
-  sm_set_bss_param(nil)
+  sm_set_bss_param()
   doAssert calls == 18 and allocated.len == 0 and sent.len == 0
   doAssert sm.pendingBssParams.first == nil and sm.pendingBssParams.last == nil
   doAssert state == 10 and stateChanges == 0 and rateBuilds == 0
   doAssert failures == @[(14'u16, 0xFFFF'u16)]
 
 setup()
-sm_set_bss_param(nil)
+sm_set_bss_param()
 doAssert calls == 18 and allocated.len == 18 and sent.len == 1 and state == 4
 while sm.pendingBssParams.first != nil:
   acknowledgeBss()
-  sm_send_next_bss_param(nil)
+  sm_send_next_bss_param()
 acknowledgeBss()
 let expected = [ME_SET_PS_DISABLE_REQ, MM_SET_BSSID_REQ, MM_SET_BASIC_RATES_REQ,
   MM_SET_BEACON_INT_REQ, MM_SET_EDCA_REQ, MM_SET_EDCA_REQ, MM_SET_EDCA_REQ,
@@ -227,10 +229,18 @@ setup()
 let original = ke_msg_alloc(0x777, TASK_MM, TASK_SM, 1)
 co_list_push_back(addr sm.pendingBssParams, keMsgHdrFromPayload(original))
 let before = calls
-sm_set_bss_param(nil)
+sm_set_bss_param()
 doAssert calls == before and sm.pendingBssParams.first == keMsgHdrFromPayload(original)
 discard co_list_pop_front(addr sm.pendingBssParams)
 ke_msg_free(keMsgHdrFromPayload(original))
+
+for count in [0'u8, 13'u8]:
+  setup()
+  vif.basicRates[0] = count
+  sm_set_bss_param()
+  doAssert calls == 0 and allocated.len == 0 and sent.len == 0
+  doAssert sm.pendingBssParams.first == nil and rateBuilds == 0
+  doAssert state == 10 and failures == @[(14'u16, 0xFFFF'u16)]
 '''
 
 
@@ -296,7 +306,7 @@ for point in 1..18:
     if calls == point:
       allocationHook = nil
       replaceCurrent()
-  sm_set_bss_param(nil)
+  sm_set_bss_param()
   doAssert state == 9 and sent.len == 0 and allocated.len == 1
   doAssert sm.pendingBssParams.first.id == 0x777
   finish()
@@ -306,7 +316,7 @@ setup()
 rateHook = proc() =
   rateHook = nil
   replaceCurrent()
-sm_set_bss_param(nil)
+sm_set_bss_param()
 doAssert state == 9 and sent.len == 0 and allocated.len == 1
 doAssert sm.pendingBssParams.first.id == 0x777
 finish()
@@ -316,7 +326,7 @@ setup()
 stateHook = proc() =
   stateHook = nil
   replaceCurrent()
-sm_set_bss_param(nil)
+sm_set_bss_param()
 doAssert state == 9 and sent.len == 0 and allocated.len == 1
 doAssert sm.pendingBssParams.first.id == 0x777
 finish()
@@ -325,8 +335,8 @@ finish()
 setup()
 allocationHook = proc() =
   allocationHook = nil
-  sm_set_bss_param(nil)
-sm_set_bss_param(nil)
+  sm_set_bss_param()
+sm_set_bss_param()
 doAssert state == 4 and allocated.len == 18 and sent.len == 1
 finish()
 ''',
@@ -349,7 +359,7 @@ for site in 0..2:
           invalidate()
     elif site == 1: rateHook = invalidate
     else: stateHook = invalidate
-    sm_set_bss_param(nil)
+    sm_set_bss_param()
     doAssert sent.len == 0 and allocated.len == 0
     doAssert sm.pendingBssParams.first == nil
     finish()
@@ -360,7 +370,7 @@ failAt = 4
 freeHook = proc() =
   freeHook = nil
   replaceCurrent()
-sm_set_bss_param(nil)
+sm_set_bss_param()
 doAssert state == 9 and sent.len == 0 and allocated.len == 1
 doAssert sm.pendingBssParams.first.id == 0x777
 doAssert failures.len == 0
@@ -375,7 +385,7 @@ for point in 1..18:
     doAssert sent.len == 0 and sm.pendingBssParams.first == nil
     failureHook = nil
     replaceCurrent()
-  sm_set_bss_param(nil)
+  sm_set_bss_param()
   doAssert failures == @[(14'u16, 0xFFFF'u16)] and state == 9
   finish()
 ''',
@@ -390,7 +400,7 @@ for site in 0..3:
   else:
     failAt = 4
     freeHook = replaceIndication
-  sm_set_bss_param(nil)
+  sm_set_bss_param()
   doAssert sm.connectIndMsg == addr otherIndication
   doAssert failures.len == 0 and sent.len == 0 and allocated.len == 0
   finish()
@@ -401,11 +411,11 @@ sendHook = proc() =
   doAssert state == 4
   acknowledgeBss()
   if sm.pendingBssParams.first != nil:
-    sm_send_next_bss_param(nil)
+    sm_send_next_bss_param()
   else:
     sm.connectInfo = addr replacement
     state = 9
-sm_set_bss_param(nil)
+sm_set_bss_param()
 doAssert sent.len == 9 and state == 9 and sm.connectInfo == addr replacement
 doAssert sm.pendingBssParams.first == nil
 finish()
@@ -420,10 +430,10 @@ for period in [0'u32, 100'u32]:
         vif.wmmQosInfo = qosFlag
         connection.qosInfo = qosMask
         chan.currentCtxt = if hasChannel: addr channel else: nil
-        sm_set_bss_param(nil)
+        sm_set_bss_param()
         while sm.pendingBssParams.first != nil:
           acknowledgeBss()
-          sm_send_next_bss_param(nil)
+          sm_send_next_bss_param()
         acknowledgeBss()
         doAssert sent.len == 9
         for ac in 0..3:
@@ -440,7 +450,7 @@ for enabled in [false, true]:
     setup()
     interruptsEnabled = enabled
     failAt = failure
-    sm_set_bss_param(nil)
+    sm_set_bss_param()
     doAssert interruptsEnabled == enabled
     finish()
 ''',
@@ -454,12 +464,12 @@ for bad in 0..5:
   of 3: vif.vifType = 2
   of 4: vif.staIdx = 7
   else: sm.connectIndMsg = nil
-  sm_set_bss_param(nil)
+  sm_set_bss_param()
   doAssert calls == 0 and stateChanges == 0 and sent.len == 0 and failures.len == 0
   finish()
 setup()
 vif.staIdx = 0xFF
-sm_set_bss_param(nil)
+sm_set_bss_param()
 doAssert calls == 18 and state == 4 and sent.len == 1
 finish()
 ''',

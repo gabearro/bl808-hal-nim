@@ -8,6 +8,8 @@
 ## changed from 0 to 1, never back.
 
 import mmio, memmap
+from std/bitops import countSetBits
+from std/volatile import volatileLoad
 
 # =============================================================================
 # eFuse register offsets
@@ -85,21 +87,43 @@ proc efuseReadBuffer*(startWord: uint32, buf: var openArray[uint32]) =
 # Common eFuse data locations
 # =============================================================================
 const
-  # MAC address location (6 bytes starting at word offset)
-  EfMacAddrWordOffset*   = 0x2C  # Words 0x2C-0x2D contain MAC address
+  EfMacAddrWordOffset*   = 0x05  # Region 0 Wi-Fi MAC and check bits
   EfChipIdWordOffset*    = 0x28  # Chip ID
   EfUserDataWordOffset*  = 0x40  # Start of user-programmable data
+  EfCtrl0Region0AutoLoadDone = 1'u32 shl 1
+  EfCtrl0Region0Busy = 1'u32 shl 2
+
+type EfuseWifiMacShadow = object
+  low: uint32
+  highAndCheck: uint32
+
+static:
+  doAssert sizeof(EfuseWifiMacShadow) == 8
+  doAssert EfMacAddrWordOffset * 4 + offsetof(EfuseWifiMacShadow, low) == 0x14
+  doAssert EfMacAddrWordOffset * 4 + offsetof(EfuseWifiMacShadow, highAndCheck) == 0x18
+
+func decodeEfuseWifiMac(words: EfuseWifiMacShadow): array[6, uint8] =
+  let high = words.highAndCheck and 0xFFFF'u32
+  let expectedZeros = (words.highAndCheck shr 16) and 0x3F'u32
+  let zeros = 48 - countSetBits(words.low) - countSetBits(high)
+  if zeros.uint32 != expectedZeros:
+    return
+  [
+    uint8(high shr 8), uint8(high and 0xFF'u32),
+    uint8(words.low shr 24), uint8((words.low shr 16) and 0xFF'u32),
+    uint8((words.low shr 8) and 0xFF'u32), uint8(words.low and 0xFF'u32)
+  ]
 
 proc efuseReadMacAddress*(mac: var array[6, uint8]) =
-  ## Read the factory-programmed WiFi MAC address.
-  let w0 = efuseReadWord(EfMacAddrWordOffset)
-  let w1 = efuseReadWord(EfMacAddrWordOffset + 1)
-  mac[0] = ((w0 shr 0) and 0xFF).uint8
-  mac[1] = ((w0 shr 8) and 0xFF).uint8
-  mac[2] = ((w0 shr 16) and 0xFF).uint8
-  mac[3] = ((w0 shr 24) and 0xFF).uint8
-  mac[4] = ((w1 shr 0) and 0xFF).uint8
-  mac[5] = ((w1 shr 8) and 0xFF).uint8
+  ## Read the boot-loaded factory Wi-Fi MAC, or zero if unavailable.
+  const statusMask = EfCtrl0Region0AutoLoadDone or EfCtrl0Region0Busy
+  if (regRead(EfCtrl0) and statusMask) != EfCtrl0Region0AutoLoadDone:
+    mac = default(typeof(mac))
+    return
+  let shadow = cast[ptr EfuseWifiMacShadow](EfDataBase + EfMacAddrWordOffset * 4)
+  mac = decodeEfuseWifiMac(EfuseWifiMacShadow(
+    low: volatileLoad(addr shadow.low),
+    highAndCheck: volatileLoad(addr shadow.highAndCheck)))
 
 proc efuseReadChipId*(): uint64 =
   ## Read the unique chip ID.

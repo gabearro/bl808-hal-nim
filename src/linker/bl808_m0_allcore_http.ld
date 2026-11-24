@@ -12,6 +12,7 @@
  *     MCU WRAM region. The D0 linkers (bl808_d0.ld / bl808_d0_ram.ld) PROVIDE
  *     __d0_sdh_adma_desc at ORIGIN(D0_SDH_DMA); the ASSERT below pins them
  *     together so M0's WiFi allocator never reclaims D0's live DMA target.
+ *   - WRAM 0x2204ec00..0x2204efff: all-core Wi-Fi SHA DMA scratch.
  *   - WRAM 0x2204f000..0x2204ffff: ramfunc.
  *   - OCRAM low 56 KB: secure M-mode runtime and stack.
  *   - OCRAM top 8 KB: enclave U-mode and shared service buffers.
@@ -41,9 +42,11 @@ MEMORY
     WASM_STAGE (rw): ORIGIN = 0x50010000, LENGTH = 64K
     WIFI_RAM (rw)  : ORIGIN = 0x22030000, LENGTH = 115K
     D0_SDH_DMA (rw): ORIGIN = 0x2204CC00, LENGTH = 8K
+    WIFI_SHA_DMA (rw): ORIGIN = 0x2204EC00, LENGTH = 1K
     URAM     (rwx) : ORIGIN = 0x6202E000, LENGTH = 4K
     SHARED   (rw)  : ORIGIN = 0x6202F000, LENGTH = 4K
     RAMFUNC  (rwx) : ORIGIN = 0x2204F000, LENGTH = 4K
+    WIFI_CACHED_EXEC (rx) : ORIGIN = 0x6204F440, LENGTH = 0xBC0
     RAM      (rwx) : ORIGIN = 0x62020000, LENGTH = 56K
 }
 
@@ -133,9 +136,17 @@ SECTIONS
         PROVIDE(__wifi_bss_end = .);
     } > WIFI_RAM
 
-    .bss (NOLOAD) : ALIGN(16)
+    .wifi_sha_dma (NOLOAD) : ALIGN(16)
+    {
+        *(.wifi_sha_dma .wifi_sha_dma.*)
+    } > WIFI_SHA_DMA
+
+    .bss (NOLOAD) : ALIGN(32)
     {
         _sbss = .;
+        /* Zeroed SD DMA scratch belongs in RAM, not the M0 flash payload. */
+        *(.sddma .sddma.*)
+        . = ALIGN(16);
         *(.ram_wifi_ctrl*)
         *(.bss .bss.*)
         *(.sbss .sbss.*)
@@ -216,8 +227,12 @@ ASSERT(__wifi_bss_end <= ORIGIN(WIFI_RAM) + LENGTH(WIFI_RAM),
        "M0 all-core HTTP WiFi WRAM overflow")
 ASSERT(ORIGIN(WIFI_RAM) + LENGTH(WIFI_RAM) <= ORIGIN(D0_SDH_DMA),
        "M0 all-core HTTP WiFi RAM overlaps D0 SDH DMA window")
-ASSERT(ORIGIN(D0_SDH_DMA) + LENGTH(D0_SDH_DMA) <= ORIGIN(RAMFUNC),
-       "D0 SDH DMA window overlaps M0 ramfunc")
+ASSERT(ORIGIN(D0_SDH_DMA) + LENGTH(D0_SDH_DMA) <= ORIGIN(WIFI_SHA_DMA),
+       "D0 SDH DMA window overlaps Wi-Fi SHA DMA window")
+ASSERT((ORIGIN(WIFI_SHA_DMA) & 1023) == 0 && LENGTH(WIFI_SHA_DMA) == 1024,
+       "Wi-Fi SHA DMA window must fit one WRAM permission block")
+ASSERT(ORIGIN(WIFI_SHA_DMA) + LENGTH(WIFI_SHA_DMA) <= ORIGIN(RAMFUNC),
+       "Wi-Fi SHA DMA window overlaps M0 ramfunc")
 /* Contract: D0 (bl808_d0.ld / bl808_d0_ram.ld) PROVIDEs
  *   __d0_sdh_adma_desc = ORIGIN(D0_SDH_DMA)            (0x2204CC00)
  *   __d0_sdh_adma_data = ORIGIN(D0_SDH_DMA) + 0x20
@@ -235,3 +250,6 @@ ASSERT(_ebss <= _sstack - 1024,
        "M0 all-core HTTP secure BSS leaves less than 1 KB stack guard")
 ASSERT(_sstack == ORIGIN(RAM) + LENGTH(RAM) - _stack_top_reserve - _stack_size,
        "M0 all-core HTTP stack is not placed below reserve at top of secure WRAM")
+
+PROVIDE(__wifi_sha_dma_start = ORIGIN(WIFI_SHA_DMA));
+PROVIDE(__wifi_sha_dma_end = ORIGIN(WIFI_SHA_DMA) + LENGTH(WIFI_SHA_DMA));

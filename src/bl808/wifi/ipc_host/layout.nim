@@ -43,8 +43,8 @@ const
   SharedMsgBodyOff = 4'u
   SharedMsgBodySize = 127'u32 * 4'u32
   SharedPatternAddrOff = 512'u
-  SharedTxbufOff = 516'u
-  SharedTxbufSize = 1604'u
+  SharedTxbufOff* = 516'u
+  SharedTxbufSize* = 1604'u
   SharedTxdesc0Off = 6932'u
   SharedTxdescHostSize = 620'u
   SharedListFreeOff = 9412'u

@@ -2,6 +2,21 @@
 #                   RX LAYER (rxl_*)
 # ###########################################################################
 
+when defined(bl808WifiDirectCsiProbe):
+  const DirectCsiProbeSlots = 64
+  var nimFwDirectCsiRxCount* {.wifiCtrl, exportc: "nimfw_direct_csi_rx_count".}: uint32
+  var nimFwDirectCsiDataCount* {.wifiCtrl, exportc: "nimfw_direct_csi_data_count".}: uint32
+  var nimFwDirectCsiFc* {.wifiCtrl, exportc: "nimfw_direct_csi_fc".}:
+    array[DirectCsiProbeSlots, uint32]
+  var nimFwDirectCsiCtl* {.wifiCtrl, exportc: "nimfw_direct_csi_ctl".}:
+    array[DirectCsiProbeSlots, uint32]
+  var nimFwDirectCsiStat* {.wifiCtrl, exportc: "nimfw_direct_csi_stat".}:
+    array[DirectCsiProbeSlots, uint32]
+  var nimFwDirectCsiWin0* {.wifiCtrl, exportc: "nimfw_direct_csi_win0".}:
+    array[DirectCsiProbeSlots, uint32]
+  var nimFwDirectCsiHash* {.wifiCtrl, exportc: "nimfw_direct_csi_hash".}:
+    array[DirectCsiProbeSlots, uint32]
+
 proc nimFwRxDmaAfterInitProbe*() {.exportc, cdecl, noinline.} =
   {.emit: "asm volatile(\"nop\" ::: \"memory\");".}
 
@@ -296,12 +311,13 @@ proc rxl_hd_append*(desc: pointer) {.exportc, cdecl.} =
     appendDesc = cast[pointer](envCur)
   let hd = rxHeaderHwDescView(appendDesc)
   rxForgetStation(appendDesc)
-  hd.next = nil
+  const nextOffset = offsetof(RxHeaderHwDescView, next).uint
+  wifiDmaStoreLink(appendDesc, nextOffset, nil)
   hd.bufferAddr = 0
   let lastPtr = env.submittedTail
   hd.flags = 0
   cast[ptr uint16](addr hd.tsfLow)[] = 0'u16
-  rxHeaderHwDescView(lastPtr).next = appendDesc
+  wifiDmaStoreLink(lastPtr, nextOffset, appendDesc)
   machwRxDmaTrigger(0x01000000'u32)
   let firstPtr = env.submittedHead
   env.submittedTail = appendDesc
@@ -320,6 +336,7 @@ proc rxl_pd_append*(swdesc: pointer, prevDesc: pointer, pddesc: pointer) {.expor
   let env = rxHwDescEnvView()
   let hwPdHead = machwRxHwPdHead()
   let currentDesc = env.pdCurrent
+  const nextOffset = offsetof(RxDmaProgressDescView, next).uint
   var submittedHead = swdesc
   var statusDesc = pddesc
   var submittedTail = pddesc
@@ -332,13 +349,13 @@ proc rxl_pd_append*(swdesc: pointer, prevDesc: pointer, pddesc: pointer) {.expor
     statusDesc = currentDesc
     submittedHead = currentDesc
     if prevDesc != nil:
-      rxDmaProgressDescAt(currentDesc).next = swdesc
+      wifiDmaStoreLink(currentDesc, nextOffset, swdesc)
       submittedTail = prevDesc
     else:
       submittedTail = currentDesc
   rxDmaProgressDescAt(statusDesc).status = 0
-  rxDmaProgressDescAt(submittedTail).next = nil
-  rxDmaProgressDescAt(env.pdTail).next = submittedHead
+  wifiDmaStoreLink(submittedTail, nextOffset, nil)
+  wifiDmaStoreLink(env.pdTail, nextOffset, submittedHead)
   machwRxDmaTrigger(0x02000000'u32)
   env.pdTail = submittedTail
 
@@ -430,7 +447,7 @@ proc rxInvalidateVif(vifIdx: uint8): bool =
   rxInvalidateQuiescentVif(vifIdx, selected)
   true
 
-proc rxCaptureStation(desc: pointer; flags: uint32) =
+proc rxCaptureStation(desc: pointer; flags: uint32; statusWord: ptr uint32 = nil) =
   let saved = irqSave()
   defer: irqRestore(saved)
   let index = rxMpduDescIndex(desc)
@@ -440,14 +457,18 @@ proc rxCaptureStation(desc: pointer; flags: uint32) =
   var identity = RxStationIdentity(captured: true, station: 0xFF, vif: 0xFF,
     vifEpochs: rxVifEpochs,
     keyRevision: rxKeyRevision,
-    associated: (flags and 0x02000000'u32) != 0 or
-                (flags and 0x20020000'u32) == 0x20020000'u32)
+    associated: (flags and 0x02000000'u32) != 0)
   if identity.associated:
     let hardwareStation = (flags shr 15) and 0x3FF'u32
     if hardwareStation >= 8 and hardwareStation < 8 + STA_INFO_TAB_ENTRIES.uint32:
       let station = (hardwareStation - 8).uint8
       let sta = staInfoForIdx(station)
-      if sta.valid != 0 and sta.instNbr < MAX_VIFS.uint8:
+      if sta.valid == 0 and statusWord != nil:
+        # Match BL808 rxl_cntrl_evt+0x11a..0x12c for a slot already invalid
+        # at harvest. A slot retired after harvest must instead fail its epoch check.
+        identity.associated = false
+        statusWord[] = flags and not 0x02000000'u32
+      elif sta.valid != 0 and sta.instNbr < MAX_VIFS.uint8:
         identity.station = station
         identity.vif = sta.instNbr
         identity.epoch = staDeleteEpoch(station)
@@ -517,15 +538,29 @@ proc rxBindVif(desc: pointer; vifIdx: uint8): bool =
   identity.vif = vifIdx
   rxIdentityCurrent(identity[])
 
-proc rxMgtMessageCurrent(header: pointer): bool =
+proc rxMgtMessageCurrent(header: pointer; protection: ptr RxMgtProtection = nil): bool =
   let saved = irqSave()
   defer: irqRestore(saved)
+  when defined(bl808WifiDiagPeerRxAdmission):
+    if protection != nil: protection[] = rxMgtProtectionUnknown
   var node = rxMgtIdentities
   while node != nil:
     if node.message == header:
-      return rxIdentityCurrent(node.identity)
+      result = rxIdentityCurrent(node.identity)
+      when defined(bl808WifiDiagPeerRxAdmission):
+        if result and protection != nil: protection[] = node.identity.mgmtProtection
+      return
     node = node.next
   true
+
+proc rxMgtNoteProtection(desc: pointer; generation: uint32; protection: RxMgtProtection) =
+  when defined(bl808WifiDiagPeerRxAdmission):
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    let index = rxMpduDescIndex(desc)
+    if index >= 0 and rxUploadCurrent(desc, generation) and
+        rxIdentityCurrent(rxStationIdentities[index]):
+      rxStationIdentities[index].mgmtProtection = protection
 
 proc rxMgtForget(header: pointer) =
   let saved = irqSave()
@@ -536,6 +571,11 @@ proc rxMgtForget(header: pointer) =
       link[] = link[].next
       return
     link = addr link[].next
+
+proc rxMgtIdentityAt(payload: pointer; payloadLength: uint32): ptr RxMgtIdentityNode =
+  const mask = alignof(RxMgtIdentityNode).uint - 1
+  let start = cast[uint](payload) + payloadLength.uint + KeMsgTailSlack.uint
+  cast[ptr RxMgtIdentityNode]((start + mask) and not mask)
 
 proc rxMgtAllocMessage(frame: pointer; destination: uint8;
                       payloadLength: uint32): pointer =
@@ -557,10 +597,8 @@ proc rxMgtAllocMessage(frame: pointer; destination: uint8;
     extra = KeMsgTailSlack + alignment - 1 + nodeSize
   if payloadLength > high(uint32) - extra:
     return nil
-  # Leave the rounded-copy slack intact; metadata is outside the wire payload.
-  let nodeOffset = (payloadLength + KeMsgTailSlack + alignment - 1) and
-                   not (alignment - 1)
-  result = ke_msg_alloc(RXU_MGT_IND, destination, TASK_RXU, nodeOffset + nodeSize)
+  # The RV32 kernel header need not preserve the allocator's alignment.
+  result = ke_msg_alloc(RXU_MGT_IND, destination, TASK_RXU, payloadLength + extra)
   if result == nil:
     return
   let header = keMsgHdrFromPayload(result)
@@ -571,7 +609,7 @@ proc rxMgtAllocMessage(frame: pointer; destination: uint8;
     defer: irqRestore(saved)
     current = rxUploadCurrent(frame, generation) and rxIdentityCurrent(identity)
     if current:
-      let node = cast[ptr RxMgtIdentityNode](cast[uint](result) + nodeOffset.uint)
+      let node = rxMgtIdentityAt(result, payloadLength)
       node.message = cast[pointer](header)
       node.identity = identity
       node.next = rxMgtIdentities
@@ -612,6 +650,10 @@ proc rxPayloadChainBounds(head: pointer; previous, last: var pointer): uint8 =
     current = payload.next
   0
 
+proc rxBeaconLengthSupported(length: uint16): bool {.inline.} =
+  # Beacon MAC header plus the unencrypted management body (no FCS).
+  length <= 24'u16 + 2304'u16
+
 proc rxAdmitMpdu(desc: pointer; header: var ptr RxSwDescView): RxFrameAdmission =
   header = rxMpduHeader(desc)
   if header == nil or header.uploadDone != 0 or (header.hwFlags and 0x4000) == 0:
@@ -643,8 +685,12 @@ proc rxAdmitMpdu(desc: pointer; header: var ptr RxSwDescView): RxFrameAdmission 
       ((frameControl and 8) == 0 and (frameControl and 0x0300) != 0) or
       headerLength == 0 or length < headerLength.uint32:
     return rxFrameDrop
-  if (frameControl and 0x00FC) == 0x0080 and length < headerLength.uint32 + 12:
+  # Allow the supported management body, MAC header, and security overhead.
+  if (frameControl and 0xC) == 0 and length > 2352:
     return rxFrameDrop
+  if (frameControl and 0x00FC) == 0x0080:
+    if length < headerLength.uint32 + 12 or not rxBeaconLengthSupported(length.uint16):
+      return rxFrameDrop
   rxFrameReady
 
 proc rxFrameCurrent(identity: RxFrameIdentity): bool =
@@ -687,6 +733,43 @@ proc rxCaptureFrameHeader(header, vifEntry, staEntry: pointer): RxFrameIdentity 
       cast[pointer](vifChannelForIdx(station.vif)) != vifEntry:
     return
   result = rxCaptureFrame(descriptor)
+
+proc rxOpenBeaconView(identity: RxFrameIdentity): RxBeaconView =
+  ## Parse through a contiguous copy without changing DMA ownership or links.
+  const segmentSize = sizeof(RxPayloadBufferView)
+  if not rxBeaconLengthSupported(identity.length) or not rxFrameCurrent(identity):
+    return
+  if identity.length.int <= segmentSize:
+    return RxBeaconView(data: identity.frame)
+  let allocate = cast[proc(size: uint32): pointer {.cdecl.}](blOpsFunc(184))
+  let release = cast[proc(data: pointer) {.cdecl.}](blOpsFunc(188))
+  if allocate == nil or release == nil: return
+  let storage = allocate(identity.length.uint32)
+  if storage == nil: return
+  block copySplitBeacon:
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    if not rxFrameCurrent(identity): break copySplitBeacon
+    var previous, last: pointer
+    if rxPayloadChainBounds(identity.payload, previous, last) != 2:
+      break copySplitBeacon
+    for descriptor in [identity.payload, last]:
+      if not rxPayloadBufferValid(descriptor): break copySplitBeacon
+      let payload = cast[ptr RxPayloadHwDescView](descriptor)
+      if payload.usedFlag != 0 or payload.bufferStart != payload.bufferAddr:
+        break copySplitBeacon
+    let firstBytes = addr rxPayloadBufferAt(rxPayloadDescIndex(identity.payload)).payloadBytes[0]
+    let lastBytes = addr rxPayloadBufferAt(rxPayloadDescIndex(last)).payloadBytes[0]
+    copyMem(storage, firstBytes, segmentSize)
+    copyMem(cast[pointer](cast[uint](storage) + segmentSize.uint), lastBytes,
+            identity.length.int - segmentSize)
+    return RxBeaconView(data: storage, release: release)
+  release(storage)
+
+proc rxCloseBeaconView(view: var RxBeaconView) =
+  let owned = view
+  view = default(RxBeaconView)
+  if owned.release != nil: owned.release(owned.data)
 
 proc rxl_mpdu_free*(desc: pointer) {.exportc, cdecl.} =
   ## Recycle a complete RX frame. Corrupt chains request recovery without
@@ -848,14 +931,6 @@ proc rxlHandleApPowerSave(vif: ptr VifChannelView; sta: ptr StaInfoView;
       return
   let hdr = macDataFrameAt(frame)
   let frameCtrl = hdr.frameControl
-  let qos =
-    if (frameCtrl and 0x008C'u16) != 0x0088'u16: 0'u16
-    elif (frameCtrl and 0x0300'u16) == 0x0300'u16:
-      macQos4AddrFrameAt(frame).qosCtrl
-    else:
-      macQosDataFrameAt(frame).qosCtrl
-  if (qos and 0x0F'u16) >= 8:
-    return
   let vifEntry = cast[pointer](vif)
   let staEntry = cast[pointer](sta)
   let bcmcStaIdx = (vif.vifIdx + 5).uint8
@@ -898,6 +973,13 @@ proc rxlHandleApPowerSave(vif: ptr VifChannelView; sta: ptr StaInfoView;
 
   if (frameCtrl and 0x008C'u16) != 0x0088'u16:
     return
+  let qos =
+    if (frameCtrl and 0x0300'u16) == 0x0300'u16:
+      macQos4AddrFrameAt(frame).qosCtrl
+    else:
+      macQosDataFrameAt(frame).qosCtrl
+  if (qos and 0x0F'u16) >= 8:
+    return
   let tid = (qos and 0x0F).uint8
   let ac = mac_tid2ac[tid]
   if (mac_ac2uapsd[ac] and sta.psState) == 0 or (sta.psStatus and 6) != 0:
@@ -912,30 +994,45 @@ proc rxlHandleApPowerSave(vif: ptr VifChannelView; sta: ptr StaInfoView;
     sta.psStatus = 0
     return
 
-  let packetBudget = sta.uapsdBitmap
+  var remaining = sta.uapsdBitmap
   if (sta.trafficFlags and 8) != 0:
     sta.psStatus = 2
     expectedService = 2
-    let sent = sta_mgmt_send_postponed_frame(vifEntry, staEntry, packetBudget.uint32)
+    let sent = sta_mgmt_send_postponed_frame(vifEntry, staEntry, remaining.uint32)
     ensureCurrentService()
-    if packetBudget != 0 and sent >= packetBudget.uint32:
-      discard txl_frame_send_qosnull_frame(identity.station, tid.uint16 or 0x10'u16, nil, 0)
-      ensureCurrentService()
-      sta.psStatus = 0
-      return
+    if remaining != 0:
+      if sent >= remaining.uint32:
+        discard txl_frame_send_qosnull_frame(identity.station, tid.uint16 or 0x10'u16, nil, 0)
+        ensureCurrentService()
+        sta.psStatus = 0
+        return
+      remaining -= sent.uint8
 
   # The drain can change traffic availability, so reload it before deciding
-  # whether the host must supply the rest of the service period.
+  # whether the host must supply the rest. Zero denotes an unlimited budget.
   if (sta.trafficFlags and 4) != 0:
     sta.psStatus = 4
     expectedService = 4
-    if not rxlRequestBufferedTraffic(identity, packetBudget, true):
+    if not rxlRequestBufferedTraffic(identity, remaining, true):
       ensureCurrentService()
       sta.psStatus = 0
   else:
     discard txl_frame_send_qosnull_frame(identity.station, tid.uint16 or 0x10'u16, nil, 0)
     ensureCurrentService()
     sta.psStatus = 0
+
+proc rxlObserveStaWmm(desc: pointer; vif: ptr VifChannelView; sta: ptr StaInfoView;
+                     frameData: pointer) =
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if smActivation.active and smActivation.owner.identity.vif == vif.vifIdx:
+    return
+  let identity = rxCaptureFrame(desc)
+  var channel: array[2, uint32]
+  if not rxFrameCurrent(identity) or not rxReadCapturedChannel(desc, channel): return
+  let frame = if frameData != nil: frameData else: identity.frame
+  if updateStaWmmFromBeacon(vif, sta, frame, identity.length, (channel[0] shr 16).uint16):
+    mmRequestStaEdcaRefresh(vif)
 
 proc rxl_cntrl_evt*() {.exportc, cdecl.} =
   ## Drain at most four queued MPDUs, matching the vendor's pre-decremented
@@ -960,7 +1057,6 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
     if not recoveryRequested and cntrlEnv.processingFlag == 0 and
         cntrlEnv.queue.first != nil:
       ke_evt_set(0x00100000'u32)
-  let hwFlagsClearMask = 0xFDFFFFFF'u32  # ~0x02000000
   inc nimFwDbgRxlCntrlEvt
   nimFwDbgRxlCntrlHead = pointerAddrU32(cast[pointer](cntrlEnv.queue.first))
 
@@ -1030,7 +1126,7 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
     let frameIdentity = rxCaptureFrame(queuedRxMpduDesc)
     if frameIdentity.generation != frameGeneration:
       continue
-    var hwFlags = sw.hwFlags
+    let hwFlags = sw.hwFlags
     var staIdx: uint8 = 0
     var sta: ptr StaInfoView = nil
     var staEntry: pointer = nil
@@ -1050,6 +1146,22 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
       let dbgFc =
         if dbgPayload != nil: cast[ptr uint16](dbgPayload)[].uint32
         else: 0'u32
+      when defined(bl808WifiDirectCsiProbe):
+        let rxNumber = nimFwDirectCsiRxCount
+        inc nimFwDirectCsiRxCount
+        if (dbgFc and 0x000C'u32) == 0x0008'u32:
+          inc nimFwDirectCsiDataCount
+        if rxNumber < DirectCsiProbeSlots.uint32:
+          nimFwDirectCsiFc[rxNumber] = dbgFc
+          nimFwDirectCsiCtl[rxNumber] = regRead(0x24C008F8'u)
+          nimFwDirectCsiStat[rxNumber] = regRead(0x24C00064'u)
+          nimFwDirectCsiWin0[rxNumber] = regRead(0x24C09000'u)
+          if (nimFwDirectCsiStat[rxNumber] and 1'u32) != 0'u32:
+            var checksum = 0x811C9DC5'u32
+            for word in 0'u ..< 52'u:
+              checksum = (checksum xor regRead(0x24C09000'u + word * 4'u)) *
+                0x01000193'u32
+            nimFwDirectCsiHash[rxNumber] = checksum
       inc nimFwDbgRxlFrameSeen
       nimFwDbgRxlLastHwFlags = hwFlags
       nimFwDbgRxlLastFc = dbgFc
@@ -1060,9 +1172,24 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
         inc nimFwDbgRxlAuthLikeSeen
         nimFwDbgRxlAuthLikeHwFlags = hwFlags
         nimFwDbgRxlAuthLikeFc = dbgFc
+      when defined(bl808WifiProbeReplyDiag):
+        # Capture before upper RX routing can discard or recycle the MPDU.
+        if (dbgFc and 0x00FF'u32) == 0x50 and sw.mpduLengthBytes >= 36:
+          let probe = macDataFrameAt(dbgPayload)
+          if (probe.addr1[0] and 1) == 0 and probe.addr1 != default(typeof(probe.addr1)):
+            for index in 0'u8 ..< MAX_VIFS.uint8:
+              if probe.addr1 == vifChannelForIdx(index).macAddr:
+                var channel: array[2, uint32]
+                if rxReadCapturedChannel(queuedRxMpduDesc, channel):
+                  let slot = nimFwDbgProbeReplyCount mod nimFwDbgProbeReplySamples.len.uint32
+                  nimFwDbgProbeReplySamples[slot] = [macAddrWord0(addr probe.addr3),
+                    probe.addr3[4].uint32 or (probe.addr3[5].uint32 shl 8) or
+                    (channel[0] and 0xFFFF0000'u32)]
+                  inc nimFwDbgProbeReplyCount
+                break
       nimFwTrace2U32("[WIFI-NIMFW] rxl_frame ", hwFlags, dbgFc)
       if not currentFrame(): break frameWork
-      if (hwFlags and 0x20020000'u32) != 0x20020000'u32:
+      if (hwFlags and 0x02002000'u32) != 0x02002000'u32:
         releaseFrame = rxu_cntrl_frame_handle(queuedRxMpduDesc) == 0
         break frameWork
 
@@ -1080,9 +1207,6 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
       sta = staInfoForIdx(staIdx)
       staEntry = cast[pointer](sta)
       if sta.valid == 0:
-        hwFlags = hwFlags and hwFlagsClearMask
-        sw.hwFlags = hwFlags
-        releaseFrame = rxu_cntrl_frame_handle(queuedRxMpduDesc) == 0
         break frameWork
 
       let lastSeen = cast[proc(): uint32 {.cdecl, raises: [Exception].}](blOpsFunc(200))()
@@ -1128,16 +1252,30 @@ proc rxl_cntrl_evt*() {.exportc, cdecl.} =
           if postMaskedFC == 0x80:
             # Beacon processing path (blob offsets 0x212-0x254).
             # mm_check_beacon ABI: (a0=bufChain, a1=vifEntry, a2=staEntry, a3=&resultVar)
-            var bcnResult: uint32 = 0
             let pVif = postVifEntry
             let pSta = staEntry
             let pBuf = swDesc
-            let pResult = addr bcnResult
-            let beaconChanged = mm_check_beacon(pBuf, pVif, pSta, pResult)
+            var tim: pointer
+            var view: RxBeaconView
+            defer: rxCloseBeaconView(view)
+            let beaconChanged = block:
+              if frameIdentity.length.int > sizeof(RxPayloadBufferView):
+                view = rxOpenBeaconView(frameIdentity)
+                if view.data == nil or not currentFrame(): break frameWork
+                mmCheckBeaconFrame(pBuf, pVif, pSta, view.data, tim)
+              else:
+                var timAddress: uint32
+                let changed = mm_check_beacon(pBuf, pVif, pSta, addr timAddress)
+                tim = cast[pointer](timAddress)
+                changed
+            if not currentFrame(): break frameWork
+            if beaconChanged == high(uint32): break frameWork
+            # WMM follows its own update count, not the RXU beacon fingerprint.
+            rxlObserveStaWmm(queuedRxMpduDesc, postVif, sta, view.data)
             if not currentFrame(): break frameWork
             # ps_check_beacon ABI: (a0=resultVar, a1=rx frame length, a2=vifEntry)
             let rxFrameLen = beaconRxDescView(pBuf).frameLen
-            ps_check_beacon(cast[pointer](bcnResult), rxFrameLen.uint32, pVif)
+            ps_check_beacon(tim, rxFrameLen.uint32, pVif)
             if not currentFrame(): break frameWork
             vif_mgmt_bcn_recv(pVif)
             if not currentFrame(): break frameWork
@@ -1301,7 +1439,7 @@ proc rxl_timer_int_handler*() {.exportc, cdecl.} =
         continue
       else:
         # Valid frame: push sw_desc onto rxl_cntrl_env processing list
-        rxCaptureStation(cast[pointer](swDescLink), innerDesc.hwFlags)
+        rxCaptureStation(cast[pointer](swDescLink), innerDesc.hwFlags, addr innerDesc.hwFlags)
         let generation = rxUploadGeneration(cast[pointer](swDescLink))
         rxCaptureChannel(cast[pointer](swDescLink))
         if rxInitializationEpoch != initialization:

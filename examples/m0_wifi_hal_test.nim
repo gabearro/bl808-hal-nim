@@ -12,6 +12,8 @@ import bl808/panicoverride
 import bl808/kernel/alloc
 when defined(bl808WifiNimFw):
   import bl808/kernel/jtaglog
+when defined(bl808WifiNimFw) and defined(bl808WifiRealLwip):
+  from bl808/kernel/lwipcore import lwipInit
 
 const
   ConsoleUartTxPin = 14'u32
@@ -41,6 +43,59 @@ var
   console: Uart
   passed = 0
   failed = 0
+
+when defined(bl808WifiDirectCsiProbe):
+  const DirectCsiCtl = 0x24C008F8'u
+  const DirectCsiStat = 0x24C00064'u
+  const DirectCsiWindow = 0x24C09000'u
+  var directCsiSavedCtl: uint32
+  var directCsiBeforeStat: uint32
+  var directCsiBeforeHash: uint32
+  var nimfw_direct_csi_rx_count {.importc.}: uint32
+  var nimfw_direct_csi_data_count {.importc.}: uint32
+  var nimfw_direct_csi_fc {.importc.}: array[64, uint32]
+  var nimfw_direct_csi_ctl {.importc.}: array[64, uint32]
+  var nimfw_direct_csi_stat {.importc.}: array[64, uint32]
+  var nimfw_direct_csi_win0 {.importc.}: array[64, uint32]
+  var nimfw_direct_csi_hash {.importc.}: array[64, uint32]
+
+  proc directCsiWindowHash(): uint32 =
+    result = 0x811C9DC5'u32
+    for word in 0'u ..< 52'u:
+      result = (result xor regRead(DirectCsiWindow + word * 4'u)) *
+        0x01000193'u32
+
+  proc directCsiField(label: string; value: uint32) =
+    discard console.sendString(" ")
+    discard console.sendString(label)
+    discard console.sendString("=")
+    console.sendHex32(value)
+
+  proc dumpDirectCsiProbe() =
+    discard console.sendString("DIRECT CSI PROBE SUMMARY")
+    directCsiField("ctl_before", directCsiSavedCtl)
+    directCsiField("stat_before", directCsiBeforeStat)
+    directCsiField("hash_before", directCsiBeforeHash)
+    directCsiField("ctl_after", regRead(DirectCsiCtl))
+    directCsiField("stat_after", regRead(DirectCsiStat))
+    directCsiField("hash_after", directCsiWindowHash())
+    directCsiField("rx_count", nimfw_direct_csi_rx_count)
+    directCsiField("data_count", nimfw_direct_csi_data_count)
+    discard console.sendLine("")
+    for index in 0'u32 ..< min(nimfw_direct_csi_rx_count, 64'u32):
+      discard console.sendString("DIRECT CSI PROBE RX ")
+      console.sendHex32(index)
+      for value in [nimfw_direct_csi_fc[index], nimfw_direct_csi_ctl[index],
+          nimfw_direct_csi_stat[index], nimfw_direct_csi_win0[index],
+          nimfw_direct_csi_hash[index]]:
+        discard console.sendString(" ")
+        console.sendHex32(value)
+      discard console.sendLine("")
+    regWrite(DirectCsiCtl, directCsiSavedCtl)
+    discard console.sendString("DIRECT CSI PROBE RESTORED ")
+    console.sendHex32(regRead(DirectCsiCtl))
+    discard console.sendLine("")
+    console.flushTx()
 
 proc check(label: string, ok: bool) =
   withInterruptsDisabled:
@@ -1133,25 +1188,14 @@ when defined(bl808WifiNimFw):
   var nimfw_dbg_crypto_captured    {.importc.}: uint32
   var nimfw_dbg_crypto_pmk_len     {.importc.}: uint32
   var nimfw_dbg_crypto_ptk_len     {.importc.}: uint32
-  var nimfw_dbg_crypto_pmk         {.importc.}: array[32, uint8]
-  var nimfw_dbg_crypto_own         {.importc.}: array[6, uint8]
-  var nimfw_dbg_crypto_bssid       {.importc.}: array[6, uint8]
-  var nimfw_dbg_crypto_snonce      {.importc.}: array[32, uint8]
-  var nimfw_dbg_crypto_anonce      {.importc.}: array[32, uint8]
-  var nimfw_dbg_crypto_kck         {.importc.}: array[16, uint8]
   var nimfw_dbg_crypto_sha256      {.importc.}: uint32
   var nimfw_dbg_crypto_keymgmt     {.importc.}: uint32
   var nimfw_dbg_crypto_pairwise    {.importc.}: uint32
-  var nimfw_dbg_crypto_prf_data    {.importc.}: array[76, uint8]
-  var nimfw_dbg_selftest_hmac      {.importc.}: array[20, uint8]
   var nimfw_dbg_selftest_ran       {.importc.}: uint32
   var nimfw_dbg_vif_mac            {.importc.}: array[6, uint8]
   var nimfw_dbg_mac_hw_lo          {.importc.}: uint32
   var nimfw_dbg_mac_hw_hi          {.importc.}: uint32
   var nimfw_dbg_m2_len             {.importc.}: uint32
-  var nimfw_dbg_m2_buf             {.importc.}: array[160, uint8]
-  var nimfw_dbg_mic_kck            {.importc.}: array[16, uint8]
-  var nimfw_dbg_mic_computed       {.importc.}: array[16, uint8]
   var nimfw_dbg_mic_frame_len      {.importc.}: uint32
   var nimfw_dbg_mic_ver            {.importc.}: uint32
   var nimfw_dbg_sae_build          {.importc.}: uint32
@@ -1168,6 +1212,9 @@ when defined(bl808WifiNimFw):
   var nimfw_dbg_auth_cfm_evt       {.importc.}: uint32
   var nimfw_dbg_auth_cfm_status    {.importc.}: uint32
   var nimfw_dbg_auth_cfm_hw_status {.importc.}: uint32
+  var nimfw_dbg_auth_cfm_final_fail16 {.importc.}: uint32
+  var nimfw_dbg_auth_cfm_ack_ok23 {.importc.}: uint32
+  var nimfw_dbg_auth_cfm_ack_fail {.importc.}: uint32
   var nimfw_dbg_auth_cfm_desc      {.importc.}: uint32
   var nimfw_dbg_auth_cfm_meta      {.importc.}: uint32
   var nimfw_dbg_auth_cfm_fc        {.importc.}: uint32
@@ -1176,6 +1223,9 @@ when defined(bl808WifiNimFw):
   var nimfw_dbg_assoc_cfm_evt       {.importc.}: uint32
   var nimfw_dbg_assoc_cfm_status    {.importc.}: uint32
   var nimfw_dbg_assoc_cfm_hw_status {.importc.}: uint32
+  var nimfw_dbg_assoc_cfm_final_fail16 {.importc.}: uint32
+  var nimfw_dbg_assoc_cfm_ack_ok23 {.importc.}: uint32
+  var nimfw_dbg_assoc_cfm_ack_fail {.importc.}: uint32
   var nimfw_dbg_assoc_cfm_desc      {.importc.}: uint32
   var nimfw_dbg_assoc_cfm_meta      {.importc.}: uint32
   var nimfw_dbg_assoc_cfm_fc        {.importc.}: uint32
@@ -1221,6 +1271,9 @@ when defined(bl808WifiNimFw):
   var nimfw_dbg_eapol_cfm_key_log {.importc.}: array[4, uint32]
   var nimfw_dbg_eapol_cfm_replay_log {.importc.}: array[4, uint32]
   var nimfw_dbg_eapol_cfm_cb_log {.importc.}: array[4, uint32]
+  when defined(bl808WifiDiagEapolRfGain):
+    var nimfw_dbg_eapol_rf_gain_count {.importc.}: uint32
+    var nimfw_dbg_eapol_rf_gain_log {.importc.}: array[8, array[5, uint32]]
   var nimfw_dbg_disconnect_req     {.importc.}: uint32
   var nimfw_dbg_disconnect_req_state {.importc.}: uint32
   var nimfw_dbg_disconnect_process {.importc.}: uint32
@@ -1331,6 +1384,12 @@ when defined(bl808WifiNimFw):
     console.sendHex32(nimfw_dbg_auth_cfm_meta)
     discard console.sendString(" fc=")
     console.sendHex32(nimfw_dbg_auth_cfm_fc)
+    discard console.sendString(" ack=")
+    console.sendHex32(nimfw_dbg_auth_cfm_ack_ok23)
+    discard console.sendString(" failed=")
+    console.sendHex32(nimfw_dbg_auth_cfm_ack_fail)
+    discard console.sendString(" final_fail16=")
+    console.sendHex32(nimfw_dbg_auth_cfm_final_fail16)
     discard console.sendLine("")
     discard console.sendString("[WIFI-NIMFW] tx_counters sta_tx_chan src=")
     console.sendHex32(nimfw_dbg_sta_tx_channel_source)
@@ -1364,6 +1423,12 @@ when defined(bl808WifiNimFw):
     console.sendHex32(nimfw_dbg_assoc_cfm_meta)
     discard console.sendString(" fc=")
     console.sendHex32(nimfw_dbg_assoc_cfm_fc)
+    discard console.sendString(" ack=")
+    console.sendHex32(nimfw_dbg_assoc_cfm_ack_ok23)
+    discard console.sendString(" failed=")
+    console.sendHex32(nimfw_dbg_assoc_cfm_ack_fail)
+    discard console.sendString(" final_fail16=")
+    console.sendHex32(nimfw_dbg_assoc_cfm_final_fail16)
     discard console.sendLine("")
     dumpHexBytes("[WIFI-NIMFW] tx_counters auth_raw=",
                  cast[ptr UncheckedArray[uint8]](addr nimfw_dbg_auth_tx_raw[0]),
@@ -1743,25 +1808,9 @@ when defined(bl808WifiNimFw):
       discard console.sendString(" pairwise=")
       console.sendHex32(nimfw_dbg_crypto_pairwise)
       discard console.sendLine("")
-      dumpHexBytes("[CRYPTO] pmk=",
-                   cast[ptr UncheckedArray[uint8]](addr nimfw_dbg_crypto_pmk[0]), 32)
-      dumpHexBytes("[CRYPTO] own=",
-                   cast[ptr UncheckedArray[uint8]](addr nimfw_dbg_crypto_own[0]), 6)
-      dumpHexBytes("[CRYPTO] bssid=",
-                   cast[ptr UncheckedArray[uint8]](addr nimfw_dbg_crypto_bssid[0]), 6)
-      dumpHexBytes("[CRYPTO] snonce=",
-                   cast[ptr UncheckedArray[uint8]](addr nimfw_dbg_crypto_snonce[0]), 32)
-      dumpHexBytes("[CRYPTO] anonce=",
-                   cast[ptr UncheckedArray[uint8]](addr nimfw_dbg_crypto_anonce[0]), 32)
-      dumpHexBytes("[CRYPTO] kck=",
-                   cast[ptr UncheckedArray[uint8]](addr nimfw_dbg_crypto_kck[0]), 16)
-      dumpHexBytes("[CRYPTO] prf_data=",
-                   cast[ptr UncheckedArray[uint8]](addr nimfw_dbg_crypto_prf_data[0]), 76)
       discard console.sendString("[CRYPTO] selftest_ran=")
       console.sendHex32(nimfw_dbg_selftest_ran)
       discard console.sendLine("")
-      dumpHexBytes("[CRYPTO] selftest_hmac=",
-                   cast[ptr UncheckedArray[uint8]](addr nimfw_dbg_selftest_hmac[0]), 20)
       dumpHexBytes("[CRYPTO] vif_mac=",
                    cast[ptr UncheckedArray[uint8]](addr nimfw_dbg_vif_mac[0]), 6)
       discard console.sendString("[CRYPTO] mac_hw_lo=")
@@ -1771,18 +1820,11 @@ when defined(bl808WifiNimFw):
       discard console.sendString(" m2_len=")
       console.sendHex32(nimfw_dbg_m2_len)
       discard console.sendLine("")
-      let m2_n = (if nimfw_dbg_m2_len < 160'u32: nimfw_dbg_m2_len.int else: 160)
-      dumpHexBytes("[CRYPTO] m2=",
-                   cast[ptr UncheckedArray[uint8]](addr nimfw_dbg_m2_buf[0]), m2_n)
       discard console.sendString("[CRYPTO] mic_frame_len=")
       console.sendHex32(nimfw_dbg_mic_frame_len)
       discard console.sendString(" mic_ver=")
       console.sendHex32(nimfw_dbg_mic_ver)
       discard console.sendLine("")
-      dumpHexBytes("[CRYPTO] mic_kck=",
-                   cast[ptr UncheckedArray[uint8]](addr nimfw_dbg_mic_kck[0]), 16)
-      dumpHexBytes("[CRYPTO] mic_out=",
-                   cast[ptr UncheckedArray[uint8]](addr nimfw_dbg_mic_computed[0]), 16)
       discard console.sendString("[SAE] build=")
       console.sendHex32(nimfw_dbg_sae_build)
       discard console.sendString(" parse=")
@@ -1901,6 +1943,23 @@ when defined(bl808WifiNimFw):
       discard console.sendString(" cb=")
       console.sendHex32(nimfw_dbg_eapol_cfm_cb_log[eapolCfmLogIndex])
       discard console.sendLine("")
+    when defined(bl808WifiDiagEapolRfGain):
+      discard console.sendString("[EAPOL-RF] count=")
+      console.sendHex32(nimfw_dbg_eapol_rf_gain_count)
+      discard console.sendLine("")
+      for i in 0 ..< min(nimfw_dbg_eapol_rf_gain_count, nimfw_dbg_eapol_rf_gain_log.len.uint32).int:
+        let sample = nimfw_dbg_eapol_rf_gain_log[i]
+        discard console.sendString("[EAPOL-RF] status=")
+        console.sendHex32(sample[0])
+        discard console.sendString(" pc7a4=")
+        console.sendHex32(sample[1])
+        discard console.sendString(" analog04c=")
+        console.sendHex32(sample[2])
+        discard console.sendString(" dfe63c=")
+        console.sendHex32(sample[3])
+        discard console.sendString(" ctrl02c=")
+        console.sendHex32(sample[4])
+        discard console.sendLine("")
     discard console.sendString("[WIFI-NIMFW] tx_counters sta_tbtt_enter=")
     console.sendHex32(nimfw_dbg_sta_tbtt_enter)
     discard console.sendString(" assoc=")
@@ -1962,6 +2021,8 @@ proc main() {.exportc, cdecl.} =
 
   discard console.sendLine("")
   discard console.sendLine("=== BL808 WiFi HAL Test ===")
+  when defined(bl808WifiDirectCsiProbe):
+    console.flushTx()
 
   when WifiPreInitDebugDelayMs > 0:
     discard console.sendString("[WIFI] pre-init debug delay ms=")
@@ -1971,6 +2032,8 @@ proc main() {.exportc, cdecl.} =
       delayUs(1000)
 
   let credsOk = WifiSsid.len > 0 and WifiPassword.len > 0
+  when defined(bl808WifiNimFw) and defined(bl808WifiRealLwip):
+    lwipInit()
   let initOk = wifiInit() == wifiOk
   when defined(bl808WifiNimFw):
     discard console.sendLine("[WIFI-NIMFW] bl_init done")
@@ -1980,6 +2043,16 @@ proc main() {.exportc, cdecl.} =
 
   var iface = wifi_mgmr_sta_enable()
   check("wifi sta enable", iface != nil)
+  when defined(bl808WifiDirectCsiProbe):
+    directCsiSavedCtl = regRead(DirectCsiCtl)
+    directCsiBeforeStat = regRead(DirectCsiStat)
+    directCsiBeforeHash = directCsiWindowHash()
+    regWrite(DirectCsiCtl, directCsiSavedCtl or 3'u32)
+    discard console.sendString("DIRECT CSI PROBE ARMED")
+    directCsiField("ctl_readback", regRead(DirectCsiCtl))
+    directCsiField("stat_readback", regRead(DirectCsiStat))
+    discard console.sendLine("")
+    console.flushTx()
   when WifiScanDebugDelayMs > 0:
     discard console.sendString("[WIFI] scan debug delay ms=")
     console.sendHex32(WifiScanDebugDelayMs.uint32)
@@ -2029,8 +2102,15 @@ proc main() {.exportc, cdecl.} =
     check("wifi scan results", bl808_wifi_backend_scan_count() > 0'u32)
 
   when WifiScanOnly:
+    when defined(bl808WifiDirectCsiProbe):
+      dumpDirectCsiProbe()
     check("wifi ap start", wifiStartAp("bl808-hal-ap", "12345678", 1) == wifiOk)
+    when defined(bl808WifiNimFw):
+      let apNetif = wifiGetApNetif()
+      check("wifi ap netif distinct", apNetif != nil and apNetif != wifiGetNetif())
     check("wifi ap stop", wifiStopAp() == wifiOk)
+    when defined(bl808WifiNimFw):
+      check("wifi ap netif released", wifiGetApNetif() == nil)
     discard rfReadRevision()
     check("wifi rf revision read", true)
     printResult()
@@ -2058,6 +2138,8 @@ proc main() {.exportc, cdecl.} =
       check("wifi credential failure classified",
             wifiCredentialFailureMatches(failureStatus, failureReason))
     discard wifiDisconnect()
+    when defined(bl808WifiDirectCsiProbe):
+      dumpDirectCsiProbe()
   else:
     let connectOk = connectResult == wifiOk
     when defined(bl808WifiNimFw):
@@ -2115,6 +2197,9 @@ proc main() {.exportc, cdecl.} =
         if not keepaliveOk:
           dumpNimFwTxCounters()
         check("wifi keepalive tx ack", keepaliveOk)
+    when defined(bl808WifiDirectCsiProbe):
+      dumpDirectCsiProbe()
+      check("direct csi rx data observed", nimfw_direct_csi_data_count > 0'u32)
     when defined(bl808WifiNimFwDiag):
       discard console.sendString("[DISCONNECT] pre sm_state=")
       console.sendHex32(ke_state_get(4'u16).uint32)
@@ -2126,8 +2211,9 @@ proc main() {.exportc, cdecl.} =
       discard console.sendLine("")
       dumpNimFwDisconnectCounters()
     check("wifi disconnect", discResult == wifiOk)
-  check("wifi ap start", wifiStartAp("bl808-hal-ap", "12345678", 1) == wifiOk)
-  check("wifi ap stop", wifiStopAp() == wifiOk)
+  when not defined(bl808WifiKeepaliveStaOnly):
+    check("wifi ap start", wifiStartAp("bl808-hal-ap", "12345678", 1) == wifiOk)
+    check("wifi ap stop", wifiStopAp() == wifiOk)
   discard rfReadRevision()
   check("wifi rf revision read", true)
 

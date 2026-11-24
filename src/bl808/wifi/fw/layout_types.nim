@@ -93,6 +93,8 @@ type
     smSerial: uint32
     smState: uint16
     smTracked: bool
+    psTracked: bool
+    psSerial: uint32
 
   TxSessionIdentity = object
     vifEpoch, stationEpoch, resetEpoch: uint32
@@ -105,6 +107,13 @@ type
     serial, lease: uint32
     state: uint16
     ownsFrame, responseArmed: bool
+
+  SmAuthResponseExpectation = object
+    connection: pointer
+    identity: TxSessionIdentity
+    serial: uint32
+    algorithm: uint8
+    txSequence: uint16
 
   SmActivationPrepared = object
     serial: uint32
@@ -507,7 +516,7 @@ type
     pendingBeaconBuffer*: pointer
     securityIe*: array[64, uint8]
     cryptoType*: uint8
-    beaconIntervalIndex*: uint8
+    embeddedEnabled*: uint8
     flags*: uint8
     staCount*: uint8
     maxSta*: uint8
@@ -529,6 +538,10 @@ type
     generation: uint32
     meQueued: bool
     vifIdx: uint8
+
+  ApFrameExtras = object
+    data: pointer
+    length, countryOffset, countrySize: uint32
 
   ConnectInfoView {.packed.} = object
     ssidLen*: uint8
@@ -823,10 +836,10 @@ type
     staKeySlots*: array[4, uint8]
 
   VifMachwKeyIndexOverlay {.packed.} = object
-    vifBaseToMachwKeyIndexesPadding*: array[172, uint8]
-    primaryPairwise*: uint8
-    secondaryPairwise*: uint8
+    vifBaseToMachwKeyIndexesPadding*: array[510, uint8]
+    pairwise*: uint8
     group*: uint8
+    management*: uint8
 
   VifHtCapabilitiesOverlay {.packed.} = object
     capInfo*: uint16
@@ -968,11 +981,13 @@ type
     bufDesc*: pointer
     hwDesc*: pointer
     aggDescPtr*: uint32
-    aggPtrToRetryCountersPadding*: array[52, uint8]
-    retryCount*: uint32
-    lifetime*: uint32
-    txFlags*: uint32
-    txFlagsToAggStoragePadding*: array[4, uint8]
+    # tx_hw_desc.thd.optlen starts at descriptor offset 160.
+    aggPtrToOptionalLengthsPadding*: array[40, uint8]
+    optionalLengths*: array[3, uint32]
+    macControlInfo1*: uint32
+    macControlInfo2*: uint32
+    statusInfo*: uint32
+    mediumTimeUsed*: uint32
     aggDescStorage*: array[16, uint8]
     cfmStatus*: uint32
     callback*: pointer
@@ -1498,6 +1513,9 @@ type
   RxFrameAdmission = enum
     rxFrameCorrupt, rxFrameDrop, rxFrameReady
 
+  RxMgtProtection = enum
+    rxMgtProtectionUnknown, rxMgtWithoutProtection, rxMgtVerifiedCcmp, rxMgtVerifiedBip
+
   RxStationIdentity = object
     epoch: uint32
     vifEpochs: array[MAX_VIFS, uint32]
@@ -1505,6 +1523,8 @@ type
     station, vif: uint8
     captured, associated: bool
     channelCaptured: bool
+    when defined(bl808WifiDiagPeerRxAdmission):
+      mgmtProtection: RxMgtProtection
     channelGeneration: uint32
 
   RxMgtIdentityNode = object
@@ -1544,11 +1564,34 @@ type
     generation: uint32
     length: uint16
 
+  RxBeaconView = object
+    data: pointer
+    release: proc(p: pointer) {.cdecl.}
+
   MmVifIdentity = object
     vif: pointer
     epoch, stationEpoch: uint32
     index, station: uint8
     captured: bool
+
+  PsTxNullOwner = object
+    peer: MmVifIdentity
+    serial, resetEpoch: uint32
+    armed: bool
+
+  SmDisconnectHandoff = object
+    peer: MmVifIdentity
+    connection: pointer
+    resetEpoch, saQuerySerial: uint32
+    state: uint16
+
+  MmConnLossTag = object
+    next: ptr MmConnLossTag
+    header: pointer
+    identity: MmVifIdentity
+    resetEpoch, probeEpoch: uint32
+    reason: uint16
+    consumed, tracksProbe: bool
 
   RxPayloadHwDescView {.packed.} = object
     magic*: uint32
@@ -2058,7 +2101,7 @@ type
   ApmStartCfmPayload {.packed.} = object
     status*: uint8
     vifIdx*: uint8
-    band*: uint8
+    channelContextIndex*: uint8
     staIdx*: uint8
 
   ApmStopReqPayload {.packed.} = object
@@ -2102,9 +2145,8 @@ type
     frameLen*: uint16
     frameLenVifPadding*: array[6, uint8]
     vifIdx*: uint8
-    vifIdxStaMacPadding*: array[33, uint8]
-    staMac*: array[6, uint8]
-    staMacToIesPadding*: array[8, uint8]
+    vifIdxFramePadding*: array[23, uint8]
+    frame*: MacDataFrameHeaderView
     ies*: UncheckedArray[uint8]
 
   StaKeyReqPayload {.packed.} = object
@@ -2714,9 +2756,9 @@ static:
   doAssert offsetof(ApmProbeReqView, frameLen) == 0
   doAssert offsetof(ApmProbeReqView, frameLenVifPadding) == 2
   doAssert offsetof(ApmProbeReqView, vifIdx) == 8
-  doAssert offsetof(ApmProbeReqView, vifIdxStaMacPadding) == 9
-  doAssert offsetof(ApmProbeReqView, staMac) == 42
-  doAssert offsetof(ApmProbeReqView, staMacToIesPadding) == 48
+  doAssert offsetof(ApmProbeReqView, vifIdxFramePadding) == 9
+  doAssert offsetof(ApmProbeReqView, frame) == 32
+  doAssert offsetof(ApmProbeReqView, frame) + offsetof(MacDataFrameHeaderView, addr2) == 42
   doAssert offsetof(ApmProbeReqView, ies) == 56
   doAssert StaKeyReqPayloadSize == 56'u32
   doAssert offsetof(StaKeyReqPayload, cipherSuite) == 0
@@ -3159,7 +3201,7 @@ static:
   doAssert offsetof(ApmEnvView, pendingBeaconBuffer) == 16
   doAssert offsetof(ApmEnvView, securityIe) == 20
   doAssert offsetof(ApmEnvView, cryptoType) == 84
-  doAssert offsetof(ApmEnvView, beaconIntervalIndex) == 85
+  doAssert offsetof(ApmEnvView, embeddedEnabled) == 85
   doAssert offsetof(ApmEnvView, flags) == 86
   doAssert offsetof(ApmEnvView, staCount) == 87
   doAssert offsetof(ApmEnvView, maxSta) == 88
@@ -3417,9 +3459,12 @@ static:
   doAssert offsetof(VifSecurityOverlay, staKeySlots) == 22
   doAssert sizeof(VifSecurityOverlay) == 26
   doAssert offsetof(VifMachwKeyIndexOverlay, vifBaseToMachwKeyIndexesPadding) == 0
-  doAssert offsetof(VifMachwKeyIndexOverlay, primaryPairwise) == 172
-  doAssert offsetof(VifMachwKeyIndexOverlay, secondaryPairwise) == 173
-  doAssert offsetof(VifMachwKeyIndexOverlay, group) == 174
+  doAssert offsetof(VifMachwKeyIndexOverlay, pairwise) == 510
+  doAssert offsetof(VifMachwKeyIndexOverlay, group) == 511
+  doAssert offsetof(VifMachwKeyIndexOverlay, management) == 512
+  doAssert offsetof(VifMachwKeyIndexOverlay, pairwise) ==
+    offsetof(VifChannelView, edcaParams) + 32 +
+    offsetof(VifSecurityOverlay, staKeySlots)
   doAssert offsetof(VifHtCapabilitiesOverlay, capInfo) == 0
   doAssert offsetof(VifHtCapabilitiesOverlay, ampduParams) == 2
   doAssert offsetof(VifHtCapabilitiesOverlay, mcsSet) == 3
@@ -3554,11 +3599,12 @@ static:
   doAssert offsetof(HostTxDescView, bufDesc) == 108
   doAssert offsetof(HostTxDescView, hwDesc) == 112
   doAssert offsetof(HostTxDescView, aggDescPtr) == 116
-  doAssert offsetof(HostTxDescView, aggPtrToRetryCountersPadding) == 120
-  doAssert offsetof(HostTxDescView, retryCount) == 172
-  doAssert offsetof(HostTxDescView, lifetime) == 176
-  doAssert offsetof(HostTxDescView, txFlags) == 180
-  doAssert offsetof(HostTxDescView, txFlagsToAggStoragePadding) == 184
+  doAssert offsetof(HostTxDescView, aggPtrToOptionalLengthsPadding) == 120
+  doAssert offsetof(HostTxDescView, optionalLengths) == 160
+  doAssert offsetof(HostTxDescView, macControlInfo1) == 172
+  doAssert offsetof(HostTxDescView, macControlInfo2) == 176
+  doAssert offsetof(HostTxDescView, statusInfo) == 180
+  doAssert offsetof(HostTxDescView, mediumTimeUsed) == 184
   doAssert offsetof(HostTxDescView, aggDescStorage) == 188
   doAssert offsetof(HostTxDescView, cfmStatus) == 204
   doAssert offsetof(HostTxDescView, callback) == 208
@@ -3591,6 +3637,7 @@ static:
   doAssert sizeof(TxlFrameHwDescSlotView) == 72
   doAssert offsetof(TxlFrameHwDescSlotView, desc) == 0
   doAssert sizeof(HostTxThdEntryView) == 20
+  doAssert offsetof(HostTxThdEntryView, next) == 4
   doAssert offsetof(HostTxThdEntryView, flags) == 16
   doAssert sizeof(HostTxThdConfirmView) == 20
   doAssert offsetof(HostTxThdConfirmView, confirmType) == 12
@@ -5045,8 +5092,8 @@ proc beaconTimeoutConfigWord(ops: ptr BlOpsDataView): uint32 {.inline.} =
 template chanEnvView(): ptr ChanEnvView =
   cast[ptr ChanEnvView](addr chan_env[0])
 
-template chanRssiLastReportTime(): ptr uint32 =
-  cast[ptr uint32](cast[uint](addr chan_env[0]) + sizeof(ChanEnvView).uint)
+template mmRssiLastReportTime(): ptr uint32 =
+  addr mmRssiReportUs
 
 template chanTbttConflictCounter(): ptr uint32 =
   # Vendor .bss.no_collision_times.0 is independent of chan_env.
@@ -5150,6 +5197,7 @@ type
     id*: uint16             # task_id in bits [15:10], msg in bits [9:0]
     taskId*: uint8          # target task
     time*: uint32           # absolute expiry in MAC ticks
+    saQuerySerial: uint32   # Nim-owned tail, not part of the BL808 timer prefix
 
   KeTimerMutation = object
     previous: ptr KeTimerMutation
@@ -5160,7 +5208,7 @@ type
   MmTimerMutation = object
     previous: ptr MmTimerMutation
     timer: pointer
-    cancelled: bool
+    cancelled, delivering: bool
 
   KeTimerGuard = proc(context: pointer): bool {.nimcall.}
 
@@ -5573,10 +5621,10 @@ type
 
   WpaParsedInfoView {.packed.} = object
     parserHeaderPadding*: array[4, uint8]
-    groupCipher*: uint8
-    groupCipherPadding*: array[3, uint8]
     pairwiseCipher*: uint8
     pairwiseCipherPadding*: array[3, uint8]
+    groupCipher*: uint8
+    groupCipherPadding*: array[3, uint8]
     keyMgmtMaskLow*: uint8
     keyMgmtMaskHigh*: uint8
     keyMgmtMaskPadding*: array[2, uint8]
@@ -5649,10 +5697,13 @@ type
     cipher*: uint8
     cipherPadding*: uint8
     keyMgmt*: uint16
-    cipherPair*: uint16
-    cipherPairTailPadding*: array[66, uint8]
-    scanNotifyVendorByte*: uint8
-    scanNotifyVendorBytePadding*: array[3, uint8]
+    pairwiseCipher*: uint8
+    groupCipher*: uint8
+    passphrase*: array[65, uint8]
+    pmfRequired*: uint8
+    mgmtGroupCipher*: uint8
+    quickConn*: uint8
+    tailPadding*: array[2, uint8]
 
   TimIeView {.packed.} = object
     ie*: MacIeView
@@ -5870,7 +5921,7 @@ template scanProbeReqIeDataPtr(ie: var ScanProbeReqIeObj, offset: uint16): point
   addr ie.ieData[offset.int]
 
 template scanProbeReqIeDataBase(ie: var ScanProbeReqIeObj): uint32 =
-  cast[uint32](scanProbeReqIeDataPtr(ie))
+  cast[uint32](ie.ieDataPtr)
 
 template scanProbeReqIePayloadPtr(ie: var ScanProbeReqIeObj): pointer =
   addr ie.magic
@@ -6244,8 +6295,8 @@ static:
   doAssert offsetof(WpsCallbacksView, eapolHandler) == 4
   doAssert offsetof(WpsCallbacksView, staConnected) == 8
   doAssert offsetof(WpsCallbacksView, staAddConfirm) == 12
-  doAssert offsetof(WpaParsedInfoView, groupCipher) == 4
-  doAssert offsetof(WpaParsedInfoView, pairwiseCipher) == 8
+  doAssert offsetof(WpaParsedInfoView, pairwiseCipher) == 4
+  doAssert offsetof(WpaParsedInfoView, groupCipher) == 8
   doAssert offsetof(WpaParsedInfoView, keyMgmtMaskLow) == 12
   doAssert offsetof(WpaParsedInfoView, keyMgmtMaskHigh) == 13
   doAssert offsetof(WpaParsedInfoView, caps) == 16
@@ -6299,10 +6350,13 @@ static:
   doAssert offsetof(WpaScanSecurityNotifyView, cipher) == 52
   doAssert offsetof(WpaScanSecurityNotifyView, cipherPadding) == 53
   doAssert offsetof(WpaScanSecurityNotifyView, keyMgmt) == 54
-  doAssert offsetof(WpaScanSecurityNotifyView, cipherPair) == 56
-  doAssert offsetof(WpaScanSecurityNotifyView, cipherPairTailPadding) == 58
-  doAssert offsetof(WpaScanSecurityNotifyView, scanNotifyVendorByte) == 124
-  doAssert offsetof(WpaScanSecurityNotifyView, scanNotifyVendorBytePadding) == 125
+  doAssert offsetof(WpaScanSecurityNotifyView, pairwiseCipher) == 56
+  doAssert offsetof(WpaScanSecurityNotifyView, groupCipher) == 57
+  doAssert offsetof(WpaScanSecurityNotifyView, passphrase) == 58
+  doAssert offsetof(WpaScanSecurityNotifyView, pmfRequired) == 123
+  doAssert offsetof(WpaScanSecurityNotifyView, mgmtGroupCipher) == 124
+  doAssert offsetof(WpaScanSecurityNotifyView, quickConn) == 125
+  doAssert offsetof(WpaScanSecurityNotifyView, tailPadding) == 126
   doAssert sizeof(WpaScanSecurityNotifyView) == 128
   doAssert offsetof(HostapdOpsView, opsBaseToEapolRxPadding) == 0
   doAssert offsetof(HostapdOpsView, eapolRx) == 44
@@ -6407,6 +6461,7 @@ const
   IE_ID_DS_PARAM* = 3'u8
   IE_ID_RSN* = 48'u8
   IE_ID_HT_CAP* = 45'u8
+  IE_ID_SSID_LIST* = 84'u8
   IE_ID_VENDOR* = 221'u8
   IE_LEN_DS_PARAM* = 1'u8
   IE_LEN_HT_CAP* = 26'u8

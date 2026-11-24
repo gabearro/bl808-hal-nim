@@ -1,0 +1,7 @@
+package ox64:math@0.2.0;
+
+world post-import {
+  import scale: func(value: s32) -> s32;
+  export adjusted: func(value: s32) -> s32;
+  export ping: func();
+}

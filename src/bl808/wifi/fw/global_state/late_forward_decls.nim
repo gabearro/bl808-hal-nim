@@ -7,7 +7,6 @@ proc chan_tbtt_switch_evt*(tbttNode: pointer) {.exportc, cdecl.}
 proc chan_conn_less_delay_evt*() {.exportc, cdecl.}
 proc chan_cde_evt*(param: pointer) {.exportc, cdecl.}
 proc chan_ctxt_op_evt*(ctxtPtr: pointer) {.exportc, cdecl.}
-proc chan_survey_timer_end*() {.exportc, cdecl.}
 proc bam_init*() {.exportc, cdecl.}
 proc bl_reset_evt*() {.exportc, cdecl.}
 proc ke_task_schedule*() {.exportc, cdecl.}
@@ -23,6 +22,7 @@ proc bl_event_handle*(evtType: uint32) {.exportc, cdecl.}
 proc bl_fw_statistic_dump*() {.exportc, cdecl.}
 proc me_init_rate*(staEntry: pointer) {.exportc, cdecl.}
 proc ke_msg_free*(param: pointer) {.exportc, cdecl.}
+proc ke_state_set*(taskId: uint8, state: uint16) {.exportc, cdecl.}
 proc meTryInitRate(staEntry: pointer): bool
 proc me_init_bcmc_rate*(staEntry: pointer) {.exportc, cdecl.}
 proc me_update_buffer_control*(sta: pointer): pointer {.exportc, cdecl.}
@@ -107,6 +107,9 @@ proc dsParamFreq(band: uint8, ds: ptr DsParamSetIeView): uint16 {.inline.} =
 proc me_bw_check*(param: pointer) {.exportc, cdecl.}
 proc me_rate_translate*(rateConfig: uint32): uint32 {.exportc, cdecl.}
 proc rc_check*(staIdx: uint8) {.exportc, cdecl.}
+when defined(bl808m0):
+  proc rcRejectUnprogrammedTrial(staIdx: uint8; stats: pointer;
+                                rateWords: array[4, uint32])
 proc rc_calc_tp*(stats: pointer; sampleIdx: uint8): uint32 {.exportc, cdecl.}
 proc rc_update_counters*(staIdx: uint8; attemptCount, failureCount: uint32;
                          txAmpdu, retryRequired: bool) {.exportc, cdecl.}
@@ -128,7 +131,6 @@ proc mac_ie_find*(buf: pointer, bufLen: uint32, ieId: uint8): pointer {.exportc,
 proc mac_vsie_find*(buf: pointer, bufLen: uint32, oui: pointer, ouiLen: uint8): pointer {.exportc, cdecl.}
 proc ke_msg_forward_and_change_id*(param: pointer, newId: uint16, destId: uint8, srcId: uint8) {.exportc, cdecl.}
 proc c_memcmp(a, b: pointer, n: csize_t): cint {.importc: "memcmp", header: "<string.h>".}
-proc ipc_emb_msg_handler*() {.exportc, cdecl.}
 
 # Forward declarations for RC internal helpers
 proc rc_get_mcs_index*(rateConfig: uint16): uint8 {.exportc, cdecl.}

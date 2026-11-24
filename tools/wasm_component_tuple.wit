@@ -1,0 +1,6 @@
+package ox64:values@0.2.0;
+
+world tuple-demo {
+  export sum-tuple: func(value: tuple<u32, u32>) -> u32;
+  export make-tuple: func(left: u32, right: u32) -> tuple<u32, u32>;
+}

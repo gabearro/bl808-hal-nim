@@ -127,7 +127,7 @@ proc scanuPublishFrameResult(frame: pointer; scanResultEntry: ptr ScanuResultEnt
 ''' + textwrap.indent(textwrap.dedent(tail), "  ")
     return code + r'''
 proc publish(bfOn = 0'u8; numSsids = 1'u8) =
-  scanuPublishFrameResult(addr incoming[0], addr scanu_env.entries[0],
+  scanuPublishFrameResult(addr incoming[0], 60, 92, addr scanu_env.entries[0],
     addr request, 7, 9, numSsids, bfOn)
 '''
 
@@ -191,7 +191,8 @@ for bfOn in [0'u8, 1'u8]:
         else:
           doAssert copyLive and scanu_env.entries[0].cachedRxuMgtInd == addr copyFrame[0]
           for i in 0 ..< 92: doAssert copyFrame[i] == incoming[i]
-          if bfOn != 0: doAssert scanu_env.pendingJoinRxuMgtInd == addr copyFrame[0]
+        doAssert scanu_env.pendingJoinRxuMgtInd == nil,
+          "a live observation was mistaken for queued replay completion"
 setup(false)
 scanu_env.entries[0].valid = 0
 publish(numSsids = 0)
@@ -201,8 +202,8 @@ setup(false)
 scanu_env.entries[0].valid = 0
 scan_env.abortFlag = 1
 publish(numSsids = 0)
-doAssert scanu_env.entries[0].valid == 1 and scanu_env.resultCount == 1
-doAssert allocations == 1 and forwarded == 1
+doAssert scanu_env.entries[0].valid == 0 and scanu_env.resultCount == 1
+doAssert allocations == 0 and forwarded == 1
 setup()
 hook = proc(at: string) =
   if at == "forward": replacePublication(2)
@@ -223,8 +224,40 @@ for point in ["free", "alloc"]:
     if at == point and not fired:
       fired = true
       inc currentSerial
-  scanuPublishFrameResult(addr incoming[0], addr scanu_env.entries[0],
+  scanuPublishFrameResult(addr incoming[0], 60, 92, addr scanu_env.entries[0],
     addr request, 7, 9, 1, 0, addr owner)
   doAssert fired and not copyLive and forwarded == 1
   doAssert scanu_env.entries[0].cachedRxuMgtInd == nil
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_cached_length_uses_admitted_snapshot(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+for point in ["free", "alloc"]:
+  setup()
+  hook = proc(at: string) =
+    if at == point:
+      rxuMgtIndAt(addr incoming[0]).frameLen =
+        if point == "free": 65535'u16 else: 0'u16
+  publish()
+  doAssert forwarded == 1 and allocations == 1 and oldFrees == 1
+  doAssert scanu_env.entries[0].cachedRxuMgtInd == addr copyFrame[0]
+  doAssert rxuMgtIndAt(addr copyFrame[0]).frameLen == 60
+  for i in 2 ..< 92: doAssert copyFrame[i] == incoming[i]
+
+for frameLength in [35'u16, 61, 65535]:
+  setup()
+  scanuPublishFrameResult(addr incoming[0], frameLength, 92,
+    addr scanu_env.entries[0], addr request, 7, 9, 1, 0)
+  doAssert forwarded == 1 and allocations == 0 and oldFrees == 0
+  doAssert scanu_env.entries[0].cachedRxuMgtInd == addr oldFrame[0]
+setup()
+scanuPublishFrameResult(addr incoming[0], 60, 31,
+  addr scanu_env.entries[0], addr request, 7, 9, 1, 0)
+doAssert forwarded == 1 and allocations == 0 and oldFrees == 0
+setup()
+scanuPublishFrameResult(nil, 60, 92,
+  addr scanu_env.entries[0], addr request, 7, 9, 1, 0)
+doAssert forwarded == 0 and allocations == 0 and oldFrees == 0
 ''')

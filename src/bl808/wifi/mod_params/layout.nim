@@ -1,6 +1,8 @@
+from ../host_table_layout import WifiHostModParamsOffset, WifiHostHtCapOffset
+
 const
-  BlHwModParamsOff* = 0x0dc'u
-  BlHwHtCapOff* = 0x0e0'u
+  BlHwModParamsOff* = WifiHostModParamsOffset
+  BlHwHtCapOff* = WifiHostHtCapOffset
 
   HtCapCapOff* = 0'u
   HtCapHtSupportedOff* = 2'u

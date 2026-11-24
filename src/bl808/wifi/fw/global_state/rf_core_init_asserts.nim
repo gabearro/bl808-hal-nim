@@ -20,8 +20,11 @@ proc wifiRfCoreInitMode(xtalfreqHz: uint32, mode: RadioPhyMode) {.noinline.} =
   nimFwConnectTrace2U32(
     "[WIFI-CT] bl808_rf_modem ", xtalfreqHz, restoreExistingCalibration)
   nimFwDbgRfPhase = 4
-  discard wl_init()
+  let initialized = wlInitModemAndPublish(true)
   snapshotWifiRfCalibData()
+  if not initialized or not wlRfConfigInitialized():
+    wifiBl808RfInited = 0'u32
+    return
   nimFwDbgRfPhase = 5
   wifiBl808RfInited = 1'u32
   nimFwConnectTrace2U32(
@@ -29,6 +32,15 @@ proc wifiRfCoreInitMode(xtalfreqHz: uint32, mode: RadioPhyMode) {.noinline.} =
 
 proc wifiRfCoreInit*(xtalfreqHz: uint32) {.exportc, cdecl, noinline.} =
   wifiRfCoreInitMode(xtalfreqHz, wifiOnly)
+
+proc wifiRfCoreReady*(): bool {.inline.} =
+  wifiBl808RfInited != 0'u32 and wlRfConfigInitialized()
+
+proc wifiRfCoreUsesNativeWlan*(): bool {.inline.} =
+  when defined(bl808WifiNativeWlanCalibration):
+    rfBankHasBl808WlanCal()
+  else:
+    false
 
 proc phy_assert_rec*(fileOrCond, condOrFile: cstring, line: cint)
     {.exportc, cdecl, noinline.} =
@@ -54,17 +66,17 @@ proc phy_assert_err*(fileOrCond, condOrFile: cstring, line: cint)
 proc wrapPhyAssertErr*(fileOrCond, condOrFile: cstring,
                        line: cint)
     {.exportc: "__wrap_phy_assert_err", cdecl, noinline.} =
-  ## The BL808 RF archive's phy_assert_err is a hard spin. The first
-  ## phy_init assert is a clock-count diagnostic on this target; log it and
-  ## continue so the smoke test can bisect the next WiFi bring-up stage.
+  ## Match the RF archive's hard stop by default. Opt in to continuing past
+  ## known diagnostics only when bisecting bring-up on hardware.
   let mdm = wifiModemRegs()
   let versionScratch3c = volatileLoad(addr mdm.versionScratch3c)
   inc nimFwDbgRfAssertCount
   nimFwDbgRfAssertLine = line.uint32
   nimFwDbgRfAssertReg3c = versionScratch3c
   nimFwConnectTrace2U32("[WIFI-CT] phy_assert ", line.uint32, versionScratch3c)
-  if line == 586.cint or line == 0x20FA.cint or line == 0x2A60.cint:
-    return
+  when defined(bl808WifiDebugContinuePhyAssert):
+    if line == 586.cint or line == 0x20FA.cint or line == 0x2A60.cint:
+      return
   while true:
     discard fileOrCond
     discard condOrFile

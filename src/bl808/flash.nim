@@ -210,7 +210,8 @@ proc sfCtrlSendCmd(cmd: uint8, flashAddr: uint32 = 0, hasAddr: bool = false,
   regWrite(SfCtrlIfSahb2, cmd1)
   regWrite(SfCtrlIfSahb0, sahb0)
   regWrite(SfCtrlIfSahb0, sahb0 or Sahb0Trigger)
-  discard regWaitClear(SfCtrlIfSahb0, Sahb0Busy or Sahb0Trigger)
+  # BUSY signals completion; the next command clears TRIGGER before staging.
+  discard regWaitClear(SfCtrlIfSahb0, Sahb0Busy)
 
 proc sfCtrlWaitBusy(timeout: uint32 = 1_000_000): FlashError {.flashRam.} =
   var countdown = timeout

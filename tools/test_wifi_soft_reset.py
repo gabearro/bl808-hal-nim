@@ -23,6 +23,7 @@ var
   writes: seq[tuple[address: uint, value: uint32]]
   timeouts: seq[tuple[address, mask: uint32]]
 proc txControlEnv(): ptr typeof(tx) = addr tx
+proc mmConfigCancelIdle() = checkResetContext()
 proc regRead(address: uint): uint32 =
   case address
   of 0x24B08050'u:
@@ -60,6 +61,9 @@ proc mm_reset() =
   mmState = 0
 proc vif_mgmt_reset() = checkResetContext()
 proc apmResumeHaltRollback() = checkResetContext()
+template smSaQueryResetScope() = discard
+proc smSaQueryClearResetTimer() = checkResetContext()
+proc mmPsModeRetryAfterReset() = checkResetContext()
 proc ke_reschedule_saved_messages(task: uint8): bool =
   checkResetContext()
   doAssert task == TASK_MM
@@ -175,9 +179,30 @@ doAssert not waitMacSoftResetClear(1) and softReads == 2
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_invalid_reset_status_cannot_complete_wait(tmp_path: Path, mode: str) -> None:
+    code = source().replace(
+        "proc assert_err(condition, file: cstring; line: cint) = doAssert false",
+        "var assertions: int\n"
+        "proc assert_err(condition, file: cstring; line: cint) = inc assertions")
+    run_program(tmp_path, mode, code + r'''
+setupSoft(true, @[0x100'u32, 0x101'u32, 0'u32])
+doAssert waitMacSoftResetClear(2)
+doAssert assertions == 2 and softReads == 3 and timeouts.len == 0
+
+assertions = 0
+setupSoft(true, @[0x100'u32])
+doAssert not waitMacSoftResetClear(1)
+doAssert assertions == 2 and softReads == 2
+doAssert timeouts == @[(WifiMachwSoftResetReg, 0xFF'u32)]
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_recovery_releases_real_saved_queue_without_state_change(tmp_path: Path, mode: str) -> None:
     support = r'''
 proc waitMacSoftResetClear(): bool = true
+template smSaQueryResetScope() = discard
+proc smSaQueryClearResetTimer() = doAssert not interrupts
 proc hal_machw_reset(): bool =
   doAssert not interrupts
   true
@@ -190,6 +215,7 @@ proc txl_reset(): bool =
 proc mm_reset() = ke_state_set(TASK_MM, 0)
 proc vif_mgmt_reset() = doAssert not interrupts
 proc apmResumeHaltRollback() = doAssert not interrupts
+proc mmPsModeRetryAfterReset() = doAssert not interrupts
 '''
     code = saved_source() + support
     code += procedure((FW / "platform_bl.nim").read_text(), "bl_reset_evt")

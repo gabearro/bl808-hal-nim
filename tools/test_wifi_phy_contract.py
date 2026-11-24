@@ -51,6 +51,151 @@ for firstFlag in [false, true]:
 
 
 @pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
+def test_phy_init_clock_count_uses_two_version_samples(tmp_path: Path, mode: str) -> None:
+    rf = RF.read_text()
+    code = object_type(rf, "WifiModemBlock") + r'''
+var
+  modem: WifiModemBlock
+  versionWords: seq[uint32]
+  scratchReads, configReads: int
+  nimFwDbgPhyInitCount, nimFwDbgPhyInitPhase: uint32
+  nimFwDbgPhyModemVersion, nimFwDbgPhyClockCount: uint32
+  clockInitCalls, clockAsserts: int
+proc wifiModemRegs(): ptr WifiModemBlock = addr modem
+proc volatileLoad[T](p: ptr T): T =
+  when T is uint32:
+    if p == addr modem.versionScratch3c:
+      result = versionWords[min(scratchReads, versionWords.len - 1)]
+      inc scratchReads
+      return
+    if p == addr modem.versionWord:
+      inc configReads
+  p[]
+proc crm_init() = inc clockInitCalls
+proc wrapPhyAssertErr(condition, file: cstring; line: cint) =
+  doAssert condition == cstring("(mdm_major_version_getf() + 2) * 10 + mdm_minor_version_getf() == NX_MDM_VER")
+  doAssert file == cstring("module") and line == 586
+  inc clockAsserts
+'''
+    for name in ("extractBits", "phyClockCountFromVersion", "phyInitValidateClock"):
+        code += rf_procedure(rf, name)
+    run_program(tmp_path, mode, code + r'''
+versionWords = @[0x01000000'u32, 0x00020000'u32]
+modem.versionWord = 0x0C822111'u32
+phyInitValidateClock()
+doAssert scratchReads == 2 and configReads == 0
+doAssert clockInitCalls == 1 and clockAsserts == 0
+doAssert nimFwDbgPhyInitCount == 1 and nimFwDbgPhyInitPhase == 1
+doAssert nimFwDbgPhyModemVersion == versionWords[0]
+doAssert nimFwDbgPhyClockCount == 32
+
+versionWords = @[0x01020000'u32, 0x00010000'u32]
+scratchReads = 0
+phyInitValidateClock()
+doAssert scratchReads == 2 and configReads == 0
+doAssert clockInitCalls == 2 and clockAsserts == 1
+doAssert nimFwDbgPhyClockCount == 31
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
+def test_phy_init_capability_store_masks_and_order(tmp_path: Path, mode: str) -> None:
+    rf = RF.read_text()
+    code = object_type(rf, "WifiModemBlock") + object_type(rf, "MacPhyCtrlBlock") + r'''
+static:
+  doAssert offsetof(WifiModemBlock, versionFeatureCtrl800) == 0x800
+  doAssert offsetof(WifiModemBlock, channelTypeCtrl824) == 0x824
+  doAssert offsetof(WifiModemBlock, channelProfile870) == 0x870
+  doAssert offsetof(MacPhyCtrlBlock, channelBandwidthCtrl310) == 0x310
+var
+  modem: WifiModemBlock
+  macPhy: MacPhyCtrlBlock
+  writes: seq[tuple[location: pointer, value: uint32]]
+proc wifiModemRegs(): ptr WifiModemBlock = addr modem
+proc macPhyCtrlRegs(): ptr MacPhyCtrlBlock = addr macPhy
+proc volatileLoad[T](p: ptr T): T = p[]
+proc volatileStore(p: ptr uint32; value: uint32) =
+  writes.add((cast[pointer](p), value))
+  p[] = value
+proc updateReg32(p: ptr uint32; keep, value: uint32) =
+  volatileStore(p, (volatileLoad(p) and keep) or value)
+proc wrapPhyAssertErr(condition, file: cstring; line: cint) =
+  doAssert false, "unexpected PHY field assertion"
+'''
+    for name in ("modemVersionReg", "extractBits", "validatePhyInitFieldFits",
+                 "bl808PhyProgramRecoveredRegs"):
+        code += rf_procedure(rf, name)
+    run_program(tmp_path, mode, code + r'''
+for bit21 in 0'u32 .. 1:
+  for bit31 in 0'u32 .. 1:
+    modem = default(WifiModemBlock)
+    macPhy = default(MacPhyCtrlBlock)
+    writes.setLen(0)
+    modem.versionWord = 0x00002220'u32 or (bit21 shl 21) or (bit31 shl 31)
+    modem.versionFeatureCtrl800 = 0xA5A55A5A'u32
+    modem.channelProfile870 = 0x881F40C1'u32
+    bl808PhyProgramRecoveredRegs()
+    var featureWrites, channelWrites, profileWrites: seq[uint32]
+    var profileIndex = -1
+    var lastChannelIndex = -1
+    for i, row in writes:
+      if row.location == cast[pointer](addr modem.versionFeatureCtrl800):
+        featureWrites.add(row.value)
+      if row.location == cast[pointer](addr modem.channelTypeCtrl824):
+        channelWrites.add(row.value)
+        lastChannelIndex = i
+      if row.location == cast[pointer](addr modem.channelProfile870):
+        profileWrites.add(row.value)
+        profileIndex = i
+      doAssert row.location != cast[pointer](addr modem.channelModeCtrl930)
+      doAssert row.location != cast[pointer](addr modem.basebandDfeTimeout3bc)
+      doAssert row.location != cast[pointer](addr modem.basebandDfeEnable414)
+      doAssert row.location != cast[pointer](addr modem.basebandRxPathCtrlC40)
+      doAssert row.location != cast[pointer](addr modem.basebandRxPathCtrlC44)
+    let firstFeature = (0xA5A55A5A'u32 and 0xFFFFF0FF'u32) or 0x100'u32
+    let secondFeature = (firstFeature and 0xFFFFFF0F'u32) or 0x10'u32
+    doAssert featureWrites == @[firstFeature, secondFeature],
+      "vendor has only two ordered feature-register writes"
+    doAssert channelWrites.len == 8
+    doAssert channelWrites[^1] == modem.channelTypeCtrl824
+    doAssert profileWrites == @[0x891F40C1'u32]
+    doAssert profileIndex > 0 and profileIndex < lastChannelIndex
+    doAssert (modem.channelTypeCtrl824 and 0x00030000'u32) ==
+      ((bit21 shl 17) or (bit31 shl 16)),
+      "version bit 31 must update bit 16 without clearing bit 17"
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
+def test_phy_field_and_aid_assert_arguments(tmp_path: Path, mode: str) -> None:
+    rf = RF.read_text()
+    code = source() + object_type(rf, "WifiModemBlock") + r'''
+var
+  modem: WifiModemBlock
+  assertions: seq[tuple[condition, file: string; line: int]]
+proc wifiModemRegs(): ptr WifiModemBlock = addr modem
+proc volatileStore[T](p: ptr T; value: T) = p[] = value
+proc wrapPhyAssertErr(condition, file: cstring; line: cint) =
+  assertions.add((condition: $condition, file: $file, line: line.int))
+'''
+    for name in ("validatePhyInitFieldFits", "phy_set_aid"):
+        code += rf_procedure(rf, name)
+    run_program(tmp_path, mode, code + r'''
+const aidCondition = "(((uint32_t)hestaid << 0) & ~((uint32_t)0x000007FF)) == 0"
+const fieldCondition = "(((uint32_t)rxnssmax << 4) & ~((uint32_t)0x00000070)) == 0"
+validatePhyInitFieldFits(fieldCondition, 7, 4, 0x70)
+doAssert assertions.len == 0
+validatePhyInitFieldFits(fieldCondition, 8, 4, 0x70)
+doAssert assertions == @[(condition: fieldCondition, file: "module", line: 0x35C4)]
+phy_set_aid(0x7FF'u16)
+doAssert assertions.len == 1 and modem.aid == 0x7FF'u32
+phy_set_aid(0x800'u16)
+doAssert assertions[1] == (condition: aidCondition, file: "module", line: 0x35C3)
+doAssert modem.aid == 0x800'u32 and modem.aidMaskLo == 0 and modem.aidMaskHi == 0x7FF
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
 def test_phy_channel_getter_snapshots_both_words_before_output(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, source() + r'''
 for seed in [0, 1, 127, 255]:
@@ -67,6 +212,26 @@ for seed in [0, 1, 127, 255]:
 channelReads.setLen(0)
 phy_get_channel_raw(nil, 255)
 doAssert channelReads.len == 0
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
+def test_phy_power_table_reload_reads_channel_type_byte(tmp_path: Path, mode: str) -> None:
+    rf = RF.read_text()
+    code = source() + r'''
+var requestedTypes: seq[uint8]
+proc trpcLoadPowerFromConfig(kind: uint8) = requestedTypes.add(kind)
+'''
+    code += rf_procedure(rf, "phy_update_power_table")
+    run_program(tmp_path, mode, code + r'''
+for kind in 0 .. 255:
+  phy_env[36] = 0xA5'u8
+  phy_env[37] = kind.uint8
+  channelReads.setLen(0)
+  requestedTypes.setLen(0)
+  phy_update_power_table()
+  doAssert requestedTypes == @[kind.uint8]
+  doAssert channelReads == @[(37, 1)], "vendor reads phy_env+37 as a byte"
 ''')
 
 

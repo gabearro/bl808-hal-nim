@@ -7,7 +7,10 @@ proc wifiServicePump*(iterations: uint32 = 8'u32) {.cdecl.} =
     (wifiStaIdleFuture != nil and not wifiStaIdleFuture.finished) or
     (wifiDisconnectFuture != nil and not wifiDisconnectFuture.finished) or
     wifiDisconnectIssuePending
-  if not hasPending and not wifiApEnabled and not wifiBackendConnected():
+  # The peer indication can clear the host link before SM's cleanup replies
+  # or station-delete retry timer arrive. Keep servicing that firmware owner.
+  if not hasPending and sm_state != SmDisconnectingState and
+      not wifiApEnabled and not wifiBackendConnected():
     return
   let count = if iterations == 0'u32: 1'u32 else: iterations
   wifiBackendPoll(count)

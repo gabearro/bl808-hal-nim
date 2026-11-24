@@ -59,9 +59,8 @@ check([37'u8, 3, 0, 36, 4, 62, 1, 1], 0,
       packed(1, 1, 5180, 5190, 0), [(1'u8, 36'u8)])
 check([37'u8, 3, 0, 36, 4, 62, 1, 3], 0,
       packed(1, 1, 5180, 5170, 0), [(1'u8, 36'u8)])
-for offset in [0'u8, 2, 255]:
-  check([37'u8, 3, 0, 6, 4, 62, 1, offset], 0,
-        packed(0, 0, 2437, 2437, 0), [(0'u8, 6'u8)])
+check([37'u8, 3, 0, 6, 4, 62, 1, 0], 0,
+      packed(0, 0, 2437, 2437, 0), [(0'u8, 6'u8)])
 for width in 0'u8 .. 4'u8:
   let encodedWidth = if width in 1'u8 .. 3'u8: width + 1 else: 1'u8
   check([37'u8, 3, 1, 36, 4, 196, 5, 194, 3, width, 42, 58], 1,
@@ -82,6 +81,28 @@ for count in [0'u8, 1, 4, 255]:
   doAssert parse(addr input[0], input.len.uint32, addr mode, addr output[0]) ==
     (if count == 0: 2'u8 else: count)
   doAssert mode == 1
+proc rejectInvalid(ies: openArray[uint8]; expectedCalls: openArray[tuple[band, channel: uint8]]) =
+  let data = malloc(ies.len.csize_t)
+  doAssert data != nil
+  copyMem(data, unsafeAddr ies[0], ies.len)
+  for value in output.mitems: value = 0xA5
+  mode = 0xCC
+  calls.setLen(0)
+  doAssert parse(data, ies.len.uint32, addr mode, addr output[0]) == 0
+  doAssert mode == 0xCC and calls == @expectedCalls
+  for value in output: doAssert value == 0xA5
+  free(data)
+rejectInvalid([37'u8, 3, 1, 0, 4], [(0'u8, 0'u8)])
+rejectInvalid([37'u8, 3, 1, 166, 4, 62, 1, 1], [(1'u8, 166'u8)])
+rejectInvalid([37'u8, 3, 1, 36, 4, 196, 5, 194, 3, 1, 0, 58],
+              [(1'u8, 36'u8), (1'u8, 0'u8)])
+rejectInvalid([37'u8, 3, 1, 36, 4, 196, 5, 194, 3, 1, 42, 166],
+              [(1'u8, 36'u8), (1'u8, 42'u8), (1'u8, 166'u8)])
+for offset in [2'u8, 4, 255]:
+  rejectInvalid([37'u8, 3, 0, 6, 4, 62, 1, offset], [])
+rejectInvalid([37'u8, 3, 0, 165, 4, 62, 1, 1], [(1'u8, 165'u8)])
+rejectInvalid([37'u8, 3, 0, 14, 4, 62, 1, 1], [(0'u8, 14'u8)])
+rejectInvalid([37'u8, 3, 0, 1, 4, 62, 1, 3], [(0'u8, 1'u8)])
 for bytes in [newSeq[uint8](), @[1'u8, 1, 2], @[37'u8, 2, 1, 6],
               @[60'u8, 3, 0, 81, 36], @[37'u8, 3, 1, 6],
               @[37'u8, 3, 1, 6, 4, 62, 0],
@@ -113,5 +134,47 @@ def test_csa_extraction(tmp_path: Path, mode: str, case: str) -> None:
                  "WideBandwidthChannelSwitchIeView", "CsaOutputView"]:
         types += "  " + name + layout.split("  " + name, 1)[1].split("\n\n  ", 1)[0] + "\n"
     functions = procedure((FW / "mac_config_debug.nim").read_text(), "mac_ie_find")
-    functions += procedure((FW / "scan_station_ap_me.nim").read_text(), "me_extract_csa")
+    scan = (FW / "scan_station_ap_me.nim").read_text()
+    functions += procedure(scan, "scanChannelValid")
+    functions += procedure(scan, "me_extract_csa")
     run_program(tmp_path, mode, types + PLATFORM + functions + (FIELDS if case == "fields" else CONTRACT))
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_csa_uses_linked_five_ghz_converter(tmp_path: Path, mode: str) -> None:
+    layout = (FW / "layout_types.nim").read_text()
+    types = "type\n"
+    for name in ["MacIeView", "CsaIeView", "ExtendedCsaIeView",
+                 "SecondaryChannelOffsetIeView", "WideBandwidthChannelSwitchIeView",
+                 "CsaOutputView"]:
+        types += "  " + name + layout.split("  " + name, 1)[1].split("\n\n  ", 1)[0] + "\n"
+    host_conversion = ROOT / "src/bl808/wifi/msg_tx/channel_plan_parts/phy_conversion.nim"
+    linked_platform = PLATFORM.replace(
+        procedure(PLATFORM, "phy_channel_to_freq"),
+        "const PHY_BAND_2G4 = 0'u8\n"
+        + procedure(host_conversion.read_text(), "phy_channel_to_freq")
+        + "proc phy_channel_to_freq(band, channel: uint8): uint16 =\n"
+          "  phy_channel_to_freq(band, channel.cint)\n",
+        1,
+    )
+    functions = procedure((FW / "mac_config_debug.nim").read_text(), "mac_ie_find")
+    scan = (FW / "scan_station_ap_me.nim").read_text()
+    functions += procedure(scan, "scanChannelValid")
+    functions += procedure(scan, "me_extract_csa")
+    run_program(tmp_path, mode, types + linked_platform + functions + r'''
+var ies = [60'u8, 4, 0, 81, 165, 1]
+var switchMode = 0xCC'u8
+var output: CsaOutputView
+doAssert me_extract_csa(addr ies[0], ies.len.uint32, addr switchMode,
+                       addr output) == 1
+doAssert switchMode == 0
+doAssert output.band == 1 and output.primaryFreq == 5825
+doAssert output.centerFreq1 == 5825 and output.centerFreq2 == 0
+let previous = output
+for invalid in [@[37'u8, 3, 1, 166, 1, 62, 1, 1],
+                @[37'u8, 3, 1, 36, 1, 196, 5, 194, 3, 1, 0, 58]]:
+  switchMode = 0xCC
+  doAssert me_extract_csa(unsafeAddr invalid[0], invalid.len.uint32,
+                         addr switchMode, addr output) == 0
+  doAssert switchMode == 0xCC and output == previous
+''')

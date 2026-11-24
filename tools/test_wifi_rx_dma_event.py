@@ -163,10 +163,12 @@ def test_scheduler_retains_next_dma_event(tmp_path: Path, mode: str) -> None:
 const KE_EVT_MAX = 26
 var keEvtHandlers: array[KE_EVT_MAX, tuple[handler, param: pointer]]
 template keEvtField: uint32 = events
+template keEnvEventField(): ptr uint32 = addr events
 proc nimFwTrace2U32(tag: cstring; first, second: uint32) = discard
 proc assert_err(condition, file: cstring; line: cint) = doAssert false
 '''
-    code += procedure(kernel, "eventIndex32") + procedure(kernel, "ke_evt_schedule")
+    code += "".join(procedure(kernel, name) for name in (
+        "eventIndex32", "keDispatchEvent", "ke_evt_schedule"))
     run_program(tmp_path, mode, code + r'''
 for irq in [false, true]:
   setup(true, irq)

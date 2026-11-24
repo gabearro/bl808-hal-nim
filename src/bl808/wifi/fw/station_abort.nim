@@ -1,6 +1,6 @@
 # Private allocation tails leave the one-byte request ABI unchanged.
 type
-  SmAbortIdentity = object
+  SmStaRequestIdentity = object
     connection: pointer
     vifEpoch: uint32
     vifIndex: uint8
@@ -8,13 +8,16 @@ type
   SmAbortTag = object
     next: ptr SmAbortTag
     header: ptr KeMsgHdr
-    identity: SmAbortIdentity
+    identity: SmStaRequestIdentity
     captured: bool
 
 var smAbortTags {.wifiCtrl.}: ptr SmAbortTag
 
+proc smHasOwnedStaRequest(id: uint16; destination: uint8): bool {.inline.} =
+  destination == TASK_SM and id in [SM_CONNECT_ABORT_REQ, SM_DISCONNECT_REQ]
+
 proc smAbortStorageLength(id: uint16; destination: uint8; length: uint32): uint32 =
-  if id != SM_CONNECT_ABORT_REQ or destination != TASK_SM or length == 0:
+  if not smHasOwnedStaRequest(id, destination) or length == 0:
     return length
   const alignment = alignof(SmAbortTag).uint32
   const overhead = KeMsgTailSlack + alignment - 1 + sizeof(SmAbortTag).uint32
@@ -23,7 +26,7 @@ proc smAbortStorageLength(id: uint16; destination: uint8; length: uint32): uint3
     sizeof(SmAbortTag).uint32
 
 proc smAbortRegister(header: ptr KeMsgHdr) =
-  if header.id != SM_CONNECT_ABORT_REQ or header.destId != TASK_SM or header.paramLen == 0:
+  if not smHasOwnedStaRequest(header.id, header.destId) or header.paramLen == 0:
     return
   const alignment = alignof(SmAbortTag).uint32
   let offset = (header.paramLen + KeMsgTailSlack + alignment - 1) and not (alignment - 1)
@@ -43,13 +46,13 @@ proc smAbortForget(header: pointer) =
       return
     link = addr link[].next
 
-proc smAbortCapture(request: pointer): SmAbortIdentity =
+proc smStaRequestCapture(request: pointer; id: uint16): SmStaRequestIdentity =
   let saved = irqSave()
   defer: irqRestore(saved)
   var tag = smAbortTags
   while tag != nil:
     if keMsgPayload(tag.header) == request:
-      if tag.header.id != SM_CONNECT_ABORT_REQ or tag.header.destId != TASK_SM or
+      if tag.header.id != id or tag.header.destId != TASK_SM or
           tag.header.paramLen != 1:
         return
       let vifIndex = cast[ptr uint8](request)[]
@@ -58,24 +61,31 @@ proc smAbortCapture(request: pointer): SmAbortIdentity =
         if vifIndex < MAX_VIFS.uint8:
           let connection = smEnvView().connectInfo
           let vif = vifChannelForIdx(vifIndex)
-          tag.identity = SmAbortIdentity(connection: connection, vifIndex: vifIndex,
+          tag.identity = SmStaRequestIdentity(connection: connection, vifIndex: vifIndex,
             vifEpoch: rxVifEpochs[vifIndex], valid:
               vif.vifIdx == vifIndex and vif.vifType == VIF_TYPE_STA and
-              (connection == nil or connectInfoView(connection).vifIdx == vifIndex))
+              (id == SM_DISCONNECT_REQ or connection == nil or
+               connectInfoView(connection).vifIdx == vifIndex))
       result = tag.identity
       if result.vifIndex != vifIndex: result.valid = false
       return
     tag = tag.next
 
-proc smAbortCurrent(identity: SmAbortIdentity): bool =
+proc smStaRequestVifCurrent(identity: SmStaRequestIdentity): bool {.inline.} =
   identity.valid and identity.vifIndex < MAX_VIFS.uint8 and
-    smEnvView().connectInfo == identity.connection and
     rxVifEpochs[identity.vifIndex] == identity.vifEpoch and
     vifChannelForIdx(identity.vifIndex).vifIdx == identity.vifIndex and
-    vifChannelForIdx(identity.vifIndex).vifType == VIF_TYPE_STA and
+    vifChannelForIdx(identity.vifIndex).vifType == VIF_TYPE_STA
+
+proc smAbortCapture(request: pointer): SmStaRequestIdentity =
+  smStaRequestCapture(request, SM_CONNECT_ABORT_REQ)
+
+proc smAbortCurrent(identity: SmStaRequestIdentity): bool =
+  smStaRequestVifCurrent(identity) and
+    smEnvView().connectInfo == identity.connection and
     (identity.connection == nil or
       connectInfoView(identity.connection).vifIdx == identity.vifIndex)
 
 proc smAbortCaptureMessage(header: ptr KeMsgHdr) =
-  if header.id == SM_CONNECT_ABORT_REQ and header.destId == TASK_SM:
-    discard smAbortCapture(keMsgPayload(header))
+  if smHasOwnedStaRequest(header.id, header.destId):
+    discard smStaRequestCapture(keMsgPayload(header), header.id)

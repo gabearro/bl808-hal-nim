@@ -1,0 +1,99 @@
+--- a/constantine/platforms/intrinsics/addcarry_subborrow.nim
++++ b/constantine/platforms/intrinsics/addcarry_subborrow.nim
+@@ -170,6 +170,12 @@
+     var carryOut: Ct[uint64]
+     sum = builtin_addcll(a, b, cast[Ct[uint64]](cIn), carryOut)
+     cOut = cast[Carry](carryOut)
++  elif sizeof(int) == 4:
++    # Portable fallback: no uint128 is available on RV32.
++    let partial = uint64(a) + uint64(b)
++    let total = partial + uint64(cIn)
++    sum = Ct[uint64](total)
++    cOut = Carry(ord(partial < uint64(a)) or ord(total < partial))
+   else:
+     block:
+       static:
+@@ -195,6 +201,11 @@
+     var borrowOut: Ct[uint64]
+     diff = builtin_subcll(a, b, cast[Ct[uint64]](bIn), borrowOut)
+     bOut = cast[Borrow](borrowOut)
++  elif sizeof(int) == 4:
++    let partial = uint64(a) - uint64(b)
++    let total = partial - uint64(bIn)
++    diff = Ct[uint64](total)
++    bOut = Borrow(ord(uint64(a) < uint64(b)) or ord(partial < uint64(bIn)))
+   else:
+     block:
+       static:
+--- a/constantine/math/arithmetic/limbs_montgomery.nim
++++ b/constantine/math/arithmetic/limbs_montgomery.nim
+@@ -10,6 +10,16 @@
+   # Internal
+   constantine/platforms/abstractions,
+   ./limbs, ./limbs_extmul
++
++when defined(zkbuildFipsTrace):
++  func zkbuildRecordFips(stage, column: cint,
++      words: ptr UncheckedArray[SecretWord], t, u, v: SecretWord)
++      {.importc.}
++
++when defined(zkbuildCiosTrace):
++  func zkbuildRecordCios(outer, column: cint,
++      words: ptr UncheckedArray[SecretWord], m, carry, low: SecretWord)
++      {.importc.}
+ 
+ when UseASM_X86_32:
+   import ./assembly/limbs_asm_redc_mont_x86
+@@ -293,6 +303,9 @@
+     mulAcc(t, u, v, a[i], b[0])
+     z[i] = v * SecretWord(m0ninv)
+     mulAcc(t, u, v, z[i], M[0])
++    when defined(zkbuildFipsTrace) and sizeof(SecretWord) == 4 and L == 8:
++      zkbuildRecordFips(0, cint(i),
++        cast[ptr UncheckedArray[SecretWord]](addr z[0]), t, u, v)
+     v = u
+     u = t
+     t = Zero
+@@ -301,12 +314,18 @@
+       mulAcc(t, u, v, a[j], b[i-j])
+       mulAcc(t, u, v, z[j], M[i-j])
+     z[i-L] = v
++    when defined(zkbuildFipsTrace) and sizeof(SecretWord) == 4 and L == 8:
++      zkbuildRecordFips(1, cint(i),
++        cast[ptr UncheckedArray[SecretWord]](addr z[0]), t, u, v)
+     v = u
+     u = t
+     t = Zero
+ 
+   when not lazyReduce:
+     discard z.csub(M, v.isNonZero() or not(z < M))
++  when defined(zkbuildFipsTrace) and sizeof(SecretWord) == 4 and L == 8:
++    zkbuildRecordFips(2, cint(2*L),
++      cast[ptr UncheckedArray[SecretWord]](addr z[0]), t, u, v)
+   r = z
+ 
+ func sumprodMont_CIOS_spare2bits[K: static int](
+@@ -433,11 +452,23 @@
+     let m = t[0] * SecretWord(m0ninv)
+     var C, lo: SecretWord
+     muladd1(C, lo, m, M[0], t[0])
++    when defined(zkbuildCiosTrace) and sizeof(SecretWord) == 4 and N == 8:
++      zkbuildRecordCios(cint(i), 0,
++        cast[ptr UncheckedArray[SecretWord]](addr t[0]), m, C, lo)
+     staticFor j, 1, N:
+       muladd2(C, t[j-1], m, M[j], C, t[j])
++      when defined(zkbuildCiosTrace) and sizeof(SecretWord) == 4 and N == 8:
++        zkbuildRecordCios(cint(i), cint(j),
++          cast[ptr UncheckedArray[SecretWord]](addr t[0]), m, C, t[j-1])
+     t[N-1] = C
++    when defined(zkbuildCiosTrace) and sizeof(SecretWord) == 4 and N == 8:
++      zkbuildRecordCios(cint(i), cint(N),
++        cast[ptr UncheckedArray[SecretWord]](addr t[0]), m, C, Zero)
+ 
+   discard t.csub(M, not(t < M))
++  when defined(zkbuildCiosTrace) and sizeof(SecretWord) == 4 and N == 8:
++    zkbuildRecordCios(cint(N), cint(N+1),
++      cast[ptr UncheckedArray[SecretWord]](addr t[0]), Zero, Zero, Zero)
+   r = t
+ 
+ # Exported API

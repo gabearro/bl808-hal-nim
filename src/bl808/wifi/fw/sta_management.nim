@@ -9,12 +9,11 @@ proc staDeleteIsCurrent(staIdx: uint8, epoch: uint32): bool =
   staIdx < STA_MGMT_FREE_STAS.uint8 and staDeleteEpochs[staIdx] == epoch and
     staInfoForIdx(staIdx).valid != 0
 
-proc staDeleteInvalidate(staIdx: uint8) =
+proc staDeleteCancelQueued(staIdx: uint8) =
   if staIdx >= STA_MGMT_FREE_STAS.uint8:
     return
-  # Keep request ownership and reply routing, but cancel its obsolete target.
   let saved = irqSave()
-  inc staDeleteEpochs[staIdx]
+  defer: irqRestore(saved)
   for queue in [addr keMsgQueueSent, addr keMsgQueueSaved]:
     var node = queue.first
     while node != nil:
@@ -26,7 +25,13 @@ proc staDeleteInvalidate(staIdx: uint8) =
         if request.staIdx == staIdx:
           request.staIdx = 0xFF
       node = node.next
-  irqRestore(saved)
+
+proc staDeleteInvalidate(staIdx: uint8; cancelQueued = true) =
+  if staIdx >= STA_MGMT_FREE_STAS.uint8: return
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  inc staDeleteEpochs[staIdx]
+  if cancelQueued: staDeleteCancelQueued(staIdx)
 
 proc sta_mgmt_init*() {.exportc, cdecl.} =
   ## Initialize station management (84 instrs).
@@ -91,6 +96,9 @@ proc sta_mgmt_register*(param: pointer, staIdxOut: ptr uint8): uint8 {.exportc, 
   staIdxOut[] = 0xFF
   let instNbr = req.instNbr
   if instNbr >= MAX_VIFS.uint8 or sta_info_env.first == nil:
+    return 1
+  if (req.macAddr[0] and 1'u8) != 0 or
+      req.macAddr == [0'u8, 0, 0, 0, 0, 0]:
     return 1
   let vif = vifChannelForIdx(instNbr)
   let vifEpoch = rxVifEpochs[instNbr]
@@ -171,7 +179,7 @@ proc sta_mgmt_register*(param: pointer, staIdxOut: ptr uint8): uint8 {.exportc, 
     sta.keyMat = cast[pointer](addr sta.keyHolder)
   else:
     sta.keyMat = cast[pointer](keyPtrs)
-  if (vifFlags and 16) != 0:
+  if (keyPtrs.flags and 16) != 0:
     sta.capabilityFlags = sta.capabilityFlags or 8
   # Push STA onto the VIF's postponed-STA list.
   co_list_push_back(vifPostponedStaList(vif), cast[ptr CoListHdr](staEntry))
@@ -208,7 +216,7 @@ proc staMgmtBeginRemoval(staIdx: uint8; owner: var StaQueueIdentity): pointer =
     return nil
   cast[pointer](sta)
 
-proc staMgmtFinishRemoval(owner: StaQueueIdentity) =
+proc staMgmtFinishRemoval(owner: StaQueueIdentity): bool {.discardable.} =
   # Keep the slot out of the free list until postponed TX callbacks finish.
   if not owner.stationTracked or owner.station >= STA_MGMT_FREE_STAS.uint8:
     return
@@ -224,7 +232,9 @@ proc staMgmtFinishRemoval(owner: StaQueueIdentity) =
       sta.valid != 0 or sta.instNbr != 0xFF or
       co_list_find(addr sta_info_env, cast[ptr CoListHdr](owner.entry)):
     return
+  staDeleteCancelQueued(owner.station)
   co_list_push_back(addr sta_info_env, cast[ptr CoListHdr](owner.entry))
+  true
 
 proc sta_mgmt_unregister*(staIdx: uint8) {.exportc, cdecl.} =
   ## Vendor order: detach, drain/reset, then return the station to the free list.
@@ -390,7 +400,11 @@ proc staMgmtResetEntry(owner: StaQueueIdentity; requireRetired: bool): bool =
     return false
   var resetOwner = owner
   if owner.stationTracked and owner.station < STA_MGMT_FREE_STAS.uint8:
-    staDeleteInvalidate(owner.station)
+    let deletion = mmStaDeletions[owner.station]
+    let preserveRequest = requireRetired and deletion.active and deletion.requestOwned and
+      deletion.owner.entry == owner.entry and
+      deletion.owner.stationEpoch == owner.stationEpoch
+    staDeleteInvalidate(owner.station, not preserveRequest)
     resetOwner.stationEpoch = staDeleteEpoch(owner.station)
   discard staReleasePostponed(resetOwner, 1'u32, saved)
   if not staPostponedOwnerCurrent(resetOwner) or

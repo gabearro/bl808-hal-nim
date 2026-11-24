@@ -34,6 +34,7 @@ proc staInfoForIdx(index: uint8): ptr Sta =
   doAssert index < 7
   addr stations[index]
 proc vifChannelForIdx(index: uint8): ptr Vif = addr vifs[index]
+proc mmResetBeaconProbeCount(vif: ptr Vif) = vif.probeCount = 0
 proc encodedArgU8(p: pointer): uint8 = cast[uint](p).uint8
 proc apm_sta_remove(vif, sta: uint8; kind, reason: uint16): bool =
   removals.add((vif, sta, kind, reason))

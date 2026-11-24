@@ -15,6 +15,7 @@ FW = ROOT / "src/bl808/wifi/fw"
 PLATFORM = MFP_PLATFORM.replace(
     "  Vif = object\n",
     "  Vif = object\n    next: pointer\n    macAddr: array[6, uint8]\n"
+    "    bssid, currentBssid: array[6, uint8]\n"
     "    vifType, vifIdx, state: uint8\n",
 ).replace(
     "  Sta = object\n", "  Sta = object\n    valid, instNbr: uint8\n"
@@ -70,7 +71,7 @@ var
   message: array[256, uint8]
   messageLength: uint32
   destination: uint8
-  allocationCalls, sent, uploads, decodes, beaconChecks, policyCalls: int
+  allocationCalls, sent, uploads, decodes, beaconChecks, policyCalls, apmChecks: int
   policyVif, policySta: uint8
   forceIgnore, forceUpload, allocationFailure: bool
   wildcardApmEnabled: bool
@@ -81,11 +82,11 @@ var
   rxUploadEpochs: array[41, uint32]
   stationEpochs: array[STA_INFO_TAB_ENTRIES, uint32]
   interrupts = true
-  onPolicy, onDecode: proc()
+  onPolicy, onDecode, onSend: proc()
   channelReads: int
   logging, loggerFailure: bool
   logs: seq[tuple[line: cint, text: string]]
-proc rxCaptureStation(desc: pointer; flags: uint32)
+proc rxCaptureStation(desc: pointer; flags: uint32; statusWord: ptr uint32 = nil)
 proc rxStationCurrent(desc: pointer): bool
 proc rxMpduDescIndex(p: pointer): int = (if p == addr desc: 0 else: -1)
 proc staDeleteEpoch(station: uint8): uint32 = stationEpochs[station]
@@ -108,6 +109,7 @@ proc vifChannelAt(p: pointer): ptr Vif = cast[ptr Vif](p)
 proc vif_mgmt_get_vif(i: uint8): pointer =
   if i < MAX_VIFS: addr vifs[i] else: nil
 proc apm_embedded_enabled(p: pointer): bool =
+  inc apmChecks
   if p == nil: wildcardApmEnabled
   else: vifChannelAt(p).vifType == 2
 proc phyif_utils_decode(p: pointer; rssi: ptr int8): uint32 =
@@ -152,6 +154,7 @@ proc rxMgtAllocMessage(p: pointer; task: uint8; length: uint32): pointer =
   addr message[0]
 proc ke_msg_send(p: pointer) =
   doAssert p == addr message[0]
+  if onSend != nil: onSend()
   inc sent
 proc ke_msg_free_payload(p: pointer) =
   doAssert p == addr message[0]
@@ -163,9 +166,11 @@ proc assert_warn(a, b: cstring; line: cint) = doAssert false
 template nimFwTrace2U32(args: varargs[untyped]) = discard
 template nimFwConnectTrace2U32(args: varargs[untyped]) = discard
 proc mfpIgnorePolicy(desc, param, frameBodyPtr: pointer; frameTotalLen: uint16;
-                     upload: ptr uint8; flags: ptr uint8; generation: uint32): bool
+                     upload: ptr uint8; flags: ptr uint8; generation: uint32;
+                     verifiedBip: ptr bool = nil): bool
 proc mfpIgnoreRxMgmtFrame(desc, param, frame: pointer; length: uint16;
-                         upload, flags: ptr uint8; generation: uint32): bool =
+                         upload, flags: ptr uint8; generation: uint32;
+                         verifiedBip: ptr bool = nil): bool =
   inc policyCalls
   policyVif = env.vifIdx
   policySta = env.staIdx
@@ -173,7 +178,7 @@ proc mfpIgnoreRxMgmtFrame(desc, param, frame: pointer; length: uint16;
     upload[] = forceUpload.uint8
     result = true
   else:
-    result = mfpIgnorePolicy(desc, param, frame, length, upload, flags, generation)
+    result = mfpIgnorePolicy(desc, param, frame, length, upload, flags, generation, verifiedBip)
   if onPolicy != nil: onPolicy()
 proc reset(fc: uint16; vif: uint8; station: uint8 = 4; kind: uint8 = 0) =
   vifs = default(typeof(vifs))
@@ -194,7 +199,17 @@ proc reset(fc: uint16; vif: uint8; station: uint8 = 4; kind: uint8 = 0) =
   mm = default(MmEnv)
   frame = Frame(frameControl: fc)
   if vif < MAX_VIFS: frame.addr1 = vifs[vif].macAddr
+  if (fc and 0xFC'u16) == 0x80'u16 and kind == 0:
+    frame.addr1 = [0xFF'u8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
   frame.addr3 = [2'u8, 8, 7, 6, 5, 4]
+  frame.addr2 = frame.addr3
+  if kind == 2 and vif < MAX_VIFS:
+    frame.addr3 = vifs[vif].macAddr
+  if vif < MAX_VIFS:
+    vifs[vif].bssid = frame.addr3
+    vifs[vif].currentBssid = frame.addr3
+  if station < STA_INFO_TAB_ENTRIES:
+    stations[station].macAddr = frame.addr2
   for i in 0 ..< frame.body.len: frame.body[i] = i.uint8
   rx = Rx(bufferChain: addr frame, mpduLengthBytes: 36)
   desc.swDesc = addr rx
@@ -210,6 +225,7 @@ proc reset(fc: uint16; vif: uint8; station: uint8 = 4; kind: uint8 = 0) =
   decodes = 0
   beaconChecks = 0
   policyCalls = 0
+  apmChecks = 0
   forceIgnore = false
   forceUpload = false
   allocationFailure = false
@@ -217,6 +233,7 @@ proc reset(fc: uint16; vif: uint8; station: uint8 = 4; kind: uint8 = 0) =
   scanState = ScanChannelRunningState
   onPolicy = nil
   onDecode = nil
+  onSend = nil
   channelReads = 0
   interrupts = true
   logging = false
@@ -260,6 +277,182 @@ for vif in 0'u8 .. 1:
   env.vifIdx = 255
   discard rxu_mgt_frame_check(addr desc, 4)
   doAssert sent == 1 and message[7] == 4 and message[8] == vif
+"""
+
+ADDRESS_ADMISSION = r"""
+for fc in [0xB0'u16, 0x10'u16, 0x30'u16]:
+  reset(fc, 0)
+  env.seqCtrl = 0x1230
+  discard rxu_mgt_frame_check(addr desc, 4)
+  doAssert sent == 1 and stations[4].nonQosSeqCtrl == 0x1230
+
+  for changed in 0 .. 5:
+    reset(fc, 0)
+    env.seqCtrl = 0x1230
+    stations[4].nonQosSeqCtrl = 0x4560
+    case changed
+    of 0: frame.addr1[0] = frame.addr1[0] xor 2
+    of 1: frame.addr2[0] = frame.addr2[0] xor 2
+    of 2: frame.addr3[0] = frame.addr3[0] xor 2
+    of 3:
+      vifs[0].currentBssid = [0'u8, 0, 0, 0, 0, 0]
+      vifs[0].bssid = [0'u8, 0, 0, 0, 0, 0]
+    else:
+      if changed == 4:
+        vifs[0].currentBssid = [0xFF'u8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+        vifs[0].bssid = [0xFF'u8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+      else:
+        vifs[0].bssid[0] = 1
+    discard rxu_mgt_frame_check(addr desc, 4)
+    doAssert sent == 0 and allocationCalls == 0,
+      "wrong station response peer was dispatched"
+    doAssert stations[4].nonQosSeqCtrl == 0x4560,
+      "wrong station response peer advanced duplicate state"
+
+  reset(fc, 0)
+  vifs[0].bssid = [0'u8, 0, 0, 0, 0, 0]
+  discard rxu_mgt_frame_check(addr desc, 4)
+  doAssert sent == 1, "current BSSID fallback was lost"
+
+  reset(fc, 0)
+  vifs[0].currentBssid = [2'u8, 8, 7, 6, 5, 9]
+  discard rxu_mgt_frame_check(addr desc, 4)
+  doAssert sent == 1, "stale current BSSID overrode the join target"
+
+reset(0xB0, 0, 4, 2)
+frame.addr2[0] = frame.addr2[0] xor 2
+discard rxu_mgt_frame_check(addr desc, 4)
+doAssert sent == 1, "AP authentication request was filtered as a STA response"
+"""
+
+DISCONNECT_PEER_ADMISSION = r"""
+for fc in [0xA0'u16, 0xC0'u16]:
+  reset(fc, 0)
+  env.seqCtrl = 0x1230
+  discard rxu_mgt_frame_check(addr desc, 4)
+  doAssert sent == 1 and stations[4].nonQosSeqCtrl == 0x1230
+
+  for changed in 0 .. 2:
+    reset(fc, 0)
+    env.seqCtrl = 0x1230
+    stations[4].nonQosSeqCtrl = 0x4560
+    case changed
+    of 0: frame.addr1[0] = frame.addr1[0] xor 2
+    of 1: frame.addr2[0] = frame.addr2[0] xor 2
+    else: frame.addr3[0] = frame.addr3[0] xor 2
+    discard rxu_mgt_frame_check(addr desc, 4)
+    doAssert sent == 0 and allocationCalls == 0,
+      "wrong disconnect peer was dispatched"
+    doAssert stations[4].nonQosSeqCtrl == 0x4560,
+      "wrong disconnect peer advanced duplicate state"
+
+  reset(fc, 0)
+  frame.addr1 = [0xFF'u8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+  discard rxu_mgt_frame_check(addr desc, 4)
+  doAssert sent == 1, "broadcast disconnect was rejected"
+
+for fc in [0xA0'u16, 0xC0'u16]:
+  reset(fc, 0, 4, 2)
+  env.seqCtrl = 0x1230
+  discard rxu_mgt_frame_check(addr desc, 4)
+  doAssert sent == 1 and stations[4].nonQosSeqCtrl == 0x1230,
+    "registered AP station disconnect was rejected"
+  for changed in 0 .. 5:
+    reset(fc, 0, 4, 2)
+    env.seqCtrl = 0x1230
+    stations[4].nonQosSeqCtrl = 0x4560
+    mm.apPromiscUploadFlag = 1
+    case changed
+    of 0: frame.addr1[0] = frame.addr1[0] xor 2
+    of 1: frame.addr2[0] = frame.addr2[0] xor 2
+    of 2: frame.addr3[0] = frame.addr3[0] xor 2
+    of 3: stations[4].macAddr[0] = stations[4].macAddr[0] xor 2
+    of 4: stations[4].instNbr = 1
+    else: stations[4].valid = 0
+    discard rxu_mgt_frame_check(addr desc, 4)
+    doAssert sent == 0 and allocationCalls == 0 and policyCalls == 0 and
+      uploads == 0,
+      "unowned AP disconnect reached management policy"
+    doAssert stations[4].nonQosSeqCtrl == 0x4560,
+      "unowned AP disconnect advanced duplicate state"
+"""
+
+ACTION_PEER_ADMISSION = r"""
+for category in [3'u8, 8'u8]:
+  reset(0xD0, 0)
+  frame.body[0] = category
+  env.seqCtrl = 0x1230
+  discard rxu_mgt_frame_check(addr desc, 4)
+  doAssert sent == 1 and stations[4].nonQosSeqCtrl == 0x1230
+
+  for changed in 0 .. 3:
+    reset(0xD0, 0)
+    frame.body[0] = category
+    env.seqCtrl = 0x1230
+    stations[4].nonQosSeqCtrl = 0x4560
+    case changed
+    of 0: frame.addr1[0] = frame.addr1[0] xor 2
+    of 1: frame.addr2[0] = frame.addr2[0] xor 2
+    of 2: frame.addr3[0] = frame.addr3[0] xor 2
+    else: frame.addr1 = [0xFF'u8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+    discard rxu_mgt_frame_check(addr desc, 4)
+    doAssert sent == 0 and allocationCalls == 0 and uploads == 0,
+      "wrong-peer action reached station state"
+    doAssert stations[4].nonQosSeqCtrl == 0x4560,
+      "wrong-peer action advanced duplicate state"
+
+reset(0xD0, 0, 4, 2)
+frame.body[0] = 3
+discard rxu_mgt_frame_check(addr desc, 4)
+doAssert sent == 1, "registered AP Block Ack action was rejected"
+for changed in 0 .. 4:
+  reset(0xD0, 0, 4, 2)
+  frame.body[0] = 3
+  env.seqCtrl = 0x1230
+  stations[4].nonQosSeqCtrl = 0x4560
+  mm.apPromiscUploadFlag = 1
+  case changed
+  of 0: frame.addr1[0] = frame.addr1[0] xor 2
+  of 1: frame.addr2[0] = frame.addr2[0] xor 2
+  of 2: frame.addr3[0] = frame.addr3[0] xor 2
+  of 3: stations[4].instNbr = 1
+  else: stations[4].valid = 0
+  discard rxu_mgt_frame_check(addr desc, 4)
+  doAssert sent == 0 and allocationCalls == 0 and policyCalls == 0 and
+    uploads == 0,
+    "unowned AP Block Ack request reached management policy"
+  doAssert stations[4].nonQosSeqCtrl == 0x4560,
+    "unowned AP Block Ack request advanced duplicate state"
+"""
+
+DUPLICATE_COMMIT = r"""
+for category in [4'u8, 5'u8]:
+  reset(0xD0, 0)
+  frame.body[0] = category
+  env.seqCtrl = 0x1230
+  stations[4].nonQosSeqCtrl = 0x4560
+  discard rxu_mgt_frame_check(addr desc, 4)
+  doAssert sent == 0 and allocationCalls == 0
+  doAssert stations[4].nonQosSeqCtrl == 0x4560,
+    "unsupported action consumed the station duplicate sequence"
+
+reset(0xB0, 0)
+env.seqCtrl = 0x1230
+stations[4].nonQosSeqCtrl = 0x4560
+allocationFailure = true
+discard rxu_mgt_frame_check(addr desc, 4)
+doAssert sent == 0 and allocationCalls == 1
+doAssert stations[4].nonQosSeqCtrl == 0x4560,
+  "allocation failure consumed the station duplicate sequence"
+
+reset(0xB0, 0)
+env.seqCtrl = 0x1230
+stations[4].nonQosSeqCtrl = 0x4560
+onSend = proc() = doAssert stations[4].nonQosSeqCtrl == 0x1230,
+  "management sequence was not committed before enqueue"
+discard rxu_mgt_frame_check(addr desc, 4)
+doAssert sent == 1 and stations[4].nonQosSeqCtrl == 0x1230,
+  "delivered management frame did not commit the duplicate sequence"
 """
 
 FILTERING = r"""
@@ -374,6 +567,78 @@ discard rxu_mgt_frame_check(addr desc, 4)
 doAssert sent == 0 and uploads == 0
 """
 
+AP_INDICATION_FIELDS = r"""
+for fc in [0'u16, 0x20'u16, 0x40'u16, 0xA0'u16, 0xB0'u16, 0xC0'u16]:
+  reset(fc, 0, 4, 2)
+  rx.timestampLow = 0x12345678'u32
+  rx.timestampHigh = 0x9ABCDEF0'u32
+  rx.phyVector[0] = 0x6D
+  for i in 16 .. 23: message[i] = 0xA5
+  message[28] = 0xA5
+  discard rxu_mgt_frame_check(addr desc, 4)
+  doAssert sent == 1 and destination == 5
+  if fc == 0:
+    doAssert equalMem(addr message[16], addr rx.timestampLow, 4)
+    doAssert equalMem(addr message[20], addr rx.timestampHigh, 4)
+    doAssert message[28] == rx.phyVector[0]
+  else:
+    for i in 16 .. 23: doAssert message[i] == 0xA5
+    doAssert message[28] == 0xA5
+"""
+
+BEACON_SCAN_STATE = r"""
+for state in [0'u16, 1'u16, ScanChannelPendingState, ScanChannelRunningState]:
+  reset(0x80, 0)
+  scanState = state
+  vifs[0].state = 1
+  doAssert rxu_mgt_frame_check(addr desc, 4) == 0
+  doAssert beaconChecks == 1, "associated beacon maintenance was skipped"
+  doAssert sent == (state == ScanChannelRunningState).int
+  doAssert allocationCalls == sent and uploads == 0
+  doAssert destination == (if sent != 0: 2'u8 else: 255'u8)
+  doAssert apmChecks == 0
+
+  reset(0x80, 255, 255)
+  rx.hwFlags = 0x200
+  scanState = state
+  doAssert rxu_mgt_frame_check(addr desc, 255) == 0
+  doAssert beaconChecks == 0 and uploads == 0
+  doAssert sent == (state == ScanChannelRunningState).int
+  doAssert apmChecks == (state != ScanChannelRunningState).int
+"""
+
+BEACON_PEER_ADMISSION = r"""
+reset(0x80, 0)
+vifs[0].state = 1
+discard rxu_mgt_frame_check(addr desc, 4)
+doAssert beaconChecks == 1 and sent == 1
+
+for changed in 0 .. 3:
+  reset(0x80, 0)
+  vifs[0].state = 1
+  case changed
+  of 0: frame.addr2[0] = frame.addr2[0] xor 2
+  of 1: frame.addr3[0] = frame.addr3[0] xor 2
+  of 2: frame.addr1 = vifs[0].macAddr
+  else: frame.addr1[0] = frame.addr1[0] xor 2
+  discard rxu_mgt_frame_check(addr desc, 4)
+  doAssert beaconChecks == 0 and sent == 0,
+    "wrong-peer associated beacon reached maintenance or scan"
+
+reset(0x80, 0)
+vifs[0].state = 1
+frame.addr1 = [0xFF'u8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+discard rxu_mgt_frame_check(addr desc, 4)
+doAssert beaconChecks == 1 and sent == 1,
+  "broadcast beacon from the selected AP was rejected"
+
+reset(0x80, 0, 4, 2)
+vifs[0].state = 1
+discard rxu_mgt_frame_check(addr desc, 4)
+doAssert beaconChecks == 0 and sent == 1,
+  "AP-mode RX beacon changed local beacon maintenance state"
+"""
+
 VIF_LIFETIME = r"""
 for vif in 0'u8 .. 1:
   # An unbound authentication frame is resolved only after a new attempt began.
@@ -440,6 +705,7 @@ for enabled in [false, true]:
     env.flags = 1
     env.seqCtrl = 0x1230
     frame.seqCtrl = env.seqCtrl
+    frame.addr1 = [0xFF'u8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
     frame.body[0] = 1
     frame.body[1] = 0
     rx.mpduLengthBytes = 44
@@ -462,12 +728,45 @@ for enabled in [false, true]:
     env.frameCtrl = frame.frameControl
     for i in 0..<8:
       mmie.mic[i] = ((computedMic shr (8 * i)) and 255).uint8
+    mm.rxPromiscUploadFlag = 1
+    frame.addr2[0] = frame.addr2[0] xor 2
+    discard rxu_mgt_frame_check(addr desc, 4)
+    doAssert stations[4].nonQosSeqCtrl == 0x7770 and sent == 0 and uploads == 0,
+      "authenticated wrong-peer BIP frame reached station state"
+    doAssert vifs[0].slots[keyId].replayCounters[0].pnLow == 0,
+      "authenticated wrong-peer BIP frame consumed the replay counter"
+    frame.addr2[0] = frame.addr2[0] xor 2
     discard rxu_mgt_frame_check(addr desc, 4)
     doAssert stations[4].nonQosSeqCtrl == 0x1230,
       "accepted BIP frame did not commit its management sequence"
     doAssert stations[3].nonQosSeqCtrl == 0x8880
     doAssert vifs[0].slots[keyId].replayCounters[0].pnLow == 4
     doAssert sent == 1 and interrupts == enabled
+
+    # A captured station still supplies the VIF when the RX environment is unset.
+    reset(0x08C0, 0, 4)
+    interrupts = enabled
+    env.vifIdx = 255
+    env.flags = 1
+    env.seqCtrl = 0x1230
+    frame.seqCtrl = env.seqCtrl
+    frame.addr1 = [0xFF'u8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+    frame.body[0] = 1
+    frame.body[1] = 0
+    rx.mpduLengthBytes = 44
+    vifs[0].keys.groupKeyPtr = 1
+    vifs[0].slots[keyId].installed = 1
+    let fallbackMmie = mmieAt(addr frame.body[2])
+    fallbackMmie[] = MmIeView(ie: Ie(id: 76, len: 16), keyId: keyId)
+    fallbackMmie.ipn[0] = 3
+    computedMic = 0x123456789ABCDEF0'u64
+    for i in 0..<8:
+      fallbackMmie.mic[i] = ((computedMic shr (8 * i)) and 255).uint8
+    discard rxu_mgt_frame_check(addr desc, 4)
+    doAssert policyVif == 0 and env.vifIdx == 0
+    doAssert vifs[0].slots[keyId].replayCounters[0].pnLow == 4
+    doAssert sent == 1 and stations[4].nonQosSeqCtrl == 0x1230
+    doAssert interrupts == enabled
 """
 
 
@@ -506,10 +805,18 @@ def test_management_logging(tmp_path: Path, mode: str) -> None:
     test_management_receive(tmp_path, mode, LOGGING)
 
 
-def management_source() -> str:
+def management_source(production_ap_gate: bool = False, rx_admission: bool = False) -> str:
     layout = (FW / "layout_types.nim").read_text()
     producer = (FW / "task_handlers.nim").read_text()
     code = PLATFORM
+    if production_ap_gate:
+        ap = (FW / "scan_station_ap_me.nim").read_text()
+        code = code.replace(procedure(code, "apm_embedded_enabled"), """
+const VIF_TYPE_AP = 2'u8
+var apmFlags: tuple[embeddedEnabled: uint8]
+var hostapd_enabled: uint8
+proc apmEnvView(): ptr typeof(apmFlags) = addr apmFlags
+""" + procedure(ap, "apm_embedded_enabled"))
     lower = (FW / "rx_layer.nim").read_text()
     for name in ["rxInvalidateQuiescentVif", "rxInvalidateVif", "rxUploadGeneration", "rxUploadCurrent", "rxCaptureStation", "rxIdentityCurrent",
                  "rxStationCurrent", "rxCapturedChannelCurrent", "rxReadCapturedChannel", "rxBindVif"]:
@@ -542,6 +849,11 @@ proc c_memcpy(dst, src: pointer; length: csize_t): pointer =
         "proc mfpIgnoreRxMgmtFrame", "proc mfpIgnorePolicy", 1
     )
     helpers = ""
+    helpers += """
+proc rxuCheckBeaconParams(desc: pointer; vif: uint8; length: uint16; frame: pointer): bool =
+  me_beacon_check(vif, length, frame)
+  true
+"""
     if "proc rxuMgtUpload(" in producer:
         helpers += procedure(producer, "rxuMgtUpload")
     body = procedure(producer, "rxu_mgt_frame_check")
@@ -550,11 +862,55 @@ proc c_memcpy(dst, src: pointer; length: csize_t): pointer =
         f"  {name}: " + ("array[16, uint32]" if name == "nimFwDbgMgtSubtypeCounts" else "uint32") + "\n"
         for name in debug
     )
+    if rx_admission:
+        code = "{.define: bl808WifiDiagPeerRxAdmission.}\n" + code
+        helpers += r'''
+type RxMgtProtection = enum
+  rxMgtProtectionUnknown, rxMgtWithoutProtection, rxMgtVerifiedCcmp, rxMgtVerifiedBip
+var reportedProtection: seq[RxMgtProtection]
+proc rxMgtNoteProtection(p: pointer; generation: uint32; protection: RxMgtProtection) =
+  doAssert p == addr desc
+  doAssert rxUploadCurrent(p, generation)
+  reportedProtection.add(protection)
+'''
     return code + helpers + body
 
 
+def test_rx_policy_labels_bip_and_unprotected_disconnects(tmp_path: Path) -> None:
+    run_program(tmp_path, "firmware", management_source(rx_admission=True) + BIP_SEQUENCE + r'''
+doAssert reportedProtection.len == 8  # Two accepted frames per VIF-key/IRQ case.
+for value in reportedProtection:
+  doAssert value == rxMgtVerifiedBip
+reportedProtection.setLen(0)
+reset(0x00C0, 0, 4)
+discard rxu_mgt_frame_check(addr desc, 4)
+doAssert sent == 1 and reportedProtection == @[rxMgtWithoutProtection]
+''')
+
+
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-@pytest.mark.parametrize("checks", [ROUTING, FILTERING, OWNERSHIP, SUBTYPES, VIF_LIFETIME, CHANNEL, BIP_SEQUENCE],
-                         ids=["routing", "filtering", "ownership", "subtypes", "vif-lifetime", "channel", "bip-sequence"])
+@pytest.mark.parametrize("checks", [ROUTING, ADDRESS_ADMISSION, DISCONNECT_PEER_ADMISSION, ACTION_PEER_ADMISSION, DUPLICATE_COMMIT, FILTERING, OWNERSHIP, SUBTYPES, AP_INDICATION_FIELDS, BEACON_SCAN_STATE, BEACON_PEER_ADMISSION, VIF_LIFETIME, CHANNEL, BIP_SEQUENCE],
+                         ids=["routing", "address-admission", "disconnect-peer-admission", "action-peer-admission", "duplicate-commit", "filtering", "ownership", "subtypes", "ap-indication-fields", "beacon-scan-state", "beacon-peer-admission", "vif-lifetime", "channel", "bip-sequence"])
 def test_management_receive(tmp_path: Path, mode: str, checks: str) -> None:
     run_program(tmp_path, mode, management_source() + checks)
+
+
+@pytest.mark.parametrize("mode", ["checked", "firmware"])
+def test_embedded_ap_flag_routes_client_authentication(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, management_source(production_ap_gate=True) + r'''
+for enabled in [false, true]:
+  reset(0xB0, 1, 255, VIF_TYPE_AP)
+  apmFlags.embeddedEnabled = enabled.uint8
+  hostapd_enabled = (not enabled).uint8
+  frame.body[0] = 0 # Open-system authentication, transaction one.
+  frame.body[1] = 0
+  frame.body[2] = 1
+  frame.body[3] = 0
+  frame.body[4] = 0
+  frame.body[5] = 0
+  discard rxu_mgt_frame_check(addr desc, 255)
+  if enabled:
+    doAssert sent == 1 and destination == 5, "enabled AP dropped ordinary authentication"
+  else:
+    doAssert sent == 0, "disabled AP accepted authentication"
+''')

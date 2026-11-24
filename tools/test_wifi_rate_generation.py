@@ -28,10 +28,9 @@ const
   RCS_NO_SS = 187
   RCS_GROUP_CNT = 188
   RCS_SHORT_GI = 189
-  RCS_BW_MAX = 190
+  RCS_PREAMBLE_TYPE = 190
   RCS_N_RATES = 192
   RCS_RATE_MAP_L = 194
-var rcPrngState: uint32
 proc rcU8(p: pointer; offset: int): var uint8 =
   cast[ptr uint8](cast[uint](p) + offset.uint)[]
 proc rcU16(p: pointer; offset: int): var uint16 =
@@ -44,6 +43,7 @@ let data = readFile(vectorPath)
 doAssert data.len mod stride == 0
 var state: array[200, uint8]
 let stats = addr state[0]
+doAssert rcPrngState == 1'u32, "incorrect cold-boot PRNG seed"
 for start in countup(0, data.len - stride, stride):
   copyMem(stats, unsafeAddr data[start], 200)
   var expected: array[2, uint16]
@@ -146,6 +146,23 @@ doAssert rc_pick_non_duplicate_rate(stats) == 0xFFFF
 rcU16(stats, 130) = 0xBEEF # Outside the ten-entry rate table.
 doAssert rc_check_rate_duplicated(stats, 0xBEEF) == 0
 doAssert rc_check_rate_duplicated(nil, 0xBEEF) == 0
+
+# Match the range of bit 10 in the HT-to-legacy random generator, including
+# nonzero OFDM indices in the deterministic exhaustion path.
+state = default(typeof(state))
+rcU8(stats, RCS_FORMAT_MOD) = 2
+rcU8(stats, RCS_LOWEST_IDX) = 3
+rcU8(stats, RCS_HIGHEST_IDX) = 4
+rcU8(stats, RCS_PREAMBLE_TYPE) = 1
+rcU8(stats, RCS_RATE_BITMAP) = 1
+rcU16(stats, RCS_RATE_MAP) = (1'u16 shl 3) or (1'u16 shl 4)
+rcU16(stats, RCS_N_RATES) = 2
+rcU16(stats, 10) = 0x403
+rcU16(stats, 22) = 0x1000
+doAssert rc_pick_non_duplicate_rate(stats) == 0x404
+rcU16(stats, 34) = 0x404
+rcU16(stats, RCS_N_RATES) = 3
+doAssert rc_pick_non_duplicate_rate(stats) == 0xFFFF
 """
 
 
@@ -238,6 +255,9 @@ def prelude() -> tuple[str, str, str]:
     source = (FW / "rate_control.nim").read_text()
     layout = (FW / "layout_types.nim").read_text()
     code = PLATFORM
+    storage = (FW / "global_state/storage.nim").read_text()
+    seed = next(line.strip() for line in storage.splitlines() if line.lstrip().startswith("rcPrngState* "))
+    code += f"\nvar {seed}\n"
     if "  RcRateCapabilitiesView" in layout:
         code += "\ntype\n  RcRateCapabilitiesView" + layout.split("  RcRateCapabilitiesView", 1)[1].split(
             "  RcRetrySlotView", 1)[0]

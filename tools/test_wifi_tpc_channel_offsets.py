@@ -1,4 +1,4 @@
-"""TPC offset publication and C-varargs behavior from the pinned WiFi object."""
+"""TPC offset forwarding and C-varargs behavior from the pinned WiFi object."""
 
 from pathlib import Path
 
@@ -74,7 +74,7 @@ def source() -> str:
 
 
 CASES = {
-    "signed_values_and_publication": r'''
+    "signed_values_without_publication": r'''
 for seed in 0 .. 255:
   setup(seed)
   let original = input
@@ -87,10 +87,10 @@ for seed in 0 .. 255:
       "logged PHY offset must be the signed low byte with CRLF: " & repr(records[i].message)
     doAssert records[i].printer == 1
     for j in 0 ..< 14:
-      let expected = if j <= i: original[24 + j] else: cached[j]
-      doAssert records[i].cached[j] == expected
-      doAssert records[i].shadow[24 + j] == (if j <= i: expected else: shadow[24 + j])
+      doAssert records[i].cached[j] == cached[j]
+      doAssert records[i].shadow[24 + j] == shadow[24 + j]
     doAssert phyOffsets[i] == scaled(original[24 + i])
+  doAssert tpcChannelOffsetTable == cached and tpcPowerTable == shadow
   for i in 0 ..< 24: doAssert tpcPowerTable[i] == shadow[i]
   doAssert records[^1].message == "dynamic update channel offset\r\n"
   doAssert operations[^2] == "print" and operations[^1] == "phy"
@@ -119,12 +119,15 @@ proc changeInput(printer: int) =
 setup(0)
 for i in 0 ..< 14: input[24 + i] = 3
 let header = input
+let cached = tpcChannelOffsetTable
+let shadow = tpcPowerTable
 afterPrint = changeInput
 bl_tpc_update_power_table_channel_offset(addr input)
 for i in 0 ..< 14:
   let sampled = (if i == 0: 3 else: i - 11).int8
   doAssert records[i].message == line(i, sampled), repr(records[i].message)
-  doAssert tpcChannelOffsetTable[i] == sampled and tpcPowerTable[24 + i] == sampled
+  doAssert tpcChannelOffsetTable[i] == cached[i]
+  doAssert tpcPowerTable[24 + i] == shadow[24 + i]
   doAssert phyOffsets[i] == scaled(sampled)
   doAssert input[24 + i] == -27
 for i in 0 ..< 24: doAssert input[i] == header[i]
@@ -135,6 +138,8 @@ proc removeLogger(printer: int) = currentPrinter = nil
 for initiallyMissing in [false, true]:
   setup(255)
   let original = input
+  let cached = tpcChannelOffsetTable
+  let shadow = tpcPowerTable
   if initiallyMissing: currentPrinter = nil
   afterPrint = removeLogger
   bl_tpc_update_power_table_channel_offset(addr input)
@@ -142,16 +147,26 @@ for initiallyMissing in [false, true]:
   doAssert lookupCount == 15 and phyCalls == 1 and operations[^1] == "phy"
   for i in 0 ..< 14:
     doAssert phyOffsets[i] == scaled(original[24 + i])
-    doAssert tpcChannelOffsetTable[i] == original[24 + i]
-    doAssert tpcPowerTable[24 + i] == original[24 + i]
+    doAssert tpcChannelOffsetTable[i] == cached[i]
+    doAssert tpcPowerTable[24 + i] == shadow[24 + i]
   doAssert input == original
+''',
+    "nil_input": r'''
+setup(17)
+let cached = tpcChannelOffsetTable
+let shadow = tpcPowerTable
+bl_tpc_update_power_table_channel_offset(nil)
+doAssert lookupCount == 0 and phyCalls == 0
+doAssert records.len == 0 and operations.len == 0
+doAssert tpcChannelOffsetTable == cached and tpcPowerTable == shadow
 ''',
     "rf_index_arithmetic": r'''
 for raw in 0 .. 255:
   let expected = ((raw * 4) and 252).uint8
-  for ignored in [0'u32, 1, 0xFFFFFFFF'u32]:
-    doAssert cast[uint8](trpc_get_power_idx(nil, ignored, raw.uint8)) == expected
-    doAssert cast[uint8](trpc_get_power_idx(cast[pointer](1), ignored, raw.uint8)) == expected
+  for ignored in [0'u8, 1, 255]:
+    let power = cast[int8](raw.uint8)
+    doAssert trpc_get_power_idx(0, ignored, power) == expected
+    doAssert trpc_get_power_idx(1, ignored, power) == expected
   for i in 0 ..< 50: trpcTxpwrVsRateTable[i] = ((raw + i * 7) and 255).uint8
   for group in 0'u32 .. 4:
     for index in 0'u8 .. 9:

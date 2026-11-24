@@ -34,7 +34,7 @@ type
     driverPrivatePrefix*: array[48, uint8]
     ipcEnv*: pointer
     driverPrivateAfterIpc*: array[8, uint8]
-    vifs*: array[2, BlVifView]
+    vifs*: array[WifiHostVifCount, BlVifView]
     stas*: array[NxRemoteStaStoreMax, BlStaView]
 
   KeTxFcView {.packed.} = object

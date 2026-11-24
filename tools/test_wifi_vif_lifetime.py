@@ -8,6 +8,7 @@ import pytest
 
 from test_wifi_ap_teardown import FW, ROOT, procedure
 from test_wifi_beacon_lifetime import VIF_PLATFORM
+from test_wifi_message_allocation import run_program
 
 
 PLATFORM = VIF_PLATFORM.replace(
@@ -61,8 +62,9 @@ prepareHook = nil
 
 for removed in 0'u8 .. 1:
   for kind in [VIF_TYPE_STA, VIF_TYPE_AP]:
-    for site in ["prepare", "retire", "teardown", "hw", "timer1", "timer2", "td"]:
+    for site in ["prepare", "retire", "teardown", "hw", "timer1", "timer2", "watchdog", "td"]:
       if kind != VIF_TYPE_AP and site in ["prepare", "hw"]: continue
+      if kind != VIF_TYPE_STA and site == "watchdog": continue
       for enabled in [false, true]:
         reset()
         interrupts = enabled
@@ -114,9 +116,10 @@ for removed in 0'u8 .. 1:
             replace()
         elif site == "hw":
           hwResetHook = replace
-        elif site in ["timer1", "timer2"]:
+        elif site in ["timer1", "timer2", "watchdog"]:
+          let expectedClears = if site == "timer1": 1 elif site == "timer2": 2 else: 3
           timerHook = proc() =
-            if clearedTimers == (if site == "timer1": 1 else: 2): replace()
+            if clearedTimers == expectedClears: replace()
         elif site == "td":
           tdHook = replace
         elif kind == VIF_TYPE_STA:
@@ -196,10 +199,11 @@ for removed in 0'u8 .. 1:
 '''
 
 
-def vif_lifetime_source(mutation: str | None = None) -> str:
+def vif_lifetime_source(mutation: str | None = None,
+                        platform: str = PLATFORM) -> str:
     kernel = (FW / "kernel_mac_channel.nim").read_text()
     vif = (FW / "vif_management.nim").read_text()
-    code = PLATFORM
+    code = platform
     code += procedure((FW / "rx_layer.nim").read_text(), "rxInvalidateQuiescentVif")
     code += procedure((FW / "rx_layer.nim").read_text(), "rxInvalidateVif")
     for name in ["co_list_init", "co_list_push_front", "co_list_push_back", "co_list_pop_front",
@@ -236,11 +240,13 @@ def vif_lifetime_source(mutation: str | None = None) -> str:
                 old = "    if not prepared:\n      return false\n"
                 new = ""
             elif mutation == "counters":
-                old = "  if vifType == VIF_TYPE_STA:\n    dec env.staCount\n  else:\n    dec env.apCount\n"
+                old = ("  if vifType == VIF_TYPE_STA:\n    dec env.staCount\n"
+                       "  elif vifType == VIF_TYPE_AP:\n    dec env.apCount\n")
                 assert body.count(old) == 1
                 body = body.replace(old, "")
                 old = "  rxInvalidateQuiescentVif(vifIdx, selected)\n"
-                new = old + "  if vifType == VIF_TYPE_STA:\n    dec env.staCount\n  else:\n    dec env.apCount\n"
+                new = old + ("  if vifType == VIF_TYPE_STA:\n    dec env.staCount\n"
+                             "  elif vifType == VIF_TYPE_AP:\n    dec env.apCount\n")
             elif mutation == "callback_irq":
                 old, new = "        irqRestore(saved)\n", "        discard\n"
             else:
@@ -249,6 +255,7 @@ def vif_lifetime_source(mutation: str | None = None) -> str:
                     "hw": "mm_hw_ap_info_reset(0)",
                     "timer1": "mm_timer_clear(addr vif.tbttTimer)",
                     "timer2": "mm_timer_clear(addr vif.beaconTimeoutTimer)",
+                    "watchdog": "mm_timer_clear(addr vif.keepAliveTimer)",
                     "td": "td_reset(vifIdx)",
                 }.get(mutation)
                 if mutation == "deinit":
@@ -261,7 +268,7 @@ def vif_lifetime_source(mutation: str | None = None) -> str:
                     new = ("      return false\n\n"
                            "  if vifType == VIF_TYPE_AP and env.apCount == 0:")
                 else:
-                    indent = "    " if mutation in ["stop", "hw"] else "  "
+                    indent = "    " if mutation in ["stop", "hw", "watchdog"] else "  "
                     old = f"{indent}{call}\n{indent}if not current():\n{indent}  return true\n"
                     new = f"{indent}{call}\n"
             assert body.count(old) == 1, (mutation, old)
@@ -270,10 +277,210 @@ def vif_lifetime_source(mutation: str | None = None) -> str:
     return code
 
 
+REGISTRATION_GUARDS = r'''
+reset()
+doAssert vif_mgmt_init()
+let originalEnv = env
+let originalVifs = vifs
+for kind in [4'u8, 255'u8]:
+  var assigned = 255'u8
+  doAssert vif_mgmt_register(addr mac[0], kind, false, addr assigned) == 1
+  doAssert assigned == 255 and env == originalEnv and vifs == originalVifs
+  doAssert hwSets == 0 and starts == 0
+var assigned = 255'u8
+doAssert vif_mgmt_register(nil, VIF_TYPE_STA, false, addr assigned) == 1
+doAssert vif_mgmt_register(addr mac[0], VIF_TYPE_STA, false, nil) == 1
+doAssert assigned == 255 and env == originalEnv and vifs == originalVifs
+doAssert hwSets == 0
+
+var foreign: Vif
+foreign.vifType = 4
+env.freeList.first = cast[ptr CoListHdr](addr foreign)
+env.freeList.last = env.freeList.first
+doAssert vif_mgmt_register(addr mac[0], VIF_TYPE_STA, false, addr assigned) == 1
+doAssert env.freeList.first == cast[ptr CoListHdr](addr foreign)
+doAssert hwSets == 0 and assigned == 255
+
+reset()
+doAssert vif_mgmt_init()
+vifs[0].vifType = VIF_TYPE_STA
+doAssert vif_mgmt_register(addr mac[0], VIF_TYPE_STA, false, addr assigned) == 1
+doAssert hwSets == 0 and assigned == 255
+
+reset()
+doAssert vif_mgmt_init()
+doAssert vif_mgmt_register(addr mac[0], VIF_TYPE_STA, false, addr assigned) == 0
+doAssert assigned == 0 and env.staCount == 1 and hwSets == 1
+
+for kind in [1'u8, 3'u8]:
+  reset()
+  doAssert vif_mgmt_init()
+  assigned = 255
+  doAssert vif_mgmt_register(addr mac[0], kind, false, addr assigned) == 0
+  doAssert assigned == 0 and vifs[0].vifType == kind
+  doAssert env.staCount == 0 and env.apCount == 0 and hwSets == 1
+  doAssert starts == 0 and env.activeList.first == cast[ptr CoListHdr](addr vifs[0])
+  doAssert vif_mgmt_unregister(assigned)
+  doAssert env.activeList.first == nil and vifs[0].vifType == 4
+  doAssert env.staCount == 0 and env.apCount == 0
+  doAssert stops == 0 and deinitializations == 0 and clearedTimers == 2
+  doAssert resets == 1
+
+# A failed queue halt must not consume a free entry or program the MAC/filter.
+reset()
+haltAllowed = true
+doAssert vif_mgmt_init()
+let beforeHaltEnv = env
+let beforeHaltVifs = vifs
+let beforeHaltEpochs = rxVifEpochs
+haltAllowed = false
+assigned = 255
+doAssert vif_mgmt_register(addr mac[0], VIF_TYPE_STA, false, addr assigned) == 1
+doAssert assigned == 255 and env == beforeHaltEnv and vifs == beforeHaltVifs
+doAssert rxVifEpochs == beforeHaltEpochs and hwSets == 0
+haltAllowed = true
+doAssert vif_mgmt_register(addr mac[0], VIF_TYPE_STA, false, addr assigned) == 0
+doAssert assigned == 0 and hwSets == 1
+let beforeFilterEnv = env
+let beforeFilterVifs = vifs
+let beforeFilterEpochs = rxVifEpochs
+mm.rxFilterExtra = 0xA0'u32
+haltAllowed = false
+assigned = 255
+doAssert vif_mgmt_register(addr mac[0], VIF_TYPE_STA, false, addr assigned) == 1
+doAssert assigned == 255 and env == beforeFilterEnv and vifs == beforeFilterVifs
+doAssert rxVifEpochs == beforeFilterEpochs and mm.rxFilterExtra == 0xA0'u32
+doAssert hwSets == 1
+haltAllowed = true
+
+# Retirement can synchronously reset the VIF table. Do not claim its new head.
+reset()
+doAssert vif_mgmt_init()
+var didReset = false
+retireHook = proc(index: uint8) =
+  doAssert index == 0 and not didReset
+  didReset = true
+  retireHook = nil
+  doAssert vif_mgmt_init()
+assigned = 255
+doAssert vif_mgmt_register(addr mac[0], VIF_TYPE_STA, false, addr assigned) == 1
+doAssert didReset and assigned == 255 and hwSets == 0
+doAssert env.activeList.first == nil
+doAssert env.freeList.first == cast[ptr CoListHdr](addr vifs[0])
+doAssert env.freeList.last == cast[ptr CoListHdr](addr vifs[1])
+'''
+
+
+@pytest.mark.parametrize("mode", ["checked", "firmware"])
+def test_vif_registration_guards_and_common_types(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, vif_lifetime_source() + REGISTRATION_GUARDS)
+
+
+def test_vif_unregister_restores_single_ibss_or_mesh_filter(tmp_path: Path) -> None:
+    platform = ("var rxControl, bssidLow, bssidHigh: uint32\n" + PLATFORM).replace(
+        "proc regWrite(address: uint; value: uint32) = discard",
+        "proc regWrite(address: uint; value: uint32) =\n"
+        "  case address\n"
+        "  of MACHW_RX_CNTRL_REG: rxControl = value\n"
+        "  of MACHW_BASE + 0x020'u: bssidLow = value\n"
+        "  of MACHW_BASE + 0x024'u: bssidHigh = value\n"
+        "  else: discard",
+    )
+    checks = r'''
+for removedKind in [VIF_TYPE_STA, VIF_TYPE_AP, 1'u8, 3'u8]:
+  for remainingKind in [1'u8, 3'u8]:
+    reset()
+    mm = default(typeof(mm))
+    rxControl = 0
+    bssidLow = 0
+    bssidHigh = 0
+    doAssert vif_mgmt_init()
+    var removed, remaining = 255'u8
+    doAssert vif_mgmt_register(addr mac[0], removedKind, false, addr removed) == 0
+    doAssert vif_mgmt_register(addr mac[0], remainingKind, false, addr remaining) == 0
+    doAssert removed == 0 and remaining == 1
+    doAssert (mm.rxFilterExtra and 16'u32) != 0
+    vifs[remaining].currentBssid = [2'u8, 5, 8, 13, 21, 34]
+    doAssert vif_mgmt_unregister(removed)
+    doAssert env.activeList.first == cast[ptr CoListHdr](addr vifs[remaining])
+    doAssert (mm.rxFilterExtra and 16'u32) == 0 and rxControl == mm.rxFilterBase
+    doAssert bssidLow == 0x0D080502'u32 and bssidHigh == 0x2215'u32
+'''
+    run_program(tmp_path, "checked", vif_lifetime_source(platform=platform) + checks)
+
+
+REGISTER_CALLBACK_PLATFORM = PLATFORM.replace(
+    "proc mm_hw_info_set(p: pointer) = inc hwSets",
+    "proc mm_hw_info_set(p: pointer) =\n"
+    "  inc hwSets\n"
+    "  if hwResetHook != nil: hwResetHook()",
+).replace(
+    "proc mm_hw_ap_info_set(i: uint8) = discard",
+    "proc mm_hw_ap_info_set(i: uint8) =\n"
+    "  if prepareHook != nil: prepareHook()",
+).replace(
+    "proc td_start(i: uint8) = discard",
+    "proc td_start(i: uint8) =\n"
+    "  if tdHook != nil: tdHook()",
+)
+
+
+REGISTER_CALLBACK_CHECKS = r'''
+for scenario in [
+    (VIF_TYPE_STA, "mac"), (VIF_TYPE_STA, "wpa"), (VIF_TYPE_STA, "td"),
+    (VIF_TYPE_AP, "mac"), (VIF_TYPE_AP, "ap_hw"),
+    (VIF_TYPE_AP, "beacon"), (VIF_TYPE_AP, "td")]:
+  let kind = scenario[0]
+  let site = scenario[1]
+  reset()
+  haltAllowed = true
+  doAssert vif_mgmt_init()
+  var fired = false
+  var replacementVifs: typeof(vifs)
+  var replacementEnv: Env
+  var replacementEpochs: typeof(rxVifEpochs)
+  proc replace() =
+    doAssert not fired
+    fired = true
+    hwResetHook = nil
+    prepareHook = nil
+    initHook = nil
+    startHook = nil
+    tdHook = nil
+    doAssert vif_mgmt_init()
+    replacementVifs = vifs
+    replacementEnv = env
+    replacementEpochs = rxVifEpochs
+  case $site
+  of "mac": hwResetHook = replace
+  of "wpa": initHook = replace
+  of "ap_hw": prepareHook = replace
+  of "beacon": startHook = replace
+  of "td": tdHook = replace
+  else: doAssert false
+  var assigned = 255'u8
+  doAssert vif_mgmt_register(addr mac[0], kind.uint8, false, addr assigned) == 1
+  doAssert fired and assigned == 255, $site
+  doAssert vifs == replacementVifs and env == replacementEnv, $site
+  doAssert rxVifEpochs == replacementEpochs, $site
+  doAssert env.activeList.first == nil and
+    env.freeList.first == cast[ptr CoListHdr](addr vifs[0])
+'''
+
+
+@pytest.mark.parametrize("mode", ["checked", "firmware"])
+def test_vif_registration_does_not_publish_after_callback_reset(
+    tmp_path: Path, mode: str
+) -> None:
+    run_program(tmp_path, mode,
+                vif_lifetime_source(platform=REGISTER_CALLBACK_PLATFORM) +
+                REGISTER_CALLBACK_CHECKS)
+
+
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 @pytest.mark.parametrize("mutation", [None, "epoch", "type", "active", "free", "prepare",
     "counters", "callback_irq", "retire", "stop", "hw", "deinit", "timer1", "timer2", "td",
-    "ap_reservation", "deferred"])
+    "ap_reservation", "deferred", "watchdog"])
 def test_vif_teardown_preserves_callback_replacement(
     tmp_path: Path, mode: str, mutation: str | None
 ) -> None:

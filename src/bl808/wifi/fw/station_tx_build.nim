@@ -1,4 +1,8 @@
 var smTxSerials {.wifiCtrl.}: array[MAX_VIFS, uint32]
+var smAuthResponseExpectations {.wifiCtrl.}: array[MAX_VIFS, SmAuthResponseExpectation]
+
+proc smAdvanceTxSerial(vifIndex: uint8) {.inline.} =
+  inc smTxSerials[vifIndex]
 
 proc smTxCapture(connection: pointer): SmTxBuildContext =
   let saved = irqSave()
@@ -131,6 +135,67 @@ proc smTxArmResponse(build: var SmTxBuildContext; delay: uint32): bool =
                           smTxTimerCurrent, addr build): return false
   if not smTxFrameCurrent(build): return false
   build.responseArmed = true
+  true
+
+proc smAuthRecordResponse(build: var SmTxBuildContext; algorithm: uint8;
+                          txSequence: uint16): bool =
+  case algorithm
+  of 0'u8:
+    if txSequence != 1: return false
+  of 1'u8:
+    if txSequence notin [1'u16, 3'u16]: return false
+  of 3'u8:
+    if txSequence notin [1'u16, 2'u16]: return false
+  else: return false
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if build.state != SmAuthenticatingState or not smTxFrameCurrent(build): return false
+  smAuthResponseExpectations[build.identity.vif] = SmAuthResponseExpectation(
+    connection: build.connection, identity: build.identity,
+    serial: build.serial, algorithm: algorithm, txSequence: txSequence)
+  true
+
+proc smAuthCancelResponse(build: SmTxBuildContext) =
+  if build.identity.vif >= MAX_VIFS.uint8: return
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  let expected = addr smAuthResponseExpectations[build.identity.vif]
+  if expected.connection == build.connection and expected.serial == build.serial and
+      expected.identity == build.identity:
+    expected.txSequence = 0
+
+proc smAuthResponseMatches(build: SmTxBuildContext; algorithm,
+                           responseSequence: uint16): bool =
+  var txSequence: uint16
+  case algorithm
+  of 0'u16:
+    if responseSequence != 2: return false
+    txSequence = 1
+  of 1'u16:
+    if responseSequence notin [2'u16, 4'u16]: return false
+    txSequence = if responseSequence == 2: 1'u16 else: 3'u16
+  of 3'u16:
+    if responseSequence notin [1'u16, 2'u16]: return false
+    txSequence = responseSequence
+  else: return false
+  if build.identity.vif >= MAX_VIFS.uint8: return false
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  let expected = addr smAuthResponseExpectations[build.identity.vif]
+  if build.state != SmAuthenticatingState or not smTxOwnerCurrent(build) or
+      expected.connection != build.connection or expected.serial != build.serial or
+      expected.identity != build.identity or expected.algorithm != algorithm.uint8 or
+      expected.txSequence != txSequence:
+    return false
+  true
+
+proc smAuthConsumeResponse(build: SmTxBuildContext; algorithm,
+                           responseSequence: uint16): bool =
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if not smAuthResponseMatches(build, algorithm, responseSequence): return false
+  let expected = addr smAuthResponseExpectations[build.identity.vif]
+  expected.txSequence = 0
   true
 
 proc smTxSubmit(build: var SmTxBuildContext; forced: bool): bool =

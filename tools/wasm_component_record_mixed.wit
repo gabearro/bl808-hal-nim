@@ -1,0 +1,11 @@
+package ox64:mixed@0.2.0;
+
+world mixed-demo {
+  record mixed {
+    flag: bool,
+    count: u64,
+    delta: s16,
+    ratio: f32,
+  }
+  export echo-mixed: func(value: mixed) -> mixed;
+}

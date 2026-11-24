@@ -1,0 +1,16 @@
+(module
+  (import "cm32p2" "relay" (func $relay (param i32 i32 i32 i64 i32 i32)))
+  (memory (export "cm32p2_memory") 1)
+  (global $next (mut i32) (i32.const 32))
+  (func (export "cm32p2_realloc") (param i32 i32 i32 i32) (result i32)
+    (local $pointer i32)
+    (local.set $pointer (global.get $next))
+    (global.set $next (i32.add (local.get $pointer) (local.get 3)))
+    (local.get $pointer))
+  (func (export "cm32p2||echo") (param $tag i32) (param $pointer i32)
+    (param $length i32) (param $number i64) (param $code i32) (result i32)
+    ;; canon lower writes the host result to the aligned caller return area.
+    (call $relay (local.get $tag) (local.get $pointer) (local.get $length)
+                 (local.get $number) (local.get $code) (i32.const 0))
+    (i32.const 0))
+)

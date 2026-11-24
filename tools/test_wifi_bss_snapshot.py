@@ -46,7 +46,7 @@ proc mutateSettings() =
 proc finishBatch() =
   while sm.pendingBssParams.first != nil:
     acknowledgeBss()
-    sm_send_next_bss_param(nil)
+    sm_send_next_bss_param()
   acknowledgeBss()
   doAssert sent.len == 9 and not smBss.active
 proc checkSnapshot(band = 1'u8; qosMask = 5'u8; uapsd = true) =
@@ -77,7 +77,7 @@ for point in 1..18:
     if calls == point:
       allocationHook = nil
       mutateSettings()
-  sm_set_bss_param(nil)
+  sm_set_bss_param()
   finishBatch()
   checkSnapshot()
   finish()
@@ -87,7 +87,7 @@ prepareSnapshot()
 rateHook = proc() =
   rateHook = nil
   mutateSettings()
-sm_set_bss_param(nil)
+sm_set_bss_param()
 finishBatch()
 checkSnapshot()
 finish()
@@ -97,7 +97,7 @@ prepareSnapshot()
 stateHook = proc() =
   stateHook = nil
   mutateSettings()
-sm_set_bss_param(nil)
+sm_set_bss_param()
 finishBatch()
 checkSnapshot()
 finish()
@@ -107,7 +107,7 @@ prepareSnapshot()
 sendHook = proc() =
   sendHook = nil
   mutateSettings()
-sm_set_bss_param(nil)
+sm_set_bss_param()
 finishBatch()
 checkSnapshot()
 finish()
@@ -118,7 +118,7 @@ vif.operChan = nil
 allocationHook = proc() =
   allocationHook = nil
   vif.operChan = addr channel
-sm_set_bss_param(nil)
+sm_set_bss_param()
 finishBatch()
 checkSnapshot(band = 0)
 finish()
@@ -134,7 +134,7 @@ for period in [0'u32, 100'u32]:
       allocationHook = proc() =
         allocationHook = nil
         mutateSettings()
-      sm_set_bss_param(nil)
+      sm_set_bss_param()
       finishBatch()
       checkSnapshot(qosMask = mask, uapsd = period != 0 and gate >= 128)
       finish()
@@ -147,7 +147,7 @@ expectedRates = vif.basicRates
 allocationHook = proc() =
   allocationHook = nil
   mutateSettings()
-sm_set_bss_param(nil)
+sm_set_bss_param()
 finishBatch()
 checkSnapshot()
 finish()
@@ -156,7 +156,7 @@ finish()
 for count in [13'u8, 255]:
   prepareSnapshot()
   vif.basicRates[0] = count
-  sm_set_bss_param(nil)
+  sm_set_bss_param()
   doAssert calls == 0 and rateBuilds == 0 and sent.len == 0
   doAssert allocated.len == 0 and not smBss.active
   doAssert failures == @[(14'u16, 0xFFFF'u16)]
@@ -168,7 +168,7 @@ failAt = 3
 allocationHook = proc() =
   allocationHook = nil
   mutateSettings()
-sm_set_bss_param(nil)
+sm_set_bss_param()
 doAssert sent.len == 0 and allocated.len == 0 and rateBuilds == 0
 doAssert failures == @[(14'u16, 0xFFFF'u16)]
 finish()

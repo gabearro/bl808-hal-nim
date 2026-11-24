@@ -41,6 +41,18 @@ import radio_phy
 import wifi/fw_constants
 import wifi/fw_messages
 from std/volatile import volatileStore, volatileLoad
+when defined(bl808WifiDiagTcpFallbackAb) or defined(bl808WifiDiagTcpDmaTiming):
+  import wifi/tcp_path_trace
+  from wifi/ipc_host/layout import SharedTxbufOff, SharedTxbufSize
+  static:
+    doAssert defined(bl808m0) and defined(bl808WifiDiagTcpPath)
+when defined(bl808WifiDiagTcpFallbackAb):
+  static:
+    doAssert not defined(bl808WifiBootstrapRetryWorkaround)
+when defined(bl808WifiDiagTcpDmaShape):
+  static: doAssert defined(bl808WifiDiagTcpDmaTiming)
+when defined(bl808WifiMbedTlsSha1Lease):
+  from wifi/mbedtls_sha1_alt import beginShaApKeySetup, finishShaApKeySetup
 
 export radio_phy
 export fw_constants
@@ -48,19 +60,29 @@ export fw_messages
 
 proc c_memcpy(dst, src: pointer, n: csize_t): pointer
   {.importc: "memcpy", header: "<string.h>".}
+proc bl808WpaStaConnectResult(callback, params: pointer): cint
+  {.importc: "bl808_wpa_sta_connect_result", cdecl.}
 
 
 include wifi/fw/register_constants
 include wifi/fw/layout_types
 include wifi/fw/global_state
 include wifi/fw/runtime_helpers
+when defined(bl808WifiDiagDhcpTxAttempts) or defined(bl808WifiDiagTcpPath):
+  include wifi/fw/tx_policy_trace
+when defined(bl808WifiDiagMacState):
+  include wifi/fw/mac_state_trace
 include wifi/fw/rsn_parse
+when defined(bl808WifiApDiscoveryDiag):
+  include wifi/fw/ap_probe_trace
 include wifi/fw/kernel_mac_channel
+include wifi/fw/channel_home_wake
 include wifi/fw/channel_timer
 include wifi/fw/channel_beacon_request
 include wifi/fw/channel_update
 include wifi/fw/channel_switch
 include wifi/fw/channel_protection
+include wifi/fw/station_sa_query
 include wifi/fw/scan_station_ap_me
 include wifi/fw/rate_control
 include wifi/fw/tx_layer

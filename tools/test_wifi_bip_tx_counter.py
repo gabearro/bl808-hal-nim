@@ -276,6 +276,7 @@ const InvalidFrameDescIndex = high(uint32)
 var
   ownedDescriptor: pointer
   mmBcnGeneration: uint32
+  txResetEpoch, psModeBuildSerial: uint32
   rxVifEpochs: array[MAX_VIFS, uint32]
   stationEpochs: array[STA_MGMT_FREE_STAS, uint32]
   txFrameIdentities: array[1, TxFrameIdentity]
@@ -297,7 +298,7 @@ proc staDeleteEpoch(i: uint8): uint32 =
 
 
 @pytest.mark.parametrize("case", CASES)
-@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+@pytest.mark.parametrize("mode", ["checked", "release", "asan", "firmware"])
 def test_bip_tx_counter(tmp_path: Path, case: str, mode: str) -> None:
     code = source(mode)
     code += "\nfor vif in 0..<2:\n  for slot in 4..5:\n    for enabled in [false, true]:\n"
@@ -305,17 +306,19 @@ def test_bip_tx_counter(tmp_path: Path, case: str, mode: str) -> None:
     run_program(tmp_path, mode, code)
 
 
-@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+@pytest.mark.parametrize("mode", ["checked", "release", "asan", "firmware"])
 def test_bip_tx_actual_frame_lease(tmp_path: Path, mode: str) -> None:
     checks = r'''
 for enabled in [false, true]:
-  for change in 0..<5:
+  for change in 0..<6:
     setup(0, 4, enabled, 41)
     descriptor.staInfoIdx = 0
     ownedDescriptor = addr descriptor
+    txResetEpoch = 7
     rxVifEpochs = [11'u32, 12'u32]
     stationEpochs = [21'u32, 22, 23, 24, 25]
     txFrameIdentities[0] = TxFrameIdentity(leased: true, generation: 3,
+      resetEpoch: txResetEpoch,
       vifEpochs: rxVifEpochs, stationEpochs: stationEpochs)
     onMic = proc() =
       case change
@@ -325,13 +328,14 @@ for enabled in [false, true]:
       of 1: txFrameIdentities[0].leased = false
       of 2: inc rxVifEpochs[0]
       of 3: inc stationEpochs[0]
+      of 4: inc txResetEpoch
       else: inc rxVifEpochs[1]
     let accepted = append() == 18
-    doAssert accepted == (change == 4), "BIP ignored the production frame-lease check"
+    doAssert accepted == (change == 5), "BIP ignored the production frame-lease check"
     doAssert counter() == 42 and interrupts == enabled
     if change == 0:
       for byte in frame: doAssert byte == 0xB7
-    elif change == 4:
+    elif change == 5:
       checkFrame(42)
     else:
       doAssert mmieAt(addr frame[42]).mic == default(array[8, uint8])

@@ -21,6 +21,7 @@ when defined(bl808m0) and not defined(bl808WifiNimFw):
   {.error: "BL808 M0 WiFi now requires -d:bl808WifiNimFw; vendor firmware is no longer supported.".}
 
 when defined(bl808m0):
+  from wifi/host_table_layout import WifiHostVifCount, WifiHostPeerCount
   import wifi_fw
   import wifi/cmds
   import wifi/driver
@@ -35,6 +36,10 @@ when defined(bl808m0):
   import wifi/rx
   import wifi/tx
   import wifi/utils
+  when defined(bl808WifiMbedTlsSha1Hardware):
+    import wifi/mbedtls_sha1_alt
+  else:
+    import wifi/wpa2_pmk
 
 include wifi/facade_parts/public_types
 include wifi/facade_parts/sdk_build_config

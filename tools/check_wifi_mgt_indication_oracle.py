@@ -147,7 +147,7 @@ def main() -> int:
         _, _, symbols = elf32(obj)
         defined = {name for name, _, s in symbols if s[3] & 15 == 2 and s[5] not in [0, 0xfff1, 0xfff2]}
         keep = {"rxu_mgt_frame_check"} | {name for name in defined if name.startswith(
-            ("rxuCopyFrameBytes__", "rxMacHeaderLen__", "contains__"))}
+            ("rxuCopyFrameBytes__", "rxMacHeaderLen__", "rxMgmtBodyValid__", "contains__"))}
         assert keep <= defined and any(n.startswith("rxuCopyFrameBytes__") for n in keep)
         extracted, extraction, relocations = extract_firmware_functions(obj, keep, work, run)
         report.update(extraction)

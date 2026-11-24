@@ -71,7 +71,7 @@ proc mmTimerSetLocked(p: pointer; target, saved: uint32) =
   try: mm_timer_set(p, target)
   finally: discard irqSave()
 proc chanCtxtForIdx(index: uint8): pointer = cast[pointer](index.uint + 1)
-proc chan_switch_start(p: pointer) =
+proc chanStartConnlessSwitch(p: pointer) =
   if checkSwitchIrq: doAssert not enabled
   inc switches
 proc assert_err(a, b: cstring; line: cint) = doAssert false
@@ -214,6 +214,31 @@ onTrace = proc() = chan_conn_less_delay_prog()
 chan_conn_less_delay_prog()
 doAssert timerCalls == 1 and enabled
 ''',
+    "additional_waiter_keeps_gate": r'''
+for first in [1'u8, 2]:
+  for boundary in ["entry", "clock", "ap", "delay"]:
+    if first == 1 and boundary == "ap": continue
+    for replaceOriginal in [false, true]:
+      setup(first)
+      let join = proc() =
+        let originalSlot = if first == 1: 4 else: 3
+        let nextSlot = if first == 1: 3 else: 4
+        inc chanCtxtEpochs[nextSlot]
+        if replaceOriginal: inc chanCtxtEpochs[originalSlot]
+        env.flags = env.flags or (first xor 3)
+        chan_conn_less_delay_prog()
+      case boundary
+      of "entry": onTrace = join
+      of "clock": onRead = join
+      of "ap": onAp = join
+      else: onTrace = proc() = onTrace = join
+      chan_conn_less_delay_prog()
+      if replaceOriginal:
+        doAssert env.flags == 3 and timerCalls == 0
+      else:
+        doAssert env.flags == 0x13 and timerCalls == 1 and expiry == now + 30000
+      doAssert enabled and mmTimerMutationTop == nil
+''',
     "event_irq": r'''
 for irq in [false, true]:
   for flags in [1'u8, 2]:
@@ -276,7 +301,7 @@ proc vif_mgmt_get_first_ap_inf(): pointer =
 
 
 @pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
-@pytest.mark.parametrize("boundary", ["normal", "entry_trace", "delay_trace"])
+@pytest.mark.parametrize("boundary", ["normal", "entry_trace", "delay_trace", "joined"])
 def test_connless_with_mm_timer(tmp_path: Path, mode: str, boundary: str) -> None:
     tasks = (FW / "task_handlers.nim").read_text()
     checks = r'''
@@ -285,7 +310,16 @@ env.flags = 2
 env.ctxtCount = 2
 scan_env.channelIndex = 3
 '''
-    if boundary != "normal":
+    if boundary == "joined":
+        checks += r'''
+onTrace = proc(tag: string) =
+  if tag == "[WIFI-NIMFW] cld_prog delay ":
+    onTrace = nil
+    env.flags = env.flags or 1
+    inc chanCtxtEpochs[4]
+    chan_conn_less_delay_prog()
+'''
+    elif boundary != "normal":
         suffix = "flags" if boundary == "entry_trace" else "delay"
         checks += f'''
 onTrace = proc(tag: string) =
@@ -298,6 +332,11 @@ onTrace = proc(tag: string) =
         checks += r'''
 doAssert queueIds() == @[4'u] and timers[3].expiry == 241000
 doAssert env.flags == 0x12 and apCalls == 1
+'''
+    elif boundary == "joined":
+        checks += r'''
+doAssert queueIds() == @[4'u] and timers[3].expiry == 31000
+doAssert env.flags == 0x13 and apCalls == 1
 '''
     else:
         checks += "doAssert queueIds().len == 0 and env.flags == 2\n"

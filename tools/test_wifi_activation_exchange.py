@@ -50,6 +50,8 @@ const
   MmSetPsOptionsReqPayloadSize = sizeof(MmSetPsOptionsReqPayload).uint32
   MeSetPsDisableReqPayloadSize = sizeof(MeSetPsDisableReqPayload).uint32
   SmStaAddIndPayloadSize = sizeof(SmStaAddIndPayload).uint32
+  WifiKeyMgmtPsk = 2'u32
+  WifiKeyMgmtPskSha256 = 256'u32
 type
   CoListHdr = object
     next: ptr CoListHdr
@@ -61,17 +63,19 @@ type
     destId, srcId: uint8
     paramLen: uint32
   Connection = object
-    vifIdx, psOptions: uint8
+    vifIdx, psOptions, authType: uint8
     listenInterval, ctrlPortEthertype: uint16
   Sta = object
     valid, instNbr, controlPortState: uint8
     rateWord: uint16
+    macAddr: array[6, uint8]
+    keyHolder: pointer
   Vif = object
     vifIdx, vifType, staIdx, state: uint8
     listenInterval: uint16
     psOptions: uint8
     key: tuple[flags: uint32]
-    security: tuple[cipher, connected: uint8]
+    security: tuple[cipher, connected: uint8, keyMgmt: uint32]
     ap: tuple[securityFlags: uint32]
   Wps = object
     staAddConfirm: pointer
@@ -82,16 +86,20 @@ var
   indication, otherIndication: uint32
   sm: tuple[connectInfo, connectIndMsg: pointer, saQueryActive, state: uint8]
   mm: tuple[rxPromiscUploadFlag: uint8, rxFilterBase: uint32]
+  vifMgmt: tuple[apCount: uint8]
   me: tuple[requesterId, psOn: uint8, activeMask, psDisableMask: uint32]
   state, meState: uint16
   rxVifEpochs: array[2, uint32]
-  txResetEpoch: uint32
+  txResetEpoch, psModeBuildSerial: uint32
+  ps: tuple[flags, pendingCount: uint8, currentVif: pointer]
   stationEpochs: array[7, uint32]
+  rxKeyLastChanged: array[7, uint64]
   smTxSerials: array[2, uint32]
   nimFwWpaPendingMask: uint32
   keMsgQueueSent, keMsgQueueSaved: CoList
-  meControlCommand, meControlReply, apmStartReply, mmPsModeRequest: pointer
-  meControlReplyReady, apmStartReplyPublished: bool
+  meControlCommand, meControlReply, apmStartRequest, apmStartReply, mmPsModeRequest: pointer
+  meControlReplyReady, apmStartReplyPublished, meConfigInProgress: bool
+  meControlEpoch: uint32
   meControlExpectedId, meControlFinalId: uint16
   meControlRequester: uint8
   wps: Wps
@@ -106,6 +114,8 @@ var
   failAt, replaceAt: int
   enabled = true
   holdMMMode: bool
+  onPeer: proc(p: pointer)
+  onEapol: proc(station: uint8; source, data: pointer; length: uint16)
   onAlloc, onFree, onSend, onState, onFilter, onTrace, onReady, onClear: proc()
 proc invoke(hook: var proc()) =
   if hook != nil:
@@ -118,7 +128,9 @@ proc irqSave(): uint32 =
 proc irqRestore(saved: uint32) = enabled = (saved and 8) != 0
 proc smEnvView(): ptr typeof(sm) = addr sm
 proc mmEnvView(): ptr typeof(mm) = addr mm
+proc vifMgmtEnvView(): ptr typeof(vifMgmt) = addr vifMgmt
 proc meEnvView(): ptr typeof(me) = addr me
+proc psEnvView(): ptr typeof(ps) = addr ps
 proc connectInfoView(p: pointer): ptr Connection = cast[ptr Connection](p)
 proc vifChannelForIdx(index: uint8): ptr Vif =
   doAssert index < 2
@@ -142,6 +154,8 @@ proc keMsgHdrFromPayload(p: pointer): ptr KeMsgHdr =
 proc keMsgPayload(h: ptr KeMsgHdr): pointer =
   cast[pointer](cast[uint](h) + sizeof(KeMsgHdr).uint)
 proc smActivationForget(header: pointer)
+proc sm_handle_eapol_input(station: uint8; source, data: pointer; length: uint16) =
+  if onEapol != nil: onEapol(station, source, data, length)
 proc co_list_push_back*(list: ptr CoList; elem: ptr CoListHdr) {.exportc, cdecl, noinline.}
 proc ke_msg_try_alloc(id: uint16; dst, src: uint8; length: uint32): pointer =
   inc calls
@@ -165,6 +179,11 @@ proc ke_msg_send(p: pointer) =
   let header = keMsgHdrFromPayload(p)
   lastSendId = header.id
   events.add((header.id, header.destId, header.srcId))
+  if header.id == SM_STA_ADD_IND and onPeer != nil:
+    inc stationReady
+    onPeer(p)
+    ke_msg_free(header)
+    return
   co_list_push_back(addr keMsgQueueSent, cast[ptr CoListHdr](header))
   invoke(onSend)
 proc smActivationCancel()
@@ -193,7 +212,7 @@ proc smCleanupAdmitRequest(p: pointer): bool = true
 proc smCleanupConsumeReply(p: pointer): bool = false
 proc smCleanupTakeReply(p: pointer; id: uint16; length: uint32): pointer = nil
 proc apmTakeStartReply(p: pointer; id: uint16; length: uint32): pointer = nil
-proc sm_send_next_bss_param(p: pointer) = doAssert false
+proc sm_send_next_bss_param() = doAssert false
 proc meCancelQueuedPayload(payload: pointer)
 proc smActivationCancelControl(request, reply: pointer; owner: SmTxBuildContext): bool
 proc meTakeControlReply(request: pointer; id: uint16; length: uint32): pointer
@@ -233,10 +252,13 @@ proc setup(vifIndex = 1'u8; staIndex = 2'u8; cipher = 0'u8; flags = 0'u32) =
   stationReady = 0
   connected = 0
   filterUpdates = 0
+  vifMgmt.apCount = 0
   calls = 0
   failAt = 0
   enabled = true
   holdMMMode = false
+  onPeer = nil
+  onEapol = nil
   wps_cbs = nil
   onAlloc = nil
   onFree = nil
@@ -350,7 +372,7 @@ def source(trace: bool = False) -> str:
     task = (FW / "task_handlers.nim").read_text()
     for name in ["meControlMessageMatches", "meCancelQueuedPayload", "mmPsModeCancel",
                  "meControlReset", "meTakeControlReply", "smActivationCancelControl",
-                 "meBeginControl", "meCompleteControl"]:
+                 "meReserveControl", "meForwardControl", "meBeginControl", "meCompleteControl"]:
         code += procedure(task, name)
     code += procedure(kernel, "ke_msg_alloc_reply") + procedure(kernel, "ke_msg_send_basic_reply")
     for name in ["mm_set_ps_options_req_handler", "mm_set_vif_state_cfm_handler",
@@ -358,6 +380,7 @@ def source(trace: bool = False) -> str:
                  "me_set_ps_disable_cfm_handler_sm"]:
         code += procedure(task, name)
     code += procedure(scan, "smAssocDone") + procedure(scan, "sm_assoc_done")
+    code += "proc smRetireEstablishedSupplicantLink(station: uint8; reason: uint16) = doAssert false\n"
     code += "proc sm_handle_supplicant_result*" + scan.split(
         "proc sm_handle_supplicant_result*", 1
     )[1].split("\n  if reason == 15:", 1)[0] + "\n"
@@ -367,6 +390,64 @@ def source(trace: bool = False) -> str:
 
 
 CASES = {
+    "psk_peer_requires_current_host_link": r'''
+for failure in 0..3:
+  setup(cipher=3)
+  vifs[1].security.connected = 1
+  vifs[1].security.keyMgmt = WifiKeyMgmtPsk
+  onPeer = proc(p: pointer) =
+    case failure
+    of 0: discard # host never linked the peer
+    of 1: doAssert not smActivationAcceptPeer(p, 0, 2, true)
+    of 2: doAssert not smActivationAcceptPeer(p, 1, 1, true)
+    else:
+      inc stationEpochs[2]
+      doAssert not smActivationAcceptPeer(p, 1, 2, true)
+  sm_assoc_done(7)
+  drain()
+  doAssert stations[2].controlPortState == 0 and connected == 0
+  doAssert failures.len == int(failure < 3)
+  finish()
+''',
+    "non_psk_publication_unchanged": r'''
+for profile in 0..3:
+  setup(cipher=3)
+  vifs[1].security.connected = 1
+  vifs[1].security.keyMgmt = WifiKeyMgmtPsk
+  case profile
+  of 0:
+    connection.authType = 3
+    vifs[1].security.cipher = 4
+    vifs[1].security.keyMgmt = 1024
+  of 1: sm.state = 2
+  of 2: connection.ctrlPortEthertype = 0x3412
+  else: vifs[1].security.keyMgmt = 1
+  sm_assoc_done(7)
+  let vifReply = takeReply(0)
+  consumeReply(vifReply)
+  ke_msg_free(keMsgHdrFromPayload(vifReply))
+  doAssert events[^1].id == MM_SET_PS_OPTIONS_REQ and stationReady == 0
+  drain()
+  doAssert stationReady == 1 and connected == 0
+  finish()
+''',
+    "psk_peer_at_vif_confirmation": r'''
+setup(cipher=3)
+vifs[1].security.connected = 1
+vifs[1].security.keyMgmt = WifiKeyMgmtPsk
+onPeer = proc(p: pointer) =
+  smActivationTrackPeer(p, nil, 1, proc(hw: pointer; station: uint8; token: uint32; retire: bool): bool = true)
+  doAssert smActivationAcceptPeer(p, 1, 2, true)
+sm_assoc_done(7)
+let vifReply = takeReply(0)
+consumeReply(vifReply)
+doAssert events[^2].id == SM_STA_ADD_IND and events[^1].id == MM_SET_PS_OPTIONS_REQ
+doAssert stations[2].controlPortState == 1 and connected == 0
+ke_msg_free(keMsgHdrFromPayload(vifReply))
+drain()
+doAssert stationReady == 1
+finish()
+''',
     "control_policy_matrix": r'''
 for vifIndex in 0'u8 .. 1'u8:
   for staIndex in 0'u8 .. 6'u8:
@@ -395,6 +476,16 @@ doAssert vifs[1].listenInterval == 17 and vifs[1].psOptions == 3
 doAssert me.psDisableMask == 0 and stations[2].controlPortState == 2
 doAssert lastStation.vifIdx == 1 and lastStation.staIdx == 2
 finish()
+''',
+    "station_preserves_registered_ap_filter": r'''
+for base in [0x3507858C'u32, 0x3507A58C'u32]:
+  begin()
+  vifMgmt.apCount = 1
+  mm.rxFilterBase = base
+  drain()
+  doAssert connected == 1 and stationReady == 1
+  doAssert mm.rxFilterBase == base and filterUpdates == 0
+  finish()
 ''',
     "unrelated_confirmation": r'''
 begin()

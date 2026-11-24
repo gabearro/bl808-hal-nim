@@ -33,7 +33,7 @@ proc ke_msg_alloc(id: uint16; dst, src: uint8; n: uint32): pointer =
 proc txl_retire_vif(vif: uint8; selected: uint8) = connectBoundary("retire")
 ''', 1)
     code = code.replace(procedure(code, "sm_connection_tlv_set"), r'''
-proc sm_connection_tlv_set(vif: uint8; p: pointer; length: uint16) = connectBoundary("tlv")
+proc sm_connection_tlv_set() = connectBoundary("tlv")
 ''', 1)
     code = code.replace(procedure(code, "connectInfoHasChannelHint"), r'''
 proc connectInfoHasChannelHint(req: ptr ConnectInfoView): bool = directHint
@@ -68,12 +68,11 @@ proc replaceConnection() =
 proc connectInfoChannelHint(p: pointer): pointer = addr sourceChannel
 ''', 1)
     code = code.replace(procedure(code, "sm_get_bss_params"), r'''
-proc sm_get_bss_params(bss, channel: ptr pointer): bool =
+proc sm_get_bss_params(bss, channel: ptr pointer) =
   if useSelected:
     bss[] = addr sourceBssid[0]
     channel[] = addr sourceChannel
   connectBoundary("select")
-  useSelected
 ''', 1)
     code = code.replace(procedure(code, "scanu_prune_scanresult_raw_frames_except_bssid"), r'''
 proc scanu_prune_scanresult_raw_frames_except_bssid(p: pointer) = connectBoundary("prune")
@@ -82,7 +81,7 @@ proc scanu_prune_scanresult_raw_frames_except_bssid(p: pointer) = connectBoundar
 proc scanu_prune_scanresult_raw_frames() = connectBoundary("prune")
 ''', 1)
     code = code.replace(procedure(code, "sm_join_bss"), r'''
-proc sm_join_bss(mac, bss, channel: pointer; flags: uint32) =
+proc sm_join_bss(mac, bss, channel: pointer; flags: bool) =
   inc reconnectJoins
   handoff(mac, bss, channel)
 ''', 1)
@@ -155,13 +154,14 @@ doAssert requestFreed == {str(transferred).lower()}
 '''
 
 for fail in [1, 2]:
+    expected_confirmations = "newSeq[uint8]()" if fail == 1 else "@[8'u8]"
     CASES[f"allocation_failure_{fail}"] = f'''
 let before = rxVifEpochs
 failAt = kernelAllocations + {fail}
 doAssert sm_connect_req_handler(request) == KeMsgConsumed
 doAssert sm.connectInfo == nil and sm.connectIndMsg == nil
 doAssert reconnectScans == 0 and reconnectJoins == 0
-doAssert reconnectConfirmations == {'newSeq[uint8]()' if fail == 1 else '@[8\'u8]'}
+doAssert reconnectConfirmations == {expected_confirmations}
 doAssert allocated == @[request] and rxVifEpochs == before
 '''
 
@@ -184,6 +184,7 @@ doAssert handedMac == expectedMac and reconnectJoins == 1
 
 CASES["direct_hint_snapshot"] = r'''
 directHint = true
+expectedFreq = sourceChannel.prim20Freq
 let expectedBssid = connectInfoView(request).bssid
 let expectedChannel = sourceChannel
 connectHook = proc(point: string) =

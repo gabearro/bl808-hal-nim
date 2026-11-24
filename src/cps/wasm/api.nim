@@ -19,6 +19,7 @@
 
 import std/tables
 import types, binary, runtime, wasi
+import validate
 
 when defined(macosx) and defined(arm64):
   import jit/memory, jit/compiler, jit/tier, jit/cache
@@ -240,9 +241,7 @@ proc resolveImports(engine: WasmEngine, module: WasmModule): seq[(string, string
       raise newException(WasmError,
         "unresolved import: " & imp.module & "." & imp.name)
 
-proc loadBytes*(engine: WasmEngine, data: openArray[byte]): LoadedModule =
-  ## Load a WASM module from raw bytes.
-  let wasmMod = decodeModule(data)
+proc loadParsed(engine: WasmEngine, wasmMod: WasmModule): LoadedModule =
   let imports = engine.resolveImports(wasmMod)
   let idx = engine.vm.instantiate(wasmMod, imports)
 
@@ -254,6 +253,17 @@ proc loadBytes*(engine: WasmEngine, data: openArray[byte]): LoadedModule =
   for exp in wasmMod.exports:
     result.exports[exp.name] = ExportInfo(kind: exp.kind, idx: exp.idx.int)
   engine.modules.add(result)
+
+proc loadBytes*(engine: WasmEngine, data: openArray[byte]): LoadedModule =
+  ## Load a WASM module from raw bytes with the existing decoder policy.
+  engine.loadParsed(decodeModule(data))
+
+proc loadValidatedBytes*(engine: WasmEngine, data: openArray[byte]): LoadedModule =
+  ## Preserve the source instruction stream and validate before resolving any
+  ## imports or executing a start function. Used by the proof-gated extension.
+  let wasmMod = decodeModule(data,optimize = false)
+  validateModule(wasmMod)
+  engine.loadParsed(wasmMod)
 
 proc loadFile*(engine: WasmEngine, path: string): LoadedModule =
   ## Load a WASM module from a .wasm file.
@@ -286,7 +296,8 @@ proc call*(module: LoadedModule, name: string,
 
   let argSeq = toWasmValues(args)
   try:
-    let results = module.engine.vm.execute(info.idx, argSeq)
+    let address = module.engine.vm.store.modules[module.instanceIdx].funcAddrs[info.idx]
+    let results = module.engine.vm.execute(address, argSeq)
     WasmResult(values: results)
   except WasiExitError as e:
     # Normal WASI program exit — not an error

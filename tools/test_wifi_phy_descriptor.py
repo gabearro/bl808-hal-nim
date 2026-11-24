@@ -28,6 +28,19 @@ proc descriptorWords(channel: ChanCtxtDefView): array[2, uint32] =
 
 
 CASES = {
+    "nonzero_force_is_noop": r'''
+for force in [1'u32, 2, high(uint32)]:
+  setup()
+  var channel = ChanCtxtDefView(band: 1, chanType: 2, primFreq: 5180,
+    centerFreq1: 5210, centerFreq2: 5530, txPower: 17, phyEnvFlags: 3)
+  let before = phy
+  clearCalls()
+  phy_set_channel(addr channel, force)
+  doAssert calls.len == 0 and programmed.len == 0
+  doAssert phy == before and channel == ChanCtxtDefView(
+    band: 1, chanType: 2, primFreq: 5180, centerFreq1: 5210,
+    centerFreq2: 5530, txPower: 17, phyEnvFlags: 3)
+''',
     "secondary_frequency": r'''
 for secondary in [0'u16, 1, 2437, 65535]:
   for power in [0'u8, 1, 17, 127, 255]:
@@ -97,6 +110,19 @@ for nilConfig in [false, true]:
   doAssert readback() == [0x00FF0501'u32, 0x00FF00FF'u32]
   for i in 44 ..< sizeof(phy):
     doAssert bytes[i] == 0xA5, "configuration copy changed descriptor flags/power"
+''',
+    "overlapping_configuration_snapshot": r'''
+setup()
+let words = cast[ptr UncheckedArray[uint32]](addr phy)
+for i in 0 ..< 12:
+  words[i] = 0x98760000'u32 + i.uint32
+var expected: array[9, uint32]
+for i in 0 ..< expected.len:
+  expected[i] = words[i + 1]
+copyPhyInitCfg(cast[pointer](addr words[1]))
+doAssert phy.initCfgWords == expected,
+  "configuration input must be fully read before overlapping output writes"
+doAssert readback() == [0x00FF0501'u32, 0x00FF00FF'u32]
 ''',
     "setter_transition_matrix": r'''
 setup()

@@ -102,6 +102,18 @@ static void prepare(void) {
     put16(buffers[0],0,sample->fc); put16(buffers[0],22,0x1230);
     memcpy(bytes(buffers[0])+4,selected+80,6); memcpy(bytes(buffers[0])+16,selected+80,6);
     for (uint32_t i=0;i<6;++i) bytes(buffers[0])[10+i]=4+i*2;
+    if (sample->kind==2)
+        memcpy(sta_info_tab+station*368+4,bytes(buffers[0])+10,6);
+    if (sample->kind==0 && ((sample->fc&0xfc)==0xb0 ||
+                            (sample->fc&0xfc)==0x10 || (sample->fc&0xfc)==0x30 ||
+                            (sample->fc&0xfc)==0xa0 || (sample->fc&0xfc)==0xc0 ||
+                            (sample->fc&0xfc)==0xd0 || (sample->fc&0xfc)==0x80)) {
+        memcpy(selected+380,bytes(buffers[0])+10,6);
+        memcpy(selected+56,bytes(buffers[0])+10,6);
+        memcpy(bytes(buffers[0])+16,bytes(buffers[0])+10,6);
+    }
+    if (sample->kind==0 && (sample->fc&0xfc)==0x80)
+        memset(bytes(buffers[0])+4,0xff,6);
     for (uint32_t i=0;i<sample->security;++i) *wire(24+i)=0xd0+i;
     for (uint32_t i=0;i<length;++i) *wire(24+sample->security+i)=(i*31+7)&255;
     if ((sample->fc&0xfc)==0xd0) *wire(24+sample->security)=3;

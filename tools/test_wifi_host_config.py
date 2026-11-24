@@ -10,7 +10,7 @@ from test_wifi_message_allocation import run_program
 
 def source() -> str:
     startup = FW.parent / "main/startup_parts"
-    code = r'''
+    code = f'import "{FW.parent / "host_table_layout.nim"}"\n' + r'''
 type
   BlHw = object
     bytes: array[1024, uint8]
@@ -18,7 +18,7 @@ type
     bytes: array[24, uint8]
 const
   BlHwVifsOff = 52'u
-  BlHwModParamsOff = 220'u
+  BlHwModParamsOff = WifiHostModParamsOffset
   BlHwIpcEnvOff = 48'u
   SizeMmVersionCfm = 24
   IpcIrqE2aAll = 0x000007FF'u32

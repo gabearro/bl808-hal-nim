@@ -42,12 +42,16 @@ type
     stateTable, defaultHandler: pointer
     statePtr: ptr uint16
     stateCount, instanceCount: uint16
+  RxMgtProtection = enum
+    rxMgtProtectionUnknown, rxMgtWithoutProtection, rxMgtVerifiedCcmp, rxMgtVerifiedBip
   RxStationIdentity = object
     epoch: uint32
     vifEpochs: array[MAX_VIFS, uint32]
     keyRevision: uint64
     station, vif: uint8
     captured, associated: bool
+    when defined(bl808WifiDiagPeerRxAdmission):
+      mgmtProtection: RxMgtProtection
   RxMgtIdentityNode = object
     next: ptr RxMgtIdentityNode
     message: pointer
@@ -371,14 +375,15 @@ interrupts = true
 """
 
 
-def run_lifetime(tmp_path: Path, mode: str, checks: str) -> None:
+def run_lifetime(tmp_path: Path, mode: str, checks: str, *, rx_admission: bool = False) -> None:
     kernel = (FW / "kernel_mac_channel.nim").read_text()
     rx = (FW / "rx_layer.nim").read_text()
-    source = PLATFORM
+    source = ("{.define: bl808WifiDiagPeerRxAdmission.}\n" if rx_admission else "") + PLATFORM
     for name in ["ke_msg_try_alloc", "ke_msg_alloc"]:
         source += procedure(kernel, name)
     for name in ["rxInvalidateQuiescentVif", "rxInvalidateVif", "rxUploadGeneration", "rxUploadCurrent", "rxCaptureStation", "rxIdentityCurrent", "rxStationCurrent", "rxBindVif",
-                 "rxMgtMessageCurrent", "rxMgtForget"]:
+                 "rxMgtMessageCurrent", "rxMgtNoteProtection",
+                 "rxMgtForget", "rxMgtIdentityAt"]:
         if re.search(rf"^proc {name}\(", rx, re.M):
             source += procedure(rx, name)
     if "proc rxInvalidateVif(" not in rx:
@@ -394,6 +399,48 @@ def run_lifetime(tmp_path: Path, mode: str, checks: str) -> None:
                  "cmp_dest_id", "smDrainStaleSentMessages", "ke_task_schedule"]:
         source += procedure(kernel, name)
     run_program(tmp_path, mode, source + checks)
+
+
+def test_management_protection_is_owned_by_the_queued_message(tmp_path: Path) -> None:
+    run_lifetime(tmp_path, "firmware", r'''
+setup()
+proc protectionOf(payload: pointer; current = true): RxMgtProtection =
+  result = rxMgtVerifiedBip
+  doAssert rxMgtMessageCurrent(keMsgHdrFromPayload(payload), addr result) == current
+
+let generation = rxUploadGeneration(addr frame)
+rxMgtNoteProtection(addr frame, generation, rxMgtVerifiedCcmp)
+let old = rxMgtAllocMessage(addr frame, 4, 68)
+doAssert protectionOf(old) == rxMgtVerifiedCcmp
+
+# Recycle the descriptor for a different frame from the same association.
+rxCaptureStation(addr frame, 0x02000000'u32 or (10'u32 shl 15))
+rxMgtNoteProtection(addr frame, generation, rxMgtVerifiedBip)
+let fresh = rxMgtAllocMessage(addr frame, 4, 68)
+doAssert protectionOf(fresh) == rxMgtProtectionUnknown
+rxMgtNoteProtection(addr frame, rxUploadGeneration(addr frame), rxMgtWithoutProtection)
+let next = rxMgtAllocMessage(addr frame, 4, 68)
+doAssert protectionOf(next) == rxMgtWithoutProtection
+doAssert protectionOf(old) == rxMgtVerifiedCcmp
+
+discard rxInvalidateVif(0)
+for p in [old, fresh, next]:
+  doAssert protectionOf(p, current = false) == rxMgtProtectionUnknown
+  ke_msg_free(keMsgHdrFromPayload(p))
+doAssert live.len == 0 and rxMgtIdentities == nil and interrupts
+''', rx_admission=True)
+
+
+def test_management_metadata_aligns_after_rv32_header(tmp_path: Path) -> None:
+    run_lifetime(tmp_path, "firmware", r'''
+const payload = 0x20000'u + 12
+const alignment = alignof(RxMgtIdentityNode).uint
+for length in 0'u32 .. 78:
+  let start = payload + length.uint + KeMsgTailSlack.uint
+  let node = cast[uint](rxMgtIdentityAt(cast[pointer](payload), length))
+  doAssert node mod alignment == 0
+  doAssert start <= node and node < start + alignment
+''')
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])

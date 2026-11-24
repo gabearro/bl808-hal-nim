@@ -119,6 +119,7 @@ def source() -> str:
         "RxSwTableDescView", "RxDmaProgressDescView", "RxlCntrlEnvView",
         "RxHwDescEnvView",
     ) + SUPPORT
+    code += procedure((FW / "runtime_helpers.nim").read_text(), "wifiDmaStoreLink")
     names = ["rxl_hwdesc_init", "rxl_hd_append", "rxl_pd_append"]
     if "proc rxInitializeHwDescriptors(" in lower:
         names.insert(0, "rxInitializeHwDescriptors")

@@ -589,12 +589,6 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
     env.seqNum = seqCtrl shr 4
     env.fragNum = (seqCtrl and 0xF).uint8
 
-    # ---- QoS TID extraction ----
-    # Blob at .L139 clears env[7] (TID) for non-QoS frames. If env[7] retained
-    # a value from a previous QoS frame, downstream per-TID lookups in the
-    # QoS sequence-cache overlay and PN replay index would index wrong entries
-    # and reject valid frames. Must clear to 0 on non-QoS path.
-    # .L142: Compute MAC header length
     let securityHeaderLen =
       if (frameControl and 0x4000) != 0:
         case hwFlags and 0x1C'u32
@@ -612,13 +606,15 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
         swdesc.mpduLengthBytes):
       inc nimFwDbgRxuDropInvalid
       doReturn()
-    if (frameControl.uint8 and 0x88) == 0x88:
-      env.tid = (rxQosControl(frame, machdrLen) and 0x0F).uint8
-      # This EDCA implementation has no HCCA/TSPEC state for TIDs 8..15.
-      if (hwFlags and 0x02000000'u32) != 0 and env.tid >= 8:
-        doReturn()
-    else:
-      env.tid = 0'u8
+    # Unlike the blob's three-bit mask, keep the wire TID for raw uploads.
+    # The associated EDCA path only has state for the eight user priorities.
+    let associated = (hwFlags and 0x02000000'u32) != 0
+    env.tid = if (frameControl and 0x008C'u16) == 0x0088'u16:
+                (rxQosControl(frame, machdrLen) and 0x0F).uint8
+              else: 0'u8
+    if associated and env.tid >= 8:
+      inc nimFwDbgRxuDropInvalid
+      doReturn()
     when defined(bl808WifiConnectTrace):
       let rxTraceState = ke_state_get(TASK_SM)
       let rxTraceType = frameControl and 0x000C
@@ -669,7 +665,7 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
     # ================================================================
     # Branch: associated/monitor (hwFlags bit 25, blob `lui 0x2000`) vs unassociated
     # ================================================================
-    if (hwFlags and 0x02000000'u32) != 0:
+    if associated:
       # .L148: Associated STA / monitor mode path
       let hwStaIdx = (hwFlags shr 15) and 0x3FF'u32
       if hwStaIdx < 8 or hwStaIdx >= 8 + STA_INFO_TAB_ENTRIES.uint32:
@@ -774,7 +770,8 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
           doReturn()
         let msduLength = swdesc.mpduLengthBytes.uint32 -
           env.machdrLen.uint32 - micLength
-        let isAmsdu = (frameControl and 0x008C) == 0x0088 and
+        # The vendor recognizes A-MSDU only on QoS Data subtype 0x88.
+        let isAmsdu = (frameControl and 0x00FC) == 0x0088 and
           (rxQosControl(frame, machdrLen) and 0x80) != 0
         if isAmsdu and not rxuAmsduValid(swdesc, frame, env, vif.vifType,
                                         sta, addr vif.macAddr):
@@ -835,9 +832,13 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
         let isEapol = hasRfc1042Snap and etherType == 0x8E88'u16
         let hasProtocol = not isAmsdu and hasSnapHeader and
           (hasRfc1042Snap or rxSnapIsBridgeTunnel(addr msdu.snap))
+        var waitingForPeer = false
         if not isAmsdu and not rxuPortAllows(sta, etherType, hasProtocol,
                                             addr env.da, addr vif.macAddr):
-          doReturn()
+          waitingForPeer = isEapol and sta.controlPortState == 0 and vif.vifType == 0 and
+            fromDs and not toDs and (frameControl and 0x4000) == 0 and env.secFlags == 0 and
+            (frame.addr1[0] and 1) == 0 and env.da == vif.macAddr and frame.addr2 == sta.macAddr
+          if not waitingForPeer: doReturn()
         let isConfiguredControlPort = hasProtocol and
           sta.rateWord == lmacGateHalfword(etherType)
         var eapolLength = 0'u32
@@ -850,6 +851,10 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
             (header.bodyLengthBe[0].uint32 shl 8) + header.bodyLengthBe[1].uint32
           if eapolLength > available:
             doReturn()
+          if eapolLength > high(uint16).uint32:
+            doReturn()
+          if not waitingForPeer and vif.vifType == 0 and
+              not smActivationEapolReady(env.vifIdx, staIdx): doReturn()
 
         # EAPOL and the configured control protocol use the uncontrolled port.
         # Other plaintext data is forbidden on a secured BSS.
@@ -990,7 +995,10 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
               nimFwDbgRecordRxuPnAccept(1'u32, frame, hwFlags, envSeq, env.tid,
                                         env.machdrLen, swdesc.mpduLengthBytes)
             if not rxKeyCurrent(param, env.secKeyPtr): doReturn()
+          if waitingForPeer and not smActivationRetainM1(env.vifIdx, staIdx, env.sa,
+              rxMsduPayload(msdu), eapolLength): doReturn()
           seqCachePtr[] = envSeq
+          if waitingForPeer: doReturn()
 
         if isEapol:
           if not frameCurrent(): doReturn()
@@ -1022,13 +1030,15 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
           when defined(bl808WifiConnectTrace):
             nimFwConnectTrace2U32("[WIFI-CT] eapol_rx ",
               staIdx.uint32 or (vifType.uint32 shl 8), eapolLength)
+          if vifType == 0 and not smActivationEapolReady(env.vifIdx, staIdx): doReturn()
           if (receivedKey != nil and not rxKeyCurrent(param, receivedKey)) or
               not frameCurrent():
             doReturn()
           if vifType == 2:
             apm_handle_eapol_input(staIdx, eapolData, eapolLength)
           else:
-            sm_handle_eapol_input(staIdx, unsafeAddr sourceAddr[0], eapolData, eapolLength)
+            sm_handle_eapol_input(staIdx, unsafeAddr sourceAddr[0], eapolData,
+                                  eapolLength.uint16)
           doReturn()
 
         # .L174: Build status word for host upload
@@ -1044,7 +1054,7 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
         let fcFinal = finalFrame.frameControl
         swdesc.frameControlFlags = swdesc.frameControlFlags and 0xFFFFFF8F'u32
 
-        if (fcFinal and 0x008C) == 0x0088:
+        if (fcFinal and 0x00FC) == 0x0088:
           let qos = rxQosControl(finalFrame, rxu_cntrl_machdr_len_get(fcFinal))
           let tidBits = (qos and 7).uint32 shl 4
           let amsdu = if (qos and 0x80) != 0: 1'u32 else: 0'u32
@@ -1128,7 +1138,17 @@ proc rxu_cntrl_frame_handle*(param: pointer): uint32 {.exportc, cdecl.} =
 
         # Blob's associated mgmt path (.L158 -> .L163 -> .L234) routes through
         # rxu_mgt_frame_check(param, sta_idx), not the data upload path.
+        when defined(bl808WifiDiagPeerRxAdmission):
+          if (frameControl and 0xFC'u16) in [0xA0'u16, 0xC0'u16] and
+              (frameControl and 0x4000) != 0 and (hwFlags and 0x1C) == 28 and
+              (env.secFlags and 2) != 0:
+            rxMgtNoteProtection(param, generation, rxMgtVerifiedCcmp)
         returnValue = rxu_mgt_frame_check(param, env.staIdx)
+        if returnValue != 0:
+          let savedIrq = irqSave()
+          if frameCurrent():
+            rxSeq.nonQosSeqCtrl = envSeq
+          irqRestore(savedIrq)
         nimFwTrace2U32("[WIFI-NIMFW] rxu_mgt_assoc ", frameControl.uint32, returnValue)
         doReturn()
 

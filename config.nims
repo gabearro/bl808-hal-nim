@@ -16,6 +16,9 @@ switch("threads", "off")
 switch("panics", "on")
 switch("path", "src")
 
+when defined(bl808ZkBuild):
+  switch("path", "build/zkbuild-deps/portable")
+
 when defined(bl808kernel):
   # CPS kernel mode: need ARC for ref objects, malloc for allocator
   switch("mm", "arc")
@@ -46,25 +49,47 @@ when defined(bl808m0):
   # The M0 BLE HCI path relies on normal call/return frames while crossing
   # Nim/C callbacks; GCC sibling-call optimization can corrupt that path.
   switch("passC", "-ffunction-sections -fdata-sections -fno-builtin -fno-optimize-sibling-calls")
-  # Disable GCC -Os crossjumping so assert_err / ke_msg_send tail-call
-  # sites match the blob's per-line distinct call sites (T-Head GCC did
-  # not aggressively crossjump these). Lifts wifi_fw.nim match rate
-  # from ~96% to ~98% of blob call sites.
-  switch("passC", "-fno-crossjumping")
+  when defined(bl808AllcoreWasmHttp) and not defined(bl808WifiPreserveCallSites):
+    # Merge identical tails so the manager fits below the retained LP image.
+    switch("passC", "-fcrossjumping")
+  else:
+    # Keep distinct assert_err / ke_msg_send sites for blob comparisons.
+    switch("passC", "-fno-crossjumping")
   switch("passL", "-march=rv32imafc -mabi=ilp32f -mcmodel=medlow")
   switch("passL", "-nostdlib -nostartfiles -static")
   switch("passL", "-Wl,--gc-sections")
   when defined(bl808jtagram):
-    when defined(bl808M0CachedRam):
+    when defined(bl808CsiCapture):
+      switch("passL", "-T src/linker/bl808_m0_wifi_csi_ram.ld")
+    elif defined(bl808ZkBuild):
+      when defined(bl808ZkLoaderTest):
+        quit("The proof-gated loader test requires its flash layout; omit bl808jtagram")
+      switch("passL", "-T src/linker/bl808_m0_zkproof_ram.ld")
+    elif defined(bl808UsbAnchorResident):
+      switch("passL", "-T src/linker/bl808_m0_usb_anchor_resident.ld")
+    elif defined(bl808M0CachedRam):
       switch("passL", "-T src/linker/bl808_m0_ram_cached.ld")
     elif defined(bl808M0JtagFullRam):
       switch("passL", "-T src/linker/bl808_m0_ram_full.ld")
     else:
       switch("passL", "-T src/linker/bl808_m0_ram.ld")
+  elif defined(bl808UsbAnchorApp):
+    switch("passL", "-T src/linker/bl808_m0_usb_anchor_app.ld")
+  elif defined(bl808ZkBuild):
+    switch("passL", "-T src/linker/bl808_m0_zkproof_flash.ld")
   elif defined(bl808AllcoreWasmHttp):
+    when defined(bl808WifiMbedTlsCachedWram):
+      when not defined(bl808WifiMbedTlsSha1Lease):
+        quit("Cached Mbed TLS code requires the hardware lease")
+      switch("passC", "-DBL808_WIFI_MBEDTLS_CACHED_WRAM")
+      switch("passL", "-T src/linker/bl808_m0_wifi_cached_hot.ld")
     switch("passL", "-T src/linker/bl808_m0_allcore_http.ld")
+  elif defined(bl808WifiHttpServer):
+    switch("passL", "-T src/linker/bl808_m0_wifi_http.ld")
   elif defined(bl808WifiCachedBss):
     switch("passL", "-T src/linker/bl808_m0_wifi_cached.ld")
+  elif defined(bl808CsiCapture):
+    switch("passL", "-T src/linker/bl808_m0_wifi_csi.ld")
   elif defined(bl808WifiNimFw):
     switch("passL", "-T src/linker/bl808_m0_wifi.ld")
   elif defined(bl808EnclaveWram):
@@ -80,6 +105,8 @@ when defined(bl808m0):
   switch("passL", "-lgcc")  # GCC builtins (__clzsi2, __ctzsi2, etc.)
 
 elif defined(bl808d0):
+  when defined(bl808jtagram) and defined(bl808D0Xip):
+    quit("D0 XIP and JTAG RAM are mutually exclusive build modes")
   switch("cpu", "riscv64")
   switch("riscv64.any.gcc.exe", riscvGcc)
   switch("riscv64.any.gcc.linkerexe", riscvGcc)
@@ -90,6 +117,8 @@ elif defined(bl808d0):
   switch("passL", "-Wl,--gc-sections")
   when defined(bl808jtagram):
     switch("passL", "-T src/linker/bl808_d0_ram.ld")
+  elif defined(bl808D0Xip):
+    switch("passL", "-T src/linker/bl808_d0_xip.ld")
   else:
     switch("passL", "-T src/linker/bl808_d0.ld")
   switch("passL", "-lgcc")  # GCC builtins (__clzdi2, __ctzdi2, etc.)
@@ -104,6 +133,8 @@ elif defined(bl808lp):
   switch("passL", "-march=rv32emc_zicsr -mabi=ilp32e -mcmodel=medlow")
   switch("passL", "-nostdlib -nostartfiles -static")
   switch("passL", "-Wl,--gc-sections")
+  when defined(bl808WasmFull) and not defined(bl808jtagram):
+    switch("passL", "-Wl,--defsym=__bl808_lp_stack_bytes=4096")
   when defined(bl808jtagram):
     switch("passL", "-T src/linker/bl808_lp_ram.ld")
   else:

@@ -9,19 +9,23 @@ const
   HwValidationLogCapacity* {.intdefine.} = 8192
 
 when defined(HwValidationLogExternalBuffer):
+  const
+    HwValidationLogSection {.strdefine.} = ".jtaglog"
+    HwValidationLogDecl = "$# $# __attribute__((section(\"" &
+      HwValidationLogSection & "\"), used))"
   var
     hwValidationLogMagic* {.exportc: "hw_validation_log_magic",
-                            codegenDecl: "$# $# __attribute__((section(\".jtaglog\"), used))".}: uint32 =
+                            codegenDecl: HwValidationLogDecl.}: uint32 =
       HwValidationLogMagic
     hwValidationLogCapacity* {.exportc: "hw_validation_log_capacity",
-                               codegenDecl: "$# $# __attribute__((section(\".jtaglog\"), used))".}: uint32 =
+                               codegenDecl: HwValidationLogDecl.}: uint32 =
       HwValidationLogCapacity
     hwValidationLogWrite* {.exportc: "hw_validation_log_write",
-                            codegenDecl: "$# $# __attribute__((section(\".jtaglog\"), used))".}: uint32 = 0
+                            codegenDecl: HwValidationLogDecl.}: uint32 = 0
     hwValidationLogWrapped* {.exportc: "hw_validation_log_wrapped",
-                              codegenDecl: "$# $# __attribute__((section(\".jtaglog\"), used))".}: uint32 = 0
+                              codegenDecl: HwValidationLogDecl.}: uint32 = 0
     hwValidationLogBuffer* {.exportc: "hw_validation_log_buffer",
-                             codegenDecl: "$# $# __attribute__((section(\".jtaglog\"), used))".}:
+                             codegenDecl: HwValidationLogDecl.}:
       array[HwValidationLogCapacity, uint8]
 else:
   var

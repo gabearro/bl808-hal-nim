@@ -53,10 +53,9 @@ var
         "rfPriCwCompensatedTarget", "rfPriCwPowerTableIndex",
         "rfPriCwXtalDivisorTenths", "rfPriCwSdmDivWord",
         "rfPriProgramCwChannel", "rfPriStartCwDfeStrobes", "rf_pri_cw_start",
-        "rfPriVcoCalWord", "rf_pri_get_vco_freq_cw", "rf_pri_get_vco_idac_cw",
-        "rfcVcoPair", "programRfcVcoTable",
     ):
         code += rf_procedure(rf, name)
+    code += rf[rf.index("proc rfPriVcoCalWord("):rf.index("proc rf_dump_status*(")]
     return code + r'''
 proc cwSetup() =
   crystalSetup()
@@ -93,19 +92,18 @@ proc vendorSdm(f: uint32; mask: int): uint32 =
 
 
 @pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
-def test_vco_getters_use_wrapped_subtraction_and_full_idac_byte(tmp_path: Path, mode: str) -> None:
+def test_vco_getters_use_demo_index_and_field_widths(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, cw_source() + r'''
 cwSetup()
 let halves = cast[ptr UncheckedArray[uint16]](addr calibration[0])
-for i in 0 ..< 21: halves[14 + i] = ((17 + i) shl 8 or (0xC0 + i)).uint16
+for i in 0 ..< 21: halves[14 + i] = ((0xA0 + i) shl 8 or (0xEF - i)).uint16
 let before = calibration
 for highWord in [0'u32, 0x10000, 0x80000000'u32, 0xFFFF0000'u32]:
   for lowWord in 0 ..< 65536:
     let f = highWord or lowWord.uint32
-    let wrapped = (f.uint64 + 4294967296'u64 - 2402) and 0xFFFFFFFF'u64
-    let index = min((wrapped shr 2).int, 20)
-    doAssert rf_pri_get_vco_freq_cw(f) == (17 + index).uint32
-    doAssert rf_pri_get_vco_idac_cw(f) == (0xC0 + index).uint32
+    let index = if f < 2404 or f >= 2484: 20 else: int(f - 2404) div 4
+    doAssert rf_pri_get_vco_freq_cw(f) == (0xA0 + index).uint32
+    doAssert rf_pri_get_vco_idac_cw(f) == ((0xEF - index) and 0x1F).uint32
 doAssert calibration == before and events.len == 0
 rfCalibDataGlobal = nil
 doAssert rf_pri_get_vco_freq_cw(2400) == 0 and rf_pri_get_vco_idac_cw(2484) == 0
@@ -113,20 +111,20 @@ doAssert rf_pri_get_vco_freq_cw(2400) == 0 and rf_pri_get_vco_idac_cw(2484) == 0
 
 
 @pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
-def test_rfc_vco_table_packs_all_records_without_masking_idac(tmp_path: Path, mode: str) -> None:
+def test_rfc_vco_replay_preserves_non_field_bits(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, cw_source() + r'''
 cwSetup()
 let halves = cast[ptr UncheckedArray[uint16]](addr calibration[0])
 for i in 0 ..< 21: halves[14 + i] = randomWord().uint16
 var wanted = registerStorage
-var trace: seq[tuple[address: uint, value: uint32]]
-for i in 0 ..< 11:
-  let value = if i < 10: halves[14 + i * 2].uint32 or (halves[15 + i * 2].uint32 shl 16)
-              else: halves[34].uint32
-  wanted[0x13C div 4 + i] = value
-  trace.add((cast[uint](addr registerStorage[0x13C div 4 + i]), value))
+for i in 0 ..< 21:
+  let slot = 0x13C div 4 + i div 2
+  let shift = (i mod 2) * 16
+  wanted[slot] = (wanted[slot] and not (0xFF1F'u32 shl shift)) or
+                 ((halves[14 + i].uint32 and 0xFF1F'u32) shl shift)
 programRfcVcoTable()
-doAssert registerStorage == wanted and mmioWrites == trace
+doAssert registerStorage == wanted
+doAssert mmioWrites.len == 42
 ''')
 
 

@@ -5,6 +5,7 @@ const
 
   SizeApmStartCfm = 4
   ApmStartStatusOff = 0'u
+  ApmStartVifIdxOff = 1'u
   ApmStartChIdxOff = 2'u
   ApmStartBcmcIdxOff = 3'u
 

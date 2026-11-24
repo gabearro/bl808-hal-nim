@@ -2,7 +2,7 @@
 ##
 ## Provides a uniform tick-based time source across cores:
 ##   M0/LP: CLIC mtime (memory-mapped 64-bit counter + compare)
-##   D0:    Timer1 channel 2 (match compare)
+##   D0:    time CSR and CLINT compare
 ##
 ## Both QEMU and real hardware run mtime at 1 MHz (1 tick = 1 us).
 
@@ -88,10 +88,15 @@ elif defined(bl808lp):
   # LP CLINT at 0xE0000000 (private bus): mtimecmp at +0x4000, mtime at +0xBFF8.
 
   proc readTick*(): uint64 {.inline.} =
-    ## Read the current monotonic tick count (shared clock with M0).
-    let lo = regRead(LpClintMtimeBase)
-    let hi = regRead(LpClintMtimeBase + 4)
-    (hi.uint64 shl 32) or lo.uint64
+    ## A low-word rollover can occur between the two MMIO reads.
+    var hi1 = regRead(LpClintMtimeBase + 4)
+    var lo = regRead(LpClintMtimeBase)
+    var hi2 = regRead(LpClintMtimeBase + 4)
+    while hi1 != hi2:
+      hi1 = hi2
+      lo = regRead(LpClintMtimeBase)
+      hi2 = regRead(LpClintMtimeBase + 4)
+    (hi2.uint64 shl 32) or lo.uint64
 
   proc setDeadline*(ticks: uint64) {.inline.} =
     ## Program LP's own mtimecmp so the timer interrupt fires at `ticks`.

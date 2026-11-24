@@ -82,7 +82,6 @@ proc rfPriConfigChannelForCal(channel: int) = events.add((1'u, channel.uint32))
 '''
     for name in (
         "rfCalibRf70ReplayLowBandWord", "rfPriRf70ReplayWindow0Nibble",
-        "wlCfgU32", "wlCfgWb03RxcalReplayA8Word", "wlCfgWb03RxcalReplayAcWord",
         *names,
     ):
         if f"proc {name}(" in rf:
@@ -123,9 +122,11 @@ for rowIndex in 0 ..< 18:
     let savedConfig = wlCfgStorage
     var expected = registerStorage
     var trace: seq[tuple[address: uint, value: uint32]]
+    var reads: seq[uint]
     template put(offset: int; keep, value: uint32) =
       expected[offset div 4] = (expected[offset div 4] and keep) or value
       trace.add((cast[uint](addr registerStorage[offset div 4]), expected[offset div 4]))
+      if offset != 0x2C: reads.add(cast[uint](addr registerStorage[offset div 4]))
     put(0x04, 0xFFFFFFFD'u32, 0)
     put(0x2C, 0, 0)
     put(0x30, 0xFFFFFFFF'u32, 2)
@@ -150,14 +151,20 @@ for rowIndex in 0 ..< 18:
     put(0x60, 0xFFFFFFFF'u32, 3)
     put(0x64, 0x0F83FFFF'u32, 0x201C0000)
     put(0x58, 0xFFF8FFFF'u32, 0x40000)
-    put(0x48, 0xCFFFFFFF'u32, (cast[uint32](row[0].int32) shl 28) and 0x30000000'u32)
-    put(0x48, 0xFE08FFFF'u32, ((cast[uint32](row[3].int32) shl 20) and 0x1F00000'u32) or 0x70000)
+    # rf_pri_rxcal+0x194..0x1cc: both table fields precede the same store.
+    put(0x48, 0xCE08FFFF'u32, ((cast[uint32](row[0].int32) and 3) shl 28) or
+      ((cast[uint32](row[3].int32) and 31) shl 20) or 0x70000)
     put(0x68, 0x1DFFFFFF'u32, 0xA0000000'u32)
     put(0x48, 0xFFFF8CE0'u32, 0x311F)
     trace.add((0'u, 10'u32))
+    # +0x206, +0x224, +0x244, +0x25c: one calibration load per RMW.
+    reads.add(cast[uint](addr calibration[43]))
     put(0x600, 0xFFFFFC00'u32, (calibration[43] and 0x3FF) or 0x400)
+    reads.add(cast[uint](addr calibration[42]))
     put(0x600, 0xFF800FFF'u32, ((calibration[42] shr 4) and 0x7FF000) or 0x800000)
+    reads.add(cast[uint](addr calibration[42]))
     put(0x74, 0xC0FFFFFF'u32, (calibration[42] shl 24) and 0x3F000000'u32)
+    reads.add(cast[uint](addr calibration[42]))
     put(0x74, 0xFFC0FFFF'u32, (calibration[42] shl 8) and 0x3F0000)
     put(0x61C, 0xFFFF'u32, 0x50000000)
     put(0x618, 0x3FFFFFFF'u32, 0x40000000)
@@ -174,6 +181,7 @@ for rowIndex in 0 ..< 18:
     prepareRfPriRxcal()
     doAssert registerStorage == expected, "RXCAL setup fields differ from vendor"
     doAssert events == trace, "RXCAL setup write/delay order differs from vendor"
+    doAssert mmioReads == reads, "RXCAL setup register or replay read order differs from vendor"
     doAssert calibration == savedCalibration and wlCfgStorage == savedConfig
     doAssert workarounds == 0 and checkpoints == @[0x30'u32, 0x31]
 ''')
@@ -446,14 +454,21 @@ var
   results: array[4, int32]
   searchInputs: seq[tuple[parameter: uint32, center, delta: int32]]
   restoreCount: int
-proc saveRfPriCalState(): uint32 = 0
-proc prepareRfPriRxcal() = discard
+const saveEvent = (1'u, 0x2c'u32)
+const setupEvent = (1'u, 0x34'u32)
+const searchSites = [0x33e'u32, 0x36c, 0x3a2, 0x3d4]
+proc saveRfPriCalState(): uint32 =
+  events.add(saveEvent)
+  return 0xCA1'u32
+proc prepareRfPriRxcal() = events.add(setupEvent)
 proc searchRfRxcalParam(parameter: uint32; center, delta: int32):
     tuple[ok: bool, value: int32, power: uint32] =
   doAssert searchInputs.len < 4
+  events.add((1'u, searchSites[searchInputs.len]))
   result = (true, results[searchInputs.len], (searchInputs.len + 1).uint32)
   searchInputs.add((parameter, center, delta))
 proc restoreRfPriCalState(saved: uint32) =
+  doAssert saved == 0xCA1'u32
   doAssert calibration == inputCalibration, "RXCAL published records before restoring state"
   inc restoreCount
   volatileStore(addr rf70.txcalDfe88, inputRegisters[0])
@@ -473,8 +488,11 @@ for vector in 0 ..< 1000:
   var expected = calibration
   var trace: seq[tuple[address: uint, value: uint32]]
   trace.add((cast[uint](addr rf70.calMode14), (initialMode and 0xFCFFFFFF'u32) or 0x1000000))
+  trace.add(saveEvent)
+  trace.add(setupEvent)
   var searchControl = rf70.rxcalSearch614
   for index in 0 ..< 4:
+    trace.add((1'u, searchSites[index]))
     let value = cast[uint32](results[index])
     searchControl = if index mod 2 == 0:
         (searchControl and 0xFF800FFF'u32) or ((value and 0x7FF) shl 12) or 0x800000

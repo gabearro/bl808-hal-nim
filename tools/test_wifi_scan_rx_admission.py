@@ -21,6 +21,7 @@ const
   IE_ID_SSID = 0'u8
   IE_ID_DS_PARAM = 3'u8
   IE_ID_HT_CAP = 45'u8
+  IE_ID_RSN = 48'u8
 type
   Header = object
     paramLen: uint32
@@ -49,6 +50,7 @@ type
     ie: MacIeView
     currentChannel: uint8
 var
+  WPA_OUI = [0'u8, 0x50, 0xF2, 1]
   header: Header
   request: Request
   scanu_env: Env
@@ -63,6 +65,8 @@ var
   allocated: uint32
   scanuRequestEpoch: uint32
   cachedSsid: tuple[generation: uint32]
+  exposeSecurityIe: bool
+  callbackCalls: int
 proc rxuMgtIndAt(p: pointer): ptr RxuMgtIndView = cast[ptr RxuMgtIndView](p)
 proc rxuMgtIndMsgAt(p: pointer): ptr RxuMgtIndMsgView = cast[ptr RxuMgtIndMsgView](p)
 proc rxuMgtIndIeStart(p: pointer): pointer = addr rxuMgtIndAt(p).ieData[0]
@@ -71,6 +75,9 @@ proc macIeAt(p: uint): ptr MacIeView = cast[ptr MacIeView](p)
 proc totalLen(ie: ptr MacIeView): uint = ie.len.uint + 2
 proc macIePayload(ie: ptr MacIeView): ptr UncheckedArray[uint8] =
   cast[ptr UncheckedArray[uint8]](cast[uint](ie) + 2)
+proc blOpsFunc(offset: int): pointer =
+  doAssert offset == 8
+  nil
 proc c_memset(p: pointer; value: cint; length: csize_t): pointer =
   doAssert value == 0
   zeroMem(p, length.int)
@@ -95,6 +102,13 @@ proc find_wpa_rsn_ie(data: pointer; length: uint32; wpa, rsn: ptr pointer) =
   inc parses
   wpa[] = nil
   rsn[] = nil
+  if exposeSecurityIe and length >= 2:
+    let ie = cast[ptr MacIeView](data)
+    if ie.id == 48: rsn[] = data
+    elif ie.id == 221: wpa[] = data
+proc parseSecurity(data: pointer; length: uint8; output: pointer): pointer {.cdecl.} =
+  inc callbackCalls
+  nil
 proc wpaCallbacks(): ptr Callbacks = addr callbacks
 proc scanu_find_result(bssid: pointer; create: uint8): pointer =
   inc lookups
@@ -126,7 +140,10 @@ proc setup(length: uint32 = 68; subtype: uint16 = 0x80) =
   forwards = 0
   notifications = 0
   logs = 0
+  exposeSecurityIe = false
+  callbackCalls = 0
   wpa_cbs = nil
+  callbacks.parseSecurityIe = cast[pointer](parseSecurity)
   if length >= 68:
     rxuMgtIndAt(allocation).frameLen = (length - 32).uint16
     rxuMgtIndAt(allocation).bssid = scanu_env.filterBssid
@@ -191,16 +208,18 @@ for badField in 0 .. 2:
   discard rxu_mgt_ind_handler_scanu(allocation)
   doAssert forwards == 1 and parses == 0 and lookups == 0
 
-for id in [0'u8, 3, 45, 221]:
+for id in [0'u8, 3, 32, 42, 45, 221]:
   for length in 0 .. 33:
     var ie = @[id, length.uint8]
     for i in 0 ..< length: ie.add(0)
     if id == 221 and length >= 5:
       ie[2] = 0; ie[3] = 0x50; ie[4] = 0xF2; ie[5] = 2; ie[6] = 1
+      if length >= 24:
+        for aci in 0 ..< 4: ie[10 + aci * 4] = (aci shl 5).uint8
     putIes(ie)
     let valid = case id
       of 0: length <= 32
-      of 3: length == 1
+      of 3, 32, 42: length == 1
       of 45: length >= 26
       else: length < 5 or length >= 24
     doAssert scanuRxFrameValid(allocation, allocated) == valid
@@ -211,14 +230,59 @@ for id in [0'u8, 3, 45, 221]:
       putIes(ie[0 ..< ie.high])
       doAssert not scanuRxFrameValid(allocation, allocated)
 
+var wmm = newSeq[uint8](26)
+wmm[0..8] = [221'u8, 24, 0, 0x50, 0xF2, 2, 1, 1, 0]
+for aci in 0 ..< 4:
+  wmm[10 + aci * 4] = (aci shl 5).uint8
+putIes(wmm)
+doAssert scanuRxFrameValid(allocation, allocated)
+wmm[14] = wmm[10] # duplicate BE, no BK
+putIes(wmm)
+doAssert not scanuRxFrameValid(allocation, allocated)
+
 putIes([1'u8])
 doAssert not scanuRxFrameValid(allocation, allocated)
 putIes([99'u8, 0, 100, 2, 1, 2])
 doAssert scanuRxFrameValid(allocation, allocated)
 putIes(@[0'u8, 0, 3, 1, 1, 45, 26] & newSeq[uint8](26))
 doAssert scanuRxFrameValid(allocation, allocated)
+for ies in [@[0'u8, 0, 0, 1, 120],
+            @[0'u8, 1, 120, 0, 0],
+            @[3'u8, 1, 1, 3, 1, 6]]:
+  putIes(ies)
+  doAssert not scanuRxFrameValid(allocation, allocated)
+  doAssert rxu_mgt_ind_handler_scanu(allocation) == KeMsgConsumed
+  doAssert parses == 0 and lookups == 0 and forwards == 0
 
-# Matching a vendor OUI may only inspect a complete element's own payload.
+for ies in [@[48'u8, 0, 48, 0],
+            @[221'u8, 4, 0, 0x50, 0xF2, 1,
+              221, 4, 0, 0x50, 0xF2, 1]]:
+  putIes(ies)
+  doAssert not scanuRxFrameValid(allocation, allocated)
+  doAssert rxu_mgt_ind_handler_scanu(allocation) == KeMsgConsumed
+  doAssert parses == 0 and lookups == 0 and forwards == 0
+putIes([221'u8, 4, 0, 0x50, 0xF2, 1, 48, 0])
+doAssert scanuRxFrameValid(allocation, allocated)
+putIes([221'u8, 4, 1, 2, 3, 4, 221, 4, 1, 2, 3, 4])
+doAssert scanuRxFrameValid(allocation, allocated)
+
+# The security parser callback length is uint8; payloads 254 and 255 would wrap.
+for id in [48'u8, 221'u8]:
+  for claimed in [253, 254, 255]:
+    var ie = newSeq[uint8](claimed + 2)
+    ie[0] = id
+    ie[1] = claimed.uint8
+    putIes(ie)
+    exposeSecurityIe = true
+    wpa_cbs = addr callbacks
+    doAssert scanuRxFrameValid(allocation, allocated)
+    discard rxu_mgt_ind_handler_scanu(allocation)
+    doAssert parses == 1
+    doAssert callbackCalls == (if claimed == 253: 1 else: 0)
+    doAssert lookups == (if claimed == 253: 1 else: 0)
+    doAssert forwards == (if claimed == 253: 0 else: 1)
+
+# The Nim finder only returns a complete IE with enough declared OUI bytes.
 var oui = [0'u8, 0x50, 0xF2, 2, 1]
 doAssert mac_vsie_find(nil, 99, addr oui[0], 5) == nil
 for available in 0 .. 35:
@@ -234,14 +298,19 @@ var vendor = [221'u8, 0, 221, 5, 0, 0x50, 0xF2, 2, 1]
 doAssert mac_vsie_find(addr vendor[0], vendor.len.uint32, addr oui[0], 5) == addr vendor[2]
 doAssert mac_vsie_find(addr vendor[0], vendor.len.uint32, nil, 1) == nil
 doAssert mac_vsie_find(addr vendor[0], vendor.len.uint32, nil, 0) == addr vendor[0]
+let wrapped = cast[pointer](high(uint) - 1'u)
+doAssert mac_ie_find(wrapped, 4, 221) == nil
+doAssert mac_vsie_find(wrapped, 4, addr oui[0], 5) == nil
 dealloc(allocation)
 allocation = nil
 """
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-@pytest.mark.parametrize("mutation", [None, "capacity", "bssid", "ssid", "ds", "ht",
-                                      "wmm", "dispatch", "vsie_size", "vsie_oui"])
+@pytest.mark.parametrize("mutation", [None, "capacity", "bssid", "ssid", "ds",
+                                      "ssid_duplicate", "ds_duplicate",
+                                      "rsn_duplicate", "wpa_duplicate", "ht",
+                                      "wmm", "dispatch"])
 def test_scan_rx_admission(tmp_path: Path, mode: str, mutation: str | None) -> None:
     nim = shutil.which("nim")
     if nim is None:
@@ -258,16 +327,23 @@ def test_scan_rx_admission(tmp_path: Path, mode: str, mutation: str | None) -> N
     elif mutation in ["ssid", "ds", "ht"]:
         condition = {"ssid": "ie.len > 32", "ds": "ie.len != 1", "ht": "ie.len < 26"}[mutation]
         parts[names[0]] = parts[names[0]].replace(condition, "false")
+    elif mutation == "ssid_duplicate":
+        parts[names[0]] = parts[names[0]].replace("seenSsid or ie.len > 32", "ie.len > 32")
+    elif mutation == "ds_duplicate":
+        parts[names[0]] = parts[names[0]].replace("seenDsParam or ie.len != 1", "ie.len != 1")
+    elif mutation == "rsn_duplicate":
+        parts[names[0]] = parts[names[0]].replace("if seenRsn: return false", "if false: return false")
+    elif mutation == "wpa_duplicate":
+        parts[names[0]] = parts[names[0]].replace("if seenWpa: return false", "if false: return false")
     elif mutation == "wmm":
         parts[names[0]] = parts[names[0]].replace("body[4] == 1 and ie.len < 24", "false")
+        parts[names[0]] = parts[names[0]].replace(
+            "body[3] == 2 and body[4] == 1:\n          var seenAccessCategories",
+            "false:\n          var seenAccessCategories")
     dispatch = procedure(tasks, "rxu_mgt_ind_handler_scanu")
     if mutation == "dispatch":
         dispatch = dispatch.replace("scanu_frame_handler(param, payloadLength)", "scanu_frame_handler(param, 0)")
     vsie = procedure(mac, "mac_vsie_find")
-    if mutation == "vsie_size":
-        vsie = vsie.replace("    if size > remaining:\n      return nil\n", "")
-    elif mutation == "vsie_oui":
-        vsie = vsie.replace(" and ie.len >= ouiLen", "")
     # Compile the real entry path through cache lookup/notification. The later
     # directed-VIF/security/WPS population is intentionally not modeled here.
     full_entry = procedure(scan, "scanu_frame_handler")
@@ -279,7 +355,8 @@ def test_scan_rx_admission(tmp_path: Path, mode: str, mutation: str | None) -> N
         types += re.search(rf"(?ms)^  {name}[^\n]*\n.*?(?=\n\n)", layout).group(0) + "\n"
     program = tmp_path / "admission.nim"
     program.write_text("type\n" + types + PLATFORM + procedure(mac, "mac_ie_find") + vsie
-                       + "\n".join(parts.values()) + procedure(scan, "scanuRequestCurrent")
+                       + procedure(scan, "readLegacyRateIe") + "\n".join(parts.values())
+                       + procedure(scan, "scanuRequestCurrent")
                        + entry + dispatch + CHECKS)
     flags = {"checked": [], "release": ["-d:release", "--assertions:on"],
              "asan": ["--cc:clang", "--passC:-fsanitize=address", "--passL:-fsanitize=address"]}

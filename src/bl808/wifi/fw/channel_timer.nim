@@ -22,6 +22,20 @@ var
   chanCtxtTimerOwner {.wifiCtrl.}: ChanCtxtTimerOwner
   chanConnlessTimerOwner {.wifiCtrl.}: ChanConnlessTimerOwner
 
+proc chanForceIdle(): bool =
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  let previous = txResetEpoch
+  if not mm_force_idle_req() or txResetEpoch != previous + 1'u32: return false
+  # A channel switch drains TX but does not cancel these already queued deadlines.
+  if chanTbttTimerOwner.valid and chanTbttTimerOwner.resetEpoch == previous:
+    chanTbttTimerOwner.resetEpoch = txResetEpoch
+  if chanConnlessTimerOwner.valid and chanConnlessTimerOwner.resetEpoch == previous:
+    chanConnlessTimerOwner.resetEpoch = txResetEpoch
+  smScanPreserveAcrossChannelReset(previous)
+  smRegistrationPreserveAcrossChannelReset(previous)
+  true
+
 proc chanTimerInvalidate(timer: pointer = nil) =
   if timer == nil or timer == chanTbttTimer():
     inc chanTbttTimerOwner.serial
@@ -135,27 +149,49 @@ proc chanConnlessTimerDispatch(callback: pointer; serial: uint32): bool =
   chanConnlessTimerOwner.valid = false
   chanConnlessDelayEvent()
 
+proc chanCtxtTimerCurrent(resetEpoch: uint32): bool =
+  let owner = addr chanCtxtTimerOwner
+  if not owner.valid or owner.resetEpoch != resetEpoch or
+      chanCtxtEpochs[owner.index] != owner.allocation:
+    return false
+  let ctxt = chanCtxtForIdx(owner.index)
+  let env = chanEnvView()
+  let phase = owner.phase
+  # A pending switch does not own the current scan dwell's end deadline.
+  let operatingScan = owner.index == 3 and phase == 4 and
+    ctxt.status == 4 and owner.current == owner.context
+  ctxt.contextIndexOrMarker == owner.index and
+    (ctxt.status == 3 or ctxt.status == phase) and env.currentCtxt == owner.current and
+    (operatingScan or env.scheduledCtxt == owner.scheduled) and
+    ctxt.channel.band == owner.definition.band and
+    ctxt.channel.chanType == owner.definition.chanType and
+    ctxt.channel.primFreq == owner.definition.primFreq and
+    ctxt.channel.centerFreq1 == owner.definition.centerFreq1 and
+    ctxt.channel.centerFreq2 == owner.definition.centerFreq2
+
+proc chanForceIdleForDeparture(target: pointer): bool =
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if target == nil or chanEnvView().scheduledCtxt != target: return false
+  let owner = addr chanCtxtTimerOwner
+  let previous = txResetEpoch
+  let serial = owner.serial
+  let carryDeadline = owner.phase == 2 and owner.context == target and
+    owner.scheduled == target and chanCtxtTimerCurrent(previous)
+  if not chanForceIdle(): return false
+  # The switch's own TX drain precedes its protection-frame wait. Keep the
+  # original deadline only if the drain did not retire or replace its owner.
+  if carryDeadline and owner.serial == serial and chanCtxtTimerCurrent(previous):
+    owner.resetEpoch = txResetEpoch
+  true
+
 proc chanCtxtTimerDispatch(callback, argument: pointer; serial: uint32): bool =
   if callback != cast[pointer](chan_ctxt_op_evt): return false
   result = true
   let saved = irqSave()
   defer: irqRestore(saved)
-  if not chanCtxtTimerOwner.valid or chanCtxtTimerOwner.serial != serial or
-      chanCtxtTimerOwner.context != argument or
-      chanCtxtTimerOwner.resetEpoch != txResetEpoch or
-      chanCtxtEpochs[chanCtxtTimerOwner.index] != chanCtxtTimerOwner.allocation:
-    return
-  let ctxt = chanCtxtForIdx(chanCtxtTimerOwner.index)
-  let phase = chanCtxtTimerOwner.phase
-  if ctxt.contextIndexOrMarker != chanCtxtTimerOwner.index or
-      (ctxt.status != 3 and ctxt.status != phase) or
-      chanEnvView().currentCtxt != chanCtxtTimerOwner.current or
-      chanEnvView().scheduledCtxt != chanCtxtTimerOwner.scheduled or
-      ctxt.channel.band != chanCtxtTimerOwner.definition.band or
-      ctxt.channel.chanType != chanCtxtTimerOwner.definition.chanType or
-      ctxt.channel.primFreq != chanCtxtTimerOwner.definition.primFreq or
-      ctxt.channel.centerFreq1 != chanCtxtTimerOwner.definition.centerFreq1 or
-      ctxt.channel.centerFreq2 != chanCtxtTimerOwner.definition.centerFreq2:
+  if chanCtxtTimerOwner.serial != serial or chanCtxtTimerOwner.context != argument or
+      not chanCtxtTimerCurrent(txResetEpoch):
     return
   chanCtxtTimerOwner.valid = false
   chanCtxtOpEvent(argument, saved)

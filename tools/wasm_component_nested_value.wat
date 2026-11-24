@@ -1,0 +1,23 @@
+(module
+  (memory (export "cm32p2_memory") 1)
+  (global $next (mut i32) (i32.const 32))
+  (func (export "cm32p2_realloc") (param i32 i32 i32 i32) (result i32)
+    ;; The only heap allocation is a UTF-8 string, whose alignment is one.
+    (local $pointer i32)
+    (local.set $pointer (global.get $next))
+    (global.set $next (i32.add (local.get $pointer) (local.get 3)))
+    (local.get $pointer))
+  (func (export "cm32p2||echo") (param $tag i32) (param $pointer i32)
+    (param $length i32) (param $number i64) (param $code i32) (result i32)
+    (if (i32.eqz (local.get $tag))
+      (then
+        (if (i32.or (i32.or (local.get $pointer) (local.get $length))
+                    (i32.eqz (i64.eqz (local.get $number))))
+          (then unreachable))))
+    (i32.store8 (i32.const 0) (local.get $tag))
+    (i32.store (i32.const 8) (local.get $pointer))
+    (i32.store (i32.const 12) (local.get $length))
+    (i64.store (i32.const 16) (local.get $number))
+    (i32.store8 (i32.const 24) (local.get $code))
+    (i32.const 0))
+)

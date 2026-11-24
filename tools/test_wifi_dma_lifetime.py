@@ -240,7 +240,8 @@ def test_dma_lifetime(tmp_path: Path, mode: str, mutation: str | None) -> None:
     if nim is None:
         pytest.skip("Nim is required")
     tx = (FW / "tx_layer.nim").read_text()
-    functions = "".join(procedure(tx, name) for name in [
+    functions = procedure((FW / "runtime_helpers.nim").read_text(), "wifiDmaStoreLink")
+    functions += "".join(procedure(tx, name) for name in [
         "txlInvalidateDmaFrame", "txlInvalidateDmaAc", "txlInvalidateDmaVif",
         "txlInvalidateDmaStation", "txlInvalidateDmaAll", "txlInvalidateDmaPool",
         "txl_payload_handle_backup", "txl_frame_release", "txl_cfm_push",
@@ -275,7 +276,8 @@ def test_dma_lifetime(tmp_path: Path, mode: str, mutation: str | None) -> None:
     options = {"checked": [], "release": ["-d:release", "--assertions:on"],
         "asan": ["--cc:clang", "--passC:-fsanitize=address", "--passL:-fsanitize=address"]}
     result = subprocess.run([nim, "c", "-r", "--skipParentCfg:on", "--skipProjCfg:on", "--skipUserCfg:on",
-        "-d:bl808WifiConnectTrace", f"--nimcache:{tmp_path / 'cache'}", f"-o:{tmp_path / 'test'}",
+        "-d:bl808WifiConnectTrace", "-d:bl808WifiDiagDhcpTxFinalSnapshot",
+        f"--nimcache:{tmp_path / 'cache'}", f"-o:{tmp_path / 'test'}",
         *options[mode], str(source)], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
     if mutation is None:
         assert result.returncode == 0, result.stdout

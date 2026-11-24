@@ -1,6 +1,6 @@
 proc bl_get_fixed_channels_is_valid*(channels: ptr uint16; channelNum: uint16): cint
     {.exportc, cdecl.} =
-  if channelNum == 0:
+  if channels == nil or channelNum == 0 or channelNum > channelNumDefault.uint16:
     return 0
   for fixedChannelIndex in 0 ..< channelNum.int:
     let channel = cast[ptr UncheckedArray[uint16]](channels)[fixedChannelIndex]

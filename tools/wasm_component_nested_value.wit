@@ -1,0 +1,9 @@
+package ox64:values@0.2.0;
+
+world nested-values {
+  record message {
+    payload: option<tuple<string, u64>>,
+    code: u8,
+  }
+  export echo: func(value: message) -> message;
+}

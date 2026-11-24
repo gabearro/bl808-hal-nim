@@ -12,7 +12,6 @@ from test_wifi_switch_request import source as switch_source
 
 def source() -> str:
     code = switch_source()
-    code = "var frameCurrent = true\nproc txlFrameCallbackCurrent(): bool = frameCurrent\n" + code
     for name in ["chan_sta_tx_cfm", "chan_ap_tx_cfm"]:
         code = code.replace(procedure(code, name),
                             f"proc {name}*(param: pointer; status: uint32) {{.exportc, cdecl.}}\n", 1)
@@ -27,14 +26,24 @@ var
   nullResult, ctsResult: uint8
   onProtectionSend, onActive, onPre: proc()
   protectedSource, protectedTarget: pointer
+  frameEpoch: uint32
+  frameTracked: bool
+  frameCurrent = true
+proc txlFrameCallbackCurrent(resetEpoch = txResetEpoch): bool =
+  not frameTracked or (frameCurrent and frameEpoch == resetEpoch)
+proc invokeProtectionFrame(callback: pointer; token: uint32) =
+  let previous = (frameTracked, frameEpoch)
+  frameTracked = true
+  frameEpoch = txResetEpoch
+  defer: (frameTracked, frameEpoch) = previous
+  cast[proc(p: pointer; status: uint32) {.cdecl.}](callback)(cast[pointer](token.uint), 0)
 proc emitProtection(callback: pointer; token: uint32; ap: bool): uint8 =
   doAssert chanProtectionTagged(cast[pointer](token.uint))
   protectionFrames.add(ProtectionFrame(callback: callback, token: token, ap: ap))
   invoke(onProtectionSend)
   result = if ap: ctsResult else: nullResult
   if synchronous and result == 0:
-    cast[proc(p: pointer; status: uint32) {.cdecl.}](callback)(
-      cast[pointer](token.uint), 0)
+    invokeProtectionFrame(callback, token)
 '''
     code += support
     code = code.replace(procedure(code, "txl_frame_send_null_frame"), r'''
@@ -96,6 +105,7 @@ proc configureProtection(target: pointer) =
 proc beginProtection() =
   protectedSource = newTarget(2412)
   protectedTarget = newTarget(2437)
+  chanCtxtAt(protectedSource).status = 4
   channelEnv.currentCtxt = protectedSource
   configureProtection(protectedTarget)
   let request = beginSwitch(protectedTarget)
@@ -104,8 +114,7 @@ proc beginProtection() =
   doAssert chanSwitchTags == nil
 proc completeFrame(index: int) =
   let frame = protectionFrames[index]
-  cast[proc(p: pointer; status: uint32) {.cdecl.}](frame.callback)(
-    cast[pointer](frame.token.uint), 0)
+  invokeProtectionFrame(frame.callback, frame.token)
 proc finishProtectionTest() =
   finishSwitch()
   doAssert not chanProtectionActive()
@@ -209,14 +218,25 @@ doAssert callbacks == 1
 finishProtectionTest()
 ''',
     "cancel_during_submission": r'''
-resetProtectionTest()
-onProtectionSend = proc() = chanSwitchCancel(protectedTarget)
-beginProtection()
-doAssert protectionFrames.len == 1 and callbacks == 0
-doAssert channelEnv.scanDelayCount == 0 and channelEnv.connlessDelayCount == 0
-completeFrame(0)
-doAssert callbacks == 0
-finishProtectionTest()
+for ap in [false, true]:
+  for retireSource in [false, true]:
+    resetProtectionTest()
+    let cancel = proc() =
+      doAssert protectionFrames[^1].ap == ap
+      chanSwitchCancel(protectedTarget)
+      if retireSource:
+        inc chanCtxtEpochs[chanCtxtAt(protectedSource).contextIndexOrMarker]
+    if ap:
+      onProtectionSend = proc() = onProtectionSend = cancel
+    else:
+      onProtectionSend = cancel
+    beginProtection()
+    doAssert protectionFrames.len == (if ap: 2 else: 1) and callbacks == 0
+    doAssert chanCtxtAt(protectedSource).status == (if retireSource: 6 else: 4)
+    doAssert channelEnv.scanDelayCount == 0 and channelEnv.connlessDelayCount == 0
+    for index in 0..<protectionFrames.len: completeFrame(index)
+    doAssert callbacks == 0
+    finishProtectionTest()
 ''',
     "new_switch_during_final_idle": r'''
 resetProtectionTest()

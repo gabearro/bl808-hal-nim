@@ -14,6 +14,7 @@ FW = ROOT / "src/bl808/wifi/fw"
 UTILS = ROOT / "src/bl808/wifi/utils"
 
 CONTEXT = r"""
+{.pragma: wifiCtrl.}
 const
   MAX_VIFS = 2
   STA_INFO_TAB_ENTRIES = 7
@@ -69,6 +70,7 @@ proc storePtr(p: pointer; offset: uint; value: pointer) =
 proc storeU8(p: pointer; offset: uint; value: uint8) =
   cast[ptr uint8](ptrAt(p, offset))[] = value
 proc noteEthernetInput(p: ptr Pbuf): bool = false
+proc ke_msg_send(p: pointer) = doAssert false, "unexpected station indication"
 proc pbuf_take_at(p: ptr Pbuf; data: pointer; length, offset: uint16): int8 =
   doAssert offset.uint32 + length.uint32 <= p.len.uint32
   let source = if cast[uint](data) < 0x50000: resolve(data, length.uint) else: data
@@ -296,6 +298,8 @@ MUTANTS = {
 
 def program(case: str, mutation: str | None = None) -> str:
     source = copy_source("copy").removesuffix(COPY_CHECKS["copy"])
+    source = (f'from "{UTILS.parent / "host_table_layout"}" import '
+              f'WifiHostStaTableOffset, WifiHostStaEntrySize, WifiHostStaTableCount\n' + source)
     source = source.replace(
         "proc ptrAt(p: pointer; offset: uint): pointer = cast[pointer](cast[uint](p) + offset)",
         "var hostStart, hostEnd: uint\n"

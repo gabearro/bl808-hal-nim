@@ -22,7 +22,7 @@ type
 var
   storage: array[40, uint64]
   active: bool
-  metadata: array[12, bool]
+  metadata: array[14, bool]
   keMsgQueueSent: CoList
   frees, deliveries, assertions, events, traces: int
   interrupts = true
@@ -69,6 +69,9 @@ proc nimFwTrace2U32(message: string; first, second: uint32) = inc traces
 proc mmTimCaptureMessage(p: ptr KeMsgHdr) = discard
 proc smAbortCaptureMessage(p: ptr KeMsgHdr) = discard
 proc chanUpdateCaptureMessage(p: ptr KeMsgHdr) = discard
+proc scanDwellForget(p: pointer) = discard
+proc mmEdcaForget(p: pointer) = discard
+proc mmConfigForgetIdleOwner(p: pointer): bool = false
 proc setup(destination: uint8) =
   storage = default(typeof(storage))
   header[] = KeMsgHdr(id: 0x1234, destId: destination, srcId: 3, paramLen: 4)
@@ -89,12 +92,13 @@ def source() -> str:
     code = (FW.parent / "fw_messages/tasks.nim").read_text() + PLATFORM
     hooks = ["mmTimForget", "rxMgtForget", "smCleanupForget", "smBssForget", "smActivationForget",
              "smScanForget", "smRegistrationForget", "chanSwitchForget", "smRspTimerForget",
-             "smDeferredForget", "smAbortForget", "chanUpdateForget"]
+             "smDeferredForget", "smAbortForget", "chanUpdateForget", "mmConnLossForget",
+             "chanBcnRequestForget"]
     for index, name in enumerate(hooks):
         code += f"\nproc {name}(p: pointer) =\n  doAssert p == header\n  metadata[{index}] = false\n"
     start = kernel.index("template platformFree(")
-    code += kernel[start:kernel.index("proc ke_msg_free_payload", start)]
-    return code + procedure(kernel, "ke_msg_send")
+    code += kernel[start:kernel.index("\n\n", start)] + "\n"
+    return code + procedure(kernel, "ke_msg_free") + procedure(kernel, "ke_msg_send")
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])

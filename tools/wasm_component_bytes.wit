@@ -1,0 +1,5 @@
+package ox64:math@0.2.0;
+
+world bytes-demo {
+  export echo-bytes: func(value: list<u8>) -> list<u8>;
+}

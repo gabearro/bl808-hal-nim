@@ -1,0 +1,6 @@
+package ox64:values@0.2.0;
+
+world option-demo {
+  export choose: func(value: option<u32>) -> u32;
+  export make-option: func(value: u32) -> option<u32>;
+}

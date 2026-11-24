@@ -54,7 +54,7 @@ proc staInfoAt(p: pointer): ptr Sta = cast[ptr Sta](p)
 proc staDeleteEpoch(index: uint8): uint32 =
   if index < 5: epochs[index] else: 0
 proc txlResetting(): bool = false
-proc txSecurityCurrent(desc: ptr HostTxDescView): bool = true
+proc txSecurityCurrent(desc: ptr HostTxDescView; allowInternalNull = false): bool = true
 proc noteHwWaitTimeout(address, mask: uint32) =
   doAssert false, "unexpected halt timeout"
 proc hal_machw_disable_int() =
@@ -81,6 +81,7 @@ proc co_list_extract(list: ptr CoList; node: ptr CoListHdr) =
     previous = current
     current = current.next
 proc staDeleteInvalidate(index: uint8) = inc epochs[index]
+proc staDeleteCancelQueued(index: uint8) = discard
 proc staMgmtResetEntry(owner: StaQueueIdentity; requireRetired: bool): bool =
   let p = owner.entry
   let sta = cast[ptr Sta](p)

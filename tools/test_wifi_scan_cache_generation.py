@@ -97,6 +97,7 @@ def test_reacquired_slot_does_not_restore_old_identity(tmp_path: Path, mode: str
     run_program(tmp_path, mode, source() + r'''
 setup()
 let entry = addr scanu_env.entries[0]
+entry.bssid = [2'u8, 0, 0, 0, 0, 1]
 let before = entry[]
 let snapshot = scanuCaptureResult(entry)
 entry.valid = 0
@@ -157,7 +158,7 @@ for incoming in [false, true]:
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-def test_reservation_retains_vendor_search_order(tmp_path: Path, mode: str) -> None:
+def test_reservation_prefers_existing_bssid_behind_hole(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, source() + r'''
 for incoming in [false, true]:
   setup()
@@ -171,7 +172,13 @@ for incoming in [false, true]:
   doAssert scanuResultCurrent(existing)
   scanu_env.entries[0].valid = 0
   doAssert scanu_find_result(addr wanted[0], 0) == addr scanu_env.entries[4]
-  doAssert scanu_find_result(addr wanted[0], 1) == addr scanu_env.entries[0]
+  doAssert scanu_find_result(addr wanted[0], 1) == addr scanu_env.entries[4]
+  doAssert scanuCachedSsids[0].generation == 10
+  doAssert scanu_env.entries[0].valid == 0
+  doAssert scanu_find_result(nil, 0) == nil
+  doAssert scanu_find_result(nil, 1) == nil
+  var newBssid = [2'u8, 0, 0, 0, 0, 99]
+  doAssert scanu_find_result(addr newBssid[0], 1) == addr scanu_env.entries[0]
   doAssert scanuCachedSsids[0].generation == 11 and scanuCachedSsids[0].valid == 0
   doAssert scanu_env.entries[0].rssi == -128 and scanu_env.entries[0].valid == 0
   doAssert scanuResultCurrent(existing)

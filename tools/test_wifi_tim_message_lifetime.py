@@ -76,17 +76,21 @@ proc blOpsFunc(offset: int): pointer =
   else: nil
 template platformFree(p: pointer) = heapFree(p)
 proc rxMgtForget(p: pointer) = discard
+proc mmConnLossForget(p: pointer) = discard
 proc smCleanupForget(p: pointer) = discard
 proc smBssForget(p: pointer) = discard
 proc smActivationForget(p: pointer) = discard
 proc smScanForget(p: pointer) = discard
 proc smRegistrationForget(p: pointer) = discard
 proc chanSwitchForget(p: pointer) = discard
+proc scanDwellForget(p: pointer) = discard
 proc smRspTimerForget(p: pointer) = discard
 proc smDeferredForget(p: pointer) = discard
 proc smAbortStorageLength(id: uint16; destination: uint8; length: uint32): uint32 = length
 proc smAbortRegister(header: ptr KeMsgHdr) = discard
 proc smAbortForget(header: pointer) = discard
+proc mmEdcaForget(header: pointer) = discard
+proc mmConfigForgetIdleOwner(header: pointer): bool = false
 proc smAbortCaptureMessage(header: ptr KeMsgHdr) = discard
 proc chanUpdateStorageLength(id: uint16; destination: uint8; length: uint32): uint32 = length
 proc chanUpdateRegister(header: ptr KeMsgHdr) = discard
@@ -148,6 +152,7 @@ proc inject(point: string) =
     inc stationEpochs[2]
     return
   if point == "free":
+    doAssert acknowledged == @[9'u8], "TIM confirmation followed request free"
     replacement = newMessage(17, 1, 0, src = 6)
     doAssert cast[pointer](keMsgHdrFromPayload(replacement)) == oldAddress
     ke_msg_send(replacement)
@@ -232,7 +237,7 @@ for irq in [false, true]:
   doAssert frees == 1 and env.timQueue.first == nil and mmTimIdentities == nil
   env.pendingCount = 0
 
-  # Free can reenter allocation before returning; confirmation uses old metadata.
+  # Confirmation is published before free can reenter allocation.
   setup(irq)
   discard send(42, 1)
   let original = co_list_pop_front(addr keMsgQueueSent)
@@ -341,7 +346,7 @@ if cached != nil: free(cached)
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-@pytest.mark.parametrize("mutation", [None, "vif", "station", "beacon", "kernel", "recapture", "forget", "publication", "payload", "sender"])
+@pytest.mark.parametrize("mutation", [None, "vif", "station", "beacon", "kernel", "recapture", "forget", "publication", "payload", "free_before_send"])
 def test_tim_message_lifetime(tmp_path: Path, mode: str, mutation: str | None) -> None:
     nim = shutil.which("nim")
     if nim is None:
@@ -386,9 +391,11 @@ def test_tim_message_lifetime(tmp_path: Path, mode: str, mutation: str | None) -
         functions = functions.replace(line, "").replace("    block:\n", line + "    block:\n")
     elif mutation == "payload":
         functions = functions.replace("      if req.vifIdx != node.vif or req.aid != node.aid or req.setFlag != node.setFlag:", "      if false:")
-    elif mutation == "sender":
+    elif mutation == "free_before_send":
+        old = "    ke_msg_send_basic(0x30, sender, TASK_MM)\n    ke_msg_free(msgHdr)"
+        assert old in base
         base = base.replace("  let sender = msgHdr.srcId\n", "").replace(
-            "    ke_msg_free(msgHdr)\n    ke_msg_send_basic(0x30, sender, TASK_MM)",
+            old,
             "    ke_msg_free(msgHdr)\n    ke_msg_send_basic(0x30, msgHdr.srcId, TASK_MM)")
     source = tmp_path / "tim_lifetime.nim"
     source.write_text(base + functions + CHECKS)

@@ -7,7 +7,7 @@ import pytest
 from test_wifi_disconnect_tx import procedure
 from test_wifi_message_allocation import run_program
 from test_wifi_rf_lo_search import lo_source, packed_lo_source
-from test_wifi_rf_power_replay import RF
+from test_wifi_rf_power_replay import RF, object_type
 
 
 @pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
@@ -169,14 +169,18 @@ for row in 0 ..< 6:
 @pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
 def test_warm_initialization_does_not_fabricate_lo_records(tmp_path: Path, mode: str) -> None:
     rf = RF.read_text()
-    code = packed_lo_source() + r'''
+    code = packed_lo_source() + object_type(rf, "RfDfeInitBlock") + r'''
+var dfe: RfDfeInitBlock
+proc rfDfeInitRegs(): ptr RfDfeInitBlock = addr dfe
 proc rfPriEfuseInit() = discard
 proc rfPriSnapshotStage(tag: uint32) = discard
 proc writeRfPriFixedValueRegs() = discard
+proc prepareBl808RfColdRegisters() = discard
 '''
     init = procedure(rf, "rf_pri_init")
-    prefix = init[init.index("  rfPriEfuseInit()"):].split("  rfPriWifiPllConfig()", 1)[0]
-    code += "proc initializeBeforePll(needsFullCal: bool) =\n" + prefix
+    start = init.index("\n  if not useBl808ColdDefaults:")
+    end = init.index("\n  if not useBl808ColdDefaults:\n    rfPriWifiPllConfig()", start + 1)
+    code += "proc initializeBeforePll(useBl808ColdDefaults: bool) =" + init[start:end] + "\n"
     run_program(tmp_path, mode, code + r'''
 for row in 0 ..< 6:
   for empty in [false, true]:

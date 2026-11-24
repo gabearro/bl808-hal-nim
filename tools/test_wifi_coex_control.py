@@ -113,7 +113,7 @@ def source() -> str:
     state = "\n".join((FW / path).read_text() for path in [
         "global_state/storage.nim", "dispatch_tables.nim"])
     declarations = []
-    for name in ["coexPtaAutoControl", "coexPtaTimestamp", "coexPtaAccum",
+    for name in ["coexPtaAutoControl", "coexPtaTimestamp",
                  "pds_slept_time", "pds_woken_time"]:
         matches = re.findall(rf"^\s*(?:var )?({name}\*[^\n]+)", state, re.M)
         assert len(matches) == 1, name
@@ -125,7 +125,6 @@ def source() -> str:
 proc setup(state: uint32; irq, enableLog: bool; times: seq[uint32]) =
   coexPtaAutoControl = state
   coexPtaTimestamp = 100
-  coexPtaAccum = 9
   pds_slept_time = 7
   pds_woken_time = 11
   expectedOldState = state
@@ -194,6 +193,22 @@ onRead = nil
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_pti_repeated_calls_still_write(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+control = 0x12345670'u32
+for (enable, expectedWrites, expectedControl) in [
+    (true, 3, 0xF6345670'u32),
+    (true, 6, 0xF6345670'u32),
+    (false, 8, 0xF6345660'u32),
+    (false, 10, 0xF6345660'u32),
+]:
+  coex_wifi_pti_forece_enable(enable)
+  doAssert writes.len == expectedWrites
+  doAssert control == expectedControl
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_pta_initial_noop_and_unknown_state(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, source() + r'''
 doAssert coexPtaAutoControl == high(uint32)
@@ -204,7 +219,7 @@ for irq in [false, true]:
     checkFinished(enable.uint32, 123)
     doAssert steps == @["log:614", "tick:123"]
     doAssert messages == @[(614.cint, "[COEX] Skip report for the first time\r\n")]
-    doAssert pds_slept_time == 7 and pds_woken_time == 11 and coexPtaAccum == 9
+    doAssert pds_slept_time == 7 and pds_woken_time == 11
 
     setup(enable.uint32, irq, true, @[])
     coex_wifi_pta_forece_enable(enable)
@@ -215,7 +230,7 @@ for irq in [false, true]:
     coex_wifi_pta_forece_enable(enable)
     checkFinished(enable.uint32, 321)
     doAssert steps == @["tick:321"] and messages.len == 0
-    doAssert pds_slept_time == 7 and pds_woken_time == 11 and coexPtaAccum == 9
+    doAssert pds_slept_time == 7 and pds_woken_time == 11
 ''')
 
 
@@ -230,7 +245,7 @@ for irq in [false, true]:
       else: doAssert coexPtaAutoControl == 1
     coex_wifi_pta_forece_enable(true)
     checkFinished(1, 130)
-    doAssert pds_slept_time == 27 and pds_woken_time == 11 and coexPtaAccum == 29
+    doAssert pds_slept_time == 27 and pds_woken_time == 11
     doAssert steps == (if enableLog: @["tick:120", "tick:122", "log:588", "tick:130"]
                       else: @["tick:120", "tick:122", "tick:130"])
     if enableLog: doAssert messages == @[(588.cint, "[COEX] BLE Usage 22ms\r\n")]
@@ -239,10 +254,9 @@ for irq in [false, true]:
     setup(0, irq, enableLog, @[0x10'u32, 0x12, 0x20])
     coexPtaTimestamp = 0xFFFFFFF0'u32
     pds_slept_time = 0xFFFFFFF8'u32
-    coexPtaAccum = 0xFFFFFFFC'u32
     coex_wifi_pta_forece_enable(true)
     checkFinished(1, 0x20)
-    doAssert pds_slept_time == 24 and coexPtaAccum == 28 and pds_woken_time == 11
+    doAssert pds_slept_time == 24 and pds_woken_time == 11
     if enableLog: doAssert messages == @[(588.cint, "[COEX] BLE Usage 34ms\r\n")]
 
 setup(0, true, true, @[0xFFFFFFF0'u32, 0xFFFFFFF1'u32, 9])
@@ -263,7 +277,7 @@ for irq in [false, true]:
       onRf = proc() = doAssert coexPtaAutoControl == 1
       coex_wifi_pta_forece_enable(false)
       checkFinished(0, 130)
-      doAssert pds_slept_time == 7 and pds_woken_time == 31 and coexPtaAccum == 29
+      doAssert pds_slept_time == 7 and pds_woken_time == 31
       var expected = @["tick:120", "lock", "nap", "restore"]
       if duration > 1000:
         expected.add(@["rf-on", "sleep:" & $(duration div 1000), "rf-off"])
@@ -311,6 +325,28 @@ doAssert steps == @["tick:120", "lock", "nap", "restore", "rf-on", "sleep:2",
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_pta_repeated_transition_state(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+setup(high(uint32), false, false,
+      @[100'u32, 110, 111, 112, 120, 121, 122])
+coex_wifi_pta_forece_enable(false)
+doAssert coexPtaAutoControl == 0 and coexPtaTimestamp == 100
+coex_wifi_pta_forece_enable(false)
+doAssert coexPtaAutoControl == 0 and coexPtaTimestamp == 100
+coex_wifi_pta_forece_enable(true)
+doAssert coexPtaAutoControl == 1 and coexPtaTimestamp == 112
+doAssert pds_slept_time == 17 and pds_woken_time == 11
+coex_wifi_pta_forece_enable(true)
+doAssert coexPtaAutoControl == 1 and coexPtaTimestamp == 112
+coex_wifi_pta_forece_enable(false)
+checkFinished(0, 122)
+doAssert pds_slept_time == 17 and pds_woken_time == 19
+doAssert steps == @["tick:100", "tick:110", "tick:111", "tick:112",
+                   "tick:120", "lock", "nap", "restore", "tick:121", "tick:122"]
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_hosal_imports_and_rf_event(tmp_path: Path, mode: str) -> None:
     declarations = (FW / "global_state/forward_decls_mac.nim").read_text()
     code = r'''
@@ -337,13 +373,100 @@ proc offCalls(): cint {.importc: "coex_test_off_calls", cdecl.}
         code += re.search(rf"^proc {name}\*[^\n]+", declarations, re.M)[0] + "\n"
     code += procedure((FW / "power_save.nim").read_text(), "ble_rf_ops")
     run_program(tmp_path, mode, code + r'''
-ble_rf_ops(0)
-ble_rf_ops(1)
-ble_rf_ops(42)
+doAssert ble_rf_ops(0) == 0'u32
+doAssert ble_rf_ops(1) == 0'u32
+doAssert ble_rf_ops(42) == 0'u32
 doAssert onCalls() == 2 and offCalls() == 1
 doAssert wifi_hosal_rf_turn_on() == 17
 doAssert wifi_hosal_rf_turn_off() == -3
 wifi_hosal_rf_turn_on(nil)
 wifi_hosal_rf_turn_off(nil)
 doAssert onCalls() == 4 and offCalls() == 3
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_pta_mode_return_value(tmp_path: Path, mode: str) -> None:
+    code = r'''
+var
+  control: uint32
+  clearCount, writeCount: int
+proc ptaCoexClear() = inc clearCount
+proc ptaCoexUpdateControl(mask, value: uint32) =
+  control = (control and mask) or value
+  inc writeCount
+proc wlanCoexControl(): uint32 = control
+proc wlanCoexWriteControl(value: uint32) =
+  control = value
+  inc writeCount
+'''
+    code += procedure((FW / "coex_intc_sysctrl.nim").read_text(),
+                      "coex_pta_force_autocontrol_set")
+    run_program(tmp_path, mode, code + r'''
+for modeValue in [0'u32, 1, 2, 255]:
+  control = high(uint32)
+  clearCount = 0
+  writeCount = 0
+  doAssert coex_pta_force_autocontrol_set(modeValue) == 0'u32
+  doAssert clearCount == 1
+  doAssert writeCount == (if modeValue == 1 or modeValue == 2: 5 else: 9)
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_pta_mode_cross_register_transitions(tmp_path: Path, mode: str) -> None:
+    code = r'''
+var
+  ptaControl = 0x55FA00E0'u32
+  wlanControl = 0xA5000000'u32
+  ptaWrites, wlanWrites: seq[uint32]
+  clearCount: int
+proc ptaCoexClear() = inc clearCount
+proc ptaCoexUpdateControl(mask, value: uint32) =
+  ptaControl = (ptaControl and mask) or value
+  ptaWrites.add(ptaControl)
+proc wlanCoexControl(): uint32 = wlanControl
+proc wlanCoexWriteControl(value: uint32) =
+  wlanControl = value
+  wlanWrites.add(value)
+'''
+    code += procedure((FW / "coex_intc_sysctrl.nim").read_text(),
+                      "coex_pta_force_autocontrol_set")
+    run_program(tmp_path, mode, code + r'''
+for modeValue in [0'u32, 0, 1, 1, 2, 2, 0, 3, high(uint32)]:
+  let oldPta = ptaControl
+  let oldWlan = wlanControl
+  let oldClearCount = clearCount
+  ptaWrites.setLen(0)
+  wlanWrites.setLen(0)
+  doAssert coex_pta_force_autocontrol_set(modeValue) == 0'u32
+  doAssert clearCount == oldClearCount + 1
+  if modeValue == 1 or modeValue == 2:
+    let priority = if modeValue == 1: 0x00030000'u32 else: 0x000C0000'u32
+    doAssert ptaControl == ((oldPta and not 0x000F0001'u32) or priority)
+    doAssert ptaWrites.len == 5 and ptaWrites[^1] == ptaControl
+    doAssert wlanWrites.len == 0 and wlanControl == oldWlan
+  else:
+    doAssert ptaControl == ((oldPta and not 0x000F0000'u32) or 0x13'u32)
+    doAssert ptaWrites.len == 7 and ptaWrites[^1] == ptaControl
+    doAssert wlanWrites == @[oldWlan and not 1'u32, oldWlan or 1'u32]
+    doAssert wlanControl == (oldWlan or 1'u32)
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_channel_restore_return_and_calls(tmp_path: Path, mode: str) -> None:
+    code = r'''
+var
+  rfInitArgs: seq[uint32]
+  coexCalls: int
+proc rf_init(config: uint32) = rfInitArgs.add(config)
+proc sm_set_channel_coex_connected() = inc coexCalls
+'''
+    code += procedure((FW / "power_save.nim").read_text(), "rfc_channel_ops")
+    run_program(tmp_path, mode, code + r'''
+doAssert rfc_channel_ops(0) == 0'u32
+doAssert rfc_channel_ops(high(uint32)) == 0'u32
+doAssert rfInitArgs == @[0x02625A00'u32, 0x02625A00'u32]
+doAssert coexCalls == 2
 ''')

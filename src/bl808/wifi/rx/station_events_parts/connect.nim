@@ -10,14 +10,16 @@ proc blRxSmConnectInd(blHw, cmd, msg: pointer): cint {.cdecl.} =
     if blHw == nil or msg == nil:
       return -1
     let vif = vifAt(blHw, BlVifSta)
+    let ind = msgParam(msg)
+    if not firmware.rxHostClaimStationIndication(ind, loadU8(vif, BlVifVifIdxOff)):
+      return 0
     let station = if loadU8(vif, BlVifLinksNumOff) != 0:
                     loadU8(vif, BlVifFixedStaIdxOff) else: 0xFF'u8
-    if loadU8(vif, BlVifLinksNumOff) != 0 and station >= NxRemoteStaStoreMax:
+    if loadU8(vif, BlVifLinksNumOff) != 0 and station >= NxRemoteStaMax:
       return -1
     transition = beginStationRxTransition(blHw, station)
     if not transition.valid:
       return -1
-    let ind = msgParam(msg)
     status = loadU16(ind, SmConnStatusOff)
     assocReqLen = loadU16(ind, SmConnAssocReqLenOff)
     assocRspLen = loadU16(ind, SmConnAssocRspLenOff)
@@ -85,6 +87,7 @@ proc blRxSmConnectInd(blHw, cmd, msg: pointer): cint {.cdecl.} =
       storeU8(sta, BlStaIsUsedOff, 0)
       linkDown = true
       bl_tx_cntrl_link_down(cast[ptr BlSta](sta))
+  if linkDown: retireStationDhcp(transition)
   if stationRxNetifCurrent(transition):
     if status == 0:
       netifapi_netif_set_link_up(cast[ptr Netif](transition.netif))

@@ -2,13 +2,18 @@
 ## Decodes .wasm binary files into WasmModule objects
 
 import ./types
+import ./binary_order
+import ./block_types
 import std/strutils
+import ./utf8_names
 
 type
   WasmDecodeError* = object of CatchableError
 
   BinaryReader* = object
     data: seq[byte]
+    view: ptr UncheckedArray[byte]
+    size: int
     pos: int
 
 # ---- Error helper ----
@@ -20,73 +25,80 @@ proc decodeError(msg: string) {.noreturn.} =
 
 proc initBinaryReader*(data: openArray[byte]): BinaryReader =
   result.data = @data
-  result.pos = 0
+  result.size = data.len
+
+proc viewBinaryReader(data: openArray[byte]): BinaryReader =
+  ## Only used within decodeModule, while its caller's buffer is alive.
+  result.size = data.len
+  if data.len > 0:
+    result.view = cast[ptr UncheckedArray[byte]](unsafeAddr data[0])
+
+proc dataAt(r: var BinaryReader, offset: int): ptr byte {.inline.} =
+  if r.view != nil: addr r.view[offset]
+  else: addr r.data[offset]
 
 proc atEnd*(r: BinaryReader): bool =
-  r.pos >= r.data.len
+  r.pos >= r.size
 
 proc remaining*(r: BinaryReader): int =
-  r.data.len - r.pos
+  r.size - r.pos
 
 proc readByte*(r: var BinaryReader): byte =
-  if r.pos >= r.data.len:
+  if r.pos >= r.size:
     decodeError("unexpected end of binary data")
-  result = r.data[r.pos]
+  result = r.dataAt(r.pos)[]
   inc r.pos
 
 proc readBytes*(r: var BinaryReader, n: int): seq[byte] =
-  if r.pos + n > r.data.len:
+  if n < 0 or n > r.size-r.pos:
     decodeError("unexpected end of binary data (need " & $n & " bytes)")
-  result = r.data[r.pos ..< r.pos + n]
+  result = newSeq[byte](n)
+  if n > 0:
+    copyMem(addr result[0], r.dataAt(r.pos), n)
   r.pos += n
 
 # ---- LEB128 decoding ----
 
 proc readU32*(r: var BinaryReader): uint32 =
-  var shift = 0
-  result = 0
-  while true:
+  for i in 0..4:
     let b = r.readByte()
-    result = result or (uint32(b and 0x7F) shl shift)
-    if (b and 0x80) == 0:
-      break
-    shift += 7
-    if shift >= 35:
-      decodeError("LEB128 u32 overflow")
+    if i == 4 and (b and 0xf0) != 0: decodeError("LEB128 u32 overflow")
+    result = result or (uint32(b and 0x7f) shl (7*i))
+    if (b and 0x80) == 0: return
+  decodeError("LEB128 u32 overflow")
 
 proc readS32*(r: var BinaryReader): int32 =
-  var shift = 0
-  var resultU: uint32 = 0
-  var b: byte
-  while true:
-    b = r.readByte()
-    resultU = resultU or (uint32(b and 0x7F) shl shift)
-    shift += 7
-    if (b and 0x80) == 0:
-      break
-    if shift >= 35:
+  var bits = 0'u32
+  for i in 0..4:
+    let b = r.readByte()
+    let payload = b and 0x7f
+    if i == 4 and ((b and 0x80) != 0 or (payload > 7 and payload < 0x78)):
       decodeError("LEB128 s32 overflow")
-  # Sign extend
-  if shift < 32 and (b and 0x40) != 0:
-    resultU = resultU or (not uint32(0) shl shift)
-  result = cast[int32](resultU)
+    bits = bits or (uint32(payload) shl (7*i))
+    if (b and 0x80) == 0:
+      let consumed = 7*(i+1)
+      if consumed < 32 and (b and 0x40) != 0: bits = bits or (not 0'u32 shl consumed)
+      return cast[int32](bits)
+  decodeError("LEB128 s32 overflow")
 
 proc readS64*(r: var BinaryReader): int64 =
-  var shift = 0
-  var resultU: uint64 = 0
-  var b: byte
-  while true:
-    b = r.readByte()
-    resultU = resultU or (uint64(b and 0x7F) shl shift)
-    shift += 7
-    if (b and 0x80) == 0:
-      break
-    if shift >= 70:
+  var bits = 0'u64
+  for i in 0..9:
+    let b = r.readByte()
+    let payload = b and 0x7f
+    if i == 9 and ((b and 0x80) != 0 or payload notin [0'u8, 0x7f]):
       decodeError("LEB128 s64 overflow")
-  # Sign extend
-  if shift < 64 and (b and 0x40) != 0:
-    resultU = resultU or (not uint64(0) shl shift)
-  result = cast[int64](resultU)
+    bits = bits or (uint64(payload) shl (7*i))
+    if (b and 0x80) == 0:
+      let consumed = 7*(i+1)
+      if consumed < 64 and (b and 0x40) != 0: bits = bits or (not 0'u64 shl consumed)
+      return cast[int64](bits)
+  decodeError("LEB128 s64 overflow")
+
+proc readCount*(r: var BinaryReader): int =
+  let count = r.readU32()
+  if uint64(count) > uint64(r.size-r.pos): decodeError("vector count exceeds available bytes")
+  int(count)
 
 # ---- Additional primitives ----
 
@@ -118,12 +130,13 @@ proc readF64Bits*(r: var BinaryReader): uint64 =
 
 proc readName*(r: var BinaryReader): string =
   let length = r.readU32()
-  if r.pos + length.int > r.data.len:
+  if uint64(length) > uint64(r.size-r.pos):
     decodeError("name length exceeds available data")
   let bytes = r.readBytes(length.int)
   result = newString(bytes.len)
   if bytes.len > 0:
     copyMem(addr result[0], unsafeAddr bytes[0], bytes.len)
+  if not validWasmName(result): decodeError("invalid UTF-8 name")
 
 # ---- Type decoders ----
 
@@ -141,7 +154,8 @@ proc readValType*(r: var BinaryReader): ValType =
 
 proc readBlockType*(r: var BinaryReader): BlockType =
   # Block type: 0x40 = empty, valtype byte, or s33 type index
-  let b = r.data[r.pos]
+  if r.atEnd(): decodeError("missing block type")
+  let b = r.dataAt(r.pos)[]
   if b == 0x40:
     inc r.pos
     return BlockType(kind: btkEmpty)
@@ -149,27 +163,34 @@ proc readBlockType*(r: var BinaryReader): BlockType =
   if b in {0x7F'u8, 0x7E, 0x7D, 0x7C, 0x7B, 0x70, 0x6F}:
     let vt = r.readValType()
     return BlockType(kind: btkValType, valType: vt)
-  # Otherwise it's a signed LEB128 type index
-  let idx = r.readS32()
-  if idx < 0:
-    decodeError("invalid block type index: " & $idx)
-  return BlockType(kind: btkTypeIdx, typeIdx: uint32(idx))
+  # A nonnegative s33 can use the entire u32 type-index range.
+  var index = 0'u32
+  for i in 0..4:
+    let byteValue = r.readByte()
+    let payload = byteValue and 0x7f
+    if i == 4 and (payload > 15 or (byteValue and 0x80) != 0): decodeError("block type s33 overflow")
+    index = index or (uint32(payload) shl (7*i))
+    if (byteValue and 0x80) == 0:
+      if i < 4 and (byteValue and 0x40) != 0: decodeError("negative block type index")
+      return BlockType(kind: btkTypeIdx, typeIdx: index)
+  decodeError("block type s33 overflow")
 
 proc readFuncType*(r: var BinaryReader): FuncType =
   let tag = r.readByte()
   if tag != 0x60:
     decodeError("expected func type tag 0x60, got 0x" & tag.toHex(2))
-  let paramCount = r.readU32()
+  let paramCount = r.readCount()
   result.params = newSeqOfCap[ValType](paramCount.int)
   for i in 0 ..< paramCount.int:
     result.params.add(r.readValType())
-  let resultCount = r.readU32()
+  let resultCount = r.readCount()
   result.results = newSeqOfCap[ValType](resultCount.int)
   for i in 0 ..< resultCount.int:
     result.results.add(r.readValType())
 
 proc readLimits*(r: var BinaryReader): Limits =
   let flag = r.readByte()
+  if flag notin [0'u8, 1]: decodeError("unsupported limits flags")
   result.min = r.readU32()
   if (flag and 0x01) != 0:
     result.hasMax = true
@@ -196,7 +217,7 @@ proc readGlobalType*(r: var BinaryReader): GlobalType =
 
 # ---- Block type encoding for compact Instr pad field ----
 
-proc blockTypeToPad(bt: BlockType): uint16 =
+proc blockTypeToPad(bt: BlockType, pc: int, wide: var seq[WideBlockType]): uint16 =
   ## Encode a BlockType into the pad field of a compact Instr.
   ##   pad = 0       → empty block
   ##   pad = 1..7    → valtype block (ValType ordinal mapped to small int)
@@ -215,7 +236,11 @@ proc blockTypeToPad(bt: BlockType): uint16 =
     of vtFuncRef:  result = 6
     of vtExternRef: result = 7
   of btkTypeIdx:
-    result = uint16(0x100) + uint16(bt.typeIdx)
+    if bt.typeIdx <= uint32(high(uint16))-0x100:
+      result = uint16(0x100+bt.typeIdx)
+    else:
+      wide.add WideBlockType(pc: uint32(pc), typeIndex: bt.typeIdx)
+      result = WideBlockPad
 
 # ---- Instruction decoder ----
 
@@ -230,6 +255,7 @@ proc readExpr*(r: var BinaryReader): Expr =
   ## Produces compact Instr objects. br_table auxiliary data is stored in
   ## result.brTables, referenced by imm1 index.
   var instrs: seq[Instr] = @[]
+  var wide: seq[WideBlockType]
   var brTables: seq[BrTableData] = @[]
   var v128Consts: seq[array[16, byte]] = @[]
   var catchTables: seq[seq[CatchClause]] = @[]
@@ -252,15 +278,15 @@ proc readExpr*(r: var BinaryReader): Expr =
     of 0x02: # block
       let bt = r.readBlockType()
       inc depth
-      instrs.add(Instr(op: opBlock, pad: blockTypeToPad(bt)))
+      instrs.add(Instr(op: opBlock, pad: blockTypeToPad(bt, instrs.len, wide)))
     of 0x03: # loop
       let bt = r.readBlockType()
       inc depth
-      instrs.add(Instr(op: opLoop, pad: blockTypeToPad(bt)))
+      instrs.add(Instr(op: opLoop, pad: blockTypeToPad(bt, instrs.len, wide)))
     of 0x04: # if
       let bt = r.readBlockType()
       inc depth
-      instrs.add(Instr(op: opIf, pad: blockTypeToPad(bt)))
+      instrs.add(Instr(op: opIf, pad: blockTypeToPad(bt, instrs.len, wide)))
     of 0x05: # else
       instrs.add(Instr(op: opElse))
     of 0x0C: # br
@@ -270,7 +296,7 @@ proc readExpr*(r: var BinaryReader): Expr =
       let idx = r.readU32()
       instrs.add(Instr(op: opBrIf, imm1: idx))
     of 0x0E: # br_table
-      let count = r.readU32()
+      let count = r.readCount()
       var labels = newSeqOfCap[uint32](count.int)
       for i in 0 ..< count.int:
         labels.add(r.readU32())
@@ -305,7 +331,7 @@ proc readExpr*(r: var BinaryReader): Expr =
 
     of 0x1F: # try_table
       let bt = r.readBlockType()
-      let catchCount = r.readU32()
+      let catchCount = r.readCount()
       var clauses: seq[CatchClause]
       for ci in 0 ..< catchCount.int:
         let kind = r.readByte()
@@ -329,7 +355,7 @@ proc readExpr*(r: var BinaryReader): Expr =
       let catchTableIdx = catchTables.len.uint32
       catchTables.add(clauses)
       inc depth
-      instrs.add(Instr(op: opTryTable, pad: blockTypeToPad(bt), imm2: catchTableIdx))
+      instrs.add(Instr(op: opTryTable, pad: blockTypeToPad(bt, instrs.len, wide), imm2: catchTableIdx))
 
     # Parametric
     of 0x1A: # drop
@@ -337,10 +363,11 @@ proc readExpr*(r: var BinaryReader): Expr =
     of 0x1B: # select
       instrs.add(Instr(op: opSelect))
     of 0x1C: # select (typed)
-      let count = r.readU32()
-      for i in 0 ..< count.int:
-        discard r.readValType()
-      instrs.add(Instr(op: opSelectTyped))
+      let count = r.readCount()
+      if count != 1:
+        decodeError("typed select requires exactly one result type")
+      let selectedType = r.readValType()
+      instrs.add(Instr(op: opSelectTyped, imm1: uint32(ord(selectedType))))
 
     # Variable
     of 0x20: # local.get
@@ -398,10 +425,10 @@ proc readExpr*(r: var BinaryReader): Expr =
       instrs.add(Instr(op: op, imm1: ma.offset, imm2: ma.align))
 
     of 0x3F: # memory.size
-      let memIdx = r.readByte()
+      let memIdx = r.readU32()
       instrs.add(Instr(op: opMemorySize, imm1: uint32(memIdx)))
     of 0x40: # memory.grow
-      let memIdx = r.readByte()
+      let memIdx = r.readU32()
       instrs.add(Instr(op: opMemoryGrow, imm1: uint32(memIdx)))
 
     # Constants
@@ -586,17 +613,17 @@ proc readExpr*(r: var BinaryReader): Expr =
         instrs.add(Instr(op: op))
       of 8: # memory.init dataIdx memIdx
         let dataIdx = r.readU32()
-        let memIdx = r.readByte()
+        let memIdx = r.readU32()
         instrs.add(Instr(op: opMemoryInit, imm1: dataIdx, imm2: uint32(memIdx)))
       of 9: # data.drop dataIdx
         let dataIdx = r.readU32()
         instrs.add(Instr(op: opDataDrop, imm1: dataIdx))
       of 10: # memory.copy dstMem srcMem
-        let dstMem = r.readByte()
-        let srcMem = r.readByte()
+        let dstMem = r.readU32()
+        let srcMem = r.readU32()
         instrs.add(Instr(op: opMemoryCopy, imm1: uint32(dstMem), imm2: uint32(srcMem)))
       of 11: # memory.fill memIdx
-        let memIdx = r.readByte()
+        let memIdx = r.readU32()
         instrs.add(Instr(op: opMemoryFill, imm1: uint32(memIdx)))
       of 12: # table.init elemIdx tableIdx
         let elemIdx = r.readU32()
@@ -737,12 +764,14 @@ proc readExpr*(r: var BinaryReader): Expr =
       of 242: instrs.add(Instr(op: opF64x2Mul))
       of 243: instrs.add(Instr(op: opF64x2Div))
       else:
-        discard  # unimplemented SIMD sub-opcode — skip (JIT will trap)
+        # Erasing an instruction changes the module being validated. Retain
+        # only implemented operations; unknown/unsupported ones must fail.
+        decodeError("unsupported 0xFD sub-opcode: " & $subOp)
 
     else:
       decodeError("unknown opcode: 0x" & b.toHex(2))
 
-  result = Expr(code: instrs, brTables: brTables, v128Consts: v128Consts, catchTables: catchTables)
+  result = Expr(code: instrs, wideBlockTypes: wide, brTables: brTables, v128Consts: v128Consts, catchTables: catchTables)
 
 # ---- Block offset resolution ----
 
@@ -856,6 +885,7 @@ proc peepholeOptimize*(expr: var Expr) =
 
   let code = expr.code
   var opt = newSeqOfCap[Instr](code.len)
+  var remapped: seq[WideBlockType]
   var i = 0
   while i < code.len:
     # ---- Quad fusions (check first — consume 4 instructions) ----
@@ -908,7 +938,8 @@ proc peepholeOptimize*(expr: var Expr) =
         opt.add(Instr(op: opLocalGetI32ConstI32Add, imm1: a.imm1, imm2: b.imm1))
         i += 3; continue
       # local.get X; i32.load off; i32.add → push(TOS + mem[local[X]+off])
-      if a.op == opLocalGet and b.op == opI32Load and c.op == opI32Add:
+      # Fused memory IR omits alignment; keep invalid memargs visible to validation.
+      if a.op == opLocalGet and b.op == opI32Load and c.op == opI32Add and b.imm2 <= 2'u32:
         opt.add(Instr(op: opLocalGetI32LoadI32Add, imm1: a.imm1, imm2: b.imm1))
         i += 3; continue
       # i32.const C; i32.eq; br_if L → branch if TOS == C (imm1=C, imm2=L)
@@ -988,7 +1019,7 @@ proc peepholeOptimize*(expr: var Expr) =
         opt.add(Instr(op: opI32ConstI32GeS, imm1: a.imm1))
         i += 2; continue
       # local.get X; i32.load offset → fused
-      if a.op == opLocalGet and b.op == opI32Load:
+      if a.op == opLocalGet and b.op == opI32Load and b.imm2 <= 2'u32:
         opt.add(Instr(op: opLocalGetI32Load, imm1: a.imm1, imm2: b.imm1))
         i += 2; continue
       # i32.const C; i32.eq → fused
@@ -1039,7 +1070,7 @@ proc peepholeOptimize*(expr: var Expr) =
         opt.add(Instr(op: opLocalTeeLocalGet, imm1: a.imm1, imm2: b.imm1))
         i += 2; continue
       # local.get X; i32.store offset → fused (store local to memory)
-      if a.op == opLocalGet and b.op == opI32Store:
+      if a.op == opLocalGet and b.op == opI32Store and b.imm2 <= 2'u32:
         opt.add(Instr(op: opLocalGetI32Store, imm1: a.imm1, imm2: b.imm1))
         i += 2; continue
       # ---- i64 local.get + arithmetic ----
@@ -1049,6 +1080,8 @@ proc peepholeOptimize*(expr: var Expr) =
       if a.op == opLocalGet and b.op == opI64Sub:
         opt.add(Instr(op: opLocalGetI64Sub, imm1: a.imm1))
         i += 2; continue
+    if code[i].pad == WideBlockPad and code[i].op in {opBlock, opLoop, opIf, opTryTable}:
+      remapped.add WideBlockType(pc: uint32(opt.len), typeIndex: expr.wideBlockIndex(i))
     opt.add(code[i])
     inc i
 
@@ -1058,34 +1091,40 @@ proc peepholeOptimize*(expr: var Expr) =
       opt[j].imm1 = 0
       opt[j].imm2 = 0
   expr.code = opt
+  expr.wideBlockTypes = remapped
   resolveBlockOffsets(expr.code)
 
 # ---- Code body decoder (instructions + block resolution) ----
 
-proc readCodeBody(r: var BinaryReader): Expr =
+proc readCodeBody(r: var BinaryReader, optimize: bool = true): Expr =
   result = r.readExpr()
   resolveBlockOffsets(result.code)
-  peepholeOptimize(result)
+  if optimize: peepholeOptimize(result)
 
-proc decodeExprBytes*(data: openArray[byte]): Expr =
+proc decodeExprBytes*(data: openArray[byte], optimize: bool = true): Expr =
   ## Decode one expression/code byte range. This is used by flash-backed
   ## modules to lazily materialize a function or init expression into scratch
   ## RAM without owning the complete .wasm image.
   var r = initBinaryReader(data)
-  result = r.readCodeBody()
+  result = r.readCodeBody(optimize)
   if not r.atEnd:
     decodeError("expression byte range has trailing data")
 
 # ---- Section decoders ----
 
 proc readTypeSection(r: var BinaryReader, m: var WasmModule) =
-  let count = r.readU32()
+  let count = r.readCount()
   m.types = newSeqOfCap[FuncType](count.int)
   for i in 0 ..< count.int:
     m.types.add(r.readFuncType())
 
+proc readTagType*(r: var BinaryReader): uint32 =
+  if r.readByte() != 0:
+    decodeError("invalid exception tag attribute")
+  r.readU32()
+
 proc readImportSection(r: var BinaryReader, m: var WasmModule) =
-  let count = r.readU32()
+  let count = r.readCount()
   m.imports = newSeqOfCap[Import](count.int)
   for i in 0 ..< count.int:
     let moduleName = r.readName()
@@ -1108,29 +1147,32 @@ proc readImportSection(r: var BinaryReader, m: var WasmModule) =
       let gt = r.readGlobalType()
       m.imports.add(Import(module: moduleName, name: name,
                            kind: ikGlobal, globalType: gt))
+    of 0x04:
+      m.imports.add(Import(module: moduleName, name: name,
+                           kind: ikTag, tagTypeIdx: r.readTagType()))
     else:
       decodeError("unknown import kind: 0x" & kind.toHex(2))
 
 proc readFunctionSection(r: var BinaryReader, m: var WasmModule) =
-  let count = r.readU32()
+  let count = r.readCount()
   m.funcTypeIdxs = newSeqOfCap[uint32](count.int)
   for i in 0 ..< count.int:
     m.funcTypeIdxs.add(r.readU32())
 
 proc readTableSection(r: var BinaryReader, m: var WasmModule) =
-  let count = r.readU32()
+  let count = r.readCount()
   m.tables = newSeqOfCap[TableType](count.int)
   for i in 0 ..< count.int:
     m.tables.add(r.readTableType())
 
 proc readMemorySection(r: var BinaryReader, m: var WasmModule) =
-  let count = r.readU32()
+  let count = r.readCount()
   m.memories = newSeqOfCap[MemType](count.int)
   for i in 0 ..< count.int:
     m.memories.add(r.readMemType())
 
 proc readGlobalSection(r: var BinaryReader, m: var WasmModule) =
-  let count = r.readU32()
+  let count = r.readCount()
   m.globals = newSeqOfCap[GlobalDef](count.int)
   for i in 0 ..< count.int:
     var g: GlobalDef
@@ -1139,7 +1181,7 @@ proc readGlobalSection(r: var BinaryReader, m: var WasmModule) =
     m.globals.add(g)
 
 proc readExportSection(r: var BinaryReader, m: var WasmModule) =
-  let count = r.readU32()
+  let count = r.readCount()
   m.exports = newSeqOfCap[Export](count.int)
   for i in 0 ..< count.int:
     var e: Export
@@ -1150,19 +1192,21 @@ proc readExportSection(r: var BinaryReader, m: var WasmModule) =
     of 0x01: e.kind = ekTable
     of 0x02: e.kind = ekMemory
     of 0x03: e.kind = ekGlobal
+    of 0x04: e.kind = ekTag
     else: decodeError("unknown export kind: 0x" & kind.toHex(2))
     e.idx = r.readU32()
     m.exports.add(e)
 
 proc readStartSection(r: var BinaryReader, m: var WasmModule) =
-  m.startFunc = int32(r.readU32())
+  m.startFunc = int64(r.readU32())
 
 proc readElementSection(r: var BinaryReader, m: var WasmModule) =
-  let count = r.readU32()
+  let count = r.readCount()
   m.elements = newSeqOfCap[ElemSegment](count.int)
   for i in 0 ..< count.int:
     var seg: ElemSegment
     let flags = r.readU32()
+    if flags > 7: decodeError("invalid element segment flags")
     # Element segment encoding uses a 3-bit flags field:
     # bit 0: passive/declarative (1) vs active with implicit table 0 (0)
     # bit 1: has explicit table index (active) or elem kind/type
@@ -1207,7 +1251,7 @@ proc readElementSection(r: var BinaryReader, m: var WasmModule) =
       seg.elemType = vtFuncRef
 
     # Read elements
-    let elemCount = r.readU32()
+    let elemCount = r.readCount()
     seg.init = newSeqOfCap[Expr](elemCount.int)
     if usesExpressions:
       # Each element is an expression
@@ -1223,21 +1267,22 @@ proc readElementSection(r: var BinaryReader, m: var WasmModule) =
 
     m.elements.add(seg)
 
-proc readCodeSection(r: var BinaryReader, m: var WasmModule) =
-  let count = r.readU32()
+proc readCodeSection(r: var BinaryReader, m: var WasmModule, optimize: bool) =
+  let count = r.readCount()
   m.codes = newSeqOfCap[FuncBody](count.int)
   for i in 0 ..< count.int:
     let bodySize = r.readU32()
-    let bodyEnd = r.pos + bodySize.int
+    if uint64(bodySize) > uint64(r.size-r.pos): decodeError("code body exceeds available bytes")
+    let bodyEnd = r.pos + int(bodySize)
     var body: FuncBody
-    let localDeclCount = r.readU32()
+    let localDeclCount = r.readCount()
     body.locals = newSeqOfCap[LocalDecl](localDeclCount.int)
     for j in 0 ..< localDeclCount.int:
       var ld: LocalDecl
       ld.count = r.readU32()
       ld.valType = r.readValType()
       body.locals.add(ld)
-    body.code = r.readCodeBody()
+    body.code = r.readCodeBody(optimize)
     # Ensure we consumed exactly the right number of bytes
     if r.pos != bodyEnd:
       decodeError("code body size mismatch: expected pos " & $bodyEnd &
@@ -1245,7 +1290,7 @@ proc readCodeSection(r: var BinaryReader, m: var WasmModule) =
     m.codes.add(body)
 
 proc readDataSection(r: var BinaryReader, m: var WasmModule) =
-  let count = r.readU32()
+  let count = r.readCount()
   m.datas = newSeqOfCap[DataSegment](count.int)
   for i in 0 ..< count.int:
     var seg: DataSegment
@@ -1268,17 +1313,24 @@ proc readDataSection(r: var BinaryReader, m: var WasmModule) =
     else:
       decodeError("unknown data segment flags: " & $flags)
     let dataLen = r.readU32()
-    seg.data = r.readBytes(dataLen.int)
+    if uint64(dataLen) > uint64(r.size-r.pos): decodeError("data segment exceeds available bytes")
+    seg.data = r.readBytes(int(dataLen))
     m.datas.add(seg)
 
 proc readDataCountSection(r: var BinaryReader, m: var WasmModule) =
-  m.dataCount = int32(r.readU32())
+  m.dataCount = int64(r.readU32())
 
-proc readCustomSection(r: var BinaryReader, m: var WasmModule, sectionSize: int) =
+proc readCustomSection(r: var BinaryReader, m: var WasmModule, sectionSize: int,
+                       retain: bool) =
   let startPos = r.pos
   let name = r.readName()
   let consumedByName = r.pos - startPos
   let dataLen = sectionSize - consumedByName
+  if dataLen < 0:
+    decodeError("custom section name exceeds section bounds")
+  if not retain:
+    r.pos += dataLen
+    return
   var data: seq[byte]
   if dataLen > 0:
     data = r.readBytes(dataLen)
@@ -1286,21 +1338,21 @@ proc readCustomSection(r: var BinaryReader, m: var WasmModule, sectionSize: int)
 
 # Note: tag section (id=13) for exception handling proposal
 proc readTagSection(r: var BinaryReader, m: var WasmModule) =
-  let count = r.readU32()
+  let count = r.readCount()
   for i in 0 ..< count.int:
-    discard r.readByte()  # attribute (always 0x00 = exception)
-    let typeIdx = r.readU32()
-    m.tagDefs.add(WasmTagDef(typeIdx: typeIdx))
+    m.tagDefs.add(WasmTagDef(typeIdx: r.readTagType()))
 
 # ---- Top-level decoder ----
 
-proc decodeModule*(data: openArray[byte]): WasmModule =
+proc decodeModule*(data: openArray[byte], optimize: bool = true,
+                   retainCustomSections: bool = true): WasmModule =
   ## Decode a WebAssembly binary module from raw bytes.
   ## Raises WasmDecodeError for malformed input.
+  ## Proof frontends use optimize=false to retain original opcode boundaries.
   if data.len < 8:
     decodeError("data too short for wasm module header")
 
-  var r = initBinaryReader(data)
+  var r = viewBinaryReader(data)
 
   # Validate magic: \0asm
   let magic = r.readBytes(4)
@@ -1317,22 +1369,24 @@ proc decodeModule*(data: openArray[byte]): WasmModule =
   result.startFunc = -1
   result.dataCount = -1
 
-  var lastSectionId: int = -1
+  var lastSectionOrder = 0
 
   while not r.atEnd():
     let sectionId = r.readByte().int
-    let sectionSize = r.readU32().int
+    let encodedSize = r.readU32()
+    if uint64(encodedSize) > uint64(r.size-r.pos): decodeError("section exceeds module bounds")
+    let sectionSize = int(encodedSize)
     let sectionEnd = r.pos + sectionSize
 
     # Validate section ordering (custom sections can appear anywhere)
+    let order = binarySectionOrder(sectionId)
+    if order < 0: decodeError("unknown section ID: " & $sectionId)
     if sectionId != 0:
-      if sectionId <= lastSectionId:
-        decodeError("sections out of order: " & $sectionId &
-                    " after " & $lastSectionId)
-      lastSectionId = sectionId
+      if order <= lastSectionOrder: decodeError("section out of order: " & $sectionId)
+      lastSectionOrder = order
 
     case sectionId
-    of 0: readCustomSection(r, result, sectionSize)
+    of 0: readCustomSection(r, result, sectionSize, retainCustomSections)
     of 1: readTypeSection(r, result)
     of 2: readImportSection(r, result)
     of 3: readFunctionSection(r, result)
@@ -1342,13 +1396,11 @@ proc decodeModule*(data: openArray[byte]): WasmModule =
     of 7: readExportSection(r, result)
     of 8: readStartSection(r, result)
     of 9: readElementSection(r, result)
-    of 10: readCodeSection(r, result)
+    of 10: readCodeSection(r, result, optimize)
     of 11: readDataSection(r, result)
     of 12: readDataCountSection(r, result)
     of 13: readTagSection(r, result)
-    else:
-      # Unknown section — skip
-      r.pos = sectionEnd
+    else: decodeError("unknown section ID: " & $sectionId)
 
     # Ensure section was fully consumed
     if r.pos != sectionEnd:

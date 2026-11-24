@@ -15,6 +15,15 @@ proc blRxRssiStatusInd(blHw, cmd, msg: pointer): cint {.cdecl.} =
   0
 
 proc blRxScanuStartCfm(blHw, cmd, msg: pointer): cint {.cdecl.} =
+  let status = if msg != nil and loadU32(msg, IpcMsgParamLenOff) != 0:
+      loadU8(msgParam(msg), 0).uint32
+    else:
+      high(uint32)
+  # Publish before the legacy callback can complete the async scan.
+  bl808_wifi_backend_record_scan_confirmation(status)
+  when defined(bl808WifiDiagWarmScan):
+    firmware.nimFwDbgWarmScanHostStatus = status
+    inc firmware.nimFwDbgWarmScan.host_replies
   notifyEventScanDone(false)
   0
 

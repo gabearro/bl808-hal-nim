@@ -2,11 +2,14 @@ proc vendorPollOnce() =
   if fwStarted:
     bl808WifiBackendPollEmbEvents()
     bl808WifiBackendPollMacIrq()
-    bl808WifiBackendDriveRfStatus()
     wifi_main_poll_once()
     vendorDrainScheduledWork()
+    discard mgmrPmProcessOne()
   elif hostPollEnabled and loadPtr(wifiHwRaw(), 48) != nil:
     bl_main_event_handle(0, nil)
+  osTimerPoll()
+  aosPollEvents()
+  aosPollDelayedActions()
 
 proc vendorPollFor(iterations: uint32) =
   var pollsRemaining = iterations

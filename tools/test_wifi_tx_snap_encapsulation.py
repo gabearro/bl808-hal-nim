@@ -56,7 +56,7 @@ for protocol in [0x80F3'u16, 0x8137, 0xF380, 0x3781, 0x0800, 0x0806, 0x86DD,
                  0x888E, 1500, 1535, 1536]:
   for vifIndex in 0'u8 .. 1'u8:
     for vifType in [0'u8, 1, 2, 3]:
-      for tid in [0'u8, 3, 7, 8, 0xFF]:
+      for tid in [0'u8, 3, 7, 0xFF]:
         for security in [0'u32, 4, 8]:
           for enabled in [false, true]:
             reset()

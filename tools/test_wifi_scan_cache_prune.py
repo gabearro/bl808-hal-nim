@@ -25,6 +25,7 @@ type
     ssid, channel: uint32
   Env = object
     entries: array[SCANU_MAX_RESULT_ENTRIES, ScanuResultEntry]
+    pendingJoinRxuMgtInd: pointer
     filterSsidLen: uint8
     filterSsid: array[32, uint8]
   Frame = object
@@ -38,10 +39,14 @@ type
   Ssid = object
     length: uint8
     ssidBytes: array[32, uint8]
+  ScanuCachedSsid = object
+    valid, length: uint8
+    ssidBytes: array[32, uint8]
   Log = proc(level, severity: uint32; file: pointer;
              line: uint32) {.cdecl, varargs.}
 var
   scanu_env, replacement: Env
+  scanuCachedSsids: array[SCANU_MAX_RESULT_ENTRIES, ScanuCachedSsid]
   oldFrames, newFrames: array[SCANU_MAX_RESULT_ENTRIES, Frame]
   freed: array[SCANU_MAX_RESULT_ENTRIES, int]
   filter: Ssid
@@ -110,11 +115,14 @@ proc ssidIeAt(p: pointer): ptr SsidIe = cast[ptr SsidIe](p)
 """
 
 CHECKS = r"""
+var replayToken: uint8
+
 proc setup(irq: bool) =
   hook = nil
   incoming = irq
   interruptsEnabled = irq
   scanu_env = default(Env)
+  scanuCachedSsids = default(typeof(scanuCachedSsids))
   oldFrames = default(typeof(oldFrames))
   newFrames = default(typeof(newFrames))
   freed = default(typeof(freed))
@@ -123,6 +131,7 @@ proc setup(irq: bool) =
   filter.ssidBytes[0] = 120
   scanu_env.filterSsidLen = 1
   scanu_env.filterSsid[0] = 120
+  scanu_env.pendingJoinRxuMgtInd = addr replayToken
   for i in 0 ..< oldFrames.len:
     oldFrames[i].frameLen = 39
     oldFrames[i].ies[0] = 0
@@ -131,6 +140,8 @@ proc setup(irq: bool) =
     scanu_env.entries[i] = ScanuResultEntry(valid: 1, rssi: (-60 + i).int8,
       cachedRxuMgtInd: addr oldFrames[i], ssid: i.uint32 + 1, channel: 2412)
     scanu_env.entries[i].bssid = [2'u8, 0, 0, 0, 0, i.uint8]
+    scanuCachedSsids[i] = ScanuCachedSsid(valid: 1, length: 1)
+    scanuCachedSsids[i].ssidBytes[0] = 120
 
 proc run(route: string) =
   case route
@@ -155,6 +166,7 @@ proc installReplacement(point: string) =
       # The allocator may hand the just-freed address to the new cache.
       scanu_env.entries[i].cachedRxuMgtInd = addr oldFrames[i]
   scanu_env.filterSsidLen = 31
+  scanu_env.pendingJoinRxuMgtInd = addr newFrames[3]
   filter.length = 255
   replacement = scanu_env
 
@@ -180,8 +192,10 @@ for route in ["all", "bssid", "ssid", "remove"]:
             else: doAssert entry == original.entries[i]
             if route != "remove":
               var expected = original.entries[i]
-              expected.cachedRxuMgtInd = entry.cachedRxuMgtInd
+              if isRemoved(route, i): expected.cachedRxuMgtInd = nil
               doAssert entry == expected, "pruning changed structured results"
+          doAssert scanu_env.pendingJoinRxuMgtInd == addr replayToken,
+            "pruning retired the in-flight replay completion"
           if route == "remove":
             doAssert scanu_env.entries[3] == default(ScanuResultEntry)
           if recursive: run(route)
@@ -247,6 +261,19 @@ for irq in [false, true]:
   filter.ssidBytes[0] = 121
   run("ssid")
   for count in freed: doAssert count == 1
+
+  # A hidden SSID can retain a learned identity for the same BSSID.
+  for excluded in [false, true]:
+    setup(irq)
+    for frame in oldFrames.mitems:
+      frame.frameLen = 38
+      frame.ies[1] = 0
+    if excluded: scanuCachedSsids[5].ssidBytes[0] = 121
+    run("ssid")
+    let kept = if excluded: 4 else: 5
+    for i, entry in scanu_env.entries:
+      doAssert freed[i] == (i != kept).int
+      doAssert (entry.cachedRxuMgtInd != nil) == (i == kept)
 
   # First-entry tie breaking, 32-byte SSIDs, and malformed/truncated IEs.
   for length in [1, 32]:
@@ -320,8 +347,9 @@ proc scanu_prune_scanresult_raw_frames() =
     count = int(re.search(r"(?m)^const SCANU_MAX_RESULT_ENTRIES\* = (\d+)$", layout).group(1))
     platform = PLATFORM.replace("SCANU_MAX_RESULT_ENTRIES = 6", f"SCANU_MAX_RESULT_ENTRIES = {count}")
     mac = procedure((FW / "mac_config_debug.nim").read_text(), "mac_ie_find")
+    cache = procedure(scan, "scanuCachedSsidFor") + procedure(scan, "scanuCachedSsidMatches")
     program = tmp_path / "prune.nim"
-    program.write_text(platform + mac + "\n".join(bodies.values()) + CHECKS)
+    program.write_text(platform + mac + cache + "\n".join(bodies.values()) + CHECKS)
     flags = {"checked": [], "release": ["-d:release", "--assertions:on"],
              "asan": ["--cc:clang", "--passC:-fsanitize=address", "--passL:-fsanitize=address"]}
     result = subprocess.run([nim, "c", "-r", "--skipParentCfg:on", "--skipProjCfg:on", "--skipUserCfg:on",

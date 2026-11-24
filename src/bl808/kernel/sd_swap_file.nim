@@ -51,6 +51,13 @@ proc slotOffset(slot: uint32): uint64 {.inline.} =
 proc requiredSize(swap: SdSwapFile): uint64 {.inline.} =
   SdSwapHeaderBytes.uint64 + swap.slots.uint64 * SdSwapPageBytes.uint64
 
+proc checkSwapRange(swap: SdSwapFile, offset: uint64, count: int): SdSwapStatus =
+  if not swap.open: return sdSwapOpenFailed
+  let capacity = swap.slots.uint64 * SdSwapPageBytes.uint64
+  if count < 0 or offset > capacity or count.uint64 > capacity - offset:
+    return sdSwapBadSlot
+  sdSwapOk
+
 proc fSize(fp: ptr Fil): uint64 {.importc: "f_size", header: "ff.h".}
 
 proc writeExact(fs: var SdFs, f: var Fil, data: openArray[uint8]): SdSwapStatus =
@@ -64,6 +71,28 @@ proc readExact(fs: var SdFs, f: var Fil, buf: var openArray[uint8]): SdSwapStatu
   if got < 0: sdSwapReadFailed
   elif got != buf.len: sdSwapShortIo
   else: sdSwapOk
+
+proc sdSwapReadRange*(fs: var SdFs, swap: var SdSwapFile, offset: uint64,
+                      buf: var openArray[uint8]): SdSwapStatus =
+  ## Byte range within the preallocated payload. The file header is private.
+  result = swap.checkSwapRange(offset, buf.len)
+  if result != sdSwapOk or buf.len == 0: return
+  if fs.seek(swap.file, SdSwapHeaderBytes.uint64 + offset) != frOk:
+    return sdSwapSeekFailed
+  result = readExact(fs, swap.file, buf)
+
+proc sdSwapWriteRange*(fs: var SdFs, swap: var SdSwapFile, offset: uint64,
+                       data: openArray[uint8]): SdSwapStatus =
+  ## Callers own the file exclusively until they sync or abandon the transfer.
+  result = swap.checkSwapRange(offset, data.len)
+  if result != sdSwapOk or data.len == 0: return
+  if fs.seek(swap.file, SdSwapHeaderBytes.uint64 + offset) != frOk:
+    return sdSwapSeekFailed
+  result = writeExact(fs, swap.file, data)
+
+proc sdSwapSync*(fs: var SdFs, swap: var SdSwapFile): SdSwapStatus =
+  if not swap.open: return sdSwapOpenFailed
+  if fs.sync(swap.file) == frOk: sdSwapOk else: sdSwapWriteFailed
 
 when defined(bl808kernel):
   proc writeExactPtr(f: ptr Fil, data: pointer, len: int): SdSwapStatus =

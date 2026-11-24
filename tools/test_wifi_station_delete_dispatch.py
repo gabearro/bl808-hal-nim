@@ -6,7 +6,7 @@ import subprocess
 
 import pytest
 
-from test_wifi_ap_teardown import procedure
+from test_wifi_disconnect_tx import procedure
 from test_wifi_message_allocation import TIM_METADATA_STUBS
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,6 +36,7 @@ type
     id: uint16
     destId, srcId: uint8
     paramLen: uint32
+  CoListHdr = KeMsgHdr
   MeStaDelReqPayload = object
     staIdx: uint8
   MmStaDelReqPayload = MeStaDelReqPayload
@@ -65,7 +66,10 @@ var
   allocated: seq[pointer]
   sent: seq[Sent]
   deleted: seq[uint8]
+  retries: seq[uint8]
+  keMsgQueueSaved: seq[pointer]
   failAllocation: bool
+  failDelete: bool
   calls: int
   stations: array[5, tuple[valid: uint8]]
   staDeleteEpochs: array[5, uint32]
@@ -106,7 +110,15 @@ proc ke_msg_send_basic(id: uint16; dest, src: uint8) =
   let p = ke_msg_alloc(id, dest, src, 0)
   if p != nil: ke_msg_send(p)
 proc mmStaDelReqView(p: pointer): ptr MmStaDelReqPayload = cast[ptr MmStaDelReqPayload](p)
-proc mm_sta_del(index: uint8) = deleted.add(index)
+proc mmStaDelTry(index: uint8; saved: uint32): bool =
+  deleted.add(index)
+  not failDelete
+proc mmStaDelRetryPending(index: uint8): bool = false
+proc mmStaDelQueueRetryLocked(index: uint8; saved: uint32) = retries.add(index)
+proc co_list_push_back(queue: ptr seq[pointer]; header: ptr CoListHdr) = queue[].add(header)
+proc irqSave(): uint32 = 0
+proc irqRestore(saved: uint32) = discard
+proc txlResetting(): bool = false
 proc staInfoForIdx(index: uint8): ptr tuple[valid: uint8] = addr stations[index]
 proc smEnvView(): ptr Sm = addr sm
 proc smCleanupAdmitRequest(request: pointer): bool = true
@@ -127,7 +139,10 @@ proc reset() =
   allocated.setLen(0)
   sent.setLen(0)
   deleted.setLen(0)
+  retries.setLen(0)
+  keMsgQueueSaved.setLen(0)
   failAllocation = false
+  failDelete = false
   calls = 0
   onAllocate = nil
   for sta in stations.mitems: sta.valid = 1
@@ -149,23 +164,25 @@ for source in 0'u8 .. 10:
     doAssert sent[0].p == p, "MM must transfer the request allocation to its reply"
     doAssert calls == 1
 
-# ME preserves its source routing while forwarding the original allocation.
+# ME acknowledges acceptance separately and sends a new MM delete request.
 for source in 0'u8 .. 10:
   reset()
   let p = ke_msg_alloc(ME_STA_DEL_REQ, TASK_ME, source, 1)
   cast[ptr MeStaDelReqPayload](p).staIdx = 4
-  me_sta_del_req_handler(p)
+  doAssert me_sta_del_req_handler(p) == KeMsgConsumed
   doAssert sent.len == 2 and deleted.len == 0
-  doAssert sent[0] == Sent(p: p, id: MM_STA_DEL_REQ, dest: TASK_MM, src: TASK_ME, length: 1)
-  doAssert mmStaDelReqView(p).staIdx == 4
+  let mmRequest = sent[0].p
+  doAssert mmRequest != p
+  doAssert sent[0] == Sent(p: mmRequest, id: MM_STA_DEL_REQ, dest: TASK_MM, src: TASK_ME, length: 1)
+  doAssert mmStaDelReqView(mmRequest).staIdx == 4
   doAssert sent[1].id == ME_STA_DEL_CFM and sent[1].dest == source
   doAssert sent[1].src == TASK_ME and sent[1].length == 0
-  doAssert calls == 2
+  doAssert calls == 3
   failAllocation = true
-  mm_sta_del_req_handler(p)
+  mm_sta_del_req_handler(mmRequest)
   doAssert deleted == @[4'u8]
-  doAssert sent[^1] == Sent(p: p, id: MM_STA_DEL_CFM, dest: TASK_ME, src: TASK_MM, length: 0)
-  doAssert calls == 2, "MM completion must not allocate"
+  doAssert sent[^1] == Sent(p: mmRequest, id: MM_STA_DEL_CFM, dest: TASK_ME, src: TASK_MM, length: 0)
+  doAssert calls == 3, "MM completion must not allocate"
 
 let meHandler = cast[proc(p: pointer): cint {.cdecl.}](me_sta_del_req_handler)
 let mmHandler = cast[proc(p: pointer): cint {.cdecl.}](mm_sta_del_req_handler)
@@ -178,9 +195,23 @@ doAssert meHandler(pending) == KeMsgSaved
 doAssert sent.len == 0 and deleted.len == 0 and allocated.len == 1
 doAssert keMsgHdrFromPayload(pending)[] == original
 failAllocation = false
-doAssert meHandler(pending) == KeMsgNoFree
-doAssert mmHandler(pending) == KeMsgNoFree
-doAssert allocated.len == 2 and deleted == @[2'u8]
+doAssert meHandler(pending) == KeMsgConsumed
+doAssert mmHandler(sent[0].p) == KeMsgNoFree
+doAssert allocated.len == 3 and deleted == @[2'u8]
+
+reset()
+let failed = ke_msg_alloc(MM_STA_DEL_REQ, TASK_MM, TASK_API, 1)
+mmStaDelReqView(failed).staIdx = 2
+failDelete = true
+doAssert mmHandler(failed) == KeMsgNoFree
+doAssert sent.len == 0 and retries == @[2'u8]
+doAssert keMsgQueueSaved == @[cast[pointer](keMsgHdrFromPayload(failed))]
+doAssert keMsgHdrFromPayload(failed).paramLen == 1
+failDelete = false
+keMsgQueueSaved.setLen(0)
+doAssert mmHandler(failed) == KeMsgNoFree
+doAssert sent.len == 1 and sent[0].id == MM_STA_DEL_CFM
+doAssert sent[0].p == failed and sent[0].dest == TASK_API
 
 for task in [TASK_MM, TASK_ME]:
   reset()
@@ -198,8 +229,8 @@ onAllocate = replaceStation
 let reused = ke_msg_alloc(ME_STA_DEL_REQ, TASK_ME, TASK_API, 1)
 cast[ptr MeStaDelReqPayload](reused).staIdx = 2
 onAllocate = replaceStation
-doAssert meHandler(reused) == KeMsgNoFree
-doAssert mmStaDelReqView(reused).staIdx == 255
+doAssert meHandler(reused) == KeMsgConsumed
+doAssert mmStaDelReqView(sent[0].p).staIdx == 255
 reset()
 '''
 

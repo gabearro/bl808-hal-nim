@@ -20,12 +20,13 @@ const
   StaTxPolicyUpdateRateControl = 1'u8
 type
   HostTxDescView = object
-    staIdx, staInfoIdx: uint8
+    staIdx, staInfoIdx, vifIdx: uint8
+    frameLen: uint16
     hwDesc: pointer
   Hardware = object
     flags: uint32
   RateEntry = object
-    attempts, successes: uint16
+    attempts, successes, rateConfig: uint16
   RateCapabilities = object
     sampleCount: uint16
   Stats = object
@@ -133,6 +134,22 @@ for aggregate in [false, true]:
     doAssert stats[0].entries[0] == RateEntry(attempts: 4, successes: 0)
     doAssert stats[0].entries[1] == RateEntry(attempts: 3, successes: 2)
 
+# The archive increments 32-bit registers then stores halfwords, so each
+# counter wraps independently at 65536 rather than saturating or trapping.
+setup()
+stats[0].totalSuccess = high(uint16)
+stats[0].totalAttempts = high(uint16)
+stats[0].entries[0] = RateEntry(attempts: high(uint16), successes: high(uint16))
+rc_update_counters(0, 1, 0, false, false)
+doAssert stats[0].totalSuccess == 0 and stats[0].totalAttempts == 0
+doAssert stats[0].entries[0] == RateEntry(attempts: 0, successes: 0)
+doAssert assertionLines.len == 0
+setup()
+stats[0].entries[0].attempts = 65534
+rc_update_counters(0, 4, 4, false, false)
+doAssert stats[0].entries[0] == RateEntry(attempts: 2, successes: 0)
+doAssert assertionLines.len == 0
+
 # Malformed confirmations cannot reach an out-of-table retry index or wrap
 # the attempt count. Unused retry slots do not affect a valid confirmation.
 for badSlot in [0, 1]:
@@ -183,6 +200,29 @@ for retries in 0'u32 .. 255'u32:
       setup()
       rc_update_counters(1, retries + 1, expectedFailures, false, false)
       doAssert stats[1] == afterSingleton
+
+# Control-port attempts used a per-frame retry policy, not these station slots.
+for proto in [0x8E88'u16, 0x888E'u16]:
+  for status in [0x80800400'u32, 0x80010700'u32]:
+    setup()
+    let beforeEapol = stats[1]
+    var hw = Hardware(flags: status)
+    var eapol = HostTxDescView(staInfoIdx: 1, frameLen: proto, hwDesc: addr hw)
+    me_tx_cfm_singleton(addr eapol)
+    doAssert stats[1] == beforeEapol and stationReads.len == 0
+
+# Software cancellation and deferral never reached the radio. Neither the
+# sample estimates nor the trial countdown should advance.
+for status in [0x40000000'u32, 0xC0020000'u32, 0xC0080000'u32, 0xC0100000'u32]:
+  for stage in 0'u8 .. 3'u8:
+    setup()
+    stats[1].updateStage = stage
+    stats[1].retryLimit = 1
+    let before = stats[1]
+    var hw = Hardware(flags: status)
+    var desc = HostTxDescView(staIdx: 3, staInfoIdx: 1, hwDesc: addr hw)
+    me_tx_cfm_singleton(addr desc)
+    doAssert stats[1] == before and stationReads.len == 0 and dumps == 0
 
 for attempts in 0'u32 .. 16'u32:
   for acknowledged in 0'u32 .. attempts:
@@ -238,7 +278,7 @@ def test_rate_confirmation_and_counters(release_mode: bool, tmp_path: Path) -> N
         pytest.skip("nim is not installed")
     rate_source = (FW / "rate_control.nim").read_text()
     me_source = (FW / "scan_station_ap_me.nim").read_text()
-    source = procedure(rate_source, "rc_update_counters")
+    source = procedure(rate_source, "rcAccountCounters") + procedure(rate_source, "rc_update_counters")
     for name in ["me_tx_cfm_singleton", "me_tx_cfm_ampdu", "me_tx_cfm_amsdu"]:
         source += procedure(me_source, name)
     names = sorted(set(re.findall(r"\bnimFwDbg\w+\b", source)))

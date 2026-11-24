@@ -174,7 +174,7 @@ for profile in 0 ..< 3:
         compSetup(profile)
         bl808RfTempInterpolationMode = interpolation
         bl808RfBzTemperatureMeasurementPass = measurement
-        rfPriRefreshTempCompParamFromWlCfg()
+        rfPriRefreshTempCompParamFromWlCfg(wlCfgGlobal)
         var current: array[5, int16]
         var baseline = bl808RfBzAppliedTempComp
         var shared = bl808RfTempPowerComp
@@ -198,6 +198,57 @@ for profile in 0 ..< 3:
         doAssert bl808RfTempPowerComp == (if publish: shared else: 1234'i16)
         doAssert bl808RfBzTempCorrAvg == (if measurement == 0: aggregate(current) else: oldAverage)
         doAssert registerStorage == wanted and mmioWrites.len == (if measurement == 0: 2 else: 0)
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
+def test_bz_zero_and_single_channel_temperature_tables(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, compensation_source() + r'''
+for count in [0'u32, 1'u32]:
+  for temperature in [-17'i32, 35, 55]:
+    for measurement in [0'u8, 1]:
+      compSetup(0)
+      bl808RfTempChannelCount = count
+      bl808RfTempChannels = [2400'u16, 2430, 2460, 2490, 2520]
+      bl808RfTempHighOffsets = [80'i16, 81, 82, 83, 84]
+      bl808RfTempLowOffsets = [100'i16, 101, 102, 103, 104]
+      bl808RfBzTemperatureMeasurementPass = measurement
+      let oldChannels = bl808RfTempChannels
+      let oldHigh = bl808RfTempHighOffsets
+      let oldLow = bl808RfTempLowOffsets
+      let oldBaseline = bl808RfBzAppliedTempComp
+      let oldRegisters = registerStorage
+      let expected =
+        if temperature == 35: 0'i16
+        elif temperature == 55: (if count == 0: 5'i16 else: 8'i16)
+        else: (if count == 0: -10'i16 else: -14'i16)
+      rf_pri_set_bz_temp_comp(temperature)
+      if count == 0:
+        doAssert bl808RfTempChannels == oldChannels
+        doAssert bl808RfTempHighOffsets == oldHigh
+        doAssert bl808RfTempLowOffsets == oldLow
+      else:
+        doAssert bl808RfTempChannels[0] == 2412
+        doAssert bl808RfTempHighOffsets[0] == 50
+        doAssert bl808RfTempLowOffsets[0] == 70
+        doAssert bl808RfTempChannels[1 .. 4] == oldChannels[1 .. 4]
+        doAssert bl808RfTempHighOffsets[1 .. 4] == oldHigh[1 .. 4]
+        doAssert bl808RfTempLowOffsets[1 .. 4] == oldLow[1 .. 4]
+      doAssert bl808RfTempPowerComp == expected
+      for i in 0 ..< 5:
+        doAssert bl808RfBzTempPowerComp[i] ==
+          (if measurement == 0: expected else: 0'i16)
+        doAssert bl808RfBzAppliedTempComp[i] ==
+          (if measurement == 0: oldBaseline[i] else: expected)
+      doAssert mmioWrites.len == (if measurement == 0: 2 else: 0)
+      if measurement == 0:
+        doAssert bl808RfBzTempCorrAvg == expected
+        var deltas: array[5, int16]
+        for i in 0 ..< 5:
+          deltas[i] = expected - oldBaseline[i]
+        for offset in [0x784, 0x7B8]:
+          doAssert registerStorage[offset div 4] ==
+            ((oldRegisters[offset div 4] and 0xC0000000'u32) or pack(deltas))
 ''')
 
 
@@ -231,7 +282,7 @@ for enabled in [0'u8, 1, 255]:
           bl808RfTempInterpolationMode = interpolation
           bl808RfTempMeasurementPass = measurement
           bl808RfChannelPowerIndex = channel
-          rfPriRefreshTempCompParamFromWlCfg()
+          rfPriRefreshTempCompParamFromWlCfg(wlCfgGlobal)
           let valid = channel >= 1 and channel <= 14
           let mhz = if channel == 14: 2484 else: 2412 + (channel.int - 1) * 5
           let want = if not valid: 1234'i16 elif enabled == 0: 0'i16
@@ -278,7 +329,7 @@ for profile in 0 ..< 3:
           halves[0x1C div 2 + i] = cast[uint16](coefficients[i].int16)
           halves[0x26 div 2 + i] = cast[uint16](coefficients[4 - i].int16)
         halves[0x30 div 2] = cast[uint16](room.int16)
-        rfPriRefreshTempCompParamFromWlCfg()
+        rfPriRefreshTempCompParamFromWlCfg(wlCfgGlobal)
         for temperature in [-2147483648'i32, -32769, -3276, -17, 0, 35, 55, 3277, 65535, 2147483647]:
           for channel in [1'u8, 7, 14]:
             bl808RfChannelPowerIndex = channel
@@ -305,4 +356,44 @@ bl808RfTempChannels = [0'u16, 65535, 65535, 65535, 65535]
 doAssert rfPriInterpolatedTempOffset(65534, [-32768'i16, 32767, 0, 0, 0], 1) == -32771
 bl808RfTempChannels = [1'u16, 1, 1, 1, 1]
 doAssert rfPriInterpolatedTempOffset(1, [5'i16, 9, 0, 0, 0], 1) == 4
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
+def test_temperature_config_pointer_is_stable_during_copy(tmp_path: Path, mode: str) -> None:
+    rf = RF.read_text()
+    code = compensation_source()
+    half = rf_procedure(rf, "wlCfgTempHalf")
+    byte = rf_procedure(rf, "wlCfgTempByte")
+    assert code.count(half) == 1 and code.count(byte) == 1
+    code = code.replace(half, r'''
+var tempCfgReads: seq[pointer]
+proc wlCfgTempHalf(cfg: pointer, offset: int): int16 =
+  tempCfgReads.add(cfg)
+  if tempCfgReads.len == 1:
+    wlCfgGlobal = addr nextConfig
+  let bytes = cast[ptr UncheckedArray[uint8]](cfg)
+  cast[int16](uint16(bytes[offset]) or (uint16(bytes[offset + 1]) shl 8))
+''')
+    code = code.replace(byte, r'''
+proc wlCfgTempByte(cfg: pointer, offset: int): uint8 =
+  tempCfgReads.add(cfg)
+  cast[ptr UncheckedArray[uint8]](cfg)[offset]
+''')
+    run_program(tmp_path, mode, code + r'''
+for bz in [false, true]:
+  compSetup(1)
+  nextBytes[0x10] = 0
+  tempCfgReads.setLen(0)
+  if bz:
+    bl808RfBzTemperatureMeasurementPass = 1
+    rf_pri_set_bz_temp_comp(55)
+  else:
+    bl808RfTempMeasurementPass = 1
+    rf_pri_set_temp_comp(55)
+  doAssert tempCfgReads.len == 17
+  for source in tempCfgReads:
+    doAssert source == addr cfgStorage, "temperature table mixed two configurations"
+  doAssert wlCfgGlobal == addr nextConfig
+  doAssert bl808RfTempCalEnabled == 1
 ''')

@@ -9,9 +9,12 @@ proc mac_ie_find*(buf: pointer, bufLen: uint32, ieId: uint8): pointer {.exportc,
   ##   lbu a5, 0(a0) => id; beq a5, a2 => return pos if match
   ##   lbu a5, 1(a0); addi a5, 2; add a0, a5 => advance past IE
   ## Returns pointer to matching IE header, or nil if not found.
+  ## Nim verifies the whole IE first so callers cannot consume truncated data.
   if buf == nil:
     return nil
   var pos = cast[uint](buf)
+  if bufLen.uint > high(uint) - pos:
+    return nil
   var remaining = bufLen.uint
   while remaining >= 2:
     let ie = macIeAt(pos)
@@ -29,22 +32,27 @@ proc mac_vsie_find*(buf: pointer, bufLen: uint32, oui: pointer, ouiLen: uint8): 
   ## From blob: a1 = buf + bufLen (end), a4 = 0xDD, a2 decremented by 1
   ## (oui adjusted for indexed load trick).
   ## Loop .L6: bltu pos, end => check IE; beq pos, end => return nil;
-  ##   pos > end => call assert, return nil.
+  ##   pos > end => print a diagnostic, return nil.
   ## .L11: lbu id; bne id, 0xDD => skip to .L7. Else a6 = pos+2 (IE body),
   ##   compare ouiLen bytes using indexed loads. Match => return pos.
   ## .L7: lbu len, 1(pos); pos += len + 2; loop back.
+  ## Nim checks declared length before comparing the OUI to bound the payload.
   if buf == nil or (oui == nil and ouiLen != 0):
     return nil
   var pos = cast[uint](buf)
+  if bufLen.uint > high(uint) - pos:
+    return nil
   var remaining = bufLen.uint
   let targetOuiBytes = cast[ptr UncheckedArray[uint8]](oui)
   while remaining >= 2:
     let ie = macIeAt(pos)
     let size = ie.totalLen
     if size > remaining:
+      let putsFn = cast[proc(text: cstring) {.cdecl.}](blOpsFunc(8))
+      if putsFn != nil:
+        putsFn("--->>> addr != end\r\n")
       return nil
     if ie.id == 0xDD'u8 and ie.len >= ouiLen:
-      # Vendor-specific IE found, compare OUI bytes
       let vendorIePayload = ie.macIePayload
       var match = true
       for ouiByteIndex in 0'u8 ..< ouiLen:
@@ -55,8 +63,6 @@ proc mac_vsie_find*(buf: pointer, bufLen: uint32, oui: pointer, ouiLen: uint8): 
         return cast[pointer](pos)
     pos += size
     remaining -= size
-  # Blob never calls assert on overrun here (0 asserts in its call graph);
-  # returning nil is the only outcome for "not found / past end".
   return nil
 
 proc mac_irq*() {.exportc, cdecl.} =
@@ -64,16 +70,16 @@ proc mac_irq*() {.exportc, cdecl.} =
   ## Reads MAC platform IRQ status registers. If both zero (spurious), returns.
   ## Otherwise reads handler index from MAC_PL_IRQ_HANDLER, looks up the ISR
   ## in the intc_handler_tab, asserts if NULL, calls it, then tail-calls
-  ## bl_irq_handler.
+  ## ipc_emb_notify.
   let status0 = regRead(MAC_PL_IRQ_STATUS0)
+  var status1 = 0'u32
   if status0 == 0:
-    let status1 = regRead(MAC_PL_IRQ_STATUS1)
+    status1 = regRead(MAC_PL_IRQ_STATUS1)
     if status1 == 0:
       return  # spurious -- both status regs zero
   # Read IRQ handler index
   let irqIdx = regRead(MAC_PL_IRQ_HANDLER)
-  let irqSlot = irqIdx and 0x3F'u32
-  let status1 = regRead(MAC_PL_IRQ_STATUS1)
+  let irqSlot = irqIdx
   inc nimFwDbgMacIrq
   nimFwDbgMacIrqLast = irqSlot or (status0 shl 8) or (status1 shl 16)
   nimFwDbgMacIrqLastHandler = irqIdx
@@ -101,11 +107,14 @@ proc mac_irq*() {.exportc, cdecl.} =
       nimFwConnectTrace2U32("[WIFI-CT] macirq_tx ",
                             irqSlot or (status0 shl 8),
                             status1)
-  let handler = cast[proc() {.cdecl.}](intc_handler_tab[irqIdx and 0x3F])
+  if irqIdx >= intc_handler_tab.len.uint32:
+    assert_err("intc.c", "intc.c", 154)
+    return
+  let handler = cast[proc() {.cdecl.}](intc_handler_tab[irqIdx])
   if handler == nil:
     assert_err("intc.c", "intc.c", 154)
-  else:
-    handler()
+    return
+  handler()
   ipc_emb_notify(0)  # blob: ipc_emb_notify (not bl_irq_handler)
 
 proc mac_paid_gid_sta_compute*(bssid: pointer): uint32 {.exportc, cdecl.} =
@@ -148,7 +157,7 @@ proc bl60x_edca_get*(ac: cint, aifs: ptr uint8, cwmin: ptr uint8, cwmax: ptr uin
   ## Get EDCA parameters for an access category (43 instrs in blob).
   ## Reads HW EDCA register for the given AC from MACHW_BASE + 0x200..0x20C.
   ## Register format: bits[3:0]=AIFS, bits[7:4]=CW_MIN, bits[11:8]=CW_MAX,
-  ## bits[31:12]=TXOP.
+  ## bits[27:12]=the 16-bit TXOP output.
   var regAddr: uint
   case ac
   of 0: regAddr = MACHW_EDCA_AC_BK_REG  # AC_BK
@@ -157,10 +166,10 @@ proc bl60x_edca_get*(ac: cint, aifs: ptr uint8, cwmin: ptr uint8, cwmax: ptr uin
   of 3: regAddr = MACHW_EDCA_AC_VO_REG  # AC_VO
   else: return -1
   let edcaParamWord = regRead(regAddr)
-  aifs[] = (edcaParamWord and 0xF).uint8             # bits [3:0]
-  cwmin[] = ((edcaParamWord shr 4) and 0xF).uint8    # bits [7:4]
+  txop[] = (edcaParamWord shr 12).uint16             # bits [27:12]
   cwmax[] = ((edcaParamWord shr 8) and 0xF).uint8    # bits [11:8]
-  txop[] = (edcaParamWord shr 12).uint16             # bits [31:12]
+  cwmin[] = ((edcaParamWord shr 4) and 0xF).uint8    # bits [7:4]
+  aifs[] = (edcaParamWord and 0xF).uint8             # bits [3:0]
   return 0
 
 proc bl60x_firmwre_mpdu_free*(param: pointer) {.exportc, cdecl.} =
@@ -214,6 +223,11 @@ proc notifier_chain_insert_ordered(headPtr: ptr pointer, notifier: ptr CoListHdr
   ##   offset 8: priority (int32, higher = inserted earlier)
   ## From blob: walks list via offset 4, compares int32 at offset 8.
   ## Inserts before the first node whose priority < new node's priority.
+  var existing = cast[ptr CoListHdr](headPtr[])
+  while existing != nil:
+    if existing == notifier:
+      return
+    existing = cast[ptr CoListHdr](notifierNodeView(existing).next)
   let newNode = notifierNodeView(notifier)
   let newPrio = newNode.priority
   var linkSlot = headPtr
@@ -247,11 +261,29 @@ proc notifier_chain_remove(headPtr: ptr pointer, notifier: ptr CoListHdr) =
     linkSlot = addr notifierNodeView(currentNotifier).next
     currentNotifier = cast[ptr CoListHdr](linkSlot[])
 
+type NotifierCriticalState = object
+  saved: uint32
+  leaveFn: proc(level: uint32) {.cdecl.}
+
+proc notifierEnterCritical(): NotifierCriticalState =
+  let enterFn = cast[proc(): uint32 {.cdecl.}](blOpsFunc(20))
+  let leaveFn = cast[proc(level: uint32) {.cdecl.}](blOpsFunc(24))
+  if enterFn != nil and leaveFn != nil:
+    result.saved = enterFn()
+    result.leaveFn = leaveFn
+  else:
+    result.saved = irqSave()
+
+proc notifierLeaveCritical(state: NotifierCriticalState) =
+  if state.leaveFn != nil:
+    state.leaveFn(state.saved)
+  else:
+    irqRestore(state.saved)
+
 proc notifier_chain_regsiter*(chain: ptr CoList, notifier: ptr CoListHdr): cint {.exportc, cdecl, discardable.} =
-  ## Register notifier with irqSave (64 bytes in blob, 30 instrs).
-  ## From blob: irqSave, inline priority-ordered insert, irqRestore, return 0.
-  let saved = irqSave()
-  defer: irqRestore(saved)
+  ## Register through the platform critical-section callbacks.
+  let critical = notifierEnterCritical()
+  defer: notifierLeaveCritical(critical)
   notifier_chain_insert_ordered(cast[ptr pointer](addr chain.first), notifier)
   0
 
@@ -262,10 +294,9 @@ proc notifier_chain_regsiter_fromCritical*(chain: ptr CoList, notifier: ptr CoLi
   0
 
 proc notifier_chain_unregsiter*(chain: ptr CoList, notifier: ptr CoListHdr): cint {.exportc, cdecl, discardable.} =
-  ## Unregister notifier with irqSave (62 bytes in blob, 29 instrs).
-  ## From blob: irqSave, inline walk singly-linked list, unlink, irqRestore, return 0.
-  let saved = irqSave()
-  defer: irqRestore(saved)
+  ## Unregister under the platform critical section, including a found node.
+  let critical = notifierEnterCritical()
+  defer: notifierLeaveCritical(critical)
   notifier_chain_remove(cast[ptr pointer](addr chain.first), notifier)
   0
 
@@ -277,13 +308,13 @@ proc notifier_chain_unregsiter_fromCritical*(chain: ptr CoList, notifier: ptr Co
 
 proc notifier_chain_call*(chain: ptr CoList, event: uint32, data: pointer): cint {.exportc, cdecl, discardable.} =
   ## Call all notifiers in the chain.
-  ## From blob (36 instrs): irqSave, s0 = chain.first, for each node:
+  ## From blob (36 instrs): platform critical enter, then for each node:
   ##   lw a5, 0(s0) => callback at offset 0
   ##   jalr a5(s0, s3=event, s4=data) => callback(node, event, data)
   ##   s0 = s0[4] => observe the next link after the callback
-  ## irqRestore, return 0.
-  let saved = irqSave()
-  defer: irqRestore(saved)
+  ## platform critical leave, return 0.
+  let critical = notifierEnterCritical()
+  defer: notifierLeaveCritical(critical)
   var currentNotifier = chain.first
   while currentNotifier != nil:
     let notifierNode = notifierNodeView(currentNotifier)
@@ -442,7 +473,7 @@ proc assert_rec*(cond: cstring, file: cstring, line: cint) {.exportc, cdecl.} =
     cast[proc(format: cstring) {.cdecl, varargs.}](printFn)("Recovery MAC...\r\n")
   # Check if reset already pending; if not, trigger reset
   let saved = irqSave()
-  if (cast[int32](keEvtField) >= 0):  # bit 31 not set
+  if (cast[int32](keEnvEventField()[]) >= 0):  # bit 31 not set
     # Blob calls hal_machw_disable_int (no arg) before raising the event
     hal_machw_disable_int()
     ke_evt_set(0x80000000'u32)

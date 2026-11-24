@@ -25,11 +25,14 @@ const
   ScanuIdleState = 0'u8
   ScanuScanningState = 1'u8
   KeMsgConsumed = 0.cint
+  KeMsgNoFree = 1.cint
   KeMsgSaved = 2.cint
   SCANU_MAX_RESULT_ENTRIES = 6
 type
   Header = object
     id: uint16
+    destId, srcId: uint8
+    paramLen: uint32
   Request = object
     flags: uint32
   StatusCfmPayload = object
@@ -39,6 +42,8 @@ type
     valid: uint8
     rssi: int8
     ssid, channel: uint32
+  CacheSidecar = object
+    generation: uint32
   Env = object
     paramPtr, pendingJoinRxuMgtInd: pointer
     bssidFilterEnabled, requester, scanBand: uint8
@@ -51,6 +56,8 @@ type
 var
   scanu_env, replacementEnv: Env
   request, replacementRequest: Request
+  requestHeader: Header
+  replayToken: Header
   responses: array[8, Response]
   oldFrames, newFrames: array[SCANU_MAX_RESULT_ENTRIES, uint32]
   freedFrames: array[SCANU_MAX_RESULT_ENTRIES, int]
@@ -58,15 +65,19 @@ var
   state: uint8
   interruptsEnabled = true
   incoming: bool
-  requestFrees, allocations, sends, advances, basicSends: int
+  requestFrees, requestTransfers, allocations, sends, advances, replaySends, replayFrees: int
   failMask: int
   hook: proc(point: string)
   isCachedJoin: bool
   cachedEntry: CacheEntry
+  cachedSidecar: CacheSidecar
   scanuRequestEpoch: uint32
 
 proc smScanAdmitRequest(p: pointer): bool = true
 proc smScanOwnsRequest(p: pointer): bool = false
+proc scanuCachedSsidFor(entry: ptr CacheEntry): ptr CacheSidecar =
+  doAssert entry == addr cachedEntry
+  addr cachedSidecar
 proc fire(point: string) =
   if hook != nil: hook(point)
 proc irqSave(): uint32 =
@@ -80,29 +91,39 @@ proc ke_state_set(task, value: uint8) =
   if not isCachedJoin: doAssert not interruptsEnabled
   state = value
 proc statusCfmView(p: pointer): ptr StatusCfmPayload = cast[ptr StatusCfmPayload](p)
-proc keMsgHdrFromPayload(p: pointer): ptr Header = cast[ptr Header](p)
-proc ke_msg_alloc(id: uint16; dest, src: uint8; length: uint32): pointer =
+proc keMsgHdrFromPayload(p: pointer): ptr Header =
+  if p == addr request: addr requestHeader else: cast[ptr Header](p)
+proc ke_msg_try_alloc(id: uint16; dest, src: uint8; length: uint32): pointer =
   doAssert interruptsEnabled == incoming
-  doAssert src == TASK_SCANU and length == 1
+  doAssert src == TASK_SCANU
   inc allocations
   let index = allocations - 1
   doAssert index < responses.len
   if (failMask and (1 shl index)) == 0:
-    responses[index] = Response(id: id, dest: dest, owned: true)
-    result = addr responses[index].payload
+    if id == SCAN_DONE_IND:
+      doAssert isCachedJoin and dest == TASK_SCANU and length == 0
+      result = addr replayToken
+    else:
+      doAssert length == 1
+      responses[index] = Response(id: id, dest: dest, owned: true)
+      result = addr responses[index].payload
   fire("alloc" & $allocations)
 proc ke_msg_free(p: pointer) =
   doAssert interruptsEnabled == incoming
-  doAssert p == addr request
+  doAssert p == addr requestHeader
   inc requestFrees
   doAssert requestFrees == 1, "old request released twice"
   request.flags = 0xDDDDDDDD'u32
   fire("request_free")
 proc smScanCompletionAlloc(request: pointer; id: uint16; destination: uint8): pointer =
-  ke_msg_alloc(id, destination, TASK_SCANU, StatusCfmPayloadSize)
+  ke_msg_try_alloc(id, destination, TASK_SCANU, StatusCfmPayloadSize)
 proc ke_msg_free_payload(p: pointer) =
   if p == nil: return
   doAssert interruptsEnabled == incoming
+  if p == addr replayToken:
+    inc replayFrees
+    doAssert replayFrees == 1 and replaySends == 0
+    return
   var found = false
   for i in 0 ..< oldFrames.len:
     if p == addr oldFrames[i]:
@@ -115,10 +136,22 @@ proc ke_msg_free_payload(p: pointer) =
 proc ke_msg_send(p: pointer) =
   doAssert interruptsEnabled == incoming
   if isCachedJoin:
+    if p == addr replayToken:
+      doAssert scanu_env.pendingJoinRxuMgtInd == p and replayFrees == 0
+      inc replaySends
+      return
     doAssert p == addr oldFrames[0]
     doAssert cachedEntry.cachedRxuMgtInd == nil and request.flags == 0,
       "cached-frame handoff preceded owner detachment"
     fire("cached_send")
+    return
+  if p == addr request:
+    doAssert requestFrees == 0 and requestTransfers == 0
+    doAssert requestHeader.paramLen == StatusCfmPayloadSize and requestHeader.srcId == TASK_SCANU
+    inc requestTransfers
+    sent.add((requestHeader.id, requestHeader.destId, statusCfmView(p).status))
+    inc sends
+    fire("send" & $sends)
     return
   for response in responses.mitems:
     if p == addr response.payload:
@@ -131,9 +164,6 @@ proc ke_msg_send(p: pointer) =
       response.payload.status = 0xE7
       return
   doAssert false
-proc ke_msg_send_basic(id: uint16; dest, source: uint8) =
-  doAssert id == SCAN_DONE_IND and dest == TASK_SCANU and source == TASK_SCANU
-  inc basicSends
 proc scanuClearCachedSsid(entry: ptr CacheEntry) =
   doAssert not interruptsEnabled
   entry.ssid = 0
@@ -151,22 +181,27 @@ proc setup(irq: bool; route: string) =
   scanu_env = default(Env)
   scanuRequestEpoch = 1
   request = Request(flags: 0x12345678)
+  requestHeader = Header(paramLen: 324)
   replacementRequest = Request(flags: 0x87654321'u32)
   responses = default(typeof(responses))
   sent.setLen(0)
   freedFrames = default(typeof(freedFrames))
   requestFrees = 0
+  requestTransfers = 0
   allocations = 0
   sends = 0
   advances = 0
-  basicSends = 0
+  replaySends = 0
+  replayFrees = 0
+  replayToken = Header(id: SCAN_DONE_IND, srcId: TASK_SCANU)
   failMask = 0
   isCachedJoin = false
   state = 7
   scanu_env.paramPtr = addr request
   scanu_env.requester = 5
   scanu_env.bssidFilterEnabled = (route in ["join", "done"]).uint8
-  scanu_env.pendingJoinRxuMgtInd = addr oldFrames[0]
+  if route in ["done", "clear"]:
+    scanu_env.pendingJoinRxuMgtInd = addr replayToken
   if route in ["done", "clear"]:
     for i in 0 ..< scanu_env.entries.len:
       scanu_env.entries[i] = CacheEntry(cachedRxuMgtInd: addr oldFrames[i],
@@ -204,7 +239,10 @@ for route in ["plain", "join", "done", "clear"]:
           doAssert interruptsEnabled == incoming
           if route != "clear":
             doAssert scanu_env.paramPtr == nil and scanu_env.pendingJoinRxuMgtInd == nil
-            doAssert state == ScanuIdleState
+            doAssert state == 7
+          else:
+            doAssert scanu_env.pendingJoinRxuMgtInd == addr replayToken,
+              "cache clearing changed independent replay ownership"
           if route in ["done", "clear"]:
             for entry in scanu_env.entries:
               doAssert entry.cachedRxuMgtInd == nil and entry.valid == 0
@@ -212,13 +250,15 @@ for route in ["plain", "join", "done", "clear"]:
           if recursive and route != "clear":
             # The detached request cannot be confirmed recursively a second time.
             scanu_confirm(99)
+            discard scan_done_ind_handler(nil)
+            doAssert state == 7 and advances == 0
           installReplacement(trigger == "request_free")
           if trigger.startsWith("cache"):
             let index = ord(trigger[^1]) - ord('0')
             scanu_env.entries[index].cachedRxuMgtInd = addr oldFrames[index]
             replacementEnv = scanu_env
         if route in ["plain", "join"]: scanu_confirm(27)
-        elif route == "done": doAssert scan_done_ind_handler(nil) == KeMsgConsumed
+        elif route == "done": doAssert scan_done_ind_handler(addr replayToken) == KeMsgConsumed
         else: scanu_cached_scanresult_clear()
         hook = nil
         doAssert fired and interruptsEnabled == irq
@@ -237,34 +277,60 @@ for route in ["plain", "join", "done", "clear"]:
         else: doAssert sent.len == 0
         for response in responses: doAssert not response.owned
 
-# Allocation failures still release the old request and any cache exactly once.
+# Allocation failures still release or transfer the old request exactly once.
 for route in ["plain", "join", "done"]:
   for mask in 0 .. 3:
     for irq in [false, true]:
       setup(irq, route)
       failMask = mask
-      if route == "done": discard scan_done_ind_handler(nil)
+      if route == "done": discard scan_done_ind_handler(addr replayToken)
       else: scanu_confirm(31)
-      doAssert requestFrees == 1 and scanu_env.paramPtr == nil
+      let transferred = ((mask and 1) != 0).int
+      doAssert requestTransfers == transferred and requestFrees + transferred == 1
+      doAssert scanu_env.paramPtr == nil
       doAssert state == ScanuIdleState and interruptsEnabled == irq
       let wanted = if route == "join": 2 else: 1
       doAssert allocations == wanted
-      var expectedCount = 0
-      for i in 0 ..< wanted:
-        if (mask and (1 shl i)) == 0: inc expectedCount
-      doAssert sent.len == expectedCount
       if route == "done":
+        doAssert sent == @[(SCANU_JOIN_CFM, 5'u8, 0'u8)]
         for count in freedFrames: doAssert count == 1
+      else:
+        let primary = if route == "join": SCANU_JOIN_CFM else: SCANU_START_CFM
+        doAssert sent[0] == (primary, 5'u8, 31'u8)
+        if route == "join" and (mask and 2) == 0:
+          doAssert sent == @[(primary, 5'u8, 31'u8), (SCANU_JOIN_CFM, TASK_API, 31'u8)]
+        else:
+          doAssert sent.len == 1
+
+setup(true, "plain")
+failMask = 1
+hook = proc(point: string) =
+  if point == "send1": installReplacement(false)
+scanu_confirm(31)
+doAssert state == 9 and scanu_env == replacementEnv
+doAssert requestTransfers == 1 and requestFrees == 0
 
 setup(true, "plain")
 scanu_env.paramPtr = nil
 scanu_confirm(0)
 doAssert allocations == 0 and requestFrees == 0 and sent.len == 0
-doAssert state == ScanuIdleState
+doAssert state == 7
 setup(true, "plain")
 scanu_env.pendingJoinRxuMgtInd = nil
 discard scan_done_ind_handler(nil)
-doAssert advances == 1 and allocations == 0 and requestFrees == 0
+doAssert advances == 0 and allocations == 0 and requestFrees == 0
+var lowerRequest, lowerDone: uint8
+scanuLower = ScanuLowerExchange(request: addr lowerRequest, epoch: scanuRequestEpoch)
+scanuTrackLowerReply(addr lowerRequest, addr lowerDone, done = true)
+discard scan_done_ind_handler(addr replayToken)
+doAssert advances == 0
+discard scan_done_ind_handler(addr lowerDone)
+discard scan_done_ind_handler(addr lowerDone)
+doAssert advances == 1 and scanu_env.paramPtr == addr request
+
+setup(true, "done")
+discard scan_done_ind_handler(nil)
+doAssert advances == 0 and allocations == 0 and scanu_env.paramPtr == addr request
 
 for irq in [false, true]:
   setup(irq, "join")
@@ -276,7 +342,28 @@ for irq in [false, true]:
       request.flags = 0xAABBCCDD'u32
   doAssert cachedJoin() == 1
   doAssert cachedEntry.cachedRxuMgtInd == addr newFrames[0]
-  doAssert request.flags == 0xAABBCCDD'u32 and basicSends == 1
+  doAssert request.flags == 0xAABBCCDD'u32 and replaySends == 1
+
+for failure in ["alloc", "slot_replaced", "request_replaced"]:
+  setup(true, "join")
+  isCachedJoin = true
+  cachedEntry.cachedRxuMgtInd = addr oldFrames[0]
+  cachedSidecar.generation = 1
+  failMask = (failure == "alloc").int
+  hook = proc(point: string) =
+    if point == "alloc1":
+      if failure == "slot_replaced": inc cachedSidecar.generation
+      elif failure == "request_replaced": installReplacement(true)
+  let replaced = failure == "request_replaced"
+  doAssert cachedJoin() == replaced.cint
+  doAssert replaySends == 0 and replayFrees == (failure != "alloc").int
+  doAssert cachedEntry.cachedRxuMgtInd == addr oldFrames[0]
+  if replaced:
+    doAssert state == 9 and scanu_env == replacementEnv
+    doAssert request.flags == 0xBADCAB1E'u32
+  else:
+    doAssert state == 7 and scanu_env.pendingJoinRxuMgtInd == nil
+    doAssert request.flags == 0x12345678'u32
 """
 
 
@@ -321,21 +408,26 @@ proc scanu_cached_scanresult_clear*() {.exportc, cdecl.} =
     elif mutation == "done_detach":
         done = done.replace("      scanu_env.paramPtr = nil\n", "")
     elif mutation == "nil_completion":
-        confirm = confirm.replace("    if oldRequest == nil:\n      ke_state_set(TASK_SCANU, ScanuIdleState)\n      return\n", "")
+        confirm = confirm.replace("    if oldRequest == nil: return\n", "")
     elif mutation == "unlocked":
         confirm = confirm.replace("    let saved = irqSave()\n    defer: irqRestore(saved)\n", "")
     elif mutation == "cached_send":
-        old = "    existingEntry.cachedRxuMgtInd = nil\n    req.flags = 0\n"
+        old = "        existingEntry.cachedRxuMgtInd = nil\n        req.flags = 0\n"
         assert old in cached
         cached = cached.replace(old, "")
-        cached = cached.replace("    ke_msg_send(cachedRxuMgtInd)\n",
-            "    ke_msg_send(cachedRxuMgtInd)\n" + old)
+        cached = cached.replace("        ke_msg_send(cachedRxuMgtInd)\n",
+            "        ke_msg_send(cachedRxuMgtInd)\n" + old)
     program = tmp_path / "completion.nim"
     layout = (FW / "layout_types.nim").read_text()
     cache_count = int(re.search(r"(?m)^const SCANU_MAX_RESULT_ENTRIES\* = (\d+)$", layout).group(1))
     platform = PLATFORM.replace("SCANU_MAX_RESULT_ENTRIES = 6", f"SCANU_MAX_RESULT_ENTRIES = {cache_count}")
     current = procedure(scan, "scanuRequestCurrent")
-    program.write_text("import std/strutils\n" + platform + current + confirm + detach + clear + done + cached + CHECKS)
+    publication = procedure(scan, "scanuReleaseCompletedOwner") + procedure(scan, "scanuPublishCompletion")
+    forward = procedure((FW / "kernel_mac_channel.nim").read_text(), "ke_msg_forward_and_change_id")
+    from test_wifi_scan_start_confirmation import exchange_source
+
+    program.write_text("import std/strutils\n" + platform + exchange_source() + forward +
+                       current + publication + confirm + detach + clear + done + cached + CHECKS)
     flags = {"checked": [], "release": ["-d:release", "--assertions:on"],
              "asan": ["--cc:clang", "--passC:-fsanitize=address", "--passL:-fsanitize=address"]}
     result = subprocess.run([nim, "c", "-r", "--skipParentCfg:on", "--skipProjCfg:on", "--skipUserCfg:on",

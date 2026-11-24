@@ -5,8 +5,11 @@
 {.experimental: "codeReordering".}
 
 import ./types
+import ./block_types
 import ./pgo
 import std/[math, bitops]
+when defined(wasmChunkedMemory):
+  import ./linear_memory
 when defined(wasmGuardPages):
   import ./guardmem
 
@@ -15,10 +18,31 @@ const MaxPages = 65536  # 4 GiB
 # Arena sizes: start small, grow by doubling.
 # Small defaults keep per-VM overhead low; most programs fit in the initial
 # allocation and never pay a reallocation cost on the hot path.
-const InitialValueStackSize = 1024   # 8 KB; typical programs rarely exceed 512 slots deep
-const InitialCallStackSize   = 64    # 64 frames; standard depth limit is well below 4096
-const InitialLabelStackSize  = 128   # 128 labels; covers deeply-nested blocks
-const InitialLocalsSize      = 256   # 256 uint64 = 2 KB; grows per function call depth
+when defined(bl808lp):
+  # All four arenas grow on demand. LP has only 16 KiB writable RAM, so the
+  # desktop warm starts and indirect-call cache must not consume its heap.
+  const InitialValueStackSize = 32
+  const InitialCallStackSize = 4
+  const InitialLabelStackSize = 8
+  const InitialLocalsSize = 16
+  const InitialCallIcSlots = 4
+elif defined(bl808m0):
+  # M0 shares its 64 KiB OCRAM budget with other firmware services. Keep a
+  # useful warm cache but let unusual guest depths grow their own arenas.
+  const InitialValueStackSize = 256
+  const InitialCallStackSize = 16
+  const InitialLabelStackSize = 32
+  const InitialLocalsSize = 64
+  const InitialCallIcSlots = 64
+else:
+  const InitialValueStackSize = 1024
+  const InitialCallStackSize = 64
+  const InitialLabelStackSize = 128
+  const InitialLocalsSize = 256
+  const InitialCallIcSlots = 512
+
+when defined(wasmChunkedMemory):
+  type MemoryBackendFactory* = proc(ctx: pointer, memType: MemType): ref LinearMemory {.nimcall.}
 
 # ---------------------------------------------------------------------------
 # Runtime data structures
@@ -38,6 +62,7 @@ type
       moduleIdx*: int
       funcIdx*: int
       code*: ptr Expr
+      codeOwner: ref Expr  ## stable, private lifetime for instantiated code
       localTypes*: seq[ValType]
 
   TableInst* = object
@@ -47,6 +72,8 @@ type
   MemInst* = object
     memType*: MemType
     data*: seq[byte]
+    when defined(wasmChunkedMemory):
+      chunked*: ref LinearMemory  ## optional bounded backing
     when defined(wasmGuardPages):
       guardMem*: GuardedMem    ## guard-page-backed virtual reservation
       useGuard*: bool          ## true when guardMem is active
@@ -140,8 +167,11 @@ type
     labelStackTop*: int
     locals*: seq[uint64]
     localsTop*: int
-    # call_indirect inline cache (direct-mapped, 1024 slots)
+    # call_indirect inline cache (power-of-two, 2-way slots)
     callIcBuf*: seq[CallIcSlot]
+    when defined(wasmChunkedMemory):
+      memoryFactory*: MemoryBackendFactory
+      memoryFactoryContext*: pointer
 
   ExternalVal* = object
     case kind*: ExportKind
@@ -154,6 +184,15 @@ type
       memInst*: MemInst
     of ekGlobal:
       globalInst*: GlobalInst
+    of ekTag:
+      discard  # Tag identity is bound through ExternalStoreRef.
+
+  ExternalStoreRef* = object
+    ## An already instantiated external in this VM's store.
+    kind*: ExportKind
+    address*: int
+
+  StoreImport* = tuple[moduleName, fieldName: string, item: ExternalStoreRef]
 
 # ---------------------------------------------------------------------------
 # Trap helper
@@ -175,8 +214,17 @@ proc initWasmVM*(): WasmVM =
   result.labelStackTop = 0
   result.locals = newSeq[uint64](InitialLocalsSize)
   result.localsTop = 0
-  # 512-slot 2-way associative call_indirect IC (512 × 2 = 1024 total entries)
-  result.callIcBuf = newSeq[CallIcSlot](512)
+  # A smaller power-of-two cache preserves semantics while bounding LP RAM.
+  result.callIcBuf = newSeq[CallIcSlot](InitialCallIcSlots)
+
+when defined(wasmChunkedMemory):
+  proc setMemoryBackendFactory*(vm: var WasmVM, factory: MemoryBackendFactory,
+                                context: pointer = nil) =
+    ## Opt in before instantiation. The factory must return an independent
+    ## memory for each defined memory, with the declared minimum pages present.
+    ## Imported memories retain the backing supplied by their host provider.
+    vm.memoryFactory = factory
+    vm.memoryFactoryContext = context
 
 # ---------------------------------------------------------------------------
 # Value stack operations
@@ -328,20 +376,22 @@ proc setLocalRaw*(vm: var WasmVM, localsStart: int, idx: int, val: uint64) {.inl
 # Block type helpers
 # ---------------------------------------------------------------------------
 
-proc blockResultArity(vm: var WasmVM, pad: uint16, cachedModIdx: int): int {.inline.} =
+proc blockResultArity(vm: var WasmVM, pad: uint16, cachedModIdx, instructionPc: int): int {.inline.} =
   ## Decode block result arity from compact pad field.
   ##   pad=0: empty (0 results), pad=1..0xFF: valtype (1 result),
   ##   pad>=0x100: type index (results.len)
   if pad == 0: return 0
-  if pad < 0x100: return 1
-  let typeIdx = (pad - 0x100).int
+  if pad < 0x100 and pad != WideBlockPad: return 1
+  let typeIdx = if pad == WideBlockPad: int(vm.callStack[vm.callStackTop-1].code[].wideBlockIndex(instructionPc))
+    else: int(pad-0x100)
   vm.store.modules[cachedModIdx].types[typeIdx].results.len
 
-proc blockParamArity(vm: var WasmVM, pad: uint16, cachedModIdx: int): int {.inline.} =
+proc blockParamArity(vm: var WasmVM, pad: uint16, cachedModIdx, instructionPc: int): int {.inline.} =
   ## Decode block param arity from compact pad field.
   ##   pad < 0x100: 0 params, pad >= 0x100: type index (params.len)
-  if pad < 0x100: return 0
-  let typeIdx = (pad - 0x100).int
+  if pad < 0x100 and pad != WideBlockPad: return 0
+  let typeIdx = if pad == WideBlockPad: int(vm.callStack[vm.callStackTop-1].code[].wideBlockIndex(instructionPc))
+    else: int(pad-0x100)
   vm.store.modules[cachedModIdx].types[typeIdx].params.len
 
 # ---------------------------------------------------------------------------
@@ -353,6 +403,12 @@ proc getMem(vm: var WasmVM, modIdx: int, memIdx: int = 0): var MemInst {.inline.
   vm.store.mems[addr0]
 
 proc boundsCheck(mem: var MemInst, ea: uint64, size: int) {.inline.} =
+  when defined(wasmChunkedMemory):
+    if mem.chunked != nil:
+      let limit = mem.chunked[].byteLen()
+      if ea > limit or size.uint64 > limit - ea:
+        trap("out of bounds memory access")
+      return
   when defined(wasmGuardPages):
     if mem.useGuard:
       return  # hardware guard pages handle the check
@@ -360,6 +416,9 @@ proc boundsCheck(mem: var MemInst, ea: uint64, size: int) {.inline.} =
     trap("out of bounds memory access")
 
 proc memBasePtr*(mem: var MemInst): ptr byte {.inline.} =
+  when defined(wasmChunkedMemory):
+    if mem.chunked != nil:
+      return nil  # chunked memory has no stable contiguous native pointer
   when defined(wasmGuardPages):
     if mem.useGuard:
       return cast[ptr byte](mem.guardMem.base)
@@ -369,6 +428,9 @@ proc memBasePtr*(mem: var MemInst): ptr byte {.inline.} =
 
 proc memBulkPtr(mem: var MemInst, offset: uint64): ptr byte {.inline.} =
   ## Pointer to byte at `offset` — works for both seq and guard-backed memory.
+  when defined(wasmChunkedMemory):
+    if mem.chunked != nil:
+      trap("chunked memory has no contiguous bulk pointer")
   when defined(wasmGuardPages):
     if mem.useGuard:
       return cast[ptr byte](cast[uint64](mem.guardMem.base) + offset)
@@ -376,27 +438,153 @@ proc memBulkPtr(mem: var MemInst, offset: uint64): ptr byte {.inline.} =
 
 proc memByteLen(mem: var MemInst): uint64 {.inline.} =
   ## Current accessible byte count.
+  when defined(wasmChunkedMemory):
+    if mem.chunked != nil:
+      return mem.chunked[].byteLen()
   when defined(wasmGuardPages):
     if mem.useGuard:
       return mem.guardMem.accessibleBytes
   mem.data.len.uint64
 
-proc loadVal[T](mem: var MemInst, ea: uint64): T {.inline.} =
+proc loadValSync[T](mem: var MemInst, ea: uint64): T {.inline.} =
   boundsCheck(mem, ea, sizeof(T))
+  when defined(wasmChunkedMemory):
+    if mem.chunked != nil:
+      let status = mem.chunked[].readAt(ea,
+        cast[ptr UncheckedArray[byte]](result.addr), sizeof(T).uint32,
+        allowIo = true)
+      if status != lmOk: trap("linear memory read failed: " & $status)
+      return
   when defined(wasmGuardPages):
     if mem.useGuard:
       copyMem(result.addr, cast[ptr byte](cast[uint64](mem.guardMem.base) + ea), sizeof(T))
       return
   copyMem(result.addr, mem.data[ea.int].unsafeAddr, sizeof(T))
 
-proc storeVal[T](mem: var MemInst, ea: uint64, val: T) {.inline.} =
+proc storeValSync[T](mem: var MemInst, ea: uint64, val: T) {.inline.} =
   boundsCheck(mem, ea, sizeof(T))
   var v = val
+  when defined(wasmChunkedMemory):
+    if mem.chunked != nil:
+      let status = mem.chunked[].writeAt(ea,
+        cast[ptr UncheckedArray[byte]](v.addr), sizeof(T).uint32,
+        allowIo = true)
+      if status != lmOk: trap("linear memory write failed: " & $status)
+      return
   when defined(wasmGuardPages):
     if mem.useGuard:
       copyMem(cast[ptr byte](cast[uint64](mem.guardMem.base) + ea), v.addr, sizeof(T))
       return
   copyMem(mem.data[ea.int].addr, v.addr, sizeof(T))
+
+proc writeBulk(mem: var MemInst, offset: uint64,
+               src: ptr UncheckedArray[byte], count: uint32) =
+  if count == 0: return
+  when defined(wasmChunkedMemory):
+    if mem.chunked != nil:
+      let status = mem.chunked[].writeAt(offset, src, count, allowIo = true)
+      if status != lmOk: trap("linear memory bulk write failed: " & $status)
+      return
+  copyMem(mem.memBulkPtr(offset), src, count.int)
+
+proc checkMemoryRange*(mem: var MemInst, offset: uint64, count: uint32) =
+  let length = mem.memByteLen()
+  if offset > length or count.uint64 > length - offset or
+      count.uint64 > high(int).uint64:
+    trap("linear memory range out of bounds")
+
+proc readMemoryBytes*(mem: var MemInst, offset: uint64,
+                      dst: ptr UncheckedArray[byte], count: uint32) =
+  ## Synchronous bounded view for adapters that run outside a deadline slot.
+  mem.checkMemoryRange(offset, count)
+  if count == 0: return
+  when defined(wasmChunkedMemory):
+    if mem.chunked != nil:
+      let status = mem.chunked[].readAt(offset, dst, count, allowIo = true)
+      if status != lmOk: trap("linear memory read failed: " & $status)
+      return
+  copyMem(dst, mem.memBulkPtr(offset), count.int)
+
+proc writeMemoryBytes*(mem: var MemInst, offset: uint64,
+                       src: ptr UncheckedArray[byte], count: uint32) =
+  mem.checkMemoryRange(offset, count)
+  mem.writeBulk(offset, src, count)
+
+proc copyBulk(dst, src: var MemInst, d, s: uint64, count: uint32,
+              sameMemory: bool) =
+  if count == 0: return
+  when defined(wasmChunkedMemory):
+    if sameMemory and dst.chunked != nil:
+      let status = dst.chunked[].copyWithin(d, s, count, allowIo = true)
+      if status != lmOk: trap("linear memory copy failed: " & $status)
+      return
+  when defined(wasmChunkedMemory):
+    let bothFlat = dst.chunked == nil and src.chunked == nil
+  else:
+    let bothFlat = true
+  if bothFlat:
+    if sameMemory:
+      moveMem(dst.memBulkPtr(d), src.memBulkPtr(s), count.int)
+    else:
+      copyMem(dst.memBulkPtr(d), src.memBulkPtr(s), count.int)
+    return
+  when defined(wasmChunkedMemory):
+    var scratch: array[64, byte]
+    var done = 0'u32
+    while done < count:
+      let size = min(count - done, scratch.len.uint32)
+      if src.chunked != nil:
+        let status = src.chunked[].readAt(s + done.uint64,
+          cast[ptr UncheckedArray[byte]](addr scratch[0]), size, allowIo = true)
+        if status != lmOk: trap("linear memory copy read failed: " & $status)
+      else:
+        copyMem(addr scratch[0], src.memBulkPtr(s + done.uint64), size.int)
+      dst.writeBulk(d + done.uint64,
+        cast[ptr UncheckedArray[byte]](addr scratch[0]), size)
+      done += size
+
+proc fillBulk(mem: var MemInst, offset: uint64, value: byte, count: uint32) =
+  if count == 0: return
+  when defined(wasmChunkedMemory):
+    if mem.chunked != nil:
+      let status = mem.chunked[].fillAt(offset, value, count, allowIo = true)
+      if status != lmOk: trap("linear memory fill failed: " & $status)
+      return
+  let dst = mem.memBulkPtr(offset)
+  for i in 0'u32 ..< count:
+    (cast[ptr byte](cast[uint64](dst) + i.uint64))[] = value
+
+proc pageCount(mem: var MemInst): int32 {.inline.} =
+  when defined(wasmChunkedMemory):
+    if mem.chunked != nil:
+      return cast[int32](mem.chunked[].currentPages())
+  when defined(wasmGuardPages):
+    if mem.useGuard:
+      return int32(mem.guardMem.accessibleBytes div WasmPageSize.uint64)
+  int32(mem.data.len div WasmPageSize)
+
+proc growMemory(mem: var MemInst, delta: int32): int32 =
+  ## Return the previous page count, or -1 as required by memory.grow.
+  if delta < 0: return -1
+  let oldPages = mem.pageCount().uint32
+  let next = oldPages.uint64 + delta.uint32.uint64
+  let declaredMax = if mem.memType.limits.hasMax:
+                      mem.memType.limits.max.uint64
+                    else:
+                      MaxPages.uint64
+  if next > declaredMax or next > MaxPages.uint64: return -1
+  when defined(wasmChunkedMemory):
+    if mem.chunked != nil:
+      var previous: uint32
+      if mem.chunked[].grow(delta.uint32, previous) != lmOk: return -1
+      return cast[int32](previous)
+  when defined(wasmGuardPages):
+    if mem.useGuard:
+      if not growGuardedMem(mem.guardMem, next.int): return -1
+      return cast[int32](oldPages)
+  if next > uint64(high(int) div WasmPageSize): return -1
+  mem.data.setLen(next.int * WasmPageSize)
+  cast[int32](oldPages)
 
 # ---------------------------------------------------------------------------
 # Init expression evaluator (for globals, data/elem offsets)
@@ -415,6 +603,9 @@ proc evalInitExpr*(vm: var WasmVM, expr: Expr, modIdx: int): WasmValue =
     of opF64Const:
       let u = uint64(instr.imm1) or (uint64(instr.imm2) shl 32)
       return wasmF64(cast[float64](u))
+    of opV128Const:
+      if uint64(instr.imm1) >= uint64(expr.v128Consts.len): trap("invalid vector constant in initializer")
+      return WasmValue(kind: wvkV128, v128: expr.v128Consts[int(instr.imm1)])
     of opGlobalGet:
       let globalIdx = instr.imm1.int
       let globalAddr = vm.store.modules[modIdx].globalAddrs[globalIdx]
@@ -438,8 +629,51 @@ proc evalInitExpr*(vm: var WasmVM, expr: Expr, modIdx: int): WasmValue =
 # Module instantiation
 # ---------------------------------------------------------------------------
 
-proc instantiate*(vm: var WasmVM, module: WasmModule,
-                  imports: openArray[(string, string, ExternalVal)]): int =
+proc importLimitsMatch*(actual, required: Limits): bool =
+  actual.min >= required.min and
+    (not required.hasMax or (actual.hasMax and actual.max <= required.max))
+
+proc bindStoreImport(vm: WasmVM, modInst: var ModuleInst, module: WasmModule,
+                     imp: Import, source: ExternalStoreRef) =
+  ## Retain the address instead of copying mutable state out of its owner.
+  let address = source.address
+  if address < 0 or ord(imp.kind) != ord(source.kind):
+    trap("incompatible store import")
+  case imp.kind
+  of ikFunc:
+    if address >= vm.store.funcs.len or
+        vm.store.funcs[address].funcType != module.types[imp.funcTypeIdx.int]:
+      trap("incompatible store function import")
+    modInst.funcAddrs.add(address)
+  of ikTable:
+    if address >= vm.store.tables.len:
+      trap("unknown store table")
+    let actual = vm.store.tables[address].tableType
+    if actual.elemType != imp.tableType.elemType or
+        not importLimitsMatch(actual.limits, imp.tableType.limits):
+      trap("incompatible store table import")
+    modInst.tableAddrs.add(address)
+  of ikMemory:
+    if address >= vm.store.mems.len or
+        not importLimitsMatch(vm.store.mems[address].memType.limits,
+                              imp.memType.limits):
+      trap("incompatible store memory import")
+    modInst.memAddrs.add(address)
+  of ikGlobal:
+    if address >= vm.store.globals.len or
+        vm.store.globals[address].globalType != imp.globalType:
+      trap("incompatible store global import")
+    modInst.globalAddrs.add(address)
+  of ikTag:
+    if address >= vm.store.tags.len or
+        vm.store.tags[address].funcType != module.types[imp.tagTypeIdx.int]:
+      trap("incompatible store tag import")
+    modInst.tagAddrs.add(address)
+
+proc instantiateImpl(vm: var WasmVM, module: WasmModule,
+    imports: openArray[(string, string, ExternalVal)],
+    storeImports: openArray[StoreImport], ownedModule: ptr WasmModule,
+    runStart = true): int =
   ## Instantiate a module into the VM store. Returns the module instance index.
   let modIdx = vm.store.modules.len
   var modInst = ModuleInst()
@@ -457,10 +691,17 @@ proc instantiate*(vm: var WasmVM, module: WasmModule,
     of ikTable: inc importTableCount
     of ikMemory: inc importMemCount
     of ikGlobal: inc importGlobalCount
+    of ikTag: discard
 
   # --- Resolve imports ---
   for imp in module.imports:
     var found = false
+    for source in storeImports:
+      if source.moduleName == imp.module and source.fieldName == imp.name:
+        vm.bindStoreImport(modInst, module, imp, source.item)
+        found = true
+        break
+    if found: continue
     for (impMod, impName, extVal) in imports:
       if impMod == imp.module and impName == imp.name:
         case imp.kind
@@ -492,6 +733,8 @@ proc instantiate*(vm: var WasmVM, module: WasmModule,
           let globalAddr = vm.store.globals.len
           vm.store.globals.add(extVal.globalInst)
           modInst.globalAddrs.add(globalAddr)
+        of ikTag:
+          trap("exception tags require a store import")
         found = true
         break
     if not found:
@@ -511,12 +754,22 @@ proc instantiate*(vm: var WasmVM, module: WasmModule,
       for ld in module.codes[i].locals:
         for j in 0'u32 ..< ld.count:
           localTys.add(ld.valType)
+    # Caller-owned decoded modules may be moved, released, or edited after
+    # instantiation. Retain a private expression at a stable heap address.
+    var codeOwner: ref Expr
+    if i < module.codes.len:
+      new(codeOwner)
+      if ownedModule == nil:
+        codeOwner[] = module.codes[i].code
+      else:
+        codeOwner[] = move ownedModule[].codes[i].code
     vm.store.funcs.add(FuncInst(
       funcType: ft,
       isHost: false,
       moduleIdx: modIdx,
       funcIdx: i,
-      code: if i < module.codes.len: module.codes[i].code.addr else: nil,
+      code: if codeOwner != nil: addr codeOwner[] else: nil,
+      codeOwner: codeOwner,
       localTypes: localTys
     ))
     modInst.funcAddrs.add(funcAddr)
@@ -537,17 +790,34 @@ proc instantiate*(vm: var WasmVM, module: WasmModule,
     let memAddr = vm.store.mems.len
     let initialPages = mt.limits.min.int
     let maxPages = if mt.limits.hasMax: mt.limits.max.int else: 0
-    when defined(wasmGuardPages):
-      var mi = MemInst(memType: mt)
-      mi.guardMem = allocGuardedMem(initialPages, maxPages)
-      mi.useGuard = true
-      vm.store.mems.add(mi)
+    when defined(wasmChunkedMemory):
+      if vm.memoryFactory != nil:
+        let backend = vm.memoryFactory(vm.memoryFactoryContext, mt)
+        if backend == nil or backend[].currentPages() != mt.limits.min or
+            backend[].byteLen() != mt.limits.min.uint64 * WasmPageSize.uint64:
+          trap("memory backend rejected module minimum")
+        vm.store.mems.add(MemInst(memType: mt, chunked: backend))
+      else:
+        when defined(wasmGuardPages):
+          var mi = MemInst(memType: mt)
+          mi.guardMem = allocGuardedMem(initialPages, maxPages)
+          mi.useGuard = true
+          vm.store.mems.add(mi)
+        else:
+          let numBytes = initialPages * WasmPageSize
+          vm.store.mems.add(MemInst(memType: mt, data: newSeq[byte](numBytes)))
     else:
-      let numBytes = initialPages * WasmPageSize
-      vm.store.mems.add(MemInst(
-        memType: mt,
-        data: newSeq[byte](numBytes)
-      ))
+      when defined(wasmGuardPages):
+        var mi = MemInst(memType: mt)
+        mi.guardMem = allocGuardedMem(initialPages, maxPages)
+        mi.useGuard = true
+        vm.store.mems.add(mi)
+      else:
+        let numBytes = initialPages * WasmPageSize
+        vm.store.mems.add(MemInst(
+          memType: mt,
+          data: newSeq[byte](numBytes)
+        ))
     modInst.memAddrs.add(memAddr)
 
   # We need the module in store before evaluating init exprs (for global.get)
@@ -583,11 +853,13 @@ proc instantiate*(vm: var WasmVM, module: WasmModule,
     if es.mode == elemActive:
       let tableAddr = vm.store.modules[modIdx].tableAddrs[es.tableIdx.int]
       let offsetVal = vm.evalInitExpr(es.offset, modIdx)
-      let offset = offsetVal.i32.int
+      let rawOffset = offsetVal.i32.uint32.uint64
       let elemAddr = vm.store.modules[modIdx].elemAddrs[i]
       let elemInst = vm.store.elems[elemAddr]
-      if offset + elemInst.elems.len > vm.store.tables[tableAddr].elems.len:
+      let tableSize = vm.store.tables[tableAddr].elems.len.uint64
+      if rawOffset > tableSize or elemInst.elems.len.uint64 > tableSize - rawOffset:
         trap("out of bounds table access during element initialization")
+      let offset = rawOffset.int
       for j in 0 ..< elemInst.elems.len:
         vm.store.tables[tableAddr].elems[offset + j] = elemInst.elems[j]
       vm.store.elems[elemAddr].dropped = true
@@ -597,23 +869,35 @@ proc instantiate*(vm: var WasmVM, module: WasmModule,
     if ds.mode == dataActive:
       let memAddr = vm.store.modules[modIdx].memAddrs[ds.memIdx.int]
       let offsetVal = vm.evalInitExpr(ds.offset, modIdx)
-      let offset = offsetVal.i32.int
+      let offset = offsetVal.i32.uint32.uint64
       let dataAddr = vm.store.modules[modIdx].dataAddrs[i]
       let dataInst = vm.store.datas[dataAddr]
+      when defined(wasmChunkedMemory):
+        if vm.store.mems[memAddr].chunked != nil:
+          let memorySize = vm.store.mems[memAddr].memByteLen()
+          if offset > memorySize or dataInst.data.len.uint64 > memorySize - offset:
+            trap("out of bounds memory access during data initialization")
+          if runStart and dataInst.data.len > 0:
+            vm.store.mems[memAddr].writeBulk(offset,
+              cast[ptr UncheckedArray[byte]](dataInst.data[0].unsafeAddr),
+              dataInst.data.len.uint32)
+          vm.store.datas[dataAddr].dropped = true
+          continue
       when defined(wasmGuardPages):
         if vm.store.mems[memAddr].useGuard:
           let guardBytes = vm.store.mems[memAddr].guardMem.accessibleBytes
-          if uint64(offset) + uint64(dataInst.data.len) > guardBytes:
+          if offset > guardBytes or dataInst.data.len.uint64 > guardBytes - offset:
             trap("out of bounds memory access during data initialization")
-          if dataInst.data.len > 0:
-            let dst = cast[ptr byte](cast[uint64](vm.store.mems[memAddr].guardMem.base) + uint64(offset))
+          if runStart and dataInst.data.len > 0:
+            let dst = cast[ptr byte](cast[uint64](vm.store.mems[memAddr].guardMem.base) + offset)
             copyMem(dst, dataInst.data[0].unsafeAddr, dataInst.data.len)
           vm.store.datas[dataAddr].dropped = true
           continue
-      if offset + dataInst.data.len > vm.store.mems[memAddr].data.len:
+      let memorySize = vm.store.mems[memAddr].data.len.uint64
+      if offset > memorySize or dataInst.data.len.uint64 > memorySize - offset:
         trap("out of bounds memory access during data initialization")
-      if dataInst.data.len > 0:
-        copyMem(vm.store.mems[memAddr].data[offset].addr,
+      if runStart and dataInst.data.len > 0:
+        copyMem(vm.store.mems[memAddr].data[offset.int].addr,
                 dataInst.data[0].unsafeAddr,
                 dataInst.data.len)
       vm.store.datas[dataAddr].dropped = true
@@ -637,6 +921,8 @@ proc instantiate*(vm: var WasmVM, module: WasmModule,
       ei.idx = vm.store.modules[modIdx].memAddrs[exp.idx.int]
     of ekGlobal:
       ei.idx = vm.store.modules[modIdx].globalAddrs[exp.idx.int]
+    of ekTag:
+      ei.idx = vm.store.modules[modIdx].tagAddrs[exp.idx.int]
     vm.store.modules[modIdx].exports.add(ei)
 
   # --- Start function ---
@@ -659,11 +945,28 @@ proc instantiate*(vm: var WasmVM, module: WasmModule,
               code[].code[j].imm1 = uint32(patchModInst.funcAddrs[origIdx])
               code[].code[j].pad = 1  # mark as pre-resolved
 
-  if module.startFunc >= 0:
+  if runStart and module.startFunc >= 0:
     let startFuncAddr = vm.store.modules[modIdx].funcAddrs[module.startFunc.int]
     discard vm.execute(startFuncAddr, [])
 
   result = modIdx
+
+proc instantiate*(vm: var WasmVM, module: WasmModule,
+                  imports: openArray[(string, string, ExternalVal)],
+                  storeImports: openArray[StoreImport] = []): int =
+  vm.instantiateImpl(module, imports, storeImports, nil)
+
+proc instantiateOwned*(vm: var WasmVM, module: sink WasmModule,
+                       imports: openArray[(string, string, ExternalVal)],
+                       storeImports: openArray[StoreImport] = []): int =
+  ## Consume a private decoded module so its code can move into the store.
+  vm.instantiateImpl(module, imports, storeImports, addr module)
+
+proc instantiateForRestore*(vm: var WasmVM, module: sink WasmModule): int =
+  ## Prepare a private store. The validated snapshot supplies effects of the
+  ## start function and active data segments, so the destination can restore
+  ## directly into its own memory policy without paging in the initial image.
+  vm.instantiateImpl(module, [], [], addr module, runStart = false)
 
 # ---------------------------------------------------------------------------
 # Branch helper
@@ -675,14 +978,14 @@ proc doBranch(vm: var WasmVM, labelDepth: int): int {.inline.} =
   let targetLabel = vm.labelStack[targetLabelIdx]
 
   let arity = targetLabel.arity
-  var results: array[128, uint64]
-  for i in countdown(arity - 1, 0):
-    results[i] = vm.popRaw()
-
-  vm.valueStackTop = targetLabel.stackHeight
-
-  for i in 0 ..< arity:
-    vm.pushRaw(results[i])
+  let sourceStart = vm.valueStackTop - arity
+  if arity < 0 or sourceStart < 0 or targetLabel.stackHeight < 0 or
+      targetLabel.stackHeight > sourceStart:
+    trap("invalid branch stack height")
+  if arity > 0:
+    moveMem(addr vm.valueStack[targetLabel.stackHeight],
+            addr vm.valueStack[sourceStart], arity * sizeof(uint64))
+  vm.valueStackTop = targetLabel.stackHeight + arity
 
   if targetLabel.isLoop:
     vm.labelStackTop = targetLabelIdx + 1
@@ -950,12 +1253,50 @@ type OsrTrigger* = object
   triggered*: bool   ## true when a function crossed the back-edge heat threshold
   funcAddr*: int     ## store funcAddr of the hot function
 
+type
+  WasmDeadlineClock* = proc(): uint64 {.nimcall.}
+
+  WasmExecutionStatus* = enum
+    wesReady
+    wesRunning
+    wesYielded
+    wesMemoryBlocked
+    wesComplete
+
+  WasmContinuation* = object
+    ## Native interpreter frames are never moved between cores. Only the
+    ## guest PC, stacks, and arena tops are retained for local resumption.
+    status*: WasmExecutionStatus
+    instructions*: uint64
+    funcAddr: int
+    entryValueStackTop: int
+    entryCallStackTop: int
+    entryLabelStackTop: int
+    entryLocalsTop: int
+    when defined(wasmChunkedMemory):
+      faultMemAddr: int
+      retryMemoryInstruction: bool
+      transferProgress: uint32
+      transferBytes: array[16, byte]
+      copyCursor: LinearMemoryCopyCursor
+      bulkDone: uint32
+      bulkPartProgress: uint32
+      bulkWriting: bool
+      bulkScratch: array[64, byte]
+
+proc continuationEntryFuncAddr*(continuation: WasmContinuation): int {.inline.} =
+  continuation.funcAddr
+
 const OsrBackEdgeThreshold* = 50_000  ## back-edges before signalling OSR
 
-proc execute*(vm: var WasmVM, funcAddr: int,
+proc executeImpl[resumable: static bool](vm: var WasmVM, funcAddr: int,
               args: openArray[WasmValue],
-              profiler: ptr PgoProfiler = nil,
-              osrOut: ptr OsrTrigger = nil): seq[WasmValue] =
+              profiler: ptr PgoProfiler,
+              osrOut: ptr OsrTrigger,
+              continuation: ptr WasmContinuation,
+              instructionBudget: uint32,
+              deadlineClock: WasmDeadlineClock,
+              deadlineTick: uint64): seq[WasmValue] =
   ## Execute a function by its address in the store.
   ## Returns the function's result values.
   ## If osrOut is non-nil and the top-level function executes OsrBackEdgeThreshold
@@ -965,62 +1306,86 @@ proc execute*(vm: var WasmVM, funcAddr: int,
 
   # Handle host functions directly
   if funcInst.isHost:
+    when resumable:
+      if continuation == nil or continuation[].status in {wesYielded, wesMemoryBlocked}:
+        trap("invalid host-function continuation")
+      continuation[].status = wesComplete
     return funcInst.hostFunc(args)
 
-  # Type check arguments
   let ft = funcInst.funcType
-  if args.len != ft.params.len:
-    trap("argument count mismatch: expected " & $ft.params.len &
-         ", got " & $args.len)
+  when resumable:
+    if continuation == nil: trap("missing interpreter continuation")
+    if continuation[].status in {wesYielded, wesMemoryBlocked}:
+      if continuation[].funcAddr != funcAddr or
+          vm.callStackTop <= continuation[].entryCallStackTop:
+        trap("stale interpreter continuation")
+    else:
+      continuation[] = WasmContinuation(
+        status: wesReady, funcAddr: funcAddr,
+        entryValueStackTop: vm.valueStackTop,
+        entryCallStackTop: vm.callStackTop,
+        entryLabelStackTop: vm.labelStackTop,
+        entryLocalsTop: vm.localsTop)
+    let resuming = continuation[].status in {wesYielded, wesMemoryBlocked}
+    let entryValueStackTop = continuation[].entryValueStackTop
+    let entryCallStackTop = continuation[].entryCallStackTop
+    let entryLabelStackTop = continuation[].entryLabelStackTop
+    let entryLocalsTop = continuation[].entryLocalsTop
+    continuation[].status = wesRunning
+  else:
+    let resuming = false
+    let entryValueStackTop = vm.valueStackTop
+    let entryCallStackTop = vm.callStackTop
+    let entryLabelStackTop = vm.labelStackTop
+    let entryLocalsTop = vm.localsTop
 
-  # Save entry state
-  let entryValueStackTop = vm.valueStackTop
-  let entryCallStackTop = vm.callStackTop
-  let entryLabelStackTop = vm.labelStackTop
-  let entryLocalsTop = vm.localsTop
+  if not resuming:
+    if args.len != ft.params.len:
+      trap("argument count mismatch: expected " & $ft.params.len &
+           ", got " & $args.len)
 
-  # Allocate locals: params + body locals
-  let localsStart = vm.localsTop
-  let totalLocals = funcInst.localTypes.len
-  while vm.localsTop + totalLocals > vm.locals.len:
-    vm.locals.setLen(vm.locals.len * 2)
+    # Allocate locals: params + body locals
+    let localsStart = vm.localsTop
+    let totalLocals = funcInst.localTypes.len
+    while vm.localsTop + totalLocals > vm.locals.len:
+      vm.locals.setLen(vm.locals.len * 2)
 
-  # Copy args into params (convert WasmValue -> uint64)
-  for i in 0 ..< ft.params.len:
-    vm.locals[localsStart + i] = wasmValueToRaw(args[i])
-  # Zero-init body locals
-  for i in ft.params.len ..< totalLocals:
-    vm.locals[localsStart + i] = 0'u64
-  vm.localsTop = localsStart + totalLocals
+    # Copy args into params (convert WasmValue -> uint64)
+    for i in 0 ..< ft.params.len:
+      vm.locals[localsStart + i] = wasmValueToRaw(args[i])
+    # Zero-init body locals
+    for i in ft.params.len ..< totalLocals:
+      vm.locals[localsStart + i] = 0'u64
+    vm.localsTop = localsStart + totalLocals
 
-  # Push frame
-  let frame = Frame(
-    pc: 0,
-    code: funcInst.code,
-    brTables: funcInst.code[].brTables.addr,
-    localsStart: localsStart,
-    localsCount: totalLocals,
-    labelStackStart: vm.labelStackTop,
-    returnArity: ft.results.len,
-    moduleIdx: funcInst.moduleIdx,
-    funcAddr: funcAddr
-  )
-  vm.pushFrame(frame)
+    # Push frame
+    let frame = Frame(
+      pc: 0,
+      code: funcInst.code,
+      brTables: funcInst.code[].brTables.addr,
+      localsStart: localsStart,
+      localsCount: totalLocals,
+      labelStackStart: vm.labelStackTop,
+      returnArity: ft.results.len,
+      moduleIdx: funcInst.moduleIdx,
+      funcAddr: funcAddr
+    )
+    vm.pushFrame(frame)
 
-  # Push implicit function-body label
-  vm.pushLabel(Label(
-    arity: ft.results.len,
-    pc: funcInst.code[].code.len,  # end of function
-    stackHeight: vm.valueStackTop,
-    isLoop: false,
-    catchTableIdx: -1
-  ))
+    # Push implicit function-body label
+    vm.pushLabel(Label(
+      arity: ft.results.len,
+      pc: funcInst.code[].code.len,  # end of function
+      stackHeight: vm.valueStackTop,
+      isLoop: false,
+      catchTableIdx: -1
+    ))
 
-  # Pre-reserve value stack based on the function's known max stack depth.
-  # This converts the per-push bounds check into an occasional resize.
-  let needed = vm.valueStackTop + funcInst.code[].maxStackDepth.int + 8
-  if needed > vm.valueStack.len:
-    vm.valueStack.setLen(max(vm.valueStack.len * 2, needed))
+    # Pre-reserve value stack based on the function's known max stack depth.
+    # This converts the per-push bounds check into an occasional resize.
+    let needed = vm.valueStackTop + funcInst.code[].maxStackDepth.int + 8
+    if needed > vm.valueStack.len:
+      vm.valueStack.setLen(max(vm.valueStack.len * 2, needed))
 
   # Main dispatch loop — cached frame state for minimal overhead
   {.push checks: off.}  # Disable bounds checks on hot path
@@ -1046,6 +1411,9 @@ proc execute*(vm: var WasmVM, funcAddr: int,
   # OSR heat tracking: count loop back-edges executed in the top-level frame.
   # Only counts when osrOut is provided (i.e., executing inside TieredVM).
   var osrBackEdges: int = 0
+  when resumable:
+    var sliceInstructions = 0'u32
+    var instructionSp = 0
   template trackOsrBackEdge() =
     ## Call at every loop back-edge in the top-level frame.
     ## Signals the caller to JIT-compile the function when the threshold is hit.
@@ -1080,6 +1448,13 @@ proc execute*(vm: var WasmVM, funcAddr: int,
     ## Sync cached sp back to vm
     vm.valueStackTop = sp
 
+  template refreshAfterHost() =
+    # A synchronous host callback may execute a guest allocator or destructor.
+    # That nested execution can move either arena even when the tops match.
+    sp = vm.valueStackTop
+    vsBase = cast[ptr UncheckedArray[uint64]](addr vm.valueStack[0])
+    locBase = cast[ptr UncheckedArray[uint64]](addr vm.locals[0])
+
   template spush(val: uint64) =
     if unlikely(sp >= vm.valueStack.len):
       vm.valueStack.setLen(vm.valueStack.len * 2)
@@ -1105,6 +1480,56 @@ proc execute*(vm: var WasmVM, funcAddr: int,
 
   template reloadLocBase() =
     locBase = cast[ptr UncheckedArray[uint64]](vm.locals[0].addr)
+
+  template suspendMemoryFault(faultAddr: int) =
+    when resumable and defined(wasmChunkedMemory):
+      sp = instructionSp
+      dec cachedPc
+      syncSp()
+      saveFramePc()
+      dec sliceInstructions  # The faulted instruction has not completed.
+      continuation[].instructions += sliceInstructions.uint64
+      continuation[].faultMemAddr = faultAddr
+      continuation[].retryMemoryInstruction = true
+      continuation[].status = wesMemoryBlocked
+      return @[]
+
+  template loadVal[T](mem: var MemInst, ea: uint64): T =
+    block:
+      when resumable and defined(wasmChunkedMemory):
+        if mem.chunked != nil:
+          var value: T
+          let status = mem.chunked[].readAtProgress(ea,
+            cast[ptr UncheckedArray[byte]](addr continuation[].transferBytes[0]),
+            sizeof(T).uint32, continuation[].transferProgress)
+          if status == lmWouldBlock:
+            suspendMemoryFault(vm.store.modules[cachedModIdx].memAddrs[0])
+          if status != lmOk: trap("linear memory read failed: " & $status)
+          copyMem(addr value, addr continuation[].transferBytes[0], sizeof(T))
+          continuation[].transferProgress = 0
+          value
+        else:
+          loadValSync[T](mem, ea)
+      else:
+        loadValSync[T](mem, ea)
+
+  template storeVal[T](mem: var MemInst, ea: uint64, val: T) =
+    when resumable and defined(wasmChunkedMemory):
+      if mem.chunked != nil:
+        if continuation[].transferProgress == 0:
+          var value = val
+          copyMem(addr continuation[].transferBytes[0], addr value, sizeof(T))
+        let status = mem.chunked[].writeAtProgress(ea,
+          cast[ptr UncheckedArray[byte]](addr continuation[].transferBytes[0]),
+          sizeof(T).uint32, continuation[].transferProgress)
+        if status == lmWouldBlock:
+          suspendMemoryFault(vm.store.modules[cachedModIdx].memAddrs[0])
+        if status != lmOk: trap("linear memory write failed: " & $status)
+        continuation[].transferProgress = 0
+      else:
+        storeValSync[T](mem, ea, val)
+    else:
+      storeValSync[T](mem, ea, val)
 
   template inlineBranch(depth: int) =
     ## Inline fast-path branch for arity 0/1 (same logic as opBr).
@@ -1139,6 +1564,20 @@ proc execute*(vm: var WasmVM, funcAddr: int,
 
   # Main dispatch loop
   while vm.callStackTop > entryCallStackTop:
+    when resumable:
+      # A hard-slot caller supplies a core-local deadline clock. Checking at
+      # each guest instruction boundary bounds guest compute preemption to
+      # one decoded instruction; host imports and backing I/O need separate
+      # admission and may not run inside a hard slot.
+      if sliceInstructions >= instructionBudget or
+          (deadlineClock != nil and deadlineClock() >= deadlineTick):
+        syncSp()
+        saveFramePc()
+        continuation[].instructions += sliceInstructions.uint64
+        continuation[].status = wesYielded
+        return @[]
+    when resumable and defined(wasmChunkedMemory):
+      continuation[].retryMemoryInstruction = false
     if unlikely(cachedPc >= cachedCodeLen):
       # Implicit return — function body end reached
       let curFrame = vm.callStack[vm.callStackTop - 1]
@@ -1151,8 +1590,12 @@ proc execute*(vm: var WasmVM, funcAddr: int,
         locBase = cast[ptr UncheckedArray[uint64]](vm.locals[0].addr)
       continue
 
+    when resumable:
+      instructionSp = sp
     let instr = cachedCode[cachedPc]
     inc cachedPc
+    when resumable:
+      inc sliceInstructions
 
     when defined(wasmTrace):
       block traceBlock:
@@ -1244,8 +1687,8 @@ proc execute*(vm: var WasmVM, funcAddr: int,
       discard
 
     of opBlock:
-      let resultArity = vm.blockResultArity(instr.pad, cachedModIdx)
-      let paramArity = vm.blockParamArity(instr.pad, cachedModIdx)
+      let resultArity = vm.blockResultArity(instr.pad, cachedModIdx, cachedPc-1)
+      let paramArity = vm.blockParamArity(instr.pad, cachedModIdx, cachedPc-1)
       # imm1 = index of matching end instruction
       let endIdx = instr.imm1.int
       let sh = sp - paramArity
@@ -1258,7 +1701,7 @@ proc execute*(vm: var WasmVM, funcAddr: int,
       ))
 
     of opLoop:
-      let paramArity = vm.blockParamArity(instr.pad, cachedModIdx)
+      let paramArity = vm.blockParamArity(instr.pad, cachedModIdx, cachedPc-1)
       let loopStart = cachedPc  # already advanced past the loop instruction
       let sh = sp - paramArity
       vm.pushLabel(Label(
@@ -1271,8 +1714,8 @@ proc execute*(vm: var WasmVM, funcAddr: int,
 
     of opIf:
       let cond = spopI32()
-      let resultArity = vm.blockResultArity(instr.pad, cachedModIdx)
-      let paramArity = vm.blockParamArity(instr.pad, cachedModIdx)
+      let resultArity = vm.blockResultArity(instr.pad, cachedModIdx, cachedPc-1)
+      let paramArity = vm.blockParamArity(instr.pad, cachedModIdx, cachedPc-1)
       let endIdx = instr.imm1.int
       let elseIdx = instr.imm2.int
       let sh = sp - paramArity
@@ -1320,14 +1763,12 @@ proc execute*(vm: var WasmVM, funcAddr: int,
           vsBase[sp] = retVal
           inc sp
         else:
-          var rets: array[128, uint64]
-          for ri in countdown(arity - 1, 0):
-            dec sp
-            rets[ri] = vsBase[sp]
-          sp = vm.labelStack[curFrame.labelStackStart].stackHeight
-          for ri in 0 ..< arity:
-            vsBase[sp] = rets[ri]
-            inc sp
+          let target = vm.labelStack[curFrame.labelStackStart].stackHeight
+          let source = sp - arity
+          if source < 0 or target < 0 or target > source:
+            trap("invalid return stack height")
+          moveMem(addr vsBase[target], addr vsBase[source], arity * sizeof(uint64))
+          sp = target + arity
 
         if vm.callStackTop > entryCallStackTop:
           loadFrameCache()
@@ -1416,14 +1857,11 @@ proc execute*(vm: var WasmVM, funcAddr: int,
       elif arity == 0:
         sp = labelSh
       else:
-        var results: array[128, uint64]
-        for i in countdown(arity - 1, 0):
-          dec sp
-          results[i] = vsBase[sp]
-        sp = labelSh
-        for i in 0 ..< arity:
-          vsBase[sp] = results[i]
-          inc sp
+        let source = sp - arity
+        if source < 0 or labelSh < 0 or labelSh > source:
+          trap("invalid return stack height")
+        moveMem(addr vsBase[labelSh], addr vsBase[source], arity * sizeof(uint64))
+        sp = labelSh + arity
       vm.localsTop = curFrame.localsStart
       vm.labelStackTop = curFrame.labelStackStart
       dec vm.callStackTop
@@ -1503,7 +1941,7 @@ proc execute*(vm: var WasmVM, funcAddr: int,
           hostArgs[i] = rawToWasmValue(spop(), callee.funcType.params[i])
         syncSp()
         let hostResults = callee.hostFunc(hostArgs)
-        sp = vm.valueStackTop
+        refreshAfterHost()
         for r in hostResults:
           spush(wasmValueToRaw(r))
       else:
@@ -1585,9 +2023,9 @@ proc execute*(vm: var WasmVM, funcAddr: int,
       # --- 2-way associative inline cache ---
       # Key encodes the call site uniquely: upper 32 bits = funcAddr,
       # lower 32 bits = PC of this call_indirect instruction.
-      # 512-slot 2-way: hash selects the slot; both entries are checked in order.
+      # Power-of-two 2-way cache; both entries are checked in order.
       let icKey  = (cachedFuncAddr.uint64 shl 32) or (cachedPc - 1).uint32.uint64
-      let icSlot = (icKey and 511'u64).int
+      let icSlot = (icKey and (vm.callIcBuf.len.uint64 - 1'u64)).int
       var calleeAddr: int
       var skipTypeCheck = false
       block icCheck:
@@ -1644,7 +2082,7 @@ proc execute*(vm: var WasmVM, funcAddr: int,
           hostArgs[i] = rawToWasmValue(spop(), callee.funcType.params[i])
         syncSp()
         let hostResults = callee.hostFunc(hostArgs)
-        sp = vm.valueStackTop
+        refreshAfterHost()
         for r in hostResults:
           spush(wasmValueToRaw(r))
       else:
@@ -1897,50 +2335,12 @@ proc execute*(vm: var WasmVM, funcAddr: int,
       storeVal[uint32](vm.getMem(cachedModIdx), ea, uint32(val and 0xFFFFFFFF))
 
     of opMemorySize:
-      let mem = vm.getMem(cachedModIdx)
-      when defined(wasmGuardPages):
-        if mem.useGuard:
-          spushI32(int32(mem.guardMem.accessibleBytes div WasmPageSize.uint64))
-        else:
-          spushI32(int32(mem.data.len div WasmPageSize))
-      else:
-        spushI32(int32(mem.data.len div WasmPageSize))
+      spushI32(vm.getMem(cachedModIdx).pageCount())
 
     of opMemoryGrow:
       let delta = spopI32()
       let memAddr = vm.store.modules[cachedModIdx].memAddrs[0]
-      when defined(wasmGuardPages):
-        if vm.store.mems[memAddr].useGuard:
-          let oldPages = int(vm.store.mems[memAddr].guardMem.accessibleBytes div WasmPageSize.uint64)
-          let newPages = oldPages + delta.int
-          if delta < 0 or not growGuardedMem(vm.store.mems[memAddr].guardMem, newPages):
-            spushI32(-1)
-          else:
-            spushI32(int32(oldPages))
-        else:
-          let oldPages = vm.store.mems[memAddr].data.len div WasmPageSize
-          let newPages = oldPages + delta.int
-          let maxPages = if vm.store.mems[memAddr].memType.limits.hasMax:
-                           vm.store.mems[memAddr].memType.limits.max.int
-                         else:
-                           MaxPages
-          if delta < 0 or newPages > maxPages or newPages > MaxPages:
-            spushI32(-1)
-          else:
-            vm.store.mems[memAddr].data.setLen(newPages * WasmPageSize)
-            spushI32(int32(oldPages))
-      else:
-        let oldPages = vm.store.mems[memAddr].data.len div WasmPageSize
-        let newPages = oldPages + delta.int
-        let maxPages = if vm.store.mems[memAddr].memType.limits.hasMax:
-                         vm.store.mems[memAddr].memType.limits.max.int
-                       else:
-                         MaxPages
-        if delta < 0 or newPages > maxPages or newPages > MaxPages:
-          spushI32(-1)
-        else:
-          vm.store.mems[memAddr].data.setLen(newPages * WasmPageSize)
-          spushI32(int32(oldPages))
+      spushI32(vm.store.mems[memAddr].growMemory(delta))
 
     # ===== Constants =====
     of opI32Const:
@@ -2572,9 +2972,19 @@ proc execute*(vm: var WasmVM, funcAddr: int,
       if d.uint64 + n.uint64 > vm.store.mems[memAddr].memByteLen():
         trap("out of bounds memory access")
       if n > 0:
-        copyMem(vm.store.mems[memAddr].memBulkPtr(d.uint64),
-                vm.store.datas[dataAddr].data[s.int].unsafeAddr,
-                n.int)
+        let source = cast[ptr UncheckedArray[byte]](
+          vm.store.datas[dataAddr].data[s.int].unsafeAddr)
+        when resumable and defined(wasmChunkedMemory):
+          if vm.store.mems[memAddr].chunked != nil:
+            let status = vm.store.mems[memAddr].chunked[].writeAtProgress(
+              d.uint64, source, n, continuation[].transferProgress)
+            if status == lmWouldBlock: suspendMemoryFault(memAddr)
+            if status != lmOk: trap("linear memory init failed: " & $status)
+            continuation[].transferProgress = 0
+          else:
+            vm.store.mems[memAddr].writeBulk(d.uint64, source, n)
+        else:
+          vm.store.mems[memAddr].writeBulk(d.uint64, source, n)
 
     of opDataDrop:
       let modIdx = cachedModIdx
@@ -2597,15 +3007,53 @@ proc execute*(vm: var WasmVM, funcAddr: int,
       if d.uint64 + n.uint64 > vm.store.mems[dstMemAddr].memByteLen():
         trap("out of bounds memory access")
       if n > 0:
-        if dstMemAddr == srcMemAddr:
-          # Overlapping: use moveMem
-          moveMem(vm.store.mems[dstMemAddr].memBulkPtr(d.uint64),
-                  vm.store.mems[srcMemAddr].memBulkPtr(s.uint64),
-                  n.int)
+        when resumable and defined(wasmChunkedMemory):
+          if dstMemAddr == srcMemAddr and vm.store.mems[dstMemAddr].chunked != nil:
+            let status = vm.store.mems[dstMemAddr].chunked[].copyWithinProgress(
+              d.uint64, s.uint64, n, continuation[].copyCursor)
+            if status == lmWouldBlock: suspendMemoryFault(dstMemAddr)
+            if status != lmOk: trap("linear memory copy failed: " & $status)
+            continuation[].copyCursor = LinearMemoryCopyCursor()
+          elif vm.store.mems[dstMemAddr].chunked != nil or
+              vm.store.mems[srcMemAddr].chunked != nil:
+            while continuation[].bulkDone < n:
+              let part = min(n - continuation[].bulkDone,
+                             continuation[].bulkScratch.len.uint32)
+              if not continuation[].bulkWriting:
+                if vm.store.mems[srcMemAddr].chunked != nil:
+                  let status = vm.store.mems[srcMemAddr].chunked[].readAtProgress(
+                    s.uint64 + continuation[].bulkDone.uint64,
+                    cast[ptr UncheckedArray[byte]](addr continuation[].bulkScratch[0]),
+                    part, continuation[].bulkPartProgress)
+                  if status == lmWouldBlock: suspendMemoryFault(srcMemAddr)
+                  if status != lmOk: trap("linear memory copy read failed: " & $status)
+                else:
+                  copyMem(addr continuation[].bulkScratch[0],
+                          vm.store.mems[srcMemAddr].memBulkPtr(
+                            s.uint64 + continuation[].bulkDone.uint64), part.int)
+                continuation[].bulkWriting = true
+                continuation[].bulkPartProgress = 0
+              if vm.store.mems[dstMemAddr].chunked != nil:
+                let status = vm.store.mems[dstMemAddr].chunked[].writeAtProgress(
+                  d.uint64 + continuation[].bulkDone.uint64,
+                  cast[ptr UncheckedArray[byte]](addr continuation[].bulkScratch[0]),
+                  part, continuation[].bulkPartProgress)
+                if status == lmWouldBlock: suspendMemoryFault(dstMemAddr)
+                if status != lmOk: trap("linear memory copy write failed: " & $status)
+              else:
+                copyMem(vm.store.mems[dstMemAddr].memBulkPtr(
+                          d.uint64 + continuation[].bulkDone.uint64),
+                        addr continuation[].bulkScratch[0], part.int)
+              continuation[].bulkDone += part
+              continuation[].bulkPartProgress = 0
+              continuation[].bulkWriting = false
+            continuation[].bulkDone = 0
+          else:
+            copyBulk(vm.store.mems[dstMemAddr], vm.store.mems[srcMemAddr],
+                     d.uint64, s.uint64, n, dstMemAddr == srcMemAddr)
         else:
-          copyMem(vm.store.mems[dstMemAddr].memBulkPtr(d.uint64),
-                  vm.store.mems[srcMemAddr].memBulkPtr(s.uint64),
-                  n.int)
+          copyBulk(vm.store.mems[dstMemAddr], vm.store.mems[srcMemAddr],
+                   d.uint64, s.uint64, n, dstMemAddr == srcMemAddr)
 
     of opMemoryFill:
       let modIdx = cachedModIdx
@@ -2617,9 +3065,25 @@ proc execute*(vm: var WasmVM, funcAddr: int,
       if d.uint64 + n.uint64 > vm.store.mems[memAddr].memByteLen():
         trap("out of bounds memory access")
       if n > 0:
-        let dstPtr = vm.store.mems[memAddr].memBulkPtr(d.uint64)
-        for i in 0'u32 ..< n:
-          (cast[ptr byte](cast[uint64](dstPtr) + i.uint64))[] = val
+        when resumable and defined(wasmChunkedMemory):
+          if vm.store.mems[memAddr].chunked != nil:
+            for cell in continuation[].bulkScratch.mitems: cell = val
+            while continuation[].bulkDone < n:
+              let part = min(n - continuation[].bulkDone,
+                             continuation[].bulkScratch.len.uint32)
+              let status = vm.store.mems[memAddr].chunked[].writeAtProgress(
+                d.uint64 + continuation[].bulkDone.uint64,
+                cast[ptr UncheckedArray[byte]](addr continuation[].bulkScratch[0]),
+                part, continuation[].bulkPartProgress)
+              if status == lmWouldBlock: suspendMemoryFault(memAddr)
+              if status != lmOk: trap("linear memory fill failed: " & $status)
+              continuation[].bulkDone += part
+              continuation[].bulkPartProgress = 0
+            continuation[].bulkDone = 0
+          else:
+            vm.store.mems[memAddr].fillBulk(d.uint64, val, n)
+        else:
+          vm.store.mems[memAddr].fillBulk(d.uint64, val, n)
 
     # ===== Table operations =====
     of opTableInit:
@@ -3026,18 +3490,22 @@ proc execute*(vm: var WasmVM, funcAddr: int,
       let calleeAddr = if instr.pad == 1: instr.imm1.int
                         else: vm.store.modules[cachedModIdx].funcAddrs[instr.imm1.int]
       let callee {.cursor.} = vm.store.funcs[calleeAddr]
+      let curFrame = vm.callStack[vm.callStackTop - 1]
+      # The function label marks the boundary between this frame's operands
+      # and those its caller must keep. Copy arguments before resetting sp.
+      let frameStackBase = vm.labelStack[curFrame.labelStackStart].stackHeight
       if callee.isHost:
         let nParams = callee.funcType.params.len
         var hostArgs = newSeq[WasmValue](nParams)
         for i in countdown(nParams - 1, 0):
           hostArgs[i] = rawToWasmValue(spop(), callee.funcType.params[i])
+        sp = frameStackBase
         syncSp()
         let hostResults = callee.hostFunc(hostArgs)
-        sp = vm.valueStackTop
+        refreshAfterHost()
         for r in hostResults:
           spush(wasmValueToRaw(r))
         # Treat as return
-        let curFrame = vm.callStack[vm.callStackTop - 1]
         vm.localsTop = curFrame.localsStart
         vm.labelStackTop = curFrame.labelStackStart
         dec vm.callStackTop
@@ -3052,7 +3520,6 @@ proc execute*(vm: var WasmVM, funcAddr: int,
         let paramCount = callee.funcType.params.len
         let returnArity = callee.funcType.results.len
         let calleeModIdx = callee.moduleIdx
-        let curFrame = vm.callStack[vm.callStackTop - 1]
         let localsStart = curFrame.localsStart
         let newTotalLocals = callee.localTypes.len
         let needed = localsStart + newTotalLocals
@@ -3063,6 +3530,7 @@ proc execute*(vm: var WasmVM, funcAddr: int,
         sp -= paramCount
         for i in 0 ..< paramCount:
           locBase[localsStart + i] = vsBase[sp + i]
+        sp = frameStackBase
         for i in paramCount ..< newTotalLocals:
           locBase[localsStart + i] = 0'u64
         vm.localsTop = needed
@@ -3112,17 +3580,19 @@ proc execute*(vm: var WasmVM, funcAddr: int,
          callee.funcType.results.len != expectedType.results.len:
         trap("indirect call type mismatch")
       # Tail call reusing current frame
+      let curFrame = vm.callStack[vm.callStackTop - 1]
+      let frameStackBase = vm.labelStack[curFrame.labelStackStart].stackHeight
       if callee.isHost:
         let nParams = callee.funcType.params.len
         var hostArgs = newSeq[WasmValue](nParams)
         for i in countdown(nParams - 1, 0):
           hostArgs[i] = rawToWasmValue(spop(), callee.funcType.params[i])
+        sp = frameStackBase
         syncSp()
         let hostResults = callee.hostFunc(hostArgs)
-        sp = vm.valueStackTop
+        refreshAfterHost()
         for r in hostResults:
           spush(wasmValueToRaw(r))
-        let curFrame = vm.callStack[vm.callStackTop - 1]
         vm.localsTop = curFrame.localsStart
         vm.labelStackTop = curFrame.labelStackStart
         dec vm.callStackTop
@@ -3136,7 +3606,6 @@ proc execute*(vm: var WasmVM, funcAddr: int,
         let paramCount = callee.funcType.params.len
         let returnArity = callee.funcType.results.len
         let calleeModIdx = callee.moduleIdx
-        let curFrame = vm.callStack[vm.callStackTop - 1]
         let localsStart = curFrame.localsStart
         let newTotalLocals = callee.localTypes.len
         let needed = localsStart + newTotalLocals
@@ -3146,6 +3615,7 @@ proc execute*(vm: var WasmVM, funcAddr: int,
         sp -= paramCount
         for i in 0 ..< paramCount:
           locBase[localsStart + i] = vsBase[sp + i]
+        sp = frameStackBase
         for i in paramCount ..< newTotalLocals:
           locBase[localsStart + i] = 0'u64
         vm.localsTop = needed
@@ -3183,11 +3653,11 @@ proc execute*(vm: var WasmVM, funcAddr: int,
       let tagAddr = vm.store.modules[cachedModIdx].tagAddrs[tagIdx]
       let tagFt = vm.store.tags[tagAddr].funcType
       let payloadLen = tagFt.params.len
-      # Pop payload values off the value stack (TOS = last param)
-      var payload: array[128, uint64]
-      for i in countdown(payloadLen - 1, 0):
-        dec sp
-        payload[i] = vsBase[sp]
+      # Keep payload values in the value-stack arena during unwinding. This
+      # avoids a fixed native-stack buffer and supports arbitrary validated
+      # tag arity.
+      let payloadStart = sp - payloadLen
+      if payloadStart < 0: trap("invalid exception payload stack height")
       # Scan label stack top-to-bottom for a matching try_table catch clause.
       # Keep track of which call frame each label segment belongs to,
       # so we can unwind the call stack when we cross a frame boundary.
@@ -3223,29 +3693,30 @@ proc execute*(vm: var WasmVM, funcAddr: int,
                 # Restore cached frame state
                 loadFrameCache()
                 locBase = cast[ptr UncheckedArray[uint64]](vm.locals[0].addr)
-                # Determine the branch target label (labelDepth relative to the try_table label)
-                let targetLabelIdx = scanLabelIdx - clause.labelDepth.int
+                # Catch depths exclude the try_table's own label.
+                let outerCount = scanLabelIdx - vm.callStack[frameIdx].labelStackStart
+                if outerCount <= 0 or uint64(clause.labelDepth) >= uint64(outerCount):
+                  trap("catch target outside current function")
+                let targetLabelIdx = scanLabelIdx - 1 - clause.labelDepth.int
                 let targetLbl = vm.labelStack[targetLabelIdx]
-                # Restore value stack to target label's stack height
-                sp = targetLbl.stackHeight
+                let target = targetLbl.stackHeight
+                if target < 0 or target > payloadStart:
+                  trap("invalid catch stack height")
+                let needsRef = clause.kind in {ckCatchRef, ckCatchAllRef}
+                let keptPayload = clause.kind in {ckCatch, ckCatchRef}
+                let newTop = target + (if keptPayload: payloadLen else: 0) +
+                  int(needsRef)
+                if newTop > vm.valueStack.len:
+                  vm.valueStack.setLen(max(newTop, vm.valueStack.len * 2))
                 vsBase = cast[ptr UncheckedArray[uint64]](vm.valueStack[0].addr)
-                # Push payload for ckCatch / ckCatchRef
-                case clause.kind
-                of ckCatch:
-                  for i in 0 ..< payloadLen:
-                    vsBase[sp] = payload[i]; inc sp
-                of ckCatchRef:
-                  for i in 0 ..< payloadLen:
-                    vsBase[sp] = payload[i]; inc sp
-                  # push a null exnref placeholder (i32 -1)
+                if keptPayload and payloadLen > 0:
+                  moveMem(addr vsBase[target], addr vsBase[payloadStart],
+                          payloadLen * sizeof(uint64))
+                sp = target + (if keptPayload: payloadLen else: 0)
+                if needsRef:
                   vsBase[sp] = cast[uint64](-1'i64); inc sp
-                of ckCatchAll:
-                  discard  # no payload
-                of ckCatchAllRef:
-                  # push a null exnref placeholder
-                  vsBase[sp] = cast[uint64](-1'i64); inc sp
-                # Pop labels to the target label (branch: non-loop = pop)
-                vm.labelStackTop = targetLabelIdx
+                # Branching to a loop retains its label for the next iteration.
+                vm.labelStackTop = targetLabelIdx + int(targetLbl.isLoop)
                 # Jump to the target label's continuation pc
                 cachedPc = targetLbl.pc
                 caught = true
@@ -3261,8 +3732,8 @@ proc execute*(vm: var WasmVM, funcAddr: int,
       trap("throw_ref: exnref propagation not supported in interpreter")
 
     of opTryTable:
-      let resultArity = vm.blockResultArity(instr.pad, cachedModIdx)
-      let paramArity = vm.blockParamArity(instr.pad, cachedModIdx)
+      let resultArity = vm.blockResultArity(instr.pad, cachedModIdx, cachedPc-1)
+      let paramArity = vm.blockParamArity(instr.pad, cachedModIdx, cachedPc-1)
       let endIdx = instr.imm1.int
       let sh = sp - paramArity
       if vm.labelStackTop >= vm.labelStack.len:
@@ -3302,6 +3773,9 @@ proc execute*(vm: var WasmVM, funcAddr: int,
 
   # Sync cached sp back before collecting results
   syncSp()
+  when resumable:
+    continuation[].instructions += sliceInstructions.uint64
+    continuation[].status = wesComplete
 
   # Collect results (convert uint64 -> WasmValue based on result types)
   let returnArity = ft.results.len
@@ -3314,6 +3788,728 @@ proc execute*(vm: var WasmVM, funcAddr: int,
   vm.callStackTop = entryCallStackTop
   vm.labelStackTop = entryLabelStackTop
   vm.localsTop = entryLocalsTop
+
+proc execute*(vm: var WasmVM, funcAddr: int,
+              args: openArray[WasmValue],
+              profiler: ptr PgoProfiler = nil,
+              osrOut: ptr OsrTrigger = nil): seq[WasmValue] =
+  ## Run a function to completion, allowing existing synchronous host and
+  ## memory operations. The sliced entry point below uses the same dispatch.
+  let valueTop = vm.valueStackTop
+  let callTop = vm.callStackTop
+  let labelTop = vm.labelStackTop
+  let localsTop = vm.localsTop
+  try:
+    result = executeImpl[false](vm, funcAddr, args, profiler, osrOut, nil, 0, nil, 0)
+  except CatchableError:
+    vm.valueStackTop = valueTop
+    vm.callStackTop = callTop
+    vm.labelStackTop = labelTop
+    vm.localsTop = localsTop
+    raise
+
+proc executeSlice*(vm: var WasmVM, funcAddr: int,
+                   args: openArray[WasmValue],
+                   continuation: var WasmContinuation,
+                   instructionBudget: uint32,
+                   profiler: ptr PgoProfiler = nil,
+                   osrOut: ptr OsrTrigger = nil,
+                   deadlineClock: WasmDeadlineClock = nil,
+                   deadlineTick = 0'u64): seq[WasmValue] =
+  ## Resume on the same core and VM after wesYielded. The returned result seq
+  ## is meaningful only when status becomes wesComplete. This preempts at a
+  ## guest instruction boundary; it does not bound a host import or page I/O.
+  if instructionBudget == 0: trap("zero interpreter instruction budget")
+  executeImpl[true](vm, funcAddr, args, profiler, osrOut,
+                    addr continuation, instructionBudget,
+                    deadlineClock, deadlineTick)
+
+when defined(wasmChunkedMemory):
+  proc serviceExecutionMemoryFault*(vm: var WasmVM,
+                                    continuation: var WasmContinuation): LinearMemoryStatus =
+    ## Run only from a backing-service context outside the guest's slice.
+    ## This may perform synchronous SD or IPC I/O; callers must unblock the
+    ## task only when the missing chunk is resident.
+    if continuation.status != wesMemoryBlocked or
+        continuation.faultMemAddr < 0 or
+        continuation.faultMemAddr >= vm.store.mems.len:
+      return lmInvalidConfig
+    let mem = addr vm.store.mems[continuation.faultMemAddr]
+    if mem[].chunked == nil: return lmInvalidConfig
+    result = mem[].chunked[].servicePendingFault()
+    if result == lmOk:
+      continuation.status = wesYielded
+
+proc abortExecution*(vm: var WasmVM,
+                     continuation: var WasmContinuation) =
+  ## Abandon a yielded or trapped call before reusing the VM. This does not
+  ## undo guest memory side effects from completed instructions.
+  if continuation.status notin {wesRunning, wesYielded, wesMemoryBlocked}: return
+  vm.valueStackTop = continuation.entryValueStackTop
+  vm.callStackTop = continuation.entryCallStackTop
+  vm.labelStackTop = continuation.entryLabelStackTop
+  vm.localsTop = continuation.entryLocalsTop
+  when defined(wasmChunkedMemory):
+    continuation.retryMemoryInstruction = false
+    continuation.transferProgress = 0
+    continuation.copyCursor = LinearMemoryCopyCursor()
+    continuation.bulkDone = 0
+    continuation.bulkPartProgress = 0
+    continuation.bulkWriting = false
+  continuation.status = wesReady
+
+# ---------------------------------------------------------------------------
+# Portable guest-only suspension state
+# ---------------------------------------------------------------------------
+
+const
+  WasmPortableMagic = 0x5356_4D57'u32
+  WasmPortableStackVersion = 1'u32
+  WasmPortableStoreVersion = 2'u32
+  WasmPortableWideStoreVersion = 3'u32
+  WasmPortableHeaderBytes* = 64
+  WasmPortableMaxBytes* = 4096
+  WasmPortableLegacyStoreMaxBytes = high(uint16).int
+  WasmPortableStagedMaxBytes* = 64 * 1024 * 1024
+  WasmPortableFrameBytes = 28
+  WasmPortableLabelBytes = 20
+
+when defined(wasmStreamMigration):
+  const
+    WasmPortableStreamVersion = 4'u32
+    WasmPortableStreamFooterBytes* = 8
+
+when defined(wasmStorageMigration):
+  type
+    WasmPortableIo* = proc(ctx: pointer, offset: int, buf: pointer,
+                           count: int): bool {.nimcall.}
+    WasmPortableStorage* = object
+      ## Exclusive medium, accessed only from normal scheduler context.
+      ctx*: pointer
+      read*, write*: WasmPortableIo
+      seal*: proc(ctx: pointer): bool {.nimcall.}
+
+type
+  WasmPortableStatus* = enum
+    wpsOk
+    wpsNotSuspended
+    wpsUnsupportedState
+    wpsTooLarge
+    wpsInvalidSnapshot
+    wpsWrongModule
+    wpsPending
+    wpsBackingFailed
+
+  WasmPortableSnapshot* = object
+    status*: WasmPortableStatus
+    bytes*: seq[byte]
+    staged*: WasmPortableStaging
+
+  WasmPortableStaging* = object
+    ## Caller-owned storage. A completed snapshot reports the populated
+    ## length instead of the original capacity.
+    data*: ptr UncheckedArray[byte]
+    len*: int
+    when defined(wasmStorageMigration):
+      storage*: ptr WasmPortableStorage
+
+  WasmPortableIoError = object of CatchableError
+
+proc usesPortableBacking*(view: WasmPortableStaging): bool {.inline.} =
+  when defined(wasmStorageMigration): view.storage != nil
+  else: false
+
+proc hasPortableStaging*(view: WasmPortableStaging): bool {.inline.} =
+  view.data != nil or view.usesPortableBacking()
+
+proc validPortableStaging*(view: WasmPortableStaging): bool =
+  if view.len notin WasmPortableHeaderBytes..WasmPortableStagedMaxBytes:
+    return false
+  when defined(wasmStorageMigration):
+    if view.usesPortableBacking():
+      return view.data == nil and view.storage.read != nil and
+        view.storage.write != nil and view.storage.seal != nil
+  view.data != nil and view.len.uint - 1 <= high(uint) - cast[uint](view.data)
+
+proc portableInputView*(data: openArray[byte]): WasmPortableStaging {.inline.} =
+  result.len = data.len
+  if data.len != 0: result.data = cast[ptr UncheckedArray[byte]](unsafeAddr data[0])
+
+proc portableLen(snapshot: WasmPortableSnapshot): int {.inline.} =
+  if snapshot.staged.hasPortableStaging(): snapshot.staged.len else: snapshot.bytes.len
+
+proc portableView(snapshot: WasmPortableSnapshot): WasmPortableStaging {.inline.} =
+  if snapshot.staged.hasPortableStaging(): snapshot.staged
+  else: portableInputView(snapshot.bytes)
+
+proc portableIo(view: WasmPortableStaging, at: int, buf: pointer, count: int,
+                writing: static bool): bool =
+  if at < 0 or at > view.len or count < 0 or count > view.len - at: return false
+  if count == 0: return true
+  if buf == nil: return false
+  when defined(wasmStorageMigration):
+    if view.usesPortableBacking():
+      let operation = if writing: view.storage.write else: view.storage.read
+      return operation != nil and operation(view.storage.ctx, at, buf, count)
+  if view.data == nil: return false
+  when writing: copyMem(addr view.data[at], buf, count)
+  else: copyMem(buf, addr view.data[at], count)
+  true
+
+proc readPortableRange*(view: WasmPortableStaging, at: int, buf: pointer,
+                        count: int): bool {.inline.} =
+  view.portableIo(at, buf, count, false)
+
+proc writePortableRange*(view: WasmPortableStaging, at: int, buf: pointer,
+                         count: int): bool {.inline.} =
+  view.portableIo(at, buf, count, true)
+
+proc sealPortableStaging*(view: WasmPortableStaging): bool =
+  when defined(wasmStorageMigration):
+    if view.usesPortableBacking():
+      return view.storage.seal != nil and view.storage.seal(view.storage.ctx)
+  true
+
+proc requirePortableIo(ok: bool) {.inline.} =
+  if not ok: raise newException(WasmPortableIoError, "snapshot storage I/O failed")
+
+proc portableRead[T: uint8 | uint16 | uint32 | uint64](
+    view: WasmPortableStaging, at: int): T {.inline.} =
+  when defined(wasmStorageMigration):
+    if view.usesPortableBacking():
+      var buf: array[sizeof(T), byte]
+      requirePortableIo(view.readPortableRange(at, addr buf[0], buf.len))
+      for i in 0 ..< buf.len: result = result or (buf[i].T shl (8 * i))
+      return
+  for i in 0 ..< sizeof(T): result = result or (view.data[at + i].T shl (8 * i))
+
+proc portableWrite[T: uint8 | uint16 | uint32 | uint64](
+    view: WasmPortableStaging, at: int, value: T) {.inline.} =
+  when defined(wasmStorageMigration):
+    if view.usesPortableBacking():
+      var buf: array[sizeof(T), byte]
+      for i in 0 ..< buf.len: buf[i] = byte(value shr (8 * i))
+      requirePortableIo(view.writePortableRange(at, addr buf[0], buf.len))
+      return
+  for i in 0 ..< sizeof(T): view.data[at + i] = byte(value shr (8 * i))
+
+template portableRead16(data: WasmPortableStaging, at: int): uint16 =
+  portableRead[uint16](data, at)
+template portableRead32(data: WasmPortableStaging, at: int): uint32 =
+  portableRead[uint32](data, at)
+template portableRead64(data: WasmPortableStaging, at: int): uint64 =
+  portableRead[uint64](data, at)
+
+proc updatePortableChecksum(crc: var uint32, data: openArray[byte], position: int) =
+  for i, b in data:
+    if position + i in 60 .. 63: continue
+    crc = crc xor b.uint32
+    for _ in 0 ..< 8:
+      crc = (crc shr 1) xor
+        (if (crc and 1) != 0: 0xEDB8_8320'u32 else: 0'u32)
+
+when defined(wasmStorageMigration):
+  const PortableTransferBytes = 512
+
+  proc portableBackingChecksum(view: WasmPortableStaging): uint32 =
+    var crc = not 0'u32
+    var buf: array[PortableTransferBytes, byte]
+    var pos = 0
+    while pos < view.len:
+      let count = min(buf.len, view.len - pos)
+      requirePortableIo(view.readPortableRange(pos, addr buf[0], count))
+      crc.updatePortableChecksum(buf.toOpenArray(0, count - 1), pos)
+      pos += count
+    not crc
+
+proc portableChecksum(data: WasmPortableStaging): uint32 =
+  when defined(wasmStorageMigration):
+    if data.usesPortableBacking(): return data.portableBackingChecksum()
+  var crc = not 0'u32
+  crc.updatePortableChecksum(data.data.toOpenArray(0, data.len - 1), 0)
+  not crc
+
+proc portableStoreEligible(vm: WasmVM): bool =
+  ## Each function address belongs to the same standalone core module.
+  ## Host references and exception state require separate transfer contracts.
+  if vm.store.modules.len != 1 or vm.store.funcs.len == 0 or
+      vm.store.mems.len > 1 or vm.store.tags.len != 0:
+    return false
+  for function in vm.store.funcs:
+    if function.isHost or function.moduleIdx != 0 or function.code == nil or
+        vtExternRef in function.funcType.params or vtExternRef in function.funcType.results:
+      return false
+  true
+
+include ./runtime_portable_store
+
+proc portableFrameValid(vm: WasmVM, frame: Frame, localsCount,
+                        labelCount: int): bool =
+  if frame.funcAddr < 0 or frame.funcAddr >= vm.store.funcs.len or
+      frame.moduleIdx != 0 or frame.pc < 0 or frame.localsStart < 0 or
+      frame.localsCount < 0 or frame.labelStackStart < 0 or
+      frame.labelStackStart > labelCount or frame.returnArity < 0 or
+      frame.returnArity > 16:
+    return false
+  let function = vm.store.funcs[frame.funcAddr]
+  if function.isHost or frame.code != function.code or
+      frame.brTables != function.code[].brTables.addr or
+      frame.pc > function.code[].code.len or
+      frame.localsCount != function.localTypes.len or
+      frame.localsStart > localsCount or
+      frame.localsCount > localsCount - frame.localsStart:
+    return false
+  true
+
+proc checkPortablePrefix(vm: WasmVM, continuation: WasmContinuation,
+                         maxBytes: int, size: var int): WasmPortableStatus =
+  if continuation.status != wesYielded:
+    return wpsNotSuspended
+  when defined(wasmChunkedMemory):
+    if continuation.retryMemoryInstruction:
+      return wpsNotSuspended
+  if not vm.portableStoreEligible() or
+      continuation.entryValueStackTop != 0 or
+      continuation.entryCallStackTop != 0 or
+      continuation.entryLabelStackTop != 0 or
+      continuation.entryLocalsTop != 0 or
+      vm.callStackTop <= 0 or vm.callStackTop > vm.callStack.len or
+      vm.valueStackTop < 0 or vm.valueStackTop > vm.valueStack.len or
+      vm.labelStackTop <= 0 or vm.labelStackTop > vm.labelStack.len or
+      vm.localsTop < 0 or vm.localsTop > vm.locals.len or
+      continuation.funcAddr < 0 or
+      continuation.funcAddr >= vm.store.funcs.len or
+      vm.callStack[0].funcAddr != continuation.funcAddr:
+    return wpsUnsupportedState
+  let valueCount = vm.valueStackTop
+  let frameCount = vm.callStackTop
+  let labelCount = vm.labelStackTop
+  let localsCount = vm.localsTop
+  if maxBytes < WasmPortableHeaderBytes or
+      valueCount > uint16.high.int or frameCount > uint16.high.int or
+      labelCount > uint16.high.int or localsCount > uint16.high.int:
+    return wpsTooLarge
+  size = WasmPortableHeaderBytes + valueCount * 8 + frameCount * WasmPortableFrameBytes +
+    labelCount * WasmPortableLabelBytes + localsCount * 8
+  if size > maxBytes: return wpsTooLarge
+  var previousLabelStart = -1
+  for i in 0 ..< frameCount:
+    let frame = vm.callStack[i]
+    if not vm.portableFrameValid(frame, localsCount, labelCount) or
+        frame.labelStackStart < previousLabelStart:
+      return wpsUnsupportedState
+    previousLabelStart = frame.labelStackStart
+  if vm.callStack[0].labelStackStart != 0:
+    return wpsUnsupportedState
+  for label in vm.labelStack.toOpenArray(0, labelCount - 1):
+    if label.arity < 0 or label.arity > 16 or label.pc < 0 or
+        label.stackHeight < 0 or label.stackHeight > valueCount or
+        label.catchTableIdx != -1:
+      return wpsUnsupportedState
+  wpsOk
+
+proc writePortableHeader(data: WasmPortableStaging, at: int, vm: WasmVM,
+    continuation: WasmContinuation, digest: array[32, byte], version: uint32) =
+  portableWrite(data, at, WasmPortableMagic)
+  portableWrite(data, at + 4, version)
+  requirePortableIo(data.writePortableRange(at + 8, unsafeAddr digest[0], digest.len))
+  portableWrite(data, at + 40, continuation.funcAddr.uint32)
+  portableWrite(data, at + 44, continuation.instructions)
+  portableWrite(data, at + 52, vm.valueStackTop.uint16)
+  portableWrite(data, at + 54, vm.callStackTop.uint16)
+  portableWrite(data, at + 56, vm.labelStackTop.uint16)
+  portableWrite(data, at + 58, vm.localsTop.uint16)
+  portableWrite(data, at + 60, 0'u32)
+
+proc writePortableFrame(data: WasmPortableStaging, at: int, frame: Frame) =
+  var pos = at
+  for field in [frame.pc, frame.localsStart, frame.localsCount,
+                frame.labelStackStart, frame.returnArity,
+                frame.moduleIdx, frame.funcAddr]:
+    portableWrite(data, pos, field.uint32)
+    pos += 4
+
+proc writePortableLabel(data: WasmPortableStaging, at: int, label: Label) =
+  var pos = at
+  for field in [label.arity, label.pc, label.stackHeight,
+                int(label.isLoop), label.catchTableIdx.int]:
+    portableWrite(data, pos, cast[uint32](field))
+    pos += 4
+
+proc capturePortablePrefix(vm: WasmVM, continuation: WasmContinuation,
+    moduleDigest: array[32, byte], maxBytes: int,
+    staging: WasmPortableStaging): WasmPortableSnapshot =
+  let staged = staging.hasPortableStaging()
+  let capacity = if staged: staging.len else: WasmPortableMaxBytes
+  if (staged and not staging.validPortableStaging()) or
+      (not staged and staging.len != 0) or maxBytes > capacity:
+    return WasmPortableSnapshot(status: wpsTooLarge)
+  var size: int
+  result.status = vm.checkPortablePrefix(continuation, maxBytes, size)
+  if result.status != wpsOk: return
+  result.staged = staging
+  result.staged.len = 0
+  discard result.appendPortable(size, maxBytes)
+  let data = result.portableView()
+  let hasStore = vm.portableStoreHasState()
+  let version = if not hasStore: WasmPortableStackVersion
+                elif maxBytes > WasmPortableLegacyStoreMaxBytes: WasmPortableWideStoreVersion
+                else: WasmPortableStoreVersion
+  data.writePortableHeader(0, vm, continuation, moduleDigest, version)
+  var at = WasmPortableHeaderBytes
+  for i in 0 ..< vm.valueStackTop:
+    portableWrite(data, at, vm.valueStack[i])
+    at += 8
+  for i in 0 ..< vm.callStackTop:
+    data.writePortableFrame(at, vm.callStack[i])
+    at += WasmPortableFrameBytes
+  for i in 0 ..< vm.labelStackTop:
+    data.writePortableLabel(at, vm.labelStack[i])
+    at += WasmPortableLabelBytes
+  for i in 0 ..< vm.localsTop:
+    portableWrite(data, at, vm.locals[i])
+    at += 8
+  result.status = wpsOk
+
+proc finishPortableCapture(vm: WasmVM, snapshot: var WasmPortableSnapshot,
+    maxBytes: int, cursor: var PortableMemoryCapture, allowAsync: static bool) =
+  if vm.portableStoreHasState():
+    snapshot.status = vm.capturePortableStore(snapshot, maxBytes, cursor, allowAsync)
+    if snapshot.status == wpsPending: return
+    if snapshot.status != wpsOk:
+      snapshot.bytes = @[]
+      snapshot.staged = WasmPortableStaging()
+      return
+  let view = snapshot.portableView()
+  portableWrite(view, 60, portableChecksum(view))
+  requirePortableIo(view.sealPortableStaging())
+  snapshot.status = wpsOk
+
+proc capturePortableSnapshot*(vm: WasmVM, continuation: WasmContinuation,
+    moduleDigest: array[32, byte], maxBytes = WasmPortableMaxBytes,
+    staging = WasmPortableStaging()): WasmPortableSnapshot =
+  ## Capture only after executeSlice yielded at a guest instruction boundary.
+  ## This synchronous entry point leaves asynchronous backing untouched.
+  try:
+    result = vm.capturePortablePrefix(continuation, moduleDigest, maxBytes, staging)
+    if result.status != wpsOk: return
+    var cursor: PortableMemoryCapture
+    vm.finishPortableCapture(result, maxBytes, cursor, false)
+  except WasmPortableIoError:
+    result = WasmPortableSnapshot(status: wpsBackingFailed)
+
+when defined(wasmChunkedMemory):
+  type WasmPortableCapture* = object
+    snapshot: WasmPortableSnapshot
+    memory: PortableMemoryCapture
+    maxBytes: int
+
+  proc `=copy`(dest: var WasmPortableCapture, source: WasmPortableCapture)
+    {.error: "a portable capture with an outstanding page read cannot be copied".}
+
+  proc cancelPortableCapture*(capture: var WasmPortableCapture) =
+    if capture.memory.memory != nil:
+      capture.memory.memory[].cancelLinearSnapshotRead(capture.memory.reader)
+    capture = WasmPortableCapture()
+
+  proc beginPortableCapture*(vm: WasmVM, continuation: WasmContinuation,
+      digest: array[32, byte], capture: var WasmPortableCapture,
+      maxBytes: int, staging = WasmPortableStaging()): WasmPortableStatus =
+    ## Keep the source VM frozen until capture completes or is canceled.
+    ## Finish with takePortableSnapshot or cancelPortableCapture.
+    if capture.maxBytes != 0: return wpsUnsupportedState
+    try:
+      capture.snapshot = vm.capturePortablePrefix(continuation, digest, maxBytes, staging)
+      if capture.snapshot.status != wpsOk: return capture.snapshot.status
+      capture.maxBytes = maxBytes
+      vm.finishPortableCapture(capture.snapshot, maxBytes, capture.memory, true)
+      capture.snapshot.status
+    except WasmPortableIoError:
+      capture.cancelPortableCapture()
+      wpsBackingFailed
+
+  proc pollPortableCapture*(vm: WasmVM, capture: var WasmPortableCapture): WasmPortableStatus =
+    if capture.snapshot.status != wpsPending: return wpsUnsupportedState
+    try:
+      vm.finishPortableCapture(capture.snapshot, capture.maxBytes, capture.memory, true)
+      capture.snapshot.status
+    except WasmPortableIoError:
+      capture.cancelPortableCapture()
+      wpsBackingFailed
+
+  proc takePortableSnapshot*(capture: var WasmPortableCapture): WasmPortableSnapshot =
+    if capture.maxBytes == 0 or capture.snapshot.status != wpsOk:
+      return WasmPortableSnapshot(status: wpsUnsupportedState)
+    result = move capture.snapshot
+    capture.cancelPortableCapture()
+
+proc validatePortableSnapshot(vm: var WasmVM, continuation: WasmContinuation,
+    data: WasmPortableStaging, expectedDigest: array[32, byte],
+    layout: var PortableRestoreLayout, allowPaging: bool): WasmPortableStatus =
+  ## Validate the entire little-endian image before changing the destination.
+  ## Caller verifies the destination module bytes before supplying its digest.
+  if continuation.status != wesReady or vm.callStackTop != 0 or
+      vm.valueStackTop != 0 or vm.labelStackTop != 0 or vm.localsTop != 0 or
+      not vm.portableStoreEligible():
+    return wpsUnsupportedState
+  if not data.validPortableStaging() or
+      portableRead32(data, 0) != WasmPortableMagic:
+    return wpsInvalidSnapshot
+  let hasStore = vm.portableStoreHasState()
+  let version = portableRead32(data, 4)
+  let streamed = when defined(wasmStreamMigration): version == WasmPortableStreamVersion
+                 else: false
+  var body = data
+  var checksumView = data
+  var expectedChecksum = portableRead32(data, 60)
+  var streamedRuns = -1'i64
+  when defined(wasmStreamMigration):
+    if streamed:
+      if data.len < WasmPortableHeaderBytes + WasmPortableStreamFooterBytes or expectedChecksum != 0:
+        return wpsInvalidSnapshot
+      body.len -= WasmPortableStreamFooterBytes
+      checksumView.len -= 4
+      streamedRuns = portableRead32(data, body.len).int64
+      expectedChecksum = portableRead32(data, checksumView.len)
+      if vm.store.mems.len == 0 and streamedRuns != 0: return wpsInvalidSnapshot
+  if not streamed:
+    if hasStore:
+      if version != WasmPortableWideStoreVersion and
+          (version != WasmPortableStoreVersion or data.len > WasmPortableLegacyStoreMaxBytes):
+        return wpsInvalidSnapshot
+    elif version != WasmPortableStackVersion:
+      return wpsInvalidSnapshot
+  layout.bodyBytes = body.len
+  var digest: array[32, byte]
+  requirePortableIo(data.readPortableRange(8, addr digest[0], digest.len))
+  if digest != expectedDigest: return wpsWrongModule
+  let valueCount = portableRead16(data, 52).int
+  let frameCount = portableRead16(data, 54).int
+  let labelCount = portableRead16(data, 56).int
+  let localsCount = portableRead16(data, 58).int
+  let payload = valueCount * 8 + frameCount * WasmPortableFrameBytes +
+    labelCount * WasmPortableLabelBytes + localsCount * 8
+  let storeOffset = WasmPortableHeaderBytes + payload
+  if frameCount == 0 or labelCount == 0 or
+      storeOffset > body.len or (not hasStore and storeOffset != body.len) or
+      expectedChecksum != portableChecksum(checksumView):
+    return wpsInvalidSnapshot
+  let root = portableRead32(data, 40)
+  if root >= vm.store.funcs.len.uint32: return wpsInvalidSnapshot
+  var at = WasmPortableHeaderBytes + valueCount * 8
+  var previousLabelStart = -1
+  for i in 0 ..< frameCount:
+    let pc = portableRead32(data, at)
+    let localsStart = portableRead32(data, at + 4)
+    let count = portableRead32(data, at + 8)
+    let labelStart = portableRead32(data, at + 12)
+    let returnArity = portableRead32(data, at + 16)
+    let moduleIdx = portableRead32(data, at + 20)
+    let funcAddr = portableRead32(data, at + 24)
+    if moduleIdx != 0 or funcAddr >= vm.store.funcs.len.uint32 or
+        (i == 0 and funcAddr != root): return wpsInvalidSnapshot
+    let function = vm.store.funcs[funcAddr.int]
+    if function.isHost or pc > function.code[].code.len.uint32 or
+        count != function.localTypes.len.uint32 or
+        localsStart > localsCount.uint32 or
+        count > localsCount.uint32 - localsStart or
+        labelStart > labelCount.uint32 or
+        labelStart.int < previousLabelStart or returnArity > 16:
+      return wpsInvalidSnapshot
+    if i == 0 and labelStart != 0: return wpsInvalidSnapshot
+    previousLabelStart = labelStart.int
+    at += WasmPortableFrameBytes
+  var owner = 0
+  let frameBase = WasmPortableHeaderBytes + valueCount * 8
+  for i in 0 ..< labelCount:
+    while owner + 1 < frameCount and
+        portableRead32(data, frameBase + (owner + 1) *
+          WasmPortableFrameBytes + 12).int <= i:
+      inc owner
+    let arity = portableRead32(data, at)
+    let pc = portableRead32(data, at + 4)
+    let stackHeight = portableRead32(data, at + 8)
+    let loopFlag = portableRead32(data, at + 12)
+    let catchIdx = portableRead32(data, at + 16)
+    let funcAddr = portableRead32(data, frameBase + owner *
+      WasmPortableFrameBytes + 24).int
+    if arity > 16 or pc > vm.store.funcs[funcAddr].code[].code.len.uint32 + 1 or
+        stackHeight > valueCount.uint32 or loopFlag > 1 or
+        catchIdx != high(uint32):
+      return wpsInvalidSnapshot
+    at += WasmPortableLabelBytes
+  if hasStore:
+    if not vm.validatePortableStore(body, storeOffset, layout, allowPaging,
+        streamed or version == WasmPortableWideStoreVersion, streamedRuns):
+      return wpsInvalidSnapshot
+  wpsOk
+
+proc restorePortableFrames(vm: var WasmVM, continuation: var WasmContinuation,
+                            data: WasmPortableStaging) =
+  let valueCount = portableRead16(data, 52).int
+  let frameCount = portableRead16(data, 54).int
+  let labelCount = portableRead16(data, 56).int
+  let localsCount = portableRead16(data, 58).int
+  if vm.valueStack.len < valueCount: vm.valueStack.setLen(valueCount)
+  if vm.callStack.len < frameCount: vm.callStack.setLen(frameCount)
+  if vm.labelStack.len < labelCount: vm.labelStack.setLen(labelCount)
+  if vm.locals.len < localsCount: vm.locals.setLen(localsCount)
+  var at = WasmPortableHeaderBytes
+  for i in 0 ..< valueCount:
+    vm.valueStack[i] = portableRead64(data, at)
+    at += 8
+  for i in 0 ..< frameCount:
+    let funcAddr = portableRead32(data, at + 24).int
+    let function = vm.store.funcs[funcAddr]
+    vm.callStack[i] = Frame(
+      pc: portableRead32(data, at).int,
+      code: function.code,
+      brTables: function.code[].brTables.addr,
+      localsStart: portableRead32(data, at + 4).int,
+      localsCount: portableRead32(data, at + 8).int,
+      labelStackStart: portableRead32(data, at + 12).int,
+      returnArity: portableRead32(data, at + 16).int,
+      moduleIdx: 0, funcAddr: funcAddr)
+    at += WasmPortableFrameBytes
+  for i in 0 ..< labelCount:
+    vm.labelStack[i] = Label(
+      arity: portableRead32(data, at).int,
+      pc: portableRead32(data, at + 4).int,
+      stackHeight: portableRead32(data, at + 8).int,
+      isLoop: portableRead32(data, at + 12) != 0,
+      catchTableIdx: -1)
+    at += WasmPortableLabelBytes
+  for i in 0 ..< localsCount:
+    vm.locals[i] = portableRead64(data, at)
+    at += 8
+  vm.valueStackTop = valueCount
+  vm.callStackTop = frameCount
+  vm.labelStackTop = labelCount
+  vm.localsTop = localsCount
+  continuation = WasmContinuation(status: wesYielded,
+    instructions: portableRead64(data, 44), funcAddr: portableRead32(data, 40).int,
+    entryValueStackTop: 0, entryCallStackTop: 0,
+    entryLabelStackTop: 0, entryLocalsTop: 0)
+
+proc restorePortableSnapshot*(vm: var WasmVM, continuation: var WasmContinuation,
+    data: WasmPortableStaging, expectedDigest: array[32, byte]): WasmPortableStatus =
+  ## Synchronous restore requires all incoming bytes to fit the resident frames.
+  ## A read failure during replay invalidates the dormant VM.
+  try:
+    var layout: PortableRestoreLayout
+    result = vm.validatePortableSnapshot(continuation, data, expectedDigest, layout, false)
+    if result != wpsOk: return
+    if layout.tailOffset != 0 and not vm.applyPortableStore(data, layout):
+      return wpsInvalidSnapshot
+    vm.restorePortableFrames(continuation, data)
+  except WasmPortableIoError:
+    result = wpsBackingFailed
+
+proc restorePortableSnapshot*(vm: var WasmVM, continuation: var WasmContinuation,
+    data: openArray[byte], expectedDigest: array[32, byte]): WasmPortableStatus =
+  vm.restorePortableSnapshot(continuation, portableInputView(data), expectedDigest)
+
+when defined(wasmChunkedMemory):
+  type WasmPortableRestore* = object
+    layout: PortableRestoreLayout
+    pos, remaining: int
+    progress: uint32
+
+  proc beginPortableRestore*(vm: var WasmVM, continuation: var WasmContinuation,
+      data: WasmPortableStaging, expectedDigest: array[32, byte],
+      pending: var WasmPortableRestore): WasmPortableStatus =
+    ## A cold restore validates before any writes. Keep the destination
+    ## dormant and the input immutable until polling finishes or it is canceled.
+    if pending.layout.cold: return wpsUnsupportedState
+    try:
+      var layout: PortableRestoreLayout
+      result = vm.validatePortableSnapshot(continuation, data, expectedDigest, layout, true)
+      if result != wpsOk: return
+      if layout.cold:
+        continuation.instructions = portableRead64(data, 44)
+        continuation.funcAddr = portableRead32(data, 40).int
+        pending.layout = layout
+        return wpsPending
+      if layout.tailOffset != 0 and not vm.applyPortableStore(data, layout):
+        return wpsInvalidSnapshot
+      vm.restorePortableFrames(continuation, data)
+    except WasmPortableIoError:
+      result = wpsBackingFailed
+
+  proc beginPortableRestore*(vm: var WasmVM, continuation: var WasmContinuation,
+      data: openArray[byte], expectedDigest: array[32, byte],
+      pending: var WasmPortableRestore): WasmPortableStatus =
+    vm.beginPortableRestore(continuation, portableInputView(data), expectedDigest, pending)
+
+  when defined(wasmStorageMigration):
+    proc restorePortableBackingRun(mem: var LinearMemory, data: WasmPortableStaging,
+        pos: int, offset: uint64, count: uint32, progress: var uint32): LinearMemoryStatus =
+      var buf: array[PortableTransferBytes, byte]
+      while progress < count:
+        let at = offset + progress.uint64
+        # A backed segment never spans two destination frames. If it blocks,
+        # writeAt has consumed none of the borrowed scratch bytes.
+        let frameBytes = WasmMemoryChunkBytes - (at mod WasmMemoryChunkBytes).uint32
+        let size = min(min(buf.len.uint32, frameBytes), count - progress)
+        requirePortableIo(data.readPortableRange(pos + progress.int, addr buf[0], size.int))
+        let status = mem.writeAt(at, cast[ptr UncheckedArray[byte]](addr buf[0]), size)
+        if status != lmOk: return status
+        progress += size
+      lmOk
+
+  proc pollPortableRestoreImpl(vm: var WasmVM, continuation: var WasmContinuation,
+      data: WasmPortableStaging, pending: var WasmPortableRestore): WasmPortableStatus =
+    if not pending.layout.cold: return wpsUnsupportedState
+    let mem = addr vm.store.mems[0]
+    if pending.pos == 0:
+      if not mem[].resetPortableMemory(pending.layout): return wpsInvalidSnapshot
+      pending.pos = pending.layout.memoryOffset
+      pending.remaining = pending.layout.runs
+    if mem.chunked[].pendingFault().pending:
+      let status = mem.chunked[].servicePendingFault()
+      if status == lmWouldBlock: return wpsPending
+      if status != lmOk: return wpsBackingFailed
+    while pending.remaining > 0:
+      let pos = pending.pos
+      let offset = portableRead32(data, pos).uint64
+      let count = portableRead16(data, pos + 4).uint32
+      let status = if data.usesPortableBacking():
+        when defined(wasmStorageMigration):
+          mem.chunked[].restorePortableBackingRun(data, pos + 6, offset, count, pending.progress)
+        else: lmInvalidConfig
+      else:
+        let src = cast[ptr UncheckedArray[byte]](addr data.data[pos + 6])
+        mem.chunked[].writeAtProgress(offset, src, count, pending.progress)
+      if status == lmWouldBlock: return wpsPending
+      if status != lmOk: return wpsBackingFailed
+      pending.pos += 6 + count.int
+      dec pending.remaining
+      pending.progress = 0
+    if not vm.restorePortableStoreTail(data.portableBody(pending.layout), pending.layout.tailOffset, true):
+      return wpsInvalidSnapshot
+    vm.restorePortableFrames(continuation, data)
+    pending = WasmPortableRestore()
+    wpsOk
+
+  proc pollPortableRestore*(vm: var WasmVM, continuation: var WasmContinuation,
+      data: WasmPortableStaging, pending: var WasmPortableRestore): WasmPortableStatus =
+    try:
+      vm.pollPortableRestoreImpl(continuation, data, pending)
+    except WasmPortableIoError:
+      wpsBackingFailed
+
+  proc pollPortableRestore*(vm: var WasmVM, continuation: var WasmContinuation,
+      data: openArray[byte], pending: var WasmPortableRestore): WasmPortableStatus =
+    vm.pollPortableRestore(continuation, portableInputView(data), pending)
+
+  proc cancelPortableRestore*(vm: var WasmVM, pending: var WasmPortableRestore) =
+    ## A canceled destination is discarded by the caller.
+    if pending.pos != 0:
+      vm.store.mems[0].chunked[].cancelLinearRestore()
+    pending = WasmPortableRestore()
+
+when defined(wasmStreamMigration):
+  include ./runtime_portable_stream
 
 # ---------------------------------------------------------------------------
 # Helper procs for external use
@@ -3353,6 +4549,9 @@ proc destroyWasmVM*(vm: var WasmVM) =
 
 proc memCurrentPages*(mem: var MemInst): int {.inline.} =
   ## Current number of allocated WASM pages.
+  when defined(wasmChunkedMemory):
+    if mem.chunked != nil:
+      return mem.chunked[].currentPages().int
   when defined(wasmGuardPages):
     if mem.useGuard:
       return int(mem.guardMem.accessibleBytes div WasmPageSize.uint64)

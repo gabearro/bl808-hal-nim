@@ -27,9 +27,12 @@ for incomingIrq in [false, true]:
         doAssert message == before, "ADDBA negotiation rewrote its request"
         let body = addBaRspActionBodyAt(addr link.macHeader[24])
         let expectedWindow = if requested == 0: 12'u16 else: min(requested, 12'u16)
-        doAssert body.statusCode == 0 and body.timeout == 0 and body.dialogToken == 0xEF
-        doAssert (body.baParams shr 6) in 1'u16 .. 12'u16,
-          "successful ADDBA response advertised a zero receive window"
+        let supported = (lowerBits and 2'u16) != 0
+        doAssert body.statusCode == (if supported: 0'u16 else: 37'u16)
+        doAssert body.timeout == 0 and body.dialogToken == 0xEF
+        if supported:
+          doAssert (body.baParams shr 6) in 1'u16 .. 12'u16,
+            "successful ADDBA response advertised a zero receive window"
         doAssert body.baParams == ((expectedWindow shl 6) or (params and 0x3E) or 2)
-        doAssert mmio == 0xABCD0090'u32
+        doAssert mmio == (if supported: 0xABCD0090'u32 else: 0xABCD0010'u32)
 ''')

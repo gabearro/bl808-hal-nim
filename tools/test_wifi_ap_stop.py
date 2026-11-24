@@ -19,7 +19,7 @@ proc expectStopped(vif: uint8; otherMask: uint32) =
   doAssert me.activeMask == otherMask and me.psDisableMask == otherMask
   doAssert vifs[vif].state == 0 and vifs[vif].beaconEnabled == 0
   doAssert vifs[vif].chanCtxt == nil and apm.hostapdCtx == nil
-  doAssert apm.cryptoType == 0 and apm.beaconIntervalIndex == 0
+  doAssert apm.cryptoType == 0 and apm.embeddedEnabled == 0
   for value in apm.securityIe: doAssert value == 0
   doAssert state == ApmIdleState and meState == MeIdleState
   doAssert not apmStopActive and not apmRollbackActive

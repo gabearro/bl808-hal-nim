@@ -13,6 +13,10 @@ const
   KE_TIMER_MAX_DELAY = 0x11E1A2FF'u32
   WifiTimerDrainLimit = 8'u32
   KE_EVT_KE_TIMER = 0x40'u32
+  SM_SA_QUERY_TIMEOUT_IND_MSG = 0x1009'u16
+  SCAN_PROBE_TIMER = 0x407'u16
+  TASK_SCAN = 1'u8
+  TASK_SM = 4'u8
 type
   CoListHdr = object
     next: ptr CoListHdr
@@ -23,6 +27,7 @@ type
     id: uint16
     taskId: uint8
     time: uint32
+    saQuerySerial: uint32
   KeTimerMutation = object
     previous: ptr KeTimerMutation
     id: uint16
@@ -32,7 +37,8 @@ type
 var
   keTimerQueue: CoList
   keTimerMutationTop: ptr KeTimerMutation
-  keTimerScheduling: bool
+  keTimerScheduling, keTimerExpiryCurrent: bool
+  keTimerExpiryKey: tuple[id: uint16, task: uint8]
   now: uint32
   enabled = true
   failAlloc, missingAllocator: bool
@@ -40,8 +46,14 @@ var
   events: uint32
   live: seq[pointer]
   delivered: seq[tuple[id: uint16, task: uint8]]
+  saExpiries: seq[uint32]
   hardware: seq[tuple[id: uint16, time: uint32]]
   onAlloc, onFree, onHardware, onMessage, onEvent: proc()
+  onExpiryAlloc: proc()
+  failExpiryId: uint16
+  expiringMessage: tuple[id: uint16, task: uint8]
+  messageOwned: bool
+  expiryMessageFrees: int
   nimFwDbgKeTimerYield, nimFwDbgKeTimerYieldHead: uint32
 proc invoke(hook: var proc()) =
   if hook != nil:
@@ -60,7 +72,7 @@ proc heapAlloc(size: uint32): pointer {.cdecl.} =
     result = alloc0(max(size.int, sizeof(KeTimerEntry)))
     live.add(result)
   invoke(onAlloc)
-proc heapFree(p: pointer) =
+proc heapFree(p: pointer) {.cdecl.} =
   doAssert p != nil
   let index = live.find(p)
   doAssert index >= 0, "timer entry freed twice"
@@ -69,6 +81,7 @@ proc heapFree(p: pointer) =
   dealloc(p)
   invoke(onFree)
 proc blOpsFunc(index: int): pointer =
+  if index == 188: return cast[pointer](heapFree)
   doAssert index == 0xB8
   if missingAllocator: return nil
   cast[pointer](heapAlloc)
@@ -83,9 +96,25 @@ proc ke_evt_set(bits: uint32) =
   events = events or bits
   invoke(onEvent)
 proc ke_evt_clear(bits: uint32) = events = events and not bits
-proc ke_msg_send_basic(id: uint16; task, source: uint8) =
-  doAssert source == 0xFF
-  delivered.add((id, task))
+proc ke_msg_try_alloc(id: uint16; task, source: uint8; length: uint32): pointer =
+  doAssert source == 0xFF and length == 0 and not messageOwned
+  if failExpiryId != 0 and id == failExpiryId: return nil
+  expiringMessage = (id, task)
+  messageOwned = true
+  invoke(onExpiryAlloc)
+  addr expiringMessage
+proc ke_msg_alloc(id: uint16; task, source: uint8; length: uint32): pointer =
+  result = ke_msg_try_alloc(id, task, source, length)
+  if result == nil: assert_err("ke_msg.c", "ke_msg.c", 48)
+proc keMsgHdrFromPayload(p: pointer): pointer = p
+proc ke_msg_free(p: pointer) =
+  doAssert p == (addr expiringMessage) and messageOwned
+  messageOwned = false
+  inc expiryMessageFrees
+proc ke_msg_send(p: pointer) =
+  doAssert p == (addr expiringMessage) and messageOwned
+  delivered.add(expiringMessage)
+  messageOwned = false
   invoke(onMessage)
 proc smRspTimerBegin(id: uint16; task: uint8; continuationUs: uint64): uint32 = 0
 proc smRspTimerAbort(serial: uint32) = discard
@@ -93,6 +122,31 @@ proc smRspTimerPublish(id: uint16; task: uint8; serial: uint32;
                        entry: ptr KeTimerEntry): bool = true
 proc smRspTimerClear(id: uint16; task: uint8) = discard
 proc smRspTimerDispatch(entry: ptr KeTimerEntry): bool = false
+proc smSaQueryQueueTimeout(serial: uint32) = saExpiries.add(serial)
+'''
+
+FLUSH_PLATFORM = r'''
+const
+  TASK_NONE = 0xFF'u8
+  MAX_VIFS = 2
+var
+  keMsgQueueSent, keMsgQueueSaved: CoList
+  keSavedReschedTask: uint8
+  keSavedReschedMask: uint32
+  keSavedReschedRemaining: array[10, uint32]
+template smSaQueryResetScope() = discard
+proc mmConfigCancelIdle() = discard
+proc scanDwellReset() = discard
+proc chanSwitchCancel() = discard
+proc smActivationCancel() = discard
+proc smBssCancel() = discard
+proc smRspTimerReset() = discard
+proc smCleanupCancel() = discard
+proc smDeferredCancel() = discard
+proc mmPsModeCancel() = discard
+proc meControlReset() = discard
+proc apmCancelPendingForVif(i: uint8) = discard
+proc mm_bcn_flush_updates(send: bool) = discard
 '''
 
 HELPERS = r'''
@@ -167,6 +221,26 @@ ke_timer_set(1, 4, 100)
 doAssert queueIds() == @[1'u16, 1] and live.len == 2
 doAssert deadline(1, 4) == 100 and deadline(1, 3) == 200
 ''',
+    "sa_query_keeps_serial_when_rearmed": r'''
+doAssert ke_timer_try_set(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM, 100, saQuerySerial = 29)
+onFree = proc() =
+  doAssert saExpiries == @[29'u32]
+  doAssert ke_timer_try_set(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM, 200, saQuerySerial = 30)
+now = 100
+ke_timer_schedule()
+doAssert saExpiries == @[29'u32] and delivered.len == 0
+now = 300
+ke_timer_schedule()
+doAssert saExpiries == @[29'u32, 30] and delivered.len == 0 and live.len == 0
+''',
+    "stale_guard_rejected_inside_timer_lock": r'''
+ke_timer_set(1, 4, 200)
+proc current(context: pointer): bool =
+  doAssert not enabled
+  false
+doAssert not ke_timer_try_set(1, 4, 100, current)
+doAssert enabled and queueIds() == @[1'u16] and deadline(1) == 200 and live.len == 1
+''',
     "clear_during_hardware": r'''
 onHardware = proc() = ke_timer_clear(1, 4)
 ke_timer_set(1, 4, 100)
@@ -182,6 +256,19 @@ ke_timer_set(1, 4, 100)
 onFree = proc() = ke_timer_set(1, 4, 200)
 ke_timer_clear(1, 4)
 doAssert queueIds() == @[1'u16] and deadline(1) == 200 and live.len == 1
+''',
+    "locked_clear_detaches_before_free": r'''
+ke_timer_set(1, 4, 100)
+onFree = proc() =
+  doAssert enabled and queueIds().len == 0
+  ke_timer_set(1, 4, 200)
+let saved = irqSave()
+keTimerClearLocked(1, 4, saved)
+doAssert enabled and queueIds() == @[1'u16] and deadline(1) == 200
+doAssert live.len == 1
+now = 201
+ke_timer_schedule()
+doAssert delivered == @[(1'u16, 4'u8)] and live.len == 0
 ''',
     "expires_during_programming": r'''
 ke_timer_set(1, 4, 100)
@@ -284,7 +371,8 @@ for initial in [false, true]:
   doAssert enabled == initial
   ke_timer_set(1, 4, 100)
   now += 101
-  onMessage = proc() = doAssert enabled == initial
+  onExpiryAlloc = proc() = doAssert enabled == initial
+  onMessage = proc() = doAssert not enabled
   onFree = proc() = doAssert enabled == initial
   ke_timer_schedule()
   doAssert enabled == initial and live.len == 0
@@ -360,6 +448,67 @@ onFree = proc() = ke_timer_set(1, 4, 300)
 doAssert not ke_timer_try_set(1, 4, 100, current, addr valid)
 doAssert queueIds() == @[1'u16] and deadline(1) == 300 and live.len == 1
 ''',
+    "flush_during_expiry_allocation": r'''
+ke_timer_set(1, 4, 100)
+now = 100
+onExpiryAlloc = proc() =
+  ke_flush()
+  ke_timer_set(1, 4, 200)
+ke_timer_schedule()
+doAssert delivered.len == 0 and expiryMessageFrees == 1 and not messageOwned
+doAssert frees == 1 and live.len == 1 and deadline(1) == 300
+now = 300
+ke_timer_schedule()
+doAssert delivered == @[(1'u16, 4'u8)] and expiryMessageFrees == 1
+doAssert frees == 2 and live.len == 0
+''',
+    "clear_during_expiry_allocation": r'''
+ke_timer_set(SCAN_PROBE_TIMER, TASK_SCAN, 100)
+now = 100
+onExpiryAlloc = proc() =
+  doAssert not ke_timer_active(SCAN_PROBE_TIMER, TASK_SCAN)
+  ke_timer_clear(SCAN_PROBE_TIMER, TASK_SCAN)
+ke_timer_schedule()
+doAssert delivered.len == 0, "canceled probe expiry escaped the allocator"
+doAssert expiryMessageFrees == 1 and not messageOwned and live.len == 0
+''',
+    "rearm_during_expiry_allocation": r'''
+ke_timer_set(SCAN_PROBE_TIMER, TASK_SCAN, 100)
+now = 100
+onExpiryAlloc = proc() = ke_timer_set(SCAN_PROBE_TIMER, TASK_SCAN, 200)
+ke_timer_schedule()
+doAssert delivered.len == 0, "superseded probe expiry reached the replacement dwell"
+doAssert expiryMessageFrees == 1 and deadline(SCAN_PROBE_TIMER, TASK_SCAN) == 300
+now = 300
+ke_timer_schedule()
+doAssert delivered == @[(SCAN_PROBE_TIMER, TASK_SCAN)] and live.len == 0
+''',
+    "unrelated_clear_during_expiry_allocation": r'''
+ke_timer_set(SCAN_PROBE_TIMER, TASK_SCAN, 100)
+now = 100
+onExpiryAlloc = proc() =
+  ke_timer_clear(SCAN_PROBE_TIMER, TASK_SM)
+  ke_timer_clear(SCAN_PROBE_TIMER + 1, TASK_SCAN)
+ke_timer_schedule()
+doAssert delivered == @[(SCAN_PROBE_TIMER, TASK_SCAN)]
+doAssert expiryMessageFrees == 0 and not messageOwned and live.len == 0
+''',
+    "optional_probe_expiry_out_of_memory": r'''
+ke_timer_set(SCAN_PROBE_TIMER, TASK_SCAN, 100)
+ke_timer_set(2, TASK_SM, 100)
+failExpiryId = SCAN_PROBE_TIMER
+now = 100
+ke_timer_schedule()
+doAssert assertions == 0, "losing an optional probe requested firmware recovery"
+doAssert delivered == @[(2'u16, TASK_SM)] and not messageOwned and live.len == 0
+''',
+    "ordinary_expiry_out_of_memory": r'''
+ke_timer_set(2, TASK_SM, 100)
+failExpiryId = 2
+now = 100
+ke_timer_schedule()
+doAssert assertions == 1 and delivered.len == 0 and live.len == 0
+''',
 }
 
 MUTATIONS = {
@@ -367,6 +516,7 @@ MUTATIONS = {
     "newer_mutation": ("  keTimerCancelMutations(id, task)", "  discard", "same_key_set"),
     "reset": ("if all or (operation.id == id and operation.task == task):", "if not all and (operation.id == id and operation.task == task):", "reset_during_allocation"),
     "budget": ("while drained < WifiTimerDrainLimit:", "while drained <= WifiTimerDrainLimit:", "drain_budget"),
+    "unowned_expiry": ("if all or keTimerExpiryKey == (id, task):", "if all:", "rearm_during_expiry_allocation"),
 }
 
 
@@ -381,8 +531,10 @@ def program_source(mutation: str = "") -> str:
             code += procedure(kernel, name)
     if "proc keTimerCancelMutations" not in kernel:
         code += "\nproc keTimerCancelMutations(id = 0'u16; task = 0'u8; all = false) = discard\n"
-    for name in ["ke_timer_set", "ke_timer_clear", "keTimerExpired", "ke_timer_schedule", "ke_timer_active"]:
+    for name in ["ke_timer_set", "keTimerClearLocked", "ke_timer_clear", "keTimerExpired", "ke_timer_schedule",
+                 "ke_timer_active"]:
         code += procedure(kernel, name)
+    code += FLUSH_PLATFORM + procedure(kernel, "ke_flush")
     code += HELPERS
     if mutation:
         old, new, _ = MUTATIONS[mutation]

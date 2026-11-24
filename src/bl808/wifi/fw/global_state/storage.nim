@@ -10,15 +10,13 @@ var mac_tid2ac* {.exportc.}: array[9, uint8] = [
 ]
 
 var
-  # Kernel event bitmap and handlers
-  keEvtField* {.wifiCtrl.}: uint32
-
   # Kernel message queues: sent, saved, timer
   keMsgQueueSent* {.wifiCtrl.}: CoList
   keMsgQueueSaved* {.wifiCtrl.}: CoList
   keTimerQueue* {.wifiCtrl.}: CoList
   keTimerMutationTop {.wifiCtrl.}: ptr KeTimerMutation
-  keTimerScheduling {.wifiCtrl.}: bool
+  keTimerScheduling, keTimerExpiryCurrent {.wifiCtrl.}: bool
+  keTimerExpiryKey {.wifiCtrl.}: tuple[id: uint16, task: uint8]
   keSavedReschedTask* {.wifiCtrl.}: uint8 = TASK_NONE
   keSavedReschedMask* {.wifiCtrl.}: uint16
   keSavedReschedRemaining {.wifiCtrl.}: array[TASK_API.int, uint32]
@@ -64,6 +62,8 @@ var
   mmKeepAliveCounter*: uint32
   mmLastBeaconLogTime {.wifiCtrl.}: uint32
   mmTbttActive {.wifiCtrl.}: bool
+  mmBeaconProbeEpochs {.wifiCtrl.}: array[MAX_VIFS, uint32]
+  mmTrafficProbeEpochs {.wifiCtrl.}: array[MAX_VIFS, uint32]
 
   # MM timer list (sorted CoList of mm_timer entries)
   # Each entry layout: [0]=next ptr, [4]=callback ptr, [8]=env ptr, [12]=time
@@ -144,6 +144,7 @@ var
   # Channel context storage is the separate 140-byte chan_ctxt_pool blob
   # COMMON symbol; chan_env itself holds lists, timers, callbacks, and state.
   chan_env* {.exportc.}: array[33, uint32]  # 132 bytes = 33 words
+  mmRssiReportUs {.wifiCtrl.}: uint32  # Vendor mm.o:.bss.last_us, not part of chan_env.
   chanCtxtCount*: uint8
   chanCtxtFlags*: uint8
   chanCurrentCtxt*: pointer
@@ -212,13 +213,11 @@ var
   # Time domain environment (per-VIF: 44 bytes each, 2 VIFs)
   # td_env is the base; td_reset uses stride=44 to index per-VIF.
   td_env* {.exportc.}: array[22, uint32]  # 88 bytes = 22 words (2 * 44 bytes)
+  tdEpochs {.wifiCtrl.}: array[MAX_VIFS, uint32]
+  tdCfmCommittedEpochs {.wifiCtrl.}: array[MAX_VIFS, uint32]
+  tdCfmScheduled {.wifiCtrl.}: array[MAX_VIFS, bool]
   tdTimerActive*: bool
   tdRecoveryTimerActive*: bool
-
-  # TPC (TX power control)
-  tpcPowerTable*: array[38, int8]
-  tpcPowerRateTable*: array[24, int8]
-  tpcChannelOffsetTable*: array[14, int8]
 
   cfgApiEntries {.wifiCtrl.}: array[13, CfgApiElementEntryView]
 
@@ -229,8 +228,13 @@ var
   # Indexed by sta_info_tab[staIdx].info_idx. Pointed to from sta+324.
   rcStaStatsPool* {.exportc: "rc_ss".}: array[MAX_STAS * RC_STATS_SIZE, uint8]
 
-  # Rate control PRNG state (LCG: next = state * RC_PRNG_MULT + RC_PRNG_INCR)
-  rcPrngState* {.exportc: "rc_prng".}: uint32
+  # The pinned rc.o starts its independent rate-control stream at one.
+  rcPrngState* {.exportc: "rc_prng".}: uint32 = 1'u32
+  rcTrialSerial {.wifiCtrl.}: array[5, uint32]
+  txRateTrialTag {.wifiCtrl.}: array[4, uint32]
+  # Keep the new feedback metadata in Wi-Fi WRAM with the rate stats pool.
+  rcRateSampleEpoch: array[5, uint16]
+  txRateSampleTag: array[4, uint32]
 
   # Private WEP IV seed from sta_mgmt.o's initialized `next` variable.
   staKeyPrngState: uint32 = 1
@@ -263,7 +267,6 @@ var
   # Coexistence
   coexPtaAutoControl*: uint32 = high(uint32) # No previous state on first call
   coexPtaTimestamp*: uint32          # Timestamp of last state change
-  coexPtaAccum*: uint32              # Legacy aggregate across both states
   pds_slept_time* {.exportc.}: uint32 # Time attributed to BLE
   pds_woken_time* {.exportc.}: uint32 # Time attributed to WiFi
 
@@ -309,7 +312,11 @@ var
   meControlFinalId: uint16
   meControlRequester: uint8
   mmPsModeRequest: pointer
+  mmPsModeTxResetEpoch: uint32
+  psModeBuildSerial {.wifiCtrl.}: uint32
+  psTxNullOwner {.wifiCtrl.}: PsTxNullOwner
   mmTimIdentities {.wifiCtrl.}: ptr MmTimIdentityNode
+  mmConnLossTags {.wifiCtrl.}: ptr MmConnLossTag
   staDeleteEpochs: array[STA_MGMT_FREE_STAS, uint32]
   mmStaAddInProgress: array[MAX_VIFS, bool]
   mmStaAddVifEpoch: array[MAX_VIFS, uint32]
@@ -343,7 +350,7 @@ var
   #   offset 44: uint8  connection state (2 = WPS mode)
   # Sized at 48 bytes to cover all accessed offsets.
   sm_env* {.exportc.}: array[56, uint8]
-  assocSecIeStore* {.wifiCtrl.}: array[MAX_VIFS, array[128, uint8]]
+  assocSecIeStore* {.wifiCtrl.}: array[MAX_VIFS, array[255, uint8]]
 
   # WPS callback pointer.  Points to callback struct:
   #   [0]=ptr, ..., [8]=wps_sta_add_cb function ptr.
@@ -358,14 +365,6 @@ var
   # Byte-level access; offset 204 = log function pointer.
   g_bl_ops_funcs* {.importc: "g_bl_ops_funcs", header: "bl_os_adapter.h".}: BlOpsFuncs
 
-  # Application IE storage for bl_wifi_set_appie_internal.
-  # ieType=1: beacon extra IE (max 170 bytes)
-  appIeBeaconPtr*: pointer    # IE data pointer for beacon extra IEs
-  appIeBeaconLen*: uint16     # IE data length for beacon extra IEs
-  # ieType=2: probe response extra IE (max 50 bytes)
-  appIeProbeRespPtr*: pointer # IE data pointer for probe response extra IEs
-  appIeProbeRespLen*: uint16  # IE data length for probe response extra IEs
-
   # Nap hook linked list head pointer (each entry: [0]=next, [4]=callback).
   napHookListHead*: pointer
 
@@ -373,9 +372,6 @@ var
   napScheduleState*: uint32   # current nap VIF state for sleep scheduling
   napSleepActive*: uint8      # sleep-active flag (non-zero = sleep management active)
   napSleepListPtr*: pointer   # associated list pointer (at napSleepActive+4 in blob)
-
-  # WPS status byte (read/written by bl_wifi_get/set_wps_status_internal)
-  wpsStatus*: uint8
 
   # Debug / assert environment (40 bytes).
   # Layout from blob (base at 0x24b08180 in linked binary):
@@ -416,7 +412,7 @@ var
   cfg_start_req_u_tlv_t* {.wifiCtrlExport.}: array[12, uint8]
   txl_frame_buf_ctrl* {.exportc.}: array[240, uint8]
   txl_frame_hwdesc_cfms* {.exportc.}: array[80, uint8]
-  txl_frame_hwdesc_pool* {.exportc.}: array[288, uint8]
+  txl_frame_hwdesc_pool* {.exportc, align: 4.}: array[288, uint8]
   txl_frame_pool* {.exportc.}: array[3440, uint8]
   # Private txl_frame.o descriptor array (.LANCHOR0 in the vendor object):
   # 4 descriptors * 220 bytes. These list nodes are what txl_frame_env holds.

@@ -15,6 +15,10 @@ type
   Future = ref object
     finished: bool
     value: WifiError
+const
+  SmIdleState = 0'u16
+  SmDisconnectingState = 10'u16
+  wifiScanConfirmed = 1'u32
 var
   connected = true
   sm_state: uint16
@@ -31,6 +35,8 @@ proc wifiBackendConnected(): bool = connected
 proc wifiBackendDisconnectDone(): bool = disconnectDone
 proc wifiBackendScanDone(): bool = false
 proc wifiBackendScanCount(): uint32 = 0
+proc bl808_wifi_backend_scan_confirmation(): uint32 = 0
+proc noteWifiScan(stage, detail: uint32) = discard
 proc wifiBackendConnectDone(): bool = false
 proc wifiBackendStaDisconnect(): cint =
   inc disconnectCalls
@@ -78,6 +84,14 @@ sm_state = 6
 doAssert wifiDisconnect() == wifiOk
 doAssert abortCalls == 1 and polls >= 3 and sm_state == 0
 """,
+    "sync_peer_cleanup": """
+connected = false
+sm_state = SmDisconnectingState
+issueResult = -5
+doAssert wifiDisconnect() == wifiOk
+doAssert abortCalls == 0 and disconnectCalls == 0
+doAssert polls == 3 and sm_state == SmIdleState
+""",
     "sync_failure": """
 issueResult = -110
 automatic = false
@@ -109,6 +123,38 @@ doAssert not original.finished and timerCalls == 1
 connected = false
 wifiCompletePendingEvents()
 doAssert original.finished and original.value == wifiOk
+""",
+    "async_peer_cleanup": """
+issueResult = -5
+for hostStillConnected in [false, true]:
+  let original = Future()
+  wifiDisconnectFuture = original
+  wifiDisconnectIssuePending = true
+  wifiDisconnectIssueTimeoutMs = 100
+  connected = hostStillConnected
+  sm_state = SmDisconnectingState
+  let previousTimers = timerCalls
+  wifiCompletePendingEvents()
+  doAssert not original.finished and timerCalls == previousTimers + 1
+  doAssert abortCalls == 0 and disconnectCalls == 0
+  connected = false
+  wifiCompletePendingEvents()
+  doAssert not original.finished, "host notification is not cleanup completion"
+  sm_state = SmIdleState
+  wifiCompletePendingEvents()
+  doAssert original.finished and original.value == wifiOk
+""",
+    "async_cleanup_completed_before_issue": """
+let original = Future()
+wifiDisconnectFuture = original
+wifiDisconnectIssuePending = true
+wifiDisconnectIssueTimeoutMs = 100
+issueResult = -5
+connected = false
+sm_state = SmIdleState
+wifiCompletePendingEvents()
+doAssert original.finished and original.value == wifiOk
+doAssert abortCalls == 0 and disconnectCalls == 0
 """,
     "async_stale_flag": """
 let original = Future()

@@ -23,6 +23,24 @@ import bl808/wasm_task_smoke
 
 when defined(bl808AllcoreWasmHttp):
   import bl808/wifi
+  import wifi_known_networks
+  when defined(bl808WifiDiagTcpPath):
+    import bl808/wifi/tcp_path_trace
+  when defined(bl808AllcoreWifiApEngineBench):
+    from bl808/wifi/mbedtls_sha1_alt import beginShaApKeySetup, finishShaApKeySetup
+    from bl808/wifi/mbedtls_sha1_dma import wifiShaDmaWindowReady
+    when defined(bl808AllcoreWifiApChannelSurvey):
+      from bl808/wifi/msg_tx import bl_msg_get_channel_nums
+      from bl808/wifi_fw import phy_get_channel_raw
+      from std/volatile import volatileLoad
+    when defined(bl808AllcoreWifiApPcProfile):
+      import wifi_ap_pc_profile
+  when defined(bl808WifiDiagLinkDrop) and defined(bl808WifiNimFw):
+    from bl808/wifi_fw import nimFwSnapshotStaBeaconEvidence
+  when defined(bl808WifiDiagWarmScan):
+    from bl808/wifi_fw import nimFwDbgWarmScan, nimFwDbgWarmScanLowerStatus,
+      nimFwDbgWarmScanHostStatus, nimFwDbgWarmScanSubmitStatus, nimFwWarmScanState,
+      nimFwDbgScanFrameSeen, nimFwDbgScanFrameAccepted, nimFwDbgWarmAssocFailure
   import bl808/kernel/clock
   import bl808/kernel/lwipcore
   import bl808/psram
@@ -38,12 +56,18 @@ const
   ConsoleClkHz {.intdefine.} = 40_000_000'u32
   WaitLoops = 200_000
   WifiSsid {.strdefine.} = "Frog"
-  WifiPassword {.strdefine.} = "6509171272"
+  WifiPassword {.strdefine.} = ""
   WifiChannel {.intdefine.} = 0
   WifiFallbackSsid {.strdefine.} = ""
   WifiFallbackChannel {.intdefine.} = 0
   WifiFallbackAfterAttempts {.intdefine.} = 2
+  WifiResolvedFallbackChannel =
+    (if WifiFallbackChannel > 0: WifiFallbackChannel else: WifiChannel).uint8
+  WpaFirstKeyExchangeState = 7'u32 # Pinned SDK WPA_FIRST_HALF_4WAY_HANDSHAKE
   WpaCompletedState = 10'u32
+  BenchConnectedScan = defined(bl808WifiBenchConnectedScan)
+  LeanWifiStartup = (defined(bl808WifiDiagLinkDrop) or
+    defined(bl808WifiDiagWarmScanCompact)) and not defined(bl808AllcoreWifiVerboseDiag)
   HttpPort {.intdefine.} = 80
   AllcoreHttpHoldPeerCoresBeforeWifi {.intdefine.} = 0
   AllcoreHttpWifiResetSettleUs {.intdefine.} = 250_000'u64
@@ -59,6 +83,14 @@ const
   WifiReconnectWpaTimeoutMs {.intdefine.} = 15_000'u32
   WifiReconnectDhcpTimeoutMs {.intdefine.} = 20_000'u32
   WifiReconnectBackoffUs {.intdefine.} = 5_000_000'u64
+  AllcoreHttpBenchReconnectMs {.intdefine.} = 0'u32
+  AllcoreHttpBenchReconnectCount {.intdefine.} = 1'u32
+  ForceReconnectBench = AllcoreHttpBenchReconnectMs != 0 and AllcoreHttpBenchReconnectCount != 0
+  QuietWifiTrace = LeanWifiStartup and defined(bl808WifiDiagTrafficProbeHistory) and
+    defined(bl808WifiDiagLinkDrop) and not ForceReconnectBench
+  QuietWifiBringup = QuietWifiTrace or (LeanWifiStartup and BenchConnectedScan)
+  AllcoreHttpGratuitousArpMs {.intdefine.} = 1000'u32
+  AllcoreHttpBenchStaPsMode {.intdefine.} = 2.cint
   # No 802.11 RX frame (not even a beacon) for this long => the RF link is dead,
   # even if the supplicant/backend still claim "connected" (silent deauth).
   WifiRxStallMs {.intdefine.} = 8_000'u32
@@ -70,8 +102,7 @@ const
   # longer than this and forces a clean reboot; normal serving + async
   # reconnects keep the scheduler looping well under it.
   WifiWedgeWdtMs {.intdefine.} = 20_000'u32
-  # During initial bring-up, tear down and re-join the association after this
-  # many consecutive failed DHCP attempts (bad link is the usual cause).
+  # Observe one DHCP exchange for this many windows before relinking.
   DhcpRelinkEveryAttempts {.intdefine.} = 3'u32
   # LP publishes this to WasmLiveLpAddValueAddr right before runScheduler(),
   # i.e. past its heavy heapInit/schedulerInit boot. M0 waits for it before
@@ -201,6 +232,7 @@ static unsigned long __psram_bss_end_addr(void){return (unsigned long)__psram_bs
     nimfw_dbg_chan_pre_chan_freq {.importc.}: uint32
     nimfw_dbg_dhcp_tx {.importc.}: uint32
     nimfw_dbg_dhcp_tx_msg {.importc.}: uint32
+    nimfw_dbg_dhcp_cfm_ack_ok {.importc.}: uint32
     nimfw_dbg_dhcp_cfm_ok {.importc.}: uint32
     nimfw_dbg_dhcp_cfm_fail {.importc.}: uint32
     nimfw_dbg_tx_sec_hdr_calls {.importc.}: uint32
@@ -223,7 +255,14 @@ static unsigned long __psram_bss_end_addr(void){return (unsigned long)__psram_bs
     nimfw_dbg_tcpip_input_dhcp_rx {.importc.}: uint32
     nimfw_dbg_lwip_dhcp_recv_count {.importc.}: uint32
     nimfw_dbg_lwip_dhcp_offer_count {.importc.}: uint32
+    nimfw_dbg_lwip_dhcp_recv_code {.importc.}: uint32
+    nimfw_dbg_lwip_dhcp_create_count {.importc.}: uint32
     sm_state {.importc.}: uint16
+    nimfw_dbg_disconnect_req {.importc.}: uint32
+    nimfw_dbg_disconnect_req_state {.importc.}: uint32
+    nimfw_dbg_disconnect_process {.importc.}: uint32
+    nimfw_dbg_sta_recovery_stage {.importc.}: uint32
+    nimfw_dbg_sta_recovery_result {.importc.}: int32
     nimfw_dbg_assert_err_count {.importc.}: uint32
     nimfw_dbg_assert_err_last_line {.importc.}: uint32
     nimfw_dbg_hw_wait_timeout_count {.importc.}: uint32
@@ -336,7 +375,7 @@ static unsigned long __psram_bss_end_addr(void){return (unsigned long)__psram_bs
     nimfw_dbg_auth_cfm_status {.importc.}: uint32
     nimfw_dbg_auth_cfm_hw_status {.importc.}: uint32
     nimfw_dbg_auth_cfm_thd_flags {.importc.}: uint32
-    nimfw_dbg_auth_cfm_ack_ok16 {.importc.}: uint32
+    nimfw_dbg_auth_cfm_final_fail16 {.importc.}: uint32
     nimfw_dbg_auth_cfm_ack_ok23 {.importc.}: uint32
     nimfw_dbg_auth_cfm_ack_fail {.importc.}: uint32
     nimfw_dbg_auth_cfm_meta {.importc.}: uint32
@@ -485,7 +524,7 @@ static unsigned long __psram_bss_end_addr(void){return (unsigned long)__psram_bs
     nimfw_dbg_assoc_cfm_status {.importc.}: uint32
     nimfw_dbg_assoc_cfm_hw_status {.importc.}: uint32
     nimfw_dbg_assoc_cfm_thd_flags {.importc.}: uint32
-    nimfw_dbg_assoc_cfm_ack_ok16 {.importc.}: uint32
+    nimfw_dbg_assoc_cfm_final_fail16 {.importc.}: uint32
     nimfw_dbg_assoc_cfm_ack_ok23 {.importc.}: uint32
     nimfw_dbg_assoc_cfm_ack_fail {.importc.}: uint32
     nimfw_dbg_assoc_cfm_meta {.importc.}: uint32
@@ -498,9 +537,6 @@ static unsigned long __psram_bss_end_addr(void){return (unsigned long)__psram_bs
     nimfw_dbg_sm_rsp_timeout {.importc.}: uint32
     nimfw_dbg_sm_rsp_timeout_state {.importc.}: uint32
     nimfw_dbg_sm_rsp_timeout_rxctrl {.importc.}: uint32
-    nimfw_dbg_ack_fallback_auth {.importc.}: uint32
-    nimfw_dbg_ack_fallback_assoc {.importc.}: uint32
-    nimfw_dbg_ack_fallback_last {.importc.}: uint32
     nimfw_dbg_wparsn_set {.importc.}: uint32
     nimfw_dbg_wparsn_len {.importc.}: uint32
     nimfw_dbg_vif_ielen_assoc {.importc.}: uint32
@@ -604,6 +640,8 @@ static unsigned long __psram_bss_end_addr(void){return (unsigned long)__psram_bs
     nimfw_dbg_crypto_bssid {.importc.}: array[6, uint8]
   proc bl808WpaCurrentState(): uint32 {.importc: "bl808_wpa_current_state", cdecl.}
   proc nimfw_ke_evt_field_get(): uint32 {.importc, cdecl.}
+  proc nimfw_dbg_rxl_processing_flag(): uint32 {.importc, cdecl.}
+  proc nimfw_dbg_mm_state(): uint32 {.importc, cdecl.}
   when defined(bl808AllcoreWasmHttpJtagGate):
     var allcoreHttpWifiJtagGate* {.exportc: "allcore_http_wifi_jtag_gate".}: uint32
 
@@ -652,18 +690,19 @@ template irqRestoreMstatus(prev: uint32) =
 proc dumpHeapMilestone(tag: string) =
   ## Compact TLSF damage counters at a boot milestone. Bisects WHEN the
   ## boot-time canary/invalid-free damage happens (smoke vs WiFi phase).
-  let hs = heapStats()
-  discard console.sendString("[M0] heap_milestone_")
-  discard console.sendString(tag)
-  discard console.sendString("=")
-  console.sendHex32(hs.usedBytes.uint32)
-  discard console.sendString(" if=")
-  console.sendHex32(hs.invalidFreeCount.uint32)
-  discard console.sendString(" cf=")
-  console.sendHex32(hs.canaryFailCount.uint32)
-  discard console.sendString(" ok=")
-  console.sendHex32(if heapCheck(): 1'u32 else: 0'u32)
-  discard console.sendLine("")
+  when not defined(bl808WifiDiagLinkDrop):
+    let hs = heapStats()
+    discard console.sendString("[M0] heap_milestone_")
+    discard console.sendString(tag)
+    discard console.sendString("=")
+    console.sendHex32(hs.usedBytes.uint32)
+    discard console.sendString(" if=")
+    console.sendHex32(hs.invalidFreeCount.uint32)
+    discard console.sendString(" cf=")
+    console.sendHex32(hs.canaryFailCount.uint32)
+    discard console.sendString(" ok=")
+    console.sendHex32(if heapCheck(): 1'u32 else: 0'u32)
+    discard console.sendLine("")
 
 when defined(bl808AllcoreWasmHttp):
   proc wifiRxRamStart(): uint {.importc: "__wifi_rx_ram_start_addr", nodecl.}
@@ -704,16 +743,11 @@ when defined(bl808AllcoreWasmHttp):
   proc tryFastAllcoreHttpResponse(data: openArray[byte],
                                   response: var string): bool
 
+  proc appendAllcoreRootBody(dst: var string)
+
   proc allcoreHttpRootBody(): string =
-    "BL808 all-core WASM manager\n" &
-      "ip=" & $((httpIp shr 0) and 0xFF'u32) & "." &
-        $((httpIp shr 8) and 0xFF'u32) & "." &
-        $((httpIp shr 16) and 0xFF'u32) & "." &
-        $((httpIp shr 24) and 0xFF'u32) & "\n" &
-      "http_requests=" & $httpRequests & "\n" &
-      "wasm_requests=" & $httpWasmRequests & "\n" &
-      "server=cps/http\n" &
-      "routes=/wasm/capabilities,/wasm/cores,/wasm/programs,/wasm/tasks,/wasm/repository,/wasm/net/status,/wasm/events/stream\n"
+    result = ""
+    result.appendAllcoreRootBody()
 
   proc writeStringResponse(tcp: ptr TcpPcb, response: string): ErrT =
     if response.len == 0:
@@ -748,6 +782,11 @@ when defined(bl808AllcoreWasmHttp):
       ctx.upgraded = false
       ctx.wsPath.setLen(0)
       ctx.wsRxBuffer.setLen(0)
+
+  proc allcoreHttpErr(arg: pointer; err: ErrT) {.cdecl.} =
+    discard err
+    # lwIP has already freed the PCB; only retire the manager's client slot.
+    releaseHttpClient(cast[ptr HttpClientState](arg))
 
   proc closeHttpClient(ctx: ptr HttpClientState): ErrT =
     if ctx == nil or ctx.pcb == nil:
@@ -911,6 +950,15 @@ when defined(bl808AllcoreWasmHttp):
     consumed = pos + payloadLen
     wfpsComplete
 
+  when defined(bl808WifiDiagTcpPath):
+    static: doAssert HttpPort == WifiTcpPathPort
+
+    proc logHttpTcpPath(pcb: ptr TcpPcb; stage: TcpPathStage; detail = 0'u32) =
+      var peerPort: uint16
+      {.emit: [peerPort, " = ((struct tcp_pcb*)", pcb, ")->remote_port;"].}
+      logTcpPath(TcpPathPacket(ports: peerPort.uint32 or (HttpPort.uint32 shl 16)),
+                 stage, detail)
+
   proc allcoreHttpRecv(arg: pointer, pcb: ptr TcpPcb, p: ptr Pbuf,
                        err: ErrT): ErrT {.cdecl.} =
     let ctx = cast[ptr HttpClientState](arg)
@@ -926,6 +974,8 @@ when defined(bl808AllcoreWasmHttp):
       return closeHttpClient(ctx)
 
     let rxLen = pbufTotLen(p)
+    when defined(bl808WifiDiagTcpPath):
+      logHttpTcpPath(pcb, tcpHttpRecv, rxLen.uint32)
     tcpRecved(pcb, rxLen)
     let copyLen =
       if rxLen.uint32 > httpRequestBuffer.len.uint32:
@@ -1032,9 +1082,14 @@ when defined(bl808AllcoreWasmHttp):
       return ErrOk
     let ctx = allocHttpClient(newPcb)
     if ctx == nil:
+      when defined(bl808WifiDiagTcpPath):
+        logHttpTcpPath(newPcb, tcpHttpPoolFull)
       tcpAbort(newPcb)
       return ErrAbrt
+    when defined(bl808WifiDiagTcpPath):
+      logHttpTcpPath(newPcb, tcpHttpAccept)
     tcpArg(newPcb, cast[pointer](ctx))
+    tcpErr(newPcb, allcoreHttpErr)
     tcpSent(newPcb, allcoreHttpSent)
     tcpRecv(newPcb, allcoreHttpRecv)
     ErrOk
@@ -1063,18 +1118,10 @@ when defined(bl808AllcoreWasmHttp):
     discard console.sendByte('.'.uint8)
     writeDecByte(((ip shr 24) and 0xFF'u32).uint8)
 
-  proc ssidMatches(bytes: ptr uint8; length: uint8; name: static[string]): bool =
-    if length.int != name.len:
-      return false
-    let view = cast[ptr UncheckedArray[uint8]](bytes)
-    for i in 0 ..< name.len:
-      if view[i] != name[i].uint8:
-        return false
-    true
-
-  proc dumpMatchingScanEntries(): uint32 =
+  proc matchingKnownScanEntries(report: static bool): KnownWifiMatches =
     let count = bl808_wifi_backend_scan_diag_count()
-    var printed = 0'u32
+    when report:
+      var matches = 0'u32
     var ssidLen: uint8
     var ssid: array[33, uint8]
     var channel: uint8
@@ -1083,28 +1130,168 @@ when defined(bl808AllcoreWasmHttp):
     var cipher: uint8
     var bssid: array[6, uint8]
     var i = 0'u32
-    while i < count and printed < 8'u32:
+    while i < count:
       if bl808_wifi_backend_scan_diag_get(i, addr ssidLen, addr ssid[0],
           addr channel, addr rssi, addr auth, addr cipher, addr bssid[0]) == 0:
-        if ssidMatches(addr ssid[0], ssidLen, WifiSsid):
-          let bssidLo =
-            bssid[0].uint32 or (bssid[1].uint32 shl 8) or
-            (bssid[2].uint32 shl 16) or (bssid[3].uint32 shl 24)
-          let bssidHi = bssid[4].uint32 or (bssid[5].uint32 shl 8)
-          let meta =
-            channel.uint32 or (cast[uint8](rssi).uint32 shl 8) or
-            (auth.uint32 shl 16) or (cipher.uint32 shl 24)
-          printHex("[M0] allcore_http_scan_match_slot=", i)
-          printHex("[M0] allcore_http_scan_match_meta=", meta)
-          printHex("[M0] allcore_http_scan_match_bssid_lo=", bssidLo)
-          printHex("[M0] allcore_http_scan_match_bssid_hi=", bssidHi)
-          inc printed
+        let primary = matchesKnownWifi(ssid, ssidLen, channel, WifiChannel.uint8, WifiSsid)
+        let fallback = matchesKnownWifi(ssid, ssidLen, channel,
+                                        WifiResolvedFallbackChannel, WifiFallbackSsid)
+        if primary: result.incl wifiTargetPrimary
+        if fallback: result.incl wifiTargetFallback
+        when report:
+          if primary or fallback:
+            when not defined(bl808WifiDiagWarmScanCompact) and not defined(bl808WifiDiagLinkDrop):
+              if matches < 8:
+                let bssidLo =
+                  bssid[0].uint32 or (bssid[1].uint32 shl 8) or
+                  (bssid[2].uint32 shl 16) or (bssid[3].uint32 shl 24)
+                let bssidHi = bssid[4].uint32 or (bssid[5].uint32 shl 8)
+                let meta =
+                  channel.uint32 or (cast[uint8](rssi).uint32 shl 8) or
+                  (auth.uint32 shl 16) or (cipher.uint32 shl 24)
+                printHex("[M0] allcore_http_scan_match_slot=", i)
+                printHex("[M0] allcore_http_scan_match_meta=", meta)
+                printHex("[M0] allcore_http_scan_match_bssid_lo=", bssidLo)
+                printHex("[M0] allcore_http_scan_match_bssid_hi=", bssidHi)
+            inc matches
       inc i
-    printHex("[M0] allcore_http_scan_match_count=", printed)
-    printed
+    when report:
+      printHex("[M0] allcore_http_scan_match_count=", matches)
+
+  proc knownWifiSsid(target: KnownWifiTarget): string {.inline.} =
+    if target == wifiTargetFallback: WifiFallbackSsid else: WifiSsid
+
+  proc knownWifiChannel(target: KnownWifiTarget): uint8 {.inline.} =
+    if target == wifiTargetFallback: WifiResolvedFallbackChannel else: WifiChannel.uint8
 
   proc nowMs(): uint32 {.inline.} =
     (kernel_read_tick_ms() and 0xffffffff'u64).uint32
+
+  # CPS resolves frame-local types even in a disabled compile-time branch.
+  type AllcoreLinkDrop = array[(when defined(bl808WifiDiagLinkDrop): 22 else: 0), uint32]
+  when defined(bl808WifiDiagLinkDrop):
+    var
+      nimfw_dbg_deauth {.importc.}: uint32
+      nimfw_dbg_traffic_probe {.importc.}: array[5, uint32]
+    var linkDropSnapshot {.exportc: "allcore_link_drop", volatile.}: AllcoreLinkDrop
+    when defined(bl808WifiNimFw):
+      var staRxEvidence {.exportc: "allcore_sta_rx_evidence", volatile.}: array[8, uint32]
+
+      proc sampleAllcoreStaRx(now: uint32) =
+        let peer = nimFwSnapshotStaBeaconEvidence()
+        if not peer.valid: return
+        staRxEvidence[0] = 0
+        staRxEvidence[1] = now
+        staRxEvidence[2] = nimfw_dbg_rxl_frame_seen
+        staRxEvidence[3] = peer.received
+        staRxEvidence[4] = peer.lastBeaconUs
+        staRxEvidence[5] = peer.sampleUs
+        staRxEvidence[6] = peer.probeEpoch
+        staRxEvidence[7] = peer.missed.uint32
+        staRxEvidence[0] = 0x8000_0000'u32 or peer.vifIndex.uint32 or
+          (peer.stationIndex.uint32 shl 8)
+
+    proc observeAllcoreLinkDrop(now, rxAge, txAge: uint32;
+                                rxStalled, txDead, hasLease: bool): AllcoreLinkDrop =
+      result[1] = now
+      result[2] = (cast[uint32](bl808_wifi_backend_last_status()) and 0xFFFF) or
+        (cast[uint32](bl808_wifi_backend_last_reason()) shl 16)
+      result[3] = sm_state.uint32 or (bl808WpaCurrentState().uint32 shl 16) or
+        ((bl808_wifi_backend_connected() != 0).uint32 shl 24) or
+        (hasLease.uint32 shl 25) or (rxStalled.uint32 shl 26) or (txDead.uint32 shl 27)
+      result[4] = rxAge
+      result[5] = txAge
+      result[6] = nimfw_dbg_tx_fc_state
+      result[7] = nimfw_dbg_deauth
+      result[8] = nimfw_dbg_connloss
+      for i, value in nimfw_dbg_traffic_probe: result[9 + i] = value
+      when defined(bl808WifiNimFw):
+        for i, value in staRxEvidence: result[14 + i] = value
+
+    proc publishFirstAllcoreLinkDrop(observed: AllcoreLinkDrop) =
+      if linkDropSnapshot[0] != 0: return
+      for i in 1 ..< observed.len: linkDropSnapshot[i] = observed[i]
+      linkDropSnapshot[0] = 0x4C494E4B'u32 # LINK
+
+    type ReconnectFailurePhase = enum
+      reconnectDisconnect = 1, reconnectScan, reconnectJoin,
+      reconnectWpa, reconnectDhcp, reconnectLinkAfterLease
+    var reconnectFailure {.exportc: "allcore_reconnect_failure", volatile.}: array[9, uint32]
+
+    proc recordFirstReconnectFailure(forced: bool; attempt, startedAt: uint32;
+                                     phase: ReconnectFailurePhase; code, detail: uint32) =
+      if forced or reconnectFailure[0] != 0: return
+      reconnectFailure[1] = attempt
+      reconnectFailure[2] = phase.uint32
+      reconnectFailure[3] = startedAt
+      reconnectFailure[4] = nowMs() - startedAt
+      reconnectFailure[5] = code
+      reconnectFailure[6] = detail
+      reconnectFailure[7] = (sm_state.uint32 and 0xFF) or
+        ((nimfw_dbg_sta_recovery_stage and 0xFF) shl 8) or
+        ((cast[uint32](nimfw_dbg_sta_recovery_result) and 0xFFFF) shl 16)
+      reconnectFailure[8] = (cast[uint32](bl808_wifi_backend_last_status()) and 0xFFFF) or
+        (cast[uint32](bl808_wifi_backend_last_reason()) shl 16)
+      reconnectFailure[0] = 0x5245434E'u32 # RECN
+
+    proc recordReconnectScanFailure(forced: bool; attempt, startedAt: uint32) =
+      let scan = wifiLastScanObservation()
+      recordFirstReconnectFailure(forced, attempt, startedAt,
+                                  reconnectScan, scan.code, scan.kind.uint32)
+
+  when defined(bl808WifiDiagWarmScan):
+    when defined(bl808WifiDiagWarmScanCompact):
+      var warmScanFailure {.exportc: "allcore_warm_scan_failure", volatile.}: array[8, uint32]
+
+      proc packWarmScanBytes(a, b, c, d: uint32): uint32 {.inline.} =
+        (a and 0xFF) or ((b and 0xFF) shl 8) or ((c and 0xFF) shl 16) or
+          ((d and 0xFF) shl 24)
+
+    proc scanForAllcoreReconnect(): CpsFuture[uint32] {.cps.} =
+      let started = nowMs()
+      let scanBefore = nimFwDbgWarmScan
+      let framesBefore = nimFwDbgScanFrameSeen
+      let acceptedBefore = nimFwDbgScanFrameAccepted
+      nimFwDbgWarmScanSubmitStatus = low(cint)
+      let scanCount = await wifiScanAsync(30_000'u32)
+      let scanAfter = nimFwDbgWarmScan
+      when defined(bl808WifiDiagWarmScanCompact):
+        if scanCount == 0 and warmScanFailure[0] == 0:
+          # Preserve the first result before the workflow starts another scan.
+          warmScanFailure[1] = nowMs() - started
+          warmScanFailure[2] = cast[uint32](nimFwDbgWarmScanSubmitStatus)
+          warmScanFailure[3] = nimFwWarmScanState()
+          warmScanFailure[4] = packWarmScanBytes(
+            scanAfter.upper_admitted - scanBefore.upper_admitted,
+            scanAfter.lower_replies - scanBefore.lower_replies,
+            scanAfter.slot_admitted - scanBefore.slot_admitted,
+            scanAfter.host_replies - scanBefore.host_replies)
+          warmScanFailure[5] = packWarmScanBytes(
+            scanAfter.start_posted - scanBefore.start_posted,
+            scanAfter.start_handled - scanBefore.start_handled,
+            scanAfter.end_posted - scanBefore.end_posted,
+            scanAfter.end_handled - scanBefore.end_handled)
+          warmScanFailure[6] = packWarmScanBytes(nimFwDbgWarmScanLowerStatus,
+            nimFwDbgWarmScanHostStatus, bl808_wifi_backend_scan_done_count(),
+            nimFwDbgScanFrameAccepted - acceptedBefore)
+          warmScanFailure[7] = nimFwDbgScanFrameSeen - framesBefore
+          warmScanFailure[0] = 0x5343414E # SCAN
+      else:
+        printHex("[M0] warm_scan_elapsed_ms=", nowMs() - started)
+        printHex("[M0] warm_scan_submit_status=", cast[uint32](nimFwDbgWarmScanSubmitStatus))
+        printHex("[M0] warm_scan_state=", nimFwWarmScanState())
+        for stage, after, before in fieldPairs(scanAfter, scanBefore):
+          printHex("[M0] warm_scan_" & stage & "=", after - before)
+        if scanAfter.lower_replies != scanBefore.lower_replies:
+          printHex("[M0] warm_scan_lower_status=", nimFwDbgWarmScanLowerStatus)
+        if scanAfter.host_replies != scanBefore.host_replies:
+          printHex("[M0] warm_scan_host_status=", nimFwDbgWarmScanHostStatus)
+        printHex("[M0] warm_scan_manager_done=", bl808_wifi_backend_scan_done_count())
+        printHex("[M0] warm_scan_frames_seen=", nimFwDbgScanFrameSeen - framesBefore)
+        printHex("[M0] warm_scan_frames_accepted=", nimFwDbgScanFrameAccepted - acceptedBefore)
+      return scanCount
+  else:
+    proc scanForAllcoreReconnect(): CpsFuture[uint32] = wifiScanAsync(30_000'u32)
 
   proc pollNetwork() {.inline.} =
     bl808_wifi_backend_poll(64)
@@ -1119,35 +1306,73 @@ when defined(bl808AllcoreWasmHttp):
       irqRestoreMstatus(savedIrq)
     sysCheckTimeouts()
 
+  proc allcoreWifiWpaReady(): bool {.inline.} =
+    bl808_wifi_backend_connected() != 0 and bl808WpaCurrentState() == WpaCompletedState
+
+  when defined(bl808WifiBenchStaUapsd):
+    static:
+      doAssert defined(bl808WifiNimFw)
+      doAssert AllcoreHttpBenchStaPsMode in 1 .. 2
+    proc wifi_mgmr_api_fw_powersaving(mode: cint): cint {.importc, cdecl.}
+
+  proc allcoreDhcpLeaseIp(netif: ptr Netif): uint32 {.inline.} =
+    if dhcpSuppliedAddress(netif) != 0: netifIp4(netif) else: 0'u32
+
+  when defined(bl808WifiBenchStationDhcpRetire):
+    static: doAssert AllcoreHttpBenchReconnectMs != 0 and defined(bl808WifiNimFw)
+    var stationDhcpRetireProbe {.exportc: "allcore_station_dhcp_retire", volatile.}: array[4, uint32]
+
+  proc startAllcoreDhcp(netif: ptr Netif): bool =
+    allcoreWifiWpaReady() and dhcpStart(netif) == ErrOk
+
+  proc allcoreConfirmedLeaseIp(netif: ptr Netif): uint32 =
+    if allcoreWifiWpaReady(): allcoreDhcpLeaseIp(netif) else: 0'u32
+
+  proc waitForAllcoreWpa(timeoutMs: uint32): CpsFuture[bool] {.cps.} =
+    let startedMs = nowMs()
+    while bl808_wifi_backend_connected() != 0 and
+        bl808WpaCurrentState() != WpaCompletedState and nowMs() - startedMs < timeoutMs:
+      pollNetwork()
+      await yieldNow()
+    return allcoreWifiWpaReady()
+
+  proc waitForAllcoreDhcpLease(netif: ptr Netif; timeoutMs: uint32;
+                             windows = 1'u32): CpsFuture[uint32] {.cps.} =
+    # Observation windows don't restart the exchange owned by lwIP.
+    for _ in 0'u32 ..< windows:
+      let startedMs = nowMs()
+      while true:
+        if bl808_wifi_backend_connected() == 0:
+          return 0'u32
+        let wpa = bl808WpaCurrentState()
+        # Key negotiation can re-enter a handshake state on the same link.
+        # Keep polling, but do not publish a lease until WPA completes again.
+        if wpa < WpaFirstKeyExchangeState or wpa > WpaCompletedState:
+          return 0'u32
+        if wpa == WpaCompletedState:
+          let lease = allcoreDhcpLeaseIp(netif)
+          if lease != 0'u32: return lease
+        if nowMs() - startedMs >= timeoutMs:
+          break
+        pollNetwork()
+        await yieldNow()
+    return 0'u32
+
   proc announceHttpIp(netif: ptr Netif) =
     discard etharpGratuitous(netif)
     for _ in 0 ..< 8:
       pollNetwork()
 
-  proc observedDhcpIp(): IpAddr =
-    let yiaddr = nimfw_dbg_tcpip_input_dhcp_yiaddr
-    ip4Addr(((yiaddr shr 24) and 0xFF'u32).uint8,
-            ((yiaddr shr 16) and 0xFF'u32).uint8,
-            ((yiaddr shr 8) and 0xFF'u32).uint8,
-            (yiaddr and 0xFF'u32).uint8)
-
-  proc applyObservedDhcpLease(netif: ptr Netif): bool =
-    let yiaddr = nimfw_dbg_tcpip_input_dhcp_yiaddr
-    if yiaddr == 0'u32 or yiaddr == 0xFFFFFFFF'u32:
-      return false
-    var observedIp = observedDhcpIp()
-    var observedMask = ip4Addr(255'u8, 255'u8, 255'u8, 0'u8)
-    # Derive the gateway from the observed lease (x.y.z.1). Everything comes
-    # from DHCP now — no static-config override.
-    var observedGw =
-      ip4Addr(((yiaddr shr 24) and 0xFF'u32).uint8,
-              ((yiaddr shr 16) and 0xFF'u32).uint8,
-              ((yiaddr shr 8) and 0xFF'u32).uint8,
-              1'u8)
-    netifSetAddr(netif, addr observedIp, addr observedMask, addr observedGw)
-    printHex("[M0] allcore_http_dhcp_observed_lease=", netifIp4(netif))
+  proc refreshAllcoreHttpLease(netif: ptr Netif; dhcpActive, radioHealthy: bool;
+                               published: var uint32): uint32 =
+    let lease = if dhcpActive: allcoreConfirmedLeaseIp(netif) else: 0'u32
+    if lease == published: return 0
+    published = 0
+    if lease == 0 or not radioHealthy: return 0
     announceHttpIp(netif)
-    true
+    if allcoreConfirmedLeaseIp(netif) == lease:
+      published = lease
+    lease # A nonzero result is the address considered, even if withdrawn.
 
   proc dumpAllcoreHttpRuntimeDiag() =
     # Heap-corruption telemetry: the TLSF allocator detects double/wild frees
@@ -1536,7 +1761,7 @@ when defined(bl808AllcoreWasmHttp):
     printHex("[M0] allcore_http_auth_cfm_status=", nimfw_dbg_auth_cfm_status)
     printHex("[M0] allcore_http_auth_cfm_hw=", nimfw_dbg_auth_cfm_hw_status)
     printHex("[M0] allcore_http_auth_cfm_thd=", nimfw_dbg_auth_cfm_thd_flags)
-    printHex("[M0] allcore_http_auth_cfm_ack16=", nimfw_dbg_auth_cfm_ack_ok16)
+    printHex("[M0] allcore_http_auth_cfm_final_fail16=", nimfw_dbg_auth_cfm_final_fail16)
     printHex("[M0] allcore_http_auth_cfm_ack23=", nimfw_dbg_auth_cfm_ack_ok23)
     printHex("[M0] allcore_http_auth_cfm_ack_fail=", nimfw_dbg_auth_cfm_ack_fail)
     printHex("[M0] allcore_http_auth_cfm_meta=", nimfw_dbg_auth_cfm_meta)
@@ -1633,7 +1858,7 @@ when defined(bl808AllcoreWasmHttp):
     printHex("[M0] allcore_http_assoc_cfm_status=", nimfw_dbg_assoc_cfm_status)
     printHex("[M0] allcore_http_assoc_cfm_hw=", nimfw_dbg_assoc_cfm_hw_status)
     printHex("[M0] allcore_http_assoc_cfm_thd=", nimfw_dbg_assoc_cfm_thd_flags)
-    printHex("[M0] allcore_http_assoc_cfm_ack16=", nimfw_dbg_assoc_cfm_ack_ok16)
+    printHex("[M0] allcore_http_assoc_cfm_final_fail16=", nimfw_dbg_assoc_cfm_final_fail16)
     printHex("[M0] allcore_http_assoc_cfm_ack23=", nimfw_dbg_assoc_cfm_ack_ok23)
     printHex("[M0] allcore_http_assoc_cfm_ack_fail=", nimfw_dbg_assoc_cfm_ack_fail)
     printHex("[M0] allcore_http_assoc_cfm_meta=", nimfw_dbg_assoc_cfm_meta)
@@ -1646,9 +1871,6 @@ when defined(bl808AllcoreWasmHttp):
     printHex("[M0] allcore_http_sm_rsp_timeout=", nimfw_dbg_sm_rsp_timeout)
     printHex("[M0] allcore_http_sm_rsp_timeout_state=", nimfw_dbg_sm_rsp_timeout_state)
     printHex("[M0] allcore_http_sm_rsp_timeout_rxctrl=", nimfw_dbg_sm_rsp_timeout_rxctrl)
-    printHex("[M0] allcore_http_ack_fallback_auth=", nimfw_dbg_ack_fallback_auth)
-    printHex("[M0] allcore_http_ack_fallback_assoc=", nimfw_dbg_ack_fallback_assoc)
-    printHex("[M0] allcore_http_ack_fallback_last=", nimfw_dbg_ack_fallback_last)
     printHex("[M0] allcore_http_wparsn_set=", nimfw_dbg_wparsn_set)
     printHex("[M0] allcore_http_wparsn_len=", nimfw_dbg_wparsn_len)
     printHex("[M0] allcore_http_vif_ielen_assoc=", nimfw_dbg_vif_ielen_assoc)
@@ -2307,6 +2529,20 @@ proc enclaveWasmTask(): CpsVoidFuture {.cps.} =
       httpEnclaveWasmStatus = WasmLiveSumFailed
     fail("enclave live WASM task result")
 
+proc printPeerHex(name, field: string; value: uint32) {.noinline.} =
+  discard console.sendString("  ")
+  discard console.sendString(name)
+  printHex(field, value)
+
+proc reportPeerStatus(name: string; status, heartbeat, addValue, sumValue: uint32) {.noinline.} =
+  printPeerHex(name, "_status=", status)
+  printPeerHex(name, "_heartbeat=", heartbeat)
+  printPeerHex(name, "_add_detail=", addValue)
+  printPeerHex(name, "_sum_detail=", sumValue)
+  if name == "D0":
+    printHex("  D0_probe2=", sharedRead32(WasmLiveD0Probe2Addr))
+    printHex("  D0_probe3=", sharedRead32(WasmLiveD0Probe3Addr))
+
 proc waitPeer(name: string, statusAddr, heartbeatAddr, addAddr, sumAddr: uint,
               expectedSum: int32): CpsVoidFuture {.cps.} =
   var loops = 0
@@ -2316,13 +2552,8 @@ proc waitPeer(name: string, statusAddr, heartbeatAddr, addAddr, sumAddr: uint,
       let hb = sharedRead32(heartbeatAddr)
       let addValue = cast[int32](sharedRead32(addAddr))
       let sumValue = cast[int32](sharedRead32(sumAddr))
-      printHex("  " & name & "_status=", status)
-      printHex("  " & name & "_heartbeat=", hb)
-      printHex("  " & name & "_add_detail=", cast[uint32](addValue))
-      printHex("  " & name & "_sum_detail=", cast[uint32](sumValue))
-      if name == "D0":
-        printHex("  D0_probe2=", sharedRead32(WasmLiveD0Probe2Addr))
-        printHex("  D0_probe3=", sharedRead32(WasmLiveD0Probe3Addr))
+      when not QuietWifiTrace:
+        reportPeerStatus(name, status, hb, cast[uint32](addValue), cast[uint32](sumValue))
       if status == WasmLiveOk and hb >= WasmLiveMinHeartbeat and
           addValue == 42'i32 and sumValue == expectedSum:
         pass(name & " executed multiple WASM programs under CPS")
@@ -2331,13 +2562,9 @@ proc waitPeer(name: string, statusAddr, heartbeatAddr, addAddr, sumAddr: uint,
       return
     inc loops
     await yieldNow()
-  printHex("  " & name & "_status=", sharedRead32(statusAddr))
-  printHex("  " & name & "_heartbeat=", sharedRead32(heartbeatAddr))
-  printHex("  " & name & "_add_detail=", sharedRead32(addAddr))
-  printHex("  " & name & "_sum_detail=", sharedRead32(sumAddr))
-  if name == "D0":
-    printHex("  D0_probe2=", sharedRead32(WasmLiveD0Probe2Addr))
-    printHex("  D0_probe3=", sharedRead32(WasmLiveD0Probe3Addr))
+  when not QuietWifiTrace:
+    reportPeerStatus(name, sharedRead32(statusAddr), sharedRead32(heartbeatAddr),
+                     sharedRead32(addAddr), sharedRead32(sumAddr))
   if name == "LP":
     let rec = faultRecordSnapshot()
     printHex("  LP_fault_magic=", rec.magic)
@@ -2349,6 +2576,170 @@ proc waitPeer(name: string, statusAddr, heartbeatAddr, addAddr, sumAddr: uint,
   fail(name & " live WASM CPS worker timeout", WasmLiveTimeout)
 
 when defined(bl808AllcoreWasmHttp):
+  var nimfw_dbg_home_wake_queued {.importc.}: uint32
+
+  when defined(bl808WifiDiagLinkDrop):
+    var bootDhcpMiss {.exportc: "allcore_boot_dhcp_miss", volatile.}: array[11, uint32]
+
+    proc recordBootDhcpMiss(started: bool; netif: ptr Netif) {.noinline.} =
+      if bootDhcpMiss[0] != 0: return
+      let flags = if netif != nil: netifFlags(netif) else: 0'u8
+      bootDhcpMiss[1] = started.uint32 or
+        ((bl808_wifi_backend_connected() != 0).uint32 shl 1) or (flags.uint32 shl 8) or
+        ((bl808WpaCurrentState() and 0xFF) shl 16) or ((sm_state.uint32 and 0xFF) shl 24)
+      bootDhcpMiss[2] = nimfw_dbg_dhcp_tx
+      bootDhcpMiss[3] = nimfw_dbg_dhcp_tx_msg
+      bootDhcpMiss[4] = nimfw_dbg_dhcp_cfm_ack_ok
+      bootDhcpMiss[5] = nimfw_dbg_dhcp_cfm_fail
+      bootDhcpMiss[6] = nimfw_dbg_tcpip_input_dhcp_rx
+      bootDhcpMiss[7] = nimfw_dbg_lwip_dhcp_recv_count
+      bootDhcpMiss[8] = nimfw_dbg_lwip_dhcp_offer_count
+      bootDhcpMiss[9] = nimfw_dbg_lwip_dhcp_recv_code
+      bootDhcpMiss[10] = nimfw_dbg_lwip_dhcp_create_count
+      bootDhcpMiss[0] = 0x44484332'u32 # DHC2
+
+  proc startAllcoreBootDhcp(netif: ptr Netif): CpsFuture[bool] {.cps.} =
+    while allcoreWifiWpaReady():
+      when not QuietWifiBringup:
+        discard console.sendLine("[M0] allcore_http_dhcp_start_begin")
+      if startAllcoreDhcp(netif):
+        when not QuietWifiBringup:
+          discard console.sendLine("[M0] allcore_http_dhcp_start_done")
+        return true
+      discard console.sendLine("[M0] allcore_http_dhcp_start_retry")
+      await sleepUs(WifiConnectRetryDelayUs)
+    return false
+
+  when defined(bl808AllcoreWifiApEngineBench):
+    const
+      AllcoreApBenchSsid {.strdefine.} = "Ox64-Allcore-Setup-Bench"
+      AllcoreApBenchPassword {.strdefine.} = ""
+      AllcoreApBenchChannel {.intdefine.} = 1
+    static:
+      doAssert defined(bl808WifiMbedTlsSha1Lease)
+      doAssert AllcoreHttpHoldPeerCoresBeforeWifi == 0
+      doAssert AllcoreApBenchSsid.len in 1 .. 32 and
+        AllcoreApBenchPassword.len in 8 .. 63 and AllcoreApBenchChannel in 1 .. 11
+    var
+      allcoreApHostTiming {.importc: "nimfw_ap_host_result".}: array[6, uint32]
+      allcoreApFwTiming {.importc: "nimfw_ap_timing".}: array[5, uint32]
+      allcoreApShaBackend {.importc: "nim_mbedtls_sha1_backend".}: array[4, uint32]
+      allcoreApMhcr {.exportc: "allcore_ap_mhcr", volatile.}: uint32
+    proc allcoreApLeaseSelftest(): cint
+      {.importc: "bl808_mbedtls_sha1_lease_selftest", cdecl.}
+
+    type AllcoreApSample = object
+      startRc, stopRc, commandUs, keyUs: uint32
+      hw, sw, timeouts, d0Progress, lpProgress: uint32
+      beaconSuccess, primaryMhz, centerMhz: uint32
+
+    when defined(bl808AllcoreWifiApChannelSurvey):
+      const
+        ApSurveyChannels = 11
+        ApSurveyBeaconWaitUs = 450_000'u32
+      static:
+        doAssert defined(bl808WifiNimFw) and defined(bl808WifiApHttpSmoke)
+        doAssert defined(bl808WifiMbedTlsCachedWram)
+        doAssert not defined(bl808AllcoreWifiApPcProfile)
+        doAssert not defined(bl808WifiMbedTlsSha1Profile)
+        doAssert sizeof(AllcoreApSample) == 12 * sizeof(uint32)
+      var
+        allcoreApBeaconDma {.importc: "nimfw_ap_beacon_dma_trace".}: array[12, uint32]
+        allcoreApSurvey {.exportc: "allcore_ap_survey", httpPsramBss.}:
+          array[ApSurveyChannels, AllcoreApSample]
+        allcoreApSurveyMask {.exportc: "allcore_ap_survey_mask", volatile.}: uint32
+
+    proc measureAllcoreAp(channel: int, sample: var AllcoreApSample): bool =
+      let hardwareBefore = allcoreApShaBackend[1]
+      let softwareBefore = allcoreApShaBackend[2]
+      let d0 = sharedRead32(WasmLiveD0HeartbeatAddr)
+      let lp = sharedRead32(WasmLiveLpHeartbeatAddr)
+      var mhcr: uint32
+      {.emit: ["asm volatile(\"csrr %0, 0x7c1\" : \"=r\"(", mhcr, ") :: \"memory\");"].}
+      allcoreApMhcr = mhcr
+      when defined(bl808AllcoreWifiApPcProfile):
+        if not startApPcProfile():
+          discard console.sendLine("[FAIL] AP PC sampler timer is unavailable")
+          return false
+      let rc = wifiStartAp(AllcoreApBenchSsid, AllcoreApBenchPassword, channel)
+      when defined(bl808AllcoreWifiApPcProfile):
+        stopApPcProfile()
+      sample = AllcoreApSample(
+        startRc: cast[uint32](rc.ord.int32), stopRc: high(uint32),
+        commandUs: allcoreApHostTiming[5] - allcoreApHostTiming[4],
+        keyUs: allcoreApFwTiming[2] - allcoreApFwTiming[1],
+        hw: allcoreApShaBackend[1] - hardwareBefore,
+        sw: allcoreApShaBackend[2] - softwareBefore, timeouts: allcoreApShaBackend[3],
+        d0Progress: sharedRead32(WasmLiveD0HeartbeatAddr) - d0,
+        lpProgress: sharedRead32(WasmLiveLpHeartbeatAddr) - lp)
+      when defined(bl808AllcoreWifiApChannelSurvey):
+        if rc == wifiOk:
+          # Require a new DMA DONE+success from the beacon queue after start.
+          let successBefore = volatileLoad(addr allcoreApBeaconDma[4])
+          let waitStart = regRead(ClicMtimeBase)
+          while regRead(ClicMtimeBase) - waitStart < ApSurveyBeaconWaitUs:
+            pollNetwork()
+            sample.beaconSuccess = volatileLoad(addr allcoreApBeaconDma[4]) - successBefore
+            if sample.beaconSuccess != 0: break
+          var frequencies: array[2, uint32]
+          phy_get_channel_raw(addr frequencies[0], 0)
+          sample.primaryMhz = frequencies[0] shr 16
+          sample.centerMhz = frequencies[1] and 0xFFFF'u32
+      printHex("[M0] allcore_ap_command_us=", sample.commandUs)
+      printHex("[M0] allcore_ap_key_us=", sample.keyUs)
+      printHex("[M0] allcore_ap_hw_blocks=", sample.hw)
+      printHex("[M0] allcore_ap_sw_blocks=", sample.sw)
+      printHex("[M0] allcore_ap_engine_timeouts=", sample.timeouts)
+      printHex("[M0] allcore_ap_d0_heartbeat_delta=", sample.d0Progress)
+      printHex("[M0] allcore_ap_lp_heartbeat_delta=", sample.lpProgress)
+      if rc == wifiOk:
+        sample.stopRc = cast[uint32](wifiStopAp().ord.int32)
+      if rc != wifiOk or sample.stopRc != 0:
+        discard console.sendLine("[FAIL] all-core AP start/stop")
+        return false
+      if sample.keyUs == 0 or sample.commandUs < sample.keyUs or sample.commandUs >= 200_000 or
+          sample.hw != 32_769 or sample.sw != 0 or sample.timeouts != 0 or
+          sample.d0Progress == 0 or sample.lpProgress == 0:
+        discard console.sendLine("[FAIL] all-core AP timing, hardware blocks or peer progress")
+        return false
+      when defined(bl808AllcoreWifiApChannelSurvey):
+        let expectedMhz = 2412'u32 + 5'u32 * (channel.uint32 - 1)
+        if sample.beaconSuccess == 0 or sample.primaryMhz != expectedMhz or
+            sample.centerMhz != expectedMhz:
+          discard console.sendLine("[FAIL] all-core AP beacon or channel readback")
+          return false
+      discard console.sendLine("[PASS] all-core AP startup under 200 ms with live peers")
+      true
+
+    proc runAllcoreApEngineBench(): bool =
+      if not wifiShaDmaWindowReady() or not beginShaApKeySetup():
+        discard console.sendLine("[FAIL] all-core AP SHA DMA setup")
+        return false
+      let checkHardwareBefore = allcoreApShaBackend[1]
+      let softwareBefore = allcoreApShaBackend[2]
+      let match = allcoreApLeaseSelftest() != 0
+      let released = finishShaApKeySetup()
+      if not match or not released or allcoreApShaBackend[1] == checkHardwareBefore or
+          allcoreApShaBackend[2] != softwareBefore:
+        discard console.sendLine("[FAIL] all-core AP SHA known-answer check")
+        return false
+      var sample: AllcoreApSample
+      when defined(bl808AllcoreWifiApChannelSurvey):
+        if bl_msg_get_channel_nums() != ApSurveyChannels:
+          discard console.sendLine("[FAIL] all-core AP survey expected the 11-channel plan")
+          return false
+        for channel in 1 .. ApSurveyChannels:
+          printHex("[M0] allcore_ap_survey_channel=", channel.uint32)
+          let passed = measureAllcoreAp(channel, sample)
+          allcoreApSurvey[channel - 1] = sample
+          dcacheCleanRange(cast[uint](addr allcoreApSurvey[channel - 1]), sizeof(sample).uint)
+          if not passed: return false
+          allcoreApSurveyMask = allcoreApSurveyMask or (1'u32 shl (channel - 1))
+        discard console.sendLine("[PASS] all-core AP channel survey complete")
+        return true
+      else:
+        return measureAllcoreAp(AllcoreApBenchChannel, sample)
+
   proc runAllcoreHttpManagerAfterSmoke(): CpsVoidFuture {.cps.} =
     if failed != 0:
       return
@@ -2359,38 +2750,56 @@ when defined(bl808AllcoreWasmHttp):
       discard console.sendLine("[M0] allcore_http_hold_lp_begin")
       holdLPReset()
       discard console.sendLine("[M0] allcore_http_hold_lp_done")
-    else:
+    elif not QuietWifiBringup:
       discard console.sendLine("[M0] allcore_http_peer_cores_left_running")
-    discard console.sendLine("[M0] allcore_http_wifi_reset_settle_begin")
+    when not defined(bl808WifiDiagLinkDrop):
+      discard console.sendLine("[M0] allcore_http_wifi_reset_settle_begin")
     await sleepUs(AllcoreHttpWifiResetSettleUs)
-    discard console.sendLine("[M0] allcore_http_wifi_reset_settle_done")
-    discard console.sendLine("[M0] Starting all-core WASM HTTP manager")
-    discard console.sendLine("[M0] allcore_http_lwip_init_begin")
+    when not defined(bl808WifiDiagLinkDrop):
+      discard console.sendLine("[M0] allcore_http_wifi_reset_settle_done")
+    when not QuietWifiBringup:
+      discard console.sendLine("[M0] Starting all-core WASM HTTP manager")
+    when not defined(bl808WifiDiagLinkDrop):
+      discard console.sendLine("[M0] allcore_http_lwip_init_begin")
     lwipInit()
-    discard console.sendLine("[M0] allcore_http_lwip_init_done")
-    discard console.sendLine("[M0] allcore_http_wifi_post_lwip_settle_begin")
+    when not defined(bl808WifiDiagLinkDrop):
+      discard console.sendLine("[M0] allcore_http_lwip_init_done")
+      discard console.sendLine("[M0] allcore_http_wifi_post_lwip_settle_begin")
     await sleepUs(AllcoreHttpWifiPostLwipSettleUs)
-    discard console.sendLine("[M0] allcore_http_wifi_post_lwip_settle_done")
+    when not defined(bl808WifiDiagLinkDrop):
+      discard console.sendLine("[M0] allcore_http_wifi_post_lwip_settle_done")
     when defined(bl808AllcoreWasmHttpJtagGate):
       await waitAllcoreHttpWifiJtagGate()
-    discard console.sendLine("[M0] allcore_http_wifi_init_begin")
+    when not QuietWifiBringup:
+      discard console.sendLine("[M0] allcore_http_wifi_init_begin")
     if wifiInit() != wifiOk:
       discard console.sendLine("[FAIL] all-core HTTP wifi init")
       return
-    discard console.sendLine("[M0] allcore_http_wifi_init_done")
+    when not (BenchConnectedScan or QuietWifiBringup):
+      discard console.sendLine("[M0] allcore_http_wifi_init_done")
+    when defined(bl808AllcoreWifiApEngineBench):
+      if not runAllcoreApEngineBench(): return
     wifiInstallServiceHook(periodUs = 1000'u32, iterations = 16'u32)
     var connectAttempts = 0'u32
+    var joinedTarget = wifiTargetPrimary
+    var netif: ptr Netif
     while true:
       inc connectAttempts
-      printHex("[M0] allcore_http_wifi_attempt=", connectAttempts)
-      discard console.sendLine("[M0] allcore_http_wifi_scan_begin")
+      when not QuietWifiBringup:
+        printHex("[M0] allcore_http_wifi_attempt=", connectAttempts)
+      when not (BenchConnectedScan or QuietWifiBringup):
+        discard console.sendLine("[M0] allcore_http_wifi_scan_begin")
       let scanItems = await wifiScanAsync(30_000'u32)
-      printHex("[M0] allcore_http_wifi_scan_items=", scanItems)
-      printHex("[M0] allcore_http_wifi_scan_done=", bl808_wifi_backend_scan_done_count())
-      printHex("[M0] allcore_http_wifi_scan_diag=", bl808_wifi_backend_scan_diag_count())
-      let scanMatches = dumpMatchingScanEntries()
-      dumpAllcoreHttpScanDiag()
-      if scanMatches == 0'u32:
+      when not QuietWifiBringup:
+        printHex("[M0] allcore_http_wifi_scan_items=", scanItems)
+      when not (BenchConnectedScan or LeanWifiStartup):
+        printHex("[M0] allcore_http_wifi_scan_done=", bl808_wifi_backend_scan_done_count())
+        printHex("[M0] allcore_http_wifi_scan_diag=", bl808_wifi_backend_scan_diag_count())
+      let target = bootWifiTarget(matchingKnownScanEntries(true),
+                                  connectAttempts > WifiFallbackAfterAttempts.uint32)
+      when defined(bl808AllcoreWifiVerboseDiag):
+        dumpAllcoreHttpScanDiag()
+      if target == wifiTargetNone:
         discard console.sendLine("[M0] allcore_http_wifi_scan_no_match_retry")
         await sleepUs(WifiConnectRetryDelayUs)
         continue
@@ -2401,135 +2810,120 @@ when defined(bl808AllcoreWasmHttp):
       elif scanItems == 0'u32:
         discard console.sendLine("[M0] allcore_http_wifi_scan_empty_cache_connect")
 
-      discard console.sendLine("[M0] allcore_http_wifi_connect_begin")
-      let useFallback =
-        WifiFallbackSsid.len > 0 and
-        connectAttempts > WifiFallbackAfterAttempts.uint32
-      let connectSsid = if useFallback: WifiFallbackSsid else: WifiSsid
-      let connectChannel =
-        if useFallback and WifiFallbackChannel > 0:
-          WifiFallbackChannel.uint8
-        else:
-          WifiChannel.uint8
-      if useFallback:
+      when not QuietWifiBringup:
+        discard console.sendLine("[M0] allcore_http_wifi_connect_begin")
+      if target == wifiTargetFallback:
         discard console.sendLine("[M0] allcore_http_wifi_fallback_ssid")
       let connectResult = await wifiConnectAsync(
-        connectSsid, WifiPassword, connectChannel, 30_000'u32)
-      if connectResult == wifiOk:
-        let wpaDeadline = nowMs() + 10_000'u32
-        while bl808WpaCurrentState() != WpaCompletedState and nowMs() < wpaDeadline:
-          pollNetwork()
-          await yieldNow()
-        printHex("[M0] allcore_http_wpa_ready_state=", bl808WpaCurrentState())
-        if bl808WpaCurrentState() != WpaCompletedState:
-          printHex("[M0] allcore_http_wifi_status=", bl808_wifi_backend_last_status().uint32)
-          printHex("[M0] allcore_http_wifi_reason=", bl808_wifi_backend_last_reason().uint32)
-          dumpAllcoreHttpConnectDiag()
-          discard console.sendLine("[M0] allcore_http_wpa_not_ready_retry")
-          let discResult = await wifiDisconnectAsync(10_000'u32)
-          printHex("[M0] allcore_http_wpa_retry_disconnect=", discResult.uint32)
-          await sleepUs(WifiConnectRetryDelayUs)
-          continue
+        knownWifiSsid(target), WifiPassword, knownWifiChannel(target), 30_000'u32)
+      if connectResult != wifiOk:
         printHex("[M0] allcore_http_wifi_status=", bl808_wifi_backend_last_status().uint32)
         printHex("[M0] allcore_http_wifi_reason=", bl808_wifi_backend_last_reason().uint32)
-        dumpAllcoreHttpConnectDiag()
-        break
-      printHex("[M0] allcore_http_wifi_status=", bl808_wifi_backend_last_status().uint32)
-      printHex("[M0] allcore_http_wifi_reason=", bl808_wifi_backend_last_reason().uint32)
-      printHex("[M0] allcore_http_scan_done=", bl808_wifi_backend_scan_done_count())
-      printHex("[M0] allcore_http_scan_items=", bl808_wifi_backend_scan_count())
-      printHex("[M0] allcore_http_scan_diag=", bl808_wifi_backend_scan_diag_count())
-      dumpAllcoreHttpConnectDiag()
-      discard console.sendLine("[M0] allcore_http_wifi_connect_retry")
-      await sleepUs(WifiConnectRetryDelayUs)
-    discard console.sendLine("[M0] allcore_http_wifi_connect_done")
-    var netifRaw = wifiGetNetif()
-    while netifRaw == nil:
-      discard console.sendLine("[M0] allcore_http_netif_missing_retry")
-      await sleepUs(WifiConnectRetryDelayUs)
-      netifRaw = wifiGetNetif()
-    let netif = cast[ptr Netif](netifRaw)
-
-    var dhcpAttempts = 0'u32
-    while netifIp4(netif) == 0'u32:
-      discard console.sendLine("[M0] allcore_http_dhcp_start_begin")
-      if dhcpStart(netif) != ErrOk:
-        discard console.sendLine("[M0] allcore_http_dhcp_start_retry")
+        when not (BenchConnectedScan or LeanWifiStartup):
+          printHex("[M0] allcore_http_scan_done=", bl808_wifi_backend_scan_done_count())
+          printHex("[M0] allcore_http_scan_items=", bl808_wifi_backend_scan_count())
+          printHex("[M0] allcore_http_scan_diag=", bl808_wifi_backend_scan_diag_count())
+        when defined(bl808AllcoreWifiVerboseDiag):
+          dumpAllcoreHttpConnectDiag()
+        discard console.sendLine("[M0] allcore_http_wifi_connect_retry")
         await sleepUs(WifiConnectRetryDelayUs)
         continue
-      discard console.sendLine("[M0] allcore_http_dhcp_start_done")
-      let deadline = nowMs() + DhcpTimeoutMs
-      while netifIp4(netif) == 0'u32 and nowMs() < deadline:
-        pollNetwork()
-        await yieldNow()
-      if netifIp4(netif) == 0'u32:
-        printHex("[M0] allcore_http_dhcp_tx=", nimfw_dbg_dhcp_tx)
-        printHex("[M0] allcore_http_dhcp_tx_msg=", nimfw_dbg_dhcp_tx_msg)
-        printHex("[M0] allcore_http_dhcp_cfm_ok=", nimfw_dbg_dhcp_cfm_ok)
-        printHex("[M0] allcore_http_dhcp_cfm_fail=", nimfw_dbg_dhcp_cfm_fail)
-        printHex("[M0] allcore_http_tx_sec_calls=", nimfw_dbg_tx_sec_hdr_calls)
-        printHex("[M0] allcore_http_tx_sec_no_keymat=", nimfw_dbg_tx_sec_hdr_no_keymat)
-        printHex("[M0] allcore_http_tx_sec_no_keyslot=", nimfw_dbg_tx_sec_hdr_no_keyslot)
-        printHex("[M0] allcore_http_tx_sec_cipher=", nimfw_dbg_tx_sec_hdr_cipher)
-        printHex("[M0] allcore_http_tx_sec_len=", nimfw_dbg_tx_sec_hdr_len)
-        printHex("[M0] allcore_http_tx_sec_append=", nimfw_dbg_tx_sec_hdr_append)
-        printHex("[M0] allcore_http_tx_sec_miss_meta=", nimfw_dbg_tx_sec_hdr_miss_meta)
-        printHex("[M0] allcore_http_tx_sec_miss_len=", nimfw_dbg_tx_sec_hdr_miss_len)
-        printHex("[M0] allcore_http_tx_sec_miss_keymat=", nimfw_dbg_tx_sec_hdr_miss_keymat)
-        printHex("[M0] allcore_http_tx_sec_sta_key0=", nimfw_dbg_tx_sec_hdr_sta_key0)
-        printHex("[M0] allcore_http_tx_sec_sta_key1=", nimfw_dbg_tx_sec_hdr_sta_key1)
-        printHex("[M0] allcore_http_tx_sec_sta_key2=", nimfw_dbg_tx_sec_hdr_sta_key2)
-        printHex("[M0] allcore_http_dhcp_tx_sec=", nimfw_dbg_dhcp_tx_sec)
-        printHex("[M0] allcore_http_dhcp_tx_sec_hdr0=", nimfw_dbg_dhcp_tx_sec_hdr0)
-        printHex("[M0] allcore_http_dhcp_tx_sec_hdr1=", nimfw_dbg_dhcp_tx_sec_hdr1)
-        printHex("[M0] allcore_http_dhcp_tx_sec_key=", nimfw_dbg_dhcp_tx_sec_key)
-        printHex("[M0] allcore_http_dhcp_tx_sec_ctl=", nimfw_dbg_dhcp_tx_sec_ctl)
-        printHex("[M0] allcore_http_dhcp_rx=", nimfw_dbg_tcpip_input_dhcp_rx)
-        printHex("[M0] allcore_http_lwip_dhcp_rx=", nimfw_dbg_lwip_dhcp_recv_count)
-        printHex("[M0] allcore_http_lwip_dhcp_offer=", nimfw_dbg_lwip_dhcp_offer_count)
-        dumpAllcoreHttpRuntimeDiag()
-        inc dhcpAttempts
-        if applyObservedDhcpLease(netif):
-          break
-        dhcpStop(netif)
-        # No static-IP fallback: keep re-running DHCP until it succeeds. A
-        # persistently failing DHCP usually means the ASSOCIATION is broken
-        # (silent deauth, stale keys), not lwIP — so every few failed attempts
-        # tear the link down and re-join before trying DHCP again. This is the
-        # same recovery the steady-state supervision uses.
-        if dhcpAttempts mod DhcpRelinkEveryAttempts == 0'u32:
-          printHex("[M0] allcore_http_dhcp_relink=", dhcpAttempts)
-          discard await wifiDisconnectAsync(10_000'u32)
-          discard await wifiScanAsync(30_000'u32)
-          let relinkRc = await wifiConnectAsync(WifiSsid, WifiPassword,
-                                                WifiChannel.uint8, 30_000'u32)
-          printHex("[M0] allcore_http_dhcp_relink_rc=", relinkRc.uint32)
-          if relinkRc == wifiOk:
-            let wpaDeadline = nowMs() + WifiReconnectWpaTimeoutMs
-            while bl808WpaCurrentState() != WpaCompletedState and
-                nowMs() < wpaDeadline:
-              pollNetwork()
-              await yieldNow()
-            printHex("[M0] allcore_http_dhcp_relink_wpa=", bl808WpaCurrentState())
-        discard console.sendLine("[M0] allcore_http_dhcp_timeout_retry")
+
+      let wpaReady = await waitForAllcoreWpa(10_000'u32)
+      printHex("[M0] allcore_http_wpa_ready_state=", bl808WpaCurrentState())
+      if not QuietWifiBringup or not wpaReady:
+        printHex("[M0] allcore_http_wifi_status=", bl808_wifi_backend_last_status().uint32)
+        printHex("[M0] allcore_http_wifi_reason=", bl808_wifi_backend_last_reason().uint32)
+      when defined(bl808AllcoreWifiVerboseDiag):
+        dumpAllcoreHttpConnectDiag()
+      if not wpaReady:
+        discard console.sendLine("[M0] allcore_http_wpa_not_ready_retry")
+        let discResult = await wifiDisconnectAsync(10_000'u32)
+        printHex("[M0] allcore_http_wpa_retry_disconnect=", discResult.uint32)
         await sleepUs(WifiConnectRetryDelayUs)
-    discard console.sendLine("[M0] allcore_http_dhcp_done")
-    httpIp = netifIp4(netif)
-    if httpIp != 0'u32:
-      printHex("[M0] allcore_http_dhcp_observed_lease=", httpIp)
-      announceHttpIp(netif)
+        continue
+      when not (BenchConnectedScan or QuietWifiBringup):
+        discard console.sendLine("[M0] allcore_http_wifi_connect_done")
+
+      netif = cast[ptr Netif](wifiGetNetif())
+      while netif == nil and allcoreWifiWpaReady():
+        discard console.sendLine("[M0] allcore_http_netif_missing_retry")
+        await sleepUs(WifiConnectRetryDelayUs)
+        netif = cast[ptr Netif](wifiGetNetif())
+      var dhcpStarted = false
+      if netif != nil:
+        dhcpStarted = await startAllcoreBootDhcp(netif)
+      if dhcpStarted:
+        let lease = await waitForAllcoreDhcpLease(netif, DhcpTimeoutMs,
+          max(DhcpRelinkEveryAttempts, 1'u32))
+        if lease != 0'u32:
+          announceHttpIp(netif)
+          if allcoreConfirmedLeaseIp(netif) == lease:
+            joinedTarget = target
+            httpIp = lease
+            break
+      when defined(bl808WifiDiagLinkDrop):
+        recordBootDhcpMiss(dhcpStarted, netif)
+      if dhcpStarted:
+        when not defined(bl808WifiDiagWarmScan) and not defined(bl808WifiDiagWarmScanCompact):
+          # Keep the reconnect diagnostics below the fixed LP slot.
+          printHex("[M0] allcore_http_dhcp_tx=", nimfw_dbg_dhcp_tx)
+          printHex("[M0] allcore_http_dhcp_tx_msg=", nimfw_dbg_dhcp_tx_msg)
+          printHex("[M0] allcore_http_dhcp_cfm_ok=", nimfw_dbg_dhcp_cfm_ok)
+          printHex("[M0] allcore_http_dhcp_cfm_fail=", nimfw_dbg_dhcp_cfm_fail)
+          printHex("[M0] allcore_http_tx_sec_calls=", nimfw_dbg_tx_sec_hdr_calls)
+          printHex("[M0] allcore_http_tx_sec_no_keymat=", nimfw_dbg_tx_sec_hdr_no_keymat)
+          printHex("[M0] allcore_http_tx_sec_no_keyslot=", nimfw_dbg_tx_sec_hdr_no_keyslot)
+          printHex("[M0] allcore_http_tx_sec_cipher=", nimfw_dbg_tx_sec_hdr_cipher)
+          printHex("[M0] allcore_http_tx_sec_len=", nimfw_dbg_tx_sec_hdr_len)
+          printHex("[M0] allcore_http_tx_sec_append=", nimfw_dbg_tx_sec_hdr_append)
+          printHex("[M0] allcore_http_tx_sec_miss_meta=", nimfw_dbg_tx_sec_hdr_miss_meta)
+          printHex("[M0] allcore_http_tx_sec_miss_len=", nimfw_dbg_tx_sec_hdr_miss_len)
+          printHex("[M0] allcore_http_tx_sec_miss_keymat=", nimfw_dbg_tx_sec_hdr_miss_keymat)
+          printHex("[M0] allcore_http_tx_sec_sta_key0=", nimfw_dbg_tx_sec_hdr_sta_key0)
+          printHex("[M0] allcore_http_tx_sec_sta_key1=", nimfw_dbg_tx_sec_hdr_sta_key1)
+          printHex("[M0] allcore_http_tx_sec_sta_key2=", nimfw_dbg_tx_sec_hdr_sta_key2)
+          printHex("[M0] allcore_http_dhcp_tx_sec=", nimfw_dbg_dhcp_tx_sec)
+          printHex("[M0] allcore_http_dhcp_tx_sec_hdr0=", nimfw_dbg_dhcp_tx_sec_hdr0)
+          printHex("[M0] allcore_http_dhcp_tx_sec_hdr1=", nimfw_dbg_dhcp_tx_sec_hdr1)
+          printHex("[M0] allcore_http_dhcp_tx_sec_key=", nimfw_dbg_dhcp_tx_sec_key)
+          printHex("[M0] allcore_http_dhcp_tx_sec_ctl=", nimfw_dbg_dhcp_tx_sec_ctl)
+          printHex("[M0] allcore_http_dhcp_rx=", nimfw_dbg_tcpip_input_dhcp_rx)
+          printHex("[M0] allcore_http_lwip_dhcp_rx=", nimfw_dbg_lwip_dhcp_recv_count)
+          printHex("[M0] allcore_http_lwip_dhcp_offer=", nimfw_dbg_lwip_dhcp_offer_count)
+        when defined(bl808AllcoreWifiVerboseDiag):
+          dumpAllcoreHttpRuntimeDiag()
+        dhcpStop(netif)
+      # Every replacement goes through scan, candidate selection and WPA again.
+      printHex("[M0] allcore_http_dhcp_relink=", connectAttempts)
+      discard await wifiDisconnectAsync(10_000'u32)
+      await sleepUs(WifiConnectRetryDelayUs)
+    when not defined(bl808WifiDiagLinkDrop):
+      discard console.sendLine("[M0] allcore_http_dhcp_done")
+    printHex("[M0] allcore_http_dhcp_observed_lease=", httpIp)
+    if BenchConnectedScan and not defined(bl808WifiBenchStationDhcpRetire):
+      let wakeBefore = nimfw_dbg_home_wake_queued
+      let associatedResults = await wifiScanAsync(30_000'u32)
+      if associatedResults != 0 and allcoreWifiWpaReady() and netifIp4(netif) == httpIp and
+          httpIp != 0 and nimfw_dbg_home_wake_queued != wakeBefore:
+        discard console.sendLine("[PASS] connected scan returned home")
+      else:
+        discard console.sendLine("[FAIL] connected scan return")
     while true:
-      discard console.sendLine("[M0] allcore_http_listen_begin")
+      when not defined(bl808WifiDiagLinkDrop):
+        discard console.sendLine("[M0] allcore_http_listen_begin")
       if startAllcoreHttpServer(HttpPort.uint16):
         break
       discard console.sendLine("[M0] allcore_http_listen_retry")
       await sleepUs(HttpListenRetryDelayUs)
-    discard console.sendLine("[M0] allcore_http_listen_done")
-    discard console.sendString("All-core WASM HTTP manager: http://")
-    writeIp4(httpIp)
-    discard console.sendString("/")
-    discard console.sendLine("")
-    dumpAllcoreHttpRuntimeDiag()
+    when not defined(bl808WifiDiagLinkDrop):
+      discard console.sendLine("[M0] allcore_http_listen_done")
+    when not LeanWifiStartup:
+      discard console.sendString("All-core WASM HTTP manager: http://")
+      writeIp4(httpIp)
+      discard console.sendLine("/")
+    when defined(bl808AllcoreWifiVerboseDiag):
+      dumpAllcoreHttpRuntimeDiag()
     dumpHeapMilestone("post_wifi")
     # Start the hardware watchdog HERE — after the long, known-slow boot (smoke
     # + WiFi bring-up + first DHCP) so those phases never trip it. From here on
@@ -2538,11 +2932,19 @@ when defined(bl808AllcoreWasmHttp):
     # MAC mid-reconnect — the CPU freezes and the scheduler stops advancing)
     # leaves the WDT unfed and the hardware reboots cleanly instead of bricking.
     watchdogInit(timer0, WifiWedgeWdtMs)
+    when defined(bl808WifiBenchStaUapsd):
+      # Association keeps PS off while the controlled port is closed.
+      discard wifi_mgmr_api_fw_powersaving(AllcoreHttpBenchStaPsMode)
     discard console.sendLine("Ready for all-core WASM HTTP manager requests")
     var lastArpMs = nowMs()
+    var benchReadySinceMs = lastArpMs
+    var benchReconnects = 0'u32
     var lastDiagMs = lastArpMs
     var linkDownSinceMs = 0'u32     # first tick we observed the STA disassociated (0 = up)
     var reconnects = 0'u32
+    var dhcpActive = true           # the client that brought up HTTP at boot
+    var reconnectLeasePending = false
+    var reconnectForced = false
     var lastRxSeen = nimfw_dbg_rxl_frame_seen  # RX-liveness baseline
     var lastRxAdvanceMs = nowMs()
     # TX-completion-liveness baselines. Witness = cfm_push ONLY (host-data
@@ -2553,12 +2955,17 @@ when defined(bl808AllcoreWasmHttp):
     var lastTxEnq = nimfw_dbg_tx_arp + nimfw_dbg_tx_tcp80
     var txStuckSinceMs = 0'u32                  # 0 = no open freeze window
     var lastEnqAdvanceMs = nowMs()
+    when defined(bl808WifiDiagLinkDrop):
+      var linkDropObserved: AllcoreLinkDrop
+      var reconnectStartedMs: uint32
+      when defined(bl808WifiNimFw):
+        var lastStaRxSampleMs = nowMs()
     while true:
       pollNetwork()
       bumpHeartbeat(heartbeat)
       if httpEnclaveWasmStatus == WasmLiveOk:
         bumpHeartbeat(httpEnclaveHeartbeat)
-      let currentMs = nowMs()
+      var currentMs = nowMs()
 
 
       # Steady-state link supervision. The AP can deauth us (Frog does) or the
@@ -2566,13 +2973,9 @@ when defined(bl808AllcoreWasmHttp):
       # this the HTTP manager stays bound to a dead association forever. Detect a
       # SUSTAINED disassociation (debounced so a transient blip does not trigger
       # a needless reconnect) and recover in place — never reboot.
-      # A drop is real if the driver reports disassociated, OR WPA has fallen out
-      # of the completed state, OR the MAC has stopped receiving ANY 802.11
-      # frames. The first two are not sufficient alone: on a silent AP deauth
-      # both the backend flag and the WPA state can stay "connected" while the RF
-      # link is actually dead. The reliable ground truth is RX liveness — the MAC
-      # frame counter (rxl_frame_seen) ticks continuously from beacons while
-      # associated and FREEZES when off-air. Track how long it has been stalled.
+      # MM watches the associated peer and reports a link loss to the driver.
+      # This aggregate RX counter only catches a stalled receive path; frames
+      # from other BSSs can advance it even after the peer is gone.
       let rxSeen = nimfw_dbg_rxl_frame_seen
       if rxSeen != lastRxSeen:
         lastRxSeen = rxSeen
@@ -2601,72 +3004,203 @@ when defined(bl808AllcoreWasmHttp):
                    currentMs - lastEnqAdvanceMs < WifiTxDeadDemandRecentMs
       if txDead and linkDownSinceMs == 0'u32:
         printHex("[M0] allcore_http_txdead_detected=", nimfw_dbg_txtrig_entry)
-      let linkUp = bl808_wifi_backend_connected() != 0 and
-                   bl808WpaCurrentState() == WpaCompletedState and
-                   not rxStalled and
-                   not txDead
-      if linkUp:
+      let wpaReadyNow = allcoreWifiWpaReady()
+      when defined(bl808WifiDiagLinkDrop) and defined(bl808WifiNimFw):
+        if wpaReadyNow and currentMs - lastStaRxSampleMs >= 250:
+          lastStaRxSampleMs = currentMs
+          sampleAllcoreStaRx(currentMs)
+      var radioHealthy = wpaReadyNow and not rxStalled and not txDead
+      let previousIp = httpIp
+      let lease = refreshAllcoreHttpLease(netif, dhcpActive, radioHealthy, httpIp)
+      if lease != 0:
+        currentMs = nowMs()
+        if httpIp != 0:
+          lastArpMs = currentMs
+        else:
+          radioHealthy = allcoreWifiWpaReady()
+      if reconnectLeasePending:
+        if httpIp != 0:
+          reconnectLeasePending = false
+          when defined(bl808WifiBenchStaUapsd):
+            discard wifi_mgmr_api_fw_powersaving(AllcoreHttpBenchStaPsMode)
+          when not defined(bl808WifiBenchStationDhcpRetire):
+            printHex("[M0] allcore_http_reconnect_ip=", httpIp)
+          discard console.sendLine("[M0] allcore_http_reconnect_done")
+          when ForceReconnectBench:
+            if reconnectForced:
+              inc benchReconnects
+              benchReadySinceMs = currentMs
+              printHex("[M0] allcore_http_bench_reconnect_passes=", benchReconnects)
+        elif lease != 0:
+          when defined(bl808WifiDiagLinkDrop):
+            recordFirstReconnectFailure(reconnectForced, reconnects, reconnectStartedMs,
+              reconnectLinkAfterLease, bl808WpaCurrentState(), lease)
+      elif radioHealthy and httpIp != previousIp:
+        when not defined(bl808WifiBenchStationDhcpRetire):
+          printHex("[M0] allcore_http_dhcp_address=", httpIp)
+      # A NAK or expiry can clear the address while lwIP rediscovers in place.
+      let linkUp = dhcpActive and radioHealthy
+      let forceReconnect = ForceReconnectBench and
+        benchReconnects < AllcoreHttpBenchReconnectCount and linkUp and httpIp != 0 and
+        currentMs - benchReadySinceMs >= AllcoreHttpBenchReconnectMs
+      if linkUp and not forceReconnect:
         linkDownSinceMs = 0'u32
       else:
-        if linkDownSinceMs == 0'u32:
+        if linkDownSinceMs == 0'u32 and not forceReconnect:
           linkDownSinceMs = currentMs
+          when defined(bl808WifiDiagLinkDrop):
+            if linkDropSnapshot[0] == 0:
+              linkDropObserved = observeAllcoreLinkDrop(currentMs, currentMs - lastRxAdvanceMs,
+                (if txStuckSinceMs != 0: currentMs - txStuckSinceMs else: 0'u32),
+                rxStalled, txDead, previousIp != 0)
           printHex("[M0] allcore_http_link_down_detected=", bl808WpaCurrentState())
-        elif currentMs - linkDownSinceMs >= WifiLinkLostConfirmMs:
+          when not defined(bl808WifiDiagLinkDrop):
+            printHex("[M0] allcore_http_ld_backend=", bl808_wifi_backend_connected().uint32)
+            printHex("[M0] allcore_http_ld_rxstalled=", rxStalled.uint32)
+            printHex("[M0] allcore_http_ld_txdead=", txDead.uint32)
+            printHex("[M0] allcore_http_ld_rxl_seen=", nimfw_dbg_rxl_frame_seen)
+            printHex("[M0] allcore_http_ld_procflag=", nimfw_dbg_rxl_processing_flag())
+            printHex("[M0] allcore_http_ld_mmstate=", nimfw_dbg_mm_state())
+        elif forceReconnect or currentMs - linkDownSinceMs >= WifiLinkLostConfirmMs:
+          when defined(bl808WifiDiagLinkDrop):
+            if not forceReconnect: publishFirstAllcoreLinkDrop(linkDropObserved)
+          when ForceReconnectBench and not defined(bl808WifiBenchStationDhcpRetire):
+            if forceReconnect:
+              discard console.sendLine("[M0] allcore_http_bench_reconnect")
+              printHex("[M0] allcore_http_bench_reconnect_attempt=", benchReconnects + 1)
+            elif benchReconnects < AllcoreHttpBenchReconnectCount:
+              discard console.sendLine("[M0] allcore_http_bench_reconnect_unexpected")
           inc reconnects
-          printHex("[M0] allcore_http_reconnect_begin=", reconnects)
-          # Tear down the stale association before re-joining.
-          discard await wifiDisconnectAsync(10_000'u32)
-          # Re-scan then re-join the same network.
-          discard await wifiScanAsync(30_000'u32)
-          let rc = await wifiConnectAsync(WifiSsid, WifiPassword,
-                                          WifiChannel.uint8, 30_000'u32)
-          printHex("[M0] allcore_http_reconnect_connect_rc=", rc.uint32)
+          when not QuietWifiTrace and not defined(bl808WifiBenchStationDhcpRetire):
+            printHex("[M0] allcore_http_reconnect_begin=", reconnects)
+          httpIp = 0
+          dhcpActive = false
+          reconnectLeasePending = false
+          when defined(bl808WifiDiagLinkDrop) and defined(bl808WifiNimFw):
+            staRxEvidence[0] = 0
+          reconnectForced = forceReconnect
+          when defined(bl808WifiDiagLinkDrop):
+            reconnectStartedMs = currentMs
+          # Ordinary recovery also covers loss without a station indication.
+          when defined(bl808WifiBenchStationDhcpRetire):
+            if not forceReconnect: dhcpStop(netif)
+          else:
+            dhcpStop(netif)
+          let disconnectResult = await wifiDisconnectAsync(10_000'u32)
+          when defined(bl808WifiBenchStationDhcpRetire):
+            if forceReconnect:
+              stationDhcpRetireProbe[1] = (stationDhcpRetireProbe[1] and 8) or
+                (disconnectResult == wifiOk).uint32 or
+                ((dhcpSuppliedAddress(netif) == 0 and netifIp4(netif) == 0).uint32 shl 1)
+              stationDhcpRetireProbe[2] = nimfw_dbg_lwip_dhcp_create_count
+          when defined(bl808WifiDiagLinkDrop):
+            if disconnectResult != wifiOk:
+              recordFirstReconnectFailure(forceReconnect, reconnects, currentMs,
+                reconnectDisconnect, disconnectResult.uint32, nimfw_dbg_disconnect_req_state)
+          when ForceReconnectBench and not defined(bl808WifiBenchStationDhcpRetire):
+            printHex("[M0] allcore_http_reconnect_disconnect_rc=", disconnectResult.uint32)
+            when not defined(bl808WifiDiagWarmScanCompact):
+              printHex("[M0] allcore_http_reconnect_disconnect_stages=",
+                (sm_state.uint32 and 0xFF) or
+                ((nimfw_dbg_disconnect_req_state and 0xFF) shl 8) or
+                ((nimfw_dbg_disconnect_req and 0xFF) shl 16) or
+                ((nimfw_dbg_disconnect_process and 0xFF) shl 24))
+          # Prefer the last joined network, or another observed known profile.
+          let scanResult = await scanForAllcoreReconnect()
+          when defined(bl808WifiDiagLinkDrop):
+            if scanResult == 0:
+              recordReconnectScanFailure(forceReconnect, reconnects, currentMs)
+          when ForceReconnectBench:
+            when not defined(bl808WifiBenchStationDhcpRetire):
+              printHex("[M0] allcore_http_reconnect_scan_rc=", scanResult.uint32)
+            when not defined(bl808WifiDiagWarmScanCompact):
+              printHex("[M0] allcore_http_reconnect_scan_recovery=",
+                (sm_state.uint32 and 0xFF) or ((nimfw_dbg_sta_recovery_stage and 0xFF) shl 8) or
+                ((cast[uint32](nimfw_dbg_sta_recovery_result) and 0xFFFF) shl 16))
+            if forceReconnect and (disconnectResult != wifiOk or scanResult == 0):
+              discard console.sendLine("[M0] allcore_http_bench_reconnect_failed")
+          when defined(bl808WifiDiagWarmScan): reset(nimFwDbgWarmAssocFailure)
+          let target = if scanResult == 0: joinedTarget
+                       else: reconnectWifiTarget(joinedTarget, matchingKnownScanEntries(false))
+          let rc = await wifiConnectAsync(knownWifiSsid(target), WifiPassword,
+                                          knownWifiChannel(target), 30_000'u32)
+          when defined(bl808WifiDiagLinkDrop):
+            if rc != wifiOk:
+              recordFirstReconnectFailure(forceReconnect, reconnects, currentMs,
+                reconnectJoin, rc.uint32, 0)
+          when not QuietWifiTrace and not defined(bl808WifiBenchStationDhcpRetire):
+            printHex("[M0] allcore_http_reconnect_connect_rc=", rc.uint32)
+          when defined(bl808WifiDiagWarmScan):
+            if rc != wifiOk:
+              printHex("[M0] warm_assoc_failure_stage=", nimFwDbgWarmAssocFailure.uint32)
+          when ForceReconnectBench and not defined(bl808WifiDiagWarmScanCompact):
+            printHex("[M0] allcore_http_reconnect_status=", bl808_wifi_backend_last_status().uint32)
+            printHex("[M0] allcore_http_reconnect_reason=", bl808_wifi_backend_last_reason().uint32)
+            printHex("[M0] allcore_http_reconnect_sta_idx=", nimfw_dbg_preauth_sta_add_result and 0xFF'u32)
+            printHex("[M0] allcore_http_reconnect_auth_cfm=", nimfw_dbg_auth_cfm_status)
+            printHex("[M0] allcore_http_reconnect_assoc_ack=", nimfw_dbg_assoc_cfm_ack_ok23)
+            printHex("[M0] allcore_http_reconnect_assoc_cfm=", nimfw_dbg_assoc_cfm_status)
+          var wpaReady = false
           if rc == wifiOk:
-            let wpaDeadline = currentMs + WifiReconnectWpaTimeoutMs
-            while bl808WpaCurrentState() != WpaCompletedState and nowMs() < wpaDeadline:
-              pollNetwork()
-              await yieldNow()
+            wpaReady = await waitForAllcoreWpa(WifiReconnectWpaTimeoutMs)
+            if wpaReady: joinedTarget = target
+            when defined(bl808WifiDiagLinkDrop):
+              if not wpaReady:
+                recordFirstReconnectFailure(forceReconnect, reconnects, currentMs,
+                  reconnectWpa, bl808WpaCurrentState(), 0)
+          when not QuietWifiTrace and not defined(bl808WifiBenchStationDhcpRetire):
             printHex("[M0] allcore_http_reconnect_wpa_state=", bl808WpaCurrentState())
-            # Re-acquire an address. Keep the existing lease if the netif still
-            # holds one; otherwise run DHCP again.
-            if netifIp4(netif) == 0'u32:
-              discard dhcpStart(netif)
-              let dhcpDeadline = nowMs() + WifiReconnectDhcpTimeoutMs
-              while netifIp4(netif) == 0'u32 and nowMs() < dhcpDeadline:
-                pollNetwork()
-                await yieldNow()
-              if netifIp4(netif) == 0'u32:
-                discard applyObservedDhcpLease(netif)
-            httpIp = netifIp4(netif)
-            printHex("[M0] allcore_http_reconnect_ip=", httpIp)
-            if httpIp != 0'u32:
-              announceHttpIp(netif)
-              linkDownSinceMs = 0'u32
-              lastArpMs = nowMs()
-              # Reset the RX-liveness baseline so the fresh association is not
-              # immediately re-flagged as stalled.
-              lastRxSeen = nimfw_dbg_rxl_frame_seen
-              lastRxAdvanceMs = nowMs()
-              # Reset TX-liveness baselines too, or the stale freeze window
-              # instantly re-flags the fresh association as TX-dead.
-              lastTxCfm = nimfw_dbg_cfm_push
-              lastTxEnq = nimfw_dbg_tx_arp + nimfw_dbg_tx_tcp80
-              txStuckSinceMs = 0'u32
-              lastEnqAdvanceMs = nowMs()
-              discard console.sendLine("[M0] allcore_http_reconnect_done")
-          if bl808_wifi_backend_connected() == 0 or
-              bl808WpaCurrentState() != WpaCompletedState:
+          when defined(bl808WifiBenchStationDhcpRetire):
+            if forceReconnect:
+              stationDhcpRetireProbe[3] = nimfw_dbg_lwip_dhcp_create_count
+              stationDhcpRetireProbe[1] = stationDhcpRetireProbe[1] or
+                (wpaReady.uint32 shl 2)
+              if stationDhcpRetireProbe[1] != 7 or
+                  stationDhcpRetireProbe[2] != stationDhcpRetireProbe[3]:
+                stationDhcpRetireProbe[1] = stationDhcpRetireProbe[1] or 8
+              inc stationDhcpRetireProbe[0]
+          dhcpActive = wpaReady and startAllcoreDhcp(netif)
+          reconnectLeasePending = dhcpActive
+          if reconnectLeasePending:
+            let lease = await waitForAllcoreDhcpLease(netif, WifiReconnectDhcpTimeoutMs)
+            if lease == 0:
+              when not QuietWifiTrace and not defined(bl808WifiBenchStationDhcpRetire):
+                printHex("[M0] allcore_http_reconnect_ip=", 0)
+              when defined(bl808WifiDiagLinkDrop):
+                recordFirstReconnectFailure(forceReconnect, reconnects, currentMs,
+                  reconnectDhcp, bl808WpaCurrentState(), allcoreWifiWpaReady().uint32)
+            # A healthy link keeps its client even after the diagnostic deadline.
+            reconnectLeasePending = allcoreWifiWpaReady()
+            currentMs = nowMs()
+            lastRxSeen = nimfw_dbg_rxl_frame_seen
+            lastRxAdvanceMs = currentMs
+            lastTxCfm = nimfw_dbg_cfm_push
+            lastTxEnq = nimfw_dbg_tx_arp + nimfw_dbg_tx_tcp80
+            txStuckSinceMs = 0'u32
+            lastEnqAdvanceMs = currentMs
+          elif wpaReady:
+            when defined(bl808WifiDiagLinkDrop):
+              recordFirstReconnectFailure(forceReconnect, reconnects, currentMs,
+                reconnectDhcp, bl808WpaCurrentState(), 2'u32) # start failed
+          if not reconnectLeasePending:
+            when ForceReconnectBench:
+              if forceReconnect:
+                discard console.sendLine("[M0] allcore_http_bench_reconnect_failed")
             # Still down — back off before the next attempt so a persistent
             # outage does not busy-spin the reconnect path.
-            printHex("[M0] allcore_http_reconnect_retry_wait=", reconnects)
+            when not QuietWifiTrace and not defined(bl808WifiBenchStationDhcpRetire):
+              printHex("[M0] allcore_http_reconnect_retry_wait=", reconnects)
             await sleepUs(WifiReconnectBackoffUs)
-            linkDownSinceMs = nowMs()  # restart the debounce window
+            currentMs = nowMs()
+            linkDownSinceMs = currentMs  # restart the debounce window
 
-      if httpIp != 0'u32 and currentMs - lastArpMs >= 1000'u32:
-        discard etharpGratuitous(netif)
-        lastArpMs = currentMs
+      when AllcoreHttpGratuitousArpMs != 0:
+        if httpIp != 0'u32 and currentMs - lastArpMs >= AllcoreHttpGratuitousArpMs:
+          discard etharpGratuitous(netif)
+          lastArpMs = currentMs
       if currentMs - lastDiagMs >= 5000'u32:
-        dumpAllcoreHttpRuntimeDiag()
+        when defined(bl808AllcoreWifiVerboseDiag):
+          dumpAllcoreHttpRuntimeDiag()
         lastDiagMs = currentMs
       await yieldNow()
 else:
@@ -2718,7 +3252,8 @@ proc mainWorkflow(): CpsVoidFuture {.cps.} =
                    FlashXipBase + Ox64D0BootOffset)
   pdsDisableLpL1c()
   installLpWramBootGate()
-  discard console.sendLine("[M0] Releasing live LP WASM CPS worker")
+  when not LeanWifiStartup:
+    discard console.sendLine("[M0] Releasing live LP WASM CPS worker")
   releaseLPAt(LpWramBootGateAddr)
 
   let initOk = enclaveInit(defaultPartition(lock = false), rkSoftDev)
@@ -2727,28 +3262,30 @@ proc mainWorkflow(): CpsVoidFuture {.cps.} =
   else:
     fail("live enclave init")
     return
-  printHex("[M0] tzc_sec_tzmid=", regRead(TzcSecBmxTzmid))
-  printHex("[M0] tzc_nsec_tzmid=", regRead(TzcNsecBmxTzmid))
-  printHex("[M0] tzc_sec_bmx_s1=", regRead(TzcSecBmxS1))
-  printHex("[M0] tzc_sec_bmx_s2=", regRead(TzcSecBmxS2))
-  printHex("[M0] tzc_sec_sf_ctrl=", regRead(TzcSecSfCtrl))
-  printHex("[M0] tzc_sec_se_ctrl1=", regRead(TzcSecSeCtrl1))
-  printHex("[M0] tzc_sec_sf_r0=", regRead(TzcSecSfR0))
-  printHex("[M0] tzc_sec_sf_r3=", regRead(TzcSecSfR3))
-  printHex("[M0] tzc_sec_sf_msb=", regRead(TzcSecSfRMsb))
-  printHex("[M0] tzc_nsec_sf_ctrl=", regRead(TzcNsecSfCtrl))
-  printHex("[M0] tzc_nsec_se_ctrl1=", regRead(TzcNsecSeCtrl1))
-  printHex("[M0] tzc_nsec_sf_r0=", regRead(TzcNsecSfR0))
-  printHex("[M0] tzc_nsec_sf_r3=", regRead(TzcNsecSfR0 + 12'u))
-  printHex("[M0] tzc_nsec_sf_msb=", regRead(TzcNsecSfRMsb))
-  printHex("[M0] sf_cfg1_before_lp_xip=", regRead(SfCtrlCfg1))
-  printHex("[M0] sf_id0_offset=", regRead(SfCtrlImageOffset0))
-  printHex("[M0] sf_id1_offset_before=", regRead(SfCtrlImageOffset1))
+  when not QuietWifiBringup:
+    printHex("[M0] tzc_sec_tzmid=", regRead(TzcSecBmxTzmid))
+    printHex("[M0] tzc_nsec_tzmid=", regRead(TzcNsecBmxTzmid))
+    printHex("[M0] tzc_sec_bmx_s1=", regRead(TzcSecBmxS1))
+    printHex("[M0] tzc_sec_bmx_s2=", regRead(TzcSecBmxS2))
+    printHex("[M0] tzc_sec_sf_ctrl=", regRead(TzcSecSfCtrl))
+    printHex("[M0] tzc_sec_se_ctrl1=", regRead(TzcSecSeCtrl1))
+    printHex("[M0] tzc_sec_sf_r0=", regRead(TzcSecSfR0))
+    printHex("[M0] tzc_sec_sf_r3=", regRead(TzcSecSfR3))
+    printHex("[M0] tzc_sec_sf_msb=", regRead(TzcSecSfRMsb))
+    printHex("[M0] tzc_nsec_sf_ctrl=", regRead(TzcNsecSfCtrl))
+    printHex("[M0] tzc_nsec_se_ctrl1=", regRead(TzcNsecSeCtrl1))
+    printHex("[M0] tzc_nsec_sf_r0=", regRead(TzcNsecSfR0))
+    printHex("[M0] tzc_nsec_sf_r3=", regRead(TzcNsecSfR0 + 12'u))
+    printHex("[M0] tzc_nsec_sf_msb=", regRead(TzcNsecSfRMsb))
+    printHex("[M0] sf_cfg1_before_lp_xip=", regRead(SfCtrlCfg1))
+    printHex("[M0] sf_id0_offset=", regRead(SfCtrlImageOffset0))
+    printHex("[M0] sf_id1_offset_before=", regRead(SfCtrlImageOffset1))
 
   sfCtrlSetLpImageOffsetToGroup1()
   sfCtrlRestoreXip()
-  printHex("[M0] sf_cfg1_after_lp_xip=", regRead(SfCtrlCfg1))
-  printHex("[M0] sf_id1_offset_after=", regRead(SfCtrlImageOffset1))
+  when not QuietWifiBringup:
+    printHex("[M0] sf_cfg1_after_lp_xip=", regRead(SfCtrlCfg1))
+    printHex("[M0] sf_id1_offset_after=", regRead(SfCtrlImageOffset1))
   regWrite(WasmLiveLpStartAddr, WasmLiveLpStartMagic)
   dcacheFlushAll()
   fenceIo()
@@ -2765,9 +3302,10 @@ proc mainWorkflow(): CpsVoidFuture {.cps.} =
       lpSettleWaited < 2000'u32:
     await sleepUs(1_000'u64)
     inc lpSettleWaited
-  printHex("[M0] lp_boot_settle_ms=", lpSettleWaited)
+  when not LeanWifiStartup:
+    printHex("[M0] lp_boot_settle_ms=", lpSettleWaited)
 
-  discard console.sendLine("[M0] Releasing live D0 WASM CPS worker")
+    discard console.sendLine("[M0] Releasing live D0 WASM CPS worker")
   releaseD0()
 
   let m0Task = m0WasmTask()
@@ -2785,11 +3323,12 @@ proc mainWorkflow(): CpsVoidFuture {.cps.} =
     initPeerWasmControlMailbox(WasmPeerControlD0Addr)
     initPeerWasmControlMailbox(WasmPeerControlLpAddr)
 
-  discard console.sendString("Result: ")
-  console.sendHex32(passed.uint32)
-  discard console.sendString(" passed, ")
-  console.sendHex32(failed.uint32)
-  discard console.sendLine(" failed")
+  when not LeanWifiStartup:
+    discard console.sendString("Result: ")
+    console.sendHex32(passed.uint32)
+    discard console.sendString(" passed, ")
+    console.sendHex32(failed.uint32)
+    discard console.sendLine(" failed")
   if failed == 0 and heartbeat >= WasmLiveMinHeartbeat:
     discard console.sendLine("=== Test Complete ===")
   else:
@@ -2807,6 +3346,13 @@ proc main() {.exportc, cdecl.} =
     setWasmHttpEnclaveControlProvider(enclaveControlProvider)
   heapInit()
   schedulerInit()
+  # NOTE: (b1) f32k wall-clock wiring (hbnStartWallClock + wallClockMsHook) was
+  # tried here but REGRESSED — powering/enabling the HBN RTC appears to disturb
+  # the PDS-adjacent CLINT mtime clock and INDUCE the very freezes it aimed to
+  # ride through (device rebooted every ~30-45s via the liveness-gated WDT vs
+  # 7 min stable without it). Reverted; the (c) liveness-gated WDT feed stays.
+  # The true fix is (a): restore the mtime divider after the offending WIFIPLL/
+  # clock-mux reconnect op (needs the JTAG probe of 0x20009014 / 0x2000E130).
   enableAllPeriphClocks()
 
   enablePeriphClock(periphUart0)

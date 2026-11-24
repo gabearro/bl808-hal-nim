@@ -12,5 +12,10 @@ proc wifi_netif_dhcp_start*(netif: ptr Netif): cint {.exportc, cdecl.} =
   0
 
 proc wifi_netif_dhcp_stop*(netif: ptr Netif): cint {.exportc, cdecl.} =
-  discard netif
+  when defined(bl808WifiRealLwip):
+    proc stopDhcp(netif: ptr Netif) {.importc: "dhcp_stop", header: "<lwip/dhcp.h>".}
+    if netif == nil: return -1
+    stopDhcp(netif)
+  else:
+    discard netif
   0

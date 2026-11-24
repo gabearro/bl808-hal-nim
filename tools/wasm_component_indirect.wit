@@ -1,0 +1,15 @@
+package ox64:indirect@0.2.0;
+
+world direct {
+  export evaluate: func(value: tuple<u8, u64, s16,
+    u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32>)
+    -> tuple<u64, u32>;
+}
+
+world linked {
+  import verify: func(value: tuple<u8, u64, s16,
+    u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32>)
+    -> tuple<u64, u32>;
+  include direct;
+  export bad-arguments: func() -> tuple<u64, u32>;
+}

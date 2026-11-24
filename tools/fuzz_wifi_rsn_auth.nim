@@ -45,11 +45,14 @@ proc validRsnIe(akms: openArray[uint8]): seq[uint8] =
 
 proc checkMask(buf: var seq[uint8]; expected: uint32) =
   let mask = wifiRsnAuthMaskFromIeBuffer(ptrFor(buf), buf.len.uint32)
+  let info = wifiRsnAkmInfoFromIeBuffer(ptrFor(buf), buf.len.uint32)
   doAssert mask == expected, "unexpected RSN mask: got=" & $mask &
     " expected=" & $expected & " len=" & $buf.len
+  doAssert info.authMask == expected
 
-proc checkDecision(mask: uint32; keyMgmt: uint32; authType: uint8) =
-  let selected = wifiPreferredKeyMgmtFromMask(mask)
+proc checkDecision(mask: uint32; keyMgmt: uint32; authType: uint8;
+                   pmfCapable = false; pmfRequired = false) =
+  let selected = wifiPreferredKeyMgmtFromMask(mask, pmfCapable, pmfRequired)
   doAssert selected == keyMgmt, "unexpected key mgmt: got=" & $selected &
     " expected=" & $keyMgmt & " mask=" & $mask
   let dot11 = wifiDot11AuthTypeFromKeyMgmt(selected)
@@ -71,11 +74,66 @@ proc main() =
 
   var sae = validRsnIe([0x08'u8])
   checkMask(sae, WifiAuthMaskSae)
-  checkDecision(WifiAuthMaskSae, WifiKeyMgmtSae, 3)
+  var saePmf = sae
+  saePmf.add([0xC0'u8, 0'u8])
+  saePmf[1] = (saePmf.len - 2).uint8
+  checkMask(saePmf, WifiAuthMaskSae)
+  let saeInfo = wifiRsnAkmInfoFromIeBuffer(ptrFor(saePmf), saePmf.len.uint32)
+  doAssert saeInfo.pmfCapable and saeInfo.pmfRequired
+  var partialCaps = sae
+  partialCaps.add(0x80'u8)
+  partialCaps[1] = (partialCaps.len - 2).uint8
+  checkMask(partialCaps, 0)
+  var zeroPairwise = saePmf
+  putLe16(zeroPairwise, 8, 0)
+  checkMask(zeroPairwise, 0)
+  var truncatedPmkid = saePmf
+  truncatedPmkid.add([1'u8, 0'u8])
+  for _ in 0 ..< 8:
+    truncatedPmkid.add(0'u8)
+  truncatedPmkid[1] = (truncatedPmkid.len - 2).uint8
+  checkMask(truncatedPmkid, 0)
+  let rejectedInfo = wifiRsnAkmInfoFromIeBuffer(
+    ptrFor(truncatedPmkid), truncatedPmkid.len.uint32)
+  doAssert not rejectedInfo.pmfCapable and not rejectedInfo.pmfRequired
+  var completePmkid = truncatedPmkid
+  for _ in 0 ..< 8:
+    completePmkid.add(0'u8)
+  completePmkid.add([0'u8, 0x0F'u8, 0xAC'u8, 6'u8])
+  completePmkid[1] = (completePmkid.len - 2).uint8
+  checkMask(completePmkid, WifiAuthMaskSae)
+  var truncatedMgmtCipher = completePmkid
+  truncatedMgmtCipher.setLen(truncatedMgmtCipher.len - 1)
+  truncatedMgmtCipher[1] = (truncatedMgmtCipher.len - 2).uint8
+  checkMask(truncatedMgmtCipher, 0)
+  checkDecision(WifiAuthMaskSae, WifiKeyMgmtNone, 0)
+  checkDecision(WifiAuthMaskSae, WifiKeyMgmtSae, 3, pmfCapable = true)
 
   var transition = validRsnIe([0x02'u8, 0x08'u8])
   checkMask(transition, WifiAuthMaskPsk or WifiAuthMaskSae)
   checkDecision(WifiAuthMaskPsk or WifiAuthMaskSae, WifiKeyMgmtPsk, 0)
+  checkDecision(WifiAuthMaskPsk or WifiAuthMaskSae, WifiKeyMgmtSae, 3,
+                pmfCapable = true)
+  checkDecision(WifiAuthMaskPsk, WifiKeyMgmtNone, 0, pmfRequired = true)
+
+  var incompleteAkms = transition
+  incompleteAkms.setLen(incompleteAkms.len - 4)
+  incompleteAkms[1] = (incompleteAkms.len - 2).uint8
+  checkMask(incompleteAkms, 0)
+
+  var wrongVersion = transition
+  wrongVersion[2] = 2
+  checkMask(wrongVersion, 0)
+
+  var wrongId = transition
+  wrongId[0] = 47
+  doAssert wifiRsnAuthMaskFromIe(addr wrongId[0], wrongId.len.uint32) == 0
+  doAssert wifiRsnAuthMaskFromIe(addr transition[0], transition.len.uint32 - 1) == 0
+  let wrapped = cast[pointer](high(uint) - 1'u)
+  doAssert wifiRsnAkmInfoFromIe(wrapped, 4).authMask == 0
+  let wpaOui = [0x00'u8, 0x50'u8, 0xF2'u8, 0x01'u8]
+  doAssert wifiIeFindBounded(wrapped, 4, WifiIeIdRsn) == nil
+  doAssert wifiVendorIeFindBounded(wrapped, 4, unsafeAddr wpaOui[0], 4) == nil
 
   var prefixed = @[0'u8, 3'u8, 1'u8, 2'u8, 3'u8]
   prefixed.add transition

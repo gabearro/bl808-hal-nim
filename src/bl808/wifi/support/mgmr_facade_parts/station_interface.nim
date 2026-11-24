@@ -57,4 +57,4 @@ proc wifi_mgmr_sta_netif_get*(): ptr Netif {.exportc, cdecl.} =
   cast[ptr Netif](ifaceNetif(staIface()))
 
 proc wifi_mgmr_ap_netif_get*(): ptr Netif {.exportc, cdecl.} =
-  cast[ptr Netif](ifaceNetif(apIface()))
+  if apEnabled: cast[ptr Netif](ifaceNetif(apIface())) else: nil

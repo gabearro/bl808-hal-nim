@@ -21,10 +21,12 @@ CALLBACKS = {
     "ps_disable_cfm": "power_save.nim",
     "ps_enable_cfm": "power_save.nim",
     "mm_ap_traffic_probe_cfm": "power_save.nim",
+    "mm_ap_probe_cfm": "kernel_mac_channel.nim",
 }
 
 PLATFORM = SESSION_PLATFORM + r"""
 proc smTxCallbackCurrent(): bool = true
+proc smClaimFlushedDisconnect(p: pointer): bool = false
 proc chanProtectionTagged(p: pointer): bool = false
 proc chanProtectionActive(): bool = false
 proc chanProtectionComplete(p: pointer; ap: bool; serial: var uint32): bool = false
@@ -35,6 +37,7 @@ proc chanProtectionCancelSerial(serial: uint32) = discard
 type
   Vif = object
     beaconTimeoutBase: uint32
+    probeCount, vifIdx: uint8
   LogProc = proc(level: uint32; tag, file: cstring; line: cint;
                  message: cstring) {.cdecl, varargs, raises: [Exception].}
 var
@@ -43,7 +46,8 @@ var
   channel: tuple[connlessDelayCount, scanDelayCount: uint8]
   ps: tuple[flags: uint8, pendingCount: uint32]
   mm: tuple[keepAliveLimit: uint32]
-  onPoll, onIdle, onLog: proc()
+  mmTrafficProbeEpochs: array[MAX_VIFS, uint32]
+  onPoll, onIdle, onLog, onClear: proc()
 proc sm_disconnect_process(p: pointer; status, reason: uint16) = inc effects
 proc sm_connect_ind(status, reason: uint16) = inc effects
 proc logHook(level: uint32; tag, file: cstring; line: cint;
@@ -52,15 +56,18 @@ proc logHook(level: uint32; tag, file: cstring; line: cint;
 proc getLogFunc(index: int): LogProc =
   if onLog != nil: logHook else: nil
 proc chanEnvView(): ptr typeof(channel) = addr channel
-proc mm_force_idle_req(): bool =
+proc chanForceIdle(): bool =
   inc effects
+  inc txResetEpoch
   if onIdle != nil: onIdle()
   true
 proc chan_pre_switch_channel() = inc effects
 proc psEnvView(): ptr typeof(ps) = addr ps
 proc mmEnvView(): ptr typeof(mm) = addr mm
 proc psTxNullTimer(): pointer = nil
-proc mm_timer_clear(p: pointer) = inc effects
+proc mm_timer_clear(p: pointer) =
+  inc effects
+  if onClear != nil: onClear()
 proc ps_check_tx_status_part0_nim(p, callback: pointer): uint32 =
   inc effects
   if onPoll != nil: onPoll()
@@ -70,8 +77,11 @@ proc ps_disable_cfm_handle(p: pointer): uint32 =
   0
 proc ps_enable_cfm_handle(p: pointer) = inc effects
 proc vifChannelAt(p: pointer): ptr Vif = cast[ptr Vif](p)
+proc mmResetBeaconProbeCount(vif: ptr Vif) = vif.probeCount = 0
 proc macTimeNow(): uint32 = 123
 proc mm_send_connection_loss_ind(p: pointer; reason: uint16) = inc effects
+proc mmPublishConnectionLoss(p: pointer; reason: uint16; epoch: ptr uint32) =
+  mm_send_connection_loss_ind(p, reason)
 proc protocolState(): auto =
   (effects, channel, ps, mm, vif)
 proc resetProtocol() =
@@ -81,11 +91,13 @@ proc resetProtocol() =
   nested = 0
   channel = (1'u8, 1'u8)
   ps = (0'u8, 1'u32)
+  psModeBuildSerial = 0
   mm.keepAliveLimit = 0
-  vif = default(Vif)
+  vif = Vif(probeCount: 17)
   onPoll = nil
   onIdle = nil
   onLog = nil
+  onClear = nil
 """
 
 CHECKS = r"""
@@ -93,10 +105,12 @@ let protocolCallbacks = [
   cast[pointer](sm_disconnect_deauth_cfm), cast[pointer](sm_connect_abort_deauth_cfm),
   cast[pointer](sm_supplicant_deauth_cfm), cast[pointer](chan_ap_tx_cfm),
   cast[pointer](chan_sta_tx_cfm), cast[pointer](ps_disable_cfm),
-  cast[pointer](ps_enable_cfm), cast[pointer](mm_ap_traffic_probe_cfm)]
+  cast[pointer](ps_enable_cfm), cast[pointer](mm_ap_traffic_probe_cfm),
+  cast[pointer](mm_ap_probe_cfm)]
 for callback in protocolCallbacks:
+  let probe = callback in [cast[pointer](mm_ap_probe_cfm), cast[pointer](mm_ap_traffic_probe_cfm)]
   for path in 0 .. 1: # queued completion, explicit failed release
-    for status in [0'u32, 0x80800000'u32]:
+    for status in [0'u32, 0x80010700'u32, 0x80800000'u32]:
       for retirement in 0 .. 3:
         resetProtocol()
         let frame = hostTxDescAt(txl_frame_get(24))
@@ -117,8 +131,10 @@ for callback in protocolCallbacks:
           txl_frame_evt()
         else:
           txl_frame_release(frame, true)
+        let reported = not probe or (path == 0 and (status and 0x80000000'u32) != 0)
         let current = retirement in [0, 3]
-        doAssert (protocolState() != before) == current,
+        let superseded = callback == cast[pointer](mm_ap_probe_cfm) and status == 0x80010700'u32
+        doAssert (protocolState() != before) == (current and reported and not superseded),
           "protocol callback crossed a retired VIF/station session"
         doAssert txActiveFrameCallback == nil
         doAssert co_list_cnt(addr frameEnv.freeList) == 4
@@ -128,20 +144,56 @@ for callback in protocolCallbacks:
 for callback in protocolCallbacks:
   resetProtocol()
   let before = protocolState()
-  cast[proc(p: pointer; status: uint32) {.cdecl.}](callback)(addr vif, 0)
+  let probe = callback in [cast[pointer](mm_ap_probe_cfm), cast[pointer](mm_ap_traffic_probe_cfm)]
+  cast[proc(p: pointer; status: uint32) {.cdecl.}](callback)(addr vif,
+    (if probe: 0x80800000'u32 else: 0'u32))
   doAssert protocolState() != before
 
-proc queueCallback(callback: pointer) =
+  if probe:
+    # Delivery can yield after taking the hardware status and before invoking
+    # the callback. The original session must still veto a real ACK.
+    resetProtocol()
+    let frame = hostTxDescAt(txl_frame_get(24))
+    frame.vifIdx = 0
+    frame.staInfoIdx = 0
+    let context = txlCaptureFrameCallback(frame)
+    discard rxInvalidateVif(0)
+    let retired = protocolState()
+    txlInvokeFrameCallback(callback, addr vif, 0x80800000'u32, context)
+    doAssert protocolState() == retired
+    txl_frame_release(frame, false)
+
+proc queueCallback(callback: pointer; status = 0'u32;
+                   tagged = false; retire = false; flush = false) =
   let frame = hostTxDescAt(txl_frame_get(24))
   frame.vifIdx = 0
   frame.staInfoIdx = 0
   frame.callback = callback
   frame.callbackArg = addr vif
-  txEnv.packetCounter = 1
-  co_list_push_back(addr frameEnv.usedList, addr frame.link)
-  txl_frame_evt()
+  if tagged:
+    let slot = txl_frame_desc_index(frame)
+    txFrameIdentities[slot].psTracked = true
+    txFrameIdentities[slot].psSerial = psModeBuildSerial
+  if retire: inc psModeBuildSerial
+  hostTxHwDescAt(frame.hwDesc).confirmStatus = status
+  if flush: txl_frame_release(frame, true)
+  else:
+    txEnv.packetCounter = 1
+    co_list_push_back(addr frameEnv.usedList, addr frame.link)
+    txl_frame_evt()
 
 for callback in [cast[pointer](ps_enable_cfm), cast[pointer](ps_disable_cfm)]:
+  for flush in [false, true]:
+    resetProtocol()
+    ps.pendingCount = 7
+    queueCallback(callback, 0x80800000'u32, tagged = true, retire = true, flush = flush)
+    doAssert ps.pendingCount == 7 and effects == 0,
+      "a delayed PS frame borrowed the replacement batch's generation"
+    doAssert co_list_cnt(addr frameEnv.freeList) == 4
+  resetProtocol()
+  queueCallback(callback, 0x80800000'u32, tagged = true)
+  doAssert ps.pendingCount == 0 and effects == 2
+
   resetProtocol()
   onPoll = proc() =
     discard rxInvalidateVif(0)
@@ -150,6 +202,34 @@ for callback in [cast[pointer](ps_enable_cfm), cast[pointer](ps_disable_cfm)]:
   queueCallback(callback)
   doAssert ps.pendingCount == 7 and effects == 0,
     "retry polling changed the VIF but callback still finalized PS"
+  for change in 0 .. 3:
+    resetProtocol()
+    onClear = proc() =
+      doAssert ps.pendingCount == 0
+      case change
+      of 1: ps.pendingCount = 1
+      of 2: discard rxInvalidateVif(0)
+      of 3: discard rxInvalidateVif(1)
+      else: discard
+    queueCallback(callback, 0x80800000'u32)
+    doAssert ps.pendingCount == (change == 1).uint32
+    doAssert effects == (if change in [1, 2]: 1 else: 2),
+      "PS finalized after timer clear changed its pending count or owner"
+  resetProtocol()
+  onPoll = proc() =
+    doAssert txlFrameCallbackCurrent()
+    inc psModeBuildSerial
+    ps.pendingCount = 7
+  queueCallback(callback)
+  doAssert ps.pendingCount == 7 and effects == 1,
+    "retired retry consumed the replacement mode's count"
+  resetProtocol()
+  onClear = proc() =
+    doAssert txlFrameCallbackCurrent() and ps.pendingCount == 0
+    inc psModeBuildSerial
+  queueCallback(callback, 0x80800000'u32)
+  doAssert ps.pendingCount == 0 and effects == 1,
+    "retired confirmation finalized the replacement mode after timer clear"
 for callback in [cast[pointer](chan_ap_tx_cfm), cast[pointer](chan_sta_tx_cfm)]:
   resetProtocol()
   if callback == cast[pointer](chan_ap_tx_cfm): channel.scanDelayCount = 0
@@ -160,6 +240,11 @@ for callback in [cast[pointer](chan_ap_tx_cfm), cast[pointer](chan_sta_tx_cfm)]:
   queueCallback(callback)
   doAssert effects == 1 and channel == (7'u8, 9'u8),
     "idle request restarted the VIF but stale callback continued switching"
+  resetProtocol()
+  if callback == cast[pointer](chan_ap_tx_cfm): channel.scanDelayCount = 0
+  else: channel.connlessDelayCount = 0
+  queueCallback(callback)
+  doAssert effects == 2, "the switch's own reset invalidated its completion"
 resetProtocol()
 onLog = proc() = discard rxInvalidateVif(0)
 queueCallback(cast[pointer](sm_supplicant_deauth_cfm))
@@ -252,13 +337,17 @@ def test_callback_session_scope(tmp_path: Path, release: bool, mutation: str | N
         body = procedure((FW / filename).read_text(), name)
         if mutation == name:
             guard = "  if not txlFrameCallbackCurrent(): return\n"
+            if name == "sm_disconnect_deauth_cfm":
+                guard = "  if not txlFrameCallbackCurrent() and not smClaimFlushedDisconnect(param): return\n"
             if name in ["chan_ap_tx_cfm", "chan_sta_tx_cfm"]:
                 entry_guard = ("  if not txlFrameCallbackCurrent():\n"
                                "    chanProtectionAbandon(param)\n    return\n")
                 assert entry_guard in body
                 body = body.replace(entry_guard, "", 1)
+                guard = "  if not txlFrameCallbackCurrent(frameEpoch): return\n"
             assert body.count(guard) >= 1
-            body = re.sub(r"(?m)^[ \t]+if not txlFrameCallbackCurrent\(\): return\n", "", body)
+            body = re.sub(r"(?m)^[ \t]+if not txlFrameCallbackCurrent\((?:frameEpoch)?\)"
+                          r"(?: and not smClaimFlushedDisconnect\(param\))?: return\n", "", body)
         functions += body
     if mutation == "context":
         assignment = "  txActiveFrameCallback = addr scope\n"

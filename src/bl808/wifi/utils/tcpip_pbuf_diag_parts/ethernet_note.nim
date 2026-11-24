@@ -40,19 +40,20 @@ proc noteEthernetInput(inputPbuf: ptr Pbuf): bool =
           let srcPort = loadBe16(ethernetFrame, l4Off.uint)
           let dstPort = loadBe16(ethernetFrame, l4Off.uint + 2'u)
           nimFwDbgTcpipInputLastPorts = srcPort.uint32 or (dstPort.uint32 shl 16)
-          if srcPort == 67'u16 and dstPort == 68'u16:
-            inc nimFwDbgTcpipInputDhcpRx
-            if inputPbuf.len >= 282'u16:
-              let msgType = dhcpMessageType(ethernetFrame, inputPbuf.len)
-              nimFwDbgTcpipInputDhcpMeta =
-                loadU8(ethernetFrame, 42).uint32 or
-                (loadU8(ethernetFrame, 44).uint32 shl 8) or
-                (msgType.uint32 shl 16) or
-                (loadBe16(ethernetFrame, 52).uint32 shl 24)
-              nimFwDbgTcpipInputDhcpXid = loadBe32(ethernetFrame, 46)
-              nimFwDbgTcpipInputDhcpYiaddr = loadBe32(ethernetFrame, 58)
-              nimFwDbgTcpipInputDhcpCh0 = loadBe32(ethernetFrame, 70)
-              nimFwDbgTcpipInputDhcpCh1 = loadBe16(ethernetFrame, 74).uint32
+          when not defined(bl808WifiDiagDhcpTxAttempts):
+            if srcPort == 67'u16 and dstPort == 68'u16:
+              inc nimFwDbgTcpipInputDhcpRx
+              if inputPbuf.len >= 282'u16:
+                let msgType = dhcpMessageType(ethernetFrame, inputPbuf.len)
+                nimFwDbgTcpipInputDhcpMeta =
+                  loadU8(ethernetFrame, 42).uint32 or
+                  (loadU8(ethernetFrame, 44).uint32 shl 8) or
+                  (msgType.uint32 shl 16) or
+                  (loadBe16(ethernetFrame, 52).uint32 shl 24)
+                nimFwDbgTcpipInputDhcpXid = loadBe32(ethernetFrame, 46)
+                nimFwDbgTcpipInputDhcpYiaddr = loadBe32(ethernetFrame, 58)
+                nimFwDbgTcpipInputDhcpCh0 = loadBe32(ethernetFrame, 70)
+                nimFwDbgTcpipInputDhcpCh1 = loadBe16(ethernetFrame, 74).uint32
   of 0x0806'u16:
     inc nimFwDbgTcpipInputArp
     nimFwDbgTcpipInputEth += 1'u32 shl 8

@@ -26,6 +26,26 @@ proc smScanOwnerCurrent(owner: SmTxBuildContext; indication: pointer): bool =
   indication != nil and smTxOwnerCurrent(owner) and
     smEnvView().connectIndMsg == indication
 
+proc smScanPreserveAcrossChannelReset(previous: uint32) =
+  # A channel switch drains TX but keeps the SM's scan command and reply.
+  # Revalidate the rest of the owner before carrying either across the drain.
+  var tag = smScanTags
+  while tag != nil:
+    if tag.published and not tag.claimed and tag.owner.identity.resetEpoch == previous:
+      var owner = tag.owner
+      owner.identity.resetEpoch = txResetEpoch
+      if smScanOwnerCurrent(owner, tag.indication):
+        tag.owner = owner
+        if tag.command and tag.reply != nil:
+          let reply = smScanTagFor(keMsgHdrFromPayload(tag.reply))
+          if reply != nil: reply.owner = owner
+    tag = tag.next
+  if smScanLost.pending and smScanLost.owner.identity.resetEpoch == previous:
+    var owner = smScanLost.owner
+    owner.identity.resetEpoch = txResetEpoch
+    if smScanOwnerCurrent(owner, smScanLost.indication):
+      smScanLost.owner = owner
+
 proc smScanForget(header: pointer) =
   let saved = irqSave()
   defer: irqRestore(saved)
@@ -87,6 +107,8 @@ proc smScanPublish(request: pointer): bool =
   if tag == nil or not tag.command or not smScanOwnerCurrent(tag.owner, tag.indication):
     return false
   tag.published = true
+  when defined(bl808WifiDiagColdScan):
+    nimFwDbgColdScanFlow[0] = tag.responseId.uint32
   true
 
 proc smScanOwnsRequest(request: pointer): bool =
@@ -112,17 +134,24 @@ proc smScanCompletionAlloc(request: pointer; id: uint16; destination: uint8): po
   let saved = irqSave()
   defer: irqRestore(saved)
   let tag = if request == nil: nil else: smScanTagFor(keMsgHdrFromPayload(request))
+  when defined(bl808WifiDiagColdScan):
+    nimFwDbgColdScanFlow[1] = id.uint32 or (destination.uint32 shl 16) or
+      ((tag != nil).uint32 shl 24)
   if tag == nil:
-    return ke_msg_alloc(id, destination, TASK_SCANU, StatusCfmPayloadSize)
+    return ke_msg_try_alloc(id, destination, TASK_SCANU, StatusCfmPayloadSize)
   if not tag.command or not tag.published or tag.claimed or
       tag.responseId != id or destination != TASK_SM: return nil
   tag.claimed = true
   result = tag.reply
   tag.reply = nil
+  when defined(bl808WifiDiagColdScan):
+    nimFwDbgColdScanFlow[2] = 1 or ((result != nil).uint32 shl 1)
   if not smScanOwnerCurrent(tag.owner, tag.indication):
     if result != nil: ke_msg_free(keMsgHdrFromPayload(result))
     return nil
   if result != nil: smScanTagFor(keMsgHdrFromPayload(result)).published = true
+  when defined(bl808WifiDiagColdScan):
+    nimFwDbgColdScanFlow[2] = nimFwDbgColdScanFlow[2] or 4
 
 proc smScanAcceptReply(reply: pointer; id: uint16): bool =
   if reply == nil: return false
@@ -130,14 +159,27 @@ proc smScanAcceptReply(reply: pointer; id: uint16): bool =
   defer: irqRestore(saved)
   let header = keMsgHdrFromPayload(reply)
   let tag = smScanTagFor(header)
+  when defined(bl808WifiDiagColdScan):
+    nimFwDbgColdScanFlow[3] = header.id.uint32 or (header.srcId.uint32 shl 16) or
+      (header.destId.uint32 shl 24)
+    nimFwDbgColdScanFlow[4] = (tag != nil).uint32
   if tag == nil or tag.command or not tag.published or tag.claimed or
       tag.responseId != id or header.id != id or header.srcId != TASK_SCANU or
       header.destId != TASK_SM or header.paramLen != StatusCfmPayloadSize or
       not smScanOwnerCurrent(tag.owner, tag.indication): return false
   tag.claimed = true
+  when defined(bl808WifiDiagColdScan):
+    nimFwDbgColdScanFlow[4] = 2 or (statusCfmView(reply).status.uint32 shl 8)
   if statusCfmView(reply).status != 0:
-    sm_connect_ind((if id == SCANU_START_CFM: WLAN_FW_SCAN_NO_BSSID_AND_CHANNEL.uint16
-                    else: WLAN_FW_JOIN_NETWORK_FAILURE.uint16), 0xFFFF)
+    let sm = smEnvView()
+    if sm.cancelRequested != 0:
+      # Match the pinned SM handlers: cancellation wins over scan/join failure.
+      sm.cancelRequested = 0
+      sm_connect_ind((if id == SCANU_START_CFM: WLAN_FW_CONNECT_ABORT_WHEN_SCANNING.uint16
+                      else: WLAN_FW_CONNECT_ABORT_WHEN_JOINING_NETWORK.uint16), 0xFFFF)
+    else:
+      sm_connect_ind((if id == SCANU_START_CFM: WLAN_FW_SCAN_NO_BSSID_AND_CHANNEL.uint16
+                      else: WLAN_FW_JOIN_NETWORK_FAILURE.uint16), 0xFFFF)
     return false
   true
 

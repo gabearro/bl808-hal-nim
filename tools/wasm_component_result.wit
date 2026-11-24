@@ -1,0 +1,6 @@
+package ox64:values@0.2.0;
+
+world result-demo {
+  export inspect: func(value: result<u32, u64>) -> u64;
+  export make-error: func(value: u64) -> result<u32, u64>;
+}

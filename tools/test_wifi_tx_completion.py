@@ -36,6 +36,7 @@ type
     hwDesc, bufDesc, dmaLink, queueFirst, cfmDst: pointer
     callback, callbackArg: pointer
     usedFlag, postponeFlag, retryFlag, vifIdx, staIdx, staInfoIdx: uint8
+    frameLen: uint16
     active: uint32
   TxFrameEnvView = object
     freeList, usedList: CoList
@@ -53,8 +54,11 @@ var
   ke_env: array[4, uint32]
   txl_cfm_evt_bit = [0x4000'u32, 0x8000'u32, 0x10000'u32, 0x20000'u32, 0x40000'u32]
   interruptsEnabled = true
+  failRateConfirmation = false
   indications: seq[uint32]
   hostCompletions, rateCompletions: seq[pointer]
+  rateCompletionIrqs: seq[bool]
+  hostCompletionIrqs: seq[bool]
 
 proc hostTxDescAt(p: pointer): ptr HostTxDescView = cast[ptr HostTxDescView](p)
 proc txlFrameSessionCurrent(d: ptr HostTxDescView): bool = true
@@ -105,10 +109,17 @@ proc listCount(list: CoList): int =
     doAssert result < 20, "list cycle"
     node = node.next
 proc me_tx_cfm_singleton(p: pointer) =
-  doAssert not interruptsEnabled
+  rateCompletionIrqs.add(interruptsEnabled)
+  if failRateConfirmation:
+    raise newException(ValueError, "rate confirmation interrupted")
   rateCompletions.add(p)
 proc ipc_emb_txcfm(p: pointer) =
-  doAssert not interruptsEnabled
+  if rateCompletions.len > hostCompletions.len:
+    doAssert rateCompletions[^1] == p
+    let desc = hostTxDescAt(p)
+    doAssert hostTxHeadThd(hostTxHwDescAt(desc.hwDesc)).confirmType == 0x0101
+    doAssert cast[ptr uint32](desc.cfmDst)[] != 0xDEADBEEF'u32
+  hostCompletionIrqs.add(interruptsEnabled)
   hostCompletions.add(p)
 proc ipc_emb_txcfm_ind(mask: uint32) = indications.add(mask)
 
@@ -136,7 +147,10 @@ proc reset() =
   indications.setLen(0)
   hostCompletions.setLen(0)
   rateCompletions.setLen(0)
+  rateCompletionIrqs.setLen(0)
+  hostCompletionIrqs.setLen(0)
   interruptsEnabled = true
+  failRateConfirmation = false
 
 proc initDesc(desc: var HostTxDescView; hw: var HwDesc; head: var HeadThd;
               output: var uint32; host: bool) =
@@ -169,9 +183,60 @@ for ac in 0'u8 .. 4'u8:
   doAssert indications == @[(1'u32 shl ac), (1'u32 shl ac)]
   doAssert hostCompletions == @[cast[pointer](addr desc[0]), cast[pointer](addr desc[1])]
   doAssert rateCompletions == hostCompletions
+  doAssert rateCompletionIrqs == @[true, true]
+  doAssert hostCompletionIrqs == @[false, false]
   for i in 0 ..< 2:
     doAssert output[i] == (0x81001231'u32 + i.uint32 * 2)
     doAssert head[i].confirmType == 0x0101 and desc[i].active == 0
+
+# An interrupted drain must leave a pending event for the remaining descriptor.
+reset()
+var interruptedDesc: array[2, HostTxDescView]
+var interruptedHw: array[2, HwDesc]
+var interruptedHead: array[2, HeadThd]
+var interruptedOutput: array[2, uint32]
+txEnv.packetCounter = 2
+for i in 0 ..< 2:
+  initDesc(interruptedDesc[i], interruptedHw[i], interruptedHead[i],
+           interruptedOutput[i], true)
+  interruptedDesc[i].bufDesc = nil
+  txl_cfm_push(addr interruptedDesc[i], 0x81001230'u32, 0)
+failRateConfirmation = true
+var interrupted = false
+try:
+  txl_cfm_evt(0)
+except ValueError:
+  interrupted = true
+doAssert interrupted and interruptsEnabled and txActiveFlush == nil
+doAssert listCount(confirmLists[0]) == 1
+doAssert (ke_env[0] and txl_cfm_evt_bit[0]) != 0
+doAssert txEnv.packetCounter == 1 and hostCompletions.len == 1
+doAssert rateCompletionIrqs == @[true]
+doAssert hostCompletionIrqs == @[false]
+failRateConfirmation = false
+txl_cfm_evt(0)
+doAssert interruptsEnabled and txActiveFlush == nil
+doAssert confirmLists[0].first == nil and ke_env[0] == 0
+doAssert txEnv.packetCounter == 0 and hostCompletions.len == 2
+doAssert rateCompletionIrqs == @[true, true]
+doAssert hostCompletionIrqs == @[false, false]
+
+# An already-masked caller retains MIE=0 across rate and IPC callbacks.
+reset()
+var maskedDesc: HostTxDescView
+var maskedHw: HwDesc
+var maskedHead: HeadThd
+var maskedOutput: uint32
+initDesc(maskedDesc, maskedHw, maskedHead, maskedOutput, true)
+maskedDesc.bufDesc = nil
+txEnv.packetCounter = 1
+interruptsEnabled = false
+txl_cfm_push(addr maskedDesc, 0x81001230'u32, 0)
+txl_cfm_evt(0)
+doAssert not interruptsEnabled and txEnv.packetCounter == 0
+doAssert rateCompletionIrqs == @[false] and hostCompletionIrqs == @[false]
+doAssert rateCompletions == hostCompletions
+doAssert maskedOutput == 0x81001231'u32
 
 # The host path of single-descriptor flush must also drain internal work.
 for ac in 0'u8 .. 4'u8:
@@ -204,6 +269,7 @@ for ac in 0'u8 .. 4'u8:
         if host:
           doAssert contexts[0].count == 0
           doAssert indications == @[(1'u32 shl ac)]
+          doAssert hostCompletionIrqs == @[false]
           doAssert output[0] == (expectedFlags or 1)
           doAssert desc[0].bufDesc == nil
           doAssert listCount(frameEnv.freeList) == 1
@@ -235,6 +301,7 @@ for ac in 0'u8 .. 4'u8:
   doAssert context.statuses == @[0x11223344'u32]
   doAssert listCount(frameEnv.freeList) == 1
   doAssert hostCompletions == @[cast[pointer](addr desc[0]), cast[pointer](addr desc[2])]
+  doAssert hostCompletionIrqs == @[false, false]
   doAssert indications == @[(1'u32 shl ac)]
   doAssert txEnv.packetCounter == 0
   doAssert output[0] == 0x7C000001'u32 and output[2] == 0x7C000001'u32
@@ -273,6 +340,21 @@ doAssert retryContext.statuses == @[0x11223344'u32, 0x99887766'u32]
 doAssert listCount(frameEnv.freeList) == 1
 doAssert frameEnv.usedList.first == nil and retried.retryFlag == 0
 doAssert txEnv.packetCounter == 0 and interruptsEnabled
+
+# RV32 ADDI wraps the global TX count; checked Nim must preserve that behavior.
+reset()
+var rolloverDesc: HostTxDescView
+var rolloverHw: HwDesc
+var rolloverHead: HeadThd
+var rolloverOutput: uint32
+initDesc(rolloverDesc, rolloverHw, rolloverHead, rolloverOutput, true)
+txl_cfm_push(addr rolloverDesc, 0x81001230'u32, 2)
+txl_cfm_evt(2)
+doAssert txEnv.packetCounter == high(uint32)
+reset()
+txEnv.packetCounter = high(uint32)
+txl_cntrl_inc_pck_cnt(2)
+doAssert txEnv.packetCounter == 0
 """
 
 
@@ -301,6 +383,7 @@ def test_tx_completion_lifecycle(tmp_path: Path, trace: bool) -> None:
         procedure(tx, "txl_cfm_evt*", "txl_cfm_flush*"),
         procedure(tx, "txl_cfm_flush*", "txl_cfm_flush_desc*"),
         procedure(tx, "txl_cfm_flush_desc*", "txl_cfm_dump*"),
+        procedure(tx, "txl_cntrl_inc_pck_cnt*", "txl_cntrl_env_dump*"),
     ])
     debug_vars = "\nvar\n" + "".join(
         f"  {name}: uint32\n" for name in sorted(set(re.findall(r"\bnimFwDbg\w+", procedures)))

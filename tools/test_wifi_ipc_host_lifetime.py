@@ -190,6 +190,23 @@ for initialIrq in [false, true]:
     doAssert seen == @[1'u, 2'u]
     doAssert length(queue(E(), EnvListFreeOff)) == 4
     checkPartition(E(), P())
+  elif TestCase == "tx_policy_scope":
+    onCfm = proc(pthis, hostId: pointer) =
+      let index = cast[uint](hostId) - 1
+      let saved = ipcHostIrqSave()
+      doAssert ipcHostTxCompletionWrapper(hostId) == node(P(), index)
+      doAssert ipcHostTxCompletionWrapper(cast[pointer](99)) == nil
+      ipcHostIrqRestore(saved)
+      if index == 0:
+        dispatch(E())
+        let saved = ipcHostIrqSave()
+        doAssert ipcHostTxCompletionWrapper(hostId) == node(P(), index)
+        ipc_host_init(E(), addr callbackTable[0], P(), pthis)
+        doAssert ipcHostTxCompletionWrapper(hostId) == nil
+        ipcHostIrqRestore(saved)
+    dispatch(E())
+    doAssert seen == @[1'u, 2'u] and ipcHostTxCompletionWrapper(cast[pointer](1)) == nil
+    checkPartition(E(), P())
   elif TestCase in ["reinit", "new_pool", "shared_pool", "aba", "nested_reset"]:
     var replacement: pointer
     let targetEnv = if TestCase == "shared_pool": F() else: E()
@@ -384,7 +401,8 @@ def program(case: str, mutation: str | None) -> str:
     types = (HOST / "callback_types.nim").read_text()
     runtime = HOST / "runtime.nim"
     runtime_types = runtime.read_text().split("template ipcHostIrqSave", 1)[0] if runtime.exists() else ""
-    helpers = "\n".join(procedure(runtime.read_text(), name) for name in [
+    runtime_code, diag_marker, runtime_diag = runtime.read_text().rpartition("\nwhen ")
+    helpers = "\n".join(procedure(runtime_code, name) for name in [
         "beginIpcHostDispatch", "endIpcHostDispatch", "ipcHostDispatchCurrent",
         "ipcHostInvalidate"]) if runtime.exists() else ""
     sources = {name: (HOST / name).read_text() for name in [
@@ -457,11 +475,18 @@ def program(case: str, mutation: str | None) -> str:
     debug = "\nvar\n" + "".join(
         f"  {name}: uint32\n" for name in sorted(set(re.findall(r"\bnimFwDbg\w+", joined)))
     )
-    return (layout + types + runtime_types + PLATFORM + helpers + debug + joined
+    diag = ""
+    if case in {"tx_policy_scope", "tcp_policy_scope"}:
+        define = ("bl808WifiDiagDhcpTxAttempts" if case == "tx_policy_scope"
+                  else "bl808WifiDiagTcpPath")
+        layout = "{.define: " + define + ".}\n" + layout
+        diag = diag_marker + runtime_diag
+        case = "tx_policy_scope"
+    return (layout + types + runtime_types + PLATFORM + helpers + diag + debug + joined
             + f'\nconst TestCase = "{case}"\n' + CHECKS)
 
 
-CASES = ["nested", "reinit", "new_pool", "shared_pool", "aba", "nested_reset",
+CASES = ["nested", "tx_policy_scope", "tcp_policy_scope", "reinit", "new_pool", "shared_pool", "aba", "nested_reset",
          "independent", "pop", "push", "txbuf", "after_pop", "snapshot",
          "init_atomic", "submit_atomic", "pre_pop", "ack_reset", "debug_reset", "tbtt_reset"]
 MUTANTS = {"invalidate": "reinit", "pop_lock": "pop", "push_lock": "push",

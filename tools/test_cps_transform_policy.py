@@ -603,17 +603,15 @@ def test_wifi_async_lifecycle_uses_event_futures_not_poll_loops():
     assert "proc wifiKernelTimerPendingWork(): bool {.inline.}" in wifi_fw
     assert "proc wifiMmTimerPendingWork(): bool {.inline.}" in wifi_fw
     assert "proc wifiMessagePendingWork(): bool {.inline.}" in wifi_fw
-    assert "proc wifiMessageEventPending(): bool {.inline.}" in wifi_fw
-    assert "proc wifiHiddenMessagePendingWork(): bool {.inline.}" in wifi_fw
+    assert "proc wifiResetEventPending(): bool {.inline.}" in wifi_fw
     assert "proc wifiMainModeFromAbi" not in wifi_fw
     assert "proc wifiUpdateMacPlCtrl() {.inline.}" in wifi_fw
     assert "proc wifiWaitForWorkIfIdle(blockWhenIdle, hasWork: bool): bool" in wifi_fw
     assert "proc wifiDrainScheduledWork(): bool" in wifi_fw
     assert "wifiMainServiceStep(blockWhenIdle != 0'u8)" in wifi_fw
-    assert "keEvtField != 0" in wifi_fw
+    assert "keEnvEventField()[] != 0" in wifi_fw
     assert "wifiEventPendingWork() or wifiKernelTimerPendingWork() or" in wifi_fw
     assert "wifiMmTimerPendingWork() or wifiMessagePendingWork()" in wifi_fw
-    assert "wifiMessagePendingWork() and not wifiMessageEventPending()" in wifi_fw
     assert "result = wifiMainHasPendingWork()" in wifi_fw
     assert "KeTaskInitSpec = object" in wifi_fw
     assert "let taskSpecs = [" in wifi_fw
@@ -631,10 +629,9 @@ def test_wifi_async_lifecycle_uses_event_futures_not_poll_loops():
     nap_body = wifi_fw.split("proc bl_nap_calculate*", 1)[1].split(
         "proc bl_nap_call*", 1
     )[0]
-    assert "if wifiMainHasPendingWork():" in sleep_body
-    assert sleep_body.index("if wifiMainHasPendingWork():") < sleep_body.index(
-        "elif pmState != 0:"
-    )
+    pending_guard = "and not wifiMainHasPendingWork():"
+    assert pending_guard in sleep_body
+    assert sleep_body.index(pending_guard) < sleep_body.index("let ps = psEnvView()")
     for expected in [
         "for machwTimerSlotIndex in 0'u32 ..< 9'u32:",
         "1'u32 shl machwTimerSlotIndex",
@@ -664,15 +661,18 @@ def test_wifi_async_lifecycle_uses_event_futures_not_poll_loops():
     wifi_drain = wifi_fw.split("proc wifiDrainScheduledWork(): bool =", 1)[1].split(
         "proc wifiMainServiceStep", 1
     )[0]
-    assert "if wifiKernelTimerPendingWork():" in wifi_drain
-    assert "ke_timer_schedule()" in wifi_drain
-    assert "if wifiMmTimerPendingWork():" in wifi_drain
-    assert "mm_timer_schedule()" in wifi_drain
-    assert "if wifiHiddenMessagePendingWork():" in wifi_drain
-    assert "ke_task_schedule()" in wifi_drain
-    assert wifi_drain.index("ke_evt_schedule()") < wifi_drain.index(
-        "if wifiHiddenMessagePendingWork():"
-    )
+    wifi_events = wifi_fw.split("proc wifiDispatchScheduledEvent(): bool =", 1)[1].split(
+        "proc wifiDrainScheduledWork", 1
+    )[0]
+    assert "events < KE_EVT_MM_TIMER and wifiMmTimerPendingWork()" in wifi_events
+    assert "events < KE_EVT_KE_TIMER and wifiKernelTimerPendingWork()" in wifi_events
+    assert "events < KE_EVT_KE_MESSAGE and wifiMessagePendingWork()" in wifi_events
+    assert "keDispatchEvent(pending)" in wifi_events
+    assert "if wifiDispatchScheduledEvent():" in wifi_drain
+    assert "ke_timer_schedule()" not in wifi_drain
+    assert "mm_timer_schedule()" not in wifi_drain
+    assert "ke_task_schedule()" not in wifi_drain
+    assert wifi_drain.index("if wifiResetEventPending():") < wifi_drain.index("serviceWhen(")
     ble = blecontroller_policy_source()
     assert "proc blecontroller_service_step*" in ble
     assert "proc blecontroller_poll_once*" in ble
@@ -1396,12 +1396,15 @@ def test_wifi_scan_result_prefers_valid_ds_channel_over_stale_rx_frequency():
         "# Channel from DS IE. Some RX indications carry a stale frequency",
         1,
     )[1].split(
-        "# SSID filter loop", 1
+        "var directedOwner:", 1
     )[0]
 
     assert "let dsFreq = dsParamFreq(rx.band, ds)" in scan_body
     assert "if dsFreq != 0xFFFF'u16: dsFreq else: rx.freq" in scan_body
     assert "scanuCacheChannel(scanResultEntry, rx.band, selectedFreq)" in scan_body
+    assert scan_body.index("# SSID filter loop") < scan_body.index(
+        "scanuCacheChannel(scanResultEntry, rx.band, selectedFreq)"
+    )
 
 
 def test_wifi_tx_confirm_event_drains_per_ac_queue_like_vendor():
@@ -1424,7 +1427,7 @@ def test_wifi_tx_confirm_event_drains_per_ac_queue_like_vendor():
     assert "inc drained" not in cfm_body
     assert "inc nimFwDbgCfmEvtYield" not in cfm_body
     assert "nimFwDbgCfmEvtYieldAc = acIdx" not in cfm_body
-    assert "ke_evt_set(evtField)" not in cfm_body
+    assert "if txlCfmPending(acList):\n      ke_evt_set(evtField)" in cfm_body
 
 
 def test_wifi_tx_confirm_dump_uses_semantic_queue_count_name():
@@ -2358,7 +2361,7 @@ def test_wifi_tx_frame_push_uses_typed_mac_header_overlay():
     wifi_fw = wifi_fw_policy_source()
 
     push_body = wifi_fw.split(
-        "proc txl_frame_push*(param: pointer, ac: uint8): uint8 {.exportc, cdecl, noinline, discardable.} =",
+        "proc txlFramePushPrepared(param: pointer, ac: uint8;",
         1,
     )[1].split(
         "proc txl_frame_push_force*", 1
@@ -2997,11 +3000,11 @@ def test_wifi_rx_hwdesc_init_uses_typed_descriptor_overlays():
 
     for expected in [
         "let hd = rxHeaderHwDescView(appendDesc)",
-            "hd.next = nil",
+            "wifiDmaStoreLink(appendDesc, nextOffset, nil)",
             "hd.bufferAddr = 0",
             "hd.flags = 0",
             "cast[ptr uint16](addr hd.tsfLow)[] = 0'u16",
-            "rxHeaderHwDescView(lastPtr).next = appendDesc",
+            "wifiDmaStoreLink(lastPtr, nextOffset, appendDesc)",
             "let hwHead = machwRxHwHdHead()",
             "machwRxDmaTrigger(0x01000000'u32)",
     ]:
@@ -3025,12 +3028,12 @@ def test_wifi_rx_hwdesc_init_uses_typed_descriptor_overlays():
         "env.pdCurrent = pddesc",
         "statusDesc = currentDesc",
         "submittedHead = currentDesc",
-        "rxDmaProgressDescAt(currentDesc).next = swdesc",
+        "wifiDmaStoreLink(currentDesc, nextOffset, swdesc)",
         "submittedTail = prevDesc",
         "submittedTail = currentDesc",
         "rxDmaProgressDescAt(statusDesc).status = 0",
-        "rxDmaProgressDescAt(submittedTail).next = nil",
-        "rxDmaProgressDescAt(env.pdTail).next = submittedHead",
+        "wifiDmaStoreLink(submittedTail, nextOffset, nil)",
+        "wifiDmaStoreLink(env.pdTail, nextOffset, submittedHead)",
         "machwRxDmaTrigger(0x02000000'u32)",
         "env.pdTail = submittedTail",
     ]:
@@ -3595,7 +3598,8 @@ def test_wifi_task_handlers_use_named_ke_message_statuses():
     assert "return KeMsgSaved" in mm_force_idle
     assert "return KeMsgConsumed" in mm_force_idle
 
-    assert "return finishAcceptedScanStartReq(param)" in scan_start
+    assert "handlerResult = finishAcceptedScanStartReq(param)" in scan_start
+    assert "return handlerResult" in scan_start
     assert "return KeMsgConsumed" in scan_start
     assert "return KeMsgNoFree" in scan_finish
     assert "if param == nil: return KeMsgConsumed" in scanu_start
@@ -3963,17 +3967,16 @@ def test_wifi_lwip_smoke_dumps_dhcp_final_tx_chain():
         'exportc: "nimfw_dbg_dhcp_udp_csum_vafter"',
         'exportc: "nimfw_dbg_dhcp_req_udp_csum_at_copy"',
         'exportc: "nimfw_dbg_dhcp_request_tx_breakpoint"',
-        "repairDhcpUdpChecksum(ethernetFrameBytes, txPbufView.len.uint32)",
+        "observeDhcpUdpChecksum(ethernetFrameBytes, txPbufView.len.uint32)",
         "nimFwDbgDhcpCfmStatusLog[ringIdx]",
         "nimFwDbgDhcpCfmMetaLog[ringIdx]",
         "if (txStatusWord and FrameSuccessfulTxBit) != 0'u32:",
         "inc nimFwDbgDhcpCfmAckOk",
         "inc nimFwDbgDhcpCfmAckFail",
         "nimFwDbgDhcpTxMsgHist[msgType]",
-        "var dhcpOptionOffset = 282'u",
-        "let dhcpOptionCode = ethernetFrameBytes[dhcpOptionOffset]",
-        "let dhcpOptionLength = ethernetFrameBytes[dhcpOptionOffset + 1'u]",
-        "dhcpOptionOffset += 2'u + dhcpOptionLength.uint",
+        "parseDhcpWire(txPbufView.payload, txPbufView.len.uint, txPbufView.totLen.uint, false)",
+        "let msgType = dhcp.kind",
+        "nimFwDbgDhcpTxMsg = msgType.uint32 or (dhcp.xid shl 8)",
         "nimFwDbgDhcpRequestTxBreakpoint()",
         "for dhcpTxRawByteIndex in 0 ..< nimFwDbgDhcpTxRawLen.int:",
         "nimFwDbgDhcpTxRaw[dhcpTxRawByteIndex] =",
@@ -4589,10 +4592,10 @@ def test_wifi_beacon_probe_builders_use_vif_overlay_directly():
     wifi_fw = wifi_fw_policy_source()
 
     beacon_body = wifi_fw.rsplit("proc me_build_beacon*", 1)[1].split(
-        "proc me_build_probe_rsp*", 1
+        "proc meProbeResponseLength", 1
     )[0]
-    probe_body = wifi_fw.rsplit("proc me_build_probe_rsp*", 1)[1].split(
-        "proc me_build_capability*", 1
+    probe_body = wifi_fw.rsplit("proc meBuildProbeResponse", 1)[1].split(
+        "proc me_build_probe_rsp*", 1
     )[0]
     me_env_layout = wifi_fw.split(
         "MeEnvView {.packed.} = object", 1
@@ -4701,13 +4704,19 @@ def test_wifi_sae_and_assoc_rsp_builders_use_typed_vif_overlays():
     sae_body = nim_procedure(builders, "meBuildSaeAuthenticate")
     sae_wrapper = nim_procedure(builders, "me_build_sae_authenticate")
     rsp_body = nim_procedure(builders, "me_build_associate_rsp_impl")
+    wmm_body = nim_procedure(builders, "writeWmmParameterIe")
     assert "meBuildSaeAuthenticate(buf, authAlgo, authSeq, statusCode, vifIdx, nil)" in sae_wrapper
 
     for expected in [
         "let vif = vifChannelForIdx(vifIdx.uint8)",
         "var own = vif.macAddr",
-        "var bssid = vif.bssid",
-        "if empty: bssid = vif.currentBssid",
+        "if ownOverride != nil:",
+        "var bssid: array[6, uint8]",
+        "if peerOverride != nil:",
+        "let staIdx = vif.staIdx",
+        "let sta = staInfoForIdx(staIdx)",
+        "bssid = sta.macAddr",
+        "bssid = vif.currentBssid",
         "let body = cast[ptr AuthBodyDataView](buf)",
         "body.fixed = AuthFixedBodyView(authAlgo: authAlgo, authSeq: authSeq,",
         "statusCode: statusCode)",
@@ -4764,21 +4773,20 @@ def test_wifi_sae_and_assoc_rsp_builders_use_typed_vif_overlays():
         "let rateCount = staAdd.rateCount",
         "let staCap = staAdd.flags",
         "me_add_ie_ht_oper(addr cursor, cast[pointer](vif))",
-        "let bufPtrPtr = addr cursor",
-        "let wmm = wmmParameterIeAt(bufPtrPtr[])",
-        "let wmmSrc = mmWmmParameterSource()",
-        "wmm.qosInfo = vif.wmmQosInfo",
-        "wmm.ac[0].setLe32(wmmSrc.acBe)",
-        "wmm.ac[1].setLe32(wmmSrc.acBk)",
-        "wmm.ac[2].setLe32(wmmSrc.acVi)",
-        "wmm.ac[3].setLe32(wmmSrc.acVo)",
-        "bufPtrPtr[] = addr wmm.next[0]",
-        "let bssMaxIdle = bssMaxIdlePeriodIeAt(bufPtrPtr[])",
-        "bssMaxIdle.ie.id = 90'u8",
-        "bssMaxIdle.idlePeriod = wmmSrc.idlePeriod",
-        "bssMaxIdle.idleOptions = wmmSrc.idleOptions",
+        "cursor = writeWmmParameterIe(cursor, vif)",
+        "totalLen += sizeof(WmmParameterIeView).uint32",
     ]:
         assert expected in rsp_body
+
+    for expected in [
+        "let wmm = wmmParameterIeAt(ieBuf)",
+        "wmm.qosInfo = vif.wmmQosInfo",
+        "const hardwareOrder = [1, 0, 2, 3]",
+        "let encoded = vif.edcaRegs[hardwareOrder[ac]]",
+        "wmm.ac[ac].setLe32(aciAifsn or",
+        "addr wmm.next[0]",
+    ]:
+        assert expected in wmm_body
 
     for forbidden in [
         "let vifTabBase = cast[uint](addr vif_info_tab[0])",
@@ -5335,8 +5343,8 @@ def test_wifi_inline_wmm_parameter_ie_uses_typed_overlay():
         "addr wmm.next[0]",
     ]:
         assert expected in helper
-    for name, next_name in [("me_build_beacon*", "me_build_probe_rsp*"),
-                            ("me_build_probe_rsp*", "me_build_add_ba_req*")]:
+    for name, next_name in [("me_build_beacon*", "meProbeResponseLength"),
+                            ("meBuildProbeResponse", "me_build_probe_rsp*")]:
         body = wifi_fw.rsplit("proc " + name, 1)[1].split("proc " + next_name, 1)[0]
         assert "ieBuf = writeWmmParameterIe(ieBuf, vif)" in body
         assert "writeWpaPskVendorIe" not in body
@@ -5430,10 +5438,10 @@ def test_wifi_beacon_builders_do_not_invent_csa_from_context_marker():
     wifi_fw = wifi_fw_policy_source()
 
     beacon_body = wifi_fw.rsplit("proc me_build_beacon*", 1)[1].split(
-        "proc me_build_probe_rsp*", 1
+        "proc meProbeResponseLength", 1
     )[0]
-    probe_body = wifi_fw.rsplit("proc me_build_probe_rsp*", 1)[1].split(
-        "proc me_build_add_ba_req*", 1
+    probe_body = wifi_fw.rsplit("proc meBuildProbeResponse", 1)[1].split(
+        "proc me_build_probe_rsp*", 1
     )[0]
     csa_check_body = wifi_fw.rsplit("proc me_extract_csa*", 1)[1].split(
         "proc me_extract_power_constraint*", 1
@@ -5480,10 +5488,13 @@ def test_wifi_beacon_probe_variable_ie_copies_use_cursor_helper():
     wifi_fw = wifi_fw_policy_source()
 
     beacon_body = wifi_fw.rsplit("proc me_build_beacon*", 1)[1].split(
+        "proc meProbeResponseLength", 1
+    )[0]
+    probe_body = wifi_fw.rsplit("proc meBuildProbeResponse", 1)[1].split(
         "proc me_build_probe_rsp*", 1
     )[0]
-    probe_body = wifi_fw.rsplit("proc me_build_probe_rsp*", 1)[1].split(
-        "proc me_build_add_ba_req*", 1
+    extras_body = wifi_fw.rsplit("proc appendApFrameExtras", 1)[1].split(
+        "proc apm_send_mlme*", 1
     )[0]
 
     for expected in [
@@ -5497,7 +5508,6 @@ def test_wifi_beacon_probe_variable_ie_copies_use_cursor_helper():
     for expected in [
         "var ieBuf: pointer = beaconFrameIeBody(frame)",
         "ieBuf = copyIeBytes(ieBuf, wpaIePtr, wpaIeLen.uint)",
-        "ieBuf = copyIeBytes(ieBuf, appIeBeaconPtr, appIeBeaconLen.uint)",
     ]:
         assert expected in beacon_body
 
@@ -5506,9 +5516,16 @@ def test_wifi_beacon_probe_variable_ie_copies_use_cursor_helper():
         "frame.beaconInterval = bcnInt",
         "frame.capabilityInfo = capInfo",
         "var ieBuf: pointer = probeRspIeBody(frame)",
-        "ieBuf = copyIeBytes(ieBuf, appIeProbeRespPtr, appIeProbeRespLen.uint)",
     ]:
         assert expected in probe_body
+
+    for expected in [
+        "extras.length > capacity - built",
+        "let slot = ieCursorAfter(buf, countryAt.uint)",
+        "copyIeBytes(slot, ieCursorAfter(extras.data, extras.countryOffset.uint)",
+        "tail = copyIeBytes(tail, extras.data, extras.countryOffset.uint)",
+    ]:
+        assert expected in extras_body
 
     for forbidden in [
         "var ieBuf: pointer = cast[pointer](cast[uint](buf) + 36)",
@@ -5591,10 +5608,10 @@ def test_wifi_beacon_channel_reads_use_scan_channel_overlay():
         "proc me_build_capability*", 1
     )[0]
     beacon_body = wifi_fw.rsplit("proc me_build_beacon*", 1)[1].split(
-        "proc me_build_probe_rsp*", 1
+        "proc meProbeResponseLength", 1
     )[0]
-    probe_body = wifi_fw.rsplit("proc me_build_probe_rsp*", 1)[1].split(
-        "proc me_build_add_ba_req*", 1
+    probe_body = wifi_fw.rsplit("proc meBuildProbeResponse", 1)[1].split(
+        "proc me_build_probe_rsp*", 1
     )[0]
 
     for expected in [
@@ -5603,7 +5620,7 @@ def test_wifi_beacon_channel_reads_use_scan_channel_overlay():
         "cast[pointer](addr sta.powerConstraintOutputStorage[10])",
         "let chan = if chanPtr != nil: cast[ptr ScanChannelEntry](chanPtr) else: nil",
         "if chan.band == 0:",
-        "var power = cast[int8](cast[uint8](chan.txPower) - bss.powerConstraint)",
+        "var power = max(chan.txPower.int - bss.powerConstraint.int,",
     ]:
         assert expected in wifi_fw if expected.startswith(("doAssert", "template", "cast[pointer](addr sta.")) else expected in check_body
 
@@ -5817,7 +5834,7 @@ def test_wifi_assoc_req_builder_uses_typed_assoc_info_overlay():
         "fixedReq.capabilityInfo = capInfo",
         "fixedReq.listenInterval = listenInt",
         "c_memcpy(addr fixedReq.reassocBssid[0], reassocBssid, 6)",
-        "me_add_ie_ssid(addr cursor, addr assoc.ssidData[0], assoc.ssidLen)",
+        "me_add_ie_ssid(addr cursor, assoc.ssidLen, addr assoc.ssidData[0])",
         "let ratesPtr = cast[pointer](addr assoc.basicRates[0])",
         "let rateCount = assoc.basicRates[0]",
         "let assocIeSrc = cast[pointer](assoc.rsnIePtr)",
@@ -5880,25 +5897,25 @@ def test_wifi_notifier_chain_uses_shared_explicit_list_helpers():
         "proc notifier_chain_regsiter*", 1
     )[0]
     register_body = wifi_fw.split(
-        "proc notifier_chain_regsiter*(chain: ptr CoList, notifier: ptr CoListHdr) {.exportc, cdecl.} =",
+        "proc notifier_chain_regsiter*(chain: ptr CoList, notifier: ptr CoListHdr): cint {.exportc, cdecl, discardable.} =",
         1,
     )[1].split(
         "proc notifier_chain_regsiter_fromCritical*", 1
     )[0]
     register_critical_body = wifi_fw.split(
-        "proc notifier_chain_regsiter_fromCritical*(chain: ptr CoList, notifier: ptr CoListHdr) {.exportc, cdecl.} =",
+        "proc notifier_chain_regsiter_fromCritical*(chain: ptr CoList, notifier: ptr CoListHdr): cint {.exportc, cdecl, discardable.} =",
         1,
     )[1].split(
         "proc notifier_chain_unregsiter*", 1
     )[0]
     unregister_body = wifi_fw.split(
-        "proc notifier_chain_unregsiter*(chain: ptr CoList, notifier: ptr CoListHdr) {.exportc, cdecl.} =",
+        "proc notifier_chain_unregsiter*(chain: ptr CoList, notifier: ptr CoListHdr): cint {.exportc, cdecl, discardable.} =",
         1,
     )[1].split(
         "proc notifier_chain_unregsiter_fromCritical*", 1
     )[0]
     unregister_critical_body = wifi_fw.split(
-        "proc notifier_chain_unregsiter_fromCritical*(chain: ptr CoList, notifier: ptr CoListHdr) {.exportc, cdecl.} =",
+        "proc notifier_chain_unregsiter_fromCritical*(chain: ptr CoList, notifier: ptr CoListHdr): cint {.exportc, cdecl, discardable.} =",
         1,
     )[1].split(
         "proc notifier_chain_call*", 1
@@ -5911,19 +5928,11 @@ def test_wifi_notifier_chain_uses_shared_explicit_list_helpers():
     )[1].split("# ###########################################################################\n#                  Replay Counter", 1)[0]
 
     assert "NotifierNodeView {.packed.} = object" in wifi_fw
-    element_notify_layout = wifi_fw.split(
-        "ElementNotifyContextView {.packed.} = object", 1
-    )[1].split("KeEnvPsFlagsView {.packed.} = object", 1)[0]
-
-    assert "ElementNotifyContextView {.packed.} = object" in wifi_fw
-    assert "notifyBaseToStatePadding*: array[8, uint8]" in wifi_fw
     assert "template notifierNodeView(node: ptr CoListHdr): ptr NotifierNodeView" in wifi_fw
-    assert "template elementNotifyContextAt(ctx: pointer): ptr ElementNotifyContextView" in wifi_fw
     assert "doAssert offsetof(NotifierNodeView, callback) == 0" in wifi_fw
     assert "doAssert offsetof(NotifierNodeView, next) == 4" in wifi_fw
     assert "doAssert offsetof(NotifierNodeView, priority) == 8" in wifi_fw
-    assert "doAssert offsetof(ElementNotifyContextView, notifyBaseToStatePadding) == 0" in wifi_fw
-    assert "doAssert offsetof(ElementNotifyContextView, state) == 8" in wifi_fw
+    assert "doAssert offsetof(CfgApiElementEntryView, name) == 8" in wifi_fw
     assert "let newNode = notifierNodeView(notifier)" in insert_body
     assert "let currentNode = notifierNodeView(currentNotifier)" in insert_body
     assert "newNode.next = cast[pointer](currentNotifier)" in insert_body
@@ -5968,9 +5977,11 @@ def test_wifi_notifier_chain_uses_shared_explicit_list_helpers():
     notify_body = wifi_fw.rsplit("proc element_notify*", 1)[1].split(
         "proc is_cck_group*", 1
     )[0]
-    assert "let ctxState = elementNotifyContextAt(ctx).state" in notify_body
+    assert "cfgApiElementEntryAt(entry).name" in notify_body
+    assert 'logFn(1, nil, "mm.c", 1826,' in notify_body
+    assert "operation.cint" in notify_body
+    assert "elementNotifyContextAt" not in wifi_fw
     assert "cast[ptr pointer](cast[uint](ctx) + 8)" not in notify_body
-    assert "reserved00*" not in element_notify_layout
 
 
 def test_wifi_rate_control_random_sample_selection_is_bounded():
@@ -6117,16 +6128,20 @@ def test_wifi_kernel_timer_scheduler_yields_under_expired_backlog():
     assert "WifiTimerDrainLimit = 8'u32" in wifi_fw
     assert "nimfw_dbg_ke_timer_yield" in wifi_fw
     assert "nimfw_dbg_ke_timer_yield_head" in wifi_fw
-    assert "proc keTimerExpired(entry: ptr KeTimerEntry): bool" in wifi_fw
+    assert "proc keTimerExpired(entry: ptr KeTimerEntry; fromPoll: static bool = false): bool" in wifi_fw
     assert "var drained = 0'u32" in timer_body
     assert "while drained < WifiTimerDrainLimit:" in timer_body
     assert "while true:" not in timer_body
     assert "let expiredTimerEntry = block:" in timer_body
-    assert "cast[ptr KeTimerEntry](popped)" in timer_body
+    assert "cast[ptr KeTimerEntry](co_list_pop_front(addr keTimerQueue))" in timer_body
+    assert "keTimerExpiryKey = (entry.id, entry.taskId)" in timer_body
     assert "if keTimerScheduling: return" in timer_body
-    assert "ke_msg_send_basic(expiredTimerEntry.id, expiredTimerEntry.taskId, 0xFF)" in timer_body
+    assert "id == SCAN_PROBE_TIMER and dest == TASK_SCAN" in timer_body
+    assert "ke_msg_try_alloc(id, dest, 0xFF, 0)" in timer_body
+    assert "ke_msg_alloc(id, dest, 0xFF, 0)" in timer_body
+    assert "if keTimerExpiryCurrent:" in timer_body
+    assert "ke_msg_free(keMsgHdrFromPayload(message))" in timer_body
     assert "platformFree(cast[pointer](expiredTimerEntry))" in timer_body
-    assert "let entry = cast[ptr KeTimerEntry](popped)" not in timer_body
     assert "inc drained" in timer_body
     assert "nimFwDbgKeTimerYieldHead = nextTimer.time" in timer_body
     assert "if keTimerExpired(nextTimer):" in timer_body
@@ -6160,16 +6175,16 @@ def test_wifi_mm_timer_scheduler_yields_under_expired_backlog():
     assert "WifiTimerDrainLimit = 8'u32" in wifi_fw
     assert "nimfw_dbg_mm_timer_yield" in wifi_fw
     assert "nimfw_dbg_mm_timer_yield_head" in wifi_fw
-    assert "proc mmTimerExpired(node: ptr CoListHdr): bool" in wifi_fw
-    assert "var drained = 0'u32" in timer_body
-    assert "while drained < WifiTimerDrainLimit:" in timer_body
+    assert "proc mmTimerExpired(node: ptr CoListHdr; fromPoll: static bool = false): bool" in wifi_fw
+    assert "var attempts = 0'u32" in timer_body
+    assert "while attempts < WifiTimerDrainLimit:" in timer_body
     assert "while true:" not in timer_body
-    assert "inc drained" in timer_body
-    assert "nimFwDbgMmTimerYieldHead = nextTimer.expiry" in timer_body
-    assert "if mmTimerExpired(nextTimerNode):" in timer_body
+    assert "inc attempts" in timer_body
+    assert "nimFwDbgMmTimerYieldHead = mmTimerAt(nextTimerNode).expiry" in timer_body
+    assert "and mmTimerExpired(nextTimerNode):" in timer_body
     assert "inc nimFwDbgMmTimerYield" in timer_body
     assert "ke_evt_set(KE_EVT_MM_TIMER)" in timer_body
-    assert "mm_timer_hw_set(cast[pointer](nextTimerNode))" in timer_body
+    assert "mm_timer_hw_set(cast[pointer](mm_timer_list.first))" in timer_body
     assert "mm_timer_hw_set(nil)" in timer_body
     assert "if mmTimerExpired(next):" not in timer_body
     assert "mm_timer_hw_set(cast[pointer](next))" not in timer_body
@@ -8722,24 +8737,23 @@ def test_wifi_tpc_channel_power_offsets_use_semantic_locals():
     for expected in [
         "for channelOffsetIndex in 0 ..< 14:",
         "let channelPowerOffset = powerTable[24 + channelOffsetIndex]",
-        "tpcChannelOffsetTable[channelOffsetIndex] = channelPowerOffset",
-        "tpcPowerTable[24 + channelOffsetIndex] = channelPowerOffset",
     ]:
         assert expected in full_update_body
         assert expected in channel_update_body
 
     assert "channelPowerOffset.int32 * 4'i32" in full_update_body
     assert "scaled[channelOffsetIndex] = cast[int8](channelPowerOffset.int32 * 4'i32)" in full_update_body
-    assert "let scaledPhyOffset = channelPowerOffset.int32 * 4'i32" in channel_update_body
-    assert "scaled[channelOffsetIndex] = cast[int8](scaledPhyOffset)" in channel_update_body
-    assert 'printFn(cstring"pwr chan[%d] offset:%d\\r\\n", channelOffsetIndex.cint, scaledPhyOffset.cint)' in (
+    assert "let scaledPhyOffset = cast[int8](channelPowerOffset.int32 * 4'i32)" in channel_update_body
+    assert "scaled[channelOffsetIndex] = scaledPhyOffset" in channel_update_body
+    assert 'printFn(cstring("pwr chan[%d] offset:%d\\r\\n"), channelOffsetIndex.cint, scaledPhyOffset.cint)' in (
         channel_update_body
     )
+    assert 'printFn(cstring("dynamic update channel offset\\r\\n"))' in channel_update_body
+    assert channel_update_body.count("let printFn = cast[PrintfFn](blOpsFunc(4))") == 2
     assert "for channelOffsetIndex in 0 ..< 14:" in table_get_body
-    assert (
-        "powerTable[24 + channelOffsetIndex] = tpcChannelOffsetTable[channelOffsetIndex]"
-        in table_get_body
-    )
+    assert "powerTable[24 + channelOffsetIndex] = 0" in table_get_body
+    assert "tpcChannelOffsetTable" not in full_update_body + channel_update_body + table_get_body
+    assert "tpcPowerTable[24 + channelOffsetIndex]" not in full_update_body + channel_update_body
 
     for forbidden in [
         "for i in 0 ..< 14:",
@@ -9078,7 +9092,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         1,
     )[1].split("proc rfc_apply_tx_dvga_offset", 1)[0]
     rfc_power_meas_body = wifi_fw.split(
-        "iOut, qOut: ptr int32) {.exportc, cdecl.} =",
+        "iOut, qOut: ptr int32): uint32 {.exportc, cdecl.} =",
         1,
     )[1].split("proc rfc_sg_start*", 1)[0]
     rfc_sg_start_body = wifi_fw.split(
@@ -9196,9 +9210,9 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     efuse_xtal_cap_body = wifi_fw.split(
         "proc rfPriApplyEfuseXtalCapTrim(cfg: ptr WlRfConfig;",
         1,
-    )[1].split("proc rfPriApplyEfuseTxGainTrim", 1)[0]
-    efuse_tx_gain_body = wifi_fw.split(
-        "proc rfPriApplyEfuseTxGainTrim(cfg: ptr WlRfConfig) =",
+    )[1].split("proc rfPriApplyEfuseChipVersion", 1)[0]
+    efuse_chip_version_body = wifi_fw.split(
+        "proc rfPriApplyEfuseChipVersion(cfg: ptr WlRfConfig) =",
         1,
     )[1].split("proc rfPriApplyEfuseDfeTrim", 1)[0]
     efuse_dfe_trim_body = wifi_fw.split(
@@ -9249,6 +9263,10 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "proc wl_init*(): int8 {.exportc, cdecl.} =",
         1,
     )[1].split("proc channelPowerIndex", 1)[0]
+    wl_init_modem_body = wifi_fw.split(
+        "proc wlInitModemAndPublish(requireNoCallbacks: bool): bool {.noinline.} =",
+        1,
+    )[1].split("proc wl_init*", 1)[0]
     wl_cfg_init_body = wifi_fw.split(
         "proc wl_rf_cfg_init*() {.exportc, cdecl.} =",
         1,
@@ -9262,7 +9280,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         1,
     )[1].split("proc wl_lp_status_update", 1)[0]
     wl_lp_init_body = wifi_fw.split(
-        "proc wl_lp_init*(rmem: ptr WlRfMemoryOverlay; phyCfg: pointer): int32",
+        "proc wl_lp_init*(rmem: ptr WlRfMemoryOverlay; channelMhz: uint32): int32",
         1,
     )[1].split("proc wl_lp_status_clear", 1)[0]
     wl_lp_early_phy_body = wifi_fw.split(
@@ -9278,7 +9296,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         1,
     )[1].split("proc wlLpProgramApiModePhyBranchStart", 1)[0]
     wl_lp_tune_agc_prep_body = wifi_fw.split(
-        "proc wlLpProgramApiModeTuneAndAgcPrep(phyCfg: pointer) =",
+        "proc wlLpProgramApiModeTuneAndAgcPrep(channelMhz: uint32) =",
         1,
     )[1].split("proc wlLpCopyAgcMemoryAndReleaseGate", 1)[0]
     wl_lp_agc_copy_body = wifi_fw.split(
@@ -9333,7 +9351,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "proc wl_154_power_cfg_get*(): int8 {.exportc, cdecl.} =",
         "proc wl_bt_power_cfg_get*(index: uint32): int8 {.exportc, cdecl.} =",
         "proc wl_ble_power_cfg_get*(): int8 {.exportc, cdecl.} =",
-        "proc wl_lp_init*(rmem: ptr WlRfMemoryOverlay; phyCfg: pointer): int32",
+        "proc wl_lp_init*(rmem: ptr WlRfMemoryOverlay; channelMhz: uint32): int32",
         "proc wl_lp_status_update*(active: uint32; statusCode: int8;",
     ]:
         assert expected in wifi_fw
@@ -9349,23 +9367,15 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "wlCfgGlobal = cast[pointer](addr rmem.config)",
         "wlCalGlobal = cast[pointer](addr rmem.calib[0])",
         "wlEnvGlobal = cast[pointer](addr rmem.env[0])",
-        "rfCalibDataGlobal = wlCalGlobal",
         "wlLpDefaultInit()",
-        "rf_pri_input_xtalfreq(cfg.xtalfreqHz)",
-        "rf_pri_init(0'u32, uint32(cfg.apiMode))",
-        "let lpXtalIndex = wlLpXtalIndex(cfg.xtalfreqHz)",
-        "wlLpProgramEarlyPhyRegs(lpXtalIndex)",
-        "wlLpProgramApiModePhyBranchStart()",
-        "wlLpProgramApiModeTuneAndAgcPrep(phyCfg)",
-        "wlLpCopyAgcMemoryAndReleaseGate()",
-        "wlLpProgramAgcCoreRegs()",
-        "wlLpProgramPostAgcPowerDetectTail()",
-        "phy_init(phyCfg)",
-        "recovered lp_phy_init register phases",
-        "hardware validation proves whether the fallback can be removed",
+        "lp_rf_pri_init(0'u32, cfg.efuseChipVersion.uint32)",
+        "lp_phy_init(wlLpXtalIndex(cfg.xtalfreqHz), channelMhz)",
     ]:
         assert expected in wl_lp_init_body
     assert "Remaining unknown:" not in wl_lp_init_body
+    for forbidden in ["rfCalibDataGlobal = wlCalGlobal", "rf_pri_input_xtalfreq(",
+                      "phy_init(phyCfg)", "rf_pri_init(0'u32, uint32(cfg.apiMode))"]:
+        assert forbidden not in wl_lp_init_body
     assert "lp_default_init+0x0..0xb4" in wifi_fw
     for expected in [
         "lp_phy_init+0x0..0x16a",
@@ -9404,7 +9414,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "rc2_config_rxgain(-5'i8)",
         "addr rf.channelTuneCtrl26c",
         "0x05000000'u32",
-        "addr crm.modemReset18",
+        "addr mdm.rxGainTailCtrlC018",
         "0x00000050'u32",
         "crm_init()",
         "crm_mdm_reset()",
@@ -9427,7 +9437,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "0x00000200'u32",
         "0x00000001'u32",
         "addr rf.channelFreqMhz264",
-        "pointerAddrU32(phyCfg) and 0x00000FFF'u32",
+        "channelMhz and 0x00000FFF'u32",
         "addr rf.channelTuneStrobe268",
         "0x00020000'u32",
         "waitRfUs(1'u32)",
@@ -9440,7 +9450,8 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         assert expected in wl_lp_tune_agc_prep_body
     for expected in [
         "lp_phy_init+0x364..0x3a6",
-        "copyAgcMemory()",
+        "for wordIndex in 0 ..< 240:",
+        "volatileStore(addr dst.memoryWords[wordIndex], agcmem[wordIndex])",
         "addr crm.rfClockMux10",
         "0xDFFFFFFF'u32",
         "addr bba.pdGain390",
@@ -9449,9 +9460,10 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         assert expected in wl_lp_agc_copy_body
     for expected in [
         "lp_phy_init+0x3a6..0x774",
-        "register-identical to the typed main-PHY AGC core phase",
-        "wlLpApiModeActive()",
-        "bl808PhyProgramAgcCoreRegs()",
+        "0x0000A300'u32",
+        "0x01800000'u32",
+        "0x00000800'u32",
+        "addr bba.pdCompRampC840, 0x7FFFFFFF'u32, 0'u32",
     ]:
         assert expected in wl_lp_agc_core_body
     for expected in [
@@ -9473,7 +9485,6 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         assert expected in wifi_fw
     for expected in [
         "lp_phy_init+0x774..0x86c",
-        "wlLpApiModeActive()",
         "addr bba.lowPowerPdCompC864",
         "0x0000C078'u32",
         "addr bba.pdGain390",
@@ -9542,10 +9553,11 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "wl_lp_status_update+0x0..0x60",
         "let env = wlLowPowerStatusEnv()",
         "active == 0'u32",
-        "env.inactiveUpdateCount >= 1'u16",
+        "(env.inactiveUpdateCount.uint32 + 1'u32) and 0xFFFF'u32",
         "env.inactiveUpdateCount = 0'u16",
         "env.statusValid = 0'u8",
-        "env.lastStatusCode = statusCode",
+        "env.lastStatusCode = filtered",
+        "env.lastStatusCode.int32 * 48'i32 + statusCode.int32 * 80'i32",
         "env.statusValid = 1'u8",
         "env.lastUpdateContext = context",
     ]:
@@ -9565,14 +9577,14 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         1,
     )[1].split("proc trpc_get_power_idx", 1)[0]
     for expected in [
-        "of 0'u32, 1'u32:",
+        "if rateClass <= 1'u32:",
         "adjusted = (rateIndex - 4'u32) and 0xFF'u32",
         "trpc_get_default_power_idx(group, adjusted.uint8)",
-        "of 2'u32, 3'u32:",
+        "elif ((rateClass - 2'u32) and 0xFF'u32) <= 1'u32:",
         "trpc_get_default_power_idx(2'u32, rateIndex.uint8)",
-        "of 4'u32:",
+        "elif rateClass == 4'u32:",
         "trpc_get_default_power_idx(3'u32, rateIndex.uint8)",
-        "of 5'u32, 6'u32, 7'u32:",
+        "elif ((rateClass - 5'u32) and 0xFF'u32) <= 2'u32:",
         "trpc_get_default_power_idx(4'u32, rateIndex.uint8)",
         "wlInvalidPowerCfgIndex()",
     ]:
@@ -9634,12 +9646,13 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "proc rfPriGetTxGainIndex(requestedPowerTenths: int32;",
         "rf_pri_get_txgain_index(power, group)",
         "recovered BL602 implementation",
-        "adjustedPower -= 30'i32",
+        "let adjustedPower = requestedPowerTenths.int64 -",
+        "if rateGroup == 0'u32: 30'i64 else: 0'i64",
         "let txPowerTableRowIndex = int(tableIndex)",
         "bl808RfTxPowerTable[txPowerTableRowIndex][RfPriTxPowerRowTxGainTenthsIndex]",
         "for txPowerTableRowIndex in 0 ..< rowCount:",
         "bl808RfTxPowerTable[txPowerTableRowIndex][RfPriTxPowerRowPowerThresholdTenthsIndex]",
-        "bl808RfTxGainComp.int32",
+        "bl808RfTxGainComp.int64",
         "return txPowerTableRowIndex.uint32",
         "15'u32",
     ]:
@@ -9652,27 +9665,30 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
             "rfcPowerMeasureFrequencyWord(clockSelect, offsetHz)",
             "addr rf.measureCtrl618",
             "addr rf.measureMode61c",
+            "(sampleCount and 0xFFFF'u32) shl 16",
             "addr rf.measureI620",
             "addr rf.measureQ624",
             "RfMeasureReadyMask",
             "signedRfAverageMeasurement",
             "if iOut != nil:",
             "if qOut != nil:",
+            "int64(iSample) * int64(iSample)",
+            "int64(qSample) * int64(qSample)",
         ]),
         (rfc_sg_start_body, [
             "rfc_sg_start+0x0..0x146",
             "let rf = rfRegs()",
             "let magnitudeHz",
             "let frequencyControl",
-            "uint64(magnitudeHz) * 1024'u64",
-            "80_000_000'u64",
+            "float64(float32(magnitudeHz) * 1024.0'f32)",
+            "80_000_000.0",
             "let amplitudeCode",
             "if amplitude > 1023'u32: 1023'u32 else: amplitude",
             "let highPathPhase",
             "0x40000000'u32",
             "0xC0000000'u32",
             "addr rf.calSingenCtrl20c",
-            "addr rf.calSingenMeasurePrep21c",
+            "addr rf.calSingenPrep210",
             "addr rf.calSingenAmpLo214",
             "addr rf.calSingenAmpHi218",
             "signedQuadraturePath != 0'u32",
@@ -9725,7 +9741,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "cfg.ratePowerTablePreamble = 0'u16",
         "cfg.ratePowerLimitDbm = 20'u8",
         "cfg.efuseTrimControl = 0x02000000'u32",
-        "cfg.efuseTxGainComp = 0x01'u8",
+        "cfg.efuseChipVersion = 0x01'u8",
         "cfg.efuseXtalCapCode0 = 0x80'u8",
         "cfg.efuseXtalCapCode1 = 0x80'u8",
         "cfg.efuseDfeTrim = 0x80'u8",
@@ -9751,10 +9767,18 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "rfCalibDataGlobal = wlCalGlobal",
     ]:
         assert expected in rf_pri_init_calib_mem_body
-    assert "seedWlCfgTxPowerDefaults()" in wl_cfg_init_body
+    assert "seedWlCfgTxPowerDefaults" not in wl_cfg_init_body
     assert "rf_pri_cfg_init()" in wl_cfg_init_body
-    assert "wlCfgSetU32(WlRfCfgRxcalA8Offset, WlRfCfgWb03RxcalA8Default)" in wl_cfg_init_body
-    assert "wlCfgSetU32(WlRfCfgRxcalA8Offset" not in rf_pri_cfg_init_body
+    for name in ["wl_cfg_get", "wl_env_get", "wl_lp_init"]:
+        assert "rfCalibDataGlobal =" not in nim_procedure(wifi_fw, name)
+    assert "cast[ptr WlRfConfig](wlCfgGlobal)" in nim_procedure(wifi_fw, "wl_cfg_get")
+    assert "wlCfgSetU32" not in wl_cfg_init_body
+    assert "WlRfCfgWb03RxcalA8Default" not in wifi_fw
+    assert "WlRfCfgWb03RxcalAcDefault" not in wifi_fw
+    assert "seedWlCfgTxPowerDefaults(cfg)" in nim_procedure(wifi_fw, "configureWlRfConfig")
+    assert "rfPriEnsureDeviceInfo" not in wifi_fw
+    assert "bl808RfDeviceInfoSet" not in wifi_fw
+    assert "bl808RfDeviceBl616: uint8 = 1" in wifi_fw
     assert "var wifiBl808RfInited: uint32" in wifi_fw
     assert "bl808WifiRfColdInit" not in wifi_fw
     assert (
@@ -9769,7 +9793,10 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     assert "let requestFullCalibration = 0'u8" not in wifi_fw
     assert "let restore = if wifiBl808RfInited" not in wifi_fw
     assert "let restore = 1'u32" not in wifi_fw
-    assert "discard wl_init()" in wifi_fw
+    assert "wlInitModemAndPublish(true)" in rf_core_init
+    assert "wlInitModemAndPublish(true)" in rfc_init_body
+    assert "if not initialized or not wlRfConfigInitialized():" in rf_core_init
+    assert "if not initialized or not wlRfConfigInitialized():" in rfc_init_body
     assert "wifiBl808RfInited = 1'u32" in wifi_fw
     assert "bl808WifiUseBl808Rf" not in wifi_fw
     assert "bl808WifiAllowLegacyBl606pRfFallback" not in wifi_fw
@@ -9793,7 +9820,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     assert "template phyEnvWord(" not in wifi_fw
     assert "template phyEnvViewPtr(): ptr PhyEnvView" in wifi_fw
     assert rf_core_init.index("wl_cfg_get(addr wifiBl808WlRmem)") < rf_core_init.index(
-        "discard wl_init()"
+        "wlInitModemAndPublish(true)"
     )
     assert "let cfg = wl_cfg_get(addr wifiBl808WlRmem)" in rfc_init_body
     assert "let wlFullCalibrationFlag =" in rfc_init_body
@@ -9815,16 +9842,23 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     assert "regRead32(" not in wifi_rf_latch and "regWrite32(" not in wifi_rf_latch
     assert "WlCapcodeGetCb = proc(cap0, cap1: ptr uint8) {.cdecl.}" in wifi_fw
     assert "(addr cap, addr cap)" in wl_init_body
-    assert wl_init_body.count("cfg = cast[ptr WlRfConfig](wlCfgGlobal)") == 5
+    assert wl_init_body.count("cfg = cast[ptr WlRfConfig](wlCfgGlobal)") == 4
+    assert "if not wlInitModemAndPublish(false):" in wl_init_body
+    assert "cfg.enableParamLoadCallback != 0'u8" in wl_init_modem_body
+    assert "cfg.capcodeSetCallback != nil" in wl_init_modem_body
+    assert "cfg.capcodeGetCallback != nil" in wl_init_modem_body
+    assert "cfg = cast[ptr WlRfConfig](wlCfgGlobal)" in wl_init_modem_body
     assert "bl808RfChannelPowerIndex: uint8 = 1'u8" in wifi_fw
-    assert "bl808RfChannelPowerIndex = uint8(channelIndex and 0xFF'u32)" in set_channel_power_comp_body
-    assert "let restoreExistingCalibration =" in wl_init_body
-    assert "if cfg.requestFullCalibration != 0'u8: 0'u32 else: 1'u32" in wl_init_body
+    assert "if channelIndex < 1'u32 or channelIndex > 14'u32:" in set_channel_power_comp_body
+    assert "bl808RfChannelPowerIndex = 0'u8" in set_channel_power_comp_body
+    assert "bl808RfChannelPowerIndex = uint8(channelIndex)" in set_channel_power_comp_body
+    assert "let restoreExistingCalibration =" in wl_init_modem_body
+    assert "if cfg.requestFullCalibration != 0'u8: 0'u32 else: 1'u32" in wl_init_modem_body
     assert (
         "modemInitCoreMode(\n    cfg.xtalfreqHz,\n    restoreExistingCalibration,"
-    ) in wl_init_body
+    ) in wl_init_modem_body
     assert "let apiMode = apiFromRadioPhyMode(mode)" in modem_init_mode_body
-    assert "let xtalCfg = RfcXtalConfigTable[xtalIndex(xtalfreqHz)]" in modem_init_mode_body
+    assert "let nominal = RfcXtalConfigTable[xtalIndex(xtalfreqHz)]" in modem_init_mode_body
     assert (
         "updateReg32(addr rf.rxMode220, 0xFBFFFFFF'u32, 0'u32)"
         in modem_init_mode_body
@@ -9833,19 +9867,23 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "updateReg32(addr rf.rxMode220, 0xF7FFFFFF'u32, 0x08000000'u32)"
         in modem_init_mode_body
     )
+    cold_handoff = (
+        "if restoreExistingCalibration == 0'u32:\n"
+        "    rf_pri_input_xtalfreq(if xtalfreqHz == nominal.xtalHz: xtalfreqHz else: WlXtal40M)"
+    )
+    assert modem_init_mode_body.count("rf_pri_input_xtalfreq(") == 1
     assert modem_init_mode_body.index(
         "updateReg32(addr rf.rxMode220, 0xFBFFFFFF'u32, 0'u32)"
-    ) < modem_init_mode_body.index("rf_pri_input_xtalfreq(xtalfreqHz)")
-    assert modem_init_mode_body.index(
+    ) < modem_init_mode_body.index(
         "updateReg32(addr rf.rxMode220, 0xF7FFFFFF'u32, 0x08000000'u32)"
-    ) < modem_init_mode_body.index("rf_pri_input_xtalfreq(xtalfreqHz)")
-    assert "restoreExistingCalibration == 0'u32" in modem_init_mode_body
+    ) < modem_init_mode_body.index(cold_handoff) < modem_init_mode_body.index("  rf_pri_init(")
+    assert "let xtalCfg = rfcModemXtalConfig(xtalfreqHz, nominal)" in modem_init_mode_body
     assert "proc modemInitCoreMode(xtalfreqHz, restore: uint32" not in wifi_fw
     assert "nimFwDbgRfApiMode = apiMode.uint32" in modem_init_mode_body
     assert "modemInitCoreMode(xtalfreqHz, restore, wifiOnly)" in wifi_fw
     assert "rf_pri_init(if restore == 0'u32: 1'u32 else: 0'u32, 1'u32)" not in modem_init_mode_body
     assert "if fullInit != 0'u32: 1'u8 else: 0'u8)" not in rfc_init_body
-    assert rfc_init_body.index("discard wl_init()") < rfc_init_body.index("phy_init(nil)")
+    assert rfc_init_body.index("wlInitModemAndPublish(true)") < rfc_init_body.index("phy_init(nil)")
     assert "rf_init(xtalfreqHz)" not in rfc_init_body
     assert "modem_init_core(" not in rfc_init_body
     assert "RfPriCalState = object" in wifi_fw
@@ -10317,13 +10355,14 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         assert old_name not in wifi_fw
     for expected in [
         "for vcoPairRegisterIndex in 0'u ..< 10'u:",
-        "volatileStore(addr rf.vcoPairTable13c[vcoPairRegisterIndex],",
+        "let reg = addr rf.vcoPairTable13c[vcoPairRegisterIndex]",
+        "programRfcVcoHalf(reg, channelMhz, 0'u32)",
+        "programRfcVcoHalf(reg, channelMhz + 4'u32, 16'u32)",
     ]:
         assert expected in vco_table_body
-    assert "volatileStore(addr rf.vcoPairTable13c[i]" not in vco_table_body
-    assert "volatileStore(addr rf.vcoPair2484Mhz164" in vco_table_body
+    assert "programRfcVcoHalf(addr rf.vcoPair2484Mhz164, 2484'u32, 0'u32)" in vco_table_body
     for expected in [
-        "addr rf.rbbRccalCtrl80",
+        "addr rf.rxMode220",
         "addr rf.bandwidthCtrl94",
         "addr rf.scanSynthControl608",
         "addr rf.txcalDfe88",
@@ -10536,7 +10575,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "of WlXtal38P4M: 3'u32",
         "of WlXtal40M: 4'u32",
         "of WlXtal52M: 5'u32",
-        "else: 5'u32",
+        "else: 0'u32",
     ]:
         assert expected in xtal_index_body
     for expected in [
@@ -10803,10 +10842,11 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     )[0]
     assert "let dst = wifiAgcMemoryRegs()" in copy_agc_body
     for expected in [
+        "var initCfgWords: array[9, uint32]",
+        "initCfgWords[phyInitConfigWordIndex] = words[phyInitConfigWordIndex]",
         "for phyInitConfigWordIndex in 0 ..< 9:",
         "volatileStore(addr env.initCfgWords[phyInitConfigWordIndex],",
-        "words[phyInitConfigWordIndex])",
-        "volatileStore(addr env.initCfgWords[phyInitConfigWordIndex], 0'u32)",
+        "initCfgWords[phyInitConfigWordIndex])",
     ]:
         assert expected in copy_phy_init_body
     for expected in [
@@ -10834,7 +10874,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     )[1].split("proc phyClockCountFromVersion", 1)[0]
     for expected in [
         "if (((value shl shift) and not mask) != 0'u32):",
-        'wrapPhyAssertErr("phy.c", cond, 0x35C4.cint)',
+        'wrapPhyAssertErr(cond, "module", 0x35C4.cint)',
     ]:
         assert expected in phy_field_assert_body
     recovered_phy_body = wifi_fw.split(
@@ -10875,14 +10915,14 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "addr mdm.versionFeatureCtrl800",
         "addr mdm.channelTypeCtrl824",
         "addr macPhy.channelBandwidthCtrl310",
+    ]:
+        assert expected in recovered_phy_body
+    for forbidden in [
         "addr mdm.channelModeCtrl930",
         "addr mdm.basebandDfeTimeout3bc",
         "addr mdm.basebandDfeEnable414",
         "addr mdm.basebandRxPathCtrlC40",
         "addr mdm.basebandRxPathCtrlC44",
-    ]:
-        assert expected in recovered_phy_body
-    for forbidden in [
         "WifiModemBase + 0x820'u",
         "WifiModemBase + 0x800'u",
         "WifiModemBase + 0x824'u",
@@ -10991,12 +11031,14 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     )[1].split("proc phy_get_ntx*", 1)[0]
     assert "let env = phyEnvViewPtr()" in phy_get_channel_body
     for expected in [
-        "addr env.channelBandType",
-        "addr env.primaryFreq",
-        "addr env.centerFreq1",
-        "addr env.centerFreq2",
+        "let primary = volatileLoad(cast[ptr uint32](addr env.channelBandType))",
+        "let center = volatileLoad(cast[ptr uint32](addr env.centerFreq1))",
+        "dst[0] = primary",
+        "dst[1] = center",
     ]:
         assert expected in phy_get_channel_body
+    assert 'var phy_env* {.align: 4, exportc.}: array[48, uint8]' in wifi_fw
+    assert phy_get_channel_body.index("let center =") < phy_get_channel_body.index("dst[0] =")
     for forbidden in [
         "phyEnvWord(36'u)",
         "phyEnvWord(40'u)",
@@ -11007,11 +11049,11 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         1,
     )[1].split("proc phy_he_supported*", 1)[0]
     for expected in [
-        "let version = modemVersionReg()",
-        "((version shr 22) and 1'u32) != 0'u32",
-        "((version shr 24) and 0x3'u32) != 0'u32",
+        "((modemVersionReg() shr 22) and 1'u32) != 0'u32 or",
+        "((modemVersionReg() shr 24) and 0x3'u32) != 0'u32",
     ]:
         assert expected in phy_vht_body
+    assert phy_vht_body.count("modemVersionReg()") == 2
     assert "(modemVersionReg() and (1'u32 shl 16)) != 0" not in wifi_fw
     phy_stop_body = wifi_fw.split(
         "proc phy_stop*() {.exportc, cdecl.} =",
@@ -11100,6 +11142,10 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         assert forbidden not in bba_pd_gain_body
     for expected in [
         'var bbaEnv* {.align: 4, exportc: "bba_env".}: BbaRuntimeState',
+        'exportc: "bba", codegenDecl: "$# $# = &bba_env"',
+        'BbaPdThresholdAttack* {.exportc: "pd_th_att".}',
+        'BbaPdThresholdRelease* {.exportc: "pd_th_rls".}',
+        "volatileLoad(addr bbaRuntimeGlobal)",
         "proc bba_get_pd_gain*(): uint8 {.exportc, cdecl.} =",
         "proc bba_get_pd_state*(): uint8 {.exportc, cdecl.} =",
         "proc bba_get_pd_mile*(): uint8 {.exportc, cdecl.} =",
@@ -11129,22 +11175,22 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "addr bbaAgcRegs().pdGain390",
         "addr bbaAgcRegs().pdCompC830",
         "addr bbaAgcRegs().pdSlope3c0",
-        "bbaSetPdLatch(enable != 0'u32)",
+        "bbaProgramPdLatchRegs(active)",
         "let saved = bbaIrqSave()",
         "let oldState = volatileLoad(addr bbaState().pdRssiState).uint32",
         "bba_set_pd_ofdm(1'u32)",
         "bba_set_pd_dsss(1'u32)",
         "bba_set_pd_ofdm(0'u32)",
         "bba_set_pd_dsss(0'u32)",
-        "bbaSetPdLatch(false)",
-        "bbaSetPdLatch(true)",
+        "bba_set_pd_mile(0'u32)",
+        "bba_set_pd_mile(1'u32)",
         "bbaProgramPdGain(0'u32)",
         "bbaProgramPdGain(1'u32)",
         "bbaProgramPdGain(2'u32)",
         "volatileStore(addr bbaState().pdRssiState, state.uint8)",
         "bbaIrqRestore(saved)",
         "volatileStore(addr bbaState().cePpmAccumulator, 0'u16)",
-        "volatileStore(addr bbaState().ceUpdateInterval, 16'u8)",
+        "bbaResetCeUpdatePeriod(16'u8)",
         "bbaApplyCarrierErrorCapcode()",
         "bbaRunCarrierErrorLoop(rssi, ppm)",
         "bbaRunPowerDetectLoop(rssi)",
@@ -11166,7 +11212,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         1,
     )[1].split("proc bbaSetPdLatch", 1)[0]
     bba_pd_latch_body = wifi_fw.split(
-        "proc bbaSetPdLatch(enable: bool) =",
+        "proc bbaProgramPdLatchRegs(enable: bool) =",
         1,
     )[1].split("proc bbaUpdatePdComp", 1)[0]
     bba_update_pd_comp_body = wifi_fw.split(
@@ -11191,15 +11237,19 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "let carrierErrorPpmOffset = signExtend(",
         "if carrierErrorPpmOffset == 0'i32:",
         "if carrierErrorPpmOffset > 0'i32:",
+        "cast[WlCapcodeGetCb](cfg.capcodeGetCallback)",
+        "cast[WlCapcodeSetCb](cfg.capcodeSetCallback)(adjustedCapcode, adjustedCapcode)",
+        "bbaIrqRestore(saved)",
     ]:
         assert expected in bba_carrier_error_capcode_body
     assert "let offset = signExtend(" not in bba_carrier_error_capcode_body
     assert "if offset > 0'i32:" not in bba_carrier_error_capcode_body
     rxgain_body = wifi_fw.split(
-        "proc rc2_config_rxgain*(offset: int8) {.exportc, cdecl.} =",
+        "proc rc2_config_rxgain*(offset: int32) {.exportc, cdecl.} =",
         1,
     )[1].split("proc bl808PhyProgramRxTailRegs()", 1)[0]
     assert "let mdm = wifiModemRegs()" in rxgain_body
+    assert 'var phyRxGainTable* {.exportc: "rxgain".}: array[9, int8]' in wifi_fw
     for expected in [
         "addr mdm.rxGainTable0C080",
         "addr mdm.rxGainTable1C084",
@@ -11222,7 +11272,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
     assert "addr mdm.rxGainTailCtrlC018" in rx_tail_body
     assert "RfBase + 0x26C'u" not in rx_tail_body
     assert "cast[ptr uint32](0x24C0C018'u)" not in rx_tail_body
-    assert "let clkCount = phyClockCountFromVersion(version)" in wifi_fw
+    assert "let clkCount = phyClockCountFromVersion(topVersion, midVersion)" in wifi_fw
     phy_get_antenna_body = wifi_fw.split(
         "proc phy_get_antenna_set*(): uint8 {.exportc, cdecl.} =",
         1,
@@ -11241,9 +11291,7 @@ def test_wifi_rf_bringup_dependency_is_explicit_and_objdump_recoverable():
         "let env = phyEnvViewPtr()",
         "addr env.initCfgWords[phyInitConfigWordIndex]",
         "addr env.channelBandType",
-        "addr env.primaryFreq",
         "addr env.centerFreq1",
-        "addr env.centerFreq2",
     ]:
         assert expected in copy_phy_cfg_body
     for forbidden in [
@@ -11779,7 +11827,8 @@ def test_rf_symbol_provenance_checker_rejects_archive_fallbacks():
         "VALIDATE_RF_BUILD_LOG",
         "VALIDATE_RF_LINK_MAP",
         "VALIDATE_RF_REQUIRE_HW_NIMCACHE",
-        "WiFi phy_init copies agcmem to 0x24C0A000 and has no LDPC RAM path",
+        "VALIDATE_WIFI_LEGACY_RF=1 checks the BL616-derived AGC-only profile",
+        'RF_ARGS+=(--bl808-demo-mac-archive "$REF" --bl808-demo-rf-archive "$BL808_DEMO_RF_ARCHIVE")',
         "rejects extracted RF archive members in the link map",
         "--check-hw-validation-nimcache-objects",
         "--hw-validation-test \"$VALIDATE_RF_HW_TEST\"",
@@ -11964,11 +12013,12 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
     assert "let value = int64(sample)" not in square_rf_sample_body
     for expected in [
         "let tempChannelTableIndex = rfPriTempChannelTableIndex(channelMhz)",
-        "let temperatureOffsetDivisor =",
-        "bl808RfTempLowOffsets,\n        tempChannelTableIndex)",
-        "bl808RfTempHighOffsets,\n        tempChannelTableIndex)",
-        "if temperatureOffsetDivisor == 0'i16:",
-        "div temperatureOffsetDivisor.int32",
+        "rfPriSensorTemperatureTenths(sensorTemperatureC)",
+        "case bl808RfTempInterpolationMode",
+        "divisor = offsets[tempChannelTableIndex - 1].int32",
+        "divisor = rfPriInterpolatedTempOffset(channelMhz, offsets,",
+        "return (previousComp, false)",
+        "rfPriSignedDiv32((sensorTenths - roomTenths) * 2'i32,",
     ]:
         assert expected in temp_power_comp_body
     assert "let index = rfPriTempChannelTableIndex(channelMhz)" not in temp_power_comp_body
@@ -12064,6 +12114,9 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
     write_acal_body = wifi_fw.split(
         "proc writeRfAcalCode(code: uint16) =",
         1,
+    )[1].split("proc programRfPriModeRegisters", 1)[0]
+    mode_register_body = wifi_fw.split(
+        "proc programRfPriModeRegisters(", 1
     )[1].split("proc prepareRfPriLoFcal", 1)[0]
     lo_calib_accessors = wifi_fw.split(
         "proc rfLoFcal(loChannelIndex: int)",
@@ -12113,7 +12166,7 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
         "elif channelCountCrossingIndex >= measuredLen:",
         "fcal = int(baseCode) + 2 - channelCountCrossingIndex",
         "if belowDistance < aboveDistance:",
-        "fcalCodes[loChannelCalIndex] = uint16((fcal + 256) and 0xFF)",
+        "fcalCodes[loChannelCalIndex] = uint16(fcal and 0xFFFF)",
         "setRfLoFcal(loChannelCalIndex, fcalCodes[loChannelCalIndex])",
         "var measured: array[40, uint16]",
         "if measuredLen > 1 and measured[measuredLen - 1] > rfPriLoFcalCountBound(2):",
@@ -12143,8 +12196,9 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
         "for loChannelCalIndex in 0 ..< RfLoChannelCount:",
         "uint32(rfLoFcal(loChannelCalIndex))",
         "rfPriChannelDivValue(loChannelCalIndex)",
-        "var acal = 0x20'u16",
-        "var acalSearchStep = 0x10'u16",
+        "addr rf.acalCtrlA4",
+        "var acal = 0x10'u16",
+        "var acalSearchStep = 0x08'u16",
         "setRfLoAcal(loChannelCalIndex, acal)",
     ]:
         assert expected in run_lo_acal_body
@@ -12154,7 +12208,6 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
         "RfChannelDivTable40M[i]",
         "setRfLoAcal(i, acal",
         "vendorLikeRfAcalForFcal",
-        "addr rf.acalCtrlA4,",
     ]:
         assert forbidden not in run_lo_acal_body
     config_channel_cal_body = wifi_fw.split(
@@ -12363,9 +12416,9 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
     efuse_xtal_cap_body = wifi_fw.split(
         "proc rfPriApplyEfuseXtalCapTrim(cfg: ptr WlRfConfig;",
         1,
-    )[1].split("proc rfPriApplyEfuseTxGainTrim", 1)[0]
-    efuse_tx_gain_body = wifi_fw.split(
-        "proc rfPriApplyEfuseTxGainTrim(cfg: ptr WlRfConfig) =",
+    )[1].split("proc rfPriApplyEfuseChipVersion", 1)[0]
+    efuse_chip_version_body = wifi_fw.split(
+        "proc rfPriApplyEfuseChipVersion(cfg: ptr WlRfConfig) =",
         1,
     )[1].split("proc rfPriApplyEfuseDfeTrim", 1)[0]
     efuse_dfe_trim_body = wifi_fw.split(
@@ -12650,8 +12703,11 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
         assert forbidden not in pack_five_fields_body
     for expected in [
         "for bzChannelPowerCompIndex, rawComp in bl808RfBzChannelPowerComp:",
-        "tempAdjusted[bzChannelPowerCompIndex] =",
-        "txAdjusted[bzChannelPowerCompIndex] =",
+        "bzAdjusted[bzChannelPowerCompIndex] =",
+        "btAdjusted[bzChannelPowerCompIndex] =",
+        "bl808RfBzTxCorrOffset.int32 + clipped.int32",
+        "clipped.int32 + bl808RfBtTxCorrOffset.int32",
+        "sum += clipped.int32",
     ]:
         assert expected in set_bz_channel_power_comp_body
     for forbidden in [
@@ -12660,6 +12716,7 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
         "txAdjusted[i]",
     ]:
         assert forbidden not in set_bz_channel_power_comp_body
+    assert "bl808RfBzTempCorrAvg" not in set_bz_channel_power_comp_body
     for expected in [
         "for bzTempCompDeltaIndex in 0 ..< deltas.len:",
         "deltas[bzTempCompDeltaIndex] =",
@@ -12677,8 +12734,12 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
     for expected in [
         "for bzTempCompChannelIndex, channelMhz in BzTempCompChannelsMhz:",
         "bl808RfBzTempPowerComp[bzTempCompChannelIndex] =",
+        "bl808RfBzAppliedTempComp[bzTempCompChannelIndex] = sharedComp",
+        "publishShared = publishShared or sample.computed",
+        "bl808RfTempPowerComp = sharedComp",
     ]:
         assert expected in set_bz_temp_comp_body
+    assert "bl808RfBzAppliedTempComp = bl808RfBzTempPowerComp" not in set_bz_temp_comp_body
     for forbidden in [
         "for i, channelMhz in BzTempCompChannelsMhz:",
         "bl808RfBzTempPowerComp[i]",
@@ -12939,11 +13000,13 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
     ]:
         assert expected in wifi_fw if expected.startswith("proc ") else expected in efuse_xtal_cap_body
     for expected in [
-        "let efuseTxGainByte = cfg.efuseTxGainComp",
-        "bl808RfTxGainComp",
-        "bl808RfTempPowerComp = rfSignedByte(cfg.temperaturePowerComp)",
+        "rf_pri_input_chip_ver(cfg.efuseChipVersion.uint32)",
     ]:
-        assert expected in efuse_tx_gain_body
+        assert expected in efuse_chip_version_body
+    assert "bl808RfTempPowerComp" not in efuse_chip_version_body
+    assert "bl808RfTxGainComp" not in efuse_chip_version_body
+    for expected in ["bl808RfBzTxCorrOffset", "bl808RfBtTxCorrOffset", "bl808RfTxGainComp"]:
+        assert expected in efuse_xtal_cap_body
     for expected in [
         "let efuseDfeTrimNibble = cfg.efuseDfeTrim",
         "let dfe = rfDfeInitRegs()",
@@ -12952,12 +13015,18 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
         assert expected in efuse_dfe_trim_body
     for expected in [
         "rfPriApplyEfuseXtalCapTrim(cfg, txCorrRegHigh, txCorrRegLow)",
-        "rfPriApplyEfuseTxGainTrim(cfg)",
+        "rfPriApplyEfuseChipVersion(cfg)",
+        "rf_pri_input_bz_target_power(rfSignedByte(cfg.ratePowerLimitDbm).int32)",
+        "rf_pri_get_bz_temp_mp_comp()",
+        "cfg = cast[ptr WlRfConfig](wlCfgGlobal)",
         "rfPriApplyEfuseDfeTrim(cfg)",
         "addr rf.txPowerComp704",
         "addr rf.txPowerComp7ac",
     ]:
         assert expected in efuse_init_body
+    assert efuse_init_body.index("rfPriApplyEfuseChipVersion(cfg)") < efuse_init_body.index(
+        "rf_pri_input_bz_target_power(") < efuse_init_body.index(
+        "rf_pri_get_bz_temp_mp_comp()") < efuse_init_body.index("rfPriApplyEfuseDfeTrim(cfg)")
     for vague_name in [
         "let cap0",
         "let cap1",
@@ -13126,12 +13195,12 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
     for body in [prepare_lo_fcal_body, run_lo_acal_body,
                  config_channel_cal_body]:
         assert "addr rf.sdmDivC4" in body
+    for expected in ["addr rf.baseCtrl1", "addr rf.synthCtrl2c", "addr rf.priModeCtrl30"]:
+        assert expected in mode_register_body
     for body in [prepare_lo_fcal_body, prepare_lo_acal_body]:
         for expected in [
             "let rf = rfRegs()",
-            "addr rf.baseCtrl1",
-            "addr rf.synthCtrl2c",
-            "addr rf.priModeCtrl30",
+            "programRfPriModeRegisters()",
             "addr rf.calCtrl1c",
         ]:
             assert expected in body
@@ -13141,7 +13210,7 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
             "RfPriModeCtrlReg",
             "RfCalCtrlReg",
         ]:
-            assert forbidden not in body
+            assert forbidden not in body and forbidden not in mode_register_body
     for expected in [
         "addr rf.fcalAc",
         "addr rf.calResultA8",
@@ -13154,7 +13223,7 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
     for expected in [
         "nim_wifi_rf_last_config_channel_index = uint32(loChannelIndex)",
         "let fcalByte = uint32(rfLoFcal(loChannelIndex))",
-        "let acalByte = uint32(rfLoAcal(loChannelIndex))",
+        "let acalCode = uint32(rfLoAcal(loChannelIndex))",
         "rfPriChannelDivValue(loChannelIndex)",
         "addr rf.fcalCtrlA0",
         "addr rf.channelFcalConfigBc",
@@ -13181,7 +13250,9 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
     assert "proc rfPriWaitConfigIdleForWb03RfcEntry(" not in wifi_fw
     assert "proc rfPriApplyWb03RfcEntryBaseline(" not in wifi_fw
 
-    for body in [prepare_txcal_body, prepare_bz_txcal_body, prepare_rxcal_body]:
+    assert "programRfPriModeRegisters(0xCEFFF8FF'u32, 0xCEFF7800'u32)" in prepare_txcal_body
+    assert "addr rf.calDfeGate23c" not in prepare_txcal_body
+    for body in [prepare_bz_txcal_body, prepare_rxcal_body]:
         assert "let rf = rfRegs()" in body
         assert "addr rf.calDfeGate23c" in body
         assert "0x2000123C'u32" not in body
@@ -13684,8 +13755,7 @@ def test_rf_pri_fixed_value_wb03_branch_and_trace_targets_are_locked():
         "addr rf.calSingenAmpLo214",
         "addr rf.calSingenAmpHi218",
         "addr rf.calSingenMeasurePrep21c",
-        "let rxcalReplayA8Word = rfCalibWord(RfCalibTxcalRecordBaseWord + 8 * 2)",
-        "let rxcalReplayAcWord = rfCalibWord(RfCalibTxcalRecordBaseWord + 8 * 2 + 1)",
+        "RfCalibTxcalRecordBaseWord + 8 * 2",
         "bl808RfTxPowerTable[bl808RfTxPowerTableIndex[8].int]",
     ]:
         assert expected in wifi_fw if expected.startswith("proc ") else expected in prepare_rxcal_body
@@ -14136,13 +14206,6 @@ def test_wifi_rx_tx_dhcp_path_uses_typed_overlays():
     assert "vifKeyPointersAt(vifAddr).flags" not in tx_sec_key
     assert "var nimfw_dbg_sta_tx_rf_latch {.importc.}: uint32" in lwip_smoke
     assert 'kvWrite("tx_rf_latch", nimfw_dbg_sta_tx_rf_latch)' in lwip_smoke
-
-    tx_check_ret = wifi_tx.split("proc txCheckRet", 1)[1].split(
-        "proc nimFwDbgDhcpTxBreakpoint", 1
-    )[0]
-    assert "discard isSta" in tx_check_ret
-    assert "(isGroupcast != 0'u8 and (value and DescDoneTxBit) != 0'u32)" in tx_check_ret
-    assert "if isSta != 0'u8:" not in tx_check_ret
 
 
 def test_wifi_rx_upload_strip_uses_payload_chain_descriptor():
@@ -14689,7 +14752,9 @@ def test_wifi_assoc_mgmt_duplicate_filter_uses_retry_and_nonqos_cache():
         "proc rxu_mgt_ind_handler_scanu", 1
     )[0]
     policy = producer.index("let ignored = mfpIgnoreRxMgmtFrame(param,")
-    commit = producer.index("rxSeq.nonQosSeqCtrl = envSeq")
+    commit = producer.index(
+        "staRxSequence(staInfoForIdx(staIdx)).nonQosSeqCtrl = envSeq"
+    )
     assert producer.index("let envSeq = env.seqCtrl") < policy < commit
     guarded_commit = producer[policy:commit]
     assert "return rxuMgtUpload(param, mfpAcceptedFlag)" in guarded_commit
@@ -14697,7 +14762,8 @@ def test_wifi_assoc_mgmt_duplicate_filter_uses_retry_and_nonqos_cache():
     assert "defer: irqRestore(savedIrq)" in guarded_commit
     assert "if not currentFrame(): return 0" in guarded_commit
     assert "rxUploadCurrent(param, generation) and rxStationCurrent(param)" in producer
-    assert "if mfpAcceptedFlag != 0 and staIdx < STA_INFO_TAB_ENTRIES.uint8:" in guarded_commit
+    assert "if frameAccepted == 0 or msgSubtype == 0xFF:" in guarded_commit
+    assert "if staIdx < STA_INFO_TAB_ENTRIES.uint8:" in guarded_commit
 
 
 def test_wifi_sta_registration_initializes_only_its_own_sequence_caches():
@@ -14727,7 +14793,8 @@ def test_wifi_rxu_eapol_routes_only_sta_and_ap_vif_types():
         "if vifType == 2:",
         "apm_handle_eapol_input(staIdx, eapolData, eapolLength)",
         "if vifType notin [0'u8, 2'u8]:",
-        "sm_handle_eapol_input(staIdx, unsafeAddr sourceAddr[0], eapolData, eapolLength)",
+        "sm_handle_eapol_input(staIdx, unsafeAddr sourceAddr[0], eapolData,",
+        "eapolLength.uint16)",
     ]:
         assert expected in eapol_block
     assert "else:\n            # STA mode: route EAPOL to SM handler" not in eapol_block
@@ -14833,8 +14900,8 @@ def test_wifi_rxu_assoc_mgmt_pn_uses_vendor_management_tid():
 
     assert "const RxuMgmtPnTid = 8'u8" in fw
     assert "rxu_cntrl_check_pn(env.secKeyPtr, env.tid) == 0:" in data_block
-    assert "env.secKeyPtr,\n               RxuMgmtPnTid) == 0:" in assoc_mgmt_block
-    assert "env.secKeyPtr,\n               env.tid) == 0:" not in assoc_mgmt_block
+    assert "rxu_cntrl_check_pn(env.secKeyPtr, RxuMgmtPnTid) == 0:" in assoc_mgmt_block
+    assert "rxu_cntrl_check_pn(env.secKeyPtr, env.tid) == 0:" not in assoc_mgmt_block
 
 
 def test_wifi_igtk_install_uses_typed_machw_key_request():
@@ -15005,34 +15072,34 @@ def test_wifi_cfg_api_element_set_uses_typed_entry_overlay():
         "name*: pointer",
         "valueStorage*: pointer",
         "setHandler*: pointer",
-        "setHandlerTailPadding*: array[8, uint8]",
+        "getHandler*: pointer",
+        "notifyHandler*: pointer",
         "doAssert sizeof(CfgApiElementEntryView) == 28",
         "doAssert offsetof(CfgApiElementEntryView, typeId) == 6",
         "doAssert offsetof(CfgApiElementEntryView, name) == 8",
         "doAssert offsetof(CfgApiElementEntryView, valueStorage) == 12",
         "doAssert offsetof(CfgApiElementEntryView, setHandler) == 16",
-        "doAssert offsetof(CfgApiElementEntryView, setHandlerTailPadding) == 20",
+        "doAssert offsetof(CfgApiElementEntryView, getHandler) == 20",
+        "doAssert offsetof(CfgApiElementEntryView, notifyHandler) == 24",
         "template cfgApiElementEntryAt(entry: pointer): ptr CfgApiElementEntryView",
     ]:
         assert expected in wifi_fw
 
     for expected in [
         "let cfg = cfgApiElementEntryAt(entry)",
-        "let nameStr = cfg.name",
+        "let nameStr = cast[cstring](cfg.name)",
         "let typeId = cfg.typeId",
         "let valueStorage = cfg.valueStorage",
     ]:
         assert expected in general_body
 
     for expected in [
-        "var cfgApiEntry {.noinit.}: CfgApiElementEntryView",
-        "discard c_memset(addr cfgApiEntry, 0, sizeof(CfgApiElementEntryView).csize_t)",
-        "cfgApiEntry.id = id",
-        "cfgApiEntry.subId = subId",
-        "cfgApiEntry.typeId = typeId",
-        "cfgApiEntry.valueStorage = cast[pointer](addr cfgElements[id])",
-        "cfgApiEntry.setHandler = cast[pointer](setFn)",
-        "setFn(cast[pointer](addr cfgApiEntry), value)",
+        "id, subId, typeId: uint32",
+        "for entry in cfgApiEntries.mitems:",
+        "entry.id != id or entry.subId.uint32 != subId",
+        "entry.typeId.uint32 != typeId",
+        "let setFn = cast[SetFn](entry.setHandler)",
+        "discard setFn(addr entry, value, extra)",
     ]:
         assert expected in set_body
 
@@ -15058,9 +15125,10 @@ def test_wifi_cfg_api_element_set_uses_typed_entry_overlay():
         assert forbidden not in timer_dump_body
 
     for expected in [
-        "for cfgElementIndex in 0'u32 ..< cfgCount:",
-        "let entryAddr = cfgBase + cfgElementIndex * 28",
-        'printf("entry %d:", cast[pointer](cfgElementIndex))',
+        "for entry in cfgApiEntries.mitems:",
+        'print("entry %p\\r\\n", addr entry)',
+        'print("    task    : %lu\\r\\n", entry.id.culong)',
+        "entry.valueStorage",
     ]:
         assert expected in dump_body
 
@@ -15072,6 +15140,7 @@ def test_wifi_cfg_api_element_set_uses_typed_entry_overlay():
         "data*: pointer",
         "let dataPtr = cfg.data",
         "cfgApiEntry.data = cast[pointer](addr cfgElements[id])",
+        "cfgElements",
         "var entry = keTimerQueue.first",
         "while entry != nil:",
         "let entryU = cast[uint](entry)",
@@ -15425,8 +15494,8 @@ def test_wifi_rate_control_counters_use_typed_overlays():
     calc_body = wifi_fw.rsplit("proc rc_calc_tp*", 1)[1].split(
         "proc rc_update_counters*", 1
     )[0]
-    update_body = wifi_fw.rsplit("proc rc_update_counters*", 1)[1].split(
-        "proc rc_get_duration*", 1
+    update_body = wifi_fw.rsplit("proc rcAccountCounters(", 1)[1].split(
+        "proc rc_update_counters*", 1
     )[0]
     stats_body = wifi_fw.rsplit("proc rc_update_stats*", 1)[1].split(
         "proc rc_set_previous_mcs_index*", 1
@@ -15578,11 +15647,10 @@ def test_wifi_rate_control_counters_use_typed_overlays():
         "let counters = rcStatsCounters(stats)",
         "counters.totalSuccess = counters.totalSuccess + 1",
         "counters.totalAttempts = counters.totalAttempts + 1",
-        "while retrySlotIndex < counters.retrySlots.len:",
-        "let retryRateIndex = counters.retrySlots[retrySlotIndex].rateIdx",
+        "counters.retrySlots[retrySlotIndex].rateIdx",
         "let retryRateEntry = rcRateEntry(stats, retryRateIndex)",
-        "retryRateEntry.attempts = entryAttempts",
-        "retryRateEntry.successes = entrySuccesses",
+        "retryRateEntry.attempts +=",
+        "retryRateEntry.successes +=",
         "if retryRateEntry.attempts < retryRateEntry.successes:",
         "let stage = counters.updateStage",
         "let retryLimit = counters.retryLimit",
@@ -15898,7 +15966,7 @@ def test_wifi_vif_management_uses_typed_timer_and_bssid_overlays():
         "proc vif_mgmt_add_key*", 1
     )[0]
     ap_bcn_int_body = wifi_fw.rsplit("proc vif_mgmt_set_ap_bcn_int*", 1)[1].split(
-        "proc vif_mgmt_switch_channel*", 1
+        "proc vif_mgmt_sta_status*", 1
     )[0]
 
     for expected in [
@@ -15910,12 +15978,13 @@ def test_wifi_vif_management_uses_typed_timer_and_bssid_overlays():
         assert expected in init_body
 
     for expected in [
-        "let freeVifListNode = co_list_pop_front(addr env.freeList)",
-        "if freeVifListNode == nil:",
+        "freeVifListNode = co_list_pop_front(addr env.freeList)",
+        "if freeVifListNode != listHead:",
         "let vifEntry = cast[pointer](freeVifListNode)",
         "vif.tbttNode.vifIdx = vifIdx",
-        "var vifIdx = 0'u8",
-        "while vifIdx < MAX_VIFS.uint8 and vifChannelForIdx(vifIdx) != vif:",
+        "var freeIdx = 0'u8",
+        "vifChannelForIdx(freeIdx)) != listHead:",
+        "let vifIdx = freeIdx",
         "vif.tbttTimer.env = pointerAddrU32(vifEntry)",
         "vif.tbttTimer.callback = staTbttCb",
         "vif.keepAliveTimer.callback = bcnTimeoutCb",
@@ -16369,7 +16438,7 @@ def test_wifi_ps_polling_frame_forwards_vif_arg_and_status():
         "proc ps_polling_frame*(vifEntry: pointer): uint8 {.exportc, cdecl, discardable,\n"
         "    noinline.} =",
         1,
-    )[1].split("proc ps_traffic_null_1_recovery*", 1)[0]
+    )[1].split("proc ps_check_tx_status_part0_nim*", 1)[0]
     mm_body = wifi_fw.split(
         "proc mm_set_ps_mode_req_handler*(param: pointer): cint {.exportc, cdecl.} =",
         1,
@@ -16679,10 +16748,10 @@ def test_wifi_null_frame_and_postponed_service_use_typed_overlays():
         "proc txl_frame_send_null_frame*(staIdx: uint8, cfmCallback: pointer, cfmArg: uint32): uint8 {.exportc, cdecl, discardable.} =",
         1,
     )[1].split(
-        "const WifiTxFrameSuccessfulBit", 1
+        "proc wifi_nimfw_coex_force_ble_role*", 1
     )[0]
-    qosnull_body = wifi_fw.rsplit(
-        "proc txl_frame_send_qosnull_frame*(staIdx: uint8, qosCtrl: uint16,",
+    qosnull_body = wifi_fw.split(
+        "proc txlSendQosNull(staIdx: uint8; qosCtrl: uint16;",
         1,
     )[1].split(
         "proc txl_frame_send_selfcts_frame*", 1
@@ -16693,7 +16762,7 @@ def test_wifi_null_frame_and_postponed_service_use_typed_overlays():
         "    discardable.} =",
         1,
     )[1].split(
-        "const WifiTxFrameSuccessfulBit", 1
+        "proc txlFrameDumpNodes", 1
     )[0]
     service_body = wifi_fw.split(
         "proc wifi_nimfw_service_sta_postponed*(limit: uint32): uint32 {.exportc, cdecl.} =",
@@ -16732,8 +16801,11 @@ def test_wifi_null_frame_and_postponed_service_use_typed_overlays():
     ]:
         assert expected in wifi_fw
 
-    for body in [null_body, qosnull_body]:
-        after_handoff = body.split("let pushRc = txl_frame_push(frame, 3)", 1)[1]
+    for body, handoff in [
+        (null_body, "let pushRc = txl_frame_push(frame, 3)"),
+        (qosnull_body, "let pushRc = txlFramePushPrepared(frame, ac, triggerMask)")
+    ]:
+        after_handoff = body.split(handoff, 1)[1]
         assert "desc." not in after_handoff
         assert "hostTxDataHeader" not in after_handoff
         assert "hostTxQosDataHeader" not in after_handoff
@@ -19492,12 +19564,14 @@ def test_wifi_phy_freq_to_channel_uses_semantic_band_distance_names():
     assert "let freqOffsetFromChannelOneMhz = freq.int - 2412" in body
     assert (
         "if freqOffsetFromChannelOneMhz < 0 or "
-        "freqOffsetFromChannelOneMhz > 72: return 0"
+        "freqOffsetFromChannelOneMhz > 60 or\n"
+        "        freqOffsetFromChannelOneMhz mod 5 != 0: return 0"
     ) in body
-    assert "let freqOffsetFromFiveGhzBaseMhz = freq.int - 5000" in body
+    assert "let freqOffsetFromFiveGhzBaseMhz = freq.int - 5005" in body
     assert (
         "if freqOffsetFromFiveGhzBaseMhz < 0 or "
-        "freqOffsetFromFiveGhzBaseMhz > 820: return 0"
+        "freqOffsetFromFiveGhzBaseMhz > 820 or\n"
+        "        freqOffsetFromFiveGhzBaseMhz mod 5 != 0: return 0"
     ) in body
     assert "let offset = freq.int - 2412" not in body
     assert "let offset = freq.int - 5000" not in body
@@ -19643,10 +19717,11 @@ def test_wifi_ap_probe_req_handler_uses_typed_ie_and_channel_overlays():
         "doAssert offsetof(VifApProbeSsidOverlay, ssidData) == 387",
         "template vifApProbeSsid(vif: ptr VifChannelView): ptr VifApProbeSsidOverlay",
         "ApmProbeReqView {.packed.} = object",
-        "bodyLenVifPadding*: array[6, uint8]",
-        "vifIdxStaMacPadding*: array[33, uint8]",
-        "doAssert offsetof(ApmProbeReqView, bodyLenVifPadding) == 2",
-        "doAssert offsetof(ApmProbeReqView, vifIdxStaMacPadding) == 9",
+        "frameLenVifPadding*: array[6, uint8]",
+        "vifIdxFramePadding*: array[23, uint8]",
+        "doAssert offsetof(ApmProbeReqView, frameLenVifPadding) == 2",
+        "doAssert offsetof(ApmProbeReqView, vifIdxFramePadding) == 9",
+        "doAssert offsetof(ApmProbeReqView, frame) == 32",
     ]:
         assert expected in wifi_fw
 
@@ -19662,17 +19737,15 @@ def test_wifi_ap_probe_req_handler_uses_typed_ie_and_channel_overlays():
         "vifChannelAt(apVif)",
         "vifChannelForIdx(vifIdx)",
         "let apSsid = vifApProbeSsid(vif)",
-        "let ssid = cast[ptr MacIeView](ssidIe)",
-        "let ieLen = ssid.len",
-        "let apSsidLen = apSsid.ssidLen",
-        "cast[pointer](addr ssid.macIePayload[0])",
-        "cast[pointer](addr apSsid.ssidData[0])",
-        "if apSsid.hiddenSsidMode != 0:",
-        "let rates = cast[ptr MacIeView](ratesIe)",
-        "let rateVal = rates.macIePayload[0]",
-        "let rateInfo = vif.operChan",
-        "let chan = cast[ptr ScanChannelEntry](rateInfo)",
-        "let band = chan.band",
+        "let ie = cast[ptr MacIeView](addr req.ies[offset])",
+        "ie.len == apSsid.ssidLen",
+        "c_memcmp(addr ie.macIePayload[0], addr apSsid.ssidData[0]",
+        "apmEnvView().flags == 0",
+        "if ds != nil and ds.len != IE_LEN_DS_PARAM:",
+        "let requested = if ds != nil: ds.macIePayload[0] else: 0'u8",
+        "let chan = cast[ptr ScanChannelEntry](vif.operChan)",
+        "let channel = phy_freq_to_channel(chan.band, freq)",
+        "if channel == 0:",
         "apm_send_mlme(cast[pointer](vif), 0x50'u16,",
     ]:
         assert expected in body
@@ -20381,10 +20454,8 @@ def test_wifi_scan_ssid_selection_has_typed_cache_fallback():
     assert "nimFwDbgProbeIeRaw[i] = if i.uint32 < ieLen: ieBytes[i] else: 0" in probe_body
     assert "for k in 0 ..< nimFwDbgProbeIeRaw.len:" not in probe_body
     assert "nimFwDbgProbeIeRaw[k] = 0" not in probe_body
-    assert "proc scan_get_chan*(channelIndex: uint32): pointer" in wifi_fw
-    assert "scanReq.channelList[channelIndex.int]" in wifi_fw
-    assert "proc scan_get_chan*(idx: uint32): pointer" not in wifi_fw
-    assert "scanReq.channelList[idx.int]" not in wifi_fw
+    assert "proc scan_get_chan*(): pointer" in wifi_fw
+    assert "scanReq.channelList[scan_env.channelIndex.int]" in wifi_fw
     assert "not scanuFrameMatchesBssid(rx)" in frame_body
     assert "for filterBssidByteIndex in 0 ..< 6:" in bssid_filter_body
     assert (
@@ -20393,9 +20464,11 @@ def test_wifi_scan_ssid_selection_has_typed_cache_fallback():
     )
     assert "var ssidFilterIndex = 0" in frame_body
     assert "while ssidFilterIndex < numSsids.int:" in frame_body
-    assert "let filterSlot = scanSsidSlot(scanReq, ssidFilterIndex)" in frame_body
-    assert "scanuPublishFrameResult(frame, scanResultEntry, scanParam, scanEpoch," in frame_body
-    assert "let cachedRxuMgtIndLen = totalLen.uint32 + 32" in publish_body
+    assert "numSsids > 1" in frame_body
+    assert "let filterSlot = addr filterSsid" in frame_body
+    assert "scanuPublishFrameResult(frame, totalLen, len," in frame_body
+    assert "let cachedRxuMgtIndLen = validatedFrameLen.uint32 + 32" in publish_body
+    assert "rxuMgtIndAt(msg).frameLen = validatedFrameLen" in publish_body
     assert "scanu_env.pendingJoinRxuMgtInd = msg" in publish_body
     assert publish_body.index("scanResultEntry.cachedRxuMgtInd = nil") < \
         publish_body.index("ke_msg_free_payload(retired)")
@@ -20418,8 +20491,11 @@ def test_wifi_scan_ssid_selection_has_typed_cache_fallback():
     assert scan_done_body.index("scanu_env.paramPtr = nil") < scan_done_body.index("ke_msg_free_payload(frame)")
     assert "let retainedMatch = scanuCachedSsidMatches(ssidSearchResultEntry," in search_body
     assert "if not retainedMatch:" in search_body
-    assert "let matches = cmpResult == 0 or retainedMatch" in search_body
-    assert "for ssidSearchResultSlotIndex in 0'u8 ..< SCANU_MAX_RESULT_ENTRIES.uint8:" in search_body
+    assert "if entrySsidLen == 0: retainedMatch" in search_body
+    assert "else: entrySsidLen <= 32 and entrySsidLen == searchLen and" in search_body
+    assert "cmpResult == 0" in search_body
+    assert "for scanIteration in 0'u8 ..< (SCANU_MAX_RESULT_ENTRIES * passCount).uint8:" in search_body
+    assert "let ssidSearchResultSlotIndex =" in search_body
     assert "let ssidSearchResultEntry =" in search_body
     assert "addr scanu_env.entries[ssidSearchResultSlotIndex]" in search_body
     assert "var bestScanResultEntry: ptr ScanuResultEntry = nil" in search_body
@@ -20494,7 +20570,7 @@ def test_wifi_scan_ssid_selection_has_typed_cache_fallback():
         assert forbidden not in scanu_layout_block
 
 
-def test_wifi_transition_mode_prefers_psk_over_sae():
+def test_wifi_transition_mode_prefers_sae_when_pmf_is_available():
     frame_body = nim_procedure(
         (ROOT / "src/bl808/wifi/fw/scan_station_ap_me.nim").read_text(), "scanu_frame_handler"
     )
@@ -20502,9 +20578,10 @@ def test_wifi_transition_mode_prefers_psk_over_sae():
         (ROOT / "src/bl808/wifi/fw/rsn_parse.nim").read_text(), "wifiPreferredKeyMgmtFromMask"
     )
     assert "selectedAuth = wifiPreferredKeyMgmtFromMask(" in frame_body
-    assert selection_body.index("return WifiKeyMgmtPsk") < selection_body.index(
+    assert "if pmfCapable or pmfRequired:" in selection_body
+    assert selection_body.index("return WifiKeyMgmtSae") < selection_body.index(
         "return WifiKeyMgmtPskSha256"
-    ) < selection_body.index("return WifiKeyMgmtSae")
+    ) < selection_body.index("return WifiKeyMgmtPsk\n")
 
 
 def test_wifi_scan_start_payload_alignment_fields_are_semantic():
@@ -20657,7 +20734,7 @@ def test_wifi_pspoll_tx_uses_typed_frame_overlays():
         "hwDesc.controlFlags = hwDesc.controlFlags or 0x10000053'u32",
         "desc.vifIdx = sta.instNbr",
         "desc.staInfoIdx = sta.infoIdx",
-        "let pushRc = txl_frame_push(txdesc, 3)",
+        "let pushRc = txl_frame_push(txdesc, API_AC_BE)",
         "return (pushRc xor 1'u8) and 0xFF'u8",
     ]:
         assert expected in body
@@ -21366,7 +21443,7 @@ def test_wifi_rxu_management_dispatch_overlay_has_semantic_padding():
         "let msg = rxuMgtDispatchView(param)",
         "let frameType = msg.frameCtrl and 0xFC'u16",
         "if msg.category == 8'u8:",
-        "msg.category != 3 or msg.actionCode != 0:",
+        "msg.category != 3 or msg.actionCode != 0 or msg.dialogToken == 0:",
         "let baParam = msg.baParam",
         "let dialogToken = msg.dialogToken",
         "let staIdx = msg.staIdx",
@@ -21375,9 +21452,9 @@ def test_wifi_rxu_management_dispatch_overlay_has_semantic_padding():
 
     assert "let frameType = msg.frameCtrl and 0xFC'u16" in sm_body
     assert "if msg.category == 8'u8:" in sm_body
-    assert "msg.category != 3 or msg.actionCode != 0:" in bam_body
+    assert "msg.category != 3 or msg.actionCode != 0 or msg.dialogToken == 0:" in bam_body
     assert "bodyLength > payloadLength - bodyOffset" in bam_body
-    assert "let acceptedWindow = min(bufferSize, 12'u16)" in bam_body
+    assert "let acceptedWindow = if bufferSize == 0: 12'u16 else: min(bufferSize, 12'u16)" in bam_body
     assert "(baParam and 0x003E'u16) or 2'u16" in bam_body
 
     for forbidden in [

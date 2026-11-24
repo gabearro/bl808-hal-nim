@@ -2118,6 +2118,37 @@ def test_nim_wifi_validation_uses_pure_bl808_rf_path():
         assert defines.get("bl808WifiUseBl808Rf") == "1", name
 
 
+def test_primary_standalone_wifi_uses_bl808_demo_rf_not_the_coex_profile():
+    tests = _tests_by_name()
+    key = "bl808WifiNativeWlanCalibration"
+    for name in (
+        "m0_wifi_nimfw_boot_test",
+        "m0_wifi_nimfw_scan_hal_test",
+        "m0_wifi_nimfw_hal_test",
+        "m0_wifi_nimfw_keepalive_hal_test",
+        "m0_wifi_nimfw_qosnull_keepalive_hal_test",
+        "m0_wifi_http_server",
+    ):
+        assert _all_defines(tests[name]).get(key) == "1", name
+    for name in (
+        "m0_wifi_nimfw_cold_scan_hal_test",
+        "m0_ble_wifi_nim_hal_test",
+        "m0_ble_wifi_nim_coex_hal_test",
+        "m0_ble_wifi_nim_scan_hal_test",
+    ):
+        assert key not in _all_defines(tests[name]), name
+
+
+def test_nim_wifi_keepalive_uses_station_only_with_completion_diagnostics():
+    tests = _tests_by_name()
+    for name in (
+        "m0_wifi_nimfw_keepalive_hal_test",
+        "m0_wifi_nimfw_qosnull_keepalive_hal_test",
+    ):
+        assert _all_defines(tests[name]).get("bl808WifiKeepaliveStaOnly") == "1"
+        assert "mdw {sym:nimfw_dbg_nullframe_no_hw_result} 1" in tests[name]["jtag_snapshot"]
+
+
 def test_nim_wifi_connect_snapshot_captures_rf70_rf88_rfd0_trace_state():
     snapshot = _tests_by_name()["m0_wifi_nimfw_hal_test"].get("jtag_snapshot", [])
     for command in (
@@ -2370,7 +2401,8 @@ def test_mixed_ble_wifi_jtag_flash_keeps_runtime_jtag():
 
 
 def test_wifi_lwip_smoke_requires_dhcp_local_icmp_and_public_icmp_diagnostics():
-    test = _tests_by_name()["m0_wifi_lwip_smoke"]
+    tests = _tests_by_name()
+    test = tests["m0_wifi_lwip_smoke"]
     defines = _all_defines(test)
     required = test.get("required", [])
     snapshot = test.get("jtag_snapshot", [])
@@ -2378,6 +2410,10 @@ def test_wifi_lwip_smoke_requires_dhcp_local_icmp_and_public_icmp_diagnostics():
     assert defines.get("bl808WifiNimFw") == "1"
     assert defines.get("bl808WifiRealLwip") == "1"
     assert defines.get("bl808WifiRxPbufInput") == "1"
+    snapshot_define = "bl808WifiDiagDhcpTxFinalSnapshot"
+    assert defines.get(snapshot_define) == "1"
+    assert {name for name, candidate in tests.items()
+            if snapshot_define in _all_defines(candidate)} == {"m0_wifi_lwip_smoke"}
     assert defines.get("WifiIcmpTargetA", {}).get("default") == 1
     assert defines.get("WifiIcmpTargetB", {}).get("default") == 1
     assert defines.get("WifiIcmpTargetC", {}).get("default") == 1
@@ -2423,6 +2459,8 @@ def test_wifi_http_server_example_uses_pure_nim_wifi_and_real_lwip():
     assert defines.get("bl808WifiRealLwip") == "1"
     assert defines.get("bl808WifiRealLwipTcp") == "1"
     assert defines.get("bl808WifiRxPbufInput") == "1"
+    assert defines.get("HwValidationLogExternalBuffer") == "1"
+    assert defines.get("HwValidationLogSection") == ".psrambss.jtaglog"
     assert defines.get("WifiSsid", {}).get("env") == "BL808_WIFI_SSID"
     assert defines.get("WifiPassword", {}).get("secret_env") == "BL808_WIFI_PASSWORD"
     assert "WifiChannel" not in defines
@@ -2470,10 +2508,10 @@ def test_wifi_http_server_example_uses_pure_nim_wifi_and_real_lwip():
         "lwipInit()",
         'proc nimHttpRecv(arg, pcb, p: pointer; err: ErrT): ErrT',
         'exportc: "nim_http_recv"',
-        "tcpBind(pcb, addr any, port)",
+        "tcpBind(pcb, addr local, port)",
         "tcpAcceptShim(cast[pointer](listenPcb))",
         "wifiConnect(WifiSsid, WifiPassword, 0'u8)",
-        "scanDiagHasFreshResult()",
+        "scanDiagHasFreshResult(scanItemsBefore, WifiSsid)",
         'HttpGreeting = "Hello World! from Nim on BL808"',
         "DhcpTimeoutMs = 30_000'u32",
         "proc bl_wifi_mac_addr_get(mac: ptr uint8): cint",
@@ -2865,16 +2903,8 @@ def test_allcore_wasm_http_manager_keeps_enclave_and_validated_wifi_memory():
     assert defines.get("bl808enclave") == "true"
     assert defines.get("bl808EnclaveWram") == "true"
     assert defines.get("WifiSsid") == "Frog"
-    assert defines.get("WifiPassword") == "6509171272"
-    assert defines.get("StaticIpA") == "192"
-    assert defines.get("StaticIpB") == "168"
-    assert defines.get("StaticIpC") == "1"
-    assert defines.get("StaticIpD") == "223"
-    assert defines.get("StaticGatewayA") == "192"
-    assert defines.get("StaticGatewayB") == "168"
-    assert defines.get("StaticGatewayC") == "1"
-    assert defines.get("StaticGatewayD") == "254"
-    assert defines.get("StaticIpAfterDhcpAttempts") == "1"
+    assert defines.get("WifiPassword", {}).get("secret_env") == "BL808_WIFI_PASSWORD"
+    assert not any(name.startswith(("StaticIp", "StaticGateway")) for name in defines)
     assert "WifiChannel" not in defines
 
     m0 = (REPO_ROOT / "examples/m0_allcore_wasm_cps_live_test.nim").read_text()
@@ -2892,13 +2922,18 @@ def test_allcore_wasm_http_manager_keeps_enclave_and_validated_wifi_memory():
         "wifiConnectAsync(",
         "bl808WpaCurrentState()",
         "WpaCompletedState = 10'u32",
+        "await startAllcoreBootDhcp(netif)",
+        "allcoreConfirmedLeaseIp(netif) == lease",
         "Ready for all-core WASM HTTP manager requests",
     ]:
         assert expected in m0
     assert "WifiChannel {.intdefine.} = 0" in m0
     assert "WifiChannel.uint8" in m0
     for expected in [
-        "HEAP_RAM (rw)  : ORIGIN = 0x50000000",
+        "HEAP_RAM (rw)  : ORIGIN = 0x50120000, LENGTH = 64K",
+        "PSRAM_BSS (rw) : ORIGIN = 0x50100000, LENGTH = 64K",
+        "ORIGIN(WASM_STAGE) + LENGTH(WASM_STAGE) <= ORIGIN(PSRAM_BSS)",
+        "ORIGIN(PSRAM_BSS) + LENGTH(PSRAM_BSS) <= ORIGIN(HEAP_RAM)",
         "WIFI_RAM (rw)  : ORIGIN = 0x22030000",
         ".wifirxram",
         "__wifi_rx_ram_start",

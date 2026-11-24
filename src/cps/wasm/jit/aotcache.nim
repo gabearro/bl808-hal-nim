@@ -8,8 +8,9 @@
 ## Format (little-endian, no padding):
 ##   Header:
 ##     magic    : u32  = 0x57414A43  ("WAJC")
-##     version  : u32  = 4
+##     version  : u32  = 5
 ##     hash     : u64  (FNV-1a 64 of module bytes)
+##     target   : u32  (native ISA, pointer ABI, and OS identity)
 ##     numFuncs : u32
 ##   Per-function record (repeated numFuncs times):
 ##     funcIdx  : u32
@@ -17,6 +18,7 @@
 ##     numLocals: u32
 ##     codeSize : u32
 ##     numRelocs: u32
+##     checksum : u32  (CRC-32 of code and relocation records)
 ##     code     : codeSize bytes
 ##     relocs   : numRelocs × Relocation
 ##   Relocation:
@@ -30,25 +32,35 @@
 
 import std/[os, streams, strutils]
 import memory
+import relocation
+export relocation
 
 const
   CacheMagic*   = 0x57414A43'u32   # "WAJC"
-  CacheVersion* = 4'u32
+  CacheVersion* = 5'u32
+  MaxCacheFuncs* = 4096
+  MaxCacheCodeBytes* = 4 * 1024 * 1024
+  MaxCacheFuncBytes* = 1024 * 1024
+  MaxCacheRelocs* = 65536
+  MaxCacheSites* = 65536'u32
+  MaxCacheFileBytes* = 8 * 1024 * 1024
+  CacheTarget* =
+    (when defined(amd64): 1'u32
+     elif defined(arm64) or defined(aarch64): 2'u32
+     elif defined(riscv64): 3'u32
+     elif defined(riscv32): 4'u32
+     else: 0'u32) or
+    (when sizeof(pointer) == 8: 0x100'u32 else: 0x200'u32) or
+    (when defined(macosx): 0x10000'u32
+     elif defined(linux): 0x20000'u32
+     elif defined(windows): 0x30000'u32
+     else: 0x40000'u32)
 
 # ---------------------------------------------------------------------------
 # Relocation records
 # ---------------------------------------------------------------------------
 
 type
-  RelocKind* = enum
-    relocDispatch   = 0  ## absolute address of tier2CallIndirectDispatch
-    relocCallCache  = 1  ## freshly-allocated ptr CallIndirectCache
-
-  Relocation* = object
-    offset*:  uint32   ## byte offset within the function code blob
-    kind*:    RelocKind
-    siteIdx*: uint32   ## for relocCallCache: which call_indirect site
-
   CachedFunc* = object
     funcIdx*:   uint32
     tier*:      uint8
@@ -59,6 +71,57 @@ type
   AotCache* = object
     moduleHash*: uint64
     funcs*:      seq[CachedFunc]
+
+proc crc32Byte(crc: uint32, b: byte): uint32 {.inline.} =
+  result = crc xor b.uint32
+  for _ in 0 ..< 8:
+    result = (result shr 1) xor
+      (if (result and 1) != 0: 0xedb88320'u32 else: 0'u32)
+
+proc cacheChecksum(f: CachedFunc): uint32 =
+  result = not 0'u32
+  for b in f.code:
+    result = crc32Byte(result, b)
+  for r in f.relocs:
+    for shift in [0, 8, 16, 24]:
+      result = crc32Byte(result, byte(r.offset shr shift))
+    result = crc32Byte(result, r.kind.uint8)
+    for shift in [0, 8, 16, 24]:
+      result = crc32Byte(result, byte(r.siteIdx shr shift))
+  result = not result
+
+proc validCachedFunc(f: CachedFunc): bool =
+  when not (defined(amd64) or defined(arm64) or defined(aarch64)):
+    # The current relocations encode x86 movabs or AArch64 MOVZ/MOVK.
+    # RISC-V needs a different relocation/link contract.
+    return false
+  if f.tier != 2 or f.numLocals > 65536'u32 or
+      f.code.len == 0 or f.code.len > MaxCacheFuncBytes or
+      f.relocs.len > MaxCacheRelocs:
+    return false
+  for r in f.relocs:
+    if r.kind == relocDispatch and r.siteIdx != 0: return false
+    if r.kind == relocCallCache and r.siteIdx >= MaxCacheSites: return false
+    when defined(arm64) or defined(aarch64):
+      if (r.offset and 3) != 0 or
+          r.offset.uint64 + 16'u64 > f.code.len.uint64: return false
+    else:
+      if r.offset.uint64 + 8'u64 > f.code.len.uint64: return false
+  true
+
+proc validCache(cache: AotCache): bool =
+  if cache.funcs.len > MaxCacheFuncs: return false
+  var total = 0
+  var fileBytes = 24'u64
+  for i, f in cache.funcs:
+    if not validCachedFunc(f) or f.code.len > MaxCacheCodeBytes - total:
+      return false
+    total += f.code.len
+    fileBytes += 21'u64 + f.code.len.uint64 + f.relocs.len.uint64 * 9'u64
+    if fileBytes > MaxCacheFileBytes.uint64: return false
+    for j in 0 ..< i:
+      if cache.funcs[j].funcIdx == f.funcIdx: return false
+  true
 
 # ---------------------------------------------------------------------------
 # Module hashing: FNV-1a 64-bit
@@ -76,6 +139,8 @@ proc fnv1a64*(data: openArray[byte]): uint64 =
 
 proc writeCacheFile*(path: string, cache: AotCache) =
   ## Write cache to *path* atomically (write to tmp, then rename).
+  if not validCache(cache):
+    raise newException(IOError, "Invalid JIT cache record")
   let tmp = path & ".tmp"
   let s = newFileStream(tmp, fmWrite)
   if s == nil:
@@ -84,6 +149,7 @@ proc writeCacheFile*(path: string, cache: AotCache) =
     s.write(CacheMagic)
     s.write(CacheVersion)
     s.write(cache.moduleHash)
+    s.write(CacheTarget)
     s.write(cache.funcs.len.uint32)
     for f in cache.funcs:
       s.write(f.funcIdx)
@@ -91,6 +157,7 @@ proc writeCacheFile*(path: string, cache: AotCache) =
       s.write(f.numLocals)
       s.write(f.code.len.uint32)
       s.write(f.relocs.len.uint32)
+      s.write(cacheChecksum(f))
       if f.code.len > 0:
         s.writeData(unsafeAddr f.code[0], f.code.len)
       for r in f.relocs:
@@ -108,6 +175,10 @@ proc writeCacheFile*(path: string, cache: AotCache) =
 proc readCacheFile*(path: string, expectedHash: uint64): AotCache =
   ## Read and verify cache.  Raises IOError on missing file, wrong format,
   ## or hash mismatch (caller should catch and treat as cache-miss).
+  when not (defined(amd64) or defined(arm64) or defined(aarch64)):
+    raise newException(IOError, "Native JIT cache unsupported on this ISA")
+  if getFileSize(path) > MaxCacheFileBytes:
+    raise newException(IOError, "JIT cache exceeds size limit")
   let s = newFileStream(path, fmRead)
   if s == nil:
     raise newException(IOError, "Cannot open cache file: " & path)
@@ -120,16 +191,27 @@ proc readCacheFile*(path: string, expectedHash: uint64): AotCache =
   let storedHash = s.readUInt64()
   if storedHash != expectedHash:
     raise newException(IOError, "Cache module hash mismatch — recompiling")
+  if s.readUInt32() != CacheTarget:
+    raise newException(IOError, "Cache native target mismatch")
 
   let n = s.readUInt32().int
+  if n < 0 or n > MaxCacheFuncs:
+    raise newException(IOError, "Cache function count limit")
   result.moduleHash = storedHash
   result.funcs.setLen(n)
+  var total = 0
   for i in 0 ..< n:
     let funcIdx  = s.readUInt32()
     let tier     = s.readUInt8()
     let nlocs    = s.readUInt32()
     let csz      = s.readUInt32().int
     let nrelocs  = s.readUInt32().int
+    let checksum = s.readUInt32()
+    if csz <= 0 or csz > MaxCacheFuncBytes or
+        csz > MaxCacheCodeBytes - total or nrelocs < 0 or
+        nrelocs > MaxCacheRelocs:
+      raise newException(IOError, "Cache record size limit")
+    total += csz
     var code: seq[byte]
     if csz > 0:
       code.setLen(csz)
@@ -140,11 +222,19 @@ proc readCacheFile*(path: string, expectedHash: uint64): AotCache =
     relocs.setLen(nrelocs)
     for j in 0 ..< nrelocs:
       let off  = s.readUInt32()
-      let kind = RelocKind(s.readUInt8())
+      let rawKind = s.readUInt8()
+      if rawKind > relocCallCache.uint8:
+        raise newException(IOError, "Invalid cache relocation kind")
+      let kind = RelocKind(rawKind)
       let si   = s.readUInt32()
       relocs[j] = Relocation(offset: off, kind: kind, siteIdx: si)
     result.funcs[i] = CachedFunc(funcIdx: funcIdx, tier: tier,
                                   numLocals: nlocs, code: code, relocs: relocs)
+    if not validCachedFunc(result.funcs[i]) or
+        cacheChecksum(result.funcs[i]) != checksum:
+      raise newException(IOError, "Invalid JIT cache record checksum")
+  if not validCache(result) or not s.atEnd():
+    raise newException(IOError, "Invalid JIT cache contents")
 
 # ---------------------------------------------------------------------------
 # Link: copy code into JIT pool, apply relocations
@@ -187,27 +277,34 @@ proc linkCachedFunc*(pool: var JitMemPool,
   ## Copy f.code into the pool, apply relocations, return JitCode.
   ## *dispatchAddr*  = address of tier2CallIndirectDispatch (cast[uint64])
   ## *siteMap*       = pre-allocated CallIndirectCache* per call_indirect site
-  if f.code.len == 0: return JitCode()
+  if not validCachedFunc(f):
+    raise newException(IOError, "Invalid JIT cache function")
+  for r in f.relocs:
+    if r.kind == relocCallCache and
+        (r.siteIdx.int >= siteMap.len or siteMap[r.siteIdx.int] == nil):
+      raise newException(IOError, "Unresolved JIT cache relocation")
 
+  let previousUsed = pool.used
   let jc = pool.alloc(f.code.len)
-  pool.enableWrite()
-  copyMem(jc.address, unsafeAddr f.code[0], f.code.len)
+  try:
+    pool.enableWrite()
+    copyMem(jc.address, unsafeAddr f.code[0], f.code.len)
 
   # Apply relocations: patch the embedded absolute address at each site
-  for r in f.relocs:
-    let patchAddr = cast[pointer](cast[int](jc.address) + r.offset.int)
-    case r.kind
-    of relocDispatch:
-      patchAbsoluteAddr(patchAddr, dispatchAddr)
-    of relocCallCache:
-      let si = r.siteIdx.int
-      if si < siteMap.len and siteMap[si] != nil:
-        patchAbsoluteAddr(patchAddr, cast[uint64](siteMap[si]))
-      # else leave the stored 0 — dispatch will see nil cache and trap
+    for r in f.relocs:
+      let patchAddr = cast[pointer](cast[int](jc.address) + r.offset.int)
+      case r.kind
+      of relocDispatch:
+        patchAbsoluteAddr(patchAddr, dispatchAddr)
+      of relocCallCache:
+        patchAbsoluteAddr(patchAddr, cast[uint64](siteMap[r.siteIdx.int]))
 
-  pool.enableExecute()
-  when not (defined(amd64) or defined(i386)):
-    invalidateICache(jc.address, f.code.len)
+    pool.enableExecute()
+    when not (defined(amd64) or defined(i386)):
+      invalidateICache(jc.address, f.code.len)
+  except:
+    pool.used = previousUsed
+    raise
 
   result = JitCode(address: jc.address, size: f.code.len,
                    numLocals: f.numLocals.int)

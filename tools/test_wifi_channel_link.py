@@ -9,6 +9,9 @@ from test_wifi_message_allocation import run_program
 
 
 PLATFORM = r'''
+const
+  MAX_VIFS = 2
+  MAX_CHAN_CTXT = 3
 var chanCtxtLinkEpochs: array[2, uint32]
 type
   CoListHdr = object
@@ -112,6 +115,13 @@ chan_ctxt_link(1, 0)
 doAssert activations.len == 1 and contexts[0].linkCount == 2
 doAssert contexts[0].channel.txPower == 8
 doAssert env.ctxtCount == 1 and env.slotPeriod == 102400
+
+for invalid in [(2'u8, 0'u8), (0'u8, 3'u8), (255'u8, 255'u8)]:
+  reset()
+  chan_ctxt_link(invalid[0], invalid[1])
+  doAssert vifs[0].chanCtxt == nil and vifs[1].chanCtxt == nil
+  doAssert env.ctxtCount == 0 and env.slotPeriod == 0
+  doAssert contexts[0].linkCount == 0 and activations.len == 0
 '''
 
 

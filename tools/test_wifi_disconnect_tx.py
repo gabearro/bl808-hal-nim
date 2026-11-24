@@ -14,6 +14,7 @@ FW = ROOT / "src/bl808/wifi/fw"
 PLATFORM = r"""
 proc txlFrameCallbackCurrent(): bool = true
 proc smTxCallbackCurrent(): bool = true
+proc smClaimFlushedDisconnect(p: pointer): bool = false
 const
   MAX_VIFS = 2
   STA_INFO_TAB_ENTRIES = 7

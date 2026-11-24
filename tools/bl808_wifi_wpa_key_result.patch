@@ -1,0 +1,33 @@
+diff --git a/components/security/wpa_supplicant/src/rsn_supp/wpa_i.h b/components/security/wpa_supplicant/src/rsn_supp/wpa_i.h
+--- a/components/security/wpa_supplicant/src/rsn_supp/wpa_i.h
++++ b/components/security/wpa_supplicant/src/rsn_supp/wpa_i.h
+@@ -184,5 +184,6 @@
+ void wpa_sendto_wrapper(bool is_sta, void *buffer, u16 len, struct bl_custom_tx_cfm *tx_cfm);
+ void wpa_config_assoc_ie(uint8_t vif_idx, u8 proto, u8 *assoc_buf, u32 assoc_wpa_ie_len);
+-void wpa_install_key(uint8_t vif_idx, uint8_t sta_idx, enum wpa_alg alg, int key_idx, int set_tx,
++#define BL808_WPA_KEY_RESULT_PRESENT 1
++int wpa_install_key(uint8_t vif_idx, uint8_t sta_idx, enum wpa_alg alg, int key_idx, int set_tx,
+                      u8 *seq, size_t seq_len, u8 *key, size_t key_len, bool pairwise);
+ int wpa_get_key(uint8_t *ifx, int *alg, u8 *addr, int *key_idx,
+diff --git a/components/security/wpa_supplicant/src/bl_supplicant/bl_wpa_main.c b/components/security/wpa_supplicant/src/bl_supplicant/bl_wpa_main.c
+--- a/components/security/wpa_supplicant/src/bl_supplicant/bl_wpa_main.c
++++ b/components/security/wpa_supplicant/src/bl_supplicant/bl_wpa_main.c
+@@ -36,6 +36,6 @@
+ 
+-void wpa_install_key(uint8_t vif_idx, uint8_t sta_idx, enum wpa_alg alg, int key_idx, int set_tx,
++int wpa_install_key(uint8_t vif_idx, uint8_t sta_idx, enum wpa_alg alg, int key_idx, int set_tx,
+                      u8 *seq, size_t seq_len, u8 *key, size_t key_len, bool pairwise)
+ {
+-    bl_wifi_set_sta_key_internal(vif_idx, sta_idx, alg, key_idx, set_tx, seq, seq_len, key, key_len, pairwise);
++    return bl_wifi_set_sta_key_internal(vif_idx, sta_idx, alg, key_idx, set_tx, seq, seq_len, key, key_len, pairwise);
+ }
+diff --git a/components/security/wpa_supplicant/src/rsn_supp/wpa.c b/components/security/wpa_supplicant/src/rsn_supp/wpa.c
+--- a/components/security/wpa_supplicant/src/rsn_supp/wpa.c
++++ b/components/security/wpa_supplicant/src/rsn_supp/wpa.c
+@@ -2413,5 +2413,4 @@
+ #endif
+ 
+-    wpa_install_key(sm->vif_idx, sm->sta_idx, alg, key_idx, set_tx, seq, seq_len, key, key_len, pairwise);
+-    return 0;
++    return wpa_install_key(sm->vif_idx, sm->sta_idx, alg, key_idx, set_tx, seq, seq_len, key, key_len, pairwise);
+ }

@@ -116,7 +116,12 @@ proc keMsgHdrFromPayload(p: pointer): ptr Header =
     if p == addr msg.body[0]: return addr msg.header
   doAssert false
 proc ke_msg_alloc(id, dst, src: uint16; length: uint32): pointer =
-  if allocationsFail: return nil
+  if allocationsFail:
+    if allocateHook != nil:
+      let callback = allocateHook
+      allocateHook = nil
+      callback()
+    return nil
   doAssert allocated < messages.len and length <= 128
   let i = allocated
   inc allocated
@@ -151,14 +156,17 @@ proc co_list_pop_front(queue: ptr CoList): ptr Header =
     if queue.first == nil: queue.last = nil
     result.next = nil
 proc ke_evt_clear(mask: uint32) = clearedEvents = mask
+proc mmConfigCancelIdle() = discard
 proc mm_bcn_flush_updates(notify: bool) = doAssert not notify
 proc mmPsModeCancel() = discard
 proc meControlReset() = discard
 proc smCleanupCancel() = discard
 proc smBssCancel() = discard
 proc chanSwitchCancel(target: pointer = nil) = discard
+proc scanDwellReset() = discard
 proc smActivationCancel() = discard
 proc smRspTimerReset() = discard
+template smSaQueryResetScope() = discard
 proc keTimerCancelMutations(id = 0'u16; task = 0'u8; all = false) = discard
 proc smDeferredCancel() = discard
 proc staInfoForIdx(i: uint8): ptr Station = addr stations[i]
@@ -483,6 +491,37 @@ me_sta_add_req_handler(queuedRequest)
 doAssert registrations == 0 and associated == 0 and apm.staCount == 1,
   "cancelled queued request registered a stale station"
 confirmTx(false)
+
+reset(true)
+basicIes(true)
+finish()
+apm_assoc_req_handler(addr input[0])
+confirmTx(true)
+let cancelledDuringAllocation = tx.argument
+allocateHook = proc() = apmCancelPendingForVif(0)
+me_sta_add_req_handler(cancelledDuringAllocation)
+doAssert registrations == 0 and apm.staCount == 0 and removed == 1
+doAssert apmPendingAssociations[0].confirmation == nil
+doAssert sent[^1] == ME_STA_ADD_CFM
+
+reset(true)
+basicIes(true)
+finish()
+apm_assoc_req_handler(addr input[0])
+confirmTx(true)
+let replacedDuringFailedAllocation = tx.argument
+allocationsFail = true
+allocateHook = proc() =
+  aidListDelete(addr input[42])
+  allocationsFail = false
+  context = cast[pointer](0x23456789)
+  apm_assoc_req_handler(addr input[0])
+me_sta_add_req_handler(replacedDuringFailedAllocation)
+doAssert registrations == 0 and apm.staCount == 1 and removed == 1
+doAssert slots[0].staHandle == context
+doAssert apmPendingAssociations[0].request == tx.argument
+confirmTx(false)
+
 reset(true)
 basicIes(true)
 finish()
@@ -778,9 +817,9 @@ proc appendIe(buf: pointer; id: uint8; data: openArray[uint8]): uint32 =
 proc me_add_ie_supp_rates(buf, rates: pointer): uint32 =
   doAssert rates == addr request.rateCount
   appendIe(buf, 1, request.rateBytes.toOpenArray(0, min(8, request.rateCount.int) - 1))
-proc me_add_ie_ext_supp_rates(buf, rates: pointer; count: uint32): uint32 =
-  doAssert rates == (addr request.rateCount) and count == request.rateCount.uint32
-  appendIe(buf, 50, request.rateBytes.toOpenArray(8, count.int - 1))
+proc me_add_ie_ext_supp_rates(buf, rates: pointer): uint32 =
+  doAssert rates == addr request.rateCount
+  appendIe(buf, 50, request.rateBytes.toOpenArray(8, request.rateCount.int - 1))
 proc me_add_ie_ht_capa(buf: pointer): uint32 = appendIe(buf, 45, [])
 proc me_add_ie_ht_oper(buf, vif: pointer): uint32 =
   doAssert vif == addr vifs[expectedVif]

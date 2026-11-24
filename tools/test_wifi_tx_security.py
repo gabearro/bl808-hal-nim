@@ -23,11 +23,14 @@ type
     tail: array[3, uint32]
   HostTxLinkDescView = object
     rateTemplate: HostTxRateTemplateView
+    macHeader: array[26, uint8]
+  HostTxHwDescView = object
+    frameLen, payloadStart, payloadEnd: uint32
   HostTxDescView = object
     frameLen: uint16
-    staInfoIdx, vifIdx, staIdx, hdrLen, secTailLen: uint8
+    staInfoIdx, vifIdx, staIdx, hdrLen, secTailLen, usedFlag: uint8
     pnScratch: array[6, uint8]
-    policy, bufDesc: pointer
+    policy, bufDesc, hwDesc, queueFirst: pointer
   StaInfoView = object
     keyMat, keyHolder: pointer
     keyType, cipherSuite, hwKeyIdx, keyInstalled: uint8
@@ -70,6 +73,7 @@ proc hostTxPnScratch(d: ptr HostTxDescView): ptr TxPnScratchView =
 proc hostTxRateTemplateAt(p: pointer): ptr HostTxRateTemplateView =
   cast[ptr HostTxRateTemplateView](p)
 proc hostTxLinkDescAt(p: pointer): ptr HostTxLinkDescView = cast[ptr HostTxLinkDescView](p)
+proc hostTxHwDescAt(p: pointer): ptr HostTxHwDescView = cast[ptr HostTxHwDescView](p)
 proc hostTxRateTemplate(p: ptr HostTxLinkDescView): ptr HostTxRateTemplateView =
   addr p.rateTemplate
 proc macFrameControlAt(p: pointer): ptr MacFrameControlView = cast[ptr MacFrameControlView](p)
@@ -122,6 +126,7 @@ proc check(cipher, keyId, hwKeyId: uint8; pn: uint64; update: uint32;
   else: discard
   var tail = 0xDEADBEEF'u32
   if skip == 0 and (cipher > 3 or
+      (cipher in [0'u8, 3'u8] and pn >= 0xFFFFFF'u64) or
       (cipher in [1'u8, 2'u8] and pn >= 0xFFFFFFFFFFFF'u64)):
     let beforeKey = key
     let beforeDesc = desc
@@ -188,7 +193,8 @@ for cipher in 0'u8 .. 5'u8:
         check(cipher, keyId, 0x37, 0x010203040506'u64, update, skip)
     if cipher < 4:
       for cached in [false, true]:
-        check(cipher, keyId, 0x37, 0x010203040506'u64, 0,
+        check(cipher, keyId, 0x37,
+              (if cipher in [0'u8, 3'u8]: 0x010203'u64 else: 0x010203040506'u64), 0,
               management = true, cached = cached)
 
 # Stress all TSC1 values, including the weak-IV avoidance mask's high bit.
@@ -196,7 +202,7 @@ for tsc1 in 0'u64 .. 255'u64:
   for keyId in 0'u8 .. 3'u8:
     check(1, keyId, 0x37, (tsc1 shl 8) or 0xA4'u64, 1)
 
-# WEP uses three IV bytes; the following byte contains only the key selector.
+# WEP uses three IV bytes; reject counters that would reuse those bytes.
 for cipher in [0'u8, 3'u8]:
   for keyId in 0'u8 .. 3'u8:
     for fourthByte in 0'u64 .. 255'u64:
@@ -222,7 +228,8 @@ def program_source() -> str:
     types = "  KeyReplayCounterView" + layout.split("  KeyReplayCounterView", 1)[1].split(
         "\n  RxMicWordsView", 1
     )[0]
-    for first, end in [("TxSecurityHeaderView", "LlcSnapHeaderView"),
+    for first, end in [("MacDataFrameHeaderView", "MacQos4AddrFrameHeaderView"),
+                       ("TxSecurityHeaderView", "LlcSnapHeaderView"),
                        ("CcmpSecurityHeaderView", "RxlCntrlEnvView")]:
         types += "\n  " + first + layout.split("  " + first, 1)[1].split(
             "\n  " + end, 1

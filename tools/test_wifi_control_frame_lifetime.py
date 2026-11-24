@@ -18,10 +18,12 @@ PLATFORM = FRAME_PLATFORM.replace(
 ).replace(
     "valid, instNbr: uint8", "valid, instNbr, infoIdx: uint8\n    aid: uint16"
 ).replace(
-    "vifIdx, staInfoIdx: uint8", "vifIdx, staInfoIdx, hdrLen, secTailLen: uint8"
+    "vifIdx, staInfoIdx, staIdx: uint8",
+    "vifIdx, staInfoIdx, staIdx, hdrLen, secTailLen: uint8"
 )
 PLATFORM += r"""
 const VIF_TYPE_AP = 2'u8
+const API_AC_BE = 1'u8
 var
   protection: bool
   headerExtra, trailerExtra: uint8
@@ -121,6 +123,7 @@ proc setup(irq: bool; allocatedCount = 3) =
     held[i].staInfoIdx = 2
 
 proc build(): uint8 =
+  expectedAc = if isBa: 3'u8 else: API_AC_BE
   if isBa:
     bam_send_air_action_frame(2, addr context, 1, 0xAF, 0x1234, 0xFEDC,
                              cast[pointer](0xFACE))
@@ -159,7 +162,7 @@ for irq in [false, true]:
       doAssert build() == (change != 6).uint8
       doAssert pushes == (change == 6).int and interruptsEnabled == irq
 
-  # PS-Poll byte layout and descriptor routing exactly match the vendor.
+  # PS-Poll retains the vendor header and uses standard best-effort routing.
   isBa = false
   for aid in [1'u16, 42, 2007]:
     setup(irq)
@@ -235,7 +238,8 @@ def test_control_frame_lifetime(tmp_path: Path, mode: str, mutation: str | None)
         "txlFrameLeaseToken", "txlFrameLeaseMatches", "txlFrameIdentityCurrent", "txlFrameSessionCurrent",
         "txlCaptureFrameCallback", "txlFrameCallbackCurrent", "txlInvokeFrameCallback",
         "txlCaptureSession", "txlSessionCurrent", "txlStationAdmits", "txlFramePreparationCurrent",
-        "txl_frame_free_list_pop", "txl_frame_get", "txl_frame_release", "txl_frame_push",
+        "txl_frame_free_list_pop", "txl_frame_get", "txl_frame_release", "txlFramePushPrepared",
+        "txl_frame_push",
     ])
     management = (FW / "scan_station_ap_me.nim").read_text()
     functions += procedure(management, "me_build_add_ba_rsp").replace(

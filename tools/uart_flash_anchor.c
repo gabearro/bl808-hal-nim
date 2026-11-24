@@ -2,8 +2,8 @@
  * BL808 M0 RAM-resident UART flash anchor.
  *
  * OpenOCD loads this image into M0 RAM after reset-halt, then the host streams
- * flash chunks over the normal UART0 console pins. The anchor only touches SPI
- * NOR flash through the SF controller; it does not access eFuse.
+ * flash chunks over the normal UART0 console pins. The anchor accesses SPI
+ * NOR through the SF controller and does not access eFuse.
  */
 
 #include <stdint.h>
@@ -24,6 +24,13 @@
 #define HBN_GLB             (HBN_BASE + 0x030u)
 #define GPIO_CFG_BASE       (GLB_BASE + 0x8C4u)
 
+#define TIMER0_BASE         0x2000A500u
+#define TIMER0_WMER         (TIMER0_BASE + 0x64u)
+#define TIMER0_WFAR         (TIMER0_BASE + 0x9Cu)
+#define TIMER0_WSAR         (TIMER0_BASE + 0xA0u)
+#define TIMER0_WDT_MODE     0x3u
+#define GLB_TIMER_CLOCK_EN  (1u << 21)
+
 #define UART0_BASE          0x2000A000u
 #define UART_UTX_CONFIG     0x00u
 #define UART_URX_CONFIG     0x04u
@@ -34,6 +41,7 @@
 #define UART_FIFO_CONFIG1   0x84u
 #define UART_FIFO_WDATA     0x88u
 #define UART_FIFO_RDATA     0x8Cu
+#define UART_STATUS         0x30u
 
 #define UART_UTX_EN         (1u << 0)
 #define UART_UTX_FREERUN    (1u << 2)
@@ -41,6 +49,8 @@
 #define UART_DATA8          7u
 #define UART_STOP1          1u
 #define UART_TX_FREE_MASK   0x3Fu
+#define UART_TX_FIFO_SIZE   32u
+#define UART_TX_BUSY        (1u << 0)
 #define UART_RX_COUNT_MASK  (0x3Fu << 8)
 #define UART_TX_CLR         (1u << 2)
 #define UART_RX_CLR         (1u << 3)
@@ -339,6 +349,14 @@ static void uart_send_response(uint32_t status, uint32_t result, uint32_t counte
     uart_send_u32(counter);
 }
 
+static void uart_wait_tx_complete(void)
+{
+    while (uart_tx_free() < UART_TX_FIFO_SIZE ||
+           (read32(UART0_BASE + UART_STATUS) & UART_TX_BUSY) != 0u) {
+        __asm__ volatile("nop");
+    }
+}
+
 static void delay_cycles(uint32_t count)
 {
     while (count--) {
@@ -350,13 +368,14 @@ static void reboot_chip(void)
 {
     uint32_t value = read32(GLB_SWRST_CFG2);
     cache_sync_before_reboot();
-    value &= ~(1u << 5);
+    /* BL808 GLB_SWRST_CFG2[0] requests a software power-on reset of M0. */
+    value &= ~(1u << 0);
     write32(GLB_SWRST_CFG2, value);
     delay_cycles(1000u);
-    value |= (1u << 5);
+    value |= (1u << 0);
     write32(GLB_SWRST_CFG2, value);
     delay_cycles(1000u);
-    value &= ~(1u << 5);
+    value &= ~(1u << 0);
     write32(GLB_SWRST_CFG2, value);
     for (;;) {
         __asm__ volatile("wfi");
@@ -519,11 +538,14 @@ static int flash_read_compare(uint32_t address, uint32_t offset, uint32_t length
         if (sf_send_cmd((uint8_t)FLASH_CMD_READ, address + base, 1, n, 0) != 0) {
             return -1;
         }
-        for (uint32_t i = 0; i < n; i++) {
-            uint32_t word = read32(SF_CTRL_BUF + (i & ~3u));
-            uint8_t got = (uint8_t)(word >> ((i & 3u) * 8u));
-            if (got != expected[base + i]) {
-                return -1;
+        for (uint32_t i = 0; i < n; i += 4u) {
+            uint32_t word = read32(SF_CTRL_BUF + i);
+            uint32_t bytes = n - i < 4u ? n - i : 4u;
+            for (uint32_t j = 0; j < bytes; j++) {
+                uint8_t got = (uint8_t)(word >> (j * 8u));
+                if (got != expected[base + i + j]) {
+                    return -1;
+                }
             }
         }
     }
@@ -570,8 +592,20 @@ static void uart_recv_payload(uint32_t length)
     }
 }
 
+static int stop_inherited_watchdog(void)
+{
+    /* A halt-only JTAG load does not reset the application's watchdog. */
+    write32(GLB_CGEN_CFG1, read32(GLB_CGEN_CFG1) | GLB_TIMER_CLOCK_EN);
+    uint32_t mode = read32(TIMER0_WMER) & ~TIMER0_WDT_MODE;
+    write32(TIMER0_WFAR, 0xBABAu);
+    write32(TIMER0_WSAR, 0xEB10u);
+    write32(TIMER0_WMER, mode);
+    return (read32(TIMER0_WMER) & TIMER0_WDT_MODE) == 0u;
+}
+
 void main(void)
 {
+    const int watchdog_stopped = stop_inherited_watchdog();
     uart0_init(UART_ANCHOR_BAUD);
     sf_claim_sahb();
     debug_clear();
@@ -598,6 +632,9 @@ void main(void)
 
         if (req.header_checksum != checksum_header(req.command, req.address, req.length)) {
             status = ERR_CHECKSUM;
+        } else if (!watchdog_stopped &&
+                   (req.command == CMD_ERASE || req.command == CMD_WRITE_VERIFY)) {
+            status = ERR_TIMEOUT;
         } else if (req.command == CMD_PING) {
             result = 1u;
         } else if (req.command == CMD_READ_ID) {
@@ -632,7 +669,7 @@ void main(void)
         dcache_flush_all();
         uart_send_response(status, result, counter);
         if (reboot_after_response != 0u) {
-            delay_cycles(100000000u);
+            uart_wait_tx_complete();
             reboot_chip();
         }
     }

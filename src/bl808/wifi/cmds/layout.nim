@@ -10,9 +10,8 @@ const
   RwnxCmdMgrStateCrashed = 2'u32
   RwnxCmdMgrStateDraining = 3'u32
 
-  # The bare-metal adapter counts polling iterations, not wall-clock ticks.
-  # Expiry returns ETIMEDOUT; a still-published command survives until ACK.
-  # Recovery cannot reuse its slot while that ACK remains outstanding.
+  # The cooperative adapter treats a wait tick as 1 ms. A timed-out command
+  # still owned by the mailbox survives until ACK.
   WifiCmdWaitTicks {.intdefine.} = 200'u32
 
   Eintr = 4'i32

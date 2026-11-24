@@ -138,6 +138,40 @@ for fourAddress in [false, true]:
 
 
 @pytest.mark.parametrize("mode", MODES)
+def test_sta_power_save_skips_qos_read_before_early_exits(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, ps.source("psTxTidToAc", "ps_check_frame") + r'''
+for protected in [false, true]:
+  for options in [0'u8, 1]:
+    setup()
+    ps.enabled = 1
+    ps.psActive = 1
+    vif.psOptions = options
+    var frame: MacHeader
+    frame.frameControl = 0x0088'u16 or (if protected: 0x2000'u16 else: 0'u16)
+    frame.addr1[0] = 1
+    ps_check_frame(addr frame, 0, addr vif)
+    let clearsGroup = not protected or options != 0
+    doAssert vif.flags == (if clearsGroup: 0xA5A5000C'u32 else: 0xA5A5000E'u32)
+    doAssert events.len == 0 and lookups == 0
+
+setup()
+ps.enabled = 1
+ps.psActive = 1
+var amsdu: MacHeader
+amsdu.frameControl = 0x0088
+ps_check_frame(addr amsdu, 0x200, addr vif)
+doAssert vif.flags == 0xA5A5000E'u32 and events.len == 0
+
+setup()
+ps.enabled = 1
+var inactive: MacHeader
+inactive.frameControl = 0x0088
+ps_check_frame(addr inactive, 0, addr vif)
+doAssert vif.flags == 0xA5A5000A'u32 and events == @["traffic"]
+''')
+
+
+@pytest.mark.parametrize("mode", MODES)
 def test_ap_power_save_does_not_alias_received_tid(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, ap_ps.source() + r'''
 for incoming in [false, true]:

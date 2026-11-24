@@ -13,6 +13,15 @@ from test_wifi_ap_teardown import procedure
 ROOT = Path(__file__).resolve().parents[1]
 FW = ROOT / "src/bl808/wifi/fw"
 
+AP_EXTRAS_PLATFORM = r'''
+proc ieCursorAfter(p: pointer; size: uint): pointer =
+  addr cast[ptr UncheckedArray[uint8]](p)[size]
+proc copyIeBytes(dst, src: pointer; size: uint): pointer =
+  copyMem(dst, src, size.int)
+  ieCursorAfter(dst, size)
+proc c_memmove(dst, src: pointer; size: csize_t): pointer {.importc: "memmove", header: "<string.h>".}
+'''
+
 PLATFORM = r'''
 const
   MAX_VIFS = 2
@@ -49,9 +58,6 @@ var
   me: tuple[htCaps: array[32, uint8]]
   sequence: tuple[seqCounter: uint16]
   mac_addr_bcst_fwd = [255'u8, 255, 255, 255, 255, 255]
-  appIeBeaconPtr, appIeProbeRespPtr: pointer
-  appIeBeaconLen, appIeProbeRespLen: uint16
-  extra = [127'u8, 1, 0x19]
   rsn = [48'u8, 20, 1, 0, 0, 15, 0xAC, 4, 1, 0, 0, 15, 0xAC, 4,
          1, 0, 0, 15, 0xAC, 2, 0, 0]
   bytes: array[2048, uint8]
@@ -73,9 +79,6 @@ proc c_memcpy(dst, src: pointer; size: csize_t): pointer =
   copyMem(dst, src, size.int)
   dst
 proc co_pack8p(dst, src: pointer; size: uint32) = copyMem(dst, src, size.int)
-proc copyIeBytes(dst, src: pointer; size: uint): pointer =
-  copyMem(dst, src, size.int)
-  cast[pointer](cast[uint](dst) + size)
 proc parse(start, length: int): seq[Ie] =
   var offset = start
   while offset < start + length:
@@ -120,12 +123,23 @@ proc reset(vif, flags, security, width: uint8; freq: uint16; count: int) =
     v.security.rsnIePtr = cast[uint](addr rsn[0])
     v.security.rsnIeLen = rsn.len.uint8
   for i in 0 ..< me.htCaps.len: me.htCaps[i] = (i + 16).uint8
-  appIeBeaconPtr = addr extra[0]
-  appIeProbeRespPtr = addr extra[0]
-  appIeBeaconLen = extra.len.uint16
-  appIeProbeRespLen = extra.len.uint16
   for b in bytes.mitems: b = 0xA5
-proc checkIes(ies: seq[Ie]; flags, security, width: uint8; freq: uint16; beacon: bool; hidden: uint8) =
+proc checkIes(ies: seq[Ie]; flags, security, width: uint8; freq: uint16;
+              beacon: bool; hidden: uint8; rateCount: int; withExtras = false) =
+  # IEEE 802.11-2012 Tables 8-20 and 8-27, independently ordered.
+  var expected = @[0'u8, 1, 3]
+  if beacon: expected.add(5)
+  if withExtras: expected.add(7)
+  expected.add(42)
+  if rateCount > 8: expected.add(50)
+  if security != 0: expected.add(48)
+  if (flags and 2) != 0: expected.add([45'u8, 61])
+  if security == 2: expected.add(221)
+  if (flags and 1) != 0: expected.add(221)
+  if withExtras: expected.add([221'u8, 221])
+  var ids: seq[uint8]
+  for ie in ies: ids.add(ie.id)
+  doAssert ids == expected, $ids & " != " & $expected
   let ssid = find(ies, 0)
   doAssert ssid == 0
   doAssert ies[ssid].payload == (if beacon and hidden != 0: @[] else: @[97'u8, 0, 98, 99])
@@ -153,11 +167,53 @@ proc checkIes(ies: seq[Ie]; flags, security, width: uint8; freq: uint16; beacon:
   let ds = find(ies, 3)
   doAssert ds >= 0 and ies[ds].payload == @[if freq == 2484: 14'u8 else: 6'u8]
   doAssert find(ies, 37) < 0, "channel-context marker was mistaken for CSA state"
-  doAssert find(ies, 127) == ies.high
+  doAssert find(ies, 127) < 0
   doAssert (find(ies, 5) >= 0) == beacon
 '''
 
 CHECKS = r'''
+var missingCursor: pointer = nil
+doAssert me_add_ie_ht_capa(nil) == 0
+doAssert me_add_ie_ht_capa(addr missingCursor) == 0
+doAssert me_add_ie_ht_oper(nil, nil) == 0
+doAssert me_add_ie_ht_oper(addr missingCursor, nil) == 0
+for mode in [1'u8, 2'u8]:
+  doAssert me_add_ie_rsn(nil, mode) == 0
+  doAssert me_add_ie_rsn(addr missingCursor, mode) == 0
+doAssert me_add_ie_wpa(nil, 2) == 0
+doAssert me_add_ie_wpa(addr missingCursor, 2) == 0
+let rsnCcmp = @[48'u8, 20, 1, 0, 0, 15, 0xAC, 4, 1, 0, 0, 15, 0xAC, 4,
+                1, 0, 0, 15, 0xAC, 2, 0, 0]
+let rsnMixed = @[48'u8, 24, 1, 0, 0, 15, 0xAC, 2, 2, 0, 0, 15, 0xAC, 2,
+                 0, 15, 0xAC, 4, 1, 0, 0, 15, 0xAC, 2, 0, 0]
+let wpaMixed = @[221'u8, 28, 0, 80, 0xF2, 1, 1, 0, 0, 80, 0xF2, 2,
+                 2, 0, 0, 80, 0xF2, 2, 0, 80, 0xF2, 4, 1, 0,
+                 0, 80, 0xF2, 2, 0, 0]
+for mode in 0'u8 .. 3'u8:
+  for b in bytes.mitems: b = 0xA5
+  var cursor: pointer = addr bytes[8]
+  let expected = if mode == 1: rsnCcmp elif mode == 2: rsnMixed else: @[]
+  let length = me_add_ie_rsn(addr cursor, mode)
+  doAssert length == expected.len.uint32
+  doAssert cursor == cast[pointer](cast[uint](addr bytes[8]) + length.uint)
+  doAssert bytes[8 ..< 8 + length.int] == expected
+  guard(length)
+let wpaBuilder: proc(buf: pointer; mode: uint8): uint32 {.cdecl.} = me_add_ie_wpa
+for mode in 0'u8 .. 3'u8:
+  for b in bytes.mitems: b = 0xA5
+  var cursor: pointer = addr bytes[8]
+  let expected = if mode == 2: wpaMixed else: @[]
+  let length = wpaBuilder(addr cursor, mode)
+  doAssert length == expected.len.uint32
+  doAssert cursor == cast[pointer](cast[uint](addr bytes[8]) + length.uint)
+  doAssert bytes[8 ..< 8 + length.int] == expected
+  guard(length)
+for b in bytes.mitems: b = 0xA5
+var timCursor: pointer = addr bytes[8]
+doAssert me_add_ie_tim(addr timCursor, 3) == 6
+doAssert cast[uint](timCursor) == cast[uint](addr bytes[14])
+doAssert bytes[8 .. 13] == [5'u8, 4, 0xA5, 3, 0xA5, 0xA5],
+  "TIM template builder overwrote fields owned by the live TIM descriptor"
 for vif in 0'u8 .. 1'u8:
   for flags in 0'u8 .. 3'u8:
     for security in 0'u8 .. 2'u8:
@@ -179,15 +235,60 @@ for vif in 0'u8 .. 1'u8:
               doAssert cap == (if security != 0: 0x411'u16 else: 0x401'u16)
               guard(size)
               let ies = parse(44, size.int - 36)
-              checkIes(ies, flags, security, width, freq, true, hidden)
+              checkIes(ies, flags, security, width, freq, true, hidden, count)
               doAssert timLength == 6 and bytes[8 + timOffset.int] == 5
               for b in bytes.mitems: b = 0xA5
               var output: uint16
               let probeSize = me_build_probe_rsp(addr bytes[8], vif, addr output)
               doAssert probeSize == output.uint32
+              doAssert probeSize == meProbeResponseLength(vif),
+                "probe response size prediction differs from serialization"
               guard(probeSize)
               for i in 8 .. 15: doAssert bytes[i] == 0, "probe timestamp leaked old buffer data"
-              checkIes(parse(20, probeSize.int - 12), flags, security, width, freq, false, hidden)
+              checkIes(parse(20, probeSize.int - 12), flags, security, width, freq, false, hidden, count)
+
+var vendorA = [221'u8, 4, 2, 3, 4, 9]
+var country = [7'u8, 6, 85, 83, 32, 1, 11, 20]
+var vendorB = [221'u8, 4, 2, 3, 4, 11]
+for first in 0 .. 2:
+  let raw = case first
+    of 0: @country & @vendorA & @vendorB
+    of 1: @vendorA & @country & @vendorB
+    else: @vendorA & @vendorB & @country
+  var extras: ApFrameExtras
+  doAssert readApFrameExtras(unsafeAddr raw[0], raw.len.uint32, extras)
+  for beacon in [false, true]:
+    reset(0, 3, 1, 0, 2437, 12)
+    var countryAt: uint16
+    let fixed = if beacon: 36 else: 12
+    let built = block:
+      if beacon:
+        var timLength: uint8
+        let n = me_build_beacon(addr bytes[8], 0, addr countryAt, addr timLength, 0)
+        doAssert bytes[8 + countryAt.int] == 5 and timLength == 6
+        countryAt += timLength
+        n
+      else:
+        meBuildProbeResponse(addr bytes[8], 0, 512, nil, addr countryAt)
+    let total = built + raw.len.uint32
+    let before = bytes
+    doAssert not appendApFrameExtras(addr bytes[8], built, countryAt.uint32, total - 1, extras)
+    doAssert bytes == before
+    doAssert appendApFrameExtras(addr bytes[8], built, countryAt.uint32, total, extras)
+    doAssert bytes[8 + countryAt.int] == 7
+    let ies = parse(8 + fixed, total.int - fixed)
+    checkIes(ies, 3, 1, 0, 2437, beacon, 0, 12, true)
+    doAssert ies[find(ies, 7)].payload == @country[2 .. ^1]
+    doAssert ies[^2].payload == @vendorA[2 .. ^1] and ies[^1].payload == @vendorB[2 .. ^1]
+    guard(total)
+var extras: ApFrameExtras
+let duplicateCountry = @country & @country
+doAssert not readApFrameExtras(unsafeAddr duplicateCountry[0], duplicateCountry.len.uint32, extras)
+doAssert not readApFrameExtras(addr country[0], country.len.uint32 - 1, extras)
+var padded = [7'u8, 10, 85, 83, 32, 1, 11, 20, 36, 4, 20, 0]
+doAssert readApFrameExtras(addr padded[0], padded.len.uint32, extras)
+padded[^1] = 1
+doAssert not readApFrameExtras(addr padded[0], padded.len.uint32, extras)
 
 reset(0, 1, 0, 0, 2437, 4)
 vifs[0].edcaRegs[1] = (vifs[0].edcaRegs[1] and not 0xF'u32) or 9
@@ -199,21 +300,12 @@ doAssert changed[find(changed, 221, 2)].payload[8] == 9,
   "WMM must advertise the configured AIFSN"
 guard(changedSize)
 
-reset(0, 0, 0, 0, 2437, 4)
-var suppliedCsa = [37'u8, 3, 1, 6, 2]
-appIeBeaconPtr = addr suppliedCsa[0]
-appIeBeaconLen = suppliedCsa.len.uint16
-let csaSize = me_build_beacon(addr bytes[8], 0, addr offset, addr timSize, 0)
-doAssert csaSize.uint64 == meBeaconFrameLength(0, 0)
-let supplied = parse(44, csaSize.int - 36)
-doAssert supplied[find(supplied, 37)].payload == @[1'u8, 6, 2]
-guard(csaSize)
 '''
 
 
 def program_source(checks: str = CHECKS) -> str:
     layout = (FW / "layout_types.nim").read_text()
-    names = ["MacIeView", "MacIeDataView", "RateSetView", "SsidIeView", "DsParamSetIeView",
+    names = ["ApFrameExtras", "MacIeView", "MacIeDataView", "RateSetView", "SsidIeView", "DsParamSetIeView",
              "OneByteMacIeView", "HtCapIeView", "HtOperIeView", "RsnSuiteView",
              "RsnCcmpPskIeView", "RsnTkipCcmpIeView", "WpaVendorIeView", "WpaPskVendorIeView",
              "CsaIeView", "TimIeView", "WmmAcParamRecord", "WmmParameterIeView",
@@ -232,7 +324,8 @@ def program_source(checks: str = CHECKS) -> str:
     scan = (FW / "scan_station_ap_me.nim").read_text()
     bodies = procedure(layout, "setLe32")
     bodies += procedure((FW / "kernel_mac_channel.nim").read_text(), "phy_freq_to_channel").replace("weakExport, ", "")
-    for name in ["me_build_capability", "me_add_ie_ssid", "me_add_ie_supp_rates",
+    for name in ["readApFrameExtras", "appendApFrameExtras",
+                 "me_build_capability", "me_add_ie_ssid", "me_add_ie_supp_rates",
                  "me_add_ie_ext_supp_rates", "me_add_ie_ds", "me_add_ie_erp", "me_add_ie_ht_capa",
                  "me_add_ie_ht_oper", "me_add_ie_rsn", "me_add_ie_wpa", "me_add_ie_tim",
                  "writeWpaPskVendorIe", "writeCsaIe", "writeWmmParameterIe",
@@ -240,7 +333,7 @@ def program_source(checks: str = CHECKS) -> str:
                  "meBuildProbeResponse", "me_build_probe_rsp"]:
         if re.search(r"^proc " + name + r"\*?\b", scan, re.M):
             bodies += procedure(scan, name)
-    return declarations + PLATFORM + helpers + bodies + checks
+    return declarations + PLATFORM + AP_EXTRAS_PLATFORM + helpers + bodies + checks
 
 
 @pytest.mark.parametrize("build", ["checked", "release", "asan"])

@@ -1,0 +1,25 @@
+(component
+  (type $ticket (resource (rep i32)))
+  (export $public-ticket "ticket" (type $ticket))
+  (core func $new (canon resource.new $ticket))
+  (core func $rep (canon resource.rep $ticket))
+  (core func $drop (canon resource.drop $ticket))
+  (core module $callee
+    (func (export "identity") (param i32) (result i32) local.get 0))
+  (core instance $callee (instantiate $callee))
+  (func $lift (param "owner" (own $public-ticket)) (result (own $public-ticket))
+    (canon lift (core func $callee "identity")))
+  (core func $lower (canon lower (func $lift)))
+  (core module $caller
+    (import "" "new" (func $new (param i32) (result i32)))
+    (import "" "move" (func $move (param i32) (result i32)))
+    (import "" "rep" (func $rep (param i32) (result i32)))
+    (import "" "drop" (func $drop (param i32)))
+    (func (export "run") (result i32) (local $handle i32)
+      (local.set $handle (call $move (call $new (i32.const 42))))
+      (call $rep (local.get $handle))
+      (call $drop (local.get $handle))))
+  (core instance $caller (instantiate $caller
+    (with "" (instance (export "new" (func $new)) (export "move" (func $lower))
+      (export "rep" (func $rep)) (export "drop" (func $drop))))))
+  (func (export "run") (result u32) (canon lift (core func $caller "run"))))

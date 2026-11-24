@@ -14,11 +14,13 @@ from test_wifi_message_allocation import run_program
 EVENT_PLATFORM = r'''
 const KE_EVT_MAX = 26
 var
-  keEvtField: uint32
+  ke_env: array[36, uint8]
   keEvtHandlers: array[KE_EVT_MAX, tuple[handler, param: pointer]]
   assertions: seq[cint]
   calls: seq[pointer]
   onAssert: proc()
+template keEnvEventField(): ptr uint32 = cast[ptr uint32](addr ke_env[0])
+template keEvtField: untyped = keEnvEventField()[]
 proc assert_err(condition, file: cstring; line: cint) =
   assertions.add(line)
   if onAssert != nil: onAssert()
@@ -88,6 +90,7 @@ proc vifChannelAt(p: pointer): ptr Vif = cast[ptr Vif](p)
 proc chanScanPoolOverlay(): ptr ChanScanPoolOverlay = addr scan
 proc chanCtxtOpTimer(): pointer = cast[pointer](76)
 proc chan_ctxt_trigger(p: pointer) = actions.add("trigger")
+proc smDeferredChannelUnlinked(vifIndex: uint8) = discard
 proc chan_update_tx_power(p: pointer) = actions.add("power")
 proc chan_tbtt_schedule(p: pointer) = actions.add("tbtt")
 proc chan_cde_evt(p: pointer) = actions.add("cde")
@@ -97,6 +100,7 @@ proc chanSwitchCancel(p: pointer) = actions.add("cancel")
 proc chan_conn_less_delay_prog() = actions.add("delay")
 proc chan_switch_start(p: pointer) =
   actions.add(if p == (addr contexts[4]): "roc" else: "scan")
+proc chanStartConnlessSwitch(p: pointer) = chan_switch_start(p)
 proc mm_timer_clear(p: pointer) = actions.add("clear")
 proc c_memcpy(dst, src: pointer; count: csize_t): pointer =
   copyMem(dst, src, count.int)
@@ -235,6 +239,25 @@ for index in 0'u8 .. 1'u8:
   doAssert clockReads == (if index == 0: 1'u32 else: 0'u32)
   doAssert assertions.len == 0
 ''',
+    "remaining_time_boundary": r'''
+for irq in [false, true]:
+  setup()
+  env.currentCtxt = addr contexts[0]
+  vifs[0].chanCtxt = addr contexts[0]
+  clockValue = 7000
+  env.remainingTimeTarget = 6999
+  # Like the BL808 sub/divu pair, a passed deadline is not an immediate dwell.
+  doAssert chan_ctxt_get_remaining_time_ms(addr vifs[0]) == high(uint32) div 1000
+  for target in [7000'u32, 7999'u32]:
+    env.remainingTimeTarget = target
+    doAssert chan_ctxt_get_remaining_time_ms(addr vifs[0]) == 0
+  env.remainingTimeTarget = 8000
+  doAssert chan_ctxt_get_remaining_time_ms(addr vifs[0]) == 1
+  clockValue = high(uint32) - 500
+  env.remainingTimeTarget = 1499
+  doAssert chan_ctxt_get_remaining_time_ms(addr vifs[0]) == 2
+  doAssert assertions.len == 0 and clockReads == 5
+''',
     "scan_busy": r'''
 for slot in 0'u8 .. 4'u8:
   setup()
@@ -319,8 +342,36 @@ for operation in 0 .. 5:
 @pytest.mark.parametrize("case", EVENT_CASES)
 def test_event_preconditions(tmp_path: Path, mode: str, case: str) -> None:
     kernel = (FW / "kernel_mac_channel.nim").read_text()
-    code = EVENT_PLATFORM + procedure(kernel, "eventIndex32") + procedure(kernel, "ke_evt_schedule")
+    code = EVENT_PLATFORM + "".join(procedure(kernel, name) for name in (
+        "eventIndex32", "keDispatchEvent", "ke_evt_schedule"))
     run_program(tmp_path, mode, code + EVENT_CASES[case])
+
+
+@pytest.mark.parametrize("mode", ["checked", "firmware"])
+def test_event_field_uses_ke_env(tmp_path: Path, mode: str) -> None:
+    kernel = (FW / "kernel_mac_channel.nim").read_text()
+    code = EVENT_PLATFORM + r'''
+var interrupts = true
+proc irqSave(): uint32 =
+  result = if interrupts: 8'u32 else: 0'u32
+  interrupts = false
+proc irqRestore(saved: uint32) = interrupts = (saved and 8) != 0
+'''
+    for name in ("ke_evt_field_get", "ke_evt_set", "ke_evt_clear",
+                 "eventIndex32", "keDispatchEvent", "ke_evt_schedule"):
+        code += procedure(kernel, name)
+    run_program(tmp_path, mode, code + r'''
+setup()
+ke_evt_set(0x80100000'u32)
+doAssert interrupts and ke_evt_field_get() == 0x80100000'u32
+doAssert keEvtField == 0x80100000'u32
+ke_evt_clear(0x80000000'u32)
+doAssert interrupts and ke_evt_field_get() == 0x00100000'u32
+keEnvEventField()[] = 0x40000000'u32
+ke_evt_schedule()
+doAssert calls == @[cast[pointer](1 + 1)]
+doAssert ke_evt_field_get() == 0x40000000'u32
+''')
 
 
 @pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
@@ -333,10 +384,10 @@ def test_channel_preconditions(tmp_path: Path, mode: str, case: str) -> None:
 def test_confirmation_event_rejection(tmp_path: Path, mode: str) -> None:
     code = host_source()
     code = code.replace(procedure(code, "assert_err"), r'''
-var assertionLines: seq[cint]
+var assertionDetails: seq[tuple[condition, file: string; line: cint]]
 var onAssert: proc()
 proc assert_err(condition, file: cstring; line: cint) =
-  assertionLines.add(line)
+  assertionDetails.add(($condition, $file, line))
   if onAssert != nil: onAssert()
 ''', 1)
     run_program(tmp_path, mode, code + r'''
@@ -344,7 +395,7 @@ for incoming in [false, true]:
   for ac in [0'u8, 1, 2, 3, 4, 5, 31, 32, 255]:
     for replace in [false, true]:
       setup(incoming)
-      assertionLines.setLen(0)
+      assertionDetails.setLen(0)
       onAssert = nil
       let index = if ac < 5: ac else: 2'u8
       confirmLists[index] = CoList(first: addr frames[0].link, last: addr frames[0].link)
@@ -357,9 +408,22 @@ for incoming in [false, true]:
           frames[1].link.next = nil
           ke_env[0] = ke_env[0] or txl_cfm_evt_bit[index]
       txl_cfm_evt(ac)
-      doAssert assertionLines == @[346.cint]
+      doAssert assertionDetails == @[("ke_evt_get() & evt_bit", "module", 346.cint)]
       doAssert txEnv.packetCounter == 1 and hostCompletions.len == 0 and indications.len == 0
       doAssert confirmLists[index].first == (if replace: addr frames[1].link else: addr frames[0].link)
       doAssert ke_env[0] == (if replace: 0x80000000'u32 or txl_cfm_evt_bit[index] else: 0x80000000'u32)
       doAssert txActiveFlush == nil and interruptsEnabled == incoming
 ''')
+
+
+def test_tx_assertion_provenance() -> None:
+    tx = (FW / "tx_layer.nim").read_text()
+    expected = {
+        "txl_cfm_evt": 'assert_err("ke_evt_get() & evt_bit", "module", 346)',
+        "txl_cntrl_halt_ac": 'assert_err("0", "module", 0x700)',
+        "txl_transmit_trigger": 'assert_err("access_category < NX_TXQ_CNT", "module", 0x86C)',
+        "txl_frame_push": 'assert_err("(thd->datastartptr & 0x01) == 0", "module", 316)',
+        "txl_frame_try_push_force": 'assert_err("(thd->datastartptr & 0x01) == 0", "module", 367)',
+    }
+    for name, diagnostic in expected.items():
+        assert diagnostic in procedure(tx, name)

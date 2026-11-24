@@ -136,7 +136,7 @@ CASES = {
 for task in [0'u8, 1, 3, 9, 255]:
   for scheduled in [false, true]:
     for vif in [0'u8, 1, 255]:
-      for duration in [0'u32, 1, 10, 67108, 0xFFFFFFFF'u32]:
+      for duration in [0'u32, 1, 10, 67108]:
         reset(vif = vif, duration = duration)
         if scheduled: env.scheduledCtxt = cast[pointer](1)
         let originalRequest = request
@@ -146,7 +146,7 @@ for task in [0'u8, 1, 3, 9, 255]:
         var expected = pool.bytes
         for index in 0..<10: expected[116 + index] = request.bytes[8 + index]
         expected[126] = task
-        let ticks = ((duration * 1000'u32) shr 10).uint16
+        let ticks = if duration == 1: 1'u16 else: ((duration * 1000'u32) shr 10).uint16
         expected[130] = ticks.uint8
         expected[131] = (ticks shr 8).uint8
         expected[134] = 1
@@ -161,6 +161,15 @@ for task in [0'u8, 1, 3, 9, 255]:
         doAssert delayCalls == (task != 0).int
         doAssert switches.len == (task == 0 and not scheduled).int
         if switches.len != 0: doAssert switches[0] == chanCtxtForIdx(4)
+''',
+    "duration_out_of_range": r'''
+for task in [0'u8, 9]:
+  for duration in [67109'u32, 0x80000000'u32, high(uint32)]:
+    reset(duration = duration)
+    let before = (pool, env, environment, request, chanCtxtEpochs)
+    doAssert callRoc(payload(), task) == 1
+    doAssert (pool, env, environment, request, chanCtxtEpochs) == before
+    doAssert delayCalls == 0 and switches.len == 0
 ''',
     "operations": r'''
 for op in 1'u8..255:

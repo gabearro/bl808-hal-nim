@@ -67,17 +67,22 @@ proc mmTimAllocationSize(id: uint16; destination: uint8; length: uint32): uint32
 proc mmTimRegisterAllocation(header: ptr KeMsgHdr) = discard
 proc mmTimCaptureMessage(header: ptr KeMsgHdr) = discard
 proc mmTimForget(header: pointer) = discard
+proc mmConnLossForget(header: pointer) = discard
 proc smCleanupForget(header: pointer) = discard
 proc smBssForget(header: pointer) = discard
 proc smActivationForget(header: pointer) = discard
 proc smScanForget(header: pointer) = discard
 proc smRegistrationForget(header: pointer) = discard
 proc chanSwitchForget(header: pointer) = discard
+proc scanDwellForget(header: pointer) = discard
 proc smRspTimerForget(header: pointer) = discard
 proc smDeferredForget(header: pointer) = discard
 proc smAbortStorageLength(id: uint16; destination: uint8; length: uint32): uint32 = length
 proc smAbortRegister(header: ptr KeMsgHdr) = discard
 proc smAbortForget(header: pointer) = discard
+proc mmEdcaForget(header: pointer) = discard
+proc mmConfigForgetIdleOwner(header: pointer): bool = false
+proc mmConfigResumeAbandonedIdle() = discard
 proc smAbortCaptureMessage(header: ptr KeMsgHdr) = discard
 proc chanUpdateStorageLength(id: uint16; destination: uint8; length: uint32): uint32 = length
 proc chanUpdateRegister(header: ptr KeMsgHdr) = discard
@@ -131,7 +136,7 @@ reset()
 '''
 
 
-def run_program(tmp_path: Path, mode: str, code: str) -> None:
+def run_program(tmp_path: Path, mode: str, code: str, *, defines: tuple[str, ...] = ()) -> None:
     nim = shutil.which("nim")
     if nim is None:
         pytest.skip("Nim is required")
@@ -146,7 +151,8 @@ def run_program(tmp_path: Path, mode: str, code: str) -> None:
              "asan": ["--cc:clang", "--passC:-fsanitize=address", "--passL:-fsanitize=address"]}
     result = subprocess.run([nim, "c", "-r", "--skipParentCfg:on", "--skipProjCfg:on",
         "--skipUserCfg:on", f"--nimcache:{tmp_path / 'cache'}", f"-o:{tmp_path / 'test'}",
-        *flags[mode], str(path)], cwd=ROOT, text=True, stdout=subprocess.PIPE,
+        *flags[mode], *(f"-d:{define}" for define in defines), str(path)],
+        cwd=ROOT, text=True, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, timeout=90)
     assert result.returncode == 0, result.stdout
 

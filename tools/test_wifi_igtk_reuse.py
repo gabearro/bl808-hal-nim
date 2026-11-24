@@ -46,6 +46,14 @@ for sequence in [0'u32, 2, 3, 1000, high(uint32)]:
   vif_mgmt_add_key(addr request, hardwareIndex)
   doAssert key[] == before and resets == 1
 ''',
+    "invalid_pn": r'''
+let before = key[]
+for highByte in 2 .. 3:
+  request.pnHighBytes[highByte] = 1
+  vif_mgmt_add_key(addr request, hardwareIndex)
+  doAssert key[] == before and resets == 1
+  request.pnHighBytes[highByte] = 0
+''',
     "reselect": r'''
 let before = key[]
 let otherSlot = if request.staIdx == 4: 5'u else: 4'u

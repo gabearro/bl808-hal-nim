@@ -31,7 +31,8 @@ MEMORY
     RAM     (rwx) : ORIGIN = 0x22054000, LENGTH = 16K
 }
 
-_stack_size = 2K;
+PROVIDE(__bl808_lp_stack_bytes = 2K);
+_stack_size = __bl808_lp_stack_bytes;
 
 SECTIONS
 {
@@ -107,6 +108,8 @@ SECTIONS
 }
 
 ASSERT(_eheap >= _sheap, "LP RAM overflow: no space left for heap")
+ASSERT(_stack_size >= 2K && (_stack_size % 16) == 0,
+       "LP stack must be at least 2 KB and 16-byte aligned")
 ASSERT(_sstack == ORIGIN(RAM) + LENGTH(RAM) - _stack_size,
        "LP stack is not placed at top of RAM")
 /* LP RAM must stay in the NON-CACHED WRAM window (0x22030000..0x22058000). The

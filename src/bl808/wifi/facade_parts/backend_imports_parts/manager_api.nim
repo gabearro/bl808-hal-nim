@@ -23,3 +23,6 @@ proc wifi_mgmr_ap_stop*(iface: ptr WifiInterface): cint
 
 proc wifi_mgmr_sta_netif_get*(): pointer {.importc, cdecl.}
   ## Returns struct netif* (lwIP network interface for STA).
+
+when defined(bl808WifiNimFw):
+  proc wifi_mgmr_ap_netif_get(): pointer {.importc, cdecl.}

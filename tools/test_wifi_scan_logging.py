@@ -157,3 +157,33 @@ for invalid in [false, true]:
             (1046.cint, "over scanu_rm_exist_ssid \r\n")])
   doAssert freed[3] == 0
 ''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_removed_ssid_reloads_logger_after_callbacks(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, removal_source() + r'''
+for changeAt in ["start", "match", "free", "enableAtFree"]:
+  setup(true)
+  logsEnabled = changeAt != "enableAtFree"
+  expectedIrq = true
+  scanLogs.setLen(0)
+  logAction = proc(line: cint) =
+    if (changeAt == "start" and line == 1032) or
+        (changeAt == "match" and line == 1043):
+      logsEnabled = false
+  hook = proc(point: string) =
+    if point == "free3":
+      if changeAt == "free": logsEnabled = false
+      if changeAt == "enableAtFree": logsEnabled = true
+  scanu_rm_exist_ssid(addr filter, 3)
+  doAssert freed[3] == 1 and interruptsEnabled
+  let expectedLines = case changeAt
+    of "start": @[1032.cint]
+    of "match", "free": @[1032.cint, 1043.cint]
+    else: @[1046.cint]
+  doAssert scanLogs.len == expectedLines.len
+  for i, line in expectedLines:
+    doAssert scanLogs[i].line == line
+logAction = nil
+hook = nil
+''')

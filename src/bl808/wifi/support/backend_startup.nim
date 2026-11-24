@@ -22,6 +22,9 @@ proc bl808WifiBackendFwStart(): bool {.discardable.} =
   setupBlOps()
   bl808WifiBackendTrace("fw_start setup_hosal")
   setupHosal()
+  if bl_pm_init() != 0:
+    bl808WifiBackendTrace("fw_start pm_init failed")
+    return false
   bl808WifiBackendTrace("fw_start wireless_domain_reset")
   bl808WifiBackendPrepareWirelessDomain(forceReset = true)
   bl808WifiBackendTrace("fw_start clock_enable")
@@ -35,16 +38,22 @@ proc bl808WifiBackendFwStart(): bool {.discardable.} =
   osExitCritical(irqState)
   bl808WifiBackendTrace("fw_start intc_toggle_done")
   bl808WifiBackendTrace("wifi_hosal_rf_turn_on begin")
-  discard wifi_hosal_rf_turn_on(nil)
+  if wifi_hosal_rf_turn_on(nil) != 0:
+    bl808WifiBackendTrace("wifi_hosal_rf_turn_on failed")
+    return false
   bl808WifiBackendTrace("wifi_hosal_rf_turn_on done")
   bl808WifiBackendTrace("wifi_rf_core_init begin")
   wifiRfCoreInit(40_000_000)
+  if not wifiRfCoreReady():
+    bl808WifiBackendTrace("wifi_rf_core_init failed")
+    return false
   bl808WifiBackendTrace("wifi_rf_core_init done")
   # Match the firmware entry point before MPIF/MAC/IPC initialization.
   regWrite32(BcnStatus, regRead32(BcnStatus) or 0x01'u32)
-  bl808WifiBackendTrace("high_power_profile begin")
-  bl808WifiBackendApplyHighPowerProfile()
-  bl808WifiBackendTrace("high_power_profile done")
+  if not wifiRfCoreUsesNativeWlan():
+    bl808WifiBackendTrace("high_power_profile begin")
+    bl808WifiBackendApplyHighPowerProfile()
+    bl808WifiBackendTrace("high_power_profile done")
   bl808WifiBackendTrace("mpif_clk_init begin")
   mpif_clk_init()
   bl808WifiBackendTrace("mpif_clk_init done")
@@ -56,6 +65,9 @@ proc bl808WifiBackendFwStart(): bool {.discardable.} =
   bl808WifiBackendTrace("intc_init done")
   bl808WifiBackendTrace("ipc_emb_init begin")
   ipc_emb_init()
+  if ipcEmbEnv == nil:
+    bl808WifiBackendTrace("ipc_emb_init failed")
+    return false
   bl808WifiBackendTrace("ipc_emb_init done")
   bl808WifiBackendClearEmbIpc()
   bl808WifiBackendClearHostIpc()
@@ -65,7 +77,7 @@ proc bl808WifiBackendFwStart(): bool {.discardable.} =
     return false
   bl808WifiBackendTrace("bl_init done")
   bl808WifiBackendTrace("bl_pm_ops_register begin")
-  bl_pm_ops_register()
+  discard bl_pm_ops_register()
   bl808WifiBackendTrace("bl_pm_ops_register done")
   regWrite32(BcnStatus + 4, 0x0024_f037'u32)
   regWrite32(BcnStatus, regRead32(BcnStatus) or 0x01)

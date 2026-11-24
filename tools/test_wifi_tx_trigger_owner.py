@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import re
+from textwrap import dedent
 
 import pytest
 
@@ -18,8 +19,12 @@ def source() -> str:
     ).replace(
         "    frameLen, seqPassthrough: uint16",
         "    usedFlag: uint8\n    frameLen, seqPassthrough: uint16",
+    ).replace(
+        "packetCounter: uint32]",
+        "packetCounter: uint32, resetInProgress: uint8]",
     )
-    code = "import std/strutils\nvar onTrace: proc(label: string)\nvar onStatus, onPublish: proc()\n" + code
+    code = ("import std/[strutils, volatile]\nvar onTrace: proc(label: string)\n"
+            "var onStatus, onPublish: proc()\n" + code)
     code = code.replace(procedure(code, "hostTxHwDescAt"), r'''
 var dmaHeads, secondary: array[3, HostTxHwDescView]
 proc hostTxHwDescAt(p: pointer): ptr HostTxHwDescView =
@@ -47,6 +52,9 @@ proc machwTxReadyAck(mask: uint32) =
   ready = ready and not mask
 ''', 1)
     code += r'''
+const KE_EVT_RESET = 0x80000000'u32
+var pendingFirmwareEvents: uint32
+proc keEnvEventField(): ptr uint32 = addr pendingFirmwareEvents
 var routed: seq[tuple[descriptor: pointer, host: bool, status: uint32]]
 proc co_list_pop_front(list: ptr CoList): pointer =
   result = list.first
@@ -62,7 +70,7 @@ proc txl_frame_cfm(p: pointer)
 proc txl_cfm_push(p: pointer; status, ac: uint32)
 '''
     tx = (FW / "tx_layer.nim").read_text()
-    for name in ("txlInvalidateDmaFrame", "txlInvalidateDmaAc", "txlInvalidateDmaVif",
+    for name in ("txlResetting", "txlInvalidateDmaFrame", "txlInvalidateDmaAc", "txlInvalidateDmaVif",
                  "txlInvalidateDmaStation", "txlInvalidateDmaAll", "txlInvalidateDmaPool"):
         code += procedure(tx, name)
     code += r'''
@@ -76,13 +84,17 @@ proc txl_cfm_push(p: pointer; status, ac: uint32) =
   if onPublish != nil: onPublish()
 '''
     body = procedure(tx, "txl_transmit_trigger")
+    debug_types = {"nimFwDbgEapolRfGainLog": "array[8, array[5, uint32]]"}
     debug = "\nvar\n" + "".join(
-        f"  {name}: uint32\n" for name in sorted(set(re.findall(r"\bnimFwDbg\w+", body)))
+        f"  {name}: {debug_types.get(name, 'uint32')}\n"
+        for name in sorted(set(re.findall(r"\bnimFwDbg\w+", body)))
     )
     validation = procedure(tx, "txlTriggerFrameCurrent") if "proc txlTriggerFrameCurrent(" in tx else ""
     return code + debug + validation + body + r'''
 proc setup(ac: int; host = false; secondaryState = 0) =
   controls = default(typeof(controls))
+  txEnvironment.resetInProgress = 0
+  pendingFirmwareEvents = 0
   descs = default(typeof(descs))
   hw = default(typeof(hw))
   links = default(typeof(links))
@@ -118,6 +130,156 @@ proc setup(ac: int; host = false; secondaryState = 0) =
 '''
 
 
+@pytest.mark.parametrize("mode", ["checked", "firmware", "asan"])
+def test_pending_descriptor_membership(tmp_path: Path, mode: str) -> None:
+    tx = (FW / "tx_layer.nim").read_text()
+    context = r'''
+const
+  MAX_VIFS = 2
+  TxlFrameDescCount = 4'u32
+  TxlFrameDescSize = 220'u
+  InvalidFrameDescIndex = high(uint32)
+type
+  HostTxDescView = object
+    first: pointer
+  IpcHostTxWrapperView = object
+    header: array[12, uint8]
+    txDesc: HostTxDescView
+  Vif = object
+    beacon: HostTxDescView
+var
+  txl_frame_desc_storage: array[880, uint8]
+  ipcSharedEnv: array[2359, uint32]
+  txRateTrialTag: array[4, uint32]
+  vifs: array[MAX_VIFS, Vif]
+proc vifChannelForIdx(index: uint8): ptr Vif = addr vifs[index]
+proc vifApBeaconFrameDesc(vif: ptr Vif): ptr HostTxDescView = addr vif.beacon
+'''
+    host_slot = dedent("  proc txlHostSlot" + tx.split("  proc txlHostSlot", 1)[1].split(
+        "  proc txlPolicyRates", 1
+    )[0])
+    guard = host_slot + "".join(procedure(tx, name) for name in (
+        "txl_frame_desc_index", "txl_frame_desc_valid", "txl_tx_desc_pointer_plausible",
+    ))
+    run_program(tmp_path, mode, context + guard + r'''
+let firstFrame = cast[uint](addr txl_frame_desc_storage[0])
+let firstHost = cast[uint](addr ipcSharedEnv[0]) + 6932 + offsetof(IpcHostTxWrapperView, txDesc).uint
+for slot in 0'u ..< 4'u:
+  for address in [firstFrame + slot * 220, firstHost + slot * 620]:
+    doAssert txl_tx_desc_pointer_plausible(cast[pointer](address))
+    doAssert not txl_tx_desc_pointer_plausible(cast[pointer](address + 4))
+for i in 0 ..< MAX_VIFS:
+  doAssert txl_tx_desc_pointer_plausible(addr vifs[i].beacon)
+for address in [0'u, 0x2203_0000, 0x6202_0000, firstHost - 4, firstHost + 4 * 620,
+                 firstFrame - 4, firstFrame + 4 * 220, high(uint)]:
+  doAssert not txl_tx_desc_pointer_plausible(cast[pointer](address))
+''', defines=("bl808m0",))
+
+
+def test_pending_trigger_uses_linked_node_guard(tmp_path: Path) -> None:
+    tx = (FW / "tx_layer.nim").read_text()
+    code = source()
+    code = code.replace(procedure(code, "txl_tx_desc_pointer_plausible"), "")
+    anchor = procedure(code, "txl_frame_desc_valid")
+    code = code.replace(anchor, anchor + r'''
+const MAX_VIFS = 2
+proc vifApBeaconFrameDesc(vif: ptr Vif): ptr HostTxDescView =
+  if vif == addr vifs[0]: addr descs[1] else: addr descs[2]
+''' + procedure(tx, "txl_tx_desc_pointer_plausible"))
+    run_program(tmp_path, "checked", code + r'''
+setup(3)
+txl_transmit_trigger()
+doAssert routed == @[(cast[pointer](addr descs[0]), false, 0x80800000'u32)]
+doAssert controls[3].pending.first == nil and controls[3].pending.last == nil
+setup(3)
+controls[3].pending.first = cast[pointer](0x22041000)
+controls[3].pending.last = controls[3].pending.first
+txl_transmit_trigger()
+doAssert routed.len == 0 and nimFwDbgTxPendingInvalid != 0
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "firmware", "asan"])
+def test_eapol_gain_samples_only_completed_host_frames(tmp_path: Path, mode: str) -> None:
+    code = source()
+    code = code.replace(procedure(code, "regRead"), r'''
+const RfBase = 0x20001000'u
+var gainReads: seq[uint]
+proc regRead(address: uint): uint32 =
+  if address == 0x24B00120'u: return timerBase
+  gainReads.add(address)
+  address.uint32
+''', 1)
+    run_program(tmp_path, mode, code + r'''
+const gainAddresses = @[RfBase + 0x7A4'u, RfBase + 0x04C'u,
+                       RfBase + 0x63C'u, RfBase + 0x02C'u]
+for proto in [0x888E'u16, 0x8E88, 0x0800]:
+  for host in [false, true]:
+    for secondaryState in 0 .. 2:
+      for done in [false, true]:
+        setup(2, host, secondaryState)
+        nimFwDbgEapolRfGainCount = 0
+        gainReads.setLen(0)
+        descs[0].frameLen = proto
+        hw[0].confirmStatus = if done: 0x80010700'u32 else: 0x00010700'u32
+        let expected = proto != 0x0800 and host and done and secondaryState != 1
+        onPublish = proc() =
+          doAssert nimFwDbgEapolRfGainCount == expected.uint32
+        txl_transmit_trigger()
+        doAssert nimFwDbgEapolRfGainCount == expected.uint32
+        doAssert gainReads == (if expected: gainAddresses else: newSeq[uint]())
+        if expected:
+          doAssert nimFwDbgEapolRfGainLog[0] == [0x80010700'u32,
+            0x200017A4, 0x2000104C, 0x2000163C, 0x2000102C]
+        doAssert routed.len == (done and secondaryState != 1).int
+
+setup(2, true)
+gainReads.setLen(0)
+descs[0].frameLen = 0x888E
+nimFwDbgEapolRfGainCount = nimFwDbgEapolRfGainLog.len.uint32
+let savedGainLog = nimFwDbgEapolRfGainLog
+txl_transmit_trigger()
+doAssert gainReads.len == 0 and routed.len == 1
+doAssert nimFwDbgEapolRfGainLog == savedGainLog
+doAssert nimFwDbgEapolRfGainCount == savedGainLog.len.uint32
+''', defines=("bl808WifiDiagEapolRfGain",))
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_trigger_leaves_readiness_to_mac_recovery(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+for inProgress in [false, true]:
+  for interruptsWereEnabled in [false, true]:
+    setup(0, true)
+    interruptsEnabled = interruptsWereEnabled
+    if inProgress: txEnvironment.resetInProgress = 1
+    else: pendingFirmwareEvents = KE_EVT_RESET
+    onStatus = proc() = doAssert false, "polled the MAC during recovery"
+    txl_transmit_trigger()
+    doAssert ready == 0x40 and readyAcks == 0 and timers.len == 0
+    doAssert routed.len == 0 and controls[0].pending.first == addr descs[0]
+    doAssert interruptsEnabled == interruptsWereEnabled and txActiveTriggerOwner == nil
+
+    # Recovery owns stale readiness; service only a fresh indication after it exits.
+    setup(0, true)
+    txl_transmit_trigger()
+    doAssert acknowledged == 0x40 and readyAcks == 1 and routed.len == 1
+
+setup(0, true)
+onStatus = proc() =
+  doAssert not interruptsEnabled
+  pendingFirmwareEvents = KE_EVT_RESET
+txl_transmit_trigger()
+doAssert ready == 0x40 and readyAcks == 0 and timers.len == 0 and routed.len == 0
+
+setup(0, true)
+onPublish = proc() = pendingFirmwareEvents = KE_EVT_RESET
+txl_transmit_trigger()
+doAssert readyAcks == 1 and routed.len == 1 and timers.len == 0
+doAssert interruptsEnabled and txActiveTriggerOwner == nil
+''')
+
+
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_trigger_preserves_vendor_routes_and_deadlines(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, source() + r'''
@@ -139,6 +301,42 @@ for ac in 0 .. 4:
         else:
           doAssert controls[ac].pending.first == addr descs[0]
         doAssert interruptsEnabled == incoming and txActiveTriggerOwner == nil
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "firmware", "asan"])
+def test_beacon_ready_requires_fresh_hardware_done(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+setup(4)
+links[0].macHeader[0] = 0x80
+descs[0].staInfoIdx = 0xFF
+# The separate completion record can retain an older done indication.
+dmaHeads[0].status = 0x80800000'u32
+hw[0].confirmStatus = 0
+txl_transmit_trigger()
+doAssert readyAcks == 1 and acknowledged == 0x400
+doAssert routed.len == 0 and timers.len == 0
+doAssert controls[4].pending.first == addr descs[0]
+doAssert dmaHeads[0].status == 0x80800000'u32
+
+hw[0].confirmStatus = 0x80000000'u32 # Groupcast does not wait for an ACK.
+ready = 0x400
+txl_transmit_trigger()
+doAssert readyAcks == 2
+doAssert dmaHeads[0].status == 0x80000000'u32
+doAssert routed == @[(cast[pointer](addr descs[0]), false, 0x80000000'u32)]
+doAssert controls[4].pending.first == nil
+
+# Another ready interrupt after rearming the same descriptor is not a reply
+# to the replacement. Only the MAC's next writeback can retire it.
+controls[4].pending.first = addr descs[0]
+controls[4].pending.last = addr descs[0]
+hw[0].confirmStatus = 0
+ready = 0x400
+txl_transmit_trigger()
+doAssert readyAcks == 3 and routed.len == 1
+doAssert controls[4].pending.first == addr descs[0]
+doAssert interruptsEnabled and txActiveTriggerOwner == nil
 ''')
 
 

@@ -1,6 +1,7 @@
 """Commit management duplicate state only for a current, accepted frame."""
 
 from pathlib import Path
+from textwrap import dedent, indent
 
 import pytest
 
@@ -35,10 +36,10 @@ proc rxu_cntrl_check_pn(p: pointer; tid: uint8): cint =
   replayResult
 ''', 1)
     task = (FW / "task_handlers.nim").read_text()
-    commit = ""
-    marker = "  # Commit management sequence only after MFP acceptance.\n"
-    if marker in task:
-        commit = task.split(marker, 1)[1].split("  var frameAccepted", 1)[0]
+    marker = "      # Commit only a complete indication, immediately before enqueue so a\n"
+    assert marker in task
+    commit = task.split(marker, 1)[1].split("      # Send message via ke_msg_send", 1)[0]
+    commit = indent(dedent(commit), "  ")
     code = code.replace(procedure(code, "rxu_mgt_frame_check"), r'''
 proc rxu_mgt_frame_check(param: pointer; staIdx: uint8): uint32 =
   doAssert param == (addr mpdu) and staIdx == 0

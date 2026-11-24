@@ -88,9 +88,10 @@ for vif in 0'u8..1:
             stations[station] = stations[3]
             stations[station].instNbr = vif
             stations[station].valid = 1
-            stations[station].macAddr[0] = 2
+            stations[station].macAddr = [2'u8, 0, 0, 0, 0, 0x20]
             stations[station].capabilityFlags = if pmf: 8 else: 0
             key.keyIdx = 8 + station
+            vifs[vif].macAddr = [2'u8, 0, 0, 0, 0, 0x10]
             vifs[vif].groupKeyPtr = if igtk: cast[pointer](1) else: nil
             case keyState
             of 0: discard

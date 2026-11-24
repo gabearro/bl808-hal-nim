@@ -174,7 +174,7 @@ for bit in 0 .. 31:
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-def test_vif_registration_programs_station_then_ap(tmp_path: Path, mode: str) -> None:
+def test_second_vif_preserves_shared_mac_configuration(tmp_path: Path, mode: str) -> None:
     platform = VIF_PLATFORM.replace("  MACHW_BASE = 0x24B00000'u\n", "").replace(
         "  MACHW_RX_CNTRL_REG = MACHW_BASE + 0x60\n", ""
     ).replace("  mm: tuple[rxFilterExtra, rxFilterBase: uint32]", "  mm: MmEnvView")
@@ -186,7 +186,7 @@ def test_vif_registration_programs_station_then_ap(tmp_path: Path, mode: str) ->
     code = definitions() + platform + REGISTER_MODEL + functions()
     code += procedure((FW / "rx_layer.nim").read_text(), "rxInvalidateQuiescentVif")
     code += procedure((FW / "rx_layer.nim").read_text(), "rxInvalidateVif")
-    for name in ["co_list_init", "co_list_push_front", "co_list_push_back", "co_list_pop_front"]:
+    for name in ["co_list_init", "co_list_push_front", "co_list_push_back", "co_list_pop_front", "co_list_find"]:
         code += procedure(kernel, name)
     for name in ["vif_mgmt_entry_init", "vif_mgmt_init", "vif_mgmt_register"]:
         code += procedure(vif, name)
@@ -214,4 +214,24 @@ for kind in [VIF_TYPE_STA, VIF_TYPE_AP]:
       (false, 0x24B08074'u, 0'u32),
       (true, 0x24B08074'u, 0x40001'u32)]
     doAssert env.apCount == 1 and env.staCount == 0
+  let registeredStatus = registers[MACHW_STATUS_REG]
+  let registeredFilter = mm.rxFilterBase
+  let registeredInterrupts = registers.getOrDefault(MACHW_INTC_UNMASK_REG)
+  let registeredMacHigh = registers[0x24B00014'u]
+  accesses.setLen(0)
+  var secondaryMac = mac
+  secondaryMac[5] = secondaryMac[5] xor 1'u8 # Ignore bit 8 of the MAC high word.
+  doAssert vif_mgmt_register(addr secondaryMac[0], VIF_TYPE_STA, false, addr index) == 0
+  doAssert index == 1 and vifs[1].macAddr == secondaryMac
+  doAssert env.staCount == (if kind == VIF_TYPE_STA: 2 else: 1)
+  doAssert env.apCount == (if kind == VIF_TYPE_AP: 1 else: 0)
+  doAssert statusIndex == 3 and mm.rxFilterBase == registeredFilter
+  doAssert registers[0x24B00014'u] == registeredMacHigh
+  doAssert registers[MACHW_STATUS_REG] == registeredStatus
+  doAssert registers.getOrDefault(MACHW_INTC_UNMASK_REG) == registeredInterrupts
+  let expectedFilter = registeredFilter or mm.rxFilterExtra
+  doAssert accesses == @[(false, 0x24B00010'u, registers[0x24B00010'u]),
+    (false, 0x24B00014'u, registeredMacHigh), (false, 0x24B0001C'u, 0x100'u32),
+    (true, 0x24B00060'u, expectedFilter)]
+  doAssert (expectedFilter and 16) != 0
 ''')

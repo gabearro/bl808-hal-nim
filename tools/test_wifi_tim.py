@@ -64,6 +64,7 @@ var
   allocated: seq[pointer]
   acknowledged: seq[uint8]
   frees, assertions, templateUpdates: int
+  confirmMustPrecedeFree: bool
   interrupts = true
 template txl_tim_bitmap_pool: untyped = bitmap.bytes
 proc irqSave(): uint32 =
@@ -102,6 +103,8 @@ proc ke_msg_send_basic(id: uint16; dst, src: uint8) =
   doAssert id == 0x30 and src == TASK_MM
   acknowledged.add(dst)
 proc ke_msg_free(p: pointer) =
+  if confirmMustPrecedeFree:
+    doAssert acknowledged.len > 0, "TIM request was freed before confirmation"
   let payload = keMsgPayload(cast[ptr Header](p))
   let index = allocated.find(payload)
   doAssert index >= 0, "TIM request freed twice or without ownership"
@@ -138,6 +141,7 @@ proc reset(vif = 0'u8) =
   assertions = 0
   templateUpdates = 0
   acknowledged.setLen(0)
+  confirmMustPrecedeFree = false
   for i in 0 ..< vifs.len:
     vifs[i].vifIdx = i.uint8
     vifs[i].beaconTxDesc = addr hw[i]
@@ -285,6 +289,17 @@ for vif in 0'u8 .. 1:
   doAssert timDescView().bitmapEnd == addr bitmap.bytes[0]
   doAssert vifs[vif].frame.callback == cast[pointer](mm_bcn_transmitted)
   doAssert vifs[vif].frame.callbackArg == addr vifs[vif]
+''', mode)
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "danger"])
+def test_tim_confirmation_precedes_request_free(tmp_path: Path, mode: str) -> None:
+    run(tmp_path, r'''
+reset()
+confirmMustPrecedeFree = true
+update(17, 1)
+doAssert acknowledged == @[9'u8]
+doAssert frees == 1
 ''', mode)
 
 

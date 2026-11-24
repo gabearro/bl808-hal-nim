@@ -89,7 +89,7 @@ extern void sysctrl_init(void);
 extern void intc_init(void);
 extern void ipc_emb_init(void);
 extern void bl_init(void);
-extern void bl_pm_ops_register(void);
+extern uint32_t bl_pm_ops_register(void);
 extern void ipc_emb_wait(void);
 extern void ke_evt_set(uint32_t events);
 extern void ke_evt_schedule(void);
@@ -1150,11 +1150,10 @@ static void bl808_wifi_vendor_nim_fw_trace(const char *step)
 #ifdef BL808_WIFI_VENDOR_USE_BL808_RF
 static uint8_t wifi_bl808_wl_rmem[544] __attribute__((aligned(4)));
 
-extern uint32_t crm_get_mac_freq(void);
-
 uint32_t phy_get_mac_freq(void)
 {
-    return crm_get_mac_freq();
+    /* Match the PHY paired with the pinned Wi-Fi MAC timing contract. */
+    return 40u;
 }
 
 void mpif_clk_init(void)

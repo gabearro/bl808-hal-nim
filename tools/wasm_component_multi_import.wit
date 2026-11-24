@@ -1,0 +1,7 @@
+package ox64:math@0.2.0;
+
+world multi-import {
+  import double: func(value: s32) -> s32;
+  import triple: func(value: s32) -> s32;
+  export combine: func(value: s32) -> s32;
+}

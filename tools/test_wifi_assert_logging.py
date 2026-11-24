@@ -27,6 +27,7 @@ var
   notes, logLookups: int
   words = [0x1234ABCD'u32, 0x89ABCDEF'u32, 0x01020304'u32, 0'u32,
            0xFEDCBA98'u32, 0x10203040'u32, 0xFFFFFFFF'u32, 1'u32]
+template keEnvEventField(): ptr uint32 = addr keEvtField
 {.emit: """
 #include <stdarg.h>
 #include <stdio.h>

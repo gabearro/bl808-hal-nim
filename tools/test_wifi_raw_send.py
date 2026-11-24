@@ -16,6 +16,7 @@ PLATFORM = r'''
 #include <stdint.h>
 #include <string.h>
 static unsigned raw_log_status, raw_log_count, raw_bad_log;
+static unsigned raw_oversize_log_count, raw_oversize_length, raw_oversize_limit;
 static void raw_log(const char *fmt, ...) {
     if (!fmt) { ++raw_bad_log; return; }
     va_list ap;
@@ -23,6 +24,10 @@ static void raw_log(const char *fmt, ...) {
     if (strcmp(fmt, "send complete, status is %08lX\r\n") == 0) {
         raw_log_status = (unsigned)va_arg(ap, unsigned long);
         ++raw_log_count;
+    } else if (strcmp(fmt, "[FW] send len(%d) exceed buf_len(%d)\r\n") == 0) {
+        raw_oversize_length = (unsigned)va_arg(ap, int);
+        raw_oversize_limit = (unsigned)va_arg(ap, int);
+        ++raw_oversize_log_count;
     }
     va_end(ap);
 }
@@ -32,9 +37,13 @@ var
   logStatus {.importc: "raw_log_status", nodecl.}: cuint
   logCount {.importc: "raw_log_count", nodecl.}: cuint
   badLog {.importc: "raw_bad_log", nodecl.}: cuint
+  oversizeLogCount {.importc: "raw_oversize_log_count", nodecl.}: cuint
+  oversizeLength {.importc: "raw_oversize_length", nodecl.}: cuint
+  oversizeLimit {.importc: "raw_oversize_limit", nodecl.}: cuint
 type
   Header = object
     srcId: uint8
+    paramLen: uint32
   Request = object
     header: Header
     payload: ScanuRawSendReqPayload
@@ -44,6 +53,7 @@ type
     after: uint64
   Hw = object
     frameLen, payloadStart, payloadEnd: uint32
+const ScanuRawSendReqPayloadSize = sizeof(ScanuRawSendReqPayload).uint32
 var
   descs: array[4, TxlFrameDescView]
   links: array[4, Link]
@@ -71,6 +81,8 @@ proc hostTxHwDescAt(p: pointer): ptr Hw = cast[ptr Hw](p)
 proc c_memcpy(dst, src: pointer; length: csize_t): pointer =
   copyMem(dst, src, length.int)
   dst
+proc c_malloc(length: csize_t): pointer {.importc: "malloc", header: "<stdlib.h>".}
+proc c_free(p: pointer) {.importc: "free", header: "<stdlib.h>".}
 proc txl_frame_get(length: uint32): pointer =
   doAssert length == 512 and ackCount == 1
   inc allocationCount
@@ -94,6 +106,9 @@ proc reset() =
   clockCalls = 0
   logCount = 0
   badLog = 0
+  oversizeLogCount = 0
+  oversizeLength = 0
+  oversizeLimit = 0
   allocatorFails = false
   loggerAbsent = false
   for index in 0 ..< 4:
@@ -126,8 +141,20 @@ for status in [0'u32, 1, 0x00800000, 0x81000000'u32, 0xFFFFFFFF'u32]:
 REQUEST_CHECKS = r'''
 var bytes: array[512, uint8]
 for index in 0 ..< bytes.len: bytes[index] = (index and 255).uint8
-var request = Request(header: Header(srcId: 73))
+var request = Request(header: Header(srcId: 73,
+                                     paramLen: ScanuRawSendReqPayloadSize))
 expectedSource = request.header.srcId
+
+for shortLength in [0'u32, ScanuRawSendReqPayloadSize - 1]:
+  reset()
+  let storage = c_malloc((offsetof(Request, payload).uint32 + shortLength).csize_t)
+  doAssert storage != nil
+  cast[ptr Header](storage)[] = Header(srcId: 73, paramLen: shortLength)
+  let payload = cast[pointer](cast[uint](storage) + offsetof(Request, payload).uint)
+  doAssert scanu_raw_send_req_handler(payload) == 0
+  doAssert ackCount == 1 and allocationCount == 0 and pushCount == 0
+  doAssert oversizeLogCount == 0
+  c_free(storage)
 
 for invalidLength in [0'u32, 512, 513, 0xFFFFFFFF'u32]:
   reset()
@@ -137,6 +164,9 @@ for invalidLength in [0'u32, 512, 513, 0xFFFFFFFF'u32]:
     doAssert scanu_raw_send_req_handler(addr request.payload) == 0
     doAssert ackCount == 1 and allocationCount == 0 and pushCount == 0
     doAssert not owned[0] and not owned[1] and not owned[2] and not owned[3]
+  doAssert oversizeLogCount == (if invalidLength > 511: 8'u32 else: 0'u32)
+  if invalidLength > 511:
+    doAssert oversizeLength == invalidLength and oversizeLimit == 512
 
 reset()
 request.payload = ScanuRawSendReqPayload(framePtr: nil, frameLen: 24)

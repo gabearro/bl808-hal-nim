@@ -12,7 +12,7 @@ const
   MACHW_RX_CNTRL_REG  = MACHW_BASE + 0x060'u  # RX control / filter register
   MACHW_RNG_REG        = MACHW_BASE + 0x0A0'u  # TRNG register
   MACHW_TX_POWER_REG   = MACHW_BASE + 0x0A0'u  # TX power control (shared with RNG reg)
-  MACHW_TIMLO_REG      = MACHW_BASE + 0x120'u  # MAC timestamp low
+  MACHW_TIMLO_REG*     = MACHW_BASE + 0x120'u  # MAC timestamp low
   MACHW_IDLE_TIMER_REG = MACHW_BASE + 0x13C'u  # Idle transition deadline
   MACHW_ABS_TIMER_REG  = MACHW_BASE + 0x144'u  # MM absolute timer target
   MACHW_BCN_STATUS_REG = MACHW_BASE + 0x400'u  # Beacon status

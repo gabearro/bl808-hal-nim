@@ -193,11 +193,16 @@ def test_channel_update(tmp_path: Path, mode: str, case: str) -> None:
 
 
 HANDLER_PLATFORM = r'''
+const MM_SET_EDCA_REQ = 22'u16
+const MmSetEdcaReqPayloadSize = 8'u32
+var mmEdcaRefresh: tuple[message: pointer]
 const
   KeMsgConsumed = 0.cint
   KeMsgSaved = 2.cint
   TaskIdleState = 0'u16
+  MM_IDLE = TaskIdleState
   TaskGoingIdleState = 2'u16
+  MM_GOING_TO_IDLE = TaskGoingIdleState
   MM_HOST_BYPASSED = 3'u8
   MM_REMOVE_IF_REQ = 8'u16
   MM_SET_VIF_STATE_REQ = 24'u16
@@ -234,6 +239,10 @@ proc apmPrepareVifRemoval(index: uint8): bool = true
 proc mmEnvView(): ptr typeof(mm) = addr mm
 proc ke_state_get(task: uint8): uint16 = mmState
 proc ke_state_set(task: uint8; state: uint16) = mmState = state
+var mmConfigTestEvents: uint32
+proc ke_evt_field_get(): uint32 = mmConfigTestEvents
+const KE_EVT_IDLE = 0x04000000'u32
+proc ke_evt_clear(bits: uint32) = doAssert bits == KE_EVT_IDLE
 proc regRead(address: uint): uint32 =
   doAssert address == MACHW_STATE_CNTRL_REG
   0
@@ -246,7 +255,16 @@ proc ke_msg_send_basic_reply(p: pointer; id: uint16) =
   doAssert id == MM_CHAN_CTXT_UPDATE_CFM
   inc replies
 proc ke_msg_send(p: pointer) = doAssert false
+proc ke_msg_free_payload(p: pointer) = doAssert false
 '''
+
+
+def mm_config_idle_source() -> str:
+    kernel = (FW / "kernel_mac_channel.nim").read_text()
+    return (kernel[kernel.index("type MmConfigIdlePhase"):kernel.index("proc mmEdcaForget(")]
+            + procedure(kernel, "mmConfigResumeIdle")
+            + procedure(kernel, "mmConfigResumeAbandonedIdle")
+            + procedure(kernel, "mm_hw_idle_evt"))
 
 
 HANDLER_CHECKS = r'''
@@ -257,6 +275,7 @@ for irq in [false, true]:
     mmState = 0
     replies = 0
     idleRequests = 0
+    mmConfigIdle = default(typeof(mmConfigIdle))
     if active: env.currentCtxt = addr contexts[1]
     else: env.currentCtxt = addr contexts[2]
     let original = contexts
@@ -274,7 +293,7 @@ for irq in [false, true]:
     doAssert mm_hw_config_handler(addr packet.payload) == KeMsgSaved
     doAssert mmState == TaskGoingIdleState and idleRequests == 1
     doAssert contexts == original and events.len == 0 and replies == 0
-    mmState = TaskIdleState
+    mm_hw_idle_evt()
     doAssert mm_hw_config_handler(addr packet.payload) == KeMsgConsumed
     doAssert contexts[1].channel == definition(packet.payload)
     doAssert env.currentCtxt == (if active: cast[pointer](addr contexts[1])
@@ -293,4 +312,5 @@ def test_mm_channel_update_request(tmp_path: Path, mode: str) -> None:
     tail = handler.split("  # Restore local MM state", 1)[1]
     selected = (prefix + "  case msgId.int\n  of 41:" + branch
                 + "\n  else: doAssert false\n  # Restore local MM state" + tail)
-    run_program(tmp_path, mode, source() + HANDLER_PLATFORM + selected + HANDLER_CHECKS)
+    run_program(tmp_path, mode, source() + "\nconst TASK_MM = 0'u8\n"
+                + HANDLER_PLATFORM + mm_config_idle_source() + selected + HANDLER_CHECKS)

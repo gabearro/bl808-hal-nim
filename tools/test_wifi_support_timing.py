@@ -142,7 +142,7 @@ doAssert rawCalls == 262144 + int((budget + high(uint32).uint64 - 1) div high(ui
     "sleep_stalled_clock": r'''
 maxPolls = 16
 advance = 0
-doAssert osMsleep(1) == 0
+doAssert osMsleep(1) == 1
 doAssert polls == 10
 doAssert nimWifiDbgDelayFallbacks == 10
 ''',
@@ -157,13 +157,13 @@ for enabled in [false, true]:
       pollAdvance = seconds.uint64 * 1000000'u64
       polls = 0
       maxPolls = 2
-      doAssert osSleep(seconds) == 0 and polls == 1
+      doAssert osSleep(seconds) == 1 and polls == 1
       doAssert interrupts == enabled
 ''',
     "sleep_nonpositive": r'''
 maxReads = 0
-doAssert osMsleep(0) == 0 and osMsleep(-1) == 0
-doAssert osSleep(0) == 0
+doAssert osMsleep(0) == 1 and osMsleep(-1) == 1
+doAssert osSleep(0) == 1
 doAssert reads == 0 and polls == 0 and rawCalls == 0
 ''',
     "tick_wrap": r'''

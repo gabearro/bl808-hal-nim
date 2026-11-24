@@ -10,6 +10,7 @@ from pathlib import Path
 
 BOOTHEADER_SIZE = 352
 FW_BOOTINFO_SIZE = 0x1000
+FW_BOOTINFO_FALLBACK = Path(__file__).with_name("bl808_fw_bootinfo.hex")
 PT_TABLE_SIZE = 596
 PT_MAGIC = 0x54504642
 BOOTHEADER_MAGIC_BFNP = 0x504E4642
@@ -91,6 +92,12 @@ def find_default_fw_bootinfo_template() -> Path | None:
     return None
 
 
+def read_fw_bootinfo_template(path: Path | None) -> bytearray:
+    if path is not None:
+        return bytearray(path.read_bytes())
+    return bytearray.fromhex(FW_BOOTINFO_FALLBACK.read_text(encoding="ascii"))
+
+
 def is_flash_xip_address(address: int) -> bool:
     return FLASH_XIP_BASE <= address < FLASH_XIP_BASE + FLASH_XIP_SIZE
 
@@ -128,18 +135,13 @@ def build_fw_image(
 
     if template_path is None:
         template_path = find_default_fw_bootinfo_template()
-    if template_path is None:
-        raise ValueError(
-            "raw FW image needs a BL808 bootinfo template; install bflb-iot-tool "
-            "or pass --fw-bootinfo-template"
-        )
-
-    bootinfo = bytearray(template_path.read_bytes())
-    if len(bootinfo) > FW_BOOTINFO_SIZE:
-        raise ValueError(f"FW bootinfo template is larger than 0x1000: {template_path}")
+    bootinfo = read_fw_bootinfo_template(template_path)
+    source = template_path or FW_BOOTINFO_FALLBACK
+    if not BOOTHEADER_SIZE <= len(bootinfo) <= FW_BOOTINFO_SIZE:
+        raise ValueError(f"BL808 FW bootinfo template must be 0x160..0x1000 bytes: {source}")
     magic, _, flash_cfg_magic = struct.unpack_from("<III", bootinfo)
     if magic != BOOTHEADER_MAGIC_BFNP or flash_cfg_magic != BOOTHEADER_FLASH_CFG_MAGIC:
-        raise ValueError(f"FW bootinfo template is not a BL808 BFNP header: {template_path}")
+        raise ValueError(f"FW bootinfo template is not a BL808 BFNP header: {source}")
 
     if m0_boot_entry is not None and not is_flash_xip_address(m0_boot_entry):
         load_address = m0_segment_load_address(m0_boot_entry)

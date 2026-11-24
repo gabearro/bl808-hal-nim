@@ -262,6 +262,32 @@ build/ftdi_srst_pulse 0x0403 0x6014
 Then rerun `make hw-preflight` and check target power plus the
 GPIO6/GPIO7/GPIO12/GPIO13 wiring if M0 still does not attach.
 
+On the Ox64 board, the five-pin J6 header carries four JTAG signals and
+ground; its [schematic](https://files.pine64.org/doc/ox64/PINE64_Ox64-Schematic-202221018.pdf)
+does not route board reset to J6. A successful FTDI nSRST helper message
+therefore confirms an adapter output pulse, not a board reset. On the
+November 21 bench setup, both debug adapters sit behind switchable hub
+`0-1` port 3. When the stalled Wi-Fi image left JTAG at IDCODE 0, this
+host-controlled port cycle restored M0 OpenOCD attach:
+
+```sh
+uhubctl -l 0-1 -p 3 -a cycle -d 3 -e
+.venv/bin/python tools/hw_validate.py --list
+.venv/bin/python tools/hw_validate.py --preflight --uart /dev/cu.usbmodem13401
+```
+
+Check the hub location and attached devices before using that exact port on
+another setup. The cycle also disconnects the UART and JTAG adapters, so
+rediscover their device paths afterward. It restores host access; it does
+not power-cycle the BL808 on this bench. A physical LED check found the
+Ox64 power LED remained lit when port 3 was disabled on both the USB 2
+and USB 3 companion hubs and when all downstream ports were disabled for
+eight seconds. The all-port check was repeated with the hub's PD supply
+unplugged, with the same result. `uhubctl -R` failed to reset the upstream
+VIA hub. To power-cycle the Ox64, interrupt the SLogic combo's 5 V feed
+physically or use a verified VBUS switch. Disabling all hub ports also
+interrupts the Mac's USB Ethernet adapter.
+
 ## Useful Modes
 
 Build without touching hardware:
@@ -301,10 +327,30 @@ Program persistent flash through the M0 UART flash anchor:
 Without `--uart-anchor-existing`, the harness first uses JTAG to reset-halt M0,
 load `tools/uart_flash_anchor.c` into WRAM, and start it. The anchor receives
 flash commands on UART0 and erases/programs/verifies SPI flash. By default the
-harness opens the runtime UART and pulses target nSRST before capture, which is
-the most reliable path when the FTDI reset line is available. Use
-`--uart-anchor-reset-after-flash` only when you intentionally want the anchor to
-request a chip reboot instead of relying on nSRST.
+harness opens the runtime UART and pulses the FTDI nSRST output before capture.
+For raw M0 firmware, the harness uses `BL808_FW_BOOTINFO` if set, otherwise
+the installed flasher's BL808 template if available, then the bundled Ox64
+template in `tools/bl808_fw_bootinfo.hex`. The bundled template comes from
+the Bouffalo image builder's BL808 `bootinfo.bin` and includes its flash
+configuration table. The image builder regenerates the firmware hash and
+header checksum; the boot2 binary is selected separately via `BL808_BOOT2`
+or the SDK under `build/bl808-sdk-a05`.
+
+On Ox64 J6, use `--uart-anchor-reset-after-flash` to request the anchor's
+verified M0-inclusive software reboot. This works with an existing persistent
+anchor in `--no-jtag` mode as well as with a JTAG-loaded RAM anchor.
+If `reset halt` loses the M0 JTAG target, pass `--no-jtag-reset`; the anchor
+flash and prebuilt-image paths then halt and load M0 without issuing a reset.
+That handoff can leave the outgoing application's Timer0 watchdog running.
+The RAM C anchor now disarms it on entry and refuses erase or write commands
+if the mode bits do not read back clear. It does not rely on reset-halt to
+protect the flash operation.
+The RAM and persistent anchors request an M0-inclusive software power-on reset
+with `GLB_SWRST_CFG2[0]` after acknowledging the reboot command.
+Use `--uart-anchor-reboot --no-jtag-reset --uart <port>` to load the RAM
+anchor and reboot the current flash image without writing flash. If a
+persistent anchor is already running, add `--uart-anchor-existing --no-jtag`
+to issue the reboot over UART alone.
 
 When a previously flashed anchor is already running, skip the JTAG load step:
 
@@ -320,6 +366,23 @@ When a previously flashed anchor is already running, skip the JTAG load step:
 the current image is not the anchor; in that case use JTAG or the manual UART
 boot fallback to restore the anchor.
 
+If the JTAG flash stub is still resident in RAM but `reset halt` loses the M0
+TAP, load the UART anchor without resetting the target:
+
+```sh
+.venv/bin/python tools/hw_validate.py --uart-anchor-probe \
+  --no-jtag-reset --uart /dev/cu.usbmodem13401
+.venv/bin/python tools/hw_validate.py --uart-anchor-probe \
+  --uart-anchor-existing --no-jtag --uart /dev/cu.usbmodem13401
+```
+
+The first command halts M0, loads the UART anchor into RAM, and checks its
+ping and flash ID without erasing or writing flash. The second confirms that
+the UART anchor remains reachable after OpenOCD exits. This replaces the
+running RAM stub; it is not a power cycle. The JTAG flash stub has no reboot
+command, and the UART anchor must be running before its reboot command can be
+used. Confirm the runtime UART device with `--list` after moving cables.
+
 Build a persistent anchor recovery image without touching hardware:
 
 ```sh
@@ -334,6 +397,23 @@ image can be replayed later with `--uart-anchor-flash-image` if an anchor is
 already live. The adjacent `recovery_manifest.json` records the anchor SHA256,
 the compact image SHA256, each flash segment, and the exact flash offset where
 the wrapped anchor payload appears.
+
+Replaying only a wrapped M0 image at `0x10000` requires the exclusive end of
+its allowed erase window. For an installed all-core manager with LP at
+`0xE0000`, use:
+
+```sh
+.venv/bin/python tools/hw_validate.py --uart-anchor-flash-image build/m0-fw-boot2.bin \
+  --uart-anchor-flash-image-address 0x10000 --uart-anchor-flash-image-end 0xE0000 \
+  --no-jtag-reset --uart /dev/cu.usbserial-XXXX --dry-run
+```
+
+Use the actual installed layout, not the end of the example's unwrapped ELF.
+The harness rejects an erase that reaches beyond the limit, including the
+final partial 4 KiB sector, before opening the transport. It rechecks the
+actual payload bytes before erasing. Whole-image recovery at address zero
+does not require this option. Manifest flash plans also reject segments that
+share an erase sector, even when their payload bytes are disjoint.
 
 Avoid the UART bootloader and BOOT button by loading validation images into RAM
 over JTAG:

@@ -75,6 +75,7 @@ def test_disconnect_and_query_timeout_reasons(tmp_path: Path, mode: str) -> None
     code += "proc sm_issue_sa_query_request() = discard\n"
     code += procedure(scan, "sm_deauth_handler")
     code += procedure(tasks, "sm_sa_query_timeout_ind_handler")
+    code += query.deliver_timeout_source()
     run_program(tmp_path, mode, code + r'''
 for enabled in [false, true]:
   for reason in [1'u16, 6, 256, 0xBEEF, 0xFFFF]:
@@ -83,6 +84,7 @@ for enabled in [false, true]:
     printedDiagnostics.setLen(0)
     var frame = SmDeauthFrameView(vifIdx: 1, staIdx: 4,
       sa: vifs[1].macAddr, bssid: vifs[1].bssid, reason: reason)
+    setFrameLen(addr frame, 26)
     doAssert sm_deauth_handler(addr frame) == 0
     let expected = if enabled:
       @["Deauth/Disassociate by AP, Wlan802.11 reason code = " & $reason & "\r\n"]
@@ -91,15 +93,15 @@ for enabled in [false, true]:
     doAssert events[^1] == ("disconnect", cast[pointer](addr vifs[1]), 7'u16, reason)
 
     setupSA(1, 4)
-    env.saQueryActive = 1
+    seedSaQuery(1, armed = true)
     env.saQueryRetryCount = 0
     env.saQueryReason = reason
     printedDiagnostics.setLen(0)
-    doAssert sm_sa_query_timeout_ind_handler(nil) == 0
+    doAssert deliverSaExpiry() == 0
     doAssert printedDiagnostics == expected and env.saQueryActive == 0
     doAssert events[^1] == ("disconnect", cast[pointer](addr vifs[1]), 7'u16, reason)
     let count = events.len
-    doAssert sm_sa_query_timeout_ind_handler(nil) == 0
+    doAssert deliverSaExpiry() == 0
     doAssert events.len == count and printedDiagnostics == expected
 ''')
 
@@ -107,9 +109,10 @@ for enabled in [false, true]:
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_handshake_timeout_before_transmission(tmp_path: Path, mode: str) -> None:
     scan = (FW / "scan_station_ap_me.nim").read_text()
-    code = "import strutils\n" + with_printf(supplicant.PLATFORM + supplicant.EXTENSION)
+    code = "import strutils\n" + with_printf(supplicant.SUPPLICANT_PLATFORM + supplicant.EXTENSION)
     code += "proc sm_supplicant_deauth_cfm(p: pointer; status: uint32) {.cdecl.} = discard\n"
     code += procedure(scan, "me_build_deauthenticate")
+    code += supplicant.established_path(scan)
     code += procedure(scan, "sm_handle_supplicant_result")
     run_program(tmp_path, mode, code + r'''
 for enabled in [false, true]:

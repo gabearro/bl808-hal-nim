@@ -244,6 +244,14 @@ proc loadImm64*(buf: var AsmBuffer, dst: Reg, value: uint64) =
   if hi32 != 0: buf.movk(dst, hi32, 32)
   if hi48 != 0: buf.movk(dst, hi48, 48)
 
+proc loadImm64Fixed*(buf: var AsmBuffer, dst: Reg, value: uint64) =
+  ## Relocatable address literal. Always emit four instructions so a cache
+  ## loader can replace all 64 bits without overwriting the next instruction.
+  buf.movz(dst, (value and 0xFFFF).uint32, 0)
+  buf.movk(dst, ((value shr 16) and 0xFFFF).uint32, 16)
+  buf.movk(dst, ((value shr 32) and 0xFFFF).uint32, 32)
+  buf.movk(dst, ((value shr 48) and 0xFFFF).uint32, 48)
+
 proc loadImm32*(buf: var AsmBuffer, dst: Reg, value: int32) =
   ## Load a 32-bit immediate (may be negative)
   if value >= 0 and value < 65536:

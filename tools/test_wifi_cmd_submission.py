@@ -275,7 +275,7 @@ for state in [false, true]:
 
 
 def program(case: str, mutation: str | None = None) -> str:
-    layout = (CMDS / "layout.nim").read_text()
+    layout = f'import "{WIFI / "host_table_layout.nim"}"\n' + (CMDS / "layout.nim").read_text()
     known = set(re.findall(r"^  (\w+) =", layout, re.M))
     for path in [WIFI / "ipc_host/layout.nim", WIFI / "msg_tx/layout/host_cmd.nim"]:
         added = []

@@ -7,7 +7,7 @@ import ../pgo
 import ir, regalloc, scheduler, lower, ircodegen, ircodegen_x64, ircodegen_rv64, ircodegen_rv32, codegen_rv64, memory, optimize, phicoalesce
 import inline
 import compiler  # for TableElem, CallIndirectCache
-import aotcache  # for Relocation type (persistent cache support)
+import relocation  # pure relocation type; filesystem cache stays host-only
 import cost      # resource-aware triage pass
 # Note: automatic TCO (tco.nim) runs inside the lowerer at bytecode level
 
@@ -70,6 +70,18 @@ proc ensureNoTier2TrapLowering(module: WasmModule, localFuncIdx: int,
       raise newException(ValueError,
         backend & " JIT does not support Tier 2 lowering for " & $instr.op)
 
+proc ensureRv64VerifiedSubset(module: WasmModule, localFuncIdx: int) =
+  ## The D0 bare-metal path has executed only pure add and f64 bit-pattern
+  ## functions on QEMU. Keep all imports, memory, traps, side effects, loops,
+  ## and budget-sensitive control flow in the full interpreter until each
+  ## generated path has a semantic and target-memory proof.
+  for instr in module.codes[localFuncIdx].code.code:
+    if instr.op notin {opEnd, opReturn, opLocalGet,
+                       opLocalGetLocalGet, opLocalGetLocalGetI32Add,
+                       opF64Const, opF64Add, opI64ReinterpretF64}:
+      raise newException(ValueError,
+        "RV64 native JIT requires interpreter fallback for " & $instr.op)
+
 proc ensureRv64FunctionCompatible(module: WasmModule, funcIdx: int, target: RvTarget) =
   ## RV64 codegen represents scalar values as integer bit patterns. Hardware
   ## float/vector instructions are only emitted when the selected target opts in.
@@ -99,6 +111,8 @@ proc ensureRv64FunctionCompatible(module: WasmModule, funcIdx: int, target: RvTa
       if module.globalType(instr.imm1.int) notin supportedTypes:
         raise newException(ValueError, "RV64 JIT target does not support this global type")
   module.ensureNoTier2TrapLowering(localFuncIdx, "RV64")
+  when defined(bl808d0):
+    module.ensureRv64VerifiedSubset(localFuncIdx)
 
 proc ensureRv32FunctionCompatible(module: WasmModule, funcIdx: int, target: RvTarget) =
   ## RV32 scalar codegen supports integer values, f32 when the target has F,

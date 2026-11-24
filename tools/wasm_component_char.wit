@@ -1,0 +1,5 @@
+package ox64:values@0.2.0;
+
+world char-demo {
+  export echo-char: func(value: char) -> char;
+}

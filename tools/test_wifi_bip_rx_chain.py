@@ -113,13 +113,11 @@ proc setup(data: seq[uint8]; vif, slot: int; enabled: bool) =
   observeMemory = false
 proc receive(bound: bool; captured = 7'u32): bool =
   if bound:
-    when compiles(mfpIgnoreRxMgmtFrame(addr descriptor, addr status, addr buffers[0][0],
-                                       total, addr upload, addr flags, captured)):
-      mfpIgnoreRxMgmtFrame(addr descriptor, addr status, addr buffers[0][0],
-                           total, addr upload, addr flags, captured)
-    else:
-      mfpIgnoreRxMgmtFrame(addr descriptor, addr status, addr buffers[0][0],
-                           total, addr upload, addr flags)
+    var verified = true
+    let ignored = mfpIgnoreRxMgmtFrame(addr descriptor, addr status, addr buffers[0][0],
+      total, addr upload, addr flags, captured, addr verified)
+    doAssert verified == not ignored
+    ignored
   else:
     mfp_ignore_mgmt_frame(addr status, addr flat[0], total, addr upload, addr flags)
 proc checkUnchanged(enabled: bool) =
@@ -147,7 +145,7 @@ def frame(length: int, slot: int, action: bool = False) -> bytes:
     mmie = bytes([76, 16]) + slot.to_bytes(2, "little") + (3).to_bytes(6, "little") + bytes(8)
     data += body + mmie
     mac = cmac.CMAC(algorithms.AES(bytes(range(16))))
-    mac.update(data[:2] + data[4:22] + data[24:])
+    mac.update(bytes(data[:2] + data[4:22] + data[24:]))
     data[-8:] = mac.finalize()[:8]
     assert len(data) == length
     return bytes(data)

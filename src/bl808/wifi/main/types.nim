@@ -2,6 +2,7 @@ type
   BlHw {.importc: "struct bl_hw", header: "bl_defs.h".} = object
   BlModParams {.importc: "struct bl_mod_params", header: "bl_mod_params.h".} = object
   Netif {.importc: "struct netif", header: "<lwip/netif.h>".} = object
+    hwaddr: array[6, uint8]
   MacAddr {.importc: "struct mac_addr", header: "lmac_msg.h".} = object
   MacSsid {.importc: "struct mac_ssid", header: "lmac_msg.h".} = object
   KeTxFc {.importc: "struct ke_tx_fc", header: "lmac_msg.h".} = object

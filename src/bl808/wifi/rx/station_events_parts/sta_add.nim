@@ -1,3 +1,20 @@
+proc checkActivationPeer(hw: pointer; station: uint8; token: uint32; retire: bool): bool =
+  let saved = callbackIrqSave()
+  defer: callbackIrqRestore(saved)
+  if hw == nil or station >= NxRemoteStaMax or token != stationRxSerial: return false
+  let vif = vifAt(hw, BlVifSta)
+  let sta = staAt(hw, station.uint)
+  if loadU8(vif, BlVifLinksNumOff) != 1 or loadU8(vif, BlVifFixedStaIdxOff) != station or
+      loadU8(sta, BlStaIsUsedOff) == 0 or loadU8(sta, BlStaStaIdxOff) != station: return false
+  if not retire: return true
+  inc stationRxSerial
+  storeU8(vif, BlVifLinksNumOff, 0)
+  storeU8(vif, BlVifFcChanOff, 0)
+  storeU8(vif, BlVifStaPsOff, PsModeOff)
+  storeU8(sta, BlStaIsUsedOff, 0)
+  bl_tx_cntrl_link_down(cast[ptr BlSta](sta))
+  true
+
 proc blRxSmStaAddInd(blHw, cmd, msg: pointer): cint {.cdecl.} =
   let saved = callbackIrqSave()
   defer: callbackIrqRestore(saved)
@@ -5,7 +22,9 @@ proc blRxSmStaAddInd(blHw, cmd, msg: pointer): cint {.cdecl.} =
   let ind = msgParam(msg)
   let vif = vifAt(blHw, BlVifSta)
   let station = loadU8(ind, SmStaAddApIdxOff)
-  if station >= NxRemoteStaStoreMax: return -1
+  if station >= NxRemoteStaMax: return -1
+  let firmwareVif = loadU8(vif, BlVifVifIdxOff)
+  if not firmware.smActivationAcceptPeer(ind, firmwareVif, station): return -1
   inc nimFwDbgRxSmStaAdd
   inc nimFwDbgRxSmSeq
   nimFwDbgRxSmStaAddSeq = nimFwDbgRxSmSeq
@@ -37,5 +56,8 @@ proc blRxSmStaAddInd(blHw, cmd, msg: pointer): cint {.cdecl.} =
     (loadU8(sta, BlStaStaIdxOff).uint32 shl 8) or
     (loadU8(sta, BlStaVifIdxOff).uint32 shl 16) or
     (loadU8(sta, BlStaQosOff).uint32 shl 24)
+  firmware.smActivationTrackPeer(ind, blHw, transition.serial, checkActivationPeer)
   bl_tx_cntrl_link_up(cast[ptr BlSta](sta))
+  if stationRxTransitionCurrent(transition):
+    discard firmware.smActivationAcceptPeer(ind, firmwareVif, station, linked = true)
   0

@@ -36,7 +36,12 @@ proc ipcHostTxCfmHandler(env: pointer; scope: ptr IpcHostDispatchScope) =
        context: loadPtr(env, EnvPthisOff))
     if scope.cancelled: return
     if completion.callback != nil:
-      discard completion.callback(completion.context, completion.hostId)
+      when defined(bl808WifiDiagDhcpTxAttempts) or defined(bl808WifiDiagTcpPath):
+        scope.txCompletion = completion.descriptor
+        try: discard completion.callback(completion.context, completion.hostId)
+        finally: scope.txCompletion = nil
+      else:
+        discard completion.callback(completion.context, completion.hostId)
     block:
       let saved = ipcHostIrqSave()
       defer: ipcHostIrqRestore(saved)
@@ -44,6 +49,7 @@ proc ipcHostTxCfmHandler(env: pointer; scope: ptr IpcHostDispatchScope) =
       inc nimFwDbgIpcHostTxCfmDrained
       storePtr(completion.descriptor, TxdescHostHostIdOff, nil)
       listPushBack(loadPtr(env, EnvListFreeOff), completion.descriptor)
+      inc ipcHostTxResources.releases
 
 proc ipcHostDbgHandler(env: pointer; scope: ptr IpcHostDispatchScope) =
   let debugHostSlotIndex = loadU8(env, EnvDbgIdxOff).uint

@@ -12,6 +12,10 @@ from test_wifi_message_allocation import run_program
 PLATFORM = r'''
 const MAX_VIFS = 2
 type
+  ChanEnvView = array[33, uint32]
+  ChannelRegion = object
+    env: ChanEnvView
+    meControlReply: uint32
   Vif = object
     vifIdx, staIdx: uint8
     rssiLast, rssiThreshold: int8
@@ -20,9 +24,14 @@ type
 var
   vifs: array[MAX_VIFS, Vif]
   rxVifEpochs: array[MAX_VIFS, uint32]
+  mmBeaconProbeEpochs, mmTrafficProbeEpochs: array[MAX_VIFS, uint32]
   stationEpochs: array[7, uint32]
-  clock, reportTime, nimFwDbgConnLossInd: uint32
-  allocations: array[8, array[16, uint8]]
+  clock, nimFwDbgConnLossInd: uint32
+  channelRegion: ChannelRegion
+  allocations: array[8, array[128, uint8]]
+  headers: array[8, KeMsgHdr]
+  txResetEpoch: uint32
+  mmConnLossTags: ptr MmConnLossTag
   ids: array[8, uint16]
   attempts, freed: int
   reports: seq[Report]
@@ -37,7 +46,8 @@ proc vifChannelAt(p: pointer): ptr Vif = cast[ptr Vif](p)
 proc vifChannelForIdx(i: uint8): ptr Vif = addr vifs[i]
 proc staDeleteEpoch(i: uint8): uint32 =
   if i < stationEpochs.len.uint8: stationEpochs[i] else: 0
-proc chanRssiLastReportTime(): ptr uint32 = addr reportTime
+template chan_env: untyped = channelRegion.env
+template reportTime: untyped = mmRssiReportUs
 proc macTimeNow(): uint32 = clock
 proc invoke(hook: var proc()) =
   if hook != nil:
@@ -50,12 +60,18 @@ proc ke_msg_alloc(id: uint16; dst, src: uint8; length: uint32): pointer =
   doAssert slot < allocations.len
   doAssert src == 0
   doAssert (id == 0x43 and dst == 9 and length == 3) or
-           (id == 0x31 and dst == 4 and length == 4)
+           (id == 0x31 and dst == 4 and
+            length == MmConnectionLossIndPayloadSize + KeMsgTailSlack +
+              alignof(MmConnLossTag).uint32 - 1 + sizeof(MmConnLossTag).uint32)
   ids[slot] = id
   allocations[slot] = default(typeof(allocations[slot]))
   invoke(onAllocate)
   if failAllocation: return nil
   addr allocations[slot][0]
+proc keMsgHdrFromPayload(p: pointer): ptr KeMsgHdr =
+  for index in 0 ..< attempts:
+    if p == addr allocations[index][0]: return addr headers[index]
+  doAssert false, "unknown message payload"
 proc ke_msg_free_payload(p: pointer) =
   doAssert p != nil
   inc freed
@@ -86,6 +102,8 @@ proc setup(old = -50'i8; threshold = -60'i8; hysteresis = 7'u8; state = 0'u8) =
   failAllocation = false
   clock = 100
   reportTime = 0
+  txResetEpoch = 0
+  mmConnLossTags = nil
   enabled = true
 proc recycle() =
   inc rxVifEpochs[0]
@@ -96,24 +114,49 @@ proc recycle() =
 
 def source() -> str:
     layout = (FW / "layout_types.nim").read_text()
+    storage = (FW / "global_state/storage.nim").read_text()
     declarations = []
-    for name in ("MmRssiStatusIndPayload", "MmConnectionLossIndPayload", "MmVifIdentity"):
+    for name in ("MmRssiStatusIndPayload", "MmConnectionLossIndPayload",
+                 "MmVifIdentity", "MmConnLossTag"):
         match = re.search(rf"(?m)^  {name}(?: \{{\.packed\.\}})? = object\n(?:    [^\n]*\n)+", layout)
         assert match, name
         declarations.append(match.group(0))
-    code = "type\n" + "".join(declarations) + r'''
+    accessor = re.search(r"(?m)^template mmRssiLastReportTime\(\): ptr uint32 =\n(?:  [^\n]+\n)+", layout)
+    clock = re.search(r"(?m)^  mmRssiReportUs \{\.wifiCtrl\.\}: uint32[^\n]*\n", storage)
+    assert accessor and clock
+    code = "{.pragma: wifiCtrl.}\nvar\n" + clock[0] + accessor[0]
+    code += "type\n" + "".join(declarations) + r'''
+type KeMsgHdr = object
+  paramLen: uint32
 const
   MmRssiStatusIndPayloadSize = sizeof(MmRssiStatusIndPayload).uint32
   MmConnectionLossIndPayloadSize = sizeof(MmConnectionLossIndPayload).uint32
+  KeMsgTailSlack = 4'u32
   MM_CONNECTION_LOSS_IND = 0x31'u16
   TASK_SM = 4'u8
   TASK_MM = 0'u8
 ''' + PLATFORM
     kernel = (FW / "kernel_mac_channel.nim").read_text()
-    for name in ("mmCaptureVif", "mmVifCurrent", "mm_send_connection_loss_ind", "mm_check_rssi"):
+    code += procedure(kernel, "mmConnLossTagAt")
+    for name in ("mmCaptureVif", "mmVifCurrent", "mmConnLossProbeEpoch", "mmPublishConnectionLoss",
+                 "mm_send_connection_loss_ind", "mm_check_rssi"):
         if re.search(rf"(?m)^proc {name}\*?\(", kernel):
             code += procedure(kernel, name)
     return code
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_rssi_report_does_not_overwrite_adjacent_me_reply(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+setup(0, 0)
+channelRegion.meControlReply = 0x501204F4'u32
+clock = 0x01896578'u32
+let afterChannel = cast[uint](addr chan_env[0]) + sizeof(ChanEnvView).uint
+doAssert afterChannel == cast[uint](addr channelRegion.meControlReply)
+mm_check_rssi(addr vifs[0], -70)
+doAssert channelRegion.meControlReply == 0x501204F4'u32
+doAssert reportTime == clock and reports.len == 1
+''')
 
 
 def transition(old: int, new: int, threshold: int, hysteresis: int, state: int) -> int:
@@ -257,4 +300,26 @@ for loss in [false, true]:
     else: mm_check_rssi(addr vifs[0], -75)
     doAssert reports.len == 0 and freed == 1
     doAssert vifs[0].rssiState == 0 and enabled
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_reset_during_report_callback_cancels_old_state(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+setup()
+onAllocate = proc() = inc txResetEpoch
+mm_check_rssi(addr vifs[0], -75)
+doAssert reports.len == 0 and freed == 1 and vifs[0].rssiState == 0
+doAssert enabled
+
+setup(0)
+onSend = proc() = inc txResetEpoch
+mm_check_rssi(addr vifs[0], -75)
+doAssert reports.len == 1 and reports[0].state == 0
+doAssert vifs[0].rssiState == 0 and enabled
+
+setup()
+onAllocate = proc() = inc txResetEpoch
+mm_send_connection_loss_ind(addr vifs[0], 22)
+doAssert reports.len == 0 and freed == 1 and enabled
 ''')

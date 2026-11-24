@@ -119,11 +119,11 @@ for preamble in 0'u32 .. 1:
     "completion": r'''
 for duration in [0'u32, 1, 320, 500, 65535]:
   setup(0x43FF0000'u32 or duration)
-  pollValues = @[0x80000000'u32, 0x80040000'u32, settled]
+  pollValues = @[0x80000000'u32, 0x80040000'u32, 0x4000AAA1'u32, 0x4000AAA2'u32]
   var descriptor = sample(0)
   doAssert hal_machw_rx_duration(addr descriptor, 24) == duration,
-    "duration query accepted the wrong ready bit or rejected a valid zero"
-  doAssert reads >= 4 and timeouts == 0 and recoveries == 0 and errors == 0
+    "duration query did not read the result after rechecking READY"
+  doAssert reads == 5 and timeouts == 0 and recoveries == 0 and errors == 0
 ''',
     "failure_paths": r'''
 setup(0x0004007B)

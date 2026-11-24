@@ -150,6 +150,7 @@ for nss in [0'u8, 1'u8]:
   sta.rcStats = addr statsStore[0]
   sta.txPolicyUpdateFlags[0] = StaTxPolicyUpdateRateControl
   rcU16(sta.rcStats, 10) = 0x1000
+  rcU16(sta.rcStats, RCS_N_RATES) = 1
   rcU8(sta.rcStats, RCS_FLAGS) = 0x40
   irqActive = false
   irqCalls = 0

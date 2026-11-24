@@ -41,6 +41,9 @@ type
     scanBand, bssidFilterEnabled: uint8
     extraIePtr: pointer
     extraIeLen: uint16
+  SmEnvView = object
+    vendorIePtr: pointer
+    vendorIeLen: uint16
 var
   scan_probe_req_ie, hostIes, extraIes: IeBuffer
   mac_id2rate: array[12, uint8]
@@ -48,6 +51,7 @@ var
   request: ScanuStartReqPayload
   child: ScanStartReqPayload
   scanu_env: ScanEnv
+  sm: SmEnvView
   allocations, frees, sends, confirmations: int
   lastStatus: uint8
   allocatorFails: bool
@@ -70,6 +74,8 @@ proc activeScanuReq(): ptr ScanuStartReqPayload = cast[ptr ScanuStartReqPayload]
 proc macIeAt(p: uint): ptr MacIeView = cast[ptr MacIeView](p)
 proc totalLen(ie: ptr MacIeView): uint = 2 + ie.len.uint
 proc meEnvView(): ptr MeEnvView = addr me
+proc smEnvView(): ptr SmEnvView = addr sm
+proc mm_set_wpa_rsn_ie(vifIdx: uint8; ie: pointer; ieLen: uint8) = discard
 proc meHtCapsPtr(p: ptr MeEnvView): pointer = addr p.caps[0]
 proc co_pack8p(dst, src: pointer; length: uint32) =
   let address = cast[uint](dst)
@@ -82,7 +88,7 @@ proc c_memcpy(dst, src: pointer; length: csize_t): pointer =
   doAssert length <= 200
   copyMem(dst, src, length.int)
   dst
-proc ke_msg_alloc(id: uint16; dest, source: uint8; length: uint32): pointer =
+proc ke_msg_try_alloc(id: uint16; dest, source: uint8; length: uint32): pointer =
   doAssert id == SCAN_START_REQ and dest == TASK_SCAN and source == TASK_SCANU
   doAssert length == ScanStartReqPayloadSize
   inc allocations
@@ -103,7 +109,9 @@ proc ke_msg_send(p: pointer) =
 proc scanu_confirm(status: uint8) =
   inc confirmations
   lastStatus = status
-proc finishAdvancedScanuScanBand() = scanu_confirm(0)
+proc finishAdvancedScanuScanBand(): bool =
+  scanu_confirm(0)
+  false
 """
 
 CHECKS = r"""
@@ -149,8 +157,8 @@ proc setHost(bytes: openArray[uint8]) =
   request.probeReqIeLen = bytes.len.uint16
 proc setExtra(bytes: openArray[uint8]) =
   for i, value in bytes: extraIes.ieData[i] = value
-  scanu_env.extraIePtr = addr extraIes.ieData[0]
-  scanu_env.extraIeLen = bytes.len.uint16
+  doAssert bl_wifi_set_appie_internal(1, 1, addr extraIes.ieData[0],
+    bytes.len.uint16, true) == 0
 proc expectedPrefix(noCck, ht: bool): seq[uint8] =
   result = @[1'u8, 8]
   let start = if noCck: 4 else: 0
@@ -174,6 +182,29 @@ for noCck in [false, true]:
     doAssert child.bssid == request.bssid and child.localMac == request.localMac
     doAssert child.ssidFilter == request.ssidFilter
     guards()
+
+for invalid in [(0'u8, 2413'u16), (0'u8, 2483'u16),
+                (1'u8, 5006'u16), (1'u8, 5826'u16),
+                (2'u8, 2412'u16)]:
+  reset()
+  request.channelList[0] = ScanChannelEntry(band: invalid[0], prim20Freq: invalid[1])
+  let before = scan_probe_req_ie.ieData
+  scanu_scan_next()
+  doAssert allocations == 0 and sends == 0 and frees == 0
+  doAssert confirmations == 1 and lastStatus == SCAN_STATUS_BAD_PARAM
+  doAssert scan_probe_req_ie.ieData == before
+  guards()
+reset()
+request.channelList[0].prim20Freq = 2484
+scanu_scan_next()
+doAssert sends == 1 and child.channelList[0].prim20Freq == 2484
+guards()
+reset()
+request.channelCount = 0
+scanu_scan_next()
+doAssert allocations == 0 and sends == 0 and confirmations == 1
+doAssert lastStatus == 0
+guards()
 
 # Request/Operating-Classes IEs precede HT; all other supplied IEs follow it.
 reset()
@@ -206,7 +237,17 @@ for total in [199, 200, 201]:
     doAssert scan_probe_req_ie.ieData == before
   guards()
 
-for which in 0 .. 8:
+# The vendor drops oversized supplied IEs but still sends the generated IEs.
+for oversized in [201'u16, high(uint16)]:
+  reset()
+  setHost([221'u8, 1, 0xA5])
+  request.probeReqIeLen = oversized
+  scanu_scan_next()
+  doAssert sends == 1 and frees == 0 and confirmations == 0
+  doAssert sentBytes == expectedPrefix(false, true)
+  guards()
+
+for which in 0 .. 6:
   reset()
   case which
   of 0: setHost([10'u8])
@@ -215,15 +256,20 @@ for which in 0 .. 8:
   of 3: setHost([221'u8, 0, 59])
   of 4: setExtra([59'u8])
   of 5: setExtra([221'u8, 255])
-  of 6: request.probeReqIeLen = 201
-  of 7: request.probeReqIeLen = 1 # nonzero size, nil pointer
-  else: scanu_env.extraIeLen = 1
+  else: request.probeReqIeLen = 1 # nonzero size, nil pointer
   let before = scan_probe_req_ie.ieData
   scanu_scan_next()
   doAssert sends == 0 and allocations == 1 and frees == 1
   doAssert confirmations == 1 and lastStatus == 4
   doAssert child.ieBodyLen == 0 and scan_probe_req_ie.ieData == before
   guards()
+
+reset()
+scanu_env.extraIeLen = 1 # stale length without an extra-IE buffer
+scanu_scan_next()
+doAssert sends == 1 and frees == 0 and confirmations == 0
+doAssert sentBytes == expectedPrefix(false, true)
+guards()
 
 # The writer's capacity and sticky failure are independent of the scan caller.
 for length in [0'u32, 1, 199, 200, 201, 65535, 0xFFFFFFFF'u32]:
@@ -277,13 +323,15 @@ def test_scan_ie_builder(tmp_path: Path, mode: str, mutation: str | None) -> Non
     writer_type = source.split("type ProbeIeWriter = object", 1)[1].split("\nproc ", 1)[0]
     functions = "type ProbeIeWriter = object" + writer_type + "\n"
     functions += "".join(procedure(source, name) for name in [
-        "scanuRequestCurrent", "reserveProbeIeBytes", "cursor", "appendByte", "appendIeHeader", "skip", "appendDsParamPlaceholder",
+        "scanuRequestCurrent", "scanChannelValid", "reserveProbeIeBytes", "cursor", "appendByte", "appendIeHeader", "skip", "appendDsParamPlaceholder",
         "appendBytes", "probeIesValid", "appendHtCapabilities", "macId2RatePtr", "appendSupportedRates",
         "finishScanStartReq", "sendScanStartReq", "initScanStartReq", "appendScanBandChannel",
         "copyScanBandChannels", "firstScanBandChannel", "clampedProbeReqIeLen", "supportedRateStart",
         "appendScanSupportedRates", "appendScanHtCapabilities", "allocScanStartReq", "allocInitializedScanStartReq",
         "copyScanSsidFilterIfPresent", "scanu_scan_next",
     ])
+    functions += procedure((FW / "platform_bl.nim").read_text(),
+                           "bl_wifi_set_appie_internal")
     if mutation == "capacity":
         functions = functions.replace("count > w.bytes.len.uint32 - w.len.uint32", "false")
     elif mutation == "exact_fit":
@@ -306,7 +354,9 @@ def test_scan_ie_builder(tmp_path: Path, mode: str, mutation: str | None) -> Non
     for name in ["ScanChannelEntry", "ScanSsidSlotView", "ScanStartReqPayload", "ScanuStartReqPayload", "MacIeView"]:
         types += "  " + name + layout.split("  " + name, 1)[1].split("\n\n", 1)[0] + "\n"
     program = tmp_path / "scan_ies.nim"
-    program.write_text(types + PLATFORM + functions + CHECKS)
+    from test_wifi_scan_start_confirmation import exchange_source
+
+    program.write_text(types + PLATFORM + exchange_source() + functions + CHECKS)
     flags = {"checked": [], "release": ["-d:release", "--assertions:on"],
              "asan": ["--cc:clang", "--passC:-fsanitize=address", "--passL:-fsanitize=address"]}
     result = subprocess.run([nim, "c", "-r", "--skipParentCfg:on", "--skipProjCfg:on", "--skipUserCfg:on",

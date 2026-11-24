@@ -12,7 +12,9 @@ from test_wifi_rf_rxcal import rxcal_source
 
 def rccal_source(names: tuple[str, ...]) -> str:
     rf = RF.read_text()
-    code = rxcal_source(())
+    # The RX fixture's wlCfgU32 extraction also includes the adjacent LO tables.
+    lo_count = next(line.strip() for line in rf.splitlines() if line.startswith("  RfLoChannelCount = "))
+    code = f"const {lo_count}\n" + rxcal_source(())
     constants = (
         "RfRccalCapabilityMask", "RfRccalModeMask", "RfRccalStartMode",
         "RfRccalDoneMode", "RfRccalFailMode", "RfRccalCodeMask",
@@ -218,6 +220,11 @@ for upper in 0'u32 .. 63'u32:
     doAssert calibration == expected and registerStorage == rfExpected,
       "RCCAL saved result packing or physical field ownership differs"
     doAssert events == trace, "RCCAL publication order differs from vendor"
+    # +0x4fe..+0x596: one RF84 snapshot, four saved-word RMWs (the
+    # last two read the source field separately), then two replay RMWs.
+    let lanes = cast[uint](addr rf70.rccalReplay84)
+    let word = cast[uint](addr calibration[2])
+    doAssert mmioReads == @[lanes, word, word, word, word, word, word, word, lanes, word, lanes]
 ''')
 
 
@@ -413,9 +420,11 @@ def calibration_lifecycle_source() -> str:
     code = rccal_source(()).replace("proc rfPriApplyWb03RccalSeed() = inc workarounds\n", "")
     code += object_type(rf, "RfDfeInitBlock")
     code += r'''
+const wifiOnly = 1'u32
 var
   dfe: RfDfeInitBlock
   measuredWord, bl808RfColdInit, bl808RfMode: uint32
+  bl808RfPriXtal40mFlag: uint8
   calibrationReplays: int
   wlCalGlobal: pointer
 proc rfDfeInitRegs(): ptr RfDfeInitBlock = addr dfe
@@ -427,6 +436,7 @@ proc rfPriEfuseInit() = discard
 proc rf_pri_xtalfreq() = discard
 proc writeRfPriFixedValueRegs() = discard
 proc rfPriWifiPllConfig() = discard
+proc prepareBl808RfColdRegisters() = discard
 proc rfPriApplyWb03RfcEntryBaseline() = discard
 proc runRfPriLoFcal() = discard
 proc runRfPriLoAcal() = discard

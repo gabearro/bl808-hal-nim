@@ -9,9 +9,30 @@ import textwrap
 import pytest
 
 from test_wifi_disconnect_tx import procedure
+from test_wifi_message_allocation import run_program
 
 ROOT = Path(__file__).resolve().parents[1]
 FW = ROOT / "src/bl808/wifi/fw"
+
+
+def test_sdk_wpa_parser_cipher_offsets() -> None:
+    clang = shutil.which("clang")
+    if clang is None:
+        pytest.skip("clang is required")
+    source = r'''
+#include "build/bl_iot_sdk_b773b3f/components/network/wifi/include/supplicant_api.h"
+_Static_assert(offsetof(wifi_wpa_ie_t, pairwise_cipher) == 4, "pairwise cipher ABI");
+_Static_assert(offsetof(wifi_wpa_ie_t, group_cipher) == 8, "group cipher ABI");
+_Static_assert(offsetof(wifi_connect_parm_t, pairwise_cipher) == 56, "connect pairwise ABI");
+_Static_assert(offsetof(wifi_connect_parm_t, group_cipher) == 57, "connect group ABI");
+_Static_assert(offsetof(wifi_connect_parm_t, pmf_required) == 123, "PMF required ABI");
+_Static_assert(offsetof(wifi_connect_parm_t, mgmt_group_cipher) == 124, "mgmt group ABI");
+'''
+    result = subprocess.run([clang, "-std=c11", "-fshort-enums", "-fsyntax-only", "-x", "c", "-"],
+                            input=source, cwd=ROOT, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    assert result.returncode == 0, result.stdout
+
 
 PLATFORM = r"""
 const MAX_VIFS = 2
@@ -35,11 +56,15 @@ type
     groupCipher, pairwiseCipher, keyMgmtMaskLow, scanNotifyVendorByte: uint8
   WpaParsedInfoBuffer = object
     view: WpaParsedInfoView
+  WifiRsnAkmInfo = object
+    bipCmac128: bool
   WpaScanSecurityNotifyView = object
     vifIdx: uint8
     macAddr, bssid: array[6, uint8]
     cipher, scanNotifyVendorByte: uint8
-    keyMgmt, cipherPair: uint16
+    keyMgmt: uint16
+    pairwiseCipher, groupCipher: uint8
+    pmfRequired, mgmtGroupCipher: uint8
   MacIeView = object
     id, len: uint8
   Callbacks = object
@@ -62,10 +87,15 @@ var
   protocol: string
   parseFails: bool
   selectedAuth: uint32
+  parsedCaps: uint16
+  parsedMgmtSupported: bool
+  preferencePmfCapable, preferencePmfRequired: bool
   parserCalls, notifications, finalized: int
+  notifiedPairwise, notifiedGroup, notifiedPmfRequired, notifiedMgmtGroup: uint8
   irq = true
-  informationElement: array[8, uint8]
-  assocSecIeStore: array[MAX_VIFS, array[128, uint8]]
+  informationElement: array[257, uint8]
+  assocSecIeStore: array[MAX_VIFS, array[255, uint8]]
+  parserLength: uint8
   nimFwDbgScanKeyMgmt, nimFwDbgScanSmF, nimFwDbgScanCaps, nimFwDbgScanAT: uint32
 proc irqSave(): uint32 =
   result = if irq: 8'u32 else: 0'u32
@@ -88,14 +118,25 @@ proc find_wpa_rsn_ie(data: pointer; length: uint32; wpa, rsn: ptr pointer) =
   wpa[] = if protocol == "wpa": addr informationElement[0] else: nil
   rsn[] = if protocol == "rsn": addr informationElement[0] else: nil
 proc parseSecurity(data: pointer; length: uint8; output: pointer): pointer {.cdecl.} =
-  doAssert data == (addr informationElement[0]) and length == 6
+  doAssert data == (addr informationElement[0]) and length == parserLength
   inc parserCalls
   cast[ptr WpaParsedInfoView](output)[] = WpaParsedInfoView(keyMgmtLe: 2,
-    groupCipher: 3, pairwiseCipher: 3, keyMgmtMaskLow: 2)
+    caps: parsedCaps, groupCipher: 3, pairwiseCipher: 3, keyMgmtMaskLow: 2)
   if parseFails: cast[pointer](1) else: nil
-proc notifySecurity(data: pointer) {.cdecl.} = inc notifications
+proc wifiRsnAkmInfoFromIe(data: pointer; length: uint32): WifiRsnAkmInfo =
+  WifiRsnAkmInfo(bipCmac128: parsedMgmtSupported)
+proc notifySecurity(data: pointer) {.cdecl.} =
+  inc notifications
+  let notify = cast[ptr WpaScanSecurityNotifyView](data)
+  notifiedPairwise = notify.pairwiseCipher
+  notifiedGroup = notify.groupCipher
+  notifiedPmfRequired = notify.pmfRequired
+  notifiedMgmtGroup = notify.mgmtGroupCipher
 proc wpaCallbacks(): ptr Callbacks = addr callbacks
-proc wifiPreferredKeyMgmtFromMask(mask: uint32; pmf: bool): uint32 = selectedAuth
+proc wifiPreferredKeyMgmtFromMask(mask: uint32; pmf, required: bool): uint32 =
+  preferencePmfCapable = pmf
+  preferencePmfRequired = required
+  selectedAuth
 proc nimFwTrace2U32(tag: string; a, b: uint32) = discard
 proc me_bw_check(p: pointer) = inc finalized
 proc me_extract_power_constraint(data: pointer; length: uint32; output: pointer) = discard
@@ -104,7 +145,7 @@ proc setup(keyLength: int; privacy: bool) =
   connection = default(ConnectInfoCredentialOverlay)
   connection.base.authType = 7
   connection.base.authRetryGate = 5
-  connection.base.channelDuration = 0x12345678
+  connection.base.channelDuration = 0x12345278
   for i in 0 ..< min(keyLength, 64): connection.keyString[i] = 65
   security = default(VifSecurityOverlay)
   security.cipher = 9
@@ -117,11 +158,21 @@ proc setup(keyLength: int; privacy: bool) =
   protocol = "legacy"
   parseFails = false
   selectedAuth = 0
+  parsedCaps = 0
+  parsedMgmtSupported = true
+  preferencePmfCapable = false
+  preferencePmfRequired = false
   parserCalls = 0
   notifications = 0
   finalized = 0
+  notifiedPairwise = 0
+  notifiedGroup = 0
+  notifiedPmfRequired = 0
+  notifiedMgmtGroup = 0
   irq = true
-  informationElement = [48'u8, 4, 1, 2, 3, 4, 0, 0]
+  informationElement = default(typeof(informationElement))
+  informationElement[0..5] = [48'u8, 4, 1, 2, 3, 4]
+  parserLength = 6
   callbacks = Callbacks(parseSecurityIe: cast[pointer](parseSecurity),
     scanSecurityNotify: cast[pointer](notifySecurity))
   wpa_cbs = addr callbacks
@@ -142,6 +193,12 @@ proc exercise() =
   let ieLen = informationElement.len.uint32
   let directedOwner = (connection: connectInfoPtr)
   template requireFrameOwner() = discard
+"""
+
+FORWARD_STUB = r"""
+var frame: pointer
+proc ke_msg_forward_and_change_id(p: pointer; id: uint16; dst, src: uint8) =
+  doAssert p == frame and id == 0x804'u16 and dst == 9 and src == 2
 """
 
 CHECKS = r"""
@@ -211,8 +268,10 @@ for family in ["wpa", "rsn"]:
       protocol = family
       parseFails = fail
       selectedAuth = auth
+      if auth == 1024: parsedCaps = 0x80
       exercise()
-      let accepted = not fail and auth != 0
+      let accepted = not fail and auth != 0 and
+        (auth != WifiKeyMgmtSae or family == "rsn")
       doAssert parserCalls == 1
       doAssert notifications == accepted.int and finalized == accepted.int
       doAssert scanu_env.directedFound == accepted.uint8
@@ -229,6 +288,91 @@ for family in ["wpa", "rsn"]:
     doAssert parserCalls == 0 and finalized == 0 and notifications == 0
     doAssert scanu_env.directedFound == 0
 
+# A new BSS must not inherit security fields or PMF policy from the previous one.
+setup(8, true)
+protocol = "rsn"
+selectedAuth = 2
+security.groupCipher = 4
+security.pairwiseCipher = 4
+security.keyMgmtMaskLow = 6
+security.keyMgmt = 1024
+security.pmfCapable = 1
+security.pmfRequired = 1
+exercise()
+doAssert scanu_env.directedFound == 1
+doAssert security.groupCipher == 3 and security.pairwiseCipher == 3
+doAssert security.keyMgmtMaskLow == 2 and security.keyMgmt == 2
+doAssert security.pmfCapable == 0 and security.pmfRequired == 0
+
+for caps in [0'u16, 0x40'u16]:
+  setup(8, true)
+  protocol = "rsn"
+  selectedAuth = 1024
+  parsedCaps = caps
+  exercise()
+  doAssert scanu_env.directedFound == 0 and finalized == 0
+  doAssert security.keyMgmt == 0 and security.pmfCapable == 0
+
+for family in ["wpa", "rsn"]:
+  for claimed in [254'u8, 255'u8]:
+    setup(8, true)
+    protocol = family
+    selectedAuth = 2
+    informationElement[1] = claimed
+    exercise()
+    doAssert parserCalls == 0 and scanu_env.directedFound == 0
+    doAssert finalized == 0 and notifications == 0
+
+setup(8, true)
+protocol = "rsn"
+selectedAuth = 1024
+parsedCaps = 0x80
+connection.base.channelDuration = connection.base.channelDuration and not 0x600'u32
+exercise()
+doAssert scanu_env.directedFound == 0 and finalized == 0
+doAssert security.keyMgmt == 0 and security.pmfCapable == 0
+
+setup(8, true)
+protocol = "rsn"
+selectedAuth = 2
+parsedCaps = 0xC0
+connection.base.channelDuration = connection.base.channelDuration and not 0x600'u32
+exercise()
+doAssert scanu_env.directedFound == 0 and finalized == 0
+doAssert security.keyMgmt == 0 and security.pmfRequired == 0
+
+setup(8, true)
+protocol = "rsn"
+selectedAuth = 2
+parsedCaps = 0x40
+exercise()
+doAssert scanu_env.directedFound == 0 and finalized == 0
+doAssert security.keyMgmt == 0 and security.pmfRequired == 0
+
+setup(8, true)
+protocol = "rsn"
+selectedAuth = 2
+connection.base.channelDuration = connection.base.channelDuration or 0x400'u32
+exercise()
+doAssert scanu_env.directedFound == 0 and finalized == 0
+doAssert security.keyMgmt == 0 and security.pmfRequired == 0
+doAssert not preferencePmfCapable and preferencePmfRequired
+
+setup(8, true)
+protocol = "rsn"
+selectedAuth = 2
+exercise()
+doAssert scanu_env.directedFound == 1 and not preferencePmfCapable
+doAssert not preferencePmfRequired
+
+setup(8, true)
+protocol = "rsn"
+selectedAuth = 1024
+parsedCaps = 0x80
+exercise()
+doAssert scanu_env.directedFound == 1 and preferencePmfCapable
+doAssert not preferencePmfRequired
+
 # Existing joining state and already prepared BSS state retain vendor bypasses.
 for prepared in [false, true]:
   setup(64, true)
@@ -237,7 +381,7 @@ for prepared in [false, true]:
   exercise()
   doAssert finalized == 1 and scanu_env.directedFound == 1
   doAssert station.connectModeFlags == 0x80 and parserCalls == 0
-  doAssert connection.base.channelDuration == (if prepared: 0x12345678'u32 else: 0x12345679'u32)
+  doAssert connection.base.channelDuration == (if prepared: 0x12345278'u32 else: 0x12345279'u32)
 """
 
 
@@ -269,7 +413,8 @@ def test_scan_credentials(tmp_path: Path, mode: str, mutation: str | None) -> No
     elif mutation == "publish":
         section = section.replace("      if securityAccepted:", "      if true:")
     elif mutation == "parse":
-        section = section.replace("if securityParsed and selectedAuth != 0:", "if selectedAuth != 0:")
+        section = section.replace("if securityParsed and selectedAuth != 0 and pmfCompatible:",
+                                  "if selectedAuth != 0 and pmfCompatible:")
     elif mutation == "reset_acceptance":
         section = section.replace("        securityAccepted = false\n", "")
     layout = (FW / "layout_types.nim").read_text()
@@ -277,7 +422,7 @@ def test_scan_credentials(tmp_path: Path, mode: str, mutation: str | None) -> No
     for name in ["ConnectInfoView", "ConnectInfoCredentialOverlay", "VifSecurityOverlay"]:
         types += re.search(rf"(?ms)^  {name}[^\n]*\n.*?(?=\n\n)", layout).group(0) + "\n"
     program = tmp_path / "credentials.nim"
-    program.write_text("type\n" + types + PLATFORM + reader + legacy + WRAPPER
+    program.write_text("const WifiKeyMgmtSae = 1024'u32\nconst WifiAuthMaskSae = 1024'u32\n" + "type\n" + types + PLATFORM + FORWARD_STUB + reader + legacy + WRAPPER
                        + textwrap.indent(textwrap.dedent(section), "  ") + "\n" + CHECKS)
     flags = {"checked": [], "release": ["-d:release", "--assertions:on"],
              "asan": ["--cc:clang", "--passC:-fsanitize=address", "--passL:-fsanitize=address"]}
@@ -289,3 +434,159 @@ def test_scan_credentials(tmp_path: Path, mode: str, mutation: str | None) -> No
     else:
         assert result.returncode != 0 and any(reason in result.stdout for reason in
             ["AssertionDefect", "IndexDefect", "AddressSanitizer", "SIGSEGV"]), result.stdout
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+@pytest.mark.parametrize("force_pmf_capable", [False, True])
+def test_scan_akm_selection_with_real_preference(tmp_path: Path, mode: str,
+                                                force_pmf_capable: bool) -> None:
+    scan = (FW / "scan_station_ap_me.nim").read_text()
+    layout = (FW / "layout_types.nim").read_text()
+    rsn = (FW / "rsn_parse.nim").read_text()
+    body = procedure(scan, "scanu_frame_handler")
+    section = "      securityState.connected = connectInfo.authRetryGate\n" + body.split(
+        "      securityState.connected = connectInfo.authRetryGate\n", 1)[1].split(
+            "\n  # WPS callback", 1)[0]
+    types = "".join(re.search(
+        rf"(?ms)^  {name}[^\n]*\n.*?(?=\n\n)", layout).group(0) + "\n"
+        for name in ["ConnectInfoView", "ConnectInfoCredentialOverlay", "VifSecurityOverlay",
+                     "WpaParsedInfoView", "WpaParsedInfoBuffer",
+                     "WpaScanSecurityNotifyView"])
+    platform = PLATFORM.replace(procedure(PLATFORM, "wifiPreferredKeyMgmtFromMask"), "")
+    platform = platform.replace("  WifiRsnAkmInfo = object\n    bipCmac128: bool\n", "")
+    platform = platform.replace(procedure(platform, "wifiRsnAkmInfoFromIe"), "")
+    platform = re.sub(r"  WpaParsedInfoView = object\n.*?  WpaParsedInfoBuffer = object\n"
+                      r"    view: WpaParsedInfoView\n", "", platform, count=1, flags=re.S)
+    platform = re.sub(r"  WpaScanSecurityNotifyView = object\n.*?(?=  MacIeView = object\n)",
+                      "", platform, count=1, flags=re.S)
+    platform = platform.replace(
+        "  parsedCaps: uint16\n",
+        "  parsedCaps: uint16\n  parsedMask: uint32\n"
+        "  parsedGroupCipher, parsedPairwiseCipher: uint8\n")
+    platform = platform.replace(
+        "  cast[ptr WpaParsedInfoView](output)[] = WpaParsedInfoView(keyMgmtLe: 2,\n"
+        "    caps: parsedCaps, groupCipher: 3, pairwiseCipher: 3, keyMgmtMaskLow: 2)",
+        "  let bytes = cast[ptr UncheckedArray[uint8]](output)\n"
+        "  zeroMem(output, sizeof(WpaParsedInfoView))\n"
+        "  bytes[4] = parsedPairwiseCipher\n"
+        "  bytes[8] = parsedGroupCipher\n"
+        "  bytes[12] = parsedMask.uint8\n"
+        "  bytes[13] = (parsedMask shr 8).uint8\n"
+        "  bytes[16] = parsedCaps.uint8")
+    platform = platform.replace(
+        "  parsedCaps = 0\n",
+        "  parsedCaps = 0\n  parsedMask = 2\n"
+        "  parsedGroupCipher = 3\n  parsedPairwiseCipher = 3\n")
+    code = (rsn + "\ntype\n" + types + platform + FORWARD_STUB +
+            procedure(layout, "keyMgmtLe") +
+            procedure(scan, "scanuConnectionKeyLength") +
+            procedure(scan, "scanuApplyLegacyCredentialPolicy").split("\n{.emit:", 1)[0] +
+            WRAPPER + textwrap.indent(textwrap.dedent(section), "  ") + "\n")
+    if force_pmf_capable:
+        code = "{.define: bl808WifiForcePmfCapable.}\n" + code
+    run_program(tmp_path, mode, code + r'''
+const realRsnIe = [48'u8, 26, 1, 0, 0, 15, 172, 4, 1, 0,
+  0, 15, 172, 4, 1, 0, 0, 15, 172, 2, 0x80, 0, 0, 0,
+  0, 15, 172, 6]
+proc setupRealRsn() =
+  setup(8, true)
+  informationElement[0..27] = realRsnIe
+  parserLength = 28
+const forceCapable = defined(bl808WifiForcePmfCapable)
+for sample in [
+    (0x200'u32, 0'u16, WifiKeyMgmtPsk, 1, 3'u8, 3'u8),
+    (0x200'u32, 0x80'u16, WifiKeyMgmtSae, 1, 4'u8, 4'u8),
+    (0x200'u32, 0x80'u16, WifiKeyMgmtSae, 1, 4'u8, 5'u8),
+    (0x400'u32, 0x80'u16, WifiKeyMgmtSae, 1, 4'u8, 4'u8),
+    (0x200'u32, 0x80'u16, WifiKeyMgmtPsk, 1, 3'u8, 4'u8),
+    (0x200'u32, 0x80'u16, WifiKeyMgmtPsk, 1, 4'u8, 3'u8),
+    (0'u32, 0x80'u16, WifiKeyMgmtPsk, 1, 3'u8, 4'u8),
+    (0x400'u32, 0'u16, WifiKeyMgmtNone, 0, 4'u8, 4'u8),
+    (0x200'u32, 0x40'u16, WifiKeyMgmtNone, 0, 4'u8, 4'u8),
+    (0'u32, 0xC0'u16, (if forceCapable: WifiKeyMgmtSae else: WifiKeyMgmtNone),
+      forceCapable.int, 4'u8, 4'u8)]:
+  setupRealRsn()
+  protocol = "rsn"
+  parsedMask = WifiAuthMaskPsk or WifiAuthMaskSae
+  connection.base.channelDuration = sample[0]
+  parsedCaps = sample[1]
+  parsedGroupCipher = sample[4]
+  parsedPairwiseCipher = sample[5]
+  exercise()
+  doAssert security.keyMgmt == sample[2],
+    "sample=" & $sample & " selected=" & $security.keyMgmt &
+    " parsed=" & $parserCalls & " choice=" & $nimFwDbgScanAT &
+    " raw=" & $wifiRsnAkmInfoFromIe(addr informationElement[0], 28)
+  doAssert scanu_env.directedFound == sample[3].uint8
+  doAssert notifications == sample[3] and finalized == sample[3]
+  if sample[3] != 0:
+    doAssert security.groupCipher == sample[4]
+    doAssert security.pairwiseCipher == sample[5]
+    doAssert notifiedGroup == sample[4]
+    doAssert notifiedPairwise == sample[5]
+    let negotiatedPmf = (forceCapable or (sample[0] and 0x600'u32) != 0) and
+      (sample[1] and 0x80'u16) != 0
+    doAssert notifiedMgmtGroup == (if negotiatedPmf: 6'u8 else: 0'u8)
+    doAssert notifiedPmfRequired == (if negotiatedPmf and
+      ((sample[0] and 0x400'u32) != 0 or (sample[1] and 0x40'u16) != 0 or
+       sample[2] == WifiKeyMgmtSae): 1'u8 else: 0'u8)
+setupRealRsn()
+protocol = "rsn"
+connection.base.channelDuration = 0x200
+parsedMask = WifiAuthMaskPsk or WifiAuthMaskSae
+parsedCaps = 0x80
+parsedGroupCipher = 4
+parsedPairwiseCipher = 4
+informationElement[27] = 11 # BIP-GMAC-128 is unsupported by this firmware.
+exercise()
+doAssert security.keyMgmt == 0 and scanu_env.directedFound == 0
+''')
+
+
+def test_scan_security_trace_handles_unaligned_short_ie(tmp_path: Path) -> None:
+    scan = (FW / "scan_station_ap_me.nim").read_text()
+    layout = (FW / "layout_types.nim").read_text()
+    rsn = (FW / "rsn_parse.nim").read_text()
+    body = procedure(scan, "scanu_frame_handler")
+    section = "      securityState.connected = connectInfo.authRetryGate\n" + body.split(
+        "      securityState.connected = connectInfo.authRetryGate\n", 1)[1].split(
+            "\n  # WPS callback", 1)[0]
+    types = "".join(re.search(
+        rf"(?ms)^  {name}[^\n]*\n.*?(?=\n\n)", layout).group(0) + "\n"
+        for name in ["ConnectInfoView", "ConnectInfoCredentialOverlay", "VifSecurityOverlay"])
+    unaligned = "cast[pointer](cast[uint](addr unalignedStorage[0]) + 1'u)"
+    platform = PLATFORM.replace(
+        "  informationElement: array[257, uint8]\n",
+        "  informationElement: array[257, uint8]\n"
+        "  unalignedStorage: array[3, uint32]\n  traceWord: uint32\n")
+    platform = platform.replace("addr informationElement[0] else: nil",
+                                f"{unaligned} else: nil")
+    platform = platform.replace(
+        "data == (addr informationElement[0]) and length == parserLength",
+        f"data == {unaligned} and length == parserLength")
+    platform = platform.replace(
+        "proc nimFwTrace2U32(tag: string; a, b: uint32) = discard",
+        "proc nimFwTrace2U32(tag: string; a, b: uint32) = traceWord = b")
+    platform = platform.replace(procedure(platform, "wifiPreferredKeyMgmtFromMask"), "")
+    platform = platform.replace("  WifiRsnAkmInfo = object\n    bipCmac128: bool\n", "")
+    platform = platform.replace(procedure(platform, "wifiRsnAkmInfoFromIe"), "")
+    code = (rsn + "\ntype\n" + types + platform + FORWARD_STUB +
+            procedure(scan, "scanuConnectionKeyLength") +
+            procedure(scan, "scanuApplyLegacyCredentialPolicy").split("\n{.emit:", 1)[0] +
+            WRAPPER + textwrap.indent(textwrap.dedent(section), "  ") + "\n")
+    run_program(tmp_path, "checked",
+                '{.passC: "-fsanitize=alignment -fno-sanitize-recover=alignment".}\n'
+                '{.passL: "-fsanitize=alignment".}\n' + code + r'''
+for sample in [(4'u8, 0x02010430'u32), (0'u8, 0x30'u32)]:
+  setup(8, true)
+  protocol = "rsn"
+  selectedAuth = 2
+  informationElement[1] = sample[0]
+  parserLength = sample[0] + 2'u8
+  copyMem(cast[pointer](cast[uint](addr unalignedStorage[0]) + 1'u),
+          addr informationElement[0], parserLength.int)
+  traceWord = 0
+  exercise()
+  doAssert scanu_env.directedFound == 1
+  doAssert traceWord == sample[1]
+''')

@@ -24,6 +24,10 @@ type
     supportedRatesLong: array[34, uint8]
   Sta = object
     valid, instNbr, marker: uint8
+  StaQueueIdentity = object
+    entry: pointer
+    stationEpoch, vifEpoch: uint32
+    station, vif: uint8
   Header = object
     paramLen: uint32
   Sm = object
@@ -50,9 +54,10 @@ var
   wpaSent: WpaKeyWriteParamView
   wepSent: WepKeyWriteParamView
   irq: bool
-  registrations, addresses, wpaCalls, wepCalls, wpsCalls, rollbacks, unregisters: int
+  registrations, addresses, addressDeletes, wpaCalls, wepCalls, wpsCalls, rollbacks, unregisters, abortCleanups: int
   registerStatus, keyIndex: uint8
-  addressFails: bool
+  wpaSetupResult: cint
+  addressFails, addressCleanupFails: bool
   registrationAdmitted: bool
   hook: proc(point: string)
   nimFwDbgPreauthStaAddEntry, nimFwDbgPreauthStaAddMeta: uint32
@@ -116,10 +121,39 @@ proc sta_mgmt_unregister(index: uint8) =
   stations[index].valid = 0
   inc stationEpochs[index]
   fire("unregister")
+proc staMgmtBeginRemoval(index: uint8; owner: var StaQueueIdentity): pointer =
+  doAssert stations[index].valid != 0 and stations[index].marker == 7
+  owner = StaQueueIdentity(entry: addr stations[index], station: index,
+    stationEpoch: stationEpochs[index] + 1, vif: stations[index].instNbr,
+    vifEpoch: rxVifEpochs[stations[index].instNbr])
+  stations[index].valid = 0
+  inc stationEpochs[index]
+  addr stations[index]
+proc staRemovalCurrent(owner: StaQueueIdentity): bool =
+  owner.entry == cast[pointer](addr stations[owner.station]) and
+    stations[owner.station].valid == 0 and
+    stations[owner.station].instNbr == owner.vif and
+    stationEpochs[owner.station] == owner.stationEpoch and
+    rxVifEpochs[owner.vif] == owner.vifEpoch
+proc mmDeleteSecurityAddress(index: uint8): bool =
+  inc addressDeletes
+  fire("address-delete")
+  not addressCleanupFails
+proc staMgmtFinishRemoval(owner: StaQueueIdentity) =
+  doAssert staRemovalCurrent(owner)
+  inc unregisters
+  fire("unregister")
+proc mmStaDelTrackUnpublished(owner: StaQueueIdentity) =
+  inc abortCleanups
+  if mmDeleteSecurityAddress(owner.station) and staRemovalCurrent(owner):
+    staMgmtFinishRemoval(owner)
 proc wpaWrite(p: pointer) {.cdecl.} =
   wpaSent = cast[ptr WpaKeyWriteParamView](p)[]
   inc wpaCalls
   fire("wpa")
+proc bl808WpaStaConnectResult(callback, params: pointer): cint =
+  cast[proc(p: pointer) {.cdecl.}](callback)(params)
+  wpaSetupResult
 proc wpsConnected(vif, station: uint8) {.cdecl.} =
   doAssert vif < MAX_VIFS and station < STA_MGMT_FREE_STAS
   inc wpsCalls
@@ -164,13 +198,17 @@ proc setup(mode: string; incomingIrq = true) =
   else: discard
   registrations = 0
   addresses = 0
+  addressDeletes = 0
   wpaCalls = 0
   wepCalls = 0
   wpsCalls = 0
   rollbacks = 0
+  abortCleanups = 0
   unregisters = 0
   registerStatus = 0
+  wpaSetupResult = 0
   addressFails = false
+  addressCleanupFails = false
   keyIndex = 4
   wpaSent = default(WpaKeyWriteParamView)
   wepSent = default(WepKeyWriteParamView)
@@ -192,7 +230,8 @@ for mode in ["open", "wps", "wpa", "wep"]:
     hook = proc(stage: string) =
       if stage == point: registrationAdmitted = false
     doAssert invoke() != 0
-    doAssert registrations == 1 and rollbacks == 1
+    doAssert registrations == 1 and abortCleanups == 1 and rollbacks == 0
+    doAssert addressDeletes == 1 and unregisters == 1
     doAssert stations[0].valid == 0
 
 for mode in ["ap", "open", "wps", "wpa", "wep"]:
@@ -269,15 +308,35 @@ registerStatus = 7
 doAssert invoke() == 7 and addresses == 0
 setup("wep")
 keyIndex = 0xFF
-doAssert invoke() != 0 and rollbacks == 1
+doAssert invoke() != 0 and abortCleanups == 1 and addressDeletes == 1
+
+setup("wpa")
+wpaSetupResult = -1
+doAssert invoke() != 0 and wpaCalls == 1 and irq
+doAssert vifs[0].staIdx == 0xFF and stations[0].valid == 0
+doAssert abortCleanups == 1 and addressDeletes == 1 and unregisters == 1
+wpaSetupResult = 0
+doAssert invoke() == 0 and wpaCalls == 2
+doAssert vifs[0].staIdx == 0 and stations[0].valid != 0
+doAssert abortCleanups == 1 and addressDeletes == 1 and unregisters == 1
 
 for mode in ["ap", "open", "wps", "wpa", "wep"]:
   for incomingIrq in [false, true]:
     setup(mode, incomingIrq)
     addressFails = true
-    doAssert invoke() != 0 and rollbacks == 0 and unregisters == 1 and irq == incomingIrq
-    doAssert addresses == 1 and wpsCalls == 0 and wpaCalls == 0 and wepCalls == 0
+    doAssert invoke() != 0 and rollbacks == 0 and abortCleanups == 1 and
+      unregisters == 1 and irq == incomingIrq
+    doAssert addresses == 1 and addressDeletes == 1 and
+      wpsCalls == 0 and wpaCalls == 0 and wepCalls == 0
     doAssert stations[0].valid == 0 and not mmStaAddInProgress[0]
+
+for mode in ["ap", "open", "wps", "wpa", "wep"]:
+  setup(mode)
+  addressFails = true
+  addressCleanupFails = true
+  doAssert invoke() != 0 and addresses == 1 and addressDeletes == 1
+  doAssert stations[0].valid == 0 and unregisters == 0,
+    "uncleared hardware address returned the station slot to the free pool"
 
 for replaceVif in [false, true]:
   setup("open")
@@ -332,7 +391,7 @@ for mode in ["open", "wps", "wpa", "wep"]:
       if action != 2:
         doAssert rollbacks == 0 and vifs[0] == replacementVif and stations[0] == replacementSta
       else:
-        doAssert rollbacks == 1 and stations[0].valid == 0
+        doAssert abortCleanups == 1 and addressDeletes == 1 and stations[0].valid == 0
 
 for point in ["register", "address", "wpa"]:
   setup("wpa")
@@ -376,13 +435,13 @@ doAssert registrations == 0
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-@pytest.mark.parametrize("mutation", [None, "ssid", "extent", "hex", "generation", "connection", "reentry", "outputs", "address", "address_cleanup"])
+@pytest.mark.parametrize("mutation", [None, "ssid", "extent", "hex", "generation", "connection", "reentry", "outputs", "address", "address_cleanup", "key_setup_result"])
 def test_sta_key_install(tmp_path: Path, mode: str, mutation: str | None) -> None:
     nim = shutil.which("nim")
     if nim is None:
         pytest.skip("Nim is required")
     source = (FW / "kernel_mac_channel.nim").read_text()
-    plan_type = re.search(r"(?ms)^type\n  MmStaKeyPlan = object.*?(?=^proc mmKeyHexDigit)", source).group(0)
+    plan_type = re.search(r"(?ms)^type\n  MmStaKeyPlan = object.*?(?=^  MmStaDeletion = object)", source).group(0)
     parts = {name: procedure(source, name) for name in
              ["mmKeyHexDigit", "mmPrepareStaKeys", "mmStaAddCurrent", "mm_sta_add"]}
     if mutation == "ssid":
@@ -402,7 +461,13 @@ def test_sta_key_install(tmp_path: Path, mode: str, mutation: str | None) -> Non
     elif mutation == "address":
         parts["mm_sta_add"] = parts["mm_sta_add"].replace("if hwIdx == 0xFF:", "if false:")
     elif mutation == "address_cleanup":
-        parts["mm_sta_add"] = parts["mm_sta_add"].replace("sta_mgmt_unregister(staIdx)", "mm_sta_del(staIdx)")
+        parts["mm_sta_add"] = parts["mm_sta_add"].replace(
+            "mmStaDelTrackUnpublished(removal)",
+            "staMgmtFinishRemoval(removal)")
+    elif mutation == "key_setup_result":
+        parts["mm_sta_add"] = parts["mm_sta_add"].replace(
+            "if bl808WpaStaConnectResult(keys.callback, addr keys.wpa) != 0:\n      return abortOwned()",
+            "discard bl808WpaStaConnectResult(keys.callback, addr keys.wpa)")
     layout = (FW / "layout_types.nim").read_text()
     types = ""
     for name in ["ConnectInfoView", "ConnectInfoCredentialOverlay", "VifSecurityOverlay",

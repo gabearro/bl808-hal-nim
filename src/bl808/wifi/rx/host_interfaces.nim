@@ -12,6 +12,9 @@ proc netifapi_netif_set_link_down(netif: ptr Netif)
   {.importc, header: "<lwip/netifapi.h>", cdecl.}
 proc netifapi_netif_set_addr(netif: ptr Netif; ipaddr, netmask, gw: pointer): cint
   {.importc, header: "<lwip/netifapi.h>", cdecl.}
+when defined(bl808WifiRealLwip):
+  proc wifi_netif_dhcp_stop(netif: ptr Netif): cint
+    {.importc, header: "wifi_netif.h", cdecl.}
 proc aos_post_event(`type`, code, value: cint): cint
   {.importc, header: "<aos/yloop.h>", cdecl.}
 proc bl_tx_cntrl_link_up(sta: ptr BlSta) {.importc, cdecl, header: "bl_tx.h".}
@@ -22,3 +25,4 @@ proc mac_ie_find(baseAddr: uint32; buflen: uint16; ieId: uint8): uint32
   {.importc, cdecl, header: "bl60x_fw_api.h".}
 proc wpa_parse_wpa_ie_wrapper(wpaIe: pointer; wpaIeLen: csize_t; data: ptr WifiWpaIe): cint
   {.importc, cdecl.}
+proc bl808_wifi_backend_record_scan_confirmation(status: uint32) {.importc, cdecl.}

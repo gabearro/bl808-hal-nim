@@ -1,0 +1,60 @@
+BL808 DHCP acquisition retry and NAK cleanup for SDK b773b3f.
+Apply after bl808_lwip_dhcp_trace.patch.
+
+diff --git a/components/network/lwip/src/core/ipv4/dhcp.c b/components/network/lwip/src/core/ipv4/dhcp.c
+index 56f754d1..363c37c4 100644
+--- a/components/network/lwip/src/core/ipv4/dhcp.c
++++ b/components/network/lwip/src/core/ipv4/dhcp.c
+@@ -182,6 +182,12 @@ static u8_t xid_initialised;
+ #define dhcp_got_option(dhcp, idx)            (dhcp_rx_options_given[idx] = 1)
+ #define dhcp_clear_option(dhcp, idx)          (dhcp_rx_options_given[idx] = 0)
+ #define dhcp_clear_all_options(dhcp)          (memset(dhcp_rx_options_given, 0, sizeof(dhcp_rx_options_given)))
++
++#ifdef BL808_LWIP_DHCP_RETRY_MS
++#define BL808_LWIP_DHCP_POLICY_PRESENT 1
++#else
++#define BL808_LWIP_DHCP_RETRY_MS(client) 1000U
++#endif
+ #define dhcp_get_option_value(dhcp, idx)      (dhcp_rx_options_val[idx])
+ #define dhcp_set_option_value(dhcp, idx, val) (dhcp_rx_options_val[idx] = (val))
+
+@@ -305,6 +311,9 @@ dhcp_handle_nak(struct netif *netif)
+   /* Change to a defined state - set this before assigning the address
+      to ensure the callback can use dhcp_supplied_address() */
+   dhcp_set_state(dhcp, DHCP_STATE_BACKING_OFF);
++  /* A rejected lease cannot expire or renew during its replacement exchange. */
++  dhcp->t0_timeout = dhcp->t1_timeout = dhcp->t2_timeout = 0;
++  dhcp->lease_used = dhcp->t1_renew_time = dhcp->t2_rebind_time = 0;
+   /* remove IP address from interface (must no longer be used, as per RFC2131) */
+   netif_set_addr(netif, IP4_ADDR_ANY4, IP4_ADDR_ANY4, IP4_ADDR_ANY4);
+   /* We can immediately restart discovery */
+@@ -450,8 +459,7 @@ dhcp_select(struct netif *netif)
+   if (dhcp->tries < 255) {
+     dhcp->tries++;
+   }
+-  //msecs = (u16_t)((dhcp->tries < 6 ? 1 << dhcp->tries : 60) * 1000);
+-  msecs = (u16_t)1000;
++  msecs = BL808_LWIP_DHCP_RETRY_MS(dhcp);
+   dhcp->request_timeout = (u16_t)((msecs + DHCP_FINE_TIMER_MSECS - 1) / DHCP_FINE_TIMER_MSECS);
+   LWIP_DEBUGF(DHCP_DEBUG | LWIP_DBG_STATE, ("dhcp_select(): set request timeout %"U16_F" msecs\n", msecs));
+   return result;
+@@ -1142,8 +1150,7 @@ dhcp_discover(struct netif *netif)
+     autoip_start(netif);
+   }
+ #endif /* LWIP_DHCP_AUTOIP_COOP */
+-  //msecs = (u16_t)((dhcp->tries < 6 ? 1 << dhcp->tries : 60) * 1000);
+-  msecs = (u16_t)(1000);
++  msecs = BL808_LWIP_DHCP_RETRY_MS(dhcp);
+   dhcp->request_timeout = (u16_t)((msecs + DHCP_FINE_TIMER_MSECS - 1) / DHCP_FINE_TIMER_MSECS);
+   /* bouffalo lp change
+    * Add for stop the dhcp timer coarse, when there is not any binded address or dhcp is not running
+@@ -1449,8 +1456,7 @@ dhcp_reboot(struct netif *netif)
+   if (dhcp->tries < 255) {
+     dhcp->tries++;
+   }
+-  //msecs = (u16_t)(dhcp->tries < 10 ? dhcp->tries * 1000 : 10 * 1000);
+-  msecs = (u16_t)1000;
++  msecs = BL808_LWIP_DHCP_RETRY_MS(dhcp);
+   dhcp->request_timeout = (u16_t)((msecs + DHCP_FINE_TIMER_MSECS - 1) / DHCP_FINE_TIMER_MSECS);
+   /* bouffalo lp change
+    * Add for stop the dhcp timer coarse, when there is not any binded address or dhcp is not running

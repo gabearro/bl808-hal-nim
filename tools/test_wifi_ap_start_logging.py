@@ -56,7 +56,7 @@ for vif in 0'u8 .. 1:
       doAssert requestFreed and apm.connectInfo == nil and state == ApmIdleState
       doAssert cfms.len == 1 and cfms[0].status == status and cfms[0].vifIdx == vif
       if status == 0:
-        doAssert cfms[0].band == 2 and cfms[0].staIdx == vif + 5
+        doAssert cfms[0].channelContextIndex == 2 and cfms[0].staIdx == vif + 5
         doAssert vifs[vif].key.flags == expectedRates
         doAssert vifs[vif].apStartBeaconInterval == expectedInterval
         doAssert rateInitialized == 1 and stations[vif + 5].valid == 1

@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -187,6 +189,32 @@ FORBIDDEN_RF_ARCHIVE_MARKERS = [
     "bl606p_phyrf",
 ]
 
+REPO = Path(__file__).resolve().parents[1]
+DEMO_MAC_BLOB = "51aba70b5c76e5d2805072da1c5359068bf6ea83"
+DEMO_RF_BLOB = "a9935b475d2198000ae7b67d141f00767176a81a"
+REPO_MAC_ARCHIVES = (REPO / "src/bl808/libwifi_fw.a", REPO / "tools/ref/libwifi_bl808.a")
+VENDOR_ARCHIVES = {
+    "libwifi.a": "MAC", "libwifi_fw.a": "MAC", "libwifi_bl808.a": "MAC",
+    "librf_bl808.a": "RF", "libbl606p_phyrf.a": "RF",
+}
+NATIVE_MARKERS = {
+    "RF": "runBl808WlanFullCal",
+    "PHY": "initializeBl808Phy",
+    "MAC start": "mm_start_req_handler",
+    "MAC scan": "scan_start_req_handler",
+}
+
+
+def check_archive_pin(path: Path, expected: str, label: str) -> list[str]:
+    if not path.is_file():
+        return [f"{label}: missing archive {path}"]
+    data = path.read_bytes()
+    digest = hashlib.sha1(f"blob {len(data)}\0".encode("ascii") + data).hexdigest()
+    if digest != expected:
+        return [f"{label}: {path}: Git blob {digest}, expected {expected}"]
+    print(f"{label}: {path}: verified Git blob {digest}")
+    return []
+
 BLE_RF_SYMBOLS = [
     "btble_rf_init",
     "ble_rf_init",
@@ -302,19 +330,63 @@ def check_build_log(path: Path) -> list[str]:
 
 
 def check_link_map(path: Path) -> list[str]:
-    """Reject RF archive members actually extracted into the final link."""
+    return check_link_map_members(path, VENDOR_ARCHIVES)
+
+
+def check_link_map_members(path: Path, archives: dict[str, str]) -> list[str]:
+    """A GNU ld LOAD is not extraction; match the owner of the named member."""
     failures: list[str] = []
+    nonstandard = tuple(name + "(" for name in archives if not name.endswith(".a"))
+    messages = {"RF": "forbidden RF archive member in link map",
+                "MAC": "forbidden MAC archive member in link map"}
     for line in path.read_text(errors="ignore").splitlines():
         stripped = line.strip()
-        for marker in FORBIDDEN_RF_ARCHIVE_MARKERS:
-            if marker not in stripped:
-                continue
-            if ".a(" not in stripped or ")" not in stripped:
-                continue
-            failures.append(stripped)
-            print(f"{path}: forbidden RF archive member in link map: {stripped}")
+        if ".a(" not in stripped and not any(name in stripped for name in nonstandard):
+            continue
+        for archive in re.findall(r"([^()\s]+)\([^()]+\)", stripped):
+            # The reference cache prefixes archive names with their Git blob ID.
+            member_archive = Path(archive)
+            name = member_archive.name
+            kind = archives.get(name) or archives.get(re.sub(r"^[0-9a-f]{40}\.", "", name))
+            if not kind and name.endswith(".a") and "bl606p_phyrf" in member_archive.parts:
+                kind = "RF"
+            if kind:
+                failures.append(stripped)
+                print(f"{path}: {messages[kind]}: {stripped}")
+                break
     if not failures:
-        print(f"{path}: no RF archive members extracted in link map")
+        print(f"{path}: no RF archive members extracted in link map; no vendor MAC members")
+    return failures
+
+
+def check_native_wifi_link(elf: Path, link_map: Path) -> list[str]:
+    """Cross-check live Nim function sections and text symbols at the same VMA."""
+    _, header, live = link_map.read_text(errors="replace").partition("Linker script and memory map")
+    if not header:
+        return [f"{link_map}: missing GNU ld memory map"]
+    section = re.compile(
+        r"^[ \t]+\.text\.(\S+)\s+(0x[\da-fA-F]+)[ \t]+(0x[\da-fA-F]+)[ \t]+(.+?\.o)[ \t]*$",
+        re.MULTILINE,
+    )
+    nim_sections = {
+        (symbol, int(address, 16))
+        for symbol, address, size, owner in section.findall(live)
+        if int(size, 16) and re.search(r"(?:^|/|@s|@m)wifi_fw\.nim\.c\.o$", owner)
+    }
+    elf_text = set()
+    for line in nm(elf, "--defined-only").splitlines():
+        fields = line.split()
+        if len(fields) == 3 and fields[1] in {"T", "t"}:
+            elf_text.add((fields[2], int(fields[0], 16)))
+    # Match raw names and addresses first. Nim appends a module and serial to
+    # private names; neither is a stable identifier across project layouts.
+    linked = {name.split("__", 1)[0].split(".", 1)[0] for name, _ in elf_text & nim_sections}
+    failures = [
+        f"{elf}: missing retained Nim {role} marker {name} in ELF/map"
+        for role, name in NATIVE_MARKERS.items() if name not in linked
+    ]
+    if not failures:
+        print(f"{elf}: native Nim RF, PHY, MAC start and scan verified against {link_map}")
     return failures
 
 
@@ -465,7 +537,16 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--wifi-object", type=Path)
     parser.add_argument("--ble-object", type=Path)
-    parser.add_argument("--rf-archive", type=Path)
+    parser.add_argument("--rf-archive", type=Path, help="legacy AGC-only RF reference, not the demo pin")
+    parser.add_argument(
+        "--bl808-demo-rf-archive", type=Path, metavar="PATH",
+        help="pin the BL808 demo PHY/RF and both repository MAC archives; with --elf or "
+             "--hw-validation-test, require native Nim RF/PHY/MAC in each ELF and its GNU ld map",
+    )
+    parser.add_argument(
+        "--bl808-demo-mac-archive", type=Path, metavar="PATH",
+        help="also pin the actual MAC comparison archive, even if provided under a different name",
+    )
     parser.add_argument("--build-log", type=Path, action="append", default=[])
     parser.add_argument("--link-map", type=Path, action="append", default=[])
     parser.add_argument("--elf", type=Path, action="append", default=[])
@@ -489,7 +570,7 @@ def main() -> int:
         "--check-wifi-phy-memory-init",
         action="store_true",
         help=(
-            "with --rf-archive, prove WiFi phy_init copies agcmem to "
+            "legacy AGC-only profile: with --rf-archive, prove WiFi phy_init copies agcmem to "
             "0x24C0A000 and does not reference ldpcmem/0x24C09000"
         ),
     )
@@ -544,6 +625,9 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.bl808_demo_rf_archive and args.check_wifi_phy_memory_init:
+        parser.error("run the legacy AGC-only check separately; native demo PHY loads AGC and LDPC")
+
     if args.hw_validation_test:
         args.check_hw_validation_nimcache_objects = True
         args.infer_hw_validation_nimcache_objects = True
@@ -562,6 +646,8 @@ def main() -> int:
         args.wifi_object is None
         and args.ble_object is None
         and args.rf_archive is None
+        and args.bl808_demo_rf_archive is None
+        and args.bl808_demo_mac_archive is None
         and not args.hw_validation_test
         and not args.elf
         and not args.build_log
@@ -569,8 +655,19 @@ def main() -> int:
     ):
         parser.error(
             "provide --wifi-object, --ble-object, --rf-archive, --elf, "
-            "--hw-validation-test, --build-log, or --link-map"
+            "--hw-validation-test, --build-log, --link-map, or a --bl808-demo-*-archive"
         )
+
+    archive_names = VENDOR_ARCHIVES.copy()
+    if args.bl808_demo_rf_archive or args.bl808_demo_mac_archive:
+        for path in REPO_MAC_ARCHIVES:
+            failures.extend(check_archive_pin(path, DEMO_MAC_BLOB, "repository BL808 MAC"))
+    if args.bl808_demo_mac_archive:
+        failures.extend(check_archive_pin(args.bl808_demo_mac_archive, DEMO_MAC_BLOB, "comparison MAC"))
+        archive_names[args.bl808_demo_mac_archive.name] = "MAC"
+    if args.bl808_demo_rf_archive:
+        failures.extend(check_archive_pin(args.bl808_demo_rf_archive, DEMO_RF_BLOB, "demo PHY/RF"))
+        archive_names[args.bl808_demo_rf_archive.name] = "RF"
 
     if args.wifi_object is not None:
         require_existing(args.wifi_object, "WiFi object")
@@ -598,6 +695,14 @@ def main() -> int:
 
     for elf in args.elf:
         require_existing(elf, "ELF")
+        if args.bl808_demo_rf_archive:
+            link_map = elf.with_suffix(".map")
+            if len(args.elf) == 1 and len(args.link_map) == 1:
+                link_map = args.link_map[0]
+            require_existing(link_map, "native ELF link map")
+            failures.extend(check_native_wifi_link(elf, link_map))
+            if link_map not in args.link_map:
+                args.link_map.append(link_map)
         label = str(elf)
         required_symbols: list[str] = []
         if args.require_elf_symbols or args.require_wifi_elf_symbols:
@@ -642,13 +747,18 @@ def main() -> int:
 
     for link_map in args.link_map:
         require_existing(link_map, "link map")
-        found = check_link_map(link_map)
+        found = check_link_map_members(link_map, archive_names)
         failures.extend(f"{link_map}:{line}" for line in found)
 
     if failures:
         print("FAIL:", ", ".join(failures))
         return 1
-    print("PASS: RF/PHY symbol provenance checks passed")
+    if args.bl808_demo_rf_archive and args.elf:
+        print("PASS: pinned BL808 demo references and native Nim RF/PHY/MAC links verified")
+    elif args.bl808_demo_rf_archive or args.bl808_demo_mac_archive:
+        print("PASS: requested BL808 reference pins verified (no native ELF/map proof requested)")
+    else:
+        print("PASS: RF/PHY symbol provenance checks passed")
     return 0
 
 

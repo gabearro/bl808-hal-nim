@@ -87,6 +87,8 @@ type ScanuResultEntry = object
   rssi: int8
   ssid: array[32, uint8]
   chanPtr, cachedRxuMgtInd: pointer
+  securityType: uint16
+  securityAuth: uint8
 type ScanEnvironment = object""", 1)
     code = code.replace("  bssidFilterEnabled, requester: uint8", """  bssidFilterEnabled, requester: uint8
   resultCount: uint32
@@ -97,9 +99,9 @@ type ScanEnvironment = object""", 1)
     helpers = SUPPORT
     for name in ["connectInfoChannelFrequency", "connectInfoHasChannelHint"]:
         helpers += procedure(layout, name)
-    for name in ["bestDirectedScanuResult", "bestScanuResultForSsidAndFreq"]:
-        helpers += procedure(scan, name)
     helpers += snapshot_source()
+    for name in ["bestCachedScanuResult", "scanuResultSlotIndex"]:
+        helpers += procedure(scan, name)
     code = code.replace(procedure(code, "sm_get_bss_params"),
                         helpers + procedure(scan, "sm_get_bss_params"), 1)
     return code + r'''
@@ -120,6 +122,7 @@ proc prepare(route: int) =
   scanuCachedSsids[0].length = 4
   scanuCachedSsids[0].ssidBytes[0..3] = conn.ssid[0..3]
   conn.authType = 7
+  conn.channelDuration = 0
   bssidAvailable = route == 0
   ssidAvailable = route in [2, 3]
   selectedIndex = if route == 3: -1 else: 0
@@ -129,7 +132,9 @@ proc prepare(route: int) =
     conn.channelHint[1] = 0x09
   if route == 5: conn.channelHint[0] = 0x6C
   if route == 6: scanu_env.directedFound = 1
-proc selectBss(bss, chan: ptr pointer): bool = sm_get_bss_params(bss, chan)
+proc selectBss(bss, chan: ptr pointer): bool =
+  sm_get_bss_params(bss, chan)
+  bss != nil and bss[] != nil
 '''
 
 
@@ -183,7 +188,7 @@ for route in 0 .. 7:
       doAssert found and bss == (addr conn.bssid[0]) and chan == (addr conn.channelHint[0])
     of 2, 4, 6:
       doAssert found and bss == (addr scanu_env.entries[0]) and chan == (addr channel)
-      doAssert sm.scanResultIndex == (if route in [4, 6]: 0xFFFFFFFF'u32 else: 0'u32)
+      doAssert sm.scanResultIndex == 0'u32
     of 5:
       doAssert not found and bss == nil and chan == (addr conn.channelHint[0])
     of 3:
@@ -191,6 +196,21 @@ for route in 0 .. 7:
     else:
       doAssert not found and bss == nil and chan == nil
     doAssert configured == (if route in [0, 2, 3, 4, 6]: 1 else: 0)
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_found_bssid_without_channel_does_not_use_hint(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, selection_source() + r'''
+prepare(0)
+scanu_env.entries[0].chanPtr = nil
+conn.channelHint[0] = 0x9E
+conn.channelHint[1] = 0x09
+var bss, chan: pointer
+doAssert selectBss(addr bss, addr chan)
+doAssert bss == addr conn.bssid[0]
+doAssert chan == nil
+doAssert configured == 1 and sm.scanResultIndex == 0xFFFFFFFF'u32
 ''')
 
 
@@ -206,6 +226,48 @@ doAssert configured == 0 and sm.scanResultIndex == 0xFFFFFFFF'u32
 prepare(6)
 doAssert selectBss(addr bss, addr chan)
 doAssert bss == (addr scanu_env.entries[0]) and chan == (addr channel)
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_cached_selection_preserves_security_filter(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, selection_source() + r'''
+for route in [4, 6]:
+  for flags in [0'u32, 0x200, 0x400, 0x600]:
+    for hasPreferred in [false, true]:
+      prepare(route)
+      conn.channelDuration = flags
+      scanu_env.entries[1] = scanu_env.entries[0]
+      scanu_env.resultCount = 2
+      scanu_env.entries[1].rssi = -75
+      scanu_env.entries[1].securityType = if hasPreferred: 1 else: 0x100
+      scanuCachedSsids[1] = scanuCachedSsids[0]
+      var bss, chan: pointer
+      let found = selectBss(addr bss, addr chan)
+      if flags == 0x600 and not hasPreferred:
+        doAssert not found and bss == nil and configured == 0
+        doAssert sm.scanResultIndex == 0xFFFFFFFF'u32
+      else:
+        let index = if (flags and 0x200) != 0 and hasPreferred: 1 else: 0
+        doAssert found and bss == addr scanu_env.entries[index]
+        doAssert chan == (addr channel) and configured == 1
+        doAssert sm.scanResultIndex == index.uint32
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_fallback_selection_publishes_actual_cache_slot(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, selection_source() + r'''
+for route in [4, 6]:
+  prepare(route)
+  scanu_env.entries[5] = scanu_env.entries[0]
+  scanu_env.entries[0] = default(ScanuResultEntry)
+  scanuCachedSsids[5] = scanuCachedSsids[0]
+  scanuCachedSsids[0] = default(ScanuCachedSsid)
+  var bss, chan: pointer
+  doAssert selectBss(addr bss, addr chan)
+  doAssert bss == (addr scanu_env.entries[5]) and chan == (addr channel)
+  doAssert sm.scanResultIndex == 5'u32
 ''')
 
 

@@ -23,6 +23,8 @@ var
   calls: seq[int]
   interrupts, callbackIrq: bool
   saves, restores: int
+  platformEnabled: bool
+  platformEnters, platformLeaves: int
   onCallback: proc(index: int)
   payload: uint32
   fw_nap_chain: array[1, NotifierNodeView]
@@ -36,6 +38,18 @@ proc irqSave(): uint32 =
 proc irqRestore(saved: uint32) =
   inc restores
   interrupts = (saved and 8) != 0
+proc platformEnter(): uint32 {.cdecl.} =
+  inc platformEnters
+  irqSave()
+proc platformLeave(saved: uint32) {.cdecl.} =
+  inc platformLeaves
+  irqRestore(saved)
+proc blOpsFunc(offset: int): pointer =
+  if not platformEnabled: return nil
+  case offset
+  of 20: cast[pointer](platformEnter)
+  of 24: cast[pointer](platformLeave)
+  else: nil
 proc callback(node: ptr CoListHdr; event: uint32; data: pointer): cint {.cdecl.} =
   doAssert interrupts == callbackIrq
   doAssert event == 0xA5A50001'u32 and data == (addr payload)
@@ -57,6 +71,9 @@ proc setup(irq: bool) =
   callbackIrq = false
   saves = 0
   restores = 0
+  platformEnabled = true
+  platformEnters = 0
+  platformLeaves = 0
   onCallback = nil
   for index in 0 ..< nodes.len:
     nodes[index].callback = cast[pointer](callback)
@@ -68,17 +85,40 @@ proc node(index: int): ptr CoListHdr = cast[ptr CoListHdr](addr nodes[index])
 def source() -> str:
     text = (FW / "mac_config_debug.nim").read_text()
     code = PLATFORM
+    code += text[text.index("type NotifierCriticalState"):text.index("proc notifier_chain_regsiter*")]
     for name in ["notifier_chain_insert_ordered", "notifier_chain_remove",
                  "notifier_chain_regsiter", "notifier_chain_regsiter_fromCritical",
                  "notifier_chain_unregsiter", "notifier_chain_unregsiter_fromCritical",
                  "notifier_chain_call", "notifier_chain_call_fromeCritical"]:
-        code += procedure(text, name)
+        body = procedure(text, name)
+        if name == "notifier_chain_remove":
+            body = body.split("type NotifierCriticalState", 1)[0]
+        code += body
     platform = (FW / "platform_bl.nim").read_text()
     for name in ["bl_nap_hook_register", "bl_nap_hook_unregister", "bl_nap_hook_call",
                  "bl_nap_hook_register_fromCritical", "bl_nap_hook_unregister_fromCritical",
                  "bl_nap_hook_call_fromCritical"]:
         code += procedure(platform, name)
     return code
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan", "firmware"])
+@pytest.mark.parametrize("platform_enabled", [False, True])
+def test_noncritical_notifiers_use_platform_critical_callbacks(
+        tmp_path: Path, mode: str, platform_enabled: bool) -> None:
+    run_program(tmp_path, mode, source() + f'''
+for incoming in [false, true]:
+  setup(incoming)
+  platformEnabled = {str(platform_enabled).lower()}
+  doAssert notifier_chain_regsiter(addr chain, node(0)) == 0
+  callbackIrq = false
+  doAssert notifier_chain_call(addr chain, 0xA5A50001'u32, addr payload) == 0
+  doAssert notifier_chain_unregsiter(addr chain, node(0)) == 0
+  doAssert calls == @[0] and chain.first == nil and interrupts == incoming
+  doAssert saves == 3 and restores == 3
+  doAssert platformEnters == (if platformEnabled: 3 else: 0)
+  doAssert platformLeaves == platformEnters
+''')
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
@@ -182,6 +222,54 @@ for incoming in [false, true]:
   doAssert bl_nap_hook_call_fromCritical(0xA5A50001'u32, addr payload) == 0
   doAssert bl_nap_hook_unregister_fromCritical(node(0)) == 0
   doAssert interrupts == incoming
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan", "firmware"])
+def test_unregister_restores_interrupts_on_found_and_missing_paths(
+        tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+for incoming in [false, true]:
+  setup(incoming)
+  notifier_chain_regsiter_fromCritical(addr chain, node(0))
+  doAssert notifier_chain_unregsiter(addr chain, node(0)) == 0
+  doAssert chain.first == nil and interrupts == incoming
+  doAssert saves == 1 and restores == 1
+
+  doAssert notifier_chain_unregsiter(addr chain, node(0)) == 0
+  doAssert interrupts == incoming
+  doAssert saves == 2 and restores == 2
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan", "firmware"])
+def test_duplicate_registration_does_not_make_a_cycle(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+for critical in [false, true]:
+  for incoming in [false, true]:
+    setup(incoming)
+    proc register(index: int) =
+      if critical: doAssert notifier_chain_regsiter_fromCritical(addr chain, node(index)) == 0
+      else: doAssert notifier_chain_regsiter(addr chain, node(index)) == 0
+    register(0)
+    register(1)
+    register(2)
+    let savesBefore = saves
+    let restoresBefore = restores
+    register(1)
+    nodes[0].priority = -50
+    register(0)
+    doAssert chain.first == node(0)
+    doAssert nodes[0].next == node(1)
+    doAssert nodes[1].next == node(2)
+    doAssert nodes[2].next == nil
+    callbackIrq = if critical: incoming else: false
+    if critical: discard notifier_chain_call_fromeCritical(addr chain, 0xA5A50001'u32, addr payload)
+    else: discard notifier_chain_call(addr chain, 0xA5A50001'u32, addr payload)
+    doAssert calls == @[0, 1, 2]
+    doAssert interrupts == incoming
+    doAssert saves == savesBefore + (if critical: 0 else: 3)
+    doAssert restores == restoresBefore + (if critical: 0 else: 3)
 ''')
 
 

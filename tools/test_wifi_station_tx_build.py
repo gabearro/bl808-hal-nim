@@ -22,6 +22,9 @@ const
   TxlFramePayloadSize = 512'u32
   TASK_SM = 4'u8
   SM_RSP_TIMEOUT_IND = 0x1006'u16
+  KE_TIMER_MAX_DELAY = 0x11E1A2FF'u32
+  KeMsgConsumed = 0.cint
+  KeMsgTailSlack = 4'u32
   MACHW_BASE = 0'u
   MACHW_RX_CNTRL_REG = 0x60'u
   SCAN_ACTIVE_RX_FILTER_BITS = 0x10'u32
@@ -46,10 +49,11 @@ type
     vif, station: uint8
     captured: bool
   Conn = object
-    vifIdx, authType, qosInfo: uint8
+    vifIdx, authType, qosInfo, retry: uint8
     listenInterval: uint16
   SmEnv = object
     connectInfo, connectIndMsg: pointer
+    authRetryLimit: uint32
     connectFlags: uint8
     primaryFreq, centerFreq: uint16
   Vif = object
@@ -58,17 +62,24 @@ type
     basicRates: array[13, uint8]
     channelFreqPair: uint32
     rsnIePtr: pointer
-    rsnIeLen: uint16
+    rsnIeLen: uint8
   Sta = object
     macAddr: array[6, uint8]
     valid, instNbr: uint8
-  Indication = object
-    assocReqIeLen: uint16
+  Indication = SmConnectIndPayload
   Mm = object
     rxFilterExtra, rxFilterBase: uint32
-  MacAddress = object
-    bytes: array[6, uint8]
   KeTimerGuard = proc(context: pointer): bool {.nimcall.}
+  KeTimerEntry = object
+    id: uint16
+    taskId: uint8
+    time: uint32
+  KeMsgHdr = object
+    id: uint16
+    destId, srcId: uint8
+    paramLen: uint32
+  WpaCallbacks = object
+    authTimeout: pointer
   TxFrameIdentity = object
     resetEpoch: uint32
     smTracked: bool
@@ -83,7 +94,7 @@ var
   conn, replacementConn: Conn
   vifs: array[2, Vif]
   stas: array[7, Sta]
-  indication: Indication
+  indication, replacementIndication: Indication
   mm: Mm
   descriptors: array[2, HostTxDescView]
   hardware: array[2, Hw]
@@ -92,27 +103,39 @@ var
   generations: array[2, uint32]
   rxVifEpochs: array[2, uint32]
   stationEpochs: array[7, uint32]
-  txResetEpoch: uint32
+  txResetEpoch, psModeBuildSerial: uint32
   activeFrame: ptr HostTxDescView
   replacementDesc: HostTxDescView
   replacementHw: Hw
   replacementLink: Link
   currentState: uint16
   timerDelay: uint32
+  now: uint32
+  timerEntry: KeTimerEntry
+  expiryMessage: pointer
+  wpa_cbs: pointer
   smConnecting: bool
   allocationFailure, pushFailure, timerFailure: bool
   hook, action: int
   hookFired: bool
-  pushes, releases, failures: int
-  failureStatus: uint16
+  pushes, releases, failures, timerSetCalls: int
+  failureStatus, failureReason: uint16
   encodedLength: uint32
+  encodedIeId: uint8
+  encodedIeSize: uint16
   invalidCursor: bool
   onHandoff: proc()
   txActiveFrameCallback: ptr TxFrameCallbackScope
   interruptsEnabled = true
+  nimFwBleWifiRoleWindowEnabled: uint32
+  channelOperational, channelTxAllowed: bool
+  channelPrepares: int
+const WifiAuthForceFreq = 0
 proc observe(point: int)
 proc smEnvView(): ptr SmEnv = addr sm
 proc connectInfoView(p: pointer): ptr Conn = cast[ptr Conn](p)
+proc connectInfoAuthRetry(p: pointer): ptr uint8 = addr connectInfoView(p).retry
+proc wpaCallbacks(): ptr WpaCallbacks = cast[ptr WpaCallbacks](wpa_cbs)
 proc vifChannelForIdx(i: uint8): ptr Vif = addr vifs[i]
 proc staInfoForIdx(i: uint8): ptr Sta = addr stas[i]
 proc mmEnvView(): ptr Mm = addr mm
@@ -124,9 +147,9 @@ proc hostTxLinkDescAt(p: pointer): ptr Link = cast[ptr Link](p)
 proc hostTxHwDescAt(p: pointer): ptr Hw = cast[ptr Hw](p)
 proc hostTxDataHeader(p: ptr HostTxDescView): ptr Header =
   cast[ptr Header](addr hostTxLinkDescAt(p.bufDesc).macHeader[0])
-proc macAddrAt(p: pointer): ptr MacAddress = cast[ptr MacAddress](p)
-proc lowLe(p: ptr MacAddress): uint32 = 0
-proc highLe(p: ptr MacAddress): uint16 = 0
+proc macAddrAt(p: pointer): ptr MacAddrView = cast[ptr MacAddrView](p)
+proc lowLe(p: ptr MacAddrView): uint32 = 0
+proc highLe(p: ptr MacAddrView): uint16 = 0
 proc pointerAddrU32(p: pointer): uint32 = cast[uint32](cast[uint](p))
 proc irqSave(): uint32 =
   result = if interruptsEnabled: 8'u32 else: 0'u32
@@ -141,9 +164,6 @@ proc c_memset(dst: pointer; value: cint; n: csize_t): pointer =
   let bytes = cast[ptr UncheckedArray[uint8]](dst)
   for i in 0..<n.int: bytes[i] = value.uint8
   dst
-proc macPtrIsSpecific(p: pointer): bool = p != nil
-proc macPtrEquals(a, b: pointer): bool =
-  a != nil and b != nil and cast[ptr array[6, uint8]](a)[] == cast[ptr array[6, uint8]](b)[]
 proc ensureVifMgmtMac(p: ptr Vif): pointer = addr p.macAddr[0]
 proc vifMgmtTxSa(p: ptr Vif): pointer = addr p.macAddr[0]
 proc frameIndex(p: pointer): int =
@@ -183,18 +203,47 @@ proc ke_state_set(task: uint8; state: uint16) =
   currentState = state
   observe(7)
 proc ke_timer_set(id: uint16; task: uint8; delay: uint32) =
+  inc timerSetCalls
   timerDelay = delay
   observe(8)
+proc smRspTimerBegin(id: uint16; task: uint8; continuationUs: uint64): uint32
+proc smRspTimerPublish(id: uint16; task: uint8; serial: uint32;
+                       entry: ptr KeTimerEntry): bool
+proc smRspTimerClear(id: uint16; task: uint8)
+proc smRspTimerForget(header: pointer)
 proc ke_timer_try_set(id: uint16; task: uint8; delay: uint32;
-                     guard: KeTimerGuard = nil; context: pointer = nil): bool =
+                      guard: KeTimerGuard = nil; context: pointer = nil;
+                      continuationUs: uint64 = 0): bool =
+  inc timerSetCalls
   observe(8)
   if timerFailure or (guard != nil and not guard(context)): return false
+  let serial = smRspTimerBegin(id, task, continuationUs)
+  timerEntry = KeTimerEntry(id: id, taskId: task, time: now + delay)
+  if not smRspTimerPublish(id, task, serial, addr timerEntry): return false
   timerDelay = delay
   true
-proc ke_timer_clear(id: uint16; task: uint8) = timerDelay = 0
+proc ke_timer_clear(id: uint16; task: uint8) =
+  smRspTimerClear(id, task)
+  timerDelay = 0
+proc macTimeNow(): uint32 = now
+proc assert_err(condition, file: cstring; line: cint) =
+  doAssert false, "unexpected assertion at " & $line
+proc keMsgHdrFromPayload(p: pointer): ptr KeMsgHdr =
+  cast[ptr KeMsgHdr](cast[uint](p) - sizeof(KeMsgHdr).uint)
+proc ke_msg_try_alloc(id: uint16; dest, src: uint8; length: uint32): pointer =
+  let header = cast[ptr KeMsgHdr](alloc0(sizeof(KeMsgHdr) + length.int))
+  header[] = KeMsgHdr(id: id, destId: dest, srcId: src, paramLen: length)
+  cast[pointer](cast[uint](header) + sizeof(KeMsgHdr).uint)
+proc ke_msg_free(header: pointer) =
+  smRspTimerForget(header)
+  dealloc(header)
+proc ke_msg_send(p: pointer) =
+  doAssert expiryMessage == nil
+  expiryMessage = p
 proc sm_connect_ind(status, reason: uint16) =
   inc failures
   failureStatus = status
+  failureReason = reason
   currentState = 10
   timerDelay = 0
   sm.connectInfo = nil
@@ -227,19 +276,27 @@ proc me_build_sae_authenticate(buf: pointer; algo, sequence, status: uint16; vif
   me_build_authenticate(buf, algo, sequence, status, nil)
 proc me_build_associate_req_impl(buf, assocInfo, reassoc, cap, cursorOut, lengthOut, info: pointer): uint32 =
   let bytes = cast[ptr UncheckedArray[uint8]](buf)
-  for i in 0..<10: bytes[i] = 0
-  bytes[4] = 48
-  bytes[5] = 4
+  for i in 0..<4 + encodedIeSize.int: bytes[i] = 0
+  bytes[4] = encodedIeId
+  bytes[5] = (encodedIeSize - 2).uint8
   cast[ptr pointer](cursorOut)[] = cast[pointer](cast[uint](buf) +
-    (if invalidCursor: 1'u else: encodedLength.uint))
-  cast[ptr uint16](lengthOut)[] = 6
+    (if invalidCursor: 1'u else: 4'u))
+  cast[ptr uint16](lengthOut)[] = encodedIeSize
   observe(3)
   encodedLength
 proc nimFwTrace2U32(s: string; a, b: uint32) = observe(4)
 proc nimFwConnectTrace2U32(s: string; a, b: uint32) = observe(4)
 proc nimFwConnectTraceBytes(s: string; p: pointer; n, limit: uint32) = observe(4)
 proc nimFwConnectTraceHw(s: string) = observe(4)
-proc wifi_nimfw_prepare_sta_tx_channel() = observe(5)
+proc chan_is_on_operational_channel(vif: pointer): bool =
+  doAssert vif == addr vifs[1]
+  channelOperational
+proc chan_is_tx_allowed(vif: pointer): bool =
+  doAssert vif == addr vifs[1]
+  channelTxAllowed
+proc wifi_nimfw_prepare_sta_tx_channel() =
+  inc channelPrepares
+  observe(5)
 proc mm_rx_filter_set() = observe(5)
 proc rfPriApplyWb03AuthTxLatches() = observe(5)
 proc applyConservativeMgmtTxRetryPolicy(p: ptr Link) = observe(5)
@@ -288,13 +345,21 @@ proc observe(point: int) =
   of 4: activeFrame.bufDesc = nil
   of 5: stas[2].valid = 0
   of 6: vifs[1].staIdx = 3
+  of 7:
+    vifs[1].bssid = [0x12'u8, 0x13, 0x14, 0x15, 0x16, 0x17]
+    vifs[1].macAddr = [0x22'u8, 0x23, 0x24, 0x25, 0x26, 0x27]
+    stas[2].macAddr = [0x32'u8, 0x33, 0x34, 0x35, 0x36, 0x37]
+  of 8: sm.connectIndMsg = addr replacementIndication
   else: discard
 proc setup(kind: int) =
-  sm = SmEnv(connectInfo: addr conn, connectIndMsg: addr indication)
+  smRspTimerReset()
+  doAssert expiryMessage == nil and smRspTags == nil
+  sm = SmEnv(connectInfo: addr conn, connectIndMsg: addr indication, authRetryLimit: 2)
   conn = Conn(vifIdx: 1, authType: 0)
   replacementConn = conn
   currentState = if kind == 0: 5 else: 7
   timerDelay = 0
+  now = 100
   smConnecting = false
   rxVifEpochs = [1'u32, 1]
   stationEpochs = default(typeof(stationEpochs))
@@ -316,33 +381,77 @@ proc setup(kind: int) =
   pushes = 0
   releases = 0
   failures = 0
+  timerSetCalls = 0
+  nimFwBleWifiRoleWindowEnabled = 0
+  channelOperational = true
+  channelTxAllowed = true
+  channelPrepares = 0
   encodedLength = 10
+  encodedIeId = IE_ID_RSN
+  encodedIeSize = 6
+  indication = default(Indication)
+  replacementIndication = default(Indication)
   invalidCursor = false
   onHandoff = nil
 proc perform(kind: int) =
   if kind == 0: sm_auth_send(1, nil)
   else: sm_assoc_req_send()
+proc runTimerClockAt(target: uint32) =
+  now = target
+  if timerDelay == 0 or now < timerEntry.time: return
+  timerDelay = 0
+  doAssert smRspTimerDispatch(addr timerEntry)
+  doAssert expiryMessage != nil
+  let message = expiryMessage
+  expiryMessage = nil
+  doAssert sm_rsp_timeout_ind_handler(message) == KeMsgConsumed
+  ke_msg_free(keMsgHdrFromPayload(message))
 '''
 
 CASES = {
+    "auth_channel_reclaim_gate": r'''
+for coex in [0'u32, 1'u32]:
+  for operational in [false, true]:
+    for txAllowed in [false, true]:
+      setup(0)
+      nimFwBleWifiRoleWindowEnabled = coex
+      channelOperational = operational
+      channelTxAllowed = txAllowed
+      perform(0)
+      doAssert pushes == 1
+      doAssert channelPrepares == (coex != 0 and operational and txAllowed).int
+''',
     "handoff_replacement": r'''
 for kind in 0..1:
-  setup(kind)
-  hook = 6
-  action = 1
-  perform(kind)
-  doAssert hookFired
-  doAssert currentState == 9 and timerDelay == 12345 and not smConnecting,
-    "older TX handoff overwrote replacement connection state"
+  for rejected in [false, true]:
+    setup(kind)
+    pushFailure = rejected
+    hook = 6
+    action = 1
+    perform(kind)
+    doAssert hookFired
+    doAssert currentState == 9 and timerDelay == 12345 and not smConnecting,
+      "older TX handoff overwrote replacement connection state"
 ''',
-    "failed_submission": r'''
+    "submission_uses_response_deadline": r'''
 for kind in 0..1:
-  setup(kind)
-  pushFailure = true
-  perform(kind)
-  doAssert pushes == 1 and failures == 1 and currentState == 10,
-    "failed TX submission left the connection waiting"
-  doAssert timerDelay == 0
+  for rejected in [false, true]:
+    setup(kind)
+    pushFailure = rejected
+    let expected = if kind == 0: SmAuthenticatingState else: SmAssocRspState
+    perform(kind)
+    for retry in 0..2:
+      doAssert pushes == retry + 1 and failures == 0 and currentState == expected
+      doAssert conn.retry == retry.uint8 and timerDelay == 0x7D000
+      if not rejected: txl_frame_release(activeFrame, false) # Completion with no response.
+      doAssert not leased[0] and not leased[1]
+      runTimerClockAt(timerEntry.time - 1)
+      doAssert pushes == retry + 1 and failures == 0
+      runTimerClockAt(timerEntry.time)
+    doAssert pushes == 3 and releases == 3 and failures == 1 and timerDelay == 0
+    doAssert failureStatus == 11 and failureReason == 0xFFFF
+    runTimerClockAt(now + 0x7D000)
+    doAssert failures == 1
 ''',
     "response_visible_at_handoff": r'''
 for kind in 0..1:
@@ -357,6 +466,78 @@ for kind in 0..1:
     smConnecting = false
   perform(kind)
   doAssert currentState == 0 and timerDelay == 0 and not smConnecting
+''',
+    "auth_response_binding": r'''
+var challenge: array[128, uint8]
+for sample in [(0'u8, 1'u16, 2'u16), (1'u8, 1'u16, 2'u16),
+               (1'u8, 3'u16, 4'u16), (3'u8, 1'u16, 1'u16),
+               (3'u8, 2'u16, 2'u16)]:
+  let (algorithm, txSequence, responseSequence) = sample
+  setup(0)
+  conn.authType = algorithm
+  onHandoff = proc() =
+    doAssert smAuthResponseExpectations[1].txSequence == txSequence
+    doAssert smAuthResponseExpectations[1].algorithm == algorithm
+    doAssert timerDelay != 0 and currentState == SmAuthenticatingState
+  sm_auth_send(txSequence,
+    if algorithm == 1 and txSequence == 3: addr challenge[0] else: nil)
+  doAssert pushes == 1 and failures == 0
+  var owner = smTxCapture(addr conn)
+  doAssert smTxBindStation(owner, 2)
+  doAssert smAuthConsumeResponse(owner, algorithm.uint16, responseSequence)
+  doAssert not smAuthConsumeResponse(owner, algorithm.uint16, responseSequence)
+''',
+    "auth_failed_push_cancels_response": r'''
+for algorithm in [0'u8, 1, 3]:
+  setup(0)
+  conn.authType = algorithm
+  pushFailure = true
+  sm_auth_send(1, nil)
+  doAssert pushes == 1 and failures == 0 and timerDelay == 0x7D000
+  doAssert smAuthResponseExpectations[1].txSequence == 0
+''',
+    "join_peer_snapshot": r'''
+for kind in 0..1:
+  setup(kind)
+  if kind == 0: conn.authType = 3
+  let expectedPeer = stas[2].macAddr
+  let expectedOwn = vifs[1].macAddr
+  hook = 1
+  action = 7
+  onHandoff = proc() =
+    let header = hostTxDataHeader(activeFrame)
+    doAssert header.addr1 == expectedPeer and header.addr3 == expectedPeer
+    doAssert header.addr2 == expectedOwn
+    doAssert activeFrame.staInfoIdx == 2 and activeFrame.vifIdx == 1
+  perform(kind)
+  doAssert hookFired and pushes == 1 and failures == 0
+''',
+    "bad_join_peer": r'''
+for kind in 0..1:
+  for problem in 0..8:
+    setup(kind)
+    let published = [0x12'u8, 0x13, 0x14, 0x15, 0x16, 0x17]
+    vifs[1].currentBssid = published
+    stas[5] = stas[2]
+    stas[6] = stas[2]
+    case problem
+    of 0: vifs[1].staIdx = 0xFF
+    of 1: vifs[1].staIdx = 5
+    of 2: vifs[1].staIdx = 6
+    of 3: stas[2].valid = 0
+    of 4: stas[2].instNbr = 0
+    of 5: stas[2].macAddr[5] = 0xF0
+    of 6: vifs[1].bssid = default(typeof(vifs[1].bssid))
+    of 7:
+      stas[2].macAddr = default(typeof(stas[2].macAddr))
+      vifs[1].bssid = stas[2].macAddr
+    else:
+      stas[2].macAddr[0] = 1
+      vifs[1].bssid = stas[2].macAddr
+    perform(kind)
+    doAssert pushes == 0 and failures == 1 and timerSetCalls == 0
+    doAssert activeFrame == nil and vifs[1].currentBssid == published
+    doAssert failureStatus == (if kind == 0: 2'u16 else: 5'u16) and failureReason == 0xFFFF
 ''',
     "preparation_replacement": r'''
 for kind in 0..1:
@@ -413,6 +594,7 @@ for kind in 0..1:
   timerFailure = true
   perform(kind)
   doAssert pushes == 0 and failures == 1 and releases == 1 and timerDelay == 0
+  doAssert failureStatus == 11 and failureReason == 0xFFFF
 ''',
     "timer_descriptor_change": r'''
 for kind in 0..1:
@@ -424,11 +606,13 @@ for kind in 0..1:
     doAssert pushes == 0 and failures == 1 and releases == 1 and timerDelay == 0
 ''',
     "allocation_failure": r'''
-for kind in 0..1:
+for kind, expectedStatus in [1'u16, 4'u16]:
   setup(kind)
   allocationFailure = true
   perform(kind)
-  doAssert pushes == 0 and failures == 1 and releases == 0 and timerDelay == 0
+  doAssert pushes == 0 and releases == 0
+  doAssert timerSetCalls == 0 and timerDelay == 0
+  doAssert failures == 1 and failureStatus == expectedStatus and failureReason == 0xFFFF
 ''',
     "failed_handoff_replacement": r'''
 for kind in 0..1:
@@ -469,15 +653,82 @@ for kind in 0..1:
       let expected = if flag != 0 and (kind == 1 or algo != 3): 0x1E000'u32 else: 0x7D000'u32
       doAssert pushes == 1 and timerDelay == expected
 ''',
+    "published_request_ies": r'''
+for alreadyHasRsn in [false, true]:
+  setup(1)
+  encodedIeId = if alreadyHasRsn: IE_ID_RSN else: 1'u8
+  var rsn = [48'u8, 4, 1, 0, 2, 3]
+  vifs[1].rsnIePtr = addr rsn[0]
+  vifs[1].rsnIeLen = rsn.len.uint8
+  for b in indication.assocIeBuffer.mitems: b = 0xA5
+  let length = if alreadyHasRsn: 6 else: 12
+  var seen = false
+  onHandoff = proc() =
+    let bytes = hostTxLinkDescAt(activeFrame.bufDesc)
+    let start = sizeof(Header) + 4
+    doAssert indication.assocReqIeLen.int == length
+    doAssert activeFrame.frameLen.int == start + length
+    doAssert indication.assocIeBuffer[0..5] == [encodedIeId, 4, 0, 0, 0, 0]
+    if not alreadyHasRsn: doAssert indication.assocIeBuffer[6..11] == rsn
+    for i in 0..<length: doAssert indication.assocIeBuffer[i] == bytes.macHeader[start+i]
+    doAssert indication.assocIeBuffer[length] == 0xA5 and indication.assocRspIeLen == 0
+    seen = true
+  perform(1)
+  doAssert seen and pushes == 1 and failures == 0
+''',
+    "request_ie_append_bounds": r'''
+const baseIeSize = 230
+const room = TxlFramePayloadSize.int - sizeof(Header) - 4 - baseIeSize
+var extra: array[room + 1, uint8]
+extra[0..3] = [48'u8, 2, 1, 0]
+extra[4] = 221
+for i in 6..<extra.len: extra[i] = (i mod 251).uint8
+for excess in 0..1:
+  setup(1)
+  encodedIeId = 221
+  encodedIeSize = baseIeSize
+  encodedLength = 4 + baseIeSize
+  extra[5] = (room + excess - 6).uint8
+  vifs[1].rsnIePtr = addr extra[0]
+  vifs[1].rsnIeLen = (room + excess).uint8
+  for b in indication.assocIeBuffer.mitems: b = 0xA5
+  let before = indication
+  perform(1)
+  if excess == 0:
+    doAssert pushes == 1 and failures == 0 and descriptors[0].frameLen == TxlFramePayloadSize
+    doAssert indication.assocReqIeLen.int == baseIeSize + room
+    for i in 0..<room: doAssert indication.assocIeBuffer[baseIeSize+i] == extra[i]
+    doAssert indication.assocIeBuffer[baseIeSize+room] == 0xA5
+  else:
+    doAssert pushes == 0 and failures == 1 and releases == 1 and indication == before
+''',
+    "request_ie_replacement": r'''
+for stage in [1, 3, 4, 5, 7, 8]:
+  setup(1)
+  hook = stage
+  action = 8
+  replacementIndication.assocReqIeLen = 42
+  replacementIndication.assocIeBuffer[0] = 0xA5
+  let before = replacementIndication
+  perform(1)
+  doAssert hookFired and pushes == 0 and failures == 0 and releases == 1
+  doAssert replacementIndication == before
+  if stage < 7: doAssert indication.assocReqIeLen == 0
+''',
 }
 
 
 def program_source() -> str:
     sm = (FW / "scan_station_ap_me.nim").read_text()
     functions = procedure(sm, "sm_auth_send") + procedure(sm, "sm_assoc_req_send")
-    code = layouts("AuthFixedBodyView", "AuthBodyTraceView", "AssocReqFixedBodyView", "MacIeView")
+    timeout = procedure((FW / "task_handlers.nim").read_text(), "sm_rsp_timeout_ind_handler")
+    code = layouts("AuthFixedBodyView", "AuthBodyTraceView", "AssocReqFixedBodyView", "MacIeView", "MacAddrView",
+                   "SmConnectIndPayload")
     code += PLATFORM
-    debug = sorted(set(re.findall(r"\bnimFwDbg\w+", functions)))
+    code += procedure(sm, "macPtrIsSpecific")
+    code += procedure(sm, "macPtrEquals")
+    code += layouts("SmAuthResponseExpectation")
+    debug = sorted(set(re.findall(r"\bnimFwDbg\w+", functions + timeout)))
     arrays = {"nimFwDbgVifMac": 6, "nimFwDbgAuthTxRaw": 256, "nimFwDbgAssocReqRaw": 256}
     code += "\nvar\n" + "".join(
         f"  {name}: array[{arrays[name]}, uint8]\n" if name in arrays else f"  {name}: uint32\n"
@@ -487,15 +738,26 @@ def program_source() -> str:
         layout = (FW / "layout_types.nim").read_text()
         code += "type\n  SmTxBuildContext" + layout.split("  SmTxBuildContext", 1)[1].split("\n\n  ", 1)[0] + "\n"
         code += helper.read_text()
+        code += (FW / "station_response_timeout.nim").read_text()
+        code += procedure(sm, "smTxSnapshotJoinPeer")
         code += r'''
 proc meBuildSaeAuthenticate(buf: pointer; algo, sequence, status: uint16; vif: uint32;
-                            build: ptr SmTxBuildContext): uint32 =
+                            build: ptr SmTxBuildContext; peerOverride, ownOverride: pointer): uint32 =
+  doAssert peerOverride != nil and ownOverride != nil
+  let header = hostTxDataHeader(activeFrame)
+  doAssert cast[ptr array[6, uint8]](peerOverride)[] == header.addr1
+  doAssert cast[ptr array[6, uint8]](ownOverride)[] == header.addr2
   me_build_sae_authenticate(buf, algo, sequence, status, vif)
 proc meBuildAssociateReq(buf, assocInfo, reassoc, cap, cursorOut, lengthOut, info: pointer;
                          build: ptr SmTxBuildContext): uint32 =
   me_build_associate_req_impl(buf, assocInfo, reassoc, cap, cursorOut, lengthOut, info)
 '''
-    return code + functions + CHECKS
+    code += functions
+    code += r'''
+proc sm_auth_send_pre(sequence: uint16; challenge: pointer) = sm_auth_send(sequence, challenge)
+proc sm_assoc_req_send_pre() = sm_assoc_req_send()
+'''
+    return code + timeout + CHECKS
 
 
 def run_case(tmp_path: Path, case: str, mode: str) -> None:

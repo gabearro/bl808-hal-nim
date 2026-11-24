@@ -24,18 +24,20 @@ var
   ipcEmbEnvStruct: array[5, uint32]
   allocationToken: uint32
   rawStatus, unmask, configLow, configHigh, events: uint32
+  magic = 0x49504332'u32
   reads: seq[uint]
   operations: seq[Operation]
-  allocations, clears: int
+  allocations, clears, assertions: int
+  missingTaskCallback, missingTaskHandle: bool
   nimFwDbgIpcTxFlowOn, nimFwDbgIpcTxFlowOff: uint32
 proc ipcEmbEnvView(): ptr Env = addr env
 proc ipcSharedEnvView(): ptr Shared = addr shared
 proc allocate(): pointer {.cdecl.} =
   inc allocations
-  addr allocationToken
+  if missingTaskHandle: nil else: addr allocationToken
 proc blOpsFunc(slot: int): pointer =
   doAssert slot == 0x44
-  cast[pointer](allocate)
+  if missingTaskCallback: nil else: cast[pointer](allocate)
 proc c_memset(p: pointer; value: cint; size: csize_t): pointer =
   doAssert p == (addr ipcEmbEnvStruct[0]) and value == 0 and size == 20
   zeroMem(p, size.int)
@@ -43,7 +45,11 @@ proc c_memset(p: pointer; value: cint; size: csize_t): pointer =
   inc clears
   p
 proc assert_err(condition, file: cstring; line: int) =
-  doAssert false, "unexpected IPC assertion"
+  doAssert line == 183
+  inc assertions
+proc assert_rec(condition, file: cstring; line: int) =
+  doAssert line == 0
+  inc assertions
 proc regRead(address: uint): uint32 =
   reads.add(address)
   case address
@@ -51,7 +57,7 @@ proc regRead(address: uint): uint32 =
   of 0x2480011C'u: rawStatus and unmask
   of 0x24800114'u: configLow
   of 0x24800118'u: configHigh
-  of 0x24800140'u: 0x49504332'u32
+  of 0x24800140'u: magic
   else: raiseAssert "unexpected IPC read"
 proc regWrite(address: uint; value: uint32) =
   operations.add(('w', address, value))
@@ -78,6 +84,10 @@ proc setup(status: uint32; mask = 0xFFFFFFFF'u32) =
   operations.setLen(0)
   allocations = 0
   clears = 0
+  assertions = 0
+  missingTaskCallback = false
+  missingTaskHandle = false
+  magic = 0x49504332'u32
   ipcEmbEnv = nil
   ipcEmbEnvStruct = [1'u32, 2, 3, 4, 5]
   env = default(Env)
@@ -164,6 +174,37 @@ expected.add(('w', 0x2480010C'u, 0x1F03'u32))
 doAssert operations == expected and reads == expectedReads
 doAssert configLow == 0x3FF2A04'u32 and configHigh == 0
 doAssert rawStatus == 0xA5001F00'u32 and unmask == 0x1F03
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_initialization_stops_on_bad_ipc_magic(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+setup(0xA5001F00'u32, 0)
+magic = 0
+ipc_emb_init()
+doAssert assertions == 1 and allocations == 1 and clears == 1
+doAssert ipcEmbEnv == nil
+doAssert reads == @[0x24800140'u]
+doAssert operations.len == 0
+doAssert configLow == 0xB6CDE123'u32 and configHigh == 0x5A3C9876'u32
+doAssert unmask == 0 and rawStatus == 0xA5001F00'u32
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_initialization_stops_without_task_binding(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+for missingCallback in [false, true]:
+  setup(0xA5001F00'u32, 0)
+  ipcEmbEnv = addr allocationToken
+  missingTaskCallback = missingCallback
+  missingTaskHandle = not missingCallback
+  ipc_emb_init()
+  doAssert ipcEmbEnv == nil and assertions == 1
+  doAssert allocations == (if missingCallback: 0 else: 1)
+  doAssert clears == 0 and reads.len == 0 and operations.len == 0
+  doAssert ipcEmbEnvStruct == [1'u32, 2, 3, 4, 5]
 ''')
 
 

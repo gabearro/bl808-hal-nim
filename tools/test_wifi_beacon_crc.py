@@ -117,11 +117,11 @@ for size in 0 .. 3:
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-def test_trailing_and_truncated_elements_stop_at_frame_end(tmp_path: Path, mode: str) -> None:
-    expected = zlib.crc32(bytes([100, 0, 0, 0]) + b"Z") ^ 0xFFFFFFFF
-    run_program(tmp_path, mode, beacon_source() + f'''
+def test_trailing_and_truncated_elements_reject_beacon(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, beacon_source() + r'''
 for bytes in [@[0'u8, 1, 90, 221], @[0'u8, 1, 90, 221, 4, 1]]:
   loadIes(bytes)
   process()
-  doAssert timOut == 0 and vif.beaconCrc == {expected}'u32
+  doAssert timOut == 0 and vif.beaconCrc == 0
+  doAssert vif.beaconRxCount == 0 and sends == 0
 ''')

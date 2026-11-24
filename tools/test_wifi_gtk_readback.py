@@ -116,12 +116,14 @@ doAssert size == 0xA6
     "copy_completion": r'''
 prepare(1)
 var output: array[32, uint8]
+for value in output.mitems: value = 0xA5
 var size = 0xA6'u8
 copyHook = proc() =
   inc rxKeyRevision
   rxKeyLastChanged[7] = rxKeyRevision
 doAssert bl_wifi_get_sta_gtk(0, addr output[0], addr size) == -1
 doAssert size == 0xA6 and irq
+for value in output: doAssert value == 0xA5
 ''',
 }
 

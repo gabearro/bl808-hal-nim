@@ -27,13 +27,13 @@ const
   IpcSignalKernel* = 3
     ## IPC signal bit reserved for kernel cross-core RPC.
 
-  MaxRpcHandlers* = 16
+  MaxRpcHandlers* {.intdefine.} = 16
     ## Maximum number of registered RPC handlers per core.
 
-  MaxPendingCalls* = 8
+  MaxPendingCalls* {.intdefine.} = 8
     ## Maximum concurrent cross-core calls per core.
 
-  MaxIpcCompletions* = 16
+  MaxIpcCompletions* {.intdefine.} = 16
     ## Maximum IPC completions deferred from response parsing to scheduler code.
 
   IpcCallTimeoutMsDefault* = 0'u64
@@ -98,6 +98,29 @@ proc findHandler(tag: uint16): RpcHandler =
     if rpcHandlers[i].tag == tag:
       return rpcHandlers[i].handler
   nil
+
+proc ipcTryRegisterHandler*(tag: uint16, handler: RpcHandler): bool =
+  ## Register a service that must report a full RPC table or an occupied tag.
+  if handler == nil or rpcHandlerCount == MaxRpcHandlers: return false
+  for i in 0 ..< rpcHandlerCount:
+    if rpcHandlers[i].tag == tag: return false
+  ipcRegisterHandler(tag, handler)
+  true
+
+proc ipcRequestFrom*(request: ptr UncheckedArray[uint8], peer: IpcTarget): bool =
+  ## Compare the request pointer passed to the handler with the peer's slot.
+  let slot = when defined(bl808m0):
+    case peer
+    of ipcD0: XramD0toM0Req
+    of ipcLP: XramLPtoM0Req
+    else: 0'u
+  elif defined(bl808d0):
+    if peer == ipcM0: XramM0toD0Req else: 0'u
+  elif defined(bl808lp):
+    if peer == ipcM0: XramM0toLPReq else: 0'u
+  else:
+    0'u
+  slot != 0 and cast[uint](request) == slot + 8
 
 # =============================================================================
 # Pending call tracking (client side)
@@ -629,7 +652,7 @@ proc armIpcPollKeepAlive() =
   ipcPollKeepAliveArmed = true
   discard addTimerMs(ipcPollKeepAliveMs, ipcPollKeepAliveTick)
 
-proc ipcBridgeInit*() =
+proc ipcBridgeInit*(pollingOnly: static bool = false) =
   ## Initialize the IPC bridge on this core.
   ## Call after schedulerInit() and ipcInit().
   rpcHandlerCount = 0
@@ -651,7 +674,9 @@ proc ipcBridgeInit*() =
   # Don't clear here — the other core may have already written data.
 
   # Register IPC ISR
-  when defined(bl808m0):
+  when pollingOnly:
+    discard # The host owns the trap vector; the poll hook handles IPC.
+  elif defined(bl808m0):
     registerTrapHandler(IrqM0Ipc, ipcKernelHandler)
     irqEnable(IrqM0Ipc)
     irqSetLevel(IrqM0Ipc, 1)
@@ -679,7 +704,8 @@ proc ipcBridgeInit*() =
 
   # Register poll hook for scheduler fallback
   addSchedulerPollHook(proc() = ipcPoll())
-  armIpcPollKeepAlive()
+  when not pollingOnly:
+    armIpcPollKeepAlive()
 
   # Initialize HAL-level IPC
   ipcInit()

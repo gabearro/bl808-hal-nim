@@ -2,6 +2,11 @@ proc wifi_mgmr_prepare_join_after_scan(): cint =
   wifi_mgmr_recover_terminal_connect_failure(true)
 
 proc wifi_mgmr_scan*(data: pointer; cb: ScanCompleteCb): cint {.exportc, cdecl.} =
+  when defined(bl808WifiDiagWarmScan):
+    defer: nimFwDbgWarmScanSubmitStatus = result
+  when defined(bl808WifiConnectCacheHint):
+    # Even a rejected new scan must not authorize pinning a previous result.
+    scanCacheHintArmed = false
   discard data
   if cb != nil: discard
   if not staEnabled: return -1
@@ -14,12 +19,16 @@ proc wifi_mgmr_scan*(data: pointer; cb: ScanCompleteCb): cint {.exportc, cdecl.}
     broadcastBssid[bssidByteIndex] = 0xff
   scanDoneCount = 0
   scanItemCount = 0
+  scanConfirmationStatus = high(uint32) # No firmware confirmation yet.
   scanDiagReset()
   when defined(bl808WifiConnectCacheHint):
     scanCacheReset()
+    scanCacheHintArmed = true
   result = bl_main_scan(cast[ptr Netif](ifaceNetif(staIface())), nil, 0,
                         cast[ptr MacAddr](addr broadcastBssid[0]), nil,
                         ScanActive, 0)
+  when defined(bl808WifiConnectCacheHint):
+    if result != 0: scanCacheHintArmed = false
   vendorPutsRaw("[WIFI] scan start rc=")
   if result < 0:
     vendorPutsRaw("-")
@@ -31,7 +40,8 @@ proc wifi_mgmr_scan*(data: pointer; cb: ScanCompleteCb): cint {.exportc, cdecl.}
 proc wifi_mgmr_sta_connect*(iface: ptr pointer; ssid, psk, pmk: cstring; mac: ptr uint8;
                             band: uint8; chanId: uint8): cint {.exportc, cdecl.} =
   discard iface
-  if not staEnabled or ssid == nil: return -1
+  if not staEnabled or ssid == nil or band != 0 or
+      (chanId != 0 and chanId.cint > bl_msg_get_channel_nums()): return -1
   if not beginStationControl(): return -16
   defer: endStationControl()
   nimfwDbgStaConnectStage = 1
@@ -60,7 +70,10 @@ proc wifi_mgmr_sta_connect*(iface: ptr pointer; ssid, psk, pmk: cstring; mac: pt
     var selectedChannel = 0'u8
     var selectedRssi = -128'i8
     connectBssid = if scannedBssidIsSpecific(mac): mac else: nil
-    if scanCacheFind(ssid, ssidLen, mac, chanId, addr selectedBssid,
+    # The next admitted join consumes the explicit scan's optional hint.
+    let mayPin = scanCacheHintArmed and scanDoneCount != 0 and scanConfirmationStatus == 0
+    scanCacheHintArmed = false
+    if mayPin and scanCacheFind(ssid, ssidLen, mac, chanId, addr selectedBssid,
                      addr selectedChannel, addr selectedRssi):
       vendorPutsRaw("[WIFI] sta_connect cache hit\r\n")
       # Pin the join to the cache-selected BSSID. Letting the SM perform a
@@ -71,6 +84,7 @@ proc wifi_mgmr_sta_connect*(iface: ptr pointer; ssid, psk, pmk: cstring; mac: pt
         freq = wifiChannelToFreq(selectedChannel)
       nimfwDbgStaConnectFreq = freq.uint32 or (selectedChannel.uint32 shl 16)
     else:
+      if not mayPin: scanCacheClearSelection()
       vendorPutsRaw("[WIFI] sta_connect cache miss\r\n")
   connectDone = -1
   lastStatusCode = -1
@@ -88,10 +102,13 @@ proc wifi_mgmr_sta_connect*(iface: ptr pointer; ssid, psk, pmk: cstring; mac: pt
                            cast[ptr uint8](psk), pskLen.cint,
                            cast[ptr uint8](pmk), pmkLen.cint,
                            connectBssid, band, freq, flags)
-  if result != 0 and connectDone < 0:
-    connectDone = 8
-    lastStatusCode = 8
-    lastReasonCode = -1
+  if result != 0:
+    when defined(bl808WifiConnectCacheHint):
+      scanCacheConnectPending = false
+    if connectDone < 0:
+      connectDone = 8
+      lastStatusCode = 8
+      lastReasonCode = -1
   nimfwDbgStaConnectStage = 6
   nimfwDbgStaConnectResult = cast[uint32](result)
   nimfwDbgStaConnectState = sm_state.uint32

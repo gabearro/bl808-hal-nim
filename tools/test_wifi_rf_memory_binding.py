@@ -46,6 +46,7 @@ proc modemInitCoreMode(frequency, restore: uint32; mode: RadioPhyMode) =
   rf_pri_init_calib_mem()
   doAssert rfCalibDataGlobal == wlCalGlobal
 '''
+    code += rf_procedure(rf, "wlInitModemAndPublish")
     code += rf_procedure(rf, "wl_init")
     return code + r'''
 proc setup(seed: int; savedRf: bool) =
@@ -144,7 +145,7 @@ for radioMode in [wifiOnly, bleOnly, wifiBleCoex]:
     configureWlRfConfig(cfg, 40000000, radioMode, cold)
     doAssert cfg.paramLoadCallback == nil and cfg.capcodeSetCallback == nil and cfg.capcodeGetCallback == nil
     doAssert cfg.enableParamLoadCallback == 0
-    doAssert wl_init() == 0
+    doAssert wlInitModemAndPublish(true)
     doAssert modemCalls == 1 and callbackCalls == 0 and configCalls == 1
     doAssert rfCalibDataGlobal == addr memories[0].calib[0]
     doAssert memories[0].calib == calibration

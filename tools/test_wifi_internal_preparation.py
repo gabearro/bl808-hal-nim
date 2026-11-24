@@ -46,6 +46,7 @@ def platform_source() -> str:
   replacementSnapshot: HostTxDescView
   replacementHardware: HwDesc
   replacementLink: LinkDesc
+  incomingIrq: bool
 """
     for name in ["txl_int_fake_transfer", "txl_payload_handle_backup", "nimFwTrace2U32", "nimFwMgmtFcTrace"]:
         source = source.replace(procedure(source, name), "")
@@ -118,7 +119,7 @@ proc observe(label: string) =
 
 proc txl_payload_handle_backup(p: pointer) =
   inc drainCalls
-  doAssert not interruptsEnabled and drainCalls == 1
+  doAssert interruptsEnabled == incomingIrq and drainCalls == 1
   doAssert txEnv.packetCounter == 1
   doAssert backups[selectedAc] == held[0].bufDesc
   doAssert tails[selectedAc] == held[0].bufDesc
@@ -148,6 +149,7 @@ proc apm_tx_int_ps_postpone(p, sta: pointer) =
 proc initialize(caseProfile, ac: int) =
   watching = false
   interruptsEnabled = true
+  incomingIrq = true
   setup()
   for i in 0 .. 3:
     held[i] = hostTxDescAt(txl_frame_get(24))
@@ -230,6 +232,7 @@ for force in [false, true]:
   initialize(0, 2)
   stopAt = 0
   interruptsEnabled = false
+  incomingIrq = false
   let accepted = if force: txl_cntrl_push_int_force(held[0], 2)
                  else: txl_cntrl_push_int(held[0], 2)
   doAssert accepted == 1 and not interruptsEnabled
@@ -279,7 +282,7 @@ def test_internal_preparation(tmp_path: Path, mode: str, mutation: str | None) -
         assert old in push
         push = push.replace(old, "  apm_tx_int_ps_postpone(param, staEntry)\n  frameEnv.postponedCount = frameEnv.postponedCount + 1")
     elif mutation == "irq":
-        push = push.replace("  let saved = irqSave()\n  defer: irqRestore(saved)\n", "")
+        push = push.replace("  let saved = irqSave()\n", "  let saved = 8'u32\n", 1)
     elif mutation == "fake_callout":
         functions = functions.replace("  # Publication must stay callback-free, as in the vendor's 52-byte helper.\n",
             "  nimFwTrace2U32(\"fake\", queueIdx, 0)\n")
@@ -303,9 +306,12 @@ def test_internal_publication_has_no_reentrant_gap() -> None:
     for name in ["txl_cntrl_push_int", "txl_cntrl_push_int_force"]:
         body = procedure(tx, name)
         assert body.index("irqSave()") < body.index("txlStationAdmits(desc)")
-        assert body.count("irqRestore(saved)") == 1
-        assert "defer: irqRestore(saved)" in body
+        assert body.count("irqRestore(saved)") == 2
+        assert "if irqHeld: irqRestore(saved)" in body
         assert body.index("txCtrl.packetCounter = txCtrl.packetCounter + 1") < body.index("txl_payload_handle_backup(param)")
+        indent = "  " if name.endswith("force") else "      "
+        handoff = f"{indent}irqHeld = false\n{indent}irqRestore(saved)\n{indent}txl_payload_handle_backup(param)"
+        assert body.index(handoff) > body.index("txCtrl.packetCounter = txCtrl.packetCounter + 1")
         tail = body.split("txl_payload_handle_backup(param)", 1)[1]
         tail = "\n".join(line.split("#", 1)[0] for line in tail.splitlines()).split("return 1'u8", 1)[0]
         assert re.search(r"\bdesc\.|\brcStats\b|nimFw.*Trace", tail) is None

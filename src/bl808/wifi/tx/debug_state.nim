@@ -14,6 +14,7 @@ var nimFwDbgDhcpTxRaw* {.exportc: "nimfw_dbg_dhcp_tx_raw".}: array[384, uint8]
 var nimFwDbgDhcpTxBreakHits* {.exportc: "nimfw_dbg_dhcp_tx_break_hits".}: uint32
 var nimFwDbgDhcpRequestTxBreakHits* {.exportc: "nimfw_dbg_dhcp_request_tx_break_hits".}: uint32
 var nimFwDbgDhcpTxMsgHist* {.exportc: "nimfw_dbg_dhcp_tx_msg_hist".}: array[8, uint32]
+# Retained for existing bench captures; diagnostics no longer repair packets.
 var nimFwDbgDhcpUdpChecksumRepair* {.exportc: "nimfw_dbg_dhcp_udp_csum_repair".}: uint32
 var nimFwDbgDhcpUdpChecksumBefore* {.exportc: "nimfw_dbg_dhcp_udp_csum_before".}: uint32
 var nimFwDbgDhcpUdpChecksumCalc* {.exportc: "nimfw_dbg_dhcp_udp_csum_calc".}: uint32
@@ -58,13 +59,6 @@ var nimFwDbgTxUdpIp* {.exportc: "nimfw_dbg_tx_udp_ip".}: uint32
 var nimFwDbgTxTcp* {.exportc: "nimfw_dbg_tx_tcp".}: uint32
 var nimFwDbgTxTcp80* {.exportc: "nimfw_dbg_tx_tcp80".}: uint32
 var nimFwDbgTxTcpFlags* {.exportc: "nimfw_dbg_tx_tcp_flags".}: uint32
-var nimFwDbgTxTcp80Len* {.exportc: "nimfw_dbg_tx_tcp80_len".}: uint32
-var nimFwDbgTxTcp80ChecksumRepair* {.exportc: "nimfw_dbg_tx_tcp80_csum_repair".}: uint32
-var nimFwDbgTxTcp80ChecksumBefore* {.exportc: "nimfw_dbg_tx_tcp80_csum_before".}: uint32
-var nimFwDbgTxTcp80ChecksumCalc* {.exportc: "nimfw_dbg_tx_tcp80_csum_calc".}: uint32
-var nimFwDbgTxTcp80ChecksumAfter* {.exportc: "nimfw_dbg_tx_tcp80_csum_after".}: uint32
-var nimFwDbgTxTcp80ChecksumVerifyBefore* {.exportc: "nimfw_dbg_tx_tcp80_csum_vbefore".}: uint32
-var nimFwDbgTxTcp80ChecksumVerifyAfter* {.exportc: "nimfw_dbg_tx_tcp80_csum_vafter".}: uint32
 
 # TX flow-control gate state, recorded at every bl_output enqueue:
 # bits [7:0]=sta.fcPs, [15:8]=vif.fcChan, [31:16]=txCntrlStaTrigger low bits.

@@ -6,6 +6,7 @@
 
 when defined(bl808m0) and defined(bl808WifiNimFw):
   import sdk_headers
+  from ../sec import secOk, trngReadAll
   import ../wifi_fw
 
   include support/defs

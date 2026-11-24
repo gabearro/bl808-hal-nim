@@ -17,8 +17,10 @@ Optional RF/PHY provenance checks:
   VALIDATE_RF_BUILD_LOG=build.log tools/validate_wifi_fw_objdump.sh <ref> <nim_obj>
   VALIDATE_RF_LINK_MAP=kernel.map tools/validate_wifi_fw_objdump.sh <ref> <nim_obj>
   VALIDATE_RF_REQUIRE_HW_NIMCACHE=1 VALIDATE_RF_ELF=build/hw-validation/bin/<test>/kernel.elf tools/validate_wifi_fw_objdump.sh <ref> <nim_obj>
-  When src/bl808/librf_bl808.a is present, the RF provenance step also checks
-  that WiFi phy_init copies agcmem to 0x24C0A000 and has no LDPC RAM path.
+  BL808_DEMO_RF_ARCHIVE=/path/to/libbl606p_phyrf.a pins the BL808 demo's
+  MAC and PHY/RF archives before using them as WiFi references.
+  VALIDATE_WIFI_LEGACY_RF=1 checks the BL616-derived AGC-only profile against
+  src/bl808/librf_bl808.a. It is not the BL808 demo WiFi reference.
   When a hw-validation kernel.map exists beside VALIDATE_RF_ELF, the RF
   provenance step also rejects extracted RF archive members in the link map.
   When a hw-validation kernel build log exists for VALIDATE_RF_ELF, the RF
@@ -112,10 +114,16 @@ def parse_objdump(path: str):
     fn = None
     out = {}
     for line in txt.splitlines():
+        if line.startswith("Disassembly of section ") or "\tfile format " in line:
+            fn = None
+            continue
         m = re.match(r"^([0-9a-fA-F]+) <([^>]+)>:$", line.strip())
         if m:
-            fn = m.group(2)
-            out.setdefault(fn, {"bytes": [], "mnem": []})
+            # LLVM prints local branch targets as labels inside the function.
+            # They do not terminate the enclosing function's instruction stream.
+            if not m.group(2).startswith("."):
+                fn = m.group(2)
+                out.setdefault(fn, {"bytes": [], "mnem": []})
             continue
         if fn is None:
             continue
@@ -164,7 +172,10 @@ PY
 
 if [[ -f tools/validate_rf_symbol_provenance.py ]]; then
   RF_ARGS=(--wifi-object "$NIM_BIN")
-  if [[ -f src/bl808/librf_bl808.a ]]; then
+  if [[ -n "${BL808_DEMO_RF_ARCHIVE:-}" ]]; then
+    RF_ARGS+=(--bl808-demo-mac-archive "$REF" --bl808-demo-rf-archive "$BL808_DEMO_RF_ARCHIVE")
+  fi
+  if [[ "${VALIDATE_WIFI_LEGACY_RF:-0}" == 1 ]]; then
     RF_ARGS+=(--rf-archive src/bl808/librf_bl808.a --check-wifi-phy-memory-init)
   fi
   if [[ -n "${VALIDATE_RF_HW_TEST:-}" ]]; then

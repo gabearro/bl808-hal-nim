@@ -1,11 +1,14 @@
 proc wifiBeginScanWait(timeoutMs: uint32): CpsFuture[uint32] =
   if not wifiBackendUsesEventFutures():
+    noteWifiScan(wifiScanUnavailable, 0'u32)
     return completedLocalFuture(0'u32)
   cancelWifiTimer(wifiScanTimer)
   let fut = newLocalCpsFuture[uint32]()
   wifiScanFuture = fut
+  noteWifiScan(wifiScanPending, 0'u32)
   if timeoutMs != 0'u32:
     wifiScanTimer = addTimerMs(timeoutMs.uint64, proc() =
+      noteWifiScan(wifiScanTimedOut, 0'u32)
       completeWifiScan(0'u32)
     )
   wifiCompletePendingEvents()

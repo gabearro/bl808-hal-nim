@@ -108,6 +108,7 @@ for rateOnly in [false, true]:
   for i in 0..<full.len: full[i] = (i - 20).int8
   let original = full
   let oldOffsets = tpcChannelOffsetTable
+  let oldShadow = tpcPowerTable
   var rates: array[24, int8]
   copyMem(addr rates[0], addr full[0], 24)
   if rateOnly: bl_tpc_update_power_table_rate(addr rates)
@@ -116,11 +117,11 @@ for rateOnly in [false, true]:
   bl_tpc_power_table_get(addr output)
   for i in 0..<24: doAssert output[i] == original[i], "WiFi wrapper lost a rate update"
   for i in 0..<14:
-    let expected = if rateOnly: oldOffsets[i] else: original[24 + i]
-    doAssert output[24 + i] == expected and tpcChannelOffsetTable[i] == expected
+    doAssert output[24 + i] == 0
+    doAssert tpcChannelOffsetTable[i] == oldOffsets[i]
+    doAssert tpcPowerTable[24 + i] == oldShadow[24 + i]
     if not rateOnly:
-      doAssert tpcPowerTable[24 + i] == expected
-      doAssert scaledOffsets[i] == cast[int8](expected.int32 * 4)
+      doAssert scaledOffsets[i] == cast[int8](original[24 + i].int32 * 4)
   doAssert offsetUpdates == (if rateOnly: 0 else: 1)
   doAssert full == original
   assertRateLookup(rates)
@@ -162,6 +163,25 @@ for kind in [0'u8, 1, 2, 255]:
     doAssert trpcTxpwrVsRateTable[i] == original[i]
   doAssert config == oldConfig
 ''',
+    "config_pointer_snapshot": r'''
+for kind in [0'u8, 1'u8]:
+  setup()
+  wlCfgGlobal = addr config[0]
+  copyCalls = 0
+  for i in 0..<alternateConfig.len:
+    alternateConfig[i] = config[i] xor 1'u8
+  loadConfig(kind)
+  doAssert copyCalls == 5
+  doAssert wlCfgGlobal == addr alternateConfig[0]
+  for i in 0..<4: doAssert trpcTxpwrVsRateTable[i] == config[0x32 + i]
+  for i in 0..<8:
+    doAssert trpcTxpwrVsRateTable[10 + i] == config[0x36 + i]
+    doAssert trpcTxpwrVsRateTable[20 + i] == config[(if kind == 0: 0x3E else: 0x46) + i]
+  for i in 0..<10:
+    let expected = config[(if kind == 0: 0x6C else: 0x78) + i]
+    doAssert trpcTxpwrVsRateTable[30 + i] == expected
+    doAssert trpcTxpwrVsRateTable[40 + i] == expected
+''',
     "empty_inputs": r'''
 setup()
 let original = trpcTxpwrVsRateTable
@@ -170,7 +190,10 @@ trpc_update_power(nil)
 trpc_update_power_11b(nil)
 trpc_update_power_11g(nil)
 trpc_update_power_11n(nil)
+bl_tpc_update_power_table(nil)
+bl_tpc_power_table_get(nil)
 doAssert trpcTxpwrVsRateTable == original
+doAssert offsetUpdates == 0
 wlCfgGlobal = nil
 loadConfig(0)
 loadConfig(1)
@@ -186,7 +209,21 @@ def test_tpc_adapter(tmp_path: Path, case: str, mode: str) -> None:
     if nim is None:
         pytest.skip("Nim is required")
     path = tmp_path / "tpc_adapter.nim"
-    path.write_text(source() + CASES[case])
+    code = source()
+    if case == "config_pointer_snapshot":
+        rf = (FW / "global_state/rf_bl808_core.nim").read_text()
+        code = code.replace(procedure(rf, "trpcCopyFromWlCfg"), r'''
+var
+  alternateConfig: array[544, uint8]
+  copyCalls: int
+proc trpcCopyFromWlCfg(cfg: pointer, dstOffset: int, cfgOffset: uint,
+                       count: int) =
+  inc copyCalls
+  if copyCalls == 1:
+    wlCfgGlobal = addr alternateConfig[0]
+  trpcCopyTable(dstOffset, cast[pointer](cast[uint](cfg) + cfgOffset), count)
+''')
+    path.write_text(code + CASES[case])
     flags = {
         "checked": [],
         "release": ["-d:release", "--assertions:on"],

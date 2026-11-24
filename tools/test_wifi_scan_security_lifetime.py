@@ -54,6 +54,8 @@ def base() -> str:
         code = code.replace(procedure(code, name), replacement, 1)
     code += r'''
 const TASK_SM = 4'u8
+const WifiKeyMgmtSae = 1024'u32
+const WifiAuthMaskSae = 1024'u32
 var
   smTxSerials, rxVifEpochs: array[MAX_VIFS, uint32]
   txResetEpoch: uint32
@@ -173,6 +175,34 @@ for family in ["wpa", "rsn"]:
 ''')
 
 
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_security_ie_copy_preserves_complete_length(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, security_source() + r'''
+for size in [6, 128, 129, 255, 256, 257]:
+  prepare()
+  protocol = "rsn"
+  informationElement[0] = 48
+  informationElement[1] = (size - 2).uint8
+  for i in 2 ..< size: informationElement[i] = (i mod 251).uint8
+  parserLength = size.uint8
+  assocSecIeStore = default(typeof(assocSecIeStore))
+  exercise()
+  if size <= 255:
+    doAssert forwards == 0 and parserCalls == 1 and notifications == 1
+    doAssert assoc.rsnIeLen == size.uint8
+    for i in 0 ..< size:
+      doAssert assocSecIeStore[0][i] == informationElement[i]
+    for i in size ..< assocSecIeStore[0].len:
+      doAssert assocSecIeStore[0][i] == 0
+  else:
+    # The parser callback takes a uint8 total length, so these IEs are
+    # rejected before the copy branch and never forwarded as accepted BSSes.
+    doAssert forwards == 0 and parserCalls == 0 and notifications == 0
+    doAssert assoc.rsnIeLen == 0
+    for byte in assocSecIeStore[0]: doAssert byte == 0
+''')
+
+
 def test_directed_owner_is_bound_before_use() -> None:
     scan = (FW / "scan_station_ap_me.nim").read_text()
     body = procedure(scan, "scanu_frame_handler")
@@ -215,7 +245,8 @@ def wps_source() -> str:
     support = r'''
 const WPS_OUI = [0'u8, 0x50, 0xF2, 4]
 proc mac_vsie_find(p: pointer; n: uint32; oui: pointer; size: uint32): pointer = addr informationElement[0]
-proc scanuPublishFrameResult(frame: pointer; item: ptr ScanuResultEntry;
+proc scanuPublishFrameResult(frame: pointer; frameLen: uint16; payloadLen: uint32;
+    item: ptr ScanuResultEntry;
     request: pointer; epoch, generation: uint32; count, bfOn: uint8;
     connection: ptr SmTxBuildContext = nil) =
   if connection != nil: doAssert smTxOwnerCurrent(connection[])
@@ -229,6 +260,8 @@ proc exerciseWps(directed: bool) =
   let ieStart = cast[pointer](addr informationElement[0])
   let ieLen = informationElement.len.uint32
   let numSsids = 1'u8
+  let totalLen = 36'u16
+  let len = 68'u32
 '''
     return base() + support + wrapper + body
 

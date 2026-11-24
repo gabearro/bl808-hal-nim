@@ -16,11 +16,6 @@ proc vif_mgmt_entry_init*(vifEntry: pointer): bool {.exportc, cdecl.} =
   vif.chanCtxt = nil
   true
 
-proc vif_mgmt_add_to_list*(vifEntry: pointer) {.exportc, cdecl.} =
-  ## Add VIF entry to the active VIF list and notify platform.
-  ## Placeholder: sends notification to platform layer.
-  discard
-
 proc vif_mgmt_init*(): bool {.exportc, cdecl.} =
   ## Initialize VIF management.
   ## From blob (67 instrs): zeroes vif_mgmt_env, inits two CoLists (free + active),
@@ -76,17 +71,25 @@ proc vif_mgmt_init*(): bool {.exportc, cdecl.} =
   co_list_push_back(addr env.freeList, cast[ptr CoListHdr](vif1Entry))
   true
 
+when defined(bl808WifiApHttpSmoke):
+  var nimfwApRegisterStage {.exportc: "nimfw_ap_register_stage", wifiCtrl.}: uint32
+
 proc vif_mgmt_register*(macAddr: pointer, vifType: uint8, p2p: bool, vifIdxOut: ptr uint8): uint8 {.exportc, cdecl.} =
   ## Register a new VIF (143 instrs).
   ## From blob: checks vif_mgmt_env[0] (active list head). If vif_mgmt_env[8]
-  ## is nonzero, validates MAC address against platform MAC registers. Then calls
-  ## mm_hw_info_set. Pops free VIF from vif_mgmt_env list via co_list_pop_front.
+  ## is nonzero, validates MAC address against platform MAC registers. The
+  ## first VIF calls mm_hw_info_set. Pops a free VIF via co_list_pop_front.
   ## Sets vifType, copies MAC addr, computes vifIdx, sets timer constants,
   ## For STA type: increments STA count, sets up STA-specific fields, calls
   ## wpa_cbs[0]->init callback. For AP type: calls mm_hw_ap_info_set on first AP,
   ## increments AP count, calls mm_bcn_init_vif. Then calls td_start and
   ## co_list_push_back to add to active VIF list.
-  if txlResetting(): return 1
+  template stage(value: uint32) =
+    when defined(bl808WifiApHttpSmoke):
+      if vifType == VIF_TYPE_AP: nimfwApRegisterStage = value
+  stage(1)
+  if txlResetting() or macAddr == nil or vifIdxOut == nil or vifType >= 4'u8:
+    return 1
   let env = vifMgmtEnvView()
   # Check if VIF management is initialized (vif_mgmt_env[0] = list head)
   if vifType == VIF_TYPE_AP and (env.apCount != 0 or not mmBeaconPoolIdle()):
@@ -97,8 +100,16 @@ proc vif_mgmt_register*(macAddr: pointer, vifType: uint8, p2p: bool, vifIdxOut: 
       if vifChannelForIdx(index).vifType == VIF_TYPE_AP:
         return 1
   let listHead = env.freeList.first
+  stage(2)
   if listHead == nil:
     return 1
+  var freeIdx = 0'u8
+  while freeIdx < MAX_VIFS.uint8 and
+      cast[ptr CoListHdr](vifChannelForIdx(freeIdx)) != listHead:
+    inc freeIdx
+  if freeIdx >= MAX_VIFS.uint8 or vifChannelForIdx(freeIdx).vifType != 4'u8:
+    return 1
+  stage(3)
   # Check if platform MAC address filter is active (vif_mgmt_env+8)
   let platFilter = env.activeList.first
   if platFilter != nil:
@@ -115,27 +126,44 @@ proc vif_mgmt_register*(macAddr: pointer, vifType: uint8, p2p: bool, vifIdxOut: 
     let diff = (mac16hi.uint32 xor platMac16.uint32) and (not macMask)
     if diff != 0:
       return 1
-    # Set filter flags: OR bit 16 into mm_env[1], write combined filter to RX ctrl
+  stage(4)
+  let epochBefore = rxVifEpochs[freeIdx]
+  if not rxInvalidateVif(freeIdx):
+    return 1
+  if rxVifEpochs[freeIdx] != epochBefore + 1'u32:
+    return 1
+  var freeVifListNode: ptr CoListHdr
+  block:
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    if env.freeList.first != listHead or
+        env.activeList.first != platFilter or
+        vifChannelForIdx(freeIdx).vifType != 4'u8 or txlResetting():
+      return 1
+    if vifType == VIF_TYPE_AP and
+        (env.apCount != 0 or not mmBeaconPoolIdle()):
+      return 1
+    freeVifListNode = co_list_pop_front(addr env.freeList)
+  if freeVifListNode != listHead:
+    return 1
+  stage(5)
+  let vifIdx = freeIdx
+  let vifEntry = cast[pointer](freeVifListNode)
+  let vif = vifChannelAt(vifEntry)
+  let ownerEpoch = rxVifEpochs[vifIdx]
+  template claimed(expectedType: uint8): bool =
+    rxVifEpochs[vifIdx] == ownerEpoch and vif.vifType == expectedType and
+      not co_list_find(addr env.freeList, freeVifListNode) and
+      not co_list_find(addr env.activeList, freeVifListNode)
+  if platFilter != nil:
+    # A compatible additional VIF only extends the shared RX filter.
     let mm = mmEnvView()
     mm.rxFilterExtra = mm.rxFilterExtra or 16
     regWrite(MACHW_RX_CNTRL_REG, mm.rxFilterExtra or mm.rxFilterBase)
-  # Set up HW info
-  mm_hw_info_set(macAddr)
-  # Pop free VIF entry from list
-  let freeVifListNode = co_list_pop_front(addr env.freeList)
-  if freeVifListNode == nil:
-    return 1
-  let vifEntry = cast[pointer](freeVifListNode)
-  let vif = vifChannelAt(vifEntry)
-  # Find the popped VIF in the typed table.
-  var vifIdx = 0'u8
-  while vifIdx < MAX_VIFS.uint8 and vifChannelForIdx(vifIdx) != vif:
-    inc vifIdx
-  if vifIdx >= MAX_VIFS.uint8:
-    return 1
-  if not rxInvalidateVif(vifIdx):
-    co_list_push_front(addr env.freeList, freeVifListNode)
-    return 1
+    if not claimed(4'u8): return 1
+  else:
+    mm_hw_info_set(macAddr)
+    if not claimed(4'u8): return 1
   vif.vifType = vifType
   discard c_memcpy(cast[pointer](addr vif.macAddr[0]), macAddr, 6.csize_t)
   vif.vifIdx = vifIdx
@@ -171,20 +199,26 @@ proc vif_mgmt_register*(macAddr: pointer, vifType: uint8, p2p: bool, vifIdxOut: 
       let initFn = cast[ptr pointer](cast[uint](wpaCbsVal))[]
       if initFn != nil:
         cast[proc(){.cdecl.}](initFn)()
+        if not claimed(vifType): return 1
   elif vifType == VIF_TYPE_AP:
     # AP mode
     if env.apCount == 0:
       # First AP VIF: set HW AP info
       mm_hw_ap_info_set(0)
+      if not claimed(vifType): return 1
     env.apCount = env.apCount + 1
     # Initialize beacon for this VIF
     mm_bcn_init_vif(vifEntry)
+    if not claimed(vifType): return 1
   # Common: call td_start, push to active VIF list, write vifIdx output
   td_start(vifIdx)
-  if vifType == VIF_TYPE_STA:
-    vif.vifType = VIF_TYPE_STA
-  vifIdxOut[] = vifIdx
-  co_list_push_back(addr env.activeList, cast[ptr CoListHdr](vifEntry))
+  block:
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    if not claimed(vifType): return 1
+    vifIdxOut[] = vifIdx
+    co_list_push_back(addr env.activeList, freeVifListNode)
+  stage(6)
   return 0
 
 proc vif_mgmt_unregister*(vifIdx: uint8): bool {.exportc, cdecl, discardable.} =
@@ -201,7 +235,7 @@ proc vif_mgmt_unregister*(vifIdx: uint8): bool {.exportc, cdecl, discardable.} =
   let vifEntry = cast[pointer](vif)
   let vifType = vif.vifType
   let entryEpoch = rxVifEpochs[vifIdx]
-  if vifType != VIF_TYPE_STA and vifType != VIF_TYPE_AP:
+  if vifType >= 4'u8:
     return true
   if not co_list_find(addr env.activeList, cast[ptr CoListHdr](vifEntry)):
     return true
@@ -223,7 +257,7 @@ proc vif_mgmt_unregister*(vifIdx: uint8): bool {.exportc, cdecl, discardable.} =
   co_list_extract(addr env.activeList, cast[ptr CoListHdr](vifEntry))
   if vifType == VIF_TYPE_STA:
     dec env.staCount
-  else:
+  elif vifType == VIF_TYPE_AP:
     dec env.apCount
   let retiredEpoch = entryEpoch + 1'u32
   template current(): bool =
@@ -248,25 +282,25 @@ proc vif_mgmt_unregister*(vifIdx: uint8): bool {.exportc, cdecl, discardable.} =
     if not current():
       return true
 
-  # Check if this was the last VIF (STA+AP count == 1)
-  if env.staCount.uint + env.apCount.uint == 1:
+  # Registration enables the two-VIF filter for every interface type, including
+  # IBSS and mesh. Count the active list rather than only STA and AP entries.
+  let remaining = env.activeList.first
+  if remaining != nil and remaining == env.activeList.last:
     # Single VIF remaining: update RX filter and HW config
     let mm = mmEnvView()
     mm.rxFilterExtra = mm.rxFilterExtra and (not 16'u32)  # clear bit 4
     regWrite(MACHW_RX_CNTRL_REG, mm.rxFilterExtra or mm.rxFilterBase)
 
     # Update beacon control from remaining VIF's channel context
-    let otherVifIdx = if vifIdx == 0: 1'u8 else: 0'u8
-    let otherVif = vifChannelForIdx(otherVifIdx)
-    if co_list_find(addr env.activeList, cast[ptr CoListHdr](otherVif)):
-      let bssidLow = otherVif.currentBssid[0].uint32 or
-        (otherVif.currentBssid[1].uint32 shl 8) or
-        (otherVif.currentBssid[2].uint32 shl 16) or
-        (otherVif.currentBssid[3].uint32 shl 24)
-      let bssidHigh = otherVif.currentBssid[4].uint32 or
-        (otherVif.currentBssid[5].uint32 shl 8)
-      regWrite(MACHW_BASE + 0x020'u, bssidLow)
-      regWrite(MACHW_BASE + 0x024'u, bssidHigh)
+    let otherVif = vifChannelAt(cast[pointer](remaining))
+    let bssidLow = otherVif.currentBssid[0].uint32 or
+      (otherVif.currentBssid[1].uint32 shl 8) or
+      (otherVif.currentBssid[2].uint32 shl 16) or
+      (otherVif.currentBssid[3].uint32 shl 24)
+    let bssidHigh = otherVif.currentBssid[4].uint32 or
+      (otherVif.currentBssid[5].uint32 shl 8)
+    regWrite(MACHW_BASE + 0x020'u, bssidLow)
+    regWrite(MACHW_BASE + 0x024'u, bssidHigh)
 
   # The vendor dispatches teardown by the VIF being removed.
   if vifType == VIF_TYPE_STA:
@@ -287,6 +321,11 @@ proc vif_mgmt_unregister*(vifIdx: uint8): bool {.exportc, cdecl, discardable.} =
   mm_timer_clear(addr vif.beaconTimeoutTimer)
   if not current():
     return true
+  if vifType == VIF_TYPE_STA:
+    # Direct removal can bypass STA deactivation and leave the watchdog linked.
+    mm_timer_clear(addr vif.keepAliveTimer)
+    if not current():
+      return true
 
   # Reset traffic detection for this VIF
   td_reset(vifIdx)
@@ -325,9 +364,14 @@ proc vifReuseBipKey(param: pointer; hwKeyIdx: uint8): bool =
 proc vif_mgmt_add_key*(param: pointer, hwKeyIdx: uint8) {.exportc, cdecl.} =
   ## Install one of the VIF's six keys: data slots 0..3 or BIP slots 4..5.
   ## The historical view names staIdx/keySlot hold key ID/VIF index here.
+  let req = vifMgmtAddKeyParamView(param)
+  if req == nil or req.keySlot >= MAX_VIFS.uint8 or req.staIdx >= 6'u8:
+    return
+  if req.cipherType in [1'u8, 2'u8, 5'u8] and
+      (req.pnHighBytes[2] != 0 or req.pnHighBytes[3] != 0):
+    return
   if vifReuseBipKey(param, hwKeyIdx):
     return
-  let req = vifMgmtAddKeyParamView(param)
   let vif = vifChannelForIdx(req.keySlot)
   let keyId = req.staIdx.uint
   let keyView = vifKeySlot(vif, keyId)
@@ -377,6 +421,8 @@ proc vif_mgmt_add_key*(param: pointer, hwKeyIdx: uint8) {.exportc, cdecl.} =
 proc vif_mgmt_del_key*(vifEntry: pointer, keySlot: uint8) {.exportc, cdecl, noinline.} =
   ## Invalidate the key and select the first remaining data/BIP replacement.
   {.emit: "__asm__ volatile(\"\" ::: \"memory\");".}
+  if vifEntry == nil or keySlot >= 6'u8:
+    return
   let vif = vifChannelAt(vifEntry)
   let keySlotU = keySlot.uint
   let keyView = vifKeySlot(vif, keySlotU)
@@ -557,8 +603,10 @@ proc vif_mgmt_set_ap_bcn_int*(vifEntry: pointer, interval: uint16) {.exportc, cd
       let cv = vifChannelAt(curVifPtr)
       let cvInt = cv.apBeaconInterval
       cv.beaconCountdown = 1
-      let divisor = cvInt div minInterval
-      cv.beaconDivisor = divisor.uint8
+      # RV32 DIVU returns all ones for a zero divisor.
+      cv.beaconDivisor =
+        if minInterval == 0'u16: 0xFF'u8
+        else: (cvInt div minInterval).uint8
       curVifPtr = cv.next
   # Write minimum interval to HW beacon interval register (lower 16 bits)
   let beaconIntervalRegValue = regRead(MACHW_BCN_INT_REG)
@@ -566,10 +614,6 @@ proc vif_mgmt_set_ap_bcn_int*(vifEntry: pointer, interval: uint16) {.exportc, cd
   regWrite(MACHW_BCN_INT_REG, beaconIntervalRegHighHalf or minInterval.uint32)
   # Restore interrupts
   irqRestore(prevIrq)
-
-proc vif_mgmt_switch_channel*(vifIdx: uint8, param: pointer) {.exportc, cdecl.} =
-  ## Switch channel for a VIF.
-  discard
 
 proc vif_mgmt_sta_status*(vifIdx: uint8; mac: pointer): cint {.exportc, cdecl.} =
   ## -1: no matching STA interface; 0: inactive; 1: station resources in use.
@@ -606,6 +650,32 @@ proc vif_mgmt_get_first_ap_inf*(): pointer {.exportc, cdecl.} =
       return activeVifListNode
     activeVifListNode = vif.next  # follow linked list next
   return nil
+
+when defined(bl808WifiDiagLinkDrop):
+  type NimFwStaBeaconEvidence* = object
+    valid*: bool
+    vifIndex*, stationIndex*, missed*: uint8
+    received*, lastBeaconUs*, sampleUs*, probeEpoch*: uint32
+
+  proc nimFwSnapshotStaBeaconEvidence*(): NimFwStaBeaconEvidence =
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    for index in 0'u8 ..< MAX_VIFS.uint8:
+      let vif = vifChannelForIdx(index)
+      if vif.vifType != VIF_TYPE_STA or vif.vifIdx != index or
+          vif.state == 0 or vif.chanCtxt == nil or
+          vif.staIdx >= STA_MGMT_FREE_STAS.uint8:
+        continue
+      let sta = staInfoForIdx(vif.staIdx)
+      if sta.valid == 0 or sta.instNbr != index: continue
+      # An unqualified sample must not guess between two associated STA VIFs.
+      if result.valid: return default(NimFwStaBeaconEvidence)
+      result = NimFwStaBeaconEvidence(valid: true, vifIndex: index,
+        stationIndex: vif.staIdx, missed: vif.probeCount,
+        received: vif.beaconRxCount, lastBeaconUs: vif.lastBeaconMacTime,
+        probeEpoch: mmBeaconProbeEpochs[index])
+    if result.valid:
+      result.sampleUs = macTimeNow()
 
 proc vif_mgmt_statistic_dump*() {.exportc, cdecl.} =
   ## Report active VIF beacon statistics, with a bounded pre-callback snapshot.

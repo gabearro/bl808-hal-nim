@@ -120,7 +120,7 @@ def source() -> str:
         if f"proc {name}(" in text:
             code += procedure(text, name)
     for name in ["set_mac_to_doze", "wait_mac_goto_idle", "wait_mac_goto_prestate",
-                 "wakeup_from_doze_pre", "wakeup_from_doze_done"]:
+                 "wakeup_from_doze_pre", "wakeup_from_doze_done", "mac_recovery"]:
         code += procedure(text, name)
     return code
 
@@ -154,6 +154,16 @@ for enabled in [false, true]:
     doAssert assertions == @[("0", "bl.c", 287.cint)]
     doAssert messages.len == enabled.int
     checkPsUnchanged()
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_mac_recovery_reports_vendor_condition(tmp_path: Path, mode: str) -> None:
+    run_program(tmp_path, mode, source() + r'''
+setup()
+doAssert mac_recovery() == 0
+doAssert assertions == @[("HW MAC still cann't enter idle", "bl.c", 299.cint)]
+doAssert reads.len == 0 and writes.len == 0
 ''')
 
 
@@ -248,9 +258,38 @@ doAssert timeouts.len == 1 and writes == @[(MACHW_STATE_CNTRL_REG, 0x30'u32)]
 checkPsUnchanged()
 
 setup()
+blDozeEnvView().dozeInProgress = 1
 registers[MACHW_STATE_CNTRL_REG] = 2
 doAssert wakeup_from_doze_pre() == 1
-doAssert bl_env[1] == 0 and timeouts.len == 1
+doAssert bl_env[1] == 1 and timeouts.len == 1
 doAssert writes[^1] == (MACHW_INTC_BASE + 0x074, 0xA0000080'u32)
 checkPsUnchanged()
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_missing_wakeup_interrupt_restores_mask_and_checks_final_state(
+    tmp_path: Path, mode: str
+) -> None:
+    run_program(tmp_path, mode, source() + r'''
+for finalState in [0'u32, 2'u32]:
+  setup()
+  blDozeEnvView().dozeInProgress = 1
+  blDozeEnvView().preState = 3
+  registers[MACHW_INTC_BASE + 0x06C] = 0
+  registers[MACHW_STATE_CNTRL_REG] = finalState
+  ticks = @[0'u32]
+  doAssert wakeup_from_doze_pre() == (if finalState == 0: 0'u32 else: 1'u32)
+  doAssert blDozeEnvView().dozeInProgress == (finalState != 0).uint32
+  doAssert blDozeEnvView().preState == 3
+  doAssert timeouts == (if finalState == 0:
+    @[(uint32(MACHW_INTC_BASE + 0x06C), 4'u32)]
+  else:
+    @[(uint32(MACHW_INTC_BASE + 0x06C), 4'u32),
+      (uint32(MACHW_STATE_CNTRL_REG), 0xF'u32)])
+  doAssert writes[^3 .. ^1] == @[(MACHW_INTC_BASE + 0x070, 4'u32),
+    (MACHW_INTC_BASE + 0x074, 0x20000080'u32),
+    (MACHW_INTC_BASE + 0x074, 0xA0000080'u32)]
+  doAssert registers[MACHW_INTC_BASE + 0x048] == 0x92345678'u32
+  checkPsUnchanged()
 ''')

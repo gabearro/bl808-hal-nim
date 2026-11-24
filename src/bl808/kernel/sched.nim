@@ -3,8 +3,8 @@
 ## Drives CPS green threads via a simple run loop:
 ##   1. Drain ISR-posted callbacks
 ##   2. Fire expired timers (tickless — only programs next deadline)
-##   3. Run all ready callbacks (CPS continuation steps)
-##   4. WFI until next event
+##   3. Run one ready batch (CPS continuation steps)
+##   4. Run poll hooks and recheck timers before considering WFI
 ##
 ## There is one global `scheduler` instance per core.
 ## All public API is safe to call from task context.
@@ -20,11 +20,14 @@ const
     ## Fixed ISR callback queue depth. postFromIsr drops callbacks after this
     ## limit and records an overflow count instead of allocating in interrupt
     ## context.
-  MaxSchedulerTimers* = 32
+  MaxSchedulerTimers* {.intdefine.} = 32
     ## Bounded timer heap backing store. Timer entries carry closures, so the
     ## heap stores stable pointers to these slots instead of copying entries.
   MaxSchedulerTimedPollHooks* = 8
     ## Bounded count of scheduler-owned timed poll hooks.
+
+static:
+  doAssert MaxSchedulerTimers >= 1 and MaxSchedulerTimers <= 32
 
 # =============================================================================
 # Timer heap entry
@@ -112,6 +115,17 @@ proc addSchedulerTimedPollHook*(hook: SchedulerTimedPollHook;
   )
   schedulerTimedPollHookCount.inc
   true
+
+proc rescheduleSchedulerTimedPollHook*(hook: SchedulerTimedPollHook,
+                                        deadline: uint64): bool =
+  ## Change an installed hook from task context. Zero disarms it until the
+  ## next call. The run loop includes the new deadline before entering WFI.
+  if hook == nil: return false
+  for i in 0 ..< schedulerTimedPollHookCount:
+    if schedulerTimedPollHooks[i].hook == hook:
+      schedulerTimedPollHooks[i].deadline = deadline
+      return true
+  false
 
 # =============================================================================
 # Min-heap operations on scheduler.timers
@@ -218,7 +232,7 @@ proc timerIsrHandler() {.cdecl.} =
 # Scheduler init
 # =============================================================================
 
-proc schedulerInit*() =
+proc schedulerInit*(pollingOnly: static bool = false) =
   ## Initialize the scheduler. Call once at boot after heapInit().
   scheduler.ready = @[]
   scheduler.timers = @[]
@@ -249,9 +263,9 @@ proc schedulerInit*() =
   # Initialize the ISR bridge
   isrBridgeInit()
 
-  # Register the machine timer ISR and enable it
-  registerTrapHandler(MachineTimerIrq, timerIsrHandler)
-  enableTimerIrq()
+  when not pollingOnly:
+    registerTrapHandler(MachineTimerIrq, timerIsrHandler)
+    enableTimerIrq()
 
 # =============================================================================
 # Posting callbacks
@@ -355,19 +369,16 @@ proc fireExpiredTimers(s: var Scheduler) =
       now = interruptDeadline
 
 proc runReadyCallbacks(s: var Scheduler) =
-  ## Run all callbacks currently in the ready queue.
-  ## Callbacks may enqueue more callbacks (via CPS continuation chains),
-  ## so we iterate until the queue is empty.
-  while s.ready.len > 0:
-    # Snapshot and clear — callbacks may add to ready during execution
-    let batch = move s.ready
-    s.ready = @[]
-    for i in 0 ..< batch.len:
-      batch[i]()
-      s.totalCallbacks += 1
-    # Drain any ISR callbacks that arrived while running
-    withInterruptsDisabled:
-      s.drainIsrPending()
+  ## Run the ready batch present on entry. Work posted by that batch runs on
+  ## the next iteration, so a task that keeps yielding cannot starve hooks.
+  if s.ready.len == 0: return
+  let batch = move s.ready
+  for i in 0 ..< batch.len:
+    batch[i]()
+    s.totalCallbacks += 1
+  # Preserve the order of ISR work arriving during the batch and posts from hooks.
+  withInterruptsDisabled:
+    s.drainIsrPending()
 
 proc reprogramNextDeadline(s: Scheduler) {.inline.} =
   ## Set the hardware timer to fire at the next timer heap entry,
@@ -418,6 +429,27 @@ proc hasDueTimedPollHooks(now: uint64): bool {.inline.} =
       return true
   false
 
+proc runSchedulerIteration(checkStack: static bool) =
+  scheduler.totalTicks += 1
+  withInterruptsDisabled:
+    scheduler.drainIsrPending()
+  drainIsrCompletions()
+  scheduler.fireExpiredTimers()
+  scheduler.runReadyCallbacks()
+  runPollHooks()
+  runTimedPollHooks(readTick())
+  when checkStack:
+    if not faultCheckStackGuard():
+      faultHalt(FaultReasonStackGuard, 0'u, 0'u, 0'u)
+  drainIsrCompletions()
+  scheduler.fireExpiredTimers()
+
+proc pollScheduler*() =
+  ## Run one ready batch and service timers without WFI or changing IRQ setup.
+  ## Use with polling-only initialization when the host owns traps and stack.
+  scheduler.running = true
+  runSchedulerIteration(false)
+
 proc runScheduler*() {.noreturn.} =
   ## Enter the scheduler main loop. Does not return.
   ##
@@ -426,30 +458,9 @@ proc runScheduler*() {.noreturn.} =
   scheduler.running = true
   enableInterrupts()
   while true:
-    scheduler.totalTicks += 1
+    runSchedulerIteration(true)
 
-    # 1. Drain ISR-posted callbacks + ISR completion ring
-    withInterruptsDisabled:
-      scheduler.drainIsrPending()
-    drainIsrCompletions()
-
-    # 2. Fire expired timers → these complete futures → enqueue CPS callbacks
-    scheduler.fireExpiredTimers()
-
-    # 3. Run all ready callbacks
-    scheduler.runReadyCallbacks()
-
-    # 4. Run poll hooks (IPC, watchdog, networking, etc.)
-    runPollHooks()
-    runTimedPollHooks(readTick())
-    if not faultCheckStackGuard():
-      faultHalt(FaultReasonStackGuard, 0'u, 0'u, 0'u)
-
-    # 5. Re-check timers and ISR completions (callbacks may have added new ones)
-    drainIsrCompletions()
-    scheduler.fireExpiredTimers()
-
-    # 6. Program next deadline and sleep. If a timer is pending, the
+    # Program next deadline and sleep. If a timer is pending, the
     # compare interrupt wakes WFI; spinning until the deadline wastes power
     # and starves lower-power validation of the real idle path.
     scheduler.reprogramNextDeadline()
@@ -465,8 +476,13 @@ proc runScheduler*() {.noreturn.} =
                       isrBridgePendingCompletions() == 0 and not timerIsrFired and
                       not hasUntimedPollHooks() and
                       not hasDueTimedPollHooks(readTick())
-      if shouldSleep:
-        wfi()
+        when defined(bl808WasmRtPolicy):
+          # A pending, locally enabled interrupt wakes WFI with MIE clear.
+          # Keep the final ready check and WFI together so the timer ISR
+          # cannot clear the compare in between.
+          if shouldSleep: wfi()
+      when not defined(bl808WasmRtPolicy):
+        if shouldSleep: wfi()
 
 # =============================================================================
 # Scheduler stats

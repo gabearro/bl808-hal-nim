@@ -11,12 +11,20 @@ import subprocess
 import pytest
 
 from test_wifi_disconnect_tx import procedure
+from test_wifi_message_allocation import run_program
 
 ROOT = Path(__file__).resolve().parents[1]
 FW = ROOT / "src/bl808/wifi/fw"
 
 PLATFORM = r"""
 const
+  MAX_VIFS = 2
+  VIF_TYPE_STA = 0'u8
+  RC_FORMATMOD_HT_MF = 2'u8
+  RC_MAX_RATE_ENTRIES = 10
+  RCS_FORMAT_MOD = 177
+  RCS_GROUP_CNT = 188
+  RCS_N_RATES = 192
   RCS_ANOTHER_FLAG = 176
   RCS_RATE_BITMAP = 178
   RCS_MAX_NSS_MCS = 184
@@ -34,6 +42,7 @@ type
     instNbr, htVhtConfig: uint8
     aggregationLength: uint32
   Vif = object
+    vifType: uint8
     mcsSet: array[16, uint8]
 var
   sta: Sta
@@ -42,6 +51,7 @@ var
   calledRates: array[4, uint32]
   originalPolicy: array[60, uint8]
   irqActive: bool
+  policyUpdateOnRestore: uint8
 proc staInfoAt(p: pointer): ptr Sta = cast[ptr Sta](p)
 proc vifChannelForIdx(index: uint8): ptr Vif =
   doAssert index == sta.instNbr
@@ -60,6 +70,7 @@ proc irqRestore(state: uint32) =
   doAssert state == 8 and irqActive
   irqActive = false
   inc irqCalls
+  sta.txPolicyUpdateFlags[0] = sta.txPolicyUpdateFlags[0] or policyUpdateOnRestore
 """
 
 HARNESS = r"""
@@ -97,6 +108,15 @@ for offset in countup(0, vectors.len - stride, stride):
   for i in 0 ..< 8:
     doAssert statsStore[i] == 0xA5 and statsStore[208 + i] == 0xA5
     doAssert policyStore[i] == 0xA5 and policyStore[68 + i] == 0xA5
+
+copyMem(addr originalPolicy[0], sta.txPolicy, 60)
+sta.txPolicyUpdateFlags[0] = StaTxPolicyUpdateTxPower
+policyUpdateOnRestore = StaTxPolicyUpdateRateControl
+powerCalls = 0
+irqCalls = 0
+doAssert me_update_buffer_control(addr sta) == sta.txPolicy
+doAssert powerCalls == 4 and irqCalls == 2
+doAssert sta.txPolicyUpdateFlags[0] == StaTxPolicyUpdateRateControl
 """
 
 
@@ -234,6 +254,107 @@ def test_tx_policy(mode, tmp_path):
     source += tpc
     source += procedure((FW / "scan_station_ap_me.nim").read_text(), "me_update_buffer_control")
     compile_and_run(tmp_path, mode, source + f'\nconst vectorPath = "{data}"\n' + HARNESS)
+
+
+@pytest.mark.parametrize("mode", ["checked", "firmware", "asan"])
+def test_native_station_keeps_distinct_ht_retry_rates(mode, tmp_path):
+    layout = (FW / "layout_types.nim").read_text()
+    source = PLATFORM + "\ntype\n  TxPolicyView" + layout.split("  TxPolicyView", 1)[1].split("  MichaelMicContextView", 1)[0]
+    source += "\ntemplate txPolicyAt(p: pointer): ptr TxPolicyView = cast[ptr TxPolicyView](p)\n"
+    source += "proc tpc_get_vif_tx_power_vs_rate(rate: uint32): int8 =\n  calledRates[powerCalls] = rate\n  inc powerCalls\n  0\n"
+    source += procedure((FW / "scan_station_ap_me.nim").read_text(), "me_update_buffer_control")
+    run_program(tmp_path, mode, source + r'''
+var stats: array[50, uint32]
+var policy: TxPolicyView
+sta.rcStats = addr stats[0]
+sta.txPolicy = addr policy
+sta.htVhtConfig = 1
+vif.mcsSet[0] = 0xFF
+const rates = [0x1205'u16, 0x1002'u16, 0x1005'u16, 0x0400'u16]
+rcU16(sta.rcStats, RCS_N_RATES) = 4
+rcU8(sta.rcStats, RCS_FORMAT_MOD) = RC_FORMATMOD_HT_MF
+for i, rate in rates:
+  rcU16(sta.rcStats, 10 + 12 * i) = rate
+  rcU16(sta.rcStats, 128 + 8 * i) = i.uint16
+
+for vifType in [VIF_TYPE_STA, 1'u8]:
+  vif.vifType = vifType
+  for fixed in [0'u8, 0x40'u8]:
+    rcU8(sta.rcStats, RCS_FLAGS) = fixed
+    for rotation in 0 ..< 4:
+      rcU8(sta.rcStats, RCS_ANOTHER_FLAG) = rotation.uint8
+      rcU8(sta.rcStats, RCS_RATE_BITMAP) = 0x24
+      rcU8(sta.rcStats, RCS_MAX_NSS_MCS) = 5
+      sta.txPolicyUpdateFlags[0] = StaTxPolicyUpdateRateControl
+      copyMem(addr originalPolicy[0], sta.txPolicy, 60)
+      irqCalls = 0
+      powerCalls = 0
+      discard me_update_buffer_control(addr sta)
+      let sdkRewrite = vifType != VIF_TYPE_STA and rotation != 3
+      for slot in 0 ..< 4:
+        let expected = rates[(slot + rotation) mod 4].uint32
+        let actual = if sdkRewrite and fixed == 0 and expected >= 0x1000:
+          (expected and not 0x7F'u32) or 7'u32
+        else:
+          expected
+        doAssert policy.retryRate[slot] == (0x80000000'u32 or actual)
+        doAssert calledRates[slot] == policy.retryRate[slot]
+      doAssert rcU8(sta.rcStats, RCS_RATE_BITMAP) == (if sdkRewrite: 0xFF'u8 else: 0x24'u8)
+      doAssert rcU8(sta.rcStats, RCS_MAX_NSS_MCS) == (if sdkRewrite: 7'u8 else: 5'u8)
+      doAssert irqCalls == 2 and powerCalls == 4
+''', defines=("bl808WifiNativeWlanCalibration",))
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_tx_policy_rejects_invalid_rate_state(mode, tmp_path):
+    layout = (FW / "layout_types.nim").read_text()
+    source = PLATFORM + "\ntype\n  TxPolicyView" + layout.split("  TxPolicyView", 1)[1].split("  MichaelMicContextView", 1)[0]
+    source += "\ntemplate txPolicyAt(p: pointer): ptr TxPolicyView = cast[ptr TxPolicyView](p)\n"
+    source += "proc tpc_get_vif_tx_power_vs_rate(rate: uint32): int8 =\n  inc powerCalls\n  0\n"
+    source += procedure((FW / "scan_station_ap_me.nim").read_text(), "me_update_buffer_control")
+    source += r'''
+var statsStore: array[216, uint8]
+var policyStore: array[76, uint8]
+for byte in statsStore.mitems: byte = 0xA5
+for byte in policyStore.mitems: byte = 0xA5
+sta.rcStats = addr statsStore[8]
+sta.txPolicy = addr policyStore[8]
+sta.txPolicyUpdateFlags[0] = StaTxPolicyUpdateRateControl
+sta.instNbr = 0
+
+proc rejected() =
+  let beforeStats = statsStore
+  let beforePolicy = policyStore
+  doAssert me_update_buffer_control(addr sta) == sta.txPolicy
+  doAssert statsStore == beforeStats and policyStore == beforePolicy
+  doAssert sta.txPolicyUpdateFlags[0] == StaTxPolicyUpdateRateControl
+  doAssert irqCalls == 0 and powerCalls == 0 and not irqActive
+
+rcU16(sta.rcStats, RCS_N_RATES) = 0
+rejected()
+rcU16(sta.rcStats, RCS_N_RATES) = 11
+rejected()
+rcU16(sta.rcStats, RCS_N_RATES) = 2
+for slot in 0 ..< 4: rcU16(sta.rcStats, 0x80 + slot * 8) = 0
+rcU8(sta.rcStats, RCS_ANOTHER_FLAG) = 3
+rcU16(sta.rcStats, 0x88) = 2
+rejected()
+rcU16(sta.rcStats, 0x88) = 0
+sta.instNbr = MAX_VIFS.uint8
+rejected()
+sta.instNbr = 0
+let savedStats = sta.rcStats
+sta.rcStats = nil
+rejected()
+sta.rcStats = savedStats
+let savedPolicy = sta.txPolicy
+sta.txPolicy = nil
+doAssert me_update_buffer_control(addr sta) == nil
+doAssert sta.txPolicyUpdateFlags[0] == StaTxPolicyUpdateRateControl
+sta.txPolicy = savedPolicy
+doAssert me_update_buffer_control(nil) == nil
+'''
+    compile_and_run(tmp_path, mode, source)
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])

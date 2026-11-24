@@ -3,13 +3,344 @@ from __future__ import annotations
 
 import json
 import hashlib
+import re
+import struct
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+import build_bl808_boot2_flash
 import hw_validate
+
+
+@pytest.mark.parametrize("offset", [False, 0xB0000, 0xE1000, 0x100000])
+def test_lp_flash_offset_rejects_invalid_window(offset):
+    with pytest.raises(RuntimeError, match="64 KiB-aligned"):
+        hw_validate.lp_flash_offset_for_test({"lp_flash_offset": offset})
+
+
+def test_allcore_flash_segments_use_manifest_lp_slot(monkeypatch, tmp_path):
+    def output(core, data):
+        path = tmp_path / f"{core}.bin"
+        path.write_bytes(data)
+        return hw_validate.BuildOutput(core, f"bl808{core}", "example.nim",
+                                       path.with_suffix(".elf"), path, core)
+
+    outputs = {core: output(core, b"image") for core in ("m0", "d0", "lp")}
+    monkeypatch.setattr(hw_validate, "build_m0_jtag_flash_segments",
+                        lambda item, **_: [hw_validate.JtagFlashSegment(0xDF000, item.bin, "FW")])
+    args = {"args": SimpleNamespace(), "work_dir": tmp_path, "outputs": outputs}
+    test = {"name": "allcore", "lp_flash_offset": 0xE0000}
+    segments = hw_validate.jtag_flash_segments_for_outputs(test, **args)
+    assert [(segment.label, segment.address) for segment in segments] == [
+        ("FW", 0xDF000), ("lp", 0xE0000), ("d0", 0x100000)]
+    m0_only = {**args, "outputs": {"m0": outputs["m0"]}}
+    outputs["m0"].bin.write_bytes(bytes(0x1000))
+    assert hw_validate.jtag_flash_segments_for_outputs(test, **m0_only) == segments[:1]
+    outputs["m0"].bin.write_bytes(bytes(0x1001))
+    with pytest.raises(RuntimeError, match="retained LP image at 0x0E0000"):
+        hw_validate.jtag_flash_segments_for_outputs(test, **m0_only)
+    with pytest.raises(RuntimeError, match="overlapping flash segments"):
+        hw_validate.jtag_flash_segments_for_outputs(test, **args)
+    outputs["lp"].bin.write_bytes(bytes(0x20001))
+    with pytest.raises(RuntimeError, match="LP image exceeds its flash window below D0"):
+        hw_validate.jtag_flash_segments_for_outputs(test, **args)
+
+
+def test_flash_planner_rejects_disjoint_writes_to_same_erase_sector(tmp_path):
+    payload = tmp_path / "byte.bin"
+    payload.write_bytes(b"a")
+    segments = [hw_validate.JtagFlashSegment(0x10000, payload, "first"),
+                hw_validate.JtagFlashSegment(0x10001, payload, "second")]
+    with pytest.raises(RuntimeError, match="overlapping flash segments \\(erase ranges\\)"):
+        hw_validate.validate_flash_segments_do_not_overlap(segments)
+
+
+def test_flash_planner_checks_legacy_jtag_lp_erase_block(tmp_path):
+    payload = tmp_path / "byte.bin"
+    payload.write_bytes(b"a")
+    segments = [hw_validate.JtagFlashSegment(hw_validate.JTAG_FLASH_LP_OFFSET, payload, "LP"),
+                hw_validate.JtagFlashSegment(hw_validate.JTAG_FLASH_LP_OFFSET + 0x1000, payload, "next")]
+    hw_validate.validate_flash_segments_do_not_overlap(segments)
+    with pytest.raises(RuntimeError, match="overlapping flash segments"):
+        hw_validate.validate_flash_segments_do_not_overlap(segments, jtag_flash=True)
+
+
+@pytest.mark.parametrize("ack_mode", ["uart", "jtag"])
+@pytest.mark.parametrize("write_payload", [False, True])
+def test_uart_anchor_command_sends_single_complete_frame(monkeypatch, ack_mode, write_payload):
+    address = 0x20000
+    payload = bytes(range(256)) * 16 if write_payload else b""
+    length = len(payload) if payload else 8192
+    command = (hw_validate.UART_FLASH_CMD_WRITE_VERIFY if payload
+               else hw_validate.UART_FLASH_CMD_ERASE)
+    checksum = hw_validate.jtag_flash_checksum(payload) if payload else 0
+    counter = address + length
+    response = bytearray(struct.pack("<IIII", hw_validate.UART_FLASH_RESP_MAGIC, 0, 0, counter))
+
+    class FakeSerial:
+        baudrate = 230400
+
+        def __init__(self):
+            self.writes = []
+            self.flushes = 0
+
+        def write(self, data):
+            self.writes.append(data)
+            return len(data)
+
+        def flush(self):
+            self.flushes += 1
+
+        def read(self, size):
+            data = bytes(response[:size])
+            del response[:size]
+            return data
+
+    waits = []
+    monkeypatch.setattr(hw_validate.time, "sleep", waits.append)
+    if ack_mode == "jtag":
+        debug_reads = iter([
+            {"sequence": 0},
+            {
+                "sequence": 1, "command": command, "address": address,
+                "length": length, "expected_header_checksum":
+                    hw_validate.uart_flash_header_checksum(command, address, length),
+                "status": 0, "result": 0, "counter": counter,
+            },
+        ])
+        def read_debug(*_args, **_kwargs):
+            debug = next(debug_reads)
+            if debug["sequence"] and payload:
+                assert ser.flushes == 1
+                assert waits == [10 * len(ser.writes[0]) / ser.baudrate]
+            return debug
+
+        monkeypatch.setattr(hw_validate, "uart_flash_anchor_read_debug", read_debug)
+
+    ser = FakeSerial()
+    assert hw_validate.uart_flash_anchor_command_checked(
+        ser, command, session=object() if ack_mode == "jtag" else None,
+        ack_mode=ack_mode, address=address, length=length, checksum=checksum,
+        payload=payload,
+    ) == (0, counter)
+    assert ser.writes == [
+        struct.pack(
+            "<IIIIII", hw_validate.UART_FLASH_REQ_MAGIC, hw_validate.UART_FLASH_REQ_GUARD,
+            command, address, length,
+            hw_validate.uart_flash_header_checksum(command, address, length),
+        ) + (struct.pack("<I", checksum) + payload if payload else b"")
+    ]
+    assert ser.flushes == 1
+    if ack_mode == "uart" or not payload:
+        assert not waits
+
+
+def test_jtag_uart_reboot_poll_survives_debug_reset(monkeypatch):
+    writes = []
+
+    def send_request(_serial, command, address, length, checksum, payload):
+        assert command == hw_validate.UART_FLASH_CMD_REBOOT
+        assert (address, length, checksum, payload) == (0, 0, 0, b"")
+        writes.append(command)
+        return 24
+
+    completed = {
+        "sequence": 8, "command": hw_validate.UART_FLASH_CMD_REBOOT,
+        "address": 0, "length": 0,
+        "expected_header_checksum": hw_validate.uart_flash_header_checksum(
+            hw_validate.UART_FLASH_CMD_REBOOT, 0, 0,
+        ),
+        "status": 0, "result": 0, "counter": 0,
+    }
+    outcomes = iter([{"sequence": 7}, RuntimeError("debug module reset"), completed])
+
+    def read_debug(*_args, **_kwargs):
+        result = next(outcomes)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(hw_validate, "uart_flash_anchor_send_request", send_request)
+    monkeypatch.setattr(hw_validate, "uart_flash_anchor_read_debug", read_debug)
+    monkeypatch.setattr(hw_validate.time, "sleep", lambda _seconds: None)
+    assert hw_validate.uart_flash_anchor_command_jtag_ack(
+        object(), object(), hw_validate.UART_FLASH_CMD_REBOOT,
+    ) == (0, 0)
+    assert writes == [hw_validate.UART_FLASH_CMD_REBOOT]
+
+
+def test_uart_anchor_command_rejects_short_write():
+    class ShortSerial:
+        def write(self, frame):
+            return len(frame) - 1
+
+        def flush(self):
+            pytest.fail("incomplete frame must not be flushed")
+
+    with pytest.raises(RuntimeError, match="completion unknown.*write was incomplete"):
+        hw_validate.uart_flash_anchor_command(
+            ShortSerial(), hw_validate.UART_FLASH_CMD_ERASE,
+            address=0x10000, length=4096,
+        )
+
+
+@pytest.mark.parametrize("command", [
+    hw_validate.UART_FLASH_CMD_ERASE,
+    hw_validate.UART_FLASH_CMD_WRITE_VERIFY,
+    hw_validate.UART_FLASH_CMD_REBOOT,
+])
+@pytest.mark.parametrize("stage", ["write", "flush", "ack"])
+def test_uart_anchor_lost_mutation_ack_does_not_replay(monkeypatch, command, stage):
+    class FaultySerial:
+        def write(self, frame):
+            writes.append(frame)
+            if stage == "write":
+                raise fault
+            return len(frame)
+
+        def flush(self):
+            if stage == "flush":
+                raise fault
+
+    def read_response(*_args, **_kwargs):
+        assert stage == "ack"
+        raise fault
+
+    fault = TimeoutError("ACK lost") if stage == "ack" else OSError("PTY write failed")
+    writes = []
+    monkeypatch.setattr(hw_validate, "serial_read_uart_anchor_response", read_response)
+    monkeypatch.setattr(hw_validate, "serial_drain_until_quiet",
+                        lambda *_a, **_kw: pytest.fail("a mutation must not drain and retry"))
+    kwargs = {
+        hw_validate.UART_FLASH_CMD_ERASE: {"address": 0x10000, "length": 4096},
+        hw_validate.UART_FLASH_CMD_WRITE_VERIFY: {"address": 0x10000, "payload": b"test"},
+        hw_validate.UART_FLASH_CMD_REBOOT: {},
+    }[command]
+    with pytest.raises(RuntimeError, match=f"command {command}.*completion unknown; not retried") as err:
+        hw_validate.uart_flash_anchor_command(FaultySerial(), command, attempts=3, **kwargs)
+    assert err.value.__cause__ is fault
+    assert str(fault) in str(err.value)
+    assert len(writes) == 1
+
+
+@pytest.mark.parametrize("command", [hw_validate.UART_FLASH_CMD_PING, hw_validate.UART_FLASH_CMD_READ_ID])
+@pytest.mark.parametrize("drain_fails", [False, True])
+def test_uart_anchor_read_only_probe_retries_without_masking_transport_error(monkeypatch, command, drain_fails):
+    fault = OSError("first transport error")
+    writes = []
+    drains = []
+
+    def read_response(*_args, **_kwargs):
+        if len(writes) == 1:
+            raise fault
+        return struct.pack("<IIII", hw_validate.UART_FLASH_RESP_MAGIC, 0, 1, 0)
+
+    def drain(*_args, **_kwargs):
+        drains.append(True)
+        if drain_fails:
+            raise OSError("cleanup transport error")
+
+    monkeypatch.setattr(hw_validate, "uart_flash_anchor_send_request",
+                        lambda _ser, cmd, *_args: writes.append(cmd))
+    monkeypatch.setattr(hw_validate, "serial_read_uart_anchor_response", read_response)
+    monkeypatch.setattr(hw_validate, "serial_drain_until_quiet", drain)
+    monkeypatch.setattr(hw_validate.time, "sleep", lambda _s: None)
+    if drain_fails:
+        with pytest.raises(OSError) as err:
+            hw_validate.uart_flash_anchor_command(object(), command, attempts=3)
+        assert err.value is fault
+        assert writes == [command]
+    else:
+        assert hw_validate.uart_flash_anchor_command(object(), command, attempts=3) == (1, 0)
+        assert writes == [command, command]
+    assert drains == [True]
+
+
+@pytest.mark.parametrize("status", [0, 3, 4, 5])
+def test_uart_anchor_mutation_ack_matches_counter_before_status(monkeypatch, status):
+    command = hw_validate.UART_FLASH_CMD_WRITE_VERIFY
+    responses = iter([
+        struct.pack("<IIII", hw_validate.UART_FLASH_RESP_MAGIC, 5, 0, 0x10000),
+        struct.pack("<IIII", hw_validate.UART_FLASH_RESP_MAGIC, status, 0, 0x10004),
+    ])
+    writes = []
+    monkeypatch.setattr(hw_validate, "uart_flash_anchor_send_request",
+                        lambda _ser, cmd, *_args: writes.append(cmd))
+    monkeypatch.setattr(hw_validate, "serial_read_uart_anchor_response",
+                        lambda *_a, **_kw: next(responses))
+    monkeypatch.setattr(hw_validate, "serial_drain_until_quiet",
+                        lambda *_a, **_kw: pytest.fail("a mutation NACK must not trigger replay"))
+
+    def program():
+        return hw_validate.uart_flash_anchor_command(
+            object(), command, address=0x10000, payload=b"test", attempts=3,
+        )
+
+    if status == 0:
+        assert program() == (0, 0x10004)
+    else:
+        with pytest.raises(RuntimeError, match=hw_validate.UART_FLASH_STATUS_NAMES[status]) as err:
+            program()
+        assert "counter=0x00010004" in str(err.value)
+        assert "completion unknown" not in str(err.value)
+    assert writes == [command]
+
+
+@pytest.mark.parametrize("lose_erase_ack", [True, False])
+def test_uart_anchor_segment_reports_exact_verified_prefix(tmp_path, lose_erase_ack):
+    image = tmp_path / "firmware.bin"
+    image.write_bytes(bytes(0x3000))
+    segment = hw_validate.JtagFlashSegment(0x10000, image, "firmware:FW")
+    fault = OSError("USB PTY disconnected")
+    requests = []
+
+    class LostAckSerial:
+        response = bytearray()
+
+        def write(self, frame):
+            command, address, length = struct.unpack_from("<III", frame, 8)
+            requests.append((command, address, length))
+            if not lose_erase_ack and len(requests) < 3:
+                self.response.extend(struct.pack(
+                    "<IIII", hw_validate.UART_FLASH_RESP_MAGIC, 0, 0, address + length,
+                ))
+            return len(frame)
+
+        def flush(self):
+            pass
+
+        def read(self, size):
+            if not self.response:
+                raise fault
+            data = bytes(self.response[:size])
+            del self.response[:size]
+            return data
+
+    verified = 0 if lose_erase_ack else 0x1000
+    with pytest.raises(RuntimeError, match=f"firmware:FW: last verified offset 0x{verified:X}/0x3000") as err:
+        hw_validate.uart_anchor_flash_program_segment(
+            LostAckSerial(), segment,
+            args=SimpleNamespace(dry_run=False, uart_anchor_flash_chunk_size=0x1000),
+        )
+    assert f"exclusive flash address 0x{0x10000 + verified:06X}" in str(err.value)
+    assert "completion unknown; not retried" in str(err.value)
+    assert "USB PTY disconnected" in str(err.value)
+    assert err.value.__cause__.__cause__ is fault
+    expected = [(hw_validate.UART_FLASH_CMD_ERASE, 0x10000, 0x3000)]
+    if not lose_erase_ack:
+        expected += [(hw_validate.UART_FLASH_CMD_WRITE_VERIFY, addr, 0x1000)
+                     for addr in (0x10000, 0x11000)]
+    assert requests == expected
+
+
+def test_jtag_m0_load_uses_elf_entry(monkeypatch):
+    elf = Path("/tmp/csi_ram_probe.elf")
+    monkeypatch.setattr(hw_validate, "elf_start_address", lambda path: 0x22030000 if path == elf else None)
+    output = SimpleNamespace(core="bl808m0", elf=elf)
+    assert hw_validate.jtag_load_entry(output) == 0x22030000
 
 
 def test_host_action_command_expands_e2e_marker_fields():
@@ -94,6 +425,73 @@ def test_existing_anchor_jtag_ack_requires_session(tmp_path):
             log_path=tmp_path / "anchor.log",
             prefix="existing UART flash anchor",
         )
+
+
+@pytest.mark.parametrize("no_jtag_reset", [False, True])
+@pytest.mark.parametrize("reboot_requested", [False, True])
+def test_ram_anchor_probe_respects_no_jtag_reset(monkeypatch, tmp_path, no_jtag_reset,
+                                                 reboot_requested):
+    calls = []
+
+    class FakeSession:
+        log_path = tmp_path / "probe.openocd.log"
+
+        def command(self, command, **_kwargs):
+            calls.append(command)
+
+        def close(self):
+            calls.append("close")
+
+    class FakeSerial:
+        def reset_input_buffer(self):
+            pass
+
+        def reset_output_buffer(self):
+            pass
+
+        def close(self):
+            pass
+
+    def fake_prepare(**kwargs):
+        calls.append(("prepare", kwargs["reset_target"]))
+        return FakeSession()
+
+    def fake_jtag_command(_session, command, **_kwargs):
+        calls.append(command)
+
+    monkeypatch.setattr(hw_validate, "configure_sudo_askpass", lambda *_args: None)
+    monkeypatch.setattr(hw_validate, "build_uart_flash_anchor", lambda **_kwargs: tmp_path / "anchor.bin")
+    monkeypatch.setattr(hw_validate, "prepare_jtag_session_with_recovery", fake_prepare)
+    monkeypatch.setattr(hw_validate, "initial_jtag_command_with_recovery", fake_jtag_command)
+    monkeypatch.setattr(hw_validate, "open_serial_device", lambda *_args, **_kwargs: FakeSerial())
+    monkeypatch.setattr(hw_validate, "wait_for_uart_flash_anchor", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(hw_validate, "serial_drain_until_quiet", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(hw_validate, "select_uart_flash_anchor_ack_mode", lambda *_args, **_kwargs: "uart")
+    monkeypatch.setattr(hw_validate, "uart_flash_anchor_command_checked",
+                        lambda _ser, command, **_kwargs: calls.append(command) or (0x123456, 0))
+
+    args = SimpleNamespace(
+        work_dir=tmp_path,
+        no_jtag=False,
+        no_jtag_reset=no_jtag_reset,
+        uart_anchor_existing=False,
+        flash_port=None,
+        uart="/dev/fake",
+        flash_baud=None,
+        uart_baud=None,
+        serial_dtr="off",
+        serial_rts="off",
+        dry_run=False,
+        uart_anchor_reboot=reboot_requested,
+    )
+    assert hw_validate.run_uart_anchor_probe(args, {"defaults": {}}) == 0
+    assert calls[0] == ("prepare", not no_jtag_reset)
+    assert ("reset halt" in calls) == (not no_jtag_reset)
+    assert "halt" in calls
+    assert f"reg pc 0x{hw_validate.UART_FLASH_ANCHOR_ENTRY:08X}" in calls
+    assert "resume" in calls
+    assert (hw_validate.UART_FLASH_CMD_REBOOT in calls) == reboot_requested
+    assert calls[-1] == "close"
 
 
 def test_uart_anchor_request_reboot_sends_reboot_command(monkeypatch):
@@ -391,6 +789,194 @@ def test_ftdi_uart_conflict_blocks_jtag_paths_only():
     )
 
 
+def test_lp_jtag_switch_stub_activates_pico_clock_divider():
+    args = SimpleNamespace(
+        jtag_gpio_style="bootrom",
+        jtag_gpio_pins=(6, 7, 12, 13),
+        lp_jtag_prebring_d0=False,
+        lp_jtag_p7_io2_5="unchanged",
+        lp_jtag_e902_sel="unchanged",
+        lp_jtag_wl_chain="unchanged",
+        lp_jtag_p4_adc_test="unchanged",
+        lp_jtag_p5_dac_test="unchanged",
+    )
+
+    source = hw_validate.jtag_switch_stub_source(
+        "lp",
+        "m0",
+        bringup_target=True,
+        args=args,
+    )
+
+    assert "# Activate PICO clock divider before enabling the LP clock gate" in source
+    assert "li   a0, 0x2000E12C" in source
+    assert "li   a0, 0x20000094" in source
+    assert "li   a2, 0x00010000" in source
+    assert "li   a3, 0x00040000" in source
+    assert source.index("0x2000E12C") < source.index("0x2000E110")
+
+
+def test_cklink_jtag_mux_bootstrap_uses_halt_without_reset():
+    args = SimpleNamespace(interface=Path("/opt/homebrew/share/openocd/scripts/interface/cklink.cfg"))
+
+    assert hw_validate.jtag_mux_bootstrap_command(args, reset_target=True) == "halt"
+    assert hw_validate.jtag_mux_bootstrap_command(args, reset_target=False) == "halt"
+
+
+def test_jtag_flash_no_reset_prepares_halt_only_session(monkeypatch, tmp_path):
+    seen = []
+
+    class Session:
+        log_path = tmp_path / "openocd.log"
+
+        def command(self, command, **_kwargs):
+            seen.append(command)
+
+        def close(self):
+            seen.append("close")
+
+    def prepare(**kwargs):
+        seen.append(kwargs["reset_target"])
+        return Session()
+
+    monkeypatch.setattr(hw_validate, "jtag_flash_segments_for_outputs", lambda *a, **kw: [])
+    monkeypatch.setattr(hw_validate, "prepare_jtag_session_with_recovery", prepare)
+    monkeypatch.setattr(hw_validate, "build_jtag_flash_stub", lambda **kw: tmp_path / "stub.elf")
+    monkeypatch.setattr(hw_validate, "jtag_flash_write32", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        hw_validate,
+        "initial_jtag_command_with_recovery",
+        lambda _session, command, **_kw: seen.append(command),
+    )
+
+    args = SimpleNamespace(jtag_load=False, no_jtag_reset=True, dry_run=True)
+    hw_validate.flash_firmware_over_jtag(
+        {"name": "scan"}, args=args, defaults={}, work_dir=tmp_path, outputs={}
+    )
+
+    assert seen[0] is False
+    assert "reset halt" not in seen
+    assert seen[-1] == "close"
+
+
+def test_uart_anchor_flash_no_reset_prepares_halt_only_session(monkeypatch, tmp_path):
+    seen = []
+
+    class Session:
+        log_path = tmp_path / "openocd.log"
+
+        def command(self, command, **_kwargs):
+            seen.append(command)
+
+        def close(self):
+            seen.append("close")
+
+    class Serial:
+        def reset_input_buffer(self):
+            pass
+
+        def reset_output_buffer(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(hw_validate, "jtag_flash_segments_for_outputs", lambda *a, **kw: [])
+    monkeypatch.setattr(hw_validate, "build_uart_flash_anchor", lambda **kw: tmp_path / "anchor.bin")
+    monkeypatch.setattr(hw_validate, "prepare_jtag_session_with_recovery",
+                        lambda **kw: seen.append(kw["reset_target"]) or Session())
+    monkeypatch.setattr(hw_validate, "initial_jtag_command_with_recovery",
+                        lambda _session, command, **_kw: seen.append(command))
+    monkeypatch.setattr(hw_validate, "open_serial_device", lambda *a, **kw: Serial())
+    monkeypatch.setattr(hw_validate, "wait_for_uart_flash_anchor", lambda *a, **kw: None)
+    monkeypatch.setattr(hw_validate, "serial_drain_until_quiet", lambda *a, **kw: None)
+    monkeypatch.setattr(hw_validate, "select_uart_flash_anchor_ack_mode",
+                        lambda *a, **kw: "uart")
+    monkeypatch.setattr(hw_validate, "uart_flash_anchor_command_checked",
+                        lambda *a, **kw: (0x1860EF, 0))
+
+    args = SimpleNamespace(jtag_flash=False, jtag_load=False, no_jtag_reset=True,
+                           uart_anchor_existing=False, uart_anchor_reset_after_flash=False,
+                           dry_run=False)
+    hw_validate.flash_firmware_over_uart_anchor(
+        {"name": "hello"}, args=args, defaults={}, work_dir=tmp_path,
+        outputs={}, flash_port="/dev/fake", flash_baud=230400, dtr=False, rts=False,
+    )
+
+    assert seen[0] is False
+    assert "reset halt" not in seen
+    assert "halt" in seen
+    assert seen[-1] == "close"
+
+
+def test_existing_uart_anchor_reboots_without_jtag(monkeypatch, tmp_path):
+    commands = []
+
+    class Serial:
+        def reset_input_buffer(self):
+            pass
+
+        def reset_output_buffer(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(hw_validate, "jtag_flash_segments_for_outputs", lambda *a, **kw: [])
+    monkeypatch.setattr(hw_validate, "open_serial_device", lambda *a, **kw: Serial())
+    monkeypatch.setattr(hw_validate, "serial_drain_until_quiet", lambda *a, **kw: None)
+    monkeypatch.setattr(hw_validate, "select_uart_flash_anchor_ack_mode",
+                        lambda *a, **kw: "uart")
+    monkeypatch.setattr(hw_validate, "uart_flash_anchor_command_checked",
+                        lambda _ser, command, **_kw: commands.append(command) or (0x1860EF, 0))
+    monkeypatch.setattr(hw_validate, "prepare_jtag_session_with_recovery",
+                        lambda **_kw: pytest.fail("existing-anchor path must not attach JTAG"))
+
+    args = SimpleNamespace(jtag_flash=False, jtag_load=False, no_jtag=True,
+                           uart_anchor_existing=True, uart_anchor_reset_after_flash=True,
+                           dry_run=False)
+    hw_validate.flash_firmware_over_uart_anchor(
+        {"name": "hello"}, args=args, defaults={}, work_dir=tmp_path,
+        outputs={}, flash_port="/dev/fake", flash_baud=230400, dtr=False, rts=False,
+    )
+
+    assert commands == [hw_validate.UART_FLASH_CMD_READ_ID,
+                        hw_validate.UART_FLASH_CMD_REBOOT]
+
+
+def test_existing_uart_anchor_reboot_only_uses_uart(monkeypatch, tmp_path):
+    commands = []
+
+    class Serial:
+        def reset_input_buffer(self):
+            pass
+
+        def reset_output_buffer(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(hw_validate, "configure_sudo_askpass", lambda *_args: None)
+    monkeypatch.setattr(hw_validate, "open_serial_device", lambda *a, **kw: Serial())
+    monkeypatch.setattr(hw_validate, "serial_drain_until_quiet", lambda *a, **kw: None)
+    monkeypatch.setattr(hw_validate, "select_uart_flash_anchor_ack_mode",
+                        lambda *a, **kw: "uart")
+    monkeypatch.setattr(hw_validate, "uart_flash_anchor_command_checked",
+                        lambda _ser, command, **_kw: commands.append(command) or (0x1860EF, 0))
+    monkeypatch.setattr(hw_validate, "prepare_jtag_session_with_recovery",
+                        lambda **_kw: pytest.fail("existing-anchor reboot must not attach JTAG"))
+
+    args = SimpleNamespace(work_dir=tmp_path, no_jtag=True,
+                           uart_anchor_existing=True, uart_anchor_reboot=True,
+                           flash_port=None, uart="/dev/fake", flash_baud=None,
+                           uart_baud=None, serial_dtr="off", serial_rts="off",
+                           dry_run=False)
+    assert hw_validate.run_uart_anchor_probe(args, {"defaults": {}}) == 0
+    assert commands == [hw_validate.UART_FLASH_CMD_READ_ID,
+                        hw_validate.UART_FLASH_CMD_REBOOT]
+
+
 def test_nim_uart_anchor_implements_reboot_command():
     source = (hw_validate.REPO_ROOT / "examples" / "m0_uart_flash_anchor.nim").read_text()
 
@@ -401,6 +987,7 @@ def test_nim_uart_anchor_implements_reboot_command():
     assert "l1cInvalidateAll()" in source
     assert "fenceI()" in source
     assert "rebootChip()" in source
+    assert "PowerOnReset = 1'u32 shl 0" in source
 
 
 def test_ram_uart_anchor_syncs_cache_before_reboot():
@@ -415,6 +1002,28 @@ def test_ram_uart_anchor_syncs_cache_before_reboot():
         "static int sf_wait_idle", 1
     )[0]
     assert "cache_sync_before_reboot();" in reboot_body
+    assert "value |= (1u << 0);" in reboot_body
+    assert "value |= (1u << 5);" not in reboot_body
+
+
+def test_ram_uart_anchor_guards_flash_against_inherited_watchdog():
+    source = (hw_validate.REPO_ROOT / "tools" / "uart_flash_anchor.c").read_text()
+    disarm, main = source.split("static int stop_inherited_watchdog(void)", 1)[1].split(
+        "void main(void)", 1
+    )
+    writes = ["write32(GLB_CGEN_CFG1", "write32(TIMER0_WFAR, 0xBABAu)",
+              "write32(TIMER0_WSAR, 0xEB10u)", "write32(TIMER0_WMER, mode)"]
+    offsets = [disarm.index(write) for write in writes]
+    assert offsets == sorted(offsets)
+    assert "read32(TIMER0_WMER) & ~TIMER0_WDT_MODE" in disarm
+    assert disarm.index("return (read32(TIMER0_WMER)") > offsets[-1]
+    assert main.index("stop_inherited_watchdog()") < main.index("uart0_init(")
+    guard = re.search(r"!watchdog_stopped\s*&&\s*"
+                      r"\(req.command == CMD_ERASE \|\| req.command == CMD_WRITE_VERIFY\)"
+                      r"\)\s*\{\s*status = ERR_TIMEOUT;", main)
+    assert guard is not None
+    assert guard.end() < main.index("status = (uint32_t)flash_program_verify(")
+    assert guard.end() < main.index("flash_erase_range(req.address")
 
 
 def test_compact_flash_image_places_segments(tmp_path):
@@ -432,6 +1041,44 @@ def test_compact_flash_image_places_segments(tmp_path):
     assert image[0x10:0x14] == b"ABCD"
     assert image[0x14:0x20] == b"\xFF" * 12
     assert image[0x20:0x22] == b"xy"
+
+
+def test_fw_bootinfo_template_env_override(monkeypatch, tmp_path):
+    template = tmp_path / "bootinfo.bin"
+    template.write_bytes(b"header")
+    monkeypatch.setenv("BL808_FW_BOOTINFO", str(template))
+    assert hw_validate.find_default_fw_bootinfo_template() == template
+
+    template.unlink()
+    with pytest.raises(RuntimeError, match="BL808_FW_BOOTINFO points to a missing file"):
+        hw_validate.find_default_fw_bootinfo_template()
+
+
+def test_fw_bootinfo_fallback_preserves_bl808_flash_table(monkeypatch):
+    monkeypatch.delenv("BL808_FW_BOOTINFO", raising=False)
+    monkeypatch.setitem(sys.modules, "bflb_iot_tool", None)
+
+    raw_fw = b"Nim BL808 test image"
+    entry = 0x58000000
+    image = hw_validate.build_fw_boot2_image(raw_fw, m0_boot_entry=entry)
+    assert image == build_bl808_boot2_flash.build_fw_image(raw_fw, None, m0_boot_entry=entry)
+    assert image[:4] == b"BFNP" and image[8:12] == b"FCFG"
+    assert image[0x64:0x68] == b"PCFG"
+    assert struct.unpack_from("<I", image, 0x84)[0] == 0x1000
+    assert struct.unpack_from("<II", image, 0xBC) == (0, entry)
+    table, table_size = struct.unpack_from("<II", image, 0x100)
+    assert (table, table_size) == (0x160, 0x1C8)
+    assert image[table:table + 4] == b"FCTG"
+    assert struct.unpack_from("<I", image, 0x15C)[0] == hw_validate.bootheader_crc32(image[:0x15C])
+    assert image[0x1000:0x1000 + len(raw_fw)] == raw_fw
+
+
+def test_fw_bootinfo_rejects_truncated_override(monkeypatch, tmp_path):
+    template = tmp_path / "bad.bin"
+    template.write_bytes(b"BFNP\0\0\0\0FCFG")
+    monkeypatch.setenv("BL808_FW_BOOTINFO", str(template))
+    with pytest.raises(RuntimeError, match="bootinfo template must be 0x160..0x1000 bytes"):
+        hw_validate.build_fw_boot2_image(b"Nim BL808 test image")
 
 
 def test_fw_boot2_image_recomputes_bootinfo_crc(monkeypatch, tmp_path):
@@ -801,7 +1448,41 @@ def test_existing_anchor_prebuilt_dry_run_allows_no_jtag(monkeypatch, tmp_path, 
     out = capsys.readouterr().out
     assert "use existing UART flash anchor" in out
     assert "UART-anchor flash prebuilt" in out
-    assert "target reset after UART-anchor flash before capture" in out
+    assert "UART-anchor reboot target" in out
+
+
+@pytest.mark.parametrize(("size", "end", "expected"), [
+    (0xD0000, 0xE0000, "erase_limit=0x0E0000"),
+    (0xD0001, 0xE0001, "0x0E1000 exceeds allowed end 0x0E0001"),
+    (857_040, 0xE0000, "0x0E2000 exceeds allowed end 0x0E0000"),
+    (0xD0000, None, "requires --uart-anchor-flash-image-end"),
+])
+def test_prebuilt_m0_checks_erase_limit_before_transport(
+    monkeypatch, tmp_path, capsys, size, end, expected
+):
+    image = tmp_path / "m0.bin"
+    image.write_bytes(bytes(size))
+    builds = []
+    monkeypatch.setattr(hw_validate, "build_uart_flash_anchor",
+                        lambda **_: builds.append("anchor") or tmp_path / "anchor.bin")
+    argv = ["hw_validate.py", "--uart-anchor-flash-image", str(image),
+            "--uart-anchor-flash-image-address", "0x10000", "--dry-run",
+            "--work-dir", str(tmp_path / "work")]
+    if end is not None:
+        argv += ["--uart-anchor-flash-image-end", hex(end)]
+    monkeypatch.setattr(sys, "argv", argv)
+    accepted = size == 0xD0000 and end is not None
+    assert hw_validate.main() == (0 if accepted else 2)
+    assert builds == (["anchor"] if accepted else [])
+    assert expected in capsys.readouterr().out
+
+
+def test_prebuilt_erase_limit_rechecks_actual_bytes_before_erase(tmp_path):
+    image = tmp_path / "m0.bin"
+    image.write_bytes(bytes(0x1001))
+    segment = hw_validate.JtagFlashSegment(0x10000, image, "changed", erase_limit=0x11000)
+    with pytest.raises(RuntimeError, match="exceeds allowed end"):
+        hw_validate.uart_anchor_flash_program_segment(None, segment, args=SimpleNamespace(dry_run=False))
 
 
 def test_uart_anchor_flash_defaults_to_target_reset_before_capture(
@@ -945,10 +1626,12 @@ def test_uart_anchor_runtime_jtag_runs_breakpoint_snapshots(
     assert "DRY-RUN openocd> rbp 0x58019BA6" in openocd_text
 
 
-def test_jtag_flash_reset_capture_keeps_runtime_jtag_by_default(
+@pytest.mark.parametrize("no_jtag_reset", [False, True])
+def test_jtag_flash_runtime_attach_respects_no_jtag_reset(
     monkeypatch,
     tmp_path,
     capsys,
+    no_jtag_reset,
 ):
     flashed = []
     reset_reasons = []
@@ -974,25 +1657,26 @@ def test_jtag_flash_reset_capture_keeps_runtime_jtag_by_default(
     monkeypatch.setattr(hw_validate, "build_firmware", fake_build_firmware)
     monkeypatch.setattr(hw_validate, "flash_firmware_over_jtag", fake_flash_firmware_over_jtag)
     monkeypatch.setattr(hw_validate, "pulse_target_reset_via_ftdi", fake_pulse_target_reset)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "hw_validate.py",
-            "--test",
-            "m0_ble_hal_test",
-            "--jtag-flash",
-            "--uart",
-            "/dev/cu.test",
-            "--dry-run",
-            "--work-dir",
-            str(tmp_path / "work"),
-        ],
-    )
+    argv = [
+        "hw_validate.py",
+        "--test",
+        "m0_ble_hal_test",
+        "--jtag-flash",
+        "--uart",
+        "/dev/cu.test",
+        "--dry-run",
+        "--work-dir",
+        str(tmp_path / "work"),
+    ]
+    if no_jtag_reset:
+        argv.append("--no-jtag-reset")
+    monkeypatch.setattr(sys, "argv", argv)
 
     assert hw_validate.main() == 0
     assert flashed == ["m0_ble_hal_test"]
-    assert reset_reasons == []
+    assert reset_reasons == (
+        ["after JTAG flash before UART/JTAG capture"] if no_jtag_reset else []
+    )
     out = capsys.readouterr().out
     assert "DRY-RUN: skip OpenOCD/JTAG" not in out
 
@@ -1003,7 +1687,10 @@ def test_jtag_flash_reset_capture_keeps_runtime_jtag_by_default(
         / "m0_ble_hal_test.m0.openocd.dry-run.log"
     )
     openocd_text = openocd_log.read_text()
-    assert "DRY-RUN openocd> reset halt" in openocd_text
+    expected = "halt" if no_jtag_reset else "reset halt"
+    assert f"DRY-RUN openocd> {expected}" in openocd_text
+    if no_jtag_reset:
+        assert "DRY-RUN openocd> reset halt" not in openocd_text
     assert "DRY-RUN openocd> resume" in openocd_text
 
 
@@ -1456,6 +2143,6 @@ def test_wireless_tests_dry_run_with_existing_anchor_reboot_no_jtag(
 
     assert hw_validate.main() == 0
     assert flashed == [test_name]
-    assert reset_reasons == ["after UART anchor flash before UART capture"]
+    assert reset_reasons == []
     out = capsys.readouterr().out
     assert "DRY-RUN: skip OpenOCD/JTAG" in out

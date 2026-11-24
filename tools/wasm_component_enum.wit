@@ -1,0 +1,6 @@
+package ox64:values@0.2.0;
+
+world enum-demo {
+  enum mode { cold, warm, hot }
+  export echo-mode: func(value: mode) -> mode;
+}

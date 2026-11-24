@@ -1,0 +1,7 @@
+package ox64:arithmetic@0.2.0;
+
+world arithmetic {
+  export add: func(a: s32, b: s32) -> s32;
+  export wrap: func(value: u8) -> u8;
+  export halve: func(value: f64) -> f64;
+}

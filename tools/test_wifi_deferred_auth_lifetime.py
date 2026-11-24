@@ -16,7 +16,9 @@ import bl808/wifi/fw_constants/states
 const
   TASK_SM = 4'u8
   MAX_VIFS = 2
+  MAX_CHAN_CTXT = 2
   VIF_TYPE_STA = 0'u8
+  MACHW_TIMLO_REG = 0x24B00120'u
   KeMsgConsumed = 0.cint
   KeMsgTailSlack = 4'u32
   SM_CONNECT_AUTH_ASSOC_REQ_MSG = 0x100B'u16
@@ -27,15 +29,29 @@ type
     id: uint16
     destId, srcId: uint8
     paramLen: uint32
+  CoListHdr = object
+    next: ptr CoListHdr
+  CoList = object
+    first, last: ptr CoListHdr
+  TbttNode = object
+    hdr: CoListHdr
+    state: uint8
+  Context = object
+    hdr: CoListHdr
+    contextIndexOrMarker, status, linkCount: uint8
   Vif = object
     chanCtxt: pointer
     vifIdx, vifType: uint8
+    tbttNode: TbttNode
   SmEnv = object
     connectInfo: pointer
   ConnectInfo = object
     vifIdx: uint8
   ChanEnv = object
-    deferredMsg: pointer
+    activeList, tbttList: CoList
+    deferredMsg, currentCtxt, scheduledCtxt, dominantCtxt: pointer
+    slotPeriod, cdeStarted, remainingTimeTarget: uint32
+    ctxtCount, flags, schedState: uint8
   SentFrame = object
     kind: uint16
     sequence: uint16
@@ -45,8 +61,9 @@ var
   conn, replacement: ConnectInfo
   vifs: array[2, Vif]
   chan: ChanEnv
-  rxVifEpochs: array[2, uint32]
-  channels: array[2, uint8]
+  rxVifEpochs, chanCtxtLinkEpochs: array[MAX_VIFS, uint32]
+  channels: array[MAX_CHAN_CTXT, Context]
+  sm_reconn_dominant_flag, macTime: uint32
   channelCount: uint8
   dominant, allocFail: bool
   remainingTime: uint32
@@ -62,7 +79,28 @@ proc smDeferredForget(header: pointer)
 proc smEnvView(): ptr SmEnv = addr env
 proc connectInfoView(p: pointer): ptr ConnectInfo = cast[ptr ConnectInfo](p)
 proc vifChannelForIdx(index: uint8): ptr Vif = addr vifs[index]
+proc vifChannelAt(p: pointer): ptr Vif = cast[ptr Vif](p)
 proc chanEnvView(): ptr ChanEnv = addr chan
+proc chanCtxtForIdx(index: uint8): ptr Context = addr channels[index]
+proc chanCtxtAt(p: pointer): ptr Context = cast[ptr Context](p)
+proc chanCtxtHdr(p: ptr Context): ptr CoListHdr = addr p.hdr
+proc chanTbttHdr(p: ptr TbttNode): ptr CoListHdr = addr p.hdr
+proc chanTbttPrimaryList(): ptr CoList = addr chan.tbttList
+proc chan_ctxt_trigger(p: pointer) = discard
+proc chan_update_tx_power(p: pointer) = discard
+proc chanCtxtOpTimer(): pointer = nil
+proc mm_timer_clear(p: pointer) = discard
+proc chan_ctxt_op_evt(p: pointer) = chan.currentCtxt = nil
+proc chan_cde_evt(p: pointer) = discard
+proc chan_tbtt_schedule(p: pointer) = discard
+proc chan_ctxt_del(index: uint8) =
+  doAssert channels[index].linkCount == 0
+  channels[index].contextIndexOrMarker = 255
+proc assert_err(condition, file: cstring; line: cint) =
+  doAssert false, "unexpected assertion at " & $line
+proc regRead(address: uint): uint32 =
+  doAssert address == MACHW_TIMLO_REG
+  macTime
 proc pointerAddrU32(p: pointer): uint32 = cast[uint32](cast[uint](p))
 proc irqSave(): uint32 =
   result = interruptsEnabled.uint32
@@ -107,6 +145,7 @@ proc ke_state_get(task: uint8): uint16 = currentState
 proc ke_state_set(task: uint8; state: uint16) =
   currentState = state
   invoke(stateHook)
+proc chanSwitchCallbackCurrent(): bool = true # The fixture activates a current switch.
 proc chan_ctxt_cnt(): uint8 = channelCount
 proc chan_ctxt_use_dominant_chan(): bool = dominant
 proc chan_ctxt_get_remaining_time_ms(vif: pointer): uint32 =
@@ -146,7 +185,10 @@ proc reset() =
   env.connectInfo = addr conn
   conn.vifIdx = 1
   replacement.vifIdx = 1
-  vifs[1] = Vif(chanCtxt: addr channels[0], vifIdx: 1)
+  chan = default(ChanEnv)
+  channels = [Context(contextIndexOrMarker: 0), Context(contextIndexOrMarker: 1)]
+  vifs = [Vif(vifIdx: 0), Vif(vifIdx: 1)]
+  chan_ctxt_link(1, 0)
   rxVifEpochs[1] = 1
   channelCount = 2
   dominant = false
@@ -173,7 +215,7 @@ CASES = {
 for kind in [5'u16, 7]:
   for count in [0'u8, 1, 2, 4]:
     for dom in [false, true]:
-      for remaining in [0'u32, 1, 40, 41, 42, 199, 200, 201, 1000, 0xFFFFFFFF'u32]:
+      for remaining in [0'u32, 1, 40, 41, 42, 199, 200, 201, 1000, high(uint32) div 1000]:
         reset()
         channelCount = count
         dominant = dom
@@ -209,10 +251,83 @@ drain()
 doAssert sent.len == 0
 ''',
     "channel_replacement": r'''
+for kind in [5'u16, 7]:
+  for alreadyQueued in [false, true]:
+    for rebind in [-1, 0, 1]:
+      reset()
+      # Hold the original context on another VIF so a relink can reuse the
+      # identical address without reallocating the context slot.
+      chan_ctxt_link(0, 0)
+      schedule(kind)
+      if alreadyQueued: publish()
+      chan_ctxt_unlink(1)
+      doAssert publications == 1 and chan.deferredMsg == nil and frees == 0
+      doAssert failures == 0 and smDeferredAbortable(1, kind)
+      if rebind >= 0: chan_ctxt_link(1, rebind.uint8)
+      drain()
+      doAssert failures == 1 and sent.len == 0 and frees == 1 and currentState == 10
+      publish()
+      drain()
+      doAssert failures == 1
+''',
+    "unrelated_unlink": r'''
+chan_ctxt_link(0, 0)
 schedule()
-vifs[1].chanCtxt = addr channels[1]
+chan_ctxt_unlink(0)
+doAssert publications == 0 and chan.deferredMsg != nil
 publish()
-doAssert frees == 1 and publications == 0
+drain()
+doAssert sent.len == 1 and failures == 0
+''',
+    "binding_changes_during_dispatch": r'''
+chan_ctxt_link(0, 0)
+schedule()
+publish()
+restoreHook = proc() =
+  chan_ctxt_unlink(1)
+  chan_ctxt_link(1, 0)
+drain()
+doAssert sent.len == 0 and failures == 1 and frees == 1
+''',
+    "binding_changes_during_build": r'''
+for phase in 0..2:
+  reset()
+  chan_ctxt_link(0, 0)
+  proc rebind() =
+    chan_ctxt_unlink(1)
+    chan_ctxt_link(1, 0)
+  if phase == 0: allocationHook = rebind
+  elif phase == 1:
+    # Force the direct path, then rebind when the owner snapshot is unlocked.
+    channelCount = 1
+    restoreHook = rebind
+  else: chan_ctxt_unlink(1)
+  schedule()
+  doAssert sent.len == 0 and failures == 1 and live.len == 0 and chan.deferredMsg == nil
+''',
+    "retired_binding_new_state": r'''
+schedule()
+chan_ctxt_unlink(1)
+doAssert publications == 1
+currentState = 6
+drain()
+doAssert sent.len == 0 and failures == 0 and frees == 1 and currentState == 6
+''',
+    "remaining_time": r'''
+let vif = addr vifs[1]
+macTime = 100_000
+chan.remainingTimeTarget = 170_000
+chan.currentCtxt = addr channels[1]
+doAssert realRemainingTime(vif) == 0
+chan.currentCtxt = vif.chanCtxt
+doAssert realRemainingTime(vif) == 70
+chan.remainingTimeTarget = macTime
+doAssert realRemainingTime(vif) == 0
+chan.remainingTimeTarget = macTime - 1000'u32
+doAssert realRemainingTime(vif) == (high(uint32) - 999'u32) div 1000'u32
+macTime = high(uint32) - 999'u32
+chan.remainingTimeTarget = 40_000
+doAssert realRemainingTime(vif) == 41
 ''',
     "wrong_vif": r'''
 schedule()
@@ -413,6 +528,11 @@ def program_source(mutation: str = "") -> str:
     activation = "\nproc activate(vif3: pointer) =\n  let vif = cast[ptr Vif](vif3)\n"
     activation += "\n".join("  " + line for line in fragment.splitlines()) + "\n"
     source = (types + constants + PLATFORM + (FW / "deferred_auth.nim").read_text()
+            + procedure(kernel, "co_list_push_back") + procedure(kernel, "co_list_extract")
+            + procedure(kernel, "chan_ctxt_link") + procedure(kernel, "chan_ctxt_unlink")
+            + procedure(kernel, "chan_is_on_operational_channel")
+            + procedure(kernel, "chan_ctxt_get_remaining_time_ms").replace(
+                "chan_ctxt_get_remaining_time_ms", "realRemainingTime", 1)
             + procedure(kernel, "chan_ctxt_set_auth_assoc_req")
             + procedure(tasks, "sm_auth_assoc_send_according_chan")
             + procedure(sm, "sm_connect_auth_assoc_req") + activation + HELPERS)
@@ -446,6 +566,10 @@ MUTATIONS = {
                    "replacement_connection"),
     "epoch": ("rxVifEpochs[owner.vifIndex] == owner.vifEpoch and", "true and",
               "same_address_new_epoch"),
+    "link_epoch": ("chanCtxtLinkEpochs[owner.vifIndex] == owner.linkEpoch and", "true and",
+                   "channel_replacement"),
+    "unlink_wake": ("  smDeferredChannelUnlinked(vifIdx)\n", "  discard\n",
+                    "channel_replacement"),
     "publication": ("  ke_msg_send(payload)\n", "  ke_msg_send(payload)\n  chanEnvView().deferredMsg = nil\n",
                     "publication_replacement"),
     "dispatch": ("tag.location != smDeferredQueued or", "false or", "duplicate_dispatch"),

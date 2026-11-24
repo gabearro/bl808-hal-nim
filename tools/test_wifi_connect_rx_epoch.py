@@ -55,6 +55,7 @@ var
   failAlloc, directJoin: bool
   retired: bool
   hint: ScanChannelEntry
+  configuredChannelCount: uint16
   released: seq[pointer]
   nimFwWpaPendingMask: uint32
   interrupts = true
@@ -78,16 +79,20 @@ proc chan_ctxt_unlink(vif: uint8) =
   boundary()
   inc cleanups
 proc assert_err(a, b: cstring; line: int) = doAssert false
-proc sm_connection_tlv_set(vif: uint8; param: pointer; length: uint16) =
+proc sm_connection_tlv_set() =
   doAssert sm.connectModeFlags == 0 and sm.cancelRequested == 0
   boundary()
 proc connectInfoHasChannelHint(req: ptr ConnectInfoView): bool = directJoin
 proc connectInfoChannelHint(p: pointer): pointer = addr hint
-proc sm_get_bss_params(bss, channel: ptr pointer): bool =
+proc me_freq_to_chan_ptr(band: uint8; freq: uint16): pointer =
+  doAssert band == 0
+  if freq >= 2412 and freq <= 2407'u16 + 5'u16 * configuredChannelCount and
+      (freq - 2407'u16) mod 5'u16 == 0:
+    return addr hint
+proc sm_get_bss_params(bss, channel: ptr pointer) =
   boundary(true)
   bss[] = nil
   channel[] = nil
-  false
 proc scanu_prune_scanresult_raw_frames_except_bssid(bssid: pointer) = boundary()
 proc scanu_prune_scanresult_raw_frames() = boundary()
 proc ke_msg_alloc(id: uint16; dst, src: uint8; length: uint32): pointer =
@@ -111,7 +116,7 @@ proc c_memset(p: pointer; value: cint; length: csize_t): pointer =
   doAssert value == 0 and length == 64
   zeroMem(p, length.int)
   p
-proc sm_join_bss(mac, bss, channel: pointer; flag: uint32) =
+proc sm_join_bss(mac, bss, channel: pointer; flag: bool) =
   boundary()
   doAssert cast[ptr array[6, uint8]](mac)[] == vifs[request.vifIdx].macAddr
   inc joins
@@ -137,6 +142,7 @@ proc reset(vif: uint8 = 0) =
   directJoin = false
   retired = false
   hint = ScanChannelEntry(prim20Freq: 2437)
+  configuredChannelCount = 11
   released.setLen(0)
   onBoundary = nil
   interrupts = true
@@ -175,12 +181,20 @@ for vif in 0'u8 .. 1:
         doAssert sm_connect_req_handler(addr request) == KeMsgNoFree
         doAssert rxVifEpochs[vif] == before[vif] + 1
         doAssert sm.connectInfo == addr request
-        doAssert sm.connectFlags == 0x34 and sm.scanResultIndex == high(uint32)
+        doAssert sm.connectFlags == 0 and sm.scanResultIndex == high(uint32)
         doAssert allocations == 2
         doAssert confirmations == (not allocationFailure).int
         if not allocationFailure: doAssert confirmationStatus == 0
         doAssert joins == direct.int and scans == (not direct).int
         doAssert cleanups == staleStation.int and interrupts
+
+for (flags, quick) in [(0x100'u32, 1'u8), (0x004'u32, 0'u8),
+                       (0x80000200'u32, 0'u8), (0x800006C4'u32, 0'u8),
+                       (0x800007C4'u32, 1'u8)]:
+  reset()
+  request.channelDuration = flags
+  doAssert sm_connect_req_handler(addr request) == KeMsgNoFree
+  doAssert sm.connectFlags == quick and request.channelDuration == flags
 
 for vif in [0'u8, 1, 2, 7, 255]:
   for state in [0'u16, 1, 6, 8, 9, 10]:

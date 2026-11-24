@@ -1,0 +1,17 @@
+package ox64:resource-bundle@0.2.0;
+
+world bundle-demo {
+  export bundles: interface {
+    resource ticket {
+      constructor(id: u32);
+      get: func() -> u32;
+    }
+    record bundle {
+      tag: u32,
+      tickets: list<own<ticket>>,
+    }
+    exchange: func(value: bundle) -> bundle;
+    peek: func(value: option<borrow<ticket>>) -> u32;
+    last-dropped: func() -> u32;
+  }
+}
