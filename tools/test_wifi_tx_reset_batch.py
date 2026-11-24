@@ -52,8 +52,9 @@ proc ipcTxHwDescWordHalfword(ac: uint32): uint16 = ac.uint16
     for name in ["txl_frame_cfm", "txlFrameConfirmPending", "txl_frame_evt",
                  "txl_frame_release", "txl_cfm_flush", "txl_cntrl_halt_ac",
                  "txlDetachAc", "txl_cntrl_flush_ac", "txl_cntrl_clear_ac",
-                 "txlDrainRetiredPostponed", "txl_buffer_reinit", "txl_reset"]:
+                 "txlDrainRetiredPostponed", "txl_buffer_reinit"]:
         functions += procedure(tx, name)
+    functions += "\nwhen not declared(txlRebasePostponedLeases):\n  proc txlRebasePostponedLeases() = discard\n" + procedure(tx, "txl_reset")
     debug = "\nvar\n" + "".join(
         f"  {name}: uint32\n" for name in sorted(set(re.findall(r"\bnimFwDbg\w+", functions)))
     )

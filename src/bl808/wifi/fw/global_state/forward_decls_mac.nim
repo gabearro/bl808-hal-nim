@@ -151,6 +151,7 @@ proc smRspTimerPublish(id: uint16; task: uint8; serial: uint32;
 proc smRspTimerClear(id: uint16; task: uint8)
 proc smRspTimerDispatch(entry: ptr KeTimerEntry): bool
 proc smRspTimerTakeRequeue(): int
+proc txlRebasePostponedLeases()
 proc smSaQueryQueueTimeout(serial: uint32)
 proc smSaQueryBeginReset(): bool
 proc smSaQueryEndReset(previous: bool)

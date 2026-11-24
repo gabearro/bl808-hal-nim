@@ -48,7 +48,7 @@ proc txl_buffer_init() = discard
 proc txl_frame_init(preserve: uint32) = discard
 '''
     tx = (FW / "tx_layer.nim").read_text()
-    return platform + "".join(procedure(tx, name) for name in [
+    return platform + "\nwhen not declared(txlRebasePostponedLeases):\n  proc txlRebasePostponedLeases() = discard\n" + "".join(procedure(tx, name) for name in [
         "txl_buffer_reinit", "txl_reset",
     ] + (["txl_cntrl_init"] if real_seed else [])) + SETUP
 

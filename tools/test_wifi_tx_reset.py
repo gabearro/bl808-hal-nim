@@ -335,7 +335,7 @@ def test_tx_halt_flush_reset(scenario: str, release_mode: bool, tmp_path: Path) 
         names.append("txl_reset")
     if scenario in ["clear", "reentry"]:
         names += ["txl_cntrl_clear_ac", "txl_cntrl_clear_bcn_ac", "txl_cntrl_clear_all_ac"]
-    source = "\n".join(procedure(tx, name) for name in names)
+    source = "\nwhen not declared(txlRebasePostponedLeases):\n  proc txlRebasePostponedLeases() = discard\n" + "\n".join(procedure(tx, name) for name in names)
     # The old C register workaround is replaced only in the test so its other
     # incorrect flush behavior can be reproduced on a native host compiler.
     source = re.sub(r'  \{\.emit: \[""".*?txl_buffer_reset\(\);.*?"""\]\.?\}',

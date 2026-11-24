@@ -155,7 +155,7 @@ proc txl_cfm_flush(ac: uint8; list: ptr CoList; status: uint32) =
   inc flushCalls
   txl_frame_evt()
 '''
-    reset = procedure(tx, "txl_reset")
+    reset = procedure(tx, "txlRebasePostponedLeases") + procedure(tx, "txl_reset")
     reset = _replace_once(reset, "volatileLoad(cast[ptr uint32](IPC_TX_STATUS_REG))", "ipcTxIdleStatus()")
     reset = _replace_once(reset, "volatileStore(cast[ptr uint32](0x24A00020'u), acBit)",
                           "haltWrites.add(acBit)")
@@ -289,8 +289,6 @@ doAssert drainCalls == 0 and cbCalls == 2 and acs[3].pending.first == nil
 ''')
 
 
-@finding("F1", "postponed frame re-pushed after a channel-switch txl_reset is released "
-        "by txl_cntrl_push_int without TX or callback")
 @pytest.mark.parametrize("mode", MODES)
 def test_postponed_frame_survives_channel_switch_reset(tmp_path: Path, mode: str) -> None:
     """Reset with work pending: off-channel frame must be sent or completed on return."""
@@ -314,8 +312,6 @@ doAssert transmitted or notified,
 ''', "F1: postponed deauth dropped silently")
 
 
-@finding("F1", "postponed frame aged out after a channel-switch txl_reset reports "
-        "completion outside the reset window with a stale scope")
 @pytest.mark.parametrize("mode", MODES)
 def test_postponed_frame_aged_after_reset_reaches_owner(tmp_path: Path, mode: str) -> None:
     """Reset then aging: owners discard stale completions unless inside txl_reset."""

@@ -2916,6 +2916,7 @@ proc txl_reset*(): bool {.exportc, cdecl, discardable.} =
       ke_evt_set(0x80000000'u32)
   txCtrl.resetInProgress = 1
   inc txResetEpoch
+  txlRebasePostponedLeases()
   txlInvalidateDmaAll()
 
   # Save sequence counter before reset
@@ -3037,6 +3038,19 @@ proc txl_frame_desc_index(frameDescPointer: pointer): uint32 {.inline.} =
   if (delta mod TxlFrameDescSize) != 0'u:
     return InvalidFrameDescIndex
   uint32(delta div TxlFrameDescSize)
+
+proc txlRebasePostponedLeases() =
+  ## Called by txl_reset right after it advances the epoch. A postponed
+  ## internal frame was never handed to the MAC, and the reset leaves it on its
+  ## station queue. Its lease moves to the new epoch with it, so it is still
+  ## sent on return, or aged out, with a callback its owner accepts. The blob
+  ## has no epoch and sends these frames after a reset.
+  for index in 0'u ..< TxlFrameDescCount.uint:
+    let frame = hostTxDescAt(cast[pointer](
+      cast[uint](addr txl_frame_desc_storage[0]) + index * TxlFrameDescSize))
+    if txFrameIdentities[index].leased and frame.postponeFlag != 0 and
+        txFrameIdentities[index].resetEpoch == txResetEpoch - 1'u32:
+      txFrameIdentities[index].resetEpoch = txResetEpoch
 
 proc txl_frame_desc_valid(frameDescPointer: pointer): bool {.inline.} =
   txl_frame_desc_index(frameDescPointer) != InvalidFrameDescIndex
