@@ -122,6 +122,22 @@ The same-deadline replay checks that a following timer still posts; other
 basic expiries retain their existing allocation policy. These are local
 scheduling checks, not an explanation for the observed Frog retries.
 
+### Station Cancel During a Public Scan
+
+Pinned `sm_task.o:sm_connect_abort_req_handler+0xA6/+0xAE` sends a
+zero-length lower abort and clears the scan cache. Pinned
+`scan_task.o:scan_abort_req_handler+0x20` can then terminate the current
+dwell. Nim can save a station scan behind an unrelated public scan, so
+the bare command could stop that public dwell and clear its results.
+
+Nim now attaches the current lower request generation to an internal
+station abort only when the station owns that lower scan. Publication
+and dispatch both recheck ownership. A canceled station scan that has
+not acquired SCANU completes through its reserved reply on replay,
+without allocating another message or starting a dwell. Host replays
+cover address reuse, replacement during allocation or publication, and
+independent public scan state with both busy and idle admission.
+
 These models do not emulate RF, MAC DMA timing, received beacon cadence, or
 access-point policy. Use the Ox64 UART-anchor flow in [AGENTS.md](../AGENTS.md)
 and a simultaneous on-channel capture for those checks. A host replay that

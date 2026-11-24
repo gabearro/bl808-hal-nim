@@ -1,3 +1,7 @@
+var
+  blRecoveryPending {.wifiCtrl.}: bool
+  blRecoveryBase {.wifiCtrl.}: uint32
+
 # ###########################################################################
 #                  PLATFORM INTEGRATION (bl_*)
 # ###########################################################################
@@ -40,7 +44,14 @@ proc bl_reset_evt*() {.exportc, cdecl.} =
   ke_evt_clear(0x80000000'u32)
   if not hal_machw_reset(): return
   if not rxl_reset(): return
+  # txl_reset advances the epoch before it can time out and be retried, so
+  # the carry-over starts from the epoch of the first attempt.
+  if not blRecoveryPending:
+    blRecoveryPending = true
+    blRecoveryBase = txResetEpoch
   if not txl_reset(): return
+  blRecoveryPending = false
+  chanPreserveAcrossRecovery(blRecoveryBase)
   mm_reset()
   vif_mgmt_reset()
   smSaQueryClearResetTimer()

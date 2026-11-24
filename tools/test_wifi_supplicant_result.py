@@ -338,6 +338,7 @@ def test_supplicant_reason_and_completion(tmp_path: Path) -> None:
     tasks = (FW / "task_handlers.nim").read_text()
     platform = (FW / "platform_bl.nim").read_text()
     run_nim(tmp_path, SUPPLICANT_PLATFORM + EXTENSION
+            + "\nproc smClaimFlushedSupplicantDeauth(p: pointer): bool = false\n"
             + procedure(tasks, "sm_supplicant_deauth_cfm")
             + procedure(source, "me_build_deauthenticate")
             + established_path(source)

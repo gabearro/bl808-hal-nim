@@ -294,7 +294,7 @@ def test_mac_reset_replays_retained_ps_mode(tmp_path: Path, mode: str) -> None:
     code += DRIVER + PS_RESET
     code += procedure(kernel, "co_list_push_front")
     code += procedure(handlers, "mmPsModeRetryAfterReset")
-    code += procedure(platform, "bl_reset_evt") + procedure(kernel, "mm_force_idle_req")
+    code += ("\nwhen not declared(txResetEpoch):\n  var txResetEpoch: uint32\nproc chanPreserveAcrossRecovery(previous: uint32) = discard\nvar blRecoveryPending: bool\nvar blRecoveryBase: uint32\n" + procedure(platform, "bl_reset_evt")) + ("\nwhen not declared(mmConfigCancelIdle):\n  proc mmConfigCancelIdle() = discard\n" + procedure(kernel, "mm_force_idle_req"))
     run_native(tmp_path, mode, code + PS_RESET_CHECKS)
 
 

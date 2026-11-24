@@ -260,7 +260,7 @@ for algorithm in [1'u16, 3'u16]:
     finish(p)
 ''',
     "shared_response_requires_matching_tx": r'''
-for mutation in 0 .. 6:
+for mutation in 0 .. 5:
   let p = authResponse(1, 4)
   let expected = addr smAuthResponseExpectations[1]
   case mutation
@@ -269,11 +269,17 @@ for mutation in 0 .. 6:
   of 2: expected.connection = addr replacement
   of 3: inc expected.identity.vifEpoch
   of 4: inc expected.identity.stationEpoch
-  of 5: inc expected.identity.resetEpoch
   else: expected.identity.station = 3
   sm_auth_handler(p)
   doAssert clears.len == 0 and associations == 0 and failures.len == 0
   doAssert expected.txSequence != 0 and conn.retry == 7
+  finish(p)
+# A TX reset between the request and its response retires frames, not the attempt.
+block:
+  let p = authResponse(1, 4)
+  inc smAuthResponseExpectations[1].identity.resetEpoch
+  sm_auth_handler(p)
+  doAssert associations == 1 and failures.len == 0
   finish(p)
 ''',
     "shared_response_consumed_once": r'''

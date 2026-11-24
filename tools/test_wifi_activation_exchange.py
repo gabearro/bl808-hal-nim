@@ -364,12 +364,13 @@ def source(trace: bool = False) -> str:
     for name in ["co_list_pop_front", "co_list_push_back", "ke_queue_extract"]:
         code += procedure(kernel, name)
     owner = (FW / "station_tx_build.nim").read_text()
-    for name in ["smTxBeginForVif", "smTxBegin", "smTxOwnerCurrent", "smTxBindStation", "smTxSetOwnerState"]:
+    for name in ["smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent", "smTxSameSession", "smTxBindStation", "smTxSetOwnerState"]:
         code += procedure(owner, name)
     scan = (FW / "scan_station_ap_me.nim").read_text()
     code += procedure(scan, "smAssocOwnerCurrent")
     code += (FW / "station_activation.nim").read_text()
     task = (FW / "task_handlers.nim").read_text()
+    code += "\nwhen not declared(ke_reschedule_saved_messages):\n  proc ke_reschedule_saved_messages(task: uint8): bool {.discardable.} = false\n"
     for name in ["meControlMessageMatches", "meCancelQueuedPayload", "mmPsModeCancel",
                  "meControlReset", "meTakeControlReply", "smActivationCancelControl",
                  "meReserveControl", "meForwardControl", "meBeginControl", "meCompleteControl"]:

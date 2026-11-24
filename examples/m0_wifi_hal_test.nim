@@ -12,6 +12,9 @@ import bl808/panicoverride
 import bl808/kernel/alloc
 when defined(bl808WifiNimFw):
   import bl808/kernel/jtaglog
+when defined(bl808WifiScanOwnershipBench):
+  import bl808/wifi_fw as firmware
+  from bl808/wifi/fw_constants/status_codes import WLAN_FW_CONNECT_ABORT_WHEN_SCANNING
 when defined(bl808WifiNimFw) and defined(bl808WifiRealLwip):
   from bl808/kernel/lwipcore import lwipInit
 
@@ -129,6 +132,70 @@ proc printResult() =
     if failed == 0:
       discard console.sendLine("=== Test Complete ===")
     console.flushTx()
+
+when defined(bl808WifiScanOwnershipBench):
+  type DwellCounts = tuple[starts, ends, replies, admitted: uint32]
+  proc benchScanConfirmation(): uint32
+    {.importc: "bl808_wifi_backend_scan_confirmation", cdecl.}
+
+  proc snapshotDwells(): DwellCounts =
+    withInterruptsDisabled:
+      let warm = firmware.nimFwDbgWarmScan
+      result = (warm.start_handled, warm.end_handled, warm.host_replies,
+                warm.upper_admitted)
+
+  proc scanOwnershipBench(iface: var WifiInterface) =
+    template pollUntil(condition: untyped): bool =
+      block:
+        for _ in 0 ..< 8_000:
+          bl808_wifi_backend_poll(8)
+          if condition: break
+          delayUs(1_000)
+        condition
+    template require(label: string; condition: bool) =
+      block:
+        let ok = condition
+        check(label, ok)
+        if not ok: return
+
+    let controlBefore = snapshotDwells()
+    require("control scan submitted", wifi_mgmr_scan(addr iface, nil) == 0)
+    require("control scan completed", pollUntil(bl808_wifi_backend_scan_done_count() == 1))
+    let control = snapshotDwells()
+    let channels = control.starts - controlBefore.starts
+    require("control visited multiple channels", channels > 1 and
+      control.ends - controlBefore.ends == channels and
+      control.replies - controlBefore.replies == 1 and
+      control.admitted - controlBefore.admitted == 1 and
+      benchScanConfirmation() == 0)
+
+    require("overlap scan submitted", wifi_mgmr_scan(addr iface, nil) == 0)
+    require("public dwell active", pollUntil(snapshotDwells().starts > control.starts and
+      bl808_wifi_backend_scan_done_count() == 0))
+    let savedBefore = firmware.nimFwDbgScanOwnershipSaved
+    let cancelledBefore = firmware.nimFwDbgScanOwnershipCancelled
+    # A nonexistent target keeps the exercise independent of network credentials.
+    require("station scan submitted", wifi_mgmr_sta_connect(addr iface,
+      "Ox64-scan-ownership-bench", nil, nil, nil, 0, 0) == 0)
+    require("station scan saved behind public scan", pollUntil(
+      firmware.nimFwDbgScanOwnershipSaved == savedBefore + 1 and
+      bl808_wifi_backend_scan_done_count() == 0 and
+      snapshotDwells().admitted == control.admitted + 1))
+    require("queued station scan cancelled", wifi_mgmr_sta_connect_abort() == 0)
+    require("both commands completed", pollUntil(
+      bl808_wifi_backend_scan_done_count() == 1 and bl808_wifi_backend_connect_done() != 0))
+    for _ in 0 ..< 100:
+      bl808_wifi_backend_poll(8)
+      delayUs(1_000)
+    let overlap = snapshotDwells()
+    require("public scan visited all control channels",
+      overlap.starts - control.starts == channels and overlap.ends - control.ends == channels and
+      overlap.replies - control.replies == 1 and bl808_wifi_backend_scan_done_count() == 1 and
+      benchScanConfirmation() == 0)
+    require("station scan retired once without a dwell",
+      firmware.nimFwDbgScanOwnershipCancelled == cancelledBefore + 1 and
+      overlap.admitted - control.admitted == 1 and
+      bl808_wifi_backend_last_status() == WLAN_FW_CONNECT_ABORT_WHEN_SCANNING.cint)
 
 proc dumpReg(label: string, address: uint) =
   discard console.sendString(label)
@@ -2043,6 +2110,10 @@ proc main() {.exportc, cdecl.} =
 
   var iface = wifi_mgmr_sta_enable()
   check("wifi sta enable", iface != nil)
+  when defined(bl808WifiScanOwnershipBench):
+    if initOk and iface != nil: scanOwnershipBench(iface)
+    printResult()
+    return
   when defined(bl808WifiDirectCsiProbe):
     directCsiSavedCtl = regRead(DirectCsiCtl)
     directCsiBeforeStat = regRead(DirectCsiStat)

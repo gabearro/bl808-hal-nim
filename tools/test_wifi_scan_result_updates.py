@@ -109,6 +109,8 @@ proc prepareUpdate(hasDs: bool; strength: int8; ssid = 65'u8) =
     frame[72] = 1
     frame[73] = 6
 '''
+    # The dwell owner is covered by test_wifi_sm_audit_scan; count the request here.
+    base += "\nproc scanEarlyEndRequest() = ke_msg_send_basic(0x4C, 1, 2)\n"
     base += procedure((FW / "mac_config_debug.nim").read_text(), "mac_ie_find")
     for name in ["scanuResetCachedSsid", "scanuCacheSsid", "scanuCacheChannel",
                  "scanuPublishFrameResult"]:

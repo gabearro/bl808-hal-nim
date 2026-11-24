@@ -172,7 +172,7 @@ def source() -> str:
     code += "const\n" + "".join(f"  {name}Size = sizeof({name}).uint32\n" for name in names)
     code += platform + EXTRA
     owner = (FW / "station_tx_build.nim").read_text()
-    for name in ["smTxBeginForVif", "smTxBegin", "smTxOwnerCurrent", "smTxBindStation", "smTxSetOwnerState"]:
+    for name in ["smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent", "smTxSameSession", "smTxBindStation", "smTxSetOwnerState"]:
         code += procedure(owner, name)
     code += (FW / "station_bss.nim").read_text()
     kernel = (FW / "kernel_mac_channel.nim").read_text()
@@ -187,6 +187,7 @@ proc releaseSavedControl(task: uint8) =
     if node == nil: break
     co_list_push_back(addr keMsgQueueSent, node)
 '''
+    code += "\nwhen not declared(ke_reschedule_saved_messages):\n  proc ke_reschedule_saved_messages(task: uint8): bool {.discardable.} = false\n"
     for name in ["meControlMessageMatches", "meCancelQueuedPayload", "mmPsModeCancel",
                  "meControlReset", "meTakeControlReply", "smBssCancelControl",
                  "meReserveControl", "meForwardControl", "meBeginControl", "meCompleteControl"]:

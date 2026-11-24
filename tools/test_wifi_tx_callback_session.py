@@ -27,6 +27,7 @@ CALLBACKS = {
 PLATFORM = SESSION_PLATFORM + r"""
 proc smTxCallbackCurrent(): bool = true
 proc smClaimFlushedDisconnect(p: pointer): bool = false
+proc smClaimFlushedSupplicantDeauth(p: pointer): bool = false
 proc chanProtectionTagged(p: pointer): bool = false
 proc chanProtectionActive(): bool = false
 proc chanProtectionComplete(p: pointer; ap: bool; serial: var uint32): bool = false
@@ -337,8 +338,10 @@ def test_callback_session_scope(tmp_path: Path, release: bool, mutation: str | N
         body = procedure((FW / filename).read_text(), name)
         if mutation == name:
             guard = "  if not txlFrameCallbackCurrent(): return\n"
-            if name == "sm_disconnect_deauth_cfm":
+            if name in ["sm_disconnect_deauth_cfm", "sm_connect_abort_deauth_cfm"]:
                 guard = "  if not txlFrameCallbackCurrent() and not smClaimFlushedDisconnect(param): return\n"
+            if name == "sm_supplicant_deauth_cfm":
+                guard = "  if not txlFrameCallbackCurrent() and not smClaimFlushedSupplicantDeauth(param): return\n"
             if name in ["chan_ap_tx_cfm", "chan_sta_tx_cfm"]:
                 entry_guard = ("  if not txlFrameCallbackCurrent():\n"
                                "    chanProtectionAbandon(param)\n    return\n")
@@ -347,7 +350,7 @@ def test_callback_session_scope(tmp_path: Path, release: bool, mutation: str | N
                 guard = "  if not txlFrameCallbackCurrent(frameEpoch): return\n"
             assert body.count(guard) >= 1
             body = re.sub(r"(?m)^[ \t]+if not txlFrameCallbackCurrent\((?:frameEpoch)?\)"
-                          r"(?: and not smClaimFlushedDisconnect\(param\))?: return\n", "", body)
+                          r"(?: and not smClaimFlushed(?:Disconnect|SupplicantDeauth)\(param\))?: return\n", "", body)
         functions += body
     if mutation == "context":
         assignment = "  txActiveFrameCallback = addr scope\n"

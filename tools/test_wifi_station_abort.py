@@ -21,6 +21,8 @@ const
   SM_CONNECT_ABORT_REQ = 0x1007'u16
   SM_CONNECT_ABORT_CFM = 0x1008'u16
   SCAN_ABORT_REQ = 0x405'u16
+  ScanChannelRunningState = 3'u16
+  SmScanAbortPayloadSize = sizeof(uint32).uint32
   StatusCfmPayloadSize = 1'u32
   WLAN_FW_CONNECT_ABORT_BY_USER_NO_DEAUTH = 24'u16
 type StatusCfmPayload = object
@@ -29,6 +31,15 @@ var
   replies: seq[uint8]
   outcomes: seq[tuple[status, reason: uint16]]
   deauths, scanAborts, cacheClears: int
+  scanTerminations: int
+  scanState: uint16
+  scanRequestEpoch: uint32
+  scan_env: tuple[paramPtr: pointer, abortFlag: uint8]
+  scanu_env: tuple[paramPtr: pointer]
+  upperScan, lowerScan: uint32
+  lowerExchange: pointer
+  smOwnsUpper: bool
+  pendingScanAborts: seq[pointer]
   scanHook: proc()
   tlvHook: proc()
   disconnects, disconnectReplies: int
@@ -41,10 +52,10 @@ proc ke_msg_alloc(id: uint16; dst, src: uint8; size: uint32): pointer =
   ke_msg_try_alloc(id, dst, src, size)
 proc smReqVifIdxOrZero(p: pointer): uint8 =
   if p == nil: 0'u8 else: cast[ptr uint8](p)[]
-proc ke_msg_send_basic(id: uint16; dst, src: uint8) =
-  doAssert id == SCAN_ABORT_REQ
-  inc scanAborts
-  invoke(scanHook)
+proc scanuLowerCurrent(request: pointer): bool = request != nil and request == lowerExchange
+proc smScanOwnsRequest(request: pointer): bool = smOwnsUpper and request == addr upperScan
+proc smScanAdmitRequest(request: pointer): bool = smScanOwnsRequest(request)
+proc scan_terminate_channel_request() = inc scanTerminations
 proc scanu_cached_scanresult_clear() = inc cacheClears
 proc sm_connect_abort_deauth_cfm() = discard
 proc sm_connect_abort_process() = discard
@@ -78,6 +89,7 @@ proc heapAlloc(size: uint32): pointer {.cdecl.} =
     live.add(cast[ptr KeMsgHdr](result))
   invoke(allocationHook)
 proc blOpsFunc(offset: int): pointer =
+  if offset == 4: return nil
   doAssert offset == 0xB8
   cast[pointer](heapAlloc)
 proc c_memset(p: pointer; value: cint; size: csize_t): pointer =
@@ -87,6 +99,18 @@ proc c_memset(p: pointer; value: cint; size: csize_t): pointer =
 '''
 
 HELPERS = r'''
+proc beginScan(owned: bool) =
+  inc scanRequestEpoch
+  scanu_env.paramPtr = addr upperScan
+  scan_env = (cast[pointer](addr lowerScan), 0'u8)
+  lowerExchange = scan_env.paramPtr
+  smOwnsUpper = owned
+  scanState = ScanChannelRunningState
+proc deliverScanAbort() =
+  doAssert pendingScanAborts.len == 1
+  let payload = pendingScanAborts.pop()
+  doAssert scan_abort_req_handler(payload) == KeMsgConsumed
+  ke_msg_free(keMsgHdrFromPayload(payload))
 proc makeAbort(vif = 1'u8): pointer =
   result = ke_msg_try_alloc(SM_CONNECT_ABORT_REQ, TASK_SM, TASK_API, 1)
   doAssert result != nil
@@ -120,6 +144,9 @@ proc smDeferredCancel()
     original_allocator = procedure(code, "ke_msg_try_alloc")
     allocator = procedure((FW / "kernel_mac_channel.nim").read_text(), "ke_msg_try_alloc")
     code = code.replace(original_allocator, ALLOCATOR + allocator, 1)
+    code = code.replace("proc ke_state_get(task: uint8): uint16 = currentState",
+                        "proc ke_state_get(task: uint8): uint16 =\n"
+                        "  if task == TASK_SCAN: scanState else: currentState", 1)
     code = code.replace("  inc publications\n  queue.add(payload)", """  if keMsgHdrFromPayload(payload).id == SM_DISCONNECT_CFM:
     let hdr = keMsgHdrFromPayload(payload)
     doAssert payload == disconnectRequest and hdr.paramLen == 0
@@ -131,6 +158,11 @@ proc smDeferredCancel()
     replies.add(cast[ptr StatusCfmPayload](payload).status)
     ke_msg_free(keMsgHdrFromPayload(payload))
     invoke(publicationHook)
+    return
+  if keMsgHdrFromPayload(payload).id == SCAN_ABORT_REQ:
+    inc scanAborts
+    pendingScanAborts.add(payload)
+    invoke(scanHook)
     return
   inc publications
   queue.add(payload)""", 1)
@@ -153,9 +185,11 @@ proc smAbortForget(header: pointer) = discard
 proc smAbortCaptureMessage(header: ptr KeMsgHdr) = discard
 """
     handlers = (FW / "task_handlers.nim").read_text()
+    abort_handlers = ["smAbortOwnsLowerScan", "scan_abort_req_handler", "smQueueOwnedScanAbort",
+                      "sm_disconnect_req_handler", "sm_connect_abort_req_handler"]
     return (code + ADAPTERS + procedure((FW / "kernel_mac_channel.nim").read_text(),
-            "ke_msg_forward_and_change_id") + procedure(handlers, "sm_disconnect_req_handler") +
-            procedure(handlers, "sm_connect_abort_req_handler") + HELPERS)
+            "ke_msg_forward_and_change_id") + "".join(procedure(handlers, name)
+            for name in abort_handlers) + HELPERS)
 
 
 CASES = {
@@ -390,13 +424,27 @@ doAssert outcomes.len == 0 and deauths == 0 and replies == @[0'u8]
 """,
     "scanning": """
 currentState = 1
+beginScan(owned = true)
 let request = makeAbort()
 doAssert deliverAbort(request) == KeMsgConsumed
 doAssert env.cancelRequested == 1 and scanAborts == 1 and cacheClears == 1
 doAssert replies == @[1'u8]
+deliverScanAbort()
+doAssert scan_env.abortFlag == 1 and scanTerminations == 1
+""",
+    "scanning_behind_public_scan": """
+currentState = 1
+# SCANU holds a public scan; this station connection's scan is still saved.
+beginScan(owned = false)
+let request = makeAbort()
+doAssert deliverAbort(request) == KeMsgConsumed
+doAssert env.cancelRequested == 1 and replies == @[1'u8]
+doAssert scanAborts == 0, "station cancellation interrupted the public scan"
+doAssert cacheClears == 0, "station cancellation erased public scan results"
 """,
     "scan_replacement": """
 currentState = 1
+beginScan(owned = true)
 let request = makeAbort()
 scanHook = proc() =
   env.connectInfo = addr replacement
@@ -404,6 +452,38 @@ scanHook = proc() =
   currentState = 1
 doAssert deliverAbort(request) == KeMsgConsumed
 doAssert cacheClears == 0 and replies == @[1'u8]
+beginScan(owned = false)
+deliverScanAbort()
+doAssert scan_env.abortFlag == 0 and scanTerminations == 0
+""",
+    "scan_abort_old_epoch": """
+currentState = 1
+beginScan(owned = true)
+doAssert deliverAbort(makeAbort()) == KeMsgConsumed
+doAssert pendingScanAborts.len == 1
+# Reuse the same lower allocation with a new logical scan.
+beginScan(owned = true)
+deliverScanAbort()
+doAssert scan_env.abortFlag == 0 and scanTerminations == 0
+""",
+    "scan_abort_replaced_while_allocating": """
+currentState = 1
+beginScan(owned = true)
+let request = makeAbort()
+allocationHook = proc() =
+  allocationHook = proc() = beginScan(owned = true)
+doAssert deliverAbort(request) == KeMsgConsumed
+doAssert env.cancelRequested == 1 and replies == @[1'u8]
+doAssert scanAborts == 0 and cacheClears == 0 and live.len == 0
+""",
+    "scan_abort_optional_allocation": """
+currentState = 1
+beginScan(owned = true)
+let request = makeAbort()
+allocationHook = proc() = allocFail = true
+doAssert deliverAbort(request) == KeMsgConsumed
+doAssert env.cancelRequested == 1 and replies == @[1'u8]
+doAssert scanAborts == 0 and cacheClears == 0 and live.len == 0
 """,
     "waiting": """
 currentState = 2
@@ -460,6 +540,7 @@ MUTATIONS = {
                 "  discard\nproc deliverAbort", "queued_replacement_before_dispatch"),
     "executing": ("if tag.location == smDeferredExecuting: return false", "if tag.location == smDeferredExecuting: return true", "executing"),
     "release": ("  smAbortForget(header)", "  discard", "recycled_request"),
+    "scan_abort_epoch": ("cast[ptr uint32](param)[] != scanRequestEpoch or ", "", "scan_abort_old_epoch"),
 }
 
 

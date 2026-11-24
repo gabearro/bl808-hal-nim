@@ -194,6 +194,12 @@ def test_compiled_message_tables_match_vendor(tmp_path: Path) -> None:
             expected = list(expected)
             expected[17] = (58, "smActivationOptionsCfmHandler")
             expected[18] = (13, "smCleanupCfmHandler")
+        elif table == "scanu_default_state":
+            # The vendor frees a raw send that arrives while scanning or joining,
+            # leaving the host to time out. The port refuses it with a CFM.
+            assert len(expected) == 3
+            assert len(observed) == 4 and observed[3][1] == "scanu_raw_send_busy_handler"
+            expected = list(expected) + [observed[3]]
         if observed != expected:
             for index in range(max(len(observed), len(expected))):
                 got = observed[index] if index < len(observed) else None

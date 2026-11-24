@@ -28,6 +28,7 @@ const
   SCANU_JOIN_CFM = 0x803'u16
   ScanuStartReqPayloadSize = sizeof(ScanuStartReqPayload).uint32
   StatusCfmPayloadSize = 1'u32
+  SCAN_STATUS_FAIL = 1'u8
   KeMsgTailSlack = 4'u32
   ScanChannelEntrySize = sizeof(ScanChannelEntry).uint32
 type
@@ -178,7 +179,7 @@ def source() -> str:
     code += "\nproc sm_join_bss*(bssid, ssid, joinInfo: pointer; flag: bool) {.exportc, cdecl.}\n"
     code += "proc sm_scan_bss*(bssid, ssid, chanInfo: pointer) {.exportc, cdecl.}\n" + PLATFORM
     owner = (FW / "station_tx_build.nim").read_text()
-    for name in ["smTxCapture", "smTxBeginForVif", "smTxBegin", "smTxOwnerCurrent", "smTxSetOwnerState"]:
+    for name in ["smTxCapture", "smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent", "smTxSetOwnerState"]:
         code += procedure(owner, name)
     for name in ["connectInfoSsidLen", "connectInfoFillSsidSlot"]:
         code += procedure(layout, name)

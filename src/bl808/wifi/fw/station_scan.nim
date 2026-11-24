@@ -23,7 +23,8 @@ proc smScanTagFor(header: ptr KeMsgHdr): ptr SmScanTag =
     tag = tag.next
 
 proc smScanOwnerCurrent(owner: SmTxBuildContext; indication: pointer): bool =
-  indication != nil and smTxOwnerCurrent(owner) and
+  # The scan and join exchanges with SCANU outlive a TX reset; only frames do not.
+  indication != nil and smTxSessionCurrent(owner) and
     smEnvView().connectIndMsg == indication
 
 proc smScanPreserveAcrossChannelReset(previous: uint32) =
@@ -152,6 +153,18 @@ proc smScanCompletionAlloc(request: pointer; id: uint16; destination: uint8): po
   if result != nil: smScanTagFor(keMsgHdrFromPayload(result)).published = true
   when defined(bl808WifiDiagColdScan):
     nimFwDbgColdScanFlow[2] = nimFwDbgColdScanFlow[2] or 4
+
+proc smScanCompleteCancelledStart(request: pointer): bool =
+  # SCANU has not installed this request; leave the active scan untouched.
+  if smEnvView().cancelRequested == 0 or not smScanOwnsRequest(request):
+    return false
+  if smScanAdmitRequest(request):
+    let reply = smScanCompletionAlloc(request, SCANU_START_CFM, TASK_SM)
+    if reply != nil:
+      statusCfmView(reply).status = SCAN_STATUS_FAIL
+      when defined(bl808WifiScanOwnershipBench): inc nimFwDbgScanOwnershipCancelled
+      ke_msg_send(reply)
+  true
 
 proc smScanAcceptReply(reply: pointer; id: uint16): bool =
   if reply == nil: return false

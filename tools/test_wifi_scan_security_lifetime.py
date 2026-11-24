@@ -110,7 +110,7 @@ proc snapshot(): auto =
    assocSecIeStore, scanu_env, notifications, finalized)
 '''
     owner = (FW / "station_tx_build.nim").read_text()
-    code += procedure(owner, "smTxCapture") + procedure(owner, "smTxOwnerCurrent")
+    code += procedure(owner, "smTxCapture") + procedure(owner, "smTxSessionCurrent") + procedure(owner, "smTxOwnerCurrent")
     code += procedure(scan, "scanuRequestCurrent")
     code += procedure(scan, "scanuConnectionKeyLength") + procedure(scan, "scanuApplyLegacyCredentialPolicy")
     return code

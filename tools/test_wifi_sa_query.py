@@ -639,7 +639,7 @@ proc mmPsModeRetryAfterReset() = discard
 proc ke_reschedule_saved_messages(task: uint8): bool = false
 '''
     return (source + procedure(kernel, "ke_init") + procedure(kernel, "ke_flush")
-            + procedure(kernel, "mm_force_idle_req") + procedure(platform, "bl_reset_evt"))
+            + ("\nwhen not declared(mmConfigCancelIdle):\n  proc mmConfigCancelIdle() = discard\n" + procedure(kernel, "mm_force_idle_req")) + ("\nwhen not declared(txResetEpoch):\n  var txResetEpoch: uint32\nproc chanPreserveAcrossRecovery(previous: uint32) = discard\nvar blRecoveryPending: bool\nvar blRecoveryBase: uint32\n" + procedure(platform, "bl_reset_evt")))
 
 
 def test_query_reset_boundaries_retire_without_readmitting_work(tmp_path: Path) -> None:

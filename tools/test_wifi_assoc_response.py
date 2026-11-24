@@ -244,7 +244,7 @@ def source(trace: bool = False) -> str:
                     "RxuMgtDispatchView", "MacIeView", "TimeoutIntervalIeView",
                     "SmConnectIndPayload", "MmSetVifStateReqPayload") + PLATFORM
     owner = (FW / "station_tx_build.nim").read_text()
-    for name in ["smTxBeginForVif", "smTxBegin", "smTxOwnerCurrent", "smTxBindStation", "smTxSetOwnerState"]:
+    for name in ["smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent", "smTxSameSession", "smTxBindStation", "smTxSetOwnerState"]:
         code += procedure(owner, name)
     # Share the real response timer ownership check, including its TX serial.
     timer = (FW / "station_response_timeout.nim").read_text()

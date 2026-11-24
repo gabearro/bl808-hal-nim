@@ -531,7 +531,8 @@ def program_source(mutation: str = "") -> str:
             code += procedure(kernel, name)
     if "proc keTimerCancelMutations" not in kernel:
         code += "\nproc keTimerCancelMutations(id = 0'u16; task = 0'u8; all = false) = discard\n"
-    for name in ["ke_timer_set", "keTimerClearLocked", "ke_timer_clear", "keTimerExpired", "ke_timer_schedule",
+    code += "\nwhen not declared(smRspTimerTakeRequeue):\n  proc smRspTimerTakeRequeue(): int = 0\n"
+    for name in ["ke_timer_set", "keTimerClearLocked", "ke_timer_clear", "keTimerExpired", "keTimerRequeue", "ke_timer_schedule",
                  "ke_timer_active"]:
         code += procedure(kernel, name)
     code += FLUSH_PLATFORM + procedure(kernel, "ke_flush")

@@ -7025,6 +7025,51 @@ failure. The M0 connected-scan manifest built; the patch was not flashed.
 This is a separate failure path, not evidence that scans caused the
 original spontaneous reason-7 disconnect.
 
+### TX reset and the station state machines
+
+The pinned SM, SCANU and channel code has no TX reset epoch: `txl_reset`
+flushes frames and every timer, expected response and control exchange
+carries on. The port had tied those owners to the epoch as well, so a
+reset left SM waiting with no completion. A 2026-11-24 audit found the
+cases below; reachability was argued from code, not reproduced on
+hardware.
+
+`smTxSessionCurrent` now checks the connection attempt without the reset
+epoch, and `smTxOwnerCurrent` adds the epoch for frames only. The
+auth/assoc response deadline, the expected auth response, the BSS
+parameter batch, the activation exchange and the SM scan/join exchange
+use the session check. `sm_connect_abort_deauth_cfm` and
+`sm_supplicant_deauth_cfm` accept a frame retired by the active reset
+drain, as `sm_disconnect_deauth_cfm` already did; pinned
+`sm.o:sm_connect_abort_deauth_cfm` and `sm_supplicant_deauth_cfm` call
+`sm_connect_ind` unconditionally. `bl_reset_evt` carries the TBTT,
+connectionless and context deadlines and the scan and registration
+exchanges across its `txl_reset` through `chanPreserveAcrossRecovery`.
+
+Three deliberate differences from the archive:
+
+- `sm_init` clears the parked connect indication. Pinned `sm_init` leaves
+  `sm_env[4]` set and `sm_connect_req_handler+0x110` then asserts; the
+  port had answered every later connect with busy. The parked messages
+  are still not freed there.
+- `MM_SCAN_CHANNEL_END_EARLY` has no payload. Pinned
+  `scan_task.o:mm_scan_channel_end_early_handler` asserts at line 186 when
+  TASK_SCAN is idle and otherwise ends whichever dwell is running. The
+  port records the request, epoch and channel index when SCANU asks, sends
+  nothing when no dwell exists, and ends only that dwell. No caller in
+  this tree sets the quick-connect flag (bit 8) that produces the message.
+- `scanu_default_state` has a fourth entry. The archive has no
+  `SCANU_RAW_SEND_REQ` handler while scanning or joining, so the kernel
+  frees the request and the host waits out its command timeout. The
+  request points at a host buffer, so it is not saved; it is refused with
+  `SCANU_RAW_SEND_CFM` result 1, and `bl_send_scanu_raw_send` returns
+  `-EBUSY`. That wrapper's confirmation buffer was one byte for a
+  four-byte payload and is now a `uint32`.
+
+Host tests are in `tools/test_wifi_sm_audit_sm_connect.py` and
+`tools/test_wifi_sm_audit_scan.py`. The M0 HTTP server manifest built;
+none of this was flashed.
+
 ## BLE
 
 - Local controller path: `src/bl808/libbtblecontroller_bl808_ble1m0s1bredr0.a`

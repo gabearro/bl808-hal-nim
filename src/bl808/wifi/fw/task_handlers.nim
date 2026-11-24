@@ -36,6 +36,9 @@ proc mmPsModeCancel() =
       ps.flags = ps.flags and not 0x06'u8
     held
   ke_msg_free(keMsgHdrFromPayload(request))
+  # A second request saved behind the held one must not wait for an
+  # unrelated MM state change.
+  discard ke_reschedule_saved_messages(TASK_MM)
 
 proc meControlReset() =
   inc meControlEpoch
@@ -574,8 +577,13 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
     return KeMsgConsumed
 
   # Restore local MM state before a confirmation can synchronously reenter.
-  if not smActivationAdmitRequest(param) or not mmConfigResumeIdle(idleEpoch, srcId) or
-      not smActivationAdmitRequest(param):
+  # The request has been applied, so it is confirmed even when a pending reset
+  # refuses the resume; only a request its owner no longer wants goes unanswered.
+  if not smActivationAdmitRequest(param):
+    if cfmPtr != nil: ke_msg_free_payload(cfmPtr)
+    return KeMsgConsumed
+  discard mmConfigResumeIdle(idleEpoch, srcId)
+  if not smActivationAdmitRequest(param):
     if cfmPtr != nil: ke_msg_free_payload(cfmPtr)
     return KeMsgConsumed
   if cfmBasicId != 0:
@@ -1363,14 +1371,12 @@ proc mm_scan_channel_end_ind_handler*(param: pointer): cint {.exportc, cdecl.} =
   return KeMsgConsumed
 
 proc mm_scan_channel_end_early_handler*(param: pointer): cint {.exportc, cdecl.} =
-  ## Handle early scan channel end (19 instrs in blob).
-  ## From blob (scan_task.o): checks ke_state_get(SCAN)!=0 (asserts at line 186).
-  ## Then calls scan_terminate_channel_request to abort current channel.
-  let state = ke_state_get(TASK_SCAN)
-  if state == ScanIdleState:
-    assert_err("scan_task.c", "scan_task.c", 186)
-    return KeMsgConsumed
-  if scan_env.paramPtr == nil:
+  ## End the current scan dwell early for quick connect.
+  ## The blob (scan_task.o, 19 instrs) asserts at line 186 when TASK_SCAN is
+  ## idle and otherwise ends whatever dwell is running. The message can be
+  ## dispatched after its dwell finished, so only the dwell that asked is ended
+  ## and a late message is dropped instead of asserting.
+  if not scanEarlyEndClaim() or ke_state_get(TASK_SCAN) == ScanIdleState:
     return KeMsgConsumed
   scan_terminate_channel_request()
   return KeMsgConsumed
@@ -1640,6 +1646,13 @@ proc scan_cancel_req_handler*(param: pointer): cint {.exportc, cdecl.} =
     scan_send_cancel_cfm(1, keMsgHdrFromPayload(param).srcId)
   return KeMsgConsumed
 
+const SmScanAbortPayloadSize = sizeof(uint32).uint32
+
+proc smAbortOwnsLowerScan(): bool =
+  let upper = scanu_env.paramPtr
+  scanuLowerCurrent(scan_env.paramPtr) and smScanOwnsRequest(upper) and
+    smScanAdmitRequest(upper)
+
 proc scan_abort_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle SCAN_ABORT_REQ — blob scan_task.o (74 bytes):
   ##   state = ke_state_get(TASK_SCAN)
@@ -1652,10 +1665,18 @@ proc scan_abort_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Nim invented both, which meant an extra IPC message + premature
   ## scan-state reset on every abort.
   ## An owned request also counts as active during channel submission.
-  if scan_env.paramPtr != nil:
-    scan_env.abortFlag = 1
-    if ke_state_get(TASK_SCAN) == ScanChannelRunningState:
-      scan_terminate_channel_request()
+  block:
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    if param != nil:
+      let header = keMsgHdrFromPayload(param)
+      if header.srcId == TASK_SM and (header.paramLen != SmScanAbortPayloadSize or
+          cast[ptr uint32](param)[] != scanRequestEpoch or not smAbortOwnsLowerScan()):
+        return KeMsgConsumed
+    if scan_env.paramPtr != nil:
+      scan_env.abortFlag = 1
+      if ke_state_get(TASK_SCAN) == ScanChannelRunningState:
+        scan_terminate_channel_request()
   let logPtr = blOpsFunc(4)
   if logPtr != nil:
     cast[proc(format, name: cstring) {.cdecl, varargs.}](logPtr)(
@@ -1697,6 +1718,9 @@ proc scanu_start_req_handler*(param: pointer): cint {.exportc, cdecl.} =
     return KeMsgConsumed
   if not smScanAdmitRequest(param): return KeMsgConsumed
   let saved = irqSave()
+  if smScanCompleteCancelledStart(param):
+    irqRestore(saved)
+    return KeMsgConsumed
   # Upper scanu owns a SINGLE scanu_env.paramPtr slot. If a new SCANU_START_REQ
   # arrives while a scan/join is still in flight (state != idle), overwriting
   # paramPtr abandons the in-flight ke_msg and makes scanu_confirm's real free
@@ -1710,7 +1734,9 @@ proc scanu_start_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   if ke_state_get(TASK_SCANU) != ScanuIdleState:
     let owned = smScanOwnsRequest(param)
     irqRestore(saved)
-    if owned: return KeMsgSaved
+    if owned:
+      when defined(bl808WifiScanOwnershipBench): inc nimFwDbgScanOwnershipSaved
+      return KeMsgSaved
     let requester = reqHdr.srcId
     statusCfmView(param).status = SCAN_STATUS_BUSY
     reqHdr.paramLen = StatusCfmPayloadSize
@@ -1998,6 +2024,14 @@ proc scanu_join_cfm_handler*(param: pointer): cint {.exportc, cdecl, discardable
       else:
         sm_connect_ind(14, 0xFFFF'u16)
   return 0
+
+proc scanu_raw_send_busy_handler*(param: pointer): cint {.exportc, cdecl.} =
+  ## SCANU is scanning or joining. The blob has no handler here, so the kernel
+  ## frees the request and the host waits out its command timeout. The request
+  ## points at a host buffer, so it cannot be saved for later either: refuse it
+  ## now with a nonzero result.
+  if param != nil: scanu_raw_send_cfm(cast[pointer](1), keMsgHdrFromPayload(param).srcId)
+  KeMsgConsumed
 
 proc scanu_raw_send_req_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
   ## Acknowledge the raw-send request, copy it into an internal TX frame,
@@ -2291,6 +2325,25 @@ proc sm_disconnect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ke_msg_forward_and_change_id(param, SM_DISCONNECT_CFM, TASK_API, TASK_SM)
   KeMsgNoFree
 
+proc smQueueOwnedScanAbort(identity: SmStaRequestIdentity) =
+  let epoch = block:
+    let saved = irqSave()
+    defer: irqRestore(saved)
+    if not smAbortCurrent(identity) or not smAbortOwnsLowerScan(): return
+    scanRequestEpoch
+  let message = ke_msg_try_alloc(SCAN_ABORT_REQ, TASK_SCAN, TASK_SM, SmScanAbortPayloadSize)
+  if message == nil: return
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  template current(): bool =
+    scanRequestEpoch == epoch and smAbortCurrent(identity) and smAbortOwnsLowerScan()
+  if not current():
+    ke_msg_free(keMsgHdrFromPayload(message))
+    return
+  cast[ptr uint32](message)[] = epoch
+  ke_msg_send(message)
+  if current(): scanu_cached_scanresult_clear()
+
 proc sm_connect_abort_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Keep saved aborts tied to their first connection, including states 3/4.
   ## In states 5/7 no frame has been submitted by an owned parked/queued command.
@@ -2311,8 +2364,7 @@ proc sm_connect_abort_req_handler*(param: pointer): cint {.exportc, cdecl.} =
     if state == SmScanningState:
       smEnvView().cancelRequested = 1
       cfm.status = 1
-      ke_msg_send_basic(SCAN_ABORT_REQ, TASK_SCAN, TASK_SM)
-      if smAbortCurrent(identity): scanu_cached_scanresult_clear()
+      smQueueOwnedScanAbort(identity)
     elif state == SmWaitingState:
       smEnvView().cancelRequested = 1
     elif state in [SmAuthStartingState, SmAssociatingState]:
@@ -2501,13 +2553,13 @@ proc sm_auth_assoc_send_according_chan*(nextState: uint16 = 0, authSequence: uin
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void sm_supplicant_deauth_cfm(void*,unsigned long);".}
 proc sm_supplicant_deauth_cfm*(param: pointer; status: uint32) {.exportc, cdecl.} =
   ## Report supplicant deauth completion; bit 23 records the MAC ACK.
-  if not txlFrameCallbackCurrent(): return
+  if not txlFrameCallbackCurrent() and not smClaimFlushedSupplicantDeauth(param): return
   if (status and 0x00800000'u32) == 0:
     let logFn = getLogFunc(204)
     if logFn != nil:
       logFn(3, nil, "sm.c", 1717,
             cstring("sm deauth frame transmit failure\r\n"))
-  if not txlFrameCallbackCurrent(): return
+  if not txlFrameCallbackCurrent() and not smClaimFlushedSupplicantDeauth(param): return
   sm_connect_ind(8, 15)
 
 # --- APM Task Handlers (apm_task.o) ---

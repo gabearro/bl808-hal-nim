@@ -878,6 +878,7 @@ def program_source() -> str:
         bodies += procedure(scan, name)
     for name in ["ke_msg_alloc_reply", "ke_msg_send_basic_reply", "mmBeaconChangeConfirm"]:
         bodies += procedure(kernel, name)
+    bodies += "\nwhen not declared(ke_reschedule_saved_messages):\n  proc ke_reschedule_saved_messages(task: uint8): bool {.discardable.} = false\n"
     for name in ["meControlMessageMatches", "meCancelQueuedPayload", "mmPsModeCancel",
                  "meControlReset", "meTakeControlReply", "meReserveControl", "meForwardControl",
                  "meBeginControl", "meCompleteControl",

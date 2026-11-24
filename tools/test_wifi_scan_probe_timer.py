@@ -1,5 +1,6 @@
 """Check scan-task message, timer, and probe ordering against the vendor."""
 
+import re
 from pathlib import Path
 
 import pytest
@@ -19,15 +20,23 @@ type ScanEnv = object
   abortFlag: uint8
 const
   TASK_SCAN = 1'u8
+  TASK_SM = 4'u8
   ScanIdleState = 0'u8
   ScanChannelRunningState = 3'u8
   KeMsgConsumed = 0.cint
+  SmScanAbortPayloadSize = sizeof(uint32).uint32
 var
   scan_env: ScanEnv
+  scanRequestEpoch: uint32
   state: uint8
   terminations: int
   logs: seq[string]
   loggingEnabled = true
+proc irqSave(): uint32 = 8
+proc irqRestore(saved: uint32) = discard
+proc keMsgHdrFromPayload(p: pointer): ptr tuple[srcId: uint8, paramLen: uint32] =
+  doAssert false, "direct call has no message header"
+proc smAbortOwnsLowerScan(): bool = false
 proc ke_state_get(task: uint8): uint8 =
   doAssert task == TASK_SCAN
   state
@@ -587,37 +596,54 @@ doAssert filterCalls == 4 and timerCalls == 2 and stateCalls == 1
 
 
 @pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
-def test_scan_early_end_stops_after_state_assertion(tmp_path: Path, mode: str) -> None:
-    source = (FW / "task_handlers.nim").read_text()
-    handler = procedure(source, "mm_scan_channel_end_early_handler")
+def test_scan_early_end_needs_a_current_dwell(tmp_path: Path, mode: str) -> None:
+    # The vendor asserts at scan_task.c:186 when idle and otherwise ends any
+    # running dwell. The port ends only the dwell that asked and never asserts.
+    scan = (FW / "scan_station_ap_me.nim").read_text()
+    declaration = re.search(r"(?m)^var scanEarlyEnd \{\.wifiCtrl\.\}.*\n.*\n", scan)
+    assert declaration
+    handler = (declaration.group(0) + procedure(scan, "scanEarlyEndRequest")
+               + procedure(scan, "scanEarlyEndClaim")
+               + procedure((FW / "task_handlers.nim").read_text(),
+                           "mm_scan_channel_end_early_handler"))
     run_program(tmp_path, mode, r'''
 type ScanEnv = object
   paramPtr: pointer
+  channelIndex: uint8
 const
   TASK_SCAN = 1'u8
+  TASK_SCANU = 2'u8
   ScanIdleState = 0'u8
   KeMsgConsumed = 0.cint
+  MM_SCAN_CHANNEL_END_EARLY = 0x4C'u16
+{.pragma: wifiCtrl.}
 var
   scan_env: ScanEnv
+  scanRequestEpoch: uint32
   state: uint8
-  assertions, terminations: int
+  sent, terminations: int
   request: uint8
+proc irqSave(): uint32 = 0
+proc irqRestore(saved: uint32) = discard
 proc ke_state_get(task: uint8): uint8 =
   doAssert task == TASK_SCAN
   state
-proc assert_err(a, b: cstring; line: int) =
-  doAssert line == 186
-  inc assertions
+proc ke_msg_send_basic(id: uint16; dest, source: uint8) = inc sent
 proc scan_terminate_channel_request() = inc terminations
 ''' + handler + r'''
 doAssert mm_scan_channel_end_early_handler(nil) == KeMsgConsumed
-doAssert assertions == 1 and terminations == 0
+scanEarlyEndRequest()
+doAssert sent == 0 and terminations == 0
 state = 2
 doAssert mm_scan_channel_end_early_handler(nil) == KeMsgConsumed
-doAssert assertions == 1 and terminations == 0
+doAssert terminations == 0
 scan_env.paramPtr = addr request
+scanEarlyEndRequest()
+doAssert sent == 1
 doAssert mm_scan_channel_end_early_handler(nil) == KeMsgConsumed
-doAssert assertions == 1 and terminations == 1
+doAssert terminations == 1
+doAssert mm_scan_channel_end_early_handler(nil) == KeMsgConsumed
+doAssert terminations == 1
 ''')
 
 

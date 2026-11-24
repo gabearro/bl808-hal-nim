@@ -16,6 +16,11 @@ var
   smRspIdentity {.wifiCtrl.}: SmRspTimeoutIdentity
   smRspEntry {.wifiCtrl.}: ptr KeTimerEntry
   smRspTags {.wifiCtrl.}: ptr SmRspTimeoutTag
+  smRspRequeue {.wifiCtrl.}: int
+
+const
+  SmRspRequeuePopped = 1
+  SmRspRequeueRetired = 2
 
 proc smRspNextSerial(): uint32 =
   inc smRspSerial
@@ -31,7 +36,7 @@ proc smRspTimerReset() =
 
 proc smRspTimeoutCurrent(identity: SmRspTimeoutIdentity): bool =
   identity.captured and identity.serial == smRspSerial and
-    smTxOwnerCurrent(identity.owner)
+    smTxSessionCurrent(identity.owner)
 
 proc smRspTimerBegin(id: uint16; task: uint8; continuationUs: uint64): uint32 =
   if id != SM_RSP_TIMEOUT_IND or task != TASK_SM: return 0
@@ -82,7 +87,7 @@ proc smRspTimerForget(header: pointer) =
     link = addr link[].next
 
 proc smRspOwnerCurrent(context: pointer): bool =
-  smTxOwnerCurrent(cast[ptr SmTxBuildContext](context)[])
+  smTxSessionCurrent(cast[ptr SmTxBuildContext](context)[])
 
 proc smRspTimerSetComeback(owner: SmTxBuildContext; intervalTu: uint32): bool =
   if owner.state != SmAssocRspState or not smTxOwnerCurrent(owner): return false
@@ -97,6 +102,13 @@ proc smRspTagAt(message: pointer): ptr SmRspTimeoutTag =
   const mask = alignof(SmRspTimeoutTag).uint - 1
   let start = cast[uint](message) + KeMsgTailSlack.uint
   cast[ptr SmRspTimeoutTag]((start + mask) and not mask)
+
+proc smRspTimerTakeRequeue(): int =
+  ## Nonzero once after a dispatch that could not deliver its expiry:
+  ## SmRspRequeuePopped while the kernel still holds the popped expiry, or
+  ## SmRspRequeueRetired when a failed re-arm already retired it.
+  result = smRspRequeue
+  smRspRequeue = 0
 
 proc smRspTimerDispatch(entry: ptr KeTimerEntry): bool =
   if entry.id != SM_RSP_TIMEOUT_IND or entry.taskId != TASK_SM: return false
@@ -122,8 +134,14 @@ proc smRspTimerDispatch(entry: ptr KeTimerEntry): bool =
       let chunk = min(remaining, KE_TIMER_MAX_DELAY.uint64)
       if not ke_timer_try_set(SM_RSP_TIMEOUT_IND, TASK_SM, chunk.uint32,
           smRspOwnerCurrent, addr identity.owner, remaining - chunk + 1) and
-          smTxOwnerCurrent(identity.owner):
-        assert_err("ke_timer.c", "ke_timer.c", 128)
+          smTxSessionCurrent(identity.owner):
+        # No memory for the next chunk. The failed re-arm reset this deadline's
+        # identity and retired the popped expiry; restore both and keep the
+        # same entry as the deadline.
+        identity.serial = smRspSerial
+        smRspIdentity = identity
+        smRspEntry = entry
+        smRspRequeue = SmRspRequeueRetired
       return
   # The timer's connection identity is copied before the message allocator can
   # reenter. The frame used to arm it may have completed in the meantime.
@@ -137,7 +155,10 @@ proc smRspTimerDispatch(entry: ptr KeTimerEntry): bool =
     if message != nil: ke_msg_free(keMsgHdrFromPayload(message))
     return
   if message == nil:
-    assert_err("ke_msg.c", "ke_msg.c", 48)
+    # No memory for the expiry message. The attempt still needs its deadline,
+    # so the kernel puts this entry back instead of freeing it.
+    smRspEntry = entry
+    smRspRequeue = SmRspRequeuePopped
     return
   let header = keMsgHdrFromPayload(message)
   header.paramLen = 0

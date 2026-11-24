@@ -70,7 +70,11 @@ proc ps_set_mode*(mode: uint8, requesterTask: uint8 = TASK_API.uint8) {.exportc,
   # An explicit mode replaces DPSM's old awake state in both PS views.
   # Otherwise channel return can clear PM despite an enabled static mode.
   ps.flags = uint8(mode == 2)
-  ps.statusFlags = ps.statusFlags and not 8'u32
+  block:
+    # The MAC idle interrupt clears bit 2 of this word.
+    let saved = irqSave()
+    ps.statusFlags = ps.statusFlags and not 8'u32
+    irqRestore(saved)
   let powerControl = cast[ptr uint32](0x24B0004C'u32)
   let powerManagement = if mode == 0: 0'u32 else: 4'u32
   volatileStore(powerControl, (volatileLoad(powerControl) and not 4'u32) or powerManagement)
@@ -728,11 +732,18 @@ proc ps_tx_null_timer_handle*() {.exportc, cdecl.} =
       mm_timer_set(psTxNullTimer(), macTimeNow() + blPsParamsView().txNullTimeout)
     irqRestore(saved)
     return
-  if current():
+  # Flushing AC3 can deliver callbacks that retire the transition. It can also
+  # complete a channel-protection frame whose departure resets TX; that alone
+  # does not end the transition, which must still be finalized here. A mode
+  # request retried after the reset clears the transition flags instead.
+  template stillOwned(): bool =
+    psModeBuildSerial == owner.serial and
+      (delivery == nil or not delivery.cancelled) and
+      (ps.flags and 6) == (flags and 6)
+  if stillOwned():
     psTxNullOwner.armed = false
   irqRestore(saved)
-  # Flushing AC3 can deliver callbacks that retire the transition.
-  if not current(): return
+  if not stillOwned(): return
   if mmVifCurrent(owner.peer):
     if (flags and 2) != 0:
       discard ps_disable_cfm_handle(owner.peer.vif)
@@ -743,7 +754,7 @@ proc ps_tx_null_timer_handle*() {.exportc, cdecl.} =
     # consuming the retained MM request as an ordinary mode confirmation.
     if (flags and 2) != 0:
       mm_timer_clear(psUapsdTimer())
-      if not current(): return
+      if not stillOwned(): return
       ps.uapsdTimerActive = 0
       ps.flags = (ps.flags and not 2'u8) or 8'u8
     elif (flags and 4) != 0:
@@ -1101,16 +1112,19 @@ proc ps_dpsm_update*(enable: uint32): uint32 {.exportc, cdecl, discardable.} =
     txResetEpoch == resetEpoch and psModeBuildSerial == serial
   # Update flags and state bits
   let flags = ps.flags
-  let envWord = ps.statusFlags
   var cfmCallback: pointer
-  if enable != 0:
-    ps.flags = flags or 0x02
-    ps.statusFlags = envWord or 0x08
-    cfmCallback = cast[pointer](ps_disable_cfm)
-  else:
-    ps.flags = flags or 0x04
-    ps.statusFlags = envWord and not 0x08'u32
-    cfmCallback = cast[pointer](ps_enable_cfm)
+  block:
+    # The MAC idle interrupt clears bit 2 of the status word.
+    let saved = irqSave()
+    if enable != 0:
+      ps.flags = flags or 0x02
+      ps.statusFlags = ps.statusFlags or 0x08
+      cfmCallback = cast[pointer](ps_disable_cfm)
+    else:
+      ps.flags = flags or 0x04
+      ps.statusFlags = ps.statusFlags and not 0x08'u32
+      cfmCallback = cast[pointer](ps_enable_cfm)
+    irqRestore(saved)
   # Update MAC HW power ctrl register at 0x24B0004C
   # Blob: read reg, clear bit 2, set ((enable^1)<<2)
   let hwBase = 0x24B00000'u

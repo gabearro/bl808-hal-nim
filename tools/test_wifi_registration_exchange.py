@@ -181,8 +181,9 @@ for beforeReply in [false, true]:
     if reply != nil:
       doAssert mm_sta_add_cfm_handler(reply) == 0
       release(reply)
-    doAssert bssCalls == (if resetKind == 0: 1 else: 0)
-    doAssert registrations == (if beforeReply or resetKind == 0: 1 else: 0)
+    # Only a replaced owner (kind 4) ends the exchange; a TX reset does not.
+    doAssert bssCalls == (if resetKind != 4: 1 else: 0)
+    doAssert registrations == (if beforeReply or resetKind != 4: 1 else: 0)
     finishExchange()
 ''',
     "reserved_completion": r'''

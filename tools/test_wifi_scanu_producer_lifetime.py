@@ -61,6 +61,7 @@ var
   requestSnapshot: ScanuStartReqPayload
   childSnapshot: ScanStartReqPayload
   ieSnapshot: array[200, uint8]
+proc smScanCompleteCancelledStart(p: pointer): bool = false
 proc observe(point: string)
 proc statusCfmView(p: pointer): ptr tuple[status: uint8] =
   cast[ptr tuple[status: uint8]](p)

@@ -50,7 +50,9 @@ var
   smPublishingPeer {.wifiCtrl.}: ptr SmPeerPublication
 
 proc smActivationOwnerCurrent(owner: SmTxBuildContext; indication: pointer): bool =
-  if not smAssocOwnerCurrent(owner, indication) or indication == nil: return false
+  # Activation is a control exchange with MM and ME; a TX reset does not end it.
+  if not smTxSessionCurrent(owner) or indication == nil or
+      smEnvView().connectIndMsg != indication: return false
   let station = owner.identity.station
   station < STA_INFO_TAB_ENTRIES.uint8 and staInfoForIdx(station).valid != 0 and
     staInfoForIdx(station).instNbr == owner.identity.vif

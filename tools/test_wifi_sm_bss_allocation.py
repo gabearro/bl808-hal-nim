@@ -264,7 +264,7 @@ def source(types: str, scan: str) -> str:
         from test_wifi_auth_frames import layouts
         code += layouts("TxSessionIdentity", "SmTxBuildContext")
         helper = (FW / "station_tx_build.nim").read_text()
-        for name in ["smTxBeginForVif", "smTxBegin", "smTxOwnerCurrent", "smTxBindStation", "smTxSetOwnerState"]:
+        for name in ["smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent", "smTxSameSession", "smTxBindStation", "smTxSetOwnerState"]:
             code += procedure(helper, name)
     code += (FW / "station_bss.nim").read_text()
     code += r'''

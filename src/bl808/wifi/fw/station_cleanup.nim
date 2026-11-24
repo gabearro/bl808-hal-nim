@@ -11,7 +11,7 @@ type
     session: RxHostSession
     serial, stationEpoch, channelBinding: uint32
     vifIndex, station: uint8
-    active, replyReserved, notified, awaiting: bool
+    active, replyReserved, notified, awaiting, lost: bool
     disconnectIndication: bool
     status, reason: uint16
     step: int
@@ -48,7 +48,14 @@ proc smCleanupForget(header: pointer) =
   var link = addr smCleanupTags
   while link[] != nil:
     if link[].header == header:
+      let payload = keMsgPayload(link[].header)
       link[] = link[].next
+      # The awaited request was consumed while its reply was still reserved,
+      # or the reply was freed undelivered: no confirmation will arrive.
+      if smCleanup.active and smCleanup.awaiting and
+          (payload == smCleanup.reply or
+           (payload == smCleanup.request and smCleanup.replyReserved)):
+        smCleanup.lost = true
       return
     link = addr link[].next
 
@@ -144,7 +151,8 @@ proc smCleanupNeedsService(): bool =
   let saved = irqSave()
   defer: irqRestore(saved)
   smCleanup.active and not txlResetting() and
-    (not smCleanup.awaiting or not smCleanupCurrent(smCleanup.serial))
+    (not smCleanup.awaiting or smCleanup.lost or
+     not smCleanupCurrent(smCleanup.serial))
 
 proc smCleanupService() =
   if not smCleanup.active or smCleanupServicing: return
@@ -176,6 +184,19 @@ proc smCleanupService() =
         smEnvView().connectInfo == nil and ke_state_get(TASK_SM) == SmDisconnectingState:
       ke_state_set(TASK_SM, SmIdleState)
     return
+  if smCleanup.lost:
+    # Whether the lost step took effect is unknown. Carry on with the next
+    # one so the disconnect still completes.
+    let reserved = if smCleanup.replyReserved: smCleanup.reply else: nil
+    smCleanup.lost = false
+    smCleanup.request = nil
+    smCleanup.reply = nil
+    smCleanup.replyReserved = false
+    smCleanup.awaiting = false
+    inc smCleanup.step
+    if reserved != nil:
+      outside: ke_msg_free(keMsgHdrFromPayload(reserved))
+      if not current(): return
   if smCleanup.connectionInfo != nil:
     let connection = smCleanup.connectionInfo
     smCleanup.connectionInfo = nil

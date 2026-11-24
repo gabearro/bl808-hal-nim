@@ -36,10 +36,12 @@ proc smTxBegin(connection: pointer): SmTxBuildContext =
   if connection == nil or smEnvView().connectInfo != connection: return
   smTxBeginForVif(connectInfoView(connection).vifIdx)
 
-proc smTxOwnerCurrent(build: SmTxBuildContext): bool =
+proc smTxSessionCurrent(build: SmTxBuildContext): bool =
+  ## The connection attempt that captured `build` is still the live one.
+  ## A TX reset retires frames, not the attempt: timers, expected responses
+  ## and control exchanges are checked with this, frames with smTxOwnerCurrent.
   let identity = build.identity
   identity.captured and identity.vif < MAX_VIFS.uint8 and
-    identity.resetEpoch == txResetEpoch and
     smTxSerials[identity.vif] == build.serial and
     smEnvView().connectInfo == build.connection and
     rxVifEpochs[identity.vif] == identity.vifEpoch and
@@ -49,6 +51,15 @@ proc smTxOwnerCurrent(build: SmTxBuildContext): bool =
     (identity.station == 0xFF or
      vifChannelForIdx(identity.vif).staIdx == identity.station) and
     ke_state_get(TASK_SM) == build.state
+
+proc smTxOwnerCurrent(build: SmTxBuildContext): bool =
+  build.identity.resetEpoch == txResetEpoch and smTxSessionCurrent(build)
+
+proc smTxSameSession(a, b: TxSessionIdentity): bool =
+  ## Identity comparison that ignores which TX reset epoch captured it.
+  var rebased = b
+  rebased.resetEpoch = a.resetEpoch
+  a == rebased
 
 proc smTxBindStation(build: var SmTxBuildContext; station: uint8): bool =
   if not smTxOwnerCurrent(build): return false
@@ -184,7 +195,7 @@ proc smAuthResponseMatches(build: SmTxBuildContext; algorithm,
   let expected = addr smAuthResponseExpectations[build.identity.vif]
   if build.state != SmAuthenticatingState or not smTxOwnerCurrent(build) or
       expected.connection != build.connection or expected.serial != build.serial or
-      expected.identity != build.identity or expected.algorithm != algorithm.uint8 or
+      not smTxSameSession(expected.identity, build.identity) or expected.algorithm != algorithm.uint8 or
       expected.txSequence != txSequence:
     return false
   true

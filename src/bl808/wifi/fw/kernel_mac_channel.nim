@@ -1511,11 +1511,10 @@ proc keTimerClearLocked(taskId: uint16; instId: uint8; saved: uint32) =
   let currentFirst = cast[ptr KeTimerEntry](keTimerQueue.first)
   if not operation.cancelled and currentFirst != nil and
       cast[int32](currentFirst.time - macTimeNow()) < 0:
-    # The diagnostic returns in this firmware; do not strand an overdue head.
+    # The next timer expired while this handler ran. The blob also asserts at
+    # line 214 here; in this firmware an assert is a full MAC recovery, so only
+    # schedule the expiry.
     ke_evt_set(KE_EVT_KE_TIMER)
-    irqRestore(saved)
-    assert_err("ke_timer.c", "ke_timer.c", 214)
-    discard irqSave()
 
 proc ke_timer_clear*(taskId: uint16, instId: uint8) {.exportc, cdecl.} =
   ## Remove a kernel timer and reprogram the hardware if the head changed.
@@ -1528,6 +1527,20 @@ proc keTimerExpired(entry: ptr KeTimerEntry; fromPoll: static bool = false): boo
     cast[int32](remaining) <= 0
   else:
     cast[int32](remaining - 50'u32) < 0
+
+proc keTimerRequeue(entry: ptr KeTimerEntry; delayUs: uint32; retired: bool): bool =
+  ## Put back a popped expiry that could not be delivered, without allocating.
+  ## A clear or re-arm that ran meanwhile has retired it, unless the owner
+  ## says that was its own failed re-arm (`retired`).
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if not keTimerExpiryCurrent and not retired: return false
+  keTimerExpiryCurrent = false
+  entry.time = macTimeNow() + delayUs
+  co_list_insert(addr keTimerQueue, cast[ptr CoListHdr](entry), cmp_abs_time)
+  if keTimerQueue.first == cast[ptr CoListHdr](entry):
+    ke_timer_hw_set(entry)
+  true
 
 proc ke_timer_schedule*() {.exportc, cdecl.} =
   ## Process expired timers.
@@ -1571,7 +1584,13 @@ proc ke_timer_schedule*() {.exportc, cdecl.} =
       entry
     if expiredTimerEntry.id == SM_SA_QUERY_TIMEOUT_IND_MSG and expiredTimerEntry.taskId == TASK_SM:
       smSaQueryQueueTimeout(expiredTimerEntry.saQuerySerial)
-    elif not smRspTimerDispatch(expiredTimerEntry):
+    elif smRspTimerDispatch(expiredTimerEntry):
+      # Out of memory for the expiry: retry with the same entry in 1 ms.
+      let requeue = smRspTimerTakeRequeue()
+      if requeue != 0 and keTimerRequeue(expiredTimerEntry, 1000, requeue == 2):
+        inc drained
+        continue
+    else:
       let id = expiredTimerEntry.id
       let dest = expiredTimerEntry.taskId
       # The repeat probe is optional; the channel timer owns dwell progress.
@@ -2027,8 +2046,9 @@ proc hal_machw_reset*(): bool {.exportc, cdecl, discardable.} =
   ## On timeout, retain queue ownership and request another reset attempt.
   ## From blob: 0x44B00038 is STATE_CNTRL, 0x44B0004C is STATUS,
   ## 0x44B00054 is DOZE_CNTRL2, 0x44B08050-0x44B0808C are INTC regs.
+  ## Like the blob, this leaves MM's saved mode and state alone: a
+  ## configuration request waiting for idle still has to restore them.
 
-  mmConfigCancelIdle()
   # Read state register (touch / prefetch)
   discard regRead(MACHW_STATE_CNTRL_REG)
 
@@ -2767,6 +2787,10 @@ proc mm_reset*() {.exportc, cdecl.} =
   if curState == MM_ACTIVE_STATE.uint16:
     mm_active()  # Blob: R_RISCV_CALL mm_active — reactivates MAC HW, NOT reinit
   else:
+    # The reset left the MAC idle, so a configuration request that was
+    # waiting for the idle interrupt can now run and restore the saved state.
+    if mmConfigIdle.phase == mmConfigAwaitIdle:
+      mmConfigIdle.phase = mmConfigIdleReady
     ke_state_set(TASK_MM, MM_IDLE.uint16)
 
 proc mm_env_max_ampdu_duration_set*(duration: uint32) {.exportc, cdecl.} =
@@ -3038,6 +3062,8 @@ proc mm_force_idle_req*(): bool {.exportc, cdecl, discardable.} =
   let saved = irqSave()
   defer: irqRestore(saved)
   if not hal_machw_reset(): return false
+  # A forced idle takes over from any configuration request waiting for idle.
+  mmConfigCancelIdle()
   if not rxl_reset(): return false
   if not txl_reset(): return false
   ke_state_set(TASK_MM, HW_ACTIVE.uint16)

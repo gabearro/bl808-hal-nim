@@ -119,6 +119,28 @@ proc scan_set_channel_request*() {.exportc, cdecl.} =
   # Transition scan task to the channel-request pending state.
   ke_state_set(TASK_SCAN, ScanChannelPendingState)
 
+var scanEarlyEnd {.wifiCtrl.}: tuple[pending: bool; request: pointer;
+                                    epoch: uint32; channel: uint8]
+
+proc scanEarlyEndRequest() =
+  ## Ask TASK_SCAN to end the current dwell. The vendor message has no payload,
+  ## so the dwell it is meant for is recorded here; with no dwell there is
+  ## nothing to end and nothing is sent.
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  if scan_env.paramPtr == nil: return
+  scanEarlyEnd = (true, scan_env.paramPtr, scanRequestEpoch, scan_env.channelIndex)
+  ke_msg_send_basic(MM_SCAN_CHANNEL_END_EARLY, TASK_SCAN, TASK_SCANU)
+
+proc scanEarlyEndClaim(): bool =
+  ## True once per request, and only while the dwell that asked is still current.
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  let asked = scanEarlyEnd
+  scanEarlyEnd.pending = false
+  asked.pending and asked.request != nil and asked.request == scan_env.paramPtr and
+    asked.epoch == scanRequestEpoch and asked.channel == scan_env.channelIndex
+
 proc scan_terminate_channel_request*() {.exportc, cdecl.} =
   ## Terminate the current channel scan request (15 instrs in blob).
   ## Builds a 20-byte abort parameter block on the stack with byte 0 = 1
@@ -1486,7 +1508,7 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
   # BSSID must first match the requested SSID slot below.
   let earlyEnd = (scanFlags and 0x100) != 0
   template endDwellEarly() =
-    ke_msg_send_basic(0x4C, 1, 2)
+    scanEarlyEndRequest()
     if not ownsResult():
       ke_msg_forward_and_change_id(frame, 0x804'u16, 9, 2)
       return
@@ -2296,6 +2318,8 @@ proc sm_init*() {.exportc, cdecl.} =
   smReconnectTrigger = false
   let sm = smEnvView()
   sm.connectInfo = nil
+  # A parked indication would make every later connect request report busy.
+  sm.connectIndMsg = nil
   sm.deauthPending = 1
   sm.authRetryLimit = 4
   ke_state_set(TASK_SM, SmIdleState)
@@ -2980,6 +3004,16 @@ proc smClaimFlushedDisconnect(param: pointer): bool =
   smAdvanceTxSerial(scope.vif)
   true
 
+proc smClaimFlushedSupplicantDeauth(param: pointer): bool =
+  ## The deauth sent after a failed handshake carries no SM owner tag. Accept
+  ## its retirement only from the active reset drain, while SM still waits.
+  let scope = txActiveFrameCallback
+  txResetActive and scope != nil and scope.tracked and
+    scope.identity.resetEpoch != txResetEpoch and
+    txlFrameCallbackCurrent(scope.identity.resetEpoch) and
+    ke_state_get(TASK_SM) == SmDisconnectingState and
+    param == vifChannelForIdx(scope.vif)
+
 proc sm_disconnect_deauth_cfm*(param: pointer, txStatus: uint32) {.exportc, cdecl.} =
   ## Confirmation that deauth frame was sent during disconnect.
   ## From blob (5 instrs): li a2,3; li a1,19; jr sm_disconnect_process
@@ -3110,8 +3144,8 @@ proc sm_connect_abort_deauth_cfm*(param: pointer, txStatus: uint32) {.exportc, c
   ## Confirmation of deauth during connect abort.
   ## From blob (5 instrs): li a1,3; li a0,23; jr sm_connect_ind
   ## Tail-calls sm_connect_ind(WLAN_FW_CONNECT_ABORT_BY_USER_WITH_DEAUTH=23, 3).
-  if not txlFrameCallbackCurrent(): return
   if not smTxCallbackCurrent(): return
+  if not txlFrameCallbackCurrent() and not smClaimFlushedDisconnect(param): return
   discard txStatus
   sm_connect_ind(23, 3)
 

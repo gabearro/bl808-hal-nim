@@ -262,6 +262,7 @@ def source(trace: bool = False, fallback: bool = False) -> str:
     code += "\nproc rxuMgtDispatchView(p: pointer): ptr RxuMgtDispatchView = cast[ptr RxuMgtDispatchView](p)\n"
     response = FW / "station_response_timeout.nim"
     if response.exists():
+        code += procedure((FW / "station_tx_build.nim").read_text(), "smTxSessionCurrent")
         code += procedure((FW / "station_tx_build.nim").read_text(), "smTxOwnerCurrent")
         code += response.read_text()
     else:
@@ -270,7 +271,7 @@ def source(trace: bool = False, fallback: bool = False) -> str:
     for name in ["co_list_pop_front", "co_list_insert", "co_list_push_back", "ke_queue_extract",
                  "cmp_abs_time", "cmp_timer_id", "keTimerCancelMutations", "keTimerBeginMutation",
                  "keTimerEndMutation", "ke_timer_try_set", "ke_timer_set", "keTimerClearLocked", "ke_timer_clear",
-                 "keTimerExpired", "ke_timer_schedule", "ke_timer_active"]:
+                 "keTimerExpired", "keTimerRequeue", "ke_timer_schedule", "ke_timer_active"]:
         code += procedure(kernel, name).split("\nconst\n", 1)[0] + "\n"
     code += procedure((FW / "task_handlers.nim").read_text(), "sm_rsp_timeout_ind_handler")
     return code + HELPERS
@@ -383,7 +384,8 @@ doAssert smRspTimerSetComeback(currentOwner(), 1000000)
 now = cast[ptr KeTimerEntry](keTimerQueue.first).time
 failAlloc = true
 ke_timer_schedule()
-doAssert allocationFailures == 1 and messages.first == nil and live.len == 0
+# Out of memory: the deadline is kept on the same entry and retried.
+doAssert messages.first == nil and keTimerQueue.first != nil
 ''',
     "comeback_new_timer_during_clock_read": r'''
 setup()
@@ -639,7 +641,13 @@ ke_timer_set(SM_RSP_TIMEOUT_IND, TASK_SM, 50)
 failAlloc = true
 now = 151
 ke_timer_schedule()
-doAssert allocationFailures == 1 and messages.first == nil and live.len == 0
+# Out of memory: the same entry is queued again 1 ms later, with no assert.
+doAssert messages.first == nil and live.len == 1
+doAssert cast[ptr KeTimerEntry](keTimerQueue.first).time == now + 1000
+failAlloc = false
+now += 1001
+ke_timer_schedule()
+doAssert messages.first != nil and keTimerQueue.first == nil
 doAssert authRetries == 0 and failures == 0
 ''',
     "allocation_failure_after_replacement": r'''

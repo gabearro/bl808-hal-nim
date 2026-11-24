@@ -317,6 +317,45 @@ finish()
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+def test_cancelled_start_retires_without_using_radio(tmp_path: Path, mode: str) -> None:
+    body = procedure((FW / "task_handlers.nim").read_text(), "scanu_start_req_handler")
+    admission = body.split("  let req = scanuStartReqView(param)", 1)[0] + r'''
+  doAssert false, "cancelled scan reached radio admission"
+  return KeMsgConsumed
+'''
+    run_program(tmp_path, mode, source() + admission + r'''
+for busy in [true, false]:
+  begin()
+  let request = take()
+  var unrelated: uint32
+  if busy:
+    scanu_env.paramPtr = addr unrelated
+    scanu_env.requester = TASK_API
+    doAssert scanu_start_req_handler(request) == KeMsgSaved
+  else:
+    scanu_env = default(ScanEnvironment)
+    scanState = ScanuIdleState
+  let original = scanu_env
+  let epoch = scanuRequestEpoch
+  let stateBefore = scanState
+  let allocationsBefore = allocations
+  sm.cancelRequested = 1
+  failAlloc = true
+  doAssert scanu_start_req_handler(request) == KeMsgConsumed
+  doAssert queued.len == 1 and allocations == allocationsBefore
+  doAssert scanu_env == original and scanuRequestEpoch == epoch and scanState == stateBefore
+  release(request)
+  let reply = take()
+  doAssert scanu_start_cfm_handler(reply) == KeMsgConsumed
+  doAssert sm.cancelRequested == 0 and lookups == 0
+  doAssert failures == @[(26'u16, 0xFFFF'u16)]
+  doAssert scanu_start_cfm_handler(reply) == KeMsgConsumed and failures.len == 1
+  release(reply)
+  finish()
+''')
+
+
+@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_busy_host_scan_returns_confirmation_without_stealing_owner(tmp_path: Path, mode: str) -> None:
     body = procedure((FW / "task_handlers.nim").read_text(), "scanu_start_req_handler")
     admission = body.split("  let req = scanuStartReqView(param)", 1)[0] + "  return KeMsgConsumed\n"
@@ -435,7 +474,13 @@ for change in 0 ..< 4:
   else:
     inc rxVifEpochs[conn.vifIdx]
     doAssert chanForceIdle()
-  doAssert complete(request) == nil
+  let reply = complete(request)
+  if change in [0, 2]:
+    # A TX reset alone retires frames, not the scan exchange with SCANU.
+    doAssert smScanAcceptReply(reply, SCANU_START_CFM)
+    release(reply)
+  else:
+    doAssert reply == nil
   finish()
 
 begin()

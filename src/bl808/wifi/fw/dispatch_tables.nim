@@ -96,14 +96,16 @@ var scan_default_handler* {.wifiCtrlExport.}: KeTaskHandler =
   KeTaskHandler(msgHandlers: cast[pointer](addr scan_default_state), count: 7)
 
 # --- SCANU task dispatch (scanu_task.o) ---
-var scanu_default_state* {.wifiCtrlExport.}: array[3, KeMsgHandler] = [
+var scanu_default_state* {.wifiCtrlExport.}: array[4, KeMsgHandler] = [
   KeMsgHandler(msgId: SCANU_START_REQ, handler: keMsgHandlerAddress(ke_msg_save)),
   KeMsgHandler(msgId: SCANU_JOIN_REQ, handler: keMsgHandlerAddress(ke_msg_save)),
   KeMsgHandler(msgId: RXU_MGT_IND, handler: keMsgHandlerAddress(ke_msg_discard)),
+  # Not in the vendor table: refuse a raw send while scanning or joining.
+  KeMsgHandler(msgId: SCANU_RAW_SEND_REQ, handler: keMsgHandlerAddress(scanu_raw_send_busy_handler)),
 ]
 
 var scanu_default_handler* {.wifiCtrlExport.}: KeTaskHandler =
-  KeTaskHandler(msgHandlers: cast[pointer](addr scanu_default_state), count: 3)
+  KeTaskHandler(msgHandlers: cast[pointer](addr scanu_default_state), count: 4)
 
 var scanu_idle* {.wifiCtrlExport.}: array[3, KeMsgHandler] = [
   KeMsgHandler(msgId: SCANU_START_REQ, handler: keMsgHandlerAddress(scanu_start_req_handler)),

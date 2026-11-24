@@ -5723,6 +5723,34 @@
       "timeout": 180
     },
     {
+      "name": "m0_wifi_nimfw_scan_ownership_test",
+      "tiers": ["manual"],
+      "build": [{
+        "id": "kernel",
+        "core": "bl808m0",
+        "source": "examples/m0_wifi_hal_test.nim",
+        "flash": "m0",
+        "defines": {
+          "bl808WifiNimFw": "1",
+          "bl808WifiUseBl808Rf": "1",
+          "bl808WifiNativeWlanCalibration": "1",
+          "bl808WifiDiagWarmScan": "1",
+          "bl808WifiScanOwnershipBench": "1",
+          "WifiScanOnly": "1"
+        }
+      }],
+      "required": [
+        "[PASS] wifi init",
+        "[PASS] wifi sta enable",
+        "[PASS] control visited multiple channels",
+        "[PASS] station scan saved behind public scan",
+        "[PASS] public scan visited all control channels",
+        "[PASS] station scan retired once without a dwell",
+        "=== Test Complete ==="
+      ],
+      "timeout": 35
+    },
+    {
       "name": "m0_wifi_nimfw_scan_hal_test",
       "tiers": [
         "smoke"

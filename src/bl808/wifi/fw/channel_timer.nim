@@ -36,6 +36,22 @@ proc chanForceIdle(): bool =
   smRegistrationPreserveAcrossChannelReset(previous)
   true
 
+proc chanPreserveAcrossRecovery(previous: uint32) =
+  ## A full MAC recovery drains TX like a channel switch, but it does not
+  ## change channel: every queued radio deadline and SM exchange stays owed.
+  ## `previous` is the epoch before the first attempt: a recovery whose TX
+  ## drain timed out has already advanced the epoch once per failed attempt.
+  template drained(epoch: uint32): bool =
+    epoch - previous < txResetEpoch - previous
+  if chanTbttTimerOwner.valid and drained(chanTbttTimerOwner.resetEpoch):
+    chanTbttTimerOwner.resetEpoch = txResetEpoch
+  if chanConnlessTimerOwner.valid and drained(chanConnlessTimerOwner.resetEpoch):
+    chanConnlessTimerOwner.resetEpoch = txResetEpoch
+  if chanCtxtTimerOwner.valid and drained(chanCtxtTimerOwner.resetEpoch):
+    chanCtxtTimerOwner.resetEpoch = txResetEpoch
+  smScanPreserveAcrossChannelReset(previous)
+  smRegistrationPreserveAcrossChannelReset(previous)
+
 proc chanTimerInvalidate(timer: pointer = nil) =
   if timer == nil or timer == chanTbttTimer():
     inc chanTbttTimerOwner.serial

@@ -55,7 +55,7 @@ proc smBssForget(header: pointer) =
 
 proc smBssCurrent(serial: uint32): bool =
   smBss.active and not smBss.lost and smBss.serial == serial and
-    smTxOwnerCurrent(smBss.owner)
+    smTxSessionCurrent(smBss.owner)
 
 proc smBssNewSerial(): uint32 =
   let saved = irqSave()
@@ -206,4 +206,9 @@ proc smBssNeedsService(): bool =
 proc smBssService() =
   let saved = irqSave()
   defer: irqRestore(saved)
-  if smBssNeedsService(): smBssCancel()
+  if not smBssNeedsService(): return
+  # A request consumed without its reply ends the batch. The attempt that owns
+  # it is still waiting in the BSS state, so it is told, as registration is.
+  let report = smBss.lost and smTxSessionCurrent(smBss.owner)
+  smBssCancel()
+  if report: sm_connect_ind(15, 0xFFFF)

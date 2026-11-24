@@ -96,7 +96,7 @@ def source() -> str:
     code += procedure(kernel, "blmac_soft_reset_getf")
     code += procedure((FW / "global_state/late_forward_decls.nim").read_text(), "waitMacSoftResetClear")
     code += procedure(kernel, "hal_machw_disable_int") + stop
-    code += procedure((FW / "platform_bl.nim").read_text(), "bl_reset_evt")
+    code += ("\nwhen not declared(txResetEpoch):\n  var txResetEpoch: uint32\nproc chanPreserveAcrossRecovery(previous: uint32) = discard\nvar blRecoveryPending: bool\nvar blRecoveryBase: uint32\n" + procedure((FW / "platform_bl.nim").read_text(), "bl_reset_evt"))
     return code
 
 
@@ -218,7 +218,7 @@ proc apmResumeHaltRollback() = doAssert not interrupts
 proc mmPsModeRetryAfterReset() = doAssert not interrupts
 '''
     code = saved_source() + support
-    code += procedure((FW / "platform_bl.nim").read_text(), "bl_reset_evt")
+    code += ("\nwhen not declared(txResetEpoch):\n  var txResetEpoch: uint32\nproc chanPreserveAcrossRecovery(previous: uint32) = discard\nvar blRecoveryPending: bool\nvar blRecoveryBase: uint32\n" + procedure((FW / "platform_bl.nim").read_text(), "bl_reset_evt"))
     run_program(tmp_path, mode, code + r'''
 for irq in [false, true]:
   setup()

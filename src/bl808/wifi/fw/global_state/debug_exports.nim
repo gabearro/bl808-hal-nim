@@ -852,6 +852,9 @@ var nimFwDbgSmOrphanDrained* {.wifiCtrl, exportc: "nimfw_dbg_sm_orphan_drained".
 # Overlap tripwire: a new SCANU req arrived while paramPtr was still live (the
 # UAF the idle guard now prevents). MUST stay 0 in the field.
 var nimFwDbgScanuParamOverwrite* {.wifiCtrl, exportc: "nimfw_dbg_scanu_param_overwrite".}: uint32
+when defined(bl808WifiScanOwnershipBench):
+  var nimFwDbgScanOwnershipSaved* {.wifiCtrl.}: uint32
+  var nimFwDbgScanOwnershipCancelled* {.wifiCtrl.}: uint32
 when defined(bl808WifiDiagColdScan):
   var nimFwDbgColdScanFlow* {.wifiCtrl, exportc: "nimfw_dbg_cold_scan_flow".}: array[6, uint32]
 when defined(bl808WifiDiagWarmScan):
