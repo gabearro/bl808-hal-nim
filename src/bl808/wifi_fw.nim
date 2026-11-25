@@ -91,7 +91,6 @@ include wifi/fw/tx_layer
 include wifi/fw/station_tx_build
 include wifi/fw/station_scan
 include wifi/fw/station_registration
-include wifi/fw/station_response_timeout
 include wifi/fw/station_bss
 include wifi/fw/station_activation
 include wifi/fw/tx_upper

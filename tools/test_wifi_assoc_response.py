@@ -133,9 +133,6 @@ proc ke_timer_clear(id: uint16; task: uint8) =
   invoke(onClear)
 proc ke_timer_set(id: uint16; task: uint8; delay: uint32) =
   delays.add(delay.uint64)
-proc smRspTimerSetComeback(owner: SmTxBuildContext; intervalTu: uint32): bool =
-  delays.add(max(1'u64, intervalTu.uint64 * 1024))
-  not failTimer
 proc c_memcpy(dst, src: pointer; length: csize_t): pointer =
   copyMem(dst, src, length.int)
   invoke(onCopy)
@@ -245,14 +242,14 @@ def source(trace: bool = False) -> str:
                     "SmConnectIndPayload", "MmSetVifStateReqPayload") + PLATFORM
     owner = (FW / "station_tx_build.nim").read_text()
     code += station_sm_source()
-    for name in ["smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent", "smTxSameSession", "smTxBindStation", "smTxSetOwnerState"]:
+    for name in ["smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent", "smTxBindStation", "smTxSetOwnerState"]:
         code += procedure(owner, name)
-    # Share the real response timer ownership check, including its TX serial.
-    timer = (FW / "station_response_timeout.nim").read_text()
-    code += "type KeTimerEntry = object\n  id: uint16\n"
-    code += timer.split("proc smRspNextSerial", 1)[0].replace(" {.wifiCtrl.}", "")
-    for name in ["smRspNextSerial", "smRspTimeoutCurrent", "smRspTimerBegin", "smRspTimerPublish"]:
-        code += procedure(timer, name)
+    code += r'''
+proc smArmResponse(stamp: uint32; delayUs: uint64): bool =
+  doAssert opCurrent(smOwn.op, stamp) and state == SmAssocRspState
+  delays.add(delayUs)
+  not failTimer
+'''
     # This suite isolates RX preparation; activation's full exchange has its own suite.
     code += r'''
 proc smActivationReleasePrepared(prepared: var SmActivationPrepared) =
@@ -293,9 +290,12 @@ proc smActivationStart(owner: SmTxBuildContext; indication: pointer;
 CASES = {
     "comeback_interval": r'''
 let p = response([56'u8, 5, 3, 128, 0, 0, 0], 30)
+let request = smGo(SmAssocRspState)
 sm_assoc_rsp_handler(p)
 doAssert delays == @[131072'u64], "comeback delay was narrowed"
 doAssert conn.retry == 0 and sent.len == 0 and failures.len == 0
+# The comeback is its own wait: the request's deadline is stale.
+doAssert state == SmAssocRspState and not opCurrent(smOwn.op, request)
 finish(p)
 ''',
     "power_constraint": r'''
@@ -620,14 +620,11 @@ finish(p)
 for name, ies in {"short_ie_header": "[1'u8]", "short_ie_body": "[1'u8, 2, 3]"}.items():
     CASES[name] = f'''
 let p = response({ies})
-var timer = KeTimerEntry(id: SM_RSP_TIMEOUT_IND)
-let timerSerial = smRspTimerBegin(SM_RSP_TIMEOUT_IND, TASK_SM, 0)
-doAssert smRspTimerPublish(SM_RSP_TIMEOUT_IND, TASK_SM, timerSerial, addr timer)
-let queuedExpiry = smRspIdentity
+let request = smGo(SmAssocRspState)
 sm_assoc_rsp_handler(p)
 doAssert clears.len == 0 and sent.len == 0
-doAssert smRspEntry == (addr timer) and smRspTimeoutCurrent(queuedExpiry),
-  "an ignored association response invalidated the timeout owner"
+doAssert opCurrent(smOwn.op, request),
+  "an ignored association response ended the response wait"
 finish(p)
 '''
 

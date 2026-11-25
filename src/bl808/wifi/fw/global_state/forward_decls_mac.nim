@@ -134,15 +134,6 @@ proc smActivationNeedsService(): bool
 proc smActivationService()
 proc smActivationNotifyCurrent(): bool
 proc smActivationConsumeSuccess(station: uint8): bool
-proc smRspTimerReset()
-proc smRspTimerBegin(id: uint16; task: uint8; continuationUs: uint64): uint32
-proc smRspTimerSetComeback(owner: SmTxBuildContext; intervalTu: uint32): bool
-proc smRspTimerAbort(serial: uint32)
-proc smRspTimerPublish(id: uint16; task: uint8; serial: uint32;
-                       entry: ptr KeTimerEntry): bool
-proc smRspTimerClear(id: uint16; task: uint8)
-proc smRspTimerDispatch(entry: ptr KeTimerEntry): bool
-proc smRspTimerTakeRequeue(): int
 proc txlRebasePostponedLeases()
 proc smSaQueryQueueTimeout(serial: uint32)
 proc smSaQueryBeginReset(): bool
@@ -152,7 +143,6 @@ template smSaQueryResetScope() =
   let previousSaQueryReset = smSaQueryBeginReset()
   defer: smSaQueryEndReset(previousSaQueryReset)
 
-proc smRspTimerForget(header: pointer)
 proc smBssCanBegin(): bool
 proc smBssNewSerial(): uint32
 proc smBssAlloc(index: int; serial: uint32; reply: bool): pointer
@@ -213,14 +203,10 @@ proc smTxFail(build: var SmTxBuildContext; status: uint16)
 proc smTxSetState(build: var SmTxBuildContext; state: uint16): bool
 proc smTxSetOwnerState(build: var SmTxBuildContext; state: uint16): bool
 proc smDeauthSend(build: var SmTxBuildContext)
-proc smTxArmResponse(build: var SmTxBuildContext; delay: uint32): bool
-proc smAuthRecordResponse(build: var SmTxBuildContext; algorithm: uint8;
-                          txSequence: uint16): bool
-proc smAuthCancelResponse(build: SmTxBuildContext)
-proc smAuthResponseMatches(build: SmTxBuildContext; algorithm,
-                           responseSequence: uint16): bool
-proc smAuthConsumeResponse(build: SmTxBuildContext; algorithm,
-                           responseSequence: uint16): bool
+proc smAuthRecordResponse(stamp: uint32; algorithm: uint8; txSequence: uint16): bool
+proc smAuthCancelResponse(stamp: uint32)
+proc smAuthResponseMatches(algorithm, responseSequence: uint16): bool
+proc smAuthConsumeResponse(algorithm, responseSequence: uint16): bool
 proc smTxSubmit(build: var SmTxBuildContext; forced: bool): bool
 proc smTxFits(build: ptr SmTxBuildContext; buffer: pointer; length: uint32): bool
 proc meBuildSaeAuthenticate(buf: pointer; authAlgo, authSeq, statusCode: uint16;

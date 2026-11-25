@@ -4,7 +4,8 @@
 # operation (or a new phase of it) starts; opFinish ends it. Whatever the
 # operation hands out and does not keep a pointer to carries the serial it
 # was issued under, its stamp: a kernel timer (KeTimerEntry.stamp, set by
-# ke_timer_try_set), a frame (its confirmation argument, opStampEnv) or a
+# ke_timer_try_set; its expiry message carries the stamp as its payload),
+# a frame (its confirmation argument, opStampEnv) or a
 # port-defined indication (its payload). The receiver drops a delivery
 # whose stamp is not current: it belongs to an operation that has ended.
 #

@@ -365,7 +365,7 @@ def source(trace: bool = False) -> str:
         code += procedure(kernel, name)
     owner = (FW / "station_tx_build.nim").read_text()
     code += station_sm_source()
-    for name in ["smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent", "smTxSameSession", "smTxBindStation", "smTxSetOwnerState"]:
+    for name in ["smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent", "smTxBindStation", "smTxSetOwnerState"]:
         code += procedure(owner, name)
     scan = (FW / "scan_station_ap_me.nim").read_text()
     code += procedure(scan, "smAssocOwnerCurrent")

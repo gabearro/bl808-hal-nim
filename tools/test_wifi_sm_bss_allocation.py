@@ -265,7 +265,7 @@ def source(types: str, scan: str) -> str:
         code += layouts("TxSessionIdentity", "SmTxBuildContext")
         helper = (FW / "station_tx_build.nim").read_text()
         code += station_sm_source()
-        for name in ["smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent", "smTxSameSession", "smTxBindStation", "smTxSetOwnerState"]:
+        for name in ["smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent", "smTxBindStation", "smTxSetOwnerState"]:
             code += procedure(helper, name)
     code += (FW / "station_bss.nim").read_text()
     code += r'''

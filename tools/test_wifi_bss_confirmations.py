@@ -173,7 +173,7 @@ def source() -> str:
     code += platform + EXTRA
     owner = (FW / "station_tx_build.nim").read_text()
     code += station_sm_source()
-    for name in ["smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent", "smTxSameSession", "smTxBindStation", "smTxSetOwnerState"]:
+    for name in ["smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent", "smTxBindStation", "smTxSetOwnerState"]:
         code += procedure(owner, name)
     code += (FW / "station_bss.nim").read_text()
     kernel = (FW / "kernel_mac_channel.nim").read_text()

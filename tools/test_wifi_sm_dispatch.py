@@ -97,10 +97,11 @@ proc ke_state_set(task: uint8; state: uint16) =
   currentState = state
 proc ke_timer_set(id: uint16; task: uint8; delay: uint32) =
   doAssert task == TASK_SM and id == SM_RSP_TIMEOUT_IND
-proc smRspTimeoutCapture(p: pointer): tuple[captured: bool,
-    owner: tuple[connection: pointer, state: uint16]] =
-  (true, (env.connectInfo, ke_state_get(TASK_SM)))
-proc smRspTimeoutCurrent(timeout: typeof(smRspTimeoutCapture(nil))): bool = true
+# Every expiry here is the live operation's (test_wifi_response_timeout.py
+# drives the stamps).
+var smOwn: tuple[op: uint32]
+proc opCurrent(op, stamp: uint32): bool = true
+proc smResponseExpiry(p: pointer): uint32 = 1
 proc sm_connect_ind(status, reason: uint16) = events.add(("connect", status, reason))
 proc sm_disconnect_process(vif: pointer; status, reason: uint16) =
   events.add(("disconnect", status, reason))

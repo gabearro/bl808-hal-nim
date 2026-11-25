@@ -9,9 +9,10 @@ F1: frames postponed on a station queue are leased in one TX reset epoch and
     mm_force_idle_req -> txl_reset, so a frame postponed while its VIF was off
     channel is dropped on return (no TX, no callback) or aged out with a stale
     callback scope outside the reset window.
-F2: the SM response deadline is bound to txResetEpoch and is discarded by
+F2: the SM response deadline was bound to txResetEpoch and was discarded by
     ke_timer_schedule after any txl_reset, including a channel switch, so SM
-    can wait for an auth/assoc response with no deadline.
+    could wait for an auth/assoc response with no deadline. It now carries
+    only the SM operation's stamp (smArmResponse), which a reset cannot touch.
 """
 
 from pathlib import Path
@@ -344,14 +345,15 @@ def test_response_deadline_survives_unrelated_retirement(tmp_path: Path, mode: s
     """Owner-scoped invalidation: retiring another VIF or peer keeps SM's deadline."""
     run_program(tmp_path, mode, response_program(r'''
 setup()
-ke_timer_set(SM_RSP_TIMEOUT_IND, TASK_SM, 50)
+discard arm(50)
 inc rxVifEpochs[0]
 inc stationEpochs[3]
 now = 151
 ke_timer_schedule()
 deliver(takeMessage())
 doAssert authRetries == 1 and connection.retry == 1 and failures == 0
-doAssert messages.first == nil and not ke_timer_active(SM_RSP_TIMEOUT_IND, TASK_SM)
+# The retry is a new operation with its own deadline.
+doAssert messages.first == nil and ke_timer_active(SM_RSP_TIMEOUT_IND, TASK_SM)
 '''))
 
 
@@ -360,7 +362,7 @@ def test_response_deadline_survives_channel_switch_reset(tmp_path: Path, mode: s
     """Reset with a timer pending: the auth deadline must still retry or fail."""
     run_finding(tmp_path, mode, response_program(r'''
 setup()
-ke_timer_set(SM_RSP_TIMEOUT_IND, TASK_SM, 50)
+discard arm(50)
 doAssert ke_timer_active(SM_RSP_TIMEOUT_IND, TASK_SM)
 # SM is authenticating; an off-channel hop runs chanForceIdle -> txl_reset.
 doAssert chanForceIdle()
@@ -369,7 +371,7 @@ ke_timer_schedule()
 while messages.first != nil:
   deliver(takeMessage())
 doAssert state == SmAuthenticatingState
-doAssert authRetries + failures == 1 or ke_timer_active(SM_RSP_TIMEOUT_IND, TASK_SM),
+doAssert authRetries == 1 and failures == 0,
   "F2: response deadline discarded; SM remains authenticating with no timer"
 '''), "F2: response deadline discarded")
 

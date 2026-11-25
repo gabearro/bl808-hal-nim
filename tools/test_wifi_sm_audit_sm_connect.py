@@ -52,12 +52,13 @@ def response_source() -> str:
     scan = (FW / "scan_station_ap_me.nim").read_text()
     return program_source() + procedure(scan, "sm_auth_start") + r'''
 proc fireDeadline(): pointer =
-  # Expire the one published SM_RSP_TIMEOUT_IND entry and return its message.
+  # Expire the one armed SM_RSP_TIMEOUT_IND entry and return the message
+  # ke_timer_schedule posts for it: its payload is the entry's stamp.
+  doAssert timerDelay != 0
   now = timerEntry.time
   timerDelay = 0
-  doAssert smRspTimerDispatch(addr timerEntry)
-  result = expiryMessage
-  expiryMessage = nil
+  result = ke_msg_try_alloc(SM_RSP_TIMEOUT_IND, TASK_SM, 0xFF, 4)
+  cast[ptr uint32](result)[] = timerEntry.stamp
 proc deliverTimeout(message: pointer) =
   doAssert sm_rsp_timeout_ind_handler(message) == KeMsgConsumed
   ke_msg_free(keMsgHdrFromPayload(message))
@@ -90,20 +91,62 @@ doAssert pushes == 3 and conn.retry == 1 and failures == 0
 
 
 def test_response_deadline_survives_tx_reset(tmp_path: Path) -> None:
+    """SMCONN-F1 by construction: the deadline carries the SM operation's
+    stamp, which only a state change advances, so a TX reset cannot retire it."""
     run_nim(tmp_path, response_source() + r'''
 for kind in 0..1:
   setup(kind)
   perform(kind)
   let waiting = if kind == 0: SmAuthenticatingState else: SmAssocRspState
   doAssert pushes == 1 and failures == 0 and currentState == waiting
+  doAssert timerEntry.stamp == smOwn.op.serial
   txl_frame_release(activeFrame, false) # Sent, but the AP response is lost.
   inc txResetEpoch                      # Channel departure or MAC recovery.
-  let message = fireDeadline()
-  doAssert message != nil, "[SMCONN-F1] response deadline dropped after TX reset; " &
-    "SM stays in state " & $currentState & " with no retry, failure or timer"
-  deliverTimeout(message)
-  doAssert pushes == 2 or failures == 1
-''', finding="SMCONN-F1")
+  deliverTimeout(fireDeadline())
+  doAssert pushes == 2 and failures == 0 and conn.retry == 1 and currentState == waiting,
+    "[SMCONN-F1] response deadline dropped after TX reset; SM stays in state " &
+    $currentState & " with no retry, failure or timer"
+''')
+
+
+def test_response_expiry_that_cannot_be_posted_is_delivered_later(tmp_path: Path) -> None:
+    """SMSTRUCT-N2: the real ke_timer_schedule could not allocate the
+    SM_RSP_TIMEOUT_IND, so the dispatch had claimed the expiry, asserted and
+    dropped it, leaving SM in state 6 or 8 with no deadline. The expiry is now
+    re-queued on the same entry 1 ms later with its stamp, and delivered. An
+    association comeback chunk whose re-arm cannot be allocated ends the wait
+    (and the retry policy runs) instead of losing it."""
+    from test_wifi_message_allocation import run_program
+    from test_wifi_response_timeout import source
+    run_program(tmp_path, "checked", source() + r'''
+for waiting in [SmAuthenticatingState, SmAssocRspState]:
+  setup(waiting)
+  let stamp = arm(0x7D000)
+  failAlloc = true
+  now = cast[ptr KeTimerEntry](keTimerQueue.first).time
+  ke_timer_schedule()
+  let entry = cast[ptr KeTimerEntry](keTimerQueue.first)
+  doAssert messages.first == nil and allocationFailures == 0
+  doAssert entry != nil and entry.stamp == stamp and entry.time == now + 1000,
+    "[SMSTRUCT-N2] an expiry that could not be posted was dropped"
+  failAlloc = false
+  now = entry.time
+  ke_timer_schedule()
+  deliver(takeMessage())
+  doAssert connection.retry == 1 and authRetries + assocRetries == 1 and failures == 0
+  doAssert state == waiting and ke_timer_active(SM_RSP_TIMEOUT_IND, TASK_SM)
+  finish()
+setup(SmAssocRspState)
+doAssert smArmResponse(smGo(SmAssocRspState), 1_000_000'u64 * 1024)
+let chunk = expire()
+failAlloc = true
+onAlloc = proc() = failAlloc = false
+deliver(chunk)
+doAssert assocRetries == 1 and connection.retry == 1 and allocationFailures == 0,
+  "[SMSTRUCT-N2] a comeback chunk that could not be re-armed was lost"
+doAssert ke_timer_active(SM_RSP_TIMEOUT_IND, TASK_SM)
+finish()
+''')
 
 
 def test_auth_response_after_tx_reset_completes_attempt(tmp_path: Path) -> None:
@@ -115,7 +158,7 @@ inc txResetEpoch # The channel scheduler departed and returned while waiting.
 sm_auth_handler(p)
 doAssert associations == 1 and failures.len == 0, "[SMCONN-F2] open-system auth " &
   "response for the live attempt was ignored after TX reset (associations=" &
-  $associations & ", txSequence=" & $smAuthResponseExpectations[1].txSequence & ")"
+  $associations & ", txSequence=" & $smAuthExpected.txSequence & ")"
 finish(p)
 ''', finding="SMCONN-F2")
 
@@ -373,7 +416,6 @@ var smConnecting, smReconnectTrigger: bool
 var smAuthRetryLimit: uint8
 var cancellations: int
 proc smActivationCancel() = inc cancellations
-proc smRspTimerReset() = inc cancellations
 proc smBssCancel() = inc cancellations
 proc smCleanupCancel() = inc cancellations
 proc smDeferredCancel() = inc cancellations
@@ -390,7 +432,7 @@ for waiting in 1'u16 .. 10'u16:
   sm.connectIndMsg = addr parked[0]
   currentState = waiting
   sm_init()
-  doAssert currentState == SmIdleState and sm.connectInfo == nil and cancellations == 5
+  doAssert currentState == SmIdleState and sm.connectInfo == nil and cancellations == 4
   cancellations = 0
   let status = sm_connect_req_handler(addr request)
   doAssert status == KeMsgNoFree and confirmationStatus == 0, "[SMCONN-F7] after " &

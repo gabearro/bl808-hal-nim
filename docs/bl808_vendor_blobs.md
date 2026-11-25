@@ -7035,10 +7035,11 @@ cases below; reachability was argued from code, not reproduced on
 hardware.
 
 `smTxSessionCurrent` now checks the connection attempt without the reset
-epoch, and `smTxOwnerCurrent` adds the epoch for frames only. The
-auth/assoc response deadline, the expected auth response, the BSS
+epoch, and `smTxOwnerCurrent` adds the epoch for frames only. The BSS
 parameter batch, the activation exchange and the SM scan/join exchange
-use the session check. The deauthentication confirmations end their wait
+use the session check. The auth/assoc response deadline and the expected
+auth response carry the SM operation's stamp instead (see "SM response
+deadline" below). The deauthentication confirmations end their wait
 with any status, as pinned `sm.o:sm_connect_abort_deauth_cfm` and
 `sm_supplicant_deauth_cfm` do (see "SM teardown" below). `bl_reset_evt` carries the TBTT,
 connectionless and context deadlines and the scan and registration
@@ -7293,6 +7294,69 @@ writer. Further tests: `tools/test_wifi_sm_audit_sm_connect.py`,
 `tools/test_wifi_sm_cleanup.py`, `tools/test_wifi_deauth_lifetime.py`,
 `tools/test_wifi_disconnect_tx.py` and `tools/test_wifi_supplicant_result.py`.
 The M0 HTTP server manifest built; none of this was flashed.
+
+#### SM response deadline (states 6 and 8)
+
+`sm_auth_send` and `sm_assoc_req_send` enter state 6 or 8 through `smGo`
+and arm `SM_RSP_TIMEOUT_IND` with `smArmResponse`, which keeps that
+operation's stamp on the kernel timer entry. `ke_timer_schedule` posts a
+stamped expiry with the stamp as a 4-byte payload; the blob's
+`ke_msg_send_basic` posts none. `sm_rsp_timeout_ind_handler` acts only on
+an expiry whose stamp is the live operation's (`smResponseExpiry`), then
+runs the blob's state, retry and failure logic. A TX reset, a channel
+switch or a slot epoch does not touch the stamp, so the deadline survives
+them as in the blob (SMCONN-F1, F2 in the TX/RX audit). Differences from
+the archive:
+
+- An expiry already posted when SM changes state (the response arrived,
+  authentication restarted, the attempt ended) is ignored. The blob's
+  handler checks only `sm_env` and the state, so it would retry the newer
+  request early. `smGo` does not clear the timer; the response handlers
+  still clear it, as in `sm.o`.
+- The expected auth response (port-only) is one record of the sending
+  operation's stamp, algorithm and transaction number. A response matches
+  only while that operation is live, so one arriving after a TX reset
+  completes the attempt (SMCONN-F2).
+- An expiry whose message cannot be allocated is re-queued on the same
+  entry 1 ms later with its stamp, like every other kernel timer expiry
+  (SMSTRUCT-N2). The blob's `ke_msg_alloc` halts.
+- Association comeback (status 30 with a Timeout Interval element of type
+  3): pinned `sm_assoc_rsp_handler+0x182..0x1a6` reads three of the four
+  interval bytes, shifts the value left by 10 in 32 bits and calls
+  `ke_timer_set`, which asserts on zero or on more than
+  `KE_TIMER_MAX_DELAY`. The port uses all four bytes, waits at least 1 us,
+  and starts a new operation in state 8 first, so an expiry already posted
+  for the request is stale. A wait longer than one kernel timer (about
+  300 s) is armed in chunks under the same stamp; `smOwn.responseUs` holds
+  the rest, and each chunk's expiry arms the next one when it is handled,
+  so the total runs late by that handling time. If a chunk cannot be
+  armed for lack of memory, the wait ends then and the retry policy runs.
+- A builder that failed or returned after arming used to clear the
+  deadline in `smTxEnd`/`smTxFail`. A silent return then left SM in state
+  6 or 8 with nothing pending. The deadline now stays: a failure's
+  teardown makes it stale, and otherwise it retries.
+- After the RX-control register read, the traces and the retry count, the
+  handler no longer re-checks the attempt; none of these can run firmware
+  code. It re-checks once after the supplicant's `authTimeout` callback.
+
+Removed: `station_response_timeout.nim` (its serial, identity, message
+tags, kernel dispatch hook and re-queue protocol), the `smRsp*` hooks in
+`ke_msg_free`, `ke_init`, `ke_flush`, `ke_timer_try_set`,
+`keTimerClearLocked` and `ke_timer_schedule`, `smTxTimerCurrent`,
+`smTxArmResponse`, `SmTxBuildContext.responseArmed`, `smTxSameSession`
+and the TX identity in the auth expectation. `ke_timer_try_set` lost its
+guard, context and continuation parameters. SA Query (`smSaQueryArmCurrent`)
+and the scan probe repeat checked the same predicate just before the call,
+and nothing inside the call can run their code; a set or clear nested in
+another of the same timer is still resolved by `KeTimerMutation`.
+
+Host tests: `tools/test_wifi_response_timeout.py` (rewritten for stamps),
+`tools/test_wifi_station_tx_build.py`, `tools/test_wifi_auth_response.py`,
+`tools/test_wifi_assoc_response.py`, `tools/test_wifi_timer_lifetime.py`
+(stamped expiry payload; the guard cases went with the guard),
+`tools/test_wifi_sm_audit_sm_connect.py` (SMCONN-F1, SMCONN-F2,
+SMSTRUCT-N2) and `tools/test_wifi_sm_audit_txrx_reset.py` (F2). The M0
+HTTP server manifest built; none of this was flashed.
 
 ## BLE
 

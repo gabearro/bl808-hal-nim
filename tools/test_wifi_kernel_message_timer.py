@@ -156,13 +156,12 @@ var
   keTimerMutationTop: ptr KeTimerMutation
   first, second: KeTimerEntry
   now, events, hardwareTarget: uint32
-  frees, diagnostics, clears: int
+  frees, diagnostics: int
   interrupts = true
 proc irqSave(): uint32 =
   result = if interrupts: 8'u32 else: 0'u32
   interrupts = false
 proc irqRestore(saved: uint32) = interrupts = saved != 0
-proc smRspTimerClear(id: uint16; task: uint8) = inc clears
 proc cmp_timer_id(elem: ptr CoListHdr; param: pointer): bool {.cdecl.} =
   let entry = cast[ptr KeTimerEntry](elem)
   let key = cast[uint](param).uint32
@@ -200,7 +199,6 @@ proc setup(secondTime, currentTime: uint32) =
   hardwareTarget = 100
   frees = 0
   diagnostics = 0
-  clears = 0
   interrupts = true
 ''' + "\n".join(procedure(kernel, name) for name in (
         "keTimerCancelMutations", "keTimerBeginMutation",
@@ -213,12 +211,12 @@ def test_clear_head_schedules_overdue_successor(tmp_path: Path, mode: str) -> No
 setup(200, 250)
 ke_timer_clear(0x40, 3)
 doAssert events == KE_EVT_KE_TIMER and hardwareTarget == 200
-doAssert diagnostics == 1 and frees == 1 and clears == 1 and interrupts
+doAssert diagnostics == 1 and frees == 1 and interrupts
 doAssert keTimerMutationTop == nil
 doAssert keTimerQueue.first == cast[ptr CoListHdr](addr second)
 
 setup(200, 150)
 ke_timer_clear(0x40, 3)
 doAssert events == 0 and hardwareTarget == 200
-doAssert diagnostics == 0 and frees == 1 and clears == 1 and interrupts
+doAssert diagnostics == 0 and frees == 1 and interrupts
 ''')

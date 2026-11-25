@@ -1175,8 +1175,7 @@ proc scheduleActiveScanProbeTimer*(scanParam: pointer; requestEpoch: uint32;
   let delay = duration shr 1
   # The channel timer ends the dwell independently of this optional retry.
   if delay != 0 and delay <= KE_TIMER_MAX_DELAY:
-    discard ke_timer_try_set(SCAN_PROBE_TIMER, TASK_SCAN, delay,
-                             scanProbeTimerCurrent, addr owner)
+    discard ke_timer_try_set(SCAN_PROBE_TIMER, TASK_SCAN, delay)
   current()
 
 proc scanTaskInChannelRunningState*(): bool {.inline.} =
@@ -2383,24 +2382,21 @@ proc sm_rsp_timeout_ind_handler*(param: pointer): cint {.exportc, cdecl, discard
   ##   - Check retry count (conn_env[60]) vs max retries (sm_env word at byte 24)
   ##   - If retries available: increment, retry auth in state 6 or assoc in state 8
   ##   - If retries exhausted: sm_connect_ind(11, 0xFFFF)
-  let timeout = smRspTimeoutCapture(param)
-  if not timeout.captured: return KeMsgConsumed
-  template current(): bool = smRspTimeoutCurrent(timeout)
+  ## The expiry carries the stamp of the SM operation that armed it; one from
+  ## an earlier operation is stale (smResponseExpiry).
+  let stamp = smResponseExpiry(param)
+  if stamp == 0: return KeMsgConsumed
   let sm = smEnvView()
-  let connEnv = timeout.owner.connection
-  let state = timeout.owner.state
+  let connEnv = sm.connectInfo
+  let state = ke_state_get(TASK_SM)
   inc nimFwDbgSmRspTimeout
   nimFwDbgSmRspTimeoutState = state.uint32
-  let rxControl = regRead(MACHW_RX_CNTRL_REG)
-  if not current(): return KeMsgConsumed
-  nimFwDbgSmRspTimeoutRxCtrl = rxControl
+  nimFwDbgSmRspTimeoutRxCtrl = regRead(MACHW_RX_CNTRL_REG)
   when defined(bl808WifiConnectTrace):
     nimFwTrace2U32("[WIFI-NIMFW] sm_rsp_timeout ",
                    state.uint32, cast[uint32](cast[uint](connEnv)))
-    if not current(): return KeMsgConsumed
     nimFwConnectTrace2U32("[WIFI-CT] sm_rsp_timeout ",
                           state.uint32, cast[uint32](cast[uint](connEnv)))
-    if not current(): return KeMsgConsumed
   if connEnv == nil:
     return KeMsgConsumed
   if state != SmAuthenticatingState and state != SmAssocRspState:
@@ -2411,10 +2407,8 @@ proc sm_rsp_timeout_ind_handler*(param: pointer): cint {.exportc, cdecl, discard
   when defined(bl808WifiConnectTrace):
     nimFwTrace2U32("[WIFI-NIMFW] sm_rsp_retry ",
                    retryCount.uint32, maxRetries)
-    if not current(): return KeMsgConsumed
     nimFwConnectTrace2U32("[WIFI-CT] sm_rsp_retry ",
                           retryCount.uint32, maxRetries)
-    if not current(): return KeMsgConsumed
   if retryCount.uint32 >= maxRetries:
     # Retries exhausted: report timeout failure
     sm_connect_ind(WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE, 0xFFFF'u16)
@@ -2426,7 +2420,8 @@ proc sm_rsp_timeout_ind_handler*(param: pointer): cint {.exportc, cdecl, discard
       let wpaCbFn = wpaCallbacks().authTimeout
       if wpaCbFn != nil:
         cast[proc() {.cdecl.}](wpaCbFn)()
-        if not current(): return KeMsgConsumed
+        # The supplicant may have ended the attempt.
+        if not opCurrent(smOwn.op, stamp): return KeMsgConsumed
     sm_auth_send_pre(1'u16, nil)
   else:
     sm_assoc_req_send_pre()

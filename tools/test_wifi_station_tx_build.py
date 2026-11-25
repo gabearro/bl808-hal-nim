@@ -69,11 +69,10 @@ type
   Indication = SmConnectIndPayload
   Mm = object
     rxFilterExtra, rxFilterBase: uint32
-  KeTimerGuard = proc(context: pointer): bool {.nimcall.}
   KeTimerEntry = object
     id: uint16
     taskId: uint8
-    time: uint32
+    time, stamp: uint32
   KeMsgHdr = object
     id: uint16
     destId, srcId: uint8
@@ -200,24 +199,14 @@ proc ke_timer_set(id: uint16; task: uint8; delay: uint32) =
   inc timerSetCalls
   timerDelay = delay
   observe(8)
-proc smRspTimerBegin(id: uint16; task: uint8; continuationUs: uint64): uint32
-proc smRspTimerPublish(id: uint16; task: uint8; serial: uint32;
-                       entry: ptr KeTimerEntry): bool
-proc smRspTimerClear(id: uint16; task: uint8)
-proc smRspTimerForget(header: pointer)
-proc ke_timer_try_set(id: uint16; task: uint8; delay: uint32;
-                      guard: KeTimerGuard = nil; context: pointer = nil;
-                      continuationUs: uint64 = 0): bool =
+proc ke_timer_try_set(id: uint16; task: uint8; delay: uint32; stamp: uint32 = 0): bool =
   inc timerSetCalls
   observe(8)
-  if timerFailure or (guard != nil and not guard(context)): return false
-  let serial = smRspTimerBegin(id, task, continuationUs)
-  timerEntry = KeTimerEntry(id: id, taskId: task, time: now + delay)
-  if not smRspTimerPublish(id, task, serial, addr timerEntry): return false
+  if timerFailure: return false
+  timerEntry = KeTimerEntry(id: id, taskId: task, time: now + delay, stamp: stamp)
   timerDelay = delay
   true
 proc ke_timer_clear(id: uint16; task: uint8) =
-  smRspTimerClear(id, task)
   timerDelay = 0
 proc macTimeNow(): uint32 = now
 proc assert_err(condition, file: cstring; line: cint) =
@@ -229,7 +218,6 @@ proc ke_msg_try_alloc(id: uint16; dest, src: uint8; length: uint32): pointer =
   header[] = KeMsgHdr(id: id, destId: dest, srcId: src, paramLen: length)
   cast[pointer](cast[uint](header) + sizeof(KeMsgHdr).uint)
 proc ke_msg_free(header: pointer) =
-  smRspTimerForget(header)
   dealloc(header)
 proc ke_msg_send(p: pointer) =
   doAssert expiryMessage == nil
@@ -347,9 +335,9 @@ proc observe(point: int) =
   of 8: sm.connectIndMsg = addr replacementIndication
   else: discard
 proc setup(kind: int) =
-  smRspTimerReset()
   smOwn = default(typeof(smOwn))
-  doAssert expiryMessage == nil and smRspTags == nil
+  smAuthExpected = default(typeof(smAuthExpected))
+  doAssert expiryMessage == nil
   sm = SmEnv(connectInfo: addr conn, connectIndMsg: addr indication, authRetryLimit: 2)
   conn = Conn(vifIdx: 1, authType: 0)
   replacementConn = conn
@@ -393,13 +381,12 @@ proc perform(kind: int) =
   if kind == 0: sm_auth_send(1, nil)
   else: sm_assoc_req_send()
 proc runTimerClockAt(target: uint32) =
+  # ke_timer_schedule posts the expiry with the entry's stamp as its payload.
   now = target
   if timerDelay == 0 or now < timerEntry.time: return
   timerDelay = 0
-  doAssert smRspTimerDispatch(addr timerEntry)
-  doAssert expiryMessage != nil
-  let message = expiryMessage
-  expiryMessage = nil
+  let message = ke_msg_try_alloc(timerEntry.id, timerEntry.taskId, 0xFF, 4)
+  cast[ptr uint32](message)[] = timerEntry.stamp
   doAssert sm_rsp_timeout_ind_handler(message) == KeMsgConsumed
   ke_msg_free(keMsgHdrFromPayload(message))
 '''
@@ -472,16 +459,20 @@ for sample in [(0'u8, 1'u16, 2'u16), (1'u8, 1'u16, 2'u16),
   setup(0)
   conn.authType = algorithm
   onHandoff = proc() =
-    doAssert smAuthResponseExpectations[1].txSequence == txSequence
-    doAssert smAuthResponseExpectations[1].algorithm == algorithm
+    doAssert smAuthExpected.txSequence == txSequence
+    doAssert smAuthExpected.algorithm == algorithm
+    doAssert smAuthExpected.stamp == smOwn.op.serial and timerEntry.stamp == smOwn.op.serial
     doAssert timerDelay != 0 and currentState == SmAuthenticatingState
   sm_auth_send(txSequence,
     if algorithm == 1 and txSequence == 3: addr challenge[0] else: nil)
   doAssert pushes == 1 and failures == 0
-  var owner = smTxCapture(addr conn)
-  doAssert smTxBindStation(owner, 2)
-  doAssert smAuthConsumeResponse(owner, algorithm.uint16, responseSequence)
-  doAssert not smAuthConsumeResponse(owner, algorithm.uint16, responseSequence)
+  doAssert smAuthConsumeResponse(algorithm.uint16, responseSequence)
+  doAssert not smAuthConsumeResponse(algorithm.uint16, responseSequence)
+  # A response to a request of an earlier operation does not match.
+  sm_auth_send(txSequence,
+    if algorithm == 1 and txSequence == 3: addr challenge[0] else: nil)
+  smGo(SmAuthenticatingState)
+  doAssert not smAuthConsumeResponse(algorithm.uint16, responseSequence)
 ''',
     "auth_failed_push_cancels_response": r'''
 for algorithm in [0'u8, 1, 3]:
@@ -490,7 +481,7 @@ for algorithm in [0'u8, 1, 3]:
   pushFailure = true
   sm_auth_send(1, nil)
   doAssert pushes == 1 and failures == 0 and timerDelay == 0x7D000
-  doAssert smAuthResponseExpectations[1].txSequence == 0
+  doAssert smAuthExpected.txSequence == 0
 ''',
     "join_peer_snapshot": r'''
 for kind in 0..1:
@@ -566,8 +557,10 @@ for kind in 0..1:
   doAssert currentState == (if kind == 0: 6'u16 else: 8'u16) and timerDelay == 0x7D000
 ''',
     "timer_and_state_replacement": r'''
+# Arming the kernel timer (hook 8) runs no firmware code; see timer_lifetime
+# for a set nested inside another.
 for kind in 0..1:
-  for stage in 7..8:
+  for stage in [7]:
     setup(kind)
     hook = stage
     action = 1
@@ -733,9 +726,8 @@ def program_source() -> str:
     if helper.exists():
         layout = (FW / "layout_types.nim").read_text()
         code += "type\n  SmTxBuildContext" + layout.split("  SmTxBuildContext", 1)[1].split("\n\n  ", 1)[0] + "\n"
-        code += station_sm_source()
+        code += station_sm_source("smGo", "smArmResponse", "smResponseExpiry")
         code += helper.read_text()
-        code += (FW / "station_response_timeout.nim").read_text()
         code += procedure(sm, "smTxSnapshotJoinPeer")
         code += r'''
 proc meBuildSaeAuthenticate(buf: pointer; algo, sequence, status: uint16; vif: uint32;

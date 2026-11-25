@@ -792,7 +792,6 @@ proc ke_msg_free*(param: pointer) {.exportc, cdecl.} =
   smRegistrationForget(param)
   chanUpdateForget(param)
   chanBcnRequestForget(param)
-  smRspTimerForget(param)
   smDeferredForget(param)
   smAbortForget(param)
   mmEdcaForget(param)
@@ -901,7 +900,6 @@ proc ke_init*() {.exportc, cdecl.} =
   smActivationCancel()
   chanSwitchReset()
   keTimerCancelMutations(all = true)
-  smRspTimerReset()
   co_list_init(addr keMsgQueueSent)
   co_list_init(addr keMsgQueueSaved)
   co_list_init(addr keTimerQueue)
@@ -923,7 +921,6 @@ proc ke_flush*() {.exportc, cdecl.} =
   chanSwitchReset()
   smActivationCancel()
   smBssCancel()
-  smRspTimerReset()
   smCleanupCancel()
   smDeferredCancel()
   mmPsModeCancel()
@@ -1387,33 +1384,17 @@ proc keTimerEndMutation(operation: var KeTimerMutation) =
   keTimerMutationTop = operation.previous
 
 proc ke_timer_try_set(taskId: uint16; instId: uint8; delay: uint32;
-                      guard: KeTimerGuard = nil; context: pointer = nil;
-                      continuationUs: uint64 = 0; stamp: uint32 = 0): bool =
+                      stamp: uint32 = 0): bool =
   ## False reports rejection/allocation failure; a newer nested mutation wins
   ## without being treated as an allocation failure by the public wrapper.
-  ## `stamp` is the owner's Op stamp, kept on the entry. Only the SA Query
-  ## expiry copies it into its message today; other expiries carry no payload.
+  ## `stamp` is the owner's Op stamp, kept on the entry. A stamped expiry
+  ## carries it as its 4-byte payload (ke_timer_schedule).
   if delay == 0 or delay > KE_TIMER_MAX_DELAY: return false
   let saved = irqSave()
-  if guard != nil and not guard(context):
-    irqRestore(saved)
-    return false
   var operation: KeTimerMutation
   keTimerBeginMutation(operation, taskId, instId)
-  let responseSerial = smRspTimerBegin(taskId, instId, continuationUs)
   var owned: ptr KeTimerEntry
-  var published = false
   defer:
-    if guard != nil and not guard(context):
-      result = false
-      if published and not operation.cancelled:
-        let first = keTimerQueue.first
-        let key = (taskId.uint32 shl 16) or instId.uint32
-        owned = cast[ptr KeTimerEntry](ke_queue_extract(addr keTimerQueue,
-          cmp_timer_id, cast[pointer](key)))
-        if owned != nil and first == cast[ptr CoListHdr](owned):
-          ke_timer_hw_set(cast[ptr KeTimerEntry](keTimerQueue.first))
-    if not result: smRspTimerAbort(responseSerial)
     if owned != nil:
       let retired = owned
       owned = nil
@@ -1436,9 +1417,7 @@ proc ke_timer_try_set(taskId: uint16; instId: uint8; delay: uint32;
     if operation.cancelled: return true
     if owned == nil: return false
   if operation.cancelled: return true
-  if guard != nil and not guard(context): return false
   let expiry = macTimeNow() + delay
-  if not smRspTimerPublish(taskId, instId, responseSerial, owned): return false
   owned.id = taskId
   owned.taskId = instId
   owned.time = expiry
@@ -1446,7 +1425,6 @@ proc ke_timer_try_set(taskId: uint16; instId: uint8; delay: uint32;
   let entry = owned
   co_list_insert(addr keTimerQueue, cast[ptr CoListHdr](entry), cmp_abs_time)
   owned = nil
-  published = true
   if wasFirst or keTimerQueue.first == cast[ptr CoListHdr](entry):
     ke_timer_hw_set(cast[ptr KeTimerEntry](keTimerQueue.first))
   # Publication may synchronously retire or replace the entry.
@@ -1467,7 +1445,6 @@ proc ke_timer_set*(taskId: uint16, instId: uint8, delay: uint32) {.exportc, cdec
 
 proc keTimerClearLocked(taskId: uint16; instId: uint8; saved: uint32) =
   ## Detach under the caller's lock and restore its IRQ state for callouts.
-  smRspTimerClear(taskId, instId)
   var operation: KeTimerMutation
   keTimerBeginMutation(operation, taskId, instId)
   var owned: ptr KeTimerEntry
@@ -1508,13 +1485,12 @@ proc keTimerExpired(entry: ptr KeTimerEntry; fromPoll: static bool = false): boo
   else:
     cast[int32](remaining - 50'u32) < 0
 
-proc keTimerRequeue(entry: ptr KeTimerEntry; delayUs: uint32; retired: bool): bool =
+proc keTimerRequeue(entry: ptr KeTimerEntry; delayUs: uint32): bool =
   ## Put back a popped expiry that could not be delivered, without allocating.
-  ## A clear or re-arm that ran meanwhile has retired it, unless the owner
-  ## says that was its own failed re-arm (`retired`).
+  ## A clear or re-arm that ran meanwhile has retired it.
   let saved = irqSave()
   defer: irqRestore(saved)
-  if not keTimerExpiryCurrent and not retired: return false
+  if not keTimerExpiryCurrent: return false
   keTimerExpiryCurrent = false
   entry.time = macTimeNow() + delayUs
   co_list_insert(addr keTimerQueue, cast[ptr CoListHdr](entry), cmp_abs_time)
@@ -1564,25 +1540,22 @@ proc ke_timer_schedule*() {.exportc, cdecl.} =
       entry
     if expiredTimerEntry.id == SM_SA_QUERY_TIMEOUT_IND_MSG and expiredTimerEntry.taskId == TASK_SM:
       smSaQueryQueueTimeout(expiredTimerEntry.stamp)
-    elif smRspTimerDispatch(expiredTimerEntry):
-      # Out of memory for the expiry: retry with the same entry in 1 ms.
-      let requeue = smRspTimerTakeRequeue()
-      if requeue != 0 and keTimerRequeue(expiredTimerEntry, 1000, requeue == 2):
-        inc drained
-        continue
     else:
       let id = expiredTimerEntry.id
       let dest = expiredTimerEntry.taskId
+      let stamp = expiredTimerEntry.stamp
       # The blob's ke_msg_alloc halts when the heap is exhausted. Here an
       # expiry that cannot be posted is retried on the same entry in 1 ms,
       # so it is late but never lost. The repeat probe is optional; the
-      # channel timer owns dwell progress.
-      let message = ke_msg_try_alloc(id, dest, 0xFF, 0)
+      # channel timer owns dwell progress. A stamped timer's expiry carries
+      # its stamp, so its owner can tell it from an earlier operation's.
+      let message = ke_msg_try_alloc(id, dest, 0xFF, if stamp != 0: 4'u32 else: 0'u32)
       if message == nil and not (id == SCAN_PROBE_TIMER and dest == TASK_SCAN) and
-          keTimerRequeue(expiredTimerEntry, 1000, false):
+          keTimerRequeue(expiredTimerEntry, 1000):
         inc drained
         continue
       if message != nil:
+        if stamp != 0: cast[ptr uint32](message)[] = stamp
         let saved = irqSave()
         if keTimerExpiryCurrent:
           ke_msg_send(message)

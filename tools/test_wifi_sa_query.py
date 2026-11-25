@@ -74,12 +74,9 @@ proc ke_state_set(task: uint8; state: uint16) =
   currentState = state
   events.add(("state", nil, 0'u16, 0'u16))
 proc macTimeNow(): uint32 = macNow
-proc ke_timer_try_set(id: uint16; task: uint8; delay: uint32;
-                      guard: proc(context: pointer): bool; context: pointer;
-                      stamp: uint32 = 0): bool =
-  doAssert task == TASK_SM
-  doAssert stamp == cast[ptr uint32](context)[] and stamp != 0
-  if timerAllocFails or not guard(context): return false
+proc ke_timer_try_set(id: uint16; task: uint8; delay: uint32; stamp: uint32 = 0): bool =
+  doAssert task == TASK_SM and stamp != 0
+  if timerAllocFails: return false
   timers.add(("set", id, delay, env.saQueryActive))
   true
 proc ke_timer_clear(id: uint16; task: uint8) =

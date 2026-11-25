@@ -2310,7 +2310,6 @@ proc scanuResultSlotIndex(entry: ptr ScanuResultEntry): uint32 {.inline.} =
 proc sm_init*() {.exportc, cdecl.} =
   ## Initialize SM module.
   smActivationCancel()
-  smRspTimerReset()
   smBssCancel()
   smCleanupCancel()
   smConnecting = false
@@ -3478,11 +3477,11 @@ proc sm_auth_send*(authSeqNum: uint16, challenge: pointer) {.exportc, cdecl.} =
 
   # Publish response state and its timeout before a synchronous TX completion.
   if not smTxSetState(build, SmAuthenticatingState): return
-  if not smTxArmResponse(build, responseDelay):
+  if not smArmResponse(build.stamp, responseDelay):
     smTxFail(build, WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE)
     return
   if authAlgo in [0'u8, 1'u8, 3'u8] and
-      not smAuthRecordResponse(build, authAlgo, authSeqNum):
+      not smAuthRecordResponse(build.stamp, authAlgo, authSeqNum):
     smTxFail(build, WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE)
     return
   smConnecting = true
@@ -3491,7 +3490,7 @@ proc sm_auth_send*(authSeqNum: uint16, challenge: pointer) {.exportc, cdecl.} =
   else:
     let accepted = smTxSubmit(build, false)
   if not accepted:
-    if authAlgo in [0'u8, 1'u8, 3'u8]: smAuthCancelResponse(build)
+    if authAlgo in [0'u8, 1'u8, 3'u8]: smAuthCancelResponse(build.stamp)
     # The vendor does not inspect the TX return value: after handoff, the
     # published deadline, not this call, drives the bounded retry policy.
     if build.ownsFrame: smTxFail(build, WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE)
@@ -3749,7 +3748,7 @@ proc sm_assoc_req_send*() {.exportc, cdecl.} =
   # Publish response state before handing the frame to the lower layer.
   if not smTxSetState(build, SmAssocRspState): return
   if sm.connectIndMsg != smEnvSecond: return
-  if not smTxArmResponse(build, responseDelay):
+  if not smArmResponse(build.stamp, responseDelay):
     fail(WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE)
     return
   if sm.connectIndMsg != smEnvSecond: return
@@ -3883,7 +3882,7 @@ proc sm_auth_handler*(param: pointer) {.exportc, cdecl.} =
     if algorithm == 0 and dispatch.staIdx == station and
         status in {AuthAlgorithmNotSupported, AuthTransactionOutOfSequence}: 2'u16
     else: sequence
-  if not smAuthResponseMatches(owner, algorithm, expectedSequence): return
+  if not smAuthResponseMatches(algorithm, expectedSequence): return
 
   var challenge: array[128, uint8]
   if status == 0 and algorithm == 1 and sequence == 2:
@@ -3903,7 +3902,7 @@ proc sm_auth_handler*(param: pointer) {.exportc, cdecl.} =
     if not current(): return
 
   if status != 0:
-    if not smAuthConsumeResponse(owner, algorithm, expectedSequence): return
+    if not smAuthConsumeResponse(algorithm, expectedSequence): return
     ke_timer_clear(SM_RSP_TIMEOUT_IND, TASK_SM)
     if not current(): return
     let info = connectInfoView(connection)
@@ -3924,7 +3923,7 @@ proc sm_auth_handler*(param: pointer) {.exportc, cdecl.} =
         processed = handleSae(smAuthSaeBodyPtr(frame), frameLen - 6, sequence, nil)
         if not current(): return
     if processed == 0:
-      if not smAuthConsumeResponse(owner, algorithm, sequence): return
+      if not smAuthConsumeResponse(algorithm, sequence): return
       ke_timer_clear(SM_RSP_TIMEOUT_IND, TASK_SM)
       if not current(): return
       if sequence == 1:
@@ -3934,7 +3933,7 @@ proc sm_auth_handler*(param: pointer) {.exportc, cdecl.} =
         sm_assoc_req_send_pre()
       return
     if processed != -8:
-      if not smAuthConsumeResponse(owner, algorithm, sequence): return
+      if not smAuthConsumeResponse(algorithm, sequence): return
       ke_timer_clear(SM_RSP_TIMEOUT_IND, TASK_SM)
       if not current(): return
     let logFn = getLogFunc(204)
@@ -3954,7 +3953,7 @@ proc sm_auth_handler*(param: pointer) {.exportc, cdecl.} =
     return
 
   if algorithm != 0 and algorithm != 1: return
-  if not smAuthConsumeResponse(owner, algorithm, sequence): return
+  if not smAuthConsumeResponse(algorithm, sequence): return
   ke_timer_clear(SM_RSP_TIMEOUT_IND, TASK_SM)
   if not current(): return
   if algorithm == 0:
@@ -4037,7 +4036,10 @@ proc sm_assoc_rsp_handler*(param: pointer) {.exportc, cdecl.} =
             let intervalTu = retry[0].uint32 or (retry[1].uint32 shl 8) or
               (retry[2].uint32 shl 16) or (retry[3].uint32 shl 24)
             connectInfoAuthRetry(build.connection)[] = 0
-            if smRspTimerSetComeback(build, intervalTu): return
+            # Waiting out the comeback is a new operation in the same state,
+            # so an expiry already posted for the request is stale.
+            if smArmResponse(smGo(SmAssocRspState),
+                             max(1'u64, intervalTu.uint64 * 1024)): return
             if smAssocOwnerCurrent(build, smEnvSecond):
               when defined(bl808WifiDiagWarmScan): nimFwDbgWarmAssocFailure = warmAssocComeback
               sm_connect_ind(WLAN_FW_ASSOCIATE_FAIILURE.uint16, 0xFFFF)
@@ -4582,7 +4584,7 @@ proc sm_issue_sa_query_request*() {.exportc, cdecl.} =
   smSaQuery.deadline = deadline
   smSaQuery.armed = true
   if not ke_timer_try_set(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM, delay,
-      smSaQueryArmCurrent, addr serial, stamp = serial) and smSaQueryCurrent(serial):
+      stamp = serial) and smSaQueryCurrent(serial):
     # Timer allocation failure is not evidence that the AP stopped responding.
     sm.saQueryActive = 0
     smSaQuery.armed = false

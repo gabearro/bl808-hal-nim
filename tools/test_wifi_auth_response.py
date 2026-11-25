@@ -14,7 +14,7 @@ EXTRA = r'''
 const WLAN_FW_AUTHENTICATION_FAIILURE = 2
 var
   wpa_cbs: pointer
-  smAuthResponseExpectations: array[MAX_VIFS, SmAuthResponseExpectation]
+  smAuthExpected: SmAuthResponseExpectation
   callbacks: array[16, pointer]
   saeResult: int32
   saeBodies: seq[seq[uint8]]
@@ -54,7 +54,8 @@ proc sm_assoc_req_send_pre() = inc associations
 proc authResponse(algorithm, sequence: uint16; status = 0'u16;
                   body: openArray[uint8] = []): pointer =
   result = response(body, status)
-  state = SmAuthenticatingState
+  # sm_auth_send's operation, which recorded the expectation below.
+  let stamp = smGo(SmAuthenticatingState)
   conn.authType = algorithm.uint8
   conn.authRetryGate = 0
   conn.retry = 7
@@ -68,13 +69,8 @@ proc authResponse(algorithm, sequence: uint16; status = 0'u16;
   of 3'u16:
     if sequence in [1'u16, 2'u16]: txSequence = sequence
   else: discard
-  if txSequence != 0:
-    smAuthResponseExpectations[1] = SmAuthResponseExpectation(
-      connection: addr conn, serial: smTxSerials[1],
-      identity: TxSessionIdentity(captured: true, vif: 1, station: 2,
-        vifEpoch: rxVifEpochs[1], stationEpoch: stationEpochs[2],
-        resetEpoch: txResetEpoch),
-      algorithm: algorithm.uint8, txSequence: txSequence)
+  smAuthExpected = SmAuthResponseExpectation(stamp: stamp,
+    algorithm: algorithm.uint8, txSequence: txSequence)
   let frame = smAuthFrameView(result)
   frame.authAlgo = algorithm
   frame.authSeq = sequence
@@ -126,7 +122,7 @@ for status in [13'u16, 14, 17]:
       let p = authResponse(0, 2, status)
       smAuthFrameView(p).authSeq = 1
       rxuMgtDispatchView(p).staIdx = peer
-      if not connected: smAuthResponseExpectations[1].txSequence = 0
+      if not connected: smAuthExpected.txSequence = 0
       sm_auth_handler(p)
       let admitted = status in [13'u16, 14] and peer == 2 and connected
       doAssert failures == (if admitted: @[(2'u16, status)] else: @[])
@@ -134,16 +130,15 @@ for status in [13'u16, 14, 17]:
       finish(p)
 ''',
     "failure_requires_pending_exchange": r'''
-for mutation in 0 .. 5:
+for mutation in 0 .. 4:
   let p = authResponse(1, 2, 17)
-  let expected = addr smAuthResponseExpectations[1]
+  let expected = addr smAuthExpected
   case mutation
   of 0: smAuthFrameView(p).authSeq = 4
   of 1: smAuthFrameView(p).authAlgo = 0
   of 2: expected.txSequence = 3
-  of 3: inc expected.serial
-  of 4: inc expected.identity.vifEpoch
-  else: expected.connection = addr replacement
+  of 3: discard smGo(SmAuthenticatingState) # sent by an earlier operation
+  else: expected.stamp = 0
   let pendingSequence = expected.txSequence
   sm_auth_handler(p)
   doAssert clears.len == 0 and failures.len == 0
@@ -158,7 +153,7 @@ for algorithm in [0'u16, 1'u16, 3'u16]:
   sm_auth_handler(p)
   doAssert failures == @[(2'u16, 17'u16)]
   doAssert clears == @[SM_RSP_TIMEOUT_IND]
-  doAssert smAuthResponseExpectations[1].txSequence == 0
+  doAssert smAuthExpected.txSequence == 0
   finish(p)
 ''',
     "sae_failure_finishes_attempt": r'''
@@ -260,16 +255,13 @@ for algorithm in [1'u16, 3'u16]:
     finish(p)
 ''',
     "shared_response_requires_matching_tx": r'''
-for mutation in 0 .. 5:
+for mutation in 0 .. 2:
   let p = authResponse(1, 4)
-  let expected = addr smAuthResponseExpectations[1]
+  let expected = addr smAuthExpected
   case mutation
   of 0: expected.txSequence = 1
-  of 1: inc expected.serial
-  of 2: expected.connection = addr replacement
-  of 3: inc expected.identity.vifEpoch
-  of 4: inc expected.identity.stationEpoch
-  else: expected.identity.station = 3
+  of 1: discard smGo(SmAuthenticatingState) # sent by an earlier operation
+  else: expected.stamp = 0
   sm_auth_handler(p)
   doAssert clears.len == 0 and associations == 0 and failures.len == 0
   doAssert expected.txSequence != 0 and conn.retry == 7
@@ -277,7 +269,7 @@ for mutation in 0 .. 5:
 # A TX reset between the request and its response retires frames, not the attempt.
 block:
   let p = authResponse(1, 4)
-  inc smAuthResponseExpectations[1].identity.resetEpoch
+  inc txResetEpoch
   sm_auth_handler(p)
   doAssert associations == 1 and failures.len == 0
   finish(p)
@@ -286,7 +278,7 @@ block:
 let p = authResponse(1, 4)
 sm_auth_handler(p)
 doAssert associations == 1 and clears == @[SM_RSP_TIMEOUT_IND]
-doAssert smAuthResponseExpectations[1].txSequence == 0
+doAssert smAuthExpected.txSequence == 0
 sm_auth_handler(p)
 doAssert associations == 1 and clears == @[SM_RSP_TIMEOUT_IND]
 finish(p)
@@ -296,12 +288,12 @@ for algorithm in [0'u16, 3'u16]:
   let sequence = if algorithm == 0: 2'u16 else: 1'u16
   for mutation in 0 .. 3:
     let p = authResponse(algorithm, sequence)
-    let expected = addr smAuthResponseExpectations[1]
+    let expected = addr smAuthExpected
     case mutation
     of 0: expected.txSequence = 3
     of 1: expected.algorithm = 1
-    of 2: inc expected.serial
-    else: inc expected.identity.vifEpoch
+    of 2: discard smGo(SmAuthenticatingState) # sent by an earlier operation
+    else: expected.stamp = 0
     sm_auth_handler(p)
     doAssert clears.len == 0 and associations == 0 and failures.len == 0
     doAssert saeBodies.len == 0 and authRequests.len == 0
@@ -313,12 +305,12 @@ let p = authResponse(3, 1)
 saeResult = -8
 sm_auth_handler(p)
 doAssert clears.len == 0 and authRequests.len == 0
-doAssert smAuthResponseExpectations[1].txSequence == 1
+doAssert smAuthExpected.txSequence == 1
 saeResult = 0
 sm_auth_handler(p)
 doAssert clears == @[SM_RSP_TIMEOUT_IND]
 doAssert authRequests.len == 1 and authRequests[0].sequence == 2
-doAssert smAuthResponseExpectations[1].txSequence == 0
+doAssert smAuthExpected.txSequence == 0
 finish(p)
 ''',
     "open_response_consumed_once": r'''

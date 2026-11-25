@@ -152,14 +152,11 @@ proc scan_get_scan_duration(): uint32 =
   events.add("duration")
   if onDuration != nil: onDuration()
   scanDuration
-proc ke_timer_try_set(id: uint16; task: uint8; duration: uint32;
-                      guard: proc(context: pointer): bool {.nimcall.};
-                      context: pointer): bool =
+proc ke_timer_try_set(id: uint16; task: uint8; duration: uint32): bool =
   doAssert id == SCAN_PROBE_TIMER and task == TASK_SCAN and duration == 11000
-  doAssert guard(context)
   events.add("timer")
   if onTimer != nil: onTimer()
-  if timerFails: false else: guard(context)
+  not timerFails
 ''' + guard + helper + r'''
 scan_env.paramPtr = addr request
 doAssert scheduleActiveScanProbeTimer(addr request, 0, 0)

@@ -101,13 +101,12 @@ type
     connection, frame, link, hardware: pointer
     identity: TxSessionIdentity
     serial, lease: uint32
+    stamp: uint32  ## the SM operation smTxSetOwnerState started
     state: uint16
-    ownsFrame, responseArmed: bool
+    ownsFrame: bool
 
   SmAuthResponseExpectation = object
-    connection: pointer
-    identity: TxSessionIdentity
-    serial: uint32
+    stamp: uint32  ## the SM operation that sent the request
     algorithm: uint8
     txSequence: uint16
 
@@ -5189,18 +5188,16 @@ type
     time*: uint32           # absolute expiry in MAC ticks
     stamp: uint32           # Op stamp; Nim-owned tail, not part of the BL808 timer prefix
 
-  KeTimerMutation = object
-    previous: ptr KeTimerMutation
-    id: uint16
-    task: uint8
-    cancelled: bool
-
   MmTimerMutation = object
     previous: ptr MmTimerMutation
     timer: pointer
     cancelled, delivering: bool
 
-  KeTimerGuard = proc(context: pointer): bool {.nimcall.}
+  KeTimerMutation = object
+    previous: ptr KeTimerMutation
+    id: uint16
+    task: uint8
+    cancelled: bool
 
 # Kernel message handler descriptor (8 bytes)
 # Used by ke_handler_search: pairs a handler table pointer with its entry count.

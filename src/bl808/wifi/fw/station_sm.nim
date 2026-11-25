@@ -20,6 +20,13 @@
 #
 # Nothing else leaves state 10: connect and disconnect requests, connection
 # losses and AP deauthentications are saved until SM is idle again.
+#
+# States 6 and 8 wait for the AP's auth or assoc response. The request's
+# sender arms SM_RSP_TIMEOUT_IND with the stamp of the operation it started
+# (smArmResponse), and the expected auth response carries the same stamp
+# (station_tx_build.nim). Leaving the state starts a new operation, so a
+# deadline or response from an earlier one is stale; nothing else (a TX
+# reset, a channel switch) invalidates them.
 
 type
   SmTeardown = enum
@@ -31,6 +38,7 @@ type
     deauthVif: uint8
     deauthCallback: pointer  ## the waited frame's callback, run by the guard
     guard: MmTimerView
+    responseUs: uint64  ## an association comeback's time beyond the armed chunk
 
 const SmDeauthGuardUs = 3_000_000'u32
   ## Longer than any off-channel period (a full passive scan is about 1.5 s),
@@ -44,6 +52,25 @@ proc smGo(state: uint16; teardown = tdNone): uint32 {.discardable.} =
   smOwn.teardown = teardown
   result = opGo(smOwn.op)
   ke_state_set(TASK_SM, state)
+
+proc smArmResponse(stamp: uint32; delayUs: uint64): bool =
+  ## Arm the auth/assoc response deadline of operation `stamp`, which must be
+  ## the live one. A deadline longer than one kernel timer (an association
+  ## comeback) is armed in chunks under the same stamp.
+  if not opCurrent(smOwn.op, stamp): return false
+  let chunk = min(delayUs, KE_TIMER_MAX_DELAY.uint64)
+  smOwn.responseUs = delayUs - chunk
+  ke_timer_try_set(SM_RSP_TIMEOUT_IND, TASK_SM, chunk.uint32, stamp = stamp)
+
+proc smResponseExpiry(param: pointer): uint32 =
+  ## The stamp of SM_RSP_TIMEOUT_IND `param` if it ends the live operation's
+  ## response wait, else 0. A chunk with time left re-arms the rest instead;
+  ## if that cannot be allocated, the wait ends now.
+  if param == nil or keMsgHdrFromPayload(param).paramLen != 4: return 0
+  let stamp = cast[ptr uint32](param)[]
+  if not opCurrent(smOwn.op, stamp): return 0
+  if smOwn.responseUs != 0 and smArmResponse(stamp, smOwn.responseUs): return 0
+  stamp
 
 proc smDeauthConfirmed(env: pointer): bool =
   ## `env`, a frame's confirmation argument, belongs to the live deauth wait.

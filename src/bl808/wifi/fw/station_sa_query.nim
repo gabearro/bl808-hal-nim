@@ -56,9 +56,6 @@ proc smSaQueryCurrent(serial: uint32): bool =
     sm.saQueryStaIdx == smSaQuery.peer.station and mmVifCurrent(smSaQuery.peer) and
     vifChannelAt(smSaQuery.peer.vif).state != 0
 
-proc smSaQueryArmCurrent(context: pointer): bool =
-  smSaQueryCurrent(cast[ptr uint32](context)[])
-
 proc smSaQueryQueueTimeout(serial: uint32) =
   if serial == 0 or not smSaQueryCurrent(serial) or not smSaQuery.armed: return
   let message = ke_msg_try_alloc(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM, 0xFF, 4)

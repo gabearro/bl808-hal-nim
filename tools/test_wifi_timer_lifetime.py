@@ -33,7 +33,6 @@ type
     id: uint16
     task: uint8
     cancelled: bool
-  KeTimerGuard = proc(context: pointer): bool {.nimcall.}
 var
   keTimerQueue: CoList
   keTimerMutationTop: ptr KeTimerMutation
@@ -51,7 +50,10 @@ var
   onAlloc, onFree, onHardware, onMessage, onEvent: proc()
   onExpiryAlloc: proc()
   failExpiryId: uint16
-  expiringMessage: tuple[id: uint16, task: uint8]
+  # The payload comes first: a stamped expiry's stamp is written there.
+  expiringMessage: tuple[stamp: uint32, id: uint16, task: uint8]
+  deliveredStamps, deliveredLengths: seq[uint32]
+  expiringLength: uint32
   messageOwned: bool
   expiryMessageFrees: int
   nimFwDbgKeTimerYield, nimFwDbgKeTimerYieldHead: uint32
@@ -97,9 +99,10 @@ proc ke_evt_set(bits: uint32) =
   invoke(onEvent)
 proc ke_evt_clear(bits: uint32) = events = events and not bits
 proc ke_msg_try_alloc(id: uint16; task, source: uint8; length: uint32): pointer =
-  doAssert source == 0xFF and length == 0 and not messageOwned
+  doAssert source == 0xFF and length in [0'u32, 4'u32] and not messageOwned
   if failExpiryId != 0 and id == failExpiryId: return nil
-  expiringMessage = (id, task)
+  expiringMessage = (0'u32, id, task)
+  expiringLength = length
   messageOwned = true
   invoke(onExpiryAlloc)
   addr expiringMessage
@@ -113,15 +116,11 @@ proc ke_msg_free(p: pointer) =
   inc expiryMessageFrees
 proc ke_msg_send(p: pointer) =
   doAssert p == (addr expiringMessage) and messageOwned
-  delivered.add(expiringMessage)
+  delivered.add((expiringMessage.id, expiringMessage.task))
+  deliveredStamps.add(expiringMessage.stamp)
+  deliveredLengths.add(expiringLength)
   messageOwned = false
   invoke(onMessage)
-proc smRspTimerBegin(id: uint16; task: uint8; continuationUs: uint64): uint32 = 0
-proc smRspTimerAbort(serial: uint32) = discard
-proc smRspTimerPublish(id: uint16; task: uint8; serial: uint32;
-                       entry: ptr KeTimerEntry): bool = true
-proc smRspTimerClear(id: uint16; task: uint8) = discard
-proc smRspTimerDispatch(entry: ptr KeTimerEntry): bool = false
 proc smSaQueryQueueTimeout(serial: uint32) = saExpiries.add(serial)
 '''
 
@@ -140,7 +139,6 @@ proc scanDwellReset() = discard
 proc chanSwitchReset() = discard
 proc smActivationCancel() = discard
 proc smBssCancel() = discard
-proc smRspTimerReset() = discard
 proc smCleanupCancel() = discard
 proc smDeferredCancel() = discard
 proc mmPsModeCancel() = discard
@@ -232,14 +230,6 @@ doAssert saExpiries == @[29'u32] and delivered.len == 0
 now = 300
 ke_timer_schedule()
 doAssert saExpiries == @[29'u32, 30] and delivered.len == 0 and live.len == 0
-''',
-    "stale_guard_rejected_inside_timer_lock": r'''
-ke_timer_set(1, 4, 200)
-proc current(context: pointer): bool =
-  doAssert not enabled
-  false
-doAssert not ke_timer_try_set(1, 4, 100, current)
-doAssert enabled and queueIds() == @[1'u16] and deadline(1) == 200 and live.len == 1
 ''',
     "clear_during_hardware": r'''
 onHardware = proc() = ke_timer_clear(1, 4)
@@ -409,45 +399,6 @@ missingAllocator = true
 ke_timer_set(1, 4, 100)
 doAssert assertions == 1 and allocations == 0 and live.len == 0
 ''',
-    "guard_rejected": r'''
-var valid = false
-proc current(p: pointer): bool = cast[ptr bool](p)[]
-doAssert not ke_timer_try_set(1, 4, 100, current, addr valid)
-doAssert allocations == 0 and live.len == 0 and queueIds().len == 0
-''',
-    "guard_after_allocation": r'''
-var valid = true
-proc current(p: pointer): bool = cast[ptr bool](p)[]
-onAlloc = proc() = valid = false
-doAssert not ke_timer_try_set(1, 4, 100, current, addr valid)
-doAssert allocations == 1 and live.len == 0 and queueIds().len == 0
-''',
-    "guard_after_publication": r'''
-var valid = true
-proc current(p: pointer): bool = cast[ptr bool](p)[]
-ke_timer_set(2, 4, 200)
-onHardware = proc() = valid = false
-doAssert not ke_timer_try_set(1, 4, 100, current, addr valid)
-doAssert queueIds() == @[2'u16] and live.len == 1
-doAssert hardware[^1] == (2'u16, 200'u32)
-''',
-    "guard_preserves_replacement": r'''
-var valid = true
-proc current(p: pointer): bool = cast[ptr bool](p)[]
-onHardware = proc() =
-  valid = false
-  ke_timer_set(1, 4, 300)
-doAssert not ke_timer_try_set(1, 4, 100, current, addr valid)
-doAssert queueIds() == @[1'u16] and deadline(1) == 300 and live.len == 1
-''',
-    "guard_during_retirement": r'''
-var valid = true
-proc current(p: pointer): bool = cast[ptr bool](p)[]
-onAlloc = proc() = valid = false
-onFree = proc() = ke_timer_set(1, 4, 300)
-doAssert not ke_timer_try_set(1, 4, 100, current, addr valid)
-doAssert queueIds() == @[1'u16] and deadline(1) == 300 and live.len == 1
-''',
     "flush_during_expiry_allocation": r'''
 ke_timer_set(1, 4, 100)
 now = 100
@@ -502,6 +453,24 @@ ke_timer_schedule()
 doAssert assertions == 0, "losing an optional probe requested firmware recovery"
 doAssert delivered == @[(2'u16, TASK_SM)] and not messageOwned and live.len == 0
 ''',
+    "stamped_expiry_carries_stamp": r'''
+doAssert ke_timer_try_set(2, TASK_SM, 100, stamp = 7)
+ke_timer_set(3, TASK_SM, 100)
+now = 100
+ke_timer_schedule()
+doAssert delivered == @[(2'u16, TASK_SM), (3'u16, TASK_SM)]
+doAssert deliveredStamps == @[7'u32, 0] and deliveredLengths == @[4'u32, 0]
+# Out of memory: the stamped expiry is retried on the same entry, stamp kept.
+doAssert ke_timer_try_set(2, TASK_SM, 100, stamp = 9)
+failExpiryId = 2
+now = 200
+ke_timer_schedule()
+doAssert delivered.len == 2 and live.len == 1 and assertions == 0
+failExpiryId = 0
+now = 1200
+ke_timer_schedule()
+doAssert delivered[^1] == (2'u16, TASK_SM) and deliveredStamps[^1] == 9 and live.len == 0
+''',
     "ordinary_expiry_out_of_memory": r'''
 ke_timer_set(2, TASK_SM, 100)
 failExpiryId = 2
@@ -537,7 +506,6 @@ def program_source(mutation: str = "") -> str:
             code += procedure(kernel, name)
     if "proc keTimerCancelMutations" not in kernel:
         code += "\nproc keTimerCancelMutations(id = 0'u16; task = 0'u8; all = false) = discard\n"
-    code += "\nwhen not declared(smRspTimerTakeRequeue):\n  proc smRspTimerTakeRequeue(): int = 0\n"
     for name in ["ke_timer_set", "keTimerClearLocked", "ke_timer_clear", "keTimerExpired", "keTimerRequeue", "ke_timer_schedule",
                  "ke_timer_active"]:
         code += procedure(kernel, name)

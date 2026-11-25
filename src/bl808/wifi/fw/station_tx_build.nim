@@ -1,5 +1,5 @@
 var smTxSerials {.wifiCtrl.}: array[MAX_VIFS, uint32]
-var smAuthResponseExpectations {.wifiCtrl.}: array[MAX_VIFS, SmAuthResponseExpectation]
+var smAuthExpected {.wifiCtrl.}: SmAuthResponseExpectation
 
 proc smTxCapture(connection: pointer): SmTxBuildContext =
   let saved = irqSave()
@@ -52,12 +52,6 @@ proc smTxSessionCurrent(build: SmTxBuildContext): bool =
 proc smTxOwnerCurrent(build: SmTxBuildContext): bool =
   build.identity.resetEpoch == txResetEpoch and smTxSessionCurrent(build)
 
-proc smTxSameSession(a, b: TxSessionIdentity): bool =
-  ## Identity comparison that ignores which TX reset epoch captured it.
-  var rebased = b
-  rebased.resetEpoch = a.resetEpoch
-  a == rebased
-
 proc smTxBindStation(build: var SmTxBuildContext; station: uint8): bool =
   if not smTxOwnerCurrent(build): return false
   if station >= STA_INFO_TAB_ENTRIES.uint8 and station != 0xFF: return false
@@ -95,47 +89,27 @@ proc smTxRelease(build: var SmTxBuildContext) =
       txl_frame_release(build.frame, false)
 
 proc smTxEnd(build: var SmTxBuildContext) =
-  if build.ownsFrame and build.responseArmed and smTxOwnerCurrent(build):
-    build.responseArmed = false
-    ke_timer_clear(SM_RSP_TIMEOUT_IND, TASK_SM)
+  ## Release the frame unless the lower layer took it. A response deadline
+  ## the builder armed is left alone: it belongs to the SM operation.
   smTxRelease(build)
 
 proc smTxFail(build: var SmTxBuildContext; status: uint16) =
   smTxRelease(build)
-  if not smTxOwnerCurrent(build): return
-  if build.responseArmed:
-    build.responseArmed = false
-    ke_timer_clear(SM_RSP_TIMEOUT_IND, TASK_SM)
   if smTxOwnerCurrent(build): sm_connect_ind(status, 0xFFFF)
 
 proc smTxSetOwnerState(build: var SmTxBuildContext; state: uint16): bool =
   if not smTxOwnerCurrent(build): return false
   build.state = state
-  smGo(state)
+  build.stamp = smGo(state)
   smTxOwnerCurrent(build)
 
 proc smTxSetState(build: var SmTxBuildContext; state: uint16): bool =
   if not smTxFrameCurrent(build) or not smTxSetOwnerState(build, state): return false
   smTxFrameCurrent(build)
 
-proc smTxTimerCurrent(context: pointer): bool =
-  let build = cast[ptr SmTxBuildContext](context)
-  if not smTxOwnerCurrent(build[]) or build.frame == nil: return false
-  let desc = hostTxDescAt(build.frame)
-  txlFrameLeaseMatches(desc, build.lease) and
-    desc.bufDesc == build.link and desc.hwDesc == build.hardware and
-    txlSessionCurrent(build.identity, desc) and txlStationAdmits(desc)
-
-proc smTxArmResponse(build: var SmTxBuildContext; delay: uint32): bool =
-  if not smTxFrameCurrent(build): return false
-  if not ke_timer_try_set(SM_RSP_TIMEOUT_IND, TASK_SM, delay,
-                          smTxTimerCurrent, addr build): return false
-  if not smTxFrameCurrent(build): return false
-  build.responseArmed = true
-  true
-
-proc smAuthRecordResponse(build: var SmTxBuildContext; algorithm: uint8;
-                          txSequence: uint16): bool =
+proc smAuthRecordResponse(stamp: uint32; algorithm: uint8; txSequence: uint16): bool =
+  ## Expect the response to auth transaction `txSequence`, sent by SM
+  ## operation `stamp` (state 6). Any later operation makes it stale.
   case algorithm
   of 0'u8:
     if txSequence != 1: return false
@@ -144,25 +118,16 @@ proc smAuthRecordResponse(build: var SmTxBuildContext; algorithm: uint8;
   of 3'u8:
     if txSequence notin [1'u16, 2'u16]: return false
   else: return false
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  if build.state != SmAuthenticatingState or not smTxFrameCurrent(build): return false
-  smAuthResponseExpectations[build.identity.vif] = SmAuthResponseExpectation(
-    connection: build.connection, identity: build.identity,
-    serial: build.serial, algorithm: algorithm, txSequence: txSequence)
+  smAuthExpected = SmAuthResponseExpectation(stamp: stamp, algorithm: algorithm,
+    txSequence: txSequence)
   true
 
-proc smAuthCancelResponse(build: SmTxBuildContext) =
-  if build.identity.vif >= MAX_VIFS.uint8: return
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  let expected = addr smAuthResponseExpectations[build.identity.vif]
-  if expected.connection == build.connection and expected.serial == build.serial and
-      expected.identity == build.identity:
-    expected.txSequence = 0
+proc smAuthCancelResponse(stamp: uint32) =
+  ## Operation `stamp` did not send its request after all.
+  if smAuthExpected.stamp == stamp: smAuthExpected.txSequence = 0
 
-proc smAuthResponseMatches(build: SmTxBuildContext; algorithm,
-                           responseSequence: uint16): bool =
+proc smAuthResponseMatches(algorithm, responseSequence: uint16): bool =
+  ## The response answers the request the live SM operation sent.
   var txSequence: uint16
   case algorithm
   of 0'u16:
@@ -175,24 +140,12 @@ proc smAuthResponseMatches(build: SmTxBuildContext; algorithm,
     if responseSequence notin [1'u16, 2'u16]: return false
     txSequence = responseSequence
   else: return false
-  if build.identity.vif >= MAX_VIFS.uint8: return false
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  let expected = addr smAuthResponseExpectations[build.identity.vif]
-  if build.state != SmAuthenticatingState or not smTxOwnerCurrent(build) or
-      expected.connection != build.connection or expected.serial != build.serial or
-      not smTxSameSession(expected.identity, build.identity) or expected.algorithm != algorithm.uint8 or
-      expected.txSequence != txSequence:
-    return false
-  true
+  opCurrent(smOwn.op, smAuthExpected.stamp) and
+    smAuthExpected.algorithm == algorithm.uint8 and smAuthExpected.txSequence == txSequence
 
-proc smAuthConsumeResponse(build: SmTxBuildContext; algorithm,
-                           responseSequence: uint16): bool =
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  if not smAuthResponseMatches(build, algorithm, responseSequence): return false
-  let expected = addr smAuthResponseExpectations[build.identity.vif]
-  expected.txSequence = 0
+proc smAuthConsumeResponse(algorithm, responseSequence: uint16): bool =
+  if not smAuthResponseMatches(algorithm, responseSequence): return false
+  smAuthExpected.txSequence = 0
   true
 
 proc smTxSubmit(build: var SmTxBuildContext; forced: bool): bool =
