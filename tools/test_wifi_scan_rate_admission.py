@@ -29,6 +29,7 @@ proc assert_err(a, b: cstring; line: cint) =
     for name in ["readLegacyRateIe", "scanuRxFrameValid", "scanuFrameMatchesBssid", "scanuRequestCurrent",
                  "me_extract_rate_set"]:
         code += procedure(scan, name)
+    code += "\nwhen not declared(scanEarlyEndRequest):\n  proc scanEarlyEndRequest() = ke_msg_send_basic(0x4C, 1, 2)\n"
     code += procedure(scan, "scanu_frame_handler").split("  # Security info\n", 1)[0]
     code += r'''
   if bfOn != 0:

@@ -357,6 +357,7 @@ def test_scan_rx_admission(tmp_path: Path, mode: str, mutation: str | None) -> N
     program.write_text("type\n" + types + PLATFORM + procedure(mac, "mac_ie_find") + vsie
                        + procedure(scan, "readLegacyRateIe") + "\n".join(parts.values())
                        + procedure(scan, "scanuRequestCurrent")
+                       + "\nproc scanEarlyEndRequest() = ke_msg_send_basic(0x4C, 1, 2)\n"
                        + entry + dispatch + CHECKS)
     flags = {"checked": [], "release": ["-d:release", "--assertions:on"],
              "asan": ["--cc:clang", "--passC:-fsanitize=address", "--passL:-fsanitize=address"]}

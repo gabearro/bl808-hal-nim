@@ -133,7 +133,7 @@ def source() -> str:
     prefix = procedure(scan, "scanu_frame_handler").split("  # Security info\n", 1)[0]
     return layouts("ScanChannelEntry", "ScanSsidSlotView", "ScanuResultEntry",
                    "ScanuCachedSsid", "RxuMgtIndView", "MacIeView") + request_type + \
-        PLATFORM + procedure(scan, "scanuRequestCurrent") + prefix + "  reachedCommit = true\n"
+        PLATFORM + procedure(scan, "scanuRequestCurrent") + "\nproc scanEarlyEndRequest() = ke_msg_send_basic(0x4C, 1, 2)\n" + prefix + "  reachedCommit = true\n"
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
