@@ -200,17 +200,34 @@ finish()
 ''', finding="SMCONN-F5")
 
 
-def test_bss_batch_without_the_sta_vif_ends_the_attempt(tmp_path: Path) -> None:
-    """sm_set_bss_param returned silently when it could not capture the STA
-    VIF, which left SM in state 3 for good. It now ends the attempt."""
-    run_nim(tmp_path, bss_source() + r'''
-for change in 0..1:
+def test_sta_vif_removed_during_the_bss_batch_ends_the_attempt(tmp_path: Path) -> None:
+    """SCAN-N3 in state 4 (stage 9g). sm_set_bss_param returned silently when
+    the STA VIF was gone, and later each answer re-checked the VIF. Now
+    vif_mgmt_unregister tells SM (smStaVifRetired): the attempt ends at the
+    removal, wherever the batch is, its unsent requests and the messages SM
+    parked are freed, and the request in flight is no longer awaited, so its
+    replier drops it. The real station_bss.nim and station_sm.nim run here."""
+    run_nim(tmp_path, bss_source() + "const SmIdleState = 0'u16\n"
+            + station_sm_source("smAbandon", "smStaVifRetired", record=False) + r'''
+for step in 0..8:
   setup()
-  if change == 0: vif.vifType = 2   # the slot now holds another interface type
-  else: vif.vifIdx = 0              # or another interface index
   sm_set_bss_param()
-  doAssert failures == @[(14'u16, 0xFFFF'u16)] and sent.len == 0 and allocated.len == 0,
-    "sm_set_bss_param left SM in state " & $state & " with no request"
+  for done in 0 ..< step:
+    acknowledgeBss()
+    sm_send_next_bss_param()
+  doAssert state == SmSettingBssState and sent.len == step + 1
+  # The attempt's parked messages, allocated so that their release shows.
+  let info = ke_msg_alloc(0x1000'u16, TASK_SM, 9, sizeof(Connection).uint32)
+  cast[ptr Connection](info)[] = connection
+  sm.connectInfo = info
+  sm.connectIndMsg = ke_msg_alloc(0x1002'u16, 9, TASK_SM, 4)
+  vif.vifType = 4       # vif_mgmt_unregister frees the slot,
+  smStaVifRetired(1)    # then tells SM.
+  doAssert state == SmIdleState,
+    "[SCAN-N3] SM stayed in state " & $state & " with its STA VIF removed"
+  doAssert sm.connectInfo == nil and sm.connectIndMsg == nil and sm.pendingBssParams.first == nil
+  doAssert smOwn.request == nil and smOwn.reply == nil and not smAwaits(sent[^1])
+  doAssert failures.len == 0 and sent.len == step + 1
   finish()
 ''')
 
@@ -227,7 +244,7 @@ for state in [3'u16, 4]:
   replies.setLen(0)
   currentState = state
   let request = makeAbort()
-  doAssert deliverAbort(request) == KeMsgConsumed,
+  doAssert deliverAbort(request) == KeMsgNoFree,
     "abort saved in state " & $state & "; the attempt keeps running"
   doAssert outcomes == @[(24'u16, 3'u16)] and replies == @[0'u8]
   finish()
@@ -421,6 +438,11 @@ doAssert disconnects == 1 and not smGuardArmed and failures == 0
 # --- Re-initialisation with an attempt parked in SM ---------------------------
 
 def test_connect_admitted_after_sm_init(tmp_path: Path) -> None:
+    """SMCONN-F7: MM_RESET_REQ -> me_init -> sm_init with an attempt parked.
+    sm_init kept connectIndMsg (every later connect answered busy) and then
+    cleared both pointers without freeing the SM_CONNECT_REQ and the 860-byte
+    SM_CONNECT_IND (a leak). It now drops the attempt through smAbandon, which
+    frees both, and the next connect is admitted."""
     from test_wifi_connect_admission import admission_source
     code = admission_source()
     fields = "    vendorIeLen: uint16\n"
@@ -437,7 +459,7 @@ proc smDeferredCancel() = inc cancellations
 proc ke_state_set(task: uint8; state: uint16) =
   doAssert task == TASK_SM
   currentState = state
-''' + station_sm_source() + procedure((FW / "scan_station_ap_me.nim").read_text(), "sm_init") + r'''
+''' + station_sm_source("smGo", "smAbandon") + procedure((FW / "scan_station_ap_me.nim").read_text(), "sm_init") + r'''
 for waiting in 1'u16 .. 10'u16:
   resetAdmission()
   # MM_RESET_REQ -> me_init -> sm_init while an attempt still owns SM.
@@ -448,6 +470,10 @@ for waiting in 1'u16 .. 10'u16:
   currentState = waiting
   sm_init()
   doAssert currentState == SmIdleState and sm.connectInfo == nil and cancellations == 4
+  doAssert released == @[cast[pointer](addr previous), cast[pointer](addr parked[0])],
+    "[SMCONN-F7] sm_init from state " & $waiting & " leaked the parked SM_CONNECT_REQ " &
+    "or SM_CONNECT_IND"
+  released.setLen(0)
   cancellations = 0
   let status = sm_connect_req_handler(addr request)
   doAssert status == KeMsgNoFree and confirmationStatus == 0, "[SMCONN-F7] after " &
@@ -568,26 +594,48 @@ finishExchange()
 ''')
 
 
-def test_registration_for_a_retired_sta_vif_is_refused(tmp_path: Path) -> None:
-    """MM checked only that SM waits on MM_STA_ADD_REQ. A registration whose
-    STA VIF was retired after the join was applied to the freed slot. MM now
-    answers it in place with status 1 and registers nothing; SM ends the
-    attempt with sm_connect_ind(15)."""
+def test_sta_vif_removed_during_registration_ends_the_attempt(tmp_path: Path) -> None:
+    """SCAN-N3 in state 3 (stage 9g). A registration whose STA VIF was
+    removed after the join used to reach MM, which applied it to the freed
+    slot (later: answered it with status 1). Now the removal ends the attempt
+    at once (smStaVifRetired) and MM drops the request SM no longer waits on:
+    nothing is registered for the removed VIF, even when its slot is
+    registered again at the same index before MM runs.
+
+    When MM registered the station before the removal, its answer comes to
+    an idle SM, and smStaAddRetire asks MM to delete a station that the
+    removal left on no VIF's list. MM's delete is then done and leaves the
+    station valid (test_wifi_station_lifetime runs the real mmStaDelTry);
+    it had been retried every 100 ms until MM_RESET."""
     from test_wifi_message_allocation import run_program
     from test_wifi_registration_exchange import source
     run_program(tmp_path, "checked", source() + r'''
-for change in 0..1:
+for readded in [false, true]:
   resetExchange()
   let request = issue()
-  if change == 0: vifs[conn.vifIdx].vifType = 4   # retired: the slot is free
-  else: vifs[conn.vifIdx].vifIdx = 127
-  let reply = completeRegistration(request)
-  doAssert reply == request and registrations == 0,
-    "a registration was applied to a VIF that is not the attempt's STA VIF"
-  doAssert cast[ptr MmStaAddCfmPayload](reply).status == 1
+  allocateAttempt()
+  removeVif(readded)
+  doAssert state == SmIdleState and smOwn.request == nil,
+    "[SCAN-N3] SM stayed in state " & $state & " with its STA VIF removed"
+  doAssert completeRegistration(request) == nil and registrations == 0,
+    "a registration was applied to a removed or re-added VIF"
+  doAssert failures.len == 0 and bssCalls == 0 and deletions == 0
+  finishExchange()
+
+for readded in [false, true]:
+  resetExchange()
+  let reply = completeRegistration(issue())
+  doAssert registrations == 1 and stations[0].valid == 1 and stations[0].listed
+  allocateAttempt()
+  removeVif(readded)
+  doAssert state == SmIdleState and smOwn.request == nil and smOwn.answer == nil
+  let sentBefore = sent.len
   doAssert mm_sta_add_cfm_handler(reply) == 0
   release(reply)
-  doAssert failures == @[(15'u16, 0xFFFF'u16)] and bssCalls == 0 and deletions == 0
+  doAssert unlistedDeletes == 1 and deletions == 0 and stations[0].valid == 1,
+    "the stale answer's station was not left to MM as a removed VIF's station"
+  doAssert failures.len == 0 and bssCalls == 0 and state == SmIdleState
+  doAssert sent.len == sentBefore
   finishExchange()
 ''')
 
@@ -602,10 +650,10 @@ def test_cleanup_request_is_always_answered(tmp_path: Path, step: int, fate: str
     VIF was retired, or after the cleanup was replaced) left it waiting in
     state 10, or a polled service cancelled it unreported. The cleanup now
     sends with SM's reserved reply (smSendReserved; the station delete is
-    answered in place), so every request it waits on is answered: a retired
-    VIF's request unapplied (smStaleRequest; mm_sta_del_req_handler for the
-    delete of a station the removal left out of any VIF's list, which MM
-    could otherwise only retry for ever). A step whose messages cannot be
+    answered in place), so every request it waits on is answered. The
+    removal of the VIF ends the cleanup at once (smStaVifRetired), and the
+    repliers drop its requests unapplied (smStaleRequest; the entry check of
+    mm_sta_del_req_handler). A step whose messages cannot be
     allocated is retried from SM's timer, never skipped. The real cleanup,
     station_sm.nim, ME's control exchange and the ME/MM repliers run here."""
     from test_wifi_sm_cleanup import CASES, program
@@ -648,37 +696,91 @@ if fate == "no_memory": completed()
 ''', finding="SMSTRUCT-N1")
 
 
-@pytest.mark.parametrize("state", [4, 6, 8])
-def test_auth_request_for_a_retired_sta_vif_ends_the_attempt(tmp_path: Path, state: int) -> None:
-    """States 4, 6 and 8 send the next auth or assoc frame through
-    sm_auth_assoc_send_according_chan. With the attempt's STA VIF retired it
-    returned without sending (smDeferredProceed failed, nothing reported),
-    and SM stayed in that state: in 6 and 8 the response deadline had already
-    fired or been cleared. The same happened to a parked request whose VIF
-    was retired before it came back. Both now end the attempt
-    (sm_connect_ind(11)). The real sm_auth_assoc_send_according_chan,
-    deferred_auth.nim and station_sm.nim run here."""
+@pytest.mark.parametrize("state", [4, 5, 6, 7, 8])
+def test_sta_vif_removed_around_auth_ends_the_attempt(tmp_path: Path, state: int) -> None:
+    """SCAN-N3 in states 4 to 8 (stage 9g). With the attempt's STA VIF
+    removed, sm_auth_assoc_send_according_chan returned without sending and
+    left SM waiting (later: ended the attempt there), and a request parked in
+    state 5 or 7 waited for a context that never came back. The removal now
+    ends the attempt at once (smStaVifRetired): a parked request is freed,
+    one already queued is ignored, and nothing is sent afterwards. The real
+    sm_auth_assoc_send_according_chan, deferred_auth.nim and station_sm.nim
+    run here."""
     from test_wifi_deferred_auth import run_nim as run_deferred
     from test_wifi_deferred_auth_lifetime import program_source
     run_deferred(tmp_path, program_source() + f"const state = {state}'u16\n" + r'''
 for kind in [5'u16, 7]:
-  for count in [1'u8, 2]:
+  for queued in [false, true]:
     reset()
-    discard smGo(state)
-    channelCount = count
-    vifs[1].vifType = 4
+    if state in [5'u16, 7]:
+      schedule(state)
+      if queued: publish()
+    else: discard smGo(state)
+    removeVif()
+    doAssert currentState == 0,
+      "[SCAN-N3] attempt left in state " & $currentState & " with its STA VIF removed"
+    doAssert chan.deferredMsg == nil and live.len == int(queued and state in [5'u16, 7])
     schedule(kind)
-    doAssert endings == @[(11'u16, 0xFFFF'u16)] and currentState == 10,
-      "[SM-AUTH-VIF] attempt left in state " & $currentState & " with its STA VIF retired"
-    doAssert sent.len == 0 and live.len == 0
-  # A parked request whose VIF is retired before the channel comes back.
-  reset()
-  discard smGo(state)
-  schedule(kind)
-  publish()
-  vifs[1].vifType = 4
-  drain()
-  doAssert endings == @[(11'u16, 0xFFFF'u16)] and currentState == 10,
-    "[SM-AUTH-VIF] parked request ignored with its STA VIF retired"
+    publish()
+    drain()
+    doAssert sent.len == 0 and endings.len == 0 and live.len == 0
 finish()
 ''')
+
+
+# --- MM_SET_BEACON_INT_REQ for a STA VIF without its AP station ---------------
+
+@pytest.mark.parametrize("mutation", [False, True], ids=["guarded", "unguarded"])
+def test_beacon_interval_without_ap_station_writes_nothing(tmp_path: Path, mutation: bool) -> None:
+    """Stage 9g item (f). Pinned mm_hw_config_handler writes the STA beacon
+    interval to sta_info_tab[vif.staIdx]; for a STA VIF without its AP
+    station (0xFF) that is past the table. The port writes nothing then. The
+    real MM_SET_BEACON_INT_REQ branch of mm_hw_config_handler runs here."""
+    tasks = (FW / "task_handlers.nim").read_text()
+    branch = tasks[tasks.index("  of 16:  # MM_SET_BEACON_INT_REQ"):tasks.index("  of 18:  # MM_SET_BASIC_RATES_REQ")]
+    lines = branch.splitlines()[1:]
+    body = "\n".join(line[2:] for line in lines) + "\n"
+    if mutation:
+        guard = "if staIdx < STA_INFO_TAB_ENTRIES.uint8:"
+        assert body.count(guard) == 1
+        body = body.replace(guard, "if true:", 1)
+    code = r'''
+const
+  STA_INFO_TAB_ENTRIES = 7
+  MM_SET_BEACON_INT_CFM = 17'u16
+type
+  MmSetBeaconIntReqPayload = object
+    interval: uint16
+    vifIdx: uint8
+  Vif = object
+    vifType, staIdx: uint8
+  Station = object
+    initialRateConfig: uint32
+var
+  vifs: array[2, Vif]
+  stations: array[STA_INFO_TAB_ENTRIES, Station]
+  apIntervals: int
+proc vifEntryAddr(index: uint8): uint = cast[uint](addr vifs[index])
+proc vifChannelAt(p: uint): ptr Vif = cast[ptr Vif](p)
+proc staInfoForIdx(index: uint8): ptr Station =
+  doAssert index < STA_INFO_TAB_ENTRIES, "[MM-BCN-INT] sta_info_tab indexed with " & $index
+  addr stations[index]
+proc vif_mgmt_set_ap_bcn_int(vif: pointer; interval: uint16) = inc apIntervals
+proc beaconInterval(msgBody: pointer): uint16 =
+  var cfmBasicId: uint16
+''' + body + r'''
+  cfmBasicId
+vifs[1] = Vif(vifType: 0, staIdx: 2)
+var request = MmSetBeaconIntReqPayload(interval: 100, vifIdx: 1)
+doAssert beaconInterval(addr request) == MM_SET_BEACON_INT_CFM
+doAssert stations[2].initialRateConfig == 100'u32 shl 10
+vifs[1].staIdx = 0xFF
+stations[2].initialRateConfig = 0
+doAssert beaconInterval(addr request) == MM_SET_BEACON_INT_CFM
+doAssert stations == default(typeof(stations)) and apIntervals == 0
+'''
+    if mutation:
+        with pytest.raises(AssertionError):
+            run_nim(tmp_path, code)
+    else:
+        run_nim(tmp_path, code)

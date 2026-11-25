@@ -2,14 +2,15 @@
 #
 # Once MM has registered the AP station, sm_set_bss_param (smBssBegin)
 # queues the nine requests of pinned sm_set_bss_param on sm_env's
-# pendingBssParams, enters state 4 and sends the first. Every answer goes
-# through smBssNext, which ends the attempt if its STA VIF is gone and
-# otherwise sends the next request (sm_send_next_bss_param); after the answer
-# to the last, ME_SET_ACTIVE_REQ, authentication starts
-# (me_set_active_cfm_handler_sm). Each request goes out with smSendReserved,
-# so its answer needs no allocation and always arrives (station_sm.nim). Every
-# end of the attempt leaves state 4, and its teardown frees the requests not
-# sent yet. The batch does not watch the AP station; nor does the blob.
+# pendingBssParams, enters state 4 and sends the first. Every answer but the
+# last goes through smBssNext, which sends the next request
+# (sm_send_next_bss_param); after the answer to the last, ME_SET_ACTIVE_REQ,
+# authentication starts (me_set_active_cfm_handler_sm). Each request goes
+# out with smSendReserved, so its answer needs no allocation and always
+# arrives (station_sm.nim). Every end of the attempt leaves state 4, and its
+# teardown frees the requests not sent yet; the removal of the STA VIF ends
+# it (smStaVifRetired). The batch does not watch the AP station; nor does
+# the blob.
 
 const
   SmBssRequests = [ME_SET_PS_DISABLE_REQ, MM_SET_BSSID_REQ, MM_SET_BASIC_RATES_REQ,
@@ -31,29 +32,22 @@ proc smBssCancel() =
 proc smBssFail() =
   sm_connect_ind(WLAN_FW_JOIN_NETWORK_FAILURE.uint16, 0xFFFF)
 
-proc smBssNext(): bool {.discardable.} =
-  ## The batch starts, or SM took the answer to its request in flight: end
-  ## the attempt if its STA VIF is gone or the next request's reply cannot be
-  ## reserved, else send that request. True when no request is left: the
-  ## last, ME_SET_ACTIVE_REQ, is answered and authentication may start.
-  let sm = smEnvView()
-  if not smAttemptStaVif(connectInfoView(sm.connectInfo).vifIdx):
-    smBssFail()
-    return false
-  let node = co_list_pop_front(addr sm.pendingBssParams)
-  if node == nil: return true
-  if not smSendReserved(keMsgPayload(cast[ptr KeMsgHdr](node))): smBssFail()
+proc smBssNext() =
+  ## The batch starts, or SM took the answer to a request before the last:
+  ## send the next request, or end the attempt if its reply cannot be
+  ## reserved.
+  let node = co_list_pop_front(addr smEnvView().pendingBssParams)
+  if node != nil and not smSendReserved(keMsgPayload(cast[ptr KeMsgHdr](node))): smBssFail()
 
 proc smBssBegin() =
   ## Queue the batch, enter state 4 and send its first request; or end the
-  ## attempt. SM is in state 3 and MM has registered the AP station.
+  ## attempt. SM is in state 3 and MM has registered the AP station, so the
+  ## attempt is live (sm.connectInfo is set in states 1 to 9) and its STA
+  ## VIF is there (smStaVifRetired).
   let sm = smEnvView()
   let connection = sm.connectInfo
-  if connection == nil: return
+  assert connection != nil
   let vifIdx = connectInfoView(connection).vifIdx
-  if not smAttemptStaVif(vifIdx):
-    smBssFail()
-    return
   let vif = vifChannelForIdx(vifIdx)
   if vif.basicRates[0] == 0 or vif.basicRates[0].int >= vif.basicRates.len:
     smBssFail()

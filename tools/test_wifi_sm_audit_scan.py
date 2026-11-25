@@ -20,9 +20,10 @@ SCAN-F3  MM_SCAN_CHANNEL_END_EARLY (quick-connect, flags bit 8) carries no
 SCAN-N3  The SM scan/join exchange was judged by an identity that included
          the STA VIF's epoch and type. Removing the STA VIF in state 1 or 2
          made SCANU's completion free SM's reply unrecorded, so SM stayed in
-         state 1 or 2 for good. SCANU now answers SM's request in place and
-         SM takes the answer while its operation is live; with its STA VIF
-         gone, the attempt ends.
+         state 1 or 2 for good. vif_mgmt_unregister now tells SM
+         (smStaVifRetired): the attempt on the removed VIF ends there, in
+         every state (tools/test_wifi_sm_table.py), and an answer to a request
+         SM no longer waits on changes nothing.
 """
 
 import re
@@ -504,21 +505,22 @@ finishSwitch()
 @pytest.mark.parametrize("mode", MODES)
 def test_sta_vif_removed_while_scanning_ends_attempt(tmp_path: Path, joining: bool, mode: str) -> None:
     """SCAN-N3: MM_REMOVE_IF_REQ for the STA VIF in state 1 or 2 resets its
-    slot (vif_mgmt_unregister) while SCANU works on SM's request. SCANU
-    still answers, SM takes the answer, and the attempt ends instead of
-    staying in state 1 or 2."""
-    from test_wifi_join_registration import submission_source
-    run_program(tmp_path, mode, submission_source() + f"let joining = {str(joining).lower()}\n" + r'''
+    slot (vif_mgmt_unregister) while SCANU works on SM's request. The
+    removal tells SM, which ends the attempt there; SCANU's later answer is
+    for a request SM no longer waits on and changes nothing."""
+    from test_wifi_registration_exchange import source
+    run_program(tmp_path, mode, source() + f"let joining = {str(joining).lower()}\n" + r'''
 begin(joining)
 let request = take()
-vifs[conn.vifIdx] = Vif(vifIdx: 127, vifType: 4, staIdx: 0xFF)
+allocateAttempt()
+removeVif()
+doAssert state == SmIdleState and smOwn.request == nil,
+  "[SCAN-N3] SM stayed in state " & $state & " after its STA VIF was removed"
 found = true
 let reply = complete(request)
 if joining: doAssert scanu_join_cfm_handler(reply) == 0
 else: doAssert scanu_start_cfm_handler(reply) == 0
 release(reply)
-doAssert failures == @[(12'u16, 0xFFFF'u16)],
-  "[SCAN-N3] SM stayed in state " & $state & " after its STA VIF was removed"
-doAssert queued.len == 0 and smOwn.request == nil
+doAssert failures.len == 0 and queued.len == 0 and state == SmIdleState
 finish()
 ''')

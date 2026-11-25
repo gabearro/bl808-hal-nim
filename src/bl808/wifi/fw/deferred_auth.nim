@@ -8,7 +8,9 @@
 # the channel scheduler sends it to TASK_SM (smDeferredPublish), and SM takes
 # it like an answer and sends the frame (smDeferredDispatch). Every smGo frees
 # a request still parked (smDeferredCancel); one already sent is ignored when
-# it arrives. An abort in state 5 or 7 ends the attempt.
+# it arrives. An abort in state 5 or 7 ends the attempt, and so does the
+# removal of the attempt's STA VIF, whose context would not come back
+# (smStaVifRetired).
 
 proc smDeferredCancel() =
   ## Free the parked request, if any (every smGo).
@@ -51,14 +53,10 @@ proc smDeferredPublish(vifEntry: pointer) =
 
 proc smDeferredDispatch(payload: pointer): cint =
   ## The parked request is back: send its frame. One SM no longer waits on
-  ## changes nothing. The attempt ends if its STA VIF has gone meanwhile:
-  ## the frame builders would return without sending.
+  ## changes nothing.
   if not smTakeAnswer(payload): return KeMsgConsumed
   let request = cast[ptr SmConnectAuthAssocReqPayload](payload)
-  let connection = smEnvView().connectInfo
-  if connection == nil or not smAttemptStaVif(connectInfoView(connection).vifIdx):
-    sm_connect_ind(WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE, 0xFFFF)
-  elif request.nextState == SmAuthStartingState:
+  if request.nextState == SmAuthStartingState:
     let challenge =
       if keMsgHdrFromPayload(payload).paramLen == SmConnectAuthAssocChallengePayloadSize:
         cast[pointer](addr cast[ptr SmConnectAuthAssocChallengePayload](payload).challenge[0])

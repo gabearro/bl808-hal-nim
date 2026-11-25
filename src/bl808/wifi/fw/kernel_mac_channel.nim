@@ -507,7 +507,7 @@ proc ke_msg_try_alloc(id: uint16, destId: uint8, srcId: uint8,
   ## Fallible allocation without scheduling recovery.
   const overhead = KeMsgHdrSize.uint32 + KeMsgTailSlack
   let storageLength = chanUpdateStorageLength(id, destId,
-    smAbortStorageLength(id, destId, mmTimAllocationSize(id, destId, paramLen)))
+    smDisconnectStorageLength(id, destId, mmTimAllocationSize(id, destId, paramLen)))
   if storageLength > high(uint32) - overhead:
     return nil
   let allocFn = cast[proc(sz: uint32): pointer {.cdecl.}](
@@ -526,7 +526,7 @@ proc ke_msg_try_alloc(id: uint16, destId: uint8, srcId: uint8,
   let payload = keMsgPayload(hdr)
   discard c_memset(payload, 0, paramLen.csize_t)
   mmTimRegisterAllocation(hdr)
-  smAbortRegister(hdr)
+  smDisconnectRegister(hdr)
   chanUpdateRegister(hdr)
   return payload
 
@@ -558,7 +558,7 @@ proc ke_msg_send*(param: pointer) {.exportc, cdecl, noinline.} =
       let saved = irqSave()
       defer: irqRestore(saved)
       mmTimCaptureMessage(hdr)
-      smAbortCaptureMessage(hdr)
+      smDisconnectStamp(hdr)
       chanUpdateCaptureMessage(hdr)
       co_list_push_back(addr keMsgQueueSent, cast[ptr CoListHdr](hdr))
       ke_evt_set(KE_EVT_KE_MESSAGE)
@@ -783,7 +783,7 @@ proc ke_msg_free*(param: pointer) {.exportc, cdecl.} =
   rxMgtForget(param)
   chanUpdateForget(param)
   chanBcnRequestForget(param)
-  smAbortForget(param)
+  smDisconnectForget(param)
   mmEdcaForget(param)
   let resumePending = mmConfigForgetIdleOwner(param)
   platformFree(param)
@@ -801,6 +801,12 @@ proc ke_msg_discard*(param: pointer): cint {.exportc, cdecl.} =
 proc ke_msg_save*(param: pointer): cint {.exportc, cdecl.} =
   ## Message handler: save (do not free, move to saved queue). Returns 2 = saved.
   ## From blob: ke_msg_save returns saved (not no-free).
+  when defined(bl808WifiScanOwnershipBench):
+    # SCANU's tables save a request that comes while it scans or joins;
+    # scanu_start_req_handler only runs in SCANU's idle state.
+    let header = keMsgHdrFromPayload(param)
+    if header.id == SCANU_START_REQ and header.srcId == TASK_SM:
+      inc nimFwDbgScanOwnershipSaved
   return KeMsgSaved
 
 # ###########################################################################
@@ -909,10 +915,8 @@ proc ke_flush*() {.exportc, cdecl.} =
   scanDwellReset()
   keTimerCancelMutations(all = true)
   chanSwitchReset()
-  smActivationCancel()
-  smBssCancel()
-  smCleanupCancel()
-  smDeferredCancel()
+  # The flush frees every message SM waits on: drop its attempt or teardown.
+  smAbandon()
   mmPsModeCancel()
   meControlReset()
   for vifIdx in 0'u8 ..< MAX_VIFS.uint8:
@@ -3384,7 +3388,14 @@ proc mmStaDelTry(staIdx: uint8; saved: uint32): bool =
     let staEntry = staMgmtBeginRemoval(staIdx, owner)
     if staEntry == nil:
       deletion.running = false
-      return staInfoForIdx(staIdx).valid == 0
+      # Retry only a station still on its VIF's list (the TX halt failed).
+      # One whose VIF was removed is on no list (vif_mgmt_unregister cleared
+      # it) and cannot be removed: it stays valid, as every station of a
+      # removed VIF, and the delete is done instead of retried for ever.
+      let station = staInfoForIdx(staIdx)
+      return station.valid == 0 or station.instNbr >= MAX_VIFS.uint8 or
+        not co_list_find(vifPostponedStaList(vifChannelForIdx(station.instNbr)),
+                         cast[ptr CoListHdr](station))
     deletion[] = MmStaDeletion(owner: owner, requestEpoch: owner.stationEpoch - 1'u32,
                                active: true, running: true, requestOwned: true)
     let vif = vifChannelForIdx(owner.vif)

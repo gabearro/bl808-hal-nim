@@ -2,9 +2,9 @@
 
 The harness runs the real deferred_auth.nim, sm_auth_assoc_send_according_chan,
 chan_ctxt_set_auth_assoc_req, the publication branch of chan_pre_switch_channel
-and station_sm.nim's smGo, smPark, smTakeAnswer and smAttemptStaVif. The frame
-builders and the end of the attempt (sm_connect_ind, which leaves the state
-through smGo) are modelled.
+and station_sm.nim's smGo, smPark, smTakeAnswer, smAbandon and smStaVifRetired.
+The frame builders and the end of the attempt (sm_connect_ind, which leaves the
+state through smGo) are modelled.
 """
 
 from pathlib import Path
@@ -51,7 +51,7 @@ type
     vifIdx, vifType: uint8
     tbttNode: TbttNode
   SmEnv = object
-    connectInfo: pointer
+    connectInfo, connectIndMsg: pointer
   ConnectInfo = object
     vifIdx: uint8
   ChanEnv = object
@@ -214,6 +214,16 @@ proc reset() =
   publications = 0
   remainingChecks = 0
   sent.setLen(0)
+proc removeVif() =
+  ## vif_mgmt_unregister removes VIF 1: the slot is freed and SM is told
+  ## (smStaVifRetired). The attempt's parked messages are allocated here,
+  ## since smAbandon frees them.
+  let info = ke_msg_try_alloc(0x1000'u16, TASK_SM, 9, sizeof(ConnectInfo).uint32)
+  cast[ptr ConnectInfo](info)[] = connectInfoView(env.connectInfo)[]
+  env.connectInfo = info
+  env.connectIndMsg = ke_msg_try_alloc(0x1002'u16, 9, TASK_SM, 4)
+  vifs[1] = Vif(vifIdx: 127, vifType: 4)
+  smStaVifRetired(1)
 proc schedule(kind = 5'u16; sequence = 1'u16) =
   sm_auth_assoc_send_according_chan(kind, sequence, nil)
 proc publish() = activate(addr vifs[1])
@@ -277,30 +287,44 @@ for kind in [5'u16, 7]:
   doAssert sent.len == 0 and frees == 1 and currentState == 10
   doAssert endings == @[(24'u16, 3'u16)]
 ''',
-    # The attempt's STA VIF is retired before the request comes back: the
-    # attempt ends instead of the frame builder returning silently.
-    "vif_retired_while_queued": r'''
+    # The removal of the attempt's STA VIF ends the attempt at once,
+    # unreported: a parked request is freed, one already sent is ignored when
+    # it comes, and nothing is sent. Its context would not come back.
+    "vif_removed_while_parked": r'''
+for kind in [5'u16, 7]:
+  reset()
+  schedule(kind)
+  removeVif()
+  doAssert currentState == 0 and chan.deferredMsg == nil and not held()
+  doAssert env.connectInfo == nil and env.connectIndMsg == nil and live.len == 0
+  publish()
+  drain()
+  doAssert sent.len == 0 and endings.len == 0
+''',
+    "vif_removed_while_queued": r'''
 for kind in [5'u16, 7]:
   reset()
   schedule(kind)
   publish()
-  vifs[1].vifType = 4
+  removeVif()
+  doAssert currentState == 0 and live.len == 1
   drain()
-  doAssert sent.len == 0 and endings == @[(11'u16, 0xFFFF'u16)] and currentState == 10
+  doAssert sent.len == 0 and endings.len == 0 and live.len == 0
 ''',
-    # ... or before the request is sent or parked (a retry from state 6 or 8,
-    # the next auth step, or the start of authentication in state 4).
-    "vif_retired_before_schedule": r'''
+    # ... and before the request is sent or parked (a retry from state 6 or
+    # 8, the next auth step, or the start of authentication in state 4):
+    # nothing is left to schedule.
+    "vif_removed_before_schedule": r'''
 for kind in [5'u16, 7]:
-  for count in [1'u8, 2]:
-    for state in [4'u16, 6, 8]:
-      reset()
-      discard smGo(state)
-      channelCount = count
-      vifs[1].vifType = 4
-      schedule(kind)
-      doAssert sent.len == 0 and allocations == 0 and chan.deferredMsg == nil
-      doAssert endings == @[(11'u16, 0xFFFF'u16)] and currentState == 10
+  for state in [4'u16, 6, 8]:
+    reset()
+    discard smGo(state)
+    removeVif()
+    doAssert currentState == 0 and live.len == 0
+    allocations = 0
+    schedule(kind)
+    doAssert sent.len == 0 and allocations == 0 and chan.deferredMsg == nil
+    doAssert endings.len == 0 and currentState == 0
 ''',
     # A request SM did not park, or one delivered twice, changes nothing.
     "forged_request": r'''
@@ -411,7 +435,7 @@ def program_source(mutation: str = "") -> str:
     activation += "\n".join("  " + line for line in fragment.splitlines()) + "\n"
     source = (types + constants + PLATFORM
               + procedure(kernel, "chan_ctxt_set_auth_assoc_req")
-              + station_sm_source("smGo", "smPark", "smTakeAnswer", "smAttemptStaVif")
+              + station_sm_source("smGo", "smPark", "smTakeAnswer", "smAbandon", "smStaVifRetired")
               + ENDS + (FW / "deferred_auth.nim").read_text()
               + procedure(kernel, "co_list_push_back") + procedure(kernel, "co_list_extract")
               + procedure(kernel, "chan_ctxt_link") + procedure(kernel, "chan_ctxt_unlink")
@@ -449,10 +473,9 @@ def run_case(tmp_path: Path, case: str, mode: str = "checked", mutation: str = "
 MUTATIONS = {
     "take_answer": ("  if not smTakeAnswer(payload): return KeMsgConsumed",
                     "  discard smTakeAnswer(payload)", "attempt_ended_while_queued"),
-    "dispatch_vif": ("  if connection == nil or not smAttemptStaVif(connectInfoView(connection).vifIdx):",
-                     "  if connection == nil:", "vif_retired_while_queued"),
-    "send_vif": ("  if not smAttemptStaVif(vifIdx):\n    sm_connect_ind(WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE, 0xFFFF)\n    return\n",
-                 "", "vif_retired_before_schedule"),
+    "vif_removal": ("      (smOwn.teardown != tdNone and smOwn.vif == vifIdx):\n    smAbandon()",
+                    "      (smOwn.teardown != tdNone and smOwn.vif == vifIdx):\n    discard",
+                    "vif_removed_while_parked"),
     "publication": ("  env.deferredMsg = nil\n  ke_msg_send(request)", "  ke_msg_send(request)", "matrix"),
     "publish_vif": ("cast[pointer](vifChannelForIdx(connectInfoView(connection).vifIdx)) != vifEntry",
                     "false", "wrong_vif"),

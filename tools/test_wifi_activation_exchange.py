@@ -184,6 +184,7 @@ proc ke_msg_send(p: pointer) =
     return
   co_list_push_back(addr keMsgQueueSent, cast[ptr CoListHdr](header))
   invoke(onSend)
+proc smActivationCancel()
 proc smConnectIndModel(status, reason: uint16)
 proc sm_connect_ind(status, reason: uint16) = smConnectIndModel(status, reason)
 proc mm_rx_filter_set() =
@@ -266,6 +267,20 @@ proc setup(vifIndex = 1'u8; staIndex = 2'u8; cipher = 0'u8; flags = 0'u32) =
 proc endAttempt() =
   ## The attempt ends (its teardown): SM leaves state 9.
   smConnectIndModel(9, 1)
+proc allocateAttempt() =
+  ## The attempt's SM_CONNECT_REQ and SM_CONNECT_IND as allocated messages,
+  ## which smAbandon frees.
+  let info = ke_msg_try_alloc(0x1000'u16, TASK_SM, TASK_API, sizeof(Connection).uint32)
+  cast[ptr Connection](info)[] = connectInfoView(sm.connectInfo)[]
+  sm.connectInfo = info
+  sm.connectIndMsg = ke_msg_try_alloc(0x1002'u16, TASK_API, TASK_SM, 4)
+proc retireVif(index: uint8) =
+  ## vif_mgmt_unregister: the slot is freed, ME forgets the VIF's mask bits
+  ## and SM is told (smStaVifRetired).
+  vifs[index] = Vif(vifIdx: 127, vifType: 4, staIdx: 0xFF)
+  me.activeMask = me.activeMask and not (1'u32 shl index)
+  me.psDisableMask = me.psDisableMask and not (1'u32 shl index)
+  smStaVifRetired(index)
 proc replaceOwner() =
   ## SM has moved on to another attempt, in state 6.
   sm.connectInfo = addr replacement
@@ -377,8 +392,8 @@ def source(trace: bool = False) -> str:
     for name in ["co_list_pop_front", "co_list_push_back", "ke_queue_extract"]:
         code += procedure(kernel, name)
     owner = (FW / "station_tx_build.nim").read_text()
-    code += station_sm_source("smGo", "smSendReserved", "smAwaits", "smAttemptStaVif",
-                              "smRequestVifLive", "smStaleRequest", "smTakeReply", "smTakeAnswer")
+    code += station_sm_source("smGo", "smSendReserved", "smAwaits", "smStaleRequest",
+                              "smTakeReply", "smTakeAnswer", "smAbandon", "smStaVifRetired")
     for name in ["smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent", "smTxBindStation", "smTxSetOwnerState"]:
         code += procedure(owner, name)
     scan = (FW / "scan_station_ap_me.nim").read_text()
@@ -665,23 +680,41 @@ finish()
 """,
     # SMCONN-F6 by construction: only SM's own operation ends the exchange.
     # A TX reset, a VIF epoch or an SM TX serial does not; a station deleted
-    # or a STA VIF retired under it ends the attempt, reported.
+    # under it ends the attempt, reported.
     "only_the_sm_operation_ends_the_activation": r"""
-for changed in 0..4:
+for changed in 0..3:
   begin()
   case changed
   of 0: inc txResetEpoch
   of 1: inc rxVifEpochs[1]
   of 2: inc smTxSerials[1]
-  of 3: inc stationEpochs[2]
-  else: vifs[1].vifType = 4  # the STA VIF was retired
+  else: inc stationEpochs[2]
   drain()
   if changed < 3:
     doAssert connected == 1 and stationReady == 1 and failures.len == 0
   else:
     doAssert connected == 0 and failures == @[(5'u16, 0xFFFF'u16)]
-  # MM answers SM's request for the retired VIF without applying it.
-  if changed == 4: doAssert applied.len == 0 and vifs[1].state == 0
+  finish()
+""",
+    # The removal of the STA VIF (vif_mgmt_unregister) ends the attempt at
+    # once, unreported, with any request in flight: its replier drops it
+    # unapplied and ME forgets the VIF's PS-disable bit.
+    "vif_removal_ends_the_activation": r"""
+for step in 0..2:
+  begin()
+  allocateAttempt()
+  while smActivation.step < step:
+    doAssert dispatchOne()
+  let sent = smOwn.request
+  doAssert sent != nil
+  let before = applied.len
+  retireVif(1)
+  doAssert state == SmIdleState and not smActivationLive() and smOwn.request == nil
+  doAssert sm.connectInfo == nil and sm.connectIndMsg == nil
+  doAssert me.psDisableMask == 0
+  drain()
+  doAssert applied.len == before, "a request was applied to the removed VIF"
+  doAssert connected == 0 and failures.len == 0 and meState == MeIdleState
   finish()
 """,
     # The host ends the attempt while it handles SM_STA_ADD_IND (a send to

@@ -238,8 +238,7 @@ def types() -> str:
 
 def source(types: str, scan: str) -> str:
     code = types + PLATFORM.replace("proc setup() =", station_sm_source(
-        "smGo", "smSendReserved", "smAwaits", "smTakeReply", "smTakeAnswer",
-        "smAttemptStaVif") + "proc setup() =", 1)
+        "smGo", "smSendReserved", "smAwaits", "smTakeReply", "smTakeAnswer") + "proc setup() =", 1)
     code += (FW / "station_bss.nim").read_text()
     code += r'''
 proc acknowledgeBss() =
@@ -335,21 +334,11 @@ for period in [0'u32, 100'u32]:
           doAssert req.edcaParam == 0x11223300'u32 + ac.uint32
         finish()
 ''',
-    # Without the attempt's STA VIF the attempt ends (it used to return and
-    # leave SM in state 3); without an attempt nothing happens.
-    "invalid_owner": r'''
-for bad in 0..3:
-  setup()
-  case bad
-  of 0: sm.connectInfo = nil
-  of 1: connection.vifIdx = 2
-  of 2: vif.vifIdx = 0
-  else: vif.vifType = 2
-  sm_set_bss_param()
-  doAssert calls == 0 and stateChanges == 0 and sent.len == 0
-  doAssert failures.len == int(bad != 0)
-  if bad != 0: doAssert failures[0] == (14'u16, 0xFFFF'u16)
-  finish()
+    # sm_set_bss_param runs only for SM's live registration answer, so the
+    # attempt is live and its STA VIF is there (its removal ends the attempt:
+    # smStaVifRetired); the batch checks neither. Nor does it watch the AP
+    # station, as in the blob.
+    "no_owner_checks": r'''
 setup()
 vif.staIdx = 0xFF
 sm_set_bss_param()

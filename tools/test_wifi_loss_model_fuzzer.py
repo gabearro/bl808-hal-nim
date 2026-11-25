@@ -273,6 +273,8 @@ def loss_firmware_source(mutation: bool = False) -> str:
                                           "    destId, srcId: uint8\n    paramLen: uint32\n")
     fixture = fixture.replace("proc ke_msg_free(p: pointer) = inc freed\n",
                               "proc ke_msg_free(p: pointer)\n")
+    # owned_disconnect_source below supplies the real smAbandon.
+    fixture = fixture.replace("proc smAbandon() = discard\n", "proc smAbandon()\n")
     tag_lookup = procedure(kernel, "mmConnLossTagFor")
     if mutation:
         old = ("not mmVifCurrent(tag.identity) or\n"

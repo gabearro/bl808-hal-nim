@@ -104,12 +104,6 @@ def source() -> str:
                         "if task == TASK_SM: state elif task == TASK_ME: meState else: mmState")
     code = code.replace("  else: meState = value\n",
                         "  elif task == TASK_ME: meState = value\n  else: mmState = value\n")
-    stub = 'proc smCleanupConfirmed() = doAssert false, "no cleanup runs here"\n'
-    assert stub in code
-    # The VIF the cleanup releases (station_cleanup.nim) is VIF 1 here.
-    code = code.replace(stub, stub + """var cleanupVifEpoch: uint32
-proc smCleanupVifLive(): bool = rxVifEpochs[1] == cleanupVifEpoch
-""", 1)
     start = code.index("  of TASK_MM:\n", code.index("proc dispatchOne"))
     end = code.index("  of TASK_API:\n", start)
     code = code[:start] + "  of TASK_MM: outcome = mm_hw_config_handler(p)\n" + code[end:]
@@ -129,35 +123,27 @@ proc smCleanupVifLive(): bool = rxVifEpochs[1] == cleanupVifEpoch
 CASES = {
     # SM's cleanup (state 10) sends MM_SET_VIF_STATE_REQ(0) with its reserved
     # reply. The real handler clears the VIF's timers and state and answers
-    # with that reply; for a VIF retired since, it answers without applying.
+    # with that reply.
     "station_cleanup_state_down": r'''
-for retired in [false, true]:
-  setup()
-  discard smGo(10, tdCleanup)
-  vifs[1].state = 1
-  vifs[1].tbttTimer = 11
-  vifs[1].keepAliveTimer = 22
-  vifs[1].securityTimer = 33
-  cleanupVifEpoch = rxVifEpochs[1]
-  let request = ke_msg_try_alloc(MM_SET_VIF_STATE_REQ, TASK_MM, TASK_SM,
-                                 MmSetVifStateReqPayloadSize)
-  cast[ptr MmSetVifStateReqPayload](request)[] = MmSetVifStateReqPayload(vifIdx: 1, state: 0)
-  doAssert smSendReserved(request)
-  let reserved = smOwn.reply
-  if retired: inc rxVifEpochs[1]
-  doAssert dispatchOne()
-  doAssert events[^1].id == MM_SET_VIF_STATE_CFM
-  doAssert keMsgQueueSent.first == keMsgHdrFromPayload(reserved)
-  doAssert smOwn.answer == reserved and smOwn.request == nil
-  if retired:
-    doAssert vifs[1].state == 1 and vifs[1].tbttTimer == 11 and
-             vifs[1].keepAliveTimer == 22 and vifs[1].securityTimer == 33,
-      "the cleanup's request was applied to the retired VIF"
-  else:
-    doAssert vifs[1].state == 0 and vifs[1].tbttTimer == 0 and
-             vifs[1].keepAliveTimer == 0 and vifs[1].securityTimer == 0
-  ke_msg_free(co_list_pop_front(addr keMsgQueueSent))
-  finish()
+setup()
+discard smGo(10, tdCleanup)
+vifs[1].state = 1
+vifs[1].tbttTimer = 11
+vifs[1].keepAliveTimer = 22
+vifs[1].securityTimer = 33
+let request = ke_msg_try_alloc(MM_SET_VIF_STATE_REQ, TASK_MM, TASK_SM,
+                               MmSetVifStateReqPayloadSize)
+cast[ptr MmSetVifStateReqPayload](request)[] = MmSetVifStateReqPayload(vifIdx: 1, state: 0)
+doAssert smSendReserved(request)
+let reserved = smOwn.reply
+doAssert dispatchOne()
+doAssert events[^1].id == MM_SET_VIF_STATE_CFM
+doAssert keMsgQueueSent.first == keMsgHdrFromPayload(reserved)
+doAssert smOwn.answer == reserved and smOwn.request == nil
+doAssert vifs[1].state == 0 and vifs[1].tbttTimer == 0 and
+         vifs[1].keepAliveTimer == 0 and vifs[1].securityTimer == 0
+ke_msg_free(co_list_pop_front(addr keMsgQueueSent))
+finish()
 ''',
     "station_probe_budget_fresh": r'''
 begin()
@@ -194,18 +180,22 @@ doAssert edcaWrites == @[(MACHW_BASE + 0x200'u, 0x0A47'u32),
   (MACHW_BASE + 0x20C'u, 0x2F322'u32)]
 finish()
 ''',
-    # The STA VIF is retired with SM's MM_SET_VIF_STATE_REQ queued: the real
-    # handler answers it without touching the slot, its station or the MAC,
-    # and SM ends the attempt at the answer.
-    "retired_vif_is_answered_unapplied": r'''
+    # The STA VIF is removed with SM's MM_SET_VIF_STATE_REQ queued: the
+    # removal ends the attempt (smStaVifRetired), and the real handler drops
+    # the request SM no longer waits on without touching the slot, its
+    # station or the MAC.
+    "retired_vif_request_is_dropped": r'''
 begin()
-vifs[1].vifType = 4
+allocateAttempt()
+retireVif(1)
+doAssert state == SmIdleState and smOwn.request == nil
+let queued = events.len
 doAssert dispatchOne()
-doAssert events[^1].id == MM_SET_VIF_STATE_CFM
+doAssert events.len == queued, "the request was answered"
 doAssert vifs[1].state == 0 and vifs[1].tbttTimer == 0 and stations[2].aid == 0
 doAssert writes.len == 0 and macReads == 0
 drain()
-doAssert failures == @[(5'u16, 0xFFFF'u16)] and connected == 0
+doAssert failures.len == 0 and connected == 0
 finish()
 ''',
     "restore_before_confirmation": r'''

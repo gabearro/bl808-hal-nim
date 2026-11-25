@@ -44,7 +44,6 @@ var
   smSaQuery: tuple[serial: uint32, armed: bool]
   onIrqRestore: proc()
   recycleOnFree, recycledHeader: pointer
-proc smCleanupVifLive(): bool
 proc smCleanupCancel()
 proc smDeferredCancel() = discard
 proc smBssCancel() = discard
@@ -121,12 +120,17 @@ proc ke_msg_try_alloc(id: uint16; dst, src: uint8; n: uint32): pointer =
     allocationHook = nil
     action()
 proc mmStaDelReqView(p: pointer): ptr MmStaDelReqPayload = cast[ptr MmStaDelReqPayload](p)
+proc smStaVifRetired(vifIdx: uint8)
 proc retireVif(index: uint8) =
   ## vif_mgmt_unregister: the VIF's epoch moves on and the memset of its entry
-  ## empties its station list. Its stations stay valid.
+  ## empties its station list (its stations stay valid); ME forgets the VIF's
+  ## mask bits and SM is told.
   inc rxVifEpochs[index]
   for station in 0 ..< stations.len:
     if stations[station].instNbr == index: listed[station] = false
+  me.activeMask = me.activeMask and not (1'u32 shl index)
+  me.psDisableMask = me.psDisableMask and not (1'u32 shl index)
+  smStaVifRetired(index)
 proc mm_sta_del(index: uint8) =
   if index >= 7: return
   removed.add(index)
@@ -433,25 +437,26 @@ completed()
 doAssert notifications.len == 1
 ''',
     # The VIF is removed and its slot registered again while the host handles
-    # SM_DISCONNECT_IND. The cleanup still finishes: the repliers answer its
-    # requests for the retired VIF without applying them. The station delete
-    # names the old link's station, which the removal left valid but out of
-    # any VIF's list, and MM answers it without trying to delete it.
+    # SM_DISCONNECT_IND. The removal ends the cleanup at once
+    # (smStaVifRetired): the request already sent is dropped by its replier,
+    # nothing more is sent and nothing touches the slot. The old link's
+    # station is left valid but out of any VIF's list, as the removal left it.
     "vif_retired_mid_cleanup": r'''
+smOwn.vif = 1  # left by an earlier teardown on another VIF
 indicationHook = proc() =
   doAssert smState == 10 and smCleanup.indication == nil and unlinks == 1
   retireVif(0)
+  doAssert smState == SmIdleState and not cleanupActive() and not smGuardArmed
   inc chanCtxtLinkEpochs[0]
   vifs[0].chanCtxt = addr cleanupChannel
   vifApConfig(addr vifs[0]).securityFlags = 9
 sm_disconnect_process(addr vifs[0], 7, 7)
-doAssert notifications.len == 1 and cleanupActive()
+doAssert notifications.len == 1 and not cleanupActive()
 drain()
-doAssert commands == @[ME_SET_PS_DISABLE_REQ, MM_SET_VIF_STATE_REQ,
-                       MM_STA_DEL_REQ, ME_SET_ACTIVE_REQ]
-doAssert smState == 0 and unlinks == 1 and deleteNames == @[2'u8]
+doAssert commands == @[ME_SET_PS_DISABLE_REQ]
+doAssert smState == 0 and unlinks == 1 and deleteNames.len == 0
 doAssert removed.len == 0 and stations[2].valid == 1
-doAssert vifs[0].state == 1 and me.activeMask == 3 and me.psDisableMask == 3,
+doAssert vifs[0].state == 1 and me.activeMask == 2 and me.psDisableMask == 2,
   "a request was applied to the retired VIF"
 doAssert vifs[0].chanCtxt == addr cleanupChannel
 doAssert vifApConfig(addr vifs[0]).securityFlags == 9
@@ -596,8 +601,9 @@ ke_msg_free(held)
 doAssert me.psDisableMask == 3 and me.activeMask == 3
 doAssert allocated.len == 0 and keMsgQueueSent.first == nil
 ''',
-    # The VIF is retired while ME forwards the first request to MM. The
-    # forward completes; the rest is answered unapplied and the cleanup ends.
+    # The VIF is removed while ME forwards the first request to MM. The
+    # removal ends the cleanup at once; the forward completes, ME goes idle
+    # and SM ignores its answer. A connect saved in state 10 runs again.
     "retired_vif_finishes_cleanup": r'''
 psDeferred = true
 sm_disconnect_process(addr vifs[0], 7, 7)
@@ -607,24 +613,20 @@ doAssert smOwn.answer != nil and smState == SmDisconnectingState
 doAssert mmPsModeRequest != nil and meState == MeBusyState
 let reconnect = newMessage(0x1000, TASK_SM, TASK_API, 32)
 co_list_push_back(addr keMsgQueueSaved, keMsgHdrFromPayload(reconnect))
-# The quiesced invalidation is the epoch boundary used by VIF unregister,
-# whose memset of the entry empties its station list.
-rxInvalidateQuiescentVif(0, 0)
+retireVif(0)
 vifs[0].vifType = 4
-listed[2] = false
+doAssert smState == SmIdleState and not cleanupActive() and smOwn.answer == nil
+# SM idle releases the saved connect.
+doAssert keMsgQueueSaved.first == nil and keMsgQueueSent.first == keMsgHdrFromPayload(reconnect)
+discard co_list_pop_front(addr keMsgQueueSent)
 mmPsModeComplete()
-var steps = 0
-while keMsgQueueSent.first != nil and keMsgQueueSent.first != keMsgHdrFromPayload(reconnect):
-  inc steps
-  doAssert steps < 40
-  driveOne()
+drain()
 doAssert smState == SmIdleState and not cleanupActive() and interruptsEnabled
 doAssert mmPsModeRequest == nil and meState == MeIdleState
-doAssert keMsgQueueSaved.first == nil and keMsgQueueSent.first == keMsgHdrFromPayload(reconnect)
 doAssert notifications.len == 1 and callbackCalls == 1 and removed.len == 0
-doAssert deleteNames == @[2'u8] and stations[2].valid == 1
-doAssert vifs[0].state == 1 and me.activeMask == 3 and me.psDisableMask == 2
-ke_msg_free(co_list_pop_front(addr keMsgQueueSent))
+doAssert deleteNames.len == 0 and stations[2].valid == 1
+doAssert vifs[0].state == 1 and me.activeMask == 2 and me.psDisableMask == 2
+ke_msg_free(keMsgHdrFromPayload(reconnect))
 doAssert allocated.len == 0
 ''',
     # The replier frees the request once it has taken SM's reply, and SM no
@@ -724,25 +726,24 @@ doAssert stations[2].valid == 1 and listed[2]
 doAssert me.activeMask == 2 and allocated.len == 0
 ''',
     # The VIF is removed before the first step runs (the cleanup began during
-    # a TX reset). The supplicant is not told, the channel and the security
-    # flags are left alone, every request is answered unapplied, and the
-    # cleanup still finishes and sends its indication.
+    # a TX reset). The removal ends the cleanup, unreported: the supplicant
+    # is not told, the channel and the security flags are left alone and no
+    # request is sent. The retry timer is cleared.
     "vif_retired_before_first_step": r'''
 txResetInProgress = true
 vifApConfig(addr vifs[0]).securityFlags = 9
 sm_disconnect_process(addr vifs[0], 19, 3)
 doAssert cleanupActive() and smGuardArmed and commands.len == 0
 retireVif(0)
+doAssert smState == SmIdleState and not cleanupActive() and not smGuardArmed
 txResetInProgress = false
 drain()
 doAssert callbackCalls == 0, "the supplicant of a removed VIF was told"
 doAssert unlinks == 0 and vifs[0].chanCtxt == addr cleanupChannel
 doAssert vifApConfig(addr vifs[0]).securityFlags == 9
-doAssert commands == @[ME_SET_PS_DISABLE_REQ, MM_SET_VIF_STATE_REQ,
-                       MM_STA_DEL_REQ, ME_SET_ACTIVE_REQ]
-doAssert removed.len == 0 and vifs[0].state == 1
-doAssert me.activeMask == 3 and me.psDisableMask == 3
-doAssert notifications.len == 1 and notifications[0].status == 19 and allocated.len == 0
+doAssert commands.len == 0 and removed.len == 0 and vifs[0].state == 1
+doAssert me.activeMask == 2 and me.psDisableMask == 2
+doAssert notifications.len == 0 and allocated.len == 0
 ''',
     "station_wrong_vif": r'''
 stations[2].instNbr = 1
@@ -982,9 +983,9 @@ doAssert notifications.len == 1
 '''
 
 
-SM_PROCS = ("smGo", "smSend", "smSendReserved", "smAwaits", "smAttemptStaVif",
-            "smRequestVifLive", "smStaleRequest", "smTakeReply", "smTakeAnswer",
-            "smDeauthConfirmed", "smDeauthVif", "smTeardownUnclaimed", "smTeardown")
+SM_PROCS = ("smGo", "smSend", "smSendReserved", "smAwaits", "smStaleRequest",
+            "smTakeReply", "smTakeAnswer", "smDeauthConfirmed", "smDeauthVif", "smAbandon",
+            "smTeardown", "smStaVifRetired")
 
 # The guard each mutation removes, and the case that must then fail.
 MUTATIONS = {
@@ -992,10 +993,8 @@ MUTATIONS = {
     "callback": ("    if callback != nil:\n", "    if false:\n", "disconnect"),
     "late_answer": ("  if answer == nil or answer != smOwn.answer: return false",
                     "  if answer == nil: return false", "late_reply"),
-    "dropped_request": ("  if not smAwaits(request): return true", "  if not smAwaits(request): return false",
+    "dropped_request": ("keMsgHdrFromPayload(request).srcId == TASK_SM and not smAwaits(request)", "false",
                         "queued_cancel"),
-    "retired_vif": ("  if smOwn.teardown == tdCleanup: return smCleanupVifLive()",
-                    "  if smOwn.teardown == tdCleanup: return true", "vif_retired_mid_cleanup"),
     "binding": ("if chanCtxtLinkEpochs[vif] == smCleanup.channelBinding and entry.chanCtxt != nil:",
                 "if entry.chanCtxt != nil:", "channel_rebound_before_detach"),
     "reset_retry": ("  if txlResetting():\n    smCleanupRetry()\n    return\n", "", "defer_while_tx_resets"),
@@ -1003,12 +1002,11 @@ MUTATIONS = {
                      "callback_runs_sm_init"),
     "station_named": ("      if smCleanupOwnsStation(smCleanup.station, vif, smCleanup.stationEpoch): smCleanup.station\n"
                       "      else: 0xFF'u8\n", "      smCleanup.station\n", "station_deleted_before_its_step"),
-    "retired_callback": ("if wpa_cbs == nil or not smCleanupVifLive(): nil", "if wpa_cbs == nil: nil",
-                         "vif_retired_before_first_step"),
-    "retired_effects": ("  if smCleanupVifLive():\n    # The VIF leaves", "  if true:\n    # The VIF leaves",
-                        "vif_retired_before_first_step"),
-    "retired_delete": ("    if not smRequestVifLive(): mmStaDelReqView(param).staIdx = 0xFF\n", "",
-                       "vif_retired_mid_cleanup"),
+    # vif_mgmt_unregister's signal ends a cleanup on the removed VIF.
+    "vif_removal": ("      (smOwn.teardown != tdNone and smOwn.vif == vifIdx):\n    smAbandon()",
+                    "      (smOwn.teardown != tdNone and smOwn.vif == vifIdx):\n    discard",
+                    "vif_retired_before_first_step"),
+    "cleanup_vif": ("  smOwn.vif = vif.vifIdx\n", "", "vif_retired_mid_cleanup"),
     "reply_hand_out": ("  smOwn.reply = nil\n  smOwn.request = nil\n  let header = keMsgHdrFromPayload(result)",
                        "  smOwn.reply = nil\n  let header = keMsgHdrFromPayload(result)",
                        "retired_request_address_reused"),

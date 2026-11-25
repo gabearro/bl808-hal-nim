@@ -171,7 +171,7 @@ def source() -> str:
                 break
             code += line + "\n"
     code += PLATFORM
-    code += station_sm_source("smGo", "smSend", "smAwaits", "smTakeAnswer", "smAttemptStaVif")
+    code += station_sm_source("smGo", "smSend", "smAwaits", "smTakeAnswer")
     for name in ["connectInfoSsidLen", "connectInfoFillSsidSlot"]:
         code += procedure(layout, name)
     handlers = (FW / "scan_station_ap_me.nim").read_text()

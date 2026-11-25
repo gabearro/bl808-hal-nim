@@ -25,7 +25,12 @@ TASK_SM's state itself, and smGo is the only ke_state_set(TASK_SM, ...).
 A second table (test_request_answer_table, below) drives the scan, join
 and registration states 1 to 3 through each fate of their one request. A
 third (test_series_table) drives the BSS parameter batch (state 4) and the
-activation (state 9) through each fate of each of their requests.
+activation (state 9) through each fate of each of their requests; further
+tables drive the cleanup (state 10) and the deferred request (states 5 and
+7). Every table has a fate in which the STA VIF is removed
+(vif_mgmt_unregister's smStaVifRetired), and test_vif_removal_table removes
+it from each state itself. test_saved_host_request_table drives the host's
+SM_CONNECT_ABORT_REQ and SM_DISCONNECT_REQ in every state.
 """
 
 from pathlib import Path
@@ -398,17 +403,63 @@ take(family, reply)
 doAssert failures.len == 0 and state == SmIdleState
 if family == SmAddingChanState: doAssert deletions == 1 and stations[0].valid == 0
 ''',
-    # SCAN-N3: the STA VIF is removed while SCANU works on the request.
+    # SCAN-N3: the STA VIF is removed (vif_mgmt_unregister) while the
+    # replier works on the request: the attempt ends at the removal,
+    # unreported, and the answer changes nothing. "vif_readded": a STA VIF
+    # is registered again at the same index before the replier runs;
+    # nothing is applied to it.
     "vif_gone": r'''
-vifs[conn.vifIdx] = Vif(vifIdx: 127, vifType: 4, staIdx: 0xFF)
+allocateAttempt()
+removeVif()
+checkFamily("removed")
+doAssert failures.len == 0 and state == SmIdleState
 found = true
-take(family, answer(family, request, false))
-doAssert failures.len == 1 and state == SmIdleState
+if family == SmAddingChanState:
+  doAssert completeRegistration(request) == nil and registrations == 0
+else:
+  take(family, answer(family, request, false))
+doAssert failures.len == 0 and state == SmIdleState
+''',
+    "vif_readded": r'''
+allocateAttempt()
+removeVif(readded = true)
+checkFamily("re-added")
+let sentBefore = sent.len
+found = true
+if family == SmAddingChanState:
+  doAssert completeRegistration(request) == nil and registrations == 0
+else:
+  take(family, answer(family, request, false))
+doAssert failures.len == 0 and state == SmIdleState
+doAssert sent.len == sentBefore, "a request went out for the re-added VIF"
 ''',
 }
 
+# The replier answered before the STA VIF was removed (and, "readded", a STA
+# VIF registered again at the index): the answer comes to an idle SM and
+# changes nothing. The station MM registered for it is on no VIF's list
+# after the removal, so MM's delete (smStaAddRetire) is done and leaves it
+# valid instead of being retried for ever (test_wifi_station_lifetime runs
+# the real mmStaDelTry).
+ANSWERED_THEN_REMOVED = r'''
+found = true
+let reply = answer(family, request, false)
+allocateAttempt()
+removeVif(readded = READDED)
+checkFamily("removed")
+doAssert failures.len == 0 and state == SmIdleState
+let sentBefore = sent.len
+take(family, reply)
+doAssert failures.len == 0 and state == SmIdleState
+doAssert sent.len == sentBefore, "a stale answer sent a request"
+if family == SmAddingChanState:
+  doAssert unlistedDeletes == 1 and deletions == 0 and stations[0].valid == 1
+'''
+FAMILY_FATES["answered_vif_gone"] = ANSWERED_THEN_REMOVED.replace("READDED", "false")
+FAMILY_FATES["answered_vif_readded"] = ANSWERED_THEN_REMOVED.replace("READDED", "true")
+
 FAMILY_ROWS = [(family, fate) for family in (1, 2, 3) for fate in FAMILY_FATES
-               if not (family == 3 and fate in ("abort", "vif_gone"))]
+               if not (family == 3 and fate == "abort")]
 
 
 def family_source() -> str:
@@ -525,21 +576,28 @@ proc answerAt(step: int): pointer = takeReply(step)
 '''
 
 SERIES_ROWS = ([("bss", step, fate) for step in range(9) for fate in SERIES_FATES]
-               + [("bss", step, "vif_retired") for step in range(9)]
+               + [("bss", step, fate) for step in range(9) for fate in ("vif_retired", "vif_readded")]
                + [("activation", step, fate) for step in range(3) for fate in SERIES_FATES]
                + [("activation", step, "station_deleted") for step in range(3)]
-               + [("activation", step, "vif_retired") for step in range(3)])
+               + [("activation", step, fate) for step in range(3)
+                  for fate in ("vif_retired", "vif_readded")])
 
-# The STA VIF is retired with request `step` queued for its replier, which
-# answers it unapplied (smStaleRequest); SM ends the attempt at the answer
-# and sends nothing more.
+# The STA VIF is removed (vif_mgmt_unregister) with request `step` queued
+# for its replier. The removal ends the attempt at once, unreported, and
+# clears the VIF's ME mask bits; the replier drops the request SM no longer
+# waits on, also when a STA VIF was registered again at the same index.
 RETIRED = r'''
 advanceTo(step)
-let unapplied = (applied.len, me.psDisableMask, me.activeMask)
+let unapplied = applied.len
+allocateAttempt()
 {retire}
+check("removed")
+doAssert state == SmIdleState and smOwn.answer == nil and smOwn.request == nil
+{readd}
 run("retired")
-doAssert (applied.len, me.psDisableMask, me.activeMask) == unapplied,
-  "a request was applied to the retired VIF"
+doAssert applied.len == unapplied, "a request was applied to the removed VIF"
+doAssert me.psDisableMask == 0 and me.activeMask == 0, "the removed VIF kept an ME mask bit"
+doAssert failures.len == 0 and state == SmIdleState
 '''
 
 
@@ -548,15 +606,17 @@ def series_program(family: str, step: int, fate: str) -> str:
         from test_wifi_bss_confirmations import source as bss_source
         code = bss_source() + BSS_SERIES + f"const fate = \"{fate}\"\nlet step = {step}\n"
         code += "begin()\ncheck(\"start\")\n"
-        if fate == "vif_retired":
-            code += RETIRED.replace("{retire}", "vif.vifType = 2")
+        if fate in ["vif_retired", "vif_readded"]:
+            code += RETIRED.replace("{retire}", "retireVif()").replace(
+                "{readd}", "vif.vifType = 0" if fate == "vif_readded" else "")
         else:
             code += SERIES_FATES[fate]
         code += r'''
 if fate in ["answered", "tx_reset", "duplicate"]:
   doAssert authStarts == 1 and state == 6 and smRequests.len == 9
+elif fate in ["vif_retired", "vif_readded"]:
+  doAssert authStarts == 0 and smRequests.len == step + 1
 else:
-  if fate == "vif_retired": doAssert failures == @[(14'u16, 0xFFFF'u16)]
   doAssert authStarts == 0 and state == SmDisconnectingState
   doAssert smRequests.len == step + 1, "a request was sent after the attempt ended"
   endAttempt()
@@ -569,15 +629,18 @@ assertQuiet()
         if fate == "station_deleted":
             # The AP station is deleted under the activation: reported once.
             code += "advanceTo(step)\ninc stationEpochs[2]\nrun(\"deleted\")\n"
-        elif fate == "vif_retired":
-            code += RETIRED.replace("{retire}", "vifs[1].vifType = 4")
+        elif fate in ["vif_retired", "vif_readded"]:
+            code += RETIRED.replace("{retire}", "retireVif(1)").replace(
+                "{readd}", "vifs[1] = Vif(vifIdx: 1, staIdx: 2)" if fate == "vif_readded" else "")
         else:
             code += SERIES_FATES[fate]
         code += r'''
 if fate in ["answered", "tx_reset", "duplicate"]:
   doAssert connected == 1 and failures.len == 0 and stationReady == 1
-elif fate in ["station_deleted", "vif_retired"]:
+elif fate == "station_deleted":
   doAssert connected == 0 and failures == @[(5'u16, 0xFFFF'u16)]
+elif fate in ["vif_retired", "vif_readded"]:
+  doAssert connected == 0 and failures.len == 0 and state == SmIdleState
 else:
   doAssert connected == 0 and failures.len == 1 and state == SmDisconnectingState
 doAssert not smActivationLive() and smOwn.answer == nil and meState == MeIdleState
@@ -681,12 +744,17 @@ CLEANUP_FATES = {
     "dropped": "start()\nuntilReplier(step)\nlet before = effects()\nsmInit()\nrunCleanup(\"dropped\")\nquiet()\n"
                "doAssert effects() == before, \"a request SM no longer waits on was applied\"\n"
                "doAssert commands.len == step + 1\n",
-    # The VIF is removed before the replier ran (its station list emptied,
-    # its station left valid): every request from here on, the station
-    # delete included, is answered unapplied and the cleanup ends.
-    "vif_retired": "start()\nuntilReplier(step)\nlet before = effects()\nretireVif(0)\n"
+    # The VIF is removed (vif_mgmt_unregister) before the replier ran: the
+    # removal ends the cleanup at once and clears the VIF's ME mask bits;
+    # the request in flight is dropped and nothing more is sent. Its station
+    # is left valid, as the removal leaves it.
+    "vif_retired": "start()\nuntilReplier(step)\nlet before = (vifs[0].state, removed.len)\n"
+                   "retireVif(0)\ncheckCleanup(\"removed\")\n"
+                   "doAssert smState == SmIdleState and smOwn.teardown == tdNone\n"
                    "runCleanup(\"retired\")\nquiet()\n"
-                   "doAssert effects() == before, \"a request was applied to the retired VIF\"\n",
+                   "doAssert (vifs[0].state, removed.len) == before, \"a request was applied to the removed VIF\"\n"
+                   "doAssert (me.psDisableMask and 1) == 0 and (me.activeMask and 1) == 0\n"
+                   "doAssert commands.len == step + 1, \"a request was sent after the removal\"\n",
     # The step's messages cannot be allocated: the retry timer runs it again
     # until memory returns; no step is skipped.
     "no_memory": "stall(proc(on: bool) = failEveryAllocation = on)\ncompleted()\n",
@@ -782,9 +850,13 @@ DEFERRED_FATES = {
     "sm_init": "discard smGo(0)\ncheckDeferred(\"sm_init\")\n"
                "doAssert live.len == 0 and chan.deferredMsg == nil\npublish()\ndispatch(\"stale\")\n"
                "doAssert sent.len == 0 and endings.len == 0\n",
-    # The STA VIF is retired before the request comes back: the attempt ends.
-    "vif_retired": "publish()\nvifs[1].vifType = 4\ndispatch(\"retired\")\n"
-                   "doAssert sent.len == 0 and endings == @[(11'u16, 0xFFFF'u16)]\n",
+    # The STA VIF is removed (vif_mgmt_unregister), with the request parked
+    # or already sent back: the attempt ends at the removal, unreported, and
+    # nothing is sent.
+    "vif_retired_parked": "removeVif()\ncheckDeferred(\"removed\")\npublish()\ndispatch(\"retired\")\n"
+                          "doAssert sent.len == 0 and endings.len == 0 and currentState == 0\n",
+    "vif_retired_queued": "publish()\nremoveVif()\ncheckDeferred(\"removed\")\ndispatch(\"retired\")\n"
+                          "doAssert sent.len == 0 and endings.len == 0 and currentState == 0\n",
     # The request delivered twice sends one frame.
     "duplicate": "publish()\nlet payload = queue[0]\nqueue.delete(0)\n"
                  "discard sm_connect_auth_assoc_req(payload)\ncheckDeferred(\"first\")\n"
@@ -819,3 +891,126 @@ def test_deferred_request_has_one_exit() -> None:
     for path in _wifi_sources():
         code = _code(path)
         assert "smGo(SmAuthStartingState" not in code and "smGo(SmAssociatingState" not in code, path
+
+
+# --------------------------------------------------------------------------
+# The removal of the STA VIF, in every state (stage 9g, SCAN-N3)
+# --------------------------------------------------------------------------
+#
+# vif_mgmt_unregister tells SM when it retires a STA VIF (smStaVifRetired).
+# The tables above remove the VIF in states 1 to 9 and 10 (cleanup) with a
+# request in flight; the rows below use the teardown harness for the states
+# themselves: an attempt in each of states 1 to 9, a link in state 0 and the
+# deauthentication wait of state 10. In every one SM ends what it does on the
+# VIF at once, unreported (smAbandon), frees what it holds, keeps no timer
+# and accepts none of the stamps it handed out.
+
+REMOVAL = r'''
+retireVif(0)        # vif_mgmt_unregister retires VIF 0 and tells SM,
+vifs[0].vifType = 4 # its entry freed.
+check("removed")
+doAssert smState == SmIdleState and smOwn.teardown == tdNone and not smGuardArmed
+doAssert sm.connectInfo == nil and sm.connectIndMsg == nil
+quiesce()
+doAssert report() == 0, "the removal was reported"
+doAssert allocated.len == 0 and smOwn.answer == nil
+let quiet = (smState, notifications.len, controlReplies.len, smOwn.teardown)
+for stamp in stamps & pending:
+  for callback in [cast[pointer](sm_disconnect_deauth_cfm),
+                   cast[pointer](sm_connect_abort_deauth_cfm),
+                   cast[pointer](sm_supplicant_deauth_cfm)]:
+    cast[proc(p: pointer; status: uint32) {.cdecl.}](callback)(stamp, 0x40000000'u32)
+  smDeauthGuardExpired(stamp)
+doAssert (smState, notifications.len, controlReplies.len, smOwn.teardown) == quiet
+'''
+
+REMOVAL_ROWS = [(state, "attempt") for state in range(1, 10)] + [(0, "link"), (10, "deauth_wait")]
+
+
+@pytest.mark.parametrize("state,holding", REMOVAL_ROWS, ids=[f"{s}-{h}" for s, h in REMOVAL_ROWS])
+def test_vif_removal_table(tmp_path: Path, state: int, holding: str) -> None:
+    body = {"attempt": f"start({state}'u16, true)\n",
+            "link": "start(0'u16, false)\n",
+            "deauth_wait": "start(9'u16, true)\nframe(cast[pointer](sm_connect_abort_deauth_cfm))\n"
+                           "doAssert smOwn.teardown == tdDeauthWait\n"}[holding]
+    run_program(tmp_path, "checked", source() + body + REMOVAL)
+
+
+def test_vif_removal_is_one_signal() -> None:
+    """vif_mgmt_unregister is the only caller of smStaVifRetired, from a defer
+    placed at the commit of the removal, so every return after it signals.
+    The per-request VIF checks it replaces are gone."""
+    callers = [path.name for path in _wifi_sources() if "smStaVifRetired(" in _code(path)]
+    assert sorted(callers) == ["station_sm.nim", "vif_management.nim"], callers
+    unregister = procedure((FW / "vif_management.nim").read_text(), "vif_mgmt_unregister")
+    defer = unregister.index("  defer:\n    if vifType == VIF_TYPE_STA:")
+    assert defer < unregister.index("smStaVifRetired(vifIdx)") < unregister.index(
+        "rxInvalidateQuiescentVif(vifIdx, selected)")
+    assert unregister.index("co_list_extract(addr env.activeList") < defer
+    code = "".join(_code(path) for path in _wifi_sources())
+    for gone in ("smAttemptStaVif", "smRequestVifLive", "smCleanupVifLive", "smTeardownUnclaimed",
+                 "SmStaRequestIdentity", "smAbortCurrent"):
+        assert gone not in code, gone
+    scan = (FW / "scan_station_ap_me.nim").read_text()
+    assert "smAbandon()" in procedure(scan, "sm_init")
+    assert "smAbandon()" in procedure((FW / "kernel_mac_channel.nim").read_text(), "ke_flush")
+
+
+# --------------------------------------------------------------------------
+# Saved host requests (stage 9h)
+# --------------------------------------------------------------------------
+#
+# The harness is test_wifi_station_abort's: the real sm_connect_abort_req_handler,
+# sm_disconnect_req_handler, station_abort.nim and the message allocator over
+# the deferred auth/assoc model. In every SM state the abort is answered in
+# place, exactly once, and never saved: it acts on the attempt live then. The
+# disconnect is saved while SM is busy and acts, once SM is idle, only on the
+# STA VIF generation it was sent for: not after the VIF was removed and added
+# again, whether that happened before its first dispatch or while it was
+# saved.
+
+HOST_REQUESTS = r'''
+proc clearRecords() =
+  replies.setLen(0)
+  outcomes.setLen(0)
+  deauths = 0
+  disconnects = 0
+  disconnectReplies = 0
+  env.cancelRequested = 0
+clearRecords()
+currentState = state
+let abort = makeAbort()
+doAssert deliverAbort(abort) == KeMsgNoFree and replies.len == 1
+doAssert outcomes.len == int(state in [3'u16, 4, 5, 7])
+doAssert deauths == int(state in [6'u16, 8, 9])
+doAssert replies[0] == (if state == 1: 1'u8 else: 0'u8)
+doAssert (env.cancelRequested == 1) == (state in [1'u16, 2])
+reset()
+clearRecords()
+currentState = state
+let disconnect = makeDisconnect()
+if fate == "replaced_before_dispatch": inc rxVifEpochs[1]
+var outcome = deliverDisconnect(disconnect)
+doAssert (outcome == KeMsgSaved) == (state != SmIdleState and fate != "replaced_before_dispatch")
+if fate == "replaced_while_saved": inc rxVifEpochs[1]
+if outcome == KeMsgSaved:
+  currentState = SmIdleState
+  outcome = deliverDisconnect(disconnect)
+doAssert outcome == KeMsgNoFree and disconnectReplies == 1
+let acted = fate == "live" or (fate == "replaced_while_saved" and state == SmIdleState)
+doAssert disconnects == int(acted), "disconnect acted on another VIF generation"
+'''
+
+HOST_FATES = ("live", "replaced_before_dispatch", "replaced_while_saved")
+HOST_ROWS = [(state, fate) for state in range(11) for fate in HOST_FATES]
+
+
+@pytest.mark.parametrize("state,fate", HOST_ROWS, ids=[f"{s}-{f}" for s, f in HOST_ROWS])
+def test_saved_host_request_table(tmp_path: Path, state: int, fate: str) -> None:
+    from test_wifi_deferred_auth import run_nim
+    from test_wifi_station_abort import program_source as abort_source
+    run_nim(tmp_path, abort_source() + f"""
+let state = {state}'u16
+let fate = "{fate}"
+reset()
+""" + HOST_REQUESTS + "finish()\ndoAssert smDisconnectStamps == nil and live.len == 0\n")

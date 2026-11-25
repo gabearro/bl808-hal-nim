@@ -869,7 +869,7 @@ when defined(bl808WifiDiagWarmScan):
   var nimFwDbgWarmScanSubmitStatus* {.wifiCtrl.}: cint
   type WarmAssocFailureStage = enum
     warmAssocNoLocalFailure, warmAssocRequestBuild, warmAssocSecurityTail,
-    warmAssocRequestIeCopy, warmAssocAid, warmAssocPrepare, warmAssocStart,
+    warmAssocRequestIeCopy, warmAssocAid,
     warmAssocComeback, warmAssocResponseIeCopy, warmAssocRateInit,
     warmAssocPeerIndication, warmAssocActivation
   var nimFwDbgWarmAssocFailure* {.wifiCtrl.}: WarmAssocFailureStage

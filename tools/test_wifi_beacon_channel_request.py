@@ -340,10 +340,10 @@ proc ke_evt_set(bits: uint32) =
   if onSend != nil: onSend()
   if sendRaises: raise newException(ValueError, "notifier callback")
 '''
-    for name in ("mmTimCaptureMessage", "smAbortCaptureMessage", "chanUpdateCaptureMessage",
+    for name in ("mmTimCaptureMessage", "smDisconnectStamp", "chanUpdateCaptureMessage",
                  "mmTimForget", "mmConnLossForget", "rxMgtForget",
                  "chanUpdateForget", "smRspTimerForget",
-                 "smAbortForget", "chanBcnRequestForget"):
+                 "smDisconnectForget", "chanBcnRequestForget"):
         support += f"proc {name}(p: pointer) = discard\n"
     support += procedure(kernel, "co_list_push_back")
     code = code.replace(procedure(code, "ke_msg_send"), support + procedure(kernel, "ke_msg_send"), 1)

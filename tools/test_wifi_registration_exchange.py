@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from test_wifi_disconnect_tx import FW, procedure
+from test_wifi_disconnect_tx import FW, procedure, station_sm_source
 from test_wifi_join_registration import submission_source
 from test_wifi_message_allocation import run_program
 
@@ -30,12 +30,13 @@ const
   MmStaAddCfmPayloadSize = 3'u32
 type Station = object
   valid, instNbr, infoIdx: uint8
+  listed: bool  ## on its VIF's station list (vif_mgmt_unregister clears it)
   supportedRates: array[13, uint8]
   capabilityFlags: uint32
   vhtCaps: array[32, uint8]
 var
   stations: array[5, Station]
-  registrations, deletions, bssCalls, htCalls: int
+  registrations, deletions, unlistedDeletes, bssCalls, htCalls: int
   registerStatus: uint8
   onRegister, onRegistered, onHt, onBss, onDelete: proc()
   nimFwDbgPreauthStaCfm, nimFwDbgPreauthStaCfmMeta: uint32
@@ -48,6 +49,11 @@ proc staDeleteIsCurrent(index: uint8; epoch: uint32): bool =
   index < 5 and stations[index].valid != 0 and stationEpochs[index] == epoch
 proc mm_sta_del(index: uint8) =
   doAssert index < 5 and stations[index].valid != 0
+  if not stations[index].listed:
+    # A station of a removed VIF is on no list: MM's delete is done and
+    # leaves it valid (mmStaDelTry; test_wifi_station_lifetime).
+    inc unlistedDeletes
+    return
   inc deletions
   let vif = stations[index].instNbr
   stations[index].valid = 0
@@ -63,7 +69,7 @@ proc mm_sta_add(request: pointer; logical, hardware: ptr uint8): uint8 =
   let vif = cast[ptr MmStaAddReqPayload](request).vifIdx
   for index in 0'u8 ..< 5:
     if stations[index].valid == 0:
-      stations[index] = Station(valid: 1, instNbr: vif, infoIdx: index)
+      stations[index] = Station(valid: 1, instNbr: vif, infoIdx: index, listed: true)
       vifs[vif].staIdx = index
       logical[] = index
       hardware[] = index + 8
@@ -83,7 +89,29 @@ proc me_set_sta_ht_vht_param(station, caps: pointer) =
     support += (FW / "station_registration.nim").read_text()
     tasks = (FW / "task_handlers.nim").read_text()
     code += support + procedure(tasks, "mm_sta_add_req_handler") + procedure(tasks, "mm_sta_add_cfm_handler")
+    code += station_sm_source("smAbandon", "smStaVifRetired", record=False)
     return code + r'''
+proc parkedMessage(size: int): pointer =
+  ## A message SM keeps, tracked as the fixture's allocator tracks one.
+  let header = cast[ptr Header](alloc0(sizeof(Header) + size))
+  live.add(header)
+  cast[pointer](cast[uint](header) + sizeof(Header).uint)
+proc allocateAttempt() =
+  ## The attempt's SM_CONNECT_REQ and SM_CONNECT_IND as allocated messages,
+  ## which smAbandon frees.
+  let info = parkedMessage(sizeof(ConnectInfoView))
+  cast[ptr ConnectInfoView](info)[] = connectInfoView(sm.connectInfo)[]
+  sm.connectInfo = info
+  sm.connectIndMsg = parkedMessage(4)
+proc removeVif(readded = false) =
+  ## vif_mgmt_unregister frees the attempt's STA VIF and tells SM; the host
+  ## may register a STA VIF at the same index again.
+  let index = conn.vifIdx
+  vifs[index] = Vif(vifIdx: 127, vifType: 4, staIdx: 0xFF)
+  for station in stations.mitems:
+    if station.valid != 0 and station.instNbr == index: station.listed = false
+  smStaVifRetired(index)
+  if readded: vifs[index] = Vif(vifIdx: index, staIdx: 0xFF)
 proc issue(): pointer =
   let reply = ready()
   doAssert scanu_join_cfm_handler(reply) == 0
@@ -109,6 +137,7 @@ proc resetExchange() =
   stations = default(typeof(stations))
   registrations = 0
   deletions = 0
+  unlistedDeletes = 0
   bssCalls = 0
   htCalls = 0
   registerStatus = 0

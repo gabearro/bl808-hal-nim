@@ -340,11 +340,6 @@ when not declared(ke_msg_free):
 when not declared(smDeferredCancel):
   proc smDeferredCancel() = discard
 '''
-# smRequestVifLive asks the cleanup about its VIF in state 10.
-SM_CLEANUP_VIF = r'''
-when not declared(smCleanupVifLive):
-  proc smCleanupVifLive(): bool = false
-'''
 SM_SA_QUERY = r'''
 when not declared(smSaQueryEnd):
   proc smSaQueryEnd() = discard
@@ -354,11 +349,13 @@ when not declared(smActivationCancel):
   proc smActivationCancel() = discard
 when not declared(smBssCancel):
   proc smBssCancel() = discard
+when not declared(smCleanupCancel):
+  proc smCleanupCancel() = discard
 when not declared(ke_msg_free):
-  proc ke_msg_free(p: pointer) = doAssert false, "an unclaimed teardown released a message"
+  proc ke_msg_free(p: pointer) = doAssert false, "an abandoned attempt released a message"
 '''
 
-SM_TEARDOWN = ("smGo", "smDeauthConfirmed", "smDeauthVif", "smTeardownUnclaimed",
+SM_TEARDOWN = ("smGo", "smDeauthConfirmed", "smDeauthVif", "smAbandon",
                "smTeardown", "smDeauthGuardExpired", "smDeauthWait")
 
 
@@ -366,7 +363,7 @@ def station_sm_source(*names: str, record: bool = True) -> str:
     """op.nim, station_sm.nim's record and its named procs (default: smGo).
 
     The fixture supplies TASK_SM, the SM states, ke_state_set and, for the
-    teardown procs, smCleanupBegin and what smTeardownUnclaimed releases."""
+    teardown procs, smCleanupBegin and what smAbandon releases."""
     names = names or ("smGo",)
     sm = (FW / "station_sm.nim").read_text().replace(" {.wifiCtrl.}", "")
     code = ""
@@ -374,13 +371,11 @@ def station_sm_source(*names: str, record: bool = True) -> str:
         code += (FW / "op.nim").read_text() + SM_TIMER + sm[sm.index("type\n"):sm.index("proc smGo(")]
     if "smGo" in names:
         code += SM_FREE
-    if "smRequestVifLive" in names:
-        code += SM_CLEANUP_VIF
     if "smDeauthWait" in names:
         code += SM_WAIT
     if "smDeauthWait" in names or "smTeardown" in names:
         code += SM_SA_QUERY
-    if "smTeardownUnclaimed" in names:
+    if "smAbandon" in names:
         code += SM_RELEASE
     return code + "".join(procedure(sm, name) for name in names)
 

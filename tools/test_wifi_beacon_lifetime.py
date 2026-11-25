@@ -149,6 +149,12 @@ var
   haltAllowed = true
   mac = [2'u8, 3, 4, 5, 6, 7]
 proc vifChannelForIdx(i: uint8): ptr Vif = addr vifs[i]
+# vif_mgmt_unregister's retirement of a STA VIF: ME's mask bits and SM.
+var
+  meMasks: tuple[activeMask, psDisableMask: uint32]
+  retiredStaVifs: seq[tuple[vif, vifTypeThen: uint8]]
+proc meEnvView(): ptr typeof(meMasks) = addr meMasks
+proc smStaVifRetired(vifIdx: uint8) = retiredStaVifs.add((vifIdx, vifs[vifIdx].vifType))
 proc txlResetting(): bool = false
 proc txlHaltVifQueues(vif: uint8; selected: var uint8): bool =
   selected = 0

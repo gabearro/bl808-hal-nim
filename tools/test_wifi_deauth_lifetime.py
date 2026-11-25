@@ -41,8 +41,6 @@ proc failed(p: pointer; status, reason: uint16) {.cdecl.} =
   failureStatus = status
 proc smCleanupConfirmed() = doAssert false, "no cleanup runs here"
 proc sm_auth_start() = inc authStarts
-var batchDone = true
-proc smBssNext(): bool = batchDone  # station_bss.nim: the STA VIF is still there
 '''
 
 TEARDOWN = r'''
@@ -295,16 +293,6 @@ for pending in 0'u8..1:
   doAssert me_set_active_cfm_handler_sm(addr answer) == 0
   doAssert pushes == pending.int and authStarts == 1 and sm.deauthPending == 0
   doAssert smOwn.answer == nil
-# The batch ended the attempt instead (its STA VIF is gone): no deauthentication
-# and no authentication.
-prepare(1)
-sm.deauthPending = 1
-batchDone = false
-var answer: uint8
-smOwn.answer = addr answer
-doAssert me_set_active_cfm_handler_sm(addr answer) == 0
-doAssert pushes == 0 and authStarts == 0 and sm.deauthPending == 1
-batchDone = true
 ''',
     # Any other ME_SET_ACTIVE_CFM (stale, or none) changes nothing.
     "active_not_the_answer": r'''

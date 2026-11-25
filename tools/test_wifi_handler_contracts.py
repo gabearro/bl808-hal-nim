@@ -13,7 +13,7 @@ from test_wifi_message_allocation import run_program
 def owned_disconnect_source() -> str:
     """The real sm_disconnect_process and smTeardown over the fixture's smCleanupBegin."""
     scan = (FW / "scan_station_ap_me.nim").read_text()
-    return (station_sm_source("smGo", "smTeardownUnclaimed", "smTeardown")
+    return (station_sm_source("smGo", "smAbandon", "smTeardown")
             + procedure(scan, "sm_disconnect_process"))
 
 

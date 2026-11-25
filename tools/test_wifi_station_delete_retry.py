@@ -45,7 +45,6 @@ proc staDeleteEpoch(index: uint8): uint32 = stationEpochs[index]
 proc txlResetting(): bool = false
 proc smStaleRequest(p: pointer): bool = false
 proc smAwaits(p: pointer): bool = true  # SM waits on its delete
-proc smRequestVifLive(): bool = true
 proc keMsgHdrFromPayload(p: pointer): ptr KeMsgHdr =
   cast[ptr KeMsgHdr](cast[uint](p) - offsetof(Request, payload).uint)
 proc mmStaDelReqView(p: pointer): ptr Payload = cast[ptr Payload](p)

@@ -7049,10 +7049,11 @@ nothing is carried across `bl_reset_evt`'s `txl_reset`.
 
 Three deliberate differences from the archive:
 
-- `sm_init` clears the parked connect indication. Pinned `sm_init` leaves
-  `sm_env[4]` set and `sm_connect_req_handler+0x110` then asserts; the
-  port had answered every later connect with busy. The parked messages
-  are still not freed there.
+- `sm_init` drops the attempt and frees the parked `SM_CONNECT_REQ` and
+  `SM_CONNECT_IND` (`smAbandon`). Pinned `sm_init` leaves `sm_env[4]` set
+  and `sm_connect_req_handler+0x110` then asserts; the port had answered
+  every later connect with busy, and then cleared both pointers without
+  freeing them (SMCONN-F7).
 - `MM_SCAN_CHANNEL_END_EARLY` has no payload. Pinned
   `scan_task.o:mm_scan_channel_end_early_handler` asserts at line 186 when
   TASK_SCAN is idle and otherwise ends whichever dwell is running. The
@@ -7274,9 +7275,9 @@ below) ends with `smGo(SmIdleState)`. The disconnect handoff (`SmDisconnectHando
   claimed the link (blob: before `sm_connection_tlv_set`). The handoff had
   carried the loss's TX reset epoch. A loss queued across a channel switch
   was dropped with state 10 already set, which left SM there (PSK-2).
-- If the cleanup finds no STA VIF (the slot was re-registered as another
-  type), the attempt ends unreported and SM goes idle (`smTeardownUnclaimed`).
-  The blob indexes the VIF regardless.
+- If the cleanup finds no STA VIF (an FT attempt admitted on another
+  interface type), the attempt ends unreported and SM goes idle
+  (`smAbandon`). The blob indexes the VIF regardless.
 - `me_set_active_cfm_handler_sm` no longer has the blob's state-10 "set
   idle" branch. It was unreachable: only a state-4 batch reply gets that far,
   and the cleanup goes idle by itself.
@@ -7397,10 +7398,9 @@ archive:
   `sm_connect_ind(15)`. The blob's `mm_sta_add_cfm_handler` asserts state 3
   and uses the station.
 - `sm_scan_bss` and `sm_join_bss` end the attempt (`sm_connect_ind(12)`)
-  when its STA VIF has been removed or retyped; the blob sends the request
-  anyway. Before, SCANU's completion was dropped with no record when the
-  VIF epoch changed, and SM stayed in state 1 or 2 (SCAN-N3). With no STA
-  VIF left, the teardown ends the attempt unreported (`smTeardownUnclaimed`).
+  when its VIF is not a STA VIF (an FT request is admitted on any type);
+  the blob sends the request anyway. The removal of the STA VIF ends the
+  attempt in every state (see "SM and the removal of its VIF" below).
 
 The join links the channel context to the STA VIF before it sends
 `MM_STA_ADD_REQ`, as the blob does, and the VIF holds it from then on: a
@@ -7448,43 +7448,33 @@ memory. Differences from the archive:
   before entering state 4, as the blob allocates them; a failure ends the
   attempt with `sm_connect_ind(14)` (the blob halts). Each request's reply
   is allocated when it is sent; a failure there also ends the attempt (14).
-- `sm_set_bss_param` ends the attempt (14) when the attempt's VIF is no
-  longer a STA VIF. The port had returned silently and left SM in state 3;
-  the blob uses the slot regardless. The batch checks the VIF again at every
-  answer, the answer to `ME_SET_ACTIVE_REQ` before authentication included
-  (`smBssNext`, 14), and the activation at each answer, with its AP station
-  (5). The batch does not watch the AP station, as in the blob; no path is
-  known that deletes it in state 4, where `MM_SET_BEACON_INT_REQ` would then
-  index `sta_info_tab` with 0xFF, as the blob does.
+- `sm_set_bss_param` no longer returns silently: the port had returned and
+  left SM in state 3 when it found no STA VIF. It runs only for SM's live
+  registration answer, and the removal of the STA VIF ends the attempt
+  first, so it checks neither (`assert` documents it). The activation checks
+  its AP station at each answer (5). The batch does not watch the AP
+  station, as in the blob. `MM_SET_BEACON_INT_REQ` for a STA VIF without an
+  AP station writes nothing; the blob writes `sta_info_tab[0xFF]`.
 - `mm_hw_config_handler`, `mm_set_ps_options_req_handler`,
   `me_set_active_req_handler` and `me_set_ps_disable_req_handler` check
-  SM's requests at entry (`smStaleRequest`). One SM no longer waits on is
-  dropped. One SM still waits on whose STA VIF has been retired (the slot is
-  free or holds another interface type) is answered there with SM's
-  reserved reply and not applied. A request queued before the retirement
-  therefore changes nothing: no field of the freed slot, no MAC BSSID
-  register (`MM_SET_BSSID_REQ` while one VIF is active), no AP beacon
-  interval (`MM_SET_BEACON_INT_REQ` on a slot that is no longer a STA), no
-  assert 1680 (`MM_SET_PS_OPTIONS_REQ`) and no ME mask bit. SM then ends the
-  attempt at that answer. The blob applies any request to whatever the slot holds; the
+  SM's requests at entry (`smStaleRequest`): one SM no longer waits on is
+  dropped unapplied. Since the removal of the STA VIF ends SM's wait
+  (`smStaVifRetired`), a request queued before the removal changes
+  nothing: no field of the freed slot or of a VIF added again at the same
+  index, no MAC BSSID register, no AP beacon interval, no assert 1680 and no
+  ME mask bit. The blob applies any request to whatever the slot holds; the
   port's former admission checks dropped it unanswered, which left SM in
   state 4 or 9. A request they accept is always answered. The admission
   re-checks inside these handlers and in ME's control procs are removed:
   nothing they call can run SM code (the firmware step is not reentered).
-  The check compares the VIF's index and type only: a STA VIF removed and
-  added again at the same index passes it (the old check's VIF epoch caught
-  that).
 - When the attempt ends, an ME exchange already forwarded to MM is not
   cancelled: ME and MM finish it, ME goes idle, and SM ignores the answer.
   When a STA VIF is left to clean up, the teardown's own
   `ME_SET_PS_DISABLE_REQ(0)` and `ME_SET_ACTIVE_REQ(0)`, saved behind it,
-  undo the mask bits. When the attempt ends because its STA VIF was retired
-  while the forward was in flight, no cleanup runs (`smTeardownUnclaimed`)
-  and the forward leaves that VIF's `psDisableMask` or `activeMask` bit set.
-  The port had cancelled the exchange (`meControlReset`) and reverted the bit
-  itself (`smBssCancelControl`); the blob has no cancel. Clearing the bits
-  of a retired VIF is not done yet: it belongs with `vif_mgmt_unregister`
-  telling SM that the attempt's VIF is gone.
+  undo the mask bits. When the STA VIF is removed, `vif_mgmt_unregister`
+  clears its bits itself. The port had cancelled the exchange
+  (`meControlReset`) and reverted the bit (`smBssCancelControl`); the blob
+  has no cancel.
 - Pinned `mm_set_vif_state_cfm_handler` sends `MM_SET_PS_OPTIONS_REQ` and
   `ME_SET_PS_DISABLE_REQ` without waiting and reports the connection at
   once. The port waits for each answer and reports after the last, as
@@ -7496,9 +7486,7 @@ memory. Differences from the archive:
   (`smActivationLive`). A TX reset, a VIF epoch or the SM TX serial no
   longer end it, and its failure is reported (SMCONN-F6). A station
   deleted under it ends the attempt with `sm_connect_ind(5)` at the next
-  answer; before, the activation was dropped unreported. In state 4 or 9,
-  an attempt whose STA VIF was retired calls `sm_connect_ind` too, but with
-  no STA VIF left the teardown ends it unreported (`smTeardownUnclaimed`).
+  answer; before, the activation was dropped unreported.
 - The teardown withdraws a TX peer the activation had published and closes
   its control port (`smActivationCancel`) whenever the station is still
   registered; before, the port was closed only on the activation's own
@@ -7511,9 +7499,8 @@ memory. Differences from the archive:
   pushing the deauthentication `sm_init` asked for. A TX reset inside that
   push used to stop the batch before authentication and leave SM in
   state 4.
-- `mm_sta_add_req_handler` answers SM's request in place with status 1,
-  registering nothing, when its VIF is no longer the attempt's STA VIF
-  (`smAttemptStaVif`); SM ends the attempt with `sm_connect_ind(15)`. The
+- `mm_sta_add_req_handler` registers nothing for a request SM no longer
+  waits on, which includes one sent before its STA VIF was removed. The
   blob registers the station on whatever the slot holds.
 
 Removed: the BSS and activation message tags, their lists and serials, the
@@ -7569,26 +7556,15 @@ the archive:
   by the main loop.
 - The cleanup's requests go through the same entry check as those of
   states 4 and 9 (`smStaleRequest`): one SM no longer waits on (after
-  `sm_init`) is dropped; one whose VIF has been retired since the cleanup
-  began (VIF epoch) is answered unapplied, and the cleanup goes on and
-  reports. `MM_STA_DEL_REQ`, answered in place, is checked at
-  `mm_sta_del_req_handler` entry: dropped when SM no longer waits on it,
-  and for a retired VIF answered with its station rewritten to 0xFF.
-  `vif_mgmt_unregister` empties the VIF's station list, so
-  `staMgmtBeginRemoval` can no longer find the AP station and the delete
-  would be retried every 100 ms for ever, leaving SM in state 10. The
-  station is left valid, as it was when the port cancelled the cleanup
-  (retiring a removed VIF's stations belongs with `vif_mgmt_unregister`
-  telling SM). The cleanup names the station only while it is the one it
-  claimed (station epoch and VIF); a queued delete whose station is deleted
+  `sm_init` or the removal of the VIF) is dropped. `MM_STA_DEL_REQ`,
+  answered in place, is checked at `mm_sta_del_req_handler` entry the same
+  way. The cleanup names the station only while it is the one it claimed
+  (station epoch and VIF); a queued delete whose station is deleted
   meanwhile already names none (`staDeleteCancelQueued`, as for any
   requester). The blob applies every request to whatever the slot holds.
   The port had dropped the request unanswered and then cancelled the
   cleanup without its indication, and re-checked the station at MM entry
   (`mmStaDelOwned`, now removed).
-- With the VIF retired, the supplicant's `stationDisconnected` callback is
-  not run (the VIF's removal already deinitialised it) and the channel and
-  security flags are not touched; the blob calls and writes regardless.
 - The cleanup no longer resets ME's exchange itself (`meControlReset`). On
   `MM_RESET_REQ`, `me_init` still resets it just before `sm_init`, as for
   the BSS batch and the activation; a request `sm_init` leaves queued is
@@ -7605,11 +7581,6 @@ the activated context, and SM takes it with `smTakeAnswer`. Every `smGo`
 frees a request still parked; one already sent is ignored when it comes.
 Differences from the archive:
 
-- The attempt ends (`sm_connect_ind(11)`) when its STA VIF is gone when the
-  frame is to be sent, from state 4, 6 or 8 or from the parked request. The
-  frame builders would return without sending; the port had returned
-  silently, leaving SM in that state with no deadline armed. The blob
-  builds the frame on whatever the slot holds.
 - An abort in state 5 or 7 ends the attempt (`sm_connect_ind(24, 3)`).
   Pinned `sm_connect_abort_req_handler` only confirms it there and the
   frame is sent later; the port had saved it unless a request was parked or
@@ -7621,13 +7592,6 @@ Differences from the archive:
   at the activation of any STA VIF's context. Unlinking that VIF's channel
   no longer sends it early: in state 5 or 7 only the cleanup or the VIF's
   removal unlinks it, and the cleanup frees it first.
-
-Not done yet: an attempt parked in state 5 or 7 whose STA VIF is removed
-waits for its context, which does not come back; an abort sent after the
-removal names no live VIF, so only `sm_init` ends it. Telling SM from
-`vif_mgmt_unregister` is the next step, as is clearing a retired VIF's ME
-mask bits and retiring its stations (a cleanup for the removed VIF leaves
-its AP station valid).
 
 Removed: the cleanup's message tags and serial, `smCleanupForget` in
 `ke_msg_free`, the lost flag, `smCleanupNeedsService`/`smCleanupService`
@@ -7660,6 +7624,124 @@ they exercised; the checks left in the cleanup (the station it names, the
 VIF epoch before the callback and the channel unlink, and the check after
 the supplicant's callback) are covered. The M0 HTTP server manifest built;
 none of this was flashed.
+
+#### SM and the removal of its VIF; saved host requests
+
+`vif_mgmt_unregister` is the only place a VIF is removed. When it retires a
+STA VIF it now clears that VIF's bits in ME's `activeMask` and
+`psDisableMask` and calls `smStaVifRetired`, at every return once the
+removal is committed (a `defer` placed just before
+`rxInvalidateQuiescentVif`, so it runs after the TX completions and the
+supplicant's deinit inside the removal). If SM's attempt (states 1 to 9) or
+its teardown (state 10: deauthentication wait or cleanup) is on that VIF,
+it ends there, unreported (`smAbandon`): the messages SM holds are freed,
+the BSS batch and the activation are cancelled and SM goes idle, so every
+request, reply, timer and frame stamp of the attempt is stale. Pinned
+`vif_mgmt_unregister` tells neither ME nor SM, and pinned SM goes on with
+the freed slot. The host drops an indication for a removed VIF
+(`rxHostClaimStationIndication`), so the reports this skips were already
+lost. Consequences:
+
+- An attempt parked in state 5 or 7 no longer waits for a context that
+  does not come back, nor one in state 9 for the supplicant that the
+  removal deinitialised (SCAN-N3, in every state).
+- A VIF removed and added again at the same index cannot receive a request
+  of the old attempt: the removal ended SM's wait, so the repliers drop it.
+- The per-request VIF checks are gone as unreachable: `smAttemptStaVif` (in
+  `smBssBegin`, `smBssNext`, `smActivationConfirmed`, `smDeferredDispatch`,
+  `sm_auth_assoc_send_according_chan` and `mm_sta_add_req_handler`),
+  `smRequestVifLive` (the unapplied answer in `smStaleRequest`, the station
+  rewrite in `mm_sta_del_req_handler`) and `smCleanupVifLive` (the
+  supplicant callback and channel unlink of the cleanup's first step).
+  `smSubmitScanRequest` keeps its type check: an FT request (`authType` 2)
+  is admitted on a VIF of any type.
+- When the removal leaves `activeMask` or `psDisableMask` at zero, nothing
+  is sent to MM: MM stays active, or PS stays disabled, until the next ME
+  transition. The blob keeps the bit, so the remaining VIFs could never let
+  MM idle or re-enable PS.
+- A removed VIF's stations stay valid, as pinned `vif_mgmt_unregister`
+  leaves them, and the abandoned cleanup sends no `MM_STA_DEL_REQ` for the
+  AP station. The removal empties the VIF's station list, so
+  `staMgmtBeginRemoval` no longer finds such a station; `mmStaDelTry` now
+  reports its delete done and leaves the station in place. That delete
+  had been retried every 100 ms until `MM_RESET`, and a host
+  `MM_STA_DEL_REQ` for it stayed saved. Ending the attempt at the removal
+  made SM reach it too: a registration MM applied before the removal is
+  answered to an idle SM, and `smStaAddRetire` deletes its station. Pinned
+  `mm_sta_del` applies the delete to whatever the slot now holds and
+  returns the station to the free list (`sta_mgmt_unregister` extracts it
+  from a list that no longer holds it).
+- A TX completion inside the removal (a flushed deauthentication frame)
+  can still start a cleanup on the VIF; the signal at the end ends it.
+
+`sm_init`, `smTeardown` with no STA VIF to clean up, and `ke_flush` use the
+same `smAbandon`. `ke_flush` (exported, no caller in this tree) had called
+four cancels that left SM's state and request pointers in place.
+`me_set_active_cfm_handler_sm` no longer asks `smBssNext` whether the batch
+is done: its answer is the batch's last.
+
+Saved host requests:
+
+- `SM_CONNECT_ABORT_REQ` is answered in place (the request becomes
+  `SM_CONNECT_ABORT_CFM`), so it needs no allocation and is never saved. It
+  acts on the attempt live when it is dispatched, if that attempt is on the
+  STA VIF it names; status 1 otherwise and in state 1. Pinned
+  `sm_connect_abort_req_handler` allocates the confirmation with
+  `ke_msg_alloc`, which halts; the port had saved the abort when that
+  allocation failed and stamped it at send (`SmStaRequestIdentity`:
+  connection pointer and VIF epoch) so that it would not act on a later
+  attempt. Both are gone.
+- `SM_DISCONNECT_REQ` is still saved while SM is busy, as in `sm_task.o`,
+  and `ke_msg_send` stamps it with the generation (`rxVifEpochs`) of the
+  STA VIF it names (`smDisconnectStamp`, `station_abort.nim`); it acts only
+  while that generation is current. The generation changes at every
+  connect admission on the VIF and at its removal, so the plan's separate
+  attempt serial was not added. The private allocation tail and its hooks
+  in `ke_msg_try_alloc`, `ke_msg_send` and `ke_msg_free` stay, renamed
+  `smDisconnect*`.
+
+Bench: `m0_wifi_nimfw_scan_ownership_test` waits for the station's scan to
+be counted as saved behind a public scan. The count was in
+`scanu_start_req_handler`'s busy branch, which never runs: SCANU's state
+tables route `SCANU_START_REQ` to `ke_msg_save` while SCANU scans or joins,
+as `scanu_task.o` does. The count (bench builds only) is now in
+`ke_msg_save`. That branch, and its busy answer to a host request, is still
+unreachable through the tables.
+
+Removed: `smAttemptStaVif`, `smRequestVifLive`, `smCleanupVifLive`,
+`smTeardownUnclaimed` (now `smAbandon`), `SmStaRequestIdentity`,
+`smStaRequestCapture`, `smStaRequestVifCurrent`, `smAbortCapture`,
+`smAbortCurrent` and the abort's stamp, the result of `smBssNext`, and the
+never-set `warmAssocPrepare`/`warmAssocStart` diagnostic stages (later
+stages renumber). `nimfw_dbg_active_cfm_bad_state` and `_last_state` are no
+longer written but stay: `examples/m0_allcore_wasm_cps_live_test.nim`
+imports them.
+
+Not done: retiring a removed VIF's stations (they stay valid until
+`MM_RESET`, see above), and unlinking its channel context (the host's job, as in the blob). `MM_SET_VIF_STATE_REQ`
+activating a STA VIF without an AP station still reads `sta_info_tab[0xFF]`
+as the blob does; the fix is more than one line.
+
+Host tests: `tools/test_wifi_sm_table.py` (a removal row for every state:
+the request/answer states 1 to 3, the series states 4 and 9 at each
+request, the cleanup at each request, states 5 and 7 parked or queued, and
+an attempt in states 1 to 9, a link in state 0 and the deauthentication
+wait, with removed-and-re-added variants; the saved-host-request table for
+the abort and the disconnect in states 0 to 10 with the VIF replaced before
+the first dispatch or while saved; and a check that `vif_mgmt_unregister` is
+the one signal; states 1 to 3 also with the answer given before the
+removal), `tools/test_wifi_vif_lifetime.py` (the real
+`vif_mgmt_unregister`: masks and signal at each exit, with a mutation),
+`tools/test_wifi_station_lifetime.py` (the real `mm_sta_del` of a removed
+VIF's station, also with a retry armed before the removal, with
+mutations),
+`tools/test_wifi_sm_audit_scan.py` and `tools/test_wifi_sm_audit_sm_connect.py`
+(SCAN-N3 in states 1 to 8, the SMCONN-F7 leak, `MM_SET_BEACON_INT_REQ` without
+an AP station), `tools/test_wifi_station_abort.py`,
+`tools/test_wifi_sm_cleanup.py`, `tools/test_wifi_bss_confirmations.py`,
+`tools/test_wifi_activation_exchange.py`, `tools/test_wifi_activation_mm.py`
+and `tools/test_wifi_deferred_auth_lifetime.py`. The M0 HTTP server and
+scan-ownership bench manifests built; none of this was flashed.
 
 ## BLE
 

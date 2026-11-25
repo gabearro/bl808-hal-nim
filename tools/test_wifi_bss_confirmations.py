@@ -198,8 +198,7 @@ def source() -> str:
     }.items():
         platform = platform.replace(procedure(platform, name), replacement)
     platform = platform.replace("proc setup() =", station_sm_source(
-        "smGo", "smSendReserved", "smAwaits", "smAttemptStaVif", "smRequestVifLive",
-        "smStaleRequest",
+        "smGo", "smSendReserved", "smAwaits", "smStaleRequest",
         "smTakeReply", "smTakeAnswer") + "proc setup() =", 1)
     platform = "proc ke_msg_send_basic_reply*(request: pointer; id: uint16)\n" + platform
     names = ["MeSetPsDisableReqPayload", "MmSetBssidReqPayload", "MmSetBasicRatesReqPayload",
@@ -208,6 +207,7 @@ def source() -> str:
     code += "const\n" + "".join(f"  {name}Size = sizeof({name}).uint32\n" for name in names)
     code += platform + EXTRA
     code += (FW / "station_bss.nim").read_text()
+    code += station_sm_source("smAbandon", "smStaVifRetired", record=False)
     kernel = (FW / "kernel_mac_channel.nim").read_text()
     task = (FW / "task_handlers.nim").read_text()
     code += procedure(kernel, "ke_queue_extract")
@@ -230,7 +230,25 @@ proc releaseSavedControl(task: uint8) =
                  "mm_bss_param_setting_handler", "me_set_ps_disable_cfm_handler_sm",
                  "me_set_active_cfm_handler_sm"]:
         code += procedure(task, name)
-    return code + WORKER
+    return code + WORKER + RETIREMENT
+
+
+RETIREMENT = r'''
+proc allocateAttempt() =
+  ## The attempt's SM_CONNECT_REQ and SM_CONNECT_IND as allocated messages,
+  ## which smAbandon frees.
+  let info = ke_msg_alloc(0x1000'u16, TASK_SM, 9, sizeof(Connection).uint32)
+  cast[ptr Connection](info)[] = connection
+  sm.connectInfo = info
+  sm.connectIndMsg = ke_msg_alloc(0x1002'u16, 9, TASK_SM, 4)
+proc retireVif() =
+  ## vif_mgmt_unregister removes the attempt's VIF (1): the slot is freed, ME
+  ## forgets the VIF's mask bits and SM is told (smStaVifRetired).
+  vif.vifType = 4
+  me.activeMask = me.activeMask and not 2'u32
+  me.psDisableMask = me.psDisableMask and not 2'u32
+  smStaVifRetired(1)
+'''
 
 
 CASES = {
@@ -318,27 +336,30 @@ ke_msg_free(keMsgHdrFromPayload(request))
 doAssert applied.len == 0 and me.psDisableMask == 0 and meState == MeIdleState
 assertQuiet()
 ''',
-    # The attempt's STA VIF is retired while SM's request waits for its
-    # replier: the replier answers it unapplied (no MM write, no ME mask bit)
-    # and SM ends the attempt at that answer, the last one included.
+    # The attempt's STA VIF is removed while SM's request waits for its
+    # replier: the removal ends the attempt at once, unreported, and the
+    # replier drops the request (no MM write, no ME mask bit); nothing more is
+    # sent.
     "vif_retired_before_the_replier_runs": r'''
 for step in 0..8:
   begin()
   while smRequests.len < step + 1: doAssert dispatchOne()
-  let before = (applied.len, me.psDisableMask, me.activeMask)
-  vif.vifType = 2
+  allocateAttempt()
+  let before = applied.len
+  retireVif()
+  doAssert state == SmIdleState and smOwn.request == nil and smOwn.reply == nil
+  doAssert sm.connectInfo == nil and sm.connectIndMsg == nil
+  doAssert sm.pendingBssParams.first == nil
   drain()
-  doAssert (applied.len, me.psDisableMask, me.activeMask) == before,
+  doAssert applied.len == before and me.psDisableMask == 0 and me.activeMask == 0,
     "request " & $step & " was applied to the retired VIF"
-  doAssert failures == @[(14'u16, 0xFFFF'u16)] and smRequests.len == step + 1
-  doAssert authStarts == 0 and state == SmDisconnectingState
-  endAttempt()
+  doAssert failures.len == 0 and smRequests.len == step + 1
+  doAssert authStarts == 0 and state == SmIdleState
   assertQuiet()
 ''',
-    # The STA VIF is retired while MM holds ME's forward of the first or the
-    # last request: ME and MM finish it and SM ends the attempt at the answer.
-    # (The mask bit the forward set stays set when no cleanup runs; clearing
-    # it belongs with vif_mgmt_unregister telling SM, stage 9g.)
+    # The STA VIF is removed while MM holds ME's forward of the first or the
+    # last request: ME and MM finish it, SM ignores the answer, and the mask
+    # bit the forward set for the removed VIF is cleared by the removal.
     "vif_retired_during_forward": r'''
 for last in [false, true]:
   begin()
@@ -350,12 +371,16 @@ for last in [false, true]:
   holdMM = true
   drain()
   doAssert heldMM != nil and meState == MeBusyState
-  vif.vifType = 2
+  if last: doAssert me.activeMask == 2
+  else: doAssert me.psDisableMask == 2
+  allocateAttempt()
+  retireVif()
+  doAssert state == SmIdleState
   releaseMM()
   drain()
-  doAssert failures == @[(14'u16, 0xFFFF'u16)] and authStarts == 0
-  doAssert state == SmDisconnectingState
-  endAttempt()
+  doAssert failures.len == 0 and authStarts == 0 and state == SmIdleState
+  doAssert me.activeMask == 0 and me.psDisableMask == 0,
+    "the removed VIF kept an ME mask bit"
   assertQuiet()
 ''',
     # A request saved while ME is busy still gets its answer.
@@ -425,7 +450,8 @@ def test_bss_batch_has_no_loss_machinery() -> None:
     kernel = (FW / "kernel_mac_channel.nim").read_text()
     assert "smBss" not in procedure(kernel, "ke_msg_free")
     assert "smTakeReply(request, id)" in procedure(kernel, "ke_msg_alloc_reply")
-    assert "smBssCancel()" in procedure((FW / "scan_station_ap_me.nim").read_text(), "sm_init")
+    assert "smAbandon()" in procedure((FW / "scan_station_ap_me.nim").read_text(), "sm_init")
+    assert "smBssCancel()" in procedure((FW / "station_sm.nim").read_text(), "smAbandon")
     assert "smBssCancel()" in procedure((FW / "station_cleanup.nim").read_text(), "smCleanupBegin")
     loop = (FW / "task_init_main.nim").read_text()
     assert "smBss" not in procedure(loop, "wifiMainHasPendingWork")

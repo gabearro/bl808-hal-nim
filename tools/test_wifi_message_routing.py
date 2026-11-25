@@ -70,7 +70,7 @@ proc assert_err(condition, file: cstring; line: cint) =
 proc nimFwTrace(message: string) = inc traces
 proc nimFwTrace2U32(message: string; first, second: uint32) = inc traces
 proc mmTimCaptureMessage(p: ptr KeMsgHdr) = discard
-proc smAbortCaptureMessage(p: ptr KeMsgHdr) = discard
+proc smDisconnectStamp(p: ptr KeMsgHdr) = discard
 proc chanUpdateCaptureMessage(p: ptr KeMsgHdr) = discard
 # The channel switch's request is static and carries no per-message metadata.
 proc chanSwitchForget(p: pointer): bool = false
@@ -92,7 +92,7 @@ proc setup(destination: uint8) =
 def source() -> str:
     kernel = (FW / "kernel_mac_channel.nim").read_text()
     code = (FW.parent / "fw_messages/tasks.nim").read_text() + PLATFORM
-    hooks = ["mmTimForget", "rxMgtForget", "smAbortForget", "chanUpdateForget",
+    hooks = ["mmTimForget", "rxMgtForget", "smDisconnectForget", "chanUpdateForget",
              "mmConnLossForget", "chanBcnRequestForget"]
     hooks += ["scanDwellForget", "mmEdcaForget"]
     for index, name in enumerate(hooks):

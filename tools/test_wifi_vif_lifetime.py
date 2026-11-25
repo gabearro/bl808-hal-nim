@@ -409,6 +409,55 @@ for removedKind in [VIF_TYPE_STA, VIF_TYPE_AP, 1'u8, 3'u8]:
     run_program(tmp_path, "checked", vif_lifetime_source(platform=platform) + checks)
 
 
+RETIREMENT_CHECKS = r'''
+# vif_mgmt_unregister retires a STA VIF's ME mask bits and tells SM once,
+# after its entry is freed, however it returns once the removal is
+# committed. A removal refused before the commit, or of an AP VIF, does
+# neither.
+proc register(kind: uint8): uint8 =
+  result = 255
+  doAssert vif_mgmt_register(addr mac[0], kind, false, addr result) == 0
+for kind in [VIF_TYPE_STA, VIF_TYPE_AP]:
+  for exit in ["normal", "replaced_in_deinit", "refused"]:
+    reset()
+    doAssert vif_mgmt_init()
+    let removed = register(kind)
+    let other = register(VIF_TYPE_STA)
+    doAssert removed == 0 and other == 1
+    meMasks = (activeMask: 3'u32, psDisableMask: 3'u32)
+    retiredStaVifs.setLen(0)
+    case exit
+    of "replaced_in_deinit":
+      # A callback in the window changes the entry; the removal returns early.
+      deinitHook = proc() = inc rxVifEpochs[removed]
+    of "refused": haltAllowed = false
+    else: discard
+    let done = vif_mgmt_unregister(removed)
+    haltAllowed = true
+    doAssert done == (exit != "refused")
+    if kind == VIF_TYPE_STA and exit != "refused":
+      doAssert meMasks == (activeMask: 2'u32, psDisableMask: 2'u32)
+      if exit == "normal": doAssert retiredStaVifs == @[(removed, 4'u8)]
+      else: doAssert retiredStaVifs.len == 1 and retiredStaVifs[0].vif == removed
+    else:
+      doAssert meMasks == (activeMask: 3'u32, psDisableMask: 3'u32) and retiredStaVifs.len == 0
+'''
+
+
+@pytest.mark.parametrize("mutation", [None, "no_signal"])
+def test_sta_vif_removal_tells_me_and_sm(tmp_path: Path, mutation: str | None) -> None:
+    code = vif_lifetime_source()
+    if mutation:
+        old = "      smStaVifRetired(vifIdx)\n"
+        assert code.count(old) == 1
+        code = code.replace(old, "      discard\n")
+    if mutation:
+        with pytest.raises(AssertionError):
+            run_program(tmp_path, "checked", code + RETIREMENT_CHECKS)
+    else:
+        run_program(tmp_path, "checked", code + RETIREMENT_CHECKS)
+
+
 REGISTER_CALLBACK_PLATFORM = PLATFORM.replace(
     "proc mm_hw_info_set(p: pointer) = inc hwSets",
     "proc mm_hw_info_set(p: pointer) =\n"

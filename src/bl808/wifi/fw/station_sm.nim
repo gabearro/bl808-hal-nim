@@ -20,8 +20,9 @@
 #                 and ends with smGo(SmIdleState). The guard timer then
 #                 retries a step whose messages could not be allocated.
 #
-# Nothing else leaves state 10: connect and disconnect requests, connection
-# losses and AP deauthentications are saved until SM is idle again.
+# Otherwise only sm_init and the removal of the VIF (smAbandon) leave state
+# 10: connect and disconnect requests, connection losses and AP
+# deauthentications are saved until SM is idle again.
 #
 # States 1, 2 and 3 wait for the answer to one request: SCANU_START_REQ or
 # SCANU_JOIN_REQ to SCANU, MM_STA_ADD_REQ to MM. smSend sends it after smGo
@@ -44,9 +45,7 @@
 # and ME's to SM are that message relabelled. From the hand-out SM waits for
 # the reply, which stays allocated until SM handles it; the replier frees
 # the request. Every smGo frees a reply not handed out yet. A replier drops
-# a request of SM's that SM no longer waits on, and answers one whose STA
-# VIF has been retired without applying it (smStaleRequest). SM checks the
-# VIF at every answer and ends the attempt when it is gone.
+# a request of SM's that SM no longer waits on (smStaleRequest).
 #
 # States 5 and 7 wait for the attempt's channel (deferred_auth.nim). The
 # auth or assoc request is parked in chan_env (smPark); the channel
@@ -59,6 +58,12 @@
 # (station_tx_build.nim). Leaving the state starts a new operation, so a
 # deadline or response from an earlier one is stale; nothing else (a TX
 # reset, a channel switch) invalidates them.
+#
+# A STA VIF is removed only by vif_mgmt_unregister, which then calls
+# smStaVifRetired. An attempt on that VIF, or the teardown of a link on it,
+# ends there at once and unreported (smAbandon). So while SM waits on
+# anything, the VIF it waits for is the one it started with, and no replier
+# or handler needs to check that the VIF is still there.
 
 type
   SmTeardown = enum
@@ -70,7 +75,7 @@ type
     request: pointer  ## the request the live operation waits on, or nil
     reply: pointer    ## the reply SM reserved for it, until a replier takes it
     answer: pointer   ## what ends the wait: the request itself or its reply
-    deauthVif: uint8
+    vif: uint8        ## state 10: the VIF whose link the teardown ends
     deauthCallback: pointer  ## the waited frame's callback, run by the guard
     guard: MmTimerView  ## state 10's timer: the deauth guard, the cleanup's retry
 
@@ -125,33 +130,11 @@ proc smAwaits(request: pointer): bool =
   ## `request` is the one the live operation waits on (a replier's check).
   request != nil and request == smOwn.request
 
-proc smAttemptStaVif(vifIdx: uint8): bool =
-  ## `vifIdx` still names the attempt's STA interface.
-  let connection = smEnvView().connectInfo
-  connection != nil and connectInfoView(connection).vifIdx == vifIdx and
-    vifIdx < MAX_VIFS.uint8 and vifChannelForIdx(vifIdx).vifIdx == vifIdx and
-    vifChannelForIdx(vifIdx).vifType == VIF_TYPE_STA
-
-proc smRequestVifLive(): bool =
-  ## The STA VIF of SM's request in flight is still there: the attempt's, or
-  ## in state 10 the one the cleanup releases.
-  if smOwn.teardown == tdCleanup: return smCleanupVifLive()
-  let connection = smEnvView().connectInfo
-  connection != nil and smAttemptStaVif(connectInfoView(connection).vifIdx)
-
 proc smStaleRequest(request: pointer): bool =
-  ## The entry check of the repliers of states 4, 9 and 10: true when the
-  ## replier must not apply `request`. A request SM sent and no longer waits
-  ## on is dropped. One SM waits on whose STA VIF has been retired (the slot
-  ## is free or holds another interface) is answered here, unapplied, with
-  ## SM's reserved reply; the attempt ends, or the cleanup goes on, when SM
-  ## takes the answer.
-  let header = keMsgHdrFromPayload(request)
-  if header.srcId != TASK_SM: return false
-  if not smAwaits(request): return true
-  if smRequestVifLive(): return false
-  ke_msg_send_basic_reply(request, header.id + 1)
-  true
+  ## The entry check of the repliers of states 4, 9 and 10: true when
+  ## `request` is one SM sent and no longer waits on. The replier drops it
+  ## without applying it.
+  keMsgHdrFromPayload(request).srcId == TASK_SM and not smAwaits(request)
 
 proc smTakeReply(request: pointer; id: uint16): pointer =
   ## ke_msg_alloc_reply for the request SM waits on: the reply reserved for
@@ -197,11 +180,13 @@ proc smDeauthConfirmed(env: pointer): bool =
   smOwn.teardown == tdDeauthWait and opCurrent(smOwn.op, opEnvStamp(env))
 
 proc smDeauthVif(): pointer =
-  cast[pointer](vifChannelForIdx(smOwn.deauthVif))
+  cast[pointer](vifChannelForIdx(smOwn.vif))
 
-proc smTeardownUnclaimed() =
-  ## No STA VIF was left to clean up (its slot now holds another interface
-  ## type). End the attempt here, unreported, rather than stay in state 10.
+proc smAbandon() =
+  ## End the attempt, and a teardown in progress, here and unreported: free
+  ## the messages SM holds and go idle. For sm_init, for the removal of the
+  ## VIF SM works on (smStaVifRetired), and for a teardown that finds no STA
+  ## VIF to clean up.
   let sm = smEnvView()
   let connection = sm.connectInfo
   let indication = sm.connectIndMsg
@@ -209,6 +194,7 @@ proc smTeardownUnclaimed() =
   sm.connectIndMsg = nil
   smActivationCancel()
   smBssCancel()
+  smCleanupCancel()
   smGo(SmIdleState)
   if connection != nil: ke_msg_free(keMsgHdrFromPayload(connection))
   if indication != nil: ke_msg_free(keMsgHdrFromPayload(indication))
@@ -222,10 +208,11 @@ proc smTeardown(vif: pointer; indication: pointer = nil; disconnected = false;
   if smOwn.teardown == tdCleanup: return false
   smSaQueryEnd()
   if smCleanupBegin(vif, indication, disconnected, status, reason): return true
-  # State 10 must not stay without an owner, nor may an attempt that is
-  # ending on its own VIF (`indication` is its SM_CONNECT_IND) stay live.
+  # No STA VIF to clean up: an FT attempt admitted on another interface
+  # type. State 10 must not stay without an owner, nor may an attempt that
+  # is ending on its own VIF (`indication` is its SM_CONNECT_IND) stay live.
   if smOwn.teardown == tdDeauthWait or indication != nil:
-    smTeardownUnclaimed()
+    smAbandon()
   false
 
 proc smDeauthGuardExpired(env: pointer) {.cdecl.} =
@@ -240,9 +227,20 @@ proc smDeauthWait(vifIdx: uint8; callback: pointer): uint32 =
   ## Refused (0) while a teardown is running: the caller drops its frame.
   if smOwn.teardown != tdNone: return 0
   smSaQueryEnd()
-  smOwn.deauthVif = vifIdx
+  smOwn.vif = vifIdx
   smOwn.deauthCallback = callback
   result = smGo(SmDisconnectingState, tdDeauthWait)
   smOwn.guard.callback = cast[pointer](smDeauthGuardExpired)
   smOwn.guard.env = result
   mm_timer_set(addr smOwn.guard, macTimeNow() + SmDeauthGuardUs)
+
+proc smStaVifRetired(vifIdx: uint8) =
+  ## vif_mgmt_unregister has retired STA VIF `vifIdx`. The attempt on it, or
+  ## the teardown of a link on it, ends here, unreported: nothing is left to
+  ## release, and the host drops an indication for a removed VIF
+  ## (rxHostClaimStationIndication). Pinned sm.o is not told and goes on with
+  ## the freed slot.
+  let connection = smEnvView().connectInfo
+  if (connection != nil and connectInfoView(connection).vifIdx == vifIdx) or
+      (smOwn.teardown != tdNone and smOwn.vif == vifIdx):
+    smAbandon()

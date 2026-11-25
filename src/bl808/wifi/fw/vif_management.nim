@@ -264,6 +264,16 @@ proc vif_mgmt_unregister*(vifIdx: uint8): bool {.exportc, cdecl, discardable.} =
     rxVifEpochs[vifIdx] == retiredEpoch and vif.vifType == vifType and
       not co_list_find(addr env.activeList, cast[ptr CoListHdr](vifEntry)) and
       not co_list_find(addr env.freeList, cast[ptr CoListHdr](vifEntry))
+  # A STA VIF is retired from here on, however this returns. Once the rest
+  # has run (TX completions, the supplicant's deinit), ME forgets the VIF's
+  # mask bits and SM ends what it does on the VIF (smStaVifRetired). The blob
+  # tells neither.
+  defer:
+    if vifType == VIF_TYPE_STA:
+      let me = meEnvView()
+      me.activeMask = me.activeMask and not (1'u32 shl vifIdx)
+      me.psDisableMask = me.psDisableMask and not (1'u32 shl vifIdx)
+      smStaVifRetired(vifIdx)
   rxInvalidateQuiescentVif(vifIdx, selected)
   if not current():
     return true

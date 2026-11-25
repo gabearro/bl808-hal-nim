@@ -200,6 +200,7 @@ proc smActivationCancel() = discard
 proc smBssCancel() = discard
 proc smCleanupCancel() = discard
 proc smDeferredCancel() = discard
+proc smAbandon() = discard
 proc mmPsModeCancel() = discard
 proc meControlReset() = discard
 proc apmCancelPendingForVif(vif: uint8) = discard

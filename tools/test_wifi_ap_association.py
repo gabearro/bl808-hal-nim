@@ -169,6 +169,7 @@ proc smRspTimerReset() = discard
 template smSaQueryResetScope() = discard
 proc keTimerCancelMutations(id = 0'u16; task = 0'u8; all = false) = discard
 proc smDeferredCancel() = discard
+proc smAbandon() = discard
 proc staInfoForIdx(i: uint8): ptr Station = addr stations[i]
 proc vifChannelForIdx(i: uint8): ptr Vif = addr vifs[i]
 proc vifApProbeSsid(v: ptr Vif): ptr Ssid = addr v.ssid

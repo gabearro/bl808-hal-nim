@@ -17,6 +17,7 @@ const
   TASK_API = 9'u8
   MM_PS_CHANGE_IND = 0x37'u16
   STA_MGMT_FREE_STAS = 5
+  MAX_VIFS = 2
   MmPsChangeIndPayloadSize = 2
 type
   CoListHdr = object
@@ -60,6 +61,7 @@ proc staInfoAt(p: pointer): ptr Sta = cast[ptr Sta](p)
 proc staDeleteEpoch(index: uint8): uint32 = 0
 proc co_list_find(list: ptr CoList; node: ptr CoListHdr): bool = false
 proc vifChannelForIdx(index: uint8): ptr Vif = addr vifs[index]
+proc vifPostponedStaList(vif: ptr Vif): ptr CoList = nil
 proc vifSecurity(p: ptr Vif): ptr Security = addr p.security
 proc ke_msg_alloc(id: uint16; dst, src: uint8; length: int): pointer =
   doAssert id == 0x37 and dst == 9 and src == TASK_MM and length == 2

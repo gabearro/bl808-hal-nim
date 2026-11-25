@@ -13,10 +13,9 @@
 #   3  ME_SET_ACTIVE_REQ(0)
 #
 # Each goes out with smSendReserved, and MM_STA_DEL_REQ, which MM answers in
-# place, with smSend, so every answer arrives (station_sm.nim). A replier
-# answers a request whose VIF has been retired without applying it
-# (smStaleRequest; mm_sta_del_req_handler for the station delete), so the
-# cleanup still finishes and reports.
+# place, with smSend, so every answer arrives (station_sm.nim). If the VIF
+# is removed meanwhile, vif_mgmt_unregister ends the cleanup at once
+# (smStaVifRetired), so every request it sends names a VIF that is there.
 # The supplicant is told before the first request; after it, the VIF leaves
 # its channel, loses its security flags and a disconnect's SM_DISCONNECT_IND
 # is sent. After the last answer SM goes idle and a failed attempt's
@@ -51,12 +50,8 @@ const
 proc smCleanupOwnsStation(station, vif: uint8; epoch: uint32): bool =
   staDeleteIsCurrent(station, epoch) and staInfoForIdx(station).instNbr == vif
 
-proc smCleanupVifLive(): bool =
-  ## The VIF the cleanup releases has not been retired since it began.
-  rxHostSessionCurrent(smCleanup.session)
-
 proc smCleanupCancel() =
-  ## sm_init: forget the cleanup and free the indication it holds.
+  ## smAbandon: forget the cleanup and free the indication it holds.
   let indication = smCleanup.indication
   smCleanup = default(SmCleanupOperation)
   if indication != nil: ke_msg_free(keMsgHdrFromPayload(indication))
@@ -91,9 +86,7 @@ proc smCleanupNext() =
     return
   if not smCleanup.notified:
     smCleanup.notified = true
-    # The VIF's own removal has already deinitialised the supplicant.
-    let callback = if wpa_cbs == nil or not smCleanupVifLive(): nil
-                   else: wpaCallbacks().stationDisconnected
+    let callback = if wpa_cbs == nil: nil else: wpaCallbacks().stationDisconnected
     if callback != nil:
       cast[proc(reason: uint8) {.cdecl.}](callback)(0)
       if smOwn.teardown != tdCleanup: return  # The host ran sm_init.
@@ -135,12 +128,11 @@ proc smCleanupNext() =
     smCleanupRetry()
     return
   if index != 0: return
-  if smCleanupVifLive():
-    # The VIF leaves its channel and drops its flags before the host hears of it.
-    let entry = vifChannelForIdx(vif)
-    if chanCtxtLinkEpochs[vif] == smCleanup.channelBinding and entry.chanCtxt != nil:
-      chan_ctxt_unlink(vif)
-    vifApConfig(entry).securityFlags = 0
+  # The VIF leaves its channel and drops its flags before the host hears of it.
+  let entry = vifChannelForIdx(vif)
+  if chanCtxtLinkEpochs[vif] == smCleanup.channelBinding and entry.chanCtxt != nil:
+    chan_ctxt_unlink(vif)
+  vifApConfig(entry).securityFlags = 0
   if smCleanup.disconnect:
     let indication = smCleanup.indication
     smCleanup.indication = nil
@@ -197,6 +189,7 @@ proc smCleanupBegin(vifEntry: pointer; indication: pointer = nil;
   sm.scanResultIndex = 0xFFFFFFFF'u32
   smConnecting = false
   smGo(SmDisconnectingState, tdCleanup)
+  smOwn.vif = vif.vifIdx
   smActivationCancel()
   smBssCancel()
   if connection != nil: ke_msg_free(keMsgHdrFromPayload(connection))

@@ -33,7 +33,9 @@ proc smStaAddStation(answer: pointer): uint8 =
 
 proc smStaAddRetire(answer: pointer) =
   ## An answer SM no longer waits on (SM was reset or the attempt ended):
-  ## delete the station it registered, unless that is already gone. The
-  ## blob asserts state 3 here instead.
+  ## delete the station it registered, unless that is already gone. If the
+  ## attempt ended because its STA VIF was removed, the station is on no
+  ## VIF's list and mm_sta_del leaves it valid, as every station of a
+  ## removed VIF (mmStaDelTry). The blob asserts state 3 here instead.
   let station = smStaAddStation(answer)
   if station != 0xFF: mm_sta_del(station)

@@ -11,7 +11,9 @@ from test_wifi_registration_exchange import source as registration_source
 
 
 def source() -> str:
-    code = "var bssFailAt: int\ntype CoList = object\n  first, last: pointer\n" + registration_source()
+    # station_bss.nim below supplies the smBssCancel that smAbandon calls.
+    code = ("var bssFailAt: int\ntype CoList = object\n  first, last: pointer\n"
+            "proc smBssCancel()\n" + registration_source())
     code = code.replace("  if not failAlloc:\n", "  if not failAlloc and allocations != bssFailAt:\n", 1)
     code = code.replace("vifIdx, ssidLen: uint8", "vifIdx, ssidLen, qosInfo: uint8", 1)
     code = code.replace("    basicRates: array[13, uint8]", """    basicRates: array[13, uint8]

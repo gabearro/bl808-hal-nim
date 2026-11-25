@@ -9,7 +9,8 @@
 # mm_set_vif_state_cfm_handler sends the last two without waiting for them.
 # After the last answer SM tells the host the AP station is ready
 # (SM_STA_ADD_IND) and reports the connection, or, on a protected network,
-# waits in state 9 for the supplicant.
+# waits in state 9 for the supplicant. The removal of the STA VIF ends that
+# wait too (smStaVifRetired): the removal deinitialises the supplicant.
 #
 # The activation belongs to the state-9 operation that started it and is
 # live while that operation is (smActivationLive). Every end of the attempt
@@ -292,9 +293,9 @@ proc smActivationApply(): bool =
 
 proc smActivationConfirmed() =
   ## SM took the answer to the activation's request in flight. The attempt
-  ## ends if its STA VIF or AP station has gone meanwhile.
-  if not smAttemptStaVif(smActivation.vif) or
-      not staDeleteIsCurrent(smActivation.station, smActivation.stationEpoch):
+  ## ends if its AP station has been deleted meanwhile. (The removal of its
+  ## STA VIF has ended it already: smStaVifRetired.)
+  if not staDeleteIsCurrent(smActivation.station, smActivation.stationEpoch):
     smActivationFail()
     return
   let step = smActivation.step

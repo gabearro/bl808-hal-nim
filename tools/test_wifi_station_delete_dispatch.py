@@ -122,7 +122,6 @@ proc txlResetting(): bool = false
 proc staInfoForIdx(index: uint8): ptr tuple[valid: uint8] = addr stations[index]
 proc smEnvView(): ptr Sm = addr sm
 proc smAwaits(request: pointer): bool = true  # SM waits on its delete
-proc smRequestVifLive(): bool = true
 proc smStaleRequest(request: pointer): bool = false
 proc vifChannelAt(p: pointer): ptr VifChannelView = cast[ptr VifChannelView](p)
 proc vifChannelForIdx(index: uint8): ptr VifChannelView = addr vifs[index]

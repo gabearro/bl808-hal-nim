@@ -1,4 +1,9 @@
-"""Run station aborts against owned deferred commands and message lifetimes."""
+"""Run station aborts and disconnects against owned deferred commands and message lifetimes.
+
+SM_CONNECT_ABORT_REQ is answered in place (it becomes SM_CONNECT_ABORT_CFM)
+and is never saved: it acts on the attempt that is live when it is
+dispatched. SM_DISCONNECT_REQ is saved while SM is busy and acts only on the
+STA VIF generation ke_msg_send stamped it with (station_abort.nim)."""
 
 from pathlib import Path
 import shutil
@@ -110,10 +115,12 @@ proc deliverScanAbort() =
   doAssert scan_abort_req_handler(payload) == KeMsgConsumed
   ke_msg_free(keMsgHdrFromPayload(payload))
 proc makeAbort(vif = 1'u8): pointer =
+  let fail = allocFail
+  allocFail = false
   result = ke_msg_try_alloc(SM_CONNECT_ABORT_REQ, TASK_SM, TASK_API, 1)
+  allocFail = fail
   doAssert result != nil
   cast[ptr uint8](result)[] = vif
-  smAbortCaptureMessage(keMsgHdrFromPayload(result))
 proc deliverAbort(request: pointer): cint =
   result = sm_connect_abort_req_handler(request)
   if result == KeMsgConsumed: ke_msg_free(keMsgHdrFromPayload(request))
@@ -121,7 +128,8 @@ proc makeDisconnect(vif = 1'u8; length = 1'u32): pointer =
   result = ke_msg_try_alloc(SM_DISCONNECT_REQ, TASK_SM, TASK_API, length)
   doAssert result != nil
   if length != 0: cast[ptr uint8](result)[] = vif
-  smAbortCaptureMessage(keMsgHdrFromPayload(result))
+  # ke_msg_send stamps it as it queues it.
+  smDisconnectStamp(keMsgHdrFromPayload(result))
   disconnectRequest = result
 proc deliverDisconnect(request: pointer): cint =
   result = sm_disconnect_req_handler(request)
@@ -131,14 +139,16 @@ proc deliverDisconnect(request: pointer): cint =
 
 def program_source() -> str:
     code = SUPPORT + deferred_source()
-    code = code.replace("    connectInfo: pointer\n", "    connectInfo: pointer\n    cancelRequested: uint8\n", 1)
-    code = code.replace("proc smDeferredCancel()\n", """proc smAbortStorageLength(id: uint16; destination: uint8; length: uint32): uint32
-proc smAbortRegister(header: ptr KeMsgHdr)
-proc smAbortForget(header: pointer)
-proc smAbortCaptureMessage(header: ptr KeMsgHdr)
+    fields = "    connectInfo, connectIndMsg: pointer\n"
+    assert code.count(fields) == 1
+    code = code.replace(fields, fields + "    cancelRequested: uint8\n", 1)
+    code = code.replace("proc smDeferredCancel()\n", """proc smDisconnectStorageLength(id: uint16; destination: uint8; length: uint32): uint32
+proc smDisconnectRegister(header: ptr KeMsgHdr)
+proc smDisconnectForget(header: pointer)
+proc smDisconnectStamp(header: ptr KeMsgHdr)
 proc smDeferredCancel()
 """, 1)
-    code = code.replace("  live.delete(index)\n", "  smAbortForget(header)\n  live.delete(index)\n", 1)
+    code = code.replace("  live.delete(index)\n", "  smDisconnectForget(header)\n  live.delete(index)\n", 1)
     original_allocator = procedure(code, "ke_msg_try_alloc")
     allocator = procedure((FW / "kernel_mac_channel.nim").read_text(), "ke_msg_try_alloc")
     code = code.replace(original_allocator, ALLOCATOR + allocator, 1)
@@ -167,16 +177,7 @@ proc smDeferredCancel()
     ending = "  endings.add((status, reason))\n"
     assert code.count(ending) == 1
     code = code.replace(ending, ending + "  if status == 24: outcomes.add((status, reason))\n", 1)
-    abort_file = FW / "station_abort.nim"
-    if abort_file.exists():
-        code += abort_file.read_text()
-    else:
-        code += """
-proc smAbortStorageLength(id: uint16; destination: uint8; length: uint32): uint32 = length
-proc smAbortRegister(header: ptr KeMsgHdr) = discard
-proc smAbortForget(header: pointer) = discard
-proc smAbortCaptureMessage(header: ptr KeMsgHdr) = discard
-"""
+    code += (FW / "station_abort.nim").read_text()
     handlers = (FW / "task_handlers.nim").read_text()
     abort_handlers = ["smAbortOwnsLowerScan", "scan_abort_req_handler", "smQueueOwnedScanAbort",
                       "sm_disconnect_req_handler", "sm_connect_abort_req_handler"]
@@ -213,11 +214,13 @@ doAssert deliverDisconnect(current) == KeMsgNoFree
 doAssert disconnects == 1 and disconnectReplies == 3 and allocations == allocated
 allocFail = false
 
-# Recheck ownership before the normal disconnect handoff.
+# A VIF removed and added again at the same index is another generation.
+currentState = 6
+let removed = makeDisconnect()
+doAssert deliverDisconnect(removed) == KeMsgSaved
+inc rxVifEpochs[1]  # vif_mgmt_unregister
 currentState = SmIdleState
-let replaced = makeDisconnect()
-tlvHook = proc() = inc rxVifEpochs[1]
-doAssert deliverDisconnect(replaced) == KeMsgNoFree
+doAssert deliverDisconnect(removed) == KeMsgNoFree
 doAssert disconnects == 1 and disconnectReplies == 4
 
 # Malformed or unbound requests still release the command, but do no work.
@@ -229,7 +232,7 @@ doAssert disconnects == 1 and disconnectReplies == 7
     "parked_auth": """
 schedule(5)
 let request = makeAbort()
-doAssert deliverAbort(request) == KeMsgConsumed
+doAssert deliverAbort(request) == KeMsgNoFree
 publish()
 drain()
 doAssert sent.len == 0, "cancelled deferred authentication was transmitted"
@@ -238,7 +241,7 @@ doAssert outcomes == @[(24'u16, 3'u16)] and replies == @[0'u8]
     "parked_assoc": """
 schedule(7)
 let request = makeAbort()
-doAssert deliverAbort(request) == KeMsgConsumed
+doAssert deliverAbort(request) == KeMsgNoFree
 publish()
 drain()
 doAssert sent.len == 0, "cancelled deferred association was transmitted"
@@ -249,7 +252,7 @@ schedule()
 publish()
 let pending = queue[0]
 let request = makeAbort()
-doAssert deliverAbort(request) == KeMsgConsumed
+doAssert deliverAbort(request) == KeMsgNoFree
 doAssert live.find(keMsgHdrFromPayload(pending)) >= 0
 drain()
 doAssert sent.len == 0 and outcomes.len == 1
@@ -263,93 +266,50 @@ for state in [3'u16, 4]:
   replies.setLen(0)
   currentState = state
   let request = makeAbort()
-  doAssert deliverAbort(request) == KeMsgConsumed
+  doAssert deliverAbort(request) == KeMsgNoFree
   doAssert outcomes == @[(24'u16, 3'u16)] and replies == @[0'u8]
   doAssert currentState == 10 and deauths == 0
 """,
-    # An abort saved because its confirmation could not be allocated does not
-    # act on a later attempt.
-    "saved_replacement": """
+    # The abort is answered in place: without memory it still acts and is
+    # confirmed, and it is never saved for a later attempt. The pinned
+    # handler allocates its confirmation with ke_msg_alloc.
+    "never_saved": """
+for state in [3'u16, 5]:
+  reset()
+  outcomes.setLen(0)
+  replies.setLen(0)
+  if state == 5: schedule(5)
+  else: currentState = state
+  let request = makeAbort()
+  let before = allocations
+  allocFail = true
+  doAssert deliverAbort(request) == KeMsgNoFree
+  allocFail = false
+  doAssert allocations == before, "the abort allocated its confirmation"
+  doAssert outcomes == @[(24'u16, 3'u16)] and replies == @[0'u8]
+  doAssert live.find(keMsgHdrFromPayload(request)) < 0
+""",
+    # It acts on the attempt live when it is dispatched, if that attempt is
+    # on the VIF it names.
+    "acts_on_the_live_attempt": """
 let request = makeAbort()
-currentState = 3
-allocFail = true
-doAssert deliverAbort(request) == KeMsgSaved
-allocFail = false
 env.connectInfo = addr replacement
 schedule()
-doAssert deliverAbort(request) == KeMsgConsumed
-doAssert outcomes.len == 0 and replies == @[0'u8]
-publish()
-drain()
-doAssert sent.len == 1
-""",
-    "queued_replacement_before_dispatch": """
-let request = makeAbort()
-env.connectInfo = addr replacement
-schedule()
-doAssert deliverAbort(request) == KeMsgConsumed
-doAssert outcomes.len == 0 and replies == @[0'u8]
-publish()
-drain()
-doAssert sent.len == 1
-""",
-    "saved_epoch": """
-let request = makeAbort()
-currentState = 4
-allocFail = true
-doAssert deliverAbort(request) == KeMsgSaved
-allocFail = false
-inc rxVifEpochs[1]
-schedule()
-doAssert deliverAbort(request) == KeMsgConsumed
-doAssert outcomes.len == 0
-publish()
-drain()
-doAssert sent.len == 1
-""",
-    "allocation_replacement": """
-schedule()
-let request = makeAbort()
-allocationHook = proc() =
-  env.connectInfo = addr replacement
-  schedule(7)
-doAssert deliverAbort(request) == KeMsgConsumed
-doAssert outcomes.len == 0 and replies == @[0'u8]
-publish()
-drain()
-doAssert sent.len == 1 and sent[0].kind == 7
-""",
-    "allocation_failure": """
-schedule()
-let request = makeAbort()
-allocFail = true
-doAssert deliverAbort(request) == KeMsgSaved
-doAssert outcomes.len == 0 and replies.len == 0 and chan.deferredMsg != nil
-allocFail = false
-doAssert deliverAbort(request) == KeMsgConsumed
+doAssert deliverAbort(request) == KeMsgNoFree
 doAssert outcomes.len == 1 and replies == @[0'u8]
+publish()
+drain()
+doAssert sent.len == 0
 """,
-    "two_inflight": """
-let first = makeAbort()
-currentState = 3
-allocFail = true
-doAssert deliverAbort(first) == KeMsgSaved
-allocFail = false
-env.connectInfo = addr replacement
-schedule(7)
-let second = makeAbort()
-doAssert deliverAbort(first) == KeMsgConsumed
-doAssert outcomes.len == 0 and currentState == 7
-doAssert deliverAbort(second) == KeMsgConsumed
-doAssert outcomes.len == 1 and replies == @[0'u8, 0]
-""",
+    # The host starts another attempt while it handles the confirmation,
+    # which is sent last: that attempt is not aborted.
     "reply_replacement": """
 schedule()
 let request = makeAbort()
 publicationHook = proc() =
   env.connectInfo = addr replacement
   schedule(7)
-doAssert deliverAbort(request) == KeMsgConsumed
+doAssert deliverAbort(request) == KeMsgNoFree
 doAssert currentState == 7 and chan.deferredMsg != nil
 publish()
 drain()
@@ -359,8 +319,7 @@ doAssert sent.len == 1 and sent[0].kind == 7 and outcomes.len == 1
 schedule()
 let request = ke_msg_try_alloc(SM_CONNECT_ABORT_REQ, TASK_SM, TASK_API, 2)
 cast[ptr uint8](request)[] = 1
-smAbortCaptureMessage(keMsgHdrFromPayload(request))
-doAssert deliverAbort(request) == KeMsgConsumed
+doAssert deliverAbort(request) == KeMsgNoFree
 doAssert outcomes.len == 0 and replies == @[1'u8]
 publish()
 drain()
@@ -369,7 +328,7 @@ doAssert sent.len == 1
     "wrong_vif": """
 schedule()
 let request = makeAbort(0)
-doAssert deliverAbort(request) == KeMsgConsumed
+doAssert deliverAbort(request) == KeMsgNoFree
 doAssert outcomes.len == 0 and replies == @[1'u8]
 publish()
 drain()
@@ -378,18 +337,7 @@ doAssert sent.len == 1
     "invalid_vif": """
 schedule()
 let request = makeAbort(2)
-doAssert deliverAbort(request) == KeMsgConsumed
-doAssert outcomes.len == 0 and replies == @[1'u8]
-""",
-    "payload_changed": """
-let request = makeAbort()
-currentState = 3
-allocFail = true
-doAssert deliverAbort(request) == KeMsgSaved
-allocFail = false
-cast[ptr uint8](request)[] = 0
-schedule()
-doAssert deliverAbort(request) == KeMsgConsumed
+doAssert deliverAbort(request) == KeMsgNoFree
 doAssert outcomes.len == 0 and replies == @[1'u8]
 """,
     "response_window": """
@@ -397,27 +345,27 @@ for state in [6'u16, 8, 9]:
   reset()
   currentState = state
   let request = makeAbort()
-  doAssert deliverAbort(request) == KeMsgConsumed
+  doAssert deliverAbort(request) == KeMsgNoFree
 doAssert deauths == 3 and outcomes.len == 0 and replies == @[0'u8, 0, 0]
 """,
     "idle": """
 env.connectInfo = nil
 currentState = 0
 let request = makeAbort()
-doAssert deliverAbort(request) == KeMsgConsumed
+doAssert deliverAbort(request) == KeMsgNoFree
 doAssert outcomes.len == 0 and deauths == 0 and replies == @[0'u8]
 """,
     "disconnecting": """
 currentState = 10
 let request = makeAbort()
-doAssert deliverAbort(request) == KeMsgConsumed
+doAssert deliverAbort(request) == KeMsgNoFree
 doAssert outcomes.len == 0 and deauths == 0 and replies == @[0'u8]
 """,
     "scanning": """
 currentState = 1
 beginScan(owned = true)
 let request = makeAbort()
-doAssert deliverAbort(request) == KeMsgConsumed
+doAssert deliverAbort(request) == KeMsgNoFree
 doAssert env.cancelRequested == 1 and scanAborts == 1 and cacheClears == 1
 doAssert replies == @[1'u8]
 deliverScanAbort()
@@ -428,58 +376,37 @@ currentState = 1
 # SCANU holds a public scan; this station connection's scan is still saved.
 beginScan(owned = false)
 let request = makeAbort()
-doAssert deliverAbort(request) == KeMsgConsumed
+doAssert deliverAbort(request) == KeMsgNoFree
 doAssert env.cancelRequested == 1 and replies == @[1'u8]
 doAssert scanAborts == 0, "station cancellation interrupted the public scan"
 doAssert cacheClears == 0, "station cancellation erased public scan results"
 """,
-    "scan_replacement": """
-currentState = 1
-beginScan(owned = true)
-let request = makeAbort()
-scanHook = proc() =
-  env.connectInfo = addr replacement
-  inc rxVifEpochs[1]
-  currentState = 1
-doAssert deliverAbort(request) == KeMsgConsumed
-doAssert cacheClears == 0 and replies == @[1'u8]
-beginScan(owned = false)
-deliverScanAbort()
-doAssert scan_env.abortFlag == 0 and scanTerminations == 0
-""",
     "scan_abort_old_epoch": """
 currentState = 1
 beginScan(owned = true)
-doAssert deliverAbort(makeAbort()) == KeMsgConsumed
+doAssert deliverAbort(makeAbort()) == KeMsgNoFree
 doAssert pendingScanAborts.len == 1
 # Reuse the same lower allocation with a new logical scan.
 beginScan(owned = true)
 deliverScanAbort()
 doAssert scan_env.abortFlag == 0 and scanTerminations == 0
 """,
-    "scan_abort_replaced_while_allocating": """
-currentState = 1
-beginScan(owned = true)
-let request = makeAbort()
-allocationHook = proc() =
-  allocationHook = proc() = beginScan(owned = true)
-doAssert deliverAbort(request) == KeMsgConsumed
-doAssert env.cancelRequested == 1 and replies == @[1'u8]
-doAssert scanAborts == 0 and cacheClears == 0 and live.len == 0
-""",
+    # Without memory for SCAN_ABORT_REQ the lower scan runs to its end; the
+    # station's scan still completes as cancelled (cancelRequested).
     "scan_abort_optional_allocation": """
 currentState = 1
 beginScan(owned = true)
 let request = makeAbort()
-allocationHook = proc() = allocFail = true
-doAssert deliverAbort(request) == KeMsgConsumed
+allocFail = true
+doAssert deliverAbort(request) == KeMsgNoFree
+allocFail = false
 doAssert env.cancelRequested == 1 and replies == @[1'u8]
 doAssert scanAborts == 0 and cacheClears == 0 and live.len == 0
 """,
     "waiting": """
 currentState = 2
 let request = makeAbort()
-doAssert deliverAbort(request) == KeMsgConsumed
+doAssert deliverAbort(request) == KeMsgNoFree
 doAssert env.cancelRequested == 1 and scanAborts == 0 and replies == @[0'u8]
 """,
     # Pinned sm_connect_abort_req_handler only confirms an abort in states 5
@@ -491,7 +418,7 @@ for state in [5'u16, 7]:
   replies.setLen(0)
   discard smGo(state)
   let request = makeAbort()
-  doAssert deliverAbort(request) == KeMsgConsumed
+  doAssert deliverAbort(request) == KeMsgNoFree
   doAssert outcomes == @[(24'u16, 3'u16)] and replies == @[0'u8]
   doAssert currentState == 10 and deauths == 0
 """,
@@ -499,43 +426,43 @@ for state in [5'u16, 7]:
 schedule()
 let request = makeAbort()
 interruptsEnabled = false
-doAssert deliverAbort(request) == KeMsgConsumed
+doAssert deliverAbort(request) == KeMsgNoFree
 doAssert not interruptsEnabled and outcomes.len == 1
 interruptsEnabled = true
 """,
     "storage_limits": """
-doAssert smAbortStorageLength(0x777, TASK_SM, 17) == 17
-doAssert smAbortStorageLength(SM_CONNECT_ABORT_REQ, TASK_SM, 0) == 0
-doAssert smAbortStorageLength(SM_CONNECT_ABORT_REQ, TASK_SM, 1) > 1
+doAssert smDisconnectStorageLength(0x777, TASK_SM, 17) == 17
+doAssert smDisconnectStorageLength(SM_CONNECT_ABORT_REQ, TASK_SM, 1) == 1
+doAssert smDisconnectStorageLength(SM_DISCONNECT_REQ, TASK_SM, 0) == 0
+doAssert smDisconnectStorageLength(SM_DISCONNECT_REQ, TASK_SM, 1) > 1
 for delta in 0'u32 .. 15:
   let before = allocations
-  doAssert ke_msg_try_alloc(SM_CONNECT_ABORT_REQ, TASK_SM, TASK_API, high(uint32) - delta) == nil
+  doAssert ke_msg_try_alloc(SM_DISCONNECT_REQ, TASK_SM, TASK_API, high(uint32) - delta) == nil
   doAssert allocations == before
-let request = makeAbort()
+let request = makeDisconnect()
 doAssert keMsgHdrFromPayload(request).paramLen == 1
 currentState = 0
-doAssert deliverAbort(request) == KeMsgConsumed
+doAssert deliverDisconnect(request) == KeMsgNoFree
 """,
     "recycled_request": """
 env.connectInfo = nil
-currentState = 0
+currentState = 6
 for index in 0..<100:
-  let request = makeAbort()
-  doAssert deliverAbort(request) == KeMsgConsumed
-  doAssert smAbortTags == nil
-doAssert replies.len == 100 and live.len == 0
+  let request = makeDisconnect()
+  inc rxVifEpochs[1]
+  doAssert deliverDisconnect(request) == KeMsgNoFree
+  doAssert smDisconnectStamps == nil
+doAssert disconnectReplies == 100 and live.len == 0
 """,
 }
 
 
 MUTATIONS = {
-    "connection": ("smEnvView().connectInfo == identity.connection and", "true and", "saved_replacement"),
-    "epoch": ("rxVifEpochs[identity.vifIndex] == identity.vifEpoch and", "true and", "saved_epoch"),
-    "disconnect_epoch": ("rxVifEpochs[identity.vifIndex] == identity.vifEpoch and", "true and",
+    "disconnect_epoch": ("rxVifEpochs[stamp.vif] == stamp.vifEpoch and", "true and",
                          "disconnect_lifetime"),
-    "capture": ("  smAbortCaptureMessage(keMsgHdrFromPayload(result))\nproc deliverAbort",
-                "  discard\nproc deliverAbort", "queued_replacement_before_dispatch"),
-    "release": ("  smAbortForget(header)", "  discard", "recycled_request"),
+    "capture": ("  smDisconnectStamp(keMsgHdrFromPayload(result))\n  disconnectRequest",
+                "  disconnectRequest", "disconnect_lifetime"),
+    "release": ("  smDisconnectForget(header)", "  discard", "recycled_request"),
     "scan_abort_epoch": ("cast[ptr uint32](param)[] != scanRequestEpoch or ", "", "scan_abort_old_epoch"),
 }
 
@@ -550,7 +477,7 @@ def run_case(tmp_path: Path, case: str, mode: str = "checked", mutation: str = "
         old, new, _ = MUTATIONS[mutation]
         assert code.count(old) == 1
         code = code.replace(old, new, 1)
-    path.write_text(code + "\nreset()\n" + CASES[case] + "\nfinish()\ndoAssert smAbortTags == nil\n")
+    path.write_text(code + "\nreset()\n" + CASES[case] + "\nfinish()\ndoAssert smDisconnectStamps == nil\n")
     flags = {"checked": [], "release": ["-d:release", "--assertions:on"],
              "asan": ["--cc:clang", "--passC:-fsanitize=address", "--passL:-fsanitize=address"]}[mode]
     result = subprocess.run([nim, "c", "-r", "--skipParentCfg:on", "--skipProjCfg:on",
@@ -577,8 +504,13 @@ def test_station_abort_guards(tmp_path: Path, mutation: str) -> None:
 def test_abort_message_hooks() -> None:
     kernel = (FW / "kernel_mac_channel.nim").read_text()
     sender = procedure(kernel, "ke_msg_send")
-    assert sender.index("smAbortCaptureMessage(hdr)") < sender.index("co_list_push_back")
-    assert "smAbortRegister(hdr)" in procedure(kernel, "ke_msg_try_alloc")
-    assert "smAbortForget(param)" in procedure(kernel, "ke_msg_free")
+    assert sender.index("smDisconnectStamp(hdr)") < sender.index("co_list_push_back")
+    assert "smDisconnectRegister(hdr)" in procedure(kernel, "ke_msg_try_alloc")
+    assert "smDisconnectForget(param)" in procedure(kernel, "ke_msg_free")
+    # The abort is answered in place and never saved: it needs no stamp.
+    tasks = (FW / "task_handlers.nim").read_text()
+    abort = procedure(tasks, "sm_connect_abort_req_handler")
+    assert "KeMsgSaved" not in abort and "ke_msg_try_alloc" not in abort
+    assert "SM_CONNECT_ABORT_REQ" not in (FW / "station_abort.nim").read_text().split("type", 1)[1]
     # A message delivered to the host is retired by ke_msg_free, which forgets it.
     assert "ke_msg_free(hdr)" in sender.split("bl_rx_e2a_handler(", 1)[1]

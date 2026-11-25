@@ -110,6 +110,7 @@ var
   keyFailure: uint8
   addressOk: bool
   haltCalls: int
+  haltOk: bool
   irq: bool
   messagesFreed: int
   extraFrame: Frame
@@ -212,7 +213,7 @@ proc txl_frame_release(p: pointer; notify: bool) =
 proc txlHaltStationQueues(index: uint8; selected: var uint8): bool =
   inc haltCalls
   if hookSite == "halt": invokeHook("halt")
-  true
+  haltOk
 proc txl_retire_station(index: uint8; selected: uint8) =
   doAssert index == 2
   doAssert stations[index].valid == 0
@@ -280,6 +281,7 @@ proc setup(vif: uint8; ap: bool) =
   keyFailure = 0xFF
   addressOk = true
   haltCalls = 0
+  haltOk = true
   mmStaDeletions = default(typeof(mmStaDeletions))
   mmStaDelRetryMask = 0
   irq = true
@@ -363,6 +365,35 @@ co_list_extract(addr vifs[0].stations, addr stations[2].link)
 mm_sta_del(2)
 sta_mgmt_unregister(2)
 doAssert events.len == 0 and sta_info_env.first == nil
+
+# A station whose VIF was removed is on no list: vif_mgmt_unregister cleared
+# the VIF's list, and a VIF the host adds again at that index does not list
+# it. It cannot be removed, so its delete is done: no retry is armed, one
+# armed before the removal (a failed TX halt) ends, and the station is left
+# as it is. Before, the delete was retried every 100 ms until MM_RESET. A
+# station still listed whose TX halt fails is retried.
+for readded in [false, true]:
+  for retryFirst in [false, true]:
+    setup(0, false)
+    if retryFirst:
+      haltOk = false
+      mm_sta_del(2)
+      doAssert mmStaDelRetryMask == 0x04 and stations[2].valid == 1,
+        "a failed TX halt was not retried"
+      haltOk = true
+    vifs[0].stations = default(CoList)
+    if readded:
+      stations[4] = Sta(instNbr: 0, valid: 1, marker: 4444)
+      co_list_push_back(addr vifs[0].stations, addr stations[4].link)
+    let epoch = staDeleteEpoch(2)
+    if retryFirst: mmStaDelRetryCb(nil)
+    else: mm_sta_del(2)
+    doAssert mmStaDelRetryMask == 0, "the delete of a removed VIF's station is retried for ever"
+    doAssert stations[2].valid == 1 and stations[2].marker == 1234 and stations[2].instNbr == 0
+    doAssert staDeleteEpoch(2) == epoch and not mmStaDeletions[2].active
+    doAssert keys.len == 0 and events.len == 0 and sta_info_env.first == nil
+    doAssert vifs[0].stations.first == (if readded: addr stations[4].link else: nil)
+    doAssert stations[4].valid == readded.uint8
 
 # Retirement cancels old requests in both queues without changing ownership.
 setup(0, false)
@@ -643,7 +674,8 @@ doAssert stations[1].marker == 777 and "zero" notin events
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 @pytest.mark.parametrize("mutation", [None, "key_failure", "address_failure", "begin_owner", "init_failure",
     "mm_owner", "reset_owner", "reset_pending", "reset_retired", "drain_capture", "drain_irq", "finish_epoch",
-    "finish_valid", "finish_vif", "finish_pool", "finish_scope", "ps_handoff", "callback_irq"])
+    "finish_valid", "finish_vif", "finish_pool", "finish_scope", "ps_handoff", "callback_irq",
+    "orphan_retry", "halt_done"])
 def test_station_retirement_is_callback_safe(tmp_path: Path, mode: str, mutation: str | None) -> None:
     nim = shutil.which("nim")
     if nim is None:
@@ -705,6 +737,13 @@ def test_station_retirement_is_callback_safe(tmp_path: Path, mode: str, mutation
             "not owner.stationTracked or owner.station >= STA_MGMT_FREE_STAS.uint8", "false")
     elif mutation == "callback_irq":
         deletion = deletion.replace("      irqRestore(saved)\n      try:", "      discard\n      try:")
+    elif mutation == "orphan_retry":
+        # The delete of a removed VIF's station is retried, as before.
+        deletion = re.sub(r"return station\.valid == 0 or [^\n]*\n[^\n]*\n[^\n]*\n",
+                          "return station.valid == 0\n", deletion, count=1)
+    elif mutation == "halt_done":
+        deletion = re.sub(r"return station\.valid == 0 or [^\n]*\n[^\n]*\n[^\n]*\n",
+                          "return true\n", deletion, count=1)
     elif mutation == "ps_handoff":
         deletion = deletion.replace("        apm_tx_int_ps_clear(cast[pointer](vif), bcmcStaIdx)",
                                     "        outsideLock(apm_tx_int_ps_clear(cast[pointer](vif), bcmcStaIdx))")

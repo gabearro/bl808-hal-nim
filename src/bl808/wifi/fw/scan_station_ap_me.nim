@@ -2317,20 +2317,16 @@ proc scanuResultSlotIndex(entry: ptr ScanuResultEntry): uint32 {.inline.} =
 # ###########################################################################
 
 proc sm_init*() {.exportc, cdecl.} =
-  ## Initialize SM module.
-  smActivationCancel()
-  smBssCancel()
-  smCleanupCancel()
+  ## Initialize SM module. Pinned sm_init clears only sm_env[0]; here an
+  ## attempt or teardown in progress is dropped, and the SM_CONNECT_REQ and
+  ## SM_CONNECT_IND it parked are freed (smAbandon).
+  smAbandon()
   smConnecting = false
   smAuthRetryLimit = 4
   smReconnectTrigger = false
   let sm = smEnvView()
-  sm.connectInfo = nil
-  # A parked indication would make every later connect request report busy.
-  sm.connectIndMsg = nil
   sm.deauthPending = 1
   sm.authRetryLimit = 4
-  smGo(SmIdleState)
 
 proc sm_get_bss_params*(selectedBssResultOut: ptr pointer, selectedBssChannelOut: ptr pointer) {.exportc, cdecl.} =
   ## Get BSS parameters from scan results.
@@ -2551,7 +2547,7 @@ proc smSubmitScanRequest(localMac, targetBssid, channelInfo: pointer;
   template invalidInput() =
     sm_connect_ind(WLAN_FW_SCAN_NO_BSSID_AND_CHANNEL.uint16, 0xFFFF)
   let vifIdx = connectInfoView(connectionPtr).vifIdx
-  # The STA VIF can be removed while the attempt scans (SCAN-N3).
+  # An FT request (authType 2) is admitted on a VIF of any type.
   if localMac == nil or (joining and (targetBssid == nil or channelInfo == nil)) or
       vifIdx >= MAX_VIFS.uint8 or vifChannelForIdx(vifIdx).vifIdx != vifIdx or
       vifChannelForIdx(vifIdx).vifType != VIF_TYPE_STA:

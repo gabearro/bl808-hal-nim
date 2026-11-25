@@ -46,4 +46,4 @@ def test_ended_attempt_does_not_send_its_request(tmp_path: Path) -> None:
 
 def test_retired_vif_ends_the_attempt(tmp_path: Path) -> None:
     from test_wifi_deferred_auth_lifetime import run_case
-    run_case(tmp_path, "vif_retired_while_queued")
+    run_case(tmp_path, "vif_removed_while_parked")
