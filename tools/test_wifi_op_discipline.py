@@ -19,6 +19,14 @@ correct without reading every callee:
 
 The session/owner machinery that these rules replaced (smTx*, the per-VIF
 TX serials, SmTxBuildContext) must not come back.
+
+The same rules hold for TASK_SCAN and TASK_SCANU (scan_machine.nim): scanGo
+and scanuGo are their only state writers and the only writers of their
+operations; the dwell's notices, its probe repeat timer and END_EARLY carry
+its stamp and every handler that takes one checks it (scanCurrent); SCANU
+takes TASK_SCAN's answer only as the request it holds (scanuTakeLower); each
+machine ends a request in one place (scanRelease, scanuComplete); and the
+dwell, lower-exchange and producer machinery they replaced must not come back.
 """
 
 from pathlib import Path
@@ -103,7 +111,7 @@ def test_one_state_writer_and_one_serial_writer() -> None:
     assert "ke_state_set(TASK_SM, state)" in go and "opGo(smOwn.op)" in go
     advancers = [path.relative_to(WIFI) for path in all_firmware()
                  for line in code(path.read_text()).splitlines()
-                 if re.search(r"\bopGo\(|\bopFinish\(|\bsmOwn(\.op(\.\w+)?)?\s*=[^=]", line)
+                 if re.search(r"\bop(Go|Finish)\(smOwn\b|\bsmOwn(\.op(\.\w+)?)?\s*=[^=]", line)
                  and path.name != "op.nim"]
     assert advancers == [Path("fw/station_sm.nim")], advancers
 
@@ -216,3 +224,137 @@ def test_session_machinery_is_gone() -> None:
     identity = (FW / "layout_types.nim").read_text().split("  TxFrameIdentity = object", 1)[1]
     identity = identity.split("\n\n", 1)[0]
     assert not re.search(r"\bsm[A-Z]\w*", identity), identity
+
+
+# --------------------------------------------------------------------------
+# TASK_SCAN and TASK_SCANU
+# --------------------------------------------------------------------------
+
+SCAN_MACHINE = FW / "scan_machine.nim"
+
+
+def scan_handlers(*tables: str) -> list[str]:
+    source = (FW / "dispatch_tables.nim").read_text()
+    names = set()
+    for table in tables:
+        block = source.split(f"var {table}*", 1)[1].split("\n]\n", 1)[0]
+        names.update(re.findall(r"keMsgHandlerAddress\((\w+)\)", block))
+    return sorted(names - {"ke_msg_save", "ke_msg_discard"})
+
+
+SCAN_HANDLERS = scan_handlers("scan_default_state")
+SCANU_HANDLERS = scan_handlers("scanu_idle", "scanu_scanning", "scanu_joining", "scanu_default_state")
+
+
+@pytest.mark.parametrize("task,go", [("TASK_SCAN", "scanGo"), ("TASK_SCANU", "scanuGo")])
+def test_scan_machines_have_one_state_writer(task: str, go: str) -> None:
+    writers = [(path.relative_to(WIFI), line.strip()) for path in all_firmware()
+               for line in code(path.read_text()).splitlines()
+               if re.search(rf"ke_state_set\({task}\b", line)]
+    assert writers == [(Path("fw/scan_machine.nim"), f"ke_state_set({task}, state)")], writers
+    assert f"ke_state_set({task}, state)" in procedure(SCAN_MACHINE.read_text(), go)
+
+
+@pytest.mark.parametrize("owner", ["scanOwn", "scanuOwn"])
+def test_scan_operations_advance_only_in_their_go(owner: str) -> None:
+    """The stamp of a dwell or a SCANU request changes only in scanGo or
+    scanuGo; their records are written only in scan_machine.nim."""
+    writers = [(path.relative_to(WIFI), line.strip()) for path in all_firmware()
+               for line in code(path.read_text()).splitlines()
+               if re.search(rf"\bop(Go|Finish)\({owner}\b|\b{owner}(\.\w+)*\s*=[^=]", line)]
+    assert {path for path, _ in writers} == {Path("fw/scan_machine.nim")}, writers
+    machine = SCAN_MACHINE.read_text()
+    go = "scanGo" if owner == "scanOwn" else "scanuGo"
+    advancing = [line for _, line in writers if re.search(r"\bop(Go|Finish)\(", line)]
+    assert all(line in procedure(machine, go) for line in advancing), advancing
+
+
+@pytest.mark.parametrize("handler", SCAN_HANDLERS + SCANU_HANDLERS)
+def test_scan_handlers_leave_the_state_to_their_go(handler: str) -> None:
+    body = code(find_procedure(handler))
+    assert "ke_state_set(" not in body, handler
+    assert not re.search(r"\bop(Go|Finish)\(", body), handler
+
+
+def test_scan_deliveries_carry_the_dwell_stamp() -> None:
+    """START, END, END_EARLY and the probe repeat expiry are taken only with
+    the live dwell's stamp; the timer and END_EARLY are stamped when made."""
+    for handler in ["mm_scan_channel_start_ind_handler", "mm_scan_channel_end_ind_handler",
+                    "mm_scan_channel_end_early_handler", "scan_probe_req_handler"]:
+        assert "scanCurrent(param, " in code(find_procedure(handler)), handler
+    arming = [(path.name, line.strip()) for path in all_firmware()
+              for line in code(path.read_text()).splitlines()
+              if "SCAN_PROBE_TIMER" in line and re.search(r"ke_timer(_try)?_set\(", line)]
+    assert len(arming) == 1 and arming[0][0] == "task_handlers.nim", arming
+    start = code(find_procedure("mm_scan_channel_start_ind_handler"))
+    assert "stamp = scanOwn.op.serial" in start
+    machine = SCAN_MACHINE.read_text()
+    assert "stampOf(message) = scanOwn.op.serial" in procedure(machine, "scanEarlyEndRequest")
+    begin = procedure(machine, "scanDwellBegin")
+    assert "stampOf(start) = stamp" in begin and "stampOf(finish) = stamp" in begin
+    sent = [(path.name, line.strip()) for path in all_firmware()
+            for line in code(path.read_text()).splitlines()
+            if re.search(r"MM_SCAN_CHANNEL_(START_IND|END_IND|END_EARLY)\b", line)
+            and re.search(r"ke_msg_(send_basic|try_alloc|alloc)\(", line)]
+    assert sorted(name for name, _ in sent) == ["scan_machine.nim"] * 3, sent
+
+
+def test_scanu_takes_only_the_answer_it_holds() -> None:
+    for handler in ["scan_start_cfm_handler", "scan_done_ind_handler"]:
+        assert "scanuTakeLower(param)" in code(find_procedure(handler)), handler
+    done = code(find_procedure("scan_done_ind_handler"))
+    assert "param == scanu_env.pendingJoinRxuMgtInd" in done
+    start = code(find_procedure("scan_start_req_handler"))
+    assert "requester == TASK_SCANU and not scanuAwaits(param)" in start
+
+
+def test_each_scan_machine_ends_a_request_in_one_place() -> None:
+    """scanRelease answers TASK_SCAN's request and goes idle; scanuComplete
+    answers SCANU's request and goes idle (scanu_confirm and the replay)."""
+    machine = SCAN_MACHINE.read_text()
+    release = procedure(machine, "scanRelease")
+    assert "scan_env.paramPtr = nil" in release and "scanGo(ScanIdleState)" in release
+    complete = procedure(machine, "scanuComplete")
+    assert "scanu_env.paramPtr = nil" in complete and "scanuGo(ScanuIdleState)" in complete
+    assert procedure(machine, "scanu_confirm").strip().endswith("scanuComplete(status)")
+    for path in all_firmware():
+        for line in code(path.read_text()).splitlines():
+            if re.search(r"\bscan_env\.paramPtr\s*=[^=]", line):
+                assert path.name in ("scan_machine.nim", "task_handlers.nim"), (path, line)
+            if re.search(r"\bscanu_env\.paramPtr\s*=[^=]", line):
+                assert path.name in ("scan_machine.nim", "task_handlers.nim"), (path, line)
+    tasks = (FW / "task_handlers.nim").read_text()
+    # The handlers store a request only on admission.
+    assert code(procedure(tasks, "cacheScanStartContext")).count("scan_env.paramPtr = param") == 1
+    for handler in ["scanu_start_req_handler", "scanu_join_req_handler"]:
+        body = code(procedure(tasks, handler))
+        assert body.count("scanu_env.paramPtr = param") == 1, handler
+        assert body.index("scanu_env.paramPtr = param") < body.index("scanuGo(")
+
+
+def test_scan_machine_takes_no_irq_lock_and_ignores_the_tx_reset_epoch() -> None:
+    text = code(SCAN_MACHINE.read_text())
+    assert "irqSave" not in text and "txResetEpoch" not in text
+    for handler in SCAN_HANDLERS + SCANU_HANDLERS:
+        body = code(without_diagnostics(find_procedure(handler)))
+        assert "txResetEpoch" not in body, handler
+        if handler != "rxu_mgt_ind_handler_scanu":
+            assert "irqSave" not in body, handler
+
+
+def test_scan_machinery_is_gone() -> None:
+    text = "".join(code(path.read_text()) for path in all_firmware())
+    for name in ["ScanDwellPair", "ScanDwellPosted", "ScanDwellRetired", "scanDwellHeld",
+                 "scanDwellRequest", "scanDwellOwnsLower", "scanDwellEpoch", "scanDwellSerial",
+                 "scanDwellSlot", "scanDwellResetEpoch", "scanDwellChannel", "scanDwellPostedHead",
+                 "scanDwellReserve", "scanDwellInstall", "scanDwellCurrent", "scanDwellPublish",
+                 "scanDwellClaim", "scanDwellDetach", "scanDwellForget", "scanDwellReset",
+                 "scanDwellBeginReset", "scanDwellFinishReset", "scanDwellDispose",
+                 "scanEarlyEndClaim", "ScanProbeTimerContext", "scanProbeTimerCurrent",
+                 "scheduleActiveScanProbeTimer", "ScanuLowerExchange", "scanuLower",
+                 "scanuLowerCurrent", "scanuTrackLowerReply", "scanuClaimLowerReply",
+                 "scanuProducerRequest", "scanuProducerEpoch", "scanRequestEpoch",
+                 "scanuRequestEpoch", "releaseCompletedScanRequest", "forwardFailedScanDwell",
+                 "scanuReleaseCompletedOwner", "cacheScanuStartRequest", "SmScanAbortPayloadSize"]:
+        assert not re.search(rf"\b{name}\b", text), name
+    assert not re.search(r"\bscanEarlyEnd\b", text)

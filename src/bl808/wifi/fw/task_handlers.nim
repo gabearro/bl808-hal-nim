@@ -1087,80 +1087,38 @@ proc applyScanChannelRxFilter*(passiveFlag: uint8) {.inline.} =
   rfPhyTraceCheckpoint(0x4F'u32)
   nimFwScanRxFilterProbe()
 
-type ScanProbeTimerContext = tuple[param: pointer, epoch: uint32, channel: uint8]
-
-proc scanProbeTimerCurrent(context: pointer): bool {.nimcall.} =
-  let owner = cast[ptr ScanProbeTimerContext](context)
-  scan_env.paramPtr == owner.param and scanRequestEpoch == owner.epoch and
-    scan_env.channelIndex == owner.channel and
-    ke_state_get(TASK_SCAN) == ScanChannelPendingState
-
-proc scheduleActiveScanProbeTimer*(scanParam: pointer; requestEpoch: uint32;
-                                   channelIndex: uint8): bool {.inline.} =
-  var owner: ScanProbeTimerContext = (scanParam, requestEpoch, channelIndex)
-  template current(): bool = scanProbeTimerCurrent(addr owner)
-  if scan_probe_req_tx() != 0:
-    let logFn = cast[proc(format: cstring) {.cdecl, varargs.}](blOpsFunc(4))
-    if logFn != nil:
-      logFn("scan_probe_req_tx f\r\n")
-  if not current(): return false
-  let duration = scan_get_scan_duration()
-  if not current(): return false
-  let delay = duration shr 1
-  # The channel timer ends the dwell independently of this optional retry.
-  if delay != 0 and delay <= KE_TIMER_MAX_DELAY:
-    discard ke_timer_try_set(SCAN_PROBE_TIMER, TASK_SCAN, delay)
-  current()
-
-proc scanTaskInChannelRunningState*(): bool {.inline.} =
-  ke_state_get(TASK_SCAN) == ScanChannelRunningState
-
-proc enterScanChannelRunningState*() {.inline.} =
-  ke_state_set(TASK_SCAN, ScanChannelRunningState)
-
-proc sendPeriodicScanProbeRequest*(): uint8 {.inline.} =
-  scan_probe_req_tx()
-
 proc mm_scan_channel_start_ind_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle scan channel start indication (68 instrs in blob).
   ## From blob (scan_task.o): checks ke_state_get(SCAN)==2 (asserts), reads scan
   ## config, sets EDCA params with passive/active flag, writes to MACHW RX filter
   ## register (0x24B00060), optionally sends active-scan probe requests, arms
   ## SCAN_PROBE_TIMER, and sets ke_state(SCAN, 3).
-  if not scanDwellClaim(param): return KeMsgConsumed
-  let state = ke_state_get(TASK_SCAN)
-  if state != ScanChannelPendingState:
-    assert_err("scan_task.c", "scan_task.c", 159)
-    return KeMsgConsumed
-  # Read scan env parameters
-  let scanParam = scan_env.paramPtr
-  if scanParam == nil: return KeMsgConsumed
-  let requestEpoch = scanRequestEpoch
-  let currentChannel = scan_env.channelIndex
-  template current(): bool =
-    scan_env.paramPtr == scanParam and scanRequestEpoch == requestEpoch and
-      scan_env.channelIndex == currentChannel and
-      ke_state_get(TASK_SCAN) == ScanChannelPendingState
-  # Set EDCA params for scan: check passive flag (param byte 3, bit 0)
-  let scanReq = scanStartReqView(scanParam)
-  if scan_env.channelIndex >= scanReq.channelCount or
-      scan_env.channelIndex.int >= scanReq.channelList.len:
-    return KeMsgConsumed
+  ## Only the live dwell's START is taken (scanCurrent); the blob asserts the
+  ## state. A dwell whose scan was stopped while it waited (an abort, a cancel
+  ## or SCANU's stop) leaves its channel at once instead of probing.
+  if not scanCurrent(param, ScanChannelPendingState): return KeMsgConsumed
+  let scanReq = scanStartReqView(scan_env.paramPtr)
   let passiveFlag = scanReq.channelList[scan_env.channelIndex.int].flags
   applyScanChannelRxFilter(passiveFlag)
-  if not current(): return KeMsgConsumed
   nimFwDbgScanStartRxCtrl = regRead(MACHW_RX_CNTRL_REG)
   nimFwDbgScanStartIrqRaw = regRead(MACHW_INTC_STATUS_RAW)
   nimFwDbgScanStartGenRaw = regRead(MACHW_INTC_GEN_RAW)
   snapshotPhyChannel(nimFwDbgScanStartPhyRaw)
   rfPhyTraceCheckpoint(0x50'u32)
-  if not current(): return KeMsgConsumed
-  # Active scan: send probe requests and set scan timer
-  if (passiveFlag and 1) == 0:
-    if not scheduleActiveScanProbeTimer(scanParam, requestEpoch, currentChannel):
-      return KeMsgConsumed
-  if not current(): return KeMsgConsumed
-  enterScanChannelRunningState()
+  let stopped = scan_env.abortFlag != 0
+  if not stopped and (passiveFlag and 1) == 0:
+    # Active scan: probe now and again half way through the dwell. The
+    # channel timer ends the dwell independently of this optional repeat.
+    if scan_probe_req_tx() != 0:
+      let logFn = cast[proc(format: cstring) {.cdecl, varargs.}](blOpsFunc(4))
+      if logFn != nil:
+        logFn("scan_probe_req_tx f\r\n")
+    let delay = scan_get_scan_duration() shr 1
+    if delay != 0 and delay <= KE_TIMER_MAX_DELAY:
+      discard ke_timer_try_set(SCAN_PROBE_TIMER, TASK_SCAN, delay,
+                               stamp = scanOwn.op.serial)
+  scanGo(ScanChannelRunningState)
+  if stopped and scanOnChannel(): scan_terminate_channel_request()
   when defined(bl808WifiDiagWarmScan): inc nimFwDbgWarmScan.start_handled
   return KeMsgConsumed
 
@@ -1175,58 +1133,6 @@ proc advanceScanChannelIndex*(): uint8 {.inline.} =
   scan_env.channelIndex = chanIdx
   chanIdx
 
-proc scanChannelSequenceDone*(chanIdx, totalChans, abortFlag: uint8): bool {.inline.} =
-  chanIdx >= totalChans or abortFlag != 0
-
-proc forwardFailedScanDwell(scanParam: pointer; requester: uint8) =
-  when defined(bl808WifiDiagWarmScan):
-    inc nimFwDbgWarmScan.lower_replies
-    nimFwDbgWarmScanLowerStatus = SCAN_STATUS_FAIL.uint32
-  keMsgHdrFromPayload(scanParam).paramLen = StatusCfmPayloadSize
-  statusCfmView(scanParam).status = SCAN_STATUS_FAIL
-  scanuTrackLowerReply(scanParam, scanParam, done = false)
-  ke_msg_forward_and_change_id(scanParam, SCAN_START_CFM, requester, TASK_SCAN)
-
-proc releaseCompletedScanRequest*(scanParam: pointer;
-                                  expectedEpoch = scanRequestEpoch;
-                                  endInd: pointer = nil; failed = false): bool
-    {.inline, discardable.} =
-  let saved = irqSave()
-  if scanParam == nil or scan_env.paramPtr != scanParam or
-      scanRequestEpoch != expectedEpoch:
-    irqRestore(saved)
-    return false
-  let requester = scan_env.requester
-  var unused: ScanDwellPair
-  if scanDwellRequest == scanParam and scanDwellEpoch == expectedEpoch:
-    unused = scanDwellDetach()
-  inc scanRequestEpoch
-  let detachedEpoch = scanRequestEpoch
-  scan_env.paramPtr = nil
-  scan_env.abortFlag = 0
-  # Queue the old completion while this task is still running. A replacement
-  # request may start when the old message is freed below.
-  if failed:
-    # The next dwell could not be reserved. Do not report the band as fully
-    # scanned: SCANU's normal nonzero START_CFM path completes it with error.
-    forwardFailedScanDwell(scanParam, requester)
-  elif endInd != nil:
-    scanuTrackLowerReply(scanParam, endInd, done = true)
-    ke_msg_forward_and_change_id(endInd, SCAN_DONE_IND, requester, TASK_SCAN)
-  else:
-    # No usable end envelope. Reuse the retained lower request; terminal
-    # publication must not silently depend on another allocation.
-    keMsgHdrFromPayload(scanParam).paramLen = 0
-    scanuTrackLowerReply(scanParam, scanParam, done = true)
-    ke_msg_forward_and_change_id(scanParam, SCAN_DONE_IND, requester, TASK_SCAN)
-  if scan_env.paramPtr == nil and scanRequestEpoch == detachedEpoch and
-      ke_state_get(TASK_SCAN) == ScanChannelRunningState:
-    ke_state_set(TASK_SCAN, ScanIdleState)
-  irqRestore(saved)
-  if not failed and endInd != nil: ke_msg_free(keMsgHdrFromPayload(scanParam))
-  scanDwellDispose(unused)
-  true
-
 proc mm_scan_channel_end_ind_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle scan channel end indication (68 instrs in blob).
   ## From blob (scan_task.o): checks ke_state_get(SCAN)==3 (asserts). Clears EDCA
@@ -1234,79 +1140,39 @@ proc mm_scan_channel_end_ind_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Increments scan channel index (scan_env[9]). If index >= total channels
   ## OR abort flag set, sends scan done msg and resets. Otherwise calls
   ## scan_set_channel_request for next channel.
-  if not scanDwellClaim(param): return KeMsgConsumed
-  let state = ke_state_get(TASK_SCAN)
-  if state != ScanChannelRunningState:
-    assert_err("scan_task.c", "scan_task.c", 234)
-    return KeMsgConsumed
-  let scanParam = scan_env.paramPtr
-  if scanParam == nil:
-    return KeMsgConsumed
-  let requestEpoch = scanRequestEpoch
-  let currentChannel = scan_env.channelIndex
-  let scanReq = scanStartReqView(scanParam)
-  if scan_env.channelIndex >= scanReq.channelCount or
-      scan_env.channelIndex.int >= scanReq.channelList.len:
-    return KeMsgConsumed
+  ## Only the live dwell's END is taken (scanCurrent). The request is answered
+  ## in place (scanRelease); the blob frees it and allocates SCAN_DONE_IND.
+  if not scanCurrent(param, ScanChannelRunningState): return KeMsgConsumed
   # The vendor clears the probe timer before advancing the channel.
   ke_timer_clear(SCAN_PROBE_TIMER, TASK_SCAN)
-  if scan_env.paramPtr != scanParam or scanRequestEpoch != requestEpoch or
-      scan_env.channelIndex != currentChannel or
-      ke_state_get(TASK_SCAN) != ScanChannelRunningState:
-    return KeMsgConsumed
   clearScanEdcaRxFilter()
   nimFwDbgScanEndRxCtrl = regRead(MACHW_RX_CNTRL_REG)
   nimFwDbgScanEndIrqRaw = regRead(MACHW_INTC_STATUS_RAW)
   nimFwDbgScanEndGenRaw = regRead(MACHW_INTC_GEN_RAW)
   snapshotPhyChannel(nimFwDbgScanEndPhyRaw)
   rfPhyTraceCheckpoint(0x51'u32)
-  if scan_env.paramPtr != scanParam or scanRequestEpoch != requestEpoch or
-      scan_env.channelIndex != currentChannel:
-    return KeMsgConsumed
   when defined(bl808WifiDiagWarmScan): inc nimFwDbgWarmScan.end_handled
   let chanIdx = advanceScanChannelIndex()
-  let totalChans = scanReq.channelCount
-  let abortFlag = scan_env.abortFlag
-  var pair: ScanDwellPair
-  defer: scanDwellDispose(pair)
-  if not scanChannelSequenceDone(chanIdx, totalChans, abortFlag):
-    let serial = scanDwellSerial
-    let ready = scanDwellReserve(pair)
-    let saved = irqSave()
-    defer: irqRestore(saved)
-    if scan_env.paramPtr != scanParam or scanRequestEpoch != requestEpoch or
-        scan_env.channelIndex != chanIdx or serial != scanDwellSerial:
-      return KeMsgConsumed
-    if scan_env.abortFlag == 0:
-      if ready and chanScanPoolOverlay().slot == 0xFF:
-        scanDwellInstall(pair, chanCtxtEpochs[3] + 1'u32)
-        let installed = scanDwellSerial
-        irqRestore(saved)
-        try:
-          if scanDwellSerial == installed and scanDwellCurrent(): scan_set_channel_request()
-        finally: discard irqSave()
-      else:
-        discard releaseCompletedScanRequest(scanParam, requestEpoch, failed = true)
-      return KeMsgConsumed
-    # Cancellation during allocation uses the ordinary terminal indication.
-  # A basic end envelope can carry the terminal indication without allocation.
-  if param != nil:
-    let hdr = keMsgHdrFromPayload(param)
-    if hdr.id == MM_SCAN_CHANNEL_END_IND and hdr.destId == TASK_SCAN and hdr.paramLen == 0:
-      if releaseCompletedScanRequest(scanParam, requestEpoch, param): return KeMsgNoFree
-      return KeMsgConsumed
-  discard releaseCompletedScanRequest(scanParam, requestEpoch)
+  if chanIdx >= scanStartReqView(scan_env.paramPtr).channelCount or
+      scan_env.abortFlag != 0:
+    scanRelease()
+  elif scanDwellBegin():
+    scan_set_channel_request()
+  else:
+    # Slot 3 or the next dwell's notices are not available: SCANU ends its
+    # request with an error rather than as a fully scanned band.
+    scanRelease(failed = true)
   return KeMsgConsumed
 
 proc mm_scan_channel_end_early_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## End the current scan dwell early for quick connect.
   ## The blob (scan_task.o, 19 instrs) asserts at line 186 when TASK_SCAN is
-  ## idle and otherwise ends whatever dwell is running. The message can be
-  ## dispatched after its dwell finished, so only the dwell that asked is ended
-  ## and a late message is dropped instead of asserting.
-  if not scanEarlyEndClaim() or ke_state_get(TASK_SCAN) == ScanIdleState:
-    return KeMsgConsumed
-  scan_terminate_channel_request()
+  ## idle and otherwise ends whatever dwell is running. The request carries
+  ## the stamp of the dwell that was on its channel when SCANU asked
+  ## (scanEarlyEndRequest); only that dwell is ended, once, and a late or
+  ## duplicate one is dropped instead of asserting.
+  if scanCurrent(param, ScanChannelRunningState) and scanOnChannel():
+    scan_terminate_channel_request()
   return KeMsgConsumed
 
 # --- Scan Task Handlers (scan_task.o) ---
@@ -1334,9 +1200,6 @@ proc cacheScanStartDurations*(scanReq: ptr ScanStartReqPayload) {.inline.} =
   scan_env.activeDuration = duration
 
 proc cacheScanStartContext*(param: pointer, requester: uint8) {.inline.} =
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  inc scanRequestEpoch
   scan_env.channelIndex = 0
   scan_env.abortFlag = 0
   scan_env.requester = requester
@@ -1374,47 +1237,6 @@ proc sendScanStartConfirmation*(cfm: pointer, status: uint8) {.inline.} =
     statusCfmView(cfm).status = status
     ke_msg_send(cfm)
 
-proc finishAcceptedScanStartReq*(param: pointer): cint {.inline.} =
-  scan_ie_download(param)
-  return KeMsgNoFree
-
-proc cacheScanuStartRequest*(
-    param: pointer,
-    req: ptr ScanuStartReqPayload,
-    requester: uint8
-): uint32 {.inline.} =
-  # Invariant (post idle-guard): paramPtr is nil here because scanu_confirm nil'd
-  # it at the previous op's completion. A non-nil, different value means an
-  # overlap slipped past the guard -> free the abandoned block so it can never
-  # dangle, and flag it (nimFwDbgScanuParamOverwrite MUST stay 0 after the fix).
-  let previousProducer = scanuProducerRequest
-  let previousProducerEpoch = scanuProducerEpoch
-  defer:
-    scanuProducerRequest = previousProducer
-    scanuProducerEpoch = previousProducerEpoch
-  var abandoned: pointer
-  block:
-    let saved = irqSave()
-    defer: irqRestore(saved)
-    if scanu_env.paramPtr != param:
-      abandoned = scanu_env.paramPtr
-    inc scanuRequestEpoch
-    result = scanuRequestEpoch
-    scanuProducerRequest = param
-    scanuProducerEpoch = result
-    scanu_env.paramPtr = param
-    scanu_env.pendingJoinRxuMgtInd = nil
-    scanu_env.bssidFilterEnabled = 0
-    scanu_env.scanBand = 0
-    scanu_env.resultState = 0
-    scanu_env.directedFound = 0
-    scanu_env.requester = requester
-    scanu_env.filterBssid = req.bssid
-    ke_state_set(TASK_SCANU, ScanuScanningState)
-  if abandoned != nil:
-    inc nimFwDbgScanuParamOverwrite
-    ke_msg_free(keMsgHdrFromPayload(abandoned))
-
 proc scan_start_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle SCAN_START_REQ (170 bytes in blob, 45 instrs).
   ## From blob (scan_task.o): allocs SCAN_START_CFM (id=0x401, 1 byte).
@@ -1423,102 +1245,50 @@ proc scan_start_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## stores scan params in scan_env (param@0, src_id@8, channelIndex@9,
   ## active/passive durations@12/@16), calls scan_ie_download, sends cfm.
   ## Returns KeMsgNoFree on success to keep req message alive.
-  ## The request pointer also marks the pre-state-change submission interval.
+  ## A refused request is answered in place, as SCAN_START_CFM with its
+  ## status, so SCANU, which waits for that message, always gets it; the blob
+  ## allocates the confirmation and frees the request. A request SCANU no
+  ## longer waits on (SCANU was reset) is dropped.
   if param == nil:
     return KeMsgConsumed
   let reqHdr = keMsgHdrFromPayload(param)
   let requester = reqHdr.srcId
-  if requester == TASK_SCANU and not scanuLowerCurrent(param):
+  if requester == TASK_SCANU and not scanuAwaits(param):
     return KeMsgConsumed
-  let cfm = ke_msg_try_alloc(SCAN_START_CFM, requester, TASK_SCAN,
-                             StatusCfmPayloadSize)
-  if requester == TASK_SCANU and not scanuLowerCurrent(param):
-    if cfm != nil: ke_msg_free(keMsgHdrFromPayload(cfm))
-    return KeMsgConsumed
-  if cfm == nil:
-    if reqHdr.paramLen < StatusCfmPayloadSize:
-      return KeMsgConsumed
-    # This request never entered the lower scan state. Return it as the
-    # failure reply so SCANU can complete without another allocation.
-    when defined(bl808WifiDiagWarmScan):
-      inc nimFwDbgWarmScan.lower_replies
-      nimFwDbgWarmScanLowerStatus = SCAN_STATUS_FAIL.uint32
-    statusCfmView(param).status = SCAN_STATUS_FAIL
-    reqHdr.paramLen = StatusCfmPayloadSize
-    scanuTrackLowerReply(param, param, done = false)
-    ke_msg_forward_and_change_id(param, SCAN_START_CFM, requester, TASK_SCAN)
-    return KeMsgNoFree
-  let scanState = ke_state_get(TASK_SCAN)
-  var cfmStatus = SCAN_STATUS_OK
-  var doDownload = true
-  var admittedEpoch: uint32
-  var admittedReset: uint32
-  var pair: ScanDwellPair
-  defer: scanDwellDispose(pair)
-  if scanState != ScanIdleState or scan_env.paramPtr != nil or chanScanPoolOverlay().slot != 0xFF:
-    cfmStatus = SCAN_STATUS_BUSY
-    doDownload = false
+  var status = SCAN_STATUS_FAIL
+  if ke_state_get(TASK_SCAN) != ScanIdleState or chanScanPoolOverlay().slot != 0xFF:
+    status = SCAN_STATUS_BUSY
+  elif not scanStartRequestValid(reqHdr.paramLen, scanStartReqView(param)):
+    status = SCAN_STATUS_BAD_PARAM
   else:
-    let scanReq = scanStartReqView(param)
-    if not scanStartRequestValid(reqHdr.paramLen, scanReq):
-      cfmStatus = SCAN_STATUS_BAD_PARAM
-      doDownload = false
-    else:
-      let lowerEpoch = scanRequestEpoch
-      let serial = scanDwellSerial
-      let ready = scanDwellReserve(pair)
-      let saved = irqSave()
-      defer: irqRestore(saved)
-      if requester == TASK_SCANU and not scanuLowerCurrent(param):
+    let cfm = ke_msg_try_alloc(SCAN_START_CFM, requester, TASK_SCAN,
+                               StatusCfmPayloadSize)
+    if cfm != nil:
+      cacheScanStartContext(param, requester)
+      cacheScanStartDurations(scanStartReqView(param))
+      if not scanDwellBegin():
         ke_msg_free(keMsgHdrFromPayload(cfm))
-        return KeMsgConsumed
-      if lowerEpoch != scanRequestEpoch or serial != scanDwellSerial or
-          scan_env.paramPtr != nil or ke_state_get(TASK_SCAN) != ScanIdleState or
-          chanScanPoolOverlay().slot != 0xFF:
-        cfmStatus = SCAN_STATUS_BUSY
-        doDownload = false
-      elif not ready:
-        cfmStatus = SCAN_STATUS_FAIL
-        doDownload = false
-      else:
-        cacheScanStartContext(param, requester)
-        admittedEpoch = scanRequestEpoch
-        admittedReset = scanDwellResetEpoch
-        cacheScanStartDurations(scanReq)
-        scanDwellInstall(pair, chanCtxtEpochs[3] + 1'u32, admitting = true)
-  # The accepted path finishes channel setup before publishing its confirmation.
-  var handlerResult = KeMsgConsumed
-  if doDownload:
-    handlerResult = KeMsgNoFree
-    if scan_env.paramPtr == param and scanRequestEpoch == admittedEpoch:
-      handlerResult = finishAcceptedScanStartReq(param)
-    if scanDwellResetEpoch != admittedReset: cfmStatus = SCAN_STATUS_FAIL
-  if requester == TASK_SCANU:
-    # A terminal failure during inline dwell setup already owns the reply.
-    if not scanuLowerCurrent(param) or scanuLower.startCfm != nil:
-      ke_msg_free(keMsgHdrFromPayload(cfm))
-      return handlerResult
-    scanuTrackLowerReply(param, cfm, done = false)
-  sendScanStartConfirmation(cfm, cfmStatus)
-  return handlerResult
+        scanRelease(failed = true)
+        return KeMsgNoFree
+      # The blob submits the first dwell before it confirms the request.
+      scan_ie_download(param)
+      sendScanStartConfirmation(cfm, SCAN_STATUS_OK)
+      return KeMsgNoFree
+  if reqHdr.paramLen < StatusCfmPayloadSize:
+    return KeMsgConsumed
+  scanAnswer(param, SCAN_START_CFM, requester, status)
+  return KeMsgNoFree
 
 proc scan_start_cfm_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle SCAN_START_CFM (30 bytes in blob).
   ## From blob: reads status byte from msg body (a1). If non-zero (error),
   ## tail-calls scanu_confirm(status). Returns 0.
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  if not scanuClaimLowerReply(param, done = false) or
-      keMsgHdrFromPayload(param).paramLen < StatusCfmPayloadSize:
-    return KeMsgConsumed
-  let status = statusCfmView(param).status
-  if status != 0:
-    scanu_confirm(status)
+  ## TASK_SCAN refuses SCANU's request by answering it in place, so a failure
+  ## is the message SCANU waits on (scanuTakeLower). The separate success
+  ## confirmation is not, and changes nothing.
+  if scanuTakeLower(param):
+    scanu_confirm(statusCfmView(param).status)
   return KeMsgConsumed
-
-proc advanceScanuScanBand*() {.inline.} =
-  scanu_env.scanBand = scanu_env.scanBand + 1
-  scanu_scan_next()
 
 proc scan_done_ind_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle SCAN_DONE_IND (164 bytes in blob, 40 instrs).
@@ -1526,34 +1296,14 @@ proc scan_done_ind_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## scanu_env+0xac, sends SCANU_JOIN_CFM and clears cached scan results.
   ## Otherwise it advances the band/phase byte at +0xb5 and lets
   ## scanu_scan_next either start the next phase or issue SCANU_START_CFM.
-  var completedRequest: pointer
-  var completedEpoch: uint32
-  var reqSrcId: uint8
-  var retired: array[SCANU_MAX_RESULT_ENTRIES, pointer]
-  # Request and cache ownership move together before the task becomes idle.
-  block:
-    let saved = irqSave()
-    defer: irqRestore(saved)
-    if scanu_env.paramPtr == nil: return KeMsgConsumed
-    let replayDone = scanu_env.pendingJoinRxuMgtInd
-    if replayDone != nil:
-      if param != replayDone: return KeMsgConsumed
-      completedRequest = scanu_env.paramPtr
-      reqSrcId = scanu_env.requester
-      retired = scanuDetachCachedScanResults()
-      inc scanuRequestEpoch
-      completedEpoch = scanuRequestEpoch
-      scanu_env.paramPtr = nil
-      scanu_env.pendingJoinRxuMgtInd = nil
-    else:
-      if scanuClaimLowerReply(param, done = true):
-        advanceScanuScanBand()
-      return KeMsgConsumed
-  defer: scanuReleaseCompletedOwner(completedEpoch)
-  for frame in retired:
-    ke_msg_free_payload(frame)
-  scanuPublishCompletion(completedRequest, scanuReply(SCANU_JOIN_CFM, reqSrcId),
-                         SCANU_JOIN_CFM, reqSrcId, 0)
+  ## Here the cached-join replay ends only with the SCAN_DONE_IND it sent
+  ## itself, and a band ends only with TASK_SCAN's answer to the request
+  ## SCANU waits on; any other SCAN_DONE_IND changes nothing.
+  if param != nil and param == scanu_env.pendingJoinRxuMgtInd:
+    scanuComplete(0, replayed = true)
+  elif scanuTakeLower(param):
+    scanu_env.scanBand = scanu_env.scanBand + 1
+    scanu_scan_next()
   return KeMsgConsumed
 
 proc scan_cancel_req_handler*(param: pointer): cint {.exportc, cdecl.} =
@@ -1562,21 +1312,17 @@ proc scan_cancel_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## If scan is active (state != 0), sets scan_env.abort (offset 0x0a) = 1
   ## and returns. If scan is idle, calls scan_send_cancel_cfm(status=1, src_id)
   ## so the requester still gets a confirmation.
-  ## Ownership covers the pre-state-change interval; a detached request is
-  ## already complete even if its task state has not yet changed to idle.
   if param == nil:
     return KeMsgConsumed
-  if scan_env.paramPtr != nil:
+  if ke_state_get(TASK_SCAN) != ScanIdleState:
     scan_env.abortFlag = 1
   else:
     scan_send_cancel_cfm(1, keMsgHdrFromPayload(param).srcId)
   return KeMsgConsumed
 
-const SmScanAbortPayloadSize = sizeof(uint32).uint32
-
 proc smAbortOwnsLowerScan(): bool =
   ## The lower scan running is the one SM's live scan request started.
-  scanuLowerCurrent(scan_env.paramPtr) and smAwaits(scanu_env.paramPtr)
+  scanuAwaits(scan_env.paramPtr) and smAwaits(scanu_env.paramPtr)
 
 proc scan_abort_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Handle SCAN_ABORT_REQ — blob scan_task.o (74 bytes):
@@ -1589,19 +1335,16 @@ proc scan_abort_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Blob does NOT emit a SCAN_ABORT_CFM or call ke_state_set — previous
   ## Nim invented both, which meant an extra IPC message + premature
   ## scan-state reset on every abort.
-  ## An owned request also counts as active during channel submission.
-  block:
-    let saved = irqSave()
-    defer: irqRestore(saved)
-    if param != nil:
-      let header = keMsgHdrFromPayload(param)
-      if header.srcId == TASK_SM and (header.paramLen != SmScanAbortPayloadSize or
-          cast[ptr uint32](param)[] != scanRequestEpoch or not smAbortOwnsLowerScan()):
-        return KeMsgConsumed
-    if scan_env.paramPtr != nil:
-      scan_env.abortFlag = 1
-      if ke_state_get(TASK_SCAN) == ScanChannelRunningState:
-        scan_terminate_channel_request()
+  ## In state 2 the dwell leaves its channel as soon as it starts. SM's
+  ## abort acts only on the lower scan of SM's live scan request.
+  if param != nil and keMsgHdrFromPayload(param).srcId == TASK_SM and
+      not smAbortOwnsLowerScan():
+    return KeMsgConsumed
+  let state = ke_state_get(TASK_SCAN)
+  if state != ScanIdleState:
+    scan_env.abortFlag = 1
+    if state == ScanChannelRunningState and scanOnChannel():
+      scan_terminate_channel_request()
   let logPtr = blOpsFunc(4)
   if logPtr != nil:
     cast[proc(format, name: cstring) {.cdecl, varargs.}](logPtr)(
@@ -1616,11 +1359,11 @@ proc scan_probe_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ##   if ret != 0:
   ##     g_bl_ops_funcs[1]("scan_probe_req_tx failed!\r\n")
   ##   return 0
-  ## Prior Nim bug: read scan_env[0] and logged nothing useful. The blob
-  ## does the actual probe-request TX via scan_probe_req_tx.
-  if not scanTaskInChannelRunningState():
+  ## The expiry carries the stamp of the dwell that armed it; one from an
+  ## earlier dwell is dropped.
+  if not scanCurrent(param, ScanChannelRunningState):
     return KeMsgConsumed
-  if sendPeriodicScanProbeRequest() != 0:
+  if scan_probe_req_tx() != 0:
     let logFn = cast[proc(format: cstring) {.cdecl, varargs.}](blOpsFunc(4))
     if logFn != nil:
       logFn("scan_probe_req_tx failed!\r\n")
@@ -1637,34 +1380,25 @@ proc scanu_start_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ##   4. Store source task id into scanu_env[176]
   ##   5. Copy 6 bytes from param+286 (BSSID filter) into scanu_env+182
   ##   6. Tail-call scanu_start(), returns KeMsgNoFree
+  ## SCANU's tables run this only in state 0; while it scans or joins,
+  ## scanu_default_state saves the request (ke_msg_save).
   if param == nil: return KeMsgConsumed
   let reqHdr = keMsgHdrFromPayload(param)
   if reqHdr.paramLen < ScanuStartReqPayloadSize:
     return KeMsgConsumed
   if smScanRefused(param): return KeMsgNoFree
-  let saved = irqSave()
-  # Upper scanu owns a SINGLE scanu_env.paramPtr slot. If a new SCANU_START_REQ
-  # arrives while a scan/join is still in flight (state != idle), overwriting
-  # paramPtr abandons the in-flight ke_msg and makes scanu_confirm's real free
-  # (scan_station_ap_me.nim:300) target the wrong/still-live block -> a
-  # use-after-free on the shared TLSF heap (the freed ke_msg is reused by Nim
-  # ARC, then a stale scanu access corrupts the Nim object -> nimIncRef fault).
-  # The lower scan_start_req_handler already busy-rejects (:1074); the upper task
-  # lost that guard. Reject the overlap; the dispatcher frees the req (:809), so
-  # no leak. Use the rejected request as a busy confirmation so the host
-  # completes its wait without allocating or touching the active scan.
-  if ke_state_get(TASK_SCANU) != ScanuIdleState:
-    irqRestore(saved)
-    if reqHdr.srcId == TASK_SM:
-      return KeMsgSaved
-    scanuAnswer(param, SCANU_START_CFM, reqHdr.srcId, SCAN_STATUS_BUSY)
-    return KeMsgNoFree
-  defer: irqRestore(saved)
   let req = scanuStartReqView(param)
-  let epoch = cacheScanuStartRequest(param, req, reqHdr.srcId)
-  if scanuRequestCurrent(param, epoch):
-    when defined(bl808WifiDiagWarmScan): inc nimFwDbgWarmScan.upper_admitted
-    scanu_start()
+  scanu_env.paramPtr = param
+  scanu_env.pendingJoinRxuMgtInd = nil
+  scanu_env.bssidFilterEnabled = 0
+  scanu_env.scanBand = 0
+  scanu_env.resultState = 0
+  scanu_env.directedFound = 0
+  scanu_env.requester = reqHdr.srcId
+  scanu_env.filterBssid = req.bssid
+  scanuGo(ScanuScanningState)
+  when defined(bl808WifiDiagWarmScan): inc nimFwDbgWarmScan.upper_admitted
+  scanu_start()
   return KeMsgNoFree
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) int scanu_start_cfm_handler(void*);".}
@@ -1730,106 +1464,60 @@ proc scanu_join_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ##  10. If scan_start succeeds: ke_state_set(TASK_SCANU, ScanuJoiningState), store scan result,
   ##      call scanu_confirm, clear link, send SCANU_JOIN_CFM
   ##  11. If fails: call scanu_confirm(fail)
+  ## SCANU's tables run this only in state 0. A join is in state 2 from
+  ## here to its end; the blob sets state 1 in scanu_start and before a
+  ## replay (the two states' tables are the same).
   if param == nil: return KeMsgConsumed
-  if keMsgHdrFromPayload(param).paramLen < ScanuStartReqPayloadSize:
+  let reqHdr = keMsgHdrFromPayload(param)
+  if reqHdr.paramLen < ScanuStartReqPayloadSize:
     return KeMsgConsumed
   if smScanRefused(param): return KeMsgNoFree
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  # Same single-paramPtr-slot hazard as scanu_start_req_handler: reject an
-  # overlapping join rather than clobbering scanu_env.paramPtr (which would make
-  # scanu_confirm free a still-live ke_msg -> shared-heap UAF -> nimIncRef).
-  if ke_state_get(TASK_SCANU) != ScanuIdleState:
-    if keMsgHdrFromPayload(param).srcId == TASK_SM: return KeMsgSaved
-    return KeMsgConsumed
   let req = scanuStartReqView(param)
   let vifIdx = req.vifIdx
-  let reqHdr = keMsgHdrFromPayload(param)
   if vifIdx >= MAX_VIFS.uint8:
     # SM's request is always answered, even one its sender should not send.
     if reqHdr.srcId != TASK_SM: return KeMsgConsumed
     scanuAnswer(param, reqHdr.id + 1, TASK_SM, SCAN_STATUS_FAIL)
     return KeMsgNoFree
   let vif = vifChannelForIdx(vifIdx)
-
-  # Store param pointer in scanu_env
-  let previousProducer = scanuProducerRequest
-  let previousProducerEpoch = scanuProducerEpoch
-  defer:
-    scanuProducerRequest = previousProducer
-    scanuProducerEpoch = previousProducerEpoch
-  inc scanuRequestEpoch
-  let epoch = scanuRequestEpoch
   scanu_env.paramPtr = param
   scanu_env.pendingJoinRxuMgtInd = nil
-  scanuProducerRequest = param
-  scanuProducerEpoch = epoch
-
-  # Store requester source task and set flags
   scanu_env.requester = reqHdr.srcId
   vifApConfig(vif).securityFlags = 0
   scanu_env.bssidFilterEnabled = 1
   scanu_env.scanBand = 0
-  ke_state_set(TASK_SCANU, ScanuJoiningState)
-
-  # Copy BSSID from param+286 (6 bytes) to scanu_env filter area. Blob has
-  # a single memcpy here — previous Nim had it duplicated (once before and
-  # once after the flag writes) for no reason.
   discard c_memcpy(addr scanu_env.filterBssid[0], addr req.bssid[0],
                    req.bssid.len.csize_t)
-
-  # Clear found flag, set scan duration
   scanu_env.resultCount = 0
   scanu_env.directedFound = 0
   scanu_env.joinRetryCount = 0x0A'u8
+  scanuGo(ScanuJoiningState)
 
   # A join target must be unicast; the Nim assertion path is not fatal.
   if (req.bssid[0] and 1) != 0:
     scanu_confirm(SCAN_STATUS_BAD_PARAM)
     return KeMsgNoFree
 
-  # Search for BSSID in existing scan results (blob: scanu_search_by_bssid)
+  # A cached frame of the target is replayed through the frame handler, and
+  # the SCAN_DONE_IND SCANU sends itself after it ends the join (pinned
+  # scan_done_ind_handler). Without that message the join scans instead.
   let existing = scanu_search_by_bssid(addr req.bssid[0])
-  if not scanuRequestCurrent(param, epoch):
-    return KeMsgNoFree
-
-  # Reserve replay completion before transferring the slot's frame. Without
-  # a DONE notice the caller must still be able to take the live scan path.
   if existing != nil:
     let existingEntry = scanuResultAt(existing)
     let cachedRxuMgtInd = existingEntry.cachedRxuMgtInd
-    let cache = scanuCachedSsidFor(existingEntry)
-    if cachedRxuMgtInd != nil and cache != nil:
-      let generation = cache.generation
-      var done = ke_msg_try_alloc(SCAN_DONE_IND, TASK_SCANU, TASK_SCANU, 0)
-      defer:
-        if done != nil: ke_msg_free_payload(done)
-      if not scanuRequestCurrent(param, epoch): return KeMsgNoFree
-      template cacheCurrent(): bool =
-        cache.generation == generation and existingEntry.cachedRxuMgtInd == cachedRxuMgtInd
-      if done != nil and cacheCurrent():
-        ke_state_set(TASK_SCANU, ScanuScanningState)
-        if not scanuRequestCurrent(param, epoch): return KeMsgNoFree
-        if cacheCurrent():
-          scanu_env.pendingJoinRxuMgtInd = done
-          existingEntry.cachedRxuMgtInd = nil
-          req.flags = 0
-          ke_msg_send(cachedRxuMgtInd)
-          if scanuRequestCurrent(param, epoch):
-            let replayDone = done
-            done = nil
-            ke_msg_send(replayDone)
-          return KeMsgNoFree
+    if cachedRxuMgtInd != nil and scanuCachedSsidFor(existingEntry) != nil:
+      let done = ke_msg_try_alloc(SCAN_DONE_IND, TASK_SCANU, TASK_SCANU, 0)
+      if done != nil:
+        scanu_env.pendingJoinRxuMgtInd = done
+        existingEntry.cachedRxuMgtInd = nil
+        req.flags = 0
+        ke_msg_send(cachedRxuMgtInd)
+        ke_msg_send(done)
+        return KeMsgNoFree
 
   # Start scan (blob: scanu_start → ke_msg_send_basic + scanu_scan_next)
-  scanuProducerRequest = previousProducer
-  scanuProducerEpoch = previousProducerEpoch
   scanu_start()
-
-  # Scan started, set state
-  if scanuRequestCurrent(param, epoch):
-    ke_state_set(TASK_SCANU, ScanuJoiningState)
-  return 1
+  return KeMsgNoFree
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) int scanu_join_cfm_handler(void*);".}
 proc scanu_join_cfm_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
@@ -2214,11 +1902,11 @@ proc sm_disconnect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
 proc smQueueOwnedScanAbort() =
   ## Abort the lower scan that SM's scan request started, and clear the
   ## cached results, as the pinned abort handler does in state 1. A scan
-  ## SCANU runs for another requester is left alone.
+  ## SCANU runs for another requester is left alone; TASK_SCAN checks that
+  ## again when it runs the abort, which carries no payload.
   if not smAbortOwnsLowerScan(): return
-  let message = ke_msg_try_alloc(SCAN_ABORT_REQ, TASK_SCAN, TASK_SM, SmScanAbortPayloadSize)
+  let message = ke_msg_try_alloc(SCAN_ABORT_REQ, TASK_SCAN, TASK_SM, 0)
   if message == nil: return
-  cast[ptr uint32](message)[] = scanRequestEpoch
   ke_msg_send(message)
   scanu_cached_scanresult_clear()
 

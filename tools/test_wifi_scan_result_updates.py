@@ -109,6 +109,10 @@ proc prepareUpdate(hasDs: bool; strength: int8; ssid = 65'u8) =
 '''
     # The dwell owner is covered by test_wifi_sm_audit_scan; count the request here.
     base += "\nwhen not declared(scanEarlyEndRequest):\n  proc scanEarlyEndRequest() = ke_msg_send_basic(0x4C, 1, 2)\n"
+    # SCANU's stop-after-dwell request, observed through the flag it sets.
+    base = base.replace("\nwhen not declared(scanStopAfterDwell):\n  proc scanStopAfterDwell() =\n"
+                        "    when declared(scan_env): scan_env.abortFlag = 1\n", "")
+    base += "\nproc scanStopAfterDwell() = scan_env.abortFlag = 1\n"
     base += procedure((FW / "mac_config_debug.nim").read_text(), "mac_ie_find")
     # A directed scan's SM operation (unused here: bfOn is 0).
     base += (FW / "op.nim").read_text() + "\nvar smOwn: tuple[op: Op]\n"

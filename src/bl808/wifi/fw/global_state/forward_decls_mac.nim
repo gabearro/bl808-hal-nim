@@ -121,6 +121,8 @@ proc smActivationCancel()
 proc smActivationNotifyCurrent(): bool
 proc smActivationConsumeSuccess(station: uint8): bool
 proc smAwaits(request: pointer): bool
+proc scanDwellPost(id: uint16)
+proc scanRelease(failed = false)
 proc smTakeReply(request: pointer; id: uint16): pointer
 proc txlRebasePostponedLeases()
 proc smSaQueryQueueTimeout(serial: uint32)

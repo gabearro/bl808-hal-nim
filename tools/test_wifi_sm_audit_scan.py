@@ -16,7 +16,15 @@ SCAN-F2  The same recovery invalidates the channel timers that carry the
          published, so TASK_SCAN, SCANU and slot 3 stay busy for good.
 SCAN-F3  MM_SCAN_CHANNEL_END_EARLY (quick-connect, flags bit 8) carries no
          owner. When it reaches an idle TASK_SCAN, it hits assert_err(186),
-         which raises KE_EVT_RESET (a full MAC recovery, see F1/F2).
+         which raises KE_EVT_RESET (a full MAC recovery, see F1/F2). It now
+         carries the stamp of the dwell that was on its channel when SCANU
+         asked, and only that dwell is ended.
+SCAN-N1  A dwell switch the channel layer drops left TASK_SCAN waiting in
+         state 2 for good. Stage 4 returns such a dwell to the
+         connectionless gate (test_dropped_dwell_switch_still_starts_the_dwell).
+         Structurally: each dwell holds its START and END from the moment it
+         is asked for, the channel layer posts END wherever it retires slot
+         3, and SCAN_ABORT_REQ in state 2 ends the dwell as soon as it starts.
 SCAN-N3  The SM scan/join exchange was judged by an identity that included
          the STA VIF's epoch and type. Removing the STA VIF in state 1 or 2
          made SCANU's completion free SM's reply unrecorded, so SM stayed in
@@ -34,7 +42,7 @@ import pytest
 from test_wifi_connless_timer_dispatch import source as connless_source
 from test_wifi_disconnect_tx import FW, procedure
 from test_wifi_message_allocation import run_program
-from test_wifi_scan_dwell_notices import source as dwell_source
+from test_wifi_scan_table import harness as scan_harness
 from test_wifi_sm_scan_completion import source as completion_source
 from test_wifi_tbtt_timer_dispatch import source as timer_source
 
@@ -255,143 +263,152 @@ def test_scan_radio_deadlines_survive_retried_recovery(tmp_path: Path, case: str
 def test_probe_expiry_behind_dwell_end_is_inert(tmp_path: Path, mode: str) -> None:
     """A SCAN_PROBE_TIMER expiry posted before END(n) cleared the timer.
 
-    The expiry must not transmit on channel n+1 while it is pending, nor
-    after the request completes. A live dwell still sends its repeat probe.
-    """
-    probe = "".join(procedure(TASKS, name) for name in (
-        "scanTaskInChannelRunningState", "sendPeriodicScanProbeRequest", "scan_probe_req_handler"))
-    run_program(tmp_path, mode, dwell_source() + r'''
-var probeTx: int
-proc scan_probe_req_tx(): uint8 =
-  inc probeTx
-  0
-''' + probe + r'''
-discard admitted(2)
-publishDwell()
-doAssert state == ScanChannelRunningState
-doAssert scan_probe_req_handler(nil) == KeMsgConsumed and probeTx == 1
-let firstEnd = take()
-events.setLen(0)
-doAssert mm_scan_channel_end_ind_handler(firstEnd) == KeMsgConsumed
-consume(firstEnd)
-doAssert state == ScanChannelPendingState and scan_env.channelIndex == 1
-doAssert events == @["clear", "filter", "next"], "END advanced before clearing the probe timer"
-doAssert scan_probe_req_handler(nil) == KeMsgConsumed
-doAssert probeTx == 1, "channel 0 probe expiry transmitted during channel 1 setup"
-publishDwell()
-doAssert scan_probe_req_handler(nil) == KeMsgConsumed and probeTx == 2
-let lastEnd = take()
-doAssert mm_scan_channel_end_ind_handler(lastEnd) == KeMsgNoFree
-let done = take()
-doAssert done == lastEnd and keMsgHdrFromPayload(done).id == SCAN_DONE_IND
-doAssert scanuClaimLowerReply(done, done = true)
-consume(done)
-doAssert state == ScanIdleState and scan_env.paramPtr == nil
-doAssert scan_probe_req_handler(nil) == KeMsgConsumed and probeTx == 2
-doAssert allocated.len == 0 and queued.len == 0 and assertions == 0
+    The expiry carries dwell n's stamp: it must not transmit on channel n+1
+    while that dwell is pending or running, nor after the request completes.
+    A live dwell still sends its repeat probe."""
+    run_program(tmp_path, mode, scan_harness() + r'''
+scan_init()
+scanu_init()
+discard newUpper(SCANU_START_REQ, HostTask, 2)
+while queue.len > 0 or states[TASK_SCAN] != ScanChannelPendingState: doAssert step()
+arrive()
+doAssert step() and states[TASK_SCAN] == ScanChannelRunningState and probes == 1
+let first = timer.stamp
+discard stale(SCAN_PROBE_TIMER, first)
+doAssert step() and probes == 2, "a live dwell's repeat probe was dropped"
+let expiry = stale(SCAN_PROBE_TIMER, first)   # posted before END(0) cleared the timer
+queue.delete(queue.find(expiry))
+retire()
+doAssert step()                               # END(0): channel 1 pending
+doAssert states[TASK_SCAN] == ScanChannelPendingState and scan_env.channelIndex == 1
+queue.insert(expiry, 0)
+doAssert step() and probes == 2, "channel 0 probe expiry transmitted during channel 1 setup"
+discard stale(SCAN_PROBE_TIMER, first)
+arrive()
+doAssert step() and probes == 2             # the old expiry, ahead of START(1)
+doAssert step() and probes == 3             # START(1) probes once
+discard stale(SCAN_PROBE_TIMER, first)
+doAssert step() and probes == 3, "channel 0 probe expiry transmitted on channel 1"
+discard stale(SCAN_PROBE_TIMER, timer.stamp)
+doAssert step() and probes == 4
+finish("probe")
+discard stale(SCAN_PROBE_TIMER, first)
+doAssert step() and probes == 4
+doAssert heap.len == 0 and queue.len == 0
 ''')
 
 
-EARLY_END_ENV = r'''
-type
-  ScanEnv = object
-    paramPtr: pointer
-    channelIndex: uint8
-const
-  TASK_SCAN = 1'u8
-  TASK_SCANU = 2'u8
-  ScanIdleState = 0'u16
-  KeMsgConsumed = 0.cint
-  MM_SCAN_CHANNEL_END_EARLY = 0x4C'u16
-{.pragma: wifiCtrl.}
-var
-  scan_env: ScanEnv
-  scanRequestEpoch: uint32
-  state: uint16
-  sent, terminations: int
-  request, other: uint8
-proc irqSave(): uint32 = 0
-proc irqRestore(saved: uint32) = discard
-proc ke_state_get(task: uint8): uint16 =
-  doAssert task == TASK_SCAN
-  state
-proc ke_msg_send_basic(id: uint16; dest, source: uint8) =
-  doAssert id == MM_SCAN_CHANNEL_END_EARLY and dest == TASK_SCAN and source == TASK_SCANU
-  inc sent
-proc scan_terminate_channel_request() = inc terminations
-proc deliver() =
-  doAssert mm_scan_channel_end_early_handler(nil) == KeMsgConsumed
-'''
-
-
-def early_end_source() -> str:
-    kernel = (FW / "scan_station_ap_me.nim").read_text()
-    declaration = re.search(r"(?m)^var scanEarlyEnd \{\.wifiCtrl\.\}.*\n.*\n", kernel)
-    assert declaration
-    env, deliver = EARLY_END_ENV.split("proc deliver() =")
-    return (env + declaration.group(0) + procedure(kernel, "scanEarlyEndRequest")
-            + procedure(kernel, "scanEarlyEndClaim")
-            + procedure(TASKS, "mm_scan_channel_end_early_handler")
-            + "proc deliver() =" + deliver)
-
-
-def test_stale_early_end_after_last_dwell_does_not_reset_mac(tmp_path: Path) -> None:
-    """Quick connect matched a frame that SCANU dispatched after the last END.
-
-    TASK_SCAN has already released the lower request. Nothing is sent, and a
-    message already queued is dropped without an assertion or a termination.
-    """
-    run_program(tmp_path, "checked", early_end_source() + r'''
-state = ScanIdleState
+def test_early_end_without_a_running_dwell_sends_nothing(tmp_path: Path) -> None:
+    """Quick connect matched a frame that SCANU dispatched with no dwell on
+    its channel (idle, or between dwells). Nothing is sent, so nothing can
+    reach an idle TASK_SCAN and assert."""
+    run_program(tmp_path, "checked", scan_harness() + r'''
+scan_init()
+scanu_init()
 scanEarlyEndRequest()
-doAssert sent == 0, "early end sent with no dwell to end"
-deliver()
-doAssert terminations == 0
+doAssert queue.len == 0, "early end sent with no dwell to end"
+discard newUpper(SCANU_START_REQ, HostTask, 2)
+while queue.len > 0 or states[TASK_SCAN] != ScanChannelPendingState: doAssert step()
+scanEarlyEndRequest()
+doAssert queue.len == 0, "early end sent for a dwell not on its channel"
+finish("pending")
 ''')
 
 
 def test_early_end_only_ends_the_dwell_that_asked(tmp_path: Path) -> None:
-    run_program(tmp_path, "checked", early_end_source() + r'''
-state = 2
-scan_env = ScanEnv(paramPtr: addr request, channelIndex: 3)
-scanRequestEpoch = 7
+    run_program(tmp_path, "checked", scan_harness() + r'''
+proc running(channels: int) =
+  scan_init()
+  scanu_init()
+  requests.setLen(0)
+  answers.setLen(0)
+  arrivals = 0
+  terminations = 0
+  discard newUpper(SCANU_START_REQ, HostTask, channels)
+  while queue.len > 0 or states[TASK_SCAN] != ScanChannelPendingState: doAssert step()
+  arrive()
+  doAssert step() and states[TASK_SCAN] == ScanChannelRunningState
 
-# The dwell that asked is ended once; a duplicate message does nothing.
+# The dwell that asked is ended; a duplicate request finds it gone.
+running(3)
 scanEarlyEndRequest()
 scanEarlyEndRequest()
-doAssert sent == 2
-deliver()
-doAssert terminations == 1
-deliver()
-doAssert terminations == 1
+doAssert queue.len == 2
+doAssert step() and terminations == 1 and queue.len == 2   # its END is queued
+finish("duplicate")
+doAssert terminations == 1 and arrivals == 3
 
-# Overlap: the message is dispatched after the scan moved to the next channel.
+# Overlap: the request is dispatched after the scan moved to the next channel.
+running(3)
 scanEarlyEndRequest()
-scan_env.channelIndex = 4
-deliver()
-doAssert terminations == 1, "early end for channel 3 ended channel 4"
+let early = queue.pop()
+retire()
+doAssert step() and scan_env.channelIndex == 1
+arrive()
+doAssert step()
+queue.add(early)
+doAssert step() and terminations == 0, "early end for channel 0 ended channel 1"
+finish("overlap")
 
-# Cancellation: the request was replaced, at the same address or another.
-scanEarlyEndRequest()
-inc scanRequestEpoch
-deliver()
-scanEarlyEndRequest()
-scan_env.paramPtr = addr other
-deliver()
-doAssert terminations == 1
-
-# Reset: TASK_SCAN went idle while the message was queued.
-scan_env.paramPtr = addr request
-scanEarlyEndRequest()
-state = ScanIdleState
-deliver()
-doAssert terminations == 1
-
-# A message with no recorded request is never acted on.
-state = 2
-deliver()
-doAssert terminations == 1
+# Cancellation and reset: the request is dispatched after TASK_SCAN's request
+# ended (abort) or after a reset; it is dropped instead of asserting.
+for reset in [false, true]:
+  running(2)
+  scanEarlyEndRequest()
+  let late = queue.pop()
+  if reset: mmReset()
+  else:
+    ke_msg_send(ke_msg_try_alloc(SCAN_ABORT_REQ, TASK_SCAN, HostTask, 0))
+    doAssert step() and terminations == 1
+  settle("ended")
+  queue.add(late)
+  doAssert step() and terminations == int(not reset) and states[TASK_SCAN] == ScanIdleState
+  finish("ended")
 ''')
+
+
+def test_abort_in_state_2_ends_the_dwell_when_it_starts(tmp_path: Path) -> None:
+    """SCAN-N1, structural: SM's abort while the dwell waits for slot 3 sets
+    the stop flag; the dwell leaves its channel as soon as it starts, END
+    follows at once, the request ends after one dwell, and SM's scan gets
+    its answer. The pinned handler only sets the flag in state 2, so the
+    dwell then ran its full duration, probing."""
+    run_program(tmp_path, "checked", scan_harness() + r'''
+scan_init()
+scanu_init()
+let upper = newUpper(SCANU_START_REQ, TASK_SM, 5)
+while queue.len > 0 or states[TASK_SCAN] != ScanChannelPendingState: doAssert step()
+smQueueOwnedScanAbort()
+doAssert step() and scan_env.abortFlag == 1 and states[TASK_SCAN] == ScanChannelPendingState
+arrive()
+doAssert step() and terminations == 1 and probes == 0
+doAssert scanSlot.slot == 0xFF and queue.len == 1 and
+  keMsgHdrFromPayload(queue[0]).id == MM_SCAN_CHANNEL_END_IND
+finish("abort")
+doAssert arrivals == 1 and answers == @[(upper, SCANU_START_CFM)]
+''')
+
+
+def test_slot_3_retires_only_with_its_end() -> None:
+    """SCAN-N1, structural: slot 3 leaves the pool only in chanCtxtOpEvent,
+    which posts the dwell's END, and in chan_init (after scan_init answered
+    TASK_SCAN's request). An abandoned switch to the slot returns the dwell to
+    the connectionless gate instead (chanConnlessRequeue)."""
+    kernel = (FW / "kernel_mac_channel.nim").read_text()
+    op = procedure(kernel, "chanCtxtOpEvent")
+    retire = op.index("elif contextIndexOrMarker == 3:")
+    assert "scanDwellPost(MM_SCAN_CHANNEL_END_IND)" in op[retire:op.index("ctxt.contextIndexOrMarker = 0xFF")]
+    assert "scanDwellPost(MM_SCAN_CHANNEL_START_IND)" in procedure(kernel, "chan_pre_switch_channel")
+    writers = sorted((path.name, line.strip()) for path in FW.glob("*.nim")
+                     for line in path.read_text().splitlines()
+                     if re.search(r"inc chanCtxtEpochs\[(3|index)\]", line))
+    assert writers == [("kernel_mac_channel.nim", "inc chanCtxtEpochs[3]"),
+                       ("kernel_mac_channel.nim", "inc chanCtxtEpochs[index]")], writers
+    assert "inc chanCtxtEpochs[3]" in procedure(kernel, "chan_scan_req")
+    mm = procedure(kernel, "mm_init")
+    assert mm.index("scan_init()") < mm.index("chan_init()")
+    switch = (FW / "channel_switch.nim").read_text()
+    assert "chanConnlessRequeue()" in procedure(switch, "chanSwitchFinish")
 
 
 def test_raw_send_during_scan_is_refused_with_confirmation(tmp_path: Path) -> None:

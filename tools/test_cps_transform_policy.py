@@ -3565,10 +3565,6 @@ def test_wifi_task_handlers_use_named_ke_message_statuses():
         "proc scan_start_req_handler*",
         "proc scan_start_cfm_handler*",
     )
-    scan_finish = body(
-        "proc finishAcceptedScanStartReq*",
-        "proc cacheScanuStartRequest*",
-    )
     scanu_start = body(
         "proc scanu_start_req_handler*",
         "proc scanu_start_cfm_handler*",
@@ -3599,10 +3595,9 @@ def test_wifi_task_handlers_use_named_ke_message_statuses():
     assert "return KeMsgSaved" in mm_force_idle
     assert "return KeMsgConsumed" in mm_force_idle
 
-    assert "handlerResult = finishAcceptedScanStartReq(param)" in scan_start
-    assert "return handlerResult" in scan_start
+    assert "scan_ie_download(param)" in scan_start
+    assert "return KeMsgNoFree" in scan_start
     assert "return KeMsgConsumed" in scan_start
-    assert "return KeMsgNoFree" in scan_finish
     assert "if param == nil: return KeMsgConsumed" in scanu_start
     assert "return KeMsgNoFree" in scanu_start
 
@@ -3623,7 +3618,6 @@ def test_wifi_task_handlers_use_named_ke_message_statuses():
         mm_set_idle,
         mm_force_idle,
         scan_start,
-        scan_finish,
         scanu_start,
         sm_connect,
         sm_disconnect,

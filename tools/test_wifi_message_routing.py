@@ -25,7 +25,7 @@ type
 var
   storage: array[40, uint64]
   active: bool
-  metadata: array[9, bool]  # one per owner hook of ke_msg_free
+  metadata: array[8, bool]  # one per owner hook of ke_msg_free
   keMsgQueueSent: CoList
   frees, deliveries, assertions, events, traces: int
   interrupts = true
@@ -94,7 +94,7 @@ def source() -> str:
     code = (FW.parent / "fw_messages/tasks.nim").read_text() + PLATFORM
     hooks = ["mmTimForget", "rxMgtForget", "smDisconnectForget", "chanUpdateForget",
              "mmConnLossForget", "chanBcnRequestForget"]
-    hooks += ["scanDwellForget", "mmEdcaForget"]
+    hooks += ["mmEdcaForget"]
     for index, name in enumerate(hooks):
         code += f"\nproc {name}(p: pointer) =\n  doAssert p == header\n  metadata[{index}] = false\n"
     code += f"\nproc mmConfigForgetIdleOwner(p: pointer): bool =\n  doAssert p == header\n  metadata[{len(hooks)}] = false\n"

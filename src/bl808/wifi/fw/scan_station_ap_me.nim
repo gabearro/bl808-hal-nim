@@ -14,10 +14,9 @@ proc scan_init*() {.exportc, cdecl.} =
   ##   scan_probe_req_ie[20] = 0            (probe IE state word at +0x14)
   ##   scan_probe_req_ie[24] = &scan_probe_req_ie[36]  (IE buffer self-ptr at +0x18)
   ##   scan_probe_req_ie[32] = 0            (at +0x20)
-  let saved = irqSave()
-  var oldDwell = scanDwellBeginReset()
-  defer: scanDwellFinishReset(oldDwell)
-  inc scanRequestEpoch
+  ## A request still running is answered first (scanRelease); the blob
+  ## drops it with the memset.
+  scanRelease()
   discard c_memset(addr scan_env, 0, sizeof(scan_env).csize_t)
   scan_env.activeDuration = 0x35B60'u32
   scan_env.passiveDuration = 0x35B60'u32
@@ -26,9 +25,7 @@ proc scan_init*() {.exportc, cdecl.} =
   scan_probe_req_ie.probeIeStateWord = 0
   scan_probe_req_ie.ieDataPtr = addr scan_probe_req_ie.ieData[0]
   scan_probe_req_ie.writeOffset = 0
-  # Rescheduling saved SCAN messages can expose the idle state immediately.
-  ke_state_set(TASK_SCAN, ScanIdleState)
-  irqRestore(saved)
+  scanGo(ScanIdleState)
   nimFwTrace("[WIFI-NIMFW] scan_init complete")
 
 proc scan_get_scan_duration*(): uint32 {.exportc, cdecl, noinline.} =
@@ -56,7 +53,8 @@ proc scanChannelValid*(band: uint8; frequency: uint16): bool {.inline.} =
 proc scan_set_channel_request*() {.exportc, cdecl.} =
   ## Set channel for scanning. Builds channel config from scan_env param
   ## pointer and channel index, computes TX power index, sends indication.
-  ## From disassembly (84 instrs).
+  ## From disassembly (84 instrs). The blob then sets TASK_SCAN to state 2;
+  ## here scanDwellBegin has entered it before this submits the dwell.
   let scanParamPtr = scan_env.paramPtr
   if scanParamPtr == nil:
     return
@@ -68,7 +66,6 @@ proc scan_set_channel_request*() {.exportc, cdecl.} =
   let scanChan = addr scanReq.channelList[scanIdx.int]
   if not scanChannelValid(scanChan.band, scanChan.prim20Freq):
     return
-  let requestEpoch = scanRequestEpoch
   var chanCfg = default(ChanScanReqPayload)
   chanCfg.vifIdx = scanReq.vifIdx
   var freqWord: uint32
@@ -89,21 +86,12 @@ proc scan_set_channel_request*() {.exportc, cdecl.} =
   chanCfg.center2Freq = 0
   chanCfg.txPower = scanChan.txPower
   nimFwTrace2U32("[WIFI-NIMFW] scan_set start ", scanIdx.uint32, cast[uint32](scanParamPtr))
-  if scanRequestEpoch != requestEpoch or scan_env.paramPtr != scanParamPtr or
-      scan_env.channelIndex != scanIdx:
-    return
   nimFwTrace2U32("[WIFI-NIMFW] scan_set chan ", chanBand.uint32, prim20Freq.uint32)
-  if scanRequestEpoch != requestEpoch or scan_env.paramPtr != scanParamPtr or
-      scan_env.channelIndex != scanIdx:
-    return
   let chanCfgView = chanScanChannel(addr chanCfg)
   nimFwDbgScanReqChanMeta = packChannelMeta(chanCfgView)
   nimFwDbgScanReqChanFreq = packChannelFreq(chanCfgView)
   # Blob: call chan_scan_req to submit channel change to HW
   chan_scan_req(addr chanCfg)
-  if scanRequestEpoch != requestEpoch or scan_env.paramPtr != scanParamPtr or
-      scan_env.channelIndex != scanIdx:
-    return
   let chanInfoPtr = scan_env.chanInfoPtr
   if chanInfoPtr != nil:
     var txPowerIdx: uint8 = 0
@@ -116,30 +104,6 @@ proc scan_set_channel_request*() {.exportc, cdecl.} =
       if currentFreq >= 5005 and currentFreq <= 5825:
         txPowerIdx = ((currentFreq - 5000) div 5).uint8
     dsParamSetIeAt(chanInfoPtr).currentChannel = txPowerIdx
-  # Transition scan task to the channel-request pending state.
-  ke_state_set(TASK_SCAN, ScanChannelPendingState)
-
-var scanEarlyEnd {.wifiCtrl.}: tuple[pending: bool; request: pointer;
-                                    epoch: uint32; channel: uint8]
-
-proc scanEarlyEndRequest() =
-  ## Ask TASK_SCAN to end the current dwell. The vendor message has no payload,
-  ## so the dwell it is meant for is recorded here; with no dwell there is
-  ## nothing to end and nothing is sent.
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  if scan_env.paramPtr == nil: return
-  scanEarlyEnd = (true, scan_env.paramPtr, scanRequestEpoch, scan_env.channelIndex)
-  ke_msg_send_basic(MM_SCAN_CHANNEL_END_EARLY, TASK_SCAN, TASK_SCANU)
-
-proc scanEarlyEndClaim(): bool =
-  ## True once per request, and only while the dwell that asked is still current.
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  let asked = scanEarlyEnd
-  scanEarlyEnd.pending = false
-  asked.pending and asked.request != nil and asked.request == scan_env.paramPtr and
-    asked.epoch == scanRequestEpoch and asked.channel == scan_env.channelIndex
 
 proc scan_terminate_channel_request*() {.exportc, cdecl.} =
   ## Terminate the current channel scan request (15 instrs in blob).
@@ -156,28 +120,24 @@ proc scan_ie_download*(param: pointer) {.exportc, cdecl.} =
   ## calls mac_ie_find(scan_probe_req_ie+36, ieLen, 3), stores the result at
   ## scan_env+4, then calls scan_set_channel_request. The final end marker
   ## uses the stored IE data pointer at +24 and the argument's IE length.
+  ## The dwell is always submitted, as in the blob; IE lengths beyond the
+  ## buffer (refused at admission) only skip the DS lookup and the marker.
   let scanParam = scan_env.paramPtr
   if scanParam == nil or param == nil:
     return
-  let requestEpoch = scanRequestEpoch
-  let channelIndex = scan_env.channelIndex
-  let scanReq = scanStartReqView(scanParam)
-  let ieLen = scanReq.ieBodyLen
+  let ieLen = scanStartReqView(scanParam).ieBodyLen
   let argumentIeLen = scanStartReqView(param).ieBodyLen
-  if ieLen.int > scan_probe_req_ie.ieData.len or
-      argumentIeLen.int > scan_probe_req_ie.ieData.len:
-    scan_env.chanInfoPtr = nil
-    return
+  let fits = ieLen.int <= scan_probe_req_ie.ieData.len and
+    argumentIeLen.int <= scan_probe_req_ie.ieData.len
   # Search for DS Parameter Set IE (id=3) in the IE buffer
-  let found = mac_ie_find(scanProbeReqIeDataPtr(scan_probe_req_ie),
-                          ieLen.uint32, 3)
+  let found = if fits: mac_ie_find(scanProbeReqIeDataPtr(scan_probe_req_ie),
+                                   ieLen.uint32, 3)
+              else: nil
   scan_env.chanInfoPtr =
     if found != nil and cast[ptr MacIeView](found).len == 1: found else: nil
   # Set up the scan channel
   scan_set_channel_request()
-  if scanRequestEpoch != requestEpoch or scan_env.paramPtr != scanParam or
-      scan_env.channelIndex != channelIndex:
-    return
+  if not fits: return
   # Update IE tracking in scan_probe_req_ie: end_offset, write_offset
   scan_probe_req_ie.writeOffset = 0
   scan_probe_req_ie.endOffset =
@@ -205,15 +165,16 @@ proc scan_probe_req_tx*(): uint8 {.exportc, cdecl.} =
       ieLen > scan_probe_req_ie.ieData.len.uint32:
     return 0
   let totalLen = 26'u32 + ssid.length.uint32 + ieLen
-  let requestEpoch = scanRequestEpoch
-  let channelIndex = scan_env.channelIndex
+  let stamp = scanOwn.op.serial
   let identity = TxSessionIdentity(captured: true, vif: vifIdx, station: 0xFF,
     vifEpoch: rxVifEpochs[vifIdx], stationEpoch: staDeleteEpoch(0xFF),
     resetEpoch: txResetEpoch)
   let bssid = scanReq.bssid
   let localMac = scanReq.localMac
-  # A recovery callback can replace both the request and the shared IE buffer.
   let ieBytes = scan_probe_req_ie.ieData
+  # Pool recovery inside txl_frame_get completes queued frames and runs
+  # their callbacks. The frame is built from the copies above, for the dwell
+  # that is still live.
   let frame = txl_frame_get(totalLen)
   if frame == nil:
     return 1
@@ -221,14 +182,11 @@ proc scan_probe_req_tx*(): uint8 {.exportc, cdecl.} =
   let generation = txlFrameLeaseToken(frameDesc)
   frameDesc.vifIdx = vifIdx
   frameDesc.staInfoIdx = 0xFF
-  template ensureProbeCurrent() =
-    if not txlFramePreparationCurrent(frameDesc, identity, generation):
-      return 0
-    if scanRequestEpoch != requestEpoch or scan_env.paramPtr != scanParam or
-        scan_env.channelIndex != channelIndex or scan_env.abortFlag != 0:
-      txl_frame_release(frame, false)
-      return 0
-  ensureProbeCurrent()
+  if not txlFramePreparationCurrent(frameDesc, identity, generation):
+    return 0
+  if not opCurrent(scanOwn.op, stamp) or scan_env.abortFlag != 0:
+    txl_frame_release(frame, false)
+    return 0
 
   let linkDesc = hostTxLinkDescAt(frameDesc.bufDesc)
   let probeFrame = hostTxProbeReqFrame(linkDesc)
@@ -253,15 +211,12 @@ proc scan_probe_req_tx*(): uint8 {.exportc, cdecl.} =
   nimFwDbgProbeIeLen = ieLen
   for i in 0 ..< nimFwDbgProbeIeRaw.len:
     nimFwDbgProbeIeRaw[i] = if i.uint32 < ieLen: ieBytes[i] else: 0
-  ensureProbeCurrent()
   when defined(bl808WifiScanTrace):
     let addressWord = bssid[0].uint32 or (bssid[1].uint32 shl 8) or
       (bssid[2].uint32 shl 16) or (bssid[3].uint32 shl 24)
     nimFwTrace2U32("[WIFI-SCAN] probe_tx ", totalLen,
       ieLen or (ssid.length.uint32 shl 16) or (vifIdx.uint32 shl 24))
-    ensureProbeCurrent()
     nimFwTrace2U32("[WIFI-SCAN] probe_fc ", 0x40, addressWord)
-    ensureProbeCurrent()
   if txl_frame_push(frame, 3) != 0: 0'u8 else: 1'u8
 
 proc scan_send_cancel_cfm*(status: uint8, destId: uint8)
@@ -293,114 +248,19 @@ proc scan_get_chan*(): pointer {.exportc, cdecl.} =
 #                      SCANU (Upper MAC Scan)
 # ###########################################################################
 
-type ScanuLowerExchange = object
-  request, startCfm, done: pointer
-  epoch: uint32
-
-# One lower scan phase at a time. Queue envelopes are identities, not borrowed
-# payloads; the upper generation invalidates the whole exchange on retirement.
-var scanuLower {.wifiCtrl.}: ScanuLowerExchange
-
-proc scanuLowerCurrent(request: pointer): bool {.inline.} =
-  request != nil and scanuLower.request == request and
-    scanu_env.paramPtr != nil and scanuLower.epoch == scanuRequestEpoch
-
-proc scanuTrackLowerReply(request, reply: pointer; done: bool) {.inline.} =
-  if scanuLowerCurrent(request):
-    if done: scanuLower.done = reply
-    else: scanuLower.startCfm = reply
-
-proc scanuClaimLowerReply(reply: pointer; done: bool): bool {.inline.} =
-  # Called under the same IRQ lock as consumption of the claimed reply.
-  if reply == nil or not scanuLowerCurrent(scanuLower.request): return false
-  if done:
-    if scanuLower.done != reply: return false
-    scanuLower = default(ScanuLowerExchange)
-  else:
-    if scanuLower.startCfm != reply: return false
-    scanuLower.startCfm = nil
-  true
-
-proc scanuRequestCurrent(param: pointer; epoch: uint32): bool {.inline.} =
-  param != nil and scanu_env.paramPtr == param and scanuRequestEpoch == epoch
-
 proc scanu_init*() {.exportc, cdecl.} =
-  ## Initialize upper MAC scan module.
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  inc scanuRequestEpoch
-  ke_state_set(TASK_SCANU, ScanuIdleState)
+  ## Initialize upper MAC scan module. A request still held is freed: its
+  ## requester, SM, is reset next by me_init, and the host is not answered,
+  ## as in the blob, which drops the pointer with the memset.
+  scanuGo(ScanuIdleState)
+  let request = scanu_env.paramPtr
   discard c_memset(cast[pointer](addr scanu_env), 0, sizeof(ScanuEnvObj).csize_t)
+  if request != nil: ke_msg_free(keMsgHdrFromPayload(request))
   scanu_env.probeIeCopyDst = addr scanuAddIeView().ieData[0]
   scanuJoinHandler = cast[pointer](scanu_frame_handler)
   scanuResultCount = 0
   for scanResultPointerIndex in 0 ..< MAX_SCAN_RESULTS:
     scanuResults[scanResultPointerIndex] = nil
-
-proc scanuReleaseCompletedOwner(epoch: uint32) =
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  # Setting IDLE drains saved requests. The confirmation must reach the
-  # queue first, and a reentrant replacement must keep its own state.
-  if scanuRequestEpoch == epoch and scanu_env.paramPtr == nil:
-    ke_state_set(TASK_SCANU, ScanuIdleState)
-
-proc scanuAnswer(request: pointer; id: uint16; destination, status: uint8) =
-  ## Answer `request` in place: it becomes its own confirmation. This needs
-  ## no allocation, so it cannot fail.
-  statusCfmView(request).status = status
-  keMsgHdrFromPayload(request).paramLen = StatusCfmPayloadSize
-  ke_msg_forward_and_change_id(request, id, destination, TASK_SCANU)
-
-proc scanuReply(id: uint16; destination: uint8): pointer =
-  ## A separate confirmation, as the blob allocates one. SM's requests, and
-  ## any whose allocation fails, are answered in place instead (nil).
-  if destination == TASK_SM: nil
-  else: ke_msg_try_alloc(id, destination, TASK_SCANU, StatusCfmPayloadSize)
-
-proc scanuPublishCompletion(request, reply: pointer; id: uint16;
-                            destination, status: uint8) =
-  if reply == nil:
-    scanuAnswer(request, id, destination, status)
-  else:
-    statusCfmView(reply).status = status
-    ke_msg_free(keMsgHdrFromPayload(request))
-    ke_msg_send(reply)
-
-proc scanu_confirm*(status: uint8) {.exportc, cdecl.} =
-  ## Send scan completion confirmation to host (58 instrs).
-  ## Blob flow: allocates SCANU_JOIN_CFM twice in join mode (to requester and
-  ## TASK_API), or SCANU_START_CFM in normal scan mode. SCANU_RESULT_IND is not
-  ## a status message; it carries real beacon/probe-response frames.
-  # Detach the old request before callouts, but keep the task busy until
-  # this completion is published ahead of any saved scan request.
-  let completion = block:
-    let saved = irqSave()
-    defer: irqRestore(saved)
-    let oldRequest = scanu_env.paramPtr
-    if oldRequest == nil: return
-    # SM's answer has the type of its request; SM does not read the filter.
-    let joining = if scanu_env.requester == TASK_SM:
-        uint8(keMsgHdrFromPayload(oldRequest).id == SCANU_JOIN_REQ)
-      else: scanu_env.bssidFilterEnabled
-    inc scanuRequestEpoch
-    scanu_env.paramPtr = nil
-    scanu_env.pendingJoinRxuMgtInd = nil
-    (request: oldRequest, join: joining,
-     source: scanu_env.requester, epoch: scanuRequestEpoch)
-  defer: scanuReleaseCompletedOwner(completion.epoch)
-  let primaryId = if completion.join != 0: SCANU_JOIN_CFM else: SCANU_START_CFM
-  let primaryCfm = scanuReply(primaryId, completion.source)
-  var apiJoinCfm: pointer = nil
-  if completion.join != 0:
-    apiJoinCfm = ke_msg_try_alloc(SCANU_JOIN_CFM, TASK_API, TASK_SCANU,
-                                  StatusCfmPayloadSize)
-  if apiJoinCfm != nil:
-    statusCfmView(apiJoinCfm).status = status
-  scanuPublishCompletion(completion.request, primaryCfm, primaryId,
-                         completion.source, status)
-  if apiJoinCfm != nil:
-    ke_msg_send(apiJoinCfm)
 
 type ProbeIeWriter = object
   len*: uint16
@@ -491,18 +351,11 @@ proc finishScanStartReq*(msg: ptr ScanStartReqPayload, ies: var ProbeIeWriter): 
   true
 
 proc sendScanStartReq*(msg: ptr ScanStartReqPayload, ies: var ProbeIeWriter) {.inline.} =
-  let owner = scanu_env.paramPtr
-  let epoch = scanuRequestEpoch
   if not msg.finishScanStartReq(ies):
     ke_msg_free(keMsgHdrFromPayload(msg))
-    if scanuRequestCurrent(owner, epoch):
-      scanu_confirm(SCAN_STATUS_BAD_PARAM)
+    scanu_confirm(SCAN_STATUS_BAD_PARAM)
     return
-  if not scanuRequestCurrent(owner, epoch):
-    ke_msg_free(keMsgHdrFromPayload(msg))
-    return
-  scanuLower = ScanuLowerExchange(request: msg, epoch: epoch)
-  ke_msg_send(msg)
+  scanuSendLower(msg)
 
 proc initScanStartReq*(
     msg: ptr ScanStartReqPayload,
@@ -577,12 +430,7 @@ proc allocInitializedScanStartReq*(
     req: ptr ScanuStartReqPayload,
     sendProbe: uint8
   ): ptr ScanStartReqPayload {.inline.} =
-  let epoch = scanuRequestEpoch
   result = allocScanStartReq()
-  if not scanuRequestCurrent(cast[pointer](req), epoch):
-    if result != nil:
-      ke_msg_free(keMsgHdrFromPayload(result))
-    return nil
   if result != nil:
     result.initScanStartReq(req, sendProbe)
 
@@ -594,19 +442,14 @@ proc copyScanSsidFilterIfPresent*(
     msg.ssidFilter = req.ssidFilter
 
 proc resetUndirectedScanuStart*() {.inline.} =
-  let scanParam = scanu_env.paramPtr
-  let epoch = scanuRequestEpoch
   scanu_cached_scanresult_clear()
-  if not scanuRequestCurrent(scanParam, epoch):
-    return
-  scanuStartReqView(scanParam).cacheScanuFilterSsid()
+  scanuStartReqView(scanu_env.paramPtr).cacheScanuFilterSsid()
   scanu_env.resultCount = 0
 
 proc finishAdvancedScanuScanBand*(): bool {.inline.} =
-  let scanParam = scanu_env.paramPtr
-  let epoch = scanuRequestEpoch
-  let sendProbeFlag = scanu_env.bssidFilterEnabled
-  if sendProbeFlag != 0 and scanu_env.directedFound == 0:
+  ## The bands are done: a join that found nothing scans band 0 again while
+  ## it has retries left (true); otherwise the request ends here.
+  if scanu_env.bssidFilterEnabled != 0 and scanu_env.directedFound == 0:
     let retryCount = scanu_env.joinRetryCount
     if retryCount > 0:
       scanu_env.joinRetryCount = retryCount - 1
@@ -615,8 +458,6 @@ proc finishAdvancedScanuScanBand*(): bool {.inline.} =
         cast[proc(level: uint32; tag, file: cstring; line: cint;
                   format: cstring) {.cdecl, varargs.}](logFunc)(
           2, nil, "scanu.c", 1163, "rescan:%s %d \r\n", "scanu_scan_next", 1163.cint)
-      if not scanuRequestCurrent(scanParam, epoch):
-        return false
       scanu_env.resultState = 1
       scanu_env.scanBand = 0
       return true
@@ -626,50 +467,26 @@ proc finishAdvancedScanuScanBand*(): bool {.inline.} =
 proc scanu_start*() {.exportc, cdecl.} =
   ## Start a scan operation (37 instrs).
   ## From blob: loads scanu_env base (s0). Checks scanu_env.joinFlag (offset 180).
-  ## If joinFlag != 0, jumps to shared path (ke_state_set + scan_next).
-  ## If joinFlag == 0: scanu_cached_scanresult_clear, memcpy params, clear count,
-  ## then shared path. Shared path: ke_state_set(2,1), check probe data,
-  ## tail-call scanu_scan_next.
-  let saved = irqSave()
-  defer: irqRestore(saved)
+  ## If joinFlag == 0: scanu_cached_scanresult_clear, memcpy params, clear count.
+  ## Shared path: ke_state_set(2,1), check probe data, tail-call
+  ## scanu_scan_next. Here the state was set once, when the request was
+  ## admitted (scanuGo), so a join stays in state 2.
   let scanParam = scanu_env.paramPtr
-  let epoch = scanuRequestEpoch
-  if not scanuRequestCurrent(scanParam, epoch):
+  if scanParam == nil:
     return
-  if scanuProducerRequest == scanParam and scanuProducerEpoch == epoch:
-    return
-  let previousProducer = scanuProducerRequest
-  let previousProducerEpoch = scanuProducerEpoch
-  scanuProducerRequest = scanParam
-  scanuProducerEpoch = epoch
-  defer:
-    scanuProducerRequest = previousProducer
-    scanuProducerEpoch = previousProducerEpoch
-  let joinFlag = scanu_env.bssidFilterEnabled
-  if joinFlag == 0:
+  if scanu_env.bssidFilterEnabled == 0:
     resetUndirectedScanuStart()
-    if not scanuRequestCurrent(scanParam, epoch):
-      return
-  ke_state_set(TASK_SCANU, ScanuScanningState)
-  if not scanuRequestCurrent(scanParam, epoch):
-    return
   # Blob 0x4c..0x74: if scanParam[300] != 0 (probe data ptr) AND
   # scanParam[304]..[305] (halfword probe length) <= 200, copy the probe
   # data into scanu_env[224] via memcpy, then tail-call scanu_scan_next.
-  # Previous Nim omitted the probe-data copy entirely.
-  if scanParam != nil:
-    let scanReq = scanuStartReqView(scanParam)
-    let probeSrc = scanReq.probeReqIe
-    if probeSrc != nil:
-      let probeLen = scanReq.probeReqIeLen
-      if probeLen <= 200'u16:
-        let probeDst = scanu_env.probeIeCopyDst
-        if probeDst != nil:
-          discard c_memcpy(probeDst, probeSrc, probeLen.csize_t)
-  # Startup hands the same request to the guarded scan builder without a callout
-  # between releasing its producer guard and entering the builder.
-  scanuProducerRequest = previousProducer
-  scanuProducerEpoch = previousProducerEpoch
+  let scanReq = scanuStartReqView(scanParam)
+  let probeSrc = scanReq.probeReqIe
+  if probeSrc != nil:
+    let probeLen = scanReq.probeReqIeLen
+    if probeLen <= 200'u16:
+      let probeDst = scanu_env.probeIeCopyDst
+      if probeDst != nil:
+        discard c_memcpy(probeDst, probeSrc, probeLen.csize_t)
   scanu_scan_next()
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void scanu_scan_next(void);".}
@@ -678,24 +495,12 @@ proc scanu_scan_next*() {.exportc, cdecl.} =
   ## From blob (265 instrs): iterates scan_param channel list, builds
   ## SCAN_START_REQ with probe request IEs, sends to lower-MAC scan module.
   ## When all channels are done or abort is requested, sends SCANU_START_CFM.
-  let saved = irqSave()
-  defer: irqRestore(saved)
   let scanParam = scanu_env.paramPtr
-  let epoch = scanuRequestEpoch
   if scanParam == nil:
     # scanu_confirm already performs ke_state_set(SCANU, 0) internally.
     # Blob does not duplicate the state clear here.
     scanu_confirm(0)
     return
-  if scanuProducerRequest == scanParam and scanuProducerEpoch == epoch:
-    return
-  let previousProducer = scanuProducerRequest
-  let previousProducerEpoch = scanuProducerEpoch
-  scanuProducerRequest = scanParam
-  scanuProducerEpoch = epoch
-  defer:
-    scanuProducerRequest = previousProducer
-    scanuProducerEpoch = previousProducerEpoch
   let scanReq = activeScanuReq()
   let numChannels = scanReq.channelCount
   if numChannels.int > scanReq.channelList.len or
@@ -714,9 +519,7 @@ proc scanu_scan_next*() {.exportc, cdecl.} =
   while true:
     scanBand = scanu_env.scanBand
     if scanBand != 0:
-      if finishAdvancedScanuScanBand() and
-          scanuRequestCurrent(scanParam, epoch):
-        continue
+      if finishAdvancedScanuScanBand(): continue
       return
     # The vendor scans band 0 first and restarts that phase on a join retry.
     chanIdx = scanReq.firstScanBandChannel(scanBand)
@@ -725,8 +528,6 @@ proc scanu_scan_next*() {.exportc, cdecl.} =
     scanu_env.scanBand = 1
   # Allocate SCAN_START_REQ (paramLen=316)
   let msg = allocInitializedScanStartReq(scanReq, scanu_env.bssidFilterEnabled)
-  if not scanuRequestCurrent(scanParam, epoch):
-    return
   if msg == nil:
     scanu_confirm(SCAN_STATUS_FAIL)
     return
@@ -1415,7 +1216,7 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
   discard c_memset(addr secInfo, 0, sizeof(WpaParsedInfoView).csize_t)
 
   let scanParam = scanu_env.paramPtr
-  let scanEpoch = scanuRequestEpoch
+  let scanEpoch = scanuOwn.op.serial
   let scanuState = ke_state_get(TASK_SCANU)
   if scanParam == nil or (scanuState != 1 and scanuState != 2) or
       not scanuRequestCurrent(scanParam, scanEpoch):
@@ -1609,7 +1410,7 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
                  length.csize_t) != 0):
       ke_msg_forward_and_change_id(frame, 0x804'u16, 9, 2)
       return
-    if (scanFlags and 0x40) != 0: scan_env.abortFlag = 1
+    if (scanFlags and 0x40) != 0: scanStopAfterDwell()
     if not directedBssid and earlyEnd:
       endDwellEarly()
 
@@ -1943,13 +1744,13 @@ proc scanuCaptureResult(scanResultEntry: ptr ScanuResultEntry): ScanuResultSnaps
   result.entry = scanResultEntry
   result.value = scanResultEntry[]
   result.ssid = cached[]
-  result.epoch = scanuRequestEpoch
+  result.epoch = scanuOwn.op.serial
   if result.value.chanPtr != nil:
     result.channel = cast[ptr ScanChannelEntry](result.value.chanPtr)[]
 
 proc scanuResultCurrent(snapshot: ScanuResultSnapshot;
                         allowRawRelease = false): bool =
-  if snapshot.entry == nil or snapshot.epoch != scanuRequestEpoch:
+  if snapshot.entry == nil or snapshot.epoch != scanuOwn.op.serial:
     return false
   var value = snapshot.entry[]
   if value.cachedRxuMgtInd != snapshot.value.cachedRxuMgtInd:
@@ -1982,7 +1783,7 @@ proc scanu_search_by_ssid*(ssid: pointer, entryIndexOut: pointer): pointer {.exp
     return nil
   let saved = irqSave()
   defer: irqRestore(saved)
-  let searchEpoch = scanuRequestEpoch
+  let searchEpoch = scanuOwn.op.serial
   let ssidSlot = lengthPrefixedSsidView(ssid)
   let searchLen = ssidSlot.length
   if searchLen == 0 or searchLen > 32:
@@ -2044,7 +1845,7 @@ proc scanu_search_by_ssid*(ssid: pointer, entryIndexOut: pointer): pointer {.exp
                    ssidSearchResultSlotIndex.uint32 or
                      (ssidSearchResultEntry.valid.uint32 shl 8),
                    cast[uint32](ssidSearchResultEntry.cachedRxuMgtInd))
-    if scanuRequestEpoch != searchEpoch:
+    if scanuOwn.op.serial != searchEpoch:
       return nil
     if ssidSearchResultEntry.valid == 0:
       continue
@@ -2126,7 +1927,7 @@ proc scanu_search_by_ssid*(ssid: pointer, entryIndexOut: pointer): pointer {.exp
     bestIndex = ssidSearchResultSlotIndex.uint32
     bestAllowsRawRelease = useRequestFilter or retainedMatch
   if bestScanResultEntry != nil:
-    if scanuRequestEpoch != searchEpoch or
+    if scanuOwn.op.serial != searchEpoch or
         not scanuResultCurrent(bestSnapshot, bestAllowsRawRelease):
       return nil
     if entryIndexOut != nil:
@@ -2354,10 +2155,10 @@ proc sm_get_bss_params*(selectedBssResultOut: ptr pointer, selectedBssChannelOut
   # while SM's operation and the scan that produced them are still current.
   let stamp = smOwn.op.serial
   let indication = sm.connectIndMsg
-  let scanEpoch = scanuRequestEpoch
+  let scanEpoch = scanuOwn.op.serial
   template current(): bool =
     opCurrent(smOwn.op, stamp) and sm.connectIndMsg == indication and
-      scanuRequestEpoch == scanEpoch
+      scanuOwn.op.serial == scanEpoch
   var snapshot = connectInfoView(connInfo)[]
   let ci = addr snapshot
   snapshot.ssid[connectInfoSsidLen(ci).int] = 0

@@ -82,7 +82,7 @@ for incoming in [false, true]:
       case mutation
       of 0: inc channel.prim20Freq
       of 1: inc channel.txPower
-      of 2: inc scanuRequestEpoch
+      of 2: inc scanuOwn.op.serial
       of 3: scanuCachedSsids[0].valid = 0
       else: scanuCachedSsids[0].length = 1
     var selected = 0x12345678'u32

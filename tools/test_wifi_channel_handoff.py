@@ -376,7 +376,7 @@ proc waitRfUs(value: uint32) = discard
 proc ke_msg_send_basic(id: uint16; dest, src: uint8) = events.add(("basic", id.uint))
 const MM_SCAN_CHANNEL_START_IND = 75'u16
 var chanCtxtEpochs: array[5, uint32]
-proc scanDwellPublish(id: uint16; slot: uint32) = ke_msg_send_basic(id, 1, 255)
+proc scanDwellPost(id: uint16) = ke_msg_send_basic(id, 1, 255)
 proc vif_mgmt_send_postponed_frame(p: pointer) = discard
 proc chan_cde_evt(p: pointer) = env.scheduledCtxt = cdeTarget
 proc lastPhy(): int =

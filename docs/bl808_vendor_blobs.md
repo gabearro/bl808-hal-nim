@@ -7055,12 +7055,13 @@ Three deliberate differences from the archive:
   and `sm_connect_req_handler+0x110` then asserts; the port had answered
   every later connect with busy, and then cleared both pointers without
   freeing them (SMCONN-F7).
-- `MM_SCAN_CHANNEL_END_EARLY` has no payload. Pinned
-  `scan_task.o:mm_scan_channel_end_early_handler` asserts at line 186 when
-  TASK_SCAN is idle and otherwise ends whichever dwell is running. The
-  port records the request, epoch and channel index when SCANU asks, sends
-  nothing when no dwell exists, and ends only that dwell. No caller in
-  this tree sets the quick-connect flag (bit 8) that produces the message.
+- `MM_SCAN_CHANNEL_END_EARLY` carries a payload, the stamp of the dwell
+  that was on its channel when SCANU asked (see "Lower scan and SCANU"
+  below). Pinned `scan_task.o:mm_scan_channel_end_early_handler` asserts
+  at line 186 when TASK_SCAN is idle and otherwise ends whichever dwell is
+  running. The port sends nothing when no dwell is on its channel and ends
+  only that dwell. No caller in this tree sets the quick-connect flag
+  (bit 8) that produces the message.
 - `scanu_default_state` has a fourth entry. The archive has no
   `SCANU_RAW_SEND_REQ` handler while scanning or joining, so the kernel
   frees the request and the host waits out its command timeout. The
@@ -7706,8 +7707,9 @@ be counted as saved behind a public scan. The count was in
 `scanu_start_req_handler`'s busy branch, which never runs: SCANU's state
 tables route `SCANU_START_REQ` to `ke_msg_save` while SCANU scans or joins,
 as `scanu_task.o` does. The count (bench builds only) is now in
-`ke_msg_save`. That branch, and its busy answer to a host request, is still
-unreachable through the tables.
+`ke_msg_save`. That branch, and its busy answer to a host request, were
+unreachable through the tables and are removed (see "Lower scan and SCANU"
+below).
 
 Removed: `smAttemptStaVif`, `smRequestVifLive`, `smCleanupVifLive`,
 `smTeardownUnclaimed` (now `smAbandon`), `SmStaRequestIdentity`,
@@ -7842,7 +7844,7 @@ builder parameter of `meBuildSaeAuthenticate` and `meBuildAssociateReq`
 and 20 IRQ mask sections. `-d:bl808WifiOpCheck` was not extended: its nested-pump counter
 already shows whether a host callback waits inside a firmware step.
 
-Not done: SCANU's own re-checks in `scanu_frame_handler` (and the IRQ mask
+Not done (still, see "Lower scan and SCANU" below): SCANU's own re-checks in `scanu_frame_handler` (and the IRQ mask
 around its directed-scan block) and SA Query's re-checks in
 `smTrySubmitSaQuery`, which still include the TX reset epoch for its frame
 identity.
@@ -7866,6 +7868,153 @@ updates, `ke_state_set`, or a frame released by someone else mid-build were
 removed with the re-checks they exercised; each remaining check was mutated
 and its test fails. The M0 HTTP server manifest built; none of this was
 flashed.
+
+#### Lower scan and SCANU (TASK_SCAN, TASK_SCANU)
+
+`scan_machine.nim` holds both machines. `scanGo` is the only
+`ke_state_set(TASK_SCAN)` and `scanuGo` the only `ke_state_set(TASK_SCANU)`;
+each is the only writer of its machine's `Op` (`op.nim`). For TASK_SCAN,
+entering state 2 starts a dwell (a new operation), state 3 is the same dwell
+on its channel and idle ends it. For TASK_SCANU, each admission (state 1 or
+2) and each end (state 0) starts a new operation. This replaces the
+statements under "Scan And Power Compensation" above about re-checking the
+request pointer, epoch and channel index after callouts. Differences from
+the archive:
+
+- A lower request ends in one place, `scanRelease`, which answers it in
+  place: the SCAN_START_REQ becomes `SCAN_DONE_IND` (no payload), or a
+  failing `SCAN_START_CFM` when its next dwell cannot start (slot 3 taken or
+  no memory for the dwell's notices), so SCANU ends its request with an
+  error. Pinned `scan_task.o` frees the request and sends
+  `ke_msg_send_basic(SCAN_DONE_IND)`, which halts without memory. A refused
+  SCAN_START_REQ (busy, slot 3 taken, malformed, or no memory for the
+  success confirmation or the first dwell's notices) is answered in place
+  with its status; the blob allocates the confirmation and frees the
+  request. The success `SCAN_START_CFM` is allocated as before and sent
+  after the first dwell is submitted, as in the blob.
+- Each dwell allocates its `MM_SCAN_CHANNEL_START_IND` and
+  `MM_SCAN_CHANNEL_END_IND` (a 4-byte payload: the dwell's stamp) before it
+  asks for slot 3 (`scanDwellBegin`). `chan_pre_switch_channel` posts START
+  when slot 3 becomes current and `chanCtxtOpEvent` posts END when it
+  retires the slot (`scanDwellPost`), START first if it was still held. The
+  blob's `chan.o` allocates both there with `ke_msg_send_basic`. Notices a
+  dwell still holds when it ends are freed. START, END, END_EARLY and the
+  `SCAN_PROBE_TIMER` expiry act only with the live dwell's stamp in the
+  state they expect (`scanCurrent`); anything else is dropped. The blob
+  asserts the state for START (line 159) and END (line 234) and has no
+  stamp.
+- `SCAN_PROBE_TIMER` is armed with the dwell's stamp, so an expiry posted
+  before END cleared the timer cannot probe in the next dwell. The blob's
+  handler checks only for state 3.
+- SCAN_ABORT_REQ and SCAN_CANCEL_REQ set the stop flag in states 2 and 3,
+  and an abort in state 3 leaves the channel (`scan_terminate_channel_request`),
+  as in the blob. A dwell that starts with the flag set (an abort or cancel
+  while it waited, or SCANU's stop once the wanted SSID was found, flag
+  0x40, now `scanStopAfterDwell`) leaves its channel at once without
+  probing; the blob runs that dwell for its full duration.
+- SM's abort in state 1 sends SCAN_ABORT_REQ without a payload. TASK_SCAN
+  acts on it only while the lower scan it runs is the one of SM's live scan
+  request (`smAbortOwnsLowerScan`, checked when the abort runs). The port
+  had stamped it with a lower-scan epoch when it was queued; an abort that
+  now reaches a later band of the same SM scan stops that band too.
+- END is posted wherever slot 3 leaves the pool: `chanCtxtOpEvent` posts it
+  and is the only place that retires the slot besides `chan_init`, which
+  runs after `scan_init` has answered the request. An abandoned switch to
+  slot 3 does not end the dwell: it returns it to the connectionless gate
+  (`chanConnlessRequeue`, see "Channel switch" above), so TASK_SCAN in state
+  2 always gets START and in state 3 END. No END is posted in state 2.
+- `scan_init` answers a request still running (`scanRelease`); the blob
+  drops it with its memset. On `MM_RESET_REQ` SCANU was reset just before
+  and drops the answer. `chan_init` and `ke_init` no longer reset TASK_SCAN;
+  `ke_flush` calls `scanRelease`, whose answer is flushed with the queues.
+- `scan_set_channel_request` no longer sets state 2: `scanDwellBegin`
+  enters it before the request is submitted. `scan_ie_download` always
+  submits the dwell; an IE length beyond the buffer (refused at admission)
+  skips only the DS lookup and the end marker. The port had returned
+  without submitting it, leaving TASK_SCAN waiting.
+- The re-checks after the traces, register reads, timer clear,
+  `chan_scan_req`, `scan_set_channel_request` and `scan_get_scan_duration`
+  are removed, as are `chan_scan_req`'s own after its traces: none of these
+  runs TASK_SCAN code. `scan_probe_req_tx` keeps one check, of the dwell's
+  stamp, after `txl_frame_get`, whose pool recovery runs TX callbacks. No
+  callback is known to end a dwell from there, so the check is a candidate
+  for removal.
+
+SCANU:
+
+- SCANU holds the one SCAN_START_REQ it sent (`scanuSendLower`) and takes
+  TASK_SCAN's answer only as that message (`scanuTakeLower`): a failing
+  SCAN_START_CFM or the SCAN_DONE_IND, both the request answered in place.
+  The success SCAN_START_CFM changes nothing, as the blob ignores status 0.
+  TASK_SCAN drops a SCAN_START_REQ that SCANU no longer waits on (after a
+  reset).
+- The state is set once per request: 1 for a scan and 2 for a join when it
+  is admitted, 0 when it ends. The blob sets 1 in `scanu_start` and before
+  a join replay, so its joins run in state 1; the two states' tables are
+  the same.
+- `scanuComplete` is the one end, used by `scanu_confirm` and by the cached
+  join replay, which, as pinned `scan_done_ind_handler` does, sends only
+  the requester's `SCANU_JOIN_CFM` with status 0 and clears the cached
+  results. It detaches the request, answers it, then goes idle.
+- `scanu_start_req_handler` and `scanu_join_req_handler` no longer have a
+  busy branch: SCANU's tables run them only in state 0, and
+  `scanu_default_state` saves both requests while SCANU is busy, as
+  `scanu_task.o` does. The host's busy answer (status 8) went with it.
+- `scanu_init` frees a request SCANU still holds; the blob drops the
+  pointer with its memset. SM, the requester of its own scans, is reset
+  next; a host requester is not answered, as in the blob.
+
+Removed: the `scanDwell*` machinery in `kernel_mac_channel.nim` (held
+envelopes, request, owner flag, epoch, serial, slot prediction, reset epoch,
+channel, the posted tag list with its tombstones, `scanDwellForget` in
+`ke_msg_free`, the resets in `ke_init`, `ke_flush` and `chan_init`); the
+`scanEarlyEnd` record and claim; `ScanProbeTimerContext`,
+`scanProbeTimerCurrent` and `scheduleActiveScanProbeTimer`;
+`releaseCompletedScanRequest`, `forwardFailedScanDwell` and
+`finishAcceptedScanStartReq`; `scanuLower` with its epoch and its four
+checks in `scan_start_req_handler`; the `scanuProducer` guard;
+`cacheScanuStartRequest` with its abandoned-request free and the never-read
+counter `nimfw_dbg_scanu_param_overwrite`; `scanuReleaseCompletedOwner`;
+the epoch payload of SM's SCAN_ABORT_REQ; the counters `scanRequestEpoch`
+and `scanuRequestEpoch` (SCANU's operation serial replaces the latter in
+`scanu_frame_handler` and the result snapshots); and the IRQ masks in the
+SCAN and SCANU handlers and `scanu_start`/`scanu_scan_next`.
+
+Not done: `scanu_frame_handler` keeps its re-checks and IRQ masks, now on
+SCANU's operation stamp. The re-check after the supplicant's parse and
+notify callbacks and the WPS callback is covered with mutations by
+`tools/test_wifi_scan_security_lifetime.py`, whose fixture was repaired.
+A dwell is asked to leave its channel only while it still holds its END
+(`scanOnChannel`). A second END_EARLY, an abort, or a stopped START for a
+dwell whose END is already queued does nothing; the blob calls
+`scan_terminate_channel_request` again, which clears the shared operation
+timer after it has passed to another context.
+
+Host tests: `tools/test_wifi_scan_table.py` drives both machines through
+the per-state tables of `dispatch_tables.nim` (TASK_SCAN's default table,
+SCANU's state tables then its default table; `test_wifi_message_tables.py`
+compares them with the archive) over a model of slot 3, with a host scan,
+an SM scan and an SM join stopped at each of their first 40 steps and given one input each
+(abort, cancel, early end, stop, probe expiry, stale stamps,
+allocation failures, slot 3 taken, MM reset, saved requests); after every
+step it checks that each machine is busy exactly while it holds a request,
+that what a busy machine waits for is coming and that nothing is answered
+twice, and at rest that every request has one answer, nothing is leaked and
+every stamp is stale; nine mutations of the rules are each caught.
+Further: `tools/test_wifi_scan_model_fuzzer.py` (seeded interleavings with
+two mutation controls), `tools/test_wifi_scan_dwell_notices.py`,
+`tools/test_wifi_scan_probe_timer.py`, `tools/test_wifi_sm_audit_scan.py`
+(SCAN-N1 structural, SCAN-F3, the probe expiry), `tools/test_wifi_op_discipline.py`
+(one state and operation writer per machine, stamps on every delivery, one
+end per machine, the removed machinery stays removed),
+`tools/test_wifi_scanu_completion_lifetime.py`,
+`tools/test_wifi_scanu_producer_lifetime.py`, `tools/test_wifi_probe_lifetime.py`,
+`tools/test_wifi_scan_start_confirmation.py`, `tools/test_wifi_station_abort.py`
+and `tools/test_wifi_sm_scan_completion.py`. Cases that replaced the request
+from traces, allocations, sends, frees, log callbacks or timer clears were
+removed with the re-checks they exercised. The M0 HTTP server and the scan,
+cold-scan, scan-ownership, connected-scan, HAL and bad-password manifests
+built; none of this was flashed.
 
 ## BLE
 

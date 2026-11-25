@@ -155,7 +155,6 @@ var
   # Scan lower-MAC environment (exported as "scan_env", 24 bytes)
   # offset 10 (0x0A): abort request flag byte
   scan_env* {.exportc.}: ScanEnvObj
-  scanRequestEpoch: uint32
   scanDurationActive*: uint32
   scanDurationPassive*: uint32
   scanDurationJoinActive*: uint32
@@ -167,9 +166,6 @@ var
 
   # Scan-upper environment (exported as "scanu_env")
   scanu_env* {.exportc.}: ScanuEnvObj
-  scanuRequestEpoch: uint32
-  scanuProducerRequest: pointer
-  scanuProducerEpoch: uint32
   scanuCachedSsids: array[SCANU_MAX_RESULT_ENTRIES, ScanuCachedSsid]
   scanuCachedChannels: array[SCANU_MAX_RESULT_ENTRIES, ScanChannelEntry]
   scanuJoinHandler*: pointer  # Function pointer stored during scanu_init

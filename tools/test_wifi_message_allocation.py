@@ -69,7 +69,6 @@ proc mmTimCaptureMessage(header: ptr KeMsgHdr) = discard
 proc mmTimForget(header: pointer) = discard
 proc mmConnLossForget(header: pointer) = discard
 proc chanSwitchForget(header: pointer): bool = false
-proc scanDwellForget(header: pointer) = discard
 proc smRspTimerForget(header: pointer) = discard
 proc smDisconnectStorageLength(id: uint16; destination: uint8; length: uint32): uint32 = length
 proc smDisconnectRegister(header: ptr KeMsgHdr) = discard

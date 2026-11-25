@@ -1,4 +1,4 @@
-"""Exercise complete probe construction, request epochs, and private IE DMA."""
+"""Exercise complete probe construction, the dwell stamp, and private IE DMA."""
 
 from pathlib import Path
 import os
@@ -47,7 +47,6 @@ type
 var
   scan_env: ScanEnv
   scan_probe_req_ie: ProbeIeStorage
-  scanRequestEpoch: uint32
   request, otherRequest: ScanStartReqPayload
   freeCalls: int
   doneSends: int
@@ -59,32 +58,6 @@ proc scanSsidSlot(req: ptr ScanStartReqPayload; index: int): ptr ScanSsidSlotVie
   cast[ptr ScanSsidSlotView](addr req.ssidFilter[index * 34])
 proc hostTxProbeReqFrame(link: ptr LinkDesc): ptr ProbeReqFrameView =
   cast[ptr ProbeReqFrameView](addr link.macHeader[0])
-type Header = object
-  paramLen: uint32
-var requestHeader: Header
-var endEnvelope: uint8
-proc keMsgHdrFromPayload(p: pointer): ptr Header =
-  doAssert p == addr request
-  addr requestHeader
-proc ke_msg_free(p: pointer) =
-  doAssert p == addr requestHeader
-  doAssert scan_env.paramPtr != addr request, "request was not detached before free"
-  inc freeCalls
-  if freeHook != nil: freeHook()
-proc ke_msg_forward_and_change_id(p: pointer; id: uint16; dest, source: uint8) =
-  doAssert p == addr endEnvelope
-  doAssert id == SCAN_DONE_IND and source == TASK_SCAN
-  doAssert scan_env.paramPtr == nil
-  inc doneSends
-  doneDest = dest
-  if sendHook != nil: sendHook()
-proc scanuTrackLowerReply(request, reply: pointer; done: bool) = discard
-type ScanDwellPair = object
-var scanDwellRequest: pointer
-var scanDwellEpoch: uint32
-proc scanDwellDetach(): ScanDwellPair = default(ScanDwellPair)
-proc scanDwellDispose(pair: var ScanDwellPair) = discard
-proc forwardFailedScanDwell(request: pointer; requester: uint8) = doAssert false
 proc ke_state_get(task: uint8): uint16 =
   doAssert task == TASK_SCAN
   scanTaskState
@@ -95,6 +68,11 @@ proc ke_state_set(task: uint8; state: uint16) =
 
 
 CHECKS = r"""
+proc newDwell(p: pointer; requester: uint8) =
+  ## TASK_SCAN admits `p` (same or another address) and starts its dwell.
+  cacheScanStartContext(p, requester)
+  discard opGo(scanOwn.op)
+
 proc replaceCurrent() =
   let desc = currentFrame
   txl_frame_release(desc, false)
@@ -118,8 +96,8 @@ proc observe(point: string) =
   of 0: discard
   of 1: inc rxVifEpochs[1]
   of 2: replaceCurrent()
-  of 3: cacheScanStartContext(addr request, 7) # Same address, new request.
-  of 4: cacheScanStartContext(addr otherRequest, 7)
+  of 3: newDwell(addr request, 7) # Same address, new request.
+  of 4: newDwell(addr otherRequest, 7)
   of 5: scan_env.abortFlag = 1
   of 6:
     for byte in scan_probe_req_ie.ieData.mitems: byte = 0xCE
@@ -134,15 +112,10 @@ proc setup(irq: bool; count: int = 3) =
   rejectPush = false
   pushResultOverride = 0
   onRecovery = nil
-  freeHook = nil
-  sendHook = nil
   interruptsEnabled = true
   initPool()
   replacement = nil
   pushes = 0
-  freeCalls = 0
-  doneSends = 0
-  doneDest = 0
   scanTaskState = ScanChannelRunningState
   pushed.setLen(0)
   sequence = 0x120
@@ -156,8 +129,7 @@ proc setup(irq: bool; count: int = 3) =
   ssid.length = 5
   for i in 0 ..< ssid.ssidBytes.len: ssid.ssidBytes[i] = (i + 0x41).uint8
   scan_env = default(ScanEnv)
-  scanRequestEpoch = 0
-  cacheScanStartContext(addr request, 2)
+  newDwell(addr request, 2)
   for i in 0 ..< scan_probe_req_ie.ieData.len:
     scan_probe_req_ie.ieData[i] = (i xor 0xA5).uint8
   for i in 0 .. 1: vifs[i] = Vif(vifIdx: i.uint8, state: 1)
@@ -187,27 +159,24 @@ proc checkFrame(desc: ptr HostTxDescView; ssidLen, ieLen: int) =
   for i in 0 ..< ssidLen: doAssert probe.ssidData[i] == (i + 0x41).uint8
   for i in 0 ..< ieLen: doAssert probe.ssidData[ssidLen + i] == (i xor 0xA5).uint8
 
-# Both trace calls can retire the session, replace the same request allocation,
-# or recycle the frame. The handoff itself may complete synchronously.
+# The traces run no firmware code: nothing is re-checked after them (they
+# still run with interrupts masked). The handoff may complete synchronously.
 for irq in [false, true]:
   for trigger in ["trace1", "trace2", "handoff"]:
-    for change in 0 .. 9:
+    for change in 0 .. (if trigger == "handoff": 9 else: 0):
       setup(irq)
       stage = trigger
       action = change
       let rc = scan_probe_req_tx()
       doAssert fired and interruptsEnabled == irq
-      let submitted = trigger == "handoff" or change in [0, 6, 7]
-      doAssert pushes == submitted.int
+      doAssert pushes == 1
       doAssert rc == 0 # Vendor clears its initial 1 for an accepted push.
       if replacement != nil:
         doAssert replacement[] == replacementDesc
         doAssert hostTxHwDescAt(replacement.hwDesc)[] == replacementHw
         doAssert hostTxLinkDescAt(replacement.bufDesc)[] == replacementLink
-      elif submitted:
-        checkFrame(currentFrame, 5, 31)
       else:
-        doAssert co_list_cnt(addr frameEnv.freeList) == 1
+        checkFrame(currentFrame, 5, 31)
 
 # The pool's recovery callback can publish a new request at the same address,
 # or change shared IEs without replacing this request. Only the latter is valid.
@@ -217,8 +186,8 @@ for irq in [false, true]:
     onRecovery = proc() =
       onRecovery = nil
       case change
-      of 0: cacheScanStartContext(addr request, 9)
-      of 1: cacheScanStartContext(addr otherRequest, 9)
+      of 0: newDwell(addr request, 9)
+      of 1: newDwell(addr otherRequest, 9)
       of 2: inc rxVifEpochs[1]
       else:
         for byte in scan_probe_req_ie.ieData.mitems: byte = 0xDD
@@ -244,7 +213,7 @@ for irq in [false, true]:
       checkFrame(currentFrame, ssidLen, ieLen)
       let original = hostTxLinkDescAt(currentFrame.bufDesc)[]
       for byte in scan_probe_req_ie.ieData.mitems: byte = 0
-      cacheScanStartContext(addr otherRequest, 5)
+      newDwell(addr otherRequest, 5)
       doAssert hostTxLinkDescAt(currentFrame.bufDesc)[] == original
 
 for irq in [false, true]:
@@ -277,47 +246,12 @@ for irq in [false, true]:
   pushResultOverride = 2
   doAssert scan_probe_req_tx() == 0 and pushes == 1
 
-# Detach before free; a free hook can install the next request without being
-# overwritten by the old completion. Releasing an unrelated request is inert.
-for irq in [false, true]:
-  setup(irq)
-  let epoch = scanRequestEpoch
-  freeHook = proc() = cacheScanStartContext(addr otherRequest, 8)
-  releaseCompletedScanRequest(addr request, endInd = addr endEnvelope)
-  doAssert freeCalls == 1 and scan_env.paramPtr == addr otherRequest
-  doAssert doneSends == 1 and doneDest == 2 and scanTaskState == ScanIdleState
-  doAssert scanRequestEpoch == epoch + 2 and interruptsEnabled == irq
-  releaseCompletedScanRequest(addr request, endInd = addr endEnvelope)
-  doAssert freeCalls == 1 and doneSends == 1 and scan_env.paramPtr == addr otherRequest
-  setup(irq)
-  sendHook = proc() =
-    cacheScanStartContext(addr otherRequest, 8)
-    scanTaskState = 2
-  releaseCompletedScanRequest(addr request, endInd = addr endEnvelope)
-  doAssert freeCalls == 1 and doneSends == 1 and doneDest == 2
-  doAssert scan_env.paramPtr == (addr otherRequest) and scanTaskState == 2
-  doAssert interruptsEnabled == irq
-  setup(irq)
-  scan_env.abortFlag = 1
-  doAssert releaseCompletedScanRequest(addr request, endInd = addr endEnvelope)
-  doAssert scan_env.abortFlag == 0 and scanTaskState == ScanIdleState
-  doAssert doneSends == 1 and freeCalls == 1 and interruptsEnabled == irq
-  setup(irq)
-  let staleEpoch = scanRequestEpoch
-  inc scanRequestEpoch
-  doAssert not releaseCompletedScanRequest(addr request, staleEpoch)
-  doAssert scan_env.paramPtr == addr request
-  doAssert doneSends == 0 and freeCalls == 0 and scanTaskState == ScanChannelRunningState
-  doAssert interruptsEnabled == irq
-  scan_env.abortFlag = 1
-  cacheScanStartContext(addr otherRequest, 8)
-  doAssert scan_env.abortFlag == 0 and scan_env.paramPtr == (addr otherRequest)
 """
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 @pytest.mark.parametrize("mutation", [None, "count", "ssid", "ies", "binding", "request",
-                                      "trace2", "snapshot", "handoff", "release", "epoch", "unlocked"])
+                                      "snapshot", "handoff", "unlocked"])
 def test_probe_lifetime(tmp_path: Path, mode: str, mutation: str | None) -> None:
     nim = shutil.which("nim")
     if nim is None:
@@ -335,7 +269,6 @@ def test_probe_lifetime(tmp_path: Path, mode: str, mutation: str | None) -> None
     handlers = (FW / "task_handlers.nim").read_text()
     probe = procedure(management, "scan_probe_req_tx")
     cache = procedure(handlers, "cacheScanStartContext")
-    release = procedure(handlers, "releaseCompletedScanRequest")
     if mutation == "count":
         probe = probe.replace("numSsids != 1 or ", "")
     elif mutation == "ssid":
@@ -345,24 +278,17 @@ def test_probe_lifetime(tmp_path: Path, mode: str, mutation: str | None) -> None
     elif mutation == "binding":
         probe = probe.replace("  frameDesc.vifIdx = vifIdx\n  frameDesc.staInfoIdx = 0xFF\n", "")
     elif mutation == "request":
-        probe = probe.replace("scanRequestEpoch != requestEpoch", "false")
-    elif mutation == "trace2":
-        marker = '    nimFwTrace2U32("[WIFI-SCAN] probe_fc ", 0x40, addressWord)\n'
-        assert marker + "    ensureProbeCurrent()\n" in probe
-        probe = probe.replace(marker + "    ensureProbeCurrent()\n", marker)
+        assert "not opCurrent(scanOwn.op, stamp)" in probe
+        probe = probe.replace("not opCurrent(scanOwn.op, stamp)", "false")
     elif mutation == "snapshot":
         probe = probe.replace("unsafeAddr ieBytes[0]", "addr scan_probe_req_ie.ieData[0]")
     elif mutation == "handoff":
         probe = probe.replace("  if txl_frame_push(frame, 3) != 0: 0'u8 else: 1'u8",
                               "  result = (if txl_frame_push(frame, 3) != 0: 0'u8 else: 1'u8)\n"
                               "  frameDesc.pendingMacTime = 0")
-    elif mutation == "release":
-        release = release.replace("  scan_env.paramPtr = nil\n", "")
-    elif mutation == "epoch":
-        cache = cache.replace("  inc scanRequestEpoch\n", "")
     elif mutation == "unlocked":
         probe = probe.replace("  let saved = irqSave()\n  defer: irqRestore(saved)\n", "")
-    functions += cache + release + probe
+    functions += cache + probe
     layout = (FW / "layout_types.nim").read_text()
     types = "type\n"
     for name in ["TxSessionIdentity", "MacDataFrameHeaderView", "MacQosDataFrameHeaderView",
@@ -375,7 +301,8 @@ def test_probe_lifetime(tmp_path: Path, mode: str, mutation: str | None) -> None
     platform = platform_source()
     split = platform.index("const NUM_TX_QUEUES")
     source = tmp_path / "probe.nim"
-    source.write_text(platform[:split] + types + platform[split:] + debug + functions + CHECKS)
+    op = (FW / "op.nim").read_text() + "\nvar scanOwn: tuple[op: Op]\n"
+    source.write_text(platform[:split] + types + platform[split:] + debug + op + functions + CHECKS)
     flags = {"checked": [], "release": ["-d:release", "--assertions:on"],
              "asan": ["--cc:clang", "--passC:-fsanitize=address", "--passL:-fsanitize=address"]}
     result = subprocess.run([nim, "c", "-r", "--skipParentCfg:on", "--skipProjCfg:on", "--skipUserCfg:on",

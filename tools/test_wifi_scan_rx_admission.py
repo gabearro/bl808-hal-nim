@@ -7,7 +7,7 @@ import subprocess
 
 import pytest
 
-from test_wifi_disconnect_tx import procedure
+from test_wifi_disconnect_tx import procedure, scanu_request_current
 
 ROOT = Path(__file__).resolve().parents[1]
 FW = ROOT / "src/bl808/wifi/fw"
@@ -63,7 +63,7 @@ var
   lastLogLine, lastLogValue: uint32
   allocation: pointer
   allocated: uint32
-  scanuRequestEpoch: uint32
+  scanuOwn: tuple[op: tuple[serial: uint32]]
   cachedSsid: tuple[generation: uint32]
   exposeSecurityIe: bool
   callbackCalls: int
@@ -356,7 +356,7 @@ def test_scan_rx_admission(tmp_path: Path, mode: str, mutation: str | None) -> N
     program = tmp_path / "admission.nim"
     program.write_text("type\n" + types + PLATFORM + procedure(mac, "mac_ie_find") + vsie
                        + procedure(scan, "readLegacyRateIe") + "\n".join(parts.values())
-                       + procedure(scan, "scanuRequestCurrent")
+                       + scanu_request_current()
                        + "\nproc scanEarlyEndRequest() = ke_msg_send_basic(0x4C, 1, 2)\n"
                        + entry + dispatch + CHECKS)
     flags = {"checked": [], "release": ["-d:release", "--assertions:on"],

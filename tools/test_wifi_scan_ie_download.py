@@ -30,9 +30,8 @@ type
 var
   scan_env: ScanEnvObj
   scan_probe_req_ie: ScanProbeReqIeObj
-  scanRequestEpoch: uint32
   findCalls, channelCalls: int
-  replaceRequest, mutateArgument: bool
+  mutateArgument: bool
   argumentToMutate: ptr ScanStartReqPayload
 proc scanStartReqView(p: pointer): ptr ScanStartReqPayload =
   cast[ptr ScanStartReqPayload](p)
@@ -52,8 +51,6 @@ proc scan_set_channel_request() =
   inc channelCalls
   if scan_env.chanInfoPtr != nil:
     cast[ptr UncheckedArray[uint8]](scan_env.chanInfoPtr)[2] = 1
-  if replaceRequest:
-    inc scanRequestEpoch
   if mutateArgument:
     argumentToMutate.ieBodyLen = 199
 ''' + procedure(scan, "scan_ie_download")
@@ -77,21 +74,18 @@ type
 var
   scan_env: ScanEnvObj
   scan_probe_req_ie: ScanProbeReqIeObj
-  scanRequestEpoch: uint32
-  stateCalls: int
-const TASK_SCAN = 1'u8
-const ScanIdleState = 0'u8
-proc irqSave(): uint32 = 8
-proc irqRestore(saved: uint32) = discard
-proc scanDwellBeginReset(): bool = true
-proc scanDwellFinishReset(retired: var bool) = doAssert retired
+  stateCalls, releases: int
+const ScanIdleState = 0'u16
+proc scanRelease(failed = false) =
+  doAssert not failed and stateCalls == 0
+  inc releases
+proc scanGo(state: uint16) =
+  doAssert state == ScanIdleState and releases == 1
+  inc stateCalls
 proc c_memset(dst: pointer; value: cint; length: csize_t): pointer =
   zeroMem(dst, length.int)
   dst
 proc nimFwTrace(message: cstring) = discard
-proc ke_state_set(task, state: uint8) =
-  doAssert task == TASK_SCAN and state == ScanIdleState
-  inc stateCalls
 '''
     code += procedure(scan, "scan_init") + r'''
 scan_env.paramPtr = cast[pointer](0x1234)
@@ -99,7 +93,7 @@ scan_env.chanInfoPtr = cast[pointer](0x5678)
 scan_probe_req_ie.probeIeStateWord = 99
 scan_probe_req_ie.writeOffset = 99
 scan_init()
-doAssert scanRequestEpoch == 1 and stateCalls == 1
+doAssert releases == 1 and stateCalls == 1
 doAssert scan_env.paramPtr == nil and scan_env.chanInfoPtr == nil
 doAssert scan_env.passiveDuration == 0x35B60'u32
 doAssert scan_env.activeDuration == 0x35B60'u32
@@ -120,7 +114,6 @@ scan_probe_req_ie.ieData[1] = 1
 scan_probe_req_ie.ieData[2] = 11
 scan_env.paramPtr = addr active
 scan_env.channelIndex = 2
-scanRequestEpoch = 9
 scan_probe_req_ie.ieDataPtr = 0x1234_5000'u32
 scan_probe_req_ie.writeOffset = 77
 scan_ie_download(addr argument)
@@ -129,33 +122,29 @@ doAssert scan_env.chanInfoPtr == addr scan_probe_req_ie.ieData[0]
 doAssert scan_probe_req_ie.writeOffset == 0
 doAssert scan_probe_req_ie.endOffset == 0x1234_5004'u32
 
-replaceRequest = true
+# IE lengths beyond the buffer (refused at admission) skip the DS lookup and
+# the end marker; the dwell is still submitted, as the blob always does.
 scan_probe_req_ie.writeOffset = 88
 scan_probe_req_ie.endOffset = 99
-scan_ie_download(addr argument)
-doAssert findCalls == 2 and channelCalls == 2
-doAssert scan_probe_req_ie.writeOffset == 88 and scan_probe_req_ie.endOffset == 99
-
 active.ieBodyLen = 201
 scan_env.chanInfoPtr = addr scan_probe_req_ie.ieData[0]
 scan_ie_download(addr argument)
-doAssert findCalls == 2 and channelCalls == 2
+doAssert findCalls == 1 and channelCalls == 2
 doAssert scan_env.chanInfoPtr == nil
 doAssert scan_probe_req_ie.writeOffset == 88 and scan_probe_req_ie.endOffset == 99
 
 active.ieBodyLen = 3
 argument.ieBodyLen = 201
 scan_ie_download(addr argument)
-doAssert findCalls == 2 and channelCalls == 2
+doAssert findCalls == 1 and channelCalls == 3
 doAssert scan_env.chanInfoPtr == nil
 doAssert scan_probe_req_ie.writeOffset == 88 and scan_probe_req_ie.endOffset == 99
 
-replaceRequest = false
 mutateArgument = true
 argumentToMutate = addr argument
 argument.ieBodyLen = 5
 scan_ie_download(addr argument)
-doAssert findCalls == 3 and channelCalls == 3
+doAssert findCalls == 2 and channelCalls == 4
 doAssert argument.ieBodyLen == 199
 doAssert scan_probe_req_ie.endOffset == 0x1234_5004'u32
 
@@ -167,6 +156,6 @@ scan_probe_req_ie.ieData[199] = 0
 scan_probe_req_ie.after = 0xA5
 scan_ie_download(addr argument)
 doAssert scan_env.chanInfoPtr == nil
-doAssert findCalls == 4 and channelCalls == 4
+doAssert findCalls == 3 and channelCalls == 5
 doAssert scan_probe_req_ie.after == 0xA5
 ''')

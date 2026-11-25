@@ -291,6 +291,34 @@ def procedure(source: str, name: str) -> str:
     return source[start.start():start.end() + end.start() if end else len(source)]
 
 
+def scan_machine_source(*names: str, record: bool = True) -> str:
+    """scan_machine.nim's owner records (scanOwn, scanuOwn; `record`) and its
+    named procs, in file order. op.nim must already be in the program; the
+    fixture supplies the kernel calls the procs make."""
+    machine = (FW / "scan_machine.nim").read_text().replace(" {.wifiCtrl.}", "")
+    code = ""
+    if record:
+        code += machine[machine.index("type\n  ScanOwner"):machine.index("template stampOf")]
+        code += machine[machine.index("template stampOf"):machine.index("\n", machine.index("template stampOf")) + 1]
+    order = re.findall(r"^proc (\w+)", machine, re.M)
+    for name in order:
+        if name in names:
+            code += procedure(machine, name)
+    missing = set(names) - set(order)
+    assert not missing, missing
+    return code
+
+
+def scanu_request_current() -> str:
+    """scan_machine.nim's scanuRequestCurrent, for fixtures that model SCANU's
+    operation as `scanuOwn: tuple[op: tuple[serial: uint32]]`: a new SCANU
+    request is `inc scanuOwn.op.serial`."""
+    machine = (FW / "scan_machine.nim").read_text()
+    return ("\nwhen not compiles(opCurrent((serial: 0'u32), 0'u32)):\n"
+            "  proc opCurrent(op: tuple[serial: uint32]; stamp: uint32): bool = stamp == op.serial\n"
+            + procedure(machine, "scanuRequestCurrent"))
+
+
 # The platform station_sm.nim needs, for fixtures that do not model it.
 SM_TIMER = r'''
 when not declared(MmTimerView):

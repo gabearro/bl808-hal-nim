@@ -135,7 +135,7 @@ var
   keSavedReschedRemaining: array[10, uint32]
 template smSaQueryResetScope() = discard
 proc mmConfigCancelIdle() = discard
-proc scanDwellReset() = discard
+proc scanRelease(failed = false) = discard
 proc chanSwitchReset() = discard
 proc smActivationCancel() = discard
 proc smBssCancel() = discard

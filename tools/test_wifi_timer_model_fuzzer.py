@@ -82,8 +82,8 @@ proc mm_back_to_host_idle() = discard
 proc chan_cde_evt(p: pointer) = doAssert false, "CDE is outside this fixture"
 proc chan_get_dominant_chan(): pointer = doAssert false, "home dwell is outside this fixture"
 proc chan_get_next_chan(): pointer = doAssert false, "home dwell is outside this fixture"
-proc scanDwellPublish(id: uint16; allocation: uint32) =
-  doAssert id == MM_SCAN_CHANNEL_END_IND and allocation == chanCtxtEpochs[3]
+proc scanDwellPost(id: uint16) =
+  doAssert id == MM_SCAN_CHANNEL_END_IND
   doAssert contexts[3].contextIndexOrMarker == 3 and owners[3] != 0
   observed.add("end:" & $owners[3])
 proc chanSwitchRetire(p: pointer) =

@@ -1,4 +1,14 @@
-"""Check directed scan security updates across connection and cache retirement."""
+"""Check directed scan security updates across SM, SCANU and cache retirement.
+
+scanu_frame_handler's directed-scan block calls the supplicant's parse and
+notify callbacks, the trace, the BSS helpers and the WPS callback; any of
+them may run SM code that ends the attempt (smGo: a new SM operation), and a
+host prune may replace the cached result. After each such call the block
+re-checks frameOwnerCurrent: the result slot's generation, SCANU's request
+(scanuRequestCurrent) and, for a directed scan, SM's operation stamp taken
+before the block (opCurrent(smOwn.op, directedStamp)). These programs extract
+the real templates and the real security section and WPS tail.
+"""
 
 from pathlib import Path
 import re
@@ -12,21 +22,13 @@ from test_wifi_scan_credentials import PLATFORM, WRAPPER
 
 
 def owner_templates(scan: str) -> str:
+    """The real ownsResult, frameOwnerCurrent and requireFrameOwner."""
     body = procedure(scan, "scanu_frame_handler")
     owns = "  template ownsResult(): bool =" + body.split(
-        "  template ownsResult(): bool =", 1)[1].split("\n  # Send result IND", 1)[0]
-    if "  template frameOwnerCurrent(): bool =" in body:
-        checks = "  template frameOwnerCurrent(): bool =" + body.split(
-            "  template frameOwnerCurrent(): bool =", 1)[1].split("\n  # Directed scan", 1)[0]
-    else:
-        checks = r'''
-  template frameOwnerCurrent(): bool =
-    ownsResult() and (bfOn == 0 or smTxOwnerCurrent(directedOwner))
-  template requireFrameOwner() =
-    if not frameOwnerCurrent():
-      ke_msg_forward_and_change_id(frame, 0x804'u16, 9, 2)
-      return
-'''
+        "  template ownsResult(): bool =", 1)[1].split("\n\n", 1)[0]
+    checks = "  template frameOwnerCurrent(): bool =" + body.split(
+        "  template frameOwnerCurrent(): bool =", 1)[1].split("\n\n", 1)[0]
+    assert "requireFrameOwner" in checks and "opCurrent(smOwn.op, directedStamp)" in checks
     return owns + "\n" + checks + "\n"
 
 
@@ -35,7 +37,7 @@ def base() -> str:
     scan = (FW / "scan_station_ap_me.nim").read_text()
     types = "type\n"
     for name in ["ConnectInfoView", "ConnectInfoCredentialOverlay", "VifSecurityOverlay",
-                 "TxSessionIdentity", "SmTxBuildContext", "ScanuCachedSsid",
+                 "ScanuCachedSsid",
                  "ScanuResultEntry", "ScanSsidSlotView", "WpsScanCallbackView",
                  "WpsScanCallbackBuffer"]:
         types += re.search(rf"(?ms)^  {name}[^\n]*\n.*?(?=\n\n)", layout).group(0) + "\n"
@@ -52,14 +54,13 @@ def base() -> str:
         "me_extract_country_reg": 'proc me_extract_country_reg(data: pointer; length: uint32; output: pointer) = fire("country")\n',
     }.items():
         code = code.replace(procedure(code, name), replacement, 1)
-    code += r'''
+    code += (FW / "op.nim").read_text() + r'''
 const TASK_SM = 4'u8
 const WifiKeyMgmtSae = 1024'u32
 const WifiAuthMaskSae = 1024'u32
 var
-  smTxSerials, rxVifEpochs: array[MAX_VIFS, uint32]
-  txResetEpoch: uint32
-  scanuRequestEpoch: uint32
+  smOwn: tuple[op: Op]        # SM's operation (station_sm.nim)
+  scanuOwn: tuple[op: Op]     # SCANU's operation (scan_machine.nim)
   cached: ScanuCachedSsid
   request: uint32
   replacementConnection: ConnectInfoCredentialOverlay
@@ -68,7 +69,6 @@ var
   entry: ScanuResultEntry
 proc smEnvView(): ptr SmEnvView = addr station
 proc vifChannelForIdx(index: uint8): ptr Vif = addr vif
-proc staDeleteEpoch(index: uint8): uint32 = 0
 proc ke_state_get(task: uint8): uint16 = station.state.uint16
 proc ke_msg_forward_and_change_id(p: pointer; id: uint16; dst, src: uint8) = inc forwards
 proc wpsNotify(p: pointer) {.cdecl.} = fire("wps")
@@ -80,22 +80,29 @@ proc prepare() =
   vif.vifType = VIF_TYPE_STA
   vif.staIdx = 0xFF
   scanu_env.paramPtr = addr request
-  scanuRequestEpoch = 7
+  discard opGo(scanuOwn.op)
+  discard opGo(smOwn.op)
   cached = ScanuCachedSsid(generation: 9)
-  smTxSerials = default(typeof(smTxSerials))
-  rxVifEpochs = default(typeof(rxVifEpochs))
   replacementConnection = connection
   forwards = 0
   published = 0
   wpsFunction = cast[pointer](wpsNotify)
   wps_cbs = addr wpsFunction
 proc replaceOwner(action: int) =
+  ## What a callback can do: SM ends the attempt and a new one starts on a
+  ## new connection (0), SM moves on (1), the STA VIF is removed (2: SM
+  ## abandons the attempt), SM changes state (3) - each an smGo, a new SM
+  ## operation; SCANU's request ends (4); a host prune replaces the result
+  ## slot (5).
   case action
-  of 0: station.connectInfo = addr replacementConnection.base
-  of 1: inc smTxSerials[0]
-  of 2: inc rxVifEpochs[0]
-  of 3: station.state = 2
-  of 4: inc scanuRequestEpoch
+  of 0:
+    discard opGo(smOwn.op)
+    station.connectInfo = addr replacementConnection.base
+  of 1, 2: discard opGo(smOwn.op)
+  of 3:
+    discard opGo(smOwn.op)
+    station.state = 2
+  of 4: discard opGo(scanuOwn.op)
   else: inc cached.generation
   security.cipher = 0x55
   security.keyMgmt = 0x11223344
@@ -109,9 +116,7 @@ proc snapshot(): auto =
   (connection, replacementConnection, security, station, vif, ap, assoc,
    assocSecIeStore, scanu_env, notifications, finalized)
 '''
-    owner = (FW / "station_tx_build.nim").read_text()
-    code += procedure(owner, "smTxCapture") + procedure(owner, "smTxSessionCurrent") + procedure(owner, "smTxOwnerCurrent")
-    code += procedure(scan, "scanuRequestCurrent")
+    code += procedure((FW / "scan_machine.nim").read_text(), "scanuRequestCurrent")
     code += procedure(scan, "scanuConnectionKeyLength") + procedure(scan, "scanuApplyLegacyCredentialPolicy")
     return code
 
@@ -119,13 +124,12 @@ proc snapshot(): auto =
 def context(scan: str, directed: str = "1'u8") -> str:
     return f'''
   let scanParam = scanu_env.paramPtr
-  let scanEpoch = scanuRequestEpoch
+  let scanEpoch = scanuOwn.op.serial
   let cachedSsid = addr cached
   let resultGeneration = cached.generation
   let frame = cast[pointer](addr request)
   let bfOn = {directed}
-  var directedOwner: SmTxBuildContext
-  if bfOn != 0: directedOwner = smTxCapture(station.connectInfo)
+  let directedStamp = smOwn.op.serial
 ''' + owner_templates(scan)
 
 
@@ -134,8 +138,7 @@ def security_source() -> str:
     body = procedure(scan, "scanu_frame_handler")
     section = "      securityState.connected = connectInfo.authRetryGate\n" + body.split(
         "      securityState.connected = connectInfo.authRetryGate\n", 1)[1].split("\n  # WPS callback", 1)[0]
-    wrapper = WRAPPER.replace("  let directedOwner = (connection: connectInfoPtr)\n", "")
-    wrapper = wrapper.replace("  template requireFrameOwner() = discard\n", "")
+    wrapper = WRAPPER.replace("  template requireFrameOwner() = discard\n", "")
     wrapper = wrapper.replace("proc exercise() =\n", "proc exercise() =\n" + context(scan), 1)
     return base() + wrapper + textwrap.indent(textwrap.dedent(section), "  ") + "\n"
 
@@ -249,8 +252,9 @@ proc mac_vsie_find(p: pointer; n: uint32; oui: pointer; size: uint32): pointer =
 proc scanuPublishFrameResult(frame: pointer; frameLen: uint16; payloadLen: uint32;
     item: ptr ScanuResultEntry;
     request: pointer; epoch, generation: uint32; count, bfOn: uint8;
-    connection: ptr SmTxBuildContext = nil) =
-  if connection != nil: doAssert smTxOwnerCurrent(connection[])
+    smStamp = 0'u32) =
+  if bfOn != 0: doAssert smStamp != 0 and opCurrent(smOwn.op, smStamp)
+  else: doAssert smStamp == 0
   inc published
 proc exerciseWps(directed: bool) =
 '''
@@ -283,3 +287,48 @@ for directed in [false, true]:
     doAssert fired
     doAssert published == (not retired).int and forwards == retired.int
 ''')
+
+
+SM_CHECK = "(bfOn == 0 or opCurrent(smOwn.op, directedStamp))"
+MUTANTS = {
+    # The directed scan no longer checks SM's operation after the callbacks.
+    "sm_stamp": (SM_CHECK, "true"),
+    # Nor SCANU's request or the result slot.
+    "owns_result": ("  template frameOwnerCurrent(): bool =\n    ownsResult() and",
+                    "  template frameOwnerCurrent(): bool =\n    true and"),
+}
+
+
+@pytest.mark.parametrize("mutant", MUTANTS)
+@pytest.mark.parametrize("program", ["security", "wps"])
+def test_owner_rechecks_are_load_bearing(tmp_path: Path, mutant: str, program: str) -> None:
+    """Each part of frameOwnerCurrent is what stops a retired update: drop it
+    and the callback tests fail."""
+    old, new = MUTANTS[mutant]
+    if program == "security":
+        code = security_source() + r'''
+for point in ["parse", "notify"]:
+  for action in 0 .. 5:
+    prepare()
+    var fired = false
+    var expected: typeof(snapshot())
+    hook = proc(at: string) =
+      if at != point or fired: return
+      fired = true
+      replaceOwner(action)
+      expected = snapshot()
+    exercise()
+    doAssert fired and snapshot() == expected, "retired update after " & point
+'''
+    else:
+        code = wps_source() + r'''
+for action in 0 .. 5:
+  prepare()
+  hook = proc(point: string) =
+    if point == "wps": replaceOwner(action)
+  exerciseWps(true)
+  doAssert published == 0 and forwards == 1, "retired directed result published"
+'''
+    assert code.count(old) == 1, mutant
+    with pytest.raises(AssertionError, match="AssertionDefect"):
+        run_program(tmp_path, "checked", code.replace(old, new, 1))

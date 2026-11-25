@@ -7,7 +7,7 @@ import random
 
 import pytest
 
-from test_wifi_disconnect_tx import FW, procedure
+from test_wifi_disconnect_tx import FW, procedure, scan_machine_source
 from test_wifi_message_allocation import run_program
 from test_wifi_saved_reschedule import source as saved_queue_source
 
@@ -42,7 +42,6 @@ type
 var
   scanu_env: tuple[paramPtr, pendingJoinRxuMgtInd: pointer,
                    requester, bssidFilterEnabled: uint8]
-  scanuRequestEpoch: uint32
   request, reply, notice: Envelope
   scheduleMode: int
   actualStatuses: seq[uint8]
@@ -126,7 +125,7 @@ proc exercise(trace: string; mode: int): string =
       # Reset discards earlier saved/sent envelopes; SCANU's new generation
       # and request are installed before another completion is admissible.
       ke_flush()
-      inc scanuRequestEpoch
+      inc scanuOwn.op.serial
       scanIds.setLen(0)
       delivered.setLen(0)
     of 'C':
@@ -167,19 +166,20 @@ def test_scanu_saved_queue_model(tmp_path: Path, mutation: bool) -> None:
     seed = int(os.environ.get("BL808_WIFI_MODEL_SEED", "808"))
     steps = int(os.environ.get("BL808_WIFI_MODEL_STEPS", "256"))
     kernel = (FW / "kernel_mac_channel.nim").read_text()
-    scan = (FW / "scan_station_ap_me.nim").read_text()
-    completion = procedure(scan, "scanu_confirm").split("\ntype ProbeIeWriter", 1)[0]
+    completion = (FW / "op.nim").read_text() + scan_machine_source(
+        "scanuGo", "scanuAnswer", "scanuReply", "scanuPublishCompletion", "scanuComplete",
+        "scanu_confirm")
     if mutation:
-        original = "  defer: scanuReleaseCompletedOwner(completion.epoch)"
-        assert original in completion
-        completion = completion.replace(original, original.replace("defer: ", ""))
+        # SCANU goes idle before its answer is queued.
+        idle = "  # Idle after the answer is queued, ahead of any saved request it releases.\n  scanuGo(ScanuIdleState)\n"
+        assert idle in completion
+        completion = completion.replace(idle, "").replace(
+            "  let primaryId = ", "  scanuGo(ScanuIdleState)\n  let primaryId = ", 1)
     fixture = saved_queue_source().replace("    destId, srcId: uint8\n",
                                          "    destId, srcId: uint8\n    paramLen: uint32\n", 1)
     fixture = fixture.replace("array[80, KeMsgHdr]", "array[512, KeMsgHdr]")
-    source = (fixture + PLATFORM + procedure(kernel, "ke_msg_forward_and_change_id")
-              + procedure(scan, "scanuReleaseCompletedOwner") + procedure(scan, "scanuAnswer")
-              + procedure(scan, "scanuReply")
-              + procedure(scan, "scanuPublishCompletion") + completion + DRIVER)
+    source = (fixture + PLATFORM + "proc scanu_cached_scanresult_clear() = discard\n"
+              + procedure(kernel, "ke_msg_forward_and_change_id") + completion + DRIVER)
     cases = schedules(seed, steps)
     source += f'echo "queue seed={seed} cases={len(cases)}"\n'
     source += "\n".join(f'check("{trace}", {mode})' for trace, mode in cases)

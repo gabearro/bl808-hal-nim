@@ -6,7 +6,7 @@ import textwrap
 import pytest
 
 from test_wifi_auth_frames import layouts
-from test_wifi_disconnect_tx import FW, procedure
+from test_wifi_disconnect_tx import FW, procedure, scanu_request_current
 from test_wifi_message_allocation import run_program
 
 
@@ -19,7 +19,7 @@ type Env = object
 var
   scanu_env: Env
   scanuCachedSsids: array[SCANU_MAX_RESULT_ENTRIES, ScanuCachedSsid]
-  scanuRequestEpoch: uint32
+  scanuOwn: tuple[op: tuple[serial: uint32]]
   scan_env: tuple[abortFlag: uint8]
   nimFwDbgScanFrameAccepted, nimFwDbgScanFrameLast: uint32
   incoming, oldFrame, copyFrame, replacementFrame: array[192, uint8]
@@ -77,7 +77,7 @@ proc setup(hasOld = true) =
   enabled = true
   scanu_env = default(Env)
   scanuCachedSsids = default(typeof(scanuCachedSsids))
-  scanuRequestEpoch = 7
+  scanuOwn.op.serial = 7
   scanu_env.paramPtr = addr request
   scanu_env.entries[0] = ScanuResultEntry(valid: 1, rssi: -30)
   scanuCachedSsids[0].generation = 9
@@ -98,7 +98,7 @@ proc setup(hasOld = true) =
     scanu_env.entries[0].cachedRxuMgtInd = addr oldFrame[0]
 proc replacePublication(action: int) =
   if action == 0: scanu_env.paramPtr = addr replacementRequest
-  elif action == 1: inc scanuRequestEpoch
+  elif action == 1: inc scanuOwn.op.serial
   elif action == 2: inc scanuCachedSsids[0].generation
   scanu_env.entries[0] = ScanuResultEntry(valid: 1, rssi: -11,
     cachedRxuMgtInd: addr replacementFrame[0])
@@ -113,7 +113,7 @@ def source() -> str:
     scan = (FW / "scan_station_ap_me.nim").read_text()
     code = layouts("ScanuResultEntry", "ScanuCachedSsid", "RxuMgtIndView")
     code += (FW / "op.nim").read_text() + PLATFORM
-    code += procedure(scan, "scanuRequestCurrent")
+    code += scanu_request_current()
     if "proc scanuPublishFrameResult(" in scan:
         code += procedure(scan, "scanuPublishFrameResult").split("\n{.emit:", 1)[0]
     else:

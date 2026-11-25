@@ -27,7 +27,6 @@ const
   SM_CONNECT_ABORT_CFM = 0x1008'u16
   SCAN_ABORT_REQ = 0x405'u16
   ScanChannelRunningState = 3'u16
-  SmScanAbortPayloadSize = sizeof(uint32).uint32
   StatusCfmPayloadSize = 1'u32
   WLAN_FW_CONNECT_ABORT_BY_USER_NO_DEAUTH = 24'u16
 type StatusCfmPayload = object
@@ -38,7 +37,6 @@ var
   deauths, scanAborts, cacheClears: int
   scanTerminations: int
   scanState: uint16
-  scanRequestEpoch: uint32
   scan_env: tuple[paramPtr: pointer, abortFlag: uint8]
   scanu_env: tuple[paramPtr: pointer]
   upperScan, lowerScan: uint32
@@ -57,9 +55,10 @@ proc ke_msg_alloc(id: uint16; dst, src: uint8; size: uint32): pointer =
   ke_msg_try_alloc(id, dst, src, size)
 proc smReqVifIdxOrZero(p: pointer): uint8 =
   if p == nil: 0'u8 else: cast[ptr uint8](p)[]
-proc scanuLowerCurrent(request: pointer): bool = request != nil and request == lowerExchange
+proc scanuAwaits(lower: pointer): bool = lower != nil and lower == lowerExchange
 proc smAwaits(request: pointer): bool = smOwnsUpper and request == addr upperScan
 proc scan_terminate_channel_request() = inc scanTerminations
+proc scanOnChannel(): bool = true  # the dwell has not left its channel
 proc scanu_cached_scanresult_clear() = inc cacheClears
 proc sm_connect_abort_deauth_cfm() = discard
 proc sm_connect_abort_process() = discard
@@ -103,7 +102,6 @@ proc c_memset(p: pointer; value: cint; size: csize_t): pointer =
 
 HELPERS = r'''
 proc beginScan(owned: bool) =
-  inc scanRequestEpoch
   scanu_env.paramPtr = addr upperScan
   scan_env = (cast[pointer](addr lowerScan), 0'u8)
   lowerExchange = scan_env.paramPtr
@@ -381,15 +379,25 @@ doAssert env.cancelRequested == 1 and replies == @[1'u8]
 doAssert scanAborts == 0, "station cancellation interrupted the public scan"
 doAssert cacheClears == 0, "station cancellation erased public scan results"
 """,
-    "scan_abort_old_epoch": """
+    # The abort carries no payload: it acts on the lower scan running when it
+    # is dispatched, if that is still the one of SM's live scan request.
+    "scan_abort_at_dispatch": """
 currentState = 1
 beginScan(owned = true)
 doAssert deliverAbort(makeAbort()) == KeMsgNoFree
 doAssert pendingScanAborts.len == 1
-# Reuse the same lower allocation with a new logical scan.
-beginScan(owned = true)
+# SCANU went on to the request's next band: the abort stops that one.
+var nextLower: uint32
+scan_env.paramPtr = addr nextLower
+lowerExchange = addr nextLower
 deliverScanAbort()
-doAssert scan_env.abortFlag == 0 and scanTerminations == 0
+doAssert scan_env.abortFlag == 1 and scanTerminations == 1
+# SM moved on before its abort ran: the scan is left alone.
+scan_env.abortFlag = 0
+doAssert deliverAbort(makeAbort()) == KeMsgNoFree
+smOwnsUpper = false
+deliverScanAbort()
+doAssert scan_env.abortFlag == 0 and scanTerminations == 1
 """,
     # Without memory for SCAN_ABORT_REQ the lower scan runs to its end; the
     # station's scan still completes as cancelled (cancelRequested).
@@ -463,7 +471,8 @@ MUTATIONS = {
     "capture": ("  smDisconnectStamp(keMsgHdrFromPayload(result))\n  disconnectRequest",
                 "  disconnectRequest", "disconnect_lifetime"),
     "release": ("  smDisconnectForget(header)", "  discard", "recycled_request"),
-    "scan_abort_epoch": ("cast[ptr uint32](param)[] != scanRequestEpoch or ", "", "scan_abort_old_epoch"),
+    "scan_abort_owner": ("  if param != nil and keMsgHdrFromPayload(param).srcId == TASK_SM and\n      not smAbortOwnsLowerScan():",
+                         "  if false:", "scan_abort_at_dispatch"),
 }
 
 

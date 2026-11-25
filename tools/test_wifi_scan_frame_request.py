@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from test_wifi_auth_frames import layouts
-from test_wifi_disconnect_tx import FW, procedure
+from test_wifi_disconnect_tx import FW, procedure, scanu_request_current
 from test_wifi_message_allocation import run_program
 
 
@@ -23,7 +23,7 @@ type
     channel: uint8
 var
   scanu_env: tuple[paramPtr: pointer, bssidFilterEnabled: uint8, filterBssid: array[6, uint8]]
-  scanuRequestEpoch: uint32
+  scanuOwn: tuple[op: tuple[serial: uint32]]
   frame: array[96, uint8]
   ie: array[6, uint8]
   entry: ScanuResultEntry
@@ -99,7 +99,7 @@ proc setup(family: int) =
   scanu_env.paramPtr = original
   scanu_env.bssidFilterEnabled = 0
   scanu_env.filterBssid = [2'u8, 0, 0, 0, 0, 0]
-  scanuRequestEpoch = 7
+  scanuOwn.op.serial = 7
   frame = default(typeof(frame))
   rxuMgtIndAt(addr frame[0]).frameLen = 36
   ie[0] = 48
@@ -133,7 +133,7 @@ def source() -> str:
     prefix = procedure(scan, "scanu_frame_handler").split("  # Security info\n", 1)[0]
     return layouts("ScanChannelEntry", "ScanSsidSlotView", "ScanuResultEntry",
                    "ScanuCachedSsid", "RxuMgtIndView", "MacIeView") + request_type + \
-        PLATFORM + procedure(scan, "scanuRequestCurrent") + "\nproc scanEarlyEndRequest() = ke_msg_send_basic(0x4C, 1, 2)\n" + prefix + "  reachedCommit = true\n"
+        PLATFORM + scanu_request_current() + "\nproc scanEarlyEndRequest() = ke_msg_send_basic(0x4C, 1, 2)\n" + "\nwhen not declared(scanStopAfterDwell):\n  proc scanStopAfterDwell() =\n    when declared(scan_env): scan_env.abortFlag = 1\n" + prefix + "  reachedCommit = true\n"
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
@@ -152,7 +152,7 @@ for family in [0, 1]:
           free(original)
           released = true
         else:
-          inc scanuRequestEpoch
+          inc scanuOwn.op.serial
       scanu_frame_handler(addr frame[0], frame.len.uint32)
       doAssert fired and not reachedCommit and forwards == 1
       doAssert finds == (if point == "indication": 1 else: 0)

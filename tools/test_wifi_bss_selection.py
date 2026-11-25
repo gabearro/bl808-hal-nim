@@ -160,7 +160,7 @@ for route in 0 .. 7:
         case action
         of 0: replaceOwner()
         of 1: discard smGo(SmIdleState)
-        of 2: inc scanuRequestEpoch
+        of 2: inc scanuOwn.op.serial
         of 3: sm.connectIndMsg = addr otherIndication
         else: discard smGo(SmWaitingState)
         sm.scanResultIndex = 0xABCDEF01'u32

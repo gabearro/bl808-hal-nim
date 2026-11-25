@@ -34,7 +34,7 @@ var
   smEnv: SmEnv
   connectInfo: ConnectInfo
   scanuCachedSsids: array[SCANU_MAX_RESULT_ENTRIES, ScanuCachedSsid]
-  scanuRequestEpoch: uint32
+  scanuOwn: tuple[op: tuple[serial: uint32]]
   nimFwDbgSsidSearch, nimFwDbgSsidEntries, nimFwDbgSsidHits: uint32
   interruptsEnabled = true
 proc irqSave(): uint32 =

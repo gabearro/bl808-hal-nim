@@ -64,7 +64,7 @@ proc keTimerCancelMutations(all: bool) = discard
 proc smActivationCancel() = discard
 proc mmConfigCancelIdle() = discard
 proc chanSwitchReset() = discard
-proc scanDwellReset() = discard
+proc scanRelease(failed = false) = discard
 proc smRspTimerReset() = discard
 template smSaQueryResetScope() = discard
 proc smBssCancel() = discard

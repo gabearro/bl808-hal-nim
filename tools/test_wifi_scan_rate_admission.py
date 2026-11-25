@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from test_wifi_auth_frames import layouts
-from test_wifi_disconnect_tx import FW, procedure
+from test_wifi_disconnect_tx import FW, procedure, scanu_request_current
 from test_wifi_message_allocation import run_program
 from test_wifi_scan_result_updates import source as result_source
 from test_wifi_scan_rx_admission import PLATFORM
@@ -26,10 +26,12 @@ proc assert_err(a, b: cstring; line: cint) =
   inc errors
 '''
     code += procedure(mac, "mac_ie_find")
-    for name in ["readLegacyRateIe", "scanuRxFrameValid", "scanuFrameMatchesBssid", "scanuRequestCurrent",
+    for name in ["readLegacyRateIe", "scanuRxFrameValid", "scanuFrameMatchesBssid",
                  "me_extract_rate_set"]:
         code += procedure(scan, name)
+    code += scanu_request_current()
     code += "\nwhen not declared(scanEarlyEndRequest):\n  proc scanEarlyEndRequest() = ke_msg_send_basic(0x4C, 1, 2)\n"
+    code += "\nwhen not declared(scanStopAfterDwell):\n  proc scanStopAfterDwell() =\n    when declared(scan_env): scan_env.abortFlag = 1\n"
     code += procedure(scan, "scanu_frame_handler").split("  # Security info\n", 1)[0]
     code += r'''
   if bfOn != 0:

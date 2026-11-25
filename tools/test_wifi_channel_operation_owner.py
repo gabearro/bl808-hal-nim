@@ -38,7 +38,7 @@ var
   interrupts, incomingIrq: bool
   nimFwDbgChanScanChanMeta, nimFwDbgChanScanChanFreq: uint32
   actions: seq[string]
-  onPower, onNotify, onRetire, onClock, onForce: proc()
+  onPower, onRetire, onClock, onForce: proc()
   onTrace: proc()
   traceCalls: int
 proc irqSave(): uint32 =
@@ -70,10 +70,10 @@ proc regRead(address: uint): uint32 =
   invoke(onClock)
   10240
 const MM_SCAN_CHANNEL_END_IND = 77'u16
-proc scanDwellPublish(id: uint16; slot: uint32) =
-  doAssert interrupts == incomingIrq and id == 77 and slot == chanCtxtEpochs[3]
+proc scanDwellPost(id: uint16) =
+  # Posting queues a reserved notice; it runs no code, so no hook here.
+  doAssert id == 77 and contexts[3].contextIndexOrMarker == 3
   actions.add("message")
-  invoke(onNotify)
 proc chanSwitchRetire(p: pointer) =
   doAssert interrupts == incomingIrq
   actions.add("retire")
@@ -128,7 +128,6 @@ proc setup(index = 4; irq = true) =
   incomingIrq = irq
   actions.setLen(0)
   onPower = nil
-  onNotify = nil
   onRetire = nil
   onClock = nil
   onForce = nil
@@ -164,8 +163,9 @@ for index in [3, 4]:
     "completion_replacement": r'''
 for index in [3, 4]:
   for irq in [false, true]:
-    for boundary in 0 .. 2:
-      if index == 4 and boundary == 1: continue
+    # Boundary 1 was the END notice, which now only queues a reserved
+    # message and runs no code (scanDwellPost).
+    for boundary in [0, 2]:
       setup(index, irq)
       var snapshot: tuple[context: Context, environment: Environment]
       var callsAtReplacement: int
@@ -179,7 +179,6 @@ for index in [3, 4]:
         snapshot = (contexts[index], env)
         callsAtReplacement = actions.len
       if boundary == 0: onPower = replace
-      elif boundary == 1: onNotify = replace
       else: onRetire = replace
       chan_ctxt_op_evt(addr contexts[index])
       doAssert (contexts[index], env) == snapshot, "old completion changed its replacement"
@@ -282,22 +281,6 @@ for change in 0 .. 3:
     snapshot = (contexts[4], env)
   chan_ctxt_op_evt(addr contexts[4])
   doAssert (contexts[4], env) == snapshot and actions == @["pm"]
-''',
-    "scan_trace_replacement": r'''
-for irq in [false, true]:
-  for boundary in 1 .. 4:
-    setup(3, irq)
-    var snapshot: tuple[value: ChanScanPoolOverlay, environment: Environment]
-    onTrace = proc() =
-      if traceCalls != boundary: return
-      inc chanCtxtEpochs[3]
-      scan = ChanScanPoolOverlay(slot: 3, durationTicks: 77, requestVifIdx: 1)
-      env.flags = 0x94
-      snapshot = (scan, env)
-    var request = ChanScanReqPayload(duration: 8192, prim20Freq: 2462)
-    chan_scan_req(addr request)
-    doAssert (scan, env) == snapshot and traceCalls == boundary
-    doAssert interrupts == irq and "delay" notin actions
 ''',
     "completion_exceptions": r'''
 for irq in [false, true]:

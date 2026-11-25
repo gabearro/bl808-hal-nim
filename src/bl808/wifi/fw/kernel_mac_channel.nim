@@ -623,110 +623,6 @@ template platformFree(p: pointer) =
     blOpsFunc(0xBC))
   pfFn(p)
 
-type
-  ScanDwellPair = object
-    start, finish: pointer
-  ScanDwellRetired = object
-    pair: ScanDwellPair
-    retained: pointer
-    queued: ptr ScanDwellPosted
-  ScanDwellPosted = object
-    next: ptr ScanDwellPosted
-    payload: pointer
-    serial: uint32
-    cancelled: bool
-
-var
-  scanDwellHeld {.wifiCtrl.}: ScanDwellPair
-  scanDwellRequest {.wifiCtrl.}: pointer
-  scanDwellOwnsLower {.wifiCtrl.}: bool
-  scanDwellEpoch, scanDwellSerial, scanDwellSlot {.wifiCtrl.}: uint32
-  scanDwellResetEpoch {.wifiCtrl.}: uint32
-  scanDwellChannel {.wifiCtrl.}: uint8
-  scanDwellPostedHead {.wifiCtrl.}: ptr ScanDwellPosted
-
-proc scanDwellDispose(pair: var ScanDwellPair) =
-  let old = pair
-  pair = default(ScanDwellPair)
-  for p in [old.start, old.finish]:
-    if p != nil: ke_msg_free(keMsgHdrFromPayload(p))
-
-proc scanDwellReserve(pair: var ScanDwellPair): bool =
-  # The dispatcher sees basic messages. Only our allocator uses the storage
-  # beyond paramLen, as an intrusive tag while a notification is in flight.
-  for id in [MM_SCAN_CHANNEL_START_IND, MM_SCAN_CHANNEL_END_IND]:
-    const storage = KeMsgTailSlack + (alignof(ScanDwellPosted) - 1 + sizeof(ScanDwellPosted)).uint32
-    let p = ke_msg_try_alloc(id, TASK_SCAN, TASK_NONE, storage)
-    if p == nil: return false
-    keMsgHdrFromPayload(p).paramLen = 0
-    if id == MM_SCAN_CHANNEL_START_IND: pair.start = p
-    else: pair.finish = p
-  true
-
-proc scanDwellInstall(pair: var ScanDwellPair; slot: uint32; admitting = false) =
-  # Caller commits the lower request and the two envelopes under one lock.
-  inc scanDwellSerial
-  swap(scanDwellHeld, pair)
-  scanDwellOwnsLower = admitting or (scanDwellOwnsLower and
-    scanDwellRequest == scan_env.paramPtr and scanDwellEpoch == scanRequestEpoch)
-  scanDwellRequest = scan_env.paramPtr
-  scanDwellEpoch = scanRequestEpoch
-  scanDwellChannel = scan_env.channelIndex
-  scanDwellSlot = slot
-
-proc scanDwellCurrent(): bool =
-  scanDwellRequest != nil and scanDwellRequest == scan_env.paramPtr and
-    scanDwellEpoch == scanRequestEpoch and scanDwellChannel == scan_env.channelIndex
-
-proc scanDwellPublish(id: uint16; slot: uint32) =
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  if not scanDwellCurrent() or slot != scanDwellSlot: return
-  if id == MM_SCAN_CHANNEL_END_IND and scanDwellHeld.start != nil:
-    # An inline expiry of the newly armed operating timer is already an
-    # entered dwell. Preserve START-before-END even in that case.
-    let serial = scanDwellSerial
-    scanDwellPublish(MM_SCAN_CHANNEL_START_IND, slot)
-    if serial != scanDwellSerial or not scanDwellCurrent(): return
-  let cell = if id == MM_SCAN_CHANNEL_START_IND: addr scanDwellHeld.start
-             else: addr scanDwellHeld.finish
-  let p = cell[]
-  if p == nil: return
-  cell[] = nil
-  const mask = alignof(ScanDwellPosted).uint - 1
-  let tag = cast[ptr ScanDwellPosted]((cast[uint](p) + KeMsgTailSlack.uint + mask) and not mask)
-  tag[] = ScanDwellPosted(next: scanDwellPostedHead, payload: p, serial: scanDwellSerial)
-  scanDwellPostedHead = tag
-  when defined(bl808WifiDiagWarmScan):
-    if id == MM_SCAN_CHANNEL_START_IND: inc nimFwDbgWarmScan.start_posted
-    else: inc nimFwDbgWarmScan.end_posted
-  ke_msg_send(p)
-
-proc scanDwellClaim(p: pointer): bool =
-  # Untagged direct calls keep the exported handler contract. A queued tag
-  # belongs to its logical dwell even after channel slot 3 has been retired.
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  var link = addr scanDwellPostedHead
-  while link[] != nil:
-    let tag = link[]
-    if tag.payload == p:
-      link[] = tag.next
-      return not tag.cancelled and tag.serial == scanDwellSerial and scanDwellCurrent()
-    link = addr tag.next
-  true
-
-proc scanDwellDetach(): ScanDwellPair =
-  inc scanDwellSerial
-  scanDwellRequest = nil
-  scanDwellOwnsLower = false
-  result = scanDwellHeld
-  scanDwellHeld = default(ScanDwellPair)
-
-proc scanDwellForget(header: pointer) =
-  if scanDwellPostedHead != nil:
-    discard scanDwellClaim(keMsgPayload(cast[ptr KeMsgHdr](header)))
-
 var mmEdcaRefresh: tuple[message, context: pointer; vif: uint8;
                          vifEpoch, bindingEpoch: uint32]
 var chanCtxtLinkEpochs {.wifiCtrl.}: array[MAX_VIFS, uint32]
@@ -777,7 +673,6 @@ proc ke_msg_free*(param: pointer) {.exportc, cdecl.} =
   ## delivered to the host, so its owners forget it exactly once.
   # The channel switch's static request is never freed.
   if chanSwitchForget(param): return
-  scanDwellForget(param)
   mmTimForget(param)
   mmConnLossForget(param)
   rxMgtForget(param)
@@ -837,62 +732,10 @@ proc ke_queue_extract*(queue: ptr CoList, cmpFn: proc(elem: ptr CoListHdr, param
 #                      KERNEL: INIT / FLUSH
 # ###########################################################################
 
-proc scanDwellBeginReset(): ScanDwellRetired =
-  # Under the IRQ lock, take only the lower request committed to KeMsgNoFree.
-  if scanDwellOwnsLower and scanDwellRequest == scan_env.paramPtr and
-      scanDwellEpoch == scanRequestEpoch:
-    inc scanDwellResetEpoch
-    result.retained = scanDwellRequest
-  result.pair = scanDwellDetach()
-  proc matches(node: ptr CoListHdr; header: pointer): bool {.cdecl.} =
-    cast[pointer](node) == header
-  var link = addr scanDwellPostedHead
-  while link[] != nil:
-    let tag = link[]
-    let header = keMsgHdrFromPayload(tag.payload)
-    if not tag.cancelled and (
-        ke_queue_extract(addr keMsgQueueSent, matches, header) != nil or
-        ke_queue_extract(addr keMsgQueueSaved, matches, header) != nil):
-      link[] = tag.next
-      tag.next = result.queued
-      result.queued = tag
-    else:
-      # The dispatcher already popped it. Keep its tombstone until claim/free.
-      tag.cancelled = true
-      link = addr tag.next
-
-proc scanDwellFinishReset(old: var ScanDwellRetired) =
-  while old.queued != nil:
-    let tag = old.queued
-    old.queued = tag.next
-    ke_msg_free(keMsgHdrFromPayload(tag.payload))
-  scanDwellDispose(old.pair)
-  let retained = old.retained
-  old.retained = nil
-  if retained != nil: ke_msg_free(keMsgHdrFromPayload(retained))
-
-template scanDwellReset() =
-  # Detach before queue/slot reset. Defer callbacks until those are usable again.
-  let saved = irqSave()
-  var old = scanDwellBeginReset()
-  if old.retained != nil:
-    inc scanRequestEpoch
-    scan_env.paramPtr = nil
-    scan_env.abortFlag = 0
-  let epoch = scanRequestEpoch
-  irqRestore(saved)
-  defer:
-    let done = irqSave()
-    if old.retained != nil and scanRequestEpoch == epoch and scan_env.paramPtr == nil:
-      ke_state_set(TASK_SCAN, ScanIdleState)
-    irqRestore(done)
-    scanDwellFinishReset(old)
-
 proc ke_init*() {.exportc, cdecl.} =
   ## Initialize the kernel subsystem.
   smSaQueryResetScope()
   mmConfigCancelIdle()
-  scanDwellReset()
   smActivationCancel()
   chanSwitchReset()
   keTimerCancelMutations(all = true)
@@ -912,7 +755,8 @@ proc ke_flush*() {.exportc, cdecl.} =
   ##   ke_evt_clear(0xFFFFFFFF)  # tail call
   smSaQueryResetScope()
   mmConfigCancelIdle()
-  scanDwellReset()
+  # The lower scan's answer is flushed with the queues below.
+  scanRelease()
   keTimerCancelMutations(all = true)
   chanSwitchReset()
   # The flush frees every message SM waits on: drop its attempt or teardown.
@@ -5646,7 +5490,6 @@ proc chan_init*() {.exportc, cdecl.} =
   ##   offset 68: .LANCHOR2 (the static CDE event byte)
   ##   offset 80: chan_ctxt_op_evt
   ##   offset 96: chan_conn_less_delay_evt
-  scanDwellReset()
   chanBcnRequestReset()
   chanSwitchReset()
   let env = chanEnvView()
@@ -6067,7 +5910,8 @@ proc chan_scan_req*(param: pointer) {.exportc, cdecl.} =
   ## Blob keeps scan context state in chan_ctxt_pool, not chan_env.
   ## Start requests set up the scan context and tail-call
   ## chan_conn_less_delay_prog. Abort requests clear the scan timer and run
-  ## chan_ctxt_op_evt.
+  ## chan_ctxt_op_evt. TASK_SCAN is the only caller; no call here can run
+  ## its code or retire slot 3, so nothing is re-checked after one.
   if param == nil: return
   let reqType = cast[ptr uint8](param)[]
   var request: ChanScanReqPayload
@@ -6076,15 +5920,12 @@ proc chan_scan_req*(param: pointer) {.exportc, cdecl.} =
   let scanReq = addr request
   let saved = irqSave()
   defer: irqRestore(saved)
-  let resetEpoch = txResetEpoch
-  let previousEpoch = chanCtxtEpochs[3]
   template outside(body: untyped) =
     irqRestore(saved)
     try: body
     finally: discard irqSave()
   outside:
     nimFwTrace2U32("[WIFI-NIMFW] chan_scan_req ", reqType.uint32, encodedArgU32(param))
-  if txResetEpoch != resetEpoch or chanCtxtEpochs[3] != previousEpoch: return
   if reqType != 0 and reqType != 1:
     return
   let env = chanEnvView()
@@ -6094,9 +5935,6 @@ proc chan_scan_req*(param: pointer) {.exportc, cdecl.} =
       assert_err("chan.c", "chan.c", 0x9E5)
       return
     inc chanCtxtEpochs[3]
-    let allocation = chanCtxtEpochs[3]
-    template current(): bool =
-      txResetEpoch == resetEpoch and chanCtxtEpochs[3] == allocation and scan.slot == 3
     scan.slot = 3
     scan.vifIdx = 0xFF
     scan.requestVifIdx = scanReq.vifIdx
@@ -6104,7 +5942,6 @@ proc chan_scan_req*(param: pointer) {.exportc, cdecl.} =
     outside:
       nimFwTrace2U32("[WIFI-NIMFW] chan_scan_req duration ",
                      scan.requestVifIdx.uint32, scanReq.duration)
-    if not current(): return
     scan.durationTicks = chanScanDurationTicks(scanReq)
     discard c_memcpy(addr scan.channel, chanScanChannel(scanReq),
                      sizeof(ChanCtxtDefView).csize_t)
@@ -6114,17 +5951,14 @@ proc chan_scan_req*(param: pointer) {.exportc, cdecl.} =
       nimFwTrace2U32("[WIFI-NIMFW] chan_scan_req channel ",
                      scan.channel.band.uint32,
                      scan.channel.primFreq.uint32)
-    if not current(): return
     let chanFlags = env.flags
     env.flags = chanFlags or 0x02
     outside:
       nimFwTrace2U32("[WIFI-NIMFW] chan_scan_req flags ", chanFlags.uint32, env.flags.uint32)
-    if not current(): return
     when defined(bl808WifiDiagWarmScan): inc nimFwDbgWarmScan.slot_admitted
     outside: chan_conn_less_delay_prog()
     return
   outside: mm_timer_clear(chanCtxtOpTimer())
-  if txResetEpoch != resetEpoch or chanCtxtEpochs[3] != previousEpoch: return
   outside: chan_ctxt_op_evt(cast[pointer](chanCtxtForIdx(3)))
 
 proc chan_roc_req*(param: pointer; taskId: uint8): uint8 {.exportc, cdecl.} =
@@ -6480,7 +6314,6 @@ proc chan_pre_switch_channel*() {.exportc, cdecl.} =
   if targetCtxt == nil:
     chanSwitchFinish(arrived = false)
     return
-  let scanSlotEpoch = chanCtxtEpochs[3]
   let ctxt = chanCtxtAt(targetCtxt)
   nimFwDbgChanPreChanMeta = packChannelMeta(addr ctxt.channel)
   nimFwDbgChanPreChanFreq = packChannelFreq(addr ctxt.channel)
@@ -6519,7 +6352,7 @@ proc chan_pre_switch_channel*() {.exportc, cdecl.} =
     # scan-channel start indication, disables PM for the connectionless slot,
     # then reactivates the MAC before the queued indication is dispatched.
     regWrite(MACHW_BASE + 0x220'u, 0'u32)
-    scanDwellPublish(MM_SCAN_CHANNEL_START_IND, scanSlotEpoch)
+    scanDwellPost(MM_SCAN_CHANNEL_START_IND)
     let saved = irqSave()
     let ps = psEnvView()
     ps.statusFlags = ps.statusFlags or 0x02'u32
@@ -6833,8 +6666,7 @@ proc chanCtxtOpEvent(ctxtPtr: pointer; saved: uint32) =
     env.flags = env.flags and not 0x04'u8
   elif contextIndexOrMarker == 3:
     env.flags = env.flags and not 0x08'u8
-    outside: scanDwellPublish(MM_SCAN_CHANNEL_END_IND, allocation)
-    if not current(): return
+    scanDwellPost(MM_SCAN_CHANNEL_END_IND)
   # A switch to the slot (none is expected while it is current) is redirected.
   outside: chanSwitchRetire(ctxtPtr)
   expectedScheduled = env.scheduledCtxt

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from test_wifi_disconnect_tx import FW, procedure
+from test_wifi_disconnect_tx import FW, procedure, scan_machine_source
 from test_wifi_message_allocation import run_program
 from test_wifi_sm_scan_submit import source as submission_source
 
@@ -36,6 +36,7 @@ proc ke_state_set(task: uint8; value: uint16) =
                         "doAssert dst == 9'u8 and src == TASK_SCANU and size >= 1", 1)
     code = code.replace("vifIdx, vifType, staIdx: uint8",
                         "vifIdx, vifType, staIdx: uint8\n    macAddr: array[6, uint8]", 1)
+    code += scan_machine_source()
     code += r'''
 const KeMsgConsumed = 0.cint
 const KeMsgNoFree = 1.cint
@@ -47,22 +48,20 @@ type ScanEnvironment = object
   paramPtr, pendingJoinRxuMgtInd: pointer
   bssidFilterEnabled, requester: uint8
 var scanu_env: ScanEnvironment
-var scanuRequestEpoch: uint32
 var lookups: int
 var found: bool
 proc vif_mgmt_get_vif(index: uint8): pointer = addr vifs[index]
 proc vifChannelAt(p: pointer): ptr Vif = cast[ptr Vif](p)
 proc assert_err(a, b: cstring; line: int) = doAssert false
+proc scanu_cached_scanresult_clear() = discard
 proc sm_get_bss_params(bss, channel: ptr pointer) =
   inc lookups
   bss[] = if found: addr target[0] else: nil
   channel[] = if found: addr config.entries[0] else: nil
 '''
-    scan = (FW / "scan_station_ap_me.nim").read_text()
     code += procedure((FW / "kernel_mac_channel.nim").read_text(), "ke_msg_forward_and_change_id")
-    for name in ["scanuReleaseCompletedOwner", "scanuAnswer", "scanuReply", "scanuPublishCompletion"]:
-        code += procedure(scan, name)
-    code += procedure(scan, "scanu_confirm").split("\ntype ProbeIeWriter", 1)[0]
+    code += scan_machine_source("scanuGo", "scanuAnswer", "scanuReply", "scanuPublishCompletion",
+                                "scanuComplete", "scanu_confirm", record=False)
     code += (FW / "station_scan.nim").read_text()
     code += procedure((FW / "task_handlers.nim").read_text(), "scanu_start_cfm_handler")
     code += r'''
@@ -270,16 +269,17 @@ def test_scan_completion_ownership(tmp_path: Path, case: str, mode: str) -> None
 
 @pytest.mark.parametrize("handler", ["scanu_start_req_handler", "scanu_join_req_handler"])
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-def test_sm_request_waits_for_idle(tmp_path: Path, handler: str, mode: str) -> None:
-    """SCANU saves SM's live request while busy; once SM has moved on, the
-    request is answered with a failure at once and SM ignores the answer."""
+def test_sm_request_refused_once_sm_moved_on(tmp_path: Path, handler: str, mode: str) -> None:
+    """SCANU's tables save SM's request while SCANU is busy (ke_msg_save,
+    tools/test_wifi_scan_table.py); the handler runs only in state 0. A
+    request SM no longer waits on is answered with a failure at once and SM
+    ignores the answer."""
     body = procedure((FW / "task_handlers.nim").read_text(), handler)
     admission = body.split("  let req = scanuStartReqView(param)", 1)[0] + "  return KeMsgConsumed\n"
     joining = handler == "scanu_join_req_handler"
     checks = f'''
 begin({str(joining).lower()})
 let request = take()
-doAssert {handler}(request) == KeMsgSaved
 doAssert live.len == 1
 replaceOwner()
 doAssert {handler}(request) == KeMsgNoFree
@@ -318,14 +318,14 @@ for busy in [true, false]:
     scanu_env = default(ScanEnvironment)
     scanState = ScanuIdleState
   let original = scanu_env
-  let epoch = scanuRequestEpoch
+  let epoch = scanuOwn.op.serial
   let stateBefore = scanState
   let allocationsBefore = allocations
   sm.cancelRequested = 1
   failAlloc = true
   doAssert handler(request) == KeMsgNoFree
   doAssert queued.len == 1 and allocations == allocationsBefore
-  doAssert scanu_env == original and scanuRequestEpoch == epoch and scanState == stateBefore
+  doAssert scanu_env == original and scanuOwn.op.serial == epoch and scanState == stateBefore
   let reply = take()
   doAssert reply == request
   let id = keMsgHdrFromPayload(reply).id
@@ -335,35 +335,6 @@ for busy in [true, false]:
   doAssert not smScanAccept(reply, id) and failures.len == 1
   release(reply)
   finish()
-''')
-
-
-@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-def test_busy_host_scan_returns_confirmation_without_stealing_owner(tmp_path: Path, mode: str) -> None:
-    body = procedure((FW / "task_handlers.nim").read_text(), "scanu_start_req_handler")
-    admission = body.split("  let req = scanuStartReqView(param)", 1)[0] + "  return KeMsgConsumed\n"
-    run_program(tmp_path, mode, source() + admission + r'''
-begin()
-let active = take()
-scanu_env.paramPtr = active
-scanu_env.requester = TASK_SM
-let original = scanu_env
-let epoch = scanuRequestEpoch
-let client = ke_msg_try_alloc(SCANU_START_REQ, TASK_SCANU, TASK_SM, ScanuStartReqPayloadSize)
-keMsgHdrFromPayload(client).srcId = TASK_API
-let tries = allocations
-failAlloc = true
-onSend = proc() = doAssert enabled
-doAssert scanu_start_req_handler(client) == KeMsgNoFree
-doAssert allocations == tries and scanu_env == original and scanuRequestEpoch == epoch
-doAssert scanState == 1 and queued == @[client]
-let reply = take()
-let header = keMsgHdrFromPayload(reply)
-doAssert header.id == SCANU_START_CFM and header.srcId == TASK_SCANU and header.destId == TASK_API
-doAssert header.paramLen == StatusCfmPayloadSize and statusCfmView(reply).status == SCAN_STATUS_BUSY
-release(reply)
-release(complete(active))
-finish()
 ''')
 
 
@@ -388,5 +359,5 @@ def test_no_lost_exchange_machinery() -> None:
     for gone in ["smScanForget", "smScanNeedsService", "smScanService", "smScanTags",
                  "smScanCompletionAlloc", "smScanAdmitRequest", "smScanOwnsRequest"]:
         assert gone not in sources, gone
-    confirm = procedure((FW / "scan_station_ap_me.nim").read_text(), "scanu_confirm")
-    assert "scanuReply(primaryId, completion.source)" in confirm
+    complete = procedure((FW / "scan_machine.nim").read_text(), "scanuComplete")
+    assert "scanuReply(primaryId, source)" in complete

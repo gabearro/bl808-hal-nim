@@ -16,7 +16,7 @@ proc smDeferredCancel() = discard
 proc chanSwitchReset() = discard
 proc chanSwitchRetire(target: pointer) = discard
 proc chanBcnRequestReset() = discard
-proc scanDwellReset() = discard
+proc scanRelease(failed = false) = discard
 type
   CoListHdr = object
     next: ptr CoListHdr
@@ -386,8 +386,8 @@ proc blmac_pwr_mgt_setf(value: uint32) = events.add(("pm", value.uint))
 proc chan_goto_idle_cb() = events.add(("goto-idle", 0'u))
 proc chan_conn_less_delay_prog() = events.add(("delay", 0'u))
 const MM_SCAN_CHANNEL_END_IND = 77'u16
-proc scanDwellPublish(id: uint16; slot: uint32) =
-  doAssert id == MM_SCAN_CHANNEL_END_IND and slot == chanCtxtEpochs[3]
+proc scanDwellPost(id: uint16) =
+  doAssert id == MM_SCAN_CHANNEL_END_IND
   events.add(("message", id.uint))
 proc mm_force_idle_req(): bool =
   events.add(("force-idle", 0'u))

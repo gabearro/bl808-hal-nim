@@ -56,9 +56,6 @@ var
   lastStatus: uint8
   allocatorFails: bool
   sentBytes: seq[uint8]
-  scanuRequestEpoch: uint32
-  scanuProducerRequest: pointer
-  scanuProducerEpoch: uint32
   interruptsEnabled = true
 proc smScanRefused(p: pointer): bool = false
 proc irqSave(): uint32 =
@@ -138,7 +135,6 @@ proc reset() =
   request.bssid = [1'u8, 2, 3, 4, 5, 6]
   request.localMac = [7'u8, 8, 9, 10, 11, 12]
   scanu_env = ScanEnv(paramPtr: addr request)
-  scanuRequestEpoch = 1
   interruptsEnabled = true
   me.htSupp = 1
   for i in 0 ..< me.caps.len: me.caps[i] = (0x80 + i).uint8
@@ -322,7 +318,7 @@ def test_scan_ie_builder(tmp_path: Path, mode: str, mutation: str | None) -> Non
     writer_type = source.split("type ProbeIeWriter = object", 1)[1].split("\nproc ", 1)[0]
     functions = "type ProbeIeWriter = object" + writer_type + "\n"
     functions += "".join(procedure(source, name) for name in [
-        "scanuRequestCurrent", "scanChannelValid", "reserveProbeIeBytes", "cursor", "appendByte", "appendIeHeader", "skip", "appendDsParamPlaceholder",
+        "scanChannelValid", "reserveProbeIeBytes", "cursor", "appendByte", "appendIeHeader", "skip", "appendDsParamPlaceholder",
         "appendBytes", "probeIesValid", "appendHtCapabilities", "macId2RatePtr", "appendSupportedRates",
         "finishScanStartReq", "sendScanStartReq", "initScanStartReq", "appendScanBandChannel",
         "copyScanBandChannels", "firstScanBandChannel", "clampedProbeReqIeLen", "supportedRateStart",

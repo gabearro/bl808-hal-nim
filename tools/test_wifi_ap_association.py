@@ -163,7 +163,7 @@ proc meControlReset() = discard
 proc smCleanupCancel() = discard
 proc smBssCancel() = discard
 proc chanSwitchReset() = discard
-proc scanDwellReset() = discard
+proc scanRelease(failed = false) = discard
 proc smActivationCancel() = discard
 proc smRspTimerReset() = discard
 template smSaQueryResetScope() = discard

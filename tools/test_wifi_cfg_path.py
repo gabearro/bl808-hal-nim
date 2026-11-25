@@ -514,8 +514,6 @@ type
     ieData: array[200, uint8]
 var
   scanRequest: ScanRequest
-  replacementRequest: ScanRequest
-  scanRequestEpoch: uint32
   stateSets: int
   channelRequests: int
   selected: ChanScanReqPayload
@@ -548,7 +546,7 @@ proc chan_scan_req(p: ptr ChanScanReqPayload) =
   selected = p[]
   if chanRequestHook != nil: chanRequestHook()
 proc ke_state_set(task, state: uint8) =
-  doAssert task == TASK_SCAN and state == ScanChannelPendingState
+  # TASK_SCAN's state is scanGo's; scan_set_channel_request does not set it.
   inc stateSets
 '''
     scan_source = (FW / "scan_station_ap_me.nim").read_text()
@@ -606,23 +604,9 @@ doAssert selected.prim20Freq == 2412 and selected.txPower == 7
 doAssert oldIe.currentChannel == 91 and newIe.currentChannel == 1
 chanRequestHook = nil
 
-# Diagnostics must not read or submit a retired scan, nor mix channel fields
-# if a callback edits the same request in place.
-for tracePoint in ["[WIFI-NIMFW] scan_set start ", "[WIFI-NIMFW] scan_set chan "]:
-  scan_env.paramPtr = addr scanRequest
-  scan_env.channelIndex = 0
-  scanRequest.channelList[0] = Channel(band: 0, prim20Freq: 2412, txPower: 7)
-  let beforeRequests = channelRequests
-  let beforeStates = stateSets
-  traceHook = proc(text: cstring) =
-    if $text == tracePoint:
-      inc scanRequestEpoch
-      scan_env.paramPtr = addr replacementRequest
-  scan_set_channel_request()
-  doAssert channelRequests == beforeRequests and stateSets == beforeStates
-  traceHook = nil
-
+# The channel fields are captured before the traces.
 scan_env.paramPtr = addr scanRequest
+scan_env.channelIndex = 0
 scanRequest.channelList[0] = Channel(band: 0, prim20Freq: 2412, txPower: 7)
 traceHook = proc(text: cstring) =
   if $text == "[WIFI-NIMFW] scan_set start ":
@@ -648,7 +632,7 @@ for frequency in [4995'u16, 5000, 5005, 5006, 5825, 5830]:
     doAssert channelRequests == previousRequests and stateSets == previousStates
     doAssert oldIe.currentChannel == 99
   else:
-    doAssert channelRequests == previousRequests + 1 and stateSets == previousStates + 1
+    doAssert channelRequests == previousRequests + 1 and stateSets == previousStates
     doAssert selected.prim20Freq == frequency
     doAssert oldIe.currentChannel == expectedChannel
 
@@ -659,7 +643,9 @@ scan_set_channel_request()
 doAssert channelRequests == previousRequests and stateSets == previousStates
 scanRequest.channelList[0].prim20Freq = 2484
 scan_set_channel_request()
-doAssert channelRequests == previousRequests + 1 and stateSets == previousStates + 1
+doAssert channelRequests == previousRequests + 1
+# scanDwellBegin entered state 2 before the request is submitted.
+doAssert stateSets == 0
 
 scanRequest.channelList[0] = Channel(band: 0, prim20Freq: 2412, txPower: 7)
 scanRequest.ieBodyLen = 7
@@ -687,35 +673,24 @@ scan_probe_req_ie.writeOffset = 77
 scan_ie_download(nil)
 doAssert scan_probe_req_ie.writeOffset == 77
 
-# A reentrant channel callback can replace the scan before the archive's
-# post-submission IE and state writes. The stale request must stop there.
+# chan_scan_req runs no TASK_SCAN code, so nothing is re-checked after it.
+# IE lengths beyond the buffer only skip the DS lookup and the end marker;
+# the dwell is still submitted.
+chanRequestHook = nil
 scan_env.paramPtr = addr scanRequest
-scan_env.chanInfoPtr = addr oldIe
-oldIe.currentChannel = 91
-newIe.currentChannel = 92
-let stateSetsBefore = stateSets
-chanRequestHook = proc() =
-  inc scanRequestEpoch
-  scan_env.paramPtr = addr replacementRequest
-  scan_env.chanInfoPtr = addr newIe
-scan_set_channel_request()
-doAssert stateSets == stateSetsBefore
-doAssert oldIe.currentChannel == 91 and newIe.currentChannel == 92
-
-scan_env.paramPtr = addr scanRequest
-scan_env.chanInfoPtr = addr oldIe
+scanRequest.ieBodyLen = 201
 scan_probe_req_ie.writeOffset = 77
 scan_probe_req_ie.endOffset = 88
+let submitted = channelRequests
 scan_ie_download(addr scanRequest)
-doAssert scan_probe_req_ie.writeOffset == 77
-doAssert scan_probe_req_ie.endOffset == 88
+doAssert channelRequests == submitted + 1 and scan_env.chanInfoPtr == nil
+doAssert scan_probe_req_ie.writeOffset == 77 and scan_probe_req_ie.endOffset == 88
+scanRequest.ieBodyLen = 7
 
-chanRequestHook = nil
 scan_env.paramPtr = nil
 scan_set_channel_request()
-doAssert stateSets == stateSetsBefore
 scan_env.paramPtr = addr scanRequest
 scan_env.channelIndex = scanRequest.channelCount
 scan_set_channel_request()
-doAssert stateSets == stateSetsBefore
+doAssert channelRequests == submitted + 1 and stateSets == 0
 ''')
