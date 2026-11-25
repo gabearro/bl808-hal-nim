@@ -4,13 +4,11 @@ type
     serial, vifEpoch, binding, allocation: uint32
     node, channel: pointer
     targetTime: uint32
-    definition: ChanCtxtDefView
     vif, index: uint8
     prepared, valid: bool
   ChanCtxtTimerOwner = object
     serial, allocation: uint32
     context, current, scheduled: pointer
-    definition: ChanCtxtDefView
     index, phase: uint8
     prepared, valid: bool
   ChanConnlessTimerOwner = object
@@ -56,7 +54,6 @@ proc chanCtxtTimerArming(timer: pointer) =
     chanCtxtTimerOwner.context = context
     chanCtxtTimerOwner.current = chanEnvView().currentCtxt
     chanCtxtTimerOwner.scheduled = chanEnvView().scheduledCtxt
-    chanCtxtTimerOwner.definition = ctxt.channel
     chanCtxtTimerOwner.index = index
     chanCtxtTimerOwner.phase = if ctxt.status == 4: 4'u8 else: 2'u8
     chanCtxtTimerOwner.allocation = chanCtxtEpochs[index]
@@ -93,7 +90,6 @@ proc chanTimerArming(timer: pointer) =
     chanTbttTimerOwner.node = nodePtr
     chanTbttTimerOwner.channel = channel
     chanTbttTimerOwner.targetTime = node.targetTime
-    chanTbttTimerOwner.definition = ctxt.channel
     chanTbttTimerOwner.vif = node.vifIdx
     chanTbttTimerOwner.index = index
     chanTbttTimerOwner.vifEpoch = rxVifEpochs[node.vifIdx]
@@ -140,6 +136,8 @@ proc chanConnlessTimerDispatch(callback: pointer; serial: uint32): bool =
   chanConnlessDelayEvent()
 
 proc chanCtxtTimerCurrent(): bool =
+  ## A context is its slot and allocation epoch; TPC and bandwidth updates
+  ## edit its definition in place without ending its operation.
   let owner = addr chanCtxtTimerOwner
   if not owner.valid or chanCtxtEpochs[owner.index] != owner.allocation:
     return false
@@ -151,19 +149,7 @@ proc chanCtxtTimerCurrent(): bool =
     ctxt.status == 4 and owner.current == owner.context
   ctxt.contextIndexOrMarker == owner.index and
     (ctxt.status == 3 or ctxt.status == phase) and env.currentCtxt == owner.current and
-    (operatingScan or env.scheduledCtxt == owner.scheduled) and
-    ctxt.channel.band == owner.definition.band and
-    ctxt.channel.chanType == owner.definition.chanType and
-    ctxt.channel.primFreq == owner.definition.primFreq and
-    ctxt.channel.centerFreq1 == owner.definition.centerFreq1 and
-    ctxt.channel.centerFreq2 == owner.definition.centerFreq2
-
-proc chanForceIdleForDeparture(target: pointer): bool =
-  ## The switch's own TX drain precedes its protection-frame wait; the wait's
-  ## deadline is checked against the contexts, not against the drain.
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  target != nil and chanEnvView().scheduledCtxt == target and chanForceIdle()
+    (operatingScan or env.scheduledCtxt == owner.scheduled)
 
 proc chanCtxtTimerDispatch(callback, argument: pointer; serial: uint32): bool =
   if callback != cast[pointer](chan_ctxt_op_evt): return false
@@ -199,12 +185,7 @@ proc chanTimerDispatch(timer, callback, argument: pointer; serial: uint32): bool
       chanTbttDeferredSlot()[] != argument or
       vifChannelForIdx(chanTbttTimerOwner.vif).chanCtxt != chanTbttTimerOwner.channel or
       cast[pointer](ctxt) != chanTbttTimerOwner.channel or
-      ctxt.contextIndexOrMarker != chanTbttTimerOwner.index or ctxt.status == 0 or
-      ctxt.channel.band != chanTbttTimerOwner.definition.band or
-      ctxt.channel.chanType != chanTbttTimerOwner.definition.chanType or
-      ctxt.channel.primFreq != chanTbttTimerOwner.definition.primFreq or
-      ctxt.channel.centerFreq1 != chanTbttTimerOwner.definition.centerFreq1 or
-      ctxt.channel.centerFreq2 != chanTbttTimerOwner.definition.centerFreq2:
+      ctxt.contextIndexOrMarker != chanTbttTimerOwner.index or ctxt.status == 0:
     return
   # Consume before callback work can arm another timer at the same address.
   chanTbttTimerOwner.valid = false

@@ -63,9 +63,7 @@ proc assert_err(condition, file: cstring; line: cint) =
   if assertionHook != nil: assertionHook()
 proc keMsgHdrFromPayload(p: pointer): ptr Header =
   cast[ptr Header](cast[uint](p) - sizeof(Header).uint)
-proc chanSwitchAdmit(p: pointer): bool = true
-proc chanSwitchTrackIdle(p: pointer; state: uint16): uint32 = mmConfigIdle.epoch
-proc chanSwitchInvoke(p: pointer): bool = false
+proc chanSwitchTake(p: pointer): cint = KeMsgConsumed # not the switch's own request
 proc hal_machw_idle_req() =
   doAssert not interrupts
   inc idleRequests
@@ -130,7 +128,9 @@ for irq in [false, true]:
     setup(irq)
     state = MM_IDLE
     hardwareState = hw
-    doAssert request() == KeMsgConsumed and interrupts == irq
+    # Non-idle hardware asserts; the request stays saved for the recovery.
+    doAssert request() == (if (hw and 15) == 0: KeMsgConsumed else: KeMsgSaved)
+    doAssert interrupts == irq
     if (hw and 15) == 0:
       doAssert assertions.len == 0 and stateChanges == @[HW_ACTIVE]
       doAssert completions == 1
@@ -187,30 +187,21 @@ def test_idle_assert_returns(tmp_path: Path, mode: str, case: str) -> None:
 
 @pytest.mark.parametrize("mode", ["checked", "asan", "firmware"])
 def test_owned_force_idle_rejection(tmp_path: Path, mode: str) -> None:
-    code = switch_source()
-    code = code.replace(procedure(code, "regRead"), r'''
-proc regRead(address: uint): uint32 =
-  doAssert address == MACHW_STATE_CNTRL_REG
-  rejectedHardware
-''')
-    code = code.replace(procedure(code, "assert_err"), r'''
-proc assert_err(condition, file: cstring; line: int) =
-  doAssert line == 1013
-  inc rejectedAssertions
-''')
-    code = "var rejectedHardware: uint32\nvar rejectedAssertions: int\n" + code
-    run_program(tmp_path, mode, code + r'''
-for irq in [false, true]:
-  for hardware in [1'u32, 15]:
-    resetSwitch()
-    enabled = irq
-    rejectedHardware = 0
-    rejectedAssertions = 0
-    let request = beginSwitch(newTarget())
-    rejectedHardware = hardware
-    doAssert mm_force_idle_req_handler(request) == KeMsgConsumed
-    doAssert rejectedAssertions == 1 and enabled == irq
-    doAssert callbacks == 0 and forced == 0 and mmState == MM_IDLE
-    release(request)
-    finishSwitch()
+    """The switch's request meets MM idle with the MAC still busy: the blob's
+    assert fires and the request stays saved until the recovery reschedules
+    MM's saved work; it is never dropped."""
+    run_program(tmp_path, mode, switch_source() + r'''
+for hardware in [1'u32, 15]:
+  resetSwitch()
+  let away = newTarget(2437)
+  chan_switch_start(away)
+  macState = hardware
+  doAssert dispatch()
+  doAssert asserts == 1 and queuedRequests(keMsgQueueSaved) == 1 and mmState == MM_IDLE
+  doAssert tuned.len == 0 and forced == 0 and chanSw.phase == swQueued
+  macState = 0
+  rescheduleMm()
+  settle()
+  doAssert tuned == @[away] and idleSwitch()
+  finishSwitch()
 ''')

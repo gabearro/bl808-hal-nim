@@ -14,7 +14,7 @@ var txResetEpoch: uint32
 var chanCtxtLinkEpochs: array[MAX_VIFS, uint32]
 proc smDeferredCancel() = discard
 proc smDeferredChannelUnlinked(vifIndex: uint8) = discard
-proc chanSwitchCancel(target: pointer = nil) = discard
+proc chanSwitchReset() = discard
 proc chanSwitchRetire(target: pointer) = discard
 proc chanBcnRequestReset() = discard
 proc scanDwellReset() = discard

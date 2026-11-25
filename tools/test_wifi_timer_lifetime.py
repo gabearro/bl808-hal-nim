@@ -137,7 +137,7 @@ var
 template smSaQueryResetScope() = discard
 proc mmConfigCancelIdle() = discard
 proc scanDwellReset() = discard
-proc chanSwitchCancel() = discard
+proc chanSwitchReset() = discard
 proc smActivationCancel() = discard
 proc smBssCancel() = discard
 proc smRspTimerReset() = discard

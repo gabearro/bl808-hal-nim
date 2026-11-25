@@ -579,7 +579,6 @@ proc ke_msg_send*(param: pointer) {.exportc, cdecl, noinline.} =
     smActivationForget(cast[pointer](hdr))
     smScanForget(cast[pointer](hdr))
     smRegistrationForget(cast[pointer](hdr))
-    chanSwitchForget(cast[pointer](hdr))
     chanUpdateForget(cast[pointer](hdr))
     chanBcnRequestForget(cast[pointer](hdr))
     smRspTimerForget(cast[pointer](hdr))
@@ -752,20 +751,15 @@ var chanCtxtLinkEpochs {.wifiCtrl.}: array[MAX_VIFS, uint32]
 type MmConfigIdlePhase = enum
   mmConfigNoIdle, mmConfigAwaitIdle, mmConfigIdleReady
 
-type MmIdleRestoreGuard = proc(): bool {.nimcall.}
+var mmConfigIdle: tuple[owner: pointer; epoch: uint32; phase: MmConfigIdlePhase]
 
-var mmConfigIdle: tuple[owner: pointer; epoch: uint32; phase: MmConfigIdlePhase;
-                        switchGuard: MmIdleRestoreGuard]
-
-proc mmConfigTrackIdle(owner: pointer; mode, state: uint8;
-                       switchGuard: MmIdleRestoreGuard = nil): uint32 =
+proc mmConfigTrackIdle(owner: pointer; mode, state: uint8): uint32 =
   let mm = mmEnvView()
   mm.hardwareMode = mode
   mm.previousState = state
   inc mmConfigIdle.epoch
   mmConfigIdle.owner = owner
   mmConfigIdle.phase = mmConfigAwaitIdle
-  mmConfigIdle.switchGuard = switchGuard
   mmConfigIdle.epoch
 
 proc mmConfigCancelIdle() =
@@ -778,7 +772,6 @@ proc mmConfigCancelIdle() =
   inc mmConfigIdle.epoch
   mmConfigIdle.owner = nil
   mmConfigIdle.phase = mmConfigNoIdle
-  mmConfigIdle.switchGuard = nil
 
 proc mmConfigForgetIdleOwner(header: pointer): bool =
   if header == nil or mmConfigIdle.owner != header: return false
@@ -798,6 +791,8 @@ proc ke_msg_free*(param: pointer) {.exportc, cdecl.} =
   ## Free a kernel message. Blob: tail-calls `g_bl_ops_funcs[0xBC](param)`
   ## — param is already the HEADER pointer (callers subtract 12 before
   ## calling).
+  # The channel switch's static request is never freed.
+  if chanSwitchForget(param): return
   scanDwellForget(param)
   mmTimForget(param)
   mmConnLossForget(param)
@@ -807,7 +802,6 @@ proc ke_msg_free*(param: pointer) {.exportc, cdecl.} =
   smActivationForget(param)
   smScanForget(param)
   smRegistrationForget(param)
-  chanSwitchForget(param)
   chanUpdateForget(param)
   chanBcnRequestForget(param)
   smRspTimerForget(param)
@@ -917,7 +911,7 @@ proc ke_init*() {.exportc, cdecl.} =
   mmConfigCancelIdle()
   scanDwellReset()
   smActivationCancel()
-  chanSwitchCancel()
+  chanSwitchReset()
   keTimerCancelMutations(all = true)
   smRspTimerReset()
   co_list_init(addr keMsgQueueSent)
@@ -938,7 +932,7 @@ proc ke_flush*() {.exportc, cdecl.} =
   mmConfigCancelIdle()
   scanDwellReset()
   keTimerCancelMutations(all = true)
-  chanSwitchCancel()
+  chanSwitchReset()
   smActivationCancel()
   smBssCancel()
   smRspTimerReset()
@@ -1128,10 +1122,6 @@ proc mmConfigResumeIdle(epoch: uint32; task: uint8; abandonedOnly = false): bool
       mmConfigIdle.owner != nil or
       (regRead(MACHW_STATE_CNTRL_REG) and 0xFF'u32) != 0):
     return false
-  if mmConfigIdle.switchGuard != nil:
-    # Configuration can complete while the channel switch still owns idle.
-    if not abandonedOnly: return true
-    if not mmConfigIdle.switchGuard(): return false
   let mm = mmEnvView()
   let nextMode = mm.hardwareMode.uint32 shl 4
   let nextState = mm.previousState.uint16
@@ -5707,7 +5697,7 @@ proc chan_init*() {.exportc, cdecl.} =
   ##   offset 96: chan_conn_less_delay_evt
   scanDwellReset()
   chanBcnRequestReset()
-  chanSwitchCancel()
+  chanSwitchReset()
   let env = chanEnvView()
   for epoch in chanCtxtEpochs.mitems: inc epoch
   for epoch in chanCtxtLinkEpochs.mitems: inc epoch
@@ -6160,9 +6150,6 @@ proc chan_scan_req*(param: pointer) {.exportc, cdecl.} =
     if scan.slot != 0xFF:
       assert_err("chan.c", "chan.c", 0x9E5)
       return
-    outside: chanSwitchCancel(cast[pointer](chanCtxtForIdx(3)))
-    if txResetEpoch != resetEpoch or chanCtxtEpochs[3] != previousEpoch or
-        scan.slot != 0xFF: return
     inc chanCtxtEpochs[3]
     let allocation = chanCtxtEpochs[3]
     template current(): bool =
@@ -6501,10 +6488,14 @@ proc chan_pre_switch_channel*() {.exportc, cdecl.} =
   ## Stores ctxt at chan_env+32 (current). Calls chan_upd_ctxt_status.
   ## If ctxt type (ctxt+23) == 3 or 4, sets HW state bits.
   ## If type <= 2, walks VIF list checking for matching channel context.
-  if not chanSwitchCallbackCurrent(): return
+  ##
+  ## Port: publishing the target ends the switch (chanSwitchFinish). Before
+  ## that, a switch that finds no target, or loses it during the port's RX
+  ## drain, is abandoned there; the blob would return and leave MM in
+  ## HW_ACTIVE. After it, the vendor tail always reaches mm_active.
   let env = chanEnvView()
+  let serial = chanSwitchSerial()
   mm_timer_clear(chanCtxtOpTimer())
-  if not chanSwitchCallbackCurrent(): return
   # Check and clear bit 5 in flags
   var chanFlags = env.flags
   if (chanFlags and 0x20) != 0:
@@ -6535,20 +6526,18 @@ proc chan_pre_switch_channel*() {.exportc, cdecl.} =
         # the call we fall through and re-read that slot below.
         var event = 1'u8
         chan_cde_evt(addr event)
-        if not chanSwitchCallbackCurrent(): return
       elif ctxtCount == 1:
         targetCtxt = cast[pointer](env.activeList.first)
         env.scheduledCtxt = targetCtxt
-      else:
-        return
     else:
       targetCtxt = schedCtxt
     # .L216: re-load the scheduled context slot (chan_cde_evt may have written it).
     if targetCtxt == nil:
       targetCtxt = env.scheduledCtxt
+  if chanSwitchSerial() != serial: return
   if targetCtxt == nil:
+    chanSwitchFinish(arrived = false)
     return
-  if not chanSwitchSelectTarget(targetCtxt): return
   let scanSlotEpoch = chanCtxtEpochs[3]
   let ctxt = chanCtxtAt(targetCtxt)
   nimFwDbgChanPreChanMeta = packChannelMeta(addr ctxt.channel)
@@ -6559,28 +6548,28 @@ proc chan_pre_switch_channel*() {.exportc, cdecl.} =
   if ctxt.contextIndexOrMarker in [3'u8, 4'u8] or
       previousCtxt == cast[pointer](chanCtxtForIdx(3)) or
       previousCtxt == cast[pointer](chanCtxtForIdx(4)):
+    # RX processing can retire or replace the target (it then ends the switch).
     rxl_timer_int_handler()
-    if not chanSwitchCallbackCurrent(): return
     rxl_cntrl_evt()
-    if not chanSwitchCallbackCurrent(): return
+    if chanSwitchSerial() != serial: return
+    if env.scheduledCtxt != targetCtxt:
+      chanSwitchFinish(arrived = false)
+      return
   # .LBB497/.LBE497: Call phy_set_channel with extracted params
   # a5=0, a0..a4 = band,chanType,primFreq,centerFreq1,centerFreq2
   phySetChannel(addr ctxt.channel)
-  if not chanSwitchCallbackCurrent(): return
 
   # Call tpc_update with TX power from context offset 12
   tpc_update_tx_power(ctxt.channel.txPower)
-  if not chanSwitchCallbackCurrent(): return
 
   # Write MAC HW BW register: 0x1F0 -> MACHW+0xDC
   regWrite(MACHW_BASE + 0x0DC'u, 0x1F0'u32)
-  if not chanSwitchCallbackCurrent(): return
   # Clear pending context, store as current
   env.scheduledCtxt = nil
   env.currentCtxt = targetCtxt
+  chanSwitchFinish(arrived = true)
   # Call chan_upd_ctxt_status to finalize
   chan_upd_ctxt_status(targetCtxt, 4)
-  if not chanSwitchCallbackCurrent(): return
   # Check context type for additional handling
   let contextIndexOrMarker = ctxt.contextIndexOrMarker
   if contextIndexOrMarker == 3:
@@ -6589,7 +6578,6 @@ proc chan_pre_switch_channel*() {.exportc, cdecl.} =
     # then reactivates the MAC before the queued indication is dispatched.
     regWrite(MACHW_BASE + 0x220'u, 0'u32)
     scanDwellPublish(MM_SCAN_CHANNEL_START_IND, scanSlotEpoch)
-    if not chanSwitchCallbackCurrent(): return
     let saved = irqSave()
     let ps = psEnvView()
     ps.statusFlags = ps.statusFlags or 0x02'u32
@@ -6615,7 +6603,6 @@ proc chan_pre_switch_channel*() {.exportc, cdecl.} =
     waitRfUs(1000'u32)
   elif contextIndexOrMarker <= 2:
     mmReplayEdca()
-    if not chanSwitchCallbackCurrent(): return
     let ps = psEnvView()
     if ps.enabled == 0 or (ps.statusFlags and 8'u32) != 0:
       # Blob .L221: leave PS mode before notifying associated STA VIFs on the
@@ -6630,7 +6617,6 @@ proc chan_pre_switch_channel*() {.exportc, cdecl.} =
             let vifAssoc = vif.state
             if vifAssoc != 0:
               chanHomeWakeRequest(vif2, contextIndexOrMarker)
-              if not chanSwitchCallbackCurrent(): return
         vif2 = vif.next
 
     # Blob .L222/.L227: walk active VIFs again, mark TD state, release any
@@ -6646,14 +6632,10 @@ proc chan_pre_switch_channel*() {.exportc, cdecl.} =
           # Blob 0x1de-0x1f0: send the deferred SM_CONNECT_AUTH_ASSOC_REQ
           # message parked by chan_ctxt_set_auth_assoc_req.
           smDeferredPublish(vif3)
-          if not chanSwitchCallbackCurrent(): return
         # Send postponed frames (blob passes vif entry pointer as a0)
         vif_mgmt_send_postponed_frame(vif3)
-        if not chanSwitchCallbackCurrent(): return
       vif3 = vif.next
     mm_active()
-
-proc chanStartConnlessSwitch(target: pointer)
 
 proc chanConnlessDelayEvent() =
   ## Caller holds the IRQ lock through the pending-to-active transition.
@@ -6690,7 +6672,7 @@ proc chanConnlessDelayEvent() =
     if env.scheduledCtxt == nil:
       switchArg = cast[pointer](chanCtxtForIdx(3))
   if switchArg != nil:
-    chanStartConnlessSwitch(switchArg)
+    chan_switch_start(switchArg)
 
 proc chan_conn_less_delay_evt*() {.exportc, cdecl.} =
   let saved = irqSave()
@@ -6831,10 +6813,8 @@ proc chanCtxtOpEvent(ctxtPtr: pointer; saved: uint32) =
       return
     # Set status=2, clear chan_env[121,122], tail-call chan_goto_idle_cb
     ctxt.status = 2
-    # The timeout now owns the switch. The forced idle below flushes old TX
-    # callbacks; they must not cancel the timed-out switch or resume it again.
-    if env.scheduledCtxt == ctxtPtr:
-      discard chanProtectionCancel(ctxtPtr)
+    # chan_goto_idle_cb starts a new protection generation, so confirmations
+    # of the timed-out frames, flushed by its forced idle, no longer count.
     env.scanDelayCount = 0
     env.connlessDelayCount = 0
     outside: chan_goto_idle_cb()

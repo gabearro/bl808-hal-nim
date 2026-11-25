@@ -417,3 +417,80 @@ doAssert scanu_raw_send_busy_handler(nil) == KeMsgConsumed and confirmations.len
     tables = (FW / "dispatch_tables.nim").read_text()
     default = tables.split("var scanu_default_state*", 1)[1].split("\n]", 1)[0]
     assert "SCANU_RAW_SEND_REQ, handler: keMsgHandlerAddress(scanu_raw_send_busy_handler)" in default
+
+
+# --------------------------------------------------------------------------
+# The slot-3 dwell switch (SCAN-N1)
+# --------------------------------------------------------------------------
+
+def dwell_switch_source() -> str:
+    from test_wifi_switch_request import source as switch_source
+    return switch_source() + r'''
+const MM_SCAN_CHANNEL_END_IND = 76'u16
+var chanConnlessGeneration: uint32
+''' + procedure((FW / "kernel_mac_channel.nim").read_text(), "chanConnlessDelayEvent") + r'''
+proc admitScan(home: bool) =
+  ## chan_scan_req admitted slot 3 (flags 0x02) and armed the gate (0x10).
+  resetSwitch()
+  if home:
+    let context = newTarget(2412)
+    linkHome(context, VIF_TYPE_STA, 0)
+    operate(context)
+  let scan = chanCtxtForIdx(3)
+  scan.contextIndexOrMarker = 3
+  scan.status = 1
+  channelEnv.flags = 0x12
+proc dwellStarted(): bool =
+  channelEnv.currentCtxt == cast[pointer](chanCtxtForIdx(3)) and
+    notices == @[MM_SCAN_CHANNEL_START_IND] and (channelEnv.flags and 0x08) != 0
+'''
+
+
+DWELL_DROPS = {
+    # MM is idle but the MAC is not: the blob's assert, a full recovery here.
+    "mac_busy_in_idle": r'''
+if mmState == MM_ACTIVE_STATE:
+  doAssert dispatch()                # MM idles for the switch first
+  idleInterrupt()
+macState = 0x33
+settle()
+doAssert asserts == 1 and chanSw.phase == swQueued and requestLinked()
+macState = 0                         # bl_reset_evt: MAC reset, MM's saved work rescheduled
+rescheduleMm()
+''',
+    # A HW poll timeout inside the forced idle (hal_machw_reset/rxl/txl_reset).
+    "forced_idle_timeout": r'''
+forceFailed = true
+settle()
+doAssert chanSw.phase == swQueued and requestLinked() and mmState != HW_ACTIVE
+forceFailed = false
+''',
+    # The kernel drops the request (it is never freed): the switch is
+    # abandoned and the dwell goes back to its gate, which fires again.
+    "request_dropped": r'''
+ke_msg_free(co_list_pop_front(addr keMsgQueueSent))
+doAssert chanSw.phase == swNone and channelEnv.scheduledCtxt == nil
+doAssert (channelEnv.flags and 0x1E) == 0x12 and gates == 1, "dwell not returned to its gate"
+chanConnlessDelayEvent()
+''',
+}
+
+
+@pytest.mark.parametrize("home", [False, True], ids=["disconnected", "connected"])
+@pytest.mark.parametrize("drop", DWELL_DROPS)
+def test_dropped_dwell_switch_still_starts_the_dwell(tmp_path: Path, drop: str, home: bool) -> None:
+    """SCAN-N1: TASK_SCAN waits in state 2 for START; only the dwell switch
+    can deliver it. A switch that cannot proceed is retried after the MAC
+    recovery or returned to the connectionless gate; END is never posted
+    for a dwell that was not entered."""
+    run_program(tmp_path, "checked", dwell_switch_source() + f"admitScan({str(home).lower()})\n"
+                + r'''
+chanConnlessDelayEvent()             # the gate fires: 0x02 -> 0x08, switch to slot 3
+doAssert (channelEnv.flags and 0x0A) == 0x08 and chanSw.phase == swQueued
+''' + DWELL_DROPS[drop] + r'''
+settle()
+doAssert MM_SCAN_CHANNEL_END_IND notin notices
+doAssert dwellStarted(), "the scan dwell never started"
+doAssert idleSwitch() and mmState == MM_ACTIVE_STATE
+finishSwitch()
+''')

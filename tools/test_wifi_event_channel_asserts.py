@@ -100,7 +100,6 @@ proc chanSwitchCancel(p: pointer) = actions.add("cancel")
 proc chan_conn_less_delay_prog() = actions.add("delay")
 proc chan_switch_start(p: pointer) =
   actions.add(if p == (addr contexts[4]): "roc" else: "scan")
-proc chanStartConnlessSwitch(p: pointer) = chan_switch_start(p)
 proc mm_timer_clear(p: pointer) = actions.add("clear")
 proc c_memcpy(dst, src: pointer; count: csize_t): pointer =
   copyMem(dst, src, count.int)
@@ -276,7 +275,7 @@ var request = ChanScanReqPayload(vifIdx: 1, duration: 8192, prim20Freq: 2437,
                                  center1Freq: 2437, txPower: 17)
 let original = request
 chan_scan_req(addr request)
-doAssert assertions.len == 0 and actions == @["cancel", "delay"]
+doAssert assertions.len == 0 and actions == @["delay"] # slot 3 was free: no switch to cancel
 doAssert scan.slot == 3 and scan.vifIdx == 255 and scan.requestVifIdx == 1
 doAssert scan.durationTicks == 8 and scan.active == 1 and scan.channel.primFreq == 2437
 doAssert scan.channel.txPower == 17 and env.flags == 2 and chanScanPending

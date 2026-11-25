@@ -7070,6 +7070,73 @@ Host tests are in `tools/test_wifi_sm_audit_sm_connect.py` and
 `tools/test_wifi_sm_audit_scan.py`. The M0 HTTP server manifest built;
 none of this was flashed.
 
+#### Channel switch
+
+`chan_switch_start` begins a switch and `chanSwitchFinish`
+(`channel_switch.nim`) is its only end: `chan_pre_switch_channel` calls it
+when it publishes the target, and every abandonment calls it too. A
+context is identified by its slot and `chanCtxtEpochs[slot]`; a retired
+context ends a switch to it at `chan_ctxt_del`, so the callbacks carry no
+other identity. This fixes audit items MMCHAN-1 to MMCHAN-4, MMCH-S1,
+MMCH-S2 and SCAN-N1. Differences from the archive:
+
+- The switch's `MM_FORCE_IDLE_REQ` is one static message, never freed:
+  `mm_force_idle_req_handler` returns `KeMsgNoFree` for it and `ke_msg_free`
+  ignores it. `chan_switch_start` therefore cannot fail; pinned
+  `chan.o:chan_switch_start` uses `ke_msg_alloc`, which asserts on failure.
+  While the message is queued or saved, a new switch reuses it.
+- When MM runs it, `chanSwitchLanded` serves what the switch needs then
+  (start the departure, or a deferred departure) and always leaves
+  `HW_ACTIVE` through `mm_back_to_host_idle`. A message that lands after
+  its switch was abandoned only hands MM back. Pinned `chan_goto_idle_cb`
+  returns at +0x30 when no context is scheduled, leaving MM in `HW_ACTIVE`.
+- Protection confirmations count with any status, as in `chan.o`. The
+  frames carry the departure attempt's generation as their callback
+  argument instead of 0, so a confirmation from an earlier attempt (flushed
+  by a timed-out departure's forced idle, or late) counts for nothing.
+  Frames are counted before submission and uncounted if refused; frames
+  that finish during submission only count. The blob stores the counts
+  after both loops.
+- When the last confirmation comes from a TX reset's drain (`bl_reset_evt`),
+  the departure is not run inside the reset: it is re-posted to MM in the
+  same message. The blob calls `mm_force_idle_req` and
+  `chan_pre_switch_channel` from inside the flush; the port refuses a
+  nested `txl_reset`.
+- A forced idle that fails (a HW poll timeout; the blob's waits have no
+  timeout) does not retune. The switch asks MM again after the recovery it
+  posted. A MAC that is not idle in MM_IDLE still hits the 1013 assert, but
+  the request stays saved instead of being dropped; `bl_reset_evt`
+  reschedules MM's saved messages.
+- An abandoned switch (its destination retired with no context left, or
+  its message dropped) puts the destination back to status 1, clears the
+  operation timer, clears the PM bit that its protection set, and leaves
+  `HW_ACTIVE`. A scan or ROC dwell that was never entered goes from 0x08
+  back to 0x02 (0x04 to 0x01) and the connectionless gate is armed again,
+  so TASK_SCAN, waiting in state 2 for START, gets its dwell later. No END
+  is posted for a dwell that was never entered. The blob never abandons a
+  switch.
+- Retiring the source context only clears `currentCtxt`; the switch
+  continues, as in the blob. The port used to cancel it.
+- `chan_pre_switch_channel` with no target ends the switch; the blob
+  returns at +0x21c with MM in `HW_ACTIVE`. The port-only RX drain is kept;
+  if it retires or replaces the target, the switch is abandoned. The
+  vendor tail after the retune runs without re-checks and always reaches
+  `mm_active`.
+- In-place TPC or bandwidth edits no longer invalidate the switch, the
+  operation and TBTT timers, or a beacon-detect ROC request. The blob has
+  no such checks; the port's had compared the whole channel definition.
+- `chan_scan_req` no longer cancels a switch to slot 3 (none can exist
+  while the slot is free), the connectionless gate calls
+  `chan_switch_start` directly (its allocation retry is gone), and MM no
+  longer tracks the switch's idle wait: MM is restored when the message
+  lands.
+
+Host tests: `tools/test_wifi_switch_request.py`,
+`tools/test_wifi_channel_protection.py`,
+`tools/test_wifi_sm_audit_mm_chan.py` and
+`tools/test_wifi_sm_audit_scan.py`. The M0 HTTP server manifest built;
+none of this was flashed.
+
 ## BLE
 
 - Local controller path: `src/bl808/libbtblecontroller_bl808_ble1m0s1bredr0.a`

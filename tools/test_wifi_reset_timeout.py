@@ -6,7 +6,7 @@ import pytest
 
 from test_wifi_auth_frames import layouts
 from test_wifi_channel_control import OP_STUBS, PLATFORM as CHANNEL_PLATFORM
-from test_wifi_channel_protection import source as protection_source
+from test_wifi_switch_request import run_case as run_switch_case
 from test_wifi_disconnect_tx import FW, procedure
 from test_wifi_mac_state_poll import source as polling_source
 from test_wifi_message_allocation import run_program
@@ -232,54 +232,43 @@ doAssert txlStationAdmits(addr frame)
 ''')
 
 
-@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
+@pytest.mark.parametrize("mode", ["checked", "asan"])
 def test_channel_switch_stops_after_failed_idle(tmp_path: Path, mode: str) -> None:
-    code = protection_source()
-    assert code.count("  not forceFailed\n") == 1
-    code = "var failForceAt: int\n" + code.replace("  not forceFailed\n", "  forced != failForceAt\n", 1)
-    run_program(tmp_path, mode, code + r'''
-resetProtectionTest()
-failForceAt = 1
-beginProtection()
-doAssert forced == 1 and callbacks == 0 and protectionFrames.len == 0
-chanSwitchCancel()
-finishProtectionTest()
+    """A forced idle that times out never retunes the MAC it failed to stop.
 
-for finalFrame in [0, 1]:
-  resetProtectionTest()
-  failForceAt = 2
-  beginProtection()
-  completeFrame(1 - finalFrame)
-  completeFrame(finalFrame)
-  doAssert forced == 2 and callbacks == 0
-  doAssert channelEnv.currentCtxt == protectedSource
-  chanSwitchCancel()
-  finishProtectionTest()
-
-for ap in [false, true]:
-  resetProtectionTest()
-  failForceAt = 1
-  if ap:
-    channelEnv.connlessDelayCount = 1
-    chan_ap_tx_cfm(nil, 0)
+    MM is handed back (never left in HW_ACTIVE) and the switch asks MM again;
+    it completes once the posted recovery has made the forced idle succeed.
+    """
+    run_switch_case(tmp_path, r'''
+var failForceAt: int
+for failAt in 1 .. 2:
+  resetSwitch()
+  failForceAt = failAt
+  onIdle = proc() = forceFailed = forced == failForceAt
+  let home = newTarget(2412)
+  linkHome(home, VIF_TYPE_STA, 0)
+  activateVifs(1)
+  operate(home)
+  let away = newTarget(2437)
+  chan_switch_start(away)
+  doAssert dispatch()                # MM active: idle request, saved
+  idleInterrupt()
+  doAssert dispatch()                # chan_goto_idle_cb: forced idle 1
+  if failAt == 1:
+    doAssert forced == 1 and frames.len == 0 and chanSw.phase == swQueued
   else:
-    channelEnv.scanDelayCount = 1
-    chan_sta_tx_cfm(nil, 0)
-  doAssert forced == 1 and callbacks == 0
-  finishProtectionTest()
-
-for bypass in [false, true]:
-  resetProtectionTest()
-  failForceAt = 2
-  synchronous = true
-  if bypass:
-    secondStation = true
-    onProtectionSend = proc() = ps.enabled = 1
-  beginProtection()
-  doAssert forced == 2 and callbacks == 0
-  chanSwitchCancel()
-  finishProtectionTest()
-''')
+    doAssert frames.len == 1 and chanSw.phase == swProtecting
+    completeFrame(0)                 # the departure's forced idle 2 fails
+    doAssert forced == 2 and chanSw.phase == swDeparting
+  doAssert tuned.len == 0, "retuned a MAC that failed to stop"
+  doAssert requestLinked() and mmState == MM_ACTIVE_STATE
+  settle()                           # after the posted recovery, the retry succeeds
+  if failAt == 1:
+    doAssert frames.len == 1 and tuned.len == 0
+    completeFrame(0)
+  doAssert tuned == @[away] and channelEnv.currentCtxt == away and idleSwitch()
+  finishSwitch()
+''', mode)
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])

@@ -147,12 +147,8 @@ proc setup(index = 4; irq = true) =
 
 def source() -> str:
     kernel = (FW / "kernel_mac_channel.nim").read_text()
-    switch = (FW / "channel_switch.nim").read_text()
-    context = re.search(r"(?ms)^  ChanSwitchContext = object.*?(?=^  ChanSwitchTag)", switch).group()
     code = layouts("ChanCtxtDefView", "ChanScanPoolOverlay", "ChanScanReqPayload",
-                   "ChanRocOverlay", "MmRemainOnChannelReqPayload") + "type\n" + context + PLATFORM
-    for name in ("chanSwitchCapture", "chanSwitchContextCurrent"):
-        code += procedure(switch, name)
+                   "ChanRocOverlay", "MmRemainOnChannelReqPayload") + PLATFORM
     code += procedure(kernel, "chanScanDurationTicks")
     code += re.search(r"(?ms)^template chanScanChannel\(.*?(?=^proc )", kernel).group()
     for name in ("chan_scan_req", "chan_roc_req", "chanCtxtOpEvent", "chan_ctxt_op_evt"):
@@ -161,15 +157,6 @@ def source() -> str:
 
 
 CASES = {
-    "switch_capture": r'''
-for index in [3, 4]:
-  setup(index)
-  let captured = chanSwitchCapture(addr contexts[index])
-  doAssert captured.captured and chanSwitchContextCurrent(captured)
-  inc chanCtxtEpochs[index]
-  doAssert not chanSwitchContextCurrent(captured), "old switch accepted a reused reserved slot"
-  doAssert chanSwitchContextCurrent(chanSwitchCapture(addr contexts[index]))
-''',
     "slot_creation": r'''
 for index in [3, 4]:
   setup(index)
@@ -280,17 +267,15 @@ chan_ctxt_op_evt(nil)
 chan_ctxt_op_evt(cast[pointer](1))
 doAssert actions.len == 0 and interrupts
 ''',
-    "scan_cancel_replacement": r'''
+    # Slot 3 is free (its retirement ended any switch to it), so admission
+    # has no switch to cancel.
+    "scan_admission_cancels_nothing": r'''
 setup(3)
-var snapshot: tuple[value: ChanScanPoolOverlay, environment: Environment]
-onCancel = proc() =
-  inc chanCtxtEpochs[3]
-  scan = ChanScanPoolOverlay(slot: 3, durationTicks: 77, requestVifIdx: 1)
-  env.flags = 0x94
-  snapshot = (scan, env)
+let epoch = chanCtxtEpochs[3]
 var request = ChanScanReqPayload(duration: 8192, prim20Freq: 2462)
 chan_scan_req(addr request)
-doAssert (scan, env) == snapshot and actions == @["cancel"]
+doAssert actions == @["delay"] and scan.slot == 3 and chanCtxtEpochs[3] == epoch + 1
+doAssert (env.flags and 0x02) != 0 and scan.channel.primFreq == 2462
 ''',
     "same_slot_state_change": r'''
 for change in 0 .. 3:

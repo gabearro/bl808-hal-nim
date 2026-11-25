@@ -71,7 +71,7 @@ proc mmTimerSetLocked(p: pointer; target, saved: uint32) =
   try: mm_timer_set(p, target)
   finally: discard irqSave()
 proc chanCtxtForIdx(index: uint8): pointer = cast[pointer](index.uint + 1)
-proc chanStartConnlessSwitch(p: pointer) =
+proc chan_switch_start(p: pointer) =
   if checkSwitchIrq: doAssert not enabled
   inc switches
 proc assert_err(a, b: cstring; line: cint) = doAssert false

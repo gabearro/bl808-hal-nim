@@ -343,7 +343,7 @@ proc ke_evt_set(bits: uint32) =
     for name in ("mmTimCaptureMessage", "smAbortCaptureMessage", "chanUpdateCaptureMessage",
                  "mmTimForget", "mmConnLossForget", "rxMgtForget", "smCleanupForget", "smBssForget",
                  "smActivationForget", "smScanForget", "smRegistrationForget",
-                 "chanSwitchForget", "chanUpdateForget", "smRspTimerForget",
+                 "chanUpdateForget", "smRspTimerForget",
                  "smDeferredForget", "smAbortForget", "chanBcnRequestForget"):
         support += f"proc {name}(p: pointer) = discard\n"
     support += procedure(kernel, "co_list_push_back")

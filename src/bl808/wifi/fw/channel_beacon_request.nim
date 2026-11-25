@@ -27,15 +27,14 @@ proc chanBcnRequestReleasePending(tag: ptr ChanBcnRequestTag; clearFlag: bool) =
       env.flags = env.flags and not 0x40'u8
 
 proc chanBcnRequestCurrent(tag: ptr ChanBcnRequestTag): bool =
+  ## The context is its lease (slot and epoch); its definition may be updated.
   if not mmStaOwnerCurrent(tag.identity) or
       not chanLeaseCurrent(tag.lease) or
       tag.identity.station >= STA_INFO_TAB_ENTRIES.uint8:
     return false
   let sta = staInfoForIdx(tag.identity.station)
   sta.valid != 0 and sta.instNbr == tag.identity.index and
-    sta.initialRateConfig == tag.interval and
-    chanCtxtForIdx(tag.lease.index).channel == tag.request.channel and
-    chanEnvView().ctxtCount > 1
+    sta.initialRateConfig == tag.interval and chanEnvView().ctxtCount > 1
 
 proc chanBcnRequestAllocate(identity: MmVifIdentity; lease: ChanCtxtLease;
                            channel: ChanCtxtDefView; interval, resetEpoch: uint32): pointer =

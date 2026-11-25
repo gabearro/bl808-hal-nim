@@ -1019,36 +1019,31 @@ proc mm_force_idle_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Previous Nim inserted a ke_msg_alloc + ke_msg_send MM_FORCE_IDLE_CFM
   ## at the state==0 path that the blob never issues. The blob's "status"
   ## is returned only via the callback (s0 return value is 0 on success).
-  if param == nil or keMsgHdrFromPayload(param).paramLen < 4 or
-      not chanSwitchAdmit(param): return KeMsgConsumed
+  ##
+  ## Port: the channel switch's request is static and is never freed
+  ## (chanSwitchTake). A MAC that is not idle in MM_IDLE asserts as in the
+  ## blob, but the request stays saved instead of being dropped; the posted
+  ## recovery reschedules MM's saved messages.
+  if param == nil or keMsgHdrFromPayload(param).paramLen < 4: return KeMsgConsumed
   let state = ke_state_get(TASK_MM)
   if state == MM_IDLE.uint16:
-    let hwState = regRead(MACHW_STATE_CNTRL_REG) and 0xF'u32
-    if not chanSwitchAdmit(param): return KeMsgConsumed
-    if hwState != 0:
+    if (regRead(MACHW_STATE_CNTRL_REG) and 0xF'u32) != 0:
       assert_err("blmac_current_state_getf() == HW_IDLE", "module", 1013)
-      return KeMsgConsumed
+      return KeMsgSaved
+    let consumed = chanSwitchTake(param)
     mmConfigCancelIdle()
     ke_state_set(TASK_MM, HW_ACTIVE.uint16)
-    if not chanSwitchAdmit(param): return KeMsgConsumed
-    if chanSwitchInvoke(param): return KeMsgConsumed
     let callbackPtr = cast[ptr pointer](param)[]
     if callbackPtr != nil:
       cast[proc() {.cdecl.}](callbackPtr)()
-    return KeMsgConsumed
+    return consumed
   elif state == MM_GOING_TO_IDLE.uint16:
     return KeMsgSaved
   else:
     let saved = irqSave()
     defer: irqRestore(saved)
-    let epoch = chanSwitchTrackIdle(param, state)
-    if not chanSwitchAdmit(param) or mmConfigIdle.epoch != epoch or
-        ke_state_get(TASK_MM) != state:
-      return KeMsgConsumed
     hal_machw_idle_req()
-    if mmConfigIdle.epoch != epoch: return KeMsgConsumed
     ke_state_set(TASK_MM, MM_GOING_TO_IDLE)
-    if not chanSwitchAdmit(param): return KeMsgConsumed
     return KeMsgSaved
 
 proc mm_remain_on_channel_req_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
@@ -3590,7 +3585,7 @@ proc chan_get_next_chan*(): pointer {.exportc, cdecl.} =
     assert_err("chan.c", "chan.c", 414)
   return best
 
-proc chanStartSwitch(chanCtxt: pointer; allocationFailed: var bool) =
+proc chan_switch_start*(chanCtxt: pointer) {.exportc, cdecl.} =
   ## Start channel switch (130 bytes in blob, 33 instrs).
   ## From blob (chan.o): if chanCtxt == current_channel(32): checks
   ## chan_env[124] (count>1) and current_channel[23] (type<=2), if ok
@@ -3598,6 +3593,8 @@ proc chanStartSwitch(chanCtxt: pointer; allocationFailed: var bool) =
   ## checks pending(36) not nil -> return. Stores chanCtxt to pending,
   ## calls chan_upd_ctxt_status(chanCtxt, 2), allocs msg (id=74, 4 bytes),
   ## stores callback pointer, sets chan_env[123]=1, tail-calls ke_msg_send.
+  ## Port: the request is the switch's static message, so a start cannot
+  ## fail for lack of memory (the blob asserts in ke_msg_alloc instead).
   let saved = irqSave()
   defer: irqRestore(saved)
   let env = chanEnvView()
@@ -3614,70 +3611,11 @@ proc chanStartSwitch(chanCtxt: pointer; allocationFailed: var bool) =
     chan_upd_ctxt_status(chanCtxt, 4)
     return
   # Different channel: check if another switch is pending
-  let pendCtxt = env.scheduledCtxt
-  if pendCtxt != nil:
+  if env.scheduledCtxt != nil or chanSwitchSlot(chanCtxt) < 0:
     return
-  # Do not publish a pending switch unless its idle request can be queued.
-  var msg = chanSwitchAllocate(chanCtxt)
-  defer:
-    if msg != nil: ke_msg_free(keMsgHdrFromPayload(msg))
-  if msg == nil:
-    allocationFailed = true
-    return
-  if env.scheduledCtxt != nil: return
   env.scheduledCtxt = chanCtxt
-  env.switchPending = 1
-  if not chanSwitchPublish(msg):
-    if env.scheduledCtxt == chanCtxt: env.scheduledCtxt = nil
-    env.switchPending = 0
-    return
   chan_upd_ctxt_status(chanCtxt, 2)
-  if not chanSwitchAdmit(msg): return
-  let outgoing = msg
-  msg = nil
-  ke_msg_send(outgoing)
-
-proc chan_switch_start*(chanCtxt: pointer) {.exportc, cdecl.} =
-  var allocationFailed = false
-  chanStartSwitch(chanCtxt, allocationFailed)
-
-proc chanStartConnlessSwitch(target: pointer) =
-  # The consumed gate timer promoted exactly one of the two reserved slots.
-  # Only allocation failure needs retry; stale or already scheduled switches do not.
-  let env = chanEnvView()
-  let owner = chanSwitchCapture(target)
-  let timer = chanConnLessDelayTimer()
-  let serial = chanTimerCapture(timer)
-  let generation = chanConnlessGeneration
-  let resetEpoch = txResetEpoch
-  let previous = env.currentCtxt
-  var allocationFailed = false
-  chanStartSwitch(target, allocationFailed)
-  if not allocationFailed or owner.status != 1 or owner.index notin {3'u8, 4'u8}: return
-
-  let active = if owner.index == 3: 0x08'u8 else: 0x04'u8
-  let pending = active shr 2
-  template stillOwnsGate(): bool =
-    chanConnlessGeneration == generation and txResetEpoch == resetEpoch and
-      chanTimerCapture(timer) == serial and chanSwitchContextCurrent(owner) and
-      chanCtxtAt(target).status == 1 and env.currentCtxt == previous and
-      env.scheduledCtxt == nil and env.switchPending == 0 and
-      (env.flags and (0x1C'u8 or pending)) == (0x10'u8 or active)
-  if not stillOwnsGate(): return
-  # A disconnected scan's normal delay is zero. Give the allocator time before
-  # trying again, using one normal 30 ms gate interval even with no home channel.
-  let deadline = regRead(MACHW_TIMLO_REG) + 30_000'u32
-  if not stillOwnsGate(): return
-  env.flags = (env.flags and not active) or pending
-  inc chanConnlessGeneration
-  let retryGeneration = chanConnlessGeneration
-  defer:
-    if chanConnlessGeneration == retryGeneration and txResetEpoch == resetEpoch and
-        chanSwitchContextCurrent(owner) and
-        (env.flags and (0x1C'u8 or pending)) == (0x10'u8 or pending) and
-        not chanConnlessTimerPending(retryGeneration):
-      env.flags = env.flags and not 0x10'u8
-  mm_timer_set(timer, deadline)
+  if env.scheduledCtxt == chanCtxt: chanSwitchBegin()
 
 proc chan_tbtt_schedule*(tbttEntry: pointer) {.exportc, cdecl.} =
   ## Insert/update a TBTT, advance displaced nodes by their beacon periods,
@@ -3780,17 +3718,32 @@ proc chan_goto_idle_cb*() {.exportc, cdecl.} =
   ##   sends self-CTS via txl_frame_send_selfcts_frame.
   ## If any frames sent: chan_upd_ctxt_status(chan_ctxt, 3) then tail-call mm_active().
   ## Otherwise: tail-call chan_pre_switch_channel().
-  if not chanSwitchCallbackCurrent(): return
+  ##
+  ## Port: runs for a queued switch (from its request) and again when the
+  ## departure's protection times out (chan_ctxt_op_evt). Each run is a new
+  ## protection generation. Frames are counted before they are sent, a
+  ## refused one is uncounted, and frames that finish while this is still
+  ## sending only count (chanSw.building); the tail then waits or departs.
+  ## A PS-enabled STA ends sending early, as in the blob, but frames already
+  ## sent are still waited for. A failed forced idle asks MM again after the
+  ## recovery it posted.
   let env = chanEnvView()
   # Clear CCA busy flag
   env.switchPending = 0
   # Check if channel context exists
   let chanCtxt = env.scheduledCtxt
-  if chanCtxt == nil:
+  if chanCtxt == nil or chanSw.phase notin {swQueued, swProtecting}:
     return
+  chanProtectionBegin()
+  let serial = chanSw.serial
+  template ended(): bool = chanSw.serial != serial
   # Force idle
-  if not chanForceIdleForDeparture(chanCtxt): return
-  if not chanSwitchCallbackCurrent(): return
+  if not chanForceIdle():
+    if not ended(): chanSwitchSend()
+    return
+  if ended():
+    mmLeaveHwActive()
+    return
   # Check current channel and flags
   let curChan = env.currentCtxt
   if curChan == nil or (env.flags and 0x20) != 0:
@@ -3798,96 +3751,72 @@ proc chan_goto_idle_cb*() {.exportc, cdecl.} =
     chan_pre_switch_channel()
     return
   let curChanAddr = cast[uint](curChan)
+  chanSw.phase = swProtecting
+  chanSw.building = true
+  chanSw.pmSet = true
   # Set power management flag
   blmac_pwr_mgt_setf(1)
-  if not chanSwitchCallbackCurrent(): return
-  let protection = chanProtectionBegin()
-  if protection == 0: return
-  let source = chanProtection.source
+  let token = chanProtectionToken()
+  var accepted = false
+  template protect(pending: untyped; send: untyped) =
+    # The old channel must admit these frames before the new one starts.
+    let current = chanCtxtAt(curChan)
+    let oldStatus = current.status
+    current.status = 6
+    inc pending
+    let refused = send != 0
+    if current.status == 6: current.status = oldStatus
+    if ended(): return
+    if refused: dec pending
+    else: accepted = true
   var selfctsDurationMs = 0'u16
   let ps = psEnvView()
-  # Loop 1: iterate STA VIFs and send null frames
   let vifMgmt = vifMgmtEnvView()
-  var vifNode = cast[pointer](vifMgmt.activeList.first)
-  while vifNode != nil:
-    let vif = vifChannelAt(cast[pointer](vifNode))
-    let vifType = vif.vifType
-    let vifChanCtxt = vif.chanCtxt
-    if vifType == VIF_TYPE_STA and vifChanCtxt != nil:
-      let durationMs = (chanCtxtAt(vifChanCtxt).schedSlot.uint32 shl 10) div 1000
-      selfctsDurationMs = (durationMs and 0xFFFF'u32).uint16
-      # STA VIF with channel context
-      if cast[uint](vifChanCtxt) == curChanAddr:
-        let active = vif.state
-        let staIdx = vif.staIdx
-        if active != 0 and staIdx < STA_INFO_TAB_ENTRIES.uint8:
-          if ps.enabled != 0 and (ps.statusFlags and 8) == 0:
-            let outcome = chanProtectionFinishBuild(protection)
-            if outcome == 1:
-              chan_upd_ctxt_status(chanCtxt, 3)
-              if not chanSwitchCallbackCurrent() or not chanProtectionCurrent(protection):
-                chanProtectionCancelSerial(protection)
-                return
-              mm_active()
-            if outcome == 2 and not chanForceIdle(): return
-            if outcome in [0, 2]:
-              if not chanSwitchCallbackCurrent() or not chanProtectionCurrent(protection):
-                chanProtectionCancelSerial(protection)
-                return
-              chanProtectionResume(protection)
-            return
-          # The old channel must admit these frames before the new one starts.
-          let current = chanCtxtAt(curChan)
-          let oldStatus = current.status
-          let ticket = chanProtectionReserve(protection, false)
-          if ticket == 0: return
-          current.status = 6
-          let sent = txl_frame_send_null_frame(staIdx, cast[pointer](chan_sta_tx_cfm), ticket)
-          if chanSwitchContextCurrent(source, checkDefinition = false) and current.status == 6:
-            current.status = oldStatus
-          if not chanProtectionSubmitted(protection, ticket, sent == 0): return
-          if not chanSwitchCallbackCurrent() or not chanProtectionCurrent(protection): return
-    vifNode = vif.next
-  # Loop 2: iterate AP VIFs and send self-CTS
-  vifNode = cast[pointer](vifMgmt.activeList.first)
-  while vifNode != nil:
-    let vif = vifChannelAt(cast[pointer](vifNode))
-    let vifType = vif.vifType
-    let vifChanCtxt = vif.chanCtxt
-    if vifType == VIF_TYPE_AP and vifChanCtxt != nil:
-      if cast[uint](vifChanCtxt) == curChanAddr and env.ctxtCount == 2 and
-          selfctsDurationMs != 0:
-        let active = vif.state
-        if active != 0:
-          if vif.postponedStaHead != nil:
-            let current = chanCtxtAt(curChan)
-            let oldStatus = current.status
-            let ticket = chanProtectionReserve(protection, true)
-            if ticket == 0: return
-            current.status = 6
-            let sent = txl_frame_send_selfcts_frame(
-              vifNode, selfctsDurationMs, cast[pointer](chan_ap_tx_cfm), ticket)
-            if chanSwitchContextCurrent(source, checkDefinition = false) and current.status == 6:
-              current.status = oldStatus
-            if not chanProtectionSubmitted(protection, ticket, sent == 0): return
-            if not chanSwitchCallbackCurrent() or not chanProtectionCurrent(protection): return
-    vifNode = vif.next
-  let outcome = chanProtectionFinishBuild(protection)
-  if outcome < 0: return
-  if outcome == 1:
+  block build:
+    # Loop 1: iterate STA VIFs and send null frames
+    var vifNode = cast[pointer](vifMgmt.activeList.first)
+    while vifNode != nil:
+      let vif = vifChannelAt(cast[pointer](vifNode))
+      let vifType = vif.vifType
+      let vifChanCtxt = vif.chanCtxt
+      if vifType == VIF_TYPE_STA and vifChanCtxt != nil:
+        let durationMs = (chanCtxtAt(vifChanCtxt).schedSlot.uint32 shl 10) div 1000
+        selfctsDurationMs = (durationMs and 0xFFFF'u32).uint16
+        # STA VIF with channel context
+        if cast[uint](vifChanCtxt) == curChanAddr:
+          let active = vif.state
+          let staIdx = vif.staIdx
+          if active != 0 and staIdx < STA_INFO_TAB_ENTRIES.uint8:
+            if ps.enabled != 0 and (ps.statusFlags and 8) == 0:
+              break build
+            protect(env.scanDelayCount,
+                    txl_frame_send_null_frame(staIdx, cast[pointer](chan_sta_tx_cfm), token))
+      vifNode = vif.next
+    # Loop 2: iterate AP VIFs and send self-CTS
+    vifNode = cast[pointer](vifMgmt.activeList.first)
+    while vifNode != nil:
+      let vif = vifChannelAt(cast[pointer](vifNode))
+      let vifType = vif.vifType
+      let vifChanCtxt = vif.chanCtxt
+      if vifType == VIF_TYPE_AP and vifChanCtxt != nil:
+        if cast[uint](vifChanCtxt) == curChanAddr and env.ctxtCount == 2 and
+            selfctsDurationMs != 0:
+          let active = vif.state
+          if active != 0:
+            if vif.postponedStaHead != nil:
+              protect(env.connlessDelayCount, txl_frame_send_selfcts_frame(
+                vifNode, selfctsDurationMs, cast[pointer](chan_ap_tx_cfm), token))
+      vifNode = vif.next
+  chanSw.building = false
+  if env.scanDelayCount != 0 or env.connlessDelayCount != 0:
     # Frames sent: mark context as PAUSED and reactivate
-    chan_upd_ctxt_status(chanCtxt, 3)
-    if not chanSwitchCallbackCurrent() or not chanProtectionCurrent(protection):
-      chanProtectionCancelSerial(protection)
-      return
+    chan_upd_ctxt_status(env.scheduledCtxt, 3)
     mm_active()
+  elif accepted:
+    # Every frame finished while it was being sent.
+    chanSwitchDepart()
   else:
-    if outcome == 2:
-      if not chanForceIdle(): return
-      if not chanSwitchCallbackCurrent() or not chanProtectionCurrent(protection):
-        chanProtectionCancelSerial(protection)
-        return
-    chanProtectionResume(protection)
+    chan_pre_switch_channel()
 
 proc chanConnLessDelay(flags, ctxtCount, scanChannel: uint8; hasAp: bool): uint32 {.inline.} =
   const DelayUnit = 0x7530'u32
@@ -3984,61 +3913,19 @@ proc chan_conn_less_delay_prog*() {.exportc, cdecl.} =
 
 proc chan_ap_tx_cfm*(param: pointer, status: uint32) {.exportc, cdecl.} =
   ## TX confirmation for AP mode channel management (17 instrs).
-  ## Retune only after all AP and STA protection completions have arrived.
+  ## Blob: decrement chan_env[122]; at zero with [121] zero, force idle and
+  ## pre-switch. Any status counts, a TX reset's flush included.
   let saved = irqSave()
   defer: irqRestore(saved)
-  if not txlFrameCallbackCurrent():
-    chanProtectionAbandon(param)
-    return
-  if chanProtectionTagged(param) or chanProtectionActive():
-    var serial: uint32
-    if chanProtectionComplete(param, true, serial):
-      let frameEpoch = txResetEpoch
-      if not chanForceIdle(): return
-      if not txlFrameCallbackCurrent(frameEpoch) or not chanProtectionCurrent(serial):
-        chanProtectionCancelSerial(serial)
-        return
-      chanProtectionResume(serial)
-    return
-  let env = chanEnvView()
-  let pending = env.connlessDelayCount
-  if pending == 0: return
-  let newPending = pending - 1
-  env.connlessDelayCount = newPending
-  if newPending == 0 and env.scanDelayCount == 0:
-    let frameEpoch = txResetEpoch
-    if not chanForceIdle(): return
-    if not txlFrameCallbackCurrent(frameEpoch): return
-    chan_pre_switch_channel()
+  chanProtectionDone(param, chanEnvView().connlessDelayCount)
 
 proc chan_sta_tx_cfm*(param: pointer, status: uint32) {.exportc, cdecl.} =
   ## TX confirmation for STA mode channel management (17 instrs).
-  ## Retune only after all STA and AP protection completions have arrived.
+  ## Blob: decrement chan_env[121]; at zero with [122] zero, force idle and
+  ## pre-switch. Any status counts, a TX reset's flush included.
   let saved = irqSave()
   defer: irqRestore(saved)
-  if not txlFrameCallbackCurrent():
-    chanProtectionAbandon(param)
-    return
-  if chanProtectionTagged(param) or chanProtectionActive():
-    var serial: uint32
-    if chanProtectionComplete(param, false, serial):
-      let frameEpoch = txResetEpoch
-      if not chanForceIdle(): return
-      if not txlFrameCallbackCurrent(frameEpoch) or not chanProtectionCurrent(serial):
-        chanProtectionCancelSerial(serial)
-        return
-      chanProtectionResume(serial)
-    return
-  let env = chanEnvView()
-  let pending = env.scanDelayCount
-  if pending == 0: return
-  let newPending = pending - 1
-  env.scanDelayCount = newPending
-  if newPending == 0 and env.connlessDelayCount == 0:
-    let frameEpoch = txResetEpoch
-    if not chanForceIdle(): return
-    if not txlFrameCallbackCurrent(frameEpoch): return
-    chan_pre_switch_channel()
+  chanProtectionDone(param, chanEnvView().scanDelayCount)
 
 # --- TX/RX Functions ---
 

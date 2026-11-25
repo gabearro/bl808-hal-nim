@@ -16,8 +16,6 @@ CALLBACKS = {
     "sm_disconnect_deauth_cfm": "scan_station_ap_me.nim",
     "sm_connect_abort_deauth_cfm": "scan_station_ap_me.nim",
     "sm_supplicant_deauth_cfm": "task_handlers.nim",
-    "chan_ap_tx_cfm": "task_handlers.nim",
-    "chan_sta_tx_cfm": "task_handlers.nim",
     "ps_disable_cfm": "power_save.nim",
     "ps_enable_cfm": "power_save.nim",
     "mm_ap_traffic_probe_cfm": "power_save.nim",
@@ -28,13 +26,6 @@ PLATFORM = SESSION_PLATFORM + r"""
 proc smTxCallbackCurrent(): bool = true
 proc smClaimFlushedDisconnect(p: pointer): bool = false
 proc smClaimFlushedSupplicantDeauth(p: pointer): bool = false
-proc chanProtectionTagged(p: pointer): bool = false
-proc chanProtectionActive(): bool = false
-proc chanProtectionComplete(p: pointer; ap: bool; serial: var uint32): bool = false
-proc chanProtectionCurrent(serial: uint32): bool = false
-proc chanProtectionResume(serial: uint32) = discard
-proc chanProtectionAbandon(p: pointer) = discard
-proc chanProtectionCancelSerial(serial: uint32) = discard
 type
   Vif = object
     beaconTimeoutBase: uint32
@@ -104,8 +95,7 @@ proc resetProtocol() =
 CHECKS = r"""
 let protocolCallbacks = [
   cast[pointer](sm_disconnect_deauth_cfm), cast[pointer](sm_connect_abort_deauth_cfm),
-  cast[pointer](sm_supplicant_deauth_cfm), cast[pointer](chan_ap_tx_cfm),
-  cast[pointer](chan_sta_tx_cfm), cast[pointer](ps_disable_cfm),
+  cast[pointer](sm_supplicant_deauth_cfm), cast[pointer](ps_disable_cfm),
   cast[pointer](ps_enable_cfm), cast[pointer](mm_ap_traffic_probe_cfm),
   cast[pointer](mm_ap_probe_cfm)]
 for callback in protocolCallbacks:
@@ -231,21 +221,6 @@ for callback in [cast[pointer](ps_enable_cfm), cast[pointer](ps_disable_cfm)]:
   queueCallback(callback, 0x80800000'u32)
   doAssert ps.pendingCount == 0 and effects == 1,
     "retired confirmation finalized the replacement mode after timer clear"
-for callback in [cast[pointer](chan_ap_tx_cfm), cast[pointer](chan_sta_tx_cfm)]:
-  resetProtocol()
-  if callback == cast[pointer](chan_ap_tx_cfm): channel.scanDelayCount = 0
-  else: channel.connlessDelayCount = 0
-  onIdle = proc() =
-    discard rxInvalidateVif(0)
-    channel = (7'u8, 9'u8)
-  queueCallback(callback)
-  doAssert effects == 1 and channel == (7'u8, 9'u8),
-    "idle request restarted the VIF but stale callback continued switching"
-  resetProtocol()
-  if callback == cast[pointer](chan_ap_tx_cfm): channel.scanDelayCount = 0
-  else: channel.connlessDelayCount = 0
-  queueCallback(callback)
-  doAssert effects == 2, "the switch's own reset invalidated its completion"
 resetProtocol()
 onLog = proc() = discard rxInvalidateVif(0)
 queueCallback(cast[pointer](sm_supplicant_deauth_cfm))
@@ -342,12 +317,6 @@ def test_callback_session_scope(tmp_path: Path, release: bool, mutation: str | N
                 guard = "  if not txlFrameCallbackCurrent() and not smClaimFlushedDisconnect(param): return\n"
             if name == "sm_supplicant_deauth_cfm":
                 guard = "  if not txlFrameCallbackCurrent() and not smClaimFlushedSupplicantDeauth(param): return\n"
-            if name in ["chan_ap_tx_cfm", "chan_sta_tx_cfm"]:
-                entry_guard = ("  if not txlFrameCallbackCurrent():\n"
-                               "    chanProtectionAbandon(param)\n    return\n")
-                assert entry_guard in body
-                body = body.replace(entry_guard, "", 1)
-                guard = "  if not txlFrameCallbackCurrent(frameEpoch): return\n"
             assert body.count(guard) >= 1
             body = re.sub(r"(?m)^[ \t]+if not txlFrameCallbackCurrent\((?:frameEpoch)?\)"
                           r"(?: and not smClaimFlushed(?:Disconnect|SupplicantDeauth)\(param\))?: return\n", "", body)
@@ -373,3 +342,15 @@ def test_callback_session_scope(tmp_path: Path, release: bool, mutation: str | N
         assert result.returncode == 0, result.stdout
     else:
         assert result.returncode != 0 and "AssertionDefect" in result.stdout, result.stdout
+
+
+def test_protection_callbacks_are_owned_by_their_switch_generation() -> None:
+    """Channel protection frames finish with any status, a flush or a retired
+    VIF session included (chan.o). They are owned by the departure attempt
+    whose token they carry, not by the TX session, so the session veto that
+    guards the other protocol callbacks does not apply to them."""
+    tasks = (FW / "task_handlers.nim").read_text()
+    for name in ["chan_ap_tx_cfm", "chan_sta_tx_cfm"]:
+        body = procedure(tasks, name)
+        assert "txlFrameCallbackCurrent" not in body
+        assert "chanProtectionDone(param, " in body

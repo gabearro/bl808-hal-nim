@@ -162,7 +162,7 @@ proc mmPsModeCancel() = discard
 proc meControlReset() = discard
 proc smCleanupCancel() = discard
 proc smBssCancel() = discard
-proc chanSwitchCancel(target: pointer = nil) = discard
+proc chanSwitchReset() = discard
 proc scanDwellReset() = discard
 proc smActivationCancel() = discard
 proc smRspTimerReset() = discard

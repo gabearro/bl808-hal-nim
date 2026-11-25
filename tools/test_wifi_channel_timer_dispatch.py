@@ -50,14 +50,14 @@ for change in 1 .. 5:
   setupTbtt()
   armOperation()
   case change
-  of 1: contexts[0].channel.primFreq = 2462
+  of 1: contexts[0].channel.primFreq = 2462 # an in-place edit is not a new context
   of 2: contexts[0].status = 1
   of 3: env.currentCtxt = addr contexts[1]
   of 4: env.scheduledCtxt = addr contexts[1]
   else: contexts[0].contextIndexOrMarker = 255
   now = timers[2].expiry + 51
   mm_timer_schedule()
-  doAssert operationDelivery.len == 0
+  doAssert operationDelivery.len == (change == 1).int
 ''',
     "protection_state": r'''
 for index in 0'u8 .. 4:
@@ -83,7 +83,7 @@ for irq in [false, true]:
       let target = addr contexts[index]
       let deadline = timers[2].expiry
       let serial = chanTimerCapture(addr timers[2])
-      doAssert chanForceIdleForDeparture(target)
+      doAssert chanForceIdle()
       doAssert txResetEpoch == epoch + 1'u32 and enabled == irq
       chan_upd_ctxt_status(target, 3)
       doAssert timers[2].expiry == deadline and chanTimerCapture(addr timers[2]) == serial
@@ -116,16 +116,17 @@ for change in 0 .. 7:
       armOperation(0, 2) # same address, different timer serial and deadline
     else: discard
   failIdle = change == 0
-  doAssert chanForceIdleForDeparture(target) == (change notin [0, 1])
+  doAssert chanForceIdle() == (change notin [0, 1])
   doAssert chanTimerDispatch(addr timers[2], timers[2].callback, target, serial)
-  # A failed or repeated TX drain (0, 1) changes nothing the deadline depends
-  # on, so it is still delivered; every other change retires it.
-  doAssert operationDelivery.len == (change in [0, 1]).int
+  # A failed or repeated TX drain (0, 1) and an in-place edit of the context
+  # (4) change nothing the deadline depends on, so it is still delivered;
+  # every other change retires it.
+  doAssert operationDelivery.len == (change in [0, 1, 4]).int
   now = timers[2].expiry + 51
   mm_timer_schedule()
   # The re-armed deadlines (6, 7) carry a new serial and still describe the
   # contexts as they are, so they fire on their own schedule.
-  doAssert operationDelivery.len == (change in [0, 1, 6, 7]).int
+  doAssert operationDelivery.len == (change in [0, 1, 4, 6, 7]).int
 ''',
     "rearm_after_pop": r'''
 armOperation()

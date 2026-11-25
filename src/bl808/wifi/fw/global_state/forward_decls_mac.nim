@@ -62,16 +62,12 @@ proc chan_goto_idle_cb*() {.exportc, cdecl.}
 proc chan_sta_tx_cfm*(param: pointer, status: uint32) {.exportc, cdecl.}
 proc chan_ap_tx_cfm*(param: pointer, status: uint32) {.exportc, cdecl.}
 proc chan_switch_start*(chanCtxt: pointer) {.exportc, cdecl.}
-proc chanSwitchForget(header: pointer)
-proc chanSwitchCancel(target: pointer = nil)
+proc chanSwitchForget(header: pointer): bool
+proc chanSwitchReset()
 proc chanSwitchRetire(target: pointer)
-proc chanSwitchAllocate(target: pointer): pointer
-proc chanSwitchPublish(request: pointer): bool
-proc chanSwitchAdmit(request: pointer): bool
-proc chanSwitchInvoke(request: pointer): bool
-proc chanSwitchCallbackCurrent(): bool
+proc chanSwitchSerial(): uint32
+proc chanSwitchFinish(arrived: bool)
 proc chanHomeWakeRequest(vifEntry: pointer; home: uint8)
-proc chanSwitchSelectTarget(target: pointer): bool
 proc chanUpdateStorageLength(id: uint16; destination: uint8; length: uint32): uint32
 proc chanUpdateRegister(header: ptr KeMsgHdr)
 proc chanUpdateCaptureMessage(header: ptr KeMsgHdr)
@@ -86,10 +82,6 @@ proc chanBcnRequestClaim(p: pointer; taskId: uint8): bool
 proc chanBcnRequestFinish(p: pointer; status: uint8)
 proc chanBcnRequestForget(header: pointer)
 proc chanBcnRequestReset()
-proc chanProtectionInvalidate()
-proc chanProtectionCancel(target: pointer = nil): pointer {.discardable.}
-proc chanProtectionCallbackCurrent(): bool
-proc chanProtectionSelectTarget(target: pointer): bool
 proc chan_get_next_chan*(): pointer {.exportc, cdecl.}
 proc chan_conn_less_delay_prog*() {.exportc, cdecl.}
 proc mm_force_idle_req*(): bool {.exportc, cdecl, discardable.}

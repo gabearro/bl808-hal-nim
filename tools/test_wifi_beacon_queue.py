@@ -188,6 +188,7 @@ CASES = {
     "stale_queue": r'''
 for irq in [false, true]:
   for change in 0 .. 10:
+    if change == 4: continue # an in-place edit of the context: see below
     prepare(irq)
     chan_bcn_detect_start(addr vifs[0])
     doAssert live == 1 and keMsgHdrFromPayload(pending()).paramLen == 20
@@ -196,7 +197,6 @@ for irq in [false, true]:
     of 1: inc stationEpochs[4]
     of 2: inc chanCtxtEpochs[0]
     of 3: inc chanCtxtLinkEpochs[0]
-    of 4: contexts[0].channel.primFreq = 2462
     of 5: retiring[0] = true
     of 6: stations[4].valid = 0
     of 7: inc stations[4].initialRateConfig
@@ -211,6 +211,16 @@ for irq in [false, true]:
     doAssert env.flags == (if change == 8: 0x20'u8 else: 0x80'u8)
     doAssert interrupts == irq and live == 0 and freed == 1
     finish()
+  # The context is its slot and allocation epoch: a TPC or bandwidth edit
+  # does not retire the request (it dwells on the channel it carries).
+  prepare(irq)
+  chan_bcn_detect_start(addr vifs[0])
+  let requested = contexts[0].channel
+  contexts[0].channel.txPower = 3
+  dispatch()
+  doAssert switches == 1 and roc.channel == requested
+  doAssert interrupts == irq and live == 0
+  finish()
 ''',
     "valid_and_busy": r'''
 for irq in [false, true]:

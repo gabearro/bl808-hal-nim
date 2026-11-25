@@ -1,240 +1,171 @@
+# One channel switch at a time, as in chan.o. chan_switch_start begins it and
+# chanSwitchFinish is its only end: chan_pre_switch_channel finishes it on
+# arrival, and every abandonment (retired destination, lost request) finishes
+# it too. A context is identified by its slot and chanCtxtEpochs[slot]; a
+# retired context ends its switch here, at retirement, so the callbacks below
+# need no other notion of identity.
+#
+# The switch's MM_FORCE_IDLE_REQ is a static kernel message that is never
+# freed. While it is queued or saved, a new switch reuses it instead of
+# sending it again, so it can never be linked into a kernel queue twice. When
+# MM runs it, chanSwitchLanded serves whatever the switch needs at that point
+# and always hands MM back out of HW_ACTIVE.
 type
-  ChanSwitchOwners = object
-    linked: set[range[0 .. MAX_VIFS - 1]]
-    bindings, vifs: array[MAX_VIFS, uint32]
-  ChanSwitchContext = object
-    target: pointer
-    definition: ChanCtxtDefView
-    epoch: uint32
-    index: uint8
-    status: uint8
-    captured: bool
-  ChanSwitchTag = object
-    next: ptr ChanSwitchTag
-    header: ptr KeMsgHdr
-    destination, source: ChanSwitchContext
-    owners: ChanSwitchOwners
-    published, claimed: bool
+  ChanSwitchPhase = enum
+    swNone        ## no switch in flight
+    swQueued      ## waiting for MM to run the force-idle request
+    swProtecting  ## PM=1 nulls / self-CTS on the source channel are outstanding
+    swDeparting   ## protection done; the departure is waiting for MM
+  ChanSwitchRequest = object
+    header: KeMsgHdr
+    callback: pointer   ## the 4-byte payload: the callback MM runs
 
 var
-  chanSwitchTags {.wifiCtrl.}: ptr ChanSwitchTag
-  chanSwitchActive {.wifiCtrl.}: ptr ChanSwitchTag
-  chanSwitchCallback {.wifiCtrl.}: ptr ChanSwitchTag
-  chanSwitchIdleHome: tuple[context: ChanSwitchContext; owners: ChanSwitchOwners]
+  chanSw {.wifiCtrl.}: tuple[phase: ChanSwitchPhase; serial: uint32; building, pmSet: bool]
+  chanSwitchRequest {.wifiCtrl.}: ChanSwitchRequest
+  chanSwitchRequestQueued {.wifiCtrl.}: bool
 
-proc chanSwitchOwners(context: ChanSwitchContext): ChanSwitchOwners =
-  if not context.captured or context.index >= 3: return
-  for i in 0 ..< MAX_VIFS:
-    if vifChannelForIdx(i.uint8).chanCtxt == context.target:
-      result.linked.incl(i)
-      result.bindings[i] = chanCtxtLinkEpochs[i]
-      result.vifs[i] = rxVifEpochs[i]
+proc chanSwitchSerial(): uint32 = chanSw.serial
 
-proc chanSwitchOwnersCurrent(owners: ChanSwitchOwners; target: pointer): bool =
-  for i in owners.linked:
-    if vifChannelForIdx(i.uint8).chanCtxt != target or
-        chanCtxtLinkEpochs[i] != owners.bindings[i] or rxVifEpochs[i] != owners.vifs[i]:
-      return false
-  true
-
-proc chanSwitchCapture(target: pointer): ChanSwitchContext =
-  if target == nil: return
+proc chanSwitchSlot(target: pointer): int =
+  ## The pool slot of a live context, or -1.
   for index in 0'u8 ..< 5:
-    if target != cast[pointer](chanCtxtForIdx(index)): continue
-    let ctxt = chanCtxtForIdx(index)
-    if ctxt.contextIndexOrMarker != index: return
-    result = ChanSwitchContext(target: target, definition: ctxt.channel,
-      index: index, status: ctxt.status, captured: true)
-    result.epoch = chanCtxtEpochs[index]
-    return
+    if target == cast[pointer](chanCtxtForIdx(index)):
+      return (if chanCtxtForIdx(index).contextIndexOrMarker == index: index.int else: -1)
+  -1
 
-proc chanSwitchContextCurrent(context: ChanSwitchContext; checkDefinition = true): bool =
-  if not context.captured or context.index >= chanCtxtEpochs.len.uint8: return false
-  let ctxt = chanCtxtForIdx(context.index)
-  context.target == cast[pointer](ctxt) and
-    ctxt.contextIndexOrMarker == context.index and
-    chanCtxtEpochs[context.index] == context.epoch and
-    (not checkDefinition or ctxt.channel == context.definition)
+proc mmLeaveHwActive() =
+  if ke_state_get(TASK_MM) == HW_ACTIVE.uint16: mm_back_to_host_idle()
 
-proc chanSwitchTagFor(header: ptr KeMsgHdr): ptr ChanSwitchTag =
-  var tag = chanSwitchTags
-  while tag != nil:
-    if tag.header == header: return tag
-    tag = tag.next
+proc chanSwitchLanded() {.cdecl.}
 
-proc chanSwitchDropState(target: pointer;
-                         context = default(ChanSwitchContext);
-                         owners = default(ChanSwitchOwners)) =
+proc chanSwitchSend() =
+  ## Ask MM to run the switch's force-idle request.
+  chanEnvView().switchPending = 1
+  if chanSwitchRequestQueued: return
+  chanSwitchRequestQueued = true
+  chanSwitchRequest.header = KeMsgHdr(id: MM_FORCE_IDLE_REQ_MSG, destId: TASK_MM,
+    srcId: TASK_NONE, paramLen: 4)
+  chanSwitchRequest.callback = cast[pointer](chanSwitchLanded)
+  ke_msg_send(addr chanSwitchRequest.callback)
+
+proc chanSwitchTake(request: pointer): cint =
+  ## MM consumed a force-idle request. The switch's own is static: never free it.
+  if request != addr chanSwitchRequest.callback: return KeMsgConsumed
+  chanSwitchRequestQueued = false
+  KeMsgNoFree
+
+proc chanSwitchBegin() =
+  ## chan_switch_start has published scheduledCtxt.
+  inc chanSw.serial
+  chanSw.phase = swQueued
+  chanSwitchSend()
+
+proc chanConnlessRequeue() =
+  ## A scan (0x08) or ROC (0x04) dwell that was never entered goes back to
+  ## its pending bit (0x02/0x01) and the connectionless gate is armed again,
+  ## so TASK_SCAN, which waits in state 2 for the dwell, is not stranded.
   let env = chanEnvView()
-  if target != nil and env.scheduledCtxt == target:
-    env.scheduledCtxt = nil
-    env.switchPending = 0
-    env.scanDelayCount = 0
-    env.connlessDelayCount = 0
-    if chanSwitchOwnersCurrent(owners, target) and
-        chanSwitchContextCurrent(context, checkDefinition = owners.linked == {}):
-      chanCtxtAt(target).status = context.status
+  var flags = env.flags
+  if (flags and 0x08) != 0 and env.currentCtxt != cast[pointer](chanCtxtForIdx(3)):
+    flags = (flags and not 0x08'u8) or 0x02
+  if (flags and 0x04) != 0 and env.currentCtxt != cast[pointer](chanCtxtForIdx(4)):
+    flags = (flags and not 0x04'u8) or 0x01
+  if flags == env.flags: return
+  env.flags = flags and not 0x10'u8
+  chan_conn_less_delay_prog()
+
+proc chanSwitchFinish(arrived: bool) =
+  ## The only end of a switch. On arrival chan_pre_switch_channel has already
+  ## made the destination current. Otherwise the switch is abandoned: the
+  ## destination goes back to waiting, an unentered scan/ROC dwell goes back
+  ## to its gate, MM leaves HW_ACTIVE and the PM bit set for the protection
+  ## frames is cleared again on the context that stays current.
+  let saved = irqSave()
+  defer: irqRestore(saved)
+  let env = chanEnvView()
+  let pmSet = chanSw.pmSet
+  inc chanSw.serial
+  chanSw.phase = swNone
+  chanSw.building = false
+  chanSw.pmSet = false
+  env.scanDelayCount = 0
+  env.connlessDelayCount = 0
+  if arrived: return
+  env.switchPending = 0
+  let destination = env.scheduledCtxt
+  env.scheduledCtxt = nil
+  if destination != nil:
+    if chanCtxtAt(destination).status in {2'u8, 3}: chanCtxtAt(destination).status = 1
     mm_timer_clear(chanCtxtOpTimer())
-
-proc chanSwitchForget(header: pointer) =
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  var link = addr chanSwitchTags
-  while link[] != nil:
-    if link[].header == header:
-      let tag = link[]
-      link[] = tag.next
-      if chanSwitchActive == tag:
-        chanSwitchActive = nil
-        chanSwitchDropState(tag.destination.target, tag.destination, tag.owners)
-      return
-    link = addr link[].next
-
-proc chanSwitchCancel(target: pointer = nil) =
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  let protectionTarget = chanProtectionCancel(target)
-  let tag = chanSwitchActive
-  if tag != nil and (target == nil or tag.destination.target == target or
-      (tag.claimed and tag.source.target == target)):
-    let request = keMsgPayload(tag.header)
-    chanSwitchActive = nil
-    chanSwitchDropState(tag.destination.target, tag.destination, tag.owners)
-    meCancelQueuedPayload(request)
-  elif protectionTarget != nil:
-    chanSwitchDropState(protectionTarget)
-  elif target != nil:
-    chanSwitchDropState(target)
-  else:
-    chanSwitchDropState(chanEnvView().scheduledCtxt)
+  chanConnlessRequeue()
+  # Inside a TX reset its caller still owns MM's state.
+  if not txResetActive: mmLeaveHwActive()
+  let current = env.currentCtxt
+  let ps = psEnvView()
+  if pmSet and current != nil and chanCtxtAt(current).contextIndexOrMarker <= 2 and
+      (ps.enabled == 0 or (ps.statusFlags and 8'u32) != 0):
+    blmac_pwr_mgt_setf(0)
 
 proc chanSwitchRetire(target: pointer) =
+  ## A context leaves the pool. A switch away from it carries on (vendor);
+  ## a switch to it is abandoned.
   let saved = irqSave()
   defer: irqRestore(saved)
-  if chanEnvView().currentCtxt == target: chanEnvView().currentCtxt = nil
-  chanSwitchCancel(target)
-
-proc chanSwitchAllocate(target: pointer): pointer =
-  let context = chanSwitchCapture(target)
-  if not context.captured: return nil
-  let owners = chanSwitchOwners(context)
-  const alignment = alignof(ChanSwitchTag).uint
-  let extra = KeMsgTailSlack + (alignment - 1).uint32 + sizeof(ChanSwitchTag).uint32
-  result = ke_msg_try_alloc(MM_FORCE_IDLE_REQ_MSG, TASK_MM, TASK_NONE, 4 + extra)
-  if result == nil: return
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  let header = keMsgHdrFromPayload(result)
-  header.paramLen = 4
-  cast[ptr pointer](result)[] = cast[pointer](chan_goto_idle_cb)
-  let start = cast[uint](result) + 4 + KeMsgTailSlack.uint
-  let tag = cast[ptr ChanSwitchTag]((start + alignment - 1) and not (alignment - 1))
-  tag[] = ChanSwitchTag(next: chanSwitchTags, header: header, destination: context, owners: owners)
-  chanSwitchTags = tag
-
-proc chanSwitchPublish(request: pointer): bool =
-  let tag = chanSwitchTagFor(keMsgHdrFromPayload(request))
-  if tag == nil or chanSwitchActive != nil or
-      not chanSwitchContextCurrent(tag.destination) or
-      not chanSwitchOwnersCurrent(tag.owners, tag.destination.target) or
-      chanEnvView().scheduledCtxt != tag.destination.target: return false
-  tag.published = true
-  chanProtectionInvalidate()
-  chanSwitchActive = tag
-  true
-
-proc chanSwitchAdmit(request: pointer): bool =
-  if request == nil: return false
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  let tag = chanSwitchTagFor(keMsgHdrFromPayload(request))
-  if tag == nil: return true
-  let header = tag.header
-  if tag != chanSwitchActive or not tag.published or tag.claimed or
-      header.id != MM_FORCE_IDLE_REQ_MSG or header.destId != TASK_MM or
-      header.srcId != TASK_NONE or header.paramLen != 4 or
-      cast[ptr pointer](request)[] != cast[pointer](chan_goto_idle_cb) or
-      chanEnvView().scheduledCtxt != tag.destination.target or
-      not chanSwitchOwnersCurrent(tag.owners, tag.destination.target): return false
-  if chanSwitchContextCurrent(tag.destination): return true
-  # MM can update a linked home channel in place while its idle request waits.
-  # Retain the allocation, bindings, and original status for rollback.
-  if tag.owners.linked == {} or not chanSwitchContextCurrent(tag.destination, checkDefinition = false) or
-      chanCtxtAt(tag.destination.target).linkCount == 0:
-    return false
-  tag.destination.definition = chanCtxtAt(tag.destination.target).channel
-  true
-
-proc chanSwitchIdleHomeCurrent(): bool =
   let env = chanEnvView()
-  let home = chanSwitchIdleHome.context
-  env.currentCtxt == home.target and env.scheduledCtxt == nil and chanSwitchActive == nil and
-    chanSwitchContextCurrent(home) and chanSwitchOwnersCurrent(chanSwitchIdleHome.owners, home.target)
+  if env.currentCtxt == target: env.currentCtxt = nil
+  if target != nil and env.scheduledCtxt == target: chanSwitchFinish(arrived = false)
 
-proc chanSwitchTrackIdle(request: pointer; state: uint16): uint32 =
-  result = mmConfigIdle.epoch
-  if state != MM_ACTIVE_STATE.uint16: return
-  let header = keMsgHdrFromPayload(request)
-  let tag = chanSwitchTagFor(header)
-  if tag == nil or tag != chanSwitchActive: return
-  let home = chanSwitchCapture(chanEnvView().currentCtxt)
-  let owners = chanSwitchOwners(home)
-  if owners.linked == {}: return
-  let mode = regRead(MACHW_STATE_CNTRL_REG) and 0xF'u32
-  if mode == 0 or mmConfigIdle.epoch != result or not chanSwitchAdmit(request): return
-  chanSwitchIdleHome = (home, owners)
-  result = mmConfigTrackIdle(header, mode.uint8, state.uint8, chanSwitchIdleHomeCurrent)
-
-proc chanSwitchCallbackCurrent(): bool =
+proc chanSwitchReset() =
+  ## Kernel and channel (re)initialisation: drop the switch and its request.
   let saved = irqSave()
   defer: irqRestore(saved)
-  let tag = chanSwitchCallback
-  chanProtectionCallbackCurrent() and (tag == nil or (tag == chanSwitchActive and
-    chanSwitchContextCurrent(tag.destination) and
-    chanSwitchOwnersCurrent(tag.owners, tag.destination.target) and
-    (tag.source.target == nil or chanSwitchContextCurrent(tag.source))))
+  proc matches(node: ptr CoListHdr; header: pointer): bool {.cdecl.} =
+    cast[pointer](node) == header
+  if chanSwitchRequestQueued:
+    for queue in [addr keMsgQueueSent, addr keMsgQueueSaved]:
+      discard ke_queue_extract(queue, matches, addr chanSwitchRequest.header)
+    chanSwitchRequestQueued = false
+  inc chanSw.serial
+  chanSw.phase = swNone
+  chanSw.building = false
+  chanSw.pmSet = false
+  let env = chanEnvView()
+  env.scheduledCtxt = nil
+  env.switchPending = 0
+  env.scanDelayCount = 0
+  env.connlessDelayCount = 0
 
-proc chanSwitchSelectTarget(target: pointer): bool =
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  if chanSwitchCallback == nil: return chanProtectionSelectTarget(target)
-  let tag = chanSwitchCallback
-  if tag != chanSwitchActive or not chanSwitchContextCurrent(tag.destination) or
-      not chanSwitchOwnersCurrent(tag.owners, tag.destination.target) or
-      (tag.source.target != nil and not chanSwitchContextCurrent(tag.source)): return false
-  let destination = chanSwitchCapture(target)
-  if not destination.captured: return false
-  if not chanProtectionSelectTarget(target): return false
-  if target != tag.destination.target:
-    tag.destination = destination
-    tag.owners = chanSwitchOwners(destination)
+proc chanSwitchForget(header: pointer): bool =
+  ## ke_msg_free never frees the static request. Should the kernel ever drop
+  ## it, the switch it carried cannot proceed and is abandoned.
+  if header != addr chanSwitchRequest.header: return false
+  chanSwitchRequestQueued = false
+  if chanSw.phase in {swQueued, swDeparting}: chanSwitchFinish(arrived = false)
   true
 
-proc chanSwitchInvoke(request: pointer): bool =
-  var tag, previous: ptr ChanSwitchTag
-  block:
-    let saved = irqSave()
-    defer: irqRestore(saved)
-    tag = chanSwitchTagFor(keMsgHdrFromPayload(request))
-    if tag == nil: return false
-    if not chanSwitchAdmit(request): return true
-    tag.source = chanSwitchCapture(chanEnvView().currentCtxt)
-    if chanEnvView().currentCtxt != nil and not tag.source.captured: return true
-    tag.claimed = true
-    previous = chanSwitchCallback
-    chanSwitchCallback = tag
-  defer:
-    let saved = irqSave()
-    defer: irqRestore(saved)
-    let current = chanSwitchCallbackCurrent()
-    chanSwitchCallback = previous
-    if chanSwitchActive == tag:
-      let env = chanEnvView()
-      # Only protection frames may legitimately leave a claimed switch pending.
-      if not current or (env.scheduledCtxt == tag.destination.target and
-          env.scanDelayCount == 0 and env.connlessDelayCount == 0):
-        chanSwitchCancel(tag.destination.target)
-      else:
-        chanSwitchActive = nil
-  if chanSwitchCallbackCurrent(): chan_goto_idle_cb()
-  true
+proc chanSwitchDepart() =
+  ## The protection frames are done: force idle and leave the source channel.
+  ## The last confirmation can come from a TX reset's drain; the departure
+  ## then runs from MM after the reset, never inside it. A failed forced idle
+  ## (its recovery is already posted) is retried the same way.
+  let serial = chanSw.serial
+  if txResetActive or not chanForceIdle():
+    if chanSw.serial == serial:
+      chanSw.phase = swDeparting
+      chanSwitchSend()
+    return
+  if chanSw.serial != serial:
+    mmLeaveHwActive()   # the forced idle's drain ended the switch
+    return
+  chan_pre_switch_channel()
+
+proc chanSwitchLanded() {.cdecl.} =
+  ## MM ran the switch's request and is HW_ACTIVE.
+  chanEnvView().switchPending = 0
+  case chanSw.phase
+  of swQueued: chan_goto_idle_cb()
+  of swDeparting: chanSwitchDepart()
+  of swNone, swProtecting: discard
+  # Every path out of a switch callback hands MM back.
+  mmLeaveHwActive()

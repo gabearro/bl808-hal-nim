@@ -15,15 +15,63 @@ import subprocess
 
 import pytest
 
-from test_wifi_connless_timer_dispatch import switch_source
+from test_wifi_auth_frames import layouts
+from test_wifi_connless_timer_dispatch import source as connless_source
 from test_wifi_disconnect_tx import FW, procedure
 
 
 # The fixture models request ingress, delivery of the queued idle request to
-# the radio, and the notice sink. The timer queue, gate, allocation handoff,
-# context status arm, operation dispatch and dwell retirement are production Nim.
+# the radio, and the notice sink. The timer queue, gate, switch start, context
+# status arm, operation dispatch and dwell retirement are production Nim. The
+# switch's MM_FORCE_IDLE_REQ is static, so starting a switch cannot fail.
+GATE_SWITCH = r'''
+var attempts, sent: int
+proc chan_goto_idle_cb() {.cdecl.} = doAssert false, "departures are outside this fixture"
+proc chanSwitchSlot(target: pointer): int =
+  for index in 0'u8 ..< 5:
+    if target == cast[pointer](addr contexts[index]):
+      return (if contexts[index].contextIndexOrMarker == index: index.int else: -1)
+  -1
+proc chanSwitchBegin() =
+  ## chan_switch_start published scheduledCtxt; the request goes to MM.
+  doAssert env.switchPending == 0
+  env.switchPending = 1
+  inc attempts
+  inc sent
+'''
+
+SETUP = r'''
+template scan: untyped = cast[ptr ChanScanPoolOverlay](addr contexts[3].channel)
+template roc: untyped = cast[ptr ChanRocOverlay](addr contexts[4].channel)
+proc setupScan() =
+  setupConnless()
+  env.ctxtCount = 0
+  attempts = 0
+  sent = 0
+  scan.slot = 3
+  scan.active = 1
+  scan.durationTicks = 37
+  scan.channel.primFreq = 2462
+  roc.slot = 0xFF
+  roc.stateLo = 0
+'''
+
+
+def gate_source() -> str:
+    code = connless_source()
+    code = code.replace(procedure(code, "chan_switch_start"),
+                        "proc chan_switch_start*(chanCtxt: pointer) {.exportc, cdecl.}\n", 1)
+    code = code.replace("ctxtCount, flags: uint8,", "ctxtCount, flags, switchPending: uint8,", 1)
+    # The pool link is a 32-bit field on RV32; it is not dereferenced here.
+    pool = layouts("ChanCtxtView", "ChanScanPoolOverlay", "ChanRocOverlay")
+    start, end = code.index("  Context = object"), code.index("  Vif = object")
+    code = (code[:start] + pool.replace("link*: CoListHdr", "link*: uint32")
+            + "  Context = ChanCtxtView\n" + code[end:])
+    code += GATE_SWITCH + procedure((FW / "task_handlers.nim").read_text(), "chan_switch_start")
+    return code + SETUP
+
+
 BRIDGE = r'''
-proc chanProtectionCancel(p: pointer): pointer = nil
 import std/strutils
 
 const MM_SCAN_CHANNEL_END_IND = 1'u16
@@ -42,7 +90,6 @@ proc chanSwitchRetire(p: pointer) =
   # The fake radio already consumed the switch; it cannot cancel a next-home
   # reservation on behalf of the finishing dwell.
   doAssert env.currentCtxt == nil and env.scheduledCtxt != p
-  doAssert chanSwitchActive == nil and chanSwitchTags == nil
 '''
 
 DRIVER = r'''
@@ -73,8 +120,6 @@ proc retireFixtureRequests() =
   env.currentCtxt = nil
   env.scheduledCtxt = nil
   env.switchPending = 0
-  chanSwitchTags = nil
-  chanSwitchActive = nil
 
 proc resetRadio() =
   mm_timer_init()
@@ -84,9 +129,7 @@ proc resetRadio() =
 proc retune() =
   let target = env.scheduledCtxt
   let i = indexOf(target)
-  doAssert i in 3..4 and env.switchPending == 1 and chanSwitchActive != nil
-  chanSwitchTags = nil
-  chanSwitchActive = nil
+  doAssert i in 3..4 and env.switchPending == 1
   env.flags = env.flags and not 0x20'u8
   env.switchPending = 0
   env.scheduledCtxt = nil
@@ -123,7 +166,7 @@ while stdin.readLine(line):
   let arg = parseInt(row[2])
   if row[0] == "begin":
     let start = now
-    setupScan(0)
+    setupScan()
     now = start
     env.ctxtCount = arg.uint8
     env.flags = 0
@@ -152,11 +195,6 @@ while stdin.readLine(line):
   of "rearm": chan_conn_less_delay_prog()
   of "aux": mm_timer_set(addr timers[1], now + cast[uint32](arg.int32))
   of "poll": mm_timer_schedule()
-  of "oom", "join_oom":
-    failures = 1
-    if op == "join_oom": onAlloc = proc() = offer(arg, id)
-    mm_timer_schedule()
-    doAssert failures == 0 and onAlloc == nil, "missed allocation boundary"
   of "retune": retune()
   of "next_home": env.scheduledCtxt = addr contexts[0]
   of "home_done": env.scheduledCtxt = nil
@@ -187,7 +225,7 @@ while stdin.readLine(line):
 
 
 def nim_source() -> str:
-    code = switch_source()
+    code = gate_source()
     code = code.replace(procedure(code, "chanCtxtOpEvent"),
                         "proc chanCtxtOpEvent(ctxtPtr: pointer; saved: uint32)\n", 1)
     code = code.replace(" lastMacTime: uint32]",
@@ -278,14 +316,9 @@ class Model:
                 self.effects.append("aux")
             elif slot == GATE:
                 self.attempts += 1
-                if op in {"oom", "join_oom"}:
-                    if op == "join_oom":
-                        self.offer(arg, ident, arm=False)
-                    self.arm(GATE, self.now + BASE_DELAY)
-                else:
-                    self.selected = ROC if ROC in self.requests else SCAN
-                    self.effects.append(f"switch:{self.requests[self.selected]}")
-                    self.arm(OP, self.now + SWITCH_GUARD)
+                self.selected = ROC if ROC in self.requests else SCAN
+                self.effects.append(f"switch:{self.requests[self.selected]}")
+                self.arm(OP, self.now + SWITCH_GUARD)
             elif not self.operating:
                 self.guard_fired = True
             else:
@@ -312,9 +345,6 @@ class Model:
             if GATE not in self.timers:
                 actions += ["rearm"]
             else:
-                actions += ["oom"]
-                if len(self.requests) == 1:
-                    actions += ["join_oom"]
                 if AUX not in self.timers:
                     actions += ["pop_clear"]
                     if self.home_count and len(self.requests) == 1:
@@ -349,16 +379,14 @@ class Model:
         elif action == "aux":
             arg = min(self.timers.values(), default=self.now + 100) - self.now
             self.arm(AUX, self.now + (arg if arg >= 0 else 3000))
-        elif action in {"edge", "near", "due", "late", "oom", "join_oom",
+        elif action in {"edge", "near", "due", "late",
                         "pop_clear", "pop_reset", "pop_replace"}:
-            if action in {"oom", "join_oom", "pop_clear", "pop_replace"}:
+            if action in {"pop_clear", "pop_replace"}:
                 deadline = self.timers[GATE]
             else:
                 deadline = min(self.timers.values())
             self.now = max(self.now, deadline + {"edge": -50, "near": -49, "late": 7000}.get(action, 0))
-            if action == "join_oom":
-                arg = ROC if SCAN in self.requests else SCAN
-            elif action == "pop_replace":
+            if action == "pop_replace":
                 arg = next(iter(self.requests))
             if action in {"edge", "near", "due", "late"}:
                 op = "poll"

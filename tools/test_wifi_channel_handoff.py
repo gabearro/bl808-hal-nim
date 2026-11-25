@@ -8,14 +8,17 @@ from test_wifi_deferred_auth import run_nim
 from test_wifi_disconnect_tx import FW, procedure
 from test_wifi_message_allocation import run_program
 from test_wifi_mm_timer_lifetime import source as mm_timer_source
+from test_wifi_switch_request import run_case as run_switch_case
 
 
 PLATFORM = r"""
 proc smDeferredPublish(vifEntry: pointer) = discard
-var txResetEpoch: uint32
-proc txlFrameCallbackCurrent(resetEpoch = txResetEpoch): bool = true
-proc chanSwitchCallbackCurrent(): bool = true
-proc chanSwitchSelectTarget(target: pointer): bool = true
+var txResetEpoch, switchSerial: uint32
+var arrivals, abandons: int
+proc chanSwitchSerial(): uint32 = switchSerial
+proc chanSwitchFinish(arrived: bool) =
+  inc switchSerial
+  if arrived: inc arrivals else: inc abandons
 const
   MAX_VIFS = 2
   TASK_MM = 0'u8
@@ -88,9 +91,6 @@ proc chanForceIdle(): bool =
   events.add(("idle", 0'u))
   inc txResetEpoch
   true
-proc chanForceIdleForDeparture(target: pointer): bool =
-  doAssert target == env.scheduledCtxt
-  chanForceIdle()
 proc mm_active() = events.add(("active", 0'u))
 proc mmReplayEdca() = discard
 proc blmac_pwr_mgt_setf(value: uint32) = events.add(("pm", value.uint))
@@ -156,200 +156,153 @@ proc chan_ap_tx_cfm(p: pointer; status: uint32 = 0) {.cdecl.} = discard
 """
 
 
-def protection_source(platform: str) -> str:
-    platform = platform.replace(procedure(platform, "resetProtection"), "proc resetProtection()\n")
-    support = r'''
-{.pragma: wifiCtrl.}
-type ChanSwitchContext = object
-  target: pointer
-  captured: bool
-proc chanSwitchCapture(target: pointer): ChanSwitchContext =
-  ChanSwitchContext(target: target, captured: target != nil)
-proc chanSwitchContextCurrent(context: ChanSwitchContext; checkDefinition = true): bool =
-  context.captured
-proc chanSwitchCancel(target: pointer = nil)
-'''
-    support += (FW / "channel_protection.nim").read_text()
-    support += r'''
-proc resetProtection() = chanProtectionInvalidate()
-proc chanSwitchCancel(target: pointer = nil) =
-  let retired = chanProtectionCancel(target)
-  if retired != nil and env.scheduledCtxt == retired: env.scheduledCtxt = nil
-'''
-    return platform + support
-
-
-def test_failed_protection_frames_do_not_block_switch(tmp_path: Path) -> None:
-    checks = r"""
-reset()
-vifs[1].state = 0
-nullResult[0] = 1
-chan_goto_idle_cb()
-doAssert env.scanDelayCount == 0 and env.connlessDelayCount == 0,
-  "failed submission has no future completion to wait for"
-doAssert events[^1].kind == "pre"
-"""
-    run_nim(tmp_path, protection_source(PLATFORM + PRE_SWITCH_STUB + CFM_STUBS)
-            + procedure((FW / "task_handlers.nim").read_text(), "chan_goto_idle_cb") + checks)
-
-
-def callback_bodies() -> str:
-    source = (FW / "task_handlers.nim").read_text()
-    return procedure(source, "chan_sta_tx_cfm") + procedure(source, "chan_ap_tx_cfm")
-
-
 def test_protection_admission_and_counting(tmp_path: Path) -> None:
-    checks = r"""
+    """chan_goto_idle_cb's vendor loops, on the switch harness."""
+    run_switch_case(tmp_path, r"""
 for count in 1'u8 .. 3:
-  for failedNull in 0'u8 .. 1:
-    for failedCts in 0'u8 .. 1:
+  for nullRefused in 0'u8 .. 1:
+    for ctsRefused in 0'u8 .. 1:
       for blockedPs in [false, true]:
         for oldStatus in [1'u8, 3, 4, 5, 6]:
-          reset()
-          env.ctxtCount = count
-          contexts[0].status = oldStatus
-          vifs[1].vifType = 2
-          nullResult[0] = failedNull
-          ctsResult[1] = failedCts
+          resetSwitch()
+          let home = newTarget(2412)
+          let away = newTarget(2437)
+          linkHome(home, VIF_TYPE_STA, 0)
+          linkHome(home, VIF_TYPE_AP, 1)
+          vifs[1].postponedStaHead = cast[pointer](1)
+          chanCtxtAt(home).schedSlot = 50
+          activateVifs(2)
+          operate(home)
+          channelEnv.ctxtCount = count
+          chanCtxtAt(home).status = oldStatus
+          nullResult = nullRefused
+          ctsResult = ctsRefused
           if blockedPs: ps.enabled = 1
-          chan_goto_idle_cb()
+          chan_switch_start(away)
+          settle()
           let apSent = count == 2 and not blockedPs
           let nullSent = not blockedPs
-          let pendingNull = nullSent and failedNull == 0
-          let pendingCts = apSent and failedCts == 0
-          doAssert env.scanDelayCount == pendingNull.uint8
-          doAssert env.connlessDelayCount == pendingCts.uint8
-          doAssert sends.len == nullSent.int + apSent.int
-          doAssert contexts[0].status == oldStatus
-          doAssert env.switchPending == 0
-          for send in sends:
-            doAssert send.state == 6, "protection frame must bypass channel pause"
-            if send.kind == "null":
-              doAssert send.callback == cast[pointer](chan_sta_tx_cfm)
+          let pendingNull = nullSent and nullRefused == 0
+          let pendingCts = apSent and ctsRefused == 0
+          doAssert channelEnv.scanDelayCount == pendingNull.uint8
+          doAssert channelEnv.connlessDelayCount == pendingCts.uint8
+          doAssert frames.len == nullSent.int + apSent.int
+          doAssert channelEnv.switchPending == 0
+          for frame in frames:
+            doAssert frame.sourceStatus == 6, "protection frame must bypass channel pause"
+            if frame.ap:
+              doAssert frame.callback == cast[pointer](chan_ap_tx_cfm) and frame.duration == 51
             else:
-              doAssert send.callback == cast[pointer](chan_ap_tx_cfm)
-              doAssert send.duration == 51
+              doAssert frame.callback == cast[pointer](chan_sta_tx_cfm) and frame.index == 0
           if pendingNull or pendingCts:
-            doAssert events[^1].kind == "active" and contexts[1].status == 3
-          else:
-            doAssert events[^1].kind == "pre"
+            doAssert tuned.len == 0 and chanCtxtAt(away).status == 3
+            doAssert chanCtxtAt(home).status == oldStatus and mmState == MM_ACTIVE_STATE
+            for index in 0 ..< frames.len: completeFrame(index)
+          doAssert tuned == @[away] and idleSwitch()
+          finishSwitch()
 
-reset()
-nullResult[0] = 1
-chan_goto_idle_cb()
-doAssert sends.len == 2 and env.scanDelayCount == 1
-chan_sta_tx_cfm(cast[pointer](sends[^1].token.uint), 0)
-doAssert env.scanDelayCount == 0 and events[^1].kind == "pre"
-
-for skip in 0 .. 4:
-  reset()
-  vifs[0].chanCtxt = addr contexts[2]
-  contexts[2].schedSlot = 30
-  vifs[1].vifType = 2
+proc otherChannel(skip: int) =
+  resetSwitch()
+  let home = newTarget(2412)
+  let away = newTarget(2437)
+  let other = newTarget(2462)
+  chanCtxtAt(other).schedSlot = 30
+  vifs[0] = Vif(vifIdx: 0, vifType: VIF_TYPE_STA, state: 1, staIdx: 0, chanCtxt: other)
+  vifs[1] = Vif(vifIdx: 1, vifType: VIF_TYPE_AP, state: 1, staIdx: 1, chanCtxt: home,
+    postponedStaHead: cast[pointer](1))
   if skip == 1: vifs[1].state = 0
   if skip == 2: vifs[1].postponedStaHead = nil
-  if skip == 3: vifs[1].chanCtxt = addr contexts[2]
-  if skip == 4: contexts[2].schedSlot = 0
-  chan_goto_idle_cb()
-  doAssert sends.len == (skip == 0).int
-  if skip == 0: doAssert sends[0].duration == 30
+  if skip == 3: vifs[1].chanCtxt = other
+  if skip == 4: chanCtxtAt(other).schedSlot = 0
+  activateVifs(2)
+  channelEnv.ctxtCount = 2
+  operate(home)
+  chan_switch_start(away)
+  settle()
+  doAssert frames.len == (skip == 0).int
+  if skip == 0:
+    doAssert frames[0].ap and frames[0].duration == 30
+    completeFrame(0)
+  doAssert tuned == @[away]
+  finishSwitch()
+for skip in 0 .. 4: otherChannel(skip)
 
 for badStation in [7'u8, 255]:
-  reset()
-  vifs[0].staIdx = badStation
-  vifs[1].state = 0
-  chan_goto_idle_cb()
-  doAssert sends.len == 0 and env.scanDelayCount == 0
+  resetSwitch()
+  let home = newTarget(2412)
+  let away = newTarget(2437)
+  vifs[0] = Vif(vifIdx: 0, vifType: VIF_TYPE_STA, state: 1, staIdx: badStation, chanCtxt: home)
+  activateVifs(1)
+  operate(home)
+  chan_switch_start(away)
+  settle()
+  doAssert frames.len == 0 and tuned == @[away]
+  finishSwitch()
+
 for slotCount in [0'u16, 1, 50, 65535]:
-  reset()
-  vifs[0].state = 0
-  vifs[1].vifType = 2
-  contexts[0].schedSlot = slotCount
-  chan_goto_idle_cb()
+  resetSwitch()
+  let home = newTarget(2412)
+  let away = newTarget(2437)
+  chanCtxtAt(home).schedSlot = slotCount
+  vifs[0] = Vif(vifIdx: 0, vifType: VIF_TYPE_STA, state: 0, staIdx: 0, chanCtxt: home)
+  vifs[1] = Vif(vifIdx: 1, vifType: VIF_TYPE_AP, state: 1, staIdx: 1, chanCtxt: home,
+    postponedStaHead: cast[pointer](1))
+  activateVifs(2)
+  channelEnv.ctxtCount = 2
+  operate(home)
+  chan_switch_start(away)
+  settle()
   let duration = ((slotCount.uint32 shl 10) div 1000) and 0xFFFF'u32
-  doAssert sends.len == (duration != 0).int
-  if sends.len != 0: doAssert sends[0].duration == duration.uint16
-reset()
-env.scheduledCtxt = nil
+  doAssert frames.len == (duration != 0).int
+  if frames.len != 0:
+    doAssert frames[0].duration == duration.uint16
+    completeFrame(0)
+  doAssert tuned == @[away]
+  finishSwitch()
+
+# Without a switch the callback does nothing.
+resetSwitch()
 chan_goto_idle_cb()
-doAssert sends.len == 0 and events.len == 0 and env.switchPending == 0
-"""
-    run_nim(tmp_path, protection_source(PLATFORM + PRE_SWITCH_STUB) + callback_bodies()
-            + procedure((FW / "task_handlers.nim").read_text(), "chan_goto_idle_cb") + checks)
+doAssert frames.len == 0 and forced == 0 and channelEnv.switchPending == 0
+finishSwitch()
+""")
 
 
-def test_tx_confirmation_waits_for_all_protection_frames(tmp_path: Path) -> None:
-    checks = r"""
-for apCount in 0'u8 .. 2:
-  for staCount in 0'u8 .. 2:
-    for reverse in [false, true]:
-      reset()
-      env.connlessDelayCount = apCount
-      env.scanDelayCount = staCount
-      let total = apCount.int + staCount.int
-      for i in 0 ..< 2:
-        let useAp = (i == 0) == reverse
-        let n = if useAp: apCount else: staCount
-        for j in 0 ..< n.int:
-          if useAp: chan_ap_tx_cfm(nil, 0)
-          else: chan_sta_tx_cfm(nil, 0x00800000)
-          let remaining = env.connlessDelayCount + env.scanDelayCount
-          doAssert events.len == (if remaining == 0: 2 else: 0),
-            "MAC must not retune with protection frames still outstanding"
-      doAssert env.connlessDelayCount == 0 and env.scanDelayCount == 0
-      doAssert events.len == (if total == 0: 0 else: 2)
-      chan_ap_tx_cfm(nil, 0)
-      chan_sta_tx_cfm(nil, 0)
-      doAssert events.len == (if total == 0: 0 else: 2), "duplicate completion"
-"""
-    run_nim(tmp_path, protection_source(PLATFORM + PRE_SWITCH_STUB) + callback_bodies() + checks)
-
-
-def test_switch_request_allocation_and_publication(tmp_path: Path) -> None:
-    checks = r"""
-reset()
-env.scheduledCtxt = nil
-env.switchPending = 0
-allocFail = true
-let before = env
-chan_switch_start(addr contexts[1])
-doAssert env == before and contexts[1].status == 0 and events.len == 0
-doAssert allocations == 1
-allocFail = false
-chan_switch_start(addr contexts[1])
-doAssert env.scheduledCtxt == addr contexts[1]
-doAssert env.switchPending == 1 and contexts[1].status == 2
-doAssert callbackStorage == cast[pointer](chan_goto_idle_cb)
-doAssert events == @[("status", 2'u), ("message", 74'u)]
-let previous = env
-chan_switch_start(addr contexts[2])
-doAssert env == previous and allocations == 2
+def test_switch_start_publication(tmp_path: Path) -> None:
+    run_switch_case(tmp_path, r"""
+resetSwitch()
+let home = newTarget(2412)
+let away = newTarget(2437)
+chan_switch_start(away)
+doAssert channelEnv.scheduledCtxt == away and channelEnv.switchPending == 1
+doAssert chanCtxtAt(away).status == 2 and chanSw.phase == swQueued
+let header = cast[ptr KeMsgHdr](keMsgQueueSent.first)
+doAssert header != nil and header.next == nil
+doAssert header.id == MM_FORCE_IDLE_REQ_MSG and header.destId == TASK_MM
+doAssert header.srcId == TASK_NONE and header.paramLen == 4
+doAssert cast[ptr pointer](keMsgPayload(header))[] != nil
+let previous = channelEnv
+chan_switch_start(home)              # another switch is in flight
+doAssert channelEnv == previous and queuedRequests(keMsgQueueSent) == 1
+finishSwitch()
 for count in 0'u8 .. 3:
   for marker in 0'u8 .. 4:
-    reset()
-    env.ctxtCount = count
-    contexts[0].contextIndexOrMarker = marker
-    chan_switch_start(addr contexts[0])
-    doAssert allocations == 0
-    doAssert events.len == (count > 1 and marker <= 2).int
-reset()
+    resetSwitch()
+    let current = chanCtxtForIdx(marker)
+    current.contextIndexOrMarker = marker
+    current.status = 5
+    channelEnv.currentCtxt = current
+    channelEnv.ctxtCount = count
+    chan_switch_start(current)
+    doAssert keMsgQueueSent.first == nil and channelEnv.scheduledCtxt == nil
+    doAssert current.status == (if count > 1 and marker <= 2: 4'u8 else: 5'u8)
+    current.status = 0
+    finishSwitch()
+resetSwitch()
 chan_switch_start(nil)
-doAssert allocations == 0 and events.len == 0
-"""
-    stubs = r"""
-proc chan_goto_idle_cb() {.cdecl.} = discard
-proc keMsgHdrFromPayload(p: pointer): pointer = p
-proc ke_msg_free(p: pointer) = discard
-proc chanSwitchAllocate(target: pointer): pointer =
-  result = ke_msg_alloc(74, TASK_MM, 255, 4)
-  if result != nil: cast[ptr pointer](result)[] = cast[pointer](chan_goto_idle_cb)
-proc chanSwitchPublish(request: pointer): bool = true
-proc chanSwitchAdmit(request: pointer): bool = true
-"""
-    tasks = (FW / "task_handlers.nim").read_text()
-    run_nim(tmp_path, PLATFORM + stubs + procedure(tasks, "chanStartSwitch")
-            + procedure(tasks, "chan_switch_start") + checks)
-
+doAssert keMsgQueueSent.first == nil and idleSwitch()
+finishSwitch()
+""")
 
 def home_wake_source() -> str:
     kernel = (FW / "kernel_mac_channel.nim").read_text()
@@ -674,119 +627,31 @@ for flags in [8'u8, 4'u8]:
             + procedure(kernel, "chan_pre_switch_channel") + checks)
 
 
-def test_protection_completion_to_preswitch_integration(tmp_path: Path) -> None:
-    source = (FW / "task_handlers.nim").read_text()
-    forward = "proc chan_pre_switch_channel*() {.exportc, cdecl.}\n"
-    checks = r"""
-reset()
-vifs[1].vifType = 2
-checkAdmission = proc(p: pointer): bool = chan_is_tx_allowed(p)
-doAssert not chan_is_tx_allowed(addr vifs[0])
-chan_goto_idle_cb()
-doAssert env.scanDelayCount == 1 and env.connlessDelayCount == 1
-doAssert lastPhy() == -1 and contexts[0].status == 4
-chan_sta_tx_cfm(cast[pointer](sends[0].token.uint), 0x00800000)
-doAssert lastPhy() == -1
-chan_ap_tx_cfm(cast[pointer](sends[1].token.uint), 0)
-doAssert lastPhy() == 1 and env.currentCtxt == addr contexts[1]
-doAssert env.scheduledCtxt == nil
-chan_ap_tx_cfm(nil, 0)
-chan_sta_tx_cfm(nil, 0)
-var retunes = 0
-for event in events:
-  if event.kind == "phy": inc retunes
-doAssert retunes == 1
-
-reset()
-env.flags = 8
-vifs[1].state = 0
-nullResult[0] = 1
-checkAdmission = proc(p: pointer): bool = chan_is_tx_allowed(p)
-chan_goto_idle_cb()
-doAssert env.scanDelayCount == 0 and lastPhy() == 3
-"""
-    kernel = (FW / "kernel_mac_channel.nim").read_text()
-    run_nim(tmp_path, protection_source(PLATFORM + PRE_SWITCH_PLATFORM + forward)
-            + procedure(kernel, "chan_is_on_channel")
-            + procedure(kernel, "chan_is_tx_allowed") + callback_bodies()
-            + procedure(source, "chan_goto_idle_cb")
-            + procedure(kernel, "chan_pre_switch_channel")
-            + checks)
-
-
 def test_protection_timeout_ignores_flushed_and_late_completions(tmp_path: Path) -> None:
-    platform = PLATFORM.replace("var txResetEpoch: uint32", r"""
-var
-  txResetEpoch, frameEpoch: uint32
-  trackedFrame: bool
-  onResetDrain: proc()
-""").replace("proc txlFrameCallbackCurrent(resetEpoch = txResetEpoch): bool = true",
-             "proc txlFrameCallbackCurrent(resetEpoch = txResetEpoch): bool =\n"
-             "  not trackedFrame or frameEpoch == resetEpoch")
-    platform = platform.replace("  inc txResetEpoch\n  true", r"""
-  inc txResetEpoch
-  if onResetDrain != nil:
-    let drain = onResetDrain
-    onResetDrain = nil
-    drain()
-  true""")
-    tasks = (FW / "task_handlers.nim").read_text()
-    kernel = (FW / "kernel_mac_channel.nim").read_text()
-    support = r"""
-const
-  MACHW_TIMLO_REG = MACHW_BASE + 0x120
-  MM_SCAN_CHANNEL_END_IND = 77'u16
-proc chan_get_next_chan(): pointer = nil
-proc chan_get_dominant_chan(): pointer = nil
-proc chan_switch_start(p: pointer) = doAssert false
-proc chanSwitchRetire(p: pointer) = doAssert false
-proc chan_conn_less_delay_prog() = doAssert false
-proc mm_back_to_host_idle() = doAssert false
-proc deliverFrame(index: int; epoch: uint32) =
-  let frame = sends[index]
-  trackedFrame = true
-  frameEpoch = epoch
-  defer: trackedFrame = false
-  cast[proc(p: pointer; status: uint32) {.cdecl.}](frame.callback)(
-    cast[pointer](frame.token.uint), 0x40000000'u32)
-"""
-    checks = r"""
-for flushDuringReset in [false, true]:
-  reset()
-  vifs[1].vifType = VIF_TYPE_AP
-  chan_goto_idle_cb()
-  let departed = txResetEpoch
-  doAssert lastPhy() == -1 and sends.len == 2
-  doAssert chanProtectionActive() and contexts[1].status == 3
-  doAssert env.scanDelayCount == 1 and env.connlessDelayCount == 1
-  if flushDuringReset:
-    onResetDrain = proc() =
-      doAssert txResetEpoch != departed
-      deliverFrame(0, departed)
-      deliverFrame(1, departed)
-  chan_ctxt_op_evt(addr contexts[1])
-  doAssert sends.len == 2 and not chanProtectionActive()
-  doAssert env.currentCtxt == (addr contexts[1]) and env.scheduledCtxt == nil
-  doAssert contexts[1].status == 4
-  let beforeLate = events.len
-  deliverFrame(0, departed)
-  deliverFrame(1, departed)
-  # Even a token replay without its original TX epoch cannot consume a ticket.
-  deliverFrame(0, txResetEpoch)
-  deliverFrame(1, txResetEpoch)
-  doAssert events.len == beforeLate
-  var retunes = 0
-  for event in events:
-    if event.kind == "phy": inc retunes
-  doAssert retunes == 1 and lastPhy() == 1
-"""
-    forward = "proc chan_pre_switch_channel*() {.exportc, cdecl.}\n"
-    code = protection_source(platform + PRE_SWITCH_PLATFORM + forward)
-    code += callback_bodies() + procedure(tasks, "chan_goto_idle_cb")
-    code += procedure(kernel, "chan_pre_switch_channel") + support
-    code += procedure(kernel, "chanCtxtOpEvent") + procedure(kernel, "chan_ctxt_op_evt")
-    run_program(tmp_path, "checked", code + checks)
+    """chan_ctxt_op_evt on the paused destination restarts the departure.
 
+    The restart is a new protection generation: the old frames, flushed by
+    its forced idle or confirmed late, count for nothing.
+    """
+    from test_wifi_sm_audit_mm_chan import source as audit_source
+    run_program(tmp_path, "checked", audit_source() + r"""
+for flushDuringReset in [false, true]:
+  let (home, away) = twoChannels()
+  stageSwitch(away, 2)
+  doAssert frames.len == 1 and chanCtxtAt(away).status == 3
+  if flushDuringReset:
+    onDrain = proc() =
+      onDrain = nil
+      completeFrame(0, 0x40000000'u32)
+  chanCtxtOpEvent(away, 0)
+  doAssert frames.len == 1 and chanSw.phase == swNone
+  doAssert channelEnv.currentCtxt == away and channelEnv.scheduledCtxt == nil
+  doAssert chanCtxtAt(away).status == 4 and tuned == @[away]
+  completeFrame(0)
+  completeFrame(0, 0x40000000'u32)
+  doAssert tuned == @[away] and forced == 2
+  finishSwitch()
+""")
 
 def test_channel_operation_timer_contract(tmp_path: Path) -> None:
     platform = PLATFORM.replace(procedure(PLATFORM, "chan_upd_ctxt_status"), "")

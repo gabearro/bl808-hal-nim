@@ -22,7 +22,7 @@ type
 var
   storage: array[40, uint64]
   active: bool
-  metadata: array[14, bool]
+  metadata: array[13, bool]
   keMsgQueueSent: CoList
   frees, deliveries, assertions, events, traces: int
   interrupts = true
@@ -72,6 +72,8 @@ proc chanUpdateCaptureMessage(p: ptr KeMsgHdr) = discard
 proc scanDwellForget(p: pointer) = discard
 proc mmEdcaForget(p: pointer) = discard
 proc mmConfigForgetIdleOwner(p: pointer): bool = false
+# The channel switch's request is static and carries no per-message metadata.
+proc chanSwitchForget(p: pointer): bool = false
 proc setup(destination: uint8) =
   storage = default(typeof(storage))
   header[] = KeMsgHdr(id: 0x1234, destId: destination, srcId: 3, paramLen: 4)
@@ -91,7 +93,7 @@ def source() -> str:
     kernel = (FW / "kernel_mac_channel.nim").read_text()
     code = (FW.parent / "fw_messages/tasks.nim").read_text() + PLATFORM
     hooks = ["mmTimForget", "rxMgtForget", "smCleanupForget", "smBssForget", "smActivationForget",
-             "smScanForget", "smRegistrationForget", "chanSwitchForget", "smRspTimerForget",
+             "smScanForget", "smRegistrationForget", "smRspTimerForget",
              "smDeferredForget", "smAbortForget", "chanUpdateForget", "mmConnLossForget",
              "chanBcnRequestForget"]
     for index, name in enumerate(hooks):

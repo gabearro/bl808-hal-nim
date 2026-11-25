@@ -205,11 +205,11 @@ for change in [0, 1, 3, 4, 5]:
   of 0: inc chanCtxtLinkEpochs[0]
   of 1: inc chanCtxtEpochs[0]
   of 3: vifs[0].chanCtxt = addr contexts[1]
-  of 4: contexts[0].channel.primFreq = 2462
+  of 4: contexts[0].channel.primFreq = 2462 # an in-place edit keeps the context
   else: nodes[0].targetTime = 200
   now = 151
   mm_timer_schedule()
-  doAssert deliveredTbtt.len == 0 and enabled
+  doAssert deliveredTbtt.len == (change == 4).int and enabled
 ''',
     "rearm_after_pop": r'''
 arm()
