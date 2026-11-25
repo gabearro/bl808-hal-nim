@@ -7034,8 +7034,9 @@ reset left SM waiting with no completion. A 2026-11-24 audit found the
 cases below; reachability was argued from code, not reproduced on
 hardware.
 
-`smTxSessionCurrent` now checks the connection attempt without the reset
-epoch, and `smTxOwnerCurrent` adds the epoch for frames only. The
+SM's frame builders no longer check the attempt or the frame with a TX
+session identity (`smTxSessionCurrent`, `smTxOwnerCurrent` and the rest
+were removed; see "SM frame builders and lock discipline" below). The
 auth/assoc response deadline and the expected auth response carry the SM
 operation's stamp instead (see "SM response deadline" below), and the
 scan, join, registration, BSS parameter, activation and cleanup exchanges
@@ -7742,6 +7743,129 @@ an AP station), `tools/test_wifi_station_abort.py`,
 `tools/test_wifi_activation_exchange.py`, `tools/test_wifi_activation_mm.py`
 and `tools/test_wifi_deferred_auth_lifetime.py`. The M0 HTTP server and
 scan-ownership bench manifests built; none of this was flashed.
+
+#### SM frame builders and lock discipline
+
+`sm_auth_send`, `sm_assoc_req_send`, `sm_handle_connection` and
+`sm_handle_supplicant_result` build their frame in one pass and then
+commit: enter the state that waits for it (`smGo`, or `smDeauthWait` for a
+deauthentication), arm the response deadline, push. `sm_deauth_send`, which
+nothing waits for, only pushes. A frame is the builder's from `txl_frame_get`
+to the push, which consumes it whether it accepts it or not, so the build
+re-checks neither the frame nor the attempt (`station_tx_build.nim`). The TX
+layer refuses, at the push, a frame whose VIF or station was replaced after
+`txl_frame_get`, or that a TX reset overtook (`txlFramePreparationCurrent`),
+and releases it without a callback.
+
+Two calls of a build can run SM code: `txl_frame_get`, whose pool recovery
+completes queued frames (a protection confirmation can depart the channel,
+whose RX drain can deliver EAPOL to the supplicant, which can call
+`sm_handle_supplicant_result`), and the supplicant's SAE frame builder
+(`wpa_cbs[14]`). Each builder takes the live operation's stamp at entry and
+commits, or reports a failure, only while `opCurrent(smOwn.op, stamp)`;
+otherwise it releases its frame and returns, since whatever moved SM on owns
+the next transition. Differences from the archive and from the port before:
+
+- A TX reset, or the deletion of the AP station, inside the build of an
+  auth or assoc request no longer stops it silently before state 6 or 8.
+  The port's frame re-checks (which included the TX reset epoch) had
+  returned with SM in state 5 or 7, or in 6 or 8 with the retry's deadline
+  already consumed, and nothing armed. The builder now commits, the push is
+  refused, and the response deadline retries, as the blob's would for a
+  frame that was never acknowledged (its builders ignore the push result).
+- A failure found after such a call (the SAE builder returned nothing, the
+  association body did not fit) is reported only while the operation is the
+  builder's; a failure after SM moved on is not reported against the new
+  attempt.
+- `sm_handle_supplicant_result` has the same commit check: if SM moved on
+  during its `txl_frame_get`, no deauthentication wait starts and nothing is
+  sent. It had pushed and entered state 10 whenever no teardown was running.
+- A builder whose VIF is no longer a STA VIF (unreachable: its removal ends
+  the attempt first) reports the attempt's failure (`smJoinPeer`, status 2
+  or 5) instead of returning. A pool frame without a link or hardware
+  descriptor (unreachable: `txl_frame_get` restores the link, and the pool's
+  hardware descriptors are fixed) is an allocation failure in
+  `sm_auth_send` and `sm_assoc_req_send`, as it already was in
+  `sm_handle_connection` and `sm_handle_supplicant_result`; `sm_deauth_send`
+  drops it.
+- The auth and assoc frames have no confirmation callback, as in `sm.o`:
+  their response or the deadline ends the wait. The deauthentication frames'
+  confirmations take only the stamp of the live wait (`smDeauthConfirmed`).
+- `sm_auth_handler` and `sm_assoc_rsp_handler` no longer re-check the attempt
+  after the timer clear, the traces, the logs, the copies, the rate
+  initialisation (`meTryInitRate`) or the TPC update: none of these runs SM
+  code. After the supplicant's SAE callback the handler compares the SM
+  operation's stamp, since the supplicant may end the attempt or send a new
+  request there. The auth and assoc builders compare it right after
+  `txl_frame_get` too, before they read the attempt's request again. The association comeback and the activation follow
+  the response with no check between them.
+
+SM takes no IRQ lock. No interrupt handler (`rxl_timer_int_handler`,
+`txl_transmit_trigger`, `hal_machw_gen_handler`, the IPC and PHY handlers)
+touches SM's state, scan results or kernel messages: they post events, move
+TX/RX descriptors and raise recovery. The masks in SM's code had also kept
+host OS timers, events and delayed actions from running inside those
+sections (an OS wait refuses to run them while MIE is clear). The firmware
+step guard only refuses nested firmware dispatch, so a host callout that
+waits, a log included, can now run a host timer that calls back into SM.
+That is safe because every SM transition is an `smGo` and a stamp
+comparison follows each such callout. Removed: the masks in
+`station_abort.nim` (the disconnect stamps, touched from `ke_msg_*` in task
+context), `station_sa_query.nim` (reset scope and timeout queueing; the
+`bl808WifiDiagLinkDrop` evidence record keeps its own), `sm_get_bss_params`,
+`sm_connect_req_handler` (two), `sm_deauth_handler`, `sm_sa_query_handler`
+(with its `keTimerClearLocked` call, now `ke_timer_clear`),
+`sm_issue_sa_query_request`, `smTrySubmitSaQuery`,
+`sm_sa_query_timeout_ind_handler` and `mm_connection_loss_ind_handler`. The
+locks the TX, RX and kernel layers take for their own IRQ-shared lists are
+unchanged.
+
+Kept re-checks after a call that can run SM code: each builder's commit
+check; `sm_rsp_timeout_ind_handler` after the supplicant's `authTimeout`;
+the activation's after the host's `SM_STA_ADD_IND` and the WPS callback;
+the cleanup's after the supplicant's disconnect callback;
+`sm_get_bss_params` after its log callbacks (now on the operation's stamp);
+SCANU's directed scan (`scanu_frame_handler`, `scanuPublishFrameResult`)
+after the supplicant's parse, notify and WPS callbacks (now on the
+operation's stamp). `smTrySubmitSaQuery` keeps SA Query's own checks.
+
+Removed: `smTxSerials`, `SmTxBuildContext`, `smTxCapture`, `smTxBegin`,
+`smTxBeginForVif`, `smTxSessionCurrent`, `smTxOwnerCurrent`,
+`smTxBindStation`, `smTxFrameCurrent`, `smTxAdopt`, `smTxSetOwnerState`,
+`smTxSetState`, `smTxSubmit`, `smTxFail`, `smTxEnd`, `smTxRelease`,
+`smTxSnapshotJoinPeer` (now `smJoinPeer`), `smDeauthSend` (folded into
+`sm_deauth_send`), `smAssocOwnerCurrent`, the result of `smAssocDone`, the
+builder parameter of `meBuildSaeAuthenticate` and `meBuildAssociateReq`
+(now the frame, for `smTxFits`'s bounds only), about 55 frame re-checks
+(`smTxFrameCurrent`) and about 45 attempt re-checks (`smTxOwnerCurrent`,
+`smAssocOwnerCurrent`, `current()`) in the builders and response handlers,
+and 20 IRQ mask sections. `-d:bl808WifiOpCheck` was not extended: its nested-pump counter
+already shows whether a host callback waits inside a firmware step.
+
+Not done: SCANU's own re-checks in `scanu_frame_handler` (and the IRQ mask
+around its directed-scan block) and SA Query's re-checks in
+`smTrySubmitSaQuery`, which still include the TX reset epoch for its frame
+identity.
+
+Host tests: `tools/test_wifi_op_discipline.py` (one TASK_SM state writer and
+one serial writer; no IRQ lock, `*Locked` call or TX reset epoch in SM's
+files and handlers; every SM handler takes its answer through
+`smTakeAnswer` or a stamp, with five inputs listed as not answers; each
+builder takes its stamp before `txl_frame_get` and checks it before any
+transition; callbacks of pushed frames carry the wait's stamp),
+`tools/test_wifi_station_tx_build.py` (all four build modes; a TX reset or
+station deletion at each point of the build, SM code run inside the build,
+and a failure after it), `tools/test_wifi_sm_audit_sm_connect.py` (the
+overtaken build keeps its deadline; this reproduces at the previous commit),
+`tools/test_wifi_deauth_lifetime.py`, `tools/test_wifi_supplicant_result.py`
+(SM moved on inside `txl_frame_get`), `tools/test_wifi_auth_response.py`,
+`tools/test_wifi_assoc_response.py`, `tools/test_wifi_station_tx_encoding.py`
+and `tools/test_wifi_bss_selection.py`. Cases that changed the attempt or the
+frame from traces, logs, timer clears, copies, allocators, rate or TPC
+updates, `ke_state_set`, or a frame released by someone else mid-build were
+removed with the re-checks they exercised; each remaining check was mutated
+and its test fails. The M0 HTTP server manifest built; none of this was
+flashed.
 
 ## BLE
 

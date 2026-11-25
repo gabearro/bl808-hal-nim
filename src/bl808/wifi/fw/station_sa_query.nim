@@ -20,20 +20,19 @@ var
   smSaQueryResetting {.wifiCtrl.}: bool
   smSaQueryResetEpoch {.wifiCtrl.}: uint32
 
+# SA Query's state is kept in task context only (no interrupt handler
+# touches SM), so it takes no IRQ lock.
+
 proc smSaQueryBeginReset(): bool =
-  let saved = irqSave()
   result = smSaQueryResetting
   smSaQueryResetting = true
   inc smSaQueryResetEpoch
   inc smSaQuery.serial
   smSaQuery.armed = false
   smEnvView().saQueryActive = 0
-  irqRestore(saved)
 
 proc smSaQueryEndReset(previous: bool) =
-  let saved = irqSave()
   smSaQueryResetting = previous
-  irqRestore(saved)
 
 proc smSaQueryClearResetTimer() =
   ke_timer_clear(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM)
@@ -59,12 +58,9 @@ proc smSaQueryCurrent(serial: uint32): bool =
 proc smSaQueryQueueTimeout(serial: uint32) =
   if serial == 0 or not smSaQueryCurrent(serial) or not smSaQuery.armed: return
   let message = ke_msg_try_alloc(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM, 0xFF, 4)
-  let saved = irqSave()
   if not smSaQueryCurrent(serial) or not smSaQuery.armed:
-    irqRestore(saved)
     if message != nil: ke_msg_free(keMsgHdrFromPayload(message))
     return
-  defer: irqRestore(saved)
   if message != nil:
     cast[ptr uint32](message)[] = serial
     ke_msg_send(message)

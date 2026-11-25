@@ -1397,7 +1397,7 @@ def test_wifi_scan_result_prefers_valid_ds_channel_over_stale_rx_frequency():
         "# Channel from DS IE. Some RX indications carry a stale frequency",
         1,
     )[1].split(
-        "var directedOwner:", 1
+        "var directedConnection:", 1
     )[0]
 
     assert "let dsFreq = dsParamFreq(rx.band, ds)" in scan_body
@@ -3712,7 +3712,7 @@ def test_wifi_bss_params_falls_back_to_typed_directed_scan_result():
         "bestDirectedScanuResult(cast[pointer](addr searchSlot.ssidBytes[0]),",
         "selectedBssResult = cast[pointer](directed)",
         "selectedBssChannel = scanResultChannelPtr(directed)",
-        "let owner = smTxCapture(sm.connectInfo)",
+        "let stamp = smOwn.op.serial",
         "scanuResultCurrent(selectedEntrySnapshot)",
         "selectedBssResultOut[] = selectedBssResult",
         "selectedBssChannelOut[] = selectedBssChannel",
@@ -4723,12 +4723,12 @@ def test_wifi_sae_and_assoc_rsp_builders_use_typed_vif_overlays():
         "statusCode: statusCode)",
         "addr bssid[0], addr own[0], passphrasePtr, authSeq.uint32, addr saeLen)",
         "let total = sizeof(AuthFixedBodyView).uint32 + saeLen",
-        "if not smTxFits(build, buf, total): return 0",
+        "if not smTxFits(frame, buf, total): return 0",
         "discard c_memcpy(addr body.variablePayload[0], saeData, saeLen.csize_t)",
     ]:
         assert expected in sae_body
     assert sae_body.index("let saeData =") < sae_body.index(
-        "if not smTxFits(build, buf, sizeof(AuthFixedBodyView).uint32) or"
+        "if not smTxFits(frame, buf, total): return 0"
     ) < sae_body.index("discard c_memcpy(addr body.variablePayload[0]")
     assert sae_body.rstrip().endswith("\n  total")
 
@@ -5742,7 +5742,7 @@ def test_wifi_auth_handler_uses_semantic_auth_frame_overlay():
         "handleSae(smAuthSaeBodyPtr(frame), frameLen - 6, sequence, nil)",
         "smAuthSharedChallengePtr(frame)",
         "if frameLen < 6 or frameLen.uint32 > payloadLength - 32: return",
-        "smTxOwnerCurrent(owner) and smEnvView().connectIndMsg == indication",
+        "if not smAuthResponseMatches(algorithm, expectedSequence): return",
         "sm_connect_ind(WLAN_FW_AUTHENTICATION_FAIILURE.uint16, status)",
     ]:
         assert expected in body
@@ -17912,8 +17912,8 @@ def test_wifi_sm_delete_resources_does_not_emit_host_indications():
 def test_wifi_sm_deauth_send_uses_typed_frame_overlays():
     wifi_fw = wifi_fw_policy_source()
 
-    body = wifi_fw.rsplit("proc smDeauthSend", 1)[1].split(
-        "proc sm_deauth_send*", 1
+    body = wifi_fw.rsplit("proc sm_deauth_send*", 1)[1].split(
+        "proc sm_auth_send*", 1
     )[0]
 
     for expected in [
@@ -17927,7 +17927,7 @@ def test_wifi_sm_deauth_send_uses_typed_frame_overlays():
         "c_memcpy(addr hdr.addr1[0], bssidPtr, 6.csize_t)",
         "c_memcpy(addr hdr.addr2[0],",
         "c_memcpy(addr hdr.addr3[0], bssidPtr, 6.csize_t)",
-        "hdr.seqCtrl = sequence",
+        "hdr.seqCtrl = txl_get_seq_ctrl()",
         "desc.callbackArg = cast[pointer](vif)",
         "let bodyPtr = cast[pointer](addr link.macHeader[sizeof(MacDataFrameHeaderView)])",
         "let txDesc = hostTxHwDescAt(desc.hwDesc)",
@@ -17966,18 +17966,18 @@ def test_wifi_sm_handle_connection_uses_typed_frame_overlays():
         "c_memcpy(addr hdr.addr1[0], staMac, 6.csize_t)",
         "c_memcpy(addr hdr.addr2[0],",
         "c_memcpy(addr hdr.addr3[0], staMac, 6.csize_t)",
-        "hdr.seqCtrl = seqCtrl",
+        "hdr.seqCtrl = txl_get_seq_ctrl()",
         "let fc = hdr.frameControl",
         "let macHdrPtr = cast[pointer](hdr)",
         "let bodyStart = cast[pointer](addr link.macHeader[bodyOffset])",
         "let txDesc = hostTxHwDescAt(desc.hwDesc)",
         "txDesc.payloadEnd = payloadLen - 1 + totalLen.uint32",
         "txDesc.frameLen = totalLen.uint32 + 4",
-        "desc.callbackArg = opStampEnv(stamp)",
+        "desc.callbackArg = opStampEnv(wait)",
         "if desc.hdrLen != 8 or desc.secTailLen != 8:",
         "if micLen != 18:",
         "cast[proc(a: pointer; b, c: uint16) {.cdecl.}](failureFn)",
-        "if smTxSubmit(build, false):\n    return",
+        "if txl_frame_push(frame, 3) != 0:\n    return",
     ]:
         assert expected in body
 
@@ -18028,7 +18028,7 @@ def test_wifi_supplicant_deauth_uses_typed_frame_overlays():
         "c_memcpy(addr hdr.addr3[0],",
         "hdr.seqCtrl = seqCtrl",
         "let callback = cast[pointer](sm_supplicant_deauth_cfm)",
-        "desc.callbackArg = opStampEnv(stamp)",
+        "desc.callbackArg = opStampEnv(wait)",
         "desc.vifIdx = vifIdx",
         "desc.staInfoIdx = result_code",
         "let thd = hostTxHwDescAt(desc.hwDesc)",

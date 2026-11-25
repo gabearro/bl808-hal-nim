@@ -902,20 +902,16 @@ proc mm_connection_loss_ind_handler*(param: pointer): cint {.exportc, cdecl, dis
   ## Here sm_disconnect_process enters state 10 once its cleanup has claimed
   ## the link.
   if param == nil: return KeMsgConsumed
-  let saved = irqSave()
   let tag = mmConnLossTagFor(param)
   if tag == nil:
-    irqRestore(saved)
     return KeMsgConsumed
   # The saved-message queue can retry this indication after a new connection
   # starts. Check its producer identity before asking the kernel to save it.
   if ke_state_get(TASK_SM) != SmIdleState:
-    irqRestore(saved)
     return KeMsgSaved
   let vif = tag.identity.vif
   let reason = tag.reason
   tag.consumed = true
-  irqRestore(saved)
   if vifChannelAt(vif).vifType != VIF_TYPE_STA or vifChannelAt(vif).state == 0:
     return KeMsgConsumed
   sm_connection_tlv_set()
@@ -2124,8 +2120,6 @@ proc sm_connect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   let publishedIndication = indication
   var published = false
   block:
-    let saved = irqSave()
-    defer: irqRestore(saved)
     if unclaimed(epoch):
       sm.connectInfo = param
       sm.connectIndMsg = indication
@@ -2155,8 +2149,6 @@ proc sm_connect_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   var selectedChannel: ScanChannelEntry
   var localMac: array[6, uint8]
   block:
-    let saved = irqSave()
-    defer: irqRestore(saved)
     if current():
       var selectedBssResult, selectedBssChannel: pointer
       if connectInfoHasChannelHint(req) and smConnectReqHasSpecificBssid(req):
@@ -2322,10 +2314,6 @@ proc sm_rsp_timeout_ind_handler*(param: pointer): cint {.exportc, cdecl, discard
 proc sm_sa_query_timeout_ind_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
   ## Retry twice, then report the original AP disconnect reason on the peer's
   ## VIF. Kernel handlers return zero (message consumed), as in sm_task.o.
-  let saved = irqSave()
-  var locked = true
-  defer:
-    if locked: irqRestore(saved)
   let serial = smSaQueryClaimTimeout(param)
   if serial == 0: return 0
   let sm = smEnvView()
@@ -2336,8 +2324,6 @@ proc sm_sa_query_timeout_ind_handler*(param: pointer): cint {.exportc, cdecl, di
     sm_issue_sa_query_request()
     return 0
   sm.saQueryActive = 0
-  locked = false
-  irqRestore(saved)
   when defined(bl808WifiDiagLinkDrop):
     smReportApDisconnect(smSaQuery.peer, sm.saQueryReason, smSaQuery.evidence)
   else:
@@ -3118,9 +3104,7 @@ proc me_set_active_cfm_handler_sm*(param: pointer): cint {.exportc: "me_set_acti
     nimFwConnectTrace2U32("[WIFI-CT] active_flag ", sm.deauthPending.uint32,
                           ke_state_get(TASK_SM).uint32)
   if sm.deauthPending != 0:
-    var build = smTxBegin(sm.connectInfo)
-    smDeauthSend(build)
-    smTxEnd(build)
+    sm_deauth_send()
     sm.deauthPending = 0
   when defined(bl808WifiConnectTrace):
     nimFwConnectTrace2U32("[WIFI-CT] active_cfm ", ke_state_get(TASK_SM).uint32,

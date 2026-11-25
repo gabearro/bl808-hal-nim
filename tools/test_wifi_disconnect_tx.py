@@ -34,11 +34,6 @@ type
     bufDesc, hwDesc, callback, callbackArg: pointer
     vifIdx, staInfoIdx, hdrLen, secTailLen: uint8
     frameLen, seqPassthrough: uint16
-  SmTxBuildContext = object
-    identity: tuple[captured: bool, vif: uint8]
-    frame: pointer
-    state: uint16
-    ownsFrame: bool
   Vif = object
     vifType, state, staIdx, vifIdx, probeCount: uint8
     macAddr: array[6, uint8]
@@ -108,26 +103,6 @@ proc txl_frame_push(p: pointer; ac: uint8): uint8 {.discardable.} =
     inc releases # Failed push consumes/releases the descriptor itself.
     return 0
   1
-proc smTxBeginForVif(vif: uint8): SmTxBuildContext =
-  result.identity.captured = vif < 2 and vifs[vif].vifType == 0
-  result.identity.vif = vif
-proc smTxBegin(connection: pointer): SmTxBuildContext =
-  if connection != nil: result = smTxBeginForVif(connectInfoView(connection).vifIdx)
-proc smTxBindStation(build: var SmTxBuildContext; station: uint8): bool = true
-proc smTxOwnerCurrent(build: SmTxBuildContext): bool = true
-proc smTxAdopt(build: var SmTxBuildContext; frame: pointer): bool =
-  build.frame = frame
-  build.ownsFrame = true
-  let desc = hostTxDescAt(frame)
-  desc.bufDesc != nil and desc.hwDesc != nil
-proc smTxFrameCurrent(build: var SmTxBuildContext): bool = true
-proc smTxEnd(build: var SmTxBuildContext) =
-  if build.ownsFrame:
-    build.ownsFrame = false
-    txl_frame_release(build.frame, false)
-proc smTxSubmit(build: var SmTxBuildContext; forced: bool): bool =
-  build.ownsFrame = false
-  txl_frame_push(build.frame, 3) != 0
 proc sm_disconnect_process(vif: pointer; status, reason: uint16) {.cdecl.} =
   events.add(("disconnect", vif, status, reason))
 proc smConnectEnd(status, reason: uint16) =
@@ -198,6 +173,8 @@ CHECKS = r"""
 proc resetAll(vif, station: uint8) =
   reset(vif, station)
   smOwn = default(typeof(smOwn))
+  smGo(SmIdleState)  # SM's live operation, as after sm_init
+  events.setLen(0)
 
 for vif in 0'u8 .. 1'u8:
   for station in 0'u8 .. 6'u8:
@@ -386,7 +363,7 @@ def test_disconnect_frame_and_completion(tmp_path: Path) -> None:
         pytest.skip("nim is not installed")
     sm = (FW / "scan_station_ap_me.nim").read_text()
     tasks = (FW / "task_handlers.nim").read_text()
-    source = PLATFORM + station_sm_source(
+    source = PLATFORM + "const VIF_TYPE_STA = 0'u8\n" + station_sm_source(
         "smGo", "smDeauthConfirmed", "smDeauthVif", "smDeauthGuardExpired", "smDeauthWait")
     source += procedure(sm, "me_build_deauthenticate")
     source += procedure(sm, "sm_disconnect_deauth_cfm")

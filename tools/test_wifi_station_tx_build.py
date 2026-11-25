@@ -95,6 +95,8 @@ var
   hardware: array[2, Hw]
   links: array[2, Link]
   leased: array[2, bool]
+  frameIdentities: array[2, tuple[reset: uint32; vifs: array[2, uint32];
+                                  stations: array[7, uint32]]]
   generations: array[2, uint32]
   rxVifEpochs: array[2, uint32]
   stationEpochs: array[7, uint32]
@@ -110,7 +112,7 @@ var
   expiryMessage: pointer
   wpa_cbs: pointer
   smConnecting: bool
-  allocationFailure, pushFailure, timerFailure: bool
+  allocationFailure, pushFailure, timerFailure, saeBuildFails: bool
   hook, action: int
   hookFired: bool
   pushes, releases, failures, timerSetCalls: int
@@ -236,6 +238,9 @@ proc txl_frame_get(size: uint32): pointer =
     if not leased[i]:
       leased[i] = true
       inc generations[i]
+      # Like txlCaptureFrameIdentity: the epochs at entry, before pool
+      # recovery can run frame callbacks (hook 1).
+      frameIdentities[i] = (txResetEpoch, rxVifEpochs, stationEpochs)
       descriptors[i] = HostTxDescView(bufDesc: addr links[i], hwDesc: addr hardware[i])
       hardware[i].payloadStart = 0x1000
       activeFrame = addr descriptors[i]
@@ -255,7 +260,8 @@ proc me_build_authenticate(buf: pointer; algo, sequence, status: uint16; challen
   observe(3)
   6
 proc me_build_sae_authenticate(buf: pointer; algo, sequence, status: uint16; vif: uint32): uint32 =
-  me_build_authenticate(buf, algo, sequence, status, nil)
+  result = me_build_authenticate(buf, algo, sequence, status, nil)
+  if saeBuildFails: result = 0
 proc me_build_associate_req_impl(buf, assocInfo, reassoc, cap, cursorOut, lengthOut, info: pointer): uint32 =
   let bytes = cast[ptr UncheckedArray[uint8]](buf)
   for i in 0..<4 + encodedIeSize.int: bytes[i] = 0
@@ -288,9 +294,18 @@ proc captureAuthTxHwPrePush(p: ptr HostTxDescView; hw: ptr Hw) = observe(5)
 proc txl_frame_push(p: pointer; ac: uint8): uint8 {.discardable.} =
   doAssert ac == 3
   inc pushes
+  # The TX layer refuses a frame overtaken by a TX reset or whose VIF or
+  # station was replaced since txl_frame_get (txlFramePreparationCurrent).
+  let i = frameIndex(p)
+  let desc = hostTxDescAt(p)
+  let identity = frameIdentities[i]
+  let current = identity.reset == txResetEpoch and
+    identity.vifs[desc.vifIdx] == rxVifEpochs[desc.vifIdx] and
+    identity.stations[desc.staInfoIdx] == stationEpochs[desc.staInfoIdx] and
+    txlStationAdmits(desc)
   observe(6)
   if onHandoff != nil: onHandoff()
-  if pushFailure:
+  if pushFailure or not current:
     txl_frame_release(p, false)
     return 0
   1
@@ -332,7 +347,10 @@ proc observe(point: int) =
     vifs[1].bssid = [0x12'u8, 0x13, 0x14, 0x15, 0x16, 0x17]
     vifs[1].macAddr = [0x22'u8, 0x23, 0x24, 0x25, 0x26, 0x27]
     stas[2].macAddr = [0x32'u8, 0x33, 0x34, 0x35, 0x36, 0x37]
-  of 8: sm.connectIndMsg = addr replacementIndication
+  of 8:
+    sm.connectIndMsg = addr replacementIndication
+    smGo(9)
+  of 9: inc txResetEpoch
   else: discard
 proc setup(kind: int) =
   smOwn = default(typeof(smOwn))
@@ -359,6 +377,7 @@ proc setup(kind: int) =
   allocationFailure = false
   pushFailure = false
   timerFailure = false
+  saeBuildFails = false
   hook = 0
   action = 0
   hookFired = false
@@ -377,6 +396,7 @@ proc setup(kind: int) =
   replacementIndication = default(Indication)
   invalidCursor = false
   onHandoff = nil
+  smGo(currentState)  # SM's live operation, as after sm_init
 proc perform(kind: int) =
   if kind == 0: sm_auth_send(1, nil)
   else: sm_assoc_req_send()
@@ -526,6 +546,9 @@ for kind in 0..1:
     doAssert activeFrame == nil and vifs[1].currentBssid == published
     doAssert failureStatus == (if kind == 0: 2'u16 else: 5'u16) and failureReason == 0xFFFF
 ''',
+    # SM code run inside the build (by txl_frame_get's pool recovery or the
+    # supplicant's SAE builder) moved SM on: the builder commits nothing and
+    # drops its frame.
     "preparation_replacement": r'''
 for kind in 0..1:
   for stage in 1..5:
@@ -534,20 +557,35 @@ for kind in 0..1:
     action = 1
     perform(kind)
     doAssert hookFired
-    doAssert pushes == 0 and failures == 0 and currentState == 9 and timerDelay == 12345
+    doAssert pushes == 0 and failures == 0 and releases == 1
+    doAssert currentState == 9 and timerDelay == 12345 and not smConnecting
 ''',
-    "lease_reuse": r'''
+    # The supplicant's SAE builder (or a callback inside the association
+    # builder) ends the attempt and the build then fails: the failure is not
+    # reported against the new attempt.
+    "failure_after_replacement": r'''
 for kind in 0..1:
-  for stage in 2..5:
-    setup(kind)
-    hook = stage
-    action = 2
-    perform(kind)
-    doAssert hookFired
-    let i = frameIndex(activeFrame)
-    doAssert descriptors[i] == replacementDesc and hardware[i] == replacementHw and links[i] == replacementLink,
-      "older builder modified a replacement frame"
-    doAssert pushes == 0 and leased[i]
+  setup(kind)
+  if kind == 0:
+    conn.authType = 3
+    saeBuildFails = true
+  else:
+    encodedLength = 3
+  hook = 3
+  action = 1
+  perform(kind)
+  doAssert hookFired and pushes == 0 and failures == 0 and releases == 1
+  doAssert currentState == 9 and timerDelay == 12345
+# Without the replacement the same failure is reported.
+for kind in 0..1:
+  setup(kind)
+  if kind == 0:
+    conn.authType = 3
+    saeBuildFails = true
+  else:
+    encodedLength = 3
+  perform(kind)
+  doAssert pushes == 0 and failures == 1 and releases == 1
 ''',
     "normal": r'''
 for kind in 0..1:
@@ -556,26 +594,24 @@ for kind in 0..1:
   doAssert pushes == 1 and failures == 0
   doAssert currentState == (if kind == 0: 6'u16 else: 8'u16) and timerDelay == 0x7D000
 ''',
-    "timer_and_state_replacement": r'''
-# Arming the kernel timer (hook 8) runs no firmware code; see timer_lifetime
-# for a set nested inside another.
-for kind in 0..1:
-  for stage in [7]:
-    setup(kind)
-    hook = stage
-    action = 1
-    perform(kind)
-    doAssert hookFired and pushes == 0 and failures == 0
-    doAssert currentState == 9 and timerDelay == 12345 and not smConnecting
-''',
+    # The builder does not watch the frame it builds. A station deleted, or a
+    # TX reset, at any point of the build makes the TX layer refuse the frame
+    # at the push; SM has entered state 6 or 8 by then, and the response
+    # deadline retries as for a frame the AP did not answer.
     "station_replacement": r'''
 for kind in 0..1:
-  for stage in 1..5:
-    setup(kind)
-    hook = stage
-    action = 3
-    perform(kind)
-    doAssert hookFired and pushes == 0 and failures == 0 and releases == 1
+  for change in [3, 9]:
+    for stage in 1..5:
+      setup(kind)
+      hook = stage
+      action = change
+      perform(kind)
+      let waiting = if kind == 0: SmAuthenticatingState else: SmAssocRspState
+      doAssert hookFired and pushes == 1 and failures == 0 and releases == 1
+      doAssert currentState == waiting and timerDelay == 0x7D000,
+        "a frame the TX layer refused left SM without its response deadline"
+      runTimerClockAt(timerEntry.time)
+      doAssert pushes == 2 and failures == 0 and conn.retry == 1
 ''',
     "timer_failure": r'''
 for kind in 0..1:
@@ -584,15 +620,6 @@ for kind in 0..1:
   perform(kind)
   doAssert pushes == 0 and failures == 1 and releases == 1 and timerDelay == 0
   doAssert failureStatus == 11 and failureReason == 0xFFFF
-''',
-    "timer_descriptor_change": r'''
-for kind in 0..1:
-  for change in [4, 5]:
-    setup(kind)
-    hook = 8
-    action = change
-    perform(kind)
-    doAssert pushes == 0 and failures == 1 and releases == 1 and timerDelay == 0
 ''',
     "allocation_failure": r'''
 for kind, expectedStatus in [1'u16, 4'u16]:
@@ -691,8 +718,10 @@ for excess in 0..1:
   else:
     doAssert pushes == 0 and failures == 1 and releases == 1 and indication == before
 ''',
+    # A new attempt (another SM_CONNECT_IND) admitted during the build: the
+    # old builder writes neither indication.
     "request_ie_replacement": r'''
-for stage in [1, 3, 4, 5, 7, 8]:
+for stage in [1, 3, 4, 5]:
   setup(1)
   hook = stage
   action = 8
@@ -701,8 +730,7 @@ for stage in [1, 3, 4, 5, 7, 8]:
   let before = replacementIndication
   perform(1)
   doAssert hookFired and pushes == 0 and failures == 0 and releases == 1
-  doAssert replacementIndication == before
-  if stage < 7: doAssert indication.assocReqIeLen == 0
+  doAssert replacementIndication == before and indication.assocReqIeLen == 0
 ''',
 }
 
@@ -722,23 +750,20 @@ def program_source() -> str:
     code += "\nvar\n" + "".join(
         f"  {name}: array[{arrays[name]}, uint8]\n" if name in arrays else f"  {name}: uint32\n"
         for name in debug)
-    helper = FW / "station_tx_build.nim"
-    if helper.exists():
-        layout = (FW / "layout_types.nim").read_text()
-        code += "type\n  SmTxBuildContext" + layout.split("  SmTxBuildContext", 1)[1].split("\n\n  ", 1)[0] + "\n"
-        code += station_sm_source("smGo", "smArmResponse", "smResponseExpiry")
-        code += helper.read_text()
-        code += procedure(sm, "smTxSnapshotJoinPeer")
-        code += r'''
+    code += station_sm_source("smGo", "smArmResponse", "smResponseExpiry")
+    code += (FW / "station_tx_build.nim").read_text()
+    code += r'''
 proc meBuildSaeAuthenticate(buf: pointer; algo, sequence, status: uint16; vif: uint32;
-                            build: ptr SmTxBuildContext; peerOverride, ownOverride: pointer): uint32 =
+                            frame: pointer; peerOverride, ownOverride: pointer): uint32 =
+  doAssert frame == activeFrame
   doAssert peerOverride != nil and ownOverride != nil
   let header = hostTxDataHeader(activeFrame)
   doAssert cast[ptr array[6, uint8]](peerOverride)[] == header.addr1
   doAssert cast[ptr array[6, uint8]](ownOverride)[] == header.addr2
   me_build_sae_authenticate(buf, algo, sequence, status, vif)
 proc meBuildAssociateReq(buf, assocInfo, reassoc, cap, cursorOut, lengthOut, info: pointer;
-                         build: ptr SmTxBuildContext): uint32 =
+                         frame: pointer): uint32 =
+  doAssert frame == activeFrame
   me_build_associate_req_impl(buf, assocInfo, reassoc, cap, cursorOut, lengthOut, info)
 '''
     code += functions

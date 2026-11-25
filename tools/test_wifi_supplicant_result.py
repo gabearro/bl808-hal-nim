@@ -19,6 +19,11 @@ SUPPLICANT_PLATFORM = PLATFORM.replace(
     '  events.add(("state", nil, state, 0\'u16))\n  currentSmState = state',
 )
 assert SUPPLICANT_PLATFORM.count("currentSmState") == 2
+# A hook inside txl_frame_get, where pool recovery runs frame callbacks.
+SUPPLICANT_PLATFORM = SUPPLICANT_PLATFORM.replace(
+    "  inc getCalls\n", "  inc getCalls\n  if onFrameGet != nil: onFrameGet()\n", 1,
+).replace("var\n  vifs:", "var\n  onFrameGet: proc()\n  vifs:", 1)
+assert SUPPLICANT_PLATFORM.count("onFrameGet") == 3
 
 EXTENSION = r"""
 const
@@ -82,6 +87,7 @@ proc resetSupp(vif, station: uint8) =
   stations[station].valid = 1
   currentSmState = 9
   smOwn = default(typeof(smOwn))
+  discard opGo(smOwn.op)  # the live state-9 operation
   txResetEpoch = 0
   isResetting = false
   logEnabled = false
@@ -160,6 +166,18 @@ for failure in 0 .. 3:
   for event in events:
     if event.kind == "abort": inc notifications
   doAssert notifications == 1
+
+# SM code run inside txl_frame_get (its pool recovery's frame callbacks; here
+# the attempt ends) moved SM on: the builder drops its frame, commits nothing
+# and reports nothing.
+resetSupp(1, 4)
+onFrameGet = proc() =
+  onFrameGet = nil
+  smGo(SmIdleState)
+sm_handle_supplicant_result(4, 17)
+doAssert getCalls == 1 and pushCalls == 0 and releases == 1
+doAssert currentSmState == SmIdleState and smOwn.teardown == tdNone
+for event in events: doAssert event.kind notin ["abort", "failure"]
 
 for priorState in [0'u8, 1, 2]:
   resetSupp(0, 0)
@@ -316,6 +334,6 @@ def test_supplicant_reason_and_completion(tmp_path: Path) -> None:
             + procedure(source, "me_build_deauthenticate")
             + established_path(source)
             + procedure(source, "sm_handle_supplicant_result")
-            + procedure(source, "smDeauthSend")
+            + "when not declared(VIF_TYPE_STA):\n  const VIF_TYPE_STA = 0'u8\n"
             + procedure(source, "sm_deauth_send")
             + procedure(platform, "bl_wifi_auth_done_internal") + CHECKS)

@@ -30,7 +30,6 @@ proc dsParamFreq(band: uint8; p: ptr DsParamSetIeView): uint16 =
 """)
     base += r'''
 const IE_ID_SSID = 0'u8
-type SmTxBuildContext = object
 var
   scan_env: tuple[abortFlag: uint8]
   channel: ScanChannelEntry
@@ -44,7 +43,6 @@ var
   nimFwDbgScanFrameAccepted, nimFwDbgScanFrameLast: uint32
 proc macIeAt(p: uint): ptr MacIeView = cast[ptr MacIeView](p)
 proc ssidIeAt(p: pointer): ptr SsidIeView = cast[ptr SsidIeView](p)
-proc smTxOwnerCurrent(owner: SmTxBuildContext): bool = true
 proc scanuCachedChannelFor(p: ptr ScanuResultEntry): ptr ScanChannelEntry = addr channel
 proc configuredScanChannelEntryForFreq(freq: uint16): ptr ScanChannelEntry =
   if not allowConfiguredChannel: return nil
@@ -112,10 +110,12 @@ proc prepareUpdate(hasDs: bool; strength: int8; ssid = 65'u8) =
     # The dwell owner is covered by test_wifi_sm_audit_scan; count the request here.
     base += "\nwhen not declared(scanEarlyEndRequest):\n  proc scanEarlyEndRequest() = ke_msg_send_basic(0x4C, 1, 2)\n"
     base += procedure((FW / "mac_config_debug.nim").read_text(), "mac_ie_find")
+    # A directed scan's SM operation (unused here: bfOn is 0).
+    base += (FW / "op.nim").read_text() + "\nvar smOwn: tuple[op: Op]\n"
     for name in ["scanuResetCachedSsid", "scanuCacheSsid", "scanuCacheChannel",
                  "scanuPublishFrameResult"]:
         base += procedure(scan, name)
-    common = procedure(scan, "scanu_frame_handler").split("  var directedOwner:", 1)[0]
+    common = procedure(scan, "scanu_frame_handler").split("  var directedConnection:", 1)[0]
     return base + common + r'''
   reachedCommit = true
   scanuPublishFrameResult(frame, totalLen, len,

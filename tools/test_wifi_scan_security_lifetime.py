@@ -206,14 +206,15 @@ for size in [6, 128, 129, 255, 256, 257]:
 def test_directed_owner_is_bound_before_use() -> None:
     scan = (FW / "scan_station_ap_me.nim").read_text()
     body = procedure(scan, "scanu_frame_handler")
-    assert body.index("directedOwner = smTxCapture(smEnvView().connectInfo)") < \
-        body.index("let connectInfoPtr = directedOwner.connection")
-    assert "directedOwner.identity.vif != scanVifIdx" in body
-    assert "if bfOn == 0: nil else: addr directedOwner" in body
+    assert body.index("directedConnection = smEnvView().connectInfo") < \
+        body.index("directedStamp = smOwn.op.serial") < \
+        body.index("let connectInfoPtr = directedConnection")
+    assert "connectInfoView(directedConnection).vifIdx != scanVifIdx" in body
+    assert "if bfOn == 0: 0'u32 else: directedStamp" in body
     publisher = procedure(scan, "scanuPublishFrameResult")
-    assert "connection == nil or smTxOwnerCurrent(connection[])" in publisher
+    assert "smStamp == 0 or opCurrent(smOwn.op, smStamp)" in publisher
     checks = owner_templates(scan)
-    assert "bfOn == 0 or smTxOwnerCurrent(directedOwner)" in checks
+    assert "bfOn == 0 or opCurrent(smOwn.op, directedStamp)" in checks
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])

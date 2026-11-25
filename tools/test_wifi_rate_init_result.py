@@ -86,12 +86,6 @@ sm_assoc_rsp_handler(p)
 doAssert rates == 1 and failures == @[(5'u16, 0xFFFF'u16)]
 doAssert powers.len == 0 and sent.len == 0 and state == 8
 finish(p)
-let replacementFrame = response([])
-failRateInit = true
-onRate = replaceOwner
-sm_assoc_rsp_handler(replacementFrame)
-doAssert failures.len == 0 and sent.len == 0 and state == 6
-finish(replacementFrame)
 ''')
 
 

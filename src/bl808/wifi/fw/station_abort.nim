@@ -11,6 +11,10 @@
 #
 # SM_CONNECT_ABORT_REQ needs no stamp: it is answered in place and never
 # saved, so it acts on the attempt that is live when it is dispatched.
+#
+# The stamps are kept and read only in task context: no interrupt handler
+# allocates, sends or frees a kernel message (they post events), so the list
+# takes no IRQ lock.
 
 type SmDisconnectStamp = object
   next: ptr SmDisconnectStamp
@@ -41,15 +45,11 @@ proc smDisconnectRegister(header: ptr KeMsgHdr) =
   const alignment = alignof(SmDisconnectStamp).uint32
   let offset = (header.paramLen + KeMsgTailSlack + alignment - 1) and not (alignment - 1)
   let stamp = cast[ptr SmDisconnectStamp](cast[uint](keMsgPayload(header)) + offset.uint)
-  let saved = irqSave()
   stamp[] = SmDisconnectStamp(next: smDisconnectStamps, header: header)
   smDisconnectStamps = stamp
-  irqRestore(saved)
 
 proc smDisconnectForget(header: pointer) =
   ## ke_msg_free.
-  let saved = irqSave()
-  defer: irqRestore(saved)
   var link = addr smDisconnectStamps
   while link[] != nil:
     if link[].header == header:
@@ -65,8 +65,6 @@ proc smDisconnectStamp(header: ptr KeMsgHdr) =
   ## ke_msg_send: record, once, the STA VIF the request names and its
   ## generation.
   if not smIsDisconnectRequest(header.id, header.destId): return
-  let saved = irqSave()
-  defer: irqRestore(saved)
   let stamp = smDisconnectFind(header)
   if stamp == nil or stamp.stamped: return
   stamp.stamped = true
@@ -84,8 +82,6 @@ proc smDisconnectCurrent(request: pointer): bool =
   ## through ke_msg_send is stamped now.
   let header = keMsgHdrFromPayload(request)
   smDisconnectStamp(header)
-  let saved = irqSave()
-  defer: irqRestore(saved)
   let stamp = smDisconnectFind(header)
   stamp != nil and stamp.vif < MAX_VIFS.uint8 and header.paramLen == 1 and
     cast[ptr uint8](request)[] == stamp.vif and

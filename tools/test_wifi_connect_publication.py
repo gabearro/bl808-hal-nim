@@ -113,10 +113,12 @@ vifs[0].macAddr = [4'u8, 1, 2, 3, 4, 5]
 '''
 
 CASES = {
+    # SM takes no IRQ lock (no interrupt handler touches SM or scan results):
+    # the selection runs with interrupts as the handler found them.
     "selection_snapshot_guard": r'''
 useSelected = true
 connectHook = proc(point: string) =
-  if point == "select": doAssert not interruptsEnabled
+  if point == "select": doAssert interruptsEnabled
 doAssert sm_connect_req_handler(request) == KeMsgNoFree
 doAssert reconnectJoins == 1 and interruptsEnabled
 ''',

@@ -97,14 +97,6 @@ type
     vif, station: uint8
     captured: bool
 
-  SmTxBuildContext = object
-    connection, frame, link, hardware: pointer
-    identity: TxSessionIdentity
-    serial, lease: uint32
-    stamp: uint32  ## the SM operation smTxSetOwnerState started
-    state: uint16
-    ownsFrame: bool
-
   SmAuthResponseExpectation = object
     stamp: uint32  ## the SM operation that sent the request
     algorithm: uint8

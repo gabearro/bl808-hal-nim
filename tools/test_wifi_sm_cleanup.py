@@ -58,10 +58,6 @@ type
     primaryFreq, centerFreq: uint16
     cancelRequested, joinBssFlag, deauthPending, saQueryActive: uint8
     scanResultIndex: uint32
-  SmTxBuildContext = object
-    connection: pointer
-    state: uint16
-    identity: tuple[captured: bool]
   RxHostSession = object
     vif: uint8
     epoch: uint32
@@ -160,13 +156,6 @@ proc scanu_rm_exist_ssid(p: pointer; index: uint8) =
     action()
 proc sm_auth_start() = inc starts
 proc sm_deauth_send() = inc starts
-proc smTxBegin(connection: pointer): SmTxBuildContext =
-  SmTxBuildContext(connection: connection, state: ke_state_get(TASK_SM),
-    identity: (captured: connection != nil))
-proc smTxOwnerCurrent(build: SmTxBuildContext): bool =
-  sm.connectInfo == build.connection and ke_state_get(TASK_SM) == build.state
-proc smTxEnd(build: var SmTxBuildContext) = discard
-proc smDeauthSend(build: var SmTxBuildContext) = sm_deauth_send()
 proc sm_send_next_bss_param() = inc starts
 proc smBssNext(): bool = true
 proc stationDisconnected(reason: uint8) {.cdecl.} =

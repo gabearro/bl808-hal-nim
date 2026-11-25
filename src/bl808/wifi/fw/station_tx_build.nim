@@ -1,110 +1,50 @@
-var smTxSerials {.wifiCtrl.}: array[MAX_VIFS, uint32]
+# What SM's frame builders share: the attempt's AP, the bounds of the frame
+# being built and the auth response SM expects.
+#
+# sm_auth_send, sm_assoc_req_send, sm_handle_connection and
+# sm_handle_supplicant_result build their frame in one pass and then commit:
+# enter the state that waits for it (smGo, smDeauthWait), arm the response
+# deadline, push. sm_deauth_send, which nothing waits for, only pushes. The
+# frame is the builder's from txl_frame_get until the push, which consumes it
+# whether it accepts it or not, so nothing in the build re-checks it.
+#
+# Two calls of a build can run SM code: txl_frame_get, whose pool recovery
+# completes queued frames (their callbacks can depart a channel and drain RX
+# into the supplicant), and the supplicant's SAE frame builder. A builder
+# therefore takes the live operation's stamp at entry and commits, or reports
+# a failure, only while opCurrent(smOwn.op, stamp); otherwise it releases its
+# frame and returns, because whatever moved SM on owns the next transition.
+#
+# A frame whose VIF or station was replaced after txl_frame_get, or that a TX
+# reset overtook, is refused by the push (txlFramePreparationCurrent) and
+# released without a callback. For auth and assoc the response deadline then
+# retries, as it does for a frame the AP did not answer.
+
 var smAuthExpected {.wifiCtrl.}: SmAuthResponseExpectation
 
-proc smTxCapture(connection: pointer): SmTxBuildContext =
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  if connection == nil or smEnvView().connectInfo != connection: return
-  let vifIndex = connectInfoView(connection).vifIdx
-  if vifIndex >= MAX_VIFS.uint8: return
-  let vif = vifChannelForIdx(vifIndex)
-  if vif.vifIdx != vifIndex or vif.vifType != VIF_TYPE_STA: return
-  result = SmTxBuildContext(connection: connection, serial: smTxSerials[vifIndex],
-    state: ke_state_get(TASK_SM), identity: TxSessionIdentity(captured: true,
-      vif: vifIndex, station: 0xFF, vifEpoch: rxVifEpochs[vifIndex],
-      stationEpoch: staDeleteEpoch(0xFF), resetEpoch: txResetEpoch))
-
-proc smTxBeginForVif(vifIndex: uint8): SmTxBuildContext =
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  if vifIndex >= MAX_VIFS.uint8: return
-  let vif = vifChannelForIdx(vifIndex)
-  if vif.vifIdx != vifIndex or vif.vifType != VIF_TYPE_STA: return
-  inc smTxSerials[vifIndex]
-  result = SmTxBuildContext(connection: smEnvView().connectInfo,
-    serial: smTxSerials[vifIndex], state: ke_state_get(TASK_SM),
-    identity: TxSessionIdentity(captured: true, vif: vifIndex, station: 0xFF,
-      vifEpoch: rxVifEpochs[vifIndex], stationEpoch: staDeleteEpoch(0xFF),
-      resetEpoch: txResetEpoch))
-
-proc smTxBegin(connection: pointer): SmTxBuildContext =
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  if connection == nil or smEnvView().connectInfo != connection: return
-  smTxBeginForVif(connectInfoView(connection).vifIdx)
-
-proc smTxSessionCurrent(build: SmTxBuildContext): bool =
-  ## The connection attempt that captured `build` is still the live one.
-  ## Frames are checked with smTxOwnerCurrent, which adds the reset epoch.
-  let identity = build.identity
-  identity.captured and identity.vif < MAX_VIFS.uint8 and
-    smTxSerials[identity.vif] == build.serial and
-    smEnvView().connectInfo == build.connection and
-    rxVifEpochs[identity.vif] == identity.vifEpoch and
-    staDeleteEpoch(identity.station) == identity.stationEpoch and
-    vifChannelForIdx(identity.vif).vifIdx == identity.vif and
-    vifChannelForIdx(identity.vif).vifType == VIF_TYPE_STA and
-    (identity.station == 0xFF or
-     vifChannelForIdx(identity.vif).staIdx == identity.station) and
-    ke_state_get(TASK_SM) == build.state
-
-proc smTxOwnerCurrent(build: SmTxBuildContext): bool =
-  build.identity.resetEpoch == txResetEpoch and smTxSessionCurrent(build)
-
-proc smTxBindStation(build: var SmTxBuildContext; station: uint8): bool =
-  if not smTxOwnerCurrent(build): return false
-  if station >= STA_INFO_TAB_ENTRIES.uint8 and station != 0xFF: return false
-  build.identity.station = station
-  build.identity.stationEpoch = staDeleteEpoch(station)
+proc smJoinPeer(vifIdx: uint8; station: var uint8; peer: var MacAddrView): bool =
+  ## The AP station the attempt joined on STA VIF `vifIdx`, and its address.
+  if vifIdx >= MAX_VIFS.uint8: return false
+  let vif = vifChannelForIdx(vifIdx)
+  if vif.vifIdx != vifIdx or vif.vifType != VIF_TYPE_STA: return false
+  station = vif.staIdx
+  if station >= STA_MGMT_FREE_STAS.uint8: return false
+  let sta = staInfoForIdx(station)
+  if sta.valid == 0 or sta.instNbr != vifIdx or sta.macAddr != vif.bssid or
+      not macPtrIsSpecific(addr sta.macAddr[0]):
+    return false
+  peer.bytes = sta.macAddr
   true
 
-proc smTxFrameCurrent(build: var SmTxBuildContext): bool =
-  if not smTxOwnerCurrent(build) or build.frame == nil: return false
-  let desc = hostTxDescAt(build.frame)
-  if not txlFrameLeaseMatches(desc, build.lease) or
-      desc.bufDesc != build.link or desc.hwDesc != build.hardware:
-    return false
-  txlFramePreparationCurrent(desc, build.identity, build.lease)
-
-proc smTxAdopt(build: var SmTxBuildContext; frame: pointer): bool =
-  if frame == nil: return false
-  build.frame = frame
-  let desc = hostTxDescAt(frame)
-  build.lease = txlFrameLeaseToken(desc)
-  build.ownsFrame = true
-  if not smTxOwnerCurrent(build): return false
-  build.link = desc.bufDesc
-  build.hardware = desc.hwDesc
-  desc.vifIdx = build.identity.vif
-  desc.staInfoIdx = build.identity.station
-  smTxFrameCurrent(build)
-
-proc smTxRelease(build: var SmTxBuildContext) =
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  if build.ownsFrame:
-    build.ownsFrame = false
-    if txlFrameLeaseMatches(hostTxDescAt(build.frame), build.lease):
-      txl_frame_release(build.frame, false)
-
-proc smTxEnd(build: var SmTxBuildContext) =
-  ## Release the frame unless the lower layer took it. A response deadline
-  ## the builder armed is left alone: it belongs to the SM operation.
-  smTxRelease(build)
-
-proc smTxFail(build: var SmTxBuildContext; status: uint16) =
-  smTxRelease(build)
-  if smTxOwnerCurrent(build): sm_connect_ind(status, 0xFFFF)
-
-proc smTxSetOwnerState(build: var SmTxBuildContext; state: uint16): bool =
-  if not smTxOwnerCurrent(build): return false
-  build.state = state
-  build.stamp = smGo(state)
-  smTxOwnerCurrent(build)
-
-proc smTxSetState(build: var SmTxBuildContext; state: uint16): bool =
-  if not smTxFrameCurrent(build) or not smTxSetOwnerState(build, state): return false
-  smTxFrameCurrent(build)
+proc smTxFits(frame: pointer; buffer: pointer; length: uint32): bool =
+  ## `length` bytes at `buffer` lie in the MAC header buffer of internal frame
+  ## `frame`. The exported builders pass no frame and are not bounded here.
+  if buffer == nil: return false
+  if frame == nil: return true
+  let base = cast[uint](addr hostTxLinkDescAt(hostTxDescAt(frame).bufDesc).macHeader[0])
+  let address = cast[uint](buffer)
+  address >= base and address - base <= TxlFramePayloadSize.uint and
+    length.uint <= TxlFramePayloadSize.uint - (address - base)
 
 proc smAuthRecordResponse(stamp: uint32; algorithm: uint8; txSequence: uint16): bool =
   ## Expect the response to auth transaction `txSequence`, sent by SM
@@ -146,21 +86,3 @@ proc smAuthConsumeResponse(algorithm, responseSequence: uint16): bool =
   if not smAuthResponseMatches(algorithm, responseSequence): return false
   smAuthExpected.txSequence = 0
   true
-
-proc smTxSubmit(build: var SmTxBuildContext; forced: bool): bool =
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  if not smTxFrameCurrent(build): return false
-  # The lower layer consumes the lease on both accepted and failed submission.
-  build.ownsFrame = false
-  if forced: txl_frame_try_push_force(build.frame, 3) != 0
-  else: txl_frame_push(build.frame, 3) != 0
-
-proc smTxFits(build: ptr SmTxBuildContext; buffer: pointer; length: uint32): bool =
-  if buffer == nil: return false
-  if build == nil: return true
-  if not smTxFrameCurrent(build[]): return false
-  let base = cast[uint](addr hostTxLinkDescAt(build.link).macHeader[0])
-  let address = cast[uint](buffer)
-  address >= base and address - base <= TxlFramePayloadSize.uint and
-    length.uint <= TxlFramePayloadSize.uint - (address - base)

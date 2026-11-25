@@ -71,28 +71,6 @@ proc configureSelectedBssAuth(entry: ptr ScanuResultEntry; ci: ptr ConnectInfoVi
 '''
 
 
-def owner_source() -> str:
-    """The SM connection identity sm_get_bss_params re-checks after each
-    callout (station_tx_build.nim)."""
-    layout = (FW / "layout_types.nim").read_text()
-    code = "type\n"
-    for name in ["TxSessionIdentity", "SmTxBuildContext"]:
-        lines = ("  " + name + layout.split("  " + name, 1)[1]).splitlines()
-        code += lines[0] + "\n"
-        for line in lines[1:]:
-            if line and not line.startswith("    "):
-                break
-            code += line + "\n"
-    code += r'''
-var smTxSerials, rxVifEpochs: array[2, uint32]
-var txResetEpoch: uint32
-proc staDeleteEpoch(index: uint8): uint32 = 0
-'''
-    owner = (FW / "station_tx_build.nim").read_text()
-    return code + "".join(procedure(owner, name) for name in
-                          ("smTxCapture", "smTxSessionCurrent", "smTxOwnerCurrent"))
-
-
 def selection_source() -> str:
     code = "{.define: bl808WifiConnectTrace.}\n" + layouts("ScanuCachedSsid") + completion_source()
     code = code.replace("    channelDuration: uint32", """    channelDuration: uint32
@@ -118,7 +96,7 @@ type ScanEnvironment = object""", 1)
   entries: array[SCANU_MAX_RESULT_ENTRIES, ScanuResultEntry]""", 1)
     scan = (FW / "scan_station_ap_me.nim").read_text()
     layout = (FW / "layout_types.nim").read_text()
-    helpers = owner_source() + SUPPORT
+    helpers = SUPPORT
     for name in ["connectInfoChannelFrequency", "connectInfoHasChannelHint"]:
         helpers += procedure(layout, name)
     helpers += snapshot_source()
@@ -129,7 +107,7 @@ type ScanEnvironment = object""", 1)
     return code + r'''
 proc prepare(route: int) =
   setup()
-  state = SmScanningState
+  discard smGo(SmScanningState)
   boundaryHook = nil
   boundaryCalls.setLen(0)
   configured = 0
@@ -170,19 +148,21 @@ for route in 0 .. 7:
   let count = boundaryCalls.len
   doAssert count > 0
   for trigger in 1 .. count:
-    for action in 0 .. 5:
+    for action in 0 .. 4:
       prepare(route)
       var replaced = false
+      # The log callbacks are host code: SM moved on (a new attempt, sm_init
+      # or the removal of the VIF, another state), the scan was replaced, or
+      # the attempt's indication changed.
       boundaryHook = proc(point: string) =
         if replaced or boundaryCalls.len != trigger: return
         replaced = true
         case action
         of 0: replaceOwner()
-        of 1: inc smTxSerials[conn.vifIdx]
-        of 2: inc rxVifEpochs[conn.vifIdx]
-        of 3: inc scanuRequestEpoch
-        of 4: sm.connectIndMsg = addr otherIndication
-        else: state = SmWaitingState
+        of 1: discard smGo(SmIdleState)
+        of 2: inc scanuRequestEpoch
+        of 3: sm.connectIndMsg = addr otherIndication
+        else: discard smGo(SmWaitingState)
         sm.scanResultIndex = 0xABCDEF01'u32
       bss = addr target
       chan = addr target

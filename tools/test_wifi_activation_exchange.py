@@ -94,7 +94,6 @@ var
   ps: tuple[flags, pendingCount: uint8, currentVif: pointer]
   stationEpochs: array[7, uint32]
   rxKeyLastChanged: array[7, uint64]
-  smTxSerials: array[2, uint32]
   nimFwWpaPendingMask: uint32
   keMsgQueueSent, keMsgQueueSaved: CoList
   meControlCommand, meControlReply, apmStartRequest, apmStartReply, mmPsModeRequest: pointer
@@ -240,7 +239,6 @@ proc setup(vifIndex = 1'u8; staIndex = 2'u8; cipher = 0'u8; flags = 0'u32) =
   mmPsModeRequest = nil
   rxVifEpochs = [1'u32, 1]
   stationEpochs = [1'u32, 1, 1, 1, 1, 1, 1]
-  smTxSerials = [1'u32, 1]
   nimFwWpaPendingMask = 0
   events.setLen(0)
   applied.setLen(0)
@@ -384,20 +382,16 @@ proc finish() =
 
 def source(trace: bool = False) -> str:
     code = "{.define: bl808WifiConnectTrace.}\n" if trace else ""
-    code += layouts("TxSessionIdentity", "SmTxBuildContext",
+    code += layouts("TxSessionIdentity",
                     "MmSetVifStateReqPayload", "MmSetPsOptionsReqPayload",
                     "MeSetPsDisableReqPayload", "SmStaAddIndPayload") + PLATFORM
     code += procedure((FW / "layout_types.nim").read_text(), "lmacGateHalfword")
     kernel = (FW / "kernel_mac_channel.nim").read_text()
     for name in ["co_list_pop_front", "co_list_push_back", "ke_queue_extract"]:
         code += procedure(kernel, name)
-    owner = (FW / "station_tx_build.nim").read_text()
     code += station_sm_source("smGo", "smSendReserved", "smAwaits", "smStaleRequest",
                               "smTakeReply", "smTakeAnswer", "smAbandon", "smStaVifRetired")
-    for name in ["smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent", "smTxBindStation", "smTxSetOwnerState"]:
-        code += procedure(owner, name)
     scan = (FW / "scan_station_ap_me.nim").read_text()
-    code += procedure(scan, "smAssocOwnerCurrent")
     code += (FW / "station_activation.nim").read_text()
     task = (FW / "task_handlers.nim").read_text()
     code += "\nwhen not declared(ke_reschedule_saved_messages):\n  proc ke_reschedule_saved_messages(task: uint8): bool {.discardable.} = false\n"
@@ -679,18 +673,17 @@ doAssert failures == @[(5'u16, 0xFFFF'u16)] and events.len == 0
 finish()
 """,
     # SMCONN-F6 by construction: only SM's own operation ends the exchange.
-    # A TX reset, a VIF epoch or an SM TX serial does not; a station deleted
-    # under it ends the attempt, reported.
+    # A TX reset or a VIF epoch does not; a station deleted under it ends
+    # the attempt, reported.
     "only_the_sm_operation_ends_the_activation": r"""
-for changed in 0..3:
+for changed in 0..2:
   begin()
   case changed
   of 0: inc txResetEpoch
   of 1: inc rxVifEpochs[1]
-  of 2: inc smTxSerials[1]
   else: inc stationEpochs[2]
   drain()
-  if changed < 3:
+  if changed < 2:
     doAssert connected == 1 and stationReady == 1 and failures.len == 0
   else:
     doAssert connected == 0 and failures == @[(5'u16, 0xFFFF'u16)]
@@ -736,9 +729,7 @@ proc wpsEnd() {.cdecl.} = endAttempt()
 setup()
 wps_cbs = addr wps
 wps.staAddConfirm = cast[pointer](wpsEnd)
-var owner = smTxBegin(sm.connectInfo)
-doAssert smTxBindStation(owner, 2)
-doAssert smAssocDone(owner, sm.connectIndMsg, 7, true)
+smAssocDone(1, 2, 7, true)
 doAssert failures == @[(9'u16, 1'u16)] and connected == 0
 doAssert events.len == 0 and smOwn.request == nil and not smActivationLive()
 finish()
@@ -777,9 +768,7 @@ proc wpsSuccess() {.cdecl.} = sm_handle_supplicant_result(2, 0)
 setup(cipher = 3)
 wps_cbs = addr wps
 wps.staAddConfirm = cast[pointer](wpsSuccess)
-var owner = smTxBegin(sm.connectInfo)
-doAssert smTxBindStation(owner, 2)
-doAssert smAssocDone(owner, sm.connectIndMsg, 7, true)
+smAssocDone(1, 2, 7, true)
 doAssert smActivation.supplicantReady and connected == 0
 drain()
 doAssert connected == 1 and stationReady == 1 and stations[2].controlPortState == 2

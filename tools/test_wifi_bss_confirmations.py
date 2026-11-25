@@ -30,7 +30,6 @@ const
   MM_SET_IDLE_CFM = 27'u16
   MM_SET_PS_MODE_REQ = 31'u16
   MM_SET_PS_MODE_CFM = 32'u16
-type SmTxBuildContext = object
 var
   keMsgQueueSent, keMsgQueueSaved: CoList
   me: tuple[requesterId, psOn: uint8, activeMask, psDisableMask: uint32]
@@ -62,9 +61,7 @@ proc controlStateSet(task: uint8; value: uint16) =
 proc smCleanupConfirmed() = doAssert false, "no cleanup runs here"
 proc apmTakeStartReply(p: pointer; id: uint16; length: uint32): pointer = nil
 proc smActivationConfirmed() = inc activations
-proc smTxBegin(connection: pointer): SmTxBuildContext = discard
-proc smTxEnd(build: var SmTxBuildContext) = discard
-proc smDeauthSend(build: var SmTxBuildContext) = inc deauths
+proc sm_deauth_send() = inc deauths
 proc sm_auth_start() =
   inc authStarts
   state = 6

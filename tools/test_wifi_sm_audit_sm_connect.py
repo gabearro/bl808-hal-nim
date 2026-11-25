@@ -151,6 +151,33 @@ finish(p)
 ''', finding="SMCONN-F2")
 
 
+def test_build_overtaken_by_tx_reset_keeps_its_deadline(tmp_path: Path) -> None:
+    """The re-check idiom of the SM structure audit: sm_auth_send and
+    sm_assoc_req_send re-checked their frame and the attempt (with the TX
+    reset epoch) after every call and returned silently before entering
+    state 6 or 8, so a TX reset or a deleted station inside the build (from
+    txl_frame_get's pool recovery) left SM in state 5 or 7 with no deadline
+    (the former station_replacement case asserted exactly that: no push, no
+    failure). A build now commits, the TX layer refuses the overtaken frame,
+    and the response deadline retries."""
+    run_nim(tmp_path, response_source() + r'''
+for kind in 0..1:
+  for change in [9, 3]:        # inc txResetEpoch; delete the AP station
+    for stage in 1..5:         # txl_frame_get .. the last pre-push call
+      setup(kind)
+      hook = stage
+      action = change
+      perform(kind)
+      let waiting = if kind == 0: SmAuthenticatingState else: SmAssocRspState
+      doAssert pushes == 1 and releases == 1 and failures == 0
+      doAssert currentState == waiting and timerDelay != 0,
+        "[SMSTRUCT-RECHECK] the build stopped with SM in state " & $currentState &
+        " and nothing armed"
+      deliverTimeout(fireDeadline())
+      doAssert pushes == 2 and conn.retry == 1 and failures == 0
+''', finding="SMSTRUCT-RECHECK")
+
+
 # --- BSS parameter batch (state 4) -------------------------------------------
 
 def bss_source() -> str:

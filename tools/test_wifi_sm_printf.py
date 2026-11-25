@@ -41,7 +41,7 @@ def with_printf(code: str) -> str:
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-def test_association_failure_status_and_owner(tmp_path: Path, mode: str) -> None:
+def test_association_failure_status(tmp_path: Path, mode: str) -> None:
     run_program(tmp_path, mode, with_printf(assoc.source()) + r'''
 for enabled in [false, true]:
   for status in [1'u16, 17, 30, 256, 0xBEEF, 0xFFFF]:
@@ -55,15 +55,6 @@ for enabled in [false, true]:
     doAssert failures == @[(5'u16, status)]
     doAssert sent.len == 0 and rates == 0
     finish(p)
-
-let p = response([], 17)
-printfEnabled = true
-printedDiagnostics.setLen(0)
-printHook = replaceOwner
-sm_assoc_rsp_handler(p)
-doAssert printedDiagnostics.len == 1
-doAssert failures.len == 0 and state == 6 and sent.len == 0
-finish(p)
 ''')
 
 

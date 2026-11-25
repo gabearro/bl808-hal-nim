@@ -55,7 +55,6 @@ var
   rxVifEpochs: array[2, uint32]
   txResetEpoch: uint32
   stationEpochs: array[7, uint32]
-  smTxSerials: array[2, uint32]
   wps: Wps
   wps_cbs: pointer
   nimFwWpaPendingMask: uint32
@@ -225,10 +224,6 @@ proc response(ies: openArray[uint8]; status = 0'u16): pointer =
   bytes[7] = 2
   bytes[8] = 1
   for i, value in ies: bytes[38 + i] = value
-proc replaceOwner() =
-  sm.connectInfo = addr replacement
-  sm.connectIndMsg = addr otherInd
-  state = 6
 proc finish(p: pointer) =
   ke_msg_free(keMsgHdrFromPayload(p))
   doAssert live.len == 0
@@ -237,14 +232,16 @@ proc finish(p: pointer) =
 
 def source(trace: bool = False) -> str:
     code = "{.define: bl808WifiConnectTrace.}\n" if trace else ""
-    code += layouts("TxSessionIdentity", "SmTxBuildContext", "SmAssocRspFrameView",
+    code += layouts("TxSessionIdentity", "SmAssocRspFrameView",
                     "RxuMgtDispatchView", "MacIeView", "TimeoutIntervalIeView",
                     "SmConnectIndPayload", "MmSetVifStateReqPayload") + PLATFORM
-    owner = (FW / "station_tx_build.nim").read_text()
     code += station_sm_source()
-    for name in ["smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent", "smTxBindStation", "smTxSetOwnerState"]:
-        code += procedure(owner, name)
     code += r'''
+proc replaceOwner() =
+  # Another attempt: SM's state changes only through smGo.
+  sm.connectInfo = addr replacement
+  sm.connectIndMsg = addr otherInd
+  discard smGo(6)
 proc smArmResponse(stamp: uint32; delayUs: uint64): bool =
   doAssert opCurrent(smOwn.op, stamp) and state == SmAssocRspState
   delays.add(delayUs)
@@ -272,7 +269,7 @@ proc smActivationStart(vif, station: uint8; aid: uint16; notifyWps: bool) =
   ke_msg_send(message)
 '''
     scan = (FW / "scan_station_ap_me.nim").read_text()
-    for name in ["smAssocOwnerCurrent", "smAssocIesValid", "smAssocIePrefix", "smAssocDone"]:
+    for name in ["smAssocIesValid", "smAssocIePrefix", "smAssocDone"]:
         if "proc " + name + "(" in scan: code += procedure(scan, name)
     code += procedure((FW / "mac_config_debug.nim").read_text(), "mac_ie_find")
     code += procedure(scan, "sm_assoc_done") + procedure(scan, "sm_assoc_rsp_handler")
@@ -313,14 +310,6 @@ smAssocRspFrameView(p).aid = 0xC000'u16 or 2007'u16
 sm_assoc_rsp_handler(p)
 doAssert sent.len == 1 and sent[0].aid == 2007
 doAssert failures.len == 0
-finish(p)
-''',
-    "clear_replaces_connection": r'''
-let p = response([])
-onClear = replaceOwner
-sm_assoc_rsp_handler(p)
-doAssert rates == 0 and powers.len == 0 and sent.len == 0
-doAssert state == 6
 finish(p)
 ''',
     "activation_state_before_send": r'''
@@ -392,29 +381,6 @@ failAlloc = true
 sm_assoc_rsp_handler(p)
 doAssert failures == @[(5'u16, 0xFFFF'u16)]
 doAssert sent.len == 0 and sm.saQueryActive == 0
-finish(p)
-''',
-    "rate_replacement": r'''
-let p = response([])
-onRate = replaceOwner
-sm_assoc_rsp_handler(p)
-doAssert rates == 1 and powers.len == 0 and sent.len == 0
-doAssert state == 6
-finish(p)
-''',
-    "power_replacement": r'''
-let p = response([])
-onPower = replaceOwner
-sm_assoc_rsp_handler(p)
-doAssert powers.len == 1 and sent.len == 0 and state == 6
-finish(p)
-''',
-    "copy_replacement": r'''
-let p = response([1'u8, 2, 3, 4])
-onCopy = replaceOwner
-sm_assoc_rsp_handler(p)
-doAssert rates == 0 and sent.len == 0 and state == 6
-doAssert otherInd.assocRspIeLen == 0
 finish(p)
 ''',
     "wps_precedes_handoff": r'''
@@ -531,9 +497,8 @@ for invalid in [0'u16, 2008'u16, 0x3FFF'u16]:
     "fallback_ignores_other_state": r'''
 let p = response([])
 state = 0
-let serial = smTxSerials[1]
 sm_assoc_done(1)
-doAssert sent.len == 0 and state == 0 and smTxSerials[1] == serial
+doAssert sent.len == 0 and state == 0
 finish(p)
 ''',
 }
@@ -553,10 +518,8 @@ for name, change in {
     CASES[name] = f'''
 let p = response([])
 {change}
-let serial = smTxSerials[1]
 sm_assoc_rsp_handler(p)
 doAssert clears.len == 0 and sent.len == 0 and rates == 0
-doAssert smTxSerials[1] == serial
 finish(p)
 '''
 
@@ -586,14 +549,3 @@ finish(p)
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_assoc_response(tmp_path: Path, case: str, mode: str) -> None:
     run_program(tmp_path, mode, source() + CASES[case])
-
-
-@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-def test_assoc_response_trace_reentry(tmp_path: Path, mode: str) -> None:
-    run_program(tmp_path, mode, source(trace=True) + r'''
-let p = response([])
-onTrace = replaceOwner
-sm_assoc_rsp_handler(p)
-doAssert state == 6 and sent.len == 0 and rates == 0
-finish(p)
-''')

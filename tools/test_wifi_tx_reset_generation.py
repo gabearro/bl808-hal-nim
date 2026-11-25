@@ -6,8 +6,6 @@ import re
 import pytest
 
 from test_wifi_message_allocation import run_program
-from test_wifi_disconnect_tx import ROOT
-from test_wifi_station_tx_build import program_source as station_source
 from test_wifi_tx_reset_admission import host_source, internal_source
 from test_wifi_tx_reset_owner import source as reset_source
 
@@ -118,23 +116,4 @@ setup()
 resetMode = true
 txl_reset()
 doAssert txResetEpoch == 0 and not txResetActive
-''')
-
-
-@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-def test_station_owner_is_not_current_after_reset(tmp_path: Path, mode: str) -> None:
-    code = with_epoch(station_source())
-    for name in ["states", "status_codes"]:
-        code = code.replace(f"import bl808/wifi/fw_constants/{name}",
-                            f'import "{ROOT}/src/bl808/wifi/fw_constants/{name}"')
-    run_program(tmp_path, mode, code + r'''
-setup(0)
-txResetEpoch = 7
-let before = smTxCapture(addr conn)
-doAssert smTxOwnerCurrent(before)
-inc txResetEpoch
-doAssert not smTxOwnerCurrent(before)
-let after = smTxCapture(addr conn)
-doAssert smTxOwnerCurrent(after)
-doAssert smTxBeginForVif(1).identity.captured
 ''')

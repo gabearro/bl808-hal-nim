@@ -17,8 +17,6 @@ def layouts(*names: str) -> str:
 BODY_PLATFORM = r"""
 const TxlFramePayloadSize = 512'u32
 type
-  SmTxBuildContext = object
-    valid: bool
   Header {.packed.} = object
     frameControl, duration: uint16
     addr1, addr2, addr3: array[6, uint8]
@@ -78,15 +76,12 @@ proc me_build_sae_authenticate(p: pointer; algo, sequence, status: uint16; vif: 
   body[] = AuthFixedBodyView(authAlgo: algo, authSeq: sequence, statusCode: status)
   6
 proc meBuildSaeAuthenticate(p: pointer; algo, sequence, status: uint16; vif: uint32;
-                            build: ptr SmTxBuildContext; peerOverride, ownOverride: pointer): uint32 =
+                            frame: pointer; peerOverride, ownOverride: pointer): uint32 =
+  doAssert frame == addr desc
   let header = cast[ptr Header](addr link.macHeader[0])
   doAssert cast[ptr array[6, uint8]](peerOverride)[] == header.addr1
   doAssert cast[ptr array[6, uint8]](ownOverride)[] == header.addr2
   me_build_sae_authenticate(p, algo, sequence, status, vif)
-proc smTxFrameCurrent(build: var SmTxBuildContext): bool = true
-proc smTxFail(build: var SmTxBuildContext; status: uint16) =
-  txl_frame_release(addr desc, false)
-  sm_connect_ind(status, 0xFFFF)
 proc reset() =
   desc = Desc(hwDesc: addr hw)
   hw = Hw(payloadStart: 0x60001000)
@@ -159,9 +154,13 @@ def test_auth_frame_bytes_and_lengths(tmp_path: Path) -> None:
     body = sender.split("  # Build auth frame header.\n", 1)[1].split("  let authRawLen", 1)[0]
     wrapper = r"""
 proc build(authAlgo: uint8; authSeqNum: uint16; challenge: pointer) =
-  var build: SmTxBuildContext
   let authChallenge = challenge
   let frame = cast[pointer](addr desc)
+  # sm_auth_send's failure exit, for the build's own SM operation.
+  template fail(status: uint16) =
+    txl_frame_release(frame, false)
+    sm_connect_ind(status, 0xFFFF)
+    return
   let desc = addr desc
   let link = addr link
   let hdr = cast[ptr Header](addr link.macHeader[0])

@@ -142,31 +142,19 @@ proc smDisconnectRegister(header: ptr KeMsgHdr)
 proc smDisconnectForget(header: pointer)
 proc smDisconnectStamp(header: ptr KeMsgHdr)
 proc keTimerCancelMutations(id = 0'u16; task = 0'u8; all = false)
-proc smTxBegin(connection: pointer): SmTxBuildContext
-proc smTxCapture(connection: pointer): SmTxBuildContext
 proc chanForceIdle(): bool
-proc smTxBeginForVif(vifIndex: uint8): SmTxBuildContext
-proc smTxOwnerCurrent(build: SmTxBuildContext): bool
-proc smTxBindStation(build: var SmTxBuildContext; station: uint8): bool
-proc smTxAdopt(build: var SmTxBuildContext; frame: pointer): bool
-proc smTxFrameCurrent(build: var SmTxBuildContext): bool
-proc smTxEnd(build: var SmTxBuildContext)
-proc smTxFail(build: var SmTxBuildContext; status: uint16)
-proc smTxSetState(build: var SmTxBuildContext; state: uint16): bool
-proc smTxSetOwnerState(build: var SmTxBuildContext; state: uint16): bool
-proc smDeauthSend(build: var SmTxBuildContext)
+proc smJoinPeer(vifIdx: uint8; station: var uint8; peer: var MacAddrView): bool
 proc smAuthRecordResponse(stamp: uint32; algorithm: uint8; txSequence: uint16): bool
 proc smAuthCancelResponse(stamp: uint32)
 proc smAuthResponseMatches(algorithm, responseSequence: uint16): bool
 proc smAuthConsumeResponse(algorithm, responseSequence: uint16): bool
-proc smTxSubmit(build: var SmTxBuildContext; forced: bool): bool
-proc smTxFits(build: ptr SmTxBuildContext; buffer: pointer; length: uint32): bool
+proc smTxFits(frame: pointer; buffer: pointer; length: uint32): bool
 proc meBuildSaeAuthenticate(buf: pointer; authAlgo, authSeq, statusCode: uint16;
-                            vifIdx: uint32; build: ptr SmTxBuildContext;
+                            vifIdx: uint32; frame: pointer;
                             peerOverride: pointer = nil;
                             ownOverride: pointer = nil): uint32
 proc meBuildAssociateReq(buf, assocInfo, reassocBssid, capParam, cursorOut,
-                        bodyLenOut, connInfo: pointer; build: ptr SmTxBuildContext): uint32
+                        bodyLenOut, connInfo: pointer; frame: pointer): uint32
 proc txl_frame_try_push_force(param: pointer; ac: uint8): uint8
 proc smCleanupCancel()
 proc smAbandon()

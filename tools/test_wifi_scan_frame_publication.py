@@ -16,8 +16,6 @@ type Env = object
   entries: array[SCANU_MAX_RESULT_ENTRIES, ScanuResultEntry]
   paramPtr, pendingJoinRxuMgtInd: pointer
   resultCount: uint16
-type SmTxBuildContext = object
-  serial: uint32
 var
   scanu_env: Env
   scanuCachedSsids: array[SCANU_MAX_RESULT_ENTRIES, ScanuCachedSsid]
@@ -29,8 +27,7 @@ var
   oldLive, copyLive, replacementLive, allocationFails, enabled: bool
   allocations, oldFrees, copyFrees, forwarded: int
   hook: proc(point: string)
-  currentSerial: uint32
-proc smTxOwnerCurrent(owner: SmTxBuildContext): bool = owner.serial == currentSerial
+  smOwn: tuple[op: Op]
 proc fire(point: string) =
   if hook != nil: hook(point)
 proc irqSave(): uint32 =
@@ -76,7 +73,7 @@ proc ke_msg_forward_and_change_id(p: pointer; id: uint16; dst, src: uint8) =
   fire("forward")
 proc setup(hasOld = true) =
   hook = nil
-  currentSerial = 1
+  discard opGo(smOwn.op)
   enabled = true
   scanu_env = default(Env)
   scanuCachedSsids = default(typeof(scanuCachedSsids))
@@ -114,7 +111,8 @@ proc replacePublication(action: int) =
 
 def source() -> str:
     scan = (FW / "scan_station_ap_me.nim").read_text()
-    code = layouts("ScanuResultEntry", "ScanuCachedSsid", "RxuMgtIndView") + PLATFORM
+    code = layouts("ScanuResultEntry", "ScanuCachedSsid", "RxuMgtIndView")
+    code += (FW / "op.nim").read_text() + PLATFORM
     code += procedure(scan, "scanuRequestCurrent")
     if "proc scanuPublishFrameResult(" in scan:
         code += procedure(scan, "scanuPublishFrameResult").split("\n{.emit:", 1)[0]
@@ -218,14 +216,14 @@ def test_directed_connection_changes_during_allocation(tmp_path: Path, mode: str
     run_program(tmp_path, mode, source() + r'''
 for point in ["free", "alloc"]:
   setup()
-  var owner = SmTxBuildContext(serial: currentSerial)
+  let stamp = smOwn.op.serial
   var fired = false
   hook = proc(at: string) =
     if at == point and not fired:
       fired = true
-      inc currentSerial
+      discard opGo(smOwn.op)  # SM moved on
   scanuPublishFrameResult(addr incoming[0], 60, 92, addr scanu_env.entries[0],
-    addr request, 7, 9, 1, 0, addr owner)
+    addr request, 7, 9, 1, 0, stamp)
   doAssert fired and not copyLive and forwarded == 1
   doAssert scanu_env.entries[0].cachedRxuMgtInd == nil
 ''')

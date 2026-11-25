@@ -77,6 +77,8 @@ proc complete() =
 '''
 
 CASES = {
+    # SM code run by txl_frame_get's pool recovery moved SM on: the builder
+    # drops its frame (station_tx_build.nim).
     "preparation_replacement": r'''
 for kind in 0..1:
   for point in [1, 2]:
@@ -84,41 +86,8 @@ for kind in 0..1:
     hook = point
     action = 1
     sendDeauth(kind)
-    doAssert hookFired and pushes == 0 and failures == 0
+    doAssert hookFired and pushes == 0 and failures == 0 and releases == 1
     doAssert currentState == 9 and sm.connectInfo == addr replacementConn
-''',
-    "lease_reuse": r'''
-for kind in 0..1:
-  prepare(kind)
-  hook = 2
-  action = 2
-  sendDeauth(kind)
-  let i = frameIndex(activeFrame)
-  doAssert descriptors[i] == replacementDesc and hardware[i] == replacementHw and links[i] == replacementLink,
-    "older deauthentication builder modified a replacement frame"
-  doAssert pushes == 0 and leased[i]
-''',
-    "protection_lease_reuse": r'''
-for point in [3, 10, 11]:
-  prepare(0)
-  mfpMode = if point == 11: 1 else: 2
-  hook = point
-  action = 2
-  sendDeauth(0)
-  let i = frameIndex(activeFrame)
-  doAssert hookFired and descriptors[i] == replacementDesc
-  doAssert hardware[i] == replacementHw and links[i] == replacementLink
-  doAssert pushes == 0 and leased[i]
-''',
-    "trace_lease_reuse": r'''
-prepare(1)
-hook = 4
-action = 2
-sendDeauth(1)
-let i = frameIndex(activeFrame)
-doAssert hookFired and descriptors[i] == replacementDesc
-doAssert hardware[i] == replacementHw and links[i] == replacementLink
-doAssert pushes == 0 and leased[i]
 ''',
     "failed_handoff_replacement": r'''
 prepare(0)
@@ -130,12 +99,6 @@ doAssert pushes == 1 and failures == 0 and currentState == 9,
   "older failed handoff notified the replacement connection"
 ''',
     "station_reassigned": r'''
-for kind in 0..1:
-  prepare(kind)
-  hook = 2
-  action = 6
-  sendDeauth(kind)
-  doAssert hookFired and pushes == 0 and failures == 0 and vifs[1].staIdx == 3
 # Once queued, the frame's confirmation ends the wait whatever the VIF now
 # holds; the cleanup decides what is left to release.
 prepare(0)
@@ -153,13 +116,6 @@ smGo(6)
 complete()
 doAssert disconnects == 0 and sm.connectInfo == addr replacementConn,
   "older completion disconnected a replacement attempt"
-''',
-    "state_replacement": r'''
-prepare(0)
-hook = 7
-action = 1
-sendDeauth(0)
-doAssert pushes == 0 and failures == 0 and currentState == 9
 ''',
     "protection_replacement": r'''
 for point in [3, 10]:
@@ -228,7 +184,7 @@ for disruption in 0 .. 6:
   case disruption
   of 2: inc rxVifEpochs[1]
   of 3: inc stationEpochs[frame.staInfoIdx]
-  of 4: inc smTxSerials[1]
+  of 4: inc txResetEpoch
   of 5: sm.connectInfo = addr replacementConn
   else: discard
   txlInvokeFrameCallback(callback, argument, 0x40000000'u32, context)
@@ -332,7 +288,7 @@ def source() -> str:
                  "txlFrameCallbackCurrent", "txlInvokeFrameCallback", "txlFrameBindSmOwner"]:
         if re.search(rf"^proc {name}\(", tx, re.M):
             extra += procedure(tx, name)
-    code = code.replace("var smTxSerials", extra + "\nvar smTxSerials", 1)
+    code = code.replace("var smAuthExpected", extra + "\nvar smAuthExpected", 1)
     code = code.replace("      inc generations[i]\n", """      inc generations[i]
       txFrameIdentities[i] = txlCaptureFrameIdentity()
       txFrameIdentities[i].generation = generations[i]
@@ -342,7 +298,7 @@ def source() -> str:
     marker = "proc txl_frame_get(size: uint32): pointer ="
     first, rest = code.split(marker, 1)
     extra_start = rest.index("const InvalidFrameDescIndex")
-    extra_end = rest.index("\nvar smTxSerials", extra_start)
+    extra_end = rest.index("\nvar smAuthExpected", extra_start)
     extras = rest[extra_start:extra_end]
     rest = rest[:extra_start] + rest[extra_end:]
     code = first + extras + "\n" + marker + rest
@@ -350,7 +306,7 @@ def source() -> str:
     code += station_sm_source("smTakeAnswer", "smDeauthConfirmed", "smDeauthVif",
                               "smDeauthGuardExpired", "smDeauthWait", record=False)
     for name in ["me_build_deauthenticate", "sm_disconnect_deauth_cfm",
-                 "sm_connect_abort_deauth_cfm", "sm_handle_connection", "smDeauthSend", "sm_deauth_send"]:
+                 "sm_connect_abort_deauth_cfm", "sm_handle_connection", "sm_deauth_send"]:
         if not re.search(rf"^proc {name}\*?\(", sm, re.M):
             continue
         code += procedure(sm, name)

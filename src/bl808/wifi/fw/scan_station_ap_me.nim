@@ -1346,7 +1346,8 @@ proc scanuPublishFrameResult(frame: pointer; validatedFrameLen: uint16;
                              scanResultEntry: ptr ScanuResultEntry;
                              request: pointer; epoch, generation: uint32;
                              numSsids, bfOn: uint8;
-                             connection: ptr SmTxBuildContext = nil) =
+                             smStamp = 0'u32) =
+  ## `smStamp`: the SM operation a directed scan belongs to, else 0.
   if frame == nil:
     return
   defer: ke_msg_forward_and_change_id(frame, 0x804'u16, 9, 2)
@@ -1359,7 +1360,7 @@ proc scanuPublishFrameResult(frame: pointer; validatedFrameLen: uint16;
   template ownsSlot(): bool =
     scanuRequestCurrent(request, epoch) and cached != nil and
       cached.generation == generation and
-      (connection == nil or smTxOwnerCurrent(connection[]))
+      (smStamp == 0 or opCurrent(smOwn.op, smStamp))
   if not ownsSlot(): return
 
   if scanResultEntry.valid == 0:
@@ -1635,9 +1636,12 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
     scanuCacheSsid(scanResultEntry, addr ssidScratch)
     resultGeneration = cachedSsid.generation
 
-  var directedOwner: SmTxBuildContext
+  # A directed scan belongs to SM's attempt: the SM operation that asked for
+  # it must still be live after each callback.
+  var directedConnection: pointer
+  var directedStamp: uint32
   template frameOwnerCurrent(): bool =
-    ownsResult() and (bfOn == 0 or smTxOwnerCurrent(directedOwner))
+    ownsResult() and (bfOn == 0 or opCurrent(smOwn.op, directedStamp))
   template requireFrameOwner() =
     if not frameOwnerCurrent():
       ke_msg_forward_and_change_id(frame, 0x804'u16, 9, 2)
@@ -1647,11 +1651,15 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
   if bfOn != 0:
     let saved = irqSave()
     defer: irqRestore(saved)
-    directedOwner = smTxCapture(smEnvView().connectInfo)
-    requireFrameOwner()
-    if directedOwner.identity.vif != scanVifIdx:
+    directedConnection = smEnvView().connectInfo
+    if directedConnection == nil or
+        connectInfoView(directedConnection).vifIdx != scanVifIdx or
+        vifChannelForIdx(scanVifIdx).vifIdx != scanVifIdx or
+        vifChannelForIdx(scanVifIdx).vifType != VIF_TYPE_STA:
       ke_msg_forward_and_change_id(frame, 0x804'u16, 9, 2)
       return
+    directedStamp = smOwn.op.serial
+    requireFrameOwner()
     let vif = vif_mgmt_get_vif(scanVifIdx)
     requireFrameOwner()
     if vif != nil:
@@ -1664,7 +1672,7 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
       let securityState = vifSecurity(vifView)
       let assocState = vifAssocInfo(cast[pointer](htCaps))
       let stationManager = smEnvView()
-      let connectInfoPtr = directedOwner.connection
+      let connectInfoPtr = directedConnection
       let connectInfo = connectInfoView(connectInfoPtr)
       let savedChannelDurationFlags = connectInfo.channelDuration
       let bssInfoOut = vifBssInfoBase(vifView)
@@ -1867,7 +1875,7 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
               if scanSecurityNotifyCallback != nil:
                 cast[proc(b:pointer){.cdecl.}](scanSecurityNotifyCallback)(addr notify)
             requireFrameOwner()
-            let securityConnectInfoPtr = directedOwner.connection
+            let securityConnectInfoPtr = directedConnection
             let securityConnectInfo = connectInfoView(securityConnectInfoPtr)
             securityConnectInfo.channelDuration = securityConnectInfo.channelDuration or 9
             if effectiveCipher == 4: securityConnectInfo.authType = 3
@@ -1913,7 +1921,7 @@ proc scanu_frame_handler*(frame: pointer, len: uint32) {.exportc, cdecl.} =
   scanuPublishFrameResult(frame, totalLen, len,
                           scanResultEntry, scanParam, scanEpoch,
                           resultGeneration, numSsids, bfOn,
-                          if bfOn == 0: nil else: addr directedOwner)
+                          if bfOn == 0: 0'u32 else: directedStamp)
 
 proc scanu_search_by_bssid*(bssid: pointer): pointer {.exportc, cdecl, noinline.} =
   return scanu_find_result(bssid, 0)
@@ -2336,17 +2344,20 @@ proc sm_get_bss_params*(selectedBssResultOut: ptr pointer, selectedBssChannelOut
   if selectedBssResultOut != nil: selectedBssResultOut[] = nil
   if selectedBssChannelOut != nil: selectedBssChannelOut[] = nil
   if selectedBssResultOut == nil or selectedBssChannelOut == nil: return
-  let saved = irqSave()
-  defer: irqRestore(saved)
   let sm = smEnvView()
-  let owner = smTxCapture(sm.connectInfo)
+  let connInfo = sm.connectInfo
+  if connInfo == nil: return
+  let vifIdx = connectInfoView(connInfo).vifIdx
+  if vifIdx >= MAX_VIFS.uint8 or vifChannelForIdx(vifIdx).vifIdx != vifIdx or
+      vifChannelForIdx(vifIdx).vifType != VIF_TYPE_STA: return
+  # The log callbacks below run host code: the results are published only
+  # while SM's operation and the scan that produced them are still current.
+  let stamp = smOwn.op.serial
   let indication = sm.connectIndMsg
   let scanEpoch = scanuRequestEpoch
   template current(): bool =
-    smTxOwnerCurrent(owner) and sm.connectIndMsg == indication and
+    opCurrent(smOwn.op, stamp) and sm.connectIndMsg == indication and
       scanuRequestEpoch == scanEpoch
-  if not current(): return
-  let connInfo = owner.connection
   var snapshot = connectInfoView(connInfo)[]
   let ci = addr snapshot
   snapshot.ssid[connectInfoSsidLen(ci).int] = 0
@@ -2667,50 +2678,40 @@ proc sm_handle_connection*(vifIdx: uint8, status: uint16,
   ##   txl_frame_push(frame, 3). On fail: failureFn(vifEntry, status, 3).
   ## Here state 10 is entered by smDeauthWait once the frame is built, just
   ## before the push, and the frame carries the wait's stamp, not the VIF.
+  ## The build commits only while SM's operation is the one it started in
+  ## (station_tx_build.nim).
   if vifIdx.int >= MAX_VIFS:
     return
   # A teardown in progress already ends this link.
   if smOwn.teardown != tdNone: return
-  var build = smTxBeginForVif(vifIdx)
-  if not build.identity.captured: return
-  defer: smTxEnd(build)
   let vif = vifChannelForIdx(vifIdx)
+  # Early exit unless this is a STA VIF (blob: lbu a5,86(s3); bnez)
+  if vif.vifIdx != vifIdx or vif.vifType != VIF_TYPE_STA:
+    return
+  let stamp = smOwn.op.serial
+  var frame: pointer
   template notifyFailure(): untyped =
-    smTxEnd(build)
-    if smTxOwnerCurrent(build) and failureFn != nil:
+    if frame != nil: txl_frame_release(frame, false)
+    if opCurrent(smOwn.op, stamp) and failureFn != nil:
       cast[proc(a: pointer; b, c: uint16) {.cdecl.}](failureFn)(
         cast[pointer](vif), status, 3'u16)
-
-  # Early exit if VIF byte at +86 is non-zero (blob: lbu a5,86(s3); bnez)
-  let vifFlag = vif.vifType
-  if vifFlag != 0:
     return
 
   # Save staIdx from VIF before frame alloc (blob: lbu s8,96(s3))
   let staIdx = vif.staIdx
-  if staIdx.int < STA_INFO_TAB_ENTRIES:
-    if not smTxBindStation(build, staIdx): return
-
   if staIdx.int >= STA_INFO_TAB_ENTRIES:
     notifyFailure()
-    return
 
   # Allocate TX frame (blob: txl_frame_get(0x200) = li a0,512)
-  let frame = txl_frame_get(512)
+  frame = txl_frame_get(512)
   if frame == nil:
     notifyFailure()
-    return
-
-  if not smTxAdopt(build, frame):
-    notifyFailure()
-    return
   let desc = hostTxDescAt(frame)
+  if desc.bufDesc == nil or desc.hwDesc == nil:
+    notifyFailure()
 
   # Update TX power (blob: tpc_update_frame_tx_power(vifEntry, frame))
   tpc_update_frame_tx_power(cast[pointer](vif), frame)
-  if not smTxFrameCurrent(build):
-    notifyFailure()
-    return
 
   # Get link descriptor from frame (blob: lw s1,108(s0) -> s1 = frame[108]).
   # The MAC header buffer lives in link.macHeader (linkDesc+348).
@@ -2731,11 +2732,7 @@ proc sm_handle_connection*(vifIdx: uint8, status: uint16,
   discard c_memcpy(addr hdr.addr3[0], staMac, 6.csize_t)
 
   # Get sequence control (blob: txl_get_seq_ctrl at 0xBE)
-  let seqCtrl = txl_get_seq_ctrl()
-  if not smTxFrameCurrent(build):
-    notifyFailure()
-    return
-  hdr.seqCtrl = seqCtrl
+  hdr.seqCtrl = txl_get_seq_ctrl()
 
   # Store VIF/STA info (blob: sb s7,47(s0); sb zero,98,100; sb a5,49(s0))
   desc.vifIdx = vifIdx
@@ -2746,9 +2743,6 @@ proc sm_handle_connection*(vifIdx: uint8, status: uint16,
   # MFP protection (blob: mfp_protect_mgmt_frame at 0xFE)
   let fc = hdr.frameControl
   let mfpResult = mfp_protect_mgmt_frame(frame, fc.uint32)
-  if not smTxFrameCurrent(build):
-    notifyFailure()
-    return
 
   # Track body start offset (macHdr + secHdrLen)
   var bodyOffset: uint = 24  # base MAC header size
@@ -2757,32 +2751,21 @@ proc sm_handle_connection*(vifIdx: uint8, status: uint16,
   # Conditional: txu_cntrl_protect_mgmt_frame if mfp returned 1
   if mfpResult == 1:
     txu_cntrl_protect_mgmt_frame(frame, macHdrPtr, 24)
-    if not smTxFrameCurrent(build):
-      notifyFailure()
-      return
     if desc.hdrLen != 8 or desc.secTailLen != 8:
       notifyFailure()
-      return
     # Read security header length added (blob: lbu s2,98(s0); addi s2,s2,24)
     bodyOffset = desc.hdrLen.uint + 24
 
   # Build deauthentication body (blob: me_build_deauthenticate(macHdr+bodyOffset, 3))
   let bodyStart = cast[pointer](addr link.macHeader[bodyOffset])
   let deauthLen = me_build_deauthenticate(bodyStart, 3)
-  if not smTxFrameCurrent(build):
-    notifyFailure()
-    return
   var totalLen = bodyOffset + deauthLen.uint
 
   # Conditional: mfp_add_mgmt_mic if mfp returned 2
   if mfpResult == 2:
     let micLen = mfp_add_mgmt_mic(frame, macHdrPtr, totalLen.uint32)
-    if not smTxFrameCurrent(build):
-      notifyFailure()
-      return
     if micLen != 18:
       notifyFailure()
-      return
     totalLen = totalLen + micLen.uint
   elif mfpResult == 1:
     # If mfp==1, check for CCMP/TKIP tail (blob: lbu a5,100(s0); add s2,s2,a5)
@@ -2792,7 +2775,6 @@ proc sm_handle_connection*(vifIdx: uint8, status: uint16,
   # TX descriptor setup (blob: lw a4,112(s0); lw a5,20(a4); ...)
   if totalLen > 512:
     notifyFailure()
-    return
   desc.frameLen = totalLen.uint16
   desc.seqPassthrough = totalLen.uint16
   if desc.hwDesc != nil:
@@ -2801,19 +2783,23 @@ proc sm_handle_connection*(vifIdx: uint8, status: uint16,
     txDesc.payloadEnd = payloadLen - 1 + totalLen.uint32
     txDesc.frameLen = totalLen.uint32 + 4
 
+  # Commit. txl_frame_get may have run SM code (station_tx_build.nim).
+  if not opCurrent(smOwn.op, stamp):
+    txl_frame_release(frame, false)
+    return
   # Enter the deauthentication wait, then push (blob: txl_frame_push(frame, 3)).
   # The callback and its argument sit at frame+208/212 (blob: sw s6,208(s0)).
-  let stamp = smDeauthWait(vifIdx, callbackCtx)
-  if stamp == 0: return  # the deferred smTxEnd releases the frame
+  let wait = smDeauthWait(vifIdx, callbackCtx)
+  if wait == 0:
+    txl_frame_release(frame, false)
+    return
   desc.callback = callbackCtx
-  desc.callbackArg = opStampEnv(stamp)
-  build.state = SmDisconnectingState
-  if smTxSubmit(build, false):
+  desc.callbackArg = opStampEnv(wait)
+  if txl_frame_push(frame, 3) != 0:
     return
   # A refused push has already consumed the descriptor and runs no callback,
   # so the wait ends here. A successful push owns it until its confirmation.
-  smTxEnd(build)
-  if smDeauthConfirmed(opStampEnv(stamp)) and failureFn != nil:
+  if smDeauthConfirmed(opStampEnv(wait)) and failureFn != nil:
     cast[proc(a: pointer; b, c: uint16) {.cdecl.}](failureFn)(
       cast[pointer](vif), status, 3'u16)
 
@@ -2939,30 +2925,37 @@ proc sm_connect_abort_deauth_cfm*(param: pointer, txStatus: uint32) {.exportc, c
   discard txStatus
   if smDeauthConfirmed(param): smConnectEnd(23, 3)
 
-proc smDeauthSend(build: var SmTxBuildContext) =
-  ## Send a deauthentication frame.
+proc sm_deauth_send*() {.exportc, cdecl.} =
+  ## Send a deauthentication frame to the attempt's AP. Nothing waits for it:
+  ## it has no confirmation callback and changes no SM state. Like the other
+  ## builders it is pushed only while SM's operation is the one it started in
+  ## (station_tx_build.nim).
   ## From blob (93 instrs): loads sm_env[0], gets vifIdx from connInfo+59,
   ## computes VIF entry, allocates 512-byte frame, builds deauth MAC header
   ## with addresses from VIF, calls me_build_deauthenticate, sets TX descriptor
   ## fields, and pushes frame via txl_frame_push(frame, 3).
-  if not smTxOwnerCurrent(build): return
-  let vifIdx = build.identity.vif
+  let connection = smEnvView().connectInfo
+  if connection == nil: return
+  let vifIdx = connectInfoView(connection).vifIdx
+  if vifIdx >= MAX_VIFS.uint8: return
   let vif = vifChannelForIdx(vifIdx)
+  if vif.vifIdx != vifIdx or vif.vifType != VIF_TYPE_STA: return
   let staIdx = vif.staIdx
   if staIdx.int >= STA_INFO_TAB_ENTRIES:
     return
-  if not smTxBindStation(build, staIdx): return
   let sta = staInfoForIdx(staIdx)
   let bssidPtr = cast[pointer](addr sta.macAddr[0])
+  let stamp = smOwn.op.serial
   # Allocate 512-byte frame buffer (blob: txl_frame_get, NOT ke_msg_alloc)
   let frame = txl_frame_get(512)
   if frame == nil:
     return
-  if not smTxAdopt(build, frame): return
   let desc = hostTxDescAt(frame)
+  if desc.bufDesc == nil or desc.hwDesc == nil:
+    txl_frame_release(frame, false)
+    return
   # Blob prepares TX power before using the frame body pointer.
   tpc_update_frame_tx_power(cast[pointer](vif), frame)
-  if not smTxFrameCurrent(build): return
   # Build deauth MAC header at frameBody+348.
   let link = hostTxLinkDescAt(desc.bufDesc)
   let hdr = hostTxDataHeader(desc)
@@ -2973,9 +2966,7 @@ proc smDeauthSend(build: var SmTxBuildContext) =
   discard c_memcpy(addr hdr.addr2[0], cast[pointer](addr vif.macAddr[0]), 6.csize_t)
   discard c_memcpy(addr hdr.addr3[0], bssidPtr, 6.csize_t)
   # Sequence control (blob: txl_get_seq_ctrl)
-  let sequence = txl_get_seq_ctrl()
-  if not smTxFrameCurrent(build): return
-  hdr.seqCtrl = sequence
+  hdr.seqCtrl = txl_get_seq_ctrl()
   # Frame metadata
   desc.callbackArg = cast[pointer](vif)
   desc.callback = nil
@@ -2986,7 +2977,6 @@ proc smDeauthSend(build: var SmTxBuildContext) =
   # Build deauth body
   let bodyPtr = cast[pointer](addr link.macHeader[sizeof(MacDataFrameHeaderView)])
   let deauthLen = me_build_deauthenticate(bodyPtr, 3)
-  if not smTxFrameCurrent(build): return
   # Set TX descriptor lengths on the HW descriptor pointed to by frame+112.
   let txDesc = hostTxHwDescAt(desc.hwDesc)
   let payloadLen = txDesc.payloadStart
@@ -3001,50 +2991,25 @@ proc smDeauthSend(build: var SmTxBuildContext) =
     nimFwConnectTrace2U32("[WIFI-CT] deauth_tx ",
                           vifIdx.uint32 or (staIdx.uint32 shl 8),
                           vif.vifIdx.uint32)
-    if not smTxFrameCurrent(build): return
     nimFwConnectTrace2U32("[WIFI-CT] deauth_hdr0 ",
                           hdrWords[0],
                           hdrWords[1])
-    if not smTxFrameCurrent(build): return
     nimFwConnectTrace2U32("[WIFI-CT] deauth_hdr1 ",
                           hdrWords[2],
                           hdrWords[3])
-    if not smTxFrameCurrent(build): return
     nimFwConnectTrace2U32("[WIFI-CT] deauth_hdr2 ",
                           hdrWords[4],
                           hdrWords[5])
-    if not smTxFrameCurrent(build): return
     nimFwConnectTrace2U32("[WIFI-CT] deauth_len ",
                           bodyLen,
                           txDesc.frameLen)
-    if not smTxFrameCurrent(build): return
-  # Push to TX
-  discard smTxSubmit(build, false)
-
-proc sm_deauth_send*() {.exportc, cdecl.} =
-  let connection = smEnvView().connectInfo
-  if connection == nil: return
-  var build = smTxBegin(connection)
-  if not build.identity.captured: return
-  defer: smTxEnd(build)
-  smDeauthSend(build)
+  # txl_frame_get may have run SM code (station_tx_build.nim).
+  if not opCurrent(smOwn.op, stamp):
+    txl_frame_release(frame, false)
+    return
+  discard txl_frame_push(frame, 3)
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void sm_auth_send(unsigned short, void*);".}
-proc smTxSnapshotJoinPeer(build: var SmTxBuildContext; peer: var MacAddrView): bool =
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  if not smTxOwnerCurrent(build): return false
-  let vif = vifChannelForIdx(build.identity.vif)
-  let station = vif.staIdx
-  if station >= STA_MGMT_FREE_STAS.uint8: return false
-  let sta = staInfoForIdx(station)
-  if sta.valid == 0 or sta.instNbr != build.identity.vif or sta.macAddr != vif.bssid:
-    return false
-  if not macPtrIsSpecific(addr sta.macAddr[0]) or not smTxBindStation(build, station):
-    return false
-  peer.bytes = sta.macAddr
-  true
-
 proc sm_auth_send*(authSeqNum: uint16, challenge: pointer) {.exportc, cdecl.} =
   ## Send an authentication frame (166 instructions in blob).
   ##
@@ -3061,28 +3026,30 @@ proc sm_auth_send*(authSeqNum: uint16, challenge: pointer) {.exportc, cdecl.} =
   ##   6. Set sequence number, frame type=0xB0
   ##   7. Shared-key seq 3: protect with WEP and append challenge text IE
   ##   8. Compute final lengths, set TX descriptor, push frame
+  ## Here the frame is built in one pass, then SM enters state 6, arms the
+  ## response deadline and pushes (station_tx_build.nim).
   let sm = smEnvView()
   let connInfo = sm.connectInfo
   if connInfo == nil: return
-  var build = smTxBegin(connInfo)
-  if not build.identity.captured: return
-  defer: smTxEnd(build)
   let ci = connectInfoView(connInfo)
-
-  let vifIdx = build.identity.vif
-  let vif = vifChannelForIdx(vifIdx)
-  var authBssid: MacAddrView
-  if not smTxSnapshotJoinPeer(build, authBssid):
-    smTxFail(build, WLAN_FW_AUTHENTICATION_FAIILURE.uint16)
+  let stamp = smOwn.op.serial
+  var frame: pointer
+  template fail(status: uint16) =
+    if frame != nil: txl_frame_release(frame, false)
+    if opCurrent(smOwn.op, stamp): sm_connect_ind(status, 0xFFFF)
     return
-  if not smTxOwnerCurrent(build): return
-  let staIdx = build.identity.station
+
+  let vifIdx = ci.vifIdx
+  var staIdx: uint8
+  var authBssid: MacAddrView
+  if not smJoinPeer(vifIdx, staIdx, authBssid):
+    fail(WLAN_FW_AUTHENTICATION_FAIILURE.uint16)
+  let vif = vifChannelForIdx(vifIdx)
   let bssidPtr = cast[pointer](addr authBssid.bytes[0])
   when defined(bl808WifiPreAuthVifActive):
     if vif != nil:
       vif.state = 1
   let vifTxSaSource = ensureVifMgmtMac(vif)
-  if not smTxOwnerCurrent(build): return
   var authOwn = macAddrAt(vifTxSaSource)[]
   let vifTxSa = cast[pointer](addr authOwn.bytes[0])
   when defined(bl808WifiAuthHwWorkaround):
@@ -3118,16 +3085,17 @@ proc sm_auth_send*(authSeqNum: uint16, challenge: pointer) {.exportc, cdecl.} =
   let authChallenge = if challenge != nil: addr challengeCopy[0] else: nil
 
   # Allocate frame buffer (512 bytes)
-  let frame = txl_frame_get(512)
+  frame = txl_frame_get(512)
   if frame == nil:
     # Vendor sm_auth_send+0x1e4 reports allocation failure, not a timeout.
-    smTxFail(build, WLAN_FW_TX_AUTH_FRAME_ALLOCATE_FAIILURE)
-    return
-  if not smTxAdopt(build, frame): return
+    fail(WLAN_FW_TX_AUTH_FRAME_ALLOCATE_FAIILURE)
+  # txl_frame_get can run SM code; an attempt that ended has freed connInfo.
+  if not opCurrent(smOwn.op, stamp): fail(0)
   let desc = hostTxDescAt(frame)
+  if desc.bufDesc == nil or desc.hwDesc == nil:
+    fail(WLAN_FW_TX_AUTH_FRAME_ALLOCATE_FAIILURE)
 
   tpc_update_frame_tx_power(cast[pointer](vif), frame)
-  if not smTxFrameCurrent(build): return
 
   let link = hostTxLinkDescAt(desc.bufDesc)
   let hdr = hostTxDataHeader(desc)
@@ -3144,9 +3112,7 @@ proc sm_auth_send*(authSeqNum: uint16, challenge: pointer) {.exportc, cdecl.} =
   discard c_memcpy(addr hdr.addr3[0], bssidPtr, 6)
 
   # Generate and write sequence number (frame body+370..371)
-  let seqNum = txl_get_seq_ctrl()  # blob uses txl_get_seq_ctrl for sequence numbers
-  if not smTxFrameCurrent(build): return
-  hdr.seqCtrl = seqNum
+  hdr.seqCtrl = txl_get_seq_ctrl()  # blob uses txl_get_seq_ctrl for sequence numbers
 
   # Store AP channel info at frame+47
   let apChanIdx = vif.vifIdx
@@ -3158,30 +3124,24 @@ proc sm_auth_send*(authSeqNum: uint16, challenge: pointer) {.exportc, cdecl.} =
   var bodyLen = 24'u32
   if authAlgo == 1 and authSeqNum == 3:
     if authChallenge == nil:
-      smTxFail(build, 2)
-      return
+      fail(2)
     txu_cntrl_protect_mgmt_frame(frame, hdr, bodyLen)
-    if not smTxFrameCurrent(build): return
     # Shared-key authentication requires a WEP IV and ICV, not RSN framing.
     if desc.hdrLen != 4 or desc.secTailLen != 4:
-      smTxFail(build, 2)
-      return
+      fail(2)
     bodyLen += desc.hdrLen.uint32
 
   let authBodyPtr = cast[pointer](addr link.macHeader[bodyLen])
   var builtLen: uint32
   if authAlgo == 3:
     builtLen = meBuildSaeAuthenticate(
-      authBodyPtr, 3'u16, authSeqNum, 0'u16, vifIdx.uint32, addr build,
+      authBodyPtr, 3'u16, authSeqNum, 0'u16, vifIdx.uint32, frame,
       bssidPtr, vifTxSa)
-    if not smTxFrameCurrent(build): return
     if builtLen == 0:
-      smTxFail(build, 2)
-      return
+      fail(2)
   else:
     builtLen = me_build_authenticate(
       authBodyPtr, authAlgo.uint16, authSeqNum, 0'u16, authChallenge)
-    if not smTxFrameCurrent(build): return
 
   # Update frame lengths
   # .L128: Set TX descriptor fields
@@ -3194,8 +3154,7 @@ proc sm_auth_send*(authSeqNum: uint16, challenge: pointer) {.exportc, cdecl.} =
   let extraIeLen = desc.secTailLen
   totalLen += extraIeLen.uint32
   if totalLen > 512'u32:
-    smTxFail(build, 2)
-    return
+    fail(2)
   desc.frameLen = totalLen.uint16
   desc.seqPassthrough = totalLen.uint16
 
@@ -3237,51 +3196,39 @@ proc sm_auth_send*(authSeqNum: uint16, challenge: pointer) {.exportc, cdecl.} =
   nimFwTrace2U32("[WIFI-NIMFW] auth_tx ",
                  authSeqNum.uint32 or (authAlgo.uint32 shl 16),
                  vifIdx.uint32 or (staIdx.uint32 shl 8))
-  if not smTxFrameCurrent(build): return
   when defined(bl808WifiConnectTrace):
     nimFwConnectTrace2U32("[WIFI-CT] auth_tx ",
                           authSeqNum.uint32 or (authAlgo.uint32 shl 16),
                           vifIdx.uint32 or (staIdx.uint32 shl 8))
-    if not smTxFrameCurrent(build): return
     nimFwConnectTrace2U32("[WIFI-CT] auth_hdr0 ",
                           cast[ptr uint32](addr link.macHeader[0])[],
                           cast[ptr uint32](addr link.macHeader[4])[])
-    if not smTxFrameCurrent(build): return
     nimFwConnectTrace2U32("[WIFI-CT] auth_hdr1 ",
                           cast[ptr uint32](addr link.macHeader[8])[],
                           cast[ptr uint32](addr link.macHeader[12])[])
-    if not smTxFrameCurrent(build): return
     nimFwConnectTrace2U32("[WIFI-CT] auth_hdr2 ",
                           cast[ptr uint32](addr link.macHeader[16])[],
                           cast[ptr uint32](addr link.macHeader[20])[])
-    if not smTxFrameCurrent(build): return
     nimFwConnectTrace2U32("[WIFI-CT] auth_body ",
                           authAlgoSeqTraceWord,
                           authStatusChallengeTraceWord)
-    if not smTxFrameCurrent(build): return
     nimFwConnectTrace2U32("[WIFI-CT] auth_len ",
                           totalLen,
                           thd.frameLen)
-    if not smTxFrameCurrent(build): return
     nimFwConnectTraceBytes("[WIFI-RAW] auth_tx ",
                            cast[pointer](addr link.macHeader[0]),
                            totalLen,
                            96)
-    if not smTxFrameCurrent(build): return
     nimFwConnectTraceHw("[WIFI-CT] auth_hw ")
-    if not smTxFrameCurrent(build): return
   nimFwTrace2U32("[WIFI-NIMFW] auth_mac ",
                  cast[ptr uint32](addr link.macHeader[4])[],
                  cast[ptr uint32](addr link.macHeader[16])[])
-  if not smTxFrameCurrent(build): return
   nimFwTrace2U32("[WIFI-NIMFW] auth_len ",
                  totalLen,
                  thd.frameLen)
-  if not smTxFrameCurrent(build): return
   nimFwTrace2U32("[WIFI-NIMFW] auth_body ",
                  authAlgoSeqTraceWord,
                  authStatusChallengeTraceWord)
-  if not smTxFrameCurrent(build): return
 
   when defined(WifiAuthForceFreq):
     let forcedAuthFreq = uint16(WifiAuthForceFreq)
@@ -3296,63 +3243,58 @@ proc sm_auth_send*(authSeqNum: uint16, challenge: pointer) {.exportc, cdecl.} =
     # RF for a shared-radio window, or when the bench override is explicit.
     when WifiAuthForceFreq != 0:
       wifi_nimfw_prepare_sta_tx_channel()
-      if not smTxFrameCurrent(build): return
     else:
       if nimFwBleWifiRoleWindowEnabled != 0 and
           chan_is_on_operational_channel(cast[pointer](vif)) and
           chan_is_tx_allowed(cast[pointer](vif)):
         wifi_nimfw_prepare_sta_tx_channel()
-        if not smTxFrameCurrent(build): return
   when defined(bl808WifiAuthPromiscRx):
     let mm = mmEnvView()
     mm.rxFilterExtra = mm.rxFilterExtra or SCAN_ACTIVE_RX_FILTER_BITS
     mm.rxFilterBase = 0x7FFFFFDE'u32
     mm_rx_filter_set()
-    if not smTxFrameCurrent(build): return
   nimFwDbgAuthRxCtrl = regRead(MACHW_RX_CNTRL_REG)
   # Keep the allocator/TPC policy unless the bench workaround is requested.
   when defined(bl808WifiMgmtRetryWorkaround):
     applyConservativeMgmtTxRetryPolicy(link)
-    if not smTxFrameCurrent(build): return
     thd.ackPolicyControl = link.ackPolicyControl
     thd.retryLimitControl = link.retryLimitControl
   rfPriCaptureWb03AuthTxPrePush()
-  if not smTxFrameCurrent(build): return
   applyForcedInternalMgmtTxPower(thd)
-  if not smTxFrameCurrent(build): return
   captureAuthTxHwPrePush(desc, thd)
-  if not smTxFrameCurrent(build): return
 
-  # Publish response state and its timeout before a synchronous TX completion.
-  if not smTxSetState(build, SmAuthenticatingState): return
-  if not smArmResponse(build.stamp, responseDelay):
-    smTxFail(build, WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE)
+  # Commit. The build may have run SM code (station_tx_build.nim).
+  if not opCurrent(smOwn.op, stamp):
+    txl_frame_release(frame, false)
     return
-  if authAlgo in [0'u8, 1'u8, 3'u8] and
-      not smAuthRecordResponse(build.stamp, authAlgo, authSeqNum):
-    smTxFail(build, WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE)
+  # Publish response state and its timeout before handing the frame over.
+  let wait = smGo(SmAuthenticatingState)
+  if not smArmResponse(wait, responseDelay) or
+      (authAlgo in [0'u8, 1'u8, 3'u8] and
+       not smAuthRecordResponse(wait, authAlgo, authSeqNum)):
+    txl_frame_release(frame, false)
+    sm_connect_ind(WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE, 0xFFFF)
     return
   smConnecting = true
+  # The vendor does not inspect the TX return value: the deadline, not this
+  # call, drives the bounded retry policy.
   when defined(bl808WifiForceAuthAssocPush):
-    let accepted = smTxSubmit(build, true)
+    let accepted = txl_frame_try_push_force(frame, 3) != 0
   else:
-    let accepted = smTxSubmit(build, false)
+    let accepted = txl_frame_push(frame, 3) != 0
   if not accepted:
-    if authAlgo in [0'u8, 1'u8, 3'u8]: smAuthCancelResponse(build.stamp)
-    # The vendor does not inspect the TX return value: after handoff, the
-    # published deadline, not this call, drives the bounded retry policy.
-    if build.ownsFrame: smTxFail(build, WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE)
+    if authAlgo in [0'u8, 1'u8, 3'u8]: smAuthCancelResponse(wait)
     return
   when defined(bl808WifiInjectAuthSuccess):
-    if smTxOwnerCurrent(build):
+    if opCurrent(smOwn.op, wait):
       var injectedAuth: tuple[header: KeMsgHdr, frame: SmAuthFrameView]
       injectedAuth.header.paramLen = sizeof(SmAuthFrameView).uint32
       injectedAuth.frame.frameLen = 6
       injectedAuth.frame.authSeq = 2
       let dispatch = rxuMgtDispatchView(addr injectedAuth.frame)
       dispatch.frameCtrl = 0xB0
-      dispatch.vifIdx = build.identity.vif
-      dispatch.staIdx = build.identity.station
+      dispatch.vifIdx = vifIdx
+      dispatch.staIdx = staIdx
       sm_auth_handler(addr injectedAuth.frame)
 
 proc sm_auth_send_pre*(authSeqNum: uint16, challenge: pointer = nil) {.exportc, cdecl.} =
@@ -3375,42 +3317,42 @@ proc sm_assoc_req_send*() {.exportc, cdecl.} =
   ## Blob call sequence: txl_frame_get(512), tpc_update_frame_tx_power,
   ##   memcpy x3 (DA/SA/BSSID), txl_get_seq_ctrl, me_build_associate_req,
   ##   txl_frame_push(3), ke_timer_set, ke_state_set(SM,8).
-  ## This implementation publishes response state before the TX handoff so
-  ## synchronous completions cannot be overwritten by the older sender.
+  ## Here the frame is built in one pass, then SM enters state 8, arms the
+  ## response deadline and pushes (station_tx_build.nim).
   let sm = smEnvView()
   let connInfo = sm.connectInfo
   let smEnvSecond = sm.connectIndMsg
   if connInfo == nil or smEnvSecond == nil: return
-  var build = smTxBegin(connInfo)
-  if not build.identity.captured: return
-  defer: smTxEnd(build)
+  let stamp = smOwn.op.serial
+  var frame: pointer
   template fail(status: uint16) =
-    if sm.connectIndMsg == smEnvSecond: smTxFail(build, status)
-  let vifIdx = build.identity.vif
-  let vif = vifChannelForIdx(vifIdx)
-  var peer: MacAddrView
-  if not smTxSnapshotJoinPeer(build, peer):
-    fail(WLAN_FW_ASSOCIATE_FAIILURE.uint16)
+    if frame != nil: txl_frame_release(frame, false)
+    if opCurrent(smOwn.op, stamp): sm_connect_ind(status, 0xFFFF)
     return
-  if not smTxOwnerCurrent(build) or sm.connectIndMsg != smEnvSecond: return
-  let staIdx = build.identity.station
+  let vifIdx = connectInfoView(connInfo).vifIdx
+  var staIdx: uint8
+  var peer: MacAddrView
+  if not smJoinPeer(vifIdx, staIdx, peer):
+    fail(WLAN_FW_ASSOCIATE_FAIILURE.uint16)
+  let vif = vifChannelForIdx(vifIdx)
   let staMac = cast[pointer](addr peer.bytes[0])
   var own = macAddrAt(vifMgmtTxSa(vif))[]
   let responseDelay = if sm.connectFlags != 0: 0x1E000'u32 else: 0x7D000'u32
   inc nimFwDbgAssocReqSend
 
   # Allocate TX frame via txl_frame_get(512) - NOT ke_msg_alloc
-  let frame = txl_frame_get(512)
+  frame = txl_frame_get(512)
   if frame == nil:
     # Vendor sm_assoc_req_send+0x19c reports allocation failure, not a timeout.
     fail(WLAN_FW_TX_ASSOC_FRAME_ALLOCATE_FAIILURE)
-    return
-  if not smTxAdopt(build, frame): return
+  # txl_frame_get can run SM code; an attempt that ended has freed connInfo.
+  if not opCurrent(smOwn.op, stamp): fail(0)
   let desc = hostTxDescAt(frame)
+  if desc.bufDesc == nil or desc.hwDesc == nil:
+    fail(WLAN_FW_TX_ASSOC_FRAME_ALLOCATE_FAIILURE)
 
   # TPC update (blob: tpc_update_frame_tx_power at 0x5a)
   tpc_update_frame_tx_power(cast[pointer](vif), frame)
-  if not smTxFrameCurrent(build): return
 
   let link = hostTxLinkDescAt(desc.bufDesc)
   let hdr = hostTxDataHeader(desc)
@@ -3434,7 +3376,6 @@ proc sm_assoc_req_send*() {.exportc, cdecl.} =
 
   # Sequence control via txl_get_seq_ctrl (blob at 0xb8)
   let seqCtrl = txl_get_seq_ctrl()
-  if not smTxFrameCurrent(build): return
   hdr.seqCtrl = seqCtrl
 
   # Store VIF/STA info
@@ -3458,14 +3399,12 @@ proc sm_assoc_req_send*() {.exportc, cdecl.} =
     cast[pointer](instNbr.uint),
     cast[pointer](addr assocIeStart),
     cast[pointer](addr assocBodyLen),
-    connInfo, addr build)
-  if not smTxFrameCurrent(build): return
-  if builtLen < 4 or not smTxFits(addr build, assocBodyPtr, builtLen) or
+    connInfo, frame)
+  if builtLen < 4 or not smTxFits(frame, assocBodyPtr, builtLen) or
       cast[uint](assocIeStart) != cast[uint](assocBodyPtr) + 4'u or
       assocBodyLen.uint32 != builtLen - 4:
     when defined(bl808WifiDiagWarmScan): nimFwDbgWarmAssocFailure = warmAssocRequestBuild
     fail(WLAN_FW_ASSOCIATE_FAIILURE)
-    return
   let assocEnd = cast[pointer](cast[uint](assocBodyPtr) + builtLen.uint)
 
   var assocHasSecurityIe = false
@@ -3490,10 +3429,9 @@ proc sm_assoc_req_send*() {.exportc, cdecl.} =
   let secIeSrc = cast[pointer](secState.rsnIePtr)
   let secIeLen = secState.rsnIeLen.uint32
   if not assocHasSecurityIe and secIeSrc != nil and secIeLen != 0'u32:
-    if not smTxFits(addr build, assocEnd, secIeLen):
+    if not smTxFits(frame, assocEnd, secIeLen):
       when defined(bl808WifiDiagWarmScan): nimFwDbgWarmAssocFailure = warmAssocSecurityTail
       fail(WLAN_FW_ASSOCIATE_FAIILURE)
-      return
     discard c_memcpy(assocEnd, secIeSrc, secIeLen.csize_t)
     builtLen += secIeLen
     assocBodyLen = assocBodyLen + secIeLen.uint16
@@ -3541,71 +3479,57 @@ proc sm_assoc_req_send*() {.exportc, cdecl.} =
   let assocReassocBssidPrefixWord =
     cast[ptr uint32](addr assocFixed.reassocBssid[0])[]
   nimFwTrace2U32("[WIFI-NIMFW] assoc_tx_len ", builtLen, assocBodyLen.uint32)
-  if not smTxFrameCurrent(build): return
   nimFwTrace2U32("[WIFI-NIMFW] assoc_tx_body ",
                  assocCapabilityListenTraceWord,
                  assocReassocBssidPrefixWord)
-  if not smTxFrameCurrent(build): return
   nimFwTrace2U32("[WIFI-NIMFW] assoc_tx_rates ",
                  cast[ptr uint32](addr vif.basicRates[0])[],
                  cast[ptr uint32](addr vif.basicRates[4])[])
-  if not smTxFrameCurrent(build): return
   when defined(bl808WifiConnectTrace):
     nimFwConnectTrace2U32("[WIFI-CT] assoc_tx_len ", builtLen, assocBodyLen.uint32)
-    if not smTxFrameCurrent(build): return
     nimFwConnectTrace2U32("[WIFI-CT] assoc_tx_body ",
                           assocCapabilityListenTraceWord,
                           assocReassocBssidPrefixWord)
-    if not smTxFrameCurrent(build): return
     nimFwConnectTrace2U32("[WIFI-CT] assoc_tx_rates ",
                           cast[ptr uint32](addr vif.basicRates[0])[],
                           cast[ptr uint32](addr vif.basicRates[4])[])
-    if not smTxFrameCurrent(build): return
     nimFwConnectTraceHw("[WIFI-CT] assoc_hw ")
-    if not smTxFrameCurrent(build): return
 
   when defined(bl808WifiAuthPromiscRx):
     let mmAssoc = mmEnvView()
     mmAssoc.rxFilterBase = 0x7FFFFFDE'u32
     mm_rx_filter_set()
-    if not smTxFrameCurrent(build): return
   when defined(bl808WifiMgmtRetryWorkaround):
     applyConservativeMgmtTxRetryPolicy(link)
-    if not smTxFrameCurrent(build): return
     thd.ackPolicyControl = link.ackPolicyControl
     thd.retryLimitControl = link.retryLimitControl
   rfPriCaptureWb03AuthTxPrePush()
-  if not smTxFrameCurrent(build): return
   applyForcedInternalMgmtTxPower(thd)
-  if not smTxFrameCurrent(build): return
 
   # The response handler appends after this exact transmitted IE prefix.
   let ind = smConnectIndPayloadAt(smEnvSecond)
   if assocBodyLen.int > ind.assocIeBuffer.len:
     when defined(bl808WifiDiagWarmScan): nimFwDbgWarmAssocFailure = warmAssocRequestIeCopy
     fail(WLAN_FW_ASSOCIATE_FAIILURE)
-    return
-  block:
-    let saved = irqSave()
-    defer: irqRestore(saved)
-    if sm.connectIndMsg != smEnvSecond or not smTxFrameCurrent(build): return
-    if assocBodyLen != 0:
-      discard c_memcpy(addr ind.assocIeBuffer[0], assocIeStart, assocBodyLen.csize_t)
-    smConnectIndPayloadAt(smEnvSecond).assocReqIeLen = assocBodyLen
 
-  # Publish response state before handing the frame to the lower layer.
-  if not smTxSetState(build, SmAssocRspState): return
-  if sm.connectIndMsg != smEnvSecond: return
-  if not smArmResponse(build.stamp, responseDelay):
-    fail(WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE)
+  # Commit. txl_frame_get may have run SM code (station_tx_build.nim); the
+  # indication is the attempt's while its operation is live.
+  if not opCurrent(smOwn.op, stamp):
+    txl_frame_release(frame, false)
     return
-  if sm.connectIndMsg != smEnvSecond: return
+  if assocBodyLen != 0:
+    discard c_memcpy(addr ind.assocIeBuffer[0], assocIeStart, assocBodyLen.csize_t)
+  ind.assocReqIeLen = assocBodyLen
+  # Publish response state before handing the frame to the lower layer.
+  if not smArmResponse(smGo(SmAssocRspState), responseDelay):
+    txl_frame_release(frame, false)
+    sm_connect_ind(WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE, 0xFFFF)
+    return
+  # A refused frame is released by the TX layer; the deadline retries.
   when defined(bl808WifiForceAuthAssocPush):
-    let accepted = smTxSubmit(build, true)
+    discard txl_frame_try_push_force(frame, 3)
   else:
-    let accepted = smTxSubmit(build, false)
-  if not accepted and build.ownsFrame:
-    fail(WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE)
+    discard txl_frame_push(frame, 3)
 
 proc sm_assoc_req_send_pre*() {.exportc, cdecl.} =
   ## Pre-send association request.
@@ -3615,9 +3539,6 @@ proc sm_assoc_req_send_pre*() {.exportc, cdecl.} =
   ##   li a2, 0         ; param2 = 0
   ##   tail-call sm_auth_assoc_send_according_chan
   sm_auth_assoc_send_according_chan(SmAssociatingState, 0'u16, nil)
-
-proc smAssocOwnerCurrent(build: SmTxBuildContext; indication: pointer): bool =
-  smTxOwnerCurrent(build) and smEnvView().connectIndMsg == indication
 
 proc smAssocIesValid(data: pointer; length: uint): bool =
   var offset = 0'u
@@ -3641,15 +3562,13 @@ proc smRxFrameFits(param: pointer; minimumFrameLength: uint32): bool =
   let frameLength = rxuMgtIndMsgAt(param).frameLen.uint32
   frameLength >= minimumFrameLength and frameLength <= payloadLength - 32'u32
 
-proc smAssocDone(build: var SmTxBuildContext; indication: pointer;
-                  aid: uint16; notifyWps: bool): bool =
-  if not smAssocOwnerCurrent(build, indication): return false
+proc smAssocDone(vif, station: uint8; aid: uint16; notifyWps: bool) =
+  ## The AP accepted the association: activate the link, state 9.
   if aid == 0 or aid > 2007'u16:
     when defined(bl808WifiDiagWarmScan): nimFwDbgWarmAssocFailure = warmAssocAid
     sm_connect_ind(WLAN_FW_ASSOCIATE_FAIILURE.uint16, 0xFFFF)
-    return false
-  smActivationStart(build.identity.vif, build.identity.station, aid, notifyWps)
-  true
+    return
+  smActivationStart(vif, station, aid, notifyWps)
 
 proc sm_assoc_done*(aid: uint16) {.exportc, cdecl.} =
   let connection = smEnvView().connectInfo
@@ -3658,11 +3577,11 @@ proc sm_assoc_done*(aid: uint16) {.exportc, cdecl.} =
       (state != SmAssocRspState and state != SmAuthenticatingState): return
   let vif = connectInfoView(connection).vifIdx
   if vif >= MAX_VIFS.uint8: return
-  let station = vifChannelForIdx(vif).staIdx
-  if station >= STA_INFO_TAB_ENTRIES.uint8: return
-  var build = smTxBegin(connection)
-  if not build.identity.captured or not smTxBindStation(build, station): return
-  discard smAssocDone(build, smEnvView().connectIndMsg, aid, false)
+  let vifView = vifChannelForIdx(vif)
+  let station = vifView.staIdx
+  if vifView.vifIdx != vif or vifView.vifType != VIF_TYPE_STA or
+      station >= STA_INFO_TAB_ENTRIES.uint8: return
+  smAssocDone(vif, station, aid, false)
 
 {.emit: "__attribute__((optimize(\"crossjumping\"))) void sm_auth_handler(void*);".}
 proc sm_auth_handler*(param: pointer) {.exportc, cdecl.} =
@@ -3698,11 +3617,6 @@ proc sm_auth_handler*(param: pointer) {.exportc, cdecl.} =
     if algorithm == 1 and sequence == 2 and
         (frameLen < 136 or frame.saeBodyFirst != 16 or
          frame.sharedChallengeLen != 128): return
-  var owner = smTxCapture(connection)
-  if owner.state != SmAuthenticatingState or not smTxBindStation(owner, station): return
-  template current(): bool =
-    smTxOwnerCurrent(owner) and smEnvView().connectIndMsg == indication
-  if not current(): return
   const
     AuthAlgorithmNotSupported = 13'u16
     AuthTransactionOutOfSequence = 14'u16
@@ -3712,29 +3626,27 @@ proc sm_auth_handler*(param: pointer) {.exportc, cdecl.} =
     if algorithm == 0 and dispatch.staIdx == station and
         status in {AuthAlgorithmNotSupported, AuthTransactionOutOfSequence}: 2'u16
     else: sequence
+  # Only the response to the request of the live operation (state 6) counts.
   if not smAuthResponseMatches(algorithm, expectedSequence): return
+  let stamp = smOwn.op.serial
 
   var challenge: array[128, uint8]
   if status == 0 and algorithm == 1 and sequence == 2:
     discard c_memcpy(addr challenge[0], smAuthSharedChallengePtr(frame), 128)
-    if not current(): return
 
   inc nimFwDbgAuthHandler
   nimFwDbgAuthHandlerLast = algorithm.uint32 or (sequence.uint32 shl 16) or
     (status.uint32 shl 24)
   when defined(bl808WifiConnectTrace):
     let staVifPair = dispatch.staIdx.uint32 or (dispatch.vifIdx.uint32 shl 8)
-    nimFwConnectTrace2U32("[WIFI-CT] sm_mgt_auth ", owner.state.uint32, staVifPair)
-    if not current(): return
+    nimFwConnectTrace2U32("[WIFI-CT] sm_mgt_auth ", SmAuthenticatingState.uint32, staVifPair)
     nimFwConnectTrace2U32("[WIFI-CT] auth_rx ",
       algorithm.uint32 or (sequence.uint32 shl 16),
-      status.uint32 or (owner.state.uint32 shl 16))
-    if not current(): return
+      status.uint32 or (SmAuthenticatingState.uint32 shl 16))
 
   if status != 0:
     if not smAuthConsumeResponse(algorithm, expectedSequence): return
     ke_timer_clear(SM_RSP_TIMEOUT_IND, TASK_SM)
-    if not current(): return
     let info = connectInfoView(connection)
     if info.authType == 1 and info.authRetryGate != 0:
       info.authType = 0
@@ -3750,12 +3662,12 @@ proc sm_auth_handler*(param: pointer) {.exportc, cdecl.} =
       if callback != nil:
         let handleSae = cast[proc(body: pointer; length, sequence: uint16;
                                  context: pointer): int32 {.cdecl.}](callback)
+        # The supplicant may end the attempt, or send a new request, here.
         processed = handleSae(smAuthSaeBodyPtr(frame), frameLen - 6, sequence, nil)
-        if not current(): return
+        if not opCurrent(smOwn.op, stamp): return
     if processed == 0:
       if not smAuthConsumeResponse(algorithm, sequence): return
       ke_timer_clear(SM_RSP_TIMEOUT_IND, TASK_SM)
-      if not current(): return
       if sequence == 1:
         sm_auth_send_pre(2'u16, nil)
       elif sequence == 2:
@@ -3765,9 +3677,7 @@ proc sm_auth_handler*(param: pointer) {.exportc, cdecl.} =
     if processed != -8:
       if not smAuthConsumeResponse(algorithm, sequence): return
       ke_timer_clear(SM_RSP_TIMEOUT_IND, TASK_SM)
-      if not current(): return
     let logFn = getLogFunc(204)
-    if not current(): return
     if logFn != nil:
       let line = if processed == -8: 1302.cint else: 1307.cint
       let format: cstring = if processed == -8:
@@ -3777,7 +3687,6 @@ proc sm_auth_handler*(param: pointer) {.exportc, cdecl.} =
       cast[proc(level: uint32; tag, file: cstring; line: cint;
                 format: cstring) {.cdecl, varargs.}](logFn)(
         3, nil, "sm.c", line, format, sequence.cint)
-      if not current(): return
     if processed != -8:
       sm_connect_ind(WLAN_FW_AUTHENTICATION_FAIILURE.uint16, 0)
     return
@@ -3785,7 +3694,6 @@ proc sm_auth_handler*(param: pointer) {.exportc, cdecl.} =
   if algorithm != 0 and algorithm != 1: return
   if not smAuthConsumeResponse(algorithm, sequence): return
   ke_timer_clear(SM_RSP_TIMEOUT_IND, TASK_SM)
-  if not current(): return
   if algorithm == 0:
     connectInfoAuthRetry(connection)[] = 0
     inc nimFwDbgAuthOpenSuccess
@@ -3828,11 +3736,6 @@ proc sm_assoc_rsp_handler*(param: pointer) {.exportc, cdecl.} =
   # A valid fixed failure status must still be reported when optional IEs are
   # malformed. Successful association and comeback timing require valid IEs.
   if statusCode == 0 and not iesValid: return
-  # Ignore malformed success before advancing the TX serial: the outstanding
-  # response timer still belongs to the request we are waiting to complete.
-  var build = smTxBegin(connection)
-  if not build.identity.captured or build.state != SmAssocRspState or
-      not smTxBindStation(build, staIdx): return
   let aid = frame.aid and 0x3FFF'u16
   let body0 = frame.capabilityInfo.uint32 or (statusCode.uint32 shl 16)
   var body4 = frame.aid.uint32
@@ -3840,7 +3743,6 @@ proc sm_assoc_rsp_handler*(param: pointer) {.exportc, cdecl.} =
   if ieLength > 0: body4 = body4 or (ieBytes[0].uint32 shl 16)
   if ieLength > 1: body4 = body4 or (ieBytes[1].uint32 shl 24)
   ke_timer_clear(SM_RSP_TIMEOUT_IND, TASK_SM)
-  if not smAssocOwnerCurrent(build, smEnvSecond): return
   if statusCode == 0 and (aid == 0 or aid > 2007'u16):
     when defined(bl808WifiDiagWarmScan): nimFwDbgWarmAssocFailure = warmAssocAid
     sm_connect_ind(WLAN_FW_ASSOCIATE_FAIILURE.uint16, 0xFFFF)
@@ -3852,9 +3754,7 @@ proc sm_assoc_rsp_handler*(param: pointer) {.exportc, cdecl.} =
   nimFwDbgAssocRspBody4 = body4
   when defined(bl808WifiConnectTrace):
     nimFwConnectTrace2U32("[WIFI-CT] assoc_rsp_status ", frameLen.uint32, statusCode.uint32)
-    if not smAssocOwnerCurrent(build, smEnvSecond): return
     nimFwConnectTrace2U32("[WIFI-CT] assoc_rsp_body ", body0, body4)
-    if not smAssocOwnerCurrent(build, smEnvSecond): return
   if statusCode != 0:
     if statusCode == 30 and iesValid:
       let iePtr = mac_ie_find(assocBody, ieLength.uint32, 56)
@@ -3865,21 +3765,19 @@ proc sm_assoc_rsp_handler*(param: pointer) {.exportc, cdecl.} =
             let retry = timeoutIe.intervalValue
             let intervalTu = retry[0].uint32 or (retry[1].uint32 shl 8) or
               (retry[2].uint32 shl 16) or (retry[3].uint32 shl 24)
-            connectInfoAuthRetry(build.connection)[] = 0
+            connectInfoAuthRetry(connection)[] = 0
             # Waiting out the comeback is a new operation in the same state,
             # so an expiry already posted for the request is stale.
             if smArmResponse(smGo(SmAssocRspState),
                              max(1'u64, intervalTu.uint64 * 1024)): return
-            if smAssocOwnerCurrent(build, smEnvSecond):
-              when defined(bl808WifiDiagWarmScan): nimFwDbgWarmAssocFailure = warmAssocComeback
-              sm_connect_ind(WLAN_FW_ASSOCIATE_FAIILURE.uint16, 0xFFFF)
+            when defined(bl808WifiDiagWarmScan): nimFwDbgWarmAssocFailure = warmAssocComeback
+            sm_connect_ind(WLAN_FW_ASSOCIATE_FAIILURE.uint16, 0xFFFF)
             return
     let logFn = blOpsFunc(4)
-    if not smAssocOwnerCurrent(build, smEnvSecond): return
     if cast[uint](logFn) > 0x1000'u:
       cast[proc(fmt: cstring) {.cdecl, varargs.}](logFn)(
         "Association failure, Wlan802.11 status code = %d\r\n", statusCode.cint)
-    if smAssocOwnerCurrent(build, smEnvSecond): sm_connect_ind(5, statusCode)
+    sm_connect_ind(5, statusCode)
     return
   let ind = smConnectIndPayloadAt(smEnvSecond)
   let reqIeLen = ind.assocReqIeLen
@@ -3892,18 +3790,14 @@ proc sm_assoc_rsp_handler*(param: pointer) {.exportc, cdecl.} =
   ind.assocRspIeLen = rspIeLen
   if rspIeLen != 0:
     discard c_memcpy(addr ind.assocIeBuffer[reqIeLen.int], assocBody, rspIeLen.csize_t)
-    if not smAssocOwnerCurrent(build, smEnvSecond): return
   let staEntry = cast[pointer](staInfoForIdx(staIdx))
   when defined(bl808WifiConnectTrace):
     nimFwConnectTrace2U32("[WIFI-CT] assoc_rsp_before_rate ", staIdx.uint32,
                           pointerAddrU32(staEntry))
-    if not smAssocOwnerCurrent(build, smEnvSecond): return
   if not meTryInitRate(staEntry):
-    if smAssocOwnerCurrent(build, smEnvSecond):
-      when defined(bl808WifiDiagWarmScan): nimFwDbgWarmAssocFailure = warmAssocRateInit
-      sm_connect_ind(WLAN_FW_ASSOCIATE_FAIILURE.uint16, 0xFFFF)
+    when defined(bl808WifiDiagWarmScan): nimFwDbgWarmAssocFailure = warmAssocRateInit
+    sm_connect_ind(WLAN_FW_ASSOCIATE_FAIILURE.uint16, 0xFFFF)
     return
-  if not smAssocOwnerCurrent(build, smEnvSecond): return
   let chanPtr = vif.operChan
   if chanPtr != nil:
     let chan = cast[ptr ScanChannelEntry](chanPtr)
@@ -3916,14 +3810,11 @@ proc sm_assoc_rsp_handler*(param: pointer) {.exportc, cdecl.} =
     when defined(bl808WifiConnectTrace):
       nimFwConnectTrace2U32("[WIFI-CT] assoc_rsp_before_tpc ", pointerAddrU32(chanPtr),
                             tpcPower.uint32)
-      if not smAssocOwnerCurrent(build, smEnvSecond): return
     tpc_update_vif_tx_power(cast[pointer](vif), cast[pointer](addr tpcPower), cast[pointer](addr tpcRate))
-    if not smAssocOwnerCurrent(build, smEnvSecond): return
   when defined(bl808WifiConnectTrace):
     nimFwConnectTrace2U32("[WIFI-CT] assoc_rsp_before_done ", vifIdx.uint32,
                           pointerAddrU32(cast[pointer](vif)))
-    if not smAssocOwnerCurrent(build, smEnvSecond): return
-  discard smAssocDone(build, smEnvSecond, aid, smEnvView().state == 2)
+  smAssocDone(vifIdx, staIdx, aid, smEnvView().state == 2)
 
 proc sm_deauth_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
   ## Handle deauthentication frame (140 instrs). Validates BSSID/SA,
@@ -3941,10 +3832,6 @@ proc sm_deauth_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
   let vifIdx = deauth.vifIdx
   if vifIdx.int >= MAX_VIFS:
     return KeMsgConsumed
-  let saved = irqSave()
-  var locked = true
-  defer:
-    if locked: irqRestore(saved)
   # The scheduler may have checked the tag before this slot was reused.
   when defined(bl808WifiDiagPeerRxAdmission):
     var protection: RxMgtProtection
@@ -3991,8 +3878,6 @@ proc sm_deauth_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
     if connInfoPtr == nil or connectInfoView(connInfoPtr).vifIdx != vifIdx:
       return KeMsgSaved
     # VIF matches: send connect indication with status=6 (deauth by AP)
-    locked = false
-    irqRestore(saved)
     sm_connect_ind(6, reason)
     return KeMsgConsumed
 
@@ -4021,8 +3906,6 @@ proc sm_deauth_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
     sm.saQueryReason = reason
     sm_issue_sa_query_request()
     return KeMsgConsumed
-  locked = false
-  irqRestore(saved)
   when defined(bl808WifiDiagLinkDrop):
     smReportApDisconnect(peer, reason, peerEvidence(false))
   else:
@@ -4184,18 +4067,19 @@ proc sm_handle_supplicant_result*(result_code: uint8, reason: uint16) {.exportc,
 
   # The blob enters state 10 here; this port does so once the frame is built
   # (smDeauthWait), so a failure below still ends a live attempt.
+  let stamp = smOwn.op.serial
   # Allocate TX frame for deauth (512 bytes)
   let frame = txl_frame_get(512)
   if frame == nil:
-    # Allocation failed: signal error via sm_connect_ind
-    sm_connect_ind(10, reason.uint16)
+    # Allocation failed: report it, unless SM moved on inside txl_frame_get.
+    if opCurrent(smOwn.op, stamp): sm_connect_ind(10, reason.uint16)
     return
 
   let vif = vifChannelForIdx(vifIdx)
   let desc = hostTxDescAt(frame)
   if desc.bufDesc == nil or desc.hwDesc == nil:
     txl_frame_release(frame, false)
-    sm_connect_ind(10, reason.uint16)
+    if opCurrent(smOwn.op, stamp): sm_connect_ind(10, reason.uint16)
     return
   tpc_update_frame_tx_power(cast[pointer](vif), frame)
   let link = hostTxLinkDescAt(desc.bufDesc)
@@ -4244,13 +4128,14 @@ proc sm_handle_supplicant_result*(result_code: uint8, reason: uint16) {.exportc,
   # Blob: `addi a5, s1, 128; sw &cfm, 80(a5); sw vif, 84(a5)`, i.e. frame+208 =
   # &sm_supplicant_deauth_cfm, frame+212 = &vif_entry; here frame+212 holds
   # the wait's stamp.
+  # Commit. txl_frame_get may have run SM code (station_tx_build.nim).
   let callback = cast[pointer](sm_supplicant_deauth_cfm)
-  let stamp = smDeauthWait(vifIdx, callback)
-  if stamp == 0:
+  let wait = if opCurrent(smOwn.op, stamp): smDeauthWait(vifIdx, callback) else: 0'u32
+  if wait == 0:
     txl_frame_release(frame, false)
     return
   desc.callback = callback
-  desc.callbackArg = opStampEnv(stamp)
+  desc.callbackArg = opStampEnv(wait)
   # The queue consumes the descriptor even on failure. Completion owns the
   # success path; a rejected push runs no callback and reports the distinct
   # vendor status 9.
@@ -4263,8 +4148,6 @@ proc smTrySubmitSaQuery(staIdx: uint8, action: uint8, transId: uint16;
   ## peer's VIF and unicast protection before appending its four-byte body.
   if staIdx.int >= STA_INFO_TAB_ENTRIES or action > 1:
     return saQueryBuildRejected
-  let saved = irqSave()
-  defer: irqRestore(saved)
   let sta = staInfoForIdx(staIdx)
   let vifIdx = sta.instNbr
   if vifIdx.int >= MAX_VIFS:
@@ -4345,10 +4228,6 @@ proc sm_sa_query_handler*(param: pointer) {.exportc, cdecl.} =
   let vifIdx = frame.vifIdx
   if vifIdx.int >= MAX_VIFS:
     return
-  let saved = irqSave()
-  var locked = true
-  defer:
-    if locked: irqRestore(saved)
   if smSaQueryResetting or not rxMgtMessageCurrent(keMsgHdrFromPayload(param)): return
   let vif = vifChannelForIdx(vifIdx)
   # Check VIF active
@@ -4382,8 +4261,7 @@ proc sm_sa_query_handler*(param: pointer) {.exportc, cdecl.} =
     if transId == pendingTransId:
       sm.saQueryActive = 0
       smSaQuery.armed = false
-      locked = false
-      keTimerClearLocked(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM, saved)
+      ke_timer_clear(SM_SA_QUERY_TIMEOUT_IND_MSG, TASK_SM)
 
 proc sm_issue_sa_query_request*() {.exportc, cdecl.} =
   ## Issue SA Query request to AP (28 instrs).
@@ -4391,8 +4269,6 @@ proc sm_issue_sa_query_request*() {.exportc, cdecl.} =
   ## stores lower 16 bits as pending transId in sm_env+40.
   ## reads the peer STA index from sm_env+38, and sends action 0.
   ## Starts the SA query timeout with ke_timer_set(id, TASK_SM, 100000).
-  let saved = irqSave()
-  defer: irqRestore(saved)
   if not smSaQueryCurrent(smSaQuery.serial): return
   let sm = smEnvView()
   inc smSaQuery.serial
@@ -6926,11 +6802,11 @@ proc me_build_authenticate*(buf: pointer, authAlgo: uint16, authSeq: uint16,
   return 6
 
 proc meBuildSaeAuthenticate(buf: pointer; authAlgo, authSeq, statusCode: uint16;
-                             vifIdx: uint32; build: ptr SmTxBuildContext;
+                             vifIdx: uint32; frame: pointer;
                              peerOverride: pointer = nil;
                              ownOverride: pointer = nil): uint32 =
   if vifIdx >= MAX_VIFS.uint32 or
-      not smTxFits(build, buf, sizeof(AuthFixedBodyView).uint32): return 0
+      not smTxFits(frame, buf, sizeof(AuthFixedBodyView).uint32): return 0
   let body = cast[ptr AuthBodyDataView](buf)
   body.fixed = AuthFixedBodyView(authAlgo: authAlgo, authSeq: authSeq,
                                  statusCode: statusCode)
@@ -6969,11 +6845,10 @@ proc meBuildSaeAuthenticate(buf: pointer; authAlgo, authSeq, statusCode: uint16;
   var saeLen: uint32
   let saeData = cast[SaeFrameFn](getSaeFrame)(
     addr bssid[0], addr own[0], passphrasePtr, authSeq.uint32, addr saeLen)
-  if not smTxFits(build, buf, sizeof(AuthFixedBodyView).uint32) or
-      saeData == nil or saeLen > high(uint32) - sizeof(AuthFixedBodyView).uint32:
+  if saeData == nil or saeLen > high(uint32) - sizeof(AuthFixedBodyView).uint32:
     return 0
   let total = sizeof(AuthFixedBodyView).uint32 + saeLen
-  if not smTxFits(build, buf, total): return 0
+  if not smTxFits(frame, buf, total): return 0
   if saeLen != 0:
     discard c_memcpy(addr body.variablePayload[0], saeData, saeLen.csize_t)
   total
@@ -6984,10 +6859,10 @@ proc me_build_sae_authenticate*(buf: pointer, authAlgo: uint16, authSeq: uint16,
 
 proc meBuildAssociateReq(buf, assocInfo, reassocBssid, capParam, cursorOut,
                          bodyLenOut, connInfo: pointer;
-                         build: ptr SmTxBuildContext): uint32 =
+                         frame: pointer): uint32 =
   let hdrSize = if reassocBssid == nil: 4'u32 else: 10'u32
   if cast[uint](capParam) >= MAX_VIFS.uint or assocInfo == nil or
-      not smTxFits(build, buf, hdrSize): return 0
+      not smTxFits(frame, buf, hdrSize): return 0
   let assoc = vifAssocInfo(assocInfo)
   if assoc.ssidLen == 0 or assoc.ssidLen > 32 or
       assoc.basicRates[0] == 0 or
@@ -6998,7 +6873,6 @@ proc meBuildAssociateReq(buf, assocInfo, reassocBssid, capParam, cursorOut,
   if connInfo != nil and connectInfoView(connInfo).listenInterval != 0:
     listenInt = connectInfoView(connInfo).listenInterval
   let capInfo = me_build_capability(capParam)
-  if not smTxFits(build, buf, hdrSize): return 0
   let fixedReq = cast[ptr AssocReqFixedBodyView](buf)
   fixedReq.capabilityInfo = capInfo
   fixedReq.listenInterval = listenInt
@@ -7008,33 +6882,33 @@ proc meBuildAssociateReq(buf, assocInfo, reassocBssid, capParam, cursorOut,
   var cursor = cast[pointer](ieStart)
   var totalLen = hdrSize
 
-  if not smTxFits(build, cursor, assoc.ssidLen.uint32 + 2): return 0
+  if not smTxFits(frame, cursor, assoc.ssidLen.uint32 + 2): return 0
   totalLen += me_add_ie_ssid(addr cursor, assoc.ssidLen, addr assoc.ssidData[0])
-  if not smTxFits(build, cursor, 0): return 0
+  if not smTxFits(frame, cursor, 0): return 0
 
   let ratesPtr = cast[pointer](addr assoc.basicRates[0])
   let rateCount = assoc.basicRates[0].uint32
-  if not smTxFits(build, cursor, min(rateCount, 8'u32) + 2): return 0
+  if not smTxFits(frame, cursor, min(rateCount, 8'u32) + 2): return 0
   totalLen += me_add_ie_supp_rates(addr cursor, ratesPtr)
-  if not smTxFits(build, cursor, 0): return 0
+  if not smTxFits(frame, cursor, 0): return 0
   if rateCount > 8:
-    if not smTxFits(build, cursor, rateCount - 6): return 0
+    if not smTxFits(frame, cursor, rateCount - 6): return 0
     totalLen += me_add_ie_ext_supp_rates(addr cursor, ratesPtr)
-    if not smTxFits(build, cursor, 0): return 0
+    if not smTxFits(frame, cursor, 0): return 0
 
   let assocIeSrc = cast[pointer](assoc.rsnIePtr)
   let assocIeLen = assoc.rsnIeLen.uint32
   nimFwDbgVifIeLenAtAssoc = assocIeLen or (cast[uint32](assocIeSrc) shl 8)
   if assocIeLen != 0:
-    if assocIeSrc == nil or not smTxFits(build, cursor, assocIeLen): return 0
+    if assocIeSrc == nil or not smTxFits(frame, cursor, assocIeLen): return 0
     discard c_memcpy(cursor, assocIeSrc, assocIeLen.csize_t)
     cursor = cast[pointer](cast[uint](cursor) + assocIeLen.uint)
     totalLen += assocIeLen
   nimFwTrace2U32("[WIFI-NIMFW] assoc_tx_sec ", secFlags, assocIeLen)
-  if not smTxFits(build, cursor, 0): return 0
+  if not smTxFits(frame, cursor, 0): return 0
 
   if (secFlags and 1) != 0:
-    if not smTxFits(build, cursor, sizeof(WmmInfoIeView).uint32): return 0
+    if not smTxFits(frame, cursor, sizeof(WmmInfoIeView).uint32): return 0
     let qosInfo =
       if psEnvView().uapsdPeriod != 0 and
           cast[int8](assoc.wmmQosInfo) < 0 and connInfo != nil:
@@ -7053,19 +6927,19 @@ proc meBuildAssociateReq(buf, assocInfo, reassocBssid, capParam, cursorOut,
     totalLen += sizeof(WmmInfoIeView).uint32
 
   if (secFlags and 2) != 0 and meEnvView().htSupp != 0:
-    if not smTxFits(build, cursor, 28): return 0
+    if not smTxFits(frame, cursor, 28): return 0
     totalLen += me_add_ie_ht_capa(addr cursor)
-    if not smTxFits(build, cursor, 0): return 0
+    if not smTxFits(frame, cursor, 0): return 0
 
   let sm = smEnvView()
   let vendorPtr = sm.vendorIePtr
   let vendorLen = sm.vendorIeLen.uint32
   if vendorLen != 0:
-    if vendorPtr == nil or not smTxFits(build, cursor, vendorLen): return 0
+    if vendorPtr == nil or not smTxFits(frame, cursor, vendorLen): return 0
     co_pack8p(cursor, vendorPtr, vendorLen)
     cursor = cast[pointer](cast[uint](cursor) + vendorLen.uint)
     totalLen += vendorLen
-    if not smTxFits(build, cursor, 0): return 0
+    if not smTxFits(frame, cursor, 0): return 0
   if cursorOut != nil: cast[ptr pointer](cursorOut)[] = cast[pointer](ieStart)
   if bodyLenOut != nil:
     cast[ptr uint16](bodyLenOut)[] = (cast[uint](cursor) - ieStart).uint16

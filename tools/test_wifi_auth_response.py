@@ -95,7 +95,6 @@ def source(trace: bool = False) -> str:
         "vifIdx, retry: uint8", "vifIdx, retry, authType, authRetryGate: uint8", 1,
     )
     code += layouts("SmAuthFrameView", "SmAuthResponseExpectation") + EXTRA
-    code += procedure((FW / "station_tx_build.nim").read_text(), "smTxCapture")
     code += procedure((FW / "station_tx_build.nim").read_text(), "smAuthResponseMatches")
     code += procedure((FW / "station_tx_build.nim").read_text(), "smAuthConsumeResponse")
     return code + procedure((FW / "scan_station_ap_me.nim").read_text(), "sm_auth_handler")
@@ -238,10 +237,8 @@ for sequence in 1'u16 .. 2'u16:
   finish(p)
 let p = authResponse(3, 1)
 saeResult = -8
-let generation = smTxSerials[1]
 sm_auth_handler(p)
 doAssert clears.len == 0 and failures.len == 0 and associations == 0
-doAssert smTxSerials[1] == generation
 finish(p)
 ''',
     "unexpected_success_sequences_keep_timer": r'''
@@ -363,35 +360,17 @@ for mutation in 0 .. 6:
   doAssert clears.len == 0 and associations == 0 and failures.len == 0
   finish(p)
 ''',
-    "timer_callback_replaces_owner": r'''
-for mutation in 0 .. 4:
-  let p = authResponse(0, 2)
-  onClear = proc() =
-    case mutation
-    of 0: replaceOwner()
-    of 1: inc rxVifEpochs[1]
-    of 2: inc stationEpochs[2]
-    of 3: inc smTxSerials[1]
-    else: sm.connectIndMsg = addr otherInd
-  sm_auth_handler(p)
-  doAssert associations == 0 and conn.retry == 7 and failures.len == 0
-  finish(p)
-''',
+    # The supplicant's SAE callback is a synchronous callout that can run
+    # SM code: the handler goes on only while SM's operation is unchanged.
     "sae_callback_replaces_owner": r'''
-let p = authResponse(3, 2)
-onSae = replaceOwner
-sm_auth_handler(p)
-doAssert saeBodies.len == 1 and clears.len == 0 and associations == 0
-doAssert conn.retry == 7 and failures.len == 0
-finish(p)
-''',
-    "failure_log_replaces_owner": r'''
-let p = authResponse(3, 2)
-saeResult = 7
-onLog = replaceOwner
-sm_auth_handler(p)
-doAssert failures.len == 0 and associations == 0
-finish(p)
+for saeStatus in [0'i32, 7]:
+  let p = authResponse(3, 2)
+  saeResult = saeStatus
+  onSae = replaceOwner
+  sm_auth_handler(p)
+  doAssert saeBodies.len == 1 and clears.len == 0 and associations == 0
+  doAssert conn.retry == 7 and failures.len == 0 and authLogs.len == 0
+  finish(p)
 ''',
     "owned_shared_challenge": r'''
 var challenge: array[130, uint8]
@@ -411,19 +390,15 @@ for length in [0, 1, 129, 130]:
   if length > 0: challenge[0] = 16
   if length > 1: challenge[1] = 127
   let p = authResponse(1, 2, body = challenge)
-  let generation = smTxSerials[1]
   sm_auth_handler(p)
   doAssert clears.len == 0 and authRequests.len == 0 and associations == 0
-  doAssert smTxSerials[1] == generation
   finish(p)
 ''',
     "unsupported_algorithm_keeps_timer": r'''
 for algorithm in [2'u16, 4, 255, 65535]:
   let p = authResponse(algorithm, 2)
-  let generation = smTxSerials[1]
   sm_auth_handler(p)
   doAssert clears.len == 0 and failures.len == 0 and associations == 0
-  doAssert smTxSerials[1] == generation
   finish(p)
 ''',
 }
@@ -433,17 +408,6 @@ for algorithm in [2'u16, 4, 255, 65535]:
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_auth_response(tmp_path: Path, case: str, mode: str) -> None:
     run_program(tmp_path, mode, source() + CASES[case])
-
-
-@pytest.mark.parametrize("mode", ["checked", "release", "asan"])
-def test_auth_trace_replaces_owner(tmp_path: Path, mode: str) -> None:
-    run_program(tmp_path, mode, source(trace=True) + r'''
-let p = authResponse(0, 2)
-onTrace = replaceOwner
-sm_auth_handler(p)
-doAssert associations == 0 and conn.retry == 7 and clears.len == 0
-finish(p)
-''')
 
 
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
@@ -482,11 +446,6 @@ let valid = authResponse(0, 2)
 doAssert rxu_mgt_ind_handler_sm(valid) == KeMsgConsumed
 doAssert associations == 1
 finish(valid)
-let p = authResponse(0, 2)
-onTrace = replaceOwner
-doAssert rxu_mgt_ind_handler_sm(p) == KeMsgConsumed
-doAssert associations == 0 and clears.len == 0
-finish(p)
 '''
     run_program(tmp_path, mode, code)
 
@@ -498,8 +457,9 @@ def test_synthetic_auth_message_layout(tmp_path: Path, mode: str) -> None:
     injection = "\n".join(line[4:] if line.startswith("    ") else line for line in injection.splitlines())
     code = source() + r'''
 let p = authResponse(0, 2)
-var build = smTxCapture(sm.connectInfo)
-doAssert smTxBindStation(build, 2)
+let wait = smOwn.op.serial
+let vifIdx = 1'u8
+let staIdx = 2'u8
 '''
     code += injection + "\ndoAssert associations == 1 and clears == @[SM_RSP_TIMEOUT_IND]\nfinish(p)\n"
     run_program(tmp_path, mode, code)

@@ -191,7 +191,7 @@ proc exercise() =
   let bssInfoOut = cast[pointer](addr ap)
   let ieStart = cast[pointer](addr informationElement[0])
   let ieLen = informationElement.len.uint32
-  let directedOwner = (connection: connectInfoPtr)
+  let directedConnection = connectInfoPtr
   template requireFrameOwner() = discard
 """
 
