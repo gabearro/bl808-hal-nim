@@ -590,3 +590,95 @@ for change in 0..1:
   doAssert failures == @[(15'u16, 0xFFFF'u16)] and bssCalls == 0 and deletions == 0
   finishExchange()
 ''')
+
+
+# --- Cleanup (state 10) and the deferred auth/assoc request (states 5/7) ----
+
+@pytest.mark.parametrize("step", range(4))
+@pytest.mark.parametrize("fate", ["vif_retired", "no_memory", "sm_init"])
+def test_cleanup_request_is_always_answered(tmp_path: Path, step: int, fate: str) -> None:
+    """SMSTRUCT-N1 (cleanup): the cleanup had no loss path. A request of its
+    that MM or ME consumed without the reply (an admission refused once the
+    VIF was retired, or after the cleanup was replaced) left it waiting in
+    state 10, or a polled service cancelled it unreported. The cleanup now
+    sends with SM's reserved reply (smSendReserved; the station delete is
+    answered in place), so every request it waits on is answered: a retired
+    VIF's request unapplied (smStaleRequest; mm_sta_del_req_handler for the
+    delete of a station the removal left out of any VIF's list, which MM
+    could otherwise only retry for ever). A step whose messages cannot be
+    allocated is retried from SM's timer, never skipped. The real cleanup,
+    station_sm.nim, ME's control exchange and the ME/MM repliers run here."""
+    from test_wifi_sm_cleanup import CASES, program
+    code = program("disconnect").removesuffix(CASES["disconnect"])
+    run_nim(tmp_path, code + f"const step = {step}\nconst fate = \"{fate}\"\n" + r'''
+proc untilReplier(target: int) =
+  while smCleanup.step < target: driveOne()
+proc untilAnswer(target: int) =
+  untilReplier(target)
+  while keMsgQueueSent.first == nil or keMsgQueueSent.first.destId != TASK_SM: driveOne()
+case fate
+of "vif_retired":
+  sm_disconnect_process(addr vifs[0], 19, 3)
+  untilReplier(step)
+  retireVif(0)
+of "no_memory":
+  if step == 0: failEveryAllocation = true
+  sm_disconnect_process(addr vifs[0], 19, 3)
+  if step > 0:
+    untilAnswer(step - 1)
+    failEveryAllocation = true
+    driveOne()
+  for _ in 0 ..< 3: discard wifiDrainScheduledWork()
+  doAssert smCleanup.step == step and commands.len == step,
+    "[SMSTRUCT-N1] a cleanup step was skipped without memory"
+  failEveryAllocation = false
+else:
+  sm_disconnect_process(addr vifs[0], 19, 3)
+  untilReplier(step)
+  smCleanupCancel()
+  smGo(SmIdleState)
+var dispatched = 0
+while wifiMainHasPendingWork() and dispatched < 64:
+  discard wifiDrainScheduledWork()
+  inc dispatched
+doAssert smState == SmIdleState and smOwn.teardown == tdNone and not smGuardArmed,
+  "[SMSTRUCT-N1] cleanup left in state 10 after request " & $step & " (" & fate & ")"
+doAssert notifications.len == 1 and allocated.len == 0 and meState == MeIdleState
+if fate == "no_memory": completed()
+''', finding="SMSTRUCT-N1")
+
+
+@pytest.mark.parametrize("state", [4, 6, 8])
+def test_auth_request_for_a_retired_sta_vif_ends_the_attempt(tmp_path: Path, state: int) -> None:
+    """States 4, 6 and 8 send the next auth or assoc frame through
+    sm_auth_assoc_send_according_chan. With the attempt's STA VIF retired it
+    returned without sending (smDeferredProceed failed, nothing reported),
+    and SM stayed in that state: in 6 and 8 the response deadline had already
+    fired or been cleared. The same happened to a parked request whose VIF
+    was retired before it came back. Both now end the attempt
+    (sm_connect_ind(11)). The real sm_auth_assoc_send_according_chan,
+    deferred_auth.nim and station_sm.nim run here."""
+    from test_wifi_deferred_auth import run_nim as run_deferred
+    from test_wifi_deferred_auth_lifetime import program_source
+    run_deferred(tmp_path, program_source() + f"const state = {state}'u16\n" + r'''
+for kind in [5'u16, 7]:
+  for count in [1'u8, 2]:
+    reset()
+    discard smGo(state)
+    channelCount = count
+    vifs[1].vifType = 4
+    schedule(kind)
+    doAssert endings == @[(11'u16, 0xFFFF'u16)] and currentState == 10,
+      "[SM-AUTH-VIF] attempt left in state " & $currentState & " with its STA VIF retired"
+    doAssert sent.len == 0 and live.len == 0
+  # A parked request whose VIF is retired before the channel comes back.
+  reset()
+  discard smGo(state)
+  schedule(kind)
+  publish()
+  vifs[1].vifType = 4
+  drain()
+  doAssert endings == @[(11'u16, 0xFFFF'u16)] and currentState == 10,
+    "[SM-AUTH-VIF] parked request ignored with its STA VIF retired"
+finish()
+''')

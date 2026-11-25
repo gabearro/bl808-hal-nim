@@ -174,18 +174,10 @@ var
   keTimerQueue: CoList
   keEvtHandlers: array[KE_EVT_MAX, tuple[handler, param: pointer]]
   beacons, kernelCallbacks, resets: int
-  registrations, taskMessages: int
-  registrationReady, messageReady, holdReset, registrationPostsReset: bool
+  taskMessages: int
+  messageReady, holdReset: bool
 proc keEnvEventField(): ptr uint32 = addr events
 proc macTimeNow(): uint32 = regRead(MACHW_TIMLO_REG)
-# The polled cleanup service in wifiDrainScheduledWork ("registration"
-# here) can post a reset.
-proc smCleanupNeedsService(): bool = registrationReady
-proc smCleanupService() =
-  registrationReady = false
-  inc registrations
-  if registrationPostsReset:
-    ke_evt_set(KE_EVT_RESET)
 proc wifiMessagePendingWork(): bool = messageReady
 proc ke_task_schedule() =
   messageReady = false
@@ -223,12 +215,9 @@ proc armServiceTimers(start, deadline: uint32) =
   beacons = 0
   kernelCallbacks = 0
   resets = 0
-  registrations = 0
   taskMessages = 0
-  registrationReady = false
   messageReady = false
   holdReset = false
-  registrationPostsReset = false
 
 keEvtHandlers[0].handler = cast[pointer](resetEvent)
 keEvtHandlers[1].handler = cast[pointer](mmEvent)
@@ -296,28 +285,17 @@ for deadline in [1000'u32, 20'u32]:
   doAssert delivered.len == 0 and beacons == 0 and kernelCallbacks == 1
   doAssert wifiDrainScheduledWork() and beacons == 1 and queueIds().len == 0
 
+  # A pending reset runs before queued messages, as often as it is posted.
   armServiceTimers(deadline - 100, deadline)
-  registrationReady = true
   messageReady = true
   holdReset = true
   ke_evt_set(KE_EVT_RESET)
   doAssert wifiDrainScheduledWork()
-  doAssert resets == 1 and events == KE_EVT_RESET
-  doAssert registrations == 0 and taskMessages == 0
+  doAssert resets == 1 and events == KE_EVT_RESET and taskMessages == 0
   holdReset = false
-  doAssert wifiDrainScheduledWork() and resets == 2
-  doAssert registrations == 0 and taskMessages == 0
+  doAssert wifiDrainScheduledWork() and resets == 2 and taskMessages == 0
   doAssert wifiDrainScheduledWork()
-  doAssert registrations == 1 and taskMessages == 1 and events == 0
-
-  armServiceTimers(deadline - 100, deadline)
-  registrationReady = true
-  registrationPostsReset = true
-  messageReady = true
-  doAssert wifiDrainScheduledWork()
-  doAssert registrations == 1 and resets == 1 and taskMessages == 0
-  doAssert wifiDrainScheduledWork()
-  doAssert registrations == 1 and taskMessages == 1
+  doAssert taskMessages == 1 and events == 0
 
   armServiceTimers(deadline - 100, deadline)
   messageReady = true
@@ -339,7 +317,7 @@ def test_timer_poll_services_only_due_fallbacks(tmp_path: Path, mode: str) -> No
     boundary = SERVICE_CHECKS.index("proc mmEvent")
     code += SERVICE_CHECKS[:boundary]
     for name in ("wifiEventPendingWork", "wifiKernelTimerPendingWork",
-                 "wifiMmTimerPendingWork", "wifiResetEventPending", "wifiMainHasPendingWork",
+                 "wifiMmTimerPendingWork", "wifiMainHasPendingWork",
                  "wifiDispatchScheduledEvent",
                  "wifiDrainScheduledWork"):
         code += procedure(service, name)

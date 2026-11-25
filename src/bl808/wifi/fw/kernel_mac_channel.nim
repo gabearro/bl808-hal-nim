@@ -590,8 +590,6 @@ proc ke_msg_alloc_reply*(request: pointer, id: uint16, length: uint32): pointer 
     return meTakeControlReply(request, id, length)
   if smAwaits(request) and length == 0:
     return smTakeReply(request, id)
-  if smCleanupOwnsRequest(request):
-    return smCleanupTakeReply(request, id, length)
   if request == apmStartRequest:
     return apmTakeStartReply(request, id, length)
   let header = keMsgHdrFromPayload(request)
@@ -783,10 +781,8 @@ proc ke_msg_free*(param: pointer) {.exportc, cdecl.} =
   mmTimForget(param)
   mmConnLossForget(param)
   rxMgtForget(param)
-  smCleanupForget(param)
   chanUpdateForget(param)
   chanBcnRequestForget(param)
-  smDeferredForget(param)
   smAbortForget(param)
   mmEdcaForget(param)
   let resumePending = mmConfigForgetIdleOwner(param)
@@ -3364,20 +3360,6 @@ proc mmStaDelQueueRetryLocked(staIdx: uint8; saved: uint32) =
   mmStaDelRetryTimer.env = 0
   mmTimerSetLocked(addr mmStaDelRetryTimer, macTimeNow() + 100_000'u32, saved)
 
-proc mmStaDelOwned(staIdx, vifIdx: uint8; stationEpoch: uint32): bool =
-  if staIdx >= STA_MGMT_FREE_STAS.uint8: return false
-  let saved = irqSave()
-  defer: irqRestore(saved)
-  let deletion = mmStaDeletions[staIdx]
-  deletion.active and deletion.requestOwned and deletion.owner.vif == vifIdx and
-    deletion.requestEpoch == stationEpoch and
-    (staRemovalCurrent(deletion.owner) or
-     (staInfoAt(deletion.owner.entry).valid == 0 and
-      staInfoAt(deletion.owner.entry).instNbr == vifIdx and
-      rxVifEpochs[vifIdx] == deletion.owner.vifEpoch and
-      not co_list_find(addr sta_info_env,
-                       cast[ptr CoListHdr](deletion.owner.entry))))
-
 proc mmStaDelTry(staIdx: uint8; saved: uint32): bool =
   ## Keep the retired slot and its original VIF/key identity across HW timeouts.
   ## The caller holds IRQs from identity validation through retry publication.
@@ -5680,7 +5662,6 @@ proc chan_init*() {.exportc, cdecl.} =
   # Vendor .bss counters outside chan_env.
   chanConflictCount = 0
   chanSlotConfigCycles = 0
-  smDeferredCancel()
 
 proc chan_ctxt_add*(param: pointer, ctxtIdxOut: ptr uint8): uint8 {.exportc, cdecl.} =
   ## Add channel context. Search existing for match, else allocate from free list.
@@ -5863,7 +5844,6 @@ proc chan_ctxt_unlink*(vifIdx: uint8) {.exportc, cdecl.} =
       env.dominantCtxt = nil
   chan_tbtt_schedule(nil)
   chan_update_tx_power(chanCtxtPtr)
-  smDeferredChannelUnlinked(vifIdx)
 
 proc chanLeaseCurrent(lease: ChanCtxtLease): bool =
   if not lease.held or lease.index >= MAX_CHAN_CTXT.uint8 or
@@ -5987,8 +5967,9 @@ proc chan_ctxt_cnt*(): uint8 {.exportc, cdecl, noinline.} =
 
 proc chan_ctxt_set_auth_assoc_req*(msg: pointer) {.exportc, cdecl, noinline.} =
   ## Park the deferred auth/assoc message for the next channel activation.
-  ## From blob (3 instrs): stores a0 at chan_env+0x80 and returns.
-  smDeferredPark(msg)
+  ## From blob (3 instrs): stores a0 at chan_env+0x80 and returns. SM is its
+  ## only caller (smPark).
+  chanEnvView().deferredMsg = msg
 
 proc chan_ctxt_get_remaining_time_ms*(vifEntry: pointer): uint32 {.exportc, cdecl.} =
   ## Get remaining time in ms for the current channel context (30 instrs in blob).

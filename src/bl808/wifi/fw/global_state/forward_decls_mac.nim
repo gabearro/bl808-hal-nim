@@ -134,12 +134,8 @@ template smSaQueryResetScope() =
 proc smBssBegin()
 proc smBssNext(): bool {.discardable.}
 proc smBssCancel()
-proc smCleanupForget(header: pointer)
-proc smDeferredForget(header: pointer)
 proc smDeferredCancel()
-proc smDeferredPark(payload: pointer)
 proc smDeferredPublish(vifEntry: pointer)
-proc smDeferredChannelUnlinked(vifIndex: uint8)
 proc smDeferredDispatch(payload: pointer): cint
 proc smAbortStorageLength(id: uint16; destination: uint8; length: uint32): uint32
 proc smAbortRegister(header: ptr KeMsgHdr)
@@ -172,13 +168,8 @@ proc meBuildSaeAuthenticate(buf: pointer; authAlgo, authSeq, statusCode: uint16;
 proc meBuildAssociateReq(buf, assocInfo, reassocBssid, capParam, cursorOut,
                         bodyLenOut, connInfo: pointer; build: ptr SmTxBuildContext): uint32
 proc txl_frame_try_push_force(param: pointer; ac: uint8): uint8
-proc smCleanupOwnsRequest(request: pointer): bool
-proc smCleanupAdmitRequest(request: pointer): bool
-proc smCleanupTakeReply(request: pointer; id: uint16; length: uint32): pointer
-proc smCleanupConsumeReply(reply: pointer): bool
+proc smCleanupVifLive(): bool
 proc smCleanupCancel()
-proc smCleanupNeedsService(): bool
-proc smCleanupService()
 proc smCleanupBegin(vifEntry: pointer; indication: pointer = nil;
                     disconnected = false; status = 0'u16; reason = 0'u16): bool
 proc mmPsModeCancel()

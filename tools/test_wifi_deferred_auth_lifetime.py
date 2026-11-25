@@ -1,4 +1,11 @@
-"""Exercise deferred SM commands with native allocations and callback reentry."""
+"""Exercise SM's deferred auth/assoc request (states 5 and 7) with native allocations.
+
+The harness runs the real deferred_auth.nim, sm_auth_assoc_send_according_chan,
+chan_ctxt_set_auth_assoc_req, the publication branch of chan_pre_switch_channel
+and station_sm.nim's smGo, smPark, smTakeAnswer and smAttemptStaVif. The frame
+builders and the end of the attempt (sm_connect_ind, which leaves the state
+through smGo) are modelled.
+"""
 
 from pathlib import Path
 import shutil
@@ -70,12 +77,15 @@ var
   currentState: uint16
   interruptsEnabled = true
   allocations, frees, failures, publications, remainingChecks: int
+  endings: seq[tuple[status, reason: uint16]]
   sent: seq[SentFrame]
   live: seq[ptr KeMsgHdr]
   queue: seq[pointer]
-  allocationHook, publicationHook, stateHook, freeHook, authHook, restoreHook: proc()
+  allocationHook, publicationHook, stateHook, freeHook: proc()
 proc smDeferredCancel()
-proc smDeferredForget(header: pointer)
+proc sm_connect_ind(status, reason: uint16)
+proc sm_auth_send(sequence: uint16; challenge: pointer)
+proc sm_assoc_req_send()
 proc smEnvView(): ptr SmEnv = addr env
 proc connectInfoView(p: pointer): ptr ConnectInfo = cast[ptr ConnectInfo](p)
 proc vifChannelForIdx(index: uint8): ptr Vif = addr vifs[index]
@@ -112,7 +122,6 @@ proc invoke(hook: var proc()) =
     action()
 proc irqRestore(saved: uint32) =
   interruptsEnabled = saved != 0
-  if interruptsEnabled: invoke(restoreHook)
 proc c_memcpy(dst, src: pointer; n: csize_t): pointer =
   copyMem(dst, src, n.int)
   dst
@@ -123,7 +132,6 @@ proc keMsgHdrFromPayload(payload: pointer): ptr KeMsgHdr =
 proc ke_msg_free(header: pointer) =
   let index = live.find(cast[ptr KeMsgHdr](header))
   doAssert index >= 0, "message freed twice or by the wrong owner"
-  smDeferredForget(header)
   live.delete(index)
   inc frees
   dealloc(header)
@@ -151,23 +159,26 @@ proc chan_ctxt_get_remaining_time_ms(vif: pointer): uint32 =
   doAssert vif == addr vifs[1]
   inc remainingChecks
   remainingTime
+'''
+
+# The modelled ends of states 5 and 7, written after station_sm.nim.
+ENDS = r'''
 proc sm_connect_ind(status, reason: uint16) =
-  doAssert status == 11 and reason == 0xFFFF
+  ## The attempt ends; its teardown leaves the state through smGo.
+  endings.add((status, reason))
   inc failures
-  currentState = 10
-  smDeferredCancel()
+  env.connectInfo = nil
+  discard smGo(10)
 proc sm_auth_send(sequence: uint16; challenge: pointer) =
   var frame = SentFrame(kind: 5, sequence: sequence)
   if challenge != nil:
     let bytes = cast[ptr array[128, uint8]](challenge)
     for value in bytes[]: frame.challenge.add(value)
   sent.add(frame)
-  currentState = 6
-  invoke(authHook)
+  discard smGo(6)
 proc sm_assoc_req_send() =
   sent.add(SentFrame(kind: 7))
-  currentState = 8
-  invoke(authHook)
+  discard smGo(8)
 '''
 
 HELPERS = r'''
@@ -177,10 +188,12 @@ proc drain() =
     queue.delete(0)
     doAssert sm_connect_auth_assoc_req(payload) == KeMsgConsumed
     ke_msg_free(keMsgHdrFromPayload(payload))
+proc held(): bool = smOwn.request != nil
 proc reset() =
-  smDeferredCancel()
+  ## sm_init, then an attempt on VIF 1 in state 4.
+  discard smGo(0)
   drain()
-  doAssert live.len == 0 and smDeferredTags == nil
+  doAssert live.len == 0 and chan.deferredMsg == nil
   env.connectInfo = addr conn
   conn.vifIdx = 1
   replacement.vifIdx = 1
@@ -193,10 +206,11 @@ proc reset() =
   dominant = false
   allocFail = false
   remainingTime = 300
-  currentState = 4
+  discard smGo(4)
   allocations = 0
   frees = 0
   failures = 0
+  endings.setLen(0)
   publications = 0
   remainingChecks = 0
   sent.setLen(0)
@@ -204,12 +218,14 @@ proc schedule(kind = 5'u16; sequence = 1'u16) =
   sm_auth_assoc_send_according_chan(kind, sequence, nil)
 proc publish() = activate(addr vifs[1])
 proc finish() =
-  smDeferredCancel()
+  discard smGo(0)
   drain()
-  doAssert live.len == 0 and smDeferredTags == nil and chan.deferredMsg == nil
+  doAssert live.len == 0 and chan.deferredMsg == nil
 '''
 
 CASES = {
+    # Direct for one channel, a dominant one, or 0 or 41..199 ms left;
+    # otherwise parked in state 5 or 7 and sent when the channel is active.
     "matrix": r'''
 for kind in [5'u16, 7]:
   for count in [0'u8, 1, 2, 4]:
@@ -226,91 +242,134 @@ for kind in [5'u16, 7]:
           let request = cast[ptr SmConnectAuthAssocReqPayload](chan.deferredMsg)
           doAssert keMsgHdrFromPayload(request).paramLen == 8
           doAssert request.nextState == kind and request.authSequence == 0x1234
-          doAssert currentState == kind
+          doAssert currentState == kind and smOwn.request == request
           publish()
           publish()
           doAssert publications == 1 and chan.deferredMsg == nil
           drain()
-        doAssert sent.len == 1 and sent[0].kind == kind
+        doAssert sent.len == 1 and sent[0].kind == kind and failures == 0
+        doAssert currentState == kind + 1 and not held()
         if kind == 5: doAssert sent[0].sequence == 0x1234
 finish()
 ''',
-    "replacement_connection": r'''
-schedule()
-publish()
-env.connectInfo = addr replacement
-drain()
-doAssert sent.len == 0
-''',
-    "same_address_new_epoch": r'''
-schedule()
-publish()
-inc rxVifEpochs[1]
-drain()
-doAssert sent.len == 0
-''',
-    "channel_replacement": r'''
+    # The attempt ends (abort, failure, sm_init) while its request is parked:
+    # leaving the state frees it, and nothing is sent.
+    "attempt_ended_while_parked": r'''
 for kind in [5'u16, 7]:
-  for alreadyQueued in [false, true]:
-    for rebind in [-1, 0, 1]:
-      reset()
-      # Hold the original context on another VIF so a relink can reuse the
-      # identical address without reallocating the context slot.
-      chan_ctxt_link(0, 0)
-      schedule(kind)
-      if alreadyQueued: publish()
-      chan_ctxt_unlink(1)
-      doAssert publications == 1 and chan.deferredMsg == nil and frees == 0
-      doAssert failures == 0 and smDeferredAbortable(1, kind)
-      if rebind >= 0: chan_ctxt_link(1, rebind.uint8)
-      drain()
-      doAssert failures == 1 and sent.len == 0 and frees == 1 and currentState == 10
-      publish()
-      drain()
-      doAssert failures == 1
-''',
-    "unrelated_unlink": r'''
-chan_ctxt_link(0, 0)
-schedule()
-chan_ctxt_unlink(0)
-doAssert publications == 0 and chan.deferredMsg != nil
-publish()
-drain()
-doAssert sent.len == 1 and failures == 0
-''',
-    "binding_changes_during_dispatch": r'''
-chan_ctxt_link(0, 0)
-schedule()
-publish()
-restoreHook = proc() =
-  chan_ctxt_unlink(1)
-  chan_ctxt_link(1, 0)
-drain()
-doAssert sent.len == 0 and failures == 1 and frees == 1
-''',
-    "binding_changes_during_build": r'''
-for phase in 0..2:
   reset()
-  chan_ctxt_link(0, 0)
-  proc rebind() =
-    chan_ctxt_unlink(1)
-    chan_ctxt_link(1, 0)
-  if phase == 0: allocationHook = rebind
-  elif phase == 1:
-    # Force the direct path, then rebind when the owner snapshot is unlocked.
-    channelCount = 1
-    restoreHook = rebind
-  else: chan_ctxt_unlink(1)
-  schedule()
-  doAssert sent.len == 0 and failures == 1 and live.len == 0 and chan.deferredMsg == nil
+  schedule(kind)
+  doAssert chan.deferredMsg != nil and live.len == 1
+  sm_connect_ind(24, 3)
+  doAssert live.len == 0 and frees == 1 and chan.deferredMsg == nil and not held()
+  publish()
+  drain()
+  doAssert sent.len == 0 and publications == 0 and endings == @[(24'u16, 3'u16)]
 ''',
-    "retired_binding_new_state": r'''
+    # ... or after the channel scheduler sent it: SM ignores it when it comes.
+    "attempt_ended_while_queued": r'''
+for kind in [5'u16, 7]:
+  reset()
+  schedule(kind)
+  publish()
+  sm_connect_ind(24, 3)
+  doAssert live.len == 1 and frees == 0
+  drain()
+  doAssert sent.len == 0 and frees == 1 and currentState == 10
+  doAssert endings == @[(24'u16, 3'u16)]
+''',
+    # The attempt's STA VIF is retired before the request comes back: the
+    # attempt ends instead of the frame builder returning silently.
+    "vif_retired_while_queued": r'''
+for kind in [5'u16, 7]:
+  reset()
+  schedule(kind)
+  publish()
+  vifs[1].vifType = 4
+  drain()
+  doAssert sent.len == 0 and endings == @[(11'u16, 0xFFFF'u16)] and currentState == 10
+''',
+    # ... or before the request is sent or parked (a retry from state 6 or 8,
+    # the next auth step, or the start of authentication in state 4).
+    "vif_retired_before_schedule": r'''
+for kind in [5'u16, 7]:
+  for count in [1'u8, 2]:
+    for state in [4'u16, 6, 8]:
+      reset()
+      discard smGo(state)
+      channelCount = count
+      vifs[1].vifType = 4
+      schedule(kind)
+      doAssert sent.len == 0 and allocations == 0 and chan.deferredMsg == nil
+      doAssert endings == @[(11'u16, 0xFFFF'u16)] and currentState == 10
+''',
+    # A request SM did not park, or one delivered twice, changes nothing.
+    "forged_request": r'''
+var request = SmConnectAuthAssocReqPayload(nextState: 5, authSequence: 1)
+discard smGo(5)
+discard sm_connect_auth_assoc_req(addr request)
+discard sm_connect_auth_assoc_req(nil)
+doAssert sent.len == 0 and failures == 0 and currentState == 5
+''',
+    "duplicate_dispatch": r'''
+schedule()
+publish()
+let payload = queue[0]
+queue.delete(0)
+discard sm_connect_auth_assoc_req(payload)
+discard sm_connect_auth_assoc_req(payload)
+ke_msg_free(keMsgHdrFromPayload(payload))
+doAssert sent.len == 1 and currentState == 6
+''',
+    "wrong_vif": r'''
+schedule()
+activate(addr vifs[0])
+doAssert chan.deferredMsg != nil and publications == 0
+publish()
+drain()
+doAssert sent.len == 1
+''',
+    # No other state is entered while the request is parked; an unlink of the
+    # VIF's channel does not send it.
+    "unlink_keeps_parked": r'''
 schedule()
 chan_ctxt_unlink(1)
-doAssert publications == 1
-currentState = 6
+doAssert publications == 0 and chan.deferredMsg != nil and currentState == 5 and held()
+''',
+    "allocation_failure": r'''
+for kind in [5'u16, 7]:
+  reset()
+  allocFail = true
+  schedule(kind)
+  doAssert endings == @[(11'u16, 0xFFFF'u16)] and sent.len == 0
+  doAssert chan.deferredMsg == nil and currentState == 10 and not held()
+''',
+    # The parked request carries its own copy of a shared-key challenge: the
+    # RX frame it came from is gone when the channel comes back.
+    "owned_challenge": r'''
+var challenge: array[128, uint8]
+for i in 0..<128: challenge[i] = (i xor 0xA5).uint8
+let expected = challenge
+sm_auth_assoc_send_according_chan(5, 3, addr challenge[0])
+zeroMem(addr challenge[0], 128)
+let payload = chan.deferredMsg
+doAssert keMsgHdrFromPayload(payload).paramLen == 136
+publish()
 drain()
-doAssert sent.len == 0 and failures == 0 and frees == 1 and currentState == 6
+doAssert sent.len == 1 and sent[0].sequence == 3 and sent[0].challenge == @expected
+''',
+    "direct_challenge": r'''
+var challenge: array[128, uint8]
+for i in 0..<128: challenge[i] = (i xor 0x5A).uint8
+channelCount = 1
+sm_auth_assoc_send_according_chan(5, 3, addr challenge[0])
+doAssert allocations == 0 and sent.len == 1 and sent[0].challenge == @challenge
+''',
+    "invalid_request": r'''
+env.connectInfo = nil
+schedule()
+env.connectInfo = addr conn
+sm_auth_assoc_send_according_chan(6, 1, nil)
+doAssert sent.len == 0 and allocations == 0 and failures == 0 and currentState == 4
 ''',
     "remaining_time": r'''
 let vif = addr vifs[1]
@@ -327,182 +386,6 @@ doAssert realRemainingTime(vif) == (high(uint32) - 999'u32) div 1000'u32
 macTime = high(uint32) - 999'u32
 chan.remainingTimeTarget = 40_000
 doAssert realRemainingTime(vif) == 41
-''',
-    "wrong_vif": r'''
-schedule()
-activate(addr vifs[0])
-doAssert chan.deferredMsg != nil and publications == 0
-publish()
-drain()
-doAssert sent.len == 1
-''',
-    "publication_replacement": r'''
-schedule()
-publicationHook = proc() = schedule(5, 2)
-publish()
-doAssert chan.deferredMsg != nil and currentState == 5
-drain()
-doAssert sent.len == 0
-publish()
-drain()
-doAssert sent.len == 1 and sent[0].sequence == 2
-''',
-    "publication_irq_replacement": r'''
-schedule()
-restoreHook = proc() = schedule(7, 2)
-publish()
-drain()
-doAssert sent.len == 0 and chan.deferredMsg != nil
-publish()
-drain()
-doAssert sent.len == 1 and sent[0].kind == 7
-''',
-    "dispatch_irq_replacement": r'''
-schedule()
-publish()
-restoreHook = proc() = schedule(7, 2)
-drain()
-doAssert sent.len == 0 and chan.deferredMsg != nil
-publish()
-drain()
-doAssert sent.len == 1 and sent[0].kind == 7
-''',
-    "allocation_replacement": r'''
-allocationHook = proc() = schedule(5, 2)
-schedule()
-doAssert live.len == 1 and frees == 1
-publish()
-drain()
-doAssert sent.len == 1 and sent[0].sequence == 2
-''',
-    "free_replacement": r'''
-schedule()
-freeHook = proc() = schedule(5, 3)
-schedule(5, 2)
-publish()
-drain()
-doAssert sent.len == 1 and sent[0].sequence == 3
-''',
-    "state_publication": r'''
-stateHook = proc() =
-  publish()
-  drain()
-schedule()
-doAssert sent.len == 1 and currentState == 6 and chan.deferredMsg == nil
-''',
-    "state_replacement": r'''
-stateHook = proc() = schedule(7, 2)
-schedule()
-publish()
-drain()
-doAssert sent.len == 1 and sent[0].kind == 7 and currentState == 8
-''',
-    "parked_cancel": r'''
-schedule()
-smDeferredCancel()
-doAssert live.len == 0 and frees == 1 and chan.deferredMsg == nil
-''',
-    "queued_cancel": r'''
-schedule()
-publish()
-smDeferredCancel()
-doAssert live.len == 1 and frees == 0
-drain()
-doAssert sent.len == 0 and frees == 1
-''',
-    "executing_cancel": r'''
-schedule()
-publish()
-authHook = proc() =
-  smDeferredCancel()
-  doAssert live.len == 1 and frees == 0
-drain()
-doAssert sent.len == 1 and frees == 1
-''',
-    "duplicate_dispatch": r'''
-schedule()
-publish()
-let payload = queue[0]
-authHook = proc() =
-  currentState = 5
-  discard sm_connect_auth_assoc_req(payload)
-drain()
-doAssert sent.len == 1
-''',
-    "allocation_failure": r'''
-allocFail = true
-schedule()
-doAssert failures == 1 and sent.len == 0 and chan.deferredMsg == nil
-''',
-    "old_allocation_failure": r'''
-allocFail = true
-allocationHook = proc() =
-  allocFail = false
-  schedule(7, 2)
-schedule()
-doAssert failures == 0
-publish()
-drain()
-doAssert sent.len == 1 and sent[0].kind == 7
-''',
-    "owned_challenge": r'''
-var challenge: array[128, uint8]
-for i in 0..<128: challenge[i] = (i xor 0xA5).uint8
-let expected = challenge
-allocationHook = proc() = zeroMem(addr challenge[0], 128)
-sm_auth_assoc_send_according_chan(5, 3, addr challenge[0])
-let payload = chan.deferredMsg
-doAssert keMsgHdrFromPayload(payload).paramLen == 136
-publish()
-drain()
-doAssert sent.len == 1 and sent[0].challenge == @expected
-''',
-    "direct_owned_challenge": r'''
-schedule()
-let challenge = cast[ptr array[128, uint8]](alloc(128))
-for i in 0..<128: challenge[i] = (i xor 0xA5).uint8
-let expected = challenge[]
-channelCount = 1
-freeHook = proc() = dealloc(challenge)
-sm_auth_assoc_send_according_chan(5, 3, challenge)
-doAssert sent.len == 1 and sent[0].challenge == @expected
-''',
-    "forged_request": r'''
-var request = SmConnectAuthAssocReqPayload(nextState: 5, authSequence: 1)
-currentState = 5
-discard sm_connect_auth_assoc_req(addr request)
-discard sm_connect_auth_assoc_req(nil)
-doAssert sent.len == 0
-''',
-    "altered_request": r'''
-for field in 0..5:
-  reset()
-  schedule()
-  let payload = chan.deferredMsg
-  let request = cast[ptr SmConnectAuthAssocReqPayload](payload)
-  let header = keMsgHdrFromPayload(payload)
-  case field
-  of 0: request.nextState = 7
-  of 1: request.authSequence = 2
-  of 2: request.challengeAddress = 0x12345678
-  of 3: header.id = 0
-  of 4: header.destId = 0
-  else: header.paramLen = 0
-  publish()
-  drain()
-  doAssert sent.len == 0
-''',
-    "direct_supersedes": r'''
-schedule()
-channelCount = 1
-schedule(7, 2)
-doAssert frees == 1 and chan.deferredMsg == nil and sent.len == 1
-''',
-    "reset_cleared_slot": r'''
-schedule()
-chan = default(ChanEnv)
-smDeferredCancel()
-doAssert live.len == 0 and frees == 1
 ''',
     "disabled_interrupts": r'''
 interruptsEnabled = false
@@ -526,18 +409,20 @@ def program_source(mutation: str = "") -> str:
     # The production branch publishes for this VIF after activating its channel.
     activation = "\nproc activate(vif3: pointer) =\n  let vif = cast[ptr Vif](vif3)\n"
     activation += "\n".join("  " + line for line in fragment.splitlines()) + "\n"
-    source = (types + constants + PLATFORM + station_sm_source() + (FW / "deferred_auth.nim").read_text()
-            + procedure(kernel, "co_list_push_back") + procedure(kernel, "co_list_extract")
-            + procedure(kernel, "chan_ctxt_link") + procedure(kernel, "chan_ctxt_unlink")
-            + procedure(kernel, "chan_is_on_operational_channel")
-            + procedure(kernel, "chan_ctxt_get_remaining_time_ms").replace(
-                "chan_ctxt_get_remaining_time_ms", "realRemainingTime", 1)
-            + procedure(kernel, "chan_ctxt_set_auth_assoc_req")
-            + procedure(tasks, "sm_auth_assoc_send_according_chan")
-            + procedure(sm, "sm_connect_auth_assoc_req") + activation + HELPERS)
+    source = (types + constants + PLATFORM
+              + procedure(kernel, "chan_ctxt_set_auth_assoc_req")
+              + station_sm_source("smGo", "smPark", "smTakeAnswer", "smAttemptStaVif")
+              + ENDS + (FW / "deferred_auth.nim").read_text()
+              + procedure(kernel, "co_list_push_back") + procedure(kernel, "co_list_extract")
+              + procedure(kernel, "chan_ctxt_link") + procedure(kernel, "chan_ctxt_unlink")
+              + procedure(kernel, "chan_is_on_operational_channel")
+              + procedure(kernel, "chan_ctxt_get_remaining_time_ms").replace(
+                  "chan_ctxt_get_remaining_time_ms", "realRemainingTime", 1)
+              + procedure(tasks, "sm_auth_assoc_send_according_chan")
+              + procedure(sm, "sm_connect_auth_assoc_req") + activation + HELPERS)
     if mutation:
         old, new = MUTATIONS[mutation][0:2]
-        assert source.count(old) == 1
+        assert source.count(old) == 1, mutation
         source = source.replace(old, new, 1)
     return source
 
@@ -560,21 +445,20 @@ def run_case(tmp_path: Path, case: str, mode: str = "checked", mutation: str = "
         assert result.returncode == 0, result.stdout
 
 
+# The guard each mutation removes, and the case that must then fail.
 MUTATIONS = {
-    "connection": ("smEnvView().connectInfo == owner.connection and", "true and",
-                   "replacement_connection"),
-    "epoch": ("rxVifEpochs[owner.vifIndex] == owner.vifEpoch and", "true and",
-              "same_address_new_epoch"),
-    "link_epoch": ("chanCtxtLinkEpochs[owner.vifIndex] == owner.linkEpoch and", "true and",
-                   "channel_replacement"),
-    "unlink_wake": ("  smDeferredChannelUnlinked(vifIdx)\n", "  discard\n",
-                    "channel_replacement"),
-    "publication": ("  ke_msg_send(payload)\n", "  ke_msg_send(payload)\n  chanEnvView().deferredMsg = nil\n",
-                    "publication_replacement"),
-    "dispatch": ("tag.location != smDeferredQueued or", "false or", "duplicate_dispatch"),
-    "state": ("  tag.location = smDeferredParked\n  chanEnvView().deferredMsg = payload",
-              "  ke_state_set(TASK_SM, tag.state)\n  tag.location = smDeferredParked\n  chanEnvView().deferredMsg = payload",
-              "state_publication"),
+    "take_answer": ("  if not smTakeAnswer(payload): return KeMsgConsumed",
+                    "  discard smTakeAnswer(payload)", "attempt_ended_while_queued"),
+    "dispatch_vif": ("  if connection == nil or not smAttemptStaVif(connectInfoView(connection).vifIdx):",
+                     "  if connection == nil:", "vif_retired_while_queued"),
+    "send_vif": ("  if not smAttemptStaVif(vifIdx):\n    sm_connect_ind(WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE, 0xFFFF)\n    return\n",
+                 "", "vif_retired_before_schedule"),
+    "publication": ("  env.deferredMsg = nil\n  ke_msg_send(request)", "  ke_msg_send(request)", "matrix"),
+    "publish_vif": ("cast[pointer](vifChannelForIdx(connectInfoView(connection).vifIdx)) != vifEntry",
+                    "false", "wrong_vif"),
+    "go_frees_parked": ("  if reserved != nil: ke_msg_free(keMsgHdrFromPayload(reserved))\n  smDeferredCancel()\n",
+                        "  if reserved != nil: ke_msg_free(keMsgHdrFromPayload(reserved))\n",
+                        "attempt_ended_while_parked"),
 }
 
 
@@ -589,13 +473,15 @@ def test_deferred_lifetime_guards(tmp_path: Path, mutation: str) -> None:
     run_case(tmp_path, MUTATIONS[mutation][2], mutation=mutation)
 
 
-def test_reset_and_release_hooks() -> None:
+def test_parked_request_has_one_owner() -> None:
+    """smGo frees a parked request; nothing else tracks, forgets or cancels it."""
+    assert "smDeferredCancel()" in procedure((FW / "station_sm.nim").read_text(), "smGo")
     kernel = (FW / "kernel_mac_channel.nim").read_text()
-    for name in ["ke_flush", "chan_init"]:
-        assert "smDeferredCancel()" in procedure(kernel, name)
-    assert "smDeferredForget(param)" in procedure(kernel, "ke_msg_free")
-    # A message delivered to the host is retired by ke_msg_free, which forgets it.
-    assert "ke_msg_free(hdr)" in procedure(kernel, "ke_msg_send").split("bl_rx_e2a_handler(", 1)[1]
+    for name in ["chan_init", "chan_ctxt_unlink", "ke_msg_free"]:
+        assert "smDeferred" not in procedure(kernel, name), name
+    assert "chanEnvView().deferredMsg = msg" in procedure(kernel, "chan_ctxt_set_auth_assoc_req")
     sm = (FW / "scan_station_ap_me.nim").read_text()
-    assert "smDeferredCancel()" in procedure(sm, "sm_init")
-    assert "smDeferredCancel()" in procedure((FW / "station_cleanup.nim").read_text(), "smCleanupBegin")
+    assert "smDeferredCancel()" not in procedure(sm, "sm_init")
+    deferred = (FW / "deferred_auth.nim").read_text()
+    assert "SmDeferredOwner" not in deferred and "Forget" not in deferred
+    assert "smDeferredAbortable" not in (FW / "task_handlers.nim").read_text()

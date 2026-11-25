@@ -15,8 +15,10 @@
 #                 (sent, not acknowledged, flushed by a TX reset or aged out),
 #                 ends the wait. So does a guard timer, in case the frame is
 #                 postponed on a channel that never comes back.
-#   tdCleanup     station_cleanup.nim releases the link through ME and MM and
-#                 ends with smGo(SmIdleState).
+#   tdCleanup     station_cleanup.nim releases the link through ME and MM, one
+#                 request at a time like the series of states 4 and 9 below,
+#                 and ends with smGo(SmIdleState). The guard timer then
+#                 retries a step whose messages could not be allocated.
 #
 # Nothing else leaves state 10: connect and disconnect requests, connection
 # losses and AP deauthentications are saved until SM is idle again.
@@ -46,6 +48,11 @@
 # VIF has been retired without applying it (smStaleRequest). SM checks the
 # VIF at every answer and ends the attempt when it is gone.
 #
+# States 5 and 7 wait for the attempt's channel (deferred_auth.nim). The
+# auth or assoc request is parked in chan_env (smPark); the channel
+# scheduler sends it to TASK_SM when the VIF's context becomes active, and SM
+# takes it as the answer. Every smGo frees a request still parked.
+#
 # States 6 and 8 wait for the AP's auth or assoc response. The request's
 # sender arms SM_RSP_TIMEOUT_IND with the stamp of the operation it started
 # (smArmResponse), and the expected auth response carries the same stamp
@@ -65,7 +72,7 @@ type
     answer: pointer   ## what ends the wait: the request itself or its reply
     deauthVif: uint8
     deauthCallback: pointer  ## the waited frame's callback, run by the guard
-    guard: MmTimerView
+    guard: MmTimerView  ## state 10's timer: the deauth guard, the cleanup's retry
 
 const SmDeauthGuardUs = 3_000_000'u32
   ## Longer than any off-channel period (a full passive scan is about 1.5 s),
@@ -75,7 +82,7 @@ var smOwn {.wifiCtrl.}: SmOwner
 
 proc smGo(state: uint16; teardown = tdNone): uint32 {.discardable.} =
   ## The only ke_state_set for TASK_SM. Returns the new operation's stamp.
-  if smOwn.teardown == tdDeauthWait: mm_timer_clear(addr smOwn.guard)
+  if smOwn.teardown != tdNone: mm_timer_clear(addr smOwn.guard)
   let reserved = smOwn.reply
   smOwn.teardown = teardown
   smOwn.request = nil
@@ -84,12 +91,20 @@ proc smGo(state: uint16; teardown = tdNone): uint32 {.discardable.} =
   result = opGo(smOwn.op)
   ke_state_set(TASK_SM, state)
   if reserved != nil: ke_msg_free(keMsgHdrFromPayload(reserved))
+  smDeferredCancel()
 
 proc smSend(request: pointer) =
   ## Send the live operation's request; its answer, in place, ends the wait.
   smOwn.request = request
   smOwn.answer = request
   ke_msg_send(request)
+
+proc smPark(request: pointer) =
+  ## Park the live operation's deferred auth/assoc request in chan_env. The
+  ## channel scheduler sends it back to TASK_SM, which ends the wait.
+  smOwn.request = request
+  smOwn.answer = request
+  chan_ctxt_set_auth_assoc_req(request)
 
 proc smSendReserved(request: pointer): bool =
   ## Send the live operation's request with the reply its replier answers
@@ -117,19 +132,24 @@ proc smAttemptStaVif(vifIdx: uint8): bool =
     vifIdx < MAX_VIFS.uint8 and vifChannelForIdx(vifIdx).vifIdx == vifIdx and
     vifChannelForIdx(vifIdx).vifType == VIF_TYPE_STA
 
+proc smRequestVifLive(): bool =
+  ## The STA VIF of SM's request in flight is still there: the attempt's, or
+  ## in state 10 the one the cleanup releases.
+  if smOwn.teardown == tdCleanup: return smCleanupVifLive()
+  let connection = smEnvView().connectInfo
+  connection != nil and smAttemptStaVif(connectInfoView(connection).vifIdx)
+
 proc smStaleRequest(request: pointer): bool =
-  ## The entry check of the repliers of states 4 and 9: true when the
+  ## The entry check of the repliers of states 4, 9 and 10: true when the
   ## replier must not apply `request`. A request SM sent and no longer waits
   ## on is dropped. One SM waits on whose STA VIF has been retired (the slot
   ## is free or holds another interface) is answered here, unapplied, with
-  ## SM's reserved reply; SM ends the attempt when it takes the answer.
-  ## (The cleanup's requests are checked by station_cleanup.nim.)
+  ## SM's reserved reply; the attempt ends, or the cleanup goes on, when SM
+  ## takes the answer.
   let header = keMsgHdrFromPayload(request)
-  if header.srcId != TASK_SM or smCleanupOwnsRequest(request): return false
+  if header.srcId != TASK_SM: return false
   if not smAwaits(request): return true
-  let connection = smEnvView().connectInfo
-  if connection != nil and smAttemptStaVif(connectInfoView(connection).vifIdx):
-    return false
+  if smRequestVifLive(): return false
   ke_msg_send_basic_reply(request, header.id + 1)
   true
 
@@ -189,7 +209,6 @@ proc smTeardownUnclaimed() =
   sm.connectIndMsg = nil
   smActivationCancel()
   smBssCancel()
-  smDeferredCancel()
   smGo(SmIdleState)
   if connection != nil: ke_msg_free(keMsgHdrFromPayload(connection))
   if indication != nil: ke_msg_free(keMsgHdrFromPayload(indication))

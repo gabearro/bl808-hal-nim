@@ -205,6 +205,5 @@ indicationHook = nil
 connectHook = nil
 while allocated.len != 0:
   ke_msg_free(keMsgHdrFromPayload(allocated[^1]))
-doAssert smCleanupTags == nil
 '''
     run_program(tmp_path, mode, source() + SETUP + CASES[case] + finish)

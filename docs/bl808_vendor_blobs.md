@@ -7038,9 +7038,10 @@ hardware.
 epoch, and `smTxOwnerCurrent` adds the epoch for frames only. The
 auth/assoc response deadline and the expected auth response carry the SM
 operation's stamp instead (see "SM response deadline" below), and the
-scan, join, registration, BSS parameter and activation exchanges are held
-by SM's operation (see "SM scan, join and registration" and "SM BSS
-parameters and activation" below). The deauthentication confirmations
+scan, join, registration, BSS parameter, activation and cleanup exchanges
+and the deferred auth/assoc request are held by SM's operation (see "SM
+scan, join and registration", "SM BSS parameters and activation" and "SM
+cleanup and deferred auth/assoc" below). The deauthentication confirmations
 end their wait with any status, as pinned `sm.o:sm_connect_abort_deauth_cfm`
 and `sm_supplicant_deauth_cfm` do (see "SM teardown" below). None of the
 channel deadlines or SM exchanges depends on the TX reset epoch, so
@@ -7236,8 +7237,8 @@ or link goes through `smTeardown`, after `smDeauthWait` when a
 deauthentication is sent first. They are the only ways into state 10, which
 has two phases. In the deauthentication wait, the frame carries the current
 serial.
-In the cleanup, `station_cleanup.nim` runs unchanged and ends with
-`smGo(SmIdleState)`. The disconnect handoff (`SmDisconnectHandoff`,
+The cleanup (`station_cleanup.nim`, see "SM cleanup and deferred auth/assoc"
+below) ends with `smGo(SmIdleState)`. The disconnect handoff (`SmDisconnectHandoff`,
 `smDisconnectOwned`), the flushed-frame claims, the SM owner fields of
 `TxFrameIdentity` and the lock passing of `smConnectIndLocked` and
 `smReportApDisconnectLocked` are gone. Differences from the archive:
@@ -7523,8 +7524,7 @@ flags, `smBssNeedsService`/`smBssService` and
 `smBssCancelControl` and `smActivationCancelControl` (SM's calls into
 `meControlReset`, and with it SMSTRUCT-N3's reset-epoch check),
 `SmActivationPrepared`, `smActivationCancelConnection` and
-`smSetActiveCfmStateAllowed`. The station cleanup (state 10) still uses its
-own tags and polled service.
+`smSetActiveCfmStateAllowed`.
 
 Host tests: `tools/test_wifi_sm_bss_allocation.py`,
 `tools/test_wifi_bss_confirmations.py` (the real ME forward, including an
@@ -7547,6 +7547,119 @@ handler were removed with the re-checks they exercised; the two re-checks
 that remain, after the host's `SM_STA_ADD_IND` and the WPS callback, are
 covered. The M0 HTTP server
 manifest built; none of this was flashed.
+
+#### SM cleanup and deferred auth/assoc (states 10, 5 and 7)
+
+The cleanup sends the requests of pinned `sm.o:sm_delete_resources`
+(`ME_SET_PS_DISABLE_REQ(0)`, `MM_SET_VIF_STATE_REQ(0)` for an active VIF,
+`MM_STA_DEL_REQ` for its AP station, `ME_SET_ACTIVE_REQ(0)`) as SM's
+requests, one at a time: the ME and MM ones with `smSendReserved`,
+`MM_STA_DEL_REQ`, which MM answers in place, with `smSend`. SM's answer
+handlers take them with `smTakeAnswer` and send the next
+(`smCleanupNext`). Every request SM waits on is answered, so no reply can
+be lost and no step is skipped; the plan's "a step whose reply is lost is
+skipped" has nothing left to apply to. The blob sends all four at once,
+with `ke_msg_alloc`, and goes idle at `ME_SET_ACTIVE_CFM`. Differences from
+the archive:
+
+- A step whose request, reply or `SM_DISCONNECT_IND` cannot be allocated,
+  or that comes while a TX reset runs, runs again 10 ms later from SM's
+  state-10 timer (the deauthentication guard's, `smCleanupRetry`). The
+  blob's `ke_msg_alloc` halts. The port had retried from a service polled
+  by the main loop.
+- The cleanup's requests go through the same entry check as those of
+  states 4 and 9 (`smStaleRequest`): one SM no longer waits on (after
+  `sm_init`) is dropped; one whose VIF has been retired since the cleanup
+  began (VIF epoch) is answered unapplied, and the cleanup goes on and
+  reports. `MM_STA_DEL_REQ`, answered in place, is checked at
+  `mm_sta_del_req_handler` entry: dropped when SM no longer waits on it,
+  and for a retired VIF answered with its station rewritten to 0xFF.
+  `vif_mgmt_unregister` empties the VIF's station list, so
+  `staMgmtBeginRemoval` can no longer find the AP station and the delete
+  would be retried every 100 ms for ever, leaving SM in state 10. The
+  station is left valid, as it was when the port cancelled the cleanup
+  (retiring a removed VIF's stations belongs with `vif_mgmt_unregister`
+  telling SM). The cleanup names the station only while it is the one it
+  claimed (station epoch and VIF); a queued delete whose station is deleted
+  meanwhile already names none (`staDeleteCancelQueued`, as for any
+  requester). The blob applies every request to whatever the slot holds.
+  The port had dropped the request unanswered and then cancelled the
+  cleanup without its indication, and re-checked the station at MM entry
+  (`mmStaDelOwned`, now removed).
+- With the VIF retired, the supplicant's `stationDisconnected` callback is
+  not run (the VIF's removal already deinitialised it) and the channel and
+  security flags are not touched; the blob calls and writes regardless.
+- The cleanup no longer resets ME's exchange itself (`meControlReset`). On
+  `MM_RESET_REQ`, `me_init` still resets it just before `sm_init`, as for
+  the BSS batch and the activation; a request `sm_init` leaves queued is
+  dropped by its replier because SM no longer waits on it.
+
+States 5 and 7 hold one parked request. `sm_auth_assoc_send_according_chan`
+sends the frame at once when the attempt's channel is the only one, the
+dominant one, or has 0 or 41..199 ms left, as `sm.o` does; otherwise
+`smDeferredPark` enters state 5 or 7 and parks `SM_CONNECT_AUTH_ASSOC_REQ`
+in `chan_env+0x80` as the operation's request (`smPark`).
+`chan_ctxt_set_auth_assoc_req` only stores it, as in `chan.o`.
+`chan_pre_switch_channel` sends it to TASK_SM when the attempt's VIF is on
+the activated context, and SM takes it with `smTakeAnswer`. Every `smGo`
+frees a request still parked; one already sent is ignored when it comes.
+Differences from the archive:
+
+- The attempt ends (`sm_connect_ind(11)`) when its STA VIF is gone when the
+  frame is to be sent, from state 4, 6 or 8 or from the parked request. The
+  frame builders would return without sending; the port had returned
+  silently, leaving SM in that state with no deadline armed. The blob
+  builds the frame on whatever the slot holds.
+- An abort in state 5 or 7 ends the attempt (`sm_connect_ind(24, 3)`).
+  Pinned `sm_connect_abort_req_handler` only confirms it there and the
+  frame is sent later; the port had saved it unless a request was parked or
+  queued.
+- The request carries its own copy of a shared-key challenge; the blob
+  stores the RX buffer's pointer. A failed allocation ends the attempt
+  (`sm_connect_ind(11)`); the blob's `ke_msg_alloc` halts.
+- The parked request is sent only for the attempt's VIF; the blob sends it
+  at the activation of any STA VIF's context. Unlinking that VIF's channel
+  no longer sends it early: in state 5 or 7 only the cleanup or the VIF's
+  removal unlinks it, and the cleanup frees it first.
+
+Not done yet: an attempt parked in state 5 or 7 whose STA VIF is removed
+waits for its context, which does not come back; an abort sent after the
+removal names no live VIF, so only `sm_init` ends it. Telling SM from
+`vif_mgmt_unregister` is the next step, as is clearing a retired VIF's ME
+mask bits and retiring its stations (a cleanup for the removed VIF leaves
+its AP station valid).
+
+Removed: the cleanup's message tags and serial, `smCleanupForget` in
+`ke_msg_free`, the lost flag, `smCleanupNeedsService`/`smCleanupService`
+and their entries in `wifiMainHasPendingWork` and `wifiDrainScheduledWork`
+(no polled service is left there), `smCleanupOwnsRequest` and
+`smCleanupTakeReply` in `ke_msg_alloc_reply`, `smCleanupAdmitRequest` in
+the MM and ME handlers with the re-checks inside `mm_hw_config_handler`'s
+state-0 branch, `smCleanupConsumeReply`, the cleanup's `meControlReset`;
+`SmDeferredOwner`, the tag list and its five locations, `smDeferredForget`,
+`smDeferredProceed` and its hidden `sm_connect_ind`, `smDeferredAbortable`,
+`smDeferredChannelUnlinked` and the `smDeferredCancel` calls in `chan_init`,
+`sm_init`, `smCleanupBegin` and `smTeardownUnclaimed`; `mmStaDelOwned`.
+
+Host tests: `tools/test_wifi_sm_cleanup.py` (rewritten: the real cleanup over
+the real ME/MM exchanges, with allocation failures at every step, a TX reset,
+`sm_init` before and after a reply, a VIF retired mid-cleanup or before
+the first step with a station delete that fails once the VIF's station
+list is emptied, a station deleted before its step, stale and duplicate
+answers, and mutations of each remaining check),
+`tools/test_wifi_deferred_auth_lifetime.py` (rewritten),
+`tools/test_wifi_sm_table.py` (the cleanup at each request with each fate,
+checking that state 10 always has exactly one thing to move it; states 5
+and 7 with each fate), `tools/test_wifi_sm_audit_sm_connect.py`
+(SMSTRUCT-N1 for the cleanup, the silent return with a retired STA VIF),
+`tools/test_wifi_station_abort.py`, `tools/test_wifi_connect_admission.py`
+and `tools/test_wifi_cleanup_model_fuzzer.py`. Cases that changed the VIF or
+the cleanup from allocator, IRQ or free callbacks inside a handler, or that
+delivered internal messages synchronously, were removed with the re-checks
+they exercised; the checks left in the cleanup (the station it names, the
+VIF epoch before the callback and the channel unlink, and the check after
+the supplicant's callback) are covered. The M0 HTTP server manifest built;
+none of this was flashed.
 
 ## BLE
 

@@ -23,9 +23,9 @@ var
   request: Message
   replyByte: uint8
   meControlCommand, apmStartRequest: pointer
-  smOwns, cleanupOwns: bool
+  smOwns: bool
   meCalls, apmCalls, genericCalls, ownerLookups: int
-  smCalls, cleanupCalls: int
+  smCalls: int
   rejectOwner: bool
   allocatedId: uint16
   allocatedDest, allocatedSrc: uint8
@@ -42,14 +42,8 @@ proc meTakeControlReply(p: pointer; id: uint16; length: uint32): pointer =
 proc smAwaits(p: pointer): bool =
   inc ownerLookups
   smOwns
-proc smCleanupOwnsRequest(p: pointer): bool =
-  inc ownerLookups
-  cleanupOwns
 proc smTakeReply(p: pointer; id: uint16): pointer =
   inc smCalls
-  if rejectOwner: nil else: addr replyByte
-proc smCleanupTakeReply(p: pointer; id: uint16; length: uint32): pointer =
-  inc cleanupCalls
   if rejectOwner: nil else: addr replyByte
 proc apmTakeStartReply(p: pointer; id: uint16; length: uint32): pointer =
   inc apmCalls
@@ -65,13 +59,11 @@ proc reset() =
   meControlCommand = nil
   apmStartRequest = nil
   smOwns = false
-  cleanupOwns = false
   meCalls = 0
   apmCalls = 0
   genericCalls = 0
   ownerLookups = 0
   smCalls = 0
-  cleanupCalls = 0
   rejectOwner = false
   request.header = KeMsgHdr(id: 0x1234, destId: 3, srcId: 9, paramLen: 4)
 ''' + procedure(kernel, "ke_msg_alloc_reply")
@@ -92,14 +84,11 @@ rejectOwner = true
 doAssert ke_msg_alloc_reply(payload(), 0x1401, 1) == nil
 doAssert apmCalls == 1 and genericCalls == 0
 
-for owner in 0 .. 1:
-  reset()
-  rejectOwner = true
-  if owner == 0: smOwns = true
-  else: cleanupOwns = true
-  doAssert ke_msg_alloc_reply(payload(), 0x1235, 0) == nil
-  doAssert genericCalls == 0 and meCalls == 0
-  doAssert smCalls + cleanupCalls == 1
+reset()
+rejectOwner = true
+smOwns = true
+doAssert ke_msg_alloc_reply(payload(), 0x1235, 0) == nil
+doAssert genericCalls == 0 and meCalls == 0 and smCalls == 1
 ''')
 
 

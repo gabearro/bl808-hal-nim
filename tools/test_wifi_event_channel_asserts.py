@@ -89,7 +89,6 @@ proc vifChannelAt(p: pointer): ptr Vif = cast[ptr Vif](p)
 proc chanScanPoolOverlay(): ptr ChanScanPoolOverlay = addr scan
 proc chanCtxtOpTimer(): pointer = cast[pointer](76)
 proc chan_ctxt_trigger(p: pointer) = actions.add("trigger")
-proc smDeferredChannelUnlinked(vifIndex: uint8) = discard
 proc chan_update_tx_power(p: pointer) = actions.add("power")
 proc chan_tbtt_schedule(p: pointer) = actions.add("tbtt")
 proc chan_cde_evt(p: pointer) = actions.add("cde")

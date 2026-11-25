@@ -84,7 +84,6 @@ var
   interruptsEnabled = true
   allocationHook, freeHook, rateHook, stateHook, sendHook, failureHook: proc()
 let mac_ac2uapsd = [4'u8, 8, 2, 1]
-proc smCleanupOwnsRequest(request: pointer): bool = false
 proc irqSave(): uint32 =
   result = if interruptsEnabled: 8'u32 else: 0'u32
   interruptsEnabled = false

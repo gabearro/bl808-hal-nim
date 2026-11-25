@@ -72,13 +72,9 @@ proc wifiMmTimerPendingWork(): bool {.inline.} =
 proc wifiMessagePendingWork(): bool {.inline.} =
   keMsgQueueSent.first != nil or keSavedReschedMask != 0
 
-proc wifiResetEventPending(): bool {.inline.} =
-  (keEnvEventField()[] and KE_EVT_RESET) != 0
-
 proc wifiMainHasPendingWork(): bool =
   wifiEventPendingWork() or wifiKernelTimerPendingWork() or
-    wifiMmTimerPendingWork() or wifiMessagePendingWork() or
-    smCleanupNeedsService()
+    wifiMmTimerPendingWork() or wifiMessagePendingWork()
 
 proc wifiUpdateMacPlCtrl() {.inline.} =
   ## arch_main.o:wifi_main samples the bit once per step before sleep scheduling.
@@ -139,17 +135,9 @@ proc wifiDispatchScheduledEvent(): bool =
   true
 
 proc wifiDrainScheduledWork(): bool =
-  if wifiResetEventPending(): return wifiDispatchScheduledEvent()
-  template serviceWhen(ready, service: untyped) =
-    if ready:
-      # An earlier service or IRQ can post reset before the next callback.
-      if wifiResetEventPending():
-        if wifiDispatchScheduledEvent(): result = true
-        return
-      service
-      result = true
-  serviceWhen(smCleanupNeedsService(), smCleanupService())
-  if wifiDispatchScheduledEvent(): result = true
+  ## Every firmware state machine is driven by events, messages and timers;
+  ## none is polled from here.
+  wifiDispatchScheduledEvent()
 
 proc wifi_nimfw_service_tx*(count: uint32) {.exportc, cdecl.} =
   ## The facade's TX service: postponed STA frames, then `count` rounds of

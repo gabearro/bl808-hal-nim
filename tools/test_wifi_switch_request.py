@@ -138,7 +138,6 @@ proc mm_timer_clear(timer: pointer) = inc opClears
 proc chan_ctxt_trigger(ctxt: pointer) = discard
 proc chan_update_tx_power(ctxt: pointer) = discard
 proc chan_tbtt_schedule(entry: pointer) = discard
-proc smDeferredChannelUnlinked(vif: uint8) = discard
 proc chan_cde_evt(param: pointer) =
   cdeEvents.add(cast[ptr uint8](param)[])
   invoke(onCde)

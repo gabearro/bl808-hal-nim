@@ -711,7 +711,13 @@ def test_station_retirement_is_callback_safe(tmp_path: Path, mode: str, mutation
     if mutation is not None:
         assert parts != before or deletion != original_deletion, mutation
     bodies = "".join(parts.values())
-    bodies += procedure(kernel, "mmStaDelOwned") + deletion
+    # The deletion a request started is still held by MM for that station.
+    bodies += """
+proc mmStaDelOwned(staIdx, vifIdx: uint8; stationEpoch: uint32): bool =
+  let deletion = mmStaDeletions[staIdx]
+  deletion.active and deletion.requestOwned and deletion.owner.vif == vifIdx and
+    deletion.requestEpoch == stationEpoch
+""" + deletion
     bodies += procedure(kernel[kernel.index("proc mmStaDelTry("):], "mmStaDelTrackUnpublished")
     bodies += procedure(kernel, "mm_sta_del")
     bodies += procedure(kernel[kernel.index("proc mm_sta_del*"):], "mmStaDelRetryCb")

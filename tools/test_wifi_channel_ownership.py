@@ -64,7 +64,6 @@ proc c_memcmp(a, b: pointer; size: csize_t): cint =
   if equalMem(a, b, size.int): 0 else: 1
 proc chan_ctxt_trigger(p: pointer) = discard
 proc chan_update_tx_power(p: pointer) = invoke(onLink)
-proc smDeferredChannelUnlinked(vifIndex: uint8) = discard
 proc chan_tbtt_schedule(p: pointer) = discard
 proc chanCtxtOpTimer(): pointer = nil
 when not declared(mm_timer_clear):  # station_sm.nim's fixture platform has one

@@ -195,10 +195,7 @@ proc nimFwConnectTrace2U32(label: string; a, b: uint32) = invoke(onTrace)
 proc assert_err(a, b: cstring; line: cint) = doAssert false, $a & ":" & $line
 proc staDeleteIsCurrent(index: uint8; epoch: uint32): bool =
   index < 7 and stations[index].valid != 0 and stationEpochs[index] == epoch
-proc smCleanupOwnsRequest(p: pointer): bool = false
-proc smCleanupAdmitRequest(p: pointer): bool = true
-proc smCleanupConsumeReply(p: pointer): bool = false
-proc smCleanupTakeReply(p: pointer; id: uint16; length: uint32): pointer = nil
+proc smCleanupConfirmed() = doAssert false, "no cleanup runs here"
 proc apmTakeStartReply(p: pointer; id: uint16; length: uint32): pointer = nil
 proc sm_send_next_bss_param() = doAssert false
 proc meTakeControlReply(request: pointer; id: uint16; length: uint32): pointer
@@ -381,7 +378,7 @@ def source(trace: bool = False) -> str:
         code += procedure(kernel, name)
     owner = (FW / "station_tx_build.nim").read_text()
     code += station_sm_source("smGo", "smSendReserved", "smAwaits", "smAttemptStaVif",
-                              "smStaleRequest", "smTakeReply", "smTakeAnswer")
+                              "smRequestVifLive", "smStaleRequest", "smTakeReply", "smTakeAnswer")
     for name in ["smTxBeginForVif", "smTxBegin", "smTxSessionCurrent", "smTxOwnerCurrent", "smTxBindStation", "smTxSetOwnerState"]:
         code += procedure(owner, name)
     scan = (FW / "scan_station_ap_me.nim").read_text()

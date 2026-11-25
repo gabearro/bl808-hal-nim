@@ -388,7 +388,9 @@ proc txlResetting(): bool = blocked
 proc keMsgHdrFromPayload(p: pointer): ptr Header = addr header
 proc mmStaDelReqView(p: pointer): ptr Request = addr request
 proc smStaleRequest(p: pointer): bool = false
-proc smCleanupAdmitRequest(p: pointer): bool = true
+const TASK_SM = 4'u8
+proc smAwaits(p: pointer): bool = true
+proc smRequestVifLive(): bool = true
 proc mmStaDelRetryPending(index: uint8): bool = false
 proc mmStaDelTry(index: uint8; saved: uint32): bool =
   inc deletes

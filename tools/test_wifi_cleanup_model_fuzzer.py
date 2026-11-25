@@ -33,14 +33,15 @@ proc exercise(trace: string; wrap: bool): string =
     failDeletion = false
     if retryArmed: retryNow = mmStaDelRetryTimer.expiry
     for _ in 0 ..< 16: discard wifiDrainScheduledWork()
-    doAssert not smCleanup.active and allocated.len == 0 and smCleanupTags == nil
+    doAssert smOwn.teardown == tdNone and allocated.len == 0
 
   proc observe(): string =
     if deleteAttempts - before.attempts != attempts: return "hardware-attempt-count"
     if hostConnected or notifications.len - before.notifications != 1 or
         notifications[^1].status != 7 or notifications[^1].reason != 7:
       return "disconnect-notification"
-    if (smState == SmIdleState) != (phase == done) or smCleanup.active != (phase != done):
+    if (smState == SmIdleState) != (phase == done) or
+        (smOwn.teardown == tdCleanup) != (phase != done):
       return "cleanup-owner"
     if deleteConfirmations - before.confirmations != (phase == done).int or
         removed.len - before.removals != (phase == done).int:

@@ -104,21 +104,11 @@ def source() -> str:
                         "if task == TASK_SM: state elif task == TASK_ME: meState else: mmState")
     code = code.replace("  else: meState = value\n",
                         "  elif task == TASK_ME: meState = value\n  else: mmState = value\n")
-    stubs = ("proc smCleanupOwnsRequest(p: pointer): bool = false\n"
-             "proc smCleanupAdmitRequest(p: pointer): bool = true\n"
-             "proc smCleanupConsumeReply(p: pointer): bool = false\n"
-             "proc smCleanupTakeReply(p: pointer; id: uint16; length: uint32): pointer = nil\n")
-    assert stubs in code
-    # The cleanup's own request (station_cleanup.nim), checked by its owner.
-    code = code.replace(stubs, """
-var cleanupRequest: pointer
-var cleanupVifEpoch: uint32
-proc smCleanupOwnsRequest(p: pointer): bool = p != nil and p == cleanupRequest
-proc smCleanupAdmitRequest(p: pointer): bool =
-  p != cleanupRequest or (state == 10 and rxVifEpochs[1] == cleanupVifEpoch)
-proc smCleanupConsumeReply(p: pointer): bool = false
-proc smCleanupTakeReply(p: pointer; id: uint16; length: uint32): pointer =
-  ke_msg_alloc(id, TASK_SM, TASK_MM, length)
+    stub = 'proc smCleanupConfirmed() = doAssert false, "no cleanup runs here"\n'
+    assert stub in code
+    # The VIF the cleanup releases (station_cleanup.nim) is VIF 1 here.
+    code = code.replace(stub, stub + """var cleanupVifEpoch: uint32
+proc smCleanupVifLive(): bool = rxVifEpochs[1] == cleanupVifEpoch
 """, 1)
     start = code.index("  of TASK_MM:\n", code.index("proc dispatchOne"))
     end = code.index("  of TASK_API:\n", start)
@@ -137,53 +127,37 @@ proc smCleanupTakeReply(p: pointer; id: uint16; length: uint32): pointer =
 
 
 CASES = {
+    # SM's cleanup (state 10) sends MM_SET_VIF_STATE_REQ(0) with its reserved
+    # reply. The real handler clears the VIF's timers and state and answers
+    # with that reply; for a VIF retired since, it answers without applying.
     "station_cleanup_state_down": r'''
-proc installReplacement() =
-  inc rxVifEpochs[1]
-  replaceOwner()
+for retired in [false, true]:
+  setup()
+  discard smGo(10, tdCleanup)
   vifs[1].state = 1
-  vifs[1].tbttTimer = 111
-  vifs[1].keepAliveTimer = 222
-  vifs[1].securityTimer = 333
-
-for irqEnabled in [false, true]:
-  for replaceAt in -1 .. 3: # Normal, MAC idle read, then the three timer clears.
-    setup()
-    enabled = irqEnabled
-    state = 10
-    vifs[1].state = 1
-    vifs[1].tbttTimer = 11
-    vifs[1].keepAliveTimer = 22
-    vifs[1].securityTimer = 33
-    cleanupVifEpoch = rxVifEpochs[1]
-    cleanupRequest = ke_msg_try_alloc(MM_SET_VIF_STATE_REQ, TASK_MM, TASK_SM,
-                                      MmSetVifStateReqPayloadSize)
-    cast[ptr MmSetVifStateReqPayload](cleanupRequest)[] =
-      MmSetVifStateReqPayload(vifIdx: 1, state: 0)
-    var clears = 0
-    proc observeClear() =
-      doAssert enabled == irqEnabled
-      inc clears
-      if clears == replaceAt: installReplacement()
-      else: onTimer = observeClear
-    if replaceAt == 0: onRead = installReplacement
-    onTimer = observeClear
-    doAssert mm_hw_config_handler(cleanupRequest) == KeMsgConsumed
-    doAssert enabled == irqEnabled
-    if replaceAt == -1:
-      doAssert vifs[1].state == 0 and clears == 3
-      doAssert vifs[1].tbttTimer == 0 and vifs[1].keepAliveTimer == 0 and
-               vifs[1].securityTimer == 0
-      doAssert events.len == 1 and events[0].id == MM_SET_VIF_STATE_CFM
-    else:
-      doAssert vifs[1].state == 1 and vifs[1].tbttTimer == 111 and
-               vifs[1].keepAliveTimer == 222 and vifs[1].securityTimer == 333,
-        "retired cleanup changed the replacement VIF"
-      doAssert clears == replaceAt and events.len == 0
-    ke_msg_free(keMsgHdrFromPayload(cleanupRequest))
-    cleanupRequest = nil
-    onTimer = nil
-    finish()
+  vifs[1].tbttTimer = 11
+  vifs[1].keepAliveTimer = 22
+  vifs[1].securityTimer = 33
+  cleanupVifEpoch = rxVifEpochs[1]
+  let request = ke_msg_try_alloc(MM_SET_VIF_STATE_REQ, TASK_MM, TASK_SM,
+                                 MmSetVifStateReqPayloadSize)
+  cast[ptr MmSetVifStateReqPayload](request)[] = MmSetVifStateReqPayload(vifIdx: 1, state: 0)
+  doAssert smSendReserved(request)
+  let reserved = smOwn.reply
+  if retired: inc rxVifEpochs[1]
+  doAssert dispatchOne()
+  doAssert events[^1].id == MM_SET_VIF_STATE_CFM
+  doAssert keMsgQueueSent.first == keMsgHdrFromPayload(reserved)
+  doAssert smOwn.answer == reserved and smOwn.request == nil
+  if retired:
+    doAssert vifs[1].state == 1 and vifs[1].tbttTimer == 11 and
+             vifs[1].keepAliveTimer == 22 and vifs[1].securityTimer == 33,
+      "the cleanup's request was applied to the retired VIF"
+  else:
+    doAssert vifs[1].state == 0 and vifs[1].tbttTimer == 0 and
+             vifs[1].keepAliveTimer == 0 and vifs[1].securityTimer == 0
+  ke_msg_free(co_list_pop_front(addr keMsgQueueSent))
+  finish()
 ''',
     "station_probe_budget_fresh": r'''
 begin()

@@ -57,7 +57,9 @@ proc check(where: string) =
   if smOwn.teardown == tdDeauthWait:
     doAssert smGuardArmed, where & ": deauthentication wait without its guard"
   if smOwn.teardown == tdCleanup:
-    doAssert smCleanup.active, where & ": state 10 without its cleanup"
+    # The cleanup waits for its request's answer or for its retry timer.
+    doAssert (smOwn.answer != nil) != smGuardArmed,
+      where & ": state 10 cleanup with nothing, or two things, to move it"
   doAssert report() <= 1, where & ": ended twice"
 
 proc frame(callback: pointer) =
@@ -179,20 +181,20 @@ def row(teardown: str, state: int, fate: str) -> str:
         body += f"doAssert pending.len == {int(fate == 'guard')}\n"
     body += "quiesce()\n"
     body += r'''
-doAssert smState == SmIdleState and smOwn.teardown == tdNone and not smCleanup.active
+doAssert smState == SmIdleState and smOwn.teardown == tdNone
 doAssert report() == 1, "teardown ended unreported or twice: " & $report()
 doAssert sm.connectInfo == nil and sm.connectIndMsg == nil
-doAssert allocated.len == 0 and smCleanupTags == nil
+doAssert allocated.len == 0 and smOwn.answer == nil
 doAssert not smGuardArmed
 # Every stamp handed out is stale now.
-let quiet = (smState, notifications.len, controlReplies.len, smCleanup.active)
+let quiet = (smState, notifications.len, controlReplies.len, smOwn.teardown)
 for stamp in stamps:
   for callback in [cast[pointer](sm_disconnect_deauth_cfm),
                    cast[pointer](sm_connect_abort_deauth_cfm),
                    cast[pointer](sm_supplicant_deauth_cfm)]:
     cast[proc(p: pointer; status: uint32) {.cdecl.}](callback)(stamp, 0x40000000'u32)
   smDeauthGuardExpired(stamp)
-doAssert (smState, notifications.len, controlReplies.len, smCleanup.active) == quiet
+doAssert (smState, notifications.len, controlReplies.len, smOwn.teardown) == quiet
 sm_connect_ind(8, 15)
 doAssert report() == 1 and smState == SmIdleState
 '''
@@ -290,7 +292,7 @@ vifs[0].vifType = 1
 if waiting: confirm(cast[pointer](sm_connect_abort_deauth_cfm), 0x80800000'u32)
 else: sm_connect_ind(8, 15)
 check("unclaimed")
-doAssert smState == SmIdleState and smOwn.teardown == tdNone and not smCleanup.active
+doAssert smState == SmIdleState and smOwn.teardown == tdNone
 doAssert sm.connectInfo == nil and sm.connectIndMsg == nil and allocated.len == 0
 doAssert report() == 0 and not smGuardArmed
 """)
@@ -444,7 +446,8 @@ def test_request_answer_states_have_one_exit() -> None:
         assert take in procedure(tasks, handler), handler
     assert "smTakeAnswer(reply)" in procedure((FW / "station_scan.nim").read_text(), "smScanAccept")
     senders = [path.name for path in _wifi_sources() if "smSend(" in _code(path)]
-    assert sorted(senders) == ["scan_station_ap_me.nim", "station_sm.nim", "task_handlers.nim"], senders
+    assert sorted(senders) == ["scan_station_ap_me.nim", "station_cleanup.nim",
+                               "station_sm.nim", "task_handlers.nim"], senders
     main = _code(FW / "task_init_main.nim")
     assert "smScanNeedsService" not in main and "smRegistrationNeedsService" not in main
 
@@ -604,3 +607,215 @@ def test_series_states_have_one_exit() -> None:
     main = _code(FW / "task_init_main.nim")
     assert "smBss" not in main and "smActivation" not in main
     assert "meControlReset" not in _code(FW / "station_bss.nim") + _code(FW / "station_activation.nim")
+
+
+# --------------------------------------------------------------------------
+# The cleanup (state 10, phase tdCleanup)
+# --------------------------------------------------------------------------
+#
+# The harness is test_wifi_sm_cleanup's. A disconnect's cleanup is stopped at
+# one of its four requests and one fate is applied. After every dispatch SM
+# in the cleanup has exactly one thing to move it: the answer it waits for,
+# or its retry timer; a reserved reply exists only with its request; the
+# disconnect is reported at most once. At quiescence SM is idle, nothing is
+# allocated, ME is idle and the disconnect was reported once.
+
+CLEANUP_SERIES = r'''
+proc checkCleanup(where: string) =
+  if smOwn.teardown == tdCleanup:
+    doAssert (smOwn.answer != nil) != smGuardArmed,
+      where & ": the cleanup has nothing, or two things, to move it"
+    doAssert smOwn.reply == nil or smOwn.request != nil, where & ": a reply reserved for nothing"
+  else:
+    doAssert smOwn.answer == nil and not smGuardArmed, where & ": the cleanup outlived state 10"
+  doAssert notifications.len <= 1, where & ": the disconnect was reported twice"
+proc runCleanup(where: string) =
+  var count = 0
+  while wifiMainHasPendingWork():
+    discard wifiDrainScheduledWork()
+    checkCleanup(where)
+    inc count
+    doAssert count < 64, where & ": the cleanup stopped making progress"
+proc untilReplier(step: int) =
+  ## Until request `step` is sent; its replier has not run.
+  while smCleanup.step < step:
+    driveOne()
+    checkCleanup("advance")
+proc untilAnswer(step: int) =
+  ## Until the answer to request `step` is queued for SM.
+  untilReplier(step)
+  while keMsgQueueSent.first == nil or keMsgQueueSent.first.destId != TASK_SM:
+    driveOne()
+    checkCleanup("answer")
+proc deliver(h: ptr Header) =
+  ## SM's handler for an answer, as the kernel dispatches it.
+  let p = keMsgPayload(h)
+  case h.id
+  of ME_SET_PS_DISABLE_CFM: me_set_ps_disable_cfm_handler_sm(p)
+  of ME_SET_ACTIVE_CFM: me_set_active_cfm_handler_sm(p)
+  of MM_STA_DEL_CFM: discard smCleanupCfmHandler(p)
+  else: discard mm_set_vif_state_cfm_handler(p)
+  checkCleanup("delivered")
+proc smInit() =
+  smCleanupCancel()
+  smGo(SmIdleState)
+  checkCleanup("sm_init")
+proc quiet() =
+  doAssert smState == SmIdleState and smOwn.teardown == tdNone
+  doAssert allocated.len == 0 and meState == MeIdleState and notifications.len == 1
+  doAssert keMsgQueueSent.first == nil and keMsgQueueSaved.first == nil
+'''
+
+# Effects of the four requests on the model: (ME PS-disable bit, VIF state,
+# station deleted, ME active bit), as each would leave them once applied.
+CLEANUP_FATES = {
+    "answered": "start()\nrunCleanup(\"answered\")\ncompleted()\n",
+    # An answer delivered twice moves the cleanup once.
+    "duplicate": "start()\nuntilAnswer(step)\nlet h = co_list_pop_front(addr keMsgQueueSent)\n"
+                 "deliver(h)\ndeliver(h)\nke_msg_free(h)\nrunCleanup(\"duplicate\")\ncompleted()\n",
+    # sm_init after the replier answered: SM ignores the answer, sends nothing more.
+    "stale": "start()\nuntilAnswer(step)\nlet h = co_list_pop_front(addr keMsgQueueSent)\nsmInit()\n"
+             "deliver(h)\nke_msg_free(h)\nrunCleanup(\"stale\")\nquiet()\n"
+             "doAssert commands.len == step + 1, \"a request was sent after sm_init\"\n",
+    # sm_init before the replier ran: it drops the request, unapplied.
+    "dropped": "start()\nuntilReplier(step)\nlet before = effects()\nsmInit()\nrunCleanup(\"dropped\")\nquiet()\n"
+               "doAssert effects() == before, \"a request SM no longer waits on was applied\"\n"
+               "doAssert commands.len == step + 1\n",
+    # The VIF is removed before the replier ran (its station list emptied,
+    # its station left valid): every request from here on, the station
+    # delete included, is answered unapplied and the cleanup ends.
+    "vif_retired": "start()\nuntilReplier(step)\nlet before = effects()\nretireVif(0)\n"
+                   "runCleanup(\"retired\")\nquiet()\n"
+                   "doAssert effects() == before, \"a request was applied to the retired VIF\"\n",
+    # The step's messages cannot be allocated: the retry timer runs it again
+    # until memory returns; no step is skipped.
+    "no_memory": "stall(proc(on: bool) = failEveryAllocation = on)\ncompleted()\n",
+    # The step comes during a TX reset: it waits for the retry timer.
+    "tx_reset": "stall(proc(on: bool) = txResetInProgress = on)\ncompleted()\n",
+}
+
+CLEANUP_ROW = r'''
+proc effects(): tuple[psDisable, vifState: uint8, removed: int, active: uint32] =
+  ((me.psDisableMask and 1).uint8, vifs[0].state, removed.len, me.activeMask and 1)
+proc start() =
+  sm_disconnect_process(addr vifs[0], 19, 3)
+  checkCleanup("start")
+proc stall(condition: proc(on: bool)) =
+  if step == 0: condition(true)
+  start()
+  if step > 0:
+    untilAnswer(step - 1)
+    condition(true)
+    driveOne()
+  doAssert smCleanup.step == step and smOwn.answer == nil and smGuardArmed
+  for _ in 0 ..< 3:
+    discard wifiDrainScheduledWork()
+    checkCleanup("stalled")
+  doAssert smCleanup.step == step and commands.len == step, "a step was skipped"
+  condition(false)
+  runCleanup("resumed")
+'''
+
+CLEANUP_ROWS = [(step, fate) for step in range(4) for fate in CLEANUP_FATES]
+
+
+@pytest.mark.parametrize("step,fate", CLEANUP_ROWS, ids=[f"{s}-{f}" for s, f in CLEANUP_ROWS])
+def test_cleanup_table(tmp_path: Path, step: int, fate: str) -> None:
+    code = cleanup_program("disconnect").removesuffix(CLEANUP_CASES["disconnect"])
+    run_program(tmp_path, "checked", code + CLEANUP_SERIES + f"let step = {step}\n"
+                + CLEANUP_ROW + CLEANUP_FATES[fate])
+
+
+def test_cleanup_has_one_exit() -> None:
+    """The cleanup sends with smSendReserved or smSend, and SM's handlers take
+    its answers with smTakeAnswer; nothing forgets, polls or cancels it."""
+    tasks = (FW / "task_handlers.nim").read_text()
+    for handler in ["me_set_ps_disable_cfm_handler_sm", "me_set_active_cfm_handler_sm",
+                    "mm_set_vif_state_cfm_handler"]:
+        body = procedure(tasks, handler)
+        assert "smTakeAnswer(param)" in body and "smCleanupConfirmed()" in body, handler
+    cleanup = _code(FW / "station_cleanup.nim")
+    assert "smTakeAnswer(reply)" in procedure(cleanup, "smCleanupCfmHandler")
+    assert "smCleanupNext()" in procedure(cleanup, "smCleanupConfirmed")
+    for gone in ("Forget", "NeedsService", "lost", "awaiting", "meControlReset", "irqSave"):
+        assert gone not in cleanup, gone
+
+
+# --------------------------------------------------------------------------
+# The deferred auth/assoc request (states 5 and 7)
+# --------------------------------------------------------------------------
+#
+# The harness is test_wifi_deferred_auth_lifetime's: the real deferred_auth.nim,
+# sm_auth_assoc_send_according_chan, chan_ctxt_set_auth_assoc_req, the
+# publication branch of chan_pre_switch_channel and station_sm.nim. SM parks
+# its request in state 5 or 7 and one fate is applied. At every step states 5
+# and 7 hold exactly the parked request and no other state holds one, chan_env
+# parks at most SM's request, and the attempt ends or sends at most once. At
+# quiescence nothing is allocated.
+
+DEFERRED_SERIES = r'''
+proc checkDeferred(where: string) =
+  doAssert (currentState in [5'u16, 7]) == held(),
+    where & ": state " & $currentState & " with a request held " & $held()
+  doAssert chan.deferredMsg == nil or chan.deferredMsg == smOwn.request,
+    where & ": chan_env parks a request SM does not hold"
+  doAssert sent.len + endings.len <= 1, where & ": the attempt went on twice"
+proc dispatch(where: string) =
+  while queue.len != 0:
+    let payload = queue[0]
+    queue.delete(0)
+    doAssert sm_connect_auth_assoc_req(payload) == KeMsgConsumed
+    checkDeferred(where)
+    ke_msg_free(keMsgHdrFromPayload(payload))
+'''
+
+DEFERRED_FATES = {
+    # The channel comes back: the frame goes out once.
+    "published": "publish()\ncheckDeferred(\"published\")\npublish()\ndispatch(\"sent\")\n"
+                 "doAssert sent.len == 1 and sent[0].kind == state and currentState == state + 1\n",
+    # The user's abort while the request is parked or queued ends the attempt.
+    "abort_parked": "sm_connect_ind(24, 3)\ncheckDeferred(\"abort\")\npublish()\ndispatch(\"stale\")\n"
+                    "doAssert sent.len == 0 and endings == @[(24'u16, 3'u16)] and live.len == 0\n",
+    "abort_queued": "publish()\nsm_connect_ind(24, 3)\ncheckDeferred(\"abort\")\ndispatch(\"stale\")\n"
+                    "doAssert sent.len == 0 and endings == @[(24'u16, 3'u16)]\n",
+    # sm_init while parked frees the request.
+    "sm_init": "discard smGo(0)\ncheckDeferred(\"sm_init\")\n"
+               "doAssert live.len == 0 and chan.deferredMsg == nil\npublish()\ndispatch(\"stale\")\n"
+               "doAssert sent.len == 0 and endings.len == 0\n",
+    # The STA VIF is retired before the request comes back: the attempt ends.
+    "vif_retired": "publish()\nvifs[1].vifType = 4\ndispatch(\"retired\")\n"
+                   "doAssert sent.len == 0 and endings == @[(11'u16, 0xFFFF'u16)]\n",
+    # The request delivered twice sends one frame.
+    "duplicate": "publish()\nlet payload = queue[0]\nqueue.delete(0)\n"
+                 "discard sm_connect_auth_assoc_req(payload)\ncheckDeferred(\"first\")\n"
+                 "discard sm_connect_auth_assoc_req(payload)\ncheckDeferred(\"second\")\n"
+                 "ke_msg_free(keMsgHdrFromPayload(payload))\ndoAssert sent.len == 1\n",
+}
+
+DEFERRED_ROWS = [(state, fate) for state in (5, 7) for fate in DEFERRED_FATES]
+
+
+@pytest.mark.parametrize("state,fate", DEFERRED_ROWS, ids=[f"{s}-{f}" for s, f in DEFERRED_ROWS])
+def test_deferred_table(tmp_path: Path, state: int, fate: str) -> None:
+    from test_wifi_deferred_auth import run_nim
+    from test_wifi_deferred_auth_lifetime import program_source as deferred_source
+    run_nim(tmp_path, deferred_source() + DEFERRED_SERIES + f"""
+let state = {state}'u16
+reset()
+checkDeferred("start")
+schedule(state)
+doAssert currentState == state and chan.deferredMsg != nil
+checkDeferred("parked")
+""" + DEFERRED_FATES[fate] + "finish()\ncheckDeferred(\"end\")\ndoAssert live.len == 0\n")
+
+
+def test_deferred_request_has_one_exit() -> None:
+    """States 5 and 7 are entered only by smDeferredPark, and the dispatch
+    takes the request with smTakeAnswer."""
+    deferred = _code(FW / "deferred_auth.nim")
+    assert "smGo(state)" in procedure(deferred, "smDeferredPark")
+    assert "smPark(request)" in procedure(deferred, "smDeferredPark")
+    assert "smTakeAnswer(payload)" in procedure(deferred, "smDeferredDispatch")
+    for path in _wifi_sources():
+        code = _code(path)
+        assert "smGo(SmAuthStartingState" not in code and "smGo(SmAssociatingState" not in code, path

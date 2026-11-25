@@ -39,7 +39,7 @@ proc mfp_add_mgmt_mic(p, bytes: pointer; length: uint32): uint32 =
 proc failed(p: pointer; status, reason: uint16) {.cdecl.} =
   inc failures
   failureStatus = status
-proc smCleanupConsumeReply(p: pointer): bool = false
+proc smCleanupConfirmed() = doAssert false, "no cleanup runs here"
 proc sm_auth_start() = inc authStarts
 var batchDone = true
 proc smBssNext(): bool = batchDone  # station_bss.nim: the STA VIF is still there

@@ -264,8 +264,8 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Blob ABI: a0=msgId, a1=msgBody, a2=srcId, a3=destId.
   ## Dispatches on msgId to configure MAC HW for various operations.
   ## Called via ke_task_schedule for msg IDs: 6,8,14,16,18,20,22,24,41.
-  if param == nil or smStaleRequest(param) or not smCleanupAdmitRequest(param) or
-      not chanUpdateAdmit(param): return KeMsgConsumed
+  if param == nil or smStaleRequest(param) or not chanUpdateAdmit(param):
+    return KeMsgConsumed
   let hdr = keMsgHdrFromPayload(param)
   let msgId = hdr.id
   let msgBody = param
@@ -295,13 +295,9 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
     let saved = irqSave()
     defer: irqRestore(saved)
     let hwMode = regRead(MACHW_STATE_CNTRL_REG) and 0x0F'u32
-    if not smCleanupAdmitRequest(param):
-      return KeMsgConsumed
     discard mmConfigTrackIdle(hdr, hwMode.uint8, curState.uint8)
     hal_machw_idle_req()
     ke_state_set(srcId, TaskGoingIdleState)
-    if not smCleanupAdmitRequest(param):
-      return KeMsgConsumed
     # Fast path: if SET_VIF_STATE with state=0, enable monitor RX
     if msgId == MM_SET_VIF_STATE_REQ and
         cast[ptr MmSetVifStateReqPayload](msgBody).state == 0:
@@ -454,15 +450,10 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
     if newState == 0:
       let saved = irqSave()
       defer: irqRestore(saved)
-      template current(): bool = smCleanupAdmitRequest(param)
-      if not current(): return KeMsgConsumed
       if vif.vifType == VIF_TYPE_STA:
         if ke_task_sm_activating(): inc nimFwDbgSetVifStateAct
-        # Reprogramming the timer head can release IRQs. Recheck the owner
-        # with IRQs masked before touching another timer or the VIF state.
         for timer in [addr vif.tbttTimer, addr vif.keepAliveTimer, addr vif.securityTimer]:
           mmTimerClearLocked(timer, saved)
-          if not current(): return KeMsgConsumed
       vif.state = 0
     elif apFlag == VIF_TYPE_STA:
       let activating = ke_task_sm_activating()
@@ -515,8 +506,6 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
         mm_env_max_ampdu_duration_set(0)
       elif newState == 0:
         mmReplayEdca()
-        if not smCleanupAdmitRequest(param):
-          return KeMsgConsumed
       cfmBasicId = MM_SET_VIF_STATE_CFM
 
   of 41:  # MM_CHAN_CTXT_UPDATE_REQ
@@ -543,8 +532,6 @@ proc mm_hw_config_handler*(param: pointer): cint {.exportc, cdecl.} =
 proc mm_set_idle_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## The request belongs to TASK_MM and remains saved until hardware is idle.
   if param == nil or keMsgHdrFromPayload(param).paramLen < MmSetIdleReqPayloadSize:
-    return KeMsgConsumed
-  if not smCleanupAdmitRequest(param):
     return KeMsgConsumed
   let state = ke_state_get(TASK_MM)
   if state == HW_ACTIVE.uint16:
@@ -658,23 +645,28 @@ proc mm_sta_add_cfm_handler*(param: pointer): cint {.exportc, cdecl, discardable
 
 proc mm_sta_del_req_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
   ## The vendor confirms to the incoming source, not unconditionally to API.
+  ## The confirmation is the request itself, so it needs no allocation. A
+  ## request of SM's that SM no longer waits on is not applied; a queued one
+  ## whose station is deleted meanwhile already names no station
+  ## (staDeleteCancelQueued). SM's delete for a VIF retired since the
+  ## cleanup began is answered unapplied: vif_mgmt_unregister emptied the
+  ## VIF's station list, so the station can no longer be removed.
   if param == nil or keMsgHdrFromPayload(param).paramLen < MmStaDelReqPayloadSize:
     return KeMsgConsumed
   let header = keMsgHdrFromPayload(param)
   let destination = header.srcId
   let source = header.destId
+  if destination == TASK_SM:
+    if not smAwaits(param): return KeMsgConsumed
+    if not smRequestVifLive(): mmStaDelReqView(param).staIdx = 0xFF
   block:
     let saved = irqSave()
     defer: irqRestore(saved)
     if txlResetting(): return KeMsgSaved
-    if not smCleanupAdmitRequest(param):
-      return KeMsgConsumed
     let staIdx = mmStaDelReqView(param).staIdx
     # A task-wide wake may replay this request before the MAC retry is due.
     if mmStaDelRetryPending(staIdx) or not mmStaDelTry(staIdx, saved):
       if txlResetting(): return KeMsgSaved
-      if not smCleanupAdmitRequest(param):
-        return KeMsgConsumed
       # Publish before arming: a synchronous timer callback must see the request.
       if mmStaDelReqView(param).staIdx == staIdx:
         co_list_push_back(addr keMsgQueueSaved, cast[ptr CoListHdr](header))
@@ -694,8 +686,6 @@ proc mm_set_ps_mode_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## ps_polling_frame. When the list is exhausted, sends MM_SET_PS_MODE_CFM.
   ## If ps_mode != 3: forwards to ps_set_mode.
   if param == nil or keMsgHdrFromPayload(param).paramLen < MmSetPsModeReqPayloadSize:
-    return KeMsgConsumed
-  if not smCleanupAdmitRequest(param):
     return KeMsgConsumed
   # Scan/ROC owns the PM register until its end restores the saved value.
   # The return-to-channel or host-idle state transition requeues this command.
@@ -750,9 +740,11 @@ proc mm_set_ps_options_req_handler*(param: pointer): cint {.exportc, cdecl, disc
   KeMsgConsumed
 
 proc mm_set_vif_state_cfm_handler*(param: pointer): cint {.exportc, cdecl, discardable.} =
-  ## The cleanup's answer, or the answer to the activation's first request.
-  if smCleanupConsumeReply(param): return KeMsgConsumed
-  if smTakeAnswer(param): smActivationConfirmed()
+  ## The answer to the activation's first request, or in state 10 the
+  ## cleanup's.
+  if not smTakeAnswer(param): return KeMsgConsumed
+  if ke_state_get(TASK_SM) == SmDisconnectingState: smCleanupConfirmed()
+  else: smActivationConfirmed()
   KeMsgConsumed
 
 proc smActivationOptionsCfmHandler(param: pointer): cint {.cdecl.} =
@@ -2257,10 +2249,10 @@ proc smQueueOwnedScanAbort(identity: SmStaRequestIdentity) =
 
 proc sm_connect_abort_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Keep saved aborts tied to their first connection.
-  ## In states 5/7 no frame has been submitted by an owned parked/queued command.
   ## Pinned sm_connect_abort_req_handler+0x32..0x3a saves the abort in states
-  ## 3 and 4. Here it ends the attempt there, as in 5/7: no frame has been
-  ## sent to the AP yet.
+  ## 3 and 4 and only confirms it in 5 and 7. Here it ends the attempt in all
+  ## four: no frame has been sent to the AP yet. In 5 and 7 the parked auth
+  ## or assoc request is freed with the attempt (smGo).
   let identity = smAbortCapture(param)
   let cfm = cast[ptr StatusCfmPayload](
     ke_msg_try_alloc(SM_CONNECT_ABORT_CFM, TASK_API, TASK_SM, StatusCfmPayloadSize))
@@ -2268,7 +2260,7 @@ proc sm_connect_abort_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   cfm.status = if identity.valid: 0'u8 else: 1'u8
   if smAbortCurrent(identity):
     let state = ke_state_get(TASK_SM)
-    if state in [SmAddingChanState, SmSettingBssState]:
+    if state in [SmAddingChanState, SmSettingBssState, SmAuthStartingState, SmAssociatingState]:
       sm_connect_ind(WLAN_FW_CONNECT_ABORT_BY_USER_NO_DEAUTH, 3)
     elif state == SmScanningState:
       smEnvView().cancelRequested = 1
@@ -2276,13 +2268,6 @@ proc sm_connect_abort_req_handler*(param: pointer): cint {.exportc, cdecl.} =
       smQueueOwnedScanAbort(identity)
     elif state == SmWaitingState:
       smEnvView().cancelRequested = 1
-    elif state in [SmAuthStartingState, SmAssociatingState]:
-      let abortable = smDeferredAbortable(identity.vifIndex, state)
-      if smAbortCurrent(identity):
-        if not abortable or ke_state_get(TASK_SM) != state:
-          ke_msg_free(keMsgHdrFromPayload(cfm))
-          return KeMsgSaved
-        sm_connect_ind(WLAN_FW_CONNECT_ABORT_BY_USER_NO_DEAUTH, 3)
     elif state in [SmAuthenticatingState, SmAssocRspState, SM_ACTIVATING_STATE]:
       sm_handle_connection(identity.vifIndex, WLAN_FW_CONNECT_ABORT_BY_USER_NO_DEAUTH,
         cast[pointer](sm_connect_abort_deauth_cfm), cast[pointer](sm_connect_abort_process))
@@ -2385,24 +2370,16 @@ proc sm_auth_assoc_send_according_chan*(nextState: uint16 = 0, authSequence: uin
   ## Send auth/assoc on appropriate channel (226 bytes in blob, 57 instrs).
   ## From blob (sm.o): reads the active connection's vif_idx(59).
   ## Direct for one channel, a dominant channel, or remaining time 0/41..199ms.
-  ## Otherwise retain a command until the channel scheduler activates the VIF.
-  ## The first eight bytes match the vendor command; any challenge is owned
-  ## by the command because the RX indication can be freed before activation.
+  ## Otherwise park the request until the channel scheduler activates the VIF
+  ## (deferred_auth.nim). The attempt ends if its STA VIF is gone: the frame
+  ## builders would return without sending and leave SM waiting.
   let connInfo = smEnvView().connectInfo
-  if connInfo == nil:
+  if connInfo == nil or nextState notin [SmAuthStartingState, SmAssociatingState]:
     return
   let vifIdx = connectInfoView(connInfo).vifIdx
-  if vifIdx >= MAX_VIFS.uint8 or
-      nextState notin [SmAuthStartingState, SmAssociatingState]:
+  if not smAttemptStaVif(vifIdx):
+    sm_connect_ind(WLAN_FW_AUTH_OR_ASSOC_RESPONSE_TIMEOUT_FAILURE, 0xFFFF)
     return
-  var challengeCopy: array[128, uint8]
-  if challenge != nil:
-    discard c_memcpy(addr challengeCopy[0], challenge, challengeCopy.len.csize_t)
-  let ownedChallenge = if challenge != nil: addr challengeCopy[0] else: nil
-  let owner = smDeferredCapture(connInfo, vifIdx)
-  if not smDeferredProceed(owner, owner.entryState): return
-  let vif = vifChannelForIdx(vifIdx)
-  # Check if we can send directly (single channel or dominant)
   let chanCnt = chan_ctxt_cnt()
   when defined(bl808WifiConnectTrace):
     nimFwTrace2U32("[WIFI-NIMFW] auth_sched ",
@@ -2413,48 +2390,20 @@ proc sm_auth_assoc_send_according_chan*(nextState: uint16 = 0, authSequence: uin
                           nextState.uint32 or (authSequence.uint32 shl 16),
                           vifIdx.uint32 or (chanCnt.uint32 shl 8) or
                             (ke_state_get(TASK_SM).uint32 shl 16))
-  if chanCnt <= 1 or chan_ctxt_use_dominant_chan():
-    # Direct send path
+  var direct = chanCnt <= 1 or chan_ctxt_use_dominant_chan()
+  if not direct:
+    let remaining = chan_ctxt_get_remaining_time_ms(cast[pointer](vifChannelForIdx(vifIdx)))
     when defined(bl808WifiConnectTrace):
-      nimFwTrace2U32("[WIFI-NIMFW] auth_sched_direct ",
-                     nextState.uint32, chanCnt.uint32)
-      nimFwConnectTrace2U32("[WIFI-CT] auth_direct ",
-                            nextState.uint32, chanCnt.uint32)
-    if not smDeferredProceed(owner, owner.entryState): return
-    if nextState == SmAuthStartingState:
-      sm_auth_send(authSequence, ownedChallenge)
-    elif nextState == SmAssociatingState:
-      sm_assoc_req_send()
-    return
-  # Check remaining channel time
-  let remaining = chan_ctxt_get_remaining_time_ms(cast[pointer](vif))
-  when defined(bl808WifiConnectTrace):
-    nimFwTrace2U32("[WIFI-NIMFW] auth_sched_rem ",
-                   remaining, pointerAddrU32(cast[pointer](vif)))
-    nimFwConnectTrace2U32("[WIFI-CT] auth_rem ",
-                          remaining, pointerAddrU32(cast[pointer](vif)))
-  if remaining == 0 or (remaining - 41'u32) <= 158'u32:
+      nimFwConnectTrace2U32("[WIFI-CT] auth_rem ", remaining, nextState.uint32)
+    direct = remaining == 0 or (remaining - 41'u32) <= 158'u32
+  if not direct:
     when defined(bl808WifiConnectTrace):
-      nimFwTrace2U32("[WIFI-NIMFW] auth_sched_short ",
-                     nextState.uint32, remaining)
-      nimFwConnectTrace2U32("[WIFI-CT] auth_short ",
-                            nextState.uint32, remaining)
-    if not smDeferredProceed(owner, owner.entryState): return
-    if nextState == SmAuthStartingState:
-      sm_auth_send(authSequence, ownedChallenge)
-    elif nextState == SmAssociatingState:
-      sm_assoc_req_send()
-    return
-  # Keep the vendor payload layout, with private connection ownership metadata.
-  if not smDeferredProceed(owner, owner.entryState): return
-  let msg = smDeferredCreate(owner, nextState, authSequence, ownedChallenge)
-  if msg != nil:
-    when defined(bl808WifiConnectTrace):
-      nimFwTrace2U32("[WIFI-NIMFW] auth_sched_queue ",
-                     nextState.uint32, cast[uint32](cast[uint](msg)))
-      nimFwConnectTrace2U32("[WIFI-CT] auth_queue ",
-                            nextState.uint32, cast[uint32](cast[uint](msg)))
-    chan_ctxt_set_auth_assoc_req(msg)
+      nimFwConnectTrace2U32("[WIFI-CT] auth_queue ", nextState.uint32, authSequence.uint32)
+    smDeferredPark(nextState, authSequence, challenge)
+  elif nextState == SmAuthStartingState:
+    sm_auth_send(authSequence, challenge)
+  else:
+    sm_assoc_req_send()
 
 proc sm_supplicant_deauth_cfm*(param: pointer; status: uint32) {.exportc, cdecl.} =
   ## Report supplicant deauth completion; bit 23 records the MAC ACK. Any
@@ -3135,7 +3084,7 @@ proc me_set_active_req_handler*(param: pointer): cint {.exportc, cdecl.} =
       nimfwApTiming[4] = regRead(ClicMtimeBase)
   if param == nil or keMsgHdrFromPayload(param).paramLen < MeSetActiveReqPayloadSize:
     return KeMsgConsumed
-  if smStaleRequest(param) or not smCleanupAdmitRequest(param):
+  if smStaleRequest(param):
     return KeMsgConsumed
   let state = ke_state_get(TASK_ME)
   if state == MeBusyState:
@@ -3169,12 +3118,15 @@ proc me_set_active_cfm_handler_sm*(param: pointer): cint {.exportc: "me_set_acti
   ## Blob sm_task.o::me_set_active_cfm_handler (136 bytes): asserts state 4
   ## or 10 (line 690); in state 10 sets SM idle; otherwise sends the
   ## deauthentication sm_init asked for (sm_env[17]) and starts
-  ## authentication. Here the cleanup takes its own answer and goes idle by
-  ## itself; otherwise only the answer to the BSS batch's last request is
-  ## taken, so SM is in state 4, and smBssNext ends the attempt instead if
-  ## its STA VIF is gone.
-  if smCleanupConsumeReply(param): return 0
-  if not smTakeAnswer(param) or not smBssNext(): return 0
+  ## authentication. Here only SM's live answer is taken: in state 10 the
+  ## cleanup's last, after which it goes idle by itself; otherwise the BSS
+  ## batch's last, and smBssNext ends the attempt instead if its STA VIF is
+  ## gone.
+  if not smTakeAnswer(param): return 0
+  if ke_state_get(TASK_SM) == SmDisconnectingState:
+    smCleanupConfirmed()
+    return 0
+  if not smBssNext(): return 0
   let sm = smEnvView()
   when defined(bl808WifiConnectTrace):
     nimFwConnectTrace2U32("[WIFI-CT] active_flag ", sm.deauthPending.uint32,
@@ -3211,7 +3163,7 @@ proc me_set_ps_disable_req_handler*(param: pointer): cint {.exportc, cdecl.} =
   ## Same bitmask set/clear pattern. Status = seqz * 2 (0 or 2).
   if param == nil or keMsgHdrFromPayload(param).paramLen < MeSetPsDisableReqPayloadSize:
     return KeMsgConsumed
-  if smStaleRequest(param) or not smCleanupAdmitRequest(param):
+  if smStaleRequest(param):
     return KeMsgConsumed
   let req = cast[ptr MeSetPsDisableReqPayload](param)
   if req.vifIdx >= MAX_VIFS.uint8:
@@ -3247,12 +3199,13 @@ proc me_set_ps_disable_req_handler*(param: pointer): cint {.exportc, cdecl.} =
 proc me_set_ps_disable_cfm_handler_sm*(param: pointer): cint {.exportc: "me_set_ps_disable_cfm_handler_sm", cdecl, discardable.} =
   ## Blob sm_task.o (108 bytes): asserts state 4, 0 or 10 (line 630), then
   ## sends the next BSS parameter in state 4. The pinned activation sends its
-  ## ME_SET_PS_DISABLE_REQ without waiting. Here the cleanup takes its own
-  ## answer; otherwise only SM's live answer is taken: the BSS batch's first
-  ## request in state 4, or the activation's last in state 9.
-  if smCleanupConsumeReply(param): return KeMsgConsumed
+  ## ME_SET_PS_DISABLE_REQ without waiting. Here only SM's live answer is
+  ## taken: the BSS batch's first request in state 4, the activation's last
+  ## in state 9, or the cleanup's first in state 10.
   if not smTakeAnswer(param): return KeMsgConsumed
-  if ke_state_get(TASK_SM) == SM_ACTIVATING_STATE: smActivationConfirmed()
+  case ke_state_get(TASK_SM)
+  of SM_ACTIVATING_STATE: smActivationConfirmed()
+  of SmDisconnectingState: smCleanupConfirmed()
   else: sm_send_next_bss_param()
   KeMsgConsumed
 

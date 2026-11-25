@@ -2331,7 +2331,6 @@ proc sm_init*() {.exportc, cdecl.} =
   sm.deauthPending = 1
   sm.authRetryLimit = 4
   smGo(SmIdleState)
-  smDeferredCancel()
 
 proc sm_get_bss_params*(selectedBssResultOut: ptr pointer, selectedBssChannelOut: ptr pointer) {.exportc, cdecl.} =
   ## Get BSS parameters from scan results.
@@ -4464,7 +4463,7 @@ proc sm_connection_sta_add_ind*() {.exportc, cdecl.} =
 
 proc sm_connect_auth_assoc_req(param: pointer): cint {.exportc, cdecl, discardable.} =
   ## The local dispatcher passes only the payload, unlike the vendor ABI.
-  ## Stale commands are consumed without advancing another connection state.
+  ## Only the request SM parked is taken (smDeferredDispatch).
   smDeferredDispatch(param)
 
 # ###########################################################################

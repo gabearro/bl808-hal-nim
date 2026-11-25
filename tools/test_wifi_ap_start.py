@@ -307,9 +307,6 @@ proc hal_machw_idle_req() = inc idleRequests
 proc mmConfigCancelIdle() = discard
 proc mmPsModeComplete()
 proc meTakeControlReply(request: pointer; id: uint16; length: uint32): pointer
-proc smCleanupOwnsRequest(request: pointer): bool = false
-proc smCleanupTakeReply(request: pointer; id: uint16; length: uint32): pointer = nil
-proc smCleanupAdmitRequest(request: pointer): bool = true
 proc smStaleRequest(request: pointer): bool = false
 proc smAwaits(request: pointer): bool = false
 proc smTakeReply(request: pointer; id: uint16): pointer = nil

@@ -603,7 +603,7 @@ def test_wifi_async_lifecycle_uses_event_futures_not_poll_loops():
     assert "proc wifiKernelTimerPendingWork(): bool {.inline.}" in wifi_fw
     assert "proc wifiMmTimerPendingWork(): bool {.inline.}" in wifi_fw
     assert "proc wifiMessagePendingWork(): bool {.inline.}" in wifi_fw
-    assert "proc wifiResetEventPending(): bool {.inline.}" in wifi_fw
+    assert "proc wifiResetEventPending" not in wifi_fw
     assert "proc wifiMainModeFromAbi" not in wifi_fw
     assert "proc wifiUpdateMacPlCtrl() {.inline.}" in wifi_fw
     assert "proc wifiWaitForWorkIfIdle(blockWhenIdle, hasWork: bool): bool" in wifi_fw
@@ -668,11 +668,12 @@ def test_wifi_async_lifecycle_uses_event_futures_not_poll_loops():
     assert "events < KE_EVT_KE_TIMER and wifiKernelTimerPendingWork()" in wifi_events
     assert "events < KE_EVT_KE_MESSAGE and wifiMessagePendingWork()" in wifi_events
     assert "keDispatchEvent(pending)" in wifi_events
-    assert "if wifiDispatchScheduledEvent():" in wifi_drain
+    # No state machine is polled: the drain is one scheduled event.
+    assert "  wifiDispatchScheduledEvent()" in wifi_drain
     assert "ke_timer_schedule()" not in wifi_drain
     assert "mm_timer_schedule()" not in wifi_drain
     assert "ke_task_schedule()" not in wifi_drain
-    assert wifi_drain.index("if wifiResetEventPending():") < wifi_drain.index("serviceWhen(")
+    assert "serviceWhen(" not in wifi_drain and "NeedsService" not in wifi_drain
     ble = blecontroller_policy_source()
     assert "proc blecontroller_service_step*" in ble
     assert "proc blecontroller_poll_once*" in ble
@@ -19454,9 +19455,7 @@ def test_wifi_auth_assoc_scheduler_uses_vif_overlay_pointer():
     )[0]
 
     for expected in [
-        "let vif = vifChannelForIdx(vifIdx)",
-        "let remaining = chan_ctxt_get_remaining_time_ms(cast[pointer](vif))",
-        "remaining, pointerAddrU32(cast[pointer](vif)))",
+        "chan_ctxt_get_remaining_time_ms(cast[pointer](vifChannelForIdx(vifIdx)))",
     ]:
         assert expected in body
 

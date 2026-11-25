@@ -137,7 +137,6 @@ proc ke_msg_free_payload(p: pointer) = doAssert false
 proc hal_machw_idle_req() = inc idleRequests
 proc ke_msg_send_basic_reply(p: pointer; id: uint16) = inc confirms
 proc smStaleRequest(p: pointer): bool = false
-proc smCleanupAdmitRequest(p: pointer): bool = true
 proc chanUpdateAdmit(p: pointer): bool = true
 proc apmPrepareVifRemoval(vif: uint8): bool = true
 proc ps_uapsd_set(vif: pointer; queue: uint8; enabled: uint32) = doAssert false

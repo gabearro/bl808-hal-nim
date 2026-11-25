@@ -56,7 +56,6 @@ var
   idleReplies: seq[uint16]
   delivered: int
 proc smStaleRequest(p: pointer): bool = false
-proc smCleanupAdmitRequest(p: pointer): bool = true
 proc mmSetIdleReqView(p: pointer): ptr MmSetIdleReqPayload = cast[ptr MmSetIdleReqPayload](p)
 proc ke_msg_send_basic_reply(p: pointer; id: uint16) = idleReplies.add(id)
 proc chan_get_dominant_chan(): pointer = nil

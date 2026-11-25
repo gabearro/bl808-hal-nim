@@ -70,9 +70,8 @@ proc sm_handle_connection(vif: uint8; status: uint16; callback, failure: pointer
   else:
     doAssert status == 24
     inc deauths
-  currentState = 10
   env.connectInfo = nil
-  smDeferredCancel()
+  discard smGo(10)
 '''
 
 ALLOCATOR = r'''
@@ -139,7 +138,7 @@ proc smAbortForget(header: pointer)
 proc smAbortCaptureMessage(header: ptr KeMsgHdr)
 proc smDeferredCancel()
 """, 1)
-    code = code.replace("  smDeferredForget(header)\n", "  smDeferredForget(header)\n  smAbortForget(header)\n", 1)
+    code = code.replace("  live.delete(index)\n", "  smAbortForget(header)\n  live.delete(index)\n", 1)
     original_allocator = procedure(code, "ke_msg_try_alloc")
     allocator = procedure((FW / "kernel_mac_channel.nim").read_text(), "ke_msg_try_alloc")
     code = code.replace(original_allocator, ALLOCATOR + allocator, 1)
@@ -165,14 +164,9 @@ proc smDeferredCancel()
     return
   inc publications
   queue.add(payload)""", 1)
-    code = code.replace("  doAssert status == 11 and reason == 0xFFFF\n", """  if status == 24:
-    outcomes.add((status, reason))
-    currentState = 10
-    env.connectInfo = nil
-    smDeferredCancel()
-    return
-  doAssert status == 11 and reason == 0xFFFF
-""", 1)
+    ending = "  endings.add((status, reason))\n"
+    assert code.count(ending) == 1
+    code = code.replace(ending, ending + "  if status == 24: outcomes.add((status, reason))\n", 1)
     abort_file = FW / "station_abort.nim"
     if abort_file.exists():
         code += abort_file.read_text()
@@ -259,20 +253,6 @@ doAssert deliverAbort(request) == KeMsgConsumed
 doAssert live.find(keMsgHdrFromPayload(pending)) >= 0
 drain()
 doAssert sent.len == 0 and outcomes.len == 1
-""",
-    "executing": """
-schedule()
-let request = makeAbort()
-authHook = proc() =
-  currentState = 5
-  doAssert deliverAbort(request) == KeMsgSaved
-  doAssert outcomes.len == 0 and replies.len == 0
-  currentState = 6
-publish()
-drain()
-doAssert sent.len == 1
-doAssert deliverAbort(request) == KeMsgConsumed
-doAssert deauths == 1 and replies == @[0'u8]
 """,
     # The pinned handler saves the abort in states 3 and 4; here it ends the
     # attempt at once, as in states 5 and 7 (no frame went to the AP yet).
@@ -502,12 +482,18 @@ let request = makeAbort()
 doAssert deliverAbort(request) == KeMsgConsumed
 doAssert env.cancelRequested == 1 and scanAborts == 0 and replies == @[0'u8]
 """,
-    "missing_pending": """
-currentState = 5
-let request = makeAbort()
-doAssert deliverAbort(request) == KeMsgSaved
-doAssert replies.len == 0 and outcomes.len == 0
-ke_msg_free(keMsgHdrFromPayload(request))
+    # Pinned sm_connect_abort_req_handler only confirms an abort in states 5
+    # and 7. Here it always ends the attempt there, parked request or not.
+    "parked_state_always_acts": """
+for state in [5'u16, 7]:
+  reset()
+  outcomes.setLen(0)
+  replies.setLen(0)
+  discard smGo(state)
+  let request = makeAbort()
+  doAssert deliverAbort(request) == KeMsgConsumed
+  doAssert outcomes == @[(24'u16, 3'u16)] and replies == @[0'u8]
+  doAssert currentState == 10 and deauths == 0
 """,
     "disabled_irqs": """
 schedule()
@@ -549,7 +535,6 @@ MUTATIONS = {
                          "disconnect_lifetime"),
     "capture": ("  smAbortCaptureMessage(keMsgHdrFromPayload(result))\nproc deliverAbort",
                 "  discard\nproc deliverAbort", "queued_replacement_before_dispatch"),
-    "executing": ("if tag.location == smDeferredExecuting: return false", "if tag.location == smDeferredExecuting: return true", "executing"),
     "release": ("  smAbortForget(header)", "  discard", "recycled_request"),
     "scan_abort_epoch": ("cast[ptr uint32](param)[] != scanRequestEpoch or ", "", "scan_abort_old_epoch"),
 }

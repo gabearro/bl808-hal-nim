@@ -232,7 +232,6 @@ var
 proc keMsgHdrFromPayload(p: pointer): ptr KeMsgHdr =
   cast[ptr KeMsgHdr](cast[uint](p) - sizeof(KeMsgHdr).uint)
 proc smStaleRequest(p: pointer): bool = false
-proc smCleanupAdmitRequest(p: pointer): bool = true
 proc chanUpdateAdmit(p: pointer): bool = true
 proc apmPrepareVifRemoval(index: uint8): bool = true
 proc mmEnvView(): ptr typeof(mm) = addr mm

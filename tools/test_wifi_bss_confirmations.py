@@ -59,9 +59,7 @@ proc controlStateSet(task: uint8; value: uint16) =
     if stateHook != nil: stateHook()
   else: meState = value
   releaseSavedControl(task)
-proc smCleanupAdmitRequest(p: pointer): bool = true
-proc smCleanupConsumeReply(p: pointer): bool = false
-proc smCleanupTakeReply(p: pointer; id: uint16; length: uint32): pointer = nil
+proc smCleanupConfirmed() = doAssert false, "no cleanup runs here"
 proc apmTakeStartReply(p: pointer; id: uint16; length: uint32): pointer = nil
 proc smActivationConfirmed() = inc activations
 proc smTxBegin(connection: pointer): SmTxBuildContext = discard
@@ -200,7 +198,8 @@ def source() -> str:
     }.items():
         platform = platform.replace(procedure(platform, name), replacement)
     platform = platform.replace("proc setup() =", station_sm_source(
-        "smGo", "smSendReserved", "smAwaits", "smAttemptStaVif", "smStaleRequest",
+        "smGo", "smSendReserved", "smAwaits", "smAttemptStaVif", "smRequestVifLive",
+        "smStaleRequest",
         "smTakeReply", "smTakeAnswer") + "proc setup() =", 1)
     platform = "proc ke_msg_send_basic_reply*(request: pointer; id: uint16)\n" + platform
     names = ["MeSetPsDisableReqPayload", "MmSetBssidReqPayload", "MmSetBasicRatesReqPayload",

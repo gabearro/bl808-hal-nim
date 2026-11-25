@@ -156,8 +156,6 @@ type ConnectInfoView = object
   bssid: array[6, uint8]
 var reconnectScans, reconnectJoins: int
 var reconnectConfirmations: seq[uint8]
-var immediateCleanup = false
-proc reconnectDriveSent()
 proc sm_connect_req_handler*(param: pointer): cint {.exportc, cdecl.}
 '''
     code = prefix + code
@@ -171,13 +169,7 @@ proc sm_connect_req_handler*(param: pointer): cint {.exportc, cdecl.}
                         "proc captureNotification(p: pointer) =\n"
                         "  if keMsgHdrFromPayload(p).id == SM_CONNECT_CFM:\n"
                         "    reconnectConfirmations.add(cast[ptr StatusCfmPayload](p).status)\n")
-    code = code.replace("    co_list_push_back(addr keMsgQueueSent, h)\n",
-                        "    co_list_push_back(addr keMsgQueueSent, h)\n"
-                        "    reconnectDriveSent()\n", 1)
     support = r'''
-proc reconnectDriveSent() =
-  if immediateCleanup:
-    while keMsgQueueSent.first != nil: driveOne()
 proc sm_connection_tlv_set() = discard
 proc connectInfoHasChannelHint(req: ptr ConnectInfoView): bool = false
 proc connectInfoChannelHint(p: pointer): pointer = nil
@@ -187,7 +179,7 @@ proc scanu_prune_scanresult_raw_frames() = discard
 proc sm_join_bss(mac, bss, channel: pointer; flags: bool) = inc reconnectJoins
 proc sm_scan_bss(mac, bss, channel: pointer) =
   doAssert vifs[0].chanCtxt == nil and vifs[0].staIdx == 255
-  doAssert not smCleanup.active and smState == 0
+  doAssert smOwn.teardown == tdNone and smState == 0
   inc reconnectScans
 '''
     tasks = (FW / "task_handlers.nim").read_text()
@@ -202,11 +194,10 @@ proc sm_scan_bss(mac, bss, channel: pointer) =
 
 
 TRANSACTION_CASES = {
-    "channel_only": (False, True, False, False),
-    "station_only": (True, False, False, False),
-    "station_and_channel": (True, True, False, False),
-    "allocation_retry": (True, True, True, False),
-    "immediate_cleanup": (True, True, False, True),
+    "channel_only": (False, True, False),
+    "station_only": (True, False, False),
+    "station_and_channel": (True, True, False),
+    "allocation_retry": (True, True, True),
 }
 
 
@@ -246,21 +237,28 @@ proc mmStaDelTry(index: uint8; saved: uint32): bool =
   inc deleteAttempts
   if failDeletion: return false
   mm_sta_del(index)
-  inc stationEpochs[index]
+  # staMgmtFinishRemoval: before the slot is free again, queued deletes of
+  # it, the saved one being retried included, name no station.
+  deleteStation(index)
   true
 ''')
     retry_stubs = procedure(code, "mmStaDelRetryPending")
     code = code.replace(retry_stubs + procedure(code, "mmStaDelQueueRetryLocked"),
                         pending + queue + callback)
+    # Two MM timers: MM's station-delete retry and SM's cleanup retry.
     code = code.replace(procedure(code, "wifiMmTimerPendingWork"), r'''
-proc wifiMmTimerPendingWork(): bool =
+proc deleteRetryDue(): bool =
   retryArmed and cast[int32](retryNow - mmStaDelRetryTimer.expiry) >= 0
+proc wifiMmTimerPendingWork(): bool = deleteRetryDue() or retryDue()
 ''')
     code = code.replace(procedure(code, "wifiDispatchScheduledEvent"), r'''
 proc wifiDispatchScheduledEvent(): bool =
-  if wifiMmTimerPendingWork():
+  if deleteRetryDue():
     retryArmed = false
     cast[proc(env: pointer) {.cdecl.}](mmStaDelRetryTimer.callback)(nil)
+    return true
+  if retryDue():
+    fireRetry()
     return true
   result = wifiEventPendingWork()
   if result: driveOne()
@@ -284,7 +282,7 @@ while keMsgQueueSent.first != nil and keMsgQueueSent.first.id != MM_STA_DEL_REQ:
 doAssert keMsgQueueSent.first != nil
 let deletion = keMsgQueueSent.first
 driveOne()
-doAssert smCleanup.awaiting and smCleanup.step == 2
+doAssert smOwn.answer != nil and smCleanup.step == 2
 doAssert keMsgQueueSaved.first == deletion and keMsgQueueSaved.last == deletion
 doAssert retryArmed and mmStaDelRetryMask == 4 and deleteAttempts == 1
 doAssert deleteConfirmations == 0
@@ -324,7 +322,7 @@ doAssert connectStatus == 0 and controlReplies[^1].id == SM_CONNECT_IND_MSG
 doAssert controlReplies.len == 3 # Disconnect indication, connect CFM, connect IND.
 doAssert sm.connectInfo == nil and sm.connectIndMsg == nil
 doAssert keMsgQueueSent.first == nil and keMsgQueueSaved.first == nil
-doAssert allocated.len == 0 and smCleanupTags == nil
+doAssert allocated.len == 0
 ''')
 
 
@@ -360,7 +358,7 @@ doAssert smState == SmDisconnectingState
 
 wifiServicePump()
 doAssert polls == 1, "link-down stopped firmware polling during cleanup"
-doAssert smCleanup.awaiting and smCleanup.step == 2 and retryArmed
+doAssert smOwn.answer != nil and smCleanup.step == 2 and retryArmed
 doAssert mmStaDelRetryMask == 4 and deleteAttempts == 1
 doAssert deleteConfirmations == 0
 
@@ -371,8 +369,8 @@ doAssert deleteAttempts == 1 and smState == SmDisconnectingState
 inc retryNow
 wifiServicePump()
 doAssert deleteAttempts == 2 and deleteConfirmations == 1 and removed == @[2'u8]
-doAssert not retryArmed and not smCleanup.active and smState == 0
-doAssert keMsgQueueSaved.first == nil and allocated.len == 0 and smCleanupTags == nil
+doAssert not retryArmed and smOwn.teardown == tdNone and smState == 0
+doAssert keMsgQueueSaved.first == nil and allocated.len == 0
 doAssert notifications.len == 1
 
 let finalPolls = polls
@@ -390,7 +388,7 @@ def test_connect_admission(tmp_path: Path, case: str, mode: str) -> None:
 @pytest.mark.parametrize("case", TRANSACTION_CASES)
 @pytest.mark.parametrize("mode", ["checked", "release", "asan"])
 def test_reconnect_cleanup(tmp_path: Path, case: str, mode: str) -> None:
-    station, channel, allocation_failure, immediate = TRANSACTION_CASES[case]
+    station, channel, allocation_failure = TRANSACTION_CASES[case]
     checks = f'''
 ke_msg_free(keMsgHdrFromPayload(sm.connectInfo))
 sm.connectInfo = nil
@@ -402,18 +400,16 @@ request = newMessage(SM_CONNECT_REQ, TASK_SM, TASK_API, 192)
 connectInfoView(request)[] = ConnectInfoView(vifIdx: 0)
 let before = rxVifEpochs
 failEveryAllocation = {str(allocation_failure).lower()}
-immediateCleanup = {str(immediate).lower()}
 let outcome = sm_connect_req_handler(request)
-if immediateCleanup:
-  doAssert outcome == KeMsgNoFree and reconnectScans == 1
-else:
-  doAssert outcome == KeMsgSaved
-  co_list_push_back(addr keMsgQueueSaved, keMsgHdrFromPayload(request))
-  doAssert sm.connectInfo == nil and not requestFreed
-  doAssert reconnectScans == 0 and reconnectConfirmations.len == 0
-  doAssert rxVifEpochs == before and smState == 10
+# Internal messages are only queued, so the cleanup cannot finish inside
+# the handler: the reconnect is saved behind it.
+doAssert outcome == KeMsgSaved
+co_list_push_back(addr keMsgQueueSaved, keMsgHdrFromPayload(request))
+doAssert sm.connectInfo == nil and not requestFreed
+doAssert reconnectScans == 0 and reconnectConfirmations.len == 0
+doAssert rxVifEpochs == before and smState == 10
 if failEveryAllocation:
-  doAssert smCleanupNeedsService() and commands.len == 0
+  doAssert smGuardArmed and commands.len == 0
   discard wifiDrainScheduledWork()
   doAssert not requestFreed and keMsgQueueSaved.first == keMsgHdrFromPayload(request)
 failEveryAllocation = false
@@ -432,6 +428,6 @@ ke_msg_free(keMsgHdrFromPayload(sm.connectInfo))
 sm.connectInfo = nil
 ke_msg_free(keMsgHdrFromPayload(sm.connectIndMsg))
 sm.connectIndMsg = nil
-doAssert allocated.len == 0 and smCleanupTags == nil
+doAssert allocated.len == 0
 '''
     run_program(tmp_path, mode, transaction_source() + checks)

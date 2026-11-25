@@ -39,11 +39,11 @@ def test_deferred_auth_command_ownership(tmp_path: Path) -> None:
     run_case(tmp_path, "matrix")
 
 
-def test_replaced_connection_does_not_consume_old_request(tmp_path: Path) -> None:
+def test_ended_attempt_does_not_send_its_request(tmp_path: Path) -> None:
     from test_wifi_deferred_auth_lifetime import run_case
-    run_case(tmp_path, "replacement_connection")
+    run_case(tmp_path, "attempt_ended_while_queued")
 
 
-def test_channel_publication_preserves_replacement(tmp_path: Path) -> None:
+def test_retired_vif_ends_the_attempt(tmp_path: Path) -> None:
     from test_wifi_deferred_auth_lifetime import run_case
-    run_case(tmp_path, "publication_replacement")
+    run_case(tmp_path, "vif_retired_while_queued")

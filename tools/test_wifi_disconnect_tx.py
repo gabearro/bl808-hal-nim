@@ -330,12 +330,20 @@ when not declared(mm_timer_set):
 when not declared(macTimeNow):
   proc macTimeNow(): uint32 = 0
 '''
-# smGo frees a reply SM reserved and no replier took (station_sm.nim).
+# smGo frees a reply SM reserved and no replier took, and a deferred
+# auth/assoc request still parked (station_sm.nim).
 SM_FREE = r'''
 when not declared(keMsgHdrFromPayload):
   proc keMsgHdrFromPayload(p: pointer): pointer = p
 when not declared(ke_msg_free):
   proc ke_msg_free(p: pointer) = doAssert false, "no reply was reserved"
+when not declared(smDeferredCancel):
+  proc smDeferredCancel() = discard
+'''
+# smRequestVifLive asks the cleanup about its VIF in state 10.
+SM_CLEANUP_VIF = r'''
+when not declared(smCleanupVifLive):
+  proc smCleanupVifLive(): bool = false
 '''
 SM_SA_QUERY = r'''
 when not declared(smSaQueryEnd):
@@ -346,8 +354,6 @@ when not declared(smActivationCancel):
   proc smActivationCancel() = discard
 when not declared(smBssCancel):
   proc smBssCancel() = discard
-when not declared(smDeferredCancel):
-  proc smDeferredCancel() = discard
 when not declared(ke_msg_free):
   proc ke_msg_free(p: pointer) = doAssert false, "an unclaimed teardown released a message"
 '''
@@ -368,6 +374,8 @@ def station_sm_source(*names: str, record: bool = True) -> str:
         code += (FW / "op.nim").read_text() + SM_TIMER + sm[sm.index("type\n"):sm.index("proc smGo(")]
     if "smGo" in names:
         code += SM_FREE
+    if "smRequestVifLive" in names:
+        code += SM_CLEANUP_VIF
     if "smDeauthWait" in names:
         code += SM_WAIT
     if "smDeauthWait" in names or "smTeardown" in names:
